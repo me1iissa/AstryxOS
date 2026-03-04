@@ -1,0 +1,17 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "cargo +nightly": true,
+        "cargo build": true,
+        "./build.sh": true,
+        "sg": true,
+        "mdir": true,
+        "readelf": true,
+        "objdump": true,
+        "/^cd ${workspaceFolder} && bash build\\.sh 2>&1 \\| tail -20$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "./scripts/run-test.sh": true,
+        "strings": true
+    }
+}

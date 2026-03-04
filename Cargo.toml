@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "bootloader",
+    "kernel",
+    "shared",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["AstryxOS Contributors"]
