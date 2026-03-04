@@ -281,6 +281,14 @@ pub fn read(port: u16) -> Vec<u8> {
     }
 }
 
+/// Check if a TCP port has incoming data available (non-destructive).
+pub fn has_data(port: u16) -> bool {
+    let conns = TCP_CONNECTIONS.lock();
+    conns.iter().any(|c| c.local_port == port
+        && c.state == TcpState::Established
+        && !c.recv_buffer.is_empty())
+}
+
 /// Send data over an established TCP connection.
 pub fn send_data(port: u16, data: &[u8]) -> Result<usize, &'static str> {
     let mut conns = TCP_CONNECTIONS.lock();

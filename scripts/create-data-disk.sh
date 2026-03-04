@@ -81,6 +81,53 @@ EOF
         mcopy -i "${DATA_IMG}" "${BUILD_DIR}/hello" "::bin/hello"
         echo "[DATA-DISK] Copied hello binary to /bin/hello"
     fi
+    if [ -f "${BUILD_DIR}/mmap_test" ]; then
+        mcopy -i "${DATA_IMG}" "${BUILD_DIR}/mmap_test" "::bin/mmap_test"
+        echo "[DATA-DISK] Copied mmap_test binary to /bin/mmap_test"
+    fi
+
+    # Create /lib for the musl dynamic linker
+    mmd -i "${DATA_IMG}" "::lib" 2>/dev/null || true
+    LD_MUSL="/usr/lib/x86_64-linux-musl/libc.so"
+    if [ -f "${LD_MUSL}" ]; then
+        mcopy -i "${DATA_IMG}" "${LD_MUSL}" "::lib/ld-musl-x86_64.so.1"
+        echo "[DATA-DISK] Copied ld-musl to /lib/ld-musl-x86_64.so.1"
+    fi
+
+    if [ -f "${BUILD_DIR}/dynamic_hello" ]; then
+        mcopy -i "${DATA_IMG}" "${BUILD_DIR}/dynamic_hello" "::bin/dynamic_hello"
+        echo "[DATA-DISK] Copied dynamic_hello to /bin/dynamic_hello"
+    fi
+
+    if [ -f "${BUILD_DIR}/clone_thread_test" ]; then
+        mcopy -i "${DATA_IMG}" "${BUILD_DIR}/clone_thread_test" "::bin/clone_thread_test"
+        echo "[DATA-DISK] Copied clone_thread_test to /bin/clone_thread_test"
+    fi
+
+    if [ -f "${BUILD_DIR}/socket_test" ]; then
+        mcopy -i "${DATA_IMG}" "${BUILD_DIR}/socket_test" "::bin/socket_test"
+        echo "[DATA-DISK] Copied socket_test to /bin/socket_test"
+    fi
+
+    if [ -f "${BUILD_DIR}/dynamic_hello_pie" ]; then
+        mcopy -i "${DATA_IMG}" "${BUILD_DIR}/dynamic_hello_pie" "::bin/dynamic_hello_pie"
+        echo "[DATA-DISK] Copied dynamic_hello_pie (ET_DYN PIE) to /bin/dynamic_hello_pie"
+    fi
+
+    # Firefox binary and resources (built by scripts/build-firefox.sh)
+    FIREFOX_BIN="${BUILD_DIR}/disk/bin/firefox"
+    FIREFOX_LIB="${BUILD_DIR}/disk/lib/firefox"
+    if [ -f "${FIREFOX_BIN}" ]; then
+        mcopy -i "${DATA_IMG}" "${FIREFOX_BIN}" "::bin/firefox"
+        echo "[DATA-DISK] Copied firefox binary to /bin/firefox"
+    fi
+    if [ -d "${FIREFOX_LIB}" ]; then
+        mmd -i "${DATA_IMG}" "::lib/firefox" 2>/dev/null || true
+        for f in "${FIREFOX_LIB}/"*; do
+            [ -f "${f}" ] && mcopy -i "${DATA_IMG}" "${f}" "::lib/firefox/$(basename "${f}")"
+        done
+        echo "[DATA-DISK] Copied Firefox resources to /lib/firefox/"
+    fi
 
     echo "[DATA-DISK] Populated with initial files (mtools)"
 else

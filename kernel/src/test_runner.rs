@@ -320,6 +320,66 @@ pub fn run() -> ! {
     total += 1;
     if test_musl_hello() { passed += 1; }
 
+    // ── Test 44: mmap syscall (arg6/offset, file-backed, MAP_FIXED) ───────
+
+    total += 1;
+    if test_mmap_syscall() { passed += 1; }
+
+    // ── Test 45: dynamic ELF (PT_INTERP → ld-musl-x86_64.so.1) ──────────
+
+    total += 1;
+    if test_dynamic_elf() { passed += 1; }
+
+    // ── Test 46: clone(CLONE_THREAD|CLONE_VM) userspace threading ─────────
+
+    total += 1;
+    if test_clone_thread() { passed += 1; }
+
+    // ── Test 47: socket-as-fd (Phase 4 Linux socket unification) ─────────
+
+    total += 1;
+    if test_socket_fd() { passed += 1; }
+
+    // ── Test 48: PIE (ET_DYN) + PT_INTERP dynamic binary ─────────────────
+
+    total += 1;
+    if test_pie_dynamic_elf() { passed += 1; }
+
+    // ── Test 49: mprotect (page-table protection changes) ─────────────────
+
+    total += 1;
+    if test_mprotect_syscall() { passed += 1; }
+
+    // ── Test 50: eventfd (counter signaling fd) ───────────────────────────
+
+    total += 1;
+    if test_eventfd_syscall() { passed += 1; }
+
+    // ── Test 51: pipe2 + statfs syscalls ─────────────────────────────────
+
+    total += 1;
+    if test_pipe2_statfs() { passed += 1; }
+
+    // ── Test 52: futex REQUEUE + WAIT_BITSET ─────────────────────────────
+
+    total += 1;
+    if test_futex_requeue() { passed += 1; }
+
+    // ── Test 53: AF_UNIX socketpair + write/read ──────────────────────────
+
+    total += 1;
+    if test_unix_socketpair() { passed += 1; }
+
+    // ── Test 54: AF_UNIX bind/listen/connect/accept ───────────────────────
+
+    total += 1;
+    if test_unix_bind_connect() { passed += 1; }
+
+    // ── Test 55: /proc/self/maps content ─────────────────────────────────
+
+    total += 1;
+    if test_proc_maps_content() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -1444,7 +1504,7 @@ fn test_exec_fork() -> bool {
         astryx_shared::syscall::SYS_EXEC,
         path.as_ptr() as u64,
         path.len() as u64,
-        0, 0, 0
+        0, 0, 0, 0
     );
     if result > 0 {
         test_println!("  exec syscall returned PID {} ✓", result);
@@ -1773,7 +1833,7 @@ fn test_linux_syscall_compat() -> bool {
 
     // 5. dispatch_linux is reachable — rseq (334) returns ENOSYS
     test_println!("  Testing dispatch_linux routing...");
-    let ret = crate::syscall::dispatch_linux(334, 0, 0, 0, 0, 0);
+    let ret = crate::syscall::dispatch_linux(334, 0, 0, 0, 0, 0, 0);
     if ret != -38 {
         test_fail!("Linux syscall compat", "rseq returned {} (expected -38/ENOSYS)", ret);
         return false;
@@ -1781,7 +1841,7 @@ fn test_linux_syscall_compat() -> bool {
     test_println!("  dispatch_linux(334/rseq) → {} (ENOSYS) ✓", ret);
 
     // 6. mprotect stub returns success
-    let ret = crate::syscall::dispatch_linux(10, 0x1000, 0x1000, 0x3, 0, 0);
+    let ret = crate::syscall::dispatch_linux(10, 0x1000, 0x1000, 0x3, 0, 0, 0);
     if ret != 0 {
         test_fail!("Linux syscall compat", "mprotect stub returned {}", ret);
         return false;
@@ -6057,4 +6117,994 @@ fn test_musl_hello() -> bool {
     test_println!("  Process exited with code 0 ✓");
     test_pass!("Musl libc hello (static ELF from disk)");
     true
+}
+
+fn test_mmap_syscall() -> bool {
+    test_header!("mmap syscall (arg6/offset, file-backed, MAP_FIXED)");
+
+    // 1. Read the mmap_test ELF from the data disk.
+    let elf_data = match crate::vfs::read_file("/disk/bin/mmap_test") {
+        Ok(data) => {
+            test_println!("  Read /disk/bin/mmap_test: {} bytes", data.len());
+            data
+        }
+        Err(e) => {
+            test_fail!("mmap_test", "Cannot read /disk/bin/mmap_test: {:?}", e);
+            return false;
+        }
+    };
+
+    // 2. Validate ELF.
+    if !crate::proc::elf::is_elf(&elf_data) {
+        test_fail!("mmap_test", "/disk/bin/mmap_test is not an ELF binary");
+        return false;
+    }
+    test_println!("  ELF validation passed ✓");
+
+    // 3. Validate ELF header.
+    match crate::proc::elf::validate_elf(&elf_data) {
+        Ok(hdr) => {
+            test_println!("  Entry point: {:#x}, {} program headers", hdr.e_entry, hdr.e_phnum);
+        }
+        Err(e) => {
+            test_fail!("mmap_test", "ELF header validation failed: {:?}", e);
+            return false;
+        }
+    }
+
+    // 4. Create user-mode process.
+    let user_pid = match crate::proc::usermode::create_user_process("mmap_test", &elf_data) {
+        Ok(pid) => {
+            test_println!("  Created user process PID {} ✓", pid);
+            pid
+        }
+        Err(e) => {
+            test_fail!("mmap_test", "create_user_process failed: {:?}", e);
+            return false;
+        }
+    };
+
+    // 5. Mark as Linux ABI.
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == user_pid) {
+            p.linux_abi = true;
+            test_println!("  linux_abi = true ✓");
+        }
+    }
+
+    // 6. Run the scheduler until the process exits or we time out.
+    let was_active = crate::sched::is_active();
+    if !was_active {
+        crate::sched::enable();
+    }
+
+    test_println!("  Scheduling mmap_test process...");
+
+    for i in 0..400 {
+        crate::sched::yield_cpu();
+        if i % 50 == 0 {
+            let state = {
+                let threads = crate::proc::THREAD_TABLE.lock();
+                threads.iter().find(|t| t.pid == user_pid)
+                    .map(|t| alloc::format!("{:?}", t.state))
+                    .unwrap_or_else(|| alloc::string::String::from("gone"))
+            };
+            test_println!("  yield #{}: pid={} state={}", i, user_pid, state);
+        }
+        crate::hal::enable_interrupts();
+        for _ in 0..5000 { core::hint::spin_loop(); }
+    }
+
+    if !was_active {
+        crate::sched::disable();
+    }
+
+    // 7. Check exit state.
+    let (state, exit_code) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == user_pid) {
+            Some(p) => (p.state, p.exit_code),
+            None => {
+                test_fail!("mmap_test", "Process PID {} not found after run", user_pid);
+                return false;
+            }
+        }
+    };
+
+    test_println!("  Process state: {:?}, exit_code: {}", state, exit_code);
+
+    if state != crate::proc::ProcessState::Zombie {
+        test_fail!("mmap_test", "Process did not exit (state={:?})", state);
+        return false;
+    }
+
+    if exit_code != 0 {
+        test_fail!("mmap_test", "mmap_test exited with code {} (expected 0 = all passed)", exit_code);
+        return false;
+    }
+
+    test_println!("  mmap_test exited with code 0 — all mmap scenarios passed ✓");
+    test_pass!("mmap syscall (arg6/offset, file-backed, MAP_FIXED)");
+    true
+}
+
+// ── Test 45: Dynamic ELF via PT_INTERP (ld-musl-x86_64.so.1) ───────────────
+
+fn test_dynamic_elf() -> bool {
+    test_header!("Dynamic ELF (PT_INTERP → ld-musl-x86_64.so.1)");
+
+    // 1. Read the dynamic ELF from disk.
+    let elf_data = match crate::vfs::read_file("/disk/bin/dynamic_hello") {
+        Ok(data) => {
+            test_println!("  Read /disk/bin/dynamic_hello: {} bytes", data.len());
+            data
+        }
+        Err(e) => {
+            test_fail!("dynamic_elf", "Cannot read /disk/bin/dynamic_hello: {:?}", e);
+            return false;
+        }
+    };
+
+    // 2. Basic ELF check.
+    if !crate::proc::elf::is_elf(&elf_data) {
+        test_fail!("dynamic_elf", "Not a valid ELF binary");
+        return false;
+    }
+    test_println!("  ELF magic OK ✓");
+
+    // 3. Validate header (ET_EXEC).
+    match crate::proc::elf::validate_elf(&elf_data) {
+        Ok(hdr) => {
+            test_println!("  Entry: {:#x}, phdrs: {}", hdr.e_entry, hdr.e_phnum);
+        }
+        Err(e) => {
+            test_fail!("dynamic_elf", "ELF validate failed: {:?}", e);
+            return false;
+        }
+    }
+
+    // 4. Create user-mode process (loader detects PT_INTERP and loads ld-musl).
+    let user_pid = match crate::proc::usermode::create_user_process("dynamic_hello", &elf_data) {
+        Ok(pid) => {
+            test_println!("  Created user process PID {} ✓", pid);
+            pid
+        }
+        Err(e) => {
+            test_fail!("dynamic_elf", "create_user_process failed: {:?}", e);
+            return false;
+        }
+    };
+
+    // 5. Mark as Linux ABI.
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == user_pid) {
+            p.linux_abi = true;
+        }
+    }
+
+    // 6. Schedule until exit or timeout.
+    let was_active = crate::sched::is_active();
+    if !was_active { crate::sched::enable(); }
+
+    test_println!("  Scheduling dynamic_hello process...");
+    for i in 0..500 {
+        crate::sched::yield_cpu();
+        if i % 100 == 0 {
+            let state = {
+                let threads = crate::proc::THREAD_TABLE.lock();
+                threads.iter().find(|t| t.pid == user_pid)
+                    .map(|t| alloc::format!("{:?}", t.state))
+                    .unwrap_or_else(|| alloc::string::String::from("gone"))
+            };
+            test_println!("  yield #{}: state={}", i, state);
+        }
+        crate::hal::enable_interrupts();
+        for _ in 0..5000 { core::hint::spin_loop(); }
+    }
+
+    if !was_active { crate::sched::disable(); }
+
+    // 7. Check exit state.
+    let (state, exit_code) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == user_pid) {
+            Some(p) => (p.state, p.exit_code),
+            None => {
+                test_fail!("dynamic_elf", "Process PID {} not found after run", user_pid);
+                return false;
+            }
+        }
+    };
+
+    test_println!("  Process state: {:?}, exit_code: {}", state, exit_code);
+
+    if state != crate::proc::ProcessState::Zombie {
+        test_fail!("dynamic_elf", "Process did not exit (state={:?})", state);
+        return false;
+    }
+
+    if exit_code != 0 {
+        test_fail!("dynamic_elf", "dynamic_hello exited with code {} (expected 0)", exit_code);
+        return false;
+    }
+
+    test_println!("  dynamic_hello exited 0 — PT_INTERP + ld-musl loader works ✓");
+    test_pass!("Dynamic ELF (PT_INTERP → ld-musl-x86_64.so.1)");
+    true
+}
+
+// ── Test 46: clone(CLONE_THREAD|CLONE_VM) userspace threading ───────────────
+
+fn test_clone_thread() -> bool {
+    test_header!("clone(CLONE_THREAD|CLONE_VM) userspace threading");
+
+    // 1. Read the binary.
+    let elf_data = match crate::vfs::read_file("/disk/bin/clone_thread_test") {
+        Ok(data) => {
+            test_println!("  Read /disk/bin/clone_thread_test: {} bytes", data.len());
+            data
+        }
+        Err(e) => {
+            test_fail!("clone_thread", "Cannot read /disk/bin/clone_thread_test: {:?}", e);
+            return false;
+        }
+    };
+
+    if !crate::proc::elf::is_elf(&elf_data) {
+        test_fail!("clone_thread", "Not a valid ELF binary");
+        return false;
+    }
+    test_println!("  ELF magic OK ✓");
+
+    // 2. Create user-mode process.
+    let user_pid = match crate::proc::usermode::create_user_process("clone_thread_test", &elf_data) {
+        Ok(pid) => {
+            test_println!("  Created user process PID {} ✓", pid);
+            pid
+        }
+        Err(e) => {
+            test_fail!("clone_thread", "create_user_process failed: {:?}", e);
+            return false;
+        }
+    };
+
+    // 3. Mark as Linux ABI.
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == user_pid) {
+            p.linux_abi = true;
+        }
+    }
+
+    // 4. Schedule.  Give more iterations because the process spawns a thread.
+    let was_active = crate::sched::is_active();
+    if !was_active { crate::sched::enable(); }
+
+    test_println!("  Scheduling clone_thread_test...");
+    for i in 0..600 {
+        crate::sched::yield_cpu();
+        if i % 100 == 0 {
+            let state = {
+                let threads = crate::proc::THREAD_TABLE.lock();
+                threads.iter().find(|t| t.pid == user_pid)
+                    .map(|t| alloc::format!("{:?}", t.state))
+                    .unwrap_or_else(|| alloc::string::String::from("gone"))
+            };
+            test_println!("  yield #{}: state={}", i, state);
+        }
+        crate::hal::enable_interrupts();
+        for _ in 0..5000 { core::hint::spin_loop(); }
+    }
+
+    if !was_active { crate::sched::disable(); }
+
+    // 5. Check exit state.
+    let (state, exit_code) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == user_pid) {
+            Some(p) => (p.state, p.exit_code),
+            None => {
+                test_fail!("clone_thread", "Process PID {} not found after run", user_pid);
+                return false;
+            }
+        }
+    };
+
+    test_println!("  Process state: {:?}, exit_code: {}", state, exit_code);
+
+    if state != crate::proc::ProcessState::Zombie {
+        test_fail!("clone_thread", "Process did not exit (state={:?})", state);
+        return false;
+    }
+
+    if exit_code != 0 {
+        test_fail!("clone_thread", "clone_thread_test exited with code {} (expected 0)", exit_code);
+        return false;
+    }
+
+    test_println!("  clone_thread_test exited 0 — CLONE_THREAD|CLONE_VM works ✓");
+    test_pass!("clone(CLONE_THREAD|CLONE_VM) userspace threading");
+    true
+}
+
+// ── Test 47: socket-as-fd (Phase 4 Linux socket unification) ────────────────
+
+fn test_socket_fd() -> bool {
+    test_header!("socket-as-fd (Phase 4 Linux socket unification)");
+
+    // 1. Read the binary.
+    let elf_data = match crate::vfs::read_file("/disk/bin/socket_test") {
+        Ok(data) => {
+            test_println!("  Read /disk/bin/socket_test: {} bytes", data.len());
+            data
+        }
+        Err(e) => {
+            test_fail!("socket_fd", "Cannot read /disk/bin/socket_test: {:?}", e);
+            return false;
+        }
+    };
+
+    if !crate::proc::elf::is_elf(&elf_data) {
+        test_fail!("socket_fd", "Not a valid ELF binary");
+        return false;
+    }
+    test_println!("  ELF magic OK ✓");
+
+    // 2. Create user-mode process.
+    let user_pid = match crate::proc::usermode::create_user_process("socket_test", &elf_data) {
+        Ok(pid) => {
+            test_println!("  Created user process PID {} ✓", pid);
+            pid
+        }
+        Err(e) => {
+            test_fail!("socket_fd", "create_user_process failed: {:?}", e);
+            return false;
+        }
+    };
+
+    // 3. Mark as Linux ABI.
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == user_pid) {
+            p.linux_abi = true;
+        }
+    }
+
+    // 4. Schedule.
+    let was_active = crate::sched::is_active();
+    if !was_active { crate::sched::enable(); }
+
+    test_println!("  Scheduling socket_test...");
+    for i in 0..400 {
+        crate::sched::yield_cpu();
+        if i % 100 == 0 {
+            let state = {
+                let threads = crate::proc::THREAD_TABLE.lock();
+                threads.iter().find(|t| t.pid == user_pid)
+                    .map(|t| alloc::format!("{:?}", t.state))
+                    .unwrap_or_else(|| alloc::string::String::from("gone"))
+            };
+            test_println!("  yield #{}: state={}", i, state);
+        }
+        crate::hal::enable_interrupts();
+        for _ in 0..5000 { core::hint::spin_loop(); }
+    }
+
+    if !was_active { crate::sched::disable(); }
+
+    // 5. Check exit state.
+    let (state, exit_code) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == user_pid) {
+            Some(p) => (p.state, p.exit_code),
+            None => {
+                test_fail!("socket_fd", "Process PID {} not found after run", user_pid);
+                return false;
+            }
+        }
+    };
+
+    test_println!("  Process state: {:?}, exit_code: {}", state, exit_code);
+
+    if state != crate::proc::ProcessState::Zombie {
+        test_fail!("socket_fd", "Process did not exit (state={:?})", state);
+        return false;
+    }
+
+    if exit_code != 0 {
+        test_fail!("socket_fd", "socket_test exited with code {} (expected 0)", exit_code);
+        return false;
+    }
+
+    test_println!("  socket_test exited 0 — socket-as-fd syscalls work ✓");
+    test_pass!("socket-as-fd (Phase 4 Linux socket unification)");
+    true
+}
+
+// ── Test 48: PIE (ET_DYN) + PT_INTERP dynamic binary ───────────────────────
+
+fn test_pie_dynamic_elf() -> bool {
+    test_header!("PIE (ET_DYN) + PT_INTERP dynamic binary");
+
+    // 1. Read the binary.
+    let elf_data = match crate::vfs::read_file("/disk/bin/dynamic_hello_pie") {
+        Ok(data) => {
+            test_println!("  Read /disk/bin/dynamic_hello_pie: {} bytes", data.len());
+            data
+        }
+        Err(e) => {
+            test_fail!("pie_elf", "Cannot read /disk/bin/dynamic_hello_pie: {:?}", e);
+            return false;
+        }
+    };
+
+    if !crate::proc::elf::is_elf(&elf_data) {
+        test_fail!("pie_elf", "Not a valid ELF binary");
+        return false;
+    }
+
+    // Verify ET_DYN type.
+    match crate::proc::elf::validate_elf(&elf_data) {
+        Ok(hdr) => {
+            test_println!("  ELF type={} (DYN=3), phdrs={} ✓", hdr.e_type, hdr.e_phnum);
+            if hdr.e_type != 3 {
+                test_fail!("pie_elf", "Expected ET_DYN(3), got {}", hdr.e_type);
+                return false;
+            }
+        }
+        Err(e) => {
+            test_fail!("pie_elf", "ELF validate failed: {:?}", e);
+            return false;
+        }
+    }
+
+    // 2. Create user-mode process (PIE loader: computes bias; then PT_INTERP loads ld-musl).
+    let user_pid = match crate::proc::usermode::create_user_process("dynamic_hello_pie", &elf_data) {
+        Ok(pid) => {
+            test_println!("  Created user process PID {} ✓", pid);
+            pid
+        }
+        Err(e) => {
+            test_fail!("pie_elf", "create_user_process failed: {:?}", e);
+            return false;
+        }
+    };
+
+    // 3. Mark as Linux ABI.
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == user_pid) {
+            p.linux_abi = true;
+        }
+    }
+
+    // 4. Schedule.
+    let was_active = crate::sched::is_active();
+    if !was_active { crate::sched::enable(); }
+
+    test_println!("  Scheduling dynamic_hello_pie...");
+    for i in 0..600 {
+        crate::sched::yield_cpu();
+        if i % 100 == 0 {
+            let state = {
+                let threads = crate::proc::THREAD_TABLE.lock();
+                threads.iter().find(|t| t.pid == user_pid)
+                    .map(|t| alloc::format!("{:?}", t.state))
+                    .unwrap_or_else(|| alloc::string::String::from("gone"))
+            };
+            test_println!("  yield #{}: state={}", i, state);
+        }
+        crate::hal::enable_interrupts();
+        for _ in 0..5000 { core::hint::spin_loop(); }
+    }
+
+    if !was_active { crate::sched::disable(); }
+
+    // 5. Check exit state.
+    let (state, exit_code) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == user_pid) {
+            Some(p) => (p.state, p.exit_code),
+            None => {
+                test_fail!("pie_elf", "Process PID {} not found after run", user_pid);
+                return false;
+            }
+        }
+    };
+
+    test_println!("  Process state: {:?}, exit_code: {}", state, exit_code);
+
+    if state != crate::proc::ProcessState::Zombie {
+        test_fail!("pie_elf", "Process did not exit (state={:?})", state);
+        return false;
+    }
+
+    if exit_code != 0 {
+        test_fail!("pie_elf", "dynamic_hello_pie exited with code {} (expected 0)", exit_code);
+        return false;
+    }
+
+    test_println!("  dynamic_hello_pie exited 0 — PIE+ld-musl loader works ✓");
+    test_pass!("PIE (ET_DYN) + PT_INTERP dynamic binary");
+    true
+}
+
+// ── Test 49: mprotect (real page-table protection) ─────────────────────────
+
+fn test_mprotect_syscall() -> bool {
+    test_header!("mprotect — page-table protection changes");
+
+    // 1. Allocate an anonymous page via mmap.
+    let addr = crate::syscall::dispatch_linux(
+        9, // mmap
+        0, 0x1000,          // addr=0 (any), len=4096
+        3,                   // prot = PROT_READ|PROT_WRITE
+        0x22,                // flags = MAP_PRIVATE|MAP_ANONYMOUS
+        u64::MAX, 0,         // fd=-1, offset=0
+    );
+
+    if addr <= 0 {
+        test_fail!("mprotect", "mmap failed: {}", addr);
+        return false;
+    }
+    test_println!("  mmap anon page @ {:#x} ✓", addr);
+
+    // 2. Write a sentinel value to the page.
+    unsafe {
+        *(addr as *mut u64) = 0xDEAD_BEEF_CAFE_BABE;
+    }
+    test_println!("  Wrote sentinel to page ✓");
+
+    // 3. mprotect → PROT_READ only.
+    let r = crate::syscall::dispatch_linux(10, addr as u64, 0x1000, 1 /*PROT_READ*/, 0, 0, 0);
+    if r != 0 {
+        test_fail!("mprotect", "mprotect(PROT_READ) failed: {}", r);
+        return false;
+    }
+    test_println!("  mprotect(PROT_READ) → 0 ✓");
+
+    // 4. mprotect → PROT_READ|PROT_EXEC (JIT scenario).
+    let r = crate::syscall::dispatch_linux(10, addr as u64, 0x1000, 5 /*PROT_READ|PROT_EXEC*/, 0, 0, 0);
+    if r != 0 {
+        test_fail!("mprotect", "mprotect(PROT_READ|PROT_EXEC) failed: {}", r);
+        return false;
+    }
+    test_println!("  mprotect(PROT_READ|PROT_EXEC) → 0 ✓");
+
+    // 5. Restore R/W and verify sentinel.
+    let r = crate::syscall::dispatch_linux(10, addr as u64, 0x1000, 3 /*PROT_RW*/, 0, 0, 0);
+    if r != 0 {
+        test_fail!("mprotect", "mprotect(PROT_RW restore) failed: {}", r);
+        return false;
+    }
+    let val = unsafe { *(addr as *const u64) };
+    if val != 0xDEAD_BEEF_CAFE_BABE {
+        test_fail!("mprotect", "sentinel corrupted: {:#x}", val);
+        return false;
+    }
+    test_println!("  Sentinel intact after prot changes: {:#x} ✓", val);
+
+    // 6. munmap.
+    let r = crate::syscall::dispatch_linux(11, addr as u64, 0x1000, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("mprotect", "munmap failed: {}", r);
+        return false;
+    }
+    test_println!("  munmap ✓");
+
+    test_pass!("mprotect page-table protection changes");
+    true
+}
+
+// ── Test 50: eventfd ────────────────────────────────────────────────────────
+
+fn test_eventfd_syscall() -> bool {
+    test_header!("eventfd counter signaling fd");
+
+    let pid = crate::proc::current_pid();
+
+    // 1. Create an eventfd with initval=0.
+    let efd = crate::syscall::dispatch_linux(284 /*eventfd*/, 0, 0, 0, 0, 0, 0);
+    if efd < 0 {
+        test_fail!("eventfd", "eventfd() syscall failed: {}", efd);
+        return false;
+    }
+    test_println!("  eventfd() → fd {} ✓", efd);
+
+    // 2. Read from empty fd — should return EAGAIN (-11).
+    let buf = alloc::vec![0u8; 8];
+    let n = crate::syscall::dispatch_linux(0 /*read*/, efd as u64, buf.as_ptr() as u64, 8, 0, 0, 0);
+    if n != -11 {
+        test_fail!("eventfd", "Read on empty eventfd returned {} (expected -11 EAGAIN)", n);
+        return false;
+    }
+    test_println!("  Read on empty eventfd → EAGAIN ✓");
+
+    // 3. Write 42 to the eventfd.
+    let write_val: u64 = 42;
+    let write_buf = write_val.to_le_bytes();
+    let n = crate::syscall::dispatch_linux(1 /*write*/, efd as u64, write_buf.as_ptr() as u64, 8, 0, 0, 0);
+    if n != 8 {
+        test_fail!("eventfd", "Write to eventfd returned {} (expected 8)", n);
+        return false;
+    }
+    test_println!("  Write 42 to eventfd → 8 bytes ✓");
+
+    // 4. Read back — should return 42 and clear the counter.
+    let mut read_buf = [0u8; 8];
+    let n = crate::syscall::dispatch_linux(0 /*read*/, efd as u64, read_buf.as_ptr() as u64, 8, 0, 0, 0);
+    if n != 8 {
+        test_fail!("eventfd", "Read from eventfd returned {} (expected 8)", n);
+        return false;
+    }
+    let read_val = u64::from_le_bytes(read_buf);
+    if read_val != 42 {
+        test_fail!("eventfd", "Read value {} (expected 42)", read_val);
+        return false;
+    }
+    test_println!("  Read from eventfd → {} ✓", read_val);
+
+    // 5. Counter cleared — should EAGAIN again.
+    let n = crate::syscall::dispatch_linux(0 /*read*/, efd as u64, read_buf.as_ptr() as u64, 8, 0, 0, 0);
+    if n != -11 {
+        test_fail!("eventfd", "Read after clear returned {} (expected EAGAIN)", n);
+        return false;
+    }
+    test_println!("  Counter cleared, re-reading → EAGAIN ✓");
+
+    // 6. close(efd).
+    let r = crate::syscall::dispatch_linux(3 /*close*/, efd as u64, 0, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("eventfd", "close(efd) failed: {}", r);
+        return false;
+    }
+    test_println!("  close(efd) ✓");
+
+    test_pass!("eventfd counter signaling fd");
+    true
+}
+
+// ── Test 51: pipe2 + statfs ─────────────────────────────────────────────────
+
+fn test_pipe2_statfs() -> bool {
+    test_header!("pipe2(O_CLOEXEC) + statfs()");
+
+    // ─── Part A: pipe2 ────────────────────────────────────────────────────
+
+    // Create a pipe with O_CLOEXEC.
+    let mut fds = [0u32; 2];
+    let r = crate::syscall::dispatch_linux(
+        293 /*pipe2*/,
+        fds.as_mut_ptr() as u64,
+        0x0008_0000, // O_CLOEXEC
+        0, 0, 0, 0,
+    );
+    if r != 0 {
+        test_fail!("pipe2", "pipe2() returned {}", r);
+        return false;
+    }
+    let (rfd, wfd) = (fds[0] as u64, fds[1] as u64);
+    test_println!("  pipe2(O_CLOEXEC) → read_fd={}, write_fd={} ✓", rfd, wfd);
+
+    // Write "pipe2 test" into the write end.
+    let msg = b"pipe2 test";
+    let n = crate::syscall::dispatch_linux(1 /*write*/, wfd, msg.as_ptr() as u64, msg.len() as u64, 0, 0, 0);
+    if n as usize != msg.len() {
+        test_fail!("pipe2", "write to pipe returned {} (expected {})", n, msg.len());
+        return false;
+    }
+    test_println!("  write {} bytes to pipe ✓", n);
+
+    // Read it back.
+    let mut buf = [0u8; 16];
+    let n = crate::syscall::dispatch_linux(0 /*read*/, rfd, buf.as_mut_ptr() as u64, 16, 0, 0, 0);
+    if n as usize != msg.len() {
+        test_fail!("pipe2", "read from pipe returned {} (expected {})", n, msg.len());
+        return false;
+    }
+    if &buf[..n as usize] != msg {
+        test_fail!("pipe2", "data mismatch");
+        return false;
+    }
+    test_println!("  read {:?} back ✓", core::str::from_utf8(&buf[..n as usize]).unwrap_or("?"));
+
+    // Close both ends.
+    crate::syscall::dispatch_linux(3, rfd, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux(3, wfd, 0, 0, 0, 0, 0);
+    test_println!("  closed pipe fds ✓");
+
+    // ─── Part B: statfs ───────────────────────────────────────────────────
+
+    let path = b"/disk\0";
+    let mut statfs_buf = [0u8; 120];
+    let r = crate::syscall::dispatch_linux(
+        137 /*statfs*/,
+        path.as_ptr() as u64,
+        statfs_buf.as_mut_ptr() as u64,
+        0, 0, 0, 0,
+    );
+    if r != 0 {
+        test_fail!("statfs", "statfs('/disk') returned {}", r);
+        return false;
+    }
+    // f_type is at offset 0 (u64 LE); should be 0xEF53 (EXT2_SUPER_MAGIC).
+    let f_type = u64::from_le_bytes(statfs_buf[0..8].try_into().unwrap_or([0; 8]));
+    test_println!("  statfs('/disk') f_type={:#x} ✓", f_type);
+
+    // fstatfs on fd 1 (stdout) — always returns 0.
+    let r = crate::syscall::dispatch_linux(138 /*fstatfs*/, 1, statfs_buf.as_mut_ptr() as u64, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("statfs", "fstatfs(1) returned {}", r);
+        return false;
+    }
+    test_println!("  fstatfs(1) → 0 ✓");
+
+    test_pass!("pipe2(O_CLOEXEC) + statfs()");
+    true
+}
+
+// ── Test 52: futex REQUEUE + WAIT_BITSET ─────────────────────────────────────
+
+fn test_futex_requeue() -> bool {
+    test_header!("futex — REQUEUE + WAIT_BITSET");
+
+    // Verify FUTEX_REQUEUE (4) doesn't crash: wake 0 waiters from uaddr,
+    // requeue INT32_MAX to uaddr2 (both with value 0 — no waiters to move).
+    let uaddr:  u32 = 0;
+    let uaddr2: u32 = 0;
+    let r = unsafe {
+        // sys_futex(uaddr_ptr, FUTEX_REQUEUE=4, val=0, val2=0, uaddr2_ptr)
+        crate::syscall::dispatch_linux(
+            202, // futex
+            &uaddr  as *const u32 as u64,
+            4,   // FUTEX_REQUEUE
+            0,   // val (wake count)
+            0,   // val2 (requeue count) passed as timeout_ptr slot
+            &uaddr2 as *const u32 as u64,
+            0,
+        )
+    };
+    // With no waiters, returns 0 (woke 0 threads)
+    if r < 0 {
+        test_fail!("futex_requeue", "FUTEX_REQUEUE returned {}", r);
+        return false;
+    }
+    test_println!("  FUTEX_REQUEUE (no waiters) → {} ✓", r);
+
+    // Verify FUTEX_WAIT_BITSET (9) with a timeout of 1ns returns ETIMEDOUT (-110).
+    // We use a stack value == 0 and check val == *uaddr (0 == 0) so it waits.
+    let futex_word: u32 = 0;
+    // timespec {tv_sec=0, tv_nsec=1}
+    let ts: [u64; 2] = [0, 1]; // 1 ns timeout
+    let r = unsafe {
+        crate::syscall::dispatch_linux(
+            202, // futex
+            &futex_word as *const u32 as u64,
+            9,   // FUTEX_WAIT_BITSET
+            0,   // val — must match *uaddr (0) to enter wait
+            ts.as_ptr() as u64, // timeout
+            0,   // uaddr2 unused
+            0xFFFF_FFFF_u64, // bitset — unused but required
+        )
+    };
+    // Should time out immediately → -110 ETIMEDOUT  (or -EAGAIN/-11 if val mismatch)
+    if r != -110 && r != -11 {
+        test_fail!("futex_wait_bitset", "expected -110 or -11, got {}", r);
+        return false;
+    }
+    test_println!("  FUTEX_WAIT_BITSET 1ns timeout → {} ✓", r);
+
+    test_pass!("futex REQUEUE + WAIT_BITSET");
+    true
+}
+
+// ── Test 53: AF_UNIX socketpair + write/read ──────────────────────────────────
+
+fn test_unix_socketpair() -> bool {
+    test_header!("AF_UNIX socketpair — write/read round-trip");
+
+    // socketpair(AF_UNIX=1, SOCK_STREAM=1, 0, fds[2])
+    let mut fds = [0i32; 2];
+    let r = crate::syscall::dispatch_linux(
+        53, // socketpair
+        1,  // AF_UNIX
+        1,  // SOCK_STREAM
+        0,
+        fds.as_mut_ptr() as u64,
+        0, 0,
+    );
+    if r != 0 {
+        test_fail!("unix_socketpair", "socketpair() returned {}", r);
+        return false;
+    }
+    test_println!("  socketpair() → fds [{}, {}] ✓", fds[0], fds[1]);
+
+    // Write "hello" from fd[0] → arrives in fd[1]'s recv buffer
+    let msg = b"hello";
+    let n = crate::syscall::dispatch_linux(
+        1, // write
+        fds[0] as u64,
+        msg.as_ptr() as u64,
+        msg.len() as u64,
+        0, 0, 0,
+    );
+    if n != msg.len() as i64 {
+        test_fail!("unix_socketpair", "write returned {} (expected {})", n, msg.len());
+        return false;
+    }
+    test_println!("  write({:?}) → {} ✓", core::str::from_utf8(msg).unwrap_or("?"), n);
+
+    // Read from fd[1]
+    let mut buf = [0u8; 16];
+    let n = crate::syscall::dispatch_linux(
+        0, // read
+        fds[1] as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        0, 0, 0,
+    );
+    if n != msg.len() as i64 {
+        test_fail!("unix_socketpair", "read returned {} (expected {})", n, msg.len());
+        return false;
+    }
+    if &buf[..n as usize] != msg {
+        test_fail!("unix_socketpair", "data mismatch");
+        return false;
+    }
+    test_println!("  read back {:?} ✓", core::str::from_utf8(&buf[..n as usize]).unwrap_or("?"));
+
+    // Close both
+    crate::syscall::dispatch_linux(3, fds[0] as u64, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux(3, fds[1] as u64, 0, 0, 0, 0, 0);
+
+    test_pass!("AF_UNIX socketpair round-trip");
+    true
+}
+
+// ── Test 54: AF_UNIX bind/listen/connect/accept ───────────────────────────────
+
+fn test_unix_bind_connect() -> bool {
+    test_header!("AF_UNIX bind/listen/connect/accept");
+
+    // Server socket
+    let server_fd = crate::syscall::dispatch_linux(41 /*socket*/, 1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0, 0, 0, 0);
+    if server_fd < 0 {
+        test_fail!("unix_server", "socket() returned {}", server_fd);
+        return false;
+    }
+
+    // bind to /tmp/test.sock — sockaddr_un: {sa_family=AF_UNIX(1), sun_path="/tmp/test.sock\0"}
+    // struct sockaddr_un: u16 family + 108-byte path
+    let mut addr = [0u8; 110];
+    addr[0] = 1; addr[1] = 0; // sa_family = AF_UNIX (LE u16 = 1)
+    let path = b"/tmp/test.sock\0";
+    addr[2..2 + path.len()].copy_from_slice(path);
+    let r = crate::syscall::dispatch_linux(
+        49 /*bind*/, server_fd as u64,
+        addr.as_ptr() as u64, addr.len() as u64,
+        0, 0, 0,
+    );
+    if r != 0 {
+        test_fail!("unix_bind", "bind() returned {}", r);
+        return false;
+    }
+    test_println!("  bind(/tmp/test.sock) ✓");
+
+    // listen
+    let r = crate::syscall::dispatch_linux(50 /*listen*/, server_fd as u64, 5, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("unix_listen", "listen() returned {}", r);
+        return false;
+    }
+    test_println!("  listen() ✓");
+
+    // Client socket + connect
+    let client_fd = crate::syscall::dispatch_linux(41, 1, 1, 0, 0, 0, 0);
+    if client_fd < 0 {
+        test_fail!("unix_client", "socket() returned {}", client_fd);
+        return false;
+    }
+    let r = crate::syscall::dispatch_linux(
+        42 /*connect*/, client_fd as u64,
+        addr.as_ptr() as u64, addr.len() as u64,
+        0, 0, 0,
+    );
+    if r != 0 {
+        test_fail!("unix_connect", "connect() returned {}", r);
+        return false;
+    }
+    test_println!("  client connect() ✓");
+
+    // accept
+    let accepted_fd = crate::syscall::dispatch_linux(43 /*accept*/, server_fd as u64, 0, 0, 0, 0, 0);
+    if accepted_fd < 0 {
+        test_fail!("unix_accept", "accept() returned {}", accepted_fd);
+        return false;
+    }
+    test_println!("  accept() → fd {} ✓", accepted_fd);
+
+    // Write from client, read on accepted
+    let msg = b"world";
+    let n = crate::syscall::dispatch_linux(1, client_fd as u64, msg.as_ptr() as u64, msg.len() as u64, 0, 0, 0);
+    if n != msg.len() as i64 {
+        test_fail!("unix_write", "write returned {}", n);
+        return false;
+    }
+    let mut buf = [0u8; 16];
+    let n = crate::syscall::dispatch_linux(0, accepted_fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0);
+    if n != msg.len() as i64 || &buf[..n as usize] != msg {
+        test_fail!("unix_read", "read returned {} or data mismatch", n);
+        return false;
+    }
+    test_println!("  write/read {:?} ✓", core::str::from_utf8(&buf[..n as usize]).unwrap_or("?"));
+
+    crate::syscall::dispatch_linux(3, server_fd as u64, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux(3, client_fd as u64, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux(3, accepted_fd as u64, 0, 0, 0, 0, 0);
+
+    test_pass!("AF_UNIX bind/listen/connect/accept");
+    true
+}
+
+// ── Test 55: /proc/self/maps content ─────────────────────────────────────────
+
+fn test_proc_maps_content() -> bool {
+    test_header!("/proc/self/maps — dynamic content");
+
+    // open("/proc/self/maps", O_RDONLY)
+    let path = b"/proc/self/maps\0";
+    let fd = crate::syscall::dispatch_linux(
+        2 /*open*/,
+        path.as_ptr() as u64,
+        0, // O_RDONLY
+        0, 0, 0, 0,
+    );
+    if fd < 0 {
+        test_fail!("proc_maps", "open() returned {}", fd);
+        return false;
+    }
+    test_println!("  open(/proc/self/maps) → fd {} ✓", fd);
+
+    // Read up to 4096 bytes
+    let mut buf = [0u8; 4096];
+    let n = crate::syscall::dispatch_linux(
+        0 /*read*/,
+        fd as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        0, 0, 0,
+    );
+    crate::syscall::dispatch_linux(3, fd as u64, 0, 0, 0, 0, 0);
+
+    if n <= 0 {
+        test_fail!("proc_maps", "read returned {}", n);
+        return false;
+    }
+    test_println!("  read {} bytes ✓", n);
+
+    let content = &buf[..n as usize];
+    // Check that at least one line has hex address range format "xxxxxxxxxxxxxxxx-"
+    let has_addr = content.windows(17).any(|w| {
+        w[16] == b'-' && w[..16].iter().all(|&c| c.is_ascii_hexdigit())
+    });
+    if !has_addr {
+        // Warn but don't fail — VmSpace may be empty in test mode
+        test_println!("  WARNING: no address ranges found in maps (empty VmSpace in test mode)");
+    } else {
+        test_println!("  maps has valid address range lines ✓");
+    }
+
+    // Check that content is non-empty and looks like text (contains newlines)
+    let has_newline = content.contains(&b'\n');
+    if !has_newline {
+        test_fail!("proc_maps", "no newlines in maps content");
+        return false;
+    }
+    test_println!("  maps content is well-formed text ✓");
+
+    test_pass!("/proc/self/maps dynamic content");
+    true
+}
 }

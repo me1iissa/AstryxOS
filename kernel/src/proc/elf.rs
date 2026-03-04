@@ -37,6 +37,18 @@ const EM_X86_64: u16 = 62;
 
 /// Program header type: loadable segment
 const PT_LOAD: u32 = 1;
+/// Program header type: interpreter path (e.g. "/lib/ld-musl-x86_64.so.1")
+const PT_INTERP: u32 = 3;
+/// Program header type: program header table location
+const PT_PHDR: u32 = 6;
+
+/// ELF type: dynamically-linked shared object / PIE
+const ET_DYN: u16 = 3;
+
+/// Virtual address at which the dynamic interpreter is loaded.
+/// Placed below the main stack: 0x7F00_0000_0000 has plenty of room for
+/// a 4 MiB interpreter without touching the stack at 0x7FFF_FFFF_0000.
+const INTERP_BASE: u64 = 0x7F00_0000_0000;
 
 /// Segment flags
 const PF_X: u32 = 1; // Execute
@@ -94,6 +106,7 @@ pub const AT_UID: u64     = 11;  // Real user ID
 pub const AT_EUID: u64    = 12;  // Effective user ID
 pub const AT_GID: u64     = 13;  // Real group ID
 pub const AT_EGID: u64    = 14;  // Effective group ID
+pub const AT_BASE: u64    = 7;   // Base address of interpreter
 pub const AT_RANDOM: u64  = 25;  // Address of 16 random bytes
 
 /// Result of loading an ELF binary.
@@ -133,6 +146,10 @@ pub enum ElfError {
     OutOfMemory,
     /// Segment address in kernel space.
     AddressInKernelSpace,
+    /// PT_INTERP path could not be found on the VFS.
+    InterpNotFound,
+    /// PT_INTERP binary failed to load.
+    InterpLoad,
 }
 
 impl From<ElfError> for astryx_shared::NtStatus {
@@ -148,11 +165,20 @@ impl From<ElfError> for astryx_shared::NtStatus {
             ElfError::NoLoadSegments => STATUS_INVALID_IMAGE_NO_LOAD,
             ElfError::OutOfMemory => STATUS_NO_MEMORY,
             ElfError::AddressInKernelSpace => STATUS_INVALID_IMAGE_KERNEL_ADDR,
+            ElfError::InterpNotFound => STATUS_INVALID_IMAGE_FORMAT,
+            ElfError::InterpLoad => STATUS_INVALID_IMAGE_FORMAT,
         }
     }
 }
 
+/// Virtual address used as load base for PIE (ET_DYN) main executables.
+/// The dynamic linker will relocate this, but we place it in a reasonable
+/// user-space range well below the interpreter at INTERP_BASE.
+const PIE_BASE: u64 = 0x0000_0000_0040_0000; // 4 MiB
+
 /// Validate and parse an ELF64 header.
+///
+/// Accepts both ET_EXEC (non-PIE) and ET_DYN (PIE) executables.
 pub fn validate_elf(data: &[u8]) -> Result<&Elf64Header, ElfError> {
     if data.len() < core::mem::size_of::<Elf64Header>() {
         return Err(ElfError::TooSmall);
@@ -169,7 +195,7 @@ pub fn validate_elf(data: &[u8]) -> Result<&Elf64Header, ElfError> {
     if header.e_ident[5] != ELFDATA2LSB {
         return Err(ElfError::NotLittleEndian);
     }
-    if header.e_type != ET_EXEC {
+    if header.e_type != ET_EXEC && header.e_type != ET_DYN {
         return Err(ElfError::NotExecutable);
     }
     if header.e_machine != EM_X86_64 {
@@ -182,7 +208,9 @@ pub fn validate_elf(data: &[u8]) -> Result<&Elf64Header, ElfError> {
 /// Load an ELF64 executable into a specific address space.
 ///
 /// Maps all PT_LOAD segments and allocates a user stack.
-/// Returns the entry point, stack pointer, and VMAs for Ring 3 execution.
+/// Handles PT_INTERP: if present, loads the interpreter (dynamic linker)
+/// at INTERP_BASE and sets it as the actual entry point, passing the
+/// main executable's entry via AT_ENTRY in the auxiliary vector.
 ///
 /// # Arguments
 /// * `data` — Complete ELF binary contents.
@@ -194,19 +222,63 @@ pub fn load_elf(data: &[u8], cr3: u64) -> Result<ElfLoadResult, ElfError> {
     let header = validate_elf(data)?;
     let mut allocated_pages: Vec<u64> = Vec::new();
     // Track pages mapped by THIS load_elf call, for overlap detection.
-    // (virt_to_phys_in can't be used because new_user deep-clones the
-    // identity map, making every low address appear "already mapped".)
     let mut mapped_pages: Vec<(u64, u64)> = Vec::new();
     let mut vmas: Vec<VmArea> = Vec::new();
     let mut load_base = u64::MAX;
     let mut load_end = 0u64;
     let mut has_load = false;
 
-    // Parse and load program headers.
+    // ── First pass: find PT_INTERP and PT_PHDR ──────────────────────
     let ph_offset = header.e_phoff as usize;
     let ph_size = header.e_phentsize as usize;
     let ph_count = header.e_phnum as usize;
 
+    let mut interp_path: Option<alloc::string::String> = None;
+    let mut phdr_vaddr: u64 = 0; // PT_PHDR virtual address (for AT_PHDR)
+
+    for i in 0..ph_count {
+        let offset = ph_offset + i * ph_size;
+        if offset + ph_size > data.len() { continue; }
+        let phdr = unsafe { &*(data.as_ptr().add(offset) as *const Elf64Phdr) };
+
+        if phdr.p_type == PT_PHDR {
+            phdr_vaddr = phdr.p_vaddr;
+        }
+        if phdr.p_type == PT_INTERP {
+            let path_start = phdr.p_offset as usize;
+            let path_end = path_start + phdr.p_filesz as usize;
+            if path_end <= data.len() {
+                let raw = &data[path_start..path_end];
+                // Strip null terminator
+                let raw = raw.split(|&b| b == 0).next().unwrap_or(raw);
+                interp_path = Some(alloc::string::String::from_utf8_lossy(raw).into_owned());
+            }
+        }
+    }
+
+    // ── Compute PIE bias for ET_DYN (PIE) main executables ──────────
+    // For ET_EXEC, bias = 0 (segments load at literal vaddr).
+    // For ET_DYN, we place the binary at PIE_BASE so it doesn't overlap
+    // with the kernel or the interpreter.
+    let pie_bias: u64 = if header.e_type == ET_DYN {
+        // Find minimum PT_LOAD vaddr to compute bias.
+        let mut min_vaddr = u64::MAX;
+        for i in 0..ph_count {
+            let offset = ph_offset + i * ph_size;
+            if offset + ph_size > data.len() { continue; }
+            let phdr = unsafe { &*(data.as_ptr().add(offset) as *const Elf64Phdr) };
+            if phdr.p_type == PT_LOAD && phdr.p_vaddr < min_vaddr {
+                min_vaddr = phdr.p_vaddr;
+            }
+        }
+        if min_vaddr == u64::MAX { 0 } else {
+            PIE_BASE.wrapping_sub(min_vaddr & !0xFFF)
+        }
+    } else {
+        0
+    };
+
+    // ── Second pass: load PT_LOAD segments ──────────────────────────
     for i in 0..ph_count {
         let offset = ph_offset + i * ph_size;
         if offset + ph_size > data.len() {
@@ -221,7 +293,7 @@ pub fn load_elf(data: &[u8], cr3: u64) -> Result<ElfLoadResult, ElfError> {
 
         has_load = true;
 
-        let vaddr = phdr.p_vaddr;
+        let vaddr = phdr.p_vaddr.wrapping_add(pie_bias); // bias=0 for ET_EXEC
         let memsz = phdr.p_memsz;
         let filesz = phdr.p_filesz;
         let file_offset = phdr.p_offset as usize;
@@ -359,17 +431,75 @@ pub fn load_elf(data: &[u8], cr3: u64) -> Result<ElfLoadResult, ElfError> {
         stack_pages.push((page_vaddr, phys));
     }
 
-    // Set up the Linux ABI initial stack: argc, argv, envp, auxvec.
+    // ── Load interpreter if PT_INTERP was found ─────────────────────
+    // For PIE binaries, apply the bias to get the actual loaded entry point.
+    let mut actual_entry = header.e_entry.wrapping_add(pie_bias);
+    let mut interp_base_for_auxv: u64 = 0;
+
+    if let Some(ref path) = interp_path {
+        // Map /lib/ld-musl-x86_64.so.1 → /disk/lib/ld-musl-x86_64.so.1
+        let disk_path = if path.starts_with('/') {
+            alloc::format!("/disk{}", path)
+        } else {
+            alloc::format!("/disk/{}", path)
+        };
+
+        crate::serial_println!("[ELF] PT_INTERP: loading interpreter '{}'", disk_path);
+
+        match crate::vfs::read_file(&disk_path) {
+            Ok(interp_data) => {
+                match load_elf_dyn(&interp_data, cr3, INTERP_BASE, &mut allocated_pages) {
+                    Ok(interp_entry) => {
+                        crate::serial_println!(
+                            "[ELF] Interpreter loaded at {:#x}, entry={:#x}",
+                            INTERP_BASE, interp_entry
+                        );
+                        actual_entry = interp_entry;
+                        interp_base_for_auxv = INTERP_BASE;
+                    }
+                    Err(e) => {
+                        crate::serial_println!("[ELF] Interpreter load failed: {:?}", e);
+                        return Err(ElfError::InterpLoad);
+                    }
+                }
+            }
+            Err(e) => {
+                crate::serial_println!("[ELF] Interpreter not found at '{}': {:?}", disk_path, e);
+                return Err(ElfError::InterpNotFound);
+            }
+        }
+    }
+
+    // ── Build extra auxvec entries for dynamic linking ───────────────
+    // AT_PHDR, AT_PHENT, AT_PHNUM: let the interpreter find the main binary's .dynamic
+    // AT_BASE: where the interpreter was loaded (0 for static binaries)
+    let mut extra_auxv: Vec<(u64, u64)> = Vec::new();
+    // AT_PHDR: address of the program headers in the loaded process
+    let loaded_phdr_vaddr = if phdr_vaddr != 0 {
+        phdr_vaddr.wrapping_add(pie_bias)
+    } else {
+        load_base.wrapping_add(header.e_phoff)
+    };
+    extra_auxv.push((AT_PHDR,  loaded_phdr_vaddr));
+    extra_auxv.push((AT_PHENT, header.e_phentsize as u64));
+    extra_auxv.push((AT_PHNUM, header.e_phnum as u64));
+    if interp_base_for_auxv != 0 {
+        extra_auxv.push((AT_BASE, interp_base_for_auxv));
+    }
+
+    // Sets up the Linux ABI initial stack: argc, argv, envp, auxvec.
+    // AT_ENTRY must be the REAL loaded entry (with PIE bias applied).
     let user_stack_ptr = setup_user_stack(
         &stack_pages,
         stack_bottom,
         &["astryx"],           // argv (program name placeholder)
         &["HOME=/", "PATH=/bin:/disk/bin"],  // envp
-        header.e_entry,        // entry point (for AT_ENTRY)
+        header.e_entry.wrapping_add(pie_bias), // AT_ENTRY
+        &extra_auxv,
     );
 
     Ok(ElfLoadResult {
-        entry_point: header.e_entry,
+        entry_point: actual_entry,  // interpreter entry if dynamic, else main entry
         user_stack_ptr,
         allocated_pages,
         load_base,
@@ -381,6 +511,114 @@ pub fn load_elf(data: &[u8], cr3: u64) -> Result<ElfLoadResult, ElfError> {
 /// Quick check: is this data an ELF binary?
 pub fn is_elf(data: &[u8]) -> bool {
     data.len() >= 4 && data[0..4] == ELF_MAGIC
+}
+
+/// Load an ET_DYN shared object (dynamic linker / shared library) at a fixed base.
+///
+/// All PT_LOAD segments are loaded with a bias so that the lowest-address
+/// segment starts at `base`. Returns the interpreter's entry point.
+///
+/// Pages are pushed into `allocated_pages` so the caller can free them on exit.
+fn load_elf_dyn(
+    data: &[u8],
+    cr3: u64,
+    base: u64,
+    allocated_pages: &mut Vec<u64>,
+) -> Result<u64, ElfError> {
+    if data.len() < core::mem::size_of::<Elf64Header>() {
+        return Err(ElfError::TooSmall);
+    }
+    let header = unsafe { &*(data.as_ptr() as *const Elf64Header) };
+    if header.e_ident[0..4] != ELF_MAGIC   { return Err(ElfError::BadMagic); }
+    if header.e_ident[4] != ELFCLASS64      { return Err(ElfError::Not64Bit); }
+    if header.e_ident[5] != ELFDATA2LSB     { return Err(ElfError::NotLittleEndian); }
+    if header.e_type != ET_DYN              { return Err(ElfError::NotExecutable); }
+    if header.e_machine != EM_X86_64       { return Err(ElfError::WrongArch); }
+
+    let ph_offset = header.e_phoff as usize;
+    let ph_size   = header.e_phentsize as usize;
+    let ph_count  = header.e_phnum as usize;
+
+    // Find the lowest PT_LOAD vaddr to compute the load bias.
+    let mut min_vaddr = u64::MAX;
+    for i in 0..ph_count {
+        let offset = ph_offset + i * ph_size;
+        if offset + ph_size > data.len() { continue; }
+        let phdr = unsafe { &*(data.as_ptr().add(offset) as *const Elf64Phdr) };
+        if phdr.p_type == PT_LOAD && phdr.p_vaddr < min_vaddr {
+            min_vaddr = phdr.p_vaddr;
+        }
+    }
+    if min_vaddr == u64::MAX { return Err(ElfError::NoLoadSegments); }
+
+    // bias = base - page-aligned min_vaddr
+    let bias = base.wrapping_sub(min_vaddr & !0xFFF);
+    let mut mapped_pages: Vec<(u64, u64)> = Vec::new();
+
+    for i in 0..ph_count {
+        let offset = ph_offset + i * ph_size;
+        if offset + ph_size > data.len() { continue; }
+        let phdr = unsafe { &*(data.as_ptr().add(offset) as *const Elf64Phdr) };
+        if phdr.p_type != PT_LOAD { continue; }
+
+        let vaddr     = phdr.p_vaddr.wrapping_add(bias);
+        let memsz     = phdr.p_memsz;
+        let filesz    = phdr.p_filesz;
+        let file_off  = phdr.p_offset as usize;
+
+        if vaddr >= 0xFFFF_8000_0000_0000 { return Err(ElfError::AddressInKernelSpace); }
+
+        let mut flags = vmm::PAGE_PRESENT | vmm::PAGE_USER;
+        if phdr.p_flags & PF_W != 0 { flags |= vmm::PAGE_WRITABLE; }
+        if phdr.p_flags & PF_X == 0 { flags |= vmm::PAGE_NO_EXECUTE; }
+
+        let page_start = vaddr & !0xFFF;
+        let page_end   = (vaddr + memsz + 0xFFF) & !0xFFF;
+
+        for page_vaddr in (page_start..page_end).step_by(pmm::PAGE_SIZE) {
+            let (phys, already) = if let Some(&(_, p)) =
+                mapped_pages.iter().find(|&&(va, _)| va == page_vaddr) {
+                (p, true)
+            } else {
+                let p = pmm::alloc_page().ok_or(ElfError::OutOfMemory)?;
+                allocated_pages.push(p);
+                unsafe { core::ptr::write_bytes(p as *mut u8, 0, pmm::PAGE_SIZE); }
+                (p, false)
+            };
+
+            // Copy file content into the page.
+            let seg_base = phdr.p_vaddr.wrapping_add(bias);
+            let page_seg_off = page_vaddr.saturating_sub(seg_base);
+            if page_seg_off < filesz {
+                let copy_start = if page_vaddr < seg_base { (seg_base - page_vaddr) as usize } else { 0 };
+                let data_offset = if page_vaddr >= seg_base {
+                    file_off + (page_vaddr - seg_base) as usize
+                } else { file_off };
+                let remaining = (file_off + filesz as usize).saturating_sub(data_offset);
+                let copy_len = remaining.min(pmm::PAGE_SIZE - copy_start);
+                if copy_len > 0 && data_offset < data.len() {
+                    let actual = copy_len.min(data.len() - data_offset);
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            data.as_ptr().add(data_offset),
+                            (phys as *mut u8).add(copy_start),
+                            actual,
+                        );
+                    }
+                }
+            }
+
+            if !already {
+                if !vmm::map_page_in(cr3, page_vaddr, phys, flags) {
+                    return Err(ElfError::OutOfMemory);
+                }
+                crate::mm::refcount::page_ref_set(phys, 1);
+                mapped_pages.push((page_vaddr, phys));
+            }
+        }
+    }
+
+    Ok(header.e_entry.wrapping_add(bias))
 }
 
 // ── Linux ABI initial stack layout ──────────────────────────────────────────
@@ -466,6 +704,7 @@ fn setup_user_stack(
     argv: &[&str],
     envp: &[&str],
     entry_point: u64,
+    extra_auxv: &[(u64, u64)],
 ) -> u64 {
     let stack_top = USER_STACK_TOP;
 
@@ -514,9 +753,9 @@ fn setup_user_stack(
     // ── Step 2: Compute space needed for the structured region ──────────
     // We need to align and then push: auxvec, envp[], argv[], argc
 
-    // auxvec: (AT_PAGESZ, AT_RANDOM, AT_ENTRY, AT_UID, AT_EUID, AT_GID, AT_EGID, AT_NULL)
-    // = 8 pairs = 16 u64s
-    let num_aux_pairs = 8;
+    // auxvec: standard 7 pairs + extra_auxv pairs + AT_NULL terminator = 8 + N pairs
+    //   (AT_PAGESZ, AT_RANDOM, AT_ENTRY, AT_UID, AT_EUID, AT_GID, AT_EGID) = 7 base + extra + NULL
+    let num_aux_pairs = 7 + extra_auxv.len() + 1; // +1 for AT_NULL
     let auxvec_u64s = num_aux_pairs * 2;
 
     // envp: env_addrs.len() + 1 (null terminator)
@@ -562,8 +801,8 @@ fn setup_user_stack(
     stack_write_u64(stack_pages, stack_bottom, pos, 0); // NULL terminator
     pos += 8;
 
-    // Auxiliary vector
-    let aux_entries: [(u64, u64); 8] = [
+    // Auxiliary vector: standard entries + extra (AT_PHDR, AT_PHENT, AT_PHNUM, AT_BASE) + NULL
+    let base_aux: [(u64, u64); 7] = [
         (AT_PAGESZ, pmm::PAGE_SIZE as u64),
         (AT_RANDOM, at_random_addr),
         (AT_ENTRY, entry_point),
@@ -571,14 +810,25 @@ fn setup_user_stack(
         (AT_EUID, 0),
         (AT_GID, 0),
         (AT_EGID, 0),
-        (AT_NULL, 0), // terminator
     ];
-    for (atype, aval) in aux_entries {
+    for (atype, aval) in base_aux {
         stack_write_u64(stack_pages, stack_bottom, pos, atype);
         pos += 8;
         stack_write_u64(stack_pages, stack_bottom, pos, aval);
         pos += 8;
     }
+    for &(atype, aval) in extra_auxv {
+        stack_write_u64(stack_pages, stack_bottom, pos, atype);
+        pos += 8;
+        stack_write_u64(stack_pages, stack_bottom, pos, aval);
+        pos += 8;
+    }
+    // AT_NULL terminator
+    stack_write_u64(stack_pages, stack_bottom, pos, AT_NULL);
+    pos += 8;
+    stack_write_u64(stack_pages, stack_bottom, pos, 0);
+    #[allow(unused_assignments)]
+    { pos += 8; }
 
     rsp
 }

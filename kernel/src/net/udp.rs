@@ -93,6 +93,12 @@ pub fn recv(port: u16) -> Option<UdpDatagram> {
     None
 }
 
+/// Check if a UDP port has datagrams queued (non-destructive).
+pub fn has_data(port: u16) -> bool {
+    let bindings = UDP_BINDINGS.lock();
+    bindings.iter().any(|b| b.port == port && !b.queue.is_empty())
+}
+
 /// Unbind a UDP port.
 pub fn unbind(port: u16) {
     let mut bindings = UDP_BINDINGS.lock();

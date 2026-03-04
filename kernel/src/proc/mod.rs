@@ -205,6 +205,8 @@ pub struct Process {
     pub subsystem: crate::win32::SubsystemType,
     /// NT-style access token ID (from the token registry).
     pub token_id: Option<u64>,
+    /// Path of the main executable (for /proc/self/exe via readlink).
+    pub exe_path: Option<alloc::string::String>,
 }
 
 /// Next PID counter.
@@ -262,6 +264,7 @@ pub fn init() {
         handle_table: None,
         subsystem: crate::win32::SubsystemType::Native,
         token_id: None,
+        exe_path: None,
     };
 
     let idle_thread = Thread {
@@ -391,6 +394,7 @@ pub fn create_kernel_process(name: &str, entry_point: u64) -> Pid {
         handle_table: Some(crate::ob::handle::HandleTable::new()),
         subsystem: crate::win32::SubsystemType::Posix,
         token_id: None,
+        exe_path: None,
     };
 
     let thread = Thread {
@@ -696,6 +700,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid) -> Option<Pid> {
         handle_table: Some(crate::ob::handle::HandleTable::new()),
         subsystem: crate::win32::SubsystemType::Posix,
         token_id: parent_token_id,
+        exe_path: None,
     };
 
     let child_thread = Thread {

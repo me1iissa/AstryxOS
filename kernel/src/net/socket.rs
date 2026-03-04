@@ -146,6 +146,20 @@ pub fn socket_recv(id: u64) -> Result<Vec<u8>, &'static str> {
     }
 }
 
+/// Check if a socket has incoming data available (used by poll).
+pub fn socket_has_data(id: u64) -> bool {
+    let sockets = SOCKETS.lock();
+    let sock = match sockets.iter().find(|s| s.id == id) {
+        Some(s) => s,
+        None => return false,
+    };
+    if !sock.bound { return false; }
+    match sock.socket_type {
+        SocketType::Udp => super::udp::has_data(sock.local_port),
+        SocketType::Tcp => super::tcp::has_data(sock.local_port),
+    }
+}
+
 /// Close a socket.
 pub fn socket_close(id: u64) {
     let mut sockets = SOCKETS.lock();
