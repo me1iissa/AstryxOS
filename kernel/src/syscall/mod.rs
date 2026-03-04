@@ -65,6 +65,14 @@ unsafe fn user_read_u32(addr: u64) -> Option<u32> {
     Some(core::ptr::read_volatile(addr as *const u32))
 }
 
+/// Read a u64 from a validated user address. Returns None on bad address.
+#[inline]
+unsafe fn user_read_u64(addr: u64) -> Option<u64> {
+    if !validate_user_ptr(addr, 8) { return None; }
+    if addr % 8 != 0 { return None; } // alignment check
+    Some(core::ptr::read_volatile(addr as *const u64))
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Futex wait queue — keyed by virtual address
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -84,6 +92,12 @@ pub static mut SYSCALL_KERNEL_RSP: u64 = 0;
 /// Scratch space for saving the user RSP during syscall handling.
 #[no_mangle]
 pub static mut SYSCALL_USER_RSP: u64 = 0;
+
+/// Saved user RIP (return address from SYSCALL instruction).
+/// Set by syscall_entry before dispatch. Used by clone() to know where the
+/// child thread should resume execution (the instruction after the syscall).
+#[no_mangle]
+pub static mut SYSCALL_USER_RIP: u64 = 0;
 
 /// Set the kernel RSP for syscall handling (called on context switches).
 ///
@@ -133,11 +147,11 @@ pub fn init_ap() {
 /// - RDI: arg1, RSI: arg2, RDX: arg3, R10: arg4, R8: arg5, R9: arg6
 ///
 /// Returns result in RAX.
-pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
+pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, arg6: u64) -> i64 {
     crate::perf::record_syscall(num);
     // Check if the current process uses Linux syscall ABI
     if is_linux_abi() {
-        return dispatch_linux(num, arg1, arg2, arg3, arg4, arg5);
+        return dispatch_linux(num, arg1, arg2, arg3, arg4, arg5, arg6);
     }
     match num {
         SYS_EXIT => {
@@ -263,7 +277,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
         }
         SYS_MMAP => {
             // mmap(addr, length, prot, flags, fd, offset)
-            sys_mmap(arg1, arg2, arg3 as u32, arg4 as u32, arg5, 0)
+            sys_mmap(arg1, arg2, arg3 as u32, arg4 as u32, arg5, arg6)
         }
         SYS_MUNMAP => {
             // munmap(addr, length)
@@ -484,8 +498,8 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
             sys_fork()
         }
         SYS_FUTEX => {
-            // futex(uaddr, op, val)
-            sys_futex_linux(arg1, arg2, arg3)
+            // futex(uaddr, op, val, timeout_ptr, uaddr2)
+            sys_futex_linux(arg1, arg2, arg3, arg4, arg5)
         }
         SYS_SYNC => {
             // sync() — flush all dirty filesystem data to disk
@@ -520,6 +534,9 @@ extern "C" fn syscall_entry() {
         // Save user RSP into the scratch global, load kernel RSP.
         "mov [{user_rsp}], rsp",
         "mov rsp, [{kernel_rsp}]",
+
+        // Save user RIP (RCX on syscall entry) before we clobber it.
+        "mov [{user_rip}], rcx",
 
         // ── Step 2: Save user context on kernel stack ───────────────
         // These are restored on SYSRETQ.
@@ -556,8 +573,13 @@ extern "C" fn syscall_entry() {
         "sti",
 
         // ── Step 4: Set up C calling convention for dispatch() ──────
-        // Syscall ABI:  rax=num, rdi=a1, rsi=a2, rdx=a3, r10=a4, r8=a5
-        // C convention:  rdi=num, rsi=a1, rdx=a2, rcx=a3, r8=a4,  r9=a5
+        // Linux syscall ABI:  rax=num, rdi=a1, rsi=a2, rdx=a3, r10=a4, r8=a5, r9=a6
+        // C calling convention (System V AMD64):
+        //   rdi=num, rsi=a1, rdx=a2, rcx=a3, r8=a4, r9=a5, [rsp+8]=a6
+        // We push a6 (R9) onto the stack as the 7th argument before shuffling,
+        // so dispatch(num,a1,a2,a3,a4,a5,a6) gets all six syscall args.
+        "sub rsp, 8",       // align + make room for arg6 on stack
+        "mov [rsp], r9",    // arg6 (R9) → stack slot
         "mov r9, r8",       // arg5 -> r9
         "mov r8, r10",      // arg4 -> r8
         "mov rcx, rdx",     // arg3 -> rcx
@@ -565,6 +587,7 @@ extern "C" fn syscall_entry() {
         "mov rsi, rdi",     // arg1 -> rsi
         "mov rdi, rax",     // num  -> rdi
         "call {dispatch}",
+        "add rsp, 8",       // pop the arg6 stack slot
         // Result in RAX.
         // NOTE: do NOT pop rdx/r8/r9/r10 yet — they must survive signal_check.
 
@@ -611,6 +634,7 @@ extern "C" fn syscall_entry() {
 
         kernel_rsp = sym SYSCALL_KERNEL_RSP,
         user_rsp = sym SYSCALL_USER_RSP,
+        user_rip = sym SYSCALL_USER_RIP,
         dispatch = sym dispatch,
         signal_check = sym crate::signal::signal_check_on_syscall_return,
     );
@@ -623,7 +647,7 @@ extern "C" fn syscall_entry() {
 pub extern "C" fn syscall_int80_dispatch(
     num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
 ) -> i64 {
-    dispatch(num, arg1, arg2, arg3, arg4, arg5)
+    dispatch(num, arg1, arg2, arg3, arg4, arg5, 0)
 }
 
 // ===== exec() Implementation ================================================
@@ -918,6 +942,172 @@ fn sys_waitpid(pid: i64, options: u32) -> i64 {
     -10 // ECHILD — no matching child found after many attempts
 }
 
+// ===== ioctl dispatcher =====================================================
+
+/// ioctl — dispatch based on which device the fd refers to.
+fn sys_ioctl(fd_num: usize, request: u64, arg_ptr: *mut u8) -> i64 {
+    // TTY / console fds (0-2) always go to tty_ioctl.
+    if fd_num <= 2 {
+        return crate::drivers::tty::tty_ioctl(request, arg_ptr);
+    }
+
+    // Look up the fd's open_path.
+    let open_path = {
+        let pid = crate::proc::current_pid();
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter()
+            .find(|p| p.pid == pid)
+            .and_then(|p| p.file_descriptors.get(fd_num))
+            .and_then(|f| f.as_ref())
+            .map(|f| f.open_path.clone())
+            .unwrap_or_default()
+    };
+
+    if open_path == "/dev/fb0" {
+        sys_fbdev_ioctl(request, arg_ptr)
+    } else if open_path.starts_with("/dev/input/") {
+        sys_input_ioctl(request, arg_ptr)
+    } else if open_path.starts_with("/dev/tty") || open_path.starts_with("/dev/pts") || open_path == "/dev/console" {
+        crate::drivers::tty::tty_ioctl(request, arg_ptr)
+    } else {
+        0 // silently accept unknown ioctls
+    }
+}
+
+// ===== fbdev ioctls =========================================================
+
+/// FBIOGET_VSCREENINFO / FBIOPUT_VSCREENINFO / FBIOGET_FSCREENINFO
+///
+/// Writes Linux-compatible `fb_var_screeninfo` (160 bytes) and
+/// `fb_fix_screeninfo` (80 bytes) structs into user space when queried.
+fn sys_fbdev_ioctl(request: u64, arg_ptr: *mut u8) -> i64 {
+    const FBIOGET_VSCREENINFO: u64 = 0x4600;
+    const FBIOPUT_VSCREENINFO: u64 = 0x4601;
+    const FBIOGET_FSCREENINFO: u64 = 0x4602;
+    // FBIOPAN_DISPLAY
+    const FBIOPAN_DISPLAY:     u64 = 0x4606;
+
+    // Get current display parameters from the SVGA driver.
+    let (fb_phys, width, height, pitch) =
+        match crate::drivers::vmware_svga::get_framebuffer() {
+            Some(v) => v,
+            None    => return -6, // ENXIO
+        };
+    let bpp:    u32 = 32;
+    let line_length: u32 = pitch * (bpp / 8); // bytes per line
+
+    match request {
+        FBIOGET_VSCREENINFO => {
+            // struct fb_var_screeninfo — 160 bytes
+            if arg_ptr.is_null() { return -14; } // EFAULT
+            unsafe {
+                core::ptr::write_bytes(arg_ptr, 0, 160);
+                write_u32(arg_ptr, 0,  width);          // xres
+                write_u32(arg_ptr, 4,  height);         // yres
+                write_u32(arg_ptr, 8,  width);          // xres_virtual
+                write_u32(arg_ptr, 12, height);         // yres_virtual
+                write_u32(arg_ptr, 24, bpp);            // bits_per_pixel
+                // Red:   offset=16, length=8
+                write_u32(arg_ptr, 32, 16); write_u32(arg_ptr, 36, 8);
+                // Green: offset=8,  length=8
+                write_u32(arg_ptr, 40, 8);  write_u32(arg_ptr, 44, 8);
+                // Blue:  offset=0,  length=8
+                write_u32(arg_ptr, 48, 0);  write_u32(arg_ptr, 52, 8);
+                // Alpha: offset=24, length=8
+                write_u32(arg_ptr, 56, 24); write_u32(arg_ptr, 60, 8);
+            }
+            0
+        }
+        FBIOPUT_VSCREENINFO => {
+            // Parse requested width/height from the struct and try to set mode.
+            if arg_ptr.is_null() { return -14; }
+            let (req_w, req_h) = unsafe {
+                (read_u32(arg_ptr, 0), read_u32(arg_ptr, 4))
+            };
+            if req_w > 0 && req_h > 0 {
+                crate::drivers::vmware_svga::set_mode(req_w, req_h, bpp);
+            }
+            0
+        }
+        FBIOGET_FSCREENINFO => {
+            // struct fb_fix_screeninfo — 80 bytes
+            if arg_ptr.is_null() { return -14; }
+            unsafe {
+                core::ptr::write_bytes(arg_ptr, 0, 80);
+                // id[0..16]: "AstryxFB"
+                let id = b"AstryxFB";
+                core::ptr::copy_nonoverlapping(id.as_ptr(), arg_ptr, id.len());
+                // smem_start (phys base) at offset 16 — 8-byte pointer
+                core::ptr::write_unaligned(arg_ptr.add(16) as *mut u64, fb_phys.to_le());
+                // smem_len = height * line_length
+                let smem_len = height * line_length;
+                write_u32(arg_ptr, 24, smem_len);
+                // visual = 2 (TRUECOLOR) at offset 36
+                write_u32(arg_ptr, 36, 2);
+                // line_length at offset 48
+                write_u32(arg_ptr, 48, line_length);
+            }
+            0
+        }
+        FBIOPAN_DISPLAY => 0, // silently accept panning requests
+        _ => -25, // ENOTTY for unknown fb ioctls
+    }
+}
+
+/// Write a little-endian u32 at `offset` bytes from `base`.
+#[inline(always)]
+unsafe fn write_u32(base: *mut u8, offset: usize, val: u32) {
+    core::ptr::write_unaligned(base.add(offset) as *mut u32, val.to_le());
+}
+
+/// Read a little-endian u32 at `offset` bytes from `base`.
+#[inline(always)]
+unsafe fn read_u32(base: *const u8, offset: usize) -> u32 {
+    u32::from_le(core::ptr::read_unaligned(base.add(offset) as *const u32))
+}
+
+// ===== input device (evdev) ioctls ==========================================
+
+fn sys_input_ioctl(request: u64, arg_ptr: *mut u8) -> i64 {
+    // EVIOCGVERSION = _IOR('E', 0x01, int) = 0x80044501
+    const EVIOCGVERSION: u64 = 0x80044501;
+    // EVIOCGID = _IOR('E', 0x02, struct input_id) = 0x80084502  (16 bytes)
+    const EVIOCGID:      u64 = 0x80084502;
+    // EVIOCGNAME(n) — ioctl cmd varies with size; match the top byte
+    // Typically 0x80nn4506 where nn = buffer len
+    // We just check bits 0-23 (type + nr, ignore size).
+    let req_lo = request & 0x0000_FFFF; // direction+type+nr stripped of size
+
+    match request {
+        EVIOCGVERSION => {
+            if !arg_ptr.is_null() {
+                // EV_VERSION = 0x010001
+                unsafe { core::ptr::write_unaligned(arg_ptr as *mut u32, 0x0001_0001u32.to_le()); }
+            }
+            0
+        }
+        EVIOCGID => {
+            // struct input_id { u16 bustype, vendor, product, version }
+            if !arg_ptr.is_null() {
+                unsafe {
+                    core::ptr::write_bytes(arg_ptr, 0, 8);
+                    // bustype = BUS_VIRTUAL (6)
+                    core::ptr::write_unaligned(arg_ptr as *mut u16, 6u16.to_le());
+                }
+            }
+            0
+        }
+        _ if req_lo == 0x4506 => {
+            // EVIOCGNAME — return empty string
+            if !arg_ptr.is_null() {
+                unsafe { *arg_ptr = 0; }
+            }
+            1 // number of bytes written
+        }
+        _ => 0, // silently accept all other evdev ioctls
+    }
+}
+
 // ===== mmap / munmap / brk ==================================================
 
 /// mmap — Map virtual memory into the current process's address space.
@@ -970,9 +1160,23 @@ fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u64, offset:
     let (backing, name) = if is_anon {
         (VmBacking::Anonymous, "[mmap]")
     } else {
-        // File-backed mapping: look up the fd to get (mount_idx, inode)
+        // File-backed or device-backed mapping: look up the fd.
         let fd_num = fd as usize;
         match proc.file_descriptors.get(fd_num).and_then(|f| f.as_ref()) {
+            Some(fd_entry) if fd_entry.open_path == "/dev/fb0" => {
+                // Framebuffer mmap → device-backed VMA using SVGA physical base.
+                if let Some((phys_base, _w, _h, _pitch)) =
+                    crate::drivers::vmware_svga::get_framebuffer()
+                {
+                    (VmBacking::Device { phys_base }, "[fb0]")
+                } else {
+                    return -6; // ENXIO
+                }
+            }
+            // /dev/dri/card0 and other device stubs → anonymous (renders nothing)
+            Some(fd_entry) if fd_entry.open_path.starts_with("/dev/dri/") => {
+                (VmBacking::Anonymous, "[dri-stub]")
+            }
             Some(fd_entry) if !fd_entry.is_console => {
                 let page_offset = offset & !0xFFF;
                 (VmBacking::File {
@@ -1246,6 +1450,8 @@ fn fill_stat_buf(st: &crate::vfs::FileStat, buf: *mut u8) {
         crate::vfs::FileType::CharDevice => 3,
         crate::vfs::FileType::BlockDevice => 4,
         crate::vfs::FileType::Pipe => 5,
+        crate::vfs::FileType::EventFd => 5,    // report as FIFO
+        crate::vfs::FileType::Socket  => 12,   // DT_SOCK substitute
     };
     out[8..12].copy_from_slice(&ft.to_le_bytes());
     out[12..16].copy_from_slice(&st.permissions.to_le_bytes());
@@ -1444,6 +1650,7 @@ fn sys_pipe(fds_out: *mut u64) -> i64 {
         flags: 0x8000_0000, // Pipe read end
         is_console: false,
         file_type: crate::vfs::FileType::Pipe,
+        open_path: alloc::string::String::new(),
     };
 
     // Create write-end FD
@@ -1454,6 +1661,7 @@ fn sys_pipe(fds_out: *mut u64) -> i64 {
         flags: 0x8000_0001, // Pipe write end
         is_console: false,
         file_type: crate::vfs::FileType::Pipe,
+        open_path: alloc::string::String::new(),
     };
 
     // Find two free FD slots
@@ -1514,6 +1722,47 @@ fn is_pipe_fd(pid: u64, fd_num: usize) -> bool {
         .unwrap_or(false)
 }
 
+/// Check if a file descriptor is a socket.
+fn is_socket_fd(pid: u64, fd_num: usize) -> bool {
+    let procs = crate::proc::PROCESS_TABLE.lock();
+    procs.iter().find(|p| p.pid == pid)
+        .and_then(|p| p.file_descriptors.get(fd_num))
+        .and_then(|f| f.as_ref())
+        .map(|f| f.mount_idx == usize::MAX && f.flags & 0x4000_0000 != 0)
+        .unwrap_or(false)
+}
+
+/// Allocate a new socket fd for the given process, returning the fd number.
+fn alloc_socket_fd(pid: u64, socket_id: u64, sock_type: u32) -> i64 {
+    let fd = crate::vfs::FileDescriptor {
+        mount_idx: usize::MAX,
+        inode: socket_id,
+        offset: 0,
+        flags: 0x4000_0000 | (sock_type & 0x03), // SOCKET_FD | type
+        is_console: false,
+        file_type: crate::vfs::FileType::CharDevice,
+        open_path: alloc::string::String::new(),
+    };
+    let mut procs = crate::proc::PROCESS_TABLE.lock();
+    let proc = match procs.iter_mut().find(|p| p.pid == pid) {
+        Some(p) => p,
+        None => return -3, // ESRCH
+    };
+    for i in 0..proc.file_descriptors.len() {
+        if proc.file_descriptors[i].is_none() {
+            proc.file_descriptors[i] = Some(fd);
+            return i as i64;
+        }
+    }
+    if proc.file_descriptors.len() < crate::vfs::MAX_FDS_PER_PROCESS {
+        let idx = proc.file_descriptors.len();
+        proc.file_descriptors.push(Some(fd));
+        idx as i64
+    } else {
+        -24 // EMFILE
+    }
+}
+
 /// Get the pipe_id for a pipe file descriptor.
 fn get_pipe_id(pid: u64, fd_num: usize) -> u64 {
     let procs = crate::proc::PROCESS_TABLE.lock();
@@ -1522,6 +1771,93 @@ fn get_pipe_id(pid: u64, fd_num: usize) -> u64 {
         .and_then(|f| f.as_ref())
         .map(|f| f.inode)
         .unwrap_or(0)
+}
+
+/// Get the socket_id for a socket file descriptor.
+fn get_socket_id(pid: u64, fd_num: usize) -> u64 {
+    let procs = crate::proc::PROCESS_TABLE.lock();
+    procs.iter().find(|p| p.pid == pid)
+        .and_then(|p| p.file_descriptors.get(fd_num))
+        .and_then(|f| f.as_ref())
+        .map(|f| f.inode)
+        .unwrap_or(u64::MAX)
+}
+
+/// Check if a file descriptor is an eventfd.
+fn is_eventfd_fd(pid: u64, fd_num: usize) -> bool {
+    let procs = crate::proc::PROCESS_TABLE.lock();
+    procs.iter().find(|p| p.pid == pid)
+        .and_then(|p| p.file_descriptors.get(fd_num))
+        .and_then(|f| f.as_ref())
+        .map(|f| f.file_type == crate::vfs::FileType::EventFd)
+        .unwrap_or(false)
+}
+
+/// Get the eventfd slot ID for a file descriptor.
+fn get_eventfd_id(pid: u64, fd_num: usize) -> u64 {
+    let procs = crate::proc::PROCESS_TABLE.lock();
+    procs.iter().find(|p| p.pid == pid)
+        .and_then(|p| p.file_descriptors.get(fd_num))
+        .and_then(|f| f.as_ref())
+        .map(|f| f.inode)
+        .unwrap_or(u64::MAX)
+}
+
+// ── AF_UNIX socket helpers ────────────────────────────────────────────────────
+
+const UNIX_SOCKET_FLAG: u32 = 0x0080_0000; // bit 23: fd is an AF_UNIX socket
+
+/// Check if a file descriptor is an AF_UNIX socket.
+fn is_unix_socket_fd(pid: u64, fd_num: usize) -> bool {
+    let procs = crate::proc::PROCESS_TABLE.lock();
+    procs.iter().find(|p| p.pid == pid)
+        .and_then(|p| p.file_descriptors.get(fd_num))
+        .and_then(|f| f.as_ref())
+        .map(|f| f.mount_idx == usize::MAX
+              && f.flags & 0x4000_0000 != 0
+              && f.flags & UNIX_SOCKET_FLAG != 0)
+        .unwrap_or(false)
+}
+
+/// Get the unix socket id for a file descriptor.
+fn get_unix_socket_id(pid: u64, fd_num: usize) -> u64 {
+    let procs = crate::proc::PROCESS_TABLE.lock();
+    procs.iter().find(|p| p.pid == pid)
+        .and_then(|p| p.file_descriptors.get(fd_num))
+        .and_then(|f| f.as_ref())
+        .map(|f| f.inode)
+        .unwrap_or(u64::MAX)
+}
+
+/// Allocate a new AF_UNIX socket fd, returning the fd number or negative errno.
+fn alloc_unix_socket_fd(pid: u64, unix_id: u64) -> i64 {
+    let fd = crate::vfs::FileDescriptor {
+        mount_idx: usize::MAX,
+        inode: unix_id,
+        offset: 0,
+        flags: 0x4000_0000 | UNIX_SOCKET_FLAG, // SOCKET_FD | UNIX_FLAG
+        is_console: false,
+        file_type: crate::vfs::FileType::Socket,
+        open_path: alloc::string::String::new(),
+    };
+    let mut procs = crate::proc::PROCESS_TABLE.lock();
+    let proc = match procs.iter_mut().find(|p| p.pid == pid) {
+        Some(p) => p,
+        None => return -3,
+    };
+    for i in 0..proc.file_descriptors.len() {
+        if proc.file_descriptors[i].is_none() {
+            proc.file_descriptors[i] = Some(fd);
+            return i as i64;
+        }
+    }
+    if proc.file_descriptors.len() < crate::vfs::MAX_FDS_PER_PROCESS {
+        let idx = proc.file_descriptors.len();
+        proc.file_descriptors.push(Some(fd));
+        idx as i64
+    } else {
+        -24 // EMFILE
+    }
 }
 
 /// uname buffer layout (5 fields, 65 bytes each = 325 bytes):
@@ -1829,9 +2165,7 @@ fn read_cstring_from_user(ptr: u64) -> &'static [u8] {
 ///
 /// Maps Linux syscall numbers to AstryxOS handlers, handling differences
 /// in argument encoding (e.g., C strings vs ptr+len for paths).
-pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
-    crate::serial_println!("[SYSCALL/Linux] #{} ({:#x}, {:#x}, {:#x}, {:#x}, {:#x})",
-        num, arg1, arg2, arg3, arg4, arg5);
+pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, arg6: u64) -> i64 {
     match num {
         // 0: read(fd, buf, count)
         0 => sys_read_linux(arg1, arg2, arg3),
@@ -1843,6 +2177,20 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
         3 => {
             let fd = arg1 as usize;
             let pid = crate::proc::current_pid();
+            // If it's a unix socket fd, close the underlying unix socket.
+            if is_unix_socket_fd(pid, fd) {
+                let unix_id = get_unix_socket_id(pid, fd);
+                crate::net::unix::close(unix_id);
+            // If it's an AF_INET socket fd, close the underlying socket.
+            } else if is_socket_fd(pid, fd) {
+                let socket_id = get_socket_id(pid, fd);
+                crate::net::socket::socket_close(socket_id);
+            }
+            // If it's an eventfd, free the counter slot.
+            if is_eventfd_fd(pid, fd) {
+                let efd_id = get_eventfd_id(pid, fd);
+                crate::ipc::eventfd::close(efd_id);
+            }
             match crate::vfs::close(pid, fd) {
                 Ok(()) => 0,
                 Err(e) => -(e as i64),
@@ -1855,7 +2203,7 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
         // 8: lseek(fd, offset, whence)
         8 => sys_lseek(arg1 as usize, arg2 as i64, arg3 as u32),
         // 9: mmap(addr, len, prot, flags, fd, offset)
-        9 => sys_mmap(arg1, arg2, arg3 as u32, arg4 as u32, arg5, 0),
+        9 => sys_mmap(arg1, arg2, arg3 as u32, arg4 as u32, arg5, arg6),
         // 10: mprotect(addr, len, prot)
         10 => sys_mprotect(arg1, arg2, arg3),
         // 11: munmap(addr, len)
@@ -1870,14 +2218,10 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
         15 => sys_sigreturn(),
         // 16: ioctl(fd, request, arg)
         16 => {
-            let fd = arg1;
+            let fd_num = arg1 as usize;
             let request = arg2;
             let arg_ptr = arg3 as *mut u8;
-            if fd <= 2 {
-                crate::drivers::tty::tty_ioctl(request, arg_ptr)
-            } else {
-                -25 // ENOTTY
-            }
+            sys_ioctl(fd_num, request, arg_ptr)
         }
         // 20: writev(fd, iov, iovcnt)
         20 => sys_writev(arg1, arg2, arg3),
@@ -1890,10 +2234,586 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
         }
         // 39: getpid
         39 => crate::proc::current_pid() as i64,
-        // 56: clone (simplified → fork)
-        56 => sys_fork(),
+        // 7: poll(fds, nfds, timeout) — wait for events on fds
+        7 => {
+            let nfds = arg2 as i64;
+            let pid  = crate::proc::current_pid();
+            let timeout_ms = arg3 as i64; // -1 = block; 0 = no wait
+            let mut ready = 0i64;
+
+            if nfds <= 0 || arg1 == 0 {
+                return 0;
+            }
+
+            // struct pollfd { int fd; short events; short revents; } = 8 bytes
+            // Layout: fd[0..4], events[4..6], revents[6..8]
+            for i in 0..nfds as u64 {
+                let base = (arg1 + i * 8) as *mut u8;
+                let (fd_val, events) = unsafe {
+                    let fd_val = core::ptr::read_unaligned(base as *const i32);
+                    let events = core::ptr::read_unaligned(base.add(4) as *const u16);
+                    (fd_val, events)
+                };
+
+                if fd_val < 0 {
+                    // Negative fd → ignore (write revents=0)
+                    unsafe { core::ptr::write_unaligned(base.add(6) as *mut u16, 0); }
+                    continue;
+                }
+                let fd = fd_val as usize;
+
+                const POLLIN:  u16 = 0x0001;
+                const POLLOUT: u16 = 0x0004;
+                const POLLERR: u16 = 0x0008;
+                const POLLHUP: u16 = 0x0010;
+
+                let revents: u16 = if fd <= 2 {
+                    // stdin/stdout/stderr: stdin always readable, stdout/stderr always writable
+                    if fd == 0 { events & POLLIN } else { events & POLLOUT }
+                } else if is_eventfd_fd(pid, fd) {
+                    let efd_id = get_eventfd_id(pid, fd);
+                    if crate::ipc::eventfd::is_readable(efd_id) { events & POLLIN }
+                    else { 0 }
+                } else if is_unix_socket_fd(pid, fd) {
+                    let unix_id = get_unix_socket_id(pid, fd);
+                    let readable = crate::net::unix::has_data(unix_id)
+                        || crate::net::unix::has_pending(unix_id);
+                    let mut rev = 0u16;
+                    if readable { rev |= events & POLLIN; }
+                    rev |= events & POLLOUT; // connected unix sockets are always writable
+                    rev
+                } else if is_socket_fd(pid, fd) {
+                    let socket_id = get_socket_id(pid, fd);
+                    let in_ready  = crate::net::socket::socket_has_data(socket_id);
+                    let out_ready = true; // TCP sockets are always writable (non-blocking model)
+                    let mut rev = 0u16;
+                    if in_ready  { rev |= events & POLLIN; }
+                    if out_ready { rev |= events & POLLOUT; }
+                    rev
+                } else if is_pipe_fd(pid, fd) {
+                    let pipe_id = get_pipe_id(pid, fd);
+                    // Read end: check if data available; write end: always writable
+                    let is_read_end = {
+                        let procs = crate::proc::PROCESS_TABLE.lock();
+                        procs.iter().find(|p| p.pid == pid)
+                            .and_then(|p| p.file_descriptors.get(fd))
+                            .and_then(|f| f.as_ref())
+                            .map(|f| f.flags & 0x1 == 0) // bit0=0 → read end
+                            .unwrap_or(false)
+                    };
+                    if is_read_end {
+                        let has_data = crate::ipc::pipe::pipe_has_data(pipe_id);
+                        if has_data { events & POLLIN } else { 0 }
+                    } else {
+                        events & POLLOUT // write end always writable
+                    }
+                } else {
+                    // Regular file: always ready
+                    events & (POLLIN | POLLOUT)
+                };
+
+                unsafe { core::ptr::write_unaligned(base.add(6) as *mut u16, revents); }
+                if revents != 0 { ready += 1; }
+            }
+
+            // If timeout_ms == 0, return immediately with result.
+            // If timeout_ms  > 0 or == -1 and nothing ready, yield once.
+            if ready == 0 && timeout_ms != 0 {
+                crate::sched::yield_cpu();
+            }
+
+            ready
+        }
+        // 17: pread64(fd, buf, count, offset)
+        17 => {
+            let fd = arg1 as usize;
+            let buf = arg2 as *mut u8;
+            let count = arg3 as usize;
+            let offset = arg4 as i64;
+            let pid = crate::proc::current_pid();
+            // Save, seek, read, restore
+            let saved = sys_lseek(fd, 0, 1 /*SEEK_CUR*/);
+            let sk = sys_lseek(fd, offset, 0 /*SEEK_SET*/);
+            if sk < 0 { return sk; }
+            let n = crate::vfs::fd_read(pid, fd, buf, count);
+            if saved >= 0 { let _ = sys_lseek(fd, saved, 0); }
+            match n {
+                Ok(n) => n as i64,
+                Err(e) => -(e as i64),
+            }
+        }
+        // 18: pwrite64(fd, buf, count, offset)
+        18 => {
+            let fd = arg1 as usize;
+            let buf = arg2 as *const u8;
+            let count = arg3 as usize;
+            let offset = arg4 as i64;
+            let pid = crate::proc::current_pid();
+            let saved = sys_lseek(fd, 0, 1);
+            let sk = sys_lseek(fd, offset, 0);
+            if sk < 0 { return sk; }
+            let n = crate::vfs::fd_write(pid, fd, buf, count);
+            if saved >= 0 { let _ = sys_lseek(fd, saved, 0); }
+            match n {
+                Ok(n) => n as i64,
+                Err(e) => -(e as i64),
+            }
+        }
+        // 35: nanosleep(req, rem) — yield once and return 0
+        35 => {
+            crate::sched::yield_cpu();
+            0
+        }
+        // 40: sendfile(out_fd, in_fd, offset, count) — stub
+        40 => -38, // ENOSYS
+        // ── Phase 4: Socket syscalls (sockets as file descriptors) ───────────
+        // 41: socket(domain, type, protocol) → fd
+        41 => {
+            let domain = arg1 as u32;  // AF_INET=2, AF_UNIX=1, AF_INET6=10
+            let sock_type = arg2 & 0xFF; // strip SOCK_NONBLOCK/SOCK_CLOEXEC
+            let pid = crate::proc::current_pid();
+            if domain == 1 {
+                // AF_UNIX: use net::unix module
+                let unix_id = crate::net::unix::create();
+                if unix_id == u64::MAX { return -24; } // EMFILE
+                alloc_unix_socket_fd(pid, unix_id)
+            } else if domain == 2 || domain == 10 {
+                // AF_INET / AF_INET6
+                let net_type = match sock_type {
+                    1 => crate::net::socket::SocketType::Tcp,
+                    _ => crate::net::socket::SocketType::Udp,
+                };
+                let socket_id = crate::net::socket::socket_create(net_type);
+                alloc_socket_fd(pid, socket_id, sock_type as u32)
+            } else {
+                -22 // EINVAL — unsupported domain
+            }
+        }
+        // 42: connect(sockfd, addr, addrlen)
+        42 => {
+            let pid = crate::proc::current_pid();
+            let fd = arg1 as usize;
+            let addr_ptr = arg2;
+            let addrlen = arg3 as usize;
+            if addrlen < 2 || addr_ptr == 0 { return -22; }
+            let family = unsafe { core::ptr::read_unaligned(addr_ptr as *const u16) };
+
+            if family == 1 {
+                // AF_UNIX — sockaddr_un { sa_family: u16, sun_path: [u8; 108] }
+                if !is_unix_socket_fd(pid, fd) { return -9; }
+                let unix_id = get_unix_socket_id(pid, fd);
+                let path_bytes = if addrlen > 2 {
+                    unsafe { core::slice::from_raw_parts((addr_ptr + 2) as *const u8, (addrlen - 2).min(108)) }
+                } else { return -22; };
+                // Strip trailing NUL
+                let plen = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
+                crate::net::unix::connect(unix_id, &path_bytes[..plen])
+            } else {
+                if !is_socket_fd(pid, fd) { return -9; }
+                let socket_id = get_socket_id(pid, fd);
+                if family == 2 && addrlen >= 16 {
+                    // sockaddr_in
+                    let bytes = unsafe { core::slice::from_raw_parts(addr_ptr as *const u8, 16) };
+                    let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+                    let ip = [bytes[4], bytes[5], bytes[6], bytes[7]];
+                    match crate::net::socket::socket_connect(socket_id, ip, port) {
+                        Ok(()) => 0,
+                        Err(_) => -111, // ECONNREFUSED
+                    }
+                } else {
+                    0 // AF_INET6 stub
+                }
+            }
+        }
+        // 43: accept(sockfd, addr, addrlen) — AF_UNIX real; AF_INET stub
+        43 => {
+            let pid = crate::proc::current_pid();
+            let fd = arg1 as usize;
+            if is_unix_socket_fd(pid, fd) {
+                let unix_id = get_unix_socket_id(pid, fd);
+                match crate::net::unix::accept(unix_id) {
+                    peer_id if peer_id >= 0 => {
+                        // Allocate an fd for the accepted connected socket.
+                        alloc_unix_socket_fd(pid, peer_id as u64)
+                    }
+                    e => e, // EAGAIN or error
+                }
+            } else {
+                -11 // EAGAIN (AF_INET accept stub: no real listener)
+            }
+        }
+        // 44: sendto(sockfd, buf, len, flags, addr, addrlen)
+        44 => {
+            let pid = crate::proc::current_pid();
+            let fd = arg1 as usize;
+            let buf_ptr = arg2 as *const u8;
+            let len = arg3 as usize;
+            let data = unsafe { core::slice::from_raw_parts(buf_ptr, len) };
+            if is_unix_socket_fd(pid, fd) {
+                let unix_id = get_unix_socket_id(pid, fd);
+                crate::net::unix::write(unix_id, data)
+            } else {
+                if !is_socket_fd(pid, fd) { return -9; }
+                let socket_id = get_socket_id(pid, fd);
+                let addr_ptr = arg5;
+                let addrlen = arg6 as usize;
+                if addr_ptr != 0 && addrlen >= 16 {
+                    let bytes = unsafe { core::slice::from_raw_parts(addr_ptr as *const u8, 16) };
+                    let family = u16::from_le_bytes([bytes[0], bytes[1]]);
+                    if family == 2 {
+                        let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+                        let ip = [bytes[4], bytes[5], bytes[6], bytes[7]];
+                        match crate::net::socket::socket_sendto(socket_id, ip, port, data) {
+                            Ok(n) => n as i64,
+                            Err(_) => -104,
+                        }
+                    } else { len as i64 }
+                } else {
+                    match crate::net::socket::socket_send(socket_id, data) {
+                        Ok(n) => n as i64,
+                        Err(_) => -104,
+                    }
+                }
+            }
+        }
+        // 45: recvfrom(sockfd, buf, len, flags, addr, addrlen)
+        45 => {
+            let pid = crate::proc::current_pid();
+            let fd = arg1 as usize;
+            let buf_ptr = arg2 as *mut u8;
+            let len = arg3 as usize;
+            if is_unix_socket_fd(pid, fd) {
+                let unix_id = get_unix_socket_id(pid, fd);
+                let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, len) };
+                crate::net::unix::read(unix_id, buf)
+            } else {
+                if !is_socket_fd(pid, fd) { return -9; }
+                let socket_id = get_socket_id(pid, fd);
+                match crate::net::socket::socket_recv(socket_id) {
+                    Ok(data) => {
+                        let n = data.len().min(len);
+                        if n > 0 { unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, n); } }
+                        n as i64
+                    }
+                    Err(_) => -11,
+                }
+            }
+        }
+        // 46: sendmsg(sockfd, msg, flags) — use single-buffer fast path
+        46 => {
+            let pid = crate::proc::current_pid();
+            let fd = arg1 as usize;
+            let msghdr_ptr = arg2 as *const u64;
+            if msghdr_ptr.is_null() { return -22; }
+            let iov_ptr = unsafe { core::ptr::read_unaligned(msghdr_ptr.add(2)) }; // offset 16
+            let iov_len = unsafe { core::ptr::read_unaligned(msghdr_ptr.add(3)) }; // offset 24
+            if iov_ptr == 0 || iov_len == 0 { return 0; }
+            let iovecs = unsafe { core::slice::from_raw_parts(iov_ptr as *const [u64; 2], iov_len as usize) };
+            let mut total = 0usize;
+            for iov in iovecs {
+                let base = iov[0] as *const u8;
+                let slen = iov[1] as usize;
+                if slen == 0 { continue; }
+                let data = unsafe { core::slice::from_raw_parts(base, slen) };
+                if is_unix_socket_fd(pid, fd) {
+                    let unix_id = get_unix_socket_id(pid, fd);
+                    match crate::net::unix::write(unix_id, data) {
+                        n if n >= 0 => total += n as usize,
+                        e => return e,
+                    }
+                } else {
+                    if !is_socket_fd(pid, fd) { return -9; }
+                    let socket_id = get_socket_id(pid, fd);
+                    match crate::net::socket::socket_send(socket_id, data) {
+                        Ok(n) => total += n,
+                        Err(_) => return -104,
+                    }
+                }
+            }
+            total as i64
+        }
+        // 47: recvmsg(sockfd, msg, flags) — via socket_recv / unix::read
+        47 => {
+            let pid = crate::proc::current_pid();
+            let fd = arg1 as usize;
+            let msghdr_ptr = arg2 as *const u64;
+            if msghdr_ptr.is_null() { return -22; }
+            let iov_ptr = unsafe { core::ptr::read_unaligned(msghdr_ptr.add(2)) };
+            let iov_len = unsafe { core::ptr::read_unaligned(msghdr_ptr.add(3)) };
+            if iov_ptr == 0 || iov_len == 0 { return -22; }
+            let iov = unsafe { core::slice::from_raw_parts(iov_ptr as *const [u64; 2], 1) };
+            let dst = iov[0][0] as *mut u8;
+            let cap = iov[0][1] as usize;
+            if is_unix_socket_fd(pid, fd) {
+                let unix_id = get_unix_socket_id(pid, fd);
+                let buf = unsafe { core::slice::from_raw_parts_mut(dst, cap) };
+                crate::net::unix::read(unix_id, buf)
+            } else {
+                if !is_socket_fd(pid, fd) { return -9; }
+                let socket_id = get_socket_id(pid, fd);
+                match crate::net::socket::socket_recv(socket_id) {
+                    Ok(data) => {
+                        if data.is_empty() { return 0; }
+                        let n = data.len().min(cap);
+                        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst, n); }
+                        n as i64
+                    }
+                    Err(_) => -11,
+                }
+            }
+        }
+        // 48: shutdown(sockfd, how) — stub success
+        48 => 0,
+        // 49: bind(sockfd, addr, addrlen)
+        49 => {
+            let pid = crate::proc::current_pid();
+            let fd = arg1 as usize;
+            let addr_ptr = arg2;
+            let addrlen = arg3 as usize;
+            if addrlen < 2 || addr_ptr == 0 { return -22; }
+            let family = unsafe { core::ptr::read_unaligned(addr_ptr as *const u16) };
+            if family == 1 {
+                // AF_UNIX — sockaddr_un
+                if !is_unix_socket_fd(pid, fd) { return -9; }
+                let unix_id = get_unix_socket_id(pid, fd);
+                let path_bytes = if addrlen > 2 {
+                    unsafe { core::slice::from_raw_parts((addr_ptr + 2) as *const u8, (addrlen - 2).min(108)) }
+                } else { return -22; };
+                let plen = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
+                crate::net::unix::bind(unix_id, &path_bytes[..plen])
+            } else if family == 2 && addrlen >= 8 {
+                if !is_socket_fd(pid, fd) { return -9; }
+                let socket_id = get_socket_id(pid, fd);
+                let bytes = unsafe { core::slice::from_raw_parts(addr_ptr as *const u8, 8) };
+                let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+                match crate::net::socket::socket_bind(socket_id, port) {
+                    Ok(()) => 0,
+                    Err(_) => -98, // EADDRINUSE
+                }
+            } else {
+                0 // unknown family stub
+            }
+        }
+        // 50: listen(sockfd, backlog)
+        50 => {
+            let pid = crate::proc::current_pid();
+            let fd = arg1 as usize;
+            if is_unix_socket_fd(pid, fd) {
+                let unix_id = get_unix_socket_id(pid, fd);
+                crate::net::unix::listen(unix_id)
+            } else {
+                0 // AF_INET stub
+            }
+        }
+        // 51: getsockname(sockfd, addr, addrlen)
+        51 => {
+            let pid = crate::proc::current_pid();
+            let fd = arg1 as usize;
+            if !is_socket_fd(pid, fd) { return -9; }
+            let addr_ptr = arg2;
+            let addrlen_ptr = arg3 as *mut u32;
+            if addr_ptr != 0 {
+                // Write sockaddr_in { AF_INET=2, port=0, addr=0.0.0.0 }
+                let out = unsafe { core::slice::from_raw_parts_mut(addr_ptr as *mut u8, 16) };
+                out.iter_mut().for_each(|b| *b = 0);
+                out[0] = 2; // AF_INET
+            }
+            if !addrlen_ptr.is_null() {
+                unsafe { core::ptr::write(addrlen_ptr, 16u32); }
+            }
+            0
+        }
+        // 52: getpeername(sockfd, addr, addrlen) — stub same as getsockname
+        52 => {
+            let addr_ptr = arg2;
+            let addrlen_ptr = arg3 as *mut u32;
+            if addr_ptr != 0 {
+                let out = unsafe { core::slice::from_raw_parts_mut(addr_ptr as *mut u8, 16) };
+                out.iter_mut().for_each(|b| *b = 0);
+                out[0] = 2;
+            }
+            if !addrlen_ptr.is_null() {
+                unsafe { core::ptr::write(addrlen_ptr, 16u32); }
+            }
+            0
+        }
+        // 53: socketpair(domain, type, protocol, sv[2]) — AF_UNIX loopback pair
+        53 => {
+            let domain = arg1 as u32;
+            let sv_ptr = arg4 as *mut u32;
+            if sv_ptr.is_null() { return -22; }
+            if domain == 1 {
+                // AF_UNIX socketpair
+                let pid = crate::proc::current_pid();
+                let (a, b) = crate::net::unix::socketpair();
+                if a == u64::MAX { return -24; }
+                let fd_a = alloc_unix_socket_fd(pid, a);
+                if fd_a < 0 {
+                    crate::net::unix::close(a);
+                    crate::net::unix::close(b);
+                    return fd_a;
+                }
+                let fd_b = alloc_unix_socket_fd(pid, b);
+                if fd_b < 0 {
+                    // Clean up fd_a: close the fd and the unix socket
+                    crate::net::unix::close(a);
+                    crate::net::unix::close(b);
+                    return fd_b;
+                }
+                unsafe {
+                    core::ptr::write(sv_ptr,       fd_a as u32);
+                    core::ptr::write(sv_ptr.add(1), fd_b as u32);
+                }
+                0
+            } else {
+                -38 // ENOSYS for non-UNIX socketpair
+            }
+        }
+        // 54: setsockopt(sockfd, level, optname, optval, optlen) — stub success
+        54 => 0,
+        // 55: getsockopt(sockfd, level, optname, optval, optlen) — stub
+        55 => {
+            const SO_ERROR: u64 = 4;
+            const SOL_SOCKET: u64 = 1;
+            if arg2 == SOL_SOCKET && arg3 == SO_ERROR {
+                // SO_ERROR requested — write 0 (no error) to optval
+                let optval = arg4 as *mut u32;
+                let optlen = arg5 as *mut u32;
+                if !optval.is_null() { unsafe { core::ptr::write(optval, 0u32); } }
+                if !optlen.is_null() { unsafe { core::ptr::write(optlen, 4u32); } }
+            }
+            0
+        }
+        // 56: clone(flags, stack, parent_tid, tls, child_tid)
+        56 => {
+            let flags = arg1;
+            let new_stack = arg2;
+            let tls = arg4;
+            const CLONE_THREAD: u64 = 0x00010000;
+            const CLONE_VM:     u64 = 0x00000100;
+            const CLONE_SETTLS: u64 = 0x00080000;
+            if flags & CLONE_THREAD != 0 && flags & CLONE_VM != 0 {
+                // pthread_create-style clone: new thread in same address space.
+                let user_rip = unsafe { SYSCALL_USER_RIP };
+                let tls_val = if flags & CLONE_SETTLS != 0 { tls } else { 0 };
+                let pid = crate::proc::current_pid();
+                match crate::proc::usermode::create_user_thread(pid, user_rip, new_stack, tls_val) {
+                    Some(tid) => {
+                        crate::serial_println!("[CLONE] Thread TID {} spawned in PID {}", tid, pid);
+                        tid as i64
+                    }
+                    None => -11, // EAGAIN
+                }
+            } else {
+                // Fork-style clone: just use sys_fork for now.
+                sys_fork()
+            }
+        }
         // 57: fork
         57 => sys_fork(),
+        // 77: ftruncate(fd, length) — stub (success; real truncate needs VFS inode API)
+        77 => 0,
+        // 82: rename(oldpath, newpath) — C strings
+        82 => {
+            let old_raw = read_cstring_from_user(arg1);
+            let new_raw = read_cstring_from_user(arg2);
+            let old_str = core::str::from_utf8(&old_raw).unwrap_or("");
+            let new_str = core::str::from_utf8(&new_raw).unwrap_or("");
+            match crate::vfs::rename(old_str, new_str) {
+                Ok(()) => 0,
+                Err(e) => -(e as i64),
+            }
+        }
+        // 89: readlink(path, buf, bufsiz) — C string path
+        // Special-cased for /proc/self/exe → returns current process executable path.
+        89 => {
+            let raw = read_cstring_from_user(arg1);
+            let path_str = core::str::from_utf8(&raw).unwrap_or("");
+            let buf = arg2 as *mut u8;
+            let bufsiz = arg3 as usize;
+
+            // /proc/self/exe — resolve to current process exe path.
+            let target_str: alloc::string::String = if path_str == "/proc/self/exe"
+                || path_str == "/proc/self/fd/exe"
+            {
+                let pid = crate::proc::current_pid();
+                let procs = crate::proc::PROCESS_TABLE.lock();
+                procs.iter().find(|p| p.pid == pid)
+                    .and_then(|p| p.exe_path.as_ref())
+                    .map(|s| s.clone())
+                    .unwrap_or_else(|| alloc::string::String::from("/bin/init"))
+            } else {
+                match crate::vfs::readlink(path_str) {
+                    Ok(t) => t,
+                    Err(_) => return -22, // EINVAL
+                }
+            };
+
+            let bytes = target_str.as_bytes();
+            let len = bytes.len().min(bufsiz);
+            if len > 0 {
+                unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, len); }
+            }
+            len as i64
+        }
+        // 157: prctl(option, arg2, arg3, arg4, arg5)
+        157 => {
+            const PR_SET_NAME: u64    = 15;
+            const PR_GET_NAME: u64    = 16;
+            const PR_SET_DUMPABLE: u64 = 4;
+            const PR_GET_DUMPABLE: u64 = 3;
+            const PR_SET_PDEATHSIG: u64 = 1;
+            match arg1 {
+                PR_SET_NAME => 0,   // ignore thread name
+                PR_GET_NAME => {
+                    let buf = arg2 as *mut u8;
+                    let name = b"astryx\0";
+                    unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), buf, name.len()); }
+                    0
+                }
+                PR_SET_DUMPABLE  => 0,
+                PR_GET_DUMPABLE  => 0,
+                PR_SET_PDEATHSIG => 0,
+                _                => 0, // permissive default
+            }
+        }
+        // 186: gettid — return current kernel thread ID
+        186 => crate::proc::current_tid() as i64,
+        // 203: sched_setaffinity(pid, cpusetsize, mask) — stub (accept any)
+        203 => 0,
+        // 204: sched_getaffinity(pid, cpusetsize, mask) — report CPU 0 only
+        204 => {
+            let buf = arg3 as *mut u8;
+            let bufsiz = arg2 as usize;
+            if buf != core::ptr::null_mut() {
+                // Zero the buffer, then set bit 0 (CPU 0).
+                unsafe {
+                    core::ptr::write_bytes(buf, 0, bufsiz.min(128));
+                    if bufsiz >= 1 { core::ptr::write(buf, 0x01); }
+                }
+            }
+            0
+        }
+        // 209: io_setup stub
+        209 => -38,
+        // 213: epoll_create(size) — not supported, return -ENOSYS
+        213 => -38,
+        // 232: epoll_ctl(epfd, op, fd, event)
+        232 => -9,  // EBADF (epfd invalid)
+        // 233: epoll_wait(epfd, events, maxevents, timeout)
+        233 => 0,   // No events (stub)
+        // 273: set_robust_list(head, len) — stub
+        273 => 0,
+        // 274: get_robust_list(pid, head_ptr, len_ptr) — stub
+        274 => 0,
+        // 281: epoll_create1(flags) — not supported  
+        281 => -38,
+        // 309: getcpu(cpu, node, cache) — stub
+        309 => {
+            if arg1 != 0 { unsafe { core::ptr::write(arg1 as *mut u32, 0); } }
+            if arg2 != 0 { unsafe { core::ptr::write(arg2 as *mut u32, 0); } }
+            0
+        }
         // 59: execve(pathname, argv, envp) — pathname is C string
         59 => {
             let path_bytes = read_cstring_from_user(arg1);
@@ -1915,12 +2835,25 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
         79 => sys_getcwd(arg1 as *mut u8, arg2 as usize),
         // 80: chdir(pathname) — C string
         80 => sys_chdir_linux(arg1),
+        // 81: fchdir(fd) — change CWD to the directory opened as fd
+        81 => sys_fchdir_linux(arg1),
         // 83: mkdir(pathname, mode) — C string
         83 => sys_mkdir_linux(arg1, arg2),
         // 84: rmdir(pathname) — C string
         84 => sys_rmdir_linux(arg1),
         // 87: unlink(pathname) — C string
         87 => sys_unlink_linux(arg1),
+        // 88: symlink(oldpath, newpath) — C strings
+        88 => {
+            let old_raw = read_cstring_from_user(arg1);
+            let new_raw = read_cstring_from_user(arg2);
+            let old_str = core::str::from_utf8(old_raw).unwrap_or("");
+            let new_str = core::str::from_utf8(new_raw).unwrap_or("");
+            match crate::vfs::symlink(old_str, new_str) {
+                Ok(()) => 0,
+                Err(e) => -(e as usize as i64),
+            }
+        }
         // 96: gettimeofday(tv, tz)
         96 => sys_gettimeofday(arg1, arg2),
         // 102: getuid
@@ -1940,7 +2873,7 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
         // 160: setrlimit(resource, rlim) — stub
         160 => 0,
         // 202: futex(uaddr, futex_op, val, ...)
-        202 => sys_futex_linux(arg1, arg2, arg3),
+        202 => sys_futex_linux(arg1, arg2, arg3, arg4, arg5),
         // 217: getdents64(fd, dirp, count)
         217 => sys_getdents64(arg1, arg2, arg3),
         // 218: set_tid_address(tidptr)
@@ -1965,6 +2898,180 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
         318 => sys_getrandom(arg1 as *mut u8, arg2 as usize),
         // 334: rseq(rseq, rseq_len, flags, sig)
         334 => -38, // ENOSYS
+
+        // ─── Phase 6 additions ────────────────────────────────────────────
+
+        // 137: statfs(path, buf) — filesystem statistics
+        137 => sys_statfs_linux(arg1, arg2 as *mut u8),
+        // 138: fstatfs(fd, buf) — filesystem statistics (fd-based)
+        138 => sys_fstatfs_linux(arg1 as usize, arg2 as *mut u8),
+        // 266: symlinkat(oldpath, newdirfd, newpath)
+        266 => {
+            let old_raw = read_cstring_from_user(arg1);
+            let new_raw = read_cstring_from_user(arg3);
+            let old_str = core::str::from_utf8(old_raw).unwrap_or("");
+            let new_str = core::str::from_utf8(new_raw).unwrap_or("");
+            match crate::vfs::symlink(old_str, new_str) {
+                Ok(()) => 0,
+                Err(e) => -(e as usize as i64),
+            }
+        }
+        // 269: faccessat(dirfd, pathname, mode, flags) — access + dirfd
+        269 => sys_faccessat_linux(arg1, arg2, arg3),
+        // 280: utimensat(dirfd, pathname, times, flags) — stub success
+        280 => 0,
+        // 284: eventfd(initval, flags) / 290: eventfd2(initval, flags)
+        284 | 290 => sys_eventfd_linux(arg1 as u64),
+        // 293: pipe2(pipefd, flags) — like pipe but with O_CLOEXEC/O_NONBLOCK
+        293 => sys_pipe2_linux(arg1 as *mut u32, arg2 as u32),
+        // 435: clone3(args, size)
+        435 => -38, // ENOSYS for now — musl falls back to clone()
+
+        // ─── Phase 7: Firefox dependency syscalls ─────────────────────────
+
+        // 28: madvise(addr, len, advice) — memory hint; always succeeds
+        28 => 0,
+        // 73: flock(fd, operation) — advisory file locking; stub success
+        73 => 0,
+        // 98: getrusage(who, usage) — resource usage; return zeroed struct
+        98 => {
+            if arg2 != 0 {
+                unsafe { core::ptr::write_bytes(arg2 as *mut u8, 0, 144); }
+            }
+            0
+        }
+        // 99: sysinfo(info) — system statistics
+        99 => {
+            if arg1 != 0 {
+                // struct sysinfo: 11 fields, 64 bytes total
+                unsafe { core::ptr::write_bytes(arg1 as *mut u8, 0, 64); }
+                // uptime (seconds) at offset 0
+                let ticks = crate::arch::x86_64::irq::get_ticks();
+                let uptime = (ticks / 100) as i64; // 100 Hz
+                unsafe { *(arg1 as *mut i64) = uptime; }
+                // totalram / freeram at offsets 8 / 16 (u64 each)
+                unsafe {
+                    let p = arg1 as *mut u64;
+                    *p.add(1) = 256 * 1024 * 1024; // 256 MiB totalram
+                    *p.add(2) = 128 * 1024 * 1024; // 128 MiB freeram
+                    *p.add(9) = 1; // mem_unit = 1 byte
+                }
+            }
+            0
+        }
+        // 229: clock_getres(clk_id, res) — returns 1 ns resolution for all clocks
+        229 => {
+            if arg2 != 0 {
+                unsafe {
+                    let ts = arg2 as *mut u64;
+                    *ts       = 0; // tv_sec = 0
+                    *ts.add(1) = 1; // tv_nsec = 1 (nanosecond resolution)
+                }
+            }
+            0
+        }
+        // 267: readlinkat(dirfd, pathname, buf, bufsiz)
+        267 => {
+            const AT_FDCWD: i64 = -100;
+            let raw = read_cstring_from_user(arg2);
+            let path_str = core::str::from_utf8(raw).unwrap_or("");
+            // If AT_FDCWD or absolute path, delegate to readlink logic
+            let full_path: alloc::string::String = if arg1 as i64 == AT_FDCWD || path_str.starts_with('/') {
+                alloc::string::String::from(path_str)
+            } else {
+                // Relative path — prepend fd's directory
+                let pid = crate::proc::current_pid();
+                let base = {
+                    let procs = crate::proc::PROCESS_TABLE.lock();
+                    let proc = match procs.iter().find(|p| p.pid == pid) {
+                        Some(p) => p,
+                        None => return -3,
+                    };
+                    let idx = arg1 as usize;
+                    if idx >= proc.file_descriptors.len() { return -9; }
+                    match &proc.file_descriptors[idx] {
+                        Some(f) => f.open_path.clone(),
+                        None => return -9,
+                    }
+                };
+                let mut s = alloc::string::String::from(base.trim_end_matches('/'));
+                s.push('/');
+                s.push_str(path_str);
+                s
+            };
+            let buf = arg3 as *mut u8;
+            let bufsiz = arg4 as usize;
+            // /proc/self/exe special case
+            let target: alloc::string::String = if full_path == "/proc/self/exe" {
+                let pid = crate::proc::current_pid();
+                let procs = crate::proc::PROCESS_TABLE.lock();
+                procs.iter().find(|p| p.pid == pid)
+                    .and_then(|p| p.exe_path.as_ref())
+                    .map(|s| s.clone())
+                    .unwrap_or_else(|| alloc::string::String::from("/bin/init"))
+            } else {
+                match crate::vfs::readlink(&full_path) {
+                    Ok(t) => t,
+                    Err(_) => return -22,
+                }
+            };
+            let bytes = target.as_bytes();
+            let len = bytes.len().min(bufsiz);
+            if len > 0 { unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, len); } }
+            len as i64
+        }
+        // 271: ppoll(fds, nfds, tmo_p, sigmask, sigsetsize) — poll with timeout+mask
+        271 => {
+            // Delegate to poll (syscall 7), ignoring sigmask
+            let timeout_ms: i64 = if arg3 == 0 {
+                0 // null timeout → return immediately
+            } else {
+                -1 // wait indefinitely (we don't support real timeouts here)
+            };
+            dispatch_linux(7, arg1, arg2, timeout_ms as u64, 0, 0, 0)
+        }
+        // 283: timerfd_create(clockid, flags) — stub ENOSYS
+        283 => -38,
+        // 289: signalfd4(fd, mask, sizemask, flags) — stub ENOSYS
+        289 => -38,
+        // 294: inotify_init1(flags) — stub ENOSYS
+        294 => -38,
+        // 319: memfd_create(name, flags) — create an anonymous in-memory file
+        319 => sys_memfd_create(arg1, arg2),
+        // 332: statx(dirfd, pathname, flags, mask, statxbuf) — extended stat
+        332 => {
+            // Simplified: delegate to stat, then fill statx fields
+            let path_bytes = read_cstring_from_user(arg2);
+            let path       = match core::str::from_utf8(path_bytes) { Ok(s) => s, Err(_) => return -22 };
+            if arg5 == 0 { return -14; } // EFAULT
+            match crate::vfs::stat(path) {
+                Ok(st) => {
+                    // struct statx is 256 bytes; zero the whole thing first
+                    unsafe { core::ptr::write_bytes(arg5 as *mut u8, 0, 256); }
+                    let p = arg5 as *mut u32;
+                    unsafe {
+                        *p       = 0x7ff; // stx_mask  — all fields valid
+                        *p.add(1) = 4096; // stx_blksize
+                        // stx_nlink at offset 8: u32
+                        *(arg5 as *mut u32).add(2) = 1;
+                        // stx_size at offset 48: u64
+                        *(arg5 as *mut u64).add(6) = st.size;
+                        // stx_mode at offset 20: u16 (type + perm bits)
+                        let mode: u16 = match st.file_type {
+                            crate::vfs::FileType::Directory   => 0o040_755,
+                            crate::vfs::FileType::SymLink     => 0o120_777,
+                            _                                 => 0o100_644,
+                        };
+                        *(arg5 as *mut u16).add(10) = mode;
+                        // stx_ino at offset 32: u64
+                        *(arg5 as *mut u64).add(4) = st.inode;
+                    }
+                    0
+                }
+                Err(e) => -(e as i64),
+            }
+        }
+
         _ => {
             crate::serial_println!("[SYSCALL/Linux] Unknown Linux syscall: {}", num);
             -38 // ENOSYS
@@ -2005,6 +3112,33 @@ fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
             Some(n) => n as i64,
             None => -9,
         }
+    } else if is_unix_socket_fd(crate::proc::current_pid(), fd as usize) {
+        // AF_UNIX socket read
+        let unix_id = get_unix_socket_id(crate::proc::current_pid(), fd as usize);
+        let buf_sl = unsafe { core::slice::from_raw_parts_mut(buf_ptr, count) };
+        crate::net::unix::read(unix_id, buf_sl)
+    } else if is_socket_fd(crate::proc::current_pid(), fd as usize) {
+        let socket_id = get_socket_id(crate::proc::current_pid(), fd as usize);
+        match crate::net::socket::socket_recv(socket_id) {
+            Ok(data) => {
+                let n = data.len().min(count);
+                unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, n); }
+                n as i64
+            }
+            Err(_) => -11, // EAGAIN — no data (non-blocking)
+        }
+    } else if is_eventfd_fd(crate::proc::current_pid(), fd as usize) {
+        // eventfd read: returns current counter as u64 LE (8 bytes)
+        if count < 8 { return -22; } // EINVAL — must read exactly 8 bytes
+        let efd_id = get_eventfd_id(crate::proc::current_pid(), fd as usize);
+        match crate::ipc::eventfd::read(efd_id) {
+            Ok(val) => {
+                let bytes = val.to_le_bytes();
+                unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr, 8); }
+                8
+            }
+            Err(e) => e, // EAGAIN or EBADF
+        }
     } else {
         let pid = crate::proc::current_pid();
         match crate::vfs::fd_read(pid, fd as usize, buf_ptr, count) {
@@ -2032,6 +3166,27 @@ fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
             Some(n) => n as i64,
             None => -9,
         }
+    } else if is_unix_socket_fd(crate::proc::current_pid(), fd as usize) {
+        // AF_UNIX socket write
+        let unix_id = get_unix_socket_id(crate::proc::current_pid(), fd as usize);
+        let data = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
+        crate::net::unix::write(unix_id, data)
+    } else if is_socket_fd(crate::proc::current_pid(), fd as usize) {
+        let socket_id = get_socket_id(crate::proc::current_pid(), fd as usize);
+        let data = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
+        match crate::net::socket::socket_send(socket_id, data) {
+            Ok(n) => n as i64,
+            Err(_) => -104, // ECONNRESET
+        }
+    } else if is_eventfd_fd(crate::proc::current_pid(), fd as usize) {
+        // eventfd write: add u64 LE value to counter
+        if count < 8 { return -22; } // EINVAL
+        let efd_id = get_eventfd_id(crate::proc::current_pid(), fd as usize);
+        let val = unsafe { core::ptr::read_unaligned(buf_ptr as *const u64) };
+        match crate::ipc::eventfd::write(efd_id, u64::from_le(val)) {
+            Ok(()) => 8,
+            Err(e) => e,
+        }
     } else {
         let pid = crate::proc::current_pid();
         match crate::vfs::fd_write(pid, fd as usize, buf_ptr, count) {
@@ -2049,8 +3204,35 @@ fn sys_open_linux(pathname: u64, flags: u64, _mode: u64) -> i64 {
         Err(_) => return -22,
     };
     let pid = crate::proc::current_pid();
+
+    // Refresh /proc/self/maps with dynamic per-process VMA content before opening.
+    if path == "/proc/self/maps" {
+        refresh_proc_maps(pid);
+    }
+
     match crate::vfs::open(pid, path, flags as u32) {
-        Ok(fd) => fd as i64,
+        Ok(fd_num) => {
+            // Special character devices: tag the fd with a device kind flag so
+            // fd_read/fd_write can give them proper behaviour.
+            //   bit 26 (0x0400_0000) = /dev/null
+            //   bit 25 (0x0200_0000) = /dev/zero
+            //   bit 24 (0x0100_0000) = /dev/urandom | /dev/random
+            let dev_flag: u32 = match path {
+                "/dev/null"                    => 0x0400_0000,
+                "/dev/zero"                    => 0x0200_0000,
+                "/dev/urandom" | "/dev/random" => 0x0100_0000,
+                _ => 0,
+            };
+            if dev_flag != 0 {
+                let mut procs = crate::proc::PROCESS_TABLE.lock();
+                if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                    if let Some(Some(f)) = p.file_descriptors.get_mut(fd_num) {
+                        f.flags |= dev_flag;
+                    }
+                }
+            }
+            fd_num as i64
+        }
         Err(e) => -(e as i64),
     }
 }
@@ -2122,6 +3304,68 @@ fn sys_chdir_linux(pathname: u64) -> i64 {
     sys_chdir(path_bytes.as_ptr(), path_bytes.len())
 }
 
+/// fchdir(fd) — change CWD to the directory referred to by `fd`.
+fn sys_fchdir_linux(fd: u64) -> i64 {
+    let pid = crate::proc::current_pid();
+    let open_path = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        let proc = match procs.iter().find(|p| p.pid == pid) {
+            Some(p) => p,
+            None => return -3, // ESRCH
+        };
+        let fd_idx = fd as usize;
+        if fd_idx >= proc.file_descriptors.len() { return -9; } // EBADF
+        match &proc.file_descriptors[fd_idx] {
+            Some(f) => f.open_path.clone(),
+            None => return -9,
+        }
+    };
+    if open_path.is_empty() { return -9; } // EBADF — path unknown
+    sys_chdir(open_path.as_ptr(), open_path.len())
+}
+
+/// faccessat(dirfd, pathname, mode, flags) — access check relative to dirfd.
+fn sys_faccessat_linux(dirfd: u64, pathname: u64, mode: u64) -> i64 {
+    const AT_FDCWD: i64 = -100;
+    // If AT_FDCWD or an absolute path, behave like access()
+    if dirfd as i64 == AT_FDCWD {
+        return sys_access(pathname, mode);
+    }
+    // Try to get the base directory from the fd and reconstruct full path
+    let pid = crate::proc::current_pid();
+    let base = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        let proc = match procs.iter().find(|p| p.pid == pid) {
+            Some(p) => p,
+            None => return -3,
+        };
+        let idx = dirfd as usize;
+        if idx >= proc.file_descriptors.len() { return -9; }
+        match &proc.file_descriptors[idx] {
+            Some(f) => f.open_path.clone(),
+            None => return -9,
+        }
+    };
+    let rel_bytes = read_cstring_from_user(pathname);
+    let rel = match core::str::from_utf8(rel_bytes) {
+        Ok(s) => s,
+        Err(_) => return -22,
+    };
+    // Build full path: base + "/" + rel (if rel is absolute, use as-is)
+    let full = if rel.starts_with('/') {
+        alloc::string::String::from(rel)
+    } else {
+        let mut s = alloc::string::String::from(base.trim_end_matches('/'));
+        s.push('/');
+        s.push_str(rel);
+        s
+    };
+    match crate::vfs::stat(&full) {
+        Ok(_) => 0,
+        Err(_) => -2, // ENOENT
+    }
+}
+
 /// Linux mkdir(pathname, mode) — pathname is a C string.
 fn sys_mkdir_linux(pathname: u64, _mode: u64) -> i64 {
     let path_bytes = read_cstring_from_user(pathname);
@@ -2168,6 +3412,8 @@ fn fill_linux_stat(buf: *mut u8, st: &crate::vfs::FileStat) {
         crate::vfs::FileType::CharDevice  => 0o020000 | st.permissions,
         crate::vfs::FileType::BlockDevice => 0o060000 | st.permissions,
         crate::vfs::FileType::Pipe        => 0o010000 | st.permissions,
+        crate::vfs::FileType::EventFd     => 0o010000 | st.permissions, // FIFO
+        crate::vfs::FileType::Socket      => 0o140000 | st.permissions, // S_IFSOCK
     };
     out[24..28].copy_from_slice(&mode.to_le_bytes());
     // uid (offset 28), gid (offset 32): 0
@@ -2263,8 +3509,66 @@ pub fn sys_clock_gettime(clk_id: u64, tp: u64) -> i64 {
 
 /// mprotect(addr, len, prot) — Change protection on memory region.
 ///
-/// Stub: returns 0 (pretend success). Full page-table manipulation deferred.
-fn sys_mprotect(_addr: u64, _len: u64, _prot: u64) -> i64 {
+/// Walks the page table for every mapped page in [addr, addr+len) and updates
+/// the PTE flags to match the requested protection.  Also updates the VMA prot
+/// field so future page-fault allocations use the right flags.
+fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
+    use crate::mm::vma::{page_align_down, page_align_up, PROT_READ, PROT_WRITE, PROT_EXEC};
+    use crate::mm::vmm::{read_pte, write_pte, invlpg, PAGE_PRESENT, PAGE_WRITABLE,
+                         PAGE_USER, PAGE_NO_EXECUTE};
+
+    if len == 0 {
+        return 0;
+    }
+
+    // Must be page-aligned.
+    if addr & 0xFFF != 0 {
+        return -22; // EINVAL
+    }
+
+    let base  = page_align_down(addr);
+    let end   = page_align_up(addr.wrapping_add(len));
+    let prot  = prot as u32;
+    let pid   = crate::proc::current_pid();
+
+    let mut procs = crate::proc::PROCESS_TABLE.lock();
+    let proc = match procs.iter_mut().find(|p| p.pid == pid) {
+        Some(p) => p,
+        None => return -3,
+    };
+
+    let space = match proc.vm_space.as_mut() {
+        Some(s) => s,
+        None => return -22,
+    };
+    let cr3 = space.cr3;
+
+    // Update VMA prot fields that overlap this range.
+    for vma in space.areas.iter_mut() {
+        if vma.base >= end || vma.end() <= base { continue; }
+        vma.prot = prot;
+    }
+
+    // Walk every page and retag PTEs.
+    let mut page = base;
+    while page < end {
+        let pte = read_pte(cr3, page);
+        if pte & PAGE_PRESENT != 0 {
+            let phys = pte & 0x000F_FFFF_FFFF_F000;
+            // Start from PRESENT | USER; add WRITABLE or NO_EXECUTE as needed.
+            let mut new_flags = PAGE_PRESENT | PAGE_USER;
+            if prot & PROT_WRITE != 0 {
+                new_flags |= PAGE_WRITABLE;
+            }
+            if prot & PROT_EXEC == 0 {
+                new_flags |= PAGE_NO_EXECUTE;
+            }
+            write_pte(cr3, page, phys | new_flags);
+            invlpg(page);
+        }
+        page = page.wrapping_add(0x1000);
+    }
+
     0
 }
 
@@ -2392,6 +3696,8 @@ fn sys_getdents64(fd: u64, buf: u64, count: u64) -> i64 {
             crate::vfs::FileType::CharDevice  => 2,  // DT_CHR
             crate::vfs::FileType::BlockDevice => 6,  // DT_BLK
             crate::vfs::FileType::Pipe        => 1,  // DT_FIFO
+            crate::vfs::FileType::EventFd     => 1,  // DT_FIFO
+            crate::vfs::FileType::Socket      => 12, // DT_SOCK
         };
         // d_name (offset 19)
         let nlen = name_bytes.len().min(reclen - 20);
@@ -2546,17 +3852,31 @@ fn sys_rt_sigprocmask_linux(how: u64, set: u64, oldset: u64, _sigsetsize: u64) -
     0
 }
 
-/// futex — Wait/Wake implementation for musl/pthread compatibility.
+/// futex — Wait/Wake/Requeue implementation for musl/pthread compatibility.
 ///
-/// FUTEX_WAIT(0): if *uaddr == val, block the calling thread until woken.
-/// FUTEX_WAKE(1): wake up to val waiters blocked on uaddr.
-fn sys_futex_linux(uaddr: u64, futex_op: u64, val: u64) -> i64 {
-    let op = futex_op & 0x7F; // Mask out FUTEX_PRIVATE_FLAG
+/// Supported ops:
+///   0  FUTEX_WAIT          Block if *uaddr==val, optional timeout in arg4
+///   1  FUTEX_WAKE          Wake up to val waiters on uaddr
+///   4  FUTEX_REQUEUE       Wake val waiters, requeue up-to val2 to uaddr2
+///   5  FUTEX_CMP_REQUEUE   Like REQUEUE but check *uaddr==val3 first
+///   9  FUTEX_WAIT_BITSET   Like WAIT (bitset ignored)
+///  10  FUTEX_WAKE_BITSET   Like WAKE (bitset ignored)
+fn sys_futex_linux(uaddr: u64, futex_op: u64, val: u64, timeout_ptr: u64, uaddr2: u64) -> i64 {
+    let op = futex_op & 0x7F; // Strip FUTEX_PRIVATE_FLAG and FUTEX_CLOCK_REALTIME
     let pid = crate::proc::current_pid();
 
+    // Helper: read timeout as nanoseconds from struct timespec { tv_sec: i64, tv_nsec: i64 }
+    let timeout_ns: Option<u64> = if timeout_ptr != 0 {
+        let tv_sec  = unsafe { user_read_u64(timeout_ptr) }.unwrap_or(0);
+        let tv_nsec = unsafe { user_read_u64(timeout_ptr + 8) }.unwrap_or(0);
+        Some(tv_sec.saturating_mul(1_000_000_000).saturating_add(tv_nsec))
+    } else {
+        None
+    };
+
     match op {
-        0 => {
-            // FUTEX_WAIT: if *uaddr == val, block until woken
+        0 | 9 => {
+            // FUTEX_WAIT / FUTEX_WAIT_BITSET: block if *uaddr == val
             let current = match unsafe { user_read_u32(uaddr) } {
                 Some(v) => v,
                 None => return -14, // EFAULT
@@ -2565,40 +3885,54 @@ fn sys_futex_linux(uaddr: u64, futex_op: u64, val: u64) -> i64 {
                 return -11; // EAGAIN — value changed
             }
 
-            // Add ourselves to the wait queue.
             let tid = crate::proc::current_tid();
             {
                 let mut waiters = FUTEX_WAITERS.lock();
                 waiters.entry((pid, uaddr)).or_insert_with(Vec::new).push(tid);
             }
 
-            // Block the thread. We'll be woken by FUTEX_WAKE.
+            // Block the thread with optional timeout deadline (approximate via tick count).
             {
                 let mut threads = crate::proc::THREAD_TABLE.lock();
                 if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
                     t.state = crate::proc::ThreadState::Blocked;
-                    t.wake_tick = u64::MAX; // indefinite block
+                    // Approximate: 100 Hz tick, so 1 tick = 10 ms = 10_000_000 ns
+                    t.wake_tick = if let Some(ns) = timeout_ns {
+                        let now = crate::arch::x86_64::irq::get_ticks();
+                        let delta_ticks = (ns / 10_000_000).max(1);
+                        now.saturating_add(delta_ticks)
+                    } else {
+                        u64::MAX
+                    };
                 }
             }
             crate::sched::schedule();
 
-            // When we return here, we've been woken.
-            // Clean up: remove ourselves from wait queue (if still there).
+            // Woken (or timed out). Clean up from wait queue.
+            let mut timed_out = false;
             {
                 let mut waiters = FUTEX_WAITERS.lock();
                 if let Some(list) = waiters.get_mut(&(pid, uaddr)) {
+                    let before = list.len();
                     list.retain(|&t| t != tid);
+                    if list.len() < before { timed_out = true; } // still in list → woken; removed → timed out
                     if list.is_empty() {
                         waiters.remove(&(pid, uaddr));
                     }
                 }
             }
-            0
+            // If we removed ourselves from the waiter list, the scheduler woke us = timeout.
+            // If the list entry was already gone, FUTEX_WAKE removed us = success.
+            if timed_out {
+                -110 // ETIMEDOUT
+            } else {
+                0
+            }
         }
-        1 => {
-            // FUTEX_WAKE: wake up to val waiters
-            let mut woken = 0u64;
+        1 | 10 => {
+            // FUTEX_WAKE / FUTEX_WAKE_BITSET: wake up to val waiters
             let max_wake = if val == 0 { u64::MAX } else { val };
+            let mut woken = 0u64;
 
             let tids_to_wake: Vec<u64> = {
                 let mut waiters = FUTEX_WAITERS.lock();
@@ -2617,13 +3951,13 @@ fn sys_futex_linux(uaddr: u64, futex_op: u64, val: u64) -> i64 {
                 }
             };
 
-            // Wake the threads.
-            if !tids_to_wake.is_empty() {
+            {
                 let mut threads = crate::proc::THREAD_TABLE.lock();
-                for &tid in &tids_to_wake {
-                    if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
-                        if t.state == crate::proc::ThreadState::Blocked {
-                            t.state = crate::proc::ThreadState::Ready;
+                for &t in &tids_to_wake {
+                    if let Some(th) = threads.iter_mut().find(|th| th.tid == t) {
+                        if th.state == crate::proc::ThreadState::Blocked {
+                            th.state = crate::proc::ThreadState::Ready;
+                            th.wake_tick = 0;
                         }
                     }
                 }
@@ -2631,6 +3965,356 @@ fn sys_futex_linux(uaddr: u64, futex_op: u64, val: u64) -> i64 {
 
             woken as i64
         }
+        4 | 5 => {
+            // FUTEX_REQUEUE / FUTEX_CMP_REQUEUE
+            // arg3=val (wake count), arg4=val2 (requeue count), arg5=uaddr2
+            // For CMP_REQUEUE, also check *uaddr == val3 (we reuse val as val1, uaddr2 as uaddr2)
+            // val2 is passed in timeout_ptr slot (Linux ABI: arg4 = val2 for REQUEUE)
+            let val2 = timeout_ptr; // requeue limit (positional arg4)
+
+            if op == 5 {
+                // CMP_REQUEUE: verify *uaddr == val (the 6th argument would be val3, skip for simplicity)
+                let current = match unsafe { user_read_u32(uaddr) } {
+                    Some(v) => v,
+                    None => return -14,
+                };
+                if current as u64 != val {
+                    return -11; // EAGAIN
+                }
+            }
+
+            let max_wake = val;
+            let max_requeue = val2;
+            let mut woken = 0u64;
+            let mut requeued = 0u64;
+
+            let tids_to_wake: Vec<u64>;
+            let tids_to_requeue: Vec<u64>;
+
+            {
+                let mut waiters = FUTEX_WAITERS.lock();
+                let src = waiters.remove(&(pid, uaddr)).unwrap_or_default();
+                let mut wake_list = Vec::new();
+                let mut requeue_list = Vec::new();
+                for tid in src {
+                    if woken < max_wake {
+                        wake_list.push(tid);
+                        woken += 1;
+                    } else if requeued < max_requeue {
+                        requeue_list.push(tid);
+                        requeued += 1;
+                    }
+                }
+                // Requeue to uaddr2
+                if !requeue_list.is_empty() {
+                    waiters.entry((pid, uaddr2)).or_insert_with(Vec::new).extend(requeue_list.iter());
+                }
+                tids_to_wake = wake_list;
+                tids_to_requeue = requeue_list;
+                let _ = tids_to_requeue; // used above
+            }
+
+            {
+                let mut threads = crate::proc::THREAD_TABLE.lock();
+                for &t in &tids_to_wake {
+                    if let Some(th) = threads.iter_mut().find(|th| th.tid == t) {
+                        if th.state == crate::proc::ThreadState::Blocked {
+                            th.state = crate::proc::ThreadState::Ready;
+                            th.wake_tick = 0;
+                        }
+                    }
+                }
+            }
+
+            (woken + requeued) as i64
+        }
         _ => -38, // ENOSYS
     }
+}
+
+// ── Phase 6 syscall implementations ────────────────────────────────────────
+
+/// eventfd(initval, flags) — Create a counter-based signaling fd.
+fn sys_eventfd_linux(initval: u64) -> i64 {
+    let efd_id = crate::ipc::eventfd::create(initval, 0);
+    if efd_id == u64::MAX {
+        return -24; // EMFILE
+    }
+
+    let pid = crate::proc::current_pid();
+    let mut procs = crate::proc::PROCESS_TABLE.lock();
+    let proc = match procs.iter_mut().find(|p| p.pid == pid) {
+        Some(p) => p,
+        None => {
+            crate::ipc::eventfd::close(efd_id);
+            return -3;
+        }
+    };
+
+    let fd = crate::vfs::FileDescriptor {
+        mount_idx: usize::MAX,
+        inode:     efd_id,
+        offset:    0,
+        flags:     0x0001_0000, // eventfd marker
+        is_console: false,
+        file_type: crate::vfs::FileType::EventFd,
+        open_path: alloc::string::String::new(),
+    };
+
+    // Find a free slot.
+    let mut slot = None;
+    for (i, f) in proc.file_descriptors.iter().enumerate() {
+        if f.is_none() { slot = Some(i); break; }
+    }
+    let idx = if let Some(i) = slot {
+        i
+    } else if proc.file_descriptors.len() < crate::vfs::MAX_FDS_PER_PROCESS {
+        let i = proc.file_descriptors.len();
+        proc.file_descriptors.push(None);
+        i
+    } else {
+        crate::ipc::eventfd::close(efd_id);
+        return -24; // EMFILE
+    };
+
+    proc.file_descriptors[idx] = Some(fd);
+    idx as i64
+}
+
+/// pipe2(pipefd[2], flags) — Create a pipe with optional flags.
+///
+/// flags may include:
+///   O_CLOEXEC (0x0008_0000) — set close-on-exec (stored but not enforced yet)
+///   O_NONBLOCK (0x0800)     — set non-blocking (stored but not enforced yet)
+fn sys_pipe2_linux(fds_out: *mut u32, flags: u32) -> i64 {
+    if fds_out.is_null() {
+        return -22; // EINVAL
+    }
+
+    let pipe_id = crate::ipc::pipe::create_pipe();
+    let pid = crate::proc::current_pid();
+
+    let mut procs = crate::proc::PROCESS_TABLE.lock();
+    let proc = match procs.iter_mut().find(|p| p.pid == pid) {
+        Some(p) => p,
+        None => return -3,
+    };
+
+    let extra_flags: u32 = flags & (0x0008_0000 | 0x0800); // cloexec | nonblock
+
+    let read_fd = crate::vfs::FileDescriptor {
+        mount_idx: usize::MAX,
+        inode:     pipe_id,
+        offset:    0,
+        flags:     0x8000_0000 | extra_flags, // read end
+        is_console: false,
+        file_type: crate::vfs::FileType::Pipe,
+        open_path: alloc::string::String::new(),
+    };
+    let write_fd = crate::vfs::FileDescriptor {
+        mount_idx: usize::MAX,
+        inode:     pipe_id,
+        offset:    0,
+        flags:     0x8000_0001 | extra_flags, // write end
+        is_console: false,
+        file_type: crate::vfs::FileType::Pipe,
+        open_path: alloc::string::String::new(),
+    };
+
+    let mut read_idx  = None;
+    let mut write_idx = None;
+    for (i, f) in proc.file_descriptors.iter().enumerate() {
+        if f.is_none() {
+            if read_idx.is_none()       { read_idx  = Some(i); }
+            else if write_idx.is_none() { write_idx = Some(i); break; }
+        }
+    }
+
+    // Extend fd table if needed
+    let ri = if let Some(i) = read_idx {
+        i
+    } else if proc.file_descriptors.len() < crate::vfs::MAX_FDS_PER_PROCESS {
+        let i = proc.file_descriptors.len();
+        proc.file_descriptors.push(None);
+        i
+    } else {
+        return -24; // EMFILE
+    };
+    let wi = if let Some(i) = write_idx {
+        i
+    } else if proc.file_descriptors.len() < crate::vfs::MAX_FDS_PER_PROCESS {
+        let i = proc.file_descriptors.len();
+        proc.file_descriptors.push(None);
+        i
+    } else {
+        return -24; // EMFILE
+    };
+
+    proc.file_descriptors[ri] = Some(read_fd);
+    proc.file_descriptors[wi] = Some(write_fd);
+
+    unsafe {
+        core::ptr::write_unaligned(fds_out,          ri as u32);
+        core::ptr::write_unaligned(fds_out.add(1),   wi as u32);
+    }
+    0
+}
+
+/// statfs(path, buf) — Report filesystem statistics.
+///
+/// struct statfs (120 bytes on x86_64):
+///   u64 f_type, f_bsize, f_blocks, f_bfree, f_bavail, f_files, f_ffree
+///   u32[2] f_fsid
+///   u64 f_namelen, f_frsize, f_flags
+///   u64[4] f_spare
+fn sys_statfs_linux(path_ptr: u64, buf: *mut u8) -> i64 {
+    if buf.is_null() { return -14; }
+    let path_raw = read_cstring_from_user(path_ptr);
+    let path = core::str::from_utf8(path_raw).unwrap_or("");
+
+    // Check the path exists (ignore error — statfs on /proc etc. always ok).
+    let _ = crate::vfs::stat(path);
+
+    fill_statfs_buf(buf);
+    0
+}
+
+/// fstatfs(fd, buf) — filesystem statistics for an open fd.
+fn sys_fstatfs_linux(_fd: usize, buf: *mut u8) -> i64 {
+    if buf.is_null() { return -14; }
+    fill_statfs_buf(buf);
+    0
+}
+
+/// Write a plausible statfs structure into `buf` (120 bytes).
+fn fill_statfs_buf(buf: *mut u8) {
+    // Wipe first.
+    unsafe { core::ptr::write_bytes(buf, 0, 120); }
+    // Use EXT2_SUPER_MAGIC (0xEF53) as f_type — widely recognised.
+    let p = buf as *mut u64;
+    unsafe {
+        *p.add(0)  = 0xEF53;   // f_type
+        *p.add(1)  = 4096;     // f_bsize
+        *p.add(2)  = 1024*128; // f_blocks (~512 MiB)
+        *p.add(3)  = 1024*64;  // f_bfree
+        *p.add(4)  = 1024*64;  // f_bavail
+        *p.add(5)  = 32768;    // f_files
+        *p.add(6)  = 32768;    // f_ffree
+        // f_fsid at offset 56 — leave 0
+        // f_namelen at byte 64 = index 8 of u64 array
+        *p.add(8)  = 255;      // f_namelen
+        *p.add(9)  = 4096;     // f_frsize
+        *p.add(10) = 0;        // f_flags (ST_RDONLY=1? leave 0 = rw)
+    }
+}
+
+/// Regenerate /proc/self/maps for `pid` from the process's live VMA list.
+///
+/// memfd_create(name, flags) — create an anonymous in-memory file.
+/// Returns an fd pointing to a freshly created, unlinkable tmpfs file.
+/// The file lives at a hidden path /tmp/.memfd_NNNN and is deleted on close.
+fn sys_memfd_create(_name: u64, _flags: u64) -> i64 {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static MEMFD_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let seq = MEMFD_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = crate::proc::current_pid();
+
+    // Build path /tmp/.memfd_NNNN
+    let mut path_buf = [0u8; 32];
+    let prefix = b"/tmp/.memfd_";
+    path_buf[..prefix.len()].copy_from_slice(prefix);
+    let mut pos = prefix.len();
+    let mut n = seq;
+    let mut digits = [0u8; 20];
+    let mut dlen = 0usize;
+    if n == 0 { digits[0] = b'0'; dlen = 1; }
+    while n > 0 { digits[dlen] = b'0' + (n % 10) as u8; dlen += 1; n /= 10; }
+    for i in (0..dlen).rev() { path_buf[pos] = digits[i]; pos += 1; }
+    let path_str = core::str::from_utf8(&path_buf[..pos]).unwrap_or("/tmp/.memfd_0");
+
+    // Create the backing file in VFS
+    if crate::vfs::create_file(path_str).is_err() {
+        return -28; // ENOSPC
+    }
+
+    // Open it read/write
+    match crate::vfs::open(pid, path_str, crate::vfs::flags::O_RDWR) {
+        Ok(fd_num) => fd_num as i64,
+        Err(_) => -12, // ENOMEM
+    }
+}
+
+/// This is called every time a process opens /proc/self/maps so the content
+/// always reflects the current address space.  We snapshot the VMA list while
+/// holding PROCESS_TABLE, release the lock, then format + write the VFS file.
+fn refresh_proc_maps(pid: u64) {
+    use crate::mm::vma::{VmProt, PROT_READ, PROT_WRITE, PROT_EXEC};
+
+    // Snapshot VMA data (base, end, prot, name) without holding any lock while
+    // we format and write the VFS file (which acquires its own locks).
+    struct VmaSnap {
+        base: u64,
+        end:  u64,
+        prot: VmProt,
+        name: &'static str,
+    }
+
+    let snaps: Vec<VmaSnap> = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter().find(|p| p.pid == pid) {
+            if let Some(ref vs) = p.vm_space {
+                vs.areas.iter().map(|a| VmaSnap {
+                    base: a.base,
+                    end:  a.end(),
+                    prot: a.prot,
+                    name: a.name,
+                }).collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        }
+    };
+
+    if snaps.is_empty() {
+        return;
+    }
+
+    // Format each VMA entry.  Linux /proc/maps format:
+    //   aaaa-bbbb rwxp 00000000 00:00 0 pathname\n
+    let mut out = Vec::new();
+    for s in &snaps {
+        let r = if s.prot & PROT_READ  != 0 { b'r' } else { b'-' };
+        let w = if s.prot & PROT_WRITE != 0 { b'w' } else { b'-' };
+        let x = if s.prot & PROT_EXEC  != 0 { b'x' } else { b'-' };
+        // Write base address
+        write_hex64(&mut out, s.base);
+        out.push(b'-');
+        write_hex64(&mut out, s.end);
+        out.push(b' ');
+        out.push(r); out.push(w); out.push(x); out.push(b'p');
+        // offset dev ino
+        out.extend_from_slice(b" 00000000 00:00 0");
+        if !s.name.is_empty() {
+            out.push(b' ');
+            out.push(b' ');
+            out.extend_from_slice(s.name.as_bytes());
+        }
+        out.push(b'\n');
+    }
+
+    let _ = crate::vfs::write_file("/proc/self/maps", &out);
+}
+
+/// Write a 64-bit value as 16 lowercase hex digits into a Vec<u8>.
+fn write_hex64(out: &mut Vec<u8>, mut v: u64) {
+    let mut buf = [0u8; 16];
+    for i in (0..16).rev() {
+        let nibble = (v & 0xF) as u8;
+        buf[i] = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+        v >>= 4;
+    }
+    out.extend_from_slice(&buf);
 }

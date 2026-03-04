@@ -24,6 +24,7 @@ pub mod tcp;
 pub mod socket;
 pub mod dns;
 pub mod dhcp;
+pub mod unix;
 
 extern crate alloc;
 

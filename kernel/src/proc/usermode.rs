@@ -10,9 +10,47 @@
 //! atomically, switching privilege level). Return from user mode is via SYSCALL
 //! (handled by syscall_entry) or interrupts (handled via IDT + TSS.rsp[0]).
 
+extern crate alloc;
 use crate::arch::x86_64::gdt;
 use crate::proc::{self, elf, PROCESS_TABLE, THREAD_TABLE};
 use core::arch::asm;
+
+/// Create a user-mode thread in an existing process (for clone(CLONE_THREAD)).
+///
+/// Allocates a kernel stack, starts the thread at `user_mode_bootstrap`,
+/// which will IRETQ to `user_rip` with RSP = `user_rsp` and FS.base = `tls`
+/// (if `tls != 0`).
+///
+/// Returns the new thread's TID on success.
+pub fn create_user_thread(
+    pid: proc::Pid,
+    user_rip: u64,
+    user_rsp: u64,
+    tls: u64,
+) -> Option<proc::Tid> {
+    let tid = proc::create_thread(pid, "clone-child", user_mode_bootstrap as u64)?;
+
+    let cr3 = {
+        let procs = PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid)?.cr3
+    };
+
+    {
+        let mut threads = THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+            t.user_entry_rip = user_rip;
+            t.user_entry_rsp = user_rsp;
+            t.tls_base       = tls;
+            t.context.cr3    = cr3;
+        }
+    }
+
+    crate::serial_println!(
+        "[USER] Created clone thread TID {} in PID {}: RIP={:#x} RSP={:#x} TLS={:#x}",
+        tid, pid, user_rip, user_rsp, tls
+    );
+    Some(tid)
+}
 
 /// Create a user-mode process from an ELF binary.
 ///
@@ -55,12 +93,14 @@ pub fn create_user_process(name: &str, elf_data: &[u8]) -> Result<proc::Pid, elf
     // Then patch it with our per-process page table and user entry info.
     let pid = proc::create_kernel_process(name, user_mode_bootstrap as *const () as u64);
 
-    // Patch the process with our per-process page table.
+    // Patch the process with our per-process page table and exe path.
     {
         let mut procs = PROCESS_TABLE.lock();
         if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
             p.cr3 = user_cr3;
             p.vm_space = Some(vm_space);
+            p.exe_path = Some(alloc::string::String::from(name));
+            // name may be a short label or a full path depending on call site
         }
     }
 
@@ -91,7 +131,7 @@ pub fn create_user_process(name: &str, elf_data: &[u8]) -> Result<proc::Pid, elf
 /// 3. Configures TSS.rsp[0] and SYSCALL_KERNEL_RSP for Ring 3 → Ring 0 transitions.
 /// 4. Performs IRETQ to enter Ring 3.
 fn user_mode_bootstrap() {
-    let (entry_rip, entry_rsp, kernel_stack_top, user_cr3) = {
+    let (entry_rip, entry_rsp, kernel_stack_top, user_cr3, tls_base) = {
         let tid = proc::current_tid();
         let threads = THREAD_TABLE.lock();
         let thread = threads.iter().find(|t| t.tid == tid)
@@ -101,6 +141,7 @@ fn user_mode_bootstrap() {
             thread.user_entry_rsp,
             thread.kernel_stack_base + thread.kernel_stack_size,
             thread.context.cr3,
+            thread.tls_base,
         )
     };
 
@@ -115,15 +156,16 @@ fn user_mode_bootstrap() {
         unsafe { crate::mm::vmm::switch_cr3(user_cr3); }
     }
 
-    // Set kernel stack for:
-    // - TSS.rsp[0]: CPU loads this on interrupt from Ring 3
-    // - SYSCALL_KERNEL_RSP: we load this manually in syscall_entry
+    // Set kernel stack for Ring 3 → Ring 0 transitions.
     unsafe {
         gdt::update_tss_rsp0(kernel_stack_top);
         crate::syscall::set_kernel_rsp(kernel_stack_top);
     }
 
-
+    // Set per-thread TLS (FS.base) if assigned (clone(CLONE_SETTLS) or arch_prctl).
+    if tls_base != 0 {
+        unsafe { proc::write_fs_base(tls_base); }
+    }
 
     // Jump to user mode via IRETQ. This never returns.
     unsafe { jump_to_user_mode(entry_rip, entry_rsp); }
@@ -152,6 +194,9 @@ pub unsafe fn jump_to_user_mode(entry_rip: u64, entry_rsp: u64) -> ! {
         "push {rflags}",   // RFLAGS = 0x202 (IF set, IOPL=0)
         "push {cs}",       // CS = USER_CODE_SELECTOR (0x23)
         "push {rip_val}",  // RIP = entry point
+        // RAX = 0 on Ring 3 entry. Required for clone() children (syscall return
+        // value must be 0 in child). Harmless for static binary _start.
+        "xor eax, eax",
         "iretq",
         ss = in(reg) gdt::USER_DATA_SELECTOR as u64,
         rsp_val = in(reg) entry_rsp,

@@ -79,6 +79,10 @@ pub enum FileType {
     CharDevice,
     BlockDevice,
     Pipe,
+    /// eventfd counter-based signaling fd.
+    EventFd,
+    /// Unix-domain or TCP socket unified into the fd table.
+    Socket,
 }
 
 /// File open flags.
@@ -174,6 +178,8 @@ pub struct FileDescriptor {
     pub file_type: FileType,
     /// Special: console stdin/stdout/stderr (not backed by VFS inode).
     pub is_console: bool,
+    /// Absolute path this fd was opened with (used by fchdir, /proc/fd/ etc.)
+    pub open_path: String,
 }
 
 impl FileDescriptor {
@@ -181,21 +187,21 @@ impl FileDescriptor {
         Self {
             inode: 0, mount_idx: 0, offset: 0,
             flags: flags::O_RDONLY, file_type: FileType::CharDevice,
-            is_console: true,
+            is_console: true, open_path: String::new(),
         }
     }
     pub fn console_stdout() -> Self {
         Self {
             inode: 0, mount_idx: 0, offset: 0,
             flags: flags::O_WRONLY, file_type: FileType::CharDevice,
-            is_console: true,
+            is_console: true, open_path: String::new(),
         }
     }
     pub fn console_stderr() -> Self {
         Self {
             inode: 0, mount_idx: 0, offset: 0,
             flags: flags::O_WRONLY, file_type: FileType::CharDevice,
-            is_console: true,
+            is_console: true, open_path: String::new(),
         }
     }
 }
@@ -220,7 +226,23 @@ pub fn init() {
 
     // Create /dev/null and /dev/console.
     let _ = create_file("/dev/null");
+    let _ = create_file("/dev/zero");
+    let _ = create_file("/dev/urandom");
+    let _ = create_file("/dev/random");
     let _ = create_file("/dev/console");
+    let _ = create_file("/dev/tty");
+
+    // Framebuffer device.
+    let _ = create_file("/dev/fb0");
+
+    // Input devices (evdev).
+    let _ = mkdir("/dev/input");
+    let _ = create_file("/dev/input/event0");  // keyboard
+    let _ = create_file("/dev/input/event1");  // mouse / pointer
+
+    // DRI / DRM stub (Firefox probes these).
+    let _ = mkdir("/dev/dri");
+    let _ = create_file("/dev/dri/card0");
 
     // Create /etc/hostname with default content.
     if let Ok(()) = create_file("/etc/hostname") {
@@ -230,6 +252,87 @@ pub fn init() {
     // Create /etc/motd.
     if let Ok(()) = create_file("/etc/motd") {
         let _ = write_file("/etc/motd", b"Welcome to AstryxOS!\n");
+    }
+
+    // ── /proc — static read-only approximations of common entries ─────────
+    let _ = mkdir("/proc");
+    let _ = mkdir("/proc/sys");
+    let _ = mkdir("/proc/sys/vm");
+    let _ = mkdir("/proc/sys/kernel");
+    let _ = mkdir("/proc/self");
+    let _ = mkdir("/proc/self/fd");
+
+    // /proc/version — kernel version string (Linux-compatible)
+    let _ = create_file("/proc/version");
+    let _ = write_file("/proc/version",
+        b"Linux version 5.15.0-astryx (musl-gcc) #1 SMP AstryxOS\n");
+
+    // /proc/cpuinfo — minimal single-CPU entry (required by some libs)
+    let _ = create_file("/proc/cpuinfo");
+    let _ = write_file("/proc/cpuinfo",
+        b"processor\t: 0\nvendor_id\t: AstryxOS\nmodel name\t: x86_64\n\
+          cpu MHz\t\t: 2000.000\ncache size\t: 4096 KB\nflags\t\t: fpu sse sse2 sse4_1 sse4_2 avx\n\n");
+
+    // /proc/meminfo — stub memory information
+    let _ = create_file("/proc/meminfo");
+    let _ = write_file("/proc/meminfo",
+        b"MemTotal:       524288 kB\nMemFree:        262144 kB\nMemAvailable:   262144 kB\n\
+          Buffers:             0 kB\nCached:              0 kB\nSwapTotal:           0 kB\n\
+          SwapFree:            0 kB\n");
+
+    // /proc/sys/vm/overcommit_memory — "0" = heuristic overcommit (default)
+    if let Ok(()) = create_file("/proc/sys/vm/overcommit_memory") {
+        let _ = write_file("/proc/sys/vm/overcommit_memory", b"0\n");
+    }
+    // /proc/sys/vm/max_map_count — max VMAs per process
+    if let Ok(()) = create_file("/proc/sys/vm/max_map_count") {
+        let _ = write_file("/proc/sys/vm/max_map_count", b"65530\n");
+    }
+    // /proc/sys/kernel/pid_max
+    if let Ok(()) = create_file("/proc/sys/kernel/pid_max") {
+        let _ = write_file("/proc/sys/kernel/pid_max", b"65536\n");
+    }
+    // /proc/sys/kernel/random/uuid — used by some initialisation code
+    let _ = mkdir("/proc/sys/kernel/random");
+    if let Ok(()) = create_file("/proc/sys/kernel/random/uuid") {
+        let _ = write_file("/proc/sys/kernel/random/uuid",
+            b"deadbeef-cafe-1234-5678-0a0b0c0d0e0f\n");
+    }
+
+    // /proc/mounts — single ramfs entry
+    if let Ok(()) = create_file("/proc/mounts") {
+        let _ = write_file("/proc/mounts",
+            b"rootfs / ramfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\n");
+    }
+
+    // /proc/self — process-specific pseudo-files (static stubs)
+    // /proc/self/cmdline — argv[0]\0...  (musl uses it to set thread name)
+    if let Ok(()) = create_file("/proc/self/cmdline") {
+        let _ = write_file("/proc/self/cmdline", b"astryx\0");
+    }
+    // /proc/self/status — process status (polled by pthreads in some versions)
+    if let Ok(()) = create_file("/proc/self/status") {
+        let _ = write_file("/proc/self/status",
+            b"Name:\tastryx\nState:\tR (running)\nPid:\t1\nPPid:\t0\nVmRSS:\t4096 kB\n");
+    }
+    // /proc/self/maps — memory map (stub: single anonymous RWX range covers user space)
+    if let Ok(()) = create_file("/proc/self/maps") {
+        let _ = write_file("/proc/self/maps",
+            b"00400000-7f0000000000 rwxp 00000000 00:00 0  [stack]\n");
+    }
+    // /proc/self/exe — symlink to the current binary (readlink resolves it dynamically)
+    // We create the file so open() doesn't fail, but the readlink syscall
+    // overrides the content with the real path.
+    if let Ok(()) = create_file("/proc/self/exe") {
+        let _ = write_file("/proc/self/exe", b"/disk/bin/init");
+    }
+    // /proc/self/environ — empty environment (optional, but avoids ENOENT)
+    if let Ok(()) = create_file("/proc/self/environ") {
+        let _ = write_file("/proc/self/environ", b"");
+    }
+    // /proc/self/comm — short process name
+    if let Ok(()) = create_file("/proc/self/comm") {
+        let _ = write_file("/proc/self/comm", b"astryx\n");
     }
 
     crate::serial_println!("[VFS] Initialized with root ramfs, standard directories created");
@@ -667,6 +770,7 @@ pub fn open(pid: crate::proc::Pid, path: &str, open_flags: u32) -> VfsResult<usi
         flags: open_flags,
         file_type: file_stat.file_type,
         is_console: false,
+        open_path: String::from(path),
     };
 
     // Add to process's fd table.
@@ -709,15 +813,32 @@ pub fn close(pid: crate::proc::Pid, fd_num: usize) -> VfsResult<()> {
 
 /// Read from a file descriptor.
 pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize) -> VfsResult<usize> {
-    let (mount_idx, inode, offset) = {
+    let (mount_idx, inode, offset, flags) = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         let proc = procs.iter().find(|p| p.pid == pid).ok_or(VfsError::InvalidArg)?;
         let fd = proc.file_descriptors.get(fd_num)
             .and_then(|f| f.as_ref())
             .ok_or(VfsError::BadFd)?;
         if fd.is_console { return Err(VfsError::Unsupported); }
-        (fd.mount_idx, fd.inode, fd.offset)
+        (fd.mount_idx, fd.inode, fd.offset, fd.flags)
     };
+
+    // ── Special character devices ─────────────────────────────────────────
+    // bit 26 = /dev/null  → always return 0 bytes (EOF)
+    if flags & 0x0400_0000 != 0 { return Ok(0); }
+    // bit 25 = /dev/zero  → fill buffer with zeros
+    if flags & 0x0200_0000 != 0 {
+        unsafe { core::ptr::write_bytes(buf, 0, count); }
+        return Ok(count);
+    }
+    // bit 24 = /dev/urandom | /dev/random  → fill with pseudo-random bytes
+    if flags & 0x0100_0000 != 0 {
+        let t = crate::arch::x86_64::irq::get_ticks();
+        for i in 0..count {
+            unsafe { *buf.add(i) = (t.wrapping_add(i as u64).wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) & 0xFF) as u8; }
+        }
+        return Ok(count);
+    }
 
     let mut buffer = unsafe { core::slice::from_raw_parts_mut(buf, count) };
     let n = {
@@ -739,15 +860,20 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
 
 /// Write to a file descriptor.
 pub fn fd_write(pid: crate::proc::Pid, fd_num: usize, buf: *const u8, count: usize) -> VfsResult<usize> {
-    let (mount_idx, inode, offset, append) = {
+    let (mount_idx, inode, offset, append, flags) = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         let proc = procs.iter().find(|p| p.pid == pid).ok_or(VfsError::InvalidArg)?;
         let fd = proc.file_descriptors.get(fd_num)
             .and_then(|f| f.as_ref())
             .ok_or(VfsError::BadFd)?;
         if fd.is_console { return Err(VfsError::Unsupported); }
-        (fd.mount_idx, fd.inode, fd.offset, fd.flags & flags::O_APPEND != 0)
+        (fd.mount_idx, fd.inode, fd.offset, fd.flags & flags::O_APPEND != 0, fd.flags)
     };
+
+    // Special character devices: accept writes silently.
+    if flags & (0x0400_0000 | 0x0200_0000 | 0x0100_0000) != 0 {
+        return Ok(count); // /dev/null, /dev/zero, /dev/urandom — discard
+    }
 
     let data = unsafe { core::slice::from_raw_parts(buf, count) };
     let write_offset = if append {

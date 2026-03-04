@@ -12,6 +12,9 @@
             "matchCommandLine": true
         },
         "./scripts/run-test.sh": true,
-        "strings": true
+        "strings": true,
+        "musl-gcc": true,
+        "cp": true,
+        "mcopy": true
     }
 }
