@@ -1,0 +1,14 @@
+[package]
+name = "ascension"
+version = "0.1.0"
+edition = "2021"
+description = "Ascension — AstryxOS init process (PID 1)"
+authors = ["AstryxOS"]
+
+# NOTE: This crate requires a custom x86_64 freestanding target to build.
+# It is NOT part of the workspace Cargo.toml members.
+# Currently Ascension is embedded as a hand-crafted ELF binary in the kernel
+# (see kernel/src/proc/ascension_elf.rs).
+
+[dependencies]
+astryx-libsys = { path = "../libsys" }

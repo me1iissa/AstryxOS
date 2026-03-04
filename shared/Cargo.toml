@@ -1,0 +1,7 @@
+[package]
+name = "astryx-shared"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []

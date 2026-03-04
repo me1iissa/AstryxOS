@@ -1,0 +1,900 @@
+//! Unified Compositor — Reads from the WM subsystem and composites to the
+//! hardware framebuffer (VMware SVGA II, 1920×1080×32bpp default).
+//!
+//! Replaces the old legacy compositor in `gui/mod.rs`.  All drawing is
+//! performed into a backbuffer and then blitted to the hardware FB in one
+//! pass per frame.
+
+extern crate alloc;
+
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+use spin::Mutex;
+
+use crate::wm::decorator;
+use crate::wm::window::{WindowHandle, WindowState, WindowStyle};
+
+// ---------------------------------------------------------------------------
+// Geometry / colour constants
+// ---------------------------------------------------------------------------
+
+const TITLE_BAR_HEIGHT: u32 = decorator::TITLE_BAR_HEIGHT;
+const BORDER_WIDTH: u32 = decorator::BORDER_WIDTH;
+const BUTTON_WIDTH: u32 = decorator::BUTTON_WIDTH;
+
+const COLOR_TITLE_BAR_ACTIVE: u32 = decorator::COLOR_TITLE_BAR_ACTIVE;
+const COLOR_TITLE_BAR_INACTIVE: u32 = decorator::COLOR_TITLE_BAR_INACTIVE;
+const COLOR_TITLE_TEXT_ACTIVE: u32 = decorator::COLOR_TITLE_TEXT_ACTIVE;
+const COLOR_TITLE_TEXT_INACTIVE: u32 = decorator::COLOR_TITLE_TEXT_INACTIVE;
+const COLOR_BORDER_ACTIVE: u32 = decorator::COLOR_BORDER_ACTIVE;
+const COLOR_BORDER_INACTIVE: u32 = decorator::COLOR_BORDER_INACTIVE;
+const COLOR_CLOSE_HOVER: u32 = decorator::COLOR_CLOSE_HOVER;
+
+const COLOR_CURSOR: u32 = 0xFFFFFFFF;
+const COLOR_CURSOR_BORDER: u32 = 0xFF000000;
+
+/// Font glyph width in pixels.
+const FONT_WIDTH: u32 = 8;
+/// Font glyph height in pixels.
+const FONT_HEIGHT: u32 = 16;
+
+// ---------------------------------------------------------------------------
+// Embedded 8×16 VGA bitmap font (printable ASCII 0x20–0x7E, 95 glyphs)
+// ---------------------------------------------------------------------------
+
+#[rustfmt::skip]
+pub static VGA_FONT_8X16: [u8; 95 * 16] = [
+    // 0x20  ' '
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // 0x21  '!'
+    0x00, 0x00, 0x18, 0x3C, 0x3C, 0x3C, 0x18, 0x18,
+    0x18, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00,
+    // 0x22  '"'
+    0x00, 0x66, 0x66, 0x66, 0x24, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // 0x23  '#'
+    0x00, 0x00, 0x00, 0x6C, 0x6C, 0xFE, 0x6C, 0x6C,
+    0x6C, 0xFE, 0x6C, 0x6C, 0x00, 0x00, 0x00, 0x00,
+    // 0x24  '$'
+    0x18, 0x18, 0x7C, 0xC6, 0xC2, 0xC0, 0x7C, 0x06,
+    0x06, 0x86, 0xC6, 0x7C, 0x18, 0x18, 0x00, 0x00,
+    // 0x25  '%'
+    0x00, 0x00, 0x00, 0x00, 0xC2, 0xC6, 0x0C, 0x18,
+    0x30, 0x60, 0xC6, 0x86, 0x00, 0x00, 0x00, 0x00,
+    // 0x26  '&'
+    0x00, 0x00, 0x38, 0x6C, 0x6C, 0x38, 0x76, 0xDC,
+    0xCC, 0xCC, 0xCC, 0x76, 0x00, 0x00, 0x00, 0x00,
+    // 0x27  "'"
+    0x00, 0x30, 0x30, 0x30, 0x60, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // 0x28  '('
+    0x00, 0x00, 0x0C, 0x18, 0x30, 0x30, 0x30, 0x30,
+    0x30, 0x30, 0x18, 0x0C, 0x00, 0x00, 0x00, 0x00,
+    // 0x29  ')'
+    0x00, 0x00, 0x30, 0x18, 0x0C, 0x0C, 0x0C, 0x0C,
+    0x0C, 0x0C, 0x18, 0x30, 0x00, 0x00, 0x00, 0x00,
+    // 0x2A  '*'
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x66, 0x3C, 0xFF,
+    0x3C, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // 0x2B  '+'
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x7E,
+    0x18, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // 0x2C  ','
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x18, 0x18, 0x18, 0x30, 0x00, 0x00, 0x00,
+    // 0x2D  '-'
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFE,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // 0x2E  '.'
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00,
+    // 0x2F  '/'
+    0x00, 0x00, 0x00, 0x00, 0x02, 0x06, 0x0C, 0x18,
+    0x30, 0x60, 0xC0, 0x80, 0x00, 0x00, 0x00, 0x00,
+    // 0x30  '0'
+    0x00, 0x00, 0x38, 0x6C, 0xC6, 0xC6, 0xD6, 0xD6,
+    0xC6, 0xC6, 0x6C, 0x38, 0x00, 0x00, 0x00, 0x00,
+    // 0x31  '1'
+    0x00, 0x00, 0x18, 0x38, 0x78, 0x18, 0x18, 0x18,
+    0x18, 0x18, 0x18, 0x7E, 0x00, 0x00, 0x00, 0x00,
+    // 0x32  '2'
+    0x00, 0x00, 0x7C, 0xC6, 0x06, 0x0C, 0x18, 0x30,
+    0x60, 0xC0, 0xC6, 0xFE, 0x00, 0x00, 0x00, 0x00,
+    // 0x33  '3'
+    0x00, 0x00, 0x7C, 0xC6, 0x06, 0x06, 0x3C, 0x06,
+    0x06, 0x06, 0xC6, 0x7C, 0x00, 0x00, 0x00, 0x00,
+    // 0x34  '4'
+    0x00, 0x00, 0x0C, 0x1C, 0x3C, 0x6C, 0xCC, 0xFE,
+    0x0C, 0x0C, 0x0C, 0x1E, 0x00, 0x00, 0x00, 0x00,
+    // 0x35  '5'
+    0x00, 0x00, 0xFE, 0xC0, 0xC0, 0xC0, 0xFC, 0x06,
+    0x06, 0x06, 0xC6, 0x7C, 0x00, 0x00, 0x00, 0x00,
+    // 0x36  '6'
+    0x00, 0x00, 0x38, 0x60, 0xC0, 0xC0, 0xFC, 0xC6,
+    0xC6, 0xC6, 0xC6, 0x7C, 0x00, 0x00, 0x00, 0x00,
+    // 0x37  '7'
+    0x00, 0x00, 0xFE, 0xC6, 0x06, 0x06, 0x0C, 0x18,
+    0x30, 0x30, 0x30, 0x30, 0x00, 0x00, 0x00, 0x00,
+    // 0x38  '8'
+    0x00, 0x00, 0x7C, 0xC6, 0xC6, 0xC6, 0x7C, 0xC6,
+    0xC6, 0xC6, 0xC6, 0x7C, 0x00, 0x00, 0x00, 0x00,
+    // 0x39  '9'
+    0x00, 0x00, 0x7C, 0xC6, 0xC6, 0xC6, 0x7E, 0x06,
+    0x06, 0x06, 0x0C, 0x78, 0x00, 0x00, 0x00, 0x00,
+    // 0x3A  ':'
+    0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00, 0x00,
+    0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // 0x3B  ';'
+    0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00, 0x00,
+    0x00, 0x18, 0x18, 0x30, 0x00, 0x00, 0x00, 0x00,
+    // 0x3C  '<'
+    0x00, 0x00, 0x00, 0x06, 0x0C, 0x18, 0x30, 0x60,
+    0x30, 0x18, 0x0C, 0x06, 0x00, 0x00, 0x00, 0x00,
+    // 0x3D  '='
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x00, 0x00,
+    0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // 0x3E  '>'
+    0x00, 0x00, 0x00, 0x60, 0x30, 0x18, 0x0C, 0x06,
+    0x0C, 0x18, 0x30, 0x60, 0x00, 0x00, 0x00, 0x00,
+    // 0x3F  '?'
+    0x00, 0x00, 0x7C, 0xC6, 0xC6, 0x0C, 0x18, 0x18,
+    0x18, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00,
+    // 0x40  '@'
+    0x00, 0x00, 0x00, 0x7C, 0xC6, 0xC6, 0xDE, 0xDE,
+    0xDE, 0xDC, 0xC0, 0x7C, 0x00, 0x00, 0x00, 0x00,
+    // 0x41  'A'
+    0x00, 0x00, 0x10, 0x38, 0x6C, 0xC6, 0xC6, 0xFE,
+    0xC6, 0xC6, 0xC6, 0xC6, 0x00, 0x00, 0x00, 0x00,
+    // 0x42  'B'
+    0x00, 0x00, 0xFC, 0x66, 0x66, 0x66, 0x7C, 0x66,
+    0x66, 0x66, 0x66, 0xFC, 0x00, 0x00, 0x00, 0x00,
+    // 0x43  'C'
+    0x00, 0x00, 0x3C, 0x66, 0xC2, 0xC0, 0xC0, 0xC0,
+    0xC0, 0xC2, 0x66, 0x3C, 0x00, 0x00, 0x00, 0x00,
+    // 0x44  'D'
+    0x00, 0x00, 0xF8, 0x6C, 0x66, 0x66, 0x66, 0x66,
+    0x66, 0x66, 0x6C, 0xF8, 0x00, 0x00, 0x00, 0x00,
+    // 0x45  'E'
+    0x00, 0x00, 0xFE, 0x66, 0x62, 0x68, 0x78, 0x68,
+    0x60, 0x62, 0x66, 0xFE, 0x00, 0x00, 0x00, 0x00,
+    // 0x46  'F'
+    0x00, 0x00, 0xFE, 0x66, 0x62, 0x68, 0x78, 0x68,
+    0x60, 0x60, 0x60, 0xF0, 0x00, 0x00, 0x00, 0x00,
+    // 0x47  'G'
+    0x00, 0x00, 0x3C, 0x66, 0xC2, 0xC0, 0xC0, 0xDE,
+    0xC6, 0xC6, 0x66, 0x3A, 0x00, 0x00, 0x00, 0x00,
+    // 0x48  'H'
+    0x00, 0x00, 0xC6, 0xC6, 0xC6, 0xC6, 0xFE, 0xC6,
+    0xC6, 0xC6, 0xC6, 0xC6, 0x00, 0x00, 0x00, 0x00,
+    // 0x49  'I'
+    0x00, 0x00, 0x3C, 0x18, 0x18, 0x18, 0x18, 0x18,
+    0x18, 0x18, 0x18, 0x3C, 0x00, 0x00, 0x00, 0x00,
+    // 0x4A  'J'
+    0x00, 0x00, 0x1E, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
+    0xCC, 0xCC, 0xCC, 0x78, 0x00, 0x00, 0x00, 0x00,
+    // 0x4B  'K'
+    0x00, 0x00, 0xE6, 0x66, 0x6C, 0x6C, 0x78, 0x78,
+    0x6C, 0x66, 0x66, 0xE6, 0x00, 0x00, 0x00, 0x00,
+    // 0x4C  'L'
+    0x00, 0x00, 0xF0, 0x60, 0x60, 0x60, 0x60, 0x60,
+    0x60, 0x62, 0x66, 0xFE, 0x00, 0x00, 0x00, 0x00,
+    // 0x4D  'M'
+    0x00, 0x00, 0xC6, 0xEE, 0xFE, 0xFE, 0xD6, 0xC6,
+    0xC6, 0xC6, 0xC6, 0xC6, 0x00, 0x00, 0x00, 0x00,
+    // 0x4E  'N'
+    0x00, 0x00, 0xC6, 0xE6, 0xF6, 0xFE, 0xDE, 0xCE,
+    0xC6, 0xC6, 0xC6, 0xC6, 0x00, 0x00, 0x00, 0x00,
+    // 0x4F  'O'
+    0x00, 0x00, 0x7C, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6,
+    0xC6, 0xC6, 0xC6, 0x7C, 0x00, 0x00, 0x00, 0x00,
+    // 0x50  'P'
+    0x00, 0x00, 0xFC, 0x66, 0x66, 0x66, 0x7C, 0x60,
+    0x60, 0x60, 0x60, 0xF0, 0x00, 0x00, 0x00, 0x00,
+    // 0x51  'Q'
+    0x00, 0x00, 0x7C, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6,
+    0xC6, 0xD6, 0xDE, 0x7C, 0x0C, 0x0E, 0x00, 0x00,
+    // 0x52  'R'
+    0x00, 0x00, 0xFC, 0x66, 0x66, 0x66, 0x7C, 0x6C,
+    0x66, 0x66, 0x66, 0xE6, 0x00, 0x00, 0x00, 0x00,
+    // 0x53  'S'
+    0x00, 0x00, 0x7C, 0xC6, 0xC6, 0x60, 0x38, 0x0C,
+    0x06, 0xC6, 0xC6, 0x7C, 0x00, 0x00, 0x00, 0x00,
+    // 0x54  'T'
+    0x00, 0x00, 0xFF, 0xDB, 0x99, 0x18, 0x18, 0x18,
+    0x18, 0x18, 0x18, 0x3C, 0x00, 0x00, 0x00, 0x00,
+    // 0x55  'U'
+    0x00, 0x00, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6,
+    0xC6, 0xC6, 0xC6, 0x7C, 0x00, 0x00, 0x00, 0x00,
+    // 0x56  'V'
+    0x00, 0x00, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6,
+    0xC6, 0x6C, 0x38, 0x10, 0x00, 0x00, 0x00, 0x00,
+    // 0x57  'W'
+    0x00, 0x00, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0xD6,
+    0xD6, 0xFE, 0xEE, 0x6C, 0x00, 0x00, 0x00, 0x00,
+    // 0x58  'X'
+    0x00, 0x00, 0xC6, 0xC6, 0x6C, 0x7C, 0x38, 0x38,
+    0x7C, 0x6C, 0xC6, 0xC6, 0x00, 0x00, 0x00, 0x00,
+    // 0x59  'Y'
+    0x00, 0x00, 0xC6, 0xC6, 0xC6, 0x6C, 0x38, 0x18,
+    0x18, 0x18, 0x18, 0x3C, 0x00, 0x00, 0x00, 0x00,
+    // 0x5A  'Z'
+    0x00, 0x00, 0xFE, 0xC6, 0x86, 0x0C, 0x18, 0x30,
+    0x60, 0xC2, 0xC6, 0xFE, 0x00, 0x00, 0x00, 0x00,
+    // 0x5B  '['
+    0x00, 0x00, 0x3C, 0x30, 0x30, 0x30, 0x30, 0x30,
+    0x30, 0x30, 0x30, 0x3C, 0x00, 0x00, 0x00, 0x00,
+    // 0x5C  '\'
+    0x00, 0x00, 0x00, 0x80, 0xC0, 0xE0, 0x70, 0x38,
+    0x1C, 0x0E, 0x06, 0x02, 0x00, 0x00, 0x00, 0x00,
+    // 0x5D  ']'
+    0x00, 0x00, 0x3C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
+    0x0C, 0x0C, 0x0C, 0x3C, 0x00, 0x00, 0x00, 0x00,
+    // 0x5E  '^'
+    0x10, 0x38, 0x6C, 0xC6, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // 0x5F  '_'
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00,
+    // 0x60  '`'
+    0x30, 0x30, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // 0x61  'a'
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0x0C, 0x7C,
+    0xCC, 0xCC, 0xCC, 0x76, 0x00, 0x00, 0x00, 0x00,
+    // 0x62  'b'
+    0x00, 0x00, 0xE0, 0x60, 0x60, 0x78, 0x6C, 0x66,
+    0x66, 0x66, 0x66, 0x7C, 0x00, 0x00, 0x00, 0x00,
+    // 0x63  'c'
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x7C, 0xC6, 0xC0,
+    0xC0, 0xC0, 0xC6, 0x7C, 0x00, 0x00, 0x00, 0x00,
+    // 0x64  'd'
+    0x00, 0x00, 0x1C, 0x0C, 0x0C, 0x3C, 0x6C, 0xCC,
+    0xCC, 0xCC, 0xCC, 0x76, 0x00, 0x00, 0x00, 0x00,
+    // 0x65  'e'
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x7C, 0xC6, 0xFE,
+    0xC0, 0xC0, 0xC6, 0x7C, 0x00, 0x00, 0x00, 0x00,
+    // 0x66  'f'
+    0x00, 0x00, 0x1C, 0x36, 0x32, 0x30, 0x78, 0x30,
+    0x30, 0x30, 0x30, 0x78, 0x00, 0x00, 0x00, 0x00,
+    // 0x67  'g'
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x76, 0xCC, 0xCC,
+    0xCC, 0xCC, 0x7C, 0x0C, 0xCC, 0x78, 0x00, 0x00,
+    // 0x68  'h'
+    0x00, 0x00, 0xE0, 0x60, 0x60, 0x6C, 0x76, 0x66,
+    0x66, 0x66, 0x66, 0xE6, 0x00, 0x00, 0x00, 0x00,
+    // 0x69  'i'
+    0x00, 0x00, 0x18, 0x18, 0x00, 0x38, 0x18, 0x18,
+    0x18, 0x18, 0x18, 0x3C, 0x00, 0x00, 0x00, 0x00,
+    // 0x6A  'j'
+    0x00, 0x00, 0x06, 0x06, 0x00, 0x0E, 0x06, 0x06,
+    0x06, 0x06, 0x06, 0x06, 0x66, 0x3C, 0x00, 0x00,
+    // 0x6B  'k'
+    0x00, 0x00, 0xE0, 0x60, 0x60, 0x66, 0x6C, 0x78,
+    0x78, 0x6C, 0x66, 0xE6, 0x00, 0x00, 0x00, 0x00,
+    // 0x6C  'l'
+    0x00, 0x00, 0x38, 0x18, 0x18, 0x18, 0x18, 0x18,
+    0x18, 0x18, 0x18, 0x3C, 0x00, 0x00, 0x00, 0x00,
+    // 0x6D  'm'
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xEC, 0xFE, 0xD6,
+    0xD6, 0xD6, 0xD6, 0xC6, 0x00, 0x00, 0x00, 0x00,
+    // 0x6E  'n'
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xDC, 0x66, 0x66,
+    0x66, 0x66, 0x66, 0x66, 0x00, 0x00, 0x00, 0x00,
+    // 0x6F  'o'
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x7C, 0xC6, 0xC6,
+    0xC6, 0xC6, 0xC6, 0x7C, 0x00, 0x00, 0x00, 0x00,
+    // 0x70  'p'
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xDC, 0x66, 0x66,
+    0x66, 0x66, 0x7C, 0x60, 0x60, 0xF0, 0x00, 0x00,
+    // 0x71  'q'
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x76, 0xCC, 0xCC,
+    0xCC, 0xCC, 0x7C, 0x0C, 0x0C, 0x1E, 0x00, 0x00,
+    // 0x72  'r'
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xDC, 0x76, 0x66,
+    0x60, 0x60, 0x60, 0xF0, 0x00, 0x00, 0x00, 0x00,
+    // 0x73  's'
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x7C, 0xC6, 0x60,
+    0x38, 0x0C, 0xC6, 0x7C, 0x00, 0x00, 0x00, 0x00,
+    // 0x74  't'
+    0x00, 0x00, 0x10, 0x30, 0x30, 0xFC, 0x30, 0x30,
+    0x30, 0x30, 0x36, 0x1C, 0x00, 0x00, 0x00, 0x00,
+    // 0x75  'u'
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xCC, 0xCC, 0xCC,
+    0xCC, 0xCC, 0xCC, 0x76, 0x00, 0x00, 0x00, 0x00,
+    // 0x76  'v'
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xC6, 0xC6, 0xC6,
+    0xC6, 0x6C, 0x38, 0x10, 0x00, 0x00, 0x00, 0x00,
+    // 0x77  'w'
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xC6, 0xC6, 0xD6,
+    0xD6, 0xD6, 0xFE, 0x6C, 0x00, 0x00, 0x00, 0x00,
+    // 0x78  'x'
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xC6, 0x6C, 0x38,
+    0x38, 0x38, 0x6C, 0xC6, 0x00, 0x00, 0x00, 0x00,
+    // 0x79  'y'
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xC6, 0xC6, 0xC6,
+    0xC6, 0xC6, 0x7E, 0x06, 0x0C, 0xF8, 0x00, 0x00,
+    // 0x7A  'z'
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xFE, 0xCC, 0x18,
+    0x30, 0x60, 0xC6, 0xFE, 0x00, 0x00, 0x00, 0x00,
+    // 0x7B  '{'
+    0x00, 0x00, 0x0E, 0x18, 0x18, 0x18, 0x70, 0x18,
+    0x18, 0x18, 0x18, 0x0E, 0x00, 0x00, 0x00, 0x00,
+    // 0x7C  '|'
+    0x00, 0x00, 0x18, 0x18, 0x18, 0x18, 0x00, 0x18,
+    0x18, 0x18, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00,
+    // 0x7D  '}'
+    0x00, 0x00, 0x70, 0x18, 0x18, 0x18, 0x0E, 0x18,
+    0x18, 0x18, 0x18, 0x70, 0x00, 0x00, 0x00, 0x00,
+    // 0x7E  '~'
+    0x00, 0x00, 0x76, 0xDC, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+// ---------------------------------------------------------------------------
+// 12×12 arrow cursor bitmap (same as legacy compositor)
+// ---------------------------------------------------------------------------
+
+/// 12×12 cursor bitmap: 0 = transparent, 1 = border, 2 = fill.
+#[rustfmt::skip]
+static CURSOR_BITMAP: [[u8; 12]; 12] = [
+    [1,0,0,0,0,0,0,0,0,0,0,0],
+    [1,1,0,0,0,0,0,0,0,0,0,0],
+    [1,2,1,0,0,0,0,0,0,0,0,0],
+    [1,2,2,1,0,0,0,0,0,0,0,0],
+    [1,2,2,2,1,0,0,0,0,0,0,0],
+    [1,2,2,2,2,1,0,0,0,0,0,0],
+    [1,2,2,2,2,2,1,0,0,0,0,0],
+    [1,2,2,2,2,2,2,1,0,0,0,0],
+    [1,2,2,2,2,1,1,1,1,0,0,0],
+    [1,2,2,1,2,1,0,0,0,0,0,0],
+    [1,2,1,0,1,2,1,0,0,0,0,0],
+    [1,1,0,0,0,1,1,0,0,0,0,0],
+];
+
+// ---------------------------------------------------------------------------
+// Window snapshot — captures all data we need without holding the WM lock
+// ---------------------------------------------------------------------------
+
+/// A snapshot of a window's state captured while the `WINDOW_REGISTRY` lock is
+/// held.  Once copied out we can draw without contending on the lock.
+struct WindowSnapshot {
+    handle: WindowHandle,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    client_x: i32,
+    client_y: i32,
+    client_width: u32,
+    client_height: u32,
+    title: String,
+    focused: bool,
+    bg_color: u32,
+    style: WindowStyle,
+    state: WindowState,
+}
+
+// ---------------------------------------------------------------------------
+// Compositor state
+// ---------------------------------------------------------------------------
+
+/// Global compositor state.
+pub struct CompositorState {
+    pub screen_width: u32,
+    pub screen_height: u32,
+    pub fb_base: u64,
+    pub fb_stride: u32,
+    pub backbuffer: Vec<u32>,
+    pub frame_count: u64,
+}
+
+static COMPOSITOR: Mutex<Option<CompositorState>> = Mutex::new(None);
+
+// ---------------------------------------------------------------------------
+// Pixel-level helpers (operate on raw `&mut [u32]` buffers)
+// ---------------------------------------------------------------------------
+
+/// Set a single pixel with bounds checking.
+#[inline]
+fn put_pixel(buf: &mut [u32], stride: u32, x: i32, y: i32, color: u32) {
+    if x >= 0 && y >= 0 {
+        let idx = y as usize * stride as usize + x as usize;
+        if idx < buf.len() {
+            buf[idx] = color;
+        }
+    }
+}
+
+/// Fill a rectangle on the buffer.
+fn fill_rect(buf: &mut [u32], stride: u32, rx: i32, ry: i32, rw: u32, rh: u32, color: u32) {
+    for row in 0..rh as i32 {
+        for col in 0..rw as i32 {
+            put_pixel(buf, stride, rx + col, ry + row, color);
+        }
+    }
+}
+
+/// Draw a horizontal line.
+fn hline(buf: &mut [u32], stride: u32, x: i32, y: i32, len: u32, color: u32) {
+    for i in 0..len as i32 {
+        put_pixel(buf, stride, x + i, y, color);
+    }
+}
+
+/// Draw a vertical line.
+fn vline(buf: &mut [u32], stride: u32, x: i32, y: i32, len: u32, color: u32) {
+    for i in 0..len as i32 {
+        put_pixel(buf, stride, x, y + i, color);
+    }
+}
+
+/// Blit a per-window surface (`src_w × src_h` pixels, tightly packed) onto
+/// the compositor backbuffer at screen position `(dst_x, dst_y)`.
+fn blit_surface(
+    buf: &mut [u32],
+    buf_stride: u32,
+    dst_x: i32,
+    dst_y: i32,
+    src_w: u32,
+    src_h: u32,
+    surface: &[u32],
+) {
+    let expected = (src_w as usize) * (src_h as usize);
+    if surface.len() < expected {
+        // Surface not yet sized — skip.
+        return;
+    }
+    for row in 0..src_h as i32 {
+        let py = dst_y + row;
+        if py < 0 || py >= buf.len() as i32 / buf_stride as i32 {
+            continue;
+        }
+        for col in 0..src_w as i32 {
+            let px = dst_x + col;
+            if px < 0 || px >= buf_stride as i32 {
+                continue;
+            }
+            let src_idx = row as usize * src_w as usize + col as usize;
+            let dst_idx = py as usize * buf_stride as usize + px as usize;
+            if dst_idx < buf.len() {
+                buf[dst_idx] = surface[src_idx];
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Text rendering on raw buffer
+// ---------------------------------------------------------------------------
+
+/// Draw a single 8×16 glyph onto a raw pixel buffer.
+fn draw_char_on_buffer(buf: &mut [u32], stride: u32, x: i32, y: i32, ch: char, color: u32) {
+    let c = ch as u32;
+    if c < 0x20 || c > 0x7E {
+        return;
+    }
+    let glyph_offset = ((c - 0x20) as usize) * 16;
+
+    for row in 0..16i32 {
+        let py = y + row;
+        if py < 0 {
+            continue;
+        }
+        let byte = VGA_FONT_8X16[glyph_offset + row as usize];
+        for col in 0..8i32 {
+            let px = x + col;
+            if px < 0 {
+                continue;
+            }
+            if (byte >> (7 - col)) & 1 != 0 {
+                put_pixel(buf, stride, px, py, color);
+            }
+        }
+    }
+}
+
+/// Draw a text string onto a raw pixel buffer using the embedded 8×16 font.
+/// Only foreground pixels are written (transparent background).
+pub fn draw_text_on_backbuffer(
+    buf: &mut [u32],
+    stride: u32,
+    x: i32,
+    y: i32,
+    text: &str,
+    color: u32,
+) {
+    let mut cx = x;
+    for ch in text.chars() {
+        if ch == '\n' {
+            continue;
+        }
+        draw_char_on_buffer(buf, stride, cx, y, ch, color);
+        cx += FONT_WIDTH as i32;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decoration drawing (inline, avoids holding WM lock)
+// ---------------------------------------------------------------------------
+
+/// Draw the thin 1px border around a window.
+fn draw_border(buf: &mut [u32], stride: u32, snap: &WindowSnapshot) {
+    if !snap.style.has_border {
+        return;
+    }
+    let color = if snap.focused { COLOR_BORDER_ACTIVE } else { COLOR_BORDER_INACTIVE };
+    let x = snap.x;
+    let y = snap.y;
+    let w = snap.width;
+    let h = snap.height;
+
+    hline(buf, stride, x, y, w, color);
+    hline(buf, stride, x, y + h as i32 - 1, w, color);
+    vline(buf, stride, x, y, h, color);
+    vline(buf, stride, x + w as i32 - 1, y, h, color);
+}
+
+/// Draw the close button glyph (×).
+fn draw_close_button(buf: &mut [u32], stride: u32, x: i32, y: i32, _hovered: bool) {
+    let bg = if _hovered { COLOR_CLOSE_HOVER } else { COLOR_TITLE_BAR_ACTIVE };
+    fill_rect(buf, stride, x, y, BUTTON_WIDTH, TITLE_BAR_HEIGHT, bg);
+
+    let glyph_size: i32 = 10;
+    let cx = x + (BUTTON_WIDTH as i32 - glyph_size) / 2;
+    let cy = y + (TITLE_BAR_HEIGHT as i32 - glyph_size) / 2;
+    let glyph_color: u32 = 0xFFFFFFFF;
+
+    for i in 0..glyph_size {
+        put_pixel(buf, stride, cx + i, cy + i, glyph_color);
+        put_pixel(buf, stride, cx + glyph_size - 1 - i, cy + i, glyph_color);
+    }
+}
+
+/// Draw the minimize button glyph (horizontal dash).
+fn draw_minimize_button(buf: &mut [u32], stride: u32, x: i32, y: i32, _hovered: bool) {
+    let bg = if _hovered { decorator::COLOR_BUTTON_HOVER } else { COLOR_TITLE_BAR_ACTIVE };
+    fill_rect(buf, stride, x, y, BUTTON_WIDTH, TITLE_BAR_HEIGHT, bg);
+
+    let glyph_w: u32 = 10;
+    let gx = x + (BUTTON_WIDTH as i32 - glyph_w as i32) / 2;
+    let gy = y + TITLE_BAR_HEIGHT as i32 / 2;
+    hline(buf, stride, gx, gy, glyph_w, 0xFFFFFFFF);
+}
+
+/// Draw the maximize / restore button glyph.
+fn draw_maximize_button(
+    buf: &mut [u32],
+    stride: u32,
+    x: i32,
+    y: i32,
+    _hovered: bool,
+    maximized: bool,
+) {
+    let bg = if _hovered { decorator::COLOR_BUTTON_HOVER } else { COLOR_TITLE_BAR_ACTIVE };
+    fill_rect(buf, stride, x, y, BUTTON_WIDTH, TITLE_BAR_HEIGHT, bg);
+
+    let glyph_color: u32 = 0xFFFFFFFF;
+    let size: i32 = 10;
+
+    if !maximized {
+        let gx = x + (BUTTON_WIDTH as i32 - size) / 2;
+        let gy = y + (TITLE_BAR_HEIGHT as i32 - size) / 2;
+        hline(buf, stride, gx, gy, size as u32, glyph_color);
+        hline(buf, stride, gx, gy + size - 1, size as u32, glyph_color);
+        vline(buf, stride, gx, gy, size as u32, glyph_color);
+        vline(buf, stride, gx + size - 1, gy, size as u32, glyph_color);
+    } else {
+        let small = size - 2;
+        let bx = x + (BUTTON_WIDTH as i32 - size) / 2 + 2;
+        let by = y + (TITLE_BAR_HEIGHT as i32 - size) / 2;
+        hline(buf, stride, bx, by, small as u32, glyph_color);
+        hline(buf, stride, bx, by + small - 1, small as u32, glyph_color);
+        vline(buf, stride, bx, by, small as u32, glyph_color);
+        vline(buf, stride, bx + small - 1, by, small as u32, glyph_color);
+        let fx = x + (BUTTON_WIDTH as i32 - size) / 2;
+        let fy = y + (TITLE_BAR_HEIGHT as i32 - size) / 2 + 2;
+        fill_rect(buf, stride, fx, fy, small as u32, small as u32, bg);
+        hline(buf, stride, fx, fy, small as u32, glyph_color);
+        hline(buf, stride, fx, fy + small - 1, small as u32, glyph_color);
+        vline(buf, stride, fx, fy, small as u32, glyph_color);
+        vline(buf, stride, fx + small - 1, fy, small as u32, glyph_color);
+    }
+}
+
+/// Draw the title bar (background + caption buttons + title text).
+fn draw_title_bar(buf: &mut [u32], stride: u32, snap: &WindowSnapshot) {
+    if !snap.style.has_title_bar {
+        return;
+    }
+
+    let active = snap.focused;
+    let bg = if active { COLOR_TITLE_BAR_ACTIVE } else { COLOR_TITLE_BAR_INACTIVE };
+    let text_color = if active { COLOR_TITLE_TEXT_ACTIVE } else { COLOR_TITLE_TEXT_INACTIVE };
+
+    let border = if snap.style.has_border { BORDER_WIDTH as i32 } else { 0 };
+    let bar_x = snap.x + border;
+    let bar_y = snap.y + border;
+    let bar_w = (snap.width as i32 - 2 * border) as u32;
+
+    // Fill title bar background.
+    fill_rect(buf, stride, bar_x, bar_y, bar_w, TITLE_BAR_HEIGHT, bg);
+
+    // Draw title text (vertically centred in the title bar).
+    if !snap.title.is_empty() {
+        let text_x = bar_x + 10;
+        let text_y = bar_y + (TITLE_BAR_HEIGHT as i32 - FONT_HEIGHT as i32) / 2;
+        // Clamp text to avoid overwriting caption buttons.
+        let max_text_pixels = bar_w as i32 - 10 - (BUTTON_WIDTH as i32 * 3) - 4;
+        let max_chars = if max_text_pixels > 0 {
+            (max_text_pixels / FONT_WIDTH as i32) as usize
+        } else {
+            0
+        };
+        let display: &str = if snap.title.len() <= max_chars {
+            &snap.title
+        } else if max_chars > 3 {
+            // Truncation happens at byte level; safe for ASCII titles.
+            // For non-ASCII we just draw whatever fits.
+            &snap.title[..max_chars]
+        } else {
+            ""
+        };
+        draw_text_on_backbuffer(buf, stride, text_x, text_y, display, text_color);
+    }
+
+    // Caption buttons (right-aligned).
+    let mut btn_x = snap.x + snap.width as i32 - border - BUTTON_WIDTH as i32;
+
+    if snap.style.has_close_button {
+        draw_close_button(buf, stride, btn_x, bar_y, false);
+        btn_x -= BUTTON_WIDTH as i32;
+    }
+    if snap.style.has_maximize_button {
+        draw_maximize_button(
+            buf,
+            stride,
+            btn_x,
+            bar_y,
+            false,
+            snap.state == WindowState::Maximized,
+        );
+        btn_x -= BUTTON_WIDTH as i32;
+    }
+    if snap.style.has_minimize_button {
+        draw_minimize_button(buf, stride, btn_x, bar_y, false);
+    }
+}
+
+/// Draw a complete window (border + title bar + surface blit) onto the
+/// backbuffer.
+fn draw_window(buf: &mut [u32], stride: u32, snap: &WindowSnapshot) {
+    // 1. Border
+    draw_border(buf, stride, snap);
+
+    // 2. Title bar (background, buttons, text)
+    draw_title_bar(buf, stride, snap);
+
+    // 3. Client area — blit the per-window surface, or fill with bg_color
+    let cx = snap.x + snap.client_x;
+    let cy = snap.y + snap.client_y;
+
+    // Read the window's surface directly from the registry (brief lock).
+    let blitted = crate::wm::window::with_window(snap.handle, |w| {
+        if !w.surface.is_empty() {
+            let sw = w.client_width;
+            let sh = w.client_height;
+            blit_surface(buf, stride, cx, cy, sw, sh, &w.surface);
+            true
+        } else {
+            false
+        }
+    }).unwrap_or(false);
+
+    // Fallback: solid fill if no surface.
+    if !blitted {
+        fill_rect(buf, stride, cx, cy, snap.client_width, snap.client_height, snap.bg_color);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mouse cursor
+// ---------------------------------------------------------------------------
+
+/// Draw the 12×12 arrow cursor at `(mx, my)`.
+fn draw_cursor(buf: &mut [u32], stride: u32, screen_w: u32, screen_h: u32, mx: i32, my: i32) {
+    for dy in 0..12i32 {
+        for dx in 0..12i32 {
+            let px = mx + dx;
+            let py = my + dy;
+            if px >= 0 && px < screen_w as i32 && py >= 0 && py < screen_h as i32 {
+                let c = CURSOR_BITMAP[dy as usize][dx as usize];
+                if c == 1 {
+                    put_pixel(buf, stride, px, py, COLOR_CURSOR_BORDER);
+                } else if c == 2 {
+                    put_pixel(buf, stride, px, py, COLOR_CURSOR);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Initialise the compositor.
+///
+/// `fb_base` is the physical address of the hardware framebuffer mapped into
+/// the kernel's address space.  `stride` is the number of **pixels** per
+/// scanline (may be wider than `width` due to hardware alignment).
+pub fn init(fb_base: u64, width: u32, height: u32, stride: u32) {
+    let buf_size = (width as usize) * (height as usize);
+    let state = CompositorState {
+        screen_width: width,
+        screen_height: height,
+        fb_base,
+        fb_stride: stride,
+        backbuffer: vec![0u32; buf_size],
+        frame_count: 0,
+    };
+    *COMPOSITOR.lock() = Some(state);
+    crate::serial_println!(
+        "[GUI] Compositor initialized ({}x{}, stride={}, fb=0x{:X})",
+        width,
+        height,
+        stride,
+        fb_base,
+    );
+}
+
+/// Main compositing entry point — call once per frame.
+///
+/// 1. Fills the backbuffer with the desktop background colour.
+/// 2. Iterates over windows in z-order (back → front), collecting a snapshot
+///    of each visible, non-minimized window and drawing it.
+/// 3. Draws the mouse cursor.
+/// 4. Blits the backbuffer to the hardware framebuffer.
+pub fn compose() {
+    let mut guard = COMPOSITOR.lock();
+    let comp = match guard.as_mut() {
+        Some(c) => c,
+        None => return,
+    };
+
+    let sw = comp.screen_width;
+    let sh = comp.screen_height;
+    let stride = sw; // backbuffer is tightly packed
+
+    // --- 1. Desktop background (subtle gradient) ---
+    // Top: deep navy (0xFF0A0A20) → Bottom: dark teal (0xFF0D1B2A)
+    let top_r: u32 = 0x0A; let top_g: u32 = 0x0A; let top_b: u32 = 0x20;
+    let bot_r: u32 = 0x0D; let bot_g: u32 = 0x1B; let bot_b: u32 = 0x2A;
+    for y in 0..sh {
+        let r = top_r + (bot_r.wrapping_sub(top_r)) * y / sh.max(1);
+        let g = top_g + (bot_g.wrapping_sub(top_g)) * y / sh.max(1);
+        let b = top_b + (bot_b.wrapping_sub(top_b)) * y / sh.max(1);
+        let color = 0xFF000000 | (r << 16) | (g << 8) | b;
+        let row_start = (y * stride) as usize;
+        let row_end = row_start + sw as usize;
+        if row_end <= comp.backbuffer.len() {
+            comp.backbuffer[row_start..row_end].fill(color);
+        }
+    }
+
+    // --- 2. Windows (back-to-front) ---
+    let z_order: Vec<WindowHandle> = crate::wm::zorder::get_z_order();
+
+    for &handle in z_order.iter() {
+        // Snapshot the window data (briefly locks WINDOW_REGISTRY, then releases).
+        let snap = crate::wm::window::with_window(handle, |w| WindowSnapshot {
+            handle: w.handle,
+            x: w.x,
+            y: w.y,
+            width: w.width,
+            height: w.height,
+            client_x: w.client_x,
+            client_y: w.client_y,
+            client_width: w.client_width,
+            client_height: w.client_height,
+            title: w.title.clone(),
+            focused: w.focused,
+            bg_color: w.bg_color,
+            style: w.style,
+            state: w.state,
+        });
+
+        let snap = match snap {
+            Some(s) => s,
+            None => continue,
+        };
+
+        // Skip invisible or minimized windows.
+        if !snap.style.visible || snap.state == WindowState::Minimized {
+            continue;
+        }
+
+        // Trivial off-screen rejection.
+        if snap.x + (snap.width as i32) <= 0
+            || snap.y + (snap.height as i32) <= 0
+            || snap.x >= sw as i32
+            || snap.y >= sh as i32
+        {
+            continue;
+        }
+
+        draw_window(&mut comp.backbuffer, stride, &snap);
+    }
+
+    // --- 3. Start menu overlay (on top of all windows) ---
+    if crate::gui::content::is_start_menu_open() {
+        crate::gui::content::render_start_menu_to_backbuffer(
+            &mut comp.backbuffer,
+            sw,
+            sh,
+        );
+    }
+
+    // --- 4. Mouse cursor ---
+    let (mx, my) = crate::drivers::mouse::position();
+    draw_cursor(&mut comp.backbuffer, stride, sw, sh, mx, my);
+
+    // --- 5. Blit to screen ---
+    blit_to_screen(comp);
+
+    // --- 6. Frame counter ---
+    comp.frame_count += 1;
+}
+
+/// Copy the backbuffer to the hardware framebuffer, row by row, then notify
+/// the SVGA device.
+fn blit_to_screen(comp: &CompositorState) {
+    let fb = comp.fb_base as *mut u32;
+    let hw_stride = comp.fb_stride;
+    let w = comp.screen_width;
+    let h = comp.screen_height;
+
+    for y in 0..h {
+        let src_offset = (y * w) as usize;
+        let dst_offset = (y * hw_stride) as usize;
+        let row = &comp.backbuffer[src_offset..src_offset + w as usize];
+        unsafe {
+            core::ptr::copy_nonoverlapping(row.as_ptr(), fb.add(dst_offset), w as usize);
+        }
+    }
+
+    crate::drivers::vmware_svga::display_notify();
+}
+
+// ---------------------------------------------------------------------------
+// Accessors
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if the compositor has been initialised.
+pub fn is_initialized() -> bool {
+    COMPOSITOR.lock().is_some()
+}
+
+/// Returns the number of frames composed so far, or 0 if not initialised.
+pub fn frame_count() -> u64 {
+    COMPOSITOR.lock().as_ref().map_or(0, |c| c.frame_count)
+}
+
+/// Run a closure with a reference to the compositor state.
+pub fn with_compositor<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&CompositorState) -> R,
+{
+    let guard = COMPOSITOR.lock();
+    guard.as_ref().map(f)
+}
+
+/// Run a closure with a mutable reference to the compositor state.
+pub fn with_compositor_mut<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut CompositorState) -> R,
+{
+    let mut guard = COMPOSITOR.lock();
+    guard.as_mut().map(f)
+}

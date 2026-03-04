@@ -1,0 +1,17 @@
+[package]
+name = "astryx-boot"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+uefi = { version = "0.34", features = ["alloc", "global_allocator", "panic_handler"] }
+log = "0.4"
+astryx-shared = { path = "../shared" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true

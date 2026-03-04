@@ -1,0 +1,13 @@
+[package]
+name = "astryx-libsys"
+version = "0.1.0"
+edition = "2021"
+description = "AstryxOS userspace syscall library — raw syscall wrappers and runtime support"
+authors = ["AstryxOS"]
+
+# NOTE: This crate requires a custom x86_64 freestanding target to build.
+# It is NOT part of the workspace Cargo.toml members.
+# Currently the programs are embedded as hand-crafted ELF binaries in the kernel.
+# This source exists as documentation and for future toolchain support.
+
+[dependencies]
