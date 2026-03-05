@@ -147,6 +147,7 @@ SQLITE_VER="3490100"        # 3.49.1
 LIBEVENT_VER="2.1.12"
 FONTCONFIG_VER="2.15.0"
 HARFBUZZ_VER="12.0.0"
+EXPAT_VER="2.6.4"
 
 # ── 1. zlib ──────────────────────────────────────────────────────────────────
 
@@ -295,15 +296,17 @@ if should_build "cairo"; then
         --cross-file="${ROOT_DIR}/scripts/meson-musl-cross.ini" \
         --prefix="${SYSROOT}" \
         --default-library=static \
-        -Dgl-backend=disabled \
-        -Dglesv2=disabled \
-        -Dgtk-doc=disabled \
-        -Dspectre=disabled \
         -Dfontconfig=disabled \
+        -Dfreetype=enabled \
+        -Dpng=enabled \
+        -Dzlib=enabled \
         -Dxlib=disabled \
+        -Dxcb=disabled \
         -Dxlib-xcb=disabled \
         -Dquartz=disabled \
-        -Dwin32=disabled \
+        -Dspectre=disabled \
+        -Dglib=disabled \
+        -Dtests=disabled \
         2>&1 | tee "${LOG_DIR}/cairo-meson.log"
     ninja -C build-astryx -j"${JOBS}" 2>&1 | tee "${LOG_DIR}/cairo-ninja.log"
     ninja -C build-astryx install 2>&1 | tee "${LOG_DIR}/cairo-install.log"
@@ -393,6 +396,32 @@ fi
 # The Firefox build system will use --with-system-nss=no (default) and build
 # the bundled versions.
 
+# ── 11a. expat (required by fontconfig) ─────────────────────────────────────
+
+if should_build "expat"; then
+    step "expat ${EXPAT_VER}"
+    download_extract expat \
+        "https://github.com/libexpat/libexpat/releases/download/R_${EXPAT_VER//./_}/expat-${EXPAT_VER}.tar.xz" \
+        "expat-${EXPAT_VER}"
+    pushd "${SOURCES_DIR}/expat-${EXPAT_VER}" > /dev/null
+    cmake -B build-astryx -S . \
+        -DCMAKE_INSTALL_PREFIX="${SYSROOT}" \
+        -DCMAKE_C_COMPILER="x86_64-linux-musl-gcc" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_FLAGS="${CFLAGS} -I${SYSROOT}/include" \
+        -DCMAKE_SYSTEM_NAME=Linux \
+        -DCMAKE_SYSTEM_PROCESSOR=x86_64 \
+        -DEXPAT_BUILD_DOCS=OFF \
+        -DEXPAT_BUILD_TESTS=OFF \
+        -DEXPAT_BUILD_TOOLS=OFF \
+        -DEXPAT_SHARED_LIBS=OFF \
+        2>&1 | tee "${LOG_DIR}/expat-cmake.log"
+    cmake --build build-astryx -j"${JOBS}" 2>&1 | tee "${LOG_DIR}/expat-build.log"
+    cmake --install build-astryx 2>&1 | tee "${LOG_DIR}/expat-install.log"
+    popd > /dev/null
+    log "expat ${EXPAT_VER} installed ✓"
+fi
+
 # ── 11. fontconfig (optional — for font enumeration) ─────────────────────────
 
 if should_build "fontconfig"; then
@@ -408,6 +437,8 @@ if should_build "fontconfig"; then
         --enable-static \
         --disable-docs \
         --with-freetype-config="${SYSROOT}/bin/freetype-config" \
+        EXPAT_CFLAGS="-I${SYSROOT}/include" \
+        EXPAT_LIBS="-L${SYSROOT}/lib -lexpat" \
         CPPFLAGS="-I${SYSROOT}/include" \
         LDFLAGS="-L${SYSROOT}/lib -static" \
         2>&1 | tee "${LOG_DIR}/fontconfig-configure.log"
@@ -432,9 +463,12 @@ if should_build "harfbuzz"; then
         -Dglib=disabled \
         -Dgobject=disabled \
         -Dcairo=disabled \
-        -Dfontconfig=disabled \
+        -Dchafa=disabled \
+        -Dicu=disabled \
         -Dfreetype=enabled \
         -Dtests=disabled \
+        -Dintrospection=disabled \
+        -Dutilities=disabled \
         -Ddocs=disabled \
         2>&1 | tee "${LOG_DIR}/harfbuzz-meson.log"
     ninja -C build-astryx -j"${JOBS}" 2>&1 | tee "${LOG_DIR}/harfbuzz-ninja.log"
