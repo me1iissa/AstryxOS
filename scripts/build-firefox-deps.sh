@@ -129,10 +129,10 @@ FREETYPE_VER="2.13.3"
 PIXMAN_VER="0.43.4"
 CAIRO_VER="1.18.0"
 LIBFFI_VER="3.4.6"
-SQLITE_VER="3460100"        # 3.46.1
+SQLITE_VER="3490100"        # 3.49.1
 LIBEVENT_VER="2.1.12"
 FONTCONFIG_VER="2.15.0"
-HARFBUZZ_VER="9.0.0"
+HARFBUZZ_VER="12.0.0"
 
 # ── 1. zlib ──────────────────────────────────────────────────────────────────
 
@@ -320,21 +320,52 @@ fi
 # ── 9. SQLite ─────────────────────────────────────────────────────────────────
 
 if should_build "sqlite"; then
-    step "SQLite ${SQLITE_VER}"
-    SQLITE_DIR="sqlite-autoconf-${SQLITE_VER}"
-    download_extract sqlite \
-        "https://www.sqlite.org/2024/${SQLITE_DIR}.tar.gz" \
-        "${SQLITE_DIR}"
-    pushd "${SOURCES_DIR}/${SQLITE_DIR}" > /dev/null
-    ./configure \
-        --host="${HOST_TRIPLE}" \
-        --prefix="${SYSROOT}" \
-        --disable-shared \
-        --enable-static \
-        --disable-readline \
-        2>&1 | tee "${LOG_DIR}/sqlite-configure.log"
-    make -j"${JOBS}" 2>&1 | tee "${LOG_DIR}/sqlite-make.log"
-    make install 2>&1 | tee "${LOG_DIR}/sqlite-install.log"
+    step "SQLite ${SQLITE_VER} (amalgamation)"
+    SQLITE_ZIP="sqlite-amalgamation-${SQLITE_VER}.zip"
+    SQLITE_DIR="sqlite-amalgamation-${SQLITE_VER}"
+    SQLITE_SRC_DIR="${SOURCES_DIR}/${SQLITE_DIR}"
+    if [ ! -d "${SQLITE_SRC_DIR}" ]; then
+        local_zip="${FFDEPS_DIR}/${SQLITE_ZIP}"
+        cache_zip="${SOURCES_DIR}/${SQLITE_ZIP}"
+        if [ -f "${local_zip}" ]; then
+            log "Using local archive for sqlite: FFDeps/${SQLITE_ZIP}"
+            cp "${local_zip}" "${cache_zip}"
+        else
+            log "Downloading SQLite amalgamation..."
+            wget -q --show-progress -O "${cache_zip}" \
+                "https://www.sqlite.org/2025/${SQLITE_ZIP}"
+        fi
+        log "Extracting SQLite amalgamation..."
+        unzip -q "${cache_zip}" -d "${SOURCES_DIR}"
+    fi
+    pushd "${SQLITE_SRC_DIR}" > /dev/null
+    # Compile the amalgamation directly — no configure script in this format.
+    ${CC} ${CFLAGS} \
+        -DSQLITE_THREADSAFE=0 \
+        -DSQLITE_DEFAULT_MEMSTATUS=0 \
+        -DSQLITE_OMIT_LOAD_EXTENSION \
+        -c sqlite3.c -o sqlite3.o \
+        2>&1 | tee "${LOG_DIR}/sqlite-compile.log"
+    ar rcs libsqlite3.a sqlite3.o \
+        2>&1 | tee "${LOG_DIR}/sqlite-ar.log"
+    ranlib libsqlite3.a
+    cp sqlite3.h shell.h 2>/dev/null || true
+    mkdir -p "${SYSROOT}/include" "${SYSROOT}/lib/pkgconfig"
+    cp sqlite3.h "${SYSROOT}/include/"
+    cp libsqlite3.a "${SYSROOT}/lib/"
+    # Write a minimal pkg-config file.
+    cat > "${SYSROOT}/lib/pkgconfig/sqlite3.pc" <<EOF
+prefix=${SYSROOT}
+exec_prefix=\${prefix}
+libdir=\${prefix}/lib
+includedir=\${prefix}/include
+
+Name: SQLite
+Description: SQL database engine
+Version: ${SQLITE_VER}
+Libs: -L\${libdir} -lsqlite3
+Cflags: -I\${includedir}
+EOF
     popd > /dev/null
     log "SQLite ${SQLITE_VER} installed ✓"
 fi
@@ -349,7 +380,7 @@ fi
 if should_build "fontconfig"; then
     step "fontconfig ${FONTCONFIG_VER}"
     download_extract fontconfig \
-        "https://www.freedesktop.org/software/fontconfig/release/fontconfig-${FONTCONFIG_VER}.tar.xz" \
+        "https://www.freedesktop.org/software/fontconfig/release/fontconfig-${FONTCONFIG_VER}.tar.gz" \
         "fontconfig-${FONTCONFIG_VER}"
     pushd "${SOURCES_DIR}/fontconfig-${FONTCONFIG_VER}" > /dev/null
     ./configure \
