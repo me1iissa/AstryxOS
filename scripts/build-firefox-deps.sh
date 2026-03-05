@@ -95,6 +95,20 @@ export PKG_CONFIG_PATH PKG_CONFIG_LIBDIR
 log() { echo "[BUILD] $*"; }
 step() { echo; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; echo " Building: $1"; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; }
 
+# ── Kernel headers overlay ──────────────────────────────────────────────────
+# Copy the Linux kernel UAPI headers (linux/, asm/, asm-generic/) into a
+# separate sub-directory inside the sysroot so we can pass -I for them
+# without polluting the search path with glibc headers from /usr/include.
+KHDRS="${SYSROOT}/include-khdrs"
+if [ ! -d "${KHDRS}/linux" ]; then
+    log "Setting up kernel headers overlay..."
+    mkdir -p "${KHDRS}"
+    [ -d /usr/include/linux ]        && cp -r /usr/include/linux        "${KHDRS}/"
+    [ -d /usr/include/asm-generic ]  && cp -r /usr/include/asm-generic  "${KHDRS}/"
+    { [ -d /usr/include/asm ] && cp -r /usr/include/asm "${KHDRS}/"; } 2>/dev/null || true
+    { [ -d /usr/include/x86_64-linux-gnu/asm ] && cp -r /usr/include/x86_64-linux-gnu/asm "${KHDRS}/"; } 2>/dev/null || true
+fi
+
 download_extract() {
     local name="$1" url="$2" dir="$3"
     local filename; filename="$(basename "${url}")"
@@ -185,11 +199,13 @@ if should_build "libjpeg-turbo"; then
     mkdir -p build-astryx && cd build-astryx
     cmake .. \
         -DCMAKE_SYSTEM_NAME=Linux \
+        -DCMAKE_SYSTEM_PROCESSOR=x86_64 \
         -DCMAKE_C_COMPILER="${CC}" \
         -DCMAKE_CXX_COMPILER="${CXX}" \
         -DCMAKE_INSTALL_PREFIX="${SYSROOT}" \
         -DENABLE_SHARED=OFF \
         -DENABLE_STATIC=ON \
+        -DWITH_SIMD=FALSE \
         -DCMAKE_BUILD_TYPE=Release \
         2>&1 | tee "${LOG_DIR}/libjpeg-cmake.log"
     make -j"${JOBS}" 2>&1 | tee "${LOG_DIR}/libjpeg-make.log"
@@ -211,6 +227,8 @@ if should_build "libffi"; then
         --prefix="${SYSROOT}" \
         --disable-shared \
         --enable-static \
+        CFLAGS="${CFLAGS} -I${KHDRS}" \
+        CPPFLAGS="-I${KHDRS}" \
         2>&1 | tee "${LOG_DIR}/libffi-configure.log"
     make -j"${JOBS}" 2>&1 | tee "${LOG_DIR}/libffi-make.log"
     make install 2>&1 | tee "${LOG_DIR}/libffi-install.log"
