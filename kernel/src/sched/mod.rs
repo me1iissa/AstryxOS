@@ -173,8 +173,10 @@ fn reap_dead_threads_isr_safe() {
     }
 
     if reaped > 0 {
-        drop(threads); // Release lock before serial output
-        crate::serial_println!("[CoreSched] Reaped {} dead thread(s)", reaped);
+        drop(threads); // Release lock before any further action
+        // NOTE: Do NOT serial_println! here — we are in ISR context (timer
+        // interrupt) and the interrupted code may hold the SERIAL spin lock.
+        // Printing would deadlock on the same CPU.
     }
 }
 
@@ -215,8 +217,17 @@ pub fn schedule() {
         let mut threads = THREAD_TABLE.lock();
         let len = threads.len();
         if len <= 1 {
+            // Check if we're a dead thread before bailing — if so we need to spin.
+            let current_is_done = threads
+                .iter()
+                .find(|t| t.tid == current_tid)
+                .map(|t| !matches!(t.state, ThreadState::Running))
+                .unwrap_or(true);
             drop(threads);
             crate::hal::enable_interrupts();
+            if current_is_done {
+                loop { core::hint::spin_loop(); } // nothing else can ever exist
+            }
             return; // Only idle thread, nothing to switch to.
         }
 
@@ -277,9 +288,34 @@ pub fn schedule() {
                 (tid, rsp, pid)
             }
             None => {
-                // No ready threads — stay on current (or idle).
+                // No ready threads on this CPU right now.
+                // If the current thread is dead/blocked/sleeping (e.g. called from
+                // exit_group or exit_thread) we MUST NOT return to it — doing so
+                // would sysretq back into dead user-space code.  Spin with interrupts
+                // enabled so timer ticks can wake/schedule another thread, then retry.
+                let current_is_done = threads
+                    .iter()
+                    .find(|t| t.tid == current_tid)
+                    .map(|t| !matches!(t.state, ThreadState::Running))
+                    .unwrap_or(true); // thread already reaped = treat as done
                 drop(threads);
                 crate::hal::enable_interrupts();
+                if current_is_done {
+                    loop {
+                        core::hint::spin_loop();
+                        // Check if a thread runnable on this CPU has become Ready.
+                        let any_ready = THREAD_TABLE.try_lock().map(|t| {
+                            t.iter().any(|th| {
+                                th.state == ThreadState::Ready
+                                    && th.cpu_affinity.map_or(true, |aff| aff == cpu)
+                            })
+                        }).unwrap_or(false);
+                        if any_ready { break; }
+                    }
+                    // Re-enter schedule() to perform the actual context switch.
+                    // The dead/blocked thread will be replaced and never return here.
+                    return schedule();
+                }
                 crate::perf::record_idle_tick();
                 return;
             }

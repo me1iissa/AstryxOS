@@ -63,9 +63,9 @@ echo "======================================"
 QEMU_CMD=(
     qemu-system-x86_64
     -machine pc
-    -cpu qemu64
-    -m 1G
-    -smp 2
+    -cpu host
+    -m 4G
+    -smp 4
     -serial stdio
     -no-reboot
     -no-shutdown

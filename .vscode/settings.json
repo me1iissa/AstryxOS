@@ -15,6 +15,27 @@
         "strings": true,
         "musl-gcc": true,
         "cp": true,
-        "mcopy": true
+        "mcopy": true,
+        "bindgen": true,
+        "ldd": true,
+        "tee": true,
+        "lsof": true,
+        "pgrep": true,
+        "rustc": true,
+        "\"${OBJCOPY}\"": true,
+        "/^cd ${workspaceFolder} && bash scripts/run-test\\.sh --headless 2>&1 \\| tail -250$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cd ${workspaceFolder} && bash scripts/run-test\\.sh --headless 2>&1 \\| tail -300$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "scripts/build.sh": true,
+        "/^cd ${workspaceFolder} && bash scripts/run-test\\.sh --no-build 2>&1 \\| tee /tmp/test-out2\\.txt$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "rustup": true
     }
 }

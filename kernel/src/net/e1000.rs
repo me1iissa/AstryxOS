@@ -220,9 +220,10 @@ fn init_device(bus: u8, dev: u8) -> bool {
     // 3) Reset the device
     mmio_write(REG_CTRL, mmio_read(REG_CTRL) | CTRL_RST);
     // Wait for reset to complete (bit self-clears).
-    // Use HLT to yield to QEMU under KVM so its event loop can run.
-    for _ in 0..100 {
-        crate::hal::halt();
+    // Use pause-spin — QEMU clears RST synchronously on re-read, and HLT is
+    // unsafe here because IF may be 0 during early kernel init.
+    for _ in 0..100_000 {
+        unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
         if mmio_read(REG_CTRL) & CTRL_RST == 0 { break; }
     }
 
@@ -240,19 +241,14 @@ fn init_device(bus: u8, dev: u8) -> bool {
     let ctrl = mmio_read(REG_CTRL);
     mmio_write(REG_CTRL, (ctrl & !(1u32 << 3)) | CTRL_SLU | CTRL_ASDE);
 
-    // Wait up to ~200ms for link to come up (tick-based spin-wait).
-    // QEMU's e1000 may need 50-100ms for link settling after SLU.
-    {
-        let start = crate::arch::x86_64::irq::get_ticks();
-        let deadline = start + 20; // 20 ticks at 100 Hz = 200ms
-        loop {
-            let s = mmio_read(REG_STATUS);
-            if s & 0x02 != 0 { break; } // Link is UP
-            let now = crate::arch::x86_64::irq::get_ticks();
-            if now >= deadline { break; }
-            // Yield CPU — HLT causes a KVM VM-exit so QEMU can run.
-            crate::hal::halt();
-        }
+    // Wait up to ~200ms for link to come up (spin-wait).
+    // QEMU's e1000 sets link-up immediately after SLU in software emulation;
+    // with KVM it may take a handful of microseconds. Use a bounded spin so
+    // we never block the init sequence if interrupts are still disabled.
+    for _ in 0..1_000_000u32 {
+        let s = mmio_read(REG_STATUS);
+        if s & 0x02 != 0 { break; } // Link is UP
+        unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
     }
 
     let status = mmio_read(REG_STATUS);

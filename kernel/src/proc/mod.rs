@@ -279,7 +279,7 @@ pub fn init() {
         },
         kernel_stack_base: 0,
         kernel_stack_size: 0,
-        wake_tick: 0,
+        wake_tick: u64::MAX,
         name: {
             let mut name = [0u8; 32];
             name[..11].copy_from_slice(b"idle_thread");
@@ -330,7 +330,17 @@ pub fn current_pid() -> Pid {
 }
 
 /// Create a new kernel process with a single thread.
+/// Create a kernel process with the main thread initially Blocked.
+/// The caller must mark the thread Ready after patching user-mode entry info.
+pub fn create_kernel_process_suspended(name: &str, entry_point: u64) -> Pid {
+    create_kernel_process_inner(name, entry_point, ThreadState::Blocked)
+}
+
 pub fn create_kernel_process(name: &str, entry_point: u64) -> Pid {
+    create_kernel_process_inner(name, entry_point, ThreadState::Ready)
+}
+
+fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: ThreadState) -> Pid {
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
     let tid = NEXT_TID.fetch_add(1, Ordering::Relaxed);
 
@@ -400,11 +410,11 @@ pub fn create_kernel_process(name: &str, entry_point: u64) -> Pid {
     let thread = Thread {
         tid,
         pid,
-        state: ThreadState::Ready,
+        state: initial_state,
         context,
         kernel_stack_base: stack_base,
         kernel_stack_size: KERNEL_STACK_SIZE,
-        wake_tick: 0,
+        wake_tick: u64::MAX,
         name: thread_name,
         exit_code: 0,
         fpu_state: None,
@@ -461,7 +471,7 @@ pub fn create_thread(pid: Pid, name: &str, entry_point: u64) -> Option<Tid> {
         context,
         kernel_stack_base: stack_base,
         kernel_stack_size: KERNEL_STACK_SIZE,
-        wake_tick: 0,
+        wake_tick: u64::MAX,
         name: thread_name,
         exit_code: 0,
         fpu_state: None,
@@ -483,7 +493,67 @@ pub fn create_thread(pid: Pid, name: &str, entry_point: u64) -> Option<Tid> {
     Some(tid)
 }
 
-/// Terminate the current thread.
+/// Like `create_thread`, but the new thread starts in `Blocked` state so the
+/// caller can safely populate `user_entry_rip` / `user_entry_rsp` / `tls_base`
+/// before the scheduler can pick it up.  Caller must transition the thread to
+/// `ThreadState::Ready` when it is ready to run.
+pub fn create_thread_blocked(pid: Pid, name: &str, entry_point: u64) -> Option<Tid> {
+    let tid = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+
+    let phys_stack = crate::mm::pmm::alloc_pages(KERNEL_STACK_PAGES)?;
+    let stack_base = KERNEL_VIRT_OFFSET + phys_stack;
+    let stack_top = stack_base + KERNEL_STACK_SIZE;
+
+    let cr3 = {
+        let procs = PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid)?.cr3
+    };
+
+    let initial_rsp = thread::init_thread_stack(stack_top, entry_point);
+
+    let context = CpuContext {
+        rip: 0,
+        rsp: initial_rsp,
+        rbp: 0,
+        rbx: entry_point,
+        r12: 0, r13: 0, r14: 0, r15: 0,
+        rflags: 0x202,
+        cr3,
+    };
+
+    let mut thread_name = [0u8; 32];
+    let bytes = name.as_bytes();
+    let len = bytes.len().min(31);
+    thread_name[..len].copy_from_slice(&bytes[..len]);
+
+    let thread = Thread {
+        tid,
+        pid,
+        state: ThreadState::Blocked, // caller must mark Ready when prepared
+        context,
+        kernel_stack_base: stack_base,
+        kernel_stack_size: KERNEL_STACK_SIZE,
+        wake_tick: u64::MAX, // indefinite — caller marks Ready explicitly
+        name: thread_name,
+        exit_code: 0,
+        fpu_state: None,
+        user_entry_rip: 0,
+        user_entry_rsp: 0,
+        priority: PRIORITY_NORMAL,
+        base_priority: PRIORITY_NORMAL,
+        tls_base: 0,
+        cpu_affinity: None,
+        last_cpu: 0,
+    };
+
+    THREAD_TABLE.lock().push(thread);
+    PROCESS_TABLE.lock().iter_mut()
+        .find(|p| p.pid == pid)
+        .map(|p| p.threads.push(tid));
+
+    crate::serial_println!("[PROC] Created thread (blocked) '{}' TID {} in PID {}", name, tid, pid);
+    Some(tid)
+}
 pub fn exit_thread(exit_code: i64) {
     let tid = current_tid();
     let pid;
@@ -501,20 +571,38 @@ pub fn exit_thread(exit_code: i64) {
     }
 
     // Check if all threads in the process are dead.
-    {
+    // IMPORTANT: Never hold THREAD_TABLE and PROCESS_TABLE simultaneously —
+    // other code paths (test runner, scheduler) may acquire them in the
+    // opposite order, causing an ABBA deadlock on SMP.
+
+    // Step 1: Get thread TID list + parent_pid from PROCESS_TABLE only.
+    let (thread_tids, ppid) = {
+        let procs = PROCESS_TABLE.lock();
+        let tids = procs.iter().find(|p| p.pid == pid)
+            .map(|p| p.threads.clone())
+            .unwrap_or_default();
+        let pp = procs.iter().find(|p| p.pid == pid)
+            .map(|p| p.parent_pid).unwrap_or(0);
+        (tids, pp)
+    };
+    parent_pid = ppid;
+
+    // Step 2: Check thread states from THREAD_TABLE only.
+    let all_dead = {
         let threads = THREAD_TABLE.lock();
+        thread_tids.iter().all(|&t| {
+            threads.iter().find(|th| th.tid == t)
+                .map(|th| th.state == ThreadState::Dead)
+                .unwrap_or(true)
+        })
+    };
+
+    // Step 3: If all dead, mark process as Zombie via PROCESS_TABLE only.
+    if all_dead {
         let mut procs = PROCESS_TABLE.lock();
-        parent_pid = procs.iter().find(|p| p.pid == pid).map(|p| p.parent_pid).unwrap_or(0);
         if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
-            let all_dead = proc.threads.iter().all(|&tid| {
-                threads.iter().find(|t| t.tid == tid)
-                    .map(|t| t.state == ThreadState::Dead)
-                    .unwrap_or(true)
-            });
-            if all_dead {
-                proc.state = ProcessState::Zombie;
-                proc.exit_code = exit_code as i32;
-            }
+            proc.state = ProcessState::Zombie;
+            proc.exit_code = exit_code as i32;
         }
     }
 
@@ -530,6 +618,53 @@ pub fn exit_thread(exit_code: i64) {
     }
 
     // Yield to scheduler — we're dead, should never return.
+    crate::sched::schedule();
+}
+
+/// exit_group(status) — Linux semantics: terminate ALL threads in the process,
+/// then mark the process as Zombie.  Called by the exit_group(231) syscall.
+pub fn exit_group(exit_code: i64) {
+    let tid = current_tid();
+    let pid;
+    let parent_pid;
+
+    // Kill every thread in the process (including the caller).
+    {
+        let mut threads = THREAD_TABLE.lock();
+        let my_thread = threads.iter().find(|t| t.tid == tid);
+        pid = match my_thread {
+            Some(t) => t.pid,
+            None => { crate::sched::schedule(); return; }
+        };
+        for t in threads.iter_mut() {
+            if t.pid == pid && t.state != ThreadState::Dead {
+                t.state = ThreadState::Dead;
+                t.exit_code = exit_code;
+            }
+        }
+    }
+
+    // Mark the process as Zombie and record exit code.
+    {
+        let mut procs = PROCESS_TABLE.lock();
+        parent_pid = procs.iter().find(|p| p.pid == pid).map(|p| p.parent_pid).unwrap_or(0);
+        if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
+            proc.state = ProcessState::Zombie;
+            proc.exit_code = exit_code as i32;
+        }
+    }
+
+    // Wake parent threads blocked in waitpid.
+    {
+        let mut threads = THREAD_TABLE.lock();
+        for t in threads.iter_mut() {
+            if t.pid == parent_pid && t.state == ThreadState::Blocked && t.wake_tick == u64::MAX - 1 {
+                t.state = ThreadState::Ready;
+            }
+        }
+    }
+
+    // Yield — we're dead and should never return.
     crate::sched::schedule();
 }
 
@@ -710,7 +845,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid) -> Option<Pid> {
         context,
         kernel_stack_base: stack_base,
         kernel_stack_size: KERNEL_STACK_SIZE,
-        wake_tick: 0,
+        wake_tick: u64::MAX,
         name: thread_name,
         exit_code: 0,
         fpu_state: None,
@@ -804,28 +939,34 @@ fn fork_child_entry() {
 ///
 /// Returns `Some((child_pid, exit_code))` if a zombie child is found, or `None`.
 pub fn waitpid(parent_pid: Pid, wait_pid: i64) -> Option<(Pid, i32)> {
-    let mut procs = PROCESS_TABLE.lock();
+    // Step 1: Find and remove zombie child from PROCESS_TABLE.
+    // Collect thread TIDs while we have the lock, but do NOT lock THREAD_TABLE
+    // simultaneously — that causes ABBA deadlocks on SMP.
+    let (child_pid, exit_code, thread_tids) = {
+        let mut procs = PROCESS_TABLE.lock();
 
-    // Find a zombie child matching the criteria.
-    let idx = procs.iter().position(|p| {
-        p.parent_pid == parent_pid
-            && p.state == ProcessState::Zombie
-            && (wait_pid < 0 || p.pid == wait_pid as u64)
-    })?;
+        let idx = procs.iter().position(|p| {
+            p.parent_pid == parent_pid
+                && p.state == ProcessState::Zombie
+                && (wait_pid < 0 || p.pid == wait_pid as u64)
+        })?;
 
-    let child = &procs[idx];
-    let child_pid = child.pid;
-    let exit_code = child.exit_code;
+        let child = &procs[idx];
+        let pid = child.pid;
+        let code = child.exit_code;
+        let tids: Vec<Tid> = child.threads.clone();
 
-    // Reap: clean up the child's threads.
-    let thread_tids: Vec<Tid> = child.threads.clone();
+        // Remove the child process entry.
+        procs.remove(idx);
+
+        (pid, code, tids)
+    }; // PROCESS_TABLE lock dropped
+
+    // Step 2: Reap the child's threads (THREAD_TABLE only).
     {
         let mut threads = THREAD_TABLE.lock();
         threads.retain(|t| !thread_tids.contains(&t.tid));
     }
-
-    // Remove the child process entry.
-    procs.remove(idx);
 
     crate::serial_println!(
         "[PROC] waitpid: reaped PID {} (exit_code={})",

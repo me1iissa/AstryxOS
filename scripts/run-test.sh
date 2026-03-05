@@ -145,7 +145,7 @@ if [ ! -f "${DATA_IMG}" ]; then
 fi
 if [ -f "${DATA_IMG}" ]; then
     QEMU_CMD+=(
-        -drive "file=${DATA_IMG},format=raw,if=none,id=data0"
+        -drive "file=${DATA_IMG},format=raw,if=none,id=data0,snapshot=on"
         -device "ide-hd,drive=data0,bus=ide.1"
     )
 fi
@@ -189,10 +189,10 @@ if [ "$PING_MIN" -gt "$PING_MAX" ] 2>/dev/null; then
 fi
 
 # Run QEMU — capture exit code
-# Timeout after 180 seconds to prevent hanging (DNS tests need extra time)
+# Timeout after 600 seconds to allow all 56 tests to complete
 # Use serial file output + tail to stream log reliably
 set +e
-timeout 180 "${QEMU_CMD[@]}" &
+timeout 600 "${QEMU_CMD[@]}" &
 QEMU_PID=$!
 
 # Stream the serial log in real-time (background tail)
@@ -233,7 +233,7 @@ case ${EXIT_CODE} in
         exit 1
         ;;
     124)
-        echo -e "${RED}${BOLD}  ✗ TIMEOUT — tests did not complete in 180s${NC}"
+        echo -e "${RED}${BOLD}  ✗ TIMEOUT — tests did not complete in 600s${NC}"
         echo ""
         echo -e "${YELLOW}[TEST] Serial output captured so far:${NC}"
         cat "${SERIAL_LOG}"

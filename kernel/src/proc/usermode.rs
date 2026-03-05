@@ -28,13 +28,16 @@ pub fn create_user_thread(
     user_rsp: u64,
     tls: u64,
 ) -> Option<proc::Tid> {
-    let tid = proc::create_thread(pid, "clone-child", user_mode_bootstrap as u64)?;
+    // Create the thread as Blocked so the scheduler cannot run it before
+    // user_entry_rip / user_entry_rsp / tls_base are set.
+    let tid = proc::create_thread_blocked(pid, "clone-child", user_mode_bootstrap as *const () as u64)?;
 
     let cr3 = {
         let procs = PROCESS_TABLE.lock();
         procs.iter().find(|p| p.pid == pid)?.cr3
     };
 
+    // Populate the run-time fields and mark the thread Ready in one lock region.
     {
         let mut threads = THREAD_TABLE.lock();
         if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
@@ -42,6 +45,7 @@ pub fn create_user_thread(
             t.user_entry_rsp = user_rsp;
             t.tls_base       = tls;
             t.context.cr3    = cr3;
+            t.state          = proc::ThreadState::Ready; // safe to schedule now
         }
     }
 
@@ -89,9 +93,9 @@ pub fn create_user_process(name: &str, elf_data: &[u8]) -> Result<proc::Pid, elf
     // Map the signal-return trampoline into the new address space.
     crate::signal::map_trampoline(user_cr3);
 
-    // Create a kernel process whose main thread starts at user_mode_bootstrap.
-    // Then patch it with our per-process page table and user entry info.
-    let pid = proc::create_kernel_process(name, user_mode_bootstrap as *const () as u64);
+    // Create the process with its thread initially Blocked so no AP can
+    // schedule it before we patch in the correct RIP/RSP/CR3.
+    let pid = proc::create_kernel_process_suspended(name, user_mode_bootstrap as *const () as u64);
 
     // Patch the process with our per-process page table and exe path.
     {
@@ -100,17 +104,17 @@ pub fn create_user_process(name: &str, elf_data: &[u8]) -> Result<proc::Pid, elf
             p.cr3 = user_cr3;
             p.vm_space = Some(vm_space);
             p.exe_path = Some(alloc::string::String::from(name));
-            // name may be a short label or a full path depending on call site
         }
     }
 
-    // Store entry point and user RSP in the thread for user_mode_bootstrap to read.
+    // Patch the thread's user-mode entry info and CR3, then mark it Ready.
     {
         let mut threads = THREAD_TABLE.lock();
         if let Some(t) = threads.iter_mut().find(|t| t.pid == pid) {
             t.user_entry_rip = entry_rip;
             t.user_entry_rsp = entry_rsp;
             t.context.cr3 = user_cr3;
+            t.state = proc::ThreadState::Ready;  // now safe to schedule
         }
     }
 
