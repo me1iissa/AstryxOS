@@ -23,6 +23,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="${ROOT_DIR}/build"
 SYSROOT="${BUILD_DIR}/sysroot"
 SOURCES_DIR="${BUILD_DIR}/firefox-deps-src"
+FFDEPS_DIR="${ROOT_DIR}/FFDeps"          # pre-downloaded tarballs live here
 LOG_DIR="${BUILD_DIR}/firefox-deps-logs"
 JOBS="$(nproc 2>/dev/null || echo 4)"
 ONLY_LIB=""
@@ -46,9 +47,15 @@ if command -v x86_64-linux-musl-gcc &>/dev/null; then
     CROSS="x86_64-linux-musl-"
     CC="${CROSS}gcc"
     CXX="${CROSS}g++"
-    AR="${CROSS}ar"
-    RANLIB="${CROSS}ranlib"
-    STRIP="${CROSS}strip"
+    AR="ar"
+    RANLIB="ranlib"
+    STRIP="strip"
+    # Use native binutils — x86_64-linux-musl-gcc is a wrapper, ar/ranlib don't exist
+    if command -v x86_64-linux-musl-ar &>/dev/null; then
+        AR="${CROSS}ar"
+        RANLIB="${CROSS}ranlib"
+        STRIP="${CROSS}strip"
+    fi
 elif command -v musl-gcc &>/dev/null; then
     CC="musl-gcc"
     CXX="musl-g++"
@@ -90,11 +97,18 @@ step() { echo; echo "━━━━━━━━━━━━━━━━━━━�
 
 download_extract() {
     local name="$1" url="$2" dir="$3"
-    local archive="${SOURCES_DIR}/$(basename "${url}")"
+    local filename; filename="$(basename "${url}")"
+    local archive="${SOURCES_DIR}/${filename}"
     if [ ! -d "${SOURCES_DIR}/${dir}" ]; then
         if [ ! -f "${archive}" ]; then
-            log "Downloading ${name}..."
-            wget -q --show-progress -O "${archive}" "${url}"
+            # Check FFDeps/ local cache first
+            if [ -f "${FFDEPS_DIR}/${filename}" ]; then
+                log "Using local archive for ${name}: FFDeps/${filename}"
+                cp "${FFDEPS_DIR}/${filename}" "${archive}"
+            else
+                log "Downloading ${name}..."
+                wget -q --show-progress -O "${archive}" "${url}"
+            fi
         fi
         log "Extracting ${name}..."
         tar -xf "${archive}" -C "${SOURCES_DIR}"
@@ -108,7 +122,7 @@ should_build() {
 
 # ── Library versions ─────────────────────────────────────────────────────────
 
-ZLIB_VER="1.3.1"
+ZLIB_VER="1.3.2"
 LIBPNG_VER="1.6.43"
 LIBJPEG_VER="3.0.3"        # libjpeg-turbo
 FREETYPE_VER="2.13.3"
