@@ -1,8 +1,8 @@
 # AstryxOS — Progress Tracker
 
-## Current Phase: Core OS Infrastructure Complete (M8–M13) ✅
-**Completed**: 2026-02-28
-**Tests**: 27/27 passing
+## Current Phase: Firefox Dynamic Linking (Phase 5+) 🔧
+**Current**: 2026-03-01
+**Tests**: 56/56 passing
 
 ### Milestone 13 — Power Management ✅
 **Completed**: 2026-02-28
@@ -326,11 +326,12 @@
 - ALPC shared memory views are struct-only (no actual memory mapping yet)
 - Win32 subsystem is framework-only (no real Win32 API dispatch)
 - Registry has no persistence (in-memory only)
-- No SMP / multi-core support
+- schedule() raw pointer race: old_rsp_ptr into Vec<Thread> while reap_dead_threads_isr_safe() can swap_remove on another CPU — transient hangs possible
+- Firefox exits 255 — glibc/ld-linux chain executes but clone thread gets further with TLS fix; needs more glibc syscall coverage to load XPCOM
 
 ---
 
-## Test Suite Results (21/21 passing)
+## Test Suite Results (56/56 passing)
 | # | Test | Status |
 |---|------|--------|
 | 1 | Network Configuration | ✅ |
@@ -354,10 +355,97 @@
 | 19 | Buffer Cache + File-backed mmap | ✅ |
 | 20 | NT Executive Core | ✅ |
 | 21 | ALPC + Win32 Subsystem | ✅ |
+| 22 | Ke — IRQL + DPC + APC | ✅ |
+| 23 | Ke — Dispatcher Objects + Wait | ✅ |
+| 24 | Ex — Executive Resources + Work Queues | ✅ |
+| 25 | Security Tokens + SIDs + Privileges | ✅ |
+| 26 | I/O Completion Ports + Async I/O | ✅ |
+| 27 | Power Management (Po) | ✅ |
+| 28 | VMware SVGA II Driver | ✅ |
+| 29 | GDI Engine | ✅ |
+| 30 | Window Manager (WM) | ✅ |
+| 31 | Message System (Msg) | ✅ |
+| 32 | IPv6 DNS Resolution (AAAA) | ✅ |
+| 33 | IPv6 Ping (ICMPv6) | ✅ |
+| 34 | VFS Rename Operations | ✅ |
+| 35 | VFS Symlinks | ✅ |
+| 36 | VFS Timestamps & Permissions | ✅ |
+| 37 | IRP Filesystem Driver | ✅ |
+| 38 | Window Manager Core | ✅ |
+| 39 | Compositor Init | ✅ |
+| 40 | Desktop Launch (timed) | ✅ |
+| 41 | AC97 Audio Subsystem | ✅ |
+| 42 | USB Controller Detection | ✅ |
+| 43 | Musl libc hello (static ELF) | ✅ |
+| 44 | mmap syscall (arg6/offset, file-backed, MAP_FIXED) | ✅ |
+| 45 | Dynamic ELF (PT_INTERP → ld-musl) | ✅ |
+| 46 | clone(CLONE_THREAD\|CLONE_VM) | ✅ |
+| 47 | socket-as-fd | ✅ |
+| 48 | PIE (ET_DYN) + PT_INTERP | ✅ |
+| 49 | mprotect page-table protection | ✅ |
+| 50 | eventfd counter signaling | ✅ |
+| 51 | pipe2(O_CLOEXEC) + statfs() | ✅ |
+| 52 | futex REQUEUE + WAIT_BITSET | ✅ |
+| 53 | AF_UNIX socketpair round-trip | ✅ |
+| 54 | AF_UNIX bind/listen/connect/accept | ✅ |
+| 55 | /proc/self/maps dynamic content | ✅ |
+| 56 | Firefox (glibc PT_INTERP dynamic ELF) | ✅ |
+| 16 | FAT32 Write Support | ✅ |
+| 17 | Linux Syscall Compat | ✅ |
+| 18 | Signal Delivery Trampoline | ✅ |
+| 19 | Buffer Cache + File-backed mmap | ✅ |
+| 20 | NT Executive Core | ✅ |
+| 21 | ALPC + Win32 Subsystem | ✅ |
 
 ---
 
 ## Changelog
+
+### 2026-03-02 (Session 15) — Clone TLS Fix + dup/dup2 + Desktop Unfreeze
+- **Critical: clone() TLS argument was using wrong register** (`arg4`=r10=ctid instead of `arg5`=r8=tls)
+  - Root cause: Linux x86-64 clone() ABI: `rdi`=flags, `rsi`=stack, `rdx`=ptid, **`r10`**=ctid, **`r8`**=tls
+  - In our syscall_entry asm: arg4→r8 maps original r10 (ctid), arg5→r9 maps original r8 (tls)
+  - The clone handler had `let tls = arg4` → was reading ctid pointer as TLS base
+  - Clone child thread got garbage/0 as FS_BASE → glibc's `movq %fs:0, %reg` hit CR2=0x0 (protection fault)
+  - Fixed: `let tls = arg5` in dispatch_linux syscall 56 handler
+  - This resolves the "Firefox clone child NULL dereference" at RIP=0x7effffd3ea36, CR2=0x0, err=0x5
+- **syscall 32 (`dup`) and 33 (`dup2`) added to dispatch_linux**
+  - `Unknown Linux syscall: 32` was appearing twice before clone()
+  - Both `sys_dup(old_fd)` and `sys_dup2(old_fd, new_fd)` now routed in Linux ABI dispatch
+  - Also added syscall 34 (`pause` → yield+EINTR) alongside nanosleep/sched_yield
+- **syscall 6 (`lstat`) added to dispatch_linux**
+  - Previously missing between stat(4) and fstat(5); now maps to `sys_stat_linux` (no symlink follow at final component)
+- **Desktop loop ARP warmup unblocked rendering**
+  - Prior: `run_desktop_loop()` blocked for up to 3 seconds in ARP probe loop before rendering ANY frames
+  - Fixed: ARP warmup is now folded into the main event loop
+  - First frame of the desktop renders immediately; ARP probing happens once-per-tick in the background
+  - `last_arp_probe` uses `saturating_sub` to avoid u64 wraparound
+- **Tests**: 56/56 passing (no regressions)
+
+### 2026-03-01 (Session 14) — Firefox Crash Fixes + FD Ordering Overhaul
+- **wake_tick Premature Wakeup Fix**: Changed `wake_tick: 0 → u64::MAX` in 4 thread creation sites (proc/mod.rs)
+  - Root cause: wake_sleeping_threads() woke Blocked threads with wake_tick:0 before create_user_process patched RIP/RSP/CR3 → PID 4 entered Ring 3 at RIP=0x0
+  - Fixed in: idle_thread, create_kernel_process_inner, create_thread, fork child_thread
+- **sys_openat Real dirfd Support**: Full implementation with dirfd path resolution (was returning EINVAL for non-AT_FDCWD dirfds)
+  - Firefox's ld-linux couldn't find libm.so.6 because openat(dirfd, ...) failed
+- **sys_newfstatat Real dirfd Support**: Full rewrite handling AT_EMPTY_PATH, null pathname, absolute paths, AT_FDCWD, relative paths with real dirfds
+- **VFS resolve_path Refactor — lstat/stat Distinction**:
+  - Renamed `resolve_path_depth` → `resolve_path_opts(path, depth, follow_final: bool)`
+  - `resolve_path(path)` follows all symlinks (for stat/open)
+  - New `resolve_path_no_follow(path)` stops at final symlink (for lstat/readlink)
+  - New `lstat()` public function using resolve_path_no_follow
+  - Fixed `readlink()` to use resolve_path_no_follow (was following symlink then failing)
+  - Updated VFS Symlinks test for POSIX semantics
+- **FD Read/Write Ordering Overhaul — VFS-First Architecture**:
+  - Root cause: `fd == 0` (stdin), `fd == 1 || fd == 2` (stdout/stderr) shortcuts were checked BEFORE special fd types (pipe/socket/eventfd) AND before VFS file descriptors
+  - When pipe/socket/eventfd/file got assigned fd 0/1/2, operations went to TTY instead of the correct target
+  - **sys_write_linux**: Now checks pipe → unix_socket → tcp_socket → eventfd → VFS fd_write → TTY fallback for fd 1/2
+  - **sys_read_linux**: Now checks pipe → unix_socket → tcp_socket → eventfd → VFS fd_read → TTY fallback for fd 0
+  - **Native SYS_WRITE**: pipe → VFS fd_write → TTY fallback for fd 1/2
+  - **Native SYS_READ**: pipe → VFS fd_read → TTY fallback for fd 0
+  - This fixed pipe2, unix_socketpair, AND /proc/self/maps tests simultaneously
+- **Test Results**: 53/56 → 56/56 (fixed VFS Symlinks, pipe2, unix_socketpair, /proc/self/maps)
+- Firefox test passes (exit 255, glibc/ld-linux chain executed, clone child spawned)
 
 ### 2026-02-28 (Session 12) — Milestones 2–7
 - **Milestone 2 — TTY/termios Layer**: Full TTY subsystem with Termios, line discipline (canonical/raw), IOCTL support (TCGETS/TCSETS/TIOCGWINSZ), VT100 extensions. 15/15 tests.

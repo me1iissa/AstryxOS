@@ -805,6 +805,9 @@ pub extern "C" fn ap_rust_entry() -> ! {
     // Read our APIC ID
     let apic_id = (lapic_read(LAPIC_ID) >> 24) as u8;
 
+    // Enable SSE on this AP (BSP does it in arch::x86_64::init)
+    crate::arch::x86_64::enable_sse();
+
     // Enable local APIC
     let apic_base_msr = unsafe { rdmsr(IA32_APIC_BASE_MSR) };
     unsafe {

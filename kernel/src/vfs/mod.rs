@@ -224,6 +224,14 @@ pub fn init() {
     let _ = mkdir("/bin");
     let _ = mkdir("/etc");
 
+    // Symlinks so glibc/musl dynamic linker can find libraries on the data disk.
+    // When ld.so opens e.g. /lib/x86_64-linux-gnu/libc.so.6, the VFS follows
+    // the symlink to /disk/lib/x86_64-linux-gnu/libc.so.6.
+    // /lib64/ld-linux-x86-64.so.2 → /disk/lib64/ld-linux-x86-64.so.2
+    let _ = symlink("/lib",   "/disk/lib");
+    let _ = symlink("/lib64", "/disk/lib64");
+    let _ = symlink("/usr",   "/disk/usr");
+
     // Create /dev/null and /dev/console.
     let _ = create_file("/dev/null");
     let _ = create_file("/dev/zero");
@@ -577,35 +585,140 @@ fn init_ata_disks() {
 }
 
 
-/// Resolve a path to (mount_index, inode).
+/// Resolve a path to (mount_index, inode), following all symlinks.
 fn resolve_path(path: &str) -> VfsResult<(usize, u64)> {
-    let mounts = MOUNTS.lock();
-    if mounts.is_empty() {
-        return Err(VfsError::NotFound);
+    resolve_path_opts(path, 0, true)
+}
+
+/// Resolve a path but do NOT follow the final component if it is a symlink.
+/// Intermediate symlinks are still followed.  Used by lstat() and readlink().
+fn resolve_path_no_follow(path: &str) -> VfsResult<(usize, u64)> {
+    resolve_path_opts(path, 0, false)
+}
+
+/// Inner resolver with symlink depth tracking and final-follow control.
+///
+/// * `follow_final` – when `true`, follow the last path component if it is a
+///   symlink (stat / open behaviour).  When `false`, stop at the symlink inode
+///   itself (lstat / readlink behaviour).
+fn resolve_path_opts(path: &str, depth: u32, follow_final: bool) -> VfsResult<(usize, u64)> {
+    const MAX_SYMLINK_DEPTH: u32 = 16;
+    if depth > MAX_SYMLINK_DEPTH {
+        return Err(VfsError::NotFound); // symlink loop
     }
 
-    // Find the deepest mount point that is a prefix of the path.
-    let mut best_mount = 0;
-    let mut best_len = 0;
-    for (i, mount) in mounts.iter().enumerate() {
-        if path.starts_with(mount.path.as_str()) && mount.path.len() >= best_len {
-            best_mount = i;
-            best_len = mount.path.len();
+    let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    // Start from root mount and walk component by component.
+    // After each lookup, check if the result is a symlink and follow it.
+    let mut resolved_so_far = String::from("/");
+
+    // Find mount + inode for "/"
+    let (mut cur_mount, mut cur_inode) = {
+        let mounts = MOUNTS.lock();
+        if mounts.is_empty() {
+            return Err(VfsError::NotFound);
+        }
+        (0usize, mounts[0].root_inode)
+    };
+
+    // Re-match the deepest mount for the initial path prefix.
+    {
+        let mounts = MOUNTS.lock();
+        let mut best_mount = 0;
+        let mut best_len = 0;
+        for (i, mount) in mounts.iter().enumerate() {
+            if path.starts_with(mount.path.as_str()) && mount.path.len() >= best_len {
+                best_mount = i;
+                best_len = mount.path.len();
+            }
+        }
+        cur_mount = best_mount;
+        cur_inode = mounts[best_mount].root_inode;
+        resolved_so_far = mounts[best_mount].path.clone();
+        if resolved_so_far.is_empty() {
+            resolved_so_far = String::from("/");
         }
     }
 
-    let mount = &mounts[best_mount];
-    let relative = &path[best_len..];
+    // Determine which components are already consumed by the mount path.
+    let mount_path = resolved_so_far.clone();
+    let mount_components: Vec<&str> = mount_path.split('/').filter(|s| !s.is_empty()).collect();
+    let remaining = &components[mount_components.len()..];
 
-    // Walk the path components.
-    let mut current_inode = mount.root_inode;
-    if !relative.is_empty() {
-        for component in relative.split('/').filter(|s| !s.is_empty()) {
-            current_inode = mount.fs.lookup(current_inode, component)?;
+    for (i, component) in remaining.iter().enumerate() {
+        let is_final = i + 1 == remaining.len();
+
+        // Lookup this component in the current directory.
+        let child_inode = {
+            let mounts = MOUNTS.lock();
+            mounts[cur_mount].fs.lookup(cur_inode, component)?
+        };
+
+        // Check if the child is a symlink.
+        let child_stat = {
+            let mounts = MOUNTS.lock();
+            mounts[cur_mount].fs.stat(child_inode)?
+        };
+
+        if child_stat.file_type == FileType::SymLink {
+            // If this is the final component and we were asked not to follow,
+            // return the symlink inode directly.
+            if is_final && !follow_final {
+                return Ok((cur_mount, child_inode));
+            }
+
+            // Read the symlink target.
+            let target = {
+                let mounts = MOUNTS.lock();
+                mounts[cur_mount].fs.readlink(child_inode)?
+            };
+
+            // Build the new path: target + remaining components after this one.
+            let rest: Vec<&str> = remaining[i + 1..].to_vec();
+            let new_path = if rest.is_empty() {
+                if target.starts_with('/') {
+                    target
+                } else {
+                    alloc::format!("{}/{}", resolved_so_far.trim_end_matches('/'), target)
+                }
+            } else {
+                let rest_str = rest.join("/");
+                if target.starts_with('/') {
+                    alloc::format!("{}/{}", target.trim_end_matches('/'), rest_str)
+                } else {
+                    alloc::format!("{}/{}/{}", resolved_so_far.trim_end_matches('/'), target, rest_str)
+                }
+            };
+            // Recurse with incremented depth.  When following intermediate
+            // symlinks the recursive call always follows the final component
+            // (the rest of the path after the symlink).
+            return resolve_path_opts(&new_path, depth + 1, true);
+        }
+
+        // Not a symlink — advance.
+        cur_inode = child_inode;
+        if resolved_so_far.ends_with('/') {
+            resolved_so_far.push_str(component);
+        } else {
+            resolved_so_far.push('/');
+            resolved_so_far.push_str(component);
+        }
+
+        // Check if there's a deeper mount point at the resolved path.
+        {
+            let mounts = MOUNTS.lock();
+            for (mi, mount) in mounts.iter().enumerate() {
+                if mount.path == resolved_so_far {
+                    cur_mount = mi;
+                    cur_inode = mount.root_inode;
+                    break;
+                }
+            }
         }
     }
 
-    Ok((best_mount, current_inode))
+    Ok((cur_mount, cur_inode))
 }
 
 /// Resolve a path to (mount_index, parent_inode, last_component).
@@ -651,9 +764,16 @@ pub fn remove(path: &str) -> VfsResult<()> {
     Ok(())
 }
 
-/// Stat a file.
+/// Stat a file (follows symlinks — like Linux `stat`).
 pub fn stat(path: &str) -> VfsResult<FileStat> {
     let (mount_idx, inode) = resolve_path(path)?;
+    let mounts = MOUNTS.lock();
+    mounts[mount_idx].fs.stat(inode)
+}
+
+/// Stat a file without following the final symlink (like Linux `lstat`).
+pub fn lstat(path: &str) -> VfsResult<FileStat> {
+    let (mount_idx, inode) = resolve_path_no_follow(path)?;
     let mounts = MOUNTS.lock();
     mounts[mount_idx].fs.stat(inode)
 }
@@ -720,9 +840,9 @@ pub fn symlink(link_path: &str, target: &str) -> VfsResult<()> {
     Ok(())
 }
 
-/// Read the target of a symbolic link.
+/// Read the target of a symbolic link (does not follow the final symlink).
 pub fn readlink(path: &str) -> VfsResult<String> {
-    let (mount_idx, inode) = resolve_path(path)?;
+    let (mount_idx, inode) = resolve_path_no_follow(path)?;
     let mounts = MOUNTS.lock();
     mounts[mount_idx].fs.readlink(inode)
 }

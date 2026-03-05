@@ -59,7 +59,7 @@ const COMMANDS: &[&str] = &[
     "ifconfig", "ip", "ping", "ping6", "netstats", "nslookup", "resolve",
     "pipe", "history", "hexdump", "date", "whoami", "hostname", "motd",
     "panic", "reboot", "shutdown", "halt", "dns", "dhcp",
-    "ob", "reg", "devmgr", "procfs", "perf", "exec",
+    "ob", "reg", "devmgr", "procfs", "perf", "exec", "ldd",
     "beep", "play", "volume", "audio", "usb",
 ];
 
@@ -718,6 +718,7 @@ fn execute(state: &mut ShellState, line: &str) {
         "procfs" => cmd_procfs(&parts),
         "perf" => cmd_perf(&parts),
         "exec" => cmd_exec(&parts),
+        "ldd" => cmd_ldd(state, &parts),
         "beep" => cmd_beep(),
         "play" => cmd_play(&parts),
         "volume" => cmd_volume(&parts),
@@ -917,6 +918,7 @@ fn cmd_help() {
     orbit_println!("");
     orbit_println!("{}User-mode:{}", color::YELLOW, color::RESET);
     orbit_println!("  exec [name]   Run ELF binary in Ring 3 (default: hello)");
+    orbit_println!("  ldd  <file>   Show shared library dependencies of an ELF binary");
     orbit_println!("");
     orbit_println!("{}GUI:{}", color::YELLOW, color::RESET);
     orbit_println!("  desktop       Launch graphical desktop");
@@ -2034,7 +2036,14 @@ fn cmd_exec(parts: &[&str]) {
         return;
     }
 
-    let name = parts[1];
+    // Normalize: ensure the path has a leading '/' so VFS mount-prefix matching works.
+    let name_buf;
+    let name = if parts[1].starts_with('/') {
+        parts[1]
+    } else {
+        name_buf = alloc::format!("/{}", parts[1]);
+        name_buf.as_str()
+    };
 
     // Enable scheduler so the user-mode process can be scheduled.
     let was_active = crate::sched::is_active();
@@ -2100,6 +2109,249 @@ fn cmd_exec(parts: &[&str]) {
     if !was_active {
         crate::sched::disable();
     }
+}
+
+// ==================== ldd — shared library dependency viewer ====================
+
+/// ELF64 Section Header (needed to locate .dynstr / .dynamic by type).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Elf64Shdr {
+    sh_name: u32,
+    sh_type: u32,
+    sh_flags: u64,
+    sh_addr: u64,
+    sh_offset: u64,
+    sh_size: u64,
+    sh_link: u32,
+    sh_info: u32,
+    sh_addralign: u64,
+    sh_entsize: u64,
+}
+
+/// ELF64 Dynamic entry.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Elf64Dyn {
+    d_tag: i64,
+    d_val: u64,
+}
+
+const PT_DYNAMIC: u32 = 2;
+const PT_INTERP: u32 = 3;
+const DT_NULL: i64 = 0;
+const DT_NEEDED: i64 = 1;
+const DT_STRTAB: i64 = 5;
+const DT_RUNPATH: i64 = 29;
+const DT_RPATH: i64 = 15;
+const SHT_STRTAB: u32 = 3;
+
+/// Standard search paths the dynamic linker would check.
+const LIB_SEARCH_PATHS: &[&str] = &[
+    "/disk/lib/x86_64-linux-gnu",
+    "/disk/lib64",
+    "/disk/lib",
+    "/disk/usr/lib/x86_64-linux-gnu",
+    "/disk/usr/lib64",
+    "/disk/usr/lib",
+    // Symlinked versions (will test symlink resolution)
+    "/lib/x86_64-linux-gnu",
+    "/lib64",
+    "/lib",
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib64",
+    "/usr/lib",
+];
+
+fn cmd_ldd(state: &ShellState, parts: &[&str]) {
+    if parts.len() < 2 {
+        orbit_println!("Usage: ldd <elf-binary>");
+        return;
+    }
+    let path = resolve_path(&state.cwd, parts[1]);
+
+    // Read the ELF file.
+    let data = match crate::vfs::read_file(&path) {
+        Ok(d) => d,
+        Err(e) => {
+            orbit_println!("ldd: cannot read '{}': {:?}", parts[1], e);
+            return;
+        }
+    };
+
+    // Basic ELF validation.
+    if data.len() < 64 || data[0..4] != [0x7f, b'E', b'L', b'F'] {
+        orbit_println!("ldd: '{}' is not an ELF binary", parts[1]);
+        return;
+    }
+
+    let header = unsafe { &*(data.as_ptr() as *const crate::proc::elf::Elf64Header) };
+
+    // ── PT_INTERP (dynamic linker) ──
+    let mut interp: Option<&str> = None;
+    let mut dyn_phdr: Option<&crate::proc::elf::Elf64Phdr> = None;
+
+    let ph_off = header.e_phoff as usize;
+    let ph_ent = header.e_phentsize as usize;
+    let ph_num = header.e_phnum as usize;
+
+    for i in 0..ph_num {
+        let off = ph_off + i * ph_ent;
+        if off + ph_ent > data.len() { break; }
+        let phdr = unsafe { &*(data.as_ptr().add(off) as *const crate::proc::elf::Elf64Phdr) };
+        if phdr.p_type == PT_INTERP {
+            let start = phdr.p_offset as usize;
+            let end = start + phdr.p_filesz as usize;
+            if end <= data.len() {
+                let bytes = &data[start..end];
+                let s = core::str::from_utf8(bytes).unwrap_or("(invalid)");
+                interp = Some(s.trim_end_matches('\0'));
+            }
+        }
+        if phdr.p_type == PT_DYNAMIC {
+            dyn_phdr = Some(phdr);
+        }
+    }
+
+    if interp.is_none() && dyn_phdr.is_none() {
+        orbit_println!("\tstatically linked");
+        return;
+    }
+
+    // Show interpreter.
+    if let Some(interp_path) = interp {
+        let found = try_resolve_lib(interp_path);
+        if found {
+            orbit_println!("\t{} => {}found{}", interp_path, color::GREEN, color::RESET);
+        } else {
+            orbit_println!("\t{} => {}not found{}", interp_path, color::RED, color::RESET);
+        }
+    }
+
+    // ── Parse DT_NEEDED from PT_DYNAMIC ──
+    let dyn_phdr = match dyn_phdr {
+        Some(p) => p,
+        None => return,
+    };
+
+    // We need the .dynstr section.  Approach: walk DT entries to find DT_STRTAB
+    // (a virtual address), then locate the corresponding file offset by finding
+    // the section header or matching against LOAD segments.
+    let dyn_off = dyn_phdr.p_offset as usize;
+    let dyn_size = dyn_phdr.p_filesz as usize;
+    let dyn_end = dyn_off + dyn_size;
+    if dyn_end > data.len() {
+        orbit_println!("ldd: PT_DYNAMIC extends beyond file");
+        return;
+    }
+
+    // Collect DT_NEEDED string offsets and DT_STRTAB vaddr.
+    let mut needed_offsets: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    let mut strtab_vaddr: u64 = 0;
+    let mut rpath_offset: Option<u64> = None;
+
+    let entry_size = core::mem::size_of::<Elf64Dyn>();
+    let mut pos = dyn_off;
+    while pos + entry_size <= dyn_end {
+        let dyn_entry = unsafe { &*(data.as_ptr().add(pos) as *const Elf64Dyn) };
+        if dyn_entry.d_tag == DT_NULL { break; }
+        match dyn_entry.d_tag {
+            DT_NEEDED => { needed_offsets.push(dyn_entry.d_val); }
+            DT_STRTAB => { strtab_vaddr = dyn_entry.d_val; }
+            DT_RPATH | DT_RUNPATH => { rpath_offset = Some(dyn_entry.d_val); }
+            _ => {}
+        }
+        pos += entry_size;
+    }
+
+    if needed_offsets.is_empty() {
+        orbit_println!("\tno shared libraries (DT_NEEDED empty)");
+        return;
+    }
+
+    // Convert DT_STRTAB vaddr to file offset by checking LOAD segments.
+    let strtab_file_off = vaddr_to_offset(header, &data, strtab_vaddr);
+    if strtab_file_off.is_none() {
+        orbit_println!("ldd: could not locate .dynstr in file");
+        return;
+    }
+    let strtab_off = strtab_file_off.unwrap();
+
+    // Show RPATH/RUNPATH if present.
+    if let Some(rp_off) = rpath_offset {
+        let rpath = read_strtab(&data, strtab_off, rp_off as usize);
+        orbit_println!("\tRPATH/RUNPATH: {}", rpath);
+    }
+
+    // ── Resolve each DT_NEEDED ──
+    let mut all_found = true;
+    for str_off in &needed_offsets {
+        let lib_name = read_strtab(&data, strtab_off, *str_off as usize);
+        let (found, found_path) = find_library(lib_name);
+        if found {
+            orbit_println!("\t{} => {}{}{}", lib_name, color::GREEN, found_path, color::RESET);
+        } else {
+            orbit_println!("\t{} => {}not found{}", lib_name, color::RED, color::RESET);
+            all_found = false;
+        }
+    }
+
+    if all_found {
+        orbit_println!("{}All {} libraries resolved.{}", color::GREEN, needed_offsets.len(), color::RESET);
+    } else {
+        orbit_println!("{}Some libraries are missing!{}", color::RED, color::RESET);
+    }
+}
+
+/// Convert a virtual address to a file offset using PT_LOAD segments.
+fn vaddr_to_offset(header: &crate::proc::elf::Elf64Header, data: &[u8], vaddr: u64) -> Option<usize> {
+    let ph_off = header.e_phoff as usize;
+    let ph_ent = header.e_phentsize as usize;
+    let ph_num = header.e_phnum as usize;
+    for i in 0..ph_num {
+        let off = ph_off + i * ph_ent;
+        if off + ph_ent > data.len() { break; }
+        let phdr = unsafe { &*(data.as_ptr().add(off) as *const crate::proc::elf::Elf64Phdr) };
+        if phdr.p_type == 1 /* PT_LOAD */ {
+            if vaddr >= phdr.p_vaddr && vaddr < phdr.p_vaddr + phdr.p_filesz {
+                let delta = vaddr - phdr.p_vaddr;
+                return Some((phdr.p_offset + delta) as usize);
+            }
+        }
+    }
+    None
+}
+
+/// Read a NUL-terminated string from the string table.
+fn read_strtab(data: &[u8], strtab_off: usize, str_off: usize) -> &str {
+    let start = strtab_off + str_off;
+    if start >= data.len() { return "(out of range)"; }
+    let remaining = &data[start..];
+    let end = remaining.iter().position(|&b| b == 0).unwrap_or(remaining.len());
+    core::str::from_utf8(&remaining[..end]).unwrap_or("(invalid UTF-8)")
+}
+
+/// Try to resolve a library name by searching the standard paths.
+/// Returns (found, full_path_string).
+fn find_library(name: &str) -> (bool, alloc::string::String) {
+    // If it's an absolute path, try it directly.
+    if name.starts_with('/') {
+        let found = try_resolve_lib(name);
+        return (found, alloc::string::String::from(name));
+    }
+
+    for search_dir in LIB_SEARCH_PATHS {
+        let full = alloc::format!("{}/{}", search_dir, name);
+        if try_resolve_lib(&full) {
+            return (true, full);
+        }
+    }
+    (false, alloc::string::String::from("not found"))
+}
+
+/// Check if a path resolves to a readable file in the VFS.
+fn try_resolve_lib(path: &str) -> bool {
+    crate::vfs::stat(path).is_ok()
 }
 
 // ==================== Orbit Print Macros ====================

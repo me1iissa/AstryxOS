@@ -16,7 +16,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="${ROOT_DIR}/build"
 DATA_IMG="${BUILD_DIR}/data.img"
-SIZE_MB=64
+SIZE_MB=512
 FORCE=false
 
 for arg in "$@"; do
@@ -114,6 +114,22 @@ EOF
         echo "[DATA-DISK] Copied dynamic_hello_pie (ET_DYN PIE) to /bin/dynamic_hello_pie"
     fi
 
+    # ── Dynamic linker + glibc (needed by Firefox and other glibc binaries) ──
+    if [ -d "${BUILD_DIR}/disk/lib64" ]; then
+        mmd -i "${DATA_IMG}" "::lib64" 2>/dev/null || true
+        for f in "${BUILD_DIR}/disk/lib64/"*; do
+            [ -f "${f}" ] && mcopy -i "${DATA_IMG}" "${f}" "::lib64/$(basename "${f}")"
+        done
+        echo "[DATA-DISK] Copied lib64/ (dynamic linker)"
+    fi
+    if [ -d "${BUILD_DIR}/disk/lib/x86_64-linux-gnu" ]; then
+        mmd -i "${DATA_IMG}" "::lib/x86_64-linux-gnu" 2>/dev/null || true
+        for f in "${BUILD_DIR}/disk/lib/x86_64-linux-gnu/"*; do
+            [ -f "${f}" ] && mcopy -i "${DATA_IMG}" "${f}" "::lib/x86_64-linux-gnu/$(basename "${f}")"
+        done
+        echo "[DATA-DISK] Copied lib/x86_64-linux-gnu/ (glibc)"
+    fi
+
     # Firefox binary and resources (built by scripts/build-firefox.sh)
     FIREFOX_BIN="${BUILD_DIR}/disk/bin/firefox"
     FIREFOX_LIB="${BUILD_DIR}/disk/lib/firefox"
@@ -123,6 +139,8 @@ EOF
     fi
     if [ -d "${FIREFOX_LIB}" ]; then
         mmd -i "${DATA_IMG}" "::lib/firefox" 2>/dev/null || true
+        # Copy all files recursively (mtools mcopy -s for subdirs)
+        mcopy -s -i "${DATA_IMG}" "${FIREFOX_LIB}/"* "::lib/firefox/" 2>/dev/null || \
         for f in "${FIREFOX_LIB}/"*; do
             [ -f "${f}" ] && mcopy -i "${DATA_IMG}" "${f}" "::lib/firefox/$(basename "${f}")"
         done

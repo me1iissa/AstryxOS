@@ -367,35 +367,14 @@ fn wparam_to_hittest(wp: u64) -> crate::wm::hittest::HitTestResult {
 pub fn run_desktop_loop() -> ! {
     crate::hal::enable_interrupts();
 
-    // ── SLIRP warmup ──
-    // QEMU's SLIRP user-mode network backend may need a few seconds after
-    // boot before it starts responding to ARP.  Now that interrupts are on
-    // and we are late in the boot sequence, actively pre-resolve the
-    // gateway so the first user command works immediately.
-    {
-        let gateway = crate::net::gateway_ip();
-        crate::net::arp::send_request(gateway);
-        let start = crate::arch::x86_64::irq::get_ticks();
-        let max_wait = start + 300; // up to 3 seconds
-        let mut last_probe = start;
-        loop {
-            crate::net::poll();
-            if crate::net::arp::lookup(gateway).is_some() {
-                crate::serial_println!("[NET] Gateway ARP resolved — network ready");
-                break;
-            }
-            let now = crate::arch::x86_64::irq::get_ticks();
-            if now >= max_wait {
-                crate::serial_println!("[NET] SLIRP warmup timed out — network may be unavailable");
-                break;
-            }
-            if now - last_probe >= 50 {
-                crate::net::arp::send_request(gateway);
-                last_probe = now;
-            }
-            for _ in 0..10_000 { unsafe { core::arch::asm!("pause"); } }
-        }
-    }
+    // ── SLIRP warmup (folded into main loop so the desktop renders first) ──
+    // We do one ARP probe here, then check once per tick inside the loop
+    // for up to 300 ticks (3 s) without blocking rendering.
+    let arp_gateway = crate::net::gateway_ip();
+    crate::net::arp::send_request(arp_gateway);
+    let arp_start = crate::arch::x86_64::irq::get_ticks();
+    let mut arp_resolved = crate::net::arp::lookup(arp_gateway).is_some();
+    let mut last_arp_probe = arp_start;
 
     let mut tick: u64 = 0;
 
@@ -409,6 +388,21 @@ pub fn run_desktop_loop() -> ! {
         // 3. Poll the network stack so incoming packets (ARP, DNS, ICMP,
         //    TCP, etc.) are processed promptly even while idle.
         crate::net::poll();
+
+        // 3b. Continue ARP warmup in background (doesn't block rendering).
+        if !arp_resolved {
+            let now = crate::arch::x86_64::irq::get_ticks();
+            if crate::net::arp::lookup(arp_gateway).is_some() {
+                crate::serial_println!("[NET] Gateway ARP resolved — network ready");
+                arp_resolved = true;
+            } else if now >= arp_start + 300 {
+                crate::serial_println!("[NET] SLIRP warmup timed out — network may be unavailable");
+                arp_resolved = true; // stop probing
+            } else if now.saturating_sub(last_arp_probe) >= 50 {
+                crate::net::arp::send_request(arp_gateway);
+                last_arp_probe = now;
+            }
+        }
 
         // 4. Re-render dynamic content periodically (taskbar every 30 ticks).
         if tick % 30 == 0 {

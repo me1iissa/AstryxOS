@@ -76,6 +76,12 @@ echo "[PREFLIGHT] Checking build prerequisites..."
 check_cmd clang-18        "sudo apt install clang"
 check_cmd clang++-18      "sudo apt install clang"
 check_cmd lld-18          "sudo apt install lld"
+
+# bindgen (used by gecko-profiler) needs libclang.so — provided by libclang-XX-dev
+if [ ! -f /usr/lib/llvm-18/lib/libclang.so ] && [ ! -f /usr/lib/x86_64-linux-gnu/libclang.so ]; then
+    echo "[MISSING    ] libclang.so — bindgen needs it: sudo apt install libclang-18-dev"
+    preflight_ok=false
+fi
 check_cmd nasm            "sudo apt install nasm"
 check_cmd rustc           "rustup install stable"
 check_cmd cargo           "rustup install stable"
@@ -113,7 +119,8 @@ if [ "${preflight_ok}" = false ]; then
     echo "[PREFLIGHT] Install missing items above, then re-run."
     echo "            Quick fix: sudo apt install clang lld nasm libgtk-3-dev libasound2-dev libpulse-dev \\"
     echo "              libx11-xcb-dev libxcb1-dev libxcb-shm0-dev libxi-dev libxcomposite-dev \\"
-    echo "              libxdamage-dev libxrandr-dev libxcursor-dev libxt-dev libdbus-1-dev libdbus-glib-1-dev"
+    echo "              libxdamage-dev libxrandr-dev libxcursor-dev libxt-dev libdbus-1-dev libdbus-glib-1-dev \\"
+    echo "              libclang-18-dev"
     exit 1
 fi
 
@@ -173,12 +180,19 @@ ac_add_options --disable-accessibility
 ac_add_options --disable-wasm-simd
 ac_add_options --without-wasm-sandboxed-libraries
 
+# ── Suppress clang-18 warnings-as-errors that break vendored code ──────────
+# -Wno-narrowing: clang-18 treats uint64_t→unsigned int narrowing as error
+CXXFLAGS="-Wno-narrowing -Wno-c++11-narrowing-const-reference"
+
 # ── Statically link C++ and GCC runtimes to reduce shared-lib deps ─────────
 LDFLAGS="-static-libstdc++ -static-libgcc"
 EOF
 
 echo "[CONFIG] mozconfig written to ${MOZCONFIG}"
 export MOZCONFIG
+
+# bindgen (gecko-profiler Rust crate) needs LIBCLANG_PATH to find libclang.so
+export LIBCLANG_PATH=/usr/lib/llvm-18/lib
 
 # ── Configure Firefox ────────────────────────────────────────────────────────
 
@@ -206,7 +220,7 @@ cd "${FF_DIR}"
 # ── Install into build/firefox-install/ ──────────────────────────────────────
 
 mkdir -p "${FF_INSTALL}"
-./mach install DESTDIR="${FF_INSTALL}" 2>&1 | tee "${LOG_DIR}/firefox-install.log"
+DESTDIR="${FF_INSTALL}" ./mach install 2>&1 | tee "${LOG_DIR}/firefox-install.log"
 
 # ── Package for AstryxOS data disk ──────────────────────────────────────────
 

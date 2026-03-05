@@ -80,31 +80,72 @@ unsafe fn user_read_u64(addr: u64) -> Option<u64> {
 /// Futex wait queue: maps (pid, uaddr) -> list of waiting TIDs.
 static FUTEX_WAITERS: Mutex<BTreeMap<(u64, u64), Vec<u64>>> = Mutex::new(BTreeMap::new());
 
-/// Kernel stack pointer for the current thread. Set by the scheduler on
-/// every context switch to a user-mode thread. SYSCALL entry loads RSP from
-/// this before doing any stack operations.
-///
-/// On a single-CPU system this is safe: only one thread can execute SYSCALL
-/// at a time, and it is set before the thread runs.
-#[no_mangle]
-pub static mut SYSCALL_KERNEL_RSP: u64 = 0;
+// ═══════════════════════════════════════════════════════════════════════════════
+// Per-CPU SYSCALL data — replaces the old global statics for SMP safety.
+//
+// Each CPU has its own `PerCpuSyscallData` slot so that concurrent SYSCALL
+// instructions on different cores do not clobber each other's saved RSP/RIP.
+//
+// The `syscall_entry` naked-asm stub uses SWAPGS to load GS with a pointer
+// to the active CPU's slot, then uses GS-relative addressing (offsets 0, 8,
+// 16) to swap stacks and save the return RIP.
+//
+// `set_kernel_rsp()` and `get_user_rip()` index the array by LAPIC-ID-based
+// cpu_index(), safe because each CPU only accesses its own slot.
+//
+// NOTE: if user-space ever uses ARCH_SET_GS / ARCH_GET_GS, the scheduler
+// must also save/restore IA32_KERNEL_GS_BASE on context switch to keep per-
+// thread GS state correct.  Currently no user code sets GS.
+// ═══════════════════════════════════════════════════════════════════════════════
 
-/// Scratch space for saving the user RSP during syscall handling.
-#[no_mangle]
-pub static mut SYSCALL_USER_RSP: u64 = 0;
+use crate::arch::x86_64::apic::MAX_CPUS;
 
-/// Saved user RIP (return address from SYSCALL instruction).
-/// Set by syscall_entry before dispatch. Used by clone() to know where the
-/// child thread should resume execution (the instruction after the syscall).
-#[no_mangle]
-pub static mut SYSCALL_USER_RIP: u64 = 0;
+/// Per-CPU scratch data for the SYSCALL entry stub.
+/// Must be `#[repr(C)]` so the assembly can rely on fixed offsets.
+#[repr(C, align(64))] // cache-line aligned to avoid false sharing
+pub struct PerCpuSyscallData {
+    /// Kernel stack top for this CPU's current user thread (offset 0).
+    pub kernel_rsp: u64,
+    /// Saved user RSP on SYSCALL entry (offset 8).
+    pub user_rsp: u64,
+    /// Saved user RIP (RCX) on SYSCALL entry (offset 16).
+    pub user_rip: u64,
+}
 
-/// Set the kernel RSP for syscall handling (called on context switches).
+/// Per-CPU array.  Indexed by `cpu_index()` (LAPIC ID >> 24, capped at MAX_CPUS).
+#[no_mangle]
+pub static mut PER_CPU_SYSCALL: [PerCpuSyscallData; MAX_CPUS] = {
+    const INIT: PerCpuSyscallData = PerCpuSyscallData {
+        kernel_rsp: 0,
+        user_rsp: 0,
+        user_rip: 0,
+    };
+    [INIT; MAX_CPUS]
+};
+
+/// Get the current CPU index (capped at MAX_CPUS-1).
+#[inline]
+fn cpu_index() -> usize {
+    let id = crate::arch::x86_64::apic::current_apic_id() as usize;
+    if id >= MAX_CPUS { 0 } else { id }
+}
+
+/// Set the kernel RSP for syscall handling on the **current** CPU.
+/// Called by the scheduler on every context switch to a user-mode thread.
 ///
 /// # Safety
 /// Must only be called with a valid kernel stack top address.
 pub unsafe fn set_kernel_rsp(rsp: u64) {
-    SYSCALL_KERNEL_RSP = rsp;
+    let cpu = cpu_index();
+    PER_CPU_SYSCALL[cpu].kernel_rsp = rsp;
+}
+
+/// Read the saved user RIP for the **current** CPU.
+/// Used by clone() to know where the child should resume.
+#[inline]
+pub unsafe fn get_user_rip() -> u64 {
+    let cpu = cpu_index();
+    PER_CPU_SYSCALL[cpu].user_rip
 }
 
 /// Initialize the syscall interface.
@@ -120,9 +161,12 @@ pub fn init() {
 /// calls this for each AP.
 pub fn init_ap() {
     unsafe {
-        // Enable SCE (System Call Extensions) in IA32_EFER
+        // Enable SCE (System Call Extensions) and NXE (No-Execute Enable) in IA32_EFER.
+        // SCE = bit 0: required for syscall/sysret.
+        // NXE = bit 11: required so the NX (bit 63) page-table flag is honoured
+        //       instead of triggering a reserved-bit page fault.
         let efer = crate::hal::rdmsr(0xC000_0080);
-        crate::hal::wrmsr(0xC000_0080, efer | 1);
+        crate::hal::wrmsr(0xC000_0080, efer | (1 << 0) | (1 << 11));
 
         // IA32_STAR — Segment selectors for syscall/sysret
         // SYSCALL: CS = STAR[47:32], SS = STAR[47:32]+8
@@ -137,6 +181,14 @@ pub fn init_ap() {
 
         // IA32_FMASK — RFLAGS mask on syscall (clear IF, TF, DF)
         crate::hal::wrmsr(0xC000_0084, 0x700);
+
+        // ── Per-CPU data for SWAPGS ─────────────────────────────────
+        // Set IA32_KERNEL_GS_BASE (0xC000_0102) to this CPU's slot in
+        // PER_CPU_SYSCALL.  On SYSCALL entry, `swapgs` will load GS
+        // from this MSR so the stub can use GS-relative addressing.
+        let cpu = cpu_index();
+        let base = &PER_CPU_SYSCALL[cpu] as *const PerCpuSyscallData as u64;
+        crate::hal::wrmsr(0xC000_0102, base);
     }
 }
 
@@ -171,20 +223,22 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
                 None => return -14, // EFAULT
             };
 
-            if fd == 1 || fd == 2 {
-                crate::drivers::tty::TTY0.lock().write(slice);
-                count as i64
-            } else if is_pipe_fd(crate::proc::current_pid(), fd as usize) {
-                let pipe_id = get_pipe_id(crate::proc::current_pid(), fd as usize);
+            // Special fd types take priority over fd-number shortcuts
+            let pid = crate::proc::current_pid();
+            if is_pipe_fd(pid, fd as usize) {
+                let pipe_id = get_pipe_id(pid, fd as usize);
                 match crate::ipc::pipe::pipe_write(pipe_id, slice) {
                     Some(n) => n as i64,
                     None => -9, // EBADF
                 }
             } else {
-                // Try VFS
-                let pid = crate::proc::current_pid();
+                // Try VFS first; fall back to TTY for fd 1/2 if no file open.
                 match crate::vfs::fd_write(pid, fd as usize, arg2 as *const u8, count) {
                     Ok(n) => n as i64,
+                    Err(_) if fd == 1 || fd == 2 => {
+                        crate::drivers::tty::TTY0.lock().write(slice);
+                        count as i64
+                    }
                     Err(_) => -9, // EBADF
                 }
             }
@@ -198,37 +252,37 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
                 None => return -14, // EFAULT
             };
 
-            if fd == 0 {
-                // stdin — read through TTY line discipline
-                let mut attempts = 0u32;
-                loop {
-                    {
-                        let mut tty = crate::drivers::tty::TTY0.lock();
-                        // Pump pending scancodes into the TTY
-                        crate::drivers::tty::pump_keyboard(&mut tty);
-                        let n = tty.read(buf, count);
-                        if n > 0 {
-                            return n as i64;
-                        }
-                    }
-                    // No data yet — yield and retry
-                    attempts += 1;
-                    if attempts > 100_000 {
-                        // Avoid infinite busy-loop in test mode
-                        return 0;
-                    }
-                    crate::hal::halt();
-                }
-            } else if is_pipe_fd(crate::proc::current_pid(), fd as usize) {
-                let pipe_id = get_pipe_id(crate::proc::current_pid(), fd as usize);
+            // Special fd types take priority over fd-number shortcuts
+            let pid = crate::proc::current_pid();
+            if is_pipe_fd(pid, fd as usize) {
+                let pipe_id = get_pipe_id(pid, fd as usize);
                 match crate::ipc::pipe::pipe_read(pipe_id, buf) {
                     Some(n) => n as i64,
                     None => -9, // EBADF
                 }
             } else {
-                let pid = crate::proc::current_pid();
+                // Try VFS first; fall back to TTY stdin for fd 0 if no file open.
                 match crate::vfs::fd_read(pid, fd as usize, arg2 as *mut u8, count) {
                     Ok(n) => n as i64,
+                    Err(_) if fd == 0 => {
+                        // stdin — read through TTY line discipline
+                        let mut attempts = 0u32;
+                        loop {
+                            {
+                                let mut tty = crate::drivers::tty::TTY0.lock();
+                                crate::drivers::tty::pump_keyboard(&mut tty);
+                                let n = tty.read(buf, count);
+                                if n > 0 {
+                                    return n as i64;
+                                }
+                            }
+                            attempts += 1;
+                            if attempts > 100_000 {
+                                return 0;
+                            }
+                            crate::hal::halt();
+                        }
+                    }
                     Err(_) => -9,
                 }
             }
@@ -530,19 +584,25 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
 #[unsafe(naked)]
 extern "C" fn syscall_entry() {
     core::arch::naked_asm!(
-        // ── Step 1: Switch to kernel stack ──────────────────────────
-        // Save user RSP into the scratch global, load kernel RSP.
-        "mov [{user_rsp}], rsp",
-        "mov rsp, [{kernel_rsp}]",
-
-        // Save user RIP (RCX on syscall entry) before we clobber it.
-        "mov [{user_rip}], rcx",
+        // ── Step 1: Switch to kernel stack (per-CPU via SWAPGS) ─────
+        // SWAPGS loads GS with KERNEL_GS_BASE → points at this CPU's
+        // PerCpuSyscallData.  Save user RSP at offset 8, load kernel
+        // RSP from offset 0, save user RIP (RCX) at offset 16.
+        "swapgs",
+        "mov gs:[8], rsp",               // per_cpu.user_rsp = user RSP
+        "mov rsp, gs:[0]",               // RSP = per_cpu.kernel_rsp
+        "mov gs:[16], rcx",              // per_cpu.user_rip = user RIP
 
         // ── Step 2: Save user context on kernel stack ───────────────
         // These are restored on SYSRETQ.
-        "push qword ptr [{user_rsp}]",  // saved user RSP
+        "push qword ptr gs:[8]",         // saved user RSP
         "push rcx",                      // return RIP
         "push r11",                      // return RFLAGS
+        // Done with GS-relative accesses; swap back so kernel code
+        // runs with the user's GS (harmless — kernel never uses GS).
+        // This also ensures KERNEL_GS_BASE is back to the per-CPU
+        // pointer for the next SWAPGS at entry.
+        "swapgs",
         // Callee-saved registers (user expects these preserved):
         "push rbp",
         "push rbx",
@@ -632,9 +692,6 @@ extern "C" fn syscall_entry() {
         // ── Step 8: Return to Ring 3 ────────────────────────────────
         "sysretq",
 
-        kernel_rsp = sym SYSCALL_KERNEL_RSP,
-        user_rsp = sym SYSCALL_USER_RSP,
-        user_rip = sym SYSCALL_USER_RIP,
         dispatch = sym dispatch,
         signal_check = sym crate::signal::signal_check_on_syscall_return,
     );
@@ -1984,11 +2041,11 @@ fn sys_sigprocmask(how: u32, new_mask: u64) -> i64 {
 ///
 /// Returns the original `saved_rax` value which dispatch() puts into RAX.
 fn sys_sigreturn() -> i64 {
-    // The user RSP at syscall entry (saved by the CPU before we switched
-    // stacks) is in SYSCALL_USER_RSP.  After the handler's `ret` popped
-    // the restorer and the trampoline issued `syscall`, RSP points at the
-    // SignalFrame.sig_num field (restorer was consumed by ret).
-    let user_rsp = unsafe { SYSCALL_USER_RSP };
+    // The user RSP at syscall entry (saved per-CPU before we switched
+    // stacks) is in PER_CPU_SYSCALL[cpu].user_rsp.  After the handler's
+    // `ret` popped the restorer and the trampoline issued `syscall`, RSP
+    // points at the SignalFrame.sig_num field (restorer was consumed by ret).
+    let user_rsp = unsafe { PER_CPU_SYSCALL[cpu_index()].user_rsp };
 
     // Read the signal frame from user memory.
     // user_rsp points to sig_num (offset 8 in SignalFrame).
@@ -2033,7 +2090,7 @@ fn sys_sigreturn() -> i64 {
 
     // Write the original registers back onto the kernel stack frame.
     // The kernel stack frame layout (from syscall_entry) relative to
-    // SYSCALL_KERNEL_RSP:
+    // the per-CPU kernel_rsp:
     //   ksp - 8  = user RSP
     //   ksp - 16 = RCX (user RIP)
     //   ksp - 24 = R11 (user RFLAGS)
@@ -2043,7 +2100,7 @@ fn sys_sigreturn() -> i64 {
     //   ksp - 56 = R13
     //   ksp - 64 = R14
     //   ksp - 72 = R15
-    let ksp = unsafe { SYSCALL_KERNEL_RSP };
+    let ksp = unsafe { PER_CPU_SYSCALL[cpu_index()].kernel_rsp };
     unsafe {
         *((ksp -  8) as *mut u64) = saved_rsp;
         *((ksp - 16) as *mut u64) = saved_rcx;  // user RIP
@@ -2200,6 +2257,8 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
         4 => sys_stat_linux(arg1, arg2),
         // 5: fstat(fd, statbuf)
         5 => sys_fstat_linux(arg1 as usize, arg2 as *mut u8),
+        // 6: lstat(pathname, statbuf) — same as stat for us (no symlink follow)
+        6 => sys_stat_linux(arg1, arg2),
         // 8: lseek(fd, offset, whence)
         8 => sys_lseek(arg1 as usize, arg2 as i64, arg3 as u32),
         // 9: mmap(addr, len, prot, flags, fd, offset)
@@ -2358,6 +2417,15 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
                 Ok(n) => n as i64,
                 Err(e) => -(e as i64),
             }
+        }
+        // 32: dup(oldfd) — duplicate fd to lowest available slot
+        32 => sys_dup(arg1 as usize),
+        // 33: dup2(oldfd, newfd) — duplicate fd to specific slot
+        33 => sys_dup2(arg1 as usize, arg2 as usize),
+        // 34: pause() — sleep until signal (stub: yield)
+        34 => {
+            crate::sched::yield_cpu();
+            -4 // EINTR
         }
         // 35: nanosleep(req, rem) — yield once and return 0
         35 => {
@@ -2684,17 +2752,19 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
             }
             0
         }
-        // 56: clone(flags, stack, parent_tid, tls, child_tid)
+        // 56: clone(flags, stack, parent_tid, child_tid, tls)
+        // Linux x86-64 clone ABI: rdi=flags, rsi=stack, rdx=ptid, r10=ctid, r8=tls
+        // In our dispatch: arg1=rdi, arg2=rsi, arg3=rdx, arg4=r10, arg5=r8
         56 => {
             let flags = arg1;
             let new_stack = arg2;
-            let tls = arg4;
+            let tls = arg5;   // r8 → arg5 (NOT arg4 which is ctid/r10)
             const CLONE_THREAD: u64 = 0x00010000;
             const CLONE_VM:     u64 = 0x00000100;
             const CLONE_SETTLS: u64 = 0x00080000;
             if flags & CLONE_THREAD != 0 && flags & CLONE_VM != 0 {
                 // pthread_create-style clone: new thread in same address space.
-                let user_rip = unsafe { SYSCALL_USER_RIP };
+                let user_rip = unsafe { get_user_rip() };
                 let tls_val = if flags & CLONE_SETTLS != 0 { tls } else { 0 };
                 let pid = crate::proc::current_pid();
                 match crate::proc::usermode::create_user_thread(pid, user_rip, new_stack, tls_val) {
@@ -2880,10 +2950,10 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
         218 => sys_set_tid_address(arg1),
         // 228: clock_gettime(clockid, tp)
         228 => sys_clock_gettime(arg1, arg2),
-        // 231: exit_group(status)
+        // 231: exit_group(status) — terminate all threads in the process
         231 => {
             crate::serial_println!("[SYSCALL/Linux] exit_group({})", arg1 as i32);
-            crate::proc::exit_thread(arg1 as i64);
+            crate::proc::exit_group(arg1 as i64);
             0
         }
         // 234: tgkill(tgid, tid, sig)
@@ -3085,66 +3155,75 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
 fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
     let buf_ptr = buf as *mut u8;
     let count = count as usize;
+    let pid = crate::proc::current_pid();
 
-    if fd == 0 {
-        // stdin
+    // ── Special fd types take priority over the fd-number shortcuts ─────────
+    // Must check these BEFORE the `fd == 0` stdin branch because kernel tests
+    // and user processes may allocate eventfd/pipe/socket at fd 0.
+    if is_pipe_fd(pid, fd as usize) {
+        let pipe_id = get_pipe_id(pid, fd as usize);
         let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, count) };
-        let mut attempts = 0u32;
-        loop {
-            {
-                let mut tty = crate::drivers::tty::TTY0.lock();
-                crate::drivers::tty::pump_keyboard(&mut tty);
-                let n = tty.read(buf, count);
-                if n > 0 {
-                    return n as i64;
-                }
-            }
-            attempts += 1;
-            if attempts > 100_000 {
-                return 0;
-            }
-            crate::hal::halt();
-        }
-    } else if is_pipe_fd(crate::proc::current_pid(), fd as usize) {
-        let pipe_id = get_pipe_id(crate::proc::current_pid(), fd as usize);
-        let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, count) };
-        match crate::ipc::pipe::pipe_read(pipe_id, buf) {
+        return match crate::ipc::pipe::pipe_read(pipe_id, buf) {
             Some(n) => n as i64,
             None => -9,
-        }
-    } else if is_unix_socket_fd(crate::proc::current_pid(), fd as usize) {
-        // AF_UNIX socket read
-        let unix_id = get_unix_socket_id(crate::proc::current_pid(), fd as usize);
+        };
+    } else if is_unix_socket_fd(pid, fd as usize) {
+        let unix_id = get_unix_socket_id(pid, fd as usize);
         let buf_sl = unsafe { core::slice::from_raw_parts_mut(buf_ptr, count) };
-        crate::net::unix::read(unix_id, buf_sl)
-    } else if is_socket_fd(crate::proc::current_pid(), fd as usize) {
-        let socket_id = get_socket_id(crate::proc::current_pid(), fd as usize);
-        match crate::net::socket::socket_recv(socket_id) {
+        return crate::net::unix::read(unix_id, buf_sl);
+    } else if is_socket_fd(pid, fd as usize) {
+        let socket_id = get_socket_id(pid, fd as usize);
+        return match crate::net::socket::socket_recv(socket_id) {
             Ok(data) => {
                 let n = data.len().min(count);
                 unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, n); }
                 n as i64
             }
-            Err(_) => -11, // EAGAIN — no data (non-blocking)
-        }
-    } else if is_eventfd_fd(crate::proc::current_pid(), fd as usize) {
-        // eventfd read: returns current counter as u64 LE (8 bytes)
-        if count < 8 { return -22; } // EINVAL — must read exactly 8 bytes
-        let efd_id = get_eventfd_id(crate::proc::current_pid(), fd as usize);
-        match crate::ipc::eventfd::read(efd_id) {
+            Err(_) => -11, // EAGAIN
+        };
+    } else if is_eventfd_fd(pid, fd as usize) {
+        if count < 8 { return -22; } // EINVAL
+        let efd_id = get_eventfd_id(pid, fd as usize);
+        return match crate::ipc::eventfd::read(efd_id) {
             Ok(val) => {
                 let bytes = val.to_le_bytes();
                 unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr, 8); }
                 8
             }
-            Err(e) => e, // EAGAIN or EBADF
+            Err(e) => e,
+        };
+    }
+
+    // ── VFS file descriptors (covers ALL fds including 0/1/2) ──────────────
+    // Try VFS first; if fd 0 has no VFS file open (BadFd), fall through to TTY.
+    match crate::vfs::fd_read(pid, fd as usize, buf_ptr, count) {
+        Ok(n) => return n as i64,
+        Err(crate::vfs::VfsError::BadFd) if fd == 0 => { /* fall through to TTY stdin */ }
+        Err(_) if fd == 0 => { /* fall through to TTY stdin */ }
+        Err(_) => return -9, // EBADF for non-stdin fds
+    }
+
+    // fd 0 with no VFS file → stdin via TTY line discipline.
+    // Limit spin-wait to 500 iterations (~5ms at 100Hz timer) so that a
+    // user process calling read(0, …) in a loop does not stall the entire
+    // system for seconds waiting for keyboard input that will never arrive
+    // (especially in headless test mode).
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, count) };
+    let mut attempts = 0u32;
+    loop {
+        {
+            let mut tty = crate::drivers::tty::TTY0.lock();
+            crate::drivers::tty::pump_keyboard(&mut tty);
+            let n = tty.read(buf, count);
+            if n > 0 {
+                return n as i64;
+            }
         }
-    } else {
-        let pid = crate::proc::current_pid();
-        match crate::vfs::fd_read(pid, fd as usize, buf_ptr, count) {
-            Ok(n) => n as i64,
-            Err(_) => -9,
+        attempts += 1;
+        if attempts > 500 {
+            return 0;
         }
+        core::hint::spin_loop();
     }
 }
 
@@ -3155,45 +3234,50 @@ fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
 
     if count == 0 { return 0; }
 
-    if fd == 1 || fd == 2 {
+    // ── Special fd types take priority over the fd-number shortcuts ─────────
+    // Must check these BEFORE the `fd == 1/2` stdout/stderr branch because
+    // kernel tests and user processes may allocate pipe/socket/eventfd at fd 1.
+    let pid = crate::proc::current_pid();
+    if is_pipe_fd(pid, fd as usize) {
+        let pipe_id = get_pipe_id(pid, fd as usize);
         let slice = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
-        crate::drivers::tty::TTY0.lock().write(slice);
-        count as i64
-    } else if is_pipe_fd(crate::proc::current_pid(), fd as usize) {
-        let pipe_id = get_pipe_id(crate::proc::current_pid(), fd as usize);
-        let slice = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
-        match crate::ipc::pipe::pipe_write(pipe_id, slice) {
+        return match crate::ipc::pipe::pipe_write(pipe_id, slice) {
             Some(n) => n as i64,
             None => -9,
-        }
-    } else if is_unix_socket_fd(crate::proc::current_pid(), fd as usize) {
-        // AF_UNIX socket write
-        let unix_id = get_unix_socket_id(crate::proc::current_pid(), fd as usize);
+        };
+    } else if is_unix_socket_fd(pid, fd as usize) {
         let data = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
-        crate::net::unix::write(unix_id, data)
-    } else if is_socket_fd(crate::proc::current_pid(), fd as usize) {
-        let socket_id = get_socket_id(crate::proc::current_pid(), fd as usize);
+        let unix_id = get_unix_socket_id(pid, fd as usize);
+        return crate::net::unix::write(unix_id, data);
+    } else if is_socket_fd(pid, fd as usize) {
+        let socket_id = get_socket_id(pid, fd as usize);
         let data = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
-        match crate::net::socket::socket_send(socket_id, data) {
+        return match crate::net::socket::socket_send(socket_id, data) {
             Ok(n) => n as i64,
             Err(_) => -104, // ECONNRESET
-        }
-    } else if is_eventfd_fd(crate::proc::current_pid(), fd as usize) {
-        // eventfd write: add u64 LE value to counter
+        };
+    } else if is_eventfd_fd(pid, fd as usize) {
         if count < 8 { return -22; } // EINVAL
-        let efd_id = get_eventfd_id(crate::proc::current_pid(), fd as usize);
+        let efd_id = get_eventfd_id(pid, fd as usize);
         let val = unsafe { core::ptr::read_unaligned(buf_ptr as *const u64) };
-        match crate::ipc::eventfd::write(efd_id, u64::from_le(val)) {
+        return match crate::ipc::eventfd::write(efd_id, u64::from_le(val)) {
             Ok(()) => 8,
             Err(e) => e,
-        }
-    } else {
-        let pid = crate::proc::current_pid();
-        match crate::vfs::fd_write(pid, fd as usize, buf_ptr, count) {
-            Ok(n) => n as i64,
-            Err(_) => -9,
-        }
+        };
     }
+
+    // ── VFS file descriptors (covers ALL fds including 0/1/2) ──────────────
+    // Try VFS first; if fd 1/2 has no VFS file open (BadFd), fall through to TTY.
+    match crate::vfs::fd_write(pid, fd as usize, buf_ptr, count) {
+        Ok(n) => return n as i64,
+        Err(_) if fd == 1 || fd == 2 => { /* fall through to TTY stdout/stderr */ }
+        Err(_) => return -9, // EBADF for other fds
+    }
+
+    // fd 1/2 with no VFS file → TTY stdout/stderr.
+    let slice = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
+    crate::drivers::tty::TTY0.lock().write(slice);
+    count as i64
 }
 
 /// Linux open(pathname, flags, mode) — pathname is a C string.
@@ -3731,20 +3815,112 @@ fn sys_openat(dirfd: u64, pathname: u64, flags: u64, mode: u64) -> i64 {
     if dirfd as i64 == AT_FDCWD {
         return sys_open_linux(pathname, flags, mode);
     }
-    -22 // EINVAL
+
+    // Real directory fd — resolve pathname relative to it.
+    let path_bytes = read_cstring_from_user(pathname);
+    let rel_path = match core::str::from_utf8(path_bytes) {
+        Ok(s) => s,
+        Err(_) => return -22, // EINVAL
+    };
+
+    // If pathname is absolute, ignore dirfd.
+    if rel_path.starts_with('/') {
+        return sys_open_linux(pathname, flags, mode);
+    }
+
+    // Empty path with AT_EMPTY_PATH — not supported yet.
+    if rel_path.is_empty() {
+        return -22; // EINVAL
+    }
+
+    // Get the directory path from the dirfd.
+    let pid = crate::proc::current_pid();
+    let dir_path = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        let proc_entry = match procs.iter().find(|p| p.pid == pid) {
+            Some(p) => p,
+            None => return -3, // ESRCH
+        };
+        let fd_idx = dirfd as usize;
+        match proc_entry.file_descriptors.get(fd_idx).and_then(|f| f.as_ref()) {
+            Some(fd) => fd.open_path.clone(),
+            None => return -9, // EBADF
+        }
+    };
+
+    // Build full path: dir_path + "/" + rel_path
+    let full_path = if dir_path.ends_with('/') {
+        alloc::format!("{}{}", dir_path, rel_path)
+    } else {
+        alloc::format!("{}/{}", dir_path, rel_path)
+    };
+
+    // Open via the normal VFS path.
+    match crate::vfs::open(pid, &full_path, flags as u32) {
+        Ok(fd_num) => fd_num as i64,
+        Err(e) => -(e as i64),
+    }
 }
 
 /// newfstatat(dirfd, pathname, statbuf, flags) — stat relative to directory fd.
-fn sys_newfstatat(dirfd: u64, pathname: u64, statbuf: u64, _flags: u64) -> i64 {
+fn sys_newfstatat(dirfd: u64, pathname: u64, statbuf: u64, flags: u64) -> i64 {
     const AT_FDCWD: i64 = -100;
-    if dirfd as i64 == AT_FDCWD || pathname != 0 {
+    const AT_EMPTY_PATH: u64 = 0x1000;
+
+    // AT_EMPTY_PATH with empty pathname → fstat the dirfd itself.
+    if flags & AT_EMPTY_PATH != 0 {
         let path_bytes = read_cstring_from_user(pathname);
         if path_bytes.is_empty() {
             return sys_fstat_linux(dirfd as usize, statbuf as *mut u8);
         }
+    }
+
+    if pathname == 0 {
+        return sys_fstat_linux(dirfd as usize, statbuf as *mut u8);
+    }
+
+    let path_bytes = read_cstring_from_user(pathname);
+    if path_bytes.is_empty() {
+        return sys_fstat_linux(dirfd as usize, statbuf as *mut u8);
+    }
+    let path_str = match core::str::from_utf8(path_bytes) {
+        Ok(s) => s,
+        Err(_) => return -22,
+    };
+
+    // Absolute path or AT_FDCWD — resolve directly.
+    if dirfd as i64 == AT_FDCWD || path_str.starts_with('/') {
         return sys_stat_linux(pathname, statbuf);
     }
-    sys_fstat_linux(dirfd as usize, statbuf as *mut u8)
+
+    // Relative path with real dirfd — resolve relative to dirfd's path.
+    let pid = crate::proc::current_pid();
+    let dir_path = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        let proc_entry = match procs.iter().find(|p| p.pid == pid) {
+            Some(p) => p,
+            None => return -3,
+        };
+        let fd_idx = dirfd as usize;
+        match proc_entry.file_descriptors.get(fd_idx).and_then(|f| f.as_ref()) {
+            Some(fd) => fd.open_path.clone(),
+            None => return -9, // EBADF
+        }
+    };
+
+    let full_path = if dir_path.ends_with('/') {
+        alloc::format!("{}{}", dir_path, path_str)
+    } else {
+        alloc::format!("{}/{}", dir_path, path_str)
+    };
+
+    match crate::vfs::stat(&full_path) {
+        Ok(st) => {
+            fill_linux_stat(statbuf as *mut u8, &st);
+            0
+        }
+        Err(e) => -(e as i64),
+    }
 }
 
 /// rt_sigaction for Linux ABI.
