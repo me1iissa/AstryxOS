@@ -10,6 +10,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 use crate::wm::decorator;
@@ -354,6 +355,78 @@ static CURSOR_BITMAP: [[u8; 12]; 12] = [
 ];
 
 // ---------------------------------------------------------------------------
+// Hardware cursor support
+// ---------------------------------------------------------------------------
+
+/// Set to `true` once the VMware SVGA hardware cursor shape has been uploaded.
+/// When `true`, `compose()` uses [`vmware_svga::move_cursor`] to position the
+/// hardware-composited cursor overlay instead of drawing pixels into the
+/// backbuffer (which would require a full 8 MB MMIO blit to take effect).
+static HARDWARE_CURSOR_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Upload the 12×12 arrow cursor shape to the VMware SVGA hardware.
+///
+/// Converts `CURSOR_BITMAP` into:
+/// - a 1-bpp AND mask  (1 = transparent/pass-through,  0 = use XOR colour)
+/// - a 32-bpp XOR mask (the actual ARGB pixels for opaque pixels)
+///
+/// Sets `HARDWARE_CURSOR_ACTIVE` to `true` on success so that `compose()`
+/// switches to the hardware cursor path.
+fn define_hardware_cursor() {
+    if !crate::drivers::vmware_svga::has_cursor_support() {
+        crate::serial_println!("[GUI] VMware SVGA cursor capability absent — using software cursor");
+        return;
+    }
+
+    const CW: usize = 12;
+    const CH: usize = 12;
+
+    // AND mask — 1 bpp, one u32 per row, MSB = leftmost pixel.
+    //   AND bit = 0: pixel is opaque (use XOR colour)
+    //   AND bit = 1: pixel is transparent (show framebuffer behind)
+    let mut and_mask = [0u32; CH];
+    for (row_idx, row) in CURSOR_BITMAP.iter().enumerate() {
+        let mut word: u32 = 0;
+        for col in 0..CW {
+            if row[col] == 0 {
+                // transparent pixel → AND bit = 1
+                word |= 1u32 << (31 - col);
+            }
+            // opaque pixel (1 or 2) → AND bit stays 0
+        }
+        and_mask[row_idx] = word;
+    }
+
+    // XOR mask — 32 bpp, one u32 per pixel (row-major).
+    //   CURSOR_BITMAP 1 → black border (0x00000000)
+    //   CURSOR_BITMAP 2 → white fill   (0x00FFFFFF)
+    //   CURSOR_BITMAP 0 → irrelevant   (AND=1 makes it transparent)
+    let mut xor_mask = [0u32; CW * CH];
+    for row in 0..CH {
+        for col in 0..CW {
+            xor_mask[row * CW + col] = match CURSOR_BITMAP[row][col] {
+                1 => 0x00000000, // black border
+                2 => 0x00FFFFFF, // white fill
+                _ => 0x00000000, // transparent (irrelevant)
+            };
+        }
+    }
+
+    crate::drivers::vmware_svga::define_cursor(
+        0, 0,             // hotspot at the tip of the arrow
+        CW as u16, CH as u16,
+        &and_mask,
+        &xor_mask,
+    );
+
+    // Hardware cursor intentionally disabled — QEMU VMware SVGA emulation does
+    // not render the cursor overlay visibly. Use software cursor (draw_cursor)
+    // in compose() instead, which blits the arrow directly into the backbuffer.
+    // HARDWARE_CURSOR_ACTIVE remains false.
+    crate::serial_println!("[GUI] VMware SVGA hardware cursor disabled — using software cursor");
+}
+
+// ---------------------------------------------------------------------------
 // Window snapshot — captures all data we need without holding the WM lock
 // ---------------------------------------------------------------------------
 
@@ -388,6 +461,9 @@ pub struct CompositorState {
     pub fb_stride: u32,
     pub backbuffer: Vec<u32>,
     pub frame_count: u64,
+    /// Bounding box of dirty region this frame: (x, y, w, h).
+    /// `None` means nothing dirty yet; `Some((0,0,sw,sh))` = full screen.
+    pub dirty_rect: Option<(u32, u32, u32, u32)>,
 }
 
 static COMPOSITOR: Mutex<Option<CompositorState>> = Mutex::new(None);
@@ -738,6 +814,7 @@ pub fn init(fb_base: u64, width: u32, height: u32, stride: u32) {
         fb_stride: stride,
         backbuffer: vec![0u32; buf_size],
         frame_count: 0,
+        dirty_rect: Some((0, 0, width, height)), // initial frame: full dirty
     };
     *COMPOSITOR.lock() = Some(state);
     crate::serial_println!(
@@ -747,6 +824,10 @@ pub fn init(fb_base: u64, width: u32, height: u32, stride: u32) {
         stride,
         fb_base,
     );
+
+    // Upload the hardware cursor shape to the SVGA device so the cursor can
+    // be moved via FIFO bypass registers instead of re-blitting the whole screen.
+    define_hardware_cursor();
 }
 
 /// Main compositing entry point — call once per frame.
@@ -782,6 +863,8 @@ pub fn compose() {
             comp.backbuffer[row_start..row_end].fill(color);
         }
     }
+    // Full screen is dirty (background covers entire frame).
+    expand_dirty(comp, 0, 0, sw, sh);
 
     // --- 2. Windows (back-to-front) ---
     let z_order: Vec<WindowHandle> = crate::wm::zorder::get_z_order();
@@ -825,6 +908,14 @@ pub fn compose() {
         }
 
         draw_window(&mut comp.backbuffer, stride, &snap);
+        // Mark the window's bounding box dirty.
+        let wx = snap.x.max(0) as u32;
+        let wy = snap.y.max(0) as u32;
+        let wx2 = ((snap.x + snap.width as i32).max(0) as u32).min(sw);
+        let wy2 = ((snap.y + snap.height as i32).max(0) as u32).min(sh);
+        if wx2 > wx && wy2 > wy {
+            expand_dirty(comp, wx, wy, wx2 - wx, wy2 - wy);
+        }
     }
 
     // --- 3. Start menu overlay (on top of all windows) ---
@@ -838,7 +929,16 @@ pub fn compose() {
 
     // --- 4. Mouse cursor ---
     let (mx, my) = crate::drivers::mouse::position();
-    draw_cursor(&mut comp.backbuffer, stride, sw, sh, mx, my);
+    if HARDWARE_CURSOR_ACTIVE.load(Ordering::Relaxed) {
+        // Hardware cursor: tell the SVGA device where to composite the cursor
+        // overlay.  This writes 3 u32s directly into FIFO bypass registers —
+        // no backbuffer modification, no MMIO blit required.
+        crate::drivers::vmware_svga::move_cursor(mx as u32, my as u32);
+    } else {
+        // Software fallback: paint the cursor into the backbuffer.  The
+        // upcoming blit will copy it to VRAM along with everything else.
+        draw_cursor(&mut comp.backbuffer, stride, sw, sh, mx, my);
+    }
 
     // --- 5. Blit to screen ---
     blit_to_screen(comp);
@@ -847,29 +947,148 @@ pub fn compose() {
     comp.frame_count += 1;
 }
 
-/// Copy the backbuffer to the hardware framebuffer, row by row, then notify
-/// the SVGA device.
-fn blit_to_screen(comp: &CompositorState) {
+/// Expand the dirty bounding box to include the given rectangle.
+#[inline]
+fn expand_dirty(comp: &mut CompositorState, x: u32, y: u32, w: u32, h: u32) {
+    let x2 = (x + w).min(comp.screen_width);
+    let y2 = (y + h).min(comp.screen_height);
+    let x = x.min(comp.screen_width);
+    let y = y.min(comp.screen_height);
+    if x2 <= x || y2 <= y { return; }
+    comp.dirty_rect = Some(match comp.dirty_rect {
+        None => (x, y, x2 - x, y2 - y),
+        Some((dx, dy, dw, dh)) => {
+            let nx = x.min(dx);
+            let ny = y.min(dy);
+            let nx2 = x2.max(dx + dw);
+            let ny2 = y2.max(dy + dh);
+            (nx, ny, nx2 - nx, ny2 - ny)
+        }
+    });
+}
+
+/// Copy the backbuffer to the hardware framebuffer.
+/// Only blits the dirty region (or the full screen if dirty_rect covers it),
+/// then issues a targeted SVGA_CMD_UPDATE for that rectangle.
+fn blit_to_screen(comp: &mut CompositorState) {
+    let (dx, dy, dw, dh) = match comp.dirty_rect.take() {
+        Some(r) => r,
+        None => return, // nothing changed
+    };
+
     let fb = comp.fb_base as *mut u32;
     let hw_stride = comp.fb_stride;
     let w = comp.screen_width;
-    let h = comp.screen_height;
 
-    for y in 0..h {
-        let src_offset = (y * w) as usize;
-        let dst_offset = (y * hw_stride) as usize;
-        let row = &comp.backbuffer[src_offset..src_offset + w as usize];
+    // Blit only the dirty rows.
+    for row_idx in dy..(dy + dh) {
+        let src_row_start = (row_idx * w + dx) as usize;
+        let dst_row_start = (row_idx * hw_stride + dx) as usize;
+        let pixels = dw as usize;
+        let src = &comp.backbuffer[src_row_start..src_row_start + pixels];
         unsafe {
-            core::ptr::copy_nonoverlapping(row.as_ptr(), fb.add(dst_offset), w as usize);
+            core::ptr::copy_nonoverlapping(src.as_ptr(), fb.add(dst_row_start), pixels);
         }
     }
 
-    crate::drivers::vmware_svga::display_notify();
+    crate::drivers::vmware_svga::update_rect(dx, dy, dw, dh);
 }
 
 // ---------------------------------------------------------------------------
 // Accessors
 // ---------------------------------------------------------------------------
+
+/// Mark a screen rectangle as dirty so it will be re-blitted this frame.
+///
+/// Called by external code (e.g. the X11 server) when window pixel data
+/// has changed and the hardware framebuffer needs to be refreshed.
+pub fn mark_dirty(x: u32, y: u32, w: u32, h: u32) {
+    let mut guard = COMPOSITOR.lock();
+    if let Some(comp) = guard.as_mut() {
+        expand_dirty(comp, x, y, w, h);
+    }
+}
+
+/// Fill a solid rectangle in the backbuffer. `color` is 0x00RRGGBB.
+/// Clipped to the screen bounds. Marks the region dirty.
+/// Called from gdi::fill_rect_screen (X11 PolyFillRectangle path).
+pub fn screen_fill_rect(x: i32, y: i32, w: i32, h: i32, color: u32) {
+    let mut guard = COMPOSITOR.lock();
+    let comp = match guard.as_mut() { Some(c) => c, None => return };
+    let sw = comp.screen_width as i32;
+    let sh = comp.screen_height as i32;
+    let x0 = x.max(0); let y0 = y.max(0);
+    let x1 = (x + w).min(sw); let y1 = (y + h).min(sh);
+    if x0 >= x1 || y0 >= y1 { return; }
+    let stride = comp.screen_width as usize;
+    for ry in y0..y1 {
+        for rx in x0..x1 {
+            comp.backbuffer[ry as usize * stride + rx as usize] = color;
+        }
+    }
+    expand_dirty(comp, x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32);
+}
+
+/// Blit a 32-bpp BGRA/XRGB pixel buffer into the backbuffer.
+/// `pixels` layout: B G R X (4 bytes per pixel, left-to-right, top-to-bottom).
+/// Clipped to screen bounds. Marks the region dirty.
+/// Called from gdi::blit_pixels_screen (X11 PutImage path).
+pub fn screen_blit_pixels(x: i32, y: i32, w: u32, h: u32, pixels: &[u8]) {
+    let mut guard = COMPOSITOR.lock();
+    let comp = match guard.as_mut() { Some(c) => c, None => return };
+    let sw = comp.screen_width as i32;
+    let sh = comp.screen_height as i32;
+    let stride = comp.screen_width as usize;
+    for row in 0..h {
+        let dy = y + row as i32;
+        if dy < 0 || dy >= sh { continue; }
+        for col in 0..w {
+            let dx = x + col as i32;
+            if dx < 0 || dx >= sw { continue; }
+            let src = ((row * w + col) * 4) as usize;
+            if src + 3 >= pixels.len() { break; }
+            let b = pixels[src] as u32;
+            let g = pixels[src + 1] as u32;
+            let r = pixels[src + 2] as u32;
+            comp.backbuffer[dy as usize * stride + dx as usize] =
+                (r << 16) | (g << 8) | b;
+        }
+    }
+    let x0 = x.max(0) as u32;
+    let y0 = y.max(0) as u32;
+    expand_dirty(comp, x0, y0, w, h);
+}
+
+/// Draw ASCII text using the embedded 8×16 VGA bitmap font.
+/// `fg`/`bg` are 0x00RRGGBB. Clipped to screen bounds. Marks region dirty.
+/// Called from gdi::draw_text_screen (X11 ImageText8 path).
+pub fn screen_draw_text(x: i32, y: i32, text: &str, fg: u32, bg: u32) {
+    let mut guard = COMPOSITOR.lock();
+    let comp = match guard.as_mut() { Some(c) => c, None => return };
+    if text.is_empty() { return; }
+    let sw = comp.screen_width as i32;
+    let sh = comp.screen_height as i32;
+    let stride = comp.screen_width as usize;
+    let mut cx = x;
+    for ch in text.chars() {
+        let idx = (ch as usize).saturating_sub(0x20);
+        let glyph_idx = if idx < 95 { idx } else { cx += 8; continue };
+        for row in 0..16i32 {
+            let py = y + row;
+            if py < 0 || py >= sh { continue; }
+            let bits = VGA_FONT_8X16[glyph_idx * 16 + row as usize];
+            for col in 0..8i32 {
+                let px = cx + col;
+                if px < 0 || px >= sw { continue; }
+                let color = if bits & (0x80 >> col as u8) != 0 { fg } else { bg };
+                comp.backbuffer[py as usize * stride + px as usize] = color;
+            }
+        }
+        cx += 8;
+    }
+    let tw = (text.len() as i32 * 8).max(0) as u32;
+    expand_dirty(comp, x.max(0) as u32, y.max(0) as u32, tw, 16);
+}
 
 /// Returns `true` if the compositor has been initialised.
 pub fn is_initialized() -> bool {

@@ -132,8 +132,11 @@ pub fn handle_irq() {
         if buf[0] & 0x10 != 0 { dx -= 256; }
         if buf[0] & 0x20 != 0 { dy -= 256; }
 
-        // PS/2 Y is inverted (positive = up)
-        dy = -dy;
+        // WSL2 XWayland delivers relative mouse deltas with both axes already
+        // inverted before QEMU sees them.  QEMU's PS/2 layer then negates Y
+        // again (standard PS/2 spec), but not X.  Net result: X needs one
+        // explicit negation here; Y comes out correct without any negation.
+        dx = -dx;
 
         // Update position
         let max_x = SCREEN_WIDTH.load(Ordering::Relaxed) - 1;
@@ -166,6 +169,14 @@ pub fn set_bounds(width: u32, height: u32) {
 /// Get mouse buttons state (bit 0=left, bit 1=right, bit 2=middle).
 pub fn buttons() -> u8 {
     MOUSE_BUTTONS.load(Ordering::Relaxed)
+}
+
+/// Warp the cursor to an absolute position (clamped to screen bounds).
+pub fn warp(x: i32, y: i32) {
+    let max_x = SCREEN_WIDTH.load(Ordering::Relaxed) - 1;
+    let max_y = SCREEN_HEIGHT.load(Ordering::Relaxed) - 1;
+    MOUSE_X.store(x.clamp(0, max_x), Ordering::Relaxed);
+    MOUSE_Y.store(y.clamp(0, max_y), Ordering::Relaxed);
 }
 
 /// Check if mouse is initialized.

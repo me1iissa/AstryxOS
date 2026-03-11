@@ -4,8 +4,9 @@
 
 pub mod pipe;
 pub mod eventfd;
+pub mod epoll;
 
 /// Initialize the IPC subsystem.
 pub fn init() {
-    crate::serial_println!("[IPC] IPC subsystem initialized (pipes + eventfd)");
+    crate::serial_println!("[IPC] IPC subsystem initialized (pipes + eventfd + epoll)");
 }

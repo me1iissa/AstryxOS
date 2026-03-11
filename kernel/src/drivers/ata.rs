@@ -257,10 +257,15 @@ impl AtaPioDevice {
             let offset = (i as usize) * SECTOR_SIZE;
             let sector_data = &data[offset..offset + SECTOR_SIZE];
 
-            // Write 256 words (512 bytes).
-            for j in (0..SECTOR_SIZE).step_by(2) {
-                let word = (sector_data[j + 1] as u16) << 8 | (sector_data[j] as u16);
-                unsafe { hal::outw(self.base + ATA_REG_DATA, word); }
+            // Write 256 words (512 bytes) using rep outsw — single VM exit in KVM.
+            unsafe {
+                core::arch::asm!(
+                    "rep outsw",
+                    in("dx") self.base + ATA_REG_DATA,
+                    inout("ecx") 256u32 => _,
+                    in("rsi") sector_data.as_ptr(),
+                    options(nostack, preserves_flags)
+                );
             }
 
             // Flush — read status to ensure write is committed.
@@ -293,11 +298,16 @@ impl BlockDevice for AtaPioDevice {
 
             let offset = (i as usize) * SECTOR_SIZE;
 
-            // Read 256 words (512 bytes).
-            for j in (0..SECTOR_SIZE).step_by(2) {
-                let word = unsafe { hal::inw(self.base + ATA_REG_DATA) };
-                buf[offset + j] = (word & 0xFF) as u8;
-                buf[offset + j + 1] = (word >> 8) as u8;
+            // Read 256 words (512 bytes) using rep insw — single VM exit in KVM,
+            // avoiding 256 separate port-read VM exits in QEMU/nested environments.
+            unsafe {
+                core::arch::asm!(
+                    "rep insw",
+                    in("dx") self.base + ATA_REG_DATA,
+                    inout("ecx") 256u32 => _,
+                    in("rdi") buf.as_mut_ptr().add(offset),
+                    options(nostack, preserves_flags)
+                );
             }
         }
 

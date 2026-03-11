@@ -67,9 +67,11 @@ const SVGA_FIFO_MIN: usize = 0;
 const SVGA_FIFO_MAX: usize = 1;
 const SVGA_FIFO_NEXT_CMD: usize = 2;
 const SVGA_FIFO_STOP: usize = 3;
-const SVGA_FIFO_CURSOR_ON: usize = 4;
-const SVGA_FIFO_CURSOR_X: usize = 5;
-const SVGA_FIFO_CURSOR_Y: usize = 6;
+// Indices 4–8: CAPABILITIES, FLAGS, FENCE, 3D_HWVERSION, PITCHLOCK
+// Cursor bypass-2 registers (SVGA2 spec §3.10, VMware SVGA Developer Kit):
+const SVGA_FIFO_CURSOR_ON: usize = 9;   // 1 = cursor visible
+const SVGA_FIFO_CURSOR_X: usize = 10;
+const SVGA_FIFO_CURSOR_Y: usize = 11;
 
 // ── SVGA Device State ───────────────────────────────────────────────────────
 
@@ -365,6 +367,17 @@ pub fn is_available() -> bool {
 /// Return the device capability bits.
 pub fn get_capabilities() -> u32 {
     SVGA.lock().as_ref().map_or(0, |s| s.capabilities)
+}
+
+/// Returns `true` when the hardware cursor (SVGA_CAP_CURSOR) is supported.
+///
+/// When true the compositor can call [`define_cursor`] once at init and
+/// [`move_cursor`] every frame instead of drawing a software cursor into the
+/// backbuffer and re-blitting the entire screen.
+pub fn has_cursor_support() -> bool {
+    SVGA.lock()
+        .as_ref()
+        .map_or(false, |s| s.capabilities & SVGA_CAP_CURSOR != 0)
 }
 
 // ── 2-D Acceleration: FIFO Commands ────────────────────────────────────────

@@ -105,6 +105,14 @@ pub fn pipe_write(pipe_id: u64, data: &[u8]) -> Option<usize> {
     Some(pipe.write(data))
 }
 
+/// Increment the writer count (e.g. when a second fd aliases the write-end).
+pub fn pipe_add_writer(pipe_id: u64) {
+    let mut pipes = PIPE_TABLE.lock();
+    if let Some(pipe) = pipes.iter_mut().find(|p| p.id == pipe_id) {
+        pipe.writers = pipe.writers.saturating_add(1);
+    }
+}
+
 /// Close the write end of a pipe.
 pub fn pipe_close_writer(pipe_id: u64) {
     let mut pipes = PIPE_TABLE.lock();

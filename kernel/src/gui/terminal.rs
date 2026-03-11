@@ -11,7 +11,12 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
+
+/// Set when a child exec is running so `poll_output()` skips the TERMINAL
+/// mutex acquisition in the common idle case.
+static EXEC_RUNNING: AtomicBool = AtomicBool::new(false);
 
 use crate::wm::window::{self, WindowHandle};
 
@@ -100,6 +105,9 @@ struct TerminalState {
     esc_state: EscState,
     esc_buf: [u8; 32],
     esc_len: usize,
+    /// Running async child process (pid, pipe read-end id).
+    /// Set when `exec` is dispatched asynchronously; cleared on child exit.
+    running_exec: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -145,6 +153,7 @@ pub fn init(handle: WindowHandle) {
         esc_state: EscState::Normal,
         esc_buf: [0u8; 32],
         esc_len: 0,
+        running_exec: None,
     };
 
     // Write welcome banner
@@ -262,17 +271,35 @@ pub fn handle_key(msg: u32, wparam: u64, _lparam: u64) {
             state.input_cursor = 0;
 
             if !cmd.trim().is_empty() {
-                // Handle "clear" / "cls" specially — just clear the grid
                 let trimmed = cmd.trim();
                 if trimmed == "clear" || trimmed == "cls" {
                     state.lines.clear();
                     state.lines.push(vec![Cell::blank(); state.cols]);
                     state.cursor_row = 0;
                     state.cursor_col = 0;
+                } else if state.running_exec.is_some() {
+                    // Ignore input while a child is running.
+                    state.write_str_colored("[busy — process running]\n", ANSI_COLORS[3]);
+                } else if is_exec_command(trimmed) {
+                    // Async path: spawn child with stdout → pipe.
+                    match spawn_async(trimmed) {
+                        Ok((pid, pipe_id)) => {
+                            state.running_exec = Some((pid, pipe_id));
+                            EXEC_RUNNING.store(true, Ordering::Release);
+                            // Don't draw prompt yet — poll_output() will do it on exit.
+                        }
+                        Err(msg) => {
+                            state.write_str_colored(&msg, ANSI_COLORS[9]);
+                            state.write_str_colored("\n", DEFAULT_FG);
+                        }
+                    }
+                    // Skip draw_prompt below.
+                    state.scroll_offset = 0;
+                    state.render_to_surface();
+                    return;
                 } else {
-                    // Execute through the real orbit shell, capturing output
+                    // Synchronous shell commands (built-ins, ls, cat, etc.)
                     let output = state.shell.execute_capture(&cmd);
-                    // Parse output (may contain ANSI escapes) and write to grid
                     state.write_ansi_str(&output);
                 }
             }
@@ -745,4 +772,158 @@ fn brighten(color: u32) -> u32 {
     let g = ((color >> 8) & 0xFF).min(200) + 55;
     let b = (color & 0xFF).min(200) + 55;
     a | (r << 16) | (g << 8) | b
+}
+
+// ---------------------------------------------------------------------------
+// Async exec helpers
+// ---------------------------------------------------------------------------
+
+/// Returns true if the command should be run as an async child process
+/// (i.e. it's `exec <path>` or a bare absolute/relative path).
+fn is_exec_command(cmd: &str) -> bool {
+    let first = cmd.split_whitespace().next().unwrap_or("");
+    first == "exec" || first.starts_with('/') || first.starts_with("./")
+}
+
+/// Spawn a child process asynchronously, wiring its stdout/stderr to a new
+/// pipe.  Returns `(child_pid, pipe_read_id)` on success.
+fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
+    let parts: Vec<&str> = cmd.trim().split_whitespace().collect();
+    if parts.is_empty() {
+        return Err(alloc::string::String::from("empty command"));
+    }
+
+    // Strip leading "exec" keyword if present.
+    let args = if parts[0] == "exec" { &parts[1..] } else { &parts[..] };
+    if args.is_empty() {
+        return Err(alloc::string::String::from("exec: missing path"));
+    }
+
+    let raw_path = args[0];
+    let name_buf;
+    let name: &str = if raw_path.starts_with('/') {
+        raw_path
+    } else {
+        name_buf = alloc::format!("/{}", raw_path);
+        &name_buf
+    };
+
+    // Load ELF bytes; capture any orbit_println! output during this phase.
+    crate::drivers::console::begin_capture();
+    let data = match crate::vfs::read_file(name) {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = crate::drivers::console::end_capture();
+            return Err(alloc::format!("exec: {}: {:?}", name, e));
+        }
+    };
+    let _setup_log = crate::drivers::console::end_capture();
+
+    if !crate::proc::elf::is_elf(&data) {
+        return Err(alloc::format!("exec: '{}' is not an ELF binary", name));
+    }
+
+    // Enable scheduler so the child can run.
+    if !crate::sched::is_active() {
+        crate::sched::enable();
+    }
+
+    let envp: &[&str] = &[
+        "HOME=/",
+        "PATH=/bin:/disk/bin",
+        "TCCDIR=/disk/lib/tcc",
+        "TMPDIR=/tmp",
+        "DISPLAY=:0",
+    ];
+
+    // Spawn blocked so we can attach the pipe before the child can run.
+    // linux_abi / subsystem are set inside create_user_process_with_args_blocked.
+    let pid = crate::proc::usermode::create_user_process_with_args_blocked(name, &data, args, envp)
+        .map_err(|e| alloc::format!("exec: ELF load failed: {:?}", e))?;
+
+    // Attach pipe to stdout/stderr while the child is still blocked.
+    let pipe_id = crate::ipc::pipe::create_pipe();
+    crate::proc::attach_stdout_pipe(pid, pipe_id);
+
+    // Now allow the scheduler to run the child.
+    crate::proc::unblock_process(pid);
+
+    Ok((pid, pipe_id))
+}
+
+// ---------------------------------------------------------------------------
+// Public per-tick poll — called from the desktop loop
+// ---------------------------------------------------------------------------
+
+/// Drain any pending stdout bytes from a running child process into the
+/// terminal display, and reap the child if it has exited.
+///
+/// Called every desktop tick so the GUI stays responsive while TCC (or any
+/// other child) is running.  Must NOT hold the TERMINAL lock while calling
+/// into the process or pipe tables (ABBA deadlock risk).
+pub fn poll_output() {
+    // Fast path: no exec is running — skip acquiring the TERMINAL mutex.
+    if !EXEC_RUNNING.load(Ordering::Acquire) { return; }
+
+    // Snapshot the running-exec handle without holding TERMINAL across
+    // the waitpid / pipe_read calls below.
+    let running = {
+        let guard = TERMINAL.lock();
+        guard.as_ref().and_then(|s| s.running_exec)
+    };
+
+    let (pid, pipe_id) = match running {
+        Some(r) => r,
+        None => return,
+    };
+
+    // Drain available pipe bytes (non-blocking).
+    let mut raw = [0u8; 512];
+    let n = crate::ipc::pipe::pipe_read(pipe_id, &mut raw).unwrap_or(0);
+
+    // Non-blocking waitpid: did the child become a zombie?
+    let exit_status = crate::proc::waitpid(0, pid as i64);
+
+    // Now re-lock TERMINAL to push output + update state.
+    let mut guard = TERMINAL.lock();
+    let state = match guard.as_mut() {
+        Some(s) => s,
+        None => return,
+    };
+
+    // Append stdout bytes to the terminal grid.
+    if n > 0 {
+        let text = core::str::from_utf8(&raw[..n]).unwrap_or("\u{FFFD}");
+        state.write_ansi_str(text);
+        state.render_to_surface();
+    }
+
+    if let Some((_reaped, code)) = exit_status {
+        // Drain any final bytes the child wrote before exiting.
+        drop(guard); // release TERMINAL before pipe_read
+        let mut tail = [0u8; 512];
+        let tn = crate::ipc::pipe::pipe_read(pipe_id, &mut tail).unwrap_or(0);
+        crate::ipc::pipe::pipe_close_reader(pipe_id);
+
+        let mut guard2 = TERMINAL.lock();
+        let state2 = match guard2.as_mut() { Some(s) => s, None => return };
+
+        if tn > 0 {
+            let text = core::str::from_utf8(&tail[..tn]).unwrap_or("\u{FFFD}");
+            state2.write_ansi_str(text);
+        }
+        if code != 0 {
+            state2.write_str_colored(
+                &alloc::format!("\r\n[exited: code {}]\r\n", code),
+                ANSI_COLORS[9],
+            );
+        } else {
+            state2.write_str_colored("\r\n", DEFAULT_FG);
+        }
+        state2.running_exec = None;
+        EXEC_RUNNING.store(false, Ordering::Release);
+        state2.draw_prompt();
+        state2.scroll_offset = 0;
+        state2.render_to_surface();
+    }
 }

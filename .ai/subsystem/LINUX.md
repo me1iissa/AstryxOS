@@ -1,0 +1,245 @@
+# Linux Subsystem — Design Document
+
+> Last updated: 2026-03-05
+
+## 1. Purpose
+
+The Linux subsystem provides **binary compatibility** with Linux x86_64 ELF executables.
+It translates Linux syscall numbers and conventions into Aether kernel primitives,
+enabling musl/glibc-linked binaries (bash, coreutils, GCC, etc.) to run unmodified.
+
+## 2. Architecture
+
+```
+  Linux ELF binary (musl-linked)
+         │
+         │  SYSCALL (RAX = Linux number)
+         ▼
+  ┌─────────────────┐
+  │  linux::dispatch │  ← translates Linux numbers → Aether calls
+  │  (subsys/linux/) │
+  └────────┬────────┘
+           │  calls into Aether kernel: VFS, MM, Proc, Net, IPC, Signal
+           ▼
+  ┌─────────────────┐
+  │  Aether Kernel   │
+  │  Primitives      │
+  └─────────────────┘
+```
+
+This is **not** a full Linux kernel re-implementation. It is a syscall-level translation
+layer, similar to:
+- WSL1 (Windows Subsystem for Linux, syscall translation)
+- FreeBSD's `linux_emu` (Linuxulator)
+
+## 3. Syscall ABI (Linux x86_64)
+
+| Register | Purpose |
+|----------|---------|
+| RAX | Linux syscall number (0–547, 385 defined) |
+| RDI | arg1 |
+| RSI | arg2 |
+| RDX | arg3 |
+| R10 | arg4 |
+| R8  | arg5 |
+| R9  | arg6 |
+| RAX (return) | Result (≥0 success, <0 negated errno) |
+
+Entry: `SYSCALL` instruction → `syscall_entry` → checks `SubsystemType::Linux` →
+routes to `linux::dispatch()`.
+
+## 4. Current Implementation Status
+
+### Phase 1 — musl hello world (DONE)
+~90 Linux syscall numbers mapped. Sufficient for:
+- Static musl-linked "hello world"
+- printf, malloc (via brk/mmap), basic file I/O
+- clone (threads), futex (mutexes)
+
+### Phase 2 — coreutils (IN PROGRESS)
+Additional syscalls needed:
+- `readlinkat`, `faccessat`, `utimensat`, `statx`
+- `epoll_create1`, `epoll_ctl`, `epoll_wait`
+- `pipe2`, `eventfd`, `socketpair`
+- `getdents64` (existing), `fchmod`, `fchown`
+
+### Phase 3 — GCC / Compiler toolchain (PLANNED)
+Additional syscalls needed:
+- `vfork`, `execveat`, `wait4` (robust)
+- `madvise`, `mremap`, `msync`
+- Full `fcntl` (F_DUPFD_CLOEXEC, F_SETFL, F_GETFL)
+- `prlimit64` (real, not stub)
+- `sched_getaffinity`, `sched_setaffinity`
+
+### Phase 4 — X11 / GUI apps (FUTURE)
+Additional syscalls needed:
+- Unix domain sockets (AF_UNIX) — `socket`, `connect`, `bind`, `listen`, `accept`
+- `poll` / `select` / `epoll` — full implementation
+- `shm_open` / `mmap` shared — for X11 shared memory pixmaps
+- `ioctl` — terminal and device ioctls
+
+## 5. Syscall Translation Table
+
+The translation maps Linux numbers to Aether kernel functions:
+
+```
+Linux #  Name              → Aether Handler           Status
+──────── ─────────────────── ─────────────────────── ──────
+0        read               sys_read_linux           ✅
+1        write              sys_write_linux          ✅
+2        open               sys_open_linux           ✅
+3        close              vfs::close               ✅
+4        stat               sys_stat_linux           ✅
+5        fstat              sys_fstat_linux          ✅
+6        lstat              sys_stat_linux           ✅
+7        poll               dispatch_linux (inline)  ✅
+8        lseek              sys_lseek                ✅
+9        mmap               sys_mmap                 ✅
+10       mprotect           sys_mprotect             ✅
+11       munmap             sys_munmap               ✅
+12       brk                sys_brk                  ✅
+13       rt_sigaction       sys_rt_sigaction_linux   ✅
+14       rt_sigprocmask     sys_rt_sigprocmask_linux ✅
+15       rt_sigreturn       sys_sigreturn            ✅
+16       ioctl              sys_ioctl                ✅
+17       pread64            inline                   ✅
+18       pwrite64           inline                   ✅
+20       writev             sys_writev               ✅
+21       access             sys_access               ✅
+24       sched_yield        sched::yield_cpu         ✅
+28       madvise            stub (success)           ✅
+32       dup                vfs::dup                 ✅
+33       dup2               vfs::dup2                ✅
+34       pause              stub (yield)             ⚠️
+35       nanosleep          stub (yield)             ⚠️
+39       getpid             proc::current_pid        ✅
+40       sendfile           stub                     ⚠️
+41       socket             net::socket              ✅
+42       connect            net::connect             ✅
+43       accept             net::accept              ✅
+44       sendto             net::sendto              ✅
+45       recvfrom           net::recvfrom            ✅
+46       sendmsg            inline                   ✅
+47       recvmsg            inline                   ✅
+48       shutdown           stub                     ⚠️
+49       bind               net::bind                ✅
+50       listen             net::listen              ✅
+51       getsockname        inline                   ✅
+52       getpeername        stub                     ⚠️
+53       socketpair         net::unix loopback       ✅
+54       setsockopt         stub                     ⚠️
+55       getsockopt         stub                     ⚠️
+56       clone              proc::clone              ✅
+57       fork               proc::fork               ✅
+59       execve             proc::exec               ✅
+60       exit               proc::exit_thread        ✅
+61       wait4              proc::waitpid            ✅
+62       kill               signal::kill             ✅
+72       fcntl              sys_fcntl                ✅
+73       flock              stub (success)           ⚠️
+77       ftruncate          stub                     ⚠️
+79       getcwd             sys_getcwd               ✅
+80       chdir              sys_chdir                ✅
+81       fchdir             inline                   ✅
+82       rename             inline                   ✅
+83       mkdir              sys_mkdir                ✅
+84       rmdir              sys_rmdir                ✅
+87       unlink             sys_unlink               ✅
+88       symlink            sys_symlink              ✅
+89       readlink           inline                   ✅
+96       gettimeofday       sys_gettimeofday         ✅
+98       getrusage          stub (zeroed)            ⚠️
+99       sysinfo            inline                   ✅
+102      getuid             stub (0)                 ✅
+104      getgid             stub (0)                 ✅
+107      geteuid            stub (0)                 ✅
+108      getegid            stub (0)                 ✅
+110      getppid            proc::parent_pid         ✅
+131      sigaltstack        stub                     ⚠️
+137      statfs             inline                   ✅
+138      fstatfs            inline                   ✅
+157      prctl              inline                   ✅
+158      arch_prctl         SET_FS via WRMSR         ✅
+160      setrlimit          stub                     ⚠️
+186      gettid             inline                   ✅
+202      futex              sys_futex                ✅
+203      sched_setaffinity  stub                     ⚠️
+204      sched_getaffinity  stub                     ⚠️
+209      io_setup           stub                     ⚠️
+217      getdents64         sys_getdents64           ✅
+218      set_tid_address    inline                   ✅
+228      clock_gettime      sys_clock_gettime        ✅
+229      clock_getres       inline                   ✅
+231      exit_group         proc::exit_thread        ✅
+234      tgkill             signal::kill             ✅
+257      openat             sys_openat               ✅
+262      newfstatat         sys_newfstatat           ✅
+266      symlinkat          inline                   ✅
+267      readlinkat         inline                   ✅
+269      faccessat          inline                   ✅
+271      ppoll              inline                   ✅
+273      set_robust_list    stub                     ⚠️
+274      get_robust_list    stub                     ⚠️
+280      utimensat          stub                     ⚠️
+284/290  eventfd/eventfd2   ipc::eventfd             ✅
+293      pipe2              ipc::pipe                ✅
+302      prlimit64          stub                     ⚠️
+309      getcpu             stub                     ⚠️
+318      getrandom          sys_getrandom            ✅
+319      memfd_create       inline                   ✅
+332      statx              inline                   ✅
+334      rseq               stub (-ENOSYS)           ⚠️
+435      clone3             inline                   ✅
+```
+
+**Legend**: ✅ = functional, ⚠️ = stub/partial
+
+## 6. Key Translation Concerns
+
+### String Convention
+Linux uses null-terminated C strings (`const char*`). The translation layer includes
+`read_cstring_from_user()` to convert to Rust `&[u8]` / `&str` before calling Aether VFS.
+
+### Struct Layouts
+Linux `struct stat`, `struct dirent`, `struct iovec`, `struct pollfd`, etc. have specific
+ABI layouts (defined by glibc/musl headers). The translation layer fills these
+byte-for-byte from Aether's internal representations.
+
+### Error Codes
+Linux returns `-errno` (1–4095). Aether uses NtStatus internally. The Linux dispatch
+layer converts errors: `NtStatus → errno`.
+
+### Signal Frame
+Linux signal delivery uses a specific trampoline layout: `rt_sigreturn` via `syscall`
+with RAX=15. The signal frame includes all GPRs, FPU state, and signal mask. Our
+implementation matches this at [kernel/src/signal.rs](kernel/src/signal.rs).
+
+## 7. Module Structure (Target)
+
+```
+kernel/src/subsys/linux/
+├── mod.rs          — dispatch_linux(), SubsystemType detection
+├── syscall.rs      — Linux syscall number → handler mapping
+├── translate.rs    — struct layout converters (stat, dirent, iovec)
+├── signal.rs       — Linux signal semantics (rt_sigaction, trampoline)
+├── elf.rs          — Linux ELF detection (PT_INTERP, GNU notes)
+└── errno.rs        — NtStatus ↔ errno mapping
+```
+
+## 8. Testing Strategy
+
+The headless test suite (`scripts/run-tests.sh`) includes:
+- **Test 17**: Linux syscall compatibility (40+ syscall smoke tests)
+- **Test 18**: Signal delivery trampoline (sigaction, sigreturn)
+
+Future tests:
+- Static musl `ls` / `cat` / `echo` execution
+- GCC cross-compiled hello world
+- Thread creation via `clone()` + `futex()` synchronization
+
+## 9. Reference Material
+
+- Linux syscall table: `SupportingResources/linux/arch/x86/entry/syscalls/syscall_64.tbl`
+- musl source: for understanding libc expectations at syscall boundary
+- FreeBSD Linuxulator: `SupportingResources/` (not present, but design reference)
+- WSL1 architecture: microsoft.com/en-us/research/publication/windows-subsystem-for-linux/

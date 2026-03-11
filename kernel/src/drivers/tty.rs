@@ -78,11 +78,17 @@ const LINE_BUF_MAX: usize = 4096;
 
 // ── ioctl request numbers ───────────────────────────────────────────────────
 
-pub const TCGETS: u64    = 0x5401;
-pub const TCSETS: u64    = 0x5402;
-pub const TCSETSW: u64   = 0x5403;
-pub const TCSETSF: u64   = 0x5404;
+pub const TCGETS: u64     = 0x5401;
+pub const TCSETS: u64     = 0x5402;
+pub const TCSETSW: u64    = 0x5403;
+pub const TCSETSF: u64    = 0x5404;
 pub const TIOCGWINSZ: u64 = 0x5413;
+pub const TIOCSWINSZ: u64 = 0x5414;
+pub const TIOCGPGRP: u64  = 0x540f;  // get foreground process group
+pub const TIOCSPGRP: u64  = 0x5410;  // set foreground process group
+pub const TIOCSCTTY: u64  = 0x540e;  // make controlling terminal
+pub const TIOCNOTTY: u64  = 0x5422; // release controlling terminal
+pub const TIOCGETSID: u64 = 0x5429; // get session id of tty
 
 // ── Structures ──────────────────────────────────────────────────────────────
 
@@ -647,6 +653,39 @@ pub fn tty_ioctl(request: u64, arg_ptr: *mut u8) -> i64 {
             let size = core::mem::size_of::<Winsize>();
             unsafe {
                 core::ptr::copy_nonoverlapping(src, arg_ptr, size);
+            }
+            0
+        }
+        TIOCSWINSZ => {
+            // Accept new window size; ignore it for now (virtual console).
+            0
+        }
+        TIOCGPGRP => {
+            // Return current process's PID as the foreground process group.
+            // A real kernel tracks per-tty foreground pgrp; we approximate.
+            if !arg_ptr.is_null() {
+                let pid = crate::proc::current_pid() as i32;
+                unsafe { core::ptr::write_unaligned(arg_ptr as *mut i32, pid); }
+            }
+            0
+        }
+        TIOCSPGRP => {
+            // Accept set-foreground-pgrp silently (no real job control yet).
+            0
+        }
+        TIOCSCTTY => {
+            // Make this terminal the controlling terminal — stub, always succeed.
+            0
+        }
+        TIOCNOTTY => {
+            // Detach from controlling terminal — stub, always succeed.
+            0
+        }
+        TIOCGETSID => {
+            // Return current process PID as session leader PID.
+            if !arg_ptr.is_null() {
+                let pid = crate::proc::current_pid() as i32;
+                unsafe { core::ptr::write_unaligned(arg_ptr as *mut i32, pid); }
             }
             0
         }

@@ -147,6 +147,31 @@ EOF
         echo "[DATA-DISK] Copied Firefox resources to /lib/firefox/"
     fi
 
+    # ── TCC compiler + runtime (built by scripts/build-tcc.sh) ──────────────
+    if [ -f "${BUILD_DIR}/disk/bin/tcc" ]; then
+        mmd -i "${DATA_IMG}" "::lib/tcc"         2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::lib/tcc/include" 2>/dev/null || true
+        mcopy -i "${DATA_IMG}" "${BUILD_DIR}/disk/bin/tcc" "::bin/tcc"
+        echo "[DATA-DISK] Copied tcc binary to /bin/tcc"
+        if [ -f "${BUILD_DIR}/disk/lib/tcc/libtcc1.a" ]; then
+            mcopy -i "${DATA_IMG}" "${BUILD_DIR}/disk/lib/tcc/libtcc1.a" "::lib/tcc/libtcc1.a"
+            echo "[DATA-DISK] Copied libtcc1.a to /lib/tcc/libtcc1.a"
+        fi
+        for f in "${BUILD_DIR}/disk/lib/tcc/include/"*; do
+            [ -f "$f" ] && mcopy -i "${DATA_IMG}" "$f" "::lib/tcc/include/$(basename "$f")"
+        done
+        echo "[DATA-DISK] Copied TCC headers to /lib/tcc/include/"
+    fi
+
+    # ── Test programs (disk/test/) ───────────────────────────────────────────
+    if [ -d "${BUILD_DIR}/disk/test" ]; then
+        mmd -i "${DATA_IMG}" "::test" 2>/dev/null || true
+        for f in "${BUILD_DIR}/disk/test/"*; do
+            [ -f "${f}" ] && mcopy -i "${DATA_IMG}" "${f}" "::test/$(basename "${f}")"
+        done
+        echo "[DATA-DISK] Copied test/ sources to /test/"
+    fi
+
     echo "[DATA-DISK] Populated with initial files (mtools)"
 else
     echo "[DATA-DISK] WARNING: mtools not found — disk created empty"

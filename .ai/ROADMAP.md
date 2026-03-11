@@ -16,7 +16,7 @@
 
 ---
 
-## Current State (14/14 tests, Session 10)
+## Current State (70/70 tests, Session 29 — SMP stable)
 
 **Have**: UEFI boot, GDT/IDT/PIC, PMM (bitmap), VMM (4-level), heap (linked-list),
 process/thread model (shared CR3), round-robin scheduler, context switch (global_asm),
@@ -361,6 +361,9 @@ The full set of syscalls needed for musl libc. Grouped by subsystem.
 ## Phase 13 — Userspace & Toolchain
 
 ### 13.1 — C Toolchain & musl Port
+- [x] **TinyCC 0.9.27** — static musl binary deployed to `/disk/bin/tcc`; compiles and runs C programs inside AstryxOS (Test 63 ✅, 2026-03-06)
+  - Bug fix applied: `fill_local_got_entries` null-guard for `-nostdlib` builds
+  - Runtime: `/disk/lib/tcc/libtcc1.a` + `/disk/lib/tcc/include/`
 - [ ] Cross-compile musl libc targeting `x86_64-astryx-linux-musl` (or custom triple)
 - [ ] Implement all syscalls musl requires (see Phase 8)
 - [ ] `crt0.S` / `crt1.o` — C runtime startup (calls `__libc_start_main`)

@@ -120,63 +120,30 @@ pub fn get_ticks() -> u64 {
 // Hardware IRQ handlers (called from IDT stubs)
 // ============================================================
 
-/// IRQ0: Timer interrupt handler.
-#[unsafe(naked)]
-pub extern "C" fn irq_timer_handler() {
-    // Naked IRQ handler. Saves registers, handles timer, sends EOI.
-    core::arch::naked_asm!(
-        "push rax",
-        "push rcx",
-        "push rdx",
-        "push rsi",
-        "push rdi",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-        "call {handler}",
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rdi",
-        "pop rsi",
-        "pop rdx",
-        "pop rcx",
-        "pop rax",
-        "iretq",
-        handler = sym timer_tick,
-    );
+/// Generate a naked ISR stub that saves caller-saved registers, calls
+/// `$handler`, then restores and `iretq`s.  All four hardware IRQ stubs
+/// are identical in structure; this macro removes the duplication.
+macro_rules! irq_stub {
+    ($name:ident, $handler:ident) => {
+        #[unsafe(naked)]
+        pub extern "C" fn $name() {
+            core::arch::naked_asm!(
+                "push rax", "push rcx", "push rdx",
+                "push rsi", "push rdi",
+                "push r8",  "push r9",  "push r10", "push r11",
+                "call {handler}",
+                "pop r11",  "pop r10",  "pop r9",   "pop r8",
+                "pop rdi",  "pop rsi",
+                "pop rdx",  "pop rcx",  "pop rax",
+                "iretq",
+                handler = sym $handler,
+            );
+        }
+    };
 }
 
-/// IRQ1: Keyboard interrupt handler.
-#[unsafe(naked)]
-pub extern "C" fn irq_keyboard_handler() {
-    // Naked IRQ handler. Saves registers, reads scancode, sends EOI.
-    core::arch::naked_asm!(
-        "push rax",
-        "push rcx",
-        "push rdx",
-        "push rsi",
-        "push rdi",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-        "call {handler}",
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rdi",
-        "pop rsi",
-        "pop rdx",
-        "pop rcx",
-        "pop rax",
-        "iretq",
-        handler = sym keyboard_interrupt,
-    );
-}
+irq_stub!(irq_timer_handler,    timer_tick);
+irq_stub!(irq_keyboard_handler, keyboard_interrupt);
 
 /// Timer interrupt logic.
 extern "C" fn timer_tick() {
@@ -196,65 +163,20 @@ extern "C" fn timer_tick() {
         }
     }
 
-    // Check if a context switch is needed (after EOI so we don't miss interrupts).
-    crate::sched::check_reschedule();
+    // NOTE: check_reschedule() is intentionally NOT called here.
+    //
+    // Calling schedule() from ISR context causes a deadlock: syscall handlers
+    // acquire THREAD_TABLE with interrupts enabled (after STI in syscall_entry).
+    // If a timer fires while THREAD_TABLE is held, check_reschedule() → schedule()
+    // → THREAD_TABLE.lock() spins forever on the same CPU (self-deadlock).
+    //
+    // Preemption is handled instead at two safe points:
+    //   1. End of syscall dispatch() — after all locks are released (BSP path).
+    //   2. AP idle loop — after each HLT wakeup (AP path, in apic.rs).
 }
 
-/// IRQ12: Mouse interrupt handler.
-#[unsafe(naked)]
-pub extern "C" fn irq_mouse_handler() {
-    core::arch::naked_asm!(
-        "push rax",
-        "push rcx",
-        "push rdx",
-        "push rsi",
-        "push rdi",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-        "call {handler}",
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rdi",
-        "pop rsi",
-        "pop rdx",
-        "pop rcx",
-        "pop rax",
-        "iretq",
-        handler = sym mouse_interrupt,
-    );
-}
-
-/// IRQ11: E1000 NIC interrupt handler.
-#[unsafe(naked)]
-pub extern "C" fn irq_e1000_handler() {
-    core::arch::naked_asm!(
-        "push rax",
-        "push rcx",
-        "push rdx",
-        "push rsi",
-        "push rdi",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-        "call {handler}",
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rdi",
-        "pop rsi",
-        "pop rdx",
-        "pop rcx",
-        "pop rax",
-        "iretq",
-        handler = sym e1000_interrupt,
-    );
-}
+irq_stub!(irq_mouse_handler, mouse_interrupt);
+irq_stub!(irq_e1000_handler, e1000_interrupt);
 
 /// E1000 NIC interrupt logic.
 /// We run with IMS=0 (polling), so this should rarely fire.

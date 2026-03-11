@@ -70,7 +70,7 @@ fn efi_main() -> Status {
         core::ptr::copy_nonoverlapping(kernel_data.as_ptr(), kernel_dest, kernel_data.len());
     }
 
-    print_line("[AstryxBoot] Kernel copied to 0x100000\r\n");
+    print_line("[AstryxBoot] Kernel copied to 0x100000 (entry at 0xFFFF800000100000)\r\n");
 
     // Find RSDP (ACPI table pointer)
     let rsdp_address = find_rsdp();
@@ -120,13 +120,19 @@ fn efi_main() -> Status {
         paging::setup_page_tables();
     }
 
-    // Jump to kernel entry point
-    // The kernel entry is at the start of the kernel binary (0x100000)
-    // We pass boot_info physical address in RDI (System V ABI)
+    // Jump to kernel entry point.
+    // The kernel binary was copied to KERNEL_PHYS_BASE (physical), but it is
+    // linked at KERNEL_VIRT_BASE + KERNEL_PHYS_BASE (higher-half virtual).
+    // The page tables set up above map 0xFFFF_8000_0000_0000 → physical 0x0,
+    // so jumping to the higher-half VA correctly executes kernel code and
+    // ensures all kernel statics (loaded via PML4[256]) are never aliased by
+    // user-mode ELF segments in PML4[0].
+    // We pass the boot_info PHYSICAL address in RDI; the kernel reads it via
+    // the identity map (PML4[0]) which remains present.
     // SAFETY: The kernel binary has been loaded at KERNEL_PHYS_BASE.
     // Page tables are set up. We jump and never return.
     unsafe {
-        let kernel_entry: u64 = KERNEL_PHYS_BASE;
+        let kernel_entry: u64 = KERNEL_VIRT_BASE + KERNEL_PHYS_BASE;
         asm!(
             "mov rdi, {boot_info}",
             "jmp {entry}",

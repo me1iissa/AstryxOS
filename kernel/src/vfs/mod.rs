@@ -204,6 +204,22 @@ impl FileDescriptor {
             is_console: true, open_path: String::new(),
         }
     }
+    /// Pipe write-end sentinel fd (not backed by VFS inode).
+    pub fn pipe_write_end(pipe_id: u64) -> Self {
+        Self {
+            inode: pipe_id, mount_idx: usize::MAX, offset: 0,
+            flags: 0x8000_0001, file_type: FileType::Pipe,
+            is_console: false, open_path: String::new(),
+        }
+    }
+    /// Pipe read-end sentinel fd (not backed by VFS inode).
+    pub fn pipe_read_end(pipe_id: u64) -> Self {
+        Self {
+            inode: pipe_id, mount_idx: usize::MAX, offset: 0,
+            flags: 0x8000_0000, file_type: FileType::Pipe,
+            is_console: false, open_path: String::new(),
+        }
+    }
 }
 
 /// Initialize the VFS with a root ramfs.
@@ -260,6 +276,66 @@ pub fn init() {
     // Create /etc/motd.
     if let Ok(()) = create_file("/etc/motd") {
         let _ = write_file("/etc/motd", b"Welcome to AstryxOS!\n");
+    }
+
+    // Minimal /etc/passwd — required by bash, login, id, whoami, etc.
+    // Format: name:password:uid:gid:gecos:home:shell
+    if let Ok(()) = create_file("/etc/passwd") {
+        let _ = write_file("/etc/passwd",
+            b"root:x:0:0:root:/root:/bin/sh\n\
+              nobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n");
+    }
+
+    // /etc/shadow — stub so passwd-reading libs don't hard-error
+    if let Ok(()) = create_file("/etc/shadow") {
+        let _ = write_file("/etc/shadow", b"root:!:19000:0:99999:7:::\nnobody:!:19000::::::\n");
+    }
+
+    // Minimal /etc/group — required by id, newgrp, bash
+    // Format: group:password:gid:member_list
+    if let Ok(()) = create_file("/etc/group") {
+        let _ = write_file("/etc/group",
+            b"root:x:0:\nnogroup:x:65534:\n");
+    }
+
+    // /etc/shells — list of valid login shells
+    if let Ok(()) = create_file("/etc/shells") {
+        let _ = write_file("/etc/shells", b"/bin/sh\n/bin/bash\n");
+    }
+
+    // /etc/nsswitch.conf — tells glibc where to look up users/hosts
+    if let Ok(()) = create_file("/etc/nsswitch.conf") {
+        let _ = write_file("/etc/nsswitch.conf",
+            b"passwd:   files\ngroup:    files\nshadow:   files\nhosts:    files\n");
+    }
+
+    // /etc/profile — sourced by login shells
+    if let Ok(()) = create_file("/etc/profile") {
+        let _ = write_file("/etc/profile",
+            b"export PATH=/bin:/usr/bin:/sbin:/usr/sbin\nexport HOME=/root\nexport TERM=linux\n");
+    }
+
+    // /root home directory
+    let _ = mkdir("/root");
+
+    // /etc/localtime stub — prevents TZ-related crashes in some libc builds
+    if let Ok(()) = create_file("/etc/localtime") {
+        // Empty file; glibc will fall back to UTC
+    }
+
+    // /etc/ascension.conf — Ascension init service configuration.
+    // Empty by default; add "service <name> <binary> [args...]" lines to
+    // register services that Ascension will launch at boot.
+    if let Ok(()) = create_file("/etc/ascension.conf") {
+        let _ = write_file("/etc/ascension.conf",
+            b"# Ascension Init Configuration\n\
+              # Format: service <name> <binary> [args...]\n\
+              # Format: service-restart <name> <binary> [args...]  (restart on exit)\n\
+              # Format: service-onfail  <name> <binary> [args...]  (restart on failure)\n\
+              #\n\
+              # Example:\n\
+              #   service-restart syslogd /disk/bin/syslogd\n\
+              #   service-restart getty   /disk/bin/getty tty0\n");
     }
 
     // ── /proc — static read-only approximations of common entries ─────────
@@ -852,6 +928,28 @@ pub fn chmod(path: &str, mode: u32) -> VfsResult<()> {
     let (mount_idx, inode) = resolve_path(path)?;
     let mounts = MOUNTS.lock();
     mounts[mount_idx].fs.chmod(inode, mode)
+}
+
+/// Truncate a file to `size` bytes by path.
+pub fn truncate_path(path: &str, size: u64) -> VfsResult<()> {
+    let (mount_idx, inode) = resolve_path(path)?;
+    let mounts = MOUNTS.lock();
+    mounts[mount_idx].fs.truncate(inode, size)
+}
+
+/// Truncate the file open as `fd_num` for process `pid` to `size` bytes.
+pub fn fd_truncate(pid: crate::proc::Pid, fd_num: usize, size: u64) -> VfsResult<()> {
+    let (mount_idx, inode) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        let proc = procs.iter().find(|p| p.pid == pid).ok_or(VfsError::InvalidArg)?;
+        let fd = proc.file_descriptors.get(fd_num)
+            .and_then(|f| f.as_ref())
+            .ok_or(VfsError::BadFd)?;
+        if fd.is_console { return Err(VfsError::Unsupported); }
+        (fd.mount_idx, fd.inode)
+    };
+    let mounts = MOUNTS.lock();
+    mounts[mount_idx].fs.truncate(inode, size)
 }
 
 // ===== Process File Descriptor Operations =====
