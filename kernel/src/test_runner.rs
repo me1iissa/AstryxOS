@@ -467,6 +467,26 @@ pub fn run() -> ! {
     total += 1;
     if test_ascension_init() { passed += 1; }
 
+    // ── Test 72: timerfd — create / settime / gettime / read ─────────────────
+
+    total += 1;
+    if test_timerfd() { passed += 1; }
+
+    // ── Test 73: signalfd — create / is_readable / read ──────────────────────
+
+    total += 1;
+    if test_signalfd() { passed += 1; }
+
+    // ── Test 74: inotify — create / add_watch / rm_watch / poll ──────────────
+
+    total += 1;
+    if test_inotify() { passed += 1; }
+
+    // ── Test 75: X11 extension handlers (SHM, XFIXES, DAMAGE, XI2) ───────────
+
+    total += 1;
+    if test_x11_extensions() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -10025,5 +10045,355 @@ fn test_ascension_init() -> bool {
     }
 
     test_pass!("Ascension init — config parse + service launch");
+    true
+}
+
+// ── Test 72: timerfd ─────────────────────────────────────────────────────────
+
+fn test_timerfd() -> bool {
+    test_header!("timerfd — create / settime / gettime / read");
+
+    // 1. Create a timerfd with CLOCK_MONOTONIC.
+    let id = crate::ipc::timerfd::create(crate::ipc::timerfd::CLOCK_MONOTONIC);
+    if id == u64::MAX {
+        test_fail!("timerfd", "create() returned MAX (no free slots)");
+        return false;
+    }
+    test_println!("  timerfd slot {} allocated ✓", id);
+
+    // 2. Before arming, gettime should return (0, 0).
+    let (int, val) = crate::ipc::timerfd::gettime(id);
+    if int != 0 || val != 0 {
+        test_fail!("timerfd", "disarmed gettime returned ({}, {}), want (0,0)", int, val);
+        return false;
+    }
+    test_println!("  gettime on disarmed fd = (0, 0) ✓");
+
+    // 3. Arm for 1 ms (1_000_000 ns).
+    let r = crate::ipc::timerfd::settime(id, 0, 1_000_000, 0);
+    if r.is_none() {
+        test_fail!("timerfd", "settime returned None");
+        return false;
+    }
+    test_println!("  settime 1ms one-shot ✓");
+
+    // 4. Immediately after arming, is_readable should be false (not expired yet).
+    let rdy_before = crate::ipc::timerfd::is_readable(id);
+    test_println!("  is_readable immediately after arm: {}", rdy_before);
+    // (We don't fail on this — the timer may expire instantly at 100 Hz resolution.)
+
+    // 5. Disarm and verify.
+    crate::ipc::timerfd::settime(id, 0, 0, 0);
+    let (int2, val2) = crate::ipc::timerfd::gettime(id);
+    if int2 != 0 || val2 != 0 {
+        test_fail!("timerfd", "after disarm gettime returned ({}, {})", int2, val2);
+        return false;
+    }
+    test_println!("  disarm + gettime = (0, 0) ✓");
+
+    // 6. Read on disarmed fd should return EAGAIN.
+    match crate::ipc::timerfd::read(id) {
+        Err(-11) => test_println!("  read on disarmed fd → EAGAIN ✓"),
+        Ok(v)    => {
+            test_fail!("timerfd", "read returned Ok({}) on disarmed fd", v);
+            return false;
+        }
+        Err(e)   => {
+            test_fail!("timerfd", "read returned Err({}) on disarmed fd", e);
+            return false;
+        }
+    }
+
+    // 7. Arm with a past-tick expiry so it fires immediately, then read.
+    // settime with value_ns = 1 tick = 10_000_000 ns, will expire next tick check
+    crate::ipc::timerfd::settime(id, 0, 10_000_000, 10_000_000); // 10 ms interval
+    // Force expiration by manipulating: read when armed with interval should eventually work.
+    // We skip actually waiting and just verify close() works.
+
+    // 8. Close and verify slot is freed.
+    crate::ipc::timerfd::close(id);
+    match crate::ipc::timerfd::read(id) {
+        Err(-9) => test_println!("  read after close → EBADF ✓"),
+        other   => {
+            test_fail!("timerfd", "read after close returned {:?}", other.is_ok());
+            return false;
+        }
+    }
+
+    test_pass!("timerfd — create / settime / gettime / read");
+    true
+}
+
+// ── Test 73: signalfd ────────────────────────────────────────────────────────
+
+fn test_signalfd() -> bool {
+    test_header!("signalfd — create / is_readable / read");
+
+    // Get current PID.
+    let pid = crate::proc::current_pid();
+
+    // 1. Ensure the current process has signal_state initialized.
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            if p.signal_state.is_none() {
+                p.signal_state = Some(crate::signal::SignalState::new());
+            }
+        }
+    }
+    test_println!("  process signal_state ready ✓");
+
+    // 2. Create a signalfd for SIGUSR1 (signal 10).
+    let sigusr1_mask: u64 = 1 << (10 - 1);
+    let id = crate::ipc::signalfd::create(pid, sigusr1_mask);
+    if id == u64::MAX {
+        test_fail!("signalfd", "create() returned MAX (no free slots)");
+        return false;
+    }
+    test_println!("  signalfd slot {} allocated ✓", id);
+
+    // 3. No signals pending → is_readable = false.
+    if crate::ipc::signalfd::is_readable(id) {
+        test_fail!("signalfd", "is_readable true with no pending signals");
+        return false;
+    }
+    test_println!("  is_readable with no signals = false ✓");
+
+    // 4. Inject SIGUSR1 into the process manually.
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            if let Some(ss) = p.signal_state.as_mut() {
+                ss.pending |= sigusr1_mask;
+            }
+        }
+    }
+    test_println!("  SIGUSR1 injected into pending ✓");
+
+    // 5. Now is_readable should be true.
+    if !crate::ipc::signalfd::is_readable(id) {
+        test_fail!("signalfd", "is_readable false after SIGUSR1 injection");
+        return false;
+    }
+    test_println!("  is_readable after injection = true ✓");
+
+    // 6. Read one siginfo record.
+    let mut buf = [0u8; 128];
+    match crate::ipc::signalfd::read(id, buf.as_mut_ptr(), 128) {
+        Ok(n) if n == 128 => {
+            let signo = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            if signo != 10 {
+                test_fail!("signalfd", "ssi_signo = {}, want 10", signo);
+                return false;
+            }
+            test_println!("  read 128 bytes, ssi_signo = {} ✓", signo);
+        }
+        Ok(n) => {
+            test_fail!("signalfd", "read returned {} bytes, want 128", n);
+            return false;
+        }
+        Err(e) => {
+            test_fail!("signalfd", "read returned Err({})", e);
+            return false;
+        }
+    }
+
+    // 7. Signal consumed — is_readable should now be false.
+    if crate::ipc::signalfd::is_readable(id) {
+        test_fail!("signalfd", "is_readable still true after read");
+        return false;
+    }
+    test_println!("  signal consumed, is_readable = false ✓");
+
+    // 8. Close.
+    crate::ipc::signalfd::close(id);
+    test_println!("  signalfd closed ✓");
+
+    test_pass!("signalfd — create / is_readable / read");
+    true
+}
+
+// ── Test 74: inotify ─────────────────────────────────────────────────────────
+
+fn test_inotify() -> bool {
+    test_header!("inotify — create / add_watch / rm_watch / poll");
+
+    // 1. Create an inotify fd.
+    let id = crate::ipc::inotify::create();
+    if id == u64::MAX {
+        test_fail!("inotify", "create() returned MAX (no free slots)");
+        return false;
+    }
+    test_println!("  inotify slot {} allocated ✓", id);
+
+    // 2. Add a watch for a path.
+    let wd = crate::ipc::inotify::add_watch(id, "/etc", 0xFFF);
+    if wd < 0 {
+        test_fail!("inotify", "add_watch returned {}", wd);
+        return false;
+    }
+    test_println!("  add_watch('/etc') → wd={} ✓", wd);
+
+    // 3. Stub always returns EAGAIN on read.
+    if crate::ipc::inotify::is_readable(id) {
+        test_fail!("inotify", "stub is_readable returned true");
+        return false;
+    }
+    test_println!("  is_readable (stub) = false ✓");
+
+    // 4. Remove the watch.
+    let r = crate::ipc::inotify::rm_watch(id, wd);
+    if !r {
+        test_fail!("inotify", "rm_watch returned false");
+        return false;
+    }
+    test_println!("  rm_watch(wd={}) ✓", wd);
+
+    // 5. Add another watch (distinct wd).
+    let wd2 = crate::ipc::inotify::add_watch(id, "/tmp", 0x1);
+    if wd2 <= wd {
+        test_fail!("inotify", "second wd {} not > first {}", wd2, wd);
+        return false;
+    }
+    test_println!("  second add_watch('/tmp') → wd={} (increments) ✓", wd2);
+
+    // 6. Close.
+    crate::ipc::inotify::close(id);
+    test_println!("  inotify closed ✓");
+
+    test_pass!("inotify — create / add_watch / rm_watch / poll");
+    true
+}
+
+// ── Test 75: X11 extension handlers (SHM, XFIXES, DAMAGE, XI2) ───────────────
+
+fn test_x11_extensions() -> bool {
+    test_header!("X11 extension handlers — SHM / XFIXES / DAMAGE / XI2");
+
+    use crate::x11::proto;
+
+    // X11 server is already running (initialised by test_x11_hello earlier).
+    // Connect a fresh client.
+    let cfd = crate::net::unix::create();
+    if cfd == u64::MAX {
+        test_fail!("x11_ext", "unix::create() failed");
+        return false;
+    }
+    if crate::net::unix::connect(cfd, b"/tmp/.X11-unix/X0\0") < 0 {
+        test_fail!("x11_ext", "unix::connect() failed");
+        crate::net::unix::close(cfd);
+        return false;
+    }
+
+    // Send ClientHello.
+    let hello: [u8; 12] = [0x6C, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    crate::net::unix::write(cfd, &hello);
+    crate::x11::poll();
+    let mut drain = [0u8; 256];
+    crate::net::unix::read(cfd, &mut drain);
+    test_println!("  connected and setup complete ✓");
+
+    // Wire format reminder: [opcode, minor/data1, len_lo, len_hi, ...]
+    // len is in 4-byte words and includes the header word.
+    // SHM QueryVersion: 4 bytes total → len = 1.
+    // ── MIT-SHM QueryVersion ─────────────────────────────────────────────────
+    {
+        let req: [u8; 4] = [proto::SHM_MAJOR_OPCODE, proto::SHM_QUERY_VERSION, 1, 0];
+        crate::net::unix::write(cfd, &req);
+        crate::x11::poll();
+        let mut rep = [0u8; 64];
+        let n = crate::net::unix::read(cfd, &mut rep);
+        if n < 12 || rep[0] != 1 {
+            test_fail!("x11_ext", "SHM QueryVersion: no reply (n={})", n);
+            crate::net::unix::close(cfd);
+            return false;
+        }
+        let major = u16::from_le_bytes([rep[8], rep[9]]);
+        test_println!("  SHM QueryVersion → major={} ✓", major);
+        if major != 1 {
+            test_fail!("x11_ext", "SHM major={}, want 1", major);
+            crate::net::unix::close(cfd);
+            return false;
+        }
+    }
+
+    // ── XFIXES QueryVersion: 12 bytes (3 words) ───────────────────────────────
+    {
+        let mut req = [0u8; 12];
+        req[0] = proto::XFIXES_MAJOR_OPCODE;
+        req[1] = proto::XFIXES_QUERY_VERSION;
+        req[2] = 3; // length = 3 words (12 bytes), low byte
+        req[4] = 5; // client_major = 5 (LE u32 at offset 4)
+        crate::net::unix::write(cfd, &req);
+        crate::x11::poll();
+        let mut rep = [0u8; 64];
+        let n = crate::net::unix::read(cfd, &mut rep);
+        if n < 12 || rep[0] != 1 {
+            test_fail!("x11_ext", "XFIXES QueryVersion: no reply (n={})", n);
+            crate::net::unix::close(cfd);
+            return false;
+        }
+        let major = u32::from_le_bytes([rep[8], rep[9], rep[10], rep[11]]);
+        test_println!("  XFIXES QueryVersion → major={} ✓", major);
+        if major != 5 {
+            test_fail!("x11_ext", "XFIXES major={}, want 5", major);
+            crate::net::unix::close(cfd);
+            return false;
+        }
+    }
+
+    // ── DAMAGE QueryVersion: 12 bytes (3 words) ───────────────────────────────
+    {
+        let mut req = [0u8; 12];
+        req[0] = proto::DAMAGE_MAJOR_OPCODE;
+        req[1] = proto::DAMAGE_QUERY_VERSION;
+        req[2] = 3; // length = 3 words
+        req[4] = 1; // client_major = 1
+        crate::net::unix::write(cfd, &req);
+        crate::x11::poll();
+        let mut rep = [0u8; 64];
+        let n = crate::net::unix::read(cfd, &mut rep);
+        if n < 12 || rep[0] != 1 {
+            test_fail!("x11_ext", "DAMAGE QueryVersion: no reply (n={})", n);
+            crate::net::unix::close(cfd);
+            return false;
+        }
+        let major = u32::from_le_bytes([rep[8], rep[9], rep[10], rep[11]]);
+        test_println!("  DAMAGE QueryVersion → major={} ✓", major);
+        if major != 1 {
+            test_fail!("x11_ext", "DAMAGE major={}, want 1", major);
+            crate::net::unix::close(cfd);
+            return false;
+        }
+    }
+
+    // ── XI2 QueryVersion: 8 bytes (2 words) ──────────────────────────────────
+    {
+        let mut req = [0u8; 8];
+        req[0] = proto::XINPUT_MAJOR_OPCODE;
+        req[1] = proto::XI_QUERY_VERSION;
+        req[2] = 2;  // length = 2 words (8 bytes), low byte
+        req[4] = 2;  // client_major = 2 (LE u16 at offset 4)
+        req[6] = 3;  // client_minor = 3 (LE u16 at offset 6)
+        crate::net::unix::write(cfd, &req);
+        crate::x11::poll();
+        let mut rep = [0u8; 64];
+        let n = crate::net::unix::read(cfd, &mut rep);
+        if n < 12 || rep[0] != 1 {
+            test_fail!("x11_ext", "XI2 QueryVersion: no reply (n={})", n);
+            crate::net::unix::close(cfd);
+            return false;
+        }
+        let xi_major = u16::from_le_bytes([rep[8], rep[9]]);
+        test_println!("  XI2 QueryVersion → major={} ✓", xi_major);
+        if xi_major != 2 {
+            test_fail!("x11_ext", "XI2 major={}, want 2", xi_major);
+            crate::net::unix::close(cfd);
+            return false;
+        }
+    }
+
+    crate::net::unix::close(cfd);
+    test_pass!("X11 extension handlers — SHM / XFIXES / DAMAGE / XI2");
     true
 }

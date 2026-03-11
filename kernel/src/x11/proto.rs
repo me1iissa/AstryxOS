@@ -200,7 +200,8 @@ pub fn pad4(n: usize) -> usize {
 // ── RENDER extension ──────────────────────────────────────────────────────────
 
 /// Major opcode assigned to the RENDER extension by Xastryx.
-pub const RENDER_MAJOR_OPCODE: u8 = 68;
+/// Extension major opcodes are in the 128-255 range per X11 spec.
+pub const RENDER_MAJOR_OPCODE: u8 = 139;
 
 // Minor opcodes
 pub const RENDER_QUERY_VERSION:      u8 = 0;
@@ -222,3 +223,59 @@ pub const RENDER_OP_OVER:  u8 = 3;
 pub const PICT_FORMAT_ARGB32: u32 = 0x2000_0001; // depth=32, alpha/red/green/blue
 pub const PICT_FORMAT_RGB24:  u32 = 0x2000_0002; // depth=24, no alpha
 pub const PICT_FORMAT_A8:     u32 = 0x2000_0003; // depth=8,  alpha only
+
+// ── Extension major opcodes assigned by Xastryx ───────────────────────────────
+// Each extension gets a unique major opcode (128-255 range for extensions).
+
+// Extension major opcodes in 128-255 range (per X11 spec; core ops are 1-127).
+pub const SHAPE_MAJOR_OPCODE:     u8 = 128; // SHAPE
+pub const XTEST_MAJOR_OPCODE:     u8 = 132; // XTEST
+pub const SYNC_MAJOR_OPCODE:      u8 = 134; // SYNC
+pub const XKEYBOARD_MAJOR_OPCODE: u8 = 135; // XKEYBOARD
+// RENDER = 139 (already defined above)
+pub const XFIXES_MAJOR_OPCODE:    u8 = 140; // XFIXES
+pub const DAMAGE_MAJOR_OPCODE:    u8 = 141; // DAMAGE
+pub const COMPOSITE_MAJOR_OPCODE: u8 = 142; // COMPOSITE
+pub const DPMS_MAJOR_OPCODE:      u8 = 145; // DPMS
+pub const XINPUT_MAJOR_OPCODE:    u8 = 131; // XInputExtension (XI2)
+pub const SHM_MAJOR_OPCODE:       u8 = 130; // MIT-SHM
+
+// ── MIT-SHM minor opcodes ──────────────────────────────────────────────────────
+pub const SHM_QUERY_VERSION:  u8 = 0;
+pub const SHM_ATTACH:         u8 = 1;
+pub const SHM_DETACH:         u8 = 2;
+pub const SHM_PUT_IMAGE:      u8 = 3;
+pub const SHM_GET_IMAGE:      u8 = 4;
+pub const SHM_CREATE_PIXMAP:  u8 = 5;
+
+// ── XFIXES minor opcodes ───────────────────────────────────────────────────────
+pub const XFIXES_QUERY_VERSION:       u8 = 0;
+pub const XFIXES_CHANGE_SAVE_SET:     u8 = 1;
+pub const XFIXES_SELECT_CURSOR_INPUT: u8 = 2;
+pub const XFIXES_GET_CURSOR_IMAGE:    u8 = 3;
+pub const XFIXES_CREATE_REGION:       u8 = 4; // and many more
+pub const XFIXES_HIDE_CURSOR:         u8 = 29;
+pub const XFIXES_SHOW_CURSOR:         u8 = 30;
+
+// ── DAMAGE minor opcodes ───────────────────────────────────────────────────────
+pub const DAMAGE_QUERY_VERSION:  u8 = 0;
+pub const DAMAGE_CREATE:         u8 = 1;
+pub const DAMAGE_DESTROY:        u8 = 2;
+pub const DAMAGE_SUBTRACT:       u8 = 3;
+pub const DAMAGE_ADD:            u8 = 4;
+
+// ── XInputExtension (XI2) minor opcodes ───────────────────────────────────────
+pub const XI_QUERY_VERSION:    u8 = 47;
+pub const XI_GET_CLIENT_POINTER: u8 = 18;
+pub const XI_SELECT_EVENTS:    u8 = 46;
+
+// ── COMPOSITE minor opcodes ───────────────────────────────────────────────────
+pub const COMPOSITE_QUERY_VERSION:            u8 = 0;
+pub const COMPOSITE_REDIRECT_WINDOW:          u8 = 1;
+pub const COMPOSITE_UNREDIRECT_WINDOW:        u8 = 2;
+pub const COMPOSITE_REDIRECT_SUBWINDOWS:      u8 = 3;
+pub const COMPOSITE_UNREDIRECT_SUBWINDOWS:    u8 = 4;
+pub const COMPOSITE_CREATE_REGION_FROM_BORDER_CLIP: u8 = 5;
+pub const COMPOSITE_NAME_WINDOW_PIXMAP:       u8 = 6;
+pub const COMPOSITE_GET_OVERLAY_WINDOW:       u8 = 7;
+pub const COMPOSITE_RELEASE_OVERLAY_WINDOW:   u8 = 8;
