@@ -365,7 +365,8 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
         None => return 0,
     };
 
-    let is_linux = proc_entry.linux_abi;
+    let is_linux = proc_entry.linux_abi
+        || proc_entry.subsystem == crate::win32::SubsystemType::Linux;
 
     let sig_state = match proc_entry.signal_state.as_mut() {
         Some(s) => s,

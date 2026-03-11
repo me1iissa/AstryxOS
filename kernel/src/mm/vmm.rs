@@ -24,6 +24,19 @@ pub const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 /// VMM lock.
 static VMM_LOCK: Mutex<()> = Mutex::new(());
 
+/// The kernel's primary page table CR3, captured during VMM init.
+/// Used to restore the CR3 on CPUs that were using a user process's page
+/// table when that process exits (e.g. AP idle after a user thread dies).
+static KERNEL_CR3: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Return the kernel's primary page table CR3.
+/// Returns 0 if VMM has not been initialised yet (safe — callers check != 0).
+#[inline]
+pub fn get_kernel_cr3() -> u64 {
+    KERNEL_CR3.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Initialize the VMM.
 ///
 /// 1. Reserves the physical pages that back the higher-half kernel heap
@@ -34,9 +47,10 @@ static VMM_LOCK: Mutex<()> = Mutex::new(());
 ///    heap mapping.
 pub fn init() {
     // Reserve physical pages that back the higher-half kernel heap.
-    // HEAP_START 0xFFFF_8000_0040_0000 → physical 0x0040_0000 (4 MiB).
+    // HEAP_START 0xFFFF_8000_0080_0000 → physical 0x0080_0000 (8 MiB).
+    // Starting at 8 MiB avoids overlap with the kernel image (ends < 6 MiB).
     // Heap size is 128 MiB.
-    let heap_phys_start = 0x0040_0000u64;
+    let heap_phys_start = 0x0080_0000u64;
     let heap_phys_end = heap_phys_start + (128 * 1024 * 1024) as u64;
     pmm::reserve_range(heap_phys_start, heap_phys_end);
 
@@ -46,6 +60,12 @@ pub fn init() {
     // a 2 MiB huge page for user ELF loading via the identity map would
     // also corrupt the corresponding higher-half mapping.
     unsafe { separate_higher_half_pds(); }
+
+    // Capture the kernel's page table root so any CPU that departs a user
+    // address space can restore to a known-good kernel CR3.
+    let cr3: u64;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
+    KERNEL_CR3.store(cr3, core::sync::atomic::Ordering::Relaxed);
 
     crate::serial_println!("[VMM] Virtual memory manager initialized");
 }

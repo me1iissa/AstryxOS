@@ -145,6 +145,9 @@ pub fn init() {
             // Syscall interrupt (vector 0x80) — for int 0x80 style syscalls
             IDT[0x80].set_handler(isr_syscall_int80 as *const () as u64, kernel_cs, 0, 3);
 
+            // NT syscall gate (vector 0x2E) — Windows INT 0x2E compatibility
+            IDT[0x2E].set_handler(isr_syscall_int2e as *const () as u64, kernel_cs, 0, 3);
+
             // Load IDT
             let idt_ptr = IdtPointer {
                 limit: (core::mem::size_of::<[IdtEntry; IDT_ENTRIES]>() - 1) as u16,
@@ -168,8 +171,8 @@ pub fn init() {
 /// Common exception handler called from stubs.
 #[no_mangle]
 extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &InterruptFrame) {
-    // Debug trace for all exceptions during user-mode bringup
-    if frame.cs & 3 == 3 {
+    // Debug trace for non-page-fault exceptions from user mode.
+    if frame.cs & 3 == 3 && vector != 14 {
         crate::serial_println!(
             "[EXC] vec={} err={:#x} RIP={:#x} CS={:#x} RSP={:#x}",
             vector, error_code, frame.rip, frame.cs, frame.rsp
@@ -218,6 +221,15 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &InterruptF
             return;
         }
 
+        // Kernel-mode page fault — print CPU context before halting
+        let cpu_id = crate::arch::x86_64::apic::current_apic_id();
+        let tid = crate::proc::current_tid();
+        let cr3: u64;
+        unsafe { asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)); }
+        crate::serial_println!(
+            "  KERNEL FAULT: CPU={} TID={} CR3={:#x} (halting this CPU)",
+            cpu_id, tid, cr3
+        );
         loop {
             unsafe { asm!("cli; hlt", options(nomem, nostack)); }
         }
@@ -270,7 +282,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &InterruptFram
     let is_write = error_code & 2 != 0;
     let _is_user = error_code & 4 != 0;
 
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::recover_current_pid();
 
     // Look up the faulting address in the process's VmSpace
     let mut procs = crate::proc::PROCESS_TABLE.lock();
@@ -558,5 +570,61 @@ extern "C" fn isr_syscall_int80() {
         "iretq",
 
         dispatch = sym crate::syscall::dispatch,
+    );
+}
+/// INT 0x2E syscall handler — NT-ABI gate for Win32 compatibility.
+///
+/// NT ABI register convention:
+///   - RAX = syscall number
+///   - RCX = arg1  (return address in SYSCALL path, but for INT stays as arg1)
+///   - RDX = arg2
+///   - R8  = arg3
+///   - R9  = arg4
+///
+/// Maps to `dispatch_nt_int2e(num, a1, a2, a3, a4, a5)` in C calling convention:
+///   rdi=num, rsi=a1, rdx=a2, rcx=a3, r8=a4, r9=0
+#[unsafe(naked)]
+extern "C" fn isr_syscall_int2e() {
+    core::arch::naked_asm!(
+        // Save all scratch registers (same layout as isr_syscall_int80)
+        "push 0",           // Fake error code placeholder
+        "push rax",         // save syscall number (live: rax)  → [rsp+64]
+        "push rcx",         // save NT a1          (live: rcx)  → [rsp+56]
+        "push rdx",         // save NT a2          (live: rdx)  → [rsp+48]
+        "push rsi",         // callee-saved                     → [rsp+40]
+        "push rdi",         // callee-saved                     → [rsp+32]
+        "push r8",          // save NT a3          (live: r8)   → [rsp+24]
+        "push r9",          // save NT a4          (live: r9)   → [rsp+16]
+        "push r10",         // callee-saved                     → [rsp+8]
+        "push r11",         // callee-saved                     → [rsp+0]
+
+        // Map NT ABI → C calling convention.
+        // Use live register values (push does not change source register).
+        // Order is carefully chosen to avoid read-after-write clobbers:
+        "mov rdi, rax",     // C arg1 = num  (rax still live)
+        "mov rsi, rcx",     // C arg2 = a1   (rcx still live; rsi was saved)
+        // rdx stays as-is  (C arg3 = a2; rdx == NT a2)
+        "mov rcx, r8",      // C arg4 = a3   (r8 still live; clobbers rcx — already saved)
+        "mov r8, r9",       // C arg5 = a4   (r9 still live; r8 already consumed above)
+        "xor r9, r9",       // C arg6 = a5 = 0
+
+        "call {dispatch}",
+
+        // Store return value over saved rax slot so pop rax gives return value
+        "mov [rsp + 64], rax",
+
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",          // NT service return value (NTSTATUS)
+        "add rsp, 8",       // pop fake error code
+        "iretq",
+
+        dispatch = sym crate::nt::dispatch_nt_int2e,
     );
 }

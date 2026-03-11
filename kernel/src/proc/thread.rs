@@ -32,7 +32,6 @@ pub extern "C" fn thread_entry_trampoline() {
     unsafe {
         asm!("mov {}, rbx", out(reg) entry, options(nomem, nostack));
     }
-
     // Cast to function pointer and call it.
     let func: fn() = unsafe { core::mem::transmute(entry) };
     func();
@@ -53,6 +52,7 @@ core::arch::global_asm!(
     ".global switch_context_asm",
     ".type switch_context_asm, @function",
     "switch_context_asm:",
+    // Args: RDI = old_rsp_ptr, RSI = new_rsp, RDX = ctx_valid_ptr (u8*, may be NULL)
     // Save callee-saved registers onto current stack
     "push rbp",
     "push rbx",
@@ -62,6 +62,16 @@ core::arch::global_asm!(
     "push r15",
     // Save current RSP to *old_rsp_ptr
     "mov [rdi], rsp",
+    // Atomically signal that the saved RSP is now valid.
+    // RDX points to the thread's ctx_rsp_valid byte (AtomicBool).
+    // Writing '1' here (BEFORE switching stacks) means: any CPU that reads
+    // ctx_rsp_valid==1 is guaranteed to also see the updated RSP above.
+    // x86 TSO ensures the store to [rdi] is visible before the store to [rdx]
+    // from any other CPU's perspective once they observe the [rdx] store.
+    "test rdx, rdx",
+    "jz 1f",
+    "mov byte ptr [rdx], 1",  // ctx_rsp_valid = true
+    "1:",
     // Load new RSP
     "mov rsp, rsi",
     // Restore callee-saved registers from new stack
@@ -82,14 +92,16 @@ extern "C" {
     /// Perform a context switch between two threads.
     ///
     /// Saves the current thread's callee-saved registers on its stack,
-    /// stores its RSP, loads the new thread's RSP, pops its callee-saved
-    /// registers, and returns — effectively resuming the new thread.
+    /// stores its RSP to *old_rsp_ptr, then sets *ctx_valid_ptr = 1
+    /// (if non-null) to atomically signal that the saved RSP is valid.
+    /// Then loads new_rsp and resumes the new thread.
     ///
     /// # Safety
     /// Both pointers must be valid. `new_rsp` must point to a properly
     /// initialized stack (either from a previous switch_context, or from
-    /// `init_thread_stack`).
-    pub fn switch_context_asm(old_rsp_ptr: *mut u64, new_rsp: u64);
+    /// `init_thread_stack`). `ctx_valid_ptr` must be null or point to a
+    /// valid `u8` (the `ctx_rsp_valid` byte of the outgoing thread).
+    pub fn switch_context_asm(old_rsp_ptr: *mut u64, new_rsp: u64, ctx_valid_ptr: *mut u8);
 }
 
 /// Safe-ish wrapper that calls the assembly context switch.
@@ -97,8 +109,8 @@ extern "C" {
 /// # Safety
 /// Same requirements as `switch_context_asm`.
 #[inline(never)]
-pub unsafe fn switch_context(old_rsp_ptr: *mut u64, new_rsp: u64) {
-    switch_context_asm(old_rsp_ptr, new_rsp);
+pub unsafe fn switch_context(old_rsp_ptr: *mut u64, new_rsp: u64, ctx_valid_ptr: *mut u8) {
+    switch_context_asm(old_rsp_ptr, new_rsp, ctx_valid_ptr);
 }
 
 /// Initialize a new thread's kernel stack so that the first switch_context

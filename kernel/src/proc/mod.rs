@@ -14,7 +14,9 @@ extern crate alloc;
 pub mod ascension_elf;
 pub mod elf;
 pub mod hello_elf;
+pub mod hello_pe;
 pub mod orbit_elf;
+pub mod pe;
 pub mod thread;
 pub mod usermode;
 
@@ -68,7 +70,6 @@ pub struct CpuContext {
     pub rbx: u64,
     pub rbp: u64,
     pub rsp: u64,
-    pub rip: u64,
     pub rflags: u64,
     pub cr3: u64,
 }
@@ -77,7 +78,7 @@ impl Default for CpuContext {
     fn default() -> Self {
         Self {
             r15: 0, r14: 0, r13: 0, r12: 0,
-            rbx: 0, rbp: 0, rsp: 0, rip: 0,
+            rbx: 0, rbp: 0, rsp: 0,
             rflags: 0x202, // IF flag set
             cr3: 0,
         }
@@ -123,6 +124,28 @@ pub struct Thread {
     pub cpu_affinity: Option<u8>,
     /// Last CPU this thread ran on (for cache affinity).
     pub last_cpu: u8,
+    /// True until this thread has been scheduled for the first time.
+    /// schedule() skips the premature CR3 switch for first-run threads so
+    /// that user_mode_bootstrap() can correctly switch to the user CR3
+    /// after the initial context-switch lands on the kernel stack.
+    pub first_run: bool,
+    /// True when context.rsp holds a valid saved kernel RSP.
+    ///
+    /// Set to `false` in schedule() just before marking the thread Ready,
+    /// and set back to `true` inside switch_context_asm right after saving
+    /// the RSP.  Other CPUs' schedulers skip threads where this is `false`
+    /// to prevent using a stale kernel RSP before the owning CPU has
+    /// finished saving the new one (SMP context-switch race guard).
+    pub ctx_rsp_valid: core::sync::atomic::AtomicBool,
+}
+
+impl Thread {
+    /// True if this thread may be reaped (removed from THREAD_TABLE and its
+    /// kernel stack freed).  Excludes idle threads (tid=0) and AP idle threads
+    /// (tid < 0x1000 by convention) which are permanent fixtures.
+    pub fn is_reapable(&self) -> bool {
+        self.state == ThreadState::Dead && self.tid != 0 && self.tid < 0x1000
+    }
 }
 
 // ── Priority Constants (NT-style) ────────────────────────────────────
@@ -207,6 +230,8 @@ pub struct Process {
     pub token_id: Option<u64>,
     /// Path of the main executable (for /proc/self/exe via readlink).
     pub exe_path: Option<alloc::string::String>,
+    /// Per-process epoll instances.  Keyed by epfd.
+    pub epoll_sets: alloc::vec::Vec<crate::ipc::epoll::EpollInstance>,
 }
 
 /// Next PID counter.
@@ -233,7 +258,7 @@ const KERNEL_STACK_SIZE: u64 = (KERNEL_STACK_PAGES * 4096) as u64;
 /// allocated from PMM (physical addresses) but accessed via the higher-half
 /// map so they remain valid after CR3 switches to user page tables (which
 /// shallow-clone PML4[256-511] from the kernel).
-const KERNEL_VIRT_OFFSET: u64 = 0xFFFF_8000_0000_0000;
+pub const KERNEL_VIRT_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 
 /// Initialize the process manager.
 pub fn init() {
@@ -265,6 +290,7 @@ pub fn init() {
         subsystem: crate::win32::SubsystemType::Native,
         token_id: None,
         exe_path: None,
+        epoll_sets: alloc::vec::Vec::new(),
     };
 
     let idle_thread = Thread {
@@ -272,7 +298,6 @@ pub fn init() {
         pid: 0,
         state: ThreadState::Running,
         context: CpuContext {
-            rip: 0,
             rsp: 0,
             cr3: crate::mm::vmm::get_cr3(),
             ..CpuContext::default()
@@ -297,6 +322,8 @@ pub fn init() {
         // switch_context save), which would load RSP=0 and triple-fault.
         cpu_affinity: Some(0),
         last_cpu: 0,
+        first_run: false,
+        ctx_rsp_valid: core::sync::atomic::AtomicBool::new(true),
     };
 
     PROCESS_TABLE.lock().push(idle_proc);
@@ -306,11 +333,7 @@ pub fn init() {
     crate::serial_println!("[PROC] Process manager initialized (idle process PID 0, TID 0)");
 }
 
-/// Get the current CPU index (APIC ID) for per-CPU data access.
-#[inline(always)]
-fn cpu_index() -> usize {
-    crate::arch::x86_64::apic::current_apic_id() as usize
-}
+use crate::arch::x86_64::apic::cpu_index;
 
 /// Get the currently running thread's TID (per-CPU).
 pub fn current_tid() -> Tid {
@@ -327,6 +350,53 @@ pub fn current_pid() -> Pid {
     let tid = current_tid();
     let threads = THREAD_TABLE.lock();
     threads.iter().find(|t| t.tid == tid).map(|t| t.pid).unwrap_or(0)
+}
+
+/// Recover the current TID even when `PER_CPU_CURRENT_TID` is transiently 0.
+///
+/// `PER_CPU_CURRENT_TID[cpu]` can be 0 when the timer ISR preempts the idle
+/// thread's brief window between calling `set_current_tid(new_tid)` and the
+/// new thread's first instruction.  In that window, kernel-mode faults and
+/// syscalls see tid=0 (idle) even though the kernel stack belongs to a real
+/// user thread.  This slow-path fallback matches the kernel stack top
+/// (`get_current_kernel_rsp()`) against every thread's stack range to find
+/// the true owner.
+pub fn recover_current_tid() -> Tid {
+    let tid = current_tid();
+    if tid != 0 { return tid; }
+    let kstack_top = crate::syscall::get_current_kernel_rsp();
+    if kstack_top == 0 { return 0; }
+    let threads = THREAD_TABLE.lock();
+    threads.iter()
+        .find(|t| {
+            t.tid != 0
+                && t.kernel_stack_base > 0
+                && t.kernel_stack_base + t.kernel_stack_size == kstack_top
+        })
+        .map(|t| t.tid)
+        .unwrap_or(0)
+}
+
+/// Like `current_pid()` but uses `recover_current_tid()` to handle the
+/// transient tid=0 race condition.  Single THREAD_TABLE lock for the slow path.
+pub fn recover_current_pid() -> Pid {
+    let fast_tid = current_tid();
+    if fast_tid != 0 {
+        let threads = THREAD_TABLE.lock();
+        return threads.iter().find(|t| t.tid == fast_tid).map(|t| t.pid).unwrap_or(0);
+    }
+    // Slow path: need to match by kernel stack top — do tid+pid in one pass
+    let kstack_top = crate::syscall::get_current_kernel_rsp();
+    if kstack_top == 0 { return 0; }
+    let threads = THREAD_TABLE.lock();
+    threads.iter()
+        .find(|t| {
+            t.tid != 0
+                && t.kernel_stack_base > 0
+                && t.kernel_stack_base + t.kernel_stack_size == kstack_top
+        })
+        .map(|t| t.pid)
+        .unwrap_or(0)
 }
 
 /// Create a new kernel process with a single thread.
@@ -357,7 +427,6 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
     let initial_rsp = thread::init_thread_stack(stack_top, entry_point);
 
     let context = CpuContext {
-        rip: 0, // Not used directly — switch_context uses RSP-based return
         rsp: initial_rsp,
         rbp: 0,
         rbx: entry_point,
@@ -402,9 +471,10 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
         signal_state: None,
         linux_abi: false,
         handle_table: Some(crate::ob::handle::HandleTable::new()),
-        subsystem: crate::win32::SubsystemType::Posix,
+        subsystem: crate::win32::SubsystemType::Aether,
         token_id: None,
         exe_path: None,
+        epoll_sets: alloc::vec::Vec::new(),
     };
 
     let thread = Thread {
@@ -425,6 +495,8 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
         tls_base: 0,
         cpu_affinity: None,
         last_cpu: 0,
+        first_run: false,
+        ctx_rsp_valid: core::sync::atomic::AtomicBool::new(true),
     };
 
     PROCESS_TABLE.lock().push(process);
@@ -450,7 +522,6 @@ pub fn create_thread(pid: Pid, name: &str, entry_point: u64) -> Option<Tid> {
     let initial_rsp = thread::init_thread_stack(stack_top, entry_point);
 
     let context = CpuContext {
-        rip: 0,
         rsp: initial_rsp,
         rbp: 0,
         rbx: entry_point,
@@ -482,6 +553,8 @@ pub fn create_thread(pid: Pid, name: &str, entry_point: u64) -> Option<Tid> {
         tls_base: 0,
         cpu_affinity: None,
         last_cpu: 0,
+        first_run: false,
+        ctx_rsp_valid: core::sync::atomic::AtomicBool::new(true),
     };
 
     THREAD_TABLE.lock().push(thread);
@@ -512,7 +585,6 @@ pub fn create_thread_blocked(pid: Pid, name: &str, entry_point: u64) -> Option<T
     let initial_rsp = thread::init_thread_stack(stack_top, entry_point);
 
     let context = CpuContext {
-        rip: 0,
         rsp: initial_rsp,
         rbp: 0,
         rbx: entry_point,
@@ -544,6 +616,8 @@ pub fn create_thread_blocked(pid: Pid, name: &str, entry_point: u64) -> Option<T
         tls_base: 0,
         cpu_affinity: None,
         last_cpu: 0,
+        first_run: false,
+        ctx_rsp_valid: core::sync::atomic::AtomicBool::new(true),
     };
 
     THREAD_TABLE.lock().push(thread);
@@ -555,22 +629,22 @@ pub fn create_thread_blocked(pid: Pid, name: &str, entry_point: u64) -> Option<T
     Some(tid)
 }
 pub fn exit_thread(exit_code: i64) {
-    let tid = current_tid();
+    let tid = recover_current_tid();
     let pid;
     let parent_pid;
 
+    // Do NOT mark this thread Dead yet — see exit_group() for the reasoning.
+    // We get our PID here but defer the Dead transition until after all cleanup.
     {
-        let mut threads = THREAD_TABLE.lock();
-        if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
-            t.state = ThreadState::Dead;
-            t.exit_code = exit_code;
+        let threads = THREAD_TABLE.lock();
+        if let Some(t) = threads.iter().find(|t| t.tid == tid) {
             pid = t.pid;
         } else {
             return;
         }
     }
 
-    // Check if all threads in the process are dead.
+    // Check if all OTHER threads in the process are dead.
     // IMPORTANT: Never hold THREAD_TABLE and PROCESS_TABLE simultaneously —
     // other code paths (test runner, scheduler) may acquire them in the
     // opposite order, causing an ABBA deadlock on SMP.
@@ -578,19 +652,19 @@ pub fn exit_thread(exit_code: i64) {
     // Step 1: Get thread TID list + parent_pid from PROCESS_TABLE only.
     let (thread_tids, ppid) = {
         let procs = PROCESS_TABLE.lock();
-        let tids = procs.iter().find(|p| p.pid == pid)
-            .map(|p| p.threads.clone())
+        let (tids, pp) = procs.iter().find(|p| p.pid == pid)
+            .map(|p| (p.threads.clone(), p.parent_pid))
             .unwrap_or_default();
-        let pp = procs.iter().find(|p| p.pid == pid)
-            .map(|p| p.parent_pid).unwrap_or(0);
         (tids, pp)
     };
     parent_pid = ppid;
 
     // Step 2: Check thread states from THREAD_TABLE only.
+    // Count us as Dead even though we haven't set the flag yet — we ARE exiting.
     let all_dead = {
         let threads = THREAD_TABLE.lock();
         thread_tids.iter().all(|&t| {
+            if t == tid { return true; } // caller is exiting — treat as dead
             threads.iter().find(|th| th.tid == t)
                 .map(|th| th.state == ThreadState::Dead)
                 .unwrap_or(true)
@@ -606,7 +680,23 @@ pub fn exit_thread(exit_code: i64) {
         }
     }
 
-    // Wake parent threads that are Blocked (waiting in waitpid).
+    // Free user memory now that the process is Zombie.  No locks held here.
+    if all_dead {
+        // Switch to the kernel page tables BEFORE freeing user page tables.
+        // This closes the race where another CPU allocates+zeroes the freed
+        // user PML4 physical page before the scheduler switches this CPU's
+        // CR3, which would triple-fault on the next interrupt.
+        let kc3 = crate::mm::vmm::get_kernel_cr3();
+        let cur = crate::mm::vmm::get_cr3();
+        if kc3 != 0 && cur != kc3 {
+            unsafe { crate::mm::vmm::switch_cr3(kc3); }
+        }
+        free_process_memory(pid);
+    }
+
+    // Wake parent threads waiting in waitpid, and mark current thread Dead.
+    // Both ops are THREAD_TABLE-only with no PROCESS_TABLE access between them,
+    // so one lock acquisition covers both.
     {
         let mut threads = THREAD_TABLE.lock();
         for t in threads.iter_mut() {
@@ -615,20 +705,149 @@ pub fn exit_thread(exit_code: i64) {
                 t.state = ThreadState::Ready;
             }
         }
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+            t.state = ThreadState::Dead;
+            t.exit_code = exit_code;
+            // Signal that the CPU is about to leave this thread's kernel stack.
+            // switch_context_asm will set ctx_rsp_valid=true after saving RSP,
+            // which is the AP's cue that the stack is safe to free.  Without
+            // this, the AP can race to free the stack while BSP is still on it.
+            t.ctx_rsp_valid.store(false, core::sync::atomic::Ordering::Release);
+        }
+    }
+
+    // Deliver SIGCHLD to parent (no locks held).
+    if all_dead && parent_pid != 0 {
+        let _ = crate::signal::kill(parent_pid, crate::signal::SIGCHLD);
     }
 
     // Yield to scheduler — we're dead, should never return.
     crate::sched::schedule();
 }
 
+/// Free all physical memory owned by a process (user page frames + page tables).
+///
+/// Walks the process's VmSpace VMAs, decrements refcounts of all present anonymous
+/// pages, and frees any whose refcount reaches zero.  Also frees the private
+/// user-half page table structures (PT → PD → PDPT → PML4).
+///
+/// Call after marking the process Zombie and after all threads are Dead, but
+/// before removing the process from PROCESS_TABLE.  Safe to call from the
+/// exiting thread's kernel stack since the scheduler will not reschedule any
+/// Dead thread.
+pub fn free_process_memory(pid: Pid) {
+    use crate::mm::{refcount, pmm, vmm};
+    use crate::mm::vma::VmBacking;
+
+    // Take the VmSpace out of the Process.  Setting cr3=0 prevents the scheduler
+    // from accidentally switching to the freed PML4.
+    let vm_space = {
+        let mut procs = PROCESS_TABLE.lock();
+        if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
+            proc.cr3 = 0;
+            proc.vm_space.take()
+        } else {
+            return;
+        }
+    };
+
+    let vm_space = match vm_space {
+        Some(vs) => vs,
+        None => return, // Kernel process or already freed
+    };
+
+    let cr3 = vm_space.cr3;
+
+    // Walk all VMAs and free physical frames (anonymous pages only).
+    // File-backed pages are managed by the page cache; device pages are MMIO.
+    const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+    const PAGE_PRESENT: u64 = 1;
+
+    for vma in &vm_space.areas {
+        match &vma.backing {
+            VmBacking::File { .. } | VmBacking::Device { .. } => continue,
+            VmBacking::Anonymous => {}
+        }
+        let mut addr = vma.base;
+        while addr < vma.base + vma.length {
+            let pte = vmm::read_pte(cr3, addr);
+            if pte & PAGE_PRESENT != 0 {
+                let phys = pte & ADDR_MASK;
+                if refcount::page_ref_dec(phys) == 0 {
+                    pmm::free_page(phys);
+                }
+            }
+            addr += 0x1000;
+        }
+    }
+
+    // Free the private user-half page table structures.
+    free_user_page_tables(cr3);
+
+    crate::serial_println!("[PROC] PID {} memory freed", pid);
+}
+
+/// Free all page table structs in the user-half (PML4[0..256]) of the given
+/// PML4 physical address, then free the PML4 page itself.
+///
+/// Only touches PML4 entries 0-255 (user space).  Entries 256-511 are
+/// shallow copies of the kernel half and must not be freed.
+///
+/// # Safety
+/// `cr3` must be a valid PML4 physical address reachable via the identity map.
+/// All user page *frames* must already have been freed/unmapped before calling.
+fn free_user_page_tables(cr3: u64) {
+    use crate::mm::pmm;
+    const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+    const PAGE_PRESENT: u64 = 1;
+    const PAGE_HUGE: u64 = 0x80;
+
+    unsafe {
+        let pml4 = cr3 as *const u64;
+        for i in 0..256usize {
+            let pml4e = core::ptr::read_volatile(pml4.add(i));
+            if pml4e & PAGE_PRESENT == 0 { continue; }
+            let pdpt_phys = pml4e & ADDR_MASK;
+            let pdpt = pdpt_phys as *const u64;
+            for j in 0..512usize {
+                let pdpte = core::ptr::read_volatile(pdpt.add(j));
+                if pdpte & PAGE_PRESENT == 0 { continue; }
+                if pdpte & PAGE_HUGE != 0 { continue; } // 1 GiB huge page — skip
+                let pd_phys = pdpte & ADDR_MASK;
+                let pd = pd_phys as *const u64;
+                for k in 0..512usize {
+                    let pde = core::ptr::read_volatile(pd.add(k));
+                    if pde & PAGE_PRESENT == 0 { continue; }
+                    if pde & PAGE_HUGE != 0 { continue; } // 2 MiB huge page — skip
+                    let pt_phys = pde & ADDR_MASK;
+                    pmm::free_page(pt_phys);
+                }
+                pmm::free_page(pd_phys);
+            }
+            pmm::free_page(pdpt_phys);
+        }
+        pmm::free_page(cr3);
+    }
+}
+
 /// exit_group(status) — Linux semantics: terminate ALL threads in the process,
 /// then mark the process as Zombie.  Called by the exit_group(231) syscall.
 pub fn exit_group(exit_code: i64) {
-    let tid = current_tid();
+    let tid = recover_current_tid();
     let pid;
     let parent_pid;
 
-    // Kill every thread in the process (including the caller).
+    // Kill every OTHER thread in the process immediately, but NOT the caller.
+    //
+    // CRITICAL: interrupts are re-enabled in syscall_entry before dispatch() is
+    // called (STI at step 3).  If the calling thread marks ITSELF as Dead here,
+    // a timer interrupt can preempt it mid-cleanup (before Zombie is set).
+    // The scheduler then sees a Dead thread and never reschedules it, so the
+    // Zombie transition never completes and the parent waits forever.
+    //
+    // By keeping the caller in its current state (Running → Ready on preemption),
+    // if preempted it will be rescheduled and finish the Zombie/parent-wake steps.
+    // We mark the caller Dead last, just before calling schedule().
     {
         let mut threads = THREAD_TABLE.lock();
         let my_thread = threads.iter().find(|t| t.tid == tid);
@@ -637,10 +856,33 @@ pub fn exit_group(exit_code: i64) {
             None => { crate::sched::schedule(); return; }
         };
         for t in threads.iter_mut() {
-            if t.pid == pid && t.state != ThreadState::Dead {
+            if t.pid == pid && t.tid != tid && t.state != ThreadState::Dead {
                 t.state = ThreadState::Dead;
                 t.exit_code = exit_code;
             }
+        }
+    }
+
+    // Close pipe fds before marking Zombie so readers see EOF promptly.
+    // Iterate a snapshot of (pipe_id, is_write) to avoid holding PROCESS_TABLE
+    // while calling into PIPE_TABLE (lock ordering: PIPE_TABLE before PROCESS_TABLE).
+    let pipe_ends: alloc::vec::Vec<(u64, bool)> = {
+        let procs = PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid)
+            .map(|p| p.file_descriptors.iter()
+                .filter_map(|f| f.as_ref())
+                .filter(|f| f.file_type == crate::vfs::FileType::Pipe
+                         && f.mount_idx == usize::MAX
+                         && f.flags & 0x8000_0000 != 0)
+                .map(|f| (f.inode, f.flags & 1 == 1))
+                .collect())
+            .unwrap_or_default()
+    };
+    for (pipe_id, is_write) in pipe_ends {
+        if is_write {
+            crate::ipc::pipe::pipe_close_writer(pipe_id);
+        } else {
+            crate::ipc::pipe::pipe_close_reader(pipe_id);
         }
     }
 
@@ -654,7 +896,20 @@ pub fn exit_group(exit_code: i64) {
         }
     }
 
-    // Wake parent threads blocked in waitpid.
+    // Switch to the kernel page tables BEFORE freeing user page tables.
+    // Same race as in exit_thread: another CPU can allocate+zero the freed
+    // user PML4 page before the scheduler switches this CPU's CR3.
+    {
+        let kc3 = crate::mm::vmm::get_kernel_cr3();
+        let cur = crate::mm::vmm::get_cr3();
+        if kc3 != 0 && cur != kc3 {
+            unsafe { crate::mm::vmm::switch_cr3(kc3); }
+        }
+    }
+    // Free user memory (no locks held).
+    free_process_memory(pid);
+
+    // Wake parent threads blocked in waitpid, and mark calling thread Dead.
     {
         let mut threads = THREAD_TABLE.lock();
         for t in threads.iter_mut() {
@@ -662,6 +917,19 @@ pub fn exit_group(exit_code: i64) {
                 t.state = ThreadState::Ready;
             }
         }
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+            t.state = ThreadState::Dead;
+            t.exit_code = exit_code;
+            // Signal that the CPU is about to leave this thread's kernel stack.
+            // switch_context_asm will set ctx_rsp_valid=true after saving RSP,
+            // which is the AP's cue that the stack is safe to free.
+            t.ctx_rsp_valid.store(false, core::sync::atomic::Ordering::Release);
+        }
+    }
+
+    // Deliver SIGCHLD to parent (no locks held).
+    if parent_pid != 0 {
+        let _ = crate::signal::kill(parent_pid, crate::signal::SIGCHLD);
     }
 
     // Yield — we're dead and should never return.
@@ -728,7 +996,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid) -> Option<Pid> {
     let stack_top = stack_base + KERNEL_STACK_SIZE;
 
     // Copy parent's file descriptors, CWD, and security credentials.
-    let (fds, cwd, parent_name, parent_uid, parent_gid, parent_euid, parent_egid, parent_groups, parent_umask, parent_linux_abi, parent_token_id) = {
+    let (fds, cwd, parent_name, parent_uid, parent_gid, parent_euid, parent_egid, parent_groups, parent_umask, parent_linux_abi, parent_subsystem, parent_token_id) = {
         let procs = PROCESS_TABLE.lock();
         let parent = procs.iter().find(|p| p.pid == parent_pid)?;
         (
@@ -742,6 +1010,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid) -> Option<Pid> {
             parent.supplementary_groups.clone(),
             parent.umask,
             parent.linux_abi,
+            parent.subsystem,
             parent.token_id,
         )
     };
@@ -795,7 +1064,6 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid) -> Option<Pid> {
     let initial_rsp = thread::init_thread_stack(stack_top, fork_child_entry as *const () as u64);
 
     let context = CpuContext {
-        rip: 0,
         rsp: initial_rsp,
         rbp: 0,
         rbx: fork_child_entry as *const () as u64,
@@ -833,9 +1101,10 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid) -> Option<Pid> {
         signal_state: Some(crate::signal::SignalState::new()),
         linux_abi: parent_linux_abi,
         handle_table: Some(crate::ob::handle::HandleTable::new()),
-        subsystem: crate::win32::SubsystemType::Posix,
+        subsystem: parent_subsystem,
         token_id: parent_token_id,
         exe_path: None,
+        epoll_sets: alloc::vec::Vec::new(),
     };
 
     let child_thread = Thread {
@@ -856,6 +1125,8 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid) -> Option<Pid> {
         tls_base: 0,
         cpu_affinity: None,
         last_cpu: 0,
+        first_run: false,
+        ctx_rsp_valid: core::sync::atomic::AtomicBool::new(true),
     };
 
     PROCESS_TABLE.lock().push(child_proc);
@@ -929,6 +1200,41 @@ fn fork_child_entry() {
             rip_val = in(reg) entry_rip,
             options(noreturn),
         );
+    }
+}
+
+/// Redirect a newly-spawned process's stdout (fd=1) and stderr (fd=2) to
+/// the write-end of an anonymous pipe.  Call this immediately after
+/// `create_user_process_with_args` returns, before the first scheduler tick
+/// lets the child run.
+///
+/// The caller owns the pipe's read-end and must close it when done
+/// (via `crate::ipc::pipe::pipe_close_reader`).
+pub fn attach_stdout_pipe(pid: Pid, pipe_id: u64) {
+    let write_fd = crate::vfs::FileDescriptor::pipe_write_end(pipe_id);
+    // Also increment writers count so the pipe stays alive while both
+    // fd=1 and fd=2 hold a reference.
+    crate::ipc::pipe::pipe_add_writer(pipe_id);
+
+    let mut procs = PROCESS_TABLE.lock();
+    if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
+        while proc.file_descriptors.len() <= 2 {
+            proc.file_descriptors.push(None);
+        }
+        proc.file_descriptors[1] = Some(write_fd.clone());
+        proc.file_descriptors[2] = Some(write_fd);
+    }
+}
+
+/// Mark the initial thread of a process as Ready so the scheduler can run it.
+///
+/// Used together with `create_kernel_process_suspended` (or
+/// `create_user_process_with_args_blocked`) to allow the caller to perform
+/// setup (e.g. attaching pipe fds) before the thread can be scheduled.
+pub fn unblock_process(pid: Pid) {
+    let mut threads = THREAD_TABLE.lock();
+    if let Some(t) = threads.iter_mut().find(|t| t.pid == pid && t.state == ThreadState::Blocked) {
+        t.state = ThreadState::Ready;
     }
 }
 
@@ -1110,11 +1416,7 @@ pub fn reap_dead_threads() -> usize {
 
     // Collect indices of dead threads to remove (skip idle threads).
     let dead_indices: Vec<usize> = threads.iter().enumerate()
-        .filter(|(_, t)| {
-            t.state == ThreadState::Dead
-                && t.tid != 0           // never reap idle
-                && t.tid < 0x1000       // never reap AP idle threads
-        })
+        .filter(|(_, t)| t.is_reapable())
         .map(|(i, _)| i)
         .collect();
 

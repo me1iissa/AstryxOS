@@ -54,31 +54,7 @@ static APIC_ENABLED: AtomicBool = AtomicBool::new(false);
 /// AP started flags.
 static AP_STARTED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 
-/// Read MSR.
-unsafe fn rdmsr(msr: u32) -> u64 {
-    let (lo, hi): (u32, u32);
-    core::arch::asm!(
-        "rdmsr",
-        in("ecx") msr,
-        out("eax") lo,
-        out("edx") hi,
-        options(nomem, nostack)
-    );
-    ((hi as u64) << 32) | (lo as u64)
-}
-
-/// Write MSR.
-unsafe fn wrmsr(msr: u32, val: u64) {
-    let lo = val as u32;
-    let hi = (val >> 32) as u32;
-    core::arch::asm!(
-        "wrmsr",
-        in("ecx") msr,
-        in("eax") lo,
-        in("edx") hi,
-        options(nomem, nostack)
-    );
-}
+use crate::hal::{rdmsr, wrmsr};
 
 /// Check if APIC is available via CPUID.
 fn has_apic() -> bool {
@@ -327,12 +303,31 @@ pub fn cpu_count() -> u32 {
     CPU_COUNT.load(Ordering::Relaxed)
 }
 
-/// Get the current CPU's APIC ID.
+/// Get the current CPU's logical index.
+///
+/// Reads `IA32_TSC_AUX` (MSR 0xC0000103), which is initialised to the CPU's
+/// APIC ID by `crate::syscall::set_per_cpu_id()` during CPU startup.  Using
+/// an MSR avoids any page-table dependency, so this function works correctly
+/// even after a user-process CR3 switch (unlike the previous LAPIC MMIO read,
+/// which could return 0 when the LAPIC identity mapping was not present in the
+/// active user page table).
+///
+/// # Initialisation contract
+/// `crate::syscall::set_per_cpu_id(apic_id)` MUST be called on every CPU
+/// before any call to `cpu_index()` or `current_tid()`.  For the BSP this
+/// happens inside `crate::syscall::init()`; for each AP it happens at the
+/// very top of `ap_rust_entry()` using the LAPIC-read APIC ID.
 pub fn current_apic_id() -> u8 {
-    if !is_enabled() {
-        return 0;
-    }
-    (lapic_read(LAPIC_ID) >> 24) as u8
+    // IA32_TSC_AUX (MSR 0xC000_0103) holds the APIC ID written at init.
+    unsafe { rdmsr(0xC000_0103) as u8 }
+}
+
+/// Get the current CPU index, bounded to `[0, MAX_CPUS)`.
+/// Use this instead of `current_apic_id() as usize` at every call site.
+#[inline(always)]
+pub fn cpu_index() -> usize {
+    let id = current_apic_id() as usize;
+    if id >= MAX_CPUS { 0 } else { id }
 }
 
 /// Send an IPI (Inter-Processor Interrupt) to a specific APIC ID.
@@ -463,7 +458,13 @@ pub fn start_aps() {
                 continue;
             }
         };
-        let ap_stack_top = ap_stack + 16384; // stack grows downward
+        // Convert physical stack top to kernel virtual so the AP's RSP lives in
+        // the higher-half (accessible even when user CR3 is active via PML4[256]).
+        // Using a physical address here would be fine while the kernel CR3 is
+        // active (identity map), but the first context-switch saves RSP into the
+        // thread's context.rsp — that physical value could be re-mapped by a user
+        // process page table if PMM later hands out the same physical page.
+        let ap_stack_top = ap_stack + 16384 + crate::proc::KERNEL_VIRT_OFFSET;
 
         // Write AP stack pointer and APIC ID into the data area
         unsafe {
@@ -814,9 +815,18 @@ pub extern "C" fn ap_rust_entry() -> ! {
         wrmsr(IA32_APIC_BASE_MSR, apic_base_msr | (1 << 11));
     }
 
-    // Load the AP's own TSS so that Ring 3 → Ring 0 interrupt stack switches
-    // use TSS_AP.rsp[0] instead of the BSP's TSS_BSP.rsp[0].
+    // Initialise this AP's per-CPU ID FIRST — before any call to cpu_index()
+    // or current_apic_id().  set_per_cpu_id writes apic_id to IA32_TSC_AUX so
+    // that current_apic_id() returns the correct per-CPU value from rdmsr.
+    // apic_id was read from the LAPIC MMIO above while the kernel CR3 is still
+    // active, so it is guaranteed to be correct.
+    // MUST be before init_ap_tss() which calls current_apic_id() internally.
+    crate::syscall::set_per_cpu_id(apic_id);
+
+    // Load the AP's own per-CPU TSS so that Ring 3 → Ring 0 interrupt stack
+    // switches use this AP's dedicated rsp[0] instead of sharing with other APs.
     // This must happen before we enable interrupts or enter Ring 3.
+    // current_apic_id() now returns the correct apic_id (set above).
     unsafe { crate::arch::x86_64::gdt::init_ap_tss(); }
 
     // Set SVR (enable APIC + spurious vector 0xFF)
@@ -838,7 +848,17 @@ pub extern "C" fn ap_rust_entry() -> ! {
             tid: ap_idle_tid,
             pid: 0, // Part of the idle process
             state: ThreadState::Running,
-            context: CpuContext::default(),
+            context: CpuContext {
+                // Store the kernel CR3 so schedule() switches back to kernel
+                // page tables when this idle thread is selected, rather than
+                // leaving a stale (and potentially freed) user process CR3.
+                cr3: crate::mm::vmm::get_cr3(),
+                ..CpuContext::default()
+            },
+            // kernel_stack_base = 0: AP idle thread is never reaped (is_reapable() returns
+            // false for tid >= 0x1000), and setting a non-zero base would cause
+            // set_kernel_rsp(ap_stack_top) when this thread is scheduled, corrupting
+            // the SYSCALL kernel RSP for subsequent user threads on this CPU.
             kernel_stack_base: 0,
             kernel_stack_size: 0,
             wake_tick: 0,
@@ -862,6 +882,8 @@ pub extern "C" fn ap_rust_entry() -> ! {
             // other CPU stealing them would load RSP=0 and triple-fault.
             cpu_affinity: Some(apic_id),
             last_cpu: 0,
+            first_run: false,
+            ctx_rsp_valid: core::sync::atomic::AtomicBool::new(true),
         };
         THREAD_TABLE.lock().push(ap_thread);
     }
@@ -884,12 +906,15 @@ pub extern "C" fn ap_rust_entry() -> ! {
     crate::syscall::init_ap();
 
     // Enable interrupts and enter scheduling loop.
-    // The timer interrupt will call timer_tick_schedule() → check_reschedule() → schedule()
-    // just like on the BSP, allowing this AP to pick up ready threads.
+    // After each timer interrupt wakes this AP from HLT, check if a reschedule
+    // is needed and switch to any ready thread.  check_reschedule() is safe
+    // here because the idle thread holds no locks.
     unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
 
     loop {
-        // HLT until next timer interrupt, then the ISR will drive scheduling.
+        // HLT until next timer interrupt.
         unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+        // Check for pending reschedule after being woken by the timer ISR.
+        crate::sched::check_reschedule();
     }
 }

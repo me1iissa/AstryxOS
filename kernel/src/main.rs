@@ -28,6 +28,7 @@ mod ke;
 mod lpc;
 mod mm;
 mod net;
+mod nt;
 mod ob;
 mod perf;
 mod po;
@@ -45,6 +46,9 @@ mod msg;
 mod vfs;
 mod wm;
 mod win32;
+mod subsys;
+mod x11;
+mod init;
 
 use astryx_shared::{BootInfo, BOOT_INFO_MAGIC};
 
@@ -275,9 +279,20 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
         serial_println!("[Aether] Phase 13: Userspace processes launched.");
 
+        // Phase 10g: X11 server (Xastryx) — in-kernel display server.
+        // Must be initialised after net::init() (AF_UNIX sockets) and GUI.
+        serial_println!("[Aether] Phase 10g: X11 server init...");
+        x11::init();
+        serial_println!("[Aether] Phase 10g: X11 OK — listening on /tmp/.X11-unix/X0");
+
+        // Phase 11: Ascension init — launch registered services from
+        // /etc/ascension.conf, then hand off to the interactive shell.
+        serial_println!("[Aether] Phase 11: Ascension init...");
+        init::boot();
+        serial_println!("[Aether] Phase 11: Ascension init complete.");
+
         // Drop to the kernel shell for interactive debugging/management.
-        // In the future, the kernel shell may be removed once Orbit is fully
-        // interactive and can be reached via serial/console.
+        // Ascension will eventually replace this with a full user-mode init.
         shell::launch()
     }
 }

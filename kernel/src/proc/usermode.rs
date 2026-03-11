@@ -65,14 +65,52 @@ pub fn create_user_thread(
 ///
 /// Returns the PID on success.
 pub fn create_user_process(name: &str, elf_data: &[u8]) -> Result<proc::Pid, elf::ElfError> {
+    create_user_process_with_args(name, elf_data, &[name], &["HOME=/", "PATH=/bin:/disk/bin"])
+}
+
+/// Like `create_user_process` but passes explicit `argv` and `envp` to the
+/// new process's initial stack (System V AMD64 ABI layout).
+///
+/// The thread is immediately marked Ready so the scheduler can run it.
+pub fn create_user_process_with_args(
+    name: &str,
+    elf_data: &[u8],
+    argv: &[&str],
+    envp: &[&str],
+) -> Result<proc::Pid, elf::ElfError> {
+    create_user_process_impl(name, elf_data, argv, envp, true)
+}
+
+/// Like `create_user_process_with_args` but leaves the initial thread
+/// in `Blocked` state so the caller can perform setup (e.g. attaching pipe
+/// fds) before the process can be scheduled.
+///
+/// Call `proc::unblock_process(pid)` when ready to allow scheduling.
+pub fn create_user_process_with_args_blocked(
+    name: &str,
+    elf_data: &[u8],
+    argv: &[&str],
+    envp: &[&str],
+) -> Result<proc::Pid, elf::ElfError> {
+    create_user_process_impl(name, elf_data, argv, envp, false)
+}
+
+fn create_user_process_impl(
+    name: &str,
+    elf_data: &[u8],
+    argv: &[&str],
+    envp: &[&str],
+    start_ready: bool,
+) -> Result<proc::Pid, elf::ElfError> {
     crate::serial_println!("[USER] Loading ELF binary '{}' ({} bytes)", name, elf_data.len());
 
     // Create a fresh user address space with its own PML4.
     let mut vm_space = crate::mm::vma::VmSpace::new_user()
         .ok_or(elf::ElfError::OutOfMemory)?;
 
-    // Load ELF into the new page table.
-    let result = elf::load_elf(elf_data, vm_space.cr3)?;
+
+    // Load ELF into the new page table with the provided argv/envp.
+    let result = elf::load_elf_with_args(elf_data, vm_space.cr3, argv, envp)?;
 
     crate::serial_println!(
         "[USER] ELF loaded: entry={:#x}, stack={:#x}, range={:#x}-{:#x}, {} pages, {} VMAs",
@@ -98,29 +136,49 @@ pub fn create_user_process(name: &str, elf_data: &[u8]) -> Result<proc::Pid, elf
     let pid = proc::create_kernel_process_suspended(name, user_mode_bootstrap as *const () as u64);
 
     // Patch the process with our per-process page table and exe path.
+    // Set linux_abi HERE (before the thread is marked Ready) to eliminate
+    // the race where the AP schedules the thread before the caller can set it.
     {
         let mut procs = PROCESS_TABLE.lock();
         if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
             p.cr3 = user_cr3;
             p.vm_space = Some(vm_space);
             p.exe_path = Some(alloc::string::String::from(name));
+            p.linux_abi = true;
+            p.subsystem = crate::win32::SubsystemType::Linux;
         }
     }
 
-    // Patch the thread's user-mode entry info and CR3, then mark it Ready.
+    // Patch the thread's user-mode entry info and CR3.
+    // Mark Ready only if start_ready — callers that need post-spawn setup
+    // (e.g. pipe attachment) pass false and call unblock_process() later.
     {
         let mut threads = THREAD_TABLE.lock();
         if let Some(t) = threads.iter_mut().find(|t| t.pid == pid) {
             t.user_entry_rip = entry_rip;
             t.user_entry_rsp = entry_rsp;
             t.context.cr3 = user_cr3;
-            t.state = proc::ThreadState::Ready;  // now safe to schedule
+            // Set initial FS.base from PT_TLS (0 = no TLS segment).
+            if result.tls_base != 0 {
+                t.tls_base = result.tls_base;
+            }
+            // Mark first_run so schedule() withholds the CR3 switch until
+            // user_mode_bootstrap() explicitly switches to the user CR3.
+            // Without this, schedule() switches CR3 before switch_context,
+            // but the new kernel stack may not be mapped in the user PML4.
+            t.first_run = true;
+            if start_ready {
+                t.state = proc::ThreadState::Ready;
+            }
+            // else: remains Blocked — caller owns the Ready transition
         }
     }
 
     crate::serial_println!(
-        "[USER] Process '{}' PID {} ready for Ring 3 (cr3={:#x}, {} physical pages)",
-        name, pid, user_cr3, result.allocated_pages.len()
+        "[USER] Process '{}' PID {} {} (cr3={:#x}, {} physical pages)",
+        name, pid,
+        if start_ready { "ready for Ring 3" } else { "suspended (blocked)" },
+        user_cr3, result.allocated_pages.len()
     );
 
     Ok(pid)
@@ -135,6 +193,20 @@ pub fn create_user_process(name: &str, elf_data: &[u8]) -> Result<proc::Pid, elf
 /// 3. Configures TSS.rsp[0] and SYSCALL_KERNEL_RSP for Ring 3 → Ring 0 transitions.
 /// 4. Performs IRETQ to enter Ring 3.
 fn user_mode_bootstrap() {
+    crate::serial_println!("[BOOT] tid={} entering bootstrap", crate::proc::current_tid());
+
+    // Clear first_run immediately so that if this thread is ever re-scheduled
+    // (after returning from user mode via a future syscall exit path), schedule()
+    // will correctly switch CR3 for it. This also pairs with the first_run guard
+    // in schedule() that skipped the premature CR3 switch on our first dispatch.
+    {
+        let tid = proc::current_tid();
+        let mut threads = THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+            t.first_run = false;
+        }
+    }
+
     let (entry_rip, entry_rsp, kernel_stack_top, user_cr3, tls_base) = {
         let tid = proc::current_tid();
         let threads = THREAD_TABLE.lock();

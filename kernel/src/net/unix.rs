@@ -15,7 +15,8 @@ const MAX_UNIX_SOCKETS: usize = 64;
 /// Maximum path length for AF_UNIX addresses (Linux: 108 bytes).
 const UNIX_PATH_MAX: usize = 108;
 /// Receive buffer per socket (bytes — ring buffer).
-const RECV_BUF_CAP: usize = 4096;
+/// Sized at 32 KiB to support X11 PutImage payloads (small-medium windows).
+const RECV_BUF_CAP: usize = 32768;
 /// Maximum number of pending connections in a listen backlog.
 const BACKLOG_CAP: usize = 8;
 

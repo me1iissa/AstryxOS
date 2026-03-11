@@ -18,3 +18,5 @@ panic = "abort"
 panic = "abort"
 opt-level = 2
 lto = true
+debug = 2
+strip = "none"

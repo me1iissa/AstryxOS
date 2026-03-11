@@ -146,17 +146,22 @@ pub fn launch_desktop() {
     crate::msg::queue::create_queue(calculator);
     *CALCULATOR_HANDLE.lock() = Some(calculator);
 
-    // (h) Set focus order (last created = front)
+    // (h) Set focus order (last = frontmost and active).
+    // Terminal is last so it has keyboard focus by default.
     crate::wm::set_active_window(file_explorer);
     crate::wm::zorder::bring_to_front(file_explorer);
     crate::wm::set_active_window(editor);
     crate::wm::zorder::bring_to_front(editor);
     crate::wm::set_active_window(calculator);
     crate::wm::zorder::bring_to_front(calculator);
-    crate::wm::set_active_window(terminal);
-    crate::wm::zorder::bring_to_front(terminal);
     crate::wm::set_active_window(settings);
     crate::wm::zorder::bring_to_front(settings);
+    crate::wm::set_active_window(terminal);
+    crate::wm::zorder::bring_to_front(terminal);
+
+    // Place the mouse cursor inside the terminal window so the first click lands.
+    // Terminal is at (300, 200) size 500×350; centre = (550, 375).
+    crate::drivers::mouse::warp(550, 375);
 
     // (i) Render initial content into window surfaces.
     crate::gui::content::init_file_explorer(file_explorer);
@@ -385,9 +390,13 @@ pub fn run_desktop_loop() -> ! {
         // 2. Drain and dispatch window messages (drag, resize, keys, etc.)
         process_desktop_messages();
 
-        // 3. Poll the network stack so incoming packets (ARP, DNS, ICMP,
-        //    TCP, etc.) are processed promptly even while idle.
+        // 3. Poll the network stack and X11 server.
         crate::net::poll();
+        crate::x11::poll();
+
+        // 3a. Drain any stdout bytes from running child processes into the
+        //     terminal widget and reap exited children.
+        crate::gui::terminal::poll_output();
 
         // 3b. Continue ARP warmup in background (doesn't block rendering).
         if !arp_resolved {
@@ -440,16 +449,19 @@ pub fn launch_desktop_with_timeout(ticks: u64) -> u64 {
 
     let mut frames: u64 = 0;
 
-    for _ in 0..ticks {
+    for _i in 0..ticks {
         crate::gui::input::pump_input();
         process_desktop_messages();
         crate::gui::compositor::compose();
         frames += 1;
 
-        unsafe {
-            core::arch::asm!("hlt");
+        // Spin-wait for one timer tick rather than using hlt.  hlt requires
+        // the LAPIC timer to wake the BSP, which is not reliable in test mode
+        // (KVM MMIO exits from framebuffer writes can mask LAPIC timer delivery).
+        let t = crate::arch::x86_64::irq::get_ticks();
+        while crate::arch::x86_64::irq::get_ticks() == t {
+            core::hint::spin_loop();
         }
     }
-
     frames
 }

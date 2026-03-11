@@ -41,6 +41,8 @@ const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;
 /// Program header type: program header table location
 const PT_PHDR: u32 = 6;
+/// Program header type: thread-local storage template
+const PT_TLS: u32 = 7;
 
 /// ELF type: dynamically-linked shared object / PIE
 const ET_DYN: u16 = 3;
@@ -108,6 +110,8 @@ pub const AT_GID: u64     = 13;  // Real group ID
 pub const AT_EGID: u64    = 14;  // Effective group ID
 pub const AT_BASE: u64    = 7;   // Base address of interpreter
 pub const AT_RANDOM: u64  = 25;  // Address of 16 random bytes
+// musl reads AT_PHDR/AT_PHNUM to find PT_TLS and validates p_filesz ≤ p_memsz.
+// We don't need a custom AT_ for TLS — musl uses PT_TLS from the phdrs directly.
 
 /// Result of loading an ELF binary.
 pub struct ElfLoadResult {
@@ -123,6 +127,9 @@ pub struct ElfLoadResult {
     pub load_end: u64,
     /// VMAs created for the loaded segments and user stack.
     pub vmas: Vec<VmArea>,
+    /// FS.base value to set for the initial thread (TCB virtual address).
+    /// 0 if the binary has no PT_TLS segment.
+    pub tls_base: u64,
 }
 
 /// Errors from ELF loading.
@@ -219,6 +226,12 @@ pub fn validate_elf(data: &[u8]) -> Result<&Elf64Header, ElfError> {
 /// # Safety
 /// `cr3` must point to a valid PML4 page table with kernel-half mapped.
 pub fn load_elf(data: &[u8], cr3: u64) -> Result<ElfLoadResult, ElfError> {
+    load_elf_with_args(data, cr3, &["astryx"], &["HOME=/", "PATH=/bin:/disk/bin"])
+}
+
+/// Like `load_elf` but lets the caller specify `argv` and `envp` that will be
+/// laid out on the initial user stack for the new process.
+pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -> Result<ElfLoadResult, ElfError> {
     let header = validate_elf(data)?;
     let mut allocated_pages: Vec<u64> = Vec::new();
     // Track pages mapped by THIS load_elf call, for overlap detection.
@@ -235,6 +248,10 @@ pub fn load_elf(data: &[u8], cr3: u64) -> Result<ElfLoadResult, ElfError> {
 
     let mut interp_path: Option<alloc::string::String> = None;
     let mut phdr_vaddr: u64 = 0; // PT_PHDR virtual address (for AT_PHDR)
+
+    // PT_TLS: filesz bytes of initialised template + (memsz-filesz) bytes of zeros.
+    struct TlsInfo { offset: usize, filesz: usize, memsz: usize, align: usize }
+    let mut tls_info: Option<TlsInfo> = None;
 
     for i in 0..ph_count {
         let offset = ph_offset + i * ph_size;
@@ -253,6 +270,14 @@ pub fn load_elf(data: &[u8], cr3: u64) -> Result<ElfLoadResult, ElfError> {
                 let raw = raw.split(|&b| b == 0).next().unwrap_or(raw);
                 interp_path = Some(alloc::string::String::from_utf8_lossy(raw).into_owned());
             }
+        }
+        if phdr.p_type == PT_TLS {
+            tls_info = Some(TlsInfo {
+                offset:  phdr.p_offset as usize,
+                filesz:  phdr.p_filesz as usize,
+                memsz:   phdr.p_memsz  as usize,
+                align:   phdr.p_align  as usize,
+            });
         }
     }
 
@@ -448,7 +473,7 @@ pub fn load_elf(data: &[u8], cr3: u64) -> Result<ElfLoadResult, ElfError> {
 
         match crate::vfs::read_file(&disk_path) {
             Ok(interp_data) => {
-                match load_elf_dyn(&interp_data, cr3, INTERP_BASE, &mut allocated_pages) {
+                match load_elf_dyn(&interp_data, cr3, INTERP_BASE, &mut allocated_pages, &mut vmas) {
                     Ok(interp_entry) => {
                         crate::serial_println!(
                             "[ELF] Interpreter loaded at {:#x}, entry={:#x}",
@@ -469,6 +494,82 @@ pub fn load_elf(data: &[u8], cr3: u64) -> Result<ElfLoadResult, ElfError> {
             }
         }
     }
+
+    // ── Set up initial TLS block for PT_TLS (musl / glibc compat) ───
+    // Layout (GNU/musl variant 2, x86-64):
+    //   [ tls_template | padding | TCB (8 bytes) ]
+    //   FS.base → TCB (which self-points back for __builtin_thread_pointer)
+    //
+    // musl's __init_tls walks AT_PHDR to find PT_TLS; it copies the template
+    // itself at runtime.  All we must do is allocate a zeroed TLS area and set
+    // FS.base to a valid TCB so early TLS accesses (errno, stack protector)
+    // don't fault before musl initialises things properly.
+    let tls_base_for_thread: u64 = if let Some(ref ti) = tls_info {
+        let align  = ti.align.max(8);
+        let memsz  = (ti.memsz + align - 1) & !(align - 1);
+        // Total allocation = aligned TLS area + 8-byte TCB self-pointer
+        let total  = memsz + 8;
+
+        // Allocate from the PMM and map into the process address space.
+        // We pick a fixed VA in the upper user area: 0x0000_7FFF_FFF0_0000.
+        let tls_virt: u64 = 0x0000_7FFF_FFF0_0000;
+        let npages = (total + pmm::PAGE_SIZE - 1) / pmm::PAGE_SIZE;
+
+        if let Some(tls_phys) = crate::mm::pmm::alloc_pages(npages) {
+            // Zero entire TLS area.
+            let tls_slice = unsafe {
+                core::slice::from_raw_parts_mut(tls_phys as *mut u8, total)
+            };
+            tls_slice.fill(0);
+
+            // Copy the initialised data template (p_filesz bytes).
+            let filesz = ti.filesz.min(ti.memsz);
+            if filesz > 0 && ti.offset + filesz <= data.len() {
+                tls_slice[..filesz].copy_from_slice(&data[ti.offset..ti.offset + filesz]);
+            }
+
+            // Write TCB self-pointer at offset `memsz` (points to itself).
+            let tcb_va   = tls_virt + memsz as u64;
+            let tcb_phys = tls_phys + memsz as u64;
+            unsafe { *(tcb_phys as *mut u64) = tcb_va; }
+
+            // Track TLS pages so they are freed on process exit (same as PT_LOAD pages).
+            for pi in 0..npages {
+                allocated_pages.push(tls_phys + (pi * pmm::PAGE_SIZE) as u64);
+            }
+
+            // Register TLS region as a VMA so /proc/self/maps and CoW fork see it.
+            vmas.push(VmArea {
+                base:    tls_virt,
+                length:  (npages * pmm::PAGE_SIZE) as u64,
+                prot:    PROT_READ | PROT_WRITE,
+                flags:   MAP_PRIVATE | MAP_ANONYMOUS,
+                backing: VmBacking::Anonymous,
+                name:    "[tls]",
+            });
+
+            // Map TLS pages into the process page tables (one page at a time).
+            let flags = vmm::PAGE_PRESENT | vmm::PAGE_USER | vmm::PAGE_WRITABLE;
+            for pi in 0..npages {
+                vmm::map_page_in(
+                    cr3,
+                    tls_virt + (pi * pmm::PAGE_SIZE) as u64,
+                    tls_phys + (pi * pmm::PAGE_SIZE) as u64,
+                    flags,
+                );
+            }
+
+            crate::serial_println!(
+                "[ELF] PT_TLS: memsz={} filesz={} tcb_va={:#x}",
+                ti.memsz, ti.filesz, tcb_va
+            );
+            tcb_va // FS.base = TCB virtual address
+        } else {
+            0
+        }
+    } else {
+        0
+    };
 
     // ── Build extra auxvec entries for dynamic linking ───────────────
     // AT_PHDR, AT_PHENT, AT_PHNUM: let the interpreter find the main binary's .dynamic
@@ -492,8 +593,8 @@ pub fn load_elf(data: &[u8], cr3: u64) -> Result<ElfLoadResult, ElfError> {
     let user_stack_ptr = setup_user_stack(
         &stack_pages,
         stack_bottom,
-        &["astryx"],           // argv (program name placeholder)
-        &["HOME=/", "PATH=/bin:/disk/bin"],  // envp
+        argv,
+        envp,
         header.e_entry.wrapping_add(pie_bias), // AT_ENTRY
         &extra_auxv,
     );
@@ -505,6 +606,7 @@ pub fn load_elf(data: &[u8], cr3: u64) -> Result<ElfLoadResult, ElfError> {
         load_base,
         load_end,
         vmas,
+        tls_base: tls_base_for_thread,
     })
 }
 
@@ -519,11 +621,14 @@ pub fn is_elf(data: &[u8]) -> bool {
 /// segment starts at `base`. Returns the interpreter's entry point.
 ///
 /// Pages are pushed into `allocated_pages` so the caller can free them on exit.
+/// VMAs for each loaded segment are pushed into `vmas` so the process's VmSpace
+/// covers interpreter pages and can free them via the VMA walk on exit.
 fn load_elf_dyn(
     data: &[u8],
     cr3: u64,
     base: u64,
     allocated_pages: &mut Vec<u64>,
+    vmas: &mut Vec<VmArea>,
 ) -> Result<u64, ElfError> {
     if data.len() < core::mem::size_of::<Elf64Header>() {
         return Err(ElfError::TooSmall);
@@ -574,6 +679,20 @@ fn load_elf_dyn(
 
         let page_start = vaddr & !0xFFF;
         let page_end   = (vaddr + memsz + 0xFFF) & !0xFFF;
+
+        // Register a VMA for this interpreter segment so the parent's VmSpace
+        // covers interpreter pages and free_process_memory can free them.
+        let mut seg_prot: VmProt = PROT_READ;
+        if phdr.p_flags & PF_W != 0 { seg_prot |= PROT_WRITE; }
+        if phdr.p_flags & PF_X != 0 { seg_prot |= PROT_EXEC; }
+        vmas.push(VmArea {
+            base: page_start,
+            length: page_end - page_start,
+            prot: seg_prot,
+            flags: MAP_PRIVATE,
+            backing: VmBacking::Anonymous,
+            name: "[interp]",
+        });
 
         for page_vaddr in (page_start..page_end).step_by(pmm::PAGE_SIZE) {
             let (phys, already) = if let Some(&(_, p)) =

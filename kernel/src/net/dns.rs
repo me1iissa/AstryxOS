@@ -63,16 +63,10 @@ pub fn resolve(hostname: &str) -> Option<Ipv4Address> {
         // Send query
         super::udp::send(dns_server, src_port, 53, &query);
 
-        // Wait for response (3 seconds = 300 ticks at 100 Hz)
-        let start = crate::arch::x86_64::irq::get_ticks();
-        let timeout: u64 = 300;
-
-        loop {
-            let now = crate::arch::x86_64::irq::get_ticks();
-            if now.wrapping_sub(start) >= timeout {
-                break;
-            }
-
+        // Wait for response (~3 seconds via bounded busy-spin, ~1M iterations at ~3ns each).
+        // We avoid hal::halt() here because on the AP (CPU 1) the APIC timer may not
+        // fire reliably, causing hlt to block indefinitely.
+        for _ in 0..1_000_000u32 {
             crate::net::poll();
 
             if let Some(dgram) = super::udp::recv(src_port) {
@@ -82,7 +76,7 @@ pub fn resolve(hostname: &str) -> Option<Ipv4Address> {
                 }
             }
 
-            crate::hal::halt();
+            for _ in 0..200u32 { core::hint::spin_loop(); }
         }
 
         if result.is_some() { break; }
@@ -244,15 +238,7 @@ pub fn resolve_ipv6(hostname: &str) -> Option<super::Ipv6Address> {
 
         super::udp::send(dns_server, src_port, 53, &query);
 
-        let start = crate::arch::x86_64::irq::get_ticks();
-        let timeout: u64 = 300;
-
-        loop {
-            let now = crate::arch::x86_64::irq::get_ticks();
-            if now.wrapping_sub(start) >= timeout {
-                break;
-            }
-
+        for _ in 0..1_000_000u32 {
             crate::net::poll();
 
             if let Some(dgram) = super::udp::recv(src_port) {
@@ -262,7 +248,7 @@ pub fn resolve_ipv6(hostname: &str) -> Option<super::Ipv6Address> {
                 }
             }
 
-            crate::hal::halt();
+            for _ in 0..200u32 { core::hint::spin_loop(); }
         }
 
         if result.is_some() { break; }

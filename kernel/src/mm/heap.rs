@@ -10,11 +10,12 @@ use spin::Mutex;
 /// Kernel heap start address.
 ///
 /// Placed in the higher-half mapping (PML4 entry 256) at the virtual address
-/// corresponding to physical 4 MiB.  This keeps the heap accessible even when
-/// CR3 points to a user-process page table (which clones PML4 entries 256-511
-/// from the kernel) while leaving the identity-mapped low-address range free
-/// for user ELF segment mappings.
-const HEAP_START: usize = 0xFFFF_8000_0040_0000;
+/// corresponding to physical 8 MiB.  Starting above 8 MiB ensures no overlap
+/// with the kernel image (text + data + bss < 6 MiB) while leaving the 0–8 MiB
+/// identity-mapped range free for user ELF segment mappings and the kernel image
+/// itself.  This keeps the heap accessible even when CR3 points to a user-process
+/// page table (which clones PML4 entries 256-511 from the kernel).
+const HEAP_START: usize = 0xFFFF_8000_0080_0000;
 /// Kernel heap size: 128 MiB (sufficient for 1920×1080 GUI with multiple window surfaces).
 const HEAP_SIZE: usize = 128 * 1024 * 1024;
 

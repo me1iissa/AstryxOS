@@ -58,7 +58,7 @@ pub struct Tss {
     pub iomap_base: u16,
 }
 
-/// GDT with kernel/user segments + two TSS descriptors (one per CPU).
+/// GDT with kernel/user segments and per-CPU TSS descriptors.
 ///
 /// Segment order is specifically arranged for SYSRET compatibility:
 /// - 0x00: Null
@@ -66,17 +66,24 @@ pub struct Tss {
 /// - 0x10: Kernel Data (Ring 0)
 /// - 0x18: User Data (Ring 3)  <-- SYSRET SS = STAR[63:48]+8
 /// - 0x20: User Code (Ring 3)  <-- SYSRET CS = STAR[63:48]+16
-/// - 0x28: BSP TSS (16 bytes, spans 0x28-0x37)
-/// - 0x38: AP  TSS (16 bytes, spans 0x38-0x47)
+/// - 0x28: BSP TSS  (16 bytes, APIC ID 0)
+/// - 0x38: AP1 TSS (16 bytes, APIC ID 1)
+/// - 0x48: AP2 TSS (16 bytes, APIC ID 2)
+/// - ...
+/// - 0x28 + MAX_AP*16: AP{MAX_AP} TSS
+///
+/// Each CPU loads TR with its own selector: 0x28 + apic_id * 0x10.
+/// This ensures TSS.rsp[0] and IST entries are per-CPU, preventing the
+/// race condition where multiple APs overwrite each other's kernel RSP.
 #[repr(C, align(16))]
 struct Gdt {
-    null: GdtEntry,           // 0x00: Null descriptor
-    kernel_code: GdtEntry,    // 0x08: Kernel code (Ring 0, 64-bit)
-    kernel_data: GdtEntry,    // 0x10: Kernel data (Ring 0)
-    user_data: GdtEntry,      // 0x18: User data (Ring 3)
-    user_code: GdtEntry,      // 0x20: User code (Ring 3, 64-bit)
-    tss_bsp: TssDescriptor,   // 0x28: BSP TSS (16 bytes, spans 0x28-0x37)
-    tss_ap:  TssDescriptor,   // 0x38: AP  TSS (16 bytes, spans 0x38-0x47)
+    null: GdtEntry,                       // 0x00
+    kernel_code: GdtEntry,                // 0x08
+    kernel_data: GdtEntry,                // 0x10
+    user_data: GdtEntry,                  // 0x18
+    user_code: GdtEntry,                  // 0x20
+    tss_bsp: TssDescriptor,               // 0x28 (BSP, APIC ID 0)
+    tss_aps: [TssDescriptor; MAX_AP],     // 0x38+ (APs, APIC IDs 1..MAX_AP)
 }
 
 /// GDT pointer structure for LGDT instruction.
@@ -91,19 +98,20 @@ pub const KERNEL_CODE_SELECTOR: u16 = 0x08;
 pub const KERNEL_DATA_SELECTOR: u16 = 0x10;
 pub const USER_DATA_SELECTOR: u16 = 0x18 | 3; // RPL 3  → 0x1B
 pub const USER_CODE_SELECTOR: u16 = 0x20 | 3; // RPL 3  → 0x23
-pub const TSS_SELECTOR:     u16 = 0x28;       // BSP TSS
-pub const TSS_AP_SELECTOR:  u16 = 0x38;       // AP  TSS
+pub const TSS_SELECTOR: u16 = 0x28;           // BSP TSS (APIC ID 0)
+
+/// Compute the GDT selector for a given APIC ID's TSS.
+/// APIC ID 0 → 0x28 (BSP), APIC ID 1 → 0x38, APIC ID 2 → 0x48, …
+#[inline]
+pub fn tss_selector_for(apic_id: u8) -> u16 {
+    0x28u16 + (apic_id as u16) * 0x10
+}
 
 /// BSP interrupt stack (16 KiB).
 static mut INTERRUPT_STACK: [u8; 16384] = [0; 16384];
 /// BSP double-fault stack (16 KiB).
 static mut DOUBLE_FAULT_STACK: [u8; 16384] = [0; 16384];
 
-/// AP interrupt stack (16 KiB) — used when an AP receives an interrupt
-/// from Ring 3 *before* a thread-specific kernel stack is available.
-static mut AP_INTERRUPT_STACK: [u8; 16384] = [0; 16384];
-/// AP double-fault stack (16 KiB).
-static mut AP_DOUBLE_FAULT_STACK: [u8; 16384] = [0; 16384];
 
 /// BSP Task State Segment.
 static mut TSS_BSP: Tss = Tss {
@@ -116,16 +124,29 @@ static mut TSS_BSP: Tss = Tss {
     iomap_base: size_of::<Tss>() as u16,
 };
 
-/// AP Task State Segment (one is sufficient for our 2-CPU setup).
-static mut TSS_AP: Tss = Tss {
-    _reserved0: 0,
-    rsp: [0; 3],
-    _reserved1: 0,
-    ist: [0; 7],
-    _reserved2: 0,
-    _reserved3: 0,
-    iomap_base: size_of::<Tss>() as u16,
-};
+/// Per-AP Task State Segments (indexed by APIC ID 1..=MAX_AP).
+/// Each AP needs its own TSS so that TSS.rsp[0] (the Ring 3→Ring 0
+/// kernel-stack pointer) and IST entries are not shared between CPUs.
+/// Sharing a single TSS across APs causes a race on rsp[0]: whichever
+/// AP writes last wins, so the other AP's Ring-3 interrupts land on the
+/// wrong kernel stack → double/triple fault.
+const MAX_AP: usize = 15; // APIC IDs 1-15
+static mut TSS_APS: [Tss; MAX_AP] = [const {
+    Tss {
+        _reserved0: 0,
+        rsp: [0; 3],
+        _reserved1: 0,
+        ist: [0; 7],
+        _reserved2: 0,
+        _reserved3: 0,
+        iomap_base: size_of::<Tss>() as u16,
+    }
+}; MAX_AP];
+
+/// Per-AP interrupt stacks (Ring 3 → Ring 0 transition stack).
+static mut AP_INTERRUPT_STACKS: [[u8; 16384]; MAX_AP] = [[0u8; 16384]; MAX_AP];
+/// Per-AP double-fault IST stacks.
+static mut AP_DOUBLE_FAULT_STACKS: [[u8; 16384]; MAX_AP] = [[0u8; 16384]; MAX_AP];
 
 /// Helper to build a zeroed TssDescriptor (used for static initialisation
 /// before the real addresses are known at runtime).
@@ -166,8 +187,8 @@ static mut GDT_INSTANCE: Gdt = Gdt {
         granularity: 0xAF,
         base_high: 0,
     },
-    tss_bsp: ZERO_TSS_DESC, // filled in by init()
-    tss_ap:  ZERO_TSS_DESC, // filled in by init_ap_tss()
+    tss_bsp: ZERO_TSS_DESC,             // filled in by init()
+    tss_aps: [ZERO_TSS_DESC; MAX_AP],   // filled in by init() and init_ap_tss()
 };
 
 static GDT_INIT: Once<()> = Once::new();
@@ -189,9 +210,8 @@ unsafe fn make_tss_descriptor(tss_ptr: *const Tss) -> TssDescriptor {
     }
 }
 
-/// Initialize the GDT with kernel/user segments and the BSP TSS.
-/// Also pre-populates the AP TSS descriptor so APs only need to call
-/// `init_ap_tss()` and `ltr TSS_AP_SELECTOR`.
+/// Initialize the GDT with kernel/user segments and all per-CPU TSSes.
+/// APs only need to call `init_ap_tss()` to load their TR register.
 pub fn init() {
     GDT_INIT.call_once(|| {
         // SAFETY: Single-threaded kernel init path.
@@ -204,17 +224,24 @@ pub fn init() {
             TSS_BSP.ist[1] = (&raw const DOUBLE_FAULT_STACK) as *const u8 as u64
                            + size_of::<[u8; 16384]>() as u64;
 
-            // ── AP TSS stacks (populated now; AP loads TR later) ──────
-            TSS_AP.rsp[0] = (&raw const AP_INTERRUPT_STACK) as *const u8 as u64
-                          + size_of::<[u8; 16384]>() as u64;
-            TSS_AP.ist[0] = (&raw const AP_INTERRUPT_STACK) as *const u8 as u64
-                          + size_of::<[u8; 16384]>() as u64;
-            TSS_AP.ist[1] = (&raw const AP_DOUBLE_FAULT_STACK) as *const u8 as u64
-                          + size_of::<[u8; 16384]>() as u64;
+            // ── Per-AP TSS stacks ─────────────────────────────────────
+            // Each AP (APIC ID 1..MAX_AP) gets its own TSS, interrupt stack,
+            // and double-fault IST stack to prevent inter-CPU RSP corruption.
+            for ap in 0..MAX_AP {
+                let istk_top = (&raw const AP_INTERRUPT_STACKS[ap]) as *const u8 as u64
+                             + size_of::<[u8; 16384]>() as u64;
+                let dstk_top = (&raw const AP_DOUBLE_FAULT_STACKS[ap]) as *const u8 as u64
+                             + size_of::<[u8; 16384]>() as u64;
+                TSS_APS[ap].rsp[0] = istk_top;
+                TSS_APS[ap].ist[0] = istk_top;
+                TSS_APS[ap].ist[1] = dstk_top;
 
-            // ── Write TSS descriptors into the GDT ───────────────────
+                // Write the TSS descriptor into the GDT slot for this AP.
+                GDT_INSTANCE.tss_aps[ap] = make_tss_descriptor(&raw const TSS_APS[ap]);
+            }
+
+            // ── BSP TSS descriptor ────────────────────────────────────
             GDT_INSTANCE.tss_bsp = make_tss_descriptor(&raw const TSS_BSP);
-            GDT_INSTANCE.tss_ap  = make_tss_descriptor(&raw const TSS_AP);
 
             // ── Load GDT ──────────────────────────────────────────────
             let gdt_ptr = GdtPointer {
@@ -259,40 +286,45 @@ pub fn init() {
         }
     });
 
-    crate::serial_println!("[GDT] Initialized: BSP TSS=0x28, AP TSS=0x38");
+    crate::serial_println!("[GDT] Initialized: per-CPU TSSes for BSP + {} APs", MAX_AP);
 }
 
-/// Called once per AP (from `ap_rust_entry`) to load the AP's own TR.
+/// Called once per AP (from `ap_rust_entry`) to load its own TSS into TR.
 ///
-/// The AP TSS descriptor was already written into the shared GDT during
-/// `init()`, so the AP only needs to execute `ltr TSS_AP_SELECTOR`.
+/// Each AP has a dedicated TSS descriptor at offset `0x28 + apic_id * 0x10`
+/// in the shared GDT.  The descriptor was written during BSP `init()`.
 ///
 /// # Safety
 /// Must be called on the AP core, after the BSP GDT has been loaded.
 pub unsafe fn init_ap_tss() {
+    let apic_id = super::apic::current_apic_id();
+    let sel = tss_selector_for(apic_id);
     asm!(
         "ltr {0:x}",
-        in(reg) TSS_AP_SELECTOR as u64,
+        in(reg) sel as u64,
         options(nostack, preserves_flags)
     );
-    crate::serial_println!("[GDT] AP loaded TR=0x38 (AP TSS)");
+    crate::serial_println!("[GDT] AP {} loaded TR={:#x} (per-AP TSS)", apic_id, sel);
 }
 
 /// Update the **current CPU's** TSS.rsp[0].
 ///
-/// Each CPU has its own TSS (BSP → TSS_BSP, all APs → TSS_AP) so that
-/// Ring 3 → Ring 0 interrupt stack switches are fully independent.
+/// Each CPU has its own TSS — BSP uses TSS_BSP, AP N (APIC ID N) uses
+/// TSS_APS[N-1] — so Ring 3 → Ring 0 interrupt stack switches are fully
+/// independent across CPUs.
 ///
 /// Must be called on every context switch to a user-mode thread.
 ///
 /// # Safety
 /// `stack_top` must be a valid, mapped kernel-stack address.
 pub unsafe fn update_tss_rsp0(stack_top: u64) {
-    let apic_id = super::apic::current_apic_id();
+    let apic_id = super::apic::current_apic_id() as usize;
     if apic_id == 0 {
         TSS_BSP.rsp[0] = stack_top;
     } else {
-        // All non-BSP CPUs share TSS_AP for now (sufficient for smp=2).
-        TSS_AP.rsp[0] = stack_top;
+        let ap_idx = apic_id - 1; // TSS_APS is 0-indexed: AP1→[0], AP2→[1], …
+        if ap_idx < MAX_AP {
+            TSS_APS[ap_idx].rsp[0] = stack_top;
+        }
     }
 }

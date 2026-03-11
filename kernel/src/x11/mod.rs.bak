@@ -1,0 +1,455 @@
+//! X11 server — in-kernel implementation.
+//!
+//! Listens on the AF_UNIX path `/tmp/.X11-unix/X0` using the kernel's built-in
+//! Unix-socket layer.  Clients connect, perform setup negotiation, and then
+//! issue synchronous X11 requests.
+//!
+//! # Current support
+//! - Connection setup (ClientHello → ServerHello, little-endian only).
+//! - `InternAtom` (opcode 16).
+//! - `GetAtomName` (opcode 17).
+//! - All other opcodes: return `BadRequest` error reply.
+//!
+//! Call `init()` once during kernel boot (after VFS/net are ready) then
+//! call `poll()` from the idle loop or a dedicated scheduler task.
+
+pub mod atoms;
+pub mod proto;
+
+use crate::net::unix;
+use spin::Mutex;
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const MAX_CLIENTS:       usize = 8;
+const SOCKET_PATH:       &[u8] = b"/tmp/.X11-unix/X0\0";
+const RESOURCE_ID_BASE:  u32   = 0x0040_0000;
+const RESOURCE_ID_MASK:  u32   = 0x001F_FFFF;
+
+// ── Per-connection state ──────────────────────────────────────────────────────
+
+struct Client {
+    fd:         u64,
+    seq:        u16,   // monotonically-increasing sequence counter
+    setup_done: bool,
+}
+
+// ── Global server state ───────────────────────────────────────────────────────
+
+struct Server {
+    /// True once `init()` has successfully bound the listen socket.
+    initialized: bool,
+    /// The listening socket fd (valid only when `initialized == true`).
+    listen_fd:   u64,
+    clients:     [Option<Client>; MAX_CLIENTS],
+}
+
+impl Server {
+    /// Zero-initialised so the static lands in .bss rather than .data,
+    /// avoiding layout changes that can corrupt the kernel .data section.
+    const fn new() -> Self {
+        Server {
+            initialized: false,
+            listen_fd:   0,
+            clients:     [const { None }; MAX_CLIENTS],
+        }
+    }
+}
+
+// SAFETY: Server only accessed through the Mutex; no raw pointers cross threads.
+unsafe impl Send for Server {}
+
+static SERVER: Mutex<Server> = Mutex::new(Server::new());
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+/// Bind and listen on `/tmp/.X11-unix/X0`.  Called once at boot.
+pub fn init() {
+    let fd = unix::create();
+    let r  = unix::bind(fd, SOCKET_PATH);
+    if r < 0 {
+        crate::serial_println!("[X11] bind(/tmp/.X11-unix/X0) failed: {}", r);
+        return;
+    }
+    unix::listen(fd);
+    {
+        let mut srv = SERVER.lock();
+        srv.listen_fd   = fd;
+        srv.initialized = true;
+    }
+    crate::serial_println!("[X11] server ready on /tmp/.X11-unix/X0 (fd={})", fd);
+}
+
+/// Accept new clients and service one pending read per connected client.
+/// Designed to be called from a polling loop or scheduler tick.
+pub fn poll() {
+    let (initialized, listen_fd) = {
+        let srv = SERVER.lock();
+        (srv.initialized, srv.listen_fd)
+    };
+    if !initialized { return; }
+
+    // ── Accept pending connections ────────────────────────────────────────
+    while unix::has_pending(listen_fd) {
+        let r = unix::accept(listen_fd);
+        if r < 0 { break; }
+        let new_fd = r as u64;
+        let mut srv = SERVER.lock();
+        for slot in srv.clients.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(Client { fd: new_fd, seq: 0, setup_done: false });
+                crate::serial_println!("[X11] accepted client fd={}", new_fd);
+                break;
+            }
+        }
+    }
+
+    // ── Collect FDs that have pending data (avoids holding SERVER lock during I/O) ─
+    let mut pending: [u64; MAX_CLIENTS] = [u64::MAX; MAX_CLIENTS];
+    {
+        let srv = SERVER.lock();
+        for (i, slot) in srv.clients.iter().enumerate() {
+            if let Some(c) = slot {
+                if unix::has_data(c.fd) {
+                    pending[i] = c.fd;
+                }
+            }
+        }
+    }
+
+    for &fd in &pending {
+        if fd != u64::MAX {
+            service_fd(fd);
+        }
+    }
+}
+
+// ── Internal: service one client ─────────────────────────────────────────────
+
+fn service_fd(fd: u64) {
+    let mut buf = [0u8; 512];
+    let n = unix::read(fd, &mut buf);
+    if n <= 0 { return; }
+    let data = &buf[..n as usize];
+
+    let setup_done = {
+        let srv = SERVER.lock();
+        srv.clients.iter()
+            .filter_map(|s| s.as_ref())
+            .find(|c| c.fd == fd)
+            .map(|c| c.setup_done)
+            .unwrap_or(false)
+    };
+
+    if !setup_done {
+        handle_setup(fd, data);
+    } else {
+        handle_request(fd, data);
+    }
+}
+
+// ── Connection setup ──────────────────────────────────────────────────────────
+//
+// Client sends at minimum 12 bytes:
+//   [0]   byte-order ('l' = 0x6C for LSB-first)
+//   [1]   pad
+//   [2-3] protocol-major-version (u16 LE, should be 11)
+//   [4-5] protocol-minor-version (u16 LE, should be 0)
+//   [6-7] auth-name-len (u16 LE)
+//   [8-9] auth-data-len (u16 LE)
+//   [10-11] pad
+//   Followed by auth-name (padded) then auth-data (padded)
+
+fn handle_setup(fd: u64, data: &[u8]) {
+    if data.len() < 12 {
+        send_setup_failed(fd, b"truncated setup request");
+        return;
+    }
+
+    let byte_order = data[0];
+    if byte_order != proto::BYTE_ORDER_LSB {
+        send_setup_failed(fd, b"big-endian clients not supported");
+        return;
+    }
+
+    let major = proto::read_u16le(data, 2);
+    if major != proto::PROTOCOL_MAJOR {
+        send_setup_failed(fd, b"unsupported protocol version");
+        return;
+    }
+
+    // Build server setup reply
+    let reply = build_setup_success();
+    unix::write(fd, &reply);
+
+    // Mark client as set-up
+    let mut srv = SERVER.lock();
+    for slot in srv.clients.iter_mut() {
+        if let Some(c) = slot {
+            if c.fd == fd {
+                c.setup_done = true;
+                c.seq = 0;
+                break;
+            }
+        }
+    }
+    crate::serial_println!("[X11] client fd={} setup complete", fd);
+}
+
+fn send_setup_failed(fd: u64, reason: &[u8]) {
+    // Failed setup reply:
+    //   [0]    0 = failed
+    //   [1]    length of reason in bytes
+    //   [2-3]  major version
+    //   [4-5]  minor version
+    //   [6-7]  additional-data-len (in 4-byte units) = ceil(reason.len, 4) / 4
+    //   reason (padded to multiple of 4)
+    let rlen = reason.len();
+    let padded = (rlen + 3) & !3;
+    let mut reply = [0u8; 64];
+    reply[0] = 0; // failed
+    reply[1] = rlen as u8;
+    proto::write_u16le(&mut reply, 2, proto::PROTOCOL_MAJOR);
+    proto::write_u16le(&mut reply, 4, proto::PROTOCOL_MINOR);
+    proto::write_u16le(&mut reply, 6, (padded / 4) as u16);
+    let copy = rlen.min(56);
+    reply[8..8 + copy].copy_from_slice(&reason[..copy]);
+    unix::write(fd, &reply[..8 + padded]);
+    crate::serial_println!("[X11] setup failed for fd={}: {:?}", fd,
+        core::str::from_utf8(reason).unwrap_or("?"));
+}
+
+/// Build the 8-byte header + additional data for a successful server setup reply.
+///
+/// Wire layout (see X11 protocol spec §B.8):
+/// Header (8 bytes):
+///   [0]    1 = success
+///   [1]    0 (unused)
+///   [2-3]  protocol-major-version
+///   [4-5]  protocol-minor-version
+///   [6-7]  additional-data-length in 4-byte units
+///
+/// Additional data: fixed body (32) + vendor (8) + format (8) + screen+depth+visual (72)
+fn build_setup_success() -> [u8; 128] {
+    let mut b = [0u8; 128];
+
+    //    Header
+    b[0] = 1; // success
+    b[1] = 0;
+    proto::write_u16le(&mut b, 2, proto::PROTOCOL_MAJOR);   // 11
+    proto::write_u16le(&mut b, 4, proto::PROTOCOL_MINOR);   // 0
+    // additional-data-length = (128 - 8) / 4 = 30
+    proto::write_u16le(&mut b, 6, 30);
+
+    //    Fixed additional body (starts at byte 8)
+    let p = 8;
+    proto::write_u32le(&mut b, p,     1);          // release-number
+    proto::write_u32le(&mut b, p + 4, RESOURCE_ID_BASE); // resource-id-base
+    proto::write_u32le(&mut b, p + 8, RESOURCE_ID_MASK); // resource-id-mask
+    proto::write_u32le(&mut b, p + 12, 256);       // motion-buffer-size
+    proto::write_u16le(&mut b, p + 16, 7);         // length-of-vendor = len("Xastryx")
+    proto::write_u16le(&mut b, p + 18, 0x7FFF);   // max-request-length
+    b[p + 20] = 1; // 1 screen
+    b[p + 21] = 1; // 1 pixmap format
+    b[p + 22] = 0; // image-byte-order = LSBFirst
+    b[p + 23] = 0; // bitmap-bit-order = LSBFirst
+    b[p + 24] = 32; // bitmap-format-scanline-unit
+    b[p + 25] = 32; // bitmap-format-scanline-pad
+    b[p + 26] = 8;  // min-keycode
+    b[p + 27] = 255; // max-keycode
+    // [p+28..p+32] = 4 bytes padding  → already 0
+
+    //    Vendor string "Xastryx" padded to 8 bytes (at byte 40)
+    let q = p + 32; // = 40
+    b[q..q + 7].copy_from_slice(proto::VENDOR_STRING);
+    // byte q+7 = 0 pad (already zero)
+
+    //    Pixmap format (8 bytes at byte 48)
+    let r = q + 8; // = 48
+    b[r]     = proto::ROOT_DEPTH; // depth = 24
+    b[r + 1] = 32;                // bits-per-pixel
+    b[r + 2] = 32;                // scanline-pad
+    // [r+3..r+8] = 5 pad bytes (already 0)
+
+    //    Screen (40 bytes at byte 56)
+    let s = r + 8; // = 56
+    proto::write_u32le(&mut b, s,      proto::ROOT_WINDOW_ID);
+    proto::write_u32le(&mut b, s + 4,  proto::DEFAULT_COLORMAP);
+    proto::write_u32le(&mut b, s + 8,  proto::WHITE_PIXEL);
+    proto::write_u32le(&mut b, s + 12, proto::BLACK_PIXEL);
+    proto::write_u32le(&mut b, s + 16, 0); // current-input-masks
+    proto::write_u16le(&mut b, s + 20, proto::SCREEN_WIDTH);
+    proto::write_u16le(&mut b, s + 22, proto::SCREEN_HEIGHT);
+    proto::write_u16le(&mut b, s + 24, proto::SCREEN_WIDTH_MM);
+    proto::write_u16le(&mut b, s + 26, proto::SCREEN_HEIGHT_MM);
+    proto::write_u16le(&mut b, s + 28, 1); // min-installed-maps
+    proto::write_u16le(&mut b, s + 30, 1); // max-installed-maps
+    proto::write_u32le(&mut b, s + 32, proto::ROOT_VISUAL);
+    b[s + 36] = 0; // backing-stores = Never
+    b[s + 37] = 0; // save-unders = false
+    b[s + 38] = proto::ROOT_DEPTH; // root-depth = 24
+    b[s + 39] = 1; // number-of-depths = 1
+
+    //    Depth list entry (8 bytes at byte 96)
+    let d = s + 40; // = 96
+    b[d]     = proto::ROOT_DEPTH; // depth = 24
+    b[d + 1] = 0;  // pad
+    proto::write_u16le(&mut b, d + 2, 1); // num-visuals = 1
+    // [d+4..d+8] = pad (already 0)
+
+    //    VisualType (24 bytes at byte 104)
+    let v = d + 8; // = 104
+    proto::write_u32le(&mut b, v,      proto::ROOT_VISUAL);   // visual-id = 32
+    b[v + 4] = proto::VISUAL_CLASS_TRUECOLOR; // class = TrueColor (4)
+    b[v + 5] = 8;  // bits-per-rgb-value
+    proto::write_u16le(&mut b, v + 6,  256); // colormap-entries
+    proto::write_u32le(&mut b, v + 8,  0x00FF0000); // red-mask
+    proto::write_u32le(&mut b, v + 12, 0x0000FF00); // green-mask
+    proto::write_u32le(&mut b, v + 16, 0x000000FF); // blue-mask
+    // [v+20..v+24] = pad (already 0)
+    // total = 104 + 24 = 128 ✓
+
+    b
+}
+
+// ── Request dispatch ──────────────────────────────────────────────────────────
+//
+// All X11 requests share a common 4-byte header:
+//   [0]   major-opcode
+//   [1]   opcode-specific data
+//   [2-3] request-length in 4-byte units (must be ≥ 1)
+
+fn handle_request(fd: u64, data: &[u8]) {
+    if data.len() < 4 { return; }
+
+    // Bump sequence number before building the reply.
+    let seq = {
+        let mut srv = SERVER.lock();
+        let c = srv.clients.iter_mut()
+            .filter_map(|s| s.as_mut())
+            .find(|c| c.fd == fd);
+        if let Some(c) = c {
+            c.seq = c.seq.wrapping_add(1);
+            c.seq
+        } else { 1 }
+    };
+
+    let opcode = data[0];
+    match opcode {
+        proto::OP_INTERN_ATOM   => handle_intern_atom(fd, data, seq),
+        proto::OP_GET_ATOM_NAME => handle_get_atom_name(fd, data, seq),
+        proto::OP_NO_OPERATION  => { /* nothing to do */ }
+        _ => send_error(fd, proto::ERR_REQUEST, 0, seq, opcode),
+    }
+}
+
+// ── InternAtom ────────────────────────────────────────────────────────────────
+//
+// Request:
+//   [0]   16 (opcode)
+//   [1]   only-if-exists (bool)
+//   [2-3] request-length (in 4-byte units) = 2 + ceil(name_len, 4)/4
+//   [4-5] name-length (u16 LE)
+//   [6-7] pad
+//   [8..] name (padded to multiple of 4)
+//
+// Reply (32 bytes):
+//   [0]   1 (reply)
+//   [1]   pad
+//   [2-3] sequence-number
+//   [4-7] reply-length (0 — no additional data beyond 24 bytes)
+//   [8-11] atom (u32 LE)
+//   [12-31] pad
+
+fn handle_intern_atom(fd: u64, data: &[u8], seq: u16) {
+    if data.len() < 8 {
+        send_error(fd, proto::ERR_LENGTH, 0, seq, proto::OP_INTERN_ATOM);
+        return;
+    }
+    let only_if_exists = data[1] != 0;
+    let name_len = proto::read_u16le(data, 4) as usize;
+    if data.len() < 8 + name_len {
+        send_error(fd, proto::ERR_LENGTH, 0, seq, proto::OP_INTERN_ATOM);
+        return;
+    }
+    let name_bytes = &data[8..8 + name_len];
+    let name = core::str::from_utf8(name_bytes).unwrap_or("");
+    let atom = atoms::intern(name, only_if_exists);
+
+    let mut reply = [0u8; 32];
+    reply[0] = 1; // reply
+    proto::write_u16le(&mut reply, 2, seq);
+    proto::write_u32le(&mut reply, 4, 0); // reply-length (no additional data)
+    proto::write_u32le(&mut reply, 8, atom);
+    unix::write(fd, &reply);
+    crate::serial_println!("[X11] InternAtom({:?}) → {}", name, atom);
+}
+
+// ── GetAtomName ───────────────────────────────────────────────────────────────
+//
+// Request:
+//   [0]   17 (opcode)
+//   [1]   pad
+//   [2-3] request-length (2 = 8 bytes)
+//   [4-7] atom (u32 LE)
+//
+// Reply:
+//   [0]   1 (reply)
+//   [1]   pad
+//   [2-3] sequence-number
+//   [4-7] reply-length (= ceil(name_len, 4) / 4)
+//   [8-9] name-length (u16 LE)
+//   [10-31] pad
+//   [32..] name (padded to multiple of 4)
+
+fn handle_get_atom_name(fd: u64, data: &[u8], seq: u16) {
+    if data.len() < 8 {
+        send_error(fd, proto::ERR_LENGTH, 0, seq, proto::OP_GET_ATOM_NAME);
+        return;
+    }
+    let atom_id = proto::read_u32le(data, 4);
+    match atoms::get_name(atom_id) {
+        None => send_error(fd, proto::ERR_ATOM, atom_id, seq, proto::OP_GET_ATOM_NAME),
+        Some(name) => {
+            let nb = name.len();
+            let padded = (nb + 3) & !3;
+            let extra = padded / 4;
+            let total = 32 + padded;
+            // Build on stack (names are short)
+            let mut reply = [0u8; 128];
+            if total > reply.len() {
+                send_error(fd, proto::ERR_ALLOC, 0, seq, proto::OP_GET_ATOM_NAME);
+                return;
+            }
+            reply[0] = 1;
+            proto::write_u16le(&mut reply, 2, seq);
+            proto::write_u32le(&mut reply, 4, extra as u32);
+            proto::write_u16le(&mut reply, 8, nb as u16);
+            reply[32..32 + nb].copy_from_slice(name.as_bytes());
+            unix::write(fd, &reply[..total]);
+            crate::serial_println!("[X11] GetAtomName({}) → {:?}", atom_id, name.as_str());
+        }
+    }
+}
+
+// ── Error reply ───────────────────────────────────────────────────────────────
+//
+// Error packet (32 bytes):
+//   [0]   0 (error)
+//   [1]   error-code
+//   [2-3] sequence-number
+//   [4-7] bad-resource-id (or 0)
+//   [8-9] minor-opcode (0 for core errors)
+//   [10]  major-opcode
+//   [11-31] pad
+
+fn send_error(fd: u64, code: u8, bad_id: u32, seq: u16, opcode: u8) {
+    let mut pkt = [0u8; 32];
+    pkt[0] = 0; // error
+    pkt[1] = code;
+    proto::write_u16le(&mut pkt, 2, seq);
+    proto::write_u32le(&mut pkt, 4, bad_id);
+    pkt[10] = opcode;
+    unix::write(fd, &pkt);
+    crate::serial_println!("[X11] error code={} opcode={} seq={}", code, opcode, seq);
+}

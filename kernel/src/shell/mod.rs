@@ -61,6 +61,7 @@ const COMMANDS: &[&str] = &[
     "panic", "reboot", "shutdown", "halt", "dns", "dhcp",
     "ob", "reg", "devmgr", "procfs", "perf", "exec", "ldd",
     "beep", "play", "volume", "audio", "usb",
+    "edit",
 ];
 
 impl ShellState {
@@ -718,6 +719,7 @@ fn execute(state: &mut ShellState, line: &str) {
         "procfs" => cmd_procfs(&parts),
         "perf" => cmd_perf(&parts),
         "exec" => cmd_exec(&parts),
+        "edit" => cmd_edit(state, &parts),
         "ldd" => cmd_ldd(state, &parts),
         "beep" => cmd_beep(),
         "play" => cmd_play(&parts),
@@ -2051,6 +2053,16 @@ fn cmd_exec(parts: &[&str]) {
         crate::sched::enable();
     }
 
+    // Build argv: [name, extra_args...]
+    // parts[0] is "exec" (the shell command), parts[1] is the binary path,
+    // parts[2..] are arguments forwarded to the process.
+    let argv: alloc::vec::Vec<&str> = {
+        let mut v = alloc::vec![name];
+        v.extend_from_slice(&parts[2..]);
+        v
+    };
+    let envp: &[&str] = &["HOME=/", "PATH=/bin:/disk/bin", "TCCDIR=/disk/lib/tcc", "TMPDIR=/tmp"];
+
     let result = if name == "hello" || name == "/bin/hello" {
         orbit_println!("Loading embedded ELF: hello ({} bytes)", crate::proc::hello_elf::HELLO_ELF.len());
         crate::proc::usermode::create_user_process("hello", &crate::proc::hello_elf::HELLO_ELF)
@@ -2060,16 +2072,19 @@ fn cmd_exec(parts: &[&str]) {
         orbit_println!("Loading ELF from VFS: {}", name);
         match crate::vfs::read_file(name) {
             Ok(data) => {
+                orbit_println!("  Read {} bytes", data.len());
                 if !crate::proc::elf::is_elf(&data) {
                     Err(alloc::format!("'{}' is not an ELF binary", name))
                 } else {
-                    crate::proc::usermode::create_user_process(name, &data)
+                    orbit_println!("  Spawning process (argv={})...", argv.len());
+                    crate::proc::usermode::create_user_process_with_args(name, &data, &argv, envp)
                         .map_err(|e| alloc::format!("ELF load failed: {:?}", e))
                         .map(|pid| {
                             // Disk-loaded ELFs use the Linux syscall ABI.
                             let mut procs = crate::proc::PROCESS_TABLE.lock();
                             if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
                                 p.linux_abi = true;
+                                p.subsystem = crate::win32::SubsystemType::Linux;
                             }
                             pid
                         })
@@ -2087,6 +2102,8 @@ fn cmd_exec(parts: &[&str]) {
             // Poll waitpid until the child becomes a zombie, yielding each
             // iteration so the scheduler can run the user process.
             // Use the kernel pid 0 as "any child" since the shell runs as pid 0.
+            // Timeout: 30 seconds (at ~10k spins per iter, ~50ms/iter → ~600 iters/30s)
+            let mut timeout_iters = 3000usize;
             loop {
                 crate::sched::yield_cpu();
                 crate::hal::enable_interrupts();
@@ -2097,6 +2114,11 @@ fn cmd_exec(parts: &[&str]) {
                     } else {
                         orbit_println!("{}Process exited with code {}{}", color::RED, code, color::RESET);
                     }
+                    break;
+                }
+                timeout_iters = timeout_iters.saturating_sub(1);
+                if timeout_iters == 0 {
+                    orbit_println!("{}exec: timeout — process PID {} did not exit{}", color::YELLOW, pid, color::RESET);
                     break;
                 }
             }
@@ -2352,6 +2374,308 @@ fn find_library(name: &str) -> (bool, alloc::string::String) {
 /// Check if a path resolves to a readable file in the VFS.
 fn try_resolve_lib(path: &str) -> bool {
     crate::vfs::stat(path).is_ok()
+}
+
+// ==================== Built-in Screen Editor ====================
+
+/// Read the next key event from keyboard (PS/2) or serial, blocking via halt.
+fn read_editor_key() -> KeyEvent {
+    loop {
+        while let Some(sc) = crate::arch::x86_64::irq::read_scancode() {
+            if let Some(ev) = crate::drivers::keyboard::process_scancode(sc) {
+                return ev;
+            }
+        }
+        while let Some(byte) = crate::drivers::serial::try_read_byte() {
+            if let Some(ev) = serial_byte_to_key_event(byte) {
+                return ev;
+            }
+        }
+        crate::hal::halt();
+    }
+}
+
+fn ed_draw_full(
+    lines: &[Vec<u8>], row: usize, col: usize, top: usize,
+    path: &str, modified: bool, status: &str, rows: usize, cols: usize,
+) {
+    crate::kprint!("\x1b[?25l\x1b[2J");
+    // Header
+    crate::kprint!("\x1b[1;1H\x1b[7m");
+    let pos_s = alloc::format!(" L:{} C:{} ", row + 1, col + 1);
+    let title = alloc::format!(" edit: {}{}", path, if modified { " [+]" } else { "    " });
+    let pad = cols.saturating_sub(title.len() + pos_s.len());
+    crate::kprint!("{}{}{:pad$}\x1b[K\x1b[0m", title, pos_s, "", pad = pad);
+    // Content rows (screen rows 2 .. rows-1)
+    let content_rows = rows.saturating_sub(2);
+    for i in 0..content_rows {
+        let fr = top + i;
+        crate::kprint!("\x1b[{};1H\x1b[K", i + 2);
+        if fr < lines.len() {
+            let line = &lines[fr];
+            let n = line.len().min(cols);
+            for &b in &line[..n] {
+                crate::kprint!("{}", if b >= 0x20 && b < 0x7f { b as char } else { ' ' });
+            }
+        }
+    }
+    // Footer (screen row = rows)
+    crate::kprint!("\x1b[{};1H\x1b[7m", rows);
+    if status.is_empty() {
+        crate::kprint!("  ^X Exit   ^S Save   ^K Kill Line   Arrows/Home/End/PgUp/PgDn");
+    } else {
+        crate::kprint!(" {}", status);
+    }
+    crate::kprint!("\x1b[K\x1b[0m");
+    // Position cursor
+    crate::kprint!("\x1b[{};{}H\x1b[?25h", row.saturating_sub(top) + 2, col + 1);
+}
+
+fn ed_draw_line(lines: &[Vec<u8>], row: usize, col: usize, top: usize,
+                path: &str, modified: bool, rows: usize, cols: usize) {
+    crate::kprint!("\x1b[?25l");
+    // Redraw header (cursor position changes)
+    crate::kprint!("\x1b[1;1H\x1b[7m");
+    let pos_s = alloc::format!(" L:{} C:{} ", row + 1, col + 1);
+    let title = alloc::format!(" edit: {}{}", path, if modified { " [+]" } else { "    " });
+    let pad = cols.saturating_sub(title.len() + pos_s.len());
+    crate::kprint!("{}{}{:pad$}\x1b[K\x1b[0m", title, pos_s, "", pad = pad);
+    // Redraw current line only
+    let sr = row.saturating_sub(top) + 2;
+    if sr < rows {
+        crate::kprint!("\x1b[{};1H\x1b[K", sr);
+        if row < lines.len() {
+            let line = &lines[row];
+            let n = line.len().min(cols);
+            for &b in &line[..n] {
+                crate::kprint!("{}", if b >= 0x20 && b < 0x7f { b as char } else { ' ' });
+            }
+        }
+    }
+    crate::kprint!("\x1b[{};{}H\x1b[?25h", sr, col + 1);
+}
+
+fn ed_save(lines: &[Vec<u8>], path: &str) -> Result<usize, alloc::string::String> {
+    let mut content: Vec<u8> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        content.extend_from_slice(line);
+        if i + 1 < lines.len() { content.push(b'\n'); }
+    }
+    content.push(b'\n');
+    let _ = crate::vfs::create_file(path);
+    crate::vfs::write_file(path, &content)
+        .map_err(|e| alloc::format!("{:?}", e))
+}
+
+/// Nano-like built-in text editor.
+/// Keybindings: ^X/^Q=exit, ^S=save, ^K=kill line, arrows, Home, End, PgUp, PgDn.
+fn cmd_edit(state: &ShellState, parts: &[&str]) {
+    if parts.len() < 2 {
+        orbit_println!("Usage: edit <filename>");
+        return;
+    }
+    let path = resolve_path(&state.cwd, parts[1]);
+
+    let (cols, rows) = {
+        if let Some(ref c) = *crate::drivers::console::CONSOLE.lock() {
+            c.dimensions()
+        } else {
+            (80, 24)
+        }
+    };
+    let content_rows = rows.saturating_sub(2);
+
+    let raw: Vec<u8> = crate::vfs::read_file(&path).unwrap_or_default();
+
+    let mut lines: Vec<Vec<u8>> = {
+        let mut v: Vec<Vec<u8>> = raw.split(|&b| b == b'\n')
+            .map(|l| if l.ends_with(b"\r") { l[..l.len() - 1].to_vec() } else { l.to_vec() })
+            .collect();
+        if v.last().map(|l| l.is_empty()).unwrap_or(false) && v.len() > 1 { v.pop(); }
+        if v.is_empty() { v.push(Vec::new()); }
+        v
+    };
+
+    let mut row: usize = 0;
+    let mut col: usize = 0;
+    let mut top: usize = 0;
+    let mut modified = false;
+    let mut status = alloc::string::String::new();
+
+    ed_draw_full(&lines, row, col, top, &path, modified, &status, rows, cols);
+    status.clear();
+
+    loop {
+        let event = read_editor_key();
+        let mut need_full = false;
+
+        match event {
+            // ── Exit ────────────────────────────────────────────────────────
+            KeyEvent::Ctrl('x') | KeyEvent::Ctrl('q') => {
+                if modified {
+                    crate::kprint!("\x1b[{};1H\x1b[7m Save before exit? (y/n) \x1b[K\x1b[0m\x1b[?25h", rows);
+                    loop {
+                        match read_editor_key() {
+                            KeyEvent::Char('y') | KeyEvent::Char('Y') => {
+                                match ed_save(&lines, &path) {
+                                    Ok(_) => {}
+                                    Err(e) => { status = alloc::format!(" Save failed: {}", e); }
+                                }
+                                break;
+                            }
+                            KeyEvent::Char('n') | KeyEvent::Char('N')
+                            | KeyEvent::Ctrl('x') | KeyEvent::Ctrl('q') => break,
+                            _ => {}
+                        }
+                    }
+                }
+                // Restore screen for shell
+                crate::kprint!("\x1b[2J\x1b[1;1H\x1b[?25h\x1b[0m");
+                return;
+            }
+
+            // ── Save ─────────────────────────────────────────────────────────
+            KeyEvent::Ctrl('s') => {
+                match ed_save(&lines, &path) {
+                    Ok(n) => {
+                        modified = false;
+                        status = alloc::format!(" Saved {} bytes to {}", n, path);
+                    }
+                    Err(e) => { status = alloc::format!(" Save failed: {}", e); }
+                }
+                need_full = true;
+            }
+
+            // ── Kill line ────────────────────────────────────────────────────
+            KeyEvent::Ctrl('k') => {
+                let llen = lines[row].len();
+                if col < llen {
+                    lines[row].truncate(col);
+                    modified = true;
+                } else if row + 1 < lines.len() {
+                    let next = lines.remove(row + 1);
+                    lines[row].extend_from_slice(&next);
+                    modified = true;
+                }
+                let max = lines[row].len();
+                if col > max { col = max; }
+                need_full = true;
+            }
+
+            // ── Insert newline ───────────────────────────────────────────────
+            KeyEvent::Enter => {
+                let c = col.min(lines[row].len());
+                let rest = lines[row][c..].to_vec();
+                lines[row].truncate(c);
+                row += 1;
+                lines.insert(row, rest);
+                col = 0;
+                modified = true;
+                if content_rows > 0 && row >= top + content_rows { top = row + 1 - content_rows; }
+                need_full = true;
+            }
+
+            // ── Backspace ────────────────────────────────────────────────────
+            KeyEvent::Backspace => {
+                if col > 0 {
+                    lines[row].remove(col - 1);
+                    col -= 1;
+                    modified = true;
+                } else if row > 0 {
+                    let current = lines.remove(row);
+                    row -= 1;
+                    col = lines[row].len();
+                    lines[row].extend_from_slice(&current);
+                    if row < top { top = row; }
+                    modified = true;
+                    need_full = true;
+                }
+            }
+
+            // ── Delete ───────────────────────────────────────────────────────
+            KeyEvent::Delete => {
+                let llen = lines[row].len();
+                if col < llen {
+                    lines[row].remove(col);
+                    modified = true;
+                } else if row + 1 < lines.len() {
+                    let next = lines.remove(row + 1);
+                    lines[row].extend_from_slice(&next);
+                    modified = true;
+                    need_full = true;
+                }
+            }
+
+            // ── Navigation ───────────────────────────────────────────────────
+            KeyEvent::ArrowUp => {
+                if row > 0 {
+                    row -= 1;
+                    let max = lines[row].len(); if col > max { col = max; }
+                    if row < top { top = row; need_full = true; }
+                }
+            }
+            KeyEvent::ArrowDown => {
+                if row + 1 < lines.len() {
+                    row += 1;
+                    let max = lines[row].len(); if col > max { col = max; }
+                    if content_rows > 0 && row >= top + content_rows {
+                        top = row + 1 - content_rows; need_full = true;
+                    }
+                }
+            }
+            KeyEvent::ArrowLeft => {
+                if col > 0 {
+                    col -= 1;
+                } else if row > 0 {
+                    row -= 1; col = lines[row].len();
+                    if row < top { top = row; need_full = true; }
+                }
+            }
+            KeyEvent::ArrowRight => {
+                let llen = lines[row].len();
+                if col < llen {
+                    col += 1;
+                } else if row + 1 < lines.len() {
+                    row += 1; col = 0;
+                    if content_rows > 0 && row >= top + content_rows {
+                        top = row + 1 - content_rows; need_full = true;
+                    }
+                }
+            }
+            KeyEvent::Home => { col = 0; }
+            KeyEvent::End  => { col = lines[row].len(); }
+            KeyEvent::PageUp => {
+                top = top.saturating_sub(content_rows);
+                row = top;
+                let max = lines[row].len(); if col > max { col = max; }
+                need_full = true;
+            }
+            KeyEvent::PageDown => {
+                let max_top = lines.len().saturating_sub(1);
+                top = (top + content_rows).min(max_top);
+                row = top.min(lines.len().saturating_sub(1));
+                let max = lines[row].len(); if col > max { col = max; }
+                need_full = true;
+            }
+
+            // ── Printable character ─────────────────────────────────────────
+            KeyEvent::Char(ch) if (ch as u32) >= 0x20 => {
+                if col > lines[row].len() { col = lines[row].len(); }
+                lines[row].insert(col, ch as u8);
+                col += 1;
+                modified = true;
+            }
+
+            _ => { continue; }
+        }
+
+        if need_full {
+            ed_draw_full(&lines, row, col, top, &path, modified, &status, rows, cols);
+            status.clear();
+        } else {
+            ed_draw_line(&lines, row, col, top, &path, modified, rows, cols);
+        }
+    }
 }
 
 // ==================== Orbit Print Macros ====================

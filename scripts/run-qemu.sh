@@ -76,7 +76,25 @@ if [ "${1:-}" = "--headless" ] || [ "${2:-}" = "--headless" ]; then
     QEMU_CMD+=(-display none)
     echo "[QEMU] Headless mode (serial only)"
 else
+    # VMware SVGA II virtual GPU (required by kernel driver).
     QEMU_CMD+=(-vga vmware)
+
+    # Display backend selection.
+    # On WSL2, GTK uses the native Wayland protocol (WSLg) which lacks the
+    # relative-pointer-v1 extension QEMU needs for PS/2 mouse grab — this
+    # breaks mouse input and causes crashes on fullscreen.  SDL uses
+    # XWayland (X11) instead and works correctly on WSL2.
+    # Prefer SDL → GTK → default.
+    DISPLAY_HELP=$(qemu-system-x86_64 -display help 2>&1)
+    if echo "${DISPLAY_HELP}" | grep -q 'sdl'; then
+        QEMU_CMD+=(-display sdl)
+        echo "[QEMU] Display: SDL (click window to capture PS/2 mouse)"
+    elif echo "${DISPLAY_HELP}" | grep -q 'gtk'; then
+        QEMU_CMD+=(-display gtk,grab-on-hover=on)
+        echo "[QEMU] Display: GTK (hover to capture mouse; fullscreen may crash on WSL2)"
+    else
+        echo "[QEMU] NOTE: Click inside the QEMU window to capture PS/2 mouse input"
+    fi
 fi
 
 # UEFI firmware

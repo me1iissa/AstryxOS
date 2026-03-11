@@ -36,6 +36,8 @@
             "approve": true,
             "matchCommandLine": true
         },
-        "rustup": true
+        "rustup": true,
+        "timeout": true,
+        "nm": true
     }
 }

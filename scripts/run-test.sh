@@ -7,9 +7,9 @@
 # goes to the serial port (stdout).
 #
 # Usage:
-#   ./scripts/run-test.sh             # Build + run tests, show serial output
-#   ./scripts/run-test.sh --headless  # Same but no QEMU window
-#   ./scripts/run-test.sh --no-build  # Run without rebuilding
+#   ./scripts/run-test.sh            # Build + run tests headless (no QEMU window)
+#   ./scripts/run-test.sh --window   # Same but show the QEMU display window
+#   ./scripts/run-test.sh --no-build # Run without rebuilding
 #
 set -euo pipefail
 
@@ -101,7 +101,7 @@ SERIAL_LOG="${BUILD_DIR}/test-serial.log"
 QEMU_CMD=(
     qemu-system-x86_64
     -machine pc
-    -cpu qemu64
+    -cpu qemu64,+rdtscp
     -m 1G
     -smp 2
     -serial "file:${SERIAL_LOG}"
@@ -114,11 +114,11 @@ QEMU_CMD=(
     -device isa-debug-exit,iobase=0xf4,iosize=0x04
 )
 
-# Display
-if [[ "${1:-}" == "--headless" ]] || [[ "${2:-}" == "--headless" ]]; then
-    QEMU_CMD+=(-display none)
-else
+# Display — headless by default; pass --window to show the QEMU display
+if [[ "${1:-}" == "--window" ]] || [[ "${2:-}" == "--window" ]]; then
     QEMU_CMD+=(-vga vmware)
+else
+    QEMU_CMD+=(-display none)
 fi
 
 # UEFI firmware
@@ -189,10 +189,10 @@ if [ "$PING_MIN" -gt "$PING_MAX" ] 2>/dev/null; then
 fi
 
 # Run QEMU — capture exit code
-# Timeout after 600 seconds to allow all 56 tests to complete
+# Timeout after 1200 seconds (20 min) to allow all tests (including TCC + X11) to complete
 # Use serial file output + tail to stream log reliably
 set +e
-timeout 600 "${QEMU_CMD[@]}" &
+timeout 1200 "${QEMU_CMD[@]}" &
 QEMU_PID=$!
 
 # Stream the serial log in real-time (background tail)
@@ -233,7 +233,7 @@ case ${EXIT_CODE} in
         exit 1
         ;;
     124)
-        echo -e "${RED}${BOLD}  ✗ TIMEOUT — tests did not complete in 600s${NC}"
+        echo -e "${RED}${BOLD}  ✗ TIMEOUT — tests did not complete in 1200s${NC}"
         echo ""
         echo -e "${YELLOW}[TEST] Serial output captured so far:${NC}"
         cat "${SERIAL_LOG}"

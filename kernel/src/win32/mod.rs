@@ -33,15 +33,17 @@ use spin::Mutex;
 pub enum SubsystemType {
     /// NT native — no environment subsystem; uses raw NT APIs.
     Native,
-    /// POSIX personality — default for AstryxOS processes.
-    Posix,
+    /// Aether personality — primary native AstryxOS subsystem.
+    Aether,
+    /// Linux compatibility personality — translates Linux ABI to Aether.
+    Linux,
     /// Win32 personality — Windows-compatible API surface.
     Win32,
 }
 
 impl Default for SubsystemType {
     fn default() -> Self {
-        SubsystemType::Posix
+        SubsystemType::Aether
     }
 }
 
@@ -60,10 +62,19 @@ pub struct SubsystemContext {
 }
 
 impl SubsystemContext {
-    /// Create a default (Posix) subsystem context.
-    pub fn posix() -> Self {
+    /// Create a default (Aether) subsystem context.
+    pub fn aether() -> Self {
         Self {
-            subsystem_type: SubsystemType::Posix,
+            subsystem_type: SubsystemType::Aether,
+            csrss_channel: None,
+            win32_flags: 0,
+        }
+    }
+
+    /// Create a Linux compatibility subsystem context.
+    pub fn linux() -> Self {
+        Self {
+            subsystem_type: SubsystemType::Linux,
             csrss_channel: None,
             win32_flags: 0,
         }
@@ -278,8 +289,14 @@ pub fn init() {
             active: true,
         });
         registry.push(SubsystemEntry {
-            subsystem_type: SubsystemType::Posix,
-            name: String::from("Posix"),
+            subsystem_type: SubsystemType::Aether,
+            name: String::from("Aether"),
+            api_port: String::new(),
+            active: true,
+        });
+        registry.push(SubsystemEntry {
+            subsystem_type: SubsystemType::Linux,
+            name: String::from("Linux"),
             api_port: String::new(),
             active: true,
         });

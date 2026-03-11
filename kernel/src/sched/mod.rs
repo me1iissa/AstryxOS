@@ -20,20 +20,12 @@ const TIME_SLICE: u64 = 5; // ~50 ms at 100 Hz
 static TICKS_REMAINING: [AtomicU64; MAX_CPUS] =
     [const { AtomicU64::new(TIME_SLICE) }; MAX_CPUS];
 
-/// Counter for periodic dead-thread reaping.
-static REAP_COUNTER: AtomicU64 = AtomicU64::new(0);
-/// Reap dead threads every N ticks (~1 second at 100 Hz).
-const REAP_INTERVAL: u64 = 100;
 
 /// Per-CPU reschedule flag: set by timer ISR, checked after interrupt return.
 static NEED_RESCHEDULE: [AtomicBool; MAX_CPUS] =
     [const { AtomicBool::new(false) }; MAX_CPUS];
 
-/// Get the current CPU index (APIC ID).
-#[inline(always)]
-fn cpu_index() -> usize {
-    crate::arch::x86_64::apic::current_apic_id() as usize
-}
+use crate::arch::x86_64::apic::cpu_index;
 
 /// Initialize CoreSched.
 pub fn init() {
@@ -74,28 +66,12 @@ pub fn timer_tick_schedule() {
     // the interrupted code path, skip this tick.
     wake_sleeping_threads();
 
-    // Periodically reap dead threads to free resources.
-    // reap_dead_threads() locks THREAD_TABLE internally; since we're in
-    // interrupt context, only do this if we can be reasonably sure the lock
-    // is free.  The actual reap uses .lock() — if it deadlocks we skip via
-    // the try_lock pattern inside reap_dead_threads_safe().
-    let reap_count = REAP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    if reap_count % REAP_INTERVAL == 0 {
-        reap_dead_threads_isr_safe();
-    }
-
-    // Decay priority boost on the current running thread.
-    // Use try_lock to avoid deadlock with interrupted code holding THREAD_TABLE.
-    {
-        let tid = proc::current_tid();
-        if let Some(mut threads) = THREAD_TABLE.try_lock() {
-            if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
-                if t.priority > t.base_priority {
-                    t.priority -= 1;
-                }
-            }
-        }
-    }
+    // NOTE: Dead-thread reaping (freeing kernel stacks via pmm::free_page)
+    // is intentionally NOT done here.  pmm::free_page acquires PMM_LOCK.
+    // If the interrupted code already holds PMM_LOCK (e.g. free_process_memory),
+    // the ISR would spin on PMM_LOCK forever — a same-CPU re-entrant deadlock.
+    // Reaping is instead done at the start of schedule() where interrupts are
+    // already disabled and no ISR can fire to cause this race.
 
     let cpu = cpu_index();
     let remaining = TICKS_REMAINING[cpu].load(Ordering::Relaxed);
@@ -131,60 +107,81 @@ fn wake_sleeping_threads() {
     }
 }
 
-/// ISR-safe variant of dead thread reaping.
-/// Uses try_lock to avoid deadlock when called from interrupt context.
-fn reap_dead_threads_isr_safe() {
-    let mut threads = match THREAD_TABLE.try_lock() {
-        Some(guard) => guard,
-        None => return,
-    };
-
-    let dead_indices: alloc::vec::Vec<usize> = threads.iter().enumerate()
-        .filter(|(_, t)| {
-            t.state == ThreadState::Dead
-                && t.tid != 0
-                && t.tid < 0x1000
-        })
-        .map(|(i, _)| i)
-        .collect();
-
-    if dead_indices.is_empty() {
-        return;
-    }
-
-    let mut reaped = 0usize;
-    for &idx in dead_indices.iter().rev() {
-        let t = &threads[idx];
-        let stack_base = t.kernel_stack_base;
-        let stack_pages = if t.kernel_stack_size > 0 {
-            (t.kernel_stack_size as usize + 4095) / 4096
-        } else {
-            0
-        };
-
-        threads.swap_remove(idx);
-        reaped += 1;
-
-        if stack_base > 0 && stack_pages > 0 {
-            for p in 0..stack_pages {
-                crate::mm::pmm::free_page(stack_base + (p * 4096) as u64);
-            }
-        }
-    }
-
-    if reaped > 0 {
-        drop(threads); // Release lock before any further action
-        // NOTE: Do NOT serial_println! here — we are in ISR context (timer
-        // interrupt) and the interrupted code may hold the SERIAL spin lock.
-        // Printing would deadlock on the same CPU.
-    }
-}
 
 /// Check if a reschedule is pending (called after returning from interrupt).
+///
+/// Returns immediately if the scheduler is not yet active — this avoids
+/// calling `cpu_index()` (which reads `IA32_TSC_AUX` via `rdmsr`) before
+/// `syscall::init()` has initialised that MSR on the BSP.
 pub fn check_reschedule() {
+    if !is_active() {
+        return;
+    }
     let cpu = cpu_index();
     if NEED_RESCHEDULE[cpu].swap(false, Ordering::Relaxed) {
         schedule();
+    }
+}
+
+/// Reap dead threads and free their kernel stacks.
+///
+/// MUST be called with interrupts already disabled so that pmm::free_page()
+/// cannot deadlock with a concurrent timer ISR that also acquires PMM_LOCK.
+/// Called at the start of schedule() which guarantees IF=0 via disable_interrupts().
+fn reap_dead_threads_sched() {
+    use crate::proc::KERNEL_VIRT_OFFSET;
+
+    // IMPORTANT: Never reap the CURRENT thread. The caller is still running on
+    // its kernel stack — freeing the stack while executing on it is a UAF.
+    // The current thread will be reaped the next time a DIFFERENT thread calls
+    // schedule() and runs this function (with a different current_tid).
+    let current_tid = crate::proc::current_tid();
+
+    // Collect (stack_base, stack_pages) for each reapable thread, removing
+    // them from THREAD_TABLE in the same pass.
+    let stacks: alloc::vec::Vec<(u64, usize)> = {
+        let mut threads = THREAD_TABLE.lock();
+        // A Dead thread is safe to reap only when ctx_rsp_valid == true, which
+        // switch_context_asm sets AFTER saving the thread's RSP (meaning the CPU
+        // has left or is about to leave the thread's kernel stack).  Exit paths
+        // (exit_thread/exit_group) set ctx_rsp_valid=false before calling schedule(),
+        // preventing the AP from freeing the stack while the BSP is still on it.
+        let dead_indices: alloc::vec::Vec<usize> = threads.iter().enumerate()
+            .filter(|(_, t)| {
+                t.is_reapable()
+                    && t.tid != current_tid
+                    && t.ctx_rsp_valid.load(core::sync::atomic::Ordering::Acquire)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if dead_indices.is_empty() {
+            return;
+        }
+        let mut out = alloc::vec::Vec::with_capacity(dead_indices.len());
+        for &idx in dead_indices.iter().rev() {
+            let t = &threads[idx];
+            let base = t.kernel_stack_base;
+            let pages = if t.kernel_stack_size > 0 {
+                (t.kernel_stack_size as usize + 4095) / 4096
+            } else { 0 };
+            threads.swap_remove(idx);
+            if base > 0 && pages > 0 {
+                out.push((base, pages));
+            }
+        }
+        out
+    }; // THREAD_TABLE released before any PMM operations
+
+    // Free kernel stacks with no locks held (interrupts still disabled → safe).
+    for (stack_base, stack_pages) in stacks {
+        let phys_base = if stack_base >= KERNEL_VIRT_OFFSET {
+            stack_base - KERNEL_VIRT_OFFSET
+        } else {
+            stack_base
+        };
+        for p in 0..stack_pages {
+            crate::mm::pmm::free_page(phys_base + (p as u64) * 0x1000);
+        }
     }
 }
 
@@ -207,13 +204,16 @@ pub fn schedule() {
     // switch completes.
     crate::hal::disable_interrupts();
 
+    // Reap dead threads here (interrupts disabled → PMM_LOCK safe, no ISR deadlock).
+    reap_dead_threads_sched();
+
     let current_tid = proc::current_tid();
     let cpu = cpu_index() as u8;
 
     // Find the next ready thread — highest priority wins, round-robin among equals.
     // Prefer threads with matching cpu_affinity, then threads whose last_cpu
     // matches the current CPU (cache locality), then any Ready thread.
-    let (next_tid, next_rsp, next_pid) = {
+    let (next_tid, next_rsp, next_pid, next_kstack_top, next_first_run) = {
         let mut threads = THREAD_TABLE.lock();
         let len = threads.len();
         if len <= 1 {
@@ -250,6 +250,12 @@ pub fn schedule() {
             if t.state != ThreadState::Ready {
                 continue;
             }
+            // Skip threads whose kernel RSP is not yet valid — another CPU is
+            // mid-way through switching them out and hasn't saved the new RSP
+            // yet.  Picking up such a thread would resume it from a stale RSP.
+            if !t.ctx_rsp_valid.load(core::sync::atomic::Ordering::Acquire) {
+                continue;
+            }
             // Skip threads pinned to a different CPU.
             if let Some(aff) = t.cpu_affinity {
                 if aff != cpu {
@@ -273,9 +279,19 @@ pub fn schedule() {
         match best_idx {
             Some(idx) => {
                 // Mark current thread as Ready (unless it's Dead/Blocked/Sleeping).
+                // IMPORTANT: Clear ctx_rsp_valid BEFORE marking Ready.  This prevents
+                // other CPUs from picking up the thread with a stale kernel RSP (SMP
+                // context-switch race guard).  switch_context_asm will set it back to
+                // true atomically right after saving the new RSP.
                 if let Some(cur) = threads.iter_mut().find(|t| t.tid == current_tid) {
                     if cur.state == ThreadState::Running {
+                        cur.ctx_rsp_valid.store(false, core::sync::atomic::Ordering::Release);
                         cur.state = ThreadState::Ready;
+                    }
+                    // Decay priority boost here (outgoing thread, lock already held)
+                    // rather than in the timer ISR to avoid 100 Hz try_lock overhead.
+                    if cur.priority > cur.base_priority {
+                        cur.priority -= 1;
                     }
                 }
 
@@ -285,7 +301,11 @@ pub fn schedule() {
                 let tid = threads[idx].tid;
                 let rsp = threads[idx].context.rsp;
                 let pid = threads[idx].pid;
-                (tid, rsp, pid)
+                let kstack_top = if threads[idx].kernel_stack_base > 0 {
+                    threads[idx].kernel_stack_base + threads[idx].kernel_stack_size
+                } else { 0 };
+                let first_run = threads[idx].first_run;
+                (tid, rsp, pid, kstack_top, first_run)
             }
             None => {
                 // No ready threads on this CPU right now.
@@ -317,7 +337,7 @@ pub fn schedule() {
                     return schedule();
                 }
                 crate::perf::record_idle_tick();
-                return;
+                return  // no semicolon — arm type is !, coerces to tuple type
             }
         }
     };
@@ -332,77 +352,95 @@ pub fn schedule() {
 
     // Perform context switch.
     proc::set_current_tid(next_tid);
-    TICKS_REMAINING[cpu as usize].store(TIME_SLICE, Ordering::Relaxed);
 
-    // Get a raw pointer to the current thread's RSP field.
-    // We need to hold the lock briefly to get the pointer, then release
-    // before calling switch_context (which won't return until we're
-    // scheduled back).
-    let old_rsp_ptr = {
-        let mut threads = THREAD_TABLE.lock();
-        let cur = threads.iter_mut()
-            .find(|t| t.tid == current_tid)
-            .expect("current thread not in table");
-        &mut cur.context.rsp as *mut u64
-    };
+    TICKS_REMAINING[cpu as usize].store(TIME_SLICE, Ordering::Relaxed);
 
     // Update TSS.rsp[0] and SYSCALL_KERNEL_RSP for the next thread.
     // This ensures that interrupts and SYSCALL from Ring 3 land on the
     // correct kernel stack for the newly-scheduled thread.
-    {
-        let threads = THREAD_TABLE.lock();
-        if let Some(t) = threads.iter().find(|t| t.tid == next_tid) {
-            if t.kernel_stack_base > 0 {
-                let kstack_top = t.kernel_stack_base + t.kernel_stack_size;
-                unsafe {
-                    crate::arch::x86_64::gdt::update_tss_rsp0(kstack_top);
-                    crate::syscall::set_kernel_rsp(kstack_top);
-                }
-            }
+    // next_kstack_top was extracted from the main scheduling lock above.
+    unsafe {
+        if next_kstack_top > 0 {
+            crate::arch::x86_64::gdt::update_tss_rsp0(next_kstack_top);
+            crate::syscall::set_kernel_rsp(next_kstack_top);
+        } else {
+            // Switching to idle/kernel thread with no dedicated stack.
+            // Invalidate kernel_rsp so recover_current_tid() slow-path
+            // does not misidentify this thread as the previous user thread.
+            crate::syscall::set_kernel_rsp(0);
         }
     }
 
     // ── Per-process address space switch ─────────────────────────────
     // If the next thread belongs to a different process with a different CR3,
     // switch the page table before switching context.
-    {
-        let procs = crate::proc::PROCESS_TABLE.lock();
-        if let Some(p) = procs.iter().find(|p| p.pid == next_pid) {
-            let new_cr3 = p.cr3;
-            let current_cr3 = crate::mm::vmm::get_cr3();
-            if new_cr3 != 0 && new_cr3 != current_cr3 {
-                unsafe { crate::mm::vmm::switch_cr3(new_cr3); }
-            }
+    //
+    // EXCEPTION: first-run threads (first_run == true) must NOT have their
+    // CR3 switched here.  Their kernel stack was allocated after the user
+    // page table was created, so the user PML4 does not yet contain the
+    // kernel-stack mapping.  Switching to the user CR3 before switch_context
+    // would cause a triple-fault the moment switch_context touches the stack.
+    // user_mode_bootstrap() clears first_run and switches CR3 itself, after
+    // running on the current kernel page table where the stack IS mapped.
+    // next_first_run was extracted from the main scheduling lock above.
+    // KERNEL THREAD CR3 RESTORE: when the next thread is a kernel/idle thread
+    // (p.cr3 == 0), switch back to the kernel's primary page table.  Without
+    // this, a CPU that previously ran a user thread (via user_mode_bootstrap)
+    // retains the user CR3 after that process exits.  free_process_memory then
+    // frees/reallocates those physical pages, corrupting the CPU's page table.
+    if !next_first_run {
+        let next_cr3 = {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            procs.iter().find(|p| p.pid == next_pid).map(|p| p.cr3).unwrap_or(0)
+        };
+        let effective_cr3 = if next_cr3 != 0 {
+            next_cr3
+        } else {
+            crate::mm::vmm::get_kernel_cr3()
+        };
+        let current_cr3 = crate::mm::vmm::get_cr3();
+        if effective_cr3 != 0 && effective_cr3 != current_cr3 {
+            unsafe { crate::mm::vmm::switch_cr3(effective_cr3); }
         }
     }
 
-    // ── FPU/SSE state save for outgoing thread ───────────────────────
-    // Save FPU state lazily: only allocate the 512-byte buffer on first save.
-    {
+    // Get raw pointers to the current thread's RSP and ctx_rsp_valid fields,
+    // and save FPU state, all in a single lock acquisition.  The lock must be
+    // released before switch_context (which won't return until rescheduled).
+    let (old_rsp_ptr, ctx_valid_ptr) = {
         let mut threads = THREAD_TABLE.lock();
-        if let Some(cur) = threads.iter_mut().find(|t| t.tid == current_tid) {
-            if cur.fpu_state.is_none() {
-                cur.fpu_state = Some(alloc::boxed::Box::new(proc::FpuState::new_zeroed()));
-            }
-            if let Some(ref mut fpu) = cur.fpu_state {
-                unsafe {
-                    core::arch::asm!(
-                        "fxsave [{}]",
-                        in(reg) fpu.data.as_mut_ptr(),
-                        options(nostack, preserves_flags),
-                    );
-                }
+        let cur = threads.iter_mut()
+            .find(|t| t.tid == current_tid)
+            .expect("current thread not in table");
+        // ── FPU/SSE state save for outgoing thread ───────────────────────
+        // Save FPU state lazily: only allocate the 512-byte buffer on first save.
+        if cur.fpu_state.is_none() {
+            cur.fpu_state = Some(alloc::boxed::Box::new(proc::FpuState::new_zeroed()));
+        }
+        if let Some(ref mut fpu) = cur.fpu_state {
+            unsafe {
+                core::arch::asm!(
+                    "fxsave [{}]",
+                    in(reg) fpu.data.as_mut_ptr(),
+                    options(nostack, preserves_flags),
+                );
             }
         }
-    }
+        (
+            &mut cur.context.rsp as *mut u64,
+            cur.ctx_rsp_valid.as_ptr() as *mut u8,
+        )
+    };
 
     // SAFETY: old_rsp_ptr and new_rsp are valid. switch_context saves/restores
     // all callee-saved registers and switches stacks.
     // Note: interrupts are disabled (CLI). The switched-to thread will either:
     //   - IRETQ to Ring 3 with IF=1 (new user thread)
     //   - Return here and re-enable below (resumed kernel thread)
+    // ctx_valid_ptr: switch_context_asm sets *ctx_valid_ptr = 1 after saving
+    // old_rsp, preventing other CPUs from using a stale RSP (SMP race guard).
     unsafe {
-        proc::thread::switch_context(old_rsp_ptr, next_rsp);
+        proc::thread::switch_context(old_rsp_ptr, next_rsp, ctx_valid_ptr);
     }
 
     // ── Resumed after being rescheduled back onto this thread ───────
