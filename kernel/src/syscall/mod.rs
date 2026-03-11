@@ -1575,6 +1575,8 @@ fn fill_stat_buf(st: &crate::vfs::FileStat, buf: *mut u8) {
         crate::vfs::FileType::BlockDevice => 4,
         crate::vfs::FileType::Pipe => 5,
         crate::vfs::FileType::EventFd => 5,    // report as FIFO
+        crate::vfs::FileType::TimerFd | crate::vfs::FileType::SignalFd |
+        crate::vfs::FileType::InotifyFd => 5,  // report as FIFO
         crate::vfs::FileType::Socket  => 12,   // DT_SOCK substitute
     };
     out[8..12].copy_from_slice(&ft.to_le_bytes());
@@ -1919,6 +1921,62 @@ fn is_eventfd_fd(pid: u64, fd_num: usize) -> bool {
 
 /// Get the eventfd slot ID for a file descriptor.
 fn get_eventfd_id(pid: u64, fd_num: usize) -> u64 {
+    let procs = crate::proc::PROCESS_TABLE.lock();
+    procs.iter().find(|p| p.pid == pid)
+        .and_then(|p| p.file_descriptors.get(fd_num))
+        .and_then(|f| f.as_ref())
+        .map(|f| f.inode)
+        .unwrap_or(u64::MAX)
+}
+
+// ── timerfd / signalfd / inotifyfd helpers ────────────────────────────────────
+
+fn is_timerfd_fd(pid: u64, fd_num: usize) -> bool {
+    let procs = crate::proc::PROCESS_TABLE.lock();
+    procs.iter().find(|p| p.pid == pid)
+        .and_then(|p| p.file_descriptors.get(fd_num))
+        .and_then(|f| f.as_ref())
+        .map(|f| f.file_type == crate::vfs::FileType::TimerFd)
+        .unwrap_or(false)
+}
+
+fn get_timerfd_id(pid: u64, fd_num: usize) -> u64 {
+    let procs = crate::proc::PROCESS_TABLE.lock();
+    procs.iter().find(|p| p.pid == pid)
+        .and_then(|p| p.file_descriptors.get(fd_num))
+        .and_then(|f| f.as_ref())
+        .map(|f| f.inode)
+        .unwrap_or(u64::MAX)
+}
+
+fn is_signalfd_fd(pid: u64, fd_num: usize) -> bool {
+    let procs = crate::proc::PROCESS_TABLE.lock();
+    procs.iter().find(|p| p.pid == pid)
+        .and_then(|p| p.file_descriptors.get(fd_num))
+        .and_then(|f| f.as_ref())
+        .map(|f| f.file_type == crate::vfs::FileType::SignalFd)
+        .unwrap_or(false)
+}
+
+fn get_signalfd_id(pid: u64, fd_num: usize) -> u64 {
+    let procs = crate::proc::PROCESS_TABLE.lock();
+    procs.iter().find(|p| p.pid == pid)
+        .and_then(|p| p.file_descriptors.get(fd_num))
+        .and_then(|f| f.as_ref())
+        .map(|f| f.inode)
+        .unwrap_or(u64::MAX)
+}
+
+fn is_inotify_fd(pid: u64, fd_num: usize) -> bool {
+    let procs = crate::proc::PROCESS_TABLE.lock();
+    procs.iter().find(|p| p.pid == pid)
+        .and_then(|p| p.file_descriptors.get(fd_num))
+        .and_then(|f| f.as_ref())
+        .map(|f| f.file_type == crate::vfs::FileType::InotifyFd)
+        .unwrap_or(false)
+}
+
+fn get_inotify_id(pid: u64, fd_num: usize) -> u64 {
     let procs = crate::proc::PROCESS_TABLE.lock();
     procs.iter().find(|p| p.pid == pid)
         .and_then(|p| p.file_descriptors.get(fd_num))
@@ -2387,6 +2445,16 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
                 let efd_id = get_eventfd_id(pid, fd);
                 crate::ipc::eventfd::close(efd_id);
             }
+            // Free timerfd / signalfd / inotifyfd slots.
+            if is_timerfd_fd(pid, fd) {
+                crate::ipc::timerfd::close(get_timerfd_id(pid, fd));
+            }
+            if is_signalfd_fd(pid, fd) {
+                crate::ipc::signalfd::close(get_signalfd_id(pid, fd));
+            }
+            if is_inotify_fd(pid, fd) {
+                crate::ipc::inotify::close(get_inotify_id(pid, fd));
+            }
             // If it's an epoll fd, remove the EpollInstance.
             {
                 let is_epoll = {
@@ -2522,6 +2590,14 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
                     } else {
                         events & POLLOUT // write end always writable
                     }
+                } else if is_timerfd_fd(pid, fd) {
+                    let tfd_id = get_timerfd_id(pid, fd);
+                    if crate::ipc::timerfd::is_readable(tfd_id) { events & POLLIN } else { 0 }
+                } else if is_signalfd_fd(pid, fd) {
+                    let sfd_id = get_signalfd_id(pid, fd);
+                    if crate::ipc::signalfd::is_readable(sfd_id) { events & POLLIN } else { 0 }
+                } else if is_inotify_fd(pid, fd) {
+                    0 // inotify stub never delivers events
                 } else {
                     // Regular file: always ready
                     events & (POLLIN | POLLOUT)
@@ -3231,8 +3307,22 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
         284 | 290 => sys_eventfd_linux(arg1 as u64),
         // 293: pipe2(pipefd, flags) — like pipe but with O_CLOEXEC/O_NONBLOCK
         293 => sys_pipe2_linux(arg1 as *mut u32, arg2 as u32),
-        // 435: clone3(args, size)
-        435 => -38, // ENOSYS for now — musl falls back to clone()
+        // 435: clone3(clone_args *args, size_t size)
+        // Extract flags and stack from the clone_args struct and forward to clone.
+        // clone_args layout: flags(u64), pidfd(u64), child_tid(u64), parent_tid(u64),
+        //                    exit_signal(u64), stack(u64), stack_size(u64), tls(u64), ...
+        435 => {
+            if arg2 < 56 || arg1 == 0 { return -22i64; } // EINVAL: struct too small
+            let clone_flags   = unsafe { *(arg1 as *const u64) };
+            let stack_ptr     = unsafe { *((arg1 + 40) as *const u64) };
+            let stack_size    = unsafe { *((arg1 + 48) as *const u64) };
+            let tls           = unsafe { *((arg1 + 56) as *const u64) };
+            let child_tidptr  = unsafe { *((arg1 + 16) as *const u64) };
+            let parent_tidptr = unsafe { *((arg1 + 24) as *const u64) };
+            // stack_ptr points to base; add stack_size to get the top (stack grows down).
+            let sp = if stack_ptr != 0 { stack_ptr + stack_size } else { 0 };
+            dispatch_linux(56, clone_flags, sp, parent_tidptr, child_tidptr, tls, 0)
+        }
 
         // ─── Phase 7: Firefox dependency syscalls ─────────────────────────
 
@@ -3337,12 +3427,20 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
             };
             dispatch_linux(7, arg1, arg2, timeout_ms as u64, 0, 0, 0)
         }
-        // 283: timerfd_create(clockid, flags) — stub ENOSYS
-        283 => -38,
-        // 289: signalfd4(fd, mask, sizemask, flags) — stub ENOSYS
-        289 => -38,
-        // 294: inotify_init1(flags) — stub ENOSYS
-        294 => -38,
+        // 283: timerfd_create(clockid, flags)
+        283 => sys_timerfd_create(arg1 as u32),
+        // 287: timerfd_gettime(fd, curr_value)
+        287 => sys_timerfd_gettime(arg1, arg2),
+        // 288: timerfd_settime(fd, flags, new_value, old_value)
+        288 => sys_timerfd_settime(arg1, arg2 as u32, arg3, arg4),
+        // 289: signalfd4(fd, mask, sizemask, flags)
+        289 => sys_signalfd4(arg1, arg2, arg3, arg4 as u32),
+        // 253: inotify_add_watch(fd, pathname, mask)
+        253 => sys_inotify_add_watch(arg1, arg2, arg3 as u32),
+        // 254: inotify_rm_watch(fd, wd)
+        254 => sys_inotify_rm_watch(arg1, arg2 as i32),
+        // 294: inotify_init1(flags)
+        294 => sys_inotify_init1(arg1 as u32),
         // 319: memfd_create(name, flags) — create an anonymous in-memory file
         319 => sys_memfd_create(arg1, arg2),
         // 23: select(nfds, readfds, writefds, exceptfds, timeout)
@@ -3520,10 +3618,14 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
         270 => sys_select_linux(arg1, arg2, arg3, arg4, arg5),
         // 285: fallocate(fd, mode, offset, len) — stub success
         285 => 0,
-        // 288: timerfd_settime(fd, flags, new_value, old_value) — stub
-        288 => -38, // ENOSYS (timerfd not supported)
-        // 295: openat2(dirfd, path, how, size) — very new, stub ENOSYS
-        295 => -38,
+        // 295: openat2(dirfd, path, how, size) — forward to openat (ignore resolve flags)
+        295 => {
+            // openat2 struct how: { flags: u64, mode: u64, resolve: u64 }
+            // arg1=dirfd, arg2=path, arg3=*how, arg4=sizeof(how)
+            let how_flags = if arg3 != 0 { unsafe { *(arg3 as *const u64) } } else { 0 };
+            let how_mode  = if arg3 != 0 { unsafe { *((arg3 + 8) as *const u64) } } else { 0o644 };
+            dispatch_linux(257, arg1, arg2, how_flags, how_mode, 0, 0) // openat
+        }
         // 316: renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
         316 => {
             let old_raw = read_cstring_from_user(arg2);
@@ -3547,7 +3649,7 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
         }
         // Explicit ENOSYS for syscalls that would silently fail otherwise
         // (give the process a chance to fall back rather than misinterpreting 0)
-        210 | 211 | 214 | 215 | 216 | 237 | 253 | 254 | 255 => -38, // ENOSYS
+        210 | 211 | 214 | 215 | 216 | 237 | 255 => -38, // ENOSYS
 
         _ => {
             crate::serial_println!("[SYSCALL/Linux] Unknown Linux syscall: {}", num);
@@ -3657,6 +3759,12 @@ fn sys_select_linux(
             crate::net::unix::has_data(uid) || crate::net::unix::has_pending(uid)
         } else if is_socket_fd(pid, fd) {
             crate::net::socket::socket_has_data(get_socket_id(pid, fd))
+        } else if is_timerfd_fd(pid, fd) {
+            crate::ipc::timerfd::is_readable(get_timerfd_id(pid, fd))
+        } else if is_signalfd_fd(pid, fd) {
+            crate::ipc::signalfd::is_readable(get_signalfd_id(pid, fd))
+        } else if is_inotify_fd(pid, fd) {
+            false
         } else {
             true // regular file: always ready
         };
@@ -3786,6 +3894,25 @@ fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
             }
             Err(e) => e,
         };
+    } else if is_timerfd_fd(pid, fd as usize) {
+        if count < 8 { return -22; } // EINVAL
+        let tfd_id = get_timerfd_id(pid, fd as usize);
+        return match crate::ipc::timerfd::read(tfd_id) {
+            Ok(val) => {
+                let bytes = val.to_le_bytes();
+                unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr, 8); }
+                8
+            }
+            Err(e) => e,
+        };
+    } else if is_signalfd_fd(pid, fd as usize) {
+        let sfd_id = get_signalfd_id(pid, fd as usize);
+        return match crate::ipc::signalfd::read(sfd_id, buf_ptr, count) {
+            Ok(n) => n as i64,
+            Err(e) => e,
+        };
+    } else if is_inotify_fd(pid, fd as usize) {
+        return -11; // EAGAIN — no events
     }
 
     // ── VFS file descriptors (covers ALL fds including 0/1/2) ──────────────
@@ -4095,6 +4222,8 @@ fn fill_linux_stat(buf: *mut u8, st: &crate::vfs::FileStat) {
         crate::vfs::FileType::BlockDevice => 0o060000 | st.permissions,
         crate::vfs::FileType::Pipe        => 0o010000 | st.permissions,
         crate::vfs::FileType::EventFd     => 0o010000 | st.permissions, // FIFO
+        crate::vfs::FileType::TimerFd | crate::vfs::FileType::SignalFd |
+        crate::vfs::FileType::InotifyFd  => 0o010000 | st.permissions, // FIFO
         crate::vfs::FileType::Socket      => 0o140000 | st.permissions, // S_IFSOCK
     };
     out[24..28].copy_from_slice(&mode.to_le_bytes());
@@ -4384,6 +4513,8 @@ fn sys_getdents64(fd: u64, buf: u64, count: u64) -> i64 {
             crate::vfs::FileType::BlockDevice => 6,  // DT_BLK
             crate::vfs::FileType::Pipe        => 1,  // DT_FIFO
             crate::vfs::FileType::EventFd     => 1,  // DT_FIFO
+            crate::vfs::FileType::TimerFd | crate::vfs::FileType::SignalFd |
+            crate::vfs::FileType::InotifyFd  => 1,  // DT_FIFO
             crate::vfs::FileType::Socket      => 12, // DT_SOCK
         };
         // d_name (offset 19)
@@ -5286,46 +5417,43 @@ fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
     use crate::ipc::epoll::{EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP};
 
     // Snapshot fd metadata with a brief lock hold.
-    // Tuple: (inode, vfs_flags, is_console, is_epoll_sentinel)
-    let info: Option<(u64, u32, bool, bool)> = {
+    let info: Option<(u64, u32, bool, bool, crate::vfs::FileType)> = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         procs.iter().find(|p| p.pid == pid).and_then(|proc| {
             proc.file_descriptors.get(fd)?.as_ref().map(|f| {
                 let is_epoll = f.open_path.as_str() == "[epoll]";
-                (f.inode, f.flags, f.is_console, is_epoll)
+                (f.inode, f.flags, f.is_console, is_epoll, f.file_type)
             })
         })
     };
 
     match info {
-        // fd not in table → fallback for bare stdin / stdout / stderr
         None => match fd { 0 => 0, 1 | 2 => EPOLLOUT, _ => EPOLLERR },
-
-        // epoll-on-epoll not supported
-        Some((_, _, _, true)) => 0,
-
-        // Console fd — only writable
-        Some((_, _, true, _)) => EPOLLOUT,
-
-        // Pipe or regular file
-        Some((inode, flags, false, false)) => {
+        Some((_, _, _, true, _)) => 0,
+        Some((_, _, true, _, _)) => EPOLLOUT,
+        Some((inode, _flags, false, false, crate::vfs::FileType::EventFd)) => {
+            if crate::ipc::eventfd::is_readable(inode) { EPOLLIN } else { 0 }
+        }
+        Some((inode, _flags, false, false, crate::vfs::FileType::TimerFd)) => {
+            if crate::ipc::timerfd::is_readable(inode) { EPOLLIN } else { 0 }
+        }
+        Some((inode, _flags, false, false, crate::vfs::FileType::SignalFd)) => {
+            if crate::ipc::signalfd::is_readable(inode) { EPOLLIN } else { 0 }
+        }
+        Some((_inode, _flags, false, false, crate::vfs::FileType::InotifyFd)) => {
+            0 // stub: never delivers events
+        }
+        Some((inode, flags, false, false, _)) => {
             if flags & 0x8000_0000 != 0 {
-                // Pipe fd — distinguish read-end (flags&1==0) from write-end (flags&1==1)
+                // Pipe fd
                 if flags & 0x01 == 0 {
-                    // Read-end: ready only when data is available
-                    if crate::ipc::pipe::pipe_has_data(inode) {
-                        EPOLLIN
-                    } else if crate::ipc::pipe::pipe_is_eof(inode) {
-                        EPOLLHUP
-                    } else {
-                        0 // empty pipe — not ready
-                    }
+                    if crate::ipc::pipe::pipe_has_data(inode)    { EPOLLIN }
+                    else if crate::ipc::pipe::pipe_is_eof(inode) { EPOLLHUP }
+                    else { 0 }
                 } else {
-                    // Write-end: always ready (we don't model a full ring buffer)
                     EPOLLOUT
                 }
             } else {
-                // Regular file / device — always ready for r+w
                 EPOLLIN | EPOLLOUT
             }
         }
@@ -5466,4 +5594,198 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
         }
     }
     count as i64
+}
+
+// ============================================================================
+// timerfd syscalls
+// ============================================================================
+
+/// `timerfd_create(clockid, flags)` — allocate a timer notification fd.
+fn sys_timerfd_create(clockid: u32) -> i64 {
+    let slot_id = crate::ipc::timerfd::create(clockid);
+    if slot_id == u64::MAX { return -24; } // EMFILE
+
+    let pid = crate::proc::current_pid();
+    let fd = crate::vfs::FileDescriptor::timer_fd(slot_id);
+
+    let mut procs = crate::proc::PROCESS_TABLE.lock();
+    let proc = match procs.iter_mut().find(|p| p.pid == pid) {
+        Some(p) => p,
+        None => { crate::ipc::timerfd::close(slot_id); return -3; }
+    };
+    for (i, slot) in proc.file_descriptors.iter().enumerate() {
+        if slot.is_none() {
+            proc.file_descriptors[i] = Some(fd);
+            return i as i64;
+        }
+    }
+    if proc.file_descriptors.len() < crate::vfs::MAX_FDS_PER_PROCESS {
+        let idx = proc.file_descriptors.len();
+        proc.file_descriptors.push(Some(fd));
+        return idx as i64;
+    }
+    crate::ipc::timerfd::close(slot_id);
+    -24 // EMFILE
+}
+
+/// `timerfd_settime(fd, flags, *new_value, *old_value)` — arm/disarm a timer.
+///
+/// `new_value` is a `struct itimerspec { it_interval, it_value }` where each
+/// timespec is `{ tv_sec: i64, tv_nsec: i64 }` (16 bytes each, 32 bytes total).
+fn sys_timerfd_settime(fd_num: u64, flags: u32, new_value_ptr: u64, old_value_ptr: u64) -> i64 {
+    let pid = crate::proc::current_pid();
+    if !is_timerfd_fd(pid, fd_num as usize) { return -9; } // EBADF
+    let slot_id = get_timerfd_id(pid, fd_num as usize);
+
+    // Read new_value itimerspec (32 bytes): interval (16) then value (16).
+    if !validate_user_ptr(new_value_ptr, 32) { return -14; } // EFAULT
+    let (int_sec, int_nsec, val_sec, val_nsec) = unsafe {
+        let p = new_value_ptr as *const i64;
+        let int_sec  = *p.add(0) as u64;
+        let int_nsec = *p.add(1) as u64;
+        let val_sec  = *p.add(2) as u64;
+        let val_nsec = *p.add(3) as u64;
+        (int_sec, int_nsec, val_sec, val_nsec)
+    };
+    let interval_ns = int_sec.saturating_mul(1_000_000_000).saturating_add(int_nsec);
+    let value_ns    = val_sec.saturating_mul(1_000_000_000).saturating_add(val_nsec);
+
+    match crate::ipc::timerfd::settime(slot_id, flags, value_ns, interval_ns) {
+        None => -9, // EBADF
+        Some((old_int_ns, old_val_ns)) => {
+            // Optionally write old_value back.
+            if old_value_ptr != 0 && validate_user_ptr(old_value_ptr, 32) {
+                let old_int_sec  = (old_int_ns / 1_000_000_000) as i64;
+                let old_int_nsec = (old_int_ns % 1_000_000_000) as i64;
+                let old_val_sec  = (old_val_ns / 1_000_000_000) as i64;
+                let old_val_nsec = (old_val_ns % 1_000_000_000) as i64;
+                unsafe {
+                    let p = old_value_ptr as *mut i64;
+                    *p.add(0) = old_int_sec;
+                    *p.add(1) = old_int_nsec;
+                    *p.add(2) = old_val_sec;
+                    *p.add(3) = old_val_nsec;
+                }
+            }
+            0
+        }
+    }
+}
+
+/// `timerfd_gettime(fd, *curr_value)` — read current timer setting.
+fn sys_timerfd_gettime(fd_num: u64, curr_value_ptr: u64) -> i64 {
+    let pid = crate::proc::current_pid();
+    if !is_timerfd_fd(pid, fd_num as usize) { return -9; } // EBADF
+    let slot_id = get_timerfd_id(pid, fd_num as usize);
+    let (interval_ns, value_ns) = crate::ipc::timerfd::gettime(slot_id);
+
+    if curr_value_ptr != 0 && validate_user_ptr(curr_value_ptr, 32) {
+        let int_sec  = (interval_ns / 1_000_000_000) as i64;
+        let int_nsec = (interval_ns % 1_000_000_000) as i64;
+        let val_sec  = (value_ns   / 1_000_000_000) as i64;
+        let val_nsec = (value_ns   % 1_000_000_000) as i64;
+        unsafe {
+            let p = curr_value_ptr as *mut i64;
+            *p.add(0) = int_sec;
+            *p.add(1) = int_nsec;
+            *p.add(2) = val_sec;
+            *p.add(3) = val_nsec;
+        }
+    }
+    0
+}
+
+// ============================================================================
+// signalfd4 syscall
+// ============================================================================
+
+/// `signalfd4(fd, *sigmask, sizemask, flags)` — create or update a signalfd.
+///
+/// If `fd == -1`, create a new signalfd. Otherwise update the mask of fd.
+fn sys_signalfd4(fd_num: u64, mask_ptr: u64, sizemask: u64, _flags: u32) -> i64 {
+    if sizemask < 8 || !validate_user_ptr(mask_ptr, 8) { return -22; } // EINVAL/EFAULT
+    let sigmask = unsafe { *(mask_ptr as *const u64) };
+    let pid = crate::proc::current_pid();
+
+    // fd == u64::MAX means -1 (create new).
+    if fd_num == u64::MAX || fd_num as i64 == -1 {
+        let slot_id = crate::ipc::signalfd::create(pid, sigmask);
+        if slot_id == u64::MAX { return -24; } // EMFILE
+
+        let fd = crate::vfs::FileDescriptor::signal_fd(slot_id);
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        let proc = match procs.iter_mut().find(|p| p.pid == pid) {
+            Some(p) => p,
+            None => { crate::ipc::signalfd::close(slot_id); return -3; }
+        };
+        for (i, slot) in proc.file_descriptors.iter().enumerate() {
+            if slot.is_none() {
+                proc.file_descriptors[i] = Some(fd);
+                return i as i64;
+            }
+        }
+        if proc.file_descriptors.len() < crate::vfs::MAX_FDS_PER_PROCESS {
+            let idx = proc.file_descriptors.len();
+            proc.file_descriptors.push(Some(fd));
+            return idx as i64;
+        }
+        crate::ipc::signalfd::close(slot_id);
+        -24 // EMFILE
+    } else {
+        // Update existing signalfd's mask.
+        if !is_signalfd_fd(pid, fd_num as usize) { return -9; } // EBADF
+        crate::ipc::signalfd::update_mask(get_signalfd_id(pid, fd_num as usize), sigmask);
+        fd_num as i64
+    }
+}
+
+// ============================================================================
+// inotify syscalls
+// ============================================================================
+
+/// `inotify_init1(flags)` — create an inotify file descriptor.
+fn sys_inotify_init1(_flags: u32) -> i64 {
+    let slot_id = crate::ipc::inotify::create();
+    if slot_id == u64::MAX { return -24; } // EMFILE
+
+    let pid = crate::proc::current_pid();
+    let fd = crate::vfs::FileDescriptor::inotify_fd(slot_id);
+
+    let mut procs = crate::proc::PROCESS_TABLE.lock();
+    let proc = match procs.iter_mut().find(|p| p.pid == pid) {
+        Some(p) => p,
+        None => { crate::ipc::inotify::close(slot_id); return -3; }
+    };
+    for (i, slot) in proc.file_descriptors.iter().enumerate() {
+        if slot.is_none() {
+            proc.file_descriptors[i] = Some(fd);
+            return i as i64;
+        }
+    }
+    if proc.file_descriptors.len() < crate::vfs::MAX_FDS_PER_PROCESS {
+        let idx = proc.file_descriptors.len();
+        proc.file_descriptors.push(Some(fd));
+        return idx as i64;
+    }
+    crate::ipc::inotify::close(slot_id);
+    -24
+}
+
+/// `inotify_add_watch(fd, pathname, mask)` — add a watch descriptor.
+fn sys_inotify_add_watch(fd_num: u64, path_ptr: u64, mask: u32) -> i64 {
+    let pid = crate::proc::current_pid();
+    if !is_inotify_fd(pid, fd_num as usize) { return -9; } // EBADF
+    let id = get_inotify_id(pid, fd_num as usize);
+    let path_bytes = read_cstring_from_user(path_ptr);
+    let path = core::str::from_utf8(path_bytes).unwrap_or("");
+    let wd = crate::ipc::inotify::add_watch(id, path, mask);
+    if wd < 0 { -1 } else { wd as i64 }
+}
+
+/// `inotify_rm_watch(fd, wd)` — remove a watch descriptor.
+fn sys_inotify_rm_watch(fd_num: u64, wd: i32) -> i64 {
+    let pid = crate::proc::current_pid();
+    if !is_inotify_fd(pid, fd_num as usize) { return -9; } // EBADF
+    let id = get_inotify_id(pid, fd_num as usize);
+    if crate::ipc::inotify::rm_watch(id, wd) { 0 } else { -22 }
 }

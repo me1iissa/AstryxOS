@@ -341,6 +341,14 @@ fn handle_request(fd: u64, data: &[u8]) {
         proto::OP_CLEAR_AREA            => op_clear_area(fd, data),
         proto::OP_COPY_AREA             => op_copy_area(fd, data),
         proto::RENDER_MAJOR_OPCODE      => op_render(fd, data, seq),
+        proto::SHM_MAJOR_OPCODE        => op_shm(fd, data, seq),
+        proto::XFIXES_MAJOR_OPCODE     => op_xfixes(fd, data, seq),
+        proto::DAMAGE_MAJOR_OPCODE     => op_damage(fd, data, seq),
+        proto::XINPUT_MAJOR_OPCODE     => op_xinput(fd, data, seq),
+        proto::COMPOSITE_MAJOR_OPCODE  => op_composite(fd, data, seq),
+        proto::XTEST_MAJOR_OPCODE      => op_xtest(fd, data, seq),
+        proto::SYNC_MAJOR_OPCODE       => op_sync_ext(fd, data, seq),
+        proto::DPMS_MAJOR_OPCODE       => op_dpms(fd, data, seq),
         proto::OP_POLY_FILL_RECTANGLE   => op_poly_fill_rect(fd, data),
         proto::OP_PUT_IMAGE             => op_put_image(fd, data),
         proto::OP_IMAGE_TEXT8           => op_image_text8(fd, data),
@@ -1154,11 +1162,20 @@ fn op_query_extension(fd: u64, data: &[u8], seq: u16) {
     let name = if data.len() >= 8+nlen { core::str::from_utf8(&data[8..8+nlen]).unwrap_or("") } else { "" };
     let mut b = [0u8;32]; b[0]=1; w16(&mut b,2,seq);
     match name {
-        "MIT-SHM"   => { b[8]=1; b[9]=65; b[10]=65; }
-        "XKEYBOARD" => { b[8]=1; b[9]=66; b[10]=67; }
-        "SHAPE"     => { b[8]=1; b[9]=67; b[10]=68; }
-        "RENDER"    => { b[8]=1; b[9]=proto::RENDER_MAJOR_OPCODE; b[10]=0; b[11]=0; }
-        _           => {}
+        "MIT-SHM"   => { b[8]=1; b[9]=proto::SHM_MAJOR_OPCODE;    b[10]=proto::SHM_MAJOR_OPCODE; }
+        "XKEYBOARD" => { b[8]=1; b[9]=proto::XKEYBOARD_MAJOR_OPCODE; b[10]=proto::XKEYBOARD_MAJOR_OPCODE; }
+        "SHAPE"     => { b[8]=1; b[9]=proto::SHAPE_MAJOR_OPCODE;   b[10]=proto::SHAPE_MAJOR_OPCODE; }
+        "RENDER"    => { b[8]=1; b[9]=proto::RENDER_MAJOR_OPCODE;  b[10]=0; b[11]=0; }
+        "XFIXES"    => { b[8]=1; b[9]=proto::XFIXES_MAJOR_OPCODE;  b[10]=0; b[11]=0; }
+        "DAMAGE"    => { b[8]=1; b[9]=proto::DAMAGE_MAJOR_OPCODE;  b[10]=0; b[11]=0; }
+        "XTEST"     => { b[8]=1; b[9]=proto::XTEST_MAJOR_OPCODE;   b[10]=0; b[11]=0; }
+        "XInputExtension" | "XI" | "XInput" => {
+            b[8]=1; b[9]=proto::XINPUT_MAJOR_OPCODE; b[10]=0; b[11]=0;
+        }
+        "DPMS"      => { b[8]=1; b[9]=proto::DPMS_MAJOR_OPCODE;    b[10]=0; b[11]=0; }
+        "SYNC"      => { b[8]=1; b[9]=proto::SYNC_MAJOR_OPCODE;    b[10]=0; b[11]=0; }
+        "COMPOSITE" => { b[8]=1; b[9]=proto::COMPOSITE_MAJOR_OPCODE; b[10]=0; b[11]=0; }
+        _           => {} // not present
     }
     with_client(fd, |c| c.send(&b));
 }
@@ -1166,7 +1183,11 @@ fn op_query_extension(fd: u64, data: &[u8], seq: u16) {
 // ── ListExtensions (99) ──────────────────────────────────────────────────────
 
 fn op_list_extensions(fd: u64, seq: u16) {
-    let names: &[&[u8]] = &[b"MIT-SHM", b"XKEYBOARD", b"SHAPE", b"RENDER"];
+    let names: &[&[u8]] = &[
+        b"MIT-SHM", b"XKEYBOARD", b"SHAPE", b"RENDER",
+        b"XFIXES", b"DAMAGE", b"XTEST", b"XInputExtension",
+        b"DPMS", b"SYNC", b"COMPOSITE",
+    ];
     let mut body: Vec<u8> = vec![];
     for &n in names { body.push(n.len() as u8); body.extend_from_slice(n); }
     let pd = proto::pad4(body.len()); while body.len() < pd { body.push(0); }
@@ -1578,5 +1599,226 @@ fn op_render_fill_rectangles(fd: u64, data: &[u8]) {
             let rgb = ((cr as u32) << 16) | ((cg as u32) << 8) | (cb as u32);
             crate::gdi::fill_rect_screen(wx + rx, wy + ry, rw, rh, rgb);
         }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// MIT-SHM extension (major opcode 65)
+// ═════════════════════════════════════════════════════════════════════════════
+
+fn op_shm(fd: u64, data: &[u8], seq: u16) {
+    if data.len() < 4 { return; }
+    let minor = data[1];
+    match minor {
+        proto::SHM_QUERY_VERSION => {
+            // ShmQueryVersionReply: shared_pixmaps=0, major=1, minor=2
+            let mut b = [0u8; 32];
+            b[0] = 1; b[1] = 0; // shared_pixmaps = false
+            w16(&mut b, 2, seq);
+            w16(&mut b, 8, 1); w16(&mut b, 10, 2); // version 1.2
+            b[16] = 2; // pixmap_format = ZPixmap
+            with_client(fd, |c| c.send(&b));
+        }
+        // SHM_ATTACH / SHM_DETACH: side-effect, accept silently
+        proto::SHM_ATTACH | proto::SHM_DETACH => {}
+        // SHM_PUT_IMAGE: stub — no real shared memory backing
+        proto::SHM_PUT_IMAGE => {}
+        // SHM_GET_IMAGE: return unimplemented error
+        proto::SHM_GET_IMAGE => {
+            with_client(fd, |c| c.send_error(proto::ERR_IMPLEMENTATION, 0, proto::SHM_MAJOR_OPCODE));
+        }
+        // SHM_CREATE_PIXMAP: accept, treated as no-op
+        proto::SHM_CREATE_PIXMAP => {}
+        _ => {}
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// XFIXES extension (major opcode 69)
+// ═════════════════════════════════════════════════════════════════════════════
+
+fn op_xfixes(fd: u64, data: &[u8], seq: u16) {
+    if data.len() < 4 { return; }
+    let minor = data[1];
+    match minor {
+        proto::XFIXES_QUERY_VERSION => {
+            // XFixesQueryVersionReply: major=5, minor=0 (CARD32 each)
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            w32(&mut b, 8,  5); // major_version
+            w32(&mut b, 12, 0); // minor_version
+            with_client(fd, |c| c.send(&b));
+        }
+        // All other XFIXES ops (hide/show cursor, region ops) are side-effect only
+        _ => {}
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DAMAGE extension (major opcode 70)
+// ═════════════════════════════════════════════════════════════════════════════
+
+fn op_damage(fd: u64, data: &[u8], seq: u16) {
+    if data.len() < 4 { return; }
+    let minor = data[1];
+    match minor {
+        proto::DAMAGE_QUERY_VERSION => {
+            // DamageQueryVersionReply: major=1, minor=1 (CARD32 each)
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            w32(&mut b, 8,  1); // major_version
+            w32(&mut b, 12, 1); // minor_version
+            with_client(fd, |c| c.send(&b));
+        }
+        // Create/Destroy/Subtract/Add: stub accept
+        proto::DAMAGE_CREATE | proto::DAMAGE_DESTROY |
+        proto::DAMAGE_SUBTRACT | proto::DAMAGE_ADD => {}
+        _ => {}
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// XInputExtension / XI2 (major opcode 72)
+// ═════════════════════════════════════════════════════════════════════════════
+
+fn op_xinput(fd: u64, data: &[u8], seq: u16) {
+    if data.len() < 4 { return; }
+    let minor = data[1];
+    match minor {
+        proto::XI_QUERY_VERSION => {
+            // XIQueryVersionReply: major=2, minor=3 (CARD16 each)
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            w16(&mut b, 8,  2); // major_version
+            w16(&mut b, 10, 3); // minor_version
+            with_client(fd, |c| c.send(&b));
+        }
+        proto::XI_GET_CLIENT_POINTER => {
+            // XIGetClientPointerReply: device_id = 2 (default pointer)
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            w16(&mut b, 8, 2); // device_id
+            with_client(fd, |c| c.send(&b));
+        }
+        // XI_SELECT_EVENTS: side-effect only
+        proto::XI_SELECT_EVENTS => {}
+        _ => {}
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// COMPOSITE extension (major opcode 75)
+// ═════════════════════════════════════════════════════════════════════════════
+
+fn op_composite(fd: u64, data: &[u8], seq: u16) {
+    if data.len() < 4 { return; }
+    let minor = data[1];
+    match minor {
+        proto::COMPOSITE_QUERY_VERSION => {
+            // CompositeQueryVersionReply: major=0, minor=4 (CARD32 each)
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            w32(&mut b, 8,  0); // major_version
+            w32(&mut b, 12, 4); // minor_version
+            with_client(fd, |c| c.send(&b));
+        }
+        proto::COMPOSITE_GET_OVERLAY_WINDOW => {
+            // Return root window id as the overlay window
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            w32(&mut b, 8, proto::ROOT_WINDOW_ID);
+            with_client(fd, |c| c.send(&b));
+        }
+        // All other Composite ops: redirect/unredirect, name pixmap — side-effect only
+        _ => {}
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// XTEST extension (major opcode 71)
+// ═════════════════════════════════════════════════════════════════════════════
+
+fn op_xtest(fd: u64, data: &[u8], seq: u16) {
+    if data.len() < 4 { return; }
+    let minor = data[1];
+    match minor {
+        0 => {
+            // XTestGetVersionReply: server_major=2 (CARD8 at b[1]), server_minor=2 (CARD16 at b[8])
+            let mut b = [0u8; 32];
+            b[0] = 1; b[1] = 2; // server_major_version
+            w16(&mut b, 2, seq);
+            w16(&mut b, 8, 2); // server_minor_version
+            with_client(fd, |c| c.send(&b));
+        }
+        1 => {
+            // XTestCompareCursor: return Same = true
+            let mut b = [0u8; 32];
+            b[0] = 1; b[1] = 1; // same = true
+            w16(&mut b, 2, seq);
+            with_client(fd, |c| c.send(&b));
+        }
+        // FakeInput (2) / GrabControl (3): side-effect only
+        _ => {}
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SYNC extension (major opcode 74)
+// ═════════════════════════════════════════════════════════════════════════════
+
+fn op_sync_ext(fd: u64, data: &[u8], seq: u16) {
+    if data.len() < 4 { return; }
+    let minor = data[1];
+    match minor {
+        0 => {
+            // SyncInitializeReply: major=3 (CARD8 at b[8]), minor=1 (CARD8 at b[9])
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            b[8] = 3; b[9] = 1; // version 3.1
+            with_client(fd, |c| c.send(&b));
+        }
+        // All SYNC counter/alarm/fence operations: stub accept
+        _ => {}
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DPMS extension (major opcode 73)
+// ═════════════════════════════════════════════════════════════════════════════
+
+fn op_dpms(fd: u64, data: &[u8], seq: u16) {
+    if data.len() < 4 { return; }
+    let minor = data[1];
+    match minor {
+        0 => {
+            // DPMSGetVersion: server_major=2, server_minor=0 (CARD16 each at b[8..12])
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            w16(&mut b, 8, 2); w16(&mut b, 10, 0);
+            with_client(fd, |c| c.send(&b));
+        }
+        1 => {
+            // DPMSCapable: return capable=true
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            b[8] = 1; // capable = true
+            with_client(fd, |c| c.send(&b));
+        }
+        2 => {
+            // DPMSGetTimeouts: standby=0, suspend=0, off=0 (all disabled)
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            with_client(fd, |c| c.send(&b));
+        }
+        7 => {
+            // DPMSInfo: power_level=DPMSModeOn(0), state=enabled
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            w16(&mut b, 8, 0); // power_level = DPMSModeOn
+            b[10] = 1; // state = enabled
+            with_client(fd, |c| c.send(&b));
+        }
+        // SetTimeouts(3), Enable(4), Disable(5), ForceLevel(6): side-effect only
+        _ => {}
     }
 }

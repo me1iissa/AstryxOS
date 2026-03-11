@@ -46,6 +46,7 @@ pub enum VfsError {
     NotEmpty = 39,      // ENOTEMPTY
     Unsupported = 95,   // EOPNOTSUPP
     Io = 5,             // EIO
+    WouldBlock = 11,    // EAGAIN / EWOULDBLOCK
 }
 
 impl From<VfsError> for astryx_shared::NtStatus {
@@ -64,6 +65,7 @@ impl From<VfsError> for astryx_shared::NtStatus {
             VfsError::NotEmpty => STATUS_DIRECTORY_NOT_EMPTY,
             VfsError::Unsupported => STATUS_NOT_SUPPORTED,
             VfsError::Io => STATUS_IO_DEVICE_ERROR,
+            VfsError::WouldBlock => STATUS_NO_MORE_FILES,
         }
     }
 }
@@ -83,6 +85,12 @@ pub enum FileType {
     EventFd,
     /// Unix-domain or TCP socket unified into the fd table.
     Socket,
+    /// timerfd — POSIX interval timer notification fd.
+    TimerFd,
+    /// signalfd — signal delivery via fd.
+    SignalFd,
+    /// inotify — filesystem event notification fd (stub: no events delivered).
+    InotifyFd,
 }
 
 /// File open flags.
@@ -217,6 +225,30 @@ impl FileDescriptor {
         Self {
             inode: pipe_id, mount_idx: usize::MAX, offset: 0,
             flags: 0x8000_0000, file_type: FileType::Pipe,
+            is_console: false, open_path: String::new(),
+        }
+    }
+    /// timerfd sentinel fd.  `slot_id` is the index into the timerfd table.
+    pub fn timer_fd(slot_id: u64) -> Self {
+        Self {
+            inode: slot_id, mount_idx: usize::MAX, offset: 0,
+            flags: 0, file_type: FileType::TimerFd,
+            is_console: false, open_path: String::new(),
+        }
+    }
+    /// signalfd sentinel fd.  `slot_id` is the index into the signalfd table.
+    pub fn signal_fd(slot_id: u64) -> Self {
+        Self {
+            inode: slot_id, mount_idx: usize::MAX, offset: 0,
+            flags: 0, file_type: FileType::SignalFd,
+            is_console: false, open_path: String::new(),
+        }
+    }
+    /// inotifyfd sentinel fd.  `slot_id` is the index into the inotify table.
+    pub fn inotify_fd(slot_id: u64) -> Self {
+        Self {
+            inode: slot_id, mount_idx: usize::MAX, offset: 0,
+            flags: 0, file_type: FileType::InotifyFd,
             is_console: false, open_path: String::new(),
         }
     }
@@ -1031,49 +1063,171 @@ pub fn close(pid: crate::proc::Pid, fd_num: usize) -> VfsResult<()> {
 
 /// Read from a file descriptor.
 pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize) -> VfsResult<usize> {
-    let (mount_idx, inode, offset, flags) = {
+    let (mount_idx, inode, offset, flags, file_type, open_path) = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         let proc = procs.iter().find(|p| p.pid == pid).ok_or(VfsError::InvalidArg)?;
         let fd = proc.file_descriptors.get(fd_num)
             .and_then(|f| f.as_ref())
             .ok_or(VfsError::BadFd)?;
         if fd.is_console { return Err(VfsError::Unsupported); }
-        (fd.mount_idx, fd.inode, fd.offset, fd.flags)
+        (fd.mount_idx, fd.inode, fd.offset, fd.flags, fd.file_type, fd.open_path.clone())
     };
 
-    // ── Special character devices ─────────────────────────────────────────
-    // bit 26 = /dev/null  → always return 0 bytes (EOF)
-    if flags & 0x0400_0000 != 0 { return Ok(0); }
-    // bit 25 = /dev/zero  → fill buffer with zeros
-    if flags & 0x0200_0000 != 0 {
-        unsafe { core::ptr::write_bytes(buf, 0, count); }
-        return Ok(count);
-    }
-    // bit 24 = /dev/urandom | /dev/random  → fill with pseudo-random bytes
-    if flags & 0x0100_0000 != 0 {
-        let t = crate::arch::x86_64::irq::get_ticks();
-        for i in 0..count {
-            unsafe { *buf.add(i) = (t.wrapping_add(i as u64).wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) & 0xFF) as u8; }
+    // ── Special fd types (timerfd / signalfd / inotifyfd) ──────────────────
+    match file_type {
+        FileType::TimerFd => {
+            if count < 8 { return Err(VfsError::InvalidArg); }
+            match crate::ipc::timerfd::read(inode) {
+                Ok(val) => {
+                    let bytes = val.to_le_bytes();
+                    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, 8); }
+                    Ok(8)
+                }
+                Err(e) => Err(if e == -11 { VfsError::WouldBlock } else { VfsError::BadFd }),
+            }
         }
-        return Ok(count);
+        FileType::SignalFd => {
+            match crate::ipc::signalfd::read(inode, buf, count) {
+                Ok(n) => Ok(n),
+                Err(e) => Err(if e == -11 { VfsError::WouldBlock } else { VfsError::BadFd }),
+            }
+        }
+        FileType::InotifyFd => {
+            Err(VfsError::WouldBlock) // never any events
+        }
+        _ => {
+            // ── Special character devices ─────────────────────────────────────────
+            // bit 26 = /dev/null  → always return 0 bytes (EOF)
+            if flags & 0x0400_0000 != 0 { return Ok(0); }
+            // bit 25 = /dev/zero  → fill buffer with zeros
+            if flags & 0x0200_0000 != 0 {
+                unsafe { core::ptr::write_bytes(buf, 0, count); }
+                return Ok(count);
+            }
+            // bit 24 = /dev/urandom | /dev/random  → fill with pseudo-random bytes
+            if flags & 0x0100_0000 != 0 {
+                let t = crate::arch::x86_64::irq::get_ticks();
+                for i in 0..count {
+                    unsafe { *buf.add(i) = (t.wrapping_add(i as u64).wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) & 0xFF) as u8; }
+                }
+                return Ok(count);
+            }
+
+            // ── Dynamic /proc entries ──────────────────────────────────────────
+            if open_path == "/proc/self/maps" || open_path.ends_with("/maps") {
+                let content = generate_proc_maps(pid);
+                return serve_dynamic_read(&content, offset, buf, count, pid, fd_num);
+            }
+            if open_path == "/proc/self/status" || open_path.ends_with("/status") {
+                let content = generate_proc_status(pid);
+                return serve_dynamic_read(&content, offset, buf, count, pid, fd_num);
+            }
+            if open_path == "/proc/self/stat" || open_path.ends_with("/stat") {
+                let content = generate_proc_stat(pid);
+                return serve_dynamic_read(&content, offset, buf, count, pid, fd_num);
+            }
+
+            let mut buffer = unsafe { core::slice::from_raw_parts_mut(buf, count) };
+            let n = {
+                let mounts = MOUNTS.lock();
+                mounts[mount_idx].fs.read(inode, offset, &mut buffer)?
+            };
+
+            // Update offset.
+            {
+                let mut procs = crate::proc::PROCESS_TABLE.lock();
+                let proc = procs.iter_mut().find(|p| p.pid == pid).unwrap();
+                if let Some(Some(fd)) = proc.file_descriptors.get_mut(fd_num) {
+                    fd.offset += n as u64;
+                }
+            }
+
+            Ok(n)
+        }
     }
+}
 
-    let mut buffer = unsafe { core::slice::from_raw_parts_mut(buf, count) };
-    let n = {
-        let mounts = MOUNTS.lock();
-        mounts[mount_idx].fs.read(inode, offset, &mut buffer)?
-    };
-
-    // Update offset.
+/// Helper: serve a slice of dynamic content at `offset` into `buf`, advance fd offset.
+fn serve_dynamic_read(content: &[u8], offset: u64, buf: *mut u8, count: usize,
+                       pid: crate::proc::Pid, fd_num: usize) -> VfsResult<usize> {
+    let start = offset as usize;
+    if start >= content.len() { return Ok(0); }
+    let available = content.len() - start;
+    let n = available.min(count);
+    unsafe { core::ptr::copy_nonoverlapping(content.as_ptr().add(start), buf, n); }
     {
         let mut procs = crate::proc::PROCESS_TABLE.lock();
-        let proc = procs.iter_mut().find(|p| p.pid == pid).unwrap();
-        if let Some(Some(fd)) = proc.file_descriptors.get_mut(fd_num) {
-            fd.offset += n as u64;
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            if let Some(Some(fd)) = p.file_descriptors.get_mut(fd_num) {
+                fd.offset += n as u64;
+            }
         }
     }
-
     Ok(n)
+}
+
+/// Generate /proc/self/maps content from the process's VMAs.
+fn generate_proc_maps(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
+    use alloc::string::ToString;
+    let vmas = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid)
+            .and_then(|p| p.vm_space.as_ref().map(|vs| vs.areas.clone()))
+            .unwrap_or_default()
+    };
+    let mut out = alloc::vec::Vec::new();
+    for vma in &vmas {
+        use crate::mm::vma::{PROT_READ, PROT_WRITE, PROT_EXEC, MAP_ANONYMOUS};
+        let r = if vma.prot & PROT_READ  != 0 { 'r' } else { '-' };
+        let w = if vma.prot & PROT_WRITE != 0 { 'w' } else { '-' };
+        let x = if vma.prot & PROT_EXEC  != 0 { 'x' } else { '-' };
+        let s = if vma.flags & MAP_ANONYMOUS != 0 { 'p' } else { 's' };
+        let line = alloc::format!(
+            "{:016x}-{:016x} {}{}{}{} 00000000 00:00 0 {}\n",
+            vma.base, vma.base + vma.length, r, w, x, s, vma.name
+        );
+        out.extend_from_slice(line.as_bytes());
+    }
+    if out.is_empty() {
+        // Fallback for processes without VmSpace (kernel threads).
+        out.extend_from_slice(b"0000000000000000-0000000000001000 r--p 00000000 00:00 0 [vvar]\n");
+    }
+    out
+}
+
+/// Generate /proc/self/status content for the process.
+fn generate_proc_status(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
+    let (name, ppid) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid)
+            .map(|p| (
+                p.exe_path.clone().unwrap_or_else(|| alloc::string::String::from("astryx")),
+                p.parent_pid,
+            ))
+            .unwrap_or_else(|| (alloc::string::String::from("astryx"), 0))
+    };
+    let short_name = name.rsplit('/').next().unwrap_or(&name);
+    alloc::format!(
+        "Name:\t{}\nState:\tR (running)\nPid:\t{}\nPPid:\t{}\n\
+         Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n\
+         VmRSS:\t4096 kB\nVmSize:\t65536 kB\nThreads:\t1\n\
+         voluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n",
+        short_name, pid, ppid
+    ).into_bytes()
+}
+
+/// Generate /proc/self/stat content for the process.
+fn generate_proc_stat(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
+    let ppid = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid)
+            .map(|p| p.parent_pid)
+            .unwrap_or(0)
+    };
+    alloc::format!(
+        "{} (astryx) R {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 0 65536 0\n",
+        pid, ppid
+    ).into_bytes()
 }
 
 /// Write to a file descriptor.

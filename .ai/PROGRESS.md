@@ -2,7 +2,7 @@
 
 ## Current Phase: Subsystem Architecture — Phase 5 Ascension Init (next)
 **Current**: 2026-03-11
-**Tests**: 70/70 passing (SMP -smp 2 stable, 3/3 consecutive runs)
+**Tests**: 74/74 passing (SMP -smp 2 stable)
 
 ### Milestone 21 — Phase 3: TinyCC Compiler Toolchain (✅)
 **Completed**: 2026-03-06
@@ -164,6 +164,63 @@
   SLIRP DNS is unreliable by nature; DNS stack correctness is already validated by ARP/ICMP.
 
 - [x] **68/68 tests passing; 3/3 additional stability runs clean**
+
+---
+
+### Milestone 30 — X11 Extensions + timerfd + signalfd + inotify + /proc dynamic (✅)
+**Completed**: 2026-03-11
+
+**Features implemented:**
+
+**timerfd (kernel/src/ipc/timerfd.rs):**
+- Full PIT-tick timer file descriptors (100 Hz / 10ms resolution)
+- Syscalls 283/287/288 (timerfd_create/gettime/settime)
+- TFD_TIMER_ABSTIME flag support, one-shot and repeating modes
+- `is_readable` for poll/epoll, `read` returns LE-u64 expiration count
+
+**signalfd (kernel/src/ipc/signalfd.rs):**
+- Signal delivery via file descriptor; dequeues matching pending signals
+- 128-byte `SfdSiginfo` repr(C) struct with ssi_signo + SI_KERNEL code
+- Syscall 289 (signalfd4), mask update via re-creation
+
+**inotify stub (kernel/src/ipc/inotify.rs):**
+- Accepts inotify_init1/add_watch/rm_watch syscalls (253/254/294)
+- Never delivers events (read → EAGAIN), applications fall back gracefully
+- Incrementing watch descriptors for API compatibility
+
+**clone3 (syscall 435) / openat2 (syscall 295):**
+- clone3 extracts clone_args struct fields and delegates to existing clone (56)
+- openat2 forwards to openat (257) by reading flags/mode from open_how
+
+**Dynamic /proc/self/maps, /proc/self/status, /proc/self/stat:**
+- Generated at read-time from process VmSpace VMAs and process table
+- Maps lines: `addr-end rwxp offset dev ino name` format
+
+**X11 extension handler functions (kernel/src/x11/mod.rs):**
+- op_shm: MIT-SHM QueryVersion (1.2, no shared pixmaps)
+- op_xfixes: XFIXES QueryVersion (5.0)
+- op_damage: DAMAGE QueryVersion (1.1)
+- op_xinput: XI2 QueryVersion (2.3), GetClientPointer, SelectEvents
+- op_composite: COMPOSITE QueryVersion (0.4), GetOverlayWindow
+- op_xtest: XTEST GetVersion (2.2), CompareCursor
+- op_sync_ext: SYNC Initialize (3.1)
+- op_dpms: DPMS GetVersion (2.0), Capable, GetTimeouts, Info
+
+**X11 extension opcodes corrected to 128-255 range** (per X11 spec):
+- RENDER=139, SHAPE=128, XTEST=132, SYNC=134, XKEYBOARD=135,
+  XFIXES=140, DAMAGE=141, COMPOSITE=142, DPMS=145, XI2=131, SHM=130
+
+**FileType enum additions:**
+- TimerFd, SignalFd, InotifyFd variants
+- All stat/dirent/getdents64 match arms updated
+
+**Tests 72-75 added:**
+- test_timerfd: create/settime/gettime/disarm/EAGAIN/close
+- test_signalfd: create/inject/is_readable/read/consume
+- test_inotify: create/add_watch/rm_watch/increment/close
+- test_x11_extensions: SHM+XFIXES+DAMAGE+XI2 QueryVersion via wire protocol
+
+**Verified**: 74/74 tests passing.
 
 ---
 
