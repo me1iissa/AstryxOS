@@ -1533,9 +1533,17 @@ fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u64, offset:
         None => return -3, // ESRCH
     };
 
-    // Ensure process has a VmSpace; lazily create one for kernel processes.
+    // Ensure process has a VmSpace.
+    // For vfork children (vm_space=None, shared parent CR3): create a VmSpace
+    // that uses the process's actual CR3 (shared with parent) so mmap pages
+    // go into the correct page table.
     if proc.vm_space.is_none() {
-        proc.vm_space = Some(VmSpace::new_kernel());
+        let cr3 = proc.cr3;
+        if cr3 != 0 {
+            proc.vm_space = Some(VmSpace::from_existing_cr3(cr3));
+        } else {
+            proc.vm_space = Some(VmSpace::new_kernel());
+        }
     }
     let space = proc.vm_space.as_mut().unwrap();
 
