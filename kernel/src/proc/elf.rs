@@ -23,6 +23,14 @@ use crate::mm::{pmm, vmm};
 use crate::mm::vma::{VmArea, VmBacking, VmFlags, VmProt, PROT_READ, PROT_WRITE, PROT_EXEC, MAP_PRIVATE, MAP_ANONYMOUS, MAP_STACK};
 use alloc::vec::Vec;
 
+/// Convert a physical page address to a kernel-accessible virtual pointer.
+/// Uses the higher-half direct map (0xFFFF_8000_0000_0000) which works
+/// regardless of which user CR3 is active (shared via PML4[256-511]).
+#[inline(always)]
+fn phys_to_virt(phys: u64) -> *mut u8 {
+    (0xFFFF_8000_0000_0000u64 + phys) as *mut u8
+}
+
 /// Kernel-side cache for the dynamic interpreter binary.
 ///
 /// ld-musl-x86_64.so.1 is ~840 KiB. On WSL2/KVM each ATA PIO sector read
@@ -398,7 +406,7 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
                 let p = pmm::alloc_page().ok_or(ElfError::OutOfMemory)?;
                 allocated_pages.push(p);
                 // Zero the new page.
-                unsafe { core::ptr::write_bytes(p as *mut u8, 0, pmm::PAGE_SIZE); }
+                unsafe { core::ptr::write_bytes(phys_to_virt(p), 0, pmm::PAGE_SIZE); }
                 (p, false)
             };
 
@@ -425,7 +433,7 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
                 if copy_len > 0 && data_offset < data.len() {
                     let actual_len = copy_len.min(data.len() - data_offset);
                     unsafe {
-                        let dst = (phys as *mut u8).add(copy_start);
+                        let dst = phys_to_virt(phys).add(copy_start);
                         let src = data.as_ptr().add(data_offset);
                         core::ptr::copy_nonoverlapping(src, dst, actual_len);
                     }
@@ -499,7 +507,7 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
         allocated_pages.push(phys);
 
         unsafe {
-            core::ptr::write_bytes(phys as *mut u8, 0, pmm::PAGE_SIZE);
+            core::ptr::write_bytes(phys_to_virt(phys), 0, pmm::PAGE_SIZE);
         }
 
         let flags = vmm::PAGE_PRESENT | vmm::PAGE_WRITABLE | vmm::PAGE_USER | vmm::PAGE_NO_EXECUTE;
@@ -577,7 +585,7 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
         if let Some(tls_phys) = crate::mm::pmm::alloc_pages(npages) {
             // Zero entire TLS area.
             let tls_slice = unsafe {
-                core::slice::from_raw_parts_mut(tls_phys as *mut u8, total)
+                core::slice::from_raw_parts_mut(phys_to_virt(tls_phys), total)
             };
             tls_slice.fill(0);
 
@@ -590,7 +598,7 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
             // Write TCB self-pointer at offset `memsz` (points to itself).
             let tcb_va   = tls_virt + memsz as u64;
             let tcb_phys = tls_phys + memsz as u64;
-            unsafe { *(tcb_phys as *mut u64) = tcb_va; }
+            unsafe { *(phys_to_virt(tcb_phys) as *mut u64) = tcb_va; }
 
             // Track TLS pages so they are freed on process exit (same as PT_LOAD pages).
             for pi in 0..npages {
@@ -760,7 +768,7 @@ fn load_elf_dyn(
             } else {
                 let p = pmm::alloc_page().ok_or(ElfError::OutOfMemory)?;
                 allocated_pages.push(p);
-                unsafe { core::ptr::write_bytes(p as *mut u8, 0, pmm::PAGE_SIZE); }
+                unsafe { core::ptr::write_bytes(phys_to_virt(p), 0, pmm::PAGE_SIZE); }
                 (p, false)
             };
 
@@ -779,7 +787,7 @@ fn load_elf_dyn(
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             data.as_ptr().add(data_offset),
-                            (phys as *mut u8).add(copy_start),
+                            phys_to_virt(phys).add(copy_start),
                             actual,
                         );
                     }
@@ -835,7 +843,7 @@ fn stack_write_u64(
     for &(pv, phys) in stack_pages {
         if pv == page_vaddr {
             unsafe {
-                let dst = (phys as *mut u8).add(offset) as *mut u64;
+                let dst = phys_to_virt(phys).add(offset) as *mut u64;
                 core::ptr::write(dst, value);
             }
             return;
@@ -862,7 +870,7 @@ fn stack_write_bytes(
         for &(pv, phys) in stack_pages {
             if pv == page_vaddr {
                 unsafe {
-                    let dst = (phys as *mut u8).add(offset);
+                    let dst = phys_to_virt(phys).add(offset);
                     core::ptr::write(dst, b);
                 }
                 break;
