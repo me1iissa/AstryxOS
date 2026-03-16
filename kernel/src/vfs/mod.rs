@@ -808,7 +808,7 @@ fn init_ata_disks() {
 
 
 /// Resolve a path to (mount_index, inode), following all symlinks.
-fn resolve_path(path: &str) -> VfsResult<(usize, u64)> {
+pub fn resolve_path(path: &str) -> VfsResult<(usize, u64)> {
     resolve_path_opts(path, 0, true)
 }
 

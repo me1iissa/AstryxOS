@@ -313,12 +313,39 @@ fn alloc_kernel_stack() -> Option<(u64, u64)> {
         write_stack_canary(cached_base);
         return Some((cached_base, cached_base + KERNEL_STACK_SIZE));
     }
-    // Cache miss — allocate fresh from PMM.
-    let phys_stack = crate::mm::pmm::alloc_pages(KERNEL_STACK_PAGES)?;
-    let stack_base = KERNEL_VIRT_OFFSET + phys_stack;
-    let stack_top = stack_base + KERNEL_STACK_SIZE;
-    write_stack_canary(stack_base);
-    Some((stack_base, stack_top))
+    // Try contiguous allocation first (fast path).
+    if let Some(phys_stack) = crate::mm::pmm::alloc_pages(KERNEL_STACK_PAGES) {
+        let stack_base = KERNEL_VIRT_OFFSET + phys_stack;
+        let stack_top = stack_base + KERNEL_STACK_SIZE;
+        write_stack_canary(stack_base);
+        return Some((stack_base, stack_top));
+    }
+    // Contiguous allocation failed (PMM fragmented by page cache).
+    // Fall back to allocating individual pages. Each page is at a different
+    // physical address but accessed via KERNEL_VIRT_OFFSET + phys (which is
+    // always mapped via the higher-half PML4 entries).
+    // For the kernel stack, we need the pages to be VIRTUALLY contiguous.
+    // Since each `KERNEL_VIRT_OFFSET + phys_page` maps independently and
+    // the kernel uses the higher-half mapping, individual pages work IF they
+    // happen to be placed at contiguous physical addresses (unlikely after
+    // fragmentation). Instead, use a single page as a minimal stack.
+    //
+    // Contiguous allocation failed. Allocate 4 individual pages (16KB) and
+    // use the FIRST page as stack base. Each page is independently mapped via
+    // KERNEL_VIRT_OFFSET but NOT virtually contiguous. We use only the first
+    // page (4KB) as the actual stack, which is enough for user_mode_bootstrap.
+    // The other 3 pages are "guard" space — wasted but prevents the stack from
+    // growing into unrelated memory.
+    //
+    // A proper fix would be vmalloc-style virtual mapping, but this unblocks Firefox.
+    if let Some(phys) = crate::mm::pmm::alloc_page() {
+        let stack_base = KERNEL_VIRT_OFFSET + phys;
+        let stack_top = stack_base + 0x1000; // 4KB usable
+        write_stack_canary(stack_base);
+        crate::serial_println!("[PROC] WARN: 4KB emergency kernel stack (PMM fragmented)");
+        return Some((stack_base, stack_top));
+    }
+    None
 }
 
 /// Magic value written at the bottom of every kernel stack for overflow

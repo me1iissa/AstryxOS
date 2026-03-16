@@ -369,23 +369,46 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // the 2.7MB firefox-bin + 300KB ld-linux take 5+ minutes cold. By pre-loading
             // here, the desktop compositor can spin while we wait, and the actual
             // Firefox exec is instant (cache hit).
-            serial_println!("[FFTEST] Pre-loading Firefox files from disk (slow ATA PIO)...");
+            // Pre-allocate kernel stacks BEFORE filling the page cache.
+            // The page cache will fragment the PMM bitmap, making contiguous
+            // 16-page (64KB) kernel stack allocations fail. By pre-allocating
+            // stacks now, they're available from the dead-stack cache later.
+            {
+                const PRE_ALLOC_STACKS: usize = 32;
+                let mut prealloc_count = 0;
+                for _ in 0..PRE_ALLOC_STACKS {
+                    if let Some(phys) = mm::pmm::alloc_pages(proc::KERNEL_STACK_PAGES_PUB) {
+                        let base = proc::KERNEL_VIRT_OFFSET + phys;
+                        proc::write_stack_canary(base);
+                        sched::push_dead_stack_pub(base);
+                        prealloc_count += 1;
+                    }
+                }
+                serial_println!("[FFTEST] Pre-allocated {} kernel stacks ({} KiB)",
+                    prealloc_count, prealloc_count * 64);
+            }
+
+            // Pre-populate the PAGE CACHE for key Firefox files.
+            // This reads every 4KB page from disk into PMM-allocated pages
+            // and inserts them into the global page cache.  When ld-linux
+            // later mmap()s these files, demand-paging hits the cache
+            // (instant) instead of reading from disk (5+ minutes on WSL2/KVM).
+            serial_println!("[FFTEST] Pre-populating page cache from disk (slow ATA PIO)...");
             for path in &[
-                "/disk/lib64/ld-linux-x86-64.so.2",
-                "/disk/lib/firefox/firefox-bin",
+                "/disk/lib64/ld-linux-x86-64.so.2",   // 236 KB — instant
+                "/disk/lib/firefox/firefox-bin",       // 2.7 MB — ~10s
+                "/disk/lib/x86_64-linux-gnu/libc.so.6", // 2.0 MB — ~8s
+                "/disk/lib/firefox/libxul.so",          // 194 MB — ~10 min (but worth it)
             ] {
                 let t0 = arch::x86_64::irq::get_ticks();
-                match vfs::read_file(path) {
-                    Ok(data) => {
-                        let dt = arch::x86_64::irq::get_ticks().wrapping_sub(t0);
-                        serial_println!("[FFTEST] Pre-loaded {} ({} bytes) in {} ticks",
-                            path, data.len(), dt);
-                    }
-                    Err(e) => serial_println!("[FFTEST] WARN: Cannot pre-load {}: {:?}", path, e),
-                }
-                // Keep compositor alive during slow I/O
+                let pages = mm::cache::prepopulate_file(path);
+                let dt = arch::x86_64::irq::get_ticks().wrapping_sub(t0);
+                serial_println!("[FFTEST] Cached {} ({} pages, {} ticks = ~{}s)",
+                    path, pages, dt, dt / 100);
                 gui::compositor::compose();
             }
+            let (total, _dirty) = mm::cache::stats();
+            serial_println!("[FFTEST] Page cache: {} pages total", total);
             serial_println!("[FFTEST] Pre-load complete — launching Firefox");
 
             serial_println!("[FFTEST] Launching /disk/lib/firefox/firefox-bin ...");

@@ -462,11 +462,19 @@ impl Fat32Fs {
     /// Ensure a sector is in the sparse cache, loading from device if needed.
     fn ensure_sector(inner: &mut Fat32Inner, device: &dyn BlockDevice, lba: u64) -> Result<(), VfsError> {
         if !inner.sector_cache.contains_key(&lba) {
+            // Evict old sectors if cache is too large (prevents OOM for large file reads).
+            // 8K sectors × 512 bytes = 4MB maximum sector cache footprint.
+            const MAX_SECTOR_CACHE: usize = 8192;
+            if inner.sector_cache.len() >= MAX_SECTOR_CACHE {
+                // Evict the first half (lowest LBAs — likely already consumed).
+                let to_remove: alloc::vec::Vec<u64> = inner.sector_cache.keys()
+                    .take(MAX_SECTOR_CACHE / 2).copied().collect();
+                for k in to_remove { inner.sector_cache.remove(&k); }
+            }
+
             // Batch prefetch: read 8 consecutive sectors (4KB = one cluster) at once.
-            // This uses multi-sector PIO (one command for 8 sectors) instead of
-            // 8 separate commands, reducing VM exits by 8x on WSL2/KVM.
             const BATCH: u32 = 8;
-            let batch_start = lba & !(BATCH as u64 - 1); // align to 8-sector boundary
+            let batch_start = lba & !(BATCH as u64 - 1);
             let mut multi_buf = [0u8; SECTOR_SIZE * BATCH as usize];
             if device.read_sectors(batch_start, BATCH, &mut multi_buf).is_ok() {
                 for i in 0..BATCH {
@@ -479,7 +487,6 @@ impl Fat32Fs {
                     }
                 }
             } else {
-                // Fallback: single sector read
                 let mut buf = [0u8; SECTOR_SIZE];
                 device.read_sector(lba, &mut buf).map_err(|_| VfsError::Io)?;
                 inner.sector_cache.insert(lba, buf);

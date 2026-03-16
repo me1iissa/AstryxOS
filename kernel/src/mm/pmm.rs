@@ -205,6 +205,13 @@ pub fn stats() -> (u64, u64) {
     )
 }
 
+/// Returns the number of free (unallocated) physical pages.
+pub fn free_page_count() -> u64 {
+    let total = TOTAL_PAGES.load(Ordering::Relaxed);
+    let used = USED_PAGES.load(Ordering::Relaxed);
+    total.saturating_sub(used)
+}
+
 /// Mark a page as used in the bitmap.
 ///
 /// # Safety

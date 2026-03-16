@@ -199,8 +199,8 @@ fn reap_dead_threads_sched() {
 // PMM.  New threads pull from this pool first, avoiding page allocator overhead
 // and TLB shootdowns.  The cache stores higher-half virtual base addresses.
 
-/// Maximum cached dead stacks (NT uses 5 for medium systems).
-const MAX_DEAD_STACKS: usize = 8;
+/// Maximum cached dead stacks. Increased for Firefox (many threads + PMM fragmentation).
+const MAX_DEAD_STACKS: usize = 64;
 
 static DEAD_STACK_CACHE: spin::Mutex<alloc::vec::Vec<u64>> = spin::Mutex::new(alloc::vec::Vec::new());
 
@@ -217,6 +217,11 @@ fn push_dead_stack(stack_base_virt: u64) -> bool {
 /// Try to pop a cached stack for reuse. Returns Some(higher-half base) or None.
 pub fn pop_dead_stack() -> Option<u64> {
     DEAD_STACK_CACHE.lock().pop()
+}
+
+/// Public interface to pre-populate the dead stack cache (called from main.rs).
+pub fn push_dead_stack_pub(stack_base_virt: u64) -> bool {
+    push_dead_stack(stack_base_virt)
 }
 
 /// Schedule the next thread to run.
