@@ -73,13 +73,15 @@ mkdir -p "${MUSL_BUILD}"
 echo "[musl] Configuring for x86_64 static + shared…"
 (
     cd "${MUSL_BUILD}"
-    "${MUSL_SRC}/configure"         \
-        --prefix="${MUSL_INSTALL}"  \
-        --target=x86_64-linux-musl \
-        --disable-debug             \
-        --enable-static             \
-        --enable-shared             \
-        CC=gcc                      \
+    "${MUSL_SRC}/configure"             \
+        --prefix="${MUSL_INSTALL}"      \
+        --syslibdir="${MUSL_INSTALL}/lib" \
+        --disable-debug                 \
+        --enable-static                 \
+        --enable-shared                 \
+        CC=gcc                          \
+        AR=ar                           \
+        RANLIB=ranlib                   \
         CFLAGS="-O2 -fno-stack-protector" \
         2>&1
 )

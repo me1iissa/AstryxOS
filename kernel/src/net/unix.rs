@@ -122,7 +122,9 @@ pub fn create() -> u64 {
 
 pub fn bind(id: u64, path: &[u8]) -> i64 {
     if id as usize >= MAX_UNIX_SOCKETS { return -9; }
-    let plen = path.len().min(UNIX_PATH_MAX);
+    // Strip trailing NUL so paths stored by bind always match paths from connect.
+    let raw_len = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+    let plen = raw_len.min(UNIX_PATH_MAX);
     let new_path = &path[..plen];
     let mut t = TABLE.lock();
     for (i, s) in t.0.iter().enumerate() {
@@ -155,7 +157,9 @@ pub fn listen(id: u64) -> i64 {
 
 pub fn connect(id: u64, path: &[u8]) -> i64 {
     if id as usize >= MAX_UNIX_SOCKETS { return -9; }
-    let plen = path.len().min(UNIX_PATH_MAX);
+    // Strip trailing NUL to match paths stored by bind.
+    let raw_len = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+    let plen = raw_len.min(UNIX_PATH_MAX);
     let search = &path[..plen];
     let mut t = TABLE.lock();
 
@@ -254,6 +258,11 @@ pub fn has_data(id: u64) -> bool {
     TABLE.lock().0[id as usize].recv_available() > 0
 }
 
+pub fn bytes_available(id: u64) -> usize {
+    if id as usize >= MAX_UNIX_SOCKETS { return 0; }
+    TABLE.lock().0[id as usize].recv_available()
+}
+
 pub fn has_pending(id: u64) -> bool {
     if id as usize >= MAX_UNIX_SOCKETS { return false; }
     TABLE.lock().0[id as usize].backlog_len > 0
@@ -262,4 +271,10 @@ pub fn has_pending(id: u64) -> bool {
 pub fn state(id: u64) -> UnixState {
     if id as usize >= MAX_UNIX_SOCKETS { return UnixState::Free; }
     TABLE.lock().0[id as usize].state
+}
+
+/// Return the peer socket id for a connected socket (u64::MAX if none).
+pub fn get_peer(id: u64) -> u64 {
+    if id as usize >= MAX_UNIX_SOCKETS { return u64::MAX; }
+    TABLE.lock().0[id as usize].peer_id
 }

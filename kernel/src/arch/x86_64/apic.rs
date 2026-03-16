@@ -135,11 +135,21 @@ pub fn init() {
     let apic_base_msr = unsafe { rdmsr(IA32_APIC_BASE_MSR) };
     let base_phys = apic_base_msr & 0xFFFF_FFFF_FFFF_F000;
 
-    // Higher-half mapping: identity map the LAPIC MMIO page
-    // The kernel uses higher-half at 0xFFFF_8000_0000_0000, but MMIO is
-    // typically accessed at its physical address. We'll map it into kernel space.
-    // For simplicity, use the physical address directly if below 4GB (MMIO identity-mapped).
-    let lapic_virt = base_phys; // Assume identity mapping for MMIO < 4GB
+    // Map LAPIC MMIO into the kernel's higher-half so it remains accessible
+    // from any CR3 (including user-process page tables that don't have PML4[0]).
+    // User processes inherit PML4[256-511] from the kernel, so this mapping is
+    // visible from all processes without USER bit.
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    let lapic_virt = PHYS_OFF + base_phys;
+    use crate::mm::vmm::{PAGE_WRITABLE, PAGE_NO_CACHE, PAGE_WRITE_THROUGH,
+                         PAGE_GLOBAL, PAGE_PRESENT};
+    // MMIO pages must NOT have PAGE_NO_EXECUTE (NX bit, bit 63). On APs,
+    // EFER.NXE is not yet set when ap_rust_entry first reads the LAPIC ID.
+    // With NXE=0, bit 63 in any PTE is a *reserved bit* → #PF(RSVD) on ANY
+    // access (data or code), not only instruction fetches.
+    let mmio_flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_NO_CACHE
+                   | PAGE_WRITE_THROUGH | PAGE_GLOBAL;
+    crate::mm::vmm::map_page(lapic_virt, base_phys, mmio_flags);
     LAPIC_BASE.store(lapic_virt, Ordering::Relaxed);
 
     // Disable legacy PIC before enabling APIC
@@ -230,9 +240,16 @@ fn calibrate_lapic_timer() -> u32 {
 
 /// Initialize I/O APIC (default address 0xFEC00000).
 fn init_ioapic() {
-    // Standard I/O APIC base address
-    let ioapic_base: u64 = 0xFEC0_0000;
-    IOAPIC_BASE.store(ioapic_base, Ordering::Relaxed);
+    // Map I/O APIC MMIO into the kernel higher-half (same reasoning as LAPIC).
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    let ioapic_phys: u64 = 0xFEC0_0000;
+    let ioapic_virt: u64 = PHYS_OFF + ioapic_phys;
+    use crate::mm::vmm::{PAGE_WRITABLE, PAGE_NO_CACHE, PAGE_WRITE_THROUGH,
+                         PAGE_GLOBAL, PAGE_PRESENT};
+    let mmio_flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_NO_CACHE
+                   | PAGE_WRITE_THROUGH | PAGE_GLOBAL; // no NX — see LAPIC comment above
+    crate::mm::vmm::map_page(ioapic_virt, ioapic_phys, mmio_flags);
+    IOAPIC_BASE.store(ioapic_virt, Ordering::Relaxed);
 
     let ver = ioapic_read(IOAPIC_VER);
     let max_entries = ((ver >> 16) & 0xFF) as u8;
@@ -803,6 +820,16 @@ fn write_trampoline(addr: u64) {
 /// Must not return.
 #[no_mangle]
 pub extern "C" fn ap_rust_entry() -> ! {
+    // Enable EFER.NXE (bit 11) before ANY memory access through the kernel
+    // higher-half page tables. Without NXE=1, bit 63 in a PTE is a reserved bit
+    // and triggers #PF(error=0x9, PRESENT|RSVD) on every access (data or code).
+    // The BSP enables NXE inside syscall::init_ap(), but APs cannot call that
+    // until after lapic_read() below, so we set the bit here directly.
+    unsafe {
+        let efer = rdmsr(0xC000_0080);
+        wrmsr(0xC000_0080, efer | (1 << 11)); // EFER.NXE
+    }
+
     // Read our APIC ID
     let apic_id = (lapic_read(LAPIC_ID) >> 24) as u8;
 
@@ -874,6 +901,8 @@ pub extern "C" fn ap_rust_entry() -> ! {
             fpu_state: None,
             user_entry_rip: 0,
             user_entry_rsp: 0,
+            user_entry_rdx: 0,
+            user_entry_r8: 0,
             priority: PRIORITY_IDLE,
             base_priority: PRIORITY_IDLE,
             tls_base: 0,
@@ -884,6 +913,10 @@ pub extern "C" fn ap_rust_entry() -> ! {
             last_cpu: 0,
             first_run: false,
             ctx_rsp_valid: core::sync::atomic::AtomicBool::new(true),
+            clear_child_tid: 0,
+            fork_user_regs: crate::proc::ForkUserRegs::default(),
+            vfork_parent_tid: None,
+            gs_base: 0,
         };
         THREAD_TABLE.lock().push(ap_thread);
     }
@@ -914,6 +947,9 @@ pub extern "C" fn ap_rust_entry() -> ! {
     loop {
         // HLT until next timer interrupt.
         unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+        // Reset watchdog: the AP idle thread is alive and responding to interrupts.
+        // Without this, the watchdog fires on idle CPUs with no threads to schedule.
+        crate::arch::x86_64::irq::reset_watchdog_counter();
         // Check for pending reschedule after being woken by the timer ISR.
         crate::sched::check_reschedule();
     }

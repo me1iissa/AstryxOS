@@ -6,6 +6,8 @@ edition.workspace = true
 [features]
 default = []
 test-mode = []
+gui-test = []
+firefox-test = []
 
 [dependencies]
 astryx-shared = { path = "../shared" }

@@ -172,8 +172,16 @@ fn reap_dead_threads_sched() {
         out
     }; // THREAD_TABLE released before any PMM operations
 
-    // Free kernel stacks with no locks held (interrupts still disabled → safe).
+    // Return kernel stacks to the dead-stack cache for reuse (NT pattern:
+    // MmDeadStackSListHead).  Only cache stacks of the standard size.
+    // Overflow goes to PMM free as before.
     for (stack_base, stack_pages) in stacks {
+        if stack_pages == crate::proc::KERNEL_STACK_PAGES_PUB {
+            if push_dead_stack(stack_base) {
+                continue; // cached for reuse
+            }
+        }
+        // Cache full or non-standard size — free to PMM.
         let phys_base = if stack_base >= KERNEL_VIRT_OFFSET {
             stack_base - KERNEL_VIRT_OFFSET
         } else {
@@ -183,6 +191,32 @@ fn reap_dead_threads_sched() {
             crate::mm::pmm::free_page(phys_base + (p as u64) * 0x1000);
         }
     }
+}
+
+// ── Dead Stack Cache (NT-inspired MmDeadStackSListHead) ──────────────────────
+//
+// Reaped kernel stacks are kept in a small pool instead of being freed to the
+// PMM.  New threads pull from this pool first, avoiding page allocator overhead
+// and TLB shootdowns.  The cache stores higher-half virtual base addresses.
+
+/// Maximum cached dead stacks (NT uses 5 for medium systems).
+const MAX_DEAD_STACKS: usize = 8;
+
+static DEAD_STACK_CACHE: spin::Mutex<alloc::vec::Vec<u64>> = spin::Mutex::new(alloc::vec::Vec::new());
+
+/// Try to push a dead stack to the cache. Returns true if cached, false if full.
+fn push_dead_stack(stack_base_virt: u64) -> bool {
+    let mut cache = DEAD_STACK_CACHE.lock();
+    if cache.len() >= MAX_DEAD_STACKS {
+        return false;
+    }
+    cache.push(stack_base_virt);
+    true
+}
+
+/// Try to pop a cached stack for reuse. Returns Some(higher-half base) or None.
+pub fn pop_dead_stack() -> Option<u64> {
+    DEAD_STACK_CACHE.lock().pop()
 }
 
 /// Schedule the next thread to run.
@@ -210,10 +244,32 @@ pub fn schedule() {
     let current_tid = proc::current_tid();
     let cpu = cpu_index() as u8;
 
+    // ── Stack canary check for the outgoing thread ───────────────────
+    // Detect kernel stack overflow before it causes silent corruption.
+    {
+        let canary_info = {
+            let threads = THREAD_TABLE.lock();
+            threads.iter().find(|t| t.tid == current_tid)
+                .filter(|t| t.kernel_stack_base > 0)
+                .map(|t| (t.pid, t.kernel_stack_base))
+        };
+        if let Some((pid, stack_base)) = canary_info {
+            if !proc::check_stack_canary(stack_base) {
+                crate::ke::bugcheck::ke_bugcheck(
+                    crate::ke::bugcheck::BUGCHECK_CANARY_CORRUPT,
+                    current_tid,   // P1: thread ID
+                    pid as u64,    // P2: process ID
+                    stack_base,    // P3: kernel stack base
+                    0,
+                );
+            }
+        }
+    }
+
     // Find the next ready thread — highest priority wins, round-robin among equals.
     // Prefer threads with matching cpu_affinity, then threads whose last_cpu
     // matches the current CPU (cache locality), then any Ready thread.
-    let (next_tid, next_rsp, next_pid, next_kstack_top, next_first_run) = {
+    let (next_tid, next_rsp, _next_pid, next_kstack_top, _next_first_run) = {
         let mut threads = THREAD_TABLE.lock();
         let len = threads.len();
         if len <= 1 {
@@ -304,6 +360,18 @@ pub fn schedule() {
                 let kstack_top = if threads[idx].kernel_stack_base > 0 {
                     threads[idx].kernel_stack_base + threads[idx].kernel_stack_size
                 } else { 0 };
+                // Catch corrupted kernel_stack_base: kstack_top must be either 0
+                // (idle/kernel thread) or a higher-half address.  A non-higher-half
+                // value would set TSS.RSP[0] to user-space, causing a double fault
+                // on the next Ring-3 exception.
+                if kstack_top != 0 && kstack_top < 0xFFFF_8000_0000_0000 {
+                    crate::serial_println!(
+                        "[SCHED] PANIC: tid={} pid={} kernel_stack_base={:#x} size={:#x} kstack_top={:#x}",
+                        threads[idx].tid, threads[idx].pid,
+                        threads[idx].kernel_stack_base, threads[idx].kernel_stack_size, kstack_top
+                    );
+                    panic!("schedule(): non-higher-half kstack_top");
+                }
                 let first_run = threads[idx].first_run;
                 (tid, rsp, pid, kstack_top, first_run)
             }
@@ -371,65 +439,55 @@ pub fn schedule() {
         }
     }
 
-    // ── Per-process address space switch ─────────────────────────────
-    // If the next thread belongs to a different process with a different CR3,
-    // switch the page table before switching context.
+    // ── Per-process address space switch (DEFERRED) ─────────────────
     //
-    // EXCEPTION: first-run threads (first_run == true) must NOT have their
-    // CR3 switched here.  Their kernel stack was allocated after the user
-    // page table was created, so the user PML4 does not yet contain the
-    // kernel-stack mapping.  Switching to the user CR3 before switch_context
-    // would cause a triple-fault the moment switch_context touches the stack.
-    // user_mode_bootstrap() clears first_run and switches CR3 itself, after
-    // running on the current kernel page table where the stack IS mapped.
-    // next_first_run was extracted from the main scheduling lock above.
-    // KERNEL THREAD CR3 RESTORE: when the next thread is a kernel/idle thread
-    // (p.cr3 == 0), switch back to the kernel's primary page table.  Without
-    // this, a CPU that previously ran a user thread (via user_mode_bootstrap)
-    // retains the user CR3 after that process exits.  free_process_memory then
-    // frees/reallocates those physical pages, corrupting the CPU's page table.
-    if !next_first_run {
-        let next_cr3 = {
-            let procs = crate::proc::PROCESS_TABLE.lock();
-            procs.iter().find(|p| p.pid == next_pid).map(|p| p.cr3).unwrap_or(0)
-        };
-        let effective_cr3 = if next_cr3 != 0 {
-            next_cr3
-        } else {
-            crate::mm::vmm::get_kernel_cr3()
-        };
-        let current_cr3 = crate::mm::vmm::get_cr3();
-        if effective_cr3 != 0 && effective_cr3 != current_cr3 {
-            unsafe { crate::mm::vmm::switch_cr3(effective_cr3); }
-        }
-    }
+    // The CR3 switch is done AFTER switch_context, not before.
+    //
+    // Reason: The outgoing thread may be TID 0 (BSP idle) which runs on the
+    // UEFI bootstrap stack at a physical address in PML4[0] (identity-mapped).
+    // If we switch CR3 to a user page table here (before switch_context), the
+    // identity map in PML4[0] is replaced by user mappings and the bootstrap
+    // stack becomes unmapped — the next stack access causes a double fault.
+    //
+    // By deferring the CR3 switch to after switch_context, we're already on
+    // the incoming thread's kernel stack (higher-half, PML4[256-511], shared
+    // across all page tables) so the switch is safe.
+    //
+    // EXCEPTION: first-run threads skip the CR3 switch entirely here.
+    // user_mode_bootstrap() handles it after the initial context switch.
 
     // Get raw pointers to the current thread's RSP and ctx_rsp_valid fields,
     // and save FPU state, all in a single lock acquisition.  The lock must be
     // released before switch_context (which won't return until rescheduled).
+    // If the current thread has already been removed from the table (e.g. it
+    // called exit_group and was reaped before schedule() ran), use a throwaway
+    // stack location for the RSP save — we will never return to this thread.
+    let mut _dead_rsp: u64 = 0;
+    static DEAD_VALID: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     let (old_rsp_ptr, ctx_valid_ptr) = {
         let mut threads = THREAD_TABLE.lock();
-        let cur = threads.iter_mut()
-            .find(|t| t.tid == current_tid)
-            .expect("current thread not in table");
-        // ── FPU/SSE state save for outgoing thread ───────────────────────
-        // Save FPU state lazily: only allocate the 512-byte buffer on first save.
-        if cur.fpu_state.is_none() {
-            cur.fpu_state = Some(alloc::boxed::Box::new(proc::FpuState::new_zeroed()));
-        }
-        if let Some(ref mut fpu) = cur.fpu_state {
-            unsafe {
-                core::arch::asm!(
-                    "fxsave [{}]",
-                    in(reg) fpu.data.as_mut_ptr(),
-                    options(nostack, preserves_flags),
-                );
+        if let Some(cur) = threads.iter_mut().find(|t| t.tid == current_tid) {
+            // ── FPU/SSE state save for outgoing thread ─────────────────────
+            if cur.fpu_state.is_none() {
+                cur.fpu_state = Some(alloc::boxed::Box::new(proc::FpuState::new_zeroed()));
             }
+            if let Some(ref mut fpu) = cur.fpu_state {
+                unsafe {
+                    core::arch::asm!(
+                        "fxsave [{}]",
+                        in(reg) fpu.data.as_mut_ptr(),
+                        options(nostack, preserves_flags),
+                    );
+                }
+            }
+            (
+                &mut cur.context.rsp as *mut u64,
+                cur.ctx_rsp_valid.as_ptr() as *mut u8,
+            )
+        } else {
+            // Thread already cleaned up — use throwaway storage.
+            (&mut _dead_rsp as *mut u64, DEAD_VALID.as_ptr())
         }
-        (
-            &mut cur.context.rsp as *mut u64,
-            cur.ctx_rsp_valid.as_ptr() as *mut u8,
-        )
     };
 
     // SAFETY: old_rsp_ptr and new_rsp are valid. switch_context saves/restores
@@ -439,6 +497,27 @@ pub fn schedule() {
     //   - Return here and re-enable below (resumed kernel thread)
     // ctx_valid_ptr: switch_context_asm sets *ctx_valid_ptr = 1 after saving
     // old_rsp, preventing other CPUs from using a stale RSP (SMP race guard).
+    // Debug: warn if we're loading a non-higher-half RSP (indicates corruption).
+    if next_rsp != 0 && next_rsp < 0xFFFF_8000_0000_0000 {
+        crate::serial_println!(
+            "[SCHED] WARN cpu={} cur_tid={} → next_tid={} next_rsp={:#x} (NOT higher-half!)",
+            cpu, current_tid, next_tid, next_rsp
+        );
+    }
+
+    // ── Pre-switch: ensure kernel CR3 for switch_context ────────────
+    // All kernel stacks are in the higher-half (PML4[256-511]), which is
+    // shared across all page tables.  However, the UEFI bootstrap stack
+    // (TID 0) is identity-mapped and requires the kernel CR3 to be active.
+    // Switch to kernel CR3 unconditionally before switch_context.
+    {
+        let kernel_cr3 = crate::mm::vmm::get_kernel_cr3();
+        let current_cr3 = crate::mm::vmm::get_cr3();
+        if kernel_cr3 != 0 && current_cr3 != kernel_cr3 {
+            unsafe { crate::mm::vmm::switch_cr3(kernel_cr3); }
+        }
+    }
+
     unsafe {
         proc::thread::switch_context(old_rsp_ptr, next_rsp, ctx_valid_ptr);
     }
@@ -465,6 +544,49 @@ pub fn schedule() {
 
     // ── TLS: restore FS base for incoming thread ────────────────────
     proc::restore_tls_for_current();
+
+    // ── Unconditional CR3 load (NT SwapContext model) ────────────────
+    // After switch_context, we're on the incoming thread's kernel stack.
+    // ALWAYS load the correct CR3 for this thread's process.  This is
+    // the NT approach (SwapContext unconditionally loads DirectoryTableBase)
+    // rather than Linux's lazy TLB.  Eliminates all CR3 race conditions.
+    //
+    // For first-run threads: switch_context jumped to user_mode_bootstrap
+    // which handles its own CR3 switch — this code is never reached.
+    //
+    // For idle/kernel threads (process cr3 == 0): fall back to kernel_cr3.
+    // For user threads: load the process's user CR3.
+    {
+        let current_pid_now = proc::current_pid();
+        let target_cr3 = {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            procs.iter().find(|p| p.pid == current_pid_now)
+                .map(|p| p.cr3).unwrap_or(0)
+        };
+        let effective_cr3 = if target_cr3 != 0 {
+            target_cr3
+        } else {
+            crate::mm::vmm::get_kernel_cr3()
+        };
+        let current_cr3 = crate::mm::vmm::get_cr3();
+        if effective_cr3 != current_cr3 {
+            unsafe { crate::mm::vmm::switch_cr3(effective_cr3); }
+        }
+
+        // Idle thread invariant: PID 0 must always have kernel CR3.
+        if current_pid_now == 0 {
+            let kcr3 = crate::mm::vmm::get_kernel_cr3();
+            if effective_cr3 != kcr3 {
+                crate::ke::bugcheck::ke_bugcheck(
+                    crate::ke::bugcheck::BUGCHECK_BAD_KERNEL_RSP,
+                    effective_cr3, kcr3, current_pid_now as u64, 0,
+                );
+            }
+        }
+    }
+
+    // ── Reset watchdog counter: this CPU just completed a context switch ──
+    crate::arch::x86_64::irq::reset_watchdog_counter();
 
     // Re-enable interrupts now that all locks are released.
     crate::hal::enable_interrupts();

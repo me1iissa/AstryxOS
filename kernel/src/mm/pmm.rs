@@ -28,6 +28,10 @@ static TOTAL_PAGES: AtomicU64 = AtomicU64::new(0);
 /// Used pages.
 static USED_PAGES: AtomicU64 = AtomicU64::new(0);
 
+/// Next-fit cursor: byte index into BITMAP to start the next search.
+/// Avoids O(N) scans from 0 when low physical frames are all in use.
+static NEXT_FIT_BYTE: AtomicU64 = AtomicU64::new(0);
+
 /// Initialize the PMM from the UEFI memory map.
 pub fn init(boot_info: &BootInfo) {
     let _lock = PMM_LOCK.lock();
@@ -87,20 +91,32 @@ pub fn init(boot_info: &BootInfo) {
 
 /// Allocate a single physical page frame.
 /// Returns the physical address, or None if out of memory.
+///
+/// Uses a next-fit cursor so repeated allocations don't scan from address 0
+/// each time.  This is critical for performance when the low physical frames
+/// are permanently occupied (kernel, page cache).
 pub fn alloc_page() -> Option<u64> {
     let _lock = PMM_LOCK.lock();
+    let start_byte = NEXT_FIT_BYTE.load(Ordering::Relaxed) as usize;
 
     // SAFETY: We hold the PMM lock. Searching bitmap for free page.
     unsafe {
-        for byte_idx in 0..BITMAP_SIZE {
-            if BITMAP[byte_idx] != 0xFF {
-                // Found a byte with at least one free bit
-                for bit in 0..8 {
-                    if BITMAP[byte_idx] & (1 << bit) == 0 {
-                        let page = byte_idx * 8 + bit;
-                        mark_page_used(page);
-                        USED_PAGES.fetch_add(1, Ordering::Relaxed);
-                        return Some((page * PAGE_SIZE) as u64);
+        // Two-pass search: start from cursor, wrap around if needed.
+        for pass in 0..2 {
+            let begin = if pass == 0 { start_byte } else { 0 };
+            let end   = if pass == 0 { BITMAP_SIZE } else { start_byte };
+            for byte_idx in begin..end {
+                if BITMAP[byte_idx] != 0xFF {
+                    for bit in 0..8u64 {
+                        if BITMAP[byte_idx] & (1 << bit) == 0 {
+                            let page = byte_idx * 8 + bit as usize;
+                            mark_page_used(page);
+                            USED_PAGES.fetch_add(1, Ordering::Relaxed);
+                            // Advance cursor past this byte for next call.
+                            let next = (byte_idx + 1) % BITMAP_SIZE;
+                            NEXT_FIT_BYTE.store(next as u64, Ordering::Relaxed);
+                            return Some((page * PAGE_SIZE) as u64);
+                        }
                     }
                 }
             }

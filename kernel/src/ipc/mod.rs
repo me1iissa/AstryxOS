@@ -8,8 +8,9 @@ pub mod epoll;
 pub mod timerfd;
 pub mod signalfd;
 pub mod inotify;
+pub mod sysv_shm;
 
 /// Initialize the IPC subsystem.
 pub fn init() {
-    crate::serial_println!("[IPC] IPC subsystem initialized (pipes + eventfd + epoll + timerfd + signalfd + inotify)");
+    crate::serial_println!("[IPC] IPC subsystem initialized (pipes + eventfd + epoll + timerfd + signalfd + inotify + sysv_shm)");
 }

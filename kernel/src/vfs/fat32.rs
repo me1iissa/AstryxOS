@@ -294,6 +294,11 @@ struct Fat32Node {
     dir_entry_offset: usize,
     /// First cluster of the directory that contains this entry.
     dir_entry_cluster: u32,
+    /// Cached cluster chain for fast random-access reads.
+    /// Built lazily on first read.  chain[i] = cluster number for logical
+    /// cluster i of this file.  Eliminates O(n) FAT walk per page fault
+    /// (critical for 194MB libxul.so with ~47000 clusters).
+    cluster_chain: alloc::vec::Vec<u32>,
 }
 
 // ── FAT32 Filesystem ────────────────────────────────────────────────────────
@@ -401,6 +406,7 @@ impl Fat32Fs {
             parent_cluster: 0,
             dir_entry_offset: 0,
             dir_entry_cluster: 0,
+            cluster_chain: alloc::vec::Vec::new(),
         };
 
         let inner = Fat32Inner {
@@ -435,6 +441,7 @@ impl Fat32Fs {
                     parent_cluster: root_cluster,
                     dir_entry_offset: entry.dir_entry_offset,
                     dir_entry_cluster: entry.dir_entry_cluster,
+                    cluster_chain: alloc::vec::Vec::new(),
                 });
             }
         }
@@ -828,6 +835,7 @@ impl Fat32Fs {
                     parent_cluster,
                     dir_entry_offset: entry.dir_entry_offset,
                     dir_entry_cluster: entry.dir_entry_cluster,
+                    cluster_chain: alloc::vec::Vec::new(),
                 });
             }
         }
@@ -1038,6 +1046,7 @@ impl FileSystemOps for Fat32Fs {
             parent_cluster: parent.first_cluster,
             dir_entry_offset: slot_offset,
             dir_entry_cluster: parent.first_cluster,
+            cluster_chain: alloc::vec::Vec::new(),
         };
         self.inner.lock().nodes.push(node);
 
@@ -1103,6 +1112,7 @@ impl FileSystemOps for Fat32Fs {
             parent_cluster: parent.first_cluster,
             dir_entry_offset: slot_offset,
             dir_entry_cluster: parent.first_cluster,
+            cluster_chain: alloc::vec::Vec::new(),
         };
         self.inner.lock().nodes.push(node);
 
@@ -1196,15 +1206,108 @@ impl FileSystemOps for Fat32Fs {
             return Ok(0);
         }
 
-        let data = self.read_chain(node.first_cluster, node.size as usize)
-            .map_err(|_| VfsError::Io)?;
+        let cluster_size = self.bpb.cluster_size as usize;
+        let spc = self.bpb.sectors_per_cluster as u64;
 
-        let start = offset as usize;
-        let available = data.len().saturating_sub(start);
-        let copy_len = core::cmp::min(available, buf.len());
+        // How many bytes remain in the file from `offset`.
+        let file_remaining = (node.size - offset) as usize;
+        let to_read = core::cmp::min(buf.len(), file_remaining);
 
-        buf[..copy_len].copy_from_slice(&data[start..start + copy_len]);
-        Ok(copy_len)
+        let start_cluster_idx = (offset as usize) / cluster_size;
+        let offset_in_cluster = (offset as usize) % cluster_size;
+
+        // Build cluster chain cache on first access (lazy).
+        // This converts O(n) per-read FAT walks to O(1) indexed lookups.
+        {
+            let mut inner = self.inner.lock();
+            // Check if chain needs building by looking at the node
+            let needs_build = inner.nodes.iter()
+                .find(|n| n.inode == inode)
+                .map(|n| n.cluster_chain.is_empty() && n.first_cluster >= 2)
+                .unwrap_or(false);
+            if needs_build {
+                let first_cluster = inner.nodes.iter()
+                    .find(|n| n.inode == inode).unwrap().first_cluster;
+                // Build chain by walking FAT (once, then cached)
+                let mut chain = alloc::vec::Vec::new();
+                let mut c = first_cluster;
+                loop {
+                    chain.push(c);
+                    if c < 2 || c as usize >= inner.fat.len() { break; }
+                    let next = inner.fat[c as usize];
+                    if next >= FAT_EOC_MIN || next < 2 { break; }
+                    c = next;
+                }
+                // Store in node
+                if let Some(n) = inner.nodes.iter_mut().find(|n| n.inode == inode) {
+                    n.cluster_chain = chain;
+                }
+            }
+        }
+
+        // Look up the starting cluster via the cached chain (O(1)).
+        let mut current = {
+            let inner = self.inner.lock();
+            if let Some(n) = inner.nodes.iter().find(|n| n.inode == inode) {
+                if start_cluster_idx < n.cluster_chain.len() {
+                    n.cluster_chain[start_cluster_idx]
+                } else {
+                    return Ok(0); // offset beyond end of chain
+                }
+            } else {
+                return Err(VfsError::NotFound);
+            }
+        };
+
+        // Legacy fallback removed — cluster chain cache handles all cases.
+        let _ = start_cluster_idx; // used above in chain lookup
+
+        // Read the required bytes cluster by cluster.
+        let mut written = 0usize;
+        let mut cluster_skip = offset_in_cluster; // byte offset within first cluster
+        let mut inner = self.inner.lock();
+
+        while written < to_read {
+            if current < 2 || current as usize >= inner.fat.len() {
+                break;
+            }
+
+            let first_sector = self.bpb.cluster_to_sector(current) as u64;
+            for s in 0..spc {
+                Self::ensure_sector(&mut inner, &*self.device, first_sector + s)?;
+            }
+
+            // How many bytes to take from this cluster.
+            let cluster_avail = cluster_size - cluster_skip;
+            let this_copy = core::cmp::min(cluster_avail, to_read - written);
+
+            // Copy sector-by-sector from the cache.
+            let mut copied = 0;
+            let mut byte_off = cluster_skip; // byte offset within cluster
+            while copied < this_copy {
+                let s = (byte_off / SECTOR_SIZE) as u64;
+                let lba = first_sector + s;
+                let in_sector = byte_off % SECTOR_SIZE;
+                let sector_data = inner.sector_cache.get(&lba).ok_or(VfsError::Io)?;
+                let avail = SECTOR_SIZE - in_sector;
+                let n = core::cmp::min(avail, this_copy - copied);
+                buf[written + copied..written + copied + n]
+                    .copy_from_slice(&sector_data[in_sector..in_sector + n]);
+                copied += n;
+                byte_off += n;
+            }
+
+            written += this_copy;
+            cluster_skip = 0; // subsequent clusters start at byte 0
+
+            let next = inner.fat[current as usize];
+            if next >= FAT_EOC_MIN || next < 2 {
+                break;
+            }
+            current = next;
+        }
+
+        Ok(written)
     }
 
     fn write(&self, inode: u64, offset: u64, data: &[u8]) -> VfsResult<usize> {

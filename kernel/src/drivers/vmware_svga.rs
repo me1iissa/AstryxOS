@@ -474,8 +474,12 @@ pub fn fill_rect(color: u32, x: u32, y: u32, w: u32, h: u32) {
         drop(guard);
         fifo_sync();
     } else {
-        // Software fallback: write directly to the identity-mapped framebuffer.
-        let fb = svga.fb_phys as *mut u32;
+        // Software fallback: write directly to the framebuffer.
+        // fb_phys is a physical address; access it via the kernel's higher-half
+        // (PHYS_OFF + phys) which is mapped for all physical addresses 0..4 GiB.
+        const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+        let fb_virt = if svga.fb_phys < PHYS_OFF { svga.fb_phys + PHYS_OFF } else { svga.fb_phys };
+        let fb = fb_virt as *mut u32;
         let pitch_pixels = svga.pitch / 4;
         for row in 0..h {
             for col in 0..w {

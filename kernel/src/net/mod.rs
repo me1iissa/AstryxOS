@@ -153,13 +153,14 @@ pub fn send_frame(frame: &[u8]) {
     }
 }
 
-/// Poll for incoming packets from the NIC.
+/// Poll for incoming packets from the NIC, and run TCP timers.
 pub fn poll() {
     if e1000::is_available() {
         e1000::poll_rx();
     } else {
         virtio_net::poll_rx();
     }
+    tcp::tcp_timer_tick();
 }
 
 /// Format an IPv4 address as a string.

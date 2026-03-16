@@ -13,6 +13,15 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
+/// True when the desktop compositor owns the framebuffer.
+/// When active, the TTY console should NOT write directly to the FB.
+static COMPOSITOR_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Check if the compositor is active (desktop mode).
+pub fn is_active() -> bool {
+    COMPOSITOR_ACTIVE.load(Ordering::Relaxed)
+}
+
 use crate::wm::decorator;
 use crate::wm::window::{WindowHandle, WindowState, WindowStyle};
 
@@ -838,6 +847,9 @@ pub fn init(fb_base: u64, width: u32, height: u32, stride: u32) {
 /// 3. Draws the mouse cursor.
 /// 4. Blits the backbuffer to the hardware framebuffer.
 pub fn compose() {
+    // Mark compositor as active — disables TTY console framebuffer writes.
+    COMPOSITOR_ACTIVE.store(true, Ordering::Relaxed);
+
     let mut guard = COMPOSITOR.lock();
     let comp = match guard.as_mut() {
         Some(c) => c,
@@ -915,6 +927,40 @@ pub fn compose() {
         let wy2 = ((snap.y + snap.height as i32).max(0) as u32).min(sh);
         if wx2 > wx && wy2 > wy {
             expand_dirty(comp, wx, wy, wx2 - wx, wy2 - wy);
+        }
+    }
+
+    // --- 2b. X11 client windows (on top of Win32 windows) ---
+    // Render mapped X11 windows to the backbuffer. These are from Firefox,
+    // xterm, or any other X11 client connected to our Xastryx server.
+    {
+        let x11_windows = crate::x11::get_mapped_windows();
+        for xwin in &x11_windows {
+            let wx = xwin.x as i32;
+            let wy = xwin.y as i32;
+            let ww = xwin.width as u32;
+            let wh = xwin.height as u32;
+            // Clip to screen
+            let x0 = wx.max(0) as u32;
+            let y0 = wy.max(0) as u32;
+            let x1 = ((wx + ww as i32) as u32).min(sw);
+            let y1 = ((wy + wh as i32) as u32).min(sh);
+            if x1 <= x0 || y1 <= y0 { continue; }
+            // Blit BGRA pixels to backbuffer
+            for py in y0..y1 {
+                let src_y = (py as i32 - wy) as u32;
+                let dst_off = (py * stride + x0) as usize;
+                let src_off = (src_y * ww + (x0 as i32 - wx) as u32) as usize;
+                for px in 0..(x1 - x0) as usize {
+                    let si = (src_off + px) * 4;
+                    if si + 3 >= xwin.pixels.len() { break; }
+                    let b = xwin.pixels[si] as u32;
+                    let g = xwin.pixels[si + 1] as u32;
+                    let r = xwin.pixels[si + 2] as u32;
+                    comp.backbuffer[dst_off + px] = 0xFF000000 | (r << 16) | (g << 8) | b;
+                }
+            }
+            expand_dirty(comp, x0, y0, x1 - x0, y1 - y0);
         }
     }
 
@@ -1116,4 +1162,74 @@ where
 {
     let mut guard = COMPOSITOR.lock();
     guard.as_mut().map(f)
+}
+
+// ---------------------------------------------------------------------------
+// GUI Automated Test — pixel telemetry
+// ---------------------------------------------------------------------------
+
+/// Sample key pixels from the backbuffer and emit them to the serial port.
+///
+/// Each pixel line has the form:
+///   `[GUITEST] pixel X Y NAME #RRGGBB`
+///
+/// A summary line follows:
+///   `[GUITEST] width=W height=H frames=N`
+///
+/// Called in `gui-test` mode after the bounded desktop loop completes.
+/// The Python analyser (`scripts/analyze-gui.py`) parses these lines and
+/// validates them against expected colour ranges.
+///
+/// **Sampling strategy** (1920×1080 layout):
+/// | NAME            | Coordinates   | Expected colour        | Why                        |
+/// |-----------------|---------------|------------------------|----------------------------|
+/// | `desktop_center`| (960, 540)    | gradient ~#0B1225      | open desktop area (mid-y)  |
+/// | `desktop_top`   | (10, 10)      | top gradient #0A0A20   | top-left desktop corner    |
+/// | `taskbar`       | (960, 1060)   | TASKBAR_COLOR #1A1A2E  | inside taskbar strip       |
+/// | `term_title`    | (550, 215)    | active titlebar #1B1B1B| terminal window (focused)  |
+/// | `expl_title`    | (400, 115)    | inactive tbar #2D2D2D  | explorer (not focused)     |
+/// | `term_client`   | (550, 380)    | window interior        | terminal client area       |
+#[cfg(feature = "gui-test")]
+pub fn emit_pixel_telemetry() {
+    let guard = COMPOSITOR.lock();
+    let comp = match guard.as_ref() {
+        Some(c) => c,
+        None => {
+            crate::serial_println!("[GUITEST] ERROR compositor not initialized");
+            return;
+        }
+    };
+
+    let sw = comp.screen_width;
+    let sh = comp.screen_height;
+
+    // Fixed sample points — computed once the screen dimensions are known.
+    // Using concrete coordinates calibrated for the default 1920×1080 layout.
+    let samples: &[(u32, u32, &str)] = &[
+        (sw / 2,  sh / 2,       "desktop_center"),
+        (10,      10,            "desktop_top"),
+        (sw / 2,  sh - 20,      "taskbar"),
+        (550,     215,           "term_title"),
+        (400,     115,           "expl_title"),
+        (550,     380,           "term_client"),
+    ];
+
+    for &(x, y, name) in samples {
+        let idx = y as usize * sw as usize + x as usize;
+        if idx < comp.backbuffer.len() {
+            let pixel = comp.backbuffer[idx];
+            let r = (pixel >> 16) & 0xFF;
+            let g = (pixel >>  8) & 0xFF;
+            let b =  pixel        & 0xFF;
+            crate::serial_println!(
+                "[GUITEST] pixel {} {} {} #{:02X}{:02X}{:02X}",
+                x, y, name, r, g, b
+            );
+        }
+    }
+
+    crate::serial_println!(
+        "[GUITEST] width={} height={} frames={}",
+        sw, sh, comp.frame_count
+    );
 }

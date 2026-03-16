@@ -175,11 +175,18 @@ impl VmSpace {
     /// per-process modifications (e.g., splitting a 2 MiB huge page to overlay
     /// user ELF segments) don't affect the kernel's own page tables.
     pub fn new_user() -> Option<Self> {
+        // Higher-half physical-to-virtual offset — same as vmm::PHYS_OFF.
+        // We use this instead of raw physical pointers so that accesses go
+        // through the stable kernel higher-half mapping (PML4[256-511]) rather
+        // than the identity map (PML4[0]), which can be split/modified by user
+        // mmap() calls after a process has been running for a while.
+        const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+
         let new_pml4 = crate::mm::pmm::alloc_page()?;
 
-        // Zero the entire PML4
+        // Zero the entire PML4 via the higher-half mapping.
         unsafe {
-            core::ptr::write_bytes(new_pml4 as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
+            core::ptr::write_bytes((PHYS_OFF + new_pml4) as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
         }
 
         // Clone kernel-half entries (256-511) from the current PML4.
@@ -187,57 +194,26 @@ impl VmSpace {
         // (kernel mappings are identical across all processes).
         let current_cr3 = crate::mm::vmm::get_cr3();
         unsafe {
-            let src = current_cr3 as *const u64;
-            let dst = new_pml4 as *mut u64;
+            let src = (PHYS_OFF + current_cr3) as *const u64;
+            let dst = (PHYS_OFF + new_pml4) as *mut u64;
             for i in 256..512 {
                 *dst.add(i) = *src.add(i);
             }
         }
 
-        // Deep-clone PML4 entry 0 (identity map of the first 4 GiB).
-        // We create private copies of the PDPT and PD tables so that
-        // map_page_in can split 2 MiB huge pages for user mappings
-        // without affecting the kernel's page tables.
-        unsafe {
-            let src_pml4 = current_cr3 as *const u64;
-            let pml4_entry0 = *src_pml4.add(0);
-            if pml4_entry0 & crate::mm::vmm::PAGE_PRESENT != 0 {
-                let src_pdpt = (pml4_entry0 & crate::mm::vmm::ADDR_MASK) as *const u64;
-
-                // Allocate a new PDPT page for this process.
-                let new_pdpt = crate::mm::pmm::alloc_page()?;
-                core::ptr::write_bytes(new_pdpt as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
-                let dst_pdpt = new_pdpt as *mut u64;
-
-                // Copy each PDPT entry, deep-cloning any PD it references.
-                for pdpt_idx in 0..512 {
-                    let pdpt_entry = *src_pdpt.add(pdpt_idx);
-                    if pdpt_entry & crate::mm::vmm::PAGE_PRESENT == 0 {
-                        continue;
-                    }
-                    // 1 GiB huge page — just copy as-is (rare, usually only PDs)
-                    if pdpt_entry & crate::mm::vmm::PAGE_HUGE != 0 {
-                        *dst_pdpt.add(pdpt_idx) = pdpt_entry;
-                        continue;
-                    }
-
-                    // Clone the PD page.
-                    let src_pd = (pdpt_entry & crate::mm::vmm::ADDR_MASK) as *const u64;
-                    let new_pd = crate::mm::pmm::alloc_page()?;
-                    core::ptr::copy_nonoverlapping(src_pd as *const u8, new_pd as *mut u8, 4096);
-
-                    // Install the cloned PD into our private PDPT,
-                    // preserving the original flags.
-                    let flags = pdpt_entry & !crate::mm::vmm::ADDR_MASK;
-                    *dst_pdpt.add(pdpt_idx) = new_pd | flags;
-                }
-
-                // Install the private PDPT into PML4 entry 0.
-                let flags0 = pml4_entry0 & !crate::mm::vmm::ADDR_MASK;
-                let dst_pml4 = new_pml4 as *mut u64;
-                *dst_pml4.add(0) = new_pdpt | flags0;
-            }
-        }
+        // PML4[0] (user virtual address space, 0x0 – 0x7FFF_FFFF_FFFF) starts
+        // completely empty.  map_page_in() will allocate PDPT/PD/PT pages as
+        // needed when user ELF segments and anonymous regions are mapped.
+        //
+        // NOTE: do NOT copy the kernel's PML4[0] identity map here.  The kernel
+        // identity map includes the first 4 GiB (physical == virtual for 0..4 GiB),
+        // which means address 0x0 would be present in every user process.  That
+        // allows a NULL function-pointer call to execute code from physical address
+        // 0x0 (BIOS area) instead of faulting cleanly.
+        //
+        // The kernel always uses PHYS_OFF (0xFFFF_8000_0000_0000 + phys) for its
+        // own memory accesses, so PML4[0] is not needed by any kernel subsystem
+        // after the higher-half switch.
 
         Some(Self {
             cr3: new_pml4,
@@ -250,51 +226,168 @@ impl VmSpace {
 
     /// Clone this address space for fork (copy-on-write).
     ///
-    /// Creates a new PML4 that shares the same physical pages but marks all
-    /// writable user-space pages as read-only in both parent and child.
-    /// The page fault handler will implement the actual copy.
-    pub fn clone_for_fork(&self) -> Option<Self> {
-        use crate::mm::vmm::{read_pte, write_pte, map_page_in, invlpg};
-        use crate::mm::vmm::{PAGE_PRESENT, PAGE_WRITABLE};
+    /// `actual_cr3` must be the process's real running CR3 (from `proc.cr3` in
+    /// the process table).  `self.cr3` may be stale if `proc.cr3` was updated
+    /// (e.g. by exec) without a corresponding update to the VmSpace.
+    ///
+    /// Walks `actual_cr3`'s page tables directly (PML4[0..256] → PDPT → PD → PT),
+    /// allocating fresh PT structures for the child at each level.  Every present
+    /// 4 KB PTE is write-protected in the parent and mirrored read-only in the
+    /// child; the page fault handler performs the actual physical copy on write.
+    ///
+    /// Also syncs `self.cr3 = actual_cr3` so subsequent VmSpace operations
+    /// (demand-paging, CoW handling) use the correct page tables.
+    pub fn clone_for_fork(&mut self, actual_cr3: u64) -> Option<Self> {
+        use crate::mm::vmm::{PAGE_PRESENT, PAGE_WRITABLE, PAGE_HUGE, ADDR_MASK};
+        use crate::mm::pmm;
         use crate::mm::refcount::page_ref_inc;
 
-        const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
-        const PAGE_SIZE: u64 = 0x1000;
+        const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
 
-        let new_space = Self::new_user()?;
+        let hw_cr3: u64;
+        unsafe { core::arch::asm!("mov {}, cr3", out(reg) hw_cr3, options(nomem, nostack)); }
 
-        // Walk all user VMAs and set up CoW mappings
+        // Sync self.cr3 to actual_cr3 so future VmSpace ops are consistent.
+        // Log if there was a discrepancy (helps diagnose root cause).
+        if self.cr3 != actual_cr3 {
+            crate::serial_println!(
+                "[FORK-COW] WARN: vm_space.cr3={:#x} != actual_cr3={:#x} (hw_cr3={:#x}); syncing",
+                self.cr3, actual_cr3, hw_cr3
+            );
+            self.cr3 = actual_cr3;
+        }
+
+        crate::serial_println!("[FORK-COW] clone_for_fork START cr3={:#x} hw_cr3={:#x} vmas={}", actual_cr3, hw_cr3, self.areas.len());
         for vma in &self.areas {
-            let mut addr = vma.base;
-            let end = vma.base + vma.length;
-            while addr < end {
-                let pte = read_pte(self.cr3, addr);
-                if pte & PAGE_PRESENT != 0 {
-                    let phys = pte & ADDR_MASK;
-                    let flags_no_write = pte & !ADDR_MASK & !PAGE_WRITABLE;
+            crate::serial_println!("[FORK-COW]   VMA [{:#x}..{:#x}) prot={:#x} flags={:#x} {:?}", vma.base, vma.base + vma.length, vma.prot, vma.flags, vma.backing);
+        }
 
-                    // Clear WRITABLE in parent PTE
-                    write_pte(self.cr3, addr, (pte & ADDR_MASK) | flags_no_write);
-                    invlpg(addr);
+        // Allocate a fresh, zeroed PML4 for the child.
+        let child_pml4_phys = match pmm::alloc_page() {
+            Some(p) => p,
+            None => { crate::serial_println!("[FORK-COW] alloc_page failed for child PML4 (OOM)"); return None; }
+        };
+        unsafe {
+            core::ptr::write_bytes((PHYS_OFF + child_pml4_phys) as *mut u8, 0, 4096);
+        }
 
-                    // Map same physical page in child without WRITABLE
-                    map_page_in(new_space.cr3, addr, phys, flags_no_write);
-
-                    // Increment reference count so the page isn't freed prematurely
-                    page_ref_inc(phys);
-                }
-                addr += PAGE_SIZE;
+        // Copy kernel-half (PML4 entries 256-511) from actual_cr3 — these are
+        // shallow shared entries identical across all processes.
+        unsafe {
+            let src = (PHYS_OFF + actual_cr3) as *const u64;
+            let dst = (PHYS_OFF + child_pml4_phys) as *mut u64;
+            for i in 256..512usize {
+                *dst.add(i) = *src.add(i);
             }
         }
 
-        // Copy VMA list to child
+        // Walk parent's user page tables (PML4[0..256]).
+        // At each level allocate a fresh table for the child so the child's
+        // PD/PT pages are never shared with the parent's.
+        let mut total_pages_cow: u64 = 0;
+        unsafe {
+            let parent_pml4 = (PHYS_OFF + actual_cr3) as *mut u64;
+            let child_pml4  = (PHYS_OFF + child_pml4_phys) as *mut u64;
+
+            for pml4_idx in 0..256usize {
+                let pml4e = *parent_pml4.add(pml4_idx);
+                if pml4e & PAGE_PRESENT == 0 { continue; }
+                crate::serial_println!("[FORK-COW] PML4[{}] present (phys={:#x})", pml4_idx, pml4e & ADDR_MASK);
+
+                let parent_pdpt_phys = pml4e & ADDR_MASK;
+
+                // Fresh PDPT for child.
+                let child_pdpt_phys = pmm::alloc_page()?;
+                core::ptr::write_bytes((PHYS_OFF + child_pdpt_phys) as *mut u8, 0, 4096);
+                *child_pml4.add(pml4_idx) = child_pdpt_phys | (pml4e & !ADDR_MASK);
+
+                let parent_pdpt = (PHYS_OFF + parent_pdpt_phys) as *mut u64;
+                let child_pdpt  = (PHYS_OFF + child_pdpt_phys)  as *mut u64;
+
+                for pdpt_idx in 0..512usize {
+                    let pdpte = *parent_pdpt.add(pdpt_idx);
+                    if pdpte & PAGE_PRESENT == 0 { continue; }
+
+                    // 1 GB huge page — write-protect in both, no CoW split.
+                    if pdpte & PAGE_HUGE != 0 {
+                        let flags_ro = (pdpte & !ADDR_MASK) & !PAGE_WRITABLE;
+                        let phys_1g  = pdpte & !0x3FFF_FFFFu64;
+                        *parent_pdpt.add(pdpt_idx) = phys_1g | flags_ro;
+                        *child_pdpt .add(pdpt_idx) = phys_1g | flags_ro;
+                        continue;
+                    }
+
+                    let parent_pd_phys = pdpte & ADDR_MASK;
+
+                    // Fresh PD for child.
+                    let child_pd_phys = pmm::alloc_page()?;
+                    core::ptr::write_bytes((PHYS_OFF + child_pd_phys) as *mut u8, 0, 4096);
+                    *child_pdpt.add(pdpt_idx) = child_pd_phys | (pdpte & !ADDR_MASK);
+
+                    let parent_pd = (PHYS_OFF + parent_pd_phys) as *mut u64;
+                    let child_pd  = (PHYS_OFF + child_pd_phys)  as *mut u64;
+
+                    for pd_idx in 0..512usize {
+                        let pde = *parent_pd.add(pd_idx);
+                        if pde & PAGE_PRESENT == 0 { continue; }
+
+                        // 2 MB huge page — write-protect in both and ref-count sub-pages.
+                        if pde & PAGE_HUGE != 0 {
+                            let phys_2m     = pde & 0x000F_FFFF_FFE0_0000u64;
+                            let flags_ro    = (pde & !ADDR_MASK) & !PAGE_WRITABLE;
+                            *parent_pd.add(pd_idx) = phys_2m | flags_ro;
+                            *child_pd .add(pd_idx) = phys_2m | flags_ro;
+                            for sub in 0..512u64 {
+                                page_ref_inc(phys_2m + sub * 0x1000);
+                            }
+                            continue;
+                        }
+
+                        let parent_pt_phys = pde & ADDR_MASK;
+
+                        // Fresh PT for child.
+                        let child_pt_phys = pmm::alloc_page()?;
+                        core::ptr::write_bytes((PHYS_OFF + child_pt_phys) as *mut u8, 0, 4096);
+                        *child_pd.add(pd_idx) = child_pt_phys | (pde & !ADDR_MASK);
+
+                        let parent_pt = (PHYS_OFF + parent_pt_phys) as *mut u64;
+                        let child_pt  = (PHYS_OFF + child_pt_phys)  as *mut u64;
+
+                        for pt_idx in 0..512usize {
+                            let pte = *parent_pt.add(pt_idx);
+                            if pte & PAGE_PRESENT == 0 { continue; }
+
+                            let phys       = pte & ADDR_MASK;
+                            let flags_ro   = (pte & !ADDR_MASK) & !PAGE_WRITABLE;
+
+                            // Write-protect parent PTE in place.
+                            *parent_pt.add(pt_idx) = phys | flags_ro;
+
+                            // Child PTE: same physical page, read-only.
+                            *child_pt.add(pt_idx) = phys | flags_ro;
+
+                            // Keep page alive until both mappings are gone.
+                            page_ref_inc(phys);
+                            total_pages_cow += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Flush TLB: parent PTEs were write-protected so stale entries must
+        // be evicted so the next write triggers a CoW page fault.
+        crate::mm::vmm::flush_tlb();
+        crate::serial_println!("[FORK-COW] total {} 4KB pages CoW'd into child CR3={:#x}", total_pages_cow, child_pml4_phys);
+
+        // Copy VMA list to child.
         let mut child_areas = Vec::with_capacity(self.areas.len());
         for vma in &self.areas {
             child_areas.push(vma.clone());
         }
 
         Some(VmSpace {
-            cr3: new_space.cr3,
+            cr3: child_pml4_phys,
             areas: child_areas,
             mmap_hint: self.mmap_hint,
             brk: self.brk,

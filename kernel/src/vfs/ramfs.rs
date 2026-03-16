@@ -240,11 +240,11 @@ impl FileSystemOps for RamFs {
     }
 
     fn read(&self, inode: u64, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
-        let inodes = self.inodes.lock();
+        let mut inodes = self.inodes.lock();
         let idx = Self::find_inode_idx(&inodes, inode).ok_or(VfsError::NotFound)?;
 
-        match &inodes[idx] {
-            RamInode::File { data, .. } => {
+        match &mut inodes[idx] {
+            RamInode::File { data, accessed, .. } => {
                 let off = offset as usize;
                 if off >= data.len() {
                     return Ok(0);
@@ -252,6 +252,7 @@ impl FileSystemOps for RamFs {
                 let available = data.len() - off;
                 let to_read = available.min(buf.len());
                 buf[..to_read].copy_from_slice(&data[off..off + to_read]);
+                *accessed = now_secs(); // C2: update atime on read
                 Ok(to_read)
             }
             RamInode::Dir { .. } => Err(VfsError::IsADirectory),
@@ -465,5 +466,29 @@ impl FileSystemOps for RamFs {
             RamInode::Dir { permissions, .. } => { *permissions = mode; Ok(()) }
             RamInode::SymLink { permissions, .. } => { *permissions = mode; Ok(()) }
         }
+    }
+
+    fn unlink_entry(&self, parent_inode: u64, name: &str) -> VfsResult<()> {
+        let mut inodes = self.inodes.lock();
+        let parent_idx = Self::find_inode_idx(&inodes, parent_inode)
+            .ok_or(VfsError::NotFound)?;
+        match &mut inodes[parent_idx] {
+            RamInode::Dir { entries, modified, .. } => {
+                let before = entries.len();
+                entries.retain(|e| e.name != name);
+                if entries.len() == before {
+                    return Err(VfsError::NotFound);
+                }
+                *modified = now_secs();
+                Ok(())
+            }
+            _ => Err(VfsError::NotADirectory),
+        }
+    }
+
+    fn remove_inode(&self, inode: u64) -> VfsResult<()> {
+        let mut inodes = self.inodes.lock();
+        inodes.retain(|n| n.inode_number() != inode);
+        Ok(())
     }
 }

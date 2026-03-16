@@ -28,6 +28,10 @@ use crate::mm::{pmm, vmm};
 use crate::mm::vma::{VmArea, VmBacking, VmFlags, VmProt, PROT_READ, PROT_WRITE, PROT_EXEC,
                      MAP_PRIVATE, MAP_ANONYMOUS};
 
+/// Physical-to-virtual offset for the higher-half kernel mapping.
+/// Physical pages must be accessed via this offset when user CR3 is active.
+const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+
 // ─── PE Signature & Magic numbers ────────────────────────────────────────────
 
 /// Intel x86-64 (AMD64) machine type.
@@ -442,7 +446,13 @@ fn count_imports(data: &[u8], oh: &ImageOptionalHeader64) -> usize {
 /// 4. IAT resolution (imports resolved via `crate::nt::lookup_stub`)
 ///
 /// Returns entry point VA, stack top, and other metadata.
-pub fn load_pe(data: &[u8], cr3: u64) -> Result<PeLoadResult, PeError> {
+/// Load a PE32+ binary into `cr3`.
+///
+/// `stub_page_va`: when non-zero, IAT entries for NT/kernel32 stubs are
+/// resolved to user-space trampoline addresses at `stub_page_va + slot * 16`
+/// (slots correspond to `NT_STUB_TABLE` indices).  Pass `0` for kernel-only
+/// PE loads where user-mode execution is not required.
+pub fn load_pe(data: &[u8], cr3: u64, stub_page_va: u64) -> Result<PeLoadResult, PeError> {
     // ── 1. Parse headers ─────────────────────────────────────────────────────
     let info = parse_pe(data)?;
     let dos: ImageDosHeader = read_struct(data, 0).unwrap();
@@ -469,21 +479,30 @@ pub fn load_pe(data: &[u8], cr3: u64) -> Result<PeLoadResult, PeError> {
     let delta = load_base.wrapping_sub(preferred_base) as i64; // will be 0 unless relocated
 
     // ── 2. Map the header page(s) ─────────────────────────────────────────────
+    // Write all data via PHYS_OFF so no CR3 switch is required (avoids
+    // SMAP faults and matches the approach used by the ELF loader).
     let header_pages = align_up(oh.size_of_headers as u64, pmm::PAGE_SIZE as u64) as usize
         / pmm::PAGE_SIZE;
+    let header_len = (oh.size_of_headers as usize).min(data.len());
     for pg in 0..header_pages {
         let va = load_base + (pg * pmm::PAGE_SIZE) as u64;
         let phys = pmm::alloc_page().ok_or(PeError::MappingFailed)?;
-        // Zero the frame
-        unsafe { core::ptr::write_bytes(phys as *mut u8, 0, pmm::PAGE_SIZE); }
+        unsafe { core::ptr::write_bytes((PHYS_OFF + phys) as *mut u8, 0, pmm::PAGE_SIZE); }
+        // Copy header bytes for this page via PHYS_OFF
+        let page_off = pg * pmm::PAGE_SIZE;
+        let copy_end = (page_off + pmm::PAGE_SIZE).min(header_len);
+        if page_off < copy_end {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    data.as_ptr().add(page_off),
+                    (PHYS_OFF + phys) as *mut u8,
+                    copy_end - page_off,
+                );
+            }
+        }
         if !vmm::map_page_in(cr3, va, phys, vmm::PAGE_PRESENT | vmm::PAGE_USER | vmm::PAGE_WRITABLE) {
             return Err(PeError::MappingFailed);
         }
-    }
-    // Copy header bytes into the mapped header region.
-    let header_len = (oh.size_of_headers as usize).min(data.len());
-    unsafe {
-        core::ptr::copy_nonoverlapping(data.as_ptr(), load_base as *mut u8, header_len);
     }
 
     // ── 3. Map sections ───────────────────────────────────────────────────────
@@ -505,36 +524,47 @@ pub fn load_pe(data: &[u8], cr3: u64) -> Result<PeLoadResult, PeError> {
         for pg in 0..n_pages {
             let va   = sect_va + (pg * pmm::PAGE_SIZE) as u64;
             let phys = pmm::alloc_page().ok_or(PeError::MappingFailed)?;
-            unsafe { core::ptr::write_bytes(phys as *mut u8, 0, pmm::PAGE_SIZE); }
-            let mut flags = vmm::PAGE_PRESENT | vmm::PAGE_USER;
-            if writeable  { flags |= vmm::PAGE_WRITABLE; }
+            // Zero via PHYS_OFF — no CR3 switch required
+            unsafe { core::ptr::write_bytes((PHYS_OFF + phys) as *mut u8, 0, pmm::PAGE_SIZE); }
+
+            // Copy raw section data for this page via PHYS_OFF (not user VA)
+            if sh.size_of_raw_data > 0 && sh.pointer_to_raw_data > 0 {
+                let file_base = sh.pointer_to_raw_data as usize;
+                let page_off  = pg * pmm::PAGE_SIZE;
+                let src_start = file_base + page_off;
+                let src_end   = (src_start + pmm::PAGE_SIZE).min(file_base + sh.size_of_raw_data as usize);
+                if src_start < src_end && src_end <= data.len() {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            data.as_ptr().add(src_start),
+                            (PHYS_OFF + phys) as *mut u8,
+                            src_end - src_start,
+                        );
+                    }
+                } else if src_start >= data.len() || src_start >= file_base + sh.size_of_raw_data as usize {
+                    // Page is beyond raw data end — already zeroed above
+                } else {
+                    return Err(PeError::SectionOutOfBounds);
+                }
+            }
+
+            // Always map writable during load (like ELF loader does); final
+            // permissions are enforced by the hardware page tables post-load.
+            let mut flags = vmm::PAGE_PRESENT | vmm::PAGE_USER | vmm::PAGE_WRITABLE;
             if !executable { flags |= vmm::PAGE_NO_EXECUTE; }
             if !vmm::map_page_in(cr3, va, phys, flags) {
                 return Err(PeError::MappingFailed);
-            }
-        }
-
-        // Copy raw section data.
-        if sh.size_of_raw_data > 0 && sh.pointer_to_raw_data > 0 {
-            let file_off  = sh.pointer_to_raw_data as usize;
-            let copy_size = sh.size_of_raw_data as usize;
-            if file_off + copy_size > data.len() {
-                return Err(PeError::SectionOutOfBounds);
-            }
-            let dst = (load_base + sh.virtual_address as u64) as *mut u8;
-            unsafe {
-                core::ptr::copy_nonoverlapping(data.as_ptr().add(file_off), dst, copy_size);
             }
         }
     }
 
     // ── 4. Apply base relocations (if load_base ≠ preferred_base) ────────────
     if delta != 0 {
-        apply_relocations(data, &oh, load_base, delta)?;
+        apply_relocations(data, &oh, load_base, delta, cr3)?;
     }
 
     // ── 5. Resolve IAT imports ────────────────────────────────────────────────
-    resolve_imports(data, &oh, load_base)?;
+    resolve_imports(data, &oh, load_base, stub_page_va, cr3)?;
 
     // ── 6. Allocate user stack ────────────────────────────────────────────────
     const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000;
@@ -543,8 +573,10 @@ pub fn load_pe(data: &[u8], cr3: u64) -> Result<PeLoadResult, PeError> {
     for s in 0..STACK_PAGES {
         let va   = stack_base + (s * pmm::PAGE_SIZE) as u64;
         let phys = pmm::alloc_page().ok_or(PeError::MappingFailed)?;
-        unsafe { core::ptr::write_bytes(phys as *mut u8, 0, pmm::PAGE_SIZE); }
-        if !vmm::map_page_in(cr3, va, phys, vmm::PAGE_PRESENT | vmm::PAGE_USER | vmm::PAGE_WRITABLE | vmm::PAGE_NO_EXECUTE) {
+        // Zero via PHYS_OFF (no CR3 switch required)
+        unsafe { core::ptr::write_bytes((PHYS_OFF + phys) as *mut u8, 0, pmm::PAGE_SIZE); }
+        if !vmm::map_page_in(cr3, va, phys,
+            vmm::PAGE_PRESENT | vmm::PAGE_USER | vmm::PAGE_WRITABLE | vmm::PAGE_NO_EXECUTE) {
             return Err(PeError::MappingFailed);
         }
     }
@@ -597,11 +629,44 @@ fn rva_to_file_offset(rva: u32, data: &[u8], oh: &ImageOptionalHeader64) -> Opti
 }
 
 /// Apply base relocations after loading at `load_base` instead of `preferred_base`.
+/// Read/write helpers that translate user VAs to physical addresses via PHYS_OFF.
+/// This avoids any need to switch CR3 or face SMAP/page-fault issues in kernel mode.
+/// `virt_to_phys_in` returns physical address including the page offset.
+
+unsafe fn write_u64_virt(cr3: u64, va: u64, val: u64) {
+    if let Some(phys) = crate::mm::vmm::virt_to_phys_in(cr3, va) {
+        core::ptr::write_unaligned((PHYS_OFF + phys) as *mut u64, val);
+    }
+}
+
+unsafe fn read_u64_virt(cr3: u64, va: u64) -> u64 {
+    if let Some(phys) = crate::mm::vmm::virt_to_phys_in(cr3, va) {
+        core::ptr::read_unaligned((PHYS_OFF + phys) as *const u64)
+    } else {
+        0
+    }
+}
+
+unsafe fn write_u32_virt(cr3: u64, va: u64, val: u32) {
+    if let Some(phys) = crate::mm::vmm::virt_to_phys_in(cr3, va) {
+        core::ptr::write_unaligned((PHYS_OFF + phys) as *mut u32, val);
+    }
+}
+
+unsafe fn read_u32_virt(cr3: u64, va: u64) -> u32 {
+    if let Some(phys) = crate::mm::vmm::virt_to_phys_in(cr3, va) {
+        core::ptr::read_unaligned((PHYS_OFF + phys) as *const u32)
+    } else {
+        0
+    }
+}
+
 fn apply_relocations(
     data:      &[u8],
     oh:        &ImageOptionalHeader64,
     load_base: u64,
     delta:     i64,
+    cr3:       u64,
 ) -> Result<(), PeError> {
     let num_dirs = oh.number_of_rva_and_sizes.min(IMAGE_NUMBEROF_DIRECTORY_ENTRIES as u32) as usize;
     if num_dirs <= IMAGE_DIRECTORY_ENTRY_BASERELOC { return Ok(()); }
@@ -632,16 +697,14 @@ fn apply_relocations(
                 }
                 IMAGE_REL_BASED_DIR64 => {
                     unsafe {
-                        let ptr = target_va as *mut u64;
-                        let old = core::ptr::read_unaligned(ptr);
-                        core::ptr::write_unaligned(ptr, old.wrapping_add(delta as u64));
+                        let old = read_u64_virt(cr3, target_va);
+                        write_u64_virt(cr3, target_va, old.wrapping_add(delta as u64));
                     }
                 }
                 IMAGE_REL_BASED_HIGHLOW => {
                     unsafe {
-                        let ptr = target_va as *mut u32;
-                        let old = core::ptr::read_unaligned(ptr);
-                        core::ptr::write_unaligned(ptr, old.wrapping_add(delta as u32));
+                        let old = read_u32_virt(cr3, target_va);
+                        write_u32_virt(cr3, target_va, old.wrapping_add(delta as u32));
                     }
                 }
                 _ => {
@@ -659,9 +722,11 @@ fn apply_relocations(
 /// If found, writes the stub address into the IAT entry in the loaded image.
 /// If not found on a required import, returns `PeError::UnresolvedImport`.
 fn resolve_imports(
-    data:      &[u8],
-    oh:        &ImageOptionalHeader64,
-    load_base: u64,
+    data:         &[u8],
+    oh:           &ImageOptionalHeader64,
+    load_base:    u64,
+    stub_page_va: u64,
+    cr3:          u64,
 ) -> Result<(), PeError> {
     let num_dirs = oh.number_of_rva_and_sizes.min(IMAGE_NUMBEROF_DIRECTORY_ENTRIES as u32) as usize;
     if num_dirs <= IMAGE_DIRECTORY_ENTRY_IMPORT { return Ok(()); }
@@ -705,28 +770,40 @@ fn resolve_imports(
             if thunk.0 == 0 { break; } // terminator
 
             let stub_addr = if thunk.is_ordinal() {
-                // Ordinal import — look up by ordinal in NT stub table
+                // Ordinal import — fall back to kernel VA (trampoline not indexed by ordinal)
                 crate::nt::lookup_stub_ordinal(dll_name, thunk.ordinal())
                     .unwrap_or(0)
             } else {
-                // Named import — look up by name
+                // Named import — resolve to trampoline slot VA or kernel VA
                 let name_file_off = rva_to_file_offset(thunk.address_rva(), data, oh)
                     .ok_or(PeError::BadSymbolName)?;
                 // Skip 2-byte hint
                 let sym_name = read_cstr(data, name_file_off + 2)
                     .ok_or(PeError::BadSymbolName)?;
-                let addr = crate::nt::lookup_stub(dll_name, sym_name);
-                if addr == 0 {
-                    crate::serial_println!("[PE]   WARN: unresolved {}!{}", dll_name, sym_name);
+                if stub_page_va != 0 {
+                    // User-mode process: use per-process trampoline slot
+                    if let Some(idx) = crate::nt::lookup_stub_slot_index(dll_name, sym_name) {
+                        let va = stub_page_va + (idx * crate::nt::NT_STUB_SLOT_BYTES) as u64;
+                        crate::serial_println!("[PE]   {}!{} → trampoline slot {} @ {:#x}",
+                            dll_name, sym_name, idx, va);
+                        va
+                    } else {
+                        crate::serial_println!("[PE]   WARN: unresolved {}!{}", dll_name, sym_name);
+                        0
+                    }
+                } else {
+                    // Kernel-only load: use kernel VA directly
+                    let addr = crate::nt::lookup_stub(dll_name, sym_name);
+                    if addr == 0 {
+                        crate::serial_println!("[PE]   WARN: unresolved {}!{}", dll_name, sym_name);
+                    }
+                    addr
                 }
-                addr
             };
 
-            // Write stub address into loaded IAT
+            // Write stub address into loaded IAT via PHYS_OFF (no CR3 switch)
             if stub_addr != 0 {
-                unsafe {
-                    core::ptr::write_unaligned(iat_va as *mut u64, stub_addr);
-                }
+                unsafe { write_u64_virt(cr3, iat_va, stub_addr); }
             }
 
             thunk_file_off += 8;

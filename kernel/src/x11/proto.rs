@@ -39,13 +39,20 @@ pub const OP_CHANGE_PROPERTY:        u8 = 18;
 pub const OP_DELETE_PROPERTY:        u8 = 19;
 pub const OP_GET_PROPERTY:           u8 = 20;
 pub const OP_LIST_PROPERTIES:        u8 = 21;
-pub const OP_SELECT_INPUT:           u8 = 25;
+pub const OP_SET_SELECTION_OWNER:    u8 = 22;
+pub const OP_GET_SELECTION_OWNER:    u8 = 23; // reply: owner window
+pub const OP_CONVERT_SELECTION:      u8 = 24;
+pub const OP_SEND_EVENT:             u8 = 25;
 pub const OP_GRAB_POINTER:           u8 = 26;
 pub const OP_UNGRAB_POINTER:         u8 = 27;
 pub const OP_GRAB_BUTTON:            u8 = 28;
 pub const OP_UNGRAB_BUTTON:          u8 = 29;
 pub const OP_GRAB_KEYBOARD:          u8 = 31;
 pub const OP_UNGRAB_KEYBOARD:        u8 = 32;
+pub const OP_ALLOW_EVENTS:           u8 = 35;
+pub const OP_GRAB_SERVER:            u8 = 36;
+pub const OP_UNGRAB_SERVER:          u8 = 37;
+pub const OP_QUERY_POINTER:          u8 = 38; // reply: pointer position
 pub const OP_WARP_POINTER:           u8 = 41;
 pub const OP_SET_INPUT_FOCUS:        u8 = 42;
 pub const OP_GET_INPUT_FOCUS:        u8 = 43;
@@ -95,6 +102,9 @@ pub const EVENT_CONFIGURE_NOTIFY:  u8 = 22;
 pub const EVENT_MAP_NOTIFY:        u8 = 19;
 pub const EVENT_UNMAP_NOTIFY:      u8 = 18;
 pub const EVENT_DESTROY_NOTIFY:    u8 = 17;
+pub const EVENT_SELECTION_CLEAR:   u8 = 29;
+pub const EVENT_SELECTION_REQUEST: u8 = 30;
+pub const EVENT_SELECTION_NOTIFY:  u8 = 31;
 pub const EVENT_CLIENT_MESSAGE:    u8 = 33;
 
 // ── Event masks ───────────────────────────────────────────────────────────────
@@ -210,7 +220,14 @@ pub const RENDER_CREATE_PICTURE:     u8 = 4;
 pub const RENDER_CHANGE_PICTURE:     u8 = 5;
 pub const RENDER_FREE_PICTURE:       u8 = 7;
 pub const RENDER_COMPOSITE:          u8 = 8;
-pub const RENDER_FILL_RECTANGLES:    u8 = 22;
+pub const RENDER_CREATE_GLYPH_SET:   u8 = 17;
+pub const RENDER_FREE_GLYPH_SET:     u8 = 19;
+pub const RENDER_ADD_GLYPHS:         u8 = 20;
+pub const RENDER_FREE_GLYPHS:        u8 = 22;
+pub const RENDER_COMPOSITE_GLYPHS8:  u8 = 23;
+pub const RENDER_COMPOSITE_GLYPHS16: u8 = 24;
+pub const RENDER_COMPOSITE_GLYPHS32: u8 = 25;
+pub const RENDER_FILL_RECTANGLES:    u8 = 26; // was wrongly 22; FreeGlyphs=22, FillRects=26
 
 // Porter-Duff compositing operators
 pub const RENDER_OP_CLEAR: u8 = 0;
@@ -239,6 +256,7 @@ pub const COMPOSITE_MAJOR_OPCODE: u8 = 142; // COMPOSITE
 pub const DPMS_MAJOR_OPCODE:      u8 = 145; // DPMS
 pub const XINPUT_MAJOR_OPCODE:    u8 = 131; // XInputExtension (XI2)
 pub const SHM_MAJOR_OPCODE:       u8 = 130; // MIT-SHM
+pub const RANDR_MAJOR_OPCODE:     u8 = 143; // RANDR (RandR)
 
 // ── MIT-SHM minor opcodes ──────────────────────────────────────────────────────
 pub const SHM_QUERY_VERSION:  u8 = 0;

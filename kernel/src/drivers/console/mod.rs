@@ -108,7 +108,17 @@ const CURSOR_BLINK_TICKS: u64 = 50;
 
 impl Console {
     /// Create a new console from framebuffer info.
-    fn new(fb: FramebufferInfo) -> Self {
+    fn new(mut fb: FramebufferInfo) -> Self {
+        // The bootloader stores the framebuffer physical address in base_address.
+        // Physical addresses above 1 GiB are not in the bootloader's higher-half
+        // RAM map, but vmm::extend_higher_half_to_4gib() maps them at PHYS_OFF+phys
+        // so the kernel can access them regardless of which CR3 is active.
+        // Convert to the kernel virtual address here so all accesses use PHYS_OFF.
+        const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+        if fb.base_address < PHYS_OFF {
+            // base_address is still a physical address — convert to virtual.
+            fb.base_address += PHYS_OFF;
+        }
         let max_cols = fb.width as usize / FONT_WIDTH;
         let max_rows = fb.height as usize / FONT_HEIGHT;
         let default_fg = 0x0055_FFFF; // Bright cyan (AstryxOS brand)
@@ -790,9 +800,12 @@ pub fn init(boot_info: &BootInfo) {
 /// Updates base address, dimensions, stride; recomputes text grid; redraws logo.
 pub fn reconfigure_framebuffer(base: u64, width: u32, height: u32, stride: u32) {
     use fmt::Write;
+    // Convert physical framebuffer address to kernel virtual (PHYS_OFF + phys).
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    let virt_base = if base < PHYS_OFF { base + PHYS_OFF } else { base };
     let mut guard = CONSOLE.lock();
     if let Some(ref mut console) = *guard {
-        console.fb.base_address = base;
+        console.fb.base_address = virt_base;
         console.fb.width = width;
         console.fb.height = height;
         console.fb.stride = stride;

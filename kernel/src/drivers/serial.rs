@@ -28,7 +28,7 @@ impl SerialPort {
             hal::outb(self.base + 0, 0x01); // Set divisor to 1 (115200 baud)
             hal::outb(self.base + 1, 0x00); //   (hi byte)
             hal::outb(self.base + 3, 0x03); // 8 bits, no parity, one stop bit
-            hal::outb(self.base + 2, 0xC7); // Enable FIFO, clear them, 14-byte threshold
+            hal::outb(self.base + 2, 0x00); // Disable FIFO (avoid TX-full livelock under SMP)
             hal::outb(self.base + 4, 0x0B); // IRQs enabled, RTS/DSR set
         }
     }
@@ -37,9 +37,14 @@ impl SerialPort {
     fn write_byte(&self, byte: u8) {
         // SAFETY: Writing to UART data register after checking transmit buffer is empty.
         unsafe {
-            // Wait for transmit buffer to be empty
+            // Wait for transmit buffer to be empty; bounded to avoid infinite livelock.
+            let mut n = 0u32;
             while hal::inb(self.base + 5) & 0x20 == 0 {
                 core::hint::spin_loop();
+                n += 1;
+                if n >= 100_000 {
+                    break; // Drop byte rather than hang forever
+                }
             }
             hal::outb(self.base, byte);
         }
@@ -96,5 +101,12 @@ pub fn try_read_byte() -> Option<u8> {
 #[doc(hidden)]
 pub fn _serial_print(args: fmt::Arguments) {
     use fmt::Write;
+    // Disable interrupts while holding SERIAL to prevent same-CPU ISR re-entry deadlock.
+    let rflags: u64;
+    unsafe { core::arch::asm!("pushfq; pop {}", out(reg) rflags, options(nomem, nostack)); }
+    crate::hal::disable_interrupts();
     SERIAL.lock().write_fmt(args).unwrap();
+    if rflags & (1 << 9) != 0 {
+        crate::hal::enable_interrupts();
+    }
 }

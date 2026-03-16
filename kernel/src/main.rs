@@ -120,9 +120,17 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     // Phase 5: Process manager and scheduler
     serial_println!("[Aether] Phase 5: Process & scheduler init...");
-    proc::init();
+    let _idle_stack_top = proc::init();
     sched::init();
     serial_println!("[Aether] Phase 5: Process & scheduler OK");
+
+    // NOTE: We do NOT switch the BSP stack here.  The UEFI bootstrap stack
+    // remains active for kernel_main.  It is in the identity-mapped region
+    // (PML4[0]) which would become unmapped if schedule() switched CR3 to a
+    // user page table.  The fix is in schedule(): the Phase 1 CR3 switch to
+    // kernel_cr3 before switch_context ensures the identity map stays active
+    // for the bootstrap stack.  TID 0's higher-half kernel_stack_base/size
+    // are still used for TSS.RSP[0] and per_cpu.kernel_rsp by the scheduler.
 
     // Phase 5b: APIC and SMP
     serial_println!("[Aether] Phase 5b: APIC init...");
@@ -260,6 +268,175 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     #[cfg(not(feature = "test-mode"))]
     {
+        // ── GUI-TEST mode: bounded desktop loop → pixel telemetry → exit ──
+        // This branch runs the full compositor and window manager for 60 timer
+        // ticks, samples key pixels from the backbuffer, emits them to serial,
+        // then triggers QEMU's ISA debug-exit port so the test script can pick
+        // up the exit code.  It does NOT launch any userspace processes.
+        #[cfg(feature = "gui-test")]
+        {
+            serial_println!("[Aether] GUI-TEST MODE — running bounded desktop loop...");
+            let frames = gui::desktop::launch_desktop_with_timeout(60);
+            gui::compositor::emit_pixel_telemetry();
+            serial_println!("[GUITEST] DONE frames={}", frames);
+            // Give the run script ~1 second to issue a QMP screendump before
+            // we pull the plug — we wait for ~100 timer ticks then exit via
+            // the ISA debug-exit device (value 0 → QEMU exit code 1 = pass).
+            let t0 = arch::x86_64::irq::get_ticks();
+            while arch::x86_64::irq::get_ticks().wrapping_sub(t0) < 100 {
+                core::hint::spin_loop();
+            }
+            unsafe {
+                core::arch::asm!(
+                    "out dx, eax",
+                    in("dx")  0xf4_u16,  // ISA debug-exit iobase
+                    in("eax") 0_u32,     // value 0 → exit(1) = pass
+                    options(nomem, nostack)
+                );
+            }
+            loop { unsafe { core::arch::asm!("hlt"); } }
+        }
+
+        // ── X11 visual test: create a colored window and hold it on screen ──
+        // Activated by firefox-test mode — shows an X11 window before Firefox.
+        #[cfg(all(not(feature = "gui-test"), feature = "firefox-test"))]
+        {
+            serial_println!("[FFTEST] Firefox-test mode starting...");
+            x11::init();
+            serial_println!("[FFTEST] X11 server ready");
+
+            // Create a visible X11 test window BEFORE Firefox launches
+            serial_println!("[X11-VIS] Creating X11 visual test window...");
+            {
+                use crate::net::unix;
+                let cfd = unix::create();
+                if cfd != u64::MAX && unix::connect(cfd, b"/tmp/.X11-unix/X0\0") >= 0 {
+                    // X11 connection setup
+                    let hello: [u8; 12] = [0x6C, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+                    unix::write(cfd, &hello);
+                    x11::poll();
+                    let mut buf = [0u8; 256];
+                    unix::read(cfd, &mut buf);
+
+                    // CreateWindow: 200×150 at (100,100), bright cyan background 0x00A0C0
+                    let mut cw = [0u8; 40];
+                    cw[0] = 1; // CreateWindow
+                    cw[2] = 10; cw[3] = 0; // length=10 words
+                    // wid = 0x700001
+                    cw[4] = 0x01; cw[5] = 0x00; cw[6] = 0x70; cw[7] = 0x00;
+                    // parent = root (1)
+                    cw[8] = 0x01; cw[9] = 0x00; cw[10] = 0x00; cw[11] = 0x00;
+                    // x=100, y=100
+                    cw[12] = 100; cw[13] = 0; cw[14] = 100; cw[15] = 0;
+                    // w=300, h=200
+                    cw[16] = 0x2C; cw[17] = 0x01; // 300
+                    cw[18] = 0xC8; cw[19] = 0x00; // 200
+                    // border=0, class=1
+                    cw[22] = 1; cw[23] = 0;
+                    // visual = 32
+                    cw[24] = 32; cw[25] = 0;
+                    // vmask = CW_BACK_PIXEL(0x02)
+                    cw[28] = 0x02;
+                    // bg_pixel = 0x00A0C0 (bright teal/cyan)
+                    cw[32] = 0xC0; cw[33] = 0xA0; cw[34] = 0x00; cw[35] = 0x00;
+                    unix::write(cfd, &cw);
+                    x11::poll();
+
+                    // MapWindow
+                    let map: [u8; 8] = [8, 0, 2, 0, 0x01, 0x00, 0x70, 0x00];
+                    unix::write(cfd, &map);
+                    x11::poll();
+
+                    serial_println!("[X11-VIS] Created 300x200 window at (100,100) with cyan bg");
+
+                    // DON'T close the connection — keep the window alive
+                    // It will persist until Firefox test ends
+                }
+            }
+            gui::desktop::launch_desktop();
+            hal::enable_interrupts();
+
+            // Wait 30 ticks for the desktop to settle before launching Firefox.
+            // Use spin-wait (not hlt) — LAPIC timer delivery after MMIO exits is unreliable.
+            let t0 = arch::x86_64::irq::get_ticks();
+            while arch::x86_64::irq::get_ticks().wrapping_sub(t0) < 30 {
+                gui::compositor::compose();
+                core::hint::spin_loop();
+            }
+
+            serial_println!("[FFTEST] Launching /disk/lib/firefox/firefox-bin ...");
+            // X11 windowed mode — Firefox should create a window on our X11 server.
+            gui::terminal::launch_process(
+                "/disk/lib/firefox/firefox-bin --no-remote --profile /tmp/ff-profile --new-instance",
+            );
+
+            // Run for up to 30000 ticks (~300 s), polling output and network.
+            // We detect Firefox exit via EXEC_RUNNING going false (set by poll_output).
+            let t_launch = arch::x86_64::irq::get_ticks();
+            let mut last_log_tick: u64 = 0;
+            let mut firefox_exited = false;
+            loop {
+                gui::input::pump_input();
+                crate::net::poll();
+                crate::x11::poll();
+                crate::gui::terminal::poll_output();
+                // Only compose every 3rd tick to reduce MMIO overhead.
+                // Input pump runs every tick for responsiveness.
+                let now_t = arch::x86_64::irq::get_ticks();
+                if now_t % 3 == 0 {
+                    gui::compositor::compose();
+                }
+
+                let now = arch::x86_64::irq::get_ticks();
+                let elapsed = now.wrapping_sub(t_launch);
+
+                // Log a heartbeat every 100 ticks
+                if elapsed / 100 != last_log_tick / 100 {
+                    last_log_tick = elapsed;
+                    serial_println!("[FFTEST] tick={} EXEC_RUNNING={} pf={}",
+                        elapsed,
+                        crate::gui::terminal::is_firefox_running(),
+                        crate::perf::page_faults());
+                }
+
+                // Check if Firefox has exited
+                if elapsed > 60 && !crate::gui::terminal::is_firefox_running() {
+                    serial_println!("[FFTEST] Firefox exited after {} ticks", elapsed);
+                    firefox_exited = true;
+                    break;
+                }
+
+                // Hard timeout after 30000 ticks
+                if elapsed >= 30000 {
+                    serial_println!("[FFTEST] Timeout after {} ticks — Firefox still running", elapsed);
+                    break;
+                }
+
+                unsafe { core::arch::asm!("hlt"); }
+            }
+
+            serial_println!("[FFTEST] firefox_exited={}", firefox_exited);
+            serial_println!("[FFTEST] DONE");
+
+            // Brief pause for QMP screendump, then exit.
+            let t_done = arch::x86_64::irq::get_ticks();
+            while arch::x86_64::irq::get_ticks().wrapping_sub(t_done) < 100 {
+                core::hint::spin_loop();
+            }
+            unsafe {
+                core::arch::asm!(
+                    "out dx, eax",
+                    in("dx")  0xf4_u16,
+                    in("eax") 0_u32,
+                    options(nomem, nostack)
+                );
+            }
+            loop { unsafe { core::arch::asm!("hlt"); } }
+        }
+
+        // ── Normal boot: launch userspace + interactive shell ──────────────
+        #[cfg(not(any(feature = "gui-test", feature = "firefox-test")))]
+        {
         // Phase 13: Launch Ascension (init) and Orbit (shell) as Ring 3 processes
         serial_println!("[Aether] Phase 13: Launching userspace processes...");
 
@@ -294,6 +471,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         // Drop to the kernel shell for interactive debugging/management.
         // Ascension will eventually replace this with a full user-mode init.
         shell::launch()
+        } // end #[cfg(not(any(feature = "gui-test", feature = "firefox-test")))]
     }
 }
 

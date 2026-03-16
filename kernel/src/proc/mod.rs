@@ -15,6 +15,7 @@ pub mod ascension_elf;
 pub mod elf;
 pub mod hello_elf;
 pub mod hello_pe;
+pub mod hello_win32_pe;
 pub mod orbit_elf;
 pub mod pe;
 pub mod thread;
@@ -86,6 +87,19 @@ impl Default for CpuContext {
 }
 
 /// Thread Control Block (TCB).
+/// User-mode callee-saved registers captured at fork() time.
+/// The fork child restores these before iretq so that the parent's
+/// stack frame (e.g. glibc's __fork epilogue) looks identical in the child.
+#[derive(Clone, Copy, Default)]
+pub struct ForkUserRegs {
+    pub rbp: u64,
+    pub rbx: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+}
+
 pub struct Thread {
     /// Thread ID (globally unique).
     pub tid: Tid,
@@ -112,6 +126,12 @@ pub struct Thread {
     pub user_entry_rip: u64,
     /// User-mode entry RSP (for user_mode_bootstrap / fork_child_return).
     pub user_entry_rsp: u64,
+    /// Extra registers for clone3 children: RDX = func, R8 = arg.
+    /// glibc 2.34+ passes the thread function in RDX and argument in R8
+    /// (saved from RCX before the syscall) rather than on the child stack.
+    /// Zero for clone2-style threads (they get fn/arg from the stack).
+    pub user_entry_rdx: u64,
+    pub user_entry_r8:  u64,
     /// Current scheduling priority (0–31; higher = higher priority).
     pub priority: u8,
     /// Base priority to decay back to after a boost.
@@ -119,6 +139,9 @@ pub struct Thread {
     /// Thread-local storage base address (loaded into FS_BASE on context switch).
     /// 0 means no TLS area is allocated for this thread.
     pub tls_base: u64,
+    /// GS.base for Win32 threads (TEB address).  0 for Linux/native threads.
+    /// Loaded into GS_BASE (MSR 0xC000_0101) in `user_mode_bootstrap`.
+    pub gs_base: u64,
     /// CPU affinity: if `Some(cpu_id)`, schedule only on that CPU.
     /// `None` means the thread can run on any CPU.
     pub cpu_affinity: Option<u8>,
@@ -137,6 +160,18 @@ pub struct Thread {
     /// to prevent using a stale kernel RSP before the owning CPU has
     /// finished saving the new one (SMP context-switch race guard).
     pub ctx_rsp_valid: core::sync::atomic::AtomicBool,
+    /// Virtual address to clear (write 0 + futex-wake) on thread exit.
+    /// Set by CLONE_CHILD_CLEARTID flag in clone(). 0 = not set.
+    pub clear_child_tid: u64,
+    /// User callee-saved registers at fork time.  Written by sys_fork_impl
+    /// after fork_process() and read by fork_child_entry() to restore the
+    /// parent's register state before iretq (so glibc's __fork epilogue,
+    /// which reads [rbp-0x38] for the stack canary, uses the correct frame).
+    pub fork_user_regs: ForkUserRegs,
+    /// vfork completion: TID of the parent thread to wake when this child
+    /// calls execve() or exit().  None = not a vfork child.
+    /// Linux equivalent: task_struct->vfork_done (completion semaphore).
+    pub vfork_parent_tid: Option<u64>,
 }
 
 impl Thread {
@@ -211,6 +246,18 @@ pub struct Process {
     pub euid: u32,
     /// Effective group ID (for setgid binaries).
     pub egid: u32,
+    /// Process group ID (for job control and kill(-pgid)).
+    pub pgid: u32,
+    /// Session ID.
+    pub sid: u32,
+    /// If true, exec() cannot gain new privileges (PR_SET_NO_NEW_PRIVS).
+    pub no_new_privs: bool,
+    /// Linux capability permitted set (bitmask; all bits set = root).
+    pub cap_permitted: u64,
+    /// Linux capability effective set.
+    pub cap_effective: u64,
+    /// Per-resource soft limits (indices = Linux RLIMIT_* constants).
+    pub rlimits_soft: [u64; 16],
     /// Supplementary group IDs.
     pub supplementary_groups: Vec<u32>,
     /// File creation mask (umask).
@@ -249,9 +296,50 @@ pub static THREAD_TABLE: Mutex<Vec<Thread>> = Mutex::new(Vec::new());
 static PER_CPU_CURRENT_TID: [AtomicU64; crate::arch::x86_64::apic::MAX_CPUS] =
     [const { AtomicU64::new(0) }; crate::arch::x86_64::apic::MAX_CPUS];
 
-/// Kernel stack size per thread: 16 KiB (4 pages).
-const KERNEL_STACK_PAGES: usize = 4;
+/// Kernel stack size per thread: 256 KiB (64 pages).
+/// Firefox's deep call chains (VFS → FAT32 → ATA + socket → DNS → NSS + signal
+/// delivery + serial formatting) can exceed 128 KiB.  256 KiB provides headroom
+/// while we audit stack-hungry code paths for optimization.
+const KERNEL_STACK_PAGES: usize = 64;
 const KERNEL_STACK_SIZE: u64 = (KERNEL_STACK_PAGES * 4096) as u64;
+/// Public alias for sched dead-stack cache to compare page counts.
+pub const KERNEL_STACK_PAGES_PUB: usize = KERNEL_STACK_PAGES;
+
+/// Allocate a kernel stack, checking the dead-stack cache first (NT pattern).
+/// Returns (stack_base_virt, stack_top_virt).
+fn alloc_kernel_stack() -> Option<(u64, u64)> {
+    // Try the dead-stack cache first — avoids PMM allocator overhead.
+    if let Some(cached_base) = crate::sched::pop_dead_stack() {
+        write_stack_canary(cached_base);
+        return Some((cached_base, cached_base + KERNEL_STACK_SIZE));
+    }
+    // Cache miss — allocate fresh from PMM.
+    let phys_stack = crate::mm::pmm::alloc_pages(KERNEL_STACK_PAGES)?;
+    let stack_base = KERNEL_VIRT_OFFSET + phys_stack;
+    let stack_top = stack_base + KERNEL_STACK_SIZE;
+    write_stack_canary(stack_base);
+    Some((stack_base, stack_top))
+}
+
+/// Magic value written at the bottom of every kernel stack for overflow
+/// detection.  Matches Linux's STACK_END_MAGIC (0x57AC6E9D), extended to
+/// 64 bits.  Checked in schedule() and exit_thread().
+pub const STACK_END_MAGIC: u64 = 0x5741_436B_5374_4B21; // "WACkStK!"
+
+/// Write the stack canary at the bottom of a kernel stack.
+#[inline]
+pub fn write_stack_canary(stack_base: u64) {
+    if stack_base >= KERNEL_VIRT_OFFSET {
+        unsafe { core::ptr::write_volatile(stack_base as *mut u64, STACK_END_MAGIC); }
+    }
+}
+
+/// Check the stack canary. Returns true if intact, false if corrupted.
+#[inline]
+pub fn check_stack_canary(stack_base: u64) -> bool {
+    if stack_base < KERNEL_VIRT_OFFSET || stack_base == 0 { return true; } // skip for idle/untracked stacks
+    unsafe { core::ptr::read_volatile(stack_base as *const u64) == STACK_END_MAGIC }
+}
 
 /// Higher-half virtual offset.  The bootloader identity-maps the first 4 GiB
 /// of RAM at both virtual 0x0 and 0xFFFF_8000_0000_0000.  Kernel stacks are
@@ -260,8 +348,31 @@ const KERNEL_STACK_SIZE: u64 = (KERNEL_STACK_PAGES * 4096) as u64;
 /// shallow-clone PML4[256-511] from the kernel).
 pub const KERNEL_VIRT_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 
+/// Default per-process soft rlimit values (mirrors `sys_getrlimit` defaults).
+fn default_rlimits() -> [u64; 16] {
+    const INF: u64 = u64::MAX;
+    [INF, INF, INF, 8*1024*1024, INF, INF, 1024, 1024, INF, INF, INF, 0, INF, 0, 0, INF]
+}
+
 /// Initialize the process manager.
+///
+/// Allocates a proper higher-half kernel stack for the BSP idle thread (TID 0)
+/// and switches to it.  The UEFI bootstrap stack is at a physical address in
+/// the identity-mapped region (PML4[0]).  When schedule() later switches CR3
+/// to a user process's page table, PML4[0] is replaced with user mappings and
+/// the bootstrap stack becomes unmapped — any stack access causes a double
+/// fault.  By giving TID 0 a higher-half kernel stack (PML4[256-511], shared
+/// with all user page tables), this crash is prevented.
 pub fn init() {
+    // Allocate a proper higher-half kernel stack for TID 0 (BSP idle thread).
+    // This replaces the UEFI bootstrap stack (which is identity-mapped only)
+    // with a stack that survives CR3 switches to user page tables.
+    let idle_phys_stack = crate::mm::pmm::alloc_pages(KERNEL_STACK_PAGES)
+        .expect("Failed to allocate BSP idle kernel stack");
+    let idle_stack_base = KERNEL_VIRT_OFFSET + idle_phys_stack;
+    let idle_stack_top = idle_stack_base + KERNEL_STACK_SIZE;
+    write_stack_canary(idle_stack_base);
+
     // Create the idle process (PID 0) and its main thread (TID 0).
     let idle_proc = Process {
         pid: 0,
@@ -281,6 +392,12 @@ pub fn init() {
         gid: 0,
         euid: 0,
         egid: 0,
+        pgid: 0,
+        sid: 0,
+        no_new_privs: false,
+        cap_permitted: !0u64,
+        cap_effective: !0u64,
+        rlimits_soft: default_rlimits(),
         supplementary_groups: Vec::new(),
         umask: 0o022,
         vm_space: None,
@@ -302,8 +419,8 @@ pub fn init() {
             cr3: crate::mm::vmm::get_cr3(),
             ..CpuContext::default()
         },
-        kernel_stack_base: 0,
-        kernel_stack_size: 0,
+        kernel_stack_base: idle_stack_base,
+        kernel_stack_size: KERNEL_STACK_SIZE,
         wake_tick: u64::MAX,
         name: {
             let mut name = [0u8; 32];
@@ -314,6 +431,8 @@ pub fn init() {
         fpu_state: None,
         user_entry_rip: 0,
         user_entry_rsp: 0,
+        user_entry_rdx: 0,
+        user_entry_r8:  0,
         priority: PRIORITY_IDLE,
         base_priority: PRIORITY_IDLE,
         tls_base: 0,
@@ -324,13 +443,26 @@ pub fn init() {
         last_cpu: 0,
         first_run: false,
         ctx_rsp_valid: core::sync::atomic::AtomicBool::new(true),
+        clear_child_tid: 0,
+        fork_user_regs: ForkUserRegs::default(),
+        vfork_parent_tid: None,
+        gs_base: 0,
     };
 
     PROCESS_TABLE.lock().push(idle_proc);
     THREAD_TABLE.lock().push(idle_thread);
     set_current_tid(0);
 
-    crate::serial_println!("[PROC] Process manager initialized (idle process PID 0, TID 0)");
+    crate::serial_println!(
+        "[PROC] Process manager initialized (idle PID 0, TID 0, kstack={:#x}–{:#x})",
+        idle_stack_base, idle_stack_top
+    );
+
+    // NOTE: We do NOT switch the BSP stack here.  The UEFI bootstrap stack
+    // remains active for kernel_main.  schedule()'s Phase 1 CR3 switch to
+    // kernel_cr3 ensures the identity map stays active for the bootstrap
+    // stack during context switches.  TID 0's kernel_stack_base/size are
+    // used for TSS.RSP[0] and per_cpu.kernel_rsp by the scheduler.
 }
 
 use crate::arch::x86_64::apic::cpu_index;
@@ -414,11 +546,9 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
     let tid = NEXT_TID.fetch_add(1, Ordering::Relaxed);
 
-    // Allocate kernel stack and use its higher-half virtual address.
-    let phys_stack = crate::mm::pmm::alloc_pages(KERNEL_STACK_PAGES)
+    // Allocate kernel stack (tries dead-stack cache first, then PMM).
+    let (stack_base, stack_top) = alloc_kernel_stack()
         .expect("Failed to allocate kernel stack");
-    let stack_base = KERNEL_VIRT_OFFSET + phys_stack;
-    let stack_top = stack_base + KERNEL_STACK_SIZE;
 
     let cr3 = crate::mm::vmm::get_cr3();
 
@@ -465,6 +595,12 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
         gid: 0,
         euid: 0,
         egid: 0,
+        pgid: pid as u32,
+        sid: pid as u32,
+        no_new_privs: false,
+        cap_permitted: !0u64,
+        cap_effective: !0u64,
+        rlimits_soft: default_rlimits(),
         supplementary_groups: Vec::new(),
         umask: 0o022,
         vm_space: None,
@@ -490,6 +626,8 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
         fpu_state: None,
         user_entry_rip: 0,
         user_entry_rsp: 0,
+        user_entry_rdx: 0,
+        user_entry_r8:  0,
         priority: PRIORITY_HIGH,
         base_priority: PRIORITY_HIGH,
         tls_base: 0,
@@ -497,6 +635,10 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
         last_cpu: 0,
         first_run: false,
         ctx_rsp_valid: core::sync::atomic::AtomicBool::new(true),
+        clear_child_tid: 0,
+        fork_user_regs: ForkUserRegs::default(),
+        vfork_parent_tid: None,
+        gs_base: 0,
     };
 
     PROCESS_TABLE.lock().push(process);
@@ -510,9 +652,7 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
 pub fn create_thread(pid: Pid, name: &str, entry_point: u64) -> Option<Tid> {
     let tid = NEXT_TID.fetch_add(1, Ordering::Relaxed);
 
-    let phys_stack = crate::mm::pmm::alloc_pages(KERNEL_STACK_PAGES)?;
-    let stack_base = KERNEL_VIRT_OFFSET + phys_stack;
-    let stack_top = stack_base + KERNEL_STACK_SIZE;
+    let (stack_base, stack_top) = alloc_kernel_stack()?;
 
     let cr3 = {
         let procs = PROCESS_TABLE.lock();
@@ -548,6 +688,8 @@ pub fn create_thread(pid: Pid, name: &str, entry_point: u64) -> Option<Tid> {
         fpu_state: None,
         user_entry_rip: 0,
         user_entry_rsp: 0,
+        user_entry_rdx: 0,
+        user_entry_r8:  0,
         priority: PRIORITY_NORMAL,
         base_priority: PRIORITY_NORMAL,
         tls_base: 0,
@@ -555,6 +697,10 @@ pub fn create_thread(pid: Pid, name: &str, entry_point: u64) -> Option<Tid> {
         last_cpu: 0,
         first_run: false,
         ctx_rsp_valid: core::sync::atomic::AtomicBool::new(true),
+        clear_child_tid: 0,
+        fork_user_regs: ForkUserRegs::default(),
+        vfork_parent_tid: None,
+        gs_base: 0,
     };
 
     THREAD_TABLE.lock().push(thread);
@@ -573,9 +719,7 @@ pub fn create_thread(pid: Pid, name: &str, entry_point: u64) -> Option<Tid> {
 pub fn create_thread_blocked(pid: Pid, name: &str, entry_point: u64) -> Option<Tid> {
     let tid = NEXT_TID.fetch_add(1, Ordering::Relaxed);
 
-    let phys_stack = crate::mm::pmm::alloc_pages(KERNEL_STACK_PAGES)?;
-    let stack_base = KERNEL_VIRT_OFFSET + phys_stack;
-    let stack_top = stack_base + KERNEL_STACK_SIZE;
+    let (stack_base, stack_top) = alloc_kernel_stack()?;
 
     let cr3 = {
         let procs = PROCESS_TABLE.lock();
@@ -611,6 +755,8 @@ pub fn create_thread_blocked(pid: Pid, name: &str, entry_point: u64) -> Option<T
         fpu_state: None,
         user_entry_rip: 0,
         user_entry_rsp: 0,
+        user_entry_rdx: 0,
+        user_entry_r8:  0,
         priority: PRIORITY_NORMAL,
         base_priority: PRIORITY_NORMAL,
         tls_base: 0,
@@ -618,6 +764,10 @@ pub fn create_thread_blocked(pid: Pid, name: &str, entry_point: u64) -> Option<T
         last_cpu: 0,
         first_run: false,
         ctx_rsp_valid: core::sync::atomic::AtomicBool::new(true),
+        clear_child_tid: 0,
+        fork_user_regs: ForkUserRegs::default(),
+        vfork_parent_tid: None,
+        gs_base: 0,
     };
 
     THREAD_TABLE.lock().push(thread);
@@ -632,6 +782,20 @@ pub fn exit_thread(exit_code: i64) {
     let tid = recover_current_tid();
     let pid;
     let parent_pid;
+
+    // ── Stack canary check before cleanup ────────────────────────────
+    {
+        let threads = THREAD_TABLE.lock();
+        if let Some(t) = threads.iter().find(|t| t.tid == tid) {
+            if t.kernel_stack_base > 0 && !check_stack_canary(t.kernel_stack_base) {
+                crate::serial_println!(
+                    "[EXIT] STACK OVERFLOW: tid={} pid={} stack_base={:#x}",
+                    tid, t.pid, t.kernel_stack_base
+                );
+                // Don't panic — we're already exiting. Just log the warning.
+            }
+        }
+    }
 
     // Do NOT mark this thread Dead yet — see exit_group() for the reasoning.
     // We get our PID here but defer the Dead transition until after all cleanup.
@@ -680,18 +844,50 @@ pub fn exit_thread(exit_code: i64) {
         }
     }
 
-    // Free user memory now that the process is Zombie.  No locks held here.
-    if all_dead {
-        // Switch to the kernel page tables BEFORE freeing user page tables.
-        // This closes the race where another CPU allocates+zeroes the freed
-        // user PML4 physical page before the scheduler switches this CPU's
-        // CR3, which would triple-fault on the next interrupt.
+    // ALWAYS switch to kernel CR3 before any cleanup or schedule().
+    // This ensures the CPU never holds a stale user CR3 when entering
+    // schedule() — the NT model (unconditional CR3 load) handles the
+    // incoming thread's CR3, but the outgoing thread must not leave
+    // a user CR3 that could be freed underneath it.
+    {
         let kc3 = crate::mm::vmm::get_kernel_cr3();
         let cur = crate::mm::vmm::get_cr3();
         if kc3 != 0 && cur != kc3 {
             unsafe { crate::mm::vmm::switch_cr3(kc3); }
         }
+    }
+
+    // Free user memory now that the process is Zombie.  No locks held here.
+    if all_dead {
         free_process_memory(pid);
+    }
+
+    // vfork completion: if this is a vfork child exiting without exec, wake parent.
+    // Linux: exit_mm_release() → mm_release() → complete_vfork_done().
+    crate::syscall::wake_vfork_parent();
+
+    // CLONE_CHILD_CLEARTID: write 0 to the child_tid address and futex-wake it.
+    // This is how glibc's pthread_join knows the thread has exited — it does
+    // futex_wait on the tid field in the TCB until this wake arrives.
+    {
+        let clear_addr = {
+            let threads = THREAD_TABLE.lock();
+            threads.iter().find(|t| t.tid == tid)
+                .map(|t| t.clear_child_tid)
+                .unwrap_or(0)
+        };
+        if clear_addr != 0 {
+            // Write 0 to the tid address (in the process's user address space).
+            let cr3 = {
+                let procs = PROCESS_TABLE.lock();
+                procs.iter().find(|p| p.pid == pid).map(|p| p.cr3).unwrap_or(0)
+            };
+            if cr3 != 0 {
+                crate::syscall::write_u32_to_user_pub(cr3, clear_addr, 0);
+            }
+            // Futex-wake any thread waiting on this address.
+            crate::syscall::futex_wake_for_exit(pid, clear_addr, 1);
+        }
     }
 
     // Wake parent threads waiting in waitpid, and mark current thread Dead.
@@ -722,7 +918,17 @@ pub fn exit_thread(exit_code: i64) {
     }
 
     // Yield to scheduler — we're dead, should never return.
-    crate::sched::schedule();
+    // Wrap in a loop: if the scheduler is disabled (between tests on SMP),
+    // schedule() returns early.  Without the loop, exit_thread (which is -> !)
+    // would exhibit undefined behavior.  Spin-wait until the scheduler is
+    // re-enabled, then schedule() will context-switch away permanently.
+    loop {
+        crate::sched::schedule();
+        // schedule() returned — scheduler probably disabled.
+        while !crate::sched::is_active() {
+            core::hint::spin_loop();
+        }
+    }
 }
 
 /// Free all physical memory owned by a process (user page frames + page tables).
@@ -794,27 +1000,42 @@ pub fn free_process_memory(pid: Pid) {
 /// shallow copies of the kernel half and must not be freed.
 ///
 /// # Safety
-/// `cr3` must be a valid PML4 physical address reachable via the identity map.
+/// `cr3` must be a valid PML4 physical address.
 /// All user page *frames* must already have been freed/unmapped before calling.
+///
+/// Page table entries are read via KERNEL_VIRT_OFFSET (higher-half direct map),
+/// NOT the identity map.  This is safe regardless of which CR3 is active —
+/// the higher-half mapping (PML4[256-511]) is shared across all page tables.
 fn free_user_page_tables(cr3: u64) {
     use crate::mm::pmm;
     const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
     const PAGE_PRESENT: u64 = 1;
     const PAGE_HUGE: u64 = 0x80;
 
+    // Guard: don't free kernel CR3 or a zero/already-freed CR3.
+    let kernel_cr3 = crate::mm::vmm::get_kernel_cr3();
+    if cr3 == 0 || cr3 == kernel_cr3 { return; }
+
+    /// Convert physical address to a kernel-accessible virtual pointer
+    /// using the higher-half direct map (not identity map).
+    #[inline(always)]
+    unsafe fn p2v(phys: u64) -> *const u64 {
+        (KERNEL_VIRT_OFFSET + phys) as *const u64
+    }
+
     unsafe {
-        let pml4 = cr3 as *const u64;
+        let pml4 = p2v(cr3);
         for i in 0..256usize {
             let pml4e = core::ptr::read_volatile(pml4.add(i));
             if pml4e & PAGE_PRESENT == 0 { continue; }
             let pdpt_phys = pml4e & ADDR_MASK;
-            let pdpt = pdpt_phys as *const u64;
+            let pdpt = p2v(pdpt_phys);
             for j in 0..512usize {
                 let pdpte = core::ptr::read_volatile(pdpt.add(j));
                 if pdpte & PAGE_PRESENT == 0 { continue; }
                 if pdpte & PAGE_HUGE != 0 { continue; } // 1 GiB huge page — skip
                 let pd_phys = pdpte & ADDR_MASK;
-                let pd = pd_phys as *const u64;
+                let pd = p2v(pd_phys);
                 for k in 0..512usize {
                     let pde = core::ptr::read_volatile(pd.add(k));
                     if pde & PAGE_PRESENT == 0 { continue; }
@@ -886,13 +1107,23 @@ pub fn exit_group(exit_code: i64) {
         }
     }
 
-    // Mark the process as Zombie and record exit code.
+    // Release POSIX file locks held by this process (C1).
+    crate::vfs::FILE_LOCKS.lock().retain(|l| l.pid != pid);
+
+    // Mark the process as Zombie, record exit code, and re-parent its live children
+    // to PID 1 (orphan adoption) so they don't accumulate as un-reapable zombies.
     {
         let mut procs = PROCESS_TABLE.lock();
         parent_pid = procs.iter().find(|p| p.pid == pid).map(|p| p.parent_pid).unwrap_or(0);
         if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
             proc.state = ProcessState::Zombie;
             proc.exit_code = exit_code as i32;
+        }
+        // Orphan adoption: re-parent surviving children to PID 1.
+        for p in procs.iter_mut() {
+            if p.parent_pid == pid && p.state != ProcessState::Zombie {
+                p.parent_pid = 1;
+            }
         }
     }
 
@@ -971,6 +1202,30 @@ pub fn process_name(pid: Pid) -> Option<alloc::string::String> {
     })
 }
 
+/// Return the CR3 of a process (for CLONE_CHILD_SETTID kernel writes).
+pub fn get_process_cr3(pid: Pid) -> Option<u64> {
+    let procs = PROCESS_TABLE.lock();
+    procs.iter().find(|p| p.pid == pid).map(|p| p.cr3)
+}
+
+/// Store the clear_child_tid address in a thread for CLONE_CHILD_CLEARTID.
+/// When that thread exits, the kernel will write 0 to that address and wake futex.
+pub fn set_clear_child_tid(pid: Pid, tid: Tid, tidptr: u64) {
+    let mut threads = THREAD_TABLE.lock();
+    if let Some(t) = threads.iter_mut().find(|t| t.pid == pid && t.tid == tid) {
+        t.clear_child_tid = tidptr;
+    }
+}
+
+/// Store the parent's user-mode callee-saved registers in the fork child's
+/// thread entry so fork_child_entry() can restore them before iretq.
+pub fn set_fork_user_regs(pid: Pid, tid: Tid, regs: ForkUserRegs) {
+    let mut threads = THREAD_TABLE.lock();
+    if let Some(t) = threads.iter_mut().find(|t| t.pid == pid && t.tid == tid) {
+        t.fork_user_regs = regs;
+    }
+}
+
 /// Fork a process: create a child that is a copy of the parent.
 ///
 /// If the parent has a VmSpace, performs Copy-on-Write (CoW) fork:
@@ -986,17 +1241,18 @@ pub fn process_name(pid: Pid) -> Option<alloc::string::String> {
 /// - (If user-mode) Returns to the same instruction as the parent with RAX=0
 ///
 /// Returns the child PID, or None on failure.
-pub fn fork_process(parent_pid: Pid, _parent_tid: Tid) -> Option<Pid> {
+pub fn fork_process(parent_pid: Pid, _parent_tid: Tid) -> Option<(Pid, Tid)> {
     let child_pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
     let child_tid = NEXT_TID.fetch_add(1, Ordering::Relaxed);
 
     // Allocate kernel stack for the child (higher-half virtual address).
-    let phys_stack = crate::mm::pmm::alloc_pages(KERNEL_STACK_PAGES)?;
-    let stack_base = KERNEL_VIRT_OFFSET + phys_stack;
-    let stack_top = stack_base + KERNEL_STACK_SIZE;
+    let (stack_base, stack_top) = alloc_kernel_stack()?;
 
     // Copy parent's file descriptors, CWD, and security credentials.
-    let (fds, cwd, parent_name, parent_uid, parent_gid, parent_euid, parent_egid, parent_groups, parent_umask, parent_linux_abi, parent_subsystem, parent_token_id) = {
+    let (fds, cwd, parent_name, parent_uid, parent_gid, parent_euid, parent_egid,
+         parent_groups, parent_umask, parent_linux_abi, parent_subsystem, parent_token_id,
+         parent_pgid, parent_sid, parent_no_new_privs, parent_cap_permitted,
+         parent_cap_effective, parent_rlimits_soft) = {
         let procs = PROCESS_TABLE.lock();
         let parent = procs.iter().find(|p| p.pid == parent_pid)?;
         (
@@ -1012,27 +1268,43 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid) -> Option<Pid> {
             parent.linux_abi,
             parent.subsystem,
             parent.token_id,
+            parent.pgid,
+            parent.sid,
+            parent.no_new_privs,
+            parent.cap_permitted,
+            parent.cap_effective,
+            parent.rlimits_soft,
         )
     };
 
-    // Read the parent's user-mode return address and stack pointer from the
-    // saved syscall frame on the parent's kernel stack (if it exists).
-    let (user_rip, user_rsp) = {
+    // Enforce RLIMIT_NPROC: count non-zombie processes.
+    {
+        let procs = PROCESS_TABLE.lock();
+        let count = procs.iter().filter(|p| p.state != ProcessState::Zombie).count();
+        if count >= parent_rlimits_soft[6] as usize {
+            return None; // EAGAIN: too many processes
+        }
+    }
+
+    // Read the parent's user-mode return address, stack pointer, and TLS base
+    // from the parent's thread struct / kernel stack.
+    let (user_rip, user_rsp, parent_tls_base) = {
         let threads = THREAD_TABLE.lock();
         if let Some(parent_thread) = threads.iter().find(|t| t.tid == _parent_tid) {
+            let tls = parent_thread.tls_base;
             if parent_thread.kernel_stack_base > 0 && parent_thread.kernel_stack_size > 0 {
                 let kstack_top = parent_thread.kernel_stack_base + parent_thread.kernel_stack_size;
                 // syscall_entry layout: offset -16 = RCX (user RIP), offset -8 = user RSP
                 unsafe {
                     let rip = *((kstack_top - 16) as *const u64);
                     let rsp = *((kstack_top - 8) as *const u64);
-                    (rip, rsp)
+                    (rip, rsp, tls)
                 }
             } else {
-                (0u64, 0u64)
+                (0u64, 0u64, tls)
             }
         } else {
-            (0u64, 0u64)
+            (0u64, 0u64, 0u64)
         }
     };
 
@@ -1040,8 +1312,12 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid) -> Option<Pid> {
     let (child_cr3, child_vm_space) = {
         let mut procs = PROCESS_TABLE.lock();
         let parent = procs.iter_mut().find(|p| p.pid == parent_pid)?;
-        if let Some(ref parent_vs) = parent.vm_space {
-            match parent_vs.clone_for_fork() {
+        // Read the actual running CR3 before mutably borrowing vm_space.
+        // This ensures clone_for_fork walks the correct page tables even
+        // if vm_space.cr3 is stale (e.g., after exec updated proc.cr3).
+        let actual_cr3 = parent.cr3;
+        if let Some(ref mut parent_vs) = parent.vm_space {
+            match parent_vs.clone_for_fork(actual_cr3) {
                 Some(child_vs) => {
                     let cr3 = child_vs.cr3;
                     (cr3, Some(child_vs))
@@ -1095,6 +1371,12 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid) -> Option<Pid> {
         gid: parent_gid,
         euid: parent_euid,
         egid: parent_egid,
+        pgid: parent_pgid,
+        sid: parent_sid,
+        no_new_privs: parent_no_new_privs,
+        cap_permitted: parent_cap_permitted,
+        cap_effective: parent_cap_effective,
+        rlimits_soft: parent_rlimits_soft,
         supplementary_groups: parent_groups,
         umask: parent_umask,
         vm_space: child_vm_space,
@@ -1110,7 +1392,9 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid) -> Option<Pid> {
     let child_thread = Thread {
         tid: child_tid,
         pid: child_pid,
-        state: ThreadState::Ready,
+        // Start Blocked so sys_fork_impl can write fork_user_regs before the
+        // child is scheduled.  unblock_process() is called after set_fork_user_regs().
+        state: ThreadState::Blocked,
         context,
         kernel_stack_base: stack_base,
         kernel_stack_size: KERNEL_STACK_SIZE,
@@ -1120,13 +1404,19 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid) -> Option<Pid> {
         fpu_state: None,
         user_entry_rip: user_rip,
         user_entry_rsp: user_rsp,
+        user_entry_rdx: 0,
+        user_entry_r8:  0,
         priority: PRIORITY_NORMAL,
         base_priority: PRIORITY_NORMAL,
-        tls_base: 0,
+        tls_base: parent_tls_base, // inherit parent's FS.base so fork child has working TLS
         cpu_affinity: None,
         last_cpu: 0,
         first_run: false,
         ctx_rsp_valid: core::sync::atomic::AtomicBool::new(true),
+        clear_child_tid: 0,
+        fork_user_regs: ForkUserRegs::default(),
+        vfork_parent_tid: None,
+        gs_base: 0,
     };
 
     PROCESS_TABLE.lock().push(child_proc);
@@ -1137,7 +1427,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid) -> Option<Pid> {
         child_pid, child_tid, parent_pid, user_rip != 0
     );
 
-    Some(child_pid)
+    Some((child_pid, child_tid))
 }
 
 /// Entry point for forked child threads.
@@ -1146,12 +1436,13 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid) -> Option<Pid> {
 /// user mode at the parent's saved instruction with RAX=0.
 /// Otherwise (kernel-mode fork), it simply exits with code 0.
 fn fork_child_entry() {
-    let (entry_rip, entry_rsp, kernel_stack_top) = {
+    let (entry_rip, entry_rsp, kernel_stack_top, tls_base, fork_regs) = {
         let tid = current_tid();
         let threads = THREAD_TABLE.lock();
         let t = threads.iter().find(|t| t.tid == tid)
             .expect("fork_child_entry: current thread not found");
-        (t.user_entry_rip, t.user_entry_rsp, t.kernel_stack_base + t.kernel_stack_size)
+        (t.user_entry_rip, t.user_entry_rsp, t.kernel_stack_base + t.kernel_stack_size,
+         t.tls_base, t.fork_user_regs)
     };
 
     if entry_rip == 0 {
@@ -1182,22 +1473,52 @@ fn fork_child_entry() {
         crate::syscall::set_kernel_rsp(kernel_stack_top);
     }
 
+    // Restore parent's FS.base (TLS pointer) in the child.
+    // Without this, thread-local variables accessed via fs:[offset] fault
+    // or return garbage (causing glibc assertion failures on fork child paths).
+    crate::serial_println!(
+        "[PROC] fork_child_entry: tls={:#x} rbp={:#x} rbx={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+        tls_base, fork_regs.rbp, fork_regs.rbx, fork_regs.r12, fork_regs.r13, fork_regs.r14, fork_regs.r15
+    );
+    if tls_base != 0 {
+        unsafe { write_fs_base(tls_base); }
+    }
+
     // Jump to user mode with RAX=0 (fork returns 0 in child).
+    // We also restore the parent's callee-saved registers (rbp, rbx, r12-r15)
+    // so that the parent's stack frame is intact in the child.  Without this,
+    // glibc's __fork epilogue crashes at "mov -0x38(%rbp),%rax" with rbp=0.
+    // rbp and rbx cannot be used as direct register constraints (LLVM restriction),
+    // so pass them through generic registers and mov into rbp/rbx in the asm.
+    // r12-r15 accept explicit constraints directly.
     unsafe {
         use crate::arch::x86_64::gdt;
         core::arch::asm!(
-            "xor rax, rax",     // fork returns 0 in child
-            "push {ss}",        // SS
-            "push {rsp_val}",   // RSP
-            "push {rflags}",    // RFLAGS (IF set)
-            "push {cs}",        // CS
-            "push {rip_val}",   // RIP
+            // Push the iretq frame FIRST, before restoring rbp/rbx.
+            // LLVM may allocate RBP as a scratch register for rip_val/rsp_val;
+            // if we do "mov rbp, rbp_val" first, we'd clobber that scratch reg
+            // before it is pushed.  Pushing first avoids any such aliasing.
+            "push {ss}",          // SS
+            "push {rsp_val}",     // RSP
+            "push {rflags}",      // RFLAGS (IF set)
+            "push {cs}",          // CS
+            "push {rip_val}",     // RIP (must be on stack before we touch rbp)
+            // Now restore callee-saved regs; frame values are safely on the stack.
+            "mov rbp, {rbp_val}", // restore parent RBP
+            "mov rbx, {rbx_val}", // restore parent RBX
+            "xor rax, rax",       // fork returns 0 in child
             "iretq",
-            ss = in(reg) gdt::USER_DATA_SELECTOR as u64,
-            rsp_val = in(reg) entry_rsp,
-            rflags = in(reg) 0x202u64,
-            cs = in(reg) gdt::USER_CODE_SELECTOR as u64,
-            rip_val = in(reg) entry_rip,
+            rbp_val  = in(reg) fork_regs.rbp,
+            rbx_val  = in(reg) fork_regs.rbx,
+            ss       = in(reg) gdt::USER_DATA_SELECTOR as u64,
+            rsp_val  = in(reg) entry_rsp,
+            rflags   = in(reg) 0x202u64,
+            cs       = in(reg) gdt::USER_CODE_SELECTOR as u64,
+            rip_val  = in(reg) entry_rip,
+            in("r12") fork_regs.r12,
+            in("r13") fork_regs.r13,
+            in("r14") fork_regs.r14,
+            in("r15") fork_regs.r15,
             options(noreturn),
         );
     }

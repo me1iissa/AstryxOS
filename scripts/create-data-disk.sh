@@ -57,6 +57,14 @@ if command -v mcopy &>/dev/null; then
     mmd -i "${DATA_IMG}" "::docs" 2>/dev/null || true
     mmd -i "${DATA_IMG}" "::bin"  2>/dev/null || true
 
+    # Create /etc/ with standard system files (needed by glibc/NSS for Firefox)
+    mmd -i "${DATA_IMG}" "::etc" 2>/dev/null || true
+    printf 'astryx\n' | mcopy -i "${DATA_IMG}" - "::etc/hostname"
+    printf '127.0.0.1 localhost\n::1 localhost\n127.0.1.1 astryx\n' | mcopy -i "${DATA_IMG}" - "::etc/hosts"
+    printf 'nameserver 10.0.2.3\n' | mcopy -i "${DATA_IMG}" - "::etc/resolv.conf"
+    printf 'hosts: files dns\n' | mcopy -i "${DATA_IMG}" - "::etc/nsswitch.conf"
+    echo "[DATA-DISK] Created /etc/ (hostname, hosts, resolv.conf, nsswitch.conf)"
+
     # Create a welcome file
     echo "Welcome to AstryxOS persistent storage!" | mcopy -i "${DATA_IMG}" - "::welcome.txt"
 
@@ -76,42 +84,38 @@ EOF
     # Create a sample file in docs/
     echo "AstryxOS documentation placeholder." | mcopy -i "${DATA_IMG}" - "::docs/guide.txt"
 
-    # Copy userspace binaries (if built)
-    if [ -f "${BUILD_DIR}/hello" ]; then
-        mcopy -i "${DATA_IMG}" "${BUILD_DIR}/hello" "::bin/hello"
-        echo "[DATA-DISK] Copied hello binary to /bin/hello"
-    fi
-    if [ -f "${BUILD_DIR}/mmap_test" ]; then
-        mcopy -i "${DATA_IMG}" "${BUILD_DIR}/mmap_test" "::bin/mmap_test"
-        echo "[DATA-DISK] Copied mmap_test binary to /bin/mmap_test"
-    fi
+    # ── Copy userspace test binaries ─────────────────────────────────────────
+    # Check build/ first, then userspace/ as fallback.
+    # These are musl-linked ELF binaries built by scripts/build-musl.sh
+    # or manually compiled in userspace/.
+    USERSPACE="${ROOT_DIR}/userspace"
+    TEST_BINS=(hello mmap_test dynamic_hello dynamic_hello_pie clone_thread_test socket_test)
+    for bin in "${TEST_BINS[@]}"; do
+        SRC=""
+        if [ -f "${BUILD_DIR}/${bin}" ]; then
+            SRC="${BUILD_DIR}/${bin}"
+        elif [ -f "${USERSPACE}/${bin}" ]; then
+            SRC="${USERSPACE}/${bin}"
+        fi
+        if [ -n "${SRC}" ]; then
+            mcopy -o -i "${DATA_IMG}" "${SRC}" "::bin/${bin}"
+            echo "[DATA-DISK] Copied ${bin} to /bin/${bin}"
+        else
+            echo "[DATA-DISK] WARNING: ${bin} not found (build/ or userspace/)"
+        fi
+    done
 
-    # Create /lib for the musl dynamic linker
+    # Create /lib for the musl dynamic linker (use our freshly built copy)
     mmd -i "${DATA_IMG}" "::lib" 2>/dev/null || true
-    LD_MUSL="/usr/lib/x86_64-linux-musl/libc.so"
+    LD_MUSL="${BUILD_DIR}/disk/lib/ld-musl-x86_64.so.1"
+    LIBC_SO="${BUILD_DIR}/disk/lib/libc.so"
     if [ -f "${LD_MUSL}" ]; then
-        mcopy -i "${DATA_IMG}" "${LD_MUSL}" "::lib/ld-musl-x86_64.so.1"
+        mcopy -o -i "${DATA_IMG}" "${LD_MUSL}" "::lib/ld-musl-x86_64.so.1"
         echo "[DATA-DISK] Copied ld-musl to /lib/ld-musl-x86_64.so.1"
     fi
-
-    if [ -f "${BUILD_DIR}/dynamic_hello" ]; then
-        mcopy -i "${DATA_IMG}" "${BUILD_DIR}/dynamic_hello" "::bin/dynamic_hello"
-        echo "[DATA-DISK] Copied dynamic_hello to /bin/dynamic_hello"
-    fi
-
-    if [ -f "${BUILD_DIR}/clone_thread_test" ]; then
-        mcopy -i "${DATA_IMG}" "${BUILD_DIR}/clone_thread_test" "::bin/clone_thread_test"
-        echo "[DATA-DISK] Copied clone_thread_test to /bin/clone_thread_test"
-    fi
-
-    if [ -f "${BUILD_DIR}/socket_test" ]; then
-        mcopy -i "${DATA_IMG}" "${BUILD_DIR}/socket_test" "::bin/socket_test"
-        echo "[DATA-DISK] Copied socket_test to /bin/socket_test"
-    fi
-
-    if [ -f "${BUILD_DIR}/dynamic_hello_pie" ]; then
-        mcopy -i "${DATA_IMG}" "${BUILD_DIR}/dynamic_hello_pie" "::bin/dynamic_hello_pie"
-        echo "[DATA-DISK] Copied dynamic_hello_pie (ET_DYN PIE) to /bin/dynamic_hello_pie"
+    if [ -f "${LIBC_SO}" ]; then
+        mcopy -o -i "${DATA_IMG}" "${LIBC_SO}" "::lib/libc.so"
+        echo "[DATA-DISK] Copied libc.so to /lib/libc.so"
     fi
 
     # ── Dynamic linker + glibc (needed by Firefox and other glibc binaries) ──
