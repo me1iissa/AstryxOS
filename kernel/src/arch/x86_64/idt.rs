@@ -395,23 +395,44 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
 
     let pid = crate::proc::recover_current_pid();
 
-    // Look up the faulting address in the process's VmSpace
-    let mut procs = crate::proc::PROCESS_TABLE.lock();
-    let proc = match procs.iter_mut().find(|p| p.pid == pid) {
-        Some(p) => p,
-        None => return false,
+    // Look up the faulting address in the process's VmSpace.
+    // For vfork children (sharing parent's CR3), also check the parent's VmSpace
+    // if the child's own VmSpace doesn't have a matching VMA.
+    let (parent_pid_for_fallback, own_cr3) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        let proc = match procs.iter().find(|p| p.pid == pid) {
+            Some(p) => p,
+            None => return false,
+        };
+        (proc.parent_pid, proc.cr3)
     };
 
-    // If this process has no VmSpace (e.g., vfork child sharing parent's CR3),
-    // try the parent's VmSpace for demand-paging resolution.
-    let has_vmspace = proc.vm_space.is_some();
-    let parent_pid_fallback = if !has_vmspace { proc.parent_pid } else { 0 };
-    drop(proc);
-    drop(procs);
+    // Determine which PID's VmSpace to use for this fault.
+    // Try own process first; if it has no VMA for this address, try the parent.
+    // This handles vfork children that share the parent's page tables.
+    let target_pid = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        let has_vma = procs.iter().find(|p| p.pid == pid)
+            .and_then(|p| p.vm_space.as_ref())
+            .and_then(|vs| vs.find_vma(faulting_addr))
+            .is_some();
+        if has_vma {
+            pid
+        } else if parent_pid_for_fallback != 0 {
+            // Check if parent has the same CR3 (shared address space = vfork)
+            let parent_cr3 = procs.iter().find(|p| p.pid == parent_pid_for_fallback)
+                .map(|p| p.cr3).unwrap_or(0);
+            if parent_cr3 == own_cr3 && parent_cr3 != 0 {
+                parent_pid_for_fallback
+            } else {
+                pid // Different CR3 — not a vfork child, use own VmSpace
+            }
+        } else {
+            pid
+        }
+    };
 
     let mut procs = crate::proc::PROCESS_TABLE.lock();
-    // Find the process with the VmSpace (self or parent for vfork children).
-    let target_pid = if has_vmspace { pid } else { parent_pid_fallback };
     let proc = match procs.iter_mut().find(|p| p.pid == target_pid) {
         Some(p) => p,
         None => return false,

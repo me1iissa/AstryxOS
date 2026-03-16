@@ -1648,7 +1648,7 @@ fn test_exec_fork() -> bool {
                 procs.iter().find(|p| p.pid == parent_user_pid).map(|p| p.cr3).unwrap_or(0)
             };
 
-            match crate::proc::fork_process(parent_user_pid, parent_user_tid) {
+            match crate::proc::fork_process(parent_user_pid, parent_user_tid, &crate::proc::ForkUserRegs::default()) {
                 Some((child_cow_pid, _child_cow_tid)) => {
                     let child_cr3 = {
                         let procs = crate::proc::PROCESS_TABLE.lock();

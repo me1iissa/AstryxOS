@@ -165,6 +165,18 @@ impl VmSpace {
         }
     }
 
+    /// Create a VmSpace that uses an existing CR3 (e.g., for vfork children
+    /// that share the parent's page tables but need their own VMA tracking).
+    pub fn from_existing_cr3(cr3: u64) -> Self {
+        Self {
+            cr3,
+            areas: Vec::new(),
+            mmap_hint: MMAP_BASE,
+            brk: HEAP_BASE,
+            brk_start: HEAP_BASE,
+        }
+    }
+
     /// Create a new user address space with its own PML4.
     ///
     /// The new PML4 clones the kernel-half (entries 256-511) from the current CR3,
