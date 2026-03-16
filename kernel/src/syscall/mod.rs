@@ -255,7 +255,12 @@ pub fn init_ap() {
 ///
 /// # ABI (Linux x86_64 register convention, shared by Aether and Linux paths)
 /// - RAX: syscall number; RDI/RSI/RDX/R10/R8/R9: args 1–6
+/// Global syscall counter for heartbeat diagnostics.
+static SYSCALL_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub fn syscall_count() -> u64 { SYSCALL_TOTAL.load(core::sync::atomic::Ordering::Relaxed) }
+
 pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, arg6: u64) -> i64 {
+    SYSCALL_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     crate::perf::record_syscall(num);
 
     let result = if is_linux_abi() {

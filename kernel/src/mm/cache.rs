@@ -79,6 +79,81 @@ pub fn sync_inode(mount_idx: usize, inode: u64) {
     }
 }
 
+/// Pre-populate the page cache for an entire file.
+///
+/// Reads every 4KB page of the file from disk into PMM-allocated pages
+/// and inserts them into the page cache.  Subsequent demand-page faults
+/// for this file will hit the cache (instant) instead of reading from
+/// disk (slow ATA PIO on WSL2/KVM).
+///
+/// Returns the number of pages cached.
+pub fn prepopulate_file(path: &str) -> usize {
+    use crate::vfs;
+
+    let (mount_idx, inode) = match vfs::resolve_path(path) {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    let file_size = {
+        let mounts = vfs::MOUNTS.lock();
+        match mounts[mount_idx].fs.stat(inode) {
+            Ok(s) => s.size,
+            Err(_) => return 0,
+        }
+    };
+
+    let page_size = crate::mm::pmm::PAGE_SIZE as u64;
+    let mut cached = 0usize;
+    let phys_off: u64 = 0xFFFF_8000_0000_0000;
+
+    // Read page-by-page directly into PMM pages (no heap allocation).
+    // Each page is read from the filesystem into a PMM-allocated physical
+    // page via the higher-half mapping, then inserted into the page cache.
+    let mut offset: u64 = 0;
+    while offset < file_size {
+        let page_off = offset & !0xFFF; // page-align
+        if lookup(mount_idx, inode, page_off).is_some() {
+            offset = page_off + page_size;
+            continue;
+        }
+        // Stop if PMM is running low — keep 20K pages (80MB) free for kernel ops.
+        if crate::mm::pmm::free_page_count() < 20_000 {
+            crate::serial_println!("[CACHE] prepopulate stopping: PMM low ({} free pages)",
+                crate::mm::pmm::free_page_count());
+            break;
+        }
+        if let Some(phys) = crate::mm::pmm::alloc_page() {
+            unsafe {
+                core::ptr::write_bytes((phys_off + phys) as *mut u8, 0, page_size as usize);
+            }
+            let buf = unsafe {
+                core::slice::from_raw_parts_mut(
+                    (phys_off + phys) as *mut u8, page_size as usize)
+            };
+            {
+                let mounts = vfs::MOUNTS.lock();
+                if mounts[mount_idx].fs.read(inode, page_off, buf).is_err() {
+                    crate::mm::pmm::free_page(phys);
+                    break;
+                }
+            }
+            insert(mount_idx, inode, page_off, phys);
+            cached += 1;
+        } else {
+            break; // OOM
+        }
+
+        offset = page_off + page_size;
+
+        // Log progress every 4000 pages (~16MB).
+        if cached > 0 && cached % 4000 == 0 {
+            crate::serial_println!("[CACHE] prepopulate {}: {} pages ({} MB)",
+                path, cached, cached * 4 / 1024);
+        }
+    }
+    cached
+}
+
 /// Return cache statistics: (total_entries, dirty_entries).
 pub fn stats() -> (usize, usize) {
     let cache = PAGE_CACHE.lock();

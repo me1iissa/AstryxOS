@@ -185,8 +185,10 @@ extern "C" fn timer_tick() {
     {
         if tick > 0 && tick % 500 == 0 {
             let cpu = super::apic::cpu_index();
-            crate::serial_println!("[HB] tick={} cpu={} pf={}", tick, cpu,
-                crate::arch::x86_64::idt::page_fault_count());
+            crate::serial_println!("[HB] tick={} cpu={} pf={} sc={}",
+                tick, cpu,
+                crate::arch::x86_64::idt::page_fault_count(),
+                crate::syscall::syscall_count());
         }
     }
 
