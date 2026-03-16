@@ -829,11 +829,31 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
     }
 
     let envp: &[&str] = &[
-        "HOME=/",
+        "HOME=/home/user",
         "PATH=/bin:/disk/bin",
         "TCCDIR=/disk/lib/tcc",
         "TMPDIR=/tmp",
         "DISPLAY=:0",
+        "GDK_BACKEND=x11",
+        "MOZ_DISABLE_CONTENT_SANDBOX=1",
+        "MOZ_DISABLE_NONLOCAL_CONNECTIONS=1",
+        "MOZ_DISABLE_AUTO_SAFE_MODE=1",
+        // Force single-process mode — no content process fork.
+        "MOZ_FORCE_DISABLE_E10S=1",
+        // Skip GPU/glxtest process — we don't support fork+exec yet.
+        // Tell Firefox to use software rendering without probing.
+        "MOZ_GFX_TESTING_NO_CHILD_PROCESS=1",
+        "MOZ_X11_EGL=0",
+        "MOZ_ACCELERATED=0",
+        "LIBGL_ALWAYS_SOFTWARE=1",
+        "LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/disk/lib/firefox",
+        "XDG_RUNTIME_DIR=/tmp",
+        "XDG_CONFIG_HOME=/tmp/.config",
+        "FONTCONFIG_PATH=/disk/lib/firefox/fonts",
+        // Pre-set D-Bus address so Firefox does not try to exec dbus-launch.
+        // Without this, Firefox forks a child that execs dbus-launch, fails
+        // (not on disk), and both parent and child exit with code 1.
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus.sock",
     ];
 
     // Spawn blocked so we can attach the pipe before the child can run.
@@ -849,6 +869,47 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
     crate::proc::unblock_process(pid);
 
     Ok((pid, pipe_id))
+}
+
+// ---------------------------------------------------------------------------
+// Public launch helper — called from start menu / desktop
+// ---------------------------------------------------------------------------
+
+/// Launch an external ELF process asynchronously, wiring its stdout to the
+/// terminal widget.  Prints any error to the terminal on failure.
+/// Safe to call even when another exec is running (will show busy message).
+pub fn launch_process(path: &str) {
+    // Show a "launching..." message in the terminal first.
+    {
+        let mut guard = TERMINAL.lock();
+        if let Some(ref mut state) = *guard {
+            let msg = alloc::format!("Launching {}...\n", path);
+            state.write_str_colored(&msg, ANSI_COLORS[2]); // green
+        }
+    }
+
+    match spawn_async(path) {
+        Ok((pid, pipe_id)) => {
+            let mut guard = TERMINAL.lock();
+            if let Some(ref mut state) = *guard {
+                state.running_exec = Some((pid, pipe_id));
+                EXEC_RUNNING.store(true, core::sync::atomic::Ordering::Release);
+            }
+        }
+        Err(msg) => {
+            let mut guard = TERMINAL.lock();
+            if let Some(ref mut state) = *guard {
+                let err = alloc::format!("Error: {}\n", msg);
+                state.write_str_colored(&err, ANSI_COLORS[1]); // red
+            }
+        }
+    }
+}
+
+/// Returns true if a child process launched via `launch_process` is currently
+/// running.  Used by the `firefox-test` feature to detect Firefox exit.
+pub fn is_firefox_running() -> bool {
+    EXEC_RUNNING.load(Ordering::Acquire)
 }
 
 // ---------------------------------------------------------------------------
@@ -877,9 +938,21 @@ pub fn poll_output() {
         None => return,
     };
 
-    // Drain available pipe bytes (non-blocking).
-    let mut raw = [0u8; 512];
-    let n = crate::ipc::pipe::pipe_read(pipe_id, &mut raw).unwrap_or(0);
+    // Drain ALL available pipe bytes in a loop (non-blocking).
+    // Larger buffer (4096) + loop drains the entire pipe in one poll_output() call,
+    // then renders ONCE — eliminates the per-512-byte render overhead that made
+    // terminal text appear much slower than serial output.
+    let mut raw = [0u8; 4096];
+    let mut any_data = false;
+
+    // First pass: read all available data before locking TERMINAL
+    let mut chunks: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    loop {
+        let n = crate::ipc::pipe::pipe_read(pipe_id, &mut raw).unwrap_or(0);
+        if n == 0 { break; }
+        chunks.push(raw[..n].to_vec());
+        any_data = true;
+    }
 
     // Non-blocking waitpid: did the child become a zombie?
     let exit_status = crate::proc::waitpid(0, pid as i64);
@@ -891,17 +964,19 @@ pub fn poll_output() {
         None => return,
     };
 
-    // Append stdout bytes to the terminal grid.
-    if n > 0 {
-        let text = core::str::from_utf8(&raw[..n]).unwrap_or("\u{FFFD}");
+    // Append ALL stdout bytes to the terminal grid, then render ONCE.
+    for chunk in &chunks {
+        let text = core::str::from_utf8(chunk).unwrap_or("\u{FFFD}");
         state.write_ansi_str(text);
+    }
+    if any_data {
         state.render_to_surface();
     }
 
     if let Some((_reaped, code)) = exit_status {
         // Drain any final bytes the child wrote before exiting.
         drop(guard); // release TERMINAL before pipe_read
-        let mut tail = [0u8; 512];
+        let mut tail = [0u8; 4096];
         let tn = crate::ipc::pipe::pipe_read(pipe_id, &mut tail).unwrap_or(0);
         crate::ipc::pipe::pipe_close_reader(pipe_id);
 

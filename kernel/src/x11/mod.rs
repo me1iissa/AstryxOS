@@ -36,14 +36,14 @@ use alloc::vec::Vec;
 use crate::net::unix;
 use spin::Mutex;
 use core::sync::atomic::{AtomicBool, Ordering};
-use resource::{ResourceBody, ResourceTable, WindowData, PixmapData, GcData, PictureData};
+use resource::{ResourceBody, ResourceTable, WindowData, PixmapData, GcData, PictureData, GlyphSet, GlyphInfo};
 
 /// Set to true once `init()` completes. Checked in `poll()` without taking
 /// the SERVER mutex so the fast path (not yet initialized) is zero-cost.
 static X11_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 // ─────────────────────────────────────────────────────────────────────────────
-const MAX_CLIENTS:      usize = 8;
+const MAX_CLIENTS:      usize = 32;
 const SOCKET_PATH:      &[u8] = b"/tmp/.X11-unix/X0\0";
 const RESOURCE_ID_BASE: u32   = 0x0040_0000;
 const RESOURCE_ID_MASK: u32   = 0x001F_FFFF;
@@ -66,7 +66,17 @@ impl Client {
                  resources: Box::new(ResourceTable::new()) }
     }
     fn next_seq(&mut self) -> u16 { self.seq = self.seq.wrapping_add(1); self.seq }
-    fn send(&self, data: &[u8])   { unix::write(self.fd, data); }
+    fn send(&self, data: &[u8])   {
+        #[cfg(feature = "firefox-test")]
+        if data.len() >= 4 && data[0] == 1 {
+            // Reply: log fd, seq, reply_length, total_bytes
+            let seq = u16::from_le_bytes([data[2], data[3]]);
+            let extra = if data.len() >= 8 { u32::from_le_bytes([data[4], data[5], data[6], data[7]]) } else { 0 };
+            crate::serial_println!("[X11REPLY] fd={} seq={} reply_len={} total={}",
+                self.fd, seq, extra, data.len());
+        }
+        unix::write(self.fd, data);
+    }
     fn send_error(&self, code: u8, bad_id: u32, opcode: u8) {
         let mut p = [0u8; 32];
         p[0] = 0; p[1] = code;
@@ -77,14 +87,45 @@ impl Client {
     }
 }
 
+// ── Selection owner table ─────────────────────────────────────────────────────
+
+const MAX_SELECTIONS: usize = 8;
+
+#[derive(Clone, Copy)]
+struct SelectionOwner {
+    selection: u32,   // selection atom ID (0 = unused slot)
+    owner:     u32,   // owner window ID (0 = no current owner)
+    owner_fd:  u64,   // client fd that set ownership (u64::MAX = none)
+    timestamp: u32,   // X timestamp when ownership was acquired
+}
+impl SelectionOwner {
+    const fn empty() -> Self {
+        SelectionOwner { selection: 0, owner: 0, owner_fd: u64::MAX, timestamp: 0 }
+    }
+}
+
 // ── Server state ─────────────────────────────────────────────────────────────
 
 struct Server {
-    initialized: bool,
-    listen_fd:   u64,
-    clients:     [Option<Client>; MAX_CLIENTS],
+    initialized:     bool,
+    listen_fd:       u64,
+    clients:         [Option<Client>; MAX_CLIENTS],
+    /// Properties on the root window (shared across all clients).
+    root_properties: [Option<resource::PropertyEntry>; resource::MAX_PROPERTIES],
+    /// ICCCM selection ownership table.
+    selections:      [SelectionOwner; MAX_SELECTIONS],
 }
-impl Server { const fn new() -> Self { Server { initialized: false, listen_fd: 0, clients: [const { None }; MAX_CLIENTS] } } }
+impl Server {
+    const fn new() -> Self {
+        Server {
+            initialized:     false,
+            listen_fd:       0,
+            clients:         [const { None }; MAX_CLIENTS],
+            root_properties: [const { None }; resource::MAX_PROPERTIES],
+            selections:      [SelectionOwner::empty(); MAX_SELECTIONS],
+        }
+    }
+}
 unsafe impl Send for Server {}
 static SERVER: Mutex<Server> = Mutex::new(Server::new());
 
@@ -94,6 +135,75 @@ static SERVER: Mutex<Server> = Mutex::new(Server::new());
 #[inline] fn r32(b: &[u8], o: usize) -> u32  { proto::read_u32le(b, o) }
 #[inline] fn w16(b: &mut [u8], o: usize, v: u16) { proto::write_u16le(b, o, v); }
 #[inline] fn w32(b: &mut [u8], o: usize, v: u32) { proto::write_u32le(b, o, v); }
+
+// ── Root-window property helpers ─────────────────────────────────────────────
+
+/// Set a property in a raw property-array (same semantics as WindowData::set_property).
+fn prop_arr_set(arr: &mut [Option<resource::PropertyEntry>; resource::MAX_PROPERTIES],
+                name: u32, type_: u32, format: u8, data: &[u8], mode: u8) {
+    let copy_len = data.len().min(resource::MAX_PROPERTY_DATA);
+    for slot in arr.iter_mut() {
+        if let Some(p) = slot {
+            if p.name == name {
+                match mode {
+                    1 => { /* prepend: put new data before existing — just replace for simplicity */
+                        let old_len = p.len;
+                        let new_len = (copy_len + old_len).min(resource::MAX_PROPERTY_DATA);
+                        p.data.copy_within(0..old_len.min(resource::MAX_PROPERTY_DATA - copy_len), copy_len);
+                        p.data[..copy_len].copy_from_slice(&data[..copy_len]);
+                        p.len = new_len;
+                    }
+                    2 => { /* append */
+                        let start = p.len;
+                        let room  = resource::MAX_PROPERTY_DATA.saturating_sub(start);
+                        let n = copy_len.min(room);
+                        p.data[start..start+n].copy_from_slice(&data[..n]);
+                        p.len = start + n;
+                    }
+                    _ => { /* replace */
+                        p.data[..copy_len].copy_from_slice(&data[..copy_len]);
+                        p.len = copy_len;
+                        p.type_ = type_; p.format = format;
+                    }
+                }
+                return;
+            }
+        }
+    }
+    // Insert new entry.
+    for slot in arr.iter_mut() {
+        if slot.is_none() {
+            let mut p = resource::PropertyEntry::empty();
+            p.name = name; p.type_ = type_; p.format = format;
+            p.data[..copy_len].copy_from_slice(&data[..copy_len]);
+            p.len = copy_len;
+            *slot = Some(p);
+            return;
+        }
+    }
+}
+
+/// Get a property from a raw property-array; returns (type_, format, len, data_copy).
+fn prop_arr_get(arr: &[Option<resource::PropertyEntry>; resource::MAX_PROPERTIES], name: u32)
+    -> Option<(u32, u8, usize, [u8; resource::MAX_PROPERTY_DATA])> {
+    for slot in arr.iter() {
+        if let Some(p) = slot {
+            if p.name == name {
+                let mut buf = [0u8; resource::MAX_PROPERTY_DATA];
+                buf[..p.len].copy_from_slice(&p.data[..p.len]);
+                return Some((p.type_, p.format, p.len, buf));
+            }
+        }
+    }
+    None
+}
+
+/// Delete a property from a raw property-array.
+fn prop_arr_del(arr: &mut [Option<resource::PropertyEntry>; resource::MAX_PROPERTIES], name: u32) {
+    for slot in arr.iter_mut() {
+        if let Some(p) = slot { if p.name == name { *slot = None; return; } }
+    }
+}
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -107,8 +217,36 @@ pub fn init() {
         return;
     }
     unix::listen(fd);
-    SERVER.lock().listen_fd = fd;
-    SERVER.lock().initialized = true;
+    {
+        let mut srv = SERVER.lock();
+        srv.listen_fd    = fd;
+        srv.initialized  = true;
+
+        // ── EWMH: pre-populate _NET_SUPPORTED on the root window ─────────
+        // Intern the EWMH atoms we support.
+        let net_supported            = atoms::intern("_NET_SUPPORTED",                false);
+        let net_wm_state             = atoms::intern("_NET_WM_STATE",                 false);
+        let net_wm_state_fullscreen  = atoms::intern("_NET_WM_STATE_FULLSCREEN",      false);
+        let net_wm_state_max_vert    = atoms::intern("_NET_WM_STATE_MAXIMIZED_VERT",  false);
+        let net_wm_state_max_horiz   = atoms::intern("_NET_WM_STATE_MAXIMIZED_HORIZ", false);
+        let net_wm_state_hidden      = atoms::intern("_NET_WM_STATE_HIDDEN",          false);
+        let net_active_window        = atoms::intern("_NET_ACTIVE_WINDOW",            false);
+        let net_wm_name              = atoms::intern("_NET_WM_NAME",                  false);
+        let net_wm_window_type       = atoms::intern("_NET_WM_WINDOW_TYPE",           false);
+        // Pack the supported-atom list as 32-bit LE values.
+        let supported = [
+            net_wm_state, net_wm_state_fullscreen, net_wm_state_max_vert,
+            net_wm_state_max_horiz, net_wm_state_hidden, net_active_window,
+            net_wm_name, net_wm_window_type,
+        ];
+        let mut buf = [0u8; 64];
+        for (i, &a) in supported.iter().enumerate() {
+            proto::write_u32le(&mut buf, i * 4, a);
+        }
+        prop_arr_set(&mut srv.root_properties,
+            net_supported, atoms::ATOM_ATOM, 32,
+            &buf[..supported.len() * 4], 0);
+    }
     X11_INITIALIZED.store(true, Ordering::Release);
     crate::serial_println!("[X11] Xastryx ready on /tmp/.X11-unix/X0 (fd={})", fd);
 }
@@ -201,6 +339,41 @@ pub fn inject_mouse_event(rx: i16, ry: i16, buttons: u8, prev_buttons: u8) {
     }
 }
 
+/// Snapshot of an X11 window for the compositor to blit.
+pub struct X11WindowSnapshot {
+    pub x: i16,
+    pub y: i16,
+    pub width: u16,
+    pub height: u16,
+    pub pixels: Vec<u8>, // BGRA, width×height×4
+}
+
+/// Collect all mapped X11 client windows for compositor rendering.
+/// Returns a Vec of snapshots (copies pixel data to avoid holding locks).
+pub fn get_mapped_windows() -> Vec<X11WindowSnapshot> {
+    if !X11_INITIALIZED.load(Ordering::Acquire) { return Vec::new(); }
+    let srv = SERVER.lock();
+    let mut result = Vec::new();
+    for slot in srv.clients.iter() {
+        if let Some(client) = slot {
+            for (_rid, body) in client.resources.iter_all() {
+                if let resource::ResourceBody::Window(ref w) = body {
+                    if w.mapped && !w.pixels.is_empty() && w.width > 0 && w.height > 0 {
+                        result.push(X11WindowSnapshot {
+                            x: w.x,
+                            y: w.y,
+                            width: w.width,
+                            height: w.height,
+                            pixels: w.pixels.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
 /// Accept new clients and service pending reads.  Call from idle/scheduler loop.
 pub fn poll() {
     if !X11_INITIALIZED.load(Ordering::Acquire) { return; }
@@ -217,10 +390,40 @@ pub fn poll() {
         }
     }
 
+    // Reap dead clients: if the peer (client) socket is Free, the client
+    // disconnected.  Close our server-side socket and free the slot.
+    {
+        let mut dead_fds = [u64::MAX; MAX_CLIENTS];
+        let mut dead_idx = [usize::MAX; MAX_CLIENTS];
+        {
+            let s = SERVER.lock();
+            for (i, sl) in s.clients.iter().enumerate() {
+                if let Some(c) = sl {
+                    let peer = unix::get_peer(c.fd);
+                    let peer_alive = peer != u64::MAX
+                        && unix::state(peer) != crate::net::unix::UnixState::Free;
+                    if !peer_alive { dead_fds[i] = c.fd; dead_idx[i] = i; }
+                }
+            }
+        }
+        let mut srv = SERVER.lock();
+        for i in 0..MAX_CLIENTS {
+            if dead_idx[i] != usize::MAX {
+                srv.clients[dead_idx[i]] = None;
+                unix::close(dead_fds[i]);
+            }
+        }
+    }
+
     let mut pending = [u64::MAX; MAX_CLIENTS];
     { let s = SERVER.lock();
       for (i, sl) in s.clients.iter().enumerate() {
-          if let Some(c) = sl { if unix::has_data(c.fd) { pending[i] = c.fd; } }
+          if let Some(c) = sl {
+              let hd = unix::has_data(c.fd);
+              #[cfg(feature = "firefox-test")]
+              if hd { crate::serial_println!("[X11POLL] svc_fd={} has_data=true avail={}", c.fd, unix::bytes_available(c.fd)); }
+              if hd { pending[i] = c.fd; }
+          }
       }
     }
     for &fd in &pending { if fd != u64::MAX { service_fd(fd); } }
@@ -233,6 +436,8 @@ fn service_fd(fd: u64) {
     let n = unix::read(fd, &mut buf);
     if n <= 0 { return; }
     let data = &buf[..n as usize];
+    #[cfg(feature = "firefox-test")]
+    crate::serial_println!("[X11SVC] fd={} read {} bytes", fd, n);
     let setup = {
         let s = SERVER.lock();
         s.clients.iter().filter_map(|s| s.as_ref()).find(|c| c.fd == fd)
@@ -256,7 +461,25 @@ fn handle_setup(fd: u64, data: &[u8]) {
     if data.len() < 12       { send_fail(fd, b"truncated"); return; }
     if data[0] != 0x6C       { send_fail(fd, b"big-endian not supported"); return; }
     if r16(data,2) != 11     { send_fail(fd, b"unsupported protocol"); return; }
-    unix::write(fd, &build_setup_ok());
+    #[cfg(feature = "firefox-test")]
+    {
+        let n_auth = r16(data, 6) as usize;
+        let d_auth = r16(data, 8) as usize;
+        crate::serial_println!("[X11] setup: byte_order={:#x} maj={} min={} n_auth={} d_auth={} total_client={}",
+            data[0], r16(data,2), r16(data,4), n_auth, d_auth, data.len());
+    }
+    let reply = build_setup_ok();
+    #[cfg(feature = "firefox-test")]
+    {
+        crate::serial_println!("[X11] setup_ok len={} hdr={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} additional_units={} n_screens={} n_formats={}",
+            reply.len(), reply[0], reply[1], reply[2], reply[3], reply[4], reply[5], reply[6], reply[7],
+            r16(&reply,6), reply[28], reply[29]);
+        crate::serial_println!("[X11] setup_ok res_base={:#x} res_mask={:#x} vendor_len={} max_req={}",
+            r32(&reply,12), r32(&reply,16), r16(&reply,24), r16(&reply,26));
+    }
+    let n_written = unix::write(fd, &reply);
+    #[cfg(feature = "firefox-test")]
+    crate::serial_println!("[X11] setup_ok written={}", n_written);
     let mut srv = SERVER.lock();
     for sl in srv.clients.iter_mut() {
         if let Some(c) = sl { if c.fd == fd { c.setup_done = true; break; } }
@@ -298,6 +521,14 @@ fn build_setup_ok() -> [u8; 128] {
 fn handle_request(fd: u64, data: &[u8]) {
     if data.len() < 4 { return; }
     let opcode = data[0];
+    #[cfg(feature = "firefox-test")]
+    {
+        static X11_REQ_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        let n = X11_REQ_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 200 {
+            crate::serial_println!("[X11] req#{} op={} len={}", n, opcode, data.len());
+        }
+    }
     let seq = { let mut srv = SERVER.lock();
         match srv.clients.iter_mut().filter_map(|s| s.as_mut()).find(|c| c.fd == fd) {
             Some(c) => c.next_seq(), None => return } };
@@ -317,13 +548,20 @@ fn handle_request(fd: u64, data: &[u8]) {
         proto::OP_DELETE_PROPERTY       => op_delete_property(fd, data),
         proto::OP_GET_PROPERTY          => op_get_property(fd, data, seq),
         proto::OP_LIST_PROPERTIES       => op_list_properties(fd, data, seq),
-        proto::OP_SELECT_INPUT          => op_select_input(fd, data),
+        proto::OP_SET_SELECTION_OWNER   => op_set_selection_owner(fd, data, seq),
+        proto::OP_GET_SELECTION_OWNER   => op_get_selection_owner(fd, data, seq),
+        proto::OP_CONVERT_SELECTION     => op_convert_selection(fd, data, seq),
+        proto::OP_SEND_EVENT            => {} // no reply — client routes event to window, no-op
         proto::OP_GRAB_POINTER          => op_grab_reply(fd, seq),
         proto::OP_UNGRAB_POINTER        => {}
         proto::OP_GRAB_BUTTON           => {}
         proto::OP_UNGRAB_BUTTON         => {}
         proto::OP_GRAB_KEYBOARD         => op_grab_reply(fd, seq),
         proto::OP_UNGRAB_KEYBOARD       => {}
+        proto::OP_ALLOW_EVENTS          => {}
+        proto::OP_GRAB_SERVER           => {}
+        proto::OP_UNGRAB_SERVER         => {}
+        proto::OP_QUERY_POINTER         => op_query_pointer(fd, seq),
         proto::OP_WARP_POINTER          => {}
         proto::OP_SET_INPUT_FOCUS       => op_set_input_focus(fd, data),
         proto::OP_GET_INPUT_FOCUS       => op_get_input_focus(fd, seq),
@@ -348,7 +586,10 @@ fn handle_request(fd: u64, data: &[u8]) {
         proto::COMPOSITE_MAJOR_OPCODE  => op_composite(fd, data, seq),
         proto::XTEST_MAJOR_OPCODE      => op_xtest(fd, data, seq),
         proto::SYNC_MAJOR_OPCODE       => op_sync_ext(fd, data, seq),
+        proto::SHAPE_MAJOR_OPCODE      => op_shape(fd, data, seq),
+        proto::XKEYBOARD_MAJOR_OPCODE  => op_xkeyboard(fd, data, seq),
         proto::DPMS_MAJOR_OPCODE       => op_dpms(fd, data, seq),
+        proto::RANDR_MAJOR_OPCODE      => op_randr(fd, data, seq),
         proto::OP_POLY_FILL_RECTANGLE   => op_poly_fill_rect(fd, data),
         proto::OP_PUT_IMAGE             => op_put_image(fd, data),
         proto::OP_IMAGE_TEXT8           => op_image_text8(fd, data),
@@ -368,7 +609,11 @@ fn handle_request(fd: u64, data: &[u8]) {
         proto::OP_SET_MODIFIER_MAPPING  => op_set_modifier_mapping(fd, seq),
         proto::OP_GET_MODIFIER_MAPPING  => op_get_modifier_mapping(fd, seq),
         proto::OP_NO_OPERATION          => {}
-        _ => { with_client(fd, |c| c.send_error(proto::ERR_REQUEST, 0, opcode)); }
+        _ => {
+            #[cfg(feature = "firefox-test")]
+            crate::serial_println!("[X11] unknown opcode={} len={}", opcode, data.len());
+            with_client(fd, |c| c.send_error(proto::ERR_REQUEST, 0, opcode));
+        }
     }
 }
 
@@ -482,6 +727,7 @@ fn op_map_window(fd: u64, data: &[u8], seq: u16) {
         if let Some(w) = c.resources.get_window_mut(wid) {
             let (x,y,width,height,evmask) = (w.x, w.y, w.width, w.height, w.event_mask);
             w.mapped = true;
+            w.ensure_pixels(); // Allocate pixel buffer for compositor
             if evmask & proto::EVENT_MASK_STRUCTURE_NOTIFY != 0 {
                 c.send(&event::encode_map_notify(seq, wid));
             }
@@ -618,9 +864,14 @@ fn op_change_property(fd: u64, data: &[u8]) {
     let nunits = r32(data, 20) as usize;
     let nbytes = nunits * (fmt as usize / 8).max(1);
     let pdata  = &data[24..data.len().min(24+nbytes)];
-    with_client(fd, |c| {
-        if let Some(w) = c.resources.get_window_mut(wid) { w.set_property(prop, type_, fmt, pdata, mode); }
-    });
+    if wid == proto::ROOT_WINDOW_ID {
+        let mut srv = SERVER.lock();
+        prop_arr_set(&mut srv.root_properties, prop, type_, fmt, pdata, mode);
+    } else {
+        with_client(fd, |c| {
+            if let Some(w) = c.resources.get_window_mut(wid) { w.set_property(prop, type_, fmt, pdata, mode); }
+        });
+    }
 }
 
 // ── DeleteProperty (19) ──────────────────────────────────────────────────────
@@ -629,7 +880,48 @@ fn op_delete_property(fd: u64, data: &[u8]) {
     if data.len() < 12 { return; }
     let wid  = r32(data, 4);
     let atom = r32(data, 8);
-    with_client(fd, |c| { if let Some(w) = c.resources.get_window_mut(wid) { w.delete_property(atom); } });
+    if wid == proto::ROOT_WINDOW_ID {
+        let mut srv = SERVER.lock();
+        prop_arr_del(&mut srv.root_properties, atom);
+    } else {
+        with_client(fd, |c| { if let Some(w) = c.resources.get_window_mut(wid) { w.delete_property(atom); } });
+    }
+}
+
+// ── GetProperty reply helper ──────────────────────────────────────────────────
+
+fn send_get_property_reply(
+    fd:      u64,
+    seq:     u16,
+    rtype:   u32,
+    offset:  usize,
+    req_len: usize,
+    result:  Option<(u32, u8, usize, [u8; resource::MAX_PROPERTY_DATA])>,
+) {
+    match result {
+        None => {
+            let mut b = [0u8; 32]; b[0] = 1; w16(&mut b, 2, seq);
+            unix::write(fd, &b);
+        }
+        Some((t, f, n, raw)) => {
+            if rtype != 0 && rtype != t {
+                let mut b = [0u8; 32]; b[0]=1; w16(&mut b,2,seq); w32(&mut b,8,t);
+                w32(&mut b,12,n as u32); unix::write(fd, &b);
+                return;
+            }
+            let start  = offset.min(n);
+            let avail  = n - start;
+            let slen   = avail.min(req_len);
+            let remain = avail - slen;
+            let pd     = proto::pad4(slen);
+            let mut rep = alloc::vec![0u8; 32 + pd];
+            rep[0]=1; rep[1]=f; w16(&mut rep,2,seq); w32(&mut rep,4,(pd/4) as u32);
+            w32(&mut rep,8,t); w32(&mut rep,12,remain as u32);
+            w32(&mut rep,16,(slen/(f as usize/8).max(1)) as u32);
+            if slen > 0 { rep[32..32+slen].copy_from_slice(&raw[start..start+slen]); }
+            unix::write(fd, &rep);
+        }
+    }
 }
 
 // ── GetProperty (20) ─────────────────────────────────────────────────────────
@@ -642,9 +934,33 @@ fn op_get_property(fd: u64, data: &[u8], seq: u16) {
     let rtype   = r32(data, 12);
     let offset  = r32(data, 16) as usize * 4;
     let req_len = r32(data, 20) as usize * 4;
+    #[cfg(feature = "firefox-test")]
+    crate::serial_println!("[X11GP] fd={} wid={} atom={} seq={}", fd, wid, atom, seq);
+
+    // Root-window properties are stored in SERVER.root_properties, not per-client.
+    if wid == proto::ROOT_WINDOW_ID {
+        let result = if atom == 0 { None } else {
+            SERVER.lock().root_properties
+                .iter().filter_map(|s| s.as_ref()).find(|p| p.name == atom)
+                .map(|p| {
+                    let mut arr = [0u8; resource::MAX_PROPERTY_DATA];
+                    arr[..p.len].copy_from_slice(&p.data[..p.len]);
+                    (p.type_, p.format, p.len, arr)
+                })
+        };
+        let client_fd_for_send = fd;
+        send_get_property_reply(client_fd_for_send, seq, rtype, offset, req_len, result);
+        if delete { let mut srv = SERVER.lock(); prop_arr_del(&mut srv.root_properties, atom); }
+        return;
+    }
+
     with_client(fd, |c| {
         if atom == 0 {
-            let mut b = [0u8;32]; b[0]=1; w16(&mut b,2,seq); c.send(&b); return;
+            let mut b = [0u8;32]; b[0]=1; w16(&mut b,2,seq);
+            let wr = unix::write(c.fd, &b);
+            #[cfg(feature = "firefox-test")]
+            crate::serial_println!("[X11GP] atom=0 empty reply fd={} wr={}", c.fd, wr);
+            return;
         }
         let result = c.resources.get_window_mut(wid).and_then(|w| {
             w.get_property(atom).map(|p| {
@@ -653,8 +969,15 @@ fn op_get_property(fd: u64, data: &[u8], seq: u16) {
                 (p.type_, p.format, p.len, arr)
             })
         });
+        #[cfg(feature = "firefox-test")]
+        crate::serial_println!("[X11GP] result={} wid={} atom={}", result.is_some(), wid, atom);
         match result {
-            None => { let mut b=[0u8;32]; b[0]=1; w16(&mut b,2,seq); c.send(&b); }
+            None => {
+                let mut b=[0u8;32]; b[0]=1; w16(&mut b,2,seq);
+                let wr = unix::write(c.fd, &b);
+                #[cfg(feature = "firefox-test")]
+                crate::serial_println!("[X11GP] none-reply fd={} seq={} wr={}", c.fd, seq, wr);
+            }
             Some((type_,fmt,total,raw)) => {
                 if rtype != 0 && rtype != type_ {
                     let mut b=[0u8;32]; b[0]=1; w16(&mut b,2,seq); w32(&mut b,8,type_);
@@ -705,6 +1028,119 @@ fn op_select_input(fd: u64, data: &[u8]) {
     if data.len() < 12 { return; }
     let wid = r32(data, 4); let evmask = r32(data, 8);
     with_client(fd, |c| { if let Some(w) = c.resources.get_window_mut(wid) { w.event_mask = evmask; } });
+}
+
+// ── SetSelectionOwner (22) ───────────────────────────────────────────────────
+
+fn op_set_selection_owner(fd: u64, data: &[u8], _seq: u16) {
+    if data.len() < 16 { return; }
+    // [4..8]=owner window, [8..12]=selection atom, [12..16]=timestamp
+    let owner_win = r32(data, 4);
+    let selection = r32(data, 8);
+    let timestamp = r32(data, 12);
+    let tick = crate::arch::x86_64::irq::get_ticks() as u32;
+    let ts = if timestamp == 0 { tick } else { timestamp };
+
+    let mut srv = SERVER.lock();
+    // Find existing entry for this selection atom.
+    let mut old_owner_fd = u64::MAX;
+    let mut old_owner_win = 0u32;
+    for slot in srv.selections.iter_mut() {
+        if slot.selection == selection {
+            old_owner_fd  = slot.owner_fd;
+            old_owner_win = slot.owner;
+            slot.owner     = owner_win;
+            slot.owner_fd  = if owner_win != 0 { fd } else { u64::MAX };
+            slot.timestamp = ts;
+            break;
+        }
+    }
+    // If no slot found, allocate a new one.
+    if old_owner_fd == u64::MAX && owner_win != 0 {
+        for slot in srv.selections.iter_mut() {
+            if slot.selection == 0 {
+                slot.selection = selection;
+                slot.owner     = owner_win;
+                slot.owner_fd  = fd;
+                slot.timestamp = ts;
+                break;
+            }
+        }
+    }
+    // Send SelectionClear to the previous owner if it differs.
+    if old_owner_win != 0 && old_owner_win != owner_win && old_owner_fd != u64::MAX {
+        let mut ev = [0u8; 32];
+        ev[0] = proto::EVENT_SELECTION_CLEAR;
+        w32(&mut ev, 4, ts);
+        w32(&mut ev, 8, old_owner_win);
+        w32(&mut ev, 12, selection);
+        unix::write(old_owner_fd, &ev);
+    }
+}
+
+// ── GetSelectionOwner (23) ───────────────────────────────────────────────────
+
+fn op_get_selection_owner(fd: u64, data: &[u8], seq: u16) {
+    let selection = if data.len() >= 8 { r32(data, 4) } else { 0 };
+    let owner = SERVER.lock().selections.iter()
+        .find(|s| s.selection == selection).map(|s| s.owner).unwrap_or(0);
+    let mut b = [0u8; 32]; b[0]=1; w16(&mut b,2,seq); w32(&mut b,8,owner);
+    unix::write(fd, &b);
+}
+
+// ── ConvertSelection (24) ────────────────────────────────────────────────────
+
+fn op_convert_selection(fd: u64, data: &[u8], _seq: u16) {
+    if data.len() < 24 { return; }
+    let selection  = r32(data, 4);
+    let target     = r32(data, 8);
+    let property   = r32(data, 12);
+    let requestor  = r32(data, 16);
+    let timestamp  = r32(data, 20);
+    let tick = crate::arch::x86_64::irq::get_ticks() as u32;
+    let ts = if timestamp == 0 { tick } else { timestamp };
+
+    let (owner_win, owner_fd) = {
+        let srv = SERVER.lock();
+        srv.selections.iter().find(|s| s.selection == selection)
+            .map(|s| (s.owner, s.owner_fd))
+            .unwrap_or((0, u64::MAX))
+    };
+
+    if owner_win == 0 || owner_fd == u64::MAX {
+        // No owner — send SelectionNotify with property=None to requestor.
+        let mut ev = [0u8; 32];
+        ev[0] = proto::EVENT_SELECTION_NOTIFY;
+        w32(&mut ev, 4, ts);
+        w32(&mut ev, 8, requestor);
+        w32(&mut ev, 12, selection);
+        w32(&mut ev, 16, target);
+        // property = 0 (None)
+        unix::write(fd, &ev);
+    } else {
+        // Owner exists — send SelectionRequest to owner.
+        let mut ev = [0u8; 32];
+        ev[0] = proto::EVENT_SELECTION_REQUEST;
+        w32(&mut ev, 4, ts);
+        w32(&mut ev, 8, owner_win);
+        w32(&mut ev, 12, requestor);
+        w32(&mut ev, 16, selection);
+        w32(&mut ev, 20, target);
+        w32(&mut ev, 24, property);
+        unix::write(owner_fd, &ev);
+    }
+}
+
+// ── QueryPointer (38) ───────────────────────────────────────────────────────
+
+fn op_query_pointer(fd: u64, seq: u16) {
+    let mut b = [0u8;32]; b[0]=1; b[1]=1; // same-screen = True
+    w16(&mut b,2,seq);
+    w32(&mut b,8,proto::ROOT_WINDOW_ID);  // root window
+    // child=0, root_x/root_y=center, win_x/win_y=0, mask=0
+    w16(&mut b,20, proto::SCREEN_WIDTH/2);  // root-x
+    w16(&mut b,22, proto::SCREEN_HEIGHT/2); // root-y
+    with_client(fd, |c| c.send(&b));
 }
 
 // ── GrabPointer/GrabKeyboard reply ─────────────────────────────────────────
@@ -1033,14 +1469,34 @@ fn op_poly_fill_rect(fd: u64, data: &[u8]) {
             });
         }
     } else {
-        // Draw directly to screen via window coordinates
-        let (wx, wy) = window_origin(fd, draw);
+        // Draw into the window's pixel buffer for compositor + direct to screen
+        let color_bgra = {
+            let r = ((fg >> 16) & 0xFF) as u8;
+            let g = ((fg >> 8) & 0xFF) as u8;
+            let b = (fg & 0xFF) as u8;
+            [b, g, r, 0xFF]
+        };
         let mut i = 12usize;
         while i + 8 <= data.len() {
             let rx = r16(data, i) as i32; let ry = r16(data, i+2) as i32;
             let rw = r16(data, i+4) as i32; let rh = r16(data, i+6) as i32;
             i += 8;
-            crate::gdi::fill_rect_screen(wx+rx, wy+ry, rw, rh, fg & 0x00FFFFFF);
+            // Write to the window's pixel buffer
+            with_client(fd, |c| {
+                if let Some(w) = c.resources.get_window_mut(draw) {
+                    w.ensure_pixels();
+                    let ww = w.width as i32;
+                    let wh = w.height as i32;
+                    for py in ry.max(0)..((ry + rh).min(wh)) {
+                        for px in rx.max(0)..((rx + rw).min(ww)) {
+                            let off = ((py * ww + px) * 4) as usize;
+                            if off + 3 < w.pixels.len() {
+                                w.pixels[off..off+4].copy_from_slice(&color_bgra);
+                            }
+                        }
+                    }
+                }
+            });
         }
     }
 }
@@ -1162,9 +1618,9 @@ fn op_query_extension(fd: u64, data: &[u8], seq: u16) {
     let name = if data.len() >= 8+nlen { core::str::from_utf8(&data[8..8+nlen]).unwrap_or("") } else { "" };
     let mut b = [0u8;32]; b[0]=1; w16(&mut b,2,seq);
     match name {
-        "MIT-SHM"   => { b[8]=1; b[9]=proto::SHM_MAJOR_OPCODE;    b[10]=proto::SHM_MAJOR_OPCODE; }
-        "XKEYBOARD" => { b[8]=1; b[9]=proto::XKEYBOARD_MAJOR_OPCODE; b[10]=proto::XKEYBOARD_MAJOR_OPCODE; }
-        "SHAPE"     => { b[8]=1; b[9]=proto::SHAPE_MAJOR_OPCODE;   b[10]=proto::SHAPE_MAJOR_OPCODE; }
+        "MIT-SHM"   => { b[8]=1; b[9]=proto::SHM_MAJOR_OPCODE;    b[10]=0; b[11]=0; }
+        "XKEYBOARD" => { b[8]=1; b[9]=proto::XKEYBOARD_MAJOR_OPCODE; b[10]=0; b[11]=0; }
+        "SHAPE"     => { b[8]=1; b[9]=proto::SHAPE_MAJOR_OPCODE;   b[10]=0; b[11]=0; }
         "RENDER"    => { b[8]=1; b[9]=proto::RENDER_MAJOR_OPCODE;  b[10]=0; b[11]=0; }
         "XFIXES"    => { b[8]=1; b[9]=proto::XFIXES_MAJOR_OPCODE;  b[10]=0; b[11]=0; }
         "DAMAGE"    => { b[8]=1; b[9]=proto::DAMAGE_MAJOR_OPCODE;  b[10]=0; b[11]=0; }
@@ -1175,6 +1631,7 @@ fn op_query_extension(fd: u64, data: &[u8], seq: u16) {
         "DPMS"      => { b[8]=1; b[9]=proto::DPMS_MAJOR_OPCODE;    b[10]=0; b[11]=0; }
         "SYNC"      => { b[8]=1; b[9]=proto::SYNC_MAJOR_OPCODE;    b[10]=0; b[11]=0; }
         "COMPOSITE" => { b[8]=1; b[9]=proto::COMPOSITE_MAJOR_OPCODE; b[10]=0; b[11]=0; }
+        "RANDR" | "RandR" => { b[8]=1; b[9]=proto::RANDR_MAJOR_OPCODE; b[10]=0; b[11]=0; }
         _           => {} // not present
     }
     with_client(fd, |c| c.send(&b));
@@ -1186,13 +1643,13 @@ fn op_list_extensions(fd: u64, seq: u16) {
     let names: &[&[u8]] = &[
         b"MIT-SHM", b"XKEYBOARD", b"SHAPE", b"RENDER",
         b"XFIXES", b"DAMAGE", b"XTEST", b"XInputExtension",
-        b"DPMS", b"SYNC", b"COMPOSITE",
+        b"DPMS", b"SYNC", b"COMPOSITE", b"RANDR",
     ];
     let mut body: Vec<u8> = vec![];
     for &n in names { body.push(n.len() as u8); body.extend_from_slice(n); }
     let pd = proto::pad4(body.len()); while body.len() < pd { body.push(0); }
     let mut rep = vec![0u8; 32+pd];
-    rep[0]=1; w16(&mut rep,2,seq); w32(&mut rep,4,(pd/4) as u32); rep[8] = names.len() as u8;
+    rep[0]=1; rep[1] = names.len() as u8; w16(&mut rep,2,seq); w32(&mut rep,4,(pd/4) as u32);
     rep[32..32+body.len()].copy_from_slice(&body);
     with_client(fd, |c| c.send(&rep));
 }
@@ -1272,14 +1729,21 @@ fn op_get_pointer_mapping(fd: u64, seq: u16) {
 fn op_render(fd: u64, data: &[u8], seq: u16) {
     if data.len() < 4 { return; }
     match data[1] {
-        proto::RENDER_QUERY_VERSION      => op_render_query_version(fd, data, seq),
-        proto::RENDER_QUERY_PICT_FORMATS => op_render_query_pict_formats(fd, seq),
-        proto::RENDER_CREATE_PICTURE     => op_render_create_picture(fd, data),
-        proto::RENDER_CHANGE_PICTURE     => {} // no-op: we don't track picture attrs
-        proto::RENDER_FREE_PICTURE       => op_render_free_picture(fd, data),
-        proto::RENDER_COMPOSITE          => op_render_composite(fd, data),
-        proto::RENDER_FILL_RECTANGLES    => op_render_fill_rectangles(fd, data),
-        _                                => {}
+        proto::RENDER_QUERY_VERSION       => op_render_query_version(fd, data, seq),
+        proto::RENDER_QUERY_PICT_FORMATS  => op_render_query_pict_formats(fd, seq),
+        proto::RENDER_CREATE_PICTURE      => op_render_create_picture(fd, data),
+        proto::RENDER_CHANGE_PICTURE      => {} // no-op: we don't track picture attrs
+        proto::RENDER_FREE_PICTURE        => op_render_free_picture(fd, data),
+        proto::RENDER_COMPOSITE           => op_render_composite(fd, data),
+        proto::RENDER_CREATE_GLYPH_SET    => op_render_create_glyphset(fd, data),
+        proto::RENDER_FREE_GLYPH_SET      => op_render_free_glyphset(fd, data),
+        proto::RENDER_ADD_GLYPHS          => op_render_add_glyphs(fd, data),
+        proto::RENDER_FREE_GLYPHS         => op_render_free_glyphs(fd, data),
+        proto::RENDER_COMPOSITE_GLYPHS8   => op_render_composite_glyphs(fd, data, 1),
+        proto::RENDER_COMPOSITE_GLYPHS16  => op_render_composite_glyphs(fd, data, 2),
+        proto::RENDER_COMPOSITE_GLYPHS32  => op_render_composite_glyphs(fd, data, 4),
+        proto::RENDER_FILL_RECTANGLES     => op_render_fill_rectangles(fd, data),
+        _                                 => {}
     }
 }
 
@@ -1536,7 +2000,7 @@ fn op_render_composite(fd: u64, data: &[u8]) {
     }
 }
 
-// ── RenderFillRectangles (minor 22) ──────────────────────────────────────────
+// ── RenderFillRectangles (minor 26) ──────────────────────────────────────────
 //
 // Request:
 //   [4]     op (PictOp)
@@ -1783,6 +2247,77 @@ fn op_sync_ext(fd: u64, data: &[u8], seq: u16) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// XKEYBOARD extension (major opcode 135)
+// ═════════════════════════════════════════════════════════════════════════════
+
+fn op_xkeyboard(fd: u64, data: &[u8], seq: u16) {
+    if data.len() < 4 { return; }
+    let minor = data[1];
+    #[cfg(feature = "firefox-test")]
+    crate::serial_println!("[X11XKB] minor={} seq={} len={}", minor, seq, data.len());
+    // XKB minor opcodes that need replies:
+    // 0=UseExtension, 4=GetState, 6=GetControls, 9=ListComponents,
+    // 10=GetMap, 17=GetCompatMap, 21=GetNames, 24=GetDeviceInfo, 31=SetDebuggingFlags
+    // No-reply: 1=SelectEvents, 3=DeviceBell, 5=SetControls, 7=LockControls, 11=SetMap, etc.
+    match minor {
+        0 => {
+            // XkbUseExtension: supported=1, serverMajor=1, serverMinor=0
+            let mut b = [0u8; 32];
+            b[0] = 1; b[1] = 1; w16(&mut b, 2, seq);
+            w16(&mut b, 8, 1); w16(&mut b, 10, 0);
+            with_client(fd, |c| c.send(&b));
+        }
+        4 => {
+            // XkbGetState: return zeroed state (no modifiers, group 0)
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            // mods, base_mods, latched_mods, locked_mods = 0
+            // group=0, locked_group=0, base_group=0, latched_group=0
+            // ptr_btn_state=0, compat_state=0, etc.
+            with_client(fd, |c| c.send(&b));
+        }
+        6 | 31 => {
+            // XkbGetControls / SetDebuggingFlags: send empty 32-byte reply
+            let mut b = [0u8; 32]; b[0] = 1; w16(&mut b, 2, seq);
+            with_client(fd, |c| c.send(&b));
+        }
+        10 => {
+            // XkbGetMap: send empty map reply.
+            // Reply header: type=1, deviceID=0, seq, length=0
+            // minKeyCode at b[8], maxKeyCode at b[9] (8..255 typical)
+            // present=0 (no components), firstType=0, nTypes=0, ...
+            let mut b = [0u8; 32]; b[0] = 1; w16(&mut b, 2, seq);
+            b[8] = 8; b[9] = 255; // min/max keycode
+            // present=0 → no map components → length stays 0
+            with_client(fd, |c| c.send(&b));
+        }
+        21 => {
+            // XkbGetNames: send reply with which=0 (no name components).
+            // The reply MUST have the correct format or Xlib reads beyond
+            // the 32-byte header, desynchronizing the XCB stream.
+            // Reply: type=1, deviceID=0, seq, length=0
+            //   b[8..12]  = which (CARD32) = 0 → no name components
+            //   b[12..16] = minKeyCode, maxKeyCode, nTypes, groupNames
+            //   b[16..20] = virtualMods, firstKey, nKeys, indicators
+            //   b[20..24] = nKTLevels, ...
+            let mut b = [0u8; 32]; b[0] = 1; w16(&mut b, 2, seq);
+            // which=0 at offset 8 (all zeros) → Xlib reads 0 extra bytes
+            b[12] = 8;  // minKeyCode
+            b[13] = 255; // maxKeyCode
+            with_client(fd, |c| c.send(&b));
+        }
+        9 | 17 | 24 => {
+            // XkbListComponents / GetCompatMap / GetDeviceInfo:
+            // Send minimal reply with length=0 (no extra data).
+            let mut b = [0u8; 32]; b[0] = 1; w16(&mut b, 2, seq);
+            with_client(fd, |c| c.send(&b));
+        }
+        // No-reply opcodes (1=SelectEvents, 3=DeviceBell, 5=SetControls, etc.): ignore
+        _ => {}
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // DPMS extension (major opcode 73)
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -1820,5 +2355,387 @@ fn op_dpms(fd: u64, data: &[u8], seq: u16) {
         }
         // SetTimeouts(3), Enable(4), Disable(5), ForceLevel(6): side-effect only
         _ => {}
+    }
+}
+
+// ── RandR extension (major opcode 143) ───────────────────────────────────────
+// Minimal RandR 1.6 stub sufficient for Firefox to enumerate screen outputs.
+
+fn op_randr(fd: u64, data: &[u8], seq: u16) {
+    if data.is_empty() { return; }
+    let minor = data[1];
+    match minor {
+        0 => {
+            // QueryVersion: return 1.6
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            w32(&mut b, 8, 1);  // major = 1
+            w32(&mut b, 12, 6); // minor = 6
+            with_client(fd, |c| c.send(&b));
+        }
+        2 => {
+            // GetScreenInfo: single config (1920x1080 @ 60 Hz)
+            //  Return a minimal RRGetScreenInfoReply with one size entry.
+            let mut b = [0u8; 96];
+            b[0] = 1; w16(&mut b, 2, seq);
+            w32(&mut b, 4, (96-32)/4);  // length in 4-byte units
+            w32(&mut b, 8, 0x1000001);  // root window
+            w32(&mut b, 12, 0x1000001); // timestamp
+            w16(&mut b, 16, 1920);      // width
+            w16(&mut b, 18, 1080);      // height
+            w16(&mut b, 20, 0);         // current rate
+            w16(&mut b, 22, 0);         // current config
+            w16(&mut b, 24, 0);         // nSizes=0 (simplified)
+            w16(&mut b, 26, 0);         // nRates=0
+            with_client(fd, |c| c.send(&b));
+        }
+        5 => {
+            // GetScreenResources: return empty resources reply
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            with_client(fd, |c| c.send(&b));
+        }
+        6 => {
+            // GetOutputInfo: ENOENT — no outputs
+            // Return error instead of reply (callers handle gracefully)
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            with_client(fd, |c| c.send(&b));
+        }
+        24 => {
+            // GetScreenResourcesCurrent: empty
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            with_client(fd, |c| c.send(&b));
+        }
+        _ => {
+            // Unknown RandR minor: return empty reply
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            with_client(fd, |c| c.send(&b));
+        }
+    }
+}
+
+// ── SHAPE extension ──────────────────────────────────────────────────────────
+
+fn op_shape(fd: u64, data: &[u8], seq: u16) {
+    if data.len() < 2 { return; }
+    let minor = data[1];
+    match minor {
+        0 => {
+            // ShapeQueryVersion: return 1.1
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            w16(&mut b, 8, 1);  // major = 1
+            w16(&mut b, 10, 1); // minor = 1
+            with_client(fd, |c| c.send(&b));
+        }
+        // ShapeMask(1), ShapeCombine(2), ShapeOffset(3), ShapeQueryExtents(5),
+        // ShapeSelectInput(6), ShapeInputSelected(7), ShapeGetRectangles(8) —
+        // none require a reply except QueryExtents(5), InputSelected(7), GetRectangles(8).
+        5 => {
+            // ShapeQueryExtents: bounding/clip shaped = false, empty extents
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            // b[1]=bounded, b[2]=clipped (both 0 = not shaped)
+            with_client(fd, |c| c.send(&b));
+        }
+        7 => {
+            // ShapeInputSelected: enabled=0
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            with_client(fd, |c| c.send(&b));
+        }
+        8 => {
+            // ShapeGetRectangles: nrects=0
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            // w32 nrects=0 already zeroed
+            with_client(fd, |c| c.send(&b));
+        }
+        _ => {
+            // ShapeMask/ShapeCombine/ShapeOffset/ShapeSelectInput — no reply
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// RENDER GlyphSet handlers (minor opcodes 17–25)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── RenderCreateGlyphSet (minor 17) ──────────────────────────────────────────
+// Request: [4-7] gsid, [8-11] format
+fn op_render_create_glyphset(fd: u64, data: &[u8]) {
+    if data.len() < 12 { return; }
+    let gsid   = r32(data, 4);
+    let format = r32(data, 8);
+    with_client(fd, |c| {
+        let gs = GlyphSet { format, glyphs: alloc::vec::Vec::new() };
+        c.resources.insert(gsid, ResourceBody::GlyphSet(alloc::boxed::Box::new(gs)));
+    });
+}
+
+// ── RenderFreeGlyphSet (minor 19) ────────────────────────────────────────────
+// Request: [4-7] gsid
+fn op_render_free_glyphset(fd: u64, data: &[u8]) {
+    if data.len() < 8 { return; }
+    with_client(fd, |c| { c.resources.remove(r32(data, 4)); });
+}
+
+// ── RenderAddGlyphs (minor 20) ───────────────────────────────────────────────
+// Request: [4-7] gsid, [8-11] nglyphs,
+//          [12..] glyph IDs (u32 × N), then GlyphInfo × N (12 bytes each),
+//          then pixel data (A8, each glyph padded to 4-byte boundary).
+fn op_render_add_glyphs(fd: u64, data: &[u8]) {
+    if data.len() < 12 { return; }
+    let gsid    = r32(data, 4);
+    let nglyphs = r32(data, 8) as usize;
+    if nglyphs == 0 { return; }
+    let ids_off    = 12;
+    let infos_off  = ids_off + nglyphs * 4;
+    let pixels_off = infos_off + nglyphs * 12;
+    if data.len() < pixels_off { return; }
+
+    // Collect IDs and GlyphInfos first (avoid holding mutable borrow)
+    let mut ids:   alloc::vec::Vec<u32>       = alloc::vec::Vec::with_capacity(nglyphs);
+    let mut infos: alloc::vec::Vec<GlyphInfo>  = alloc::vec::Vec::with_capacity(nglyphs);
+    for i in 0..nglyphs {
+        ids.push(r32(data, ids_off + i * 4));
+        let b = infos_off + i * 12;
+        if data.len() < b + 12 { break; }
+        infos.push(GlyphInfo {
+            width:  r16(data, b),
+            height: r16(data, b + 2),
+            x_off:  r16(data, b + 4) as i16,
+            y_off:  r16(data, b + 6) as i16,
+            x_adv:  r16(data, b + 8) as i16,
+            y_adv:  r16(data, b + 10) as i16,
+        });
+    }
+    let n = infos.len();
+
+    // Collect pixel data
+    let mut pixel_bufs: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::with_capacity(n);
+    let mut pix_cur = pixels_off;
+    for i in 0..n {
+        let nbytes = (infos[i].width as usize) * (infos[i].height as usize); // A8 = 1B/pixel
+        let nbytes_aligned = (nbytes + 3) & !3;
+        let pixels = if data.len() >= pix_cur + nbytes {
+            data[pix_cur..pix_cur + nbytes].to_vec()
+        } else {
+            alloc::vec![0u8; nbytes]
+        };
+        pix_cur += nbytes_aligned;
+        pixel_bufs.push(pixels);
+    }
+
+    with_client(fd, |c| {
+        if let Some(gs) = c.resources.get_glyphset_mut(gsid) {
+            for i in 0..n {
+                let gid = ids[i];
+                let info = infos[i];
+                let pixels = pixel_bufs[i].clone();
+                if let Some(pos) = gs.glyphs.iter().position(|(id, _, _)| *id == gid) {
+                    gs.glyphs[pos] = (gid, info, pixels);
+                } else {
+                    gs.glyphs.push((gid, info, pixels));
+                }
+            }
+        }
+    });
+}
+
+// ── RenderFreeGlyphs (minor 22) ──────────────────────────────────────────────
+// Request: [4-7] gsid, [8..] glyph IDs (u32 each)
+fn op_render_free_glyphs(fd: u64, data: &[u8]) {
+    if data.len() < 8 { return; }
+    let gsid = r32(data, 4);
+    with_client(fd, |c| {
+        if let Some(gs) = c.resources.get_glyphset_mut(gsid) {
+            let mut off = 8;
+            while off + 4 <= data.len() {
+                let gid = r32(data, off);
+                gs.glyphs.retain(|(id, _, _)| *id != gid);
+                off += 4;
+            }
+        }
+    });
+}
+
+// ── RenderCompositeGlyphs8/16/32 (minor 23/24/25) ────────────────────────────
+//
+// Request (elem_size = 1/2/4 for Glyphs8/16/32):
+//   [4]     PictOp
+//   [8-11]  src Picture
+//   [12-15] dst Picture
+//   [16-19] mask-format (0 = None)
+//   [20-23] GlyphSet ID
+//   [24-25] src-x (i16) — initial pen x
+//   [26-27] src-y (i16) — initial pen y
+//   [28+]   item list (GlyphElt or GlyphSetElt elements)
+//
+// GlyphElt:    count(1) pad(3) dx(i16) dy(i16)  glyph_ids[count × elem_size]
+//              padded to 4-byte boundary (glyph_ids portion)
+// GlyphSetElt: 0xFF(1)  pad(3) new_gsid(4)
+fn op_render_composite_glyphs(fd: u64, data: &[u8], elem_size: u8) {
+    if data.len() < 28 { return; }
+    let op     = data[4];
+    let src_id = r32(data, 8);
+    let dst_id = r32(data, 12);
+    let mut cur_gsid = r32(data, 20);
+    let init_x = r16(data, 24) as i16 as i32;
+    let init_y = r16(data, 26) as i16 as i32;
+
+    // Phase 1: collect glyph render commands + src color + dst drawable
+    // Each cmd: (alpha_pixels: Vec<u8>, glyph_w: u16, glyph_h: u16, dst_x: i32, dst_y: i32)
+    let mut cmds: alloc::vec::Vec<(alloc::vec::Vec<u8>, u16, u16, i32, i32)> = alloc::vec::Vec::new();
+    let (src_bgra, dst_draw) = {
+        let srv = SERVER.lock();
+        let c = match srv.clients.iter().filter_map(|s| s.as_ref()).find(|c| c.fd == fd) {
+            Some(c) => c,
+            None    => return,
+        };
+        // src Picture → read 1×1 solid-color pixmap as BGRA bytes
+        let src_draw = c.resources.picture_drawable(src_id).unwrap_or(src_id);
+        let src_bgra = if let Some(p) = c.resources.get_pixmap(src_draw) {
+            if p.pixels.len() >= 4 {
+                [p.pixels[0], p.pixels[1], p.pixels[2], p.pixels[3]]
+            } else { [0u8, 0, 0, 255] }
+        } else { [0u8, 0, 0, 255] }; // opaque black fallback
+
+        let dst_draw = c.resources.picture_drawable(dst_id).unwrap_or(dst_id);
+
+        // Parse item list
+        let mut pen_x = init_x;
+        let mut pen_y = init_y;
+        let mut pos   = 28usize;
+        while pos < data.len() {
+            if data.len() - pos < 4 { break; }
+            let count = data[pos] as usize;
+            pos += 4; // count + 3 pad bytes
+
+            if count == 0 { break; } // invalid / end-of-stream
+
+            if count == 0xFF {
+                // GlyphSetElt: change active GlyphSet
+                if data.len() - pos < 4 { break; }
+                cur_gsid = r32(data, pos);
+                pos += 4;
+                continue;
+            }
+
+            // GlyphElt: dx, dy, then glyph IDs
+            if data.len() - pos < 4 { break; }
+            let dx = r16(data, pos) as i16 as i32; pos += 2;
+            let dy = r16(data, pos) as i16 as i32; pos += 2;
+            pen_x += dx;
+            pen_y += dy;
+
+            let ids_bytes   = count * elem_size as usize;
+            let ids_padded  = (ids_bytes + 3) & !3;
+            if data.len() - pos < ids_padded { break; }
+
+            if let Some(gs) = c.resources.get_glyphset(cur_gsid) {
+                for i in 0..count {
+                    let gid: u32 = match elem_size {
+                        1 => if pos + i     < data.len() { data[pos + i]            as u32 } else { 0 },
+                        2 => if pos + i*2+1 < data.len() { r16(data, pos + i*2)     as u32 } else { 0 },
+                        _ => if pos + i*4+3 < data.len() { r32(data, pos + i*4)           } else { 0 },
+                    };
+                    if let Some((_, info, alpha)) = gs.glyphs.iter().find(|(id, _, _)| *id == gid) {
+                        let gx = pen_x + info.x_off as i32;
+                        let gy = pen_y + info.y_off as i32;
+                        cmds.push((alpha.clone(), info.width, info.height, gx, gy));
+                        pen_x += info.x_adv as i32;
+                        pen_y += info.y_adv as i32;
+                    }
+                }
+            }
+            pos += ids_padded;
+        }
+        (src_bgra, dst_draw)
+    };
+
+    if cmds.is_empty() { return; }
+    let _ = op; // Porter-Duff op; treat all as OVER for glyph rendering
+
+    // Phase 2: composite glyphs into dst
+    let dst_is_pix = {
+        let srv = SERVER.lock();
+        let c = match srv.clients.iter().filter_map(|s| s.as_ref()).find(|c| c.fd == fd) {
+            Some(c) => c, None => return,
+        };
+        c.resources.entries.iter().filter_map(|s| s.as_ref())
+            .find(|r| r.id == dst_draw)
+            .map_or(false, |r| matches!(r.body, ResourceBody::Pixmap(_)))
+    };
+
+    if dst_is_pix {
+        with_client(fd, |c| {
+            if let Some(dst) = c.resources.get_pixmap_mut(dst_draw) {
+                let dw = dst.width  as i32;
+                let dh = dst.height as i32;
+                for (alpha, gw, gh, gx, gy) in &cmds {
+                    for row in 0..(*gh as i32) {
+                        let dy = gy + row;
+                        if dy < 0 || dy >= dh { continue; }
+                        for col in 0..(*gw as i32) {
+                            let dx = gx + col;
+                            if dx < 0 || dx >= dw { continue; }
+                            let ai = (row * *gw as i32 + col) as usize;
+                            if ai >= alpha.len() { continue; }
+                            let a  = alpha[ai] as u32;
+                            if a == 0 { continue; }
+                            let ia = 255 - a;
+                            let do_ = ((dy * dw + dx) * 4) as usize;
+                            // Porter-Duff OVER: src_color × a + dst × (1-a)
+                            dst.pixels[do_]   = ((src_bgra[0] as u32 * a + dst.pixels[do_]   as u32 * ia) / 255) as u8;
+                            dst.pixels[do_+1] = ((src_bgra[1] as u32 * a + dst.pixels[do_+1] as u32 * ia) / 255) as u8;
+                            dst.pixels[do_+2] = ((src_bgra[2] as u32 * a + dst.pixels[do_+2] as u32 * ia) / 255) as u8;
+                            dst.pixels[do_+3] = (a + dst.pixels[do_+3] as u32 * ia / 255) as u8;
+                        }
+                    }
+                }
+            }
+        });
+    } else {
+        // Window destination — blit composite to screen framebuffer
+        let (wx, wy) = window_origin(fd, dst_draw);
+        // Find bounding box of all glyphs
+        let (mut min_x, mut min_y, mut max_x, mut max_y) =
+            (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        for (_, gw, gh, gx, gy) in &cmds {
+            min_x = min_x.min(*gx);
+            min_y = min_y.min(*gy);
+            max_x = max_x.max(gx + *gw as i32);
+            max_y = max_y.max(gy + *gh as i32);
+        }
+        if min_x >= max_x || min_y >= max_y { return; }
+        let bw = (max_x - min_x) as usize;
+        let bh = (max_y - min_y) as usize;
+        if bw > 4096 || bh > 4096 { return; } // sanity check
+        // Build BGRA buffer (transparent background = 0x00 → let compositor blend)
+        let mut out = alloc::vec![0u8; bw * bh * 4];
+        for (alpha, gw, gh, gx, gy) in &cmds {
+            for row in 0..(*gh as i32) {
+                for col in 0..(*gw as i32) {
+                    let ai = (row * *gw as i32 + col) as usize;
+                    if ai >= alpha.len() { continue; }
+                    let a = alpha[ai] as u32;
+                    if a == 0 { continue; }
+                    let ia  = 255 - a;
+                    let ox  = (gx - min_x + col) as usize;
+                    let oy  = (gy - min_y + row) as usize;
+                    if ox >= bw || oy >= bh { continue; }
+                    let oo  = (oy * bw + ox) * 4;
+                    out[oo]   = ((src_bgra[0] as u32 * a + out[oo]   as u32 * ia) / 255) as u8;
+                    out[oo+1] = ((src_bgra[1] as u32 * a + out[oo+1] as u32 * ia) / 255) as u8;
+                    out[oo+2] = ((src_bgra[2] as u32 * a + out[oo+2] as u32 * ia) / 255) as u8;
+                    out[oo+3] = (a + out[oo+3] as u32 * ia / 255) as u8;
+                }
+            }
+        }
+        crate::gdi::blit_pixels_screen(wx + min_x, wy + min_y, bw as u32, bh as u32, &out);
     }
 }

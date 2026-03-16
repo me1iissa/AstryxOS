@@ -5,6 +5,7 @@
 
 pub mod ac97;
 pub mod ahci;
+pub mod rtc;
 pub mod ata;
 pub mod block;
 pub mod console;
@@ -13,6 +14,7 @@ pub mod mouse;
 pub mod partition;
 pub mod pci;
 pub mod serial;
+pub mod pty;
 pub mod tty;
 pub mod usb;
 pub mod vmware_svga;

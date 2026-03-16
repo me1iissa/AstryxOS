@@ -91,128 +91,174 @@ pub const STATUS_WAIT_0:                i64 = 0x0000_0000;
 pub const STATUS_TIMEOUT:               i64 = 0x0000_0102;
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// kernel32.dll AstryxOS service numbers (0x100-0x11F range)
+// These are dispatched via INT 0x2E just like NT services.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const K32_EXIT_PROCESS:          u64 = 0x100;
+pub const K32_READ_FILE:             u64 = 0x101;
+pub const K32_WRITE_FILE:            u64 = 0x102;
+pub const K32_GET_STD_HANDLE:        u64 = 0x103;
+pub const K32_WRITE_CONSOLE_A:       u64 = 0x104;
+pub const K32_WRITE_CONSOLE_W:       u64 = 0x105;
+pub const K32_GET_CMDLINE_A:         u64 = 0x106;
+pub const K32_GET_CMDLINE_W:         u64 = 0x107;
+pub const K32_GET_PROCESS_HEAP:      u64 = 0x108;
+pub const K32_HEAP_ALLOC:            u64 = 0x109;
+pub const K32_HEAP_FREE:             u64 = 0x10A;
+pub const K32_HEAP_REALLOC:          u64 = 0x10B;
+pub const K32_HEAP_SIZE:             u64 = 0x10C;
+pub const K32_VIRTUAL_ALLOC:         u64 = 0x10D;
+pub const K32_VIRTUAL_FREE:          u64 = 0x10E;
+pub const K32_VIRTUAL_QUERY:         u64 = 0x10F;
+pub const K32_GET_LAST_ERROR:        u64 = 0x110;
+pub const K32_SET_LAST_ERROR:        u64 = 0x111;
+pub const K32_OUTPUT_DEBUG_A:        u64 = 0x112;
+pub const K32_OUTPUT_DEBUG_W:        u64 = 0x113;
+pub const K32_IS_DEBUGGER_PRESENT:   u64 = 0x114;
+pub const K32_GET_PID:               u64 = 0x115;
+pub const K32_GET_TID:               u64 = 0x116;
+pub const K32_GET_PROCESS_HANDLE:    u64 = 0x117;
+pub const K32_GET_THREAD_HANDLE:     u64 = 0x118;
+pub const K32_GET_SYSTEM_INFO:       u64 = 0x119;
+pub const K32_QPC:                   u64 = 0x11A;
+pub const K32_QPF:                   u64 = 0x11B;
+pub const K32_SLEEP:                 u64 = 0x11C;
+pub const K32_SET_CONSOLE_CTRL:      u64 = 0x11D;
+pub const K32_GET_CONSOLE_MODE:      u64 = 0x11E;
+pub const K32_SET_CONSOLE_MODE:      u64 = 0x11F;
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // NT Stub Table — keyed by (DLL name, export name)
 // ═══════════════════════════════════════════════════════════════════════════════
+
+/// User-space address for the per-process NT syscall trampoline page.
+/// Each slot (16 bytes): `mov rax, service_num (10 bytes); int 0x2e (2); ret (1); nop*3`.
+/// Mapped in every Win32 process so IAT entries can call NT services from Ring 3.
+pub const NT_STUB_PAGE_VA: u64 = 0x7FFF_0000;
+pub const NT_STUB_SLOT_BYTES: usize = 16;
 
 /// Stub function signature: same as `extern "C" fn(a1..a5) -> i64`.
 type NtStubFn = extern "C" fn(u64, u64, u64, u64, u64) -> i64;
 
-/// Static NT stub entry: (dll_name, export_name, stub_fn).
+/// Static NT stub entry: (dll_name, export_name, service_num, stub_fn).
 struct NtStub {
-    dll:  &'static str,
-    name: &'static str,
-    func: NtStubFn,
+    dll:         &'static str,
+    name:        &'static str,
+    service_num: u64,
+    func:        NtStubFn,
 }
 
 /// Macro to declare a stub entry.
 macro_rules! stub_entry {
-    ($dll:literal, $name:literal, $fn:expr) => {
-        NtStub { dll: $dll, name: $name, func: $fn }
+    ($dll:literal, $name:literal, $svc:expr, $fn:expr) => {
+        NtStub { dll: $dll, name: $name, service_num: $svc, func: $fn }
     };
 }
 
 /// The static NT stub table.  All stubs must be `extern "C"` functions
 /// with an `NT_fn_...` prefix to avoid name conflicts.
+/// `service_num` is used by `build_stub_trampoline_page` to generate
+/// the per-process user-space `mov rax, N; int 0x2e; ret` stubs.
 static NT_STUB_TABLE: &[NtStub] = &[
-    stub_entry!("ntdll.dll", "NtClose",                     nt_fn_close),
-    stub_entry!("ntdll.dll", "ZwClose",                     nt_fn_close),
-    stub_entry!("ntdll.dll", "NtReadFile",                  nt_fn_read_file),
-    stub_entry!("ntdll.dll", "ZwReadFile",                  nt_fn_read_file),
-    stub_entry!("ntdll.dll", "NtWriteFile",                 nt_fn_write_file),
-    stub_entry!("ntdll.dll", "ZwWriteFile",                 nt_fn_write_file),
-    stub_entry!("ntdll.dll", "NtTerminateProcess",          nt_fn_terminate_process),
-    stub_entry!("ntdll.dll", "ZwTerminateProcess",          nt_fn_terminate_process),
-    stub_entry!("ntdll.dll", "NtTerminateThread",           nt_fn_terminate_thread),
-    stub_entry!("ntdll.dll", "ZwTerminateThread",           nt_fn_terminate_thread),
-    stub_entry!("ntdll.dll", "NtAllocateVirtualMemory",     nt_fn_alloc_virtual_memory),
-    stub_entry!("ntdll.dll", "ZwAllocateVirtualMemory",     nt_fn_alloc_virtual_memory),
-    stub_entry!("ntdll.dll", "NtFreeVirtualMemory",         nt_fn_free_virtual_memory),
-    stub_entry!("ntdll.dll", "ZwFreeVirtualMemory",         nt_fn_free_virtual_memory),
-    stub_entry!("ntdll.dll", "NtProtectVirtualMemory",      nt_fn_protect_virtual_memory),
-    stub_entry!("ntdll.dll", "ZwProtectVirtualMemory",      nt_fn_protect_virtual_memory),
-    stub_entry!("ntdll.dll", "NtQueryVirtualMemory",        nt_fn_query_virtual_memory),
-    stub_entry!("ntdll.dll", "NtCreateFile",                nt_fn_create_file),
-    stub_entry!("ntdll.dll", "ZwCreateFile",                nt_fn_create_file),
-    stub_entry!("ntdll.dll", "NtOpenFile",                  nt_fn_open_file),
-    stub_entry!("ntdll.dll", "ZwOpenFile",                  nt_fn_open_file),
-    stub_entry!("ntdll.dll", "NtQueryInformationFile",      nt_fn_query_info_file),
-    stub_entry!("ntdll.dll", "NtSetInformationFile",        nt_fn_set_info_file),
-    stub_entry!("ntdll.dll", "NtQuerySystemInformation",    nt_fn_query_system_info),
-    stub_entry!("ntdll.dll", "ZwQuerySystemInformation",    nt_fn_query_system_info),
-    stub_entry!("ntdll.dll", "NtQueryInformationProcess",   nt_fn_query_info_process),
-    stub_entry!("ntdll.dll", "ZwQueryInformationProcess",   nt_fn_query_info_process),
-    stub_entry!("ntdll.dll", "NtWaitForSingleObject",       nt_fn_wait_for_single_object),
-    stub_entry!("ntdll.dll", "ZwWaitForSingleObject",       nt_fn_wait_for_single_object),
-    stub_entry!("ntdll.dll", "NtWaitForMultipleObjects",    nt_fn_wait_for_multiple_objects),
-    stub_entry!("ntdll.dll", "NtDuplicateObject",           nt_fn_duplicate_object),
-    stub_entry!("ntdll.dll", "NtCreateEvent",               nt_fn_create_event),
-    stub_entry!("ntdll.dll", "ZwCreateEvent",               nt_fn_create_event),
-    stub_entry!("ntdll.dll", "NtSetEvent",                  nt_fn_set_event),
-    stub_entry!("ntdll.dll", "NtResetEvent",                nt_fn_reset_event),
-    stub_entry!("ntdll.dll", "NtCreateMutant",              nt_fn_create_mutant),
-    stub_entry!("ntdll.dll", "ZwCreateMutant",              nt_fn_create_mutant),
-    stub_entry!("ntdll.dll", "NtReleaseMutant",             nt_fn_release_mutant),
-    stub_entry!("ntdll.dll", "NtQuerySystemTime",           nt_fn_query_system_time),
-    stub_entry!("ntdll.dll", "ZwQuerySystemTime",           nt_fn_query_system_time),
-    stub_entry!("ntdll.dll", "NtFlushBuffersFile",          nt_fn_flush_buffers_file),
-    stub_entry!("ntdll.dll", "NtDeviceIoControlFile",       nt_fn_device_io_control_file),
-    stub_entry!("ntdll.dll", "NtFsControlFile",             nt_fn_fs_control_file),
-    stub_entry!("ntdll.dll", "NtQueryDirectoryFile",        nt_fn_query_directory_file),
-    stub_entry!("ntdll.dll", "NtCreateKey",                 nt_fn_create_key),
-    stub_entry!("ntdll.dll", "ZwCreateKey",                 nt_fn_create_key),
-    stub_entry!("ntdll.dll", "NtOpenKey",                   nt_fn_open_key),
-    stub_entry!("ntdll.dll", "ZwOpenKey",                   nt_fn_open_key),
-    stub_entry!("ntdll.dll", "NtQueryValueKey",             nt_fn_query_value_key),
-    stub_entry!("ntdll.dll", "NtSetValueKey",               nt_fn_set_value_key),
-    stub_entry!("ntdll.dll", "NtDeleteValueKey",            nt_fn_delete_value_key),
-    stub_entry!("ntdll.dll", "NtEnumerateKey",              nt_fn_enumerate_key),
-    stub_entry!("ntdll.dll", "NtDeleteKey",                 nt_fn_delete_key),
-    stub_entry!("ntdll.dll", "NtCreateSection",             nt_fn_create_section),
-    stub_entry!("ntdll.dll", "ZwCreateSection",             nt_fn_create_section),
-    stub_entry!("ntdll.dll", "NtMapViewOfSection",          nt_fn_map_view_of_section),
-    stub_entry!("ntdll.dll", "ZwMapViewOfSection",          nt_fn_map_view_of_section),
-    stub_entry!("ntdll.dll", "NtUnmapViewOfSection",        nt_fn_unmap_view_of_section),
-    stub_entry!("ntdll.dll", "ZwUnmapViewOfSection",        nt_fn_unmap_view_of_section),
-    stub_entry!("ntdll.dll", "NtCreateThread",              nt_fn_create_thread),
-    stub_entry!("ntdll.dll", "NtCreateProcess",             nt_fn_create_process),
-    stub_entry!("ntdll.dll", "NtSetInformationProcess",     nt_fn_set_info_process),
-    // kernel32.dll forwarded stubs ─ kernel32 forwards many calls to ntdll,
-    // but we provide direct stubs so imports from kernel32 also resolve.
-    stub_entry!("kernel32.dll", "ExitProcess",              nt_fn_terminate_process),
-    stub_entry!("kernel32.dll", "ReadFile",                 nt_fn_k32_read_file),
-    stub_entry!("kernel32.dll", "WriteFile",                nt_fn_k32_write_file),
-    stub_entry!("kernel32.dll", "CloseHandle",              nt_fn_close),
-    // Console / environment / heap APIs
-    stub_entry!("kernel32.dll", "GetStdHandle",             nt_fn_get_std_handle),
-    stub_entry!("kernel32.dll", "WriteConsoleA",            nt_fn_write_console_a),
-    stub_entry!("kernel32.dll", "WriteConsoleW",            nt_fn_write_console_w),
-    stub_entry!("kernel32.dll", "GetCommandLineA",          nt_fn_get_cmdline_a),
-    stub_entry!("kernel32.dll", "GetCommandLineW",          nt_fn_get_cmdline_w),
-    stub_entry!("kernel32.dll", "GetProcessHeap",           nt_fn_get_process_heap),
-    stub_entry!("kernel32.dll", "HeapAlloc",                nt_fn_heap_alloc),
-    stub_entry!("kernel32.dll", "HeapFree",                 nt_fn_heap_free),
-    stub_entry!("kernel32.dll", "HeapReAlloc",              nt_fn_heap_realloc),
-    stub_entry!("kernel32.dll", "HeapSize",                 nt_fn_heap_size),
-    stub_entry!("kernel32.dll", "VirtualAlloc",             nt_fn_virtual_alloc),
-    stub_entry!("kernel32.dll", "VirtualFree",              nt_fn_virtual_free),
-    stub_entry!("kernel32.dll", "VirtualQuery",             nt_fn_virtual_query),
-    stub_entry!("kernel32.dll", "GetLastError",             nt_fn_get_last_error),
-    stub_entry!("kernel32.dll", "SetLastError",             nt_fn_set_last_error),
-    stub_entry!("kernel32.dll", "OutputDebugStringA",       nt_fn_output_debug_string_a),
-    stub_entry!("kernel32.dll", "OutputDebugStringW",       nt_fn_output_debug_string_w),
-    stub_entry!("kernel32.dll", "IsDebuggerPresent",        nt_fn_is_debugger_present),
-    stub_entry!("kernel32.dll", "GetCurrentProcessId",      nt_fn_get_current_process_id),
-    stub_entry!("kernel32.dll", "GetCurrentThreadId",       nt_fn_get_current_thread_id),
-    stub_entry!("kernel32.dll", "GetCurrentProcess",        nt_fn_get_current_process),
-    stub_entry!("kernel32.dll", "GetCurrentThread",         nt_fn_get_current_thread),
-    stub_entry!("kernel32.dll", "GetSystemInfo",            nt_fn_get_system_info),
-    stub_entry!("kernel32.dll", "QueryPerformanceCounter",  nt_fn_query_perf_counter),
-    stub_entry!("kernel32.dll", "QueryPerformanceFrequency",nt_fn_query_perf_freq),
-    stub_entry!("kernel32.dll", "Sleep",                    nt_fn_sleep),
-    stub_entry!("kernel32.dll", "FlushFileBuffers",         nt_fn_flush_buffers_file),
-    stub_entry!("kernel32.dll", "SetConsoleCtrlHandler",    nt_fn_set_console_ctrl_handler),
-    stub_entry!("kernel32.dll", "GetConsoleMode",           nt_fn_get_console_mode),
-    stub_entry!("kernel32.dll", "SetConsoleMode",           nt_fn_set_console_mode),
+    // ── ntdll.dll NT services ────────────────────────────────────────────────
+    stub_entry!("ntdll.dll", "NtClose",                  NT_CLOSE,                    nt_fn_close),
+    stub_entry!("ntdll.dll", "ZwClose",                  NT_CLOSE,                    nt_fn_close),
+    stub_entry!("ntdll.dll", "NtReadFile",               NT_READ_FILE,                nt_fn_read_file),
+    stub_entry!("ntdll.dll", "ZwReadFile",               NT_READ_FILE,                nt_fn_read_file),
+    stub_entry!("ntdll.dll", "NtWriteFile",              NT_WRITE_FILE,               nt_fn_write_file),
+    stub_entry!("ntdll.dll", "ZwWriteFile",              NT_WRITE_FILE,               nt_fn_write_file),
+    stub_entry!("ntdll.dll", "NtTerminateProcess",       NT_TERMINATE_PROCESS,        nt_fn_terminate_process),
+    stub_entry!("ntdll.dll", "ZwTerminateProcess",       NT_TERMINATE_PROCESS,        nt_fn_terminate_process),
+    stub_entry!("ntdll.dll", "NtTerminateThread",        NT_TERMINATE_THREAD,         nt_fn_terminate_thread),
+    stub_entry!("ntdll.dll", "ZwTerminateThread",        NT_TERMINATE_THREAD,         nt_fn_terminate_thread),
+    stub_entry!("ntdll.dll", "NtAllocateVirtualMemory",  NT_ALLOC_VIRTUAL_MEMORY,     nt_fn_alloc_virtual_memory),
+    stub_entry!("ntdll.dll", "ZwAllocateVirtualMemory",  NT_ALLOC_VIRTUAL_MEMORY,     nt_fn_alloc_virtual_memory),
+    stub_entry!("ntdll.dll", "NtFreeVirtualMemory",      NT_FREE_VIRTUAL_MEMORY,      nt_fn_free_virtual_memory),
+    stub_entry!("ntdll.dll", "ZwFreeVirtualMemory",      NT_FREE_VIRTUAL_MEMORY,      nt_fn_free_virtual_memory),
+    stub_entry!("ntdll.dll", "NtProtectVirtualMemory",   NT_PROTECT_VIRTUAL_MEMORY,   nt_fn_protect_virtual_memory),
+    stub_entry!("ntdll.dll", "ZwProtectVirtualMemory",   NT_PROTECT_VIRTUAL_MEMORY,   nt_fn_protect_virtual_memory),
+    stub_entry!("ntdll.dll", "NtQueryVirtualMemory",     NT_QUERY_VIRTUAL_MEMORY,     nt_fn_query_virtual_memory),
+    stub_entry!("ntdll.dll", "NtCreateFile",             NT_CREATE_FILE,              nt_fn_create_file),
+    stub_entry!("ntdll.dll", "ZwCreateFile",             NT_CREATE_FILE,              nt_fn_create_file),
+    stub_entry!("ntdll.dll", "NtOpenFile",               NT_OPEN_FILE,                nt_fn_open_file),
+    stub_entry!("ntdll.dll", "ZwOpenFile",               NT_OPEN_FILE,                nt_fn_open_file),
+    stub_entry!("ntdll.dll", "NtQueryInformationFile",   NT_QUERY_INFO_FILE,          nt_fn_query_info_file),
+    stub_entry!("ntdll.dll", "NtSetInformationFile",     NT_SET_INFO_FILE,            nt_fn_set_info_file),
+    stub_entry!("ntdll.dll", "NtQuerySystemInformation", NT_QUERY_SYSTEM_INFORMATION, nt_fn_query_system_info),
+    stub_entry!("ntdll.dll", "ZwQuerySystemInformation", NT_QUERY_SYSTEM_INFORMATION, nt_fn_query_system_info),
+    stub_entry!("ntdll.dll", "NtQueryInformationProcess",NT_QUERY_INFO_PROCESS,       nt_fn_query_info_process),
+    stub_entry!("ntdll.dll", "ZwQueryInformationProcess",NT_QUERY_INFO_PROCESS,       nt_fn_query_info_process),
+    stub_entry!("ntdll.dll", "NtWaitForSingleObject",    NT_WAIT_FOR_SINGLE_OBJECT,   nt_fn_wait_for_single_object),
+    stub_entry!("ntdll.dll", "ZwWaitForSingleObject",    NT_WAIT_FOR_SINGLE_OBJECT,   nt_fn_wait_for_single_object),
+    stub_entry!("ntdll.dll", "NtWaitForMultipleObjects", NT_WAIT_FOR_MULTIPLE_OBJECTS,nt_fn_wait_for_multiple_objects),
+    stub_entry!("ntdll.dll", "NtDuplicateObject",        NT_DUPLICATE_OBJECT,         nt_fn_duplicate_object),
+    stub_entry!("ntdll.dll", "NtCreateEvent",            NT_CREATE_EVENT,             nt_fn_create_event),
+    stub_entry!("ntdll.dll", "ZwCreateEvent",            NT_CREATE_EVENT,             nt_fn_create_event),
+    stub_entry!("ntdll.dll", "NtSetEvent",               NT_SET_EVENT,                nt_fn_set_event),
+    stub_entry!("ntdll.dll", "NtResetEvent",             NT_RESET_EVENT,              nt_fn_reset_event),
+    stub_entry!("ntdll.dll", "NtCreateMutant",           NT_CREATE_MUTANT,            nt_fn_create_mutant),
+    stub_entry!("ntdll.dll", "ZwCreateMutant",           NT_CREATE_MUTANT,            nt_fn_create_mutant),
+    stub_entry!("ntdll.dll", "NtReleaseMutant",          NT_RELEASE_MUTANT,           nt_fn_release_mutant),
+    stub_entry!("ntdll.dll", "NtQuerySystemTime",        NT_QUERY_SYSTEM_TIME,        nt_fn_query_system_time),
+    stub_entry!("ntdll.dll", "ZwQuerySystemTime",        NT_QUERY_SYSTEM_TIME,        nt_fn_query_system_time),
+    stub_entry!("ntdll.dll", "NtFlushBuffersFile",       NT_FLUSH_BUFFERS_FILE,       nt_fn_flush_buffers_file),
+    stub_entry!("ntdll.dll", "NtDeviceIoControlFile",    NT_DEVICE_IO_CONTROL_FILE,   nt_fn_device_io_control_file),
+    stub_entry!("ntdll.dll", "NtFsControlFile",          NT_FS_CONTROL_FILE,          nt_fn_fs_control_file),
+    stub_entry!("ntdll.dll", "NtQueryDirectoryFile",     NT_QUERY_DIRECTORY_FILE,     nt_fn_query_directory_file),
+    stub_entry!("ntdll.dll", "NtCreateKey",              NT_CREATE_KEY,               nt_fn_create_key),
+    stub_entry!("ntdll.dll", "ZwCreateKey",              NT_CREATE_KEY,               nt_fn_create_key),
+    stub_entry!("ntdll.dll", "NtOpenKey",                NT_OPEN_KEY,                 nt_fn_open_key),
+    stub_entry!("ntdll.dll", "ZwOpenKey",                NT_OPEN_KEY,                 nt_fn_open_key),
+    stub_entry!("ntdll.dll", "NtQueryValueKey",          NT_QUERY_VALUE_KEY,          nt_fn_query_value_key),
+    stub_entry!("ntdll.dll", "NtSetValueKey",            NT_SET_VALUE_KEY,            nt_fn_set_value_key),
+    stub_entry!("ntdll.dll", "NtDeleteValueKey",         NT_DELETE_VALUE_KEY,         nt_fn_delete_value_key),
+    stub_entry!("ntdll.dll", "NtEnumerateKey",           NT_ENUMERATE_KEY,            nt_fn_enumerate_key),
+    stub_entry!("ntdll.dll", "NtDeleteKey",              NT_DELETE_KEY,               nt_fn_delete_key),
+    stub_entry!("ntdll.dll", "NtCreateSection",          NT_CREATE_SECTION,           nt_fn_create_section),
+    stub_entry!("ntdll.dll", "ZwCreateSection",          NT_CREATE_SECTION,           nt_fn_create_section),
+    stub_entry!("ntdll.dll", "NtMapViewOfSection",       NT_MAP_VIEW_OF_SECTION,      nt_fn_map_view_of_section),
+    stub_entry!("ntdll.dll", "ZwMapViewOfSection",       NT_MAP_VIEW_OF_SECTION,      nt_fn_map_view_of_section),
+    stub_entry!("ntdll.dll", "NtUnmapViewOfSection",     NT_UNMAP_VIEW_OF_SECTION,    nt_fn_unmap_view_of_section),
+    stub_entry!("ntdll.dll", "ZwUnmapViewOfSection",     NT_UNMAP_VIEW_OF_SECTION,    nt_fn_unmap_view_of_section),
+    stub_entry!("ntdll.dll", "NtCreateThread",           NT_CREATE_THREAD,            nt_fn_create_thread),
+    stub_entry!("ntdll.dll", "NtCreateProcess",          NT_CREATE_PROCESS,           nt_fn_create_process),
+    stub_entry!("ntdll.dll", "NtSetInformationProcess",  NT_SET_INFO_PROCESS,         nt_fn_set_info_process),
+    // ── kernel32.dll stubs — use K32_* service numbers ───────────────────────
+    stub_entry!("kernel32.dll", "ExitProcess",               K32_EXIT_PROCESS,        nt_fn_terminate_process),
+    stub_entry!("kernel32.dll", "ReadFile",                  K32_READ_FILE,           nt_fn_k32_read_file),
+    stub_entry!("kernel32.dll", "WriteFile",                 K32_WRITE_FILE,          nt_fn_k32_write_file),
+    stub_entry!("kernel32.dll", "CloseHandle",               NT_CLOSE,                nt_fn_close),
+    stub_entry!("kernel32.dll", "GetStdHandle",              K32_GET_STD_HANDLE,      nt_fn_get_std_handle),
+    stub_entry!("kernel32.dll", "WriteConsoleA",             K32_WRITE_CONSOLE_A,     nt_fn_write_console_a),
+    stub_entry!("kernel32.dll", "WriteConsoleW",             K32_WRITE_CONSOLE_W,     nt_fn_write_console_w),
+    stub_entry!("kernel32.dll", "GetCommandLineA",           K32_GET_CMDLINE_A,       nt_fn_get_cmdline_a),
+    stub_entry!("kernel32.dll", "GetCommandLineW",           K32_GET_CMDLINE_W,       nt_fn_get_cmdline_w),
+    stub_entry!("kernel32.dll", "GetProcessHeap",            K32_GET_PROCESS_HEAP,    nt_fn_get_process_heap),
+    stub_entry!("kernel32.dll", "HeapAlloc",                 K32_HEAP_ALLOC,          nt_fn_heap_alloc),
+    stub_entry!("kernel32.dll", "HeapFree",                  K32_HEAP_FREE,           nt_fn_heap_free),
+    stub_entry!("kernel32.dll", "HeapReAlloc",               K32_HEAP_REALLOC,        nt_fn_heap_realloc),
+    stub_entry!("kernel32.dll", "HeapSize",                  K32_HEAP_SIZE,           nt_fn_heap_size),
+    stub_entry!("kernel32.dll", "VirtualAlloc",              K32_VIRTUAL_ALLOC,       nt_fn_virtual_alloc),
+    stub_entry!("kernel32.dll", "VirtualFree",               K32_VIRTUAL_FREE,        nt_fn_virtual_free),
+    stub_entry!("kernel32.dll", "VirtualQuery",              K32_VIRTUAL_QUERY,       nt_fn_virtual_query),
+    stub_entry!("kernel32.dll", "GetLastError",              K32_GET_LAST_ERROR,      nt_fn_get_last_error),
+    stub_entry!("kernel32.dll", "SetLastError",              K32_SET_LAST_ERROR,      nt_fn_set_last_error),
+    stub_entry!("kernel32.dll", "OutputDebugStringA",        K32_OUTPUT_DEBUG_A,      nt_fn_output_debug_string_a),
+    stub_entry!("kernel32.dll", "OutputDebugStringW",        K32_OUTPUT_DEBUG_W,      nt_fn_output_debug_string_w),
+    stub_entry!("kernel32.dll", "IsDebuggerPresent",         K32_IS_DEBUGGER_PRESENT, nt_fn_is_debugger_present),
+    stub_entry!("kernel32.dll", "GetCurrentProcessId",       K32_GET_PID,             nt_fn_get_current_process_id),
+    stub_entry!("kernel32.dll", "GetCurrentThreadId",        K32_GET_TID,             nt_fn_get_current_thread_id),
+    stub_entry!("kernel32.dll", "GetCurrentProcess",         K32_GET_PROCESS_HANDLE,  nt_fn_get_current_process),
+    stub_entry!("kernel32.dll", "GetCurrentThread",          K32_GET_THREAD_HANDLE,   nt_fn_get_current_thread),
+    stub_entry!("kernel32.dll", "GetSystemInfo",             K32_GET_SYSTEM_INFO,     nt_fn_get_system_info),
+    stub_entry!("kernel32.dll", "QueryPerformanceCounter",   K32_QPC,                 nt_fn_query_perf_counter),
+    stub_entry!("kernel32.dll", "QueryPerformanceFrequency", K32_QPF,                 nt_fn_query_perf_freq),
+    stub_entry!("kernel32.dll", "Sleep",                     K32_SLEEP,               nt_fn_sleep),
+    stub_entry!("kernel32.dll", "FlushFileBuffers",          NT_FLUSH_BUFFERS_FILE,   nt_fn_flush_buffers_file),
+    stub_entry!("kernel32.dll", "SetConsoleCtrlHandler",     K32_SET_CONSOLE_CTRL,    nt_fn_set_console_ctrl_handler),
+    stub_entry!("kernel32.dll", "GetConsoleMode",            K32_GET_CONSOLE_MODE,    nt_fn_get_console_mode),
+    stub_entry!("kernel32.dll", "SetConsoleMode",            K32_SET_CONSOLE_MODE,    nt_fn_set_console_mode),
 ];
 
 // ─── Ordinal table (for imports resolved by ordinal) ────────────────────────
@@ -247,6 +293,56 @@ pub fn lookup_stub(dll: &str, name: &str) -> u64 {
     }
     crate::serial_println!("[NT] lookup_stub: unresolved {}!{}", dll, name);
     0
+}
+
+/// Return the slot index for (dll, name) in NT_STUB_TABLE, or None.
+///
+/// Used by `resolve_imports` when building user-space IAT entries that point
+/// into the per-process trampoline page instead of kernel VAs.
+pub fn lookup_stub_slot_index(dll: &str, name: &str) -> Option<usize> {
+    NT_STUB_TABLE.iter().position(|e| {
+        dll.eq_ignore_ascii_case(e.dll) && e.name == name
+    })
+}
+
+/// Write per-process NT syscall trampoline stubs into `page_ptr`.
+///
+/// The page must be at least `NT_STUB_TABLE.len() * NT_STUB_SLOT_BYTES` bytes
+/// and must already be mapped into the process address space at `NT_STUB_PAGE_VA`.
+///
+/// Each 16-byte slot:
+///   48 B8 <svc u64 LE>   — MOV RAX, service_num  (10 bytes)
+///   CD 2E                 — INT 0x2E              ( 2 bytes)
+///   C3                    — RET                   ( 1 byte )
+///   90 90 90              — NOP padding           ( 3 bytes)
+///
+/// # Safety
+/// `page_ptr` must be valid for `NT_STUB_TABLE.len() * 16` bytes of write.
+pub unsafe fn build_stub_trampoline_page(page_ptr: *mut u8) {
+    for (i, entry) in NT_STUB_TABLE.iter().enumerate() {
+        let slot = page_ptr.add(i * NT_STUB_SLOT_BYTES);
+        let svc  = entry.service_num;
+        // MOV RAX, imm64 — opcode 48 B8 followed by 8-byte little-endian immediate
+        slot.write(0x48);
+        slot.add(1).write(0xB8);
+        slot.add(2).write((svc      ) as u8);
+        slot.add(3).write((svc >>  8) as u8);
+        slot.add(4).write((svc >> 16) as u8);
+        slot.add(5).write((svc >> 24) as u8);
+        slot.add(6).write((svc >> 32) as u8);
+        slot.add(7).write((svc >> 40) as u8);
+        slot.add(8).write((svc >> 48) as u8);
+        slot.add(9).write((svc >> 56) as u8);
+        // INT 0x2E
+        slot.add(10).write(0xCD);
+        slot.add(11).write(0x2E);
+        // RET
+        slot.add(12).write(0xC3);
+        // NOP padding
+        slot.add(13).write(0x90);
+        slot.add(14).write(0x90);
+        slot.add(15).write(0x90);
+    }
 }
 
 /// Look up a kernel stub VA by ordinal.
@@ -319,6 +415,39 @@ pub fn dispatch_nt(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64
         NT_ENUMERATE_KEY             => nt_fn_enumerate_key(a1, a2, a3, a4, a5),
         NT_DELETE_KEY                => nt_fn_delete_key(a1, a2, a3, a4, a5),
         NT_SET_SYSTEM_TIME           => STATUS_NOT_IMPLEMENTED,
+        // ── kernel32.dll services (0x100–0x11F) ─────────────────────────────
+        K32_EXIT_PROCESS        => { crate::proc::exit_thread(a1 as i64); 0 }
+        K32_READ_FILE           => nt_fn_k32_read_file(a1, a2, a3, a4, a5),
+        K32_WRITE_FILE          => nt_fn_k32_write_file(a1, a2, a3, a4, a5),
+        K32_GET_STD_HANDLE      => nt_fn_get_std_handle(a1, a2, a3, a4, a5),
+        K32_WRITE_CONSOLE_A     => nt_fn_write_console_a(a1, a2, a3, a4, a5),
+        K32_WRITE_CONSOLE_W     => nt_fn_write_console_w(a1, a2, a3, a4, a5),
+        K32_GET_CMDLINE_A       => nt_fn_get_cmdline_a(a1, a2, a3, a4, a5),
+        K32_GET_CMDLINE_W       => nt_fn_get_cmdline_w(a1, a2, a3, a4, a5),
+        K32_GET_PROCESS_HEAP    => nt_fn_get_process_heap(a1, a2, a3, a4, a5),
+        K32_HEAP_ALLOC          => nt_fn_heap_alloc(a1, a2, a3, a4, a5),
+        K32_HEAP_FREE           => nt_fn_heap_free(a1, a2, a3, a4, a5),
+        K32_HEAP_REALLOC        => nt_fn_heap_realloc(a1, a2, a3, a4, a5),
+        K32_HEAP_SIZE           => nt_fn_heap_size(a1, a2, a3, a4, a5),
+        K32_VIRTUAL_ALLOC       => nt_fn_virtual_alloc(a1, a2, a3, a4, a5),
+        K32_VIRTUAL_FREE        => nt_fn_virtual_free(a1, a2, a3, a4, a5),
+        K32_VIRTUAL_QUERY       => nt_fn_virtual_query(a1, a2, a3, a4, a5),
+        K32_GET_LAST_ERROR      => nt_fn_get_last_error(a1, a2, a3, a4, a5),
+        K32_SET_LAST_ERROR      => nt_fn_set_last_error(a1, a2, a3, a4, a5),
+        K32_OUTPUT_DEBUG_A      => nt_fn_output_debug_string_a(a1, a2, a3, a4, a5),
+        K32_OUTPUT_DEBUG_W      => nt_fn_output_debug_string_w(a1, a2, a3, a4, a5),
+        K32_IS_DEBUGGER_PRESENT => nt_fn_is_debugger_present(a1, a2, a3, a4, a5),
+        K32_GET_PID             => nt_fn_get_current_process_id(a1, a2, a3, a4, a5),
+        K32_GET_TID             => nt_fn_get_current_thread_id(a1, a2, a3, a4, a5),
+        K32_GET_PROCESS_HANDLE  => nt_fn_get_current_process(a1, a2, a3, a4, a5),
+        K32_GET_THREAD_HANDLE   => nt_fn_get_current_thread(a1, a2, a3, a4, a5),
+        K32_GET_SYSTEM_INFO     => nt_fn_get_system_info(a1, a2, a3, a4, a5),
+        K32_QPC                 => nt_fn_query_perf_counter(a1, a2, a3, a4, a5),
+        K32_QPF                 => nt_fn_query_perf_freq(a1, a2, a3, a4, a5),
+        K32_SLEEP               => nt_fn_sleep(a1, a2, a3, a4, a5),
+        K32_SET_CONSOLE_CTRL    => nt_fn_set_console_ctrl_handler(a1, a2, a3, a4, a5),
+        K32_GET_CONSOLE_MODE    => nt_fn_get_console_mode(a1, a2, a3, a4, a5),
+        K32_SET_CONSOLE_MODE    => nt_fn_set_console_mode(a1, a2, a3, a4, a5),
         _ => {
             crate::serial_println!("[NT] unknown service 0x{:X}", num);
             STATUS_NOT_IMPLEMENTED

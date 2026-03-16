@@ -51,6 +51,9 @@ pub struct WindowData {
     pub background_pixel: u32,
     pub mapped:          bool,
     pub properties:      [Option<PropertyEntry>; MAX_PROPERTIES],
+    /// Pixel buffer (BGRA, width×height×4 bytes) for compositor blitting.
+    /// Allocated on MapWindow with background_pixel fill.
+    pub pixels:          alloc::vec::Vec<u8>,
 }
 
 impl WindowData {
@@ -63,6 +66,23 @@ impl WindowData {
             background_pixel: 0xFFFFFFFF,
             mapped: false,
             properties: [const { None }; MAX_PROPERTIES],
+            pixels: alloc::vec::Vec::new(),
+        }
+    }
+
+    /// Ensure pixel buffer is allocated (BGRA format, w×h×4 bytes).
+    /// Called on MapWindow and before any drawing operation.
+    pub fn ensure_pixels(&mut self) {
+        let needed = (self.width as usize) * (self.height as usize) * 4;
+        if self.pixels.len() == needed { return; }
+        self.pixels.resize(needed, 0);
+        // Fill with background_pixel (convert RGB to BGRA)
+        let bg = self.background_pixel;
+        let r = ((bg >> 16) & 0xFF) as u8;
+        let g = ((bg >> 8) & 0xFF) as u8;
+        let b = (bg & 0xFF) as u8;
+        for chunk in self.pixels.chunks_exact_mut(4) {
+            chunk[0] = b; chunk[1] = g; chunk[2] = r; chunk[3] = 0xFF;
         }
     }
 
@@ -297,6 +317,25 @@ impl GcData {
     }
 }
 
+// ── GlyphSet (RENDER extension) ───────────────────────────────────────────────
+
+/// Per-glyph metrics for RENDER glyph compositing.
+#[derive(Clone, Copy, Default)]
+pub struct GlyphInfo {
+    pub width:  u16,
+    pub height: u16,
+    pub x_off:  i16,  // left bearing from pen x
+    pub y_off:  i16,  // top bearing from pen y
+    pub x_adv:  i16,  // x-advance after this glyph
+    pub y_adv:  i16,  // y-advance after this glyph
+}
+
+/// A RENDER GlyphSet — stores a collection of glyphs with A8 alpha masks.
+pub struct GlyphSet {
+    pub format: u32,
+    pub glyphs: Vec<(u32, GlyphInfo, Vec<u8>)>,  // (glyph_id, info, alpha_A8_pixels)
+}
+
 // ── Resource enum ─────────────────────────────────────────────────────────────
 
 pub enum ResourceBody {
@@ -304,6 +343,7 @@ pub enum ResourceBody {
     Pixmap(PixmapData),
     Gc(GcData),
     Picture(PictureData),
+    GlyphSet(alloc::boxed::Box<GlyphSet>),
 }
 
 pub struct Resource {
@@ -313,7 +353,7 @@ pub struct Resource {
 
 // ── Per-client resource table ─────────────────────────────────────────────────
 
-pub const MAX_RESOURCES: usize = 256;
+pub const MAX_RESOURCES: usize = 512;
 
 pub struct ResourceTable {
     pub entries: [Option<Resource>; MAX_RESOURCES],
@@ -322,6 +362,12 @@ pub struct ResourceTable {
 impl ResourceTable {
     pub const fn new() -> Self {
         ResourceTable { entries: [const { None }; MAX_RESOURCES] }
+    }
+
+    /// Iterate over all resources (id, body) pairs.
+    pub fn iter_all(&self) -> impl Iterator<Item = (u32, &ResourceBody)> {
+        self.entries.iter()
+            .filter_map(|slot| slot.as_ref().map(|r| (r.id, &r.body)))
     }
 
     pub fn insert(&mut self, id: u32, body: ResourceBody) -> bool {
@@ -421,16 +467,41 @@ impl ResourceTable {
         self.get_picture(pic_id).map(|p| p.drawable)
     }
 
+    pub fn get_glyphset_mut(&mut self, id: u32) -> Option<&mut GlyphSet> {
+        for slot in self.entries.iter_mut() {
+            if let Some(r) = slot {
+                if r.id == id {
+                    if let ResourceBody::GlyphSet(ref mut gs) = r.body { return Some(gs.as_mut()); }
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    pub fn get_glyphset(&self, id: u32) -> Option<&GlyphSet> {
+        for slot in self.entries.iter() {
+            if let Some(r) = slot {
+                if r.id == id {
+                    if let ResourceBody::GlyphSet(ref gs) = r.body { return Some(gs.as_ref()); }
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
     /// Returns (width, height, depth) for any Drawable (Window or Pixmap).
     pub fn get_drawable_geom(&self, id: u32) -> Option<(u16, u16, u8)> {
         for slot in self.entries.iter() {
             if let Some(r) = slot {
                 if r.id == id {
                     return match &r.body {
-                        ResourceBody::Window(w)  => Some((w.width, w.height, w.depth)),
-                        ResourceBody::Pixmap(p)  => Some((p.width, p.height, p.depth)),
-                        ResourceBody::Gc(_)      => None,
-                        ResourceBody::Picture(_) => None,
+                        ResourceBody::Window(w)   => Some((w.width, w.height, w.depth)),
+                        ResourceBody::Pixmap(p)   => Some((p.width, p.height, p.depth)),
+                        ResourceBody::Gc(_)       => None,
+                        ResourceBody::Picture(_)  => None,
+                        ResourceBody::GlyphSet(_) => None,
                     };
                 }
             }

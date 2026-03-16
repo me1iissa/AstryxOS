@@ -318,6 +318,16 @@ pub unsafe fn init_ap_tss() {
 /// # Safety
 /// `stack_top` must be a valid, mapped kernel-stack address.
 pub unsafe fn update_tss_rsp0(stack_top: u64) {
+    // Validate: TSS.RSP[0] must be a higher-half kernel address.
+    // A non-higher-half value causes a double fault on the next Ring-3
+    // exception (CPU pushes ISR frame to unmapped user-space address).
+    if stack_top != 0 && stack_top < 0xFFFF_8000_0000_0000 {
+        crate::serial_println!(
+            "[TSS] PANIC: bad RSP0 {:#x} apic_id={}",
+            stack_top, super::apic::current_apic_id()
+        );
+        panic!("update_tss_rsp0: non-higher-half value");
+    }
     let apic_id = super::apic::current_apic_id() as usize;
     if apic_id == 0 {
         TSS_BSP.rsp[0] = stack_top;
@@ -325,6 +335,21 @@ pub unsafe fn update_tss_rsp0(stack_top: u64) {
         let ap_idx = apic_id - 1; // TSS_APS is 0-indexed: AP1→[0], AP2→[1], …
         if ap_idx < MAX_AP {
             TSS_APS[ap_idx].rsp[0] = stack_top;
+        }
+    }
+}
+
+/// Read the current CPU's TSS.rsp[0] value (for diagnostics).
+pub unsafe fn read_tss_rsp0() -> u64 {
+    let apic_id = super::apic::current_apic_id() as usize;
+    if apic_id == 0 {
+        TSS_BSP.rsp[0]
+    } else {
+        let ap_idx = apic_id - 1;
+        if ap_idx < MAX_AP {
+            TSS_APS[ap_idx].rsp[0]
+        } else {
+            0
         }
     }
 }

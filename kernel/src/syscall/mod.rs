@@ -80,6 +80,22 @@ unsafe fn user_read_u64(addr: u64) -> Option<u64> {
 /// Futex wait queue: maps (pid, uaddr) -> list of waiting TIDs.
 static FUTEX_WAITERS: Mutex<BTreeMap<(u64, u64), Vec<u64>>> = Mutex::new(BTreeMap::new());
 
+/// SCM_RIGHTS pending fd transfers.
+/// Key = receiving unix socket id.  Value = list of FileDescriptors to deliver.
+static PENDING_SCM: Mutex<Vec<(u64, Vec<crate::vfs::FileDescriptor>)>> = Mutex::new(Vec::new());
+
+/// Queue SCM_RIGHTS fds to be delivered when `receiver_id` calls recvmsg.
+pub fn scm_queue(receiver_id: u64, fds: Vec<crate::vfs::FileDescriptor>) {
+    PENDING_SCM.lock().push((receiver_id, fds));
+}
+
+/// Pop SCM_RIGHTS fds for `receiver_id`.  Returns None if nothing pending.
+pub fn scm_dequeue(receiver_id: u64) -> Option<Vec<crate::vfs::FileDescriptor>> {
+    let mut q = PENDING_SCM.lock();
+    let pos = q.iter().position(|(id, _)| *id == receiver_id)?;
+    Some(q.remove(pos).1)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Per-CPU SYSCALL data — replaces the old global statics for SMP safety.
 //
@@ -110,6 +126,10 @@ pub struct PerCpuSyscallData {
     pub user_rsp: u64,
     /// Saved user RIP (RCX) on SYSCALL entry (offset 16).
     pub user_rip: u64,
+    /// Kernel RSP after all user-reg pushes (offset 24).
+    /// Points at: [rdi, rsi, rdx, r8, r9, r10, r15, r14, r13, r12, rbx, rbp, r11, rcx, user_rsp]
+    /// Written by syscall_entry naked_asm; read by read_fork_user_regs().
+    pub frame_rsp: u64,
 }
 
 /// Per-CPU array.  Indexed by `cpu_index()` (LAPIC ID >> 24, capped at MAX_CPUS).
@@ -119,6 +139,7 @@ pub static mut PER_CPU_SYSCALL: [PerCpuSyscallData; MAX_CPUS] = {
         kernel_rsp: 0,
         user_rsp: 0,
         user_rip: 0,
+        frame_rsp: 0,
     };
     [INIT; MAX_CPUS]
 };
@@ -131,6 +152,14 @@ use crate::arch::x86_64::apic::cpu_index;
 /// # Safety
 /// Must only be called with a valid kernel stack top address.
 pub unsafe fn set_kernel_rsp(rsp: u64) {
+    // Validate: must be 0 (idle thread) or a higher-half kernel address.
+    if rsp != 0 && rsp < 0xFFFF_8000_0000_0000 {
+        crate::serial_println!(
+            "[KERN_RSP] PANIC: bad value {:#x} cpu={}",
+            rsp, cpu_index()
+        );
+        panic!("set_kernel_rsp: non-higher-half value");
+    }
     let cpu = cpu_index();
     PER_CPU_SYSCALL[cpu].kernel_rsp = rsp;
 }
@@ -164,6 +193,11 @@ pub fn set_per_cpu_id(cpu_id: u8) {
         crate::hal::wrmsr(0xC000_0103, cpu_id as u64);
     }
 }
+
+/// When set to a non-zero value, every Linux syscall made by the process
+/// with that PID is printed to the serial console (used for debugging).
+pub static DEBUG_TRACE_PID: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// Initialize the syscall interface.
 pub fn init() {
@@ -278,6 +312,11 @@ pub fn dispatch_aether(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg
                 }
             } else {
                 // Try VFS first; fall back to TTY for fd 1/2 if no file open.
+                #[cfg(feature = "firefox-test")]
+                if fd == 2 {
+                    let s = core::str::from_utf8(slice).unwrap_or("<binary>");
+                    crate::serial_println!("[FF/stderr] pid={} {:?}", pid, s);
+                }
                 match crate::vfs::fd_write(pid, fd as usize, arg2 as *const u8, count) {
                     Ok(n) => n as i64,
                     Err(_) if fd == 1 || fd == 2 => {
@@ -627,6 +666,33 @@ pub fn dispatch_aether(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg
 ///   RSP = user stack (UNCHANGED by SYSCALL instruction)
 ///   RAX = syscall number
 ///   RDI, RSI, RDX, R10, R8, R9 = arguments
+/// Read callee-saved registers from the current CPU's syscall entry frame.
+/// syscall_entry stores kernel RSP (after all user-reg pushes) in per-CPU
+/// slot gs:[24] (PerCpuSyscallData::frame_rsp).
+///
+/// Frame layout (u64 slots from frame_rsp, low → high):
+///   [0]=rdi  [1]=rsi  [2]=rdx  [3]=r8  [4]=r9  [5]=r10
+///   [6]=r15  [7]=r14  [8]=r13  [9]=r12  [10]=rbx  [11]=rbp
+///   [12]=r11  [13]=rcx  [14]=user_rsp
+fn read_fork_user_regs() -> crate::proc::ForkUserRegs {
+    let cpu = cpu_index();
+    let rsp = unsafe { PER_CPU_SYSCALL[cpu as usize].frame_rsp };
+    if rsp == 0 {
+        return crate::proc::ForkUserRegs::default();
+    }
+    unsafe {
+        let p = rsp as *const u64;
+        crate::proc::ForkUserRegs {
+            rbp: *p.add(11),
+            rbx: *p.add(10),
+            r12: *p.add(9),
+            r13: *p.add(8),
+            r14: *p.add(7),
+            r15: *p.add(6),
+        }
+    }
+}
+
 ///
 /// Callee-saved registers (RBX, RBP, R12-R15) are preserved.
 /// Caller-saved registers (RDI, RSI, RDX, R10, R8, R9) may be clobbered.
@@ -677,6 +743,20 @@ extern "C" fn syscall_entry() {
         "push r9",
         "push r8",
         "push rdx",
+        // Save RSI and RDI — Linux syscall ABI requires ALL regs except
+        // RAX/RCX/R11 to be preserved.  Without saving these, kernel
+        // addresses leak into user space after SYSRET, causing crashes
+        // when glibc stores the leaked values in data structures.
+        "push rsi",
+        "push rdi",
+        // Save frame RSP into per-CPU slot for fork/clone to capture parent's
+        // callee-saved regs.  At this point GS → user_gs_base (post-swapgs above),
+        // so we must swapgs→kernel_gs, write, swapgs→user_gs.
+        // Interrupts are still disabled (no sti yet), so the swapgs sequence is safe.
+        // RSP points to: [rdi,rsi,rdx,r8,r9,r10,r15,r14,r13,r12,rbx,rbp,r11,rcx,user_rsp]
+        "swapgs",              // GS → KERNEL_GS_BASE (per-CPU struct)
+        "mov gs:[24], rsp",    // per_cpu.frame_rsp = frame RSP
+        "swapgs",              // GS → user_gs_base (restore)
 
         // ── Step 3: Re-enable interrupts for syscall handling ───────
         "sti",
@@ -719,6 +799,8 @@ extern "C" fn syscall_entry() {
 
         // ── Step 4b: Restore caller-saved scratch regs ──────────────
         // Pop AFTER signal_check so the Rust function cannot clobber them.
+        "pop rdi",
+        "pop rsi",
         "pop rdx",
         "pop r8",
         "pop r9",
@@ -885,6 +967,12 @@ fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
             // ELFs loaded from disk use the Linux syscall ABI.
             p.linux_abi = true;
             p.subsystem = crate::win32::SubsystemType::Linux;
+            // Close all FDs marked close-on-exec (O_CLOEXEC / FD_CLOEXEC).
+            for fd_slot in p.file_descriptors.iter_mut() {
+                if matches!(fd_slot, Some(f) if f.cloexec) {
+                    *fd_slot = None;
+                }
+            }
         }
     }
 
@@ -933,11 +1021,38 @@ fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
 
     crate::serial_println!("[SYSCALL] exec: process image replaced, returning to new entry");
 
+    // vfork completion: if this is a vfork child, wake the blocked parent.
+    // Linux: mm_release() → complete_vfork_done() in fs/exec.c:1459.
+    wake_vfork_parent();
+
     // Return 0 — dispatch puts this in RAX. When syscall_entry does SYSRETQ,
     // it restores the modified frame and jumps to the new entry point.
     // Note: for a true exec, the return value in RAX is irrelevant because
     // the new process image doesn't expect a return value from exec.
     0
+}
+
+/// Wake the vfork parent if the current thread is a vfork child.
+/// Called from both sys_exec() and exit_thread().
+pub fn wake_vfork_parent() {
+    let tid = crate::proc::current_tid();
+    let parent_tid = {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        threads.iter().find(|t| t.tid == tid)
+            .and_then(|t| t.vfork_parent_tid)
+    };
+    if let Some(ptid) = parent_tid {
+        crate::serial_println!("[VFORK] child tid={} waking parent tid={}", tid, ptid);
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+            t.vfork_parent_tid = None;
+        }
+        if let Some(p) = threads.iter_mut().find(|t| t.tid == ptid) {
+            if p.state == crate::proc::ThreadState::Blocked {
+                p.state = crate::proc::ThreadState::Ready;
+            }
+        }
+    }
 }
 
 /// Kernel-callable exec: load and run an ELF binary from the VFS.
@@ -990,23 +1105,117 @@ pub fn kernel_exec(path: &str) -> Result<crate::proc::Pid, i64> {
 /// fork creates a new process + thread that shares the same code/data pages.
 /// This is similar to vfork() semantics — the child should call exec() promptly.
 fn sys_fork() -> i64 {
+    sys_fork_impl(0, 0)
+}
+
+/// Fork implementation shared by sys_fork() (syscall 57) and clone()-style fork (syscall 56).
+/// `clone_flags` and `child_tidptr` are only used when called from clone().
+fn sys_fork_impl(clone_flags: u64, child_tidptr: u64) -> i64 {
+    const CLONE_CHILD_SETTID: u64 = 0x01000000;
+    const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
+
     let parent_pid = crate::proc::current_pid();
     let parent_tid = crate::proc::current_tid();
+
+    // Capture parent's callee-saved regs from the syscall entry frame BEFORE
+    // fork_process() takes THREAD_TABLE lock (which changes the frame context).
+    let parent_regs = read_fork_user_regs();
 
     crate::serial_println!("[SYSCALL] fork() from PID {} TID {}", parent_pid, parent_tid);
 
     // Create a new process (child) with a new PID and thread.
-    let child_pid = crate::proc::fork_process(parent_pid, parent_tid);
+    match crate::proc::fork_process(parent_pid, parent_tid) {
+        Some((child_pid, child_tid)) => {
+            crate::serial_println!("[SYSCALL] fork: child PID {} created", child_pid);
 
-    match child_pid {
-        Some(pid) => {
-            crate::serial_println!("[SYSCALL] fork: child PID {} created", pid);
-            pid as i64 // Return child PID to parent
+            // Store parent callee-saved regs into child thread so fork_child_entry
+            // can restore them before iretq — critical for glibc __fork epilogue.
+            crate::proc::set_fork_user_regs(child_pid, child_tid, parent_regs);
+
+            // CLONE_CHILD_SETTID: write child TID to child_tidptr in child's address space.
+            // Since child shares physical pages with parent (CoW, not yet written), writing
+            // through the child's CR3 is equivalent to writing to the shared physical page.
+            if clone_flags & CLONE_CHILD_SETTID != 0 && child_tidptr != 0 {
+                let child_cr3 = crate::proc::get_process_cr3(child_pid).unwrap_or(0);
+                if child_cr3 != 0 {
+                    write_u32_to_user(child_cr3, child_tidptr, child_tid as u32);
+                    crate::serial_println!("[FORK] CLONE_CHILD_SETTID: wrote tid={} to {:#x}", child_tid, child_tidptr);
+                }
+            }
+
+            // CLONE_CHILD_CLEARTID: store child_tidptr in thread so exit() can futex-wake it.
+            if clone_flags & CLONE_CHILD_CLEARTID != 0 && child_tidptr != 0 {
+                crate::proc::set_clear_child_tid(child_pid, child_tid, child_tidptr);
+            }
+
+            // Now that fork_user_regs are written, unblock the child so the scheduler
+            // can pick it up.  The child was created Blocked to prevent an AP from
+            // scheduling it before its register state was initialised.
+            crate::proc::unblock_process(child_pid);
+
+            child_pid as i64 // Return child PID to parent
         }
         None => {
             crate::serial_println!("[SYSCALL] fork: failed to create child");
             -12 // ENOMEM
         }
+    }
+}
+
+/// Write a 32-bit value to a virtual address in the CURRENT process's page tables.
+/// Used for CLONE_CHILD_SETTID / CLONE_PARENT_SETTID in the clone3 thread path
+/// (CLONE_VM: parent and child share address space → same CR3).
+unsafe fn write_u32_to_user_current(vaddr: u64, val: u32) {
+    let cr3 = crate::mm::vmm::get_cr3();
+    write_u32_to_user(cr3, vaddr, val);
+}
+
+/// Public wrapper for CLONE_CHILD_CLEARTID in exit path (proc/mod.rs).
+pub fn write_u32_to_user_pub(cr3: u64, vaddr: u64, val: u32) {
+    write_u32_to_user(cr3, vaddr, val);
+}
+
+/// Wake futex waiters from the exit path (CLONE_CHILD_CLEARTID).
+/// This is called from proc::exit_thread when a thread with clear_child_tid exits.
+pub fn futex_wake_for_exit(pid: u64, uaddr: u64, max_wake: u64) {
+    let tids_to_wake: alloc::vec::Vec<u64> = {
+        let mut waiters = FUTEX_WAITERS.lock();
+        if let Some(list) = waiters.get_mut(&(pid, uaddr)) {
+            let mut result = alloc::vec::Vec::new();
+            let mut woken = 0u64;
+            while !list.is_empty() && woken < max_wake {
+                result.push(list.remove(0));
+                woken += 1;
+            }
+            if list.is_empty() {
+                waiters.remove(&(pid, uaddr));
+            }
+            result
+        } else {
+            alloc::vec::Vec::new()
+        }
+    };
+    // Wake the threads (no lock held).
+    let mut threads = crate::proc::THREAD_TABLE.lock();
+    for wake_tid in tids_to_wake {
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == wake_tid) {
+            if t.state == crate::proc::ThreadState::Blocked {
+                t.state = crate::proc::ThreadState::Ready;
+            }
+        }
+    }
+}
+
+/// Write a 32-bit value to a virtual address through the given CR3's page tables.
+/// Used for CLONE_CHILD_SETTID.
+fn write_u32_to_user(cr3: u64, vaddr: u64, val: u32) {
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    use crate::mm::vmm::{read_pte, ADDR_MASK, PAGE_PRESENT};
+    let pte = read_pte(cr3, vaddr);
+    if pte & PAGE_PRESENT == 0 { return; }
+    let phys = (pte & ADDR_MASK) + (vaddr & 0xFFF);
+    unsafe {
+        core::ptr::write_volatile((PHYS_OFF + phys) as *mut u32, val);
     }
 }
 
@@ -1075,17 +1284,30 @@ fn sys_ioctl(fd_num: usize, request: u64, arg_ptr: *mut u8) -> i64 {
         return crate::drivers::tty::tty_ioctl(request, arg_ptr);
     }
 
-    // Look up the fd's open_path.
-    let open_path = {
+    // Look up the fd's open_path and file_type.
+    let (open_path, file_type, inode) = {
         let pid = crate::proc::current_pid();
         let procs = crate::proc::PROCESS_TABLE.lock();
-        procs.iter()
+        let fd_opt = procs.iter()
             .find(|p| p.pid == pid)
             .and_then(|p| p.file_descriptors.get(fd_num))
-            .and_then(|f| f.as_ref())
-            .map(|f| f.open_path.clone())
-            .unwrap_or_default()
+            .and_then(|f| f.as_ref());
+        match fd_opt {
+            Some(f) => (f.open_path.clone(), f.file_type, f.inode),
+            None    => (alloc::string::String::new(), crate::vfs::FileType::RegularFile, 0),
+        }
     };
+
+    // PTY ioctls
+    match file_type {
+        crate::vfs::FileType::PtyMaster => {
+            return sys_pty_master_ioctl(inode as u8, request, arg_ptr);
+        }
+        crate::vfs::FileType::PtySlave => {
+            return crate::drivers::tty::tty_ioctl(request, arg_ptr);
+        }
+        _ => {}
+    }
 
     if open_path == "/dev/fb0" {
         sys_fbdev_ioctl(request, arg_ptr)
@@ -1095,6 +1317,64 @@ fn sys_ioctl(fd_num: usize, request: u64, arg_ptr: *mut u8) -> i64 {
         crate::drivers::tty::tty_ioctl(request, arg_ptr)
     } else {
         0 // silently accept unknown ioctls
+    }
+}
+
+/// Ioctls for the PTY master side (/dev/ptmx).
+fn sys_pty_master_ioctl(pty_n: u8, request: u64, arg_ptr: *mut u8) -> i64 {
+    // TIOCGPTN (0x80045430) — get slave number
+    const TIOCGPTN:   u64 = 0x8004_5430;
+    // TIOCSPTLCK (0x40045431) — set slave lock (0 = unlock)
+    const TIOCSPTLCK: u64 = 0x4004_5431;
+    // TIOCGPTLCK (0x80045439) — get lock state
+    const TIOCGPTLCK: u64 = 0x8004_5439;
+    // TIOCGWINSZ (0x5413) / TIOCSWINSZ (0x5414)
+    const TIOCGWINSZ: u64 = 0x5413;
+    const TIOCSWINSZ: u64 = 0x5414;
+
+    match request {
+        TIOCGPTN => {
+            if !arg_ptr.is_null() {
+                unsafe { core::ptr::write(arg_ptr as *mut u32, pty_n as u32); }
+            }
+            0
+        }
+        TIOCSPTLCK => {
+            if !arg_ptr.is_null() {
+                let lock_val = unsafe { core::ptr::read(arg_ptr as *const i32) };
+                if lock_val == 0 {
+                    crate::drivers::pty::unlock_slave(pty_n);
+                }
+            }
+            0
+        }
+        TIOCGPTLCK => {
+            if !arg_ptr.is_null() {
+                unsafe { core::ptr::write(arg_ptr as *mut i32, 0i32); } // unlocked
+            }
+            0
+        }
+        TIOCGWINSZ => {
+            if !arg_ptr.is_null() {
+                let (cols, rows) = crate::drivers::pty::get_winsz(pty_n);
+                unsafe {
+                    core::ptr::write(arg_ptr as *mut u16, rows);
+                    core::ptr::write((arg_ptr as *mut u16).add(1), cols);
+                    core::ptr::write((arg_ptr as *mut u16).add(2), 0u16); // xpixel
+                    core::ptr::write((arg_ptr as *mut u16).add(3), 0u16); // ypixel
+                }
+            }
+            0
+        }
+        TIOCSWINSZ => {
+            if !arg_ptr.is_null() {
+                let rows = unsafe { core::ptr::read(arg_ptr as *const u16) };
+                let cols = unsafe { core::ptr::read((arg_ptr as *const u16).add(1)) };
+                crate::drivers::pty::set_winsz(pty_n, cols, rows);
+            }
+            0
+        }
+        _ => 0, // Accept all other ioctls silently
     }
 }
 
@@ -1577,6 +1857,7 @@ fn fill_stat_buf(st: &crate::vfs::FileStat, buf: *mut u8) {
         crate::vfs::FileType::EventFd => 5,    // report as FIFO
         crate::vfs::FileType::TimerFd | crate::vfs::FileType::SignalFd |
         crate::vfs::FileType::InotifyFd => 5,  // report as FIFO
+        crate::vfs::FileType::PtyMaster | crate::vfs::FileType::PtySlave => 2, // DT_CHR
         crate::vfs::FileType::Socket  => 12,   // DT_SOCK substitute
     };
     out[8..12].copy_from_slice(&ft.to_le_bytes());
@@ -1775,6 +2056,7 @@ fn sys_pipe(fds_out: *mut u64) -> i64 {
         offset: 0,
         flags: 0x8000_0000, // Pipe read end
         is_console: false,
+        cloexec: false,
         file_type: crate::vfs::FileType::Pipe,
         open_path: alloc::string::String::new(),
     };
@@ -1786,6 +2068,7 @@ fn sys_pipe(fds_out: *mut u64) -> i64 {
         offset: 0,
         flags: 0x8000_0001, // Pipe write end
         is_console: false,
+        cloexec: false,
         file_type: crate::vfs::FileType::Pipe,
         open_path: alloc::string::String::new(),
     };
@@ -1866,6 +2149,7 @@ fn alloc_socket_fd(pid: u64, socket_id: u64, sock_type: u32) -> i64 {
         offset: 0,
         flags: 0x4000_0000 | (sock_type & 0x03), // SOCKET_FD | type
         is_console: false,
+        cloexec: false,
         file_type: crate::vfs::FileType::CharDevice,
         open_path: alloc::string::String::new(),
     };
@@ -1985,6 +2269,63 @@ fn get_inotify_id(pid: u64, fd_num: usize) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+// ── Poll fd readiness helper ──────────────────────────────────────────────────
+
+/// Compute revents for a single fd given the requested events mask.
+/// Returns 0 if fd is not ready for any of the requested events.
+fn poll_revents(pid: u64, fd: usize, events: u16) -> u16 {
+    const POLLIN:  u16 = 0x0001;
+    const POLLOUT: u16 = 0x0004;
+    if fd <= 2 {
+        if fd == 0 { events & POLLIN } else { events & POLLOUT }
+    } else if is_eventfd_fd(pid, fd) {
+        if crate::ipc::eventfd::is_readable(get_eventfd_id(pid, fd)) { events & POLLIN } else { 0 }
+    } else if is_unix_socket_fd(pid, fd) {
+        let uid = get_unix_socket_id(pid, fd);
+        let has_d = crate::net::unix::has_data(uid);
+        let has_p = crate::net::unix::has_pending(uid);
+        let readable = has_d || has_p;
+        #[cfg(feature = "firefox-test")]
+        if pid >= 1 && events & POLLIN != 0 {
+            crate::serial_println!("[UNIXPOLL] pid={} fd={} uid={} has_data={} avail={} events={:#x}",
+                pid, fd, uid, has_d, crate::net::unix::bytes_available(uid), events);
+        }
+        let mut rev = 0u16;
+        if readable { rev |= events & POLLIN; }
+        rev |= events & POLLOUT; // connected sockets always writable
+        rev
+    } else if is_socket_fd(pid, fd) {
+        let sid = get_socket_id(pid, fd);
+        let mut rev = 0u16;
+        if crate::net::socket::socket_has_data(sid) { rev |= events & POLLIN; }
+        rev |= events & POLLOUT;
+        rev
+    } else if is_pipe_fd(pid, fd) {
+        let pipe_id = get_pipe_id(pid, fd);
+        let is_read_end = {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            procs.iter().find(|p| p.pid == pid)
+                .and_then(|p| p.file_descriptors.get(fd))
+                .and_then(|f| f.as_ref())
+                .map(|f| f.flags & 0x1 == 0)
+                .unwrap_or(false)
+        };
+        if is_read_end {
+            if crate::ipc::pipe::pipe_has_data(pipe_id) { events & POLLIN } else { 0 }
+        } else {
+            events & POLLOUT
+        }
+    } else if is_timerfd_fd(pid, fd) {
+        if crate::ipc::timerfd::is_readable(get_timerfd_id(pid, fd)) { events & POLLIN } else { 0 }
+    } else if is_signalfd_fd(pid, fd) {
+        if crate::ipc::signalfd::is_readable(get_signalfd_id(pid, fd)) { events & POLLIN } else { 0 }
+    } else if is_inotify_fd(pid, fd) {
+        0
+    } else {
+        events & (POLLIN | POLLOUT) // regular file always ready
+    }
+}
+
 // ── AF_UNIX socket helpers ────────────────────────────────────────────────────
 
 const UNIX_SOCKET_FLAG: u32 = 0x0080_0000; // bit 23: fd is an AF_UNIX socket
@@ -2019,6 +2360,7 @@ fn alloc_unix_socket_fd(pid: u64, unix_id: u64) -> i64 {
         offset: 0,
         flags: 0x4000_0000 | UNIX_SOCKET_FLAG, // SOCKET_FD | UNIX_FLAG
         is_console: false,
+        cloexec: false,
         file_type: crate::vfs::FileType::Socket,
         open_path: alloc::string::String::new(),
     };
@@ -2407,8 +2749,28 @@ fn read_user_argv(ptr: u64) -> alloc::vec::Vec<alloc::string::String> {
 /// Maps Linux syscall numbers to AstryxOS handlers, handling differences
 /// in argument encoding (e.g., C strings vs ptr+len for paths).
 pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, arg6: u64) -> i64 {
-    // ── Transient debug trace: log Linux syscalls from PID≥12 (TCC and later) ─
-    // Remove after TCC bring-up is confirmed working.
+    // ── Per-PID debug trace ───────────────────────────────────────────────────
+    let trace_pid = DEBUG_TRACE_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let do_trace = trace_pid != 0 && crate::proc::current_pid() == trace_pid;
+    if do_trace {
+        crate::serial_println!("[TRACE] pid={} sys={} a1={:#x} a2={:#x} a3={:#x}",
+            trace_pid, num, arg1, arg2, arg3);
+    }
+
+    // ── Transient debug trace: log Linux syscalls from user processes ─────────
+    #[cfg(feature = "firefox-test")]
+    {
+        static TRACE_N: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        let pid = crate::proc::current_pid();
+        if pid >= 1 {
+            let n = TRACE_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < 10000 {
+                crate::serial_println!("[LINUX-SYS] #{} pid={} num={} a1={:#x}", n, pid, num, arg1);
+            }
+        }
+    }
+    #[cfg(not(feature = "firefox-test"))]
     {
         static TRACE_N: core::sync::atomic::AtomicU64 =
             core::sync::atomic::AtomicU64::new(0);
@@ -2522,98 +2884,77 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
             let nfds = arg2 as i64;
             let pid  = crate::proc::current_pid();
             let timeout_ms = arg3 as i64; // -1 = block; 0 = no wait
-            let mut ready = 0i64;
 
             if nfds <= 0 || arg1 == 0 {
                 return 0;
             }
 
+            // Poll entry logging disabled — deep call stack + serial formatting
+            // was contributing to kernel stack overflow for Firefox.
+            #[cfg(feature = "firefox-test")]
+            if false && pid >= 1 {
+                crate::serial_println!("[POLL_ENTRY] pid={} nfds={} timeout={}",
+                    pid, nfds, timeout_ms);
+            }
+
+            // Inner check: evaluate all pollfds, write revents, return ready count.
             // struct pollfd { int fd; short events; short revents; } = 8 bytes
-            // Layout: fd[0..4], events[4..6], revents[6..8]
-            for i in 0..nfds as u64 {
-                let base = (arg1 + i * 8) as *mut u8;
-                let (fd_val, events) = unsafe {
-                    let fd_val = core::ptr::read_unaligned(base as *const i32);
-                    let events = core::ptr::read_unaligned(base.add(4) as *const u16);
-                    (fd_val, events)
-                };
-
-                if fd_val < 0 {
-                    // Negative fd → ignore (write revents=0)
-                    unsafe { core::ptr::write_unaligned(base.add(6) as *mut u16, 0); }
-                    continue;
-                }
-                let fd = fd_val as usize;
-
-                const POLLIN:  u16 = 0x0001;
-                const POLLOUT: u16 = 0x0004;
-                const POLLERR: u16 = 0x0008;
-                const POLLHUP: u16 = 0x0010;
-
-                let revents: u16 = if fd <= 2 {
-                    // stdin/stdout/stderr: stdin always readable, stdout/stderr always writable
-                    if fd == 0 { events & POLLIN } else { events & POLLOUT }
-                } else if is_eventfd_fd(pid, fd) {
-                    let efd_id = get_eventfd_id(pid, fd);
-                    if crate::ipc::eventfd::is_readable(efd_id) { events & POLLIN }
-                    else { 0 }
-                } else if is_unix_socket_fd(pid, fd) {
-                    let unix_id = get_unix_socket_id(pid, fd);
-                    let readable = crate::net::unix::has_data(unix_id)
-                        || crate::net::unix::has_pending(unix_id);
-                    let mut rev = 0u16;
-                    if readable { rev |= events & POLLIN; }
-                    rev |= events & POLLOUT; // connected unix sockets are always writable
-                    rev
-                } else if is_socket_fd(pid, fd) {
-                    let socket_id = get_socket_id(pid, fd);
-                    let in_ready  = crate::net::socket::socket_has_data(socket_id);
-                    let out_ready = true; // TCP sockets are always writable (non-blocking model)
-                    let mut rev = 0u16;
-                    if in_ready  { rev |= events & POLLIN; }
-                    if out_ready { rev |= events & POLLOUT; }
-                    rev
-                } else if is_pipe_fd(pid, fd) {
-                    let pipe_id = get_pipe_id(pid, fd);
-                    // Read end: check if data available; write end: always writable
-                    let is_read_end = {
-                        let procs = crate::proc::PROCESS_TABLE.lock();
-                        procs.iter().find(|p| p.pid == pid)
-                            .and_then(|p| p.file_descriptors.get(fd))
-                            .and_then(|f| f.as_ref())
-                            .map(|f| f.flags & 0x1 == 0) // bit0=0 → read end
-                            .unwrap_or(false)
+            let do_check = |clear: bool, log: bool| -> i64 {
+                let mut ready = 0i64;
+                for i in 0..nfds as u64 {
+                    let base = (arg1 + i * 8) as *mut u8;
+                    let (fd_val, events) = unsafe {
+                        (core::ptr::read_unaligned(base as *const i32),
+                         core::ptr::read_unaligned(base.add(4) as *const u16))
                     };
-                    if is_read_end {
-                        let has_data = crate::ipc::pipe::pipe_has_data(pipe_id);
-                        if has_data { events & POLLIN } else { 0 }
-                    } else {
-                        events & POLLOUT // write end always writable
+                    if fd_val < 0 {
+                        if clear { unsafe { core::ptr::write_unaligned(base.add(6) as *mut u16, 0); } }
+                        continue;
                     }
-                } else if is_timerfd_fd(pid, fd) {
-                    let tfd_id = get_timerfd_id(pid, fd);
-                    if crate::ipc::timerfd::is_readable(tfd_id) { events & POLLIN } else { 0 }
-                } else if is_signalfd_fd(pid, fd) {
-                    let sfd_id = get_signalfd_id(pid, fd);
-                    if crate::ipc::signalfd::is_readable(sfd_id) { events & POLLIN } else { 0 }
-                } else if is_inotify_fd(pid, fd) {
-                    0 // inotify stub never delivers events
-                } else {
-                    // Regular file: always ready
-                    events & (POLLIN | POLLOUT)
-                };
+                    let revents = poll_revents(pid, fd_val as usize, events);
+                    // Per-fd poll logging disabled to reduce kernel stack pressure.
+                    let _ = log;
+                    unsafe { core::ptr::write_unaligned(base.add(6) as *mut u16, revents); }
+                    if revents != 0 { ready += 1; }
+                }
+                ready
+            };
 
-                unsafe { core::ptr::write_unaligned(base.add(6) as *mut u16, revents); }
-                if revents != 0 { ready += 1; }
-            }
-
-            // If timeout_ms == 0, return immediately with result.
-            // If timeout_ms  > 0 or == -1 and nothing ready, yield once.
+            let ready = do_check(false, true);
             if ready == 0 && timeout_ms != 0 {
-                crate::sched::yield_cpu();
+                // Pump X11 once immediately after the initial check so the server can
+                // process any pending requests from Firefox and write replies to its
+                // socket buffer.  Then check AGAIN before the first yield — if X11
+                // already wrote a reply, we can return without yielding at all.
+                crate::x11::poll();
+                let r = do_check(true, true);
+                if r > 0 {
+                    #[cfg(feature = "firefox-test")]
+                    if pid >= 1 { crate::serial_println!("[POLL_RET] pid={} ret={} (post-x11-poll)", pid, r); }
+                    return r;
+                }
+                let max_retries: usize = if timeout_ms < 0 { 64 } else {
+                    ((timeout_ms as usize / 10).max(1)).min(64)
+                };
+                for _ in 0..max_retries {
+                    crate::sched::yield_cpu();
+                    // Pump X11 on each retry so concurrent X11 replies appear promptly.
+                    crate::x11::poll();
+                    let r = do_check(true, true);
+                    if r > 0 {
+                        #[cfg(feature = "firefox-test")]
+                        if pid >= 1 { crate::serial_println!("[POLL_RET] pid={} ret={} (retry)", pid, r); }
+                        return r;
+                    }
+                }
+                #[cfg(feature = "firefox-test")]
+                if pid >= 1 { crate::serial_println!("[POLL_RET] pid={} ret=0 (timeout)", pid); }
+                0
+            } else {
+                #[cfg(feature = "firefox-test")]
+                if pid >= 1 { crate::serial_println!("[POLL_RET] pid={} ret={} (immediate)", pid, ready); }
+                ready
             }
-
-            ready
         }
         // 17: pread64(fd, buf, count, offset)
         17 => {
@@ -2650,6 +2991,16 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
                 Err(e) => crate::subsys::linux::errno::vfs_err(e),
             }
         }
+        // 19: readv(fd, iov, iovcnt) — scatter-gather read
+        19 => sys_readv(arg1, arg2, arg3),
+        // 29: shmget(key, size, shmflg) — get/create shared memory segment
+        29 => crate::ipc::sysv_shm::shmget(arg1 as i32, arg2, arg3 as i32),
+        // 30: shmat(shmid, shmaddr, shmflg) — attach shared memory
+        30 => crate::ipc::sysv_shm::shmat(arg1 as u32, arg2, arg3 as i32),
+        // 31: shmdt(shmaddr) — detach shared memory
+        31 => crate::ipc::sysv_shm::shmdt(arg1),
+        // 65: shmctl(shmid, cmd, buf) — control shared memory
+        65 => crate::ipc::sysv_shm::shmctl(arg1 as u32, arg2 as i32, arg3),
         // 32: dup(oldfd) — duplicate fd to lowest available slot
         32 => sys_dup(arg1 as usize),
         // 33: dup2(oldfd, newfd) — duplicate fd to specific slot
@@ -2661,8 +3012,8 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
         }
         // 35: nanosleep(req, rem) — struct timespec { tv_sec: i64, tv_nsec: i64 }
         35 => sys_nanosleep_linux(arg1, arg2),
-        // 40: sendfile(out_fd, in_fd, offset, count) — stub
-        40 => -38, // ENOSYS
+        // 40: sendfile(out_fd, in_fd, offset_ptr, count)
+        40 => sys_sendfile(arg1 as usize, arg2 as usize, arg3, arg4 as usize),
         // ── Phase 4: Socket syscalls (sockets as file descriptors) ───────────
         // 41: socket(domain, type, protocol) → fd
         41 => {
@@ -2704,6 +3055,12 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
                 } else { return -22; };
                 // Strip trailing NUL
                 let plen = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
+                #[cfg(feature = "firefox-test")]
+                if pid >= 1 {
+                    if let Ok(p) = core::str::from_utf8(&path_bytes[..plen]) {
+                        crate::serial_println!("[FF/connect] pid={} path={}", pid, p);
+                    }
+                }
                 crate::net::unix::connect(unix_id, &path_bytes[..plen])
             } else {
                 if !is_socket_fd(pid, fd) { return -9; }
@@ -2714,7 +3071,32 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
                     let port = u16::from_be_bytes([bytes[2], bytes[3]]);
                     let ip = [bytes[4], bytes[5], bytes[6], bytes[7]];
                     match crate::net::socket::socket_connect(socket_id, ip, port) {
-                        Ok(()) => 0,
+                        Ok(()) => {
+                            // For TCP: wait up to 3s for connection to become Established.
+                            let local_port = {
+                                let socks = crate::net::socket::SOCKETS.lock();
+                                socks.iter().find(|s| s.id == socket_id).map(|s| s.local_port)
+                            };
+                            if let Some(lport) = local_port {
+                                let deadline = crate::arch::x86_64::irq::get_ticks() + 300;
+                                loop {
+                                    crate::net::poll();
+                                    match crate::net::tcp::get_state(lport) {
+                                        Some(crate::net::tcp::TcpState::Established) => break,
+                                        Some(crate::net::tcp::TcpState::Closed)
+                                        | Some(crate::net::tcp::TcpState::TimeWait) => {
+                                            return -111; // ECONNREFUSED
+                                        }
+                                        _ => {}
+                                    }
+                                    if crate::arch::x86_64::irq::get_ticks() >= deadline {
+                                        return -110; // ETIMEDOUT
+                                    }
+                                    crate::sched::yield_cpu();
+                                }
+                            }
+                            0
+                        }
                         Err(_) => -111, // ECONNREFUSED
                     }
                 } else {
@@ -2827,6 +3209,44 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
                     }
                 }
             }
+            // Handle SCM_RIGHTS in msg_control (Unix sockets only).
+            // msghdr layout (x86_64): msg_control at byte-offset 32 (u64 index 4),
+            // msg_controllen at byte-offset 40 (u64 index 5).
+            if is_unix_socket_fd(pid, fd) {
+                let ctrl_ptr = unsafe { core::ptr::read_unaligned(msghdr_ptr.add(4)) };
+                let ctrl_len = unsafe { core::ptr::read_unaligned(msghdr_ptr.add(5)) } as usize;
+                if ctrl_ptr != 0 && ctrl_len >= 16 {
+                    let ctrl = ctrl_ptr as *const u8;
+                    // cmsghdr: cmsg_len(u64@0), cmsg_level(i32@8), cmsg_type(i32@12)
+                    let cmsg_len   = unsafe { core::ptr::read_unaligned(ctrl as *const u64) } as usize;
+                    let cmsg_level = unsafe { core::ptr::read_unaligned((ctrl_ptr + 8)  as *const i32) };
+                    let cmsg_type  = unsafe { core::ptr::read_unaligned((ctrl_ptr + 12) as *const i32) };
+                    const SOL_SOCKET_I32: i32 = 1;
+                    const SCM_RIGHTS_I32: i32 = 1;
+                    if cmsg_level == SOL_SOCKET_I32 && cmsg_type == SCM_RIGHTS_I32 && cmsg_len > 16 {
+                        let nfds = (cmsg_len.min(ctrl_len) - 16) / 4;
+                        let fd_arr = (ctrl_ptr + 16) as *const i32;
+                        let sender_fds: Vec<crate::vfs::FileDescriptor> = {
+                            let procs = crate::proc::PROCESS_TABLE.lock();
+                            if let Some(p) = procs.iter().find(|p| p.pid == pid) {
+                                (0..nfds).filter_map(|i| {
+                                    let fd_n = unsafe { core::ptr::read_unaligned(fd_arr.add(i)) } as usize;
+                                    if fd_n < p.file_descriptors.len() {
+                                        p.file_descriptors[fd_n].clone()
+                                    } else { None }
+                                }).collect()
+                            } else { Vec::new() }
+                        };
+                        if !sender_fds.is_empty() {
+                            let unix_id  = get_unix_socket_id(pid, fd);
+                            let peer_id  = crate::net::unix::get_peer(unix_id);
+                            if peer_id != u64::MAX {
+                                scm_queue(peer_id, sender_fds);
+                            }
+                        }
+                    }
+                }
+            }
             total as i64
         }
         // 47: recvmsg(sockfd, msg, flags) — via socket_recv / unix::read
@@ -2841,23 +3261,74 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
             let iov = unsafe { core::slice::from_raw_parts(iov_ptr as *const [u64; 2], 1) };
             let dst = iov[0][0] as *mut u8;
             let cap = iov[0][1] as usize;
+            let bytes_read: i64;
             if is_unix_socket_fd(pid, fd) {
                 let unix_id = get_unix_socket_id(pid, fd);
                 let buf = unsafe { core::slice::from_raw_parts_mut(dst, cap) };
-                crate::net::unix::read(unix_id, buf)
+                bytes_read = crate::net::unix::read(unix_id, buf);
+                // Deliver pending SCM_RIGHTS fds into receiver's fd table.
+                if bytes_read >= 0 {
+                    if let Some(scm_fds) = scm_dequeue(unix_id) {
+                        // Allocate fds in the receiver's process.
+                        let new_fd_nums: Vec<i32> = {
+                            let mut procs = crate::proc::PROCESS_TABLE.lock();
+                            if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                                scm_fds.into_iter().map(|fdesc| {
+                                    // Find free slot.
+                                    let slot = p.file_descriptors.iter()
+                                        .position(|e| e.is_none())
+                                        .unwrap_or(p.file_descriptors.len());
+                                    if slot == p.file_descriptors.len() {
+                                        p.file_descriptors.push(Some(fdesc));
+                                    } else {
+                                        p.file_descriptors[slot] = Some(fdesc);
+                                    }
+                                    slot as i32
+                                }).collect()
+                            } else { Vec::new() }
+                        };
+                        // Write SCM_RIGHTS cmsghdr into msg_control.
+                        let ctrl_ptr = unsafe { core::ptr::read_unaligned(msghdr_ptr.add(4)) };
+                        let ctrl_len = unsafe { core::ptr::read_unaligned(msghdr_ptr.add(5)) } as usize;
+                        if ctrl_ptr != 0 && ctrl_len >= 16 + new_fd_nums.len() * 4 {
+                            let needed = 16 + new_fd_nums.len() * 4;
+                            unsafe {
+                                core::ptr::write_unaligned(ctrl_ptr as *mut u64, needed as u64);
+                                core::ptr::write_unaligned((ctrl_ptr + 8)  as *mut i32, 1i32); // SOL_SOCKET
+                                core::ptr::write_unaligned((ctrl_ptr + 12) as *mut i32, 1i32); // SCM_RIGHTS
+                                for (i, &new_fd) in new_fd_nums.iter().enumerate() {
+                                    core::ptr::write_unaligned((ctrl_ptr + 16 + i as u64 * 4) as *mut i32, new_fd);
+                                }
+                            }
+                            unsafe { core::ptr::write_unaligned(msghdr_ptr.add(5) as *mut u64, needed as u64); }
+                        } else if ctrl_ptr != 0 {
+                            // No room — zero out msg_controllen.
+                            unsafe { core::ptr::write_unaligned(msghdr_ptr.add(5) as *mut u64, 0u64); }
+                        }
+                    } else {
+                        // No SCM to deliver — set msg_controllen to 0.
+                        let ctrl_ptr = unsafe { core::ptr::read_unaligned(msghdr_ptr.add(4)) };
+                        if ctrl_ptr != 0 {
+                            unsafe { core::ptr::write_unaligned(msghdr_ptr.add(5) as *mut u64, 0u64); }
+                        }
+                    }
+                }
             } else {
                 if !is_socket_fd(pid, fd) { return -9; }
                 let socket_id = get_socket_id(pid, fd);
-                match crate::net::socket::socket_recv(socket_id) {
+                bytes_read = match crate::net::socket::socket_recv(socket_id) {
                     Ok(data) => {
-                        if data.is_empty() { return 0; }
-                        let n = data.len().min(cap);
-                        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst, n); }
-                        n as i64
+                        if data.is_empty() { 0 }
+                        else {
+                            let n = data.len().min(cap);
+                            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst, n); }
+                            n as i64
+                        }
                     }
                     Err(_) => -11,
-                }
+                };
             }
+            bytes_read
         }
         // 48: shutdown(sockfd, how) — stub success
         48 => 0,
@@ -2966,19 +3437,79 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
                 -38 // ENOSYS for non-UNIX socketpair
             }
         }
-        // 54: setsockopt(sockfd, level, optname, optval, optlen) — stub success
-        54 => 0,
-        // 55: getsockopt(sockfd, level, optname, optval, optlen) — stub
-        55 => {
-            const SO_ERROR: u64 = 4;
-            const SOL_SOCKET: u64 = 1;
-            if arg2 == SOL_SOCKET && arg3 == SO_ERROR {
-                // SO_ERROR requested — write 0 (no error) to optval
-                let optval = arg4 as *mut u32;
-                let optlen = arg5 as *mut u32;
-                if !optval.is_null() { unsafe { core::ptr::write(optval, 0u32); } }
-                if !optlen.is_null() { unsafe { core::ptr::write(optlen, 4u32); } }
+        // 54: setsockopt(sockfd, level, optname, optval, optlen)
+        54 => {
+            let pid   = crate::proc::current_pid();
+            let fd    = arg1 as usize;
+            let level = arg2;
+            let opt   = arg3;
+            let val   = if arg4 != 0 { unsafe { core::ptr::read_unaligned(arg4 as *const u32) } }
+                        else         { 0u32 };
+            if is_socket_fd(pid, fd) {
+                let sid = get_socket_id(pid, fd);
+                crate::net::socket::socket_setsockopt(sid, level, opt, val) as i64
+            } else {
+                0 // AF_UNIX: ignore (no per-socket options tracked yet)
             }
+        }
+        // 55: getsockopt(sockfd, level, optname, optval, optlen)
+        55 => {
+            let pid    = crate::proc::current_pid();
+            let fd     = arg1 as usize;
+            let level  = arg2;
+            let opt    = arg3;
+            let optval = arg4 as *mut u32;
+            let optlen = arg5 as *mut u32;
+            // Check AF_UNIX FIRST — unix socket fds also have the
+            // 0x4000_0000 socket flag set, so is_socket_fd returns true
+            // for them.  But TCP/UDP socket_getsockopt returns 0 when the
+            // unix socket ID isn't found, causing Firefox's
+            // CHECK(buf_len > 0) to ABORT.
+            let val = if is_unix_socket_fd(pid, fd) {
+                const SOL_SOCKET:  u64 = 1;
+                const SO_TYPE:     u64 = 3;
+                const SO_RCVBUF:   u64 = 8;
+                const SO_SNDBUF:   u64 = 7;
+                const SO_ERROR:    u64 = 4;
+                const SO_PEERCRED: u64 = 17;
+                match (level, opt) {
+                    (SOL_SOCKET, SO_TYPE)   => 1,  // SOCK_STREAM
+                    (SOL_SOCKET, SO_RCVBUF) => 87380,
+                    (SOL_SOCKET, SO_SNDBUF) => 131072,
+                    (SOL_SOCKET, SO_ERROR)  => 0,
+                    (SOL_SOCKET, SO_PEERCRED) => {
+                        // Return struct ucred { pid, uid, gid } = 12 bytes
+                        if !optval.is_null() {
+                            unsafe {
+                                let p = optval as *mut u8;
+                                core::ptr::write(p as *mut u32, crate::proc::current_pid() as u32);
+                                core::ptr::write(p.add(4) as *mut u32, 0); // uid
+                                core::ptr::write(p.add(8) as *mut u32, 0); // gid
+                            }
+                        }
+                        if !optlen.is_null() { unsafe { core::ptr::write(optlen, 12u32); } }
+                        return 0i64;
+                    }
+                    _ => 0,
+                }
+            } else if is_socket_fd(pid, fd) {
+                let sid = get_socket_id(pid, fd);
+                crate::net::socket::socket_getsockopt(sid, level, opt)
+            } else {
+                // Unknown fd type — return sensible defaults
+                const SOL_SOCKET:  u64 = 1;
+                const SO_TYPE:     u64 = 3;
+                const SO_RCVBUF:   u64 = 8;
+                const SO_SNDBUF:   u64 = 7;
+                match (level, opt) {
+                    (SOL_SOCKET, SO_TYPE)   => 1,
+                    (SOL_SOCKET, SO_RCVBUF) => 87380,
+                    (SOL_SOCKET, SO_SNDBUF) => 131072,
+                    _ => 0,
+                }
+            };
+            if !optval.is_null() { unsafe { core::ptr::write(optval, val); } }
+            if !optlen.is_null() { unsafe { core::ptr::write(optlen, 4u32); } }
             0
         }
         // 56: clone(flags, stack, parent_tid, child_tid, tls)
@@ -2996,20 +3527,86 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
                 let user_rip = unsafe { get_user_rip() };
                 let tls_val = if flags & CLONE_SETTLS != 0 { tls } else { 0 };
                 let pid = crate::proc::current_pid();
-                match crate::proc::usermode::create_user_thread(pid, user_rip, new_stack, tls_val) {
+                let parent_tidptr = arg3; // rdx = parent_tid
+                let child_tidptr  = arg4; // r10 = child_tid
+                match crate::proc::usermode::create_user_thread(pid, user_rip, new_stack, tls_val, 0, 0) {
                     Some(tid) => {
                         crate::serial_println!("[CLONE] Thread TID {} spawned in PID {}", tid, pid);
+
+                        // CLONE_CHILD_SETTID: write TID into child's TCB tid field.
+                        const CLONE_CHILD_SETTID: u64 = 0x01000000;
+                        if flags & CLONE_CHILD_SETTID != 0 && child_tidptr != 0 {
+                            unsafe { write_u32_to_user_current(child_tidptr, tid as u32); }
+                        }
+                        const CLONE_PARENT_SETTID: u64 = 0x00100000;
+                        if flags & CLONE_PARENT_SETTID != 0 && parent_tidptr != 0 {
+                            unsafe { write_u32_to_user_current(parent_tidptr, tid as u32); }
+                        }
+                        const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
+                        if flags & CLONE_CHILD_CLEARTID != 0 && child_tidptr != 0 {
+                            let mut threads = crate::proc::THREAD_TABLE.lock();
+                            if let Some(t) = threads.iter_mut().find(|t| t.tid == tid as u64) {
+                                t.clear_child_tid = child_tidptr;
+                            }
+                        }
+
                         tid as i64
                     }
                     None => -11, // EAGAIN
                 }
+            } else if flags & (CLONE_VM as u64) != 0 {
+                // CLONE_VM without CLONE_THREAD = vfork-style.
+                // Linux pattern: CoW fork + parent blocks until child execs/exits.
+                // Child signals completion via vfork_parent_tid in exec/exit paths.
+                const CLONE_VFORK: u64 = 0x00004000;
+                let is_vfork = flags & CLONE_VFORK != 0;
+                let parent_tid = crate::proc::current_tid();
+                crate::serial_println!("[VFORK] pid={} flags={:#x} vfork={} parent_tid={}",
+                    crate::proc::current_pid(), flags, is_vfork, parent_tid);
+
+                let child_tidptr = arg4; // r10 = ctid
+                let child_pid = sys_fork_impl(flags, child_tidptr);
+
+                if child_pid > 0 && is_vfork {
+                    // Store parent TID in child thread so exec/exit can wake us.
+                    // The child's first (and only) thread has the same PID.
+                    {
+                        let mut threads = crate::proc::THREAD_TABLE.lock();
+                        for t in threads.iter_mut() {
+                            if t.pid == child_pid as u64 {
+                                t.vfork_parent_tid = Some(parent_tid);
+                                break;
+                            }
+                        }
+                    }
+
+                    // Block parent until child signals completion.
+                    // Linux: wait_for_vfork_done() uses completion semaphore.
+                    // We use Blocked state + schedule() — child wakes us.
+                    {
+                        let mut threads = crate::proc::THREAD_TABLE.lock();
+                        if let Some(t) = threads.iter_mut().find(|t| t.tid == parent_tid) {
+                            t.state = crate::proc::ThreadState::Blocked;
+                            t.wake_tick = u64::MAX; // indefinite block
+                        }
+                    }
+                    crate::sched::schedule();
+                    // Resumed: child called exec or exit and woke us.
+                }
+
+                child_pid
             } else {
-                // Fork-style clone: just use sys_fork for now.
-                sys_fork()
+                // Fork-style clone: new address space copy.
+                // Pass flags and child_tidptr for CLONE_CHILD_SETTID support.
+                sys_fork_impl(flags, arg4)
             }
         }
         // 57: fork
         57 => sys_fork(),
+        // 74: fsync(fd) — flush file data to storage (stub: VFS has no dirty state yet)
+        74 => 0,
+        // 75: fdatasync(fd) — flush file data (no metadata) to storage (stub)
+        75 => 0,
         // 77: ftruncate(fd, length) — truncate open file to given length
         77 => {
             let pid = crate::proc::current_pid();
@@ -3110,8 +3707,23 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
                     }
                     0
                 }
-                PR_SET_NO_NEW_PRIVS      => 0, // stub: accept
-                PR_GET_NO_NEW_PRIVS      => 0, // not set → 0
+                PR_SET_NO_NEW_PRIVS      => {
+                    if arg2 == 1 {
+                        let pid = crate::proc::current_pid();
+                        let mut procs = crate::proc::PROCESS_TABLE.lock();
+                        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                            p.no_new_privs = true;
+                        }
+                    }
+                    0
+                }
+                PR_GET_NO_NEW_PRIVS      => {
+                    let pid = crate::proc::current_pid();
+                    let procs = crate::proc::PROCESS_TABLE.lock();
+                    procs.iter().find(|p| p.pid == pid)
+                        .map(|p| if p.no_new_privs { 1i64 } else { 0i64 })
+                        .unwrap_or(0)
+                }
                 PR_SET_SECCOMP           => 0, // stub: accept any seccomp mode
                 PR_GET_SECCOMP           => 0, // SECCOMP_MODE_DISABLED
                 PR_SET_KEEPCAPS          => 0,
@@ -3122,6 +3734,8 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
         }
         // 186: gettid — return current kernel thread ID
         186 => crate::proc::current_tid() as i64,
+        // 187: readahead(fd, offset, count) — pre-cache pages; no page cache, return success
+        187 => 0,
         // 203: sched_setaffinity(pid, cpusetsize, mask) — stub (accept any)
         203 => 0,
         // 204: sched_getaffinity(pid, cpusetsize, mask) — report CPU 0 only
@@ -3215,8 +3829,61 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
         131 => 0,
         // 158: arch_prctl(code, addr)
         158 => sys_arch_prctl(arg1, arg2),
-        // 160: setrlimit(resource, rlim) — stub
-        160 => 0,
+        // 125: capget(_capuser_header_t hdrp, capuser_data_t datap)
+        125 => {
+            // Return all capabilities (root-equivalent) for the calling process.
+            // struct __user_cap_data_struct: effective(u32), permitted(u32), inheritable(u32)
+            // For version 3 (0x20080522), two consecutive structs are expected (64-bit caps).
+            if arg2 != 0 && validate_user_ptr(arg2, 24) {
+                let pid = crate::proc::current_pid();
+                let procs = crate::proc::PROCESS_TABLE.lock();
+                let (eff, perm) = procs.iter().find(|p| p.pid == pid)
+                    .map(|p| (p.cap_effective as u32, p.cap_permitted as u32))
+                    .unwrap_or((!0u32, !0u32));
+                drop(procs);
+                unsafe {
+                    let p = arg2 as *mut u32;
+                    // struct 0: effective, permitted, inheritable
+                    core::ptr::write_unaligned(p,         eff);
+                    core::ptr::write_unaligned(p.add(1),  perm);
+                    core::ptr::write_unaligned(p.add(2),  0u32); // inheritable
+                    // struct 1: upper 32 bits (always 0 for us)
+                    core::ptr::write_unaligned(p.add(3),  0u32);
+                    core::ptr::write_unaligned(p.add(4),  0u32);
+                    core::ptr::write_unaligned(p.add(5),  0u32);
+                }
+            }
+            0
+        }
+        // 126: capset(_capuser_header_t hdrp, const capuser_data_t datap)
+        126 => {
+            // Accept capability drops; update effective/permitted in PCB.
+            if arg2 != 0 && validate_user_ptr(arg2, 12) {
+                let pid = crate::proc::current_pid();
+                let mut procs = crate::proc::PROCESS_TABLE.lock();
+                if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                    let dp = arg2 as *const u32;
+                    let eff  = unsafe { core::ptr::read_unaligned(dp) };
+                    let perm = unsafe { core::ptr::read_unaligned(dp.add(1)) };
+                    p.cap_effective  = eff  as u64;
+                    p.cap_permitted  = perm as u64;
+                }
+            }
+            0
+        }
+        // 160: setrlimit(resource, rlim) — update per-process soft limit
+        160 => {
+            let resource = arg1 as usize;
+            if resource >= 16 { return -22; } // EINVAL
+            if !validate_user_ptr(arg2, 16) { return -14; } // EFAULT
+            let soft = unsafe { core::ptr::read_unaligned(arg2 as *const u64) };
+            let pid = crate::proc::current_pid();
+            let mut procs = crate::proc::PROCESS_TABLE.lock();
+            if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                p.rlimits_soft[resource] = soft;
+            }
+            0
+        }
         // 202: futex(uaddr, futex_op, val, ...)
         202 => sys_futex_linux(arg1, arg2, arg3, arg4, arg5),
         // 217: getdents64(fd, dirp, count)
@@ -3269,13 +3936,22 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
         // 262: newfstatat(dirfd, pathname, statbuf, flags)
         262 => sys_newfstatat(arg1, arg2, arg3, arg4),
         // 302: prlimit64(pid, resource, new_limit, old_limit)
-        // For GET (new_limit == NULL): fill old_limit with current limits.
         302 => {
-            if arg3 == 0 && arg4 != 0 {
-                sys_getrlimit(arg2, arg4) // GET: fill old_limit
-            } else {
-                0 // SET: accept silently
+            // GET old limit if requested
+            if arg4 != 0 {
+                let r = sys_getrlimit(arg2, arg4);
+                if r < 0 { return r; }
             }
+            // SET new limit if provided
+            if arg3 != 0 && (arg2 as usize) < 16 && validate_user_ptr(arg3, 16) {
+                let soft = unsafe { core::ptr::read_unaligned(arg3 as *const u64) };
+                let pid  = crate::proc::current_pid();
+                let mut procs = crate::proc::PROCESS_TABLE.lock();
+                if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                    p.rlimits_soft[arg2 as usize] = soft;
+                }
+            }
+            0
         }
         // 318: getrandom(buf, buflen, flags)
         318 => sys_getrandom(arg1 as *mut u8, arg2 as usize),
@@ -3308,9 +3984,13 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
         // 293: pipe2(pipefd, flags) — like pipe but with O_CLOEXEC/O_NONBLOCK
         293 => sys_pipe2_linux(arg1 as *mut u32, arg2 as u32),
         // 435: clone3(clone_args *args, size_t size)
-        // Extract flags and stack from the clone_args struct and forward to clone.
-        // clone_args layout: flags(u64), pidfd(u64), child_tid(u64), parent_tid(u64),
-        //                    exit_signal(u64), stack(u64), stack_size(u64), tls(u64), ...
+        // clone_args layout (offsets in bytes):
+        //   0:  flags(u64), 8: pidfd(u64), 16: child_tid(u64), 24: parent_tid(u64),
+        //   32: exit_signal(u64), 40: stack(u64), 48: stack_size(u64), 56: tls(u64)
+        //
+        // glibc 2.34+ __clone3_wrapper passes thread fn in rdx (arg3) and thread arg
+        // in r8 (arg5) through the syscall; the child does:  mov rdi, r8; call *rdx.
+        // We must preserve these into the new thread's registers via user_entry_rdx/r8.
         435 => {
             if arg2 < 56 || arg1 == 0 { return -22i64; } // EINVAL: struct too small
             let clone_flags   = unsafe { *(arg1 as *const u64) };
@@ -3319,15 +3999,63 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
             let tls           = unsafe { *((arg1 + 56) as *const u64) };
             let child_tidptr  = unsafe { *((arg1 + 16) as *const u64) };
             let parent_tidptr = unsafe { *((arg1 + 24) as *const u64) };
-            // stack_ptr points to base; add stack_size to get the top (stack grows down).
             let sp = if stack_ptr != 0 { stack_ptr + stack_size } else { 0 };
-            dispatch_linux(56, clone_flags, sp, parent_tidptr, child_tidptr, tls, 0)
+            const CLONE_THREAD: u64 = 0x00010000;
+            const CLONE_VM:     u64 = 0x00000100;
+            const CLONE_SETTLS: u64 = 0x00080000;
+            if clone_flags & CLONE_THREAD != 0 && clone_flags & CLONE_VM != 0 {
+                // pthread_create via clone3: glibc passes func in rdx (arg3), arg in r8 (arg5).
+                let func       = arg3; // Linux rdx = thread function
+                let thread_arg = arg5; // Linux r8  = thread argument (glibc's saved rcx)
+                let user_rip   = unsafe { get_user_rip() };
+                let tls_val    = if clone_flags & CLONE_SETTLS != 0 { tls } else { 0 };
+                let pid        = crate::proc::current_pid();
+                crate::serial_println!(
+                    "[CLONE3] CLONE_THREAD pid={} rip={:#x} sp={:#x} tls={:#x} func={:#x} arg={:#x}",
+                    pid, user_rip, sp, tls_val, func, thread_arg
+                );
+                match crate::proc::usermode::create_user_thread(pid, user_rip, sp, tls_val, func, thread_arg) {
+                    Some(tid) => {
+                        crate::serial_println!("[CLONE3] Thread TID {} spawned in PID {}", tid, pid);
+
+                        // CLONE_CHILD_SETTID: write the child TID into the child's TLS/TCB.
+                        // glibc's pthread_create sets this so that the TCB's `tid` field is
+                        // populated — required for pthread_rwlock, pthread_mutex, etc. which
+                        // read THREAD_GETMEM(THREAD_SELF, tid).  Without this, the tid field
+                        // is 0 and glibc's rwlock returns EDEADLK (0 == __cur_writer's 0).
+                        const CLONE_CHILD_SETTID: u64 = 0x01000000;
+                        if clone_flags & CLONE_CHILD_SETTID != 0 && child_tidptr != 0 {
+                            unsafe { write_u32_to_user_current(child_tidptr, tid as u32); }
+                        }
+
+                        // CLONE_PARENT_SETTID: write child TID into parent's address space.
+                        const CLONE_PARENT_SETTID: u64 = 0x00100000;
+                        if clone_flags & CLONE_PARENT_SETTID != 0 && parent_tidptr != 0 {
+                            unsafe { write_u32_to_user_current(parent_tidptr, tid as u32); }
+                        }
+
+                        // CLONE_CHILD_CLEARTID: store address for futex wake on thread exit.
+                        const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
+                        if clone_flags & CLONE_CHILD_CLEARTID != 0 && child_tidptr != 0 {
+                            let mut threads = crate::proc::THREAD_TABLE.lock();
+                            if let Some(t) = threads.iter_mut().find(|t| t.tid == tid as u64) {
+                                t.clear_child_tid = child_tidptr;
+                            }
+                        }
+
+                        tid as i64
+                    }
+                    None => -11, // EAGAIN
+                }
+            } else {
+                dispatch_linux(56, clone_flags, sp, parent_tidptr, child_tidptr, tls, 0)
+            }
         }
 
         // ─── Phase 7: Firefox dependency syscalls ─────────────────────────
 
-        // 28: madvise(addr, len, advice) — memory hint; always succeeds
-        28 => 0,
+        // 28: madvise(addr, len, advice)
+        28 => sys_madvise(arg1, arg2, arg3),
         // 73: flock(fd, operation) — advisory file locking; stub success
         73 => 0,
         // 98: getrusage(who, usage) — resource usage; return zeroed struct
@@ -3429,10 +4157,12 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
         }
         // 283: timerfd_create(clockid, flags)
         283 => sys_timerfd_create(arg1 as u32),
+        // 286: timerfd_settime(fd, flags, new_value, old_value)
+        286 => sys_timerfd_settime(arg1, arg2 as u32, arg3, arg4),
         // 287: timerfd_gettime(fd, curr_value)
         287 => sys_timerfd_gettime(arg1, arg2),
-        // 288: timerfd_settime(fd, flags, new_value, old_value)
-        288 => sys_timerfd_settime(arg1, arg2 as u32, arg3, arg4),
+        // 288: accept4(sockfd, addr, addrlen, flags) — delegate to accept(43)
+        288 => dispatch_linux(43, arg1, arg2, arg3, 0, 0, 0),
         // 289: signalfd4(fd, mask, sizemask, flags)
         289 => sys_signalfd4(arg1, arg2, arg3, arg4 as u32),
         // 253: inotify_add_watch(fd, pathname, mask)
@@ -3477,26 +4207,61 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
         94 => 0,
         // 97: getrlimit(resource, rlim)
         97 => sys_getrlimit(arg1, arg2),
-        // 109: setpgid(pid, pgid) — stub success
-        109 => 0,
-        // 111: getpgrp()
-        111 => crate::proc::current_pid() as i64,
-        // 112: setsid() — stub: act as new session leader, return PID
-        112 => crate::proc::current_pid() as i64,
-        // 121: getpgid(pid)
-        121 => {
-            if arg1 == 0 { crate::proc::current_pid() as i64 }
-            else { arg1 as i64 } // stub: process's group == itself
+        // 109: setpgid(pid, pgid) — real: update pgid in PCB
+        109 => {
+            let target = if arg1 == 0 { crate::proc::current_pid() } else { arg1 };
+            let new_pgid = if arg2 == 0 { target as u32 } else { arg2 as u32 };
+            let mut procs = crate::proc::PROCESS_TABLE.lock();
+            match procs.iter_mut().find(|p| p.pid == target) {
+                Some(p) => { p.pgid = new_pgid; 0 }
+                None    => -3, // ESRCH
+            }
         }
-        // 122: getsid(pid) — return session id (stub: return pid itself)
+        // 111: getpgrp() — return caller's pgid
+        111 => {
+            let pid = crate::proc::current_pid();
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            procs.iter().find(|p| p.pid == pid).map(|p| p.pgid as i64).unwrap_or(pid as i64)
+        }
+        // 112: setsid() — become session leader with new sid/pgid
+        112 => {
+            let pid = crate::proc::current_pid();
+            let mut procs = crate::proc::PROCESS_TABLE.lock();
+            if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                p.pgid = pid as u32;
+                p.sid  = pid as u32;
+            }
+            pid as i64
+        }
+        // 121: getpgid(pid) — return pgid of target (0 = caller)
+        121 => {
+            let target = if arg1 == 0 { crate::proc::current_pid() } else { arg1 };
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            procs.iter().find(|p| p.pid == target).map(|p| p.pgid as i64).unwrap_or(-3)
+        }
+        // 122: getsid(pid) — return session id
         122 => {
-            if arg1 == 0 { crate::proc::current_pid() as i64 }
-            else { arg1 as i64 }
+            let target = if arg1 == 0 { crate::proc::current_pid() } else { arg1 };
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            procs.iter().find(|p| p.pid == target).map(|p| p.sid as i64).unwrap_or(-3)
         }
         // 230: clock_nanosleep(clockid, flags, req, rem)
         230 => sys_nanosleep_linux(arg3, arg4),
         // 292: dup3(oldfd, newfd, flags) — like dup2 + optional O_CLOEXEC
-        292 => sys_dup2(arg1 as usize, arg2 as usize),
+        292 => {
+            let ret = sys_dup2(arg1 as usize, arg2 as usize);
+            if ret >= 0 && (arg3 & 0x0008_0000) != 0 {
+                // O_CLOEXEC: set cloexec on the new fd
+                let pid = crate::proc::current_pid();
+                let mut procs = crate::proc::PROCESS_TABLE.lock();
+                if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
+                    if let Some(Some(f)) = proc.file_descriptors.get_mut(arg2 as usize) {
+                        f.cloexec = true;
+                    }
+                }
+            }
+            ret
+        }
         // 332: statx(dirfd, pathname, flags, mask, statxbuf) — extended stat
         332 => {
             // Simplified: delegate to stat, then fill statx fields
@@ -3647,6 +4412,33 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
             }
             0
         }
+        // 149: mlock(addr, len)   — no-op (no swapping in AstryxOS)
+        149 => 0,
+        // 150: munlock(addr, len) — no-op
+        150 => 0,
+        // 151: mlockall(flags)    — no-op
+        151 => 0,
+        // 152: munlockall()       — no-op
+        152 => 0,
+        // 322: execveat(dirfd, path, argv, envp, flags)
+        322 => {
+            // If path is empty and AT_EMPTY_PATH (0x1000) set, exec fd directly — unsupported
+            let path_bytes = read_cstring_from_user(arg2);
+            let path_str   = core::str::from_utf8(path_bytes).unwrap_or("");
+            if path_str.is_empty() {
+                return -38; // ENOSYS — fd-based execveat not supported
+            }
+            // Otherwise delegate to execve (59) ignoring dirfd (absolute path required)
+            dispatch_linux(59, arg2, arg3, arg4, 0, 0, 0)
+        }
+        // 326: copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)
+        // Delegate to sendfile (40); arg1=fd_in, arg3=fd_out, arg2=off_in, arg5=len
+        326 => sys_sendfile(arg3 as usize, arg1 as usize, arg2, arg5 as usize),
+        // 424: pidfd_send_signal — ENOSYS
+        424 => -38,
+        // 443-445: landlock_* — ENOSYS
+        443 | 444 | 445 => -38,
+
         // Explicit ENOSYS for syscalls that would silently fail otherwise
         // (give the process a chance to fall back rather than misinterpreting 0)
         210 | 211 | 214 | 215 | 216 | 237 | 255 => -38, // ENOSYS
@@ -3695,29 +4487,26 @@ fn sys_nanosleep_linux(req_ptr: u64, _rem_ptr: u64) -> i64 {
 fn sys_getrlimit(resource: u64, rlim_ptr: u64) -> i64 {
     if !validate_user_ptr(rlim_ptr, 16) { return -14; } // EFAULT
     const RLIM_INFINITY: u64 = u64::MAX;
-    let (cur, max): (u64, u64) = match resource {
-        0  => (RLIM_INFINITY,   RLIM_INFINITY), // RLIMIT_CPU
-        1  => (RLIM_INFINITY,   RLIM_INFINITY), // RLIMIT_FSIZE
-        2  => (RLIM_INFINITY,   RLIM_INFINITY), // RLIMIT_DATA
-        3  => (8 * 1024 * 1024, RLIM_INFINITY), // RLIMIT_STACK (8 MiB soft)
-        4  => (RLIM_INFINITY,   RLIM_INFINITY), // RLIMIT_CORE
-        5  => (RLIM_INFINITY,   RLIM_INFINITY), // RLIMIT_RSS
-        6  => (1024,            RLIM_INFINITY), // RLIMIT_NPROC
-        7  => (1024,            65536),         // RLIMIT_NOFILE
-        8  => (RLIM_INFINITY,   RLIM_INFINITY), // RLIMIT_MEMLOCK
-        9  => (RLIM_INFINITY,   RLIM_INFINITY), // RLIMIT_AS (address space)
-        10 => (RLIM_INFINITY,   RLIM_INFINITY), // RLIMIT_LOCKS
-        11 => (0,               0),             // RLIMIT_SIGPENDING
-        12 => (RLIM_INFINITY,   RLIM_INFINITY), // RLIMIT_MSGQUEUE
-        13 => (0,               0),             // RLIMIT_NICE
-        14 => (0,               0),             // RLIMIT_RTPRIO
-        15 => (RLIM_INFINITY,   RLIM_INFINITY), // RLIMIT_RTTIME
-        _  => (RLIM_INFINITY,   RLIM_INFINITY),
+    // Hard limits (max) are fixed; soft limits come from per-process rlimits_soft.
+    let hard: u64 = match resource {
+        3  => RLIM_INFINITY,        // RLIMIT_STACK hard = unlimited
+        7  => 65536,                // RLIMIT_NOFILE hard
+        _  => RLIM_INFINITY,
+    };
+    // Read per-process soft limit.
+    let soft = if resource < 16 {
+        let pid = crate::proc::current_pid();
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid)
+            .map(|p| p.rlimits_soft[resource as usize])
+            .unwrap_or(RLIM_INFINITY)
+    } else {
+        RLIM_INFINITY
     };
     unsafe {
         let p = rlim_ptr as *mut u64;
-        core::ptr::write_unaligned(p,        cur);
-        core::ptr::write_unaligned(p.add(1), max);
+        core::ptr::write_unaligned(p,        soft);
+        core::ptr::write_unaligned(p.add(1), hard);
     }
     0
 }
@@ -3785,17 +4574,86 @@ fn sys_select_linux(
         }
     }
 
-    // If nothing ready and timeout != 0, yield once so other threads run.
+    let do_rescan = |ready: &mut i64| {
+        *ready = 0;
+        for fd in 0..nfds {
+            let byte_off = (fd / 8) as u64;
+            let bit      = 1u8 << (fd % 8);
+            let r_req = readfds != 0
+                && validate_user_ptr(readfds + byte_off, 1)
+                && unsafe { *((readfds + byte_off) as *const u8) & bit != 0 };
+            let w_req = writefds != 0
+                && validate_user_ptr(writefds + byte_off, 1)
+                && unsafe { *((writefds + byte_off) as *const u8) & bit != 0 };
+            if !r_req && !w_req { continue; }
+            let revents = poll_revents(pid, fd, if r_req { 0x0001 } else { 0x0004 });
+            if r_req && revents & 0x0001 != 0 { *ready += 1; }
+            else if r_req { unsafe { *((readfds + byte_off) as *mut u8) &= !bit; } }
+            if w_req && revents & 0x0004 != 0 { *ready += 1; }
+            else if w_req { unsafe { *((writefds + byte_off) as *mut u8) &= !bit; } }
+        }
+    };
+
     if ready == 0 {
-        let non_zero_timeout = timeout != 0 && {
-            validate_user_ptr(timeout, 8)
-            && unsafe { *(timeout as *const i64) != 0 }
-        };
-        if non_zero_timeout || timeout != 0 {
+        // SMP fix: pump x11 once, then retry up to 64 times yielding each iteration
+        // to give CPU 0's desktop loop time to finish writing replies.
+        let non_zero_timeout = timeout != 0;
+        crate::x11::poll();
+        for _ in 0..64 {
             crate::sched::yield_cpu();
+            do_rescan(&mut ready);
+            if ready > 0 || !non_zero_timeout { break; }
         }
     }
     ready
+}
+
+/// madvise(addr, len, advice) — memory usage hint.
+///
+/// MADV_DONTNEED (4) and MADV_FREE (8): free physical pages in range so the
+/// next access re-allocates a zero-filled page. All other values are no-ops.
+fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
+    const MADV_DONTNEED: u64 = 4;
+    const MADV_FREE:     u64 = 8;
+    if advice != MADV_DONTNEED && advice != MADV_FREE { return 0; }
+    if len == 0 { return 0; }
+
+    let pid = crate::proc::current_pid();
+    let start = addr & !0xFFF;
+    let end   = (addr + len + 0xFFF) & !0xFFF;
+
+    let cr3_opt = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid)
+            .and_then(|p| p.vm_space.as_ref())
+            .map(|vs| vs.cr3)
+    };
+    let cr3 = match cr3_opt { Some(c) => c, None => return 0 };
+
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    let mut page = start;
+    while page < end {
+        let pte = crate::mm::vmm::read_pte(cr3, page);
+        if pte & 1 != 0 {
+            // Present — free the physical page.
+            let phys = pte & 0x000F_FFFF_FFFF_F000;
+            // Zero-out and unmap; next access demand-pages a fresh zeroed page.
+            unsafe {
+                core::ptr::write_bytes((PHYS_OFF + phys) as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
+            }
+            crate::mm::vmm::write_pte(cr3, page, 0);
+            crate::mm::vmm::invlpg(page);
+            let rc = crate::mm::refcount::page_ref_count(phys);
+            if rc <= 1 {
+                crate::mm::refcount::page_ref_set(phys, 0);
+                crate::mm::pmm::free_page(phys);
+            } else {
+                crate::mm::refcount::page_ref_dec(phys);
+            }
+        }
+        page += crate::mm::pmm::PAGE_SIZE as u64;
+    }
+    0
 }
 
 /// mremap(old_addr, old_size, new_size, flags, [new_addr])
@@ -3871,8 +4729,15 @@ fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
         };
     } else if is_unix_socket_fd(pid, fd as usize) {
         let unix_id = get_unix_socket_id(pid, fd as usize);
+        let avail = crate::net::unix::bytes_available(unix_id);
         let buf_sl = unsafe { core::slice::from_raw_parts_mut(buf_ptr, count) };
-        return crate::net::unix::read(unix_id, buf_sl);
+        let ret = crate::net::unix::read(unix_id, buf_sl);
+        #[cfg(feature = "firefox-test")]
+        if pid >= 1 {
+            crate::serial_println!("[XSOCK] read fd={} uid={} want={} avail={} got={}",
+                fd, unix_id, count, avail, ret);
+        }
+        return ret;
     } else if is_socket_fd(pid, fd as usize) {
         let socket_id = get_socket_id(pid, fd as usize);
         return match crate::net::socket::socket_recv(socket_id) {
@@ -3955,6 +4820,16 @@ fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
 
     if count == 0 { return 0; }
 
+    #[cfg(feature = "firefox-test")]
+    if fd == 2 {
+        let pid = crate::proc::current_pid();
+        if pid >= 1 {
+            let slice = unsafe { core::slice::from_raw_parts(buf_ptr, count.min(512)) };
+            let s = core::str::from_utf8(slice).unwrap_or("<binary>");
+            crate::serial_println!("[FF/stderr] pid={} {:?}", pid, s);
+        }
+    }
+
     // ── Special fd types take priority over the fd-number shortcuts ─────────
     // Must check these BEFORE the `fd == 1/2` stdout/stderr branch because
     // kernel tests and user processes may allocate pipe/socket/eventfd at fd 1.
@@ -4009,6 +4884,8 @@ fn sys_open_linux(pathname: u64, flags: u64, _mode: u64) -> i64 {
         Err(_) => return -22,
     };
     let pid = crate::proc::current_pid();
+    #[cfg(feature = "firefox-test")]
+    crate::serial_println!("[FF/open] pid={} path={}", pid, path);
 
     // Refresh /proc/self/maps with dynamic per-process VMA content before opening.
     if path == "/proc/self/maps" {
@@ -4017,6 +4894,43 @@ fn sys_open_linux(pathname: u64, flags: u64, _mode: u64) -> i64 {
     // Refresh /proc/self/status with live PID, PPID, FDSize, VmRSS.
     if path == "/proc/self/status" {
         refresh_proc_status(pid);
+    }
+
+    // ── PTY: /dev/ptmx → allocate pair, return master fd ─────────────────
+    if path == "/dev/ptmx" {
+        return match crate::drivers::pty::alloc() {
+            Some(pty_n) => {
+                let fd = crate::vfs::FileDescriptor::pty_master(pty_n);
+                let mut procs = crate::proc::PROCESS_TABLE.lock();
+                if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                    let slot = p.file_descriptors.iter().position(|s| s.is_none()).unwrap_or_else(|| {
+                        p.file_descriptors.push(None);
+                        p.file_descriptors.len() - 1
+                    });
+                    p.file_descriptors[slot] = Some(fd);
+                    slot as i64
+                } else {
+                    -22
+                }
+            }
+            None => -24, // EMFILE
+        };
+    }
+    // ── PTY: /dev/pts/N → return slave fd ────────────────────────────────
+    if path.starts_with("/dev/pts/") {
+        if let Ok(n) = path["/dev/pts/".len()..].parse::<u8>() {
+            let fd = crate::vfs::FileDescriptor::pty_slave(n);
+            let mut procs = crate::proc::PROCESS_TABLE.lock();
+            if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                let slot = p.file_descriptors.iter().position(|s| s.is_none()).unwrap_or_else(|| {
+                    p.file_descriptors.push(None);
+                    p.file_descriptors.len() - 1
+                });
+                p.file_descriptors[slot] = Some(fd);
+                return slot as i64;
+            }
+        }
+        return -2; // ENOENT
     }
 
     match crate::vfs::open(pid, path, flags as u32) {
@@ -4224,6 +5138,7 @@ fn fill_linux_stat(buf: *mut u8, st: &crate::vfs::FileStat) {
         crate::vfs::FileType::EventFd     => 0o010000 | st.permissions, // FIFO
         crate::vfs::FileType::TimerFd | crate::vfs::FileType::SignalFd |
         crate::vfs::FileType::InotifyFd  => 0o010000 | st.permissions, // FIFO
+        crate::vfs::FileType::PtyMaster | crate::vfs::FileType::PtySlave => 0o020000 | 0o666, // S_IFCHR
         crate::vfs::FileType::Socket      => 0o140000 | st.permissions, // S_IFSOCK
     };
     out[24..28].copy_from_slice(&mode.to_le_bytes());
@@ -4295,23 +5210,44 @@ pub fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
 }
 
 /// set_tid_address(tidptr) — Store clear_child_tid pointer, return current TID.
+/// glibc calls this during thread startup to register the address that should
+/// be written to 0 and futex-woken when the thread exits (CLONE_CHILD_CLEARTID).
 pub fn sys_set_tid_address(tidptr: u64) -> i64 {
-    let _ = tidptr; // Store for future use (CLONE_CHILD_CLEARTID)
-    crate::proc::current_tid() as i64
+    let tid = crate::proc::current_tid();
+    if tidptr != 0 {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+            t.clear_child_tid = tidptr;
+        }
+    }
+    tid as i64
 }
 
 /// clock_gettime(clockid, tp) — Get time from a clock.
 ///
 /// tp points to a struct timespec { u64 tv_sec, u64 tv_nsec }.
+/// CLOCK_REALTIME (0): wall-clock time from CMOS RTC + PIT sub-second.
+/// CLOCK_MONOTONIC (1) and others: monotonic PIT ticks since boot.
 pub fn sys_clock_gettime(clk_id: u64, tp: u64) -> i64 {
-    let _ = clk_id; // CLOCK_REALTIME=0, CLOCK_MONOTONIC=1 — treat the same
+    const CLOCK_REALTIME:  u64 = 0;
+    const CLOCK_MONOTONIC: u64 = 1;
     if tp == 0 {
         return -22; // EINVAL
     }
     let ticks = crate::arch::x86_64::irq::get_ticks();
-    // Assuming ~100 Hz timer (PIT default configuration)
-    let secs = ticks / 100;
-    let nsecs = (ticks % 100) * 10_000_000; // 10ms per tick
+    let (secs, nsecs) = if clk_id == CLOCK_REALTIME {
+        // Read wall-clock seconds from CMOS RTC; add sub-second from PIT.
+        let wall_secs = crate::drivers::rtc::read_unix_time();
+        let sub_nsecs = (ticks % 100) * 10_000_000u64; // 10 ms per PIT tick
+        (wall_secs, sub_nsecs)
+    } else {
+        // CLOCK_MONOTONIC / CLOCK_MONOTONIC_RAW / CLOCK_PROCESS_CPUTIME_ID etc.
+        // All return PIT-tick-based monotonic time.
+        let s = ticks / 100;
+        let ns = (ticks % 100) * 10_000_000u64;
+        (s, ns)
+    };
+    let _ = CLOCK_MONOTONIC; // suppress unused warning
     let buf = unsafe { core::slice::from_raw_parts_mut(tp as *mut u8, 16) };
     buf[0..8].copy_from_slice(&secs.to_le_bytes());
     buf[8..16].copy_from_slice(&nsecs.to_le_bytes());
@@ -4354,10 +5290,75 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
     };
     let cr3 = space.cr3;
 
-    // Update VMA prot fields that overlap this range.
-    for vma in space.areas.iter_mut() {
-        if vma.base >= end || vma.end() <= base { continue; }
-        vma.prot = prot;
+    // Update VMA prot fields that overlap this range, splitting VMAs as needed
+    // so that only the exact [base, end) portion gets the new prot.
+    let new_prot = prot;
+    let mut i = 0;
+    while i < space.areas.len() {
+        let vma_base = space.areas[i].base;
+        let vma_end  = space.areas[i].end();
+        let old_prot = space.areas[i].prot;
+        let flags    = space.areas[i].flags;
+        let backing  = space.areas[i].backing.clone();
+        let name     = space.areas[i].name;
+
+        // No overlap — skip
+        if vma_end <= base || vma_base >= end {
+            i += 1;
+            continue;
+        }
+
+        // Fully covered — just update in place, no split
+        if vma_base >= base && vma_end <= end {
+            space.areas[i].prot = new_prot;
+            i += 1;
+            continue;
+        }
+
+        // Partial overlap — remove and re-insert as up to 3 pieces.
+        // CRITICAL: for file-backed VMAs, each split piece must have its
+        // file offset adjusted by (piece.base - original_vma_base) so that
+        // demand-paging reads from the correct file position.
+        space.areas.remove(i);
+        let overlap_start = vma_base.max(base);
+        let overlap_end   = vma_end.min(end);
+
+        // Helper: adjust file offset in backing for a split piece
+        let adjust_backing = |b: &crate::mm::vma::VmBacking, piece_base: u64| -> crate::mm::vma::VmBacking {
+            match b {
+                crate::mm::vma::VmBacking::File { mount_idx, inode, offset } => {
+                    crate::mm::vma::VmBacking::File {
+                        mount_idx: *mount_idx,
+                        inode: *inode,
+                        offset: offset + (piece_base - vma_base),
+                    }
+                }
+                other => other.clone(),
+            }
+        };
+
+        let mut pieces: alloc::vec::Vec<crate::mm::vma::VmArea> = alloc::vec::Vec::new();
+        if vma_base < base {
+            pieces.push(crate::mm::vma::VmArea {
+                base: vma_base, length: base - vma_base,
+                prot: old_prot, flags, backing: adjust_backing(&backing, vma_base), name,
+            });
+        }
+        pieces.push(crate::mm::vma::VmArea {
+            base: overlap_start, length: overlap_end - overlap_start,
+            prot: new_prot, flags, backing: adjust_backing(&backing, overlap_start), name,
+        });
+        if vma_end > end {
+            pieces.push(crate::mm::vma::VmArea {
+                base: end, length: vma_end - end,
+                prot: old_prot, flags, backing: adjust_backing(&backing, end), name,
+            });
+        }
+        let n = pieces.len();
+        for piece in pieces.into_iter().rev() {
+            space.areas.insert(i, piece);
+        }
+        i += n;
     }
 
     // Walk every page and retag PTEs.
@@ -4402,21 +5403,248 @@ pub fn sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64 {
     total
 }
 
+/// readv(fd, iov, iovcnt) — Scatter-gather read.
+///
+/// Reads from `fd` into multiple buffers described by the iovec array.
+/// struct iovec { void *iov_base; size_t iov_len; } = [u64; 2] on x86_64.
+fn sys_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64 {
+    if iovcnt == 0 { return 0; }
+    let iovecs = unsafe {
+        core::slice::from_raw_parts(iov_ptr as *const [u64; 2], iovcnt as usize)
+    };
+    let mut total = 0i64;
+    for iov in iovecs {
+        let base = iov[0];
+        let len = iov[1] as usize;
+        if len == 0 { continue; }
+        let result = sys_read_linux(fd, base, len as u64);
+        if result < 0 { return if total > 0 { total } else { result }; }
+        total += result;
+        if (result as usize) < len { break; } // short read — stop
+    }
+    total
+}
+
 /// fcntl(fd, cmd, arg) — File descriptor control.
-fn sys_fcntl(fd: u64, cmd: u64, _arg: u64) -> i64 {
-    const F_DUPFD: u64 = 0;
-    const F_GETFD: u64 = 1;
-    const F_SETFD: u64 = 2;
-    const F_GETFL: u64 = 3;
-    const F_SETFL: u64 = 4;
+fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> i64 {
+    const F_DUPFD:    u64 = 0;
+    const F_GETFD:    u64 = 1;
+    const F_SETFD:    u64 = 2;
+    const F_GETFL:    u64 = 3;
+    const F_SETFL:    u64 = 4;
+    const F_GETLK:    u64 = 5;
+    const F_SETLK:    u64 = 6;
+    const F_SETLKW:   u64 = 7;
+    const F_DUPFD_CLOEXEC: u64 = 1030;
+    const FD_CLOEXEC: u64 = 1;
+    // struct flock (x86_64): l_type(i16@0), l_whence(i16@2), l_start(i64@8), l_len(i64@16), l_pid(i32@24)
+    const F_RDLCK: i16 = 0;
+    const F_WRLCK: i16 = 1;
+    const F_UNLCK: i16 = 2;
+    let pid = crate::proc::current_pid();
     match cmd {
+        F_GETLK | F_SETLK | F_SETLKW => {
+            if arg == 0 { return -22; } // EINVAL: null flock pointer
+            let l_type  = unsafe { *(arg as *const i16) };
+            let l_start = unsafe { *((arg + 8)  as *const i64) } as u64;
+            let l_len   = unsafe { *((arg + 16) as *const i64) } as u64;
+
+            // Get fd's backing (mount_idx, inode).
+            let (mount_idx, inode) = {
+                let procs = crate::proc::PROCESS_TABLE.lock();
+                match procs.iter().find(|p| p.pid == pid)
+                    .and_then(|p| p.file_descriptors.get(fd as usize)?.as_ref())
+                {
+                    Some(f) if !f.is_console => (f.mount_idx, f.inode),
+                    _ => return -9, // EBADF
+                }
+            };
+
+            if cmd == F_GETLK {
+                let locks = crate::vfs::FILE_LOCKS.lock();
+                let conflict = locks.iter().find(|l| {
+                    l.mount_idx == mount_idx && l.inode == inode && l.pid != pid
+                        && (l_type == F_WRLCK || l.lock_type == F_WRLCK)
+                });
+                if let Some(lk) = conflict {
+                    unsafe {
+                        *(arg as *mut i16)        = lk.lock_type;
+                        *((arg + 8)  as *mut i64) = lk.start as i64;
+                        *((arg + 16) as *mut i64) = lk.end as i64;
+                        *((arg + 24) as *mut i32) = lk.pid as i32;
+                    }
+                } else {
+                    unsafe { *(arg as *mut i16) = F_UNLCK; }
+                }
+                return 0;
+            }
+
+            // F_SETLK / F_SETLKW — acquire or release.
+            if l_type == F_UNLCK {
+                crate::vfs::FILE_LOCKS.lock().retain(|l| {
+                    !(l.mount_idx == mount_idx && l.inode == inode && l.pid == pid)
+                });
+                return 0;
+            }
+            // Check for conflict (we don't block for F_SETLKW — return EAGAIN).
+            {
+                let locks = crate::vfs::FILE_LOCKS.lock();
+                if locks.iter().any(|l| {
+                    l.mount_idx == mount_idx && l.inode == inode && l.pid != pid
+                        && (l_type == F_WRLCK || l.lock_type == F_WRLCK)
+                }) {
+                    return -11; // EAGAIN
+                }
+            }
+            let mut locks = crate::vfs::FILE_LOCKS.lock();
+            locks.retain(|l| !(l.mount_idx == mount_idx && l.inode == inode && l.pid == pid));
+            locks.push(crate::vfs::FileLockEntry {
+                mount_idx, inode, pid,
+                start: l_start, end: l_len, lock_type: l_type,
+            });
+            0
+        }
         F_DUPFD => sys_dup(fd as usize),
-        F_GETFD => 0,
-        F_SETFD => 0,
-        F_GETFL => 0o2, // O_RDWR
-        F_SETFL => 0,
+        F_DUPFD_CLOEXEC => {
+            let newfd = sys_dup(fd as usize);
+            if newfd >= 0 {
+                let mut procs = crate::proc::PROCESS_TABLE.lock();
+                if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
+                    if let Some(Some(f)) = proc.file_descriptors.get_mut(newfd as usize) {
+                        f.cloexec = true;
+                    }
+                }
+            }
+            newfd
+        }
+        F_GETFD => {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            if let Some(proc) = procs.iter().find(|p| p.pid == pid) {
+                if let Some(Some(f)) = proc.file_descriptors.get(fd as usize) {
+                    return if f.cloexec { FD_CLOEXEC as i64 } else { 0 };
+                }
+            }
+            -9 // EBADF
+        }
+        F_SETFD => {
+            let mut procs = crate::proc::PROCESS_TABLE.lock();
+            if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
+                if let Some(Some(f)) = proc.file_descriptors.get_mut(fd as usize) {
+                    f.cloexec = (arg & FD_CLOEXEC) != 0;
+                    return 0;
+                }
+            }
+            -9 // EBADF
+        }
+        F_GETFL => {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            if let Some(proc) = procs.iter().find(|p| p.pid == pid) {
+                if let Some(Some(f)) = proc.file_descriptors.get(fd as usize) {
+                    return (f.flags & 0x0FFF) as i64; // return access mode + status flags
+                }
+            }
+            -9 // EBADF
+        }
+        F_SETFL => 0, // ignore flag changes (O_NONBLOCK etc.)
         _ => -22 // EINVAL
     }
+}
+
+/// sendfile(out_fd, in_fd, offset_ptr, count) — Copy data between file descriptors.
+///
+/// If offset_ptr is non-NULL, reads from *offset_ptr rather than in_fd's current
+/// position, and updates *offset_ptr to reflect bytes read (in_fd's offset unchanged).
+/// If offset_ptr is NULL, uses and advances in_fd's current file offset.
+fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: u64, count: usize) -> i64 {
+    if count == 0 { return 0; }
+    let max_chunk: usize = 65536; // send at most 64 KiB at a time
+    let len = count.min(max_chunk);
+    let pid = crate::proc::current_pid();
+
+    // Snapshot in_fd info and the read offset.
+    let (in_mount, in_inode, in_offset_cur) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        let proc = match procs.iter().find(|p| p.pid == pid) {
+            Some(p) => p, None => return -3,
+        };
+        match proc.file_descriptors.get(in_fd).and_then(|f| f.as_ref()) {
+            Some(f) => (f.mount_idx, f.inode, f.offset),
+            None => return -9,
+        }
+    };
+    let read_offset: u64 = if offset_ptr != 0 {
+        unsafe { core::ptr::read_unaligned(offset_ptr as *const u64) }
+    } else {
+        in_offset_cur
+    };
+
+    // Read data from in_fd into a heap buffer.
+    let mut buf: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
+    let n = {
+        let mounts = crate::vfs::MOUNTS.lock();
+        match mounts.get(in_mount) {
+            Some(m) => match m.fs.read(in_inode, read_offset, &mut buf) {
+                Ok(n) => n,
+                Err(_) => return -5,
+            },
+            None => return -9,
+        }
+    };
+    if n == 0 { return 0; }
+    buf.truncate(n);
+
+    // Snapshot out_fd info.
+    let out_info = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        let proc = match procs.iter().find(|p| p.pid == pid) {
+            Some(p) => p, None => return -3,
+        };
+        proc.file_descriptors.get(out_fd).and_then(|f| f.as_ref()).map(|f| {
+            (f.is_console, f.file_type, f.mount_idx, f.inode, f.offset,
+             f.flags & 0x8000_0001)
+        })
+    };
+    let (is_console, file_type, out_mount, out_inode, out_offset, pipe_flags) = match out_info {
+        Some(x) => x, None => return -9,
+    };
+    if is_console {
+        crate::serial_print!("{}", core::str::from_utf8(&buf).unwrap_or("?"));
+    } else if file_type == crate::vfs::FileType::Pipe {
+        if pipe_flags & 1 != 0 {
+            crate::ipc::pipe::pipe_write(out_inode, &buf);
+        } else {
+            return -9;
+        }
+    } else {
+        let mounts = crate::vfs::MOUNTS.lock();
+        match mounts.get(out_mount) {
+            Some(m) => {
+                let _ = m.fs.write(out_inode, out_offset, &buf);
+                drop(mounts);
+                let mut procs = crate::proc::PROCESS_TABLE.lock();
+                if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
+                    if let Some(Some(fd)) = proc.file_descriptors.get_mut(out_fd) {
+                        fd.offset += n as u64;
+                    }
+                }
+            }
+            None => return -9,
+        }
+    }
+
+    // Update the read offset.
+    if offset_ptr != 0 {
+        unsafe { core::ptr::write_unaligned(offset_ptr as *mut u64, read_offset + n as u64); }
+    } else {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
+            if let Some(Some(fd)) = proc.file_descriptors.get_mut(in_fd) {
+                fd.offset += n as u64;
+            }
+        }
+    }
+
+    n as i64
 }
 
 /// access(pathname, mode) — Check user's permissions for a file.
@@ -4515,6 +5743,7 @@ fn sys_getdents64(fd: u64, buf: u64, count: u64) -> i64 {
             crate::vfs::FileType::EventFd     => 1,  // DT_FIFO
             crate::vfs::FileType::TimerFd | crate::vfs::FileType::SignalFd |
             crate::vfs::FileType::InotifyFd  => 1,  // DT_FIFO
+            crate::vfs::FileType::PtyMaster | crate::vfs::FileType::PtySlave => 2, // DT_CHR
             crate::vfs::FileType::Socket      => 12, // DT_SOCK
         };
         // d_name (offset 19)
@@ -5066,6 +6295,7 @@ fn sys_eventfd_linux(initval: u64) -> i64 {
         offset:    0,
         flags:     0x0001_0000, // eventfd marker
         is_console: false,
+        cloexec: false,
         file_type: crate::vfs::FileType::EventFd,
         open_path: alloc::string::String::new(),
     };
@@ -5111,12 +6341,14 @@ fn sys_pipe2_linux(fds_out: *mut u32, flags: u32) -> i64 {
 
     let extra_flags: u32 = flags & (0x0008_0000 | 0x0800); // cloexec | nonblock
 
+    let pipe_cloexec = (extra_flags & 0x0008_0000) != 0;
     let read_fd = crate::vfs::FileDescriptor {
         mount_idx: usize::MAX,
         inode:     pipe_id,
         offset:    0,
         flags:     0x8000_0000 | extra_flags, // read end
         is_console: false,
+        cloexec:   pipe_cloexec,
         file_type: crate::vfs::FileType::Pipe,
         open_path: alloc::string::String::new(),
     };
@@ -5126,6 +6358,7 @@ fn sys_pipe2_linux(fds_out: *mut u32, flags: u32) -> i64 {
         offset:    0,
         flags:     0x8000_0001 | extra_flags, // write end
         is_console: false,
+        cloexec:   pipe_cloexec,
         file_type: crate::vfs::FileType::Pipe,
         open_path: alloc::string::String::new(),
     };
@@ -5443,6 +6676,12 @@ fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
         Some((_inode, _flags, false, false, crate::vfs::FileType::InotifyFd)) => {
             0 // stub: never delivers events
         }
+        Some((inode, _flags, false, false, crate::vfs::FileType::PtyMaster)) => {
+            if crate::drivers::pty::master_readable(inode as u8) { EPOLLIN | EPOLLOUT } else { EPOLLOUT }
+        }
+        Some((inode, _flags, false, false, crate::vfs::FileType::PtySlave)) => {
+            if crate::drivers::pty::slave_readable(inode as u8) { EPOLLIN | EPOLLOUT } else { EPOLLOUT }
+        }
         Some((inode, flags, false, false, _)) => {
             if flags & 0x8000_0000 != 0 {
                 // Pipe fd
@@ -5485,6 +6724,7 @@ fn sys_epoll_create1(_flags: u32) -> i64 {
         flags:     0,
         file_type: crate::vfs::FileType::CharDevice,
         is_console: false,
+        cloexec:   false,
         open_path: alloc::string::String::from("[epoll]"),
     });
     proc.epoll_sets.push(crate::ipc::epoll::EpollInstance::new(slot));

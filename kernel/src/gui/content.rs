@@ -57,7 +57,7 @@ pub fn handle_start_menu_click(screen_x: i32, screen_y: i32) -> bool {
     }).unwrap_or((1024, 768));
 
     let popup_w: i32 = 200;
-    let popup_h: i32 = 280;
+    let popup_h: i32 = 300;
     let popup_x: i32 = 4;
     let popup_y: i32 = sh as i32 - crate::gui::desktop::TASKBAR_HEIGHT as i32 - popup_h - 2;
 
@@ -72,12 +72,14 @@ pub fn handle_start_menu_click(screen_x: i32, screen_y: i32) -> bool {
 
     // Determine which menu item was clicked.
     // Must match the layout in render_start_menu_to_backbuffer exactly.
-    let item_heights: [(i32, &str); 12] = [
+    let item_heights: [(i32, &str); 14] = [
         (20, "AstryxOS"),     // header — not clickable
         (8,  ""),             // separator
         (20, "File Explorer"),
         (20, "Terminal"),
         (20, "Settings"),
+        (8,  ""),             // separator
+        (20, "Firefox"),
         (8,  ""),             // separator
         (20, "Text Editor"),
         (20, "Calculator"),
@@ -110,6 +112,14 @@ pub fn handle_start_menu_click(screen_x: i32, screen_y: i32) -> bool {
                 }
                 "Calculator" => {
                     crate::gui::desktop::focus_app("calculator");
+                    return true;
+                }
+                "Firefox" => {
+                    // Focus the terminal window so output is visible, then launch.
+                    crate::gui::desktop::focus_app("terminal");
+                    crate::gui::terminal::launch_process(
+                        "/disk/lib/firefox/firefox-bin --no-remote --profile /tmp/ff-profile --new-instance",
+                    );
                     return true;
                 }
                 "System Info" => {
@@ -163,7 +173,7 @@ pub fn render_start_menu_overlay(taskbar_handle: WindowHandle) {
     let fb = fb_base as *mut u32;
 
     let popup_w: u32 = 200;
-    let popup_h: u32 = 280;
+    let popup_h: u32 = 300;
     let popup_bg: u32 = 0xFF1E1E2E;
     let popup_border: u32 = 0xFF444466;
 
@@ -254,7 +264,7 @@ pub fn render_start_menu_overlay(taskbar_handle: WindowHandle) {
 /// Draw the start menu popup into the compositor backbuffer (no flicker).
 pub fn render_start_menu_to_backbuffer(buf: &mut [u32], sw: u32, sh: u32) {
     let popup_w: u32 = 200;
-    let popup_h: u32 = 280;
+    let popup_h: u32 = 300;
     let popup_bg: u32 = 0xFF1E1E2E;
     let popup_border: u32 = 0xFF444466;
 
@@ -298,12 +308,14 @@ pub fn render_start_menu_to_backbuffer(buf: &mut [u32], sw: u32, sh: u32) {
     }
 
     // Menu items
-    let items: [(&str, u32); 12] = [
+    let items: [(&str, u32); 14] = [
         ("\x0F AstryxOS", 0xFF50C878),
         ("", 0),
         ("  File Explorer", 0xFFCCCCCC),
         ("  Terminal", 0xFFCCCCCC),
         ("  Settings", 0xFFCCCCCC),
+        ("", 0),
+        ("  Firefox", 0xFFFF9933),
         ("", 0),
         ("  Text Editor", 0xFFCCCCCC),
         ("  Calculator", 0xFFCCCCCC),

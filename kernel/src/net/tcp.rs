@@ -1,21 +1,52 @@
-//! TCP — Transmission Control Protocol (stub)
+//! TCP — Transmission Control Protocol
 //!
-//! Minimal TCP state machine for basic connections.
+//! Enhanced implementation with:
+//! - rdtsc-based Initial Sequence Number (RFC 6528)
+//! - Retransmit queue with exponential backoff (RFC 6298)
+//! - Congestion control: slow start + congestion avoidance (RFC 5681)
+//! - Proper window tracking and RST handling
+//! - TimeWait expiry, LastAck → Closed transition
 
 extern crate alloc;
 
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use spin::Mutex;
 use super::Ipv4Address;
 
-/// TCP flags.
+// ── Constants ──────────────────────────────────────────────────────────────────
+
+/// TCP flag bits.
 pub const FIN: u8 = 0x01;
 pub const SYN: u8 = 0x02;
 pub const RST: u8 = 0x04;
 pub const PSH: u8 = 0x08;
 pub const ACK: u8 = 0x10;
 
-/// TCP connection state.
+/// Maximum Segment Size (Ethernet 1500 − 20 IP − 20 TCP).
+pub const MSS: u32 = 1460;
+
+/// Initial RTO in PIT ticks (100 Hz → 200 = 2 s).
+const RTO_INITIAL: u32 = 200;
+/// Maximum RTO in ticks (64 s).
+const RTO_MAX: u32 = 6400;
+/// Maximum retransmit retries before RST.
+const MAX_RETRIES: u8 = 5;
+/// TIME_WAIT duration in ticks (2 s, simplified from 2×MSL).
+const TIMEWAIT_TICKS: u64 = 200;
+
+// ── Data structures ────────────────────────────────────────────────────────────
+
+/// One unacknowledged segment sitting in the retransmit queue.
+struct RetransmitEntry {
+    seq:        u32,
+    data:       Vec<u8>,
+    sent_ticks: u64,
+    rto:        u32,
+    retries:    u8,
+}
+
+/// TCP connection state (per RFC 793).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TcpState {
     Closed,
@@ -30,368 +61,726 @@ pub enum TcpState {
     TimeWait,
 }
 
-/// A TCP connection control block.
+/// TCP Connection Control Block (TCB).
 pub struct TcpConnection {
-    pub local_ip: Ipv4Address,
-    pub local_port: u16,
-    pub remote_ip: Ipv4Address,
+    // 4-tuple
+    pub local_ip:    Ipv4Address,
+    pub local_port:  u16,
+    pub remote_ip:   Ipv4Address,
     pub remote_port: u16,
-    pub state: TcpState,
-    pub send_next: u32,
-    pub send_unack: u32,
-    pub recv_next: u32,
-    pub recv_buffer: Vec<u8>,
-    pub send_buffer: Vec<u8>,
+    pub state:       TcpState,
+
+    // Sequence numbers
+    pub send_next:  u32,  // SND.NXT
+    pub send_unack: u32,  // SND.UNA
+    pub recv_next:  u32,  // RCV.NXT
+
+    // Data buffers
+    pub recv_buffer: Vec<u8>,  // application receive queue
+    pub send_buffer: Vec<u8>,  // data pending window space
+
+    // Retransmit queue
+    retransmit_queue: VecDeque<RetransmitEntry>,
+    rto:  u32,   // current RTO in ticks
+    srtt: u32,   // smoothed RTT
+
+    // Congestion control (RFC 5681)
+    pub cwnd:     u32,  // congestion window (bytes)
+    pub ssthresh: u32,  // slow-start threshold
+    dup_acks:     u8,   // dup-ACK counter
+
+    // Flow control
+    pub peer_window: u32,  // peer's advertised window
+
+    // Socket options
+    pub reuseaddr: bool,
+    pub nodelay:   bool,
+    pub rcvbuf:    u32,
+    pub sndbuf:    u32,
+
+    // TIME_WAIT expiry
+    timewait_start: u64,
 }
 
-/// A parsed TCP header.
+// ── ISN generation ─────────────────────────────────────────────────────────────
+
+#[inline]
+fn rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi,
+                         options(nostack, nomem, preserves_flags));
+    }
+    ((hi as u64) << 32) | (lo as u64)
+}
+
+/// Generate a pseudo-random ISN from the TSC.
+pub fn new_isn() -> u32 {
+    let tsc = rdtsc();
+    let folded = (tsc ^ (tsc >> 32)) as u32;
+    folded.wrapping_mul(1_000_003).wrapping_add(0xDEAD_BEEF)
+}
+
+// ── Global table ───────────────────────────────────────────────────────────────
+
+static TCP_CONNECTIONS: Mutex<Vec<TcpConnection>> = Mutex::new(Vec::new());
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// TCP pseudo-header checksum.
+fn tcp_checksum(src: Ipv4Address, dst: Ipv4Address, tcp: &[u8]) -> u16 {
+    let mut buf = Vec::with_capacity(12 + tcp.len());
+    buf.extend_from_slice(&src);
+    buf.extend_from_slice(&dst);
+    buf.push(0);
+    buf.push(super::ipv4::PROTO_TCP);
+    buf.extend_from_slice(&(tcp.len() as u16).to_be_bytes());
+    buf.extend_from_slice(tcp);
+    let off = 12 + 16;
+    if buf.len() > off + 1 { buf[off] = 0; buf[off + 1] = 0; }
+    super::ipv4::checksum(&buf)
+}
+
+/// Build a TCP segment (header + payload), checksum filled.
+fn build_segment(
+    src_port: u16, dst_port: u16,
+    seq: u32, ack: u32, flags: u8,
+    src_ip: Ipv4Address, dst_ip: Ipv4Address,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut s = Vec::with_capacity(20 + payload.len());
+    s.extend_from_slice(&src_port.to_be_bytes());
+    s.extend_from_slice(&dst_port.to_be_bytes());
+    s.extend_from_slice(&seq.to_be_bytes());
+    s.extend_from_slice(&ack.to_be_bytes());
+    s.push(5 << 4);                          // data offset = 5 dwords
+    s.push(flags);
+    s.extend_from_slice(&65535u16.to_be_bytes()); // advertise full window
+    s.push(0); s.push(0);                    // checksum placeholder
+    s.push(0); s.push(0);                    // urgent pointer
+    s.extend_from_slice(payload);
+    let ck = tcp_checksum(src_ip, dst_ip, &s);
+    s[16] = (ck >> 8) as u8;
+    s[17] = (ck & 0xFF) as u8;
+    s
+}
+
+/// Send a flag-only TCP segment.
+fn send_flags(
+    src_ip: Ipv4Address, src_port: u16,
+    dst_ip: Ipv4Address, dst_port: u16,
+    seq: u32, ack: u32, flags: u8,
+) {
+    let s = build_segment(src_port, dst_port, seq, ack, flags, src_ip, dst_ip, &[]);
+    super::ipv4::send_ipv4(dst_ip, super::ipv4::PROTO_TCP, &s);
+}
+
+// ── Sequence-number arithmetic ────────────────────────────────────────────────
+
+/// `a <= b` in sequence space (RFC 1982 serial-number arithmetic).
+#[inline]
+fn seq_le(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) <= 0
+}
+
+/// `a > b` in sequence space.
+#[inline]
+fn seq_gt(a: u32, b: u32) -> bool {
+    (b.wrapping_sub(a) as i32) < 0
+}
+
+// ── ACK / congestion helpers ───────────────────────────────────────────────────
+
+/// Remove retransmit-queue entries whose end sequence ≤ ack_num.
+fn drain_retransmit(conn: &mut TcpConnection, ack_num: u32) {
+    while let Some(e) = conn.retransmit_queue.front() {
+        let end = e.seq.wrapping_add(e.data.len() as u32);
+        if seq_le(end, ack_num) {
+            conn.retransmit_queue.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+/// Update cwnd after a new cumulative ACK (RFC 5681 §3.1).
+fn update_cwnd(conn: &mut TcpConnection, acked: u32) {
+    if conn.cwnd < conn.ssthresh {
+        // Slow start: cwnd += min(ACKed, MSS)
+        conn.cwnd = conn.cwnd.saturating_add(acked.min(MSS));
+    } else {
+        // Congestion avoidance: cwnd += MSS²/cwnd
+        let inc = MSS * MSS / conn.cwnd.max(1);
+        conn.cwnd = conn.cwnd.saturating_add(inc.max(1));
+    }
+}
+
+/// Handle an incoming cumulative ACK on an existing connection.
+fn handle_ack(conn: &mut TcpConnection, ack_num: u32) {
+    if ack_num == conn.send_unack {
+        // Duplicate ACK
+        conn.dup_acks = conn.dup_acks.saturating_add(1);
+        if conn.dup_acks >= 3 {
+            // Fast retransmit trigger (RFC 5681 §3.2)
+            conn.ssthresh = (conn.cwnd / 2).max(2 * MSS);
+            conn.cwnd     = conn.ssthresh + 3 * MSS;
+            conn.dup_acks = 0;
+            if let Some(e) = conn.retransmit_queue.front_mut() {
+                e.sent_ticks = 0; // force retransmit on next timer tick
+            }
+        }
+        return;
+    }
+    if seq_gt(ack_num, conn.send_unack) {
+        let acked = ack_num.wrapping_sub(conn.send_unack);
+        conn.send_unack = ack_num;
+        conn.dup_acks   = 0;
+        conn.rto        = RTO_INITIAL; // reset after fresh ACK
+        drain_retransmit(conn, ack_num);
+        update_cwnd(conn, acked);
+    }
+}
+
+// ── Receive path ──────────────────────────────────────────────────────────────
+
+/// Parsed TCP header fields.
 pub struct TcpHeader {
-    pub src_port: u16,
-    pub dst_port: u16,
-    pub seq_num: u32,
-    pub ack_num: u32,
+    pub src_port:    u16,
+    pub dst_port:    u16,
+    pub seq_num:     u32,
+    pub ack_num:     u32,
     pub data_offset: u8,
-    pub flags: u8,
-    pub window: u16,
-    pub checksum: u16,
+    pub flags:       u8,
+    pub window:      u16,
+    pub checksum:    u16,
 }
 
 impl TcpHeader {
-    pub fn parse(data: &[u8]) -> Option<Self> {
-        if data.len() < 20 { return None; }
+    pub fn parse(d: &[u8]) -> Option<Self> {
+        if d.len() < 20 { return None; }
         Some(TcpHeader {
-            src_port: u16::from_be_bytes([data[0], data[1]]),
-            dst_port: u16::from_be_bytes([data[2], data[3]]),
-            seq_num: u32::from_be_bytes([data[4], data[5], data[6], data[7]]),
-            ack_num: u32::from_be_bytes([data[8], data[9], data[10], data[11]]),
-            data_offset: data[12] >> 4,
-            flags: data[13],
-            window: u16::from_be_bytes([data[14], data[15]]),
-            checksum: u16::from_be_bytes([data[16], data[17]]),
+            src_port:    u16::from_be_bytes([d[0],  d[1]]),
+            dst_port:    u16::from_be_bytes([d[2],  d[3]]),
+            seq_num:     u32::from_be_bytes([d[4],  d[5],  d[6],  d[7]]),
+            ack_num:     u32::from_be_bytes([d[8],  d[9],  d[10], d[11]]),
+            data_offset: d[12] >> 4,
+            flags:       d[13],
+            window:      u16::from_be_bytes([d[14], d[15]]),
+            checksum:    u16::from_be_bytes([d[16], d[17]]),
         })
     }
-
-    pub fn header_len(&self) -> usize {
-        (self.data_offset as usize) * 4
-    }
+    pub fn header_len(&self) -> usize { (self.data_offset as usize) * 4 }
 }
 
-/// Active TCP connections.
-static TCP_CONNECTIONS: Mutex<Vec<TcpConnection>> = Mutex::new(Vec::new());
+/// Handle an incoming TCP segment dispatched from the IPv4 layer.
+pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
+    let hdr = match TcpHeader::parse(data) { Some(h) => h, None => return };
+    let hlen = hdr.header_len().min(data.len());
+    let payload = &data[hlen..];
 
-/// Handle an incoming TCP segment.
-pub fn handle_tcp(src_ip: Ipv4Address, _dst_ip: Ipv4Address, data: &[u8]) {
-    let header = match TcpHeader::parse(data) {
-        Some(h) => h,
-        None => return,
-    };
-
-    let payload_start = header.header_len();
-    let payload = if data.len() > payload_start {
-        &data[payload_start..]
-    } else {
-        &[]
-    };
+    // RST: immediately close matching connection.
+    if hdr.flags & RST != 0 {
+        let mut conns = TCP_CONNECTIONS.lock();
+        if let Some(c) = conns.iter_mut().find(|c|
+            c.local_port == hdr.dst_port &&
+            c.remote_ip  == src_ip &&
+            c.remote_port == hdr.src_port
+        ) {
+            crate::serial_println!("[TCP] RST: closing port {}", c.local_port);
+            c.state = TcpState::Closed;
+            c.retransmit_queue.clear();
+        }
+        return;
+    }
 
     let mut conns = TCP_CONNECTIONS.lock();
 
-    // Find matching connection.
-    if let Some(conn) = conns.iter_mut().find(|c| {
-        c.local_port == header.dst_port &&
-        c.remote_ip == src_ip &&
-        c.remote_port == header.src_port
-    }) {
-        process_segment(conn, &header, payload);
-    } else if header.flags & SYN != 0 {
-        // Check for listening sockets.
-        if let Some(listener) = conns.iter_mut().find(|c| {
-            c.local_port == header.dst_port && c.state == TcpState::Listen
-        }) {
-            // Accept connection → send SYN-ACK.
-            listener.remote_ip = src_ip;
-            listener.remote_port = header.src_port;
-            listener.recv_next = header.seq_num.wrapping_add(1);
-            listener.state = TcpState::SynReceived;
+    // Existing connection?
+    let idx = conns.iter().position(|c|
+        c.local_port  == hdr.dst_port &&
+        c.remote_ip   == src_ip &&
+        c.remote_port == hdr.src_port
+    );
+    if let Some(i) = idx {
+        process_segment(&mut conns[i], &hdr, payload);
+        return;
+    }
 
-            send_tcp_flags(
-                listener.local_ip, listener.local_port,
-                src_ip, header.src_port,
-                listener.send_next, listener.recv_next,
-                SYN | ACK,
-            );
-            listener.send_next = listener.send_next.wrapping_add(1);
+    // New SYN → find listener.
+    if hdr.flags & SYN != 0 && hdr.flags & ACK == 0 {
+        let listen_idx = conns.iter().position(|c|
+            c.local_port == hdr.dst_port && c.state == TcpState::Listen
+        );
+        if let Some(li) = listen_idx {
+            let isn     = new_isn();
+            let lip     = conns[li].local_ip;
+            let lport   = conns[li].local_port;
+            let rcv_nxt = hdr.seq_num.wrapping_add(1);
+            conns.push(TcpConnection {
+                local_ip:    lip,
+                local_port:  lport,
+                remote_ip:   src_ip,
+                remote_port: hdr.src_port,
+                state:       TcpState::SynReceived,
+                send_next:   isn.wrapping_add(1),
+                send_unack:  isn,
+                recv_next:   rcv_nxt,
+                recv_buffer: Vec::new(),
+                send_buffer: Vec::new(),
+                retransmit_queue: VecDeque::new(),
+                rto:         RTO_INITIAL,
+                srtt:        RTO_INITIAL / 2,
+                cwnd:        MSS,
+                ssthresh:    65535,
+                dup_acks:    0,
+                peer_window: hdr.window as u32,
+                reuseaddr:   false,
+                nodelay:     false,
+                rcvbuf:      87380,
+                sndbuf:      131072,
+                timewait_start: 0,
+            });
+            drop(conns);
+            send_flags(lip, lport, src_ip, hdr.src_port, isn, rcv_nxt, SYN | ACK);
         } else {
-            // Send RST for unsolicited SYN.
-            send_tcp_flags(
-                _dst_ip, header.dst_port,
-                src_ip, header.src_port,
-                0, header.seq_num.wrapping_add(1),
-                RST | ACK,
-            );
+            drop(conns);
+            send_flags(dst_ip, hdr.dst_port, src_ip, hdr.src_port,
+                       0, hdr.seq_num.wrapping_add(1), RST | ACK);
         }
     }
 }
 
-/// Process a TCP segment for an existing connection.
-fn process_segment(conn: &mut TcpConnection, header: &TcpHeader, payload: &[u8]) {
+/// Process one segment on an existing connection (lock already held by caller).
+fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8]) {
+    conn.peer_window = hdr.window as u32;
+
+    let lp = conn.local_port;
+    let rp = conn.remote_port;
+    let lip = conn.local_ip;
+    let rip = conn.remote_ip;
+
     match conn.state {
         TcpState::SynSent => {
-            if header.flags & (SYN | ACK) == (SYN | ACK) {
-                conn.recv_next = header.seq_num.wrapping_add(1);
-                conn.send_unack = header.ack_num;
+            if hdr.flags & (SYN | ACK) == (SYN | ACK) {
+                conn.recv_next  = hdr.seq_num.wrapping_add(1);
+                conn.send_unack = hdr.ack_num;
+                drain_retransmit(conn, hdr.ack_num);
                 conn.state = TcpState::Established;
-                send_tcp_flags(
-                    conn.local_ip, conn.local_port,
-                    conn.remote_ip, conn.remote_port,
-                    conn.send_next, conn.recv_next,
-                    ACK,
-                );
-                crate::serial_println!("[TCP] Connection established to {}:{}",
-                    conn.remote_ip[0], conn.remote_port);
+                crate::serial_println!("[TCP] Established → {}:{}", rip[0], rp);
+                let sn = conn.send_next;
+                let rn = conn.recv_next;
+                let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
+                super::ipv4::send_ipv4(rip, super::ipv4::PROTO_TCP, &s);
             }
         }
+
         TcpState::SynReceived => {
-            if header.flags & ACK != 0 {
+            if hdr.flags & ACK != 0 {
+                conn.send_unack = hdr.ack_num;
+                drain_retransmit(conn, hdr.ack_num);
                 conn.state = TcpState::Established;
-                crate::serial_println!("[TCP] Connection established from {}:{}",
-                    conn.remote_ip[0], conn.remote_port);
+                crate::serial_println!("[TCP] Accepted from {}:{}", rip[0], rp);
             }
         }
+
         TcpState::Established => {
-            if !payload.is_empty() {
+            if hdr.flags & ACK != 0 {
+                handle_ack(conn, hdr.ack_num);
+            }
+            // In-order data.
+            if !payload.is_empty() && hdr.seq_num == conn.recv_next {
                 conn.recv_buffer.extend_from_slice(payload);
                 conn.recv_next = conn.recv_next.wrapping_add(payload.len() as u32);
-                send_tcp_flags(
-                    conn.local_ip, conn.local_port,
-                    conn.remote_ip, conn.remote_port,
-                    conn.send_next, conn.recv_next,
-                    ACK,
-                );
+                let sn = conn.send_next;
+                let rn = conn.recv_next;
+                let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
+                super::ipv4::send_ipv4(rip, super::ipv4::PROTO_TCP, &s);
             }
-            if header.flags & FIN != 0 {
+            // FIN from peer.
+            if hdr.flags & FIN != 0 {
                 conn.recv_next = conn.recv_next.wrapping_add(1);
                 conn.state = TcpState::CloseWait;
-                send_tcp_flags(
-                    conn.local_ip, conn.local_port,
-                    conn.remote_ip, conn.remote_port,
-                    conn.send_next, conn.recv_next,
-                    ACK,
-                );
+                let sn = conn.send_next;
+                let rn = conn.recv_next;
+                let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
+                super::ipv4::send_ipv4(rip, super::ipv4::PROTO_TCP, &s);
             }
         }
+
         TcpState::FinWait1 => {
-            if header.flags & ACK != 0 {
+            if hdr.flags & ACK != 0 {
+                handle_ack(conn, hdr.ack_num);
+            }
+            if hdr.flags & FIN != 0 {
+                // Simultaneous close or ACK+FIN in same segment.
+                conn.recv_next = conn.recv_next.wrapping_add(1);
+                conn.state = TcpState::TimeWait;
+                conn.timewait_start = crate::arch::x86_64::irq::get_ticks();
+                let sn = conn.send_next;
+                let rn = conn.recv_next;
+                let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
+                super::ipv4::send_ipv4(rip, super::ipv4::PROTO_TCP, &s);
+            } else if hdr.flags & ACK != 0 {
+                // Pure ACK (no FIN): move to FinWait2.
                 conn.state = TcpState::FinWait2;
             }
         }
+
         TcpState::FinWait2 => {
-            if header.flags & FIN != 0 {
+            if hdr.flags & FIN != 0 {
                 conn.recv_next = conn.recv_next.wrapping_add(1);
                 conn.state = TcpState::TimeWait;
-                send_tcp_flags(
-                    conn.local_ip, conn.local_port,
-                    conn.remote_ip, conn.remote_port,
-                    conn.send_next, conn.recv_next,
-                    ACK,
-                );
+                conn.timewait_start = crate::arch::x86_64::irq::get_ticks();
+                let sn = conn.send_next;
+                let rn = conn.recv_next;
+                let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
+                super::ipv4::send_ipv4(rip, super::ipv4::PROTO_TCP, &s);
             }
         }
+
+        TcpState::LastAck => {
+            // Our FIN has been acknowledged → connection done.
+            if hdr.flags & ACK != 0 {
+                conn.state = TcpState::Closed;
+                conn.retransmit_queue.clear();
+                crate::serial_println!("[TCP] Closed (LastAck → Closed) port {}", lp);
+            }
+        }
+
         _ => {}
     }
 }
 
-/// Send a TCP packet with given flags (no payload).
-fn send_tcp_flags(
-    src_ip: Ipv4Address, src_port: u16,
-    dst_ip: Ipv4Address, dst_port: u16,
-    seq: u32, ack: u32,
-    flags: u8,
-) {
-    let mut segment = Vec::with_capacity(20);
-    segment.extend_from_slice(&src_port.to_be_bytes());
-    segment.extend_from_slice(&dst_port.to_be_bytes());
-    segment.extend_from_slice(&seq.to_be_bytes());
-    segment.extend_from_slice(&ack.to_be_bytes());
-    segment.push(5 << 4); // Data offset = 5 (20 bytes)
-    segment.push(flags);
-    segment.extend_from_slice(&8192u16.to_be_bytes()); // Window
-    segment.push(0); // Checksum placeholder
-    segment.push(0);
-    segment.push(0); // Urgent pointer
-    segment.push(0);
+// ── Send path ─────────────────────────────────────────────────────────────────
 
-    // TCP checksum over pseudo-header.
-    let cksum = tcp_checksum(src_ip, dst_ip, &segment);
-    segment[16] = (cksum >> 8) as u8;
-    segment[17] = (cksum & 0xFF) as u8;
+/// Send data on an established connection.
+/// Respects congestion window; buffers excess in send_buffer.
+pub fn send_data(port: u16, data: &[u8]) -> Result<usize, &'static str> {
+    if data.is_empty() { return Ok(0); }
 
-    super::ipv4::send_ipv4(dst_ip, super::ipv4::PROTO_TCP, &segment);
-}
+    struct PendingSend {
+        remote_ip: Ipv4Address,
+        seg:       Vec<u8>,
+    }
+    let mut to_send: Vec<PendingSend> = Vec::new();
 
-/// TCP checksum with pseudo-header.
-fn tcp_checksum(src_ip: Ipv4Address, dst_ip: Ipv4Address, tcp_data: &[u8]) -> u16 {
-    let mut pseudo = Vec::with_capacity(12 + tcp_data.len());
-    pseudo.extend_from_slice(&src_ip);
-    pseudo.extend_from_slice(&dst_ip);
-    pseudo.push(0);
-    pseudo.push(super::ipv4::PROTO_TCP);
-    pseudo.extend_from_slice(&(tcp_data.len() as u16).to_be_bytes());
+    {
+        let mut conns = TCP_CONNECTIONS.lock();
+        let conn = conns.iter_mut()
+            .find(|c| c.local_port == port && c.state == TcpState::Established)
+            .ok_or("no established connection on port")?;
 
-    pseudo.extend_from_slice(tcp_data);
-    // Zero the checksum field.
-    let cksum_offset = 12 + 16;
-    if pseudo.len() > cksum_offset + 1 {
-        pseudo[cksum_offset] = 0;
-        pseudo[cksum_offset + 1] = 0;
+        let ticks = crate::arch::x86_64::irq::get_ticks();
+        let in_flight   = conn.send_next.wrapping_sub(conn.send_unack);
+        let eff_window  = conn.cwnd.min(conn.peer_window.max(MSS));
+        let can_send    = if eff_window > in_flight { (eff_window - in_flight) as usize } else { 0 };
+
+        let mut offset = 0usize;
+        while offset < data.len() && offset < can_send {
+            let end   = (offset + MSS as usize).min(data.len()).min(offset + can_send - offset);
+            let chunk = &data[offset..end];
+            let seq   = conn.send_next;
+            let seg   = build_segment(
+                conn.local_port, conn.remote_port,
+                seq, conn.recv_next,
+                PSH | ACK,
+                conn.local_ip, conn.remote_ip,
+                chunk,
+            );
+            conn.retransmit_queue.push_back(RetransmitEntry {
+                seq,
+                data:       chunk.to_vec(),
+                sent_ticks: ticks,
+                rto:        conn.rto,
+                retries:    0,
+            });
+            conn.send_next = conn.send_next.wrapping_add(chunk.len() as u32);
+            to_send.push(PendingSend { remote_ip: conn.remote_ip, seg });
+            offset = end;
+        }
+        // Buffer data that didn't fit in the window.
+        if offset < data.len() {
+            conn.send_buffer.extend_from_slice(&data[offset..]);
+        }
     }
 
-    super::ipv4::checksum(&pseudo)
+    for ps in to_send {
+        super::ipv4::send_ipv4(ps.remote_ip, super::ipv4::PROTO_TCP, &ps.seg);
+    }
+    Ok(data.len())
 }
 
-/// Listen on a TCP port.
-pub fn listen(port: u16) -> Result<(), &'static str> {
+// ── Timer ─────────────────────────────────────────────────────────────────────
+
+/// Called periodically from net::poll().
+/// Handles retransmit timeouts and TIME_WAIT expiry.
+pub fn tcp_timer_tick() {
+    let now = crate::arch::x86_64::irq::get_ticks();
+
+    struct SendJob {
+        lip: Ipv4Address, lp: u16,
+        rip: Ipv4Address, rp: u16,
+        seq: u32, ack: u32, flags: u8,
+        payload: Vec<u8>,
+    }
+    let mut jobs:     Vec<SendJob> = Vec::new();
+    let mut aborted:  Vec<u16>    = Vec::new(); // local_ports that hit MAX_RETRIES
+
+    {
+        let mut conns = TCP_CONNECTIONS.lock();
+
+        for conn in conns.iter_mut() {
+            // TIME_WAIT expiry.
+            if conn.state == TcpState::TimeWait {
+                if now.wrapping_sub(conn.timewait_start) >= TIMEWAIT_TICKS {
+                    conn.state = TcpState::Closed;
+                }
+                continue;
+            }
+
+            // Only check retransmit for states with pending unacked data.
+            if !matches!(conn.state,
+                TcpState::SynSent | TcpState::SynReceived |
+                TcpState::Established | TcpState::FinWait1 | TcpState::LastAck
+            ) { continue; }
+
+            if let Some(e) = conn.retransmit_queue.front_mut() {
+                let elapsed = now.wrapping_sub(e.sent_ticks);
+                if elapsed >= e.rto as u64 {
+                    if e.retries >= MAX_RETRIES {
+                        aborted.push(conn.local_port);
+                        jobs.push(SendJob {
+                            lip: conn.local_ip, lp: conn.local_port,
+                            rip: conn.remote_ip, rp: conn.remote_port,
+                            seq: conn.send_next, ack: 0, flags: RST,
+                            payload: Vec::new(),
+                        });
+                        conn.state = TcpState::Closed;
+                        conn.retransmit_queue.clear();
+                    } else {
+                        e.retries   += 1;
+                        e.rto        = (e.rto * 2).min(RTO_MAX);
+                        e.sent_ticks = now;
+                        conn.ssthresh = (conn.cwnd / 2).max(2 * MSS);
+                        conn.cwnd     = MSS;
+                        jobs.push(SendJob {
+                            lip: conn.local_ip, lp: conn.local_port,
+                            rip: conn.remote_ip, rp: conn.remote_port,
+                            seq: e.seq, ack: conn.recv_next,
+                            flags: PSH | ACK,
+                            payload: e.data.clone(),
+                        });
+                    }
+                }
+            }
+
+            // Drain send_buffer if window reopened.
+            if conn.send_buffer.is_empty() { continue; }
+            let in_flight  = conn.send_next.wrapping_sub(conn.send_unack);
+            let eff_window = conn.cwnd.min(conn.peer_window.max(MSS));
+            if eff_window <= in_flight { continue; }
+            let can  = (eff_window - in_flight) as usize;
+            let take = can.min(conn.send_buffer.len()).min(MSS as usize);
+            let chunk: Vec<u8> = conn.send_buffer.drain(..take).collect();
+            let seq = conn.send_next;
+            conn.retransmit_queue.push_back(RetransmitEntry {
+                seq,
+                data:       chunk.clone(),
+                sent_ticks: now,
+                rto:        conn.rto,
+                retries:    0,
+            });
+            conn.send_next = conn.send_next.wrapping_add(take as u32);
+            jobs.push(SendJob {
+                lip: conn.local_ip, lp: conn.local_port,
+                rip: conn.remote_ip, rp: conn.remote_port,
+                seq, ack: conn.recv_next, flags: PSH | ACK,
+                payload: chunk,
+            });
+        }
+
+        conns.retain(|c| !(c.state == TcpState::Closed && aborted.contains(&c.local_port)));
+    }
+
+    for job in jobs {
+        let seg = build_segment(job.lp, job.rp, job.seq, job.ack,
+                                job.flags, job.lip, job.rip, &job.payload);
+        super::ipv4::send_ipv4(job.rip, super::ipv4::PROTO_TCP, &seg);
+    }
+}
+
+// ── Public query API ──────────────────────────────────────────────────────────
+
+pub fn get_state(port: u16) -> Option<TcpState> {
+    TCP_CONNECTIONS.lock().iter()
+        .find(|c| c.local_port == port)
+        .map(|c| c.state)
+}
+
+pub fn retransmit_queue_len(port: u16) -> usize {
+    TCP_CONNECTIONS.lock().iter()
+        .find(|c| c.local_port == port)
+        .map(|c| c.retransmit_queue.len())
+        .unwrap_or(0)
+}
+
+pub fn get_cwnd(port: u16) -> u32 {
+    TCP_CONNECTIONS.lock().iter()
+        .find(|c| c.local_port == port)
+        .map(|c| c.cwnd)
+        .unwrap_or(0)
+}
+
+pub fn get_ssthresh(port: u16) -> u32 {
+    TCP_CONNECTIONS.lock().iter()
+        .find(|c| c.local_port == port)
+        .map(|c| c.ssthresh)
+        .unwrap_or(0)
+}
+
+pub fn get_send_next(port: u16) -> u32 {
+    TCP_CONNECTIONS.lock().iter()
+        .find(|c| c.local_port == port)
+        .map(|c| c.send_next)
+        .unwrap_or(0)
+}
+
+/// Inject a synthetic ACK directly into the connection (used by tests).
+pub fn inject_ack(port: u16, ack_num: u32, window: u16) {
     let mut conns = TCP_CONNECTIONS.lock();
-    if conns.iter().any(|c| c.local_port == port && c.state == TcpState::Listen) {
-        return Err("port already listening");
+    if let Some(conn) = conns.iter_mut().find(|c| c.local_port == port) {
+        conn.peer_window = window as u32;
+        handle_ack(conn, ack_num);
     }
-    conns.push(TcpConnection {
-        local_ip: super::our_ip(),
-        local_port: port,
-        remote_ip: [0; 4],
-        remote_port: 0,
-        state: TcpState::Listen,
-        send_next: 1000, // Initial sequence number
-        send_unack: 0,
-        recv_next: 0,
-        recv_buffer: Vec::new(),
-        send_buffer: Vec::new(),
-    });
-    Ok(())
 }
 
-/// Read data from a TCP connection.
+pub fn has_data(port: u16) -> bool {
+    TCP_CONNECTIONS.lock().iter()
+        .any(|c| c.local_port == port
+                 && c.state == TcpState::Established
+                 && !c.recv_buffer.is_empty())
+}
+
 pub fn read(port: u16) -> Vec<u8> {
     let mut conns = TCP_CONNECTIONS.lock();
-    if let Some(conn) = conns.iter_mut().find(|c| c.local_port == port && c.state == TcpState::Established) {
-        let data = conn.recv_buffer.clone();
+    if let Some(conn) = conns.iter_mut()
+        .find(|c| c.local_port == port && c.state == TcpState::Established)
+    {
+        let d = conn.recv_buffer.clone();
         conn.recv_buffer.clear();
-        data
+        d
     } else {
         Vec::new()
     }
 }
 
-/// Check if a TCP port has incoming data available (non-destructive).
-pub fn has_data(port: u16) -> bool {
-    let conns = TCP_CONNECTIONS.lock();
-    conns.iter().any(|c| c.local_port == port
-        && c.state == TcpState::Established
-        && !c.recv_buffer.is_empty())
-}
+// ── Control operations ────────────────────────────────────────────────────────
 
-/// Send data over an established TCP connection.
-pub fn send_data(port: u16, data: &[u8]) -> Result<usize, &'static str> {
+pub fn listen(port: u16) -> Result<(), &'static str> {
     let mut conns = TCP_CONNECTIONS.lock();
-    let conn = conns.iter_mut()
-        .find(|c| c.local_port == port && c.state == TcpState::Established)
-        .ok_or("no established connection on this port")?;
-
-    if data.is_empty() { return Ok(0); }
-
-    // Build TCP segment with payload
-    let mut segment = Vec::with_capacity(20 + data.len());
-    segment.extend_from_slice(&conn.local_port.to_be_bytes());
-    segment.extend_from_slice(&conn.remote_port.to_be_bytes());
-    segment.extend_from_slice(&conn.send_next.to_be_bytes());
-    segment.extend_from_slice(&conn.recv_next.to_be_bytes());
-    segment.push(5 << 4); // Data offset = 5 (20 bytes header)
-    segment.push(PSH | ACK); // flags
-    segment.extend_from_slice(&8192u16.to_be_bytes()); // Window
-    segment.push(0); // Checksum placeholder
-    segment.push(0);
-    segment.push(0); // Urgent pointer
-    segment.push(0);
-    segment.extend_from_slice(data);
-
-    // Compute TCP checksum
-    let cksum = tcp_checksum(conn.local_ip, conn.remote_ip, &segment);
-    segment[16] = (cksum >> 8) as u8;
-    segment[17] = (cksum & 0xFF) as u8;
-
-    let remote_ip = conn.remote_ip;
-    conn.send_next = conn.send_next.wrapping_add(data.len() as u32);
-
-    // Drop the lock before sending
-    drop(conns);
-    super::ipv4::send_ipv4(remote_ip, super::ipv4::PROTO_TCP, &segment);
-
-    Ok(data.len())
-}
-
-/// Initiate a TCP connection (active open).
-pub fn connect(remote_ip: Ipv4Address, remote_port: u16) -> Result<u16, &'static str> {
-    let mut conns = TCP_CONNECTIONS.lock();
-
-    // Allocate an ephemeral local port (49152-65535)
-    static NEXT_EPHEMERAL: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(49152);
-    let local_port = NEXT_EPHEMERAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-
-    let local_ip = super::our_ip();
+    // Check for conflicting listener (unless reuseaddr allows it).
+    if conns.iter().any(|c| c.local_port == port && c.state == TcpState::Listen) {
+        return Err("port already listening");
+    }
+    let isn = new_isn();
     conns.push(TcpConnection {
-        local_ip,
-        local_port,
-        remote_ip,
-        remote_port,
-        state: TcpState::SynSent,
-        send_next: 1000,
-        send_unack: 1000,
-        recv_next: 0,
+        local_ip:    super::our_ip(),
+        local_port:  port,
+        remote_ip:   [0; 4],
+        remote_port: 0,
+        state:       TcpState::Listen,
+        send_next:   isn,
+        send_unack:  isn,
+        recv_next:   0,
         recv_buffer: Vec::new(),
         send_buffer: Vec::new(),
+        retransmit_queue: VecDeque::new(),
+        rto:         RTO_INITIAL,
+        srtt:        RTO_INITIAL / 2,
+        cwnd:        MSS,
+        ssthresh:    65535,
+        dup_acks:    0,
+        peer_window: 65535,
+        reuseaddr:   false,
+        nodelay:     false,
+        rcvbuf:      87380,
+        sndbuf:      131072,
+        timewait_start: 0,
     });
+    Ok(())
+}
 
-    // Send SYN
-    drop(conns);
-    send_tcp_flags(
-        local_ip, local_port,
-        remote_ip, remote_port,
-        1000, 0,
-        SYN,
-    );
+pub fn connect(remote_ip: Ipv4Address, remote_port: u16) -> Result<u16, &'static str> {
+    static NEXT_EPHEMERAL: core::sync::atomic::AtomicU16 =
+        core::sync::atomic::AtomicU16::new(49152);
+    let local_port = NEXT_EPHEMERAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let local_ip   = super::our_ip();
+    let isn        = new_isn();
 
+    {
+        let mut conns = TCP_CONNECTIONS.lock();
+        conns.push(TcpConnection {
+            local_ip,
+            local_port,
+            remote_ip,
+            remote_port,
+            state:       TcpState::SynSent,
+            send_next:   isn.wrapping_add(1),   // SYN consumed 1 byte
+            send_unack:  isn,
+            recv_next:   0,
+            recv_buffer: Vec::new(),
+            send_buffer: Vec::new(),
+            retransmit_queue: VecDeque::new(),
+            rto:         RTO_INITIAL,
+            srtt:        RTO_INITIAL / 2,
+            cwnd:        MSS,
+            ssthresh:    65535,
+            dup_acks:    0,
+            peer_window: 65535,
+            reuseaddr:   false,
+            nodelay:     false,
+            rcvbuf:      87380,
+            sndbuf:      131072,
+            timewait_start: 0,
+        });
+    }
+    send_flags(local_ip, local_port, remote_ip, remote_port, isn, 0, SYN);
     Ok(local_port)
 }
 
-/// Close a TCP connection.
 pub fn close(port: u16) -> Result<(), &'static str> {
-    let mut conns = TCP_CONNECTIONS.lock();
-    let conn = conns.iter_mut()
-        .find(|c| c.local_port == port &&
-              (c.state == TcpState::Established || c.state == TcpState::CloseWait))
-        .ok_or("no connection to close")?;
-
-    let local_ip = conn.local_ip;
-    let local_port = conn.local_port;
-    let remote_ip = conn.remote_ip;
-    let remote_port = conn.remote_port;
-    let send_next = conn.send_next;
-    let recv_next = conn.recv_next;
-
-    if conn.state == TcpState::Established {
-        conn.state = TcpState::FinWait1;
-    } else {
-        // CloseWait → LastAck
-        conn.state = TcpState::LastAck;
+    struct CloseInfo {
+        lip: Ipv4Address, lp: u16,
+        rip: Ipv4Address, rp: u16,
+        sn: u32, rn: u32,
+        was_close_wait: bool,
     }
-
-    drop(conns);
-
-    send_tcp_flags(
-        local_ip, local_port,
-        remote_ip, remote_port,
-        send_next, recv_next,
-        FIN | ACK,
-    );
-
+    let info = {
+        let mut conns = TCP_CONNECTIONS.lock();
+        let conn = conns.iter_mut()
+            .find(|c| c.local_port == port &&
+                  matches!(c.state, TcpState::Established | TcpState::CloseWait))
+            .ok_or("no connection to close")?;
+        let was_cw = conn.state == TcpState::CloseWait;
+        conn.state = if was_cw { TcpState::LastAck } else { TcpState::FinWait1 };
+        CloseInfo { lip: conn.local_ip, lp: conn.local_port,
+                    rip: conn.remote_ip, rp: conn.remote_port,
+                    sn: conn.send_next, rn: conn.recv_next,
+                    was_close_wait: was_cw }
+    };
+    send_flags(info.lip, info.lp, info.rip, info.rp, info.sn, info.rn, FIN | ACK);
     Ok(())
+}
+
+/// Set a socket option on the TCP connection for a given port.
+pub fn set_option(port: u16, reuseaddr: Option<bool>, nodelay: Option<bool>,
+                   rcvbuf: Option<u32>, sndbuf: Option<u32>) {
+    let mut conns = TCP_CONNECTIONS.lock();
+    if let Some(c) = conns.iter_mut().find(|c| c.local_port == port) {
+        if let Some(v) = reuseaddr { c.reuseaddr = v; }
+        if let Some(v) = nodelay   { c.nodelay   = v; }
+        if let Some(v) = rcvbuf    { c.rcvbuf    = v; }
+        if let Some(v) = sndbuf    { c.sndbuf    = v; }
+    }
 }

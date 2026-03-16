@@ -220,6 +220,27 @@ pub fn init() {
 /// Send a signal to a process by PID.
 /// Returns 0 on success, negative errno on failure.
 pub fn kill(target_pid: u64, sig: u8) -> i64 {
+    // kill(-pgid, sig): send to all processes in process group |target_pid|.
+    if (target_pid as i64) < 0 {
+        let pgid = (-(target_pid as i64)) as u32;
+        if sig == 0 {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            return if procs.iter().any(|p| p.pgid == pgid) { 0 } else { -3 };
+        }
+        if sig >= MAX_SIGNAL { return -22; }
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        let mut found = false;
+        for proc in procs.iter_mut() {
+            if proc.pgid == pgid && proc.state != crate::proc::ProcessState::Zombie {
+                found = true;
+                if let Some(ref mut ss) = proc.signal_state {
+                    ss.send(sig);
+                }
+            }
+        }
+        return if found { 0 } else { -3 }; // ESRCH
+    }
+
     if sig == 0 {
         // Signal 0 = check if process exists
         let procs = crate::proc::PROCESS_TABLE.lock();
@@ -249,7 +270,6 @@ pub fn kill(target_pid: u64, sig: u8) -> i64 {
         }
     }
 
-    crate::serial_println!("[SIGNAL] kill(pid={}, sig={}) delivered", target_pid, sig);
     0
 }
 
@@ -494,4 +514,156 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
             sig as u64
         }
     }
+}
+
+// ── SIGSEGV Delivery from Hardware Exception ISR ─────────────────────────────
+
+/// Attempt to deliver SIGSEGV to the current process from a page-fault ISR.
+///
+/// Called when `handle_page_fault` returns `false` for a Ring-3 fault.  If the
+/// process has a `SigAction::Handler` for SIGSEGV, this function:
+///
+/// 1. Builds a [`SignalFrame`] on the user stack (callee-saved GPRs zeroed —
+///    acceptable because SIGSEGV handlers either `siglongjmp` or terminate).
+/// 2. Writes a minimal 128-byte `siginfo_t` with `si_addr = cr2` above the
+///    signal frame so that `RSI` can point to it.
+/// 3. Modifies `frame.rip` → handler address and `frame.rsp` → new stack so
+///    that `iretq` in the ISR stub lands directly in the user handler.
+/// 4. Patches the saved `RDI`/`RSI` on the kernel ISR stack so the handler
+///    receives `(signo=11, siginfo_ptr, 0)` per the Linux SA_SIGINFO ABI.
+///
+/// Returns `true` if delivery was set up; `false` if the process has no
+/// handler (caller should call `exit_thread(-11)`).
+///
+/// # Safety
+/// * `frame` must be the `InterruptFrame` produced by the `isr_with_error`
+///   naked stub for vector 14 (page fault).  The 80 bytes *below* `frame` in
+///   memory (lower virtual addresses) are the 9 pushed caller-saved registers
+///   followed by the CPU-pushed error code, as laid out by that stub.
+/// * `frame.rsp` must be a mapped, writable user stack page.  A write fault
+///   here would cause a nested kernel-mode page fault (CPU halts anyway).
+pub unsafe fn deliver_sigsegv_from_isr(
+    cr2: u64,
+    error_code: u64,
+    frame: *mut crate::arch::x86_64::idt::InterruptFrame,
+) -> bool {
+    let pid = crate::proc::current_pid();
+    let mut procs = crate::proc::PROCESS_TABLE.lock();
+    let proc_entry = match procs.iter_mut().find(|p| p.pid == pid) {
+        Some(p) => p,
+        None => return false,
+    };
+
+    let is_linux = proc_entry.linux_abi
+        || proc_entry.subsystem == crate::win32::SubsystemType::Linux;
+
+    let sig_state = match proc_entry.signal_state.as_mut() {
+        Some(s) => s,
+        None => return false,
+    };
+
+    let action = sig_state.actions[SIGSEGV as usize];
+    let (handler_addr, restorer) = match action {
+        SigAction::Handler { addr, restorer } => (addr, restorer),
+        _ => return false, // Default or Ignore — caller kills the process
+    };
+
+    let user_rip = (*frame).rip;
+    let user_rsp = (*frame).rsp;
+    let user_rflags = (*frame).rflags;
+    let saved_mask = sig_state.blocked;
+
+    let restorer_addr = if restorer != 0 {
+        restorer
+    } else if is_linux {
+        TRAMPOLINE_VADDR + TRAMPOLINE_LINUX_OFFSET
+    } else {
+        TRAMPOLINE_VADDR
+    };
+
+    // ── User stack layout (growing downward) ─────────────────────────────────
+    //   new_rsp + 0   .. +112  : SignalFrame  (restorer at [new_rsp] = return addr)
+    //   new_rsp + 112 .. +240  : siginfo_t (128 bytes)   ← RSI points here
+    let sigframe_size = core::mem::size_of::<SignalFrame>() as u64; // 112
+    let siginfo_size  = 128u64;
+    let total = sigframe_size + siginfo_size; // 240
+
+    // 16-align the allocation base, then subtract 8 for "just-called" ABI.
+    let base    = (user_rsp.wrapping_sub(total)) & !0xFu64;
+    let new_rsp = base.wrapping_sub(8);
+
+    let sig_frame_ptr = new_rsp as *mut SignalFrame;
+    let siginfo_ptr   = (new_rsp + sigframe_size) as *mut u8;
+
+    // ── Guard: verify user stack is mapped before writing ────────────────────
+    // If the user stack is unmapped, writing the signal frame would fault in
+    // kernel mode (nested #PF → double fault on SMP where the ISR stack is the
+    // only valid kernel memory).  Return false so the caller kills the process
+    // via exit_thread instead.
+    {
+        let cr3: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+        if crate::mm::vmm::virt_to_phys_in(cr3, new_rsp).is_none() {
+            drop(procs); // release PROCESS_TABLE lock before returning
+            return false;
+        }
+    }
+
+    // ── Write SignalFrame ─────────────────────────────────────────────────────
+    (*sig_frame_ptr).restorer    = restorer_addr;
+    (*sig_frame_ptr).sig_num     = SIGSEGV as u64;
+    (*sig_frame_ptr).saved_mask  = saved_mask;
+    (*sig_frame_ptr).saved_rsp   = user_rsp;
+    (*sig_frame_ptr).saved_r15   = 0; // callee-saved — unavailable from ISR
+    (*sig_frame_ptr).saved_r14   = 0;
+    (*sig_frame_ptr).saved_r13   = 0;
+    (*sig_frame_ptr).saved_r12   = 0;
+    (*sig_frame_ptr).saved_rbx   = 0;
+    (*sig_frame_ptr).saved_rbp   = 0;
+    (*sig_frame_ptr).saved_r11   = user_rflags;
+    (*sig_frame_ptr).saved_rcx   = user_rip;
+    (*sig_frame_ptr).saved_rax   = 0;
+    (*sig_frame_ptr)._pad        = 0;
+
+    // ── Write minimal siginfo_t (Linux x86_64 layout) ─────────────────────────
+    // offset  0: si_signo (i32) = 11
+    // offset  4: si_errno (i32) = 0
+    // offset  8: si_code  (i32) = 1 (SEGV_MAPERR) | 2 (SEGV_ACCERR)
+    // offset 12: _pad     (i32) = 0
+    // offset 16: si_addr  (u64) = cr2
+    // offset 24..128: zeroed
+    core::ptr::write_bytes(siginfo_ptr, 0, 128);
+    let si_code: i32 = if error_code & 1 != 0 { 2 } else { 1 }; // present→ACCERR
+    core::ptr::write(siginfo_ptr.add(0)  as *mut i32, SIGSEGV as i32);
+    core::ptr::write(siginfo_ptr.add(4)  as *mut i32, 0i32);
+    core::ptr::write(siginfo_ptr.add(8)  as *mut i32, si_code);
+    core::ptr::write(siginfo_ptr.add(16) as *mut u64, cr2);
+
+    // ── Redirect IRET ─────────────────────────────────────────────────────────
+    (*frame).rip = handler_addr;
+    (*frame).rsp = new_rsp;
+
+    // ── Patch saved RDI/RSI on the ISR kernel stack ───────────────────────────
+    // The `isr_with_error` stub pushes (from bottom = lower address → higher):
+    //   [frame - 80] rax  [frame - 72] rcx  [frame - 64] rdx
+    //   [frame - 56] rsi  [frame - 48] rdi
+    //   [frame - 40] r8   [frame - 32] r9   [frame - 24] r10
+    //   [frame - 16] r11  [frame -  8] error_code
+    //   [frame +  0] InterruptFrame (rip, cs, rflags, rsp, ss)
+    let frame_u64 = frame as u64;
+    let saved_rdi = (frame_u64 - 48) as *mut u64;
+    let saved_rsi = (frame_u64 - 56) as *mut u64;
+    *saved_rdi = SIGSEGV as u64;        // RDI = signo
+    *saved_rsi = siginfo_ptr as u64;    // RSI = &siginfo_t
+
+    // Block SIGSEGV during handler execution (re-enabled by sigreturn).
+    sig_state.blocked |= 1u64 << SIGSEGV;
+    sig_state.blocked &= !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
+
+    crate::serial_println!(
+        "[SIGNAL] SIGSEGV ISR delivery: PID={} CR2={:#x} handler={:#x} new_rsp={:#x}",
+        pid, cr2, handler_addr, new_rsp
+    );
+
+    true
 }

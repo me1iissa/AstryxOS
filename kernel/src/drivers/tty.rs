@@ -472,7 +472,11 @@ impl Tty {
 /// Write a single byte to the framebuffer console.
 ///
 /// This bypasses the TTY output processing (used for echo).
+/// When the desktop compositor is active, skip framebuffer writes — user
+/// process output goes through pipes to the Terminal window instead.
 fn write_console_byte(b: u8) {
+    // Skip when compositor owns the framebuffer (desktop mode).
+    if crate::gui::compositor::is_active() { return; }
     if let Some(ref mut console) = *crate::drivers::console::CONSOLE.lock() {
         use core::fmt::Write;
         let _ = console.write_char(b as char);

@@ -29,7 +29,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
 /// Maximum open files per process.
-pub const MAX_FDS_PER_PROCESS: usize = 64;
+pub const MAX_FDS_PER_PROCESS: usize = 1024;
 
 /// Error codes for VFS operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +91,10 @@ pub enum FileType {
     SignalFd,
     /// inotify — filesystem event notification fd (stub: no events delivered).
     InotifyFd,
+    /// PTY master side (/dev/ptmx).  Payload = PTY pair index stored in fd.open_path.
+    PtyMaster,
+    /// PTY slave side (/dev/pts/N).  Payload = PTY pair index stored in fd.open_path.
+    PtySlave,
 }
 
 /// File open flags.
@@ -124,6 +128,24 @@ static NEXT_INODE: AtomicU64 = AtomicU64::new(2); // 0 = invalid, 1 = root
 pub fn alloc_inode_number() -> u64 {
     NEXT_INODE.fetch_add(1, Ordering::Relaxed)
 }
+
+/// Inodes pending deletion: (mount_idx, inode_number).
+/// Added by remove() when the file is still open; freed on last close().
+static DELETED_INODES: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+
+/// A held POSIX byte-range lock.
+#[derive(Clone)]
+pub struct FileLockEntry {
+    pub mount_idx: usize,
+    pub inode: u64,
+    pub pid: u64,
+    pub start: u64,
+    pub end: u64,       // 0 = to end-of-file (entire range above start)
+    pub lock_type: i16, // F_RDLCK=0, F_WRLCK=1
+}
+
+/// Global file-lock table (F_SETLK / F_SETLKW / F_GETLK).
+pub static FILE_LOCKS: Mutex<Vec<FileLockEntry>> = Mutex::new(Vec::new());
 
 /// Filesystem operations trait — each filesystem type must implement this.
 pub trait FileSystemOps: Send + Sync {
@@ -159,6 +181,18 @@ pub trait FileSystemOps: Send + Sync {
     fn chmod(&self, _inode: u64, _mode: u32) -> VfsResult<()> {
         Err(VfsError::Unsupported)
     }
+
+    /// Unlink just the directory entry (name→inode link) without freeing the inode.
+    /// Used for unlink-on-last-close: the inode survives while fds are open.
+    fn unlink_entry(&self, _parent_inode: u64, _name: &str) -> VfsResult<()> {
+        Err(VfsError::Unsupported)
+    }
+
+    /// Free an inode that has already been unlinked from its parent directory.
+    /// Called when the last open file descriptor pointing to the inode is closed.
+    fn remove_inode(&self, _inode: u64) -> VfsResult<()> {
+        Err(VfsError::Unsupported)
+    }
 }
 
 /// A mounted filesystem.
@@ -186,6 +220,8 @@ pub struct FileDescriptor {
     pub file_type: FileType,
     /// Special: console stdin/stdout/stderr (not backed by VFS inode).
     pub is_console: bool,
+    /// Close-on-exec flag (set by O_CLOEXEC or fcntl F_SETFD FD_CLOEXEC).
+    pub cloexec: bool,
     /// Absolute path this fd was opened with (used by fchdir, /proc/fd/ etc.)
     pub open_path: String,
 }
@@ -195,21 +231,21 @@ impl FileDescriptor {
         Self {
             inode: 0, mount_idx: 0, offset: 0,
             flags: flags::O_RDONLY, file_type: FileType::CharDevice,
-            is_console: true, open_path: String::new(),
+            is_console: true, cloexec: false, open_path: String::new(),
         }
     }
     pub fn console_stdout() -> Self {
         Self {
             inode: 0, mount_idx: 0, offset: 0,
             flags: flags::O_WRONLY, file_type: FileType::CharDevice,
-            is_console: true, open_path: String::new(),
+            is_console: true, cloexec: false, open_path: String::new(),
         }
     }
     pub fn console_stderr() -> Self {
         Self {
             inode: 0, mount_idx: 0, offset: 0,
             flags: flags::O_WRONLY, file_type: FileType::CharDevice,
-            is_console: true, open_path: String::new(),
+            is_console: true, cloexec: false, open_path: String::new(),
         }
     }
     /// Pipe write-end sentinel fd (not backed by VFS inode).
@@ -217,7 +253,7 @@ impl FileDescriptor {
         Self {
             inode: pipe_id, mount_idx: usize::MAX, offset: 0,
             flags: 0x8000_0001, file_type: FileType::Pipe,
-            is_console: false, open_path: String::new(),
+            is_console: false, cloexec: false, open_path: String::new(),
         }
     }
     /// Pipe read-end sentinel fd (not backed by VFS inode).
@@ -225,7 +261,7 @@ impl FileDescriptor {
         Self {
             inode: pipe_id, mount_idx: usize::MAX, offset: 0,
             flags: 0x8000_0000, file_type: FileType::Pipe,
-            is_console: false, open_path: String::new(),
+            is_console: false, cloexec: false, open_path: String::new(),
         }
     }
     /// timerfd sentinel fd.  `slot_id` is the index into the timerfd table.
@@ -233,7 +269,7 @@ impl FileDescriptor {
         Self {
             inode: slot_id, mount_idx: usize::MAX, offset: 0,
             flags: 0, file_type: FileType::TimerFd,
-            is_console: false, open_path: String::new(),
+            is_console: false, cloexec: false, open_path: String::new(),
         }
     }
     /// signalfd sentinel fd.  `slot_id` is the index into the signalfd table.
@@ -241,7 +277,7 @@ impl FileDescriptor {
         Self {
             inode: slot_id, mount_idx: usize::MAX, offset: 0,
             flags: 0, file_type: FileType::SignalFd,
-            is_console: false, open_path: String::new(),
+            is_console: false, cloexec: false, open_path: String::new(),
         }
     }
     /// inotifyfd sentinel fd.  `slot_id` is the index into the inotify table.
@@ -249,7 +285,25 @@ impl FileDescriptor {
         Self {
             inode: slot_id, mount_idx: usize::MAX, offset: 0,
             flags: 0, file_type: FileType::InotifyFd,
-            is_console: false, open_path: String::new(),
+            is_console: false, cloexec: false, open_path: String::new(),
+        }
+    }
+    /// PTY master fd.  `pty_n` is the pair index (= slave number N).
+    pub fn pty_master(pty_n: u8) -> Self {
+        use alloc::format;
+        Self {
+            inode: pty_n as u64, mount_idx: usize::MAX, offset: 0,
+            flags: flags::O_RDWR, file_type: FileType::PtyMaster,
+            is_console: false, cloexec: false, open_path: format!("/dev/ptmx"),
+        }
+    }
+    /// PTY slave fd.  `pty_n` is the pair index.
+    pub fn pty_slave(pty_n: u8) -> Self {
+        use alloc::format;
+        Self {
+            inode: pty_n as u64, mount_idx: usize::MAX, offset: 0,
+            flags: flags::O_RDWR, file_type: FileType::PtySlave,
+            is_console: false, cloexec: false, open_path: format!("/dev/pts/{}", pty_n),
         }
     }
 }
@@ -287,6 +341,12 @@ pub fn init() {
     let _ = create_file("/dev/random");
     let _ = create_file("/dev/console");
     let _ = create_file("/dev/tty");
+    let _ = create_file("/dev/ptmx");
+    let _ = mkdir("/dev/pts");
+    // /dev/shm — POSIX shared memory (tmpfs on Linux).
+    // Firefox IPC falls back to shm_open() when memfd_create fails.
+    // shm_open("/name") maps to open("/dev/shm/name", O_RDWR|O_CREAT).
+    let _ = mkdir("/dev/shm");
 
     // Framebuffer device.
     let _ = create_file("/dev/fb0");
@@ -339,6 +399,36 @@ pub fn init() {
     if let Ok(()) = create_file("/etc/nsswitch.conf") {
         let _ = write_file("/etc/nsswitch.conf",
             b"passwd:   files\ngroup:    files\nshadow:   files\nhosts:    files\n");
+    }
+
+    // /etc/hosts — minimal hostname map (required by musl resolver)
+    if let Ok(()) = create_file("/etc/hosts") {
+        let _ = write_file("/etc/hosts",
+            b"127.0.0.1 localhost\n::1 localhost\n127.0.0.1 astryx\n");
+    }
+
+    // /etc/host.conf — resolver order configuration
+    if let Ok(()) = create_file("/etc/host.conf") {
+        let _ = write_file("/etc/host.conf", b"order files,bind\n");
+    }
+
+    // /etc/resolv.conf — no nameservers; hosts: files means DNS is not used
+    if let Ok(()) = create_file("/etc/resolv.conf") {
+        let _ = write_file("/etc/resolv.conf", b"# no nameservers\n");
+    }
+
+    // /etc/machine-id — required by GLib, systemd, D-Bus, and many userspace tools.
+    // Must be a 32-character lowercase hex string.
+    if let Ok(()) = create_file("/etc/machine-id") {
+        let _ = write_file("/etc/machine-id", b"d3b07384d113edec49eaa6238ad5ff00\n");
+    }
+
+    // /var/lib/dbus/machine-id — D-Bus reads this path first; same value.
+    let _ = mkdir("/var");
+    let _ = mkdir("/var/lib");
+    let _ = mkdir("/var/lib/dbus");
+    if let Ok(()) = create_file("/var/lib/dbus/machine-id") {
+        let _ = write_file("/var/lib/dbus/machine-id", b"d3b07384d113edec49eaa6238ad5ff00\n");
     }
 
     // /etc/profile — sourced by login shells
@@ -675,21 +765,45 @@ fn init_ata_disks() {
         }
     }
 
-    // Fallback: try each ATA device as whole-disk FAT32
+    // Fallback: try each ATA device as whole-disk FAT32.
+    // Mount the LARGEST valid FAT32 device at /disk (this skips the small
+    // boot ESP and picks the data disk).  Other valid devices get skipped
+    // for now — in the future they could be mounted at /disk2 etc.
     let devices2 = crate::drivers::ata::probe_all();
-    for dev in devices2 {
-        let boxed: Box<dyn crate::drivers::block::BlockDevice> = Box::new(dev);
-        match fat32::Fat32Fs::new(boxed) {
-            Ok(fs) => {
-                let root_inode = fs.root_inode();
-                mount("/disk", Box::new(fs), root_inode);
-                crate::serial_println!("[VFS] FAT32 whole-disk mounted at /disk (ATA)");
-                return;
+    let mut best: Option<(usize, u64)> = None; // (index, sector_count)
+    for (idx, dev) in devices2.iter().enumerate() {
+        // Quick check: read sector 0 and see if it looks like FAT32
+        let mut buf = [0u8; 512];
+        if dev.read_sector(0, &mut buf).is_ok() {
+            let sig = u16::from_le_bytes([buf[510], buf[511]]);
+            let bps = u16::from_le_bytes([buf[11], buf[12]]);
+            if sig == 0xAA55 && (bps == 512 || bps == 1024 || bps == 4096) {
+                let sc = dev.sector_count();
+                if best.is_none() || sc > best.unwrap().1 {
+                    best = Some((idx, sc));
+                }
             }
-            Err(_) => {}
         }
     }
-    crate::serial_println!("[VFS] No real ATA disk found");
+    if let Some((best_idx, _best_sectors)) = best {
+        // Re-probe to get an owned device for the selected index
+        let fresh = crate::drivers::ata::probe_all();
+        if let Some(dev) = fresh.into_iter().nth(best_idx) {
+            let boxed: Box<dyn crate::drivers::block::BlockDevice> = Box::new(dev);
+            match fat32::Fat32Fs::new(boxed) {
+                Ok(fs) => {
+                    let root_inode = fs.root_inode();
+                    mount("/disk", Box::new(fs), root_inode);
+                    crate::serial_println!("[VFS] FAT32 whole-disk mounted at /disk (ATA dev {}, largest)", best_idx);
+                    return;
+                }
+                Err(e) => {
+                    crate::serial_println!("[VFS] ATA dev {} FAT32 mount failed: {:?}", best_idx, e);
+                }
+            }
+        }
+    }
+    crate::serial_println!("[VFS] No real ATA data disk found");
 }
 
 
@@ -865,10 +979,36 @@ pub fn mkdir(path: &str) -> VfsResult<()> {
 }
 
 /// Remove a file or empty directory.
+/// For regular files that are currently open, the directory entry is removed
+/// immediately but the inode is kept alive until all file descriptors are closed
+/// (Unix unlink-on-last-close semantics — C5).
 pub fn remove(path: &str) -> VfsResult<()> {
     let (mount_idx, parent_inode, name) = resolve_parent(path)?;
-    let mounts = MOUNTS.lock();
-    mounts[mount_idx].fs.remove(parent_inode, &name)?;
+
+    // Resolve the target inode to check whether it is open.
+    let target_inode = {
+        let mounts = MOUNTS.lock();
+        mounts[mount_idx].fs.lookup(parent_inode, &name)?
+    };
+
+    // Determine whether it is a regular file that any process has open.
+    let is_open = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().any(|p| p.file_descriptors.iter().any(|fdo| {
+            fdo.as_ref().map(|f| f.mount_idx == mount_idx && f.inode == target_inode)
+                .unwrap_or(false)
+        }))
+    };
+
+    if is_open {
+        // Deferred deletion: unlink directory entry, keep inode until last close.
+        let mounts = MOUNTS.lock();
+        mounts[mount_idx].fs.unlink_entry(parent_inode, &name)?;
+        DELETED_INODES.lock().push((mount_idx, target_inode));
+    } else {
+        let mounts = MOUNTS.lock();
+        mounts[mount_idx].fs.remove(parent_inode, &name)?;
+    }
     Ok(())
 }
 
@@ -986,16 +1126,49 @@ pub fn fd_truncate(pid: crate::proc::Pid, fd_num: usize, size: u64) -> VfsResult
 
 // ===== Process File Descriptor Operations =====
 
+/// Translate `/proc/<N>/foo` → `/proc/self/foo` for per-PID pseudo-files.
+/// Returns `None` if the path does not match the numeric-PID pattern.
+fn redirect_proc_pid_path(path: &str) -> Option<alloc::string::String> {
+    let rest = path.strip_prefix("/proc/")?;
+    let slash_pos = rest.find('/')?;
+    let pid_str = &rest[..slash_pos];
+    // Only redirect purely numeric components (not "self", "net", "sys", …).
+    if pid_str.is_empty() || !pid_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let suffix = &rest[slash_pos..]; // includes the leading "/"
+    Some(alloc::format!("/proc/self{}", suffix))
+}
+
+/// Extract the target PID from a `/proc/<N>/...` open_path.
+/// Returns `None` for `/proc/self/...` (caller should use its own PID).
+fn proc_target_pid(open_path: &str) -> Option<u64> {
+    let rest = open_path.strip_prefix("/proc/")?;
+    let pid_str = rest.split('/').next()?;
+    if pid_str == "self" { return None; }
+    pid_str.parse::<u64>().ok()
+}
+
 /// Open a file for a process, returning the fd number.
 pub fn open(pid: crate::proc::Pid, path: &str, open_flags: u32) -> VfsResult<usize> {
-    // Try to resolve the path.
-    let resolved = resolve_path(path);
+    // C4: redirect /proc/<N>/... to /proc/self/... for inode resolution,
+    // while preserving the original path in the fd for target-PID detection.
+    let redirected;
+    let lookup_path: &str = if let Some(r) = redirect_proc_pid_path(path) {
+        redirected = r;
+        &redirected
+    } else {
+        path
+    };
+
+    // Try to resolve the (possibly redirected) path.
+    let resolved = resolve_path(lookup_path);
 
     let (mount_idx, inode) = match resolved {
         Ok((m, i)) => (m, i),
         Err(VfsError::NotFound) if open_flags & flags::O_CREAT != 0 => {
-            // Create the file.
-            let (m, parent, name) = resolve_parent(path)?;
+            // Create the file using the (possibly redirected) lookup path.
+            let (m, parent, name) = resolve_parent(lookup_path)?;
             let mounts = MOUNTS.lock();
             let ino = mounts[m].fs.create_file(parent, &name)?;
             (m, ino)
@@ -1020,6 +1193,7 @@ pub fn open(pid: crate::proc::Pid, path: &str, open_flags: u32) -> VfsResult<usi
         flags: open_flags,
         file_type: file_stat.file_type,
         is_console: false,
+        cloexec: (open_flags & 0x0008_0000) != 0, // O_CLOEXEC
         open_path: String::from(path),
     };
 
@@ -1035,8 +1209,10 @@ pub fn open(pid: crate::proc::Pid, path: &str, open_flags: u32) -> VfsResult<usi
         }
     }
 
-    // Grow the fd table.
-    if proc.file_descriptors.len() < MAX_FDS_PER_PROCESS {
+    // Grow the fd table, capped at min(RLIMIT_NOFILE soft, MAX_FDS_PER_PROCESS).
+    let nofile_limit = proc.rlimits_soft[7]
+        .min(MAX_FDS_PER_PROCESS as u64) as usize;
+    if proc.file_descriptors.len() < nofile_limit {
         let idx = proc.file_descriptors.len();
         proc.file_descriptors.push(Some(fd));
         return Ok(idx);
@@ -1046,18 +1222,52 @@ pub fn open(pid: crate::proc::Pid, path: &str, open_flags: u32) -> VfsResult<usi
 }
 
 /// Close a file descriptor.
+/// Implements C5 (unlink-on-last-close): if the file was unlinked while open,
+/// its inode is freed when the last fd pointing to it is closed.
 pub fn close(pid: crate::proc::Pid, fd_num: usize) -> VfsResult<()> {
-    let mut procs = crate::proc::PROCESS_TABLE.lock();
-    let proc = procs.iter_mut().find(|p| p.pid == pid).ok_or(VfsError::InvalidArg)?;
+    // Extract fd info and clear the slot atomically under PROCESS_TABLE.
+    let closed = {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        let proc = procs.iter_mut().find(|p| p.pid == pid).ok_or(VfsError::InvalidArg)?;
+        if fd_num >= proc.file_descriptors.len() { return Err(VfsError::BadFd); }
+        let fd_opt = &mut proc.file_descriptors[fd_num];
+        if fd_opt.is_none() { return Err(VfsError::BadFd); }
+        fd_opt.take().map(|fd| (fd.mount_idx, fd.inode, fd.is_console, fd.file_type))
+    };
 
-    if fd_num >= proc.file_descriptors.len() {
-        return Err(VfsError::BadFd);
-    }
-    if proc.file_descriptors[fd_num].is_none() {
-        return Err(VfsError::BadFd);
+    if let Some((mount_idx, inode, is_console, file_type)) = closed {
+        // Release POSIX locks held by this pid on the closed inode (C1).
+        if !is_console && mount_idx != usize::MAX {
+            FILE_LOCKS.lock().retain(|l| !(l.mount_idx == mount_idx && l.inode == inode && l.pid == pid));
+        }
+
+        // C5: unlink-on-last-close — check if this inode was deferred-deleted.
+        if !is_console && file_type == FileType::RegularFile && mount_idx != usize::MAX {
+            // Check remaining open fds + atomically remove from DELETED_INODES if last.
+            let should_free = {
+                let procs = crate::proc::PROCESS_TABLE.lock();
+                let still_open = procs.iter().any(|p| p.file_descriptors.iter().any(|fdo| {
+                    fdo.as_ref().map(|f| f.mount_idx == mount_idx && f.inode == inode)
+                        .unwrap_or(false)
+                }));
+                if !still_open {
+                    let mut dl = DELETED_INODES.lock();
+                    let before = dl.len();
+                    dl.retain(|(m, n)| !(*m == mount_idx && *n == inode));
+                    dl.len() < before // true if we actually removed an entry
+                } else {
+                    false
+                }
+            };
+            if should_free {
+                let mounts = MOUNTS.lock();
+                if mount_idx < mounts.len() {
+                    let _ = mounts[mount_idx].fs.remove_inode(inode);
+                }
+            }
+        }
     }
 
-    proc.file_descriptors[fd_num] = None;
     Ok(())
 }
 
@@ -1095,6 +1305,22 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
         FileType::InotifyFd => {
             Err(VfsError::WouldBlock) // never any events
         }
+        FileType::PtyMaster => {
+            let pty_n = inode as u8;
+            if !crate::drivers::pty::master_readable(pty_n) {
+                return Err(VfsError::WouldBlock);
+            }
+            let slice = unsafe { core::slice::from_raw_parts_mut(buf, count) };
+            Ok(crate::drivers::pty::master_read(pty_n, slice))
+        }
+        FileType::PtySlave => {
+            let pty_n = inode as u8;
+            if !crate::drivers::pty::slave_readable(pty_n) {
+                return Err(VfsError::WouldBlock);
+            }
+            let slice = unsafe { core::slice::from_raw_parts_mut(buf, count) };
+            Ok(crate::drivers::pty::slave_read(pty_n, slice))
+        }
         _ => {
             // ── Special character devices ─────────────────────────────────────────
             // bit 26 = /dev/null  → always return 0 bytes (EOF)
@@ -1114,16 +1340,21 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
             }
 
             // ── Dynamic /proc entries ──────────────────────────────────────────
+            // C4: /proc/<N>/... paths store the original path in open_path; parse
+            // target PID from it so we serve the right process's data.
             if open_path == "/proc/self/maps" || open_path.ends_with("/maps") {
-                let content = generate_proc_maps(pid);
+                let target_pid = proc_target_pid(&open_path).unwrap_or(pid);
+                let content = generate_proc_maps(target_pid);
                 return serve_dynamic_read(&content, offset, buf, count, pid, fd_num);
             }
             if open_path == "/proc/self/status" || open_path.ends_with("/status") {
-                let content = generate_proc_status(pid);
+                let target_pid = proc_target_pid(&open_path).unwrap_or(pid);
+                let content = generate_proc_status(target_pid);
                 return serve_dynamic_read(&content, offset, buf, count, pid, fd_num);
             }
             if open_path == "/proc/self/stat" || open_path.ends_with("/stat") {
-                let content = generate_proc_stat(pid);
+                let target_pid = proc_target_pid(&open_path).unwrap_or(pid);
+                let content = generate_proc_stat(target_pid);
                 return serve_dynamic_read(&content, offset, buf, count, pid, fd_num);
             }
 
@@ -1232,22 +1463,33 @@ fn generate_proc_stat(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
 
 /// Write to a file descriptor.
 pub fn fd_write(pid: crate::proc::Pid, fd_num: usize, buf: *const u8, count: usize) -> VfsResult<usize> {
-    let (mount_idx, inode, offset, append, flags) = {
+    let (mount_idx, inode, offset, append, flags, file_type) = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         let proc = procs.iter().find(|p| p.pid == pid).ok_or(VfsError::InvalidArg)?;
         let fd = proc.file_descriptors.get(fd_num)
             .and_then(|f| f.as_ref())
             .ok_or(VfsError::BadFd)?;
         if fd.is_console { return Err(VfsError::Unsupported); }
-        (fd.mount_idx, fd.inode, fd.offset, fd.flags & flags::O_APPEND != 0, fd.flags)
+        (fd.mount_idx, fd.inode, fd.offset, fd.flags & flags::O_APPEND != 0, fd.flags, fd.file_type)
     };
+
+    // PTY write paths
+    let data = unsafe { core::slice::from_raw_parts(buf, count) };
+    match file_type {
+        FileType::PtyMaster => {
+            return Ok(crate::drivers::pty::master_write(inode as u8, data));
+        }
+        FileType::PtySlave => {
+            return Ok(crate::drivers::pty::slave_write(inode as u8, data));
+        }
+        _ => {}
+    }
 
     // Special character devices: accept writes silently.
     if flags & (0x0400_0000 | 0x0200_0000 | 0x0100_0000) != 0 {
         return Ok(count); // /dev/null, /dev/zero, /dev/urandom — discard
     }
 
-    let data = unsafe { core::slice::from_raw_parts(buf, count) };
     let write_offset = if append {
         let mounts = MOUNTS.lock();
         mounts[mount_idx].fs.stat(inode)?.size
@@ -1259,6 +1501,7 @@ pub fn fd_write(pid: crate::proc::Pid, fd_num: usize, buf: *const u8, count: usi
         let mounts = MOUNTS.lock();
         mounts[mount_idx].fs.write(inode, write_offset, data)?
     };
+
 
     // Update offset.
     {

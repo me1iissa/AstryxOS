@@ -23,6 +23,31 @@ use crate::mm::{pmm, vmm};
 use crate::mm::vma::{VmArea, VmBacking, VmFlags, VmProt, PROT_READ, PROT_WRITE, PROT_EXEC, MAP_PRIVATE, MAP_ANONYMOUS, MAP_STACK};
 use alloc::vec::Vec;
 
+/// Kernel-side cache for the dynamic interpreter binary.
+///
+/// ld-musl-x86_64.so.1 is ~840 KiB. On WSL2/KVM each ATA PIO sector read
+/// requires a hypervisor exit (~100 µs), making 1638 sector reads take 300+
+/// seconds. By caching the bytes in kernel RAM after the first successful
+/// read, every subsequent `exec` of a dynamically-linked binary is instant.
+static INTERP_CACHE: spin::Mutex<Option<(alloc::string::String, alloc::vec::Vec<u8>)>> =
+    spin::Mutex::new(None);
+
+/// Return the interpreter binary, reading from disk only on first call.
+fn read_interpreter_cached(path: &str) -> Result<alloc::vec::Vec<u8>, crate::vfs::VfsError> {
+    {
+        let cache = INTERP_CACHE.lock();
+        if let Some((ref p, ref data)) = *cache {
+            if p == path {
+                return Ok(data.clone());
+            }
+        }
+    }
+    // Cache miss — read from VFS (slow on first call).
+    let data = crate::vfs::read_file(path)?;
+    *INTERP_CACHE.lock() = Some((alloc::string::String::from(path), data.clone()));
+    Ok(data)
+}
+
 /// ELF magic number: \x7fELF
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 
@@ -59,9 +84,13 @@ const PF_R: u32 = 4; // Read
 
 /// Default user stack virtual address (top of lower half)
 const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000;
-/// Default user stack size: 64 KiB (16 pages)
+/// Eager (pre-mapped) stack pages — covers initial argc/argv/env setup.
 const USER_STACK_PAGES: usize = 16;
 const USER_STACK_SIZE: u64 = (USER_STACK_PAGES * pmm::PAGE_SIZE) as u64;
+/// Maximum stack size (lazy VMA — demand-paged on growth): 1 MiB.
+const USER_STACK_MAX: u64 = 1024 * 1024;
+/// One guard page below the maximum stack region.
+const USER_STACK_GUARD: u64 = pmm::PAGE_SIZE as u64;
 
 /// ELF64 Header
 #[repr(C)]
@@ -109,6 +138,8 @@ pub const AT_EUID: u64    = 12;  // Effective user ID
 pub const AT_GID: u64     = 13;  // Real group ID
 pub const AT_EGID: u64    = 14;  // Effective group ID
 pub const AT_BASE: u64    = 7;   // Base address of interpreter
+pub const AT_HWCAP: u64   = 16;  // Hardware capability bitmask (CPU features)
+pub const AT_CLKTCK: u64  = 17;  // Frequency of times() clock (100 Hz)
 pub const AT_RANDOM: u64  = 25;  // Address of 16 random bytes
 // musl reads AT_PHDR/AT_PHNUM to find PT_TLS and validates p_filesz ≤ p_memsz.
 // We don't need a custom AT_ for TLS — musl uses PT_TLS from the phdrs directly.
@@ -421,7 +452,35 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
     }
 
     // Allocate user stack (grows down from USER_STACK_TOP).
-    let stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
+    // The full VMA covers USER_STACK_MAX (1 MiB) for lazy growth; only the
+    // top USER_STACK_PAGES are pre-mapped below.  A PROT_NONE guard page sits
+    // immediately below the VMA to catch runaway stack overflows.
+    let stack_bottom_eager = USER_STACK_TOP - USER_STACK_SIZE;
+    let stack_bottom_max   = USER_STACK_TOP - USER_STACK_MAX;
+    let guard_page_base    = stack_bottom_max - USER_STACK_GUARD;
+    let stack_bottom = stack_bottom_eager; // kept for page-mapping loop below
+
+    // Guard page — PROT_NONE, never demand-paged.
+    vmas.push(VmArea {
+        base: guard_page_base,
+        length: USER_STACK_GUARD,
+        prot: crate::mm::vma::PROT_NONE,
+        flags: MAP_PRIVATE | MAP_ANONYMOUS,
+        backing: VmBacking::Anonymous,
+        name: "[stack guard]",
+    });
+    // Full lazy-growth region below the eager zone.
+    if stack_bottom_max < stack_bottom_eager {
+        vmas.push(VmArea {
+            base:   stack_bottom_max,
+            length: USER_STACK_MAX - USER_STACK_SIZE,
+            prot:   PROT_READ | PROT_WRITE,
+            flags:  MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK,
+            backing: VmBacking::Anonymous,
+            name: "[stack grow]",
+        });
+    }
+    // Eager top region (pre-mapped).
     vmas.push(VmArea {
         base: stack_bottom,
         length: USER_STACK_SIZE,
@@ -470,9 +529,9 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
         };
 
         crate::serial_println!("[ELF] PT_INTERP: loading interpreter '{}'", disk_path);
-
-        match crate::vfs::read_file(&disk_path) {
+        match read_interpreter_cached(&disk_path) {
             Ok(interp_data) => {
+                crate::serial_println!("[ELF] PT_INTERP: {} bytes (cached)", interp_data.len());
                 match load_elf_dyn(&interp_data, cr3, INTERP_BASE, &mut allocated_pages, &mut vmas) {
                     Ok(interp_entry) => {
                         crate::serial_println!(
@@ -872,9 +931,9 @@ fn setup_user_stack(
     // ── Step 2: Compute space needed for the structured region ──────────
     // We need to align and then push: auxvec, envp[], argv[], argc
 
-    // auxvec: standard 7 pairs + extra_auxv pairs + AT_NULL terminator = 8 + N pairs
-    //   (AT_PAGESZ, AT_RANDOM, AT_ENTRY, AT_UID, AT_EUID, AT_GID, AT_EGID) = 7 base + extra + NULL
-    let num_aux_pairs = 7 + extra_auxv.len() + 1; // +1 for AT_NULL
+    // auxvec: standard 10 pairs + extra_auxv pairs + AT_NULL terminator
+    //   (AT_PAGESZ, AT_HWCAP, AT_HWCAP2, AT_CLKTCK, AT_RANDOM, AT_ENTRY, AT_UID, AT_EUID, AT_GID, AT_EGID) = 10 base
+    let num_aux_pairs = 10 + extra_auxv.len() + 1; // +1 for AT_NULL
     let auxvec_u64s = num_aux_pairs * 2;
 
     // envp: env_addrs.len() + 1 (null terminator)
@@ -921,8 +980,39 @@ fn setup_user_stack(
     pos += 8;
 
     // Auxiliary vector: standard entries + extra (AT_PHDR, AT_PHENT, AT_PHNUM, AT_BASE) + NULL
-    let base_aux: [(u64, u64); 7] = [
+    // AT_HWCAP: on x86_64 Linux, this is CPUID.01H:EDX verbatim.
+    // glibc IFUNC resolvers compare AT_HWCAP against CPUID to select
+    // optimized memcpy/memset/zlib implementations.  If AT_HWCAP doesn't
+    // match the CPU's actual feature bits, IFUNC may choose wrong code
+    // paths (e.g., SSE3 memcpy when the CPU has it but AT_HWCAP says no),
+    // causing subtle data corruption in zlib, malloc, etc.
+    // AT_HWCAP/AT_HWCAP2: on x86_64 Linux, HWCAP = CPUID.01H:EDX,
+    // HWCAP2 = CPUID.01H:ECX.  glibc IFUNC resolvers compare both
+    // against CPUID to select optimized code paths (memcpy, zlib, etc.).
+    // Read directly from CPUID so the values match what glibc detects.
+    let (at_hwcap, at_hwcap2): (u64, u64) = {
+        let edx: u64;
+        let ecx: u64;
+        unsafe {
+            core::arch::asm!(
+                "push rbx",
+                "xor ecx, ecx",  // sub-leaf 0
+                "mov eax, 1",
+                "cpuid",
+                "pop rbx",
+                out("eax") _,
+                lateout("ecx") ecx,
+                lateout("edx") edx,
+            );
+        }
+        (edx, ecx)
+    };
+    pub const AT_HWCAP2: u64 = 26;
+    let base_aux: [(u64, u64); 10] = [
         (AT_PAGESZ, pmm::PAGE_SIZE as u64),
+        (AT_HWCAP,  at_hwcap),
+        (AT_HWCAP2, at_hwcap2),
+        (AT_CLKTCK, 100),           // PIT runs at 100 Hz
         (AT_RANDOM, at_random_addr),
         (AT_ENTRY, entry_point),
         (AT_UID, 0),

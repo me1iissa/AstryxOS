@@ -5,7 +5,29 @@
 
 use crate::hal;
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use super::apic::MAX_CPUS;
+
+// ── Watchdog counter (per-CPU) ──────────────────────────────────────────────
+// Incremented every timer tick. Reset to 0 on successful context switch.
+// If a CPU exceeds WATCHDOG_LIMIT ticks without a switch → bugcheck.
+
+static WATCHDOG_COUNTER: [AtomicU32; MAX_CPUS] =
+    [const { AtomicU32::new(0) }; MAX_CPUS];
+/// 120 seconds at 100 Hz.  Must be generous enough for ATA PIO transfers
+/// in nested virtualisation (WSL2/KVM) which can stall a CPU for 60-90s
+/// while loading large shared libraries (e.g., Firefox's libxul.so = 194 MB).
+/// The external Python watchdog (tools/qemu-watchdog.py) handles faster
+/// hang detection via serial output monitoring.
+const WATCHDOG_LIMIT: u32 = 12000;
+
+/// Reset the watchdog counter for the current CPU.
+/// Called by schedule() after a successful context switch.
+#[inline]
+pub fn reset_watchdog_counter() {
+    let cpu = super::apic::cpu_index();
+    WATCHDOG_COUNTER[cpu as usize].store(0, Ordering::Relaxed);
+}
 
 /// PIC I/O ports.
 const PIC1_COMMAND: u16 = 0x20;
@@ -147,8 +169,47 @@ irq_stub!(irq_keyboard_handler, keyboard_interrupt);
 
 /// Timer interrupt logic.
 extern "C" fn timer_tick() {
-    let _tick = TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    // Bail immediately if a bugcheck is in progress — avoid lock contention.
+    if crate::ke::bugcheck::is_bugcheck_active() {
+        if super::apic::is_enabled() { super::apic::lapic_eoi(); }
+        return;
+    }
+
+    let tick = TICK_COUNT.fetch_add(1, Ordering::Relaxed);
     crate::perf::record_interrupt(32); // IRQ0 = vector 32
+
+    // ── Heartbeat: emit every 500 ticks (~5s at 100 Hz) ─────────────
+    // Gives the external watchdog (tools/qemu-watchdog.py) a signal that
+    // the timer ISR is still firing.  Zero cost in production builds.
+    #[cfg(feature = "test-mode")]
+    {
+        if tick > 0 && tick % 500 == 0 {
+            let cpu = super::apic::cpu_index();
+            crate::serial_println!("[HB] tick={} cpu={}", tick, cpu);
+        }
+    }
+
+    // ── Watchdog counter ─────────────────────────────────────────────
+    // Incremented every tick.  Reset to 0 by reset_watchdog_counter()
+    // called from schedule() on successful context switch.  If it reaches
+    // the limit, a CPU has been stuck for >10s → bugcheck.
+    {
+        let cpu = super::apic::cpu_index();
+        // Only check when the scheduler is active — before it's enabled,
+        // all kernel init runs on CPU 0 without context switches.
+        if crate::sched::is_active() {
+            let wd = WATCHDOG_COUNTER[cpu as usize].fetch_add(1, Ordering::Relaxed);
+            if wd >= WATCHDOG_LIMIT {
+                crate::ke::bugcheck::ke_bugcheck(
+                    crate::ke::bugcheck::BUGCHECK_SCHEDULER_DEADLOCK,
+                    cpu as u64,
+                    wd as u64,
+                    tick as u64,
+                    0,
+                );
+            }
+        }
+    }
 
     // Notify the scheduler about the tick.
     crate::sched::timer_tick_schedule();

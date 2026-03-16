@@ -2,6 +2,7 @@
 //!
 //! NT-inspired kernel services: IRQL, DPC, APC, Dispatcher Objects, Wait.
 
+pub mod bugcheck;
 pub mod irql;
 pub mod dpc;
 pub mod apc;

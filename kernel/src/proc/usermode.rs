@@ -27,6 +27,8 @@ pub fn create_user_thread(
     user_rip: u64,
     user_rsp: u64,
     tls: u64,
+    entry_rdx: u64,
+    entry_r8: u64,
 ) -> Option<proc::Tid> {
     // Create the thread as Blocked so the scheduler cannot run it before
     // user_entry_rip / user_entry_rsp / tls_base are set.
@@ -43,6 +45,8 @@ pub fn create_user_thread(
         if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
             t.user_entry_rip = user_rip;
             t.user_entry_rsp = user_rsp;
+            t.user_entry_rdx = entry_rdx;
+            t.user_entry_r8  = entry_r8;
             t.tls_base       = tls;
             t.context.cr3    = cr3;
             t.state          = proc::ThreadState::Ready; // safe to schedule now
@@ -50,8 +54,8 @@ pub fn create_user_thread(
     }
 
     crate::serial_println!(
-        "[USER] Created clone thread TID {} in PID {}: RIP={:#x} RSP={:#x} TLS={:#x}",
-        tid, pid, user_rip, user_rsp, tls
+        "[USER] Created clone thread TID {} in PID {}: RIP={:#x} RSP={:#x} TLS={:#x} RDX={:#x} R8={:#x}",
+        tid, pid, user_rip, user_rsp, tls, entry_rdx, entry_r8
     );
     Some(tid)
 }
@@ -146,6 +150,13 @@ fn create_user_process_impl(
             p.exe_path = Some(alloc::string::String::from(name));
             p.linux_abi = true;
             p.subsystem = crate::win32::SubsystemType::Linux;
+            // Initialize signal state for Linux user processes.
+            // Without this, rt_sigaction returns -1 and signal handlers
+            // (SIGSEGV, SIGBUS, etc.) are never installed — processes get
+            // killed on first NULL deref instead of invoking their handler.
+            if p.signal_state.is_none() {
+                p.signal_state = Some(crate::signal::SignalState::new());
+            }
         }
     }
 
@@ -207,7 +218,7 @@ fn user_mode_bootstrap() {
         }
     }
 
-    let (entry_rip, entry_rsp, kernel_stack_top, user_cr3, tls_base) = {
+    let (entry_rip, entry_rsp, entry_rdx, entry_r8, kernel_stack_top, user_cr3, tls_base, gs_base) = {
         let tid = proc::current_tid();
         let threads = THREAD_TABLE.lock();
         let thread = threads.iter().find(|t| t.tid == tid)
@@ -215,9 +226,12 @@ fn user_mode_bootstrap() {
         (
             thread.user_entry_rip,
             thread.user_entry_rsp,
+            thread.user_entry_rdx,
+            thread.user_entry_r8,
             thread.kernel_stack_base + thread.kernel_stack_size,
             thread.context.cr3,
             thread.tls_base,
+            thread.gs_base,
         )
     };
 
@@ -243,42 +257,177 @@ fn user_mode_bootstrap() {
         unsafe { proc::write_fs_base(tls_base); }
     }
 
+    // Set GS.base to TEB address for Win32 threads.
+    if gs_base != 0 {
+        unsafe { proc::write_gs_base(gs_base); }
+    }
+
     // Jump to user mode via IRETQ. This never returns.
-    unsafe { jump_to_user_mode(entry_rip, entry_rsp); }
+    unsafe { jump_to_user_mode(entry_rip, entry_rsp, entry_rdx, entry_r8); }
 }
 
 /// Transition to user mode (Ring 3) via IRETQ.
 ///
 /// Pushes an interrupt return frame onto the current stack and executes
-/// IRETQ to atomically switch to Ring 3 with the given RIP and RSP.
+/// IRETQ to atomically switch to Ring 3 with the given RIP, RSP, RDX, and R8.
 ///
 /// # Safety
 /// - `entry_rip` must point to valid, executable, Ring 3-accessible code.
 /// - `entry_rsp` must point to a valid, Ring 3-accessible stack.
+/// - `entry_rdx` / `entry_r8`: thread function and argument for glibc clone3 children
+///   (glibc 2.34+ passes `func` in RDX and `arg` in R8 through the clone3 syscall;
+///   set both to 0 for initial processes and clone2-style threads).
 /// - This function never returns.
-#[inline(never)]
-pub unsafe fn jump_to_user_mode(entry_rip: u64, entry_rsp: u64) -> ! {
-    asm!(
-        // Build IRETQ frame on current (kernel) stack:
-        //   [RSP+32] SS
-        //   [RSP+24] RSP (user)
-        //   [RSP+16] RFLAGS
-        //   [RSP+8]  CS
-        //   [RSP+0]  RIP (user)
-        "push {ss}",       // SS = USER_DATA_SELECTOR (0x1B)
-        "push {rsp_val}",  // RSP = user stack pointer
-        "push {rflags}",   // RFLAGS = 0x202 (IF set, IOPL=0)
-        "push {cs}",       // CS = USER_CODE_SELECTOR (0x23)
-        "push {rip_val}",  // RIP = entry point
-        // RAX = 0 on Ring 3 entry. Required for clone() children (syscall return
-        // value must be 0 in child). Harmless for static binary _start.
+/// Transition to user mode via IRETQ.
+///
+/// # Arguments
+/// RDI = entry_rip, RSI = entry_rsp, RDX = entry_rdx, RCX = entry_r8
+///
+/// # Safety
+/// Must be called with valid user-space RIP/RSP.
+#[unsafe(naked)]
+pub unsafe extern "C" fn jump_to_user_mode(_entry_rip: u64, _entry_rsp: u64, _entry_rdx: u64, _entry_r8: u64) -> ! {
+    core::arch::naked_asm!(
+        // Args: rdi=rip, rsi=rsp, rdx=rdx_val, rcx=r8_val
+        // Build IRETQ frame
+        "push 0x1B",       // SS = USER_DATA_SELECTOR
+        "push rsi",        // RSP = user stack pointer (arg2)
+        "push 0x202",      // RFLAGS (IF set)
+        "push 0x23",       // CS = USER_CODE_SELECTOR
+        "push rdi",        // RIP = entry point (arg1)
+        // Set R8 from arg4 (rcx), RDX stays as arg3
+        "mov r8, rcx",
+        // RAX = 0 (fork child return value)
         "xor eax, eax",
+        // Zero all other GPRs to prevent kernel address leaks
+        "xor esi, esi",
+        "xor edi, edi",
+        "xor ecx, ecx",
+        "xor r9d, r9d",
+        "xor r10d, r10d",
+        "xor r11d, r11d",
+        "xor ebx, ebx",
+        "xor ebp, ebp",
+        "xor r12d, r12d",
+        "xor r13d, r13d",
+        "xor r14d, r14d",
+        "xor r15d, r15d",
         "iretq",
-        ss = in(reg) gdt::USER_DATA_SELECTOR as u64,
-        rsp_val = in(reg) entry_rsp,
-        rflags = in(reg) 0x202u64,
-        cs = in(reg) gdt::USER_CODE_SELECTOR as u64,
-        rip_val = in(reg) entry_rip,
-        options(noreturn)
     );
+}
+
+/// Create a Win32 user-mode process from a PE32+ binary.
+///
+/// Allocates a fresh user address space, maps a per-process NT syscall
+/// trampoline page at `NT_STUB_PAGE_VA`, builds a minimal TEB at
+/// `0x7FFE_F000`, loads the PE image, and starts the initial thread.
+///
+/// Returns the PID on success.
+pub fn create_win32_process(name: &str, pe_data: &[u8]) -> Result<proc::Pid, crate::proc::pe::PeError> {
+    crate::serial_println!("[WIN32] Loading PE binary '{}' ({} bytes)", name, pe_data.len());
+
+    // ── 1. Create a fresh user address space ─────────────────────────────────
+    let mut vm_space = crate::mm::vma::VmSpace::new_user()
+        .ok_or(crate::proc::pe::PeError::MappingFailed)?;
+    let user_cr3 = vm_space.cr3;
+
+    // ── 2. Allocate and map the NT stub trampoline page ───────────────────────
+    let tramp_phys = crate::mm::pmm::alloc_page()
+        .ok_or(crate::proc::pe::PeError::MappingFailed)?;
+    // Physical addresses must be accessed via the higher-half PHYS_OFF mapping —
+    // the identity map (PML4[0]) may have been modified by earlier user processes.
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    unsafe { core::ptr::write_bytes((PHYS_OFF + tramp_phys) as *mut u8, 0, crate::mm::pmm::PAGE_SIZE); }
+
+    // Write MOV RAX / INT 0x2E / RET stubs for every NT_STUB_TABLE entry.
+    unsafe { crate::nt::build_stub_trampoline_page((PHYS_OFF + tramp_phys) as *mut u8); }
+
+    // Map trampoline page at NT_STUB_PAGE_VA as user-readable+executable.
+    if !crate::mm::vmm::map_page_in(
+        user_cr3,
+        crate::nt::NT_STUB_PAGE_VA,
+        tramp_phys,
+        crate::mm::vmm::PAGE_PRESENT | crate::mm::vmm::PAGE_USER,
+        // PAGE_NO_EXECUTE intentionally omitted — trampoline must be executable
+    ) {
+        return Err(crate::proc::pe::PeError::MappingFailed);
+    }
+
+    // Register trampoline VMA.
+    let _ = vm_space.insert_vma(crate::mm::vma::VmArea {
+        base:    crate::nt::NT_STUB_PAGE_VA,
+        length:  crate::mm::pmm::PAGE_SIZE as u64,
+        prot:    crate::mm::vma::PROT_READ | crate::mm::vma::PROT_EXEC,
+        flags:   crate::mm::vma::MAP_PRIVATE | crate::mm::vma::MAP_ANONYMOUS,
+        backing: crate::mm::vma::VmBacking::Anonymous,
+        name:    "[nt-trampoline]",
+    });
+
+    // ── 3. Allocate a minimal TEB at 0x7FFE_F000 ─────────────────────────────
+    const TEB_VA: u64 = 0x7FFE_F000;
+    let teb_phys = crate::mm::pmm::alloc_page()
+        .ok_or(crate::proc::pe::PeError::MappingFailed)?;
+    unsafe { core::ptr::write_bytes((PHYS_OFF + teb_phys) as *mut u8, 0, crate::mm::pmm::PAGE_SIZE); }
+    unsafe {
+        let teb = (PHYS_OFF + teb_phys) as *mut u64;
+        core::ptr::write_unaligned(teb.add(0),  0xFFFF_FFFF_FFFF_FFFFu64); // ExceptionList
+        core::ptr::write_unaligned(teb.add(6),  TEB_VA);                   // NT_TIB.Self (+0x30)
+        // ClientId.UniqueProcess at +0x68 = index 13
+        core::ptr::write_unaligned(teb.add(13), crate::proc::current_pid() as u64);
+    }
+    if !crate::mm::vmm::map_page_in(
+        user_cr3, TEB_VA, teb_phys,
+        crate::mm::vmm::PAGE_PRESENT | crate::mm::vmm::PAGE_USER | crate::mm::vmm::PAGE_WRITABLE | crate::mm::vmm::PAGE_NO_EXECUTE,
+    ) {
+        return Err(crate::proc::pe::PeError::MappingFailed);
+    }
+    let _ = vm_space.insert_vma(crate::mm::vma::VmArea {
+        base:    TEB_VA,
+        length:  crate::mm::pmm::PAGE_SIZE as u64,
+        prot:    crate::mm::vma::PROT_READ | crate::mm::vma::PROT_WRITE,
+        flags:   crate::mm::vma::MAP_PRIVATE | crate::mm::vma::MAP_ANONYMOUS,
+        backing: crate::mm::vma::VmBacking::Anonymous,
+        name:    "[teb]",
+    });
+    // ── 4. Load the PE image into the new address space ───────────────────────
+    // No CR3 switch needed: load_pe writes all data via PHYS_OFF, same as ELF loader.
+    let result = crate::proc::pe::load_pe(pe_data, user_cr3, crate::nt::NT_STUB_PAGE_VA);
+    let pe = result?;
+
+    crate::serial_println!(
+        "[WIN32] PE loaded: entry={:#x}, stack={:#x}, image_base={:#x}",
+        pe.entry_point, pe.stack_top, pe.load_base
+    );
+
+    // ── 5. Map signal trampoline (needed for POSIX signals even in Win32) ─────
+    crate::signal::map_trampoline(user_cr3);
+
+    // ── 6. Create process ─────────────────────────────────────────────────────
+    let pid = proc::create_kernel_process_suspended(name, user_mode_bootstrap as *const () as u64);
+
+    {
+        let mut procs = PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            p.cr3      = user_cr3;
+            p.vm_space = Some(vm_space);
+            p.exe_path = Some(alloc::string::String::from(name));
+            p.linux_abi = false; // Win32 process
+            p.subsystem = crate::win32::SubsystemType::Win32;
+        }
+    }
+
+    {
+        let mut threads = THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.pid == pid) {
+            t.user_entry_rip = pe.entry_point;
+            t.user_entry_rsp = pe.stack_top;
+            t.context.cr3    = user_cr3;
+            t.gs_base        = TEB_VA; // Win32 convention: GS.base = TEB
+            t.first_run      = true;
+            t.state          = proc::ThreadState::Ready;
+        }
+    }
+
+    crate::serial_println!("[WIN32] Process '{}' PID {} ready (cr3={:#x})", name, pid, user_cr3);
+    Ok(pid)
 }

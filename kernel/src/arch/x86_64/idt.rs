@@ -170,7 +170,7 @@ pub fn init() {
 
 /// Common exception handler called from stubs.
 #[no_mangle]
-extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &InterruptFrame) {
+extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut InterruptFrame) {
     // Debug trace for non-page-fault exceptions from user mode.
     if frame.cs & 3 == 3 && vector != 14 {
         crate::serial_println!(
@@ -191,6 +191,26 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &InterruptF
         let cr2: u64;
         unsafe {
             asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags));
+        }
+
+        #[cfg(feature = "firefox-test")]
+        {
+            use core::sync::atomic::{AtomicU64, Ordering};
+            static PF_TOTAL_LOG: AtomicU64 = AtomicU64::new(0);
+            static PF_WRITE: AtomicU64 = AtomicU64::new(0);
+            static PF_NOTPRESENT: AtomicU64 = AtomicU64::new(0);
+            let tot = PF_TOTAL_LOG.fetch_add(1, Ordering::Relaxed);
+            if error_code & 2 != 0 { PF_WRITE.fetch_add(1, Ordering::Relaxed); }
+            else { PF_NOTPRESENT.fetch_add(1, Ordering::Relaxed); }
+            if tot > 0 && tot % 1_000_000 == 0 {
+                crate::serial_println!(
+                    "[PF/stat] total={} write={} notpresent={} err_sample={:#x} cr2={:#x}",
+                    tot,
+                    PF_WRITE.load(Ordering::Relaxed),
+                    PF_NOTPRESENT.load(Ordering::Relaxed),
+                    error_code, cr2
+                );
+            }
         }
 
         if handle_page_fault(cr2, error_code, frame) {
@@ -214,38 +234,120 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &InterruptF
             if error_code & 16 != 0 { "IFETCH" } else { "" },
         );
 
-        // If the fault came from Ring 3, kill the process instead of halting
+        // Dump user GPRs saved on the ISR stack (below the InterruptFrame).
+        // The isr_with_error stub pushes: rax,rbx,rcx,rdx,rsi,rdi,r8,r9,r10,r11,r12,r13,r14,r15,rbp
+        // in that order (rax first at highest address / last pushed).
+        // The saved regs are BELOW frame (lower addresses) since the CPU pushed error+frame
+        // THEN the stub pushed caller-saved regs.
+        #[cfg(feature = "firefox-test")]
         if error_code & 4 != 0 {
-            crate::serial_println!("  Killing user process (page fault in Ring 3)");
+            // Read saved GPRs from the ISR stack.  Layout below frame:
+            //   [frame-8]   = error_code (pushed by CPU)
+            //   [frame-16]  = rax
+            //   [frame-24]  = rbx
+            //   [frame-32]  = rcx
+            //   [frame-40]  = rdx
+            //   [frame-48]  = rsi
+            //   [frame-56]  = rdi
+            //   [frame-64]  = r8  ... etc
+            // ISR stub push order: rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11
+            // frame[-1]=error_code, frame[-2]=rax, frame[-3]=rcx, frame[-4]=rdx,
+            // frame[-5]=rsi, frame[-6]=rdi, frame[-7]=r8, frame[-8]=r9, frame[-9]=r10, frame[-10]=r11
+            let base = frame as *const InterruptFrame as *const u64;
+            unsafe {
+                let rax = *base.sub(2);
+                let rcx = *base.sub(3);
+                let rdx = *base.sub(4);
+                let rsi = *base.sub(5);
+                let rdi = *base.sub(6);
+                let r8  = *base.sub(7);
+                crate::serial_println!(
+                    "  User GPRs: RAX={:#x} RCX={:#x} RDX={:#x} RSI={:#x} RDI={:#x} R8={:#x}",
+                    rax, rcx, rdx, rsi, rdi, r8
+                );
+            }
+        }
+
+        // If the fault came from Ring 3, try to deliver SIGSEGV first.
+        if error_code & 4 != 0 {
+            let delivered = unsafe {
+                crate::signal::deliver_sigsegv_from_isr(
+                    cr2,
+                    error_code,
+                    frame as *mut InterruptFrame,
+                )
+            };
+            if delivered {
+                return; // IRET will go to the signal handler
+            }
+            // Re-enable interrupts BEFORE any serial prints: serial_println! spins on
+            // SERIAL mutex. If the BSP holds SERIAL (e.g. during ELF loading output)
+            // and the AP ISR tries to print with interrupts disabled, we deadlock.
+            // Enabling interrupts here also allows idle thread's `hlt` to wake after
+            // schedule() is called from exit_thread.
+            crate::hal::enable_interrupts();
+            crate::serial_println!("  Killing user process (page fault in Ring 3, no handler)");
+            // Dump user stack to aid crash analysis
+            {
+                let rsp = frame.rsp;
+                let cr3: u64;
+                unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)); }
+                crate::serial_println!("  Stack dump (RSP={:#x} CR3={:#x}):", rsp, cr3);
+                for i in 0..16usize {
+                    let addr = rsp + (i * 8) as u64;
+                    if let Some(phys) = crate::mm::vmm::virt_to_phys_in(cr3, addr) {
+                        let virt = phys + astryx_shared::KERNEL_VIRT_BASE;
+                        let val = unsafe { core::ptr::read_volatile(virt as *const u64) };
+                        crate::serial_println!("    [RSP+{:#04x}] {:#018x} = {:#018x}", i*8, addr, val);
+                    } else {
+                        crate::serial_println!("    [RSP+{:#04x}] {:#018x} = (unmapped)", i*8, addr);
+                    }
+                }
+                // Dump IRET frame fields
+                crate::serial_println!("  RFLAGS={:#018x}", frame.rflags);
+            }
             crate::proc::exit_thread(-11i64); // SIGSEGV
             return;
         }
 
-        // Kernel-mode page fault — print CPU context before halting
-        let cpu_id = crate::arch::x86_64::apic::current_apic_id();
-        let tid = crate::proc::current_tid();
-        let cr3: u64;
-        unsafe { asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)); }
-        crate::serial_println!(
-            "  KERNEL FAULT: CPU={} TID={} CR3={:#x} (halting this CPU)",
-            cpu_id, tid, cr3
+        // Kernel-mode page fault → bugcheck (structured crash report)
+        crate::ke::bugcheck::ke_bugcheck(
+            crate::ke::bugcheck::BUGCHECK_KERNEL_PAGE_FAULT,
+            cr2,             // P1: fault address
+            error_code,      // P2: error code
+            frame.rip,       // P3: instruction that faulted
+            frame.rsp,       // P4: stack pointer at fault
         );
-        loop {
-            unsafe { asm!("cli; hlt", options(nomem, nostack)); }
-        }
+    }
+
+    // Enable interrupts early for Ring 3 exceptions so serial_println! can acquire
+    // the SERIAL mutex without deadlocking (BSP may hold it during ELF loading).
+    // For kernel-mode exceptions we keep interrupts disabled until halt.
+    if frame.cs & 3 == 3 {
+        crate::hal::enable_interrupts();
     }
 
     crate::serial_println!(
-        "\n!!! Exception #{}: {} (error_code=0x{:x})",
+        "\n!!! Exception #{}: {} (error_code=0x{:x}) cpu={} tid={}",
         vector,
         name,
-        error_code
+        error_code,
+        crate::arch::x86_64::apic::cpu_index(),
+        crate::proc::current_tid(),
     );
     crate::serial_println!("  RIP: 0x{:016x}", frame.rip);
     crate::serial_println!("  CS:  0x{:04x}", frame.cs);
     crate::serial_println!("  RFLAGS: 0x{:016x}", frame.rflags);
     crate::serial_println!("  RSP: 0x{:016x}", frame.rsp);
     crate::serial_println!("  SS:  0x{:04x}", frame.ss);
+
+    // Double Fault diagnostics: print TSS.RSP[0] and per_cpu.kernel_rsp
+    // to identify whether the corruption is in the TSS or SYSCALL path.
+    if vector == 8 {
+        let tss_rsp0 = unsafe { crate::arch::x86_64::gdt::read_tss_rsp0() };
+        let kern_rsp = crate::syscall::get_current_kernel_rsp();
+        crate::serial_println!("  TSS.RSP[0]={:#x}  per_cpu.kernel_rsp={:#x}", tss_rsp0, kern_rsp);
+    }
 
     if vector == 3 {
         // Breakpoint — continue execution
@@ -259,12 +361,21 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &InterruptF
         return;
     }
 
-    // Fatal kernel exception — halt
-    loop {
-        unsafe {
-            asm!("cli; hlt", options(nomem, nostack));
-        }
-    }
+    // Fatal kernel exception → bugcheck
+    let bugcode = if vector == 8 {
+        crate::ke::bugcheck::BUGCHECK_DOUBLE_FAULT
+    } else if vector == 13 {
+        crate::ke::bugcheck::BUGCHECK_KERNEL_GPF
+    } else {
+        crate::ke::bugcheck::BUGCHECK_UNEXPECTED_TRAP
+    };
+    crate::ke::bugcheck::ke_bugcheck(
+        bugcode,
+        vector as u64,      // P1: exception vector
+        error_code as u64,  // P2: error code
+        frame.rip,          // P3: RIP
+        frame.rsp,          // P4: RSP
+    );
 }
 
 /// Attempt to handle a page fault.
@@ -277,7 +388,7 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &InterruptF
 /// - Bit 1: Write (1 = write, 0 = read)
 /// - Bit 2: User (1 = user mode, 0 = kernel mode)
 /// - Bit 4: Instruction fetch
-fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &InterruptFrame) -> bool {
+fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut InterruptFrame) -> bool {
     let is_present = error_code & 1 != 0;
     let is_write = error_code & 2 != 0;
     let _is_user = error_code & 4 != 0;
@@ -296,19 +407,76 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &InterruptFram
         None => return false, // No VmSpace — can't handle
     };
 
+    let page_addr = crate::mm::vma::page_align_down(faulting_addr);
+    let cr3 = vm_space.cr3;
+
+    // === Copy-on-Write (early path): present+write faults must be handled
+    // even when the VMA list is incomplete (e.g., fork child whose parent
+    // vm_space.areas was stale). Check this before the VMA lookup so that
+    // pages CoW'd via clone_for_fork are always writable by their sole owner.
+    if is_present && is_write {
+        use crate::mm::vmm::{PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER};
+        const PHYS_OFF_COW: u64 = 0xFFFF_8000_0000_0000;
+
+        // Determine page flags from the VMA if available; fall back to RW|User
+        // for pages with no registered VMA (orphaned CoW pages after fork).
+        let page_flags = match vm_space.find_vma(faulting_addr) {
+            Some(vma) => {
+                if vma.prot & crate::mm::vma::PROT_WRITE == 0 {
+                    return false; // Genuine write-protection fault — SIGSEGV
+                }
+                vma.to_page_flags()
+            }
+            None => {
+                // No VMA but page is present — treat as RW|User (CoW orphan).
+                PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
+            }
+        };
+
+        let pte = crate::mm::vmm::read_pte(cr3, page_addr);
+        let old_phys = pte & 0x000F_FFFF_FFFF_F000;
+
+        if crate::mm::refcount::page_ref_count(old_phys) > 1 {
+            // Shared page — make a private copy
+            if let Some(new_phys) = crate::mm::pmm::alloc_page() {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (PHYS_OFF_COW + old_phys) as *const u8,
+                        (PHYS_OFF_COW + new_phys) as *mut u8,
+                        crate::mm::pmm::PAGE_SIZE,
+                    );
+                }
+                crate::mm::refcount::page_ref_dec(old_phys);
+                crate::mm::refcount::page_ref_set(new_phys, 1);
+                crate::mm::vmm::map_page_in(cr3, page_addr, new_phys, page_flags);
+                crate::mm::vmm::invlpg(page_addr);
+                return true;
+            }
+            return false; // OOM
+        } else {
+            // Single owner — just make it writable
+            let new_pte = old_phys | page_flags | PAGE_PRESENT;
+            crate::mm::vmm::write_pte(cr3, page_addr, new_pte);
+            crate::mm::vmm::invlpg(page_addr);
+            return true;
+        }
+    }
+
+    // === Demand Paging: VMA required ===
     let vma = match vm_space.find_vma(faulting_addr) {
         Some(v) => v,
         None => return false, // Fault outside any VMA — SIGSEGV
     };
 
-    // Check permission: write to non-writable VMA?
+    // PROT_NONE VMAs (guard pages) — never accessible in any mode.
+    if vma.prot == crate::mm::vma::PROT_NONE { return false; }
+
+    // (is_write on a !is_present page: check VMA write permission)
     if is_write && (vma.prot & crate::mm::vma::PROT_WRITE == 0) {
         return false; // Permission denied — SIGSEGV
     }
 
-    let page_addr = crate::mm::vma::page_align_down(faulting_addr);
     let page_flags = vma.to_page_flags();
-    let cr3 = vm_space.cr3;
 
     if !is_present {
         // === Demand Paging: page not yet mapped ===
@@ -329,18 +497,86 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &InterruptFram
             let page_offset_in_vma = page_addr - vma_base;
             let file_page_offset = file_base_offset + page_offset_in_vma;
 
+            #[cfg(feature = "firefox-test")]
+            {
+                static PF_FILE_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+                let n = PF_FILE_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if n < 20 {
+                    let hw_cr3: u64;
+                    unsafe { core::arch::asm!("mov {}, cr3", out(reg) hw_cr3, options(nomem, nostack)); }
+                    // Higher-half physical accessor (safe: PML4[256-511] shallow-copied to user CR3)
+                    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+                    let pml4i = ((page_addr >> 39) & 0x1FF) as usize;
+                    let pdpti = ((page_addr >> 30) & 0x1FF) as usize;
+                    let pdi   = ((page_addr >> 21) & 0x1FF) as usize;
+                    let pti   = ((page_addr >> 12) & 0x1FF) as usize;
+                    let cr3p  = hw_cr3 & 0x000F_FFFF_FFFF_F000;
+                    let (pml4e, pdpte, pde, pte_hw) = unsafe {
+                        let pml4e = *((PHYS_OFF + cr3p + pml4i as u64 * 8) as *const u64);
+                        let pdpte = if pml4e & 1 != 0 {
+                            *((PHYS_OFF + (pml4e & 0x000F_FFFF_FFFF_F000) + pdpti as u64 * 8) as *const u64)
+                        } else { 0 };
+                        let pde = if pdpte & 1 != 0 && pdpte & (1<<7) == 0 {
+                            *((PHYS_OFF + (pdpte & 0x000F_FFFF_FFFF_F000) + pdi as u64 * 8) as *const u64)
+                        } else { 0 };
+                        let pte_hw = if pde & 1 != 0 && pde & (1<<7) == 0 {
+                            *((PHYS_OFF + (pde & 0x000F_FFFF_FFFF_F000) + pti as u64 * 8) as *const u64)
+                        } else { 0 };
+                        (pml4e, pdpte, pde, pte_hw)
+                    };
+                    crate::serial_println!("[PF/file] #{} err={:#x} addr={:#x} hw_cr3={:#x} vm_cr3={:#x}",
+                        n, error_code, page_addr, hw_cr3, cr3);
+                    crate::serial_println!("[PF/walk] PML4[{}]={:#x} PDPT[{}]={:#x} PD[{}]={:#x} PT[{}]={:#x}",
+                        pml4i, pml4e, pdpti, pdpte, pdi, pde, pti, pte_hw);
+                }
+            }
+
             // 1. Check the page cache
             if let Some(cached_phys) = crate::mm::cache::lookup(mount_idx, inode, file_page_offset) {
                 crate::mm::refcount::page_ref_inc(cached_phys);
                 crate::mm::vmm::map_page_in(cr3, page_addr, cached_phys, page_flags);
                 crate::mm::vmm::invlpg(page_addr);
+                #[cfg(feature = "firefox-test")]
+                {
+                    static PF_CACHED_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+                    let n2 = PF_CACHED_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    if n2 < 20 {
+                        const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+                        let pml4i = ((page_addr >> 39) & 0x1FF) as usize;
+                        let pdpti = ((page_addr >> 30) & 0x1FF) as usize;
+                        let pdi   = ((page_addr >> 21) & 0x1FF) as usize;
+                        let pti   = ((page_addr >> 12) & 0x1FF) as usize;
+                        let hw_cr3: u64;
+                        unsafe { core::arch::asm!("mov {}, cr3", out(reg) hw_cr3, options(nomem, nostack)); }
+                        let cr3p  = hw_cr3 & 0x000F_FFFF_FFFF_F000;
+                        let (pml4e, pdpte, pde, pte_hw) = unsafe {
+                            let pml4e = *((PHYS_OFF + cr3p + pml4i as u64 * 8) as *const u64);
+                            let pdpte = if pml4e & 1 != 0 {
+                                *((PHYS_OFF + (pml4e & 0x000F_FFFF_FFFF_F000) + pdpti as u64 * 8) as *const u64)
+                            } else { 0 };
+                            let pde = if pdpte & 1 != 0 && pdpte & (1<<7) == 0 {
+                                *((PHYS_OFF + (pdpte & 0x000F_FFFF_FFFF_F000) + pdi as u64 * 8) as *const u64)
+                            } else { 0 };
+                            let pte_hw = if pde & 1 != 0 && pde & (1<<7) == 0 {
+                                *((PHYS_OFF + (pde & 0x000F_FFFF_FFFF_F000) + pti as u64 * 8) as *const u64)
+                            } else { 0 };
+                            (pml4e, pdpte, pde, pte_hw)
+                        };
+                        crate::serial_println!("[PF/cache] #{} addr={:#x} phys={:#x}", n2, page_addr, cached_phys);
+                        crate::serial_println!("[PF/after] PML4[{}]={:#x} PDPT[{}]={:#x} PD[{}]={:#x} PT[{}]={:#x}",
+                            pml4i, pml4e, pdpti, pdpte, pdi, pde, pti, pte_hw);
+                    }
+                }
                 return true;
             }
 
             // 2. Not cached — allocate a page, read from the filesystem
+            // Use PHYS_OFF for all accesses to the new physical page —
+            // the identity map in PML4[0] may be corrupted by user mmap().
+            const PHYS_OFF_FILE: u64 = 0xFFFF_8000_0000_0000;
             if let Some(phys) = crate::mm::pmm::alloc_page() {
                 unsafe {
-                    core::ptr::write_bytes(phys as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
+                    core::ptr::write_bytes((PHYS_OFF_FILE + phys) as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
                 }
 
                 // Read file data into the page.
@@ -349,11 +585,25 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &InterruptFram
                     if mount_idx < mounts.len() {
                         let buf = unsafe {
                             core::slice::from_raw_parts_mut(
-                                phys as *mut u8,
+                                (PHYS_OFF_FILE + phys) as *mut u8,
                                 crate::mm::pmm::PAGE_SIZE,
                             )
                         };
                         let _ = mounts[mount_idx].fs.read(inode, file_page_offset, buf);
+                    }
+                }
+
+                // Verify file data: log first 8 bytes for corruption detection.
+                #[cfg(feature = "firefox-test")]
+                {
+                    static PF_VERIFY_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+                    let vn = PF_VERIFY_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    // Log every 500th page to detect corruption without flooding
+                    if vn % 500 == 0 || vn < 5 {
+                        let first8 = unsafe { core::ptr::read_volatile((PHYS_OFF_FILE + phys) as *const u64) };
+                        crate::serial_println!(
+                            "[PF/verify] #{} addr={:#x} file_off={:#x} inode={} first8={:#018x}",
+                            vn, page_addr, file_page_offset, inode, first8);
                     }
                 }
 
@@ -364,17 +614,66 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &InterruptFram
 
                 crate::mm::vmm::map_page_in(cr3, page_addr, phys, page_flags);
                 crate::mm::vmm::invlpg(page_addr);
+                #[cfg(feature = "firefox-test")]
+                {
+                    static PF_MISS_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+                    let n3 = PF_MISS_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    if n3 < 20 {
+                        const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+                        let pml4i = ((page_addr >> 39) & 0x1FF) as usize;
+                        let pdpti = ((page_addr >> 30) & 0x1FF) as usize;
+                        let pdi   = ((page_addr >> 21) & 0x1FF) as usize;
+                        let pti   = ((page_addr >> 12) & 0x1FF) as usize;
+                        let hw_cr3: u64;
+                        unsafe { core::arch::asm!("mov {}, cr3", out(reg) hw_cr3, options(nomem, nostack)); }
+                        let cr3p  = hw_cr3 & 0x000F_FFFF_FFFF_F000;
+                        let (pml4e, pdpte, pde, pte_hw) = unsafe {
+                            let pml4e = *((PHYS_OFF + cr3p + pml4i as u64 * 8) as *const u64);
+                            let pdpte = if pml4e & 1 != 0 {
+                                *((PHYS_OFF + (pml4e & 0x000F_FFFF_FFFF_F000) + pdpti as u64 * 8) as *const u64)
+                            } else { 0 };
+                            let pde = if pdpte & 1 != 0 && pdpte & (1<<7) == 0 {
+                                *((PHYS_OFF + (pdpte & 0x000F_FFFF_FFFF_F000) + pdi as u64 * 8) as *const u64)
+                            } else { 0 };
+                            let pte_hw = if pde & 1 != 0 && pde & (1<<7) == 0 {
+                                *((PHYS_OFF + (pde & 0x000F_FFFF_FFFF_F000) + pti as u64 * 8) as *const u64)
+                            } else { 0 };
+                            (pml4e, pdpte, pde, pte_hw)
+                        };
+                        crate::serial_println!("[PF/miss] #{} addr={:#x} phys={:#x} flags={:#x}", n3, page_addr, phys, page_flags);
+                        crate::serial_println!("[PF/after] PML4[{}]={:#x} PDPT[{}]={:#x} PD[{}]={:#x} PT[{}]={:#x}",
+                            pml4i, pml4e, pdpti, pdpte, pdi, pde, pti, pte_hw);
+                    }
+                }
                 return true;
             }
             return false; // OOM
         }
 
+        // Use the stable higher-half mapping (PHYS_OFF) for all physical
+        // memory accesses — the identity map in PML4[0] may have been
+        // corrupted by user mmap() operations splitting 2MiB huge pages.
+        const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+
         match &vma.backing {
             crate::mm::vma::VmBacking::Anonymous => {
+                #[cfg(feature = "firefox-test")]
+                {
+                    static ANON_PF_N: core::sync::atomic::AtomicU64
+                        = core::sync::atomic::AtomicU64::new(0);
+                    let n = ANON_PF_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    // Sample every 500K anonymous faults to see address distribution.
+                    if n % 500_000 == 0 {
+                        crate::serial_println!(
+                            "[PF/anon] #{} addr={:#x} vma=[{:#x}..{:#x}] is_write={}",
+                            n, page_addr, vma.base, vma.end(), is_write
+                        );
+                    }
+                }
                 // Allocate a zeroed page
                 if let Some(phys) = crate::mm::pmm::alloc_page() {
                     unsafe {
-                        core::ptr::write_bytes(phys as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
+                        core::ptr::write_bytes((PHYS_OFF + phys) as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
                     }
                     crate::mm::refcount::page_ref_set(phys, 1);
                     crate::mm::vmm::map_page_in(cr3, page_addr, phys, page_flags);
@@ -392,37 +691,6 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &InterruptFram
                 return true;
             }
             crate::mm::vma::VmBacking::File { .. } => unreachable!(),
-        }
-    }
-
-    if is_present && is_write {
-        // === Copy-on-Write: page is mapped but read-only, VMA says writable ===
-        let pte = crate::mm::vmm::read_pte(cr3, page_addr);
-        let old_phys = pte & 0x000F_FFFF_FFFF_F000;
-
-        if crate::mm::refcount::page_ref_count(old_phys) > 1 {
-            // Shared page — make a private copy
-            if let Some(new_phys) = crate::mm::pmm::alloc_page() {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        old_phys as *const u8,
-                        new_phys as *mut u8,
-                        crate::mm::pmm::PAGE_SIZE,
-                    );
-                }
-                crate::mm::refcount::page_ref_dec(old_phys);
-                crate::mm::refcount::page_ref_set(new_phys, 1);
-                crate::mm::vmm::map_page_in(cr3, page_addr, new_phys, page_flags);
-                crate::mm::vmm::invlpg(page_addr);
-                return true;
-            }
-            return false; // OOM
-        } else {
-            // Single owner — just make it writable
-            let new_pte = (old_phys) | page_flags | crate::mm::vmm::PAGE_PRESENT;
-            crate::mm::vmm::write_pte(cr3, page_addr, new_pte);
-            crate::mm::vmm::invlpg(page_addr);
-            return true;
         }
     }
 

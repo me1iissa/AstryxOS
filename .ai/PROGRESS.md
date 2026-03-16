@@ -1,8 +1,239 @@
 # AstryxOS — Progress Tracker
 
-## Current Phase: Subsystem Architecture — Phase 5 Ascension Init (next)
-**Current**: 2026-03-11
-**Tests**: 74/74 passing (SMP -smp 2 stable)
+## Current Phase: Memory hardening + Firefox X11
+**Current**: 2026-03-14
+**Tests**: 95/95 passing (SMP -smp 2 stable)
+**GUI Tests**: 10/10 pixel checks passing (`scripts/run-gui-test.sh`)
+**Firefox**: Runs for full 15000 ticks without crashing (was: crash at 1481 syscalls at RIP=0x0)
+
+### Milestone 41 — Double Fault Fix: UEFI Bootstrap Stack + CR3 Switch (✅)
+**Completed**: 2026-03-14
+
+**Root cause:** TID 0 (BSP idle/test runner) runs on the UEFI bootstrap stack at physical ~0x3FE84xxx (identity-mapped, PML4[0]). When `schedule()` switched CR3 to a user process's page table before `switch_context`, PML4[0] was replaced by user mappings, unmapping the bootstrap stack → double fault.
+
+**What was fixed:**
+- [x] **Two-phase CR3 switch in schedule()** — Phase 1 (before switch_context): switch to kernel_cr3 so identity map stays active. Phase 2 (after switch_context): switch to incoming thread's per-process CR3, safely on higher-half stack (sched/mod.rs).
+- [x] **exit_thread `-> !` loop** — Wraps schedule() in a loop to prevent undefined behavior when scheduler is disabled between tests on SMP (proc/mod.rs).
+- [x] **Validation guards** — Panics in set_kernel_rsp/update_tss_rsp0 if non-higher-half value passed; panic in schedule() for corrupted kstack_top (syscall/mod.rs, gdt.rs, sched/mod.rs).
+- [x] **DF handler diagnostics** — Double fault handler prints TSS.RSP[0] and per_cpu.kernel_rsp values for crash analysis (idt.rs).
+- [x] **deliver_sigsegv_from_isr hardening** — Validates user stack is mapped before writing signal frame; returns false if unmapped (signal.rs).
+- [x] **TID 0 kernel stack allocation** — BSP idle thread gets a proper PMM-allocated higher-half kernel_stack_base/size for TSS.RSP[0] and per_cpu.kernel_rsp (proc/mod.rs).
+
+---
+
+### Milestone 40 — Firefox Phase 1: Crash Fix (✅)
+**Completed**: 2026-03-13
+
+**What was built:**
+- [x] **AT_HWCAP fix** — Changed from incomplete `0x3200200` to full x86-64 baseline `FPU|TSC|MSR|CX8|APIC|SEP|CMOV|CLFLUSH|MMX|FXSR|SSE|SSE2|HT` (elf.rs). Fixes glibc IFUNC resolvers leaving function pointers as NULL → crash at RIP=0x0.
+- [x] **Syscall 187 (readahead) stub** — Returns 0 (no page cache). Eliminates 13× ENOSYS noise in serial log (syscall/mod.rs).
+- [x] **Data disk /etc/ files** — hostname, hosts, resolv.conf (`nameserver 10.0.2.3`), nsswitch.conf (create-data-disk.sh). Needed by glibc NSS for name resolution.
+- [x] **Firefox envp** — Added `LD_LIBRARY_PATH`, `XDG_RUNTIME_DIR=/tmp`, `XDG_CONFIG_HOME=/tmp/.config`, `FONTCONFIG_PATH`, `HOME=/home/user` (terminal.rs).
+- [x] **Firefox launch args** — `--no-remote --profile /tmp/ff-profile --new-instance` (main.rs, content.rs).
+- [x] **Results**: 49 CreateWindow ops, 110 X11 requests (full GTK init), CLONE3 thread spawned, 1.18M demand-page faults loading libxul.so — Firefox fully alive.
+
+---
+
+### Milestone 39 — Phase F+G: Memory Hardening + X11/GUI (✅)
+**Completed**: 2026-03-13
+
+**What was built:**
+- [x] **F2: Stack guard + lazy growth** — PROT_NONE guard VMA below stack; 1MB anonymous grow region; eager top 16 pages pre-mapped (elf.rs). PROT_NONE check in page fault handler (idt.rs).
+- [x] **F3: madvise MADV_DONTNEED** — Frees physical pages in range: zero, clear PTE, invlpg, decrement refcount/free PMM (syscall/mod.rs).
+- [x] **G1: X11 ICCCM clipboard** — `SetSelectionOwner(22)` with `SelectionClear(29)` to old owner; `GetSelectionOwner(23)`; `ConvertSelection(24)` routes `SelectionRequest(30)` to owner (x11/mod.rs).
+- [x] **G3: EWMH _NET_SUPPORTED** — Root window properties infrastructure (`root_properties` field + `prop_arr_set/get/del` helpers); EWMH atoms pre-interned at `init()`; `_NET_SUPPORTED` set on root window (x11/mod.rs).
+- [x] **X11 bugfixes**: MAX_CLIENTS 8→32; dead-client reaping in `poll()` (peer Free → close server-side socket + remove slot).
+- [x] Tests 93–96: stack guard VMA, madvise DONTNEED, X11 selection ICCCM, EWMH _NET_SUPPORTED
+- [x] **95/95 tests passing** ✅
+
+---
+
+### Milestone 38 — Phase B: Full TCP Networking (✅)
+**Completed**: 2026-03-13
+
+**What was built:**
+- [x] **B1a: rdtsc ISN + send/recv buffers** — `new_isn()` via rdtsc XOR+multiply; retransmit queue as `VecDeque<RetransmitEntry>`; peer window tracking (`peer_window: u32`)
+- [x] **B1b: Full connection lifecycle** — 3WHS (SynSent→SynReceived→Established); FIN exchange (FinWait1/2, CloseWait, LastAck→Closed); TIME_WAIT 200-tick expiry; RST immediate close
+- [x] **B1c: Retransmit queue** — exponential backoff RTO (initial=200, max=6400 ticks); MAX_RETRIES=5 before RST; `tcp_timer_tick()` drains queue + send_buffer + TIME_WAIT
+- [x] **B1d: Congestion control (RFC 5681)** — cwnd starts 1 MSS (1460); ssthresh=65535; slow start + congestion avoidance; fast retransmit on 3 dup-ACKs; timeout loss recovery
+- [x] **B2: setsockopt/getsockopt** — `Socket` struct gains reuseaddr/keepalive/nodelay/rcvbuf/sndbuf/linger/so_error; `socket_setsockopt()/socket_getsockopt()` in socket.rs; syscalls 54/55 wired
+- [x] **B3: SCM_RIGHTS fd passing** — `PENDING_SCM: Mutex<Vec<(u64, Vec<FileDescriptor>)>>`; sendmsg parses cmsghdr, routes to peer; recvmsg dequeues, installs fds, writes reply cmsghdr
+- [x] **B4: unix get_peer** — `unix::get_peer(id) -> u64` added for SCM_RIGHTS routing
+- [x] Tests 89–92: TCP retransmit, congestion control, setsockopt/getsockopt, SCM_RIGHTS
+- [x] **91/91 tests passing** ✅
+
+---
+
+### Milestone 37 — Phase C: VFS Hardening (✅)
+**Completed**: 2026-03-13
+
+**What was built:**
+- [x] **C2: atime on read** — `RamFs::read()` updated to mutable lock + `*accessed = now_secs()` after successful read (ramfs.rs)
+- [x] **C5: unlink-on-last-close** — `DELETED_INODES: Mutex<Vec<(usize,u64)>>` static; `FileSystemOps::unlink_entry()` + `remove_inode()` default methods; `RamFs` implements both; `vfs::remove()` checks open fds before deciding immediate vs. deferred; `vfs::close()` frees inode atomically on last close (vfs/mod.rs + ramfs.rs)
+- [x] **C1: POSIX file locking** — `FileLockEntry` struct + `FILE_LOCKS: Mutex<Vec<FileLockEntry>>` pub static; `F_GETLK(5)`, `F_SETLK(6)`, `F_SETLKW(7)` added to `sys_fcntl`; `exit_group` calls `FILE_LOCKS.lock().retain(|l| l.pid != pid)` for cleanup (vfs/mod.rs + syscall/mod.rs + proc/mod.rs)
+- [x] **C4: /proc/<PID>/ dynamic tree** — `redirect_proc_pid_path()` translates `/proc/<N>/foo` → `/proc/self/foo` for inode resolution; original path preserved in `fd.open_path`; `proc_target_pid()` extracts target PID from open_path; `fd_read()` dynamic dispatch updated to use target_pid for `generate_proc_maps/status/stat` (vfs/mod.rs)
+- [x] Tests 85–88: VFS C2 atime, C5 unlink-last-close, C1 locking, C4 /proc/<PID>/
+- [x] **87/87 tests passing** ✅
+
+---
+
+### Milestone 36 — Phase D/E: Process Groups + Security Foundation (✅)
+**Completed**: 2026-03-13
+
+**What was built:**
+- [x] `pgid: u32`, `sid: u32`, `no_new_privs: bool`, `cap_permitted: u64`, `cap_effective: u64`, `rlimits_soft: [u64; 16]` fields added to `Process` struct (proc/mod.rs)
+- [x] `default_rlimits()` helper — matches Linux defaults (NOFILE=1024, STACK=8MB, NPROC=1024, etc.)
+- [x] All 3 Process constructors updated (idle_proc, create_kernel_process_inner, fork child)
+- [x] `fork_process` captures pgid/sid/no_new_privs/cap_permitted/cap_effective/rlimits_soft from parent and propagates to child
+- [x] RLIMIT_NPROC enforcement in `fork_process` (counts non-zombie processes; returns None if >= soft limit)
+- [x] Orphan adoption in `exit_group`: surviving children of dying process re-parented to PID 1
+- [x] `signal::kill(negative_pid)`: sends to all processes in group pgid=|target_pid| (kill -pgid behavior)
+- [x] Real `setpgid(109)`: updates `proc.pgid` in PROCESS_TABLE
+- [x] Real `getpgrp(111)`: returns caller's `proc.pgid`
+- [x] Real `setsid(112)`: sets `proc.pgid = proc.sid = pid`, returns pid
+- [x] Real `getpgid(121)`: returns target process's `proc.pgid`
+- [x] Real `getsid(122)`: returns target process's `proc.sid`
+- [x] `capget(125)`: returns `cap_effective/cap_permitted` from PCB (2×3-u32 struct for version 3)
+- [x] `capset(126)`: stores new `cap_effective/cap_permitted` in PCB
+- [x] `setrlimit(160)`: updates `rlimits_soft[resource]` in PCB
+- [x] `prlimit64(302)`: GET fills from per-process rlimits_soft; SET updates it
+- [x] `sys_getrlimit` now reads soft limit from per-process `rlimits_soft`
+- [x] `PR_SET_NO_NEW_PRIVS(38)`: sets `proc.no_new_privs = true`; `PR_GET_NO_NEW_PRIVS(39)`: reads it
+- [x] VFS fd allocation: respects `proc.rlimits_soft[7]` (RLIMIT_NOFILE) as cap
+- [x] Tests 83+84: process groups (kill -pgid + setsid + orphan adoption) + capabilities/no_new_privs/rlimits
+- [x] **83/83 tests passing** ✅
+
+---
+
+### Milestone 35 — Win32 PE32+ Process (Phase 3 Complete) (✅)
+**Completed**: 2026-03-13
+
+**What was built:**
+- [x] `kernel/src/proc/pe.rs` — PE32+ loader using PHYS_OFF for all page writes (no CR3 switch)
+- [x] `kernel/src/proc/usermode.rs` — `create_win32_process()`: NT trampoline page, TEB, PE load
+- [x] `kernel/src/nt/mod.rs` — NT stub table, INT 0x2E dispatch, `build_stub_trampoline_page()`
+- [x] `kernel/src/proc/hello_win32_pe.rs` — embedded PE32+ test binary (fixed import table layout)
+- [x] Tests 80+81: `parse_win32_pe` (header validation) + `win32_pe` (full process execution)
+
+**Root cause of PE import terminator bug:** "kernel32.dll" string placed at RVA 0x3090 overlapped the import directory terminator descriptor (RVA 0x3084-0x3097). Terminator's Name field at 0x3090-0x3093 = "kern" ≠ 0 → loader tried to process "MZ" as second DLL → BadSymbolName. Fixed by moving DLL name to RVA 0x30A0.
+
+**Root cause of wrong exit code:** `K32_EXIT_PROCESS` dispatch called `nt_fn_terminate_process(a1, a2, ...)` which uses a2 (RDX) as exit_status. But ExitProcess(0) passes exit code in a1 (RCX). Fixed by inlining `exit_thread(a1)` for K32_EXIT_PROCESS.
+
+**Key architectural insight:** All page writes in PE loader (sections, headers, stack, relocations, IAT) must use PHYS_OFF (`0xFFFF_8000_0000_0000 + phys`). No CR3 switch needed — identical approach to ELF loader.
+
+### Milestone 34 — musl Dynamic Linking (Phase 2 Complete) (✅)
+**Completed**: 2026-03-13
+
+**Root cause of hang:** `read_file("/disk/lib/ld-musl-x86_64.so.1")` (838KB, 1638 sectors)
+took 300+ seconds on WSL2/KVM due to nested virtualization: each ATA PIO port read
+(`inb` status port) costs ~100µs (KVM inside Hyper-V). 1638 sector reads × ~2 `wait_ready`
+calls each × ~100ms = 327 seconds → test timeout at 120s.
+
+**Fix:** `INTERP_CACHE` static in `proc/elf.rs` — `spin::Mutex<Option<(String, Vec<u8>)>>`.
+First `exec` of a dynamic ELF reads from disk (slow, ~300s); subsequent execs clone from RAM
+(instant). `read_interpreter_cached(path)` wraps `vfs::read_file` with the cache.
+
+**Impact:** test_dynamic_elf [PASS]; test_pie_dynamic_elf [PASS] (both pass 77/77 run).
+ld-musl ran successfully: arch_prctl→set_tid_address→brk×2→mmap(PROT_NONE)→mprotect×2→
+write(1,…)×33→exit_group(0). Output printed to stdout fd, process exited cleanly.
+
+**Note:** The slow first-load still exists for test runs (it's the first exec). The test suite
+timeout is generous enough now because the cache is warm after the first test that loads it.
+
+### Milestone 33 — Fork Child Register Inheritance Fix (✅ Complete)
+**Completed**: 2026-03-13
+
+**Root cause:** `fork_child_entry` only set RAX=0 and RSP/RIP via iretq, leaving callee-saved
+registers (RBP, RBX, R12–R15) as garbage kernel values. glibc's `__fork` epilogue
+(`mov -0x38(%rbp),%rax; sub %fs:0x28,%rax; jne __stack_chk_fail`) crashed with
+CR2=0xffffffffffffffc8 because RBP=0 (kernel garbage).
+
+**What was built:**
+- [x] `ForkUserRegs` struct + `fork_user_regs` Thread field + `set_fork_user_regs()` helper (`proc/mod.rs`)
+- [x] `PerCpuSyscallData::frame_rsp` field at gs:[24] (`syscall/mod.rs`): naked_asm stores kernel RSP after all user-reg pushes; avoids R_X86_64_32S relocation issue (higher-half statics can't be referenced via 32-bit absolute in naked_asm)
+- [x] `read_fork_user_regs()` reads `PER_CPU_SYSCALL[cpu].frame_rsp` and extracts RBP/RBX/R12–R15 from the saved frame
+- [x] `sys_fork_impl`: captures parent regs before `fork_process`, stores via `set_fork_user_regs` after child created
+- [x] `fork_child_entry`: `mov rbp, {rbp_val}` + `mov rbx, {rbx_val}` (via generic reg constraints) + `in("r12")` through `in("r15")` explicit constraints — all callee-saved regs restored before iretq
+- [x] AP idle thread in `apic.rs` updated with `fork_user_regs: ForkUserRegs::default()`
+- [x] **Firefox smoke test: 4/4 PASS, `FFTEST DONE` at tick ~11000** (was crashing at tick 14607)
+- [x] All 77 kernel unit tests still pass
+
+### Milestone 32 — Fork/CoW Fix for Firefox (✅ Complete)
+**Completed**: 2026-03-12
+
+**Root cause found and fixed:**
+- [x] **`vm_space.cr3 ≠ proc.cr3` discrepancy** — `clone_for_fork` was walking stale page tables (VmSpace CR3 `0x5d2000`) instead of the actual running CR3 (`proc.cr3` = `0x3de29000`). Fork child got only ~529 pages instead of Firefox's full address space, causing `__nss_database_fork_subprocess: local != NULL` assertion failure.
+- [x] **`clone_for_fork` signature** (`mm/vma.rs`): `(&self)` → `(&mut self, actual_cr3: u64)`. Uses `actual_cr3` for all page table walks. Syncs `self.cr3 = actual_cr3` when they diverge (logged as warning).
+- [x] **`fork_process` call site** (`proc/mod.rs`): Reads `actual_cr3 = parent.cr3` before mutable borrow on `vm_space`; passes it to `clone_for_fork`.
+- [x] **CoW early path in page fault handler** (`idt.rs` `handle_page_fault`): Moved present+write CoW handling BEFORE VMA lookup. Added fallback `RW|User` flags for CoW pages with no registered VMA (handles fork children with incomplete VMA lists).
+- [x] Tests 1–44 all pass including test 14 ("exec/fork per-process page tables + CoW") ✓
+
+---
+
+### Milestone 31 — Linux Syscall Completeness + CRT Infrastructure (✅)
+**Completed**: 2026-03-12
+
+**What was built:**
+- [x] **CMOS RTC driver** (`drivers/rtc.rs`) — reads wall-clock time from CMOS 0x70/0x71; BCD + binary mode; Unix timestamp conversion
+- [x] **`clock_gettime` differentiated** — CLOCK_REALTIME (0) returns RTC wall-clock, CLOCK_MONOTONIC returns PIT uptime
+- [x] **MAX_FDS_PER_PROCESS: 64 → 1024** (`vfs/mod.rs`)
+- [x] **FD_CLOEXEC tracking** — `cloexec: bool` added to `FileDescriptor`; `fcntl` F_GETFD/F_SETFD read/write it; enforced on exec; pipe2/dup3 set from flags
+- [x] **`fcntl` F_DUPFD_CLOEXEC** — full implementation
+- [x] **`fcntl` F_GETFL** — returns actual fd flags instead of hardcoded 0o2
+- [x] **`fsync(74)`/`fdatasync(75)`** — added as stubs returning 0
+- [x] **`sendfile(40)`** — implemented: reads from in_fd at offset, writes to out_fd
+- [x] **AT_HWCAP + AT_CLKTCK** added to ELF aux vector (AT_HWCAP=SSE+SSE2+FXSR; AT_CLKTCK=100)
+- [x] **`getsockopt`** — returns sensible defaults for SO_RCVBUF(87380), SO_SNDBUF(131072), SO_TYPE, SO_REUSEADDR, SO_ERROR, TCP_NODELAY
+- [x] **Fixed timerfd_settime** syscall number: 288→286 (Linux canonical); added accept4(288)
+- [x] **`dup3`** — honors O_CLOEXEC flag on the new fd
+- [x] **Tests 79/80** — syscall completeness (fcntl/cloexec/fsync/fd-table), clock_gettime CLOCK_REALTIME
+- [x] **79/79 tests passing** ✅
+
+**Reference documents created:**
+- `.ai/missing_features/` — 13-file gap analysis vs Windows XP + Linux reference OSes
+- `.ai/C_Runtime/` — 7-file CRT design (musl/glibc/Win32 ntdll + MSVCRT + libaether)
+
+---
+
+### Milestone 30 — Automated GUI Testing System (✅)
+**Completed**: 2026-03-11
+
+**What was built:**
+- [x] **`gui-test` kernel feature** (`kernel/Cargo.toml`) — new cargo feature flag separate from `test-mode`
+- [x] **Pixel telemetry** (`compositor.rs::emit_pixel_telemetry`) — kernel reads its own backbuffer after 60 render ticks and emits `[GUITEST] pixel X Y name #RRGGBB` lines to serial
+- [x] **`gui-test` boot path** (`main.rs`) — inside `not(test-mode)` block, the `gui-test` feature runs bounded desktop loop (60 ticks), emits telemetry, waits ~1s, then triggers ISA debug-exit
+- [x] **`scripts/run-gui-test.sh`** — builds `--features gui-test`, runs QEMU with debug-exit + QMP socket, captures serial, optionally takes screenshot via QMP, runs Python analyser
+- [x] **`scripts/analyze-gui.py`** — parses `[GUITEST]` serial lines; validates: kernel_done, frame_count, resolution, desktop gradient (exact formula match), taskbar colour, active/inactive window title bars, client area coverage; optional PPM screenshot sampling
+
+**Test results (first run)**:
+```
+[PASS] kernel_done, frame_count=60, resolution=1920×1080
+[PASS] desktop_center: #0B1225  expected ~#0B1225  (dist=0)
+[PASS] desktop_top: #0A0A20  expected ~#0A0A20  (dist=0)
+[PASS] taskbar: #1A1A2E  expected ~#1A1A2E  (dist=0)
+[PASS] term_title: #1B1B1B  expected ~#1B1B1B  (dist=0, active)
+[PASS] expl_title: #2D2D2D  expected ~#2D2D2D  (dist=0, inactive)
+[PASS] term_client: drawn over desktop
+Results: 10/10 checks passed — OVERALL: PASS
+```
+
+**Novel approach**: The kernel acts as its own test oracle — no external image processing required. It reads pixels from the compositor backbuffer (the same Vec<u32> that drives the SVGA II hardware) and reports them via serial. The Python analyser validates colours using the exact same gradient formula as the kernel (bit-for-bit reproducible). QMP screendump provides a visual archive.
+
+---
+
+### Milestone 29 — Phase 6: Firefox Desktop Support Foundation (✅)
+**Completed**: 2026-03-11
+
+**What was built:**
+- [x] **SIGSEGV delivery from page fault ISR** — `exception_handler` calls `deliver_sigsegv_from_isr(cr2, error_code, frame)` before killing Ring-3. If `SigAction::Handler` registered: builds `SignalFrame` + 128-byte `siginfo_t` (si_addr=cr2) on user stack, patches saved RDI/RSI on ISR stack, modifies InterruptFrame.rip/rsp to redirect IRET to handler.
+- [x] **SysV shared memory** (`kernel/src/ipc/sysv_shm.rs`) — shmget/shmat/shmdt/shmctl; 64-segment table, physical backing, Device-VMA
+- [x] **PTY** (`kernel/src/drivers/pty.rs`) — /dev/ptmx + /dev/pts/N; bidirectional ring buffers; TIOCGPTN/TIOCSPTLCK/TIOCGWINSZ; epoll support
+- [x] **XRandR** (`op_randr`) — major opcode 143; QueryVersion 1.6, GetScreenInfo, GetScreenResources stubs
+- [x] **timerfd / signalfd / inotify** — new ipc modules wired to syscalls
+- [x] **Tests 76/77/78** — SIGSEGV infrastructure, PTY I/O, SysV SHM all pass
+- [x] **77/77 tests passing** ✅
+
+---
 
 ### Milestone 21 — Phase 3: TinyCC Compiler Toolchain (✅)
 **Completed**: 2026-03-06
