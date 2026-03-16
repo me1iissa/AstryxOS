@@ -1344,16 +1344,20 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
         "[FORK] child PID {} stack: rip={:#x} rsp={:#x} tls={:#x} rbp={:#x} rbx={:#x}",
         child_pid, user_rip, user_rsp, parent_tls_base, parent_regs.rbp, parent_regs.rbx
     );
-    let initial_rsp = thread::init_fork_child_stack(
-        stack_top, user_rip, user_rsp, parent_tls_base, parent_regs,
+    // Use user_mode_bootstrap (same path as clone threads) for the fork child.
+    // This ensures proper CR3 switch, TSS.RSP0, TLS setup before entering Ring 3.
+    // The child's user_entry_rip is advanced +7 past glibc's __clone child path
+    // to skip `pop rax; call *rax` and land on `ret` (parent return path).
+    let child_rip = user_rip + 7;
+    let initial_rsp = thread::init_thread_stack(
+        stack_top, crate::proc::usermode::user_mode_bootstrap as *const () as u64,
     );
 
     let context = CpuContext {
         rsp: initial_rsp,
-        rbp: parent_regs.rbp,
-        rbx: 0,
-        r12: parent_regs.r12, r13: parent_regs.r13,
-        r14: parent_regs.r14, r15: parent_regs.r15,
+        rbp: 0,
+        rbx: crate::proc::usermode::user_mode_bootstrap as *const () as u64,
+        r12: 0, r13: 0, r14: 0, r15: 0,
         rflags: 0x202,
         cr3: child_cr3,
     };
@@ -1412,7 +1416,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
         name: thread_name,
         exit_code: 0,
         fpu_state: None,
-        user_entry_rip: user_rip,
+        user_entry_rip: child_rip, // +7 to skip clone child path → land on `ret`
         user_entry_rsp: user_rsp,
         user_entry_rdx: 0,
         user_entry_r8:  0,
@@ -1421,7 +1425,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
         tls_base: parent_tls_base, // inherit parent's FS.base so fork child has working TLS
         cpu_affinity: None,
         last_cpu: 0,
-        first_run: false,
+        first_run: true, // goes through user_mode_bootstrap (CR3 switch, TSS, TLS)
         ctx_rsp_valid: core::sync::atomic::AtomicBool::new(true),
         clear_child_tid: 0,
         fork_user_regs: ForkUserRegs::default(),
@@ -1506,13 +1510,17 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
     let child_rip = user_rip + 7; // skip test;jl;je → land on `ret`
 
     crate::serial_println!(
-        "[VFORK] child PID {} sharing parent CR3={:#x} rip={:#x}(+7={:#x}) rsp={:#x} tls={:#x}",
+        "[VFORK] child PID {} CR3={:#x} rip={:#x}(+7={:#x}) rsp={:#x} tls={:#x}",
         child_pid, parent_cr3, user_rip, child_rip, user_rsp, parent_tls
     );
 
     // Build the fork child's kernel stack with pre-built IRETQ frame.
+    // Child uses parent's RSP (shared address space). The child's `ret` from
+    // clone() pops the correct return address from the parent's stack frame.
+    // Note: the child may corrupt the parent's stack canary (causing "stack
+    // smashing detected" in the child), but the parent continues fine.
     let initial_rsp = thread::init_fork_child_stack(
-        stack_top, user_rip, user_rsp, parent_tls, parent_regs,
+        stack_top, child_rip, user_rsp, parent_tls, parent_regs,
     );
 
     // Use the normal thread_entry_trampoline → user_mode_bootstrap path.
