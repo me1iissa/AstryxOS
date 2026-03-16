@@ -364,6 +364,30 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 core::hint::spin_loop();
             }
 
+            // Pre-load key files into the VFS read cache BEFORE launching Firefox.
+            // ATA PIO on WSL2/KVM is ~100µs per sector (nested virt exit), making
+            // the 2.7MB firefox-bin + 300KB ld-linux take 5+ minutes cold. By pre-loading
+            // here, the desktop compositor can spin while we wait, and the actual
+            // Firefox exec is instant (cache hit).
+            serial_println!("[FFTEST] Pre-loading Firefox files from disk (slow ATA PIO)...");
+            for path in &[
+                "/disk/lib64/ld-linux-x86-64.so.2",
+                "/disk/lib/firefox/firefox-bin",
+            ] {
+                let t0 = arch::x86_64::irq::get_ticks();
+                match vfs::read_file(path) {
+                    Ok(data) => {
+                        let dt = arch::x86_64::irq::get_ticks().wrapping_sub(t0);
+                        serial_println!("[FFTEST] Pre-loaded {} ({} bytes) in {} ticks",
+                            path, data.len(), dt);
+                    }
+                    Err(e) => serial_println!("[FFTEST] WARN: Cannot pre-load {}: {:?}", path, e),
+                }
+                // Keep compositor alive during slow I/O
+                gui::compositor::compose();
+            }
+            serial_println!("[FFTEST] Pre-load complete — launching Firefox");
+
             serial_println!("[FFTEST] Launching /disk/lib/firefox/firefox-bin ...");
             // X11 windowed mode — Firefox should create a window on our X11 server.
             gui::terminal::launch_process(

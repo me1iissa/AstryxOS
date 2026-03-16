@@ -31,28 +31,32 @@ fn phys_to_virt(phys: u64) -> *mut u8 {
     (0xFFFF_8000_0000_0000u64 + phys) as *mut u8
 }
 
-/// Kernel-side cache for the dynamic interpreter binary.
+/// Kernel-side cache for dynamic interpreter binaries.
 ///
-/// ld-musl-x86_64.so.1 is ~840 KiB. On WSL2/KVM each ATA PIO sector read
-/// requires a hypervisor exit (~100 µs), making 1638 sector reads take 300+
-/// seconds. By caching the bytes in kernel RAM after the first successful
-/// read, every subsequent `exec` of a dynamically-linked binary is instant.
-static INTERP_CACHE: spin::Mutex<Option<(alloc::string::String, alloc::vec::Vec<u8>)>> =
-    spin::Mutex::new(None);
+/// Interpreters (ld-musl, ld-linux) are 300-840 KiB. On WSL2/KVM each ATA PIO
+/// sector read requires a hypervisor exit (~100 µs), making reads take 60-300
+/// seconds. Caching in kernel RAM makes all subsequent execs instant.
+/// Supports up to 4 different interpreters (ld-musl, ld-linux, etc.).
+static INTERP_CACHE: spin::Mutex<alloc::vec::Vec<(alloc::string::String, alloc::vec::Vec<u8>)>> =
+    spin::Mutex::new(alloc::vec::Vec::new());
 
-/// Return the interpreter binary, reading from disk only on first call.
+/// Return the interpreter binary, reading from disk only on cache miss.
 fn read_interpreter_cached(path: &str) -> Result<alloc::vec::Vec<u8>, crate::vfs::VfsError> {
     {
         let cache = INTERP_CACHE.lock();
-        if let Some((ref p, ref data)) = *cache {
+        for (ref p, ref data) in cache.iter() {
             if p == path {
                 return Ok(data.clone());
             }
         }
     }
-    // Cache miss — read from VFS (slow on first call).
+    // Cache miss — read from VFS (slow).
+    crate::serial_println!("[ELF] INTERP cache miss for '{}' — reading from disk (slow)...", path);
     let data = crate::vfs::read_file(path)?;
-    *INTERP_CACHE.lock() = Some((alloc::string::String::from(path), data.clone()));
+    crate::serial_println!("[ELF] INTERP loaded {} bytes, caching", data.len());
+    let mut cache = INTERP_CACHE.lock();
+    if cache.len() >= 4 { cache.remove(0); } // LRU eviction
+    cache.push((alloc::string::String::from(path), data.clone()));
     Ok(data)
 }
 

@@ -181,11 +181,12 @@ extern "C" fn timer_tick() {
     // ── Heartbeat: emit every 500 ticks (~5s at 100 Hz) ─────────────
     // Gives the external watchdog (tools/qemu-watchdog.py) a signal that
     // the timer ISR is still firing.  Zero cost in production builds.
-    #[cfg(feature = "test-mode")]
+    #[cfg(any(feature = "test-mode", feature = "firefox-test"))]
     {
         if tick > 0 && tick % 500 == 0 {
             let cpu = super::apic::cpu_index();
-            crate::serial_println!("[HB] tick={} cpu={}", tick, cpu);
+            crate::serial_println!("[HB] tick={} cpu={} pf={}", tick, cpu,
+                crate::arch::x86_64::idt::page_fault_count());
         }
     }
 
