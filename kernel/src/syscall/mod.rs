@@ -3596,11 +3596,28 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
                         // Override child's user RSP to the new_stack provided by glibc.
                         // glibc's __clone placed fn/arg on this stack before the syscall.
                         // The child will `pop rax; pop rdi; call *rax` on this stack.
-                        // Don't override RSP/RIP. fork_process already set:
-                        //   user_entry_rip = user_rip (clone return point)
-                        //   user_entry_rsp = parent's user RSP
-                        // The child returns from clone() to Firefox's code which
-                        // checks if (pid == 0) → child path → calls exec.
+                        // Override child's RSP to use the new_stack provided to clone().
+                        // SandboxLaunch/glibc placed fn/arg on this stack before syscall.
+                        // The child goes through glibc's clone child path:
+                        //   test rax,rax; je .child; .child: pop rax; pop rdi; call *rax
+                        // where rax = the function that sets up sandbox + calls execve.
+                        if new_stack != 0 {
+                            let original_rip = unsafe { get_user_rip() };
+                            // glibc's __clone did `sub $0x10, %rsi` and placed fn/arg
+                            // at the adjusted address before syscall. But Firefox's
+                            // SandboxLaunch passes the original stack_top to clone().
+                            // The fn/arg are at stack_top-0x10 and stack_top-0x08.
+                            // Set child RSP = stack_top - 0x10 so pop rax gets fn.
+                            let child_rsp = new_stack - 0x10;
+                            let mut threads = crate::proc::THREAD_TABLE.lock();
+                            if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
+                                t.user_entry_rsp = child_rsp;
+                                t.user_entry_rip = original_rip;
+                                crate::serial_println!(
+                                    "[VFORK] child TID {} stack={:#x}(-0x10={:#x}) rip={:#x}",
+                                    child_tid, new_stack, child_rsp, original_rip);
+                            }
+                        }
 
                         // Unblock the child so the scheduler can run it.
                         crate::proc::unblock_process(child_pid);
