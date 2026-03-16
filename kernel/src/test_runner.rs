@@ -1588,7 +1588,7 @@ fn test_exec_fork() -> bool {
     let proc_count_before = crate::proc::process_count();
 
     test_println!("  Testing fork (parent PID={})...", parent_pid);
-    match crate::proc::fork_process(parent_pid, parent_tid) {
+    match crate::proc::fork_process(parent_pid, parent_tid, &crate::proc::ForkUserRegs::default()) {
         Some((child_pid, _child_tid)) => {
             test_println!("  fork created child PID {} ✓", child_pid);
 

@@ -203,7 +203,7 @@ fn create_user_process_impl(
 /// 2. Switches to the per-process page table (CR3).
 /// 3. Configures TSS.rsp[0] and SYSCALL_KERNEL_RSP for Ring 3 → Ring 0 transitions.
 /// 4. Performs IRETQ to enter Ring 3.
-fn user_mode_bootstrap() {
+pub fn user_mode_bootstrap() {
     crate::serial_println!("[BOOT] tid={} entering bootstrap", crate::proc::current_tid());
 
     // Clear first_run immediately so that if this thread is ever re-scheduled
@@ -221,8 +221,15 @@ fn user_mode_bootstrap() {
     let (entry_rip, entry_rsp, entry_rdx, entry_r8, kernel_stack_top, user_cr3, tls_base, gs_base) = {
         let tid = proc::current_tid();
         let threads = THREAD_TABLE.lock();
-        let thread = threads.iter().find(|t| t.tid == tid)
-            .expect("bootstrap: current thread not found");
+        let thread = match threads.iter().find(|t| t.tid == tid) {
+            Some(t) => t,
+            None => {
+                crate::serial_println!("[BOOT] FATAL: tid={} not found in THREAD_TABLE!", tid);
+                drop(threads);
+                proc::exit_thread(-1);
+                loop {} // unreachable
+            }
+        };
         (
             thread.user_entry_rip,
             thread.user_entry_rsp,
@@ -236,8 +243,8 @@ fn user_mode_bootstrap() {
     };
 
     crate::serial_println!(
-        "[USER] Bootstrap: entering Ring 3 at RIP={:#x}, RSP={:#x}, CR3={:#x}",
-        entry_rip, entry_rsp, user_cr3
+        "[USER] Bootstrap tid={}: Ring 3 at RIP={:#x} RSP={:#x} CR3={:#x} RDX={:#x} R8={:#x}",
+        proc::current_tid(), entry_rip, entry_rsp, user_cr3, entry_rdx, entry_r8
     );
 
     // Switch to the per-process page table.
@@ -263,6 +270,9 @@ fn user_mode_bootstrap() {
     }
 
     // Jump to user mode via IRETQ. This never returns.
+    crate::serial_println!(
+        "[BOOT] jump_to_user_mode: rip={:#x} rsp={:#x} rdx={:#x} r8={:#x}",
+        entry_rip, entry_rsp, entry_rdx, entry_r8);
     unsafe { jump_to_user_mode(entry_rip, entry_rsp, entry_rdx, entry_r8); }
 }
 
