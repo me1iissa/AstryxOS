@@ -4084,6 +4084,63 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
                     }
                     None => -11, // EAGAIN
                 }
+            } else if clone_flags & CLONE_VM != 0 {
+                // CLONE_VM without CLONE_THREAD via clone3 = vfork-style.
+                // glibc's __clone3 passes func in RDX and arg in R8/RCX.
+                // The child path does: mov rdi, r8; call *rdx.
+                // We must set entry_rdx/entry_r8 BEFORE unblocking the child.
+                let func = arg3; // RDX at clone3 = func pointer
+                let thread_arg = arg5; // R8 at clone3 = arg pointer (via RCX→R8)
+                let original_rip = unsafe { get_user_rip() };
+                let pid = crate::proc::current_pid();
+                let parent_tid = crate::proc::current_tid();
+                let parent_regs = read_fork_user_regs();
+
+                const CLONE_VFORK: u64 = 0x00004000;
+                let is_vfork = clone_flags & CLONE_VFORK != 0;
+
+                crate::serial_println!("[CLONE3-VFORK] pid={} func={:#x} arg={:#x} rip={:#x} sp={:#x}",
+                    pid, func, thread_arg, original_rip, sp);
+
+                match crate::proc::fork_process(pid, parent_tid, &parent_regs) {
+                    Some((child_pid, child_tid)) => {
+                        // Set func/arg and original RIP BEFORE unblocking
+                        {
+                            let mut threads = crate::proc::THREAD_TABLE.lock();
+                            if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
+                                t.user_entry_rdx = func;
+                                t.user_entry_r8 = thread_arg;
+                                t.user_entry_rip = original_rip; // clone3 child uses call *rdx
+                                if sp != 0 {
+                                    t.user_entry_rsp = sp; // use the new_stack from clone3
+                                }
+                            }
+                        }
+                        crate::serial_println!(
+                            "[CLONE3-VFORK] child PID {} TID {} rdx={:#x} r8={:#x} rip={:#x} rsp={:#x}",
+                            child_pid, child_tid, func, thread_arg, original_rip, sp);
+
+                        // NOW unblock the child
+                        crate::proc::unblock_process(child_pid);
+
+                        // Block parent for vfork
+                        if is_vfork {
+                            let mut threads = crate::proc::THREAD_TABLE.lock();
+                            if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
+                                t.vfork_parent_tid = Some(parent_tid);
+                            }
+                            if let Some(t) = threads.iter_mut().find(|t| t.tid == parent_tid) {
+                                t.state = crate::proc::ThreadState::Blocked;
+                                let now = crate::arch::x86_64::irq::get_ticks();
+                                t.wake_tick = now.saturating_add(500);
+                            }
+                            drop(threads);
+                            crate::sched::schedule();
+                        }
+                        child_pid as i64
+                    }
+                    None => -11 // EAGAIN
+                }
             } else {
                 dispatch_linux(56, clone_flags, sp, parent_tidptr, child_tidptr, tls, 0)
             }
