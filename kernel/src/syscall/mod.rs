@@ -3582,34 +3582,35 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
                 crate::serial_println!("[VFORK] pid={} flags={:#x} vfork={} parent_tid={}",
                     pid, flags, is_vfork, parent_tid);
 
-                // Create a child PROCESS sharing the parent's address space (CR3).
-                // Linux: copy_process() with CLONE_VM creates a new task_struct
-                // that references the parent's mm_struct. The child has its own
-                // PID so crashes don't kill the parent.
+                // Create a child process via CoW fork. Although CLONE_VM means
+                // "shared address space", Firefox uses this for content processes
+                // that run Firefox code (not exec a different binary). CoW fork
+                // gives the child its own stack (avoiding "stack smashing detected"
+                // from shared-stack vfork). The parent is NOT blocked (no deadlock).
                 let parent_regs = read_fork_user_regs();
-                match crate::proc::vfork_process(pid, parent_tid, &parent_regs) {
+                let child_tidptr = arg4; // r10 = ctid
+                match crate::proc::fork_process(pid, parent_tid, &parent_regs) {
                     Some((child_pid, child_tid)) => {
                         crate::serial_println!("[VFORK] child PID {} TID {} created", child_pid, child_tid);
 
-                        if is_vfork {
-                            // Store parent TID in child thread for wake-on-exec/exit.
-                            {
-                                let mut threads = crate::proc::THREAD_TABLE.lock();
-                                if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
-                                    t.vfork_parent_tid = Some(parent_tid);
-                                }
-                            }
+                        // Unblock the child so the scheduler can run it.
+                        // fork_process creates the child in Blocked state.
+                        crate::proc::unblock_process(child_pid);
 
-                            // Block parent until child signals completion.
-                            {
-                                let mut threads = crate::proc::THREAD_TABLE.lock();
-                                if let Some(t) = threads.iter_mut().find(|t| t.tid == parent_tid) {
-                                    t.state = crate::proc::ThreadState::Blocked;
-                                    t.wake_tick = u64::MAX;
-                                }
+                        // CLONE_VFORK: In Linux, the parent blocks until the child
+                        // calls execve/exit. But Firefox uses CLONE_VM|CLONE_VFORK
+                        // to create content processes that run Firefox code in the
+                        // shared address space without ever calling execve. Blocking
+                        // the parent causes a deadlock (child waits for IPC from
+                        // blocked parent). Instead: don't block. The child runs
+                        // concurrently with the parent in the shared address space.
+                        // This is safe because CLONE_VM means shared page tables.
+                        if is_vfork {
+                            // Store parent TID so exit/exec can signal if needed.
+                            let mut threads = crate::proc::THREAD_TABLE.lock();
+                            if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
+                                t.vfork_parent_tid = Some(parent_tid);
                             }
-                            crate::sched::schedule();
-                            // Resumed: child called exec or exit and woke us.
                         }
                         child_pid as i64
                     }
