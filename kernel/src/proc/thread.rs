@@ -86,22 +86,58 @@ core::arch::global_asm!(
     // For a new thread, this returns to thread_entry_trampoline.
     "ret",
     ".size switch_context_asm, . - switch_context_asm",
+
+    // ── ret_from_fork_asm ────────────────────────────────────────────────
+    // Fork child return-to-userspace trampoline (Linux ret_from_fork pattern).
+    //
+    // switch_context_asm's `ret` lands here for fork children.  At entry:
+    //   r12-r15 = parent's callee-saved regs (restored by switch_context_asm pops)
+    //   rbp     = parent's RBP (restored by switch_context_asm pop)
+    //   RSP →   [tls_base, saved_rbx, SS, user_rsp, RFLAGS, CS, user_rip]
+    //
+    // This trampoline:
+    //   1. Restores FS base (TLS) from the pre-built stack frame
+    //   2. Restores RBX from parent
+    //   3. Zeroes scratch registers (security: prevent kernel data leak)
+    //   4. Executes IRETQ to enter Ring 3 with RAX=0 (fork child return)
+    //
+    // NO Rust function calls.  NO `call` instructions.  The IRETQ frame was
+    // pre-built by init_fork_child_stack() at fork time.
+    ".global ret_from_fork_asm",
+    ".type ret_from_fork_asm, @function",
+    "ret_from_fork_asm:",
+    // Pop TLS base and write to FS_BASE MSR if non-zero
+    "pop rax",                     // tls_base
+    "test rax, rax",
+    "jz 2f",
+    "mov ecx, 0xC0000100",        // IA32_FS_BASE
+    "mov rdx, rax",
+    "shr rdx, 32",                // high 32 bits → EDX
+    "mov eax, eax",               // low 32 bits (zero-extend) → EAX
+    "wrmsr",
+    "2:",
+    // Pop parent's RBX
+    "pop rbx",
+    // Zero ALL scratch registers (prevent kernel address leak to Ring 3)
+    "xor eax, eax",               // RAX = 0 (fork returns 0 in child)
+    "xor ecx, ecx",
+    "xor edx, edx",
+    "xor esi, esi",
+    "xor edi, edi",
+    "xor r8d, r8d",
+    "xor r9d, r9d",
+    "xor r10d, r10d",
+    "xor r11d, r11d",
+    // RSP now points to the pre-built IRETQ frame: [SS, RSP, RFLAGS, CS, RIP]
+    "iretq",
+    ".size ret_from_fork_asm, . - ret_from_fork_asm",
 );
 
 extern "C" {
     /// Perform a context switch between two threads.
-    ///
-    /// Saves the current thread's callee-saved registers on its stack,
-    /// stores its RSP to *old_rsp_ptr, then sets *ctx_valid_ptr = 1
-    /// (if non-null) to atomically signal that the saved RSP is valid.
-    /// Then loads new_rsp and resumes the new thread.
-    ///
-    /// # Safety
-    /// Both pointers must be valid. `new_rsp` must point to a properly
-    /// initialized stack (either from a previous switch_context, or from
-    /// `init_thread_stack`). `ctx_valid_ptr` must be null or point to a
-    /// valid `u8` (the `ctx_rsp_valid` byte of the outgoing thread).
     pub fn switch_context_asm(old_rsp_ptr: *mut u64, new_rsp: u64, ctx_valid_ptr: *mut u8);
+    /// Fork child return-to-userspace trampoline (address used by init_fork_child_stack).
+    fn ret_from_fork_asm();
 }
 
 /// Safe-ish wrapper that calls the assembly context switch.
@@ -158,4 +194,150 @@ pub fn init_thread_stack(stack_top: u64, entry_point: u64) -> u64 {
     }
     // Initial RSP points just below the last pushed register
     stack_top - 8 * 8
+}
+
+/// Initialize a fork child's kernel stack with a pre-built IRETQ frame.
+///
+/// Unlike `init_thread_stack` (which uses `thread_entry_trampoline` → Rust function),
+/// this builds the entire return-to-userspace frame at fork time.  When the scheduler
+/// picks this child, `switch_context_asm` pops callee-saved regs and `ret` lands
+/// directly in `ret_from_fork_asm` (pure assembly), which restores TLS, RBX, zeroes
+/// scratch regs, and does IRETQ.  No Rust function calls in the path.
+///
+/// This is the Linux `copy_thread` + `ret_from_fork_asm` pattern.
+///
+/// Stack layout (growing downward, top = high address):
+/// ```text
+///   [stack_top - 8]   = 0                    (alignment padding)
+///   [stack_top - 16]  = ret_from_fork_asm    (return address for switch_context ret)
+///   [stack_top - 24]  = fork_regs.rbp        (rbp — popped by switch_context)
+///   [stack_top - 32]  = 0                    (rbx — switch_context pops, ignored)
+///   [stack_top - 40]  = fork_regs.r12        (r12 — popped by switch_context)
+///   [stack_top - 48]  = fork_regs.r13        (r13 — popped by switch_context)
+///   [stack_top - 56]  = fork_regs.r14        (r14 — popped by switch_context)
+///   [stack_top - 64]  = fork_regs.r15        (r15 — popped by switch_context)
+///   ── switch_context pops above, ret → ret_from_fork_asm ──
+///   [stack_top - 72]  = tls_base             (popped by ret_from_fork_asm → WRMSR FS_BASE)
+///   [stack_top - 80]  = fork_regs.rbx        (popped by ret_from_fork_asm → RBX)
+///   [stack_top - 88]  = 0x1B                 (SS — USER_DATA_SELECTOR)
+///   [stack_top - 96]  = user_rsp             (RSP — popped by IRETQ)
+///   [stack_top - 104] = 0x202                (RFLAGS — IF set)
+///   [stack_top - 112] = 0x23                 (CS — USER_CODE_SELECTOR)
+///   [stack_top - 120] = user_rip             (RIP — popped by IRETQ)
+///   ^ initial RSP
+/// ```
+pub fn init_fork_child_stack(
+    stack_top: u64,
+    user_rip: u64,
+    user_rsp: u64,
+    tls_base: u64,
+    fork_regs: &super::ForkUserRegs,
+) -> u64 {
+    // Stack grows DOWN. switch_context_asm pops from initial_rsp UPWARD.
+    // Layout (high address = top, low address = bottom):
+    //
+    //   stack_top - 8    = alignment padding
+    //   stack_top - 16   = ret_from_fork_asm   ← popped by switch_context `ret`
+    //   stack_top - 24   = rbp                  ← popped by switch_context `pop rbp`
+    //   stack_top - 32   = 0 (rbx placeholder) ← popped by switch_context `pop rbx`
+    //   stack_top - 40   = r12                  ← popped by switch_context `pop r12`
+    //   stack_top - 48   = r13                  ← popped by switch_context `pop r13`
+    //   stack_top - 56   = r14                  ← popped by switch_context `pop r14`
+    //   stack_top - 64   = r15                  ← popped by switch_context `pop r15`
+    //                                              (initial_rsp points here)
+    //
+    // After switch_context pops 6 regs (48 bytes) + ret (8 bytes),
+    // RSP = initial_rsp + 56 = stack_top - 8.
+    // ret pops from stack_top - 16 → RSP = stack_top - 8.
+    //
+    // Wait: pop r15 from initial_rsp, pop r14 from +8, pop r13 from +16,
+    //       pop r12 from +24, pop rbx from +32, pop rbp from +40,
+    //       ret pops from +48.
+    //
+    // So after switch_context: ret_addr is at initial_rsp + 48.
+    // initial_rsp + 48 = (stack_top - 64) + 48 = stack_top - 16. Correct!
+    //
+    // After ret: RSP = stack_top - 8. But that's the alignment padding.
+    // ret_from_fork_asm starts executing. RSP = stack_top - 8.
+    // But we need ret_from_fork_asm to pop tls_base and rbx, then IRETQ.
+    // So those must be at stack_top - 8 downward? NO — RSP = stack_top - 8
+    // means the next pop reads from stack_top - 8. But that's the alignment
+    // padding (value 0). That's wrong!
+    //
+    // Fix: put the ret_from_fork data ABOVE the alignment padding.
+    // Better: rethink the layout. After ret, RSP points to stack_top - 8.
+    // But ret consumed the word at stack_top - 16 (ret_from_fork_asm addr).
+    // After ret, RSP = (stack_top - 16) + 8 = stack_top - 8.
+    // A `pop` reads from RSP and increments. So first pop reads stack_top - 8.
+    //
+    // I need to put the ret_from_fork data at stack_top - 8 and above:
+    //
+    //   stack_top - 8    = tls_base             ← popped by ret_from_fork `pop rax`
+    //   stack_top - 16   = rbx                  ← popped by ret_from_fork `pop rbx`
+    //
+    // Wait, pop reads from RSP (stack_top - 8) and RSP becomes stack_top.
+    // Second pop reads from stack_top and RSP becomes stack_top + 8.
+    // But stack_top + 8 is ABOVE the stack! That's a buffer overrun.
+    //
+    // The real issue: after ret, RSP goes UP. We need the ret_from_fork data
+    // to be BETWEEN the ret address and the alignment padding. But there's
+    // no room there.
+    //
+    // SOLUTION: Don't use alignment padding at the top. Instead:
+    //
+    //   stack_top - 8    = user_rip              ← IRETQ pops RIP
+    //   stack_top - 16   = 0x23                  ← IRETQ pops CS
+    //   stack_top - 24   = 0x202                 ← IRETQ pops RFLAGS
+    //   stack_top - 32   = user_rsp              ← IRETQ pops RSP
+    //   stack_top - 40   = 0x1B                  ← IRETQ pops SS
+    //   stack_top - 48   = rbx_val               ← ret_from_fork pops RBX
+    //   stack_top - 56   = tls_base              ← ret_from_fork pops RAX (TLS)
+    //   stack_top - 64   = ret_from_fork_asm     ← switch_context `ret` pops this
+    //   stack_top - 72   = rbp_val               ← switch_context `pop rbp`
+    //   stack_top - 80   = 0                     ← switch_context `pop rbx` (ignored)
+    //   stack_top - 88   = r12_val               ← switch_context `pop r12`
+    //   stack_top - 96   = r13_val               ← switch_context `pop r13`
+    //   stack_top - 104  = r14_val               ← switch_context `pop r14`
+    //   stack_top - 112  = r15_val               ← switch_context `pop r15`
+    //                                               (initial_rsp points here)
+    //
+    // switch_context pops r15..rbp (6 regs, 48 bytes), then ret (8 bytes).
+    // After ret: RSP = initial_rsp + 56 = (stack_top-112) + 56 = stack_top - 56.
+    // ret_from_fork_asm: pop rax → reads stack_top-56 (tls_base), RSP→stack_top-48
+    //                    pop rbx → reads stack_top-48 (rbx_val), RSP→stack_top-40
+    //                    iretq   → pops SS,RSP,RFLAGS,CS,RIP from stack_top-40..stack_top-8
+    //
+    // IRETQ order: [RSP+0]=RIP, [RSP+8]=CS, [RSP+16]=RFLAGS, [RSP+24]=RSP, [RSP+32]=SS
+    // So RSP points to stack_top-40:
+    //   [RSP+0]  = stack_top-40 = 0x1B (SS)  ← WRONG! IRETQ expects RIP first!
+    //
+    // IRETQ pops in order: RIP(RSP+0), CS(+8), RFLAGS(+16), RSP(+24), SS(+32)
+    // So the frame needs: RIP at lowest address, SS at highest.
+    //
+    // Let me write: lowest addr → highest addr = RIP, CS, RFLAGS, RSP, SS
+    //
+    let top = stack_top as *mut u64;
+    unsafe {
+        // IRETQ frame (RIP at lowest address, SS at highest)
+        *top.sub(1) = 0x1B;                                      // SS  (highest in frame)
+        *top.sub(2) = user_rsp;                                  // RSP
+        *top.sub(3) = 0x202;                                     // RFLAGS
+        *top.sub(4) = 0x23;                                      // CS
+        *top.sub(5) = user_rip;                                  // RIP (lowest in frame)
+
+        // ret_from_fork_asm pops (after switch_context ret)
+        *top.sub(6) = fork_regs.rbx;                             // popped by `pop rbx`
+        *top.sub(7) = tls_base;                                  // popped by `pop rax` (TLS)
+
+        // switch_context_asm frame (ret_addr at highest, r15 at lowest)
+        *top.sub(8)  = ret_from_fork_asm as *const () as u64;    // `ret` pops this
+        *top.sub(9)  = fork_regs.rbp;                            // `pop rbp`
+        *top.sub(10) = 0;                                        // `pop rbx` (unused)
+        *top.sub(11) = fork_regs.r12;                            // `pop r12`
+        *top.sub(12) = fork_regs.r13;                            // `pop r13`
+        *top.sub(13) = fork_regs.r14;                            // `pop r14`
+        *top.sub(14) = fork_regs.r15;                            // `pop r15` (first pop)
+    }
+    // initial_rsp = bottom of switch_context frame
+    stack_top - 14 * 8
 }

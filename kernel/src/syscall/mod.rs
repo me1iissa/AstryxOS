@@ -1124,13 +1124,12 @@ fn sys_fork_impl(clone_flags: u64, child_tidptr: u64) -> i64 {
     crate::serial_println!("[SYSCALL] fork() from PID {} TID {}", parent_pid, parent_tid);
 
     // Create a new process (child) with a new PID and thread.
-    match crate::proc::fork_process(parent_pid, parent_tid) {
+    match crate::proc::fork_process(parent_pid, parent_tid, &parent_regs) {
         Some((child_pid, child_tid)) => {
             crate::serial_println!("[SYSCALL] fork: child PID {} created", child_pid);
 
-            // Store parent callee-saved regs into child thread so fork_child_entry
-            // can restore them before iretq — critical for glibc __fork epilogue.
-            crate::proc::set_fork_user_regs(child_pid, child_tid, parent_regs);
+            // Parent callee-saved regs are now baked into the child's kernel stack
+            // by fork_process() → init_fork_child_stack().  No need for set_fork_user_regs.
 
             // CLONE_CHILD_SETTID: write child TID to child_tidptr in child's address space.
             // Since child shares physical pages with parent (CoW, not yet written), writing
@@ -3556,45 +3555,58 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
                 }
             } else if flags & (CLONE_VM as u64) != 0 {
                 // CLONE_VM without CLONE_THREAD = vfork-style.
-                // Linux pattern: CoW fork + parent blocks until child execs/exits.
-                // Child signals completion via vfork_parent_tid in exec/exit paths.
+                // CLONE_VM means SHARED address space — the child runs in the
+                // parent's memory. This is how glibc implements vfork():
+                //   clone(CLONE_VM | CLONE_VFORK | SIGCHLD)
+                // The child shares the parent's page tables and must only call
+                // execve() or _exit(). execve() replaces the child with a new
+                // process; _exit() kills the child. Either way, the parent
+                // unblocks when the child signals completion.
+                //
+                // Implementation: create a new thread in the SAME process
+                // (shared address space via same PID) that returns to the
+                // clone() return point with RAX=0. This is identical to
+                // CLONE_THREAD but without the TID-sharing semantics.
                 const CLONE_VFORK: u64 = 0x00004000;
                 let is_vfork = flags & CLONE_VFORK != 0;
                 let parent_tid = crate::proc::current_tid();
+                let pid = crate::proc::current_pid();
                 crate::serial_println!("[VFORK] pid={} flags={:#x} vfork={} parent_tid={}",
-                    crate::proc::current_pid(), flags, is_vfork, parent_tid);
+                    pid, flags, is_vfork, parent_tid);
 
-                let child_tidptr = arg4; // r10 = ctid
-                let child_pid = sys_fork_impl(flags, child_tidptr);
+                // Create a child PROCESS sharing the parent's address space (CR3).
+                // Linux: copy_process() with CLONE_VM creates a new task_struct
+                // that references the parent's mm_struct. The child has its own
+                // PID so crashes don't kill the parent.
+                let parent_regs = read_fork_user_regs();
+                match crate::proc::vfork_process(pid, parent_tid, &parent_regs) {
+                    Some((child_pid, child_tid)) => {
+                        crate::serial_println!("[VFORK] child PID {} TID {} created", child_pid, child_tid);
 
-                if child_pid > 0 && is_vfork {
-                    // Store parent TID in child thread so exec/exit can wake us.
-                    // The child's first (and only) thread has the same PID.
-                    {
-                        let mut threads = crate::proc::THREAD_TABLE.lock();
-                        for t in threads.iter_mut() {
-                            if t.pid == child_pid as u64 {
-                                t.vfork_parent_tid = Some(parent_tid);
-                                break;
+                        if is_vfork {
+                            // Store parent TID in child thread for wake-on-exec/exit.
+                            {
+                                let mut threads = crate::proc::THREAD_TABLE.lock();
+                                if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
+                                    t.vfork_parent_tid = Some(parent_tid);
+                                }
                             }
-                        }
-                    }
 
-                    // Block parent until child signals completion.
-                    // Linux: wait_for_vfork_done() uses completion semaphore.
-                    // We use Blocked state + schedule() — child wakes us.
-                    {
-                        let mut threads = crate::proc::THREAD_TABLE.lock();
-                        if let Some(t) = threads.iter_mut().find(|t| t.tid == parent_tid) {
-                            t.state = crate::proc::ThreadState::Blocked;
-                            t.wake_tick = u64::MAX; // indefinite block
+                            // Block parent until child signals completion.
+                            {
+                                let mut threads = crate::proc::THREAD_TABLE.lock();
+                                if let Some(t) = threads.iter_mut().find(|t| t.tid == parent_tid) {
+                                    t.state = crate::proc::ThreadState::Blocked;
+                                    t.wake_tick = u64::MAX;
+                                }
+                            }
+                            crate::sched::schedule();
+                            // Resumed: child called exec or exit and woke us.
                         }
+                        child_pid as i64
                     }
-                    crate::sched::schedule();
-                    // Resumed: child called exec or exit and woke us.
+                    None => -11 // EAGAIN
                 }
-
-                child_pid
             } else {
                 // Fork-style clone: new address space copy.
                 // Pass flags and child_tidptr for CLONE_CHILD_SETTID support.

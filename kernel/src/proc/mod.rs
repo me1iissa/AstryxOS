@@ -1241,7 +1241,7 @@ pub fn set_fork_user_regs(pid: Pid, tid: Tid, regs: ForkUserRegs) {
 /// - (If user-mode) Returns to the same instruction as the parent with RAX=0
 ///
 /// Returns the child PID, or None on failure.
-pub fn fork_process(parent_pid: Pid, _parent_tid: Tid) -> Option<(Pid, Tid)> {
+pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserRegs) -> Option<(Pid, Tid)> {
     let child_pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
     let child_tid = NEXT_TID.fetch_add(1, Ordering::Relaxed);
 
@@ -1336,14 +1336,24 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid) -> Option<(Pid, Tid)> {
     // Map the signal-return trampoline into the child's address space.
     crate::signal::map_trampoline(child_cr3);
 
-    // The child's main thread starts at fork_child_entry.
-    let initial_rsp = thread::init_thread_stack(stack_top, fork_child_entry as *const () as u64);
+    // Build the fork child's kernel stack with a pre-built IRETQ frame.
+    // Linux pattern: copy_thread() + ret_from_fork_asm.  The child's first
+    // context switch lands directly in ret_from_fork_asm (pure asm), which
+    // restores TLS + RBX, zeroes scratch regs, and does IRETQ to Ring 3.
+    crate::serial_println!(
+        "[FORK] child PID {} stack: rip={:#x} rsp={:#x} tls={:#x} rbp={:#x} rbx={:#x}",
+        child_pid, user_rip, user_rsp, parent_tls_base, parent_regs.rbp, parent_regs.rbx
+    );
+    let initial_rsp = thread::init_fork_child_stack(
+        stack_top, user_rip, user_rsp, parent_tls_base, parent_regs,
+    );
 
     let context = CpuContext {
         rsp: initial_rsp,
-        rbp: 0,
-        rbx: fork_child_entry as *const () as u64,
-        r12: 0, r13: 0, r14: 0, r15: 0,
+        rbp: parent_regs.rbp,
+        rbx: 0,
+        r12: parent_regs.r12, r13: parent_regs.r13,
+        r14: parent_regs.r14, r15: parent_regs.r15,
         rflags: 0x202,
         cr3: child_cr3,
     };
@@ -1430,98 +1440,147 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid) -> Option<(Pid, Tid)> {
     Some((child_pid, child_tid))
 }
 
-/// Entry point for forked child threads.
+/// Create a vfork child: new process (new PID) sharing the parent's address space.
 ///
-/// If the child has user_entry_rip set (user-mode fork), it returns to
-/// user mode at the parent's saved instruction with RAX=0.
-/// Otherwise (kernel-mode fork), it simply exits with code 0.
-fn fork_child_entry() {
-    let (entry_rip, entry_rsp, kernel_stack_top, tls_base, fork_regs) = {
-        let tid = current_tid();
-        let threads = THREAD_TABLE.lock();
-        let t = threads.iter().find(|t| t.tid == tid)
-            .expect("fork_child_entry: current thread not found");
-        (t.user_entry_rip, t.user_entry_rsp, t.kernel_stack_base + t.kernel_stack_size,
-         t.tls_base, t.fork_user_regs)
-    };
+/// Unlike `fork_process` (CoW clone), this shares the parent's CR3 directly.
+/// The child MUST call execve() or _exit() — writing to shared memory is
+/// undefined behavior (but works in practice for the vfork+exec pattern).
+///
+/// Linux equivalent: copy_process() with CLONE_VM flag.
+pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserRegs) -> Option<(Pid, Tid)> {
+    let child_pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+    let child_tid = NEXT_TID.fetch_add(1, Ordering::Relaxed);
 
-    if entry_rip == 0 {
-        // Kernel-only fork — no user context to return to.
-        crate::serial_println!("[PROC] fork child running (PID {}, kernel-only)", current_pid());
-        exit_thread(0);
-        return;
-    }
+    let (stack_base, stack_top) = alloc_kernel_stack()?;
 
-    crate::serial_println!(
-        "[PROC] fork child PID {} returning to user mode RIP={:#x} RSP={:#x}",
-        current_pid(), entry_rip, entry_rsp
-    );
-
-    // Switch to the child's page table.
-    let cr3 = {
-        let pid = current_pid();
+    // Copy parent's file descriptors and credentials.
+    let (fds, cwd, parent_name, parent_cr3, parent_tls_base,
+         parent_linux_abi, parent_pgid, parent_sid) = {
         let procs = PROCESS_TABLE.lock();
-        procs.iter().find(|p| p.pid == pid).map(|p| p.cr3).unwrap_or(0)
+        let parent = procs.iter().find(|p| p.pid == parent_pid)?;
+        let fds = parent.file_descriptors.clone();
+        let cwd = parent.cwd.clone();
+        let mut name = parent.name;
+        (fds, cwd, name, parent.cr3, 0u64, parent.linux_abi, parent.pgid, parent.sid)
     };
-    if cr3 != 0 && cr3 != crate::mm::vmm::get_cr3() {
-        unsafe { crate::mm::vmm::switch_cr3(cr3); }
-    }
 
-    // Set up kernel stack for Ring 3 → Ring 0 transitions.
-    unsafe {
-        crate::arch::x86_64::gdt::update_tss_rsp0(kernel_stack_top);
-        crate::syscall::set_kernel_rsp(kernel_stack_top);
-    }
+    // Get parent's TLS base from thread struct.
+    let parent_tls = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().find(|t| t.tid == parent_tid)
+            .map(|t| t.tls_base).unwrap_or(0)
+    };
 
-    // Restore parent's FS.base (TLS pointer) in the child.
-    // Without this, thread-local variables accessed via fs:[offset] fault
-    // or return garbage (causing glibc assertion failures on fork child paths).
+    // Read user RIP/RSP from parent's kernel stack (syscall frame).
+    let (user_rip, user_rsp) = {
+        let threads = THREAD_TABLE.lock();
+        if let Some(pt) = threads.iter().find(|t| t.tid == parent_tid) {
+            if pt.kernel_stack_base > 0 && pt.kernel_stack_size > 0 {
+                let kstack_top = pt.kernel_stack_base + pt.kernel_stack_size;
+                unsafe {
+                    let rip = *((kstack_top - 16) as *const u64);
+                    let rsp = *((kstack_top - 8) as *const u64);
+                    (rip, rsp)
+                }
+            } else { (0, 0) }
+        } else { (0, 0) }
+    };
+
     crate::serial_println!(
-        "[PROC] fork_child_entry: tls={:#x} rbp={:#x} rbx={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
-        tls_base, fork_regs.rbp, fork_regs.rbx, fork_regs.r12, fork_regs.r13, fork_regs.r14, fork_regs.r15
+        "[VFORK] child PID {} sharing parent CR3={:#x} rip={:#x} rsp={:#x} tls={:#x}",
+        child_pid, parent_cr3, user_rip, user_rsp, parent_tls
     );
-    if tls_base != 0 {
-        unsafe { write_fs_base(tls_base); }
-    }
 
-    // Jump to user mode with RAX=0 (fork returns 0 in child).
-    // We also restore the parent's callee-saved registers (rbp, rbx, r12-r15)
-    // so that the parent's stack frame is intact in the child.  Without this,
-    // glibc's __fork epilogue crashes at "mov -0x38(%rbp),%rax" with rbp=0.
-    // rbp and rbx cannot be used as direct register constraints (LLVM restriction),
-    // so pass them through generic registers and mov into rbp/rbx in the asm.
-    // r12-r15 accept explicit constraints directly.
-    unsafe {
-        use crate::arch::x86_64::gdt;
-        core::arch::asm!(
-            // Push the iretq frame FIRST, before restoring rbp/rbx.
-            // LLVM may allocate RBP as a scratch register for rip_val/rsp_val;
-            // if we do "mov rbp, rbp_val" first, we'd clobber that scratch reg
-            // before it is pushed.  Pushing first avoids any such aliasing.
-            "push {ss}",          // SS
-            "push {rsp_val}",     // RSP
-            "push {rflags}",      // RFLAGS (IF set)
-            "push {cs}",          // CS
-            "push {rip_val}",     // RIP (must be on stack before we touch rbp)
-            // Now restore callee-saved regs; frame values are safely on the stack.
-            "mov rbp, {rbp_val}", // restore parent RBP
-            "mov rbx, {rbx_val}", // restore parent RBX
-            "xor rax, rax",       // fork returns 0 in child
-            "iretq",
-            rbp_val  = in(reg) fork_regs.rbp,
-            rbx_val  = in(reg) fork_regs.rbx,
-            ss       = in(reg) gdt::USER_DATA_SELECTOR as u64,
-            rsp_val  = in(reg) entry_rsp,
-            rflags   = in(reg) 0x202u64,
-            cs       = in(reg) gdt::USER_CODE_SELECTOR as u64,
-            rip_val  = in(reg) entry_rip,
-            in("r12") fork_regs.r12,
-            in("r13") fork_regs.r13,
-            in("r14") fork_regs.r14,
-            in("r15") fork_regs.r15,
-            options(noreturn),
-        );
-    }
+    // Build the fork child's kernel stack with pre-built IRETQ frame.
+    let initial_rsp = thread::init_fork_child_stack(
+        stack_top, user_rip, user_rsp, parent_tls, parent_regs,
+    );
+
+    // Use the normal thread_entry_trampoline → user_mode_bootstrap path.
+    // user_mode_bootstrap handles CR3 switch, TSS.RSP0, TLS, then IRETQ.
+    // This avoids the ret_from_fork_asm CR3-skip bug.
+    let initial_rsp = thread::init_thread_stack(
+        stack_top, crate::proc::usermode::user_mode_bootstrap as *const () as u64,
+    );
+
+    let context = CpuContext {
+        rsp: initial_rsp,
+        rbp: 0,
+        rbx: crate::proc::usermode::user_mode_bootstrap as *const () as u64,
+        r12: 0, r13: 0, r14: 0, r15: 0,
+        rflags: 0x202,
+        cr3: parent_cr3,
+    };
+
+    let mut child_name = [0u8; 64];
+    let name_len = parent_name.iter().position(|&b| b == 0).unwrap_or(parent_name.len()).min(57);
+    child_name[..name_len].copy_from_slice(&parent_name[..name_len]);
+    let suffix = b".vfork";
+    let suf_len = suffix.len().min(64 - name_len);
+    child_name[name_len..name_len+suf_len].copy_from_slice(&suffix[..suf_len]);
+
+    let mut thread_name = [0u8; 32];
+    thread_name[..4].copy_from_slice(b"main");
+
+    let child_proc = Process {
+        pid: child_pid,
+        parent_pid,
+        name: child_name,
+        state: ProcessState::Active,
+        cr3: parent_cr3, // SHARED with parent
+        threads: Vec::from([child_tid]),
+        exit_code: 0,
+        file_descriptors: fds,
+        cwd,
+        uid: 0, gid: 0, euid: 0, egid: 0,
+        pgid: parent_pgid, sid: parent_sid,
+        no_new_privs: false,
+        cap_permitted: 0, cap_effective: 0,
+        rlimits_soft: default_rlimits(),
+        supplementary_groups: Vec::new(),
+        umask: 0o022,
+        vm_space: None, // No VmSpace — shares parent's page tables directly
+        signal_state: Some(crate::signal::SignalState::new()),
+        linux_abi: parent_linux_abi,
+        handle_table: Some(crate::ob::handle::HandleTable::new()),
+        subsystem: crate::win32::SubsystemType::Native,
+        token_id: None,
+        exe_path: None,
+        epoll_sets: alloc::vec::Vec::new(),
+    };
+
+    let child_thread = Thread {
+        tid: child_tid,
+        pid: child_pid,
+        state: ThreadState::Ready, // Ready immediately (parent blocks itself)
+        context,
+        kernel_stack_base: stack_base,
+        kernel_stack_size: KERNEL_STACK_SIZE,
+        wake_tick: u64::MAX,
+        name: thread_name,
+        exit_code: 0,
+        fpu_state: None,
+        user_entry_rip: user_rip,  // user_mode_bootstrap reads this
+        user_entry_rsp: user_rsp,  // user_mode_bootstrap reads this
+        user_entry_rdx: 0,         // RAX=0 (fork child return) set by jump_to_user_mode
+        user_entry_r8: 0,
+        priority: PRIORITY_NORMAL,
+        base_priority: PRIORITY_NORMAL,
+        tls_base: parent_tls,
+        cpu_affinity: None,
+        last_cpu: 0,
+        first_run: true,  // Goes through user_mode_bootstrap (handles CR3, TSS, TLS)
+        ctx_rsp_valid: core::sync::atomic::AtomicBool::new(true),
+        clear_child_tid: 0,
+        fork_user_regs: ForkUserRegs::default(),
+        vfork_parent_tid: None,
+        gs_base: 0,
+    };
+
+    PROCESS_TABLE.lock().push(child_proc);
+    THREAD_TABLE.lock().push(child_thread);
+
+    Some((child_pid, child_tid))
 }
 
 /// Redirect a newly-spawned process's stdout (fd=1) and stderr (fd=2) to
