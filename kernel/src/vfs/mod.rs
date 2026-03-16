@@ -1042,14 +1042,39 @@ pub fn write_file(path: &str, data: &[u8]) -> VfsResult<usize> {
     mounts[mount_idx].fs.write(inode, 0, data)
 }
 
-/// Read data from a file.
+/// File read cache — avoids re-reading large files from slow ATA PIO.
+/// On WSL2/KVM, ATA PIO takes ~100µs per sector (hypervisor exit), making
+/// a 3MB file take 5+ minutes. Caching makes repeated reads instant.
+static FILE_READ_CACHE: spin::Mutex<Vec<(alloc::string::String, Vec<u8>)>> =
+    spin::Mutex::new(Vec::new());
+const FILE_CACHE_MAX: usize = 8;
+const FILE_CACHE_MAX_SIZE: usize = 16 * 1024 * 1024;
+
+/// Read data from a file (with caching for slow disk I/O).
 pub fn read_file(path: &str) -> VfsResult<Vec<u8>> {
+    // Check cache first.
+    {
+        let cache = FILE_READ_CACHE.lock();
+        for (ref p, ref data) in cache.iter() {
+            if p == path {
+                return Ok(data.clone());
+            }
+        }
+    }
+    // Cache miss — read from VFS.
     let (mount_idx, inode) = resolve_path(path)?;
     let mounts = MOUNTS.lock();
     let stat = mounts[mount_idx].fs.stat(inode)?;
     let mut buf = alloc::vec![0u8; stat.size as usize];
     let n = mounts[mount_idx].fs.read(inode, 0, &mut buf)?;
     buf.truncate(n);
+    drop(mounts);
+    // Cache if reasonably sized.
+    if buf.len() <= FILE_CACHE_MAX_SIZE {
+        let mut cache = FILE_READ_CACHE.lock();
+        if cache.len() >= FILE_CACHE_MAX { cache.remove(0); }
+        cache.push((alloc::string::String::from(path), buf.clone()));
+    }
     Ok(buf)
 }
 

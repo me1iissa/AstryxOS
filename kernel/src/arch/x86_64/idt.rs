@@ -4,7 +4,12 @@
 //! Supports IST (Interrupt Stack Table) for critical exceptions.
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Once;
+
+/// Global page fault counter for heartbeat diagnostics.
+static PAGE_FAULT_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub fn page_fault_count() -> u64 { PAGE_FAULT_TOTAL.load(Ordering::Relaxed) }
 
 /// Number of IDT entries (256 vectors).
 const IDT_ENTRIES: usize = 256;
@@ -389,6 +394,7 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
 /// - Bit 2: User (1 = user mode, 0 = kernel mode)
 /// - Bit 4: Instruction fetch
 fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut InterruptFrame) -> bool {
+    PAGE_FAULT_TOTAL.fetch_add(1, Ordering::Relaxed);
     let is_present = error_code & 1 != 0;
     let is_write = error_code & 2 != 0;
     let _is_user = error_code & 4 != 0;
@@ -605,81 +611,100 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 return true;
             }
 
-            // 2. Not cached — allocate a page, read from the filesystem
-            // Use PHYS_OFF for all accesses to the new physical page —
-            // the identity map in PML4[0] may be corrupted by user mmap().
+            // 2. Not cached — allocate pages and read from the filesystem.
+            // READAHEAD: Read 32 pages (128 KB) at once to amortize disk I/O.
+            // On WSL2/KVM, each ATA PIO sector read costs ~100µs. By reading
+            // 256 sectors (128 KB) in one batch instead of 8 (4 KB), we reduce
+            // 47,000 page faults for a 194 MB library to ~1,500 batches.
             const PHYS_OFF_FILE: u64 = 0xFFFF_8000_0000_0000;
+            const READAHEAD_PAGES: u64 = 32; // 128 KB readahead
+
+            // Allocate the faulting page + readahead pages (best effort).
+            // Fixed-size array to avoid alloc dependency in the ISR path.
+            let mut pages_to_map: [(u64, u64, u64); READAHEAD_PAGES as usize] = [(0, 0, 0); READAHEAD_PAGES as usize];
+            let mut n_pages = 0usize;
+            {
+                let mounts = crate::vfs::MOUNTS.lock();
+                if mount_idx < mounts.len() {
+                    // Get file size to bound readahead
+                    let file_size = mounts[mount_idx].fs.stat(inode)
+                        .map(|s| s.size).unwrap_or(0);
+
+                    for pg_idx in 0..READAHEAD_PAGES {
+                        let vaddr = page_addr + pg_idx * 0x1000;
+                        let foff = file_page_offset + pg_idx * 0x1000;
+                        // Don't read past end of file
+                        if foff >= file_size { break; }
+                        // Don't readahead pages that are already cached/mapped
+                        if pg_idx > 0 {
+                            if crate::mm::cache::lookup(mount_idx, inode, foff).is_some() { continue; }
+                            // Check if already mapped in PTE
+                            let existing = crate::mm::vmm::read_pte(cr3, vaddr);
+                            if existing & 1 != 0 { continue; } // already present
+                        }
+                        if let Some(phys) = crate::mm::pmm::alloc_page() {
+                            unsafe {
+                                core::ptr::write_bytes((PHYS_OFF_FILE + phys) as *mut u8, 0, 0x1000);
+                            }
+                            let buf = unsafe {
+                                core::slice::from_raw_parts_mut(
+                                    (PHYS_OFF_FILE + phys) as *mut u8, 0x1000)
+                            };
+                            let _ = mounts[mount_idx].fs.read(inode, foff, buf);
+                            pages_to_map[n_pages] = (vaddr, phys, foff);
+                            n_pages += 1;
+                        } else {
+                            break; // OOM — stop readahead
+                        }
+                    }
+                }
+            }
+
+            // Map all readahead pages and insert into cache.
+            let mapped_faulting = n_pages > 0;
+            for i in 0..n_pages {
+                let (vaddr, phys, foff) = pages_to_map[i];
+                crate::mm::cache::insert(mount_idx, inode, foff, phys);
+                crate::mm::refcount::page_ref_inc(phys);
+                crate::mm::vmm::map_page_in(cr3, vaddr, phys, page_flags);
+                crate::mm::vmm::invlpg(vaddr);
+            }
+
+            // Log progress periodically
+            #[cfg(feature = "firefox-test")]
+            {
+                static PF_VERIFY_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+                let vn = PF_VERIFY_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if vn % 100 == 0 || vn < 5 {
+                    crate::serial_println!(
+                        "[PF/readahead] #{} addr={:#x} readahead={} pages",
+                        vn, page_addr, n_pages);
+                }
+            }
+
+            if mapped_faulting {
+                return true;  // Readahead handled the faulting page + extras.
+            }
+
+            // Fallback: readahead failed entirely — allocate single page.
             if let Some(phys) = crate::mm::pmm::alloc_page() {
                 unsafe {
-                    core::ptr::write_bytes((PHYS_OFF_FILE + phys) as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
+                    core::ptr::write_bytes((PHYS_OFF_FILE + phys) as *mut u8, 0, 0x1000);
                 }
-
-                // Read file data into the page.
                 {
                     let mounts = crate::vfs::MOUNTS.lock();
                     if mount_idx < mounts.len() {
                         let buf = unsafe {
                             core::slice::from_raw_parts_mut(
-                                (PHYS_OFF_FILE + phys) as *mut u8,
-                                crate::mm::pmm::PAGE_SIZE,
-                            )
+                                (PHYS_OFF_FILE + phys) as *mut u8, 0x1000)
                         };
                         let _ = mounts[mount_idx].fs.read(inode, file_page_offset, buf);
                     }
                 }
-
-                // Verify file data: log first 8 bytes for corruption detection.
-                #[cfg(feature = "firefox-test")]
-                {
-                    static PF_VERIFY_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-                    let vn = PF_VERIFY_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    // Log every 500th page to detect corruption without flooding
-                    if vn % 500 == 0 || vn < 5 {
-                        let first8 = unsafe { core::ptr::read_volatile((PHYS_OFF_FILE + phys) as *const u64) };
-                        crate::serial_println!(
-                            "[PF/verify] #{} addr={:#x} file_off={:#x} inode={} first8={:#018x}",
-                            vn, page_addr, file_page_offset, inode, first8);
-                    }
-                }
-
-                // Insert into the page cache (gives cache its own refcount).
                 crate::mm::cache::insert(mount_idx, inode, file_page_offset, phys);
-                // Add a mapping reference.
                 crate::mm::refcount::page_ref_inc(phys);
-
                 crate::mm::vmm::map_page_in(cr3, page_addr, phys, page_flags);
                 crate::mm::vmm::invlpg(page_addr);
-                #[cfg(feature = "firefox-test")]
-                {
-                    static PF_MISS_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-                    let n3 = PF_MISS_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    if n3 < 20 {
-                        const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
-                        let pml4i = ((page_addr >> 39) & 0x1FF) as usize;
-                        let pdpti = ((page_addr >> 30) & 0x1FF) as usize;
-                        let pdi   = ((page_addr >> 21) & 0x1FF) as usize;
-                        let pti   = ((page_addr >> 12) & 0x1FF) as usize;
-                        let hw_cr3: u64;
-                        unsafe { core::arch::asm!("mov {}, cr3", out(reg) hw_cr3, options(nomem, nostack)); }
-                        let cr3p  = hw_cr3 & 0x000F_FFFF_FFFF_F000;
-                        let (pml4e, pdpte, pde, pte_hw) = unsafe {
-                            let pml4e = *((PHYS_OFF + cr3p + pml4i as u64 * 8) as *const u64);
-                            let pdpte = if pml4e & 1 != 0 {
-                                *((PHYS_OFF + (pml4e & 0x000F_FFFF_FFFF_F000) + pdpti as u64 * 8) as *const u64)
-                            } else { 0 };
-                            let pde = if pdpte & 1 != 0 && pdpte & (1<<7) == 0 {
-                                *((PHYS_OFF + (pdpte & 0x000F_FFFF_FFFF_F000) + pdi as u64 * 8) as *const u64)
-                            } else { 0 };
-                            let pte_hw = if pde & 1 != 0 && pde & (1<<7) == 0 {
-                                *((PHYS_OFF + (pde & 0x000F_FFFF_FFFF_F000) + pti as u64 * 8) as *const u64)
-                            } else { 0 };
-                            (pml4e, pdpte, pde, pte_hw)
-                        };
-                        crate::serial_println!("[PF/miss] #{} addr={:#x} phys={:#x} flags={:#x}", n3, page_addr, phys, page_flags);
-                        crate::serial_println!("[PF/after] PML4[{}]={:#x} PDPT[{}]={:#x} PD[{}]={:#x} PT[{}]={:#x}",
-                            pml4i, pml4e, pdpti, pdpte, pdi, pde, pti, pte_hw);
-                    }
-                }
                 return true;
             }
             return false; // OOM

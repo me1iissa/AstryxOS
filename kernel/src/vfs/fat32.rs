@@ -462,9 +462,28 @@ impl Fat32Fs {
     /// Ensure a sector is in the sparse cache, loading from device if needed.
     fn ensure_sector(inner: &mut Fat32Inner, device: &dyn BlockDevice, lba: u64) -> Result<(), VfsError> {
         if !inner.sector_cache.contains_key(&lba) {
-            let mut buf = [0u8; SECTOR_SIZE];
-            device.read_sector(lba, &mut buf).map_err(|_| VfsError::Io)?;
-            inner.sector_cache.insert(lba, buf);
+            // Batch prefetch: read 8 consecutive sectors (4KB = one cluster) at once.
+            // This uses multi-sector PIO (one command for 8 sectors) instead of
+            // 8 separate commands, reducing VM exits by 8x on WSL2/KVM.
+            const BATCH: u32 = 8;
+            let batch_start = lba & !(BATCH as u64 - 1); // align to 8-sector boundary
+            let mut multi_buf = [0u8; SECTOR_SIZE * BATCH as usize];
+            if device.read_sectors(batch_start, BATCH, &mut multi_buf).is_ok() {
+                for i in 0..BATCH {
+                    let sector_lba = batch_start + i as u64;
+                    if !inner.sector_cache.contains_key(&sector_lba) {
+                        let mut sector = [0u8; SECTOR_SIZE];
+                        let off = i as usize * SECTOR_SIZE;
+                        sector.copy_from_slice(&multi_buf[off..off + SECTOR_SIZE]);
+                        inner.sector_cache.insert(sector_lba, sector);
+                    }
+                }
+            } else {
+                // Fallback: single sector read
+                let mut buf = [0u8; SECTOR_SIZE];
+                device.read_sector(lba, &mut buf).map_err(|_| VfsError::Io)?;
+                inner.sector_cache.insert(lba, buf);
+            }
         }
         Ok(())
     }
