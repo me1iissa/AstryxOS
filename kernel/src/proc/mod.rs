@@ -1416,7 +1416,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
         name: thread_name,
         exit_code: 0,
         fpu_state: None,
-        user_entry_rip: user_rip, // clone return point; CLONE_VM handler overrides
+        user_entry_rip: user_rip + 7, // skip clone child path → ret to caller
         user_entry_rsp: user_rsp,
         user_entry_rdx: 0,
         user_entry_r8:  0,

@@ -307,27 +307,7 @@ pub unsafe extern "C" fn jump_to_user_mode(_entry_rip: u64, _entry_rsp: u64, _en
         "push rdi",        // RIP = entry point (arg1)
         // Set R8 from arg4 (rcx), RDX stays as arg3
         "mov r8, rcx",
-        // Verify IRETQ frame: [rsp]=RIP should be non-zero
-        // If RIP is 0, the frame is corrupt — halt for debugging
-        "mov rax, [rsp]",       // read RIP from IRETQ frame
-        "test rax, rax",
-        "jnz 2f",
-        // RIP is 0! Debug: write 0xDEAD to port 0x3F8 (serial)
-        "mov dx, 0x3F8",
-        "mov al, 0x44",         // 'D'
-        "out dx, al",
-        "mov al, 0x45",         // 'E'
-        "out dx, al",
-        "mov al, 0x41",         // 'A'
-        "out dx, al",
-        "mov al, 0x44",         // 'D'
-        "out dx, al",
-        "mov al, 0x0A",         // newline
-        "out dx, al",
-        "cli",
-        "hlt",
-        "2:",
-        // RAX = 0 (fork child return value)
+        // RAX = 0 (fork child return value / harmless for initial process)
         "xor eax, eax",
         // Zero all other GPRs to prevent kernel address leaks
         "xor esi, esi",
