@@ -1486,9 +1486,28 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
         } else { (0, 0) }
     };
 
+    // The parent called clone() via glibc's __clone wrapper. The child's user_rip
+    // from get_user_rip() points to the instruction AFTER the `syscall` in __clone:
+    //   syscall            ; ← parent was here
+    //   test rax, rax      ; ← user_rip points here (saved by SYSCALL hardware)
+    //   jl .error
+    //   je .child           ; ← child path: pop rax; pop rdi; call *rax (WRONG for vfork!)
+    //   ret                 ; ← parent path: return to caller with RAX=child_pid
+    //
+    // The child path expects fn/arg on the stack (pushed by __clone's prologue).
+    // But for vfork, the child shares the parent's stack which has no fn/arg.
+    // Calling *rax would jump to garbage → crash.
+    //
+    // FIX: Skip the child path entirely. Set user_rip to the `ret` instruction
+    // (parent return path). The child returns from clone() to the caller with
+    // RAX=0, and the caller (Firefox) checks RAX to know it's the child.
+    //
+    // Layout: test(3B) + jl(2B) + je(2B) = 7 bytes from user_rip to ret.
+    let child_rip = user_rip + 7; // skip test;jl;je → land on `ret`
+
     crate::serial_println!(
-        "[VFORK] child PID {} sharing parent CR3={:#x} rip={:#x} rsp={:#x} tls={:#x}",
-        child_pid, parent_cr3, user_rip, user_rsp, parent_tls
+        "[VFORK] child PID {} sharing parent CR3={:#x} rip={:#x}(+7={:#x}) rsp={:#x} tls={:#x}",
+        child_pid, parent_cr3, user_rip, child_rip, user_rsp, parent_tls
     );
 
     // Build the fork child's kernel stack with pre-built IRETQ frame.
@@ -1560,8 +1579,8 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
         name: thread_name,
         exit_code: 0,
         fpu_state: None,
-        user_entry_rip: user_rip,  // user_mode_bootstrap reads this
-        user_entry_rsp: user_rsp,  // user_mode_bootstrap reads this
+        user_entry_rip: child_rip, // skip clone child path → land on `ret`
+        user_entry_rsp: user_rsp,  // parent's stack (shared vfork)
         user_entry_rdx: 0,         // RAX=0 (fork child return) set by jump_to_user_mode
         user_entry_r8: 0,
         priority: PRIORITY_NORMAL,
