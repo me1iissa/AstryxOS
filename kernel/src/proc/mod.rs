@@ -1346,9 +1346,9 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
     );
     // Use user_mode_bootstrap (same path as clone threads) for the fork child.
     // This ensures proper CR3 switch, TSS.RSP0, TLS setup before entering Ring 3.
-    // The child's user_entry_rip is advanced +7 past glibc's __clone child path
-    // to skip `pop rax; call *rax` and land on `ret` (parent return path).
-    let child_rip = user_rip + 7;
+    // The child's user_entry_rip starts at the original clone return point.
+    // The caller (CLONE_VM handler) may override user_entry_rip/rsp after
+    // fork_process returns to use the new_stack provided by glibc.
     let initial_rsp = thread::init_thread_stack(
         stack_top, crate::proc::usermode::user_mode_bootstrap as *const () as u64,
     );
@@ -1416,7 +1416,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
         name: thread_name,
         exit_code: 0,
         fpu_state: None,
-        user_entry_rip: child_rip, // +7 to skip clone child path → land on `ret`
+        user_entry_rip: user_rip + 7, // skip clone child path (test;jl;je → ret)
         user_entry_rsp: user_rsp,
         user_entry_rdx: 0,
         user_entry_r8:  0,
