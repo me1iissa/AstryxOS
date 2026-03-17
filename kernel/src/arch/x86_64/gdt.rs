@@ -196,7 +196,8 @@ static GDT_INIT: Once<()> = Once::new();
 /// Build a TssDescriptor from a TSS pointer.
 #[inline]
 unsafe fn make_tss_descriptor(tss_ptr: *const Tss) -> TssDescriptor {
-    let addr = tss_ptr as u64;
+    // Fix truncated TSS address from mcmodel=kernel.
+    let addr = crate::proc::thread::fixup_fn_ptr(tss_ptr as u64);
     let limit = (size_of::<Tss>() - 1) as u16;
     TssDescriptor {
         limit_low:   limit,
@@ -216,21 +217,24 @@ pub fn init() {
     GDT_INIT.call_once(|| {
         // SAFETY: Single-threaded kernel init path.
         unsafe {
+            // Fix truncated static addresses from mcmodel=kernel.
+            let fix = crate::proc::thread::fixup_fn_ptr;
+
             // ── BSP TSS stacks ────────────────────────────────────────
-            TSS_BSP.rsp[0] = (&raw const INTERRUPT_STACK) as *const u8 as u64
+            TSS_BSP.rsp[0] = fix((&raw const INTERRUPT_STACK) as *const u8 as u64)
                            + size_of::<[u8; 16384]>() as u64;
-            TSS_BSP.ist[0] = (&raw const INTERRUPT_STACK) as *const u8 as u64
+            TSS_BSP.ist[0] = fix((&raw const INTERRUPT_STACK) as *const u8 as u64)
                            + size_of::<[u8; 16384]>() as u64;
-            TSS_BSP.ist[1] = (&raw const DOUBLE_FAULT_STACK) as *const u8 as u64
+            TSS_BSP.ist[1] = fix((&raw const DOUBLE_FAULT_STACK) as *const u8 as u64)
                            + size_of::<[u8; 16384]>() as u64;
 
             // ── Per-AP TSS stacks ─────────────────────────────────────
             // Each AP (APIC ID 1..MAX_AP) gets its own TSS, interrupt stack,
             // and double-fault IST stack to prevent inter-CPU RSP corruption.
             for ap in 0..MAX_AP {
-                let istk_top = (&raw const AP_INTERRUPT_STACKS[ap]) as *const u8 as u64
+                let istk_top = fix((&raw const AP_INTERRUPT_STACKS[ap]) as *const u8 as u64)
                              + size_of::<[u8; 16384]>() as u64;
-                let dstk_top = (&raw const AP_DOUBLE_FAULT_STACKS[ap]) as *const u8 as u64
+                let dstk_top = fix((&raw const AP_DOUBLE_FAULT_STACKS[ap]) as *const u8 as u64)
                              + size_of::<[u8; 16384]>() as u64;
                 TSS_APS[ap].rsp[0] = istk_top;
                 TSS_APS[ap].ist[0] = istk_top;
@@ -244,9 +248,12 @@ pub fn init() {
             GDT_INSTANCE.tss_bsp = make_tss_descriptor(&raw const TSS_BSP);
 
             // ── Load GDT ──────────────────────────────────────────────
+            // Fix truncated GDT base address from mcmodel=kernel.
             let gdt_ptr = GdtPointer {
                 limit: (size_of::<Gdt>() - 1) as u16,
-                base:  &raw const GDT_INSTANCE as *const Gdt as u64,
+                base:  crate::proc::thread::fixup_fn_ptr(
+                    &raw const GDT_INSTANCE as *const Gdt as u64
+                ),
             };
             asm!(
                 "lgdt [{}]",

@@ -586,7 +586,7 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
     let context = CpuContext {
         rsp: initial_rsp,
         rbp: 0,
-        rbx: entry_point,
+        rbx: thread::fixup_fn_ptr(entry_point),
         r12: 0, r13: 0, r14: 0, r15: 0,
         rflags: 0x202,
         cr3,
@@ -1383,7 +1383,9 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
     let context = CpuContext {
         rsp: initial_rsp,
         rbp: 0,
-        rbx: crate::proc::usermode::user_mode_bootstrap as *const () as u64,
+        rbx: crate::proc::thread::fixup_fn_ptr(
+            crate::proc::usermode::user_mode_bootstrap as *const () as u64
+        ),
         r12: 0, r13: 0, r14: 0, r15: 0,
         rflags: 0x202,
         cr3: child_cr3,

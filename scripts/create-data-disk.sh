@@ -18,10 +18,12 @@ BUILD_DIR="${ROOT_DIR}/build"
 DATA_IMG="${BUILD_DIR}/data.img"
 SIZE_MB=512
 FORCE=false
+FIREFOX=false
 
 for arg in "$@"; do
     case "$arg" in
         --force) FORCE=true ;;
+        --firefox) FIREFOX=true; FORCE=true ;;
         [0-9]*) SIZE_MB="$arg" ;;
     esac
 done
@@ -174,6 +176,48 @@ EOF
             [ -f "${f}" ] && mcopy -i "${DATA_IMG}" "${f}" "::test/$(basename "${f}")"
         done
         echo "[DATA-DISK] Copied test/ sources to /test/"
+    fi
+
+    # ── Firefox shared library dependencies (--firefox flag) ───────────────
+    if [ "$FIREFOX" = true ]; then
+        echo "[DATA-DISK] Resolving Firefox shared library dependencies..."
+        DISK_LIB="${BUILD_DIR}/disk/lib/x86_64-linux-gnu"
+        mkdir -p "${DISK_LIB}"
+
+        # Collect all transitive deps from Firefox's key .so files
+        FF_DIR="${BUILD_DIR}/disk/lib/firefox"
+        FF_LIBS=""
+        for so in "${FF_DIR}/firefox-bin" "${FF_DIR}/libmozgtk.so" "${FF_DIR}/libxul.so"; do
+            [ -f "${so}" ] && FF_LIBS="${FF_LIBS}$(ldd "${so}" 2>/dev/null | grep '=> /' | awk '{print $3}')"$'\n'
+        done
+
+        # Deduplicate and copy
+        copied=0
+        while IFS= read -r lib; do
+            [ -z "${lib}" ] && continue
+            bn="$(basename "${lib}")"
+            if [ ! -f "${DISK_LIB}/${bn}" ] && [ -f "${lib}" ]; then
+                cp "${lib}" "${DISK_LIB}/${bn}"
+                copied=$((copied + 1))
+            fi
+        done <<< "$(echo "${FF_LIBS}" | sort -u)"
+
+        # Copy all staged libs to disk image
+        for f in "${DISK_LIB}/"*; do
+            [ -f "${f}" ] && mcopy -o -i "${DATA_IMG}" "${f}" "::lib/x86_64-linux-gnu/$(basename "${f}")" 2>/dev/null
+        done
+        echo "[DATA-DISK] Copied ${copied} new Firefox dependency libraries"
+
+        # Also ensure /proc, /sys, /tmp, /run directories exist (Firefox expects them)
+        for d in proc sys tmp run; do
+            mmd -i "${DATA_IMG}" "::${d}" 2>/dev/null || true
+        done
+        # /run/dbus stub
+        mmd -i "${DATA_IMG}" "::run/dbus" 2>/dev/null || true
+
+        # /tmp/ff-profile for Firefox profile
+        mmd -i "${DATA_IMG}" "::tmp" 2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::tmp/ff-profile" 2>/dev/null || true
     fi
 
     echo "[DATA-DISK] Populated with initial files (mtools)"
