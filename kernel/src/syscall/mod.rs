@@ -232,7 +232,8 @@ pub fn init_ap() {
         crate::hal::wrmsr(0xC000_0081, star_value);
 
         // IA32_LSTAR — Syscall entry point
-        crate::hal::wrmsr(0xC000_0082, syscall_entry as *const () as u64);
+        // Fix truncated function pointer from mcmodel=kernel.
+        crate::hal::wrmsr(0xC000_0082, crate::proc::thread::fixup_fn_ptr(syscall_entry as *const () as u64));
 
         // IA32_FMASK — RFLAGS mask on syscall (clear IF, TF, DF)
         crate::hal::wrmsr(0xC000_0084, 0x700);
@@ -1613,6 +1614,15 @@ fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u64, offset:
         backing,
         name,
     };
+
+    #[cfg(feature = "firefox-test")]
+    {
+        let r = if prot & PROT_READ  != 0 { 'r' } else { '-' };
+        let w = if prot & PROT_WRITE != 0 { 'w' } else { '-' };
+        let x = if prot & PROT_EXEC  != 0 { 'x' } else { '-' };
+        crate::serial_println!("[MMAP] pid={} base={:#x} len={:#x} prot={}{}{} fd={} off={:#x} {}",
+            pid, base, length, r, w, x, fd as i64, offset, name);
+    }
 
     match space.insert_vma(vma) {
         Ok(()) => {

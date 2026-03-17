@@ -116,47 +116,51 @@ pub fn init() {
     IDT_INIT.call_once(|| {
         let kernel_cs = super::gdt::KERNEL_CODE_SELECTOR;
 
+        // Fix truncated function pointers from mcmodel=kernel.
+        // See proc/thread.rs fixup_fn_ptr for details.
+        let fix = crate::proc::thread::fixup_fn_ptr;
+
         // SAFETY: We're in single-threaded init. Setting up IDT entries.
         unsafe {
             // CPU exceptions (0-31)
-            IDT[0].set_handler(isr_divide_error as *const () as u64, kernel_cs, 0, 0);
-            IDT[1].set_handler(isr_debug as *const () as u64, kernel_cs, 0, 0);
-            IDT[2].set_handler(isr_nmi as *const () as u64, kernel_cs, 0, 0);
-            IDT[3].set_handler(isr_breakpoint as *const () as u64, kernel_cs, 0, 3); // Allow from userspace
-            IDT[4].set_handler(isr_overflow as *const () as u64, kernel_cs, 0, 0);
-            IDT[5].set_handler(isr_bound_range as *const () as u64, kernel_cs, 0, 0);
-            IDT[6].set_handler(isr_invalid_opcode as *const () as u64, kernel_cs, 0, 0);
-            IDT[7].set_handler(isr_device_not_available as *const () as u64, kernel_cs, 0, 0);
-            IDT[8].set_handler(isr_double_fault as *const () as u64, kernel_cs, 2, 0); // IST 2 for double fault
-            IDT[10].set_handler(isr_invalid_tss as *const () as u64, kernel_cs, 0, 0);
-            IDT[11].set_handler(isr_segment_not_present as *const () as u64, kernel_cs, 0, 0);
-            IDT[12].set_handler(isr_stack_segment as *const () as u64, kernel_cs, 0, 0);
-            IDT[13].set_handler(isr_general_protection as *const () as u64, kernel_cs, 0, 0);
-            IDT[14].set_handler(isr_page_fault as *const () as u64, kernel_cs, 0, 0);
-            IDT[16].set_handler(isr_x87_fp as *const () as u64, kernel_cs, 0, 0);
-            IDT[17].set_handler(isr_alignment_check as *const () as u64, kernel_cs, 0, 0);
-            IDT[18].set_handler(isr_machine_check as *const () as u64, kernel_cs, 0, 0);
-            IDT[19].set_handler(isr_simd_fp as *const () as u64, kernel_cs, 0, 0);
+            IDT[0].set_handler(fix(isr_divide_error as *const () as u64), kernel_cs, 0, 0);
+            IDT[1].set_handler(fix(isr_debug as *const () as u64), kernel_cs, 0, 0);
+            IDT[2].set_handler(fix(isr_nmi as *const () as u64), kernel_cs, 0, 0);
+            IDT[3].set_handler(fix(isr_breakpoint as *const () as u64), kernel_cs, 0, 3); // Allow from userspace
+            IDT[4].set_handler(fix(isr_overflow as *const () as u64), kernel_cs, 0, 0);
+            IDT[5].set_handler(fix(isr_bound_range as *const () as u64), kernel_cs, 0, 0);
+            IDT[6].set_handler(fix(isr_invalid_opcode as *const () as u64), kernel_cs, 0, 0);
+            IDT[7].set_handler(fix(isr_device_not_available as *const () as u64), kernel_cs, 0, 0);
+            IDT[8].set_handler(fix(isr_double_fault as *const () as u64), kernel_cs, 2, 0); // IST 2 for double fault
+            IDT[10].set_handler(fix(isr_invalid_tss as *const () as u64), kernel_cs, 0, 0);
+            IDT[11].set_handler(fix(isr_segment_not_present as *const () as u64), kernel_cs, 0, 0);
+            IDT[12].set_handler(fix(isr_stack_segment as *const () as u64), kernel_cs, 0, 0);
+            IDT[13].set_handler(fix(isr_general_protection as *const () as u64), kernel_cs, 0, 0);
+            IDT[14].set_handler(fix(isr_page_fault as *const () as u64), kernel_cs, 0, 0);
+            IDT[16].set_handler(fix(isr_x87_fp as *const () as u64), kernel_cs, 0, 0);
+            IDT[17].set_handler(fix(isr_alignment_check as *const () as u64), kernel_cs, 0, 0);
+            IDT[18].set_handler(fix(isr_machine_check as *const () as u64), kernel_cs, 0, 0);
+            IDT[19].set_handler(fix(isr_simd_fp as *const () as u64), kernel_cs, 0, 0);
 
             // Hardware IRQs (32-47) — set up in irq module
             // IRQ0 (timer) = vector 32
             // IRQ1 (keyboard) = vector 33
             // etc.
-            IDT[32].set_handler(super::irq::irq_timer_handler as *const () as u64, kernel_cs, 0, 0);
-            IDT[33].set_handler(super::irq::irq_keyboard_handler as *const () as u64, kernel_cs, 0, 0);
-            IDT[43].set_handler(super::irq::irq_e1000_handler as *const () as u64, kernel_cs, 0, 0);
-            IDT[44].set_handler(super::irq::irq_mouse_handler as *const () as u64, kernel_cs, 0, 0);
+            IDT[32].set_handler(fix(super::irq::irq_timer_handler as *const () as u64), kernel_cs, 0, 0);
+            IDT[33].set_handler(fix(super::irq::irq_keyboard_handler as *const () as u64), kernel_cs, 0, 0);
+            IDT[43].set_handler(fix(super::irq::irq_e1000_handler as *const () as u64), kernel_cs, 0, 0);
+            IDT[44].set_handler(fix(super::irq::irq_mouse_handler as *const () as u64), kernel_cs, 0, 0);
 
             // Syscall interrupt (vector 0x80) — for int 0x80 style syscalls
-            IDT[0x80].set_handler(isr_syscall_int80 as *const () as u64, kernel_cs, 0, 3);
+            IDT[0x80].set_handler(fix(isr_syscall_int80 as *const () as u64), kernel_cs, 0, 3);
 
             // NT syscall gate (vector 0x2E) — Windows INT 0x2E compatibility
-            IDT[0x2E].set_handler(isr_syscall_int2e as *const () as u64, kernel_cs, 0, 3);
+            IDT[0x2E].set_handler(fix(isr_syscall_int2e as *const () as u64), kernel_cs, 0, 3);
 
-            // Load IDT
+            // Load IDT — fix truncated base address from mcmodel=kernel
             let idt_ptr = IdtPointer {
                 limit: (core::mem::size_of::<[IdtEntry; IDT_ENTRIES]>() - 1) as u16,
-                base: (&raw const IDT) as *const IdtEntry as u64,
+                base: fix((&raw const IDT) as *const IdtEntry as u64),
             };
             asm!(
                 "lidt [{}]",
@@ -166,6 +170,25 @@ pub fn init() {
         }
     });
 
+    // Verify IDT handler addresses are higher-half (mcmodel=kernel fixup check)
+    unsafe {
+        let pf_entry = &IDT[14];
+        let handler = pf_entry.offset_low as u64
+            | ((pf_entry.offset_mid as u64) << 16)
+            | ((pf_entry.offset_high as u64) << 32);
+        let timer_entry = &IDT[32];
+        let timer_handler = timer_entry.offset_low as u64
+            | ((timer_entry.offset_mid as u64) << 16)
+            | ((timer_entry.offset_high as u64) << 32);
+        let sc_entry = &IDT[0x80];
+        let sc_handler = sc_entry.offset_low as u64
+            | ((sc_entry.offset_mid as u64) << 16)
+            | ((sc_entry.offset_high as u64) << 32);
+        crate::serial_println!(
+            "[IDT] PF={:#x} Timer={:#x} INT80={:#x} (should be 0xFFFF8000...)",
+            handler, timer_handler, sc_handler
+        );
+    }
     crate::serial_println!("[IDT] Initialized with {} vectors", IDT_ENTRIES);
 }
 
@@ -512,6 +535,21 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
     // PROT_NONE VMAs (guard pages) — never accessible in any mode.
     if vma.prot == crate::mm::vma::PROT_NONE { return false; }
 
+    // === NX fixup: page is PRESENT but marked NX, VMA says PROT_EXEC ===
+    // This happens when a page was demand-faulted for read/write before the
+    // execute permission was needed, or after mprotect changed permissions.
+    let is_ifetch = error_code & 0x10 != 0;
+    if is_present && is_ifetch && (vma.prot & crate::mm::vma::PROT_EXEC != 0) {
+        let pte = crate::mm::vmm::read_pte(cr3, page_addr);
+        if pte & crate::mm::vmm::PAGE_NO_EXECUTE != 0 {
+            // Clear NX bit to allow execution
+            let new_pte = pte & !crate::mm::vmm::PAGE_NO_EXECUTE;
+            crate::mm::vmm::write_pte(cr3, page_addr, new_pte);
+            crate::mm::vmm::invlpg(page_addr);
+            return true;
+        }
+    }
+
     // (is_write on a !is_present page: check VMA write permission)
     if is_write && (vma.prot & crate::mm::vma::PROT_WRITE == 0) {
         return false; // Permission denied — SIGSEGV
@@ -526,12 +564,12 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
         // accessing the VFS (which takes MOUNTS), so extract the info first.
         let file_info = match &vma.backing {
             crate::mm::vma::VmBacking::File { mount_idx, inode, offset } => {
-                Some((*mount_idx, *inode, *offset, vma.base))
+                Some((*mount_idx, *inode, *offset, vma.base, vma.base + vma.length))
             }
             _ => None,
         };
 
-        if let Some((mount_idx, inode, file_base_offset, vma_base)) = file_info {
+        if let Some((mount_idx, inode, file_base_offset, vma_base, vma_end)) = file_info {
             // Release PROCESS_TABLE to avoid deadlock with MOUNTS.
             drop(procs);
 
@@ -633,6 +671,8 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     for pg_idx in 0..READAHEAD_PAGES {
                         let vaddr = page_addr + pg_idx * 0x1000;
                         let foff = file_page_offset + pg_idx * 0x1000;
+                        // Don't readahead past VMA boundary (different VMAs may have different permissions)
+                        if vaddr >= vma_end { break; }
                         // Don't read past end of file
                         if foff >= file_size { break; }
                         // Don't readahead pages that are already cached/mapped

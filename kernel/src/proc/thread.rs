@@ -174,15 +174,31 @@ pub unsafe fn switch_context(old_rsp_ptr: *mut u64, new_rsp: u64, ctx_valid_ptr:
 /// the System V AMD64 ABI function entry convention.
 pub fn init_thread_stack(stack_top: u64, entry_point: u64) -> u64 {
     let top = stack_top as *mut u64;
+
+    // Fix truncated function pointers caused by mcmodel=kernel.
+    //
+    // With code-model "kernel", the Rust compiler assumes all code/data addresses
+    // fit in a 32-bit sign-extended value (top 2 GB of the 64-bit address space).
+    // Our kernel VMA (0xFFFF_8000_0010_0000) is NOT in the top 2 GB, so function
+    // pointers are truncated to their physical (LMA) address.
+    //
+    // Fix: if a function pointer's bit 47 is clear (not in higher-half), add
+    // KERNEL_VIRT_BASE to reconstruct the correct VMA.  This ensures switch_context's
+    // `ret` instruction jumps to the higher-half address (PML4[256], mapped in all
+    // page tables) rather than the identity-mapped physical address (PML4[0], which
+    // is per-process user address space).
+    let trampoline_addr = fixup_fn_ptr(thread_entry_trampoline as *const () as u64);
+    let entry_addr = fixup_fn_ptr(entry_point);
+
     unsafe {
         // Alignment padding (unused value)
         *top.sub(1) = 0;
-        // Return address: thread_entry_trampoline
-        *top.sub(2) = thread_entry_trampoline as *const () as u64;
+        // Return address: thread_entry_trampoline (higher-half VMA)
+        *top.sub(2) = trampoline_addr;
         // rbp = 0
         *top.sub(3) = 0;
-        // rbx = entry_point (the trampoline reads this)
-        *top.sub(4) = entry_point;
+        // rbx = entry_point (the trampoline reads this, higher-half VMA)
+        *top.sub(4) = entry_addr;
         // r12 = 0
         *top.sub(5) = 0;
         // r13 = 0
@@ -194,6 +210,24 @@ pub fn init_thread_stack(stack_top: u64, entry_point: u64) -> u64 {
     }
     // Initial RSP points just below the last pushed register
     stack_top - 8 * 8
+}
+
+/// Fix a potentially truncated function pointer by adding KERNEL_VIRT_BASE.
+///
+/// With mcmodel=kernel, function pointers may be truncated to their physical
+/// (LMA) address.  This function checks if bit 47 is clear (indicating a
+/// truncated physical address) and adds KERNEL_VIRT_BASE to produce the
+/// correct higher-half VMA.
+///
+/// For addresses that are already in the higher-half (bit 47 set), the
+/// address is returned unchanged.
+#[inline]
+pub fn fixup_fn_ptr(addr: u64) -> u64 {
+    if addr != 0 && (addr & (1u64 << 47)) == 0 {
+        astryx_shared::KERNEL_VIRT_BASE + addr
+    } else {
+        addr
+    }
 }
 
 /// Initialize a fork child's kernel stack with a pre-built IRETQ frame.
