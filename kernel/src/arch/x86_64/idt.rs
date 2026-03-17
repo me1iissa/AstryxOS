@@ -634,9 +634,36 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
 
             // 1. Check the page cache
             if let Some(cached_phys) = crate::mm::cache::lookup(mount_idx, inode, file_page_offset) {
-                crate::mm::refcount::page_ref_inc(cached_phys);
-                crate::mm::vmm::map_page_in(cr3, page_addr, cached_phys, page_flags);
-                crate::mm::vmm::invlpg(page_addr);
+                // MAP_PRIVATE + writable: give the process a private copy so
+                // writes (e.g., GOT/PLT relocations) don't corrupt the shared
+                // cache page. Without this, a second process loading the same
+                // library sees PID 1's relocated pointers as garbage.
+                let is_writable = page_flags & crate::mm::vmm::PAGE_WRITABLE != 0;
+                if is_writable {
+                    if let Some(private_phys) = crate::mm::pmm::alloc_page() {
+                        const COW_OFF: u64 = 0xFFFF_8000_0000_0000;
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                (COW_OFF + cached_phys) as *const u8,
+                                (COW_OFF + private_phys) as *mut u8,
+                                crate::mm::pmm::PAGE_SIZE,
+                            );
+                        }
+                        crate::mm::refcount::page_ref_set(private_phys, 1);
+                        crate::mm::vmm::map_page_in(cr3, page_addr, private_phys, page_flags);
+                        crate::mm::vmm::invlpg(page_addr);
+                    } else {
+                        // OOM fallback: share the cached page (may cause issues)
+                        crate::mm::refcount::page_ref_inc(cached_phys);
+                        crate::mm::vmm::map_page_in(cr3, page_addr, cached_phys, page_flags);
+                        crate::mm::vmm::invlpg(page_addr);
+                    }
+                } else {
+                    // Read-only: share the cached page directly
+                    crate::mm::refcount::page_ref_inc(cached_phys);
+                    crate::mm::vmm::map_page_in(cr3, page_addr, cached_phys, page_flags);
+                    crate::mm::vmm::invlpg(page_addr);
+                }
                 #[cfg(feature = "firefox-test")]
                 {
                     static PF_CACHED_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
