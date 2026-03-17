@@ -201,15 +201,26 @@ extern "C" fn timer_tick() {
         // Only check when the scheduler is active — before it's enabled,
         // all kernel init runs on CPU 0 without context switches.
         if crate::sched::is_active() {
-            let wd = WATCHDOG_COUNTER[cpu as usize].fetch_add(1, Ordering::Relaxed);
-            if wd >= WATCHDOG_LIMIT {
-                crate::ke::bugcheck::ke_bugcheck(
-                    crate::ke::bugcheck::BUGCHECK_SCHEDULER_DEADLOCK,
-                    cpu as u64,
-                    wd as u64,
-                    tick as u64,
-                    0,
-                );
+            // Don't watchdog idle threads — they legitimately wait in hlt
+            // without calling schedule() when no user threads are assigned.
+            let current_tid = crate::proc::current_tid();
+            let is_idle = current_tid == 0 || {
+                // AP idle threads have PID 0
+                crate::proc::recover_current_pid() == 0
+            };
+            if is_idle {
+                WATCHDOG_COUNTER[cpu as usize].store(0, Ordering::Relaxed);
+            } else {
+                let wd = WATCHDOG_COUNTER[cpu as usize].fetch_add(1, Ordering::Relaxed);
+                if wd >= WATCHDOG_LIMIT {
+                    crate::ke::bugcheck::ke_bugcheck(
+                        crate::ke::bugcheck::BUGCHECK_SCHEDULER_DEADLOCK,
+                        cpu as u64,
+                        wd as u64,
+                        tick as u64,
+                        0,
+                    );
+                }
             }
         }
     }
