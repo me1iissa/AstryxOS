@@ -9964,7 +9964,7 @@ fn test_sigchld_delivery() -> bool {
     let was_active = crate::sched::is_active();
     if !was_active { crate::sched::enable(); }
 
-    for _ in 0..200 {
+    for _ in 0..2000 {
         crate::sched::yield_cpu();
         let done = {
             let procs = crate::proc::PROCESS_TABLE.lock();

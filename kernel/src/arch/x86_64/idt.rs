@@ -384,6 +384,22 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
 
     // If the fault came from Ring 3, kill the process instead of halting
     if frame.cs & 3 == 3 {
+        // Print saved GPRs from ISR stack for debugging.
+        // ISR stub pushes: rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11, then error_code, then IRETQ frame.
+        // frame points to IRETQ frame. Saved regs are below: frame-8=err, frame-16=rax, frame-24=rcx, ...
+        let fp = frame as *const InterruptFrame as u64;
+        let (rax, rcx, rdx, rsi, rdi, r8) = unsafe {
+            (
+                *((fp - 16) as *const u64),  // RAX
+                *((fp - 24) as *const u64),  // RCX
+                *((fp - 32) as *const u64),  // RDX
+                *((fp - 40) as *const u64),  // RSI
+                *((fp - 48) as *const u64),  // RDI
+                *((fp - 56) as *const u64),  // R8
+            )
+        };
+        crate::serial_println!("  User GPRs: RAX={:#x} RCX={:#x} RDX={:#x} RSI={:#x} RDI={:#x} R8={:#x}",
+            rax, rcx, rdx, rsi, rdi, r8);
         crate::serial_println!("  Killing user process (exception in Ring 3)");
         crate::proc::exit_thread(-(vector as i64));
         return;
