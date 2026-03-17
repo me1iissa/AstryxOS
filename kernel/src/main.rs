@@ -437,13 +437,14 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 let now = arch::x86_64::irq::get_ticks();
                 let elapsed = now.wrapping_sub(t_launch);
 
-                // Log a heartbeat every 100 ticks
-                if elapsed / 100 != last_log_tick / 100 {
+                // Log a heartbeat every 1000 ticks (~10s)
+                if elapsed / 1000 != last_log_tick / 1000 {
                     last_log_tick = elapsed;
-                    serial_println!("[FFTEST] tick={} EXEC_RUNNING={} pf={}",
-                        elapsed,
-                        crate::gui::terminal::is_firefox_running(),
-                        crate::perf::page_faults());
+                    let sc = crate::syscall::syscall_count();
+                    let pf = crate::perf::page_faults();
+                    serial_println!("[FFTEST] tick={} sc={} pf={} running={}",
+                        elapsed, sc, pf,
+                        crate::gui::terminal::is_firefox_running());
                 }
 
                 // Check if Firefox has exited
@@ -453,8 +454,8 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                     break;
                 }
 
-                // Hard timeout after 30000 ticks
-                if elapsed >= 30000 {
+                // Hard timeout after 120000 ticks (~20 min at 100 Hz)
+                if elapsed >= 120000 {
                     serial_println!("[FFTEST] Timeout after {} ticks — Firefox still running", elapsed);
                     break;
                 }
