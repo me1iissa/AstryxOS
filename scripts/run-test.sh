@@ -146,7 +146,7 @@ fi
 if [ -f "${DATA_IMG}" ]; then
     QEMU_CMD+=(
         -drive "file=${DATA_IMG},format=raw,if=none,id=data0,snapshot=on"
-        -device "ide-hd,drive=data0,bus=ide.1"
+        -device "virtio-blk-pci,drive=data0"
     )
 fi
 

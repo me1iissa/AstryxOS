@@ -17,6 +17,7 @@ pub mod serial;
 pub mod pty;
 pub mod tty;
 pub mod usb;
+pub mod virtio_blk;
 pub mod vmware_svga;
 
 use astryx_shared::BootInfo;
@@ -37,6 +38,9 @@ pub fn init(boot_info: &BootInfo) {
         crate::serial_println!("[DRIVERS] AC97 audio initialized");
     }
     usb::init();
+    if virtio_blk::init() {
+        crate::serial_println!("[DRIVERS] Virtio-blk initialized");
+    }
     // Note: vmware_svga::init() is called later in Phase 10b (after PCI init)
     crate::serial_println!("[DRIVERS] All drivers initialized");
 }

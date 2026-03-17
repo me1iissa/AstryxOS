@@ -578,15 +578,109 @@ pub fn init_disks() {
         }
     }
 
-    // ── Real disk at /disk (try AHCI first, then ATA PIO) ──────────────
-    if !init_ahci_disks() {
-        init_ata_disks();
+    // ── Real disk at /disk (try virtio first, then AHCI, then ATA PIO) ─
+    if !init_virtio_disks() {
+        if !init_ahci_disks() {
+            init_ata_disks();
+        }
     }
 }
 
 /// Backwards-compatible alias for `init_disks`.
 pub fn init_fat32() {
     init_disks();
+}
+
+/// Probe virtio-blk device for partitions and mount FAT32/NTFS volumes.
+/// Returns true if any volume was successfully mounted.
+fn init_virtio_disks() -> bool {
+    use crate::drivers::block::BlockDevice;
+    use crate::drivers::partition;
+    use crate::drivers::virtio_blk;
+
+    if !virtio_blk::is_available() {
+        crate::serial_println!("[VFS] Virtio-blk not available, skipping");
+        return false;
+    }
+
+    let dev = virtio_blk::VirtioBlkBlockDevice;
+    crate::serial_println!(
+        "[VFS] Probing virtio-blk device ({} sectors) for partitions...",
+        dev.sector_count()
+    );
+
+    let partitions = partition::scan_partitions(&dev as &dyn BlockDevice);
+
+    if !partitions.is_empty() {
+        crate::serial_println!(
+            "[VFS] Found {} partition(s) on virtio-blk",
+            partitions.len()
+        );
+        for part in &partitions {
+            crate::serial_println!(
+                "[VFS]   Partition {}: type={:?}, start={}, size={} sectors",
+                part.index, part.partition_type, part.start_lba, part.sector_count
+            );
+            let pdev = partition::create_partition_device(
+                Box::new(virtio_blk::VirtioBlkBlockDevice),
+                part.start_lba,
+                part.sector_count,
+            );
+            match part.partition_type {
+                partition::PartitionType::Fat32 => {
+                    match fat32::Fat32Fs::new(Box::new(pdev)) {
+                        Ok(fs) => {
+                            let root_inode = fs.root_inode();
+                            mount("/disk", Box::new(fs), root_inode);
+                            crate::serial_println!(
+                                "[VFS] FAT32 partition mounted at /disk (virtio-blk)"
+                            );
+                            return true;
+                        }
+                        Err(e) => {
+                            crate::serial_println!(
+                                "[VFS] FAT32 mount failed on virtio-blk partition: {:?}",
+                                e
+                            );
+                        }
+                    }
+                }
+                partition::PartitionType::Ntfs => {
+                    if let Some(fs) = ntfs::try_mount_ntfs(Box::new(pdev)) {
+                        let root_inode = fs.root_inode();
+                        mount("/ntfs", Box::new(fs), root_inode);
+                        crate::serial_println!(
+                            "[VFS] NTFS partition mounted at /ntfs (virtio-blk)"
+                        );
+                        return true;
+                    }
+                }
+                _ => {
+                    crate::serial_println!(
+                        "[VFS]   Skipping unsupported partition type: {:?}",
+                        part.partition_type
+                    );
+                }
+            }
+        }
+    }
+
+    // Fallback: try whole-disk FAT32.
+    crate::serial_println!(
+        "[VFS] No partitions on virtio-blk, trying whole disk FAT32..."
+    );
+    match fat32::Fat32Fs::new(Box::new(virtio_blk::VirtioBlkBlockDevice)) {
+        Ok(fs) => {
+            let root_inode = fs.root_inode();
+            mount("/disk", Box::new(fs), root_inode);
+            crate::serial_println!("[VFS] FAT32 whole-disk mounted at /disk (virtio-blk)");
+            true
+        }
+        Err(_) => {
+            crate::serial_println!("[VFS] Virtio-blk disk is not FAT32");
+            false
+        }
+    }
 }
 
 /// Probe AHCI ports for partitions and mount FAT32/NTFS volumes.
