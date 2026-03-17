@@ -164,7 +164,54 @@ macro_rules! irq_stub {
     };
 }
 
-irq_stub!(irq_timer_handler,    timer_tick);
+// Timer IRQ uses a custom stub that preempts user-mode threads.
+// The generic irq_stub! cannot do this because it has no access to
+// the interrupted CS value.  After timer_tick() returns, we check
+// NEED_RESCHEDULE and the interrupted CS — if both indicate preemption
+// of a Ring 3 thread, we call schedule() before iretq.
+#[unsafe(naked)]
+pub extern "C" fn irq_timer_handler() {
+    core::arch::naked_asm!(
+        // Save caller-saved registers (same as irq_stub!)
+        "push rax", "push rcx", "push rdx",
+        "push rsi", "push rdi",
+        "push r8",  "push r9",  "push r10", "push r11",
+        // Save callee-saved registers too (schedule() may clobber via context switch)
+        "push rbx", "push rbp",
+        "push r12", "push r13", "push r14", "push r15",
+        // Call the timer handler (updates tick count, scheduler bookkeeping, EOI)
+        "call {timer_tick}",
+        // Check if we should preempt: is the interrupted context Ring 3?
+        // IRETQ frame CS is at RSP + 15*8 (15 pushed regs) + 8 (RIP) = RSP + 128
+        "mov rax, [rsp + 128]",  // interrupted CS
+        "test rax, 3",           // Ring 3?
+        "jz 2f",                 // skip if kernel mode
+        // Check NEED_RESCHEDULE for this CPU
+        "call {check_preempt}",
+        "test al, al",
+        "jz 2f",                 // no preemption needed
+        // Preempt: call schedule() which may context-switch
+        "call {schedule}",
+        "2:",
+        // Restore all registers
+        "pop r15", "pop r14", "pop r13", "pop r12",
+        "pop rbp", "pop rbx",
+        "pop r11",  "pop r10",  "pop r9",   "pop r8",
+        "pop rdi",  "pop rsi",
+        "pop rdx",  "pop rcx",  "pop rax",
+        "iretq",
+        timer_tick = sym timer_tick,
+        check_preempt = sym check_preempt_needed,
+        schedule = sym crate::sched::schedule,
+    );
+}
+
+/// Check if preemption is needed on the current CPU.
+/// Called from the timer ISR stub after timer_tick().
+/// Returns true if NEED_RESCHEDULE is set for this CPU.
+extern "C" fn check_preempt_needed() -> bool {
+    crate::sched::should_preempt()
+}
 irq_stub!(irq_keyboard_handler, keyboard_interrupt);
 
 /// Timer interrupt logic.
