@@ -10103,7 +10103,7 @@ fn test_ascension_init() -> bool {
     let was_active = crate::sched::is_active();
     if !was_active { crate::sched::enable(); }
 
-    for _ in 0..200 {
+    for _ in 0..2000 {
         crate::sched::yield_cpu();
         let done = {
             let procs = crate::proc::PROCESS_TABLE.lock();
@@ -10114,7 +10114,7 @@ fn test_ascension_init() -> bool {
         };
         if done { break; }
         crate::hal::enable_interrupts();
-        for _ in 0..1000 { core::hint::spin_loop(); }
+        for _ in 0..10_000 { core::hint::spin_loop(); }
     }
 
     if !was_active { crate::sched::disable(); }

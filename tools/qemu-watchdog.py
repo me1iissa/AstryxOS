@@ -218,7 +218,7 @@ class QemuWatchdog:
         # Data disk
         if data_img.exists():
             cmd.extend(["-drive", f"format=raw,file={data_img},if=none,id=data,snapshot=on",
-                        "-device", "ide-hd,drive=data,bus=ide.1"])
+                        "-device", "virtio-blk-pci,drive=data"])
 
         # GDB stub if requested
         if self.args.gdb_on_hang:
