@@ -123,6 +123,15 @@ pub fn check_reschedule() {
     }
 }
 
+/// Check if the current CPU needs preemption (without clearing the flag).
+/// Used by the timer ISR to decide whether to call schedule() when
+/// returning to Ring 3 user code.
+pub fn should_preempt() -> bool {
+    if !is_active() { return false; }
+    let cpu = cpu_index();
+    NEED_RESCHEDULE[cpu].load(Ordering::Relaxed)
+}
+
 /// Reap dead threads and free their kernel stacks.
 ///
 /// MUST be called with interrupts already disabled so that pmm::free_page()
@@ -234,6 +243,10 @@ pub fn schedule() {
     if !is_active() {
         return;
     }
+
+    // Clear the reschedule flag for this CPU (it was set by timer_tick_schedule).
+    let cpu_idx = cpu_index();
+    NEED_RESCHEDULE[cpu_idx].store(false, Ordering::Relaxed);
 
     // ── Disable interrupts to prevent deadlock ──────────────────────
     // timer_tick_schedule() runs in the timer ISR and acquires THREAD_TABLE.
