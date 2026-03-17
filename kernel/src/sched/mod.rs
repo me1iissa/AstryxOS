@@ -410,12 +410,16 @@ pub fn schedule() {
                     return schedule();
                 }
                 crate::perf::record_idle_tick();
+                // Reset watchdog: this CPU is running a valid thread, just
+                // has nothing to switch to. Not a deadlock.
+                crate::arch::x86_64::irq::reset_watchdog_counter();
                 return  // no semicolon — arm type is !, coerces to tuple type
             }
         }
     };
 
     if next_tid == current_tid {
+        crate::arch::x86_64::irq::reset_watchdog_counter();
         crate::hal::enable_interrupts();
         return; // No switch needed.
     }
