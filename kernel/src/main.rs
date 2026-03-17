@@ -442,9 +442,27 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                     last_log_tick = elapsed;
                     let sc = crate::syscall::syscall_count();
                     let pf = crate::perf::page_faults();
-                    serial_println!("[FFTEST] tick={} sc={} pf={} running={}",
-                        elapsed, sc, pf,
-                        crate::gui::terminal::is_firefox_running());
+                    // Dump thread states to diagnose spin-wait
+                    {
+                        let threads = crate::proc::THREAD_TABLE.lock();
+                        let total = threads.len();
+                        let mut p1_run = 0u32;
+                        let mut p1_blk = 0u32;
+                        let mut p1_dead = 0u32;
+                        let mut p1_total = 0u32;
+                        for t in threads.iter().filter(|t| t.pid == 1) {
+                            p1_total += 1;
+                            match t.state {
+                                crate::proc::ThreadState::Running => p1_run += 1,
+                                crate::proc::ThreadState::Ready => p1_run += 1, // count as active
+                                crate::proc::ThreadState::Blocked => p1_blk += 1,
+                                crate::proc::ThreadState::Sleeping => p1_blk += 1,
+                                crate::proc::ThreadState::Dead => p1_dead += 1,
+                            }
+                        }
+                        serial_println!("[FFTEST] tick={} sc={} pf={} total_th={} p1:{}(run={},blk={},dead={})",
+                            elapsed, sc, pf, total, p1_total, p1_run, p1_blk, p1_dead);
+                    }
                 }
 
                 // Check if Firefox has exited
