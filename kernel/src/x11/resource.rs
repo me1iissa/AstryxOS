@@ -50,6 +50,7 @@ pub struct WindowData {
     pub event_mask:      u32,
     pub background_pixel: u32,
     pub mapped:          bool,
+    pub override_redirect: bool,
     pub properties:      [Option<PropertyEntry>; MAX_PROPERTIES],
     /// Pixel buffer (BGRA, width×height×4 bytes) for compositor blitting.
     /// Allocated on MapWindow with background_pixel fill.
@@ -65,6 +66,7 @@ impl WindowData {
             event_mask: 0,
             background_pixel: 0xFFFFFFFF,
             mapped: false,
+            override_redirect: false,
             properties: [const { None }; MAX_PROPERTIES],
             pixels: alloc::vec::Vec::new(),
         }

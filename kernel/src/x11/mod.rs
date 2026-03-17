@@ -638,12 +638,23 @@ fn op_create_window(fd: u64, data: &[u8], _seq: u16) {
     let visual = r32(data, 24);
     let vmask  = r32(data, 28);
     let mut event_mask = 0u32; let mut bg_pixel = 0u32;
+    let mut override_redirect = false;
     let mut vi = 32usize;
-    if vmask & proto::CW_BACK_PIXMAP != 0 { vi += 4; }
-    if vmask & proto::CW_BACK_PIXEL  != 0 { bg_pixel = r32(data, vi); vi += 4; }
-    if vmask & proto::CW_BORDER_PIXMAP != 0 { vi += 4; }
-    if vmask & proto::CW_BORDER_PIXEL  != 0 { vi += 4; }
-    if vmask & proto::CW_EVENT_MASK    != 0 { event_mask = r32(data, vi); }
+    if vmask & proto::CW_BACK_PIXMAP       != 0 { vi += 4; }
+    if vmask & proto::CW_BACK_PIXEL        != 0 { bg_pixel = r32(data, vi); vi += 4; }
+    if vmask & proto::CW_BORDER_PIXMAP     != 0 { vi += 4; }
+    if vmask & proto::CW_BORDER_PIXEL      != 0 { vi += 4; }
+    if vmask & proto::CW_BIT_GRAVITY       != 0 { vi += 4; }
+    if vmask & proto::CW_WIN_GRAVITY       != 0 { vi += 4; }
+    if vmask & proto::CW_BACKING_STORE     != 0 { vi += 4; }
+    if vmask & proto::CW_BACKING_PLANES    != 0 { vi += 4; }
+    if vmask & proto::CW_BACKING_PIXEL     != 0 { vi += 4; }
+    if vmask & proto::CW_OVERRIDE_REDIRECT != 0 { override_redirect = r32(data, vi) != 0; vi += 4; }
+    if vmask & proto::CW_SAVE_UNDER        != 0 { vi += 4; }
+    if vmask & proto::CW_EVENT_MASK        != 0 { event_mask = r32(data, vi); vi += 4; }
+    if vmask & proto::CW_DO_NOT_PROPAGATE  != 0 { vi += 4; }
+    if vmask & proto::CW_COLORMAP          != 0 { vi += 4; }
+    if vmask & proto::CW_CURSOR            != 0 { let _ = vi; }
     with_client(fd, |c| {
         let mut w = WindowData::new(
             if parent == 0 { proto::ROOT_WINDOW_ID } else { parent },
@@ -652,6 +663,7 @@ fn op_create_window(fd: u64, data: &[u8], _seq: u16) {
             bw, if class == 0 { 1 } else { class },
             if visual == 0 { proto::ROOT_VISUAL } else { visual });
         w.event_mask = event_mask; w.background_pixel = bg_pixel;
+        w.override_redirect = override_redirect;
         if !c.resources.insert(wid, ResourceBody::Window(w)) {
             c.send_error(proto::ERR_ALLOC, wid, proto::OP_CREATE_WINDOW);
         }
@@ -667,11 +679,21 @@ fn op_change_win_attrs(fd: u64, data: &[u8]) {
     with_client(fd, |c| {
         if let Some(w) = c.resources.get_window_mut(wid) {
             let mut vi = 12usize;
-            if vmask & proto::CW_BACK_PIXMAP != 0 { vi += 4; }
-            if vmask & proto::CW_BACK_PIXEL  != 0 { w.background_pixel = r32(data, vi); vi += 4; }
-            if vmask & proto::CW_BORDER_PIXMAP != 0 { vi += 4; }
-            if vmask & proto::CW_BORDER_PIXEL  != 0 { vi += 4; }
-            if vmask & proto::CW_EVENT_MASK    != 0 { w.event_mask = r32(data, vi); }
+            if vmask & proto::CW_BACK_PIXMAP       != 0 { vi += 4; }
+            if vmask & proto::CW_BACK_PIXEL        != 0 { w.background_pixel = r32(data, vi); vi += 4; }
+            if vmask & proto::CW_BORDER_PIXMAP     != 0 { vi += 4; }
+            if vmask & proto::CW_BORDER_PIXEL      != 0 { vi += 4; }
+            if vmask & proto::CW_BIT_GRAVITY       != 0 { vi += 4; }
+            if vmask & proto::CW_WIN_GRAVITY       != 0 { vi += 4; }
+            if vmask & proto::CW_BACKING_STORE     != 0 { vi += 4; }
+            if vmask & proto::CW_BACKING_PLANES    != 0 { vi += 4; }
+            if vmask & proto::CW_BACKING_PIXEL     != 0 { vi += 4; }
+            if vmask & proto::CW_OVERRIDE_REDIRECT != 0 { w.override_redirect = r32(data, vi) != 0; vi += 4; }
+            if vmask & proto::CW_SAVE_UNDER        != 0 { vi += 4; }
+            if vmask & proto::CW_EVENT_MASK        != 0 { w.event_mask = r32(data, vi); vi += 4; }
+            if vmask & proto::CW_DO_NOT_PROPAGATE  != 0 { vi += 4; }
+            if vmask & proto::CW_COLORMAP          != 0 { vi += 4; }
+            if vmask & proto::CW_CURSOR            != 0 { let _ = vi; }
         }
     });
 }

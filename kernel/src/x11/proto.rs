@@ -122,7 +122,17 @@ pub const CW_BACK_PIXMAP:       u32 = 0x0001;
 pub const CW_BACK_PIXEL:        u32 = 0x0002;
 pub const CW_BORDER_PIXMAP:     u32 = 0x0004;
 pub const CW_BORDER_PIXEL:      u32 = 0x0008;
+pub const CW_BIT_GRAVITY:       u32 = 0x0010;
+pub const CW_WIN_GRAVITY:       u32 = 0x0020;
+pub const CW_BACKING_STORE:     u32 = 0x0040;
+pub const CW_BACKING_PLANES:    u32 = 0x0080;
+pub const CW_BACKING_PIXEL:     u32 = 0x0100;
+pub const CW_OVERRIDE_REDIRECT: u32 = 0x0200;
+pub const CW_SAVE_UNDER:        u32 = 0x0400;
 pub const CW_EVENT_MASK:        u32 = 0x0800;
+pub const CW_DO_NOT_PROPAGATE:  u32 = 0x1000;
+pub const CW_COLORMAP:          u32 = 0x2000;
+pub const CW_CURSOR:            u32 = 0x4000;
 
 // ── GC value-list masks ───────────────────────────────────────────────────────
 pub const GC_FUNCTION:          u32 = 0x0001;
