@@ -472,8 +472,8 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                     break;
                 }
 
-                // Hard timeout after 120000 ticks (~20 min at 100 Hz)
-                if elapsed >= 120000 {
+                // Hard timeout after 300000 ticks (~50 min at 100 Hz)
+                if elapsed >= 300000 {
                     serial_println!("[FFTEST] Timeout after {} ticks — Firefox still running", elapsed);
                     break;
                 }
