@@ -6925,9 +6925,19 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
     let mut fired: alloc::vec::Vec<EpollEvent> = alloc::vec::Vec::new();
     do_poll(&mut fired);
 
-    // If nothing ready and caller is willing to wait, yield one tick then retry.
+    // If nothing ready and caller is willing to wait, sleep for the requested
+    // timeout then retry. Firefox's event loop depends on epoll_wait actually
+    // blocking for the full timeout — returning 0 too quickly causes Firefox
+    // to spin in a tight loop and never advance its internal timers.
     if fired.is_empty() && timeout_ms != 0 {
-        crate::proc::sleep_ticks(1);
+        let wait_ticks = if timeout_ms < 0 {
+            // Infinite timeout — sleep a reasonable amount then retry
+            10u64  // 100ms
+        } else {
+            // Convert ms to ticks (100 Hz = 10ms/tick), minimum 1
+            ((timeout_ms as u64) / 10).max(1)
+        };
+        crate::proc::sleep_ticks(wait_ticks);
         do_poll(&mut fired);
     }
 
