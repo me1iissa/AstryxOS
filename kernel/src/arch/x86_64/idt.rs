@@ -573,6 +573,12 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
             // Release PROCESS_TABLE to avoid deadlock with MOUNTS.
             drop(procs);
 
+            // Enable interrupts during the file read so the timer ISR can
+            // fire. ATA PIO reads can take 10-100ms; without re-enabling
+            // interrupts, the CPU appears dead (no heartbeat, no scheduling).
+            // Safe: all kernel locks are released at this point.
+            crate::hal::enable_interrupts();
+
             let page_offset_in_vma = page_addr - vma_base;
             let file_page_offset = file_base_offset + page_offset_in_vma;
 
