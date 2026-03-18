@@ -242,6 +242,12 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
         }
 
         if handle_page_fault(cr2, error_code, frame) {
+            // Deferred preemption: check if a reschedule is pending.
+            // This is a safe point — all locks released, returning to user mode.
+            // This replaces the broken ISR-direct schedule() approach.
+            if frame.cs & 3 == 3 {
+                crate::sched::check_reschedule();
+            }
             return; // Fault resolved
         }
 
