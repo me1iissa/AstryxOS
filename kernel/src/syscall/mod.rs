@@ -4541,6 +4541,11 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
             }
             0
         }
+        // 140: getpriority(which, who) — return nice value (always 0 = normal)
+        // Linux returns 20-nice (range 1-40), so 20 = nice 0.
+        140 => 20,
+        // 141: setpriority(which, who, prio) — no-op
+        141 => 0,
         // 149: mlock(addr, len)   — no-op (no swapping in AstryxOS)
         149 => 0,
         // 150: munlock(addr, len) — no-op
