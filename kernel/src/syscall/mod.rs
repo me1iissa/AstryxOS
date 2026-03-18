@@ -2955,19 +2955,28 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
                     if pid >= 1 { crate::serial_println!("[POLL_RET] pid={} ret={} (post-x11-poll)", pid, r); }
                     return r;
                 }
-                let max_retries: usize = if timeout_ms < 0 { 64 } else {
-                    ((timeout_ms as usize / 10).max(1)).min(64)
+                // Block the thread until an fd becomes ready or timeout expires.
+                // For timeout_ms == -1 (infinite), block indefinitely.
+                // For timeout_ms > 0, block for at most that many ms.
+                // Each iteration sleeps 1 tick (10ms), pumps X11, and re-checks.
+                let deadline_tick = if timeout_ms < 0 {
+                    u64::MAX // infinite
+                } else {
+                    let now = crate::arch::x86_64::irq::get_ticks();
+                    now + ((timeout_ms as u64) / 10).max(1)
                 };
-                for _ in 0..max_retries {
-                    crate::sched::yield_cpu();
-                    // Pump X11 on each retry so concurrent X11 replies appear promptly.
+                loop {
+                    crate::proc::sleep_ticks(1); // sleep 1 tick (10ms)
+                    // Pump X11 so replies appear in socket buffers.
                     crate::x11::poll();
                     let r = do_check(true, true);
                     if r > 0 {
                         #[cfg(feature = "firefox-test")]
-                        if pid >= 1 { crate::serial_println!("[POLL_RET] pid={} ret={} (retry)", pid, r); }
+                        if pid >= 1 { crate::serial_println!("[POLL_RET] pid={} ret={} (woke)", pid, r); }
                         return r;
                     }
+                    let now = crate::arch::x86_64::irq::get_ticks();
+                    if now >= deadline_tick { break; }
                 }
                 #[cfg(feature = "firefox-test")]
                 if pid >= 1 { crate::serial_println!("[POLL_RET] pid={} ret=0 (timeout)", pid); }
@@ -4256,11 +4265,21 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
         }
         // 271: ppoll(fds, nfds, tmo_p, sigmask, sigsetsize) — poll with timeout+mask
         271 => {
-            // Delegate to poll (syscall 7), ignoring sigmask
+            // Delegate to poll (syscall 7), ignoring sigmask.
+            // NULL tmo_p (arg3==0) = block indefinitely (-1).
+            // Non-NULL tmo_p = parse struct timespec and convert to ms.
             let timeout_ms: i64 = if arg3 == 0 {
-                0 // null timeout → return immediately
+                -1 // NULL timeout = block indefinitely (POSIX)
             } else {
-                -1 // wait indefinitely (we don't support real timeouts here)
+                // Parse struct timespec { tv_sec: i64, tv_nsec: i64 }
+                let tv_sec = unsafe { user_read_u64(arg3) }.unwrap_or(0) as i64;
+                let tv_nsec = unsafe { user_read_u64(arg3 + 8) }.unwrap_or(0) as i64;
+                if tv_sec == 0 && tv_nsec == 0 {
+                    0 // zero timeout = return immediately
+                } else {
+                    // Convert to ms, minimum 1
+                    (tv_sec * 1000 + tv_nsec / 1_000_000).max(1)
+                }
             };
             dispatch_linux(7, arg1, arg2, timeout_ms as u64, 0, 0, 0)
         }
@@ -4511,8 +4530,9 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
                 Err(e) => crate::subsys::linux::errno::vfs_err(e),
             }
         }
-        // 355: close_range(first, last, flags) — close a range of fds
-        355 => {
+        // 436: close_range(first, last, flags) — close a range of fds
+        // (also mapped at 355 for backwards compat, but 436 is the correct x86_64 number)
+        436 | 355 => {
             let pid = crate::proc::current_pid();
             let first = arg1 as usize;
             let last = (arg2 as usize).min(4095);
