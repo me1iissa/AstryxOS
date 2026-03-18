@@ -123,15 +123,6 @@ pub fn check_reschedule() {
     }
 }
 
-/// Check if the current CPU needs preemption (without clearing the flag).
-/// Used by the timer ISR to decide whether to call schedule() when
-/// returning to Ring 3 user code.
-pub fn should_preempt() -> bool {
-    if !is_active() { return false; }
-    let cpu = cpu_index();
-    NEED_RESCHEDULE[cpu].load(Ordering::Relaxed)
-}
-
 /// Reap dead threads and free their kernel stacks.
 ///
 /// MUST be called with interrupts already disabled so that pmm::free_page()
