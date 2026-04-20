@@ -460,85 +460,19 @@ pub fn init() {
               #   service-restart getty   /disk/bin/getty tty0\n");
     }
 
-    // ── /proc — static read-only approximations of common entries ─────────
-    let _ = mkdir("/proc");
-    let _ = mkdir("/proc/sys");
-    let _ = mkdir("/proc/sys/vm");
-    let _ = mkdir("/proc/sys/kernel");
-    let _ = mkdir("/proc/self");
-    let _ = mkdir("/proc/self/fd");
-
-    // /proc/version — kernel version string (Linux-compatible)
-    let _ = create_file("/proc/version");
-    let _ = write_file("/proc/version",
-        b"Linux version 5.15.0-astryx (musl-gcc) #1 SMP AstryxOS\n");
-
-    // /proc/cpuinfo — minimal single-CPU entry (required by some libs)
-    let _ = create_file("/proc/cpuinfo");
-    let _ = write_file("/proc/cpuinfo",
-        b"processor\t: 0\nvendor_id\t: AstryxOS\nmodel name\t: x86_64\n\
-          cpu MHz\t\t: 2000.000\ncache size\t: 4096 KB\nflags\t\t: fpu sse sse2 sse4_1 sse4_2 avx\n\n");
-
-    // /proc/meminfo — stub memory information
-    let _ = create_file("/proc/meminfo");
-    let _ = write_file("/proc/meminfo",
-        b"MemTotal:       524288 kB\nMemFree:        262144 kB\nMemAvailable:   262144 kB\n\
-          Buffers:             0 kB\nCached:              0 kB\nSwapTotal:           0 kB\n\
-          SwapFree:            0 kB\n");
-
-    // /proc/sys/vm/overcommit_memory — "0" = heuristic overcommit (default)
-    if let Ok(()) = create_file("/proc/sys/vm/overcommit_memory") {
-        let _ = write_file("/proc/sys/vm/overcommit_memory", b"0\n");
-    }
-    // /proc/sys/vm/max_map_count — max VMAs per process
-    if let Ok(()) = create_file("/proc/sys/vm/max_map_count") {
-        let _ = write_file("/proc/sys/vm/max_map_count", b"65530\n");
-    }
-    // /proc/sys/kernel/pid_max
-    if let Ok(()) = create_file("/proc/sys/kernel/pid_max") {
-        let _ = write_file("/proc/sys/kernel/pid_max", b"65536\n");
-    }
-    // /proc/sys/kernel/random/uuid — used by some initialisation code
-    let _ = mkdir("/proc/sys/kernel/random");
-    if let Ok(()) = create_file("/proc/sys/kernel/random/uuid") {
-        let _ = write_file("/proc/sys/kernel/random/uuid",
-            b"deadbeef-cafe-1234-5678-0a0b0c0d0e0f\n");
-    }
-
-    // /proc/mounts — single ramfs entry
-    if let Ok(()) = create_file("/proc/mounts") {
-        let _ = write_file("/proc/mounts",
-            b"rootfs / ramfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\n");
-    }
-
-    // /proc/self — process-specific pseudo-files (static stubs)
-    // /proc/self/cmdline — argv[0]\0...  (musl uses it to set thread name)
-    if let Ok(()) = create_file("/proc/self/cmdline") {
-        let _ = write_file("/proc/self/cmdline", b"astryx\0");
-    }
-    // /proc/self/status — process status (polled by pthreads in some versions)
-    if let Ok(()) = create_file("/proc/self/status") {
-        let _ = write_file("/proc/self/status",
-            b"Name:\tastryx\nState:\tR (running)\nPid:\t1\nPPid:\t0\nVmRSS:\t4096 kB\n");
-    }
-    // /proc/self/maps — memory map (stub: single anonymous RWX range covers user space)
-    if let Ok(()) = create_file("/proc/self/maps") {
-        let _ = write_file("/proc/self/maps",
-            b"00400000-7f0000000000 rwxp 00000000 00:00 0  [stack]\n");
-    }
-    // /proc/self/exe — symlink to the current binary (readlink resolves it dynamically)
-    // We create the file so open() doesn't fail, but the readlink syscall
-    // overrides the content with the real path.
-    if let Ok(()) = create_file("/proc/self/exe") {
-        let _ = write_file("/proc/self/exe", b"/disk/bin/init");
-    }
-    // /proc/self/environ — empty environment (optional, but avoids ENOENT)
-    if let Ok(()) = create_file("/proc/self/environ") {
-        let _ = write_file("/proc/self/environ", b"");
-    }
-    // /proc/self/comm — short process name
-    if let Ok(()) = create_file("/proc/self/comm") {
-        let _ = write_file("/proc/self/comm", b"astryx\n");
+    // ── /proc — mount ProcFs as a real VFS filesystem ─────────────────────
+    // ProcFs generates all content dynamically on every read(), so userspace
+    // always sees live kernel state.  The static ramfs entries that used to
+    // live here have been replaced by the ProcFs mount below.
+    //
+    // The `mount()` call creates the /proc directory in the parent ramfs and
+    // then registers ProcFs in the MOUNTS table.  The path resolver will
+    // thereafter route any /proc/... open() to ProcFs rather than ramfs.
+    {
+        let proc_fs = procfs::ProcFs::new();
+        let proc_root = proc_fs.root_inode();
+        mount("/proc", Box::new(proc_fs), proc_root);
+        crate::serial_println!("[VFS] ProcFs mounted at /proc (dynamic, live kernel state)");
     }
 
     crate::serial_println!("[VFS] Initialized with root ramfs, standard directories created");
@@ -1474,6 +1408,25 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
             if open_path == "/proc/self/stat" || open_path.ends_with("/stat") {
                 let target_pid = proc_target_pid(&open_path).unwrap_or(pid);
                 let content = generate_proc_stat(target_pid);
+                return serve_dynamic_read(&content, offset, buf, count, pid, fd_num);
+            }
+            // ── Dynamic /proc global entries (no PID context needed) ──────────
+            // These are served from ProcFs::read() but we intercept here too so
+            // the content is always fresh regardless of which mount serves the fd.
+            if open_path == "/proc/cpuinfo" {
+                let content = procfs::generate_cpuinfo();
+                return serve_dynamic_read(&content, offset, buf, count, pid, fd_num);
+            }
+            if open_path == "/proc/meminfo" {
+                let content = procfs::generate_meminfo();
+                return serve_dynamic_read(&content, offset, buf, count, pid, fd_num);
+            }
+            if open_path == "/proc/uptime" {
+                let content = procfs::generate_uptime();
+                return serve_dynamic_read(&content, offset, buf, count, pid, fd_num);
+            }
+            if open_path == "/proc/version" {
+                let content = procfs::generate_version();
                 return serve_dynamic_read(&content, offset, buf, count, pid, fd_num);
             }
 
