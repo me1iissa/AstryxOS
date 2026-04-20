@@ -1,10 +1,20 @@
 # AstryxOS — Progress Tracker
 
-## Current Phase: Memory hardening + Firefox X11
-**Current**: 2026-03-14
-**Tests**: 95/95 passing (SMP -smp 2 stable)
+## Current Phase: RC1 — /proc VFS mount + Firefox compatibility
+**Current**: 2026-04-20
+**Tests**: 98/98 passing with data disk; 92/98 without (6 disk-dependent tests require /disk/bin/hello + tcc)
 **GUI Tests**: 10/10 pixel checks passing (`scripts/run-gui-test.sh`)
 **Firefox**: Runs for full 15000 ticks without crashing (was: crash at 1481 syscalls at RIP=0x0)
+
+### Milestone 42 — ProcFs VFS Mount: /proc as a real filesystem (✅)
+**Completed**: 2026-04-20
+
+**What was built:**
+- [x] **ProcFs struct** — Implements `FileSystemOps`; mounted at `/proc` by `vfs::init()` replacing all static ramfs `/proc` entries. Virtual inodes 2000–2043 cover cpuinfo, meminfo, uptime, version, mounts, cmdline, self/{maps,status,stat,cmdline,exe,comm,environ,fd}, sys/vm/*, sys/kernel/*.
+- [x] **Dynamic content generation** — `generate_cpuinfo()` uses CPUID leaf 0 (vendor), leaf 1 (family/model/features), and leaves 0x80000002-4 (brand string). `generate_meminfo()` uses live PMM stats. `generate_uptime()` uses PIT tick counter. `generate_version()` returns AstryxOS Aether 0.1 string.
+- [x] **fd_read() dispatch extended** — Added intercepts for `/proc/cpuinfo`, `/proc/meminfo`, `/proc/uptime`, `/proc/version` so content is always freshly generated on every read regardless of which mount serves the fd.
+- [x] **3 new tests** — `test_procfs_cpuinfo` (97), `test_procfs_meminfo` (98), `test_procfs_self_maps` (99): all pass.
+- [x] Files changed: `kernel/src/vfs/procfs.rs` (rewritten), `kernel/src/vfs/mod.rs` (init + fd_read), `kernel/src/test_runner.rs` (+3 tests)
 
 ### Milestone 41 — Double Fault Fix: UEFI Bootstrap Stack + CR3 Switch (✅)
 **Completed**: 2026-03-14
