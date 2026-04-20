@@ -37,7 +37,7 @@ itself (wrong) or ENOENT.
 - Any package that installs via symlinks is silently broken
 
 **Reference**: `linux/fs/namei.c` (`follow_link`, `trailing_symlink`);
-`XP/base/ntos/fsrtl/fsrtlpc.c`
+`reactos/ntoskrnl/fsrtl/fsrtlpc.c`
 
 ---
 
@@ -50,7 +50,7 @@ itself (wrong) or ENOENT.
 - Many Unix daemons use lock files (pid files via `flock(LOCK_EX|LOCK_NB)`)
 - Firefox profile manager uses lock files to detect concurrent instances
 
-**Reference**: `linux/fs/locks.c` (1,700 LOC); `XP/base/ntos/fsrtl/filtrctx.c`
+**Reference**: `linux/fs/locks.c` (1,700 LOC); `reactos/ntoskrnl/fsrtl/filtrctx.c`
 
 ---
 
@@ -72,7 +72,7 @@ directory trees, this is catastrophic for performance.
 `/usr/lib/x86_64-linux-gnu/libssl.so.1.1` = 7 lookups every single open().
 
 **Reference**: `linux/fs/dcache.c` (1,900 LOC, `dentry` struct, `d_lookup`, LRU);
-`XP/base/ntos/cache/` (CcInitializeCacheMap)
+`reactos/ntoskrnl/cc/` (CcInitializeCacheMap)
 
 ---
 
@@ -112,7 +112,7 @@ Also: if a file is unlinked while still open, its data must persist until the la
 mounting. Currently mounts are hardcoded in init.
 
 **Reference**: `linux/fs/namespace.c` (`sys_mount`, `sys_umount`);
-`XP/base/ntos/io/pnpmgr.c`
+`reactos/ntoskrnl/io/pnpmgr/`
 
 ---
 
@@ -150,7 +150,7 @@ read by musl, glibc, and many utilities.
 |---------|-------------|-----------|
 | Filesystem namespace | Separate mount table per process (containers) | `linux/fs/namespace.c` |
 | `chroot()` | Restrict process root directory | `linux/fs/namei.c` |
-| FAT32 write path | Currently read-only in memory; no cluster allocation | `XP/base/fs/fastfat/` |
+| FAT32 write path | Currently read-only in memory; no cluster allocation | `reactos/drivers/filesystems/fastfat/` |
 | ext2 write path | Stub: no inode/block allocation | `linux/fs/ext2/` |
 | File descriptor limits | `RLIMIT_NOFILE` enforcement (see rlimit in proc gaps) | — |
 | Fsync directory | Flush directory metadata to persist rename | `linux/fs/inode.c` |

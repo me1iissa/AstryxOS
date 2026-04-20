@@ -39,8 +39,7 @@ blocking at DISPATCH_LEVEL (which would be a deadlock on a real kernel).
 code waiting for an interrupt) → deadlock. This is a class of bug that silently causes random
 hangs in drivers.
 
-**Reference**: `XP/base/ntos/ke/i386/amd64s.asm` (`KfRaiseIrql`, `KfLowerIrql`);
-`reactos/ntoskrnl/ke/i386/irq.c`
+**Reference**: `reactos/ntoskrnl/ke/i386/irq.c` (`KfRaiseIrql`, `KfLowerIrql`)
 
 ---
 
@@ -60,8 +59,7 @@ Without DPC drain, received packets are silently discarded.
 2. End of `schedule()` (after all locks released)
 3. AP idle loop between `hlt` instructions
 
-**Reference**: `XP/base/ntos/ke/dpcsup.c` (`KiExecuteDpc`);
-`reactos/ntoskrnl/ke/dpc.c`
+**Reference**: `reactos/ntoskrnl/ke/dpc.c` (`KiExecuteDpc`)
 
 ---
 
@@ -78,8 +76,8 @@ thread returns to user mode from a syscall/interrupt (at PASSIVE_LEVEL). The ker
 `QueueUserAPC()`. Direct equivalent in Linux is signal delivery (already done) but APC delivery
 enables the NT subsystem compatibility layer.
 
-**Reference**: `XP/base/ntos/ke/apc.c` (`KiDeliverApc`);
-`XP/base/ntos/ke/i386/apcuser.asm`
+**Reference**: `reactos/ntoskrnl/ke/apc.c` (`KiDeliverApc`);
+`reactos/ntoskrnl/ke/i386/abios.c` (user-mode APC frame setup)
 
 ---
 
@@ -92,7 +90,7 @@ Currently there is a single global interrupt enable/disable via `sti`/`cli`.
 **Why high**: SMP requires per-CPU IRQL. An ISR on CPU 1 should not be blocked by CPU 0
 lowering its IRQL.
 
-**Reference**: `XP/base/ntos/ke/i386/` (`amd64prc.asm`); per-CPU GDT slot for IRQL
+**Reference**: `reactos/ntoskrnl/include/internal/ke.h` (KPCR/per-CPU IRQL); per-CPU GDT slot for IRQL
 
 ---
 
@@ -104,8 +102,7 @@ manager tree locks, file system metadata.
 **Current state**: `ex/resource.rs` has the struct but `acquire_shared`/`acquire_exclusive`
 likely don't implement proper reader-writer semantics with waiters.
 
-**Reference**: `XP/base/ntos/ex/resource.c` (`ExAcquireResourceSharedLite`);
-`reactos/ntoskrnl/ex/resource.c`
+**Reference**: `reactos/ntoskrnl/ex/resource.c` (`ExAcquireResourceSharedLite`)
 
 ---
 
@@ -116,7 +113,7 @@ These are the NT equivalent of Linux kernel work queues (`workqueue_struct`).
 **Current state**: `queue_work_item()` exists, items stored in queue, but no worker threads
 are ever spawned and no drain happens.
 
-**Reference**: `XP/base/ntos/ex/worker.c` (`ExpWorkerThread`);
+**Reference**: `reactos/ntoskrnl/ex/work.c` (`ExpWorkerThread`);
 `linux/kernel/workqueue.c` (`process_one_work`)
 
 ---
@@ -128,7 +125,7 @@ are ever spawned and no drain happens.
 
 Many kernel subsystems need one-shot timers: TCP retransmit, ARP retry, DHCP lease renewal.
 
-**Reference**: `XP/base/ntos/ke/timer.c` (`KeSetTimer`, `KeSetTimerEx`);
+**Reference**: `reactos/ntoskrnl/ke/timerobj.c` (`KeSetTimer`, `KeSetTimerEx`);
 `linux/kernel/hrtimer.c`
 
 ---
@@ -140,9 +137,9 @@ Many kernel subsystems need one-shot timers: TCP retransmit, ARP retry, DHCP lea
 | High-resolution timers | Sub-tick precision (HPET or TSC) | `linux/kernel/hrtimer.c` |
 | Soft-lockup / hard-lockup detection | Detect hung CPU via NMI watchdog | `linux/kernel/watchdog.c` |
 | CPU stall detection | Panic if CPU is stuck in interrupt | `linux/kernel/rcu/tree_stall.h` |
-| Spin count for mutexes | Try spin before blocking (NUMA perf) | `XP/base/ntos/ex/pushlock.c` |
+| Spin count for mutexes | Try spin before blocking (NUMA perf) | `reactos/ntoskrnl/ex/pushlock.c` |
 | Timer coalescing | Group nearby timers to reduce wakeups | `linux/kernel/timer.c` |
-| APC cancellation | Cancel queued APC before delivery | `XP/base/ntos/ke/apc.c` |
+| APC cancellation | Cancel queued APC before delivery | `reactos/ntoskrnl/ke/apc.c` |
 
 ---
 

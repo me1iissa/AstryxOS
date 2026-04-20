@@ -2,7 +2,7 @@
 //!
 //! Parses and loads PE32+ (64-bit) executables into a process address space.
 //! Inspired by the Windows NT loader architecture; references from:
-//! - `SupportingResources/NT4.0/private/ntos/dll/ldrinit.c`
+//! - `reactos/dll/ntdll/ldr/ldrinit.c`
 //! - `SupportingResources/reactos/dll/ntdll/ldr/`
 //!
 //! # Supported Features

@@ -29,8 +29,8 @@ and decrement the old refcount.
 **Why critical**: Without CoW, `fork()` is either a full page copy (expensive, breaks under memory
 pressure) or sharing (parent/child corrupt each other). musl/libc `fork()` requires CoW.
 
-**Reference**: `XP/base/ntos/mm/pagfault.c` (`MiCopyOnWrite`);
-`linux/mm/memory.c` (`do_wp_page`, `wp_page_copy`)
+**Reference**: `linux/mm/memory.c` (`do_wp_page`, `wp_page_copy`);
+Windows NT copy-on-write (`MiCopyOnWrite`) — see ReactOS `ntoskrnl/mm/ARM3/pagfault.c` or NT Internals docs
 
 ---
 
@@ -42,7 +42,7 @@ access (page fault). Current code pre-allocates pages at mmap time.
 RAM immediately. Lazy alloc is the only viable model.
 
 **Reference**: `linux/mm/memory.c` (`do_anonymous_page`);
-`XP/base/ntos/mm/pagfault.c` (`MiResolveDemandZeroFault`)
+Windows NT demand-zero fault handling (`MiResolveDemandZeroFault`) — see ReactOS `ntoskrnl/mm/ARM3/pagfault.c`
 
 ---
 
@@ -54,7 +54,7 @@ triggers a fault; the kernel extends the stack VMA and allocates the new page.
 Without guard-page growth, any function with deep recursion or large stack frames will fault and die.
 
 **Reference**: `linux/mm/mmap.c` (`expand_stack`);
-`XP/base/ntos/mm/pagfault.c` (`MiCheckForUserStackOverflow`)
+Windows NT user-stack overflow handling (`MiCheckForUserStackOverflow`) — see ReactOS `ntoskrnl/mm/ARM3/pagfault.c`
 
 ---
 
@@ -67,7 +67,7 @@ without updating the hardware PTEs.
 to create executable code. Without hardware PTE updates, the code stays writable or non-executable.
 
 **Reference**: `linux/mm/mprotect.c` (`mprotect_fixup`, `change_pte_range`);
-`XP/base/ntos/mm/protect.c`
+`reactos/ntoskrnl/mm/ARM3/virtual.c` (NtProtectVirtualMemory)
 
 ---
 
@@ -80,7 +80,7 @@ the cache; subsequent reads return cached pages. Writes mark pages dirty for wri
 **Why high**: Without a page cache, every `read()` copies from disk; `mmap()` of file-backed regions
 can't share pages between processes that map the same file. Firefox reads shared libraries repeatedly.
 
-**Reference**: `linux/mm/filemap.c` (2,500 LOC); `XP/base/ntos/cache/` (`CcMapData`, `CcPinRead`)
+**Reference**: `linux/mm/filemap.c` (2,500 LOC); `reactos/ntoskrnl/cc/` (`CcMapData`, `CcPinRead`)
 
 ---
 
@@ -92,7 +92,7 @@ must be notified via IPI (Inter-Processor Interrupt) to flush it.
 CPU 1 can access freed memory, causing silent data corruption or use-after-free.
 
 **Reference**: `linux/arch/x86/mm/tlb.c` (`flush_tlb_others`);
-`XP/base/ntos/mm/flushsec.c` (`MiFlushTbAndCapture`)
+Windows NT TLB-flush architecture (`MiFlushTbAndCapture`) — see ReactOS `ntoskrnl/mm/` or NT Internals docs
 
 ---
 
@@ -110,7 +110,7 @@ anonymous pages to swap, or kill a low-priority process (OOM killer). Without th
 panics or hangs when RAM is exhausted.
 
 **Reference**: `linux/mm/vmscan.c` (`shrink_node`, `reclaim_clean_pages`);
-`XP/base/ntos/mm/wsmanage.c` (working set trim)
+Windows NT working-set trimming — see ReactOS `ntoskrnl/mm/` or NT Internals docs
 
 ---
 

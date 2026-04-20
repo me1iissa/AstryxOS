@@ -3,3 +3,7 @@ target/
 FFDeps/
 build/
 TinyCC/
+.vscode/
+.claude/
+*.bak
+*.swp

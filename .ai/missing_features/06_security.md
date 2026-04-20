@@ -33,8 +33,8 @@ setuid helpers (sudo, passwd), and anything running as non-root depends on ACL c
 2. In `vfs/mod.rs` `write()` → check GENERIC_WRITE
 3. Build actual ACL comparison loop in `se::check_dacl()`
 
-**Reference**: `XP/base/ntos/se/access.c` (`SeAccessCheck`);
-`reactos/ntoskrnl/se/access.c`; `linux/security/commoncap.c`
+**Reference**: `reactos/ntoskrnl/se/access.c` (`SeAccessCheck`);
+`linux/security/commoncap.c`
 
 ---
 
@@ -80,7 +80,7 @@ privilege. Without this, sandboxing is impossible.
 with file owner's UID. On exec, if not setuid: inherit parent token. On `setuid()` syscall:
 modify effective UID in token.
 
-**Reference**: `XP/base/ntos/ps/create.c` (`PspInitializeProcessSecurity`);
+**Reference**: `reactos/ntoskrnl/ps/security.c` (`PspInitializeProcessSecurity`);
 `linux/kernel/cred.c` (`copy_creds`)
 
 ---

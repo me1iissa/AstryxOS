@@ -91,10 +91,8 @@
 ```
 
 **Reference**:
-- `XP/base/ntdll/ldrinit.c` — steps 3-4 (LdrInitializeThunk, LdrpInitializeProcess)
-- `XP/base/crts/crtw32/startup/crt0.c` — step 6 (mainCRTStartup)
-- `reactos/dll/ntdll/ldr/ldrinit.c` — cleaner reimplementation of steps 3-4
-- `reactos/dll/win32/msvcrt/main.c` — step 6
+- `reactos/dll/ntdll/ldr/ldrinit.c` — steps 3-4 (LdrInitializeThunk, LdrpInitializeProcess)
+- `reactos/dll/win32/msvcrt/main.c` — step 6 (mainCRTStartup)
 
 ---
 
@@ -263,6 +261,6 @@ fill these structures in the process's user address space:
 ```
 
 **Reference**:
-- `XP/base/ntdll/ntdllp.h` — PEB/TEB structure definitions
 - `reactos/dll/ntdll/include/ntdll.h` — ReactOS PEB/TEB definitions
-- `XP/base/ntdll/ldrinit.c` lines 1-200 — reading from PEB in LdrInitializeThunk
+- `reactos/dll/ntdll/ldr/ldrinit.c` — reading from PEB in LdrInitializeThunk
+- Public NT Internals documentation (Russinovich/Solomon) — PEB/TEB structure layouts

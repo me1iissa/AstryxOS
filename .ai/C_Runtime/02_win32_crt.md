@@ -1,9 +1,7 @@
 # Win32 C Runtime (MSVCRT + STL)
 
 > This covers the Win32 personality: ntdll.dll → kernel32.dll → msvcrt.dll → STL/msvcp
-> Reference: `SupportingResources/Microsoft-Windows-XP-Source-Kit/base/crts/`
->             `SupportingResources/Microsoft-Windows-XP-Source-Kit/base/ntdll/`
->             `SupportingResources/reactos/dll/ntdll/`
+> Reference: `SupportingResources/reactos/dll/ntdll/`
 >             `SupportingResources/reactos/dll/win32/msvcrt/`
 
 ---
@@ -91,12 +89,10 @@ LdrpInitializeProcess()  (called from LdrInitializeThunk, which kernel calls at 
 ```
 
 **Reference files**:
-- `XP/base/ntdll/ldrinit.c` — `LdrpInitializeProcess` (2,000 LOC)
-- `XP/base/ntdll/ldrapi.c` — `LdrLoadDll`, `LdrGetProcedureAddress`
-- `XP/base/ntdll/ldrsnap.c` — IAT snapping / thunk patching
-- `XP/base/ntdll/ldrutil.c` — helper routines
-- `reactos/dll/ntdll/ldr/ldrpe.c` — PE loading (cleaner, same logic)
-- `reactos/dll/ntdll/ldr/ldrinit.c` — initialization
+- `reactos/dll/ntdll/ldr/ldrpe.c` — PE loading
+- `reactos/dll/ntdll/ldr/ldrinit.c` — `LdrpInitializeProcess`, initialization
+- `reactos/dll/ntdll/ldr/ldrapi.c` — `LdrLoadDll`, `LdrGetProcedureAddress`
+- `reactos/dll/ntdll/ldr/ldrutils.c` — helper routines, IAT snapping / thunk patching
 
 ### ntdll syscall stubs (the key piece)
 
@@ -198,7 +194,7 @@ Misc             IsDebuggerPresent, DebugBreak, OutputDebugStringA/W
 
 **Reference files**:
 - `reactos/dll/win32/kernel32/` — complete kernel32 reimplementation
-- `XP/base/ntos/io/` — NT I/O primitives that kernel32 wraps
+- `reactos/ntoskrnl/io/` — NT I/O primitives that kernel32 wraps
 
 ---
 
@@ -268,10 +264,6 @@ Locale
 ```
 
 **Reference files**:
-- `XP/base/crts/crtw32/startup/crt0.c` — mainCRTStartup
-- `XP/base/crts/crtw32/heap/malloc.c` — malloc
-- `XP/base/crts/crtw32/stdio/` — stdio implementation
-- `XP/base/crts/crtw32/eh/frame.cpp` — C++ exception handling
 - `reactos/dll/win32/msvcrt/` — complete msvcrt reimplementation (easiest reference)
   - `reactos/dll/win32/msvcrt/heap.c` — heap ops
   - `reactos/dll/win32/msvcrt/main.c` — mainCRTStartup
@@ -417,5 +409,4 @@ The TEB is accessed via `GS:0` on x86_64 (set via `arch_prctl(ARCH_SET_GS, teb_a
 **AstryxOS kernel must populate PEB + TEB before jumping to ntdll entrypoint.**
 
 This is the most complex part of Win32 startup. See:
-- `XP/base/ntdll/ldrinit.c` — `LdrpInitializeProcess()` builds these structures
-- `reactos/dll/ntdll/ldr/ldrinit.c` — ReactOS equivalent
+- `reactos/dll/ntdll/ldr/ldrinit.c` — `LdrpInitializeProcess()` builds these structures

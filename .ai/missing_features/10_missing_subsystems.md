@@ -205,7 +205,7 @@ Useful for automated test environments.
 - On wake: restore kernel state, bring CPUs online, device resume
 
 **Reference**: `linux/kernel/power/` (suspend.c, hibernate.c);
-`XP/base/ntos/po/` (power.c, acpi.c, hiber.c)
+`reactos/ntoskrnl/po/` (power.c, poshtdwn.c)
 
 ---
 

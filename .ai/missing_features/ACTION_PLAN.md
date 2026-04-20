@@ -204,7 +204,7 @@ Cong avoidance: cwnd += MSS²/cwnd per ACK (linear growth)
 On loss: ssthresh = cwnd/2, cwnd = 1 MSS
 ```
 
-**Reference**: `linux/net/ipv4/tcp_output.c` + `tcp_input.c`; `XP/base/ntos/tcpip/tcp/tcpsend.c`
+**Reference**: `linux/net/ipv4/tcp_output.c` + `tcp_input.c`; `reactos/drivers/network/tcpip/tcpip/`
 
 ---
 
@@ -512,7 +512,7 @@ Then G (X11 polish for GUI apps).
 | Phase | Best Reference |
 |-------|---------------|
 | A1-A9 | `linux/drivers/char/mem.c`, `linux/fs/select.c`, `linux/kernel/sys.c` |
-| B TCP | `linux/net/ipv4/tcp.c`, `linux/net/ipv4/tcp_input.c`, `XP/tcpip/tcp/` |
+| B TCP | `linux/net/ipv4/tcp.c`, `linux/net/ipv4/tcp_input.c`, `reactos/drivers/network/tcpip/` |
 | C VFS | `linux/fs/locks.c`, `linux/fs/dcache.c`, `linux/fs/proc/` |
 | D Proc | `linux/kernel/sys.c`, `linux/kernel/exit.c` |
 | E Sec | `linux/security/commoncap.c`, `linux/kernel/sys.c` (prctl) |

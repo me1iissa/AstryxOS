@@ -1,7 +1,7 @@
 # Drivers & HAL Gaps
 
-> Reference: Windows XP `drivers/` (2,891 C files), Linux `drivers/` (extensive),
->             `XP/base/ntos/io/` (75 C files — I/O manager)
+> Reference: Linux `drivers/` (extensive),
+>             `reactos/ntoskrnl/io/` (NT-style I/O manager)
 > AstryxOS: `drivers/`, `hal/mod.rs`, `io/`
 
 ---
@@ -37,7 +37,7 @@ interrupt storms on busy systems. Any PCIe device on a machine without ISA-style
 (common in modern VMs) requires MSI.
 
 **Reference**: `linux/drivers/pci/msi/` (msi.c, irqdomain.c);
-`XP/base/busdrv/pci/msi.c`
+`reactos/drivers/bus/pcix/pci/msi.c`
 
 ---
 
@@ -82,7 +82,7 @@ USB storage, USB Ethernet, USB serial.
 The xHCI driver in `drivers/usb/xhci.rs` has device probing but no ring management.
 
 **Reference**: `linux/drivers/usb/host/xhci.c` (4,000 LOC);
-`XP/drivers/wdm/usb/hcd/uhcd/` (UHCI reference simpler)
+`reactos/drivers/usb/usbuhci/` (UHCI reference simpler)
 
 ---
 
@@ -108,7 +108,7 @@ The current `drivers/block.rs` has AHCI only. Many cloud VMs don't have AHCI.
 to D3 and back to D0 is required for system suspend/resume.
 
 **Reference**: `linux/drivers/pci/pci.c` (`pci_set_power_state`);
-`XP/base/busdrv/pci/power.c`
+`reactos/drivers/bus/pcix/pci/power.c`
 
 ---
 
@@ -120,7 +120,7 @@ to D3 and back to D0 is required for system suspend/resume.
 - Driver attach/detach callbacks
 
 **Reference**: `linux/drivers/pci/hotplug/` (pciehp_ctrl.c);
-`XP/base/busdrv/pci/hotplug.c`
+`reactos/drivers/bus/pcix/pci/hotplug.c`
 
 ---
 
@@ -163,7 +163,7 @@ The current I/O model (direct function calls from syscall → driver) has no:
 - **Buffered vs direct I/O**: all I/O goes through user buffer copy; no zero-copy path
 - **I/O statistics**: no per-device bytes-read/written counters
 
-**Reference**: `XP/base/ntos/io/iomgr.c` (IRP lifecycle);
+**Reference**: `reactos/ntoskrnl/io/iomgr/iomgr.c` (IRP lifecycle);
 `linux/block/blk-mq.c` (multi-queue block layer);
 `linux/fs/io_uring.c` (async I/O ring, ~8,000 LOC)
 

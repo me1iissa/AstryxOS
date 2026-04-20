@@ -37,7 +37,7 @@ is a TCP that can't be used.
 
 **Reference**: `linux/net/ipv4/tcp.c` (`tcp_sendmsg`, `tcp_recvmsg`);
 `linux/net/ipv4/tcp_input.c` (`tcp_rcv_state_process`);
-`XP/base/ntos/tcpip/tcp/` (tcpconn.c, tcpdata.c, tcpsend.c)
+`reactos/drivers/network/tcpip/tcpip/` (tcpconn.c, tcpdata.c, tcpsend.c)
 
 ---
 
@@ -214,4 +214,4 @@ Reference files to read:
 - `linux/net/ipv4/tcp.c` lines 1-300 (socket interface)
 - `linux/net/ipv4/tcp_output.c` lines 1-200 (segment building)
 - `linux/net/ipv4/tcp_input.c` lines 1-200 (ACK processing)
-- `XP/base/ntos/tcpip/tcp/tcpsend.c` (simpler, 800 LOC)
+- `reactos/drivers/network/tcpip/tcpip/tcp.c` (simpler reference)
