@@ -8,7 +8,7 @@ The Win32/WoW subsystem provides **Windows application compatibility** for Astry
 This enables running PE32+ (64-bit) and eventually PE32 (32-bit via WoW64) Windows
 executables. The implementation is inspired by:
 
-- **Windows NT** executive architecture (`internal-refs/NT4.0/private/`)
+- **Windows NT** executive architecture (public NT Internals documentation)
 - **ReactOS** Win32 subsystem (`internal-refs/reactos/win32ss/`)
 - **Wine** NT syscall thunking and PE loading
 
@@ -207,7 +207,6 @@ kernel/src/subsys/win32/
 
 ## 11. Reference Material
 
-- NT4.0 source: `internal-refs/NT4.0/private/` (csr/, windows/, sm/)
 - ReactOS: `internal-refs/reactos/` (subsystems/csr/, win32ss/, ntoskrnl/)
 - OpenNT: `internal-refs/OpenNT/`
 - Wine: PE loading, DLL stubbing (external reference)

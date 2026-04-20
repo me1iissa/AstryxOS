@@ -34,7 +34,7 @@ Job control (Ctrl+C, Ctrl+Z, fg, bg) depends entirely on this.
 - TTY foreground process group (TIOCSPGRP/TIOCGPGRP) is unimplemented
 
 **Reference**: `linux/kernel/sys.c` (`sys_setsid`, `sys_setpgid`);
-`XP/base/ntos/ps/job.c`; `reactos/ntoskrnl/ps/job.c`
+`reactos/ntoskrnl/ps/job.c`
 
 ---
 
@@ -49,7 +49,7 @@ RLIMIT_CPU (CPU time), RLIMIT_AS (address space), RLIMIT_FSIZE (max file size).
 - Firefox will crash trying to open many sockets
 
 **Reference**: `linux/include/uapi/linux/resource.h`; `linux/kernel/sys.c` (`do_getrlimit`);
-`XP/base/ntos/ps/quota.c`
+`reactos/ntoskrnl/ps/quota.c`
 
 ---
 
@@ -59,7 +59,7 @@ must be re-parented to PID 1 (init). Without PID 1 adoption, orphaned zombies ac
 consume PID space.
 
 **Reference**: `linux/kernel/exit.c` (`forget_original_parent`, `exit_ptrace`);
-`XP/base/ntos/ps/kill.c`
+`reactos/ntoskrnl/ps/kill.c`
 
 ---
 
@@ -69,7 +69,7 @@ consume PID space.
 **What**: RT threads must preempt normal threads immediately. SCHED_FIFO runs until it blocks;
 SCHED_RR gives equal timeslices among same-priority RT threads.
 
-**Reference**: `linux/kernel/sched/rt.c`; `XP/base/ntos/ke/thredsup.c` (priority boost)
+**Reference**: `linux/kernel/sched/rt.c`; `reactos/ntoskrnl/ke/thrdschd.c` (NT priority-boost logic)
 
 ---
 

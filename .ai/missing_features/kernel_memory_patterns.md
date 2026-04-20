@@ -6,8 +6,8 @@
 - `internal-refs/linux/arch/x86/mm/tlb.c` — CR3 switching
 - `internal-refs/linux/kernel/sched/core.c` — context_switch()
 - `internal-refs/reactos/ntoskrnl/mm/ARM3/procsup.c` — MmCreateKernelStack
-- `internal-refs/Microsoft-Windows-XP-Source-Kit/base/ntos/ke/i386/ctxswap.asm` — SwapContext
-- `internal-refs/Microsoft-Windows-XP-Source-Kit/base/ntos/mm/i386/mi386.h` — VA layout
+- `internal-refs/reactos/ntoskrnl/ke/i386/ctxswitch.S` — SwapContext (ReactOS equivalent)
+- Public NT Internals documentation (Russinovich/Solomon) — NT VA layout
 
 ---
 

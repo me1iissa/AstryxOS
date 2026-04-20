@@ -191,7 +191,7 @@ in the kernel should only contain the actual handlers (which `dispatch_win32` al
 | C runtime | msvcrt.dll (user) | msvcrt.dll (user) | libc.so.6 / musl | msvcrt.dll (user, to build) |
 | C++ STL | msvcp*.dll (user) | msvcp*.dll (user) | libstdc++ / libc++ | to build |
 | Dynamic linker | ntdll LDR | ntdll LDR | ld.so | ntdll LDR (Win32) / ld-musl (Linux) |
-| Source reference | `XP/base/ntdll/` + `XP/base/crts/` | `reactos/dll/ntdll/` + `reactos/dll/win32/msvcrt/` | linux kernel syscall table | — |
+| Source reference | ReactOS / NT Internals docs | `reactos/dll/ntdll/` + `reactos/dll/win32/msvcrt/` | linux kernel syscall table | — |
 
 ---
 

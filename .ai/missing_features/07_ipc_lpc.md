@@ -80,7 +80,7 @@ musl's stdio buffers also use this.
 The server calls `NtAlpcCreatePortSection`, the client maps it via `NtAlpcMapPortSection`.
 Currently `AlpcView` struct exists in `lpc/mod.rs` but no pages are ever mapped.
 
-**Reference**: `XP/base/ntos/lpc/` (`obapi.c`, view handling); `reactos/ntoskrnl/lpc/`
+**Reference**: `reactos/ntoskrnl/lpc/` (port objects, view handling)
 
 ---
 
@@ -88,7 +88,7 @@ Currently `AlpcView` struct exists in `lpc/mod.rs` but no pages are ever mapped.
 **What**: An ALPC server can have multiple clients connecting simultaneously. Currently
 `accept_connection()` only handles the first pending connection.
 
-**Reference**: `XP/base/ntos/lpc/receive.c` (`NtAcceptConnectPort`)
+**Reference**: `reactos/ntoskrnl/lpc/connect.c` (`NtAcceptConnectPort`)
 
 ---
 

@@ -64,8 +64,6 @@ The kernel just handles syscalls. Everything else lives in DLLs or shared librar
 
 | Source | Path | What to use it for |
 |--------|------|---------------------|
-| XP CRT | `internal-refs/Microsoft-Windows-XP-Source-Kit/base/crts/crtw32/` | malloc, stdio, startup, eh |
-| XP ntdll | `internal-refs/Microsoft-Windows-XP-Source-Kit/base/ntdll/` | ldrapi.c, ldrinit.c, ldrsnap.c |
 | ReactOS msvcrt | `internal-refs/reactos/dll/win32/msvcrt/` | Complete msvcrt reimplementation in C |
 | ReactOS ntdll | `internal-refs/reactos/dll/ntdll/` | ldr/, rtl/, dispatch/ |
 | Linux kernel | `internal-refs/linux/` | Syscall ABI, ELF aux vector conventions |

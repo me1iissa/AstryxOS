@@ -181,7 +181,7 @@ Session W1a — Syscall stubs + basic RTL:
 Session W1b — Heap manager (RtlHeap):
   RtlCreateHeap(flags, base, reserve, commit, lock, params)
     → NtAllocateVirtualMemory for initial commit
-    → Buddy allocator or XP-style heap (see XP/base/ntos/rtl/heap.c or reactos version)
+    → Buddy allocator or NT-style heap (see reactos/sdk/lib/rtl/heap.c)
   RtlAllocateHeap(heap, flags, size) → allocate from heap
   RtlFreeHeap(heap, flags, ptr) → free block
   RtlReAllocateHeap(heap, flags, ptr, size) → resize block
@@ -326,7 +326,7 @@ C++ exception ABI (required for any C++ app):
   __cxa_throw, __cxa_begin_catch, __cxa_end_catch
   __cxa_allocate_exception (malloc wrapper)
   _Unwind_RaiseException (DWARF unwind) or SEH integration
-  Reference: XP/base/crts/crtw32/eh/frame.cpp
+  Reference: Itanium C++ ABI spec + libcxxabi, or SEH via reactos/sdk/lib/rtl/
 ```
 
 ---
@@ -388,12 +388,12 @@ Future: Track 1 — L3 (glibc), when pre-built binary compat is needed
 |---------------|---------------|-----|
 | ntdll LDR (PE loader) | `reactos/dll/ntdll/ldr/` | Clean C, same logic as XP, shorter |
 | ntdll RTL (heap, strings) | `reactos/dll/ntdll/rtl/` | Clean C reimplementation |
-| ntdll syscall stubs | `XP/base/ntdll/amd64/` | Exact XP stub format for AMD64 |
+| ntdll syscall stubs | `reactos/dll/ntdll/dispatch/` | ntdll stub format for AMD64 |
 | msvcrt | `reactos/dll/win32/msvcrt/` | Complete, buildable, MIT-ish license |
-| CRT startup (crt0) | `XP/base/crts/crtw32/startup/crt0.c` | Original Windows CRT startup |
-| CRT heap | `XP/base/crts/crtw32/heap/malloc.c` | Original NT heap allocator |
-| CRT exception handling | `XP/base/crts/crtw32/eh/frame.cpp` | SEH unwinder |
-| PEB/TEB structures | `XP/base/ntdll/ntdllp.h` | Authoritative NT structure defs |
+| CRT startup (crt0) | `reactos/dll/win32/msvcrt/startup/crt0_c.c` | CRT startup |
+| CRT heap | `reactos/sdk/lib/rtl/heap.c` | NT-style heap allocator |
+| CRT exception handling | `reactos/sdk/lib/rtl/amd64/unwind.c` | SEH unwinder |
+| PEB/TEB structures | `reactos/sdk/include/ndk/peb_teb.h` | NT PEB/TEB structure defs |
 | ELF aux vector | `linux/fs/binfmt_elf.c` | Canonical aux vector population |
 | musl startup | musl source (`crt/crt1.c`) | Direct _start → main path |
 | Linux syscall ABI | `linux/arch/x86/entry/syscalls/syscall_64.tbl` | Canonical x86_64 syscall numbers |

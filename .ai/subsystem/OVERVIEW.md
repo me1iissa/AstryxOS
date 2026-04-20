@@ -136,7 +136,6 @@ process's `SubsystemType`:
 
 ## 6. References
 
-- NT4.0 subsystems: `internal-refs/NT4.0/private/` — `posix/`, `os2/`, `mvdm/`, `csr/`, `sm/`
 - ReactOS subsystems: `internal-refs/reactos/subsystems/` — `csr/`, `mvdm/`, `win/`
 - ReactOS win32ss: `internal-refs/reactos/win32ss/` — `gdi/`, `user/`, `drivers/`
 - Linux syscall table: `internal-refs/linux/arch/x86/entry/syscalls/syscall_64.tbl` (385 native x86_64)
