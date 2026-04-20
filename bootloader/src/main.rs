@@ -57,8 +57,13 @@ fn efi_main() -> Status {
     let fb_info = framebuffer::get_framebuffer_info();
     print_line("[AstryxBoot] Framebuffer acquired via GOP\r\n");
 
-    // Load kernel binary
-    let kernel_data = loader::load_kernel();
+    // Load kernel binary. On failure, render a friendly on-screen message
+    // and halt. We must not exit_boot_services before reporting, so the
+    // UEFI stdout path remains available here.
+    let kernel_data = match loader::load_kernel() {
+        Ok(data) => data,
+        Err(err) => fatal_boot_error(err.as_message()),
+    };
     let kernel_size = kernel_data.len() as u64;
     print_line("[AstryxBoot] Kernel loaded from ESP\r\n");
 
@@ -140,6 +145,37 @@ fn efi_main() -> Status {
             entry = in(reg) kernel_entry,
             options(noreturn)
         );
+    }
+}
+
+/// Render a friendly multi-line boot error to the UEFI console and halt.
+///
+/// Replaces the prior behaviour of panicking on missing/unreadable kernel.bin,
+/// which produced an opaque UEFI trace. This renders a clear message with
+/// remediation guidance and parks the CPU. Can only be called before
+/// `exit_boot_services()` — after that, UEFI stdout is no longer available.
+fn fatal_boot_error(message: &str) -> ! {
+    uefi::system::with_stdout(|stdout| {
+        let _ = write!(
+            stdout,
+            "\r\n\
+             ================================================================\r\n\
+             AstryxBoot — fatal boot error\r\n\
+             ================================================================\r\n\
+             {}\r\n\
+             \r\n\
+             The system has been halted. Power-cycle or reset the machine\r\n\
+             after addressing the issue above.\r\n",
+            message
+        );
+    });
+    loop {
+        // SAFETY: hlt is a no-op on all supported x86_64 CPUs and halts
+        // the core until the next interrupt; with interrupts disabled this
+        // parks the CPU indefinitely, which is the desired outcome here.
+        unsafe {
+            asm!("cli", "hlt", options(nomem, nostack));
+        }
     }
 }
 
