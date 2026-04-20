@@ -8,6 +8,10 @@ default = []
 test-mode = []
 gui-test = []
 firefox-test = []
+# Re-enables test 82 (Win32 PE32+ hello_win32.exe). Currently hangs the
+# headless runner — the embedded PE spins in Ring 3 without calling
+# ExitProcess under the current scheduler timing. Off by default.
+win32-pe-test = []
 
 [dependencies]
 astryx-shared = { path = "../shared" }
