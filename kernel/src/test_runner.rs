@@ -688,6 +688,11 @@ pub fn run() -> ! {
     total += 1;
     if test_aslr_elf_exec_no_randomisation() { passed += 1; }
 
+    // ── Test 109: xHCI probe safety ───────────────────────────────────────
+
+    total += 1;
+    if test_xhci_probe_safe() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -13701,4 +13706,61 @@ fn test_aslr_elf_exec_no_randomisation() -> bool {
     test_println!("  Both loads → {:#x} (deterministic) ✓", base1);
     test_pass!("ASLR — ET_EXEC load base is stable (never randomised)");
     true
+// ── Test 106: xHCI probe safety ──────────────────────────────────────────────
+//
+// Verifies that the xHCI driver does not panic regardless of whether an xHCI
+// controller is present.  In the default QEMU configuration (no -device
+// qemu-xhci), is_present() must return false and connected_port_count() must
+// return 0.  With -device qemu-xhci added to the QEMU command line, is_present()
+// returns true and connected_port_count() reflects any attached USB devices.
+//
+// To enable xHCI in QEMU for manual testing:
+//   -device qemu-xhci,id=xhci
+// To attach a USB keyboard to the xHCI bus:
+//   -device usb-kbd,bus=xhci.0
+fn test_xhci_probe_safe() -> bool {
+    test_header!("xHCI probe safety");
+
+    // These calls must never panic, regardless of hardware presence.
+    let present      = crate::drivers::usb::xhci::is_present();
+    let ctrl_count   = crate::drivers::usb::xhci::controller_count();
+    let port_count   = crate::drivers::usb::xhci::connected_port_count();
+
+    test_println!("  xHCI present:         {}", present);
+    test_println!("  Controllers init'd:   {}", ctrl_count);
+    test_println!("  Connected port count: {}", port_count);
+
+    // Consistency checks:
+    // 1. If no controller is present, counts must be zero.
+    // 2. connected_port_count() can never exceed max possible ports.
+    //    The xHCI spec allows up to 255 ports; we accept any value <= 255.
+    // 3. If present=false, both counts must be 0.
+    let mut ok = true;
+
+    if !present {
+        if ctrl_count != 0 {
+            test_fail!("xhci_probe_safe", "is_present=false but controller_count={}", ctrl_count);
+            ok = false;
+        }
+        if port_count != 0 {
+            test_fail!("xhci_probe_safe", "is_present=false but connected_port_count={}", port_count);
+            ok = false;
+        }
+        test_println!("  (no xHCI device in this QEMU config — expected)");
+    } else {
+        // Controller found: controller_count must be >= 1
+        if ctrl_count == 0 {
+            test_fail!("xhci_probe_safe", "is_present=true but controller_count=0");
+            ok = false;
+        }
+        // port_count can legitimately be 0 (controller present but no devices plugged in)
+        if port_count > 255 {
+            test_fail!("xhci_probe_safe", "connected_port_count={} exceeds xHCI maximum of 255", port_count);
+            ok = false;
+        }
+        test_println!("  xHCI controller active with {} connected port(s)", port_count);
+    }
+
+    if ok { test_pass!("xHCI probe safe — no panic, sensible results"); }
+    ok
 }
