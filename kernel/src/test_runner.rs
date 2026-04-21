@@ -13089,7 +13089,10 @@ fn test_wm_title_renders_via_gdi() -> bool {
     test_println!("  GDI text_out rendered at least one foreground pixel in title-bar ✓");
 
     test_pass!("WM title bar rendered via GDI text engine");
-// ── Test 97: execve VmSpace teardown — no PMM leak across exec ───────────────
+    true
+}
+
+// ── Test 104: execve VmSpace teardown — no PMM leak across exec ────────────
 //
 // Verifies that free_vm_space() (the execve teardown path) actually reclaims
 // physical pages, not just drops the VmSpace struct.  Without the fix, each
