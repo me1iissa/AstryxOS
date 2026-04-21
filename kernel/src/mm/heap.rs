@@ -15,9 +15,24 @@ use spin::Mutex;
 /// identity-mapped range free for user ELF segment mappings and the kernel image
 /// itself.  This keeps the heap accessible even when CR3 points to a user-process
 /// page table (which clones PML4 entries 256-511 from the kernel).
-const HEAP_START: usize = 0xFFFF_8000_0080_0000;
+pub const HEAP_START: usize = 0xFFFF_8000_0080_0000;
 /// Kernel heap size: 128 MiB (sufficient for 1920×1080 GUI with multiple window surfaces).
-const HEAP_SIZE: usize = 128 * 1024 * 1024;
+pub const HEAP_SIZE: usize = 128 * 1024 * 1024;
+
+/// Guard page immediately below the heap (one 4 KiB page, not-present).
+///
+/// Virtual address `HEAP_START - 4096`.  Faults into the kernel guard handler.
+/// Physical frame `HEAP_GUARD_BELOW_PHYS` is reserved in the PMM so the
+/// allocator never hands it out — preventing a direct-map alias via
+/// `PHYS_OFF + phys` from silently corrupting the guard.
+pub const HEAP_GUARD_BELOW_VA: u64   = HEAP_START as u64 - 0x1000;
+pub const HEAP_GUARD_BELOW_PHYS: u64 = HEAP_GUARD_BELOW_VA - 0xFFFF_8000_0000_0000;
+
+/// Guard page immediately above the heap (one 4 KiB page, not-present).
+///
+/// Virtual address `HEAP_START + HEAP_SIZE`.  Same PMM reservation rationale.
+pub const HEAP_GUARD_ABOVE_VA: u64   = (HEAP_START + HEAP_SIZE) as u64;
+pub const HEAP_GUARD_ABOVE_PHYS: u64 = HEAP_GUARD_ABOVE_VA - 0xFFFF_8000_0000_0000;
 
 /// Minimum block size — must be large enough to hold a FreeBlock header.
 const MIN_BLOCK_SIZE: usize = core::mem::size_of::<FreeBlock>();
@@ -249,6 +264,53 @@ pub fn init() {
         HEAP_START,
         HEAP_START + HEAP_SIZE,
         HEAP_SIZE / 1024
+    );
+}
+
+/// Install 4 KiB guard pages immediately below and above the heap region.
+///
+/// # Guard layout
+/// ```
+/// HEAP_GUARD_BELOW_VA  (not-present PTE)  ← underflow trap
+/// HEAP_START           (heap, 128 MiB)
+/// HEAP_START + HEAP_SIZE (= HEAP_GUARD_ABOVE_VA, not-present PTE) ← overflow trap
+/// ```
+///
+/// # Physical-alias prevention
+/// The bootloader maps all physical RAM at both the identity map (PML4[0]) and the
+/// higher-half (PML4[256]) using 2 MiB huge pages.  The physical frames that
+/// correspond to the guard VAs (`guard_va - PHYS_OFF`) are inside UEFI CONVENTIONAL
+/// memory and could normally be handed out by the PMM, which would mean another
+/// caller could access them via `PHYS_OFF + phys` even though the guard PTE is
+/// not-present — defeating the guard silently.
+///
+/// To prevent this we call `pmm::reserve_range` on those frames *before* writing
+/// the not-present PTEs, so the PMM bitmap marks them as permanently used.  The
+/// guard PTEs themselves have no physical backing (PTE value = 0); the reservation
+/// merely prevents the direct-map alias.
+pub fn init_guard_pages() {
+    use crate::mm::{pmm, vmm};
+
+    // Reserve the physical frames for both guard pages.
+    // This must happen before installing PTEs so that no racing allocation can
+    // grab those frames in the window between the PMM free-mark and the PTE write.
+    pmm::reserve_range(HEAP_GUARD_BELOW_PHYS, HEAP_GUARD_BELOW_PHYS + 0x1000);
+    pmm::reserve_range(HEAP_GUARD_ABOVE_PHYS, HEAP_GUARD_ABOVE_PHYS + 0x1000);
+
+    // Install not-present PTEs (creates PT hierarchy, writes PTE = 0).
+    if !vmm::install_not_present_guard(HEAP_GUARD_BELOW_VA) {
+        crate::serial_println!("[HEAP GUARD] WARN: failed to install below-guard at {:#x}", HEAP_GUARD_BELOW_VA);
+    }
+    if !vmm::install_not_present_guard(HEAP_GUARD_ABOVE_VA) {
+        crate::serial_println!("[HEAP GUARD] WARN: failed to install above-guard at {:#x}", HEAP_GUARD_ABOVE_VA);
+    }
+
+    crate::serial_println!(
+        "[HEAP GUARD] Guard pages installed: below={:#x} above={:#x} (heap {:#x}..{:#x})",
+        HEAP_GUARD_BELOW_VA,
+        HEAP_GUARD_ABOVE_VA,
+        HEAP_START as u64,
+        (HEAP_START + HEAP_SIZE) as u64,
     );
 }
 

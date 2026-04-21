@@ -271,6 +271,58 @@ pub fn map_page(virt_addr: u64, phys_addr: u64, flags: u64) -> bool {
     true
 }
 
+/// Install a not-present (guard) PTE at `virt_addr` in the *kernel* page table.
+///
+/// Creates the intermediate PT levels as needed (so the walk succeeds), but
+/// writes a zero final PTE — keeping the present bit clear.  Any access to this
+/// address will raise a page fault.
+///
+/// The caller must separately call `pmm::reserve_range` for the physical frame
+/// that would correspond to this virtual address (`virt_addr - PHYS_OFF`) so
+/// that the PMM never hands that frame out and creates a direct-map alias.
+pub fn install_not_present_guard(virt_addr: u64) -> bool {
+    let _lock = VMM_LOCK.lock();
+
+    let pml4_phys = get_cr3();
+
+    let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;
+    let pd_idx   = ((virt_addr >> 21) & 0x1FF) as usize;
+    let pt_idx   = ((virt_addr >> 12) & 0x1FF) as usize;
+
+    // SAFETY: We hold VMM_LOCK. We walk and potentially allocate PT pages, then
+    // write a zero (not-present) PTE to the leaf slot.  Intermediate entries are
+    // created without PAGE_USER so the guard is kernel-only.
+    unsafe {
+        // Walk PML4 → PDPT
+        let pdpt_phys = match get_or_create_entry(pml4_phys, pml4_idx, 0) {
+            Some(a) => a,
+            None => return false,
+        };
+        // Walk PDPT → PD
+        let pd_phys = match get_or_create_entry(pdpt_phys, pdpt_idx, 0) {
+            Some(a) => a,
+            None => return false,
+        };
+        // Walk PD → PT (may split a 2 MiB huge page if one exists here)
+        let pt_phys = match get_or_create_entry(pd_phys, pd_idx, 0) {
+            Some(a) => a,
+            None => return false,
+        };
+
+        // Write a zero PTE — present bit is clear, so any access faults.
+        // We do NOT encode a physical address: the guard page has no backing.
+        let pt_ptr = p2v(pt_phys);
+        *pt_ptr.add(pt_idx) = 0;
+
+        // Ensure the CPU's TLB reflects the not-present entry (it may have
+        // cached a stale entry from a previous mapping at this VA).
+        invlpg(virt_addr);
+    }
+
+    true
+}
+
 /// Unmap a virtual page.
 pub fn unmap_page(virt_addr: u64) {
     let _lock = VMM_LOCK.lock();
