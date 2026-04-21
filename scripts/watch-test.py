@@ -140,7 +140,7 @@ def launch_qemu(gdb_port: Optional[int] = None, freeze: bool = False) -> subproc
     cmd = [
         "qemu-system-x86_64",
         "-machine", "pc",
-        "-cpu", "qemu64",
+        "-cpu", "qemu64,+rdtscp",
         "-m", "1G",
         "-smp", "2",
         "-serial", f"file:{SERIAL_LOG}",
