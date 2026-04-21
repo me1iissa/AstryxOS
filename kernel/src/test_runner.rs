@@ -664,6 +664,15 @@ pub fn run() -> ! {
     total += 1;
     if test_execve_no_pmm_leak() { passed += 1; }
 
+    // ── Test 105: Heap guard pages — PTE verification ─────────────────────
+    // Non-destructive: verifies that guard PTEs are not-present and that the
+    // first heap page is present.  Does NOT trigger the guard fault (which would
+    // panic and kill the test run).  A separate manual test (feature-gated with
+    // `heap-guard-test`) can be added to actually trigger and observe the panic.
+
+    total += 1;
+    if test_heap_guard_pte() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -13251,5 +13260,91 @@ fn test_execve_no_pmm_leak() -> bool {
 
     test_println!("  PMM leak {} pages <= tolerance {} ✓", leaked, tolerance);
     test_pass!("execve VmSpace teardown — no PMM leak across exec");
+    true
+}
+
+// ── Test 105: Heap guard pages — PTE verification ────────────────────────────
+//
+// Non-destructive test: verify that the guard PTEs are not-present (bit 0 = 0)
+// and that the first page of the heap itself is mapped present (bit 0 = 1).
+//
+// This proves `init_guard_pages()` successfully wrote the PTEs without actually
+// triggering a fault (which would panic and kill the test run).
+//
+// Manual / feature-gated active test:
+//   Add `--features heap-guard-test` and an explicit write to HEAP_GUARD_BELOW_VA
+//   or HEAP_GUARD_ABOVE_VA to observe the "[KERNEL HEAP GUARD] overflow" panic.
+//   That path is intentionally excluded from the headless runner.
+
+fn test_heap_guard_pte() -> bool {
+    test_header!("Heap guard pages — PTE present-bit verification");
+
+    use crate::mm::heap::{
+        HEAP_GUARD_BELOW_VA, HEAP_GUARD_ABOVE_VA,
+        HEAP_START, HEAP_SIZE,
+    };
+    use crate::mm::vmm;
+
+    let kernel_cr3 = vmm::get_kernel_cr3();
+    if kernel_cr3 == 0 {
+        test_fail!("heap_guard", "kernel CR3 is 0 — VMM not initialized");
+        return false;
+    }
+    test_println!("  kernel CR3 = {:#x} ✓", kernel_cr3);
+
+    // 1. Guard below: PTE must NOT be present (bit 0 = 0).
+    let pte_below = vmm::read_pte(kernel_cr3, HEAP_GUARD_BELOW_VA);
+    test_println!("  Below-guard VA={:#x}  PTE={:#x}", HEAP_GUARD_BELOW_VA, pte_below);
+    if pte_below & 1 != 0 {
+        test_fail!("heap_guard",
+            "Below-guard PTE at {:#x} has PRESENT set (PTE={:#x}) — guard not installed",
+            HEAP_GUARD_BELOW_VA, pte_below);
+        return false;
+    }
+    test_println!("  Below-guard PTE present=0 (not-present) ✓");
+
+    // 2. Guard above: PTE must NOT be present (bit 0 = 0).
+    let pte_above = vmm::read_pte(kernel_cr3, HEAP_GUARD_ABOVE_VA);
+    test_println!("  Above-guard VA={:#x}  PTE={:#x}", HEAP_GUARD_ABOVE_VA, pte_above);
+    if pte_above & 1 != 0 {
+        test_fail!("heap_guard",
+            "Above-guard PTE at {:#x} has PRESENT set (PTE={:#x}) — guard not installed",
+            HEAP_GUARD_ABOVE_VA, pte_above);
+        return false;
+    }
+    test_println!("  Above-guard PTE present=0 (not-present) ✓");
+
+    // 3. First heap page: PTE MUST be present (heap was already used by the
+    //    time we reach the tests — at least the first block header is mapped).
+    //    The heap is backed by 2 MiB huge pages from the bootloader so the
+    //    higher-half PD entry will be a huge-page entry (bit 7 = 1, bit 0 = 1).
+    //    read_pte returns the huge-page PD entry in that case; present=1 is enough.
+    let heap_first_page = HEAP_START as u64;
+    let pte_heap = vmm::read_pte(kernel_cr3, heap_first_page);
+    test_println!("  Heap first page VA={:#x}  PTE={:#x}", heap_first_page, pte_heap);
+    if pte_heap & 1 == 0 {
+        test_fail!("heap_guard",
+            "Heap first page PTE at {:#x} is not present (PTE={:#x}) — unexpected",
+            heap_first_page, pte_heap);
+        return false;
+    }
+    test_println!("  Heap first page PTE present=1 ✓");
+
+    // 4. Last heap page (HEAP_START + HEAP_SIZE - 4096): also present.
+    let heap_last_page = (HEAP_START + HEAP_SIZE) as u64 - 0x1000;
+    let pte_heap_last = vmm::read_pte(kernel_cr3, heap_last_page);
+    test_println!("  Heap last page  VA={:#x}  PTE={:#x}", heap_last_page, pte_heap_last);
+    if pte_heap_last & 1 == 0 {
+        test_fail!("heap_guard",
+            "Heap last page PTE at {:#x} is not present (PTE={:#x}) — unexpected",
+            heap_last_page, pte_heap_last);
+        return false;
+    }
+    test_println!("  Heap last page PTE present=1 ✓");
+
+    test_println!("  Guard below={:#x} above={:#x} heap={:#x}..{:#x}",
+        HEAP_GUARD_BELOW_VA, HEAP_GUARD_ABOVE_VA,
+        HEAP_START as u64, (HEAP_START + HEAP_SIZE) as u64);
+    test_pass!("Heap guard pages — PTE present-bit verification");
     true
 }
