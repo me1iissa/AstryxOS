@@ -826,6 +826,20 @@ pub fn reconfigure_framebuffer(base: u64, width: u32, height: u32, stride: u32) 
     );
 }
 
+/// Quiesce the framebuffer console on shutdown.
+///
+/// Clears cursor blink state, hides the cursor, and issues a final
+/// framebuffer flush so the last console output is committed to VRAM before
+/// the power-off path executes.  Safe to call with or without VMware SVGA.
+pub fn stop() {
+    crate::serial_println!("[CONSOLE] stop: finalizing framebuffer");
+    if let Some(ref mut c) = *CONSOLE.lock() {
+        c.cursor_visible = false;
+        c.cursor_shown   = false;
+    }
+    crate::drivers::vmware_svga::update_screen();
+}
+
 /// Print to the framebuffer console (used by kprint! macro).
 #[doc(hidden)]
 pub fn _kprint(args: fmt::Arguments) {
