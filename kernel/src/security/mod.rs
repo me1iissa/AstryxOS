@@ -29,6 +29,7 @@
 pub mod sid;
 pub mod privilege;
 pub mod token;
+pub mod rand;
 
 extern crate alloc;
 

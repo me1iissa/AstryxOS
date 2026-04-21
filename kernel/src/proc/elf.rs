@@ -221,10 +221,31 @@ impl From<ElfError> for astryx_shared::NtStatus {
     }
 }
 
-/// Virtual address used as load base for PIE (ET_DYN) main executables.
-/// The dynamic linker will relocate this, but we place it in a reasonable
-/// user-space range well below the interpreter at INTERP_BASE.
-const PIE_BASE: u64 = 0x0000_0000_0040_0000; // 4 MiB
+/// Deterministic load base for ET_EXEC (fixed-address) executables.
+/// PIE / ET_DYN executables use a *randomised* base instead (see below).
+const PIE_BASE: u64 = 0x0000_0000_0040_0000; // 4 MiB — deterministic fallback only
+
+/// ASLR entropy for ET_DYN (PIE) main executables: 28 bits.
+///
+/// With 28 bits of page-granular entropy the random window covers
+/// 2^28 * 4 KiB = 1 TiB.  Load addresses are uniformly distributed over
+/// [PIE_BASE, PIE_BASE + 1 TiB) — well within the user lower-half.
+/// Collision probability on a single fork is 1 / 2^28 ≈ 4e-9.
+const ASLR_BITS: u32 = 28;
+
+/// Compute a randomised load base for an ET_DYN binary.
+///
+/// Returns `PIE_BASE + random_4k_aligned_offset` where the offset has
+/// `ASLR_BITS` bits of entropy.  The result is guaranteed to be in
+/// user address space (below 0xFFFF_8000_0000_0000).
+#[inline]
+fn pie_aslr_base() -> u64 {
+    let offset = crate::security::rand::aslr_page_offset(ASLR_BITS);
+    // Saturating add: if somehow PIE_BASE + offset overflows user space,
+    // fall back to PIE_BASE.  In practice 4 MiB + 1 TiB << 128 TiB limit.
+    let base = PIE_BASE.saturating_add(offset);
+    if base >= 0xFFFF_8000_0000_0000 { PIE_BASE } else { base }
+}
 
 /// Validate and parse an ELF64 header.
 ///
@@ -325,11 +346,12 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
     }
 
     // ── Compute PIE bias for ET_DYN (PIE) main executables ──────────
-    // For ET_EXEC, bias = 0 (segments load at literal vaddr).
-    // For ET_DYN, we place the binary at PIE_BASE so it doesn't overlap
-    // with the kernel or the interpreter.
+    // For ET_EXEC, bias = 0 (segments load at their literal link-time vaddr).
+    // For ET_DYN, we choose a *random* base (ASLR) so exploit code cannot
+    // predict absolute addresses.  All segments in the image receive the
+    // same bias so intra-image relative references still resolve correctly.
     let pie_bias: u64 = if header.e_type == ET_DYN {
-        // Find minimum PT_LOAD vaddr to compute bias.
+        // Find minimum PT_LOAD vaddr so we can compute the bias.
         let mut min_vaddr = u64::MAX;
         for i in 0..ph_count {
             let offset = ph_offset + i * ph_size;
@@ -340,9 +362,11 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
             }
         }
         if min_vaddr == u64::MAX { 0 } else {
-            PIE_BASE.wrapping_sub(min_vaddr & !0xFFF)
+            // ASLR: randomise the load base for each exec() of a PIE binary.
+            pie_aslr_base().wrapping_sub(min_vaddr & !0xFFF)
         }
     } else {
+        // ET_EXEC: fixed load address — never randomise.
         0
     };
 
