@@ -46,25 +46,35 @@ Result: **101/107 tests passing** (up from 95/95 baseline; 6 remaining failures 
 
 ---
 
-## Wave 2 — in flight (parallel worktrees)
+## Wave 2 — LANDED
 
-| # | Task | Priority | Scope |
-|---|---|---|---|
-| 1 | `feat/driver-stop-sweep` | **P1** | Wire `po/shutdown.rs` to call every driver's `stop()` in order. |
-| 2 | `feat/aslr-pe-elf` | **P2** | Randomise base for ET_DYN ELF + PE32+ DYNAMIC_BASE images. |
-| 3 | `feat/xhci-device-enumeration` | **P2** | Real PCI probe + MMIO decode + root-hub port count (no endpoint setup yet). |
+| # | Task | Priority | Branch | Status |
+|---|---|---|---|---|
+| 1 | Driver stop sweep | P1 | merged `b00fb91` | po::shutdown sweeps e1000/virtio_net/virtio_blk/ahci/ata/ac97/console/serial |
+| 2 | ASLR for ET_DYN + PE DYNAMIC_BASE | P2 | merged `5b43bcb` | 28-bit entropy, page-granular; ET_EXEC deterministic |
+| 3 | xHCI device enumeration | P2 | merged `f2e2765` | PCI probe + MMIO decode + root-hub port count |
+| — | Brace-closure fix | — | `e6343eb` | Post-merge cleanup |
 
-All three agents instructed to use `python3 scripts/watch-test.py --idle-timeout 45 --hard-timeout 300` as the canonical test command so hangs abort in 45 s.
+Result: **104/111 passing** (up from 101/107). +4 tests, +3 passing (+1 flaky network test introduced with driver-stop-sweep).
 
 ---
 
-## Wave 3 — queued
+## Wave 3 — in flight (parallel worktrees)
+
+| # | Task | Priority | Scope |
+|---|---|---|---|
+| 1 | `feat/ac97-dev-dsp` | **P2** | Expose AC97 at `/dev/dsp` — open/write/ioctl/poll. Graceful ENODEV when absent. |
+| 2 | `feat/fat32-read-write` | **P2** | Cluster allocator + create/write/truncate/unlink on FAT32. |
+
+---
+
+## Wave 4 — queued
 
 | # | Task | Priority | Notes |
 |---|---|---|---|
-| 4 | `refactor/syscall-split` | **P1** | Splits 7175-line `syscall/mod.rs` into `subsys/linux/syscall.rs` + `subsys/aether/syscall.rs`. Big refactor — sequential, not parallel. |
-| 5 | `feat/mount-syscall-tmpfs` | **P2** | Wire `sys_mount` + real tmpfs at `/tmp`. Touches syscall/mod.rs so scheduled after split. |
-| 6 | `feat/ac97-device-file` | **P2** | Expose AC97 at `/dev/dsp`. Touches `vfs/mod.rs` + `drivers/ac97.rs`. |
+| 4 | `refactor/syscall-split` | **P1** | Split 7175-line `syscall/mod.rs` into `subsys/linux/syscall.rs` + `subsys/aether/syscall.rs`. Sequential — not parallelisable. |
+| 5 | `feat/mount-syscall-tmpfs` | **P2** | Wire `sys_mount` + real tmpfs at `/tmp`. Touches syscall/mod.rs — schedule after split. |
+| 6 | `feat/oom-kill-for-firefox` | **P2** | Extend OOM killer to score_adj via prctl. |
 | 7 | `infra/musl-tcc-rebuild` | **Infrastructure** | Run `build-musl.sh` + `build-tcc.sh` + regenerate `data.img` so 6 disk-dependent tests move from FAIL to PASS. |
 
 ---
