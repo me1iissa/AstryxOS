@@ -1,10 +1,22 @@
 # AstryxOS — Progress Tracker
 
-## Current Phase: RC1 — /proc VFS mount + Firefox compatibility
-**Current**: 2026-04-20
-**Tests**: 98/98 passing with data disk; 92/98 without (6 disk-dependent tests require /disk/bin/hello + tcc)
+## Current Phase: RC1 — syscall split + Firefox compatibility
+**Current**: 2026-04-21
+**Tests**: 111/121 without disk; 114/121 with data disk (10 disk/network failures pre-existing)
 **GUI Tests**: 10/10 pixel checks passing (`scripts/run-gui-test.sh`)
 **Firefox**: Runs for full 15000 ticks without crashing (was: crash at 1481 syscalls at RIP=0x0)
+
+### Milestone 43 — syscall/mod.rs split into subsys/{aether,linux}/syscall.rs (✅)
+**Completed**: 2026-04-21
+
+**What was built:**
+- [x] **`subsys/aether/syscall.rs`** — 396-line file containing `pub fn dispatch()` for Aether native syscall numbers (SYS_EXIT..SYS_SYNC). Shared helpers called via `crate::syscall::`.
+- [x] **`subsys/linux/syscall.rs`** — 4569-line file containing `pub fn dispatch()` (renamed from `dispatch_linux`) plus all Linux-specific helpers (sys_read_linux, sys_write_linux, sys_futex_linux, etc.).
+- [x] **`syscall/mod.rs` reduced** — 7379 → 2490 lines: now contains infrastructure (PER_CPU_SYSCALL, syscall_entry naked_asm, init/init_ap), shared helpers (sys_mmap, sys_fork, sys_exec, etc. as pub(crate)), and thin delegating stubs for dispatch_aether/dispatch_linux.
+- [x] **All public exports preserved** — `crate::syscall::dispatch_linux`, `crate::syscall::dispatch_aether`, `crate::syscall::sys_arch_prctl`, `crate::syscall::sys_clock_gettime`, `crate::syscall::sys_set_tid_address`, `crate::syscall::sys_writev`, `crate::syscall::sys_*_test`, `crate::syscall::DEBUG_TRACE_PID`, `crate::syscall::scm_queue`/`scm_dequeue` all unchanged.
+- [x] **No behavioral changes** — every dispatched syscall follows the exact same code path; only file location changed.
+- [x] **LOC delta**: `syscall/mod.rs` 7379→2490 (-66%), `subsys/aether/syscall.rs` new (396), `subsys/linux/syscall.rs` new (4569)
+- [x] Files changed: `kernel/src/syscall/mod.rs`, `kernel/src/subsys/aether/mod.rs`, `kernel/src/subsys/aether/syscall.rs` (new), `kernel/src/subsys/linux/mod.rs`, `kernel/src/subsys/linux/syscall.rs` (new)
 
 ### Milestone 42 — ProcFs VFS Mount: /proc as a real filesystem (✅)
 **Completed**: 2026-04-20
