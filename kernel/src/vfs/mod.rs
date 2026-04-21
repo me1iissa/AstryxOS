@@ -18,6 +18,7 @@ pub mod ext2;
 pub mod fat32;
 pub mod ntfs;
 pub mod ramfs;
+pub mod tmpfs;
 pub mod procfs;
 
 extern crate alloc;
@@ -1683,4 +1684,178 @@ pub fn fd_write(pid: crate::proc::Pid, fd_num: usize, buf: *const u8, count: usi
     }
 
     Ok(n)
+}
+
+// ── Runtime mount / umount ────────────────────────────────────────────────────
+
+/// Linux mount(2) flag: mount read-only.
+const MS_RDONLY_FLAG: u64 = 1;
+
+/// Runtime `mount` syscall implementation (Linux syscall 165).
+///
+/// Supports filesystem types: "tmpfs", "ramfs", "procfs", "fat32".
+/// "fat32" is a stub that always returns -ENODEV (no block device supplied by
+/// the simple `mount` ABI; block-device mounts require a more complete VFS
+/// namespace model).
+///
+/// Returns 0 on success, or a negative errno on failure:
+///   -ENOENT  (2)  — target path does not exist
+///   -ENODEV  (19) — unknown filesystem type
+///   -EINVAL  (22) — bad arguments
+pub fn sys_mount(
+    _source: &str,
+    target: &str,
+    fstype: &str,
+    flags: u64,
+    _data: &str,
+) -> i64 {
+    if target.is_empty() {
+        return -22; // EINVAL
+    }
+
+    // Validate: target path must already exist.
+    if resolve_path(target).is_err() {
+        crate::serial_println!("[VFS] mount: target '{}' does not exist", target);
+        return -2; // ENOENT
+    }
+
+    let rdonly = (flags & MS_RDONLY_FLAG) != 0;
+
+    match fstype {
+        "tmpfs" | "ramfs" => {
+            // Each mount gets its own fresh filesystem instance so that
+            // mount("tmpfs","/a","tmpfs",0) and mount("tmpfs","/b","tmpfs",0)
+            // have completely independent directory trees.
+            if fstype == "tmpfs" {
+                let concrete = if rdonly {
+                    tmpfs::TmpFs::new_rdonly()
+                } else {
+                    tmpfs::TmpFs::new()
+                };
+                let ri = concrete.root_inode();
+                MOUNTS.lock().push(Mount {
+                    path: String::from(target),
+                    fs: Box::new(concrete),
+                    root_inode: ri,
+                });
+            } else {
+                // "ramfs"
+                let concrete = ramfs::RamFs::new();
+                let ri = concrete.root_inode();
+                MOUNTS.lock().push(Mount {
+                    path: String::from(target),
+                    fs: Box::new(concrete),
+                    root_inode: ri,
+                });
+            }
+            crate::serial_println!("[VFS] mount: {} mounted at '{}' (rdonly={})", fstype, target, rdonly);
+            0
+        }
+        "proc" | "procfs" => {
+            // Re-mount procfs at the requested path.
+            let proc_fs = procfs::ProcFs::new();
+            let proc_root = proc_fs.root_inode();
+            let _ = mkdir(target); // ensure dir exists
+            MOUNTS.lock().push(Mount {
+                path: String::from(target),
+                fs: Box::new(proc_fs),
+                root_inode: proc_root,
+            });
+            crate::serial_println!("[VFS] mount: procfs mounted at '{}'", target);
+            0
+        }
+        "fat32" => {
+            // Stub: block-device mounts require a device argument that the
+            // simple Linux mount(2) ABI delivers only as a path string.
+            // A full implementation would open the device file, wrap it in
+            // a BlockDevice, and call fat32::Fat32Fs::new().  For now,
+            // return ENODEV to indicate the feature is not yet available.
+            crate::serial_println!("[VFS] mount: fat32 block-device mount not yet supported");
+            -19 // ENODEV
+        }
+        _ => {
+            crate::serial_println!("[VFS] mount: unknown fstype '{}'", fstype);
+            -19 // ENODEV
+        }
+    }
+}
+
+/// Runtime `umount` / `umount2` syscall implementation (Linux syscalls 166/168).
+///
+/// Removes the mount at `target` from the mount table.  The underlying
+/// filesystem and all its in-memory data are freed when the `Box<dyn
+/// FileSystemOps>` is dropped.
+///
+/// # Busy check
+/// A proper EBUSY check would require scanning all open file descriptors for
+/// any `mount_idx` that resolves to the target mount.  That is correct but
+/// expensive.  For v1 we perform a conservative check: if any process has an
+/// open fd whose `mount_idx` matches the target mount, we return -EBUSY.
+///
+/// Returns 0 on success, or a negative errno on failure:
+///   -ENOENT  (2)  — no mount at target
+///   -EBUSY   (16) — files still open on this mount
+///   -EINVAL  (22) — trying to umount "/" or other protected mounts
+pub fn sys_umount(target: &str, _flags: u64) -> i64 {
+    if target.is_empty() || target == "/" {
+        return -22; // EINVAL — cannot umount root
+    }
+
+    // Find the mount index for this target.
+    let mount_idx = {
+        let mounts = MOUNTS.lock();
+        mounts.iter().position(|m| m.path == target)
+    };
+
+    let mount_idx = match mount_idx {
+        Some(i) => i,
+        None => {
+            crate::serial_println!("[VFS] umount: no mount at '{}'", target);
+            return -2; // ENOENT
+        }
+    };
+
+    // EBUSY check: scan all process fd tables for fds on this mount.
+    {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        let busy = procs.iter().any(|p| {
+            p.file_descriptors.iter().any(|fdo| {
+                fdo.as_ref().map(|f| f.mount_idx == mount_idx).unwrap_or(false)
+            })
+        });
+        if busy {
+            crate::serial_println!("[VFS] umount: '{}' is busy", target);
+            return -16; // EBUSY
+        }
+    }
+
+    // Remove the mount.  The dropped Box<dyn FileSystemOps> frees all FS memory.
+    {
+        let mut mounts = MOUNTS.lock();
+        if mount_idx >= mounts.len() {
+            return -2; // ENOENT — raced with another umount
+        }
+        mounts.remove(mount_idx);
+    }
+
+    // Any remaining open-fd mount_idx values that were above `mount_idx` are
+    // now off-by-one.  Fix them up so existing fds stay valid.
+    //
+    // This is safe because we just confirmed no fds are on the removed mount,
+    // so only fds with mount_idx > removed_mount_idx need patching.
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        for proc in procs.iter_mut() {
+            for fdo in proc.file_descriptors.iter_mut() {
+                if let Some(fd) = fdo {
+                    if fd.mount_idx != usize::MAX && fd.mount_idx > mount_idx {
+                        fd.mount_idx -= 1;
+                    }
+                }
+            }
+        }
+    }
+
+    crate::serial_println!("[VFS] umount: '{}' removed from mount table", target);
+    0
 }
