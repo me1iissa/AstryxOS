@@ -1343,6 +1343,8 @@ fn sys_ioctl(fd_num: usize, request: u64, arg_ptr: *mut u8) -> i64 {
         sys_input_ioctl(request, arg_ptr)
     } else if open_path.starts_with("/dev/tty") || open_path.starts_with("/dev/pts") || open_path == "/dev/console" {
         crate::drivers::tty::tty_ioctl(request, arg_ptr)
+    } else if open_path == "/dev/dsp" {
+        sys_dsp_ioctl(request, arg_ptr)
     } else {
         0 // silently accept unknown ioctls
     }
@@ -1537,6 +1539,71 @@ fn sys_input_ioctl(request: u64, arg_ptr: *mut u8) -> i64 {
             1 // number of bytes written
         }
         _ => 0, // silently accept all other evdev ioctls
+    }
+}
+
+// ===== /dev/dsp (OSS audio) ioctls =========================================
+
+/// OSS SNDCTL_DSP_* ioctls for the AC97 audio device (/dev/dsp).
+///
+/// Supported commands (minimal OSS subset):
+///   SNDCTL_DSP_SPEED   (0xC0045002) — set sample rate (44100 and 48000 only)
+///   SNDCTL_DSP_SETFMT  (0xC0045005) — set sample format (AFMT_S16_LE only)
+///   SNDCTL_DSP_CHANNELS(0xC0045006) — set channel count (stereo = 2 only)
+///
+/// Any other ioctl is accepted silently (returns 0) so programs that probe
+/// optional capabilities don't abort.
+fn sys_dsp_ioctl(request: u64, arg_ptr: *mut u8) -> i64 {
+    // OSS ioctl numbers — _IOWR('P', N, int)
+    // SNDCTL_DSP_SPEED    = 0xC004_5002
+    // SNDCTL_DSP_SETFMT   = 0xC004_5005
+    // SNDCTL_DSP_CHANNELS = 0xC004_5006
+    const SNDCTL_DSP_SPEED:    u64 = 0xC004_5002;
+    const SNDCTL_DSP_SETFMT:   u64 = 0xC004_5005;
+    const SNDCTL_DSP_CHANNELS: u64 = 0xC004_5006;
+    // AFMT_S16_LE format tag
+    const AFMT_S16_LE: i32 = 0x0000_0010;
+
+    match request {
+        SNDCTL_DSP_SPEED => {
+            // arg_ptr points to an int (sample rate); on success the driver
+            // writes back the actual rate it will use.  We accept 44100 and
+            // 48000; the AC97 hardware is always configured for 48000.
+            if arg_ptr.is_null() { return -22; } // EINVAL
+            let rate = unsafe { core::ptr::read_unaligned(arg_ptr as *const i32) };
+            match rate {
+                44100 | 48000 => {
+                    // Write back 48000 — that is what the hardware runs at.
+                    unsafe { core::ptr::write_unaligned(arg_ptr as *mut i32, 48000i32); }
+                    0
+                }
+                _ => -22, // EINVAL — unsupported rate
+            }
+        }
+        SNDCTL_DSP_SETFMT => {
+            // arg_ptr points to an int (format); write back accepted format or EINVAL.
+            if arg_ptr.is_null() { return -22; }
+            let fmt = unsafe { core::ptr::read_unaligned(arg_ptr as *const i32) };
+            if fmt == AFMT_S16_LE {
+                // Accepted — write back the same value.
+                unsafe { core::ptr::write_unaligned(arg_ptr as *mut i32, AFMT_S16_LE); }
+                0
+            } else {
+                -22 // EINVAL — only 16-bit LE PCM supported
+            }
+        }
+        SNDCTL_DSP_CHANNELS => {
+            // arg_ptr points to an int (channel count); stereo (2) only.
+            if arg_ptr.is_null() { return -22; }
+            let channels = unsafe { core::ptr::read_unaligned(arg_ptr as *const i32) };
+            if channels == 2 {
+                unsafe { core::ptr::write_unaligned(arg_ptr as *mut i32, 2i32); }
+                0
+            } else {
+                -22 // EINVAL — only stereo supported
+            }
+        }
+        _ => 0, // Accept unknown DSP ioctls silently (e.g. capability probes)
     }
 }
 
@@ -5057,6 +5124,29 @@ fn sys_open_linux(pathname: u64, flags: u64, _mode: u64) -> i64 {
         refresh_proc_status(pid);
     }
 
+    // ── /dev/dsp — OSS-compatible audio output via AC97 ─────────────────
+    // Return ENODEV immediately if the AC97 controller was not probed so
+    // callers can fall back gracefully rather than receiving a stale fd that
+    // silently discards all writes.
+    if path == "/dev/dsp" {
+        if !crate::drivers::ac97::is_available() {
+            return -19; // ENODEV
+        }
+        match crate::vfs::open(pid, path, flags as u32) {
+            Ok(fd_num) => {
+                // Tag the fd with bit 23 so fd_write routes to the AC97 ring.
+                let mut procs = crate::proc::PROCESS_TABLE.lock();
+                if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                    if let Some(Some(f)) = p.file_descriptors.get_mut(fd_num) {
+                        f.flags |= 0x0080_0000;
+                    }
+                }
+                return fd_num as i64;
+            }
+            Err(e) => return crate::subsys::linux::errno::vfs_err(e),
+        }
+    }
+
     // ── PTY: /dev/ptmx → allocate pair, return master fd ─────────────────
     if path == "/dev/ptmx" {
         return match crate::drivers::pty::alloc() {
@@ -7199,4 +7289,48 @@ fn sys_inotify_rm_watch(fd_num: u64, wd: i32) -> i64 {
     if !is_inotify_fd(pid, fd_num as usize) { return -9; } // EBADF
     let id = get_inotify_id(pid, fd_num as usize);
     if crate::ipc::inotify::rm_watch(id, wd) { 0 } else { -22 }
+}
+
+// ===== Kernel-internal test helpers =========================================
+//
+// These thin public wrappers expose syscall internals to the headless test
+// suite without going through the full syscall dispatch path.  They are
+// only used from test_runner.rs and are safe to call from kernel context
+// (current_pid() returns the test process PID, which is always valid).
+
+/// Open a file from a kernel string literal.  Equivalent to `open(path, flags, 0)`
+/// but callable without a user-space address-space context.
+pub fn sys_open_test(path: &str, flags: u32) -> i64 {
+    // Append a NUL so read_cstring_from_user can find the end.
+    // We construct a small stack buffer to avoid heap allocation in the hot path.
+    use alloc::vec;
+    let mut buf = vec![0u8; path.len() + 1];
+    buf[..path.len()].copy_from_slice(path.as_bytes());
+    // buf ends with 0 already (vec![] zero-initialises).
+    sys_open_linux(buf.as_ptr() as u64, flags as u64, 0)
+}
+
+/// Write `count` bytes from kernel buffer `buf` to file descriptor `fd_num`.
+pub fn sys_write_test(fd_num: usize, buf: *const u8, count: usize) -> i64 {
+    sys_write_linux(fd_num as u64, buf as u64, count as u64)
+}
+
+/// Close file descriptor `fd_num` in the current process.
+pub fn sys_close_test(fd_num: usize) -> i64 {
+    let pid = crate::proc::current_pid();
+    match crate::vfs::close(pid, fd_num) {
+        Ok(()) => 0,
+        Err(e) => crate::subsys::linux::errno::vfs_err(e),
+    }
+}
+
+/// Issue an ioctl on `fd_num`.  arg_ptr may point into kernel memory.
+pub fn sys_ioctl_test(fd_num: usize, request: u64, arg_ptr: *mut u8) -> i64 {
+    sys_ioctl(fd_num, request, arg_ptr)
+}
+
+/// Call the /dev/dsp ioctl handler directly (no fd lookup required).
+/// Used by tests when AC97 is absent and a real fd cannot be opened.
+pub fn dsp_ioctl_test(request: u64, arg_ptr: *mut u8) -> i64 {
+    sys_dsp_ioctl(request, arg_ptr)
 }

@@ -708,6 +708,21 @@ pub fn run() -> ! {
     total += 1;
     if test_fat32_unlink_frees_clusters() { passed += 1; }
 
+    // ── Test 113: /dev/dsp open fails gracefully when AC97 absent ─────────
+
+    total += 1;
+    if test_dev_dsp_open_with_ac97_absent() { passed += 1; }
+
+    // ── Test 114: /dev/dsp open + write when AC97 present (skip if absent) ─
+
+    total += 1;
+    if test_dev_dsp_open_with_ac97_present() { passed += 1; }
+
+    // ── Test 115: /dev/dsp ioctl SNDCTL_DSP_SETFMT accepts S16_LE ─────────
+
+    total += 1;
+    if test_dev_dsp_ioctl_set_format() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -14119,5 +14134,140 @@ fn test_xhci_probe_safe() -> bool {
     }
 
     if ok { test_pass!("xHCI probe safe — no panic, sensible results"); }
+    ok
+}
+
+// ── Test 110: /dev/dsp — open must fail when AC97 absent ─────────────────────
+//
+// In the default QEMU configuration (no -device AC97), the AC97 driver is not
+// probed and is_available() returns false.  Attempting to open /dev/dsp must
+// return ENODEV (-19), never succeed or panic.
+fn test_dev_dsp_open_with_ac97_absent() -> bool {
+    test_header!("/dev/dsp open — AC97 absent path");
+
+    // If AC97 somehow is available in this QEMU run, this test's
+    // "absent" branch does not apply — pass trivially and let test 111
+    // exercise the present case.
+    if crate::drivers::ac97::is_available() {
+        test_println!("  AC97 present in this run — absent-path test N/A, passing trivially");
+        test_pass!("/dev/dsp open gracefully fails (AC97 absent check skipped — device present)");
+        return true;
+    }
+
+    // Open /dev/dsp: must return ENODEV, not panic.
+    let fd = crate::syscall::sys_open_test("/dev/dsp", 1 /* O_WRONLY */);
+    test_println!("  open(\"/dev/dsp\", O_WRONLY) = {}", fd);
+
+    if fd == -19 {
+        test_pass!("/dev/dsp open returns ENODEV when AC97 absent");
+        true
+    } else {
+        test_fail!("dev_dsp_absent", "expected -19 (ENODEV), got {}", fd);
+        false
+    }
+}
+
+// ── Test 111: /dev/dsp — open + write when AC97 present ──────────────────────
+//
+// If AC97 is present (QEMU started with -device AC97), open must succeed and
+// a write of 4 bytes of silence should return 4.  When AC97 is absent this
+// test silently passes so CI is not broken.
+fn test_dev_dsp_open_with_ac97_present() -> bool {
+    test_header!("/dev/dsp open + write — AC97 present path");
+
+    if !crate::drivers::ac97::is_available() {
+        test_println!("  AC97 not present — skipping write test");
+        test_pass!("/dev/dsp write test skipped (AC97 absent)");
+        return true;
+    }
+
+    let fd = crate::syscall::sys_open_test("/dev/dsp", 1 /* O_WRONLY */);
+    test_println!("  open(\"/dev/dsp\", O_WRONLY) = {}", fd);
+    if fd < 0 {
+        test_fail!("dev_dsp_present", "open failed: {}", fd);
+        return false;
+    }
+
+    // Write 4 bytes of silence (two 16-bit zero stereo samples).
+    let silence: [u8; 4] = [0u8; 4];
+    let written = crate::syscall::sys_write_test(fd as usize, silence.as_ptr(), silence.len());
+    test_println!("  write(fd, [0;4], 4) = {}", written);
+
+    // Close the fd to release state.
+    let _ = crate::syscall::sys_close_test(fd as usize);
+
+    if written == 4 {
+        test_pass!("/dev/dsp open + write succeeds when AC97 present");
+        true
+    } else {
+        test_fail!("dev_dsp_present", "write returned {} (expected 4)", written);
+        false
+    }
+}
+
+// ── Test 112: /dev/dsp — SNDCTL_DSP_SETFMT accepts AFMT_S16_LE ──────────────
+//
+// The ioctl surface must accept AFMT_S16_LE (0x10) and reject anything else
+// with EINVAL.  This test opens /dev/dsp (if AC97 present) or exercises the
+// ioctl dispatch directly via a stub path to verify the format gating logic.
+fn test_dev_dsp_ioctl_set_format() -> bool {
+    test_header!("/dev/dsp ioctl SNDCTL_DSP_SETFMT");
+
+    // OSS ioctl numbers
+    const SNDCTL_DSP_SETFMT: u64 = 0xC004_5005;
+    const AFMT_S16_LE: i32       = 0x0000_0010;
+    const AFMT_MU_LAW: i32       = 0x0000_0001; // unsupported
+
+    if !crate::drivers::ac97::is_available() {
+        // AC97 absent: we can still exercise the ioctl handler by opening
+        // /dev/dsp through the syscall layer — it will return ENODEV, so
+        // instead we call the internal handler directly.
+        test_println!("  AC97 absent — exercising sys_dsp_ioctl directly");
+
+        let mut fmt: i32 = AFMT_S16_LE;
+        let r = crate::syscall::dsp_ioctl_test(SNDCTL_DSP_SETFMT, &mut fmt as *mut i32 as *mut u8);
+        test_println!("  SETFMT(S16_LE) via direct call = {}, fmt_back = {}", r, fmt);
+        if r != 0 || fmt != AFMT_S16_LE {
+            test_fail!("dev_dsp_ioctl_fmt", "SETFMT(S16_LE) failed: ret={} fmt={}", r, fmt);
+            return false;
+        }
+
+        let mut bad_fmt: i32 = AFMT_MU_LAW;
+        let r2 = crate::syscall::dsp_ioctl_test(SNDCTL_DSP_SETFMT, &mut bad_fmt as *mut i32 as *mut u8);
+        test_println!("  SETFMT(MU_LAW) via direct call = {}", r2);
+        if r2 != -22 {
+            test_fail!("dev_dsp_ioctl_fmt", "SETFMT(MU_LAW) expected EINVAL, got {}", r2);
+            return false;
+        }
+
+        test_pass!("/dev/dsp SETFMT accepts S16_LE, rejects MU_LAW (direct dispatch)");
+        return true;
+    }
+
+    // AC97 present: open the fd and call ioctl through the normal path.
+    let fd = crate::syscall::sys_open_test("/dev/dsp", 1 /* O_WRONLY */);
+    if fd < 0 {
+        test_fail!("dev_dsp_ioctl_fmt", "open /dev/dsp failed: {}", fd);
+        return false;
+    }
+
+    let mut fmt: i32 = AFMT_S16_LE;
+    let r = crate::syscall::sys_ioctl_test(fd as usize, SNDCTL_DSP_SETFMT, &mut fmt as *mut i32 as *mut u8);
+    test_println!("  SETFMT(S16_LE) = {}, fmt_back = {}", r, fmt);
+
+    let mut bad_fmt: i32 = AFMT_MU_LAW;
+    let r2 = crate::syscall::sys_ioctl_test(fd as usize, SNDCTL_DSP_SETFMT, &mut bad_fmt as *mut i32 as *mut u8);
+    test_println!("  SETFMT(MU_LAW) = {}", r2);
+
+    let _ = crate::syscall::sys_close_test(fd as usize);
+
+    let ok = r == 0 && fmt == AFMT_S16_LE && r2 == -22;
+    if ok {
+        test_pass!("/dev/dsp SETFMT: S16_LE accepted, MU_LAW rejected with EINVAL");
+    } else {
+        test_fail!("dev_dsp_ioctl_fmt",
+            "S16_LE: ret={} fmt={} | MU_LAW: ret={} (want 0/{} and -22)",
+            r, fmt, r2, AFMT_S16_LE);
+    }
     ok
 }
