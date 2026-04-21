@@ -457,6 +457,14 @@ impl Fat32Fs {
         self.inner.lock().nodes[0].inode
     }
 
+    /// Count the number of free clusters in FAT1.
+    /// A cluster is free when its FAT entry is 0.
+    /// Clusters 0 and 1 are reserved; usable data clusters start at 2.
+    pub fn count_free_clusters(&self) -> usize {
+        let inner = self.inner.lock();
+        inner.fat.iter().skip(2).filter(|&&v| v == 0).count()
+    }
+
     // ── Cache helpers ───────────────────────────────────────────────────
 
     /// Ensure a sector is in the sparse cache, loading from device if needed.
@@ -1737,6 +1745,98 @@ pub fn create_test_image() -> Vec<u8> {
         let offset = ((DATA_START + 4) as usize) * 512;
         img[offset..offset + data.len()].copy_from_slice(data);
     }
+
+    img
+}
+
+/// Create a larger FAT32 test image suitable for read-write tests.
+///
+/// 256 sectors × 512 bytes = 128 KiB image.  Layout:
+/// - Sector 0:      Boot sector (BPB)
+/// - Sector 1:      FSInfo sector
+/// - Sectors 2-3:   FAT #1 (2 sectors = 256 entries)
+/// - Sectors 4-5:   FAT #2 (copy)
+/// - Sector 6+:     Data clusters (cluster 2 = root directory, rest free)
+///
+/// Provides ~250 free clusters (×512 bytes = ~125 KiB free) for write tests.
+pub fn create_rw_test_image() -> Vec<u8> {
+    const BYTES_PER_SECTOR: u16 = 512;
+    const SECTORS_PER_CLUSTER: u8 = 1;
+    const RESERVED_SECTORS: u16 = 2;
+    const NUM_FATS: u8 = 2;
+    const FAT_SIZE_SECTORS: u32 = 2;
+    const TOTAL_SECTORS: u32 = 256;
+
+    const FAT1_START: u32 = RESERVED_SECTORS as u32;
+    const FAT2_START: u32 = FAT1_START + FAT_SIZE_SECTORS;
+    const DATA_START: u32 = FAT2_START + FAT_SIZE_SECTORS;
+    const ROOT_CLUSTER: u32 = 2;
+
+    let image_size = (TOTAL_SECTORS as usize) * (BYTES_PER_SECTOR as usize);
+    let mut img = vec![0u8; image_size];
+
+    // Boot sector.
+    {
+        let s = &mut img[0..512];
+        s[0] = 0xEB; s[1] = 0x58; s[2] = 0x90;
+        s[3..11].copy_from_slice(b"ASTRYX  ");
+        s[11..13].copy_from_slice(&BYTES_PER_SECTOR.to_le_bytes());
+        s[13] = SECTORS_PER_CLUSTER;
+        s[14..16].copy_from_slice(&RESERVED_SECTORS.to_le_bytes());
+        s[16] = NUM_FATS;
+        // root_entry_count = 0 (FAT32)
+        s[17] = 0; s[18] = 0;
+        // total_sectors_16 = 0
+        s[19] = 0; s[20] = 0;
+        s[21] = 0xF8; // media type
+        s[22] = 0; s[23] = 0; // fat_size_16 = 0
+        s[24..26].copy_from_slice(&63u16.to_le_bytes());
+        s[26..28].copy_from_slice(&255u16.to_le_bytes());
+        s[28..32].copy_from_slice(&0u32.to_le_bytes());
+        s[32..36].copy_from_slice(&TOTAL_SECTORS.to_le_bytes());
+        s[36..40].copy_from_slice(&FAT_SIZE_SECTORS.to_le_bytes());
+        s[40..42].copy_from_slice(&0u16.to_le_bytes());
+        s[42..44].copy_from_slice(&0u16.to_le_bytes());
+        s[44..48].copy_from_slice(&ROOT_CLUSTER.to_le_bytes());
+        s[48..50].copy_from_slice(&1u16.to_le_bytes());
+        s[50..52].copy_from_slice(&0u16.to_le_bytes());
+        s[64] = 0x80;
+        s[66] = 0x29;
+        s[67..71].copy_from_slice(&0xCAFEBABEu32.to_le_bytes());
+        s[71..82].copy_from_slice(b"ASTRYXRWIMG");
+        s[82..90].copy_from_slice(b"FAT32   ");
+        s[510] = 0x55;
+        s[511] = 0xAA;
+    }
+
+    // FSInfo sector.
+    {
+        let s = &mut img[512..1024];
+        s[0..4].copy_from_slice(&0x41615252u32.to_le_bytes());
+        s[484..488].copy_from_slice(&0x61417272u32.to_le_bytes());
+        s[488..492].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        s[492..496].copy_from_slice(&3u32.to_le_bytes());
+        s[508..512].copy_from_slice(&0xAA550000u32.to_le_bytes());
+    }
+
+    // FAT #1: entries 0-1 reserved; entry 2 (root) = EOC; rest = 0 (free).
+    let fat1_offset = (FAT1_START as usize) * 512;
+    {
+        let fat = &mut img[fat1_offset..fat1_offset + (FAT_SIZE_SECTORS as usize) * 512];
+        fat[0..4].copy_from_slice(&0x0FFFFFF8u32.to_le_bytes());
+        fat[4..8].copy_from_slice(&0x0FFFFFFFu32.to_le_bytes());
+        fat[8..12].copy_from_slice(&0x0FFFFFFFu32.to_le_bytes()); // root dir EOC
+        // All other entries remain 0 (free).
+    }
+
+    // FAT #2 = copy of FAT #1.
+    let fat2_offset = (FAT2_START as usize) * 512;
+    let fat_byte_size = (FAT_SIZE_SECTORS as usize) * 512;
+    img.copy_within(fat1_offset..fat1_offset + fat_byte_size, fat2_offset);
+
+    // Root directory cluster (cluster 2 = sector DATA_START) — empty.
+    // All 512 bytes are already zero, which is correct (no entries).
+    let _ = DATA_START;
 
     img
 }
