@@ -639,6 +639,11 @@ pub fn run() -> ! {
     total += 1;
     if test_wm_title_renders_via_gdi() { passed += 1; }
 
+    // ── Test 104: execve VmSpace teardown — no PMM leak across exec ────
+
+    total += 1;
+    if test_execve_no_pmm_leak() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -12759,5 +12764,164 @@ fn test_wm_title_renders_via_gdi() -> bool {
     test_println!("  GDI text_out rendered at least one foreground pixel in title-bar ✓");
 
     test_pass!("WM title bar rendered via GDI text engine");
+// ── Test 97: execve VmSpace teardown — no PMM leak across exec ───────────────
+//
+// Verifies that free_vm_space() (the execve teardown path) actually reclaims
+// physical pages, not just drops the VmSpace struct.  Without the fix, each
+// exec leaks the old page tables and anonymous data frames forever.
+//
+// Strategy:
+//   1. Snapshot PMM free-page count.
+//   2. Repeat N times:
+//      a. Create a fresh user VmSpace (load the embedded HELLO_ELF into it).
+//      b. Load a second fresh VmSpace with the same ELF (simulates the new image).
+//      c. Swap the new VmSpace in, capturing the old one.
+//      d. Call free_vm_space() on the old one — this is the path under test.
+//      e. Let the child run to completion and have its final VmSpace freed by
+//         exit_group / free_process_memory.
+//   3. Assert free-page count returned within TOLERANCE of the baseline.
+//
+// The test uses the embedded HELLO_ELF (always available, no disk dependency).
+
+fn test_execve_no_pmm_leak() -> bool {
+    test_header!("execve VmSpace teardown — no PMM leak across exec");
+
+    // How many exec iterations to exercise.
+    const ITERS: usize = 3;
+    // Maximum tolerated PMM leak per exec iteration (in 4 KiB pages).
+    // A small slop is allowed for kernel heap fragmentation and CoW refcount
+    // pages that are legitimately not freed until after this measurement.
+    const TOLERANCE_PER_ITER: u64 = 8;
+
+    // Use the embedded HELLO_ELF — always present, no disk dependency.
+    let elf_data = &crate::proc::hello_elf::HELLO_ELF;
+    test_println!("  Using embedded HELLO_ELF ({} bytes) ✓", elf_data.len());
+
+    // Snapshot free-page count before any exec.
+    let pages_before = crate::mm::pmm::free_page_count();
+    test_println!("  PMM free pages before: {}", pages_before);
+
+    // Enable the scheduler so child threads can run to completion.
+    let was_active = crate::sched::is_active();
+    if !was_active { crate::sched::enable(); }
+
+    for iter in 0..ITERS {
+        // 1. Create a user process with the hello ELF (initial image).
+        let child_pid = match crate::proc::usermode::create_user_process(
+            "exec_leak_child",
+            elf_data,
+        ) {
+            Ok(pid) => pid,
+            Err(e) => {
+                if !was_active { crate::sched::disable(); }
+                test_fail!("execve_leak", "create_user_process failed (iter {}): {:?}", iter, e);
+                return false;
+            }
+        };
+
+        // Mark as Linux ABI so it uses the correct syscall dispatch.
+        {
+            let mut procs = crate::proc::PROCESS_TABLE.lock();
+            if let Some(p) = procs.iter_mut().find(|p| p.pid == child_pid) {
+                p.linux_abi = true;
+                p.subsystem = crate::win32::SubsystemType::Linux;
+            }
+        }
+
+        // 2. Simulate an in-process exec: allocate a fresh VmSpace, load the
+        //    ELF into it, swap it into the child's Process entry (capturing
+        //    the old VmSpace), then call free_vm_space() on the old one.
+        //    This exercises the exact same code path that sys_execve now uses.
+        {
+            let mut new_vm = match crate::mm::vma::VmSpace::new_user() {
+                Some(vs) => vs,
+                None => {
+                    if !was_active { crate::sched::disable(); }
+                    test_fail!("execve_leak", "OOM allocating new VmSpace (iter {})", iter);
+                    return false;
+                }
+            };
+
+            let argv: &[&str] = &["hello"];
+            let envp: &[&str] = &["HOME=/"];
+
+            let result = match crate::proc::elf::load_elf_with_args(
+                elf_data, new_vm.cr3, argv, envp,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    if !was_active { crate::sched::disable(); }
+                    test_fail!("execve_leak", "load_elf_with_args failed (iter {}): {:?}", iter, e);
+                    return false;
+                }
+            };
+            for vma in result.vmas {
+                let _ = new_vm.insert_vma(vma);
+            }
+
+            // Atomically swap new VmSpace into the process, capturing the old one.
+            let old_vm = {
+                let mut procs = crate::proc::PROCESS_TABLE.lock();
+                let mut old = None;
+                if let Some(p) = procs.iter_mut().find(|p| p.pid == child_pid) {
+                    let new_cr3 = new_vm.cr3;
+                    p.cr3 = new_cr3;
+                    old = p.vm_space.replace(new_vm);
+                }
+                old
+            };
+
+            // Free the old VmSpace — THIS IS THE CODE PATH UNDER TEST.
+            // Before the fix, this was a no-op (pages leaked forever).
+            // After the fix, free_vm_space() reclaims all anonymous frames.
+            if let Some(old_space) = old_vm {
+                crate::proc::free_vm_space(old_space);
+            }
+        }
+
+        // 3. Let the child run to exit (exit_group calls free_process_memory).
+        for _ in 0..2000 {
+            crate::sched::yield_cpu();
+            let done = {
+                let procs = crate::proc::PROCESS_TABLE.lock();
+                match procs.iter().find(|p| p.pid == child_pid) {
+                    Some(p) => p.state == crate::proc::ProcessState::Zombie,
+                    None => true,
+                }
+            };
+            if done { break; }
+            crate::hal::enable_interrupts();
+            for _ in 0..1000 { core::hint::spin_loop(); }
+        }
+
+        test_println!("  iter {}/{}: child PID {} exited ✓", iter + 1, ITERS, child_pid);
+    }
+
+    if !was_active { crate::sched::disable(); }
+
+    // 4. Check PMM free page count after all iterations.
+    let pages_after = crate::mm::pmm::free_page_count();
+    let tolerance = TOLERANCE_PER_ITER * ITERS as u64;
+    test_println!("  PMM free pages before: {}", pages_before);
+    test_println!("  PMM free pages after:  {}", pages_after);
+    test_println!("  Delta (before - after): {}", pages_before.saturating_sub(pages_after));
+    test_println!("  Tolerance:             {} pages ({} per iter × {} iters)",
+        tolerance, TOLERANCE_PER_ITER, ITERS);
+
+    // pages_after should be close to pages_before.  A large deficit means
+    // free_vm_space is not being called or is not freeing all pages.
+    // We allow pages_after > pages_before (GC freed something in background).
+    let leaked = pages_before.saturating_sub(pages_after);
+    if leaked > tolerance {
+        test_fail!(
+            "execve_leak",
+            "PMM leaked {} pages across {} execs (tolerance {})",
+            leaked, ITERS, tolerance
+        );
+        return false;
+    }
+
+    test_println!("  PMM leak {} pages <= tolerance {} ✓", leaked, tolerance);
+    test_pass!("execve VmSpace teardown — no PMM leak across exec");
     true
 }
