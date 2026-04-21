@@ -5,6 +5,7 @@
 
 pub mod cache;
 pub mod heap;
+pub mod oom;
 pub mod pmm;
 pub mod refcount;
 pub mod vma;
