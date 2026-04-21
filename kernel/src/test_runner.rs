@@ -13442,7 +13442,9 @@ fn test_po_shutdown_sweep() -> bool {
         test_pass!("Po shutdown driver-stop sweep");
     }
     ok
-// ── Test 106: ASLR — ET_DYN load base differs between two loads ──────────────
+}
+
+// ── Test 107: ASLR — ET_DYN load base differs between two loads ──────────────
 //
 // Creates a minimal hand-crafted ET_DYN (PIE) ELF and loads it twice into
 // separate fresh address spaces.  With 28 bits of ASLR entropy the chance of
@@ -13706,7 +13708,9 @@ fn test_aslr_elf_exec_no_randomisation() -> bool {
     test_println!("  Both loads → {:#x} (deterministic) ✓", base1);
     test_pass!("ASLR — ET_EXEC load base is stable (never randomised)");
     true
-// ── Test 106: xHCI probe safety ──────────────────────────────────────────────
+}
+
+// ── Test 109: xHCI probe safety ──────────────────────────────────────────────
 //
 // Verifies that the xHCI driver does not panic regardless of whether an xHCI
 // controller is present.  In the default QEMU configuration (no -device
