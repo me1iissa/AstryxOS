@@ -613,7 +613,12 @@ pub fn run() -> ! {
     total += 1;
     if test_procfs_self_maps() { passed += 1; }
 
-    // ── Test 100: vfork + _exit — DISABLED: test runner is TID 0 (BSP),
+    // ── Test 100: virtio-net driver probe ──────────────────────────────────
+
+    total += 1;
+    if test_virtio_net_probes() { passed += 1; }
+
+    // ── Test 101: vfork + _exit — DISABLED: test runner is TID 0 (BSP),
     // cannot be blocked by vfork mechanism (blocking TID 0 breaks scheduler).
     // vfork is verified via Firefox test mode (glxtest child process).
     // total += 1;
@@ -12609,5 +12614,63 @@ fn test_oom_skips_init() -> bool {
             test_fail!("OOM killer skips init", "score_pick returned None on non-empty list");
             false
         }
+    }
+}
+
+// ── Test 100: virtio-net probe ───────────────────────────────────────────────
+
+/// Verify that the virtio-net driver probe path is safe to call even when no
+/// virtio-net device is present (e1000 is the active NIC in our headless QEMU
+/// configuration).
+///
+/// The test passes unconditionally as long as:
+///  - `init()` does not panic or corrupt the heap when the device is absent.
+///  - `send_packet()` and `poll_rx()` are no-ops (not panics) when unavailable.
+///  - `is_available()` returns the correct boolean for the current hardware.
+///
+/// If QEMU is launched with `-device virtio-net-pci` (and *without* `-device
+/// e1000`), the test will additionally verify that the driver successfully
+/// initialises and that `is_available()` returns true.  That scenario requires
+/// a QEMU flag change and is noted in the commit message; it does not affect
+/// the headless CI run which uses e1000.
+fn test_virtio_net_probes() -> bool {
+    test_header!("virtio-net driver probe");
+
+    let e1000_present = crate::net::e1000::is_available();
+    let vnet_present  = crate::net::virtio_net::is_available();
+
+    test_println!("  e1000 active:    {}", e1000_present);
+    test_println!("  virtio-net active: {}", vnet_present);
+
+    if e1000_present {
+        // Running under QEMU with e1000 — virtio-net was probed during net::init()
+        // and correctly found nothing (or was skipped as the fallback path).
+        // Verify that calling send_packet / poll_rx on the (absent) virtio-net
+        // device doesn't panic.
+        crate::net::virtio_net::send_packet(&[]);
+        crate::net::virtio_net::poll_rx();
+        test_println!("  send_packet(empty) on absent device: OK (no panic)");
+        test_println!("  poll_rx() on absent device: OK (no panic)");
+        // Verify is_available() correctly reports false.
+        if vnet_present {
+            test_fail!("virtio_net_probes",
+                "virtio-net reported available but e1000 should have claimed the slot");
+            return false;
+        }
+        test_pass!("virtio-net probe (e1000 active, virtio-net correctly absent)");
+        true
+    } else if vnet_present {
+        // Running under QEMU with virtio-net-pci — full driver init succeeded.
+        test_println!("  virtio-net driver initialised successfully");
+        // Verify acknowledge_irq() doesn't panic (reads ISR register).
+        let isr = crate::net::virtio_net::acknowledge_irq();
+        test_println!("  acknowledge_irq() = {:#04x} (OK)", isr);
+        test_pass!("virtio-net probe (device found and initialised)");
+        true
+    } else {
+        // No network device at all — still passes (we're just testing probe safety).
+        test_println!("  No network device present — probe path clean (no panic)");
+        test_pass!("virtio-net probe (no device, probe path safe)");
+        true
     }
 }
