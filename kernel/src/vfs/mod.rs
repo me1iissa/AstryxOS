@@ -351,6 +351,10 @@ pub fn init() {
     // Framebuffer device.
     let _ = create_file("/dev/fb0");
 
+    // OSS-compatible audio device.  Writes go to the AC97 DMA ring when
+    // the driver is present; open returns ENODEV when AC97 was not probed.
+    let _ = create_file("/dev/dsp");
+
     // Input devices (evdev).
     let _ = mkdir("/dev/input");
     let _ = create_file("/dev/input/event0");  // keyboard
@@ -1641,6 +1645,14 @@ pub fn fd_write(pid: crate::proc::Pid, fd_num: usize, buf: *const u8, count: usi
     // Special character devices: accept writes silently.
     if fd_flags & (0x0400_0000 | 0x0200_0000 | 0x0100_0000) != 0 {
         return Ok(count); // /dev/null, /dev/zero, /dev/urandom — discard
+    }
+
+    // bit 23 (0x0080_0000) = /dev/dsp — forward PCM data to AC97 DMA ring.
+    // The AC97 driver accepts the bytes as-is (caller is responsible for
+    // producing 16-bit little-endian stereo PCM at the configured rate).
+    if fd_flags & 0x0080_0000 != 0 {
+        let n = crate::drivers::ac97::play_buffer(data);
+        return Ok(n);
     }
 
     let write_offset = if append {
