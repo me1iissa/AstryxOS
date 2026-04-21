@@ -673,6 +673,11 @@ pub fn run() -> ! {
     total += 1;
     if test_heap_guard_pte() { passed += 1; }
 
+    // ── Test 106: po::shutdown driver-stop sweep (dry-run) ────────────────
+
+    total += 1;
+    if test_po_shutdown_sweep() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -13347,4 +13352,79 @@ fn test_heap_guard_pte() -> bool {
         HEAP_START as u64, (HEAP_START + HEAP_SIZE) as u64);
     test_pass!("Heap guard pages — PTE present-bit verification");
     true
+}
+
+// ── Test 106: po::shutdown driver-stop sweep (dry-run) ───────────────────────
+
+fn test_po_shutdown_sweep() -> bool {
+    test_header!("Po shutdown driver-stop sweep (dry-run)");
+
+    use crate::po::shutdown::{
+        shutdown_dry_run, init_shutdown, drivers_stopped_mask,
+        DRIVER_BIT_AC97, DRIVER_BIT_E1000, DRIVER_BIT_VIRTIO_NET,
+        DRIVER_BIT_VIRTIO_BLK, DRIVER_BIT_AHCI, DRIVER_BIT_ATA,
+        DRIVER_BIT_CONSOLE, DRIVER_BIT_SERIAL, DRIVER_BITS_ALL,
+    };
+
+    // Reset state so we start from a clean slate regardless of prior tests.
+    init_shutdown();
+
+    let pre_mask = drivers_stopped_mask();
+    if pre_mask != 0 {
+        test_fail!("Po/Sweep", "DRIVERS_STOPPED not zero after init_shutdown (got {:#010x})", pre_mask);
+        return false;
+    }
+    test_println!("  Pre-sweep mask = 0x{:08x} (clean) ✓", pre_mask);
+
+    // Execute the dry-run sweep — calls every real driver stop() without halt.
+    let mask = shutdown_dry_run();
+
+    test_println!("  Post-sweep mask = 0x{:08x}", mask);
+    test_println!("  Expected mask   = 0x{:08x}", DRIVER_BITS_ALL);
+
+    // Verify each driver was called exactly once (its bit is set).
+    let mut ok = true;
+
+    macro_rules! check_bit {
+        ($bit:expr, $name:expr) => {
+            if mask & $bit != 0 {
+                test_println!("    [ok] {} stop() called ✓", $name);
+            } else {
+                test_fail!("Po/Sweep", "{} stop() was NOT called (bit {:#010x} missing)", $name, $bit);
+                ok = false;
+            }
+        };
+    }
+
+    check_bit!(DRIVER_BIT_AC97,       "ac97");
+    check_bit!(DRIVER_BIT_E1000,      "e1000");
+    check_bit!(DRIVER_BIT_VIRTIO_NET, "virtio_net");
+    check_bit!(DRIVER_BIT_VIRTIO_BLK, "virtio_blk");
+    check_bit!(DRIVER_BIT_AHCI,       "ahci");
+    check_bit!(DRIVER_BIT_ATA,        "ata");
+    check_bit!(DRIVER_BIT_CONSOLE,    "console");
+    check_bit!(DRIVER_BIT_SERIAL,     "serial");
+
+    if mask != DRIVER_BITS_ALL {
+        test_fail!("Po/Sweep", "mask mismatch: got {:#010x}, want {:#010x}", mask, DRIVER_BITS_ALL);
+        ok = false;
+    }
+
+    // Run a second dry-run to confirm idempotency (stop() is safe to call
+    // on an already-quiesced driver).
+    let mask2 = shutdown_dry_run();
+    if mask2 != DRIVER_BITS_ALL {
+        test_fail!("Po/Sweep", "second dry-run mask wrong: {:#010x}", mask2);
+        ok = false;
+    } else {
+        test_println!("  Second dry-run mask = 0x{:08x} (idempotent) ✓", mask2);
+    }
+
+    // Restore init state so any subsequent power-management tests start clean.
+    init_shutdown();
+
+    if ok {
+        test_pass!("Po shutdown driver-stop sweep");
+    }
+    ok
 }
