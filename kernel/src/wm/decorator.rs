@@ -1,9 +1,20 @@
 //! Window Decorator — Draws modern flat window decorations
 //!
-//! All drawing is done directly to pixel slices (`&mut [u32]` ARGB buffers)
-//! to avoid circular dependencies on the GDI engine.
+//! Title-bar text is rendered via the GDI text engine (`gdi::text::text_out`)
+//! so that it picks up whatever font the GDI layer supports.  The legacy
+//! 8x16 bitmap-rectangle placeholder is preserved behind the
+//! `bitmap-title-fallback` Cargo feature (default: disabled).
+//!
+//! All other drawing is done directly to pixel slices (`&mut [u32]` ARGB
+//! buffers) to avoid circular dependencies on the GDI engine for geometry
+//! operations.
 
 use super::window::Window;
+
+// GDI imports for title-text rendering via text_out.
+use crate::gdi::dc::{BgMode, DeviceContext};
+use crate::gdi::surface::Surface;
+use crate::gdi::text::text_out;
 
 // ---------------------------------------------------------------------------
 // Geometry constants (modern flat style)
@@ -102,7 +113,7 @@ pub fn draw_title_bar(
     surface_pixels: &mut [u32],
     surface_width: u32,
     window: &Window,
-    _title: &str,
+    title: &str,
 ) {
     if !window.style.has_title_bar {
         return;
@@ -110,7 +121,7 @@ pub fn draw_title_bar(
 
     let active = window.focused;
     let bg = if active { COLOR_TITLE_BAR_ACTIVE } else { COLOR_TITLE_BAR_INACTIVE };
-    let _text_color = if active { COLOR_TITLE_TEXT_ACTIVE } else { COLOR_TITLE_TEXT_INACTIVE };
+    let text_color = if active { COLOR_TITLE_TEXT_ACTIVE } else { COLOR_TITLE_TEXT_INACTIVE };
 
     let border = if window.style.has_border { BORDER_WIDTH as i32 } else { 0 };
     let bar_x = window.x + border;
@@ -120,17 +131,70 @@ pub fn draw_title_bar(
     // Fill title bar background.
     fill_rect(surface_pixels, surface_width, bar_x, bar_y, bar_w, TITLE_BAR_HEIGHT, bg);
 
-    // TODO: render title text with GDI font
-    // For now, draw a small colored rectangle as a placeholder indicating
-    // where the title text would appear (12px high, starting 10px from left).
-    let text_placeholder_color = if active { COLOR_TITLE_TEXT_ACTIVE } else { COLOR_TITLE_TEXT_INACTIVE };
-    if !_title.is_empty() {
-        // Placeholder: small rectangle (width proportional to title length, max 200px)
-        let tw = core::cmp::min(_title.len() as u32 * 7, 200);
+    // ── Render title text ────────────────────────────────────────────────
+    //
+    // We build a short-lived Surface covering just the title-bar strip,
+    // call gdi::text::text_out into it, then blit the result back to the
+    // main pixel buffer.  This keeps the decorator's public API unchanged
+    // (it still takes a raw &mut [u32] slice) while routing text through
+    // the GDI font engine for consistency.
+    //
+    // The text is positioned 10 px from the left edge and vertically
+    // centred within the TITLE_BAR_HEIGHT band.
+    #[cfg(not(feature = "bitmap-title-fallback"))]
+    if !title.is_empty() && bar_w > 0 {
+        // Vertical centre offset: align 16-px-tall glyphs within the bar.
+        let gdi_y_offset = (TITLE_BAR_HEIGHT as i32 - crate::gdi::text::FONT_HEIGHT as i32) / 2;
+
+        // Build a temporary Surface for the title-bar strip.
+        let mut title_surf = Surface::new_with_color(bar_w, TITLE_BAR_HEIGHT, bg);
+
+        // Set up a minimal DC: transparent background, correct text colour.
+        // ID 0 is a sentinel — we own this DC on the stack; never put it
+        // in the global DC registry to avoid needing alloc/free here.
+        let mut dc = DeviceContext::new(0);
+        dc.text_color = text_color;
+        dc.bg_color = bg;
+        dc.bg_mode = BgMode::Transparent;
+
+        // Render the title string starting at (10, gdi_y_offset) inside the
+        // title-bar surface.  text_out clips to the Surface dimensions, so
+        // long titles are naturally truncated at the bar edge.
+        text_out(&mut title_surf, &dc, 10, gdi_y_offset, title);
+
+        // Blit rendered strip back into the main pixel buffer.
+        // bar_x / bar_y may be negative (window partially off-screen), so
+        // we clip the blit to the visible region.
+        let dst_x = bar_x;
+        let dst_y = bar_y;
+        for row in 0..TITLE_BAR_HEIGHT as i32 {
+            let py = dst_y + row;
+            if py < 0 { continue; }
+            let py = py as u32;
+            for col in 0..bar_w {
+                let px = dst_x + col as i32;
+                if px < 0 { continue; }
+                let px = px as u32;
+                let src_px = title_surf.pixels[row as usize * bar_w as usize + col as usize];
+                let dst_idx = py as usize * surface_width as usize + px as usize;
+                if dst_idx < surface_pixels.len() {
+                    surface_pixels[dst_idx] = src_px;
+                }
+            }
+        }
+    }
+
+    // ── Bitmap fallback (feature = "bitmap-title-fallback") ──────────────
+    //
+    // Legacy rectangle placeholder — preserved so we can re-enable it if
+    // the GDI path has a regression before RC1 final.
+    #[cfg(feature = "bitmap-title-fallback")]
+    if !title.is_empty() {
+        let tw = core::cmp::min(title.len() as u32 * 7, 200);
         let th: u32 = 12;
         let tx = bar_x + 10;
         let ty = bar_y + (TITLE_BAR_HEIGHT as i32 - th as i32) / 2;
-        fill_rect(surface_pixels, surface_width, tx, ty, tw, th, text_placeholder_color);
+        fill_rect(surface_pixels, surface_width, tx, ty, tw, th, text_color);
     }
 
     // Draw caption buttons.
