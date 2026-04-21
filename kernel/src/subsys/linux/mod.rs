@@ -30,6 +30,10 @@
 /// Linux errno constants and VfsError / NtStatus conversion helpers.
 pub mod errno;
 
+/// Linux x86_64 syscall dispatch and Linux-specific helpers.
+/// Extracted from `kernel/src/syscall/mod.rs` in Phase 0.2.
+pub mod syscall;
+
 // Re-export the two most-used helpers at the subsystem level so submodules
 // can write `use crate::subsys::linux::{vfs_err, EINVAL};`.
 pub use errno::{vfs_err, EINVAL, ENOENT, EBADF, ENOMEM, EFAULT, ENOSYS,
@@ -48,14 +52,13 @@ pub use errno::{vfs_err, EINVAL, ENOENT, EBADF, ENOMEM, EFAULT, ENOSYS,
 
 /// Linux compatibility syscall entry point.
 ///
-/// Forwards to `crate::syscall::dispatch_linux()`.  External code should use
-/// this rather than calling `syscall::dispatch_linux` directly, as this will
-/// remain the stable API surface once the implementation migrates here.
+/// Delegates directly to `self::syscall::dispatch`.  External code should use
+/// this rather than calling `syscall::dispatch_linux` directly.
 #[inline]
 pub fn dispatch(
     num: u64,
     arg1: u64, arg2: u64, arg3: u64,
     arg4: u64, arg5: u64, arg6: u64,
 ) -> i64 {
-    crate::syscall::dispatch_linux(num, arg1, arg2, arg3, arg4, arg5, arg6)
+    self::syscall::dispatch(num, arg1, arg2, arg3, arg4, arg5, arg6)
 }

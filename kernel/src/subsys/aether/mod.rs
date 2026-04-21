@@ -9,11 +9,14 @@
 //! - Errors: negative NtStatus values on failure
 //! - Entry: `SYSCALL` instruction (MSR-based, same x86_64 path as Linux)
 //!
-//! # Phase 0.1 Plan
-//! Move `dispatch()` body from `kernel/src/syscall/mod.rs` into this module
-//! once the Linux extraction is done (avoids disturbing both at once).
+//! # Phase 0.1 Status (complete)
+//! `dispatch()` body has been extracted from `kernel/src/syscall/mod.rs`
+//! into `syscall.rs` in this module.  `syscall::dispatch_aether()` is now a
+//! thin stub that delegates here.
 //!
 //! See `.ai/subsystem/AETHER.md` for full design.
+
+pub mod syscall;
 
 // ============================================================================
 // Subsystem dispatch entry point
@@ -26,14 +29,13 @@
 
 /// Aether native syscall entry point.
 ///
-/// Forwards to `crate::syscall::dispatch_aether()`.  External code should use
-/// this rather than calling `syscall::dispatch_aether` directly, as this will
-/// remain the stable API surface once the implementation migrates here.
+/// Delegates directly to `self::syscall::dispatch`.  External code should use
+/// this rather than calling `syscall::dispatch_aether` directly.
 #[inline]
 pub fn dispatch(
     num: u64,
     arg1: u64, arg2: u64, arg3: u64,
     arg4: u64, arg5: u64, arg6: u64,
 ) -> i64 {
-    crate::syscall::dispatch_aether(num, arg1, arg2, arg3, arg4, arg5, arg6)
+    self::syscall::dispatch(num, arg1, arg2, arg3, arg4, arg5, arg6)
 }
