@@ -8,6 +8,10 @@ default = []
 test-mode = []
 gui-test = []
 firefox-test = []
+# Keep the old 8x16 bitmap rectangle placeholder for title-bar text instead of
+# using the GDI text engine.  Disabled by default; re-enable if the GDI path
+# triggers any rendering issue before it is fully validated.
+bitmap-title-fallback = []
 
 [dependencies]
 astryx-shared = { path = "../shared" }
