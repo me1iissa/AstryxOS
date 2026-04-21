@@ -444,6 +444,34 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
     let is_write = error_code & 2 != 0;
     let _is_user = error_code & 4 != 0;
 
+    // === Kernel Heap Guard Page Detection ===
+    //
+    // The 4 KiB pages immediately below and above the kernel heap are mapped
+    // not-present to catch heap underflow and overflow at the page boundary.
+    // Detect these before the normal demand-paging path and panic loudly — a
+    // guard hit means kernel heap corruption, not a recoverable page fault.
+    //
+    // Guards only fire for kernel-mode faults (bit 2 clear).  A user-mode
+    // access to a kernel higher-half address would already be caught by the
+    // CPU's ring-level check (GP fault) before reaching here; guard detection
+    // is purely a defence-in-depth for buggy kernel allocations.
+    {
+        use crate::mm::heap::{HEAP_GUARD_BELOW_VA, HEAP_GUARD_ABOVE_VA, HEAP_START, HEAP_SIZE};
+        let is_below_guard = faulting_addr >= HEAP_GUARD_BELOW_VA
+                          && faulting_addr <  HEAP_GUARD_BELOW_VA + 0x1000;
+        let is_above_guard = faulting_addr >= HEAP_GUARD_ABOVE_VA
+                          && faulting_addr <  HEAP_GUARD_ABOVE_VA + 0x1000;
+        if is_below_guard || is_above_guard {
+            // Do not hold any lock — panic is unrecoverable.
+            panic!(
+                "[KERNEL HEAP GUARD] overflow at {:#x} (heap range: {:#x}..{:#x})",
+                faulting_addr,
+                HEAP_START as u64,
+                (HEAP_START + HEAP_SIZE) as u64,
+            );
+        }
+    }
+
     let pid = crate::proc::recover_current_pid();
 
     // Look up the faulting address in the process's VmSpace.

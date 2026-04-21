@@ -21,7 +21,9 @@ pub fn init(boot_info: &BootInfo) {
     vmm::init();
     crate::serial_println!("[MM] VMM done, starting heap init...");
     heap::init();
-    crate::serial_println!("[MM] Heap done, starting refcount init...");
+    crate::serial_println!("[MM] Heap done, installing heap guard pages...");
+    heap::init_guard_pages();
+    crate::serial_println!("[MM] Heap guard pages installed, starting refcount init...");
     refcount::init();
     crate::serial_println!("[MM] Memory management subsystem initialized");
 }
