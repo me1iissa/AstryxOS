@@ -552,6 +552,30 @@ impl BlockDevice for VirtioBlkBlockDevice {
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
+/// Quiesce the virtio-blk device on shutdown.
+///
+/// Writes 0 to the VIRTIO_DEVICE_STATUS register to reset the device,
+/// which tells the hypervisor that this driver is done.  The virtio spec
+/// (§4.1.4.1) says writing 0 performs a device reset, and is the correct
+/// way to cleanly hand back the device on teardown.
+pub fn stop() {
+    crate::serial_println!("[VIRTIO-BLK] stop: resetting device");
+    if !VIRTIO_BLK_AVAILABLE.load(Ordering::Acquire) {
+        crate::serial_println!("[VIRTIO-BLK] stop: not initialized, skipping");
+        return;
+    }
+    let guard = VIRTIO_BLK.lock();
+    if let Some(ref dev) = *guard {
+        // SAFETY: Writing device-status 0 is the spec-defined reset path for
+        // a legacy virtio device; this is safe to do at any time per §4.1.4.1.
+        unsafe {
+            crate::hal::outb(dev.io_base + VIRTIO_REG_DEVICE_STATUS, 0);
+        }
+    }
+    VIRTIO_BLK_AVAILABLE.store(false, Ordering::Release);
+    crate::serial_println!("[VIRTIO-BLK] stop: done");
+}
+
 /// Check if a virtio-blk device is available.
 pub fn is_available() -> bool {
     VIRTIO_BLK_AVAILABLE.load(Ordering::Acquire)

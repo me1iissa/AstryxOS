@@ -375,6 +375,29 @@ pub fn read_sectors(drive: u8, lba: u32, count: u8, buf: &mut [u8]) -> Result<()
     dev.read_sectors(lba as u64, count as u32, buf).map_err(|_| "ATA read error")
 }
 
+/// Quiesce the ATA PIO controller on shutdown.
+///
+/// Waits until no drive is reporting BSY on either the primary or secondary
+/// bus, then clears the device list so stale handles cannot issue I/O after
+/// we return.  The bounded retry prevents a hung drive from blocking shutdown.
+pub fn stop() {
+    crate::serial_println!("[ATA] stop: quiescing drives");
+    // Drain BSY on primary and secondary buses.
+    for &base in &[0x1F0u16, 0x170u16] {
+        let mut n = 0u32;
+        // SAFETY: Reading the ATA status port; bounded to prevent hang.
+        unsafe {
+            while crate::hal::inb(base + ATA_REG_STATUS_CMD) & ATA_SR_BSY != 0 {
+                n += 1;
+                if n >= 500_000 { break; }
+                core::hint::spin_loop();
+            }
+        }
+    }
+    ATA_DEVICES.lock().clear();
+    crate::serial_println!("[ATA] stop: done");
+}
+
 /// Write sectors to ATA drive `drive` (0-based index) using cached devices.
 pub fn write_sectors(drive: u8, lba: u32, count: u8, data: &[u8]) -> Result<(), &'static str> {
     let devices = ATA_DEVICES.lock();
