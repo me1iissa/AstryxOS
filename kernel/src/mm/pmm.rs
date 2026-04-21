@@ -89,38 +89,76 @@ pub fn init(boot_info: &BootInfo) {
     );
 }
 
+/// Inner bitmap search for a single free page.
+/// Caller must hold PMM_LOCK.
+///
+/// # Safety
+/// Caller must hold PMM_LOCK.  The bitmap is accessed without bounds checking
+/// on the page index, but `byte_idx * 8 + bit` is always < MAX_PAGES because
+/// `byte_idx < BITMAP_SIZE` and `bit < 8`.
+unsafe fn alloc_page_locked() -> Option<u64> {
+    let start_byte = NEXT_FIT_BYTE.load(Ordering::Relaxed) as usize;
+
+    // Two-pass search: start from cursor, wrap around if needed.
+    for pass in 0..2 {
+        let begin = if pass == 0 { start_byte } else { 0 };
+        let end   = if pass == 0 { BITMAP_SIZE } else { start_byte };
+        for byte_idx in begin..end {
+            if BITMAP[byte_idx] != 0xFF {
+                for bit in 0..8u64 {
+                    if BITMAP[byte_idx] & (1 << bit) == 0 {
+                        let page = byte_idx * 8 + bit as usize;
+                        mark_page_used(page);
+                        USED_PAGES.fetch_add(1, Ordering::Relaxed);
+                        // Advance cursor past this byte for next call.
+                        let next = (byte_idx + 1) % BITMAP_SIZE;
+                        NEXT_FIT_BYTE.store(next as u64, Ordering::Relaxed);
+                        return Some((page * PAGE_SIZE) as u64);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Allocate a single physical page frame.
 /// Returns the physical address, or None if out of memory.
 ///
 /// Uses a next-fit cursor so repeated allocations don't scan from address 0
 /// each time.  This is critical for performance when the low physical frames
 /// are permanently occupied (kernel, page cache).
+///
+/// On first failure the OOM killer is invoked and the allocation is retried
+/// once after giving the scheduler a brief window to reap the killed process.
+/// If the retry also fails, None is returned (or the caller may panic — that
+/// is preserved from whatever the caller was already doing).
 pub fn alloc_page() -> Option<u64> {
-    let _lock = PMM_LOCK.lock();
-    let start_byte = NEXT_FIT_BYTE.load(Ordering::Relaxed) as usize;
-
-    // SAFETY: We hold the PMM lock. Searching bitmap for free page.
-    unsafe {
-        // Two-pass search: start from cursor, wrap around if needed.
-        for pass in 0..2 {
-            let begin = if pass == 0 { start_byte } else { 0 };
-            let end   = if pass == 0 { BITMAP_SIZE } else { start_byte };
-            for byte_idx in begin..end {
-                if BITMAP[byte_idx] != 0xFF {
-                    for bit in 0..8u64 {
-                        if BITMAP[byte_idx] & (1 << bit) == 0 {
-                            let page = byte_idx * 8 + bit as usize;
-                            mark_page_used(page);
-                            USED_PAGES.fetch_add(1, Ordering::Relaxed);
-                            // Advance cursor past this byte for next call.
-                            let next = (byte_idx + 1) % BITMAP_SIZE;
-                            NEXT_FIT_BYTE.store(next as u64, Ordering::Relaxed);
-                            return Some((page * PAGE_SIZE) as u64);
-                        }
-                    }
-                }
-            }
+    // Fast path: try the normal allocation first.
+    {
+        let _lock = PMM_LOCK.lock();
+        // SAFETY: We hold the PMM lock.
+        if let Some(addr) = unsafe { alloc_page_locked() } {
+            return Some(addr);
         }
+    } // release lock before calling OOM killer
+
+    // Slow path: bitmap is full.  Invoke the OOM killer, yield briefly so the
+    // scheduler can run SIGKILL handling, then retry once.
+    if crate::mm::oom::invoke_oom_killer(1).is_some() {
+        // Spin a moment to let the killed process's exit path run.  We cannot
+        // call schedule() here because alloc_page() may be called from paths
+        // that hold other locks.  A short spin is acceptable: SIGKILL takes
+        // effect on the next scheduler tick, which fires within ~10 ms.
+        for _ in 0..100_000u32 {
+            core::hint::spin_loop();
+        }
+
+        // Retry once after the OOM event.
+        let _lock = PMM_LOCK.lock();
+        // SAFETY: We hold the PMM lock.
+        return unsafe { alloc_page_locked() };
     }
 
     None
