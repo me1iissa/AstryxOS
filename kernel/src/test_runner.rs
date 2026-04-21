@@ -482,6 +482,26 @@ pub fn run() -> ! {
     total += 1;
     if test_inotify() { passed += 1; }
 
+    // ── Test 74b: inotify — IN_CREATE event delivery ─────────────────────────
+
+    total += 1;
+    if test_inotify_create_event() { passed += 1; }
+
+    // ── Test 74c: inotify — IN_MODIFY event delivery ─────────────────────────
+
+    total += 1;
+    if test_inotify_modify_event() { passed += 1; }
+
+    // ── Test 74d: inotify — IN_DELETE event delivery ─────────────────────────
+
+    total += 1;
+    if test_inotify_delete_event() { passed += 1; }
+
+    // ── Test 74e: inotify — IN_Q_OVERFLOW when queue is full ─────────────────
+
+    total += 1;
+    if test_inotify_overflow() { passed += 1; }
+
     // ── Test 75: X11 extension handlers (SHM, XFIXES, DAMAGE, XI2) ───────────
 
     total += 1;
@@ -10340,50 +10360,355 @@ fn test_signalfd() -> bool {
 fn test_inotify() -> bool {
     test_header!("inotify — create / add_watch / rm_watch / poll");
 
-    // 1. Create an inotify fd.
+    // 1. Create an inotify instance.
     let id = crate::ipc::inotify::create();
     if id == u64::MAX {
         test_fail!("inotify", "create() returned MAX (no free slots)");
         return false;
     }
-    test_println!("  inotify slot {} allocated ✓", id);
+    test_println!("  inotify slot {} allocated", id);
 
-    // 2. Add a watch for a path.
+    // 2. Add a watch for /etc with a broad mask.
     let wd = crate::ipc::inotify::add_watch(id, "/etc", 0xFFF);
     if wd < 0 {
         test_fail!("inotify", "add_watch returned {}", wd);
         return false;
     }
-    test_println!("  add_watch('/etc') → wd={} ✓", wd);
+    test_println!("  add_watch('/etc') => wd={}", wd);
 
-    // 3. Stub always returns EAGAIN on read.
+    // 3. No events yet — is_readable must be false.
     if crate::ipc::inotify::is_readable(id) {
-        test_fail!("inotify", "stub is_readable returned true");
+        test_fail!("inotify", "is_readable returned true before any event");
         return false;
     }
-    test_println!("  is_readable (stub) = false ✓");
+    test_println!("  is_readable=false before events");
 
-    // 4. Remove the watch.
-    let r = crate::ipc::inotify::rm_watch(id, wd);
-    if !r {
+    // 4. Duplicate add_watch must return same wd and merge mask.
+    let wd_dup = crate::ipc::inotify::add_watch(id, "/etc", 0x001);
+    if wd_dup != wd {
+        test_fail!("inotify", "duplicate add_watch returned different wd {} vs {}", wd_dup, wd);
+        return false;
+    }
+    test_println!("  duplicate add_watch('/etc') => same wd={} (mask merged)", wd_dup);
+
+    // 5. Remove the watch.
+    if !crate::ipc::inotify::rm_watch(id, wd) {
         test_fail!("inotify", "rm_watch returned false");
         return false;
     }
-    test_println!("  rm_watch(wd={}) ✓", wd);
+    test_println!("  rm_watch(wd={}) ok", wd);
 
-    // 5. Add another watch (distinct wd).
+    // 6. Add a second watch — wd must be strictly greater than first.
     let wd2 = crate::ipc::inotify::add_watch(id, "/tmp", 0x1);
     if wd2 <= wd {
         test_fail!("inotify", "second wd {} not > first {}", wd2, wd);
         return false;
     }
-    test_println!("  second add_watch('/tmp') → wd={} (increments) ✓", wd2);
+    test_println!("  second add_watch('/tmp') => wd={} (increments)", wd2);
 
-    // 6. Close.
+    // 7. Close.
     crate::ipc::inotify::close(id);
-    test_println!("  inotify closed ✓");
+    test_println!("  inotify closed");
 
     test_pass!("inotify — create / add_watch / rm_watch / poll");
+    true
+}
+
+// ── Test 74b: inotify — IN_CREATE event delivery ────────────────────────────
+
+fn test_inotify_create_event() -> bool {
+    test_header!("inotify — IN_CREATE event on file creation");
+    use crate::ipc::inotify;
+
+    // Ensure /tmp exists.
+    let _ = crate::vfs::mkdir("/tmp");
+
+    // Create an inotify instance and watch /tmp.
+    let id = inotify::create();
+    if id == u64::MAX {
+        test_fail!("inotify_create_event", "create() failed");
+        return false;
+    }
+    let wd = inotify::add_watch(id, "/tmp", inotify::IN_CREATE);
+    if wd < 0 {
+        test_fail!("inotify_create_event", "add_watch failed: {}", wd);
+        inotify::close(id);
+        return false;
+    }
+    test_println!("  watching /tmp with wd={}", wd);
+
+    // Create a new file under /tmp — this should fire IN_CREATE.
+    let _ = crate::vfs::remove("/tmp/inotify_test_create.txt");
+    if let Err(e) = crate::vfs::create_file("/tmp/inotify_test_create.txt") {
+        test_fail!("inotify_create_event", "create_file failed: {:?}", e);
+        inotify::close(id);
+        return false;
+    }
+    test_println!("  created /tmp/inotify_test_create.txt");
+
+    // is_readable must now be true.
+    if !inotify::is_readable(id) {
+        test_fail!("inotify_create_event", "is_readable=false after create");
+        let _ = crate::vfs::remove("/tmp/inotify_test_create.txt");
+        inotify::close(id);
+        return false;
+    }
+
+    // Read the event into a stack buffer (inotify_event = 16 bytes + name).
+    let mut buf = [0u8; 512];
+    match inotify::read(id, buf.as_mut_ptr(), buf.len()) {
+        Ok(n) if n >= 16 => {
+            // Decode wd, mask from the first event.
+            let ev_wd   = i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            let ev_mask = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            test_println!("  read {} bytes: wd={} mask={:#x}", n, ev_wd, ev_mask);
+            if ev_wd != wd {
+                test_fail!("inotify_create_event", "event wd={} expected {}", ev_wd, wd);
+                let _ = crate::vfs::remove("/tmp/inotify_test_create.txt");
+                inotify::close(id);
+                return false;
+            }
+            if ev_mask & inotify::IN_CREATE == 0 {
+                test_fail!("inotify_create_event", "mask {:#x} missing IN_CREATE", ev_mask);
+                let _ = crate::vfs::remove("/tmp/inotify_test_create.txt");
+                inotify::close(id);
+                return false;
+            }
+            // Check that the filename is present in the event.
+            let name_len = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]) as usize;
+            if name_len > 0 {
+                let name_bytes = &buf[16..16 + name_len];
+                let name = core::str::from_utf8(name_bytes).unwrap_or("?");
+                let name = name.trim_end_matches('\0');
+                test_println!("  event filename: '{}'", name);
+                if !name.contains("inotify_test_create") {
+                    test_fail!("inotify_create_event", "unexpected filename '{}'", name);
+                    let _ = crate::vfs::remove("/tmp/inotify_test_create.txt");
+                    inotify::close(id);
+                    return false;
+                }
+            }
+        }
+        Ok(n) => {
+            test_fail!("inotify_create_event", "read returned only {} bytes (< 16)", n);
+            let _ = crate::vfs::remove("/tmp/inotify_test_create.txt");
+            inotify::close(id);
+            return false;
+        }
+        Err(e) => {
+            test_fail!("inotify_create_event", "read returned err {}", e);
+            let _ = crate::vfs::remove("/tmp/inotify_test_create.txt");
+            inotify::close(id);
+            return false;
+        }
+    }
+
+    let _ = crate::vfs::remove("/tmp/inotify_test_create.txt");
+    inotify::close(id);
+    test_pass!("inotify — IN_CREATE event on file creation");
+    true
+}
+
+// ── Test 74c: inotify — IN_MODIFY event delivery ────────────────────────────
+
+fn test_inotify_modify_event() -> bool {
+    test_header!("inotify — IN_MODIFY event on file write");
+    use crate::ipc::inotify;
+
+    let _ = crate::vfs::mkdir("/tmp");
+    // Create the file first so we can watch it and write to it.
+    let _ = crate::vfs::remove("/tmp/inotify_test_mod.txt");
+    if let Err(e) = crate::vfs::create_file("/tmp/inotify_test_mod.txt") {
+        test_fail!("inotify_modify_event", "create_file: {:?}", e);
+        return false;
+    }
+
+    let id = inotify::create();
+    if id == u64::MAX {
+        test_fail!("inotify_modify_event", "create() failed");
+        let _ = crate::vfs::remove("/tmp/inotify_test_mod.txt");
+        return false;
+    }
+
+    // Watch the file directly (self-watch) for IN_MODIFY.
+    let wd = inotify::add_watch(id, "/tmp/inotify_test_mod.txt", inotify::IN_MODIFY);
+    if wd < 0 {
+        test_fail!("inotify_modify_event", "add_watch on file failed: {}", wd);
+        let _ = crate::vfs::remove("/tmp/inotify_test_mod.txt");
+        inotify::close(id);
+        return false;
+    }
+    // Also watch the directory for IN_MODIFY.
+    let wd_dir = inotify::add_watch(id, "/tmp", inotify::IN_MODIFY);
+    test_println!("  watching /tmp/inotify_test_mod.txt wd={}, /tmp wd={}", wd, wd_dir);
+
+    // Write to the file via vfs::write_file.
+    if let Err(e) = crate::vfs::write_file("/tmp/inotify_test_mod.txt", b"hello inotify") {
+        test_fail!("inotify_modify_event", "write_file: {:?}", e);
+        let _ = crate::vfs::remove("/tmp/inotify_test_mod.txt");
+        inotify::close(id);
+        return false;
+    }
+    test_println!("  wrote to /tmp/inotify_test_mod.txt");
+
+    if !inotify::is_readable(id) {
+        test_fail!("inotify_modify_event", "is_readable=false after write");
+        let _ = crate::vfs::remove("/tmp/inotify_test_mod.txt");
+        inotify::close(id);
+        return false;
+    }
+
+    // Read events and confirm IN_MODIFY appeared.
+    let mut buf = [0u8; 1024];
+    let mut got_modify = false;
+    match inotify::read(id, buf.as_mut_ptr(), buf.len()) {
+        Ok(n) if n >= 16 => {
+            let mut off = 0usize;
+            while off + 16 <= n {
+                let ev_mask = u32::from_le_bytes([buf[off+4], buf[off+5], buf[off+6], buf[off+7]]);
+                let ev_len  = u32::from_le_bytes([buf[off+12], buf[off+13], buf[off+14], buf[off+15]]) as usize;
+                test_println!("  event off={} mask={:#x}", off, ev_mask);
+                if ev_mask & inotify::IN_MODIFY != 0 { got_modify = true; }
+                off += 16 + ev_len;
+            }
+        }
+        Ok(n)  => { test_fail!("inotify_modify_event", "read {} bytes < 16", n); }
+        Err(e) => { test_fail!("inotify_modify_event", "read err {}", e); }
+    }
+
+    let _ = crate::vfs::remove("/tmp/inotify_test_mod.txt");
+    inotify::close(id);
+
+    if !got_modify {
+        test_fail!("inotify_modify_event", "no IN_MODIFY event received");
+        return false;
+    }
+    test_pass!("inotify — IN_MODIFY event on file write");
+    true
+}
+
+// ── Test 74d: inotify — IN_DELETE event delivery ────────────────────────────
+
+fn test_inotify_delete_event() -> bool {
+    test_header!("inotify — IN_DELETE event on file removal");
+    use crate::ipc::inotify;
+
+    let _ = crate::vfs::mkdir("/tmp");
+    let _ = crate::vfs::remove("/tmp/inotify_test_del.txt");
+    if let Err(e) = crate::vfs::create_file("/tmp/inotify_test_del.txt") {
+        test_fail!("inotify_delete_event", "create_file: {:?}", e);
+        return false;
+    }
+
+    let id = inotify::create();
+    if id == u64::MAX {
+        test_fail!("inotify_delete_event", "create() failed");
+        let _ = crate::vfs::remove("/tmp/inotify_test_del.txt");
+        return false;
+    }
+    let wd = inotify::add_watch(id, "/tmp", inotify::IN_DELETE);
+    test_println!("  watching /tmp for IN_DELETE wd={}", wd);
+
+    // Remove the file — should fire IN_DELETE.
+    if let Err(e) = crate::vfs::remove("/tmp/inotify_test_del.txt") {
+        test_fail!("inotify_delete_event", "remove: {:?}", e);
+        inotify::close(id);
+        return false;
+    }
+    test_println!("  removed /tmp/inotify_test_del.txt");
+
+    if !inotify::is_readable(id) {
+        test_fail!("inotify_delete_event", "is_readable=false after remove");
+        inotify::close(id);
+        return false;
+    }
+
+    let mut buf = [0u8; 512];
+    let mut got_delete = false;
+    match inotify::read(id, buf.as_mut_ptr(), buf.len()) {
+        Ok(n) if n >= 16 => {
+            let ev_mask = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            test_println!("  event mask={:#x}", ev_mask);
+            if ev_mask & inotify::IN_DELETE != 0 { got_delete = true; }
+        }
+        Ok(n)  => { test_fail!("inotify_delete_event", "read {} bytes < 16", n); }
+        Err(e) => { test_fail!("inotify_delete_event", "read err {}", e); }
+    }
+
+    inotify::close(id);
+    if !got_delete {
+        test_fail!("inotify_delete_event", "no IN_DELETE event received");
+        return false;
+    }
+    test_pass!("inotify — IN_DELETE event on file removal");
+    true
+}
+
+// ── Test 74e: inotify — IN_Q_OVERFLOW when queue is full ────────────────────
+
+fn test_inotify_overflow() -> bool {
+    test_header!("inotify — IN_Q_OVERFLOW when queue exceeds cap");
+    use crate::ipc::inotify;
+
+    let _ = crate::vfs::mkdir("/tmp");
+
+    let id = inotify::create();
+    if id == u64::MAX {
+        test_fail!("inotify_overflow", "create() failed");
+        return false;
+    }
+    let wd = inotify::add_watch(id, "/tmp", inotify::IN_CREATE);
+    test_println!("  watching /tmp wd={}", wd);
+
+    // Inject MAX_EVENTS+1 synthetic events directly to force overflow.
+    // We use notify_event via the public API, injecting 16385 create events.
+    // Since the cap is 16384, the 16385th push should emit IN_Q_OVERFLOW instead.
+    //
+    // To avoid slow filesystem ops, inject events directly via notify_event().
+    for i in 0..16385u32 {
+        let name = if i % 2 == 0 { "a" } else { "b" };
+        inotify::notify_event("/tmp", name, inotify::IN_CREATE, 0);
+    }
+    test_println!("  injected 16385 events");
+
+    // is_readable must be true.
+    if !inotify::is_readable(id) {
+        test_fail!("inotify_overflow", "is_readable=false after overflow injection");
+        inotify::close(id);
+        return false;
+    }
+
+    // Drain all events and look for IN_Q_OVERFLOW (wd = -1).
+    let mut found_overflow = false;
+    let mut total_drained = 0usize;
+    let mut buf = [0u8; 4096];
+    loop {
+        match inotify::read(id, buf.as_mut_ptr(), buf.len()) {
+            Ok(n) if n >= 16 => {
+                let mut off = 0usize;
+                while off + 16 <= n {
+                    let ev_wd   = i32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]]);
+                    let ev_mask = u32::from_le_bytes([buf[off+4], buf[off+5], buf[off+6], buf[off+7]]);
+                    let ev_len  = u32::from_le_bytes([buf[off+12], buf[off+13], buf[off+14], buf[off+15]]) as usize;
+                    if ev_wd == -1 && ev_mask & inotify::IN_Q_OVERFLOW != 0 {
+                        found_overflow = true;
+                        test_println!("  IN_Q_OVERFLOW found at drain offset {}", total_drained);
+                    }
+                    total_drained += 1;
+                    off += 16 + ev_len;
+                }
+            }
+            _ => break,
+        }
+    }
+    test_println!("  drained {} events total", total_drained);
+
+    inotify::close(id);
+    if !found_overflow {
+        test_fail!("inotify_overflow", "IN_Q_OVERFLOW not found after filling queue");
+        return false;
+    }
+    test_pass!("inotify — IN_Q_OVERFLOW when queue exceeds cap");
     true
 }
 

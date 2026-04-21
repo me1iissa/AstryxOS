@@ -2342,7 +2342,7 @@ fn poll_revents(pid: u64, fd: usize, events: u16) -> u16 {
     } else if is_signalfd_fd(pid, fd) {
         if crate::ipc::signalfd::is_readable(get_signalfd_id(pid, fd)) { events & POLLIN } else { 0 }
     } else if is_inotify_fd(pid, fd) {
-        0
+        if crate::ipc::inotify::is_readable(get_inotify_id(pid, fd)) { events & POLLIN } else { 0 }
     } else {
         events & (POLLIN | POLLOUT) // regular file always ready
     }
@@ -4687,7 +4687,7 @@ fn sys_select_linux(
         } else if is_signalfd_fd(pid, fd) {
             crate::ipc::signalfd::is_readable(get_signalfd_id(pid, fd))
         } else if is_inotify_fd(pid, fd) {
-            false
+            crate::ipc::inotify::is_readable(get_inotify_id(pid, fd))
         } else {
             true // regular file: always ready
         };
@@ -4911,7 +4911,11 @@ fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
             Err(e) => e,
         };
     } else if is_inotify_fd(pid, fd as usize) {
-        return -11; // EAGAIN — no events
+        let inotify_id = get_inotify_id(pid, fd as usize);
+        return match crate::ipc::inotify::read(inotify_id, buf_ptr, count) {
+            Ok(n) => n as i64,
+            Err(e) => e,
+        };
     }
 
     // ── VFS file descriptors (covers ALL fds including 0/1/2) ──────────────
