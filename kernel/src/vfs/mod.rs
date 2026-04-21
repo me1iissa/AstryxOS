@@ -990,19 +990,43 @@ fn resolve_parent(path: &str) -> VfsResult<(usize, u64, String)> {
     Ok((mount_idx, parent_inode, String::from(name)))
 }
 
+/// Split an absolute path into (parent_dir, filename).
+/// Returns ("/", path) for top-level entries.
+fn split_parent_name(path: &str) -> (&str, &str) {
+    let path = path.trim_end_matches('/');
+    match path.rfind('/') {
+        Some(0) | None => ("/", &path[path.rfind('/').map(|i| i + 1).unwrap_or(0)..]),
+        Some(pos) => (&path[..pos], &path[pos + 1..]),
+    }
+}
+
 /// Create a file at the given absolute path.
 pub fn create_file(path: &str) -> VfsResult<()> {
     let (mount_idx, parent_inode, name) = resolve_parent(path)?;
-    let mounts = MOUNTS.lock();
-    mounts[mount_idx].fs.create_file(parent_inode, &name)?;
+    {
+        let mounts = MOUNTS.lock();
+        mounts[mount_idx].fs.create_file(parent_inode, &name)?;
+    }
+    // Fire IN_CREATE on the parent directory.
+    let (parent_dir, filename) = split_parent_name(path);
+    crate::ipc::inotify::notify_event(parent_dir, filename, crate::ipc::inotify::IN_CREATE, 0);
     Ok(())
 }
 
 /// Create a directory.
 pub fn mkdir(path: &str) -> VfsResult<()> {
     let (mount_idx, parent_inode, name) = resolve_parent(path)?;
-    let mounts = MOUNTS.lock();
-    mounts[mount_idx].fs.create_dir(parent_inode, &name)?;
+    {
+        let mounts = MOUNTS.lock();
+        mounts[mount_idx].fs.create_dir(parent_inode, &name)?;
+    }
+    // Fire IN_CREATE|IN_ISDIR on the parent directory.
+    let (parent_dir, filename) = split_parent_name(path);
+    crate::ipc::inotify::notify_event(
+        parent_dir, filename,
+        crate::ipc::inotify::IN_CREATE | crate::ipc::inotify::IN_ISDIR,
+        0,
+    );
     Ok(())
 }
 
@@ -1037,6 +1061,9 @@ pub fn remove(path: &str) -> VfsResult<()> {
         let mounts = MOUNTS.lock();
         mounts[mount_idx].fs.remove(parent_inode, &name)?;
     }
+    // Fire IN_DELETE on the parent directory.
+    let (parent_dir, filename) = split_parent_name(path);
+    crate::ipc::inotify::notify_event(parent_dir, filename, crate::ipc::inotify::IN_DELETE, 0);
     Ok(())
 }
 
@@ -1129,8 +1156,19 @@ pub fn rename(old_path: &str, new_path: &str) -> VfsResult<()> {
     if old_mount != new_mount {
         return Err(VfsError::Unsupported); // cross-mount rename not supported
     }
-    let mounts = MOUNTS.lock();
-    mounts[old_mount].fs.rename(old_parent, &old_name, new_parent, &new_name)
+    {
+        let mounts = MOUNTS.lock();
+        mounts[old_mount].fs.rename(old_parent, &old_name, new_parent, &new_name)?;
+    }
+    // Fire IN_MOVED_FROM / IN_MOVED_TO with a shared non-zero cookie.
+    // Use a simple increment from the tick counter as the cookie.
+    let cookie = (crate::arch::x86_64::irq::TICK_COUNT
+        .load(core::sync::atomic::Ordering::Relaxed) & 0xFFFF_FFFF) as u32;
+    let (old_dir, old_fn) = split_parent_name(old_path);
+    let (new_dir, new_fn) = split_parent_name(new_path);
+    crate::ipc::inotify::notify_event(old_dir, old_fn, crate::ipc::inotify::IN_MOVED_FROM, cookie);
+    crate::ipc::inotify::notify_event(new_dir, new_fn, crate::ipc::inotify::IN_MOVED_TO, cookie);
+    Ok(())
 }
 
 /// Create a symbolic link at `link_path` pointing to `target`.
@@ -1217,14 +1255,14 @@ pub fn open(pid: crate::proc::Pid, path: &str, open_flags: u32) -> VfsResult<usi
     // Try to resolve the (possibly redirected) path.
     let resolved = resolve_path(lookup_path);
 
-    let (mount_idx, inode) = match resolved {
-        Ok((m, i)) => (m, i),
+    let (mount_idx, inode, newly_created) = match resolved {
+        Ok((m, i)) => (m, i, false),
         Err(VfsError::NotFound) if open_flags & flags::O_CREAT != 0 => {
             // Create the file using the (possibly redirected) lookup path.
             let (m, parent, name) = resolve_parent(lookup_path)?;
             let mounts = MOUNTS.lock();
             let ino = mounts[m].fs.create_file(parent, &name)?;
-            (m, ino)
+            (m, ino, true)
         }
         Err(e) => return Err(e),
     };
@@ -1251,27 +1289,44 @@ pub fn open(pid: crate::proc::Pid, path: &str, open_flags: u32) -> VfsResult<usi
     };
 
     // Add to process's fd table.
-    let mut procs = crate::proc::PROCESS_TABLE.lock();
-    let proc = procs.iter_mut().find(|p| p.pid == pid).ok_or(VfsError::InvalidArg)?;
+    let fd_idx = {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        let proc = procs.iter_mut().find(|p| p.pid == pid).ok_or(VfsError::InvalidArg)?;
 
-    // Find first free fd slot (skip 0,1,2 which are console).
-    for i in 0..proc.file_descriptors.len() {
-        if proc.file_descriptors[i].is_none() {
+        // Find first free fd slot by index, then insert after the loop to avoid
+        // move-in-loop borrow issues.
+        let free_idx = proc.file_descriptors.iter().position(|f| f.is_none());
+        if let Some(i) = free_idx {
             proc.file_descriptors[i] = Some(fd);
-            return Ok(i);
+            i
+        } else {
+            // Grow the fd table, capped at min(RLIMIT_NOFILE soft, MAX_FDS_PER_PROCESS).
+            let nofile_limit = proc.rlimits_soft[7]
+                .min(MAX_FDS_PER_PROCESS as u64) as usize;
+            if proc.file_descriptors.len() < nofile_limit {
+                let idx = proc.file_descriptors.len();
+                proc.file_descriptors.push(Some(fd));
+                idx
+            } else {
+                return Err(VfsError::TooManyOpenFiles);
+            }
         }
+    };
+
+    // Fire inotify events now that locks are released.
+    // O_CREAT on a new file: fire IN_CREATE then IN_OPEN.
+    // Existing file open: fire IN_OPEN only.
+    let (parent_dir, filename) = split_parent_name(path);
+    if file_stat.file_type == FileType::RegularFile || file_stat.file_type == FileType::Directory {
+        if newly_created {
+            crate::ipc::inotify::notify_event(
+                parent_dir, filename, crate::ipc::inotify::IN_CREATE, 0);
+        }
+        crate::ipc::inotify::notify_event(
+            parent_dir, filename, crate::ipc::inotify::IN_OPEN, 0);
     }
 
-    // Grow the fd table, capped at min(RLIMIT_NOFILE soft, MAX_FDS_PER_PROCESS).
-    let nofile_limit = proc.rlimits_soft[7]
-        .min(MAX_FDS_PER_PROCESS as u64) as usize;
-    if proc.file_descriptors.len() < nofile_limit {
-        let idx = proc.file_descriptors.len();
-        proc.file_descriptors.push(Some(fd));
-        return Ok(idx);
-    }
-
-    Err(VfsError::TooManyOpenFiles)
+    Ok(fd_idx)
 }
 
 /// Close a file descriptor.
@@ -1285,10 +1340,12 @@ pub fn close(pid: crate::proc::Pid, fd_num: usize) -> VfsResult<()> {
         if fd_num >= proc.file_descriptors.len() { return Err(VfsError::BadFd); }
         let fd_opt = &mut proc.file_descriptors[fd_num];
         if fd_opt.is_none() { return Err(VfsError::BadFd); }
-        fd_opt.take().map(|fd| (fd.mount_idx, fd.inode, fd.is_console, fd.file_type))
+        fd_opt.take().map(|fd| {
+            (fd.mount_idx, fd.inode, fd.is_console, fd.file_type, fd.flags, fd.open_path.clone())
+        })
     };
 
-    if let Some((mount_idx, inode, is_console, file_type)) = closed {
+    if let Some((mount_idx, inode, is_console, file_type, open_flags, open_path)) = closed {
         // Release POSIX locks held by this pid on the closed inode (C1).
         if !is_console && mount_idx != usize::MAX {
             FILE_LOCKS.lock().retain(|l| !(l.mount_idx == mount_idx && l.inode == inode && l.pid == pid));
@@ -1318,6 +1375,18 @@ pub fn close(pid: crate::proc::Pid, fd_num: usize) -> VfsResult<()> {
                     let _ = mounts[mount_idx].fs.remove_inode(inode);
                 }
             }
+        }
+
+        // Fire inotify IN_CLOSE_WRITE or IN_CLOSE_NOWRITE for regular files.
+        if !is_console && file_type == FileType::RegularFile && mount_idx != usize::MAX {
+            let writable = open_flags & (flags::O_WRONLY | flags::O_RDWR) != 0;
+            let close_mask = if writable {
+                crate::ipc::inotify::IN_CLOSE_WRITE
+            } else {
+                crate::ipc::inotify::IN_CLOSE_NOWRITE
+            };
+            let (parent_dir, filename) = split_parent_name(&open_path);
+            crate::ipc::inotify::notify_event(parent_dir, filename, close_mask, 0);
         }
     }
 
@@ -1356,7 +1425,10 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
             }
         }
         FileType::InotifyFd => {
-            Err(VfsError::WouldBlock) // never any events
+            match crate::ipc::inotify::read(inode, buf, count) {
+                Ok(n) => Ok(n),
+                Err(e) => Err(if e == -11 { VfsError::WouldBlock } else if e == -22 { VfsError::InvalidArg } else { VfsError::BadFd }),
+            }
         }
         FileType::PtyMaster => {
             let pty_n = inode as u8;
@@ -1535,14 +1607,16 @@ fn generate_proc_stat(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
 
 /// Write to a file descriptor.
 pub fn fd_write(pid: crate::proc::Pid, fd_num: usize, buf: *const u8, count: usize) -> VfsResult<usize> {
-    let (mount_idx, inode, offset, append, flags, file_type) = {
+    let (mount_idx, inode, offset, append, fd_flags, file_type, open_path) = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         let proc = procs.iter().find(|p| p.pid == pid).ok_or(VfsError::InvalidArg)?;
         let fd = proc.file_descriptors.get(fd_num)
             .and_then(|f| f.as_ref())
             .ok_or(VfsError::BadFd)?;
         if fd.is_console { return Err(VfsError::Unsupported); }
-        (fd.mount_idx, fd.inode, fd.offset, fd.flags & flags::O_APPEND != 0, fd.flags, fd.file_type)
+        (fd.mount_idx, fd.inode, fd.offset,
+         fd.flags & flags::O_APPEND != 0, fd.flags, fd.file_type,
+         fd.open_path.clone())
     };
 
     // PTY write paths
@@ -1558,7 +1632,7 @@ pub fn fd_write(pid: crate::proc::Pid, fd_num: usize, buf: *const u8, count: usi
     }
 
     // Special character devices: accept writes silently.
-    if flags & (0x0400_0000 | 0x0200_0000 | 0x0100_0000) != 0 {
+    if fd_flags & (0x0400_0000 | 0x0200_0000 | 0x0100_0000) != 0 {
         return Ok(count); // /dev/null, /dev/zero, /dev/urandom — discard
     }
 
@@ -1574,7 +1648,6 @@ pub fn fd_write(pid: crate::proc::Pid, fd_num: usize, buf: *const u8, count: usi
         mounts[mount_idx].fs.write(inode, write_offset, data)?
     };
 
-
     // Update offset.
     {
         let mut procs = crate::proc::PROCESS_TABLE.lock();
@@ -1582,6 +1655,12 @@ pub fn fd_write(pid: crate::proc::Pid, fd_num: usize, buf: *const u8, count: usi
         if let Some(Some(fd)) = proc.file_descriptors.get_mut(fd_num) {
             fd.offset = write_offset + n as u64;
         }
+    }
+
+    // Fire IN_MODIFY on the parent directory (and self-watches on the file).
+    if file_type == FileType::RegularFile && mount_idx != usize::MAX {
+        let (parent_dir, filename) = split_parent_name(&open_path);
+        crate::ipc::inotify::notify_event(parent_dir, filename, crate::ipc::inotify::IN_MODIFY, 0);
     }
 
     Ok(n)
