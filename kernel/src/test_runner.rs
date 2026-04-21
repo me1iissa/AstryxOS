@@ -723,6 +723,26 @@ pub fn run() -> ! {
     total += 1;
     if test_dev_dsp_ioctl_set_format() { passed += 1; }
 
+    // ── Test 116: mount tmpfs + write/read + umount ────────────────────────
+
+    total += 1;
+    if test_mount_tmpfs() { passed += 1; }
+
+    // ── Test 117: two tmpfs mounts are independent ─────────────────────────
+
+    total += 1;
+    if test_mount_two_tmpfs_are_independent() { passed += 1; }
+
+    // ── Test 118: mount with unknown fstype returns -ENODEV ────────────────
+
+    total += 1;
+    if test_mount_unknown_fstype() { passed += 1; }
+
+    // ── Test 119: umount removes the mount from the table ─────────────────
+
+    total += 1;
+    if test_umount_removes_mount() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -14210,6 +14230,207 @@ fn test_dev_dsp_open_with_ac97_present() -> bool {
 // The ioctl surface must accept AFMT_S16_LE (0x10) and reject anything else
 // with EINVAL.  This test opens /dev/dsp (if AC97 present) or exercises the
 // ioctl dispatch directly via a stub path to verify the format gating logic.
+// ── Test 116: mount tmpfs — create file, write, read, umount ─────────────────
+fn test_mount_tmpfs() -> bool {
+    test_header!("mount: tmpfs lifecycle (mount/write/read/umount)");
+
+    let mount_point = "/mnt/scratch_116";
+
+    // Ensure the mount point directory exists.
+    let _ = crate::vfs::mkdir(mount_point);
+
+    // Mount a fresh tmpfs.
+    let r = crate::syscall::sys_mount_test("tmpfs", mount_point, "tmpfs", 0);
+    if r != 0 {
+        test_fail!("mount_tmpfs", "mount returned {}, expected 0", r);
+        let _ = crate::vfs::remove(mount_point);
+        return false;
+    }
+    test_println!("  mount tmpfs at '{}' -> ok", mount_point);
+
+    // Create a file inside the tmpfs.
+    let file_path = "/mnt/scratch_116/hello.txt";
+    let create_r = crate::vfs::create_file(file_path);
+    if create_r.is_err() {
+        test_fail!("mount_tmpfs", "create_file failed: {:?}", create_r);
+        let _ = crate::syscall::sys_umount_test(mount_point);
+        return false;
+    }
+
+    // Write content via the syscall layer.
+    let content = b"Hi from tmpfs";
+    let fd = crate::syscall::sys_open_test(file_path, 1 /* O_WRONLY */);
+    if fd < 0 {
+        test_fail!("mount_tmpfs", "open for write failed: {}", fd);
+        let _ = crate::syscall::sys_umount_test(mount_point);
+        return false;
+    }
+    let n_written = crate::syscall::sys_write_test(fd as usize, content.as_ptr(), content.len());
+    let _ = crate::syscall::sys_close_test(fd as usize);
+    if n_written != content.len() as i64 {
+        test_fail!("mount_tmpfs", "write returned {}, expected {}", n_written, content.len());
+        let _ = crate::syscall::sys_umount_test(mount_point);
+        return false;
+    }
+    test_println!("  wrote {} bytes to '{}'", n_written, file_path);
+
+    // Read back and verify.
+    let fd2 = crate::syscall::sys_open_test(file_path, 0 /* O_RDONLY */);
+    if fd2 < 0 {
+        test_fail!("mount_tmpfs", "open for read failed: {}", fd2);
+        let _ = crate::syscall::sys_umount_test(mount_point);
+        return false;
+    }
+    let mut rbuf = [0u8; 32];
+    let n_read = crate::syscall::sys_read_test(fd2 as usize, rbuf.as_mut_ptr(), rbuf.len());
+    let _ = crate::syscall::sys_close_test(fd2 as usize);
+    if n_read < 0 || &rbuf[..n_read as usize] != content {
+        test_fail!("mount_tmpfs", "read returned {}, expected {:?}", n_read, content);
+        let _ = crate::syscall::sys_umount_test(mount_point);
+        return false;
+    }
+    test_println!("  read {} bytes, content matches ✓", n_read);
+
+    // Umount and verify the file is gone.
+    let umount_r = crate::syscall::sys_umount_test(mount_point);
+    if umount_r != 0 {
+        test_fail!("mount_tmpfs", "umount returned {}, expected 0", umount_r);
+        return false;
+    }
+    test_println!("  umount '{}' -> ok", mount_point);
+
+    // After umount the file should no longer be accessible.
+    let gone = crate::vfs::stat(file_path).is_err();
+    if !gone {
+        test_fail!("mount_tmpfs", "file still accessible after umount");
+        return false;
+    }
+    test_println!("  file gone after umount ✓");
+
+    test_pass!("mount: tmpfs lifecycle");
+    true
+}
+
+// ── Test 117: two independent tmpfs mounts ────────────────────────────────────
+fn test_mount_two_tmpfs_are_independent() -> bool {
+    test_header!("mount: two tmpfs instances are independent");
+
+    let mp_a = "/mnt/scratch_117a";
+    let mp_b = "/mnt/scratch_117b";
+
+    let _ = crate::vfs::mkdir(mp_a);
+    let _ = crate::vfs::mkdir(mp_b);
+
+    // Mount two separate tmpfs instances.
+    let ra = crate::syscall::sys_mount_test("tmpfs", mp_a, "tmpfs", 0);
+    let rb = crate::syscall::sys_mount_test("tmpfs", mp_b, "tmpfs", 0);
+    if ra != 0 || rb != 0 {
+        test_fail!("mount_independent", "mount failed: ra={} rb={}", ra, rb);
+        let _ = crate::syscall::sys_umount_test(mp_a);
+        let _ = crate::syscall::sys_umount_test(mp_b);
+        return false;
+    }
+
+    // Write different content to the same relative path in each mount.
+    let path_a = "/mnt/scratch_117a/foo";
+    let path_b = "/mnt/scratch_117b/foo";
+
+    let _ = crate::vfs::create_file(path_a);
+    let _ = crate::vfs::create_file(path_b);
+    let _ = crate::vfs::write_file(path_a, b"alpha");
+    let _ = crate::vfs::write_file(path_b, b"beta");
+
+    // Read back and check independence.
+    let data_a = crate::vfs::read_file(path_a).unwrap_or_default();
+    let data_b = crate::vfs::read_file(path_b).unwrap_or_default();
+
+    let ok = data_a == b"alpha" && data_b == b"beta";
+    test_println!("  /mnt/scratch_117a/foo = {:?}", core::str::from_utf8(&data_a).unwrap_or("?"));
+    test_println!("  /mnt/scratch_117b/foo = {:?}", core::str::from_utf8(&data_b).unwrap_or("?"));
+
+    let _ = crate::syscall::sys_umount_test(mp_a);
+    let _ = crate::syscall::sys_umount_test(mp_b);
+
+    if ok {
+        test_pass!("mount: two tmpfs instances are independent");
+    } else {
+        test_fail!("mount_independent", "data_a={:?} data_b={:?}", data_a, data_b);
+    }
+    ok
+}
+
+// ── Test 118: unknown fstype returns -ENODEV ──────────────────────────────────
+fn test_mount_unknown_fstype() -> bool {
+    test_header!("mount: unknown fstype returns -ENODEV");
+
+    // Ensure target exists so we get ENODEV not ENOENT.
+    let _ = crate::vfs::mkdir("/mnt");
+    let r = crate::syscall::sys_mount_test("x", "/mnt", "notafs", 0);
+    test_println!("  mount 'notafs' -> {}", r);
+
+    if r == -19 {
+        test_pass!("mount: unknown fstype returns -ENODEV (-19)");
+        true
+    } else {
+        test_fail!("mount_unknown_fstype", "expected -19 (ENODEV), got {}", r);
+        false
+    }
+}
+
+// ── Test 119: umount removes the mount ───────────────────────────────────────
+fn test_umount_removes_mount() -> bool {
+    test_header!("mount: umount removes mount from table");
+
+    let mp = "/mnt/scratch_119";
+    let _ = crate::vfs::mkdir(mp);
+
+    // Mount.
+    let r = crate::syscall::sys_mount_test("tmpfs", mp, "tmpfs", 0);
+    if r != 0 {
+        test_fail!("umount_removes", "mount returned {}", r);
+        return false;
+    }
+
+    // Create a file — proves the mount is active.
+    let file_path = "/mnt/scratch_119/probe";
+    let _ = crate::vfs::create_file(file_path);
+    let alive = crate::vfs::stat(file_path).is_ok();
+    if !alive {
+        test_fail!("umount_removes", "file not visible after mount");
+        let _ = crate::syscall::sys_umount_test(mp);
+        return false;
+    }
+    test_println!("  file visible after mount ✓");
+
+    // Umount.
+    let ur = crate::syscall::sys_umount_test(mp);
+    if ur != 0 {
+        test_fail!("umount_removes", "umount returned {}", ur);
+        return false;
+    }
+    test_println!("  umount '{}' -> ok", mp);
+
+    // File should no longer be accessible.
+    let gone = crate::vfs::stat(file_path).is_err();
+    if !gone {
+        test_fail!("umount_removes", "file still accessible after umount");
+        return false;
+    }
+    test_println!("  lookup after umount fails ✓");
+
+    // A second umount of the same path should return -ENOENT.
+    let ur2 = crate::syscall::sys_umount_test(mp);
+    test_println!("  second umount -> {}", ur2);
+    if ur2 != -2 {
+        test_fail!("umount_removes", "expected -ENOENT (-2) on second umount, got {}", ur2);
+        return false;
+    }
+    test_println!("  double-umount returns -ENOENT ✓");
+
+    test_pass!("mount: umount removes mount from table");
+    true
+}
+
 fn test_dev_dsp_ioctl_set_format() -> bool {
     test_header!("/dev/dsp ioctl SNDCTL_DSP_SETFMT");
 
