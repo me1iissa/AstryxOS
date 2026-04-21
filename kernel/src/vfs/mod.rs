@@ -1092,9 +1092,16 @@ pub fn readdir(path: &str) -> VfsResult<Vec<(String, FileType)>> {
 /// Write data to a file (overwrite from beginning).
 pub fn write_file(path: &str, data: &[u8]) -> VfsResult<usize> {
     let (mount_idx, inode) = resolve_path(path)?;
-    let mounts = MOUNTS.lock();
-    mounts[mount_idx].fs.truncate(inode, 0)?;
-    mounts[mount_idx].fs.write(inode, 0, data)
+    let n = {
+        let mounts = MOUNTS.lock();
+        mounts[mount_idx].fs.truncate(inode, 0)?;
+        mounts[mount_idx].fs.write(inode, 0, data)?
+    };
+    // Fire IN_MODIFY so inotify watchers (and poll/epoll) see the update.
+    // This mirrors the notification in the fd-based write() syscall path.
+    let (parent_dir, filename) = split_parent_name(path);
+    crate::ipc::inotify::notify_event(parent_dir, filename, crate::ipc::inotify::IN_MODIFY, 0);
+    Ok(n)
 }
 
 /// File read cache — avoids re-reading large files from slow ATA PIO.
