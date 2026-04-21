@@ -963,13 +963,23 @@ fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
         pid, entry_rip, entry_rsp, new_cr3
     );
 
-    // 2. Update the process's address space.
-    // TODO: unmap old user pages and free old VmSpace physical pages.
-    {
+    // 2. Update the process's address space, atomically swapping in the new
+    //    VmSpace and extracting the old one so we can free it afterwards.
+    //
+    //    We do NOT free the old VmSpace while holding PROCESS_TABLE lock —
+    //    free_vm_space walks page tables and calls into the PMM (which has its
+    //    own lock).  Holding two locks in that order could deadlock with the
+    //    PMM's internal locking.  Instead we take ownership of the old VmSpace
+    //    here, release PROCESS_TABLE, and free afterwards (below).
+    let old_vm_space = {
         let mut procs = crate::proc::PROCESS_TABLE.lock();
+        let mut extracted = None;
         if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            // Swap in the new address space.
             p.cr3 = new_cr3;
-            p.vm_space = Some(new_vm_space);
+            // mem::replace gives us the old VmSpace (may be None for kernel
+            // processes, but we already checked has_vm_space above).
+            extracted = p.vm_space.replace(new_vm_space);
             // ELFs loaded from disk use the Linux syscall ABI.
             p.linux_abi = true;
             p.subsystem = crate::win32::SubsystemType::Linux;
@@ -980,7 +990,8 @@ fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
                 }
             }
         }
-    }
+        extracted
+    };
 
     // 3. Get kernel stack info for this thread.
     let kstack_top = {
@@ -992,7 +1003,19 @@ fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
     };
 
     // 4. Switch to the new page table.
+    //    This MUST happen before free_vm_space() so the hardware CR3 no longer
+    //    references the old page tables when we free their backing frames.
     unsafe { crate::mm::vmm::switch_cr3(new_cr3); }
+
+    // 4b. Reclaim the old address space now that the hardware no longer uses it.
+    //     free_vm_space() walks old VMAs, decrements CoW refcounts, frees any
+    //     anonymous pages whose refcount reaches zero, and releases the old PT
+    //     structures (PT/PD/PDPT/PML4) back to the PMM.
+    //     This is safe: we hold no locks, the new CR3 is active, and the old
+    //     VmSpace is local (not referenced by any other thread or CPU).
+    if let Some(old_space) = old_vm_space {
+        crate::proc::free_vm_space(old_space);
+    }
 
     // 5. Update kernel stack pointers for Ring 3 transitions.
     unsafe {

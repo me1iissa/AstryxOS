@@ -1020,6 +1020,65 @@ pub fn free_process_memory(pid: Pid) {
     crate::serial_println!("[PROC] PID {} memory freed", pid);
 }
 
+/// Free all physical pages and page table structures owned by a VmSpace.
+///
+/// This is the execve teardown path: the caller already holds the new VmSpace
+/// and passes the old one in by value.  Ownership is consumed, so there is no
+/// risk of double-free.
+///
+/// Walks every anonymous VMA, decrements the per-page refcount, and frees any
+/// physical frame whose refcount reaches zero (CoW pages shared with a child
+/// are not freed until the last reference drops).  Then frees the private
+/// user-half page table structures (PT → PD → PDPT → PML4).
+///
+/// # Safety contract for the caller
+/// The caller MUST have already switched the hardware CR3 away from this
+/// VmSpace before calling this function (or be about to do so imminently).
+/// Because exec atomically replaces the VmSpace in the process table first and
+/// THEN switches CR3, the window where the CPU might still speculatively
+/// access the old page tables is eliminated by the CR3 switch that follows
+/// immediately after the process-table update.
+pub fn free_vm_space(vm_space: crate::mm::vma::VmSpace) {
+    use crate::mm::{refcount, pmm, vmm};
+    use crate::mm::vma::VmBacking;
+
+    let cr3 = vm_space.cr3;
+
+    // Guard: never free the kernel CR3 or a zero/already-freed one.
+    let kernel_cr3 = crate::mm::vmm::get_kernel_cr3();
+    if cr3 == 0 || cr3 == kernel_cr3 {
+        return;
+    }
+
+    // Walk all anonymous VMAs and decrement/free the backing physical pages.
+    // File-backed pages belong to the page cache; device pages are MMIO.
+    const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+    const PAGE_PRESENT: u64 = 1;
+
+    for vma in &vm_space.areas {
+        match &vma.backing {
+            VmBacking::File { .. } | VmBacking::Device { .. } => continue,
+            VmBacking::Anonymous => {}
+        }
+        let mut addr = vma.base;
+        while addr < vma.base + vma.length {
+            let pte = vmm::read_pte(cr3, addr);
+            if pte & PAGE_PRESENT != 0 {
+                let phys = pte & ADDR_MASK;
+                if refcount::page_ref_dec(phys) == 0 {
+                    pmm::free_page(phys);
+                }
+            }
+            addr += 0x1000;
+        }
+    }
+
+    // Free the private user-half page table structures (PDPT / PD / PT / PML4).
+    free_user_page_tables(cr3);
+
+    crate::serial_println!("[PROC] old VmSpace (cr3={:#x}) freed", cr3);
+}
+
 /// Free all page table structs in the user-half (PML4[0..256]) of the given
 /// PML4 physical address, then free the PML4 page itself.
 ///
