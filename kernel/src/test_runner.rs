@@ -693,6 +693,21 @@ pub fn run() -> ! {
     total += 1;
     if test_xhci_probe_safe() { passed += 1; }
 
+    // ── Test 110: FAT32 create / write / read-back ─────────────────────────
+
+    total += 1;
+    if test_fat32_create_write_read() { passed += 1; }
+
+    // ── Test 111: FAT32 truncate shortens a file ───────────────────────────
+
+    total += 1;
+    if test_fat32_truncate_shortens() { passed += 1; }
+
+    // ── Test 112: FAT32 unlink returns clusters to free pool ───────────────
+
+    total += 1;
+    if test_fat32_unlink_frees_clusters() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -2056,6 +2071,344 @@ fn test_fat32_write() -> bool {
     }
 
     test_pass!("FAT32 write support");
+    true
+}
+
+// ============================================================================
+// Test 110: FAT32 create / write "Hello" / re-open / read back
+// ============================================================================
+//
+// Uses a fresh writable RW test image (256 sectors, 1 sector/cluster).
+// Exercises: create_file → write → read back → verify exact content.
+
+fn test_fat32_create_write_read() -> bool {
+    test_header!("FAT32 create / write / read-back");
+
+    // Mount a fresh writable FAT32 image directly (not via VFS /mnt to avoid
+    // cross-test state contamination).
+    let image = crate::vfs::fat32::create_rw_test_image();
+    let image_static: &'static [u8] = Box::leak(image.into_boxed_slice());
+    let device = Box::new(crate::drivers::block::MemoryBlockDevice::new(image_static));
+
+    let fs = match crate::vfs::fat32::Fat32Fs::new(device) {
+        Ok(f) => f,
+        Err(e) => {
+            test_fail!("FAT32 crwr", "Fat32Fs::new failed: {:?}", e);
+            return false;
+        }
+    };
+
+    use crate::vfs::FileSystemOps;
+    let root = fs.root_inode();
+
+    // Step 1: Create /hello.txt
+    test_println!("  Creating hello.txt in root ...");
+    let file_inode = match fs.create_file(root, "hello.txt") {
+        Ok(i) => { test_println!("  Created inode {} ✓", i); i }
+        Err(e) => {
+            test_fail!("FAT32 crwr", "create_file failed: {:?}", e);
+            return false;
+        }
+    };
+
+    // Step 2: Write "Hello" to offset 0
+    let payload = b"Hello";
+    test_println!("  Writing {:?} ({} bytes) ...", core::str::from_utf8(payload).unwrap_or("?"), payload.len());
+    match fs.write(file_inode, 0, payload) {
+        Ok(n) if n == payload.len() => test_println!("  Wrote {} bytes ✓", n),
+        Ok(n) => {
+            test_fail!("FAT32 crwr", "short write: {} vs {}", n, payload.len());
+            return false;
+        }
+        Err(e) => {
+            test_fail!("FAT32 crwr", "write failed: {:?}", e);
+            return false;
+        }
+    }
+
+    // Step 3: Stat — verify size
+    match fs.stat(file_inode) {
+        Ok(s) => {
+            test_println!("  stat: size={} ✓", s.size);
+            if s.size != payload.len() as u64 {
+                test_fail!("FAT32 crwr", "size after write: {} (expected {})", s.size, payload.len());
+                return false;
+            }
+        }
+        Err(e) => {
+            test_fail!("FAT32 crwr", "stat failed: {:?}", e);
+            return false;
+        }
+    }
+
+    // Step 4: Re-open via lookup (simulates closing and reopening)
+    let looked_up = match fs.lookup(root, "hello.txt") {
+        Ok(i) => i,
+        Err(e) => {
+            test_fail!("FAT32 crwr", "lookup after write failed: {:?}", e);
+            return false;
+        }
+    };
+    if looked_up != file_inode {
+        test_fail!("FAT32 crwr", "lookup returned different inode {} vs {}", looked_up, file_inode);
+        return false;
+    }
+
+    // Step 5: Read back and assert equal
+    let mut buf = [0u8; 16];
+    match fs.read(file_inode, 0, &mut buf) {
+        Ok(n) => {
+            let read_back = &buf[..n];
+            test_println!("  Read back {} bytes: {:?} ✓", n, core::str::from_utf8(read_back).unwrap_or("?"));
+            if read_back != payload {
+                test_fail!("FAT32 crwr", "content mismatch: {:?} vs {:?}", read_back, payload);
+                return false;
+            }
+        }
+        Err(e) => {
+            test_fail!("FAT32 crwr", "read failed: {:?}", e);
+            return false;
+        }
+    }
+
+    test_pass!("FAT32 create/write/read-back");
+    true
+}
+
+// ============================================================================
+// Test 111: FAT32 truncate — write 16 KiB, truncate to 4 KiB, verify size
+// ============================================================================
+//
+// Uses a fresh writable RW test image (256 sectors = 250 free clusters).
+// Confirms that truncate both updates the dir-entry size and frees excess clusters.
+
+fn test_fat32_truncate_shortens() -> bool {
+    test_header!("FAT32 truncate shortens file");
+
+    let image = crate::vfs::fat32::create_rw_test_image();
+    let image_static: &'static [u8] = Box::leak(image.into_boxed_slice());
+    let device = Box::new(crate::drivers::block::MemoryBlockDevice::new(image_static));
+
+    let fs = match crate::vfs::fat32::Fat32Fs::new(device) {
+        Ok(f) => f,
+        Err(e) => {
+            test_fail!("FAT32 trunc", "Fat32Fs::new failed: {:?}", e);
+            return false;
+        }
+    };
+
+    use crate::vfs::FileSystemOps;
+    let root = fs.root_inode();
+
+    // Check free clusters before writing (should be ~249: total 256 - 2 reserved - 4 FAT - 1 root = 249).
+    let free_before_write = fs.count_free_clusters();
+    test_println!("  Free clusters before write: {}", free_before_write);
+    if free_before_write < 40 {
+        test_fail!("FAT32 trunc", "not enough free clusters ({}) for 16 KiB write", free_before_write);
+        return false;
+    }
+
+    // Create big.txt and write 16 KiB (16384 bytes = 32 clusters at 512 bytes/cluster).
+    let file_inode = match fs.create_file(root, "big.txt") {
+        Ok(i) => i,
+        Err(e) => {
+            test_fail!("FAT32 trunc", "create_file failed: {:?}", e);
+            return false;
+        }
+    };
+
+    let write_size: usize = 16 * 1024; // 16 KiB
+    let write_data: Vec<u8> = (0..write_size).map(|i| (i & 0xFF) as u8).collect();
+    test_println!("  Writing {} bytes ...", write_size);
+    match fs.write(file_inode, 0, &write_data) {
+        Ok(n) if n == write_size => test_println!("  Wrote {} bytes ✓", n),
+        Ok(n) => {
+            test_fail!("FAT32 trunc", "short write: {} vs {}", n, write_size);
+            return false;
+        }
+        Err(e) => {
+            test_fail!("FAT32 trunc", "write failed: {:?}", e);
+            return false;
+        }
+    }
+
+    let free_after_write = fs.count_free_clusters();
+    test_println!("  Free clusters after 16 KiB write: {} (used {})",
+        free_after_write, free_before_write - free_after_write);
+
+    // Verify stat shows 16 KiB.
+    match fs.stat(file_inode) {
+        Ok(s) if s.size == write_size as u64 => test_println!("  stat: {} bytes ✓", s.size),
+        Ok(s) => {
+            test_fail!("FAT32 trunc", "size after write: {} (expected {})", s.size, write_size);
+            return false;
+        }
+        Err(e) => {
+            test_fail!("FAT32 trunc", "stat after write failed: {:?}", e);
+            return false;
+        }
+    }
+
+    // Truncate to 4 KiB.
+    let trunc_size: u64 = 4 * 1024;
+    test_println!("  Truncating to {} bytes ...", trunc_size);
+    match fs.truncate(file_inode, trunc_size) {
+        Ok(()) => test_println!("  Truncated ✓"),
+        Err(e) => {
+            test_fail!("FAT32 trunc", "truncate failed: {:?}", e);
+            return false;
+        }
+    }
+
+    // Verify stat shows 4 KiB.
+    match fs.stat(file_inode) {
+        Ok(s) if s.size == trunc_size => test_println!("  stat after truncate: {} bytes ✓", s.size),
+        Ok(s) => {
+            test_fail!("FAT32 trunc", "size after truncate: {} (expected {})", s.size, trunc_size);
+            return false;
+        }
+        Err(e) => {
+            test_fail!("FAT32 trunc", "stat after truncate failed: {:?}", e);
+            return false;
+        }
+    }
+
+    // Clusters freed: 16 KiB = 32 clusters, 4 KiB = 8 clusters → 24 freed.
+    let free_after_trunc = fs.count_free_clusters();
+    let clusters_freed = free_after_trunc.saturating_sub(free_after_write);
+    test_println!("  Free clusters after truncate: {} (recovered {})", free_after_trunc, clusters_freed);
+    // Should have recovered 24 clusters (16 KiB - 4 KiB = 12 KiB = 24 × 512-byte clusters).
+    if clusters_freed < 20 {
+        test_fail!("FAT32 trunc", "expected ≥20 clusters freed, got {}", clusters_freed);
+        return false;
+    }
+
+    // Read back — should still return first 4 KiB of original pattern.
+    let mut read_buf = alloc::vec![0u8; 4096];
+    match fs.read(file_inode, 0, &mut read_buf) {
+        Ok(n) if n == 4096 => {
+            // Verify first few bytes match write pattern.
+            let ok = read_buf[..4096].iter().enumerate().all(|(i, &b)| b == (i & 0xFF) as u8);
+            if !ok {
+                test_fail!("FAT32 trunc", "data mismatch after truncate");
+                return false;
+            }
+            test_println!("  Read {} bytes after truncate — pattern correct ✓", n);
+        }
+        Ok(n) => {
+            test_fail!("FAT32 trunc", "short read after truncate: {} (expected 4096)", n);
+            return false;
+        }
+        Err(e) => {
+            test_fail!("FAT32 trunc", "read after truncate failed: {:?}", e);
+            return false;
+        }
+    }
+
+    test_pass!("FAT32 truncate shortens file");
+    true
+}
+
+// ============================================================================
+// Test 112: FAT32 unlink returns clusters to free pool
+// ============================================================================
+//
+// Measures free-cluster count before and after creating + unlinking a file.
+// Verifies that unlink frees the cluster chain.
+
+fn test_fat32_unlink_frees_clusters() -> bool {
+    test_header!("FAT32 unlink frees clusters");
+
+    let image = crate::vfs::fat32::create_rw_test_image();
+    let image_static: &'static [u8] = Box::leak(image.into_boxed_slice());
+    let device = Box::new(crate::drivers::block::MemoryBlockDevice::new(image_static));
+
+    let fs = match crate::vfs::fat32::Fat32Fs::new(device) {
+        Ok(f) => f,
+        Err(e) => {
+            test_fail!("FAT32 unlink", "Fat32Fs::new failed: {:?}", e);
+            return false;
+        }
+    };
+
+    use crate::vfs::FileSystemOps;
+    let root = fs.root_inode();
+
+    // Baseline free count.
+    let free_baseline = fs.count_free_clusters();
+    test_println!("  Baseline free clusters: {}", free_baseline);
+
+    // Create a file and write ~10 KiB (20 clusters at 512 bytes/cluster).
+    let file_inode = match fs.create_file(root, "canary.txt") {
+        Ok(i) => i,
+        Err(e) => {
+            test_fail!("FAT32 unlink", "create_file failed: {:?}", e);
+            return false;
+        }
+    };
+
+    let write_size: usize = 10 * 1024; // 10 KiB = 20 clusters
+    let write_data: Vec<u8> = alloc::vec![0xABu8; write_size];
+    match fs.write(file_inode, 0, &write_data) {
+        Ok(n) if n == write_size => test_println!("  Wrote {} bytes ✓", n),
+        Ok(n) => {
+            test_fail!("FAT32 unlink", "short write: {} vs {}", n, write_size);
+            return false;
+        }
+        Err(e) => {
+            test_fail!("FAT32 unlink", "write failed: {:?}", e);
+            return false;
+        }
+    }
+
+    let free_after_write = fs.count_free_clusters();
+    let clusters_used = free_baseline.saturating_sub(free_after_write);
+    test_println!("  Free after write: {} (used {} clusters)", free_after_write, clusters_used);
+    if clusters_used < 18 {
+        // 10 KiB / 512 = 20 clusters; allow slight tolerance
+        test_fail!("FAT32 unlink", "expected ≥18 clusters used for 10 KiB file, got {}", clusters_used);
+        return false;
+    }
+
+    // Unlink the file.
+    test_println!("  Removing canary.txt ...");
+    match fs.remove(root, "canary.txt") {
+        Ok(()) => test_println!("  Removed ✓"),
+        Err(e) => {
+            test_fail!("FAT32 unlink", "remove failed: {:?}", e);
+            return false;
+        }
+    }
+
+    // Verify it's gone.
+    match fs.lookup(root, "canary.txt") {
+        Err(crate::vfs::VfsError::NotFound) => test_println!("  lookup returns NotFound ✓"),
+        Ok(_) => {
+            test_fail!("FAT32 unlink", "file still visible after unlink");
+            return false;
+        }
+        Err(e) => {
+            test_fail!("FAT32 unlink", "unexpected lookup error: {:?}", e);
+            return false;
+        }
+    }
+
+    // Clusters should be returned to the free pool.
+    let free_after_unlink = fs.count_free_clusters();
+    test_println!("  Free after unlink: {} (recovered {} clusters)",
+        free_after_unlink, free_after_unlink.saturating_sub(free_after_write));
+
+    // Allow ±2 cluster tolerance (the dir-entry slot itself may not be freed).
+    let tolerance: usize = 2;
+    if free_after_unlink + tolerance < free_baseline {
+        test_fail!("FAT32 unlink",
+            "clusters not fully returned: baseline={} after_unlink={} (diff {})",
+            free_baseline, free_after_unlink,
+            free_baseline.saturating_sub(free_after_unlink));
+        return false;
+    }
+
+    test_pass!("FAT32 unlink frees clusters");
     true
 }
 
