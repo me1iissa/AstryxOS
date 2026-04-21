@@ -511,6 +511,27 @@ pub fn init() -> bool {
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
+/// Quiesce all AHCI ports and de-initialise the controller on shutdown.
+///
+/// For every active port, invokes `stop_port()` to drain the command list
+/// and FIS receive engines before the system powers off.  Mirrors the
+/// symmetric teardown described in the AHCI 1.3 §10.1.2 shutdown sequence.
+pub fn stop() {
+    crate::serial_println!("[AHCI] stop: stopping all ports");
+    let abar = *AHCI_BASE.lock();
+    if abar == 0 {
+        crate::serial_println!("[AHCI] stop: not initialized, skipping");
+        return;
+    }
+    let ports = AHCI_PORTS.lock().clone();
+    for port in &ports {
+        let pb = port_base(abar, *port);
+        stop_port(pb);
+        crate::serial_println!("[AHCI] stop: port {} quiesced", port);
+    }
+    crate::serial_println!("[AHCI] stop: done ({} port(s))", ports.len());
+}
+
 /// Check if the AHCI controller has been initialized.
 pub fn is_available() -> bool {
     *AHCI_BASE.lock() != 0

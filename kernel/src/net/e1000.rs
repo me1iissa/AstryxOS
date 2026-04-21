@@ -602,6 +602,29 @@ pub fn poll_rx() {
     }
 }
 
+/// Quiesce the e1000 NIC on shutdown.
+///
+/// Disables TX and RX engines via TCTL/RCTL, masks all interrupts (IMC),
+/// and clears the AVAILABLE flag.  Does NOT perform a full device reset
+/// (CTRL_RST) because that would nuke EEPROM state; a clean disable suffices
+/// for a graceful power-off and is faster.
+pub fn stop() {
+    crate::serial_println!("[E1000] stop: disabling TX/RX");
+    if !AVAILABLE.load(Ordering::Acquire) {
+        crate::serial_println!("[E1000] stop: not initialized, skipping");
+        return;
+    }
+    // Disable transmitter and receiver.
+    mmio_write(REG_TCTL, 0);
+    mmio_write(REG_RCTL, 0);
+    // Mask all interrupts so no spurious IRQs fire during teardown.
+    mmio_write(REG_IMC, 0xFFFF_FFFF);
+    // Clear any pending interrupt causes.
+    let _ = mmio_read(REG_ICR);
+    AVAILABLE.store(false, Ordering::Release);
+    crate::serial_println!("[E1000] stop: done");
+}
+
 /// Check if the e1000 NIC is available.
 pub fn is_available() -> bool {
     AVAILABLE.load(Ordering::Acquire)

@@ -633,6 +633,29 @@ unsafe fn re_post_rx_desc(
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
+/// Quiesce the virtio-net device on shutdown.
+///
+/// Writes 0 to VIRTIO_DEVICE_STATUS to perform a device reset (per virtio
+/// spec §4.1.4.1).  This is the symmetric counterpart to the `init()` path.
+/// Clears VIRTIO_NET_AVAILABLE so subsequent TX/RX calls are no-ops.
+pub fn stop() {
+    crate::serial_println!("[VIRTIO-NET] stop: resetting device");
+    if !VIRTIO_NET_AVAILABLE.load(Ordering::Acquire) {
+        crate::serial_println!("[VIRTIO-NET] stop: not initialized, skipping");
+        return;
+    }
+    let guard = VIRTIO_NET.lock();
+    if let Some(ref dev) = *guard {
+        // SAFETY: Writing 0 to the device-status register is the spec-defined
+        // reset operation for a legacy virtio device.  Safe at any time.
+        unsafe {
+            crate::hal::outb(dev.io_base + VIRTIO_REG_DEVICE_STATUS, 0);
+        }
+    }
+    VIRTIO_NET_AVAILABLE.store(false, Ordering::Release);
+    crate::serial_println!("[VIRTIO-NET] stop: done");
+}
+
 /// Check if a virtio-net device is available.
 pub fn is_available() -> bool {
     VIRTIO_NET_AVAILABLE.load(Ordering::Acquire)

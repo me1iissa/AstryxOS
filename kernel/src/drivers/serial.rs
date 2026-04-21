@@ -97,6 +97,29 @@ pub fn try_read_byte() -> Option<u8> {
     }
 }
 
+/// Flush the TX FIFO and quiesce the serial port on shutdown.
+///
+/// Spins waiting for the transmit holding register (THR) empty bit so any
+/// buffered debug output reaches the host terminal before the machine powers
+/// off.  The same bounded-wait logic as `write_byte` prevents an infinite
+/// hang if the UART is wedged.
+pub fn stop() {
+    crate::serial_println!("[SERIAL] stop: flushing TX...");
+    let port = SERIAL.lock();
+    // SAFETY: Reading the line-status register is a harmless read-only access.
+    unsafe {
+        let mut n = 0u32;
+        while crate::hal::inb(port.base + 5) & 0x20 == 0 {
+            core::hint::spin_loop();
+            n += 1;
+            if n >= 100_000 { break; }
+        }
+    }
+    // Note: we intentionally do NOT disable interrupts or print after this
+    // point — the caller (po::shutdown) has already logged the "stopping"
+    // banner before invoking us.
+}
+
 /// Print to serial port (used by serial_print! macro).
 #[doc(hidden)]
 pub fn _serial_print(args: fmt::Arguments) {
