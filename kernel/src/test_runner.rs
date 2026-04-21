@@ -9503,18 +9503,31 @@ void _start(void) {\n\
     }
 
     // ── Step 4: wait for TCC to exit ─────────────────────────────────────────
+    //
+    // TIMEOUT DESIGN: the loop is bounded both by iteration count (2000) AND
+    // by a wall-clock tick deadline (20 s = 2000 ticks at 100 Hz).  We print
+    // every 50 iterations so the idle watchdog (--idle-timeout 60 s) never
+    // fires even in the worst case.
+    //
+    // KNOWN ISSUE (Approach B TODO): TCC currently calls exit_group(0) with no
+    // intervening syscalls, which means it sees argc=0 and returns immediately.
+    // Root cause is likely that the argv/envp stack layout written by
+    // load_elf_with_args is not compatible with TCC's musl _start, which reads
+    // argc from [rsp] before calling main().  When fixed, TCC will actually
+    // compile hello63.c and this loop will wait for real compilation.
     let was_active = crate::sched::is_active();
     if !was_active { crate::sched::enable(); }
 
     test_println!("  Waiting for TCC to compile hello63.c...");
     let ticks_start = crate::arch::x86_64::irq::get_ticks();
-    test_println!("  ticks_start={} scheduler_active={}", ticks_start, crate::sched::is_active());
-    for i in 0..3000usize {
+    // 20 s timeout: 100 ticks/s × 20 = 2000 ticks.
+    let ticks_deadline = ticks_start.wrapping_add(2000);
+    test_println!("  ticks_start={} deadline={} scheduler_active={}",
+        ticks_start, ticks_deadline, crate::sched::is_active());
+    let mut tcc_timed_out = true;
+    for i in 0..2000usize {
         crate::sched::yield_cpu();
-        if i == 0 {
-            let ticks_now = crate::arch::x86_64::irq::get_ticks();
-            test_println!("  yield_cpu() returned (i=0), ticks_now={}, delta={}", ticks_now, ticks_now.wrapping_sub(ticks_start));
-        }
+        let ticks_now = crate::arch::x86_64::irq::get_ticks();
         let done = {
             let procs = crate::proc::PROCESS_TABLE.lock();
             match procs.iter().find(|p| p.pid == tcc_pid) {
@@ -9522,21 +9535,31 @@ void _start(void) {\n\
                 None => true,
             }
         };
-        if done { break; }
-        if i % 10 == 0 {
+        if done { tcc_timed_out = false; break; }
+        // Check wall-clock deadline (100 Hz ticks).
+        if ticks_now.wrapping_sub(ticks_start) >= 2000 {
+            test_println!("  TCC wait tick-deadline reached at i={} ticks_now={}", i, ticks_now);
+            break;
+        }
+        if i % 50 == 0 {
             let st = {
                 let threads = crate::proc::THREAD_TABLE.lock();
                 threads.iter().find(|t| t.pid == tcc_pid)
                     .map(|t| alloc::format!("{:?}", t.state))
                     .unwrap_or_else(|| alloc::string::String::from("?"))
             };
-            test_println!("  yield #{} TCC state={}", i, st);
+            test_println!("  yield #{} TCC state={} ticks={}", i, st, ticks_now);
         }
         crate::hal::enable_interrupts();
         for _ in 0..1000u32 { core::hint::spin_loop(); }
     }
 
     if !was_active { crate::sched::disable(); }
+
+    if tcc_timed_out {
+        test_fail!("TCC compile", "TCC process did not exit within 20 s (likely argc=0 bug: TCC sees no args and returns immediately without producing output — see Approach B TODO above)");
+        return false;
+    }
 
     // Check TCC exit code
     let (tcc_state, tcc_exit) = {
@@ -9604,12 +9627,16 @@ void _start(void) {\n\
     }
 
     // ── Step 6: wait for compiled program to exit with code 42 ───────────────
+    // Same bounded-timeout design as Step 4 (5 s / 500 ticks at 100 Hz).
     let was_active2 = crate::sched::is_active();
     if !was_active2 { crate::sched::enable(); }
 
     test_println!("  Waiting for TCC-compiled hello to run...");
+    let ticks_hello_start = crate::arch::x86_64::irq::get_ticks();
+    let mut hello_timed_out = true;
     for i in 0..1000usize {
         crate::sched::yield_cpu();
+        let ticks_now = crate::arch::x86_64::irq::get_ticks();
         let done = {
             let procs = crate::proc::PROCESS_TABLE.lock();
             match procs.iter().find(|p| p.pid == hello_pid) {
@@ -9617,15 +9644,24 @@ void _start(void) {\n\
                 None => true,
             }
         };
-        if done { break; }
-        if i % 100 == 0 {
-            test_println!("  yield #{} waiting for hello exit", i);
+        if done { hello_timed_out = false; break; }
+        if ticks_now.wrapping_sub(ticks_hello_start) >= 500 {
+            test_println!("  hello wait tick-deadline reached at i={}", i);
+            break;
+        }
+        if i % 50 == 0 {
+            test_println!("  yield #{} waiting for hello exit ticks={}", i, ticks_now);
         }
         crate::hal::enable_interrupts();
         for _ in 0..1000u32 { core::hint::spin_loop(); }
     }
 
     if !was_active2 { crate::sched::disable(); }
+
+    if hello_timed_out {
+        test_fail!("TCC compile", "tcc63_hello did not exit within 5 s");
+        return false;
+    }
 
     let (hello_state, hello_exit) = {
         let procs = crate::proc::PROCESS_TABLE.lock();
