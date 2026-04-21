@@ -64,6 +64,11 @@ pub const IMAGE_SUBSYSTEM_WINDOWS_GUI:      u16 = 2;
 pub const IMAGE_SUBSYSTEM_WINDOWS_CUI:      u16 = 3;
 pub const IMAGE_SUBSYSTEM_NATIVE:           u16 = 1;
 
+// ─── DllCharacteristics ──────────────────────────────────────────────────────
+/// IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE — image is ASLR-eligible.
+/// Set by the linker for /DYNAMICBASE images (default on modern MSVC/LLD).
+pub const IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE: u16 = 0x0040;
+
 // ─── Data Directory indices ───────────────────────────────────────────────────
 pub const IMAGE_DIRECTORY_ENTRY_EXPORT:     usize = 0;
 pub const IMAGE_DIRECTORY_ENTRY_IMPORT:     usize = 1;
@@ -473,10 +478,27 @@ pub fn load_pe(data: &[u8], cr3: u64, stub_page_va: u64) -> Result<PeLoadResult,
         return Err(PeError::BadImageBase);
     }
 
-    // For now, always attempt to load at the preferred base.
-    // TODO: ASLR / conflict detection.
-    let load_base = preferred_base;
-    let delta = load_base.wrapping_sub(preferred_base) as i64; // will be 0 unless relocated
+    // ASLR: if the image was linked with /DYNAMICBASE (IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE,
+    // bit 6 of DllCharacteristics), randomise the load address.  We add a 4 KiB-aligned
+    // random offset with 28 bits of entropy — identical policy to the ELF ET_DYN loader.
+    //
+    // Images WITHOUT DYNAMIC_BASE are built expecting a specific absolute base and must
+    // not be relocated (the base-relocation table may be absent).
+    let load_base = if oh.dll_characteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE != 0 {
+        let offset = crate::security::rand::aslr_page_offset(28);
+        let candidate = preferred_base.saturating_add(offset);
+        // Stay within user lower-half.
+        if candidate >= 0xFFFF_8000_0000_0000
+            || candidate.saturating_add(image_size) >= 0xFFFF_8000_0000_0000
+        {
+            preferred_base
+        } else {
+            candidate
+        }
+    } else {
+        preferred_base
+    };
+    let delta = load_base.wrapping_sub(preferred_base) as i64;
 
     // ── 2. Map the header page(s) ─────────────────────────────────────────────
     // Write all data via PHYS_OFF so no CR3 switch is required (avoids
