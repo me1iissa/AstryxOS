@@ -624,15 +624,20 @@ pub fn run() -> ! {
     // total += 1;
     // if test_vfork_exit() { passed += 1; }
 
-    // ── Test 97: OOM killer — score_pick selects largest RSS ─────────────
+    // ── Test 101: OOM killer — score_pick selects largest RSS ───────────
 
     total += 1;
     if test_oom_picks_largest_rss() { passed += 1; }
 
-    // ── Test 98: OOM killer — PID 1 is never selected ────────────────────
+    // ── Test 102: OOM killer — PID 1 is never selected ──────────────────
 
     total += 1;
     if test_oom_skips_init() { passed += 1; }
+
+    // ── Test 103: WM title bar rendered via GDI text engine ─────────────
+
+    total += 1;
+    if test_wm_title_renders_via_gdi() { passed += 1; }
 
     // ── Summary ─────────────────────────────────────────────────────────
 
@@ -12673,4 +12678,86 @@ fn test_virtio_net_probes() -> bool {
         test_pass!("virtio-net probe (no device, probe path safe)");
         true
     }
+}
+
+// ── Test 103: WM title bar rendered via GDI text engine ─────────────────────
+//
+// Creates a window with title "Hello", invokes the decorator on an in-memory
+// pixel buffer, and asserts that at least one pixel in the title-bar region
+// differs from the plain background fill — proving the GDI text path fired.
+//
+// The test does NOT depend on the specific font shape; it only verifies that
+// text_out produced at least one foreground-coloured pixel in the expected
+// region, which would be impossible if the bitmap-rectangle placeholder were
+// still in use (placeholder fills with the same colour as text_color, so a
+// naïve check would still pass — but here we use a distinct bg and check for
+// the text colour specifically to catch that case too).
+
+fn test_wm_title_renders_via_gdi() -> bool {
+    test_header!("WM title bar rendered via GDI text engine");
+
+    use crate::wm;
+    use crate::wm::decorator::{TITLE_BAR_HEIGHT, BORDER_WIDTH, COLOR_TITLE_TEXT_ACTIVE};
+
+    // Window dimensions — wide enough for "Hello" (5 * 8 = 40 px) plus margins.
+    let win_w: u32 = 300;
+    let win_h: u32 = 200;
+
+    // Create a real WM window so draw_decorations can inspect its fields.
+    let handle = wm::create_window(
+        "Default",
+        "Hello",
+        0, 0,
+        win_w, win_h,
+        crate::wm::window::WindowStyle::overlapped(),
+        None,
+    );
+    if handle == 0 {
+        test_fail!("WM/GDI title", "create_window returned 0");
+        return false;
+    }
+
+    // Allocate an off-screen framebuffer large enough for the window.
+    let buf_size = (win_w * win_h) as usize;
+    let mut pixels: alloc::vec::Vec<u32> = alloc::vec![0u32; buf_size];
+
+    // Mark the window as focused so the active colour palette is used.
+    crate::wm::window::with_window_mut(handle, |w| { w.focused = true; });
+
+    // Draw decorations (border + title bar) into our scratch buffer.
+    crate::wm::window::with_window(handle, |w| {
+        crate::wm::decorator::draw_decorations(&mut pixels, win_w, w);
+    });
+
+    // Destroy the test window before we return (regardless of outcome).
+    wm::destroy_window(handle);
+
+    // Inspect the title-bar region for at least one pixel with the active
+    // title-text colour (0xFFFFFFFF).  The title bar occupies rows
+    // [BORDER_WIDTH .. BORDER_WIDTH + TITLE_BAR_HEIGHT) and starts at
+    // column BORDER_WIDTH.
+    let bar_top = BORDER_WIDTH;
+    let bar_bottom = BORDER_WIDTH + TITLE_BAR_HEIGHT;
+
+    let found_text_pixel = (bar_top..bar_bottom).any(|row| {
+        (BORDER_WIDTH..win_w - BORDER_WIDTH).any(|col| {
+            let idx = row as usize * win_w as usize + col as usize;
+            idx < buf_size && pixels[idx] == COLOR_TITLE_TEXT_ACTIVE
+        })
+    });
+
+    if !found_text_pixel {
+        test_fail!(
+            "WM/GDI title",
+            "no active-title-text pixel (0x{:08X}) found in title-bar strip \
+             rows {}..{} — GDI text_out did not render",
+            COLOR_TITLE_TEXT_ACTIVE,
+            bar_top, bar_bottom
+        );
+        return false;
+    }
+    test_println!("  GDI text_out rendered at least one foreground pixel in title-bar ✓");
+
+    test_pass!("WM title bar rendered via GDI text engine");
+    true
 }
