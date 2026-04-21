@@ -4591,8 +4591,36 @@ pub fn dispatch_linux(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5
         163 => -38, // ENOSYS
         // 164: settimeofday — stub
         164 => 0,
+        // 165: mount(source, target, fstype, flags, data)
+        165 => {
+            let source_raw = read_cstring_from_user(arg1);
+            let target_raw = read_cstring_from_user(arg2);
+            let fstype_raw = read_cstring_from_user(arg3);
+            let flags = arg4;
+            let data_raw  = read_cstring_from_user(arg5);
+            let source = core::str::from_utf8(source_raw).unwrap_or("");
+            let target = core::str::from_utf8(target_raw).unwrap_or("");
+            let fstype = core::str::from_utf8(fstype_raw).unwrap_or("");
+            let data   = core::str::from_utf8(data_raw).unwrap_or("");
+            crate::vfs::sys_mount(source, target, fstype, flags, data)
+        }
+        // 166: umount(target)
+        166 => {
+            let target_raw = read_cstring_from_user(arg1);
+            let target = core::str::from_utf8(target_raw).unwrap_or("");
+            crate::vfs::sys_umount(target, 0)
+        }
+        // 167: swapon — stub ENOSYS (no swap on AstryxOS)
+        167 => -38, // ENOSYS
         // 168: poll(fds, nfds, timeout) — same as syscall 7
         168 => dispatch_linux(7, arg1, arg2, arg3, 0, 0, 0),
+        // 169: umount2(target, flags)
+        169 => {
+            let target_raw = read_cstring_from_user(arg1);
+            let target = core::str::from_utf8(target_raw).unwrap_or("");
+            let flags  = arg2;
+            crate::vfs::sys_umount(target, flags)
+        }
         // 185: rt_sigaction alias (some binaries use 185 on x86-64) — stub
         185 => sys_rt_sigaction_linux(arg1, arg2, arg3, arg4),
         // 198: lgetxattr — ENODATA (no extended attributes)
@@ -7333,4 +7361,19 @@ pub fn sys_ioctl_test(fd_num: usize, request: u64, arg_ptr: *mut u8) -> i64 {
 /// Used by tests when AC97 is absent and a real fd cannot be opened.
 pub fn dsp_ioctl_test(request: u64, arg_ptr: *mut u8) -> i64 {
     sys_dsp_ioctl(request, arg_ptr)
+}
+
+/// Mount a filesystem at `target`.  Callable from kernel test context.
+pub fn sys_mount_test(source: &str, target: &str, fstype: &str, flags: u64) -> i64 {
+    crate::vfs::sys_mount(source, target, fstype, flags, "")
+}
+
+/// Unmount the filesystem at `target`.  Callable from kernel test context.
+pub fn sys_umount_test(target: &str) -> i64 {
+    crate::vfs::sys_umount(target, 0)
+}
+
+/// Read `count` bytes from file descriptor `fd_num` into kernel buffer `buf`.
+pub fn sys_read_test(fd_num: usize, buf: *mut u8, count: usize) -> i64 {
+    sys_read_linux(fd_num as u64, buf as u64, count as u64)
 }
