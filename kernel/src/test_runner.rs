@@ -678,6 +678,16 @@ pub fn run() -> ! {
     total += 1;
     if test_po_shutdown_sweep() { passed += 1; }
 
+    // ── Test 107: ASLR — ET_DYN load base differs between two loads ───────
+
+    total += 1;
+    if test_aslr_elf_dyn() { passed += 1; }
+
+    // ── Test 108: ASLR — ET_EXEC load base is stable (never randomised) ───
+
+    total += 1;
+    if test_aslr_elf_exec_no_randomisation() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -13427,4 +13437,268 @@ fn test_po_shutdown_sweep() -> bool {
         test_pass!("Po shutdown driver-stop sweep");
     }
     ok
+// ── Test 106: ASLR — ET_DYN load base differs between two loads ──────────────
+//
+// Creates a minimal hand-crafted ET_DYN (PIE) ELF and loads it twice into
+// separate fresh address spaces.  With 28 bits of ASLR entropy the chance of
+// a collision is 1/2^28 ≈ 4e-9, so a collision almost certainly indicates a
+// broken ASLR implementation.
+//
+// NOTE: this test loads but does NOT execute the binary — it just verifies
+// that `load_elf` assigns a different `load_base` on each call.
+
+fn test_aslr_elf_dyn() -> bool {
+    test_header!("ASLR — ET_DYN load base differs between two loads");
+
+    // Minimal ET_DYN ELF64 — structurally identical to HELLO_ELF but with
+    // e_type=ET_DYN(3) and p_vaddr=0x0 (PIE link-time base).  The code uses
+    // RIP-relative addressing so it would be position-independent if run.
+    // For this test we only care about the load_base returned by load_elf.
+    //
+    // Binary layout (181 bytes):
+    //   0x00..0x40  ELF64 header
+    //   0x40..0x78  PT_LOAD program header (vaddr=0, memsz=0xB5)
+    //   0x78..0xA2  Code: write + exit_group via SYSCALL
+    //   0xA2..0xB5  Data: "Hello from Ring 3!\n"
+    let pie_elf: [u8; 181] = [
+        // ── ELF64 Header (64 bytes) ───────────────────────────────────────
+        0x7F, 0x45, 0x4C, 0x46, // magic \x7fELF
+        0x02,                   // EI_CLASS = ELFCLASS64
+        0x01,                   // EI_DATA  = ELFDATA2LSB
+        0x01,                   // EI_VERSION
+        0x00,                   // EI_OSABI
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // padding
+        0x03, 0x00,             // e_type = ET_DYN (PIE)
+        0x3E, 0x00,             // e_machine = EM_X86_64
+        0x01, 0x00, 0x00, 0x00, // e_version
+        0x78, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // e_entry = 0x78 (PIE offset)
+        0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // e_phoff = 64
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // e_shoff = 0
+        0x00, 0x00, 0x00, 0x00, // e_flags
+        0x40, 0x00,             // e_ehsize = 64
+        0x38, 0x00,             // e_phentsize = 56
+        0x01, 0x00,             // e_phnum = 1
+        0x00, 0x00,             // e_shentsize
+        0x00, 0x00,             // e_shnum
+        0x00, 0x00,             // e_shstrndx
+        // ── PT_LOAD Program Header (56 bytes) ────────────────────────────
+        0x01, 0x00, 0x00, 0x00, // p_type = PT_LOAD
+        0x05, 0x00, 0x00, 0x00, // p_flags = PF_R | PF_X
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // p_offset = 0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // p_vaddr  = 0x0 (PIE)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // p_paddr  = 0x0
+        0xB5, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // p_filesz = 181
+        0xB5, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // p_memsz  = 181
+        0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // p_align  = 0x1000
+        // ── Code (42 bytes, RIP-relative — position-independent) ─────────
+        0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1  (SYS_WRITE)
+        0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00, // mov rdi, 1  (stdout)
+        0x48, 0x8D, 0x35, 0x15, 0x00, 0x00, 0x00, // lea rsi, [rip + 0x15]
+        0x48, 0xC7, 0xC2, 0x13, 0x00, 0x00, 0x00, // mov rdx, 19
+        0x0F, 0x05,                                // syscall
+        0x48, 0xC7, 0xC0, 0xE7, 0x00, 0x00, 0x00, // mov rax, 231 (SYS_EXIT_GROUP)
+        0x48, 0x31, 0xFF,                          // xor rdi, rdi
+        0x0F, 0x05,                                // syscall
+        // ── Data: "Hello from Ring 3!\n" ───────────────────────────────────
+        0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x20,
+        0x66, 0x72, 0x6F, 0x6D, 0x20,
+        0x52, 0x69, 0x6E, 0x67, 0x20,
+        0x33, 0x21, 0x0A,
+    ];
+
+    // Sanity: verify the binary is recognised as ET_DYN.
+    match crate::proc::elf::validate_elf(&pie_elf) {
+        Ok(h) if h.e_type == 3 => {
+            test_println!("  ET_DYN ({}) confirmed ✓", h.e_type);
+        }
+        Ok(h) => {
+            test_fail!("aslr_elf_dyn", "unexpected e_type={} (want 3)", h.e_type);
+            return false;
+        }
+        Err(e) => {
+            test_fail!("aslr_elf_dyn", "validate_elf failed: {:?}", e);
+            return false;
+        }
+    }
+
+    // ── Load 1 ───────────────────────────────────────────────────────────────
+    let vm1 = match crate::mm::vma::VmSpace::new_user() {
+        Some(v) => v,
+        None => {
+            test_fail!("aslr_elf_dyn", "VmSpace::new_user() failed (load 1)");
+            return false;
+        }
+    };
+    let result1 = match crate::proc::elf::load_elf(&pie_elf, vm1.cr3) {
+        Ok(r) => r,
+        Err(e) => {
+            test_fail!("aslr_elf_dyn", "load_elf (1) failed: {:?}", e);
+            return false;
+        }
+    };
+    let base1 = result1.load_base;
+    test_println!("  Load 1 base: {:#x}", base1);
+    // Free physical pages from load 1.
+    for &p in &result1.allocated_pages { crate::mm::pmm::free_page(p); }
+
+    // ── Load 2 ───────────────────────────────────────────────────────────────
+    let vm2 = match crate::mm::vma::VmSpace::new_user() {
+        Some(v) => v,
+        None => {
+            test_fail!("aslr_elf_dyn", "VmSpace::new_user() failed (load 2)");
+            return false;
+        }
+    };
+    let result2 = match crate::proc::elf::load_elf(&pie_elf, vm2.cr3) {
+        Ok(r) => r,
+        Err(e) => {
+            test_fail!("aslr_elf_dyn", "load_elf (2) failed: {:?}", e);
+            return false;
+        }
+    };
+    let base2 = result2.load_base;
+    test_println!("  Load 2 base: {:#x}", base2);
+    for &p in &result2.allocated_pages { crate::mm::pmm::free_page(p); }
+
+    // ── Verify bases are 4 KiB-aligned and in user space ─────────────────────
+    if base1 & 0xFFF != 0 {
+        test_fail!("aslr_elf_dyn", "base1={:#x} not page-aligned", base1);
+        return false;
+    }
+    if base2 & 0xFFF != 0 {
+        test_fail!("aslr_elf_dyn", "base2={:#x} not page-aligned", base2);
+        return false;
+    }
+    if base1 >= 0xFFFF_8000_0000_0000 || base2 >= 0xFFFF_8000_0000_0000 {
+        test_fail!("aslr_elf_dyn", "load base in kernel space — ASLR overflow");
+        return false;
+    }
+
+    // ── Verify the two bases differ (probabilistic; P(collision) ≈ 1/2^28) ───
+    if base1 == base2 {
+        // A collision on 28 bits of entropy is negligible in practice but not
+        // impossible.  Perform a third load as a tiebreaker before declaring failure.
+        test_println!("  WARNING: base1 == base2 == {:#x}; trying a third load as tiebreaker", base1);
+        let vm3 = match crate::mm::vma::VmSpace::new_user() {
+            Some(v) => v,
+            None => {
+                test_fail!("aslr_elf_dyn", "VmSpace::new_user() failed (load 3)");
+                return false;
+            }
+        };
+        let result3 = match crate::proc::elf::load_elf(&pie_elf, vm3.cr3) {
+            Ok(r) => r,
+            Err(e) => {
+                test_fail!("aslr_elf_dyn", "load_elf (3) failed: {:?}", e);
+                return false;
+            }
+        };
+        let base3 = result3.load_base;
+        test_println!("  Load 3 base: {:#x}", base3);
+        for &p in &result3.allocated_pages { crate::mm::pmm::free_page(p); }
+
+        if base1 == base3 {
+            test_fail!(
+                "aslr_elf_dyn",
+                "ASLR produced identical base {:#x} on 3 consecutive loads — \
+                 randomisation appears broken",
+                base1
+            );
+            return false;
+        }
+    }
+
+    test_println!("  Bases differ: {:#x} vs {:#x} ✓  (28-bit ASLR active)", base1, base2);
+    test_pass!("ASLR — ET_DYN load base differs between two loads");
+    true
+}
+
+// ── Test 107: ASLR — ET_EXEC load base is stable (never randomised) ──────────
+//
+// Load the HELLO_ELF (ET_EXEC) binary twice and assert the load_base is
+// identical both times.  ET_EXEC images contain absolute addresses baked in
+// by the linker; randomising them would break all absolute references.
+
+fn test_aslr_elf_exec_no_randomisation() -> bool {
+    test_header!("ASLR — ET_EXEC load base is stable (never randomised)");
+
+    let data = &crate::proc::hello_elf::HELLO_ELF;
+
+    // Confirm it is ET_EXEC.
+    match crate::proc::elf::validate_elf(data) {
+        Ok(h) if h.e_type == 2 => {
+            test_println!("  ET_EXEC ({}) confirmed ✓", h.e_type);
+        }
+        Ok(h) => {
+            test_fail!("aslr_elf_exec", "unexpected e_type={} (want 2=ET_EXEC)", h.e_type);
+            return false;
+        }
+        Err(e) => {
+            test_fail!("aslr_elf_exec", "validate_elf failed: {:?}", e);
+            return false;
+        }
+    }
+
+    // ── Load 1 ───────────────────────────────────────────────────────────────
+    let vm1 = match crate::mm::vma::VmSpace::new_user() {
+        Some(v) => v,
+        None => {
+            test_fail!("aslr_elf_exec", "VmSpace::new_user() failed (load 1)");
+            return false;
+        }
+    };
+    let result1 = match crate::proc::elf::load_elf(data, vm1.cr3) {
+        Ok(r) => r,
+        Err(e) => {
+            test_fail!("aslr_elf_exec", "load_elf (1) failed: {:?}", e);
+            return false;
+        }
+    };
+    let base1 = result1.load_base;
+    test_println!("  Load 1 base: {:#x}", base1);
+    for &p in &result1.allocated_pages { crate::mm::pmm::free_page(p); }
+
+    // ── Load 2 ───────────────────────────────────────────────────────────────
+    let vm2 = match crate::mm::vma::VmSpace::new_user() {
+        Some(v) => v,
+        None => {
+            test_fail!("aslr_elf_exec", "VmSpace::new_user() failed (load 2)");
+            return false;
+        }
+    };
+    let result2 = match crate::proc::elf::load_elf(data, vm2.cr3) {
+        Ok(r) => r,
+        Err(e) => {
+            test_fail!("aslr_elf_exec", "load_elf (2) failed: {:?}", e);
+            return false;
+        }
+    };
+    let base2 = result2.load_base;
+    test_println!("  Load 2 base: {:#x}", base2);
+    for &p in &result2.allocated_pages { crate::mm::pmm::free_page(p); }
+
+    // ── ET_EXEC must produce the same base both times ─────────────────────────
+    if base1 != base2 {
+        test_fail!(
+            "aslr_elf_exec",
+            "ET_EXEC produced different bases: {:#x} vs {:#x} — \
+             ET_EXEC must never be randomised",
+            base1, base2
+        );
+        return false;
+    }
+
+    // The expected fixed base for HELLO_ELF is 0x400000 (its PT_LOAD p_vaddr).
+    if base1 != 0x400000 {
+        test_fail!(
+            "aslr_elf_exec",
+            "ET_EXEC base={:#x}, expected 0x400000",
+            base1
+        );
+        return false;
+    }
+
+    test_println!("  Both loads → {:#x} (deterministic) ✓", base1);
+    test_pass!("ASLR — ET_EXEC load base is stable (never randomised)");
+    true
 }
