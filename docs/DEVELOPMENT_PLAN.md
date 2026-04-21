@@ -24,57 +24,48 @@ The review is the *diagnosis*; this is the *treatment plan*.
 
 ---
 
-## Wave 1 — in flight (parallel worktrees)
+## Wave 1 — LANDED (2026-04-20/21)
 
-Four independent kernel engineers are working right now on bounded tasks that
-do not share files. Each will come back with a feature branch to merge.
+All P0/P1 punch-list items from section 6 of the review, plus two P2s:
+
+| Task | Priority | Branch | Status |
+|---|---|---|---|
+| `fix/bootloader-friendly-errors` | P0 | merged `578ef4c` | structured LoadError with 7 failure modes + UEFI halt |
+| `fix/execve-vmspace-leak` | P0 | merged `fbdca79` | 17-page leak vs 24 tolerance across 3 exec iters |
+| Win32 PE test gated | P0 | `38554f7` | unblocks headless runner |
+| `feat/procfs-vfs-mount` | P1 | merged `55d615c` | cpuinfo/meminfo/uptime/version + self/maps/status/cmdline |
+| `feat/virtio-net-functional` | P1 | merged `2935c3b` | PCI probe + virtqueue TX/RX; e1000 kept as fallback |
+| `feat/inotify-real-events` | P1 | merged `4f05ad4` | CREATE/DELETE/MODIFY/MOVE from VFS hooks |
+| `fix/inotify-modify-fd-readable` | P1 | merged `f972848` | MODIFY marks fd readable + wakes poll/epoll |
+| `feat/oom-killer` | P2 | merged `1c437b7` | largest-RSS scoring, init/kernel protected |
+| `feat/wm-gdi-title-text` | P2 | merged `a5057a5` | GDI text engine for title bars |
+| `feat/heap-guard-pages` | P2 | merged `f2f0495` | PMM-reserved physical frames + not-present PTEs |
+| watchdog `+rdtscp` fix | Tooling | `22abefa` | scripts/watch-test.py now matches run-test.sh CPU flags |
+
+Result: **101/107 tests passing** (up from 95/95 baseline; 6 remaining failures are all infrastructure-dependent, need `build-musl.sh`, `build-tcc.sh`, or a dynamic-linker interp).
+
+---
+
+## Wave 2 — in flight (parallel worktrees)
 
 | # | Task | Priority | Scope |
 |---|---|---|---|
-| 1 | `fix/execve-vmspace-leak` | **P0** | Reclaim old VmSpace pages on `execve`. Regression test asserts stable PMM free-page count across repeated fork→execve. |
-| 2 | `feat/procfs-vfs-mount` | **P1** | Plug `procfs` into the VFS at `/proc` with `cpuinfo`, `meminfo`, `uptime`, `version`, `self/maps`, `self/status`, `self/cmdline`. Unlocks glibc/Firefox checks. |
-| 3 | `feat/virtio-net-functional` | **P1** | PCI-probed virtio-net driver with virtqueue TX/RX and IRQ handling, mirroring the `virtio_blk` pattern. e1000 kept as fallback. |
-| 4 | `feat/inotify-real-events` | **P1** | Real event delivery from VFS hooks (CREATE/DELETE/MODIFY/MOVE), bounded event queues, poll/epoll integration. |
+| 1 | `feat/driver-stop-sweep` | **P1** | Wire `po/shutdown.rs` to call every driver's `stop()` in order. |
+| 2 | `feat/aslr-pe-elf` | **P2** | Randomise base for ET_DYN ELF + PE32+ DYNAMIC_BASE images. |
+| 3 | `feat/xhci-device-enumeration` | **P2** | Real PCI probe + MMIO decode + root-hub port count (no endpoint setup yet). |
 
-Expected merge order: 1 → 2 → 3 → 4. Build + headless test between merges.
+All three agents instructed to use `python3 scripts/watch-test.py --idle-timeout 45 --hard-timeout 300` as the canonical test command so hangs abort in 45 s.
 
 ---
 
-## Wave 2 — queued after Wave 1 merges
+## Wave 3 — queued
 
-These were held back from Wave 1 because they would conflict with the in-flight
-agents (same files).
-
-| # | Task | Priority | Why held |
+| # | Task | Priority | Notes |
 |---|---|---|---|
-| 5 | `fix/bootloader-friendly-errors` | **P0** | Independent of kernel Waves; parallelisable but trivial — held for batch. |
-| 6 | `refactor/syscall-split` | **P1** | Splits the 7175-line `syscall/mod.rs` into `subsys/linux/syscall.rs` + `subsys/aether/syscall.rs` per the documented Phase 0.2 plan. Conflicts with Wave 1 agent 1 (execve) and agent 4 (inotify). Do after both merge. |
-| 7 | `feat/driver-stop-sweep` | **P1** | Wire `po/shutdown.rs` to call every registered driver's `stop()`. Touches many files; safer in isolation. |
-
----
-
-## Wave 3 — P2 hardening (independent, can parallelise)
-
-Once Waves 1–2 are merged and stable, the following are good parallel-agent
-candidates. Each is independently useful; none blocks Firefox rendering on
-its own, but together they lift AstryxOS from "Firefox runs" to "Firefox is
-robust."
-
-1. **ASLR in the PE/ELF loaders** (`proc/pe.rs`, `proc/elf.rs`) — randomise
-   the base for PIE / PE32+ / interpreter.
-2. **Heap guard pages** (`mm/heap.rs`) — detect kernel heap overflow at the
-   page-fault boundary instead of corrupting neighbouring allocations.
-3. **OOM killer** (`mm/oom.rs`, new) — on PMM exhaustion, pick the largest-RSS
-   non-critical process and send SIGKILL instead of panicking.
-4. **Real `mount` syscall** — wire `sys_mount` into the VFS so userspace can
-   mount filesystems at runtime (useful for tmpfs, devpts, debugfs).
-5. **Font-rendered window titles** (`wm/decorator.rs:123`) — switch from
-   bitmap to GDI `TextOut`.
-6. **Mount syscall + tmpfs** — make `/tmp` real rather than bolted onto ramfs.
-7. **AC97 as a device file** (`drivers/ac97.rs`, `vfs/mod.rs`) — expose at
-   `/dev/dsp` or similar so userspace can produce audio.
-8. **Real xHCI device enumeration** (`drivers/xhci.rs`) — currently a stub.
-   Priority driven by USB HID / mass-storage need.
+| 4 | `refactor/syscall-split` | **P1** | Splits 7175-line `syscall/mod.rs` into `subsys/linux/syscall.rs` + `subsys/aether/syscall.rs`. Big refactor — sequential, not parallel. |
+| 5 | `feat/mount-syscall-tmpfs` | **P2** | Wire `sys_mount` + real tmpfs at `/tmp`. Touches syscall/mod.rs so scheduled after split. |
+| 6 | `feat/ac97-device-file` | **P2** | Expose AC97 at `/dev/dsp`. Touches `vfs/mod.rs` + `drivers/ac97.rs`. |
+| 7 | `infra/musl-tcc-rebuild` | **Infrastructure** | Run `build-musl.sh` + `build-tcc.sh` + regenerate `data.img` so 6 disk-dependent tests move from FAIL to PASS. |
 
 ---
 
