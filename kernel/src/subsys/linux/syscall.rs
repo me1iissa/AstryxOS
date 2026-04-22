@@ -117,6 +117,15 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
             trace_pid, num, arg1, arg2, arg3);
     }
 
+    // ── Global syscall counter (used by Firefox oracle test) ─────────────────
+    {
+        let pid = crate::proc::current_pid();
+        if pid >= 1 {
+            crate::syscall::FIREFOX_SYSCALL_COUNT
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     // ── Transient debug trace: log Linux syscalls from user processes ─────────
     #[cfg(feature = "firefox-test")]
     {
