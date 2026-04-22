@@ -76,10 +76,23 @@ const EM_X86_64: u16 = 62;
 const PT_LOAD: u32 = 1;
 /// Program header type: interpreter path (e.g. "/lib/ld-musl-x86_64.so.1")
 const PT_INTERP: u32 = 3;
+/// Program header type: dynamic linking information
+const PT_DYNAMIC: u32 = 2;
 /// Program header type: program header table location
 const PT_PHDR: u32 = 6;
 /// Program header type: thread-local storage template
 const PT_TLS: u32 = 7;
+
+/// Dynamic section tag: packed relative relocations array address
+const DT_RELR: u64 = 36;
+/// Dynamic section tag: packed relative relocations array size in bytes
+const DT_RELRSZ: u64 = 35;
+/// Dynamic section tag: size of one DT_RELR entry (always 8 on x86_64)
+const DT_RELRENT: u64 = 37;
+/// Dynamic section tag: GNU hash table (tolerate, do not reject when DT_HASH absent)
+const DT_GNU_HASH: u64 = 0x6ffffef5;
+/// Dynamic section tag: end of dynamic array
+const DT_NULL: u64 = 0;
 
 /// ELF type: dynamically-linked shared object / PIE
 const ET_DYN: u16 = 3;
@@ -245,6 +258,211 @@ fn pie_aslr_base() -> u64 {
     // fall back to PIE_BASE.  In practice 4 MiB + 1 TiB << 128 TiB limit.
     let base = PIE_BASE.saturating_add(offset);
     if base >= 0xFFFF_8000_0000_0000 { PIE_BASE } else { base }
+}
+
+/// ELF64 Dynamic section entry (Elf64_Dyn).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct Elf64Dyn {
+    d_tag: u64,
+    d_val: u64, // union d_un: both d_val and d_ptr are u64
+}
+
+/// Apply one DT_RELR relocation slot at link-time virtual address `slot_lva`.
+///
+/// Translates `slot_lva` to a physical address via `mapped_pages`, then adds
+/// `load_bias` to the u64 stored at that location.
+///
+/// `mapped_pages` — (page_vaddr_at_runtime, phys_addr) pairs built during PT_LOAD.
+/// `load_bias`    — bias added to all virtual addresses for this binary.
+/// `slot_lva`     — link-time virtual address of the relocation target.
+///
+/// Returns `false` and logs if the page containing `slot_lva` is not found.
+#[inline]
+fn relr_patch_slot(
+    mapped_pages: &[(u64, u64)],
+    load_bias: u64,
+    slot_lva: u64,
+) -> bool {
+    // The slot's runtime VA is slot_lva + load_bias.
+    let slot_rva = slot_lva.wrapping_add(load_bias);
+    let page_rva = slot_rva & !0xFFF;
+    let byte_off = (slot_rva & 0xFFF) as usize;
+
+    for &(page_va, phys) in mapped_pages {
+        if page_va == page_rva {
+            // SAFETY: `phys` is a valid PMM page, mapped into the direct map.
+            // `byte_off + 8 <= PAGE_SIZE` because slot_rva is within this page
+            // and a u64 cannot straddle a 4 KiB boundary (slots are 8-byte aligned
+            // by the DT_RELR spec — the ELF linker guarantees alignment).
+            unsafe {
+                let ptr = phys_to_virt(phys).add(byte_off) as *mut u64;
+                let old = core::ptr::read(ptr);
+                core::ptr::write(ptr, old.wrapping_add(load_bias));
+            }
+            return true;
+        }
+    }
+    crate::serial_println!(
+        "[ELF] DT_RELR: slot_lva={:#x} (rva={:#x}) not in mapped pages",
+        slot_lva, slot_rva
+    );
+    false
+}
+
+/// Apply DT_RELR packed relative relocations.
+///
+/// Called after PT_LOAD segments are loaded. `relr_off` and `relr_sz` are the
+/// file offset and byte length of the DT_RELR table within `data`.
+/// `load_bias` is the ASLR offset applied to all VAs.
+/// `mapped_pages` is the (runtime_page_va, phys) table built during PT_LOAD.
+///
+/// # DT_RELR encoding (64-bit, little-endian)
+/// Each 8-byte word is either:
+///   - An **address entry** (bit 0 == 0): sets the current group base to this
+///     link-time VA.  This word is also a pointer slot — we relocate it too.
+///   - A **bitmap entry** (bit 0 == 1): bits 1..63 describe up to 63 pointer
+///     slots at base, base+8, …, base+496.  Bit N set (counting from 1) means
+///     relocate the slot at `base + (N-1)*8`.  After processing the 63 slots,
+///     advance base by 63*8 = 504 bytes.
+///
+/// Reference: <https://sourceware.org/glibc/wiki/RelativeRelocations>
+fn apply_relr_relocations(
+    data: &[u8],
+    relr_off: usize,
+    relr_sz: usize,
+    load_bias: u64,
+    mapped_pages: &[(u64, u64)],
+) {
+    if load_bias == 0 || relr_sz == 0 {
+        // No bias → all stored addresses are already correct runtime values.
+        return;
+    }
+
+    let n_words = relr_sz / 8;
+    let mut base_lva: u64 = 0; // current link-time VA of the group base
+
+    for i in 0..n_words {
+        let off = relr_off + i * 8;
+        if off + 8 > data.len() {
+            break;
+        }
+        let word = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+
+        if word & 1 == 0 {
+            // Address entry: this word itself is a pointer slot AND sets base_lva.
+            // Apply the relocation to this slot first.
+            base_lva = word; // link-time VA stored in the RELR entry = slot address
+            relr_patch_slot(mapped_pages, load_bias, base_lva);
+            // base_lva now points just past this address entry; the next bitmap
+            // (if any) starts from the slot AFTER this one.
+            base_lva = base_lva.wrapping_add(8);
+        } else {
+            // Bitmap entry: strip marker bit, then scan bits 0..62.
+            // Bit 0 after stripping → slot at base_lva + 0*8 = base_lva
+            // Bit 1 after stripping → slot at base_lva + 1*8
+            // ...
+            // Bit 62 after stripping → slot at base_lva + 62*8
+            let mut bitmap = word >> 1;
+            let mut slot_off: u64 = 0;
+            while bitmap != 0 {
+                if bitmap & 1 != 0 {
+                    relr_patch_slot(mapped_pages, load_bias, base_lva.wrapping_add(slot_off));
+                }
+                bitmap >>= 1;
+                slot_off = slot_off.wrapping_add(8);
+            }
+            // Advance base by 63 slots (the 63 bits that could have been set).
+            base_lva = base_lva.wrapping_add(63 * 8);
+        }
+    }
+}
+
+/// Parse the PT_DYNAMIC section of a loaded ELF and return
+/// `(relr_file_offset, relr_sz, has_gnu_hash)`.
+///
+/// `data`     — raw ELF binary bytes.
+/// `phdrs`    — (p_type, p_offset, p_vaddr, p_filesz) tuples extracted from program headers.
+/// `load_bias`— PIE ASLR bias (0 for ET_EXEC).
+///
+/// The DT_RELR/DT_RELRSZ entries store *virtual addresses* (not file offsets).
+/// We convert VA → file offset by: `file_off = va - bias - (segment_vaddr - segment_foffset)`.
+/// For a minimal single-segment ET_DYN binary the segment's p_vaddr == 0 so
+/// `file_off = va - bias`.  For multi-segment binaries we search the PT_LOAD
+/// that covers the VA.
+fn parse_dynamic_for_relr(
+    data: &[u8],
+    header: &Elf64Header,
+    load_bias: u64,
+) -> (usize, usize, bool) {
+    let ph_off  = header.e_phoff as usize;
+    let ph_sz   = header.e_phentsize as usize;
+    let ph_cnt  = header.e_phnum as usize;
+
+    // Collect PT_LOAD segments so we can VA→file-offset translate.
+    let mut loads: alloc::vec::Vec<(u64, u64, u64)> = alloc::vec::Vec::new(); // (p_vaddr, p_offset, p_filesz)
+    let mut dyn_off: usize = 0;
+    let mut dyn_sz: usize  = 0;
+
+    for i in 0..ph_cnt {
+        let base = ph_off + i * ph_sz;
+        if base + ph_sz > data.len() { continue; }
+        let phdr = unsafe { &*(data.as_ptr().add(base) as *const Elf64Phdr) };
+        if phdr.p_type == PT_LOAD {
+            loads.push((phdr.p_vaddr, phdr.p_offset, phdr.p_filesz));
+        }
+        if phdr.p_type == PT_DYNAMIC {
+            dyn_off = phdr.p_offset as usize;
+            dyn_sz  = phdr.p_filesz as usize;
+        }
+    }
+
+    if dyn_sz == 0 || dyn_off + dyn_sz > data.len() {
+        return (0, 0, false);
+    }
+
+    // VA → file offset translation helper.
+    // For a PIE binary loaded at link-time base 0 (typical), all VAs from the
+    // dynamic section are link-time VAs, so file_off = va (since p_vaddr == 0
+    // and p_offset == 0 for the first load segment in a minimal PIE).
+    let va_to_file_off = |va: u64| -> Option<usize> {
+        // Try each PT_LOAD segment.
+        for &(seg_va, seg_off, seg_filesz) in &loads {
+            if va >= seg_va && va < seg_va + seg_filesz {
+                return Some((seg_off + (va - seg_va)) as usize);
+            }
+        }
+        None
+    };
+
+    let n_entries = dyn_sz / 16; // each Elf64_Dyn is 16 bytes
+    let mut relr_va:  u64 = 0;
+    let mut relr_sz:  u64 = 0;
+    let mut has_gnu_hash = false;
+
+    for i in 0..n_entries {
+        let base = dyn_off + i * 16;
+        if base + 16 > data.len() { break; }
+        let dyn_entry = unsafe { &*(data.as_ptr().add(base) as *const Elf64Dyn) };
+        match dyn_entry.d_tag {
+            DT_NULL    => break,
+            DT_RELR    => { relr_va  = dyn_entry.d_val; }
+            DT_RELRSZ  => { relr_sz  = dyn_entry.d_val; }
+            DT_GNU_HASH => { has_gnu_hash = true; }
+            _ => {}
+        }
+    }
+
+    let relr_file_off = if relr_va != 0 && relr_sz != 0 {
+        // DT_RELR stores a link-time VA (not adjusted by bias).
+        // Subtract bias first to get the link-time VA, then convert to file offset.
+        let lva = relr_va.wrapping_sub(load_bias);
+        va_to_file_off(lva).unwrap_or(0)
+    } else {
+        0
+    };
+
+    (relr_file_off, relr_sz as usize, has_gnu_hash)
 }
 
 /// Validate and parse an ELF64 header.
@@ -487,6 +705,22 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
         return Err(ElfError::NoLoadSegments);
     }
 
+    // ── Apply DT_RELR packed relative relocations (PIE + ASLR) ─────────
+    // For ET_DYN with ASLR, all stored absolute pointers in .got/.data need
+    // to be adjusted by pie_bias.  The DT_RELR table encodes which slots to
+    // patch.  ET_EXEC binaries (pie_bias==0) need no patching.
+    if pie_bias != 0 {
+        let (relr_off, relr_sz, _has_gnu_hash) =
+            parse_dynamic_for_relr(data, header, 0 /* link-time bias = 0 for ET_DYN */);
+        if relr_sz > 0 {
+            crate::serial_println!(
+                "[ELF] DT_RELR: applying {} bytes at file offset {:#x} with bias={:#x}",
+                relr_sz, relr_off, pie_bias
+            );
+            apply_relr_relocations(data, relr_off, relr_sz, pie_bias, &mapped_pages);
+        }
+    }
+
     // Allocate user stack (grows down from USER_STACK_TOP).
     // The full VMA covers USER_STACK_MAX (1 MiB) for lazy growth; only the
     // top USER_STACK_PAGES are pre-mapped below.  A PROT_NONE guard page sits
@@ -710,6 +944,77 @@ pub fn is_elf(data: &[u8]) -> bool {
     data.len() >= 4 && data[0..4] == ELF_MAGIC
 }
 
+/// Test-only: apply DT_RELR relocations to an in-memory image buffer.
+///
+/// This version treats the buffer as both the file image AND the runtime image
+/// (i.e., the pages are already kernel-visible and the load_bias was already
+/// applied to the addresses).  Used exclusively by `test_runner.rs` to verify
+/// the DT_RELR algorithm without spinning up a full process address space.
+///
+/// `image`     — mutable byte slice of the loaded image (writable, kernel-mapped)
+/// `load_base` — base address at which the image is logically loaded
+/// `relr_off`  — byte offset of the DT_RELR table within `image`
+/// `relr_sz`   — byte length of the DT_RELR table
+/// `load_bias` — value to add to each slot (= load_base for a binary loaded at bias)
+///
+/// Each slot in the DT_RELR table is a u64 within `image` at
+/// `(slot_link_time_va - 0) + 0 == slot_link_time_va` (for min_vaddr=0 PIE).
+/// The slot values are incremented in-place by `load_bias`.
+#[cfg(feature = "test-mode")]
+pub fn apply_relr_in_place(image: &mut [u8], relr_off: usize, relr_sz: usize, load_bias: u64) {
+    if load_bias == 0 || relr_sz == 0 || relr_off + relr_sz > image.len() {
+        return;
+    }
+
+    let n_words = relr_sz / 8;
+    let mut base_lva: u64 = 0;
+
+    for i in 0..n_words {
+        let off = relr_off + i * 8;
+        if off + 8 > image.len() { break; }
+        let word = u64::from_le_bytes(image[off..off + 8].try_into().unwrap());
+
+        if word & 1 == 0 {
+            // Address entry: this word is the link-time VA of the next slot,
+            // AND the slot itself gets relocated.
+            base_lva = word;
+            // Patch the slot at base_lva (which is an offset into image for min_vaddr=0 PIE).
+            let slot_off = base_lva as usize;
+            if slot_off + 8 <= image.len() {
+                let old = u64::from_le_bytes(image[slot_off..slot_off + 8].try_into().unwrap());
+                image[slot_off..slot_off + 8].copy_from_slice(&(old.wrapping_add(load_bias)).to_le_bytes());
+            }
+            base_lva = base_lva.wrapping_add(8);
+        } else {
+            // Bitmap entry.
+            let mut bitmap = word >> 1;
+            let mut slot_delta: u64 = 0;
+            while bitmap != 0 {
+                if bitmap & 1 != 0 {
+                    let slot_off = (base_lva.wrapping_add(slot_delta)) as usize;
+                    if slot_off + 8 <= image.len() {
+                        let old = u64::from_le_bytes(image[slot_off..slot_off + 8].try_into().unwrap());
+                        image[slot_off..slot_off + 8].copy_from_slice(&(old.wrapping_add(load_bias)).to_le_bytes());
+                    }
+                }
+                bitmap >>= 1;
+                slot_delta = slot_delta.wrapping_add(8);
+            }
+            base_lva = base_lva.wrapping_add(63 * 8);
+        }
+    }
+}
+
+/// Test-only: parse PT_DYNAMIC for DT_RELR info and DT_GNU_HASH presence.
+/// Returns `(relr_file_off, relr_sz, has_gnu_hash)`.
+#[cfg(feature = "test-mode")]
+pub fn parse_dynamic_test(data: &[u8]) -> (usize, usize, bool) {
+    match validate_elf(data) {
+        Ok(h) => parse_dynamic_for_relr(data, h, 0),
+        Err(_) => (0, 0, false),
+    }
+}
+
 /// Load an ET_DYN shared object (dynamic linker / shared library) at a fixed base.
 ///
 /// All PT_LOAD segments are loaded with a bias so that the lowest-address
@@ -829,6 +1134,21 @@ fn load_elf_dyn(
                 crate::mm::refcount::page_ref_set(phys, 1);
                 mapped_pages.push((page_vaddr, phys));
             }
+        }
+    }
+
+    // ── Apply DT_RELR packed relative relocations for interpreter ───────
+    // The interpreter (ld-linux-x86-64.so.2) may use DT_RELR for its own
+    // internal pointers.  bias is the ASLR offset applied to all its VAs.
+    if bias != 0 {
+        let (relr_off, relr_sz, _has_gnu_hash) =
+            parse_dynamic_for_relr(data, header, 0 /* link-time bias = 0 */);
+        if relr_sz > 0 {
+            crate::serial_println!(
+                "[ELF] DT_RELR(interp): {} bytes at file offset {:#x} bias={:#x}",
+                relr_sz, relr_off, bias
+            );
+            apply_relr_relocations(data, relr_off, relr_sz, bias, &mapped_pages);
         }
     }
 
