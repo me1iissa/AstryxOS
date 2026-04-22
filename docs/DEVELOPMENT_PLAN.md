@@ -1,6 +1,6 @@
 # AstryxOS Development Plan
 
-**Last updated:** 2026-04-20
+**Last updated:** 2026-04-22
 **Target:** 1.0-RC1 — "Firefox boots to a rendered page inside AstryxOS."
 
 This document is the operational companion to `SOURCE_REVIEW_2026-04-20.md`.
@@ -10,17 +10,18 @@ The review is the *diagnosis*; this is the *treatment plan*.
 
 ## Current state snapshot
 
-- **~76.4 KLOC** kernel + tooling across 152 Rust files.
-- **95/95 headless tests passing** per `.ai/PROGRESS.md`.
-- **Dual ABI:** 181 Linux syscalls dispatched; 50 native Aether syscalls.
+- **~83 KLOC** kernel + tooling across 170+ Rust files.
+- **139/140 headless tests passing** (143 total; one Win32 PE test gated behind
+  `win32-pe-test` feature flag).
+- **Dual ABI:** 193 Linux syscalls dispatched; 50+ native Aether syscalls.
+- **glibc milestone:** glibc-linked hello world runs end-to-end on the data disk
+  (`ld-musl-x86_64.so.1` + glibc dynamic linker fully functional).
 - **Firefox milestone:** content process has reached 56K+ syscalls, completes
   `vfork` → `execve`, but does not yet render a page end-to-end.
-- **Active blockers** (per source review §6):
-  - P0: `execve` leaks VmSpace pages; bootloader panics on missing kernel.
-  - P1: virtio-net TX/RX stubbed; `/proc` not VFS-mounted; inotify silent;
-    `syscall/mod.rs` is a 7175-line monolith; no driver stop sweep on shutdown.
-  - P2: ASLR, font-rendered window titles, OOM killer, heap guard pages, mount
-    syscall, swap, real xHCI, AC97 device file, FS journaling, sleep/hibernate.
+- **Active blockers** (post-Wave-8):
+  - Firefox network I/O path not yet exercised end-to-end.
+  - WebRender framebuffer fast-path not yet wired.
+  - NSS/NSPR not yet ported.
 
 ---
 
@@ -59,27 +60,87 @@ Result: **104/111 passing** (up from 101/107). +4 tests, +3 passing (+1 flaky ne
 
 ---
 
-## Wave 3 — in flight (parallel worktrees)
+## Wave 3 — LANDED
 
-| # | Task | Priority | Scope |
-|---|---|---|---|
-| 1 | `feat/ac97-dev-dsp` | **P2** | Expose AC97 at `/dev/dsp` — open/write/ioctl/poll. Graceful ENODEV when absent. |
-| 2 | `feat/fat32-read-write` | **P2** | Cluster allocator + create/write/truncate/unlink on FAT32. |
+| # | Task | Priority | Branch | Status |
+|---|---|---|---|---|
+| 1 | `feat/ac97-dev-dsp` | P2 | merged | AC97 at `/dev/dsp`; graceful ENODEV when absent |
+| 2 | `feat/fat32-read-write` | P2 | merged | cluster allocator + create/write/truncate/unlink on FAT32 |
+
+Result: **~111 tests passing**.
 
 ---
 
-## Wave 4 — queued
+## Wave 4 — LANDED
+
+| # | Task | Priority | Branch | Status |
+|---|---|---|---|---|
+| 1 | `refactor/syscall-split` | P1 | merged `d01bf9e` | split 7175-line `syscall/mod.rs` into `subsys/linux/` + `subsys/aether/` |
+| 2 | `feat/mount-syscall-tmpfs` | P2 | merged `c733bc8` | `sys_mount` / `sys_umount` + real tmpfs at `/tmp` |
+
+Result: **~113 tests passing**.
+
+---
+
+## Wave 5 — LANDED
+
+| # | Task | Priority | Branch | Status |
+|---|---|---|---|---|
+| 1 | `infra/glibc-dynamic-linker` | P1 | merged `e6c8e3a` | `ld-musl-x86_64.so.1` + glibc libs + `/etc` seed on data disk |
+| 2 | `test/glibc-hello-runs` | P1 | merged with above | oracle test: fork → exec glibc hello → check exit 0 |
+
+Result: **glibc hello runs end-to-end**. ~120 tests passing.
+
+---
+
+## Wave 6 — LANDED
+
+| # | Task | Priority | Branch | Status |
+|---|---|---|---|---|
+| 1 | `feat/procfs-auxv-environ-fd` | P1 | merged `07ff3d3` | `/proc/self/auxv`, `/proc/self/environ`, `/proc/<pid>/fd/` symlinks |
+| 2 | `feat/glibc-critical-syscalls` | P1 | merged `41720e5` | statx, getrandom, mremap, set/get_robust_list, membarrier |
+| 3 | `feat/elf-dt-relr-gnu-hash` | P1 | merged `62c8538` | ELF loader accepts DT_RELR packed relocations + DT_GNU_HASH |
+
+Result: **~130 tests passing**.
+
+---
+
+## Wave 7 — LANDED
+
+| # | Task | Priority | Branch | Status |
+|---|---|---|---|---|
+| 1 | `feat/qemu-harness-tier1` | Tooling | merged `67c2d1a` | agentic QEMU session manager — JSON protocol, session/log/events |
+| 2 | `feat/qemu-harness-tier2` | Tooling | merged `26fae57` | GDB RSP stub client (regs/mem/sym/bp/step/cont/pause/resume) |
+
+Result: full agentic debug harness available.
+
+---
+
+## Wave 8 — LANDED
+
+| # | Task | Priority | Branch | Status |
+|---|---|---|---|---|
+| 1 | `feat/x11-extensions` | P2 | merged `a157034` | MIT-SHM, BIG-REQUESTS, XKB, XFIXES, SYNC, RENDER stubs |
+| 2 | `test/x11-extension-audit` | P2 | merged `0e23c50` | 6 new tests verifying 5 pre-existing + RENDER extensions |
+| 3 | `fix/tgkill-tgid` | P1 | merged `337fbbd` | tgkill uses tgid (arg1) not tid (arg2) for signal delivery |
+| 4 | `fix/termios-struct-size` | P1 | merged `6dc5308` | Termios struct 36 bytes (not 60); fixes glibc stack-canary smash |
+
+Result: **139/140 tests passing** (143 total, one Win32 PE test gated).
+
+---
+
+## Wave 9 — current priorities
 
 | # | Task | Priority | Notes |
 |---|---|---|---|
-| 4 | `refactor/syscall-split` | **P1** | Split 7175-line `syscall/mod.rs` into `subsys/linux/syscall.rs` + `subsys/aether/syscall.rs`. Sequential — not parallelisable. |
-| 5 | `feat/mount-syscall-tmpfs` | **P2** | Wire `sys_mount` + real tmpfs at `/tmp`. Touches syscall/mod.rs — schedule after split. |
-| 6 | `feat/oom-kill-for-firefox` | **P2** | Extend OOM killer to score_adj via prctl. |
-| 7 | `infra/musl-tcc-rebuild` | **Infrastructure** | Run `build-musl.sh` + `build-tcc.sh` + regenerate `data.img` so 6 disk-dependent tests move from FAIL to PASS. |
+| 1 | Firefox network path | P0 | Exercise TCP connect through the virtio-net stack from Firefox content process |
+| 2 | WebRender framebuffer | P1 | Wire WebRender software renderer output to kernel framebuffer |
+| 3 | NSS/NSPR port | P1 | Needed for HTTPS; depends on DNS and TCP being stable |
+| 4 | `feat/oom-kill-score-adj` | P2 | Extend OOM killer to honour `score_adj` via prctl |
 
 ---
 
-## Wave 4 — post-RC1 stretch
+## Post-RC1 stretch
 
 1. Swap / page eviction for memory-pressure response.
 2. Filesystem journaling (ext4 / NTFS read-write).
