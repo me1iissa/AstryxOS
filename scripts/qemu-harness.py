@@ -9,8 +9,9 @@ Session state is stored in ~/.astryx-harness/<sid>.json.
 Events are written to ~/.astryx-harness/<sid>.events.jsonl.
 QMP socket: ~/.astryx-harness/<sid>.qmp.sock
 
-Usage:
+Tier 1 — session management:
     python3 scripts/qemu-harness.py start [--features FLAGS] [--no-build]
+                                          [--gdb-port PORT] [--gdb-wait]
     python3 scripts/qemu-harness.py stop <sid>
     python3 scripts/qemu-harness.py list
     python3 scripts/qemu-harness.py wait <sid> <regex> [--ms MS]
@@ -20,6 +21,16 @@ Usage:
     python3 scripts/qemu-harness.py status <sid>
     python3 scripts/qemu-harness.py events <sid> [--tail N] [--follow]
     python3 scripts/qemu-harness.py snap <sid> save|load <name>
+
+Tier 2 — GDB stub integration (requires --gdb-port on start):
+    python3 scripts/qemu-harness.py regs <sid>
+    python3 scripts/qemu-harness.py mem <sid> <addr> <len>
+    python3 scripts/qemu-harness.py sym <sid> <name>
+    python3 scripts/qemu-harness.py bp <sid> add|del|list <addr>
+    python3 scripts/qemu-harness.py step <sid>
+    python3 scripts/qemu-harness.py cont <sid>
+    python3 scripts/qemu-harness.py pause <sid>
+    python3 scripts/qemu-harness.py resume <sid>
 """
 
 import argparse
@@ -29,6 +40,7 @@ import re
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -36,6 +48,379 @@ import time
 import uuid
 from pathlib import Path
 from typing import Optional
+
+# ── Tier 2: GDB Remote Serial Protocol client ────────────────────────────────
+#
+# Implements a minimal RSP client sufficient for register reads, memory reads,
+# breakpoint management, and single-step/continue.
+#
+# Wire format:  $<payload>#<checksum_hex2>
+# Ack:          + (acknowledged) / - (nak, retransmit)
+# The GDB stub inside QEMU speaks this protocol over TCP.
+#
+# Port conflict policy: if connect fails on the requested port, we back off
+# and retry on port+1 (up to 5 attempts) to avoid "address already in use"
+# when a previous test left a stale stub open.
+
+class GdbClient:
+    """Minimal RSP client for QEMU's GDB stub."""
+
+    # x86_64 g-packet register order (GDB remote protocol):
+    # rax rbx rcx rdx rsi rdi rbp rsp r8..r15 rip eflags
+    # cs ss ds es fs gs (segment regs, 32-bit each in the packet)
+    # Offsets in the 'g' response (little-endian 64-bit each for GPRs/RIP):
+    _GPR_NAMES = [
+        "rax", "rbx", "rcx", "rdx",
+        "rsi", "rdi", "rbp", "rsp",
+        "r8",  "r9",  "r10", "r11",
+        "r12", "r13", "r14", "r15",
+        "rip",
+    ]
+    # After the 17 64-bit GPRs comes eflags (32-bit), then segment regs (32-bit each).
+    _SEG_NAMES = ["cs", "ss", "ds", "es", "fs", "gs"]
+
+    def __init__(self, host: str, port: int, timeout: float = 5.0):
+        self.host    = host
+        self.port    = port
+        self.timeout = timeout
+        self._s: Optional[socket.socket] = None
+        self._ack_mode = True  # QEMU stub defaults to ack mode
+
+    # ── connection ────────────────────────────────────────────────────────────
+
+    def connect(self) -> bool:
+        """
+        Connect to GDB stub. Retries on port+1 .. port+4 if port is busy.
+        Returns True on success.
+        """
+        for attempt in range(5):
+            port = self.port + attempt
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(self.timeout)
+                s.connect((self.host, port))
+                self._s = s
+                if attempt > 0:
+                    # record the actual port we used
+                    self.port = port
+                return True
+            except (ConnectionRefusedError, OSError):
+                time.sleep(0.1)
+        return False
+
+    def close(self):
+        if self._s:
+            try:
+                self._s.sendall(b"$D#44")  # detach
+            except OSError:
+                pass
+            try:
+                self._s.close()
+            except OSError:
+                pass
+            self._s = None
+
+    # ── low-level packet I/O ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _checksum(payload: bytes) -> int:
+        return sum(payload) & 0xFF
+
+    def _send_pkt(self, payload: str):
+        """Frame and send an RSP packet, wait for + ack."""
+        raw = payload.encode("ascii")
+        cs  = self._checksum(raw)
+        pkt = f"${payload}#{cs:02x}".encode("ascii")
+        # Retry up to 3 times if we get a - nak
+        for _ in range(3):
+            self._s.sendall(pkt)
+            if not self._ack_mode:
+                return
+            ack = self._recv_bytes(1)
+            if ack == b"+":
+                return
+            # nak: fall through and retransmit
+
+    def _recv_bytes(self, n: int) -> bytes:
+        buf = b""
+        while len(buf) < n:
+            chunk = self._s.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("GDB stub closed connection")
+            buf += chunk
+        return buf
+
+    def _recv_pkt(self) -> str:
+        """
+        Receive one RSP packet.  Skips any leading ack bytes (+/-) and
+        consumes the trailing checksum.  Sends + ack back.
+        """
+        # Skip leading +/- ack bytes (response to our previous send)
+        while True:
+            b = self._recv_bytes(1)
+            if b == b"$":
+                break
+            # b is + or - or other noise — skip
+
+        payload = b""
+        while True:
+            c = self._recv_bytes(1)
+            if c == b"#":
+                break
+            payload += c
+
+        # Read the two-hex checksum
+        _cs_bytes = self._recv_bytes(2)
+
+        if self._ack_mode:
+            self._s.sendall(b"+")
+
+        return payload.decode("ascii", errors="replace")
+
+    def send(self, payload: str) -> str:
+        """Send a packet and return the response payload."""
+        self._send_pkt(payload)
+        return self._recv_pkt()
+
+    # ── high-level commands ───────────────────────────────────────────────────
+
+    def read_regs(self) -> dict:
+        """Issue 'g' packet; decode and return register dict."""
+        raw = self.send("g")
+        if raw.startswith("E"):
+            raise RuntimeError(f"GDB 'g' error: {raw}")
+
+        # Each register is 8 bytes = 16 hex chars (little-endian)
+        def le64(off):
+            chunk = raw[off*16 : off*16+16]
+            if len(chunk) < 16:
+                return 0
+            return struct.unpack_from("<Q", bytes.fromhex(chunk))[0]
+
+        def le32(off_bytes):
+            # off_bytes is byte offset into the hex string
+            chunk = raw[off_bytes*2 : off_bytes*2+8]
+            if len(chunk) < 8:
+                return 0
+            return struct.unpack_from("<I", bytes.fromhex(chunk))[0]
+
+        result = {}
+        for i, name in enumerate(self._GPR_NAMES):
+            result[name] = le64(i)
+
+        # eflags is at offset 17 (17 * 8 = 136 bytes = after 17 GPRs)
+        result["eflags"] = le32(17 * 8)
+
+        # segment regs at offsets 18..23 (each 4 bytes in the g-packet)
+        seg_base = 17 * 8 + 4  # 17 GPRs + eflags
+        for i, name in enumerate(self._SEG_NAMES):
+            result[name] = le32(seg_base + i * 4)
+
+        # Format as hex strings for readability
+        return {k: hex(v) for k, v in result.items()}
+
+    def read_mem(self, addr: int, length: int) -> bytes:
+        """Issue 'm addr,len' packet; return raw bytes."""
+        resp = self.send(f"m{addr:x},{length:x}")
+        if resp.startswith("E"):
+            raise RuntimeError(f"GDB mem read error: {resp}")
+        return bytes.fromhex(resp)
+
+    def set_bp(self, addr: int) -> bool:
+        """Set software breakpoint via Z0 packet."""
+        resp = self.send(f"Z0,{addr:x},1")
+        return resp == "OK"
+
+    def del_bp(self, addr: int) -> bool:
+        """Remove software breakpoint via z0 packet."""
+        resp = self.send(f"z0,{addr:x},1")
+        return resp == "OK"
+
+    def vcont_step(self) -> str:
+        """Single-step via vCont;s. Returns stop-reply payload."""
+        # First check vCont is supported
+        support = self.send("vCont?")
+        if "s" in support:
+            return self.send("vCont;s")
+        # Fallback to 's' packet
+        return self.send("s")
+
+    def vcont_cont(self) -> str:
+        """
+        Continue via vCont;c.  Sends the packet and returns immediately.
+
+        The stop-reply will only arrive when the guest hits a breakpoint or
+        is interrupted.  We set a very short recv timeout so we don't block
+        indefinitely; a timeout here simply means the kernel is running, which
+        is the expected state.
+        """
+        support = self.send("vCont?")
+        pkt = "vCont;c" if "c" in support else "c"
+        # Send the continue packet
+        raw = pkt.encode("ascii")
+        cs  = self._checksum(raw)
+        frame = f"${pkt}#{cs:02x}".encode("ascii")
+        self._s.sendall(frame)
+        if self._ack_mode:
+            # Drain the '+' ack (may arrive quickly)
+            self._s.settimeout(0.5)
+            try:
+                self._recv_bytes(1)  # consume '+'
+            except (socket.timeout, ConnectionError):
+                pass
+            finally:
+                self._s.settimeout(self.timeout)
+        # Do NOT wait for a stop-reply — the kernel is now running.
+        return f"<sent: {pkt}>"
+
+
+# ── Tier 2: ELF symbol resolver ──────────────────────────────────────────────
+#
+# Resolves symbol names from the kernel ELF without spawning a GDB process.
+# Uses pyelftools if available; falls back to a hand-rolled ELF64 parser.
+
+def _resolve_symbol(elf_path: Path, name: str) -> Optional[dict]:
+    """
+    Return {"addr": "0x...", "size": N, "type": "func|obj|other"} or None.
+    Tries pyelftools first; falls back to struct-based parser.
+    """
+    if not elf_path.exists():
+        return None
+
+    # ── pyelftools path ───────────────────────────────────────────────────────
+    try:
+        from elftools.elf.elffile import ELFFile
+        from elftools.elf.sections import SymbolTableSection
+        with elf_path.open("rb") as f:
+            elf = ELFFile(f)
+            for sec in elf.iter_sections():
+                if not isinstance(sec, SymbolTableSection):
+                    continue
+                for sym in sec.iter_symbols():
+                    if sym.name == name:
+                        addr  = sym["st_value"]
+                        size  = sym["st_size"]
+                        stype = sym["st_info"]["type"]
+                        type_str = {
+                            "STT_FUNC":   "func",
+                            "STT_OBJECT": "obj",
+                        }.get(stype, "other")
+                        return {
+                            "addr":  hex(addr),
+                            "size":  size,
+                            "type":  type_str,
+                        }
+        return None
+    except ImportError:
+        pass  # fall through to manual parser
+
+    # ── Manual ELF64 parser ───────────────────────────────────────────────────
+    # ELF64 header: magic(4)+class(1)+data(1)+version(1)+osabi(1)+pad(8)
+    #              +e_type(2)+e_machine(2)+e_version(4)+e_entry(8)
+    #              +e_phoff(8)+e_shoff(8)+e_flags(4)+e_ehsize(2)
+    #              +e_phentsize(2)+e_phnum(2)+e_shentsize(2)+e_shnum(2)
+    #              +e_shstrndx(2)  = 64 bytes total
+    ELF_HDR = struct.Struct("<4sBBBBxxxxxxxx HHIQQQIHHHHHH")
+
+    with elf_path.open("rb") as f:
+        raw = f.read()
+
+    if raw[:4] != b"\x7fELF":
+        return None
+
+    (magic, ei_class, ei_data, ei_ver, ei_osabi,
+     e_type, e_machine, e_version, e_entry,
+     e_phoff, e_shoff, e_flags, e_ehsize,
+     e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx) = ELF_HDR.unpack_from(raw)
+
+    # Section header entry: sh_name(4)+sh_type(4)+sh_flags(8)+sh_addr(8)
+    #                       +sh_offset(8)+sh_size(8)+sh_link(4)+sh_info(4)
+    #                       +sh_addralign(8)+sh_entsize(8) = 64 bytes
+    SH_HDR = struct.Struct("<IIQQQQIIQQ")
+    SHT_SYMTAB = 2
+    SHT_DYNSYM = 11
+
+    # Symbol entry: st_name(4)+st_info(1)+st_other(1)+st_shndx(2)
+    #               +st_value(8)+st_size(8) = 24 bytes
+    SYM = struct.Struct("<IBBHQQ")
+    STT_FUNC   = 2
+    STT_OBJECT = 1
+
+    def read_strtab(offset, size):
+        return raw[offset:offset+size]
+
+    for i in range(e_shnum):
+        sh_off = e_shoff + i * 64
+        (sh_name, sh_type, sh_flags, sh_addr, sh_offset,
+         sh_size, sh_link, sh_info, sh_addralign, sh_entsize) = SH_HDR.unpack_from(raw, sh_off)
+
+        if sh_type not in (SHT_SYMTAB, SHT_DYNSYM):
+            continue
+        if sh_entsize == 0:
+            continue
+
+        # Load string table for this symbol table
+        str_sh_off = e_shoff + sh_link * 64
+        (_, _, _, _, str_offset, str_size, *_) = SH_HDR.unpack_from(raw, str_sh_off)
+        strtab = read_strtab(str_offset, str_size)
+
+        # Iterate symbols
+        n_syms = sh_size // sh_entsize
+        for j in range(n_syms):
+            sym_off = sh_offset + j * 24
+            (st_name, st_info, st_other, st_shndx,
+             st_value, st_size) = SYM.unpack_from(raw, sym_off)
+
+            # Extract name from string table
+            end = strtab.find(b"\x00", st_name)
+            sym_name = strtab[st_name:end].decode("ascii", errors="replace")
+
+            if sym_name != name:
+                continue
+
+            stype = st_info & 0xF
+            type_str = {STT_FUNC: "func", STT_OBJECT: "obj"}.get(stype, "other")
+            return {
+                "addr":  hex(st_value),
+                "size":  st_size,
+                "type":  type_str,
+            }
+
+    return None
+
+
+def _get_gdb_port(sess: dict) -> int:
+    port = sess.get("gdb_port", 0)
+    if not port:
+        _err("Session was not started with --gdb-port; GDB stub unavailable")
+    return port
+
+
+def _get_kernel_elf() -> Path:
+    """
+    Locate the kernel ELF.  In a git worktree the `target/` directory lives
+    in the main worktree root, not the per-worktree checkout.  We walk up
+    from the script's directory looking for the ELF so that both normal and
+    worktree layouts work correctly.
+    """
+    wt  = _get_watch_test()
+    elf = wt.KERNEL_ELF  # usually ROOT/target/x86_64-astryx/release/astryx-kernel
+
+    if elf.exists():
+        return elf
+
+    # Fallback: git worktrees share the object store.  The common dir is the
+    # main worktree's .git/; walk up from __file__ until we find a target/ dir.
+    here = _SCRIPTS_DIR
+    for _ in range(6):  # at most 6 levels up
+        candidate = here / "target" / "x86_64-astryx" / "release" / "astryx-kernel"
+        if candidate.exists():
+            return candidate
+        here = here.parent
+
+    # Return the computed path even if it doesn't exist yet — callers check.
+    return elf
+
 
 # ── Shared build helpers (re-used from watch-test.py logic) ──────────────────
 # Import build_kernel and path constants from the sibling module without
@@ -334,8 +719,15 @@ def _build(features: str) -> bool:
 # ── QEMU launch (harness variant) ────────────────────────────────────────────
 
 def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
-                          ovmf_vars_dst: str) -> subprocess.Popen:
-    """Launch QEMU with a per-session serial log and QMP socket."""
+                          ovmf_vars_dst: str,
+                          gdb_port: int = 0,
+                          gdb_wait: bool = False) -> subprocess.Popen:
+    """
+    Launch QEMU with a per-session serial log and QMP socket.
+
+    gdb_port: if > 0, adds -gdb tcp::PORT to the QEMU command line.
+    gdb_wait: if True and gdb_port > 0, adds -S (start frozen, wait for GDB).
+    """
     wt = _get_watch_test()
     ROOT     = wt.ROOT
     ESP_DIR  = wt.ESP_DIR
@@ -385,6 +777,15 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
     if os.path.exists("/dev/kvm") and os.access("/dev/kvm", os.R_OK):
         cmd += ["-enable-kvm"]
 
+    # GDB stub (Tier 2) — attach QEMU's built-in GDB server on a TCP port.
+    # Port conflict policy: if the caller's port is busy, GdbClient.connect()
+    # will back off to port+1 .. port+4 automatically.
+    if gdb_port > 0:
+        cmd += ["-gdb", f"tcp::{gdb_port}"]
+        if gdb_wait:
+            # Start frozen; the debugger must `continue` to unfreeze.
+            cmd += ["-S"]
+
     proc = subprocess.Popen(
         cmd,
         cwd=str(ROOT),
@@ -405,6 +806,9 @@ def cmd_start(args):
     qmp_sock    = str(HARNESS_DIR / f"{sid}.qmp.sock")
     ovmf_vars   = str(HARNESS_DIR / f"{sid}.OVMF_VARS.fd")
 
+    gdb_port = getattr(args, "gdb_port", 0) or 0
+    gdb_wait = getattr(args, "gdb_wait", False)
+
     # Build unless --no-build.
     # Redirect all build output to stderr so stdout stays JSON-only.
     if not args.no_build:
@@ -417,7 +821,8 @@ def cmd_start(args):
         if not ok:
             _err("Build failed")
 
-    proc = _launch_qemu_harness(sid, serial_log, qmp_sock, ovmf_vars)
+    proc = _launch_qemu_harness(sid, serial_log, qmp_sock, ovmf_vars,
+                                 gdb_port=gdb_port, gdb_wait=gdb_wait)
 
     session = {
         "sid":        sid,
@@ -427,6 +832,9 @@ def cmd_start(args):
         "ovmf_vars":  ovmf_vars,
         "started_at": time.time(),
         "features":   args.features or "test-mode",
+        "gdb_port":   gdb_port,
+        "gdb_wait":   gdb_wait,
+        "breakpoints": [],
     }
     _save_session(session)
 
@@ -443,7 +851,8 @@ def cmd_start(args):
     session["watcher_pid"] = watcher_proc.pid
     _save_session(session)
 
-    _out({"sid": sid, "pid": proc.pid, "serial_log": serial_log})
+    _out({"sid": sid, "pid": proc.pid, "serial_log": serial_log,
+          "gdb_port": gdb_port})
 
 
 def cmd_stop(args):
@@ -779,6 +1188,182 @@ def cmd_run_watcher(args):
     sys.exit(0)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Tier 2 subcommand implementations
+# ══════════════════════════════════════════════════════════════════════════════
+
+def cmd_regs(args):
+    """Connect to GDB stub, read all GPRs, return as JSON dict."""
+    sess = _load_session(args.sid)
+    port = _get_gdb_port(sess)
+
+    gdb = GdbClient("127.0.0.1", port)
+    if not gdb.connect():
+        _err(f"Cannot connect to GDB stub on port {port} (tried {port}..{port+4})")
+    try:
+        regs = gdb.read_regs()
+    except Exception as e:
+        _err(f"GDB regs error: {e}")
+    finally:
+        gdb.close()
+
+    _out({"ok": True, "regs": regs})
+
+
+def cmd_mem(args):
+    """Read memory via GDB 'm addr,len' packet; cap at 4096 bytes."""
+    sess = _load_session(args.sid)
+    port = _get_gdb_port(sess)
+
+    try:
+        addr = int(args.addr, 0)
+    except ValueError:
+        _err(f"Invalid address: {args.addr}")
+
+    length = min(args.length, 4096)  # protect agent context
+
+    gdb = GdbClient("127.0.0.1", port)
+    if not gdb.connect():
+        _err(f"Cannot connect to GDB stub on port {port} (tried {port}..{port+4})")
+    try:
+        data = gdb.read_mem(addr, length)
+    except Exception as e:
+        _err(f"GDB mem error: {e}")
+    finally:
+        gdb.close()
+
+    _out({
+        "ok":    True,
+        "addr":  hex(addr),
+        "bytes": data.hex(),
+        "len":   len(data),
+    })
+
+
+def cmd_sym(args):
+    """Resolve a kernel symbol name from the ELF; no GDB needed."""
+    elf = _get_kernel_elf()
+    result = _resolve_symbol(elf, args.name)
+    if result is None:
+        _out({"ok": False, "error": f"Symbol '{args.name}' not found in {elf}"})
+    else:
+        result["ok"] = True
+        result["name"] = args.name
+        _out(result)
+
+
+def cmd_bp(args):
+    """Breakpoint management: add / del / list."""
+    sess = _load_session(args.sid)
+    op   = args.op
+
+    if op == "list":
+        bps = sess.get("breakpoints", [])
+        _out({"ok": True, "breakpoints": bps})
+        return
+
+    port = _get_gdb_port(sess)
+
+    try:
+        addr = int(args.addr, 0)
+    except (ValueError, TypeError):
+        _err(f"Invalid address: {getattr(args, 'addr', None)}")
+
+    gdb = GdbClient("127.0.0.1", port)
+    if not gdb.connect():
+        _err(f"Cannot connect to GDB stub on port {port} (tried {port}..{port+4})")
+    try:
+        if op == "add":
+            ok = gdb.set_bp(addr)
+            if ok:
+                bps = sess.get("breakpoints", [])
+                hex_addr = hex(addr)
+                if hex_addr not in bps:
+                    bps.append(hex_addr)
+                sess["breakpoints"] = bps
+                _save_session(sess)
+        elif op == "del":
+            ok = gdb.del_bp(addr)
+            if ok:
+                bps = sess.get("breakpoints", [])
+                hex_addr = hex(addr)
+                sess["breakpoints"] = [b for b in bps if b != hex_addr]
+                _save_session(sess)
+        else:
+            _err(f"Unknown bp op: {op}")
+    except Exception as e:
+        _err(f"GDB bp error: {e}")
+    finally:
+        gdb.close()
+
+    _out({"ok": ok, "op": op, "addr": hex(addr)})
+
+
+def cmd_step(args):
+    """Single-step via GDB vCont;s. Returns new RIP."""
+    sess = _load_session(args.sid)
+    port = _get_gdb_port(sess)
+
+    gdb = GdbClient("127.0.0.1", port)
+    if not gdb.connect():
+        _err(f"Cannot connect to GDB stub on port {port} (tried {port}..{port+4})")
+    try:
+        stop_reply = gdb.vcont_step()
+        # After stepping, read new RIP
+        regs = gdb.read_regs()
+        rip  = regs.get("rip", "0x0")
+    except Exception as e:
+        _err(f"GDB step error: {e}")
+    finally:
+        gdb.close()
+
+    _out({"ok": True, "stop_reply": stop_reply, "rip": rip})
+
+
+def cmd_cont(args):
+    """Continue execution via GDB vCont;c. Returns immediately."""
+    sess = _load_session(args.sid)
+    port = _get_gdb_port(sess)
+
+    gdb = GdbClient("127.0.0.1", port)
+    if not gdb.connect():
+        _err(f"Cannot connect to GDB stub on port {port} (tried {port}..{port+4})")
+    try:
+        resp = gdb.vcont_cont()
+    except Exception as e:
+        # vCont;c sends the packet but the reply may not arrive immediately
+        # (the kernel is running). Treat a timeout/connection-reset as normal.
+        resp = f"<running: {e}>"
+    finally:
+        gdb.close()
+
+    _out({"ok": True, "note": "kernel running", "reply": resp})
+
+
+def cmd_pause(args):
+    """Pause QEMU via QMP 'stop'. Freezes all vCPUs."""
+    sess     = _load_session(args.sid)
+    qmp_sock = sess["qmp_sock"]
+
+    result = _qmp_command(qmp_sock, "stop", connect_timeout=3.0)
+    if "error" in result:
+        _out({"ok": False, "qmp_error": result["error"]})
+    else:
+        _out({"ok": True, "note": "QEMU paused"})
+
+
+def cmd_resume(args):
+    """Resume QEMU via QMP 'cont'. Unfreezes all vCPUs."""
+    sess     = _load_session(args.sid)
+    qmp_sock = sess["qmp_sock"]
+
+    result = _qmp_command(qmp_sock, "cont", connect_timeout=3.0)
+    if "error" in result:
+        _out({"ok": False, "qmp_error": result["error"]})
+    else:
+        _out({"ok": True, "note": "QEMU resumed"})
+
+
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 def main():
@@ -794,6 +1379,11 @@ def main():
                           help="Extra kernel features (comma-separated, test-mode always added)")
     p_start.add_argument("--no-build", action="store_true",
                           help="Skip cargo build; use existing kernel.bin")
+    p_start.add_argument("--gdb-port", type=int, default=0, metavar="PORT",
+                          help="Enable GDB stub on TCP PORT (0=off). "
+                               "GdbClient will back off to PORT+1..PORT+4 on conflict.")
+    p_start.add_argument("--gdb-wait", action="store_true",
+                          help="Start QEMU frozen (-S); debugger must 'cont' to unfreeze")
 
     # stop
     p_stop = sub.add_parser("stop", help="Kill a QEMU session")
@@ -847,6 +1437,48 @@ def main():
     p_snap.add_argument("op", choices=["save", "load"])
     p_snap.add_argument("name")
 
+    # ── Tier 2: GDB stub subcommands ──────────────────────────────────────────
+    # All require that `start` was called with --gdb-port PORT.
+
+    # regs
+    p_regs = sub.add_parser("regs", help="[Tier2] Read x86_64 registers via GDB stub")
+    p_regs.add_argument("sid")
+
+    # mem
+    p_mem = sub.add_parser("mem", help="[Tier2] Read guest memory via GDB stub")
+    p_mem.add_argument("sid")
+    p_mem.add_argument("addr", help="Guest virtual address (hex or decimal)")
+    p_mem.add_argument("length", type=int, help="Byte count (capped at 4096)")
+
+    # sym
+    p_sym = sub.add_parser("sym", help="[Tier2] Resolve kernel symbol to address (ELF parse, no GDB)")
+    p_sym.add_argument("sid")
+    p_sym.add_argument("name", help="Symbol name (e.g. kernel_main)")
+
+    # bp
+    p_bp = sub.add_parser("bp", help="[Tier2] Manage breakpoints via GDB stub")
+    p_bp.add_argument("sid")
+    p_bp.add_argument("op", choices=["add", "del", "list"],
+                       help="add <addr> / del <addr> / list")
+    p_bp.add_argument("addr", nargs="?", default=None,
+                       help="Address for add/del (hex or decimal)")
+
+    # step
+    p_step = sub.add_parser("step", help="[Tier2] Single-step via GDB vCont;s")
+    p_step.add_argument("sid")
+
+    # cont
+    p_cont = sub.add_parser("cont", help="[Tier2] Continue execution via GDB vCont;c")
+    p_cont.add_argument("sid")
+
+    # pause
+    p_pause = sub.add_parser("pause", help="[Tier2] Pause QEMU via QMP stop")
+    p_pause.add_argument("sid")
+
+    # resume
+    p_resume = sub.add_parser("resume", help="[Tier2] Resume QEMU via QMP cont")
+    p_resume.add_argument("sid")
+
     # _watch: private subcommand used internally by `start` to run the
     # background watcher in a detached process. Not shown in help.
     p_watch = sub.add_parser("_watch")
@@ -865,6 +1497,15 @@ def main():
         "status": cmd_status,
         "events": cmd_events,
         "snap":   cmd_snap,
+        # Tier 2
+        "regs":   cmd_regs,
+        "mem":    cmd_mem,
+        "sym":    cmd_sym,
+        "bp":     cmd_bp,
+        "step":   cmd_step,
+        "cont":   cmd_cont,
+        "pause":  cmd_pause,
+        "resume": cmd_resume,
         "_watch": cmd_run_watcher,
     }
     dispatch[args.cmd](args)
