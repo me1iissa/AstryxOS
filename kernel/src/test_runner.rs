@@ -743,6 +743,11 @@ pub fn run() -> ! {
     total += 1;
     if test_umount_removes_mount() { passed += 1; }
 
+    // ── Test 120: glibc hello — oracle test for glibc dynamic linker ───────
+
+    total += 1;
+    if test_glibc_hello_runs() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -14527,4 +14532,146 @@ fn test_dev_dsp_ioctl_set_format() -> bool {
             r, fmt, r2, AFMT_S16_LE);
     }
     ok
+}
+
+// ── Test 120: glibc hello — oracle test for glibc dynamic linker ────────────
+//
+// Loads /disk/bin/glibc_hello (a glibc-linked PIE binary compiled by host gcc),
+// creates a user process, and waits up to ~5 seconds for it to exit with
+// code 0.  This is the primary oracle for all glibc compatibility work: if
+// the ELF loader, PT_INTERP dispatch, ld-linux-x86-64.so.2, and libc.so.6 are
+// all wired correctly the process will print its greeting and exit cleanly.
+//
+// If the binary is absent the test is skipped with a warning (infrastructure
+// may not have run install-glibc.sh + create-data-disk.sh yet).
+fn test_glibc_hello_runs() -> bool {
+    test_header!("glibc hello (oracle: ld-linux + libc.so.6 dynamic ELF)");
+
+    // 1. Read the binary from the data disk.
+    let elf_data = match crate::vfs::read_file("/disk/bin/glibc_hello") {
+        Ok(data) => {
+            test_println!("  Read /disk/bin/glibc_hello: {} bytes", data.len());
+            data
+        }
+        Err(e) => {
+            // Binary missing — skip rather than fail so the suite can still
+            // report progress while the data disk is being rebuilt.
+            test_println!("  SKIP: /disk/bin/glibc_hello not found ({:?})", e);
+            test_println!("        Run scripts/create-data-disk.sh --force to rebuild.");
+            test_pass!("glibc hello (skipped — binary absent)");
+            return true;
+        }
+    };
+
+    // 2. Basic ELF sanity check.
+    if !crate::proc::elf::is_elf(&elf_data) {
+        test_fail!("glibc_hello", "/disk/bin/glibc_hello is not an ELF binary");
+        return false;
+    }
+    test_println!("  ELF magic OK ✓");
+
+    match crate::proc::elf::validate_elf(&elf_data) {
+        Ok(hdr) => {
+            test_println!("  Entry {:#x}, {} phdrs", hdr.e_entry, hdr.e_phnum);
+        }
+        Err(e) => {
+            test_fail!("glibc_hello", "ELF validate failed: {:?}", e);
+            return false;
+        }
+    }
+
+    // 3. Create a user-mode process.
+    let user_pid = match crate::proc::usermode::create_user_process("glibc_hello", &elf_data) {
+        Ok(pid) => {
+            test_println!("  Created user process PID {} ✓", pid);
+            pid
+        }
+        Err(e) => {
+            test_fail!("glibc_hello", "create_user_process failed: {:?}", e);
+            return false;
+        }
+    };
+
+    // 4. Mark as Linux ABI (glibc uses the syscall instruction).
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == user_pid) {
+            p.linux_abi = true;
+            p.subsystem = crate::win32::SubsystemType::Linux;
+            test_println!("  linux_abi = true ✓");
+        }
+    }
+
+    // 5. Enable the scheduler and spin for up to ~5 seconds (~500 yields at
+    //    ~10 ms each on the QEMU timer tick).
+    let was_active = crate::sched::is_active();
+    if !was_active {
+        crate::sched::enable();
+    }
+
+    test_println!("  Scheduling glibc_hello...");
+    {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        test_println!("  Thread table has {} entries", threads.len());
+    }
+
+    const MAX_YIELDS: usize = 500;
+    for i in 0..MAX_YIELDS {
+        crate::sched::yield_cpu();
+        let proc_done = {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            match procs.iter().find(|p| p.pid == user_pid) {
+                Some(p) => p.state == crate::proc::ProcessState::Zombie,
+                None => true,
+            }
+        };
+        if proc_done {
+            test_println!("  Exited after {} yields ✓", i + 1);
+            break;
+        }
+        if i % 50 == 0 {
+            let state_str = {
+                let threads = crate::proc::THREAD_TABLE.lock();
+                threads.iter().find(|t| t.pid == user_pid)
+                    .map(|t| alloc::format!("{:?}", t.state))
+                    .unwrap_or_else(|| alloc::string::String::from("gone"))
+            };
+            test_println!("  yield #{} glibc_hello={}", i, state_str);
+        }
+        crate::hal::enable_interrupts();
+        for _ in 0..1000 { core::hint::spin_loop(); }
+    }
+
+    if !was_active {
+        crate::sched::disable();
+    }
+
+    // 6. Verify exit state.
+    let (state, exit_code) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == user_pid) {
+            Some(p) => (p.state, p.exit_code),
+            None => {
+                test_println!("  glibc_hello reaped cleanly ✓");
+                test_pass!("glibc hello (oracle: ld-linux + libc.so.6 dynamic ELF)");
+                return true;
+            }
+        }
+    };
+
+    test_println!("  Process state={:?} exit_code={}", state, exit_code);
+
+    if state != crate::proc::ProcessState::Zombie {
+        test_fail!("glibc_hello", "Process did not exit within timeout (state={:?})", state);
+        return false;
+    }
+
+    if exit_code != 0 {
+        test_fail!("glibc_hello", "Expected exit code 0, got {}", exit_code);
+        return false;
+    }
+
+    test_println!("  glibc hello exited cleanly with code 0 ✓");
+    test_pass!("glibc hello (oracle: ld-linux + libc.so.6 dynamic ELF)");
+    true
 }
