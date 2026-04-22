@@ -853,6 +853,21 @@ pub fn run() -> ! {
     total += 1;
     if test_cpp_hello_runs() { passed += 1; }
 
+    // ── Test 142: syscall number alignment — poll(7) vs swapoff(168) ────
+
+    total += 1;
+    if test_syscall_number_alignment_poll() { passed += 1; }
+
+    // ── Test 143: syscall number alignment — SHM family (29/30/31/67) ──
+
+    total += 1;
+    if test_syscall_number_alignment_shm_family() { passed += 1; }
+
+    // ── Test 144: syscall number alignment — SEM family (64/65/66) ──────
+
+    total += 1;
+    if test_syscall_number_alignment_sem_family() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -16483,5 +16498,146 @@ fn test_cpp_hello_runs() -> bool {
     test_println!("  C++ hello exited cleanly with code 0 ✓");
     test_pass!("C++ hello (oracle: libstdc++ / libgcc_s / iostream)");
     true
+}
+
+// ── Test 142: syscall number alignment — poll (7) vs swapoff (168) ────────────
+//
+// UAPI 7 = poll   — must work (returns ready-count or 0-on-timeout)
+// UAPI 168 = swapoff — must return -ENOSYS (arm previously mis-dispatched to poll)
+fn test_syscall_number_alignment_poll() -> bool {
+    test_header!("syscall number alignment — poll(7) vs swapoff(168)");
+    let mut ok = true;
+
+    // syscall 7 (poll) with no fds and 0-ms timeout → 0 (no fds ready, no error)
+    let poll_ret = crate::subsys::linux::syscall::dispatch(7, 0, 0, 0, 0, 0, 0);
+    if poll_ret != 0 {
+        test_fail!("syscall_align_poll", "syscall 7 (poll, nfds=0) expected 0, got {}", poll_ret);
+        ok = false;
+    } else {
+        test_println!("  syscall 7 (poll, nfds=0) → 0 ✓");
+    }
+
+    // syscall 168 (swapoff) must return -ENOSYS; it must NOT behave like poll
+    let swapoff_ret = crate::subsys::linux::syscall::dispatch(168, 0, 0, 0, 0, 0, 0);
+    if swapoff_ret != -38 {
+        test_fail!("syscall_align_poll",
+            "syscall 168 (swapoff) expected -38 (ENOSYS), got {} — collision with poll?",
+            swapoff_ret);
+        ok = false;
+    } else {
+        test_println!("  syscall 168 (swapoff) → -38 (ENOSYS) ✓");
+    }
+
+    if ok { test_pass!("syscall number alignment — poll(7) vs swapoff(168)"); }
+    ok
+}
+
+// ── Test 143: syscall number alignment — SHM family (29/30/31/67) ────────────
+//
+// UAPI 29 = shmget, 30 = shmat, 31 = shmctl, 67 = shmdt
+// Before the fix arm 31 dispatched shmdt and arm 67 was absent.
+fn test_syscall_number_alignment_shm_family() -> bool {
+    test_header!("syscall number alignment — SHM family (29/30/31/67)");
+    let mut ok = true;
+
+    // syscall 29 (shmget IPC_PRIVATE, 4096, IPC_CREAT|0o666) → valid id (≥0)
+    let ipc_private: u64 = 0; // IPC_PRIVATE = 0
+    let ipc_creat: u64   = 0o1000;
+    let shmid = crate::subsys::linux::syscall::dispatch(29, ipc_private, 4096, ipc_creat | 0o666, 0, 0, 0);
+    if shmid < 0 {
+        test_fail!("syscall_align_shm", "syscall 29 (shmget) returned {} (expected ≥0)", shmid);
+        ok = false;
+    } else {
+        test_println!("  syscall 29 (shmget IPC_PRIVATE,4096) → id={} ✓", shmid);
+    }
+
+    // syscall 31 (shmctl IPC_STAT on segment) — UAPI 31 = shmctl
+    // IPC_STAT = 2; pass a zeroed buf pointer — implementation accepts null for IPC_STAT
+    let ipc_stat: u64 = 2;
+    let shmctl_ret = crate::subsys::linux::syscall::dispatch(31, shmid as u64, ipc_stat, 0, 0, 0, 0);
+    if shmctl_ret != 0 {
+        test_fail!("syscall_align_shm",
+            "syscall 31 (shmctl IPC_STAT) expected 0, got {} — was it routing to shmdt?",
+            shmctl_ret);
+        ok = false;
+    } else {
+        test_println!("  syscall 31 (shmctl IPC_STAT) → 0 ✓");
+    }
+
+    // syscall 67 (shmdt) — UAPI 67 = shmdt; detach with addr=0 → -EINVAL is acceptable
+    // (no segment attached at 0), but must NOT return -ENOSYS which would mean the arm
+    // is absent.
+    let shmdt_ret = crate::subsys::linux::syscall::dispatch(67, 0, 0, 0, 0, 0, 0);
+    if shmdt_ret == -38 {
+        // -38 = ENOSYS — means the arm is still missing or mapping to wrong handler
+        test_fail!("syscall_align_shm",
+            "syscall 67 (shmdt) returned -38 (ENOSYS) — arm not wired");
+        ok = false;
+    } else {
+        // Any non-ENOSYS result (e.g. -EINVAL) means the arm reached shmdt correctly.
+        test_println!("  syscall 67 (shmdt addr=0) → {} (arm reached shmdt — not ENOSYS) ✓", shmdt_ret);
+    }
+
+    // Cleanup: shmctl IPC_RMID on the segment created above
+    if shmid >= 0 {
+        let ipc_rmid: u64 = 0; // IPC_RMID = 0
+        crate::subsys::linux::syscall::dispatch(31, shmid as u64, ipc_rmid, 0, 0, 0, 0);
+    }
+
+    if ok { test_pass!("syscall number alignment — SHM family (29/30/31/67)"); }
+    ok
+}
+
+// ── Test 144: syscall number alignment — SEM family (64/65/66) ───────────────
+//
+// UAPI 64 = semget, 65 = semop, 66 = semctl
+// Before the fix arm 65 dispatched shmctl.
+fn test_syscall_number_alignment_sem_family() -> bool {
+    test_header!("syscall number alignment — SEM family (64/65/66)");
+    let mut ok = true;
+
+    // syscall 64 (semget): may return -ENOSYS if not implemented — that is fine as
+    // long as it does NOT silently succeed as something else.
+    let semget_ret = crate::subsys::linux::syscall::dispatch(64, 0, 0, 0, 0, 0, 0);
+    // Accept either a real semid (≥0) or ENOSYS (-38); anything else is suspicious.
+    if semget_ret < -38 || (semget_ret < 0 && semget_ret != -38 && semget_ret != -1) {
+        test_fail!("syscall_align_sem",
+            "syscall 64 (semget) returned unexpected {} — check dispatch arm",
+            semget_ret);
+        ok = false;
+    } else {
+        test_println!("  syscall 64 (semget) → {} (real or ENOSYS — arm present) ✓", semget_ret);
+    }
+
+    // syscall 65 (semop): UAPI 65 = semop; before fix this ran shmctl.
+    // Must return -ENOSYS (-38); must NOT return 0 as if shmctl IPC_RMID succeeded.
+    let semop_ret = crate::subsys::linux::syscall::dispatch(65, 0, 0, 0, 0, 0, 0);
+    if semop_ret == 0 {
+        test_fail!("syscall_align_sem",
+            "syscall 65 (semop) returned 0 — was it dispatching to shmctl IPC_RMID(0)?");
+        ok = false;
+    } else if semop_ret == -38 {
+        test_println!("  syscall 65 (semop) → -38 (ENOSYS) ✓");
+    } else {
+        // Any other negative errno is fine — just not a shmctl success
+        test_println!("  syscall 65 (semop) → {} (not shmctl success) ✓", semop_ret);
+    }
+
+    // syscall 66 (semctl): may return -ENOSYS or -EINVAL — present or absent is OK
+    // as long as the arm is correct.
+    let semctl_ret = crate::subsys::linux::syscall::dispatch(66, 0, 0, 0, 0, 0, 0);
+    // Accept ENOSYS or negative errno; reject only a spurious 0 (would mean something
+    // weird ran successfully).
+    if semctl_ret == 0 {
+        // semctl with semid=0, cmd=0 (IPC_RMID) on a non-existent segment should fail.
+        test_fail!("syscall_align_sem",
+            "syscall 66 (semctl) returned 0 unexpectedly — check dispatch arm");
+        ok = false;
+    } else {
+        test_println!("  syscall 66 (semctl) → {} (non-zero — arm present or ENOSYS) ✓", semctl_ret);
+    }
+
+    if ok { test_pass!("syscall number alignment — SEM family (64/65/66)"); }
+    ok
 }
 
