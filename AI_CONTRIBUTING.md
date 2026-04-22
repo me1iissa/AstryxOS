@@ -146,22 +146,26 @@ ReactOS is MIT-licensed and is explicitly safe to reference. Linux is GPL and
 is also safe to reference. If you are uncertain whether something came from a
 leaked source, do not include it.
 
-### Private reference material is out-of-scope for any public artefact
+### Private reference material — read freely, never publish
 
-The project maintainer may provide out-of-tree reference material for agent
-use during development. This material is strictly private and gitignored.
+The project maintainer provides out-of-tree reference material for agent use
+during development. The material is strictly private and gitignored.
 
-You MAY consult such material, if provided, for algorithms, struct layouts,
-semantics, constants, and error-handling patterns.
+You MAY consult it freely for algorithms, struct layouts, semantics,
+constants, error-handling patterns, and any other implementation detail
+that accelerates your work.
 
-You MUST NOT, under any circumstances:
-- Name, link to, or describe the location of private reference material in
-  any committed file, comment, doc, test, commit message, PR description,
-  issue, or reported summary
-- Copy text verbatim from private reference material into this tree
-- Leave a TODO, footnote, or breadcrumb that would let a future reader
-  identify or locate the material
-- Paraphrase it in a way that makes the source identifiable
+You MUST NEVER publish information derived from it in the project tree.
+Specifically, under no circumstances leave any of the following in a
+committed file, comment, doc, test, commit message, PR description, issue,
+or reported summary:
+
+- The path, location, or layout of any private reference material
+- Verbatim excerpts from it
+- Paraphrases that make the source identifiable
+- TODOs, footnotes, or breadcrumbs that would let a future reader locate it
+- Any quotation, including comment headers such as "see FOO.C:123" or
+  "from BAR"
 
 The only evidence that you consulted anything should be that your code is
 correct. Every citation you do leave in the tree must point exclusively to
@@ -173,6 +177,21 @@ If you need to cite something for a semantic decision, use the closest
 public equivalent (ReactOS for NT-style semantics; upstream Linux for POSIX
 semantics). If no public source applies, write correct code and do not
 cite anything.
+
+#### Where to store working notes from private material
+
+If you want to record notes, scratchpad derivations, or extracted pseudocode
+for future reference, write them to the user-scope Claude memory directory:
+
+```
+~/.claude/projects/-mnt-devdisk-RXX-AIOnly-AstryxOS/memory/<topic>.md
+```
+
+That location is outside the project tree and is never published. It is a
+safe place to keep, for example, a note like "observed field layout for
+struct X" or "steps of algorithm Y as I understand it". Never write these
+notes inside the project repository — not even in `.ai/`, not in scratch
+files, not in test fixtures.
 
 ---
 
