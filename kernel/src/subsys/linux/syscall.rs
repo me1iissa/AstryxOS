@@ -1482,8 +1482,10 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         269 => sys_faccessat_linux(arg1, arg2, arg3),
         // 280: utimensat(dirfd, pathname, times, flags) — stub success
         280 => 0,
-        // 284: eventfd(initval, flags) / 290: eventfd2(initval, flags)
-        284 | 290 => sys_eventfd_linux(arg1 as u64),
+        // 284: eventfd(initval) — legacy form, no flags argument
+        284 => sys_eventfd_linux(arg1 as u64, 0),
+        // 290: eventfd2(initval, flags) — takes EFD_NONBLOCK / EFD_CLOEXEC / EFD_SEMAPHORE
+        290 => sys_eventfd_linux(arg1 as u64, arg2 as u32),
         // 293: pipe2(pipefd, flags) — like pipe but with O_CLOEXEC/O_NONBLOCK
         293 => sys_pipe2_linux(arg1 as *mut u32, arg2 as u32),
         // 435: clone3(clone_args *args, size_t size)
@@ -2174,6 +2176,51 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         263 => sys_unlinkat(arg1, arg2, arg3),
         // 264: renameat(olddirfd, oldpath, newdirfd, newpath)
         264 => sys_renameat(arg1, arg2, arg3, arg4),
+
+        // ─── T1 batch 2 additions ─────────────────────────────────────────
+
+        // 297: rt_tgsigqueueinfo(tgid, tid, sig, uinfo)
+        // Deliver signal `sig` to thread `tid` in thread group `tgid`.
+        // The siginfo_t user pointer is accepted but we delegate to the
+        // existing kill primitive which carries no extra info payload.
+        297 => {
+            // arg1=tgid, arg2=tid, arg3=sig, arg4=uinfo*
+            // sig==0 is a validity probe — just return 0.
+            if arg3 == 0 { return 0; }
+            crate::signal::kill(arg1, arg3 as u8)
+        }
+
+        // 300: fanotify_init(flags, event_f_flags) — stub ENOSYS
+        // 301: fanotify_mark(fanotify_fd, flags, mask, dirfd, pathname) — stub ENOSYS
+        // Firefox and common tools probe fanotify presence via -ENOSYS and fall back.
+        300 | 301 => {
+            crate::serial_println!("[SYSCALL/Linux] fanotify syscall {} — ENOSYS (no fanotify support)", num);
+            -38 // ENOSYS
+        }
+
+        // 306: syncfs(fd) — flush the filesystem containing fd.
+        // We have no async writeback queue; just return success so callers
+        // (e.g. package managers) don't abort.
+        306 => {
+            crate::serial_println!("[SYSCALL/Linux] syncfs(fd={}) — returning 0 (no writeback queue)", arg1);
+            0
+        }
+
+        // 329: pkey_mprotect(addr, len, prot, pkey) — delegate to mprotect, ignore pkey.
+        // 330: pkey_alloc(flags, access_rights) — stub; returns pkey 0 (default key).
+        // 331: pkey_free(pkey) — pkey_free(0) is invalid (can't free default key).
+        // PKE (CR4.PKE) is not enabled; these stubs satisfy glibc's cpuid probe path.
+        329 => sys_mprotect(arg1, arg2, arg3), // delegate; arg4 pkey silently ignored
+        330 => {
+            // flags and access_rights are reserved; must be 0.
+            if arg1 != 0 || arg2 != 0 { return -22; } // EINVAL
+            0 // return pkey 0 (the default protection key)
+        }
+        331 => {
+            // pkey 0 is the default key; it may never be freed.
+            if arg1 == 0 { return -22; } // EINVAL
+            -22 // EINVAL — we only ever return key 0, so any free is invalid
+        }
 
         // Explicit ENOSYS for syscalls that would silently fail otherwise
         // (give the process a chance to fall back rather than misinterpreting 0)
@@ -4035,9 +4082,13 @@ pub fn sys_futex_linux(uaddr: u64, futex_op: u64, val: u64, timeout_ptr: u64, ua
 
 // ── Phase 6 syscall implementations ────────────────────────────────────────
 
-/// eventfd(initval, flags) — Create a counter-based signaling fd.
-fn sys_eventfd_linux(initval: u64) -> i64 {
-    let efd_id = crate::ipc::eventfd::create(initval, 0);
+/// eventfd(initval) / eventfd2(initval, flags) — Create a counter-based signaling fd.
+///
+/// `flags` may contain EFD_NONBLOCK (0x800), EFD_CLOEXEC (0x80000), EFD_SEMAPHORE (0x1).
+/// The eventfd fd always returns EAGAIN when the counter is 0; EFD_NONBLOCK only matters
+/// for callers using blocking semantics (which we don't yet implement as a sleep).
+fn sys_eventfd_linux(initval: u64, flags: u32) -> i64 {
+    let efd_id = crate::ipc::eventfd::create(initval, flags);
     if efd_id == u64::MAX {
         return -24; // EMFILE
     }
@@ -4052,13 +4103,17 @@ fn sys_eventfd_linux(initval: u64) -> i64 {
         }
     };
 
+    // EFD_CLOEXEC = 0x80000, EFD_NONBLOCK = 0x800
+    let efd_cloexec  = (flags & 0x0008_0000) != 0;
+    let efd_nonblock = (flags & 0x0000_0800) != 0;
     let fd = crate::vfs::FileDescriptor {
         mount_idx: usize::MAX,
         inode:     efd_id,
         offset:    0,
-        flags:     0x0001_0000, // eventfd marker
+        // Store nonblock flag in lower bits so poll/read can check it.
+        flags:     0x0001_0000 | if efd_nonblock { 0x0800 } else { 0 },
         is_console: false,
-        cloexec: false,
+        cloexec:   efd_cloexec,
         file_type: crate::vfs::FileType::EventFd,
         open_path: alloc::string::String::new(),
     };
