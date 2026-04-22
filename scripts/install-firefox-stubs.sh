@@ -68,8 +68,11 @@ build_stub() {
         return 0
     fi
 
+    # -lc: allocator stubs forward to glibc malloc/free, so we need libc.
+    # -nostartfiles keeps the stub tiny (no crt0 overhead) while still
+    # allowing libc function calls via the PLT.
     local gcc_args=(-shared -fPIC -nostartfiles -o "${out}" "${c_src}"
-                    -Wl,-soname,"${soname}")
+                    -Wl,-soname,"${soname}" -lc)
     if [ -n "${vscript}" ]; then
         gcc_args+=(-Wl,--version-script="${vscript}")
     fi
@@ -104,10 +107,12 @@ fi
 log "Collecting undefined symbols from libxul.so and libmozgtk.so ..."
 
 # Python helper: generate stub .c and version scripts for each library.
+# Symbols are classified into categories that get appropriate stub bodies
+# instead of a blanket NULL return, so Firefox progresses further into init.
 python3 - "${LIBXUL}" "${LIBMOZGTK}" "${STUB_DIR}" << 'PYEOF'
-import subprocess, sys, os, collections
+import subprocess, sys, os, collections, re
 
-libxul   = sys.argv[1]
+libxul    = sys.argv[1]
 libmozgtk = sys.argv[2]
 stub_dir  = sys.argv[3]
 
@@ -134,8 +139,8 @@ for path in [libxul, libmozgtk]:
 
 print(f"[FF-STUBS]   Total undefined symbols: {len(undef)}")
 
-# Classify each symbol to its providing library (best-effort by name prefix).
-def classify(name):
+# ── Library classifier ────────────────────────────────────────────────────────
+def classify_lib(name):
     p = name
     if p.startswith('snd_'):                       return 'libasound.so.2'
     if p.startswith('FT_') or p.startswith('FTC_'): return 'libfreetype.so.6'
@@ -173,35 +178,259 @@ def classify(name):
     if p.startswith('X'):                           return 'libX11.so.6'
     return None
 
-# Group by library
+# ── Symbol-body classifier ────────────────────────────────────────────────────
+# Returns a string: one of 'alloc', 'free', 'strdup', 'strdup_printf',
+# 'strndup', 'realloc', 'slice_alloc', 'slice_free', 'bool_true',
+# 'ref_passthrough', 'unref_noop', 'opaque_ptr', 'null' (default).
+
+# Exact-name overrides take priority over pattern matching.
+_EXACT_CATEGORY = {
+    # --- allocators ---
+    'g_malloc':            'alloc',
+    'g_malloc0':           'alloc0',
+    'g_malloc_n':          'alloc',
+    'g_try_malloc':        'alloc',
+    'g_try_malloc0':       'alloc0',
+    'g_realloc':           'realloc',
+    'g_try_realloc':       'realloc',
+    'g_free':              'free',
+    'g_slice_alloc':       'slice_alloc',
+    'g_slice_alloc0':      'slice_alloc0',
+    'g_slice_free1':       'slice_free',
+    # --- string helpers ---
+    'g_strdup':            'strdup',
+    'g_strndup':           'strndup',
+    'g_strdup_printf':     'strdup_printf',
+    'g_strdup_vprintf':    'strdup_printf',
+    # --- bool-success inits ---
+    'gtk_init_check':      'bool_true',
+    'gtk_init':            'void_noop',
+    'g_thread_init':       'void_noop',
+    'g_thread_init_with_errorcheck_mutexes': 'void_noop',
+    # --- ref / unref ---
+    'g_object_ref':        'ref_passthrough',
+    'g_object_ref_sink':   'ref_passthrough',
+    'g_type_class_ref':    'ref_passthrough',
+    'g_type_class_peek':   'ref_passthrough',
+    'g_object_unref':      'unref_noop',
+    'g_type_class_unref':  'unref_noop',
+    # --- opaque object constructors ---
+    'g_object_new':        'opaque_ptr',
+    'gtk_window_new':      'opaque_ptr',
+    'gtk_style_context_new': 'opaque_ptr',
+    'cairo_create':        'opaque_ptr',
+    'g_type_register_static': 'opaque_ptr',
+    'g_type_register_static_simple': 'opaque_ptr',
+}
+
+# Pattern-based rules applied when no exact match.
+# Each entry: (compiled_regex, category)
+_PATTERN_RULES = [
+    # allocators: names ending with _new, _alloc, _malloc, _calloc
+    (re.compile(r'(?:_new|_alloc|_malloc|_calloc)$'),          'opaque_ptr'),
+    # free/unref: names ending with _free, _unref, _destroy, _close, _release
+    (re.compile(r'(?:_free|_unref|_destroy|_close|_release)$'), 'unref_noop'),
+    # ref: names ending with _ref or _ref_sink
+    (re.compile(r'_ref(?:_sink)?$'),                            'ref_passthrough'),
+    # boolean init checks ending _check
+    (re.compile(r'_init_check$'),                               'bool_true'),
+    # void inits
+    (re.compile(r'_init$'),                                     'void_noop'),
+]
+
+def classify_body(name):
+    if name in _EXACT_CATEGORY:
+        return _EXACT_CATEGORY[name]
+    for pat, cat in _PATTERN_RULES:
+        if pat.search(name):
+            return cat
+    return 'null'
+
+# ── C body emitter ────────────────────────────────────────────────────────────
+# We emit a single variadic signature `void* name(...)` for almost everything —
+# this avoids argument-count mismatches at the ABI level.  The few exceptions
+# that need typed signatures (free, strdup, etc.) are handled explicitly.
+
+# Static placeholder object that opaque-ptr stubs can point to — valid read-
+# only memory that survives the lifetime of the process.  Using a single global
+# avoids returning stack addresses.
+_C_PREAMBLE = """\
+/* AstryxOS smart stub — {lib}
+ * Generated by install-firefox-stubs.sh for headless Firefox ESR 115.
+ * Symbols are classified into categories with plausible return values so
+ * Firefox progresses further into GTK/GLib init before hitting real missing
+ * functionality. */
+
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <stdio.h>
+
+/* Singleton placeholder: returned by object-constructor stubs.
+ * Read-only, always non-NULL, safe to pass back into unref/free stubs. */
+static const int _stub_placeholder = 0;
+
+"""
+
+def emit_stub(name, cat):
+    """Return C source lines for one stub function."""
+    if cat == 'alloc':
+        # g_malloc(gsize n) — forward to malloc, same ABI (size_t arg)
+        return (
+            f'void* {name}(unsigned long n) {{\n'
+            f'    return malloc((size_t)n);\n'
+            f'}}\n'
+        )
+    elif cat == 'alloc0':
+        return (
+            f'void* {name}(unsigned long n) {{\n'
+            f'    return calloc(1, (size_t)n);\n'
+            f'}}\n'
+        )
+    elif cat == 'realloc':
+        return (
+            f'void* {name}(void* p, unsigned long n) {{\n'
+            f'    return realloc(p, (size_t)n);\n'
+            f'}}\n'
+        )
+    elif cat == 'free':
+        return (
+            f'void {name}(void* p) {{\n'
+            f'    free(p);\n'
+            f'}}\n'
+        )
+    elif cat == 'slice_alloc':
+        return (
+            f'void* {name}(unsigned long block_size) {{\n'
+            f'    return malloc((size_t)block_size);\n'
+            f'}}\n'
+        )
+    elif cat == 'slice_alloc0':
+        return (
+            f'void* {name}(unsigned long block_size) {{\n'
+            f'    return calloc(1, (size_t)block_size);\n'
+            f'}}\n'
+        )
+    elif cat == 'slice_free':
+        return (
+            f'void {name}(unsigned long block_size, void* mem_block) {{\n'
+            f'    (void)block_size;\n'
+            f'    free(mem_block);\n'
+            f'}}\n'
+        )
+    elif cat == 'strdup':
+        return (
+            f'char* {name}(const char* s) {{\n'
+            f'    if (!s) return (char*)malloc(1);\n'
+            f'    size_t n = strlen(s) + 1;\n'
+            f'    char* d = (char*)malloc(n);\n'
+            f'    if (d) memcpy(d, s, n);\n'
+            f'    return d;\n'
+            f'}}\n'
+        )
+    elif cat == 'strndup':
+        return (
+            f'char* {name}(const char* s, unsigned long n) {{\n'
+            f'    if (!s) return (char*)calloc(1, 1);\n'
+            f'    size_t len = strnlen(s, (size_t)n);\n'
+            f'    char* d = (char*)malloc(len + 1);\n'
+            f'    if (d) {{ memcpy(d, s, len); d[len] = \'\\0\'; }}\n'
+            f'    return d;\n'
+            f'}}\n'
+        )
+    elif cat == 'strdup_printf':
+        # g_strdup_printf(fmt, ...) — use vasprintf
+        return (
+            f'char* {name}(const char* fmt, ...) {{\n'
+            f'    va_list ap;\n'
+            f'    char* out = (char*)malloc(1);\n'
+            f'    if (out) out[0] = \'\\0\';\n'
+            f'    if (!fmt) return out;\n'
+            f'    va_start(ap, fmt);\n'
+            f'    char* tmp = (char*)malloc(4096);\n'
+            f'    if (tmp) {{\n'
+            f'        vsnprintf(tmp, 4096, fmt, ap);\n'
+            f'        free(out);\n'
+            f'        out = tmp;\n'
+            f'    }}\n'
+            f'    va_end(ap);\n'
+            f'    return out;\n'
+            f'}}\n'
+        )
+    elif cat == 'bool_true':
+        # Returns int 1 (TRUE) — init-check functions
+        return (
+            f'int {name}(...) {{\n'
+            f'    return 1;\n'
+            f'}}\n'
+        )
+    elif cat == 'void_noop':
+        return (
+            f'void {name}(...) {{\n'
+            f'}}\n'
+        )
+    elif cat == 'ref_passthrough':
+        # g_object_ref(gpointer obj) — return the same pointer
+        return (
+            f'void* {name}(void* obj) {{\n'
+            f'    return obj ? obj : (void*)&_stub_placeholder;\n'
+            f'}}\n'
+        )
+    elif cat == 'unref_noop':
+        # g_object_unref — ignore, free stubs are separate
+        return (
+            f'void {name}(...) {{\n'
+            f'}}\n'
+        )
+    elif cat == 'opaque_ptr':
+        # Returns a non-NULL placeholder pointer — object constructors,
+        # type-system functions, etc.
+        return (
+            f'void* {name}(...) {{\n'
+            f'    return (void*)&_stub_placeholder;\n'
+            f'}}\n'
+        )
+    else:  # 'null' — original behaviour
+        return (
+            f'void* {name}(...) {{\n'
+            f'    return (void*)0;\n'
+            f'}}\n'
+        )
+
+# ── Group symbols by library ──────────────────────────────────────────────────
 by_lib = collections.defaultdict(dict)  # lib -> {name: version}
 for name, ver in undef.items():
-    lib = classify(name)
+    lib = classify_lib(name)
     if lib:
         by_lib[lib][name] = ver
 
-# For each library: write .c stub + version script
+# ── Write .c stubs + version scripts ─────────────────────────────────────────
 for lib, syms in sorted(by_lib.items()):
-    safe = lib.replace('.', '_').replace('-', '_')
-    c_path  = os.path.join(stub_dir, f'stub_{safe}.c')
+    safe   = lib.replace('.', '_').replace('-', '_')
+    c_path = os.path.join(stub_dir, f'stub_{safe}.c')
     vs_path = os.path.join(stub_dir, f'stub_{safe}.vscript')
 
-    # Group by version
+    # Count per category for the log line
+    cat_counts = collections.Counter()
+
+    with open(c_path, 'w') as f:
+        f.write(_C_PREAMBLE.format(lib=lib))
+        for name in sorted(syms):
+            cat = classify_body(name)
+            cat_counts[cat] += 1
+            f.write(emit_stub(name, cat))
+            f.write('\n')
+        f.write('void __attribute__((weak)) __gmon_start__(void) {}\n')
+
+    # Version script
     by_ver = collections.defaultdict(set)
     for name, ver in syms.items():
         by_ver[ver if ver else ''].add(name)
 
     has_versions = any(v for v in by_ver)
 
-    with open(c_path, 'w') as f:
-        f.write(f'/* AstryxOS stub {lib} for headless Firefox ESR 115. */\n\n')
-        for name in sorted(syms):
-            f.write(f'void* {name}(void) {{ return (void*)0; }}\n')
-        f.write('\nvoid __attribute__((weak)) __gmon_start__(void) {}\n')
-
     if has_versions:
         with open(vs_path, 'w') as f:
-            # Write a version node for each distinct version tag
             for ver, names in sorted(by_ver.items()):
                 if not ver:
                     continue
@@ -209,7 +438,6 @@ for lib, syms in sorted(by_lib.items()):
                 for n in sorted(names):
                     f.write(f'    {n};\n')
                 f.write('  local: *;\n};\n\n')
-            # Also write an unversioned section for any unversioned symbols
             if '' in by_ver:
                 f.write('{\n  global:\n')
                 for n in sorted(by_ver['']):
@@ -217,7 +445,6 @@ for lib, syms in sorted(by_lib.items()):
                 f.write('  __gmon_start__;\n')
                 f.write('  local: *;\n};\n')
     else:
-        # No versioned symbols: simple export-all version script
         with open(vs_path, 'w') as f:
             f.write('{\n  global:\n')
             for n in sorted(syms):
@@ -225,7 +452,8 @@ for lib, syms in sorted(by_lib.items()):
             f.write('  __gmon_start__;\n')
             f.write('  local: *;\n};\n')
 
-    print(f"[FF-STUBS]   Generated stubs for {lib} ({len(syms)} symbols)")
+    summary = ' '.join(f'{k}={v}' for k, v in sorted(cat_counts.items()) if v)
+    print(f"[FF-STUBS]   {lib} ({len(syms)} syms: {summary})")
 
 # Write a manifest of all libraries to build
 libs_file = os.path.join(stub_dir, 'libs.txt')
