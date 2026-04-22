@@ -7,3 +7,4 @@ TinyCC/
 .claude/
 *.bak
 *.swp
+__pycache__/
