@@ -293,6 +293,14 @@ pub struct Process {
     /// Environment strings stored at exec time; exposed via /proc/self/environ
     /// as NUL-separated bytes.  Empty for kernel threads.
     pub envp: Vec<alloc::string::String>,
+    /// POSIX alarm()/setitimer(ITIMER_REAL) deadline in PIT ticks.
+    /// 0 means no alarm is set.  Checked at dispatch entry — SIGALRM is
+    /// delivered lazily (on the next syscall after expiry) to avoid acquiring
+    /// PROCESS_TABLE inside the timer ISR.
+    pub alarm_deadline_ticks: u64,
+    /// ITIMER_REAL interval in ticks (0 = one-shot).  Non-zero means the alarm
+    /// is automatically re-armed after each expiry.
+    pub alarm_interval_ticks: u64,
 }
 
 /// Next PID counter.
@@ -451,6 +459,8 @@ pub fn init() {
         epoll_sets: alloc::vec::Vec::new(),
         auxv: Vec::new(),
         envp: Vec::new(),
+        alarm_deadline_ticks: 0,
+        alarm_interval_ticks: 0,
     };
 
     let idle_thread = Thread {
@@ -658,6 +668,8 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
         epoll_sets: alloc::vec::Vec::new(),
         auxv: Vec::new(),
         envp: Vec::new(),
+        alarm_deadline_ticks: 0,
+        alarm_interval_ticks: 0,
     };
 
     let thread = Thread {
@@ -1517,6 +1529,9 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
         epoll_sets: alloc::vec::Vec::new(),
         auxv: Vec::new(),
         envp: Vec::new(),
+        // POSIX: alarm state is NOT inherited across fork (POSIX.1-2008 §2.4)
+        alarm_deadline_ticks: 0,
+        alarm_interval_ticks: 0,
     };
 
     let child_thread = Thread {
@@ -1694,6 +1709,8 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
         epoll_sets: alloc::vec::Vec::new(),
         auxv: Vec::new(),
         envp: Vec::new(),
+        alarm_deadline_ticks: 0,
+        alarm_interval_ticks: 0,
     };
 
     let child_thread = Thread {
