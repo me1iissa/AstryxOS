@@ -297,6 +297,17 @@ pub const XI_QUERY_VERSION:    u8 = 47;
 pub const XI_GET_CLIENT_POINTER: u8 = 18;
 pub const XI_SELECT_EVENTS:    u8 = 46;
 
+// ── BIG-REQUESTS major opcode ─────────────────────────────────────────────────
+// BIG-REQUESTS is a tiny protocol-negotiation extension: the client sends
+// BigReqEnable (minor 0) and the server replies with the new maximum request
+// length in 4-byte units.  We advertise 4 MiB (0x100_0000 bytes = 0x40_0000
+// units).  No other opcodes are defined.
+pub const BIGREQ_MAJOR_OPCODE: u8 = 133; // BIG-REQUESTS
+pub const BIGREQ_ENABLE:       u8 = 0;   // BigReqEnable minor opcode
+
+// New maximum request length in 4-byte units (4 MiB).
+pub const BIGREQ_MAX_REQUEST_LEN: u32 = 0x0010_0000; // 4 MiB / 4
+
 // ── COMPOSITE minor opcodes ───────────────────────────────────────────────────
 pub const COMPOSITE_QUERY_VERSION:            u8 = 0;
 pub const COMPOSITE_REDIRECT_WINDOW:          u8 = 1;
