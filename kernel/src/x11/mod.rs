@@ -580,6 +580,7 @@ fn handle_request(fd: u64, data: &[u8]) {
         proto::OP_COPY_AREA             => op_copy_area(fd, data),
         proto::RENDER_MAJOR_OPCODE      => op_render(fd, data, seq),
         proto::SHM_MAJOR_OPCODE        => op_shm(fd, data, seq),
+        proto::BIGREQ_MAJOR_OPCODE     => op_bigreq(fd, data, seq),
         proto::XFIXES_MAJOR_OPCODE     => op_xfixes(fd, data, seq),
         proto::DAMAGE_MAJOR_OPCODE     => op_damage(fd, data, seq),
         proto::XINPUT_MAJOR_OPCODE     => op_xinput(fd, data, seq),
@@ -1640,8 +1641,9 @@ fn op_query_extension(fd: u64, data: &[u8], seq: u16) {
     let name = if data.len() >= 8+nlen { core::str::from_utf8(&data[8..8+nlen]).unwrap_or("") } else { "" };
     let mut b = [0u8;32]; b[0]=1; w16(&mut b,2,seq);
     match name {
-        "MIT-SHM"   => { b[8]=1; b[9]=proto::SHM_MAJOR_OPCODE;    b[10]=0; b[11]=0; }
-        "XKEYBOARD" => { b[8]=1; b[9]=proto::XKEYBOARD_MAJOR_OPCODE; b[10]=0; b[11]=0; }
+        "MIT-SHM"        => { b[8]=1; b[9]=proto::SHM_MAJOR_OPCODE;    b[10]=0; b[11]=0; }
+        "BIG-REQUESTS"   => { b[8]=1; b[9]=proto::BIGREQ_MAJOR_OPCODE; b[10]=0; b[11]=0; }
+        "XKEYBOARD"      => { b[8]=1; b[9]=proto::XKEYBOARD_MAJOR_OPCODE; b[10]=0; b[11]=0; }
         "SHAPE"     => { b[8]=1; b[9]=proto::SHAPE_MAJOR_OPCODE;   b[10]=0; b[11]=0; }
         "RENDER"    => { b[8]=1; b[9]=proto::RENDER_MAJOR_OPCODE;  b[10]=0; b[11]=0; }
         "XFIXES"    => { b[8]=1; b[9]=proto::XFIXES_MAJOR_OPCODE;  b[10]=0; b[11]=0; }
@@ -1663,7 +1665,7 @@ fn op_query_extension(fd: u64, data: &[u8], seq: u16) {
 
 fn op_list_extensions(fd: u64, seq: u16) {
     let names: &[&[u8]] = &[
-        b"MIT-SHM", b"XKEYBOARD", b"SHAPE", b"RENDER",
+        b"MIT-SHM", b"BIG-REQUESTS", b"XKEYBOARD", b"SHAPE", b"RENDER",
         b"XFIXES", b"DAMAGE", b"XTEST", b"XInputExtension",
         b"DPMS", b"SYNC", b"COMPOSITE", b"RANDR",
     ];
@@ -2117,6 +2119,36 @@ fn op_shm(fd: u64, data: &[u8], seq: u16) {
         proto::SHM_CREATE_PIXMAP => {}
         _ => {}
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// BIG-REQUESTS extension (major opcode 133)
+//
+// The entire extension is a single negotiation round-trip:
+//   Client → BigReqEnable (minor 0, 4-byte request)
+//   Server → BigReqEnableReply: 32 bytes, b[8..12] = new max request length
+//            in 4-byte units.
+//
+// After this exchange the client may send requests whose 16-bit length field
+// is 0; in that case the next four bytes carry the real (32-bit) length.
+// We acknowledge the negotiation and advertise 4 MiB, but we do not yet
+// handle 32-bit lengths in the dispatcher — requests that large aren't needed
+// for GTK/Firefox init.
+// ═════════════════════════════════════════════════════════════════════════════
+
+fn op_bigreq(fd: u64, data: &[u8], seq: u16) {
+    if data.len() < 4 { return; }
+    let minor = data[1];
+    if minor == proto::BIGREQ_ENABLE {
+        // BigReqEnableReply: b[8..12] = maximum request length in 4-byte units.
+        let mut b = [0u8; 32];
+        b[0] = 1; // reply
+        w16(&mut b, 2, seq);
+        // length field (b[4..8]) = 0 — the reply body fits in the 32-byte header.
+        w32(&mut b, 8, proto::BIGREQ_MAX_REQUEST_LEN);
+        with_client(fd, |c| c.send(&b));
+    }
+    // No other opcodes are defined for BIG-REQUESTS; ignore anything else.
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

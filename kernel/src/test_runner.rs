@@ -808,6 +808,36 @@ pub fn run() -> ! {
     total += 1;
     if test_elf_dt_gnu_hash_accepted() { passed += 1; }
 
+    // ── Test 133: X11 BIG-REQUESTS — QueryExtension present + BigReqEnable ─
+
+    total += 1;
+    if test_x11_big_requests_enable() { passed += 1; }
+
+    // ── Test 134: X11 MIT-SHM — QueryExtension present + ShmQueryVersion ───
+
+    total += 1;
+    if test_x11_query_extension_mit_shm() { passed += 1; }
+
+    // ── Test 135: X11 XKB — QueryExtension present + XkbUseExtension ───────
+
+    total += 1;
+    if test_x11_xkb_use_extension() { passed += 1; }
+
+    // ── Test 136: X11 XFIXES — QueryExtension present + QueryVersion ────────
+
+    total += 1;
+    if test_x11_xfixes_query_version() { passed += 1; }
+
+    // ── Test 137: X11 SYNC — QueryExtension present + SyncInitialize ────────
+
+    total += 1;
+    if test_x11_sync_initialize() { passed += 1; }
+
+    // ── Test 138: X11 RENDER — already tested in test 68; verify version ≥0.11
+
+    total += 1;
+    if test_x11_render_query_version() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -15463,6 +15493,426 @@ fn test_elf_dt_gnu_hash_accepted() -> bool {
     }
 
     test_pass!("ELF DT_GNU_HASH accepted (no DT_HASH)");
+    true
+}
+
+// ── X11 extension test helper: connect + setup, return fd or u64::MAX ────────
+//
+// Shared connection pattern for tests 133-138.  Returns the connected socket fd
+// with the ServerHello already drained, or u64::MAX on failure (caller must NOT
+// close on MAX).
+
+fn x11_connect_and_setup(tag: &str) -> u64 {
+    let fd = crate::net::unix::create();
+    if fd == u64::MAX {
+        test_println!("  [{}] unix::create() failed", tag);
+        return u64::MAX;
+    }
+    if crate::net::unix::connect(fd, b"/tmp/.X11-unix/X0\0") < 0 {
+        test_println!("  [{}] connect failed", tag);
+        crate::net::unix::close(fd);
+        return u64::MAX;
+    }
+    let hello: [u8; 12] = [0x6C, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    crate::net::unix::write(fd, &hello);
+    crate::x11::poll();
+    let mut drain = [0u8; 256];
+    let n = crate::net::unix::read(fd, &mut drain);
+    if n < 8 || drain[0] != 1 {
+        test_println!("  [{}] setup failed n={}", tag, n);
+        crate::net::unix::close(fd);
+        return u64::MAX;
+    }
+    fd
+}
+
+// ── Test 133: X11 BIG-REQUESTS — QueryExtension present + BigReqEnable ───────
+
+fn test_x11_big_requests_enable() -> bool {
+    test_header!("X11 BIG-REQUESTS — QueryExtension + BigReqEnable");
+
+    use crate::x11::proto;
+
+    let fd = x11_connect_and_setup("bigreq");
+    if fd == u64::MAX {
+        test_fail!("x11_bigreq", "X11 connect/setup failed");
+        return false;
+    }
+
+    // ── QueryExtension("BIG-REQUESTS") ──────────────────────────────────────
+    // Name = 12 bytes; padded to 12 (already aligned); header=8 bytes → 20 total = 5 words.
+    let name = b"BIG-REQUESTS"; // 12 bytes — already 4-byte aligned, no pad needed
+    let nlen = name.len() as u16;
+    let req_words = ((8u16 + ((nlen + 3) & !3)) / 4) as u8; // = (8+12)/4 = 5
+    let mut qe = [0u8; 20];
+    qe[0] = 98; // OP_QUERY_EXTENSION
+    qe[2] = req_words;
+    qe[4] = nlen as u8;
+    qe[5] = (nlen >> 8) as u8;
+    qe[8..8 + name.len()].copy_from_slice(name);
+    crate::net::unix::write(fd, &qe);
+    crate::x11::poll();
+    let mut rep = [0u8; 32];
+    let n = crate::net::unix::read(fd, &mut rep);
+    if n < 12 || rep[0] != 1 {
+        test_fail!("x11_bigreq", "QueryExtension(BIG-REQUESTS) no reply n={}", n);
+        crate::net::unix::close(fd);
+        return false;
+    }
+    if rep[8] != 1 {
+        test_fail!("x11_bigreq", "BIG-REQUESTS present={} (expected 1)", rep[8]);
+        crate::net::unix::close(fd);
+        return false;
+    }
+    let major = rep[9];
+    if major != proto::BIGREQ_MAJOR_OPCODE {
+        test_fail!("x11_bigreq", "BIG-REQUESTS major={} (expected {})", major, proto::BIGREQ_MAJOR_OPCODE);
+        crate::net::unix::close(fd);
+        return false;
+    }
+    test_println!("  QueryExtension(BIG-REQUESTS): present=1 major={} ✓", major);
+
+    // ── BigReqEnable (minor 0) ───────────────────────────────────────────────
+    // Request: [major_opcode, 0, 1, 0] = 4 bytes = 1 word
+    let req: [u8; 4] = [proto::BIGREQ_MAJOR_OPCODE, proto::BIGREQ_ENABLE, 1, 0];
+    crate::net::unix::write(fd, &req);
+    crate::x11::poll();
+    let mut brep = [0u8; 32];
+    let n = crate::net::unix::read(fd, &mut brep);
+    if n < 12 || brep[0] != 1 {
+        test_fail!("x11_bigreq", "BigReqEnable no reply n={}", n);
+        crate::net::unix::close(fd);
+        return false;
+    }
+    let max_len = u32::from_le_bytes([brep[8], brep[9], brep[10], brep[11]]);
+    if max_len < 0x1000 {
+        test_fail!("x11_bigreq", "BigReqEnable max_len={} (too small)", max_len);
+        crate::net::unix::close(fd);
+        return false;
+    }
+    test_println!("  BigReqEnable: max_request_len={:#x} ✓", max_len);
+
+    crate::net::unix::close(fd);
+    test_pass!("X11 BIG-REQUESTS extension");
+    true
+}
+
+// ── Test 134: X11 MIT-SHM — QueryExtension present + ShmQueryVersion ─────────
+
+fn test_x11_query_extension_mit_shm() -> bool {
+    test_header!("X11 MIT-SHM — QueryExtension present + ShmQueryVersion");
+
+    use crate::x11::proto;
+
+    let fd = x11_connect_and_setup("mitshm");
+    if fd == u64::MAX {
+        test_fail!("x11_mitshm", "X11 connect/setup failed");
+        return false;
+    }
+
+    // ── QueryExtension("MIT-SHM") ─────────────────────────────────────────────
+    // Name = 7 bytes → padded to 8; header=8 → total=16 = 4 words.
+    let name = b"MIT-SHM"; // 7 bytes
+    let nlen = name.len() as u16;
+    let req_words = ((8u16 + ((nlen + 3) & !3)) / 4) as u8; // (8+8)/4=4
+    let mut qe = [0u8; 16];
+    qe[0] = 98; // OP_QUERY_EXTENSION
+    qe[2] = req_words;
+    qe[4] = nlen as u8;
+    qe[8..8 + name.len()].copy_from_slice(name);
+    crate::net::unix::write(fd, &qe);
+    crate::x11::poll();
+    let mut rep = [0u8; 32];
+    let n = crate::net::unix::read(fd, &mut rep);
+    if n < 12 || rep[0] != 1 {
+        test_fail!("x11_mitshm", "QueryExtension(MIT-SHM) no reply n={}", n);
+        crate::net::unix::close(fd);
+        return false;
+    }
+    if rep[8] != 1 {
+        test_fail!("x11_mitshm", "MIT-SHM not present (present={})", rep[8]);
+        crate::net::unix::close(fd);
+        return false;
+    }
+    let major = rep[9];
+    if major == 0 {
+        test_fail!("x11_mitshm", "MIT-SHM major opcode is 0");
+        crate::net::unix::close(fd);
+        return false;
+    }
+    test_println!("  QueryExtension(MIT-SHM): present=1 major={} ✓", major);
+
+    // ── ShmQueryVersion (minor 0) ────────────────────────────────────────────
+    let req: [u8; 4] = [proto::SHM_MAJOR_OPCODE, proto::SHM_QUERY_VERSION, 1, 0];
+    crate::net::unix::write(fd, &req);
+    crate::x11::poll();
+    let mut vrep = [0u8; 32];
+    let n = crate::net::unix::read(fd, &mut vrep);
+    if n < 12 || vrep[0] != 1 {
+        test_fail!("x11_mitshm", "ShmQueryVersion no reply n={}", n);
+        crate::net::unix::close(fd);
+        return false;
+    }
+    let shm_major = u16::from_le_bytes([vrep[8], vrep[9]]);
+    if shm_major != 1 {
+        test_fail!("x11_mitshm", "SHM major={} (expected 1)", shm_major);
+        crate::net::unix::close(fd);
+        return false;
+    }
+    test_println!("  ShmQueryVersion: {}.{} ✓", shm_major, u16::from_le_bytes([vrep[10], vrep[11]]));
+
+    crate::net::unix::close(fd);
+    test_pass!("X11 MIT-SHM extension");
+    true
+}
+
+// ── Test 135: X11 XKB — QueryExtension present + XkbUseExtension ──────────────
+
+fn test_x11_xkb_use_extension() -> bool {
+    test_header!("X11 XKB — QueryExtension present + XkbUseExtension");
+
+    use crate::x11::proto;
+
+    let fd = x11_connect_and_setup("xkb");
+    if fd == u64::MAX {
+        test_fail!("x11_xkb", "X11 connect/setup failed");
+        return false;
+    }
+
+    // ── QueryExtension("XKEYBOARD") ──────────────────────────────────────────
+    // "XKEYBOARD" = 9 bytes → padded to 12; header=8 → total=20 = 5 words.
+    let name = b"XKEYBOARD";
+    let nlen = name.len() as u16; // 9
+    let req_words = ((8u16 + ((nlen + 3) & !3)) / 4) as u8; // (8+12)/4=5
+    let mut qe = [0u8; 20];
+    qe[0] = 98;
+    qe[2] = req_words;
+    qe[4] = nlen as u8;
+    qe[8..8 + name.len()].copy_from_slice(name);
+    crate::net::unix::write(fd, &qe);
+    crate::x11::poll();
+    let mut rep = [0u8; 32];
+    let n = crate::net::unix::read(fd, &mut rep);
+    if n < 12 || rep[0] != 1 {
+        test_fail!("x11_xkb", "QueryExtension(XKEYBOARD) no reply n={}", n);
+        crate::net::unix::close(fd);
+        return false;
+    }
+    if rep[8] != 1 {
+        test_fail!("x11_xkb", "XKEYBOARD not present (present={})", rep[8]);
+        crate::net::unix::close(fd);
+        return false;
+    }
+    test_println!("  QueryExtension(XKEYBOARD): present=1 major={} ✓", rep[9]);
+
+    // ── XkbUseExtension (minor 0) ─────────────────────────────────────────────
+    // Request: 8 bytes (2 words): major_opcode, 0, 2, 0, wantedMajor(u16), wantedMinor(u16)
+    let mut req = [0u8; 8];
+    req[0] = proto::XKEYBOARD_MAJOR_OPCODE;
+    req[1] = 0; // minor = UseExtension
+    req[2] = 2; // length = 2 words (8 bytes)
+    req[4] = 1; req[5] = 0; // wantedMajor = 1 (LE u16)
+    req[6] = 0; req[7] = 0; // wantedMinor = 0 (LE u16)
+    crate::net::unix::write(fd, &req);
+    crate::x11::poll();
+    let mut krep = [0u8; 32];
+    let n = crate::net::unix::read(fd, &mut krep);
+    if n < 12 || krep[0] != 1 {
+        test_fail!("x11_xkb", "XkbUseExtension no reply n={}", n);
+        crate::net::unix::close(fd);
+        return false;
+    }
+    // b[1] = supported flag
+    if krep[1] != 1 {
+        test_fail!("x11_xkb", "XkbUseExtension supported={} (expected 1)", krep[1]);
+        crate::net::unix::close(fd);
+        return false;
+    }
+    let server_major = u16::from_le_bytes([krep[8], krep[9]]);
+    test_println!("  XkbUseExtension: supported=1 serverMajor={} ✓", server_major);
+
+    crate::net::unix::close(fd);
+    test_pass!("X11 XKB extension");
+    true
+}
+
+// ── Test 136: X11 XFIXES — QueryExtension present + QueryVersion ──────────────
+
+fn test_x11_xfixes_query_version() -> bool {
+    test_header!("X11 XFIXES — QueryExtension present + QueryVersion");
+
+    use crate::x11::proto;
+
+    let fd = x11_connect_and_setup("xfixes");
+    if fd == u64::MAX {
+        test_fail!("x11_xfixes2", "X11 connect/setup failed");
+        return false;
+    }
+
+    // ── QueryExtension("XFIXES") ──────────────────────────────────────────────
+    // "XFIXES" = 6 bytes → padded to 8; header=8 → total=16 = 4 words.
+    let name = b"XFIXES";
+    let nlen = name.len() as u16; // 6
+    let req_words = ((8u16 + ((nlen + 3) & !3)) / 4) as u8; // (8+8)/4=4
+    let mut qe = [0u8; 16];
+    qe[0] = 98;
+    qe[2] = req_words;
+    qe[4] = nlen as u8;
+    qe[8..8 + name.len()].copy_from_slice(name);
+    crate::net::unix::write(fd, &qe);
+    crate::x11::poll();
+    let mut rep = [0u8; 32];
+    let n = crate::net::unix::read(fd, &mut rep);
+    if n < 12 || rep[0] != 1 {
+        test_fail!("x11_xfixes2", "QueryExtension(XFIXES) no reply n={}", n);
+        crate::net::unix::close(fd);
+        return false;
+    }
+    if rep[8] != 1 {
+        test_fail!("x11_xfixes2", "XFIXES not present (present={})", rep[8]);
+        crate::net::unix::close(fd);
+        return false;
+    }
+    test_println!("  QueryExtension(XFIXES): present=1 major={} ✓", rep[9]);
+
+    // ── XFixesQueryVersion (minor 0): 12 bytes (3 words) ────────────────────
+    let mut vreq = [0u8; 12];
+    vreq[0] = proto::XFIXES_MAJOR_OPCODE;
+    vreq[1] = proto::XFIXES_QUERY_VERSION;
+    vreq[2] = 3; // length = 3 words
+    vreq[4] = 5; // client_major = 5 (LE u32)
+    crate::net::unix::write(fd, &vreq);
+    crate::x11::poll();
+    let mut vrep = [0u8; 32];
+    let n = crate::net::unix::read(fd, &mut vrep);
+    if n < 16 || vrep[0] != 1 {
+        test_fail!("x11_xfixes2", "XFixesQueryVersion no reply n={}", n);
+        crate::net::unix::close(fd);
+        return false;
+    }
+    let xf_major = u32::from_le_bytes([vrep[8], vrep[9], vrep[10], vrep[11]]);
+    if xf_major < 4 {
+        test_fail!("x11_xfixes2", "XFIXES major={} (expected ≥4)", xf_major);
+        crate::net::unix::close(fd);
+        return false;
+    }
+    test_println!("  XFixesQueryVersion: major={} ✓", xf_major);
+
+    crate::net::unix::close(fd);
+    test_pass!("X11 XFIXES extension");
+    true
+}
+
+// ── Test 137: X11 SYNC — QueryExtension present + SyncInitialize ──────────────
+
+fn test_x11_sync_initialize() -> bool {
+    test_header!("X11 SYNC — QueryExtension present + SyncInitialize");
+
+    use crate::x11::proto;
+
+    let fd = x11_connect_and_setup("sync");
+    if fd == u64::MAX {
+        test_fail!("x11_sync2", "X11 connect/setup failed");
+        return false;
+    }
+
+    // ── QueryExtension("SYNC") ────────────────────────────────────────────────
+    // "SYNC" = 4 bytes (already aligned); header=8 → total=12 = 3 words.
+    let name = b"SYNC";
+    let nlen = name.len() as u16; // 4
+    let req_words = ((8u16 + ((nlen + 3) & !3)) / 4) as u8; // (8+4)/4=3
+    let mut qe = [0u8; 12];
+    qe[0] = 98;
+    qe[2] = req_words;
+    qe[4] = nlen as u8;
+    qe[8..8 + name.len()].copy_from_slice(name);
+    crate::net::unix::write(fd, &qe);
+    crate::x11::poll();
+    let mut rep = [0u8; 32];
+    let n = crate::net::unix::read(fd, &mut rep);
+    if n < 12 || rep[0] != 1 {
+        test_fail!("x11_sync2", "QueryExtension(SYNC) no reply n={}", n);
+        crate::net::unix::close(fd);
+        return false;
+    }
+    if rep[8] != 1 {
+        test_fail!("x11_sync2", "SYNC not present (present={})", rep[8]);
+        crate::net::unix::close(fd);
+        return false;
+    }
+    test_println!("  QueryExtension(SYNC): present=1 major={} ✓", rep[9]);
+
+    // ── SyncInitialize (minor 0): 8 bytes (2 words) ───────────────────────────
+    // Request: [major_opcode, 0, 2, 0, clientMajor(u8), clientMinor(u8), 0, 0]
+    let mut sreq = [0u8; 8];
+    sreq[0] = proto::SYNC_MAJOR_OPCODE;
+    sreq[1] = 0; // minor = Initialize
+    sreq[2] = 2; // length = 2 words
+    sreq[4] = 3; // client_major = 3
+    sreq[5] = 1; // client_minor = 1
+    crate::net::unix::write(fd, &sreq);
+    crate::x11::poll();
+    let mut srep = [0u8; 32];
+    let n = crate::net::unix::read(fd, &mut srep);
+    if n < 12 || srep[0] != 1 {
+        test_fail!("x11_sync2", "SyncInitialize no reply n={}", n);
+        crate::net::unix::close(fd);
+        return false;
+    }
+    // b[8] = server_major (CARD8), b[9] = server_minor (CARD8)
+    let sync_major = srep[8];
+    test_println!("  SyncInitialize: serverMajor={} ✓", sync_major);
+
+    crate::net::unix::close(fd);
+    test_pass!("X11 SYNC extension");
+    true
+}
+
+// ── Test 138: X11 RENDER — dedicated QueryVersion smoke test ──────────────────
+//
+// This is a lightweight duplicate of the RENDER assertions in test 68 that
+// exists so the extension-audit suite (tests 133-138) is self-contained and
+// so regressions in RENDER version reporting are caught independently.
+
+fn test_x11_render_query_version() -> bool {
+    test_header!("X11 RENDER — QueryVersion standalone (≥0.11)");
+
+    use crate::x11::proto;
+
+    let fd = x11_connect_and_setup("render2");
+    if fd == u64::MAX {
+        test_fail!("x11_render2", "X11 connect/setup failed");
+        return false;
+    }
+
+    // ── RenderQueryVersion (minor 0) ─────────────────────────────────────────
+    // Request: 12 bytes (3 words): [major, 0, 3, 0, clientMajor(u32), clientMinor(u32)]
+    let mut req = [0u8; 12];
+    req[0] = proto::RENDER_MAJOR_OPCODE;
+    req[1] = 0; // QueryVersion
+    req[2] = 3; // length = 3 words
+    // client-major=0, client-minor=11 at offsets 4 and 8
+    req[8] = 11; // client_minor = 11 (LE u32 low byte)
+    crate::net::unix::write(fd, &req);
+    crate::x11::poll();
+    let mut rep = [0u8; 32];
+    let n = crate::net::unix::read(fd, &mut rep);
+    if n < 16 || rep[0] != 1 {
+        test_fail!("x11_render2", "RenderQueryVersion no reply n={}", n);
+        crate::net::unix::close(fd);
+        return false;
+    }
+    let server_major = u32::from_le_bytes([rep[8],  rep[9],  rep[10], rep[11]]);
+    let server_minor = u32::from_le_bytes([rep[12], rep[13], rep[14], rep[15]]);
+    if server_minor < 11 {
+        test_fail!("x11_render2", "RENDER version {}.{} < 0.11", server_major, server_minor);
+        crate::net::unix::close(fd);
+        return false;
+    }
+    test_println!("  RenderQueryVersion: {}.{} ✓", server_major, server_minor);
+
+    crate::net::unix::close(fd);
+    test_pass!("X11 RENDER QueryVersion (≥0.11)");
     true
 }
 
