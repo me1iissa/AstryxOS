@@ -1297,7 +1297,7 @@ these statics read from TCC's user pages (zero), causing:
   - Added GTK `grab-on-hover=on` to run-qemu.sh so PS/2 mouse auto-captures
 - **Subsystem architecture audit + design (Steps 1-3 of 8)**
   - Audited: syscall/mod.rs (4496 lines, 2 dispatch paths), win32/mod.rs, proc/mod.rs, shared/lib.rs
-  - Reviewed SupportingResources: NT4.0 (5 env subsystems), ReactOS (csr+win32ss), Linux (385 syscalls)
+  - Reviewed upstream source trees: NT4.0 (5 env subsystems), ReactOS (csr+win32ss), Linux (385 syscalls)
   - Identified `SubsystemType::Posix` misnaming (should be Aether) and `linux_abi`/`subsystem` redundancy
   - Created `.ai/subsystem/` with 5 design documents:
     - `OVERVIEW.md` — Architecture diagram, current state table, 5-point restructuring plan

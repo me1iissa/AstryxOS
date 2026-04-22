@@ -144,7 +144,7 @@ Realloc:
 ```
 
 This is the same design as musl's allocator (`src/malloc/mallocng/`). Reference:
-`SupportingResources/linux/lib/` (memory allocator patterns) and musl source.
+`linux/lib/` (memory allocator patterns) and musl source.
 
 ---
 

@@ -2,8 +2,7 @@
 //!
 //! Parses and loads PE32+ (64-bit) executables into a process address space.
 //! Inspired by the Windows NT loader architecture; references from:
-//! - `reactos/dll/ntdll/ldr/ldrinit.c`
-//! - `SupportingResources/reactos/dll/ntdll/ldr/`
+//! - ReactOS `dll/ntdll/ldr/ldrinit.c` (upstream reference)
 //!
 //! # Supported Features
 //! - PE32+ (Magic 0x020B) on AMD64 (Machine 0x8664)

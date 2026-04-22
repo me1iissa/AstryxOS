@@ -9,7 +9,7 @@ This enables running PE32+ (64-bit) and eventually PE32 (32-bit via WoW64) Windo
 executables. The implementation is inspired by:
 
 - **Windows NT** executive architecture (public NT Internals documentation)
-- **ReactOS** Win32 subsystem (`SupportingResources/reactos/win32ss/`)
+- **ReactOS** Win32 subsystem (`reactos/win32ss/`)
 - **Wine** NT syscall thunking and PE loading
 
 ## 2. Architecture
@@ -149,8 +149,8 @@ pub fn load_pe(data: &[u8], preferred_base: u64) -> Result<PeImage, PeError> {
 ```
 
 ### Reference: ReactOS PE loader
-- `SupportingResources/reactos/ntoskrnl/mm/section.c` — `MmLoadSystemImage`
-- `SupportingResources/reactos/dll/ntdll/ldr/` — User-mode PE loader
+- `reactos/ntoskrnl/mm/section.c` — `MmLoadSystemImage`
+- `reactos/dll/ntdll/ldr/` — User-mode PE loader
 
 ## 7. CSRSS Communication
 
@@ -207,6 +207,6 @@ kernel/src/subsys/win32/
 
 ## 11. Reference Material
 
-- ReactOS: `SupportingResources/reactos/` (subsystems/csr/, win32ss/, ntoskrnl/)
-- OpenNT: `SupportingResources/OpenNT/`
+- ReactOS: `reactos/` (subsystems/csr/, win32ss/, ntoskrnl/)
+- OpenNT: `upstream source trees/OpenNT/`
 - Wine: PE loading, DLL stubbing (external reference)

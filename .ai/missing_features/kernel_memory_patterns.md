@@ -1,12 +1,12 @@
 # Kernel Memory Management Patterns — Linux vs NT vs AstryxOS
 
 ## Reference Sources
-- `SupportingResources/linux/kernel/fork.c` — thread stack allocation
-- `SupportingResources/linux/Documentation/arch/x86/x86_64/mm.rst` — VA layout
-- `SupportingResources/linux/arch/x86/mm/tlb.c` — CR3 switching
-- `SupportingResources/linux/kernel/sched/core.c` — context_switch()
-- `SupportingResources/reactos/ntoskrnl/mm/ARM3/procsup.c` — MmCreateKernelStack
-- `SupportingResources/reactos/ntoskrnl/ke/i386/ctxswitch.S` — SwapContext (ReactOS equivalent)
+- `linux/kernel/fork.c` — thread stack allocation
+- `linux/Documentation/arch/x86/x86_64/mm.rst` — VA layout
+- `linux/arch/x86/mm/tlb.c` — CR3 switching
+- `linux/kernel/sched/core.c` — context_switch()
+- `reactos/ntoskrnl/mm/ARM3/procsup.c` — MmCreateKernelStack
+- `reactos/ntoskrnl/ke/i386/ctxswitch.S` — SwapContext (ReactOS equivalent)
 - Public NT Internals documentation (Russinovich/Solomon) — NT VA layout
 
 ---
