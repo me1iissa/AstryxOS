@@ -938,6 +938,51 @@ pub fn run() -> ! {
     total += 1;
     if test_firefox_stub_libraries_link() { passed += 1; }
 
+    // ── Test 159: pipe2 O_CLOEXEC — FD_CLOEXEC set on both ends ──────────
+
+    total += 1;
+    if test_pipe2_cloexec() { passed += 1; }
+
+    // ── Test 160: dup3 O_CLOEXEC — FD_CLOEXEC set on new fd ──────────────
+
+    total += 1;
+    if test_dup3_cloexec() { passed += 1; }
+
+    // ── Test 161: eventfd roundtrip — initval=5, read→5, write 3, read→3 ─
+
+    total += 1;
+    if test_eventfd_roundtrip() { passed += 1; }
+
+    // ── Test 162: eventfd2 EFD_NONBLOCK — read on empty counter → -EAGAIN ─
+
+    total += 1;
+    if test_eventfd2_nonblock() { passed += 1; }
+
+    // ── Test 163: rt_tgsigqueueinfo — delivers SIGUSR1 to self ───────────
+
+    total += 1;
+    if test_rt_tgsigqueueinfo_delivers() { passed += 1; }
+
+    // ── Test 164: prlimit64(0, RLIMIT_STACK) == getrlimit(RLIMIT_STACK) ──
+
+    total += 1;
+    if test_prlimit64_getrlimit_equivalence() { passed += 1; }
+
+    // ── Test 165: syncfs(fd) → 0 ──────────────────────────────────────────
+
+    total += 1;
+    if test_syncfs_on_file() { passed += 1; }
+
+    // ── Test 166: pkey_alloc → 0; pkey_free(0) → -EINVAL ────────────────
+
+    total += 1;
+    if test_pkey_alloc_default() { passed += 1; }
+
+    // ── Test 167: openat2 basic — opens /etc/passwd with how{O_RDONLY,0,0} ─
+
+    total += 1;
+    if test_openat2_basic() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -17707,5 +17752,404 @@ fn test_firefox_stub_libraries_link() -> bool {
     }
 
     test_pass!("Firefox stub libs — allocator symbols exported");
+    true
+}
+
+// ── Test 159: pipe2 O_CLOEXEC — FD_CLOEXEC set on both ends ─────────────────
+
+fn test_pipe2_cloexec() -> bool {
+    test_header!("pipe2 O_CLOEXEC — FD_CLOEXEC on both ends");
+
+    let mut fds = [0u32; 2];
+    // pipe2(fds, O_CLOEXEC=0x80000)
+    let r = crate::syscall::dispatch_linux(293, fds.as_mut_ptr() as u64, 0x0008_0000, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("pipe2_cloexec", "pipe2(O_CLOEXEC) returned {}", r);
+        return false;
+    }
+    let (rfd, wfd) = (fds[0] as u64, fds[1] as u64);
+    test_println!("  pipe2(O_CLOEXEC) → r={} w={} ✓", rfd, wfd);
+
+    // F_GETFD = 1; FD_CLOEXEC = 1
+    let r_flags = crate::syscall::dispatch_linux(72 /*fcntl*/, rfd, 1 /*F_GETFD*/, 0, 0, 0, 0);
+    let w_flags = crate::syscall::dispatch_linux(72 /*fcntl*/, wfd, 1 /*F_GETFD*/, 0, 0, 0, 0);
+
+    if r_flags & 1 == 0 {
+        test_fail!("pipe2_cloexec", "read-end FD_CLOEXEC not set (fcntl={:#x})", r_flags);
+        crate::syscall::dispatch_linux(3, rfd, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux(3, wfd, 0, 0, 0, 0, 0);
+        return false;
+    }
+    if w_flags & 1 == 0 {
+        test_fail!("pipe2_cloexec", "write-end FD_CLOEXEC not set (fcntl={:#x})", w_flags);
+        crate::syscall::dispatch_linux(3, rfd, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux(3, wfd, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  F_GETFD read-end={:#x} write-end={:#x} (FD_CLOEXEC set) ✓", r_flags, w_flags);
+
+    crate::syscall::dispatch_linux(3, rfd, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux(3, wfd, 0, 0, 0, 0, 0);
+    test_pass!("pipe2 O_CLOEXEC — FD_CLOEXEC on both ends");
+    true
+}
+
+// ── Test 160: dup3 O_CLOEXEC — FD_CLOEXEC set on dup'd fd ───────────────────
+
+fn test_dup3_cloexec() -> bool {
+    test_header!("dup3 O_CLOEXEC — FD_CLOEXEC on dup'd fd");
+
+    // Open a file to get a base fd.
+    let path = b"/etc/passwd\0";
+    let base_fd = crate::syscall::dispatch_linux(
+        2 /*open*/, path.as_ptr() as u64, 0 /*O_RDONLY*/, 0, 0, 0, 0,
+    );
+    if base_fd < 0 {
+        test_fail!("dup3_cloexec", "open(/etc/passwd) returned {}", base_fd);
+        return false;
+    }
+    test_println!("  open(/etc/passwd) → fd {} ✓", base_fd);
+
+    // dup3(base_fd, target_fd, O_CLOEXEC) — pick target_fd = base_fd+10
+    let target_fd = (base_fd + 10) as u64;
+    let r = crate::syscall::dispatch_linux(
+        292 /*dup3*/, base_fd as u64, target_fd, 0x0008_0000 /*O_CLOEXEC*/, 0, 0, 0,
+    );
+    if r != target_fd as i64 {
+        test_fail!("dup3_cloexec", "dup3() returned {} (expected {})", r, target_fd);
+        crate::syscall::dispatch_linux(3, base_fd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  dup3({}, {}, O_CLOEXEC) → {} ✓", base_fd, target_fd, r);
+
+    // F_GETFD should return FD_CLOEXEC (1).
+    let flags = crate::syscall::dispatch_linux(72 /*fcntl*/, target_fd, 1 /*F_GETFD*/, 0, 0, 0, 0);
+    if flags & 1 == 0 {
+        test_fail!("dup3_cloexec", "FD_CLOEXEC not set on dup'd fd (fcntl={:#x})", flags);
+        crate::syscall::dispatch_linux(3, base_fd as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux(3, target_fd, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  F_GETFD → {:#x} (FD_CLOEXEC set) ✓", flags);
+
+    crate::syscall::dispatch_linux(3, base_fd as u64, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux(3, target_fd, 0, 0, 0, 0, 0);
+    test_pass!("dup3 O_CLOEXEC — FD_CLOEXEC on dup'd fd");
+    true
+}
+
+// ── Test 161: eventfd roundtrip — initval=5, read→5, write 3, read→3 ─────────
+
+fn test_eventfd_roundtrip() -> bool {
+    test_header!("eventfd roundtrip — initval=5, r→5, w=3, r→3");
+
+    // eventfd(5, 0)
+    let efd = crate::syscall::dispatch_linux(284 /*eventfd*/, 5, 0, 0, 0, 0, 0);
+    if efd < 0 {
+        test_fail!("eventfd_roundtrip", "eventfd(5, 0) returned {}", efd);
+        return false;
+    }
+    test_println!("  eventfd(5, 0) → fd {} ✓", efd);
+
+    // read 8 bytes → should be 5
+    let mut buf = [0u8; 8];
+    let n = crate::syscall::dispatch_linux(0 /*read*/, efd as u64, buf.as_mut_ptr() as u64, 8, 0, 0, 0);
+    if n != 8 {
+        test_fail!("eventfd_roundtrip", "read returned {} (expected 8)", n);
+        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    let val = u64::from_le_bytes(buf);
+    if val != 5 {
+        test_fail!("eventfd_roundtrip", "read value {} (expected 5)", val);
+        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  read → {} ✓", val);
+
+    // write 3
+    let write_val: u64 = 3u64.to_le();
+    let wbuf = write_val.to_le_bytes();
+    let n = crate::syscall::dispatch_linux(1 /*write*/, efd as u64, wbuf.as_ptr() as u64, 8, 0, 0, 0);
+    if n != 8 {
+        test_fail!("eventfd_roundtrip", "write returned {} (expected 8)", n);
+        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  write(3) → 8 bytes ✓");
+
+    // read → 3
+    let n = crate::syscall::dispatch_linux(0 /*read*/, efd as u64, buf.as_mut_ptr() as u64, 8, 0, 0, 0);
+    if n != 8 {
+        test_fail!("eventfd_roundtrip", "second read returned {} (expected 8)", n);
+        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    let val2 = u64::from_le_bytes(buf);
+    if val2 != 3 {
+        test_fail!("eventfd_roundtrip", "second read value {} (expected 3)", val2);
+        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  read → {} ✓", val2);
+
+    crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+    test_pass!("eventfd roundtrip — initval=5, r→5, w=3, r→3");
+    true
+}
+
+// ── Test 162: eventfd2 EFD_NONBLOCK — read on empty → -EAGAIN ────────────────
+
+fn test_eventfd2_nonblock() -> bool {
+    test_header!("eventfd2 EFD_NONBLOCK — read on empty → -EAGAIN");
+
+    // eventfd2(0, EFD_NONBLOCK=0x800)
+    let efd = crate::syscall::dispatch_linux(290 /*eventfd2*/, 0, 0x0800 /*EFD_NONBLOCK*/, 0, 0, 0, 0);
+    if efd < 0 {
+        test_fail!("eventfd2_nonblock", "eventfd2(0, EFD_NONBLOCK) returned {}", efd);
+        return false;
+    }
+    test_println!("  eventfd2(0, EFD_NONBLOCK) → fd {} ✓", efd);
+
+    // read on empty counter → -EAGAIN (-11)
+    let mut buf = [0u8; 8];
+    let n = crate::syscall::dispatch_linux(0 /*read*/, efd as u64, buf.as_mut_ptr() as u64, 8, 0, 0, 0);
+    if n != -11 {
+        test_fail!("eventfd2_nonblock", "read on empty returned {} (expected -11 EAGAIN)", n);
+        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  read on empty eventfd2 → -EAGAIN ✓");
+
+    crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+    test_pass!("eventfd2 EFD_NONBLOCK — read on empty → -EAGAIN");
+    true
+}
+
+// ── Test 163: rt_tgsigqueueinfo delivers SIGUSR1 to calling process ───────────
+
+fn test_rt_tgsigqueueinfo_delivers() -> bool {
+    test_header!("rt_tgsigqueueinfo(297) — SIGUSR1 becomes pending");
+
+    let pid = crate::proc::current_pid();
+    let tid = crate::proc::current_tid();
+    const SIGUSR1: u8 = 10;
+
+    // Ensure the process has a signal state (initialise if not present).
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            if p.signal_state.is_none() {
+                p.signal_state = Some(crate::signal::SignalState::new());
+            }
+        }
+    }
+
+    // Clear any existing SIGUSR1 pending bit.
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            if let Some(ss) = p.signal_state.as_mut() {
+                ss.pending &= !(1u64 << SIGUSR1);
+            }
+        }
+    }
+
+    // Build a minimal siginfo_t (128 bytes on x86_64); si_signo at offset 0.
+    let mut siginfo = [0u8; 128];
+    siginfo[0..4].copy_from_slice(&(SIGUSR1 as u32).to_le_bytes());
+
+    // rt_tgsigqueueinfo(tgid=pid, tid=tid, sig=SIGUSR1, uinfo=&siginfo)
+    let r = crate::syscall::dispatch_linux(
+        297,
+        pid as u64,
+        tid as u64,
+        SIGUSR1 as u64,
+        siginfo.as_ptr() as u64,
+        0, 0,
+    );
+    if r < 0 {
+        test_fail!("rt_tgsigqueueinfo", "syscall returned {}", r);
+        return false;
+    }
+    test_println!("  rt_tgsigqueueinfo(pid={}, sig=SIGUSR1) → {} ✓", pid, r);
+
+    // Verify SIGUSR1 is now pending.
+    let pending = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid)
+            .and_then(|p| p.signal_state.as_ref())
+            .map(|ss| ss.pending & (1u64 << SIGUSR1) != 0)
+            .unwrap_or(false)
+    };
+    if !pending {
+        test_fail!("rt_tgsigqueueinfo", "SIGUSR1 not pending after delivery");
+        return false;
+    }
+    test_println!("  SIGUSR1 pending bit set ✓");
+
+    // Clean up pending bit so it doesn't affect other tests.
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            if let Some(ss) = p.signal_state.as_mut() {
+                ss.pending &= !(1u64 << SIGUSR1);
+            }
+        }
+    }
+
+    test_pass!("rt_tgsigqueueinfo(297) — SIGUSR1 becomes pending");
+    true
+}
+
+// ── Test 164: prlimit64(0, RLIMIT_STACK) == getrlimit(RLIMIT_STACK) ──────────
+
+fn test_prlimit64_getrlimit_equivalence() -> bool {
+    test_header!("prlimit64(0, RLIMIT_STACK) == getrlimit(RLIMIT_STACK)");
+
+    const RLIMIT_STACK: u64 = 3;
+
+    // getrlimit(RLIMIT_STACK, &r)
+    let mut gr = [0u64; 2];
+    let r = crate::syscall::dispatch_linux(
+        97 /*getrlimit*/, RLIMIT_STACK, gr.as_mut_ptr() as u64, 0, 0, 0, 0,
+    );
+    if r != 0 {
+        test_fail!("prlimit64_equiv", "getrlimit(RLIMIT_STACK) returned {}", r);
+        return false;
+    }
+    test_println!("  getrlimit(RLIMIT_STACK) → soft={} hard={} ✓", gr[0], gr[1]);
+
+    // prlimit64(0 = calling process, RLIMIT_STACK, NULL, &old)
+    let mut pl = [0u64; 2];
+    let r = crate::syscall::dispatch_linux(
+        302 /*prlimit64*/,
+        0,             // pid = 0 means calling process
+        RLIMIT_STACK,
+        0,             // new_limit = NULL
+        pl.as_mut_ptr() as u64,
+        0, 0,
+    );
+    if r != 0 {
+        test_fail!("prlimit64_equiv", "prlimit64(0, RLIMIT_STACK, NULL, &old) returned {}", r);
+        return false;
+    }
+    test_println!("  prlimit64(0, RLIMIT_STACK, NULL, &old) → soft={} hard={} ✓", pl[0], pl[1]);
+
+    if gr[0] != pl[0] || gr[1] != pl[1] {
+        test_fail!("prlimit64_equiv",
+            "results differ: getrlimit={}/{} prlimit64={}/{}",
+            gr[0], gr[1], pl[0], pl[1]);
+        return false;
+    }
+    test_println!("  values match ✓");
+
+    test_pass!("prlimit64(0, RLIMIT_STACK) == getrlimit(RLIMIT_STACK)");
+    true
+}
+
+// ── Test 165: syncfs(fd) → 0 ─────────────────────────────────────────────────
+
+fn test_syncfs_on_file() -> bool {
+    test_header!("syncfs(fd) — returns 0 on open file");
+
+    // Open /etc/passwd to get a valid fd.
+    let path = b"/etc/passwd\0";
+    let fd = crate::syscall::dispatch_linux(
+        2 /*open*/, path.as_ptr() as u64, 0 /*O_RDONLY*/, 0, 0, 0, 0,
+    );
+    if fd < 0 {
+        test_fail!("syncfs", "open(/etc/passwd) returned {}", fd);
+        return false;
+    }
+    test_println!("  open(/etc/passwd) → fd {} ✓", fd);
+
+    // syncfs(fd) should return 0.
+    let r = crate::syscall::dispatch_linux(306 /*syncfs*/, fd as u64, 0, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("syncfs", "syncfs({}) returned {}", fd, r);
+        crate::syscall::dispatch_linux(3, fd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  syncfs({}) → 0 ✓", fd);
+
+    crate::syscall::dispatch_linux(3, fd as u64, 0, 0, 0, 0, 0);
+    test_pass!("syncfs(fd) — returns 0 on open file");
+    true
+}
+
+// ── Test 166: pkey_alloc → 0; pkey_free(0) → -EINVAL ────────────────────────
+
+fn test_pkey_alloc_default() -> bool {
+    test_header!("pkey_alloc(0,0)→0; pkey_free(0)→-EINVAL");
+
+    // pkey_alloc(flags=0, access_rights=0) — must return 0 (default key).
+    let key = crate::syscall::dispatch_linux(330 /*pkey_alloc*/, 0, 0, 0, 0, 0, 0);
+    if key != 0 {
+        test_fail!("pkey_alloc", "pkey_alloc(0,0) returned {} (expected 0)", key);
+        return false;
+    }
+    test_println!("  pkey_alloc(0, 0) → 0 ✓");
+
+    // pkey_alloc with non-zero flags → -EINVAL.
+    let r = crate::syscall::dispatch_linux(330 /*pkey_alloc*/, 1, 0, 0, 0, 0, 0);
+    if r != -22 {
+        test_fail!("pkey_alloc", "pkey_alloc(1,0) returned {} (expected -EINVAL)", r);
+        return false;
+    }
+    test_println!("  pkey_alloc(1, 0) → -EINVAL ✓");
+
+    // pkey_free(0) — pkey 0 is the default key; freeing it must fail with -EINVAL.
+    let r = crate::syscall::dispatch_linux(331 /*pkey_free*/, 0, 0, 0, 0, 0, 0);
+    if r != -22 {
+        test_fail!("pkey_free", "pkey_free(0) returned {} (expected -EINVAL)", r);
+        return false;
+    }
+    test_println!("  pkey_free(0) → -EINVAL ✓");
+
+    test_pass!("pkey_alloc(0,0)→0; pkey_free(0)→-EINVAL");
+    true
+}
+
+// ── Test 167: openat2 basic — opens /etc/passwd with how{O_RDONLY,0,0} ────────
+
+fn test_openat2_basic() -> bool {
+    test_header!("openat2(437) basic — open /etc/passwd with open_how");
+
+    // struct open_how { flags: u64, mode: u64, resolve: u64 } — 24 bytes
+    let how: [u64; 3] = [
+        0,     // O_RDONLY
+        0,     // mode (ignored for read)
+        0,     // resolve flags (none)
+    ];
+
+    let path = b"/etc/passwd\0";
+    // openat2(AT_FDCWD=-100, path, &how, sizeof(how)=24)
+    let fd = crate::syscall::dispatch_linux(
+        437 /*openat2*/,
+        (-100i64) as u64,          // AT_FDCWD
+        path.as_ptr() as u64,
+        how.as_ptr() as u64,
+        24,                        // sizeof(struct open_how)
+        0, 0,
+    );
+    if fd < 0 {
+        test_fail!("openat2_basic", "openat2(/etc/passwd) returned {}", fd);
+        return false;
+    }
+    test_println!("  openat2(AT_FDCWD, /etc/passwd, {{O_RDONLY,0,0}}, 24) → fd {} ✓", fd);
+
+    // Verify the fd is readable — read a few bytes.
+    let mut buf = [0u8; 8];
+    let n = crate::syscall::dispatch_linux(0 /*read*/, fd as u64, buf.as_mut_ptr() as u64, 8, 0, 0, 0);
+    if n <= 0 {
+        test_fail!("openat2_basic", "read from fd returned {}", n);
+        crate::syscall::dispatch_linux(3, fd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  read {} bytes → valid fd ✓", n);
+
+    crate::syscall::dispatch_linux(3, fd as u64, 0, 0, 0, 0, 0);
+    test_pass!("openat2(437) basic — open /etc/passwd with open_how");
     true
 }
