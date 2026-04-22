@@ -173,6 +173,10 @@ pub struct ElfLoadResult {
     /// FS.base value to set for the initial thread (TCB virtual address).
     /// 0 if the binary has no PT_TLS segment.
     pub tls_base: u64,
+    /// Auxiliary vector passed to the process (same entries placed on the stack).
+    /// Format: Vec of (AT_type, value) pairs; the AT_NULL terminator is NOT included.
+    /// Used by /proc/self/auxv to expose the process auxvec.
+    pub auxv: Vec<(u64, u64)>,
 }
 
 /// Errors from ELF loading.
@@ -694,6 +698,37 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
         &extra_auxv,
     );
 
+    // Build the auxv snapshot for /proc/self/auxv.
+    // Mirrors the entries placed on the stack by setup_user_stack().
+    // AT_HWCAP / AT_HWCAP2 are read from CPUID here too; we accept the tiny
+    // overhead (two CPUID executions per exec) to keep this self-contained.
+    let at_random_va = USER_STACK_TOP - 16; // matches setup_user_stack step-1 placement
+    let (at_hwcap, at_hwcap2): (u64, u64) = {
+        let edx: u64; let ecx: u64;
+        unsafe {
+            core::arch::asm!(
+                "push rbx", "xor ecx, ecx", "mov eax, 1", "cpuid", "pop rbx",
+                out("eax") _,
+                lateout("ecx") ecx,
+                lateout("edx") edx,
+            );
+        }
+        (edx, ecx)
+    };
+    pub const AT_HWCAP2_AUX: u64 = 26;
+    let mut auxv_snap: Vec<(u64, u64)> = Vec::new();
+    auxv_snap.push((AT_PAGESZ, pmm::PAGE_SIZE as u64));
+    auxv_snap.push((AT_HWCAP,  at_hwcap));
+    auxv_snap.push((AT_HWCAP2_AUX, at_hwcap2));
+    auxv_snap.push((AT_CLKTCK, 100));
+    auxv_snap.push((AT_RANDOM, at_random_va));
+    auxv_snap.push((AT_ENTRY,  header.e_entry.wrapping_add(pie_bias)));
+    auxv_snap.push((AT_UID,    0));
+    auxv_snap.push((AT_EUID,   0));
+    auxv_snap.push((AT_GID,    0));
+    auxv_snap.push((AT_EGID,   0));
+    for &pair in &extra_auxv { auxv_snap.push(pair); }
+
     Ok(ElfLoadResult {
         entry_point: actual_entry,  // interpreter entry if dynamic, else main entry
         user_stack_ptr,
@@ -702,6 +737,7 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
         load_end,
         vmas,
         tls_base: tls_base_for_thread,
+        auxv: auxv_snap,
     })
 }
 
