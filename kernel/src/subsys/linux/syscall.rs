@@ -138,7 +138,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         if pid >= 12 {
             let n = TRACE_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             if n < 500 {
-                crate::serial_println!("[LINUX-SYS] #{} pid={} num={} a1={:#x}", n, pid, num, arg1);
+                crate::serial_println!("[LINUX-SYS] #{} pid={} num={} a1={:#x} a2={:#x}", n, pid, num, arg1, arg2);
             }
         }
     }
