@@ -54,6 +54,21 @@ if [ -f "${GLIBC_HELLO_SRC}" ]; then
     fi
 fi
 
+# ── Compile cpp_hello oracle binary if source present ────────────────────────
+CPP_HELLO_SRC="${ROOT_DIR}/userspace/cpp_hello.cpp"
+CPP_HELLO_BIN="${BUILD_DIR}/cpp_hello"
+if [ -f "${CPP_HELLO_SRC}" ]; then
+    if [ ! -f "${CPP_HELLO_BIN}" ] || [ "${FORCE}" = true ] || \
+       [ "${CPP_HELLO_SRC}" -nt "${CPP_HELLO_BIN}" ]; then
+        if command -v g++ &>/dev/null; then
+            g++ -O2 -o "${CPP_HELLO_BIN}" "${CPP_HELLO_SRC}"
+            echo "[DATA-DISK] Compiled cpp_hello (glibc C++ dynamic ELF)"
+        else
+            echo "[DATA-DISK] WARNING: g++ not found — cannot compile cpp_hello"
+        fi
+    fi
+fi
+
 # Skip if image exists and --force not given
 if [ -f "${DATA_IMG}" ] && [ "$FORCE" = false ]; then
     echo "[DATA-DISK] ${DATA_IMG} already exists (use --force to recreate)"
@@ -131,7 +146,7 @@ EOF
     # or manually compiled in userspace/.
     USERSPACE="${ROOT_DIR}/userspace"
     # glibc_hello is the oracle binary for all glibc compat work
-    TEST_BINS=(hello mmap_test dynamic_hello dynamic_hello_pie clone_thread_test socket_test glibc_hello)
+    TEST_BINS=(hello mmap_test dynamic_hello dynamic_hello_pie clone_thread_test socket_test glibc_hello cpp_hello)
     for bin in "${TEST_BINS[@]}"; do
         SRC=""
         if [ -f "${BUILD_DIR}/${bin}" ]; then
