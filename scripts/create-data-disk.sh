@@ -49,6 +49,21 @@ if [ -f "${ROOT_DIR}/scripts/install-firefox.sh" ]; then
         echo "[DATA-DISK] WARNING: install-firefox.sh failed — /opt/firefox may be absent"
 fi
 
+# ── Build Firefox headless stub libraries (non-fatal) ────────────────────────
+# Firefox ESR 115 links libmozgtk.so and libxul.so against GTK3, ALSA, X11,
+# GLib/GObject, Cairo, Pango, DBus, and other system libraries.  In headless
+# mode these APIs are never actually called but glibc's ld-linux still resolves
+# NEEDED entries at dlopen() time.  install-firefox-stubs.sh generates minimal
+# stub .so files (no-op functions with the right SONAMEs and version nodes) so
+# the XPCOMGlue can load without "cannot open shared object file" errors.
+if [ -f "${ROOT_DIR}/scripts/install-firefox-stubs.sh" ] && \
+   [ -f "${BUILD_DIR}/disk/opt/firefox/libxul.so" ]; then
+    STUB_FLAGS=""
+    [ "${FORCE}" = true ] && STUB_FLAGS="--force"
+    bash "${ROOT_DIR}/scripts/install-firefox-stubs.sh" ${STUB_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
+        echo "[DATA-DISK] WARNING: install-firefox-stubs.sh failed — stub libs may be absent"
+fi
+
 # ── Compile glibc_hello oracle binary if source present ──────────────────────
 GLIBC_HELLO_SRC="${ROOT_DIR}/userspace/glibc_hello.c"
 GLIBC_HELLO_BIN="${BUILD_DIR}/glibc_hello"
