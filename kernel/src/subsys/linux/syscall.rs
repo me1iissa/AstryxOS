@@ -1599,8 +1599,71 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
 
         // 28: madvise(addr, len, advice)
         28 => sys_madvise(arg1, arg2, arg3),
-        // 73: flock(fd, operation) — advisory file locking; stub success
-        73 => 0,
+        // 73: flock(fd, operation) — BSD-style whole-file advisory locking.
+        // LOCK_SH=1 LOCK_EX=2 LOCK_UN=8 LOCK_NB=4 (Linux UAPI values).
+        // Reuses the per-inode FILE_LOCKS table (F_RDLCK=0, F_WRLCK=1).
+        73 => {
+            const LOCK_SH: u64 = 1;
+            const LOCK_EX: u64 = 2;
+            const LOCK_NB: u64 = 4;
+            const LOCK_UN: u64 = 8;
+            let fd = arg1 as usize;
+            let op = arg2;
+            let nonblock = (op & LOCK_NB) != 0;
+            let op_base = op & !LOCK_NB;
+            let pid = crate::proc::current_pid();
+
+            // Resolve (mount_idx, inode) from the fd.
+            let (mount_idx, inode) = {
+                let procs = crate::proc::PROCESS_TABLE.lock();
+                match procs.iter().find(|p| p.pid == pid)
+                    .and_then(|p| p.file_descriptors.get(fd)?.as_ref())
+                {
+                    Some(f) if !f.is_console && f.mount_idx != usize::MAX => {
+                        (f.mount_idx, f.inode)
+                    }
+                    Some(_) => return 0, // special fd — no lock needed, succeed
+                    None => return -9,   // EBADF
+                }
+            };
+
+            if op_base == LOCK_UN {
+                // Release any whole-file flock held by this pid on this inode.
+                crate::vfs::FILE_LOCKS.lock().retain(|l| {
+                    !(l.mount_idx == mount_idx && l.inode == inode && l.pid == pid)
+                });
+                return 0;
+            }
+
+            let lock_type: i16 = if op_base == LOCK_SH { 0 } else if op_base == LOCK_EX { 1 } else {
+                crate::serial_println!("[flock] invalid op {}", op);
+                return -22; // EINVAL
+            };
+
+            // Check for conflicting lock held by another pid.
+            let conflict = {
+                let locks = crate::vfs::FILE_LOCKS.lock();
+                locks.iter().any(|l| {
+                    l.mount_idx == mount_idx && l.inode == inode && l.pid != pid
+                        && (lock_type == 1 /* EX */ || l.lock_type == 1 /* other holds EX */)
+                })
+            };
+            if conflict {
+                // flock() always non-blocking if LOCK_NB; otherwise would block.
+                // We never sleep in kernel for F_SETLKW either — return EWOULDBLOCK.
+                return -11; // EWOULDBLOCK / EAGAIN
+            }
+
+            // Acquire: replace any existing flock by this pid on this inode.
+            let mut locks = crate::vfs::FILE_LOCKS.lock();
+            locks.retain(|l| !(l.mount_idx == mount_idx && l.inode == inode && l.pid == pid));
+            locks.push(crate::vfs::FileLockEntry {
+                mount_idx, inode, pid,
+                start: 0, end: 0, // whole-file: start=0, end=0 sentinel
+                lock_type,
+            });
+            0
+        }
         // 98: getrusage(who, usage) — resource usage; return zeroed struct
         98 => {
             if arg2 != 0 {
@@ -1750,8 +1813,14 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
                 Err(e) => crate::subsys::linux::errno::vfs_err(e),
             }
         }
-        // 91: fchmod(fd, mode) — stub (mode not stored per-inode yet)
-        91 => 0,
+        // 91: fchmod(fd, mode) — set permission bits on an open fd
+        91 => {
+            let pid = crate::proc::current_pid();
+            match crate::vfs::fchmod(pid, arg1 as usize, arg2 as u32) {
+                Ok(()) => 0,
+                Err(e) => crate::subsys::linux::errno::vfs_err(e),
+            }
+        }
         // 92: chown(path, uid, gid) — stub (no uid/gid yet)
         92 => 0,
         // 93: fchown(fd, uid, gid) — stub
@@ -1871,8 +1940,13 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
 
         // 22: pipe(pipefd[2]) — same as pipe2 with no flags
         22 => crate::syscall::sys_pipe(arg1 as *mut u64),
-        // 26: msync(addr, length, flags) — memory hint; always succeeds
-        26 => 0,
+        // 26: msync(addr, length, flags) — writeback not yet implemented.
+        // Returning 0 silently is dangerous (caller believes data is durable).
+        // Return ENOSYS until a real writeback path exists.
+        26 => {
+            crate::serial_println!("[msync] {:#x} len={} flags={} -> ENOSYS (no writeback infrastructure)", arg1, arg2, arg3);
+            -38 // ENOSYS
+        }
         // 27: mincore(addr, length, vec) — report all pages as resident
         27 => {
             let pages = ((arg2 + 0xFFF) / 0x1000) as usize;
@@ -1936,8 +2010,13 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
             crate::sched::yield_cpu();
             -4 // EINTR
         }
-        // 161: chroot(path) — stub success
-        161 => 0,
+        // 161: chroot(path) — per-task VFS root pivot not yet implemented.
+        // Silent success was a security hazard: sandboxes believed they were jailed.
+        // Return ENOSYS until per-task root tracking is added to task_struct.
+        161 => {
+            crate::serial_println!("[chroot] -> ENOSYS (per-task root not implemented)");
+            -38 // ENOSYS
+        }
         // 162: sync() — flush filesystem
         162 => { crate::vfs::sync_all(); 0 }
         // 163: acct(filename) — stub  
