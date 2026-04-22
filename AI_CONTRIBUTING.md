@@ -146,6 +146,34 @@ ReactOS is MIT-licensed and is explicitly safe to reference. Linux is GPL and
 is also safe to reference. If you are uncertain whether something came from a
 leaked source, do not include it.
 
+### Private reference material is out-of-scope for any public artefact
+
+The project maintainer may provide out-of-tree reference material for agent
+use during development. This material is strictly private and gitignored.
+
+You MAY consult such material, if provided, for algorithms, struct layouts,
+semantics, constants, and error-handling patterns.
+
+You MUST NOT, under any circumstances:
+- Name, link to, or describe the location of private reference material in
+  any committed file, comment, doc, test, commit message, PR description,
+  issue, or reported summary
+- Copy text verbatim from private reference material into this tree
+- Leave a TODO, footnote, or breadcrumb that would let a future reader
+  identify or locate the material
+- Paraphrase it in a way that makes the source identifiable
+
+The only evidence that you consulted anything should be that your code is
+correct. Every citation you do leave in the tree must point exclusively to
+public sources: ReactOS, the Linux kernel git history, musl libc, published
+RFCs, Intel/AMD architecture manuals, the Filesystem Hierarchy Standard, or
+OSDev wiki.
+
+If you need to cite something for a semantic decision, use the closest
+public equivalent (ReactOS for NT-style semantics; upstream Linux for POSIX
+semantics). If no public source applies, write correct code and do not
+cite anything.
+
 ---
 
 ## win32-pe-test must stay off
