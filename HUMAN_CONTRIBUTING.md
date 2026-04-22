@@ -224,13 +224,30 @@ See [docs/HARNESS.md](docs/HARNESS.md) for the full subcommand reference
 - Functions should generally stay under ~100 lines. Extract helpers for
   complex logic.
 
-### Source references
+### Source provenance
 
-- ReactOS (MIT-licensed) and Linux (GPL) references are welcome in comments
-  and documentation.
-- Do not cite or paraphrase leaked Microsoft Windows source code (NT 4.0 source
-  kit, XP source kit, or similar). If you are uncertain whether a reference is
-  from a leaked source, do not include it.
+Every contribution must be your own original work, or derived from a
+permissively licensed public source whose licence is compatible with the
+project licence (MIT), or a clean-room implementation based on a published
+specification.
+
+Permitted reference sources (welcome in comments and docs):
+
+- ReactOS (MIT)
+- Linux kernel (GPL-2.0) and its documentation
+- musl libc (MIT)
+- Published RFCs, architecture manuals (Intel SDM, AMD APM, Arm ARM), and
+  open standards (POSIX, FHS, UEFI, ACPI)
+- OSDev wiki
+
+Do not base contributions on, cite, or paraphrase material from sources
+obtained through leaks, unauthorised disclosure, non-disclosure agreements,
+or commercial end-user licences that restrict derivative use. If you are
+uncertain whether something is safe, assume it is not.
+
+By submitting a pull request you attest that the contribution is your own
+or submitted with rights consistent with the project licence, and that you
+have not copied or paraphrased material from excluded sources.
 
 ### Focus
 
