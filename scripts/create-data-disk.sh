@@ -28,6 +28,32 @@ for arg in "$@"; do
     esac
 done
 
+# ── Stage glibc runtime libraries (non-fatal) ─────────────────────────────────
+# install-glibc.sh copies host glibc to build/disk/lib64 and
+# build/disk/lib/x86_64-linux-gnu.  We call it here so any --force re-run also
+# refreshes the libraries.  Failure only produces a warning.
+if [ -f "${ROOT_DIR}/scripts/install-glibc.sh" ]; then
+    GLIBC_FLAGS=""
+    [ "${FORCE}" = true ] && GLIBC_FLAGS="--force"
+    bash "${ROOT_DIR}/scripts/install-glibc.sh" ${GLIBC_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
+        echo "[DATA-DISK] WARNING: install-glibc.sh failed — glibc libs may be absent"
+fi
+
+# ── Compile glibc_hello oracle binary if source present ──────────────────────
+GLIBC_HELLO_SRC="${ROOT_DIR}/userspace/glibc_hello.c"
+GLIBC_HELLO_BIN="${BUILD_DIR}/glibc_hello"
+if [ -f "${GLIBC_HELLO_SRC}" ]; then
+    if [ ! -f "${GLIBC_HELLO_BIN}" ] || [ "${FORCE}" = true ] || \
+       [ "${GLIBC_HELLO_SRC}" -nt "${GLIBC_HELLO_BIN}" ]; then
+        if command -v gcc &>/dev/null; then
+            gcc -O2 -o "${GLIBC_HELLO_BIN}" "${GLIBC_HELLO_SRC}"
+            echo "[DATA-DISK] Compiled glibc_hello (glibc dynamic ELF)"
+        else
+            echo "[DATA-DISK] WARNING: gcc not found — cannot compile glibc_hello"
+        fi
+    fi
+fi
+
 # Skip if image exists and --force not given
 if [ -f "${DATA_IMG}" ] && [ "$FORCE" = false ]; then
     echo "[DATA-DISK] ${DATA_IMG} already exists (use --force to recreate)"
@@ -59,13 +85,26 @@ if command -v mcopy &>/dev/null; then
     mmd -i "${DATA_IMG}" "::docs" 2>/dev/null || true
     mmd -i "${DATA_IMG}" "::bin"  2>/dev/null || true
 
-    # Create /etc/ with standard system files (needed by glibc/NSS for Firefox)
+    # ── Seed /etc/ with minimal files required by glibc/NSS ─────────────────
+    # glibc reads these at runtime for hostname resolution, user lookup, etc.
+    # The linker also reads /etc/ld.so.conf to find shared library paths.
     mmd -i "${DATA_IMG}" "::etc" 2>/dev/null || true
-    printf 'astryx\n' | mcopy -i "${DATA_IMG}" - "::etc/hostname"
-    printf '127.0.0.1 localhost\n::1 localhost\n127.0.1.1 astryx\n' | mcopy -i "${DATA_IMG}" - "::etc/hosts"
-    printf 'nameserver 10.0.2.3\n' | mcopy -i "${DATA_IMG}" - "::etc/resolv.conf"
-    printf 'hosts: files dns\n' | mcopy -i "${DATA_IMG}" - "::etc/nsswitch.conf"
-    echo "[DATA-DISK] Created /etc/ (hostname, hosts, resolv.conf, nsswitch.conf)"
+    printf 'astryx\n' | mcopy -o -i "${DATA_IMG}" - "::etc/hostname"
+    printf '127.0.0.1 localhost\n::1 localhost\n10.0.2.2 gateway\n' | \
+        mcopy -o -i "${DATA_IMG}" - "::etc/hosts"
+    printf 'nameserver 10.0.2.3\n' | mcopy -o -i "${DATA_IMG}" - "::etc/resolv.conf"
+    printf 'hosts: files dns\npasswd: files\ngroup: files\n' | \
+        mcopy -o -i "${DATA_IMG}" - "::etc/nsswitch.conf"
+    printf 'root:x:0:0:root:/:/bin/sh\nuser:x:1000:1000:user:/home/user:/bin/sh\n' | \
+        mcopy -o -i "${DATA_IMG}" - "::etc/passwd"
+    printf 'root:x:0:\nuser:x:1000:\n' | \
+        mcopy -o -i "${DATA_IMG}" - "::etc/group"
+    # ld.so.conf: library search paths used by glibc dynamic linker
+    printf '/lib64\n/lib/x86_64-linux-gnu\n/usr/lib/x86_64-linux-gnu\n' | \
+        mcopy -o -i "${DATA_IMG}" - "::etc/ld.so.conf"
+    # ld.so.cache: empty placeholder — linker falls back to ld.so.conf on miss
+    printf '' | mcopy -o -i "${DATA_IMG}" - "::etc/ld.so.cache"
+    echo "[DATA-DISK] Seeded /etc/ (hostname, hosts, resolv.conf, nsswitch.conf, passwd, group, ld.so.conf)"
 
     # Create a welcome file
     echo "Welcome to AstryxOS persistent storage!" | mcopy -i "${DATA_IMG}" - "::welcome.txt"
@@ -91,7 +130,8 @@ EOF
     # These are musl-linked ELF binaries built by scripts/build-musl.sh
     # or manually compiled in userspace/.
     USERSPACE="${ROOT_DIR}/userspace"
-    TEST_BINS=(hello mmap_test dynamic_hello dynamic_hello_pie clone_thread_test socket_test)
+    # glibc_hello is the oracle binary for all glibc compat work
+    TEST_BINS=(hello mmap_test dynamic_hello dynamic_hello_pie clone_thread_test socket_test glibc_hello)
     for bin in "${TEST_BINS[@]}"; do
         SRC=""
         if [ -f "${BUILD_DIR}/${bin}" ]; then
