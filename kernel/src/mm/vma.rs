@@ -438,6 +438,14 @@ impl VmSpace {
 
     /// Remove all VMAs that overlap with the range [base, base+length).
     /// Partially overlapping VMAs are split or shrunk.
+    ///
+    /// For file-backed VMAs, split pieces have their backing offset adjusted so
+    /// that each piece still maps the correct portion of the file.  Without this
+    /// adjustment, glibc's ld-linux (which uses an initial PROT_READ file-backed
+    /// reservation to reserve the full library span, then overwrites individual
+    /// segments with MAP_FIXED) would read stale/wrong file data from the
+    /// remnant reservation pages, corrupting its internal load-address
+    /// structures and producing garbage mprotect/relocation addresses.
     pub fn remove_range(&mut self, base: u64, length: u64) -> Result<(), VmaError> {
         let end = base + length;
         let mut i = 0;
@@ -458,21 +466,35 @@ impl VmSpace {
             }
 
             if vma.base < base && vma.end() > end {
-                // Range punches a hole in the middle — split into two
+                // Range punches a hole in the middle — split into two pieces.
+                // The right piece starts at `end`, which is `end - vma.base`
+                // bytes into the original VMA.  For file-backed VMAs the
+                // backing offset of the right piece must be advanced by that
+                // same delta so page faults still read from the correct file
+                // position.
+                let right_delta = end - vma.base;
                 let left = VmArea {
                     base: vma.base,
                     length: base - vma.base,
                     prot: vma.prot,
                     flags: vma.flags,
-                    backing: vma.backing.clone(),
+                    backing: vma.backing.clone(),   // left piece: offset unchanged
                     name: vma.name,
+                };
+                let right_backing = match &vma.backing {
+                    VmBacking::File { mount_idx, inode, offset } => VmBacking::File {
+                        mount_idx: *mount_idx,
+                        inode: *inode,
+                        offset: offset + right_delta,
+                    },
+                    other => other.clone(),
                 };
                 let right = VmArea {
                     base: end,
                     length: vma.end() - end,
                     prot: vma.prot,
                     flags: vma.flags,
-                    backing: vma.backing.clone(),
+                    backing: right_backing,
                     name: vma.name,
                 };
                 self.areas.remove(i);
@@ -483,7 +505,8 @@ impl VmSpace {
             }
 
             if vma.base < base {
-                // Overlap on the right side — shrink
+                // Overlap on the right side — shrink (left portion kept).
+                // The kept portion starts at vma.base with unchanged offset.
                 let mut vma = self.areas.remove(i);
                 vma.length = base - vma.base;
                 self.areas.insert(i, vma);
@@ -491,11 +514,17 @@ impl VmSpace {
                 continue;
             }
 
-            // Overlap on the left side — shrink from left
+            // Overlap on the left side — shrink from left.
+            // The kept portion starts at `end`, which is `end - old_base`
+            // bytes into the original VMA.  Advance the file offset accordingly.
             let mut vma = self.areas.remove(i);
             let old_base = vma.base;
+            let left_delta = end - old_base;
+            if let VmBacking::File { offset, .. } = &mut vma.backing {
+                *offset += left_delta;
+            }
             vma.base = end;
-            vma.length -= end - old_base;
+            vma.length -= left_delta;
             self.areas.insert(i, vma);
             i += 1;
         }
