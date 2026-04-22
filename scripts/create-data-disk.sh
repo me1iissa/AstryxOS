@@ -16,7 +16,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="${ROOT_DIR}/build"
 DATA_IMG="${BUILD_DIR}/data.img"
-SIZE_MB=512
+SIZE_MB=2048
 FORCE=false
 FIREFOX=false
 
@@ -39,6 +39,16 @@ if [ -f "${ROOT_DIR}/scripts/install-glibc.sh" ]; then
         echo "[DATA-DISK] WARNING: install-glibc.sh failed — glibc libs may be absent"
 fi
 
+# ── Stage Firefox ESR to build/disk/opt/firefox/ (non-fatal) ─────────────────
+# install-firefox.sh is idempotent — it skips extraction if already done.
+# We always call it here so a --force re-run also refreshes Firefox.
+if [ -f "${ROOT_DIR}/scripts/install-firefox.sh" ]; then
+    FIREFOX_FLAGS=""
+    [ "${FORCE}" = true ] && FIREFOX_FLAGS="--force"
+    bash "${ROOT_DIR}/scripts/install-firefox.sh" ${FIREFOX_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
+        echo "[DATA-DISK] WARNING: install-firefox.sh failed — /opt/firefox may be absent"
+fi
+
 # ── Compile glibc_hello oracle binary if source present ──────────────────────
 GLIBC_HELLO_SRC="${ROOT_DIR}/userspace/glibc_hello.c"
 GLIBC_HELLO_BIN="${BUILD_DIR}/glibc_hello"
@@ -50,28 +60,6 @@ if [ -f "${GLIBC_HELLO_SRC}" ]; then
             echo "[DATA-DISK] Compiled glibc_hello (glibc dynamic ELF)"
         else
             echo "[DATA-DISK] WARNING: gcc not found — cannot compile glibc_hello"
-        fi
-    fi
-fi
-
-# ── Compile x11_hello oracle binary (static, hand-built X11 protocol) ────────
-# Prefer musl-gcc for a dependency-free static binary (no glibc init complexity).
-# Fall back to gcc if musl-gcc is absent.
-X11_HELLO_SRC="${ROOT_DIR}/userspace/x11_hello.c"
-X11_HELLO_BIN="${BUILD_DIR}/x11_hello"
-if [ -f "${X11_HELLO_SRC}" ]; then
-    if [ ! -f "${X11_HELLO_BIN}" ] || [ "${FORCE}" = true ] || \
-       [ "${X11_HELLO_SRC}" -nt "${X11_HELLO_BIN}" ]; then
-        if command -v musl-gcc &>/dev/null; then
-            musl-gcc -O2 -static -o "${X11_HELLO_BIN}" "${X11_HELLO_SRC}" 2>&1 | \
-                grep -v 'warn_unused_result' || true
-            echo "[DATA-DISK] Compiled x11_hello (musl static ELF, hand-built X11 protocol)"
-        elif command -v gcc &>/dev/null; then
-            gcc -O2 -static -o "${X11_HELLO_BIN}" "${X11_HELLO_SRC}" 2>&1 | \
-                grep -v 'warn_unused_result' || true
-            echo "[DATA-DISK] Compiled x11_hello (glibc static ELF, hand-built X11 protocol)"
-        else
-            echo "[DATA-DISK] WARNING: neither musl-gcc nor gcc found — cannot compile x11_hello"
         fi
     fi
 fi
@@ -153,7 +141,7 @@ EOF
     # or manually compiled in userspace/.
     USERSPACE="${ROOT_DIR}/userspace"
     # glibc_hello is the oracle binary for all glibc compat work
-    TEST_BINS=(hello mmap_test dynamic_hello dynamic_hello_pie clone_thread_test socket_test glibc_hello x11_hello)
+    TEST_BINS=(hello mmap_test dynamic_hello dynamic_hello_pie clone_thread_test socket_test glibc_hello)
     for bin in "${TEST_BINS[@]}"; do
         SRC=""
         if [ -f "${BUILD_DIR}/${bin}" ]; then
@@ -198,7 +186,34 @@ EOF
         echo "[DATA-DISK] Copied lib/x86_64-linux-gnu/ (glibc)"
     fi
 
-    # Firefox binary and resources (built by scripts/build-firefox.sh)
+    # ── Firefox ESR at /opt/firefox/ (installed by install-firefox.sh) ──────
+    # Firefox is large (~238 MB uncompressed).  We use mcopy -s (recursive)
+    # to copy the full directory tree.  FAT32 directory depth limit is 8 on
+    # some mtools versions, but Firefox's directory structure is flat enough.
+    FF_OPT="${BUILD_DIR}/disk/opt/firefox"
+    if [ -f "${FF_OPT}/firefox" ]; then
+        echo "[DATA-DISK] Copying /opt/firefox (~238 MiB) to data image — this takes a moment..."
+        mmd -i "${DATA_IMG}" "::opt"         2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::opt/firefox" 2>/dev/null || true
+        # Use mcopy -s for the full tree; tolerate failures for deep symlink chains
+        mcopy -s -o -i "${DATA_IMG}" "${FF_OPT}/." "::opt/firefox/" 2>&1 | \
+            grep -v "^$" | grep -iv "^skipping" | head -20 || true
+        echo "[DATA-DISK] Copied /opt/firefox to data image"
+    else
+        echo "[DATA-DISK] WARNING: ${FF_OPT}/firefox not found — Firefox not on data disk"
+    fi
+
+    # ── /tmp staging: hello.html for Firefox oracle test ─────────────────────
+    STAGING_TMP="${BUILD_DIR}/disk/tmp"
+    if [ -d "${STAGING_TMP}" ]; then
+        mmd -i "${DATA_IMG}" "::tmp" 2>/dev/null || true
+        for f in "${STAGING_TMP}/"*; do
+            [ -f "${f}" ] && mcopy -o -i "${DATA_IMG}" "${f}" "::tmp/$(basename "${f}")"
+        done
+        echo "[DATA-DISK] Copied staging tmp/ files"
+    fi
+
+    # Firefox binary and resources (built by scripts/build-firefox.sh — legacy path)
     FIREFOX_BIN="${BUILD_DIR}/disk/bin/firefox"
     FIREFOX_LIB="${BUILD_DIR}/disk/lib/firefox"
     if [ -f "${FIREFOX_BIN}" ]; then
