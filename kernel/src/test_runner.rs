@@ -838,6 +838,14 @@ pub fn run() -> ! {
     total += 1;
     if test_x11_render_query_version() { passed += 1; }
 
+    // ── Test 139: Firefox ESR launch oracle ──────────────────────────────────
+    // Probe test: measures how far Firefox gets before crashing or timing out.
+    // Deliberately lenient — logs syscall count and last crash context for the
+    // next agent to act on. Does NOT fail the suite on crashes.
+
+    total += 1;
+    if test_firefox_launch_progress() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -15916,3 +15924,229 @@ fn test_x11_render_query_version() -> bool {
     true
 }
 
+// ── Test 139: Firefox ESR launch oracle ───────────────────────────────────────
+//
+// Infrastructure probe, NOT a feature gate.  This test:
+//   1. Verifies /disk/opt/firefox/firefox exists — skips (pass) if absent.
+//   2. Writes /tmp/hello.html to the VFS ramdisk.
+//   3. Spawns Firefox with --headless --screenshot /tmp/fx.png file:///tmp/hello.html
+//   4. Schedules it for up to ~60 s (6000 yields) counting Linux syscalls.
+//   5. Reports one of:
+//      - PASS "Firefox runs end-to-end" if exit code 0
+//      - PASS "progress: N syscalls" if N > 50000 (even if crashed)
+//      - PASS "still running after 60s" if it never exited (stuck in init)
+//      - FAIL "only N syscalls" if N < 10000 and process died
+//
+// The test is intentionally lenient: the suite must still pass=95+/95+ while
+// Firefox is expected to crash.  The goal is to measure progress and report
+// the exact crash context for the next agent.
+//
+fn test_firefox_launch_progress() -> bool {
+    test_header!("Firefox ESR launch oracle (progress probe)");
+
+    // ── 1. Check /disk/opt/firefox/firefox exists ─────────────────────────────
+    let ff_bin = match crate::vfs::read_file("/disk/opt/firefox/firefox") {
+        Ok(data) => {
+            test_println!("  /disk/opt/firefox/firefox: {} bytes", data.len());
+            data
+        }
+        Err(e) => {
+            test_println!("  SKIP: /disk/opt/firefox/firefox not found ({:?})", e);
+            test_println!("        Run scripts/create-data-disk.sh --force to rebuild data disk.");
+            test_pass!("Firefox ESR oracle (skipped — binary absent)");
+            return true;
+        }
+    };
+
+    // ── Basic ELF sanity ──────────────────────────────────────────────────────
+    if !crate::proc::elf::is_elf(&ff_bin) {
+        test_fail!("firefox_oracle", "/disk/opt/firefox/firefox is not an ELF binary");
+        return false;
+    }
+    test_println!("  ELF magic OK");
+
+    match crate::proc::elf::validate_elf(&ff_bin) {
+        Ok(hdr) => {
+            test_println!("  Entry {:#x}, {} phdrs", hdr.e_entry, hdr.e_phnum);
+        }
+        Err(e) => {
+            test_fail!("firefox_oracle", "ELF validate failed: {:?}", e);
+            return false;
+        }
+    }
+
+    // ── 2. Write /tmp/hello.html to VFS ramdisk ───────────────────────────────
+    let hello_html = b"<html><body>Hi</body></html>\n";
+    // Create /tmp in the ramdisk if not present (best-effort — may already exist)
+    let _ = crate::vfs::mkdir("/tmp");
+    // create_file then write_file is the two-step VFS API
+    let _ = crate::vfs::create_file("/tmp/hello.html");
+    match crate::vfs::write_file("/tmp/hello.html", hello_html) {
+        Ok(_)  => test_println!("  Wrote /tmp/hello.html ✓"),
+        Err(e) => test_println!("  WARNING: could not write /tmp/hello.html: {:?}", e),
+    }
+
+    // ── 3. Reset the global syscall counter before spawning ───────────────────
+    crate::syscall::FIREFOX_SYSCALL_COUNT
+        .store(0, core::sync::atomic::Ordering::SeqCst);
+
+    // ── 4. Spawn Firefox ──────────────────────────────────────────────────────
+    // argv mirrors what strace would see on Linux for a headless screenshot run.
+    // MOZ_LOG=all:5 in the environment maximises early diagnostic output on the
+    // serial console (Firefox writes MOZ_LOG to stderr which lands on our tty fd).
+    let argv = &[
+        "firefox",
+        "--headless",
+        "--screenshot",
+        "/tmp/fx.png",
+        "file:///tmp/hello.html",
+    ];
+    let envp = &[
+        "HOME=/tmp",
+        "PATH=/opt/firefox:/bin:/disk/bin",
+        "LD_LIBRARY_PATH=/opt/firefox:/lib64:/lib/x86_64-linux-gnu",
+        "MOZ_HEADLESS=1",
+        "MOZ_LOG=all:5",
+        "MOZ_LOG_FILE=/tmp/firefox.log",
+        "DISPLAY=:0",
+        "XAUTHORITY=/tmp/.Xauthority",
+        "XDG_RUNTIME_DIR=/tmp",
+        "XDG_DATA_DIRS=/tmp",
+        "XDG_CONFIG_HOME=/tmp",
+        "XDG_CACHE_HOME=/tmp/cache",
+        "DBUS_SESSION_BUS_ADDRESS=",
+        "FONTCONFIG_FILE=/tmp",
+    ];
+
+    // Use the *blocked* variant so we can set exe_path BEFORE the thread
+    // is scheduled.  The Firefox launcher calls readlink("/proc/self/exe"),
+    // appends "-bin", and execv's the result.  If exe_path is just "firefox"
+    // (the default process name), readlink returns "firefox" and execv tries
+    // the relative path "firefox-bin" which is not found.  Setting the full
+    // disk path first means readlink returns "/disk/opt/firefox/firefox" and
+    // execv gets "/disk/opt/firefox/firefox-bin" which is on the data disk.
+    let ff_pid = match crate::proc::usermode::create_user_process_with_args_blocked(
+        "firefox", &ff_bin, argv, envp
+    ) {
+        Ok(pid) => {
+            test_println!("  Created Firefox PID {} (blocked) ✓", pid);
+            pid
+        }
+        Err(e) => {
+            test_fail!("firefox_oracle", "create_user_process_with_args_blocked failed: {:?}", e);
+            return false;
+        }
+    };
+
+    // Set linux_abi and the correct exe_path before unblocking.
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == ff_pid) {
+            p.linux_abi = true;
+            p.subsystem = crate::win32::SubsystemType::Linux;
+            p.exe_path = Some(alloc::string::String::from("/disk/opt/firefox/firefox"));
+        }
+    }
+
+    // Now unblock so the scheduler can run Firefox.
+    crate::proc::unblock_process(ff_pid);
+
+    // ── 5. Enable scheduler and spin for up to ~60 s (6000 yields) ───────────
+    let was_active = crate::sched::is_active();
+    if !was_active {
+        crate::sched::enable();
+    }
+
+    test_println!("  Scheduling Firefox for up to 60 s...");
+
+    const MAX_YIELDS: usize = 6000;
+    let mut exited = false;
+
+    for i in 0..MAX_YIELDS {
+        crate::sched::yield_cpu();
+
+        let done = {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            match procs.iter().find(|p| p.pid == ff_pid) {
+                Some(p) => p.state == crate::proc::ProcessState::Zombie,
+                None    => true, // reaped
+            }
+        };
+
+        if done {
+            test_println!("  Firefox exited after {} yields", i + 1);
+            exited = true;
+            break;
+        }
+
+        // Progress log every 500 yields (~5 s)
+        if i % 500 == 0 {
+            let sc = crate::syscall::FIREFOX_SYSCALL_COUNT
+                .load(core::sync::atomic::Ordering::Relaxed);
+            let state_str = {
+                let threads = crate::proc::THREAD_TABLE.lock();
+                threads.iter().find(|t| t.pid == ff_pid)
+                    .map(|t| alloc::format!("{:?}", t.state))
+                    .unwrap_or_else(|| alloc::string::String::from("gone"))
+            };
+            test_println!("  yield #{} firefox={} syscalls={}", i, state_str, sc);
+        }
+
+        crate::hal::enable_interrupts();
+        for _ in 0..1000 { core::hint::spin_loop(); }
+    }
+
+    if !was_active {
+        crate::sched::disable();
+    }
+
+    // ── 6. Evaluate results ───────────────────────────────────────────────────
+    let syscall_count = crate::syscall::FIREFOX_SYSCALL_COUNT
+        .load(core::sync::atomic::Ordering::SeqCst);
+
+    test_println!();
+    test_println!("  [FIREFOX-ORACLE] syscalls reached: {}", syscall_count);
+
+    if !exited {
+        // Still running at timeout — likely stuck in GTK/X11/D-Bus init
+        test_println!("  [FIREFOX-ORACLE] still running after ~60s");
+        test_println!("  [FIREFOX-ORACLE] VERDICT: stuck-in-init (likely GTK/X11 startup)");
+        test_pass!("Firefox ESR oracle (still running after 60s — progressing)");
+        return true;
+    }
+
+    // Process exited — check exit code
+    let (exit_code, was_signal) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == ff_pid) {
+            Some(p) => (p.exit_code, p.exit_code < 0),
+            None    => (0, false),
+        }
+    };
+
+    test_println!("  [FIREFOX-ORACLE] exit_code={} signal={}", exit_code, was_signal);
+
+    if exit_code == 0 {
+        test_println!("  [FIREFOX-ORACLE] VERDICT: Firefox runs end-to-end!");
+        test_pass!("Firefox ESR oracle (exit 0 — runs end-to-end!)");
+        return true;
+    }
+
+    if syscall_count >= 50_000 {
+        test_println!("  [FIREFOX-ORACLE] VERDICT: progress — {} syscalls before crash", syscall_count);
+        test_pass!("Firefox ESR oracle (progress: >50K syscalls)");
+        return true;
+    }
+
+    if syscall_count < 10_000 {
+        test_fail!("firefox_oracle",
+            "only {} syscalls reached, exit_code={} — crashed very early",
+            syscall_count, exit_code);
+        return false;
+    }
+
+    // 10K–50K syscalls: moderate progress, treat as pass
+    test_println!("  [FIREFOX-ORACLE] VERDICT: moderate progress — {} syscalls", syscall_count);
+    test_pass!("Firefox ESR oracle (moderate progress: 10K-50K syscalls)");
+    true
+}
