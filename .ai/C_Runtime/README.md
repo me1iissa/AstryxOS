@@ -64,6 +64,6 @@ The kernel just handles syscalls. Everything else lives in DLLs or shared librar
 
 | Source | Path | What to use it for |
 |--------|------|---------------------|
-| ReactOS msvcrt | `internal-refs/reactos/dll/win32/msvcrt/` | Complete msvcrt reimplementation in C |
-| ReactOS ntdll | `internal-refs/reactos/dll/ntdll/` | ldr/, rtl/, dispatch/ |
-| Linux kernel | `internal-refs/linux/` | Syscall ABI, ELF aux vector conventions |
+| ReactOS msvcrt | `reactos/dll/win32/msvcrt/` | Complete msvcrt reimplementation in C |
+| ReactOS ntdll | `reactos/dll/ntdll/` | ldr/, rtl/, dispatch/ |
+| Linux kernel | `linux/` | Syscall ABI, ELF aux vector conventions |

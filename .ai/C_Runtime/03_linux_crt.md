@@ -1,7 +1,7 @@
 # Linux C Runtime: musl vs glibc
 
 > This covers the Linux ELF personality
-> Reference: `internal-refs/linux/` (kernel syscall ABI)
+> Reference: `linux/` (kernel syscall ABI)
 > Already working: static musl (confirmed Session 23)
 
 ---

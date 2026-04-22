@@ -239,7 +239,7 @@ Future tests:
 
 ## 9. Reference Material
 
-- Linux syscall table: `internal-refs/linux/arch/x86/entry/syscalls/syscall_64.tbl`
+- Linux syscall table: `linux/arch/x86/entry/syscalls/syscall_64.tbl`
 - musl source: for understanding libc expectations at syscall boundary
-- FreeBSD Linuxulator: `internal-refs/` (not present, but design reference)
+- FreeBSD Linuxulator: `upstream source trees/` (not present, but design reference)
 - WSL1 architecture: microsoft.com/en-us/research/publication/windows-subsystem-for-linux/

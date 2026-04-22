@@ -1,8 +1,8 @@
 # Win32 C Runtime (MSVCRT + STL)
 
 > This covers the Win32 personality: ntdll.dll → kernel32.dll → msvcrt.dll → STL/msvcp
-> Reference: `internal-refs/reactos/dll/ntdll/`
->             `internal-refs/reactos/dll/win32/msvcrt/`
+> Reference: `reactos/dll/ntdll/`
+>             `reactos/dll/win32/msvcrt/`
 
 ---
 
