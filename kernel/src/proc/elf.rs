@@ -166,7 +166,6 @@ pub const AT_BASE: u64    = 7;   // Base address of interpreter
 pub const AT_HWCAP: u64   = 16;  // Hardware capability bitmask (CPU features)
 pub const AT_CLKTCK: u64  = 17;  // Frequency of times() clock (100 Hz)
 pub const AT_RANDOM: u64  = 25;  // Address of 16 random bytes
-pub const AT_SYSINFO_EHDR: u64 = 33; // Base address of the vDSO ELF image
 // musl reads AT_PHDR/AT_PHNUM to find PT_TLS and validates p_filesz ≤ p_memsz.
 // We don't need a custom AT_ for TLS — musl uses PT_TLS from the phdrs directly.
 
@@ -191,9 +190,6 @@ pub struct ElfLoadResult {
     /// Format: Vec of (AT_type, value) pairs; the AT_NULL terminator is NOT included.
     /// Used by /proc/self/auxv to expose the process auxvec.
     pub auxv: Vec<(u64, u64)>,
-    /// Virtual address at which the vDSO was mapped, or 0 if mapping failed.
-    /// Placed into AT_SYSINFO_EHDR so glibc/musl can locate the vDSO ELF header.
-    pub vdso_base: u64,
 }
 
 /// Errors from ELF loading.
@@ -908,14 +904,6 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
         0
     };
 
-    // ── Map the vDSO into the new process ───────────────────────────
-    // The vDSO is a tiny position-independent shared object providing
-    // __vdso_clock_gettime, __vdso_gettimeofday, __vdso_time, __vdso_getcpu.
-    // glibc/musl discover it via AT_SYSINFO_EHDR in the auxvec.
-    // A failed mapping is non-fatal — the process still works via syscalls.
-    let vdso_base = super::vdso::map_vdso(cr3, &mut allocated_pages, &mut vmas)
-        .unwrap_or(0);
-
     // ── Build extra auxvec entries for dynamic linking ───────────────
     // AT_PHDR, AT_PHENT, AT_PHNUM: let the interpreter find the main binary's .dynamic
     // AT_BASE: where the interpreter was loaded (0 for static binaries)
@@ -931,9 +919,6 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
     extra_auxv.push((AT_PHNUM, header.e_phnum as u64));
     if interp_base_for_auxv != 0 {
         extra_auxv.push((AT_BASE, interp_base_for_auxv));
-    }
-    if vdso_base != 0 {
-        extra_auxv.push((AT_SYSINFO_EHDR, vdso_base));
     }
 
     // Sets up the Linux ABI initial stack: argc, argv, envp, auxvec.
@@ -987,7 +972,6 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
         vmas,
         tls_base: tls_base_for_thread,
         auxv: auxv_snap,
-        vdso_base,
     })
 }
 
