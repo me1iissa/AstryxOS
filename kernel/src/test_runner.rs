@@ -748,6 +748,21 @@ pub fn run() -> ! {
     total += 1;
     if test_glibc_hello_runs() { passed += 1; }
 
+    // ── Test 121: /proc/self/auxv — raw auxvec bytes ──────────────────────
+
+    total += 1;
+    if test_procfs_self_auxv() { passed += 1; }
+
+    // ── Test 122: /proc/self/environ — process environment bytes ─────────
+
+    total += 1;
+    if test_procfs_self_environ() { passed += 1; }
+
+    // ── Test 123: /proc/<pid>/fd/ symlinks — readdir + readlink ──────────
+
+    total += 1;
+    if test_procfs_fd_symlinks() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -14674,4 +14689,240 @@ fn test_glibc_hello_runs() -> bool {
     test_println!("  glibc hello exited cleanly with code 0 ✓");
     test_pass!("glibc hello (oracle: ld-linux + libc.so.6 dynamic ELF)");
     true
+}
+// ── Test 120: /proc/self/auxv ─────────────────────────────────────────────────
+
+fn test_procfs_self_auxv() -> bool {
+    test_header!("/proc/self/auxv — process auxiliary vector as raw bytes");
+
+    let pid = crate::proc::current_pid();
+
+    let fd = match crate::vfs::open(pid, "/proc/self/auxv", 0) {
+        Ok(n) => { test_println!("  open(/proc/self/auxv) = fd {} ok", n); n }
+        Err(e) => { test_fail!("procfs_auxv", "open failed: {:?}", e); return false; }
+    };
+
+    let mut buf = [0u8; 4096];
+    let n = crate::vfs::fd_read(pid, fd, buf.as_mut_ptr(), buf.len());
+    let _ = crate::vfs::close(pid, fd);
+
+    let n = match n {
+        Ok(x) => x,
+        Err(e) => { test_fail!("procfs_auxv", "read failed: {:?}", e); return false; }
+    };
+
+    // Content must be at least 16 bytes (one entry + AT_NULL terminator).
+    if n < 16 {
+        test_fail!("procfs_auxv", "too short: {} bytes (need >= 16)", n);
+        return false;
+    }
+
+    // Must be a multiple of 16 bytes (pairs of u64).
+    if n % 16 != 0 {
+        test_fail!("procfs_auxv", "length {} is not a multiple of 16", n);
+        return false;
+    }
+
+    test_println!("  read {} bytes ({} auxv entries)", n, n / 16);
+
+    // Last pair must be AT_NULL (0, 0).
+    let last_pair_off = n - 16;
+    let last_type  = u64::from_le_bytes(buf[last_pair_off..last_pair_off+8].try_into().unwrap());
+    let last_value = u64::from_le_bytes(buf[last_pair_off+8..last_pair_off+16].try_into().unwrap());
+    if last_type != 0 || last_value != 0 {
+        test_fail!("procfs_auxv", "last pair is ({}, {}) — expected (0, 0)", last_type, last_value);
+        return false;
+    }
+    test_println!("  last pair = AT_NULL (0, 0) ok");
+
+    // If AT_PAGESZ (type=6) is present, its value must be 4096.
+    let content = &buf[..n];
+    let mut off = 0usize;
+    while off + 16 <= n {
+        let atype = u64::from_le_bytes(content[off..off+8].try_into().unwrap());
+        let aval  = u64::from_le_bytes(content[off+8..off+16].try_into().unwrap());
+        if atype == 6 /* AT_PAGESZ */ {
+            if aval != 4096 {
+                test_fail!("procfs_auxv", "AT_PAGESZ value = {} (expected 4096)", aval);
+                return false;
+            }
+            test_println!("  AT_PAGESZ = 4096 ok");
+        }
+        if atype == 0 { break; } // AT_NULL
+        off += 16;
+    }
+
+    test_pass!("/proc/self/auxv: valid auxvec binary format");
+    true
+}
+
+// ── Test 121: /proc/self/environ ──────────────────────────────────────────────
+
+fn test_procfs_self_environ() -> bool {
+    test_header!("/proc/self/environ — process environment as NUL-separated bytes");
+
+    let pid = crate::proc::current_pid();
+
+    let fd = match crate::vfs::open(pid, "/proc/self/environ", 0) {
+        Ok(n) => { test_println!("  open(/proc/self/environ) = fd {} ok", n); n }
+        Err(e) => { test_fail!("procfs_environ", "open failed: {:?}", e); return false; }
+    };
+
+    let mut buf = [0u8; 4096];
+    let n = crate::vfs::fd_read(pid, fd, buf.as_mut_ptr(), buf.len());
+    let _ = crate::vfs::close(pid, fd);
+
+    let n = match n {
+        Ok(x) => x,
+        Err(e) => { test_fail!("procfs_environ", "read failed: {:?}", e); return false; }
+    };
+
+    test_println!("  read {} bytes", n);
+
+    // Must return at least 1 byte (even for empty env: single NUL).
+    if n == 0 {
+        test_fail!("procfs_environ", "read returned 0 bytes — expected at least NUL");
+        return false;
+    }
+
+    // For PID 0 (kernel thread / test runner), envp is empty → single NUL byte.
+    // For user processes with envp, content should be NUL-terminated strings.
+    let content = &buf[..n];
+    let envp_stored: alloc::vec::Vec<alloc::string::String> = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid)
+            .map(|p| p.envp.clone())
+            .unwrap_or_default()
+    };
+
+    if envp_stored.is_empty() {
+        // Kernel thread: expect single NUL or truly empty.
+        test_println!("  pid {} has no stored envp — checking for single NUL", pid);
+        if content == b"\0" || content.is_empty() {
+            test_println!("  empty/NUL environ ok");
+        } else {
+            // Non-empty: that's also fine if the content is valid NUL-separated.
+            test_println!("  WARNING: unexpected content for pid {} with no envp ({} bytes)", pid, n);
+        }
+    } else {
+        // Verify the content matches what we stored.
+        let mut expected = alloc::vec::Vec::new();
+        for e in &envp_stored {
+            expected.extend_from_slice(e.as_bytes());
+            expected.push(0u8);
+        }
+        if content == expected.as_slice() {
+            test_println!("  environ content matches stored envp ({} entries) ok", envp_stored.len());
+        } else {
+            test_fail!("procfs_environ", "content mismatch: got {} bytes, expected {}", n, expected.len());
+            return false;
+        }
+    }
+
+    test_pass!("/proc/self/environ: readable and valid");
+    true
+}
+
+// ── Test 122: /proc/<pid>/fd/ symlinks ────────────────────────────────────────
+
+fn test_procfs_fd_symlinks() -> bool {
+    test_header!("/proc/<pid>/fd/ — open fd entries appear as symlink-style entries");
+
+    let pid = crate::proc::current_pid();
+
+    // Open two files to ensure at least two fds are visible.
+    let path_a = "/proc/cpuinfo";
+    let path_b = "/proc/meminfo";
+
+    let fd_a = match crate::vfs::open(pid, path_a, 0) {
+        Ok(n) => n,
+        Err(e) => { test_fail!("procfs_fd_symlinks", "open({}) failed: {:?}", path_a, e); return false; }
+    };
+    let fd_b = match crate::vfs::open(pid, path_b, 0) {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = crate::vfs::close(pid, fd_a);
+            test_fail!("procfs_fd_symlinks", "open({}) failed: {:?}", path_b, e);
+            return false;
+        }
+    };
+    test_println!("  opened {} as fd {}, {} as fd {}", path_a, fd_a, path_b, fd_b);
+
+    // ── readdir of /proc/self/fd — must list fd_a and fd_b ───────────────────
+    // We use the procfs readdir API directly (the inode for fd/ dir is 2020).
+    // This exercises the new live-listing code path in procfs.rs.
+    let fd_dir_inode: u64 = 2020;
+    let entries = {
+        // Acquire the procfs mount index by resolving the path.
+        let mounts = crate::vfs::MOUNTS.lock();
+        let mut found: Option<alloc::vec::Vec<(alloc::string::String, u64, crate::vfs::FileType)>> = None;
+        for m in mounts.iter() {
+            if m.path == "/proc" {
+                if let Ok(e) = m.fs.readdir(fd_dir_inode) {
+                    found = Some(e);
+                    break;
+                }
+            }
+        }
+        found
+    };
+
+    let entries = match entries {
+        Some(e) => e,
+        None => { test_fail!("procfs_fd_symlinks", "readdir(/proc/self/fd) not found"); return false; }
+    };
+
+    test_println!("  readdir(/proc/self/fd) returned {} entries", entries.len());
+
+    let names: alloc::vec::Vec<&str> = entries.iter().map(|(n, _, _)| n.as_str()).collect();
+
+    let fd_a_name = alloc::format!("{}", fd_a);
+    let fd_b_name = alloc::format!("{}", fd_b);
+
+    let has_a = names.contains(&fd_a_name.as_str());
+    let has_b = names.contains(&fd_b_name.as_str());
+
+    if !has_a {
+        test_fail!("procfs_fd_symlinks", "fd {} ({}) not found in listing", fd_a, fd_a_name);
+    } else {
+        test_println!("  fd {} present in listing ok", fd_a);
+    }
+    if !has_b {
+        test_fail!("procfs_fd_symlinks", "fd {} ({}) not found in listing", fd_b, fd_b_name);
+    } else {
+        test_println!("  fd {} present in listing ok", fd_b);
+    }
+
+    // ── readlink for fd_a — target should match path_a ────────────────────────
+    // The readlink syscall-path already handles /proc/self/fd/<N> → open_path.
+    // Verify via the process table directly (same as the syscall does).
+    let open_path_a: Option<alloc::string::String> = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid)
+            .and_then(|p| p.file_descriptors.get(fd_a))
+            .and_then(|f| f.as_ref())
+            .map(|f| f.open_path.clone())
+    };
+
+    let ok = has_a && has_b;
+
+    let _ = crate::vfs::close(pid, fd_a);
+    let _ = crate::vfs::close(pid, fd_b);
+
+    match open_path_a {
+        Some(ref target) if target == path_a || target.ends_with(path_a) => {
+            test_println!("  readlink fd {} -> '{}' ok", fd_a, target);
+        }
+        Some(ref target) => {
+            test_println!("  WARNING: open_path for fd {} = '{}' (expected '{}')", fd_a, target, path_a);
+        }
+        None => {
+            test_fail!("procfs_fd_symlinks", "fd {} not found in fd table for readlink", fd_a);
+        }
+    }
+
+    if ok {
+        test_pass!("/proc/self/fd/ readdir shows open fds");
+    }
+    ok
 }

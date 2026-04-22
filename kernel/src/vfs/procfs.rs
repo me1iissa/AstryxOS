@@ -29,6 +29,7 @@
 //! 2015  self/exe
 //! 2016  self/comm
 //! 2017  self/environ
+//! 2018  self/auxv
 //! 2020  self/fd/ (directory)
 //! 2030  sys/     (directory)
 //! 2031  sys/vm/  (directory)
@@ -64,6 +65,7 @@ const INO_SELF_STAT:         u64 = 2014;
 const INO_SELF_EXE:          u64 = 2015;
 const INO_SELF_COMM:         u64 = 2016;
 const INO_SELF_ENVIRON:      u64 = 2017;
+const INO_SELF_AUXV:         u64 = 2018;
 const INO_SELF_FD_DIR:       u64 = 2020;
 const INO_SYS_DIR:           u64 = 2030;
 const INO_SYS_VM_DIR:        u64 = 2031;
@@ -115,6 +117,7 @@ impl ProcFs {
             | INO_SELF_EXE
             | INO_SELF_COMM
             | INO_SELF_ENVIRON
+            | INO_SELF_AUXV
             | INO_OVERCOMMIT
             | INO_MAX_MAP_COUNT
             | INO_PID_MAX
@@ -144,7 +147,16 @@ impl ProcFs {
             INO_SELF_STAT     => Some(b"1 (astryx) R 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 0 65536 0\n".to_vec()),
             INO_SELF_EXE      => Some(b"/disk/bin/init".to_vec()),
             INO_SELF_COMM     => Some(b"astryx\n".to_vec()),
-            INO_SELF_ENVIRON  => Some(b"".to_vec()),
+            INO_SELF_ENVIRON  => Some(b"\0".to_vec()),
+            // auxv is intercepted by fd_read() which generates live content.
+            // Return a minimal AT_NULL pair as a non-empty stub.
+            INO_SELF_AUXV     => {
+                let mut v = [0u8; 16];
+                // AT_NULL (0), 0 — valid terminated auxvec
+                v[0..8].copy_from_slice(&0u64.to_le_bytes());
+                v[8..16].copy_from_slice(&0u64.to_le_bytes());
+                Some(v.to_vec())
+            }
             INO_OVERCOMMIT    => Some(b"0\n".to_vec()),
             INO_MAX_MAP_COUNT => Some(b"65530\n".to_vec()),
             INO_PID_MAX       => Some(b"65536\n".to_vec()),
@@ -180,6 +192,7 @@ impl FileSystemOps for ProcFs {
             (INO_SELF_DIR, "exe")           => Ok(INO_SELF_EXE),
             (INO_SELF_DIR, "comm")          => Ok(INO_SELF_COMM),
             (INO_SELF_DIR, "environ")       => Ok(INO_SELF_ENVIRON),
+            (INO_SELF_DIR, "auxv")          => Ok(INO_SELF_AUXV),
             (INO_SELF_DIR, "fd")            => Ok(INO_SELF_FD_DIR),
             (INO_SYS_DIR,  "vm")            => Ok(INO_SYS_VM_DIR),
             (INO_SYS_DIR,  "kernel")        => Ok(INO_SYS_KERNEL_DIR),
@@ -267,9 +280,26 @@ impl FileSystemOps for ProcFs {
                 f!("exe",      INO_SELF_EXE),
                 f!("comm",     INO_SELF_COMM),
                 f!("environ",  INO_SELF_ENVIRON),
+                f!("auxv",     INO_SELF_AUXV),
                 d!("fd",       INO_SELF_FD_DIR),
             ],
-            INO_SELF_FD_DIR => alloc::vec![],
+            INO_SELF_FD_DIR => {
+                // Return live fd entries for the calling process as symlinks.
+                // Each open fd is represented as a DT_LNK entry named by fd number.
+                let pid = crate::proc::current_pid();
+                let procs = crate::proc::PROCESS_TABLE.lock();
+                if let Some(p) = procs.iter().find(|p| p.pid == pid) {
+                    p.file_descriptors.iter().enumerate()
+                        .filter_map(|(i, slot)| {
+                            slot.as_ref().map(|_| {
+                                (alloc::format!("{}", i), 3000 + i as u64, FileType::SymLink)
+                            })
+                        })
+                        .collect()
+                } else {
+                    alloc::vec![]
+                }
+            }
             INO_SYS_DIR => alloc::vec![
                 d!("vm",     INO_SYS_VM_DIR),
                 d!("kernel", INO_SYS_KERNEL_DIR),

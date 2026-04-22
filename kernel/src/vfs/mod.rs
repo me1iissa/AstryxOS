@@ -1494,6 +1494,16 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
                 let content = generate_proc_stat(target_pid);
                 return serve_dynamic_read(&content, offset, buf, count, pid, fd_num);
             }
+            if open_path == "/proc/self/auxv" || open_path.ends_with("/auxv") {
+                let target_pid = proc_target_pid(&open_path).unwrap_or(pid);
+                let content = generate_proc_auxv(target_pid);
+                return serve_dynamic_read(&content, offset, buf, count, pid, fd_num);
+            }
+            if open_path == "/proc/self/environ" || open_path.ends_with("/environ") {
+                let target_pid = proc_target_pid(&open_path).unwrap_or(pid);
+                let content = generate_proc_environ(target_pid);
+                return serve_dynamic_read(&content, offset, buf, count, pid, fd_num);
+            }
             // ── Dynamic /proc global entries (no PID context needed) ──────────
             // These are served from ProcFs::read() but we intercept here too so
             // the content is always fresh regardless of which mount serves the fd.
@@ -1615,6 +1625,70 @@ fn generate_proc_stat(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
         "{} (astryx) R {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 0 65536 0\n",
         pid, ppid
     ).into_bytes()
+}
+
+/// Generate /proc/self/auxv content: raw (u64 type, u64 value) pairs terminated
+/// by (AT_NULL=0, 0).  For processes with a stored auxv (user processes), the
+/// real values are emitted.  For kernel threads / idle (pid=0 or empty auxv), a
+/// synthetic minimal auxvec is returned so /proc/self/auxv is always readable.
+fn generate_proc_auxv(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
+    // AT_ constants (same as elf.rs; duplicated to avoid coupling)
+    const AT_NULL:   u64 = 0;
+    const AT_PAGESZ: u64 = 6;
+    const AT_CLKTCK: u64 = 17;
+    const AT_RANDOM: u64 = 25;
+
+    let auxv: alloc::vec::Vec<(u64, u64)> = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid)
+            .map(|p| p.auxv.clone())
+            .unwrap_or_default()
+    };
+
+    let entries: alloc::vec::Vec<(u64, u64)> = if auxv.is_empty() {
+        // Synthetic minimal auxvec for kernel threads / PID 0.
+        // AT_RANDOM points to a stable kernel address (0xDEAD0 placeholder).
+        alloc::vec![
+            (AT_PAGESZ, 4096),
+            (AT_CLKTCK, 100),
+            (AT_RANDOM, 0xDEAD0u64),
+        ]
+    } else {
+        auxv
+    };
+
+    let mut out = alloc::vec::Vec::with_capacity((entries.len() + 1) * 16);
+    for (t, v) in &entries {
+        out.extend_from_slice(&t.to_le_bytes());
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    // AT_NULL terminator
+    out.extend_from_slice(&AT_NULL.to_le_bytes());
+    out.extend_from_slice(&0u64.to_le_bytes());
+    out
+}
+
+/// Generate /proc/self/environ content: NUL-separated environment strings.
+/// For user processes, emits each stored envp entry followed by NUL.
+/// For kernel threads (empty envp), emits a single NUL byte.
+fn generate_proc_environ(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
+    let envp: alloc::vec::Vec<alloc::string::String> = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid)
+            .map(|p| p.envp.clone())
+            .unwrap_or_default()
+    };
+
+    if envp.is_empty() {
+        return alloc::vec![0u8]; // single NUL for empty env
+    }
+
+    let mut out = alloc::vec::Vec::new();
+    for e in &envp {
+        out.extend_from_slice(e.as_bytes());
+        out.push(0u8); // NUL terminator after each entry
+    }
+    out
 }
 
 /// Write to a file descriptor.
