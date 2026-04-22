@@ -375,10 +375,16 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         29 => crate::ipc::sysv_shm::shmget(arg1 as i32, arg2, arg3 as i32),
         // 30: shmat(shmid, shmaddr, shmflg) — attach shared memory
         30 => crate::ipc::sysv_shm::shmat(arg1 as u32, arg2, arg3 as i32),
-        // 31: shmdt(shmaddr) — detach shared memory
-        31 => crate::ipc::sysv_shm::shmdt(arg1),
-        // 65: shmctl(shmid, cmd, buf) — control shared memory
-        65 => crate::ipc::sysv_shm::shmctl(arg1 as u32, arg2 as i32, arg3),
+        // 31: shmctl(shmid, cmd, buf) — control shared memory (UAPI 31; previously mis-assigned to shmdt)
+        31 => crate::ipc::sysv_shm::shmctl(arg1 as u32, arg2 as i32, arg3),
+        // 65: semop(semid, sops, nsops) — UAPI 65; previously mis-assigned to shmctl
+        // Not yet implemented; return ENOSYS so callers get a clear failure.
+        65 => {
+            crate::serial_println!("[SYSCALL] semop (65) not implemented — ENOSYS");
+            -38 // ENOSYS
+        }
+        // 67: shmdt(shmaddr) — detach shared memory (UAPI 67; previously dispatched at wrong arm 31)
+        67 => crate::ipc::sysv_shm::shmdt(arg1),
         // 32: dup(oldfd) — duplicate fd to lowest available slot
         32 => crate::syscall::sys_dup(arg1 as usize),
         // 33: dup2(oldfd, newfd) — duplicate fd to specific slot
@@ -1965,8 +1971,12 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         }
         // 167: swapon — stub ENOSYS (no swap on AstryxOS)
         167 => -38, // ENOSYS
-        // 168: poll(fds, nfds, timeout) — same as syscall 7
-        168 => dispatch(7, arg1, arg2, arg3, 0, 0, 0),
+        // 168: swapoff(path) — UAPI 168; previously mis-dispatched to poll (syscall 7)
+        // AstryxOS has no swap; return ENOSYS so callers get a clear failure.
+        168 => {
+            crate::serial_println!("[SYSCALL] swapoff (168) not implemented — ENOSYS");
+            -38 // ENOSYS
+        }
         // 169: umount2(target, flags)
         169 => {
             let target_raw = read_cstring_from_user(arg1);
@@ -1974,8 +1984,12 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
             let flags  = arg2;
             crate::vfs::sys_umount(target, flags)
         }
-        // 185: rt_sigaction alias (some binaries use 185 on x86-64) — stub
-        185 => sys_rt_sigaction_linux(arg1, arg2, arg3, arg4),
+        // 185: security (LSM hook entry point) — UAPI 185; previously mis-assigned to rt_sigaction.
+        // No application legitimately calls rt_sigaction via 185; real rt_sigaction is syscall 13.
+        185 => {
+            crate::serial_println!("[SYSCALL] security (185) not implemented — ENOSYS");
+            -38 // ENOSYS
+        }
         // 198: lgetxattr — ENODATA (no extended attributes)
         196 | 197 | 198 | 199 | 200 | 201 => -61, // ENODATA
         // 270: pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask)
