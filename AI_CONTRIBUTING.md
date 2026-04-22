@@ -13,7 +13,7 @@ contributing to AstryxOS. Human contributors should read
 3. [Use the watchdog — not run-test.sh](#use-the-watchdog)
 4. [Worktree isolation](#worktree-isolation)
 5. [Conflict resolution pitfall](#conflict-resolution-pitfall)
-6. [No proprietary source citations](#no-proprietary-source-citations)
+6. [Source provenance and attestation](#source-provenance-and-attestation)
 7. [win32-pe-test must stay off](#win32-pe-test-must-stay-off)
 8. [Commit identity](#commit-identity)
 9. [Co-Authored-By lines](#co-authored-by-lines)
@@ -134,77 +134,79 @@ the missing brace was found.
 
 ---
 
-## No proprietary source citations
+## Source provenance and attestation
 
-Do not include comments, documentation, or commit message text that cites or
-paraphrases leaked Microsoft Windows source code. This includes:
-- Windows NT 4.0 source kit
-- Windows XP source kit
-- Any other leaked or improperly disclosed Microsoft source tree
+Every contribution to this repository must be one of the following:
 
-ReactOS is MIT-licensed and is explicitly safe to reference. Linux is GPL and
-is also safe to reference. If you are uncertain whether something came from a
-leaked source, do not include it.
+1. Your own original work.
+2. Derived from a permissively licensed public source whose licence is
+   compatible with the project licence (MIT).
+3. A clean-room implementation based on a public specification.
 
-### Private reference material — read freely, never publish
+### Permitted reference sources
 
-The project maintainer provides out-of-tree reference material for agent use
-during development. The material is strictly private and gitignored.
+These are safe to read, derive algorithms from, and cite in comments or
+commit messages:
 
-You MAY consult it freely for algorithms, struct layouts, semantics,
-constants, error-handling patterns, and any other implementation detail
-that accelerates your work.
+- **ReactOS** — MIT-licensed clean-room reimplementation of Windows APIs
+- **The Linux kernel** — GPL-2.0 source and documentation
+- **musl libc** — MIT-licensed C standard library
+- **Published RFCs** (IETF)
+- **Published architecture manuals** (Intel SDM, AMD APM, Arm ARM)
+- **Open standards** (POSIX, Filesystem Hierarchy Standard, UEFI, ACPI)
+- **OSDev wiki** and comparable educational resources
 
-You MUST NEVER publish information derived from it in the project tree.
-Specifically, under no circumstances leave any of the following in a
-committed file, comment, doc, test, commit message, PR description, issue,
-or reported summary:
+### Not permitted
 
-- The path, location, or layout of any private reference material
-- Verbatim excerpts from it
-- Paraphrases that make the source identifiable
-- TODOs, footnotes, or breadcrumbs that would let a future reader locate it
-- Any quotation, including comment headers such as "see FOO.C:123" or
-  "from BAR"
+Do not base any contribution on, reference, paraphrase, or structurally
+mimic material that falls into any of the following categories:
 
-The only evidence that you consulted anything should be that your code is
-correct. Every citation you do leave in the tree must point exclusively to
-public sources: ReactOS, the Linux kernel git history, musl libc, published
-RFCs, Intel/AMD architecture manuals, the Filesystem Hierarchy Standard, or
-OSDev wiki.
+- Source code obtained through leaks, unauthorised disclosures, or other
+  improper means
+- Source code obtained under a non-disclosure agreement or similar
+  confidentiality obligation
+- Source code restricted by a commercial end-user licence or equivalent
+  restriction on derivative use
 
-If you need to cite something for a semantic decision, use the closest
-public equivalent (ReactOS for NT-style semantics; upstream Linux for POSIX
-semantics). If no public source applies, write correct code and do not
-cite anything.
+If you are uncertain whether something is safe to use, assume it is not.
+If you cannot find a permitted public source that covers what you need,
+write the code from scratch against the published specification or ask the
+maintainer for guidance.
 
-#### Where to store working notes from private material
+### Attestation
 
-If you want to record notes, scratchpad derivations, or extracted pseudocode
-for future reference, write them to the user-scope Claude memory directory:
+By submitting a contribution to this repository, you assert that:
 
-```
-~/.claude/projects/-mnt-devdisk-RXX-AIOnly-AstryxOS/memory/<topic>.md
-```
+- The contribution is your own original work, or you have the right to
+  submit it under the project licence (MIT).
+- You have not copied, paraphrased, or structurally mimicked any source
+  excluded by the previous section.
+- Any third-party content included is drawn exclusively from permitted
+  reference sources.
 
-That location is outside the project tree and is never published. It is a
-safe place to keep, for example, a note like "observed field layout for
-struct X" or "steps of algorithm Y as I understand it". Never write these
-notes inside the project repository — not even in `.ai/`, not in scratch
-files, not in test fixtures.
+This mirrors the spirit of the Developer Certificate of Origin used by the
+Linux kernel and many other large projects.
+
+### Working notes and scratch files
+
+Keep exploration notes, working drafts, and source commentary outside the
+project tree. Your personal editor scratch directory or agent memory area
+is the appropriate place for them. Do not add them to `.ai/`, `docs/`, or
+anywhere else in the repository. Committed documentation describes the
+finished state of the project; it is not a place for working drafts.
 
 ---
 
 ## win32-pe-test must stay off
 
-The `win32-pe-test` Cargo feature gates a test that requires proprietary PE
-binaries not included in the repository. When this feature is enabled, the
-test suite hangs indefinitely waiting for binaries that will never arrive.
+The `win32-pe-test` Cargo feature gates a test that is currently unreliable
+under the kernel's scheduler — the embedded program spins in user mode
+without reaching its exit path, causing the headless test suite to hang.
 
-Never pass `--features win32-pe-test` to any build command. Never add it to
-`watch-test.py` or any CI script. The expected test count `139/140` reflects
-this feature being off: the one gated test is excluded from the denominator
-of passing tests.
+Never pass `--features win32-pe-test` to any build command. Never add it
+to `watch-test.py` or any CI script. The expected headless test count
+reflects this feature being off: the one gated test is excluded from the
+denominator.
 
 ---
 
