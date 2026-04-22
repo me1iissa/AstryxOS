@@ -279,6 +279,13 @@ pub struct Process {
     pub exe_path: Option<alloc::string::String>,
     /// Per-process epoll instances.  Keyed by epfd.
     pub epoll_sets: alloc::vec::Vec<crate::ipc::epoll::EpollInstance>,
+    /// Auxiliary vector pairs stored at exec time.  Same values placed on the
+    /// initial stack; exposed via /proc/self/auxv as raw (type, value) u64 pairs.
+    /// Empty for kernel threads and the idle process.
+    pub auxv: Vec<(u64, u64)>,
+    /// Environment strings stored at exec time; exposed via /proc/self/environ
+    /// as NUL-separated bytes.  Empty for kernel threads.
+    pub envp: Vec<alloc::string::String>,
 }
 
 /// Next PID counter.
@@ -435,6 +442,8 @@ pub fn init() {
         token_id: None,
         exe_path: None,
         epoll_sets: alloc::vec::Vec::new(),
+        auxv: Vec::new(),
+        envp: Vec::new(),
     };
 
     let idle_thread = Thread {
@@ -638,6 +647,8 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
         token_id: None,
         exe_path: None,
         epoll_sets: alloc::vec::Vec::new(),
+        auxv: Vec::new(),
+        envp: Vec::new(),
     };
 
     let thread = Thread {
@@ -1489,6 +1500,8 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
         token_id: parent_token_id,
         exe_path: None,
         epoll_sets: alloc::vec::Vec::new(),
+        auxv: Vec::new(),
+        envp: Vec::new(),
     };
 
     let child_thread = Thread {
@@ -1662,6 +1675,8 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
         token_id: None,
         exe_path: None,
         epoll_sets: alloc::vec::Vec::new(),
+        auxv: Vec::new(),
+        envp: Vec::new(),
     };
 
     let child_thread = Thread {

@@ -150,6 +150,9 @@ fn create_user_process_impl(
             p.exe_path = Some(alloc::string::String::from(name));
             p.linux_abi = true;
             p.subsystem = crate::win32::SubsystemType::Linux;
+            // Store auxv/envp for /proc/self/auxv and /proc/self/environ.
+            p.auxv = result.auxv.clone();
+            p.envp = envp.iter().map(|s| alloc::string::String::from(*s)).collect();
             // Initialize signal state for Linux user processes.
             // Without this, rt_sigaction returns -1 and signal handlers
             // (SIGSEGV, SIGBUS, etc.) are never installed — processes get
