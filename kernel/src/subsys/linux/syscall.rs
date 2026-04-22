@@ -1351,7 +1351,10 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
             0
         }
         // 234: tgkill(tgid, tid, sig)
-        234 => crate::signal::kill(arg2, arg3 as u8),
+        // Sends signal `sig` to thread `tid` in thread group `tgid`.
+        // For single-threaded processes tgid == pid; look up by tgid (arg1),
+        // not by tid (arg2) which is only a thread identifier, not a process id.
+        234 => crate::signal::kill(arg1, arg3 as u8),
         // 247: waitid(idtype, id, infop, options, rusage)
         // idtype: P_ALL=0, P_PID=1, P_PGID=2
         // options: WEXITED=4, WNOHANG=1, WSTOPPED=2, WCONTINUED=8
