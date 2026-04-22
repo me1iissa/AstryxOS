@@ -798,6 +798,16 @@ pub fn run() -> ! {
     total += 1;
     if test_rseq_enosys() { passed += 1; }
 
+    // ── Test 131: ELF DT_RELR applies relative relocations ────────────────
+
+    total += 1;
+    if test_elf_dt_relr_applies_relative_relocs() { passed += 1; }
+
+    // ── Test 132: ELF DT_GNU_HASH accepted (no DT_HASH needed) ────────────
+
+    total += 1;
+    if test_elf_dt_gnu_hash_accepted() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -14626,6 +14636,172 @@ fn test_glibc_hello_runs() -> bool {
         }
         Err(e) => {
             test_fail!("glibc_hello", "ELF validate failed: {:?}", e);
+// ── Test 120: ELF DT_RELR — packed relative relocations are applied ───────────
+//
+// Calls apply_relr_in_place() directly on a hand-crafted 96-byte buffer.
+// Two pointer slots are placed at offsets 0x10 and 0x18; the DT_RELR table
+// at offset 0x40 describes them via an address entry + one bitmap word.
+// After apply, both slots must have load_bias added to their original values.
+
+fn test_elf_dt_relr_applies_relative_relocs() -> bool {
+    test_header!("ELF DT_RELR — packed relative relocations");
+
+    // ── Image buffer setup ────────────────────────────────────────────────────
+    // We operate on a 96-byte buffer.  Offsets:
+    //   0x10..0x17  slot A  (initial link-time VA = 0x0000_0000_0001_0000)
+    //   0x18..0x1F  slot B  (initial link-time VA = 0x0000_0000_0002_0000)
+    //   0x40..0x4F  DT_RELR table (2 words × 8 bytes):
+    //
+    // DT_RELR table:
+    //   Word 0 = 0x0010  (bit 0 == 0 → address entry; base_lva=0x10; patch slot 0x10; advance base to 0x18)
+    //   Word 1 = 0x0003  (bit 0 == 1 → bitmap; stripped = 0x01; bit 0 set → patch slot at 0x18+0=0x18)
+
+    let mut image = [0u8; 96];
+
+    // Write initial slot values (link-time VAs before relocation).
+    const SLOT_A_INIT: u64 = 0x0000_0000_0001_0000;
+    const SLOT_B_INIT: u64 = 0x0000_0000_0002_0000;
+    image[0x10..0x18].copy_from_slice(&SLOT_A_INIT.to_le_bytes());
+    image[0x18..0x20].copy_from_slice(&SLOT_B_INIT.to_le_bytes());
+
+    // Write DT_RELR table.
+    const RELR_ADDR_ENTRY: u64 = 0x0010; // address entry: points at slot A
+    const RELR_BITMAP:     u64 = 0x0003; // bitmap: bit 0 (after strip) → slot at base+0 = 0x18
+    image[0x40..0x48].copy_from_slice(&RELR_ADDR_ENTRY.to_le_bytes());
+    image[0x48..0x50].copy_from_slice(&RELR_BITMAP.to_le_bytes());
+
+    // Load bias to apply.
+    const LOAD_BIAS: u64 = 0x0000_0040_0000_0000;
+
+    // Apply DT_RELR relocations.
+    crate::proc::elf::apply_relr_in_place(&mut image, 0x40, 16, LOAD_BIAS);
+
+    // ── Verify slot A ─────────────────────────────────────────────────────────
+    let slot_a = u64::from_le_bytes(image[0x10..0x18].try_into().unwrap());
+    let expected_a = SLOT_A_INIT.wrapping_add(LOAD_BIAS);
+    test_println!("  slot A: got={:#x} expected={:#x}", slot_a, expected_a);
+    if slot_a != expected_a {
+        test_fail!("dt_relr", "slot A mismatch: got {:#x}, want {:#x}", slot_a, expected_a);
+        return false;
+    }
+
+    // ── Verify slot B ─────────────────────────────────────────────────────────
+    let slot_b = u64::from_le_bytes(image[0x18..0x20].try_into().unwrap());
+    let expected_b = SLOT_B_INIT.wrapping_add(LOAD_BIAS);
+    test_println!("  slot B: got={:#x} expected={:#x}", slot_b, expected_b);
+    if slot_b != expected_b {
+        test_fail!("dt_relr", "slot B mismatch: got {:#x}, want {:#x}", slot_b, expected_b);
+        return false;
+    }
+
+    // ── Verify zero-bias is a no-op ───────────────────────────────────────────
+    let mut image2 = [0u8; 96];
+    image2[0x10..0x18].copy_from_slice(&SLOT_A_INIT.to_le_bytes());
+    image2[0x18..0x20].copy_from_slice(&SLOT_B_INIT.to_le_bytes());
+    image2[0x40..0x48].copy_from_slice(&RELR_ADDR_ENTRY.to_le_bytes());
+    image2[0x48..0x50].copy_from_slice(&RELR_BITMAP.to_le_bytes());
+    crate::proc::elf::apply_relr_in_place(&mut image2, 0x40, 16, 0 /* bias = 0 → no-op */);
+    let slot_a2 = u64::from_le_bytes(image2[0x10..0x18].try_into().unwrap());
+    if slot_a2 != SLOT_A_INIT {
+        test_fail!("dt_relr", "zero-bias should be no-op; slot A={:#x} (want {:#x})", slot_a2, SLOT_A_INIT);
+        return false;
+    }
+    test_println!("  zero-bias is no-op ✓");
+
+    test_pass!("ELF DT_RELR — packed relative relocations");
+    true
+}
+
+// ── Test 121: ELF DT_GNU_HASH accepted when DT_HASH absent ───────────────────
+//
+// Builds a minimal ET_DYN ELF whose PT_DYNAMIC contains only DT_GNU_HASH and
+// DT_NULL (no DT_HASH).  Loads it via load_elf() into a fresh address space
+// and asserts the load succeeds — the loader must tolerate DT_GNU_HASH.
+//
+// Binary layout (208 bytes):
+//   0x00..0x3F  ELF64 header   (e_phnum=2)
+//   0x40..0x77  PT_LOAD        (covers 0..0xD0, R|W)
+//   0x78..0xAF  PT_DYNAMIC     (offset 0xB0, size 0x20)
+//   0xB0..0xBF  DT_GNU_HASH entry  (tag=0x6ffffef5, val=0x1000)
+//   0xC0..0xCF  DT_NULL entry      (tag=0, val=0)
+//   0xD0        end (208 bytes total)
+
+fn test_elf_dt_gnu_hash_accepted() -> bool {
+    test_header!("ELF DT_GNU_HASH accepted (no DT_HASH)");
+
+    // ── Hand-crafted ET_DYN ELF with PT_DYNAMIC containing DT_GNU_HASH ───────
+    let gnu_hash_elf: [u8; 208] = [
+        // ── ELF64 Header (0x00..0x3F) ─────────────────────────────────────
+        0x7F, 0x45, 0x4C, 0x46,         // magic \x7fELF
+        0x02,                            // EI_CLASS = ELFCLASS64
+        0x01,                            // EI_DATA  = ELFDATA2LSB
+        0x01,                            // EI_VERSION
+        0x00,                            // EI_OSABI
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // padding
+        0x03, 0x00,                      // e_type = ET_DYN
+        0x3E, 0x00,                      // e_machine = EM_X86_64
+        0x01, 0x00, 0x00, 0x00,          // e_version = 1
+        // e_entry = 0x90 (offset within image; test does not execute)
+        0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // e_phoff = 64 = 0x40
+        0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // e_shoff = 0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,          // e_flags
+        0x40, 0x00,                      // e_ehsize = 64
+        0x38, 0x00,                      // e_phentsize = 56
+        0x02, 0x00,                      // e_phnum = 2
+        0x00, 0x00,                      // e_shentsize
+        0x00, 0x00,                      // e_shnum
+        0x00, 0x00,                      // e_shstrndx
+        // ── PH[0]: PT_LOAD (0x40..0x77) ───────────────────────────────────
+        0x01, 0x00, 0x00, 0x00,          // p_type = PT_LOAD (1)
+        0x06, 0x00, 0x00, 0x00,          // p_flags = PF_R | PF_W (6)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // p_offset = 0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // p_vaddr  = 0 (PIE)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // p_paddr  = 0
+        // p_filesz = 0xD0 = 208
+        0xD0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // p_memsz = 0xD0 = 208
+        0xD0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // p_align = 0x1000
+        0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // ── PH[1]: PT_DYNAMIC (0x78..0xAF) ────────────────────────────────
+        0x02, 0x00, 0x00, 0x00,          // p_type = PT_DYNAMIC (2)
+        0x04, 0x00, 0x00, 0x00,          // p_flags = PF_R (4)
+        // p_offset = 0xB0 = 176
+        0xB0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // p_vaddr = 0xB0
+        0xB0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // p_paddr = 0xB0
+        0xB0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // p_filesz = 0x20 = 32
+        0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // p_memsz = 0x20 = 32
+        0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // p_align = 8
+        0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // ── Dynamic section (0xB0..0xCF) ──────────────────────────────────
+        // Entry 0: DT_GNU_HASH (tag = 0x6ffffef5 LE), d_val = 0x1000
+        0xF5, 0xFE, 0xFF, 0x6F, 0x00, 0x00, 0x00, 0x00, // d_tag
+        0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // d_val = 0x1000
+        // Entry 1: DT_NULL
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // d_tag = 0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // d_val = 0
+        // Total: 64 + 56 + 56 + 32 = 208 bytes = 0xD0
+    ];
+
+    // Sanity-check: validate header.
+    match crate::proc::elf::validate_elf(&gnu_hash_elf) {
+        Ok(h) if h.e_type == 3 => {
+            test_println!("  ET_DYN confirmed (e_type={})", h.e_type);
+        }
+        Ok(h) => {
+            test_fail!("dt_gnu_hash", "unexpected e_type={}", h.e_type);
+            return false;
+        }
+        Err(e) => {
+            test_fail!("dt_gnu_hash", "validate_elf failed: {:?}", e);
             return false;
         }
     }
@@ -15243,3 +15419,44 @@ fn test_rseq_enosys() -> bool {
     test_pass!("rseq: returns -ENOSYS ✓ (glibc fallback path safe)");
     true
 }
+    // parse_dynamic_test should detect DT_GNU_HASH and no DT_RELR.
+    let (relr_off, relr_sz, has_gnu_hash) = crate::proc::elf::parse_dynamic_test(&gnu_hash_elf);
+    test_println!(
+        "  parse_dynamic: relr_off={:#x} relr_sz={} has_gnu_hash={}",
+        relr_off, relr_sz, has_gnu_hash
+    );
+    if !has_gnu_hash {
+        test_fail!("dt_gnu_hash", "DT_GNU_HASH not detected in dynamic section");
+        return false;
+    }
+    if relr_sz != 0 {
+        test_fail!("dt_gnu_hash", "unexpected DT_RELR found (relr_sz={})", relr_sz);
+        return false;
+    }
+    test_println!("  DT_GNU_HASH detected, no spurious DT_RELR ✓");
+
+    // load_elf must succeed — DT_GNU_HASH without DT_HASH must not be rejected.
+    let vm = match crate::mm::vma::VmSpace::new_user() {
+        Some(v) => v,
+        None => {
+            test_fail!("dt_gnu_hash", "VmSpace::new_user() failed");
+            return false;
+        }
+    };
+    match crate::proc::elf::load_elf(&gnu_hash_elf, vm.cr3) {
+        Ok(result) => {
+            test_println!("  load_elf succeeded, load_base={:#x} ✓", result.load_base);
+            for &p in &result.allocated_pages {
+                crate::mm::pmm::free_page(p);
+            }
+        }
+        Err(e) => {
+            test_fail!("dt_gnu_hash", "load_elf rejected DT_GNU_HASH binary: {:?}", e);
+            return false;
+        }
+    }
+
+    test_pass!("ELF DT_GNU_HASH accepted (no DT_HASH)");
+    true
+}
+
