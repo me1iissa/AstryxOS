@@ -1205,6 +1205,26 @@ pub fn chmod(path: &str, mode: u32) -> VfsResult<()> {
     mounts[mount_idx].fs.chmod(inode, mode)
 }
 
+/// Change permission bits on an open file descriptor.
+/// Returns `Err(VfsError::BadFd)` for console or pipe fds (caller may treat as success).
+pub fn fchmod(pid: crate::proc::Pid, fd_num: usize, mode: u32) -> VfsResult<()> {
+    let (mount_idx, inode, is_console) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        let proc = procs.iter().find(|p| p.pid == pid).ok_or(VfsError::InvalidArg)?;
+        let fd = proc.file_descriptors.get(fd_num)
+            .and_then(|f| f.as_ref())
+            .ok_or(VfsError::BadFd)?;
+        (fd.mount_idx, fd.inode, fd.is_console)
+    };
+    // Console / pipe / special fds have no backing inode — treat as success
+    // (caller is always root in AstryxOS; no privilege check needed here).
+    if is_console || mount_idx == usize::MAX {
+        return Ok(());
+    }
+    let mounts = MOUNTS.lock();
+    mounts[mount_idx].fs.chmod(inode, mode)
+}
+
 /// Truncate a file to `size` bytes by path.
 pub fn truncate_path(path: &str, size: u64) -> VfsResult<()> {
     let (mount_idx, inode) = resolve_path(path)?;
