@@ -54,6 +54,28 @@ if [ -f "${GLIBC_HELLO_SRC}" ]; then
     fi
 fi
 
+# ── Compile x11_hello oracle binary (static, hand-built X11 protocol) ────────
+# Prefer musl-gcc for a dependency-free static binary (no glibc init complexity).
+# Fall back to gcc if musl-gcc is absent.
+X11_HELLO_SRC="${ROOT_DIR}/userspace/x11_hello.c"
+X11_HELLO_BIN="${BUILD_DIR}/x11_hello"
+if [ -f "${X11_HELLO_SRC}" ]; then
+    if [ ! -f "${X11_HELLO_BIN}" ] || [ "${FORCE}" = true ] || \
+       [ "${X11_HELLO_SRC}" -nt "${X11_HELLO_BIN}" ]; then
+        if command -v musl-gcc &>/dev/null; then
+            musl-gcc -O2 -static -o "${X11_HELLO_BIN}" "${X11_HELLO_SRC}" 2>&1 | \
+                grep -v 'warn_unused_result' || true
+            echo "[DATA-DISK] Compiled x11_hello (musl static ELF, hand-built X11 protocol)"
+        elif command -v gcc &>/dev/null; then
+            gcc -O2 -static -o "${X11_HELLO_BIN}" "${X11_HELLO_SRC}" 2>&1 | \
+                grep -v 'warn_unused_result' || true
+            echo "[DATA-DISK] Compiled x11_hello (glibc static ELF, hand-built X11 protocol)"
+        else
+            echo "[DATA-DISK] WARNING: neither musl-gcc nor gcc found — cannot compile x11_hello"
+        fi
+    fi
+fi
+
 # Skip if image exists and --force not given
 if [ -f "${DATA_IMG}" ] && [ "$FORCE" = false ]; then
     echo "[DATA-DISK] ${DATA_IMG} already exists (use --force to recreate)"
@@ -131,7 +153,7 @@ EOF
     # or manually compiled in userspace/.
     USERSPACE="${ROOT_DIR}/userspace"
     # glibc_hello is the oracle binary for all glibc compat work
-    TEST_BINS=(hello mmap_test dynamic_hello dynamic_hello_pie clone_thread_test socket_test glibc_hello)
+    TEST_BINS=(hello mmap_test dynamic_hello dynamic_hello_pie clone_thread_test socket_test glibc_hello x11_hello)
     for bin in "${TEST_BINS[@]}"; do
         SRC=""
         if [ -f "${BUILD_DIR}/${bin}" ]; then
