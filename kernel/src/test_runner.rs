@@ -938,6 +938,21 @@ pub fn run() -> ! {
     total += 1;
     if test_firefox_stub_libraries_link() { passed += 1; }
 
+    // ── Test 159: vDSO AT_SYSINFO_EHDR present in auxvec ─────────────────
+
+    total += 1;
+    if test_vdso_aux_entry_present() { passed += 1; }
+
+    // ── Test 160: vDSO VMA named [vdso] in process address space ─────────
+
+    total += 1;
+    if test_vdso_is_loaded_into_process() { passed += 1; }
+
+    // ── Test 161: vDSO clock_gettime returns a plausible time ─────────────
+
+    total += 1;
+    if test_vdso_clock_gettime_returns_plausible_time() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -17707,5 +17722,208 @@ fn test_firefox_stub_libraries_link() -> bool {
     }
 
     test_pass!("Firefox stub libs — allocator symbols exported");
+    true
+}
+
+// ── Test 159: vDSO AT_SYSINFO_EHDR present in auxvec ─────────────────────────
+
+fn test_vdso_aux_entry_present() -> bool {
+    test_header!("vDSO — AT_SYSINFO_EHDR (33) present and non-zero in auxvec");
+
+    // Load the embedded hello binary into a fresh user address space.
+    // We only need the ElfLoadResult — the process is never scheduled.
+    let data = &crate::proc::hello_elf::HELLO_ELF;
+
+    let user_vm = match crate::mm::vma::VmSpace::new_user() {
+        Some(vm) => vm,
+        None => {
+            test_fail!("vdso_aux", "VmSpace::new_user() OOM");
+            return false;
+        }
+    };
+    let user_cr3 = user_vm.cr3;
+
+    let result = match crate::proc::elf::load_elf(data, user_cr3) {
+        Ok(r) => r,
+        Err(e) => {
+            test_fail!("vdso_aux", "load_elf failed: {:?}", e);
+            return false;
+        }
+    };
+
+    // AT_SYSINFO_EHDR = 33
+    const AT_SYSINFO_EHDR: u64 = 33;
+
+    let entry = result.auxv.iter().find(|&&(t, _)| t == AT_SYSINFO_EHDR);
+    let ok = if let Some(&(_, v)) = entry {
+        if v != 0 {
+            test_println!("  AT_SYSINFO_EHDR = {:#x} ✓", v);
+            true
+        } else {
+            test_fail!("vdso_aux", "AT_SYSINFO_EHDR present but value is 0");
+            false
+        }
+    } else {
+        test_fail!("vdso_aux", "AT_SYSINFO_EHDR not found in auxvec");
+        false
+    };
+
+    // Also check vdso_base field
+    if result.vdso_base == 0 {
+        test_fail!("vdso_aux", "ElfLoadResult.vdso_base is 0");
+        for &p in &result.allocated_pages { crate::mm::pmm::free_page(p); }
+        return false;
+    }
+    test_println!("  vdso_base = {:#x} ✓", result.vdso_base);
+
+    for &p in &result.allocated_pages { crate::mm::pmm::free_page(p); }
+
+    if ok { test_pass!("vDSO AT_SYSINFO_EHDR present and non-zero"); }
+    ok
+}
+
+// ── Test 159: vDSO VMA named [vdso] in process address space ─────────────────
+
+fn test_vdso_is_loaded_into_process() -> bool {
+    test_header!("vDSO — [vdso] VMA present in ELF load result");
+
+    let data = &crate::proc::hello_elf::HELLO_ELF;
+
+    let user_vm = match crate::mm::vma::VmSpace::new_user() {
+        Some(vm) => vm,
+        None => {
+            test_fail!("vdso_vma", "VmSpace::new_user() OOM");
+            return false;
+        }
+    };
+    let user_cr3 = user_vm.cr3;
+
+    let result = match crate::proc::elf::load_elf(data, user_cr3) {
+        Ok(r) => r,
+        Err(e) => {
+            test_fail!("vdso_vma", "load_elf failed: {:?}", e);
+            return false;
+        }
+    };
+
+    // Find the [vdso] VMA.
+    let vdso_vma = result.vmas.iter().find(|v| v.name == "[vdso]");
+    let ok = match vdso_vma {
+        Some(vma) => {
+            test_println!(
+                "  [vdso] VMA: base={:#x} length={:#x} ({} KiB) ✓",
+                vma.base, vma.length, vma.length / 1024
+            );
+            // Sanity checks: non-zero length, at least one page, in user space.
+            let size_ok = vma.length >= crate::mm::pmm::PAGE_SIZE as u64;
+            let user_ok = vma.base < 0xFFFF_8000_0000_0000;
+            let base_ok = vma.base == crate::proc::vdso::VDSO_BASE;
+            if !size_ok { test_fail!("vdso_vma", "VMA length {} is less than one page", vma.length); }
+            if !user_ok { test_fail!("vdso_vma", "VMA base {:#x} is in kernel space", vma.base); }
+            if !base_ok { test_fail!("vdso_vma", "VMA base {:#x} != VDSO_BASE {:#x}", vma.base, crate::proc::vdso::VDSO_BASE); }
+            size_ok && user_ok && base_ok
+        }
+        None => {
+            test_fail!("vdso_vma", "[vdso] VMA not found in load result");
+            false
+        }
+    };
+
+    // Also confirm vDSO pages are mapped in the page table.
+    let phys_check = crate::mm::vmm::virt_to_phys_in(user_cr3, crate::proc::vdso::VDSO_BASE);
+    if phys_check.is_none() {
+        test_fail!("vdso_vma", "VDSO_BASE {:#x} not mapped in page table", crate::proc::vdso::VDSO_BASE);
+        for &p in &result.allocated_pages { crate::mm::pmm::free_page(p); }
+        return false;
+    }
+    test_println!("  vDSO pages mapped in page table ✓");
+
+    // Verify the mapped bytes start with the ELF magic.
+    let phys = phys_check.unwrap();
+    let ok2 = unsafe {
+        let ptr = (0xFFFF_8000_0000_0000u64 + phys) as *const u8;
+        let magic = core::slice::from_raw_parts(ptr, 4);
+        magic == [0x7f, b'E', b'L', b'F']
+    };
+    if !ok2 {
+        test_fail!("vdso_vma", "mapped vDSO bytes do not start with ELF magic");
+    } else {
+        test_println!("  mapped vDSO ELF magic correct ✓");
+    }
+
+    for &p in &result.allocated_pages { crate::mm::pmm::free_page(p); }
+
+    let all_ok = ok && ok2;
+    if all_ok { test_pass!("vDSO [vdso] VMA present and mapped"); }
+    all_ok
+}
+
+// ── Test 160: vDSO clock_gettime returns a plausible time ────────────────────
+
+fn test_vdso_clock_gettime_returns_plausible_time() -> bool {
+    test_header!("vDSO — clock_gettime via kernel dispatch returns plausible tv_sec");
+
+    // We test the kernel-side clock_gettime implementation directly (the same
+    // path the vDSO falls back to), since running a userspace process via the
+    // vDSO stub requires Ring-3 execution that doesn't fit the synchronous test
+    // model.  This confirms the syscall path the vDSO uses is sound.
+    //
+    // A separate integration test (not headless) would exercise the vDSO ELF
+    // image mapped into a user process.  For the headless suite, validating the
+    // kernel path is the meaningful check.
+
+    // CLOCK_REALTIME = 0
+    const CLOCK_REALTIME: u64 = 0;
+
+    // Allocate a kernel-local timespec (2 * u64 = 16 bytes).
+    let mut ts: [u64; 2] = [0xDEAD_BEEF; 2];
+    let tp = ts.as_mut_ptr() as u64;
+
+    let pid = crate::proc::current_pid();
+    // Temporarily mark this kernel task as Linux so the syscall dispatch path
+    // accepts the call.
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            p.linux_abi = true;
+            p.subsystem = crate::win32::SubsystemType::Linux;
+        }
+    }
+
+    // Call via the Linux syscall dispatch — syscall 228 = clock_gettime.
+    let ret = crate::syscall::dispatch_linux(228, CLOCK_REALTIME, tp, 0, 0, 0, 0);
+
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            p.linux_abi = false;
+            p.subsystem = crate::win32::SubsystemType::Aether;
+        }
+    }
+
+    if ret != 0 {
+        test_fail!("vdso_clock", "clock_gettime returned {} (expected 0)", ret);
+        return false;
+    }
+
+    let tv_sec  = ts[0];
+    let tv_nsec = ts[1];
+
+    test_println!("  tv_sec  = {} ({})", tv_sec, if tv_sec > 0 { "non-zero ✓" } else { "ZERO ✗" });
+    test_println!("  tv_nsec = {}", tv_nsec);
+
+    // tv_sec must be > 0 (any second since the epoch is valid — CMOS RTC or
+    // PIT fallback always gives a positive value on QEMU).
+    if tv_sec == 0 {
+        test_fail!("vdso_clock", "tv_sec is 0 — clock not initialised");
+        return false;
+    }
+    // tv_nsec must be in [0, 1_000_000_000).
+    if tv_nsec >= 1_000_000_000 {
+        test_fail!("vdso_clock", "tv_nsec={} out of range [0, 1e9)", tv_nsec);
+        return false;
+    }
+
+    test_pass!("vDSO clock_gettime returns plausible time");
     true
 }
