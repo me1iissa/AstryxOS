@@ -481,5 +481,29 @@ while IFS= read -r soname; do
     build_stub "${soname}" "${c_src}" "${vs_arg}"
 done < "${STUB_DIR}/libs.txt"
 
+# ── Always-required empty stubs ───────────────────────────────────────────────
+# These libraries appear in libxul.so's DT_NEEDED list but import zero symbols
+# that can be attributed to them by the classify() function above (because the
+# actual callers go through gdk/gtk wrappers, etc.).  ld-linux still refuses to
+# start the process if the .so file is absent — so we emit empty stubs here.
+declare -A FORCED_STUBS=(
+    [libXrender.so.1]="stub_libXrender_so_1"
+    [libXtst.so.6]="stub_libXtst_so_6"
+    [libXcursor.so.1]="stub_libXcursor_so_1"
+    [libpangocairo-1.0.so.0]="stub_libpangocairo_1_0_so_0"
+)
+
+for soname in "${!FORCED_STUBS[@]}"; do
+    base="${FORCED_STUBS[$soname]}"
+    c_src="${STUB_DIR}/${base}.c"
+    if [ ! -f "${c_src}" ]; then
+        cat > "${c_src}" << EOF
+/* AstryxOS empty stub: ${soname} — satisfies DT_NEEDED without real symbols. */
+void __attribute__((weak)) __gmon_start__(void) {}
+EOF
+    fi
+    build_stub "${soname}" "${c_src}" ""
+done
+
 log "Done.  Stubs are in ${DISK_LIB64}/"
 log "Re-run create-data-disk.sh --force to embed them in the FAT32 image."
