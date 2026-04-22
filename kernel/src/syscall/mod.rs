@@ -199,6 +199,13 @@ pub fn set_per_cpu_id(cpu_id: u8) {
 pub static DEBUG_TRACE_PID: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// Global Linux syscall counter for the Firefox oracle test.
+/// Incremented on every Linux syscall dispatch from any user-mode PID.
+/// Reset to zero by the test before spawning Firefox, then read after
+/// the process exits (or times out) to report progress.
+pub static FIREFOX_SYSCALL_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// Initialize the syscall interface.
 pub fn init() {
     // BSP is always CPU 0.  Setting IA32_TSC_AUX = 0 here ensures that
