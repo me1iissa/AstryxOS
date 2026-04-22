@@ -14636,6 +14636,106 @@ fn test_glibc_hello_runs() -> bool {
         }
         Err(e) => {
             test_fail!("glibc_hello", "ELF validate failed: {:?}", e);
+            return false;
+        }
+    }
+
+    // 3. Create a user-mode process.
+    let user_pid = match crate::proc::usermode::create_user_process("glibc_hello", &elf_data) {
+        Ok(pid) => {
+            test_println!("  Created user process PID {} ✓", pid);
+            pid
+        }
+        Err(e) => {
+            test_fail!("glibc_hello", "create_user_process failed: {:?}", e);
+            return false;
+        }
+    };
+
+    // 4. Mark as Linux ABI (glibc uses the syscall instruction).
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == user_pid) {
+            p.linux_abi = true;
+            p.subsystem = crate::win32::SubsystemType::Linux;
+            test_println!("  linux_abi = true ✓");
+        }
+    }
+
+    // 5. Enable the scheduler and spin for up to ~5 seconds (~500 yields at
+    //    ~10 ms each on the QEMU timer tick).
+    let was_active = crate::sched::is_active();
+    if !was_active {
+        crate::sched::enable();
+    }
+
+    test_println!("  Scheduling glibc_hello...");
+    {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        test_println!("  Thread table has {} entries", threads.len());
+    }
+
+    const MAX_YIELDS: usize = 500;
+    for i in 0..MAX_YIELDS {
+        crate::sched::yield_cpu();
+        let proc_done = {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            match procs.iter().find(|p| p.pid == user_pid) {
+                Some(p) => p.state == crate::proc::ProcessState::Zombie,
+                None => true,
+            }
+        };
+        if proc_done {
+            test_println!("  Exited after {} yields ✓", i + 1);
+            break;
+        }
+        if i % 50 == 0 {
+            let state_str = {
+                let threads = crate::proc::THREAD_TABLE.lock();
+                threads.iter().find(|t| t.pid == user_pid)
+                    .map(|t| alloc::format!("{:?}", t.state))
+                    .unwrap_or_else(|| alloc::string::String::from("gone"))
+            };
+            test_println!("  yield #{} glibc_hello={}", i, state_str);
+        }
+        crate::hal::enable_interrupts();
+        for _ in 0..1000 { core::hint::spin_loop(); }
+    }
+
+    if !was_active {
+        crate::sched::disable();
+    }
+
+    // 6. Verify exit state.
+    let (state, exit_code) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == user_pid) {
+            Some(p) => (p.state, p.exit_code),
+            None => {
+                test_println!("  glibc_hello reaped cleanly ✓");
+                test_pass!("glibc hello (oracle: ld-linux + libc.so.6 dynamic ELF)");
+                return true;
+            }
+        }
+    };
+
+    test_println!("  Process state={:?} exit_code={}", state, exit_code);
+
+    if state != crate::proc::ProcessState::Zombie {
+        test_fail!("glibc_hello", "Process did not exit within timeout (state={:?})", state);
+        return false;
+    }
+
+    if exit_code != 0 {
+        test_fail!("glibc_hello", "Expected exit code 0, got {}", exit_code);
+        return false;
+    }
+
+    test_println!("  glibc hello exited cleanly with code 0 ✓");
+    test_pass!("glibc hello (oracle: ld-linux + libc.so.6 dynamic ELF)");
+    true
+}
+
 // ── Test 120: ELF DT_RELR — packed relative relocations are applied ───────────
 //
 // Calls apply_relr_in_place() directly on a hand-crafted 96-byte buffer.
