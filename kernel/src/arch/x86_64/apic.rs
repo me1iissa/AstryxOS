@@ -917,6 +917,8 @@ pub extern "C" fn ap_rust_entry() -> ! {
             fork_user_regs: crate::proc::ForkUserRegs::default(),
             vfork_parent_tid: None,
             gs_base: 0,
+            robust_list_head: 0,
+            robust_list_len: 0,
         };
         THREAD_TABLE.lock().push(ap_thread);
     }
