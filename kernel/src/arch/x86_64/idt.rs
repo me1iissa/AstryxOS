@@ -784,12 +784,45 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
             }
 
             // Map all readahead pages and insert into cache.
+            // IMPORTANT: for MAP_PRIVATE writable VMAs (e.g. .data/.bss of shared libs),
+            // the cache page must stay CLEAN (original file content) so that future
+            // processes get unmodified file data. We insert the clean frame into the
+            // cache and give each writable mapping a PRIVATE COPY, exactly as the
+            // cache-hit path does. Without this, ld-linux's GOT relocations would write
+            // into the shared cache page, corrupting it for every subsequent process
+            // that loads the same library (observed crash: cpp_hello sees glibc_hello's
+            // relocated pointers in libc's .dynamic section).
+            const PHYS_COW: u64 = 0xFFFF_8000_0000_0000;
+            let is_writable_vma = page_flags & crate::mm::vmm::PAGE_WRITABLE != 0;
             let mapped_faulting = n_pages > 0;
             for i in 0..n_pages {
                 let (vaddr, phys, foff) = pages_to_map[i];
+                // Always insert the clean page into the shared cache.
                 crate::mm::cache::insert(mount_idx, inode, foff, phys);
-                crate::mm::refcount::page_ref_inc(phys);
-                crate::mm::vmm::map_page_in(cr3, vaddr, phys, page_flags);
+                // For writable VMAs: give this process a private copy so writes
+                // (GOT relocations, BSS init, etc.) don't corrupt the cache page.
+                // For read-only VMAs: share the cache page directly (saves memory).
+                if is_writable_vma {
+                    if let Some(private_phys) = crate::mm::pmm::alloc_page() {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                (PHYS_COW + phys) as *const u8,
+                                (PHYS_COW + private_phys) as *mut u8,
+                                crate::mm::pmm::PAGE_SIZE,
+                            );
+                        }
+                        crate::mm::refcount::page_ref_set(private_phys, 1);
+                        crate::mm::vmm::map_page_in(cr3, vaddr, private_phys, page_flags);
+                    } else {
+                        // OOM fallback: share the cache page (may cause reloc corruption)
+                        crate::mm::refcount::page_ref_inc(phys);
+                        crate::mm::vmm::map_page_in(cr3, vaddr, phys, page_flags);
+                    }
+                } else {
+                    // Read-only: share the cache page (safe — no writes expected).
+                    crate::mm::refcount::page_ref_inc(phys);
+                    crate::mm::vmm::map_page_in(cr3, vaddr, phys, page_flags);
+                }
                 crate::mm::vmm::invlpg(vaddr);
             }
 

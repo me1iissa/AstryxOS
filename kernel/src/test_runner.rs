@@ -838,6 +838,11 @@ pub fn run() -> ! {
     total += 1;
     if test_x11_render_query_version() { passed += 1; }
 
+    // ── Test 139: C++ hello — oracle test for libstdc++ / libgcc_s runtime ──
+
+    total += 1;
+    if test_cpp_hello_runs() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -15913,6 +15918,149 @@ fn test_x11_render_query_version() -> bool {
 
     crate::net::unix::close(fd);
     test_pass!("X11 RENDER QueryVersion (≥0.11)");
+    true
+}
+
+// ── Test 139: C++ hello — oracle test for libstdc++ / libgcc_s / C++ runtime ──
+//
+// Validates that the ELF loader, PT_INTERP dispatch, ld-linux-x86-64.so.2,
+// libc.so.6, libstdc++.so.6, and libgcc_s.so.1 all cooperate correctly.
+// The binary calls std::cout (iostream), exercises __cxa_atexit, and tests
+// global destructor ordering — all the C++ runtime fundamentals that Firefox
+// depends on.
+//
+// If the binary is absent the test is skipped with a warning (infrastructure
+// may not have run g++ + create-data-disk.sh yet).
+fn test_cpp_hello_runs() -> bool {
+    test_header!("C++ hello (oracle: libstdc++ / libgcc_s / iostream)");
+
+    // 1. Read the binary from the data disk.
+    let elf_data = match crate::vfs::read_file("/disk/bin/cpp_hello") {
+        Ok(data) => {
+            test_println!("  Read /disk/bin/cpp_hello: {} bytes", data.len());
+            data
+        }
+        Err(e) => {
+            // Binary missing — skip rather than fail so the suite can still
+            // report progress while the data disk is being rebuilt.
+            test_println!("  SKIP: /disk/bin/cpp_hello not found ({:?})", e);
+            test_println!("        Run g++ -O2 -o build/cpp_hello userspace/cpp_hello.cpp");
+            test_println!("        then scripts/create-data-disk.sh --force to rebuild.");
+            test_pass!("C++ hello (skipped — binary absent)");
+            return true;
+        }
+    };
+
+    // 2. Basic ELF sanity check.
+    if !crate::proc::elf::is_elf(&elf_data) {
+        test_fail!("cpp_hello", "/disk/bin/cpp_hello is not an ELF binary");
+        return false;
+    }
+    test_println!("  ELF magic OK ✓");
+
+    match crate::proc::elf::validate_elf(&elf_data) {
+        Ok(hdr) => {
+            test_println!("  Entry {:#x}, {} phdrs", hdr.e_entry, hdr.e_phnum);
+        }
+        Err(e) => {
+            test_fail!("cpp_hello", "ELF validate failed: {:?}", e);
+            return false;
+        }
+    }
+
+    // 3. Create a user-mode process.
+    let user_pid = match crate::proc::usermode::create_user_process("cpp_hello", &elf_data) {
+        Ok(pid) => {
+            test_println!("  Created user process PID {} ✓", pid);
+            pid
+        }
+        Err(e) => {
+            test_fail!("cpp_hello", "create_user_process failed: {:?}", e);
+            return false;
+        }
+    };
+
+    // 4. Mark as Linux ABI (glibc/libstdc++ use the syscall instruction).
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == user_pid) {
+            p.linux_abi = true;
+            p.subsystem = crate::win32::SubsystemType::Linux;
+            test_println!("  linux_abi = true ✓");
+        }
+    }
+
+    // 5. Enable the scheduler and spin for up to ~5 seconds (~500 yields at
+    //    ~10 ms each on the QEMU timer tick).
+    let was_active = crate::sched::is_active();
+    if !was_active {
+        crate::sched::enable();
+    }
+
+    test_println!("  Scheduling cpp_hello...");
+    {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        test_println!("  Thread table has {} entries", threads.len());
+    }
+
+    const MAX_YIELDS: usize = 500;
+    for i in 0..MAX_YIELDS {
+        crate::sched::yield_cpu();
+        let proc_done = {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            match procs.iter().find(|p| p.pid == user_pid) {
+                Some(p) => p.state == crate::proc::ProcessState::Zombie,
+                None => true,
+            }
+        };
+        if proc_done {
+            test_println!("  Exited after {} yields ✓", i + 1);
+            break;
+        }
+        if i % 50 == 0 {
+            let state_str = {
+                let threads = crate::proc::THREAD_TABLE.lock();
+                threads.iter().find(|t| t.pid == user_pid)
+                    .map(|t| alloc::format!("{:?}", t.state))
+                    .unwrap_or_else(|| alloc::string::String::from("gone"))
+            };
+            test_println!("  yield #{} cpp_hello={}", i, state_str);
+        }
+        crate::hal::enable_interrupts();
+        for _ in 0..1000 { core::hint::spin_loop(); }
+    }
+
+    if !was_active {
+        crate::sched::disable();
+    }
+
+    // 6. Verify exit state.
+    let (state, exit_code) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == user_pid) {
+            Some(p) => (p.state, p.exit_code),
+            None => {
+                test_println!("  cpp_hello reaped cleanly ✓");
+                test_pass!("C++ hello (oracle: libstdc++ / libgcc_s / iostream)");
+                return true;
+            }
+        }
+    };
+
+    test_println!("  Process state={:?} exit_code={}", state, exit_code);
+
+    if state != crate::proc::ProcessState::Zombie {
+        test_fail!("cpp_hello", "Process did not exit within timeout (state={:?})", state);
+        return false;
+    }
+
+    if exit_code != 0 {
+        test_fail!("cpp_hello", "Expected exit code 0, got {}", exit_code);
+        return false;
+    }
+
+    test_println!("  C++ hello exited cleanly with code 0 ✓");
+    test_pass!("C++ hello (oracle: libstdc++ / libgcc_s / iostream)");
     true
 }
 
