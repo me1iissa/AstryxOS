@@ -1173,20 +1173,22 @@ fn load_elf_dyn(
         }
     }
 
-    // ── Apply DT_RELR packed relative relocations for interpreter ───────
-    // The interpreter (ld-linux-x86-64.so.2) may use DT_RELR for its own
-    // internal pointers.  bias is the ASLR offset applied to all its VAs.
-    if bias != 0 {
-        let (relr_off, relr_sz, _has_gnu_hash) =
-            parse_dynamic_for_relr(data, header, 0 /* link-time bias = 0 */);
-        if relr_sz > 0 {
-            crate::serial_println!(
-                "[ELF] DT_RELR(interp): {} bytes at file offset {:#x} bias={:#x}",
-                relr_sz, relr_off, bias
-            );
-            apply_relr_relocations(data, relr_off, relr_sz, bias, &mapped_pages);
-        }
-    }
+    // ── DT_RELR for the interpreter: DO NOT apply from the kernel ───────
+    //
+    // On real Linux, the kernel NEVER applies DT_RELR (or any relocations) to
+    // the ELF interpreter (ld-linux-x86-64.so.2).  The interpreter is loaded
+    // verbatim — raw file bytes — and its own bootstrap code (`_dl_start`)
+    // detects the load bias via PC-relative tricks, then applies its own
+    // DT_RELR in `_dl_relocate_object`.
+    //
+    // We previously called `apply_relr_relocations` here, which patched the
+    // interpreter's .data.rel.ro slots.  When ld-linux then ran its bootstrap
+    // and applied the same DT_RELR a second time, each slot received
+    // `bias + bias + link_time_value` instead of `bias + link_time_value`,
+    // producing a non-canonical address and a General Protection Fault the
+    // first time one of those function-pointer slots was called.
+    //
+    // Fix: leave the interpreter pages unpatched; let ld-linux relocate itself.
 
     Ok(header.e_entry.wrapping_add(bias))
 }

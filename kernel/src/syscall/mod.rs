@@ -1287,14 +1287,61 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
     }
     let space = proc.vm_space.as_mut().unwrap();
 
+    // MAP_FIXED_NOREPLACE (Linux 4.17+, flag 0x100000): like MAP_FIXED but the
+    // kernel should return EEXIST if the range is already mapped.  Modern glibc
+    // (2.31+) and ld-linux use this flag when loading library segments so that
+    // they can detect address-space conflicts.  Without recognising it we fell
+    // through to find_free_range() and silently placed the library at a
+    // completely different address — corrupting all relocation offsets and
+    // producing non-canonical pointers that caused a GPF later.
+    //
+    // For our purposes: honour the requested address just like MAP_FIXED.
+    // For NOREPLACE semantics: if the range overlaps an existing VMA, return
+    // EEXIST.  ld-linux never pre-reserves with PROT_NONE when using
+    // MAP_FIXED_NOREPLACE, so this check is safe.
+    const MAP_FIXED_NOREPLACE: u32 = 0x0010_0000;
+    let is_fixed = flags & (MAP_FIXED as u32 | MAP_FIXED_NOREPLACE) != 0;
+    let is_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
+
+
     // Choose base address
-    let base = if flags & MAP_FIXED as u32 != 0 {
+    let base = if is_fixed {
         let base = page_align_down(addr_hint);
         if base == 0 {
             return -22; // EINVAL
         }
-        // Remove any existing mappings in the range
-        let _ = space.remove_range(base, length);
+        if is_noreplace {
+            // Fail if any existing VMA overlaps the requested range.
+            let conflict = space.areas.iter().any(|vma| vma.overlaps(base, length));
+            if conflict {
+                return -17; // EEXIST
+            }
+        } else {
+            // Regular MAP_FIXED: silently replace existing mappings.
+            //
+            // CRITICAL: We must unmap any physical pages already present in the
+            // page table for [base, base+length) BEFORE removing the VMA record.
+            // If we only remove the VMA (leaving old PTEs intact), the new
+            // file-backed VMA will be shadowed by the old physical pages — page
+            // faults won't fire and the process reads stale data instead of the
+            // new file content.  This is what caused ld-linux link_map->l_addr
+            // corruption when a MAP_PRIVATE|MAP_NORESERVE reservation (with a
+            // few demand-paged pages) was replaced by MAP_FIXED segment mmaps.
+            let cr3 = space.cr3;
+            let mut pg = base;
+            while pg < base + length {
+                if let Some(phys) = crate::mm::vmm::virt_to_phys_in(cr3, pg) {
+                    crate::mm::vmm::unmap_page_in(cr3, pg);
+                    crate::mm::vmm::invlpg(pg);
+                    let new_rc = crate::mm::refcount::page_ref_dec(phys);
+                    if new_rc == 0 {
+                        crate::mm::pmm::free_page(phys);
+                    }
+                }
+                pg += 0x1000;
+            }
+            let _ = space.remove_range(base, length);
+        }
         base
     } else {
         match space.find_free_range(length) {
@@ -1366,7 +1413,16 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
             }
             base as i64
         }
-        Err(_) => -12, // ENOMEM
+        Err(_) => {
+            // Log VMA insert failures — these indicate a MAP_FIXED race or
+            // a remaining overlap after remove_range that would silently return
+            // the wrong address to ld-linux, corrupting link_map->l_addr.
+            crate::serial_println!(
+                "[MMAP-ERR] pid={} insert_vma failed: base={:#x} len={:#x} flags={:#x} fd={}",
+                pid, base, length, flags, fd as i64
+            );
+            -12 // ENOMEM
+        }
     }
 }
 
