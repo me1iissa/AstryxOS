@@ -20,6 +20,7 @@ pub mod orbit_elf;
 pub mod pe;
 pub mod thread;
 pub mod usermode;
+pub mod vdso;
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
