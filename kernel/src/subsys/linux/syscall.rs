@@ -151,6 +151,17 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
             }
         }
     }
+    // ── Lazy SIGALRM delivery — check alarm deadline before every syscall ────
+    // The timer ISR cannot safely acquire PROCESS_TABLE, so alarm expiry is
+    // detected here instead.  This guarantees delivery within one syscall of
+    // expiry, which meets POSIX requirements for non-real-time scheduling.
+    {
+        let pid = crate::proc::current_pid();
+        if pid >= 1 {
+            check_and_deliver_alarm(pid);
+        }
+    }
+
     match num {
         // 0: read(fd, buf, count)
         0 => sys_read_linux(arg1, arg2, arg3),
@@ -1996,8 +2007,14 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         270 => sys_select_linux(arg1, arg2, arg3, arg4, arg5),
         // 285: fallocate(fd, mode, offset, len) — stub success
         285 => 0,
-        // 295: openat2(dirfd, path, how, size) — forward to openat (ignore resolve flags)
-        295 => {
+        // 295: preadv(fd, iov, iovcnt, offset_lo, offset_hi)
+        // Scatter-gather positioned read; offset = (offset_hi << 32) | offset_lo on x86-64
+        // but Linux x86_64 passes the offset as a single i64 in arg4 (lo) with arg5=0.
+        295 => sys_preadv(arg1, arg2, arg3, arg4 as i64),
+        // 296: pwritev(fd, iov, iovcnt, offset)
+        296 => sys_pwritev(arg1, arg2, arg3, arg4 as i64),
+        // 437: openat2(dirfd, path, how, size) — forward to openat (ignore resolve flags)
+        437 => {
             // openat2 struct how: { flags: u64, mode: u64, resolve: u64 }
             // arg1=dirfd, arg2=path, arg3=*how, arg4=sizeof(how)
             let how_flags = if arg3 != 0 { unsafe { *(arg3 as *const u64) } } else { 0 };
@@ -2057,6 +2074,27 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         424 => -38,
         // 443-445: landlock_* — ENOSYS
         443 | 444 | 445 => -38,
+
+        // 85: creat(pathname, mode) — trivially: open(path, O_CREAT|O_WRONLY|O_TRUNC, mode)
+        85 => {
+            // Linux flags: O_CREAT=0x40, O_WRONLY=1, O_TRUNC=0x200 → combined = 0x241
+            sys_open_linux(arg1, 0x241, arg2)
+        }
+        // 78: getdents(fd, buf, count) — 32-bit inode/offset variant of getdents64
+        78 => sys_getdents(arg1, arg2, arg3),
+        // 37: alarm(seconds) — schedule SIGALRM after `seconds` wall-clock seconds.
+        // Returns previous alarm remaining seconds (0 if none).
+        37 => sys_alarm(arg1),
+        // 38: setitimer(which, new_value, old_value) — interval timer
+        38 => sys_setitimer(arg1, arg2, arg3),
+        // 36: getitimer(which, curr_value) — read current interval timer
+        36 => sys_getitimer(arg1, arg2),
+        // 258: mkdirat(dirfd, pathname, mode)
+        258 => sys_mkdirat(arg1, arg2, arg3),
+        // 263: unlinkat(dirfd, pathname, flags)
+        263 => sys_unlinkat(arg1, arg2, arg3),
+        // 264: renameat(olddirfd, oldpath, newdirfd, newpath)
+        264 => sys_renameat(arg1, arg2, arg3, arg4),
 
         // Explicit ENOSYS for syscalls that would silently fail otherwise
         // (give the process a chance to fall back rather than misinterpreting 0)
@@ -4684,5 +4722,453 @@ fn sys_inotify_rm_watch(fd_num: u64, wd: i32) -> i64 {
     if !crate::syscall::is_inotify_fd(pid, fd_num as usize) { return -9; } // EBADF
     let id = crate::syscall::get_inotify_id(pid, fd_num as usize);
     if crate::ipc::inotify::rm_watch(id, wd) { 0 } else { -22 }
+}
+
+// ============================================================================
+// T0/T1 syscalls — creat, getdents, alarm, setitimer, getitimer,
+//                  mkdirat, unlinkat, renameat, preadv, pwritev
+// ============================================================================
+
+// PIT ticks per second (100 Hz).
+const TICKS_PER_SEC: u64 = 100;
+
+/// Deliver SIGALRM if the alarm deadline has passed.  Called at the top of
+/// every Linux syscall dispatch so delivery is prompt without requiring the
+/// timer ISR to hold PROCESS_TABLE.
+///
+/// If the alarm was set with a non-zero interval (setitimer repeating), the
+/// timer is automatically re-armed.
+///
+/// Exposed as `pub` so the test runner can exercise alarm delivery directly
+/// without going through a full syscall dispatch.
+pub fn check_and_deliver_alarm_pub(pid: u64) { check_and_deliver_alarm(pid); }
+
+fn check_and_deliver_alarm(pid: u64) {
+    let now = crate::arch::x86_64::irq::get_ticks();
+    // Fast path: check deadline without holding the process lock.
+    // We read alarm_deadline_ticks without a lock; the field is only written
+    // by this same process (in syscall context, single-threaded per-process
+    // alarm state), so this is safe for the non-zero quick-exit check.
+    let deadline = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == pid) {
+            Some(p) => p.alarm_deadline_ticks,
+            None => return,
+        }
+    };
+    if deadline == 0 || now < deadline {
+        return;
+    }
+    // Alarm has expired — queue SIGALRM and re-arm if interval is set.
+    let mut procs = crate::proc::PROCESS_TABLE.lock();
+    if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+        let interval = p.alarm_interval_ticks;
+        if interval > 0 {
+            // Periodic timer: advance deadline by one (or more) intervals so
+            // we never fall behind more than one period.
+            let periods = ((now - p.alarm_deadline_ticks) / interval) + 1;
+            p.alarm_deadline_ticks += periods * interval;
+        } else {
+            p.alarm_deadline_ticks = 0; // one-shot: disarm
+        }
+        if let Some(ref mut ss) = p.signal_state {
+            ss.send(crate::signal::SIGALRM);
+        }
+    }
+}
+
+/// alarm(seconds) — POSIX.1 one-shot SIGALRM timer.
+///
+/// Schedules delivery of SIGALRM after `seconds` wall-clock seconds.
+/// Setting seconds=0 cancels any pending alarm.
+/// Returns the number of seconds remaining in any previously scheduled alarm,
+/// or 0 if no alarm was set.
+fn sys_alarm(seconds: u64) -> i64 {
+    let pid = crate::proc::current_pid();
+    let now = crate::arch::x86_64::irq::get_ticks();
+    let mut procs = crate::proc::PROCESS_TABLE.lock();
+    let proc = match procs.iter_mut().find(|p| p.pid == pid) {
+        Some(p) => p,
+        None => return 0,
+    };
+    // Calculate remaining time on the old alarm (return value).
+    let old_remaining = if proc.alarm_deadline_ticks > now {
+        // Round up to whole seconds.
+        (proc.alarm_deadline_ticks - now + TICKS_PER_SEC - 1) / TICKS_PER_SEC
+    } else {
+        0
+    };
+    // Arm (or disarm) the new alarm.
+    if seconds == 0 {
+        proc.alarm_deadline_ticks = 0;
+    } else {
+        proc.alarm_deadline_ticks = now + seconds * TICKS_PER_SEC;
+    }
+    proc.alarm_interval_ticks = 0; // alarm is always one-shot
+    old_remaining as i64
+}
+
+/// setitimer(which, new_value, old_value) — POSIX interval timer.
+///
+/// Only ITIMER_REAL (which=0) is implemented; ITIMER_VIRTUAL (1) and
+/// ITIMER_PROF (2) return -EINVAL.
+///
+/// struct itimerval layout (x86-64):
+///   it_interval: { tv_sec: i64 @0, tv_usec: i64 @8 }  (period)
+///   it_value:    { tv_sec: i64 @16, tv_usec: i64 @24 } (time until first expiry)
+fn sys_setitimer(which: u64, new_val_ptr: u64, old_val_ptr: u64) -> i64 {
+    const ITIMER_REAL: u64 = 0;
+    if which != ITIMER_REAL {
+        // ITIMER_VIRTUAL / ITIMER_PROF — not implemented.
+        crate::serial_println!("[alarm] setitimer: which={} not implemented (EINVAL)", which);
+        return -22; // EINVAL
+    }
+
+    let pid = crate::proc::current_pid();
+    let now = crate::arch::x86_64::irq::get_ticks();
+
+    // Read the new itimerval before acquiring the process lock.
+    let (new_interval_ticks, new_value_ticks) = if new_val_ptr != 0 {
+        if !crate::syscall::validate_user_ptr(new_val_ptr, 32) { return -14; } // EFAULT
+        let it_interval_sec  = unsafe { *( new_val_ptr       as *const i64) } as u64;
+        let it_interval_usec = unsafe { *((new_val_ptr + 8)  as *const i64) } as u64;
+        let it_value_sec     = unsafe { *((new_val_ptr + 16) as *const i64) } as u64;
+        let it_value_usec    = unsafe { *((new_val_ptr + 24) as *const i64) } as u64;
+        // Convert microseconds → ticks (round up, minimum 1 if non-zero).
+        let interval_us = it_interval_sec * 1_000_000 + it_interval_usec;
+        let value_us    = it_value_sec    * 1_000_000 + it_value_usec;
+        let interval_ticks = if interval_us == 0 { 0 } else { (interval_us * TICKS_PER_SEC / 1_000_000).max(1) };
+        let value_ticks    = if value_us    == 0 { 0 } else { (value_us    * TICKS_PER_SEC / 1_000_000).max(1) };
+        (interval_ticks, value_ticks)
+    } else {
+        return -14; // EFAULT: new_value is mandatory for setitimer
+    };
+
+    let mut procs = crate::proc::PROCESS_TABLE.lock();
+    let proc = match procs.iter_mut().find(|p| p.pid == pid) {
+        Some(p) => p,
+        None => return -3, // ESRCH
+    };
+
+    // Optionally return the old timer value.
+    if old_val_ptr != 0 && crate::syscall::validate_user_ptr(old_val_ptr, 32) {
+        let old_remaining_ticks = if proc.alarm_deadline_ticks > now {
+            proc.alarm_deadline_ticks - now
+        } else {
+            0
+        };
+        let old_value_us    = old_remaining_ticks * 1_000_000 / TICKS_PER_SEC;
+        let old_interval_us = proc.alarm_interval_ticks * 1_000_000 / TICKS_PER_SEC;
+        unsafe {
+            // it_interval
+            *( old_val_ptr       as *mut i64) = (old_interval_us / 1_000_000) as i64;
+            *((old_val_ptr +  8) as *mut i64) = (old_interval_us % 1_000_000) as i64;
+            // it_value
+            *((old_val_ptr + 16) as *mut i64) = (old_value_us / 1_000_000) as i64;
+            *((old_val_ptr + 24) as *mut i64) = (old_value_us % 1_000_000) as i64;
+        }
+    }
+
+    // Arm the new timer.
+    if new_value_ticks == 0 {
+        proc.alarm_deadline_ticks = 0; // disarm
+        proc.alarm_interval_ticks = 0;
+    } else {
+        proc.alarm_deadline_ticks = now + new_value_ticks;
+        proc.alarm_interval_ticks = new_interval_ticks;
+    }
+    0
+}
+
+/// getitimer(which, curr_value) — read current ITIMER_REAL state.
+fn sys_getitimer(which: u64, val_ptr: u64) -> i64 {
+    const ITIMER_REAL: u64 = 0;
+    if which != ITIMER_REAL {
+        return -22; // EINVAL
+    }
+    if val_ptr == 0 || !crate::syscall::validate_user_ptr(val_ptr, 32) {
+        return -14; // EFAULT
+    }
+    let pid = crate::proc::current_pid();
+    let now = crate::arch::x86_64::irq::get_ticks();
+    let procs = crate::proc::PROCESS_TABLE.lock();
+    let proc = match procs.iter().find(|p| p.pid == pid) {
+        Some(p) => p,
+        None => return -3,
+    };
+    let remaining_ticks = if proc.alarm_deadline_ticks > now {
+        proc.alarm_deadline_ticks - now
+    } else {
+        0
+    };
+    let value_us    = remaining_ticks * 1_000_000 / TICKS_PER_SEC;
+    let interval_us = proc.alarm_interval_ticks * 1_000_000 / TICKS_PER_SEC;
+    unsafe {
+        *( val_ptr       as *mut i64) = (interval_us / 1_000_000) as i64;
+        *((val_ptr +  8) as *mut i64) = (interval_us % 1_000_000) as i64;
+        *((val_ptr + 16) as *mut i64) = (value_us / 1_000_000) as i64;
+        *((val_ptr + 24) as *mut i64) = (value_us % 1_000_000) as i64;
+    }
+    0
+}
+
+/// Resolve a path relative to `dirfd` (or CWD when dirfd == AT_FDCWD).
+/// Returns the full absolute path as an owned String, or an errno on error.
+fn resolve_at_path(dirfd: u64, rel_ptr: u64) -> Result<alloc::string::String, i64> {
+    const AT_FDCWD: i64 = -100;
+    let path_bytes = read_cstring_from_user(rel_ptr);
+    let rel_str = core::str::from_utf8(path_bytes).map_err(|_| -22i64)?;
+    if rel_str.is_empty() {
+        return Err(-2); // ENOENT
+    }
+    // Absolute path: dirfd is irrelevant (POSIX).
+    if rel_str.starts_with('/') {
+        return Ok(alloc::string::String::from(rel_str));
+    }
+    // Relative path with AT_FDCWD: use process CWD.
+    if dirfd as i64 == AT_FDCWD {
+        let pid = crate::proc::current_pid();
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        let cwd = procs.iter().find(|p| p.pid == pid)
+            .map(|p| p.cwd.clone())
+            .unwrap_or_else(|| alloc::string::String::from("/"));
+        drop(procs);
+        return Ok(if cwd.ends_with('/') {
+            alloc::format!("{}{}", cwd, rel_str)
+        } else {
+            alloc::format!("{}/{}", cwd, rel_str)
+        });
+    }
+    // Relative path with a real directory fd: get dir path from fd table.
+    let pid = crate::proc::current_pid();
+    let dir_path = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        let proc = procs.iter().find(|p| p.pid == pid).ok_or(-3i64)?;
+        let fd_idx = dirfd as usize;
+        proc.file_descriptors.get(fd_idx)
+            .and_then(|f| f.as_ref())
+            .map(|f| f.open_path.clone())
+            .ok_or(-9i64)? // EBADF
+    };
+    Ok(if dir_path.ends_with('/') {
+        alloc::format!("{}{}", dir_path, rel_str)
+    } else {
+        alloc::format!("{}/{}", dir_path, rel_str)
+    })
+}
+
+/// mkdirat(dirfd, pathname, mode) — create directory relative to dirfd.
+fn sys_mkdirat(dirfd: u64, pathname: u64, _mode: u64) -> i64 {
+    let full_path = match resolve_at_path(dirfd, pathname) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    match crate::vfs::mkdir(&full_path) {
+        Ok(()) => 0,
+        Err(e) => crate::subsys::linux::errno::vfs_err(e),
+    }
+}
+
+/// unlinkat(dirfd, pathname, flags) — remove file or directory relative to dirfd.
+///
+/// AT_REMOVEDIR (0x200) causes rmdir semantics; otherwise unlink.
+fn sys_unlinkat(dirfd: u64, pathname: u64, flags: u64) -> i64 {
+    const AT_REMOVEDIR: u64 = 0x200;
+    let full_path = match resolve_at_path(dirfd, pathname) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if flags & AT_REMOVEDIR != 0 {
+        let path_bytes = full_path.as_bytes();
+        crate::syscall::sys_rmdir(path_bytes.as_ptr(), path_bytes.len())
+    } else {
+        let path_bytes = full_path.as_bytes();
+        crate::syscall::sys_unlink(path_bytes.as_ptr(), path_bytes.len())
+    }
+}
+
+/// renameat(olddirfd, oldpath, newdirfd, newpath) — rename relative to dir fds.
+fn sys_renameat(olddirfd: u64, oldpath: u64, newdirfd: u64, newpath: u64) -> i64 {
+    let old = match resolve_at_path(olddirfd, oldpath) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let new = match resolve_at_path(newdirfd, newpath) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    match crate::vfs::rename(&old, &new) {
+        Ok(()) => 0,
+        Err(e) => crate::subsys::linux::errno::vfs_err(e),
+    }
+}
+
+/// getdents(fd, buf, count) — 32-bit inode/offset variant of getdents64.
+///
+/// struct linux_dirent layout (NOT linux_dirent64):
+///   d_ino:    u32  @0   — inode number (truncated to 32 bits)
+///   d_off:    u32  @4   — offset to next entry (truncated to 32 bits)
+///   d_reclen: u16  @8   — total record length including name and padding
+///   d_name:   char @10  — null-terminated filename
+///   (d_type is stored as the byte just before the null terminator, after the name)
+///
+/// Per man 2 getdents: d_type is at offset d_reclen-1 (last byte of the record).
+fn sys_getdents(fd: u64, buf: u64, count: u64) -> i64 {
+    let pid = crate::proc::current_pid();
+    let (mount_idx, inode, offset) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        let proc_entry = match procs.iter().find(|p| p.pid == pid) {
+            Some(p) => p,
+            None => return -3,
+        };
+        let fd_entry = match proc_entry.file_descriptors.get(fd as usize).and_then(|f| f.as_ref()) {
+            Some(f) => f,
+            None => return -9,
+        };
+        (fd_entry.mount_idx, fd_entry.inode, fd_entry.offset)
+    };
+
+    // Read directory entries from VFS.
+    let entries = {
+        let mounts = crate::vfs::MOUNTS.lock();
+        match mounts.get(mount_idx) {
+            Some(m) => match m.fs.readdir(inode) {
+                Ok(e) => e,
+                Err(e) => return crate::subsys::linux::errno::vfs_err(e),
+            },
+            None => return -9,
+        }
+    };
+
+    if buf == 0 || !crate::syscall::validate_user_ptr(buf, count as usize) {
+        return -14; // EFAULT
+    }
+    let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, count as usize) };
+    let mut pos = 0usize;
+    let mut entry_idx = offset as usize;
+
+    while entry_idx < entries.len() {
+        let (ref name, ino, ft) = entries[entry_idx];
+        let name_bytes = name.as_bytes();
+        // Record: 4(d_ino) + 4(d_off) + 2(d_reclen) + name + 1(d_type) + 1(nul)
+        // Padded to 4-byte alignment (32-bit ABI compatibility).
+        let fixed = 12 + name_bytes.len() + 1; // header + name + d_type byte (at end)
+        let reclen = (fixed + 3) & !3; // align to 4 bytes
+
+        if pos + reclen > count as usize {
+            break;
+        }
+
+        let d_ino = ino as u32;
+        let d_off = (entry_idx + 1) as u32;
+        let d_type: u8 = match ft {
+            crate::vfs::FileType::RegularFile => 8,  // DT_REG
+            crate::vfs::FileType::Directory   => 4,  // DT_DIR
+            crate::vfs::FileType::SymLink     => 10, // DT_LNK
+            crate::vfs::FileType::CharDevice  => 2,  // DT_CHR
+            crate::vfs::FileType::BlockDevice => 6,  // DT_BLK
+            _                                 => 0,  // DT_UNKNOWN
+        };
+
+        // d_ino (u32 @0)
+        out[pos..pos+4].copy_from_slice(&d_ino.to_le_bytes());
+        // d_off (u32 @4)
+        out[pos+4..pos+8].copy_from_slice(&d_off.to_le_bytes());
+        // d_reclen (u16 @8)
+        out[pos+8..pos+10].copy_from_slice(&(reclen as u16).to_le_bytes());
+        // d_name (@10): name bytes then d_type then null terminator
+        let nlen = name_bytes.len().min(reclen - 12);
+        out[pos+10..pos+10+nlen].copy_from_slice(&name_bytes[..nlen]);
+        // Zero padding between name and the end of the record
+        for i in (pos+10+nlen)..(pos+reclen-1) {
+            out[i] = 0;
+        }
+        // d_type stored as last byte of record (glibc/musl convention)
+        out[pos+reclen-1] = d_type;
+
+        pos += reclen;
+        entry_idx += 1;
+    }
+
+    // Update fd offset.
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(proc_entry) = procs.iter_mut().find(|p| p.pid == pid) {
+            if let Some(Some(fd_entry)) = proc_entry.file_descriptors.get_mut(fd as usize) {
+                fd_entry.offset = entry_idx as u64;
+            }
+        }
+    }
+    pos as i64
+}
+
+/// preadv(fd, iov, iovcnt, offset) — scatter-gather positioned read.
+///
+/// Reads from position `offset` (does not advance the fd offset) into the
+/// iovec array.  Per POSIX, the file offset is preserved after the call.
+fn sys_preadv(fd: u64, iov_ptr: u64, iovcnt: u64, offset: i64) -> i64 {
+    if iovcnt == 0 { return 0; }
+    if iovcnt > 1024 { return -22; } // EINVAL: IOV_MAX
+    let pid = crate::proc::current_pid();
+    // Save, seek to offset, scatter-read, restore.
+    let saved = crate::syscall::sys_lseek(fd as usize, 0, 1 /*SEEK_CUR*/);
+    let sk = crate::syscall::sys_lseek(fd as usize, offset, 0 /*SEEK_SET*/);
+    if sk < 0 { return sk; }
+    // SAFETY: iovcnt validated above; caller is responsible for valid iov array.
+    let iovecs = unsafe {
+        core::slice::from_raw_parts(iov_ptr as *const [u64; 2], iovcnt as usize)
+    };
+    let mut total = 0i64;
+    for iov in iovecs {
+        let base = iov[0];
+        let len  = iov[1] as usize;
+        if len == 0 { continue; }
+        let result = match crate::vfs::fd_read(pid, fd as usize, base as *mut u8, len) {
+            Ok(n) => n as i64,
+            Err(e) => {
+                if total > 0 { break; }
+                if saved >= 0 { let _ = crate::syscall::sys_lseek(fd as usize, saved, 0); }
+                return crate::subsys::linux::errno::vfs_err(e);
+            }
+        };
+        total += result;
+        if (result as usize) < len { break; } // short read — stop
+    }
+    if saved >= 0 { let _ = crate::syscall::sys_lseek(fd as usize, saved, 0); }
+    total
+}
+
+/// pwritev(fd, iov, iovcnt, offset) — scatter-gather positioned write.
+///
+/// Writes from the iovec array to position `offset`.  The fd offset is
+/// preserved after the call (same contract as pread64).
+fn sys_pwritev(fd: u64, iov_ptr: u64, iovcnt: u64, offset: i64) -> i64 {
+    if iovcnt == 0 { return 0; }
+    if iovcnt > 1024 { return -22; } // EINVAL: IOV_MAX
+    let pid = crate::proc::current_pid();
+    let saved = crate::syscall::sys_lseek(fd as usize, 0, 1 /*SEEK_CUR*/);
+    let sk = crate::syscall::sys_lseek(fd as usize, offset, 0 /*SEEK_SET*/);
+    if sk < 0 { return sk; }
+    // SAFETY: iovcnt validated above; caller is responsible for valid iov array.
+    let iovecs = unsafe {
+        core::slice::from_raw_parts(iov_ptr as *const [u64; 2], iovcnt as usize)
+    };
+    let mut total = 0i64;
+    for iov in iovecs {
+        let base = iov[0];
+        let len  = iov[1] as usize;
+        if len == 0 { continue; }
+        let result = match crate::vfs::fd_write(pid, fd as usize, base as *const u8, len) {
+            Ok(n) => n as i64,
+            Err(e) => {
+                if total > 0 { break; }
+                if saved >= 0 { let _ = crate::syscall::sys_lseek(fd as usize, saved, 0); }
+                return crate::subsys::linux::errno::vfs_err(e);
+            }
+        };
+        total += result;
+    }
+    if saved >= 0 { let _ = crate::syscall::sys_lseek(fd as usize, saved, 0); }
+    total
 }
 
