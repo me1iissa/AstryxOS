@@ -92,7 +92,24 @@ pub const TIOCGETSID: u64 = 0x5429; // get session id of tty
 
 // ── Structures ──────────────────────────────────────────────────────────────
 
-/// Terminal I/O settings, matching the Linux `struct termios` layout.
+/// NCCS — number of control-character slots in `struct termios`, matching
+/// the Linux x86_64 ABI (asm-generic/termbits.h: `#define NCCS 19`).
+pub const NCCS: usize = 19;
+
+/// Terminal I/O settings, matching the Linux `struct termios` layout exactly.
+///
+/// Linux x86_64 ABI layout (asm-generic/termbits.h):
+///   c_iflag  u32 @ offset  0
+///   c_oflag  u32 @ offset  4
+///   c_cflag  u32 @ offset  8
+///   c_lflag  u32 @ offset 12
+///   c_line   u8  @ offset 16
+///   c_cc[19] u8  @ offset 17  (NCCS = 19)
+///   total = 36 bytes
+///
+/// NOTE: `struct termios2` (used by TCGETS2 / 0x802C542A) is different —
+/// it includes c_ispeed and c_ospeed after c_cc.  Do not add speed fields
+/// here; TCGETS (0x5401) strictly expects the 36-byte layout above.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct Termios {
@@ -101,17 +118,15 @@ pub struct Termios {
     pub c_cflag: u32,
     pub c_lflag: u32,
     pub c_line: u8,
-    pub c_cc: [u8; 32],
-    pub c_ispeed: u32,
-    pub c_ospeed: u32,
+    pub c_cc: [u8; NCCS],   // exactly 19 bytes — Linux NCCS
 }
 
 impl Termios {
     /// Create a default cooked-mode termios (like a freshly-opened terminal).
     pub fn default_cooked() -> Self {
-        let mut c_cc = [0u8; 32];
+        let mut c_cc = [0u8; NCCS];
         c_cc[VINTR] = 3;      // ^C
-        c_cc[VQUIT] = 28;     // ^\  
+        c_cc[VQUIT] = 28;     // ^\
         c_cc[VERASE] = 127;   // DEL
         c_cc[VKILL] = 21;     // ^U
         c_cc[VEOF] = 4;       // ^D
@@ -133,8 +148,6 @@ impl Termios {
             c_lflag: ECHO | ECHOE | ICANON | ISIG | IEXTEN,
             c_line: 0,
             c_cc,
-            c_ispeed: 38400,
-            c_ospeed: 38400,
         }
     }
 }
@@ -172,7 +185,7 @@ pub static TTY0: Mutex<Tty> = Mutex::new(Tty::const_new());
 impl Tty {
     /// Const constructor for static initialization.
     const fn const_new() -> Self {
-        let mut c_cc = [0u8; 32];
+        let mut c_cc = [0u8; NCCS];
         c_cc[VINTR] = 3;
         c_cc[VQUIT] = 28;
         c_cc[VERASE] = 127;
@@ -197,8 +210,6 @@ impl Tty {
                 c_lflag: ECHO | ECHOE | ICANON | ISIG | IEXTEN,
                 c_line: 0,
                 c_cc,
-                c_ispeed: 38400,
-                c_ospeed: 38400,
             },
             input_buf: Vec::new(),
             input_ready: false,
