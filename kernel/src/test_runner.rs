@@ -763,6 +763,41 @@ pub fn run() -> ! {
     total += 1;
     if test_procfs_fd_symlinks() { passed += 1; }
 
+    // ── Test 124: statx on /etc/passwd — correct size + S_IFREG mode ─────────
+
+    total += 1;
+    if test_statx_regular_file() { passed += 1; }
+
+    // ── Test 125: getrandom fills 64-byte buffer, non-zero ────────────────────
+
+    total += 1;
+    if test_getrandom_fills_buffer() { passed += 1; }
+
+    // ── Test 126: mremap shrink — first 2 pages still readable ───────────────
+
+    total += 1;
+    if test_mremap_shrink() { passed += 1; }
+
+    // ── Test 127: set_robust_list / get_robust_list roundtrip ────────────────
+
+    total += 1;
+    if test_set_robust_list_roundtrip() { passed += 1; }
+
+    // ── Test 128: membarrier QUERY returns non-zero mask with GLOBAL bit ─────
+
+    total += 1;
+    if test_membarrier_query() { passed += 1; }
+
+    // ── Test 129: sched_getaffinity reports all online CPUs ───────────────────
+
+    total += 1;
+    if test_sched_getaffinity_shows_all_cpus() { passed += 1; }
+
+    // ── Test 130: rseq returns -ENOSYS (sentinel — must not regress) ─────────
+
+    total += 1;
+    if test_rseq_enosys() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -14925,4 +14960,286 @@ fn test_procfs_fd_symlinks() -> bool {
         test_pass!("/proc/self/fd/ readdir shows open fds");
     }
     ok
+// ── Test 120: statx on /etc/passwd — correct size + S_IFREG mode ─────────────
+
+fn test_statx_regular_file() -> bool {
+    test_header!("statx(332): /etc/passwd → size>0, S_IFREG bit set");
+
+    // struct statx — 256 bytes, must be aligned to 8 bytes for u64 field access.
+    // Layout used here (matches linux/stat.h):
+    //   offset  0: stx_mask    u32
+    //   offset 28: stx_mode    u16
+    //   offset 40: stx_size    u64
+    #[repr(C, align(8))]
+    struct Statx { data: [u8; 256] }
+    let mut sx = Statx { data: [0u8; 256] };
+
+    // Path for /etc/passwd (null-terminated)
+    let path: &[u8] = b"/etc/passwd\0";
+
+    // statx(AT_FDCWD=-100, path, 0, STATX_BASIC_STATS=0x7ff, &sx)
+    let r = crate::syscall::dispatch_linux(
+        332,
+        (-100i64) as u64,   // dirfd = AT_FDCWD
+        path.as_ptr() as u64,
+        0,                  // flags
+        0x7ff,              // mask = STATX_BASIC_STATS
+        sx.data.as_mut_ptr() as u64,
+        0,
+    );
+
+    test_println!("  statx(\"/etc/passwd\") = {}", r);
+
+    if r != 0 {
+        test_fail!("statx_regular_file", "syscall returned {} (expected 0)", r);
+        return false;
+    }
+
+    // Read stx_mask (offset 0, u32)
+    let stx_mask = u32::from_le_bytes(sx.data[0..4].try_into().unwrap_or([0;4]));
+    // Read stx_mode (offset 28, u16)
+    let stx_mode = u16::from_le_bytes(sx.data[28..30].try_into().unwrap_or([0;2]));
+    // Read stx_size (offset 40, u64)
+    let stx_size = u64::from_le_bytes(sx.data[40..48].try_into().unwrap_or([0;8]));
+
+    test_println!("  stx_mask={:#x} stx_mode={:#o} stx_size={}", stx_mask, stx_mode, stx_size);
+
+    // S_IFREG = 0o100000 = 0x8000
+    let is_reg = (stx_mode & 0xF000) == 0x8000;
+    let has_size = stx_size > 0;
+
+    if !is_reg {
+        test_fail!("statx_regular_file", "stx_mode={:#o} — S_IFREG bit (0o100000) not set", stx_mode);
+        return false;
+    }
+    if !has_size {
+        test_fail!("statx_regular_file", "stx_size=0 — expected /etc/passwd to have content");
+        return false;
+    }
+
+    test_pass!("statx: /etc/passwd size+mode S_IFREG");
+    true
+}
+
+// ── Test 121: getrandom fills 64-byte buffer, non-zero ────────────────────────
+
+fn test_getrandom_fills_buffer() -> bool {
+    test_header!("getrandom(318): fills 64-byte buffer, returns 64, non-zero");
+
+    let mut buf = [0u8; 64];
+
+    // getrandom(buf, 64, 0) — no flags
+    let r = crate::syscall::dispatch_linux(
+        318,
+        buf.as_mut_ptr() as u64,
+        64,
+        0, // flags = 0
+        0, 0, 0,
+    );
+
+    test_println!("  getrandom(64) = {}", r);
+
+    if r != 64 {
+        test_fail!("getrandom_fills_buffer", "returned {} (expected 64)", r);
+        return false;
+    }
+
+    // Verify that not all bytes are zero — with any decent RNG this is
+    // astronomically unlikely to fail.
+    let all_zero = buf.iter().all(|&b| b == 0);
+    if all_zero {
+        test_fail!("getrandom_fills_buffer", "buffer is all-zero — RNG not working");
+        return false;
+    }
+
+    test_println!("  buf[0..4] = {:02X} {:02X} {:02X} {:02X} (non-zero ✓)", buf[0], buf[1], buf[2], buf[3]);
+    test_pass!("getrandom: 64 bytes, non-zero ✓");
+    true
+}
+
+// ── Test 122: mremap shrink — first 2 pages still readable ───────────────────
+
+fn test_mremap_shrink() -> bool {
+    test_header!("mremap(25): shrink 4-page → 2-page, first 2 pages readable");
+
+    // mmap 4 anonymous pages (16 KiB), PROT_RW, MAP_PRIVATE|MAP_ANONYMOUS
+    let addr = crate::syscall::dispatch_linux(
+        9, 0, 0x4000, 3, 0x22, u64::MAX, 0,
+    );
+    if addr <= 0 {
+        test_fail!("mremap_shrink", "mmap 4 pages failed: {}", addr);
+        return false;
+    }
+    test_println!("  mmap 4 pages @ {:#x} ✓", addr);
+
+    // Write a sentinel into the first page
+    unsafe { core::ptr::write(addr as *mut u64, 0xCAFE_BABE_1234_5678u64); }
+
+    // mremap(addr, 0x4000, 0x2000, 0) — shrink to 2 pages, no MAYMOVE
+    let r = crate::syscall::dispatch_linux(
+        25,
+        addr as u64, // old_addr
+        0x4000,      // old_size
+        0x2000,      // new_size
+        0,           // flags = 0 (no MAYMOVE)
+        0, 0,
+    );
+
+    test_println!("  mremap(shrink) = {:#x}", r as u64);
+
+    if r != addr {
+        test_fail!("mremap_shrink", "expected same addr {:#x}, got {:#x}", addr, r);
+        return false;
+    }
+
+    // Sentinel in first page must still be readable
+    let sentinel = unsafe { core::ptr::read(addr as *const u64) };
+    if sentinel != 0xCAFE_BABE_1234_5678u64 {
+        test_fail!("mremap_shrink", "sentinel corrupted: {:#x}", sentinel);
+        return false;
+    }
+
+    // Cleanup: munmap the remaining 2 pages
+    let _ = crate::syscall::dispatch_linux(11, addr as u64, 0x2000, 0, 0, 0, 0);
+
+    test_pass!("mremap shrink: sentinel readable, addr unchanged ✓");
+    true
+}
+
+// ── Test 123: set_robust_list / get_robust_list roundtrip ─────────────────────
+
+fn test_set_robust_list_roundtrip() -> bool {
+    test_header!("set_robust_list(273) / get_robust_list(274): roundtrip");
+
+    // Use a stack address as a fake robust-list head pointer.
+    // The kernel stores it verbatim and must return the same value.
+    let fake_head: u64 = 0xDEAD_C0DE_0000_0000u64 | (crate::proc::current_tid() as u64 * 8);
+    let fake_len:  u64 = 24; // sizeof(struct robust_list_head)
+
+    // set_robust_list(head, len)
+    let set_r = crate::syscall::dispatch_linux(273, fake_head, fake_len, 0, 0, 0, 0);
+    test_println!("  set_robust_list({:#x}, {}) = {}", fake_head, fake_len, set_r);
+    if set_r != 0 {
+        test_fail!("set_robust_list_roundtrip", "set returned {} (expected 0)", set_r);
+        return false;
+    }
+
+    // get_robust_list(0 = calling thread, &head_out, &len_out)
+    let mut head_out: u64 = 0;
+    let mut len_out:  u64 = 0;
+    let get_r = crate::syscall::dispatch_linux(
+        274,
+        0,                             // pid=0 → calling thread
+        &mut head_out as *mut u64 as u64,
+        &mut len_out  as *mut u64 as u64,
+        0, 0, 0,
+    );
+    test_println!("  get_robust_list(0) = {} head={:#x} len={}", get_r, head_out, len_out);
+
+    if get_r != 0 {
+        test_fail!("set_robust_list_roundtrip", "get returned {} (expected 0)", get_r);
+        return false;
+    }
+    if head_out != fake_head {
+        test_fail!("set_robust_list_roundtrip", "head mismatch: got {:#x} want {:#x}", head_out, fake_head);
+        return false;
+    }
+    if len_out != fake_len {
+        test_fail!("set_robust_list_roundtrip", "len mismatch: got {} want {}", len_out, fake_len);
+        return false;
+    }
+
+    test_pass!("set/get_robust_list roundtrip ✓");
+    true
+}
+
+// ── Test 124: membarrier QUERY returns non-zero mask with GLOBAL bit ──────────
+
+fn test_membarrier_query() -> bool {
+    test_header!("membarrier(324): QUERY returns mask including GLOBAL (bit 0x1)");
+
+    // membarrier(MEMBARRIER_CMD_QUERY=0, flags=0, cpu_id=0)
+    let r = crate::syscall::dispatch_linux(324, 0, 0, 0, 0, 0, 0);
+    test_println!("  membarrier(QUERY) = {:#x}", r as u64);
+
+    if r <= 0 {
+        test_fail!("membarrier_query", "returned {} (expected positive bitmask)", r);
+        return false;
+    }
+    // MEMBARRIER_CMD_GLOBAL is bit 0x1
+    if r & 0x1 == 0 {
+        test_fail!("membarrier_query", "GLOBAL bit (0x1) not set in mask {:#x}", r as u64);
+        return false;
+    }
+
+    // Also verify GLOBAL command executes without error
+    let r2 = crate::syscall::dispatch_linux(324, 1, 0, 0, 0, 0, 0);
+    test_println!("  membarrier(GLOBAL) = {}", r2);
+    if r2 != 0 {
+        test_fail!("membarrier_query", "GLOBAL command returned {} (expected 0)", r2);
+        return false;
+    }
+
+    test_pass!("membarrier: QUERY mask non-zero with GLOBAL bit, GLOBAL cmd=0");
+    true
+}
+
+// ── Test 125: sched_getaffinity reports all online CPUs ───────────────────────
+
+fn test_sched_getaffinity_shows_all_cpus() -> bool {
+    test_header!("sched_getaffinity(204): popcount == online CPU count");
+
+    let ncpus_reported = crate::arch::x86_64::apic::cpu_count() as usize;
+    let ncpus_reported = ncpus_reported.max(1);
+
+    // cpuset buffer — 128 bytes covers up to 1024 CPUs
+    let mut cpuset = [0u8; 128];
+
+    // sched_getaffinity(pid=0, cpusetsize=128, mask=&cpuset)
+    let r = crate::syscall::dispatch_linux(
+        204,
+        0,                             // pid = 0 → caller
+        128,                           // cpusetsize
+        cpuset.as_mut_ptr() as u64,
+        0, 0, 0,
+    );
+    test_println!("  sched_getaffinity(0) = {}", r);
+
+    if r != 0 {
+        test_fail!("sched_getaffinity_shows_all_cpus", "returned {} (expected 0)", r);
+        return false;
+    }
+
+    // Count bits set in the returned mask
+    let popcount: usize = cpuset.iter().map(|b| b.count_ones() as usize).sum();
+    test_println!("  cpuset popcount={} kernel_cpu_count={}", popcount, ncpus_reported);
+
+    if popcount != ncpus_reported {
+        test_fail!("sched_getaffinity_shows_all_cpus",
+            "popcount={} != kernel cpu_count={}", popcount, ncpus_reported);
+        return false;
+    }
+
+    test_pass!("sched_getaffinity: popcount matches online CPU count");
+    true
+}
+
+// ── Test 126: rseq returns -ENOSYS (sentinel — must not regress) ─────────────
+
+fn test_rseq_enosys() -> bool {
+    test_header!("rseq(334): must return -ENOSYS (38) — no real implementation yet");
+
+    // rseq(NULL, 0, 0, 0) — minimal call
+    let r = crate::syscall::dispatch_linux(334, 0, 0, 0, 0, 0, 0);
+    test_println!("  rseq(334) = {}", r);
+
+    if r != -38 {
+        test_fail!("rseq_enosys",
+            "returned {} (expected -38/ENOSYS) — rseq may have been accidentally enabled",
+            r);
+        return false;
+    }
+
+    test_pass!("rseq: returns -ENOSYS ✓ (glibc fallback path safe)");
+    true
 }
