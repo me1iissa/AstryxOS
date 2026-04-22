@@ -172,6 +172,13 @@ pub struct Thread {
     /// calls execve() or exit().  None = not a vfork child.
     /// Linux equivalent: task_struct->vfork_done (completion semaphore).
     pub vfork_parent_tid: Option<u64>,
+    /// Linux robust futex list head (set_robust_list / get_robust_list).
+    /// Stored as a raw user-space pointer; the kernel only passes it back
+    /// on get_robust_list — it never dereferences it in normal operation.
+    pub robust_list_head: u64,
+    /// Length of the robust list structure (always sizeof(struct robust_list_head)
+    /// = 24 bytes in practice, but stored verbatim as passed by glibc).
+    pub robust_list_len: usize,
 }
 
 impl Thread {
@@ -474,6 +481,8 @@ pub fn init() {
         fork_user_regs: ForkUserRegs::default(),
         vfork_parent_tid: None,
         gs_base: 0,
+        robust_list_head: 0,
+        robust_list_len: 0,
     };
 
     PROCESS_TABLE.lock().push(idle_proc);
@@ -666,6 +675,8 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
         fork_user_regs: ForkUserRegs::default(),
         vfork_parent_tid: None,
         gs_base: 0,
+        robust_list_head: 0,
+        robust_list_len: 0,
     };
 
     PROCESS_TABLE.lock().push(process);
@@ -728,6 +739,8 @@ pub fn create_thread(pid: Pid, name: &str, entry_point: u64) -> Option<Tid> {
         fork_user_regs: ForkUserRegs::default(),
         vfork_parent_tid: None,
         gs_base: 0,
+        robust_list_head: 0,
+        robust_list_len: 0,
     };
 
     THREAD_TABLE.lock().push(thread);
@@ -795,6 +808,8 @@ pub fn create_thread_blocked(pid: Pid, name: &str, entry_point: u64) -> Option<T
         fork_user_regs: ForkUserRegs::default(),
         vfork_parent_tid: None,
         gs_base: 0,
+        robust_list_head: 0,
+        robust_list_len: 0,
     };
 
     THREAD_TABLE.lock().push(thread);
@@ -1519,6 +1534,8 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
         fork_user_regs: ForkUserRegs::default(),
         vfork_parent_tid: None,
         gs_base: 0,
+        robust_list_head: 0,
+        robust_list_len: 0,
     };
 
     PROCESS_TABLE.lock().push(child_proc);
@@ -1690,6 +1707,8 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
         fork_user_regs: ForkUserRegs::default(),
         vfork_parent_tid: None,
         gs_base: 0,
+        robust_list_head: 0,
+        robust_list_len: 0,
     };
 
     PROCESS_TABLE.lock().push(child_proc);

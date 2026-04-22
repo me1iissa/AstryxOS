@@ -1137,15 +1137,28 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         187 => 0,
         // 203: sched_setaffinity(pid, cpusetsize, mask) — stub (accept any)
         203 => 0,
-        // 204: sched_getaffinity(pid, cpusetsize, mask) — report CPU 0 only
+        // 204: sched_getaffinity(pid, cpusetsize, mask) — report all online CPUs.
+        // Glibc reads the popcount of this mask to determine nproc; returning
+        // only bit 0 would make it report 1 CPU even on SMP systems.
         204 => {
             let buf = arg3 as *mut u8;
             let bufsiz = arg2 as usize;
             if buf != core::ptr::null_mut() {
-                // Zero the buffer, then set bit 0 (CPU 0).
+                let ncpus = crate::arch::x86_64::apic::cpu_count() as usize;
+                let ncpus = ncpus.max(1); // always at least 1
+                // Zero the buffer, then set one bit per online CPU.
                 unsafe {
                     core::ptr::write_bytes(buf, 0, bufsiz.min(128));
-                    if bufsiz >= 1 { core::ptr::write(buf, 0x01); }
+                    // Set bits 0..ncpus-1 in the cpuset bitmask (little-endian).
+                    // Each byte covers 8 CPUs.  We support up to bufsiz*8 CPUs.
+                    for cpu in 0..ncpus {
+                        let byte_idx = cpu / 8;
+                        let bit_idx  = cpu % 8;
+                        if byte_idx < bufsiz {
+                            let byte_ptr = buf.add(byte_idx);
+                            *byte_ptr |= 1u8 << bit_idx;
+                        }
+                    }
                 }
             }
             0
@@ -1158,10 +1171,50 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         232 => sys_epoll_wait(arg1 as usize, arg2, arg3 as usize, arg4 as i32),
         // 233: epoll_ctl(epfd, op, fd, event_ptr)
         233 => sys_epoll_ctl(arg1 as usize, arg2, arg3 as usize, arg4),
-        // 273: set_robust_list(head, len) — stub
-        273 => 0,
-        // 274: get_robust_list(pid, head_ptr, len_ptr) — stub
-        274 => 0,
+        // 273: set_robust_list(head, len)
+        // Store head pointer + length in the calling thread for later retrieval.
+        // The kernel only uses this during thread death (to mark locked mutexes as
+        // abandoned), which we don't implement, but we must store it so that
+        // get_robust_list returns the same values (glibc consistency check).
+        273 => {
+            let head = arg1;
+            let len  = arg2 as usize;
+            let tid  = crate::proc::current_tid();
+            let mut threads = crate::proc::THREAD_TABLE.lock();
+            if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+                t.robust_list_head = head;
+                t.robust_list_len  = len;
+            }
+            0
+        }
+        // 274: get_robust_list(pid, head_ptr_ptr, len_ptr)
+        // Return the robust-list head pointer and length stored by set_robust_list.
+        // pid == 0 means the calling thread; non-zero means another thread by TID.
+        274 => {
+            let target_tid = if arg1 == 0 {
+                crate::proc::current_tid()
+            } else {
+                arg1
+            };
+            let threads = crate::proc::THREAD_TABLE.lock();
+            if let Some(t) = threads.iter().find(|t| t.tid == target_tid) {
+                let head = t.robust_list_head;
+                let len  = t.robust_list_len;
+                drop(threads);
+                // Write head pointer into *head_ptr (arg2 is **robust_list_head)
+                if arg2 != 0 {
+                    unsafe { core::ptr::write(arg2 as *mut u64, head); }
+                }
+                // Write length into *len_ptr
+                if arg3 != 0 {
+                    unsafe { core::ptr::write(arg3 as *mut usize, len); }
+                }
+                0
+            } else {
+                drop(threads);
+                -3 // ESRCH — no such thread
+            }
+        }
         // 281: epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize)
         //      Same as epoll_wait but with optional signal mask — we ignore the mask.
         281 => sys_epoll_wait(arg1 as usize, arg2, arg3 as usize, arg4 as i32),
@@ -1354,6 +1407,28 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         }
         // 318: getrandom(buf, buflen, flags)
         318 => crate::syscall::sys_getrandom(arg1 as *mut u8, arg2 as usize),
+        // 324: membarrier(cmd, flags, cpu_id)
+        // Used by glibc's rseq fallback path and by jemalloc.
+        // MEMBARRIER_CMD_QUERY (0)             — return supported command bitmask
+        // MEMBARRIER_CMD_GLOBAL (1)            — full system-wide memory barrier
+        // MEMBARRIER_CMD_PRIVATE_EXPEDITED (8) — barrier on current process's threads
+        324 => {
+            // Supported command bitmask reported by QUERY.
+            // Bit 0 = MEMBARRIER_CMD_GLOBAL, bit 3 = MEMBARRIER_CMD_PRIVATE_EXPEDITED.
+            const MEMBARRIER_SUPPORTED: i64 = 0x1 | 0x8;
+            match arg1 as i64 {
+                0 => MEMBARRIER_SUPPORTED, // MEMBARRIER_CMD_QUERY
+                1 | 8 => {
+                    // MEMBARRIER_CMD_GLOBAL or MEMBARRIER_CMD_PRIVATE_EXPEDITED.
+                    // Issue a full memory barrier.  On x86_64 all stores are
+                    // ordered, but mfence + lfence ensures prior stores are visible
+                    // to all CPUs before any subsequent loads.
+                    unsafe { core::arch::asm!("mfence", "lfence", options(nostack, preserves_flags)); }
+                    0
+                }
+                _ => -22, // EINVAL — unknown command
+            }
+        }
         // 334: rseq(rseq, rseq_len, flags, sig)
         334 => -38, // ENOSYS
 
@@ -1729,32 +1804,50 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
             ret
         }
         // 332: statx(dirfd, pathname, flags, mask, statxbuf) — extended stat
+        //
+        // struct statx layout (from linux/stat.h):
+        //   offset  0: stx_mask       u32   — which fields are valid
+        //   offset  4: stx_blksize    u32
+        //   offset  8: stx_attributes u64
+        //   offset 16: stx_nlink      u32
+        //   offset 20: stx_uid        u32
+        //   offset 24: stx_gid        u32
+        //   offset 28: stx_mode       u16
+        //   offset 30: __spare0       u16
+        //   offset 32: stx_ino        u64
+        //   offset 40: stx_size       u64
+        //   offset 48: stx_blocks     u64
+        //   offset 56: stx_attributes_mask u64
         332 => {
-            // Simplified: delegate to stat, then fill statx fields
             let path_bytes = read_cstring_from_user(arg2);
             let path       = match core::str::from_utf8(path_bytes) { Ok(s) => s, Err(_) => return -22 };
             if arg5 == 0 { return -14; } // EFAULT
+            // arg4 = requested mask; we always fill all fields we have.
+            // STATX_BASIC_STATS = 0x7ff covers mode, nlink, uid, gid, ino, size, etc.
+            let _req_mask = arg4 as u32;
             match crate::vfs::stat(path) {
                 Ok(st) => {
                     // struct statx is 256 bytes; zero the whole thing first
-                    unsafe { core::ptr::write_bytes(arg5 as *mut u8, 0, 256); }
-                    let p = arg5 as *mut u32;
+                    let base = arg5 as *mut u8;
+                    unsafe { core::ptr::write_bytes(base, 0, 256); }
                     unsafe {
-                        *p       = 0x7ff; // stx_mask  — all fields valid
-                        *p.add(1) = 4096; // stx_blksize
-                        // stx_nlink at offset 8: u32
-                        *(arg5 as *mut u32).add(2) = 1;
-                        // stx_size at offset 48: u64
-                        *(arg5 as *mut u64).add(6) = st.size;
-                        // stx_mode at offset 20: u16 (type + perm bits)
+                        // stx_mask (offset 0): populate BASIC_STATS fields
+                        core::ptr::write(base.add(0) as *mut u32, 0x7ff_u32);
+                        // stx_blksize (offset 4)
+                        core::ptr::write(base.add(4) as *mut u32, 4096_u32);
+                        // stx_nlink (offset 16)
+                        core::ptr::write(base.add(16) as *mut u32, 1_u32);
+                        // stx_mode (offset 28): file type bits + permission bits
                         let mode: u16 = match st.file_type {
-                            crate::vfs::FileType::Directory   => 0o040_755,
-                            crate::vfs::FileType::SymLink     => 0o120_777,
-                            _                                 => 0o100_644,
+                            crate::vfs::FileType::Directory => 0o040_755,
+                            crate::vfs::FileType::SymLink   => 0o120_777,
+                            _                               => 0o100_644,
                         };
-                        *(arg5 as *mut u16).add(10) = mode;
-                        // stx_ino at offset 32: u64
-                        *(arg5 as *mut u64).add(4) = st.inode;
+                        core::ptr::write(base.add(28) as *mut u16, mode);
+                        // stx_ino (offset 32)
+                        core::ptr::write(base.add(32) as *mut u64, st.inode);
+                        // stx_size (offset 40)
+                        core::ptr::write(base.add(40) as *mut u64, st.size);
                     }
                     0
                 }
