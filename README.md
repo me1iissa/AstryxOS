@@ -7,7 +7,7 @@ A UEFI-native x86_64 research operating system written in Rust, with an NT-inspi
 [![Tests](https://img.shields.io/badge/tests-167%2F171-brightgreen.svg)](#test-suite)
 [![Rust](https://img.shields.io/badge/rust-nightly-orange.svg)](rust-toolchain.toml)
 
-![AstryxOS desktop — Orbit shell, File Explorer, Text Editor, Settings, Calculator and Terminal running on the in-kernel compositor](docs/screenshots/desktop.png)
+![AstryxOS desktop — Orbit shell, File Explorer, Text Editor, Settings, Calculator and Terminal running on the in-kernel compositor](docs/screenshots/desktop-v2.png)
 
 ---
 
