@@ -84,6 +84,11 @@ pub fn wait_for_single_object(
     {
         let mut threads = crate::proc::THREAD_TABLE.lock();
         if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+            // INVARIANT: Release-store ctx_rsp_valid=false BEFORE transitioning to
+            // Blocked.  A peer CPU that wakes this thread between the state write and
+            // the schedule() call must not see ctx_rsp_valid==true and pick up a
+            // stale user-space RSP as the kernel stack pointer.
+            t.ctx_rsp_valid.store(false, core::sync::atomic::Ordering::Release);
             t.state = crate::proc::ThreadState::Blocked;
             t.wake_tick = deadline.unwrap_or(u64::MAX);
         }
@@ -183,6 +188,8 @@ pub fn wait_for_multiple_objects(
             {
                 let mut threads = crate::proc::THREAD_TABLE.lock();
                 if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+                    // INVARIANT: Release-store ctx_rsp_valid=false BEFORE Blocked.
+                    t.ctx_rsp_valid.store(false, core::sync::atomic::Ordering::Release);
                     t.state = crate::proc::ThreadState::Blocked;
                     t.wake_tick = deadline.unwrap_or(u64::MAX);
                 }
@@ -245,6 +252,8 @@ pub fn wait_for_multiple_objects(
                 {
                     let mut threads = crate::proc::THREAD_TABLE.lock();
                     if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+                        // INVARIANT: Release-store ctx_rsp_valid=false BEFORE Blocked.
+                        t.ctx_rsp_valid.store(false, core::sync::atomic::Ordering::Release);
                         t.state = crate::proc::ThreadState::Blocked;
                         t.wake_tick = short_deadline;
                     }
