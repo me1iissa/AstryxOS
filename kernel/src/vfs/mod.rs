@@ -20,6 +20,7 @@ pub mod ntfs;
 pub mod ramfs;
 pub mod tmpfs;
 pub mod procfs;
+pub mod sysfs;
 
 extern crate alloc;
 
@@ -478,6 +479,17 @@ pub fn init() {
         let proc_root = proc_fs.root_inode();
         mount("/proc", Box::new(proc_fs), proc_root);
         crate::serial_println!("[VFS] ProcFs mounted at /proc (dynamic, live kernel state)");
+    }
+
+    // ── /sys — mount SysFs ─────────────────────────────────────────────────
+    // Provides /sys/devices/system/cpu/... used by Firefox and other
+    // Gecko-based applications for CPU topology detection.  Without these
+    // files Firefox calls exit(1) before its event loop starts.
+    {
+        let sys_fs = sysfs::SysFs::new();
+        let sys_root = sys_fs.root_inode();
+        mount("/sys", Box::new(sys_fs), sys_root);
+        crate::serial_println!("[VFS] SysFs mounted at /sys");
     }
 
     crate::serial_println!("[VFS] Initialized with root ramfs, standard directories created");
