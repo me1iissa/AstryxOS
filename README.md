@@ -2,8 +2,9 @@
 
 A UEFI-native x86_64 research operating system written in Rust, with an NT-inspired kernel that runs real Linux ELF binaries.
 
+[![Build](https://github.com/me1iissa/AstryxOS/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/me1iissa/AstryxOS/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-139%2F140-brightgreen.svg)](#test-suite)
+[![Tests](https://img.shields.io/badge/tests-167%2F171-brightgreen.svg)](#test-suite)
 [![Rust](https://img.shields.io/badge/rust-nightly-orange.svg)](rust-toolchain.toml)
 
 ---
