@@ -988,6 +988,11 @@ pub fn run() -> ! {
     total += 1;
     if test_smp_blocking_state_ordering() { passed += 1; }
 
+    // ── Test 169: /proc/self/task/<tid>/stat — glibc start_thread compat ─────
+
+    total += 1;
+    if test_proc_task_stat() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -18241,5 +18246,87 @@ fn test_smp_blocking_state_ordering() -> bool {
 
     test_println!("  all {} workers completed {} sleep/wake cycles each ✓", N_THREADS, ITERS);
     test_pass!("SMP blocking-state ordering (ctx_rsp_valid before Blocked/Sleeping)");
+    true
+}
+
+// ── Test 169: /proc/self/task/<tid>/stat — glibc start_thread compatibility ──
+//
+// glibc's start_thread() (nptl/pthread_create.c) opens
+// /proc/self/task/<tid>/stat to obtain thread-specific scheduler accounting.
+// Before this fix the procfs lookup returned ENOENT because INO_SELF_TASK_DIR
+// and its children were absent from the procfs inode tree.
+//
+// This test verifies:
+//   a) /proc/self/task/ is a readable directory
+//   b) /proc/self/task/<tid>/stat opens successfully
+//   c) The stat content has ≥ 52 whitespace-separated fields (Linux format)
+//   d) Field 1 (pid/tid) is a decimal integer
+fn test_proc_task_stat() -> bool {
+    test_header!("/proc/self/task/<tid>/stat — glibc start_thread compat");
+
+    let pid = crate::proc::current_pid();
+    let tid = crate::proc::current_tid();
+
+    // (a) Open /proc/self/task — must succeed as a directory.
+    let task_dir_fd = match crate::vfs::open(pid, "/proc/self/task", 0) {
+        Ok(fd) => { test_println!("  open(/proc/self/task) → fd {} ✓", fd); fd }
+        Err(e) => {
+            test_fail!("proc_task_stat", "open(/proc/self/task) failed: {:?}", e);
+            return false;
+        }
+    };
+    let _ = crate::vfs::close(pid, task_dir_fd);
+
+    // (b) Open /proc/self/task/<tid>/stat.
+    let stat_path = alloc::format!("/proc/self/task/{}/stat", tid);
+    let stat_fd = match crate::vfs::open(pid, &stat_path, 0) {
+        Ok(fd) => { test_println!("  open({}) → fd {} ✓", stat_path, fd); fd }
+        Err(e) => {
+            test_fail!("proc_task_stat", "open({}) failed: {:?}", stat_path, e);
+            return false;
+        }
+    };
+
+    // (c)+(d) Read content and count fields.
+    let mut buf = [0u8; 512];
+    let n = match crate::vfs::fd_read(pid, stat_fd, buf.as_mut_ptr(), buf.len()) {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = crate::vfs::close(pid, stat_fd);
+            test_fail!("proc_task_stat", "read({}) failed: {:?}", stat_path, e);
+            return false;
+        }
+    };
+    let _ = crate::vfs::close(pid, stat_fd);
+
+    if n == 0 {
+        test_fail!("proc_task_stat", "read returned 0 bytes — empty stat file");
+        return false;
+    }
+
+    let content = core::str::from_utf8(&buf[..n]).unwrap_or("");
+    test_println!("  read {} bytes: {:?}…", n, &content[..content.len().min(60)]);
+
+    // Count whitespace-separated fields.
+    let field_count = content.split_whitespace().count();
+    test_println!("  field count = {} (need ≥ 52)", field_count);
+    if field_count < 52 {
+        test_fail!("proc_task_stat",
+            "only {} fields in stat output (need ≥ 52 for Linux compat)", field_count);
+        return false;
+    }
+
+    // Field 1 must be a decimal integer (the TID).
+    let first_field = content.split_whitespace().next().unwrap_or("");
+    match first_field.parse::<u64>() {
+        Ok(v) => test_println!("  field[1] = {} (TID) ✓", v),
+        Err(_) => {
+            test_fail!("proc_task_stat",
+                "field[1] = {:?} is not a decimal integer", first_field);
+            return false;
+        }
+    }
+
+    test_pass!("/proc/self/task/<tid>/stat — 52 fields, parseable");
     true
 }

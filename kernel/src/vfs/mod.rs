@@ -1284,6 +1284,24 @@ fn proc_target_pid(open_path: &str) -> Option<u64> {
     pid_str.parse::<u64>().ok()
 }
 
+/// If `open_path` matches `/proc/{pid-or-self}/task/<tid>/stat`, return the TID.
+/// Returns `None` for all other paths.
+fn proc_task_tid_from_stat_path(open_path: &str) -> Option<u64> {
+    // Accepted forms:
+    //   /proc/self/task/<tid>/stat
+    //   /proc/<N>/task/<tid>/stat
+    let rest = open_path.strip_prefix("/proc/")?;
+    // Skip the pid-or-self component.
+    let after_pid = rest.splitn(2, '/').nth(1)?;
+    let after_task = after_pid.strip_prefix("task/")?;
+    // after_task = "<tid>/stat"
+    let mut parts = after_task.splitn(2, '/');
+    let tid_str = parts.next()?;
+    let tail    = parts.next()?;
+    if tail != "stat" { return None; }
+    tid_str.parse::<u64>().ok()
+}
+
 /// Open a file for a process, returning the fd number.
 pub fn open(pid: crate::proc::Pid, path: &str, open_flags: u32) -> VfsResult<usize> {
     // C4: redirect /proc/<N>/... to /proc/self/... for inode resolution,
@@ -1521,6 +1539,13 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
                 let content = generate_proc_status(target_pid);
                 return serve_dynamic_read(&content, offset, buf, count, pid, fd_num);
             }
+            // /proc/self/task/<tid>/stat — task-thread stat; field 1 = TID.
+            // Must be checked before the generic "/stat" catch-all below.
+            if let Some(tid) = proc_task_tid_from_stat_path(&open_path) {
+                let target_pid = proc_target_pid(&open_path).unwrap_or(pid);
+                let content = generate_proc_stat_for(tid, target_pid);
+                return serve_dynamic_read(&content, offset, buf, count, pid, fd_num);
+            }
             if open_path == "/proc/self/stat" || open_path.ends_with("/stat") {
                 let target_pid = proc_target_pid(&open_path).unwrap_or(pid);
                 let content = generate_proc_stat(target_pid);
@@ -1645,17 +1670,36 @@ fn generate_proc_status(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
     ).into_bytes()
 }
 
-/// Generate /proc/self/stat content for the process.
+/// Generate /proc/self/stat content for the process (or a task thread).
+///
+/// Linux `/proc/<pid>/stat` (and `/proc/<pid>/task/<tid>/stat`) has 52 fields.
+/// Field 28 (`startstack`) is read by glibc `start_thread` to locate the
+/// thread's stack; returning 0 for it is safe — glibc only uses it for
+/// diagnostics.  The critical requirement is that the file EXISTS and is
+/// parseable (non-empty, correct number of fields so sscanf succeeds).
+///
+/// When `tid` differs from `pid` this is a task-thread stat entry; the first
+/// field should carry the TID, not the PID.
 fn generate_proc_stat(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
-    let ppid = {
+    generate_proc_stat_for(pid, pid)
+}
+
+/// Core stat generator.  `id` is the value placed in field 1 (TID for task
+/// entries, PID for process entries); `pid` is used to look up the process
+/// record (ppid, num_threads).
+fn generate_proc_stat_for(id: u64, pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
+    let (ppid, num_threads) = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         procs.iter().find(|p| p.pid == pid)
-            .map(|p| p.parent_pid)
-            .unwrap_or(0)
+            .map(|p| (p.parent_pid, p.threads.len().max(1) as u64))
+            .unwrap_or((0, 1))
     };
+    // 52 fields matching Linux 5.x /proc/<pid>/stat format.
+    // Fields we can't populate meaningfully are set to 0.
+    // Field 28 (startstack) set to 0 — glibc accepts this.
     alloc::format!(
-        "{} (astryx) R {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 0 65536 0\n",
-        pid, ppid
+        "{id} (astryx) R {ppid} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 20 0 {nthreads} 0 0 65536 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        id = id, ppid = ppid, nthreads = num_threads
     ).into_bytes()
 }
 
