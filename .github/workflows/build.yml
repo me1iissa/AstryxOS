@@ -25,6 +25,7 @@ jobs:
         with:
           toolchain: nightly
           components: rust-src, llvm-tools-preview, rustfmt
+          targets: x86_64-unknown-uefi, x86_64-unknown-none
 
       - name: Cache cargo registry + target
         uses: actions/cache@v4
@@ -37,9 +38,22 @@ jobs:
           restore-keys: |
             cargo-check-${{ runner.os }}-
 
-      - name: cargo check (workspace, default target)
-        run: cargo +nightly check --workspace --all-targets
-        # Failures here usually mean a real syntax/type error, not a kernel-target oddity
+      # Check each package with its correct target. The kernel is a no_std bare-metal
+      # crate that requires -Zbuild-std; checking it against the host target (linux-gnu)
+      # causes a duplicate panic_impl error because std also defines a panic handler.
+      - name: cargo check (astryx-shared)
+        run: cargo +nightly check -p astryx-shared
+
+      - name: cargo check (astryx-boot, UEFI target)
+        run: cargo +nightly check -p astryx-boot --target x86_64-unknown-uefi
+
+      - name: cargo check (astryx-kernel, bare-metal target)
+        run: >
+          cargo +nightly check -p astryx-kernel
+          --target kernel/x86_64-astryx.json
+          -Zbuild-std=core,alloc
+          -Zbuild-std-features=compiler-builtins-mem
+          -Zjson-target-spec
 
       - name: rustfmt (advisory only — won't fail the build)
         run: cargo +nightly fmt --all -- --check || true
@@ -56,6 +70,7 @@ jobs:
         with:
           toolchain: nightly
           components: rust-src, llvm-tools-preview
+          targets: x86_64-unknown-uefi, x86_64-unknown-none
 
       - name: Install build dependencies
         run: |
