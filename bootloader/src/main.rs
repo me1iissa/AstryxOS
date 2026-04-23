@@ -85,7 +85,7 @@ fn efi_main() -> Status {
     // Exit boot services and get final memory map
     // SAFETY: We are intentionally exiting boot services. After this call,
     // no UEFI boot services or runtime printing can be used.
-    let memory_map = unsafe { uefi::boot::exit_boot_services(UefiMemoryType::LOADER_DATA) };
+    let memory_map = unsafe { uefi::boot::exit_boot_services(Some(UefiMemoryType::LOADER_DATA)) };
 
     // Build BootInfo at a fixed location well past the kernel's full image
     // (including .bss which is NOT in the flat binary but occupies memory).
