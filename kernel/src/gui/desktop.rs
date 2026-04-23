@@ -56,7 +56,10 @@ pub fn focus_app(name: &str) {
 }
 
 /// Creates the demo desktop layout: a taskbar pinned to the bottom of the
-/// screen and three overlapped demo windows (File Explorer, Terminal, Settings).
+/// screen and six non-overlapping demo windows laid out in a 3×2 grid
+/// (File Explorer / Text Editor / Settings on the top row, Terminal /
+/// Calculator on the bottom row). Tuned for 1920×1080 so each window's
+/// contents remain legible in a full-desktop screenshot.
 pub fn launch_desktop() {
     // (a) Get screen dimensions from the active desktop.
     let (screen_width, screen_height) =
@@ -76,12 +79,17 @@ pub fn launch_desktop() {
     crate::msg::queue::create_queue(taskbar);
     *TASKBAR_HANDLE.lock() = Some(taskbar);
 
-    // (c) Demo Window 1 — File Explorer
+    // 3×2 grid layout, 1920×1080-tuned, 20 px outer margin.
+    //   Row 1 (y=20):  File Explorer 600×400  |  Text Editor 520×380  |  Settings 450×300
+    //   Row 2 (y=500): Terminal      500×350  |  Calculator   272×310
+    // No window overlaps any other — content of each is fully visible.
+
+    // (c) Demo Window 1 — File Explorer (row 1, col 1)
     let file_explorer: WindowHandle = crate::wm::create_window(
         "Static",
         "File Explorer",
-        100,
-        100,
+        20,
+        20,
         600,
         400,
         WindowStyle::overlapped(),
@@ -90,12 +98,12 @@ pub fn launch_desktop() {
     crate::msg::queue::create_queue(file_explorer);
     *EXPLORER_HANDLE.lock() = Some(file_explorer);
 
-    // (d) Demo Window 2 — Terminal
+    // (d) Demo Window 2 — Terminal (row 2, col 1)
     let terminal: WindowHandle = crate::wm::create_window(
         "Edit",
         "Terminal",
-        300,
-        200,
+        20,
+        500,
         500,
         350,
         WindowStyle::overlapped(),
@@ -104,12 +112,12 @@ pub fn launch_desktop() {
     crate::msg::queue::create_queue(terminal);
     *TERMINAL_HANDLE.lock() = Some(terminal);
 
-    // (e) Demo Window 3 — Settings
+    // (e) Demo Window 3 — Settings (row 1, col 3)
     let settings: WindowHandle = crate::wm::create_window(
         "Static",
         "Settings",
-        500,
-        150,
+        1240,
+        20,
         450,
         300,
         WindowStyle::overlapped(),
@@ -118,12 +126,12 @@ pub fn launch_desktop() {
     crate::msg::queue::create_queue(settings);
     *SETTINGS_HANDLE.lock() = Some(settings);
 
-    // (f) Demo Window 4 — Text Editor
+    // (f) Demo Window 4 — Text Editor (row 1, col 2)
     let editor: WindowHandle = crate::wm::create_window(
         "Edit",
         "Text Editor",
-        150,
-        120,
+        640,
+        20,
         520,
         380,
         WindowStyle::overlapped(),
@@ -132,12 +140,12 @@ pub fn launch_desktop() {
     crate::msg::queue::create_queue(editor);
     *EDITOR_HANDLE.lock() = Some(editor);
 
-    // (g) Demo Window 5 — Calculator
+    // (g) Demo Window 5 — Calculator (row 2, col 2)
     let calculator: WindowHandle = crate::wm::create_window(
         "Static",
         "Calculator",
-        700,
-        180,
+        560,
+        500,
         272,
         310,
         WindowStyle::overlapped(),
