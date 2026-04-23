@@ -215,7 +215,16 @@ AstryxOS/
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the contributor routing page.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the contributor workflow.
+
+For what to work on:
+- Browse the [issue tracker](https://github.com/me1iissa/AstryxOS/issues)
+- Good starting points: [`good first issue`](https://github.com/me1iissa/AstryxOS/labels/good%20first%20issue)
+- AI agents welcome: [`agent-friendly`](https://github.com/me1iissa/AstryxOS/labels/agent-friendly)
+- Community wishlist: [`help wanted`](https://github.com/me1iissa/AstryxOS/labels/help%20wanted)
+
+The [roadmap project](https://github.com/users/me1iissa/projects) shows active waves and backlog.
+
 Human contributors: [HUMAN_CONTRIBUTING.md](HUMAN_CONTRIBUTING.md).
 AI agents: [AI_CONTRIBUTING.md](AI_CONTRIBUTING.md).
 
