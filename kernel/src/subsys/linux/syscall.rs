@@ -2607,10 +2607,10 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
 
     if count == 0 { return 0; }
 
-    #[cfg(feature = "firefox-test")]
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
     if fd == 2 {
         let pid = crate::proc::current_pid();
-        if pid >= 1 {
+        if pid == 28 {
             let slice = unsafe { core::slice::from_raw_parts(buf_ptr, count.min(512)) };
             let s = core::str::from_utf8(slice).unwrap_or("<binary>");
             crate::serial_println!("[FF/stderr] pid={} {:?}", pid, s);
@@ -2671,8 +2671,10 @@ pub fn sys_open_linux(pathname: u64, flags: u64, _mode: u64) -> i64 {
         Err(_) => return -22,
     };
     let pid = crate::proc::current_pid();
-    #[cfg(feature = "firefox-test")]
-    crate::serial_println!("[FF/open] pid={} path={}", pid, path);
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    if pid == 28 {
+        crate::serial_println!("[FF/open] pid={} path={}", pid, path);
+    }
 
     // Refresh /proc/self/maps with dynamic per-process VMA content before opening.
     if path == "/proc/self/maps" {
