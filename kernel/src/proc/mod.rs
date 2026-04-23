@@ -1299,6 +1299,10 @@ pub fn sleep_ticks(ticks: u64) {
     {
         let mut threads = THREAD_TABLE.lock();
         if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+            // INVARIANT: Release-store ctx_rsp_valid=false BEFORE transitioning to
+            // Sleeping.  A peer CPU that wakes this thread (via the scheduler tick)
+            // between the state write and schedule() must not load a stale RSP.
+            t.ctx_rsp_valid.store(false, core::sync::atomic::Ordering::Release);
             t.state = ThreadState::Sleeping;
             t.wake_tick = current_tick + ticks;
         }

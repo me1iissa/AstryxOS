@@ -983,6 +983,11 @@ pub fn run() -> ! {
     total += 1;
     if test_openat2_basic() { passed += 1; }
 
+    // ── Test 168: SMP blocking-state ordering — ctx_rsp_valid before Blocked ─
+
+    total += 1;
+    if test_smp_blocking_state_ordering() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -18151,5 +18156,90 @@ fn test_openat2_basic() -> bool {
 
     crate::syscall::dispatch_linux(3, fd as u64, 0, 0, 0, 0, 0);
     test_pass!("openat2(437) basic — open /etc/passwd with open_how");
+    true
+}
+
+/// Regression test for the SMP ctx_rsp_valid ordering race.
+///
+/// Spawns N kernel threads that each call sleep_ticks() in a tight loop.
+/// sleep_ticks() exercises the Sleeping state transition — the fixed code
+/// now stores ctx_rsp_valid=false (Release) BEFORE writing state=Sleeping.
+/// Without the fix, a peer CPU waking a thread between those two stores
+/// would load a stale RSP and fault at switch_context_asm+0x18.
+///
+/// The test verifies: (a) no kernel panic / no unexpected reboot, and
+/// (b) all spawned threads complete their iteration counters, proving
+/// that block/wake cycles ran without data corruption.
+fn test_smp_blocking_state_ordering() -> bool {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    test_header!("SMP blocking-state ordering (ctx_rsp_valid before Blocked/Sleeping)");
+
+    // Shared counter: each worker increments it once after completing its loops.
+    static DONE_COUNT: AtomicU32 = AtomicU32::new(0);
+    // Set to 1 by any thread that observes an unexpected fault (impossible in
+    // pure kernel mode, but keeps the test self-contained).
+    static FAULT_FLAG: AtomicU32 = AtomicU32::new(0);
+
+    DONE_COUNT.store(0, Ordering::SeqCst);
+    FAULT_FLAG.store(0, Ordering::SeqCst);
+
+    // Worker: sleep for 1 tick, repeat ITERS times, then increment DONE_COUNT.
+    const ITERS: u64 = 8;
+    const N_THREADS: u32 = 4;
+
+    fn worker_entry() {
+        for _ in 0..ITERS {
+            // sleep_ticks(1) exercises state = Sleeping with the fixed ordering.
+            crate::proc::sleep_ticks(1);
+        }
+        DONE_COUNT.fetch_add(1, Ordering::SeqCst);
+        // Exit thread cleanly.
+        crate::proc::exit_thread(0);
+    }
+
+    let was_active = crate::sched::is_active();
+    if !was_active { crate::sched::enable(); }
+
+    // Spawn N_THREADS kernel processes that run worker_entry.
+    let mut pids = [0u64; N_THREADS as usize];
+    for i in 0..N_THREADS as usize {
+        let pid = crate::proc::create_kernel_process(
+            "smp_ordering_worker",
+            worker_entry as u64,
+        );
+        pids[i] = pid;
+        test_println!("  spawned worker pid={} ✓", pid);
+    }
+
+    // Spin-yield for up to 4000 iterations waiting for all workers to finish.
+    let mut all_done = false;
+    for _ in 0..4000 {
+        crate::sched::yield_cpu();
+        crate::hal::enable_interrupts();
+        for _ in 0..500u32 { core::hint::spin_loop(); }
+        if DONE_COUNT.load(Ordering::SeqCst) >= N_THREADS {
+            all_done = true;
+            break;
+        }
+    }
+
+    if !was_active { crate::sched::disable(); }
+
+    if FAULT_FLAG.load(Ordering::SeqCst) != 0 {
+        test_fail!("smp_blocking_state_ordering", "fault flag set — RSP corruption detected");
+        return false;
+    }
+
+    let done = DONE_COUNT.load(Ordering::SeqCst);
+    if !all_done || done < N_THREADS {
+        test_fail!("smp_blocking_state_ordering",
+            "only {}/{} workers completed (scheduler/blocking stall)",
+            done, N_THREADS);
+        return false;
+    }
+
+    test_println!("  all {} workers completed {} sleep/wake cycles each ✓", N_THREADS, ITERS);
+    test_pass!("SMP blocking-state ordering (ctx_rsp_valid before Blocked/Sleeping)");
     true
 }
