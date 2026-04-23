@@ -1,0 +1,83 @@
+name: build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch: {}
+
+# Cancel in-flight runs on the same PR when a new push lands
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-check:
+    name: cargo check (fmt + clippy tolerant)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly (matching rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly
+          components: rust-src, llvm-tools-preview, rustfmt
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-check-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-check-${{ runner.os }}-
+
+      - name: cargo check (workspace, default target)
+        run: cargo +nightly check --workspace --all-targets
+        # Failures here usually mean a real syntax/type error, not a kernel-target oddity
+
+      - name: rustfmt (advisory only — won't fail the build)
+        run: cargo +nightly fmt --all -- --check || true
+
+  kernel-build:
+    name: bootloader + kernel builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly
+          components: rust-src, llvm-tools-preview
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mtools
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: kernel-build-${{ runner.os }}-${{ hashFiles('Cargo.lock','kernel/x86_64-astryx.json') }}
+          restore-keys: |
+            kernel-build-${{ runner.os }}-
+
+      - name: ./build.sh release
+        run: bash build.sh release
+
+      - name: Report build artifacts
+        run: |
+          ls -lh build/ || true
+          echo "Disk image size:"
+          stat -c '%s' build/astryx-os.img 2>/dev/null || echo "(no image built)"

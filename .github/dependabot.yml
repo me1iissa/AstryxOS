@@ -1,0 +1,39 @@
+# AstryxOS Dependabot configuration
+# See https://docs.github.com/en/code-security/dependabot/dependabot-version-updates
+version: 2
+updates:
+  # Cargo dependencies (all workspace members)
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: Europe/London
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "priority/P3"
+    commit-message:
+      prefix: "deps"
+    groups:
+      # Group patch-level bumps together — less PR noise
+      rust-patches:
+        update-types:
+          - patch
+      # Minor-version updates also grouped
+      rust-minors:
+        update-types:
+          - minor
+
+  # GitHub Actions workflow dependencies
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "priority/P3"
+    commit-message:
+      prefix: "ci"
