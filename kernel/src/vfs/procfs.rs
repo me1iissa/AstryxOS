@@ -71,6 +71,7 @@ const INO_SYS_DIR:           u64 = 2030;
 const INO_SYS_VM_DIR:        u64 = 2031;
 const INO_SYS_KERNEL_DIR:    u64 = 2032;
 const INO_SYS_KERNEL_RAND:   u64 = 2033;
+const INO_STAT:              u64 = 2007;
 const INO_OVERCOMMIT:        u64 = 2040;
 const INO_MAX_MAP_COUNT:     u64 = 2041;
 const INO_PID_MAX:           u64 = 2042;
@@ -110,6 +111,7 @@ impl ProcFs {
             | INO_VERSION
             | INO_MOUNTS
             | INO_CMDLINE
+            | INO_STAT
             | INO_SELF_MAPS
             | INO_SELF_STATUS
             | INO_SELF_CMDLINE
@@ -137,6 +139,7 @@ impl ProcFs {
             INO_UPTIME  => Some(generate_uptime()),
             INO_VERSION => Some(generate_version()),
             INO_MOUNTS  => Some(generate_mounts()),
+            INO_STAT    => Some(generate_stat()),
             INO_CMDLINE => Some(b"astryx_kernel root=/dev/ramdisk0 console=fb0\n".to_vec()),
             // /proc/self/maps, /proc/self/status, /proc/self/stat, /proc/self/cmdline
             // are intercepted by fd_read() before fs.read() is called.
@@ -177,6 +180,7 @@ impl FileSystemOps for ProcFs {
             (INO_ROOT, "version")           => Ok(INO_VERSION),
             (INO_ROOT, "mounts")            => Ok(INO_MOUNTS),
             (INO_ROOT, "cmdline")           => Ok(INO_CMDLINE),
+            (INO_ROOT, "stat")              => Ok(INO_STAT),
             (INO_ROOT, "self")              => Ok(INO_SELF_DIR),
             (INO_ROOT, "sys")               => Ok(INO_SYS_DIR),
             // /proc/<numeric-pid> — redirect to self (the VFS open() layer also
@@ -269,6 +273,7 @@ impl FileSystemOps for ProcFs {
                 f!("version",  INO_VERSION),
                 f!("mounts",   INO_MOUNTS),
                 f!("cmdline",  INO_CMDLINE),
+                f!("stat",     INO_STAT),
                 d!("self",     INO_SELF_DIR),
                 d!("sys",      INO_SYS_DIR),
             ],
@@ -588,6 +593,34 @@ fn generate_mounts() -> Vec<u8> {
         out.extend_from_slice(line.as_bytes());
     }
     out
+}
+
+/// Generate `/proc/stat` content.
+///
+/// Firefox's CPU topology detection code reads this to determine the number of
+/// online CPUs (lines starting with "cpu" followed by a digit) and get
+/// aggregate scheduler ticks.  A minimal two-line file (aggregate + cpu0)
+/// satisfies it.
+pub fn generate_stat() -> Vec<u8> {
+    let ticks = crate::arch::x86_64::irq::get_ticks();
+    // Provide plausible user/nice/system/idle values derived from the PIT tick counter.
+    // Fields: user nice system idle iowait irq softirq steal guest guest_nice
+    let user   = ticks / 4;
+    let system = ticks / 8;
+    let idle   = ticks.saturating_sub(user + system);
+    alloc::format!(
+        "cpu  {user} 0 {system} {idle} 0 0 0 0 0 0\n\
+         cpu0 {user} 0 {system} {idle} 0 0 0 0 0 0\n\
+         intr 0\n\
+         ctxt 0\n\
+         btime 1700000000\n\
+         processes 1\n\
+         procs_running 1\n\
+         procs_blocked 0\n",
+        user   = user,
+        system = system,
+        idle   = idle,
+    ).into_bytes()
 }
 
 // ── Legacy shell interface (unchanged) ──────────────────────────────────────
