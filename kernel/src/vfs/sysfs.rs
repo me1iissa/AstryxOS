@@ -114,10 +114,13 @@ impl FileSystemOps for SysFs {
 
     fn stat(&self, inode: u64) -> VfsResult<FileStat> {
         let file_type = Self::file_type_for(inode).ok_or(VfsError::NotFound)?;
-        let size = match file_type {
-            FileType::RegularFile => 4096,
-            _ => 0,
-        };
+        // Real Linux sysfs regular files report `st_size = 0`; userspace
+        // discovers actual content length by reading until EOF. A non-zero
+        // size here makes some readers (e.g. glibc's internal sysfs probes
+        // used by Firefox's mozglue CPU topology detection) allocate a
+        // 4 KiB buffer and treat everything past the short read as padding.
+        let size = 0u64;
+        let _ = file_type; // kept by design — stat semantics don't depend on FileType here
         Ok(FileStat {
             inode,
             file_type,
