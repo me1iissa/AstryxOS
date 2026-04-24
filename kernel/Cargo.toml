@@ -19,7 +19,7 @@ bitmap-title-fallback = []
 
 [dependencies]
 astryx-shared = { path = "../shared" }
-spin = "0.9"
+spin = "0.10"
 
 [profile.dev]
 panic = "abort"
