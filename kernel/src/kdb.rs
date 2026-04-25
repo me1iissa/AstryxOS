@@ -130,8 +130,11 @@ pub fn pump() {
         }
     }
 
-    // Dispatch any session with a full line.
-    let mut to_close: Vec<u16> = Vec::new();
+    // Dispatch any session with a full line.  Identify the responded
+    // connection by its full 4-tuple — closing by `local_port` alone would
+    // FIN whichever TCB on KDB_PORT matches first (typically the listener
+    // itself), permanently disabling kdb after the very first response.
+    let mut to_close: Vec<([u8; 4], u16, u16)> = Vec::new();
     {
         let mut ss = KDB_SESSIONS.lock();
         for s in ss.iter_mut() {
@@ -139,14 +142,18 @@ pub fn pump() {
             if let Some(nl) = s.buf.iter().position(|&b| b == b'\n') {
                 let line = s.buf[..nl].to_vec();
                 let resp = handle_request(&line);
-                let _ = tcp::send_data(s.local_port, resp.as_bytes());
+                let _ = tcp::send_data_to(
+                    s.local_port, s.remote_ip, s.remote_port, resp.as_bytes(),
+                );
                 s.responded = true;
-                to_close.push(s.local_port);
+                to_close.push((s.remote_ip, s.remote_port, s.local_port));
             }
         }
     }
 
-    for p in to_close { let _ = tcp::close(p); }
+    for (rip, rp, lp) in to_close {
+        let _ = tcp::close_connection(lp, rip, rp);
+    }
 
     // Reap sessions whose TCP side has fully closed.
     {
@@ -377,12 +384,20 @@ fn op_proc_list(out: &mut String) {
         None => true, // best-effort: omit per-thread RIPs from the response.
     };
 
-    if thread_table_busy {
-        out.push_str(r#"{"busy":"THREAD_TABLE held","procs":["#);
-    } else {
-        out.push_str(r#"{"procs":["#);
-    }
     let sc_total = crate::syscall::syscall_count();
+    // Emit `syscall_count_total` once at the response root rather than on
+    // every row — it is a global counter, not per-process, and repeating it
+    // on each row was actively misleading.  Per-process syscall counters
+    // would need separate plumbing through dispatch and are out of scope.
+    if thread_table_busy {
+        out.push_str(r#"{"busy":"THREAD_TABLE held",""#);
+    } else {
+        out.push_str(r#"{""#);
+    }
+    out.push_str("syscall_count_total\":");
+    use core::fmt::Write;
+    let _ = write!(out, "{}", sc_total);
+    out.push_str(",\"procs\":[");
 
     for (i, r) in rows.iter().enumerate() {
         if i > 0 { out.push(','); }
@@ -394,7 +409,6 @@ fn op_proc_list(out: &mut String) {
         j_kv(out, "threads", &alloc::format!("{}", r.num_threads));
         let rip = tmap.get(&r.pid).copied().unwrap_or(0);
         j_str(out, "rip"); out.push(':'); j_hex(out, rip); out.push(',');
-        j_kv(out, "syscall_count_total", &alloc::format!("{}", sc_total));
         j_kv(out, "pf_count", "0");
         j_trim_comma(out);
         out.push('}');

@@ -465,6 +465,24 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8]) {
 /// Send data on an established connection.
 /// Respects congestion window; buffers excess in send_buffer.
 pub fn send_data(port: u16, data: &[u8]) -> Result<usize, &'static str> {
+    send_data_inner(port, None, data)
+}
+
+/// Send `data` on the connection identified by the full 4-tuple
+/// `(local_port, remote_ip, remote_port)`.
+///
+/// Matches the connection strictly by tuple instead of by `local_port`
+/// alone — required when several concurrent client sessions share a single
+/// listening port (kdb on TCP/9999 in particular).
+pub fn send_data_to(local_port: u16, remote_ip: Ipv4Address, remote_port: u16,
+                     data: &[u8]) -> Result<usize, &'static str>
+{
+    send_data_inner(local_port, Some((remote_ip, remote_port)), data)
+}
+
+fn send_data_inner(port: u16, peer: Option<(Ipv4Address, u16)>, data: &[u8])
+    -> Result<usize, &'static str>
+{
     if data.is_empty() { return Ok(0); }
 
     struct PendingSend {
@@ -476,7 +494,8 @@ pub fn send_data(port: u16, data: &[u8]) -> Result<usize, &'static str> {
     {
         let mut conns = TCP_CONNECTIONS.lock();
         let conn = conns.iter_mut()
-            .find(|c| c.local_port == port && c.state == TcpState::Established)
+            .find(|c| c.local_port == port && c.state == TcpState::Established
+                    && peer.map_or(true, |(rip, rp)| c.remote_ip == rip && c.remote_port == rp))
             .ok_or("no established connection on port")?;
 
         let ticks = crate::arch::x86_64::irq::get_ticks();
@@ -848,6 +867,40 @@ pub fn close(port: u16) -> Result<(), &'static str> {
                     rip: conn.remote_ip, rp: conn.remote_port,
                     sn: conn.send_next, rn: conn.recv_next,
                     was_close_wait: was_cw }
+    };
+    send_flags(info.lip, info.lp, info.rip, info.rp, info.sn, info.rn, FIN | ACK);
+    Ok(())
+}
+
+/// Close a specific connection identified by the full 4-tuple.
+///
+/// Used by services that share a single listening port across multiple
+/// concurrent client sessions (e.g. kdb on TCP/9999): closing by `port`
+/// alone matches the first established/close-wait TCB on that port and
+/// would FIN the listener or a sibling session, not the responded one.
+/// This variant matches strictly on `(local_port, remote_ip, remote_port)`
+/// so the caller closes exactly the session it serviced.
+pub fn close_connection(local_port: u16, remote_ip: Ipv4Address, remote_port: u16)
+    -> Result<(), &'static str>
+{
+    struct CloseInfo {
+        lip: Ipv4Address, lp: u16,
+        rip: Ipv4Address, rp: u16,
+        sn: u32, rn: u32,
+    }
+    let info = {
+        let mut conns = TCP_CONNECTIONS.lock();
+        let conn = conns.iter_mut()
+            .find(|c| c.local_port == local_port
+                   && c.remote_ip == remote_ip
+                   && c.remote_port == remote_port
+                   && matches!(c.state, TcpState::Established | TcpState::CloseWait))
+            .ok_or("no connection to close")?;
+        let was_cw = conn.state == TcpState::CloseWait;
+        conn.state = if was_cw { TcpState::LastAck } else { TcpState::FinWait1 };
+        CloseInfo { lip: conn.local_ip, lp: conn.local_port,
+                    rip: conn.remote_ip, rp: conn.remote_port,
+                    sn: conn.send_next, rn: conn.recv_next }
     };
     send_flags(info.lip, info.lp, info.rip, info.rp, info.sn, info.rn, FIN | ACK);
     Ok(())
