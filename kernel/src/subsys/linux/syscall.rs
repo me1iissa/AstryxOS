@@ -490,7 +490,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
             {
                 let pid = crate::proc::current_pid();
-                if pid == 1 || pid == 28 {
+                if pid == 1 || crate::syscall::ring::is_tracked(pid) {
                     crate::serial_println!("[FF/dup2] pid={} old={} new={} ret={}", pid, arg1, arg2, ret);
                 }
             }
@@ -2000,7 +2000,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
             {
                 let pid = crate::proc::current_pid();
-                if pid == 1 || pid == 28 {
+                if pid == 1 || crate::syscall::ring::is_tracked(pid) {
                     crate::serial_println!("[FF/dup2] pid={} old={} new={} flags={:#x} ret={} (dup3)", pid, arg1, arg2, arg3, ret);
                 }
             }
@@ -2201,6 +2201,13 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         201 => {
             let wall_secs: i64 = crate::drivers::rtc::read_unix_time() as i64;
             if arg1 != 0 {
+                // Validate the user pointer before writing — a userspace
+                // caller passing a kernel address (or any non-writable
+                // user address) must observe EFAULT, not corrupt kernel
+                // memory or trigger a page fault inside the syscall arm.
+                if !crate::syscall::validate_user_ptr(arg1, 8) {
+                    return -14; // EFAULT
+                }
                 let buf = unsafe { core::slice::from_raw_parts_mut(arg1 as *mut u8, 8) };
                 buf.copy_from_slice(&wall_secs.to_le_bytes());
             }
@@ -2700,13 +2707,22 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
                 // Only peek at synthetic filesystems; regular-disk reads are
                 // high-volume and their content is uninteresting for the
                 // decision-making path.
+                // Snapshot the fd's open_path under PROCESS_TABLE, then drop
+                // it explicitly before any ring::* call. The ring uses its own
+                // RINGS lock; mixing the two acquisition orders across the
+                // dispatch table would create an ABBA hazard (RINGS held by
+                // begin() vs PROCESS_TABLE held by mmap dispatch). Keeping
+                // the path snapshot strictly lock-disjoint avoids that hazard
+                // even as future code is added between the two operations.
                 let path = {
                     let procs = crate::proc::PROCESS_TABLE.lock();
-                    procs.iter().find(|p| p.pid == pid)
+                    let p = procs.iter().find(|p| p.pid == pid)
                         .and_then(|p| p.file_descriptors.get(fd as usize))
                         .and_then(|f| f.as_ref())
                         .map(|f| f.open_path.clone())
-                        .unwrap_or_default()
+                        .unwrap_or_default();
+                    drop(procs);
+                    p
                 };
                 if !path.is_empty() && crate::syscall::ring::is_synthetic_path(&path) {
                     // Snapshot up to READ_BYTES (256) into a Vec we can feed
@@ -2765,7 +2781,7 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
     #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
     {
         let pid = crate::proc::current_pid();
-        if pid == 1 || pid == 28 {
+        if pid == 1 || crate::syscall::ring::is_tracked(pid) {
             // Skip ultra-short non-printable bursts (e.g. the 1-byte `\n`
             // ping-pongs some stdio buffers emit) unless clearly human-visible
             // output.  ASCII-printable / whitespace passes through.
@@ -2878,7 +2894,7 @@ pub fn sys_open_linux(pathname: u64, flags: u64, _mode: u64) -> i64 {
     #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
     {
         let pid = crate::proc::current_pid();
-        if pid == 1 || pid == 28 {
+        if pid == 1 || crate::syscall::ring::is_tracked(pid) {
             crate::serial_println!(
                 "[FF/open-ret] pid={} path={} ret={}",
                 pid, path_snapshot, ret,
@@ -2896,7 +2912,7 @@ fn sys_open_linux_inner(pathname: u64, flags: u64, _mode: u64) -> i64 {
     };
     let pid = crate::proc::current_pid();
     #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
-    if pid == 1 || pid == 28 {
+    if pid == 1 || crate::syscall::ring::is_tracked(pid) {
         crate::serial_println!("[FF/open] pid={} path={}", pid, path);
     }
     // Attach the resolved path string to the pending ring entry so the ring
@@ -3917,6 +3933,10 @@ fn sys_openat(dirfd: u64, pathname: u64, flags: u64, mode: u64) -> i64 {
 
     // Get the directory path from the dirfd.
     let pid = crate::proc::current_pid();
+    // Resolve dirfd → directory path under PROCESS_TABLE, then drop the lock
+    // explicitly before any ring::* call. Keeping ring access strictly
+    // disjoint from PROCESS_TABLE prevents an ABBA against any other path
+    // that takes the ring lock first and then a process-table lock.
     let dir_path = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         let proc_entry = match procs.iter().find(|p| p.pid == pid) {
@@ -3924,10 +3944,12 @@ fn sys_openat(dirfd: u64, pathname: u64, flags: u64, mode: u64) -> i64 {
             None => return -3, // ESRCH
         };
         let fd_idx = dirfd as usize;
-        match proc_entry.file_descriptors.get(fd_idx).and_then(|f| f.as_ref()) {
+        let path = match proc_entry.file_descriptors.get(fd_idx).and_then(|f| f.as_ref()) {
             Some(fd) => fd.open_path.clone(),
             None => return -9, // EBADF
-        }
+        };
+        drop(procs);
+        path
     };
 
     // Build full path: dir_path + "/" + rel_path

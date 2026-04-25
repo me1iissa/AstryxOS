@@ -127,7 +127,7 @@ pub fn enable_for(pid: u64) {
 }
 
 /// Return true if `pid` is tracked.
-fn is_tracked(pid: u64) -> bool {
+pub fn is_tracked(pid: u64) -> bool {
     let t = TRACKED.lock();
     t.contains(&pid)
 }
@@ -420,32 +420,38 @@ fn read_user_u64_safe(cr3: u64, va: u64) -> Option<u64> {
     let end = va.checked_add(8)?;
     if end > astryx_shared::KERNEL_VIRT_BASE { return None; }
 
-    // Resolve starting page.
+    // Resolve starting byte (phys0 already includes the in-page offset).
     let phys0 = crate::mm::vmm::virt_to_phys_in(cr3, va)?;
-    // If the 8-byte read crosses a page boundary, require the second page
-    // to also be mapped.  (read_unaligned handles the split transparently
-    // only because PHYS_OFF is a 1:1 linear map of contiguous physical
-    // memory — which it is NOT across arbitrary VA pages.  So we must
-    // bail on cross-page reads rather than risk reading the wrong bytes.)
     let page_off = va & 0xFFF;
     if page_off + 8 > 0x1000 {
+        // The 8-byte read straddles a page boundary.  Resolve the SECOND
+        // page ONCE (rather than per byte) and read the two halves through
+        // PHYS_OFF.  Re-walking the page tables for each of the 8 bytes
+        // costs 8x VMM_LOCK acquisitions on every cross-page user-stack
+        // probe — measurable on the SC-RING-STACK dump path that walks up
+        // to 16 KiB of user stack.
         let va_next = (va & !0xFFF).wrapping_add(0x1000);
-        if crate::mm::vmm::virt_to_phys_in(cr3, va_next).is_none() {
-            return None;
-        }
-        // Read byte-by-byte to avoid reading across non-contiguous physical
-        // pages via a single unaligned load.
+        let phys_next_base = crate::mm::vmm::virt_to_phys_in(cr3, va_next)?;
+        let first_len = (0x1000 - page_off) as usize; // 1..=7 bytes from phys0
         let mut bytes = [0u8; 8];
-        for i in 0..8u64 {
-            let b_va = va + i;
-            let b_phys = crate::mm::vmm::virt_to_phys_in(cr3, b_va)?;
-            bytes[i as usize] = unsafe {
-                core::ptr::read_volatile((PHYS_OFF + b_phys) as *const u8)
-            };
+        unsafe {
+            // First half: bytes from the starting page, contiguous from phys0.
+            for i in 0..first_len {
+                bytes[i] = core::ptr::read_volatile(
+                    (PHYS_OFF + phys0 + i as u64) as *const u8
+                );
+            }
+            // Second half: bytes from the next page, starting at its base.
+            for i in first_len..8 {
+                bytes[i] = core::ptr::read_volatile(
+                    (PHYS_OFF + phys_next_base + (i - first_len) as u64) as *const u8
+                );
+            }
         }
         return Some(u64::from_le_bytes(bytes));
     }
     // Single-page read — straight unaligned read through PHYS_OFF.
+    // phys0 already accounts for the in-page offset of `va`.
     unsafe {
         Some(core::ptr::read_unaligned((PHYS_OFF + phys0) as *const u64))
     }

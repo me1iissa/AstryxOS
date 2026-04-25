@@ -27,6 +27,16 @@ use spin::Mutex;
 #[cfg(feature = "firefox-test")]
 pub mod ring;
 
+/// Stub `ring` module for builds without the firefox-test feature.  Provides
+/// the `is_tracked()` predicate so generic syscall-trace gates can compile
+/// uniformly; always returns false because no PIDs are tracked outside of
+/// the firefox-test diagnostic build.
+#[cfg(not(feature = "firefox-test"))]
+pub mod ring {
+    #[inline]
+    pub fn is_tracked(_pid: u64) -> bool { false }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // User pointer validation
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1460,23 +1470,23 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
         (space.cr3, vma_backing, vma_name, chosen_base)
     };
 
-    // ── Phase 2 — bulk unmap of the prior MAP_FIXED tenants (lock-free). ────
+    // ── Phase 2/3 — install the new VMA atomically with respect to faults. ──
     //
     // POSIX mmap(2) requires MAP_FIXED to silently replace any existing
-    // mappings that overlap [base, base+length).  We must clear the page
-    // table entries first so demand-paging fires for the new VMA on the
-    // next user access; otherwise a stale PTE shadows the new file content.
+    // mappings that overlap [base, base+length).  Before this PR an earlier
+    // version cleared the page-table entries lock-free (Phase 2) and only
+    // afterwards removed the overlapping VMAs under PROCESS_TABLE (Phase 3).
+    // That leaves a window where a concurrent fault on another CPU finds the
+    // OLD VMA still in the list (Phase 3 hasn't run yet) and demand-pages a
+    // fresh anonymous frame into the just-cleared range — which is then
+    // silently shadowed by the new mapping when its first access faults.
     //
-    // PROCESS_TABLE is intentionally NOT held here — the per-process VMA
-    // list isn't consulted, and the page-table edit serialises on VMM_LOCK
-    // (frame freeing on PMM_LOCK).  The single-threaded mmap caller
-    // assumption holds: a process making mmap calls also holds the
-    // logical "address-space writer" role.
-    if is_fixed && !is_noreplace {
-        crate::mm::vmm::unmap_and_free_range_in(cr3, base, length);
-    }
-
-    // ── Phase 3 — finalise the VMA list under PROCESS_TABLE. ─────────────────
+    // Closing the window: hold PROCESS_TABLE while removing the old VMA
+    // records FIRST, then perform the bulk page-table edit, then insert the
+    // new VMA.  A fault arriving after remove_range cannot find an old VMA
+    // and so cannot demand-page; a fault arriving before sees the old
+    // mapping and is satisfied as before.  For the non-MAP_FIXED case we
+    // skip both the remove and the bulk unmap — there is nothing to clear.
     let vma = VmArea {
         base,
         length,
@@ -1505,13 +1515,16 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
         None => return -3,
     };
 
-    // For MAP_FIXED, drop any VMA records that overlap before inserting.
-    // Done here (not in Phase 1) because remove_range mutates the per-process
-    // VMA list and is fast; running it under the lock keeps the list and the
-    // freshly-cleared page tables consistent for any concurrent fault that
-    // arrives between Phase 2 and now.
+    // For MAP_FIXED, atomically clear both the VMA list AND the page tables
+    // for the overlapping range.  Order matters: remove the VMA records
+    // first so a concurrent fault cannot demand-page into the soon-to-be-
+    // cleared range from a stale VMA, then drop the PTEs.  The bulk unmap
+    // serialises on VMM_LOCK and PMM_LOCK; PROCESS_TABLE is held for the
+    // duration but kdb's `proc-list` / `proc <pid>` use try_lock_brief and
+    // emit a `busy` envelope rather than block — see kdb.rs.
     if is_fixed && !is_noreplace {
         let _ = space.remove_range(base, length);
+        crate::mm::vmm::unmap_and_free_range_in(cr3, base, length);
     }
 
     match space.insert_vma(vma) {
@@ -1545,35 +1558,31 @@ pub(crate) fn sys_munmap(addr: u64, length: u64) -> i64 {
     let length = page_align_up(length);
     let pid = crate::proc::current_pid();
 
-    // Phase 1 — capture cr3 under the lock and drop it before the bulk
-    // page-table edit + frame free.  Mirrors sys_mmap's lock discipline so
-    // unmapping a large region (e.g. ld-linux's libxul placeholder during
-    // teardown) doesn't stall every other CPU's page-fault handler or
-    // freeze kdb introspection.
-    let cr3 = {
-        let mut procs = crate::proc::PROCESS_TABLE.lock();
-        let proc = match procs.iter_mut().find(|p| p.pid == pid) {
-            Some(p) => p,
-            None => return -3,
-        };
-        match proc.vm_space.as_ref() {
-            Some(space) => space.cr3,
-            None => return 0, // No address space — nothing to unmap.
-        }
+    // Atomically remove the VMA records AND clear the page tables under
+    // one PROCESS_TABLE acquisition.  Order matters: drop the VMA records
+    // FIRST so a concurrent fault on another CPU cannot find a stale VMA
+    // and demand-page into the range; THEN clear the PTEs and free the
+    // backing frames.  Releasing the lock between the two would leave a
+    // window in which another thread of the same process could mmap into
+    // the freshly-vacated range, only to have its just-installed PTEs
+    // wiped by our bulk-unmap pass.
+    //
+    // Holding PROCESS_TABLE for the duration is acceptable because kdb's
+    // introspection ops use try_lock_brief and emit `busy` envelopes
+    // rather than block (see kdb.rs).
+    let mut procs = crate::proc::PROCESS_TABLE.lock();
+    let proc = match procs.iter_mut().find(|p| p.pid == pid) {
+        Some(p) => p,
+        None => return -3,
     };
-
-    // Phase 2 — clear page tables and drop frame references without locks.
+    let space = match proc.vm_space.as_mut() {
+        Some(s) => s,
+        None => return 0, // No address space — nothing to unmap.
+    };
+    let cr3 = space.cr3;
+    let _ = space.remove_range(addr, length);
     crate::mm::vmm::unmap_and_free_range_in(cr3, addr, length);
-
-    // Phase 3 — drop the VMA records that overlap the unmapped range.
-    {
-        let mut procs = crate::proc::PROCESS_TABLE.lock();
-        if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
-            if let Some(space) = proc.vm_space.as_mut() {
-                let _ = space.remove_range(addr, length);
-            }
-        }
-    }
+    drop(procs);
 
     0
 }
