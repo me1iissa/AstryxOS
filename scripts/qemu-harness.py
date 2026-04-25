@@ -727,7 +727,8 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
                           ovmf_vars_dst: str,
                           gdb_port: int = 0,
                           gdb_wait: bool = False,
-                          kdb_host_port: int = 0) -> subprocess.Popen:
+                          kdb_host_port: int = 0,
+                          kvm: Optional[bool] = None) -> subprocess.Popen:
     """
     Launch QEMU with a per-session serial log and QMP socket.
 
@@ -735,6 +736,8 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
     gdb_wait: if True and gdb_port > 0, adds -S (start frozen, wait for GDB).
     kdb_host_port: if > 0, adds a hostfwd rule forwarding host-port to
         guest 10.0.2.15:9999 for the kdb introspection server.
+    kvm: tri-state. None = autodetect; True = force-enable; False = force-disable
+        (matches CI which has no /dev/kvm — useful for reproducing CI hangs locally).
     """
     wt = _get_watch_test()
     ROOT     = wt.ROOT
@@ -767,6 +770,7 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
         qmp_sock=str(qmp_sock),
         gdb_port=gdb_port if gdb_port and gdb_port > 0 else None,
         gdb_wait=gdb_wait,
+        kvm=kvm,
     )
 
     # Inject the kdb hostfwd rule by patching the `-netdev user,id=net0`
@@ -824,9 +828,17 @@ def cmd_start(args):
         if not ok:
             _err("Build failed")
 
+    kvm_arg: Optional[bool]
+    if getattr(args, "no_kvm", False):
+        kvm_arg = False
+    elif getattr(args, "force_kvm", False):
+        kvm_arg = True
+    else:
+        kvm_arg = None  # autodetect
     proc = _launch_qemu_harness(sid, serial_log, qmp_sock, ovmf_vars,
                                  gdb_port=gdb_port, gdb_wait=gdb_wait,
-                                 kdb_host_port=kdb_host_port)
+                                 kdb_host_port=kdb_host_port,
+                                 kvm=kvm_arg)
 
     session = {
         "sid":        sid,
@@ -2086,6 +2098,13 @@ def main():
                                "GdbClient will back off to PORT+1..PORT+4 on conflict.")
     p_start.add_argument("--gdb-wait", action="store_true",
                           help="Start QEMU frozen (-S); debugger must 'cont' to unfreeze")
+    p_start.add_argument("--no-kvm", dest="no_kvm", action="store_true",
+                          help="Force-disable KVM acceleration. Reproduces CI's "
+                               "TCG-only environment (qemu64 CPU model). Useful "
+                               "when a test hangs only without KVM.")
+    p_start.add_argument("--kvm", dest="force_kvm", action="store_true",
+                          help="Force-enable KVM acceleration. Errors out if "
+                               "/dev/kvm is unavailable.")
 
     # stop
     p_stop = sub.add_parser("stop", help="Kill a QEMU session")

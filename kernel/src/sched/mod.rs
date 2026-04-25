@@ -511,7 +511,16 @@ pub fn schedule() {
     // ctx_valid_ptr: switch_context_asm sets *ctx_valid_ptr = 1 after saving
     // old_rsp, preventing other CPUs from using a stale RSP (SMP race guard).
     // Debug: warn if we're loading a non-higher-half RSP (indicates corruption).
-    if next_rsp != 0 && next_rsp < 0xFFFF_8000_0000_0000 {
+    //
+    // Exception: the BSP idle thread (tid=0) and the AP idle threads
+    // (tid >= 0x1000) intentionally execute on identity-mapped low addresses —
+    // tid=0 keeps the UEFI bootstrap stack (PML4[0] identity map) and AP idle
+    // threads have context.rsp=0 until their first switch.  Both are safe by
+    // construction; emitting a WARN every time the BSP idle is scheduled-back
+    // is just noise and floods the serial log on TCG runners where tests
+    // round-trip through the idle thread frequently.
+    let next_is_idle = next_tid == 0 || next_tid >= 0x1000;
+    if !next_is_idle && next_rsp != 0 && next_rsp < 0xFFFF_8000_0000_0000 {
         crate::serial_println!(
             "[SCHED] WARN cpu={} cur_tid={} → next_tid={} next_rsp={:#x} (NOT higher-half!)",
             cpu, current_tid, next_tid, next_rsp

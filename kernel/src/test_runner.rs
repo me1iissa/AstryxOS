@@ -19267,6 +19267,18 @@ fn test_smp_blocking_state_ordering() -> bool {
     const N_THREADS: u32 = 4;
 
     fn worker_entry() {
+        // A new kernel thread inherits whatever IF state schedule() had at
+        // the moment it context-switched in — and schedule() always CLI's
+        // before switch_context, so the worker starts with IF=0.  The
+        // first call into sleep_ticks() below would normally re-enable IF
+        // on the way out of schedule(), but only after the entire first
+        // sleep cycle has run with IF=0.  On a slow TCG-only CI host that
+        // window can stretch long enough for the per-CPU timer ISR to be
+        // missed for the worker's first wake, manifesting as a 4-WARN
+        // burst followed by 30 s of silence (CI watchdog kill).  Enabling
+        // IF up-front closes that window so the timer ISR fires on every
+        // CPU from the worker's first instruction.
+        crate::hal::enable_interrupts();
         for _ in 0..ITERS {
             // sleep_ticks(1) exercises state = Sleeping with the fixed ordering.
             crate::proc::sleep_ticks(1);
@@ -19291,14 +19303,24 @@ fn test_smp_blocking_state_ordering() -> bool {
     }
 
     // Spin-yield for up to 4000 iterations waiting for all workers to finish.
+    // Emit a periodic progress line so a slow CI host does not get killed by
+    // the harness's idle-output watchdog (default 30 s) while the workers
+    // are still cycling through their sleep_ticks() loop.
     let mut all_done = false;
-    for _ in 0..4000 {
+    for i in 0..4000u32 {
         crate::sched::yield_cpu();
         crate::hal::enable_interrupts();
         for _ in 0..500u32 { core::hint::spin_loop(); }
         if DONE_COUNT.load(Ordering::SeqCst) >= N_THREADS {
             all_done = true;
             break;
+        }
+        // ~Every 256 iterations: emit one heartbeat line.  Cheap, but keeps
+        // the watchdog reset on a TCG-only host where each iteration may
+        // span many real seconds.
+        if i != 0 && i % 256 == 0 {
+            test_println!("  smp_blocking: still waiting (done={}/{}, iter {})",
+                DONE_COUNT.load(Ordering::SeqCst), N_THREADS, i);
         }
     }
 
