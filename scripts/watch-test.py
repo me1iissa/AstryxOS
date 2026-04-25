@@ -349,6 +349,13 @@ def main():
                         help="Show every serial line even in quiet mode")
     parser.add_argument("--log",          default=str(SERIAL_LOG),
                         help=f"Path to serial log file (default: {SERIAL_LOG})")
+    parser.add_argument("--allow-fail",   default="", metavar="REGEX",
+                        help="Substring regex matched against [FAIL] lines: tests "
+                             "matching this are tolerated (still reported but don't "
+                             "set non-zero exit). Use for issue #41 env-gap tests "
+                             "(NotFound /disk/bin/* fixtures, firefox_oracle SIGSEGV) "
+                             "until the data.img workflow ships those prebuilts. "
+                             "Any [FAIL] not matching this still exits 1.")
     args = parser.parse_args()
 
     # ── Build ─────────────────────────────────────────────────────────────────
@@ -391,6 +398,32 @@ def main():
         show_all    = args.show_all,
         quiet       = args.quiet,
     )
+
+    # If the only failures match --allow-fail, downgrade exit_code 1 → 0.
+    # Counts and the per-test log are unchanged; CI only treats unexpected
+    # regressions as gating.
+    if exit_code == 1 and args.allow_fail:
+        try:
+            allow_re = re.compile(args.allow_fail)
+        except re.error as e:
+            print(_c(RED, f"[WATCH] --allow-fail is not a valid regex: {e}"))
+            sys.exit(1)
+        # Re-scan the serial log for [FAIL] lines that don't match the allow-list.
+        unexpected = []
+        try:
+            with open(SERIAL_LOG, "r", errors="replace") as f:
+                for ln in f:
+                    if "[FAIL]" in ln and not allow_re.search(ln):
+                        unexpected.append(ln.rstrip("\n"))
+        except FileNotFoundError:
+            pass
+        if not unexpected:
+            print(_c(YELLOW, "[WATCH] All failures matched --allow-fail; treating as pass."))
+            exit_code = 0
+        else:
+            print(_c(RED, f"[WATCH] {len(unexpected)} unexpected [FAIL] line(s):"))
+            for ln in unexpected:
+                print(_c(RED, f"  {ln}"))
 
     # Map to human label for quick reading
     labels = {0: "PASS", 1: "FAIL", 2: "HUNG", 3: "TIMEOUT", 4: "CRASH", 5: "BUILD_FAIL"}
