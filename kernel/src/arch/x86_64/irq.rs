@@ -19,7 +19,15 @@ static WATCHDOG_COUNTER: [AtomicU32; MAX_CPUS] =
 /// while loading large shared libraries (e.g., Firefox's libxul.so = 194 MB).
 /// The external Python watchdog (tools/qemu-watchdog.py) handles faster
 /// hang detection via serial output monitoring.
-const WATCHDOG_LIMIT: u32 = 12000;
+///
+/// Under the `firefox-test` feature the limit is raised to 10 minutes because
+/// Firefox's NSS / PK11 / ICU / font-cache initialisation performs long
+/// CPU-bound work with no syscalls or page faults, and the shorter production
+/// limit would false-positive during that phase.
+#[cfg(feature = "firefox-test")]
+const WATCHDOG_LIMIT: u32 = 60_000;
+#[cfg(not(feature = "firefox-test"))]
+const WATCHDOG_LIMIT: u32 = 12_000;
 
 /// Reset the watchdog counter for the current CPU.
 /// Called by schedule() after a successful context switch.

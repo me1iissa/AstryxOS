@@ -980,6 +980,158 @@ pub fn is_elf(data: &[u8]) -> bool {
     data.len() >= 4 && data[0..4] == ELF_MAGIC
 }
 
+/// Quick check: is this data a `#!` shebang script?
+pub fn is_shebang(data: &[u8]) -> bool {
+    data.len() >= 2 && data[0] == b'#' && data[1] == b'!'
+}
+
+/// Maximum number of nested shebang layers we will follow before giving up.
+/// Linux uses BINPRM_MAX_RECURSION = 4 (`fs/exec.c`). Matches POSIX intent of
+/// preventing `#!` loops without limiting any legitimate use.
+pub const SHEBANG_MAX_RECURSION: usize = 4;
+
+/// Maximum length of a `#!` first line (excluding the `#!` itself).  Linux
+/// uses BINPRM_BUF_SIZE=256 but historically 127 is the POSIX-portable cap;
+/// we stick with 127 since it covers every real-world interpreter path.
+const SHEBANG_MAX_LINE: usize = 127;
+
+/// Result of resolving a `#!` chain for an exec() call.
+pub struct ShebangResolved {
+    /// The final (interpreter) ELF bytes that should be loaded.
+    pub elf_data: alloc::vec::Vec<u8>,
+    /// The rewritten argv, as owned strings.
+    ///
+    /// Layout for `#!<interp> <opt_arg>` exec'd as `[script, a1, a2]`:
+    ///   `[interp, opt_arg?, script, a1, a2]`
+    pub argv: alloc::vec::Vec<alloc::string::String>,
+    /// The final resolved interpreter path (useful for debug/tracing).
+    pub interp_path: alloc::string::String,
+}
+
+/// Parse a single `#!` line into `(interpreter, optional_arg)`.
+///
+/// The rules we follow (aligned with Linux `fs/binfmt_script.c`):
+///   * Strip the leading `#!`.
+///   * Stop at the first `\n` or after at most `SHEBANG_MAX_LINE` bytes.
+///   * Trim leading whitespace (spaces and tabs).
+///   * The interpreter is everything up to the first whitespace run.
+///   * After the interpreter, skip one whitespace run, then the remainder
+///     (trailing whitespace stripped) is a *single* argument — Linux does NOT
+///     tokenise further, and neither do we. This matches `strace`-observed
+///     behaviour and is what busybox/perl/etc. rely on.
+///
+/// Returns `None` if the interpreter field is empty.
+fn parse_shebang_line(data: &[u8]) -> Option<(alloc::string::String, Option<alloc::string::String>)> {
+    if data.len() < 2 || &data[0..2] != b"#!" {
+        return None;
+    }
+    // Clamp to first newline or SHEBANG_MAX_LINE bytes after the `#!`.
+    let mut end = 2;
+    while end < data.len() && end - 2 < SHEBANG_MAX_LINE {
+        if data[end] == b'\n' { break; }
+        end += 1;
+    }
+    let line = &data[2..end];
+
+    // Skip leading whitespace.
+    let mut i = 0;
+    while i < line.len() && (line[i] == b' ' || line[i] == b'\t') { i += 1; }
+    // Interpreter token: up to next whitespace.
+    let interp_start = i;
+    while i < line.len() && line[i] != b' ' && line[i] != b'\t' { i += 1; }
+    let interp_end = i;
+    if interp_start == interp_end { return None; }
+    let interp = core::str::from_utf8(&line[interp_start..interp_end]).ok()?.into();
+
+    // Skip whitespace between interpreter and optional arg.
+    while i < line.len() && (line[i] == b' ' || line[i] == b'\t') { i += 1; }
+    // The remainder is a single argument. Trim trailing whitespace.
+    let mut j = line.len();
+    while j > i && (line[j - 1] == b' ' || line[j - 1] == b'\t' || line[j - 1] == b'\r') { j -= 1; }
+    let opt_arg = if i < j {
+        Some(core::str::from_utf8(&line[i..j]).ok()?.into())
+    } else {
+        None
+    };
+
+    Some((interp, opt_arg))
+}
+
+/// Resolve a potentially-shebang exec request into a concrete ELF + argv.
+///
+/// Given the file bytes and argv for an `exec(script_path, argv, envp)` call,
+/// if the file starts with `#!` this reads the interpreter, rewrites argv to
+/// `[interp, (opt_arg)?, script_path, argv[1..]]`, and repeats (up to
+/// `SHEBANG_MAX_RECURSION` layers) until an ELF is reached.
+///
+/// On success returns `Ok(ShebangResolved)` whose `elf_data` is an ELF binary.
+/// If the file was already an ELF, returns the same data and the original argv
+/// untouched.
+///
+/// Errors are encoded as negative errno values (ENOEXEC=-8, ELOOP=-40).
+/// VFS errors from reading the interpreter are mapped via
+/// `subsys::linux::errno::vfs_err`.
+pub fn resolve_shebang(
+    script_path: &str,
+    data: alloc::vec::Vec<u8>,
+    argv: &[&str],
+) -> Result<ShebangResolved, i64> {
+    let mut cur_data = data;
+    let mut cur_path: alloc::string::String = script_path.into();
+    // Own the argv so we can rewrite it across recursion layers.
+    let mut cur_argv: alloc::vec::Vec<alloc::string::String> =
+        argv.iter().map(|s| (*s).into()).collect();
+    if cur_argv.is_empty() {
+        cur_argv.push(cur_path.clone());
+    }
+
+    for _depth in 0..SHEBANG_MAX_RECURSION {
+        if is_elf(&cur_data) {
+            return Ok(ShebangResolved {
+                elf_data: cur_data,
+                argv: cur_argv,
+                interp_path: cur_path,
+            });
+        }
+        if !is_shebang(&cur_data) {
+            return Err(-8); // ENOEXEC
+        }
+        let (interp, opt_arg) = match parse_shebang_line(&cur_data) {
+            Some(p) => p,
+            None => return Err(-8), // ENOEXEC — malformed #!
+        };
+
+        // Read the interpreter. Use the same cache path ELF loader uses, so
+        // repeated shebang-dispatched execs of the same interp don't re-hit
+        // the disk (busybox wrappers all point at /bin/busybox).
+        let interp_data = match read_interpreter_cached(&interp) {
+            Ok(d) => d,
+            Err(e) => return Err(crate::subsys::linux::errno::vfs_err(e)),
+        };
+        if interp_data.is_empty() {
+            return Err(-8); // ENOEXEC
+        }
+
+        // Rewrite argv: [interp, opt_arg?, script_path, original[1..]]
+        let tail: alloc::vec::Vec<alloc::string::String> = if cur_argv.len() > 1 {
+            cur_argv[1..].iter().cloned().collect()
+        } else {
+            alloc::vec::Vec::new()
+        };
+        let mut new_argv = alloc::vec::Vec::with_capacity(2 + tail.len());
+        new_argv.push(interp.clone());
+        if let Some(a) = opt_arg { new_argv.push(a); }
+        new_argv.push(cur_path.clone());
+        new_argv.extend(tail);
+
+        cur_data = interp_data;
+        cur_path = interp;
+        cur_argv = new_argv;
+    }
+
+    Err(-40) // ELOOP — too many #! layers
+}
+
 /// Test-only: apply DT_RELR relocations to an in-memory image buffer.
 ///
 /// This version treats the buffer as both the file image AND the runtime image

@@ -1580,6 +1580,15 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
                 let content = procfs::generate_version();
                 return serve_dynamic_read(&content, offset, buf, count, pid, fd_num);
             }
+            // /proc/mounts — must be intercepted here because generate_mounts()
+            // acquires MOUNTS.lock() itself.  Routing through ProcFs::read() (as
+            // the fallthrough below does) would take MOUNTS.lock() first and
+            // then re-enter it in generate_mounts() — a single-thread re-entrant
+            // spin that hangs in the kernel indefinitely.
+            if open_path == "/proc/mounts" {
+                let content = procfs::generate_mounts();
+                return serve_dynamic_read(&content, offset, buf, count, pid, fd_num);
+            }
 
             let mut buffer = unsafe { core::slice::from_raw_parts_mut(buf, count) };
             let n = {

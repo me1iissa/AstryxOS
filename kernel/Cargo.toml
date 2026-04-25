@@ -8,6 +8,14 @@ default = []
 test-mode = []
 gui-test = []
 firefox-test = []
+# Opt-in "soft-pass" network tests that depend on QEMU SLIRP actually
+# delivering ICMP echo replies and forwarding DNS queries.  These tests
+# (Test 5 ping 8.8.8.8, Test 6 DNS, Test 32 IPv6 DNS, Test 33 IPv6 ping)
+# historically passed even when the operation returned no result, which
+# made genuine network-stack regressions invisible in CI.  They are now
+# off by default and only built into the runner when this feature is
+# enabled alongside `test-mode`.  See docs/HARNESS.md.
+network-tests = []
 # Re-enables test 82 (Win32 PE32+ hello_win32.exe). Currently hangs the
 # headless runner — the embedded PE spins in Ring 3 without calling
 # ExitProcess under the current scheduler timing. Off by default.
@@ -16,10 +24,25 @@ win32-pe-test = []
 # using the GDI text engine. Disabled by default; re-enable if the GDI path
 # triggers any rendering issue before it is fully validated.
 bitmap-title-fallback = []
+# Tier-0 syscall tracing. Emits one `[SC] pid=.. tid=.. nr=.. rip=.. a1=.. a2=.. a3=..`
+# line per Linux syscall entry on the serial console. Off by default; enable
+# alongside `firefox-test` when debugging user-mode regressions via
+# `qemu-harness.py grep <sid> '^\[SC\] '`. See docs/HARNESS.md.
+syscall-trace = []
+# Tier-0 page-fault tracing. Emits one `[PF] cr2=.. rip=.. code=.. pid=.. tid=..`
+# line per #PF (before VMA resolution). Pairs with `syscall-trace` to make a
+# full cause-and-effect stream for Ring 3 crashes. See docs/HARNESS.md.
+pf-trace = []
+# Tier-1 in-kernel debugger. Opens a read-only JSON introspection TCP server
+# on port 9999 (proc-list, proc, vfs-mounts, dmesg, syms, mem, trace-status,
+# ping). Driven by `scripts/qemu-harness.py kdb`. Default builds are
+# byte-identical to the pre-kdb artefact; every code path is cfg-gated.
+# See docs/HARNESS.md.
+kdb = []
 
 [dependencies]
 astryx-shared = { path = "../shared" }
-spin = "0.10"
+spin = "0.9"
 
 [profile.dev]
 panic = "abort"

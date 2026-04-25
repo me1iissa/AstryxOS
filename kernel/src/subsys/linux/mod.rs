@@ -34,6 +34,38 @@ pub mod errno;
 /// Extracted from `kernel/src/syscall/mod.rs` in Phase 0.2.
 pub mod syscall;
 
+/// Firefox-test diagnostic ring helpers — tiny shim that holds the "current
+/// syscall's ring-entry index" so sys_read_linux / sys_open_linux can attach
+/// path / read-content context without threading it through every signature.
+#[cfg(feature = "firefox-test")]
+pub mod syscall_ring {
+    use core::sync::atomic::{AtomicI64, Ordering};
+    use crate::arch::x86_64::apic::MAX_CPUS;
+
+    /// Per-CPU "current syscall ring entry".  -1 means "no entry".
+    /// A u64 would wrap harmlessly; i64 lets us store -1 as a sentinel.
+    static CUR: [AtomicI64; MAX_CPUS] = [const { AtomicI64::new(-1) }; MAX_CPUS];
+
+    #[inline]
+    fn cpu() -> usize { crate::arch::x86_64::apic::cpu_index() }
+
+    #[inline]
+    pub fn set_current_entry(idx: Option<usize>) {
+        CUR[cpu()].store(idx.map(|v| v as i64).unwrap_or(-1), Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn clear_current_entry() {
+        CUR[cpu()].store(-1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn current_entry() -> Option<usize> {
+        let v = CUR[cpu()].load(Ordering::Relaxed);
+        if v < 0 { None } else { Some(v as usize) }
+    }
+}
+
 // Re-export the two most-used helpers at the subsystem level so submodules
 // can write `use crate::subsys::linux::{vfs_err, EINVAL};`.
 pub use errno::{vfs_err, EINVAL, ENOENT, EBADF, ENOMEM, EFAULT, ENOSYS,

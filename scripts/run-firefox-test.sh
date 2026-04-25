@@ -80,69 +80,45 @@ if [[ ! -f "${OVMF_CODE}" ]]; then
     OVMF_VARS=""
 fi
 
-OVMF_VARS_COPY=""
+OVMF_VARS_COPY="${BUILD_DIR}/OVMF_VARS_FFTEST.fd"
 if [[ -n "${OVMF_VARS:-}" ]]; then
-    OVMF_VARS_COPY="${BUILD_DIR}/OVMF_VARS_FFTEST.fd"
     cp "${OVMF_VARS}" "${OVMF_VARS_COPY}"
+else
+    # Fallback: combined OVMF.fd — use a copy as writable NVRAM.
+    cp "${OVMF_CODE}" "${OVMF_VARS_COPY}"
 fi
 
 # ── Step 3: QEMU command ─────────────────────────────────────────────────────
 : > "${SERIAL_LOG}"
 
-QEMU_CMD=(
-    qemu-system-x86_64
-    -machine pc
-    -cpu host
-    -m 2G
-    -smp 2
-    -serial "file:${SERIAL_LOG}"
-    -no-reboot
-    -no-shutdown
-
-    # ISA debug-exit for clean automated exit
-    -device isa-debug-exit,iobase=0xf4,iosize=0x04
-)
-
-# Display
-if [[ $SHOW_WINDOW -eq 1 ]]; then
-    QEMU_CMD+=(-vga vmware)
-else
-    QEMU_CMD+=(-vga vmware -display none)
-fi
-
-# UEFI firmware
-if [[ -n "${OVMF_VARS_COPY:-}" ]]; then
-    QEMU_CMD+=(
-        -drive "if=pflash,format=raw,readonly=on,file=${OVMF_CODE}"
-        -drive "if=pflash,format=raw,file=${OVMF_VARS_COPY}"
-    )
-else
-    QEMU_CMD+=(-bios "${OVMF_CODE}")
-fi
-
-# Boot disk
-QEMU_CMD+=(-drive "format=raw,file=fat:rw:${BUILD_DIR}/esp")
-
-# Data disk (with Firefox)
 DATA_IMG="${BUILD_DIR}/data.img"
-if [[ -f "${DATA_IMG}" ]]; then
-    QEMU_CMD+=(
-        -drive "file=${DATA_IMG},format=raw,if=none,id=data0,snapshot=on"
-        -device "ide-hd,drive=data0,bus=ide.1"
-    )
-else
+if [[ ! -f "${DATA_IMG}" ]]; then
     echo -e "${RED}ERROR: No data disk at ${DATA_IMG} — Firefox won't be found.${NC}"
     exit 1
 fi
 
-# KVM
-[[ -r /dev/kvm ]] && QEMU_CMD+=(-enable-kvm)
+WINDOW_FLAG=()
+[[ $SHOW_WINDOW -eq 1 ]] && WINDOW_FLAG+=("--window")
 
-# Network
-QEMU_CMD+=(
-    -device e1000,netdev=net0
-    -netdev user,id=net0
-)
+KVM_FLAG=(--no-kvm)
+[[ -r /dev/kvm ]] && KVM_FLAG=(--kvm)
+
+# Canonical QEMU argv — one source of truth in scripts/astryx_qemu.py.
+# The `firefox-test` mode bakes in the 2 GiB memory and `-cpu host`
+# that Firefox needs. Previously this script had its own inline argv
+# which drifted from the test / gui-test builders (audit MED-2/3/5);
+# the canonical builder kills that drift. Data disk bus is now
+# virtio-blk-pci (was ide-hd here) — tests against the recently
+# regression-hunted virtio path (commit f0e1835).
+readarray -t QEMU_CMD < <(python3 "${ROOT_DIR}/scripts/astryx_qemu.py" build \
+    --mode firefox-test \
+    --serial-path "${SERIAL_LOG}" \
+    --data-img    "${DATA_IMG}" \
+    --ovmf-code   "${OVMF_CODE}" \
+    --ovmf-vars   "${OVMF_VARS_COPY}" \
+    --esp-dir     "${BUILD_DIR}/esp" \
+    "${WINDOW_FLAG[@]}" \
+    "${KVM_FLAG[@]}")
 
 # ── Step 4: Run QEMU ─────────────────────────────────────────────────────────
 echo -e "${CYAN}[FFTEST] Launching QEMU (firefox-test mode)...${NC}"
@@ -190,7 +166,7 @@ check() {
 
 check "kernel_init"   "X11 server ready"               "\[FFTEST\] X11 server ready"
 check "desktop_ready" "Desktop launched"               "\[WM\] Created window.*Terminal"
-check "ff_launched"   "Firefox launch initiated"       "Launching /disk/lib/firefox/firefox-bin"
+check "ff_launched"   "Firefox launch initiated"       "Launching /disk/opt/firefox/firefox-bin"
 check "ff_done"       "FFTEST DONE marker received"    "\[FFTEST\] DONE"
 
 # Look for common crash/error patterns

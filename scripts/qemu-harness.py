@@ -21,6 +21,8 @@ Tier 1 — session management:
     python3 scripts/qemu-harness.py status <sid>
     python3 scripts/qemu-harness.py events <sid> [--tail N] [--follow]
     python3 scripts/qemu-harness.py snap <sid> save|load <name>
+    python3 scripts/qemu-harness.py prune [--ttl DAYS]
+    python3 scripts/qemu-harness.py results <sid>
 
 Tier 2 — GDB stub integration (requires --gdb-port on start):
     python3 scripts/qemu-harness.py regs <sid>
@@ -48,6 +50,12 @@ import time
 import uuid
 from pathlib import Path
 from typing import Optional
+
+# Canonical QEMU argv builder — one source of truth across all launchers.
+# astryx_qemu.py lives next to this file; make it importable whether we're
+# invoked from the scripts/ dir or elsewhere.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import astryx_qemu  # noqa: E402
 
 # ── Tier 2: GDB Remote Serial Protocol client ────────────────────────────────
 #
@@ -659,61 +667,58 @@ def _watcher_thread(sid: str, serial_log: str, qmp_sock: str, pid: int):
 # ── Build helper (shared with watch-test.py) ──────────────────────────────────
 
 def _build(features: str) -> bool:
-    """Build the kernel using the same logic as watch-test.py."""
+    """
+    Build the kernel, passing `features` to cargo VERBATIM.
+
+    Empty string → no --features flag (default desktop kernel).
+    Nothing is injected silently — callers that want the test-runner
+    path must pass "test-mode" themselves.
+    """
     wt = _get_watch_test()
-    # watch-test's build_kernel always uses 'test-mode'.
-    # If caller passes extra features we need to do the build ourselves.
-    if features and features != "test-mode":
-        # features is a comma-separated string; build directly
-        ROOT = wt.ROOT
-        KERNEL_TARGET = wt.KERNEL_TARGET
-        BOOT_EFI_SRC = wt.BOOT_EFI_SRC
-        BOOT_EFI_DST = wt.BOOT_EFI_DST
-        KERNEL_ELF   = wt.KERNEL_ELF
-        KERNEL_BIN   = wt.KERNEL_BIN
+    ROOT = wt.ROOT
+    KERNEL_TARGET = wt.KERNEL_TARGET
+    BOOT_EFI_SRC = wt.BOOT_EFI_SRC
+    BOOT_EFI_DST = wt.BOOT_EFI_DST
+    KERNEL_ELF   = wt.KERNEL_ELF
+    KERNEL_BIN   = wt.KERNEL_BIN
 
-        r1 = subprocess.run(
-            ["cargo", "+nightly", "build",
-             "--package", "astryx-boot",
-             "--target", "x86_64-unknown-uefi",
-             "--profile", "release"],
-            cwd=ROOT
-        )
-        if r1.returncode != 0:
-            return False
+    r1 = subprocess.run(
+        ["cargo", "+nightly", "build",
+         "--package", "astryx-boot",
+         "--target", "x86_64-unknown-uefi",
+         "--profile", "release"],
+        cwd=ROOT
+    )
+    if r1.returncode != 0:
+        return False
 
-        feature_list = features if "test-mode" in features else f"test-mode,{features}"
-        r2 = subprocess.run(
-            ["cargo", "+nightly", "build",
-             "--package", "astryx-kernel",
-             f"--target={KERNEL_TARGET}",
-             "--profile", "release",
-             "--features", feature_list,
-             "-Zbuild-std=core,alloc",
-             "-Zbuild-std-features=compiler-builtins-mem",
-             "-Zjson-target-spec"],
-            cwd=ROOT
-        )
-        if r2.returncode != 0:
-            return False
+    kernel_cmd = ["cargo", "+nightly", "build",
+                  "--package", "astryx-kernel",
+                  f"--target={KERNEL_TARGET}",
+                  "--profile", "release"]
+    if features:
+        kernel_cmd += ["--features", features]
+    kernel_cmd += ["-Zbuild-std=core,alloc",
+                   "-Zbuild-std-features=compiler-builtins-mem",
+                   "-Zjson-target-spec"]
+    r2 = subprocess.run(kernel_cmd, cwd=ROOT)
+    if r2.returncode != 0:
+        return False
 
-        BOOT_EFI_DST.parent.mkdir(parents=True, exist_ok=True)
-        KERNEL_BIN.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy(BOOT_EFI_SRC, BOOT_EFI_DST)
+    BOOT_EFI_DST.parent.mkdir(parents=True, exist_ok=True)
+    KERNEL_BIN.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(BOOT_EFI_SRC, BOOT_EFI_DST)
 
-        sysroot = subprocess.check_output(
-            ["rustc", "+nightly", "--print", "sysroot"],
-            text=True, cwd=ROOT
-        ).strip()
-        objcopy = next(Path(sysroot).rglob("llvm-objcopy"), None) or shutil.which("llvm-objcopy")
-        if not objcopy:
-            return False
-        r3 = subprocess.run([str(objcopy), "-O", "binary",
-                             str(KERNEL_ELF), str(KERNEL_BIN)], cwd=ROOT)
-        return r3.returncode == 0
-
-    # Default path: delegate to watch-test's build_kernel()
-    return wt.build_kernel()
+    sysroot = subprocess.check_output(
+        ["rustc", "+nightly", "--print", "sysroot"],
+        text=True, cwd=ROOT
+    ).strip()
+    objcopy = next(Path(sysroot).rglob("llvm-objcopy"), None) or shutil.which("llvm-objcopy")
+    if not objcopy:
+        return False
+    r3 = subprocess.run([str(objcopy), "-O", "binary",
+                         str(KERNEL_ELF), str(KERNEL_BIN)], cwd=ROOT)
+    return r3.returncode == 0
 
 
 # ── QEMU launch (harness variant) ────────────────────────────────────────────
@@ -721,12 +726,15 @@ def _build(features: str) -> bool:
 def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
                           ovmf_vars_dst: str,
                           gdb_port: int = 0,
-                          gdb_wait: bool = False) -> subprocess.Popen:
+                          gdb_wait: bool = False,
+                          kdb_host_port: int = 0) -> subprocess.Popen:
     """
     Launch QEMU with a per-session serial log and QMP socket.
 
     gdb_port: if > 0, adds -gdb tcp::PORT to the QEMU command line.
     gdb_wait: if True and gdb_port > 0, adds -S (start frozen, wait for GDB).
+    kdb_host_port: if > 0, adds a hostfwd rule forwarding host-port to
+        guest 10.0.2.15:9999 for the kdb introspection server.
     """
     wt = _get_watch_test()
     ROOT     = wt.ROOT
@@ -743,48 +751,32 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
     Path(serial_log).parent.mkdir(parents=True, exist_ok=True)
     Path(serial_log).write_text("")
 
-    cmd = [
-        "qemu-system-x86_64",
-        "-machine", "pc",
-        "-cpu", "qemu64,+rdtscp",
-        "-m", "1G",
-        "-smp", "2",
-        # Serial: per-session log file + a pty for send command
-        "-chardev", f"file,id=ser0,path={serial_log},append=off",
-        "-serial", "chardev:ser0",
-        "-no-reboot", "-no-shutdown",
-        "-display", "none",
-        # ISA debug-exit (same as run-test.sh)
-        "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
-        # QMP socket for agent control
-        "-qmp", f"unix:{qmp_sock},server,nowait",
-        # UEFI firmware
-        "-drive", f"if=pflash,format=raw,readonly=on,file={OVMF_CODE}",
-        "-drive", f"if=pflash,format=raw,file={ovmf_vars_dst}",
-        # Boot disk
-        "-drive", f"format=raw,file=fat:rw:{ESP_DIR}",
-        # Network
-        "-device", "e1000,netdev=net0",
-        "-netdev", "user,id=net0",
-    ]
+    # Canonical argv — see scripts/astryx_qemu.py for the single source of
+    # truth. We ask for the `test` mode (1 GiB, CPU model chosen by host
+    # KVM availability, virtio-blk-pci data disk) plus a QMP socket and
+    # optional GDB stub. All launchers must go through this builder so
+    # divergence like audit MED-2/3 cannot recreep back in.
+    cmd = astryx_qemu.build_qemu_cmd(
+        kernel_path="",
+        data_img=str(DATA_IMG),
+        serial_path=str(serial_log),
+        mode="test",
+        ovmf_code=str(OVMF_CODE),
+        ovmf_vars=str(ovmf_vars_dst),
+        esp_dir=str(ESP_DIR),
+        qmp_sock=str(qmp_sock),
+        gdb_port=gdb_port if gdb_port and gdb_port > 0 else None,
+        gdb_wait=gdb_wait,
+    )
 
-    if DATA_IMG.exists():
-        cmd += [
-            "-drive", f"file={DATA_IMG},format=raw,if=none,id=data0,snapshot=on",
-            "-device", "virtio-blk-pci,drive=data0",
-        ]
-
-    if os.path.exists("/dev/kvm") and os.access("/dev/kvm", os.R_OK):
-        cmd += ["-enable-kvm"]
-
-    # GDB stub (Tier 2) — attach QEMU's built-in GDB server on a TCP port.
-    # Port conflict policy: if the caller's port is busy, GdbClient.connect()
-    # will back off to port+1 .. port+4 automatically.
-    if gdb_port > 0:
-        cmd += ["-gdb", f"tcp::{gdb_port}"]
-        if gdb_wait:
-            # Start frozen; the debugger must `continue` to unfreeze.
-            cmd += ["-S"]
+    # Inject the kdb hostfwd rule by patching the `-netdev user,id=net0`
+    # entry in-place.  Done here (rather than in `astryx_qemu.py`) to keep
+    # the kdb feature self-contained — `build_qemu_cmd` stays unchanged.
+    if kdb_host_port and kdb_host_port > 0:
+        for i, arg in enumerate(cmd):
+            if arg == "-netdev" and i + 1 < len(cmd) and cmd[i + 1].startswith("user,id=net0"):
+                cmd[i + 1] = cmd[i + 1] + f",hostfwd=tcp:127.0.0.1:{kdb_host_port}-:9999"
+                break
 
     proc = subprocess.Popen(
         cmd,
@@ -809,6 +801,17 @@ def cmd_start(args):
     gdb_port = getattr(args, "gdb_port", 0) or 0
     gdb_wait = getattr(args, "gdb_wait", False)
 
+    # Derive a per-session kdb host port when --features includes `kdb`.
+    # We hash the sid into the 9990..10989 range — 1000 slots, collision
+    # resolved by a linear-probe in the derivation itself (not bindable
+    # ports are just forwarded; only the SLIRP side binds inside QEMU).
+    features_str = (args.features or "")
+    kdb_host_port = 0
+    if "kdb" in [f.strip() for f in features_str.split(",")]:
+        # Derive deterministically from sid so reruns are stable and two
+        # concurrent sessions almost certainly land on distinct ports.
+        kdb_host_port = 9990 + (int(sid, 16) % 1000)
+
     # Build unless --no-build.
     # Redirect all build output to stderr so stdout stays JSON-only.
     if not args.no_build:
@@ -822,7 +825,8 @@ def cmd_start(args):
             _err("Build failed")
 
     proc = _launch_qemu_harness(sid, serial_log, qmp_sock, ovmf_vars,
-                                 gdb_port=gdb_port, gdb_wait=gdb_wait)
+                                 gdb_port=gdb_port, gdb_wait=gdb_wait,
+                                 kdb_host_port=kdb_host_port)
 
     session = {
         "sid":        sid,
@@ -831,9 +835,10 @@ def cmd_start(args):
         "qmp_sock":   qmp_sock,
         "ovmf_vars":  ovmf_vars,
         "started_at": time.time(),
-        "features":   args.features or "test-mode",
+        "features":   args.features or "",
         "gdb_port":   gdb_port,
         "gdb_wait":   gdb_wait,
+        "kdb_host_port": kdb_host_port,
         "breakpoints": [],
     }
     _save_session(session)
@@ -852,7 +857,7 @@ def cmd_start(args):
     _save_session(session)
 
     _out({"sid": sid, "pid": proc.pid, "serial_log": serial_log,
-          "gdb_port": gdb_port})
+          "gdb_port": gdb_port, "kdb_host_port": kdb_host_port})
 
 
 def cmd_stop(args):
@@ -1021,46 +1026,158 @@ def cmd_send(args):
 
 
 def cmd_tail(args):
+    """
+    Return the last N bytes of the serial log without materialising the full
+    file. Serial logs can grow into the multi-MB range during a long run; a
+    naive `readlines()` then slice allocates the whole file. Instead we seek
+    to `max(0, size - window)` (the window is `max_bytes` with a small
+    multiplier so `--since LINE` has enough context to bite) and stream
+    forward, splitting on `\n` as we go.
+    """
     sess = _load_session(args.sid)
     serial_log = sess["serial_log"]
     max_bytes  = args.bytes
     since_line = args.since
 
+    path = Path(serial_log)
     try:
-        with Path(serial_log).open("r", errors="replace") as fh:
-            lines = fh.readlines()
+        total_size = path.stat().st_size
     except OSError:
-        _out({"lines": [], "total_lines": 0})
+        _out({"lines": [], "total_lines": 0, "returned": 0})
         return
 
-    total = len(lines)
+    # If `--since LINE` is set, we need to count lines from the start of
+    # the file (there is no cheap way to map a line number to a byte
+    # offset without a persistent index). We stream the file in 64 KiB
+    # chunks and split on newlines, keeping only a rolling window of the
+    # most recent lines — bounded by both the line count (post-`since`)
+    # and the byte budget.
+    result_lines = []
+    total_lines  = 0
+    # Byte budget for the "keep the tail" window. When `--since` is set
+    # we may need to keep many lines, so we don't cap by bytes in that
+    # branch; without `--since`, the byte cap bounds memory directly.
+    CHUNK = 64 * 1024
 
-    if since_line is not None:
-        lines = lines[since_line:]
+    try:
+        if since_line is None:
+            # Pure tail path — seek backwards to an offset that is
+            # guaranteed to cover `max_bytes` worth of data, then
+            # forward-stream from there. This avoids reading byte 0.
+            seek_to = max(0, total_size - max_bytes * 2 - CHUNK)
+            with path.open("rb") as fh:
+                # Count total newlines with a forward scan that never
+                # holds more than CHUNK bytes in memory. We do this in
+                # a single streaming pass from byte 0 to EOF.
+                fh.seek(0)
+                while True:
+                    chunk = fh.read(CHUNK)
+                    if not chunk:
+                        break
+                    total_lines += chunk.count(b"\n")
+                # Now stream from seek_to onwards for the actual tail window.
+                fh.seek(seek_to)
+                remainder = fh.read()  # bounded by max_bytes * 2 + CHUNK
+                # If we seeked past byte 0, the first (possibly partial)
+                # line is incomplete. Drop it so we only emit whole lines.
+                if seek_to > 0:
+                    nl = remainder.find(b"\n")
+                    if nl >= 0:
+                        remainder = remainder[nl+1:]
+            text_lines = remainder.decode("utf-8", errors="replace").splitlines()
+        else:
+            # --since LINE: stream the whole file once, keep lines >= since_line.
+            text_lines = []
+            with path.open("rb") as fh:
+                buf = b""
+                while True:
+                    chunk = fh.read(CHUNK)
+                    if not chunk:
+                        if buf:
+                            total_lines += 1
+                            if total_lines - 1 >= since_line:
+                                text_lines.append(buf.decode("utf-8", errors="replace"))
+                        break
+                    buf += chunk
+                    while True:
+                        nl = buf.find(b"\n")
+                        if nl < 0:
+                            break
+                        line = buf[:nl]
+                        buf = buf[nl+1:]
+                        total_lines += 1
+                        if total_lines - 1 >= since_line:
+                            text_lines.append(line.decode("utf-8", errors="replace"))
+    except OSError:
+        _out({"lines": [], "total_lines": 0, "returned": 0})
+        return
 
-    # Apply byte cap
+    # Apply the byte cap from the back.
     result = []
     acc = 0
-    for ln in reversed(lines):
-        enc = ln.encode("utf-8", errors="replace")
-        if acc + len(enc) > max_bytes:
+    for ln in reversed(text_lines):
+        enc_len = len(ln.encode("utf-8", errors="replace")) + 1  # + newline
+        if acc + enc_len > max_bytes:
             break
-        result.append(ln.rstrip("\n"))
-        acc += len(enc)
+        result.append(ln)
+        acc += enc_len
     result.reverse()
 
     _out({
-        "lines":      result,
-        "total_lines": total,
-        "returned":   len(result),
+        "lines":       result,
+        "total_lines": total_lines,
+        "returned":    len(result),
     })
+
+
+def _classify_exit_cause(serial_log: str, running: bool) -> str:
+    """
+    Walk the serial log tail and classify why (or whether) QEMU stopped.
+
+    Priority — first match wins:
+      1. `BUGCHECK 0xNNNN` → `bugcheck:0xNNNN`
+      2. `SCHEDULER_DEADLOCK` → `scheduler_deadlock`
+      3. `PANIC:` / `panicked at` → `panic`
+      4. `[FFTEST] DONE` → `firefox_exited_clean`
+      5. `[FFTEST] Firefox exited after N ticks` → `firefox_exited:ticks=N`
+      6. Still running (process alive) → `running`
+      7. Nothing of the above → `unknown_exit`
+
+    We read only the last ~256 KiB of the log; the causal marker is always
+    near the end. Reading from the tail keeps latency O(1) regardless of
+    log size.
+    """
+    if running:
+        return "running"
+    try:
+        with Path(serial_log).open("rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 256 * 1024), 0)
+            tail = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return "unknown_exit"
+
+    m = re.search(r"BUGCHECK\s+0x([0-9a-fA-F]+)", tail)
+    if m:
+        return f"bugcheck:0x{m.group(1).lower()}"
+    if re.search(r"SCHEDULER_DEADLOCK", tail):
+        return "scheduler_deadlock"
+    if re.search(r"PANIC:|panicked at", tail):
+        return "panic"
+    if re.search(r"\[FFTEST\]\s+DONE", tail):
+        return "firefox_exited_clean"
+    m = re.search(r"\[FFTEST\]\s+Firefox exited after\s+(\d+)\s+ticks", tail)
+    if m:
+        return f"firefox_exited:ticks={m.group(1)}"
+    return "unknown_exit"
 
 
 def cmd_status(args):
     sid = args.sid
     p   = _session_path(sid)
     if not p.exists():
-        _out({"running": False, "sid": sid})
+        _out({"running": False, "sid": sid, "exit_cause": "no_session"})
         return
     sess = _load_session(sid)
     pid  = sess.get("pid", 0)
@@ -1076,6 +1193,8 @@ def cmd_status(args):
     if sess.get("started_at"):
         uptime = time.time() - sess["started_at"]
 
+    exit_cause = _classify_exit_cause(sess["serial_log"], alive)
+
     _out({
         "running":         alive,
         "sid":             sid,
@@ -1083,6 +1202,7 @@ def cmd_status(args):
         "serial_log_size": serial_size,
         "uptime_s":        round(uptime, 1),
         "features":        sess.get("features"),
+        "exit_cause":      exit_cause,
     })
 
 
@@ -1120,25 +1240,59 @@ def cmd_events(args):
 
 
 def _follow_events(ep: Path):
-    """Tail an events file indefinitely, printing each new line as JSON."""
-    pos = ep.stat().st_size if ep.exists() else 0
+    """
+    Tail an events file indefinitely, printing each new line as JSON.
+
+    Uses `select.select` on the underlying file descriptor for zero-latency
+    wake-up when new data arrives, with a 5-second periodic fallback so we
+    still notice rotations or unlinks. The previous implementation used a
+    500 ms poll which delayed event delivery for agent callers.
+    """
+    import select
+
+    # Wait briefly for the file to appear if it doesn't yet exist.
+    for _ in range(50):
+        if ep.exists():
+            break
+        time.sleep(0.1)
+    if not ep.exists():
+        return
+
+    try:
+        fh = ep.open("r")
+    except OSError:
+        return
+
+    # Start at EOF so we only emit *new* events.
+    fh.seek(0, 2)  # SEEK_END
+
     try:
         while True:
+            # select() on a regular file always returns immediately "readable".
+            # That's fine — the loop below will read any available new data
+            # and fall through to select() again. When no new data is ready,
+            # readline() returns "" and we block on select() with the 5 s
+            # periodic fallback.
+            line = fh.readline()
+            if line:
+                stripped = line.strip()
+                if stripped:
+                    print(stripped, flush=True)
+                continue
+
+            # No new data — wait up to 5 s for more, honouring KeyboardInterrupt.
             try:
-                sz = ep.stat().st_size if ep.exists() else 0
-            except OSError:
-                sz = pos
-            if sz > pos:
-                with ep.open() as f:
-                    f.seek(pos)
-                    for line in f:
-                        line = line.strip()
-                        if line:
-                            print(line, flush=True)
-                pos = sz
-            time.sleep(0.5)
+                select.select([fh], [], [], 5.0)
+            except (OSError, ValueError):
+                # fd closed under us; exit cleanly.
+                return
     except KeyboardInterrupt:
         pass
+    finally:
+        try:
+            fh.close()
+        except OSError:
+            pass
 
 
 def cmd_snap(args):
@@ -1364,6 +1518,551 @@ def cmd_resume(args):
         _out({"ok": True, "note": "QEMU resumed"})
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Tier 1: kdb — one-shot JSON introspection TCP client
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Non-interactive contract: open → send one JSON request → read one JSON
+# response → close.  Session-side state mirrored to
+# ~/.astryx-harness/<sid>.kdb.json so repeat callers see the last
+# response per op without another round-trip.
+
+def _kdb_build_request(op: str, rest: list[str]) -> dict:
+    """CLI args → request dict.  Each op has its own arg shape."""
+    if op in ("ping", "proc-list", "vfs-mounts", "trace-status"):
+        return {"op": op}
+    if op == "proc":
+        if not rest: raise ValueError("proc requires <pid>")
+        return {"op": "proc", "pid": int(rest[0], 0)}
+    if op == "dmesg":
+        return {"op": "dmesg", "tail": int(rest[0]) if rest else 100}
+    if op == "syms":
+        if not rest: raise ValueError("syms requires <name> or 0x<addr>")
+        key = "addr" if rest[0].lower().startswith("0x") else "name"
+        return {"op": "syms", key: rest[0]}
+    if op == "mem":
+        if len(rest) < 2: raise ValueError("mem requires <addr> <len>")
+        return {"op": "mem", "addr": rest[0], "len": int(rest[1], 0)}
+    raise ValueError(f"unknown kdb op: {op}")
+
+
+def cmd_kdb(args):
+    """One-shot kdb client: connect, send, receive one line, close."""
+    sess = _load_session(args.sid)
+    port = int(sess.get("kdb_host_port") or 0)
+    if port <= 0:
+        _out({"error": "session was not started with --features kdb"})
+        sys.exit(1)
+    try:
+        req = _kdb_build_request(args.op, list(args.args or []))
+    except ValueError as e:
+        _out({"error": str(e)}); sys.exit(1)
+
+    payload = (json.dumps(req) + "\n").encode("utf-8")
+    timeout = float(getattr(args, "timeout", 5.0) or 5.0)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(("127.0.0.1", port))
+        s.sendall(payload)
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk: break
+            buf += chunk
+            if len(buf) > 128 * 1024: break
+        s.close()
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        _out({"error": f"kdb connect/io failed on 127.0.0.1:{port}: {e}"})
+        sys.exit(1)
+
+    try:
+        resp = json.loads(buf.strip().decode("utf-8", errors="replace"))
+    except (json.JSONDecodeError, ValueError) as e:
+        _out({"error": f"malformed response: {e}",
+              "raw": buf.decode(errors="replace")})
+        sys.exit(1)
+
+    # Mirror to ~/.astryx-harness/<sid>.kdb.json (best-effort).
+    cache = HARNESS_DIR / f"{args.sid}.kdb.json"
+    state = {"operations_called": 0, "last_response": {}}
+    if cache.exists():
+        try: state = json.loads(cache.read_text())
+        except Exception: pass
+    state["port"] = port
+    state["last_ping_unix"] = int(time.time())
+    state["operations_called"] = int(state.get("operations_called", 0)) + 1
+    state.setdefault("last_response", {})[args.op] = resp
+    try: cache.write_text(json.dumps(state))
+    except OSError: pass
+
+    _out(resp)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Housekeeping / reporting subcommands
+# ══════════════════════════════════════════════════════════════════════════════
+
+def cmd_prune(args):
+    """
+    Remove per-session artefacts for dead sessions older than --ttl days.
+
+    Walks HARNESS_DIR, groups files by sid (derived from `<sid>.json` or from
+    the filename stem of orphaned `<sid>.serial.log` / `<sid>.events.jsonl` /
+    `<sid>.OVMF_VARS.fd`). A sid is considered prunable when:
+      - its .json either doesn't exist, OR its recorded pid is not alive; AND
+      - the newest mtime across all its files is older than TTL days.
+
+    Orphan files without any matching `.json` are always eligible if older
+    than TTL.
+
+    Per-file permission/OS errors are swallowed so one bad file doesn't abort
+    the whole sweep.
+    """
+    ttl_days = max(0.0, float(args.ttl))
+    ttl_seconds = ttl_days * 86400.0
+    now = time.time()
+
+    # Group files by sid stem. We recognise the well-known suffix set:
+    # .json, .serial.log, .events.jsonl, .qmp.sock, .OVMF_VARS.fd
+    known_suffixes = (
+        ".json",
+        ".serial.log",
+        ".events.jsonl",
+        ".qmp.sock",
+        ".OVMF_VARS.fd",
+    )
+
+    groups: dict = {}  # sid -> list[Path]
+    try:
+        entries = list(HARNESS_DIR.iterdir())
+    except OSError:
+        _out({"pruned": [], "kept": 0, "freed_bytes": 0})
+        return
+
+    for p in entries:
+        if not p.is_file():
+            continue
+        name = p.name
+        sid = None
+        for suf in known_suffixes:
+            if name.endswith(suf):
+                sid = name[: -len(suf)]
+                break
+        if not sid:
+            continue
+        groups.setdefault(sid, []).append(p)
+
+    pruned = []
+    kept = 0
+    freed_bytes = 0
+
+    for sid, files in groups.items():
+        # Determine liveness via the .json file, if present.
+        alive = False
+        sess_pid = 0
+        json_path = HARNESS_DIR / f"{sid}.json"
+        if json_path.exists():
+            try:
+                with json_path.open() as f:
+                    sess = json.load(f)
+                sess_pid = int(sess.get("pid", 0) or 0)
+                if sess_pid:
+                    alive = _pid_alive(sess_pid)
+            except (json.JSONDecodeError, OSError, ValueError):
+                # Corrupt JSON — treat as dead (orphan).
+                alive = False
+
+        if alive:
+            kept += 1
+            continue
+
+        # Newest mtime across all grouped files.
+        newest = 0.0
+        for fp in files:
+            try:
+                st = fp.stat()
+                if st.st_mtime > newest:
+                    newest = st.st_mtime
+            except OSError:
+                continue
+
+        age = now - newest if newest > 0 else float("inf")
+        if age < ttl_seconds:
+            kept += 1
+            continue
+
+        # Prune: delete every file in the group.
+        for fp in files:
+            try:
+                sz = fp.stat().st_size
+            except OSError:
+                sz = 0
+            try:
+                fp.unlink()
+                freed_bytes += sz
+            except OSError:
+                # Permission denied or race with another pruner — skip.
+                continue
+        pruned.append(sid)
+
+    _out({
+        "pruned":      sorted(pruned),
+        "kept":        kept,
+        "freed_bytes": freed_bytes,
+    })
+
+
+_TEST_JSON_RE   = re.compile(r"^\[TEST-JSON\]\s+(\{.*\})\s*$")
+_FF_OPEN_RET_RE = re.compile(r"^\[FF/open-ret\]\s+pid=(\d+)\s+path=(\S+)\s+ret=(-?\d+)")
+_SC_ENTRY_RE    = re.compile(
+    r"^\[SC\]\s+pid=(\d+)\s+tid=(\d+)\s+nr=(\d+)\s+rip=(0x[0-9a-fA-F]+)"
+    r"\s+a1=(0x[0-9a-fA-F]+)\s+a2=(0x[0-9a-fA-F]+)\s+a3=(0x[0-9a-fA-F]+)")
+_FF_EXIT_CLEAN_RE = re.compile(r"\[FFTEST\]\s+DONE")
+_FF_EXIT_TICKS_RE = re.compile(r"\[FFTEST\]\s+Firefox exited after\s+(\d+)\s+ticks")
+_FF_EXIT_CODE_RE  = re.compile(r"\[FFTEST\]\s+Firefox exit code[:= ]+(-?\d+)")
+_TICK_RE          = re.compile(r"tick[=:\s]+(\d+)")
+
+
+def cmd_results(args):
+    """
+    Scan the session's serial log and summarise test-runner + Firefox state.
+
+    The kernel test_runner emits one `[TEST-JSON] {...}` line per
+    test_pass! / test_fail!. When `firefox-test` / `syscall-trace` features
+    are enabled, additional `[FF/*]` and `[SC]` / `[SC-RET]` markers are
+    rolled up into the `firefox` sub-object. Missing lines (session still
+    running, or a crash before emission) result in a partial report — we
+    never fail.
+    """
+    sess = _load_session(args.sid)
+    serial_log = sess["serial_log"]
+
+    tests: list = []
+    libs_loaded: list = []
+    failed_opens: list = []
+    last_syscall: Optional[dict] = None
+    ff_exit_code: Optional[int] = None
+    ff_exit_ticks: Optional[int] = None
+    ff_clean_exit = False
+    total_ticks = 0
+    ff_trace_seen = False
+
+    try:
+        with Path(serial_log).open("rb") as fh:
+            buf = b""
+            while True:
+                chunk = fh.read(64 * 1024)
+                if not chunk:
+                    if buf:
+                        _scan_line(buf, tests, libs_loaded, failed_opens)
+                    break
+                buf += chunk
+                while True:
+                    nl = buf.find(b"\n")
+                    if nl < 0:
+                        break
+                    line_b = buf[:nl]
+                    buf = buf[nl+1:]
+                    line = line_b.decode("utf-8", errors="replace").rstrip("\r")
+                    _scan_line(line_b, tests, libs_loaded, failed_opens)
+                    # Last-syscall (entry) for Firefox diagnostics.
+                    m = _SC_ENTRY_RE.match(line)
+                    if m:
+                        ff_trace_seen = True
+                        last_syscall = {
+                            "pid":  int(m.group(1)),
+                            "tid":  int(m.group(2)),
+                            "nr":   int(m.group(3)),
+                            "rip":  m.group(4),
+                            "args": [m.group(5), m.group(6), m.group(7)],
+                        }
+                    # Firefox lifecycle markers.
+                    if _FF_EXIT_CLEAN_RE.search(line):
+                        ff_clean_exit = True
+                    m = _FF_EXIT_TICKS_RE.search(line)
+                    if m:
+                        ff_exit_ticks = int(m.group(1))
+                    m = _FF_EXIT_CODE_RE.search(line)
+                    if m:
+                        ff_exit_code = int(m.group(1))
+                    # Track highest tick we've seen for total_ticks.
+                    m = _TICK_RE.search(line)
+                    if m:
+                        t = int(m.group(1))
+                        if t > total_ticks:
+                            total_ticks = t
+    except OSError as e:
+        _err(f"Cannot read serial log: {e}")
+
+    passed = sum(1 for t in tests if t.get("result") == "pass")
+    failed = sum(1 for t in tests if t.get("result") == "fail")
+    duration = sum(int(t.get("elapsed_ticks") or 0) for t in tests)
+
+    # Determine exit cause from same heuristics as `status`.
+    pid = sess.get("pid", 0)
+    alive = _pid_alive(pid) if pid else False
+    exit_cause = _classify_exit_cause(serial_log, alive)
+
+    firefox = None
+    if ff_trace_seen or libs_loaded or failed_opens:
+        firefox = {
+            "libs_loaded":   libs_loaded,
+            "failed_opens":  failed_opens,
+            "last_syscall":  last_syscall,
+            "exit_code":     ff_exit_code,
+            "exit_ticks":    ff_exit_ticks,
+            "clean_exit":    ff_clean_exit,
+        }
+
+    _out({
+        "exit_cause":     exit_cause,
+        "total_ticks":    total_ticks,
+        "test_results": {
+            "total":          len(tests),
+            "passed":         passed,
+            "failed":         failed,
+            "duration_ticks": duration,
+            "tests":          tests,
+        },
+        "firefox":        firefox,
+    })
+
+
+def _scan_line(line_bytes: bytes, tests: list, libs_loaded: list,
+               failed_opens: list) -> None:
+    """
+    Called for every serial log line. Extracts TEST-JSON, FF/open-ret.
+    Multi-purpose so we only pay one decode per line.
+    """
+    try:
+        line = line_bytes.decode("utf-8", errors="replace").rstrip("\r")
+    except Exception:
+        return
+    # Test-runner JSON lines
+    m = _TEST_JSON_RE.match(line)
+    if m:
+        try:
+            obj = json.loads(m.group(1))
+            if isinstance(obj, dict) and "name" in obj and "result" in obj:
+                tests.append(obj)
+        except json.JSONDecodeError:
+            pass
+        return
+    # Firefox open() return-value lines
+    m = _FF_OPEN_RET_RE.match(line)
+    if m:
+        ret = int(m.group(3))
+        path = m.group(2)
+        if ret >= 0:
+            # Extract library name from common paths like
+            # /lib/x86_64-linux-gnu/libnspr4.so.0.
+            base = path.rsplit("/", 1)[-1]
+            lib = base.split(".so", 1)[0] if ".so" in base else base
+            if lib and lib not in libs_loaded:
+                libs_loaded.append(lib)
+        else:
+            failed_opens.append({"path": path, "errno": ret})
+
+
+# ── scrings: parse per-process syscall ring-buffer dumps ─────────────────────
+#
+# The kernel (with the firefox-test feature) emits ring-buffer traces on any
+# `exit_group(code)` where `code != 0`.  Format, from kernel/src/syscall/ring.rs:
+#
+#   [SC-RING-BEGIN] pid=<N> exit_code=<N> entries=<N>
+#   [SC-RING] i=NNN t=<tick> <name>/<nr> rip=0x.. a1=0x.. a2=0x.. a3=0x.. \
+#             a4=0x.. a5=0x.. a6=0x.. ret=<i64>
+#   [SC-RING-PATH] i=NNN path="..."                    (for open/openat only)
+#   [SC-RING-BYTES] i=NNN len=<N> hex=<hex-ascii>      (for captured reads)
+#   [SC-RING-END] pid=<N>
+#
+# `scrings` finds every dump in the serial log and returns a JSON array — one
+# object per dump — each containing pid, exit_code, and a chronological list
+# of parsed entries.  The path / bytes lines are attached to their parent
+# [SC-RING] entry by matching `i=NNN`.
+
+_SC_RING_BEGIN = re.compile(
+    r"\[SC-RING-BEGIN\] pid=(\d+) exit_code=(-?\d+) entries=(\d+)"
+)
+_SC_RING_LINE = re.compile(
+    r"\[SC-RING\] i=(\d+) t=(\d+) (\S+) rip=(0x[0-9a-fA-F]+) "
+    r"a1=(0x[0-9a-fA-F]+) a2=(0x[0-9a-fA-F]+) a3=(0x[0-9a-fA-F]+) "
+    r"a4=(0x[0-9a-fA-F]+) a5=(0x[0-9a-fA-F]+) a6=(0x[0-9a-fA-F]+) "
+    r"ret=(-?\d+)"
+)
+_SC_RING_PATH = re.compile(r'\[SC-RING-PATH\] i=(\d+) path="([^"]*)"')
+_SC_RING_BYTES = re.compile(r'\[SC-RING-BYTES\] i=(\d+) len=(\d+) hex=([0-9a-fA-F]+)')
+_SC_RING_END = re.compile(r"\[SC-RING-END\] pid=(\d+)")
+
+
+def _parse_ring_dump(lines):
+    """Given an iterable of serial-log lines, yield one parsed dump per
+    [SC-RING-BEGIN]...[SC-RING-END] block."""
+    cur = None
+    entries_by_idx = {}
+    for ln in lines:
+        m = _SC_RING_BEGIN.search(ln)
+        if m:
+            cur = {
+                "pid":         int(m.group(1)),
+                "exit_code":   int(m.group(2)),
+                "entry_count": int(m.group(3)),
+                "entries":     [],
+            }
+            entries_by_idx = {}
+            continue
+        if cur is None:
+            continue
+        m = _SC_RING_LINE.search(ln)
+        if m:
+            e = {
+                "i":    int(m.group(1)),
+                "tick": int(m.group(2)),
+                "name": m.group(3),
+                "rip":  int(m.group(4), 16),
+                "a1":   int(m.group(5), 16),
+                "a2":   int(m.group(6), 16),
+                "a3":   int(m.group(7), 16),
+                "a4":   int(m.group(8), 16),
+                "a5":   int(m.group(9), 16),
+                "a6":   int(m.group(10), 16),
+                "ret":  int(m.group(11)),
+                "path": None,
+                "bytes_hex": None,
+                "bytes_len": 0,
+            }
+            cur["entries"].append(e)
+            entries_by_idx[e["i"]] = e
+            continue
+        m = _SC_RING_PATH.search(ln)
+        if m:
+            e = entries_by_idx.get(int(m.group(1)))
+            if e is not None:
+                e["path"] = m.group(2)
+            continue
+        m = _SC_RING_BYTES.search(ln)
+        if m:
+            e = entries_by_idx.get(int(m.group(1)))
+            if e is not None:
+                e["bytes_hex"] = m.group(3)
+                e["bytes_len"] = int(m.group(2))
+            continue
+        m = _SC_RING_END.search(ln)
+        if m:
+            yield cur
+            cur = None
+            entries_by_idx = {}
+    # If the log ended mid-dump (e.g. kernel panic), yield what we have.
+    if cur is not None:
+        yield cur
+
+
+def cmd_scrings(args):
+    """Parse syscall ring-buffer dumps from the serial log and emit JSON."""
+    sess = _load_session(args.sid)
+    serial_log = sess["serial_log"]
+
+    dumps = []
+    try:
+        with Path(serial_log).open("r", errors="replace") as fh:
+            for d in _parse_ring_dump(fh):
+                dumps.append(d)
+    except OSError as e:
+        _err(f"could not read serial log: {e}")
+
+    # Optional pid filter.
+    pid = getattr(args, "pid", None)
+    if pid is not None:
+        dumps = [d for d in dumps if d["pid"] == pid]
+
+    # Optional entry-count cap per dump.
+    last = getattr(args, "last", None)
+    if last is not None and last > 0:
+        for d in dumps:
+            d["entries"] = d["entries"][-last:]
+
+    _out({"dumps": dumps, "dump_count": len(dumps)})
+
+
+# ── stack: parse exit-time userspace stack snapshots ─────────────────────────
+#
+# On non-zero exit the kernel (firefox-test feature) emits:
+#
+#   [SC-RING-STACK] pid=<N> rsp=<hex> rbp=<hex>
+#   [SC-RING-STACK] stack_top=<up-to-256-hex-chars>
+#   [SC-RING-STACK] frame[N] rbp=<hex> rip=<hex>
+#   ...
+#   [SC-RING-STACK-END]
+#
+# `stack` collects every such block in the serial log and returns a JSON
+# array — one object per block — containing pid, rsp, rbp, stack_top_hex,
+# and the list of parsed frames.  Frames order matches the kernel's emission
+# order (frame[0] = deepest / immediate caller of exit_group).
+
+_STACK_HEADER = re.compile(
+    r"\[SC-RING-STACK\] pid=(\d+) rsp=(0x[0-9a-fA-F]+) rbp=(0x[0-9a-fA-F]+)"
+)
+_STACK_TOP = re.compile(r"\[SC-RING-STACK\] stack_top=([0-9a-fA-F]*)")
+_STACK_FRAME = re.compile(
+    r"\[SC-RING-STACK\] frame\[(\d+)\] rbp=(0x[0-9a-fA-F]+) rip=(0x[0-9a-fA-F]+)"
+)
+_STACK_END = re.compile(r"\[SC-RING-STACK-END\]")
+
+
+def _parse_stack_dumps(lines):
+    cur = None
+    for ln in lines:
+        m = _STACK_HEADER.search(ln)
+        if m:
+            # Start a fresh block whenever we see a pid/rsp/rbp header.  The
+            # stack_top line follows immediately; frames come after.
+            cur = {
+                "pid":  int(m.group(1)),
+                "rsp":  int(m.group(2), 16),
+                "rbp":  int(m.group(3), 16),
+                "stack_top_hex": None,
+                "frames": [],
+            }
+            continue
+        if cur is None:
+            continue
+        m = _STACK_TOP.search(ln)
+        if m:
+            cur["stack_top_hex"] = m.group(1)
+            continue
+        m = _STACK_FRAME.search(ln)
+        if m:
+            cur["frames"].append({
+                "i":   int(m.group(1)),
+                "rbp": int(m.group(2), 16),
+                "rip": int(m.group(3), 16),
+            })
+            continue
+        if _STACK_END.search(ln):
+            yield cur
+            cur = None
+    if cur is not None:
+        yield cur
+
+
+def cmd_stack(args):
+    """Parse exit-time userspace stack snapshots and emit JSON."""
+    sess = _load_session(args.sid)
+    serial_log = sess["serial_log"]
+    snapshots = []
+    try:
+        with Path(serial_log).open("r", errors="replace") as fh:
+            for s in _parse_stack_dumps(fh):
+                snapshots.append(s)
+    except OSError as e:
+        _err(f"could not read serial log: {e}")
+    pid = getattr(args, "pid", None)
+    if pid is not None:
+        snapshots = [s for s in snapshots if s["pid"] == pid]
+    _out({"snapshots": snapshots, "snapshot_count": len(snapshots)})
+
+
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 def main():
@@ -1376,7 +2075,10 @@ def main():
     # start
     p_start = sub.add_parser("start", help="Launch a new QEMU session")
     p_start.add_argument("--features", default="", metavar="FLAGS",
-                          help="Extra kernel features (comma-separated, test-mode always added)")
+                          help="Kernel feature flags passed VERBATIM to cargo "
+                               "(comma-separated, e.g. 'test-mode,kdb'). "
+                               "Empty string → default desktop kernel. "
+                               "Nothing is injected silently.")
     p_start.add_argument("--no-build", action="store_true",
                           help="Skip cargo build; use existing kernel.bin")
     p_start.add_argument("--gdb-port", type=int, default=0, metavar="PORT",
@@ -1479,6 +2181,54 @@ def main():
     p_resume = sub.add_parser("resume", help="[Tier2] Resume QEMU via QMP cont")
     p_resume.add_argument("sid")
 
+    # kdb — Tier 1 kernel debugger JSON socket
+    p_kdb = sub.add_parser(
+        "kdb",
+        help="[Tier1] One-shot JSON request against the in-kernel debugger "
+             "(requires --features kdb at start)")
+    p_kdb.add_argument("sid")
+    p_kdb.add_argument("op", choices=[
+        "ping", "proc-list", "proc", "vfs-mounts",
+        "dmesg", "syms", "mem", "trace-status",
+    ])
+    p_kdb.add_argument("args", nargs="*",
+                        help="Op-specific positional args: "
+                             "proc <pid>, dmesg [tail], syms <name|0xaddr>, "
+                             "mem <addr> <len>")
+    p_kdb.add_argument("--timeout", type=float, default=5.0,
+                        help="Socket timeout in seconds (default 5.0)")
+
+    # prune — housekeeping for ~/.astryx-harness/
+    p_prune = sub.add_parser("prune",
+        help="Delete state/log files for dead sessions older than --ttl days")
+    p_prune.add_argument("--ttl", type=float, default=7.0,
+                          help="Age threshold in days (default 7)")
+
+    # results — summarise [TEST-JSON] lines from a session's serial log
+    p_results = sub.add_parser("results",
+        help="Parse per-test JSONL results from the session's serial log")
+    p_results.add_argument("sid")
+
+    # scrings — parse firefox-test syscall ring-buffer dumps from serial log.
+    p_scrings = sub.add_parser(
+        "scrings",
+        help="Parse syscall ring-buffer dumps (firefox-test feature)"
+    )
+    p_scrings.add_argument("sid")
+    p_scrings.add_argument("--pid", type=int, default=None,
+                            help="Only return dumps for this PID")
+    p_scrings.add_argument("--last", type=int, default=None,
+                            help="Truncate each dump's entries[] to last N")
+
+    # stack — parse [SC-RING-STACK] exit-time userspace stack snapshots.
+    p_stack = sub.add_parser(
+        "stack",
+        help="Parse exit-time userspace stack snapshots (firefox-test feature)"
+    )
+    p_stack.add_argument("sid")
+    p_stack.add_argument("--pid", type=int, default=None,
+                          help="Only return snapshots for this PID")
+
     # _watch: private subcommand used internally by `start` to run the
     # background watcher in a detached process. Not shown in help.
     p_watch = sub.add_parser("_watch")
@@ -1506,7 +2256,14 @@ def main():
         "cont":   cmd_cont,
         "pause":  cmd_pause,
         "resume": cmd_resume,
-        "_watch": cmd_run_watcher,
+        # Tier 1
+        "kdb":    cmd_kdb,
+        # Housekeeping / reporting
+        "prune":   cmd_prune,
+        "results": cmd_results,
+        "scrings": cmd_scrings,
+        "stack":   cmd_stack,
+        "_watch":  cmd_run_watcher,
     }
     dispatch[args.cmd](args)
 

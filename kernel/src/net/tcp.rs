@@ -314,7 +314,15 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
         );
         if let Some(li) = listen_idx {
             let isn     = new_isn();
-            let lip     = conns[li].local_ip;
+            // Use the SYN's dst_ip as our local IP for the child TCB,
+            // not the listener's stored `local_ip`.  The listener is
+            // created at boot before DHCP runs, so its stored IP is
+            // the hardcoded default (10.0.2.15).  After DHCP the real
+            // IP differs; replying from the stale value makes the peer
+            // drop the SYN-ACK as a martian source.  Using dst_ip is
+            // also correct for multi-homed hosts — we reply on the
+            // same address the peer reached us on.
+            let lip     = dst_ip;
             let lport   = conns[li].local_port;
             let rcv_nxt = hdr.seq_num.wrapping_add(1);
             conns.push(TcpConnection {
@@ -612,6 +620,31 @@ pub fn tcp_timer_tick() {
 
 // ── Public query API ──────────────────────────────────────────────────────────
 
+/// Snapshot of a connection's 4-tuple + state.  Used by kdb for child-of-
+/// listener discovery without exposing the full TCB struct.  Gated to
+/// preserve byte-identical default builds — the struct would otherwise
+/// alter LLVM's symbol mangling hashes of neighbouring statics.
+#[cfg(feature = "kdb")]
+#[derive(Clone, Copy)]
+pub struct ConnSnap {
+    pub local_port:  u16,
+    pub remote_ip:   Ipv4Address,
+    pub remote_port: u16,
+    pub state:       TcpState,
+}
+
+/// Return a snapshot of every connection in the TCP table.  Caller-owned
+/// copy — safe to use after the lock is dropped.
+#[cfg(feature = "kdb")]
+pub fn snapshot_connections() -> alloc::vec::Vec<ConnSnap> {
+    TCP_CONNECTIONS.lock().iter().map(|c| ConnSnap {
+        local_port:  c.local_port,
+        remote_ip:   c.remote_ip,
+        remote_port: c.remote_port,
+        state:       c.state,
+    }).collect()
+}
+
 pub fn get_state(port: u16) -> Option<TcpState> {
     TCP_CONNECTIONS.lock().iter()
         .find(|c| c.local_port == port)
@@ -747,6 +780,53 @@ pub fn connect(remote_ip: Ipv4Address, remote_port: u16) -> Result<u16, &'static
     }
     send_flags(local_ip, local_port, remote_ip, remote_port, isn, 0, SYN);
     Ok(local_port)
+}
+
+/// Abort the connection on `port` by transmitting a RST segment to the
+/// remote peer (if any) and marking the local TCB closed.
+///
+/// Unlike `close()`, which initiates a graceful four-way handshake and
+/// leaves the peer in CLOSE_WAIT until it acks the FIN, `abort()` tears
+/// the connection down unilaterally — necessary when the test harness
+/// has finished with a scratch connection pointed at an unreachable
+/// address and needs to release the corresponding state on the
+/// emulator's SLIRP backend.
+///
+/// Returns `Ok(())` whether or not a matching connection was found so
+/// call sites don't have to special-case missing entries.
+pub fn abort(port: u16) -> Result<(), &'static str> {
+    struct AbortInfo {
+        lip: Ipv4Address, lp: u16,
+        rip: Ipv4Address, rp: u16,
+        sn: u32, rn: u32,
+    }
+    let info = {
+        let mut conns = TCP_CONNECTIONS.lock();
+        let conn = match conns.iter_mut().find(|c| c.local_port == port) {
+            Some(c) => c,
+            None    => return Ok(()),
+        };
+        // Send a RST to the peer whenever we know who it is, regardless
+        // of our local state — callers use abort() precisely to tear
+        // down a connection the remote side still considers live, such
+        // as a SLIRP entry left over from a test that only cleaned up
+        // the local TCB.  The one case where we suppress the RST is a
+        // pure listener (remote_port == 0) which has no peer to notify.
+        let info = if conn.remote_port != 0 && !matches!(conn.state, TcpState::Listen) {
+            Some(AbortInfo {
+                lip: conn.local_ip, lp: conn.local_port,
+                rip: conn.remote_ip, rp: conn.remote_port,
+                sn: conn.send_next, rn: conn.recv_next,
+            })
+        } else { None };
+        conn.state = TcpState::Closed;
+        conn.retransmit_queue.clear();
+        info
+    };
+    if let Some(i) = info {
+        send_flags(i.lip, i.lp, i.rip, i.rp, i.sn, i.rn, RST | ACK);
+    }
+    Ok(())
 }
 
 pub fn close(port: u16) -> Result<(), &'static str> {
