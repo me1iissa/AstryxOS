@@ -530,6 +530,40 @@ pub fn unmap_page_in(pml4_phys: u64, virt_addr: u64) {
     }
 }
 
+/// Unmap every present page in `[base, base+length)` from an arbitrary page
+/// table, drop one reference on the underlying physical frame, and free the
+/// frame when the last reference goes away.  Each cleared PTE is followed by
+/// `invlpg` on the calling CPU.
+///
+/// This helper exists so the upper-level mmap / munmap paths can run the
+/// expensive bulk-unmap loop **without holding `PROCESS_TABLE`**.  It only
+/// needs the PML4 physical address and the VMM/PMM/refcount globals it
+/// already serialises on internally.
+///
+/// `base` and `length` are caller-validated to be page-aligned and bounded
+/// to a user-process VMA range.
+///
+/// Returns the number of frames actually freed (rc reached zero).  Pages
+/// that were never demand-paged are skipped.
+pub fn unmap_and_free_range_in(pml4_phys: u64, base: u64, length: u64) -> usize {
+    let mut freed = 0usize;
+    let mut pg = base;
+    let end = base.saturating_add(length);
+    while pg < end {
+        if let Some(phys) = virt_to_phys_in(pml4_phys, pg) {
+            unmap_page_in(pml4_phys, pg);
+            invlpg(pg);
+            let new_rc = crate::mm::refcount::page_ref_dec(phys);
+            if new_rc == 0 {
+                pmm::free_page(phys);
+                freed += 1;
+            }
+        }
+        pg += 0x1000;
+    }
+    freed
+}
+
 /// Read a PTE from an arbitrary page table.
 /// Returns the raw PTE value, or 0 if unmapped.
 pub fn read_pte(pml4_phys: u64, virt_addr: u64) -> u64 {

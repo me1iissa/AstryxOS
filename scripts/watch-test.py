@@ -31,6 +31,10 @@ import time
 from pathlib import Path
 from typing import Optional
 
+# Canonical QEMU argv builder (audit MED-2/3/5 consolidation).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import astryx_qemu  # noqa: E402
+
 # ── ANSI colours ──────────────────────────────────────────────────────────────
 
 RED    = "\033[0;31m"
@@ -137,37 +141,22 @@ def launch_qemu(gdb_port: Optional[int] = None, freeze: bool = False) -> subproc
     SERIAL_LOG.parent.mkdir(parents=True, exist_ok=True)
     SERIAL_LOG.write_text("")
 
-    cmd = [
-        "qemu-system-x86_64",
-        "-machine", "pc",
-        "-cpu", "qemu64,+rdtscp",
-        "-m", "1G",
-        "-smp", "2",
-        "-serial", f"file:{SERIAL_LOG}",
-        "-no-reboot", "-no-shutdown",
-        "-monitor", "none",
-        "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
-        "-display", "none",
-        "-drive", f"if=pflash,format=raw,readonly=on,file={OVMF_CODE}",
-        "-drive", f"if=pflash,format=raw,file={OVMF_VARS_DST}",
-        "-drive", f"format=raw,file=fat:rw:{ESP_DIR}",
-        "-device", "e1000,netdev=net0",
-        "-netdev", "user,id=net0",
-    ]
-
-    if DATA_IMG.exists():
-        cmd += [
-            "-drive", f"file={DATA_IMG},format=raw,if=none,id=data0,snapshot=on",
-            "-device", "ide-hd,drive=data0,bus=ide.1",
-        ]
-
-    if os.path.exists("/dev/kvm") and os.access("/dev/kvm", os.R_OK):
-        cmd += ["-enable-kvm"]
-
-    if gdb_port:
-        cmd += ["-gdb", f"tcp::{gdb_port}"]
-    if freeze:
-        cmd += ["-S"]
+    # Canonical argv — see astryx_qemu.build_qemu_cmd for the single
+    # source of truth. Previously this launcher used `ide-hd` for the
+    # data disk while run-test.sh and qemu-harness.py used
+    # `virtio-blk-pci` — a silent divergence that audit MED-2 flagged.
+    # All launchers now go through one builder.
+    cmd = astryx_qemu.build_qemu_cmd(
+        kernel_path="",
+        data_img=str(DATA_IMG),
+        serial_path=str(SERIAL_LOG),
+        mode="test",
+        ovmf_code=str(OVMF_CODE),
+        ovmf_vars=str(OVMF_VARS_DST),
+        esp_dir=str(ESP_DIR),
+        gdb_port=gdb_port,
+        gdb_wait=freeze,
+    )
 
     print(_c(CYAN, f"[WATCH] Launching QEMU: {' '.join(cmd[:6])} ..."))
     proc = subprocess.Popen(cmd, cwd=ROOT)
@@ -360,6 +349,13 @@ def main():
                         help="Show every serial line even in quiet mode")
     parser.add_argument("--log",          default=str(SERIAL_LOG),
                         help=f"Path to serial log file (default: {SERIAL_LOG})")
+    parser.add_argument("--allow-fail",   default="", metavar="REGEX",
+                        help="Substring regex matched against [FAIL] lines: tests "
+                             "matching this are tolerated (still reported but don't "
+                             "set non-zero exit). Use for issue #41 env-gap tests "
+                             "(NotFound /disk/bin/* fixtures, firefox_oracle SIGSEGV) "
+                             "until the data.img workflow ships those prebuilts. "
+                             "Any [FAIL] not matching this still exits 1.")
     args = parser.parse_args()
 
     # ── Build ─────────────────────────────────────────────────────────────────
@@ -402,6 +398,32 @@ def main():
         show_all    = args.show_all,
         quiet       = args.quiet,
     )
+
+    # If the only failures match --allow-fail, downgrade exit_code 1 → 0.
+    # Counts and the per-test log are unchanged; CI only treats unexpected
+    # regressions as gating.
+    if exit_code == 1 and args.allow_fail:
+        try:
+            allow_re = re.compile(args.allow_fail)
+        except re.error as e:
+            print(_c(RED, f"[WATCH] --allow-fail is not a valid regex: {e}"))
+            sys.exit(1)
+        # Re-scan the serial log for [FAIL] lines that don't match the allow-list.
+        unexpected = []
+        try:
+            with open(SERIAL_LOG, "r", errors="replace") as f:
+                for ln in f:
+                    if "[FAIL]" in ln and not allow_re.search(ln):
+                        unexpected.append(ln.rstrip("\n"))
+        except FileNotFoundError:
+            pass
+        if not unexpected:
+            print(_c(YELLOW, "[WATCH] All failures matched --allow-fail; treating as pass."))
+            exit_code = 0
+        else:
+            print(_c(RED, f"[WATCH] {len(unexpected)} unexpected [FAIL] line(s):"))
+            for ln in unexpected:
+                print(_c(RED, f"  {ln}"))
 
     # Map to human label for quick reading
     labels = {0: "PASS", 1: "FAIL", 2: "HUNG", 3: "TIMEOUT", 4: "CRASH", 5: "BUILD_FAIL"}

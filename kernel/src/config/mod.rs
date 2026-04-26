@@ -293,6 +293,31 @@ pub fn registry_set(path: &str, name: &str, data: &str) {
     crate::kprintln!("Set {}\\{} = {}", path, name, data);
 }
 
+/// Read a registry value without formatting it to the console.
+///
+/// Returns a clone of the `RegistryValue` at `path\name`, or `None` if the
+/// key path or named value does not exist.  This is the canonical read
+/// path; `registry_query` is only for shell-style display.  Tests use
+/// `registry_get` so a silently-broken `registry_set` no longer
+/// "passes" by producing no observable error.
+pub fn registry_get(path: &str, name: &str) -> Option<RegistryValue> {
+    let reg = REGISTRY.lock();
+    let root = reg.as_ref()?;
+
+    let clean = path.replace('/', "\\");
+    let parts: Vec<&str> = clean.split('\\').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let (hive_key, rest) = find_hive(&parts);
+
+    let mut current = root.get(hive_key)?;
+    for part in rest {
+        current = current.subkeys.get(*part)?;
+    }
+    current.values.get(name).cloned()
+}
+
 /// Delete a registry key or value.
 pub fn registry_delete(path: &str, value_name: Option<&str>) {
     let mut reg = REGISTRY.lock();

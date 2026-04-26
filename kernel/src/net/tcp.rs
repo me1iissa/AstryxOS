@@ -314,7 +314,15 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
         );
         if let Some(li) = listen_idx {
             let isn     = new_isn();
-            let lip     = conns[li].local_ip;
+            // Use the SYN's dst_ip as our local IP for the child TCB,
+            // not the listener's stored `local_ip`.  The listener is
+            // created at boot before DHCP runs, so its stored IP is
+            // the hardcoded default (10.0.2.15).  After DHCP the real
+            // IP differs; replying from the stale value makes the peer
+            // drop the SYN-ACK as a martian source.  Using dst_ip is
+            // also correct for multi-homed hosts — we reply on the
+            // same address the peer reached us on.
+            let lip     = dst_ip;
             let lport   = conns[li].local_port;
             let rcv_nxt = hdr.seq_num.wrapping_add(1);
             conns.push(TcpConnection {
@@ -457,6 +465,24 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8]) {
 /// Send data on an established connection.
 /// Respects congestion window; buffers excess in send_buffer.
 pub fn send_data(port: u16, data: &[u8]) -> Result<usize, &'static str> {
+    send_data_inner(port, None, data)
+}
+
+/// Send `data` on the connection identified by the full 4-tuple
+/// `(local_port, remote_ip, remote_port)`.
+///
+/// Matches the connection strictly by tuple instead of by `local_port`
+/// alone — required when several concurrent client sessions share a single
+/// listening port (kdb on TCP/9999 in particular).
+pub fn send_data_to(local_port: u16, remote_ip: Ipv4Address, remote_port: u16,
+                     data: &[u8]) -> Result<usize, &'static str>
+{
+    send_data_inner(local_port, Some((remote_ip, remote_port)), data)
+}
+
+fn send_data_inner(port: u16, peer: Option<(Ipv4Address, u16)>, data: &[u8])
+    -> Result<usize, &'static str>
+{
     if data.is_empty() { return Ok(0); }
 
     struct PendingSend {
@@ -468,7 +494,8 @@ pub fn send_data(port: u16, data: &[u8]) -> Result<usize, &'static str> {
     {
         let mut conns = TCP_CONNECTIONS.lock();
         let conn = conns.iter_mut()
-            .find(|c| c.local_port == port && c.state == TcpState::Established)
+            .find(|c| c.local_port == port && c.state == TcpState::Established
+                    && peer.map_or(true, |(rip, rp)| c.remote_ip == rip && c.remote_port == rp))
             .ok_or("no established connection on port")?;
 
         let ticks = crate::arch::x86_64::irq::get_ticks();
@@ -612,6 +639,31 @@ pub fn tcp_timer_tick() {
 
 // ── Public query API ──────────────────────────────────────────────────────────
 
+/// Snapshot of a connection's 4-tuple + state.  Used by kdb for child-of-
+/// listener discovery without exposing the full TCB struct.  Gated to
+/// preserve byte-identical default builds — the struct would otherwise
+/// alter LLVM's symbol mangling hashes of neighbouring statics.
+#[cfg(feature = "kdb")]
+#[derive(Clone, Copy)]
+pub struct ConnSnap {
+    pub local_port:  u16,
+    pub remote_ip:   Ipv4Address,
+    pub remote_port: u16,
+    pub state:       TcpState,
+}
+
+/// Return a snapshot of every connection in the TCP table.  Caller-owned
+/// copy — safe to use after the lock is dropped.
+#[cfg(feature = "kdb")]
+pub fn snapshot_connections() -> alloc::vec::Vec<ConnSnap> {
+    TCP_CONNECTIONS.lock().iter().map(|c| ConnSnap {
+        local_port:  c.local_port,
+        remote_ip:   c.remote_ip,
+        remote_port: c.remote_port,
+        state:       c.state,
+    }).collect()
+}
+
 pub fn get_state(port: u16) -> Option<TcpState> {
     TCP_CONNECTIONS.lock().iter()
         .find(|c| c.local_port == port)
@@ -667,6 +719,86 @@ pub fn read(port: u16) -> Vec<u8> {
     if let Some(conn) = conns.iter_mut()
         .find(|c| c.local_port == port && c.state == TcpState::Established)
     {
+        let d = conn.recv_buffer.clone();
+        conn.recv_buffer.clear();
+        d
+    } else {
+        Vec::new()
+    }
+}
+
+/// Test-only: synthesise an Established TCB with the given 4-tuple and a
+/// pre-loaded receive buffer.  Bypasses the wire entirely so the test
+/// runner can exercise drain/4-tuple-routing logic without paying the
+/// e1000 + SLIRP round-trip (and its inevitable RST when the synthetic
+/// peer doesn't actually exist on the host).
+///
+/// Behaviour mirrors a successful 3WHS finishing in `Established`: an
+/// arbitrary ISN is chosen, retransmit queues are empty, congestion
+/// windows are sane defaults.  Only the receive buffer is pre-populated
+/// from `recv_data`.
+///
+/// Returns `Err` on duplicate 4-tuple.  Gated on `kdb` because that is
+/// the only build profile that pulls in the test runner that needs it.
+#[cfg(feature = "kdb")]
+pub fn test_inject_established(local_port: u16, remote_ip: Ipv4Address,
+                                remote_port: u16, recv_data: &[u8])
+    -> Result<(), &'static str>
+{
+    let mut conns = TCP_CONNECTIONS.lock();
+    if conns.iter().any(|c|
+        c.local_port  == local_port
+        && c.remote_ip   == remote_ip
+        && c.remote_port == remote_port)
+    {
+        return Err("duplicate 4-tuple");
+    }
+    let isn = new_isn();
+    conns.push(TcpConnection {
+        local_ip:    super::our_ip(),
+        local_port,
+        remote_ip,
+        remote_port,
+        state:       TcpState::Established,
+        send_next:   isn.wrapping_add(1),
+        send_unack:  isn,
+        recv_next:   1,
+        recv_buffer: recv_data.to_vec(),
+        send_buffer: Vec::new(),
+        retransmit_queue: VecDeque::new(),
+        rto:         RTO_INITIAL,
+        srtt:        RTO_INITIAL / 2,
+        cwnd:        MSS,
+        ssthresh:    65535,
+        dup_acks:    0,
+        peer_window: 65535,
+        reuseaddr:   false,
+        nodelay:     false,
+        rcvbuf:      87380,
+        sndbuf:      131072,
+        timewait_start: 0,
+    });
+    Ok(())
+}
+
+/// Drain the receive buffer of the established TCB identified by the full
+/// 4-tuple `(local_port, remote_ip, remote_port)`.
+///
+/// Required when several concurrent client sessions share a single listening
+/// port (kdb on TCP/9999 is the canonical case): `read(port)` returns bytes
+/// from whichever Established TCB on `port` happens to match first, which
+/// can attribute one client's request bytes to another.  The 4-tuple form
+/// matches strictly so per-connection drains stay isolated.
+///
+/// Mirrors the shape of [`send_data_to`] / [`close_connection`].
+pub fn read_from(local_port: u16, remote_ip: Ipv4Address, remote_port: u16) -> Vec<u8> {
+    let mut conns = TCP_CONNECTIONS.lock();
+    if let Some(conn) = conns.iter_mut().find(|c| {
+        c.local_port  == local_port
+            && c.remote_ip   == remote_ip
+            && c.remote_port == remote_port
+            && c.state       == TcpState::Established
+    }) {
         let d = conn.recv_buffer.clone();
         conn.recv_buffer.clear();
         d
@@ -749,6 +881,53 @@ pub fn connect(remote_ip: Ipv4Address, remote_port: u16) -> Result<u16, &'static
     Ok(local_port)
 }
 
+/// Abort the connection on `port` by transmitting a RST segment to the
+/// remote peer (if any) and marking the local TCB closed.
+///
+/// Unlike `close()`, which initiates a graceful four-way handshake and
+/// leaves the peer in CLOSE_WAIT until it acks the FIN, `abort()` tears
+/// the connection down unilaterally — necessary when the test harness
+/// has finished with a scratch connection pointed at an unreachable
+/// address and needs to release the corresponding state on the
+/// emulator's SLIRP backend.
+///
+/// Returns `Ok(())` whether or not a matching connection was found so
+/// call sites don't have to special-case missing entries.
+pub fn abort(port: u16) -> Result<(), &'static str> {
+    struct AbortInfo {
+        lip: Ipv4Address, lp: u16,
+        rip: Ipv4Address, rp: u16,
+        sn: u32, rn: u32,
+    }
+    let info = {
+        let mut conns = TCP_CONNECTIONS.lock();
+        let conn = match conns.iter_mut().find(|c| c.local_port == port) {
+            Some(c) => c,
+            None    => return Ok(()),
+        };
+        // Send a RST to the peer whenever we know who it is, regardless
+        // of our local state — callers use abort() precisely to tear
+        // down a connection the remote side still considers live, such
+        // as a SLIRP entry left over from a test that only cleaned up
+        // the local TCB.  The one case where we suppress the RST is a
+        // pure listener (remote_port == 0) which has no peer to notify.
+        let info = if conn.remote_port != 0 && !matches!(conn.state, TcpState::Listen) {
+            Some(AbortInfo {
+                lip: conn.local_ip, lp: conn.local_port,
+                rip: conn.remote_ip, rp: conn.remote_port,
+                sn: conn.send_next, rn: conn.recv_next,
+            })
+        } else { None };
+        conn.state = TcpState::Closed;
+        conn.retransmit_queue.clear();
+        info
+    };
+    if let Some(i) = info {
+        send_flags(i.lip, i.lp, i.rip, i.rp, i.sn, i.rn, RST | ACK);
+    }
+    Ok(())
+}
+
 pub fn close(port: u16) -> Result<(), &'static str> {
     struct CloseInfo {
         lip: Ipv4Address, lp: u16,
@@ -768,6 +947,40 @@ pub fn close(port: u16) -> Result<(), &'static str> {
                     rip: conn.remote_ip, rp: conn.remote_port,
                     sn: conn.send_next, rn: conn.recv_next,
                     was_close_wait: was_cw }
+    };
+    send_flags(info.lip, info.lp, info.rip, info.rp, info.sn, info.rn, FIN | ACK);
+    Ok(())
+}
+
+/// Close a specific connection identified by the full 4-tuple.
+///
+/// Used by services that share a single listening port across multiple
+/// concurrent client sessions (e.g. kdb on TCP/9999): closing by `port`
+/// alone matches the first established/close-wait TCB on that port and
+/// would FIN the listener or a sibling session, not the responded one.
+/// This variant matches strictly on `(local_port, remote_ip, remote_port)`
+/// so the caller closes exactly the session it serviced.
+pub fn close_connection(local_port: u16, remote_ip: Ipv4Address, remote_port: u16)
+    -> Result<(), &'static str>
+{
+    struct CloseInfo {
+        lip: Ipv4Address, lp: u16,
+        rip: Ipv4Address, rp: u16,
+        sn: u32, rn: u32,
+    }
+    let info = {
+        let mut conns = TCP_CONNECTIONS.lock();
+        let conn = conns.iter_mut()
+            .find(|c| c.local_port == local_port
+                   && c.remote_ip == remote_ip
+                   && c.remote_port == remote_port
+                   && matches!(c.state, TcpState::Established | TcpState::CloseWait))
+            .ok_or("no connection to close")?;
+        let was_cw = conn.state == TcpState::CloseWait;
+        conn.state = if was_cw { TcpState::LastAck } else { TcpState::FinWait1 };
+        CloseInfo { lip: conn.local_ip, lp: conn.local_port,
+                    rip: conn.remote_ip, rp: conn.remote_port,
+                    sn: conn.send_next, rn: conn.recv_next }
     };
     send_flags(info.lip, info.lp, info.rip, info.rp, info.sn, info.rn, FIN | ACK);
     Ok(())

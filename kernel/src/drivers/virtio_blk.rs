@@ -473,6 +473,13 @@ impl BlockDevice for VirtioBlkBlockDevice {
             return Ok(());
         }
 
+        // Fast-fail when the device has been reset (see stop()).  Without this
+        // check, callers that race against shutdown spin the used-ring poll
+        // 10M times before giving up.
+        if !VIRTIO_BLK_AVAILABLE.load(Ordering::Acquire) {
+            return Err(BlockError::IoError);
+        }
+
         let mut dev = VIRTIO_BLK.lock();
         let dev = dev.as_mut().ok_or(BlockError::IoError)?;
 
@@ -514,6 +521,10 @@ impl BlockDevice for VirtioBlkBlockDevice {
         }
         if count == 0 {
             return Ok(());
+        }
+
+        if !VIRTIO_BLK_AVAILABLE.load(Ordering::Acquire) {
+            return Err(BlockError::IoError);
         }
 
         let mut dev = VIRTIO_BLK.lock();
@@ -574,6 +585,87 @@ pub fn stop() {
     }
     VIRTIO_BLK_AVAILABLE.store(false, Ordering::Release);
     crate::serial_println!("[VIRTIO-BLK] stop: done");
+}
+
+/// Re-initialize a previously-stopped virtio-blk device in place.
+///
+/// Used by the Po dry-run shutdown test, which calls `stop()` on every
+/// registered driver but still needs disk I/O for the rest of the test
+/// suite.  Reuses the already-allocated virtqueue memory and the cached
+/// I/O base / queue size so no PCI re-discovery is required.
+///
+/// After a device reset (status=0), virtio §4.1.4.1 requires the driver
+/// to re-run the ACKNOWLEDGE → DRIVER → FEATURES → QUEUE_ADDRESS →
+/// DRIVER_OK sequence.  We also zero the virtqueue and reset our cached
+/// `last_used_idx` so the used-ring poll matches the device's post-reset
+/// state (device starts at used_idx=0 again).
+///
+/// Returns true if the device was successfully restarted.  Returns false
+/// if no device was ever initialized, or if the queue configuration has
+/// diverged (spec violation — device should report the same queue size).
+pub fn restart_device() -> bool {
+    let mut guard = VIRTIO_BLK.lock();
+    let dev = match guard.as_mut() {
+        Some(d) => d,
+        None => {
+            crate::serial_println!("[VIRTIO-BLK] restart_device: no device to restart");
+            return false;
+        }
+    };
+
+    // Zero the virtqueue region — stale descriptor/used-ring bytes from
+    // before the reset would confuse the device after re-enable.
+    let vq_virt = phys_to_virt::<u8>(dev.vq_phys);
+    let total_bytes = virtqueue_total_bytes(dev.queue_size);
+    // SAFETY: vq_phys + total_bytes is the owned virtqueue region we
+    // allocated in init(); still reserved because we hold VIRTIO_BLK.
+    unsafe {
+        core::ptr::write_bytes(vq_virt, 0, total_bytes);
+    }
+
+    // SAFETY: Writing I/O ports of the discovered virtio-blk device.
+    unsafe {
+        // Re-run the device-init handshake (§4.1.4.1 after status=0 reset).
+        hal::outb(dev.io_base + VIRTIO_REG_DEVICE_STATUS, 0);
+        hal::outb(dev.io_base + VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
+        hal::outb(
+            dev.io_base + VIRTIO_REG_DEVICE_STATUS,
+            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER,
+        );
+        let _features = hal::inl(dev.io_base + VIRTIO_REG_DEVICE_FEATURES);
+        hal::outl(dev.io_base + VIRTIO_REG_GUEST_FEATURES, 0);
+
+        // Select queue 0 and reconfirm queue size matches.
+        hal::outw(dev.io_base + VIRTIO_REG_QUEUE_SELECT, 0);
+        let queue_size = hal::inw(dev.io_base + VIRTIO_REG_QUEUE_SIZE);
+        if queue_size != dev.queue_size {
+            crate::serial_println!(
+                "[VIRTIO-BLK] restart_device: queue size changed ({} → {}), aborting",
+                dev.queue_size, queue_size
+            );
+            hal::outb(dev.io_base + VIRTIO_REG_DEVICE_STATUS, 0);
+            return false;
+        }
+
+        // Re-publish the virtqueue PFN (the device forgets it across reset).
+        let pfn = (dev.vq_phys >> 12) as u32;
+        hal::outl(dev.io_base + VIRTIO_REG_QUEUE_ADDRESS, pfn);
+
+        // DRIVER_OK — device is live again.
+        hal::outb(
+            dev.io_base + VIRTIO_REG_DEVICE_STATUS,
+            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK,
+        );
+    }
+
+    // Reset our cached used-ring index — the device's used idx is 0 again
+    // after reset, and we just zeroed the used ring.
+    dev.last_used_idx = 0;
+
+    drop(guard);
+    VIRTIO_BLK_AVAILABLE.store(true, Ordering::Release);
+    crate::serial_println!("[VIRTIO-BLK] restart_device: device re-initialized");
+    true
 }
 
 /// Check if a virtio-blk device is available.

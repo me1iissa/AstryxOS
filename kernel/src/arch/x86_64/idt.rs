@@ -276,6 +276,31 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
             asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags));
         }
 
+        // ── Tier-0 trace: one self-contained line per page fault ─────────────
+        // Emitted BEFORE resolution so we see every fault, not just unresolved
+        // ones.  Grepped by qemu-harness.py via `^\[PF\] `.
+        //
+        // We read tid from per-CPU atomics only and resolve pid via a
+        // try-locked walk of THREAD_TABLE.  If the lock is contended (e.g.
+        // the fault happened while another CPU is editing the thread table),
+        // we emit `pid=?` rather than block — the trace is diagnostic, not
+        // load-bearing.
+        #[cfg(feature = "pf-trace")]
+        {
+            let tid = crate::proc::current_tid();
+            // Resolve pid without blocking: if THREAD_TABLE is contended we
+            // emit pid=0 rather than deadlock.  Trace is diagnostic-only.
+            let pid = match crate::proc::THREAD_TABLE.try_lock() {
+                Some(threads) => threads.iter()
+                    .find(|t| t.tid == tid).map(|t| t.pid).unwrap_or(0),
+                None => 0,
+            };
+            crate::serial_println!(
+                "[PF] cr2={:#x} rip={:#x} code={:#x} pid={} tid={}",
+                cr2, frame.rip, error_code, pid, tid,
+            );
+        }
+
         #[cfg(feature = "firefox-test")]
         {
             use core::sync::atomic::{AtomicU64, Ordering};
@@ -637,13 +662,32 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
         None => return false, // Fault outside any VMA — SIGSEGV
     };
 
-    // PROT_NONE VMAs (guard pages) — never accessible in any mode.
-    if vma.prot == crate::mm::vma::PROT_NONE { return false; }
+    // === Permission-match gate (POSIX) ===========================================
+    // Before allocating any frame or touching the PTE we verify the fault class
+    // against the VMA's declared protection.  Demand-paging is only legitimate
+    // when the access matches a permission the VMA actually grants; otherwise we
+    // must surface SIGSEGV so user code sees a deterministic failure instead of
+    // silently acquiring a page it was never entitled to.
+    //
+    // Without this gate the handler would still allocate a zero page (or load a
+    // file page) and install a PTE whose effective permissions happen to match
+    // the VMA — the access would then proceed on the retry, papering over the
+    // userspace bug and, for unknown-VMA faults, leaking kernel frames into the
+    // address space.  The `find_vma` miss path above already returns false; this
+    // additional check hardens the in-VMA case and covers PROT_NONE guard pages.
+    //
+    // The decision policy lives in `mm::vma::fault_access_permitted` so the unit
+    // tests and the handler share one source of truth.
+    let access = crate::mm::vma::FaultAccess::from_error_code(error_code);
+    if !crate::mm::vma::fault_access_permitted(vma.prot, access) {
+        return false;
+    }
+
+    let is_ifetch = matches!(access, crate::mm::vma::FaultAccess::InstructionFetch);
 
     // === NX fixup: page is PRESENT but marked NX, VMA says PROT_EXEC ===
     // This happens when a page was demand-faulted for read/write before the
     // execute permission was needed, or after mprotect changed permissions.
-    let is_ifetch = error_code & 0x10 != 0;
     if is_present && is_ifetch && (vma.prot & crate::mm::vma::PROT_EXEC != 0) {
         let pte = crate::mm::vmm::read_pte(cr3, page_addr);
         if pte & crate::mm::vmm::PAGE_NO_EXECUTE != 0 {
@@ -653,11 +697,6 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
             crate::mm::vmm::invlpg(page_addr);
             return true;
         }
-    }
-
-    // (is_write on a !is_present page: check VMA write permission)
-    if is_write && (vma.prot & crate::mm::vma::PROT_WRITE == 0) {
-        return false; // Permission denied — SIGSEGV
     }
 
     let page_flags = vma.to_page_flags();
