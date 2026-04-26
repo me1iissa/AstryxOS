@@ -1118,6 +1118,18 @@ pub fn run() -> ! {
         if test_tcp_inbound_3whs() { passed += 1; }
     }
 
+    // ── Test 178: TCP read_from — 4-tuple isolation under shared port ───────
+    //
+    // Two synthetic clients land on a single listener.  Each writes a
+    // distinct payload.  We must drain each TCB by full 4-tuple and not
+    // mis-attribute one client's bytes to the other.
+
+    #[cfg(feature = "kdb")]
+    {
+        total += 1;
+        if test_tcp_read_from_isolation() { passed += 1; }
+    }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -19614,6 +19626,89 @@ fn test_tcp_inbound_3whs() -> bool {
     test_println!("  Data segment ({} bytes) accepted and readable ✓", got.len());
 
     test_pass!("TCP inbound 3WHS — synthetic end-to-end handshake");
+    true
+}
+
+/// Two-client read isolation — proves tcp::read_from's 4-tuple matching.
+///
+/// The kdb listener on TCP/9999 multiplexes several concurrent harness
+/// shells onto one port; before tcp::read_from was added, draining by
+/// `local_port` alone matched whichever Established TCB came first in the
+/// table, which let one client's request bytes leak into another client's
+/// pending session.  This test reproduces that topology by synthesising
+/// two Established TCBs sharing one local port — bypassing the wire to
+/// avoid SLIRP RST'ing the synthetic peer mid-test.
+#[cfg(feature = "kdb")]
+fn test_tcp_read_from_isolation() -> bool {
+    test_header!("TCP read_from — 4-tuple isolation under shared port");
+
+    use crate::net::tcp;
+
+    const LOCAL_PORT: u16 = 47018;
+    let a_ip:   [u8;4] = [10, 0, 2, 2];
+    let a_port: u16    = 51001;
+    let b_ip:   [u8;4] = [10, 0, 2, 3];
+    let b_port: u16    = 51002;
+
+    if let Err(e) = tcp::listen(LOCAL_PORT) {
+        test_fail!("tcp_read_from_isolation", "listen({}) failed: {}", LOCAL_PORT, e);
+        return false;
+    }
+
+    // Synthesise two Established TCBs with distinct pre-loaded payloads,
+    // both sharing LOCAL_PORT.  This is the topology kdb sees when two
+    // harness shells talk to it concurrently.
+    const PAYLOAD_A: &[u8] = b"{\"op\":\"ping\",\"who\":\"A\"}\n";
+    const PAYLOAD_B: &[u8] = b"{\"op\":\"proc-list\",\"who\":\"B\"}\n";
+    if let Err(e) = tcp::test_inject_established(LOCAL_PORT, a_ip, a_port, PAYLOAD_A) {
+        test_fail!("tcp_read_from_isolation", "inject A failed: {}", e);
+        return false;
+    }
+    if let Err(e) = tcp::test_inject_established(LOCAL_PORT, b_ip, b_port, PAYLOAD_B) {
+        test_fail!("tcp_read_from_isolation", "inject B failed: {}", e);
+        return false;
+    }
+
+    // The pre-fix port-only `read(LOCAL_PORT)` would return whichever
+    // Established TCB matched first — typically A, leaving B's bytes
+    // unread or vice versa.  read_from() must return EXACTLY each
+    // session's bytes, regardless of insertion order.
+    let got_a = tcp::read_from(LOCAL_PORT, a_ip, a_port);
+    if got_a != PAYLOAD_A {
+        test_fail!("tcp_read_from_isolation",
+            "A: got {} bytes (expected {}); cross-TCB leak?",
+            got_a.len(), PAYLOAD_A.len());
+        return false;
+    }
+    let got_b = tcp::read_from(LOCAL_PORT, b_ip, b_port);
+    if got_b != PAYLOAD_B {
+        test_fail!("tcp_read_from_isolation",
+            "B: got {} bytes (expected {})",
+            got_b.len(), PAYLOAD_B.len());
+        return false;
+    }
+
+    // Second drain on either tuple must return empty — recv_buffer
+    // has been cleared by the first read_from().
+    if !tcp::read_from(LOCAL_PORT, a_ip, a_port).is_empty()
+        || !tcp::read_from(LOCAL_PORT, b_ip, b_port).is_empty()
+    {
+        test_fail!("tcp_read_from_isolation", "second drain returned bytes");
+        return false;
+    }
+
+    // Mismatched 4-tuples must return empty.  This guards against
+    // a regression where read_from accidentally matches by partial
+    // tuple (e.g. local_port-only).
+    if !tcp::read_from(LOCAL_PORT, a_ip, b_port).is_empty()
+        || !tcp::read_from(LOCAL_PORT, b_ip, a_port).is_empty()
+    {
+        test_fail!("tcp_read_from_isolation",
+            "mismatched 4-tuple returned bytes (partial-match regression)");
+        return false;
+    }
+
+    test_pass!("TCP read_from — 4-tuple isolation under shared port");
     true
 }
 

@@ -727,6 +727,86 @@ pub fn read(port: u16) -> Vec<u8> {
     }
 }
 
+/// Test-only: synthesise an Established TCB with the given 4-tuple and a
+/// pre-loaded receive buffer.  Bypasses the wire entirely so the test
+/// runner can exercise drain/4-tuple-routing logic without paying the
+/// e1000 + SLIRP round-trip (and its inevitable RST when the synthetic
+/// peer doesn't actually exist on the host).
+///
+/// Behaviour mirrors a successful 3WHS finishing in `Established`: an
+/// arbitrary ISN is chosen, retransmit queues are empty, congestion
+/// windows are sane defaults.  Only the receive buffer is pre-populated
+/// from `recv_data`.
+///
+/// Returns `Err` on duplicate 4-tuple.  Gated on `kdb` because that is
+/// the only build profile that pulls in the test runner that needs it.
+#[cfg(feature = "kdb")]
+pub fn test_inject_established(local_port: u16, remote_ip: Ipv4Address,
+                                remote_port: u16, recv_data: &[u8])
+    -> Result<(), &'static str>
+{
+    let mut conns = TCP_CONNECTIONS.lock();
+    if conns.iter().any(|c|
+        c.local_port  == local_port
+        && c.remote_ip   == remote_ip
+        && c.remote_port == remote_port)
+    {
+        return Err("duplicate 4-tuple");
+    }
+    let isn = new_isn();
+    conns.push(TcpConnection {
+        local_ip:    super::our_ip(),
+        local_port,
+        remote_ip,
+        remote_port,
+        state:       TcpState::Established,
+        send_next:   isn.wrapping_add(1),
+        send_unack:  isn,
+        recv_next:   1,
+        recv_buffer: recv_data.to_vec(),
+        send_buffer: Vec::new(),
+        retransmit_queue: VecDeque::new(),
+        rto:         RTO_INITIAL,
+        srtt:        RTO_INITIAL / 2,
+        cwnd:        MSS,
+        ssthresh:    65535,
+        dup_acks:    0,
+        peer_window: 65535,
+        reuseaddr:   false,
+        nodelay:     false,
+        rcvbuf:      87380,
+        sndbuf:      131072,
+        timewait_start: 0,
+    });
+    Ok(())
+}
+
+/// Drain the receive buffer of the established TCB identified by the full
+/// 4-tuple `(local_port, remote_ip, remote_port)`.
+///
+/// Required when several concurrent client sessions share a single listening
+/// port (kdb on TCP/9999 is the canonical case): `read(port)` returns bytes
+/// from whichever Established TCB on `port` happens to match first, which
+/// can attribute one client's request bytes to another.  The 4-tuple form
+/// matches strictly so per-connection drains stay isolated.
+///
+/// Mirrors the shape of [`send_data_to`] / [`close_connection`].
+pub fn read_from(local_port: u16, remote_ip: Ipv4Address, remote_port: u16) -> Vec<u8> {
+    let mut conns = TCP_CONNECTIONS.lock();
+    if let Some(conn) = conns.iter_mut().find(|c| {
+        c.local_port  == local_port
+            && c.remote_ip   == remote_ip
+            && c.remote_port == remote_port
+            && c.state       == TcpState::Established
+    }) {
+        let d = conn.recv_buffer.clone();
+        conn.recv_buffer.clear();
+        d
+    } else {
+        Vec::new()
+    }
+}
+
 // ── Control operations ────────────────────────────────────────────────────────
 
 pub fn listen(port: u16) -> Result<(), &'static str> {

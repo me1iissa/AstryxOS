@@ -1494,6 +1494,34 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
     // by Phase 2b a moment later — also expected MAP_FIXED-replacement
     // behaviour.  See arch::x86_64::idt::handle_page_fault for the lookup.
     //
+    // ── File-backed safety: the page cache holds its own refcount ──
+    //
+    // For file-backed mappings the "before-Phase-2a" sub-case deserves an
+    // explicit safety argument because Phase 2b runs lock-free.  Sequence:
+    //
+    //   T0  CPU1 #PF on `addr` ∈ [base, base+length).  find_vma returns
+    //       the OLD file-backed VMA.
+    //   T1  CPU1 demand-pages: cache::lookup hits, returns frame F.
+    //       page_ref_inc(F) → rc=2 (cache's ref + new PTE's ref).
+    //       (If the cache miss path: pmm::alloc_page → cache::insert,
+    //        which does its own page_ref_inc(F) → rc=1 for the cache;
+    //        the demand-page code then does a second page_ref_inc(F) →
+    //        rc=2 before installing the PTE.  See idt.rs::handle_page_fault.)
+    //   T2  CPU0 Phase 2a: remove_range under PROCESS_TABLE.
+    //   T3  CPU0 Phase 2b: unmap_and_free_range_in walks PTEs lock-free,
+    //       finds F installed by CPU1, page_ref_dec(F) → rc=1.
+    //       rc != 0 ⇒ pmm::free_page(F) is NOT called; F stays alive.
+    //   T4  Cache still owns its reference to F; subsequent lookups still
+    //       hit; Phase 3 installs the new VMA describing the same range.
+    //
+    // The invariant — "every PTE pointing at a cached frame F holds its
+    // own ref on F, distinct from the cache's ref" — is enforced by
+    // every map_page_in call site in handle_page_fault: each is paired
+    // with a page_ref_inc (or, for MAP_PRIVATE-writable, an alloc_page
+    // + page_ref_set(_, 1) for a private copy whose lifetime is tied
+    // to that PTE alone).  See kernel/src/mm/cache.rs and
+    // kernel/src/mm/refcount.rs.
+    //
     // Non-MAP_FIXED skips Phases 2a/2b entirely — there is nothing to
     // clear.
     if is_fixed && !is_noreplace {

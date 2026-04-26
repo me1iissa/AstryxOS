@@ -116,11 +116,19 @@ pub fn pump() {
         }
     }
 
-    // Drain the recv buffer into the active session.
-    let bytes = tcp::read(KDB_PORT);
-    if !bytes.is_empty() {
+    // Drain each connected child TCB by full 4-tuple so two concurrent
+    // clients can't have their request bytes mis-attributed to each other.
+    // `tcp::read(port)` returns bytes from whichever Established TCB on
+    // KDB_PORT matches first — that's a real cross-session leak when more
+    // than one harness shell is talking to kdb at the same time.  See
+    // tcp::read_from for the per-connection variant.
+    for (rip, rp) in &new_peers {
+        let bytes = tcp::read_from(KDB_PORT, *rip, *rp);
+        if bytes.is_empty() { continue; }
         let mut ss = KDB_SESSIONS.lock();
-        if let Some(s) = ss.iter_mut().rev().find(|s| !s.responded) {
+        if let Some(s) = ss.iter_mut()
+            .find(|s| !s.responded && s.remote_ip == *rip && s.remote_port == *rp)
+        {
             if s.buf.len() + bytes.len() <= MAX_REQ_BYTES {
                 s.buf.extend_from_slice(&bytes);
             } else {
@@ -530,8 +538,20 @@ fn op_proc(req: &str, out: &mut String) {
 // ── vfs-mounts ────────────────────────────────────────────────────────────────
 
 fn op_vfs_mounts(out: &mut String) {
+    // Mirror the try_lock_brief discipline used by op_proc_list / op_proc:
+    // a blocking MOUNTS.lock() would freeze the kdb listener thread when a
+    // concurrent mount/unmount is in flight, since pump() handles every op
+    // (including unrelated ones) on the same poll tick.  Emit a `busy`
+    // envelope on contention so the host harness can distinguish "no
+    // mounts" (`mounts:[]` with no `busy` key) from "couldn't read".
+    let mounts = match try_lock_brief(&crate::vfs::MOUNTS) {
+        Some(g) => g,
+        None => {
+            out.push_str(r#"{"busy":"MOUNTS held","mounts":[]}"#);
+            return;
+        }
+    };
     out.push_str(r#"{"mounts":["#);
-    let mounts = crate::vfs::MOUNTS.lock();
     for (i, m) in mounts.iter().enumerate() {
         if i > 0 { out.push(','); }
         out.push('{');
