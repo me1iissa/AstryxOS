@@ -85,9 +85,14 @@ if [ ! -f "${OVMF_CODE}" ]; then
     OVMF_VARS=""
 fi
 
+OVMF_VARS_COPY="${BUILD_DIR}/OVMF_VARS_TEST.fd"
 if [ -n "${OVMF_VARS:-}" ]; then
-    OVMF_VARS_COPY="${BUILD_DIR}/OVMF_VARS_TEST.fd"
     cp "${OVMF_VARS}" "${OVMF_VARS_COPY}"
+else
+    # Older distros only ship a combined OVMF.fd — fall back to using
+    # a copy of it as writable NVRAM so the canonical pflash pair
+    # layout still works.
+    cp "${OVMF_CODE}" "${OVMF_VARS_COPY}"
 fi
 
 # ── Step 3: Launch QEMU with ISA debug-exit ──────────────────────────────────
@@ -98,70 +103,41 @@ echo ""
 SERIAL_LOG="${BUILD_DIR}/test-serial.log"
 : > "${SERIAL_LOG}"   # truncate
 
-QEMU_CMD=(
-    qemu-system-x86_64
-    -machine pc
-    -cpu qemu64,+rdtscp
-    -m 1G
-    -smp 2
-    -serial "file:${SERIAL_LOG}"
-    -no-reboot
-    -no-shutdown
-    -monitor none
-
-    # ISA debug-exit: writing to port 0xf4 terminates QEMU.
-    # Exit code = (value * 2) + 1.  Kernel uses 0 → exit(1)=pass, 1 → exit(3)=fail.
-    -device isa-debug-exit,iobase=0xf4,iosize=0x04
-)
-
-# Display — headless by default; pass --window to show the QEMU display
-if [[ "${1:-}" == "--window" ]] || [[ "${2:-}" == "--window" ]]; then
-    QEMU_CMD+=(-vga vmware)
-else
-    QEMU_CMD+=(-display none)
-fi
-
-# UEFI firmware
-if [ -n "${OVMF_VARS:-}" ]; then
-    QEMU_CMD+=(
-        -drive "if=pflash,format=raw,readonly=on,file=${OVMF_CODE}"
-        -drive "if=pflash,format=raw,file=${OVMF_VARS_COPY}"
-    )
-else
-    QEMU_CMD+=(
-        -bios "${OVMF_CODE}"
-    )
-fi
-
-# Boot disk
-QEMU_CMD+=(
-    -drive "format=raw,file=fat:rw:${BUILD_DIR}/esp"
-)
-
-# Data disk — persistent FAT32 drive (secondary IDE)
+# Ensure the data disk exists before building the argv — astryx_qemu's
+# canonical builder omits the data drive if the image is missing.
 DATA_IMG="${BUILD_DIR}/data.img"
 if [ ! -f "${DATA_IMG}" ]; then
     "${ROOT_DIR}/scripts/create-data-disk.sh" 2>/dev/null || true
 fi
-if [ -f "${DATA_IMG}" ]; then
-    QEMU_CMD+=(
-        -drive "file=${DATA_IMG},format=raw,if=none,id=data0,snapshot=on"
-        -device "virtio-blk-pci,drive=data0"
-    )
+
+# --window forces the QEMU display on; without it we run headless.
+WINDOW_FLAG=()
+if [[ "${1:-}" == "--window" ]] || [[ "${2:-}" == "--window" ]]; then
+    WINDOW_FLAG+=("--window")
 fi
 
-# KVM if available
+# KVM autodetect — astryx_qemu does the same check, but we surface
+# the decision explicitly here so the shell log still mentions it.
+KVM_FLAG=(--no-kvm)
 if [ -r /dev/kvm ]; then
-    QEMU_CMD+=(-enable-kvm)
+    KVM_FLAG=(--kvm)
 fi
 
-# Network — e1000 with QEMU user-mode NAT (SLIRP)
-# Uses the host's network stack directly — no TAP, bridge, or sudo needed.
-# Guest gets 10.0.2.15, gateway 10.0.2.2 — SLIRP proxies ICMP/TCP/UDP.
-QEMU_CMD+=(
-    -device e1000,netdev=net0
-    -netdev user,id=net0
-)
+# Canonical QEMU argv — single source of truth in scripts/astryx_qemu.py.
+# Previously this launcher built its own argv inline which drifted over
+# time from watch-test.py and qemu-harness.py (audit MED-2/3/5). The
+# builder prints one argv token per line so `readarray` reconstructs
+# the array exactly, including any token containing spaces.
+readarray -t QEMU_CMD < <(python3 "${ROOT_DIR}/scripts/astryx_qemu.py" build \
+    --mode test \
+    --serial-path "${SERIAL_LOG}" \
+    --data-img    "${DATA_IMG}" \
+    --ovmf-code   "${OVMF_CODE}" \
+    --ovmf-vars   "${OVMF_VARS_COPY}" \
+    --esp-dir     "${BUILD_DIR}/esp" \
+    "${WINDOW_FLAG[@]}" \
+    "${KVM_FLAG[@]}")
+
 echo -e "${CYAN}[TEST] Network: e1000 user-mode NAT (IPv4+IPv6 via host network)${NC}"
 
 # SLIRP needs unprivileged ICMP sockets to forward ping to external hosts.

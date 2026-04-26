@@ -109,6 +109,61 @@ impl VmArea {
     }
 }
 
+/// Classification of a page-fault access, decoded from the x86 error code.
+///
+/// The three variants partition the access into at most one of
+/// {instruction-fetch, write, read}.  Instruction-fetch takes priority so that
+/// an `ifetch` fault is never misinterpreted as a read even on CPUs that leave
+/// the R/W bit ambiguous for those faults.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum FaultAccess {
+    InstructionFetch,
+    Write,
+    Read,
+}
+
+impl FaultAccess {
+    /// Decode from the x86_64 page-fault error code:
+    ///   bit 1 (R/W):  1 = write
+    ///   bit 4 (I/D):  1 = instruction fetch
+    pub fn from_error_code(err: u64) -> Self {
+        if err & 0x10 != 0 {
+            FaultAccess::InstructionFetch
+        } else if err & 0x02 != 0 {
+            FaultAccess::Write
+        } else {
+            FaultAccess::Read
+        }
+    }
+}
+
+/// Decide whether a page fault of a given access class is compatible with a
+/// VMA's declared protection bits.
+///
+/// Returns `true` when demand-paging may proceed, `false` when the fault is a
+/// permission violation that should surface as SIGSEGV to user space.
+///
+/// Rules (matches POSIX `mmap`/`mprotect` semantics and Linux `do_user_addr_fault`):
+///   * `PROT_NONE`           — rejects every access (guard pages).
+///   * `InstructionFetch`    — requires `PROT_EXEC`.
+///   * `Write`               — requires `PROT_WRITE`.
+///   * `Read`                — requires any of `PROT_READ | PROT_WRITE | PROT_EXEC`
+///     (x86_64 execute-only pages are implicitly readable, matching Linux).
+///
+/// This helper is the single source of truth used by both the x86 page-fault
+/// handler and the unit tests, so the "which accesses are allowed?" policy is
+/// decided in exactly one place.
+pub fn fault_access_permitted(prot: VmProt, access: FaultAccess) -> bool {
+    if prot == PROT_NONE {
+        return false;
+    }
+    match access {
+        FaultAccess::InstructionFetch => prot & PROT_EXEC != 0,
+        FaultAccess::Write            => prot & PROT_WRITE != 0,
+        FaultAccess::Read             => prot & (PROT_READ | PROT_WRITE | PROT_EXEC) != 0,
+    }
+}
+
 impl fmt::Debug for VmArea {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let prot_str = [

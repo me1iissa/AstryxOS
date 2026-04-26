@@ -201,6 +201,53 @@ EOF
         echo "[DATA-DISK] Copied lib/x86_64-linux-gnu/ (glibc)"
     fi
 
+    # ── Host GTK3 runtime + fonts (build-firefox-deps.sh --copy-host-libs) ──
+    # These populate /usr/lib/x86_64-linux-gnu/, /usr/share/fonts/, /etc/fonts/,
+    # and /var/cache/fontconfig/ for Firefox ESR 115 GTK resolution. We copy
+    # real files under their SONAME names (FAT32 has no symlinks, so `[ -f ]`
+    # dereferences and mcopy writes the target contents under the link name).
+    HOST_USR_LIB="${BUILD_DIR}/disk/usr/lib/x86_64-linux-gnu"
+    if [ -d "${HOST_USR_LIB}" ]; then
+        mmd -i "${DATA_IMG}" "::usr"                          2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/lib"                      2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/lib/x86_64-linux-gnu"     2>/dev/null || true
+        for f in "${HOST_USR_LIB}/"*; do
+            [ -f "${f}" ] && mcopy -o -i "${DATA_IMG}" "${f}" \
+                "::usr/lib/x86_64-linux-gnu/$(basename "${f}")" 2>/dev/null || true
+        done
+        echo "[DATA-DISK] Copied usr/lib/x86_64-linux-gnu/ (host GTK3 runtime)"
+    fi
+    HOST_FONTS="${BUILD_DIR}/disk/usr/share/fonts"
+    if [ -d "${HOST_FONTS}/truetype/dejavu" ]; then
+        mmd -i "${DATA_IMG}" "::usr/share"                    2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/share/fonts"              2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/share/fonts/truetype"     2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/share/fonts/truetype/dejavu" 2>/dev/null || true
+        for f in "${HOST_FONTS}/truetype/dejavu/"*; do
+            [ -f "${f}" ] && mcopy -o -i "${DATA_IMG}" "${f}" \
+                "::usr/share/fonts/truetype/dejavu/$(basename "${f}")" 2>/dev/null || true
+        done
+        echo "[DATA-DISK] Copied usr/share/fonts/truetype/dejavu/"
+    fi
+    HOST_ETC_FONTS="${BUILD_DIR}/disk/etc/fonts"
+    if [ -d "${HOST_ETC_FONTS}" ]; then
+        mmd -i "${DATA_IMG}" "::etc/fonts" 2>/dev/null || true
+        mcopy -s -o -i "${DATA_IMG}" "${HOST_ETC_FONTS}/." "::etc/fonts/" \
+            2>/dev/null || true
+        echo "[DATA-DISK] Copied etc/fonts/ (fontconfig system config)"
+    fi
+    HOST_FC_CACHE="${BUILD_DIR}/disk/var/cache/fontconfig"
+    if [ -d "${HOST_FC_CACHE}" ]; then
+        mmd -i "${DATA_IMG}" "::var"                          2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::var/cache"                    2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::var/cache/fontconfig"         2>/dev/null || true
+        for f in "${HOST_FC_CACHE}/"*; do
+            [ -f "${f}" ] && mcopy -o -i "${DATA_IMG}" "${f}" \
+                "::var/cache/fontconfig/$(basename "${f}")" 2>/dev/null || true
+        done
+        echo "[DATA-DISK] Copied var/cache/fontconfig/ (fc-cache output)"
+    fi
+
     # ── Firefox ESR at /opt/firefox/ (installed by install-firefox.sh) ──────
     # Firefox is large (~238 MB uncompressed).  We use mcopy -s (recursive)
     # to copy the full directory tree.  FAT32 directory depth limit is 8 on
@@ -259,6 +306,41 @@ EOF
             [ -f "$f" ] && mcopy -i "${DATA_IMG}" "$f" "::lib/tcc/include/$(basename "$f")"
         done
         echo "[DATA-DISK] Copied TCC headers to /lib/tcc/include/"
+    fi
+
+    # ── BusyBox binary + applet wrapper scripts (built by build-busybox.sh) ─
+    # Ships a single static musl binary at /bin/busybox plus a curated set of
+    # `#!/bin/busybox <applet>` wrapper scripts for sh, ls, cat, grep, awk, etc.
+    # The wrappers depend on kernel shebang (#!) support; the real binary can
+    # always be invoked directly as `busybox <applet>`.
+    if [ -f "${BUILD_DIR}/disk/bin/busybox" ]; then
+        mcopy -o -i "${DATA_IMG}" "${BUILD_DIR}/disk/bin/busybox" "::bin/busybox"
+        echo "[DATA-DISK] Copied busybox binary to /bin/busybox"
+        # Copy every non-binary, non-list wrapper script that was staged next
+        # to busybox. We skip busybox itself and the .applets reference file.
+        wrapper_count=0
+        for f in "${BUILD_DIR}/disk/bin/"*; do
+            [ -f "${f}" ] || continue
+            bn="$(basename "${f}")"
+            case "${bn}" in
+                busybox|busybox.applets|tcc|firefox|hello|mmap_test|dynamic_hello|dynamic_hello_pie|clone_thread_test|socket_test|glibc_hello)
+                    continue ;;
+            esac
+            mcopy -o -i "${DATA_IMG}" "${f}" "::bin/${bn}" 2>/dev/null && \
+                wrapper_count=$((wrapper_count + 1))
+        done
+        echo "[DATA-DISK] Copied ${wrapper_count} busybox applet wrappers to /bin/"
+    fi
+
+    # ── Host userspace headers (staged by build-busybox.sh) ─────────────────
+    # Lets TCC-compiled C programs find <stdio.h>, <unistd.h>, <linux/*.h>
+    # etc. at /usr/include/ on the guest.
+    if [ -d "${BUILD_DIR}/disk/usr/include" ]; then
+        mmd -i "${DATA_IMG}" "::usr"         2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/include" 2>/dev/null || true
+        mcopy -s -o -i "${DATA_IMG}" "${BUILD_DIR}/disk/usr/include/." \
+            "::usr/include/" 2>/dev/null || true
+        echo "[DATA-DISK] Copied usr/include/ (userspace headers for TCC)"
     fi
 
     # ── Test programs (disk/test/) ───────────────────────────────────────────

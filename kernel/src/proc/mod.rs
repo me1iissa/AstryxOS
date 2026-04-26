@@ -1182,6 +1182,28 @@ pub fn exit_group(exit_code: i64) {
     let pid;
     let parent_pid;
 
+    // ── Firefox-test diagnostic dump ─────────────────────────────────────────
+    // On non-zero exit, first dump a userspace stack snapshot (RSP/RBP,
+    // 128 bytes of stack top, RBP chain up to 8 frames) so the harness can
+    // resolve the call chain that led to `exit(1)`.  Then spill the
+    // per-process syscall ring buffer to serial.  Both must run BEFORE any
+    // teardown so the caller's CR3 and VMAs are still live.  Neither dump
+    // takes locks that conflict with the teardown below.
+    #[cfg(feature = "firefox-test")]
+    {
+        let cur_pid = current_pid();
+        if cur_pid >= 1 {
+            if exit_code != 0 {
+                let (user_rsp, user_rbp) = crate::syscall::get_user_rsp_rbp();
+                let cr3 = crate::mm::vmm::get_cr3();
+                crate::syscall::ring::dump_exit_stack(cur_pid, cr3, user_rsp, user_rbp);
+                crate::syscall::ring::dump_for_exit(cur_pid, exit_code);
+            } else {
+                crate::syscall::ring::drop_ring(cur_pid);
+            }
+        }
+    }
+
     // Kill every OTHER thread in the process immediately, but NOT the caller.
     //
     // CRITICAL: interrupts are re-enabled in syscall_entry before dispatch() is

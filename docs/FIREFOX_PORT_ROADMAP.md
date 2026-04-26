@@ -9,6 +9,25 @@ no dynamic linker, no threading, no userspace graphics).
 
 ---
 
+## Progression Log
+
+Running tally of where `firefox-test` stalls. Tick = 10 ms at the 100 Hz kernel timer.
+
+| Date       | Ticks | Blocker                                                               | Resolution / tracking                                                        |
+|------------|-------|-----------------------------------------------------------------------|------------------------------------------------------------------------------|
+| 2026-04-23 | 2071  | `libgtk-3.so.0` missing during `XPCOMGlueLoad` (post-sysfs-st_size fix) | Resolved: host-lib staging — commit `c86b9a5` stages 67 real GTK3/X11/Pango/Cairo libs. |
+| 2026-04-23 | 29500 | Scheduler watchdog `BUGCHECK 0xdead0004` at tick 43401 during NSS/ICU/fontcache init | New issue — watchdog raise / runtime config. See GitHub issue for scheduler watchdog P1. |
+
+- 2026-04-24: tick 75002 (post-WATCHDOG_LIMIT bump to 60000 under firefox-test).
+  Firefox now enters a 70k-tick pure-userspace CPU loop after reading
+  `/proc/mounts`; watchdog still fires despite raised limit. Root cause is
+  in userspace, not the kernel. Trace flags (`syscall-trace`, `pf-trace`)
+  landed in 2911a10 to support the next round of bisection. See issue #40.
+
+Design pivot captured on 2026-04-23: for GTK3 core we now use real host libraries rather than stubs, because `libmozgtk` calls into real GTK3 APIs for widget creation and event-loop integration (not just symbol resolution). Stubs remain the right answer for D-Bus / accessibility / IM module adapters.
+
+---
+
 ## Architecture Overview
 
 ```

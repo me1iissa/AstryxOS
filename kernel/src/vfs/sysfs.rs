@@ -77,9 +77,13 @@ impl SysFs {
 
     fn content(inode: u64) -> Option<&'static [u8]> {
         match inode {
-            // Single CPU (cpu0 only).
-            INO_CPU_PRESENT  => Some(b"0\n"),
-            INO_CPU_POSSIBLE => Some(b"0\n"),
+            // Two-CPU SMP — matches QEMU's `-smp 2` default.  glibc's
+            // pthread/nproc init reads these and falls back to a no-thread
+            // path when it sees a single online CPU, so we synthesise the
+            // canonical `cpulist` form (sysfs(5), `bitmap_print_to_pagebuf`)
+            // for both CPUs even though we expose only `cpu0` directories.
+            INO_CPU_PRESENT  => Some(b"0-1\n"),
+            INO_CPU_POSSIBLE => Some(b"0-1\n"),
             // 2 GHz reported in kHz (matches /proc/cpuinfo cpu MHz: 2000.000).
             INO_CPU0_FREQ_MAX  => Some(b"2000000\n"),
             // L2 4 MiB, L3 8 MiB — plausible for a QEMU virtual CPU.

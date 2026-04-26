@@ -838,6 +838,13 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         "MOZ_DISABLE_CONTENT_SANDBOX=1",
         "MOZ_DISABLE_NONLOCAL_CONNECTIONS=1",
         "MOZ_DISABLE_AUTO_SAFE_MODE=1",
+        // Short-circuit SetExceptionHandler() before it touches the
+        // Crash Reports directory tree.  Release builds of Firefox check
+        // `MOZ_CRASHREPORTER_DISABLE` early and return NS_OK without any
+        // filesystem setup, sidestepping /home/user/.mozilla/firefox/Crash
+        // Reports/ creation and the subsequent fatal-on-error writes that
+        // bubble up through CrashReporter::SetupExtraData().
+        "MOZ_CRASHREPORTER_DISABLE=1",
         // Force single-process mode — no content process fork.
         "MOZ_FORCE_DISABLE_E10S=1",
         // Skip GPU/glxtest process — we don't support fork+exec yet.
@@ -854,6 +861,13 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         // Without this, Firefox forks a child that execs dbus-launch, fails
         // (not on disk), and both parent and child exit with code 1.
         "DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus.sock",
+        // Route NSPR/XPCOM module logging to stderr (fd 2) so the kernel
+        // write-trace picks it up.  Level 5 = debug.  Deliberately omit
+        // NSPR_LOG_FILE — we want output on the parent-visible fd, not
+        // squirreled away in a file we'd have to tail separately.
+        // See https://firefox-source-docs.mozilla.org/xpcom/logging.html
+        "MOZ_LOG=all:5,nsresult:5,xpcom:5",
+        "NSPR_LOG_MODULES=all:5",
     ];
 
     // Spawn blocked so we can attach the pipe before the child can run.

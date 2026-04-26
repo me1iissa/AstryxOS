@@ -3,6 +3,7 @@ target/
 FFDeps/
 build/
 TinyCC/
+BusyBox/
 .vscode/
 .claude/
 *.bak

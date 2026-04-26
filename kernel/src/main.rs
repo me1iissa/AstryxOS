@@ -42,6 +42,8 @@ mod syscall;
 mod test_runner;
 mod gdi;
 mod gui;
+#[cfg(feature = "kdb")]
+mod kdb;
 mod msg;
 mod vfs;
 mod wm;
@@ -160,6 +162,15 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     serial_println!("[Aether] Phase 8: Network init...");
     net::init();
     serial_println!("[Aether] Phase 8: Network OK");
+
+    // Phase 8b: kdb TCP introspection server (feature-gated).
+    // Must run after net::init() because it calls tcp::listen().
+    #[cfg(feature = "kdb")]
+    {
+        serial_println!("[Aether] Phase 8b: kdb introspection server init...");
+        kdb::init();
+        serial_println!("[Aether] Phase 8b: kdb OK");
+    }
 
     // Phase 9: NT Executive subsystems
     serial_println!("[Aether] Phase 9: NT Executive subsystems init...");
@@ -395,10 +406,10 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // (instant) instead of reading from disk (5+ minutes on WSL2/KVM).
             serial_println!("[FFTEST] Pre-populating page cache from disk (slow ATA PIO)...");
             for path in &[
-                "/disk/lib64/ld-linux-x86-64.so.2",   // 236 KB — instant
-                "/disk/lib/firefox/firefox-bin",       // 2.7 MB — ~10s
+                "/disk/lib64/ld-linux-x86-64.so.2",    // 236 KB — instant
+                "/disk/opt/firefox/firefox-bin",        // 671 KB — ~3s
                 "/disk/lib/x86_64-linux-gnu/libc.so.6", // 2.0 MB — ~8s
-                "/disk/lib/firefox/libxul.so",          // 194 MB — ~10 min (but worth it)
+                "/disk/opt/firefox/libxul.so",          // 157 MB — ~10 min (but worth it)
             ] {
                 let t0 = arch::x86_64::irq::get_ticks();
                 let pages = mm::cache::prepopulate_file(path);
@@ -411,10 +422,10 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             serial_println!("[FFTEST] Page cache: {} pages total", total);
             serial_println!("[FFTEST] Pre-load complete — launching Firefox");
 
-            serial_println!("[FFTEST] Launching /disk/lib/firefox/firefox-bin ...");
+            serial_println!("[FFTEST] Launching /disk/opt/firefox/firefox-bin ...");
             // X11 windowed mode — Firefox should create a window on our X11 server.
             gui::terminal::launch_process(
-                "/disk/lib/firefox/firefox-bin --no-remote --profile /tmp/ff-profile --new-instance",
+                "/disk/opt/firefox/firefox-bin --no-remote --profile /tmp/ff-profile --new-instance",
             );
 
             // Run for up to 30000 ticks (~300 s), polling output and network.

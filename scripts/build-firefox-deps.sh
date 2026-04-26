@@ -13,9 +13,17 @@
 # Usage:
 #   ./scripts/build-firefox-deps.sh [--clean] [--lib <name>]
 #
-#   --clean         Remove sysroot and rebuild from scratch
-#   --lib <name>    Build only the specified library
-#   --jobs <N>      Parallel make jobs (default: nproc)
+#   --clean            Remove sysroot and rebuild from scratch
+#   --lib <name>       Build only the specified library
+#   --jobs <N>         Parallel make jobs (default: nproc)
+#   --copy-host-libs   Short-term shortcut for Firefox ESR 115: copy the
+#                      host's GTK3 runtime stack (and transitive deps) from
+#                      Ubuntu 24.04 into build/disk/usr/lib/x86_64-linux-gnu/
+#                      so XPCOMGlueLoad can resolve libgtk-3.so.0 at dlopen
+#                      time. This mode is INDEPENDENT of the musl cross-build
+#                      path — it only copies host libraries + minimal fonts
+#                      and exits. Requires host glibc to match the on-disk
+#                      glibc (verified for Ubuntu 24.04 / glibc 2.39).
 #
 set -euo pipefail
 
@@ -28,17 +36,175 @@ LOG_DIR="${BUILD_DIR}/firefox-deps-logs"
 JOBS="$(nproc 2>/dev/null || echo 4)"
 ONLY_LIB=""
 CLEAN=false
+COPY_HOST_LIBS=false
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --clean)    CLEAN=true;       shift ;;
-        --lib)      ONLY_LIB="$2";   shift 2 ;;
-        --jobs)     JOBS="$2";        shift 2 ;;
+        --clean)            CLEAN=true;            shift ;;
+        --lib)              ONLY_LIB="$2";         shift 2 ;;
+        --jobs)             JOBS="$2";             shift 2 ;;
+        --copy-host-libs)   COPY_HOST_LIBS=true;   shift ;;
+        -h|--help)
+            sed -n '2,20p' "$0" | sed 's/^# \?//'
+            exit 0
+            ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
+
+# ── Mode: --copy-host-libs ────────────────────────────────────────────────────
+# Short-circuit path. Does not touch the sysroot or invoke musl-gcc. Copies
+# a curated seed list of GTK3/X11 shared libs plus their transitive ldd
+# dependencies into build/disk/usr/lib/x86_64-linux-gnu/ using the host's
+# ldconfig cache. Also stages minimal DejaVu fonts + /etc/fonts/.
+if [ "${COPY_HOST_LIBS}" = true ]; then
+    DISK_USR_LIB="${BUILD_DIR}/disk/usr/lib/x86_64-linux-gnu"
+    DISK_USR_SHARE_FONTS="${BUILD_DIR}/disk/usr/share/fonts/truetype/dejavu"
+    DISK_ETC_FONTS="${BUILD_DIR}/disk/etc/fonts"
+    DISK_FC_CACHE="${BUILD_DIR}/disk/var/cache/fontconfig"
+    mkdir -p "${DISK_USR_LIB}" "${DISK_USR_SHARE_FONTS}" "${DISK_ETC_FONTS}" "${DISK_FC_CACHE}"
+
+    # Seed list — the core GTK3 + X11 rendering stack for Firefox ESR 115.
+    SEED_LIBS=(
+        libgtk-3.so.0  libgdk-3.so.0
+        libglib-2.0.so.0  libgobject-2.0.so.0  libgio-2.0.so.0  libgmodule-2.0.so.0
+        libpango-1.0.so.0  libpangocairo-1.0.so.0  libpangoft2-1.0.so.0
+        libcairo.so.2  libcairo-gobject.so.2
+        libharfbuzz.so.0  libfreetype.so.6  libfontconfig.so.1  libpixman-1.so.0
+        libatk-1.0.so.0  libatk-bridge-2.0.so.0  libepoxy.so.0
+        libX11.so.6  libX11-xcb.so.1  libxcb.so.1  libxcb-render.so.0  libxcb-shm.so.0
+        libXext.so.6  libXrender.so.1  libXcomposite.so.1  libXcursor.so.1
+        libXdamage.so.1  libXfixes.so.3  libXi.so.6  libXinerama.so.1
+        libXrandr.so.2  libXtst.so.6
+        libwayland-client.so.0  libwayland-cursor.so.0  libwayland-egl.so.1
+    )
+
+    # Libraries already present on the AstryxOS data disk (glibc core + libgcc
+    # + libstdc++ + nss). Skip these so we don't clobber the matched-version
+    # copies install-glibc.sh places in /disk/lib/x86_64-linux-gnu/ and
+    # /disk/lib64/.
+    is_excluded() {
+        case "$1" in
+            # Glob on basename. ld-linux-*, libc, libm, libpthread, libdl, librt,
+            # libresolv, libnss_*, libgcc_s, libstdc++ — already on disk.
+            ld-linux-x86-64.so.*|ld-linux.so.*) return 0 ;;
+            libc.so.6|libm.so.6|libpthread.so.0|libdl.so.2) return 0 ;;
+            librt.so.1|libresolv.so.2|libnss_*.so.*) return 0 ;;
+            libgcc_s.so.1|libstdc++.so.*) return 0 ;;
+        esac
+        return 1
+    }
+
+    # Resolve a library name via ldconfig. Emits the real absolute path on
+    # success, empty string on failure.
+    resolve_lib() {
+        local name="$1"
+        ldconfig -p 2>/dev/null \
+            | awk -v n="$name" '$0 ~ "^[[:space:]]*"n"[[:space:]]" {print $NF; exit}'
+    }
+
+    # Copy a resolved .so path into DISK_USR_LIB. Preserves the *soname* (the
+    # name ld.so will look for, e.g. libgtk-3.so.0) while storing the real
+    # file contents (e.g. libgtk-3.so.0.2409.32). Also creates the soname
+    # symlink if the resolved path basename differs from the requested name.
+    # Sets globals: CP_STATUS ("copied"|"present"|"skip"|"missing") and
+    # CP_REAL (real absolute path on "copied", empty otherwise). Avoids a
+    # subshell so COPIED[] mutations persist to the caller.
+    declare -A COPIED    # basename -> realpath (for dedup + symlink building)
+    CP_STATUS=""; CP_REAL=""
+    copy_one() {
+        local want="$1" resolved real bn
+        CP_STATUS=""; CP_REAL=""
+        if is_excluded "$want"; then CP_STATUS="skip"; return 0; fi
+        if [ -n "${COPIED[$want]:-}" ]; then CP_STATUS="present"; return 0; fi
+        resolved="$(resolve_lib "$want")"
+        [ -z "$resolved" ] && { CP_STATUS="missing"; return 0; }
+        real="$(readlink -f "$resolved")"
+        bn="$(basename "$real")"
+        # Store the *real file* under its own basename.
+        if [ ! -f "${DISK_USR_LIB}/${bn}" ]; then
+            cp --preserve=timestamps "$real" "${DISK_USR_LIB}/${bn}"
+        fi
+        # Re-create soname symlink (e.g. libgtk-3.so.0 -> libgtk-3.so.0.2409.32)
+        if [ "$want" != "$bn" ] && [ ! -e "${DISK_USR_LIB}/${want}" ]; then
+            ln -s "$bn" "${DISK_USR_LIB}/${want}"
+        fi
+        COPIED[$want]="$real"
+        COPIED[$bn]="$real"
+        CP_STATUS="copied"; CP_REAL="$real"
+    }
+
+    # Pre-populate COPIED with what's already in DISK_USR_LIB so re-runs are
+    # idempotent and count correctly.
+    for existing in "${DISK_USR_LIB}/"*; do
+        [ -e "$existing" ] || continue
+        COPIED["$(basename "$existing")"]="$existing"
+    done
+
+    echo "[copy-host-libs] Copying seed libs + transitive deps into ${DISK_USR_LIB}"
+    n_copied=0; n_present=0; n_skipped=0
+    declare -A SKIP_REASONS
+    queue=("${SEED_LIBS[@]}")
+    while [ ${#queue[@]} -gt 0 ]; do
+        name="${queue[0]}"
+        queue=("${queue[@]:1}")
+        copy_one "$name"
+        case "$CP_STATUS" in
+            copied)
+                n_copied=$((n_copied + 1))
+                # Expand transitive deps via ldd on the real file just written.
+                while IFS= read -r dep; do
+                    [ -z "$dep" ] && continue
+                    [ -n "${COPIED[$dep]:-}" ] && continue
+                    queue+=("$dep")
+                done < <(ldd "$CP_REAL" 2>/dev/null \
+                    | awk '/=> \// {print $1}')
+                ;;
+            present) n_present=$((n_present + 1)) ;;
+            skip)    n_skipped=$((n_skipped + 1)); SKIP_REASONS[$name]="excluded (already on disk)" ;;
+            missing) n_skipped=$((n_skipped + 1)); SKIP_REASONS[$name]="not found in ldconfig -p" ;;
+        esac
+    done
+
+    # ── Minimal fonts ────────────────────────────────────────────────────────
+    for font in DejaVuSans.ttf DejaVuSans-Bold.ttf DejaVuSansMono.ttf; do
+        src="/usr/share/fonts/truetype/dejavu/${font}"
+        if [ -f "$src" ] && [ ! -f "${DISK_USR_SHARE_FONTS}/${font}" ]; then
+            cp --preserve=timestamps "$src" "${DISK_USR_SHARE_FONTS}/${font}"
+        fi
+    done
+
+    # Copy /etc/fonts/ wholesale (<100 KB, keeps fontconfig happy).
+    if [ -d /etc/fonts ]; then
+        cp -r /etc/fonts/. "${DISK_ETC_FONTS}/" 2>/dev/null || true
+    fi
+
+    # Regenerate fontconfig cache targeting build/disk. --sysroot makes the
+    # cache entries reference *guest* paths (/usr/share/fonts/...) while
+    # scanning the staged host tree. Failure is non-fatal — libfontconfig
+    # inside Firefox will rebuild into /tmp at first use.
+    if command -v fc-cache >/dev/null 2>&1; then
+        fc-cache -f --sysroot="${BUILD_DIR}/disk" /usr/share/fonts 2>/dev/null \
+            || echo "[copy-host-libs] WARN: fc-cache failed — runtime rebuild will kick in"
+    fi
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    total_files="$(find "${DISK_USR_LIB}" -maxdepth 1 -type f,l | wc -l)"
+    total_bytes="$(du -sb "${BUILD_DIR}/disk" 2>/dev/null | awk '{print $1}')"
+    total_mb=$(( total_bytes / 1024 / 1024 ))
+    echo
+    echo "[copy-host-libs] Results:"
+    echo "[copy-host-libs]   copied this run : ${n_copied}"
+    echo "[copy-host-libs]   already present : ${n_present}"
+    echo "[copy-host-libs]   skipped         : ${n_skipped}"
+    for k in "${!SKIP_REASONS[@]}"; do
+        echo "[copy-host-libs]     - ${k}: ${SKIP_REASONS[$k]}"
+    done
+    echo "[copy-host-libs] total: ${total_files} files in ${DISK_USR_LIB}, ${total_mb} MB in build/disk/"
+    exit 0
+fi
 
 # ── Cross-compiler setup ─────────────────────────────────────────────────────
 

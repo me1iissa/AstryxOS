@@ -37,6 +37,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="${ROOT_DIR}/build"
 DISK_LIB64="${BUILD_DIR}/disk/lib64"
+# Firefox runs with LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/disk/lib/firefox.
+# The first entry is searched before /lib64, so any older copy of these
+# stubs at the multiarch path takes precedence.  We install the freshly
+# generated stubs to BOTH locations so the runtime always picks the
+# current version regardless of LD_LIBRARY_PATH order.
+DISK_MULTIARCH="${BUILD_DIR}/disk/lib/x86_64-linux-gnu"
 FF_DIR="${BUILD_DIR}/disk/opt/firefox"
 STUB_DIR="${BUILD_DIR}/firefox-stubs"
 
@@ -47,7 +53,7 @@ for arg in "$@"; do
     esac
 done
 
-mkdir -p "${STUB_DIR}" "${DISK_LIB64}"
+mkdir -p "${STUB_DIR}" "${DISK_LIB64}" "${DISK_MULTIARCH}"
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -63,7 +69,7 @@ build_stub() {
     local vscript="$3"
     local out="${STUB_DIR}/${soname}"
 
-    if [ -f "${DISK_LIB64}/${soname}" ] && [ "${FORCE}" = false ]; then
+    if [ -f "${DISK_LIB64}/${soname}" ] && [ -f "${DISK_MULTIARCH}/${soname}" ] && [ "${FORCE}" = false ]; then
         log "  ${soname} already present — skip (use --force to rebuild)"
         return 0
     fi
@@ -79,6 +85,7 @@ build_stub() {
 
     if gcc "${gcc_args[@]}" 2>/dev/null; then
         cp "${out}" "${DISK_LIB64}/${soname}"
+        cp "${out}" "${DISK_MULTIARCH}/${soname}"
         log "  ${soname}: $(stat -c%s "${out}") bytes"
     else
         log "  WARNING: failed to build stub for ${soname}"
@@ -205,6 +212,17 @@ _EXACT_CATEGORY = {
     # --- bool-success inits ---
     'gtk_init_check':      'bool_true',
     'gtk_init':            'void_noop',
+    # gtk_parse_args returns gboolean (TRUE on success). Default 'null'
+    # → 0 = FALSE makes XREMain::XRE_mainStartup take the `if
+    # (!gtk_parse_args(...)) return 1;` branch at nsAppRunner.cpp:4820,
+    # ending the process with exit_group(1) before any widget setup.
+    # Spec: GTK3 docs — gtk_parse_args() — TRUE if init successful.
+    'gtk_parse_args':      'bool_true',
+    # gdk_display_open / gdk_display_get_default deliberately keep the
+    # default 'null' classifier (return NULL).  Returning an opaque_ptr
+    # convinces GTK init dependents that the X display is valid and they
+    # then busy-loop trying to use it, hanging dlopen.  NULL is the
+    # canonical "no display, run without one" signal.
     'g_thread_init':       'void_noop',
     'g_thread_init_with_errorcheck_mutexes': 'void_noop',
     # --- ref / unref ---

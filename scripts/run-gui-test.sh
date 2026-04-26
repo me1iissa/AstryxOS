@@ -90,71 +90,36 @@ if [[ ! -f "${OVMF_CODE}" ]]; then
     OVMF_VARS=""
 fi
 
-OVMF_VARS_COPY=""
+OVMF_VARS_COPY="${BUILD_DIR}/OVMF_VARS_GUITEST.fd"
 if [[ -n "${OVMF_VARS:-}" ]]; then
-    OVMF_VARS_COPY="${BUILD_DIR}/OVMF_VARS_GUITEST.fd"
     cp "${OVMF_VARS}" "${OVMF_VARS_COPY}"
+else
+    cp "${OVMF_CODE}" "${OVMF_VARS_COPY}"
 fi
 
 # ── Step 3: QEMU command ─────────────────────────────────────────────────────
 : > "${SERIAL_LOG}"   # truncate
 
-QEMU_CMD=(
-    qemu-system-x86_64
-    -machine pc
-    -cpu qemu64,+rdtscp
-    -m 1G
-    -smp 2
-    -serial "file:${SERIAL_LOG}"
-    -no-reboot
-    -no-shutdown
-    -monitor none
-
-    # ISA debug-exit: writing 0 to port 0xf4 → QEMU exit(1) = pass
-    -device isa-debug-exit,iobase=0xf4,iosize=0x04
-
-    # QMP monitor for optional screendump
-    -qmp "unix:${QMP_SOCK},server=on,wait=off"
-)
-
-# Display
-if [[ $SHOW_WINDOW -eq 1 ]]; then
-    QEMU_CMD+=(-vga vmware)
-else
-    # Even headless, -vga vmware lets QMP screendump read SVGA VRAM.
-    QEMU_CMD+=(-vga vmware -display none)
-fi
-
-# UEFI firmware
-if [[ -n "${OVMF_VARS_COPY:-}" ]]; then
-    QEMU_CMD+=(
-        -drive "if=pflash,format=raw,readonly=on,file=${OVMF_CODE}"
-        -drive "if=pflash,format=raw,file=${OVMF_VARS_COPY}"
-    )
-else
-    QEMU_CMD+=(-bios "${OVMF_CODE}")
-fi
-
-# Boot disk
-QEMU_CMD+=(-drive "format=raw,file=fat:rw:${BUILD_DIR}/esp")
-
-# Data disk
 DATA_IMG="${BUILD_DIR}/data.img"
-if [[ -f "${DATA_IMG}" ]]; then
-    QEMU_CMD+=(
-        -drive "file=${DATA_IMG},format=raw,if=none,id=data0,snapshot=on"
-        -device "ide-hd,drive=data0,bus=ide.1"
-    )
-fi
 
-# KVM
-[[ -r /dev/kvm ]] && QEMU_CMD+=(-enable-kvm)
+WINDOW_FLAG=()
+[[ $SHOW_WINDOW -eq 1 ]] && WINDOW_FLAG+=("--window")
 
-# Network (needed for kernel init phases)
-QEMU_CMD+=(
-    -device e1000,netdev=net0
-    -netdev user,id=net0
-)
+KVM_FLAG=(--no-kvm)
+[[ -r /dev/kvm ]] && KVM_FLAG=(--kvm)
+
+# Canonical QEMU argv via scripts/astryx_qemu.py. `gui-test` mode
+# picks vmware VGA + headless display + virtio-blk-pci data disk.
+readarray -t QEMU_CMD < <(python3 "${ROOT_DIR}/scripts/astryx_qemu.py" build \
+    --mode gui-test \
+    --serial-path "${SERIAL_LOG}" \
+    --data-img    "${DATA_IMG}" \
+    --ovmf-code   "${OVMF_CODE}" \
+    --ovmf-vars   "${OVMF_VARS_COPY}" \
+    --esp-dir     "${BUILD_DIR}/esp" \
+    --qmp-sock    "${QMP_SOCK}" \
+    "${WINDOW_FLAG[@]}" \
+    "${KVM_FLAG[@]}")
 
 # ── Step 4: Run QEMU ─────────────────────────────────────────────────────────
 echo -e "${CYAN}[GUITEST] Launching QEMU (gui-test mode)...${NC}"
@@ -168,37 +133,18 @@ QEMU_PID=$!
 tail -f "${SERIAL_LOG}" --pid=${QEMU_PID} 2>/dev/null &
 TAIL_PID=$!
 
-# Background: watch for [GUITEST] DONE, then take a QMP screendump
+# Background: watch for [GUITEST] DONE, then take a QMP screendump.
+# The QMP handshake lives in scripts/astryx_qemu.py (audit LOW-5) — the
+# inline heredoc that used to be here was a second implementation of
+# the QMP client already present in qemu-harness.py.
 (
     for _ in $(seq 1 600); do
         sleep 0.2
         if grep -q '\[GUITEST\] DONE' "${SERIAL_LOG}" 2>/dev/null; then
-            # Try QMP screendump — kernel waits ~1 s before debug-exit
             if command -v python3 &>/dev/null && [[ -S "${QMP_SOCK}" ]]; then
-                python3 - "${QMP_SOCK}" "${SCREENSHOT}" <<'PYEOF' 2>/dev/null || true
-import socket, json, sys, time
-sock_path, out_path = sys.argv[1], sys.argv[2]
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-try:
-    s.connect(sock_path)
-    s.settimeout(5)
-    # Read greeting
-    data = b""
-    while b"\n" not in data:
-        data += s.recv(4096)
-    # Negotiate capabilities
-    s.sendall(json.dumps({"execute": "qmp_capabilities"}).encode() + b"\n")
-    time.sleep(0.2)
-    s.recv(4096)
-    # Take screenshot
-    cmd = {"execute": "screendump", "arguments": {"filename": out_path}}
-    s.sendall(json.dumps(cmd).encode() + b"\n")
-    time.sleep(1)
-    s.recv(4096)
-    print(f"[GUITEST] Screenshot saved to {out_path}")
-finally:
-    s.close()
-PYEOF
+                python3 "${ROOT_DIR}/scripts/astryx_qemu.py" screendump \
+                    --qmp-sock "${QMP_SOCK}" \
+                    --out      "${SCREENSHOT}" 2>/dev/null || true
             fi
             break
         fi

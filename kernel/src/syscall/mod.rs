@@ -21,6 +21,22 @@ use alloc::vec::Vec;
 use astryx_shared::syscall::*;
 use spin::Mutex;
 
+/// Per-process syscall ring buffer (firefox-test diagnostic aid).  Active
+/// code is feature-gated inside; the module itself compiles out cleanly when
+/// the feature is off because nothing outside the module references it.
+#[cfg(feature = "firefox-test")]
+pub mod ring;
+
+/// Stub `ring` module for builds without the firefox-test feature.  Provides
+/// the `is_tracked()` predicate so generic syscall-trace gates can compile
+/// uniformly; always returns false because no PIDs are tracked outside of
+/// the firefox-test diagnostic build.
+#[cfg(not(feature = "firefox-test"))]
+pub mod ring {
+    #[inline]
+    pub fn is_tracked(_pid: u64) -> bool { false }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // User pointer validation
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -170,6 +186,65 @@ pub unsafe fn set_kernel_rsp(rsp: u64) {
 pub unsafe fn get_user_rip() -> u64 {
     let cpu = cpu_index();
     PER_CPU_SYSCALL[cpu].user_rip
+}
+
+/// Read the user RSP / RBP values captured at syscall entry on the current
+/// CPU.  Returns `(0, 0)` if no syscall frame is active — e.g. when called
+/// from a context that did not enter via SYSCALL (int 0x80 path, test
+/// harness).  The values come from the per-CPU `frame_rsp` slot populated
+/// by `syscall_entry`; see its frame-layout comment for offsets.
+///
+/// Used by the firefox-test exit-time stack snapshot.
+pub fn get_user_rsp_rbp() -> (u64, u64) {
+    let cpu = cpu_index();
+    let rsp = unsafe { PER_CPU_SYSCALL[cpu as usize].frame_rsp };
+    if rsp == 0 { return (0, 0); }
+    unsafe {
+        let p = rsp as *const u64;
+        // Frame layout from syscall_entry:
+        //   [11]=rbp   [14]=user_rsp
+        (*p.add(14), *p.add(11))
+    }
+}
+
+/// Read the user-mode caller return address at `[rsp]`.  For System V x86_64,
+/// the C `syscall()` wrapper (`libc/sysdeps/unix/sysv/linux/x86_64/syscall.S`)
+/// issues the hardware `syscall` instruction directly; `syscall` does NOT
+/// push a return address, so the top-of-stack at syscall entry is still the
+/// return address to the wrapper's caller.  This gives us an immediate "who
+/// called the libc syscall wrapper" frame without needing a full stack walk.
+///
+/// Returns `0` if the frame is not active or the read is unsafe.
+///
+/// NOTE: the read walks the active user CR3 (we are still on the user page
+/// tables at the first instruction of the syscall handler, before any CR3
+/// switch).  If the stack page is not mapped we return 0.  The read is
+/// unguarded — a subsequent page fault would be fatal — so callers should
+/// only invoke this from the syscall entry path where user_rsp is provably
+/// mapped.
+pub fn get_user_caller_rip() -> u64 {
+    let (user_rsp, _) = get_user_rsp_rbp();
+    if user_rsp == 0 { return 0; }
+    // Sanity bounds: must be in a plausible user-space range and 8-byte
+    // aligned.  Anything else is a corrupted frame; return 0 rather than
+    // fault.
+    if user_rsp < 0x1000 || user_rsp >= astryx_shared::KERNEL_VIRT_BASE { return 0; }
+    if user_rsp & 0x7 != 0 { return 0; }
+    // Fault-safe deref: walk the current process's page table.  A raw
+    // *(user_rsp) deref hangs the syscall handler if user_rsp is in an
+    // mmap'd-but-not-demand-paged stack page (the deref page-faults
+    // inside the syscall path, observed during dlopen of libXfixes
+    // which mmaps a fresh stack page just before issuing the next
+    // syscall).  Returning 0 is acceptable — caller_rip is diagnostic
+    // only and never load-bearing.
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    let cr3 = crate::mm::vmm::get_cr3();
+    match crate::mm::vmm::virt_to_phys_in(cr3, user_rsp) {
+        Some(phys) => unsafe {
+            core::ptr::read_unaligned((PHYS_OFF + phys) as *const u64)
+        },
+        None => 0,
+    }
 }
 
 /// Return the kernel RSP set for the current CPU's active user thread.
@@ -513,8 +588,8 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
 
     crate::serial_println!("[SYSCALL] exec(\"{}\")", path);
 
-    // Read ELF binary from VFS.
-    let elf_data = match crate::vfs::read_file(path) {
+    // Read the target file from VFS.
+    let file_data = match crate::vfs::read_file(path) {
         Ok(data) => data,
         Err(e) => {
             crate::serial_println!("[SYSCALL] exec: file not found: {:?}", e);
@@ -522,22 +597,41 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
         }
     };
 
-    // Validate it's an ELF binary.
+    // Read argv and envp arrays from user memory (null ptr → empty).
+    let mut argv_owned = crate::subsys::linux::syscall::read_user_argv(argv_ptr);
+    let envp_owned = crate::subsys::linux::syscall::read_user_argv(envp_ptr);
+
+    // Default argv to [path] if caller passed NULL — before shebang resolution,
+    // because `resolve_shebang` needs argv[0] to rewrite the new argv tail.
+    if argv_owned.is_empty() {
+        argv_owned.push(alloc::string::String::from(path));
+    }
+
+    // Resolve `#!` shebangs. If the file is already an ELF, this is a no-op.
+    // Otherwise it reads the interpreter chain (up to SHEBANG_MAX_RECURSION
+    // levels), rewrites argv, and returns the final interpreter ELF + argv.
+    let (elf_data, argv_owned) = {
+        let argv_refs: alloc::vec::Vec<&str> = argv_owned.iter().map(|s| s.as_str()).collect();
+        match crate::proc::elf::resolve_shebang(path, file_data, &argv_refs) {
+            Ok(r) => (r.elf_data, r.argv),
+            Err(e) => {
+                crate::serial_println!("[SYSCALL] exec: shebang/load error: {}", e);
+                return e;
+            }
+        }
+    };
+
+    // Validate it's an ELF binary (resolve_shebang guarantees this on Ok).
     if !crate::proc::elf::is_elf(&elf_data) {
         crate::serial_println!("[SYSCALL] exec: not an ELF binary");
         return -8; // ENOEXEC
     }
 
-    // Read argv and envp arrays from user memory (null ptr → empty).
-    let argv_owned = crate::subsys::linux::syscall::read_user_argv(argv_ptr);
-    let envp_owned = crate::subsys::linux::syscall::read_user_argv(envp_ptr);
-
     // Build &[&str] slices valid for the duration of this call.
     let argv_strs: alloc::vec::Vec<&str> = argv_owned.iter().map(|s| s.as_str()).collect();
     let envp_strs: alloc::vec::Vec<&str> = envp_owned.iter().map(|s| s.as_str()).collect();
 
-    // Default argv to [path] if caller passed NULL.
-    let argv_slice: &[&str] = if argv_strs.is_empty() { &[path] } else { &argv_strs };
+    let argv_slice: &[&str] = &argv_strs;
     let envp_slice: &[&str] = if envp_strs.is_empty() {
         &["HOME=/", "PATH=/bin:/disk/bin"]
     } else {
@@ -1267,26 +1361,6 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
     let length = page_align_up(length);
     let pid = crate::proc::current_pid();
 
-    let mut procs = crate::proc::PROCESS_TABLE.lock();
-    let proc = match procs.iter_mut().find(|p| p.pid == pid) {
-        Some(p) => p,
-        None => return -3, // ESRCH
-    };
-
-    // Ensure process has a VmSpace.
-    // For vfork children (vm_space=None, shared parent CR3): create a VmSpace
-    // that uses the process's actual CR3 (shared with parent) so mmap pages
-    // go into the correct page table.
-    if proc.vm_space.is_none() {
-        let cr3 = proc.cr3;
-        if cr3 != 0 {
-            proc.vm_space = Some(VmSpace::from_existing_cr3(cr3));
-        } else {
-            proc.vm_space = Some(VmSpace::new_kernel());
-        }
-    }
-    let space = proc.vm_space.as_mut().unwrap();
-
     // MAP_FIXED_NOREPLACE (Linux 4.17+, flag 0x100000): like MAP_FIXED but the
     // kernel should return EEXIST if the range is already mapped.  Modern glibc
     // (2.31+) and ld-linux use this flag when loading library segments so that
@@ -1303,89 +1377,170 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
     let is_fixed = flags & (MAP_FIXED as u32 | MAP_FIXED_NOREPLACE) != 0;
     let is_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
 
+    // ── Phase 1 — choose base address, resolve fd, build the VMA. ────────────
+    //
+    // Lock is held only while we read the per-process state we need.  We
+    // capture cr3 plus the resolved VmBacking and decided base address, then
+    // drop the lock so the bulk page-table edit (Phase 2) and the heavy
+    // unmap-and-free loop don't block other CPUs' page faults / kdb queries.
+    //
+    // For MAP_FIXED-without-NOREPLACE the unmap loop is the long-running
+    // step (one VMM_LOCK + PMM_LOCK round-trip per page); previously it ran
+    // with PROCESS_TABLE held, which froze the rest of the kernel for the
+    // duration of every library-segment overlay during ld-linux's load.
+    //
+    // (backing, name, base, cr3) is computed atomically under the lock so
+    // address-space invariants are preserved at decision time.
+    let (cr3, backing, name, base) = {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        let proc = match procs.iter_mut().find(|p| p.pid == pid) {
+            Some(p) => p,
+            None => return -3, // ESRCH
+        };
 
-    // Choose base address
-    let base = if is_fixed {
-        let base = page_align_down(addr_hint);
-        if base == 0 {
-            return -22; // EINVAL
-        }
-        if is_noreplace {
-            // Fail if any existing VMA overlaps the requested range.
-            let conflict = space.areas.iter().any(|vma| vma.overlaps(base, length));
-            if conflict {
-                return -17; // EEXIST
+        // Ensure process has a VmSpace.
+        // For vfork children (vm_space=None, shared parent CR3): create a VmSpace
+        // that uses the process's actual CR3 (shared with parent) so mmap pages
+        // go into the correct page table.
+        if proc.vm_space.is_none() {
+            let proc_cr3 = proc.cr3;
+            if proc_cr3 != 0 {
+                proc.vm_space = Some(VmSpace::from_existing_cr3(proc_cr3));
+            } else {
+                proc.vm_space = Some(VmSpace::new_kernel());
             }
+        }
+        let space = proc.vm_space.as_mut().unwrap();
+
+        // Choose base address.
+        let chosen_base = if is_fixed {
+            let b = page_align_down(addr_hint);
+            if b == 0 {
+                return -22; // EINVAL
+            }
+            if is_noreplace {
+                let conflict = space.areas.iter().any(|vma| vma.overlaps(b, length));
+                if conflict {
+                    return -17; // EEXIST
+                }
+            }
+            b
         } else {
-            // Regular MAP_FIXED: silently replace existing mappings.
-            //
-            // CRITICAL: We must unmap any physical pages already present in the
-            // page table for [base, base+length) BEFORE removing the VMA record.
-            // If we only remove the VMA (leaving old PTEs intact), the new
-            // file-backed VMA will be shadowed by the old physical pages — page
-            // faults won't fire and the process reads stale data instead of the
-            // new file content.  This is what caused ld-linux link_map->l_addr
-            // corruption when a MAP_PRIVATE|MAP_NORESERVE reservation (with a
-            // few demand-paged pages) was replaced by MAP_FIXED segment mmaps.
-            let cr3 = space.cr3;
-            let mut pg = base;
-            while pg < base + length {
-                if let Some(phys) = crate::mm::vmm::virt_to_phys_in(cr3, pg) {
-                    crate::mm::vmm::unmap_page_in(cr3, pg);
-                    crate::mm::vmm::invlpg(pg);
-                    let new_rc = crate::mm::refcount::page_ref_dec(phys);
-                    if new_rc == 0 {
-                        crate::mm::pmm::free_page(phys);
+            match space.find_free_range(length) {
+                Some(b) => b,
+                None => return -12, // ENOMEM
+            }
+        };
+
+        // Resolve backing type while we still hold the lock (fd lookup needs
+        // proc.file_descriptors).
+        let is_anon = flags & MAP_ANONYMOUS as u32 != 0
+            || fd == u64::MAX
+            || fd as i64 == -1;
+
+        let (vma_backing, vma_name) = if is_anon {
+            (VmBacking::Anonymous, "[mmap]")
+        } else {
+            let fd_num = fd as usize;
+            match proc.file_descriptors.get(fd_num).and_then(|f| f.as_ref()) {
+                Some(fd_entry) if fd_entry.open_path == "/dev/fb0" => {
+                    if let Some((phys_base, _w, _h, _pitch)) =
+                        crate::drivers::vmware_svga::get_framebuffer()
+                    {
+                        (VmBacking::Device { phys_base }, "[fb0]")
+                    } else {
+                        return -6; // ENXIO
                     }
                 }
-                pg += 0x1000;
-            }
-            let _ = space.remove_range(base, length);
-        }
-        base
-    } else {
-        match space.find_free_range(length) {
-            Some(b) => b,
-            None => return -12, // ENOMEM
-        }
-    };
-
-    // Determine backing type: file-backed or anonymous
-    let is_anon = flags & MAP_ANONYMOUS as u32 != 0
-        || fd == u64::MAX
-        || fd as i64 == -1;
-
-    let (backing, name) = if is_anon {
-        (VmBacking::Anonymous, "[mmap]")
-    } else {
-        // File-backed or device-backed mapping: look up the fd.
-        let fd_num = fd as usize;
-        match proc.file_descriptors.get(fd_num).and_then(|f| f.as_ref()) {
-            Some(fd_entry) if fd_entry.open_path == "/dev/fb0" => {
-                // Framebuffer mmap → device-backed VMA using SVGA physical base.
-                if let Some((phys_base, _w, _h, _pitch)) =
-                    crate::drivers::vmware_svga::get_framebuffer()
-                {
-                    (VmBacking::Device { phys_base }, "[fb0]")
-                } else {
-                    return -6; // ENXIO
+                Some(fd_entry) if fd_entry.open_path.starts_with("/dev/dri/") => {
+                    (VmBacking::Anonymous, "[dri-stub]")
                 }
+                Some(fd_entry) if !fd_entry.is_console => {
+                    let page_offset = offset & !0xFFF;
+                    (VmBacking::File {
+                        mount_idx: fd_entry.mount_idx,
+                        inode: fd_entry.inode,
+                        offset: page_offset,
+                    }, "[mmap-file]")
+                }
+                _ => return -9, // EBADF
             }
-            // /dev/dri/card0 and other device stubs → anonymous (renders nothing)
-            Some(fd_entry) if fd_entry.open_path.starts_with("/dev/dri/") => {
-                (VmBacking::Anonymous, "[dri-stub]")
-            }
-            Some(fd_entry) if !fd_entry.is_console => {
-                let page_offset = offset & !0xFFF;
-                (VmBacking::File {
-                    mount_idx: fd_entry.mount_idx,
-                    inode: fd_entry.inode,
-                    offset: page_offset,
-                }, "[mmap-file]")
-            }
-            _ => return -9, // EBADF
-        }
+        };
+
+        (space.cr3, vma_backing, vma_name, chosen_base)
     };
+
+    // ── MAP_FIXED replacement: split into three phases ──────────────────────
+    //
+    // POSIX mmap(2) requires MAP_FIXED to silently replace any existing
+    // mappings that overlap [base, base+length).  We perform the
+    // replacement under separate lock acquisitions so the writer never
+    // blocks faults on a heavy bulk page-table edit (libxul's execve
+    // teardown unmaps hundreds of MiB):
+    //
+    //   Phase 2a (lock):       remove the overlapping VMA records.
+    //   Phase 2b (lock-free):  unmap_and_free_range_in clears the PTEs
+    //                          and decrements/frees the backing frames.
+    //   Phase 3  (lock):       insert the new VMA record.
+    //
+    // The race window admitted by an earlier ordering (Phase 2b first,
+    // Phase 2a second — i.e. PT cleared while a stale VMA still describes
+    // the range) is closed by performing the VMA removal FIRST.  A fault
+    // arriving after Phase 2a runs find_vma under PROCESS_TABLE and finds
+    // no covering VMA, returning false → SIGSEGV — the expected outcome
+    // for a concurrent access into a region the user has just asked the
+    // kernel to replace.  A fault arriving before Phase 2a sees the old
+    // VMA, demand-pages into the range, and the PTE it installs is cleared
+    // by Phase 2b a moment later — also expected MAP_FIXED-replacement
+    // behaviour.  See arch::x86_64::idt::handle_page_fault for the lookup.
+    //
+    // ── File-backed safety: the page cache holds its own refcount ──
+    //
+    // For file-backed mappings the "before-Phase-2a" sub-case deserves an
+    // explicit safety argument because Phase 2b runs lock-free.  Sequence:
+    //
+    //   T0  CPU1 #PF on `addr` ∈ [base, base+length).  find_vma returns
+    //       the OLD file-backed VMA.
+    //   T1  CPU1 demand-pages: cache::lookup hits, returns frame F.
+    //       page_ref_inc(F) → rc=2 (cache's ref + new PTE's ref).
+    //       (If the cache miss path: pmm::alloc_page → cache::insert,
+    //        which does its own page_ref_inc(F) → rc=1 for the cache;
+    //        the demand-page code then does a second page_ref_inc(F) →
+    //        rc=2 before installing the PTE.  See idt.rs::handle_page_fault.)
+    //   T2  CPU0 Phase 2a: remove_range under PROCESS_TABLE.
+    //   T3  CPU0 Phase 2b: unmap_and_free_range_in walks PTEs lock-free,
+    //       finds F installed by CPU1, page_ref_dec(F) → rc=1.
+    //       rc != 0 ⇒ pmm::free_page(F) is NOT called; F stays alive.
+    //   T4  Cache still owns its reference to F; subsequent lookups still
+    //       hit; Phase 3 installs the new VMA describing the same range.
+    //
+    // The invariant — "every PTE pointing at a cached frame F holds its
+    // own ref on F, distinct from the cache's ref" — is enforced by
+    // every map_page_in call site in handle_page_fault: each is paired
+    // with a page_ref_inc (or, for MAP_PRIVATE-writable, an alloc_page
+    // + page_ref_set(_, 1) for a private copy whose lifetime is tied
+    // to that PTE alone).  See kernel/src/mm/cache.rs and
+    // kernel/src/mm/refcount.rs.
+    //
+    // Non-MAP_FIXED skips Phases 2a/2b entirely — there is nothing to
+    // clear.
+    if is_fixed && !is_noreplace {
+        // Phase 2a — remove the overlapping VMA records under PROCESS_TABLE.
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
+            if let Some(space) = proc.vm_space.as_mut() {
+                let _ = space.remove_range(base, length);
+            }
+        }
+        drop(procs);
+
+        // Phase 2b — clear the PTEs and release the backing frames without
+        // holding PROCESS_TABLE.  unmap_and_free_range_in serialises on
+        // VMM_LOCK + PMM_LOCK internally; concurrent kdb proc-list /
+        // proc <pid> queries can still progress (they use try_lock_brief
+        // — see kdb.rs).
+        crate::mm::vmm::unmap_and_free_range_in(cr3, base, length);
+    }
 
     let vma = VmArea {
         base,
@@ -1405,18 +1560,25 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
             pid, base, length, r, w, x, fd as i64, offset, name);
     }
 
+    // Phase 3 — install the new VMA under PROCESS_TABLE.
+    let mut procs = crate::proc::PROCESS_TABLE.lock();
+    let proc = match procs.iter_mut().find(|p| p.pid == pid) {
+        Some(p) => p,
+        None => return -3, // ESRCH (process exited between phases)
+    };
+    let space = match proc.vm_space.as_mut() {
+        Some(s) => s,
+        None => return -3,
+    };
+
     match space.insert_vma(vma) {
         Ok(()) => {
-            // Update mmap hint for next allocation
             if base < space.mmap_hint {
                 space.mmap_hint = base;
             }
             base as i64
         }
         Err(_) => {
-            // Log VMA insert failures — these indicate a MAP_FIXED race or
-            // a remaining overlap after remove_range that would silently return
-            // the wrong address to ld-linux, corrupting link_map->l_addr.
             crate::serial_println!(
                 "[MMAP-ERR] pid={} insert_vma failed: base={:#x} len={:#x} flags={:#x} fd={}",
                 pid, base, length, flags, fd as i64
@@ -1431,7 +1593,7 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
 /// For each mapped page the reference count is decremented.  When it
 /// reaches zero the physical frame is returned to the PMM.
 pub(crate) fn sys_munmap(addr: u64, length: u64) -> i64 {
-    use crate::mm::vma::*;
+    use crate::mm::vma::page_align_up;
 
     if length == 0 || addr & 0xFFF != 0 {
         return -22; // EINVAL
@@ -1440,29 +1602,37 @@ pub(crate) fn sys_munmap(addr: u64, length: u64) -> i64 {
     let length = page_align_up(length);
     let pid = crate::proc::current_pid();
 
-    let mut procs = crate::proc::PROCESS_TABLE.lock();
-    let proc = match procs.iter_mut().find(|p| p.pid == pid) {
-        Some(p) => p,
-        None => return -3,
-    };
-
-    if let Some(space) = proc.vm_space.as_mut() {
+    // ── Phase 1 (lock) — capture cr3 AND remove the VMA records first. ────
+    //
+    // The remove_range call MUST happen before the lock-free PTE clear so
+    // that a concurrent page fault on another CPU cannot find a stale VMA
+    // covering the range and demand-page a fresh frame into it.  The
+    // page-fault handler's `find_vma` lookup runs under PROCESS_TABLE
+    // (see arch::x86_64::idt::handle_page_fault), so once Phase 1 commits
+    // a fault on the unmapped range will return None → SIGSEGV (the
+    // expected outcome for an unmapped address).
+    //
+    // Phase 2 (the bulk PTE clear + frame free) runs WITHOUT the lock so
+    // unmapping a large region (e.g. ld-linux's libxul placeholder during
+    // execve teardown) doesn't stall every other CPU's page-fault handler
+    // or freeze kdb introspection.
+    let cr3 = {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        let proc = match procs.iter_mut().find(|p| p.pid == pid) {
+            Some(p) => p,
+            None => return -3,
+        };
+        let space = match proc.vm_space.as_mut() {
+            Some(s) => s,
+            None => return 0, // No address space — nothing to unmap.
+        };
         let cr3 = space.cr3;
-        let mut page = addr;
-        while page < addr + length {
-            if let Some(phys) = crate::mm::vmm::virt_to_phys_in(cr3, page) {
-                crate::mm::vmm::unmap_page_in(cr3, page);
-                crate::mm::vmm::invlpg(page);
-                // Decrement refcount; free the frame when no references remain.
-                let new_rc = crate::mm::refcount::page_ref_dec(phys);
-                if new_rc == 0 {
-                    crate::mm::pmm::free_page(phys);
-                }
-            }
-            page += 0x1000;
-        }
         let _ = space.remove_range(addr, length);
-    }
+        cr3
+    }; // PROCESS_TABLE released here
+
+    // ── Phase 2 (lock-free) — clear PTEs and release backing frames. ──────
+    crate::mm::vmm::unmap_and_free_range_in(cr3, addr, length);
 
     0
 }

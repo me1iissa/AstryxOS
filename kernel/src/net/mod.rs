@@ -161,6 +161,10 @@ pub fn poll() {
         virtio_net::poll_rx();
     }
     tcp::tcp_timer_tick();
+    // Service the kdb introspection server once per net-poll tick.  No-op
+    // when the `kdb` feature is disabled.
+    #[cfg(feature = "kdb")]
+    crate::kdb::pump();
 }
 
 /// Format an IPv4 address as a string.

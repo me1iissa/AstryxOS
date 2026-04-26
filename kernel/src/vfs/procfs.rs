@@ -619,16 +619,66 @@ pub fn generate_version() -> Vec<u8> {
     b"Linux version 5.15.0-astryx (AstryxOS Aether 0.1 x86_64) #1 SMP AstryxOS\n".to_vec()
 }
 
+/// Escape whitespace/backslash/hash chars with octal sequences so the output
+/// round-trips cleanly through `getmntent_r`, `strtok(" \t")`, and similar
+/// whitespace-splitting parsers (per fstab(5)).
+///
+/// Mangled characters: space (\040), tab (\011), newline (\012),
+/// backslash (\134), hash (\043).  All other bytes pass through unchanged.
+fn mangle_field(s: &str, out: &mut Vec<u8>) {
+    for &b in s.as_bytes() {
+        match b {
+            b' '  => out.extend_from_slice(b"\\040"),
+            b'\t' => out.extend_from_slice(b"\\011"),
+            b'\n' => out.extend_from_slice(b"\\012"),
+            b'\\' => out.extend_from_slice(b"\\134"),
+            b'#'  => out.extend_from_slice(b"\\043"),
+            _     => out.push(b),
+        }
+    }
+}
+
 /// Generate `/proc/mounts` content from the live mount table.
-fn generate_mounts() -> Vec<u8> {
-    let mut out = alloc::vec::Vec::new();
-    let mounts = crate::vfs::MOUNTS.lock();
-    for m in mounts.iter() {
-        let fstype = m.fs.name();
-        let line = alloc::format!("{fstype} {path} {fstype} rw 0 0\n",
-            fstype = fstype,
-            path   = m.path);
-        out.extend_from_slice(line.as_bytes());
+///
+/// Format per fstab(5): `<source> <mountpoint> <fstype> <opts> <freq> <passno>\n`
+/// with exactly one space between fields.  Whitespace inside any field is
+/// octal-escaped by [`mangle_field`] so single-pass tokenizers
+/// (getmntent_r / strtok / split_whitespace) parse each line into six fields.
+///
+/// LOCKING: the caller must NOT hold `MOUNTS.lock()` when invoking this
+/// function — it acquires that lock itself.  `fd_read()` handles this by
+/// intercepting `/proc/mounts` before it reaches `ProcFs::read()`, which
+/// would otherwise already be holding `MOUNTS` (recursive-lock deadlock).
+pub fn generate_mounts() -> Vec<u8> {
+    // Snapshot (path, fstype) pairs under the MOUNTS lock, then release it
+    // before formatting.  Keeping the critical section small avoids blocking
+    // concurrent mount/umount while a large /proc/mounts buffer is formatted.
+    let snapshot: alloc::vec::Vec<(alloc::string::String, alloc::string::String)> = {
+        let mounts = crate::vfs::MOUNTS.lock();
+        mounts.iter()
+            .map(|m| (m.path.clone(), alloc::string::String::from(m.fs.name())))
+            .collect()
+    };
+
+    let mut out = alloc::vec::Vec::with_capacity(snapshot.len() * 48);
+    for (path, fstype) in &snapshot {
+        // source — use the fstype as the device identifier for synthetic
+        // filesystems, matching fstab(5) convention (e.g. "proc /proc proc ...").
+        mangle_field(fstype.as_str(), &mut out);
+        out.push(b' ');
+        // mountpoint
+        mangle_field(path.as_str(), &mut out);
+        out.push(b' ');
+        // type
+        mangle_field(fstype.as_str(), &mut out);
+        out.push(b' ');
+        // options — "rw,relatime" is the canonical default (fstab(5)).
+        // Consumers that only check for "ro"/"noexec" substrings see neither
+        // here, which is the intended read-write no-restrictions semantics.
+        out.extend_from_slice(b"rw,relatime");
+        out.push(b' ');
+        // freq, passno — both zero for all synthetic mounts.
+        out.extend_from_slice(b"0 0\n");
     }
     out
 }

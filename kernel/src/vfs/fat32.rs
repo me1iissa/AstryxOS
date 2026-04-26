@@ -60,6 +60,10 @@ struct Fat32Bpb {
     total_sectors: u32,
     fat_size: u32,          // sectors per FAT
     root_cluster: u32,
+    /// FSInfo sector number from BPB offset 48 (0 or 0xFFFF → no FSInfo).
+    /// When present, `do_sync` updates its free-cluster count and next-free
+    /// hint on every flush (FAT32-6).
+    fsinfo_sector: u16,
     // Derived values
     fat_start_sector: u32,
     data_start_sector: u32,
@@ -104,6 +108,9 @@ impl Fat32Bpb {
         };
 
         let root_cluster = u32::from_le_bytes([sector[44], sector[45], sector[46], sector[47]]);
+        // FAT32-6: FSInfo sector number lives at offset 48 (2 bytes LE).
+        // 0x0000 and 0xFFFF are both defined as "no FSInfo" per the MS spec.
+        let fsinfo_sector = u16::from_le_bytes([sector[48], sector[49]]);
 
         // Validate basic sanity.
         if bytes_per_sector == 0 || sectors_per_cluster == 0 || num_fats == 0 || fat_size == 0 {
@@ -122,6 +129,7 @@ impl Fat32Bpb {
             total_sectors,
             fat_size,
             root_cluster,
+            fsinfo_sector,
             fat_start_sector,
             data_start_sector,
             cluster_size,
@@ -143,6 +151,8 @@ struct Fat32DirEntry {
     attr: u8,
     first_cluster: u32,
     file_size: u32,
+    /// NT-case preservation byte (offset 12 in on-disk entry). FAT32-8.
+    nt_res: u8,
     /// Absolute byte offset of this 32-byte entry in the volume.
     dir_entry_offset: usize,
     /// First cluster of the containing directory.
@@ -163,20 +173,48 @@ impl Fat32DirEntry {
     }
 }
 
-/// Parse an 8.3 short filename from a directory entry's first 11 bytes.
+/// NT-case preservation bits in directory-entry byte 12 (`NTRes`).
+/// Windows NT sets these for 8.3 names that would otherwise need a redundant
+/// LFN entry. Without honouring them, every short name from Windows appears
+/// lowercased here (FAT32-8).
+const NT_RES_LOWERCASE_BASE: u8 = 0x08;
+const NT_RES_LOWERCASE_EXT:  u8 = 0x10;
+
+/// Parse an 8.3 short filename from a directory entry, honouring NTRes
+/// (byte 12) per MS FAT spec. The caller passes the full 32-byte entry
+/// so we can read the NTRes byte; the raw 8.3 name is stored on disk in
+/// uppercase and per-segment case is reconstructed via NTRes bits.
+///
+/// Exposed `pub(crate)` so regression tests can exercise it without
+/// constructing a full disk image (FAT32-8).
+pub(crate) fn parse_short_name_test(entry: &[u8]) -> String {
+    parse_short_name(entry)
+}
+
 fn parse_short_name(entry: &[u8]) -> String {
-    // First 8 bytes: name (space-padded)
+    let nt_res = if entry.len() > 12 { entry[12] } else { 0 };
+    let lower_base = nt_res & NT_RES_LOWERCASE_BASE != 0;
+    let lower_ext  = nt_res & NT_RES_LOWERCASE_EXT  != 0;
+
+    // First 8 bytes: name (space-padded). Preserve as-on-disk, then
+    // apply lowercase per-segment only if NTRes requests it.
     let name_part: String = entry[0..8]
         .iter()
         .take_while(|&&b| b != b' ')
-        .map(|&b| (b as char).to_ascii_lowercase())
+        .map(|&b| {
+            let c = b as char;
+            if lower_base { c.to_ascii_lowercase() } else { c }
+        })
         .collect();
 
-    // Next 3 bytes: extension (space-padded)
+    // Next 3 bytes: extension (space-padded).
     let ext_part: String = entry[8..11]
         .iter()
         .take_while(|&&b| b != b' ')
-        .map(|&b| (b as char).to_ascii_lowercase())
+        .map(|&b| {
+            let c = b as char;
+            if lower_ext { c.to_ascii_lowercase() } else { c }
+        })
         .collect();
 
     if ext_part.is_empty() {
@@ -209,6 +247,7 @@ fn parse_dir_entry(raw: &[u8]) -> Option<Fat32DirEntry> {
             attr: 0,
             first_cluster: 0,
             file_size: 0,
+            nt_res: 0,
             dir_entry_offset: 0,
             dir_entry_cluster: 0,
         });
@@ -223,12 +262,14 @@ fn parse_dir_entry(raw: &[u8]) -> Option<Fat32DirEntry> {
             attr: attributes,
             first_cluster: 0,
             file_size: 0,
+            nt_res: 0,
             dir_entry_offset: 0,
             dir_entry_cluster: 0,
         });
     }
 
     let name = parse_short_name(raw);
+    let nt_res = raw[12];
 
     let cluster_hi = u16::from_le_bytes([raw[20], raw[21]]) as u32;
     let cluster_lo = u16::from_le_bytes([raw[26], raw[27]]) as u32;
@@ -241,6 +282,7 @@ fn parse_dir_entry(raw: &[u8]) -> Option<Fat32DirEntry> {
         attr: attributes,
         first_cluster,
         file_size,
+        nt_res,
         dir_entry_offset: 0,  // filled in by caller
         dir_entry_cluster: 0, // filled in by caller
     })
@@ -277,6 +319,48 @@ fn ucs2_to_string(chars: &[u16]) -> String {
     s
 }
 
+/// Return the absolute byte offset of the 32-byte directory slot that
+/// immediately precedes `cur_off` in the directory whose cluster chain is
+/// `chain`. Handles cluster-boundary wrap-around: when `cur_off` is at the
+/// first slot of a cluster, steps back into the last slot of the previous
+/// cluster in the chain. Returns `None` at the very first slot of the chain.
+///
+/// Used by `remove()` (FAT32-5) to mark preceding LFN entries as 0xE5.
+fn prev_dir_slot(
+    cur_off: usize,
+    chain: &[u32],
+    bpb: &Fat32Bpb,
+    cluster_size: usize,
+) -> Option<usize> {
+    if chain.is_empty() {
+        return None;
+    }
+    // Find which cluster in the chain contains cur_off.
+    // Each cluster covers [cluster_to_sector(c)*SECTOR_SIZE,
+    //                      cluster_to_sector(c)*SECTOR_SIZE + cluster_size).
+    let mut cluster_idx_opt: Option<usize> = None;
+    for (i, &c) in chain.iter().enumerate() {
+        let base = (bpb.cluster_to_sector(c) as usize) * SECTOR_SIZE;
+        if cur_off >= base && cur_off < base + cluster_size {
+            cluster_idx_opt = Some(i);
+            break;
+        }
+    }
+    let cluster_idx = cluster_idx_opt?;
+    let base = (bpb.cluster_to_sector(chain[cluster_idx]) as usize) * SECTOR_SIZE;
+    let within = cur_off - base;
+    if within >= DIR_ENTRY_SIZE {
+        // Simple case: stay in the same cluster.
+        Some(cur_off - DIR_ENTRY_SIZE)
+    } else if cluster_idx > 0 {
+        // Wrap to the last slot of the previous cluster in the chain.
+        let prev_base = (bpb.cluster_to_sector(chain[cluster_idx - 1]) as usize) * SECTOR_SIZE;
+        Some(prev_base + cluster_size - DIR_ENTRY_SIZE)
+    } else {
+        None
+    }
+}
+
 // ── FAT32 VFS Node ──────────────────────────────────────────────────────────
 
 /// Internal node stored for each discovered file/directory.
@@ -294,6 +378,20 @@ struct Fat32Node {
     dir_entry_offset: usize,
     /// First cluster of the directory that contains this entry.
     dir_entry_cluster: u32,
+    /// True only for the filesystem's root node. Used by `flush_dir_entry`
+    /// to short-circuit updates for the root (which has no parent directory
+    /// entry to update). Previously `flush_dir_entry` relied on
+    /// `dir_entry_offset == 0 && parent_cluster == 0`, which can legitimately
+    /// be true for a file at the very first slot of the root directory on
+    /// corrupted/edge BPBs where `root_cluster == 0` (FAT32-7).
+    is_root: bool,
+    /// NT-case preservation flags (byte 12 of the directory entry, `NTRes`).
+    /// Bit 0x08 = basename is lowercase for display, 0x10 = extension is
+    /// lowercase (FAT32-8). New files created by this driver always have
+    /// NTRes=0 (MS-DOS semantics); existing files from Windows retain their
+    /// original NTRes on read. Only used by `flush_dir_entry` to preserve
+    /// the byte on round-trip updates.
+    nt_res: u8,
     /// Cached cluster chain for fast random-access reads.
     /// Built lazily on first read.  chain[i] = cluster number for logical
     /// cluster i of this file.  Eliminates O(n) FAT walk per page fault
@@ -320,6 +418,12 @@ struct Fat32Inner {
     sector_cache: BTreeMap<u64, [u8; SECTOR_SIZE]>,
     /// Set of dirty sector LBAs that need to be written back.
     dirty: BTreeSet<u64>,
+    /// Set of parent cluster numbers whose directory contents have been fully
+    /// read from disk. Used by `ensure_children_loaded` to distinguish
+    /// "already scanned from disk" from "has in-memory children" — the latter
+    /// is no longer a valid proxy (FAT32-3) once `create_file` can inject
+    /// nodes before a scan.
+    scanned_clusters: BTreeSet<u32>,
 }
 
 impl Fat32Fs {
@@ -406,14 +510,23 @@ impl Fat32Fs {
             parent_cluster: 0,
             dir_entry_offset: 0,
             dir_entry_cluster: 0,
+            is_root: true,
+            nt_res: 0,
             cluster_chain: alloc::vec::Vec::new(),
         };
+
+        let mut scanned_clusters = BTreeSet::new();
+        // Mount pre-scans the root directory below, so record that here so
+        // a later `create_file` can't cause `ensure_children_loaded` to skip
+        // re-scanning (FAT32-3).
+        scanned_clusters.insert(bpb.root_cluster);
 
         let inner = Fat32Inner {
             nodes: vec![root_node],
             fat,
             sector_cache,
             dirty: BTreeSet::new(),
+            scanned_clusters,
         };
 
         let root_cluster = bpb.root_cluster;
@@ -441,6 +554,8 @@ impl Fat32Fs {
                     parent_cluster: root_cluster,
                     dir_entry_offset: entry.dir_entry_offset,
                     dir_entry_cluster: entry.dir_entry_cluster,
+                    is_root: false,
+                    nt_res: entry.nt_res,
                     cluster_chain: alloc::vec::Vec::new(),
                 });
             }
@@ -465,6 +580,38 @@ impl Fat32Fs {
         inner.fat.iter().skip(2).filter(|&&v| v == 0).count()
     }
 
+    /// Read the currently-cached FSInfo sector as the driver sees it.
+    /// Used by FAT32-6 tests to verify that `do_sync` updates the free-count
+    /// and next-free-hint fields. Returns `None` if the BPB specified no
+    /// FSInfo sector (0 or 0xFFFF).
+    pub fn cached_fsinfo(&self) -> Option<[u8; SECTOR_SIZE]> {
+        let lba = self.bpb.fsinfo_sector;
+        if lba == 0 || lba == 0xFFFF {
+            return None;
+        }
+        let inner = self.inner.lock();
+        inner.sector_cache.get(&(lba as u64)).copied()
+    }
+
+    /// Test-only: read the raw sector at `lba` from the cache.
+    /// Returns `None` if not cached.
+    pub fn cached_sector(&self, lba: u64) -> Option<[u8; SECTOR_SIZE]> {
+        self.inner.lock().sector_cache.get(&lba).copied()
+    }
+
+    /// Test-only: write `data` to sector `lba` in the cache and mark dirty.
+    /// Used by FAT32-5 regression test to plant a synthetic LFN run.
+    pub fn test_poke_sector(&self, lba: u64, data: &[u8; SECTOR_SIZE]) {
+        let mut inner = self.inner.lock();
+        inner.sector_cache.insert(lba, *data);
+        inner.dirty.insert(lba);
+    }
+
+    /// Test-only: expose data-region start sector (first data cluster is 2).
+    pub fn data_start_sector(&self) -> u32 {
+        self.bpb.data_start_sector
+    }
+
     // ── Cache helpers ───────────────────────────────────────────────────
 
     /// Ensure a sector is in the sparse cache, loading from device if needed.
@@ -475,9 +622,33 @@ impl Fat32Fs {
             const MAX_SECTOR_CACHE: usize = 8192;
             if inner.sector_cache.len() >= MAX_SECTOR_CACHE {
                 // Evict the first half (lowest LBAs — likely already consumed).
+                // CRITICAL (FAT32-2): dirty sectors must be flushed before
+                // eviction. FAT sectors live at the lowest LBAs and are the
+                // most likely victims; dropping a dirty FAT sector silently
+                // loses the cluster-allocation update.
                 let to_remove: alloc::vec::Vec<u64> = inner.sector_cache.keys()
                     .take(MAX_SECTOR_CACHE / 2).copied().collect();
-                for k in to_remove { inner.sector_cache.remove(&k); }
+                for k in to_remove {
+                    if inner.dirty.contains(&k) {
+                        if let Some(sector) = inner.sector_cache.get(&k) {
+                            let data = *sector;
+                            if device.write_sectors(k, 1, &data).is_ok() {
+                                inner.dirty.remove(&k);
+                                crate::serial_println!(
+                                    "[FAT32] flushed dirty sector {} during eviction", k);
+                            } else {
+                                // Write failed — keep the sector cached so
+                                // a later `do_sync` can retry. Skip eviction
+                                // of this entry.
+                                crate::serial_println!(
+                                    "[FAT32] WARN: failed to flush dirty sector {} during eviction; \
+                                     keeping in cache", k);
+                                continue;
+                            }
+                        }
+                    }
+                    inner.sector_cache.remove(&k);
+                }
             }
 
             // Batch prefetch: read 8 consecutive sectors (4KB = one cluster) at once.
@@ -839,11 +1010,16 @@ impl Fat32Fs {
     }
 
     /// Find or create inode nodes for a directory's children.
+    ///
+    /// Uses `scanned_clusters` to track which directory clusters have been
+    /// read from disk. The previous "any in-memory child" heuristic was
+    /// incorrect (FAT32-3): once `create_file` injects a single node, it
+    /// short-circuits the disk scan for the whole directory and any
+    /// pre-existing on-disk files remain invisible.
     fn ensure_children_loaded(&self, parent_cluster: u32) -> Result<(), VfsError> {
         {
             let inner = self.inner.lock();
-            let has_children = inner.nodes.iter().any(|n| n.parent_cluster == parent_cluster && n.name != "/");
-            if has_children {
+            if inner.scanned_clusters.contains(&parent_cluster) {
                 return Ok(());
             }
         }
@@ -869,10 +1045,13 @@ impl Fat32Fs {
                     parent_cluster,
                     dir_entry_offset: entry.dir_entry_offset,
                     dir_entry_cluster: entry.dir_entry_cluster,
+                    is_root: false,
+                    nt_res: entry.nt_res,
                     cluster_chain: alloc::vec::Vec::new(),
                 });
             }
         }
+        inner.scanned_clusters.insert(parent_cluster);
 
         Ok(())
     }
@@ -887,8 +1066,11 @@ impl Fat32Fs {
     /// Update the file size and first cluster of a node's directory entry
     /// in the cache.
     fn flush_dir_entry(&self, node: &Fat32Node) -> Result<(), VfsError> {
-        if node.dir_entry_offset == 0 && node.parent_cluster == 0 {
-            // Root node — no parent directory entry to update.
+        // The old guard `dir_entry_offset == 0 && parent_cluster == 0` can
+        // false-positive on corrupted/edge BPBs where `root_cluster == 0`
+        // (which would make a real child of root satisfy both conditions)
+        // — FAT32-7. Use the explicit root flag instead.
+        if node.is_root {
             return Ok(());
         }
         let off = node.dir_entry_offset;
@@ -1006,8 +1188,70 @@ impl Fat32Fs {
 
     // ── Sync to disk ────────────────────────────────────────────────────
 
+    /// Refresh the FSInfo sector (FAT32-6). Computes the free-cluster count
+    /// from the in-memory FAT and writes it (plus a next-free hint) into the
+    /// cached FSInfo sector, after validating the three FAT32 FSInfo
+    /// signatures. If signatures don't match we leave the sector alone rather
+    /// than corrupt an unrelated reserved sector.
+    ///
+    /// Assumes the caller does not hold `inner`.
+    fn refresh_fsinfo(&self) -> Result<(), VfsError> {
+        let fsinfo_lba = self.bpb.fsinfo_sector;
+        if fsinfo_lba == 0 || fsinfo_lba == 0xFFFF {
+            return Ok(());
+        }
+        let lba = fsinfo_lba as u64;
+
+        // Compute free-cluster count and lowest free cluster.
+        // Clusters 0 and 1 are reserved; data clusters start at 2.
+        let (free_count, next_free_hint) = {
+            let inner = self.inner.lock();
+            let mut count: u32 = 0;
+            let mut lowest: Option<u32> = None;
+            for (i, &v) in inner.fat.iter().enumerate().skip(2) {
+                if v == 0 {
+                    count = count.saturating_add(1);
+                    if lowest.is_none() {
+                        lowest = Some(i as u32);
+                    }
+                }
+            }
+            (count, lowest.unwrap_or(0xFFFFFFFF))
+        };
+
+        let mut inner = self.inner.lock();
+        Self::ensure_sector(&mut inner, &*self.device, lba)?;
+        let sector = match inner.sector_cache.get_mut(&lba) {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        // Validate FSInfo signatures. Misplaced/wrong FSInfo pointer is a
+        // real-world BPB bug — don't stomp on a non-FSInfo sector.
+        let sig1 = u32::from_le_bytes([sector[0], sector[1], sector[2], sector[3]]);
+        let sig2 = u32::from_le_bytes([sector[484], sector[485], sector[486], sector[487]]);
+        let sig3 = u32::from_le_bytes([sector[508], sector[509], sector[510], sector[511]]);
+        if sig1 != 0x41615252 || sig2 != 0x61417272 || sig3 != 0xAA550000 {
+            crate::serial_println!(
+                "[FAT32] FSInfo sector {} signatures invalid ({:#x}/{:#x}/{:#x}); \
+                 skipping update", lba, sig1, sig2, sig3);
+            return Ok(());
+        }
+
+        // Free-cluster count at offset 488 (4 bytes LE).
+        sector[488..492].copy_from_slice(&free_count.to_le_bytes());
+        // Next-free-cluster hint at offset 492 (4 bytes LE).
+        sector[492..496].copy_from_slice(&next_free_hint.to_le_bytes());
+        inner.dirty.insert(lba);
+        Ok(())
+    }
+
     /// Flush all dirty sectors from cache to the underlying block device.
     fn do_sync(&self) -> Result<(), VfsError> {
+        // Refresh FSInfo free count/hint BEFORE collecting the dirty set so
+        // the FSInfo sector itself is included in this flush (FAT32-6).
+        let _ = self.refresh_fsinfo();
+
         let dirty: Vec<u64> = {
             let inner = self.inner.lock();
             inner.dirty.iter().copied().collect()
@@ -1024,7 +1268,15 @@ impl Fat32Fs {
                 let inner = self.inner.lock();
                 match inner.sector_cache.get(&lba) {
                     Some(sector) => *sector,
-                    None => continue,
+                    None => {
+                        // After FAT32-2's eviction fix, a dirty LBA should
+                        // always be present in the cache (eviction flushes
+                        // and clears `dirty` atomically under the lock).
+                        // If we see this, it indicates a bug somewhere.
+                        crate::serial_println!(
+                            "[FAT32] WARN: dirty sector {} not in cache at sync!", lba);
+                        continue;
+                    }
                 }
             };
             self.device.write_sectors(lba, 1, &data).map_err(|_| VfsError::Io)?;
@@ -1080,6 +1332,8 @@ impl FileSystemOps for Fat32Fs {
             parent_cluster: parent.first_cluster,
             dir_entry_offset: slot_offset,
             dir_entry_cluster: parent.first_cluster,
+            is_root: false,
+            nt_res: 0, // new files written by us follow MS-DOS semantics
             cluster_chain: alloc::vec::Vec::new(),
         };
         self.inner.lock().nodes.push(node);
@@ -1146,6 +1400,8 @@ impl FileSystemOps for Fat32Fs {
             parent_cluster: parent.first_cluster,
             dir_entry_offset: slot_offset,
             dir_entry_cluster: parent.first_cluster,
+            is_root: false,
+            nt_res: 0,
             cluster_chain: alloc::vec::Vec::new(),
         };
         self.inner.lock().nodes.push(node);
@@ -1188,7 +1444,17 @@ impl FileSystemOps for Fat32Fs {
             self.free_chain(node.first_cluster);
         }
 
-        // Mark directory entry as deleted (0xE5).
+        // Walk the parent directory's cluster chain to translate absolute
+        // byte offsets into (cluster-index-in-chain, within-cluster) pairs.
+        // Needed for FAT32-5 so that scanning backwards across cluster
+        // boundaries in a multi-cluster directory works correctly.
+        let dir_chain = self.follow_chain(node.dir_entry_cluster);
+        let cluster_size = self.bpb.cluster_size as usize;
+
+        // Mark directory entry as deleted (0xE5) and also mark any preceding
+        // LFN entries (attr byte 11 == 0x0F) as deleted. Otherwise orphaned
+        // LFN entries re-associate with the next short-name entry on the next
+        // scan, producing ghost filenames (FAT32-5).
         {
             let mut inner = self.inner.lock();
             let off = node.dir_entry_offset;
@@ -1200,8 +1466,48 @@ impl FileSystemOps for Fat32Fs {
                 inner.dirty.insert(sector_lba);
             }
 
+            // FAT32-5: scan backwards 32 bytes at a time, crossing cluster
+            // boundaries along the parent directory's chain. Stop at the
+            // first non-LFN entry or when we run out of chain.
+            let mut cur_off = off;
+            loop {
+                // Step back 32 bytes, handling cluster-boundary wrap-around.
+                let new_off_opt = prev_dir_slot(cur_off, &dir_chain, &self.bpb, cluster_size);
+                let prev_off = match new_off_opt {
+                    Some(v) => v,
+                    None => break, // at the very start of the directory chain
+                };
+                let prev_lba = (prev_off / SECTOR_SIZE) as u64;
+                let prev_in  = prev_off % SECTOR_SIZE;
+                if Self::ensure_sector(&mut inner, &*self.device, prev_lba).is_err() {
+                    break;
+                }
+                let is_lfn = if let Some(s) = inner.sector_cache.get(&prev_lba) {
+                    // Don't reap already-deleted (0xE5) entries as LFN —
+                    // they belonged to a prior short-name entry's LFN run.
+                    s[prev_in] != 0xE5 && s[prev_in + 11] == attr::LONG_NAME
+                } else {
+                    false
+                };
+                if !is_lfn {
+                    break;
+                }
+                if let Some(s) = inner.sector_cache.get_mut(&prev_lba) {
+                    s[prev_in] = 0xE5;
+                    inner.dirty.insert(prev_lba);
+                }
+                cur_off = prev_off;
+            }
+
             // Remove node from in-memory list.
             inner.nodes.retain(|n| n.inode != node.inode);
+
+            // If we just removed a directory, its cluster is freed and may
+            // later be reallocated to a different directory. Drop the
+            // "already scanned" mark so a future lookup re-scans (FAT32-3).
+            if node.file_type == FileType::Directory && node.first_cluster >= 2 {
+                inner.scanned_clusters.remove(&node.first_cluster);
+            }
         }
 
         let _ = self.do_sync();
@@ -1420,6 +1726,12 @@ impl FileSystemOps for Fat32Fs {
             if let Some(n) = inner.nodes.iter_mut().find(|n| n.inode == inode) {
                 n.size = new_size;
                 n.first_cluster = node.first_cluster;
+                // Writes that extended the file may have allocated new
+                // clusters beyond the cached chain. Clearing forces the
+                // next read to rebuild the chain from the updated FAT
+                // (FAT32-1). Without this, reads past the original EOF
+                // silently return Ok(0).
+                n.cluster_chain.clear();
             }
         }
 
@@ -1520,12 +1832,23 @@ impl FileSystemOps for Fat32Fs {
             let old_end = node.size as usize;
             let zero_start_cluster_idx = old_end / cluster_size;
             let zero_start_within = old_end % cluster_size;
+            // Only iterate clusters up to and including the one that
+            // contains `new_size`. Without the saturating_sub below, the
+            // `new_size - idx * cluster_size` expression would wrap in
+            // usize when idx * cluster_size > new_size, and `min` would
+            // happily return `cluster_size`, zeroing an entire partial
+            // tail cluster (FAT32-4).
+            let last_cluster_idx = if new_size == 0 { 0 } else { (new_size - 1) / cluster_size };
+            let end_cluster_idx = core::cmp::min(chain.len(), last_cluster_idx + 1);
 
-            for idx in zero_start_cluster_idx..chain.len() {
+            for idx in zero_start_cluster_idx..end_cluster_idx {
                 let cluster = chain[idx];
                 let cluster_offset = (self.bpb.cluster_to_sector(cluster) as usize) * SECTOR_SIZE;
                 let start = if idx == zero_start_cluster_idx { zero_start_within } else { 0 };
-                let end = core::cmp::min(cluster_size, new_size - idx * cluster_size);
+                let end = core::cmp::min(
+                    cluster_size,
+                    new_size.saturating_sub(idx * cluster_size),
+                );
                 if start < end {
                     let zeros = vec![0u8; end - start];
                     self.cache_write(cluster_offset + start, &zeros)?;
@@ -1542,6 +1865,10 @@ impl FileSystemOps for Fat32Fs {
             if let Some(n) = inner.nodes.iter_mut().find(|n| n.inode == inode) {
                 n.size = size;
                 n.first_cluster = node.first_cluster;
+                // Truncate may have freed or extended the cluster chain.
+                // Invalidate the cache so next read rebuilds it from the
+                // updated FAT (FAT32-1).
+                n.cluster_chain.clear();
             }
         }
 
