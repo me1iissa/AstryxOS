@@ -92,8 +92,12 @@ def _cpu_args(mode: str, kvm: bool) -> list[str]:
     """
     CPU model. Under KVM we prefer `host` because that matches what a
     real-hardware boot would encounter — critical for Firefox and any
-    test that exercises CPUID. Under TCG we fall back to the minimum
-    feature set the kernel relies on (+rdtscp, +sse4.2).
+    test that exercises CPUID. Under TCG we fall back to a feature set
+    that mirrors what glibc's IFUNC dispatcher will select on a typical
+    modern host (+rdtscp, +ssse3, +sse4.1, +sse4.2): glibc's optimised
+    string routines (strcmp, strncmp, memcpy) emit `palignr` (SSSE3)
+    and `pcmpistri` (SSE4.2), so omitting either makes the very first
+    libc call from any non-trivial userspace process raise #UD.
 
     firefox-test forces `-cpu host` because its perf target is
     unreachable under TCG; if KVM is absent the run will be slow but
@@ -103,7 +107,7 @@ def _cpu_args(mode: str, kvm: bool) -> list[str]:
         return ["-cpu", "host"]
     if kvm:
         return ["-cpu", "host"]
-    return ["-cpu", "qemu64,+rdtscp,+sse4_2"]
+    return ["-cpu", "qemu64,+rdtscp,+ssse3,+sse4_1,+sse4_2"]
 
 
 def _memory_args(mode: str) -> list[str]:
