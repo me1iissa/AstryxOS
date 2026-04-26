@@ -278,22 +278,83 @@ pub fn schedule() {
     // Find the next ready thread — highest priority wins, round-robin among equals.
     // Prefer threads with matching cpu_affinity, then threads whose last_cpu
     // matches the current CPU (cache locality), then any Ready thread.
-    let (next_tid, next_rsp, _next_pid, next_kstack_top, _next_first_run) = {
+    //
+    // The whole picker is wrapped in a `'pick:` loop so the "no Ready peer
+    // and the current thread is Sleeping/Blocked/Dead" path can wait for an
+    // interrupt and retry WITHOUT recursing into schedule().  Recursion was
+    // unbounded under TCG (both CPUs Dead/idle never converged) and burned
+    // a kernel-stack frame per iteration; an iterative `'pick:` retry is
+    // O(1) stack with the same observable behaviour.  Each iteration runs
+    // with IF=0 to keep the THREAD_TABLE acquisition safe against the
+    // timer ISR (which also acquires it).  The wait paths use `sti; hlt;
+    // cli`: the dying/sleeping vCPU halts so the OTHER vCPU is not
+    // starved competing for host CPU time under TCG, and the timer ISR
+    // wakes us on the next tick.
+    let (next_tid, next_rsp, _next_pid, next_kstack_top, _next_first_run) = 'pick: loop {
+        // Re-establish IF=0 at the top of every iteration.  The wait
+        // paths below execute `sti; hlt; cli` which leaves IF=0 on
+        // return — this disable_interrupts() call is defence in depth
+        // against a future edit that switches to a wait primitive that
+        // does not re-disable interrupts.
+        crate::hal::disable_interrupts();
         let mut threads = THREAD_TABLE.lock();
         let len = threads.len();
         if len <= 1 {
-            // Check if we're a dead thread before bailing — if so we need to spin.
-            let current_is_done = threads
+            // Only this thread (idle) exists.  Decide based on its state.
+            //   Running             — caller wanted to yield/preempt but
+            //                         there's nothing else; reset watchdog
+            //                         and return so the caller's spin loop
+            //                         retries naturally.
+            //   Sleeping / Blocked  — `sti; hlt; cli` so the vCPU sleeps
+            //                         until the timer ISR (or any other
+            //                         wake source) flips us back to Ready;
+            //                         then `continue 'pick` to retry.
+            //   Dead                — terminal halt; no wake source can
+            //                         ever produce another runnable
+            //                         thread on this kernel.  Returning
+            //                         would sysretq into dead user code.
+            let current_state = threads
                 .iter()
                 .find(|t| t.tid == current_tid)
-                .map(|t| !matches!(t.state, ThreadState::Running))
-                .unwrap_or(true);
+                .map(|t| t.state);
             drop(threads);
-            crate::hal::enable_interrupts();
-            if current_is_done {
-                loop { core::hint::spin_loop(); } // nothing else can ever exist
+            match current_state {
+                Some(ThreadState::Running) => {
+                    crate::arch::x86_64::irq::reset_watchdog_counter();
+                    crate::hal::enable_interrupts();
+                    return;
+                }
+                Some(ThreadState::Sleeping) | Some(ThreadState::Blocked) => {
+                    crate::arch::x86_64::irq::reset_watchdog_counter();
+                    crate::perf::record_idle_tick();
+                    // sti; hlt; cli — the STI shadow guarantees the next
+                    // instruction (hlt) is executed before any pending
+                    // interrupt fires, so this sequence is race-free.
+                    unsafe {
+                        core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                    }
+                    continue 'pick;
+                }
+                _ => {
+                    // Dead, or thread already reaped.  Halt until the timer
+                    // ISR (or another wake source) flips a peer to Ready,
+                    // then `continue 'pick` so the picker can find it.
+                    // We do NOT loop here without re-entering the picker —
+                    // a peer thread with affinity to THIS CPU can become
+                    // Ready while we're halted (e.g. an idle TID 0
+                    // preempted by mmap_test that has now exited), and
+                    // only the picker is allowed to context-switch back
+                    // to it.  Looping forever in `sti;hlt;cli` without
+                    // retrying the picker leaves the affinity-pinned peer
+                    // stranded and deadlocks the test_runner.
+                    crate::arch::x86_64::irq::reset_watchdog_counter();
+                    crate::perf::record_idle_tick();
+                    unsafe {
+                        core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                    }
+                    continue 'pick;
+                }
             }
-            return; // Only idle thread, nothing to switch to.
         }
 
         // Find current thread's index.
@@ -382,42 +443,76 @@ pub fn schedule() {
                     panic!("schedule(): non-higher-half kstack_top");
                 }
                 let first_run = threads[idx].first_run;
-                (tid, rsp, pid, kstack_top, first_run)
+                break 'pick (tid, rsp, pid, kstack_top, first_run);
             }
             None => {
-                // No ready threads on this CPU right now.
-                // If the current thread is dead/blocked/sleeping (e.g. called from
-                // exit_group or exit_thread) we MUST NOT return to it — doing so
-                // would sysretq back into dead user-space code.  Spin with interrupts
-                // enabled so timer ticks can wake/schedule another thread, then retry.
-                let current_is_done = threads
+                // No Ready peer on this CPU right now.  Three cases for the
+                // current thread:
+                //
+                //   Running             — return to caller.  The caller wanted
+                //                         to yield/preempt but there's nothing
+                //                         better to run on this CPU; reset the
+                //                         watchdog and let the caller's spin
+                //                         loop retry on the next tick.
+                //
+                //   Sleeping / Blocked  — drop the lock, `sti; hlt; cli`,
+                //                         then `continue 'pick`.  The vCPU
+                //                         halts so it does not starve peer
+                //                         vCPUs of host CPU time under TCG;
+                //                         the timer ISR (or any other wake
+                //                         source — futex_wake, signal
+                //                         delivery) flips our state to
+                //                         Ready, and the next iteration's
+                //                         picker selects us cleanly via the
+                //                         normal context-switch path.  We
+                //                         deliberately do NOT auto-self-
+                //                         resume — only the wake source is
+                //                         entitled to flip our state to
+                //                         Ready, preserving the picker's
+                //                         invariant (only Ready→Running
+                //                         transitions happen under
+                //                         THREAD_TABLE).
+                //
+                //   Dead                — drop the lock, `sti; hlt; cli` and
+                //                         loop.  At least one peer thread
+                //                         exists (len > 1) but none are
+                //                         Ready right now; wait for the
+                //                         timer ISR (or signal delivery
+                //                         from another CPU) to flip a peer
+                //                         to Ready, then continue 'pick.
+                //                         Returning would sysretq into
+                //                         dead user code.
+                let current_state = threads
                     .iter()
                     .find(|t| t.tid == current_tid)
-                    .map(|t| !matches!(t.state, ThreadState::Running))
-                    .unwrap_or(true); // thread already reaped = treat as done
+                    .map(|t| t.state);
                 drop(threads);
-                crate::hal::enable_interrupts();
-                if current_is_done {
-                    loop {
-                        core::hint::spin_loop();
-                        // Check if a thread runnable on this CPU has become Ready.
-                        let any_ready = THREAD_TABLE.try_lock().map(|t| {
-                            t.iter().any(|th| {
-                                th.state == ThreadState::Ready
-                                    && th.cpu_affinity.map_or(true, |aff| aff == cpu)
-                            })
-                        }).unwrap_or(false);
-                        if any_ready { break; }
+                match current_state {
+                    Some(ThreadState::Running) => {
+                        crate::perf::record_idle_tick();
+                        crate::arch::x86_64::irq::reset_watchdog_counter();
+                        crate::hal::enable_interrupts();
+                        return;
                     }
-                    // Re-enter schedule() to perform the actual context switch.
-                    // The dead/blocked thread will be replaced and never return here.
-                    return schedule();
+                    Some(ThreadState::Sleeping) | Some(ThreadState::Blocked) => {
+                        crate::arch::x86_64::irq::reset_watchdog_counter();
+                        crate::perf::record_idle_tick();
+                        unsafe {
+                            core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                        }
+                        continue 'pick;
+                    }
+                    _ => {
+                        // Dead, or already reaped.  Halt until a peer
+                        // becomes Ready.
+                        crate::arch::x86_64::irq::reset_watchdog_counter();
+                        crate::perf::record_idle_tick();
+                        unsafe {
+                            core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                        }
+                        continue 'pick;
+                    }
                 }
-                crate::perf::record_idle_tick();
-                // Reset watchdog: this CPU is running a valid thread, just
-                // has nothing to switch to. Not a deadlock.
-                crate::arch::x86_64::irq::reset_watchdog_counter();
-                return  // no semicolon — arm type is !, coerces to tuple type
             }
         }
     };
