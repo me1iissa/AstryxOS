@@ -2905,6 +2905,16 @@ pub fn sys_open_linux(pathname: u64, flags: u64, _mode: u64) -> i64 {
 }
 
 fn sys_open_linux_inner(pathname: u64, flags: u64, _mode: u64) -> i64 {
+    // O_TMPFILE (per open(2)) is encoded as 0x410000 (0x400000 | O_DIRECTORY).
+    // The detection bit is 0x400000.  The flag asks the kernel to create an
+    // unnamed inode under the given directory; we have no anonymous-inode
+    // support yet, so report -EOPNOTSUPP.  glibc's mkstemp falls back to the
+    // ordinary O_RDWR|O_CREAT|O_EXCL path which we already implement.
+    const O_TMPFILE_BIT: u64 = 0x0040_0000;
+    if flags & O_TMPFILE_BIT != 0 {
+        return -95; // EOPNOTSUPP
+    }
+
     let path_bytes = read_cstring_from_user(pathname);
     let path = match core::str::from_utf8(path_bytes) {
         Ok(s) => s,

@@ -1105,7 +1105,11 @@ pub fn run() -> ! {
     total += 1;
     if test_shebang_resolve() { passed += 1; }
 
-    // ── Test 177: TCP inbound 3WHS (SYN → SYN-ACK → ACK → Established) ──────
+    // ── Test 177: open(O_TMPFILE) returns -EOPNOTSUPP ──────────────────────
+    total += 1;
+    if test_open_tmpfile_eopnotsupp() { passed += 1; }
+
+    // ── Test 178: TCP inbound 3WHS (SYN → SYN-ACK → ACK → Established) ──────
     //
     // Gated on `kdb` because it relies on `tcp::snapshot_connections()`
     // to peek at the child-TCB created by the listener — the same API
@@ -19278,6 +19282,37 @@ fn test_openat2_basic() -> bool {
 
     crate::syscall::dispatch_linux(3, fd as u64, 0, 0, 0, 0, 0);
     test_pass!("openat2(437) basic — open /etc/passwd with open_how");
+    true
+}
+
+/// `open(path, O_TMPFILE|O_RDWR|O_EXCL, 0600)` must report -EOPNOTSUPP (95).
+///
+/// Per open(2) the flag asks the kernel to create an unnamed inode rooted at
+/// the given directory.  We have no anonymous-inode support yet, so userspace
+/// must see -EOPNOTSUPP and fall back to mkstemp(3) which uses a normal
+/// `open(name, O_RDWR|O_CREAT|O_EXCL, 0600)`.  Without the rejection,
+/// path-resolution succeeded and a directory fd was returned — libffi's
+/// open_temp_exec_file then operated on the directory inode and looped
+/// forever waiting for a working temp-file location.
+fn test_open_tmpfile_eopnotsupp() -> bool {
+    test_header!("open(O_TMPFILE) → -EOPNOTSUPP");
+
+    // O_RDWR(2) | O_EXCL(0x80) | O_DIRECTORY(0x10000) | O_TMPFILE bit (0x400000)
+    const O_TMPFILE: u64 = 0x0040_0000 | 0x0001_0000;
+    const O_RDWR:    u64 = 0x0000_0002;
+    const O_EXCL:    u64 = 0x0000_0080;
+
+    let path = b"/tmp\0";
+    let r = dispatch(2 /*open*/, path.as_ptr() as u64,
+                     O_TMPFILE | O_RDWR | O_EXCL, 0o600, 0, 0, 0);
+    if r != -95 {
+        test_fail!("open_tmpfile_eopnotsupp",
+            "open(O_TMPFILE,/tmp) = {} (expected -95 EOPNOTSUPP)", r);
+        return false;
+    }
+    test_println!("  open(/tmp, O_TMPFILE|O_RDWR|O_EXCL, 0600) = -EOPNOTSUPP ✓");
+
+    test_pass!("open(O_TMPFILE) → -EOPNOTSUPP");
     true
 }
 
