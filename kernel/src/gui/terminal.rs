@@ -835,6 +835,16 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         "TMPDIR=/tmp",
         "DISPLAY=:0",
         "GDK_BACKEND=x11",
+        // Tell Firefox to run headless even when DISPLAY is set.  libxul
+        // checks gfxPlatform::IsHeadless() / nsAppRunner XRE_main and skips
+        // gdk_display_open() / XOpenDisplay() entirely on this branch.  Our
+        // libX11 / libgdk stubs return NULL from those calls, which would
+        // otherwise produce "Error: cannot open display: :0\n" on stderr
+        // followed by exit_group(1).  Mozilla documents `MOZ_HEADLESS=1`
+        // (and the equivalent `--headless` argv flag) as the canonical
+        // headless-mode trigger.
+        // See: https://firefox-source-docs.mozilla.org/widget/headless.html
+        "MOZ_HEADLESS=1",
         "MOZ_DISABLE_CONTENT_SANDBOX=1",
         "MOZ_DISABLE_NONLOCAL_CONNECTIONS=1",
         "MOZ_DISABLE_AUTO_SAFE_MODE=1",
