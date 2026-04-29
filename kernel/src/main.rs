@@ -448,31 +448,40 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 let now = arch::x86_64::irq::get_ticks();
                 let elapsed = now.wrapping_sub(t_launch);
 
-                // Log a heartbeat every 1000 ticks (~10s)
+                // Log a heartbeat every 1000 ticks (~10s).  Use try_lock so a
+                // contended/leaked THREAD_TABLE never wedges CPU0; the BSP must
+                // remain alive to drive net::poll, X11 polling, kdb, and to
+                // observe and report a deadlock rather than become its second
+                // victim.  When skipping, we still emit a heartbeat so the
+                // qemu-harness watchdog observes forward progress.
                 if elapsed / 1000 != last_log_tick / 1000 {
                     last_log_tick = elapsed;
                     let sc = crate::syscall::syscall_count();
                     let pf = crate::perf::page_faults();
-                    // Dump thread states to diagnose spin-wait
-                    {
-                        let threads = crate::proc::THREAD_TABLE.lock();
-                        let total = threads.len();
-                        let mut p1_run = 0u32;
-                        let mut p1_blk = 0u32;
-                        let mut p1_dead = 0u32;
-                        let mut p1_total = 0u32;
-                        for t in threads.iter().filter(|t| t.pid == 1) {
-                            p1_total += 1;
-                            match t.state {
-                                crate::proc::ThreadState::Running => p1_run += 1,
-                                crate::proc::ThreadState::Ready => p1_run += 1, // count as active
-                                crate::proc::ThreadState::Blocked => p1_blk += 1,
-                                crate::proc::ThreadState::Sleeping => p1_blk += 1,
-                                crate::proc::ThreadState::Dead => p1_dead += 1,
+                    match crate::proc::THREAD_TABLE.try_lock() {
+                        Some(threads) => {
+                            let total = threads.len();
+                            let mut p1_run = 0u32;
+                            let mut p1_blk = 0u32;
+                            let mut p1_dead = 0u32;
+                            let mut p1_total = 0u32;
+                            for t in threads.iter().filter(|t| t.pid == 1) {
+                                p1_total += 1;
+                                match t.state {
+                                    crate::proc::ThreadState::Running => p1_run += 1,
+                                    crate::proc::ThreadState::Ready => p1_run += 1, // count as active
+                                    crate::proc::ThreadState::Blocked => p1_blk += 1,
+                                    crate::proc::ThreadState::Sleeping => p1_blk += 1,
+                                    crate::proc::ThreadState::Dead => p1_dead += 1,
+                                }
                             }
+                            serial_println!("[FFTEST] tick={} sc={} pf={} total_th={} p1:{}(run={},blk={},dead={})",
+                                elapsed, sc, pf, total, p1_total, p1_run, p1_blk, p1_dead);
                         }
-                        serial_println!("[FFTEST] tick={} sc={} pf={} total_th={} p1:{}(run={},blk={},dead={})",
-                            elapsed, sc, pf, total, p1_total, p1_run, p1_blk, p1_dead);
+                        None => {
+                            serial_println!("[FFTEST] tick={} sc={} pf={} THREAD_TABLE busy, skipping",
+                                elapsed, sc, pf);
+                        }
                     }
                 }
 
