@@ -14579,6 +14579,38 @@ fn test_procfs_mounts() -> bool {
     }
     test_println!("  root mount '/' present ok");
 
+    // Per proc(5), synthetic filesystems must advertise the "ro" and "noexec"
+    // mount options so userspace temp-exec scanners (libffi, glib, etc.) skip
+    // them when searching for a writable+executable directory via
+    // /proc/mounts + getmntent(3) / hasmntopt(3).  Search for a procfs line
+    // whose fstype field == "procfs" and whose opts field contains both
+    // "ro" and "noexec" as whole tokens.
+    let mut found_procfs_ro_noexec = false;
+    let mut start = 0;
+    for i in 0..n {
+        if content[i] == b'\n' {
+            let line = &content[start..i];
+            start = i + 1;
+            if line.is_empty() { continue; }
+            // Tokenise.
+            let s = match core::str::from_utf8(line) { Ok(s) => s, Err(_) => continue };
+            let toks: alloc::vec::Vec<&str> = s.split_whitespace().collect();
+            if toks.len() < 4 { continue; }
+            if toks[2] != "procfs" { continue; }
+            let opts: alloc::vec::Vec<&str> = toks[3].split(',').collect();
+            if opts.iter().any(|t| *t == "ro") && opts.iter().any(|t| *t == "noexec") {
+                found_procfs_ro_noexec = true;
+                break;
+            }
+        }
+    }
+    if !found_procfs_ro_noexec {
+        test_fail!("procfs_mounts",
+            "procfs mount line is missing ro/noexec opts (libffi mount loop will spin)");
+        return false;
+    }
+    test_println!("  procfs advertises ro,noexec ok");
+
     test_pass!("/proc/mounts fstab(5) format + recursive-lock regression");
     true
 }
