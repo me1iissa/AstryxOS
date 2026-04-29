@@ -3717,16 +3717,95 @@ fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: u64, count: usize) -> i
 }
 
 /// access(pathname, mode) — Check user's permissions for a file.
-fn sys_access(pathname: u64, _mode: u64) -> i64 {
+///
+/// Per access(2):
+///   - F_OK (0): existence only — return 0 if the path resolves, -ENOENT otherwise.
+///   - R_OK (4): readable — granted unconditionally (no per-user perms yet).
+///   - W_OK (2): writable — denied with -EACCES on a read-only mount or when
+///     the inode mode lacks any of the write bits (mode & 0o222 == 0).
+///   - X_OK (1): executable — granted for directories (modulo the readability
+///     check above) or when the inode mode has any execute bit set.  On a
+///     `noexec` mount, X_OK is denied with -EACCES per mount(2).
+///
+/// The mount-flag set (ro / noexec) is derived from procfs::mount_opts_for
+/// which currently keys on (mountpoint, fstype).  Replacing that helper with
+/// per-mount flag plumbing later changes nothing here.
+fn sys_access(pathname: u64, mode: u64) -> i64 {
+    const F_OK: u64 = 0;
+    const X_OK: u64 = 1;
+    const W_OK: u64 = 2;
+    const R_OK: u64 = 4;
+
     let path_bytes = read_cstring_from_user(pathname);
     let path = match core::str::from_utf8(path_bytes) {
         Ok(s) => s,
-        Err(_) => return -22,
+        Err(_) => return -22, // EINVAL
     };
-    match crate::vfs::stat(path) {
-        Ok(_) => 0,
-        Err(_) => -2, // ENOENT
+
+    // Resolve to (mount_idx, inode).  Existence failure → -ENOENT.
+    let (mount_idx, inode) = match crate::vfs::resolve_path(path) {
+        Ok(t) => t,
+        Err(_) => return -2, // ENOENT
+    };
+
+    // F_OK alone: existence check passed already.
+    if mode == F_OK {
+        return 0;
     }
+
+    // Read inode mode bits and the mount's (path, fstype) under the lock,
+    // then drop it before consulting procfs::mount_opts_for to keep the
+    // critical section tight.
+    let (st, mount_path, fstype) = {
+        let mounts = crate::vfs::MOUNTS.lock();
+        let m = match mounts.get(mount_idx) {
+            Some(m) => m,
+            None => return -2,
+        };
+        let st = match m.fs.stat(inode) {
+            Ok(s) => s,
+            Err(_) => return -2,
+        };
+        (st, m.path.clone(), alloc::string::String::from(m.fs.name()))
+    };
+
+    let opts = crate::vfs::procfs::mount_opts_for(mount_path.as_str(), fstype.as_str());
+    let mount_ro     = opts.split(',').any(|t| t == "ro");
+    let mount_noexec = opts.split(',').any(|t| t == "noexec");
+    let perm = st.permissions;
+
+    // R_OK: we have no per-user / per-process credentials yet.  Treat every
+    // resolvable inode as readable.
+
+    // W_OK: deny on read-only mount, or if the mode bits lack any write bit.
+    if mode & W_OK != 0 {
+        if mount_ro || (perm & 0o222) == 0 {
+            return -13; // EACCES
+        }
+    }
+
+    // X_OK: directories are "executable" when readable (path-traversal bit).
+    // Regular files need at least one mode_t exec bit AND the mount must not
+    // be `noexec`.  Per access(2), X_OK on a noexec mount returns -EACCES.
+    if mode & X_OK != 0 {
+        let is_dir = st.file_type == crate::vfs::FileType::Directory;
+        if is_dir {
+            // No additional mode-bit gating for directory traversal.
+            // The noexec mount flag does not block directory traversal —
+            // it blocks only PROT_EXEC mappings of files on the mount.
+        } else if mount_noexec || (perm & 0o111) == 0 {
+            return -13; // EACCES
+        }
+    }
+
+    // Sanity for unknown bits: per access(2), passing bits other than R_OK |
+    // W_OK | X_OK | F_OK yields -EINVAL.  We accept any subset of those four
+    // and reject anything else.
+    if mode & !(R_OK | W_OK | X_OK | F_OK) != 0 {
+        return -22; // EINVAL
+    }
+
+    0
 }
 
 /// gettimeofday(tv, tz) — Get the time of day.
