@@ -705,6 +705,14 @@ pub fn run() -> ! {
     total += 1;
     if test_procfs_mounts() { passed += 1; }
 
+    // ── Test 98c: open(O_TMPFILE) returns -EOPNOTSUPP ─────────────────────
+    total += 1;
+    if test_open_tmpfile_eopnotsupp() { passed += 1; }
+
+    // ── Test 98d: access(W_OK) on read-only mount returns -EACCES ─────────
+    total += 1;
+    if test_access_w_ok_readonly() { passed += 1; }
+
     // ── Test 99: procfs self/maps — per-process VMA listing ──────────────
 
     total += 1;
@@ -1105,11 +1113,7 @@ pub fn run() -> ! {
     total += 1;
     if test_shebang_resolve() { passed += 1; }
 
-    // ── Test 177: open(O_TMPFILE) returns -EOPNOTSUPP ──────────────────────
-    total += 1;
-    if test_open_tmpfile_eopnotsupp() { passed += 1; }
-
-    // ── Test 178: TCP inbound 3WHS (SYN → SYN-ACK → ACK → Established) ──────
+    // ── Test 177: TCP inbound 3WHS (SYN → SYN-ACK → ACK → Established) ──────
     //
     // Gated on `kdb` because it relies on `tcp::snapshot_connections()`
     // to peek at the child-TCB created by the listener — the same API
@@ -19313,6 +19317,79 @@ fn test_open_tmpfile_eopnotsupp() -> bool {
     test_println!("  open(/tmp, O_TMPFILE|O_RDWR|O_EXCL, 0600) = -EOPNOTSUPP ✓");
 
     test_pass!("open(O_TMPFILE) → -EOPNOTSUPP");
+    true
+}
+
+/// `access(path, mode)` honours the mode bits and the mount's read-only flag.
+///
+/// Per access(2):
+///   - F_OK (0)        → -ENOENT iff path doesn't exist, else 0
+///   - R_OK (4)        → 0 for any existing readable inode (no per-user perms)
+///   - W_OK (2)        → -EACCES on a read-only mount (procfs / sysfs)
+///   - X_OK (1)        → honours the inode mode bits (and `noexec` on the mount)
+///
+/// This is the access-side half of the libffi open_temp_exec_file_mnt fix:
+/// /proc and /sys must report -EACCES for W_OK so the loop advances to the
+/// next /etc/mtab entry rather than spinning on a synthetic mount.
+fn test_access_w_ok_readonly() -> bool {
+    test_header!("access(path, mode) — F_OK / R_OK / W_OK / X_OK semantics");
+
+    const F_OK: u64 = 0;
+    const W_OK: u64 = 2;
+    const R_OK: u64 = 4;
+
+    // F_OK: existing path must succeed.
+    let p_passwd = b"/etc/passwd\0";
+    let r = dispatch(21 /*access*/, p_passwd.as_ptr() as u64, F_OK, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("access_w_ok_readonly",
+            "access(/etc/passwd, F_OK) = {} (expected 0)", r);
+        return false;
+    }
+    test_println!("  access(/etc/passwd, F_OK) = 0 ✓");
+
+    // F_OK: missing path must fail with -ENOENT (-2).
+    let p_missing = b"/nonexistent_8b3f4d2c\0";
+    let r = dispatch(21, p_missing.as_ptr() as u64, F_OK, 0, 0, 0, 0);
+    if r != -2 {
+        test_fail!("access_w_ok_readonly",
+            "access(/nonexistent, F_OK) = {} (expected -2 ENOENT)", r);
+        return false;
+    }
+    test_println!("  access(/nonexistent, F_OK) = -ENOENT ✓");
+
+    // R_OK on /proc/cpuinfo: must succeed (procfs is readable).
+    let p_cpuinfo = b"/proc/cpuinfo\0";
+    let r = dispatch(21, p_cpuinfo.as_ptr() as u64, R_OK, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("access_w_ok_readonly",
+            "access(/proc/cpuinfo, R_OK) = {} (expected 0)", r);
+        return false;
+    }
+    test_println!("  access(/proc/cpuinfo, R_OK) = 0 ✓");
+
+    // W_OK on /proc/cpuinfo: must fail with -EACCES (-13) — procfs is ro.
+    // libffi's open_temp_exec_file_mnt skips any mount where access(dir,W_OK)
+    // is non-zero, so a correct -EACCES here lets the loop advance past /proc.
+    let r = dispatch(21, p_cpuinfo.as_ptr() as u64, W_OK, 0, 0, 0, 0);
+    if r != -13 {
+        test_fail!("access_w_ok_readonly",
+            "access(/proc/cpuinfo, W_OK) = {} (expected -13 EACCES on ro mount)", r);
+        return false;
+    }
+    test_println!("  access(/proc/cpuinfo, W_OK) = -EACCES ✓");
+
+    // W_OK on /: root ramfs is rw, must succeed.
+    let p_root = b"/\0";
+    let r = dispatch(21, p_root.as_ptr() as u64, W_OK, 0, 0, 0, 0);
+    if r != 0 {
+        test_fail!("access_w_ok_readonly",
+            "access(/, W_OK) = {} (expected 0)", r);
+        return false;
+    }
+    test_println!("  access(/, W_OK) = 0 ✓");
+
+    test_pass!("access(path, mode) — F_OK / R_OK / W_OK / X_OK semantics");
     true
 }
 
