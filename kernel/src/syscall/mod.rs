@@ -944,8 +944,14 @@ pub fn write_u32_to_user_pub(cr3: u64, vaddr: u64, val: u32) {
 /// Wake futex waiters from the exit path (CLONE_CHILD_CLEARTID).
 /// This is called from proc::exit_thread when a thread with clear_child_tid exits.
 pub fn futex_wake_for_exit(pid: u64, uaddr: u64, max_wake: u64) {
+    #[cfg(feature = "firefox-test")]
+    let key_present;
     let tids_to_wake: alloc::vec::Vec<u64> = {
         let mut waiters = FUTEX_WAITERS.lock();
+        #[cfg(feature = "firefox-test")]
+        {
+            key_present = waiters.contains_key(&(pid, uaddr));
+        }
         if let Some(list) = waiters.get_mut(&(pid, uaddr)) {
             let mut result = alloc::vec::Vec::new();
             let mut woken = 0u64;
@@ -961,6 +967,20 @@ pub fn futex_wake_for_exit(pid: u64, uaddr: u64, max_wake: u64) {
             alloc::vec::Vec::new()
         }
     };
+    #[cfg(feature = "firefox-test")]
+    {
+        // Snapshot remaining keys for diagnosis if our lookup missed.
+        let waiters = FUTEX_WAITERS.lock();
+        let other_keys: alloc::vec::Vec<(u64, u64)> = waiters
+            .keys()
+            .filter(|&&(p, _)| p == pid)
+            .copied()
+            .collect();
+        crate::serial_println!(
+            "[FUTEX_WAKE_EXIT] pid={} uaddr={:#x} key_present={} woken={:?} remaining_pid_keys={:?}",
+            pid, uaddr, key_present, tids_to_wake, other_keys
+        );
+    }
     // Wake the threads (no lock held).
     let mut threads = crate::proc::THREAD_TABLE.lock();
     for wake_tid in tids_to_wake {
