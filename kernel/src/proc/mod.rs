@@ -313,6 +313,42 @@ pub static PROCESS_TABLE: Mutex<Vec<Process>> = Mutex::new(Vec::new());
 /// Thread table.
 pub static THREAD_TABLE: Mutex<Vec<Thread>> = Mutex::new(Vec::new());
 
+/// Bounded-spin acquire of `THREAD_TABLE` with a loud panic on exhaustion.
+///
+/// Used (under `firefox-test`) at hot read-only call sites that previously
+/// called `THREAD_TABLE.lock()` unconditionally.  A `MutexGuard` leaked from
+/// a prior panic (kernel builds with `panic = "abort"`) would otherwise turn
+/// every subsequent acquirer into a silent infinite spin — both vCPUs idle
+/// at the spin loop with no diagnostic output.  Converting the call to
+/// `thread_table_try_lock_or_panic` turns that silent hang into an immediate
+/// panic identifying the *next* contender, which is enough signal to triangulate
+/// the leaking owner across runs.
+///
+/// `site` is a static string (e.g. `"proc::current_pid"`) included in the panic
+/// message.  `max_spins` bounds the wait — about 10 µs per iteration on TCG
+/// (much less under KVM), so the default `THREAD_TABLE_DIAG_SPINS` is roughly
+/// a 100 ms upper bound under TCG before declaring the lock leaked.
+#[cfg(feature = "firefox-test")]
+pub const THREAD_TABLE_DIAG_SPINS: u32 = 10_000;
+
+#[cfg(feature = "firefox-test")]
+#[inline]
+pub fn thread_table_try_lock_or_panic(
+    site: &'static str,
+    max_spins: u32,
+) -> spin::MutexGuard<'static, Vec<Thread>> {
+    for _ in 0..max_spins {
+        if let Some(g) = THREAD_TABLE.try_lock() {
+            return g;
+        }
+        core::hint::spin_loop();
+    }
+    panic!(
+        "THREAD_TABLE deadlocked at {}: {} spins exhausted (likely lock leak from prior panic; build is panic=abort so MutexGuard::drop never runs)",
+        site, max_spins
+    );
+}
+
 /// Currently running thread ID — per-CPU, indexed by APIC ID.
 /// With SMP, each CPU tracks its own running thread.
 static PER_CPU_CURRENT_TID: [AtomicU64; crate::arch::x86_64::apic::MAX_CPUS] =
@@ -535,6 +571,10 @@ pub fn set_current_tid(tid: Tid) {
 /// Get the currently running process's PID.
 pub fn current_pid() -> Pid {
     let tid = current_tid();
+    #[cfg(feature = "firefox-test")]
+    let threads = thread_table_try_lock_or_panic(
+        "proc::current_pid", THREAD_TABLE_DIAG_SPINS);
+    #[cfg(not(feature = "firefox-test"))]
     let threads = THREAD_TABLE.lock();
     threads.iter().find(|t| t.tid == tid).map(|t| t.pid).unwrap_or(0)
 }
@@ -553,6 +593,10 @@ pub fn recover_current_tid() -> Tid {
     if tid != 0 { return tid; }
     let kstack_top = crate::syscall::get_current_kernel_rsp();
     if kstack_top == 0 { return 0; }
+    #[cfg(feature = "firefox-test")]
+    let threads = thread_table_try_lock_or_panic(
+        "proc::recover_current_tid", THREAD_TABLE_DIAG_SPINS);
+    #[cfg(not(feature = "firefox-test"))]
     let threads = THREAD_TABLE.lock();
     threads.iter()
         .find(|t| {
@@ -569,12 +613,20 @@ pub fn recover_current_tid() -> Tid {
 pub fn recover_current_pid() -> Pid {
     let fast_tid = current_tid();
     if fast_tid != 0 {
+        #[cfg(feature = "firefox-test")]
+        let threads = thread_table_try_lock_or_panic(
+            "proc::recover_current_pid (fast path)", THREAD_TABLE_DIAG_SPINS);
+        #[cfg(not(feature = "firefox-test"))]
         let threads = THREAD_TABLE.lock();
         return threads.iter().find(|t| t.tid == fast_tid).map(|t| t.pid).unwrap_or(0);
     }
     // Slow path: need to match by kernel stack top — do tid+pid in one pass
     let kstack_top = crate::syscall::get_current_kernel_rsp();
     if kstack_top == 0 { return 0; }
+    #[cfg(feature = "firefox-test")]
+    let threads = thread_table_try_lock_or_panic(
+        "proc::recover_current_pid (slow path)", THREAD_TABLE_DIAG_SPINS);
+    #[cfg(not(feature = "firefox-test"))]
     let threads = THREAD_TABLE.lock();
     threads.iter()
         .find(|t| {

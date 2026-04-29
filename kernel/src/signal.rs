@@ -29,7 +29,14 @@ pub const SIGCONT: u8 = 18;
 pub const SIGSTOP: u8 = 19;
 pub const SIGTSTP: u8 = 20;
 pub const SIGWINCH: u8 = 28;
-pub const MAX_SIGNAL: u8 = 32;
+// Per signal(7) on x86_64 Linux, _NSIG = 64 (32 standard + 32 real-time).
+// glibc uses signal numbers 32 (SIGCANCEL) and 33 (SIGSETXID) for its internal
+// thread-cancellation and setuid-broadcast machinery, both of which fail with
+// EINVAL when MAX_SIGNAL is 32 — a soft incompatibility that surfaces as
+// startup oddities on first thread-team initialisation.  Raising the cap to 64
+// matches the public POSIX/Linux ABI without changing on-the-wire behaviour:
+// `pending` and `blocked` are u64 so all 64 valid signal bits already fit.
+pub const MAX_SIGNAL: u8 = 64;
 
 /// Virtual address where the signal-return trampoline is mapped for every
 /// user-mode process.  The page contains two entry points:
@@ -113,7 +120,9 @@ impl SignalState {
     /// Queue a signal (set its pending bit).
     pub fn send(&mut self, sig: u8) {
         if sig > 0 && sig < MAX_SIGNAL {
-            self.pending |= 1 << sig;
+            // Explicit u64 literal: with MAX_SIGNAL=64, `sig` reaches 63 and a
+            // bare `1 << 63` would overflow the default i32 inference.
+            self.pending |= 1u64 << sig;
         }
     }
 
@@ -126,7 +135,7 @@ impl SignalState {
         }
         // Find lowest set bit
         let sig = deliverable.trailing_zeros() as u8;
-        self.pending &= !(1 << sig);
+        self.pending &= !(1u64 << sig);
         Some(sig)
     }
 
