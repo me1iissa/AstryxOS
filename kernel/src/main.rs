@@ -423,9 +423,16 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             serial_println!("[FFTEST] Pre-load complete — launching Firefox");
 
             serial_println!("[FFTEST] Launching /disk/opt/firefox/firefox-bin ...");
-            // X11 windowed mode — Firefox should create a window on our X11 server.
+            // Headless mode: pass `--headless` so libxul takes the IsHeadless()
+            // path and does not call XOpenDisplay() / gdk_display_open().  With
+            // a stub libX11.so XOpenDisplay returns NULL and Firefox prints
+            // "Error: cannot open display: <name>" then exit_group(1) before
+            // any real work is done.  Mozilla documents both `--headless` and
+            // `MOZ_HEADLESS=1` (set in the spawn envp) as equivalent triggers
+            // for headless rendering; we set both for defence in depth.
+            // See: https://firefox-source-docs.mozilla.org/widget/headless.html
             gui::terminal::launch_process(
-                "/disk/opt/firefox/firefox-bin --no-remote --profile /tmp/ff-profile --new-instance",
+                "/disk/opt/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance",
             );
 
             // Run for up to 30000 ticks (~300 s), polling output and network.
