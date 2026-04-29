@@ -253,9 +253,12 @@ extern "C" fn timer_tick() {
             // Don't watchdog idle threads — they legitimately wait in hlt
             // without calling schedule() when no user threads are assigned.
             let current_tid = crate::proc::current_tid();
+            // Lockless PID read: timer ISR runs with IF=0 in interrupt
+            // context.  Acquiring THREAD_TABLE here could deadlock the same
+            // CPU if a syscall mid-flight on this CPU already holds it.
             let is_idle = current_tid == 0 || {
                 // AP idle threads have PID 0
-                crate::proc::recover_current_pid() == 0
+                crate::proc::current_pid_lockless() == 0
             };
             if is_idle {
                 WATCHDOG_COUNTER[cpu as usize].store(0, Ordering::Relaxed);

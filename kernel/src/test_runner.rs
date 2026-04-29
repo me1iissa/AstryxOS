@@ -1142,6 +1142,18 @@ pub fn run() -> ! {
         if test_tcp_read_from_isolation() { passed += 1; }
     }
 
+    // ── Test 179: per-CPU lock-free PID matches THREAD_TABLE walk ────────
+    //
+    // Regression guard for the THREAD_TABLE re-entrant deadlock fix.
+    // current_pid_lockless() reads PER_CPU_CURRENT_PID without taking any
+    // lock.  set_current_pid() must therefore stay in sync with the
+    // authoritative THREAD_TABLE-derived PID at every context-switch site.
+    // Walking THREAD_TABLE here under the test runner's idle PID 0 should
+    // observe exactly the same answer as the lockless read.
+
+    total += 1;
+    if test_per_cpu_pid_lockless_consistent() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -19987,6 +19999,42 @@ fn test_tcp_read_from_isolation() -> bool {
     }
 
     test_pass!("TCP read_from — 4-tuple isolation under shared port");
+    true
+}
+
+// ── Test 179: per-CPU lock-free PID matches THREAD_TABLE walk ──────────────
+//
+// The page-fault and timer ISRs depend on `current_pid_lockless()` returning
+// the same PID a `THREAD_TABLE` walk would produce.  set_current_pid() is
+// called at every context-switch site to maintain this invariant; this test
+// asserts the invariant for the runtime context of the test runner itself.
+fn test_per_cpu_pid_lockless_consistent() -> bool {
+    test_header!("per-CPU current_pid_lockless() matches THREAD_TABLE walk");
+
+    let lockless = crate::proc::current_pid_lockless();
+    let walked = {
+        let tid = crate::proc::current_tid();
+        let threads = crate::proc::THREAD_TABLE.lock();
+        threads.iter().find(|t| t.tid == tid).map(|t| t.pid).unwrap_or(0)
+    };
+    if lockless != walked {
+        test_fail!("per_cpu_pid_lockless",
+            "current_pid_lockless()={} but THREAD_TABLE walk gives {}",
+            lockless, walked);
+        return false;
+    }
+
+    // Cross-check against current_pid() (which is THREAD_TABLE-locked) so a
+    // future refactor that diverges the helpers fails the test, not Firefox.
+    let cur = crate::proc::current_pid();
+    if cur != lockless {
+        test_fail!("per_cpu_pid_lockless",
+            "current_pid()={} but current_pid_lockless()={}", cur, lockless);
+        return false;
+    }
+
+    test_println!("  current_pid_lockless()={} matches THREAD_TABLE walk and current_pid() ✓", lockless);
+    test_pass!("per-CPU current_pid_lockless() == THREAD_TABLE walk == current_pid()");
     true
 }
 

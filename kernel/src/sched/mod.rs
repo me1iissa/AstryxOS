@@ -290,7 +290,7 @@ pub fn schedule() {
     // cli`: the dying/sleeping vCPU halts so the OTHER vCPU is not
     // starved competing for host CPU time under TCG, and the timer ISR
     // wakes us on the next tick.
-    let (next_tid, next_rsp, _next_pid, next_kstack_top, _next_first_run) = 'pick: loop {
+    let (next_tid, next_rsp, next_pid, next_kstack_top, _next_first_run) = 'pick: loop {
         // Re-establish IF=0 at the top of every iteration.  The wait
         // paths below execute `sti; hlt; cli` which leaves IF=0 on
         // return — this disable_interrupts() call is defence in depth
@@ -526,8 +526,11 @@ pub fn schedule() {
     // Record performance metric
     crate::perf::record_context_switch();
 
-    // Perform context switch.
+    // Perform context switch.  Update both the per-CPU TID and PID atomics
+    // together so the page-fault handler's lockless current_pid_lockless()
+    // sees a consistent (tid, pid) pair across the switch.
     proc::set_current_tid(next_tid);
+    proc::set_current_pid(next_pid);
 
     TICKS_REMAINING[cpu as usize].store(TIME_SLICE, Ordering::Relaxed);
 
