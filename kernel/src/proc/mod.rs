@@ -354,6 +354,24 @@ pub fn thread_table_try_lock_or_panic(
 static PER_CPU_CURRENT_TID: [AtomicU64; crate::arch::x86_64::apic::MAX_CPUS] =
     [const { AtomicU64::new(0) }; crate::arch::x86_64::apic::MAX_CPUS];
 
+/// Currently running process PID — per-CPU, kept in sync with `PER_CPU_CURRENT_TID`.
+///
+/// Maintained as a parallel atomic so interrupt-context code (notably the
+/// page-fault handler) can read the current PID without acquiring
+/// `THREAD_TABLE`.  Acquiring that lock from the PF handler is unsafe: a
+/// kernel-mode #PF can fire while a syscall on the same CPU already holds
+/// THREAD_TABLE, producing a non-recoverable same-CPU re-entrant deadlock on
+/// the non-reentrant `spin::Mutex`.  Reading this atomic is wait-free.
+///
+/// Update discipline: every `set_current_tid` call site that knows the PID
+/// must call `set_current_pid` immediately afterwards.  The two stores are
+/// independent atomics so there is a brief window during context switches
+/// where they disagree; readers in interrupt context must therefore tolerate
+/// a stale-but-self-consistent (tid, pid) pair — which is exactly the same
+/// invariant `recover_current_tid` already documents.
+static PER_CPU_CURRENT_PID: [AtomicU64; crate::arch::x86_64::apic::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::arch::x86_64::apic::MAX_CPUS];
+
 /// Kernel stack size per thread: 256 KiB (64 pages).
 /// Firefox's deep call chains (VFS → FAT32 → ATA + socket → DNS → NSS + signal
 /// delivery + serial formatting) can exceed 128 KiB.  256 KiB provides headroom
@@ -543,6 +561,7 @@ pub fn init() {
     PROCESS_TABLE.lock().push(idle_proc);
     THREAD_TABLE.lock().push(idle_thread);
     set_current_tid(0);
+    set_current_pid(0);
 
     crate::serial_println!(
         "[PROC] Process manager initialized (idle PID 0, TID 0, kstack={:#x}–{:#x})",
@@ -566,6 +585,32 @@ pub fn current_tid() -> Tid {
 /// Set the currently running thread's TID (per-CPU).
 pub fn set_current_tid(tid: Tid) {
     PER_CPU_CURRENT_TID[cpu_index()].store(tid, Ordering::Relaxed);
+}
+
+/// Set the currently running process's PID (per-CPU).
+///
+/// Must be called from every `set_current_tid` call site that knows the
+/// owning PID, so the PF handler's lockless `current_pid_lockless()` lookup
+/// stays in sync with the THREAD_TABLE-derived authoritative answer.
+pub fn set_current_pid(pid: Pid) {
+    PER_CPU_CURRENT_PID[cpu_index()].store(pid, Ordering::Relaxed);
+}
+
+/// Read the currently running process's PID without taking any lock.
+///
+/// Designed for interrupt-context callers (page-fault handler, NMI, etc.)
+/// where acquiring `THREAD_TABLE` could deadlock — a kernel-mode #PF can
+/// fire while a syscall on the same CPU already holds the lock, and
+/// `spin::Mutex` is not reentrant.
+///
+/// Returns 0 if no user thread is currently scheduled (idle thread, AP
+/// startup before first context switch).  Callers that hit a 0 result
+/// should treat the fault as unresolvable rather than retry-with-lock —
+/// the cost of dropping the resolution attempt is a SIGSEGV at worst,
+/// far better than a hard hang.
+#[inline]
+pub fn current_pid_lockless() -> Pid {
+    PER_CPU_CURRENT_PID[cpu_index()].load(Ordering::Relaxed)
 }
 
 /// Get the currently running process's PID.

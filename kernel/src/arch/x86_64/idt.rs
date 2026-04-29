@@ -552,7 +552,18 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
         }
     }
 
-    let pid = crate::proc::recover_current_pid();
+    // Lockless PID lookup: the page-fault handler runs in interrupt context
+    // (IF=0 on entry via the interrupt gate).  A kernel-mode #PF can fire
+    // while a syscall on the same CPU already holds THREAD_TABLE — taking
+    // the lock here would either deadlock the same CPU on its own held lock
+    // (spin::Mutex is not reentrant) or, under panic=abort, surface a stuck
+    // 0x01 lock byte forever after any earlier panic stranded the guard.
+    // The per-CPU PID atomic is updated at every context switch (see
+    // proc::set_current_pid) so this read is always current for a non-idle
+    // thread.  An idle thread on this CPU (pid=0) has no VmSpace to consult,
+    // so we bail out and let the existing PROCESS_TABLE.iter().find() miss
+    // path return false.
+    let pid = crate::proc::current_pid_lockless();
 
     // Look up the faulting address in the process's VmSpace.
     // For vfork children (sharing parent's CR3), also check the parent's VmSpace
