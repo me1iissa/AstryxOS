@@ -633,6 +633,14 @@ pub fn current_pid() -> Pid {
 /// user thread.  This slow-path fallback matches the kernel stack top
 /// (`get_current_kernel_rsp()`) against every thread's stack range to find
 /// the true owner.
+///
+/// **MUST NOT be called from interrupt context** — this function takes
+/// `THREAD_TABLE.lock()` on the slow path.  A kernel-mode #PF or timer ISR
+/// firing on a CPU that already holds `THREAD_TABLE` would re-enter the
+/// non-reentrant `spin::Mutex` and deadlock the CPU permanently (see #55).
+/// Interrupt handlers must use `current_tid()` (lock-free fast path) and
+/// accept the transient-zero window, or use `current_pid_lockless()` which
+/// is maintained per-CPU specifically for ISR consumption.
 pub fn recover_current_tid() -> Tid {
     let tid = current_tid();
     if tid != 0 { return tid; }
@@ -650,36 +658,6 @@ pub fn recover_current_tid() -> Tid {
                 && t.kernel_stack_base + t.kernel_stack_size == kstack_top
         })
         .map(|t| t.tid)
-        .unwrap_or(0)
-}
-
-/// Like `current_pid()` but uses `recover_current_tid()` to handle the
-/// transient tid=0 race condition.  Single THREAD_TABLE lock for the slow path.
-pub fn recover_current_pid() -> Pid {
-    let fast_tid = current_tid();
-    if fast_tid != 0 {
-        #[cfg(feature = "firefox-test")]
-        let threads = thread_table_try_lock_or_panic(
-            "proc::recover_current_pid (fast path)", THREAD_TABLE_DIAG_SPINS);
-        #[cfg(not(feature = "firefox-test"))]
-        let threads = THREAD_TABLE.lock();
-        return threads.iter().find(|t| t.tid == fast_tid).map(|t| t.pid).unwrap_or(0);
-    }
-    // Slow path: need to match by kernel stack top — do tid+pid in one pass
-    let kstack_top = crate::syscall::get_current_kernel_rsp();
-    if kstack_top == 0 { return 0; }
-    #[cfg(feature = "firefox-test")]
-    let threads = thread_table_try_lock_or_panic(
-        "proc::recover_current_pid (slow path)", THREAD_TABLE_DIAG_SPINS);
-    #[cfg(not(feature = "firefox-test"))]
-    let threads = THREAD_TABLE.lock();
-    threads.iter()
-        .find(|t| {
-            t.tid != 0
-                && t.kernel_stack_base > 0
-                && t.kernel_stack_base + t.kernel_stack_size == kstack_top
-        })
-        .map(|t| t.pid)
         .unwrap_or(0)
 }
 
