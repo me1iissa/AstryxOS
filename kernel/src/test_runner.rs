@@ -713,6 +713,10 @@ pub fn run() -> ! {
     total += 1;
     if test_access_w_ok_readonly() { passed += 1; }
 
+    // ── Test 98e: CLONE_CHILD_CLEARTID exit-time futex wake ──────────────
+    total += 1;
+    if test_cleartid_futex_wake() { passed += 1; }
+
     // ── Test 99: procfs self/maps — per-process VMA listing ──────────────
 
     total += 1;
@@ -19390,6 +19394,136 @@ fn test_access_w_ok_readonly() -> bool {
     test_println!("  access(/, W_OK) = 0 ✓");
 
     test_pass!("access(path, mode) — F_OK / R_OK / W_OK / X_OK semantics");
+    true
+}
+
+/// Regression test for the CLONE_CHILD_CLEARTID exit-time futex wake.
+///
+/// Per clone(2), a thread spawned with CLONE_CHILD_CLEARTID stores a user
+/// virtual address (`child_tid`); when that thread terminates the kernel
+/// writes 0 to the address and performs a futex wake on it.  glibc 2.34+
+/// uses this hand-shake to implement pthread_join: the joiner sleeps in
+/// FUTEX_WAIT_BITSET on the same address (the `joinstate` field of the
+/// pthread descriptor) and is unblocked by the kernel's wake when the
+/// child exits.
+///
+/// This test pins the wake-side dispatch.  It does not run a real user
+/// thread (the BSP test runner cannot block); instead it inserts a fake
+/// waiter into the `(pid, uaddr)` queue, calls `futex_wake_for_exit`,
+/// and asserts:
+///   - the queue entry was consumed (key removed when last waiter pops),
+///   - the same call with no matching key is a no-op (no panic, no entry
+///     created).
+///
+/// The two failure modes this catches are exactly the keying / dispatch
+/// regressions that broke pthread_join in earlier kernels:
+///   - a (pid, uaddr) lookup-key mismatch leaves the waiter in the queue,
+///   - a stale entry left behind on a missing key would inadvertently
+///     wake a future, unrelated waiter on the same address.
+///
+/// Coverage gap (intentional, called out for future regressions):
+///   - clone3's storage of `child_tid` into the spawned thread's
+///     `clear_child_tid` slot is NOT exercised here; an end-to-end
+///     pthread_create / pthread_join repro requires a real user thread
+///     and is left to the firefox-test integration path.
+///   - the exit-path's lookup of `clear_addr` from THREAD_TABLE before
+///     calling `futex_wake_for_exit` is NOT exercised here; this test
+///     calls the wake function directly with a synthetic key.
+///   - the FUTEX_WAIT_BITSET ↔ FUTEX_WAKE_ON_EXIT interaction (per
+///     futex(2): a wake without an explicit bitset must match a
+///     WAIT_BITSET waiter, which Linux models as `FUTEX_BITSET_MATCH_ANY
+///     = ~0u32`) is NOT exercised here; the wake-side caller's bitset
+///     handling is covered by the regular FUTEX_WAKE syscall tests.
+fn test_cleartid_futex_wake() -> bool {
+    test_header!("CLONE_CHILD_CLEARTID exit-time futex wake (key match + dequeue)");
+
+    use crate::syscall::{FUTEX_WAITERS, futex_wake_for_exit};
+
+    // Pick a synthetic (pid, uaddr) pair that no real thread is using.
+    // The high tid value 0xFEED_1234 ensures we do not collide with any
+    // live thread; futex_wake_for_exit's secondary thread-state update
+    // is a benign no-op when the tid does not exist.
+    let fake_pid: u64    = 0xDEAD_BEEF;
+    let fake_uaddr: u64  = 0x7EFF_FF44_9990; // shape matches glibc joinstate addr
+    let fake_tid: u64    = 0xFEED_1234;
+
+    // Step 1: register a fake waiter.
+    {
+        let mut waiters = FUTEX_WAITERS.lock();
+        waiters.entry((fake_pid, fake_uaddr))
+            .or_insert_with(alloc::vec::Vec::new)
+            .push(fake_tid);
+    }
+    test_println!("  inserted fake waiter (pid={:#x}, uaddr={:#x}, tid={:#x})",
+        fake_pid, fake_uaddr, fake_tid);
+
+    // Step 2: call the same wake path proc::exit_thread invokes.
+    futex_wake_for_exit(fake_pid, fake_uaddr, 1);
+
+    // Step 3: the (pid, uaddr) key must be gone (last waiter popped).
+    {
+        let waiters = FUTEX_WAITERS.lock();
+        if waiters.contains_key(&(fake_pid, fake_uaddr)) {
+            drop(waiters);
+            test_fail!("cleartid_futex_wake",
+                "FUTEX_WAITERS still contains (pid={:#x}, uaddr={:#x}) after wake",
+                fake_pid, fake_uaddr);
+            // Best-effort cleanup so a failed run does not leak the entry.
+            FUTEX_WAITERS.lock().remove(&(fake_pid, fake_uaddr));
+            return false;
+        }
+    }
+    test_println!("  futex_wake_for_exit consumed the waiter ✓");
+
+    // Step 4: idempotent no-op on missing key — must not insert anything.
+    futex_wake_for_exit(fake_pid, fake_uaddr, 1);
+    {
+        let waiters = FUTEX_WAITERS.lock();
+        if waiters.contains_key(&(fake_pid, fake_uaddr)) {
+            drop(waiters);
+            test_fail!("cleartid_futex_wake",
+                "wake-on-missing-key fabricated a stale entry");
+            FUTEX_WAITERS.lock().remove(&(fake_pid, fake_uaddr));
+            return false;
+        }
+    }
+    test_println!("  wake-on-missing-key is a clean no-op ✓");
+
+    // Step 5: queue with multiple waiters — wake 1 leaves the rest.
+    {
+        let mut waiters = FUTEX_WAITERS.lock();
+        let v = waiters.entry((fake_pid, fake_uaddr))
+            .or_insert_with(alloc::vec::Vec::new);
+        v.push(0xAAA1);
+        v.push(0xAAA2);
+        v.push(0xAAA3);
+    }
+    futex_wake_for_exit(fake_pid, fake_uaddr, 1);
+    let remaining = {
+        let waiters = FUTEX_WAITERS.lock();
+        waiters.get(&(fake_pid, fake_uaddr)).map(|v| v.len()).unwrap_or(0)
+    };
+    if remaining != 2 {
+        // Cleanup before failing.
+        FUTEX_WAITERS.lock().remove(&(fake_pid, fake_uaddr));
+        test_fail!("cleartid_futex_wake",
+            "expected 2 remaining waiters, got {}", remaining);
+        return false;
+    }
+    test_println!("  wake-1 of 3 leaves 2 remaining ✓");
+    // Drain the rest so we leave FUTEX_WAITERS clean.
+    futex_wake_for_exit(fake_pid, fake_uaddr, u64::MAX);
+    let leftover = {
+        let waiters = FUTEX_WAITERS.lock();
+        waiters.contains_key(&(fake_pid, fake_uaddr))
+    };
+    if leftover {
+        FUTEX_WAITERS.lock().remove(&(fake_pid, fake_uaddr));
+        test_fail!("cleartid_futex_wake", "drain wake left a stale key");
+        return false;
+    }
+
+    test_pass!("CLONE_CHILD_CLEARTID exit-time futex wake (key match + dequeue)");
     true
 }
 

@@ -1593,13 +1593,20 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // in r8 (arg5) through the syscall; the child does:  mov rdi, r8; call *rdx.
         // We must preserve these into the new thread's registers via user_entry_rdx/r8.
         435 => {
-            if arg2 < 56 || arg1 == 0 { return -22i64; } // EINVAL: struct too small
+            // CLONE_ARGS_SIZE_VER0 = 64 bytes (covers flags..tls).  Anything
+            // smaller cannot supply a tls offset; reject per clone(2).
+            if arg2 < 64 || arg1 == 0 { return -22i64; } // EINVAL: struct too small
             let clone_flags   = unsafe { *(arg1 as *const u64) };
             let stack_ptr     = unsafe { *((arg1 + 40) as *const u64) };
             let stack_size    = unsafe { *((arg1 + 48) as *const u64) };
             let tls           = unsafe { *((arg1 + 56) as *const u64) };
             let child_tidptr  = unsafe { *((arg1 + 16) as *const u64) };
             let parent_tidptr = unsafe { *((arg1 + 24) as *const u64) };
+            #[cfg(feature = "firefox-test")]
+            crate::serial_println!(
+                "[CLONE3] flags={:#x} child_tid={:#x} parent_tid={:#x} arg2_size={}",
+                clone_flags, child_tidptr, parent_tidptr, arg2
+            );
             let sp = if stack_ptr != 0 { stack_ptr + stack_size } else { 0 };
             const CLONE_THREAD: u64 = 0x00010000;
             const CLONE_VM:     u64 = 0x00000100;
@@ -4285,6 +4292,11 @@ pub fn sys_futex_linux(uaddr: u64, futex_op: u64, val: u64, timeout_ptr: u64, ua
             }
 
             let tid = crate::proc::current_tid();
+            #[cfg(feature = "firefox-test")]
+            crate::serial_println!(
+                "[FUTEX_WAIT_REG] tid={} pid={} uaddr={:#x} val={} op={:#x}",
+                tid, pid, uaddr, val, futex_op
+            );
             {
                 let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
                 waiters.entry((pid, uaddr)).or_insert_with(Vec::new).push(tid);
