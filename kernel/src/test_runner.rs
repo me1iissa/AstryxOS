@@ -20008,6 +20008,16 @@ fn test_tcp_read_from_isolation() -> bool {
 // the same PID a `THREAD_TABLE` walk would produce.  set_current_pid() is
 // called at every context-switch site to maintain this invariant; this test
 // asserts the invariant for the runtime context of the test runner itself.
+//
+// SCOPE LIMITATION: this test runs in the BSP test-runner context where
+// pid=0 (idle/bootstrap) is the typical observed value, so all three
+// readings (lockless, walked, locked) compare equal trivially when zero.
+// The test will NOT catch a regression that diverges set_current_tid from
+// set_current_pid only on a code path that doesn't run during the test
+// suite — that class of regression must be caught by the firefox-test
+// feature's loud-panic instrumentation in `current_pid` / `current_tid`.
+// This test guards against the simpler case: a global rename / refactor
+// that breaks the invariant outright.
 fn test_per_cpu_pid_lockless_consistent() -> bool {
     test_header!("per-CPU current_pid_lockless() matches THREAD_TABLE walk");
 
