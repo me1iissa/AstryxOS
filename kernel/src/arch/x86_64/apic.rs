@@ -923,8 +923,10 @@ pub extern "C" fn ap_rust_entry() -> ! {
         THREAD_TABLE.lock().push(ap_thread);
     }
 
-    // Set this AP's current thread ID
+    // Set this AP's current thread ID and matching PID for the lock-free
+    // current_pid_lockless() path used by interrupt handlers.
     crate::proc::set_current_tid(ap_idle_tid);
+    crate::proc::set_current_pid(0); // AP idle is on PID 0 (the idle process).
 
     // Mark ourselves as started
     AP_STARTED[apic_id as usize].store(true, Ordering::Release);
