@@ -638,6 +638,26 @@ fn mangle_field(s: &str, out: &mut Vec<u8>) {
     }
 }
 
+/// Compute the fstab(5)-format mount options string for a (mountpoint, fstype) pair.
+///
+/// Per proc(5) and the kernel's MS_* mount flags, synthetic filesystems are
+/// always exposed read-only and non-executable (no point opening files there
+/// for `PROT_EXEC` mappings).  fat32 image data mounted under `/mnt` is the
+/// in-memory test stub and is treated read-only for the same reason; the
+/// real data disk at `/disk` is the only writable fat32 volume.  The root
+/// ramfs at `/` and any other mount fall back to the default `rw,relatime`.
+///
+/// The substrings "ro", "noexec", "nosuid", and "nodev" must be matchable as
+/// whole tokens by `hasmntopt(3)`-style consumers (libffi's
+/// `open_temp_exec_file_mnt` is one such caller, per fstab(5)/getmntent(3)).
+pub(crate) fn mount_opts_for(path: &str, fstype: &str) -> &'static str {
+    match fstype {
+        "procfs" | "sysfs" => "ro,noexec,nosuid,nodev,relatime",
+        "fat32" if path == "/mnt" => "ro,noexec,relatime",
+        _ => "rw,relatime",
+    }
+}
+
 /// Generate `/proc/mounts` content from the live mount table.
 ///
 /// Format per fstab(5): `<source> <mountpoint> <fstype> <opts> <freq> <passno>\n`
@@ -672,10 +692,11 @@ pub fn generate_mounts() -> Vec<u8> {
         // type
         mangle_field(fstype.as_str(), &mut out);
         out.push(b' ');
-        // options — "rw,relatime" is the canonical default (fstab(5)).
-        // Consumers that only check for "ro"/"noexec" substrings see neither
-        // here, which is the intended read-write no-restrictions semantics.
-        out.extend_from_slice(b"rw,relatime");
+        // options — derived from (mountpoint, fstype).  Synthetic filesystems
+        // (procfs, sysfs) and the in-memory fat32 test stub at /mnt are
+        // exposed read-only + noexec so userspace tools that scan /proc/mounts
+        // for an executable temp-file location (libffi, glib, etc.) skip them.
+        out.extend_from_slice(mount_opts_for(path, fstype).as_bytes());
         out.push(b' ');
         // freq, passno — both zero for all synthetic mounts.
         out.extend_from_slice(b"0 0\n");
