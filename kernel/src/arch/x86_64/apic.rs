@@ -912,7 +912,7 @@ pub extern "C" fn ap_rust_entry() -> ! {
             cpu_affinity: Some(apic_id),
             last_cpu: 0,
             first_run: false,
-            ctx_rsp_valid: core::sync::atomic::AtomicBool::new(true),
+            ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
             clear_child_tid: 0,
             fork_user_regs: crate::proc::ForkUserRegs::default(),
             vfork_parent_tid: None,
