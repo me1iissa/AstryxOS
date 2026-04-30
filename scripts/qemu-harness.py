@@ -2162,14 +2162,30 @@ def _try_symbolise(host_path, file_offset):
     return f"{best_sym}+{file_offset - best_addr:#x}"
 
 
-def _resolve_path_on_host(guest_path):
+def _resolve_path_on_host(guest_path, disk_root=None):
     """Map a guest path like /opt/firefox/libxul.so to a host path under
-    build/disk/...  Returns the first match that exists on the host."""
-    candidates = [
-        Path("build/disk") / guest_path.lstrip("/"),
-        Path("build") / guest_path.lstrip("/"),
+    `disk_root` (default: ./build/disk and ./build).  Returns the first match
+    that exists on the host, or None.
+
+    Passing an explicit `disk_root` makes resolution independent of the
+    process's current working directory — useful when the harness is being
+    driven from outside the repo root, or when several disk staging
+    directories coexist (e.g. firefox-test vs the default test-mode disk).
+    """
+    candidates = []
+    rel = guest_path.lstrip("/")
+    if disk_root:
+        root = Path(disk_root)
+        candidates.append(root / rel)
+        # Permit `--disk-root build/disk` to resolve `/opt/x` to
+        # `build/disk/opt/x` AND `--disk-root build` to resolve `/disk/opt/x`
+        # to `build/disk/opt/x`; either flag spelling works.
+        candidates.append(root / "disk" / rel)
+    candidates.extend([
+        Path("build/disk") / rel,
+        Path("build") / rel,
         Path(guest_path),
-    ]
+    ])
     for c in candidates:
         if c.exists(): return str(c)
     return None
@@ -2190,6 +2206,7 @@ def cmd_ustack(args):
     libs = _build_load_base_map(lines)
     libs.sort(key=lambda L: L["base"])
     do_syms = bool(getattr(args, "symbolise", False))
+    disk_root = getattr(args, "disk_root", None)
 
     snapshots = []
     for ln in lines:
@@ -2227,7 +2244,7 @@ def cmd_ustack(args):
                 "symbol": None,
             }
             if do_syms and lib is not None:
-                host = _resolve_path_on_host(lib)
+                host = _resolve_path_on_host(lib, disk_root=disk_root)
                 sym = _try_symbolise(host, off) if host else None
                 entry["symbol"] = sym
                 entry["host_path"] = host
@@ -2446,6 +2463,11 @@ def main():
                           help="Only return snapshots for this TID")
     p_ustack.add_argument("--nr", type=int, default=None,
                           help="Only return snapshots for this syscall number")
+    p_ustack.add_argument("--disk-root", default=None, metavar="DIR",
+                          help="Root directory containing the staged guest disk "
+                               "(used to resolve guest paths to host files for "
+                               "symbol lookup).  Defaults to ./build/disk and "
+                               "./build relative to CWD.")
 
     # _watch: private subcommand used internally by `start` to run the
     # background watcher in a detached process. Not shown in help.
