@@ -376,8 +376,11 @@ pub fn dispatch(
             crate::syscall::sys_fork()
         }
         SYS_FUTEX => {
-            // futex(uaddr, op, val, timeout_ptr, uaddr2)
-            crate::subsys::linux::syscall::sys_futex_linux(arg1, arg2, arg3, arg4, arg5)
+            // futex(uaddr, op, val, timeout_ptr, uaddr2, val3)
+            // val3 carries the bitset for FUTEX_WAIT_BITSET/FUTEX_WAKE_BITSET; see futex(2).
+            // Aether subsystem currently dispatches without arg6, so pass 0 (== unused for
+            // the ops Aether code actually invokes).
+            crate::subsys::linux::syscall::sys_futex_linux(arg1, arg2, arg3, arg4, arg5, 0)
         }
         SYS_SYNC => {
             // sync() — flush all dirty filesystem data to disk
