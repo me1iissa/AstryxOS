@@ -344,11 +344,17 @@ pub static THREAD_TABLE: Mutex<Vec<Thread>> = Mutex::new(Vec::new());
 /// the leaking owner across runs.
 ///
 /// `site` is a static string (e.g. `"proc::current_pid"`) included in the panic
-/// message.  `max_spins` bounds the wait — about 10 µs per iteration on TCG
-/// (much less under KVM), so the default `THREAD_TABLE_DIAG_SPINS` is roughly
-/// a 100 ms upper bound under TCG before declaring the lock leaked.
+/// message.  `max_spins` bounds the wait.  Each iteration is a `PAUSE` hint
+/// (~5–25 CPU cycles, ~2–10 ns on modern silicon under KVM), so the default
+/// `THREAD_TABLE_DIAG_SPINS` is roughly a 50–100 ms upper bound under KVM and
+/// several seconds under TCG before declaring the lock leaked.  A smaller
+/// bound (10_000 spins ≈ a few µs under KVM) caused false-positive panics
+/// during Firefox bringup once the cmdline-handler chain dispatched and many
+/// concurrent worker threads competed with the timer-ISR scheduler picker for
+/// `THREAD_TABLE`.  The bound exists to surface true deadlocks, not raw
+/// contention.
 #[cfg(feature = "firefox-test")]
-pub const THREAD_TABLE_DIAG_SPINS: u32 = 10_000;
+pub const THREAD_TABLE_DIAG_SPINS: u32 = 10_000_000;
 
 #[cfg(feature = "firefox-test")]
 #[inline]
