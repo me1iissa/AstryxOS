@@ -108,7 +108,18 @@ pub struct Thread {
     /// Thread state.
     pub state: ThreadState,
     /// Saved CPU context (for context switch).
-    pub context: CpuContext,
+    ///
+    /// Heap-allocated for the same reason as `ctx_rsp_valid`: the picker
+    /// captures `&mut cur.context.rsp` as a raw pointer under
+    /// `THREAD_TABLE.lock()`, drops the lock, and only later passes that
+    /// pointer to `switch_context_asm` which executes `mov [rdi], rsp`
+    /// to save the outgoing RSP.  If `THREAD_TABLE: Vec<Thread>` reallocates
+    /// in the lock-drop window, an embedded `CpuContext` would dangle and
+    /// the save would write into freed memory; the resumed-side read
+    /// (`cur.context.rsp` under a fresh lock) would then return the stale
+    /// pre-switch value, restoring the wrong stack.  A `Box<CpuContext>`
+    /// has a stable heap address for the lifetime of the `Thread`.
+    pub context: alloc::boxed::Box<CpuContext>,
     /// Kernel stack base (lowest address; stack grows down).
     pub kernel_stack_base: u64,
     /// Kernel stack size in bytes.
@@ -529,11 +540,11 @@ pub fn init() {
         tid: 0,
         pid: 0,
         state: ThreadState::Running,
-        context: CpuContext {
+        context: alloc::boxed::Box::new(CpuContext {
             rsp: 0,
             cr3: crate::mm::vmm::get_cr3(),
             ..CpuContext::default()
-        },
+        }),
         kernel_stack_base: idle_stack_base,
         kernel_stack_size: KERNEL_STACK_SIZE,
         wake_tick: u64::MAX,
@@ -759,7 +770,7 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
         tid,
         pid,
         state: initial_state,
-        context,
+        context: alloc::boxed::Box::new(context),
         kernel_stack_base: stack_base,
         kernel_stack_size: KERNEL_STACK_SIZE,
         wake_tick: u64::MAX,
@@ -823,7 +834,7 @@ pub fn create_thread(pid: Pid, name: &str, entry_point: u64) -> Option<Tid> {
         tid,
         pid,
         state: ThreadState::Ready,
-        context,
+        context: alloc::boxed::Box::new(context),
         kernel_stack_base: stack_base,
         kernel_stack_size: KERNEL_STACK_SIZE,
         wake_tick: u64::MAX,
@@ -892,7 +903,7 @@ pub fn create_thread_blocked(pid: Pid, name: &str, entry_point: u64) -> Option<T
         tid,
         pid,
         state: ThreadState::Blocked, // caller must mark Ready when prepared
-        context,
+        context: alloc::boxed::Box::new(context),
         kernel_stack_base: stack_base,
         kernel_stack_size: KERNEL_STACK_SIZE,
         wake_tick: u64::MAX, // indefinite — caller marks Ready explicitly
@@ -1656,7 +1667,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
         // Start Blocked so sys_fork_impl can write fork_user_regs before the
         // child is scheduled.  unblock_process() is called after set_fork_user_regs().
         state: ThreadState::Blocked,
-        context,
+        context: alloc::boxed::Box::new(context),
         kernel_stack_base: stack_base,
         kernel_stack_size: KERNEL_STACK_SIZE,
         wake_tick: u64::MAX,
@@ -1833,7 +1844,7 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
         tid: child_tid,
         pid: child_pid,
         state: ThreadState::Ready, // Ready immediately (parent blocks itself)
-        context,
+        context: alloc::boxed::Box::new(context),
         kernel_stack_base: stack_base,
         kernel_stack_size: KERNEL_STACK_SIZE,
         wake_tick: u64::MAX,
