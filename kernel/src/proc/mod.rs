@@ -159,7 +159,15 @@ pub struct Thread {
     /// the RSP.  Other CPUs' schedulers skip threads where this is `false`
     /// to prevent using a stale kernel RSP before the owning CPU has
     /// finished saving the new one (SMP context-switch race guard).
-    pub ctx_rsp_valid: core::sync::atomic::AtomicBool,
+    ///
+    /// Heap-allocated via `Box` so the address is stable across `Vec` growth
+    /// of `THREAD_TABLE`.  The picker captures `as_ptr()` under the table
+    /// lock and the asm `mov byte ptr [rdx], 1` write happens AFTER the lock
+    /// is dropped — if another CPU pushes a new thread and the Vec
+    /// reallocates in that window, an embedded AtomicBool's address would
+    /// dangle.  The `Box` indirection guarantees the address survives any
+    /// movement of the surrounding `Thread` value.
+    pub ctx_rsp_valid: alloc::boxed::Box<core::sync::atomic::AtomicBool>,
     /// Virtual address to clear (write 0 + futex-wake) on thread exit.
     /// Set by CLONE_CHILD_CLEARTID flag in clone(). 0 = not set.
     pub clear_child_tid: u64,
@@ -549,7 +557,7 @@ pub fn init() {
         cpu_affinity: Some(0),
         last_cpu: 0,
         first_run: false,
-        ctx_rsp_valid: core::sync::atomic::AtomicBool::new(true),
+        ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         fork_user_regs: ForkUserRegs::default(),
         vfork_parent_tid: None,
@@ -768,7 +776,7 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
         cpu_affinity: None,
         last_cpu: 0,
         first_run: false,
-        ctx_rsp_valid: core::sync::atomic::AtomicBool::new(true),
+        ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         fork_user_regs: ForkUserRegs::default(),
         vfork_parent_tid: None,
@@ -832,7 +840,7 @@ pub fn create_thread(pid: Pid, name: &str, entry_point: u64) -> Option<Tid> {
         cpu_affinity: None,
         last_cpu: 0,
         first_run: false,
-        ctx_rsp_valid: core::sync::atomic::AtomicBool::new(true),
+        ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         fork_user_regs: ForkUserRegs::default(),
         vfork_parent_tid: None,
@@ -901,7 +909,7 @@ pub fn create_thread_blocked(pid: Pid, name: &str, entry_point: u64) -> Option<T
         cpu_affinity: None,
         last_cpu: 0,
         first_run: false,
-        ctx_rsp_valid: core::sync::atomic::AtomicBool::new(true),
+        ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         fork_user_regs: ForkUserRegs::default(),
         vfork_parent_tid: None,
@@ -1665,7 +1673,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
         cpu_affinity: None,
         last_cpu: 0,
         first_run: true, // goes through user_mode_bootstrap (CR3 switch, TSS, TLS)
-        ctx_rsp_valid: core::sync::atomic::AtomicBool::new(true),
+        ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         fork_user_regs: ForkUserRegs::default(),
         vfork_parent_tid: None,
@@ -1842,7 +1850,7 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
         cpu_affinity: None,
         last_cpu: 0,
         first_run: true,  // Goes through user_mode_bootstrap (handles CR3, TSS, TLS)
-        ctx_rsp_valid: core::sync::atomic::AtomicBool::new(true),
+        ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         fork_user_regs: ForkUserRegs::default(),
         vfork_parent_tid: None,
