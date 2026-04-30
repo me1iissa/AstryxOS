@@ -154,6 +154,15 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     // empirically rather than from the histogram alone.
     #[cfg(feature = "firefox-test")]
     {
+        // First PID at which the user-stack snapshot emitter starts firing.
+        // Lower PIDs belong to the kernel bringup chain (idle, init, X11
+        // server, the test runner's own helpers) — none of them produce
+        // useful Firefox-side stack traces, and emitting for them just
+        // pollutes the serial log during boot.  PID 12 is the first
+        // PID assigned to a Firefox-equivalent user process under the
+        // current bringup ordering; bump this if the boot chain grows.
+        const FIRST_USERLAND_PID: u64 = 12;
+
         let pid_now = crate::proc::current_pid();
         let tid_now = crate::proc::current_tid();
         let is_hot = matches!(num,
@@ -162,9 +171,14 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
             202 | 449 |       // futex, futex_waitv
             232 | 270 | 271   // epoll_wait, pselect6, ppoll
         );
-        if pid_now >= 12 && is_hot {
-            // 4-element ring per (pid,tid,num) tuple — small enough that the
-            // total log volume stays bounded across all worker threads.
+        if pid_now >= FIRST_USERLAND_PID && is_hot {
+            // 64-slot ring of per-(pid,tid,num) emission counters.  The slot
+            // index is a small hash of tid and syscall number, so distinct
+            // (tid,num) tuples that hash to the same slot SHARE the 8-emission
+            // budget — a deliberate trade of perfect per-tuple isolation for
+            // a fixed-size statics table.  In practice Firefox runs ~30-50
+            // worker threads against ~10 hot syscalls, so collisions cost
+            // a small number of missed snapshots, never a runaway log.
             static USTACK_N: [core::sync::atomic::AtomicU64; 64] = {
                 const Z: core::sync::atomic::AtomicU64 =
                     core::sync::atomic::AtomicU64::new(0);
@@ -5877,7 +5891,12 @@ fn emit_user_stack_snapshot(num: u64, sample_idx: u64) {
         Some(unsafe { core::ptr::read_unaligned((PHYS_OFF + phys) as *const u64) })
     };
 
-    let mut line = alloc::string::String::with_capacity(512);
+    // 1024 chosen so a fully-populated snapshot (16 RBP frames × ~12 bytes
+    // each + 16 stack-scan candidates × ~22 bytes each + the ~80-byte
+    // header) fits without a realloc.  Previous 512-byte capacity always
+    // grew at least once on full snapshots, which is wasteful when the
+    // formatter is on the hot busy-poll path.
+    let mut line = alloc::string::String::with_capacity(1024);
     let _ = write!(
         &mut line,
         "[SC-USTACK] pid={} tid={} nr={} n={} rsp={:#x} rbp={:#x} leaf={:#x}",
@@ -5907,6 +5926,15 @@ fn emit_user_stack_snapshot(num: u64, sample_idx: u64) {
     // Format: ` s<i>=<rsp_offset>:<word>` — host can keep words pointing
     // into known exec ranges as candidate frames.
     if frames_emitted < MAX_FRAMES {
+        // Stack-scan pre-filter range — the user-space mmap window where the
+        // dynamic loader places shared objects, the heap, and per-thread
+        // stacks.  Defined as a named constant so a future change to the
+        // mmap policy (mm::vma::USER_MMAP_BASE etc.) can be tracked back to
+        // a single source of truth.  See the user-VA layout documented in
+        // `kernel/src/mm/vma.rs` (USER_MMAP_BASE..KERNEL_VIRT_BASE).
+        const USER_EXEC_VA_LO: u64 = 0x7000_0000_0000;
+        const USER_EXEC_VA_HI: u64 = 0x8000_0000_0000;
+
         let mut emitted_scan = 0usize;
         let scan_words = 256usize; // 2 KiB of stack above RSP
         for off in 0..scan_words {
@@ -5914,9 +5942,8 @@ fn emit_user_stack_snapshot(num: u64, sample_idx: u64) {
             let va = user_rsp.wrapping_add((off as u64) * 8);
             let w = match read_u64(va) { Some(v) => v, None => break };
             // Only print words that look like a user-space code address —
-            // host filtering by exec-range handles the rest.  Cheap pre-filter:
-            // bit-pattern of typical user code addresses (0x7eff..0x7fff).
-            if w >= 0x7000_0000_0000 && w < 0x8000_0000_0000 {
+            // host filtering by exec-range handles the rest.
+            if w >= USER_EXEC_VA_LO && w < USER_EXEC_VA_HI {
                 let _ = write!(&mut line, " s{}={:#x}:{:#x}",
                     emitted_scan, off * 8, w);
                 emitted_scan += 1;
