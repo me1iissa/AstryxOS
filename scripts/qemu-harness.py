@@ -1540,12 +1540,34 @@ def cmd_resume(args):
 # response per op without another round-trip.
 
 def _kdb_build_request(op: str, rest: list[str]) -> dict:
-    """CLI args → request dict.  Each op has its own arg shape."""
+    """CLI args → request dict.  Each op has its own arg shape.
+
+    Argparse claims `--foo` tokens for itself so optional flags here are
+    accepted *positionally* (after `--`) only:
+      proc-tree     [<root_pid>]                       (default 1)
+      fd-table      <pid>
+      syscall-trend [<seconds> [<pid>]]                (defaults: 5 0)
+
+    Examples:
+        qemu-harness.py kdb <sid> proc-tree 0
+        qemu-harness.py kdb <sid> fd-table 6
+        qemu-harness.py kdb <sid> syscall-trend 10 4
+    """
     if op in ("ping", "proc-list", "vfs-mounts", "trace-status"):
         return {"op": op}
     if op == "proc":
         if not rest: raise ValueError("proc requires <pid>")
         return {"op": "proc", "pid": int(rest[0], 0)}
+    if op == "proc-tree":
+        pid = int(rest[0], 0) if rest else 1
+        return {"op": "proc-tree", "pid": pid}
+    if op == "fd-table":
+        if not rest: raise ValueError("fd-table requires <pid>")
+        return {"op": "fd-table", "pid": int(rest[0], 0)}
+    if op == "syscall-trend":
+        seconds = int(rest[0], 0) if len(rest) >= 1 else 5
+        pid     = int(rest[1], 0) if len(rest) >= 2 else 0
+        return {"op": "syscall-trend", "seconds": seconds, "pid": pid}
     if op == "dmesg":
         return {"op": "dmesg", "tail": int(rest[0]) if rest else 100}
     if op == "syms":
@@ -2405,12 +2427,16 @@ def main():
              "(requires --features kdb at start)")
     p_kdb.add_argument("sid")
     p_kdb.add_argument("op", choices=[
-        "ping", "proc-list", "proc", "vfs-mounts",
+        "ping", "proc-list", "proc", "proc-tree", "fd-table",
+        "syscall-trend", "vfs-mounts",
         "dmesg", "syms", "mem", "trace-status",
     ])
     p_kdb.add_argument("args", nargs="*",
                         help="Op-specific positional args: "
-                             "proc <pid>, dmesg [tail], syms <name|0xaddr>, "
+                             "proc <pid>, proc-tree [<root_pid>] (def 1), "
+                             "fd-table <pid>, "
+                             "syscall-trend [<seconds> [<pid>]] (def 5 0), "
+                             "dmesg [tail], syms <name|0xaddr>, "
                              "mem <addr> <len>")
     p_kdb.add_argument("--timeout", type=float, default=5.0,
                         help="Socket timeout in seconds (default 5.0)")
