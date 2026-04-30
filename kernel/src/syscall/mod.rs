@@ -346,6 +346,15 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     SYSCALL_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     crate::perf::record_syscall(num);
 
+    // kdb syscall-trend ring: append (tick, pid, nr) so the kdb
+    // `syscall-trend` op can produce a per-PID histogram of recent activity.
+    // Wait-free; no allocation; produces zero overhead in non-kdb builds.
+    #[cfg(feature = "kdb")]
+    {
+        let pid = crate::proc::current_pid_lockless();
+        crate::perf::record_syscall_event(pid, num);
+    }
+
     let result = if crate::subsys::linux::syscall::is_linux_abi() {
         dispatch_linux(num, arg1, arg2, arg3, arg4, arg5, arg6)
     } else {
