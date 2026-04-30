@@ -1411,7 +1411,7 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
     //
     // (backing, name, base, cr3) is computed atomically under the lock so
     // address-space invariants are preserved at decision time.
-    let (cr3, backing, name, base) = {
+    let mmap_setup = {
         let mut procs = crate::proc::PROCESS_TABLE.lock();
         let proc = match procs.iter_mut().find(|p| p.pid == pid) {
             Some(p) => p,
@@ -1458,6 +1458,25 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
             || fd == u64::MAX
             || fd as i64 == -1;
 
+        // Capture the resolved fd path (for shared-library files only) so we
+        // can emit a `[FFTEST/mmap-so]` trace AFTER dropping the lock.  Letting
+        // the print happen under PROCESS_TABLE could block other CPUs on a
+        // slow serial port.  Tied to firefox-test so it never appears in
+        // normal desktop boots.
+        #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+        let so_trace_path: Option<alloc::string::String> = {
+            let fd_num = fd as usize;
+            proc.file_descriptors
+                .get(fd_num)
+                .and_then(|f| f.as_ref())
+                .and_then(|e| {
+                    let p = &e.open_path;
+                    if p.ends_with(".so") || p.contains(".so.") {
+                        Some(alloc::string::String::from(p.as_str()))
+                    } else { None }
+                })
+        };
+
         let (vma_backing, vma_name) = if is_anon {
             (VmBacking::Anonymous, "[mmap]")
         } else {
@@ -1487,8 +1506,33 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
             }
         };
 
-        (space.cr3, vma_backing, vma_name, chosen_base)
+        #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+        {
+            (space.cr3, vma_backing, vma_name, chosen_base, so_trace_path)
+        }
+        #[cfg(not(any(feature = "firefox-test", feature = "test-mode")))]
+        {
+            (space.cr3, vma_backing, vma_name, chosen_base)
+        }
     };
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    let (cr3, backing, name, base, so_trace_path_out) = mmap_setup;
+    #[cfg(not(any(feature = "firefox-test", feature = "test-mode")))]
+    let (cr3, backing, name, base) = mmap_setup;
+
+    // Emit shared-library mmap trace AFTER the PROCESS_TABLE lock is dropped
+    // so a slow serial path cannot block the process table.  Format:
+    //   [FFTEST/mmap-so] pid=<n> base=<vaddr> len=<bytes> off=<file-off>
+    //                    prot=<prot> fd=<fd> path=<path>
+    // The first executable LOAD segment for a given .so is the load base;
+    // later segments are placed by ld-linux at base+seg_vaddr via MAP_FIXED.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    if let Some(path) = so_trace_path_out {
+        crate::serial_println!(
+            "[FFTEST/mmap-so] pid={} base={:#x} len={:#x} off={:#x} prot={:#x} fd={} path={}",
+            pid, base, length, offset, prot, fd, path
+        );
+    }
 
     // ── MAP_FIXED replacement: split into three phases ──────────────────────
     //
