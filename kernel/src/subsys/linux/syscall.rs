@@ -112,17 +112,73 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     // ── Tier-0 trace: one self-contained line per syscall entry ──────────────
     // Grepped by qemu-harness.py via `^\[SC\] `.  User RIP comes from the
     // per-CPU syscall_entry stash (set by the naked-asm stub before dispatch).
+    // `caller_rip` is `[user_rsp]` at entry — the address that called the libc
+    // syscall wrapper, which resolves to a Mozilla / firefox-bin function.
+    //
+    // a4/a5/a6 are also printed so e.g. epoll_wait's timeout (a4),
+    // futex's timeout pointer (a4) and op-flags decoded later, and
+    // clock_gettime's clock-id (a1, already covered) are all visible
+    // without re-entering the kernel.  Phase 3A.
     #[cfg(feature = "syscall-trace")]
     {
         let user_rip = unsafe { crate::syscall::get_user_rip() };
+        let caller_rip = crate::syscall::get_user_caller_rip();
         crate::serial_println!(
-            "[SC] pid={} tid={} nr={} rip={:#x} a1={:#x} a2={:#x} a3={:#x}",
+            "[SC] pid={} tid={} nr={} rip={:#x} cr={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x} a6={:#x}",
             crate::proc::current_pid(),
             crate::proc::current_tid(),
             num,
             user_rip,
-            arg1, arg2, arg3,
+            caller_rip,
+            arg1, arg2, arg3, arg4, arg5, arg6,
         );
+    }
+
+    // ── Phase 3B: periodic user-stack snapshot on hot syscalls ──────────────
+    // Triggered every Nth `clock_gettime` / `gettimeofday` / `futex` call from
+    // any user pid (>= 12 to skip kernel init / shell processes).  Emits an
+    // `[SC-USTACK]` line with the saved RBP chain (up to 16 frames) so the
+    // host post-processor can resolve every frame to a `libxul.so + offset`
+    // symbol via the `[FFTEST/mmap-so]` load-base table.  All reads go through
+    // `virt_to_phys_in` so a corrupt or unmapped RBP cannot fault the syscall
+    // handler.
+    //
+    // The snapshot is keyed on `(pid, tid, num)` so every distinct caller
+    // gets its own emission cadence — important because Firefox runs many
+    // worker threads alongside the busy-polling main thread.  We bound the
+    // total emissions per (pid,tid,num) tuple at 8 to keep log size sane.
+    //
+    // Sleeping syscalls included (35=nanosleep, 230=clock_nanosleep,
+    // 202=futex, 232=epoll_wait, 271=ppoll, 270=pselect6, 449=futex_waitv)
+    // so we can confirm the Phase 3C "zero sleeping syscalls" observation
+    // empirically rather than from the histogram alone.
+    #[cfg(feature = "firefox-test")]
+    {
+        let pid_now = crate::proc::current_pid();
+        let tid_now = crate::proc::current_tid();
+        let is_hot = matches!(num,
+            96 | 228 |        // gettimeofday, clock_gettime
+            35 | 230 |        // nanosleep, clock_nanosleep
+            202 | 449 |       // futex, futex_waitv
+            232 | 270 | 271   // epoll_wait, pselect6, ppoll
+        );
+        if pid_now >= 12 && is_hot {
+            // 4-element ring per (pid,tid,num) tuple — small enough that the
+            // total log volume stays bounded across all worker threads.
+            static USTACK_N: [core::sync::atomic::AtomicU64; 64] = {
+                const Z: core::sync::atomic::AtomicU64 =
+                    core::sync::atomic::AtomicU64::new(0);
+                [Z; 64]
+            };
+            let slot = ((tid_now as usize).wrapping_mul(31)
+                ^ (num as usize).wrapping_mul(7)) & 63;
+            let n = USTACK_N[slot].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            // Every 500th hit per slot, capped at 8 emissions — gives several
+            // samples per active worker thread without flooding the serial log.
+            if n % 500 == 0 && n / 500 < 8 {
+                emit_user_stack_snapshot(num, n / 500);
+            }
+        }
     }
 
     // ── Per-PID debug trace ───────────────────────────────────────────────────
@@ -5769,3 +5825,104 @@ fn sys_pwritev(fd: u64, iov_ptr: u64, iovcnt: u64, offset: i64) -> i64 {
     total
 }
 
+// ── Phase 3B: user-stack snapshot helper ────────────────────────────────────
+//
+// Walks the saved RBP frame chain in user space starting from the user RBP
+// captured at syscall entry, emits up to 16 RIPs (in addition to the leaf
+// RIP captured by [SC]), and quits at the first invalid frame.
+//
+// All reads use `virt_to_phys_in` against the calling process's CR3 so a
+// corrupt RBP returns 0 instead of faulting.  RBP=0 (or non-canonical user
+// range) terminates the walk cleanly.
+//
+// Frame layout per System V x86_64 ABI (AMD64 ABI §3.4) with frame pointers:
+//   [rbp]    = saved caller RBP
+//   [rbp+8]  = saved return RIP
+//
+// Output format (one line per snapshot):
+//   [SC-USTACK] pid=<n> tid=<n> nr=<num> n=<sample-index> rsp=<...> rbp=<...>
+//               leaf=<rip0> f1=<rip1> f2=<rip2> ... f15=<rip15>
+//
+// The host post-processor pairs each `f<i>=` against the [FFTEST/mmap-so]
+// load-base table to resolve every frame to <library> + offset, then runs
+// `nm` / `addr2line` for symbolisation.  The walk terminates early when
+// frame pointers are omitted (common in JIT code), which is harmless —
+// we still get the leaf, the libc-wrapper caller (`cr=` in [SC]), and as
+// many native frames as the compiler preserved.
+#[cfg(feature = "firefox-test")]
+fn emit_user_stack_snapshot(num: u64, sample_idx: u64) {
+    use core::fmt::Write as _;
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    const MAX_FRAMES: usize = 16;
+
+    let pid = crate::proc::current_pid();
+    let tid = crate::proc::current_tid();
+    let (user_rsp, user_rbp) = crate::syscall::get_user_rsp_rbp();
+    let leaf_rip = unsafe { crate::syscall::get_user_rip() };
+    let cr3 = crate::mm::vmm::get_cr3();
+
+    // Plausible user-VA bounds — anything outside aborts the walk.
+    let user_ok = |va: u64| -> bool {
+        va >= 0x1000 && va < astryx_shared::KERNEL_VIRT_BASE && (va & 0x7) == 0
+    };
+
+    // Read 8 bytes from user space, returning None on bad address.  Uses
+    // `virt_to_phys_in` so an unmapped page just returns None (no fault).
+    let read_u64 = |va: u64| -> Option<u64> {
+        if !user_ok(va) { return None; }
+        let phys = crate::mm::vmm::virt_to_phys_in(cr3, va)?;
+        // SAFETY: phys is a valid frame returned by the page-table walk;
+        // PHYS_OFF + phys is mapped in the kernel's higher-half identity
+        // region for all RAM, so the unaligned 8-byte read cannot fault.
+        Some(unsafe { core::ptr::read_unaligned((PHYS_OFF + phys) as *const u64) })
+    };
+
+    let mut line = alloc::string::String::with_capacity(512);
+    let _ = write!(
+        &mut line,
+        "[SC-USTACK] pid={} tid={} nr={} n={} rsp={:#x} rbp={:#x} leaf={:#x}",
+        pid, tid, num, sample_idx, user_rsp, user_rbp, leaf_rip
+    );
+
+    let mut rbp = user_rbp;
+    let mut frames_emitted = 0usize;
+    for i in 0..MAX_FRAMES {
+        if !user_ok(rbp) { break; }
+        let saved_rbp = match read_u64(rbp)     { Some(v) => v, None => break };
+        let saved_rip = match read_u64(rbp + 8) { Some(v) => v, None => break };
+        let _ = write!(&mut line, " f{}={:#x}", i + 1, saved_rip);
+        frames_emitted += 1;
+        // Ascending stack with RBP_new > RBP_old; if rbp regresses or
+        // doesn't move we treat the chain as corrupted and stop.
+        if saved_rbp <= rbp { break; }
+        rbp = saved_rbp;
+    }
+
+    // Frame-pointer walk often terminates early because libnspr4 / libxul are
+    // built with `-fomit-frame-pointer` for tier-1 perf.  Fall back to a
+    // bounded conservative stack-word scan above RSP, emitting at most 16
+    // additional candidate return-addresses.  The host post-processor filters
+    // by `[FFTEST/mmap-so]` exec range so the noise is bounded.
+    //
+    // Format: ` s<i>=<rsp_offset>:<word>` — host can keep words pointing
+    // into known exec ranges as candidate frames.
+    if frames_emitted < MAX_FRAMES {
+        let mut emitted_scan = 0usize;
+        let scan_words = 256usize; // 2 KiB of stack above RSP
+        for off in 0..scan_words {
+            if emitted_scan >= 16 { break; }
+            let va = user_rsp.wrapping_add((off as u64) * 8);
+            let w = match read_u64(va) { Some(v) => v, None => break };
+            // Only print words that look like a user-space code address —
+            // host filtering by exec-range handles the rest.  Cheap pre-filter:
+            // bit-pattern of typical user code addresses (0x7eff..0x7fff).
+            if w >= 0x7000_0000_0000 && w < 0x8000_0000_0000 {
+                let _ = write!(&mut line, " s{}={:#x}:{:#x}",
+                    emitted_scan, off * 8, w);
+                emitted_scan += 1;
+            }
+        }
+    }
+
+    crate::serial_println!("{}", line);
+}

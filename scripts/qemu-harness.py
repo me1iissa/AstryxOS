@@ -2075,6 +2075,187 @@ def cmd_stack(args):
     _out({"snapshots": snapshots, "snapshot_count": len(snapshots)})
 
 
+# ── ustack: parse periodic [SC-USTACK] snapshots + resolve frames ─────────────
+#
+# When the kernel is built with `firefox-test`, every Nth `clock_gettime` /
+# `gettimeofday` syscall on tid=1 emits one line of the form:
+#
+#   [SC-USTACK] tid=1 nr=<num> n=<idx> rsp=0x... rbp=0x... leaf=0x... f1=... f2=...
+#
+# `ustack` collects every such line plus the `[FFTEST/mmap-so]` library-load
+# table that precedes it, and resolves each frame address to
+# `<library>+<offset>` using simple range arithmetic.  Optional symbol
+# resolution via `nm` / `addr2line` (when present on $PATH and the library
+# binary is reachable on the host) returns `<symbol>+<offset>` for each frame.
+#
+# Output: { "load_bases":[...], "snapshots":[ {nr, n, rsp, rbp, leaf, frames:[
+#   {rip, library, offset, symbol, file_offset} ]} ] }
+
+_USTACK_LINE = re.compile(
+    r"\[SC-USTACK\] pid=(\d+) tid=(\d+) nr=(\d+) n=(\d+) rsp=(0x[0-9a-fA-F]+) "
+    r"rbp=(0x[0-9a-fA-F]+) leaf=(0x[0-9a-fA-F]+)(.*)$"
+)
+_USTACK_FRAME = re.compile(r" f(\d+)=(0x[0-9a-fA-F]+)")
+_USTACK_SCAN  = re.compile(r" s(\d+)=(0x[0-9a-fA-F]+):(0x[0-9a-fA-F]+)")
+_MMAP_SO = re.compile(
+    r"\[FFTEST/mmap-so\] pid=(\d+) base=(0x[0-9a-fA-F]+) "
+    r"len=(0x[0-9a-fA-F]+) off=(0x[0-9a-fA-F]+) prot=(0x[0-9a-fA-F]+) "
+    r"fd=(\d+) path=(\S+)"
+)
+
+
+def _build_load_base_map(lines):
+    """Walk the serial log and collect every library mmap, returning a list of
+    {pid, base, end, off, path} ranges.  Multiple LOADs per .so accumulate;
+    we use the lowest `base` for each path as the load base."""
+    by_path = {}
+    for ln in lines:
+        m = _MMAP_SO.search(ln)
+        if not m: continue
+        pid  = int(m.group(1))
+        base = int(m.group(2), 16)
+        leng = int(m.group(3), 16)
+        off  = int(m.group(4), 16)
+        path = m.group(7)
+        end  = base + leng
+        rec  = by_path.setdefault(path, {
+            "pid": pid, "path": path, "base": base, "end": end, "off": off,
+        })
+        if base < rec["base"]: rec["base"] = base
+        if end  > rec["end"]:  rec["end"]  = end
+    return list(by_path.values())
+
+
+def _resolve_frame_to_lib(rip, libs):
+    """Return (library, offset_from_load_base) or (None, None)."""
+    for L in libs:
+        if L["base"] <= rip < L["end"]:
+            return (L["path"], rip - L["base"])
+    return (None, None)
+
+
+def _try_symbolise(host_path, file_offset):
+    """Best-effort: run `nm -D` on host_path, return nearest `<sym>+<delta>`
+    where the symbol's file-offset (lowest virt addr in the .so) is <= the
+    target offset.  Returns None if `nm` fails or no host file is present."""
+    if not host_path or not Path(host_path).exists(): return None
+    import subprocess
+    try:
+        out = subprocess.check_output(
+            ["nm", "--defined-only", "-D", "--no-demangle", host_path],
+            stderr=subprocess.DEVNULL, timeout=10,
+        ).decode("utf-8", errors="replace")
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+    best_sym, best_addr = None, -1
+    for line in out.splitlines():
+        # Format: "0000000000123abc T some_symbol"
+        parts = line.split(maxsplit=2)
+        if len(parts) < 3: continue
+        try:
+            addr = int(parts[0], 16)
+        except ValueError:
+            continue
+        if addr <= file_offset and addr > best_addr:
+            best_addr, best_sym = addr, parts[2]
+    if best_sym is None: return None
+    return f"{best_sym}+{file_offset - best_addr:#x}"
+
+
+def _resolve_path_on_host(guest_path):
+    """Map a guest path like /opt/firefox/libxul.so to a host path under
+    build/disk/...  Returns the first match that exists on the host."""
+    candidates = [
+        Path("build/disk") / guest_path.lstrip("/"),
+        Path("build") / guest_path.lstrip("/"),
+        Path(guest_path),
+    ]
+    for c in candidates:
+        if c.exists(): return str(c)
+    return None
+
+
+def cmd_ustack(args):
+    """Parse [SC-USTACK] snapshots and resolve frames against [FFTEST/mmap-so]."""
+    sess = _load_session(args.sid)
+    serial_log = sess["serial_log"]
+
+    try:
+        text = Path(serial_log).read_text(errors="replace")
+    except OSError as e:
+        _err(f"could not read serial log: {e}")
+        return
+    lines = text.splitlines()
+
+    libs = _build_load_base_map(lines)
+    libs.sort(key=lambda L: L["base"])
+    do_syms = bool(getattr(args, "symbolise", False))
+
+    snapshots = []
+    for ln in lines:
+        m = _USTACK_LINE.search(ln)
+        if not m: continue
+        pid  = int(m.group(1))
+        tid  = int(m.group(2))
+        nr   = int(m.group(3))
+        n    = int(m.group(4))
+        rsp  = int(m.group(5), 16)
+        rbp  = int(m.group(6), 16)
+        leaf = int(m.group(7), 16)
+        frame_text = m.group(8) or ""
+        frames = [(0, leaf, "leaf")]
+        for fm in _USTACK_FRAME.finditer(frame_text):
+            frames.append((int(fm.group(1)), int(fm.group(2), 16), "rbp"))
+        # Scan candidates: only keep words that resolve to a known mapped
+        # library — drops random user-data words that happen to look like
+        # code addresses but aren't return addresses.
+        for sm in _USTACK_SCAN.finditer(frame_text):
+            soff = int(sm.group(2), 16)
+            sval = int(sm.group(3), 16)
+            lib, off = _resolve_frame_to_lib(sval, libs)
+            if lib is not None:
+                # Index the scan slot using its stack offset (in 8-byte words)
+                # so multiple snapshots are comparable across runs.
+                frames.append((soff // 8, sval, "scan"))
+
+        resolved = []
+        for (idx, rip, kind) in frames:
+            lib, off = _resolve_frame_to_lib(rip, libs)
+            entry = {
+                "i": idx, "kind": kind, "rip": f"{rip:#x}",
+                "library": lib, "offset": (f"{off:#x}" if off is not None else None),
+                "symbol": None,
+            }
+            if do_syms and lib is not None:
+                host = _resolve_path_on_host(lib)
+                sym = _try_symbolise(host, off) if host else None
+                entry["symbol"] = sym
+                entry["host_path"] = host
+            resolved.append(entry)
+
+        snapshots.append({
+            "pid": pid, "tid": tid, "nr": nr, "n": n,
+            "rsp": f"{rsp:#x}", "rbp": f"{rbp:#x}",
+            "frames": resolved,
+        })
+
+    if getattr(args, "pid", None) is not None:
+        snapshots = [s for s in snapshots if s["pid"] == args.pid]
+    if getattr(args, "tid", None) is not None:
+        snapshots = [s for s in snapshots if s["tid"] == args.tid]
+    if getattr(args, "nr", None) is not None:
+        snapshots = [s for s in snapshots if s["nr"] == args.nr]
+
+    _out({
+        "load_bases": [
+            {"path": L["path"], "base": f"{L['base']:#x}", "end": f"{L['end']:#x}"}
+            for L in libs
+        ],
+        "snapshots": snapshots,
+        "snapshot_count": len(snapshots),
+    })
+
+
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 def main():
@@ -2248,6 +2429,24 @@ def main():
     p_stack.add_argument("--pid", type=int, default=None,
                           help="Only return snapshots for this PID")
 
+    # ustack — parse periodic [SC-USTACK] tid=1 snapshots + resolve frames
+    # against the [FFTEST/mmap-so] load-base table.  Use --symbolise to also
+    # run `nm` on the host-side library binary for symbol names.
+    p_ustack = sub.add_parser(
+        "ustack",
+        help="Parse periodic tid=1 user-stack snapshots + resolve frames"
+    )
+    p_ustack.add_argument("sid")
+    p_ustack.add_argument("--symbolise", action="store_true",
+                          help="Also resolve each frame to <symbol>+<delta> "
+                               "via `nm` on the host-side .so file")
+    p_ustack.add_argument("--pid", type=int, default=None,
+                          help="Only return snapshots for this PID")
+    p_ustack.add_argument("--tid", type=int, default=None,
+                          help="Only return snapshots for this TID")
+    p_ustack.add_argument("--nr", type=int, default=None,
+                          help="Only return snapshots for this syscall number")
+
     # _watch: private subcommand used internally by `start` to run the
     # background watcher in a detached process. Not shown in help.
     p_watch = sub.add_parser("_watch")
@@ -2282,6 +2481,7 @@ def main():
         "results": cmd_results,
         "scrings": cmd_scrings,
         "stack":   cmd_stack,
+        "ustack":  cmd_ustack,
         "_watch":  cmd_run_watcher,
     }
     dispatch[args.cmd](args)
