@@ -154,16 +154,13 @@ jobs:
       # is intentionally off in CI: QEMU SLIRP drops external ICMP
       # without CAP_NET_ADMIN, so those four tests would soft-pass
       # uninformatively.  See kernel/Cargo.toml.
-      - name: Build kernel (test-mode + ci-skip-test-104)
+      - name: Build kernel (test-mode)
         run: |
-          # `ci-skip-test-104` skips one test that hangs under GitHub
-          # Actions' slow TCG (sc=332 wakeup race; passes on real hardware).
-          # Tracked separately; the rest of the suite stays observable.
           cargo +nightly build \
             --package astryx-kernel \
             --target kernel/x86_64-astryx.json \
             --profile release \
-            --features test-mode,ci-skip-test-104 \
+            --features test-mode \
             -Zbuild-std=core,alloc \
             -Zbuild-std-features=compiler-builtins-mem \
             -Zjson-target-spec
@@ -269,13 +266,13 @@ jobs:
           restore-keys: |
             kernel-build-${{ runner.os }}-
 
-      - name: Build kernel (test-mode + ci-skip-test-104)
+      - name: Build kernel (test-mode)
         run: |
           cargo +nightly build \
             --package astryx-kernel \
             --target kernel/x86_64-astryx.json \
             --profile release \
-            --features test-mode,ci-skip-test-104 \
+            --features test-mode \
             -Zbuild-std=core,alloc \
             -Zbuild-std-features=compiler-builtins-mem \
             -Zjson-target-spec

@@ -749,17 +749,9 @@ pub fn run() -> ! {
     if test_wm_title_renders_via_gdi() { passed += 1; }
 
     // ── Test 104: execve VmSpace teardown — no PMM leak across exec ────
-    //
-    // Gated behind `ci-skip-test-104` because under GitHub Actions' slow TCG
-    // the test triggers a kernel-side wakeup race that hangs the runner at
-    // sc=332.  The race passes deterministically on real hardware and on
-    // local KVM (36/36 runs) — see the feature comment in kernel/Cargo.toml.
 
-    #[cfg(not(feature = "ci-skip-test-104"))]
-    {
-        total += 1;
-        if test_execve_no_pmm_leak() { passed += 1; }
-    }
+    total += 1;
+    if test_execve_no_pmm_leak() { passed += 1; }
 
     // ── Test 105: Heap guard pages — PTE verification ─────────────────────
     // Non-destructive: verifies that guard PTEs are not-present and that the
