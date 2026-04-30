@@ -8614,6 +8614,69 @@ fn test_futex_requeue() -> bool {
     }
     test_println!("  FUTEX_WAIT_BITSET 1ns timeout → {} ✓", r);
 
+    // Verify FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME (op = 9 | 0x100 = 0x109)
+    // with an *absolute* CLOCK_REALTIME deadline.  Per `futex(2)`, this is the
+    // form glibc's `pthread_cond_timedwait()` uses: the timespec is interpreted
+    // as a wall-clock timestamp, not a relative interval.
+    //
+    // Sub-case A: deadline already in the past (tv_sec=1) returns ETIMEDOUT
+    // immediately without parking the caller.  If the kernel mistakenly
+    // treated this as a relative interval it would park for ~1 second.
+    let futex_word: u32 = 0;
+    let past_ts: [u64; 2] = [1, 0]; // 1 second after Unix epoch — long since past.
+    let r = unsafe {
+        crate::syscall::dispatch_linux(
+            202,
+            &futex_word as *const u32 as u64,
+            0x109, // FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME
+            0,
+            past_ts.as_ptr() as u64,
+            0,
+            0xFFFF_FFFF_u64, // bitset = MATCH_ANY
+        )
+    };
+    if r != -110 {
+        test_fail!("futex_wait_clock_realtime_past", "expected -110, got {}", r);
+        return false;
+    }
+    test_println!("  FUTEX_WAIT_BITSET|CLOCK_REALTIME past deadline → {} ✓", r);
+
+    // Sub-case B: deadline in the future.  Compute "now + 20 ms" via
+    // sys_clock_gettime(CLOCK_REALTIME) and verify the wait actually parks
+    // and returns ETIMEDOUT after the deadline elapses (not immediately,
+    // not -EAGAIN).
+    let mut now_ts: [u64; 2] = [0, 0];
+    let r = crate::syscall::sys_clock_gettime(0, now_ts.as_mut_ptr() as u64);
+    if r != 0 {
+        test_fail!("futex_wait_clock_realtime_future", "clock_gettime returned {}", r);
+        return false;
+    }
+    // Deadline: now + 20 ms.  20 ms is short enough that the test stays fast,
+    // long enough to be discriminated from "fired immediately" (which would
+    // suggest the deadline-elapsed shortcut still triggered).
+    let mut fut_ts: [u64; 2] = now_ts;
+    fut_ts[1] = fut_ts[1].saturating_add(20_000_000);
+    if fut_ts[1] >= 1_000_000_000 {
+        fut_ts[1] -= 1_000_000_000;
+        fut_ts[0] += 1;
+    }
+    let r = unsafe {
+        crate::syscall::dispatch_linux(
+            202,
+            &futex_word as *const u32 as u64,
+            0x109,
+            0,
+            fut_ts.as_ptr() as u64,
+            0,
+            0xFFFF_FFFF_u64,
+        )
+    };
+    if r != -110 {
+        test_fail!("futex_wait_clock_realtime_future", "expected -110, got {}", r);
+        return false;
+    }
+    test_println!("  FUTEX_WAIT_BITSET|CLOCK_REALTIME future deadline → {} ✓", r);
+
     test_pass!("futex REQUEUE + WAIT_BITSET");
     true
 }

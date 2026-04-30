@@ -1458,8 +1458,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             }
             0
         }
-        // 202: futex(uaddr, futex_op, val, ...)
-        202 => sys_futex_linux(arg1, arg2, arg3, arg4, arg5),
+        // 202: futex(uaddr, futex_op, val, timeout, uaddr2, val3)
+        // arg6 carries `val3` (the bitset for FUTEX_WAIT_BITSET / FUTEX_WAKE_BITSET,
+        // and val3 for FUTEX_CMP_REQUEUE).  See futex(2).
+        202 => sys_futex_linux(arg1, arg2, arg3, arg4, arg5, arg6),
         // 217: getdents64(fd, dirp, count)
         217 => sys_getdents64(arg1, arg2, arg3),
         // 218: set_tid_address(tidptr)
@@ -4265,19 +4267,94 @@ fn sys_rt_sigprocmask_linux(how: u64, set: u64, oldset: u64, _sigsetsize: u64) -
 ///   1  FUTEX_WAKE          Wake up to val waiters on uaddr
 ///   4  FUTEX_REQUEUE       Wake val waiters, requeue up-to val2 to uaddr2
 ///   5  FUTEX_CMP_REQUEUE   Like REQUEUE but check *uaddr==val3 first
-///   9  FUTEX_WAIT_BITSET   Like WAIT (bitset ignored)
-///  10  FUTEX_WAKE_BITSET   Like WAKE (bitset ignored)
-pub fn sys_futex_linux(uaddr: u64, futex_op: u64, val: u64, timeout_ptr: u64, uaddr2: u64) -> i64 {
+///   9  FUTEX_WAIT_BITSET   Like WAIT (bitset arg accepted but treated as MATCH_ANY)
+///  10  FUTEX_WAKE_BITSET   Like WAKE (bitset arg accepted but treated as MATCH_ANY)
+///
+/// Op-flags (per `futex(2)`):
+///   0x80   FUTEX_PRIVATE_FLAG     — private to this process; treated as a hint
+///   0x100  FUTEX_CLOCK_REALTIME   — `timeout_ptr` is an *absolute* CLOCK_REALTIME
+///                                   timestamp (seconds + nanoseconds since epoch),
+///                                   not a relative interval.  Required for glibc's
+///                                   `pthread_cond_timedwait()` and any caller that
+///                                   computes a deadline ahead of time.
+///
+/// `_val3` is the bitset for `FUTEX_WAIT_BITSET` / `FUTEX_WAKE_BITSET`, or `val3`
+/// for `FUTEX_CMP_REQUEUE`.  We accept any non-zero bitset (including
+/// `FUTEX_BITSET_MATCH_ANY = 0xFFFF_FFFF`) and currently ignore filtering — every
+/// waker pairs with every waiter on the same uaddr, which matches glibc's actual
+/// usage (cond impls always pass `MATCH_ANY`).
+pub fn sys_futex_linux(
+    uaddr: u64,
+    futex_op: u64,
+    val: u64,
+    timeout_ptr: u64,
+    uaddr2: u64,
+    _val3: u64,
+) -> i64 {
+    const FUTEX_PRIVATE_FLAG:   u64 = 0x80;
+    const FUTEX_CLOCK_REALTIME: u64 = 0x100;
+    let _ = FUTEX_PRIVATE_FLAG; // documented for clarity; no behavioural use
+
     let op = futex_op & 0x7F; // Strip FUTEX_PRIVATE_FLAG and FUTEX_CLOCK_REALTIME
+    let abs_realtime = (futex_op & FUTEX_CLOCK_REALTIME) != 0;
     let pid = crate::proc::current_pid();
 
-    // Helper: read timeout as nanoseconds from struct timespec { tv_sec: i64, tv_nsec: i64 }
-    let timeout_ns: Option<u64> = if timeout_ptr != 0 {
+    // Read the timespec at `timeout_ptr` (NULL means "no timeout") and convert
+    // it to a *relative* nanosecond duration that the rest of the handler can
+    // turn into a tick-based wake deadline.
+    //
+    // Per `futex(2)`, when `FUTEX_CLOCK_REALTIME` is set on the op (specifically
+    // for FUTEX_WAIT_BITSET in mainline kernels, more permissively here), the
+    // timespec is an *absolute* CLOCK_REALTIME timestamp — i.e. a wall-clock
+    // deadline.  glibc's `pthread_cond_timedwait()` uses this exact form: it
+    // computes `abstime = clock_gettime(CLOCK_REALTIME) + user_relative_timeout`
+    // and passes the absolute value through.  If we treat that absolute value
+    // as a relative interval, the kernel parks the caller for ~50,000 years
+    // instead of the requested few milliseconds — observable as ETIMEDOUT
+    // never firing on `pthread_cond_timedwait` (timeouts are silently swallowed,
+    // event loops that depend on timed waits stall).
+    //
+    // Convert absolute → relative by subtracting "now" from the deadline.  If
+    // the deadline has already elapsed, return None to signal "fire immediately"
+    // up the call chain (caller will treat as ETIMEDOUT for FUTEX_WAIT).
+    enum TimeoutNs {
+        Indefinite,           // timeout_ptr was NULL
+        Relative(u64),        // duration in nanoseconds
+        AlreadyExpired,       // absolute deadline in the past
+    }
+    let timeout_ns = if timeout_ptr == 0 {
+        TimeoutNs::Indefinite
+    } else {
+        // Validate the timespec is fully readable before touching either field.
+        if !crate::syscall::validate_user_ptr(timeout_ptr, 16) {
+            return -14; // EFAULT
+        }
         let tv_sec  = unsafe { crate::syscall::user_read_u64(timeout_ptr) }.unwrap_or(0);
         let tv_nsec = unsafe { crate::syscall::user_read_u64(timeout_ptr + 8) }.unwrap_or(0);
-        Some(tv_sec.saturating_mul(1_000_000_000).saturating_add(tv_nsec))
-    } else {
-        None
+        if tv_nsec >= 1_000_000_000 {
+            return -22; // EINVAL — out-of-range nanoseconds, per futex(2).
+        }
+        let raw_ns = tv_sec.saturating_mul(1_000_000_000).saturating_add(tv_nsec);
+
+        if abs_realtime {
+            // Convert absolute CLOCK_REALTIME deadline to a relative duration.
+            // CLOCK_REALTIME advances with wall-clock time: seconds since the
+            // Unix epoch, sub-second from the PIT tick fraction (matching
+            // sys_clock_gettime).
+            let wall_secs  = crate::drivers::rtc::read_unix_time();
+            let wall_ticks = crate::arch::x86_64::irq::get_ticks();
+            let now_ns = wall_secs
+                .saturating_mul(1_000_000_000)
+                .saturating_add((wall_ticks % 100) * 10_000_000);
+            if raw_ns <= now_ns {
+                TimeoutNs::AlreadyExpired
+            } else {
+                TimeoutNs::Relative(raw_ns - now_ns)
+            }
+        } else {
+            // Default WAIT semantics: timespec is a relative interval.
+            TimeoutNs::Relative(raw_ns)
+        }
     };
 
     match op {
@@ -4289,6 +4366,19 @@ pub fn sys_futex_linux(uaddr: u64, futex_op: u64, val: u64, timeout_ptr: u64, ua
             };
             if current as u64 != val {
                 return -11; // EAGAIN — value changed
+            }
+
+            // Per `futex(2)`: an absolute CLOCK_REALTIME deadline that has
+            // already passed must return ETIMEDOUT immediately, without
+            // parking the caller.  Catch this before touching the wait queue
+            // so we never end up with a registered-but-already-expired waiter.
+            if matches!(timeout_ns, TimeoutNs::AlreadyExpired) {
+                #[cfg(feature = "firefox-test")]
+                crate::serial_println!(
+                    "[FUTEX_TIMEDOUT] tid={} pid={} uaddr={:#x} op={:#x} (absolute deadline elapsed)",
+                    crate::proc::current_tid(), pid, uaddr, futex_op
+                );
+                return -110; // ETIMEDOUT
             }
 
             let tid = crate::proc::current_tid();
@@ -4308,12 +4398,17 @@ pub fn sys_futex_linux(uaddr: u64, futex_op: u64, val: u64, timeout_ptr: u64, ua
                 if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
                     t.state = crate::proc::ThreadState::Blocked;
                     // Approximate: 100 Hz tick, so 1 tick = 10 ms = 10_000_000 ns
-                    t.wake_tick = if let Some(ns) = timeout_ns {
-                        let now = crate::arch::x86_64::irq::get_ticks();
-                        let delta_ticks = (ns / 10_000_000).max(1);
-                        now.saturating_add(delta_ticks)
-                    } else {
-                        u64::MAX
+                    t.wake_tick = match timeout_ns {
+                        TimeoutNs::Relative(ns) => {
+                            let now = crate::arch::x86_64::irq::get_ticks();
+                            let delta_ticks = (ns / 10_000_000).max(1);
+                            now.saturating_add(delta_ticks)
+                        }
+                        TimeoutNs::Indefinite => u64::MAX,
+                        TimeoutNs::AlreadyExpired => {
+                            // Handled above — unreachable here, but stay safe.
+                            crate::arch::x86_64::irq::get_ticks()
+                        }
                     };
                 }
             }
@@ -4335,6 +4430,11 @@ pub fn sys_futex_linux(uaddr: u64, futex_op: u64, val: u64, timeout_ptr: u64, ua
             // If we removed ourselves from the waiter list, the scheduler woke us = timeout.
             // If the list entry was already gone, FUTEX_WAKE removed us = success.
             if timed_out {
+                #[cfg(feature = "firefox-test")]
+                crate::serial_println!(
+                    "[FUTEX_TIMEDOUT] tid={} pid={} uaddr={:#x} op={:#x}",
+                    tid, pid, uaddr, futex_op
+                );
                 -110 // ETIMEDOUT
             } else {
                 0
