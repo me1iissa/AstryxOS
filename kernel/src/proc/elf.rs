@@ -166,6 +166,7 @@ pub const AT_BASE: u64    = 7;   // Base address of interpreter
 pub const AT_HWCAP: u64   = 16;  // Hardware capability bitmask (CPU features)
 pub const AT_CLKTCK: u64  = 17;  // Frequency of times() clock (100 Hz)
 pub const AT_RANDOM: u64  = 25;  // Address of 16 random bytes
+pub const AT_SYSINFO_EHDR: u64 = 33; // Base address of the vDSO ELF header (vdso(7))
 // musl reads AT_PHDR/AT_PHNUM to find PT_TLS and validates p_filesz ≤ p_memsz.
 // We don't need a custom AT_ for TLS — musl uses PT_TLS from the phdrs directly.
 
@@ -190,6 +191,10 @@ pub struct ElfLoadResult {
     /// Format: Vec of (AT_type, value) pairs; the AT_NULL terminator is NOT included.
     /// Used by /proc/self/auxv to expose the process auxvec.
     pub auxv: Vec<(u64, u64)>,
+    /// Runtime address of the vDSO ELF header in this process, or 0 if vDSO
+    /// mapping failed.  Mirrors the AT_SYSINFO_EHDR auxv entry; exposed for
+    /// tests and for /proc/self/maps.  See `kernel/src/proc/vdso.rs`.
+    pub vdso_base: u64,
 }
 
 /// Errors from ELF loading.
@@ -921,6 +926,15 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
         extra_auxv.push((AT_BASE, interp_base_for_auxv));
     }
 
+    // ── Map the vDSO + vvar pages into the new process ───────────────
+    // Provides __vdso_clock_gettime / __vdso_gettimeofday / __vdso_time /
+    // __vdso_getcpu — see kernel/src/proc/vdso.rs and vdso(7).  A failed
+    // mapping is non-fatal: the process still works via raw syscalls.
+    let vdso_base = super::vdso::map_vdso(cr3, &mut vmas).unwrap_or(0);
+    if vdso_base != 0 {
+        extra_auxv.push((AT_SYSINFO_EHDR, vdso_base));
+    }
+
     // Sets up the Linux ABI initial stack: argc, argv, envp, auxvec.
     // AT_ENTRY must be the REAL loaded entry (with PIE bias applied).
     let user_stack_ptr = setup_user_stack(
@@ -972,6 +986,7 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
         vmas,
         tls_base: tls_base_for_thread,
         auxv: auxv_snap,
+        vdso_base,
     })
 }
 

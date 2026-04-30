@@ -20,6 +20,7 @@ pub mod orbit_elf;
 pub mod pe;
 pub mod thread;
 pub mod usermode;
+pub mod vdso;
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -598,6 +599,11 @@ pub fn init() {
     // kernel_cr3 ensures the identity map stays active for the bootstrap
     // stack during context switches.  TID 0's kernel_stack_base/size are
     // used for TSS.RSP[0] and per_cpu.kernel_rsp by the scheduler.
+
+    // Initialise the global vDSO + vvar pages.  Must run after PMM and
+    // refcount, before any user process is loaded — see
+    // `kernel/src/proc/vdso.rs` and vdso(7).
+    vdso::init();
 }
 
 use crate::arch::x86_64::apic::cpu_index;
