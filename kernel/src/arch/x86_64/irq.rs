@@ -227,6 +227,11 @@ extern "C" fn timer_tick() {
     let tick = TICK_COUNT.fetch_add(1, Ordering::Relaxed);
     crate::perf::record_interrupt(32); // IRQ0 = vector 32
 
+    // Mirror the new tick value into the user-readable vvar page so the
+    // vDSO clock_gettime / gettimeofday / time fast paths see it without
+    // a syscall.  See kernel/src/proc/vdso.rs for the seqlock layout.
+    crate::proc::vdso::vvar_tick(tick + 1);
+
     // ── Heartbeat: emit every 500 ticks (~5s at 100 Hz) ─────────────
     // Gives the external watchdog (tools/qemu-watchdog.py) a signal that
     // the timer ISR is still firing.  Zero cost in production builds.

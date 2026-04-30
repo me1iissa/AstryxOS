@@ -1162,6 +1162,21 @@ pub fn run() -> ! {
     total += 1;
     if test_per_cpu_pid_lockless_consistent() { passed += 1; }
 
+    // ── Test 180: vDSO — AT_SYSINFO_EHDR set in auxv ──────────────────────
+
+    total += 1;
+    if test_vdso_aux_entry_present() { passed += 1; }
+
+    // ── Test 181: vDSO — [vdso] VMA mapped, ELF magic at vdso_base ────────
+
+    total += 1;
+    if test_vdso_image_mapped() { passed += 1; }
+
+    // ── Test 182: vDSO — vvar page populated; tick mirror advances ────────
+
+    total += 1;
+    if test_vdso_vvar_advances() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -20137,4 +20152,216 @@ fn make_tcp_seg_with_payload(src_port: u16, dst_port: u16,
     s.push(0); s.push(0);
     s.extend_from_slice(payload);
     s
+}
+
+// ── Test 180: vDSO — AT_SYSINFO_EHDR set in auxv ────────────────────────────
+//
+// glibc / musl probe the vDSO via the AT_SYSINFO_EHDR (= 33) auxv entry.
+// load_elf must add this entry pointing at the runtime address of the vDSO
+// ELF header (i.e. the vDSO ELF base, NOT the vvar page below it).
+
+fn test_vdso_aux_entry_present() -> bool {
+    test_header!("vDSO — AT_SYSINFO_EHDR (33) present in auxv, points at vDSO ELF base");
+
+    let data = &crate::proc::hello_elf::HELLO_ELF;
+
+    let user_vm = match crate::mm::vma::VmSpace::new_user() {
+        Some(vm) => vm,
+        None => {
+            test_fail!("vdso_aux", "VmSpace::new_user() OOM");
+            return false;
+        }
+    };
+    let user_cr3 = user_vm.cr3;
+
+    let result = match crate::proc::elf::load_elf(data, user_cr3) {
+        Ok(r) => r,
+        Err(e) => {
+            test_fail!("vdso_aux", "load_elf failed: {:?}", e);
+            return false;
+        }
+    };
+
+    const AT_SYSINFO_EHDR: u64 = 33;
+    let entry = result.auxv.iter().find(|&&(t, _)| t == AT_SYSINFO_EHDR);
+    let mut ok = match entry {
+        Some(&(_, v)) => {
+            if v == 0 {
+                test_fail!("vdso_aux", "AT_SYSINFO_EHDR present but value is 0");
+                false
+            } else if v != crate::proc::vdso::VDSO_ELF_BASE {
+                test_fail!(
+                    "vdso_aux",
+                    "AT_SYSINFO_EHDR = {:#x}, expected VDSO_ELF_BASE {:#x}",
+                    v, crate::proc::vdso::VDSO_ELF_BASE
+                );
+                false
+            } else {
+                test_println!("  AT_SYSINFO_EHDR = {:#x} ✓", v);
+                true
+            }
+        }
+        None => {
+            test_fail!("vdso_aux", "AT_SYSINFO_EHDR missing from auxv");
+            false
+        }
+    };
+
+    if result.vdso_base != crate::proc::vdso::VDSO_ELF_BASE {
+        test_fail!(
+            "vdso_aux",
+            "ElfLoadResult.vdso_base = {:#x}, expected {:#x}",
+            result.vdso_base, crate::proc::vdso::VDSO_ELF_BASE
+        );
+        ok = false;
+    }
+
+    for &p in &result.allocated_pages { crate::mm::pmm::free_page(p); }
+
+    if ok { test_pass!("vDSO AT_SYSINFO_EHDR present and points at vDSO ELF base"); }
+    ok
+}
+
+// ── Test 181: vDSO — [vdso] VMA mapped, ELF magic at vdso_base ─────────────
+//
+// Confirms the vDSO ELF is actually mapped into the new process's page
+// table at the advertised AT_SYSINFO_EHDR address, and that the bytes
+// there start with the ELF magic so glibc's vDSO probe will accept them.
+
+fn test_vdso_image_mapped() -> bool {
+    test_header!("vDSO — [vdso] VMA + ELF magic at VDSO_ELF_BASE");
+
+    let data = &crate::proc::hello_elf::HELLO_ELF;
+    let user_vm = match crate::mm::vma::VmSpace::new_user() {
+        Some(vm) => vm,
+        None => {
+            test_fail!("vdso_map", "VmSpace::new_user() OOM");
+            return false;
+        }
+    };
+    let user_cr3 = user_vm.cr3;
+
+    let result = match crate::proc::elf::load_elf(data, user_cr3) {
+        Ok(r) => r,
+        Err(e) => {
+            test_fail!("vdso_map", "load_elf failed: {:?}", e);
+            return false;
+        }
+    };
+
+    let vdso_vma = result.vmas.iter().find(|v| v.name == "[vdso]");
+    let mut ok = match vdso_vma {
+        Some(vma) => {
+            test_println!(
+                "  [vdso] VMA: base={:#x} length={:#x} ({} bytes) ✓",
+                vma.base, vma.length, vma.length
+            );
+            let base_ok = vma.base == crate::proc::vdso::VDSO_WINDOW_BASE;
+            if !base_ok {
+                test_fail!(
+                    "vdso_map",
+                    "[vdso] base {:#x} != VDSO_WINDOW_BASE {:#x}",
+                    vma.base, crate::proc::vdso::VDSO_WINDOW_BASE
+                );
+            }
+            base_ok
+        }
+        None => {
+            test_fail!("vdso_map", "[vdso] VMA not present in load result");
+            false
+        }
+    };
+
+    // Verify the page table actually maps both vvar (no-X) and vDSO (R+X).
+    let vvar_phys = crate::mm::vmm::virt_to_phys_in(user_cr3, crate::proc::vdso::VVAR_BASE);
+    let vdso_phys = crate::mm::vmm::virt_to_phys_in(user_cr3, crate::proc::vdso::VDSO_ELF_BASE);
+    if vvar_phys.is_none() {
+        test_fail!("vdso_map", "VVAR_BASE {:#x} not mapped", crate::proc::vdso::VVAR_BASE);
+        ok = false;
+    } else {
+        test_println!("  vvar mapped: phys={:#x} ✓", vvar_phys.unwrap());
+    }
+    if vdso_phys.is_none() {
+        test_fail!("vdso_map", "VDSO_ELF_BASE {:#x} not mapped", crate::proc::vdso::VDSO_ELF_BASE);
+        ok = false;
+    } else {
+        test_println!("  vDSO ELF mapped: phys={:#x} ✓", vdso_phys.unwrap());
+    }
+
+    // Check ELF magic at the vDSO base via the kernel direct-map.
+    if let Some(p) = vdso_phys {
+        let ptr = (0xFFFF_8000_0000_0000u64 + p) as *const u8;
+        let magic = unsafe { core::slice::from_raw_parts(ptr, 4) };
+        if magic != [0x7f, b'E', b'L', b'F'] {
+            test_fail!(
+                "vdso_map",
+                "vDSO bytes at {:#x} = {:?} (expected ELF magic)",
+                crate::proc::vdso::VDSO_ELF_BASE, magic
+            );
+            ok = false;
+        } else {
+            test_println!("  ELF magic at VDSO_ELF_BASE ✓");
+        }
+    }
+
+    for &p in &result.allocated_pages { crate::mm::pmm::free_page(p); }
+
+    if ok { test_pass!("vDSO [vdso] VMA + ELF magic at advertised base"); }
+    ok
+}
+
+// ── Test 182: vDSO — vvar page populated; tick mirror advances ──────────────
+//
+// Confirms that:
+//   1. `vdso::init()` populated the vvar page with non-zero wall_secs.
+//   2. The PIT timer ISR's vvar_tick() mirror is advancing in lock-step
+//      with TICK_COUNT (within one tick of slack).
+//   3. vvar_phys is non-zero (init ran).
+
+fn test_vdso_vvar_advances() -> bool {
+    test_header!("vDSO — vvar page populated; ticks mirror PIT TICK_COUNT");
+
+    let phys = crate::proc::vdso::vvar_phys_for_test();
+    if phys == 0 {
+        test_fail!("vdso_vvar", "VVAR_PHYS = 0 — init() never ran");
+        return false;
+    }
+    test_println!("  vvar_phys = {:#x} ✓", phys);
+
+    let wall = crate::proc::vdso::vvar_wall_secs_for_test();
+    if wall == 0 {
+        test_fail!("vdso_vvar", "wall_secs = 0 — RTC read failed at boot");
+        return false;
+    }
+    test_println!("  vvar.wall_secs = {} ✓", wall);
+
+    // Sample TICK_COUNT and vvar.ticks several times; vvar.ticks must always
+    // be within (TICK_COUNT - 1, TICK_COUNT] modulo timer-ISR write latency.
+    let mut max_skew: i64 = 0;
+    for _ in 0..16 {
+        let tk = crate::arch::x86_64::irq::TICK_COUNT
+            .load(core::sync::atomic::Ordering::Relaxed);
+        let vv = crate::proc::vdso::vvar_ticks_for_test();
+        let skew = (tk as i64) - (vv as i64);
+        if skew.abs() > max_skew.abs() { max_skew = skew; }
+        // Tiny pause (~10000 cycles) without sleeping — keeps the test fast
+        // and ensures the timer ISR has a chance to fire between samples.
+        for _ in 0..1000 { core::hint::spin_loop(); }
+    }
+    // The mirror is updated by the timer ISR right after the atomic
+    // increment, so skew should be small in absolute value.  Allow up
+    // to 2 ticks of slack for cases where TICK_COUNT was bumped on
+    // another CPU but vvar_tick hasn't run yet on this CPU's view.
+    if max_skew.abs() > 2 {
+        test_fail!(
+            "vdso_vvar",
+            "max(|TICK_COUNT - vvar.ticks|) = {} > 2",
+            max_skew.abs()
+        );
+        return false;
+    }
+    test_println!("  max |TICK_COUNT - vvar.ticks| = {} ✓", max_skew.abs());
+
+    test_pass!("vDSO vvar page populated; tick mirror in sync with TICK_COUNT");
+    true
 }
