@@ -664,6 +664,27 @@ pub fn snapshot_connections() -> alloc::vec::Vec<ConnSnap> {
     }).collect()
 }
 
+/// Sum of bytes still in `send_buffer` (not yet on the wire) plus bytes
+/// in the retransmit queue (on the wire but not yet ACKed) for the
+/// given connection 4-tuple.  Returns 0 if no matching Established or
+/// CloseWait connection exists.
+///
+/// Used by callers (kdb) that must defer FIN until the peer has actually
+/// received their entire response.  Closing while either count is non-
+/// zero discards the buffered tail because the FIN advances `send_next`
+/// past data that has not yet been transmitted.
+#[cfg(feature = "kdb")]
+pub fn outbound_pending(local_port: u16, remote_ip: Ipv4Address, remote_port: u16) -> usize {
+    TCP_CONNECTIONS.lock().iter()
+        .find(|c| c.local_port == local_port
+                  && c.remote_ip == remote_ip
+                  && c.remote_port == remote_port
+                  && matches!(c.state, TcpState::Established | TcpState::CloseWait))
+        .map(|c| c.send_buffer.len()
+                  + c.retransmit_queue.iter().map(|e| e.data.len()).sum::<usize>())
+        .unwrap_or(0)
+}
+
 pub fn get_state(port: u16) -> Option<TcpState> {
     TCP_CONNECTIONS.lock().iter()
         .find(|c| c.local_port == port)

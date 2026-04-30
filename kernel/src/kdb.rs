@@ -142,7 +142,6 @@ pub fn pump() {
     // connection by its full 4-tuple — closing by `local_port` alone would
     // FIN whichever TCB on KDB_PORT matches first (typically the listener
     // itself), permanently disabling kdb after the very first response.
-    let mut to_close: Vec<([u8; 4], u16, u16)> = Vec::new();
     {
         let mut ss = KDB_SESSIONS.lock();
         for s in ss.iter_mut() {
@@ -154,11 +153,29 @@ pub fn pump() {
                     s.local_port, s.remote_ip, s.remote_port, resp.as_bytes(),
                 );
                 s.responded = true;
-                to_close.push((s.remote_ip, s.remote_port, s.local_port));
             }
         }
     }
 
+    // Close only sessions whose response has fully drained out of the
+    // TCP send_buffer and retransmit queue.  `send_data_to` may have
+    // buffered the tail of a large response when cwnd was small (one
+    // MSS at start-of-connection); calling `close_connection` while
+    // anything is still pending would advance send_next past that
+    // unsent data and the peer would never see it.  We defer the FIN
+    // to a later pump tick once `tcp::tcp_timer_tick` has drained the
+    // buffer naturally.
+    let mut to_close: Vec<([u8; 4], u16, u16)> = Vec::new();
+    {
+        let ss = KDB_SESSIONS.lock();
+        for s in ss.iter() {
+            if !s.responded { continue; }
+            let pending = tcp::outbound_pending(s.local_port, s.remote_ip, s.remote_port);
+            if pending == 0 {
+                to_close.push((s.remote_ip, s.remote_port, s.local_port));
+            }
+        }
+    }
     for (rip, rp, lp) in to_close {
         let _ = tcp::close_connection(lp, rip, rp);
     }
