@@ -875,13 +875,13 @@ pub extern "C" fn ap_rust_entry() -> ! {
             tid: ap_idle_tid,
             pid: 0, // Part of the idle process
             state: ThreadState::Running,
-            context: CpuContext {
+            context: alloc::boxed::Box::new(CpuContext {
                 // Store the kernel CR3 so schedule() switches back to kernel
                 // page tables when this idle thread is selected, rather than
                 // leaving a stale (and potentially freed) user process CR3.
                 cr3: crate::mm::vmm::get_cr3(),
                 ..CpuContext::default()
-            },
+            }),
             // kernel_stack_base = 0: AP idle thread is never reaped (is_reapable() returns
             // false for tid >= 0x1000), and setting a non-zero base would cause
             // set_kernel_rsp(ap_stack_top) when this thread is scheduled, corrupting
