@@ -4206,6 +4206,12 @@ fn sys_newfstatat(dirfd: u64, pathname: u64, statbuf: u64, flags: u64) -> i64 {
 ///
 /// Linux struct kernel_sigaction:
 ///   sa_handler: u64, sa_flags: u64, sa_restorer: u64, sa_mask: [u64; 1]
+///
+/// Lock-ordering note: same recursive-spinlock hazard as `rt_sigprocmask` —
+/// reading `act` or writing `oldact` may demand-page a user page whose fault
+/// handler needs `PROCESS_TABLE`.  We perform the user reads first, then take
+/// the lock to mutate signal state, then write the prior action back AFTER
+/// releasing the lock.
 fn sys_rt_sigaction_linux(sig: u64, act: u64, oldact: u64, _sigsetsize: u64) -> i64 {
     use crate::signal::{SigAction, SIGKILL, SIGSTOP, MAX_SIGNAL};
 
@@ -4220,9 +4226,6 @@ fn sys_rt_sigaction_linux(sig: u64, act: u64, oldact: u64, _sigsetsize: u64) -> 
         return -22;
     }
 
-    // Validate pointer arguments before acquiring any locks to avoid
-    // a page-fault-induced deadlock (page fault handler needs PROCESS_TABLE
-    // which we would already hold).
     if oldact != 0 && (oldact < USER_PTR_MIN || oldact >= USER_PTR_MAX) {
         return -14; // EFAULT
     }
@@ -4230,57 +4233,82 @@ fn sys_rt_sigaction_linux(sig: u64, act: u64, oldact: u64, _sigsetsize: u64) -> 
         return -14; // EFAULT
     }
 
-    let pid = crate::proc::current_pid();
-    let mut procs = crate::proc::PROCESS_TABLE.lock();
-    let proc_entry = match procs.iter_mut().find(|p| p.pid == pid) {
-        Some(p) => p,
-        None => return -3,
-    };
-
-    let sig_state = match proc_entry.signal_state.as_mut() {
-        Some(s) => s,
-        None => return -1,
-    };
-
-    // Save old action if requested
-    if oldact != 0 {
-        let (handler_addr, restorer_addr): (u64, u64) = match sig_state.actions[sig as usize] {
-            SigAction::Default => (0, 0),
-            SigAction::Ignore => (1, 0),
-            SigAction::Handler { addr, restorer } => (addr, restorer),
-        };
-        let out = unsafe { core::slice::from_raw_parts_mut(oldact as *mut u8, 32) };
-        out[0..8].copy_from_slice(&handler_addr.to_le_bytes());
-        out[8..16].copy_from_slice(&0u64.to_le_bytes()); // sa_flags
-        out[16..24].copy_from_slice(&restorer_addr.to_le_bytes());
-        out[24..32].copy_from_slice(&0u64.to_le_bytes()); // sa_mask
-    }
-
-    // Set new action if provided
-    if act != 0 {
+    // Step 1: read the requested new action from user memory FIRST, before any
+    // kernel lock is held.  Demand-paging that user page may take
+    // `PROCESS_TABLE`; doing it under our own held lock would deadlock.
+    let new_action: Option<SigAction> = if act != 0 {
         let inp = unsafe { core::slice::from_raw_parts(act as *const u8, 32) };
         let handler_addr = u64::from_le_bytes(inp[0..8].try_into().unwrap());
         let sa_flags = u64::from_le_bytes(inp[8..16].try_into().unwrap());
         let sa_restorer = u64::from_le_bytes(inp[16..24].try_into().unwrap());
-
         let restorer = if sa_flags & SA_RESTORER != 0 && sa_restorer != 0 {
             sa_restorer
         } else {
             0 // use kernel trampoline
         };
-
-        let action = match handler_addr {
+        Some(match handler_addr {
             0 => SigAction::Default,
             1 => SigAction::Ignore,
             addr => SigAction::Handler { addr, restorer },
+        })
+    } else {
+        None
+    };
+
+    // Step 2: take the lock, swap in the new action, and capture the prior
+    // one for later write-back.  No user-pointer dereferences inside.
+    let pid = crate::proc::current_pid();
+    let prior_handler_addr: u64;
+    let prior_restorer_addr: u64;
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        let proc_entry = match procs.iter_mut().find(|p| p.pid == pid) {
+            Some(p) => p,
+            None => return -3,
         };
-        sig_state.actions[sig as usize] = action;
+        let sig_state = match proc_entry.signal_state.as_mut() {
+            Some(s) => s,
+            None => return -1,
+        };
+        let (h, r) = match sig_state.actions[sig as usize] {
+            SigAction::Default => (0u64, 0u64),
+            SigAction::Ignore => (1u64, 0u64),
+            SigAction::Handler { addr, restorer } => (addr, restorer),
+        };
+        prior_handler_addr = h;
+        prior_restorer_addr = r;
+        if let Some(new) = new_action {
+            sig_state.actions[sig as usize] = new;
+        }
+    }
+
+    // Step 3: write the prior action back to user memory AFTER releasing the
+    // lock so that a demand-page fault on `oldact` can resolve.
+    if oldact != 0 {
+        let out = unsafe { core::slice::from_raw_parts_mut(oldact as *mut u8, 32) };
+        out[0..8].copy_from_slice(&prior_handler_addr.to_le_bytes());
+        out[8..16].copy_from_slice(&0u64.to_le_bytes()); // sa_flags
+        out[16..24].copy_from_slice(&prior_restorer_addr.to_le_bytes());
+        out[24..32].copy_from_slice(&0u64.to_le_bytes()); // sa_mask
     }
 
     0
 }
 
 /// rt_sigprocmask for Linux ABI.
+///
+/// Per `sigprocmask(2)`: if `set` is non-NULL the kernel reads a `sigset_t`
+/// from it; if `oldset` is non-NULL the kernel writes the prior mask there.
+///
+/// Lock-ordering note: a kernel-mode `#PF` triggered by demand-paging the
+/// user `set` / `oldset` pages must be able to acquire `PROCESS_TABLE` to
+/// resolve the fault.  Therefore we MUST NOT hold `PROCESS_TABLE` while
+/// dereferencing user pointers — otherwise the recursive non-reentrant
+/// spinlock attempt deadlocks the CPU.  The fix below splits the work into
+/// (1) a user-memory read into a local buffer, (2) lock + mutate signal
+/// state, (3) a user-memory write of the saved mask.  The race window is
+/// invisible to userspace because `rt_sigprocmask` is documented as
+/// per-thread serialized.
 fn sys_rt_sigprocmask_linux(how: u64, set: u64, oldset: u64, _sigsetsize: u64) -> i64 {
     const USER_PTR_MIN: u64 = 0x1000;
     const USER_PTR_MAX: u64 = 0x0000_8000_0000_0000;
@@ -4291,40 +4319,56 @@ fn sys_rt_sigprocmask_linux(how: u64, set: u64, oldset: u64, _sigsetsize: u64) -
         return -14; // EFAULT
     }
 
-    let pid = crate::proc::current_pid();
-    let mut procs = crate::proc::PROCESS_TABLE.lock();
-    let proc_entry = match procs.iter_mut().find(|p| p.pid == pid) {
-        Some(p) => p,
-        None => return -3,
-    };
-
-    let sig_state = match proc_entry.signal_state.as_mut() {
-        Some(s) => s,
-        None => return -1,
-    };
-
-    // Save old mask
-    if oldset != 0 {
-        let out = unsafe { core::slice::from_raw_parts_mut(oldset as *mut u8, 8) };
-        out[0..8].copy_from_slice(&sig_state.blocked.to_le_bytes());
+    const SIG_BLOCK: u64 = 0;
+    const SIG_UNBLOCK: u64 = 1;
+    const SIG_SETMASK: u64 = 2;
+    if set != 0 && !matches!(how, SIG_BLOCK | SIG_UNBLOCK | SIG_SETMASK) {
+        return -22; // EINVAL
     }
 
-    // Apply new mask
-    if set != 0 {
-        let inp = unsafe { core::slice::from_raw_parts(set as *const u8, 8) };
-        let new_mask = u64::from_le_bytes(inp[0..8].try_into().unwrap());
+    // Step 1: read the requested new mask from user memory FIRST, before any
+    // kernel lock is held.  Demand-paging that user page may take
+    // `PROCESS_TABLE`; doing it under our own held lock would deadlock.
+    let new_mask: Option<u64> = if set != 0 {
+        Some(u64::from_le_bytes(unsafe {
+            core::slice::from_raw_parts(set as *const u8, 8)
+        }.try_into().unwrap()))
+    } else {
+        None
+    };
 
-        const SIG_BLOCK: u64 = 0;
-        const SIG_UNBLOCK: u64 = 1;
-        const SIG_SETMASK: u64 = 2;
-
-        match how {
-            SIG_BLOCK => sig_state.blocked |= new_mask,
-            SIG_UNBLOCK => sig_state.blocked &= !new_mask,
-            SIG_SETMASK => sig_state.blocked = new_mask,
-            _ => return -22,
+    // Step 2: take the lock, fold in the new mask, capture the prior mask
+    // for write-back.  No user-pointer dereferences inside this block.
+    let pid = crate::proc::current_pid();
+    let prior_mask: u64 = {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        let proc_entry = match procs.iter_mut().find(|p| p.pid == pid) {
+            Some(p) => p,
+            None => return -3,
+        };
+        let sig_state = match proc_entry.signal_state.as_mut() {
+            Some(s) => s,
+            None => return -1,
+        };
+        let prior = sig_state.blocked;
+        if let Some(nm) = new_mask {
+            match how {
+                SIG_BLOCK => sig_state.blocked |= nm,
+                SIG_UNBLOCK => sig_state.blocked &= !nm,
+                SIG_SETMASK => sig_state.blocked = nm,
+                _ => unreachable!(), // already validated above
+            }
+            sig_state.blocked &= !((1u64 << crate::signal::SIGKILL)
+                                  | (1u64 << crate::signal::SIGSTOP));
         }
-        sig_state.blocked &= !((1u64 << crate::signal::SIGKILL) | (1u64 << crate::signal::SIGSTOP));
+        prior
+    };
+
+    // Step 3: write the prior mask back to user memory AFTER releasing the
+    // lock, again to keep demand-paging recursion-safe.
+    if oldset != 0 {
+        let out = unsafe { core::slice::from_raw_parts_mut(oldset as *mut u8, 8) };
+        out[0..8].copy_from_slice(&prior_mask.to_le_bytes());
     }
 
     0
