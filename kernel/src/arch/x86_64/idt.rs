@@ -983,6 +983,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 // file-backed path (so the timer can preempt this CPU and
                 // let the lock holder make progress on another CPU), and
                 // no other lock is held here, so the spin is safe.
+                let mut spin_iters: u64 = 0;
                 loop {
                     if let Some(mounts) = crate::vfs::MOUNTS.try_lock() {
                         if mount_idx < mounts.len() {
@@ -999,6 +1000,19 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     // with the CPU's branch-predictor / store-buffer to
                     // reduce contention overhead on x86.
                     core::hint::spin_loop();
+                    spin_iters += 1;
+                    // Diagnostic: a long spin almost certainly means same-CPU
+                    // recursion (the holder cannot make progress because it
+                    // is this thread).  Emit one log line then continue —
+                    // the watchdog will eventually fire if it really is
+                    // wedged, but the line gives us a head-start on triage.
+                    if spin_iters == 1 << 20 {
+                        crate::serial_println!(
+                            "[PF] MOUNTS spin >1M iters faulting_addr={:#x} rip={:#x} \
+                             — likely same-thread recursion (see Phase 8)",
+                            faulting_addr, _frame.rip,
+                        );
+                    }
                 }
                 crate::mm::cache::insert(mount_idx, inode, file_page_offset, phys);
                 crate::mm::refcount::page_ref_inc(phys);
