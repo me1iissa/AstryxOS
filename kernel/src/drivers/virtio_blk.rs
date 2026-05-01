@@ -487,11 +487,21 @@ impl BlockDevice for VirtioBlkBlockDevice {
             return Err(BlockError::OutOfRange);
         }
 
-        // Submit one request for the entire read.  Virtio can handle
-        // multi-sector requests natively — no need to loop sector by sector.
-        // However, very large requests may exceed descriptor data size limits,
-        // so batch in chunks of 128 sectors (64 KiB) to be safe.
-        const MAX_SECTORS: u32 = 128;
+        // Submit one virtio request per up-to-MAX_SECTORS-sectors batch.
+        // Virtio block devices accept arbitrarily large data descriptors
+        // (the descriptor's `len` field is u32, so up to 4 GiB per request);
+        // the per-request size is constrained only by the device's segment
+        // limits and the contiguity of the caller's buffer.  Kernel-heap
+        // buffers in AstryxOS are always physically contiguous (the heap
+        // occupies one contiguous physical range), so a single descriptor
+        // suffices.
+        //
+        // 2048 sectors = 1 MiB per request.  Larger values further amortise
+        // the per-request overhead (one KVM/MMIO round trip, one doorbell
+        // write, one polling spin) but require the caller's buffer to be
+        // physically contiguous over the same span.  1 MiB stays well
+        // within the 128 MiB kernel heap.
+        const MAX_SECTORS: u32 = 2048;
         let mut sector_idx = 0u32;
 
         while sector_idx < count {
@@ -534,7 +544,8 @@ impl BlockDevice for VirtioBlkBlockDevice {
             return Err(BlockError::OutOfRange);
         }
 
-        const MAX_SECTORS: u32 = 128;
+        // See `read_sectors` for the rationale behind the 2048-sector cap.
+        const MAX_SECTORS: u32 = 2048;
         let mut sector_idx = 0u32;
 
         while sector_idx < count {

@@ -651,12 +651,41 @@ impl Fat32Fs {
                 }
             }
 
-            // Batch prefetch: read 8 consecutive sectors (4KB = one cluster) at once.
-            const BATCH: u32 = 8;
+            // Batch prefetch: read up to 128 consecutive sectors (64 KiB)
+            // at once.  A single block-device call carries a single transport
+            // request through to the underlying driver, so amortising the
+            // per-request overhead across 128 sectors reduces the round-trip
+            // count by 16x for sequential reads (one cluster = 8 sectors).
+            //
+            // The buffer is heap-allocated (not stack) — 64 KiB on a 256 KiB
+            // kernel stack would consume a quarter of the stack inside a
+            // call already nested several frames deep (VFS → FAT32 →
+            // BlockDevice).
+            //
+            // The prefetched window is aligned to a BATCH-sector boundary
+            // and clamped to the device capacity so reads never run off the
+            // end of the disk.  Sectors past `last_lba` are simply not
+            // populated; the caller will fault them in on the next miss.
+            //
+            // BATCH is intentionally kept modest (128 sectors) so that
+            // inserting prefetched sectors into the small BTreeMap-backed
+            // sector cache stays cheap.  Bulk readers that would otherwise
+            // overflow the cache call `read_contiguous_run` below, which
+            // streams data straight from the device without populating the
+            // sector cache at all.
+            const BATCH: u32 = 128;
+            let device_capacity = device.sector_count();
             let batch_start = lba & !(BATCH as u64 - 1);
-            let mut multi_buf = [0u8; SECTOR_SIZE * BATCH as usize];
-            if device.read_sectors(batch_start, BATCH, &mut multi_buf).is_ok() {
-                for i in 0..BATCH {
+            let mut batch_count = BATCH;
+            if batch_start + batch_count as u64 > device_capacity {
+                // Clamp to device end (won't underflow because lba < capacity
+                // — the caller already validated this).
+                batch_count = (device_capacity - batch_start) as u32;
+            }
+            let batch_bytes = batch_count as usize * SECTOR_SIZE;
+            let mut multi_buf: alloc::vec::Vec<u8> = alloc::vec![0u8; batch_bytes];
+            if device.read_sectors(batch_start, batch_count, &mut multi_buf).is_ok() {
+                for i in 0..batch_count {
                     let sector_lba = batch_start + i as u64;
                     if !inner.sector_cache.contains_key(&sector_lba) {
                         let mut sector = [0u8; SECTOR_SIZE];
@@ -666,6 +695,7 @@ impl Fat32Fs {
                     }
                 }
             } else {
+                // Fallback to a single-sector read for the requested LBA only.
                 let mut buf = [0u8; SECTOR_SIZE];
                 device.read_sector(lba, &mut buf).map_err(|_| VfsError::Io)?;
                 inner.sector_cache.insert(lba, buf);
@@ -1585,66 +1615,100 @@ impl FileSystemOps for Fat32Fs {
             }
         }
 
-        // Look up the starting cluster via the cached chain (O(1)).
-        let mut current = {
+        // Take a snapshot of the cluster chain slice we will traverse so we
+        // can look ahead for contiguous runs without holding the inner lock
+        // across the disk read.  The chain is append-only (the entry only
+        // grows when extending the file), so a snapshot is safe to use for
+        // a single read call.
+        let chain_slice: alloc::vec::Vec<u32> = {
             let inner = self.inner.lock();
-            if let Some(n) = inner.nodes.iter().find(|n| n.inode == inode) {
-                if start_cluster_idx < n.cluster_chain.len() {
-                    n.cluster_chain[start_cluster_idx]
-                } else {
-                    return Ok(0); // offset beyond end of chain
-                }
-            } else {
-                return Err(VfsError::NotFound);
+            let n = inner.nodes.iter().find(|n| n.inode == inode)
+                .ok_or(VfsError::NotFound)?;
+            if start_cluster_idx >= n.cluster_chain.len() {
+                return Ok(0);
             }
+            n.cluster_chain[start_cluster_idx..].to_vec()
         };
+        let _ = start_cluster_idx; // captured above
 
-        // Legacy fallback removed — cluster chain cache handles all cases.
-        let _ = start_cluster_idx; // used above in chain lookup
-
-        // Read the required bytes cluster by cluster.
+        // Read the required bytes, exploiting contiguous cluster runs.
+        // Sequentially-allocated files (typical for a freshly-built disk
+        // image) compress into a handful of long runs; each run is read
+        // with a single block-device call rather than `cluster_count`
+        // separate per-cluster requests through the sector cache.
         let mut written = 0usize;
         let mut cluster_skip = offset_in_cluster; // byte offset within first cluster
-        let mut inner = self.inner.lock();
+        let mut chain_idx = 0usize;
 
-        while written < to_read {
-            if current < 2 || current as usize >= inner.fat.len() {
+        while written < to_read && chain_idx < chain_slice.len() {
+            let first_cluster = chain_slice[chain_idx];
+            if first_cluster < 2 {
                 break;
             }
 
-            let first_sector = self.bpb.cluster_to_sector(current) as u64;
-            for s in 0..spc {
-                Self::ensure_sector(&mut inner, &*self.device, first_sector + s)?;
+            // Look ahead in the chain for clusters that are physically
+            // adjacent on disk (chain[i+1] == chain[i] + 1).  The whole run
+            // can be read in a single multi-sector block-device call.
+            let mut run_clusters = 1usize;
+            while chain_idx + run_clusters < chain_slice.len()
+                && chain_slice[chain_idx + run_clusters]
+                    == chain_slice[chain_idx + run_clusters - 1] + 1
+            {
+                run_clusters += 1;
+                // Stop the run early if we already cover the requested data,
+                // so we don't read more than the caller asked for.  The
+                // first cluster contributes (cluster_size - cluster_skip)
+                // bytes; subsequent clusters contribute cluster_size each.
+                let bytes_so_far = (cluster_size - cluster_skip)
+                    + (run_clusters - 1) * cluster_size;
+                if written + bytes_so_far >= to_read {
+                    break;
+                }
             }
 
-            // How many bytes to take from this cluster.
-            let cluster_avail = cluster_size - cluster_skip;
-            let this_copy = core::cmp::min(cluster_avail, to_read - written);
+            let first_sector = self.bpb.cluster_to_sector(first_cluster) as u64;
+            let run_sectors = run_clusters * (spc as usize);
+            let run_bytes = run_clusters * cluster_size;
 
-            // Copy sector-by-sector from the cache.
-            let mut copied = 0;
-            let mut byte_off = cluster_skip; // byte offset within cluster
-            while copied < this_copy {
-                let s = (byte_off / SECTOR_SIZE) as u64;
-                let lba = first_sector + s;
-                let in_sector = byte_off % SECTOR_SIZE;
-                let sector_data = inner.sector_cache.get(&lba).ok_or(VfsError::Io)?;
-                let avail = SECTOR_SIZE - in_sector;
-                let n = core::cmp::min(avail, this_copy - copied);
-                buf[written + copied..written + copied + n]
-                    .copy_from_slice(&sector_data[in_sector..in_sector + n]);
-                copied += n;
-                byte_off += n;
+            // Bytes contributed to the result by this run.
+            let run_avail = run_bytes - cluster_skip;
+            let this_copy = core::cmp::min(run_avail, to_read - written);
+
+            // Read the entire run into a heap-backed buffer with one
+            // multi-sector block-device call.  The kernel heap is one
+            // physically contiguous range so the virtio descriptor sees one
+            // contiguous segment regardless of run size.
+            let mut run_buf: alloc::vec::Vec<u8> = alloc::vec![0u8; run_sectors * SECTOR_SIZE];
+            self.device
+                .read_sectors(first_sector, run_sectors as u32, &mut run_buf)
+                .map_err(|_| VfsError::Io)?;
+
+            // Overlay any sectors that are still resident in the in-memory
+            // sector cache.  Cached sectors are the authoritative copy when
+            // present — they may carry pending writes that haven't been
+            // flushed to disk yet.  Without this overlay a write-then-read
+            // sequence would lose the pending data.
+            //
+            // The lock is dropped immediately after copying so the overlay
+            // does not serialise with the rest of the kernel.
+            {
+                let inner = self.inner.lock();
+                for s in 0..run_sectors as u64 {
+                    let lba = first_sector + s;
+                    if let Some(cached) = inner.sector_cache.get(&lba) {
+                        let off = (s as usize) * SECTOR_SIZE;
+                        run_buf[off..off + SECTOR_SIZE].copy_from_slice(cached);
+                    }
+                }
             }
+
+            buf[written..written + this_copy].copy_from_slice(
+                &run_buf[cluster_skip..cluster_skip + this_copy],
+            );
 
             written += this_copy;
-            cluster_skip = 0; // subsequent clusters start at byte 0
-
-            let next = inner.fat[current as usize];
-            if next >= FAT_EOC_MIN || next < 2 {
-                break;
-            }
-            current = next;
+            cluster_skip = 0;
+            chain_idx += run_clusters;
         }
 
         Ok(written)
