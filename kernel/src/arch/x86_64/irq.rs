@@ -309,6 +309,21 @@ extern "C" fn timer_tick() {
 
 irq_stub!(irq_mouse_handler, mouse_interrupt);
 irq_stub!(irq_e1000_handler, e1000_interrupt);
+irq_stub!(irq_virtio_blk_handler, virtio_blk_interrupt);
+
+/// Virtio-blk PCI INTx interrupt logic.
+///
+/// Per virtio 1.0 §4.1.4.5 we ack the device by reading its ISR status
+/// register (read-to-clear), walk the used ring for completions, and
+/// wake the blocked submitter.  All of that is in the driver — this stub
+/// only routes to it.
+extern "C" fn virtio_blk_interrupt() {
+    crate::perf::record_interrupt(crate::drivers::virtio_blk::VIRTIO_BLK_IRQ_VECTOR);
+    crate::drivers::virtio_blk::handle_irq();
+    // EOI is sent by handle_irq itself (LAPIC) — keep this stub narrow so
+    // the ack-then-EOI ordering matches the rest of the device's spec
+    // contract (read ISR before EOI for level-triggered PCI INTx).
+}
 
 /// E1000 NIC interrupt logic.
 /// We run with IMS=0 (polling), so this should rarely fire.

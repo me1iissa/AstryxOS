@@ -320,6 +320,12 @@ pub fn cpu_count() -> u32 {
     CPU_COUNT.load(Ordering::Relaxed)
 }
 
+/// Get the bootstrap-processor's APIC ID.  Used by drivers to target the
+/// BSP for legacy PCI INTx routing through the IO-APIC.
+pub fn bsp_apic_id() -> u8 {
+    BSP_APIC_ID.load(Ordering::Relaxed)
+}
+
 /// Get the current CPU's logical index.
 ///
 /// Reads `IA32_TSC_AUX` (MSR 0xC0000103), which is initialised to the CPU's

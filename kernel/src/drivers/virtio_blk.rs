@@ -9,15 +9,30 @@
 //!
 //! Uses a single request virtqueue (queue 0).  Each I/O request is a
 //! 3-descriptor chain: header (type + sector) -> data buffer -> status byte.
-//! The driver polls the used ring for completion (no interrupt handler needed).
+//!
+//! # Completion Model
+//!
+//! Two paths coexist:
+//!
+//! * **Poll fallback** — used during early boot before the IO-APIC and the
+//!   scheduler are ready (mount of root FS happens in this window).  The
+//!   submitter spins on the used-ring index after writing the doorbell.
+//!
+//! * **IRQ-driven** — armed once the APIC is up via [`arm_irq`].  The
+//!   submitter publishes its TID + a per-request "done" flag, marks itself
+//!   `Blocked`, and yields via `schedule()`.  The virtio-blk ISR walks the
+//!   used ring, sets the per-request flag, and flips the waker thread back
+//!   to `Ready`.
 //!
 //! # References
 //! - Virtio 1.0 spec, Section 5.2 (Block Device)
+//! - Virtio 1.0 spec, Section 2.4 (Virtqueue Interrupt Suppression)
+//! - Virtio 1.0 spec, Section 4.1.4 (PCI legacy device init)
 //! - Legacy interface: <https://docs.oasis-open.org/virtio/virtio/v1.0/cs04/virtio-v1.0-cs04.html>
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use spin::Mutex;
 
 use super::block::{BlockDevice, BlockError, SECTOR_SIZE};
@@ -42,7 +57,10 @@ const VIRTIO_REG_QUEUE_SIZE:      u16 = 0x0C; // u16 RO
 const VIRTIO_REG_QUEUE_SELECT:    u16 = 0x0E; // u16 RW
 const VIRTIO_REG_QUEUE_NOTIFY:    u16 = 0x10; // u16 WO
 const VIRTIO_REG_DEVICE_STATUS:   u16 = 0x12; // u8  RW
-const _VIRTIO_REG_ISR_STATUS:     u16 = 0x13; // u8  RO
+/// ISR status (read-to-clear).  Bit 0 = used-ring update; bit 1 = config change.
+/// Per virtio 1.0 §4.1.4.5, reading this register clears all bits and
+/// de-asserts the legacy INTx line.
+const VIRTIO_REG_ISR_STATUS:      u16 = 0x13; // u8  RO (read-to-clear)
 // Device-specific config starts at +0x14 for legacy.
 const VIRTIO_REG_BLK_CAPACITY_LO: u16 = 0x14; // u32 RO (low 32 bits)
 const VIRTIO_REG_BLK_CAPACITY_HI: u16 = 0x18; // u32 RO (high 32 bits)
@@ -124,14 +142,81 @@ struct VirtioBlkDevice {
     queue_size: u16,
     /// Physical base of the virtqueue memory.
     vq_phys: u64,
-    /// Last seen used ring index (for polling).
+    /// Last seen used ring index.  Kept in step with the device's view so we
+    /// can detect newly-completed requests in both the poll and IRQ paths.
     last_used_idx: u16,
+    /// PCI bus/device/function (cached for IRQ ack diagnostics + `restart_device`).
+    pci_bus: u8,
+    pci_dev: u8,
+    pci_func: u8,
+    /// PCI legacy interrupt line as programmed by firmware (read from PCI
+    /// config offset 0x3C).  Used as the IO-APIC GSI for level-triggered
+    /// PCI INTx routing.
+    pci_irq_line: u8,
 }
 
 /// Global virtio-blk device (if found).
 static VIRTIO_BLK: Mutex<Option<VirtioBlkDevice>> = Mutex::new(None);
 /// Fast check without acquiring the mutex on every block I/O call.
 static VIRTIO_BLK_AVAILABLE: AtomicBool = AtomicBool::new(false);
+
+// ── IRQ-Driven Completion State ─────────────────────────────────────────────
+//
+// The driver serialises requests with `VIRTIO_BLK.lock()`, so at most one
+// request is ever in flight.  The submitter publishes its TID and the
+// per-request "done" flag here, then blocks; the ISR reads them, sets
+// `done = true`, and wakes the waiter.  Both fields are atomic so the ISR
+// can read them without touching the device mutex (which the submitter
+// still holds throughout its critical section).
+//
+// `IRQS_ARMED` gates the entire path: until `arm_irq()` has registered the
+// IO-APIC route the driver falls back to spin-polling.  This keeps the
+// early-boot mount sequence (which runs before APIC init) working.
+
+/// Set to `true` by [`arm_irq`] once the IO-APIC route is live; the submit
+/// path then prefers blocking over polling.
+static IRQS_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// TID of the thread blocked on the in-flight request, or 0 if none.
+/// Written by the submit path before [`schedule`] and read by the ISR.
+static WAITER_TID: AtomicU64 = AtomicU64::new(0);
+
+/// Per-request completion flag.  The submitter clears this before submitting
+/// and re-checks after wake; the ISR sets it after walking the used ring.
+static REQUEST_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Last-seen virtio-blk request status byte (0 = OK, non-zero = device error).
+/// The ISR copies the per-request status here before signalling `REQUEST_DONE`.
+static REQUEST_STATUS: AtomicU8 = AtomicU8::new(0);
+
+/// Spurious-IRQ counter (ISR fired but no used-ring progress).  Useful for
+/// detecting shared-IRQ wiring mistakes; surfaced via [`spurious_count`].
+static SPURIOUS_IRQS: AtomicU64 = AtomicU64::new(0);
+
+// ── Lock-Free Snapshot for the ISR ──────────────────────────────────────────
+//
+// The submit path holds `VIRTIO_BLK.lock()` for the full lifetime of a request
+// (descriptor build → doorbell → wait → completion).  The ISR therefore must
+// NOT touch that mutex — `try_lock` would always fail while a thread is
+// blocked mid-request, and the IRQ-driven wake would never fire.
+//
+// These atomics hold the post-init values that never change for the lifetime
+// of the device (or change only inside `restart_device`, which runs with
+// IRQs effectively quiet).  Populated by [`publish_irq_snapshot`].
+static IRQ_VQ_VIRT: AtomicU64 = AtomicU64::new(0);
+static IRQ_QUEUE_SIZE: AtomicU16 = AtomicU16::new(0);
+static IRQ_IO_BASE: AtomicU16 = AtomicU16::new(0);
+
+/// Last-used-ring index observed by the ISR.  The submit path reads it via
+/// [`Ordering::Acquire`] after waking to confirm a completion happened, and
+/// the ISR uses it to detect newly-completed requests across IRQ events.
+/// At init time this is 0, matching the device's reset state.
+static IRQ_LAST_USED_IDX: AtomicU16 = AtomicU16::new(0);
+
+/// IRQ vector assigned to virtio-blk in the IDT.  Vectors 32-44 are taken by
+/// the timer (32), keyboard (33), e1000 (43) and mouse (44) — pick the next
+/// free slot.
+pub const VIRTIO_BLK_IRQ_VECTOR: u8 = 45;
 
 // ── Initialization ──────────────────────────────────────────────────────────
 
@@ -243,11 +328,187 @@ pub fn init() -> bool {
             queue_size,
             vq_phys,
             last_used_idx: 0,
+            pci_bus: pci_dev.bus,
+            pci_dev: pci_dev.device,
+            pci_func: pci_dev.function,
+            pci_irq_line: pci_dev.interrupt_line,
         });
+        publish_irq_snapshot(io_base, queue_size, vq_phys);
         VIRTIO_BLK_AVAILABLE.store(true, Ordering::Release);
     }
 
     true
+}
+
+/// Publish the device's invariant fields into the ISR-visible snapshot.
+/// Called from [`init`] and [`restart_device`].  Resets `IRQ_LAST_USED_IDX`
+/// to 0 because the device's used.idx is also 0 after a reset.
+fn publish_irq_snapshot(io_base: u16, queue_size: u16, vq_phys: u64) {
+    IRQ_VQ_VIRT.store(PHYS_OFFSET + vq_phys, Ordering::Release);
+    IRQ_QUEUE_SIZE.store(queue_size, Ordering::Release);
+    IRQ_IO_BASE.store(io_base, Ordering::Release);
+    IRQ_LAST_USED_IDX.store(0, Ordering::Release);
+}
+
+// ── IRQ Wiring ──────────────────────────────────────────────────────────────
+
+/// Route the virtio-blk legacy INTx line through the IO-APIC and flip
+/// [`IRQS_ARMED`] so subsequent submissions block instead of spinning.
+///
+/// MUST be called after `apic::init()` (the IO-APIC must be live) and after
+/// `sched::init()` (the blocking path needs the scheduler).  Safe to call
+/// even if no virtio-blk device was discovered — it becomes a no-op.
+///
+/// Per virtio 1.0 §4.1.4.5 a driver enables interrupts simply by leaving
+/// the device's interrupt line unmasked at the IO-APIC; nothing in the
+/// virtio-blk register file needs to change.  The device already raises
+/// the line whenever it advances `used.idx`, regardless of whether anyone
+/// is listening.  We acknowledge each IRQ by reading `ISR_STATUS`
+/// (read-to-clear, §4.1.4.5).
+pub fn arm_irq() {
+    if !VIRTIO_BLK_AVAILABLE.load(Ordering::Acquire) {
+        return;
+    }
+    let (irq_line, b, d, f) = {
+        let guard = VIRTIO_BLK.lock();
+        match guard.as_ref() {
+            Some(dev) => (dev.pci_irq_line, dev.pci_bus, dev.pci_dev, dev.pci_func),
+            None => return,
+        }
+    };
+    if irq_line == 0 || irq_line == 0xFF {
+        crate::serial_println!(
+            "[VIRTIO-BLK] No PCI interrupt line programmed (line={:#x}); staying on poll path",
+            irq_line
+        );
+        return;
+    }
+
+    // Route the GSI through the IO-APIC.  PCI INTx is level-triggered,
+    // active-low — use the level helper.
+    let bsp_id = crate::arch::x86_64::apic::bsp_apic_id();
+    crate::arch::x86_64::apic::ioapic_route_irq_level(irq_line, VIRTIO_BLK_IRQ_VECTOR, bsp_id);
+
+    // Drain any stale ISR bit so the first real completion isn't masked
+    // behind a left-over assertion from QEMU's device init.
+    // SAFETY: Reading the device's ISR status is read-to-clear; no side
+    // effects beyond clearing the latched bits and de-asserting INTx.
+    let io_base_snap = IRQ_IO_BASE.load(Ordering::Acquire);
+    if io_base_snap != 0 {
+        unsafe {
+            let _ = crate::hal::inb(io_base_snap + VIRTIO_REG_ISR_STATUS);
+        }
+    }
+
+    IRQS_ARMED.store(true, Ordering::Release);
+    crate::serial_println!(
+        "[VIRTIO-BLK] IRQ armed: PCI {:02x}:{:02x}.{} line={} -> vector {} (BSP APIC {})",
+        b, d, f, irq_line, VIRTIO_BLK_IRQ_VECTOR, bsp_id
+    );
+}
+
+/// Number of IRQs we received that did not advance the used ring.
+/// Exposed for diagnostics; spurious counts > a handful at boot indicate
+/// a routing or shared-IRQ misconfiguration.
+pub fn spurious_count() -> u64 {
+    SPURIOUS_IRQS.load(Ordering::Relaxed)
+}
+
+// ── ISR ─────────────────────────────────────────────────────────────────────
+
+/// Virtio-blk interrupt handler.  Called from the IDT stub with interrupts
+/// disabled.  Acknowledges the device, walks the used ring, and (if a
+/// completion is observed) wakes the blocked submitter.
+///
+/// The handler must:
+///   1. Read `ISR_STATUS` to clear the device's INTx assertion (virtio 1.0
+///      §4.1.4.5 — read-to-clear).
+///   2. Compare `used.idx` against `IRQ_LAST_USED_IDX` to detect completions.
+///   3. Copy the per-request status byte while still in the ISR.
+///   4. Signal `REQUEST_DONE` and try to flip the waker thread to `Ready`.
+///   5. Send LAPIC EOI.
+///
+/// Lock discipline: the ISR NEVER takes [`VIRTIO_BLK`] (the submit path
+/// holds it for the full request lifetime, so a `try_lock` here is
+/// guaranteed to fail) and uses `try_lock` only for [`THREAD_TABLE`].
+/// All device state needed by the ISR is read from the lock-free atomics
+/// populated by [`publish_irq_snapshot`].  If `THREAD_TABLE` is contended,
+/// the wake is deferred — the submitter's `wake_tick = now + 1` safety
+/// floor lets the next timer ISR's [`crate::sched::wake_sleeping_threads`]
+/// pick up the missed wake.
+pub(crate) fn handle_irq() {
+    let io_base = IRQ_IO_BASE.load(Ordering::Acquire);
+    let qs = IRQ_QUEUE_SIZE.load(Ordering::Acquire);
+    let vq_virt = IRQ_VQ_VIRT.load(Ordering::Acquire);
+
+    // 1. Acknowledge device — read ISR status (read-to-clear).  Required
+    //    even on spurious entries to keep the level-triggered PCI line from
+    //    re-asserting immediately after EOI.
+    let isr_bits = if io_base != 0 {
+        // SAFETY: ISR status is a read-to-clear u8 register at +0x13.
+        unsafe { crate::hal::inb(io_base + VIRTIO_REG_ISR_STATUS) }
+    } else { 0 };
+
+    // 2. Walk used ring lock-free.  If the snapshot is empty (driver
+    //    not yet up) skip — only the EOI matters.
+    let mut completed = false;
+    let mut status_byte: u8 = 0xFF;
+    if qs != 0 && vq_virt != 0 {
+        // SAFETY: Reading `used.idx` from our owned virtqueue memory.
+        // `vq_virt` is the kernel higher-half mapping of the virtqueue
+        // PFN we passed to QUEUE_ADDRESS; valid until `restart_device`
+        // republishes it (in which case IRQS_ARMED gating prevents new
+        // requests from racing with the republish).
+        let cur_used = unsafe {
+            let used_idx_ptr = (vq_virt as *const u8).add(used_ring_offset(qs) + 2) as *const u16;
+            used_idx_ptr.read_volatile()
+        };
+        let last_seen = IRQ_LAST_USED_IDX.load(Ordering::Acquire);
+        if cur_used != last_seen {
+            // The submit path always uses descriptor 0 as the head and
+            // places the status byte at a fixed offset (see `submit_request`).
+            let used_ring_end = used_ring_offset(qs) + 4 + (qs as usize) * 8;
+            let header_offset = (used_ring_end + 15) & !15;
+            let status_offset = header_offset + 16;
+            // SAFETY: Status byte was written by the device into our
+            // virtqueue-local scratch slot before it advanced used.idx.
+            status_byte = unsafe {
+                let p = (vq_virt as *const u8).add(status_offset);
+                p.read_volatile()
+            };
+            IRQ_LAST_USED_IDX.store(cur_used, Ordering::Release);
+            completed = true;
+        }
+    }
+
+    if completed {
+        REQUEST_STATUS.store(status_byte, Ordering::Relaxed);
+        REQUEST_DONE.store(true, Ordering::Release);
+
+        // 3. Try to wake the waiter directly.  If THREAD_TABLE is contended
+        //    the submitter's wake_tick=now+1 floor will catch it on the
+        //    next timer tick.
+        let waker = WAITER_TID.load(Ordering::Acquire);
+        if waker != 0 {
+            if let Some(mut threads) = crate::proc::THREAD_TABLE.try_lock() {
+                if let Some(t) = threads.iter_mut().find(|t| t.tid == waker) {
+                    if t.state == crate::proc::ThreadState::Blocked {
+                        t.state = crate::proc::ThreadState::Ready;
+                        t.wake_tick = 0;
+                    }
+                }
+            }
+        }
+    } else if isr_bits & 1 != 0 {
+        // Device asserted "used ring update" but we couldn't see one —
+        // probably already serviced by a previous IRQ.  Count for diagnostics.
+        SPURIOUS_IRQS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // 4. EOI.
+    if crate::arch::x86_64::apic::is_enabled() {
+        crate::arch::x86_64::apic::lapic_eoi();
+    }
 }
 
 // ── PCI Discovery ───────────────────────────────────────────────────────────
@@ -276,21 +537,24 @@ fn find_virtio_blk_pci() -> Option<super::pci::PciDevice> {
 
 // ── I/O Operations ──────────────────────────────────────────────────────────
 
-/// Submit a virtio-blk request and poll for completion.
+/// Submit a virtio-blk request.
 ///
 /// `req_type` is VIRTIO_BLK_T_IN (read) or VIRTIO_BLK_T_OUT (write).
 /// `sector` is the starting LBA.
 /// `data` points to the data buffer (count * 512 bytes).
 /// `count` is the number of sectors.
 ///
-/// Returns Ok(()) on success, Err(BlockError) on failure.
+/// Returns Ok(true) when the request must be awaited via the IRQ path
+/// (caller drops the device lock and calls [`wait_completion`]) and
+/// Ok(false) on the poll fallback (which already completed inside this
+/// function).  Err on submission/poll failure.
 fn submit_request(
     dev: &mut VirtioBlkDevice,
     req_type: u32,
     sector: u64,
     data: *mut u8,
     data_len: usize,
-) -> Result<(), BlockError> {
+) -> Result<bool, BlockError> {
     let io_base = dev.io_base;
     let qs = dev.queue_size;
     let vq_base = phys_to_virt::<u8>(dev.vq_phys);
@@ -394,7 +658,7 @@ fn submit_request(
 
     // avail ring layout: flags(u16), idx(u16), ring[qs](u16 each)
     // SAFETY: Writing to the available ring within our allocated virtqueue memory.
-    let avail_idx = unsafe {
+    unsafe {
         let avail_idx_ptr = avail_base.add(2) as *mut u16;
         let idx = avail_idx_ptr.read_volatile();
 
@@ -408,10 +672,23 @@ fn submit_request(
 
         // Increment avail idx.
         avail_idx_ptr.write_volatile(idx.wrapping_add(1));
+    }
 
-        idx.wrapping_add(1)
-    };
-    let _ = avail_idx;
+    // Pre-arm the IRQ-completion state BEFORE the doorbell write.  Once the
+    // device sees the new avail.idx it can complete and IRQ at any time;
+    // the ISR must be able to find a valid waker tid + cleared done flag.
+    let irq_path = IRQS_ARMED.load(Ordering::Acquire) && crate::sched::is_active();
+    if irq_path {
+        REQUEST_DONE.store(false, Ordering::Release);
+        REQUEST_STATUS.store(0xFF, Ordering::Relaxed);
+        WAITER_TID.store(crate::proc::current_tid(), Ordering::Release);
+    }
+
+    // Bump our local used-idx counter to match what the device will produce.
+    // On the IRQ path the ISR also bumps `IRQ_LAST_USED_IDX`; we use
+    // `dev.last_used_idx` only for the poll fallback's expected_used check.
+    dev.last_used_idx = dev.last_used_idx.wrapping_add(1);
+    let expected_used = dev.last_used_idx;
 
     // ── Notify Device ──────────────────────────────────────────────
 
@@ -420,10 +697,16 @@ fn submit_request(
         hal::outw(io_base + VIRTIO_REG_QUEUE_NOTIFY, 0);
     }
 
-    // ── Poll Used Ring for Completion ──────────────────────────────
+    if irq_path {
+        // Caller will drop the device mutex and call `wait_completion`.
+        return Ok(true);
+    }
 
+    // ── Poll Fallback ──────────────────────────────────────────────
+    //
+    // Only used during early boot before `arm_irq` has run (e.g. FAT32
+    // mount during VFS init at Phase 7, before the scheduler is active).
     let used_idx_ptr = unsafe { used_base.add(2) as *const u16 };
-    let expected_used = dev.last_used_idx.wrapping_add(1);
 
     let mut timeout = 10_000_000u32;
     loop {
@@ -436,8 +719,6 @@ fn submit_request(
         core::hint::spin_loop();
     }
 
-    dev.last_used_idx = expected_used;
-
     // ── Check Status Byte ──────────────────────────────────────────
 
     // SAFETY: The device has written the status byte; we read it back.
@@ -448,6 +729,73 @@ fn submit_request(
         return Err(BlockError::IoError);
     }
 
+    Ok(false)
+}
+
+/// Block the current thread until the in-flight virtio-blk request completes.
+///
+/// MUST be called with the [`VIRTIO_BLK`] mutex *not* held — the ISR runs
+/// lock-free, but holding the device mutex across `schedule()` would block
+/// any other thread that tries to issue disk I/O.
+///
+/// Two-stage wait:
+///   1. Bounded micro-spin (most KVM completions land here).
+///   2. State=Blocked + `schedule()` loop with `wake_tick = now+1` safety
+///      floor in case the ISR couldn't take `THREAD_TABLE` and the wake
+///      was deferred to the timer tick.
+fn wait_completion() -> Result<(), BlockError> {
+    // Cheap micro-spin first — virtio-blk under KVM typically completes in
+    // single-digit microseconds, so the IRQ may already have signalled DONE
+    // by the time we get here.  Saves a schedule() round-trip in the
+    // common case.
+    let mut spin_budget = 1024u32;
+    while spin_budget > 0 && !REQUEST_DONE.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+        spin_budget -= 1;
+    }
+
+    if !REQUEST_DONE.load(Ordering::Acquire) {
+        // Bound the total wait at ~1s wall-clock so a wedged device
+        // fails-fast instead of hanging.
+        let start_tick = crate::arch::x86_64::irq::get_ticks();
+        let deadline = start_tick.saturating_add(100); // 100 ticks ≈ 1s @ 100Hz
+        let my_tid = crate::proc::current_tid();
+        loop {
+            if REQUEST_DONE.load(Ordering::Acquire) {
+                break;
+            }
+            let now_tick = crate::arch::x86_64::irq::get_ticks();
+            if now_tick >= deadline {
+                crate::serial_println!("[VIRTIO-BLK] IRQ wait timeout");
+                WAITER_TID.store(0, Ordering::Release);
+                return Err(BlockError::IoError);
+            }
+
+            {
+                let mut threads = crate::proc::THREAD_TABLE.lock();
+                if let Some(t) = threads.iter_mut().find(|t| t.tid == my_tid) {
+                    // Pre-empt-resume race guard: the ISR may have already
+                    // signalled DONE in the window between the load above
+                    // and acquiring THREAD_TABLE.  Re-check before sleeping.
+                    if !REQUEST_DONE.load(Ordering::Acquire) {
+                        t.state = crate::proc::ThreadState::Blocked;
+                        // 1-tick safety floor — see arm_irq doc above.
+                        t.wake_tick = now_tick.saturating_add(1);
+                    }
+                }
+            }
+            crate::sched::schedule();
+            // Resumed: loop and re-check DONE.
+        }
+    }
+
+    WAITER_TID.store(0, Ordering::Release);
+
+    let status = REQUEST_STATUS.load(Ordering::Relaxed);
+    if status != 0 {
+        crate::serial_println!("[VIRTIO-BLK] Request failed (irq path): status={}", status);
+        return Err(BlockError::IoError);
+    }
     Ok(())
 }
 
@@ -472,56 +820,7 @@ impl BlockDevice for VirtioBlkBlockDevice {
         if count == 0 {
             return Ok(());
         }
-
-        // Fast-fail when the device has been reset (see stop()).  Without this
-        // check, callers that race against shutdown spin the used-ring poll
-        // 10M times before giving up.
-        if !VIRTIO_BLK_AVAILABLE.load(Ordering::Acquire) {
-            return Err(BlockError::IoError);
-        }
-
-        let mut dev = VIRTIO_BLK.lock();
-        let dev = dev.as_mut().ok_or(BlockError::IoError)?;
-
-        if lba + count as u64 > dev.capacity {
-            return Err(BlockError::OutOfRange);
-        }
-
-        // Submit one virtio request per up-to-MAX_SECTORS-sectors batch.
-        // Virtio block devices accept arbitrarily large data descriptors
-        // (the descriptor's `len` field is u32, so up to 4 GiB per request);
-        // the per-request size is constrained only by the device's segment
-        // limits and the contiguity of the caller's buffer.  Kernel-heap
-        // buffers in AstryxOS are always physically contiguous (the heap
-        // occupies one contiguous physical range), so a single descriptor
-        // suffices.
-        //
-        // 2048 sectors = 1 MiB per request.  Larger values further amortise
-        // the per-request overhead (one KVM/MMIO round trip, one doorbell
-        // write, one polling spin) but require the caller's buffer to be
-        // physically contiguous over the same span.  1 MiB stays well
-        // within the 128 MiB kernel heap.
-        const MAX_SECTORS: u32 = 2048;
-        let mut sector_idx = 0u32;
-
-        while sector_idx < count {
-            let batch = core::cmp::min(count - sector_idx, MAX_SECTORS);
-            let offset = (sector_idx as usize) * SECTOR_SIZE;
-            let batch_len = (batch as usize) * SECTOR_SIZE;
-            let data_ptr = unsafe { buf.as_mut_ptr().add(offset) };
-
-            submit_request(
-                dev,
-                VIRTIO_BLK_T_IN,
-                lba + sector_idx as u64,
-                data_ptr,
-                batch_len,
-            )?;
-
-            sector_idx += batch;
-        }
-
-        Ok(())
+        do_io(VIRTIO_BLK_T_IN, lba, count, buf.as_mut_ptr())
     }
 
     fn write_sectors(&self, lba: u64, count: u32, data: &[u8]) -> Result<(), BlockError> {
@@ -532,44 +831,72 @@ impl BlockDevice for VirtioBlkBlockDevice {
         if count == 0 {
             return Ok(());
         }
+        // SAFETY: We pass a *mut for the submit_request interface but the
+        // device only reads from this buffer for T_OUT.
+        do_io(VIRTIO_BLK_T_OUT, lba, count, data.as_ptr() as *mut u8)
+    }
+}
 
-        if !VIRTIO_BLK_AVAILABLE.load(Ordering::Acquire) {
-            return Err(BlockError::IoError);
-        }
+/// Issue a virtio-blk request and await its completion.  Splits the work into
+/// up-to-MAX_SECTORS-sized batches; each batch acquires the device mutex,
+/// builds descriptors, rings the doorbell, **drops the mutex**, then either
+/// blocks on the IRQ-completion path (post-`arm_irq`) or polls inline (early
+/// boot).  Dropping the mutex around the wait is essential — the ISR is
+/// lock-free, but holding the mutex across `schedule()` would block any
+/// other thread that tries to issue disk I/O.
+///
+/// Virtio block devices accept arbitrarily large data descriptors (the
+/// descriptor's `len` field is u32, so up to 4 GiB per request); the
+/// per-request size is constrained only by the device's segment limits and
+/// the contiguity of the caller's buffer.  Kernel-heap buffers in AstryxOS
+/// are always physically contiguous (the heap occupies one contiguous
+/// physical range), so a single descriptor suffices.
+///
+/// 2048 sectors = 1 MiB per request.  Larger values further amortise the
+/// per-request overhead (one KVM/MMIO round trip, one doorbell write, one
+/// IRQ delivery) but require the caller's buffer to be physically
+/// contiguous over the same span.  1 MiB stays well within the 128 MiB
+/// kernel heap.
+fn do_io(req_type: u32, lba: u64, count: u32, buf: *mut u8) -> Result<(), BlockError> {
+    if !VIRTIO_BLK_AVAILABLE.load(Ordering::Acquire) {
+        return Err(BlockError::IoError);
+    }
 
-        let mut dev = VIRTIO_BLK.lock();
-        let dev = dev.as_mut().ok_or(BlockError::IoError)?;
+    const MAX_SECTORS: u32 = 2048;
+    let mut sector_idx = 0u32;
 
-        if lba + count as u64 > dev.capacity {
-            return Err(BlockError::OutOfRange);
-        }
+    while sector_idx < count {
+        let batch = core::cmp::min(count - sector_idx, MAX_SECTORS);
+        let offset = (sector_idx as usize) * SECTOR_SIZE;
+        let batch_len = (batch as usize) * SECTOR_SIZE;
+        // SAFETY: caller has already validated `buf` covers `count` sectors.
+        let data_ptr = unsafe { buf.add(offset) };
 
-        // See `read_sectors` for the rationale behind the 2048-sector cap.
-        const MAX_SECTORS: u32 = 2048;
-        let mut sector_idx = 0u32;
-
-        while sector_idx < count {
-            let batch = core::cmp::min(count - sector_idx, MAX_SECTORS);
-            let offset = (sector_idx as usize) * SECTOR_SIZE;
-            let batch_len = (batch as usize) * SECTOR_SIZE;
-            // SAFETY: We need a *mut u8 for the submit_request interface but
-            // we won't actually write to it for VIRTIO_BLK_T_OUT — the device
-            // reads from this buffer.
-            let data_ptr = unsafe { data.as_ptr().add(offset) as *mut u8 };
-
+        // ── Submit + doorbell (lock held) ──────────────────────────────
+        let needs_irq_wait = {
+            let mut guard = VIRTIO_BLK.lock();
+            let dev = guard.as_mut().ok_or(BlockError::IoError)?;
+            if lba + count as u64 > dev.capacity {
+                return Err(BlockError::OutOfRange);
+            }
             submit_request(
                 dev,
-                VIRTIO_BLK_T_OUT,
+                req_type,
                 lba + sector_idx as u64,
                 data_ptr,
                 batch_len,
-            )?;
+            )?
+        };
 
-            sector_idx += batch;
+        // ── Wait (lock dropped) ────────────────────────────────────────
+        if needs_irq_wait {
+            wait_completion()?;
         }
 
-        Ok(())
+        sector_idx += batch;
     }
+
+    Ok(())
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────
@@ -672,8 +999,15 @@ pub fn restart_device() -> bool {
     // Reset our cached used-ring index — the device's used idx is 0 again
     // after reset, and we just zeroed the used ring.
     dev.last_used_idx = 0;
+    let io_base_snap = dev.io_base;
+    let qs_snap = dev.queue_size;
+    let vq_phys_snap = dev.vq_phys;
 
     drop(guard);
+    // Refresh the lock-free ISR snapshot — the device fields have not
+    // changed but `IRQ_LAST_USED_IDX` must be reset to 0 to match the
+    // post-reset device state.
+    publish_irq_snapshot(io_base_snap, qs_snap, vq_phys_snap);
     VIRTIO_BLK_AVAILABLE.store(true, Ordering::Release);
     crate::serial_println!("[VIRTIO-BLK] restart_device: device re-initialized");
     true
