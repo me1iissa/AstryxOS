@@ -177,9 +177,14 @@ static VIRTIO_BLK_AVAILABLE: AtomicBool = AtomicBool::new(false);
 /// path then prefers blocking over polling.
 static IRQS_ARMED: AtomicBool = AtomicBool::new(false);
 
-/// TID of the thread blocked on the in-flight request, or 0 if none.
-/// Written by the submit path before [`schedule`] and read by the ISR.
-static WAITER_TID: AtomicU64 = AtomicU64::new(0);
+/// TID of the thread blocked on the in-flight request, or [`NO_WAITER`]
+/// (`u64::MAX`) when no request is in flight.
+///
+/// Note: zero is a valid TID (the BSP idle thread / kernel-init thread runs
+/// as TID 0, and it issues disk reads during early Firefox setup), so we
+/// can't use 0 as a "no waiter" sentinel.
+const NO_WAITER: u64 = u64::MAX;
+static WAITER_TID: AtomicU64 = AtomicU64::new(NO_WAITER);
 
 /// Per-request completion flag.  The submitter clears this before submitting
 /// and re-checks after wake; the ISR sets it after walking the used ring.
@@ -192,6 +197,16 @@ static REQUEST_STATUS: AtomicU8 = AtomicU8::new(0);
 /// Spurious-IRQ counter (ISR fired but no used-ring progress).  Useful for
 /// detecting shared-IRQ wiring mistakes; surfaced via [`spurious_count`].
 static SPURIOUS_IRQS: AtomicU64 = AtomicU64::new(0);
+
+/// Total IRQ entries (productive + spurious).  Diagnostic only.
+static TOTAL_IRQS: AtomicU64 = AtomicU64::new(0);
+
+/// Completions discovered via the poll-fallback in `wait_completion`.
+/// Non-zero values indicate the IRQ wiring is unreliable on the host —
+/// the wait loop's used-ring read picked up the completion before the
+/// ISR did.  Zero in steady state means IRQ delivery is working as
+/// designed and the schedule() yield happens once per request.
+static POLLED_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 
 // ── Lock-Free Snapshot for the ISR ──────────────────────────────────────────
 //
@@ -384,6 +399,24 @@ pub fn arm_irq() {
         return;
     }
 
+    // Clear PCI command-register bit 10 (Interrupt Disable) so the device
+    // can assert legacy INTx.  Default after PCI reset is bit 10 = 0
+    // (INTx enabled), but firmware may have set it expecting an MSI/MSI-X
+    // path; we explicitly enable INTx for the legacy IO-APIC route below.
+    // PCI Local Bus Specification 3.0, §6.2.2.
+    let cmd = super::pci::pci_config_read32(b, d, f, 0x04);
+    super::pci::pci_config_write32(b, d, f, 0x04, cmd & !(1u32 << 10));
+
+    // Walk the PCI capability list and disable MSI-X if present.  When
+    // MSI-X enable=1 the device routes interrupts via MSI-X messages and
+    // ignores its INTx pin entirely (PCI 3.0 §6.8.2.3 — MSI-X Message
+    // Control register, Bit 15 "MSI-X Enable").  QEMU's virtio-blk-pci
+    // exposes MSI-X by default; UEFI may have left it enabled with
+    // entries still in their "function masked" reset state, which makes
+    // the device silently swallow our completions.  Forcing it off on
+    // arm restores the legacy INTx path that this driver uses.
+    disable_msix(b, d, f);
+
     // Route the GSI through the IO-APIC.  PCI INTx is level-triggered,
     // active-low — use the level helper.
     let bsp_id = crate::arch::x86_64::apic::bsp_apic_id();
@@ -405,6 +438,46 @@ pub fn arm_irq() {
         "[VIRTIO-BLK] IRQ armed: PCI {:02x}:{:02x}.{} line={} -> vector {} (BSP APIC {})",
         b, d, f, irq_line, VIRTIO_BLK_IRQ_VECTOR, bsp_id
     );
+}
+
+/// Walk a device's PCI capability list and disable any MSI-X capability we
+/// find.  PCI 3.0 §6.7 (Capability Pointers): caps list starts at config
+/// offset 0x34 if Status register bit 4 is set; each cap header is two
+/// bytes — `cap_id` at +0, `next_ptr` at +1.  MSI-X cap_id = 0x11.
+/// The MSI-X Message Control register lives at cap_offset+2; bit 15 of
+/// that 16-bit field is "MSI-X Enable" — clear it to fall back to INTx.
+fn disable_msix(bus: u8, device: u8, function: u8) {
+    // Status reg is at +0x06 (high half of dword at +0x04).
+    let status_reg = super::pci::pci_config_read32(bus, device, function, 0x04);
+    let status = (status_reg >> 16) as u16;
+    if status & (1 << 4) == 0 {
+        return; // Capabilities List bit not set — no caps.
+    }
+    // Cap pointer at +0x34, low byte.
+    let cap_ptr = super::pci::pci_config_read32(bus, device, function, 0x34) & 0xFF;
+    let mut off = (cap_ptr as u8) & 0xFC; // dword-aligned
+    let mut hops = 0u8;
+    while off != 0 && hops < 48 {
+        let dw = super::pci::pci_config_read32(bus, device, function, off);
+        let cap_id = (dw & 0xFF) as u8;
+        let next = ((dw >> 8) & 0xFF) as u8;
+        if cap_id == 0x11 {
+            // MSI-X.  Message Control is bits 16..31 of the same dword
+            // (cap_offset+2 = high half).
+            let msg_ctl = ((dw >> 16) & 0xFFFF) as u16;
+            if msg_ctl & (1 << 15) != 0 {
+                let new_ctl = (msg_ctl & !(1u16 << 15)) as u32;
+                let new_dw = (dw & 0x0000_FFFF) | (new_ctl << 16);
+                super::pci::pci_config_write32(bus, device, function, off, new_dw);
+                crate::serial_println!(
+                    "[VIRTIO-BLK] Disabled MSI-X (was enabled, cap@{:#x})", off
+                );
+            }
+            return;
+        }
+        off = next & 0xFC;
+        hops += 1;
+    }
 }
 
 /// Number of IRQs we received that did not advance the used ring.
@@ -437,6 +510,7 @@ pub fn spurious_count() -> u64 {
 /// floor lets the next timer ISR's [`crate::sched::wake_sleeping_threads`]
 /// pick up the missed wake.
 pub(crate) fn handle_irq() {
+    TOTAL_IRQS.fetch_add(1, Ordering::Relaxed);
     let io_base = IRQ_IO_BASE.load(Ordering::Acquire);
     let qs = IRQ_QUEUE_SIZE.load(Ordering::Acquire);
     let vq_virt = IRQ_VQ_VIRT.load(Ordering::Acquire);
@@ -489,7 +563,7 @@ pub(crate) fn handle_irq() {
         //    the submitter's wake_tick=now+1 floor will catch it on the
         //    next timer tick.
         let waker = WAITER_TID.load(Ordering::Acquire);
-        if waker != 0 {
+        if waker != NO_WAITER {
             if let Some(mut threads) = crate::proc::THREAD_TABLE.try_lock() {
                 if let Some(t) = threads.iter_mut().find(|t| t.tid == waker) {
                     if t.state == crate::proc::ThreadState::Blocked {
@@ -682,6 +756,13 @@ fn submit_request(
         REQUEST_DONE.store(false, Ordering::Release);
         REQUEST_STATUS.store(0xFF, Ordering::Relaxed);
         WAITER_TID.store(crate::proc::current_tid(), Ordering::Release);
+        // Synchronise the ISR's last-seen index with what the device has
+        // already produced from the poll path.  Without this, the polled
+        // fallback inside `wait_completion` would see the prior poll-path
+        // completions (cur_used != last_seen=0) and falsely declare the
+        // current request done before the device has touched its status
+        // byte — which then reads back the 0xFF sentinel above.
+        IRQ_LAST_USED_IDX.store(dev.last_used_idx, Ordering::Release);
     }
 
     // Bump our local used-idx counter to match what the device will produce.
@@ -732,22 +813,38 @@ fn submit_request(
     Ok(false)
 }
 
-/// Block the current thread until the in-flight virtio-blk request completes.
+/// Diagnostic: number of times we entered wait_completion (one per IRQ-path
+/// request).  Cheap counter for figuring out which step in the IRQ pipeline
+/// is silent during early bring-up.
+static WAIT_ENTRIES: AtomicU64 = AtomicU64::new(0);
+
+/// Wait for the in-flight virtio-blk request to complete.
 ///
 /// MUST be called with the [`VIRTIO_BLK`] mutex *not* held — the ISR runs
-/// lock-free, but holding the device mutex across `schedule()` would block
-/// any other thread that tries to issue disk I/O.
+/// lock-free (it reads device state from `IRQ_*` atomics), but holding
+/// the device mutex across `schedule()` would block any other thread
+/// that tries to issue disk I/O.
 ///
-/// Two-stage wait:
-///   1. Bounded micro-spin (most KVM completions land here).
-///   2. State=Blocked + `schedule()` loop with `wake_tick = now+1` safety
-///      floor in case the ISR couldn't take `THREAD_TABLE` and the wake
-///      was deferred to the timer tick.
+/// Three-stage wait:
+///   1. Bounded micro-spin on `REQUEST_DONE` (most KVM completions land here
+///      because the ISR runs immediately).
+///   2. Polled used-ring read + scheduler yield: if the IRQ hasn't fired
+///      promptly, we walk the used ring ourselves and yield via
+///      `schedule()` to let other threads run.  This is the load-bearing
+///      path for hosts where the IO-APIC route doesn't actually deliver
+///      to vector 45 (UEFI quirk, shared-IRQ corner case, etc.).
+///   3. Hard deadline at 1s wall-clock — a wedged device fails-fast
+///      rather than hanging the kernel.
+///
+/// Even in stage 2, the calling thread is *not* marked Blocked: when no
+/// other thread is Ready on this CPU, `schedule()` returns immediately
+/// (no work to do) and we re-poll.  When other threads ARE Ready, the
+/// scheduler dispatches them while our request is in flight — which is
+/// the SMP-fairness win this driver is after.
 fn wait_completion() -> Result<(), BlockError> {
-    // Cheap micro-spin first — virtio-blk under KVM typically completes in
-    // single-digit microseconds, so the IRQ may already have signalled DONE
-    // by the time we get here.  Saves a schedule() round-trip in the
-    // common case.
+    let _ = WAIT_ENTRIES.fetch_add(1, Ordering::Relaxed);
+
+    // Stage 1: cheap micro-spin.
     let mut spin_budget = 1024u32;
     while spin_budget > 0 && !REQUEST_DONE.load(Ordering::Acquire) {
         core::hint::spin_loop();
@@ -755,45 +852,67 @@ fn wait_completion() -> Result<(), BlockError> {
     }
 
     if !REQUEST_DONE.load(Ordering::Acquire) {
-        // Bound the total wait at ~1s wall-clock so a wedged device
-        // fails-fast instead of hanging.
+        let qs = IRQ_QUEUE_SIZE.load(Ordering::Acquire);
+        let vq_virt = IRQ_VQ_VIRT.load(Ordering::Acquire);
+        let used_idx_off = if qs != 0 { used_ring_offset(qs) + 2 } else { 0 };
+        let status_off = if qs != 0 {
+            let used_ring_end = used_ring_offset(qs) + 4 + (qs as usize) * 8;
+            ((used_ring_end + 15) & !15) + 16
+        } else { 0 };
+
         let start_tick = crate::arch::x86_64::irq::get_ticks();
-        let deadline = start_tick.saturating_add(100); // 100 ticks ≈ 1s @ 100Hz
-        let my_tid = crate::proc::current_tid();
+        let deadline = start_tick.saturating_add(100); // ~1s @ 100Hz
+
         loop {
             if REQUEST_DONE.load(Ordering::Acquire) {
                 break;
             }
-            let now_tick = crate::arch::x86_64::irq::get_ticks();
-            if now_tick >= deadline {
-                crate::serial_println!("[VIRTIO-BLK] IRQ wait timeout");
-                WAITER_TID.store(0, Ordering::Release);
+
+            // Walk the used ring ourselves.  The ISR may have already
+            // updated `IRQ_LAST_USED_IDX` and `REQUEST_DONE`, in which
+            // case the load above caught it; otherwise we look at the
+            // device's published `used.idx` directly.
+            if qs != 0 && vq_virt != 0 {
+                // SAFETY: vq_virt is the kernel virt of our owned virtqueue.
+                let cur_used = unsafe {
+                    let p = (vq_virt as *const u8).add(used_idx_off) as *const u16;
+                    p.read_volatile()
+                };
+                let last_seen = IRQ_LAST_USED_IDX.load(Ordering::Acquire);
+                if cur_used != last_seen {
+                    // SAFETY: status byte was written by the device.
+                    let status_byte = unsafe {
+                        let p = (vq_virt as *const u8).add(status_off);
+                        p.read_volatile()
+                    };
+                    IRQ_LAST_USED_IDX.store(cur_used, Ordering::Release);
+                    REQUEST_STATUS.store(status_byte, Ordering::Relaxed);
+                    REQUEST_DONE.store(true, Ordering::Release);
+                    POLLED_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+            }
+
+            if crate::arch::x86_64::irq::get_ticks() >= deadline {
+                crate::serial_println!("[VIRTIO-BLK] wait_completion timeout");
+                WAITER_TID.store(NO_WAITER, Ordering::Release);
                 return Err(BlockError::IoError);
             }
 
-            {
-                let mut threads = crate::proc::THREAD_TABLE.lock();
-                if let Some(t) = threads.iter_mut().find(|t| t.tid == my_tid) {
-                    // Pre-empt-resume race guard: the ISR may have already
-                    // signalled DONE in the window between the load above
-                    // and acquiring THREAD_TABLE.  Re-check before sleeping.
-                    if !REQUEST_DONE.load(Ordering::Acquire) {
-                        t.state = crate::proc::ThreadState::Blocked;
-                        // 1-tick safety floor — see arm_irq doc above.
-                        t.wake_tick = now_tick.saturating_add(1);
-                    }
-                }
-            }
+            // Yield to the scheduler.  If another thread is Ready on this
+            // CPU, schedule() picks it; we resume on the next round.  If
+            // not, schedule() is essentially a no-op and we go straight
+            // back to the polled used-ring check.  Either way, the
+            // scheduler runs and other CPUs are not blocked.
             crate::sched::schedule();
-            // Resumed: loop and re-check DONE.
         }
     }
 
-    WAITER_TID.store(0, Ordering::Release);
+    WAITER_TID.store(NO_WAITER, Ordering::Release);
 
     let status = REQUEST_STATUS.load(Ordering::Relaxed);
     if status != 0 {
-        crate::serial_println!("[VIRTIO-BLK] Request failed (irq path): status={}", status);
+        crate::serial_println!("[VIRTIO-BLK] Request failed: status={}", status);
         return Err(BlockError::IoError);
     }
     Ok(())
