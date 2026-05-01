@@ -86,6 +86,14 @@ pub fn sync_inode(mount_idx: usize, inode: u64) {
 /// for this file will hit the cache (instant) instead of reading from
 /// disk (slow ATA PIO on WSL2/KVM).
 ///
+/// Reads are issued in multi-megabyte bursts so each `Filesystem::read` call
+/// amortises its inode lookup, cluster-chain walk, and lock acquisitions over
+/// many pages — and the underlying block driver coalesces sequential clusters
+/// into a small number of large multi-sector requests instead of one per
+/// page.  After the burst arrives, we copy each page into a freshly allocated
+/// PMM frame so the page cache continues to own per-page physical frames as
+/// the rest of the VM expects.
+///
 /// Returns the number of pages cached.
 pub fn prepopulate_file(path: &str) -> usize {
     use crate::vfs;
@@ -106,50 +114,103 @@ pub fn prepopulate_file(path: &str) -> usize {
     let mut cached = 0usize;
     let phys_off: u64 = 0xFFFF_8000_0000_0000;
 
-    // Read page-by-page directly into PMM pages (no heap allocation).
-    // Each page is read from the filesystem into a PMM-allocated physical
-    // page via the higher-half mapping, then inserted into the page cache.
+    // Read in 2 MiB bursts.  Sized to match the BlockDevice multi-sector
+    // batch window so each `read` translates into a small number of
+    // underlying multi-sector requests (the block driver caps each request
+    // at 1 MiB to keep the contiguous-buffer requirement modest, so a
+    // 2 MiB burst becomes two adjacent virtio requests).  This amortises
+    // the per-request KVM/MMIO round-trip cost (typical 3-5 ms per virtio
+    // request) over many pages — the 38k-page libxul prepopulate compresses
+    // into ~75 bursts (~150 underlying requests) instead of the original
+    // 38k page-by-page reads.
+    const CHUNK_PAGES: usize = 512;
+    const CHUNK_BYTES: usize = CHUNK_PAGES * 4096;
+    let mut chunk_buf: alloc::vec::Vec<u8> = alloc::vec![0u8; CHUNK_BYTES];
+
     let mut offset: u64 = 0;
     while offset < file_size {
-        let page_off = offset & !0xFFF; // page-align
-        if lookup(mount_idx, inode, page_off).is_some() {
-            offset = page_off + page_size;
-            continue;
-        }
         // Stop if PMM is running low — keep 20K pages (80MB) free for kernel ops.
         if crate::mm::pmm::free_page_count() < 20_000 {
             crate::serial_println!("[CACHE] prepopulate stopping: PMM low ({} free pages)",
                 crate::mm::pmm::free_page_count());
             break;
         }
-        if let Some(phys) = crate::mm::pmm::alloc_page() {
-            unsafe {
-                core::ptr::write_bytes((phys_off + phys) as *mut u8, 0, page_size as usize);
+
+        let chunk_start = offset & !(CHUNK_BYTES as u64 - 1); // CHUNK-aligned
+        let chunk_remaining = file_size.saturating_sub(chunk_start);
+        let this_chunk = core::cmp::min(chunk_remaining as usize, CHUNK_BYTES);
+
+        // If every page in this chunk is already cached, skip the disk read.
+        let mut all_cached = true;
+        for page_idx in 0..((this_chunk + 4095) / 4096) {
+            let page_off = chunk_start + (page_idx as u64) * page_size;
+            if lookup(mount_idx, inode, page_off).is_none() {
+                all_cached = false;
+                break;
             }
-            let buf = unsafe {
-                core::slice::from_raw_parts_mut(
-                    (phys_off + phys) as *mut u8, page_size as usize)
-            };
-            {
-                let mounts = vfs::MOUNTS.lock();
-                if mounts[mount_idx].fs.read(inode, page_off, buf).is_err() {
-                    crate::mm::pmm::free_page(phys);
-                    break;
+        }
+        if all_cached {
+            offset = chunk_start + this_chunk as u64;
+            continue;
+        }
+
+        // Issue one filesystem read for the entire chunk.  The FAT32 driver
+        // detects the contiguous cluster run, computes the matching disk
+        // sector range, and issues large multi-sector block-device calls —
+        // one virtio request per up-to-1 MiB-aligned segment of the burst.
+        let read_buf = &mut chunk_buf[..this_chunk];
+        {
+            let mounts = vfs::MOUNTS.lock();
+            if mounts[mount_idx].fs.read(inode, chunk_start, read_buf).is_err() {
+                break;
+            }
+        }
+
+        // Split the chunk into 4 KiB pages, allocating a PMM frame for each
+        // and inserting it into the page cache.
+        let mut page_off_in_chunk = 0usize;
+        while page_off_in_chunk < this_chunk {
+            let page_off = chunk_start + page_off_in_chunk as u64;
+            if lookup(mount_idx, inode, page_off).is_some() {
+                page_off_in_chunk += page_size as usize;
+                continue;
+            }
+            if let Some(phys) = crate::mm::pmm::alloc_page() {
+                let copy_len = core::cmp::min(
+                    page_size as usize,
+                    this_chunk - page_off_in_chunk,
+                );
+                let dst = (phys_off + phys) as *mut u8;
+                // SAFETY: PMM hands out an exclusive 4 KiB physical frame.
+                // The higher-half identity map covers it, and the page cache
+                // is the sole owner once we insert.
+                unsafe {
+                    if copy_len < page_size as usize {
+                        core::ptr::write_bytes(dst, 0, page_size as usize);
+                    }
+                    core::ptr::copy_nonoverlapping(
+                        chunk_buf.as_ptr().add(page_off_in_chunk),
+                        dst,
+                        copy_len,
+                    );
                 }
+                insert(mount_idx, inode, page_off, phys);
+                cached += 1;
+            } else {
+                // OOM — bail out of the inner loop; outer loop will hit the
+                // free-page guard and exit on the next iteration.
+                break;
             }
-            insert(mount_idx, inode, page_off, phys);
-            cached += 1;
-        } else {
-            break; // OOM
+            page_off_in_chunk += page_size as usize;
+
+            // Log progress every 4000 pages (~16MB).
+            if cached > 0 && cached % 4000 == 0 {
+                crate::serial_println!("[CACHE] prepopulate {}: {} pages ({} MB)",
+                    path, cached, cached * 4 / 1024);
+            }
         }
 
-        offset = page_off + page_size;
-
-        // Log progress every 4000 pages (~16MB).
-        if cached > 0 && cached % 4000 == 0 {
-            crate::serial_println!("[CACHE] prepopulate {}: {} pages ({} MB)",
-                path, cached, cached * 4 / 1024);
-        }
+        offset = chunk_start + this_chunk as u64;
     }
     cached
 }
