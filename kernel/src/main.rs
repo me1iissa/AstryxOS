@@ -138,6 +138,11 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     serial_println!("[Aether] Phase 5b: APIC init...");
     arch::x86_64::apic::init();
     arch::x86_64::apic::start_aps();
+    // Now that the IO-APIC is live, route the virtio-blk legacy INTx line
+    // to its IDT vector.  Any virtio-blk reads issued before this point
+    // (none today, but keep in mind for future early-FS code) use the
+    // poll fallback, see drivers/virtio_blk.rs::submit_request.
+    drivers::virtio_blk::arm_irq();
     serial_println!("[Aether] Phase 5b: APIC OK");
 
     // Phase 6: Syscall interface

@@ -150,6 +150,7 @@ pub fn init() {
             IDT[33].set_handler(fix(super::irq::irq_keyboard_handler as *const () as u64), kernel_cs, 0, 0);
             IDT[43].set_handler(fix(super::irq::irq_e1000_handler as *const () as u64), kernel_cs, 0, 0);
             IDT[44].set_handler(fix(super::irq::irq_mouse_handler as *const () as u64), kernel_cs, 0, 0);
+            IDT[45].set_handler(fix(super::irq::irq_virtio_blk_handler as *const () as u64), kernel_cs, 0, 0);
 
             // Syscall interrupt (vector 0x80) — for int 0x80 style syscalls
             IDT[0x80].set_handler(fix(isr_syscall_int80 as *const () as u64), kernel_cs, 0, 3);
