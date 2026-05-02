@@ -3694,6 +3694,24 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> i64 {
             -9 // EBADF
         }
         F_SETFL => 0, // ignore flag changes (O_NONBLOCK etc.)
+        // F_ADD_SEALS / F_GET_SEALS — memfd sealing API (Linux 3.17+).
+        //
+        // Mozilla's IPC layer applies F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL
+        // (often with F_SEAL_FUTURE_WRITE) to every read-only shared-memory
+        // handoff between parent and content processes.  When the call fails
+        // with -EINVAL the parent prints "failed to seal memfd" and the
+        // subsequent "freezeable shared memory was never frozen" warning,
+        // then dereferences a NULL pointer in the post-freeze codepath
+        // (shared_memory_posix.cc:554).  Returning success here keeps the
+        // parent on the sealed-shmem fast path it expects.
+        //
+        // We do not yet track per-fd seal state; mmap(PROT_WRITE, MAP_SHARED)
+        // on a "sealed" memfd will still succeed, which is a content-process
+        // correctness debt logged for follow-up.  See audit notes for the
+        // full picture.  No application observed in this codebase relies on
+        // the kernel actually enforcing seals during startup.
+        1033 /* F_ADD_SEALS */ => 0,
+        1034 /* F_GET_SEALS */ => 0,
         _ => -22 // EINVAL
     }
 }

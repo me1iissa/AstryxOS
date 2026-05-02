@@ -136,6 +136,13 @@ impl ProcFs {
             | INO_PID_MAX
             | INO_RAND_UUID => Some(FileType::RegularFile),
 
+            // /proc/self/fd/<N> entries — modelled as symlinks per the Linux
+            // procfs(5) contract.  Inode encoding: 3000 + fd_num (see
+            // `lookup` and `readdir` for the encoding).  Capping at 3000+4096
+            // matches MAX_FDS_PER_PROCESS so we do not claim ownership of
+            // unrelated inode numbers.
+            n if n >= 3000 && n < 3000 + 4096 => Some(FileType::SymLink),
+
             _ => None,
         }
     }
@@ -383,6 +390,43 @@ impl FileSystemOps for ProcFs {
 
     fn truncate(&self, _inode: u64, _size: u64) -> VfsResult<()> {
         Err(VfsError::PermissionDenied)
+    }
+
+    /// Resolve `/proc/self/fd/<N>` symlinks to the path the corresponding fd
+    /// was opened with.
+    ///
+    /// Per procfs(5), each entry in `/proc/<pid>/fd` is a symbolic link
+    /// pointing at the underlying file.  Programs (notably runtime loaders
+    /// and Mozilla's IPC layer) `openat(/proc/self/fd/<N>, ...)` to obtain
+    /// an independently-flagged handle on the same file — typically a
+    /// read-only dup of an `O_RDWR` memfd.
+    ///
+    /// The callable `pid` is the current task's pid (resolution always
+    /// applies to the caller, since this filesystem only supports the
+    /// `/proc/self/...` view; numeric pid paths are pre-redirected by
+    /// `vfs::open()`).
+    fn readlink(&self, inode: u64) -> VfsResult<String> {
+        if !(3000..3000 + 4096).contains(&inode) {
+            return Err(VfsError::Unsupported);
+        }
+        let fd_num = (inode - 3000) as usize;
+        let pid = crate::proc::current_pid();
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        let proc = procs
+            .iter()
+            .find(|p| p.pid == pid)
+            .ok_or(VfsError::NotFound)?;
+        let fd = proc
+            .file_descriptors
+            .get(fd_num)
+            .and_then(|slot| slot.as_ref())
+            .ok_or(VfsError::NotFound)?;
+        if fd.open_path.is_empty() {
+            // Anonymous fd (pipe, eventfd, socket): synthesise a stable
+            // name so callers that only need uniqueness still succeed.
+            return Ok(alloc::format!("/dev/fd/{}", fd_num));
+        }
+        Ok(fd.open_path.clone())
     }
 }
 
