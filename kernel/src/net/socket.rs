@@ -114,6 +114,10 @@ pub fn socket_getsockopt(id: u64, level: u64, optname: u64) -> u32 {
 }
 
 /// Bind a socket to a local port.
+///
+/// If `port == 0`, an ephemeral port is allocated from the IANA dynamic
+/// range (49152–65535) per RFC 6335 §6.  The caller can retrieve the
+/// chosen port via [`socket_local_addr`] (per `getsockname(2)`).
 pub fn socket_bind(id: u64, port: u16) -> Result<(), &'static str> {
     let mut sockets = SOCKETS.lock();
     let sock = sockets.iter_mut().find(|s| s.id == id)
@@ -123,19 +127,95 @@ pub fn socket_bind(id: u64, port: u16) -> Result<(), &'static str> {
         return Err("already bound");
     }
 
+    let actual_port = if port == 0 {
+        // Allocate an ephemeral port.  Try up to MAX_TRIES candidates
+        // before giving up — covers the case where the dynamic range is
+        // densely populated with bound sockets.
+        const MAX_TRIES: u16 = 1024;
+        let mut found: Option<u16> = None;
+        for _ in 0..MAX_TRIES {
+            let candidate = NEXT_EPHEMERAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            // Wrap from 65535 back to 49152.
+            let candidate = if candidate < 49152 {
+                NEXT_EPHEMERAL.store(49153, core::sync::atomic::Ordering::Relaxed);
+                49152
+            } else {
+                candidate
+            };
+            // Probe: is this port already bound on this socket type?
+            let collision = match sock.socket_type {
+                SocketType::Udp => super::udp::is_bound(candidate),
+                SocketType::Tcp => super::tcp::is_listening(candidate),
+            };
+            if !collision { found = Some(candidate); break; }
+        }
+        found.ok_or("no ephemeral port available")?
+    } else {
+        port
+    };
+
     match sock.socket_type {
         SocketType::Udp => {
             // Bind will be done on first recv.
-            super::udp::bind(port)?;
+            super::udp::bind(actual_port)?;
         }
         SocketType::Tcp => {
-            super::tcp::listen(port)?;
+            super::tcp::listen(actual_port)?;
         }
     }
 
-    sock.local_port = port;
+    sock.local_port = actual_port;
     sock.bound = true;
     Ok(())
+}
+
+/// Ephemeral-port allocator for bind(port=0) — IANA dynamic range
+/// 49152–65535 (RFC 6335 §6).  Wraps when exhausted.
+static NEXT_EPHEMERAL: core::sync::atomic::AtomicU16 =
+    core::sync::atomic::AtomicU16::new(49152);
+
+/// Look up a socket's bound 4-tuple for `getsockname(2)`.
+///
+/// Returns `(local_ip, local_port)` when the socket is bound, else
+/// returns `(0.0.0.0, 0)` — POSIX permits a zeroed reply for an
+/// unbound or unspecified-address socket per IEEE 1003.1.
+///
+/// For TCP, the local IP is read from the underlying TCB (which records
+/// the actual bound source IP at listen()/connect() time); for UDP we
+/// fall back to the host's primary IPv4 address.  Listeners bound with
+/// INADDR_ANY appear as `0.0.0.0:port`.
+pub fn socket_local_addr(id: u64) -> (Ipv4Address, u16) {
+    let sockets = SOCKETS.lock();
+    let sock = match sockets.iter().find(|s| s.id == id) {
+        Some(s) => s,
+        None => return ([0; 4], 0),
+    };
+    if !sock.bound {
+        return ([0; 4], 0);
+    }
+    let port = sock.local_port;
+    let socket_type = sock.socket_type;
+    drop(sockets);
+
+    let ip = match socket_type {
+        SocketType::Tcp => super::tcp::lookup_local_ip(port).unwrap_or([0; 4]),
+        SocketType::Udp => super::our_ip(),
+    };
+    (ip, port)
+}
+
+/// Look up a socket's connected peer 4-tuple for `getpeername(2)`.
+///
+/// Returns `Some((remote_ip, remote_port))` only when the socket is
+/// connected; otherwise returns `None` (the caller should report
+/// `ENOTCONN` per IEEE 1003.1 §getpeername).
+pub fn socket_peer_addr(id: u64) -> Option<(Ipv4Address, u16)> {
+    let sockets = SOCKETS.lock();
+    let sock = sockets.iter().find(|s| s.id == id)?;
+    if !sock.connected {
+        return None;
+    }
+    Some((sock.remote_ip, sock.remote_port))
 }
 
 /// Send data through a socket.

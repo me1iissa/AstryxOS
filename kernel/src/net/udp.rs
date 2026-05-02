@@ -99,6 +99,13 @@ pub fn has_data(port: u16) -> bool {
     bindings.iter().any(|b| b.port == port && !b.queue.is_empty())
 }
 
+/// Returns true if `port` already has a UDP binding.  Used by the
+/// ephemeral-port allocator to probe for collisions.
+pub fn is_bound(port: u16) -> bool {
+    let bindings = UDP_BINDINGS.lock();
+    bindings.iter().any(|b| b.port == port)
+}
+
 /// Unbind a UDP port.
 pub fn unbind(port: u16) {
     let mut bindings = UDP_BINDINGS.lock();
