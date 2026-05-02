@@ -12,7 +12,20 @@ Usage (one-shot, non-interactive):
                             [--native-tid <pid>]                    \
                             [--skip <name>[,<name>...]]             \
                             [--skip-enoent-prefix]                  \
+                            [--align-from NAME[:N]]                 \
+                            [--align-from-tail NAME[:N]]            \
+                            [--limit N]                             \
                             [--context N] [--debug]
+
+`--align-from NAME[:N]` and `--align-from-tail NAME[:N]` advance the
+alignment cursor on BOTH streams to the Nth (default 1st) occurrence of
+NAME — useful when both runs share a known synchronization marker
+(e.g. ``memfd_create:16`` to skip past the freeze-shmem dance) but the
+prologue is environment-divergent and would otherwise produce a noisy
+"first divergence" inside the linker probes.
+
+`--limit N` truncates the post-alignment streams to N calls each, so the
+diff focuses on a narrow window around a hypothesized divergence point.
 
 Output (stdout): JSON with keys
     summary.{linux_total_calls, astryxos_total_calls, aligned_calls,
@@ -321,6 +334,34 @@ def filter_skip(stream: List[Dict], skip: set) -> List[Dict]:
     return [c for c in stream if c["name"] not in skip]
 
 
+def _drop_until_nth(stream: List[Dict], name: str, n: int) -> Tuple[List[Dict], int]:
+    """Drop calls from the FRONT of `stream` up to and including the Nth
+    occurrence of `name`.  Returns (remainder, dropped_count).  If `name`
+    appears fewer than N times, returns an empty stream and the full count.
+    """
+    seen = 0
+    for i, c in enumerate(stream):
+        if c["name"] == name:
+            seen += 1
+            if seen == n:
+                return stream[i + 1:], i + 1
+    return [], len(stream)
+
+
+def _drop_until_nth_from_tail(stream: List[Dict], name: str, n: int) -> Tuple[List[Dict], int]:
+    """Drop calls from the FRONT of `stream` up to and including the Nth-
+    from-end occurrence of `name`.  When `n=1` this drops up to and
+    including the LAST occurrence.  When `n=2`, the second-to-last, etc.
+    """
+    seen = 0
+    for i in range(len(stream) - 1, -1, -1):
+        if stream[i]["name"] == name:
+            seen += 1
+            if seen == n:
+                return stream[i + 1:], i + 1
+    return [], len(stream)
+
+
 def classify_divergence(linux: Dict, astryx: Dict) -> str:
     if linux["nr"] != astryx["nr"]:
         return "missing_or_extra_call"
@@ -440,6 +481,23 @@ def main() -> int:
                          "different ld.so search-path layouts.")
     ap.add_argument("--context", type=int, default=5,
                     help="Number of preceding calls to include in output (5).")
+    ap.add_argument("--align-from", default=None,
+                    help="Align by skipping both streams forward to the Nth "
+                         "occurrence of NAME, where the value is "
+                         "'NAME[:N]' (default N=1).  Useful to skip past "
+                         "linker prologue and start the diff at a known "
+                         "synchronization point (e.g. memfd_create:16).")
+    ap.add_argument("--align-from-tail", default=None,
+                    help="Align by trimming both streams *back* to the Nth "
+                         "occurrence of NAME, then forward-walking from "
+                         "there. 'NAME[:N]' — N counts from the END of each "
+                         "stream (default N=1, i.e. the last occurrence).  "
+                         "Useful to focus diff on the divergence region "
+                         "immediately preceding a known plateau marker.")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="If set, only diff at most this many calls past "
+                         "the alignment point on EACH stream.  Helpful to "
+                         "isolate a specific window around a divergence.")
     ap.add_argument("--debug", action="store_true",
                     help="Emit a side-by-side TSV-style debug table of the "
                          "first 200 aligned calls, in result['debug'].")
@@ -464,6 +522,27 @@ def main() -> int:
         native = filter_skip(native, skip)
         astryx = filter_skip(astryx, skip)
 
+    align_from_dropped = {"linux": 0, "astryxos": 0}
+    if args.align_from:
+        align_name, _, n_str = args.align_from.partition(":")
+        n = int(n_str) if n_str else 1
+        native, dropped_n = _drop_until_nth(native, align_name, n)
+        astryx, dropped_a = _drop_until_nth(astryx, align_name, n)
+        align_from_dropped["linux"] = dropped_n
+        align_from_dropped["astryxos"] = dropped_a
+
+    if args.align_from_tail:
+        align_name, _, n_str = args.align_from_tail.partition(":")
+        n = int(n_str) if n_str else 1
+        native, dropped_n = _drop_until_nth_from_tail(native, align_name, n)
+        astryx, dropped_a = _drop_until_nth_from_tail(astryx, align_name, n)
+        align_from_dropped["linux"] += dropped_n
+        align_from_dropped["astryxos"] += dropped_a
+
+    if args.limit is not None and args.limit >= 0:
+        native = native[: args.limit]
+        astryx = astryx[: args.limit]
+
     result = diff_streams(native, astryx, context=args.context)
     result["meta"] = {
         "native_file":       str(main_file),
@@ -474,6 +553,10 @@ def main() -> int:
         "enoent_prefix_dropped": enoent_dropped,
         "skip_enoent_probes": args.skip_enoent_probes,
         "enoent_probes_dropped": enoent_probe_dropped,
+        "align_from":        args.align_from,
+        "align_from_tail":   args.align_from_tail,
+        "align_from_dropped": align_from_dropped,
+        "limit":             args.limit,
     }
     if args.debug:
         n = min(200, len(native), len(astryx))
