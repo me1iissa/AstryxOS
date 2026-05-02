@@ -4497,10 +4497,20 @@ pub fn sys_futex_linux(
 
             let tid = crate::proc::current_tid();
             #[cfg(feature = "firefox-test")]
-            crate::serial_println!(
-                "[FUTEX_WAIT_REG] tid={} pid={} uaddr={:#x} val={} op={:#x}",
-                tid, pid, uaddr, val, futex_op
-            );
+            {
+                // Capture the user-mode call site of this futex_wait directly
+                // from the trap frame: gives the harness per-tid leaf frame
+                // info without needing a kdb round-trip (which is fragile under
+                // SLIRP hostfwd).  RBP supports a four-deep rbp-chain walk
+                // when paired with the [FFTEST/mmap-so] table.
+                let user_rip = unsafe { crate::syscall::get_user_rip() };
+                let (user_rsp, user_rbp) = crate::syscall::get_user_rsp_rbp();
+                crate::serial_println!(
+                    "[FUTEX_WAIT_REG] tid={} pid={} uaddr={:#x} val={} op={:#x} \
+                     rip={:#x} rsp={:#x} rbp={:#x}",
+                    tid, pid, uaddr, val, futex_op, user_rip, user_rsp, user_rbp
+                );
+            }
             {
                 let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
                 waiters.entry((pid, uaddr)).or_insert_with(Vec::new).push(tid);
