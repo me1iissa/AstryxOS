@@ -1626,9 +1626,8 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
     raise ValueError(f"unknown kdb op: {op}")
 
 
-def _kdb_call(port: int, req: dict, timeout: float = 5.0) -> dict:
-    """One-shot kdb call.  Connects, sends one JSON line, reads one line back,
-    closes.  Returns the parsed response (or raises on connect/IO failure)."""
+def _kdb_recv(port: int, req: dict, timeout: float = 5.0) -> bytes:
+    """Send one JSON kdb request, return the raw response bytes."""
     payload = (json.dumps(req) + "\n").encode("utf-8")
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
@@ -1643,7 +1642,15 @@ def _kdb_call(port: int, req: dict, timeout: float = 5.0) -> dict:
             if len(buf) > 128 * 1024: break
     finally:
         s.close()
-    return json.loads(buf.strip().decode("utf-8", errors="replace"))
+    return buf
+
+
+def _kdb_call(port: int, req: dict, timeout: float = 5.0) -> dict:
+    """One-shot kdb call.  Connects, sends one JSON line, reads one line back,
+    closes.  Returns the parsed response.  For diagnostic access to the raw
+    bytes (e.g. to surface them in a malformed-response error), use
+    `_kdb_recv` and `json.loads` separately."""
+    return json.loads(_kdb_recv(port, req, timeout).strip().decode("utf-8", errors="replace"))
 
 
 def cmd_kdb(args):
@@ -1660,12 +1667,15 @@ def cmd_kdb(args):
 
     timeout = float(getattr(args, "timeout", 5.0) or 5.0)
     try:
-        resp = _kdb_call(port, req, timeout=timeout)
+        raw = _kdb_recv(port, req, timeout=timeout)
     except (socket.timeout, ConnectionRefusedError, OSError) as e:
         _out({"error": f"kdb connect/io failed on 127.0.0.1:{port}: {e}"})
         sys.exit(1)
+    try:
+        resp = json.loads(raw.strip().decode("utf-8", errors="replace"))
     except (json.JSONDecodeError, ValueError) as e:
-        _out({"error": f"malformed response: {e}"})
+        _out({"error": f"malformed response: {e}",
+              "raw": raw.decode(errors="replace")})
         sys.exit(1)
 
     # Mirror to ~/.astryx-harness/<sid>.kdb.json (best-effort).

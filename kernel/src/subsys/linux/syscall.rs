@@ -4503,6 +4503,12 @@ pub fn sys_futex_linux(
                 // info without needing a kdb round-trip (which is fragile under
                 // SLIRP hostfwd).  RBP supports a four-deep rbp-chain walk
                 // when paired with the [FFTEST/mmap-so] table.
+                //
+                // Both helpers read only from the per-CPU PER_CPU_SYSCALL
+                // array populated by syscall_entry — no user-memory deref
+                // happens here, so the read cannot fault.  `get_user_rsp_rbp`
+                // returns (0, 0) when the saved frame_rsp is zero, so a
+                // non-syscall caller would degrade cleanly.
                 let user_rip = unsafe { crate::syscall::get_user_rip() };
                 let (user_rsp, user_rbp) = crate::syscall::get_user_rsp_rbp();
                 crate::serial_println!(
