@@ -721,14 +721,20 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
 
         // For file-backed VMAs we must drop the PROCESS_TABLE lock before
         // accessing the VFS (which takes MOUNTS), so extract the info first.
+        // We also capture MAP_SHARED here: a writable MAP_SHARED file mapping
+        // must alias the cache page directly (so other mappers see writes —
+        // posix mmap(2) MAP_SHARED contract).  MAP_PRIVATE writable mappings
+        // get the per-process COW copy that protects the cache from GOT/PLT
+        // relocations bleeding between independent loads of the same .so.
         let file_info = match &vma.backing {
             crate::mm::vma::VmBacking::File { mount_idx, inode, offset } => {
-                Some((*mount_idx, *inode, *offset, vma.base, vma.base + vma.length))
+                let is_shared = vma.flags & crate::mm::vma::MAP_SHARED != 0;
+                Some((*mount_idx, *inode, *offset, vma.base, vma.base + vma.length, is_shared))
             }
             _ => None,
         };
 
-        if let Some((mount_idx, inode, file_base_offset, vma_base, vma_end)) = file_info {
+        if let Some((mount_idx, inode, file_base_offset, vma_base, vma_end, is_shared)) = file_info {
             // Release PROCESS_TABLE to avoid deadlock with MOUNTS.
             drop(procs);
 
@@ -781,8 +787,18 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 // writes (e.g., GOT/PLT relocations) don't corrupt the shared
                 // cache page. Without this, a second process loading the same
                 // library sees PID 1's relocated pointers as garbage.
+                //
+                // MAP_SHARED + writable: per mmap(2), writes through the
+                // mapping must be visible to all other mappings of the same
+                // file region.  Aliasing the cache page directly satisfies
+                // the contract — a subsequent MAP_SHARED|PROT_READ mapping of
+                // the same inode/offset hits the same cache frame and sees
+                // the writes.  Mozilla's freeze-shmem dance (memfd_create →
+                // ftruncate → MAP_SHARED|RW write → seal → MAP_SHARED|RO
+                // read in the same process) depends on this aliasing.
                 let is_writable = page_flags & crate::mm::vmm::PAGE_WRITABLE != 0;
-                if is_writable {
+                let needs_private_copy = is_writable && !is_shared;
+                if needs_private_copy {
                     if let Some(private_phys) = crate::mm::pmm::alloc_page() {
                         const COW_OFF: u64 = 0xFFFF_8000_0000_0000;
                         unsafe {
@@ -802,7 +818,9 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         crate::mm::vmm::invlpg(page_addr);
                     }
                 } else {
-                    // Read-only: share the cached page directly
+                    // MAP_SHARED writable, or any read-only mapping: alias
+                    // the cache page directly so writes are visible to other
+                    // mappers and reads see the latest content.
                     crate::mm::refcount::page_ref_inc(cached_phys);
                     crate::mm::vmm::map_page_in(cr3, page_addr, cached_phys, page_flags);
                     crate::mm::vmm::invlpg(page_addr);
@@ -917,26 +935,41 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 }
             }
 
-            // Map all readahead pages and insert into cache.
-            // IMPORTANT: for MAP_PRIVATE writable VMAs (e.g. .data/.bss of shared libs),
-            // the cache page must stay CLEAN (original file content) so that future
-            // processes get unmodified file data. We insert the clean frame into the
-            // cache and give each writable mapping a PRIVATE COPY, exactly as the
-            // cache-hit path does. Without this, ld-linux's GOT relocations would write
-            // into the shared cache page, corrupting it for every subsequent process
-            // that loads the same library (observed crash: cpp_hello sees glibc_hello's
-            // relocated pointers in libc's .dynamic section).
+            // Map all readahead pages and insert into cache.  Three regimes
+            // need to be distinguished and the per-arm logic below must match
+            // the cache-hit path (lines ~786-820):
+            //
+            // - MAP_PRIVATE + writable: give the process a private COPY of
+            //   the cache page so its writes (GOT relocations, BSS init, etc.)
+            //   don't corrupt the cache for parallel loaders of the same .so.
+            //   Without this, ld-linux's GOT relocations would observably
+            //   poison subsequent processes (cpp_hello saw glibc_hello's
+            //   relocated pointers in libc's .dynamic section).
+            // - MAP_SHARED + writable: ALIAS the cache page so that writes
+            //   are visible to other mappers of the same (mount,inode,off).
+            //   Required by mmap(2)'s MAP_SHARED contract; Mozilla's
+            //   freeze-shmem dance (rw-then-ro re-mmap of a memfd) breaks
+            //   silently if violated.
+            // - Read-only mappings (private or shared): alias the cache page;
+            //   no write visibility question and aliasing saves memory.
             const PHYS_COW: u64 = 0xFFFF_8000_0000_0000;
             let is_writable_vma = page_flags & crate::mm::vmm::PAGE_WRITABLE != 0;
+            let needs_private_copy_vma = is_writable_vma && !is_shared;
             let mapped_faulting = n_pages > 0;
             for i in 0..n_pages {
                 let (vaddr, phys, foff) = pages_to_map[i];
                 // Always insert the clean page into the shared cache.
                 crate::mm::cache::insert(mount_idx, inode, foff, phys);
-                // For writable VMAs: give this process a private copy so writes
-                // (GOT relocations, BSS init, etc.) don't corrupt the cache page.
-                // For read-only VMAs: share the cache page directly (saves memory).
-                if is_writable_vma {
+                // MAP_PRIVATE + writable: give this process a private copy so
+                // writes (GOT relocations, BSS init, etc.) don't corrupt the
+                // cache page (which a parallel loader of the same .so still
+                // expects to be the unrelocated file contents).
+                //
+                // MAP_SHARED + writable: alias the cache page so writes are
+                // visible to other mappers — required by mmap(2) MAP_SHARED.
+                //
+                // Read-only VMAs: alias the cache page (saves memory).
+                if needs_private_copy_vma {
                     if let Some(private_phys) = crate::mm::pmm::alloc_page() {
                         unsafe {
                             core::ptr::copy_nonoverlapping(
@@ -953,7 +986,8 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         crate::mm::vmm::map_page_in(cr3, vaddr, phys, page_flags);
                     }
                 } else {
-                    // Read-only: share the cache page (safe — no writes expected).
+                    // MAP_SHARED writable, or any read-only mapping: alias
+                    // the cache page directly.
                     crate::mm::refcount::page_ref_inc(phys);
                     crate::mm::vmm::map_page_in(cr3, vaddr, phys, page_flags);
                 }
@@ -1025,6 +1059,14 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     let _ = fs.read(inode, file_page_offset, buf);
                 }
                 crate::mm::cache::insert(mount_idx, inode, file_page_offset, phys);
+                // Single-page fallback always aliases the cache frame
+                // regardless of MAP_SHARED / MAP_PRIVATE.  This is correct
+                // for MAP_SHARED + writable and read-only mappings; for
+                // MAP_PRIVATE + writable it is the same lossy behaviour
+                // the OOM-fallback arm in the readahead path exhibits when
+                // alloc_page() returns None (the comment at line ~983
+                // documents the consequence).  Pre-fix behaviour, left
+                // unchanged.
                 crate::mm::refcount::page_ref_inc(phys);
                 crate::mm::vmm::map_page_in(cr3, page_addr, phys, page_flags);
                 crate::mm::vmm::invlpg(page_addr);
