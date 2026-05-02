@@ -3,6 +3,9 @@
 //! Handles CPU exceptions and hardware interrupts.
 //! Supports IST (Interrupt Stack Table) for critical exceptions.
 
+extern crate alloc;
+
+use alloc::sync::Arc;
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Once;
@@ -865,46 +868,54 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
             // below decide between spin-yield and graceful retry.  The
             // skipped readahead is not a correctness loss — it merely
             // forfeits the I/O batching opportunity for this one fault.
-            if let Some(mounts) = crate::vfs::MOUNTS.try_lock() {
-                if mount_idx < mounts.len() {
-                    // Get file size to bound readahead
-                    let file_size = mounts[mount_idx].fs.stat(inode)
-                        .map(|s| s.size).unwrap_or(0);
+            // Snapshot the FS handle once and drop MOUNTS before any FS
+            // dispatch.  Holding MOUNTS across `stat`/`read` re-introduces
+            // the cross-CPU hazard PR #81 closed *and* the same-thread
+            // hazard issue #82 closed.  Once the Arc is cloned out, the
+            // FS object stays alive even if another CPU racily umounts.
+            let fs_opt: Option<Arc<dyn crate::vfs::FileSystemOps>> = {
+                if let Some(mounts) = crate::vfs::MOUNTS.try_lock() {
+                    mounts.get(mount_idx).map(|m| m.fs.clone())
+                } else {
+                    // Contended: skip readahead entirely (lost batching, not
+                    // correctness — the single-page fallback below will
+                    // handle the faulting page).
+                    None
+                }
+            };
+            if let Some(fs) = fs_opt {
+                let file_size = fs.stat(inode).map(|s| s.size).unwrap_or(0);
 
-                    for pg_idx in 0..READAHEAD_PAGES {
-                        let vaddr = page_addr + pg_idx * 0x1000;
-                        let foff = file_page_offset + pg_idx * 0x1000;
-                        // Don't readahead past VMA boundary (different VMAs may have different permissions)
-                        if vaddr >= vma_end { break; }
-                        // Don't read past end of file
-                        if foff >= file_size { break; }
-                        // Don't readahead pages that are already cached/mapped
-                        if pg_idx > 0 {
-                            if crate::mm::cache::lookup(mount_idx, inode, foff).is_some() { continue; }
-                            // Check if already mapped in PTE
-                            let existing = crate::mm::vmm::read_pte(cr3, vaddr);
-                            if existing & 1 != 0 { continue; } // already present
+                for pg_idx in 0..READAHEAD_PAGES {
+                    let vaddr = page_addr + pg_idx * 0x1000;
+                    let foff = file_page_offset + pg_idx * 0x1000;
+                    // Don't readahead past VMA boundary (different VMAs may have different permissions)
+                    if vaddr >= vma_end { break; }
+                    // Don't read past end of file
+                    if foff >= file_size { break; }
+                    // Don't readahead pages that are already cached/mapped
+                    if pg_idx > 0 {
+                        if crate::mm::cache::lookup(mount_idx, inode, foff).is_some() { continue; }
+                        // Check if already mapped in PTE
+                        let existing = crate::mm::vmm::read_pte(cr3, vaddr);
+                        if existing & 1 != 0 { continue; } // already present
+                    }
+                    if let Some(phys) = crate::mm::pmm::alloc_page() {
+                        unsafe {
+                            core::ptr::write_bytes((PHYS_OFF_FILE + phys) as *mut u8, 0, 0x1000);
                         }
-                        if let Some(phys) = crate::mm::pmm::alloc_page() {
-                            unsafe {
-                                core::ptr::write_bytes((PHYS_OFF_FILE + phys) as *mut u8, 0, 0x1000);
-                            }
-                            let buf = unsafe {
-                                core::slice::from_raw_parts_mut(
-                                    (PHYS_OFF_FILE + phys) as *mut u8, 0x1000)
-                            };
-                            let _ = mounts[mount_idx].fs.read(inode, foff, buf);
-                            pages_to_map[n_pages] = (vaddr, phys, foff);
-                            n_pages += 1;
-                        } else {
-                            break; // OOM — stop readahead
-                        }
+                        let buf = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                (PHYS_OFF_FILE + phys) as *mut u8, 0x1000)
+                        };
+                        let _ = fs.read(inode, foff, buf);
+                        pages_to_map[n_pages] = (vaddr, phys, foff);
+                        n_pages += 1;
+                    } else {
+                        break; // OOM — stop readahead
                     }
                 }
             }
-            // (Else: MOUNTS is held by another path on this or another CPU.
-            // Fall through with n_pages == 0 — the single-page fallback
-            // handles the faulting page on its own.)
 
             // Map all readahead pages and insert into cache.
             // IMPORTANT: for MAP_PRIVATE writable VMAs (e.g. .data/.bss of shared libs),
@@ -970,49 +981,48 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 unsafe {
                     core::ptr::write_bytes((PHYS_OFF_FILE + phys) as *mut u8, 0, 0x1000);
                 }
-                // Recursive-lock hazard avoidance (closes #78, mirrors the
-                // readahead site above and the PROCESS_TABLE fix from PR
-                // #77).  A blocking `MOUNTS.lock()` here triggers the same
-                // self-deadlock pattern: the PF handler runs after another
-                // VFS path has taken `MOUNTS` and faulted on its user
-                // buffer.  Returning `false` from the page-fault handler
-                // is treated as a fatal fault by the dispatch site (see
-                // line ~325), so we cannot drop the request — instead we
-                // spin-yield with interrupts enabled until the lock is
-                // free.  Interrupts were re-enabled at the top of the
-                // file-backed path (so the timer can preempt this CPU and
-                // let the lock holder make progress on another CPU), and
-                // no other lock is held here, so the spin is safe.
-                let mut spin_iters: u64 = 0;
-                loop {
+                // Snapshot the FS handle out of MOUNTS (one short critical
+                // section) and dispatch the read with the lock released.
+                // This is the fix for issues #78 (cross-CPU contention) and
+                // #82 (same-thread recursion when the FS read itself faults
+                // on a kernel buffer): once we hold an Arc, the FS object
+                // is alive without us blocking any other CPU and without
+                // re-entering MOUNTS from the nested PF handler.
+                //
+                // If MOUNTS happens to be momentarily contended we spin
+                // briefly; cross-CPU contention is bounded because no FS
+                // dispatches happen under the lock anymore — only the Arc
+                // clone, which is a couple of atomic ops.
+                let mut spin_iters: u32 = 0;
+                const SPIN_BOUND: u32 = 1 << 24;
+                let fs_opt: Option<Arc<dyn crate::vfs::FileSystemOps>> = loop {
                     if let Some(mounts) = crate::vfs::MOUNTS.try_lock() {
-                        if mount_idx < mounts.len() {
-                            let buf = unsafe {
-                                core::slice::from_raw_parts_mut(
-                                    (PHYS_OFF_FILE + phys) as *mut u8, 0x1000)
-                            };
-                            let _ = mounts[mount_idx].fs.read(inode, file_page_offset, buf);
-                        }
-                        break;
+                        break mounts.get(mount_idx).map(|m| m.fs.clone());
                     }
-                    // Spin hint: let the holder make forward progress
-                    // before we attempt the lock again.  `pause` cooperates
-                    // with the CPU's branch-predictor / store-buffer to
-                    // reduce contention overhead on x86.
                     core::hint::spin_loop();
                     spin_iters += 1;
-                    // Diagnostic: a long spin almost certainly means same-CPU
-                    // recursion (the holder cannot make progress because it
-                    // is this thread).  Emit one log line then continue —
-                    // the watchdog will eventually fire if it really is
-                    // wedged, but the line gives us a head-start on triage.
-                    if spin_iters == 1 << 20 {
+                    // Bounded spin (defence-in-depth): if a non-VFS callsite
+                    // ever holds MOUNTS across an FS dispatch and the FS
+                    // dispatch faults on a kernel buffer, the same-thread
+                    // recursion would wedge here.  Drop the page rather than
+                    // wedge — `cache::insert` and the map_page_in below will
+                    // skip on the None path.
+                    if spin_iters >= SPIN_BOUND {
                         crate::serial_println!(
-                            "[PF] MOUNTS spin >1M iters faulting_addr={:#x} rip={:#x} \
-                             — likely same-thread recursion (see Phase 8)",
+                            "[PF] MOUNTS spin exceeded bound at faulting_addr={:#x} \
+                             rip={:#x} — leaving page unread (likely same-thread \
+                             MOUNTS recursion outside vfs::*; see #82 follow-up)",
                             faulting_addr, _frame.rip,
                         );
+                        break None;
                     }
+                };
+                if let Some(fs) = fs_opt {
+                    let buf = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            (PHYS_OFF_FILE + phys) as *mut u8, 0x1000)
+                    };
+                    let _ = fs.read(inode, file_page_offset, buf);
                 }
                 crate::mm::cache::insert(mount_idx, inode, file_page_offset, phys);
                 crate::mm::refcount::page_ref_inc(phys);

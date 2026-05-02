@@ -102,12 +102,19 @@ pub fn prepopulate_file(path: &str) -> usize {
         Ok(r) => r,
         Err(_) => return 0,
     };
-    let file_size = {
+    // Snapshot the FS handle and drop MOUNTS before any FS dispatch:
+    // stat/read here could fault on the chunk buffer's kernel pages and
+    // re-enter the PF handler, which itself needs MOUNTS (#82).
+    let fs: alloc::sync::Arc<dyn vfs::FileSystemOps> = {
         let mounts = vfs::MOUNTS.lock();
-        match mounts[mount_idx].fs.stat(inode) {
-            Ok(s) => s.size,
-            Err(_) => return 0,
+        match mounts.get(mount_idx) {
+            Some(m) => m.fs.clone(),
+            None => return 0,
         }
+    };
+    let file_size = match fs.stat(inode) {
+        Ok(s) => s.size,
+        Err(_) => return 0,
     };
 
     let page_size = crate::mm::pmm::PAGE_SIZE as u64;
@@ -158,12 +165,10 @@ pub fn prepopulate_file(path: &str) -> usize {
         // detects the contiguous cluster run, computes the matching disk
         // sector range, and issues large multi-sector block-device calls —
         // one virtio request per up-to-1 MiB-aligned segment of the burst.
+        // (`fs` was snapshotted above; MOUNTS is not held during the read.)
         let read_buf = &mut chunk_buf[..this_chunk];
-        {
-            let mounts = vfs::MOUNTS.lock();
-            if mounts[mount_idx].fs.read(inode, chunk_start, read_buf).is_err() {
-                break;
-            }
+        if fs.read(inode, chunk_start, read_buf).is_err() {
+            break;
         }
 
         // Split the chunk into 4 KiB pages, allocating a PMM frame for each
