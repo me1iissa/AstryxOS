@@ -2716,7 +2716,20 @@ def cmd_parked_tids(args):
 #   near_misses          for each parked_only uaddr, attempted uaddrs within
 #                        ±0x100 → Branch B: cond-var struct relocated.
 #
-# Output: `{branch:"A"|"B"|"mixed", parked_only:[...],
+# Branch classification (downstream automation should rely on these exact
+# rules — the prose summary in any commit/PR text may be looser):
+#
+#   "A"     n_parked > 0 AND n_matched == 0 AND no near_misses
+#           — no wake ever reaches a parked uaddr or any neighbour
+#   "B"     near_misses present AND n_matched == 0
+#           — wakes go to addresses adjacent to parked uaddrs but never
+#             directly hit them; cond-var-relocation pattern
+#   "none"  n_parked == 0
+#           — nothing parked; this snapshot doesn't show a missing-wake bug
+#   "mixed" otherwise (any combination not covered above; in particular
+#           any non-empty matched_set falls here)
+#
+# Output: `{branch:"A"|"B"|"none"|"mixed", parked_only:[...],
 #           attempted_and_matched:[...], near_misses:[...]}`
 _FUTEX_WAKE_REQ_RE = re.compile(
     r"\[FUTEX_WAKE_REQ\] tid=(\d+) pid=(\d+) uaddr=(0x[0-9a-fA-F]+) "
