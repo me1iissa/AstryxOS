@@ -104,6 +104,36 @@ pub(crate) fn read_user_argv(ptr: u64) -> alloc::vec::Vec<alloc::string::String>
     result
 }
 
+/// Marshal a Linux `struct sockaddr_in` into a user buffer for
+/// `getsockname(2)` / `getpeername(2)`.
+///
+/// Layout (16 bytes, network byte order for `sin_port`/`sin_addr`):
+///   off  0: sin_family   (u16, host order; AF_INET = 2)
+///   off  2: sin_port     (u16, BE)
+///   off  4: sin_addr     (4 × u8, BE)
+///   off  8: sin_zero     (8 × u8, must be zero per IEEE 1003.1)
+///
+/// Honours the in/out semantics of `addrlen`: writes at most `cap` bytes
+/// into the user buffer (truncation is permitted), then unconditionally
+/// writes the full struct size (16) back into `*addrlen` so callers can
+/// detect truncation.
+fn write_sockaddr_in(addr_ptr: u64, addrlen_ptr: *mut u32,
+                      ip: [u8; 4], port: u16, cap: usize) {
+    let mut buf = [0u8; 16];
+    buf[0] = 2;                              // sin_family lo (AF_INET)
+    buf[1] = 0;                              // sin_family hi
+    let p = port.to_be_bytes();
+    buf[2] = p[0]; buf[3] = p[1];            // sin_port
+    buf[4] = ip[0]; buf[5] = ip[1];
+    buf[6] = ip[2]; buf[7] = ip[3];          // sin_addr
+    // sin_zero already zero.
+    let n = cap.min(16);
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), addr_ptr as *mut u8, n);
+        core::ptr::write(addrlen_ptr, 16u32);
+    }
+}
+
 /// Dispatch a Linux x86_64 syscall.
 ///
 /// Maps Linux syscall numbers to AstryxOS handlers, handling differences
@@ -935,36 +965,82 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             }
         }
         // 51: getsockname(sockfd, addr, addrlen)
+        //
+        // Per IEEE 1003.1 §getsockname: writes the locally-bound 4-tuple
+        // for AF_INET sockets, or the bound path for AF_UNIX.  An unbound
+        // AF_INET socket reports 0.0.0.0:0 with success.  The caller's
+        // `*addrlen` is read as the buffer cap (truncation only) and on
+        // return holds the unmarshalled struct's full size.
         51 => {
             let pid = crate::proc::current_pid();
             let fd = arg1 as usize;
-            if !crate::syscall::is_socket_fd(pid, fd) { return -9; }
             let addr_ptr = arg2;
             let addrlen_ptr = arg3 as *mut u32;
-            if addr_ptr != 0 {
-                // Write sockaddr_in { AF_INET=2, port=0, addr=0.0.0.0 }
-                let out = unsafe { core::slice::from_raw_parts_mut(addr_ptr as *mut u8, 16) };
-                out.iter_mut().for_each(|b| *b = 0);
-                out[0] = 2; // AF_INET
+            if addr_ptr == 0 || addrlen_ptr.is_null() { return -22; }
+            let cap = unsafe { core::ptr::read(addrlen_ptr) } as usize;
+
+            if crate::syscall::is_unix_socket_fd(pid, fd) {
+                // AF_UNIX sockaddr_un — minimal: family=1, empty path.
+                // Suffices for socketpair() peers and unnamed sockets;
+                // bind()-ed paths could be plumbed through a unix
+                // accessor in a follow-on phase.
+                let want = 2usize;
+                let mut tmp = [0u8; 110];
+                tmp[0] = 1; // AF_UNIX
+                let n = cap.min(want);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(tmp.as_ptr(), addr_ptr as *mut u8, n);
+                    core::ptr::write(addrlen_ptr, want as u32);
+                }
+                return 0;
             }
-            if !addrlen_ptr.is_null() {
-                unsafe { core::ptr::write(addrlen_ptr, 16u32); }
-            }
+            if !crate::syscall::is_socket_fd(pid, fd) { return -9; }
+            let socket_id = crate::syscall::get_socket_id(pid, fd);
+            let (ip, port) = crate::net::socket::socket_local_addr(socket_id);
+            write_sockaddr_in(addr_ptr, addrlen_ptr, ip, port, cap);
             0
         }
-        // 52: getpeername(sockfd, addr, addrlen) — stub same as getsockname
+        // 52: getpeername(sockfd, addr, addrlen)
+        //
+        // Per IEEE 1003.1 §getpeername: writes the connected peer's
+        // 4-tuple, or returns ENOTCONN (-107) when the socket is not
+        // connected.  AF_UNIX peer reporting mirrors getsockname's
+        // unnamed-socket reply.
         52 => {
+            let pid = crate::proc::current_pid();
+            let fd = arg1 as usize;
             let addr_ptr = arg2;
             let addrlen_ptr = arg3 as *mut u32;
-            if addr_ptr != 0 {
-                let out = unsafe { core::slice::from_raw_parts_mut(addr_ptr as *mut u8, 16) };
-                out.iter_mut().for_each(|b| *b = 0);
-                out[0] = 2;
+            if addr_ptr == 0 || addrlen_ptr.is_null() { return -22; }
+            let cap = unsafe { core::ptr::read(addrlen_ptr) } as usize;
+
+            if crate::syscall::is_unix_socket_fd(pid, fd) {
+                // Unconnected AF_UNIX → ENOTCONN.  Connected AF_UNIX
+                // sockets without a bound path report family=1,
+                // empty path (matches Linux for unnamed peers).
+                let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
+                if crate::net::unix::state(unix_id) != crate::net::unix::UnixState::Connected {
+                    return -107; // ENOTCONN
+                }
+                let want = 2usize;
+                let mut tmp = [0u8; 110];
+                tmp[0] = 1;
+                let n = cap.min(want);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(tmp.as_ptr(), addr_ptr as *mut u8, n);
+                    core::ptr::write(addrlen_ptr, want as u32);
+                }
+                return 0;
             }
-            if !addrlen_ptr.is_null() {
-                unsafe { core::ptr::write(addrlen_ptr, 16u32); }
+            if !crate::syscall::is_socket_fd(pid, fd) { return -9; }
+            let socket_id = crate::syscall::get_socket_id(pid, fd);
+            match crate::net::socket::socket_peer_addr(socket_id) {
+                Some((ip, port)) => {
+                    write_sockaddr_in(addr_ptr, addrlen_ptr, ip, port, cap);
+                    0
+                }
+                None => -107, // ENOTCONN
             }
-            0
         }
         // 53: socketpair(domain, type, protocol, sv[2]) — AF_UNIX loopback pair
         53 => {

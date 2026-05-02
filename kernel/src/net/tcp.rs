@@ -691,6 +691,32 @@ pub fn get_state(port: u16) -> Option<TcpState> {
         .map(|c| c.state)
 }
 
+/// Returns true if any TCB on `port` is in the Listen state — used by
+/// the socket-layer ephemeral-port allocator to probe for collisions.
+pub fn is_listening(port: u16) -> bool {
+    TCP_CONNECTIONS.lock().iter()
+        .any(|c| c.local_port == port && c.state == TcpState::Listen)
+}
+
+/// Returns the bound `local_ip` recorded for a TCB on `port`, if any.
+/// Prefers an Established connection (a connect()ed socket) over a
+/// Listen entry, since the former carries the actual selected source
+/// IP for the connection.  Returns `None` if no TCB matches.
+///
+/// Used by `getsockname(2)` to reconstruct the bound 4-tuple.
+pub fn lookup_local_ip(port: u16) -> Option<Ipv4Address> {
+    let conns = TCP_CONNECTIONS.lock();
+    // Prefer Established (or any non-Listen) so getsockname on a
+    // connected socket reflects the connection's source IP, not the
+    // INADDR_ANY listener wildcard.
+    if let Some(c) = conns.iter().find(|c|
+        c.local_port == port && c.state != TcpState::Listen
+    ) {
+        return Some(c.local_ip);
+    }
+    conns.iter().find(|c| c.local_port == port).map(|c| c.local_ip)
+}
+
 pub fn retransmit_queue_len(port: u16) -> usize {
     TCP_CONNECTIONS.lock().iter()
         .find(|c| c.local_port == port)
