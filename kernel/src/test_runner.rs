@@ -1177,6 +1177,33 @@ pub fn run() -> ! {
     total += 1;
     if test_vdso_vvar_advances() { passed += 1; }
 
+    // ── Test 183: Loopback — UDP echo via 127.0.0.1 ──────────────────────
+
+    total += 1;
+    if test_loopback_udp_echo() { passed += 1; }
+
+    // ── Test 184: Loopback — TCP 3WHS via 127.0.0.1 (kdb only) ───────────
+    //
+    // Uses tcp::snapshot_connections, which is gated on the kdb feature
+    // because that's the build profile that pulls in the introspection
+    // surface used to assert connection state.
+
+    #[cfg(feature = "kdb")]
+    {
+        total += 1;
+        if test_loopback_tcp_handshake() { passed += 1; }
+    }
+
+    // ── Test 185: Loopback — 127/8 coverage and 128/8 rejection ──────────
+
+    total += 1;
+    if test_loopback_address_coverage() { passed += 1; }
+
+    // ── Test 186: Loopback — does not touch NIC TX path ──────────────────
+
+    total += 1;
+    if test_loopback_does_not_touch_nic() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -20152,6 +20179,257 @@ fn make_tcp_seg_with_payload(src_port: u16, dst_port: u16,
     s.push(0); s.push(0);
     s.extend_from_slice(payload);
     s
+}
+
+// ── Test 183: Loopback (lo) — UDP echo via 127.0.0.1 ─────────────────────────
+//
+// RFC 1122 §3.2.1.3 mandates that 127.0.0.0/8 traffic stays inside the host.
+// This test binds a UDP socket to a port, sends a datagram from a synthetic
+// peer (127.0.0.2 is a peer-equivalent within the loopback prefix) by feeding
+// it through the regular send path, runs the loopback drain, and asserts the
+// payload appears on the bound port.  Any escape onto the e1000/virtio-net
+// driver would be a kernel bug — the audit measured the live SLIRP path
+// silently dropping such traffic, hanging X11 / D-Bus.
+
+fn test_loopback_udp_echo() -> bool {
+    test_header!("Loopback (lo) — UDP echo via 127.0.0.1");
+
+    use crate::net::{udp, loopback};
+
+    const PORT: u16 = 17110;
+    const PAYLOAD: &[u8] = b"loopback udp roundtrip";
+
+    if let Err(e) = udp::bind(PORT) {
+        test_fail!("loopback_udp_echo", "bind({}) failed: {}", PORT, e);
+        return false;
+    }
+
+    let pkts_out_before = loopback::stats().1;
+
+    // Send to 127.0.0.1:PORT.  The IPv4 transmit path must short-circuit
+    // the datagram into the loopback queue rather than building an
+    // Ethernet frame.
+    udp::send([127, 0, 0, 1], 50001, PORT, PAYLOAD);
+
+    // Drain the deferred RX queue — feeds the IP packet back into
+    // ipv4::handle_ipv4 → udp::handle_udp → bound port queue.
+    crate::net::poll();
+
+    // Datagram should now be on the bound port.
+    let dg = match udp::recv(PORT) {
+        Some(d) => d,
+        None => {
+            udp::unbind(PORT);
+            test_fail!("loopback_udp_echo", "no datagram received on port {}", PORT);
+            return false;
+        }
+    };
+
+    if dg.data != PAYLOAD {
+        udp::unbind(PORT);
+        test_fail!("loopback_udp_echo",
+            "payload mismatch: got {} bytes, expected {}",
+            dg.data.len(), PAYLOAD.len());
+        return false;
+    }
+
+    if dg.src_ip[0] != 127 {
+        udp::unbind(PORT);
+        test_fail!("loopback_udp_echo",
+            "expected src in 127/8, got {}.{}.{}.{}",
+            dg.src_ip[0], dg.src_ip[1], dg.src_ip[2], dg.src_ip[3]);
+        return false;
+    }
+
+    let pkts_out_after = loopback::stats().1;
+    if pkts_out_after <= pkts_out_before {
+        udp::unbind(PORT);
+        test_fail!("loopback_udp_echo",
+            "loopback pkts_out did not advance ({} -> {}) — packet may have escaped",
+            pkts_out_before, pkts_out_after);
+        return false;
+    }
+
+    udp::unbind(PORT);
+    test_pass!("Loopback (lo) — UDP echo via 127.0.0.1");
+    true
+}
+
+// ── Test 184: Loopback (lo) — TCP 3WHS via 127.0.0.1 ──────────────────────────
+//
+// listen() on TCP/PORT, connect() from the same host to 127.0.0.1:PORT,
+// pump the loopback drain, and assert both sides reach Established with
+// matching 4-tuples.  The connecting side's SYN, the listener's SYN-ACK,
+// and the connector's final ACK must all traverse the loopback queue.
+
+#[cfg(feature = "kdb")]
+fn test_loopback_tcp_handshake() -> bool {
+    test_header!("Loopback (lo) — TCP 3WHS via 127.0.0.1");
+
+    use crate::net::{tcp, loopback};
+
+    const SERVER_PORT: u16 = 17111;
+    const LB_IP: [u8; 4] = [127, 0, 0, 1];
+
+    if let Err(e) = tcp::listen(SERVER_PORT) {
+        test_fail!("loopback_tcp_handshake", "listen({}) failed: {}", SERVER_PORT, e);
+        return false;
+    }
+
+    let pkts_out_before = loopback::stats().1;
+
+    let client_port = match tcp::connect(LB_IP, SERVER_PORT) {
+        Ok(p) => p,
+        Err(e) => {
+            test_fail!("loopback_tcp_handshake", "connect failed: {}", e);
+            return false;
+        }
+    };
+
+    // Drive the handshake to completion.  Each net::poll() drains
+    // outstanding loopback packets which may produce reply packets that
+    // are themselves enqueued for the next tick (SYN → SYN-ACK → ACK).
+    for _ in 0..6 {
+        crate::net::poll();
+    }
+
+    // Locate both TCBs.
+    let snap = tcp::snapshot_connections();
+    let client = snap.iter().find(|c|
+        c.local_port == client_port && c.remote_ip == LB_IP && c.remote_port == SERVER_PORT
+    );
+    let server = snap.iter().find(|c|
+        c.local_port == SERVER_PORT
+        && c.remote_ip[0] == 127
+        && c.remote_port == client_port
+    );
+
+    let client_state = client.map(|c| c.state);
+    let server_state = server.map(|c| c.state);
+
+    if client_state != Some(tcp::TcpState::Established) {
+        test_fail!("loopback_tcp_handshake",
+            "client TCB not Established (got {:?})", client_state);
+        return false;
+    }
+    if server_state != Some(tcp::TcpState::Established) {
+        test_fail!("loopback_tcp_handshake",
+            "server child TCB not Established (got {:?})", server_state);
+        return false;
+    }
+
+    let pkts_out_after = loopback::stats().1;
+    if pkts_out_after <= pkts_out_before + 2 {
+        test_fail!("loopback_tcp_handshake",
+            "loopback pkts_out advanced only {} (expected >2)",
+            pkts_out_after - pkts_out_before);
+        return false;
+    }
+
+    test_println!("  client {:?}, server {:?}, lo pkts_out delta {} ✓",
+        client_state.unwrap(), server_state.unwrap(),
+        pkts_out_after - pkts_out_before);
+
+    test_pass!("Loopback (lo) — TCP 3WHS via 127.0.0.1");
+    true
+}
+
+// ── Test 185: Loopback (lo) — coverage of 127/8, rejects 128.0.0.1 ────────────
+//
+// Validates that is_loopback_addr matches every address in the prefix
+// (127.0.0.1, 127.0.0.2, 127.255.255.254) and rejects the first address
+// outside it (128.0.0.1).  Runs a UDP send on each loopback address and
+// checks that the loopback packet counter advances; 128.0.0.1 must NOT
+// enqueue (no DHCP, no route → dropped before the loopback path).
+
+fn test_loopback_address_coverage() -> bool {
+    test_header!("Loopback (lo) — 127/8 coverage and 128.0.0.0/8 rejection");
+
+    use crate::net::{udp, loopback};
+
+    let cases: [([u8; 4], bool); 4] = [
+        ([127, 0, 0, 1],         true),   // standard
+        ([127, 0, 0, 2],         true),   // alternate loopback
+        ([127, 255, 255, 254],   true),   // last usable in 127/8
+        ([128, 0, 0, 1],         false),  // outside the prefix
+    ];
+
+    for (addr, expect_loop) in cases.iter() {
+        let actual = loopback::is_loopback_addr(*addr);
+        if actual != *expect_loop {
+            test_fail!("loopback_addr_coverage",
+                "is_loopback_addr({}.{}.{}.{}) = {} (expected {})",
+                addr[0], addr[1], addr[2], addr[3], actual, *expect_loop);
+            return false;
+        }
+    }
+
+    // Now drive an actual datagram through 127.255.255.254 to confirm the
+    // tail of the prefix actually reaches the deferred queue.
+    const PORT: u16 = 17112;
+    const PAYLOAD: &[u8] = b"127.255.255.254 still loops";
+    if let Err(e) = udp::bind(PORT) {
+        test_fail!("loopback_addr_coverage", "bind: {}", e);
+        return false;
+    }
+    let before = loopback::stats().1;
+    udp::send([127, 255, 255, 254], 50002, PORT, PAYLOAD);
+    let after = loopback::stats().1;
+    if after != before + 1 {
+        udp::unbind(PORT);
+        test_fail!("loopback_addr_coverage",
+            "send to 127.255.255.254 did not enqueue (out delta {})", after - before);
+        return false;
+    }
+    crate::net::poll();
+    let dg = udp::recv(PORT);
+    udp::unbind(PORT);
+    if dg.is_none() || dg.as_ref().unwrap().data != PAYLOAD {
+        test_fail!("loopback_addr_coverage",
+            "127.255.255.254 datagram did not arrive at bound port");
+        return false;
+    }
+
+    test_pass!("Loopback (lo) — 127/8 coverage and 128.0.0.0/8 rejection");
+    true
+}
+
+// ── Test 186: Loopback (lo) — driver-bypass invariant ────────────────────────
+//
+// Sending to 127.0.0.1 must not increment the global NIC TX counter
+// (`crate::net::stats()` packets_tx field).  This is the structural
+// guarantee that loopback traffic stays out of the e1000/virtio-net
+// path.  Drives a UDP datagram and checks the global stat is unchanged
+// while the loopback stat advances.
+
+fn test_loopback_does_not_touch_nic() -> bool {
+    test_header!("Loopback (lo) — does not touch NIC TX path");
+
+    use crate::net::{udp, loopback};
+
+    let (_, nic_tx_before, _, _) = crate::net::stats();
+    let lo_out_before = loopback::stats().1;
+
+    udp::send([127, 0, 0, 1], 50003, 17113, b"do not escape");
+
+    let (_, nic_tx_after, _, _) = crate::net::stats();
+    let lo_out_after = loopback::stats().1;
+
+    if nic_tx_after != nic_tx_before {
+        test_fail!("loopback_no_nic",
+            "NIC TX counter advanced ({} -> {}) — loopback escaped to driver",
+            nic_tx_before, nic_tx_after);
+        return false;
+    }
+    if lo_out_after != lo_out_before + 1 {
+        test_fail!("loopback_no_nic",
+            "loopback TX counter did not advance ({} -> {})",
+            lo_out_before, lo_out_after);
+        return false;
+    }
+
+    test_pass!("Loopback (lo) — does not touch NIC TX path");
+    true
 }
 
 // ── Test 180: vDSO — AT_SYSINFO_EHDR set in auxv ────────────────────────────

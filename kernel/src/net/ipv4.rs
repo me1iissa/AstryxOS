@@ -67,9 +67,15 @@ pub fn handle_ipv4(data: &[u8]) {
         None => return,
     };
 
-    // Only accept packets addressed to us, broadcast, or when we have no IP yet (DHCP).
+    // Only accept packets addressed to us, broadcast, when we have no IP
+    // yet (DHCP), or destined for the loopback prefix 127.0.0.0/8 (RFC
+    // 1122 §3.2.1.3 — every host implicitly owns the entire 127/8 range).
     let our = our_ip();
-    if header.dst_ip != our && header.dst_ip != [255, 255, 255, 255] && our != [0, 0, 0, 0] {
+    if header.dst_ip != our
+        && header.dst_ip != [255, 255, 255, 255]
+        && our != [0, 0, 0, 0]
+        && !super::loopback::is_loopback_addr(header.dst_ip)
+    {
         return;
     }
 
@@ -110,6 +116,13 @@ pub fn send_ipv4_from(src_ip: Ipv4Address, dst_ip: Ipv4Address, dst_mac: MacAddr
     let total_length = 20 + payload.len();
     let mut packet = Vec::with_capacity(total_length);
 
+    // Per RFC 1122 §3.2.1.3, the loopback prefix never reaches the link
+    // layer — short-circuit it through the loopback pseudo-device even
+    // when a caller has supplied an explicit source address.  A non-127
+    // src_ip here would route the eventual reply out the physical NIC,
+    // so reflect the loopback dst into the source field.
+    let effective_src = if super::loopback::is_loopback_addr(dst_ip) { dst_ip } else { src_ip };
+
     packet.push(0x45);
     packet.push(0x00);
     packet.extend_from_slice(&(total_length as u16).to_be_bytes());
@@ -121,7 +134,7 @@ pub fn send_ipv4_from(src_ip: Ipv4Address, dst_ip: Ipv4Address, dst_mac: MacAddr
     packet.push(protocol);
     packet.push(0);
     packet.push(0);
-    packet.extend_from_slice(&src_ip);
+    packet.extend_from_slice(&effective_src);
     packet.extend_from_slice(&dst_ip);
 
     let cksum = checksum(&packet[..20]);
@@ -129,6 +142,11 @@ pub fn send_ipv4_from(src_ip: Ipv4Address, dst_ip: Ipv4Address, dst_mac: MacAddr
     packet[11] = (cksum & 0xFF) as u8;
 
     packet.extend_from_slice(payload);
+
+    if super::loopback::is_loopback_addr(dst_ip) {
+        super::loopback::enqueue(&packet);
+        return;
+    }
 
     let frame = build_frame(dst_mac, ETHERTYPE_IPV4, &packet);
     send_frame(&frame);
@@ -138,6 +156,18 @@ pub fn send_ipv4_from(src_ip: Ipv4Address, dst_ip: Ipv4Address, dst_mac: MacAddr
 pub fn send_ipv4(dst_ip: Ipv4Address, protocol: u8, payload: &[u8]) {
     let total_length = 20 + payload.len();
     let mut packet = Vec::with_capacity(total_length);
+
+    // Loopback short-circuit (RFC 1122 §3.2.1.3): packets destined for
+    // 127.0.0.0/8 must never escape onto the link.  Reflect the dst into
+    // the source field so the receiver's reply also addresses 127.x and
+    // re-enters the loopback pseudo-device — without this rewrite the
+    // peer would direct its reply to our globally-routable address and
+    // the SYN-ACK / ACK / data segments would be lost.
+    let src_ip = if super::loopback::is_loopback_addr(dst_ip) {
+        dst_ip
+    } else {
+        our_ip()
+    };
 
     // Version + IHL
     packet.push(0x45);
@@ -159,7 +189,7 @@ pub fn send_ipv4(dst_ip: Ipv4Address, protocol: u8, payload: &[u8]) {
     packet.push(0);
     packet.push(0);
     // Source IP
-    packet.extend_from_slice(&our_ip());
+    packet.extend_from_slice(&src_ip);
     // Destination IP
     packet.extend_from_slice(&dst_ip);
 
@@ -170,6 +200,11 @@ pub fn send_ipv4(dst_ip: Ipv4Address, protocol: u8, payload: &[u8]) {
 
     // Payload
     packet.extend_from_slice(payload);
+
+    if super::loopback::is_loopback_addr(dst_ip) {
+        super::loopback::enqueue(&packet);
+        return;
+    }
 
     // Determine destination MAC.
     let dst_mac = resolve_mac(dst_ip);

@@ -25,6 +25,7 @@ pub mod socket;
 pub mod dns;
 pub mod dhcp;
 pub mod unix;
+pub mod loopback;
 
 extern crate alloc;
 
@@ -155,6 +156,13 @@ pub fn send_frame(frame: &[u8]) {
 
 /// Poll for incoming packets from the NIC, and run TCP timers.
 pub fn poll() {
+    // Drain the loopback deferred-RX queue first so packets a syscall
+    // just enqueued (e.g. a connect() that synthesised a SYN to 127.x)
+    // are delivered before we sample the hardware RX ring.  The queue is
+    // drained-and-released, so a reply transmitted from within
+    // ipv4::handle_ipv4() that itself targets 127.x is re-queued and
+    // delivered on the next tick.
+    loopback::poll();
     if e1000::is_available() {
         e1000::poll_rx();
     } else {
