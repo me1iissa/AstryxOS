@@ -993,11 +993,29 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 // briefly; cross-CPU contention is bounded because no FS
                 // dispatches happen under the lock anymore — only the Arc
                 // clone, which is a couple of atomic ops.
+                let mut spin_iters: u32 = 0;
+                const SPIN_BOUND: u32 = 1 << 24;
                 let fs_opt: Option<Arc<dyn crate::vfs::FileSystemOps>> = loop {
                     if let Some(mounts) = crate::vfs::MOUNTS.try_lock() {
                         break mounts.get(mount_idx).map(|m| m.fs.clone());
                     }
                     core::hint::spin_loop();
+                    spin_iters += 1;
+                    // Bounded spin (defence-in-depth): if a non-VFS callsite
+                    // ever holds MOUNTS across an FS dispatch and the FS
+                    // dispatch faults on a kernel buffer, the same-thread
+                    // recursion would wedge here.  Drop the page rather than
+                    // wedge — `cache::insert` and the map_page_in below will
+                    // skip on the None path.
+                    if spin_iters >= SPIN_BOUND {
+                        crate::serial_println!(
+                            "[PF] MOUNTS spin exceeded bound at faulting_addr={:#x} \
+                             rip={:#x} — leaving page unread (likely same-thread \
+                             MOUNTS recursion outside vfs::*; see #82 follow-up)",
+                            faulting_addr, _frame.rip,
+                        );
+                        break None;
+                    }
                 };
                 if let Some(fs) = fs_opt {
                     let buf = unsafe {
