@@ -2699,6 +2699,174 @@ def cmd_parked_tids(args):
     })
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# wake-attempts — diff attempted-wake uaddrs against still-parked uaddrs
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Reads `[FUTEX_WAKE_REQ]` (every WAKE attempt at handler entry, regardless of
+# match) and `[FUTEX_WAIT_REG]` (every futex_wait registration) and classifies
+# the missing-wakeup mode:
+#
+#   parked_only          uaddr appears in WAIT_REG (latest per tid) but never in
+#                        WAKE_REQ → Branch A: wake call site never reached.
+#   attempted_and_matched uaddr in BOTH → wake handler ran but waiter wasn't
+#                        queued (race) or the kernel match logic differs.
+#   attempted_only       uaddr in WAKE_REQ only → diagnostic noise (already-
+#                        woken or pre-wait wake).
+#   near_misses          for each parked_only uaddr, attempted uaddrs within
+#                        ±0x100 → Branch B: cond-var struct relocated.
+#
+# Output: `{branch:"A"|"B"|"mixed", parked_only:[...],
+#           attempted_and_matched:[...], near_misses:[...]}`
+_FUTEX_WAKE_REQ_RE = re.compile(
+    r"\[FUTEX_WAKE_REQ\] tid=(\d+) pid=(\d+) uaddr=(0x[0-9a-fA-F]+) "
+    r"max=\d+ op=(0x[0-9a-fA-F]+) rip=(0x[0-9a-fA-F]+)"
+)
+
+def cmd_wake_attempts(args):
+    sess = _load_session(args.sid)
+    try:
+        lines = Path(sess["serial_log"]).read_text(errors="replace").splitlines()
+    except OSError as e:
+        _err(f"could not read serial log: {e}")
+    libs = _build_load_base_map(lines)
+    disk_root = getattr(args, "disk_root", None)
+
+    # Replicate parked-tids logic to derive the still-parked uaddr set.
+    last_reg: dict[int, dict] = {}
+    waked_uaddrs: set[str] = set()
+    attempted: dict[str, dict] = {}  # uaddr -> first-seen attempt sample
+    attempted_count: dict[str, int] = {}
+    for ln in lines:
+        m = _FUTEX_WAIT_REG_RICH.search(ln)
+        if m:
+            last_reg[int(m.group(1))] = {
+                "tid":   int(m.group(1)),
+                "uaddr": m.group(3),
+                "rip":   int(m.group(5), 16),
+            }
+            continue
+        w = _FUTEX_WAKE_RE.search(ln)
+        if w and int(w.group(2)) > 0:
+            waked_uaddrs.add(w.group(1))
+            continue
+        a = _FUTEX_WAKE_REQ_RE.search(ln)
+        if a:
+            ua = a.group(3)
+            attempted_count[ua] = attempted_count.get(ua, 0) + 1
+            if ua not in attempted:
+                attempted[ua] = {
+                    "uaddr": ua,
+                    "tid":   int(a.group(1)),
+                    "op":    a.group(4),
+                    "rip":   int(a.group(5), 16),
+                }
+
+    parked_uaddrs: dict[str, list[int]] = {}
+    for tid, r in last_reg.items():
+        if r["uaddr"] not in waked_uaddrs:
+            parked_uaddrs.setdefault(r["uaddr"], []).append(tid)
+
+    parked_set = set(parked_uaddrs.keys())
+    attempted_set = set(attempted.keys())
+
+    parked_only_set = parked_set - attempted_set
+    matched_set = parked_set & attempted_set
+    attempted_only_set = attempted_set - parked_set
+
+    def _att_row(ua: str) -> dict:
+        a = attempted[ua]
+        ur = _resolve_user_rip(a["rip"], libs, disk_root) if a["rip"] else None
+        return {
+            "uaddr":   ua,
+            "count":   attempted_count[ua],
+            "op":      a["op"],
+            "tid":     a["tid"],
+            "rip":     f"{a['rip']:#x}",
+            "library": (ur or {}).get("library"),
+            "symbol":  (ur or {}).get("symbol"),
+            "offset":  (ur or {}).get("offset"),
+        }
+
+    def _parked_row(ua: str) -> dict:
+        tids = parked_uaddrs[ua]
+        sample_tid = tids[0]
+        rip = last_reg[sample_tid]["rip"]
+        ur = _resolve_user_rip(rip, libs, disk_root) if rip else None
+        return {
+            "uaddr":   ua,
+            "tids":    sorted(tids),
+            "rip":     f"{rip:#x}",
+            "library": (ur or {}).get("library"),
+            "symbol":  (ur or {}).get("symbol"),
+            "offset":  (ur or {}).get("offset"),
+        }
+
+    # Branch B near-miss heuristic: glibc's __pthread_cond_broadcast may target
+    # a uaddr offset by a few bytes from the cond-var's wait-uaddr (cond-var
+    # struct layout — the seq counter sits adjacent to the futex word).  Scan
+    # ±0x100 for visual alignment with that pattern.
+    near_misses: list[dict] = []
+    parked_ints = {ua: int(ua, 16) for ua in parked_only_set}
+    attempted_ints = {ua: int(ua, 16) for ua in attempted_set}
+    for pua, pi in parked_ints.items():
+        nearby = []
+        for aua, ai in attempted_ints.items():
+            d = ai - pi
+            if -0x100 <= d <= 0x100 and d != 0:
+                nearby.append({"attempted_uaddr": aua, "delta": d,
+                               "count": attempted_count[aua]})
+        if nearby:
+            nearby.sort(key=lambda r: abs(r["delta"]))
+            near_misses.append({
+                "parked_uaddr": pua,
+                "parked_tids":  sorted(parked_uaddrs[pua]),
+                "nearby":       nearby[:8],
+            })
+
+    parked_only = sorted(
+        (_parked_row(ua) for ua in parked_only_set),
+        key=lambda r: -len(r["tids"]),
+    )
+    attempted_and_matched = sorted(
+        (_att_row(ua) for ua in matched_set),
+        key=lambda r: -r["count"],
+    )
+    attempted_only = sorted(
+        (_att_row(ua) for ua in attempted_only_set),
+        key=lambda r: -r["count"],
+    )
+
+    n_parked = len(parked_only_set)
+    n_matched = len(matched_set)
+    if n_parked > 0 and n_matched == 0 and not near_misses:
+        branch = "A"   # No wake ever reaches a parked uaddr or any neighbour.
+    elif near_misses and not matched_set:
+        branch = "B"   # Wakes go to addresses adjacent to parked uaddrs.
+    elif n_parked == 0:
+        branch = "none"  # Nothing parked → no missing-wake bug here.
+    else:
+        branch = "mixed"
+
+    _out({
+        "ok":                       True,
+        "branch":                   branch,
+        "summary": {
+            "parked_uaddr_count":    len(parked_set),
+            "attempted_uaddr_count": len(attempted_set),
+            "parked_only":           n_parked,
+            "attempted_and_matched": n_matched,
+            "attempted_only":        len(attempted_only_set),
+            "near_miss_count":       len(near_misses),
+            "wake_req_total":        sum(attempted_count.values()),
+        },
+        "parked_only":           parked_only,
+        "attempted_and_matched": attempted_and_matched,
+        "attempted_only":        attempted_only[:32],
+        "near_misses":           near_misses,
+    })
+
+
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 def main():
@@ -2925,6 +3093,16 @@ def main():
     p_parked.add_argument("--disk-root", default=None, metavar="DIR",
                           help="Disk staging root for symbol lookup")
 
+    # wake-attempts — diff WAKE_REQ vs still-parked uaddrs (Branch A/B verdict).
+    p_wake = sub.add_parser(
+        "wake-attempts",
+        help="Diff [FUTEX_WAKE_REQ] uaddrs against still-parked uaddrs to "
+             "decide Branch A (wake never called) vs Branch B (wrong uaddr)."
+    )
+    p_wake.add_argument("sid")
+    p_wake.add_argument("--disk-root", default=None, metavar="DIR",
+                        help="Disk staging root for symbol lookup")
+
     # _watch: private subcommand used internally by `start` to run the
     # background watcher in a detached process. Not shown in help.
     p_watch = sub.add_parser("_watch")
@@ -2961,6 +3139,7 @@ def main():
         "stack":   cmd_stack,
         "ustack":  cmd_ustack,
         "parked-tids": cmd_parked_tids,
+        "wake-attempts": cmd_wake_attempts,
         "rip-sample": cmd_rip_sample,
         "_watch":  cmd_run_watcher,
     }
