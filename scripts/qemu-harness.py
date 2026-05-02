@@ -2377,6 +2377,9 @@ def _build_kernel_symtab(elf_path: Path) -> list[tuple[int, int, str]]:
     return syms
 
 
+_USER_SYMTAB_CACHE: dict[str, list[tuple[int, int, str]]] = {}
+
+
 def _resolve_kernel_rip(rip: int, syms: list[tuple[int, int, str]]) -> Optional[str]:
     """Bisect into the sorted symbol list; return 'name+0xN' or None."""
     if not syms:
@@ -2419,9 +2422,6 @@ def _user_lib_symtab(host_path: str) -> list[tuple[int, int, str]]:
     syms.sort(key=lambda t: t[0])
     cache[host_path] = syms
     return syms
-
-
-_USER_SYMTAB_CACHE: dict[str, list[tuple[int, int, str]]] = {}
 
 
 def _resolve_user_rip(rip: int, libs: list, disk_root: Optional[str]) -> Optional[dict]:
@@ -2476,6 +2476,21 @@ def cmd_rip_sample(args):
     count       = max(1, int(args.count))
     interval_ms = max(0, int(args.interval_ms))
     disk_root   = getattr(args, "disk_root", None)
+
+    # The GDB stub keeps server-side selected-thread state across packets
+    # (Hg<tid>), so two concurrent invocations against the same sid would
+    # race.  Take an advisory file lock across the GDB-stub session — the
+    # kdb subcommand uses the same stub, so other consumers will block
+    # while sampling is in progress instead of corrupting thread state.
+    import fcntl
+    lock_path = HARNESS_DIR / f"{args.sid}.gdb.lock"
+    lock_fd = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_fd.close()
+        _err(f"GDB stub for sid {args.sid} is busy (held by another "
+             f"qemu-harness.py process). Retry once it exits.")
 
     # Build symbolisation tables once up-front.
     kernel_elf = _get_kernel_elf()
@@ -2549,6 +2564,10 @@ def cmd_rip_sample(args):
                 time.sleep(interval_ms / 1000.0)
     finally:
         gdb.close()
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_fd.close()
 
     # Sorted top-K histogram for a compact agent-readable summary.
     top_k = sorted(by_symbol.items(), key=lambda kv: -kv[1])[:20]
