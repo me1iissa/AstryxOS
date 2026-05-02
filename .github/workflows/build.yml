@@ -207,7 +207,7 @@ jobs:
 
       - name: Upload serial logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: kernel-smoke-logs
           path: |
@@ -304,7 +304,7 @@ jobs:
 
       - name: Upload harness logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: harness-smoke-logs
           path: |
