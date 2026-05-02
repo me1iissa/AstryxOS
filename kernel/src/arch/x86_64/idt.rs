@@ -935,15 +935,23 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 }
             }
 
-            // Map all readahead pages and insert into cache.
-            // IMPORTANT: for MAP_PRIVATE writable VMAs (e.g. .data/.bss of shared libs),
-            // the cache page must stay CLEAN (original file content) so that future
-            // processes get unmodified file data. We insert the clean frame into the
-            // cache and give each writable mapping a PRIVATE COPY, exactly as the
-            // cache-hit path does. Without this, ld-linux's GOT relocations would write
-            // into the shared cache page, corrupting it for every subsequent process
-            // that loads the same library (observed crash: cpp_hello sees glibc_hello's
-            // relocated pointers in libc's .dynamic section).
+            // Map all readahead pages and insert into cache.  Three regimes
+            // need to be distinguished and the per-arm logic below must match
+            // the cache-hit path (lines ~786-820):
+            //
+            // - MAP_PRIVATE + writable: give the process a private COPY of
+            //   the cache page so its writes (GOT relocations, BSS init, etc.)
+            //   don't corrupt the cache for parallel loaders of the same .so.
+            //   Without this, ld-linux's GOT relocations would observably
+            //   poison subsequent processes (cpp_hello saw glibc_hello's
+            //   relocated pointers in libc's .dynamic section).
+            // - MAP_SHARED + writable: ALIAS the cache page so that writes
+            //   are visible to other mappers of the same (mount,inode,off).
+            //   Required by mmap(2)'s MAP_SHARED contract; Mozilla's
+            //   freeze-shmem dance (rw-then-ro re-mmap of a memfd) breaks
+            //   silently if violated.
+            // - Read-only mappings (private or shared): alias the cache page;
+            //   no write visibility question and aliasing saves memory.
             const PHYS_COW: u64 = 0xFFFF_8000_0000_0000;
             let is_writable_vma = page_flags & crate::mm::vmm::PAGE_WRITABLE != 0;
             let needs_private_copy_vma = is_writable_vma && !is_shared;
@@ -1051,6 +1059,14 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     let _ = fs.read(inode, file_page_offset, buf);
                 }
                 crate::mm::cache::insert(mount_idx, inode, file_page_offset, phys);
+                // Single-page fallback always aliases the cache frame
+                // regardless of MAP_SHARED / MAP_PRIVATE.  This is correct
+                // for MAP_SHARED + writable and read-only mappings; for
+                // MAP_PRIVATE + writable it is the same lossy behaviour
+                // the OOM-fallback arm in the readahead path exhibits when
+                // alloc_page() returns None (the comment at line ~983
+                // documents the consequence).  Pre-fix behaviour, left
+                // unchanged.
                 crate::mm::refcount::page_ref_inc(phys);
                 crate::mm::vmm::map_page_in(cr3, page_addr, phys, page_flags);
                 crate::mm::vmm::invlpg(page_addr);
