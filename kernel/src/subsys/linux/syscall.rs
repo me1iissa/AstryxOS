@@ -4588,6 +4588,18 @@ pub fn sys_futex_linux(
                 }
             }
 
+            // Diagnostic: every FUTEX_WAKE is a candidate root cause for a
+            // missing-wakeup deadlock.  Logging the (uaddr, woken count, max
+            // requested) triple lets the qemu-harness post-processor correlate
+            // wakes against waiters by uaddr without having to instrument
+            // userspace.  Gated to firefox-test to stay out of the test-mode
+            // serial budget.
+            #[cfg(feature = "firefox-test")]
+            crate::serial_println!(
+                "[FUTEX_WAKE] tid={} pid={} uaddr={:#x} woken={} max={} op={:#x}",
+                crate::proc::current_tid(), pid, uaddr, woken, val, futex_op
+            );
+
             woken as i64
         }
         4 | 5 => {
