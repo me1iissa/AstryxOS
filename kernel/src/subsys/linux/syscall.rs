@@ -4575,6 +4575,25 @@ pub fn sys_futex_linux(
             let max_wake = if val == 0 { u64::MAX } else { val };
             let mut woken = 0u64;
 
+            // Diagnostic: log every WAKE *attempt* on entry, even ones that
+            // match nothing.  Combined with [FUTEX_WAKE] (post-match) and
+            // [FUTEX_WAIT_REG] (registration), this lets the harness diff
+            // attempted-wake uaddrs against still-parked uaddrs to decide
+            // whether a missing-wakeup is "wake call never reached" vs
+            // "wake call reached but wrong uaddr".  See the FUTEX_WAIT_REG
+            // site for the fault-safety rationale of the user-frame helpers.
+            #[cfg(feature = "firefox-test")]
+            {
+                let user_rip = unsafe { crate::syscall::get_user_rip() };
+                let (user_rsp, user_rbp) = crate::syscall::get_user_rsp_rbp();
+                crate::serial_println!(
+                    "[FUTEX_WAKE_REQ] tid={} pid={} uaddr={:#x} max={} op={:#x} \
+                     rip={:#x} rsp={:#x} rbp={:#x}",
+                    crate::proc::current_tid(), pid, uaddr, val, futex_op,
+                    user_rip, user_rsp, user_rbp
+                );
+            }
+
             let tids_to_wake: Vec<u64> = {
                 let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
                 if let Some(list) = waiters.get_mut(&(pid, uaddr)) {
