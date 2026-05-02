@@ -436,8 +436,17 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // `MOZ_HEADLESS=1` (set in the spawn envp) as equivalent triggers
             // for headless rendering; we set both for defence in depth.
             // See: https://firefox-source-docs.mozilla.org/widget/headless.html
+            //
+            // `--screenshot <PATH> <URL>` is the documented headless flag that
+            // drives the HeadlessShell command-line handler (see Mozilla's
+            // browser/components/shell/HeadlessShell.sys.mjs).  Passing it
+            // causes the handler to load the URL and write a PNG, which is
+            // the headless demo bar for issue #88.  /tmp/hello.html is staged
+            // into the data image by scripts/create-data-disk.sh.  Reaching
+            // the handler requires the JS event loop to advance to cmdline-
+            // handler dispatch — see issue #88 for the current barrier.
             gui::terminal::launch_process(
-                "/disk/opt/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance",
+                "/disk/opt/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png file:///tmp/hello.html",
             );
 
             // Run for up to 30000 ticks (~300 s), polling output and network.
