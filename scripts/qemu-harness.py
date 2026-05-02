@@ -767,7 +767,8 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
                           gdb_port: int = 0,
                           gdb_wait: bool = False,
                           kdb_host_port: int = 0,
-                          kvm: Optional[bool] = None) -> subprocess.Popen:
+                          kvm: Optional[bool] = None,
+                          smp: int = 2) -> subprocess.Popen:
     """
     Launch QEMU with a per-session serial log and QMP socket.
 
@@ -811,6 +812,16 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
         gdb_wait=gdb_wait,
         kvm=kvm,
     )
+
+    # Override -smp count if caller asked for non-default. astryx_qemu.py
+    # honours ASTRYX_SMP env on its own; here we patch the pre-built argv
+    # so we don't have to mutate process env. Plan-C experiments use --smp 16
+    # to stress-test Mozilla nsThreadPool sizing keyed off _SC_NPROCESSORS_ONLN.
+    if smp != 2:
+        for i, arg in enumerate(cmd):
+            if arg == "-smp" and i + 1 < len(cmd):
+                cmd[i + 1] = str(smp)
+                break
 
     # Inject the kdb hostfwd rule by patching the `-netdev user,id=net0`
     # entry in-place.  Done here (rather than in `astryx_qemu.py`) to keep
@@ -874,10 +885,12 @@ def cmd_start(args):
         kvm_arg = True
     else:
         kvm_arg = None  # autodetect
+    smp = int(getattr(args, "smp", 2) or 2)
     proc = _launch_qemu_harness(sid, serial_log, qmp_sock, ovmf_vars,
                                  gdb_port=gdb_port, gdb_wait=gdb_wait,
                                  kdb_host_port=kdb_host_port,
-                                 kvm=kvm_arg)
+                                 kvm=kvm_arg,
+                                 smp=smp)
 
     session = {
         "sid":        sid,
@@ -890,6 +903,7 @@ def cmd_start(args):
         "gdb_port":   gdb_port,
         "gdb_wait":   gdb_wait,
         "kdb_host_port": kdb_host_port,
+        "smp":         smp,
         "breakpoints": [],
     }
     _save_session(session)
@@ -2910,6 +2924,10 @@ def main():
     p_start.add_argument("--kvm", dest="force_kvm", action="store_true",
                           help="Force-enable KVM acceleration. Errors out if "
                                "/dev/kvm is unavailable.")
+    p_start.add_argument("--smp", type=int, default=2, metavar="N",
+                          help="Number of QEMU vCPUs (default 2). Plan-C "
+                               "experiment uses 16 to test Mozilla "
+                               "nsThreadPool sizing under wider _SC_NPROCESSORS_ONLN.")
 
     # stop
     p_stop = sub.add_parser("stop", help="Kill a QEMU session")
