@@ -281,6 +281,45 @@ class GdbClient:
         # Do NOT wait for a stop-reply — the kernel is now running.
         return f"<sent: {pkt}>"
 
+    # ── thread enumeration / selection (each QEMU vCPU is a "thread") ─────────
+
+    def list_threads(self) -> list[int]:
+        """Enumerate vCPU thread IDs via qfThreadInfo / qsThreadInfo.
+
+        Returns a list of integer thread IDs (typically [1, 2, ...] for SMP).
+        Empty list if the stub doesn't advertise threads.
+        """
+        ids: list[int] = []
+        try:
+            resp = self.send("qfThreadInfo")
+        except Exception:
+            return ids
+        # Loop: "m<id>,<id>,..." then "qsThreadInfo" to get next batch; "l" terminator.
+        while resp and resp != "l":
+            if not resp.startswith("m"):
+                break
+            for tok in resp[1:].split(","):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                try:
+                    ids.append(int(tok, 16))
+                except ValueError:
+                    pass
+            try:
+                resp = self.send("qsThreadInfo")
+            except Exception:
+                break
+        return ids
+
+    def select_thread(self, tid: int) -> bool:
+        """Select thread for subsequent g/G/m/M operations via Hg packet."""
+        try:
+            resp = self.send(f"Hg{tid:x}")
+            return resp == "OK"
+        except Exception:
+            return False
+
 
 # ── Tier 2: ELF symbol resolver ──────────────────────────────────────────────
 #
@@ -2295,6 +2334,236 @@ def cmd_ustack(args):
     })
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# rip-sample — sampling profiler for kernel + user RIP via QMP stop / GDB g
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Pause QEMU via QMP, read RIP/RSP from each vCPU via the GDB stub, resume,
+# repeat.  Symbolises kernel RIPs against the kernel ELF and user RIPs against
+# the [FFTEST/mmap-so] load-base table parsed from the serial log.  Output is
+# a fully-resolved sample list plus a by_symbol histogram so the dominant
+# spin function falls out for free.
+
+# Lower bound of the higher-half kernel virtual address space.  Anything
+# >= this is treated as a kernel RIP for symbolisation.
+_KERNEL_VMA_BASE = 0xFFFF_8000_0000_0000
+
+
+def _build_kernel_symtab(elf_path: Path) -> list[tuple[int, int, str]]:
+    """Extract (addr, size, name) for STT_FUNC symbols from the kernel ELF.
+    Sorted by address so a binary search finds the enclosing function."""
+    syms: list[tuple[int, int, str]] = []
+    try:
+        from elftools.elf.elffile import ELFFile
+        from elftools.elf.sections import SymbolTableSection
+    except ImportError:
+        return syms
+    if not elf_path.exists():
+        return syms
+    with elf_path.open("rb") as f:
+        elf = ELFFile(f)
+        for sec in elf.iter_sections():
+            if not isinstance(sec, SymbolTableSection):
+                continue
+            for sym in sec.iter_symbols():
+                if sym["st_info"]["type"] != "STT_FUNC":
+                    continue
+                addr = sym["st_value"]
+                size = sym["st_size"]
+                if addr == 0:
+                    continue
+                syms.append((addr, size, sym.name))
+    syms.sort(key=lambda t: t[0])
+    return syms
+
+
+def _resolve_kernel_rip(rip: int, syms: list[tuple[int, int, str]]) -> Optional[str]:
+    """Bisect into the sorted symbol list; return 'name+0xN' or None."""
+    if not syms:
+        return None
+    import bisect
+    idx = bisect.bisect_right([s[0] for s in syms], rip) - 1
+    if idx < 0:
+        return None
+    addr, size, name = syms[idx]
+    delta = rip - addr
+    # Tolerate symbols with size==0 (some asm symbols) up to a 4 KiB window.
+    upper = size if size > 0 else 0x1000
+    if delta >= upper:
+        return None
+    return f"{name}+{delta:#x}"
+
+
+def _user_lib_symtab(host_path: str) -> list[tuple[int, int, str]]:
+    """Extract STT_FUNC (and STT_NOTYPE) dynamic symbols from a userspace
+    .so / executable.  Cached per-host_path via _USER_SYMTAB_CACHE."""
+    cache = _USER_SYMTAB_CACHE
+    if host_path in cache:
+        return cache[host_path]
+    syms: list[tuple[int, int, str]] = []
+    try:
+        from elftools.elf.elffile import ELFFile
+        from elftools.elf.sections import SymbolTableSection
+        with open(host_path, "rb") as f:
+            elf = ELFFile(f)
+            for sec in elf.iter_sections():
+                if not isinstance(sec, SymbolTableSection):
+                    continue
+                for sym in sec.iter_symbols():
+                    addr = sym["st_value"]
+                    if addr == 0:
+                        continue
+                    syms.append((addr, sym["st_size"], sym.name))
+    except Exception:
+        syms = []
+    syms.sort(key=lambda t: t[0])
+    cache[host_path] = syms
+    return syms
+
+
+_USER_SYMTAB_CACHE: dict[str, list[tuple[int, int, str]]] = {}
+
+
+def _resolve_user_rip(rip: int, libs: list, disk_root: Optional[str]) -> Optional[dict]:
+    """Resolve a userspace RIP against the [FFTEST/mmap-so] load-base table.
+    Returns {library, offset, symbol} or None if outside any mapping."""
+    lib_path, off = _resolve_frame_to_lib(rip, libs)
+    if lib_path is None:
+        return None
+    host = _resolve_path_on_host(lib_path, disk_root=disk_root)
+    sym = None
+    if host:
+        # First try the cached pyelftools symtab (handles static + dynamic).
+        elf_syms = _user_lib_symtab(host)
+        if elf_syms:
+            import bisect
+            idx = bisect.bisect_right([s[0] for s in elf_syms], off) - 1
+            if idx >= 0:
+                a, sz, name = elf_syms[idx]
+                delta = off - a
+                upper = sz if sz > 0 else 0x10000
+                if delta < upper:
+                    sym = f"{name}+{delta:#x}"
+        # Fall back to nm on the host file (covers stripped binaries' .dynsym).
+        if sym is None:
+            sym = _try_symbolise(host, off)
+    return {
+        "library": lib_path,
+        "offset":  f"{off:#x}",
+        "symbol":  sym,
+    }
+
+
+def cmd_rip_sample(args):
+    """Pause/resume QEMU N times; read RIP per vCPU each time; symbolise.
+
+    Output schema:
+      {
+        "sample_count": <N * vcpu_count>,
+        "vcpu_count":   <int>,
+        "interval_ms":  <int>,
+        "samples":      [{"i":i, "cpu":n, "rip":hex, "rsp":hex,
+                          "domain":"kernel|user|unknown",
+                          "symbol":str|null, "library":str|null}, ...],
+        "by_symbol":    {"<name>": <count>, ...},  # top-level histogram
+        "by_domain":    {"kernel":N, "user":N, "unknown":N},
+      }
+    """
+    sess     = _load_session(args.sid)
+    qmp_sock = sess["qmp_sock"]
+    port     = _get_gdb_port(sess)
+
+    count       = max(1, int(args.count))
+    interval_ms = max(0, int(args.interval_ms))
+    disk_root   = getattr(args, "disk_root", None)
+
+    # Build symbolisation tables once up-front.
+    kernel_elf = _get_kernel_elf()
+    kernel_syms = _build_kernel_symtab(kernel_elf)
+
+    serial_log = sess["serial_log"]
+    try:
+        log_lines = Path(serial_log).read_text(errors="replace").splitlines()
+    except OSError:
+        log_lines = []
+    libs = _build_load_base_map(log_lines)
+
+    # One persistent GDB connection across all iterations — handshake is
+    # expensive (the stub re-queries supported features on each connect).
+    gdb = GdbClient("127.0.0.1", port)
+    if not gdb.connect():
+        _err(f"Cannot connect to GDB stub on port {port} (tried {port}..{port+4})")
+
+    samples: list[dict] = []
+    by_symbol: dict[str, int] = {}
+    by_domain = {"kernel": 0, "user": 0, "unknown": 0}
+
+    try:
+        threads = gdb.list_threads()
+        if not threads:
+            # Stub doesn't enumerate threads — sample the current CPU only.
+            threads = [0]
+        for i in range(count):
+            # QMP stop is the canonical way to freeze all vCPUs atomically.
+            stop_resp = _qmp_command(qmp_sock, "stop", connect_timeout=2.0)
+            if "error" in stop_resp:
+                _err(f"QMP stop failed: {stop_resp['error']}")
+            try:
+                for tid in threads:
+                    if tid:
+                        gdb.select_thread(tid)
+                    try:
+                        regs = gdb.read_regs()
+                    except Exception as e:
+                        regs = {"rip": "0x0", "rsp": "0x0", "_err": str(e)}
+                    rip = int(regs.get("rip", "0x0"), 16)
+                    rsp = int(regs.get("rsp", "0x0"), 16)
+                    domain = "unknown"
+                    library = None
+                    symbol  = None
+                    if rip >= _KERNEL_VMA_BASE:
+                        domain = "kernel"
+                        symbol = _resolve_kernel_rip(rip, kernel_syms)
+                    elif rip != 0:
+                        ur = _resolve_user_rip(rip, libs, disk_root)
+                        if ur is not None:
+                            domain  = "user"
+                            library = ur["library"]
+                            symbol  = ur["symbol"]
+                    by_domain[domain] += 1
+                    key = symbol or f"<unresolved {domain} {rip:#x}>"
+                    by_symbol[key] = by_symbol.get(key, 0) + 1
+                    samples.append({
+                        "i":      i,
+                        "cpu":    tid,
+                        "rip":    f"{rip:#x}",
+                        "rsp":    f"{rsp:#x}",
+                        "domain": domain,
+                        "symbol": symbol,
+                        "library": library,
+                    })
+            finally:
+                # Always resume — never leave the guest paused on error.
+                _qmp_command(qmp_sock, "cont", connect_timeout=2.0)
+            if i + 1 < count and interval_ms > 0:
+                time.sleep(interval_ms / 1000.0)
+    finally:
+        gdb.close()
+
+    # Sorted top-K histogram for a compact agent-readable summary.
+    top_k = sorted(by_symbol.items(), key=lambda kv: -kv[1])[:20]
+
+    _out({
+        "ok":           True,
+        "sample_count": len(samples),
+        "vcpu_count":   len(threads),
+        "interval_ms":  interval_ms,
+        "by_domain":    by_domain,
+        "by_symbol":    dict(top_k),
+        "samples":      samples,
+    })
+
+
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 def main():
@@ -2495,6 +2764,22 @@ def main():
                                "symbol lookup).  Defaults to ./build/disk and "
                                "./build relative to CWD.")
 
+    # rip-sample — sampling profiler (QMP stop + GDB g).  Requires --gdb-port.
+    p_rip = sub.add_parser(
+        "rip-sample",
+        help="[Tier2] Sample RIP/RSP per vCPU N times via QMP stop + GDB stub; "
+             "symbolise against kernel ELF + [FFTEST/mmap-so] load-base table",
+    )
+    p_rip.add_argument("sid")
+    p_rip.add_argument("--count", type=int, default=100,
+                       help="Number of sampling iterations (default 100)")
+    p_rip.add_argument("--interval-ms", type=int, default=100,
+                       dest="interval_ms",
+                       help="Sleep between iterations in ms (default 100)")
+    p_rip.add_argument("--disk-root", default=None, metavar="DIR",
+                       help="Disk staging root for userspace .so symbol lookup "
+                            "(see `ustack --disk-root`)")
+
     # _watch: private subcommand used internally by `start` to run the
     # background watcher in a detached process. Not shown in help.
     p_watch = sub.add_parser("_watch")
@@ -2530,6 +2815,7 @@ def main():
         "scrings": cmd_scrings,
         "stack":   cmd_stack,
         "ustack":  cmd_ustack,
+        "rip-sample": cmd_rip_sample,
         "_watch":  cmd_run_watcher,
     }
     dispatch[args.cmd](args)
