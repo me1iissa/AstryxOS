@@ -122,7 +122,7 @@ def parse_strace_args_truncated(args_str: str, max_args: int = 6) -> List[str]:
     in_str = False
     escape = False
     cur = []
-    for c in args_str:
+    for i, c in enumerate(args_str):
         if in_str:
             cur.append(c)
             if escape:
@@ -145,8 +145,13 @@ def parse_strace_args_truncated(args_str: str, max_args: int = 6) -> List[str]:
             out.append("".join(cur).strip())
             cur = []
             if len(out) >= max_args:
-                # Append the remainder verbatim and stop.
-                rest = args_str[len("".join(out)) + len(out):]  # rough
+                # Append the remainder verbatim using the actual byte offset
+                # past this comma (i + 1).  Earlier versions reconstructed the
+                # offset from `len("".join(out)) + len(out)` which only worked
+                # when strace omitted spaces after commas — incorrect in the
+                # common `a, b, c` form, so the rest slice was off by one
+                # space per arg.
+                rest = args_str[i + 1:]
                 if rest.strip():
                     out.append(rest.strip())
                 return out

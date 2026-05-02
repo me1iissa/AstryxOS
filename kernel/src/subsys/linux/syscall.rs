@@ -3705,11 +3705,14 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> i64 {
         // (shared_memory_posix.cc:554).  Returning success here keeps the
         // parent on the sealed-shmem fast path it expects.
         //
-        // We do not yet track per-fd seal state; mmap(PROT_WRITE, MAP_SHARED)
-        // on a "sealed" memfd will still succeed, which is a content-process
-        // correctness debt logged for follow-up.  See audit notes for the
-        // full picture.  No application observed in this codebase relies on
-        // the kernel actually enforcing seals during startup.
+        // We currently accept F_ADD_SEALS as a no-op without tracking per-fd
+        // seal state, and F_GET_SEALS always returns 0 ("no seals applied").
+        // mmap(PROT_WRITE, MAP_SHARED) on a "sealed" memfd will still succeed.
+        // Both are a known correctness debt: Mozilla relies on enforcement at
+        // a downstream call site that the strace-diff (issue #99) suggests
+        // is the source of the next plateau (NULL deref at CR2=0xac in
+        // shared_memory_posix.cc post-memfd init).  Phase 15 will introduce
+        // a per-fd seal side-table and enforce on mmap.  See #99 follow-up.
         1033 /* F_ADD_SEALS */ => 0,
         1034 /* F_GET_SEALS */ => 0,
         _ => -22 // EINVAL

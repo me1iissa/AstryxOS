@@ -138,9 +138,10 @@ impl ProcFs {
 
             // /proc/self/fd/<N> entries — modelled as symlinks per the Linux
             // procfs(5) contract.  Inode encoding: 3000 + fd_num (see
-            // `lookup` and `readdir` for the encoding).  Capping at 3000+4096
-            // matches MAX_FDS_PER_PROCESS so we do not claim ownership of
-            // unrelated inode numbers.
+            // `lookup` and `readdir` for the encoding).  The cap of 4096
+            // is 4× MAX_FDS_PER_PROCESS (currently 1024), giving headroom
+            // for future expansion of the per-process fd table without
+            // re-encoding inode numbers.
             n if n >= 3000 && n < 3000 + 4096 => Some(FileType::SymLink),
 
             _ => None,
