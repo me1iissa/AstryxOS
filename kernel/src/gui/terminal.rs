@@ -855,10 +855,13 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         // Reports/ creation and the subsequent fatal-on-error writes that
         // bubble up through CrashReporter::SetupExtraData().
         "MOZ_CRASHREPORTER_DISABLE=1",
-        // Force single-process mode — no content process fork.
-        "MOZ_FORCE_DISABLE_E10S=1",
-        // Skip GPU/glxtest process — we don't support fork+exec yet.
-        // Tell Firefox to use software rendering without probing.
+        // E10S (multi-process) is left enabled so libxul attempts to launch
+        // plugin-container.  This drives the parent through
+        // GeckoChildProcessHost::PerformAsyncLaunch (chromium IPC LaunchProcess
+        // path), which exercises clone(), execve(), socketpair(AF_UNIX,
+        // SOCK_SEQPACKET), and SCM_RIGHTS cmsg delivery — all needed for
+        // issue #88.  See https://wiki.mozilla.org/Electrolysis.
+        // Skip GPU/glxtest process — software rendering only.
         "MOZ_GFX_TESTING_NO_CHILD_PROCESS=1",
         "MOZ_X11_EGL=0",
         "MOZ_ACCELERATED=0",
