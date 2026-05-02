@@ -1616,7 +1616,41 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
     if op == "mem":
         if len(rest) < 2: raise ValueError("mem requires <addr> <len>")
         return {"op": "mem", "addr": rest[0], "len": int(rest[1], 0)}
+    if op == "tframe":
+        if len(rest) < 2: raise ValueError("tframe requires <pid> <tid>")
+        return {"op": "tframe", "pid": int(rest[0], 0), "tid": int(rest[1], 0)}
+    if op == "user-mem":
+        if len(rest) < 3: raise ValueError("user-mem requires <pid> <addr> <len>")
+        return {"op": "user-mem", "pid": int(rest[0], 0),
+                "addr": rest[1], "len": int(rest[2], 0)}
     raise ValueError(f"unknown kdb op: {op}")
+
+
+def _kdb_recv(port: int, req: dict, timeout: float = 5.0) -> bytes:
+    """Send one JSON kdb request, return the raw response bytes."""
+    payload = (json.dumps(req) + "\n").encode("utf-8")
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(("127.0.0.1", port))
+        s.sendall(payload)
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk: break
+            buf += chunk
+            if len(buf) > 128 * 1024: break
+    finally:
+        s.close()
+    return buf
+
+
+def _kdb_call(port: int, req: dict, timeout: float = 5.0) -> dict:
+    """One-shot kdb call.  Connects, sends one JSON line, reads one line back,
+    closes.  Returns the parsed response.  For diagnostic access to the raw
+    bytes (e.g. to surface them in a malformed-response error), use
+    `_kdb_recv` and `json.loads` separately."""
+    return json.loads(_kdb_recv(port, req, timeout).strip().decode("utf-8", errors="replace"))
 
 
 def cmd_kdb(args):
@@ -1631,29 +1665,17 @@ def cmd_kdb(args):
     except ValueError as e:
         _out({"error": str(e)}); sys.exit(1)
 
-    payload = (json.dumps(req) + "\n").encode("utf-8")
     timeout = float(getattr(args, "timeout", 5.0) or 5.0)
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect(("127.0.0.1", port))
-        s.sendall(payload)
-        buf = b""
-        while not buf.endswith(b"\n"):
-            chunk = s.recv(65536)
-            if not chunk: break
-            buf += chunk
-            if len(buf) > 128 * 1024: break
-        s.close()
+        raw = _kdb_recv(port, req, timeout=timeout)
     except (socket.timeout, ConnectionRefusedError, OSError) as e:
         _out({"error": f"kdb connect/io failed on 127.0.0.1:{port}: {e}"})
         sys.exit(1)
-
     try:
-        resp = json.loads(buf.strip().decode("utf-8", errors="replace"))
+        resp = json.loads(raw.strip().decode("utf-8", errors="replace"))
     except (json.JSONDecodeError, ValueError) as e:
         _out({"error": f"malformed response: {e}",
-              "raw": buf.decode(errors="replace")})
+              "raw": raw.decode(errors="replace")})
         sys.exit(1)
 
     # Mirror to ~/.astryx-harness/<sid>.kdb.json (best-effort).
@@ -2582,6 +2604,100 @@ def cmd_rip_sample(args):
         "samples":      samples,
     })
 
+# ══════════════════════════════════════════════════════════════════════════════
+# parked-tids — characterise threads parked in futex_wait via serial-log scan
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Phase-12 fallback for environments where the kdb hostfwd is unreliable
+# (WSL2 + slirp + e1000: inbound TCP can stall behind QEMU's flush_queue_timer
+# coalescer).  Reads `[FUTEX_WAIT_REG] tid=… uaddr=… rip=… rsp=… rbp=…`
+# lines from the serial log, keeps the most-recent registration per tid, and
+# resolves each rip against the `[FFTEST/mmap-so]` load-base table.
+#
+# To classify a tid as "still parked" we cross-check `[FUTEX_WAKE]`: any wake
+# directed at the tid's last-registered uaddr that woke ≥1 waiter is taken as
+# evidence that the tid likely re-entered the run-queue (best-effort — a wake
+# may have hit a different waiter on the same uaddr).
+#
+# Output: { "tids":[{tid, uaddr, op, rip, library, symbol, parked}],
+#           "by_signature":{<library:symbol>: [tids…]} }
+_FUTEX_WAIT_REG_RICH = re.compile(
+    r"\[FUTEX_WAIT_REG\] tid=(\d+) pid=(\d+) uaddr=(0x[0-9a-fA-F]+) "
+    r"val=\d+ op=(0x[0-9a-fA-F]+) rip=(0x[0-9a-fA-F]+) "
+    r"rsp=(0x[0-9a-fA-F]+) rbp=(0x[0-9a-fA-F]+)"
+)
+_FUTEX_WAKE_RE = re.compile(
+    r"\[FUTEX_WAKE\] tid=\d+ pid=\d+ uaddr=(0x[0-9a-fA-F]+) woken=(\d+)"
+)
+
+def cmd_parked_tids(args):
+    sess = _load_session(args.sid)
+    try:
+        lines = Path(sess["serial_log"]).read_text(errors="replace").splitlines()
+    except OSError as e:
+        _err(f"could not read serial log: {e}")
+    libs = _build_load_base_map(lines)
+    disk_root = getattr(args, "disk_root", None)
+
+    # Latest registration per tid (parked tids re-enter futex_wait several
+    # times before the system reaches steady state; the last entry tells us
+    # where the tid has *currently* settled).
+    last_reg: dict[int, dict] = {}
+    waked_uaddrs: set[str] = set()
+    for ln in lines:
+        m = _FUTEX_WAIT_REG_RICH.search(ln)
+        if m:
+            tid = int(m.group(1))
+            last_reg[tid] = {
+                "tid":   tid,
+                "pid":   int(m.group(2)),
+                "uaddr": m.group(3),
+                "op":    m.group(4),
+                "rip":   int(m.group(5), 16),
+                "rsp":   int(m.group(6), 16),
+                "rbp":   int(m.group(7), 16),
+            }
+            continue
+        w = _FUTEX_WAKE_RE.search(ln)
+        if w and int(w.group(2)) > 0:
+            waked_uaddrs.add(w.group(1))
+
+    rows: list[dict] = []
+    by_signature: dict[str, list[int]] = {}
+    for tid in sorted(last_reg):
+        r = last_reg[tid]
+        ur = _resolve_user_rip(r["rip"], libs, disk_root) if r["rip"] else None
+        sig_lib = (ur or {}).get("library") or "<unresolved>"
+        sig_sym = (ur or {}).get("symbol")  or f"<rip {r['rip']:#x}>"
+        sig = f"{Path(sig_lib).name}:{sig_sym}"
+        # Heuristic: a tid is "likely parked" if its last-registered uaddr
+        # never appears with woken≥1.  Imperfect (wakes may target a sibling
+        # waiter on the same uaddr) but matches the Phase-11 methodology.
+        parked = r["uaddr"] not in waked_uaddrs
+        rows.append({
+            "tid":      tid,
+            "pid":      r["pid"],
+            "uaddr":    r["uaddr"],
+            "op":       r["op"],
+            "rip":      f"{r['rip']:#x}",
+            "rsp":      f"{r['rsp']:#x}",
+            "rbp":      f"{r['rbp']:#x}",
+            "library":  (ur or {}).get("library"),
+            "offset":   (ur or {}).get("offset"),
+            "symbol":   (ur or {}).get("symbol"),
+            "parked":   parked,
+        })
+        if parked:
+            by_signature.setdefault(sig, []).append(tid)
+
+    _out({
+        "ok":           True,
+        "tid_count":    len(rows),
+        "parked_count": sum(1 for r in rows if r["parked"]),
+        "tids":         rows,
+        "by_signature": by_signature,
+    })
+
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
@@ -2717,7 +2833,7 @@ def main():
     p_kdb.add_argument("op", choices=[
         "ping", "proc-list", "proc", "proc-tree", "fd-table",
         "syscall-trend", "vfs-mounts",
-        "dmesg", "syms", "mem", "trace-status",
+        "dmesg", "syms", "mem", "tframe", "user-mem", "trace-status",
     ])
     p_kdb.add_argument("args", nargs="*",
                         help="Op-specific positional args: "
@@ -2799,6 +2915,16 @@ def main():
                        help="Disk staging root for userspace .so symbol lookup "
                             "(see `ustack --disk-root`)")
 
+    # parked-tids — passive serial-log scan of FUTEX_WAIT_REG → leaf rip + sig.
+    p_parked = sub.add_parser(
+        "parked-tids",
+        help="Resolve futex_wait leaf RIP per tid from serial log; group by "
+             "library:symbol signature.  Works without kdb (firefox-test)."
+    )
+    p_parked.add_argument("sid")
+    p_parked.add_argument("--disk-root", default=None, metavar="DIR",
+                          help="Disk staging root for symbol lookup")
+
     # _watch: private subcommand used internally by `start` to run the
     # background watcher in a detached process. Not shown in help.
     p_watch = sub.add_parser("_watch")
@@ -2834,6 +2960,7 @@ def main():
         "scrings": cmd_scrings,
         "stack":   cmd_stack,
         "ustack":  cmd_ustack,
+        "parked-tids": cmd_parked_tids,
         "rip-sample": cmd_rip_sample,
         "_watch":  cmd_run_watcher,
     }
