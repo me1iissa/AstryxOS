@@ -442,11 +442,9 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // browser/components/shell/HeadlessShell.sys.mjs).  Passing it
             // causes the handler to load the URL and write a PNG, which is
             // the headless demo bar for issue #88.  /tmp/hello.html is staged
-            // into the data image by scripts/create-data-disk.sh.  Note that
-            // reaching the handler requires the JS engine to start running;
-            // if MOZ_FORCE_DISABLE_E10S is set, the parent never spawns a
-            // content child but the JS dispatch can still fire in single-
-            // process mode.
+            // into the data image by scripts/create-data-disk.sh.  Reaching
+            // the handler requires the JS event loop to advance to cmdline-
+            // handler dispatch — see issue #88 for the current barrier.
             gui::terminal::launch_process(
                 "/disk/opt/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png file:///tmp/hello.html",
             );
