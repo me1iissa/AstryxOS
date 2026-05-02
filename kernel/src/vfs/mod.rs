@@ -26,6 +26,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
@@ -198,14 +199,37 @@ pub trait FileSystemOps: Send + Sync {
 }
 
 /// A mounted filesystem.
+///
+/// `fs` is held as `Arc<dyn FileSystemOps>` rather than `Box` so that the VFS
+/// helpers can clone a reference out of `MOUNTS`, drop the lock, and then
+/// dispatch into the FS without holding the global mount-table mutex.
+///
+/// # Why this matters
+///
+/// Holding `MOUNTS` across an FS-method dispatch creates a same-thread
+/// recursive-lock hazard: if the dispatched method touches a userspace
+/// buffer (or any file-backed VMA) whose page is not yet resident, the
+/// kernel-mode page-fault handler also needs `MOUNTS` to satisfy the
+/// demand-page — and the spin-yield retry path cannot make forward
+/// progress because the holder is *this* CPU.  See `resolve_path` and
+/// the page-fault file-backed path in `arch/x86_64/idt.rs` for the
+/// fix shape (snapshot the Arc under the lock; drop; dispatch).
 pub struct Mount {
     pub path: String,
-    pub fs: Box<dyn FileSystemOps>,
+    pub fs: Arc<dyn FileSystemOps>,
     pub root_inode: u64,
 }
 
 /// Mount table.
 pub static MOUNTS: Mutex<Vec<Mount>> = Mutex::new(Vec::new());
+
+/// Snapshot the (Arc<FS>, root_inode) for `mount_idx` without retaining the
+/// `MOUNTS` lock across the FS dispatch that follows.  Returns `None` if the
+/// index is out of bounds.
+fn fs_at(idx: usize) -> Option<(Arc<dyn FileSystemOps>, u64)> {
+    let mounts = MOUNTS.lock();
+    mounts.get(idx).map(|m| (m.fs.clone(), m.root_inode))
+}
 
 /// File descriptor — an open file handle in a process.
 #[derive(Clone)]
@@ -317,7 +341,7 @@ pub fn init() {
 
     MOUNTS.lock().push(Mount {
         path: String::from("/"),
-        fs: Box::new(root_fs),
+        fs: Arc::new(root_fs),
         root_inode,
     });
 
@@ -496,13 +520,18 @@ pub fn init() {
 }
 
 /// Mount a filesystem at the given path.
+///
+/// The supplied `Box` is converted to `Arc` on insertion so that the VFS
+/// helpers can clone a reference out of `MOUNTS` and dispatch without
+/// holding the lock.  Callers continue to pass `Box::new(MyFs::new())` —
+/// the conversion is zero-cost (`Arc::from(Box<T>)` reuses the allocation).
 pub fn mount(path: &str, fs: Box<dyn FileSystemOps>, root_inode: u64) {
     // Ensure mount point directory exists in parent filesystem.
     let _ = mkdir(path);
 
     MOUNTS.lock().push(Mount {
         path: String::from(path),
-        fs,
+        fs: Arc::from(fs),
         root_inode,
     });
 }
@@ -916,17 +945,18 @@ fn resolve_path_opts(path: &str, depth: u32, follow_final: bool) -> VfsResult<(u
     for (i, component) in remaining.iter().enumerate() {
         let is_final = i + 1 == remaining.len();
 
+        // Snapshot the current FS handle before each dispatch.  Holding
+        // `MOUNTS` across `lookup` / `stat` / `readlink` would deadlock if
+        // the FS implementation faults on a user-supplied or file-backed
+        // buffer — the page-fault handler also needs `MOUNTS` to demand-page
+        // the missing frame, but this thread already holds it (#82).
+        let fs = fs_at(cur_mount).ok_or(VfsError::NotFound)?.0;
+
         // Lookup this component in the current directory.
-        let child_inode = {
-            let mounts = MOUNTS.lock();
-            mounts[cur_mount].fs.lookup(cur_inode, component)?
-        };
+        let child_inode = fs.lookup(cur_inode, component)?;
 
         // Check if the child is a symlink.
-        let child_stat = {
-            let mounts = MOUNTS.lock();
-            mounts[cur_mount].fs.stat(child_inode)?
-        };
+        let child_stat = fs.stat(child_inode)?;
 
         if child_stat.file_type == FileType::SymLink {
             // If this is the final component and we were asked not to follow,
@@ -936,10 +966,7 @@ fn resolve_path_opts(path: &str, depth: u32, follow_final: bool) -> VfsResult<(u
             }
 
             // Read the symlink target.
-            let target = {
-                let mounts = MOUNTS.lock();
-                mounts[cur_mount].fs.readlink(child_inode)?
-            };
+            let target = fs.readlink(child_inode)?;
 
             // Build the new path: target + remaining components after this one.
             let rest: Vec<&str> = remaining[i + 1..].to_vec();
@@ -1020,10 +1047,8 @@ fn split_parent_name(path: &str) -> (&str, &str) {
 /// Create a file at the given absolute path.
 pub fn create_file(path: &str) -> VfsResult<()> {
     let (mount_idx, parent_inode, name) = resolve_parent(path)?;
-    {
-        let mounts = MOUNTS.lock();
-        mounts[mount_idx].fs.create_file(parent_inode, &name)?;
-    }
+    let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
+    fs.create_file(parent_inode, &name)?;
     // Fire IN_CREATE on the parent directory.
     let (parent_dir, filename) = split_parent_name(path);
     crate::ipc::inotify::notify_event(parent_dir, filename, crate::ipc::inotify::IN_CREATE, 0);
@@ -1034,8 +1059,8 @@ pub fn create_file(path: &str) -> VfsResult<()> {
 pub fn mkdir(path: &str) -> VfsResult<()> {
     let (mount_idx, parent_inode, name) = resolve_parent(path)?;
     {
-        let mounts = MOUNTS.lock();
-        mounts[mount_idx].fs.create_dir(parent_inode, &name)?;
+        let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
+        fs.create_dir(parent_inode, &name)?;
     }
     // Fire IN_CREATE|IN_ISDIR on the parent directory.
     let (parent_dir, filename) = split_parent_name(path);
@@ -1054,11 +1079,10 @@ pub fn mkdir(path: &str) -> VfsResult<()> {
 pub fn remove(path: &str) -> VfsResult<()> {
     let (mount_idx, parent_inode, name) = resolve_parent(path)?;
 
+    let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
+
     // Resolve the target inode to check whether it is open.
-    let target_inode = {
-        let mounts = MOUNTS.lock();
-        mounts[mount_idx].fs.lookup(parent_inode, &name)?
-    };
+    let target_inode = fs.lookup(parent_inode, &name)?;
 
     // Determine whether it is a regular file that any process has open.
     let is_open = {
@@ -1071,12 +1095,10 @@ pub fn remove(path: &str) -> VfsResult<()> {
 
     if is_open {
         // Deferred deletion: unlink directory entry, keep inode until last close.
-        let mounts = MOUNTS.lock();
-        mounts[mount_idx].fs.unlink_entry(parent_inode, &name)?;
+        fs.unlink_entry(parent_inode, &name)?;
         DELETED_INODES.lock().push((mount_idx, target_inode));
     } else {
-        let mounts = MOUNTS.lock();
-        mounts[mount_idx].fs.remove(parent_inode, &name)?;
+        fs.remove(parent_inode, &name)?;
     }
     // Fire IN_DELETE on the parent directory.
     let (parent_dir, filename) = split_parent_name(path);
@@ -1087,22 +1109,22 @@ pub fn remove(path: &str) -> VfsResult<()> {
 /// Stat a file (follows symlinks — like Linux `stat`).
 pub fn stat(path: &str) -> VfsResult<FileStat> {
     let (mount_idx, inode) = resolve_path(path)?;
-    let mounts = MOUNTS.lock();
-    mounts[mount_idx].fs.stat(inode)
+    let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
+    fs.stat(inode)
 }
 
 /// Stat a file without following the final symlink (like Linux `lstat`).
 pub fn lstat(path: &str) -> VfsResult<FileStat> {
     let (mount_idx, inode) = resolve_path_no_follow(path)?;
-    let mounts = MOUNTS.lock();
-    mounts[mount_idx].fs.stat(inode)
+    let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
+    fs.stat(inode)
 }
 
 /// Read directory contents. Returns (name, file_type) pairs.
 pub fn readdir(path: &str) -> VfsResult<Vec<(String, FileType)>> {
     let (mount_idx, inode) = resolve_path(path)?;
-    let mounts = MOUNTS.lock();
-    let entries = mounts[mount_idx].fs.readdir(inode)?;
+    let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
+    let entries = fs.readdir(inode)?;
     Ok(entries.into_iter().map(|(name, _ino, ft)| (name, ft)).collect())
 }
 
@@ -1110,9 +1132,9 @@ pub fn readdir(path: &str) -> VfsResult<Vec<(String, FileType)>> {
 pub fn write_file(path: &str, data: &[u8]) -> VfsResult<usize> {
     let (mount_idx, inode) = resolve_path(path)?;
     let n = {
-        let mounts = MOUNTS.lock();
-        mounts[mount_idx].fs.truncate(inode, 0)?;
-        mounts[mount_idx].fs.write(inode, 0, data)?
+        let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
+        fs.truncate(inode, 0)?;
+        fs.write(inode, 0, data)?
     };
     // Fire IN_MODIFY so inotify watchers (and poll/epoll) see the update.
     // This mirrors the notification in the fd-based write() syscall path.
@@ -1142,12 +1164,11 @@ pub fn read_file(path: &str) -> VfsResult<Vec<u8>> {
     }
     // Cache miss — read from VFS.
     let (mount_idx, inode) = resolve_path(path)?;
-    let mounts = MOUNTS.lock();
-    let stat = mounts[mount_idx].fs.stat(inode)?;
+    let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
+    let stat = fs.stat(inode)?;
     let mut buf = alloc::vec![0u8; stat.size as usize];
-    let n = mounts[mount_idx].fs.read(inode, 0, &mut buf)?;
+    let n = fs.read(inode, 0, &mut buf)?;
     buf.truncate(n);
-    drop(mounts);
     // Cache if reasonably sized.
     if buf.len() <= FILE_CACHE_MAX_SIZE {
         let mut cache = FILE_READ_CACHE.lock();
@@ -1160,16 +1181,22 @@ pub fn read_file(path: &str) -> VfsResult<Vec<u8>> {
 /// Append data to a file.
 pub fn append_file(path: &str, data: &[u8]) -> VfsResult<usize> {
     let (mount_idx, inode) = resolve_path(path)?;
-    let mounts = MOUNTS.lock();
-    let stat = mounts[mount_idx].fs.stat(inode)?;
-    mounts[mount_idx].fs.write(inode, stat.size, data)
+    let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
+    let stat = fs.stat(inode)?;
+    fs.write(inode, stat.size, data)
 }
 
 /// Sync (flush) all dirty data in all mounted filesystems to their backing store.
 pub fn sync_all() {
-    let mounts = MOUNTS.lock();
-    for mount in mounts.iter() {
-        let _ = mount.fs.sync();
+    // Snapshot the FS handles, then drop MOUNTS before invoking sync —
+    // sync() may flush to a backing block device which can in turn fault
+    // on a kernel buffer (#82 hazard shape).
+    let fss: Vec<Arc<dyn FileSystemOps>> = {
+        let mounts = MOUNTS.lock();
+        mounts.iter().map(|m| m.fs.clone()).collect()
+    };
+    for fs in fss.iter() {
+        let _ = fs.sync();
     }
 }
 
@@ -1181,8 +1208,8 @@ pub fn rename(old_path: &str, new_path: &str) -> VfsResult<()> {
         return Err(VfsError::Unsupported); // cross-mount rename not supported
     }
     {
-        let mounts = MOUNTS.lock();
-        mounts[old_mount].fs.rename(old_parent, &old_name, new_parent, &new_name)?;
+        let fs = fs_at(old_mount).ok_or(VfsError::NotFound)?.0;
+        fs.rename(old_parent, &old_name, new_parent, &new_name)?;
     }
     // Fire IN_MOVED_FROM / IN_MOVED_TO with a shared non-zero cookie.
     // Use a simple increment from the tick counter as the cookie.
@@ -1198,23 +1225,23 @@ pub fn rename(old_path: &str, new_path: &str) -> VfsResult<()> {
 /// Create a symbolic link at `link_path` pointing to `target`.
 pub fn symlink(link_path: &str, target: &str) -> VfsResult<()> {
     let (mount_idx, parent_inode, name) = resolve_parent(link_path)?;
-    let mounts = MOUNTS.lock();
-    mounts[mount_idx].fs.symlink(parent_inode, &name, target)?;
+    let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
+    fs.symlink(parent_inode, &name, target)?;
     Ok(())
 }
 
 /// Read the target of a symbolic link (does not follow the final symlink).
 pub fn readlink(path: &str) -> VfsResult<String> {
     let (mount_idx, inode) = resolve_path_no_follow(path)?;
-    let mounts = MOUNTS.lock();
-    mounts[mount_idx].fs.readlink(inode)
+    let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
+    fs.readlink(inode)
 }
 
 /// Change permission bits on a file/directory.
 pub fn chmod(path: &str, mode: u32) -> VfsResult<()> {
     let (mount_idx, inode) = resolve_path(path)?;
-    let mounts = MOUNTS.lock();
-    mounts[mount_idx].fs.chmod(inode, mode)
+    let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
+    fs.chmod(inode, mode)
 }
 
 /// Change permission bits on an open file descriptor.
@@ -1233,15 +1260,15 @@ pub fn fchmod(pid: crate::proc::Pid, fd_num: usize, mode: u32) -> VfsResult<()> 
     if is_console || mount_idx == usize::MAX {
         return Ok(());
     }
-    let mounts = MOUNTS.lock();
-    mounts[mount_idx].fs.chmod(inode, mode)
+    let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
+    fs.chmod(inode, mode)
 }
 
 /// Truncate a file to `size` bytes by path.
 pub fn truncate_path(path: &str, size: u64) -> VfsResult<()> {
     let (mount_idx, inode) = resolve_path(path)?;
-    let mounts = MOUNTS.lock();
-    mounts[mount_idx].fs.truncate(inode, size)
+    let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
+    fs.truncate(inode, size)
 }
 
 /// Truncate the file open as `fd_num` for process `pid` to `size` bytes.
@@ -1255,8 +1282,8 @@ pub fn fd_truncate(pid: crate::proc::Pid, fd_num: usize, size: u64) -> VfsResult
         if fd.is_console { return Err(VfsError::Unsupported); }
         (fd.mount_idx, fd.inode)
     };
-    let mounts = MOUNTS.lock();
-    mounts[mount_idx].fs.truncate(inode, size)
+    let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
+    fs.truncate(inode, size)
 }
 
 // ===== Process File Descriptor Operations =====
@@ -1322,21 +1349,18 @@ pub fn open(pid: crate::proc::Pid, path: &str, open_flags: u32) -> VfsResult<usi
         Err(VfsError::NotFound) if open_flags & flags::O_CREAT != 0 => {
             // Create the file using the (possibly redirected) lookup path.
             let (m, parent, name) = resolve_parent(lookup_path)?;
-            let mounts = MOUNTS.lock();
-            let ino = mounts[m].fs.create_file(parent, &name)?;
+            let fs = fs_at(m).ok_or(VfsError::NotFound)?.0;
+            let ino = fs.create_file(parent, &name)?;
             (m, ino, true)
         }
         Err(e) => return Err(e),
     };
 
-    let file_stat = {
-        let mounts = MOUNTS.lock();
-        mounts[mount_idx].fs.stat(inode)?
-    };
+    let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
+    let file_stat = fs.stat(inode)?;
 
     if open_flags & flags::O_TRUNC != 0 && file_stat.file_type == FileType::RegularFile {
-        let mounts = MOUNTS.lock();
-        mounts[mount_idx].fs.truncate(inode, 0)?;
+        fs.truncate(inode, 0)?;
     }
 
     let fd = FileDescriptor {
@@ -1432,9 +1456,8 @@ pub fn close(pid: crate::proc::Pid, fd_num: usize) -> VfsResult<()> {
                 }
             };
             if should_free {
-                let mounts = MOUNTS.lock();
-                if mount_idx < mounts.len() {
-                    let _ = mounts[mount_idx].fs.remove_inode(inode);
+                if let Some((fs, _)) = fs_at(mount_idx) {
+                    let _ = fs.remove_inode(inode);
                 }
             }
         }
@@ -1591,9 +1614,12 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
             }
 
             let mut buffer = unsafe { core::slice::from_raw_parts_mut(buf, count) };
+            // Drop MOUNTS before the FS read: the read may fault on the
+            // user buffer pages (file-backed VMA), and the page-fault
+            // handler also needs MOUNTS — same-thread recursion (#82).
             let n = {
-                let mounts = MOUNTS.lock();
-                mounts[mount_idx].fs.read(inode, offset, &mut buffer)?
+                let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
+                fs.read(inode, offset, &mut buffer)?
             };
 
             // Update offset.
@@ -1815,17 +1841,17 @@ pub fn fd_write(pid: crate::proc::Pid, fd_num: usize, buf: *const u8, count: usi
         return Ok(n);
     }
 
+    // Snapshot the FS handle once and drop MOUNTS before the FS dispatch:
+    // both stat() and write() may touch user buffers and re-enter the PF
+    // handler, which itself needs MOUNTS (#82).
+    let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
     let write_offset = if append {
-        let mounts = MOUNTS.lock();
-        mounts[mount_idx].fs.stat(inode)?.size
+        fs.stat(inode)?.size
     } else {
         offset
     };
 
-    let n = {
-        let mounts = MOUNTS.lock();
-        mounts[mount_idx].fs.write(inode, write_offset, data)?
-    };
+    let n = fs.write(inode, write_offset, data)?;
 
     // Update offset.
     {
@@ -1894,7 +1920,7 @@ pub fn sys_mount(
                 let ri = concrete.root_inode();
                 MOUNTS.lock().push(Mount {
                     path: String::from(target),
-                    fs: Box::new(concrete),
+                    fs: Arc::new(concrete),
                     root_inode: ri,
                 });
             } else {
@@ -1903,7 +1929,7 @@ pub fn sys_mount(
                 let ri = concrete.root_inode();
                 MOUNTS.lock().push(Mount {
                     path: String::from(target),
-                    fs: Box::new(concrete),
+                    fs: Arc::new(concrete),
                     root_inode: ri,
                 });
             }
@@ -1917,7 +1943,7 @@ pub fn sys_mount(
             let _ = mkdir(target); // ensure dir exists
             MOUNTS.lock().push(Mount {
                 path: String::from(target),
-                fs: Box::new(proc_fs),
+                fs: Arc::new(proc_fs),
                 root_inode: proc_root,
             });
             crate::serial_println!("[VFS] mount: procfs mounted at '{}'", target);
@@ -1942,8 +1968,8 @@ pub fn sys_mount(
 /// Runtime `umount` / `umount2` syscall implementation (Linux syscalls 166/168).
 ///
 /// Removes the mount at `target` from the mount table.  The underlying
-/// filesystem and all its in-memory data are freed when the `Box<dyn
-/// FileSystemOps>` is dropped.
+/// filesystem and all its in-memory data are freed when the last `Arc<dyn
+/// FileSystemOps>` reference is dropped.
 ///
 /// # Busy check
 /// A proper EBUSY check would require scanning all open file descriptors for
@@ -1988,7 +2014,9 @@ pub fn sys_umount(target: &str, _flags: u64) -> i64 {
         }
     }
 
-    // Remove the mount.  The dropped Box<dyn FileSystemOps> frees all FS memory.
+    // Remove the mount.  The dropped Arc<dyn FileSystemOps> frees the FS
+    // memory once the last outstanding reference (e.g. an in-flight FS
+    // dispatch from another thread that snapshotted the Arc) is released.
     {
         let mut mounts = MOUNTS.lock();
         if mount_idx >= mounts.len() {
