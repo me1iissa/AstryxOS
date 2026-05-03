@@ -1829,6 +1829,638 @@ def cmd_qmp_xv(args):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# rip-walk — pause at a serial-log marker; walk user RBP chain via QMP
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Phase 18 demand: at a chosen syscall ordinal (the upstream branching choice
+# in libxul/NSPR/GTK that picks "fork glxtest" vs "thread-spawn-only"),
+# capture the user-space RBP chain so we can identify the gating Mozilla
+# function on the stack at that exact moment.
+#
+# The kernel already publishes the saved user RBP via per-CPU storage
+# (`PER_CPU_SYSCALL[cpu].frame_rsp`, populated by syscall_entry).  At any
+# moment a CPU is executing a Linux syscall, frame_rsp[11] is the user RBP
+# and frame_rsp[14] is the user RSP (see kernel/src/syscall/mod.rs).  We
+# read those via QMP `xv` (kernel addresses translate through the active
+# CR3 because the kernel is mapped in higher half of every user CR3),
+# then walk the user RBP chain entirely via QMP `xv` reads against the
+# user CR3.  No kernel rebuild required, no GDB stub required.
+#
+# Output schema (stable for downstream tools):
+# {
+#   "ok": true,
+#   "marker": <regex>, "matched_line": <str>, "match_index": <int>,
+#   "cpu": <int>, "kernel_rip": <hex>, "cr3": <hex>,
+#   "frame_rsp": <hex>,  // kernel pointer to saved user regs
+#   "user_rsp": <hex>, "user_rbp": <hex>,
+#   "frames": [
+#     {"i": 0, "kind": "user_rip", "rip": hex,
+#      "library": str|null, "offset": hex|null, "symbol": str|null},
+#     {"i": 1, "kind": "rbp",     "rip": hex, ...},
+#     ...
+#   ]
+# }
+
+# Slot offset of `rbp` and `user_rsp` in the syscall_entry frame (8-byte
+# words from `frame_rsp`).  Must match the layout in
+# kernel/src/syscall/mod.rs: get_user_rsp_rbp() reads p.add(11) for rbp
+# and p.add(14) for user_rsp.
+_SC_FRAME_RBP_SLOT      = 11
+_SC_FRAME_USER_RSP_SLOT = 14
+
+
+def _kernel_symbol_addr(elf_path: Path, name: str) -> Optional[int]:
+    """Resolve a STT_OBJECT or STT_FUNC symbol's address from the kernel ELF.
+    Returns the integer virtual address or None."""
+    info = _resolve_symbol(elf_path, name)
+    if info is None:
+        return None
+    try:
+        return int(info["addr"], 16)
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def _qmp_xp_bytes(qmp: "QMP", paddr: int, nbytes: int) -> Optional[bytes]:
+    """Read N bytes of guest *physical* memory via QMP `xp`.  Used for the
+    manual page-table walk in `_translate_va_via_cr3`."""
+    resp = qmp.execute("human-monitor-command",
+                        {"command-line": f"xp /{nbytes}bx 0x{paddr:x}"})
+    text = resp.get("return", "") if isinstance(resp, dict) else ""
+    if "Cannot access memory" in text:
+        return None
+    out = bytearray()
+    for ln in text.splitlines():
+        if ":" not in ln:
+            continue
+        _, rhs = ln.split(":", 1)
+        for tok in rhs.split():
+            tok = tok.strip()
+            if tok.startswith("0x") and len(tok) <= 4:
+                try:
+                    out.append(int(tok, 16))
+                except ValueError:
+                    return None
+    if len(out) == 0:
+        return None
+    return bytes(out[:nbytes])
+
+
+def _translate_va_via_cr3(qmp: "QMP", cr3: int, vaddr: int) -> Optional[int]:
+    """Translate a 4-level x86_64 virtual address to a physical address by
+    manually walking the page tables rooted at CR3.  Returns the physical
+    address (with 12-bit offset preserved) or None if any level is not
+    present.
+
+    This is the fallback when QMP's HMP `cpu N`/`x` cannot reach a CR3
+    (e.g. tid=1 was on Firefox's CR3 when the syscall fired but every
+    paused vCPU is now on the kernel's CR3 — between Firefox bursts).
+    """
+    cr3_pa = cr3 & ~0xFFF
+    levels = [
+        (39, "PML4"),
+        (30, "PDPT"),
+        (21, "PD"),
+        (12, "PT"),
+    ]
+    table_pa = cr3_pa
+    for shift, _name in levels:
+        idx = (vaddr >> shift) & 0x1FF
+        entry_pa = table_pa + idx * 8
+        raw = _qmp_xp_bytes(qmp, entry_pa, 8)
+        if raw is None or len(raw) < 8:
+            return None
+        entry = struct.unpack_from("<Q", raw)[0]
+        if (entry & 0x1) == 0:  # not present
+            return None
+        # Bit 7 = PS (huge page): PDPT→1G, PD→2M.  Mask the next-level
+        # index bits below shift and OR in the current va offset.
+        if shift in (30, 21) and (entry & (1 << 7)):
+            base = entry & 0x000F_FFFF_FFFF_F000
+            mask = (1 << shift) - 1
+            return (base & ~mask) | (vaddr & mask)
+        table_pa = entry & 0x000F_FFFF_FFFF_F000
+    # Final PT entry maps a 4 KiB page.
+    return table_pa | (vaddr & 0xFFF)
+
+
+def _qmp_xv_via_cr3(qmp: "QMP", cr3: int, vaddr: int, nbytes: int) -> Optional[bytes]:
+    """Read N bytes of guest virtual memory through an *explicit* CR3 via
+    a manual page-table walk + `xp` reads.  Use when no paused vCPU has
+    the desired user CR3 loaded (the common case mid-walk on this kernel —
+    syscall returned, scheduler switched to kernel CR3, then we paused).
+
+    This walks one page boundary at a time so a multi-page read whose
+    middle page is unmapped still returns the prefix.
+    """
+    out = bytearray()
+    remaining = nbytes
+    cur = vaddr
+    while remaining > 0:
+        page_off = cur & 0xFFF
+        chunk = min(0x1000 - page_off, remaining)
+        pa = _translate_va_via_cr3(qmp, cr3, cur)
+        if pa is None:
+            break
+        raw = _qmp_xp_bytes(qmp, pa, chunk)
+        if raw is None:
+            break
+        out.extend(raw)
+        if len(raw) < chunk:
+            break
+        cur += chunk
+        remaining -= chunk
+    return bytes(out) if out else None
+
+
+def _qmp_xv_u64_via_cr3(qmp: "QMP", cr3: int, vaddr: int) -> Optional[int]:
+    """Read one little-endian u64 at a guest virtual address via an
+    explicit CR3."""
+    raw = _qmp_xv_via_cr3(qmp, cr3, vaddr, 8)
+    if raw is None or len(raw) < 8:
+        return None
+    return struct.unpack_from("<Q", raw)[0]
+
+
+def _qmp_xv_via_qmp(qmp: "QMP", cpu: int, vaddr: int, nbytes: int) -> Optional[bytes]:
+    """Read N bytes of guest *virtual* memory through CPU `cpu`'s active
+    CR3, using a CALLER-SUPPLIED open QMP connection.
+
+    The HMP `cpu N` selection lasts only as long as the QMP connection
+    stays open — issuing `cpu N` then a `x` on a *new* connection fails
+    silently (the second connection's HMP context still defaults to CPU 0,
+    whose CR3 lacks user-space mappings on this kernel).  Take a persistent
+    connection from the caller so all reads against one CPU share the
+    selection, and so we amortise connection setup over a stack walk.
+
+    Returns the raw bytes (best-effort, may be shorter than `nbytes` if
+    only part of the range was readable), or None if the address is
+    entirely unmapped from CPU `cpu`'s CR3.
+    """
+    qmp.execute("human-monitor-command", {"command-line": f"cpu {cpu}"})
+    resp = qmp.execute("human-monitor-command",
+                        {"command-line": f"x /{nbytes}bx 0x{vaddr:x}"})
+    text = resp.get("return", "") if isinstance(resp, dict) else ""
+    if "Cannot access memory" in text:
+        return None
+    out = bytearray()
+    for ln in text.splitlines():
+        if ":" not in ln:
+            continue
+        _, rhs = ln.split(":", 1)
+        for tok in rhs.split():
+            tok = tok.strip()
+            if tok.startswith("0x") and len(tok) <= 4:
+                try:
+                    out.append(int(tok, 16))
+                except ValueError:
+                    return None
+    if len(out) == 0:
+        return None
+    return bytes(out[:nbytes])
+
+
+def _qmp_xv_u64(qmp: "QMP", cpu: int, vaddr: int) -> Optional[int]:
+    """Read one little-endian u64 at a guest virtual address through `cpu`'s
+    CR3, using a caller-supplied open QMP connection."""
+    raw = _qmp_xv_via_qmp(qmp, cpu, vaddr, 8)
+    if raw is None or len(raw) < 8:
+        return None
+    return struct.unpack_from("<Q", raw)[0]
+
+
+def _wait_for_marker(serial_log: str, regex: re.Pattern, timeout_ms: int,
+                      start_offset: int = 0,
+                      occurrence: int = 1) -> Optional[tuple]:
+    """Tail `serial_log` from `start_offset` until `regex` matches `occurrence`
+    times or `timeout_ms` elapses.  Returns (match_text, byte_offset_after,
+    occurrence_count) on success, None on timeout.
+
+    Re-opens the file each poll so growth is observed even on log-rotation.
+    """
+    deadline = time.monotonic() + (timeout_ms / 1000.0)
+    matches_seen = 0
+    last_match: Optional[tuple] = None
+    pos = start_offset
+    while time.monotonic() < deadline:
+        try:
+            with open(serial_log, "rb") as f:
+                f.seek(pos)
+                chunk = f.read()
+        except OSError:
+            time.sleep(0.05)
+            continue
+        if chunk:
+            text = chunk.decode("utf-8", errors="replace")
+            for m in regex.finditer(text):
+                matches_seen += 1
+                end_off = pos + m.end()
+                if matches_seen >= occurrence:
+                    return (m.group(0), end_off, matches_seen)
+                last_match = (m.group(0), pos + m.end(), matches_seen)
+            pos += len(chunk)
+        time.sleep(0.05)
+    return None
+
+
+def cmd_rip_walk(args):
+    """Pause QEMU at a serial-log marker, walk the user RBP chain, symbolise.
+
+    Required: --marker <regex>.  Optional: --frames N (default 32),
+              --occurrence K (default 1, K-th match wins),
+              --timeout-ms M (default 60000),
+              --disk-root DIR (host disk-staging root for symbol lookup).
+
+    Implementation flow:
+      1. Tail the session's serial log waiting for `--marker`.
+      2. On match, QMP `stop` immediately (atomic across all vCPUs).
+      3. QMP `info registers -a` → find tid=1's CPU (the syscall is on
+         the CPU whose RIP is in higher-half AND whose CR3 matches the
+         active user process).  We default to CPU 0 unless --cpu is set
+         (Firefox tid=1 lives on CPU 0 in every observed run).
+      4. Read PER_CPU_SYSCALL[cpu].frame_rsp via QMP xv on the kernel
+         address (`PER_CPU_SYSCALL_addr + cpu * sizeof(slot) + 24`).
+      5. From frame_rsp, read user_rbp (slot 11) and user_rsp (slot 14).
+      6. Walk RBP chain: each frame has [rbp, return_rip] at [rbp, rbp+8].
+      7. Resolve every RIP against the [FFTEST/mmap-so] load-base map +
+         pyelftools symtab cache (same machinery as `ustack`/`rip-sample`).
+      8. QMP `cont` (always — never leave the guest paused on error).
+    """
+    sess     = _load_session(args.sid)
+    qmp_sock = sess.get("qmp_sock") or str(HARNESS_DIR / f"{args.sid}.qmp.sock")
+    serial_log = sess["serial_log"]
+
+    pattern    = re.compile(args.marker)
+    frames_n   = max(1, int(args.frames))
+    occurrence = max(1, int(args.occurrence))
+    timeout_ms = max(0, int(args.timeout_ms))
+    disk_root  = getattr(args, "disk_root", None)
+    target_cpu = int(args.cpu) if args.cpu is not None else None
+    user_cr3   = int(args.user_cr3, 0) if args.user_cr3 is not None else None
+
+    # Establish a starting offset so we don't match historical lines.
+    start_off = 0
+    try:
+        start_off = Path(serial_log).stat().st_size
+    except OSError:
+        pass
+
+    # ── 1. Wait for the marker line ───────────────────────────────────────
+    match = _wait_for_marker(serial_log, pattern, timeout_ms, start_off,
+                              occurrence=occurrence)
+    if match is None:
+        # NB: serial log may simply not have grown yet — caller can retry.
+        _out({
+            "ok": False,
+            "error": "marker not seen",
+            "marker": args.marker,
+            "timeout_ms": timeout_ms,
+            "start_offset": start_off,
+        })
+        return
+
+    matched_line, match_off, occ = match
+
+    # ── 2. Pause guest atomically ─────────────────────────────────────────
+    # We hold a SINGLE persistent QMP connection across the whole walk.
+    # The HMP `cpu N` selection only persists within one connection, so
+    # opening a fresh connection per memory read (the previous design)
+    # would silently fall back to CPU 0's CR3 — which on this kernel
+    # has no user-space mappings, making every user_rsp / rbp read
+    # report "Cannot access memory".
+    qmp = QMP(qmp_sock)
+    if not qmp.connect(timeout=2.0):
+        _err("QMP socket not available")
+    stop_resp = qmp.execute("stop")
+    if "error" in stop_resp:
+        _err(f"QMP stop failed: {stop_resp.get('error')}")
+
+    out: dict = {
+        "ok": False,
+        "marker": args.marker,
+        "matched_line": matched_line.rstrip(),
+        "match_index": occ,
+        "frames": [],
+    }
+
+    try:
+        # ── 3. Read per-CPU register file ────────────────────────────────
+        regs_resp = qmp.execute("human-monitor-command",
+                                 {"command-line": "info registers -a"})
+        regs_text = regs_resp.get("return", "") if isinstance(regs_resp, dict) else ""
+        cpus = _parse_info_registers(regs_text)
+        if not cpus:
+            out["error"] = "no CPUs in info registers"
+            _out(out)
+            return
+
+        # ── Pick the target CPU ──────────────────────────────────────────
+        # The right choice is the CPU whose per-CPU syscall slot was last
+        # populated by a SYSCALL — that's the CPU currently servicing (or
+        # most recently serviced) tid=1's syscall.  We probe slots[0..N]
+        # for non-zero `frame_rsp`; if multiple are populated we prefer
+        # one whose RIP is currently in higher-half kernel space (matches
+        # the marker we paused on).  Falling back to "first CPU with
+        # frame_rsp != 0" handles the common case where tid=1 has already
+        # SYSRET'd back to user-space by the time we observe the marker.
+        kernel_elf = _get_kernel_elf()
+        base = _kernel_symbol_addr(kernel_elf, "PER_CPU_SYSCALL")
+        if base is None:
+            out["error"] = ("PER_CPU_SYSCALL symbol not in kernel ELF — "
+                            "cannot read user RBP without it")
+            _out(out)
+            return
+        # PerCpuSyscallData is repr(C, align(64)): 4 u64 fields = 32 bytes,
+        # padded to 64 bytes by alignment.  Slot stride is therefore 64.
+        slot_stride = 64
+        # Probe each CPU's frame_rsp and rank by liveness.
+        slot_state: list[dict] = []
+        for c in cpus:
+            ci = c["cpu"]
+            slot = base + ci * slot_stride
+            fr   = _qmp_xv_u64(qmp, ci, slot + 24) or 0
+            slot_state.append({
+                "cpu":       ci,
+                "rip":       c.get("rip", 0),
+                "rsp":       c.get("rsp", 0),
+                "rbp":       c.get("rbp", 0),
+                "cr3":       c.get("cr3", 0),
+                "frame_rsp": fr,
+                "in_kernel": (c.get("rip", 0) or 0) >= _KERNEL_VMA_BASE,
+            })
+
+        chosen = None
+        if target_cpu is not None:
+            for s in slot_state:
+                if s["cpu"] == target_cpu:
+                    chosen = s
+                    break
+        # Best: kernel-mode CPU with populated frame_rsp.
+        if chosen is None:
+            for s in slot_state:
+                if s["frame_rsp"] != 0 and s["in_kernel"]:
+                    chosen = s
+                    break
+        # Next best: any CPU with populated frame_rsp (user-mode, post-SYSRET).
+        if chosen is None:
+            for s in slot_state:
+                if s["frame_rsp"] != 0:
+                    chosen = s
+                    break
+        # Last resort: first CPU.
+        if chosen is None:
+            chosen = slot_state[0]
+
+        cpu_idx = chosen["cpu"]
+        kernel_rip = chosen["rip"]
+        cr3 = chosen["cr3"]
+        out["cpu"]        = cpu_idx
+        out["kernel_rip"] = f"{kernel_rip:#x}"
+        out["cr3"]        = f"{cr3:#x}"
+        out["all_cpus"]   = [
+            {"cpu": c["cpu"],
+             "rip": f"{(c.get('rip') or 0):#x}",
+             "rsp": f"{(c.get('rsp') or 0):#x}",
+             "rbp": f"{(c.get('rbp') or 0):#x}",
+             "cr3": f"{(c.get('cr3') or 0):#x}"}
+            for c in cpus
+        ]
+
+        # ── 4. Resolve PER_CPU_SYSCALL slot for the chosen CPU ──────────
+        # We already probed all slots above to make the CPU choice;
+        # `chosen["frame_rsp"]` is the live value from the active CR3.
+        slot_addr      = base + cpu_idx * slot_stride
+        frame_rsp_addr = slot_addr + 24
+        out["per_cpu_syscall_base"] = f"{base:#x}"
+        out["frame_rsp_addr"]       = f"{frame_rsp_addr:#x}"
+        out["per_cpu_slots"]        = [
+            {"cpu": s["cpu"], "frame_rsp": f"{s['frame_rsp']:#x}",
+             "in_kernel": s["in_kernel"]}
+            for s in slot_state
+        ]
+
+        frame_rsp = chosen["frame_rsp"]
+        if not frame_rsp:
+            out["error"] = ("no CPU has a populated PER_CPU_SYSCALL slot — "
+                            "tid=1 may not have entered a syscall yet, or the "
+                            "marker fired during early boot")
+            _out(out)
+            return
+        out["frame_rsp"] = f"{frame_rsp:#x}"
+
+        # ── 5. Read saved user RBP and user RSP from kernel stack ────────
+        # frame_rsp is a kernel-half address (the kernel stack window the
+        # syscall_entry stub pushed user GPRs onto).  Reads here go through
+        # the *current* CPU's CR3 — the higher-half mapping is identical
+        # across all CR3s in this kernel, so any populated CR3 works.
+        user_rbp = _qmp_xv_u64(qmp, cpu_idx,
+                                  frame_rsp + _SC_FRAME_RBP_SLOT * 8)
+        user_rsp = _qmp_xv_u64(qmp, cpu_idx,
+                                  frame_rsp + _SC_FRAME_USER_RSP_SLOT * 8)
+        out["user_rbp"] = f"{(user_rbp or 0):#x}"
+        out["user_rsp"] = f"{(user_rsp or 0):#x}"
+
+        # ── 5a. Decide which CR3 to use for user-space reads ─────────────
+        # If --user-cr3 was supplied, use it verbatim.  Otherwise:
+        #   (a) prefer a paused CPU whose CR3 has user-space mappings
+        #       (PML4[0..255] populated) — that's still on the user
+        #       process's CR3.
+        #   (b) fall back to scanning the serial log for the most-recent
+        #       Firefox/user-process CR3 marker.
+        eff_user_cr3 = None
+        if user_cr3 is not None:
+            eff_user_cr3 = user_cr3
+            out["user_cr3_source"] = "explicit"
+        else:
+            # (a) Probe each CPU's CR3 for a *Firefox-style* PML4 layout:
+            # the bootloader's kernel CR3 has PML4[0..3] populated for the
+            # 4 GiB identity map + PML4[256..] for the higher half, but
+            # NOTHING in PML4[4..255].  A Firefox-side CR3 has PML4[253]
+            # (≈0x7eff_… libxul/heap/thread-stack range) and/or PML4[255]
+            # (≈0x7fff_… main stack) populated — i.e. some entry in [4..255].
+            # We probe that span directly, skipping the [0..3] identity
+            # entries that the kernel CR3 also has.
+            for s in slot_state:
+                cr3_val = s["cr3"]
+                if not cr3_val:
+                    continue
+                pml4_lo = _qmp_xp_bytes(qmp, cr3_val & ~0xFFF, 256 * 8)
+                if not pml4_lo or len(pml4_lo) < 256 * 8:
+                    continue
+                has_user = False
+                for i in range(4, 256):
+                    e = struct.unpack_from("<Q", pml4_lo, i * 8)[0]
+                    if e & 1:
+                        has_user = True
+                        break
+                if has_user:
+                    eff_user_cr3 = cr3_val
+                    out["user_cr3_source"] = f"cpu{s['cpu']}"
+                    break
+            # (b) If no paused CPU is on a user CR3, parse the serial log
+            # for the most recent CR3 marker — Firefox bringup logs lines
+            # like [USER] Bootstrap tid=N: ... CR3=0xNNN.
+            if eff_user_cr3 is None:
+                cr3_re = re.compile(r"CR3=0x([0-9a-fA-F]+)")
+                try:
+                    log_text = Path(serial_log).read_text(errors="replace")
+                except OSError:
+                    log_text = ""
+                # Tally CR3 occurrences: the most-frequently-cited
+                # non-boot CR3 in the log is the user process's.
+                counts: dict[int, int] = {}
+                for m in cr3_re.finditer(log_text):
+                    val = int(m.group(1), 16)
+                    if val and val != 0x3dcd3000 and val < 0x4_0000_0000:
+                        counts[val] = counts.get(val, 0) + 1
+                if counts:
+                    # Pick the highest-count CR3 (a Firefox process's CR3
+                    # is referenced once per syscall trace and once per
+                    # bootstrap, so it dominates).
+                    eff_user_cr3 = max(counts.items(), key=lambda kv: kv[1])[0]
+                    out["user_cr3_source"] = "serial-log"
+        out["user_cr3"] = f"{(eff_user_cr3 or 0):#x}"
+
+        # ── 5b. The leaf user caller RIP at *(user_rsp) ──────────────────
+        # Try the chosen CPU's CR3 first; if that fails (CPU is on kernel
+        # CR3), fall back to manual page-table walk via eff_user_cr3.
+        leaf_rip = None
+        if user_rsp and user_rsp >= 0x1000 and user_rsp < _KERNEL_VMA_BASE:
+            leaf_rip = _qmp_xv_u64(qmp, cpu_idx, user_rsp)
+            if leaf_rip is None and eff_user_cr3:
+                leaf_rip = _qmp_xv_u64_via_cr3(qmp, eff_user_cr3, user_rsp)
+
+        # ── 6. Build symbol resolution context (load-base + cache) ───────
+        try:
+            log_lines = Path(serial_log).read_text(errors="replace").splitlines()
+        except OSError:
+            log_lines = []
+        libs = _build_load_base_map(log_lines)
+        libs.sort(key=lambda L: L["base"])
+
+        def _resolve(rip: int) -> dict:
+            entry = {"rip": f"{rip:#x}", "library": None,
+                     "offset": None, "symbol": None}
+            if rip == 0:
+                return entry
+            ur = _resolve_user_rip(rip, libs, disk_root)
+            if ur is not None:
+                entry.update({
+                    "library": ur["library"],
+                    "offset":  ur["offset"],
+                    "symbol":  ur["symbol"],
+                })
+            return entry
+
+        frames: list[dict] = []
+
+        # Frame 0: the leaf — caller of the libc syscall wrapper.
+        if leaf_rip:
+            f0 = _resolve(leaf_rip)
+            f0.update({"i": 0, "kind": "user_caller"})
+            frames.append(f0)
+
+        # ── 7. Walk RBP chain via QMP xv (live CPU) + CR3 walk fallback ──
+        def _ureadu64(va: int) -> Optional[int]:
+            """User-virtual u64 read with CPU-CR3 then explicit-CR3 fallback."""
+            v = _qmp_xv_u64(qmp, cpu_idx, va)
+            if v is None and eff_user_cr3:
+                v = _qmp_xv_u64_via_cr3(qmp, eff_user_cr3, va)
+            return v
+
+        cur = user_rbp or 0
+        prev = 0
+        for i in range(frames_n):
+            if cur == 0 or cur >= _KERNEL_VMA_BASE or cur < 0x1000:
+                break
+            if (cur & 0x7) != 0:
+                break
+            # Sanity: rbp should march up the stack.  A frame whose saved-rbp
+            # is <= the current rbp indicates a corrupted chain (or the
+            # standard libc/_start sentinel saved-rbp=0).  Stop in either
+            # case rather than risk emitting garbage.
+            if prev != 0 and cur <= prev:
+                break
+            saved_rbp = _ureadu64(cur)
+            saved_rip = _ureadu64(cur + 8)
+            if saved_rip is None:
+                break
+            frame = _resolve(saved_rip)
+            frame.update({"i": len(frames), "kind": "rbp",
+                          "rbp_at": f"{cur:#x}"})
+            frames.append(frame)
+            if saved_rbp is None or saved_rbp == 0:
+                break
+            prev = cur
+            cur  = saved_rbp
+
+        # ── 7b. RBP-chain absent or short — scan up the user RSP for any
+        # word that resolves to a known mapped library.  This is the same
+        # "raw stack scan" trick the [SC-USTACK]/parked-stacks tools use
+        # for FPO-compiled callers (libc/libxul leaf functions don't set
+        # up frame pointers).  Scan up to 256 words of stack.
+        if user_rsp and user_rsp >= 0x1000 and user_rsp < _KERNEL_VMA_BASE:
+            scan_words = 256
+            scan_buf = _qmp_xv_via_qmp(qmp, cpu_idx, user_rsp, scan_words * 8)
+            if (scan_buf is None or len(scan_buf) < 64) and eff_user_cr3:
+                scan_buf = _qmp_xv_via_cr3(qmp, eff_user_cr3, user_rsp,
+                                            scan_words * 8)
+            if scan_buf:
+                seen_libs: set[str] = set()
+                for off in range(0, len(scan_buf) - 8, 8):
+                    word = struct.unpack_from("<Q", scan_buf, off)[0]
+                    if word == 0 or word >= _KERNEL_VMA_BASE:
+                        continue
+                    lib, lib_off = _resolve_frame_to_lib(word, libs)
+                    if lib is None:
+                        continue
+                    # One scan-frame per library — keeps the output compact
+                    # and surfaces the call chain (libc → libxul → libc).
+                    if lib in seen_libs:
+                        continue
+                    seen_libs.add(lib)
+                    fr = _resolve(word)
+                    fr.update({"i": len(frames), "kind": "scan",
+                               "rsp_off": off})
+                    frames.append(fr)
+
+        out["frames"] = frames
+        out["frame_count"] = len(frames)
+
+        # Compact "stack signature" = the lowest non-libc library:symbol
+        # tuple — that is the function name the caller is hunting.
+        gate_lib = None
+        gate_sym = None
+        for fr in frames:
+            lib = fr.get("library") or ""
+            sym = fr.get("symbol")
+            # Skip libc/ld/pthread frames — the gate is the first
+            # *non-libc* frame above the syscall.
+            if lib and not any(s in lib for s in (
+                "libc.so", "libpthread", "ld-musl", "ld-linux",
+                "libdl.so", "libm.so",
+            )):
+                gate_lib, gate_sym = lib, sym
+                break
+        out["gate_library"] = gate_lib
+        out["gate_symbol"]  = gate_sym
+        out["ok"] = True
+    finally:
+        # Always resume — never leave the guest paused on error.
+        try:
+            qmp.execute("cont")
+        except Exception:
+            # Last-resort: spin a fresh one-shot connection in case the
+            # persistent one wedged.  Guest-paused-forever is the worst
+            # outcome we can have here, so always fire `cont`.
+            _qmp_command(qmp_sock, "cont", connect_timeout=2.0)
+        finally:
+            qmp.close()
+
+    _out(out)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Housekeeping / reporting subcommands
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -3421,6 +4053,37 @@ def main():
     p_qmp_xp.add_argument("bytes", help="Number of bytes to read")
     p_qmp_xp.add_argument("--raw", action="store_true")
 
+    # rip-walk — pause at a serial-log marker, walk user RBP chain.
+    p_rwalk = sub.add_parser(
+        "rip-walk",
+        help="Pause at a serial-log marker and walk the user RBP chain via "
+             "QMP; resolve every frame against the [FFTEST/mmap-so] map.  "
+             "Use to identify the user-space gate function at a chosen "
+             "syscall ordinal (e.g. --marker '\\[LINUX-SYS\\] #742 ').")
+    p_rwalk.add_argument("sid")
+    p_rwalk.add_argument("--marker", required=True,
+                          help="Regex matched against incoming serial-log "
+                               "lines; QEMU is paused on first match.")
+    p_rwalk.add_argument("--frames", type=int, default=32,
+                          help="Maximum RBP-chain frames to walk (default 32)")
+    p_rwalk.add_argument("--occurrence", type=int, default=1,
+                          help="K-th match wins (default 1)")
+    p_rwalk.add_argument("--timeout-ms", type=int, default=60000,
+                          dest="timeout_ms",
+                          help="Marker-wait timeout in ms (default 60000)")
+    p_rwalk.add_argument("--cpu", default=None,
+                          help="Force vCPU index (default: first kernel-RIP CPU)")
+    p_rwalk.add_argument("--user-cr3", default=None, dest="user_cr3",
+                          help="Explicit user-process CR3 to use for the "
+                               "user-space stack walk.  Required if every "
+                               "paused vCPU is on the kernel CR3 at pause "
+                               "time (the common case between Firefox "
+                               "syscall bursts).  Default: auto-detect from "
+                               "[FFTEST/...] / [PROC] log lines.")
+    p_rwalk.add_argument("--disk-root", default=None, metavar="DIR",
+                          help="Disk staging root for symbol lookup "
+                               "(see `ustack --disk-root`)")
+
     # _watch: private subcommand used internally by `start` to run the
     # background watcher in a detached process. Not shown in help.
     p_watch = sub.add_parser("_watch")
@@ -3463,6 +4126,7 @@ def main():
         "qmp-regs": cmd_qmp_regs,
         "qmp-xv":   cmd_qmp_xv,
         "qmp-xp":   cmd_qmp_xp,
+        "rip-walk": cmd_rip_walk,
         "_watch":  cmd_run_watcher,
     }
     dispatch[args.cmd](args)
