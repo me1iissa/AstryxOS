@@ -119,10 +119,12 @@ impl AhciBlockDevice {
 
 impl BlockDevice for AhciBlockDevice {
     fn sector_count(&self) -> u64 {
-        // AHCI IDENTIFY would give us exact count; use a large default.
-        // For a 64 MiB disk: 64 * 1024 * 1024 / 512 = 131072 sectors.
-        // We'll return a generous upper bound and let I/O errors handle OOB.
-        131072
+        // Sector count is discovered at port init time via ATA IDENTIFY DEVICE
+        // (T13 ACS-3 §7.12).  Prefer LBA48 (words 100-103) when the device
+        // supports 48-bit addressing; fall back to LBA28 (words 60-61) otherwise.
+        // If IDENTIFY failed, get_port_sector_count() returns FALLBACK_SECTOR_COUNT
+        // and a WARN line was emitted during init.
+        super::ahci::get_port_sector_count(self.port)
     }
 
     fn read_sectors(&self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), BlockError> {
