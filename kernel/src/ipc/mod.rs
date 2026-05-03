@@ -9,6 +9,7 @@ pub mod timerfd;
 pub mod signalfd;
 pub mod inotify;
 pub mod sysv_shm;
+pub mod waitlist;
 
 /// Initialize the IPC subsystem.
 pub fn init() {
