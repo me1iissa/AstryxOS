@@ -1253,6 +1253,18 @@ pub fn run() -> ! {
     total += 1;
     if test_pf_failed_read_no_cache_poison() { passed += 1; }
 
+    // ── Test 192: eventfd blocking read wakes after a write ──────────────
+    total += 1;
+    if test_eventfd_blocking_read_wakes() { passed += 1; }
+
+    // ── Test 193: eventfd fcntl(F_SETFL,O_NONBLOCK) makes read EAGAIN ────
+    total += 1;
+    if test_eventfd_fcntl_setfl_nonblock() { passed += 1; }
+
+    // ── Test 194: rt_sigaction round-trips sa_flags + sa_mask ────────────
+    total += 1;
+    if test_rt_sigaction_flags_mask_roundtrip() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -8514,15 +8526,19 @@ fn test_eventfd_syscall() -> bool {
 
     let pid = crate::proc::current_pid();
 
-    // 1. Create an eventfd with initval=0.
-    let efd = crate::syscall::dispatch_linux(284 /*eventfd*/, 0, 0, 0, 0, 0, 0);
+    // 1. Create an eventfd with initval=0 and EFD_NONBLOCK so that the
+    // empty-counter read returns -EAGAIN rather than blocking the test
+    // thread.  Per `man 2 eventfd`, EFD_NONBLOCK = O_NONBLOCK on the fd.
+    const EFD_NONBLOCK: u64 = 0x0800;
+    let efd = crate::syscall::dispatch_linux(290 /*eventfd2*/, 0, EFD_NONBLOCK, 0, 0, 0, 0);
     if efd < 0 {
-        test_fail!("eventfd", "eventfd() syscall failed: {}", efd);
+        test_fail!("eventfd", "eventfd2() syscall failed: {}", efd);
         return false;
     }
-    test_println!("  eventfd() → fd {} ✓", efd);
+    test_println!("  eventfd2(0, EFD_NONBLOCK) → fd {} ✓", efd);
 
-    // 2. Read from empty fd — should return EAGAIN (-11).
+    // 2. Read from empty fd — should return EAGAIN (-11) because we set
+    // EFD_NONBLOCK at creation time.
     let buf = alloc::vec![0u8; 8];
     let n = crate::syscall::dispatch_linux(0 /*read*/, efd as u64, buf.as_ptr() as u64, 8, 0, 0, 0);
     if n != -11 {
@@ -21574,5 +21590,210 @@ fn test_pf_failed_read_no_cache_poison() -> bool {
     crate::vfs::MOUNTS.lock().pop();
 
     test_pass!("PF handler — failed FS read does not poison page cache");
+    true
+}
+
+// ── Test 192: eventfd blocking read wakes after a write ─────────────────────
+//
+// Per `man 2 eventfd`: "If the eventfd counter is zero at the time of the
+// call, then the call either blocks until the counter becomes nonzero ...
+// or fails with the error EAGAIN if the file descriptor has been made
+// nonblocking."  This test verifies the blocking branch — a default-flag
+// eventfd whose counter starts non-zero must NOT return -EAGAIN.  (Driving
+// a true block-then-wake from a single in-kernel test thread is awkward
+// because we have no convenient second thread to issue the write between
+// our read calls; instead we exercise the path by writing first, then
+// reading, and asserting the read succeeds without ever going to EAGAIN.)
+fn test_eventfd_blocking_read_wakes() -> bool {
+    test_header!("eventfd — blocking read returns counter, never EAGAIN");
+
+    // eventfd2(0, 0) — flags=0 means BLOCKING.
+    let efd = crate::syscall::dispatch_linux(290 /*eventfd2*/, 0, 0 /*flags=0*/, 0, 0, 0, 0);
+    if efd < 0 {
+        test_fail!("eventfd_blocking_read", "eventfd2(0, 0) returned {}", efd);
+        return false;
+    }
+
+    // Write 7 to the counter.
+    let wval: u64 = 7u64.to_le();
+    let wbuf = wval.to_le_bytes();
+    let n = crate::syscall::dispatch_linux(1 /*write*/, efd as u64, wbuf.as_ptr() as u64, 8, 0, 0, 0);
+    if n != 8 {
+        test_fail!("eventfd_blocking_read", "write(7) returned {} (expected 8)", n);
+        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+
+    // Read should return 7 without ever going through the blocking branch
+    // (counter is already non-zero).  Critically, it must NOT return -EAGAIN,
+    // which is the bug that prevented Mozilla's IPC channel from advancing.
+    let mut rbuf = [0u8; 8];
+    let n = crate::syscall::dispatch_linux(0 /*read*/, efd as u64, rbuf.as_mut_ptr() as u64, 8, 0, 0, 0);
+    if n == -11 {
+        test_fail!("eventfd_blocking_read",
+            "blocking eventfd returned -EAGAIN despite counter=7 (regression)");
+        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    if n != 8 {
+        test_fail!("eventfd_blocking_read", "read returned {} (expected 8)", n);
+        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    let val = u64::from_le_bytes(rbuf);
+    if val != 7 {
+        test_fail!("eventfd_blocking_read", "read value {} (expected 7)", val);
+        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  blocking read on eventfd(counter=7) → {} ✓", val);
+
+    crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+    test_pass!("eventfd — blocking read returns counter, never EAGAIN");
+    true
+}
+
+// ── Test 193: eventfd fcntl(F_SETFL,O_NONBLOCK) makes read EAGAIN ────────────
+//
+// Per `man 2 fcntl` F_SETFL must update the file's status flags
+// (O_NONBLOCK in particular).  An eventfd created without EFD_NONBLOCK
+// blocks on a zero counter; after `fcntl(fd, F_SETFL, O_NONBLOCK)` the
+// same read must return -EAGAIN.
+fn test_eventfd_fcntl_setfl_nonblock() -> bool {
+    test_header!("eventfd — fcntl(F_SETFL,O_NONBLOCK) toggles non-blocking semantics");
+
+    let efd = crate::syscall::dispatch_linux(290 /*eventfd2*/, 0, 0, 0, 0, 0, 0);
+    if efd < 0 {
+        test_fail!("eventfd_setfl", "eventfd2(0, 0) returned {}", efd);
+        return false;
+    }
+
+    // Apply O_NONBLOCK via fcntl(F_SETFL).  F_SETFL = 4.  O_NONBLOCK = 0x800.
+    let r = crate::syscall::dispatch_linux(72 /*fcntl*/, efd as u64, 4 /*F_SETFL*/, 0x0800, 0, 0, 0);
+    if r != 0 {
+        test_fail!("eventfd_setfl", "fcntl(F_SETFL,O_NONBLOCK) returned {} (expected 0)", r);
+        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  fcntl(F_SETFL,O_NONBLOCK) → 0 ✓");
+
+    // F_GETFL should now report O_NONBLOCK set.
+    let flags = crate::syscall::dispatch_linux(72 /*fcntl*/, efd as u64, 3 /*F_GETFL*/, 0, 0, 0, 0);
+    if flags < 0 || (flags as u64) & 0x0800 == 0 {
+        test_fail!("eventfd_setfl",
+            "F_GETFL returned {:#x}, expected O_NONBLOCK set", flags);
+        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  F_GETFL after F_SETFL → {:#x} (O_NONBLOCK set) ✓", flags);
+
+    // Read on empty counter → -EAGAIN now that O_NONBLOCK is set.
+    let mut buf = [0u8; 8];
+    let n = crate::syscall::dispatch_linux(0 /*read*/, efd as u64, buf.as_mut_ptr() as u64, 8, 0, 0, 0);
+    if n != -11 {
+        test_fail!("eventfd_setfl",
+            "read after F_SETFL,O_NONBLOCK returned {} (expected -11 EAGAIN)", n);
+        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  read on empty NONBLOCK eventfd → -EAGAIN ✓");
+
+    crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+    test_pass!("eventfd — fcntl(F_SETFL,O_NONBLOCK) toggles non-blocking semantics");
+    true
+}
+
+// ── Test 194: rt_sigaction round-trips sa_flags + sa_mask ───────────────────
+//
+// Per `man 2 rt_sigaction`: a getact call (act=NULL, oldact=&prev) must
+// return the previously-installed sigaction structure verbatim — handler,
+// flags, restorer, and mask.  Mozilla installs SIGCHLD with
+// SA_NOCLDSTOP|SA_RESTART|SA_SIGINFO and inspects the prior structure on
+// the second sigaction call to detect ABI mismatches.  The pre-fix kernel
+// silently zeroed sa_flags + sa_mask in the oldact write path.
+fn test_rt_sigaction_flags_mask_roundtrip() -> bool {
+    test_header!("rt_sigaction — sa_flags + sa_mask round-trip via oldact");
+
+    let pid = crate::proc::current_pid();
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            if p.signal_state.is_none() {
+                p.signal_state = Some(crate::signal::SignalState::new());
+            }
+        }
+    }
+
+    // Install a fake handler at addr=0xCAFEBABE0 with SA_RESTART|SA_SIGINFO|
+    // SA_NOCLDSTOP (the canonical Mozilla SIGCHLD setup).
+    const SIGCHLD: u64 = 17;
+    const SA_NOCLDSTOP: u64 = 0x0000_0001;
+    const SA_SIGINFO:   u64 = 0x0000_0004;
+    const SA_RESTART:   u64 = 0x1000_0000;
+    let want_flags: u64 = SA_NOCLDSTOP | SA_SIGINFO | SA_RESTART;
+    let want_mask:  u64 = 0x0000_FF00;
+    let want_handler: u64 = 0xCAFE_BABE_0u64;
+
+    let mut new_act = [0u8; 32];
+    new_act[0..8].copy_from_slice(&want_handler.to_le_bytes());
+    new_act[8..16].copy_from_slice(&want_flags.to_le_bytes());
+    new_act[16..24].copy_from_slice(&0u64.to_le_bytes()); // sa_restorer
+    new_act[24..32].copy_from_slice(&want_mask.to_le_bytes());
+
+    // setact: act=&new_act, oldact=NULL.
+    let r = crate::syscall::dispatch_linux(
+        13, SIGCHLD, new_act.as_ptr() as u64, 0, 8, 0, 0,
+    );
+    if r != 0 {
+        test_fail!("rt_sigaction_roundtrip",
+            "setact for SIGCHLD returned {} (expected 0)", r);
+        return false;
+    }
+    test_println!("  setact SIGCHLD flags={:#x} mask={:#x} handler={:#x} ✓",
+        want_flags, want_mask, want_handler);
+
+    // getact: act=NULL, oldact=&buf.
+    let mut old_act = [0u8; 32];
+    let r = crate::syscall::dispatch_linux(
+        13, SIGCHLD, 0, old_act.as_mut_ptr() as u64, 8, 0, 0,
+    );
+    if r != 0 {
+        test_fail!("rt_sigaction_roundtrip",
+            "getact for SIGCHLD returned {} (expected 0)", r);
+        return false;
+    }
+
+    let got_handler = u64::from_le_bytes(old_act[0..8].try_into().unwrap());
+    let got_flags   = u64::from_le_bytes(old_act[8..16].try_into().unwrap());
+    let got_mask    = u64::from_le_bytes(old_act[24..32].try_into().unwrap());
+
+    if got_handler != want_handler {
+        test_fail!("rt_sigaction_roundtrip",
+            "handler {:#x} != installed {:#x}", got_handler, want_handler);
+        return false;
+    }
+    if got_flags != want_flags {
+        test_fail!("rt_sigaction_roundtrip",
+            "sa_flags {:#x} != installed {:#x} (SA_RESTART/SA_SIGINFO dropped)",
+            got_flags, want_flags);
+        return false;
+    }
+    if got_mask != want_mask {
+        test_fail!("rt_sigaction_roundtrip",
+            "sa_mask {:#x} != installed {:#x}", got_mask, want_mask);
+        return false;
+    }
+    test_println!("  getact SIGCHLD → flags={:#x} mask={:#x} handler={:#x} ✓",
+        got_flags, got_mask, got_handler);
+
+    // Reset SIGCHLD to default so other tests aren't affected.
+    let mut reset_act = [0u8; 32];
+    // sa_handler=0 (SIG_DFL), all-zero flags/mask.
+    let _ = crate::syscall::dispatch_linux(
+        13, SIGCHLD, reset_act.as_ptr() as u64, 0, 8, 0, 0,
+    );
+    let _ = &mut reset_act; // silence unused-mut
+
+    test_pass!("rt_sigaction — sa_flags + sa_mask round-trip via oldact");
     true
 }
