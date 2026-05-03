@@ -82,6 +82,9 @@ const FIS_TYPE_REG_H2D: u8 = 0x27;
 const ATA_CMD_READ_DMA_EXT: u8 = 0x25;
 /// WRITE DMA EXT (48-bit LBA).
 const ATA_CMD_WRITE_DMA_EXT: u8 = 0x35;
+/// IDENTIFY DEVICE — returns 256 words (512 bytes) of device information.
+/// Defined in T13 ACS-3 §7.12.
+const ATA_CMD_IDENTIFY: u8 = 0xEC;
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -93,6 +96,10 @@ const SECTOR_SIZE: usize = 512;
 const PAGE_SIZE: usize = 4096;
 /// Port signature for SATA disk.
 const SATA_SIG_ATA: u32 = 0x00000101;
+/// Fallback sector count used when IDENTIFY DEVICE fails.
+/// 131072 sectors = 64 MiB at 512 bytes/sector.  A WARN log is emitted
+/// whenever this value is used so the regression is visible.
+const FALLBACK_SECTOR_COUNT: u64 = 131072;
 
 // ── Per-Port DMA State ──────────────────────────────────────────────────────
 
@@ -103,6 +110,9 @@ struct AhciPort {
     fb_phys: u64,       // FIS Base physical address
     ctbl_phys: u64,     // Command Table physical address (slot 0)
     dma_buf_phys: u64,  // DMA staging buffer (1 page = 8 sectors)
+    /// Total addressable LBA sectors discovered via IDENTIFY DEVICE (ACS-3 §7.12).
+    /// Set to FALLBACK_SECTOR_COUNT if IDENTIFY failed; a WARN line is logged.
+    sector_count: u64,
 }
 
 // ── Global State ────────────────────────────────────────────────────────────
@@ -247,12 +257,34 @@ fn init_port(abar: u64, port: u8) -> Option<AhciPort> {
         port, clb_phys, fb_phys, ctbl_phys, dma_buf_phys
     );
 
+    // 10. Discover actual disk capacity via IDENTIFY DEVICE (ACS-3 §7.12).
+    //     This replaces the previous hard-coded 131072-sector assumption and
+    //     prevents silent out-of-bounds I/O on disks larger than 64 MiB.
+    let sector_count = match identify_port(pb, clb_phys, ctbl_phys, dma_buf_phys) {
+        Some(n) => {
+            crate::serial_println!(
+                "[AHCI] Port {}: IDENTIFY OK — {} sectors ({} MiB)",
+                port, n, n * SECTOR_SIZE as u64 / (1024 * 1024)
+            );
+            n
+        }
+        None => {
+            crate::serial_println!(
+                "[AHCI] WARN Port {}: IDENTIFY DEVICE failed, \
+                 using fallback sector count {}",
+                port, FALLBACK_SECTOR_COUNT
+            );
+            FALLBACK_SECTOR_COUNT
+        }
+    };
+
     Some(AhciPort {
         port_num: port,
         clb_phys,
-        fb_phys: fb_phys,
+        fb_phys,
         ctbl_phys,
         dma_buf_phys,
+        sector_count,
     })
 }
 
@@ -407,6 +439,92 @@ fn issue_command(pb: u64) -> Result<(), &'static str> {
     Err("AHCI: command timeout")
 }
 
+// ── IDENTIFY DEVICE ─────────────────────────────────────────────────────────
+
+/// Issue ATA IDENTIFY DEVICE (0xEC) on a port and return the total sector count.
+///
+/// The AHCI HBA transparently bridges the device's PIO data-in transfer to
+/// DMA, placing the 512-byte IDENTIFY response in the PRDT-pointed buffer.
+/// We reuse slot 0's command table and the port's existing DMA staging buffer.
+///
+/// Sector-count extraction follows T13 ACS-3 §7.12 (IDENTIFY DEVICE data):
+/// - Word 83 bit 10: device supports 48-bit LBA addressing.
+/// - LBA48: words 100-103 form a 64-bit LE count (preferred when supported).
+/// - LBA28: words 60-61 form a 32-bit LE count (fallback).
+///
+/// Returns `Some(sector_count)` on success, `None` if the command fails or
+/// the reported sector count is zero (indicating a malformed IDENTIFY block).
+fn identify_port(pb: u64, clb_phys: u64, ctbl_phys: u64, dma_buf_phys: u64)
+    -> Option<u64>
+{
+    // Zero the DMA buffer so stale data cannot confuse the parse below.
+    unsafe { core::ptr::write_bytes(dma_buf_phys as *mut u8, 0, SECTOR_SIZE); }
+
+    // Wait for port to be idle before issuing a new command.
+    if wait_port_idle(pb).is_err() {
+        crate::serial_println!("[AHCI] IDENTIFY: port not idle, skipping");
+        return None;
+    }
+
+    unsafe {
+        // IDENTIFY DEVICE delivers exactly one 512-byte block.
+        // Count field = 1 sector; LBA = 0 (unused for IDENTIFY).
+        build_h2d_fis(ctbl_phys, ATA_CMD_IDENTIFY, 0, 1);
+
+        // Single PRDT entry: 512 bytes into the DMA staging buffer.
+        setup_prdt(ctbl_phys, dma_buf_phys, SECTOR_SIZE as u32);
+
+        // Command header: read direction (device-to-host data), 1 PRDT entry.
+        setup_cmd_header(clb_phys, ctbl_phys, false, 1);
+    }
+
+    if issue_command(pb).is_err() {
+        crate::serial_println!("[AHCI] IDENTIFY: command failed");
+        return None;
+    }
+
+    // The HBA has DMA'd 512 bytes into dma_buf_phys.  Read back as u16 words
+    // in native (little-endian on x86) byte order — the ATA spec defines
+    // IDENTIFY data as little-endian 16-bit words (T13 ACS-3 §7.12.7 Note 1).
+    let identify: [u16; 256] = unsafe {
+        let src = dma_buf_phys as *const u16;
+        let mut buf = [0u16; 256];
+        for (i, slot) in buf.iter_mut().enumerate() {
+            *slot = core::ptr::read_volatile(src.add(i));
+        }
+        buf
+    };
+
+    // Word 83 bit 10: "Device supports 48-bit LBA" (ACS-3 §7.12.7 table 29).
+    // Bits 15:14 must be 0b10 for the word to be valid (not all-ones/all-zeros).
+    let word83_valid = (identify[83] & 0xC000) == 0x4000;
+    let lba48_supported = word83_valid && (identify[83] & (1 << 10) != 0);
+
+    let sector_count: u64 = if lba48_supported {
+        // Words 100-103: 64-bit total user addressable sectors (LBA48).
+        // ACS-3 §7.12.7 table 29, words 100-103.
+        let lba48 = (identify[103] as u64) << 48
+            | (identify[102] as u64) << 32
+            | (identify[101] as u64) << 16
+            | (identify[100] as u64);
+        // Sanity: fall back to LBA28 if LBA48 count is zero (malformed IDENTIFY).
+        if lba48 > 0 { lba48 } else {
+            (identify[61] as u64) << 16 | (identify[60] as u64)
+        }
+    } else {
+        // Words 60-61: 32-bit total user addressable sectors (LBA28).
+        // ACS-3 §7.12.7 table 29, words 60-61.
+        (identify[61] as u64) << 16 | (identify[60] as u64)
+    };
+
+    if sector_count == 0 {
+        crate::serial_println!("[AHCI] IDENTIFY: reported 0 sectors, treating as failed");
+        return None;
+    }
+
+    Some(sector_count)
+}
+
 // ── Initialization ──────────────────────────────────────────────────────────
 
 /// Initialize the AHCI controller: discover ports, set up DMA structures.
@@ -540,6 +658,18 @@ pub fn is_available() -> bool {
 /// Get the list of active SATA port numbers.
 pub fn active_ports() -> Vec<u8> {
     AHCI_PORTS.lock().clone()
+}
+
+/// Return the sector count discovered via IDENTIFY DEVICE for the given port.
+///
+/// Returns `FALLBACK_SECTOR_COUNT` (131072) when the port is not found or
+/// IDENTIFY failed during init (a WARN was logged at init time in that case).
+pub fn get_port_sector_count(port: u8) -> u64 {
+    AHCI_PORT_STATE.lock()
+        .iter()
+        .find(|p| p.port_num == port)
+        .map(|p| p.sector_count)
+        .unwrap_or(FALLBACK_SECTOR_COUNT)
 }
 
 /// Read sectors from a SATA disk using AHCI DMA.
