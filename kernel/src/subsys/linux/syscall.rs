@@ -15,6 +15,64 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+// ── memfd sealing side-table ─────────────────────────────────────────────────
+//
+// Tracks which inodes were created with MFD_ALLOW_SEALING and their current
+// seal mask.  Per memfd_create(2) and fcntl(2): an inode without sealing
+// capability must return -EPERM on F_ADD_SEALS; once F_SEAL_SEAL is added no
+// further seals may be applied.
+//
+// Entry: (inode_number, seal_mask).  Absent = not sealing-capable.
+// Seal constants (same bit definitions as <linux/memfd.h>):
+//   F_SEAL_SEAL         = 0x0001
+//   F_SEAL_SHRINK       = 0x0002
+//   F_SEAL_GROW         = 0x0004
+//   F_SEAL_WRITE        = 0x0008
+//   F_SEAL_FUTURE_WRITE = 0x0010
+const F_SEAL_SEAL:         u32 = 0x0001;
+const F_SEAL_SHRINK:       u32 = 0x0002;
+const F_SEAL_GROW:         u32 = 0x0004;
+const F_SEAL_WRITE:        u32 = 0x0008;
+const F_SEAL_FUTURE_WRITE: u32 = 0x0010;
+const F_SEAL_ALL_VALID:    u32 =
+    F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_FUTURE_WRITE;
+
+static MEMFD_SEALS: spin::Mutex<Vec<(u64, u32)>> = spin::Mutex::new(Vec::new());
+
+/// Register `inode` as sealing-capable with an initial seal mask of 0.
+/// Called from sys_memfd_create when MFD_ALLOW_SEALING is set.
+fn memfd_seals_register(inode: u64) {
+    let mut seals = MEMFD_SEALS.lock();
+    // Guard against double-registration (shouldn't happen, but be safe).
+    if !seals.iter().any(|(ino, _)| *ino == inode) {
+        seals.push((inode, 0));
+    }
+}
+
+/// Look up the current seal mask for `inode`.
+/// Returns `Some(mask)` if sealing-capable, `None` otherwise.
+fn memfd_seals_get(inode: u64) -> Option<u32> {
+    MEMFD_SEALS.lock().iter().find(|(ino, _)| *ino == inode).map(|(_, m)| *m)
+}
+
+/// Add seals to `inode`.  Returns 0 on success, -EPERM/-EINVAL on error.
+fn memfd_seals_add(inode: u64, new_seals: u32) -> i64 {
+    if new_seals & !F_SEAL_ALL_VALID != 0 {
+        return -22; // EINVAL — unknown seal bits
+    }
+    let mut seals = MEMFD_SEALS.lock();
+    match seals.iter_mut().find(|(ino, _)| *ino == inode) {
+        None => -1, // Not sealing-capable (caller converts to -EPERM)
+        Some((_, mask)) => {
+            if *mask & F_SEAL_SEAL != 0 {
+                return -1; // F_SEAL_SEAL is set — no further seals allowed (caller converts to -EPERM)
+            }
+            *mask |= new_seals;
+            0
+        }
+    }
+}
+
 // ===== Linux Syscall ABI Compatibility Layer ================================
 //
 // musl-libc (and other Linux binaries) use Linux x86_64 syscall numbers which
@@ -4094,27 +4152,54 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> i64 {
             }
             -9 // EBADF
         }
-        // F_ADD_SEALS / F_GET_SEALS — memfd sealing API (Linux 3.17+).
+        // F_ADD_SEALS / F_GET_SEALS — memfd sealing API.
         //
-        // Mozilla's IPC layer applies F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL
-        // (often with F_SEAL_FUTURE_WRITE) to every read-only shared-memory
-        // handoff between parent and content processes.  When the call fails
-        // with -EINVAL the parent prints "failed to seal memfd" and the
-        // subsequent "freezeable shared memory was never frozen" warning,
-        // then dereferences a NULL pointer in the post-freeze codepath
-        // (shared_memory_posix.cc:554).  Returning success here keeps the
-        // parent on the sealed-shmem fast path it expects.
+        // Per fcntl(2): F_ADD_SEALS adds the seals in `arg` to the inode's
+        // seal set.  The fd must be writable and the inode must have been
+        // created with MFD_ALLOW_SEALING; otherwise -EPERM is returned.
+        // Once F_SEAL_SEAL is set, no further seals may be added (-EPERM).
+        // Unknown seal bits return -EINVAL.
         //
-        // We currently accept F_ADD_SEALS as a no-op without tracking per-fd
-        // seal state, and F_GET_SEALS always returns 0 ("no seals applied").
-        // mmap(PROT_WRITE, MAP_SHARED) on a "sealed" memfd will still succeed.
-        // Both are a known correctness debt: Mozilla relies on enforcement at
-        // a downstream call site that the strace-diff (issue #99) suggests
-        // is the source of the next plateau (NULL deref at CR2=0xac in
-        // shared_memory_posix.cc post-memfd init).  Phase 15 will introduce
-        // a per-fd seal side-table and enforce on mmap.  See #99 follow-up.
-        1033 /* F_ADD_SEALS */ => 0,
-        1034 /* F_GET_SEALS */ => 0,
+        // F_GET_SEALS returns the current seal mask, or 0 if the inode is
+        // not sealing-capable (matches Linux behaviour — not an error).
+        1033 /* F_ADD_SEALS */ => {
+            // Resolve the inode for this fd.
+            let inode_opt = {
+                let procs = crate::proc::PROCESS_TABLE.lock();
+                procs.iter().find(|p| p.pid == pid).and_then(|p| {
+                    p.file_descriptors.get(fd as usize)
+                        .and_then(|f| f.as_ref())
+                        .map(|f| f.inode)
+                })
+            };
+            let inode = match inode_opt {
+                Some(i) => i,
+                None    => return -9, // EBADF
+            };
+            let rc = memfd_seals_add(inode, arg as u32);
+            if rc == -22 {
+                -22 // EINVAL — unknown seal bits
+            } else if rc < 0 {
+                -1  // EPERM — not sealing-capable or F_SEAL_SEAL already set
+            } else {
+                0
+            }
+        }
+        1034 /* F_GET_SEALS */ => {
+            // Resolve the inode for this fd.
+            let inode_opt = {
+                let procs = crate::proc::PROCESS_TABLE.lock();
+                procs.iter().find(|p| p.pid == pid).and_then(|p| {
+                    p.file_descriptors.get(fd as usize)
+                        .and_then(|f| f.as_ref())
+                        .map(|f| f.inode)
+                })
+            };
+            match inode_opt {
+                None        => -9, // EBADF
+                Some(inode) => memfd_seals_get(inode).unwrap_or(0) as i64,
+            }
+        }
         _ => -22 // EINVAL
     }
 }
@@ -5408,11 +5493,36 @@ fn fill_statfs_buf(buf: *mut u8) {
 /// Regenerate /proc/self/maps for `pid` from the process's live VMA list.
 ///
 /// memfd_create(name, flags) — create an anonymous in-memory file.
-/// Returns an fd pointing to a freshly created, unlinkable tmpfs file.
-/// The file lives at a hidden path /tmp/.memfd_NNNN and is deleted on close.
-fn sys_memfd_create(_name: u64, _flags: u64) -> i64 {
+///
+/// Per memfd_create(2): returns a new file descriptor backed by an
+/// anonymous tmpfs file.  The file is automatically unlinked; it exists
+/// only as long as the fd (and any dups) remain open.
+///
+/// Flags (from <linux/memfd.h>):
+///   MFD_CLOEXEC       (0x0001) — set FD_CLOEXEC on the returned fd.
+///   MFD_ALLOW_SEALING (0x0002) — enable fcntl F_ADD_SEALS / F_GET_SEALS.
+///   MFD_HUGETLB       (0x0004) — backed by huge pages; not supported here.
+fn sys_memfd_create(_name: u64, flags: u64) -> i64 {
     use core::sync::atomic::{AtomicU64, Ordering};
     static MEMFD_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    // MFD flag constants per memfd_create(2).
+    const MFD_CLOEXEC:       u64 = 0x0001;
+    const MFD_ALLOW_SEALING: u64 = 0x0002;
+    const MFD_HUGETLB:       u64 = 0x0004;
+    // Huge-page size tags occupy bits 26–31; reserved but not enforced here.
+    const MFD_HUGETLB_SIZE_MASK: u64 = 0xFC00_0000;
+    const MFD_VALID_FLAGS: u64 =
+        MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB | MFD_HUGETLB_SIZE_MASK;
+
+    // Reject unknown flags per memfd_create(2).
+    if flags & !MFD_VALID_FLAGS != 0 {
+        return -22; // EINVAL
+    }
+    // MFD_HUGETLB is not supported on this kernel configuration.
+    if flags & MFD_HUGETLB != 0 {
+        return -22; // EINVAL — HUGETLB not supported
+    }
 
     let seq = MEMFD_COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = crate::proc::current_pid();
@@ -5435,11 +5545,49 @@ fn sys_memfd_create(_name: u64, _flags: u64) -> i64 {
         return -28; // ENOSPC
     }
 
-    // Open it read/write
-    match crate::vfs::open(pid, path_str, crate::vfs::flags::O_RDWR) {
-        Ok(fd_num) => fd_num as i64,
-        Err(_) => -12, // ENOMEM
+    // Open flags: always O_RDWR; honour MFD_CLOEXEC per memfd_create(2).
+    let open_flags = crate::vfs::flags::O_RDWR
+        | if flags & MFD_CLOEXEC != 0 { 0x0008_0000u32 } else { 0 }; // 0x80000 = O_CLOEXEC
+
+    let fd_num = match crate::vfs::open(pid, path_str, open_flags) {
+        Ok(n) => n,
+        Err(_) => return -12, // ENOMEM
+    };
+
+    // Resolve the inode for this fd so we can register sealing capability.
+    if flags & MFD_ALLOW_SEALING != 0 {
+        let inode_opt = {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            procs.iter().find(|p| p.pid == pid).and_then(|p| {
+                p.file_descriptors.get(fd_num).and_then(|f| f.as_ref()).map(|f| f.inode)
+            })
+        };
+        if let Some(inode) = inode_opt {
+            memfd_seals_register(inode);
+        }
     }
+
+    fd_num as i64
+}
+
+/// Test shim: call sys_memfd_create from in-kernel tests.
+///
+/// `_name` is unused (name is cosmetic); `flags` is the MFD_* flag word.
+#[cfg(feature = "test-mode")]
+pub fn sys_memfd_create_test(_name: u64, flags: u64) -> i64 {
+    sys_memfd_create(_name, flags)
+}
+
+/// Test shim: call sys_fcntl from in-kernel tests.
+#[cfg(feature = "test-mode")]
+pub fn sys_fcntl_test(fd: u64, cmd: u64, arg: u64) -> i64 {
+    sys_fcntl(fd, cmd, arg)
+}
+
+/// Test shim: close an fd from in-kernel tests (delegates to the shared close helper).
+#[cfg(feature = "test-mode")]
+pub fn sys_close_test(fd: u64) -> i64 {
+    crate::syscall::sys_close_test(fd as usize)
 }
 
 /// Generate and write /proc/self/status for `pid` with live process data.
