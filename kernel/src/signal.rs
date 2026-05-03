@@ -106,6 +106,18 @@ pub struct SignalState {
     pub blocked: u64,
     /// Action table indexed by signal number (0..MAX_SIGNAL).
     pub actions: [SigAction; MAX_SIGNAL as usize],
+    /// `sa_flags` value most recently installed for each signal via
+    /// `rt_sigaction(2)`.  Per `man 2 sigaction`, this is the bitwise-OR of
+    /// flags such as `SA_RESTART`, `SA_SIGINFO`, `SA_NOCLDSTOP`, etc.
+    /// Stored verbatim so that `getact` can round-trip the value.  Future
+    /// signal-delivery work consumes this (e.g. `SA_RESTART` to retry the
+    /// interrupted syscall, `SA_SIGINFO` to choose the 3-arg handler ABI).
+    pub action_flags: [u64; MAX_SIGNAL as usize],
+    /// `sa_mask` value most recently installed for each signal — the set
+    /// of additional signals to block while this signal's handler runs.
+    /// Per `man 2 sigaction`, this mask is implicitly augmented with the
+    /// signal being delivered unless `SA_NODEFER` is set.
+    pub action_mask: [u64; MAX_SIGNAL as usize],
 }
 
 impl SignalState {
@@ -114,6 +126,8 @@ impl SignalState {
             pending: 0,
             blocked: 0,
             actions: [SigAction::Default; MAX_SIGNAL as usize],
+            action_flags: [0u64; MAX_SIGNAL as usize],
+            action_mask:  [0u64; MAX_SIGNAL as usize],
         }
     }
 
