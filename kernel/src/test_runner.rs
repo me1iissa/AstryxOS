@@ -163,6 +163,16 @@ pub fn run() -> ! {
     let mut total = 0u32;
     let mut passed = 0u32;
 
+    // ── Test 0a: pipe wake hook (Stream A) ───────────────────────────────
+    // Run before any network/disk tests so a regression here surfaces
+    // immediately rather than after the long pre-amble.
+    total += 1;
+    if test_pipe_wake_hook() { passed += 1; }
+
+    // ── Test 0b: eventfd wake hook (Stream A) ────────────────────────────
+    total += 1;
+    if test_eventfd_wake_hook() { passed += 1; }
+
     // ── Test 1: Network Configuration ───────────────────────────────────
 
     total += 1;
@@ -1296,6 +1306,10 @@ pub fn run() -> ! {
     // ── Test 195: FUTEX_WAIT atomic check-then-queue (lost-wakeup race) ──
     total += 1;
     if test_futex_wait_atomic_check_then_queue() { passed += 1; }
+
+    // (Stream-A pipe / eventfd wake-hook tests run first — see Tests 0a/0b
+    // at the top of this function so failures surface before the suite's
+    // long network/disk pre-amble.)
 
     // ── Summary ─────────────────────────────────────────────────────────
 
@@ -22590,6 +22604,255 @@ fn test_futex_wait_atomic_check_then_queue() -> bool {
 
     test_println!("  all {} waiters drained, no leaked queue entries ✓", N_WAITERS);
     test_pass!("FUTEX_WAIT atomic check-then-queue (lost-wakeup race)");
+    true
+}
+
+// ── Test 196: pipe wake hook — reader parks, writer wakes ────────────────────
+//
+// Verifies the per-pipe wait list integration introduced for Stream A.
+// A reader thread enters `wait_readable` against an empty pipe, parks
+// itself in `Blocked`, and is woken when a peer thread calls
+// `pipe_write` followed by `wake_readers_all`.  Pre-fix the pipe layer
+// had no wait list and the syscall layer's pipe_read returned 0 bytes
+// immediately, so blocked-pipe semantics from `man 7 pipe` were
+// unsatisfiable in-kernel.
+//
+// The test deliberately exercises the kernel-level primitives (not the
+// syscall surface) so it does not depend on per-process file descriptor
+// table state — same shape as the futex check-then-queue test above.
+fn test_pipe_wake_hook() -> bool {
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    test_header!("pipe wake hook — reader parks, writer wakes");
+
+    let pipe_id = crate::ipc::pipe::create_pipe();
+    test_println!("  created pipe id={} ✓", pipe_id);
+
+    static READER_DONE: AtomicU32 = AtomicU32::new(0);
+    static READER_OUTCOME: AtomicU32 = AtomicU32::new(0); // 1 = Ready, 2 = Enqueued+woken, 3 = Gone
+    static PIPE_ID_SLOT: AtomicU64 = AtomicU64::new(0);
+    READER_DONE.store(0, Ordering::SeqCst);
+    READER_OUTCOME.store(0, Ordering::SeqCst);
+    PIPE_ID_SLOT.store(pipe_id, Ordering::SeqCst);
+
+    fn reader_entry() {
+        crate::hal::enable_interrupts();
+        let pid = PIPE_ID_SLOT.load(Ordering::SeqCst);
+        let tid = crate::proc::current_tid();
+        // Park indefinitely on the pipe's reader wait list.
+        match crate::ipc::pipe::wait_readable(pid, u64::MAX) {
+            crate::ipc::pipe::WaitOutcome::Ready => {
+                READER_OUTCOME.store(1, Ordering::SeqCst);
+            }
+            crate::ipc::pipe::WaitOutcome::Enqueued => {
+                crate::sched::schedule();
+                crate::ipc::pipe::waiter_cleanup_reader(pid, tid);
+                READER_OUTCOME.store(2, Ordering::SeqCst);
+            }
+            crate::ipc::pipe::WaitOutcome::Gone => {
+                READER_OUTCOME.store(3, Ordering::SeqCst);
+            }
+        }
+        READER_DONE.store(1, Ordering::SeqCst);
+        crate::proc::exit_thread(0);
+    }
+
+    let was_active = crate::sched::is_active();
+    if !was_active { crate::sched::enable(); }
+
+    let reader_pid = crate::proc::create_kernel_process(
+        "pipe_wake_reader", reader_entry as *const () as u64);
+    test_println!("  spawned reader pid={} ✓", reader_pid);
+
+    // Yield enough times for the reader to reach `wait_readable` and park.
+    for _ in 0..32u32 {
+        crate::sched::yield_cpu();
+        crate::hal::enable_interrupts();
+        for _ in 0..400u32 { core::hint::spin_loop(); }
+    }
+
+    let parked = crate::ipc::pipe::debug_reader_waiter_count(pipe_id);
+    if parked != 1 {
+        test_fail!("pipe_wake_hook",
+            "expected 1 parked reader, found {} (reader did not enter wait_readable)",
+            parked);
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+    test_println!("  reader parked on pipe.read_waiters (count={}) ✓", parked);
+
+    // Write to the pipe and wake.  Use the kernel-level helpers so the
+    // test does not depend on a per-process fd table.
+    let n = crate::ipc::pipe::pipe_write(pipe_id, b"hello").unwrap_or(0);
+    if n != 5 {
+        test_fail!("pipe_wake_hook", "pipe_write returned {} (expected 5)", n);
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+    crate::ipc::pipe::wake_readers_all(pipe_id);
+    test_println!("  wrote 5 bytes + wake_readers_all ✓");
+
+    // Wait for reader to re-run and exit.  Bounded loop so we report
+    // hang rather than freezing the suite.
+    let mut woke = false;
+    for _ in 0..512u32 {
+        crate::sched::yield_cpu();
+        crate::hal::enable_interrupts();
+        for _ in 0..200u32 { core::hint::spin_loop(); }
+        if READER_DONE.load(Ordering::SeqCst) == 1 {
+            woke = true;
+            break;
+        }
+    }
+
+    let outcome = READER_OUTCOME.load(Ordering::SeqCst);
+    let leaked = crate::ipc::pipe::debug_reader_waiter_count(pipe_id);
+
+    // Cleanup: drain the pipe so the close path is clean.
+    let mut drain = [0u8; 5];
+    let _ = crate::ipc::pipe::pipe_read(pipe_id, &mut drain);
+    crate::ipc::pipe::pipe_close_writer(pipe_id);
+    crate::ipc::pipe::pipe_close_reader(pipe_id);
+
+    if !was_active { crate::sched::disable(); }
+
+    if !woke {
+        test_fail!("pipe_wake_hook",
+            "reader did not exit after wake_readers_all (lost wakeup; outcome={})", outcome);
+        return false;
+    }
+    if outcome != 2 {
+        test_fail!("pipe_wake_hook",
+            "reader outcome {} (expected 2 = Enqueued+woken)", outcome);
+        return false;
+    }
+    if leaked != 0 {
+        test_fail!("pipe_wake_hook",
+            "{} stale waiter(s) on PIPE_READ_WAITERS after wake (leaked entry)", leaked);
+        return false;
+    }
+    test_println!("  reader woke promptly (outcome={}, no leaked waiters) ✓", outcome);
+    test_pass!("pipe wake hook — reader parks, writer wakes");
+    true
+}
+
+// ── Test 197: eventfd wake hook — reader parks, write wakes ──────────────────
+//
+// Symmetric to the pipe test: a reader parks via `wait_readable` on a
+// zero-counter eventfd; a peer thread calls `eventfd::write` (which
+// internally invokes `wake_readers_all` via the syscall write hook —
+// here we drive the kernel helper directly), and the reader wakes.
+fn test_eventfd_wake_hook() -> bool {
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    test_header!("eventfd wake hook — reader parks, writer wakes");
+
+    let efd_id = crate::ipc::eventfd::create(0, 0);
+    if efd_id == u64::MAX {
+        test_fail!("eventfd_wake_hook", "eventfd create returned u64::MAX");
+        return false;
+    }
+    test_println!("  created eventfd id={} (counter=0) ✓", efd_id);
+
+    static READER_DONE: AtomicU32 = AtomicU32::new(0);
+    static READER_OUTCOME: AtomicU32 = AtomicU32::new(0);
+    static EFD_SLOT: AtomicU64 = AtomicU64::new(0);
+    READER_DONE.store(0, Ordering::SeqCst);
+    READER_OUTCOME.store(0, Ordering::SeqCst);
+    EFD_SLOT.store(efd_id, Ordering::SeqCst);
+
+    fn reader_entry() {
+        crate::hal::enable_interrupts();
+        let id = EFD_SLOT.load(Ordering::SeqCst);
+        let tid = crate::proc::current_tid();
+        match crate::ipc::eventfd::wait_readable(id, u64::MAX) {
+            crate::ipc::eventfd::WaitOutcome::Ready => {
+                READER_OUTCOME.store(1, Ordering::SeqCst);
+            }
+            crate::ipc::eventfd::WaitOutcome::Enqueued => {
+                crate::sched::schedule();
+                crate::ipc::eventfd::waiter_cleanup(id, tid);
+                READER_OUTCOME.store(2, Ordering::SeqCst);
+            }
+            crate::ipc::eventfd::WaitOutcome::Gone => {
+                READER_OUTCOME.store(3, Ordering::SeqCst);
+            }
+        }
+        READER_DONE.store(1, Ordering::SeqCst);
+        crate::proc::exit_thread(0);
+    }
+
+    let was_active = crate::sched::is_active();
+    if !was_active { crate::sched::enable(); }
+
+    let reader_pid = crate::proc::create_kernel_process(
+        "evfd_wake_reader", reader_entry as *const () as u64);
+    test_println!("  spawned reader pid={} ✓", reader_pid);
+
+    for _ in 0..32u32 {
+        crate::sched::yield_cpu();
+        crate::hal::enable_interrupts();
+        for _ in 0..400u32 { core::hint::spin_loop(); }
+    }
+
+    let parked = crate::ipc::eventfd::debug_reader_waiter_count(efd_id);
+    if parked != 1 {
+        test_fail!("eventfd_wake_hook",
+            "expected 1 parked reader, found {} (reader did not enter wait_readable)",
+            parked);
+        crate::ipc::eventfd::close(efd_id);
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+    test_println!("  reader parked on eventfd.read_waiters (count={}) ✓", parked);
+
+    // Bump counter and wake.
+    if let Err(e) = crate::ipc::eventfd::write(efd_id, 1) {
+        test_fail!("eventfd_wake_hook", "eventfd write returned {}", e);
+        crate::ipc::eventfd::close(efd_id);
+        if !was_active { crate::sched::disable(); }
+        return false;
+    }
+    crate::ipc::eventfd::wake_readers_all(efd_id);
+    test_println!("  posted counter += 1 + wake_readers_all ✓");
+
+    let mut woke = false;
+    for _ in 0..512u32 {
+        crate::sched::yield_cpu();
+        crate::hal::enable_interrupts();
+        for _ in 0..200u32 { core::hint::spin_loop(); }
+        if READER_DONE.load(Ordering::SeqCst) == 1 {
+            woke = true;
+            break;
+        }
+    }
+
+    let outcome = READER_OUTCOME.load(Ordering::SeqCst);
+    let leaked = crate::ipc::eventfd::debug_reader_waiter_count(efd_id);
+
+    // Drain counter + free slot.
+    let _ = crate::ipc::eventfd::try_read(efd_id);
+    crate::ipc::eventfd::close(efd_id);
+
+    if !was_active { crate::sched::disable(); }
+
+    if !woke {
+        test_fail!("eventfd_wake_hook",
+            "reader did not exit after wake_readers_all (lost wakeup; outcome={})", outcome);
+        return false;
+    }
+    if outcome != 2 {
+        test_fail!("eventfd_wake_hook",
+            "reader outcome {} (expected 2 = Enqueued+woken)", outcome);
+        return false;
+    }
+    if leaked != 0 {
+        test_fail!("eventfd_wake_hook",
+            "{} stale waiter(s) on EVENTFD_READ_WAITERS after wake (leaked entry)", leaked);
+        return false;
+    }
+    test_println!("  reader woke promptly (outcome={}, no leaked waiters) ✓", outcome);
+    test_pass!("eventfd wake hook — reader parks, writer wakes");
     true
 }
 
