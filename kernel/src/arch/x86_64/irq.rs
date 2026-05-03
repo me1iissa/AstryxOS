@@ -283,20 +283,18 @@ extern "C" fn timer_tick() {
 
     // Each CPU's LAPIC delivers its own periodic timer interrupt at ~100 Hz.
     // The TICK_COUNT is the *single global* monotonic time-of-day source —
-    // it must therefore advance at exactly one CPU's tick rate, NOT the sum
-    // across CPUs.  Letting every CPU bump TICK_COUNT scales the apparent
-    // wall-clock by the number of online CPUs, which silently breaks every
-    // CLOCK_MONOTONIC consumer (including the userspace vDSO clock_gettime
-    // fast path used by glibc / NSPR / Mozilla event loops).
+    // it must therefore advance at wall-clock rate (~TICK_HZ), independent
+    // of how many CPUs are online and firing.  Letting every CPU naively
+    // `+= 1` scales the apparent wall-clock by the number of online CPUs,
+    // which silently breaks every CLOCK_MONOTONIC consumer (including the
+    // userspace vDSO clock_gettime fast path used by glibc / NSPR / Mozilla
+    // event loops).
     //
-    // Rule:
-    //   * BSP advances TICK_COUNT and the vvar page.
-    //   * APs handle preemption / per-CPU scheduling locally and EOI, but
-    //     do NOT touch the global tick counter or vvar.
-    //
-    // If the BSP is HLT-idle, KVM/the LAPIC will still deliver the BSP's
-    // periodic timer to wake it (this is the standard x86 timer model:
-    // the LAPIC timer is independent of the CPU's HLT state).
+    // Mechanism: TICK_COUNT is TSC-derived.  Any CPU running this ISR
+    // computes `expected = (rdtsc - tsc_at_boot) / tsc_per_tick` and
+    // monotonically CAS-publishes it.  Multiple CPUs racing converge to
+    // the same value; whichever wins the CAS is the sole vvar-page
+    // updater for that step.
     let cpu = super::apic::cpu_index();
     let is_bsp = cpu == 0;
     if cpu < super::apic::MAX_CPUS {
@@ -335,6 +333,7 @@ extern "C" fn timer_tick() {
     // The loop is bounded — if another CPU wins, its value is at least as
     // new and we can stop.
     let mut cur = TICK_COUNT.load(Ordering::Relaxed);
+    let mut we_published = false;
     let tick = loop {
         if new_tick <= cur {
             break cur; // someone else (or our previous ISR) is already ahead
@@ -346,6 +345,7 @@ extern "C" fn timer_tick() {
                 // Update vvar only when WE published the new value, so we
                 // don't double-write between racing CPUs.
                 crate::proc::vdso::vvar_tick(new_tick);
+                we_published = true;
                 break new_tick;
             }
             Err(observed) => {
@@ -359,14 +359,26 @@ extern "C" fn timer_tick() {
     // ── Heartbeat: emit every 500 ticks (~5s at 100 Hz) ─────────────
     // Gives the external watchdog (tools/qemu-watchdog.py) a signal that
     // the timer ISR is still firing.  Zero cost in production builds.
-    // Only the BSP emits — it is the authoritative tick source.
+    //
+    // Emit whenever WE were the CPU that published a tick crossing a 500
+    // boundary.  This is at most one emit per boundary (the CAS guarantees
+    // one publisher) regardless of which CPU is actually firing the LAPIC
+    // — under KVM, the BSP's LAPIC is sometimes silent while APs deliver,
+    // so a BSP-only emit would mute the heartbeat entirely.
     #[cfg(any(feature = "test-mode", feature = "firefox-test"))]
     {
-        if is_bsp && tick > 0 && tick % 500 == 0 {
-            crate::serial_println!("[HB] tick={} cpu={} pf={} sc={}",
-                tick, cpu,
-                crate::arch::x86_64::idt::page_fault_count(),
-                crate::syscall::syscall_count());
+        if we_published && tick > 0 {
+            // Emit if THIS publish crossed a 500-tick boundary.
+            // (cur was the previous value before we CAS'd; tick is what
+            //  we published.)
+            let prev_500 = cur / 500;
+            let now_500  = tick / 500;
+            if now_500 > prev_500 {
+                crate::serial_println!("[HB] tick={} cpu={} pf={} sc={}",
+                    tick, cpu,
+                    crate::arch::x86_64::idt::page_fault_count(),
+                    crate::syscall::syscall_count());
+            }
         }
     }
 
