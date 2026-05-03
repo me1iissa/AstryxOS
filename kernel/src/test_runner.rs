@@ -13239,13 +13239,22 @@ fn test_clock_monotonic_rate_invariant() -> bool {
     test_println!("  wall-clock ratio = {}% of expected (must be 80–125%) ✓",
                   ratio_pct);
 
-    // (c) BUMPS ≥ TICKS: every published value is one CAS success; multiple
-    //     ISRs can publish the same value (no advance), but no advance can
-    //     happen without at least one bump.
-    if dbumps < dticks {
+    // (c) BUMPS in (0, TICKS]: a single CAS-success can advance TICK_COUNT
+    //     by more than 1 if multiple wall-clock ticks elapsed between
+    //     consecutive ISRs (e.g. interrupts disabled in a critical section,
+    //     or simply spaced-out timer firings under VM scheduling jitter).
+    //     So `dbumps <= dticks` is the right upper bound, and we require
+    //     at least one bump to know the canonical path was exercised.
+    if dbumps == 0 {
         test_fail!("monotonic-rate",
-                   "TICK_COUNT_BUMPS delta {} < TICK_COUNT delta {} — \
-                    counter advanced without recording a bump",
+                   "TICK_COUNT advanced {} but no CAS-bump was recorded",
+                   dticks);
+        return false;
+    }
+    if dbumps > dticks {
+        test_fail!("monotonic-rate",
+                   "TICK_COUNT_BUMPS delta {} > TICK_COUNT delta {} — \
+                    bumps without monotonic advance",
                    dbumps, dticks);
         return false;
     }
