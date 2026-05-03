@@ -2926,14 +2926,35 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
     } else if crate::syscall::is_eventfd_fd(pid, fd as usize) {
         if count < 8 { return -22; } // EINVAL
         let efd_id = crate::syscall::get_eventfd_id(pid, fd as usize);
-        return match crate::ipc::eventfd::read(efd_id) {
-            Ok(val) => {
-                let bytes = val.to_le_bytes();
-                unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr, 8); }
-                8
+        // Per `man 2 eventfd`: a read of zero counter blocks until non-zero,
+        // unless the fd is non-blocking (set via EFD_NONBLOCK at creation or
+        // O_NONBLOCK via fcntl(F_SETFL)).  Both flag sources flow through
+        // the per-fd `flags` field and the eventfd entry's creation flags.
+        let nonblock = {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            procs.iter().find(|p| p.pid == pid)
+                .and_then(|p| p.file_descriptors.get(fd as usize).and_then(|f| f.as_ref()))
+                .map(|f| (f.flags & 0x0800) != 0)
+                .unwrap_or(false)
+        } || crate::ipc::eventfd::is_efd_nonblock(efd_id);
+        loop {
+            match crate::ipc::eventfd::try_read(efd_id) {
+                Ok(val) => {
+                    let bytes = val.to_le_bytes();
+                    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr, 8); }
+                    return 8;
+                }
+                Err(-11) if nonblock => return -11, // EAGAIN
+                Err(-11) => {
+                    // Block: yield until counter becomes non-zero or a
+                    // signal interrupts us.  10 ms tick polling matches the
+                    // shape used by sys_select/poll above.
+                    if signal_pending(pid) { return -4; } // EINTR
+                    crate::proc::sleep_ticks(1);
+                }
+                Err(e) => return e,
             }
-            Err(e) => e,
-        };
+        }
     } else if crate::syscall::is_timerfd_fd(pid, fd as usize) {
         if count < 8 { return -22; } // EINVAL
         let tfd_id = crate::syscall::get_timerfd_id(pid, fd as usize);
@@ -3878,7 +3899,26 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> i64 {
             }
             -9 // EBADF
         }
-        F_SETFL => 0, // ignore flag changes (O_NONBLOCK etc.)
+        F_SETFL => {
+            // Per `man 2 fcntl`: F_SETFL sets the file status flags portion
+            // of `f.flags` (O_APPEND, O_NONBLOCK, O_ASYNC, O_DIRECT,
+            // O_NOATIME).  The access mode (O_RDONLY/O_WRONLY/O_RDWR) and
+            // file-creation flags (O_CREAT etc.) are not affected.
+            //
+            // We persist O_NONBLOCK (0x0800) and O_APPEND (0x0400) so that
+            // subsequent read/write calls on eventfds, pipes, and sockets
+            // can honour the documented blocking semantics.
+            const SETTABLE: u64 = 0x0800 | 0x0400; // O_NONBLOCK | O_APPEND
+            let mut procs = crate::proc::PROCESS_TABLE.lock();
+            if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
+                if let Some(Some(f)) = proc.file_descriptors.get_mut(fd as usize) {
+                    f.flags = (f.flags & !(SETTABLE as u32))
+                        | ((arg as u32) & (SETTABLE as u32));
+                    return 0;
+                }
+            }
+            -9 // EBADF
+        }
         // F_ADD_SEALS / F_GET_SEALS — memfd sealing API (Linux 3.17+).
         //
         // Mozilla's IPC layer applies F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL
@@ -4442,30 +4482,51 @@ fn sys_rt_sigaction_linux(sig: u64, act: u64, oldact: u64, _sigsetsize: u64) -> 
     // Step 1: read the requested new action from user memory FIRST, before any
     // kernel lock is held.  Demand-paging that user page may take
     // `PROCESS_TABLE`; doing it under our own held lock would deadlock.
-    let new_action: Option<SigAction> = if act != 0 {
+    //
+    // The Linux `struct kernel_sigaction` on x86_64 (per
+    // `arch/x86/include/uapi/asm/signal.h`) is laid out as:
+    //   u64 sa_handler;       // [0..8)
+    //   u64 sa_flags;         // [8..16)
+    //   u64 sa_restorer;      // [16..24)
+    //   u64 sa_mask[1];       // [24..32) — sigset_t is a single u64 on x86_64
+    let new_handler_addr: Option<u64>;
+    let new_sa_flags: u64;
+    let new_sa_mask: u64;
+    let new_action: Option<SigAction>;
+    if act != 0 {
         let inp = unsafe { core::slice::from_raw_parts(act as *const u8, 32) };
         let handler_addr = u64::from_le_bytes(inp[0..8].try_into().unwrap());
-        let sa_flags = u64::from_le_bytes(inp[8..16].try_into().unwrap());
+        let sa_flags    = u64::from_le_bytes(inp[8..16].try_into().unwrap());
         let sa_restorer = u64::from_le_bytes(inp[16..24].try_into().unwrap());
+        let sa_mask     = u64::from_le_bytes(inp[24..32].try_into().unwrap());
         let restorer = if sa_flags & SA_RESTORER != 0 && sa_restorer != 0 {
             sa_restorer
         } else {
             0 // use kernel trampoline
         };
-        Some(match handler_addr {
+        new_handler_addr = Some(handler_addr);
+        new_sa_flags = sa_flags;
+        new_sa_mask = sa_mask;
+        new_action = Some(match handler_addr {
             0 => SigAction::Default,
             1 => SigAction::Ignore,
             addr => SigAction::Handler { addr, restorer },
-        })
+        });
     } else {
-        None
-    };
+        new_handler_addr = None;
+        new_sa_flags = 0;
+        new_sa_mask = 0;
+        new_action = None;
+    }
+    let _ = new_handler_addr; // currently unused outside the SigAction variant
 
     // Step 2: take the lock, swap in the new action, and capture the prior
     // one for later write-back.  No user-pointer dereferences inside.
     let pid = crate::proc::current_pid();
     let prior_handler_addr: u64;
     let prior_restorer_addr: u64;
+    let prior_sa_flags: u64;
+    let prior_sa_mask: u64;
     {
         let mut procs = crate::proc::PROCESS_TABLE.lock();
         let proc_entry = match procs.iter_mut().find(|p| p.pid == pid) {
@@ -4481,21 +4542,28 @@ fn sys_rt_sigaction_linux(sig: u64, act: u64, oldact: u64, _sigsetsize: u64) -> 
             SigAction::Ignore => (1u64, 0u64),
             SigAction::Handler { addr, restorer } => (addr, restorer),
         };
-        prior_handler_addr = h;
+        prior_handler_addr  = h;
         prior_restorer_addr = r;
+        prior_sa_flags = sig_state.action_flags[sig as usize];
+        prior_sa_mask  = sig_state.action_mask[sig as usize];
         if let Some(new) = new_action {
             sig_state.actions[sig as usize] = new;
+            sig_state.action_flags[sig as usize] = new_sa_flags;
+            sig_state.action_mask[sig as usize]  = new_sa_mask;
         }
     }
 
     // Step 3: write the prior action back to user memory AFTER releasing the
-    // lock so that a demand-page fault on `oldact` can resolve.
+    // lock so that a demand-page fault on `oldact` can resolve.  Per
+    // `man 2 rt_sigaction`, all four words of the previous sigaction must
+    // round-trip — Mozilla's IPC layer compares the value it set against
+    // the value it gets back to detect ABI mismatches.
     if oldact != 0 {
         let out = unsafe { core::slice::from_raw_parts_mut(oldact as *mut u8, 32) };
         out[0..8].copy_from_slice(&prior_handler_addr.to_le_bytes());
-        out[8..16].copy_from_slice(&0u64.to_le_bytes()); // sa_flags
+        out[8..16].copy_from_slice(&prior_sa_flags.to_le_bytes());
         out[16..24].copy_from_slice(&prior_restorer_addr.to_le_bytes());
-        out[24..32].copy_from_slice(&0u64.to_le_bytes()); // sa_mask
+        out[24..32].copy_from_slice(&prior_sa_mask.to_le_bytes());
     }
 
     0
