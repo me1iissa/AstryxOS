@@ -1709,6 +1709,126 @@ def cmd_kdb(args):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# QMP-based register / memory introspection (does not require kdb hostfwd)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# These subcommands drive QEMU's QMP `human-monitor-command` to capture the
+# current architectural state of every vCPU and read guest memory through the
+# active CR3 page table. They are the fallback when kdb's slirp hostfwd is
+# unreliable (a recurring WSL2 + slirp issue) and they work even when no GDB
+# stub has been configured.
+
+_RE_QMP_RIP = re.compile(r"^RIP=([0-9a-fA-F]+)\s+RFL=", re.MULTILINE)
+_RE_QMP_RAX = re.compile(r"^RAX=([0-9a-fA-F]+)\s+RBX=([0-9a-fA-F]+)\s+RCX=([0-9a-fA-F]+)\s+RDX=([0-9a-fA-F]+)", re.MULTILINE)
+_RE_QMP_RSI = re.compile(r"^RSI=([0-9a-fA-F]+)\s+RDI=([0-9a-fA-F]+)\s+RBP=([0-9a-fA-F]+)\s+RSP=([0-9a-fA-F]+)", re.MULTILINE)
+_RE_QMP_R8  = re.compile(r"^R8 =([0-9a-fA-F]+)\s+R9 =([0-9a-fA-F]+)\s+R10=([0-9a-fA-F]+)\s+R11=([0-9a-fA-F]+)", re.MULTILINE)
+_RE_QMP_R12 = re.compile(r"^R12=([0-9a-fA-F]+)\s+R13=([0-9a-fA-F]+)\s+R14=([0-9a-fA-F]+)\s+R15=([0-9a-fA-F]+)", re.MULTILINE)
+_RE_QMP_CR3 = re.compile(r"\bCR3=([0-9a-fA-F]+)")
+_RE_QMP_CPU_HEADER = re.compile(r"^(?:CPU#\s*)?(\d+):\s*$|^CPU#?\s*(\d+)\s*", re.MULTILINE)
+
+
+def _parse_info_registers(text: str) -> list:
+    """Parse QEMU's `info registers -a` text into a list of per-CPU dicts.
+
+    QEMU emits a header like `CPU#0` or `CPU#0:` at the start of each block,
+    followed by RAX/RBX/.../RIP/CR3/etc. lines. We tokenise on the headers and
+    extract the fields we care about for the futex/mutex investigation.
+    """
+    blocks = re.split(r"^(?:CPU#?\s*\d+:?)\s*$", text, flags=re.MULTILINE)
+    headers = re.findall(r"^CPU#?\s*(\d+):?\s*$", text, flags=re.MULTILINE)
+    cpus = []
+    for cpu_idx_str, body in zip(headers, blocks[1:]):
+        cpu = {"cpu": int(cpu_idx_str)}
+        for name, regex, keys in [
+            ("rip", _RE_QMP_RIP, ["rip"]),
+            ("rax", _RE_QMP_RAX, ["rax", "rbx", "rcx", "rdx"]),
+            ("rsi", _RE_QMP_RSI, ["rsi", "rdi", "rbp", "rsp"]),
+            ("r8",  _RE_QMP_R8,  ["r8", "r9", "r10", "r11"]),
+            ("r12", _RE_QMP_R12, ["r12", "r13", "r14", "r15"]),
+        ]:
+            m = regex.search(body)
+            if m:
+                for k, v in zip(keys, m.groups()):
+                    cpu[k] = int(v, 16)
+        m = _RE_QMP_CR3.search(body)
+        if m:
+            cpu["cr3"] = int(m.group(1), 16)
+        cpus.append(cpu)
+    return cpus
+
+
+def cmd_qmp_regs(args):
+    """Pause via QMP, read `info registers -a`, parse, resume.  No GDB needed."""
+    sess = _load_session(args.sid)
+    qmp_sock = sess.get("qmp_sock") or str(HARNESS_DIR / f"{args.sid}.qmp.sock")
+    if not args.no_pause:
+        _qmp_command(qmp_sock, "stop")
+    try:
+        resp = _qmp_command(qmp_sock, "human-monitor-command",
+                             {"command-line": "info registers -a"})
+        text = resp.get("return", "") if isinstance(resp, dict) else ""
+        cpus = _parse_info_registers(text)
+        out = {"cpus": cpus}
+        if args.raw:
+            out["raw"] = text
+        _out(out)
+    finally:
+        if not args.no_pause:
+            _qmp_command(qmp_sock, "cont")
+
+
+def cmd_qmp_xp(args):
+    """Read guest physical memory via QMP `xp`. Useful for page-table walks."""
+    sess = _load_session(args.sid)
+    qmp_sock = sess.get("qmp_sock") or str(HARNESS_DIR / f"{args.sid}.qmp.sock")
+    addr = int(args.addr, 0)
+    nbytes = int(args.bytes, 0)
+    # `xp /Nb 0xADDR` dumps N bytes as hex.  Use /b (byte) so the layout is
+    # unambiguous; we then re-pack to a plain hex string.
+    cmdline = f"xp /{nbytes}bx 0x{addr:x}"
+    resp = _qmp_command(qmp_sock, "human-monitor-command",
+                         {"command-line": cmdline})
+    text = resp.get("return", "") if isinstance(resp, dict) else ""
+    # Lines look like: `0000000007fc0000: 0x12 0x34 ...`
+    hex_bytes = []
+    for ln in text.splitlines():
+        toks = ln.split(":", 1)
+        if len(toks) != 2: continue
+        for t in toks[1].split():
+            t = t.strip()
+            if t.startswith("0x") and len(t) <= 4:
+                hex_bytes.append(t[2:].zfill(2))
+    _out({"addr": f"0x{addr:x}", "bytes": nbytes, "hex": "".join(hex_bytes), "raw": text if args.raw else None})
+
+
+def cmd_qmp_xv(args):
+    """Read guest *virtual* memory via QMP `x` (uses current CR3)."""
+    sess = _load_session(args.sid)
+    qmp_sock = sess.get("qmp_sock") or str(HARNESS_DIR / f"{args.sid}.qmp.sock")
+    addr = int(args.addr, 0)
+    nbytes = int(args.bytes, 0)
+    cpu = int(args.cpu)
+    # `x` uses the current CPU's translation; we select the CPU first so the
+    # walker uses tid=1's CR3 (CPU 0 if tid=1 is on CPU 0).
+    _qmp_command(qmp_sock, "human-monitor-command",
+                  {"command-line": f"cpu {cpu}"})
+    cmdline = f"x /{nbytes}bx 0x{addr:x}"
+    resp = _qmp_command(qmp_sock, "human-monitor-command",
+                         {"command-line": cmdline})
+    text = resp.get("return", "") if isinstance(resp, dict) else ""
+    hex_bytes = []
+    for ln in text.splitlines():
+        toks = ln.split(":", 1)
+        if len(toks) != 2: continue
+        for t in toks[1].split():
+            t = t.strip()
+            if t.startswith("0x") and len(t) <= 4:
+                hex_bytes.append(t[2:].zfill(2))
+    _out({"cpu": cpu, "addr": f"0x{addr:x}", "bytes": nbytes,
+          "hex": "".join(hex_bytes), "raw": text if args.raw else None})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Housekeeping / reporting subcommands
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -3273,6 +3393,34 @@ def main():
     p_wake.add_argument("--disk-root", default=None, metavar="DIR",
                         help="Disk staging root for symbol lookup")
 
+    # qmp-regs / qmp-xv / qmp-xp — QEMU monitor introspection (no GDB needed)
+    p_qmp_regs = sub.add_parser(
+        "qmp-regs",
+        help="Read all CPU registers via QMP `info registers -a` (pauses VM)")
+    p_qmp_regs.add_argument("sid")
+    p_qmp_regs.add_argument("--no-pause", action="store_true",
+                              help="Do not stop/cont the VM around the read")
+    p_qmp_regs.add_argument("--raw", action="store_true",
+                              help="Include raw monitor text in the response")
+
+    p_qmp_xv = sub.add_parser(
+        "qmp-xv",
+        help="Read guest *virtual* memory through the active CR3 via QMP `x`")
+    p_qmp_xv.add_argument("sid")
+    p_qmp_xv.add_argument("addr", help="Virtual address (0x... or decimal)")
+    p_qmp_xv.add_argument("bytes", help="Number of bytes to read")
+    p_qmp_xv.add_argument("--cpu", default="0",
+                            help="vCPU index whose CR3 to use (default 0)")
+    p_qmp_xv.add_argument("--raw", action="store_true")
+
+    p_qmp_xp = sub.add_parser(
+        "qmp-xp",
+        help="Read guest *physical* memory via QMP `xp`")
+    p_qmp_xp.add_argument("sid")
+    p_qmp_xp.add_argument("addr", help="Physical address (0x... or decimal)")
+    p_qmp_xp.add_argument("bytes", help="Number of bytes to read")
+    p_qmp_xp.add_argument("--raw", action="store_true")
+
     # _watch: private subcommand used internally by `start` to run the
     # background watcher in a detached process. Not shown in help.
     p_watch = sub.add_parser("_watch")
@@ -3312,6 +3460,9 @@ def main():
         "parked-stacks": cmd_parked_stacks,
         "wake-attempts": cmd_wake_attempts,
         "rip-sample": cmd_rip_sample,
+        "qmp-regs": cmd_qmp_regs,
+        "qmp-xv":   cmd_qmp_xv,
+        "qmp-xp":   cmd_qmp_xp,
         "_watch":  cmd_run_watcher,
     }
     dispatch[args.cmd](args)
