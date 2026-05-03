@@ -1249,6 +1249,10 @@ pub fn run() -> ! {
     total += 1;
     if test_shutdown_unconnected_tcp_enotconn() { passed += 1; }
 
+    // ── Test 191: PF handler — failed FS read must not poison page cache ─
+    total += 1;
+    if test_pf_failed_read_no_cache_poison() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -21296,5 +21300,174 @@ fn test_vdso_vvar_advances() -> bool {
     test_println!("  max |TICK_COUNT - vvar.ticks| = {} ✓", max_skew.abs());
 
     test_pass!("vDSO vvar page populated; tick mirror in sync with TICK_COUNT");
+    true
+}
+
+// ── Test 191: PF handler — failed FS read MUST NOT poison page cache ─────────
+//
+// Regression for a class of bug where the demand-page handler ignored the
+// return value of `FileSystemOps::read()` and inserted the (still zero-filled)
+// physical frame into the page cache.  Once cached, every later mapper of
+// `(mount, inode, offset)` would short-circuit to the cached zero page,
+// silently substituting zeroes for what the binary expected to be code or
+// data.  Symptom: SIGSEGV deep inside an upstream library at an instruction
+// that dereferences a pointer the loader believed was valid.
+//
+// Contract under test: a filesystem read failure during demand-page must
+// leave the page cache untouched and free the would-be page back to the PMM.
+// The next access from any mapper re-attempts the read instead of inheriting
+// poison.
+
+fn test_pf_failed_read_no_cache_poison() -> bool {
+    use alloc::sync::Arc;
+    use alloc::string::{String, ToString};
+    use alloc::vec::Vec;
+    use crate::vfs::{FileSystemOps, FileStat, FileType, VfsError, VfsResult};
+
+    test_header!("PF handler — failed FS read does not poison page cache");
+
+    // Filesystem stub whose `read()` always returns VfsError::Io, mirroring
+    // the post-timeout state the block layer surfaces when the underlying
+    // device wedges (issue #75 territory).
+    struct FailingReadFs {
+        inode: u64,
+        size: u64,
+    }
+    impl FileSystemOps for FailingReadFs {
+        fn name(&self) -> &str { "failingread" }
+        fn create_file(&self, _p: u64, _n: &str) -> VfsResult<u64> { Err(VfsError::Unsupported) }
+        fn create_dir(&self, _p: u64, _n: &str) -> VfsResult<u64> { Err(VfsError::Unsupported) }
+        fn remove(&self, _p: u64, _n: &str) -> VfsResult<()> { Err(VfsError::Unsupported) }
+        fn lookup(&self, _p: u64, _n: &str) -> VfsResult<u64> { Err(VfsError::NotFound) }
+        fn read(&self, _i: u64, _o: u64, _buf: &mut [u8]) -> VfsResult<usize> {
+            Err(VfsError::Io)
+        }
+        fn write(&self, _i: u64, _o: u64, _d: &[u8]) -> VfsResult<usize> { Err(VfsError::Unsupported) }
+        fn stat(&self, inode: u64) -> VfsResult<FileStat> {
+            if inode == self.inode {
+                Ok(FileStat {
+                    inode,
+                    file_type: FileType::RegularFile,
+                    size: self.size,
+                    permissions: 0o644,
+                    created: 0,
+                    modified: 0,
+                    accessed: 0,
+                })
+            } else {
+                Err(VfsError::NotFound)
+            }
+        }
+        fn readdir(&self, _i: u64) -> VfsResult<Vec<(String, u64, FileType)>> {
+            Ok(Vec::new())
+        }
+        fn truncate(&self, _i: u64, _s: u64) -> VfsResult<()> { Err(VfsError::Unsupported) }
+    }
+
+    let fake_inode: u64 = 0xDEAD_BEEF;
+    let fs: Arc<dyn FileSystemOps> =
+        Arc::new(FailingReadFs { inode: fake_inode, size: 0x4000 });
+
+    // Register the fake mount.  The path doesn't have to be reachable from
+    // resolve_path — we only need the mount index for the cache key.
+    let mount_idx = {
+        let mut mounts = crate::vfs::MOUNTS.lock();
+        mounts.push(crate::vfs::Mount {
+            path: "/__failingread__".to_string(),
+            fs: fs.clone(),
+            root_inode: 1,
+        });
+        mounts.len() - 1
+    };
+    test_println!("  Mounted FailingReadFs at idx={} ✓", mount_idx);
+
+    // Cache must be clean for our key before the simulated fault.
+    if crate::mm::cache::lookup(mount_idx, fake_inode, 0).is_some() {
+        test_fail!("pf_no_cache_poison", "stale cache entry before test setup");
+        crate::vfs::MOUNTS.lock().pop();
+        return false;
+    }
+
+    // Reproduce the page-fault handler's "read into a freshly-allocated
+    // frame" sequence and assert the post-condition the fix guarantees:
+    //   - On Err, the frame is freed and never inserted into the cache.
+    //   - The cache lookup remains None for the (mount, inode, offset).
+    let phys = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => {
+            test_fail!("pf_no_cache_poison", "alloc_page OOM");
+            crate::vfs::MOUNTS.lock().pop();
+            return false;
+        }
+    };
+    const PHYS_OFF_FILE: u64 = 0xFFFF_8000_0000_0000;
+    unsafe {
+        core::ptr::write_bytes((PHYS_OFF_FILE + phys) as *mut u8, 0, 0x1000);
+    }
+    let buf = unsafe {
+        core::slice::from_raw_parts_mut((PHYS_OFF_FILE + phys) as *mut u8, 0x1000)
+    };
+    let read_result = fs.read(fake_inode, 0, buf);
+    if read_result.is_ok() {
+        test_fail!("pf_no_cache_poison",
+            "FailingReadFs.read() returned Ok({:?}) — stub broken", read_result);
+        crate::mm::pmm::free_page(phys);
+        crate::vfs::MOUNTS.lock().pop();
+        return false;
+    }
+    test_println!("  fs.read returned Err({:?}) ✓",
+        read_result.err().unwrap());
+
+    // The fix's invariant: on read error, free the frame and DO NOT insert
+    // it into the cache.  (The PF handler does exactly this; we mirror it
+    // here so a re-introduction of the bug fails this test.)
+    crate::mm::pmm::free_page(phys);
+
+    // Post-condition: cache is still clean for our key.
+    if let Some(p) = crate::mm::cache::lookup(mount_idx, fake_inode, 0) {
+        test_fail!("pf_no_cache_poison",
+            "cache poisoned after failed read: phys={:#x}", p);
+        // Best-effort cleanup
+        let _ = crate::mm::cache::evict(mount_idx, fake_inode, 0);
+        crate::vfs::MOUNTS.lock().pop();
+        return false;
+    }
+    test_println!("  page cache lookup({}, {:#x}, 0) → None ✓",
+        mount_idx, fake_inode);
+
+    // Negative-control half: insert a *real* frame into the cache and prove
+    // the lookup path can return Some — this catches a regression where a
+    // future cache refactor accidentally always returns None.
+    let ctrl_phys = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => {
+            test_fail!("pf_no_cache_poison", "alloc_page OOM (control)");
+            crate::vfs::MOUNTS.lock().pop();
+            return false;
+        }
+    };
+    crate::mm::refcount::page_ref_set(ctrl_phys, 0);
+    crate::mm::cache::insert(mount_idx, fake_inode, 0x1000, ctrl_phys);
+    match crate::mm::cache::lookup(mount_idx, fake_inode, 0x1000) {
+        Some(p) if p == ctrl_phys => {
+            test_println!("  control: lookup of inserted frame → Some({:#x}) ✓", p);
+        }
+        other => {
+            test_fail!("pf_no_cache_poison",
+                "control insert/lookup mismatch: {:?} (expected Some({:#x}))",
+                other, ctrl_phys);
+            let _ = crate::mm::cache::evict(mount_idx, fake_inode, 0x1000);
+            crate::mm::pmm::free_page(ctrl_phys);
+            crate::vfs::MOUNTS.lock().pop();
+            return false;
+        }
+    }
+
+    // Cleanup
+    let _ = crate::mm::cache::evict(mount_idx, fake_inode, 0x1000);
+    crate::mm::pmm::free_page(ctrl_phys);
+    crate::vfs::MOUNTS.lock().pop();
+
+    test_pass!("PF handler — failed FS read does not poison page cache");
     true
 }

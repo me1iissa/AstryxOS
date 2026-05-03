@@ -926,7 +926,30 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                             core::slice::from_raw_parts_mut(
                                 (PHYS_OFF_FILE + phys) as *mut u8, 0x1000)
                         };
-                        let _ = fs.read(inode, foff, buf);
+                        // Filesystem-read failures (e.g. transient block-device
+                        // timeouts) MUST NOT silently produce a zero-filled
+                        // mapping: the page cache treats whatever frame we
+                        // hand it as the authoritative file contents, so a
+                        // single failed read poisons the cache for every
+                        // subsequent mapper of (mount,inode,offset).  POSIX
+                        // ABI on file-backed I/O failure during demand-page
+                        // is a SIGBUS / SIGSEGV; we deliver SIGSEGV by
+                        // failing the page-fault below, releasing the frame
+                        // here so it can be reused.  For pg_idx > 0 (pure
+                        // readahead) the fault will retry on next access; for
+                        // pg_idx == 0 (the faulting page) the user-mode
+                        // signal handler observes the failure rather than
+                        // executing against zeroed-out code/data.
+                        if fs.read(inode, foff, buf).is_err() {
+                            crate::mm::pmm::free_page(phys);
+                            #[cfg(feature = "firefox-test")]
+                            crate::serial_println!(
+                                "[PF/io-err] readahead read failed inode={} foff={:#x} pg_idx={}",
+                                inode, foff, pg_idx);
+                            // Stop the readahead burst — sequential pages from
+                            // the same backing file are likely to fail too.
+                            break;
+                        }
                         pages_to_map[n_pages] = (vaddr, phys, foff);
                         n_pages += 1;
                     } else {
@@ -1056,7 +1079,27 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         core::slice::from_raw_parts_mut(
                             (PHYS_OFF_FILE + phys) as *mut u8, 0x1000)
                     };
-                    let _ = fs.read(inode, file_page_offset, buf);
+                    // See readahead-path commentary above: a failed
+                    // filesystem read here MUST NOT install a zero-filled
+                    // page into the cache, since later mappers of the same
+                    // (mount,inode,offset) will accept the cached frame as
+                    // authoritative file contents.  Free the frame and let
+                    // the page-fault propagate as SIGSEGV — POSIX-equivalent
+                    // behaviour for I/O errors during demand-page.
+                    if fs.read(inode, file_page_offset, buf).is_err() {
+                        crate::mm::pmm::free_page(phys);
+                        #[cfg(feature = "firefox-test")]
+                        crate::serial_println!(
+                            "[PF/io-err] single-page read failed inode={} foff={:#x} addr={:#x}",
+                            inode, file_page_offset, page_addr);
+                        return false;
+                    }
+                } else {
+                    // We never even reached the FS dispatch (MOUNTS spin
+                    // bound exhausted).  Don't poison the cache with a
+                    // zero page — fail the fault.
+                    crate::mm::pmm::free_page(phys);
+                    return false;
                 }
                 crate::mm::cache::insert(mount_idx, inode, file_page_offset, phys);
                 // Single-page fallback always aliases the cache frame
