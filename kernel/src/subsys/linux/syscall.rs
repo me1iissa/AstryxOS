@@ -4747,14 +4747,35 @@ pub fn sys_futex_linux(
 
     match op {
         0 | 9 => {
-            // FUTEX_WAIT / FUTEX_WAIT_BITSET: block if *uaddr == val
-            let current = match unsafe { crate::syscall::user_read_u32(uaddr) } {
-                Some(v) => v,
-                None => return -14, // EFAULT
-            };
-            if current as u64 != val {
-                return -11; // EAGAIN — value changed
-            }
+            // FUTEX_WAIT / FUTEX_WAIT_BITSET: block if *uaddr == val.
+            //
+            // Lost-wakeup race fix (post-PR-#123 wedge): the value-vs-`val`
+            // recheck and the wait-queue insertion MUST occur under the same
+            // critical section as the FUTEX_WAKE-side queue scan, otherwise a
+            // concurrent waker can race past an arriving waiter and observe
+            // an empty queue, returning `woken=0` while the waiter then
+            // enqueues itself with no wake on the way.
+            //
+            // Per `man 2 futex` (FUTEX_WAIT semantics):
+            //   "If the thread starts to sleep, it is considered a waiter
+            //    on this futex word.  If the futex value does not match val,
+            //    then the call fails immediately with EAGAIN.  […]  The
+            //    purpose of the comparison is to prevent lost wake-ups: if
+            //    another thread changes the value of the futex word between
+            //    the calling thread's load and the kernel's check that the
+            //    thread should sleep, the kernel returns EAGAIN."
+            //
+            // The "kernel's check" must be inside the wait-queue critical
+            // section — otherwise the lost-wakeup window the comparison is
+            // meant to close is reopened by the kernel itself.  The matching
+            // pattern in mainline Linux is `futex_wait_setup` in
+            // `kernel/futex/waitwake.c`: the comparison-and-enqueue is one
+            // critical section, gated by the futex hash bucket spinlock.
+            //
+            // Lock order: FUTEX_WAITERS → THREAD_TABLE.  We hold FUTEX_WAITERS
+            // across the THREAD_TABLE acquire so that any concurrent
+            // FUTEX_WAKE on the same key blocks on FUTEX_WAITERS until we
+            // have both registered as a waiter and transitioned to Blocked.
 
             // Per `futex(2)`: an absolute CLOCK_REALTIME deadline that has
             // already passed must return ETIMEDOUT immediately, without
@@ -4769,20 +4790,62 @@ pub fn sys_futex_linux(
                 return -110; // ETIMEDOUT
             }
 
+            // Validate the user pointer up front (cheap — no locks held).
+            // Holding FUTEX_WAITERS across `user_read_u32` is otherwise
+            // safe (no allocation, no further locks, no #PF handler that
+            // would re-enter the futex queue), but failing fast on EFAULT
+            // before touching the queue avoids a needless lock acquire.
+            if !crate::syscall::validate_user_ptr(uaddr, 4) || (uaddr & 3) != 0 {
+                return -14; // EFAULT
+            }
+
             let tid = crate::proc::current_tid();
+
+            // Compute the wake deadline (100 Hz tick → 10 ms per tick).
+            let wake_tick = match timeout_ns {
+                TimeoutNs::Relative(ns) => {
+                    let now = crate::arch::x86_64::irq::get_ticks();
+                    let delta_ticks = (ns / 10_000_000).max(1);
+                    now.saturating_add(delta_ticks)
+                }
+                TimeoutNs::Indefinite => u64::MAX,
+                TimeoutNs::AlreadyExpired => {
+                    // Handled at function entry — keep defensive.
+                    crate::arch::x86_64::irq::get_ticks()
+                }
+            };
+
+            // ── Single critical section: check-then-queue under FUTEX_WAITERS ──
+            //
+            // The helper takes FUTEX_WAITERS, re-reads `*uaddr` under the
+            // lock, compares to `val`, enqueues us on match, then takes
+            // THREAD_TABLE (lock order: FUTEX_WAITERS → THREAD_TABLE) and
+            // marks us Blocked.  Both locks are dropped on return; the
+            // caller (us) invokes `schedule()` afterwards.
+            //
+            // A concurrent FUTEX_WAKE on the same key blocks on
+            // FUTEX_WAITERS until we have both registered as a waiter and
+            // transitioned to Blocked, so it cannot return `woken=0` while
+            // we're still mid-registration.
+            match crate::syscall::futex_wait_check_and_enqueue(
+                pid, uaddr, val, tid, wake_tick,
+                || unsafe { crate::syscall::user_read_u32(uaddr) },
+            ) {
+                crate::syscall::FutexWaitOutcome::Enqueued     => {}
+                crate::syscall::FutexWaitOutcome::ValueMismatch => return -11, // EAGAIN
+                crate::syscall::FutexWaitOutcome::Fault         => return -14, // EFAULT
+            }
+
+            // ── Diagnostics live OUTSIDE the critical section ──────────────
+            //
+            // serial_println! is not free (UART MMIO + a Mutex on the writer)
+            // and any ms it spends with the wait-queue lock held would widen
+            // the race window the fix above is meant to close.  Emit the
+            // [FUTEX_WAIT_REG] line and the rbp-chain walk now — the waiter
+            // is already on the queue and Blocked, so a wake racing with
+            // these prints is correct.
             #[cfg(feature = "firefox-test")]
             {
-                // Capture the user-mode call site of this futex_wait directly
-                // from the trap frame: gives the harness per-tid leaf frame
-                // info without needing a kdb round-trip (which is fragile under
-                // SLIRP hostfwd).  RBP supports a four-deep rbp-chain walk
-                // when paired with the [FFTEST/mmap-so] table.
-                //
-                // Both helpers read only from the per-CPU PER_CPU_SYSCALL
-                // array populated by syscall_entry — no user-memory deref
-                // happens here, so the read cannot fault.  `get_user_rsp_rbp`
-                // returns (0, 0) when the saved frame_rsp is zero, so a
-                // non-syscall caller would degrade cleanly.
                 let user_rip = unsafe { crate::syscall::get_user_rip() };
                 let (user_rsp, user_rbp) = crate::syscall::get_user_rsp_rbp();
                 crate::serial_println!(
@@ -4790,10 +4853,6 @@ pub fn sys_futex_linux(
                      rip={:#x} rsp={:#x} rbp={:#x}",
                     tid, pid, uaddr, val, futex_op, user_rip, user_rsp, user_rbp
                 );
-                // Walk the rbp chain so the harness can resolve each parked
-                // worker's libxul callsite without needing a kdb round-trip
-                // or a host-side GDB attach.  Only walked when the caller
-                // is in user mode (rbp non-zero, rsp under KERNEL_VIRT_BASE).
                 if user_rbp != 0 && user_rsp < astryx_shared::KERNEL_VIRT_BASE {
                     let cr3 = crate::mm::vmm::get_cr3();
                     crate::syscall::ring::dump_futex_wait_stack(
@@ -4801,31 +4860,7 @@ pub fn sys_futex_linux(
                     );
                 }
             }
-            {
-                let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
-                waiters.entry((pid, uaddr)).or_insert_with(Vec::new).push(tid);
-            }
 
-            // Block the thread with optional timeout deadline (approximate via tick count).
-            {
-                let mut threads = crate::proc::THREAD_TABLE.lock();
-                if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
-                    t.state = crate::proc::ThreadState::Blocked;
-                    // Approximate: 100 Hz tick, so 1 tick = 10 ms = 10_000_000 ns
-                    t.wake_tick = match timeout_ns {
-                        TimeoutNs::Relative(ns) => {
-                            let now = crate::arch::x86_64::irq::get_ticks();
-                            let delta_ticks = (ns / 10_000_000).max(1);
-                            now.saturating_add(delta_ticks)
-                        }
-                        TimeoutNs::Indefinite => u64::MAX,
-                        TimeoutNs::AlreadyExpired => {
-                            // Handled above — unreachable here, but stay safe.
-                            crate::arch::x86_64::irq::get_ticks()
-                        }
-                    };
-                }
-            }
             crate::sched::schedule();
 
             // Woken (or timed out). Clean up from wait queue.
