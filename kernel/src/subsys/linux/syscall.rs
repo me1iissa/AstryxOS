@@ -134,6 +134,15 @@ fn write_sockaddr_in(addr_ptr: u64, addrlen_ptr: *mut u32,
     }
 }
 
+/// Test-only re-export of [`write_sockaddr_in`] so the headless suite
+/// can exercise the truncation/in-out semantics in isolation without
+/// driving the full recvfrom syscall stub from kernel space.
+#[doc(hidden)]
+pub fn test_write_sockaddr_in(addr_ptr: u64, addrlen_ptr: *mut u32,
+                               ip: [u8; 4], port: u16, cap: usize) {
+    write_sockaddr_in(addr_ptr, addrlen_ptr, ip, port, cap);
+}
+
 /// Dispatch a Linux x86_64 syscall.
 ///
 /// Maps Linux syscall numbers to AstryxOS handlers, handling differences
@@ -747,11 +756,24 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             }
         }
         // 45: recvfrom(sockfd, buf, len, flags, addr, addrlen)
+        //
+        // Per IEEE 1003.1 §recvfrom and `recvfrom(2)`: if `addr` is
+        // non-NULL the kernel writes the source 4-tuple of the dequeued
+        // datagram (UDP) or the connected peer (TCP).  Honours the in/out
+        // semantics of `addrlen`: a smaller user buffer truncates the
+        // sockaddr_in but `*addrlen` is still set to the unmodified
+        // struct size (16) so callers can detect truncation.  When `addr`
+        // is NULL the address is silently dropped (RFC 768 / man-page
+        // back-compat — many UDP clients pass NULL when they don't care).
+        // AF_UNIX SOCK_DGRAM is not implemented yet, so the AF_UNIX path
+        // continues to ignore the address out-params.
         45 => {
             let pid = crate::proc::current_pid();
             let fd = arg1 as usize;
             let buf_ptr = arg2 as *mut u8;
             let len = arg3 as usize;
+            let addr_ptr     = arg5;
+            let addrlen_ptr  = arg6 as *mut u32;
             if crate::syscall::is_unix_socket_fd(pid, fd) {
                 let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
                 let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, len) };
@@ -759,10 +781,22 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             } else {
                 if !crate::syscall::is_socket_fd(pid, fd) { return -9; }
                 let socket_id = crate::syscall::get_socket_id(pid, fd);
-                match crate::net::socket::socket_recv(socket_id) {
-                    Ok(data) => {
+                match crate::net::socket::socket_recvfrom(socket_id) {
+                    Ok((data, src_ip, src_port)) => {
                         let n = data.len().min(len);
-                        if n > 0 { unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, n); } }
+                        if n > 0 {
+                            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, n); }
+                        }
+                        // Only marshal the source address when the caller
+                        // asked for it (both pointers non-NULL) AND we
+                        // actually returned a payload.  A zero-byte read
+                        // must leave `*addrlen` untouched per POSIX —
+                        // the contents of the sockaddr buffer are
+                        // unspecified when no message was received.
+                        if n > 0 && addr_ptr != 0 && !addrlen_ptr.is_null() {
+                            let cap = unsafe { core::ptr::read(addrlen_ptr) } as usize;
+                            write_sockaddr_in(addr_ptr, addrlen_ptr, src_ip, src_port, cap);
+                        }
                         n as i64
                     }
                     Err(_) => -11,
