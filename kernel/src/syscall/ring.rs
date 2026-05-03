@@ -567,3 +567,110 @@ pub fn dump_exit_stack(pid: u64, cr3: u64, rsp: u64, rbp: u64) {
     }
     crate::serial_println!("[SC-RING-STACK-END]");
 }
+
+/// Compact RBP-chain walk for futex_wait registration sites.
+///
+/// Walks up to `MAX_FRAMES` frames and emits a single tagged line:
+///
+///     [FUTEX_WAIT_STACK] tid=<N> pid=<N> uaddr=<hex> leaf=<rip> \
+///         f1=<rip> f2=<rip> ... f7=<rip>
+///
+/// Combined with the [FFTEST/mmap-so] table the harness can resolve each
+/// frame to <library>+<offset> and (with --symbolise) <symbol>+<delta>.
+/// This is the minimum information needed to identify which Mozilla
+/// CondVar / Semaphore wait-site a parked worker is blocked on, without
+/// needing a kdb round-trip or a host-side GDB attach (both of which are
+/// fragile under SLIRP+e1000 hostfwd).
+///
+/// SAFETY-of-fault-recovery: every memory read uses `read_user_u64_safe`
+/// which walks the page table via `virt_to_phys_in` and returns `None` on
+/// any unmapped step.  No PF can fire from this path.  The caller must
+/// supply `cr3` of the *current* thread's address space (i.e. read by
+/// `crate::mm::vmm::get_cr3()` while still on the calling thread's CR3).
+/// Emit a single line of up to N hex u64 words from a user stack so the
+/// harness can do a stack-scan symbolisation pass (catches return addresses
+/// of frames whose callee was built with -fomit-frame-pointer, where the
+/// rbp-chain walker dies after one or two frames).
+///
+/// Output: `[FUTEX_WAIT_SCAN] tid=<N> pid=<N> rsp=<hex> w0=<hex> w1=<hex> ...`
+///
+/// Words are read with `read_user_u64_safe`; an unmapped page truncates
+/// the suffix.  The default depth (32 words = 256 bytes of stack) is small
+/// enough to keep the line under the serial driver's 1024-byte budget but
+/// deep enough to capture two or three frames' worth of return-address
+/// candidates above the futex syscall's argument-pass region.
+fn dump_futex_wait_scan(tid: u64, pid: u64, cr3: u64, rsp: u64) {
+    // 128 words = 1 KiB of stack — enough to walk past pthread_cond_wait's
+    // local-variable region and capture the libxul/libnspr return address
+    // of whatever user code called pthread_cond_wait or sem_wait.  Emitted
+    // as a single line to stay below the serial driver's 4 KiB budget
+    // (128 × ~22 bytes per " w<idx>=<hex>" tag ≈ 2.8 KiB).
+    const WORDS: u64 = 128;
+    let mut suffix = alloc::string::String::with_capacity(WORDS as usize * 22);
+    for i in 0..WORDS {
+        let va = rsp.wrapping_add(i.wrapping_mul(8));
+        if va >= astryx_shared::KERNEL_VIRT_BASE { break; }
+        match read_user_u64_safe(cr3, va) {
+            Some(w) => {
+                let _ = core::fmt::Write::write_fmt(
+                    &mut suffix,
+                    format_args!(" w{}={:#x}", i, w),
+                );
+            }
+            None => break,
+        }
+    }
+    crate::serial_println!(
+        "[FUTEX_WAIT_SCAN] tid={} pid={} rsp={:#x}{}",
+        tid, pid, rsp, suffix
+    );
+}
+
+pub fn dump_futex_wait_stack(tid: u64, pid: u64, uaddr: u64, cr3: u64,
+                             leaf_rip: u64, rsp: u64, rbp: u64) {
+    // Stack-scan pass first — catches return addresses where the rbp chain
+    // is unreliable (libxul / libnspr are -fomit-frame-pointer in release
+    // builds, so the rbp-chain walk often dies after f1-f2 inside libc).
+    dump_futex_wait_scan(tid, pid, cr3, rsp);
+    const MAX_FRAMES: u32 = 7;
+    // Build the suffix incrementally so we emit a single line.  An empty
+    // chain still prints the leaf — useful when libc's sem_wait clobbers
+    // RBP before parking and the chain dies at frame 0.
+    let mut suffix = alloc::string::String::with_capacity(8 * 24);
+    let mut cur_rbp = rbp;
+    let mut prev_rbp: u64 = 0;
+    for i in 0..MAX_FRAMES {
+        if cur_rbp == 0 || cur_rbp < 0x1000 { break; }
+        if cur_rbp >= astryx_shared::KERNEL_VIRT_BASE { break; }
+        if cur_rbp & 0x7 != 0 { break; }
+        let saved_rbp = match read_user_u64_safe(cr3, cur_rbp) {
+            Some(v) => v, None => break,
+        };
+        let saved_rip = match read_user_u64_safe(cr3, cur_rbp.wrapping_add(8)) {
+            Some(v) => v, None => break,
+        };
+        // Reject obviously bogus RIPs (zero, kernel half).  Keeps the
+        // emitted line tight and the post-processor simple.
+        if saved_rip == 0 || saved_rip >= astryx_shared::KERNEL_VIRT_BASE {
+            break;
+        }
+        // i is 0..MAX_FRAMES; format the ordinal one-based for parity with
+        // [SC-RING-STACK] frame[i] semantics.
+        let _ = core::fmt::Write::write_fmt(
+            &mut suffix,
+            format_args!(" f{}={:#x}", i + 1, saved_rip),
+        );
+        let _ = saved_rbp;
+        // Cycle / descent guard: each saved_rbp must be strictly higher
+        // than the current one and within a reasonable stack window.
+        if saved_rbp <= cur_rbp { break; }
+        if saved_rbp.wrapping_sub(cur_rbp) > 0x20_0000 { break; }
+        prev_rbp = cur_rbp;
+        cur_rbp = saved_rbp;
+        let _ = prev_rbp;
+    }
+    crate::serial_println!(
+        "[FUTEX_WAIT_STACK] tid={} pid={} uaddr={:#x} leaf={:#x}{}",
+        tid, pid, uaddr, leaf_rip, suffix
+    );
+}
