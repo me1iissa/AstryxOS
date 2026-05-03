@@ -96,6 +96,71 @@ pub(crate) unsafe fn user_read_u64(addr: u64) -> Option<u64> {
 /// Futex wait queue: maps (pid, uaddr) -> list of waiting TIDs.
 pub(crate) static FUTEX_WAITERS: Mutex<BTreeMap<(u64, u64), Vec<u64>>> = Mutex::new(BTreeMap::new());
 
+/// Outcome of `futex_wait_check_and_enqueue`.
+#[derive(Debug)]
+pub(crate) enum FutexWaitOutcome {
+    /// Caller is now enqueued and marked Blocked; caller MUST call schedule().
+    Enqueued,
+    /// `*uaddr != val` — caller should return EAGAIN without parking.
+    ValueMismatch,
+    /// User-pointer read failed — caller should return EFAULT without parking.
+    Fault,
+}
+
+/// Atomic check-then-queue for FUTEX_WAIT.
+///
+/// Performs the value-vs-`val` comparison and the wait-queue enqueue under a
+/// single `FUTEX_WAITERS` critical section, then transitions the calling
+/// thread to `Blocked` under `THREAD_TABLE` while still holding
+/// `FUTEX_WAITERS`.  This is the single atomic step the lost-wakeup fix
+/// hinges on: any concurrent FUTEX_WAKE on `(pid, uaddr)` either runs before
+/// us (and updates `*uaddr` so we observe `ValueMismatch`) or after (and
+/// finds us already in the queue + Blocked).  No window for `woken=0` on a
+/// thread that is on the verge of registering as a waiter.
+///
+/// Lock order: `FUTEX_WAITERS` → `THREAD_TABLE`.  Both are released on
+/// return; the caller invokes `schedule()` after this returns `Enqueued`.
+///
+/// `read_u32` is called *under* `FUTEX_WAITERS` to read the futex word.
+/// For the Linux syscall path it wraps `user_read_u32(uaddr)`; the test
+/// path uses a kernel-mode reader so the same critical section is exercised
+/// without needing a real user mapping.  The closure must be cheap and must
+/// not acquire any kernel locks.
+pub(crate) fn futex_wait_check_and_enqueue<R>(
+    pid: u64,
+    uaddr: u64,
+    val: u64,
+    tid: u64,
+    wake_tick: u64,
+    read_u32: R,
+) -> FutexWaitOutcome
+where
+    R: FnOnce() -> Option<u32>,
+{
+    let mut waiters = FUTEX_WAITERS.lock();
+
+    let current = match read_u32() {
+        Some(v) => v,
+        None => return FutexWaitOutcome::Fault,
+    };
+    if current as u64 != val {
+        return FutexWaitOutcome::ValueMismatch;
+    }
+
+    waiters.entry((pid, uaddr)).or_insert_with(Vec::new).push(tid);
+
+    // Mark Blocked under THREAD_TABLE while still holding FUTEX_WAITERS.
+    {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+            t.state = crate::proc::ThreadState::Blocked;
+            t.wake_tick = wake_tick;
+        }
+    }
+
+    FutexWaitOutcome::Enqueued
+}
+
 /// SCM_RIGHTS pending fd transfers.
 /// Key = receiving unix socket id.  Value = list of FileDescriptors to deliver.
 static PENDING_SCM: Mutex<Vec<(u64, Vec<crate::vfs::FileDescriptor>)>> = Mutex::new(Vec::new());
