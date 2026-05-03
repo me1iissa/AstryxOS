@@ -1307,6 +1307,14 @@ pub fn run() -> ! {
     total += 1;
     if test_futex_wait_atomic_check_then_queue() { passed += 1; }
 
+    // ── Test 196: memfd_create MFD_CLOEXEC + MFD_ALLOW_SEALING + seals ──
+    total += 1;
+    if test_memfd_cloexec_sealing() { passed += 1; }
+
+    // ── Test 197: dup(2) clears FD_CLOEXEC on the duplicate ──────────────
+    total += 1;
+    if test_dup_clears_cloexec() { passed += 1; }
+
     // (Stream-A pipe / eventfd wake-hook tests run first — see Tests 0a/0b
     // at the top of this function so failures surface before the suite's
     // long network/disk pre-amble.)
@@ -22853,6 +22861,273 @@ fn test_eventfd_wake_hook() -> bool {
     }
     test_println!("  reader woke promptly (outcome={}, no leaked waiters) ✓", outcome);
     test_pass!("eventfd wake hook — reader parks, writer wakes");
+    true
+}
+
+// ── Test 196: memfd_create MFD_CLOEXEC + MFD_ALLOW_SEALING + seals ──────────
+//
+// Exercises:
+//   1. memfd_create(MFD_CLOEXEC) → FD_CLOEXEC is set on returned fd.
+//   2. memfd_create(MFD_CLOEXEC | MFD_ALLOW_SEALING) → sealing is enabled.
+//   3. fcntl(F_GET_SEALS) returns 0 initially.
+//   4. fcntl(F_ADD_SEALS, F_SEAL_SHRINK|F_SEAL_GROW) succeeds.
+//   5. fcntl(F_GET_SEALS) returns the added mask.
+//   6. fcntl(F_ADD_SEALS, F_SEAL_SEAL) freezes the seal set.
+//   7. fcntl(F_GET_SEALS) now includes F_SEAL_SEAL.
+//   8. A further F_ADD_SEALS after F_SEAL_SEAL returns -EPERM.
+//   9. memfd_create() without MFD_ALLOW_SEALING returns -EPERM on F_ADD_SEALS.
+//  10. memfd_create() with unknown flags returns -EINVAL.
+//
+// Falsification condition: after the full sealing dance, F_GET_SEALS should
+// return 0x17 = F_SEAL_SEAL|F_SEAL_SHRINK|F_SEAL_GROW|F_SEAL_WRITE
+// (if those seals were all applied in the dance).  This test uses
+// SHRINK|GROW first, then WRITE, then SEAL — total = 0x0F before freeze,
+// plus 0x01 = 0x0F after.
+fn test_memfd_cloexec_sealing() -> bool {
+    test_header!("memfd_create MFD_CLOEXEC + MFD_ALLOW_SEALING + seals");
+
+    const MFD_CLOEXEC:       u64 = 0x0001;
+    const MFD_ALLOW_SEALING: u64 = 0x0002;
+    const F_SEAL_SEAL:         u64 = 0x0001;
+    const F_SEAL_SHRINK:       u64 = 0x0002;
+    const F_SEAL_GROW:         u64 = 0x0004;
+    const F_SEAL_WRITE:        u64 = 0x0008;
+    const F_ADD_SEALS:         u64 = 1033;
+    const F_GET_SEALS:         u64 = 1034;
+    const F_GETFD:             u64 = 1;
+    const FD_CLOEXEC:          i64 = 1;
+
+    // ── Step 1: MFD_CLOEXEC sets FD_CLOEXEC ──────────────────────────────
+    let fd_ce = crate::subsys::linux::syscall::sys_memfd_create_test(0, MFD_CLOEXEC);
+    if fd_ce < 0 {
+        test_fail!("memfd_cloexec_sealing",
+            "memfd_create(MFD_CLOEXEC) returned {} (expected fd >= 0)", fd_ce);
+        return false;
+    }
+    let getfd_ce = crate::subsys::linux::syscall::sys_fcntl_test(fd_ce as u64, F_GETFD, 0);
+    if getfd_ce & FD_CLOEXEC == 0 {
+        test_fail!("memfd_cloexec_sealing",
+            "MFD_CLOEXEC: F_GETFD returned {} (FD_CLOEXEC bit missing)", getfd_ce);
+        crate::subsys::linux::syscall::sys_close_test(fd_ce as u64);
+        return false;
+    }
+    test_println!("  MFD_CLOEXEC: FD_CLOEXEC set on returned fd ✓");
+    crate::subsys::linux::syscall::sys_close_test(fd_ce as u64);
+
+    // ── Step 2–9: MFD_ALLOW_SEALING enables full sealing API ─────────────
+    let fd = crate::subsys::linux::syscall::sys_memfd_create_test(
+        0, MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if fd < 0 {
+        test_fail!("memfd_cloexec_sealing",
+            "memfd_create(MFD_CLOEXEC|MFD_ALLOW_SEALING) returned {} (expected fd >= 0)", fd);
+        return false;
+    }
+
+    // Initial seal mask must be 0.
+    let seals0 = crate::subsys::linux::syscall::sys_fcntl_test(fd as u64, F_GET_SEALS, 0);
+    if seals0 != 0 {
+        test_fail!("memfd_cloexec_sealing",
+            "initial F_GET_SEALS = {} (expected 0)", seals0);
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+    test_println!("  initial F_GET_SEALS = 0 ✓");
+
+    // Add SHRINK|GROW seals.
+    let add1 = crate::subsys::linux::syscall::sys_fcntl_test(
+        fd as u64, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW);
+    if add1 != 0 {
+        test_fail!("memfd_cloexec_sealing",
+            "F_ADD_SEALS(SHRINK|GROW) returned {} (expected 0)", add1);
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+    let seals1 = crate::subsys::linux::syscall::sys_fcntl_test(fd as u64, F_GET_SEALS, 0);
+    if seals1 != (F_SEAL_SHRINK | F_SEAL_GROW) as i64 {
+        test_fail!("memfd_cloexec_sealing",
+            "after SHRINK|GROW: F_GET_SEALS = {} (expected {})",
+            seals1, F_SEAL_SHRINK | F_SEAL_GROW);
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+    test_println!("  F_ADD_SEALS(SHRINK|GROW) + F_GET_SEALS={:#x} ✓", seals1);
+
+    // Add WRITE seal.
+    let add2 = crate::subsys::linux::syscall::sys_fcntl_test(
+        fd as u64, F_ADD_SEALS, F_SEAL_WRITE);
+    if add2 != 0 {
+        test_fail!("memfd_cloexec_sealing",
+            "F_ADD_SEALS(WRITE) returned {} (expected 0)", add2);
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+
+    // Freeze with F_SEAL_SEAL.
+    let add3 = crate::subsys::linux::syscall::sys_fcntl_test(
+        fd as u64, F_ADD_SEALS, F_SEAL_SEAL);
+    if add3 != 0 {
+        test_fail!("memfd_cloexec_sealing",
+            "F_ADD_SEALS(SEAL) returned {} (expected 0)", add3);
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+
+    // After freeze: mask = SEAL(0x01)|SHRINK(0x02)|GROW(0x04)|WRITE(0x08) = 0x0F.
+    let seals_final = crate::subsys::linux::syscall::sys_fcntl_test(fd as u64, F_GET_SEALS, 0);
+    let expected_final = (F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE) as i64;
+    if seals_final != expected_final {
+        test_fail!("memfd_cloexec_sealing",
+            "after freeze: F_GET_SEALS = {:#x} (expected {:#x})",
+            seals_final, expected_final);
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+    test_println!("  F_SEAL_SEAL freeze: F_GET_SEALS={:#x} ✓", seals_final);
+
+    // Attempt to add another seal after F_SEAL_SEAL — must return -EPERM.
+    let add_blocked = crate::subsys::linux::syscall::sys_fcntl_test(
+        fd as u64, F_ADD_SEALS, F_SEAL_SHRINK);
+    if add_blocked != -1 {
+        test_fail!("memfd_cloexec_sealing",
+            "F_ADD_SEALS after F_SEAL_SEAL returned {} (expected -EPERM = -1)", add_blocked);
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+    test_println!("  F_ADD_SEALS after F_SEAL_SEAL → -EPERM ✓");
+    crate::subsys::linux::syscall::sys_close_test(fd as u64);
+
+    // ── Step 9: no MFD_ALLOW_SEALING → F_ADD_SEALS returns -EPERM ────────
+    let fd_ns = crate::subsys::linux::syscall::sys_memfd_create_test(0, MFD_CLOEXEC);
+    if fd_ns < 0 {
+        test_fail!("memfd_cloexec_sealing",
+            "memfd_create(MFD_CLOEXEC only) returned {}", fd_ns);
+        return false;
+    }
+    let ns_add = crate::subsys::linux::syscall::sys_fcntl_test(
+        fd_ns as u64, F_ADD_SEALS, F_SEAL_SHRINK);
+    if ns_add != -1 {
+        test_fail!("memfd_cloexec_sealing",
+            "F_ADD_SEALS on non-sealing memfd returned {} (expected -EPERM = -1)", ns_add);
+        crate::subsys::linux::syscall::sys_close_test(fd_ns as u64);
+        return false;
+    }
+    test_println!("  F_ADD_SEALS on non-sealing fd → -EPERM ✓");
+    // F_GET_SEALS on non-sealing fd must return 0 (no error).
+    let ns_get = crate::subsys::linux::syscall::sys_fcntl_test(
+        fd_ns as u64, F_GET_SEALS, 0);
+    if ns_get != 0 {
+        test_fail!("memfd_cloexec_sealing",
+            "F_GET_SEALS on non-sealing memfd returned {} (expected 0)", ns_get);
+        crate::subsys::linux::syscall::sys_close_test(fd_ns as u64);
+        return false;
+    }
+    test_println!("  F_GET_SEALS on non-sealing fd → 0 ✓");
+    crate::subsys::linux::syscall::sys_close_test(fd_ns as u64);
+
+    // ── Step 10: unknown flags → -EINVAL ─────────────────────────────────
+    let fd_bad = crate::subsys::linux::syscall::sys_memfd_create_test(0, 0x0100);
+    if fd_bad != -22 {
+        if fd_bad >= 0 {
+            crate::subsys::linux::syscall::sys_close_test(fd_bad as u64);
+        }
+        test_fail!("memfd_cloexec_sealing",
+            "memfd_create(unknown_flag=0x100) returned {} (expected -EINVAL = -22)", fd_bad);
+        return false;
+    }
+    test_println!("  unknown flags → -EINVAL ✓");
+
+    test_pass!("memfd_create MFD_CLOEXEC + MFD_ALLOW_SEALING + seals");
+    true
+}
+
+// ── Test 197: dup(2) clears FD_CLOEXEC on the duplicate ─────────────────────
+//
+// Per POSIX dup(2): "The duplicate descriptor shall have its close-on-exec
+// flag cleared."  Verifies sys_dup() and sys_dup2() both clear cloexec on
+// the result, even when the source fd has FD_CLOEXEC set.
+fn test_dup_clears_cloexec() -> bool {
+    test_header!("dup/dup2 clear FD_CLOEXEC on duplicate");
+
+    const F_GETFD:    u64 = 1;
+    const F_SETFD:    u64 = 2;
+    const FD_CLOEXEC: u64 = 1;
+
+    // Create a file, set FD_CLOEXEC on it.
+    let path = "/tmp/.test_dup_cloexec";
+    if crate::vfs::create_file(path).is_err() {
+        // File may already exist from a prior run — that's fine.
+    }
+    let pid = crate::proc::current_pid();
+    let orig_fd = match crate::vfs::open(pid, path, crate::vfs::flags::O_RDWR) {
+        Ok(n) => n as i64,
+        Err(_) => {
+            test_fail!("dup_clears_cloexec", "could not open test file");
+            return false;
+        }
+    };
+
+    // Set FD_CLOEXEC on orig_fd via fcntl(F_SETFD).
+    let set_rc = crate::subsys::linux::syscall::sys_fcntl_test(
+        orig_fd as u64, F_SETFD, FD_CLOEXEC);
+    if set_rc != 0 {
+        test_fail!("dup_clears_cloexec",
+            "fcntl(F_SETFD, FD_CLOEXEC) on orig_fd returned {}", set_rc);
+        crate::subsys::linux::syscall::sys_close_test(orig_fd as u64);
+        return false;
+    }
+    // Confirm it is set.
+    let get_orig = crate::subsys::linux::syscall::sys_fcntl_test(
+        orig_fd as u64, F_GETFD, 0);
+    if get_orig & FD_CLOEXEC as i64 == 0 {
+        test_fail!("dup_clears_cloexec",
+            "F_GETFD on orig_fd = {} (FD_CLOEXEC not set)", get_orig);
+        crate::subsys::linux::syscall::sys_close_test(orig_fd as u64);
+        return false;
+    }
+    test_println!("  orig_fd has FD_CLOEXEC set ✓");
+
+    // dup(orig_fd) → duplicate must NOT have FD_CLOEXEC.
+    let dup_fd = crate::syscall::sys_dup(orig_fd as usize);
+    if dup_fd < 0 {
+        test_fail!("dup_clears_cloexec", "sys_dup returned {}", dup_fd);
+        crate::subsys::linux::syscall::sys_close_test(orig_fd as u64);
+        return false;
+    }
+    let get_dup = crate::subsys::linux::syscall::sys_fcntl_test(
+        dup_fd as u64, F_GETFD, 0);
+    if get_dup & FD_CLOEXEC as i64 != 0 {
+        test_fail!("dup_clears_cloexec",
+            "sys_dup: F_GETFD on duplicate = {} (FD_CLOEXEC not cleared)", get_dup);
+        crate::subsys::linux::syscall::sys_close_test(orig_fd as u64);
+        crate::subsys::linux::syscall::sys_close_test(dup_fd as u64);
+        return false;
+    }
+    test_println!("  dup(orig_fd): FD_CLOEXEC cleared on duplicate ✓");
+    crate::subsys::linux::syscall::sys_close_test(dup_fd as u64);
+
+    // dup2(orig_fd, target) → duplicate must NOT have FD_CLOEXEC.
+    // Pick a slot that is currently free (use orig_fd + 10 as a hint).
+    let target_fd = (orig_fd + 10) as usize;
+    let dup2_fd = crate::syscall::sys_dup2(orig_fd as usize, target_fd);
+    if dup2_fd < 0 {
+        test_fail!("dup_clears_cloexec", "sys_dup2 returned {}", dup2_fd);
+        crate::subsys::linux::syscall::sys_close_test(orig_fd as u64);
+        return false;
+    }
+    let get_dup2 = crate::subsys::linux::syscall::sys_fcntl_test(
+        dup2_fd as u64, F_GETFD, 0);
+    if get_dup2 & FD_CLOEXEC as i64 != 0 {
+        test_fail!("dup_clears_cloexec",
+            "sys_dup2: F_GETFD on duplicate = {} (FD_CLOEXEC not cleared)", get_dup2);
+        crate::subsys::linux::syscall::sys_close_test(orig_fd as u64);
+        crate::subsys::linux::syscall::sys_close_test(dup2_fd as u64);
+        return false;
+    }
+    test_println!("  dup2(orig_fd, target): FD_CLOEXEC cleared on duplicate ✓");
+    crate::subsys::linux::syscall::sys_close_test(dup2_fd as u64);
+    crate::subsys::linux::syscall::sys_close_test(orig_fd as u64);
+
+    test_pass!("dup/dup2 clear FD_CLOEXEC on duplicate");
     true
 }
 
