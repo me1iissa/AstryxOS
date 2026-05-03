@@ -102,6 +102,19 @@ pub fn run() -> ! {
     test_println!("╚══════════════════════════════════════════════════════╝");
     test_println!();
 
+    // ── Optional: bugcheck self-test ────────────────────────────────────
+    // Compiled in only when the `bugcheck-test` feature is set.  Triggers
+    // a deliberate kernel-mode page fault to verify the fault-immune
+    // banner printer.  The bugcheck path exits QEMU with code 3, so this
+    // feature MUST run before any other test (and is incompatible with
+    // a clean test-suite pass — the harness inspects the banner output
+    // and exit code directly).
+    #[cfg(feature = "bugcheck-test")]
+    {
+        run_bugcheck_self_test();
+        // unreachable — bugcheck exits QEMU
+    }
+
     // Enable interrupts so the timer + network work
     crate::hal::enable_interrupts();
 
@@ -22215,4 +22228,58 @@ fn test_futex_wait_atomic_check_then_queue() -> bool {
     test_println!("  all {} waiters drained, no leaked queue entries ✓", N_WAITERS);
     test_pass!("FUTEX_WAIT atomic check-then-queue (lost-wakeup race)");
     true
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Bugcheck self-test (gated by feature `bugcheck-test`)
+//
+// When enabled, runs at the very start of `run()`, before the rest of
+// the test suite.  The flow is:
+//
+//   1. Validate the stack-only formatters (no_alloc_fmt::tests).
+//      A failure here prints "[BUGCHECK-SELFTEST] formatters FAIL"
+//      and exits QEMU with status FAILURE — we want to catch
+//      formatter regressions before relying on them in the printer.
+//
+//   2. Trigger a deliberate kernel-mode page fault.  The fault is
+//      caught by the IDT and routed to `ke_bugcheck`, which emits
+//      the structured banner and exits QEMU with code 3.
+//
+// The harness validates the result by inspecting the serial log:
+//   - "*** AETHER KERNEL BUGCHECK ***" appears exactly once
+//   - bug-check name "KERNEL_PAGE_FAULT" is present
+//   - all 16 GPR labels (rax, rbx, ... r15) are present
+//   - no "RE-ENTERED BUGCHECK" line
+//   - QEMU exits with status 3 (the bugcheck exit code)
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "bugcheck-test")]
+fn run_bugcheck_self_test() -> ! {
+    test_println!("[BUGCHECK-SELFTEST] formatter self-tests starting");
+    let formatters_ok = crate::util::no_alloc_fmt::tests::run_self_tests();
+    if !formatters_ok {
+        test_println!("[BUGCHECK-SELFTEST] formatters FAIL");
+        unsafe { crate::hal::outl(QEMU_EXIT_PORT, EXIT_FAILURE); }
+        loop { unsafe { core::arch::asm!("cli; hlt"); } }
+    }
+    test_println!("[BUGCHECK-SELFTEST] formatters OK");
+
+    test_println!("[BUGCHECK-SELFTEST] triggering kernel-mode page fault at 0xfffffffffffffff8");
+    // Small delay so the test_println! output has time to drain before
+    // the fault.  Spin (not halt) — interrupts may still be off.
+    for _ in 0..100_000u32 { core::hint::spin_loop(); }
+
+    // SAFETY: deliberately faulting.  Address is a non-canonical /
+    // unmapped kernel-space address that will reliably take #PF in
+    // ring 0.  Volatile write so the optimiser cannot drop it.
+    unsafe {
+        let bad: *mut u64 = 0xfffffffffffffff8u64 as *mut u64;
+        core::ptr::write_volatile(bad, 0xDEAD_BEEFu64);
+    }
+
+    // Should not be reached — the fault routes to ke_bugcheck which
+    // exits QEMU.  If we somehow get here, fail loudly.
+    test_println!("[BUGCHECK-SELFTEST] FATAL: write_volatile to bad address returned");
+    unsafe { crate::hal::outl(QEMU_EXIT_PORT, EXIT_FAILURE); }
+    loop { unsafe { core::arch::asm!("cli; hlt"); } }
 }
