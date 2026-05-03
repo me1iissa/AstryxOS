@@ -1464,28 +1464,49 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // 204: sched_getaffinity(pid, cpusetsize, mask) — report all online CPUs.
         // Glibc reads the popcount of this mask to determine nproc; returning
         // only bit 0 would make it report 1 CPU even on SMP systems.
+        //
+        // Per `man 2 sched_getaffinity` ("C library/kernel differences"):
+        //   "On success, the raw sched_getaffinity() system call returns the
+        //    number of bytes placed copied into the mask buffer; this will be
+        //    the minimum of cpusetsize and the size (in bytes) of the
+        //    cpumask_t data type that is used internally by the kernel to
+        //    represent the CPU set bit mask."
+        //
+        // Glibc's `__pthread_getaffinity_np` and Mozilla's mozglue both
+        // check `rv > 0` to validate the bitmap; returning 0 here makes them
+        // treat the bitmap as invalid and silently fall back to single-CPU
+        // assumptions, which under-sizes thread pools.
+        //
+        // Cap at 128 bytes (1024 CPUs) — comfortably above MAX_CPUS=16.
         204 => {
             let buf = arg3 as *mut u8;
             let bufsiz = arg2 as usize;
-            if buf != core::ptr::null_mut() {
+            const KERNEL_CPUMASK_BYTES: usize = 128;
+            let written = bufsiz.min(KERNEL_CPUMASK_BYTES);
+            if buf == core::ptr::null_mut() || written == 0 {
+                // Nothing to write — preserve permissive 0 return for NULL/zero
+                // (real Linux returns -EFAULT here; glibc never invokes this path).
+                0
+            } else {
                 let ncpus = crate::arch::x86_64::apic::cpu_count() as usize;
                 let ncpus = ncpus.max(1); // always at least 1
                 // Zero the buffer, then set one bit per online CPU.
                 unsafe {
-                    core::ptr::write_bytes(buf, 0, bufsiz.min(128));
+                    core::ptr::write_bytes(buf, 0, written);
                     // Set bits 0..ncpus-1 in the cpuset bitmask (little-endian).
-                    // Each byte covers 8 CPUs.  We support up to bufsiz*8 CPUs.
+                    // Each byte covers 8 CPUs.  We support up to written*8 CPUs.
                     for cpu in 0..ncpus {
                         let byte_idx = cpu / 8;
                         let bit_idx  = cpu % 8;
-                        if byte_idx < bufsiz {
+                        if byte_idx < written {
                             let byte_ptr = buf.add(byte_idx);
                             *byte_ptr |= 1u8 << bit_idx;
                         }
                     }
                 }
+                // Return bytes-copied: min(cpusetsize, sizeof(cpumask_t)).
+                written as i64
             }
-            0
         }
         // 209: io_setup stub
         209 => -38,
