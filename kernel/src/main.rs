@@ -326,7 +326,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             serial_println!("[X11-VIS] Creating X11 visual test window...");
             {
                 use crate::net::unix;
-                let cfd = unix::create();
+                let cfd = unix::create(unix::SockKind::Stream);
                 if cfd != u64::MAX && unix::connect(cfd, b"/tmp/.X11-unix/X0\0") >= 0 {
                     // X11 connection setup
                     let hello: [u8; 12] = [0x6C, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];

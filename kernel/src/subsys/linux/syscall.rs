@@ -619,12 +619,25 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         41 => {
             let domain = arg1 as u32;  // AF_INET=2, AF_UNIX=1, AF_INET6=10
             let sock_type = arg2 & 0xFF; // strip SOCK_NONBLOCK/SOCK_CLOEXEC
+            // Per `man 2 socket`: SOCK_CLOEXEC = 0o2000000 = 0x80000,
+            // SOCK_NONBLOCK = 0o4000 = 0x800.  Both are ORed into the
+            // type argument and must be honoured on the resulting fd.
+            let cloexec  = (arg2 & 0x80000) != 0;
+            let nonblock = (arg2 & 0x00800) != 0;
             let pid = crate::proc::current_pid();
             if domain == 1 {
-                // AF_UNIX: use net::unix module
-                let unix_id = crate::net::unix::create();
+                // AF_UNIX: use net::unix module.
+                // SOCK_STREAM=1, SOCK_DGRAM=2, SOCK_SEQPACKET=5.
+                let kind = match sock_type {
+                    1 => crate::net::unix::SockKind::Stream,
+                    5 => crate::net::unix::SockKind::SeqPacket,
+                    // SOCK_DGRAM and other AF_UNIX types are not yet
+                    // supported — return -EPROTONOSUPPORT per POSIX.
+                    _ => return -93,
+                };
+                let unix_id = crate::net::unix::create(kind);
                 if unix_id == u64::MAX { return -24; } // EMFILE
-                crate::syscall::alloc_unix_socket_fd(pid, unix_id)
+                crate::syscall::alloc_unix_socket_fd(pid, unix_id, cloexec, nonblock)
             } else if domain == 2 || domain == 10 {
                 // AF_INET / AF_INET6
                 let net_type = match sock_type {
@@ -704,16 +717,21 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 }
             }
         }
-        // 43: accept(sockfd, addr, addrlen) — AF_UNIX real; AF_INET stub
+        // 43: accept(sockfd, addr, addrlen) — AF_UNIX real; AF_INET stub.
+        // arg4 carries `flags` for accept4(2): SOCK_CLOEXEC | SOCK_NONBLOCK.
+        // Plain accept(2) (#43) leaves arg4 = 0; accept4(2) (#288) forwards it.
         43 => {
             let pid = crate::proc::current_pid();
             let fd = arg1 as usize;
+            // accept4 flag bits: SOCK_CLOEXEC = 0x80000, SOCK_NONBLOCK = 0x800.
+            let cloexec  = (arg4 & 0x80000) != 0;
+            let nonblock = (arg4 & 0x00800) != 0;
             if crate::syscall::is_unix_socket_fd(pid, fd) {
                 let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
                 match crate::net::unix::accept(unix_id) {
                     peer_id if peer_id >= 0 => {
                         // Allocate an fd for the accepted connected socket.
-                        crate::syscall::alloc_unix_socket_fd(pid, peer_id as u64)
+                        crate::syscall::alloc_unix_socket_fd(pid, peer_id as u64, cloexec, nonblock)
                     }
                     e => e, // EAGAIN or error
                 }
@@ -893,7 +911,25 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             if crate::syscall::is_unix_socket_fd(pid, fd) {
                 let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
                 let buf = unsafe { core::slice::from_raw_parts_mut(dst, cap) };
-                bytes_read = crate::net::unix::read(unix_id, buf);
+                // Use read_msg so SOCK_SEQPACKET callers see one message per
+                // recvmsg and can observe MSG_TRUNC (msghdr.msg_flags bit 0x20)
+                // when the receiver buffer was shorter than the sender message.
+                // msghdr.msg_flags lives at byte-offset 48 (i32) per the Linux
+                // x86_64 ABI for `struct msghdr`.
+                const MSG_TRUNC: u32 = 0x20;
+                bytes_read = match crate::net::unix::read_msg(unix_id, buf) {
+                    Ok((n, discarded)) => {
+                        if discarded > 0 {
+                            unsafe {
+                                let flags_ptr = (arg2 + 48) as *mut u32;
+                                let cur = core::ptr::read_unaligned(flags_ptr);
+                                core::ptr::write_unaligned(flags_ptr, cur | MSG_TRUNC);
+                            }
+                        }
+                        n as i64
+                    }
+                    Err(e) => e,
+                };
                 // Deliver pending SCM_RIGHTS fds into receiver's fd table.
                 if bytes_read >= 0 {
                     if let Some(scm_fds) = crate::syscall::scm_dequeue(unix_id) {
@@ -1098,37 +1134,76 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 None => -107, // ENOTCONN
             }
         }
-        // 53: socketpair(domain, type, protocol, sv[2]) — AF_UNIX loopback pair
+        // 53: socketpair(domain, type, protocol, sv[2]) — AF_UNIX loopback pair.
+        //
+        // Per `man 2 socketpair` / `man 7 unix`:
+        //   `type` is `sock_type | flags`.
+        //     - sock_type & 0xff selects the kind: SOCK_STREAM=1,
+        //       SOCK_SEQPACKET=5 (others currently rejected).
+        //     - SOCK_CLOEXEC  (0o2000000 = 0x80000) sets FD_CLOEXEC on both fds.
+        //     - SOCK_NONBLOCK (0o4000    = 0x800)   sets O_NONBLOCK on both fds.
+        //   Unknown sock_type → -EPROTONOSUPPORT (-93).
+        //
+        // SEQPACKET preserves message boundaries: a recv of N bytes returns at
+        // most one full sender-side message and discards any tail that does
+        // not fit (the in-kernel net::unix layer enforces this via per-message
+        // length records).
         53 => {
-            let domain = arg1 as u32;
-            let sv_ptr = arg4 as *mut u32;
+            let domain      = arg1 as u32;
+            let type_arg    = arg2;
+            let sock_type   = type_arg & 0xff;
+            let cloexec     = (type_arg & 0x80000) != 0;
+            let nonblock    = (type_arg & 0x00800) != 0;
+            let sv_ptr      = arg4 as *mut u32;
             if sv_ptr.is_null() { return -22; }
-            if domain == 1 {
-                // AF_UNIX socketpair
-                let pid = crate::proc::current_pid();
-                let (a, b) = crate::net::unix::socketpair();
-                if a == u64::MAX { return -24; }
-                let fd_a = crate::syscall::alloc_unix_socket_fd(pid, a);
-                if fd_a < 0 {
-                    crate::net::unix::close(a);
-                    crate::net::unix::close(b);
-                    return fd_a;
-                }
-                let fd_b = crate::syscall::alloc_unix_socket_fd(pid, b);
-                if fd_b < 0 {
-                    // Clean up fd_a: close the fd and the unix socket
-                    crate::net::unix::close(a);
-                    crate::net::unix::close(b);
-                    return fd_b;
-                }
-                unsafe {
-                    core::ptr::write(sv_ptr,       fd_a as u32);
-                    core::ptr::write(sv_ptr.add(1), fd_b as u32);
-                }
-                0
-            } else {
-                -38 // ENOSYS for non-UNIX socketpair
+            if domain != 1 {
+                // Only AF_UNIX socketpair is implemented.  POSIX permits
+                // -EAFNOSUPPORT for unknown families; -EOPNOTSUPP for
+                // unsupported family/type combinations.  Mozilla expects an
+                // unsupported-domain error; return -EAFNOSUPPORT (-97).
+                return -97;
             }
+            // Validate sock_type.  Reject everything but STREAM and SEQPACKET
+            // for now — DGRAM, RAW, RDM are not implemented for AF_UNIX.
+            let kind = match sock_type {
+                1 => crate::net::unix::SockKind::Stream,
+                5 => crate::net::unix::SockKind::SeqPacket,
+                _ => return -93, // EPROTONOSUPPORT
+            };
+            // Reject any unknown bits in `type` (Linux ignores them, but
+            // surfacing rather than silently dropping aids debugging; the
+            // common known bits are SOCK_CLOEXEC and SOCK_NONBLOCK only).
+            // We accept those plus the type field; anything else passes
+            // through silently to match Linux leniency.
+            let pid = crate::proc::current_pid();
+            let (a, b) = crate::net::unix::socketpair(kind);
+            if a == u64::MAX { return -24; }
+            let fd_a = crate::syscall::alloc_unix_socket_fd(pid, a, cloexec, nonblock);
+            if fd_a < 0 {
+                crate::net::unix::close(a);
+                crate::net::unix::close(b);
+                return fd_a;
+            }
+            let fd_b = crate::syscall::alloc_unix_socket_fd(pid, b, cloexec, nonblock);
+            if fd_b < 0 {
+                // Best-effort cleanup of fd_a's slot before propagating EMFILE.
+                {
+                    let mut procs = crate::proc::PROCESS_TABLE.lock();
+                    if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                        if let Some(slot) = p.file_descriptors.get_mut(fd_a as usize) {
+                            *slot = None;
+                        }
+                    }
+                }
+                crate::net::unix::close(a);
+                crate::net::unix::close(b);
+                return fd_b;
+            }
+            unsafe {
+                core::ptr::write(sv_ptr,       fd_a as u32);
+                core::ptr::write(sv_ptr.add(1), fd_b as u32);
+            }
+            0
         }
         // 54: setsockopt(sockfd, level, optname, optval, optlen)
         54 => {
@@ -2124,8 +2199,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         286 => sys_timerfd_settime(arg1, arg2 as u32, arg3, arg4),
         // 287: timerfd_gettime(fd, curr_value)
         287 => sys_timerfd_gettime(arg1, arg2),
-        // 288: accept4(sockfd, addr, addrlen, flags) — delegate to accept(43)
-        288 => dispatch(43, arg1, arg2, arg3, 0, 0, 0),
+        // 288: accept4(sockfd, addr, addrlen, flags) — delegate to accept(43),
+        // forwarding the SOCK_CLOEXEC / SOCK_NONBLOCK flags via arg4 so the
+        // returned fd carries them (per `man 2 accept4`).
+        288 => dispatch(43, arg1, arg2, arg3, arg4, 0, 0),
         // 289: signalfd4(fd, mask, sizemask, flags)
         289 => sys_signalfd4(arg1, arg2, arg3, arg4 as u32),
         // 253: inotify_add_watch(fd, pathname, mask)

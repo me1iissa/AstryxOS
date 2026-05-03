@@ -623,6 +623,11 @@ pub fn run() -> ! {
     total += 1;
     if test_clock_realtime_futex_parity() { passed += 1; }
 
+    // ── Test 80d: socketpair(2) — type / SOCK_CLOEXEC / SOCK_NONBLOCK + SEQPACKET
+
+    total += 1;
+    if test_socketpair_type_flags() { passed += 1; }
+
     // ── Test 81: mlock/execveat/copy_file_range stubs ────────────────────────
 
     total += 1;
@@ -11159,7 +11164,7 @@ fn test_x11_hello() -> bool {
     // Init the X11 server here (not at boot) so Firefox doesn't block on it.
     crate::x11::init();
 
-    let client = crate::net::unix::create();
+    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream);
     if client == u64::MAX {
         test_fail!("x11_hello", "unix::create() failed");
         return false;
@@ -11222,7 +11227,7 @@ fn test_x11_intern_atom() -> bool {
     test_header!("X11 server — InternAtom(WM_NAME)");
 
     // ── Connect + perform setup ───────────────────────────────────────────
-    let client = crate::net::unix::create();
+    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream);
     if client == u64::MAX {
         test_fail!("x11_intern", "unix::create() failed");
         return false;
@@ -11314,7 +11319,7 @@ fn test_x11_draw_cycle() -> bool {
     test_header!("X11 CreateWindow + MapWindow + Draw cycle");
 
     // ── Connect + setup ──────────────────────────────────────────────────────
-    let client = crate::net::unix::create();
+    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream);
     if client == u64::MAX {
         test_fail!("x11_draw", "unix::create() failed");
         return false;
@@ -11494,7 +11499,7 @@ fn test_x11_key_event() -> bool {
     test_header!("X11 key event injection + delivery");
 
     // ── Connect + setup ──────────────────────────────────────────────────────
-    let client = crate::net::unix::create();
+    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream);
     if client == u64::MAX {
         test_fail!("x11_key", "unix::create() failed");
         return false;
@@ -11611,7 +11616,7 @@ fn test_x11_render_query() -> bool {
     test_header!("X11 RENDER extension — QueryExtension + QueryVersion");
 
     // ── Connect + setup ──────────────────────────────────────────────────────
-    let client = crate::net::unix::create();
+    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream);
     if client == u64::MAX {
         test_fail!("x11_render_q", "unix::create() failed");
         return false;
@@ -11736,7 +11741,7 @@ fn test_x11_render_draw() -> bool {
     test_header!("X11 RENDER extension — CreatePixmap + Picture + FillRectangles");
 
     // ── Connect + setup ──────────────────────────────────────────────────────
-    let client = crate::net::unix::create();
+    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream);
     if client == u64::MAX {
         test_fail!("x11_render_d", "unix::create() failed");
         return false;
@@ -12661,7 +12666,7 @@ fn test_x11_extensions() -> bool {
 
     // X11 server is already running (initialised by test_x11_hello earlier).
     // Connect a fresh client.
-    let cfd = crate::net::unix::create();
+    let cfd = crate::net::unix::create(crate::net::unix::SockKind::Stream);
     if cfd == u64::MAX {
         test_fail!("x11_ext", "unix::create() failed");
         return false;
@@ -13464,6 +13469,192 @@ fn test_clock_realtime_futex_parity() -> bool {
     let _ = Ordering::Relaxed; // silence unused-import warning when conditions disable use sites
 
     test_pass!("clock_gettime CLOCK_REALTIME — vDSO/syscall formula parity");
+    true
+}
+
+// ── Test 80d: socketpair(2) — type / SOCK_CLOEXEC / SOCK_NONBLOCK + SEQPACKET ─
+//
+// Asserts the Linux ABI for `socketpair(domain, type, protocol, sv[2])`:
+//
+//   * `type & 0xff` selects the socket kind (SOCK_STREAM=1, SOCK_SEQPACKET=5).
+//   * `type & SOCK_CLOEXEC`  (0x80000) sets FD_CLOEXEC on both fds.
+//   * `type & SOCK_NONBLOCK` (0x800)   sets O_NONBLOCK on both fds.
+//   * Unknown sock_type → -EPROTONOSUPPORT (-93).
+//   * SOCK_SEQPACKET preserves message boundaries: a `read` of N bytes
+//     returns at most one full sender-side message; the truncated tail is
+//     discarded and the next `read` returns the next message intact.
+//
+// Pre-fix bug: dispatch ignored `arg2` entirely, so `socketpair(AF_UNIX,
+// SOCK_SEQPACKET | SOCK_CLOEXEC, ...)` silently returned a STREAM pair with
+// no FD_CLOEXEC, no per-message framing, and no error for unknown types.
+// Mozilla's `LaunchProcess` requires SEQPACKET + CLOEXEC for parent/child
+// IPC; without these semantics it would silently corrupt the framing of
+// content-process IPDL messages.
+fn test_socketpair_type_flags() -> bool {
+    test_header!("socketpair(2) — type / SOCK_CLOEXEC / SOCK_NONBLOCK / SEQPACKET");
+
+    const AF_UNIX: u64        = 1;
+    const SOCK_STREAM: u64    = 1;
+    const SOCK_SEQPACKET: u64 = 5;
+    const SOCK_CLOEXEC: u64   = 0x80000;
+    const SOCK_NONBLOCK: u64  = 0x00800;
+    const F_GETFD: u64        = 1;
+    const F_GETFL: u64        = 3;
+    const FD_CLOEXEC: i64     = 1;
+    const O_NONBLOCK: i64     = 0x800;
+    const EPROTONOSUPPORT: i64 = -93;
+
+    let sp = |type_arg: u64, sv: &mut [u32; 2]| -> i64 {
+        crate::syscall::dispatch_linux(53, AF_UNIX, type_arg, 0, sv.as_mut_ptr() as u64, 0, 0)
+    };
+
+    // ── Sub-case 1: STREAM, no flags ────────────────────────────────────────
+    let mut sv = [0xFFFF_FFFFu32; 2];
+    let r = sp(SOCK_STREAM, &mut sv);
+    if r != 0 || sv[0] == 0xFFFF_FFFF || sv[1] == 0xFFFF_FFFF {
+        test_fail!("socketpair", "STREAM: rc={} sv=[{},{}]", r, sv[0] as i32, sv[1] as i32);
+        return false;
+    }
+    test_println!("  STREAM            → fds=[{},{}] ✓", sv[0], sv[1]);
+    // Cleanup.
+    let _ = crate::syscall::dispatch_linux(3, sv[0] as u64, 0, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux(3, sv[1] as u64, 0, 0, 0, 0, 0);
+
+    // ── Sub-case 2: SEQPACKET, no flags ─────────────────────────────────────
+    let mut sv = [0xFFFF_FFFFu32; 2];
+    let r = sp(SOCK_SEQPACKET, &mut sv);
+    if r != 0 || sv[0] == 0xFFFF_FFFF || sv[1] == 0xFFFF_FFFF {
+        test_fail!("socketpair", "SEQPACKET: rc={} sv=[{},{}]", r, sv[0] as i32, sv[1] as i32);
+        return false;
+    }
+    test_println!("  SEQPACKET         → fds=[{},{}] ✓", sv[0], sv[1]);
+    // Sub-case 6 tests the underlying unix socket layer directly via
+    // `net::unix::write/read`, which takes unix-socket IDs (table indices),
+    // not process fds.  Resolve the IDs once here so the fds can later be
+    // closed via dispatch_linux(close).
+    let seq_fd_a = sv[0] as u64;
+    let seq_fd_b = sv[1] as u64;
+    let pid_for_lookup = crate::proc::current_pid();
+    let seq_a = crate::syscall::get_unix_socket_id(pid_for_lookup, seq_fd_a as usize);
+    let seq_b = crate::syscall::get_unix_socket_id(pid_for_lookup, seq_fd_b as usize);
+    if seq_a == u64::MAX || seq_b == u64::MAX {
+        test_fail!("socketpair",
+                   "SEQPACKET: get_unix_socket_id failed for fds=[{},{}]", seq_fd_a, seq_fd_b);
+        return false;
+    }
+
+    // ── Sub-case 3: STREAM | SOCK_CLOEXEC ───────────────────────────────────
+    let mut sv = [0u32; 2];
+    let r = sp(SOCK_STREAM | SOCK_CLOEXEC, &mut sv);
+    if r != 0 {
+        test_fail!("socketpair", "STREAM|CLOEXEC: rc={}", r);
+        return false;
+    }
+    let g0 = crate::syscall::dispatch_linux(72, sv[0] as u64, F_GETFD, 0, 0, 0, 0);
+    let g1 = crate::syscall::dispatch_linux(72, sv[1] as u64, F_GETFD, 0, 0, 0, 0);
+    if g0 != FD_CLOEXEC || g1 != FD_CLOEXEC {
+        test_fail!("socketpair",
+                   "SOCK_CLOEXEC not propagated: F_GETFD on fd[0]={}, fd[1]={} (want {})",
+                   g0, g1, FD_CLOEXEC);
+        return false;
+    }
+    test_println!("  STREAM|CLOEXEC    → F_GETFD={},{} (FD_CLOEXEC) ✓", g0, g1);
+    let _ = crate::syscall::dispatch_linux(3, sv[0] as u64, 0, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux(3, sv[1] as u64, 0, 0, 0, 0, 0);
+
+    // ── Sub-case 4: STREAM | SOCK_NONBLOCK ──────────────────────────────────
+    let mut sv = [0u32; 2];
+    let r = sp(SOCK_STREAM | SOCK_NONBLOCK, &mut sv);
+    if r != 0 {
+        test_fail!("socketpair", "STREAM|NONBLOCK: rc={}", r);
+        return false;
+    }
+    let f0 = crate::syscall::dispatch_linux(72, sv[0] as u64, F_GETFL, 0, 0, 0, 0);
+    let f1 = crate::syscall::dispatch_linux(72, sv[1] as u64, F_GETFL, 0, 0, 0, 0);
+    if (f0 & O_NONBLOCK) == 0 || (f1 & O_NONBLOCK) == 0 {
+        test_fail!("socketpair",
+                   "SOCK_NONBLOCK not propagated: F_GETFL on fd[0]={:#x}, fd[1]={:#x}",
+                   f0, f1);
+        return false;
+    }
+    test_println!("  STREAM|NONBLOCK   → F_GETFL={:#x},{:#x} (O_NONBLOCK) ✓", f0, f1);
+    let _ = crate::syscall::dispatch_linux(3, sv[0] as u64, 0, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux(3, sv[1] as u64, 0, 0, 0, 0, 0);
+
+    // ── Sub-case 5: unknown sock_type → -EPROTONOSUPPORT ───────────────────
+    let mut sv = [0u32; 2];
+    let r = sp(99, &mut sv);
+    if r != EPROTONOSUPPORT {
+        test_fail!("socketpair", "unknown type=99: rc={} (want {})", r, EPROTONOSUPPORT);
+        return false;
+    }
+    test_println!("  type=99 (unknown) → -EPROTONOSUPPORT ✓");
+
+    // ── Sub-case 6: SEQPACKET preserves message boundaries ─────────────────
+    //
+    // Two writes of 64 bytes each on seq_a; one read of up to 128 bytes on
+    // seq_b must return exactly 64 (one message) — not 128.  The next read
+    // must return the second 64-byte message intact.  This catches the
+    // type-blind regression where SEQPACKET silently degraded to STREAM.
+    let mut msg1 = [0u8; 64];
+    for (i, b) in msg1.iter_mut().enumerate() { *b = i as u8; }
+    let mut msg2 = [0u8; 64];
+    for (i, b) in msg2.iter_mut().enumerate() { *b = (0x80 + i) as u8; }
+    let w1 = crate::net::unix::write(seq_a, &msg1);
+    let w2 = crate::net::unix::write(seq_a, &msg2);
+    if w1 != 64 || w2 != 64 {
+        test_fail!("socketpair", "SEQPACKET write: w1={} w2={} (want 64,64)", w1, w2);
+        return false;
+    }
+    let mut rxbuf = [0u8; 128];
+    let r1 = crate::net::unix::read(seq_b, &mut rxbuf);
+    if r1 != 64 {
+        test_fail!("socketpair",
+                   "SEQPACKET read with buf=128 returned {} bytes — STREAM-style coalescing! \
+                    SEQPACKET must return one message at a time.", r1);
+        return false;
+    }
+    if &rxbuf[..64] != &msg1[..] {
+        test_fail!("socketpair", "SEQPACKET msg1 contents mismatch after first read");
+        return false;
+    }
+    let mut rxbuf2 = [0u8; 128];
+    let r2 = crate::net::unix::read(seq_b, &mut rxbuf2);
+    if r2 != 64 {
+        test_fail!("socketpair", "SEQPACKET second read: rc={} (want 64)", r2);
+        return false;
+    }
+    if &rxbuf2[..64] != &msg2[..] {
+        test_fail!("socketpair", "SEQPACKET msg2 contents mismatch after second read");
+        return false;
+    }
+    test_println!("  SEQPACKET boundary: read 128-byte buf got {}+{} (boundary preserved) ✓", r1, r2);
+
+    // Sub-case 6b: SEQPACKET truncation — write 100, read 32 → return 32, drop 68.
+    let mut big = [0u8; 100];
+    for (i, b) in big.iter_mut().enumerate() { *b = i as u8; }
+    let _ = crate::net::unix::write(seq_a, &big);
+    let mut small = [0u8; 32];
+    let n = crate::net::unix::read(seq_b, &mut small);
+    if n != 32 {
+        test_fail!("socketpair", "SEQPACKET truncation: read returned {} (want 32)", n);
+        return false;
+    }
+    // Next read must EAGAIN (no further messages), proving the 68-byte tail was discarded.
+    let mut tmp = [0u8; 100];
+    let n2 = crate::net::unix::read(seq_b, &mut tmp);
+    if n2 != -11 {
+        test_fail!("socketpair",
+                   "SEQPACKET truncation tail not dropped: next read returned {} (want -EAGAIN=-11)",
+                   n2);
+        return false;
+    }
+    test_println!("  SEQPACKET truncate: 100-byte msg → 32-byte read, tail discarded ✓");
+
+    let _ = crate::syscall::dispatch_linux(3, seq_fd_a, 0, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux(3, seq_fd_b, 0, 0, 0, 0, 0);
+
+    test_pass!("socketpair(2) — type / SOCK_CLOEXEC / SOCK_NONBLOCK / SEQPACKET");
     true
 }
 
@@ -14392,7 +14583,7 @@ fn test_scm_rights() -> bool {
     test_header!("SCM_RIGHTS fd passing over Unix domain socket");
 
     // Create a socketpair.
-    let (id_a, id_b) = crate::net::unix::socketpair();
+    let (id_a, id_b) = crate::net::unix::socketpair(crate::net::unix::SockKind::Stream);
     if id_a == u64::MAX || id_b == u64::MAX {
         test_fail!("scm_rights", "socketpair() failed");
         return false;
@@ -14734,8 +14925,8 @@ fn test_x11_selection() -> bool {
     use crate::net::unix;
 
     // Connect client A (will own the selection).
-    let cfd_a = unix::create();
-    let cfd_b = unix::create();
+    let cfd_a = unix::create(unix::SockKind::Stream);
+    let cfd_b = unix::create(unix::SockKind::Stream);
     if cfd_a == u64::MAX || cfd_b == u64::MAX {
         test_fail!("x11_sel", "unix::create() failed");
         return false;
@@ -14848,7 +15039,7 @@ fn test_ewmh_net_supported() -> bool {
     use crate::x11::proto;
     use crate::net::unix;
 
-    let cfd = unix::create();
+    let cfd = unix::create(unix::SockKind::Stream);
     if cfd == u64::MAX { test_fail!("ewmh", "unix::create() failed"); return false; }
     if unix::connect(cfd, b"/tmp/.X11-unix/X0\0") < 0 {
         test_fail!("ewmh", "connect failed"); unix::close(cfd); return false;
@@ -17498,9 +17689,9 @@ fn test_elf_dt_gnu_hash_accepted() -> bool {
 // close on MAX).
 
 fn x11_connect_and_setup(tag: &str) -> u64 {
-    let fd = crate::net::unix::create();
+    let fd = crate::net::unix::create(crate::net::unix::SockKind::Stream);
     if fd == u64::MAX {
-        test_println!("  [{}] unix::create() failed", tag);
+        test_println!("  [{}] unix::create(unix::SockKind::Stream) failed", tag);
         return u64::MAX;
     }
     if crate::net::unix::connect(fd, b"/tmp/.X11-unix/X0\0") < 0 {
