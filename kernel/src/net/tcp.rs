@@ -1033,6 +1033,47 @@ pub fn close_connection(local_port: u16, remote_ip: Ipv4Address, remote_port: u1
     Ok(())
 }
 
+/// Half-close the send side of an Established / CloseWait connection
+/// identified by the full 4-tuple.  Drives the same RFC 793 §3.5 state
+/// transition as a full close on the local TCB (Established → FinWait1
+/// or CloseWait → LastAck) and emits a single FIN segment to the peer,
+/// but is a no-op when the connection is in any other state — repeated
+/// SHUT_WR calls or a SHUT_WR after our peer already FIN'd us must not
+/// queue stray segments.
+///
+/// Distinct from [`close_connection`] only in intent: the socket layer
+/// keeps the user-visible socket alive after this call so that pending
+/// inbound data can still be read.  The underlying TCB lifecycle is
+/// identical.
+pub fn shutdown_write(local_port: u16, remote_ip: Ipv4Address, remote_port: u16)
+    -> Result<(), &'static str>
+{
+    struct CloseInfo {
+        lip: Ipv4Address, lp: u16,
+        rip: Ipv4Address, rp: u16,
+        sn: u32, rn: u32,
+    }
+    let info = {
+        let mut conns = TCP_CONNECTIONS.lock();
+        let conn = match conns.iter_mut()
+            .find(|c| c.local_port == local_port
+                   && c.remote_ip == remote_ip
+                   && c.remote_port == remote_port
+                   && matches!(c.state, TcpState::Established | TcpState::CloseWait))
+        {
+            Some(c) => c,
+            None    => return Ok(()),
+        };
+        let was_cw = conn.state == TcpState::CloseWait;
+        conn.state = if was_cw { TcpState::LastAck } else { TcpState::FinWait1 };
+        CloseInfo { lip: conn.local_ip, lp: conn.local_port,
+                    rip: conn.remote_ip, rp: conn.remote_port,
+                    sn: conn.send_next, rn: conn.recv_next }
+    };
+    send_flags(info.lip, info.lp, info.rip, info.rp, info.sn, info.rn, FIN | ACK);
+    Ok(())
+}
+
 /// Set a socket option on the TCP connection for a given port.
 pub fn set_option(port: u16, reuseaddr: Option<bool>, nodelay: Option<bool>,
                    rcvbuf: Option<u32>, sndbuf: Option<u32>) {

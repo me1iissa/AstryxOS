@@ -32,6 +32,12 @@ pub struct Socket {
     pub sndbuf:    u32,
     pub linger:    bool,
     pub so_error:  u32,
+    // Half-close state per IEEE 1003.1 §shutdown.
+    // `shut_rd` disables further receives (recv returns 0 / EOF).
+    // `shut_wr` disables further sends (send returns -EPIPE) and, for
+    // connection-mode sockets, signals end-of-stream to the peer (TCP FIN).
+    pub shut_rd:   bool,
+    pub shut_wr:   bool,
 }
 
 /// Socket table.
@@ -57,6 +63,8 @@ pub fn socket_create(socket_type: SocketType) -> u64 {
         sndbuf:      131072,
         linger:      false,
         so_error:    0,
+        shut_rd:     false,
+        shut_wr:     false,
     });
     id
 }
@@ -224,6 +232,14 @@ pub fn socket_send(id: u64, data: &[u8]) -> Result<usize, &'static str> {
     let sock = sockets.iter().find(|s| s.id == id)
         .ok_or("socket not found")?;
 
+    // Per IEEE 1003.1 §shutdown: after SHUT_WR on the local end, send(2)
+    // must fail with EPIPE.  The errno gets translated by the syscall
+    // layer; here we surface it via a distinct error string that the
+    // caller maps to -EPIPE.
+    if sock.shut_wr {
+        return Err("EPIPE");
+    }
+
     let socket_type = sock.socket_type;
     let remote_ip = sock.remote_ip;
     let local_port = sock.local_port;
@@ -259,6 +275,10 @@ pub fn socket_sendto(
     let sock = sockets.iter().find(|s| s.id == id)
         .ok_or("socket not found")?;
 
+    if sock.shut_wr {
+        return Err("EPIPE");
+    }
+
     if sock.socket_type != SocketType::Udp {
         return Err("sendto only for UDP");
     }
@@ -272,6 +292,12 @@ pub fn socket_recv(id: u64) -> Result<Vec<u8>, &'static str> {
     let sockets = SOCKETS.lock();
     let sock = sockets.iter().find(|s| s.id == id)
         .ok_or("socket not found")?;
+
+    // Per IEEE 1003.1 §shutdown: after SHUT_RD, subsequent recv(2)
+    // returns 0 (orderly EOF) regardless of any data still queued.
+    if sock.shut_rd {
+        return Ok(Vec::new());
+    }
 
     match sock.socket_type {
         SocketType::Udp => {
@@ -309,6 +335,12 @@ pub fn socket_recvfrom(id: u64) -> Result<(Vec<u8>, Ipv4Address, u16), &'static 
     let sockets = SOCKETS.lock();
     let sock = sockets.iter().find(|s| s.id == id)
         .ok_or("socket not found")?;
+
+    if sock.shut_rd {
+        // Connection-mode: peer 4-tuple is still meaningful.
+        // Datagram (UDP unconnected): zero peer is benign.
+        return Ok((Vec::new(), sock.remote_ip, sock.remote_port));
+    }
 
     match sock.socket_type {
         SocketType::Udp => {
@@ -382,6 +414,82 @@ pub fn socket_close(id: u64) {
         }
         sockets.remove(idx);
     }
+}
+
+/// `shutdown(2)` direction selector — RFC 793 §3.5 / IEEE 1003.1 §shutdown.
+pub const SHUT_RD:   i32 = 0;
+pub const SHUT_WR:   i32 = 1;
+pub const SHUT_RDWR: i32 = 2;
+
+/// Half-close a socket per IEEE 1003.1 §`shutdown` and RFC 793 §3.5.
+///
+/// `how` selects which directions are torn down:
+///   * `SHUT_RD`   — disable further receives.  Subsequent `recv` returns
+///     0 (orderly EOF).  No bytes are sent on the wire.
+///   * `SHUT_WR`   — disable further sends.  For TCP, transmits a FIN to
+///     the peer (Established → FinWait1, CloseWait → LastAck).  Subsequent
+///     `send` returns -EPIPE.
+///   * `SHUT_RDWR` — both of the above.
+///
+/// Returns 0 on success, -EBADF when the socket id is unknown, -ENOTCONN
+/// when the connection-mode socket is not yet connected, or -EINVAL on
+/// invalid `how`.  UDP (connectionless) sockets accept the call as a
+/// pure local-flag update — the wire stays untouched.
+pub fn socket_shutdown(id: u64, how: i32) -> i32 {
+    if how != SHUT_RD && how != SHUT_WR && how != SHUT_RDWR {
+        return -22; // EINVAL
+    }
+    let want_rd = how == SHUT_RD   || how == SHUT_RDWR;
+    let want_wr = how == SHUT_WR   || how == SHUT_RDWR;
+
+    // Snapshot the bits we need under the lock, then release before
+    // reaching into tcp:: (close_connection takes TCP_CONNECTIONS).
+    struct Snap {
+        socket_type: SocketType,
+        connected:   bool,
+        local_port:  u16,
+        remote_ip:   Ipv4Address,
+        remote_port: u16,
+        already_wr:  bool,
+    }
+
+    let snap = {
+        let mut sockets = SOCKETS.lock();
+        let sock = match sockets.iter_mut().find(|s| s.id == id) {
+            Some(s) => s,
+            None    => return -9, // EBADF
+        };
+        if sock.socket_type == SocketType::Tcp && !sock.connected {
+            // POSIX requires ENOTCONN for an unconnected stream socket.
+            return -107;
+        }
+        let snap = Snap {
+            socket_type: sock.socket_type,
+            connected:   sock.connected,
+            local_port:  sock.local_port,
+            remote_ip:   sock.remote_ip,
+            remote_port: sock.remote_port,
+            already_wr:  sock.shut_wr,
+        };
+        // Apply the local flags now so a racing send/recv sees the new
+        // state immediately even if we still have wire work to do below.
+        if want_rd { sock.shut_rd = true; }
+        if want_wr { sock.shut_wr = true; }
+        snap
+    };
+
+    // For TCP, SHUT_WR signals end-of-stream to the peer by sending FIN.
+    // Only do this on the first SHUT_WR — repeated calls are no-ops per
+    // POSIX and would otherwise queue stray FINs.
+    if want_wr && !snap.already_wr
+        && snap.socket_type == SocketType::Tcp
+        && snap.connected
+    {
+        let _ = super::tcp::shutdown_write(
+            snap.local_port, snap.remote_ip, snap.remote_port,
+        );
+    }
+    0
 }
 
 /// Set the remote endpoint for a socket and initiate TCP connection if applicable.
