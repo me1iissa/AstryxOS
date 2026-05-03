@@ -16688,15 +16688,14 @@ fn test_membarrier_query() -> bool {
 // ── Test 125: sched_getaffinity reports all online CPUs ───────────────────────
 
 fn test_sched_getaffinity_shows_all_cpus() -> bool {
-    test_header!("sched_getaffinity(204): popcount == online CPU count");
+    test_header!("sched_getaffinity(204): bytes-copied return + popcount + small-buf");
 
     let ncpus_reported = crate::arch::x86_64::apic::cpu_count() as usize;
     let ncpus_reported = ncpus_reported.max(1);
 
-    // cpuset buffer — 128 bytes covers up to 1024 CPUs
+    // ── Sub-test 1: normal-sized buffer (128 bytes) ──────────────────────────
+    // Per `man 2 sched_getaffinity`: raw syscall returns bytes-copied (>0).
     let mut cpuset = [0u8; 128];
-
-    // sched_getaffinity(pid=0, cpusetsize=128, mask=&cpuset)
     let r = crate::syscall::dispatch_linux(
         204,
         0,                             // pid = 0 → caller
@@ -16704,24 +16703,49 @@ fn test_sched_getaffinity_shows_all_cpus() -> bool {
         cpuset.as_mut_ptr() as u64,
         0, 0, 0,
     );
-    test_println!("  sched_getaffinity(0) = {}", r);
-
-    if r != 0 {
-        test_fail!("sched_getaffinity_shows_all_cpus", "returned {} (expected 0)", r);
+    test_println!("  sched_getaffinity(bufsiz=128) = {}", r);
+    if r <= 0 || r > 128 {
+        test_fail!("sched_getaffinity_shows_all_cpus",
+            "bufsiz=128 returned {} (expected 1..=128)", r);
         return false;
     }
-
-    // Count bits set in the returned mask
+    if cpuset[0] & 0x01 == 0 {
+        test_fail!("sched_getaffinity_shows_all_cpus", "bit 0 not set in mask");
+        return false;
+    }
     let popcount: usize = cpuset.iter().map(|b| b.count_ones() as usize).sum();
-    test_println!("  cpuset popcount={} kernel_cpu_count={}", popcount, ncpus_reported);
-
     if popcount != ncpus_reported {
         test_fail!("sched_getaffinity_shows_all_cpus",
             "popcount={} != kernel cpu_count={}", popcount, ncpus_reported);
         return false;
     }
 
-    test_pass!("sched_getaffinity: popcount matches online CPU count");
+    // ── Sub-test 2: small buffer (8 bytes) → must return exactly 8 ───────────
+    let mut small = [0xFFu8; 8];
+    let r2 = crate::syscall::dispatch_linux(
+        204, 0, 8, small.as_mut_ptr() as u64, 0, 0, 0,
+    );
+    test_println!("  sched_getaffinity(bufsiz=8) = {}", r2);
+    if r2 != 8 {
+        test_fail!("sched_getaffinity_shows_all_cpus",
+            "bufsiz=8 returned {} (expected 8)", r2);
+        return false;
+    }
+    if small[0] & 0x01 == 0 {
+        test_fail!("sched_getaffinity_shows_all_cpus", "small buf: bit 0 not set");
+        return false;
+    }
+
+    // ── Sub-test 3: NULL buffer — preserve existing permissive behavior (0) ─
+    let r3 = crate::syscall::dispatch_linux(204, 0, 128, 0, 0, 0, 0);
+    test_println!("  sched_getaffinity(NULL) = {}", r3);
+    if r3 != 0 {
+        test_fail!("sched_getaffinity_shows_all_cpus",
+            "NULL buf returned {} (expected 0 — permissive)", r3);
+        return false;
+    }
+
+    test_pass!("sched_getaffinity: bytes-copied semantics correct");
     true
 }
 
