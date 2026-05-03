@@ -2102,10 +2102,14 @@ pub(crate) fn sys_dup(old_fd: usize) -> i64 {
         None => return -3,
     };
 
-    let fd_clone = match proc.file_descriptors.get(old_fd).and_then(|f| f.as_ref()) {
+    let mut fd_clone = match proc.file_descriptors.get(old_fd).and_then(|f| f.as_ref()) {
         Some(fd) => fd.clone(),
         None => return -9,
     };
+
+    // Per POSIX dup(2): "The duplicate descriptor shall have its
+    // close-on-exec flag cleared."
+    fd_clone.cloexec = false;
 
     // Find lowest free fd
     for i in 0..proc.file_descriptors.len() {
@@ -2140,10 +2144,13 @@ pub(crate) fn sys_dup2(old_fd: usize, new_fd: usize) -> i64 {
         };
     }
 
-    let fd_clone = match proc.file_descriptors.get(old_fd).and_then(|f| f.as_ref()) {
+    let mut fd_clone = match proc.file_descriptors.get(old_fd).and_then(|f| f.as_ref()) {
         Some(fd) => fd.clone(),
         None => return -9,
     };
+
+    // Per POSIX dup2(2): the duplicate's close-on-exec flag is cleared.
+    fd_clone.cloexec = false;
 
     // Grow the table if needed
     while proc.file_descriptors.len() <= new_fd {
