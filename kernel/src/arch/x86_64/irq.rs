@@ -54,7 +54,64 @@ pub const IRQ_OFFSET: u8 = 32;
 const PIC_EOI: u8 = 0x20;
 
 /// Timer tick counter.
+///
+/// Advances at exactly `TICK_HZ` (≈100 Hz) regardless of how many CPUs
+/// are online.  The value is *wall-clock-derived* from TSC, not the sum of
+/// per-CPU LAPIC ISR entries — a buggy approach where N online CPUs each
+/// independently bump `+= 1` would make the apparent monotonic clock
+/// advance N× faster than wall time, which silently breaks every consumer
+/// that schedules deadlines from CLOCK_MONOTONIC (the userspace vDSO fast
+/// path among them).  See `timer_tick` for the TSC-monotone update logic.
 pub static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// TSC value at boot — captured by [`set_tsc_calibration`] right after the
+/// PIT-driven LAPIC calibration completes.  Used as the "epoch" against
+/// which `timer_tick` recomputes `TICK_COUNT` each interrupt.
+pub(crate) static TSC_AT_BOOT: AtomicU64 = AtomicU64::new(0);
+
+/// TSC cycles per tick (100 Hz → 10 ms).  Captured at boot from the same
+/// PIT-driven calibration window used to size the LAPIC initial-count.
+/// Zero before calibration; once non-zero it is treated as immutable.
+pub(crate) static TSC_PER_TICK: AtomicU64 = AtomicU64::new(0);
+
+/// Per-CPU count of timer-ISR entries.  Diagnostic-only; used by the
+/// `clock_monotonic_rate` regression test (and by anyone debugging where
+/// timer interrupts are landing).  Increments on every timer ISR entry
+/// regardless of which CPU.
+pub static TIMER_ISR_PER_CPU: [AtomicU64; super::apic::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; super::apic::MAX_CPUS];
+
+/// Number of times TICK_COUNT was advanced (CAS won by some CPU).
+/// Should be approximately equal to the wall-clock tick count, *not* to
+/// the sum of per-CPU ISR entries.
+pub static TICK_COUNT_BUMPS: AtomicU64 = AtomicU64::new(0);
+
+/// Read the TSC.  Standard `rdtsc` — no fences (we only need ordering
+/// against ourselves on the same CPU).
+#[inline(always)]
+fn rdtsc() -> u64 {
+    let lo: u32; let hi: u32;
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi,
+                         options(nomem, nostack, preserves_flags));
+    }
+    ((hi as u64) << 32) | lo as u64
+}
+
+/// Tick rate.  Kept consistent with the LAPIC/PIT calibration target
+/// (~100 Hz) and with the vDSO `tick_hz` field.
+pub const TICK_HZ: u64 = 100;
+
+/// Record the TSC frequency the BSP measured during LAPIC calibration so
+/// `timer_tick` can derive a wall-locked `TICK_COUNT`.  Must be called
+/// once on the BSP after `calibrate_lapic_timer` completes.
+pub fn set_tsc_calibration(tsc_per_10ms: u64) {
+    if tsc_per_10ms == 0 { return; }
+    let _ = TSC_AT_BOOT.compare_exchange(
+        0, rdtsc(), Ordering::AcqRel, Ordering::Relaxed);
+    let _ = TSC_PER_TICK.compare_exchange(
+        0, tsc_per_10ms, Ordering::AcqRel, Ordering::Relaxed);
+}
 
 /// Keyboard scancode buffer (simple ring buffer).
 static mut KEYBOARD_BUFFER: [u8; 256] = [0; 256];
@@ -224,21 +281,88 @@ extern "C" fn timer_tick() {
         return;
     }
 
-    let tick = TICK_COUNT.fetch_add(1, Ordering::Relaxed);
-    crate::perf::record_interrupt(32); // IRQ0 = vector 32
+    // Each CPU's LAPIC delivers its own periodic timer interrupt at ~100 Hz.
+    // The TICK_COUNT is the *single global* monotonic time-of-day source —
+    // it must therefore advance at exactly one CPU's tick rate, NOT the sum
+    // across CPUs.  Letting every CPU bump TICK_COUNT scales the apparent
+    // wall-clock by the number of online CPUs, which silently breaks every
+    // CLOCK_MONOTONIC consumer (including the userspace vDSO clock_gettime
+    // fast path used by glibc / NSPR / Mozilla event loops).
+    //
+    // Rule:
+    //   * BSP advances TICK_COUNT and the vvar page.
+    //   * APs handle preemption / per-CPU scheduling locally and EOI, but
+    //     do NOT touch the global tick counter or vvar.
+    //
+    // If the BSP is HLT-idle, KVM/the LAPIC will still deliver the BSP's
+    // periodic timer to wake it (this is the standard x86 timer model:
+    // the LAPIC timer is independent of the CPU's HLT state).
+    let cpu = super::apic::cpu_index();
+    let is_bsp = cpu == 0;
+    if cpu < super::apic::MAX_CPUS {
+        TIMER_ISR_PER_CPU[cpu].fetch_add(1, Ordering::Relaxed);
+    }
 
-    // Mirror the new tick value into the user-readable vvar page so the
-    // vDSO clock_gettime / gettimeofday / time fast paths see it without
-    // a syscall.  See kernel/src/proc/vdso.rs for the seqlock layout.
-    crate::proc::vdso::vvar_tick(tick + 1);
+    // Compute the wall-clock-correct TICK_COUNT from the TSC delta.  Any
+    // CPU may run this — whoever wins the CAS publishes the new value.
+    // This is independent of the ISR firing rate, so it is safe for every
+    // online CPU to participate (KVM occasionally suppresses BSP timer
+    // delivery; trusting BSP-only would freeze the clock in that case).
+    //
+    // Before calibration is published (very early boot, before LAPIC init),
+    // fall back to a single-bump-per-ISR scheme just so timing-dependent
+    // boot code doesn't see a frozen clock.
+    let tsc_per_tick = TSC_PER_TICK.load(Ordering::Acquire);
+    let new_tick: u64;
+    if tsc_per_tick != 0 {
+        let now_tsc = rdtsc();
+        let tsc_at_boot = TSC_AT_BOOT.load(Ordering::Acquire);
+        let elapsed = now_tsc.wrapping_sub(tsc_at_boot);
+        new_tick = elapsed / tsc_per_tick;
+    } else {
+        // BSP only during pre-calibration to avoid CPU-count scaling.
+        if !is_bsp {
+            // No tick advance from APs before calibration — they will
+            // catch up once the BSP publishes TSC_PER_TICK.
+            // (Just EOI and return below — same as if the tick happened.)
+            new_tick = TICK_COUNT.load(Ordering::Relaxed);
+        } else {
+            new_tick = TICK_COUNT.load(Ordering::Relaxed) + 1;
+        }
+    }
+
+    // Monotone CAS: only publish if `new_tick` exceeds the current value.
+    // The loop is bounded — if another CPU wins, its value is at least as
+    // new and we can stop.
+    let mut cur = TICK_COUNT.load(Ordering::Relaxed);
+    let tick = loop {
+        if new_tick <= cur {
+            break cur; // someone else (or our previous ISR) is already ahead
+        }
+        match TICK_COUNT.compare_exchange_weak(
+            cur, new_tick, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => {
+                TICK_COUNT_BUMPS.fetch_add(1, Ordering::Relaxed);
+                // Update vvar only when WE published the new value, so we
+                // don't double-write between racing CPUs.
+                crate::proc::vdso::vvar_tick(new_tick);
+                break new_tick;
+            }
+            Err(observed) => {
+                cur = observed;
+                // Loop to recheck — the new value may already exceed ours.
+            }
+        }
+    };
+    crate::perf::record_interrupt(32); // IRQ0 = vector 32
 
     // ── Heartbeat: emit every 500 ticks (~5s at 100 Hz) ─────────────
     // Gives the external watchdog (tools/qemu-watchdog.py) a signal that
     // the timer ISR is still firing.  Zero cost in production builds.
+    // Only the BSP emits — it is the authoritative tick source.
     #[cfg(any(feature = "test-mode", feature = "firefox-test"))]
     {
-        if tick > 0 && tick % 500 == 0 {
-            let cpu = super::apic::cpu_index();
+        if is_bsp && tick > 0 && tick % 500 == 0 {
             crate::serial_println!("[HB] tick={} cpu={} pf={} sc={}",
                 tick, cpu,
                 crate::arch::x86_64::idt::page_fault_count(),
@@ -250,8 +374,9 @@ extern "C" fn timer_tick() {
     // Incremented every tick.  Reset to 0 by reset_watchdog_counter()
     // called from schedule() on successful context switch.  If it reaches
     // the limit, a CPU has been stuck for >10s → bugcheck.
+    // Per-CPU counter advances on each CPU's own LAPIC firing — independent
+    // of whether this CPU updates the global TICK_COUNT.
     {
-        let cpu = super::apic::cpu_index();
         // Only check when the scheduler is active — before it's enabled,
         // all kernel init runs on CPU 0 without context switches.
         if crate::sched::is_active() {

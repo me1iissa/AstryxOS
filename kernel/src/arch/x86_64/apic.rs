@@ -51,6 +51,18 @@ static CPU_COUNT: AtomicU32 = AtomicU32::new(1);
 /// Whether APIC is available and initialized.
 static APIC_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// LAPIC periodic timer initial-count value calibrated by the BSP.
+///
+/// Captured at the end of [`init`] after the PIT-driven calibration.  APs
+/// then read this value when programming their own LAPIC timer in
+/// `ap_rust_entry`, so every CPU's periodic timer fires at the same ~100 Hz
+/// regardless of LAPIC bus frequency.
+///
+/// Before BSP calibration this reads as 0; APs MUST NOT consult it until the
+/// BSP has stored a non-zero value.  The BSP brings up APs only after
+/// completing its own LAPIC init, so this ordering is naturally established.
+static LAPIC_TIMER_PERIOD: AtomicU32 = AtomicU32::new(0);
+
 /// AP started flags.
 static AP_STARTED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 
@@ -174,14 +186,18 @@ pub fn init() {
     // Use divide-by-16 for calibration
     lapic_write(LAPIC_TIMER_DIVIDE, 0x03); // Divide by 16
 
-    // Calibrate using PIT: count LAPIC ticks in ~10ms
-    let calibration_ticks = calibrate_lapic_timer();
+    // Calibrate using PIT: count LAPIC ticks AND TSC cycles in ~10 ms.
+    let (calibration_ticks, tsc_per_10ms) = calibrate_lapic_timer();
+    crate::arch::x86_64::irq::set_tsc_calibration(tsc_per_10ms);
 
     // Configure periodic timer at ~100 Hz
     // We measured ticks in 10ms, so this gives us ~100 Hz
     let timer_count = calibration_ticks;
     lapic_write(LAPIC_TIMER_LVT, 0x20000 | 32); // Periodic | vector 32
     lapic_write(LAPIC_TIMER_INIT, timer_count);
+
+    // Publish the calibrated period for APs to copy (see `ap_rust_entry`).
+    LAPIC_TIMER_PERIOD.store(timer_count, Ordering::Release);
 
     crate::serial_println!(
         "[APIC] Local APIC initialized: BSP ID={}, base={:#x}, timer count={}",
@@ -198,7 +214,12 @@ pub fn init() {
 }
 
 /// Calibrate LAPIC timer using the PIT.
-fn calibrate_lapic_timer() -> u32 {
+///
+/// Returns `(lapic_ticks_per_10ms, tsc_cycles_per_10ms)`.  The TSC
+/// measurement is the source of truth for `TICK_COUNT` updates (see
+/// `arch::x86_64::irq::timer_tick`); the LAPIC count drives periodic
+/// preemption.
+fn calibrate_lapic_timer() -> (u32, u64) {
     // Use PIT Channel 2 for calibration
     unsafe {
         // Set PIT channel 2 to one-shot mode
@@ -213,6 +234,17 @@ fn calibrate_lapic_timer() -> u32 {
     // Reset LAPIC timer with max count
     lapic_write(LAPIC_TIMER_INIT, 0xFFFF_FFFF);
 
+    // Sample TSC at the start of the 10 ms window so we can compute the
+    // TSC-per-tick ratio against the same PIT-measured baseline.
+    let tsc_start: u64 = {
+        let lo: u32; let hi: u32;
+        unsafe {
+            core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi,
+                             options(nomem, nostack, preserves_flags));
+        }
+        ((hi as u64) << 32) | lo as u64
+    };
+
     // Wait for PIT channel 2 to expire
     unsafe {
         // Gate on
@@ -224,18 +256,31 @@ fn calibrate_lapic_timer() -> u32 {
         while crate::hal::inb(0x61) & 0x20 == 0 {}
     }
 
+    // Sample TSC at the end of the window and compute the delta.
+    let tsc_end: u64 = {
+        let lo: u32; let hi: u32;
+        unsafe {
+            core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi,
+                             options(nomem, nostack, preserves_flags));
+        }
+        ((hi as u64) << 32) | lo as u64
+    };
+
     // Read how many ticks elapsed
     let elapsed = 0xFFFF_FFFF - lapic_read(LAPIC_TIMER_CURRENT);
 
     // Stop the timer temporarily
     lapic_write(LAPIC_TIMER_INIT, 0);
 
-    if elapsed == 0 {
+    let tsc_per_10ms = tsc_end.wrapping_sub(tsc_start);
+
+    let lapic_count = if elapsed == 0 {
         // Fallback value if calibration failed
         100_000
     } else {
         elapsed
-    }
+    };
+    (lapic_count, tsc_per_10ms)
 }
 
 /// Initialize I/O APIC (default address 0xFEC00000).
@@ -867,10 +912,20 @@ pub extern "C" fn ap_rust_entry() -> ! {
     // Accept all interrupts
     lapic_write(LAPIC_TPR, 0);
 
-    // Configure LAPIC timer (same settings as BSP — periodic, vector 32)
+    // Configure LAPIC timer (same settings as BSP — periodic, vector 32).
+    //
+    // Use the period the BSP measured against the PIT, not a hard-coded
+    // guess.  A wrong AP period was previously masked because APs do not
+    // advance the global TICK_COUNT (BSP-only), but it still affects
+    // preemption granularity and any future per-CPU time accounting.
     lapic_write(LAPIC_TIMER_DIVIDE, 0x03);   // divide by 16
     lapic_write(LAPIC_TIMER_LVT, 0x20000 | 32); // periodic | vector 32
-    lapic_write(LAPIC_TIMER_INIT, 100_000);  // approximate — will be close to BSP
+    let period = LAPIC_TIMER_PERIOD.load(Ordering::Acquire);
+    // Fallback to a conservative count if we ever reach this before the BSP
+    // published its calibration; this keeps timer interrupts firing rather
+    // than leaving the AP without any periodic preemption.
+    let ap_count = if period == 0 { 100_000 } else { period };
+    lapic_write(LAPIC_TIMER_INIT, ap_count);
 
     // Create an idle thread for this AP so the scheduler can track it.
     // We use a special TID = 0x1000 + apic_id to avoid conflicts.
