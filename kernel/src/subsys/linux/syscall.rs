@@ -2739,14 +2739,45 @@ fn sys_select_linux(
     };
 
     if ready == 0 {
-        // SMP fix: pump x11 once, then retry up to 64 times yielding each iteration
-        // to give CPU 0's desktop loop time to finish writing replies.
-        let non_zero_timeout = timeout != 0;
+        // Per `man 2 select`: NULL timeout blocks indefinitely; a timeval of
+        // {0,0} returns immediately; otherwise block bounded by the timeval.
+        // Returning 0 early (the previous "yield 64 times" behaviour) caused
+        // applications using the canonical self-pipe-wakeup pattern to
+        // busy-loop instead of blocking until the peer thread wrote.
         crate::x11::poll();
-        for _ in 0..64 {
-            crate::sched::yield_cpu();
-            do_rescan(&mut ready);
-            if ready > 0 || !non_zero_timeout { break; }
+        let timeout_ms: i64 = if timeout == 0 {
+            -1 // NULL → infinite
+        } else if !crate::syscall::validate_user_ptr(timeout, 16) {
+            -1 // bad pointer — treat as infinite to be conservative
+        } else {
+            // struct timeval { tv_sec: i64, tv_usec: i64 } on x86_64.
+            let tv_sec  = unsafe { core::ptr::read_unaligned(timeout as *const i64) };
+            let tv_usec = unsafe { core::ptr::read_unaligned((timeout + 8) as *const i64) };
+            if tv_sec == 0 && tv_usec == 0 {
+                0
+            } else {
+                let ms = tv_sec.saturating_mul(1000)
+                    .saturating_add(tv_usec / 1000);
+                ms.max(1)
+            }
+        };
+
+        if timeout_ms != 0 {
+            let deadline_tick = if timeout_ms < 0 {
+                u64::MAX
+            } else {
+                let now = crate::arch::x86_64::irq::get_ticks();
+                now.saturating_add(((timeout_ms as u64) / 10).max(1))
+            };
+            loop {
+                crate::proc::sleep_ticks(1); // 10ms
+                crate::x11::poll();
+                do_rescan(&mut ready);
+                if ready > 0 { break; }
+                if signal_pending(pid) { return -4; } // EINTR
+                let now = crate::arch::x86_64::irq::get_ticks();
+                if now >= deadline_tick { break; }
+            }
         }
     }
     ready
@@ -5326,6 +5357,17 @@ fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
     }
 }
 
+/// Returns true if a deliverable (pending && !blocked) signal is queued for `pid`.
+/// Used by blocking syscalls (epoll_wait, select) to honour the POSIX contract
+/// that they must abort with EINTR when a signal is delivered during the wait.
+fn signal_pending(pid: u64) -> bool {
+    let procs = crate::proc::PROCESS_TABLE.lock();
+    procs.iter().find(|p| p.pid == pid)
+        .and_then(|p| p.signal_state.as_ref())
+        .map(|s| s.has_pending())
+        .unwrap_or(false)
+}
+
 /// epoll_create / epoll_create1 — allocate a new epoll fd.
 fn sys_epoll_create1(_flags: u32) -> i64 {
     let pid = crate::proc::current_pid();
@@ -5443,20 +5485,32 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
     let mut fired: alloc::vec::Vec<EpollEvent> = alloc::vec::Vec::new();
     do_poll(&mut fired);
 
-    // If nothing ready and caller is willing to wait, sleep for the requested
-    // timeout then retry. Firefox's event loop depends on epoll_wait actually
-    // blocking for the full timeout — returning 0 too quickly causes Firefox
-    // to spin in a tight loop and never advance its internal timers.
+    // Per `man 2 epoll_wait`: the call must block until at least one fd is
+    // ready, the timeout expires, or a signal is delivered. Returning 0 early
+    // is a contract violation — applications that use the canonical self-pipe
+    // wakeup pattern (write to a pipe-write end to wake a sibling thread
+    // blocked in epoll_wait) will busy-loop instead of waking on demand.
+    //
+    // We poll on a 10ms cadence (1 tick) and re-check until one of the three
+    // termination conditions fires. Wake-on-readiness (notifying epoll
+    // instances directly when a watched fd transitions to ready) is a
+    // correctness-preserving optimisation tracked as follow-up work.
     if fired.is_empty() && timeout_ms != 0 {
-        let wait_ticks = if timeout_ms < 0 {
-            // Infinite timeout — sleep a reasonable amount then retry
-            10u64  // 100ms
+        let deadline_tick = if timeout_ms < 0 {
+            u64::MAX // infinite — block until ready or signal
         } else {
-            // Convert ms to ticks (100 Hz = 10ms/tick), minimum 1
-            ((timeout_ms as u64) / 10).max(1)
+            let now = crate::arch::x86_64::irq::get_ticks();
+            now.saturating_add(((timeout_ms as u64) / 10).max(1))
         };
-        crate::proc::sleep_ticks(wait_ticks);
-        do_poll(&mut fired);
+        loop {
+            crate::proc::sleep_ticks(1); // 10ms granularity
+            do_poll(&mut fired);
+            if !fired.is_empty() { break; }
+            // Signal pending → return -EINTR per spec.
+            if signal_pending(pid) { return -4; } // EINTR
+            let now = crate::arch::x86_64::irq::get_ticks();
+            if now >= deadline_tick { break; }
+        }
     }
 
     // ── Step 3: copy events to the caller's buffer ───────────────────────────
