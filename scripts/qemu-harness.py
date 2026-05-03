@@ -2643,6 +2643,132 @@ _FUTEX_WAIT_REG_RICH = re.compile(
 _FUTEX_WAKE_RE = re.compile(
     r"\[FUTEX_WAKE\] tid=\d+ pid=\d+ uaddr=(0x[0-9a-fA-F]+) woken=(\d+)"
 )
+# Phase-17 stack-walk markers — emitted by the kernel at futex_wait entry
+# alongside FUTEX_WAIT_REG.  WAIT_STACK is the rbp-chain walk (up to 7
+# frames); WAIT_SCAN is the raw u64 stack window for cases where the chain
+# dies inside libc/libxul (callees built with -fomit-frame-pointer).
+_FUTEX_WAIT_STACK_RE = re.compile(
+    r"\[FUTEX_WAIT_STACK\] tid=(\d+) pid=\d+ uaddr=0x[0-9a-fA-F]+ "
+    r"leaf=(0x[0-9a-fA-F]+)(.*)"
+)
+_FUTEX_WAIT_SCAN_RE = re.compile(
+    r"\[FUTEX_WAIT_SCAN\] tid=(\d+) pid=\d+ rsp=(0x[0-9a-fA-F]+)(.*)"
+)
+_FRAME_RE = re.compile(r" f(\d+)=(0x[0-9a-fA-F]+)")
+_SCAN_WORD_RE = re.compile(r" w(\d+)=(0x[0-9a-fA-F]+)")
+
+def cmd_parked_stacks(args):
+    """Phase-17 deep stack walk for parked tids.
+
+    Combines the latest [FUTEX_WAIT_REG] (uaddr/op/rip), [FUTEX_WAIT_STACK]
+    (rbp-chain frames f1..f7) and [FUTEX_WAIT_SCAN] (128 u64 stack words)
+    records per tid and resolves every frame against the [FFTEST/mmap-so]
+    load-base table plus the host-side .so symbol tables.  The scan-word
+    pass is critical because Mozilla libraries are built with
+    -fomit-frame-pointer — the rbp chain dies after 1-3 frames inside
+    libc, but the actual libxul/libnspr return addresses live on the stack
+    and can be recovered by treating any u64 that lands in a known mapped
+    .text segment as a candidate return address.
+
+    Output schema:
+      { "tids":[{tid, pid, uaddr, op, leaf, rbp_chain:[{rip, library,
+        offset, symbol}], scan_hits:[{idx, rip, library, offset, symbol}]
+        }], "tid_count": N, "parked_count": M }
+
+    The post-processor in this subcommand only reports SCAN words that
+    resolve to a non-libc, non-libpthread library — those are the
+    user-code return addresses that identify the wedge's call chain.
+    """
+    sess = _load_session(args.sid)
+    try:
+        lines = Path(sess["serial_log"]).read_text(errors="replace").splitlines()
+    except OSError as e:
+        _err(f"could not read serial log: {e}")
+    libs = _build_load_base_map(lines)
+    disk_root = getattr(args, "disk_root", None)
+    # Reuse the parked-tids state-machine for "is this tid currently parked?"
+    last_reg: dict[int, dict] = {}
+    last_stack: dict[int, dict] = {}
+    last_scan: dict[int, dict] = {}
+    waked_uaddrs: set[str] = set()
+    for ln in lines:
+        m = _FUTEX_WAIT_REG_RICH.search(ln)
+        if m:
+            tid = int(m.group(1))
+            last_reg[tid] = {
+                "tid": tid, "pid": int(m.group(2)), "uaddr": m.group(3),
+                "op": m.group(4),
+                "rip": int(m.group(5), 16), "rsp": int(m.group(6), 16),
+                "rbp": int(m.group(7), 16),
+            }
+            continue
+        m = _FUTEX_WAIT_STACK_RE.search(ln)
+        if m:
+            tid = int(m.group(1)); leaf = int(m.group(2), 16)
+            frames = [(int(i), int(v, 16)) for i, v in
+                      _FRAME_RE.findall(m.group(3))]
+            last_stack[tid] = {"leaf": leaf, "frames": frames}
+            continue
+        m = _FUTEX_WAIT_SCAN_RE.search(ln)
+        if m:
+            tid = int(m.group(1)); rsp = int(m.group(2), 16)
+            words = [(int(i), int(v, 16)) for i, v in
+                     _SCAN_WORD_RE.findall(m.group(3))]
+            last_scan[tid] = {"rsp": rsp, "words": words}
+            continue
+        w = _FUTEX_WAKE_RE.search(ln)
+        if w and int(w.group(2)) > 0:
+            waked_uaddrs.add(w.group(1))
+
+    rows: list[dict] = []
+    for tid in sorted(last_reg):
+        r = last_reg[tid]
+        parked = r["uaddr"] not in waked_uaddrs
+        # rbp-chain frames
+        rbp_chain = []
+        if tid in last_stack:
+            for i, rip in last_stack[tid]["frames"]:
+                ur = _resolve_user_rip(rip, libs, disk_root)
+                rbp_chain.append({
+                    "i": i, "rip": f"{rip:#x}",
+                    "library": (ur or {}).get("library"),
+                    "offset":  (ur or {}).get("offset"),
+                    "symbol":  (ur or {}).get("symbol"),
+                })
+        # Scan-word hits filtered to non-libc libraries
+        scan_hits = []
+        if tid in last_scan:
+            for idx, rip in last_scan[tid]["words"]:
+                ur = _resolve_user_rip(rip, libs, disk_root)
+                if not ur: continue
+                lib = ur["library"] or ""
+                # Filter out libc/libpthread/ld — the caller is interested
+                # in libxul/libnspr/libmoz*/libnss* return addresses.
+                bn = Path(lib).name if lib else ""
+                if bn.startswith("libc.") or bn.startswith("libpthread.") \
+                   or bn.startswith("ld-") or bn.startswith("libstdc++"):
+                    continue
+                scan_hits.append({
+                    "idx": idx, "rip": f"{rip:#x}",
+                    "library": lib, "offset": ur.get("offset"),
+                    "symbol":  ur.get("symbol"),
+                })
+        leaf = last_stack.get(tid, {}).get("leaf")
+        rows.append({
+            "tid": tid, "pid": r["pid"], "uaddr": r["uaddr"],
+            "op": r["op"], "parked": parked,
+            "leaf": (f"{leaf:#x}" if leaf else None),
+            "rbp_chain": rbp_chain,
+            "scan_hits": scan_hits,
+        })
+
+    _out({
+        "ok": True,
+        "tid_count": len(rows),
+        "parked_count": sum(1 for r in rows if r["parked"]),
+        "tids": rows,
+    })
+
 
 def cmd_parked_tids(args):
     sess = _load_session(args.sid)
@@ -3124,6 +3250,19 @@ def main():
     p_parked.add_argument("--disk-root", default=None, metavar="DIR",
                           help="Disk staging root for symbol lookup")
 
+    # parked-stacks — Phase-17 deep stack walk: rbp-chain frames + raw stack
+    # word scan, resolved against [FFTEST/mmap-so] + host-side .so symbols.
+    p_pstacks = sub.add_parser(
+        "parked-stacks",
+        help="Phase-17 deep stack walk for parked tids: combines "
+             "[FUTEX_WAIT_STACK] rbp-chain frames with [FUTEX_WAIT_SCAN] "
+             "raw stack words, filtered to non-libc libraries.  Reveals "
+             "the libxul/libnspr return addresses where the rbp chain "
+             "dies inside libc.")
+    p_pstacks.add_argument("sid")
+    p_pstacks.add_argument("--disk-root", default=None, metavar="DIR",
+                           help="Disk staging root for symbol lookup")
+
     # wake-attempts — diff WAKE_REQ vs still-parked uaddrs (Branch A/B verdict).
     p_wake = sub.add_parser(
         "wake-attempts",
@@ -3170,6 +3309,7 @@ def main():
         "stack":   cmd_stack,
         "ustack":  cmd_ustack,
         "parked-tids": cmd_parked_tids,
+        "parked-stacks": cmd_parked_stacks,
         "wake-attempts": cmd_wake_attempts,
         "rip-sample": cmd_rip_sample,
         "_watch":  cmd_run_watcher,

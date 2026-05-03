@@ -4613,6 +4613,16 @@ pub fn sys_futex_linux(
                      rip={:#x} rsp={:#x} rbp={:#x}",
                     tid, pid, uaddr, val, futex_op, user_rip, user_rsp, user_rbp
                 );
+                // Walk the rbp chain so the harness can resolve each parked
+                // worker's libxul callsite without needing a kdb round-trip
+                // or a host-side GDB attach.  Only walked when the caller
+                // is in user mode (rbp non-zero, rsp under KERNEL_VIRT_BASE).
+                if user_rbp != 0 && user_rsp < astryx_shared::KERNEL_VIRT_BASE {
+                    let cr3 = crate::mm::vmm::get_cr3();
+                    crate::syscall::ring::dump_futex_wait_stack(
+                        tid, pid, uaddr, cr3, user_rip, user_rsp, user_rbp,
+                    );
+                }
             }
             {
                 let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
