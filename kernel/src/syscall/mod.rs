@@ -2473,14 +2473,24 @@ pub(crate) fn get_unix_socket_id(pid: u64, fd_num: usize) -> u64 {
 }
 
 /// Allocate a new AF_UNIX socket fd, returning the fd number or negative errno.
-pub(crate) fn alloc_unix_socket_fd(pid: u64, unix_id: u64) -> i64 {
+///
+/// `cloexec` sets `FD_CLOEXEC` on the new fd (per `socket(2)` `SOCK_CLOEXEC`).
+/// `nonblock` sets `O_NONBLOCK` in the fd's status flags so subsequent
+/// read/write calls return -EAGAIN instead of blocking (per `socket(2)`
+/// `SOCK_NONBLOCK`).
+pub(crate) fn alloc_unix_socket_fd(pid: u64, unix_id: u64, cloexec: bool, nonblock: bool) -> i64 {
+    // O_NONBLOCK = 0x800 (Linux ABI).  Stored in the lower 12 bits of
+    // `flags` so fcntl(F_GETFL/F_SETFL) round-trips and read/write paths
+    // can branch on it.
+    let mut flag_bits: u32 = 0x4000_0000 | UNIX_SOCKET_FLAG; // SOCKET_FD | UNIX_FLAG
+    if nonblock { flag_bits |= 0x0800; }
     let fd = crate::vfs::FileDescriptor {
         mount_idx: usize::MAX,
         inode: unix_id,
         offset: 0,
-        flags: 0x4000_0000 | UNIX_SOCKET_FLAG, // SOCKET_FD | UNIX_FLAG
+        flags: flag_bits,
         is_console: false,
-        cloexec: false,
+        cloexec,
         file_type: crate::vfs::FileType::Socket,
         open_path: alloc::string::String::new(),
     };
