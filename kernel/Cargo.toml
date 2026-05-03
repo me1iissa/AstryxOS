@@ -47,6 +47,15 @@ kdb = []
 # the suite stays observable; remove this gate once the underlying wakeup
 # race is fixed.  Tracking issue filed alongside this feature flag.
 ci-skip-test-104 = []
+# Builds a self-test for the fault-immune bugcheck banner printer.
+# When enabled (alongside `test-mode`), `test_runner::run` first invokes
+# `kernel/src/util/no_alloc_fmt.rs::tests::run_self_tests` to validate
+# the stack-only formatters, then triggers a deliberate kernel-mode
+# page fault and asserts the banner is emitted cleanly with no
+# secondary "fault while formatting" message.  The test halts that
+# vCPU on completion (the bugcheck path exits QEMU via isa-debug-exit
+# in test-mode), so this feature is OFF by default.
+bugcheck-test = []
 
 [dependencies]
 astryx-shared = { path = "../shared" }
