@@ -293,6 +293,56 @@ pub fn socket_recv(id: u64) -> Result<Vec<u8>, &'static str> {
     }
 }
 
+/// Receive data and the sender 4-tuple (for `recvfrom(2)`).
+///
+/// Per IEEE 1003.1 §recvfrom: when the caller supplies a non-NULL
+/// `address` argument, the implementation writes the source address of
+/// the returned message.  For unconnected datagram sockets this is the
+/// sender of the dequeued datagram; for connection-mode sockets it is
+/// the connected peer.
+///
+/// Returns `(payload, src_ip, src_port)`.  When no data is available
+/// the payload is empty and the address is the zero 4-tuple — callers
+/// must check the byte count before consulting the address (matches the
+/// existing non-blocking semantics of [`socket_recv`]).
+pub fn socket_recvfrom(id: u64) -> Result<(Vec<u8>, Ipv4Address, u16), &'static str> {
+    let sockets = SOCKETS.lock();
+    let sock = sockets.iter().find(|s| s.id == id)
+        .ok_or("socket not found")?;
+
+    match sock.socket_type {
+        SocketType::Udp => {
+            if !sock.bound {
+                return Err("not bound");
+            }
+            let local_port = sock.local_port;
+            drop(sockets);
+            if let Some(datagram) = super::udp::recv(local_port) {
+                let src_ip   = datagram.src_ip;
+                let src_port = datagram.src_port;
+                Ok((datagram.data, src_ip, src_port))
+            } else {
+                Ok((Vec::new(), [0; 4], 0))
+            }
+        }
+        SocketType::Tcp => {
+            if !sock.bound {
+                return Err("not bound");
+            }
+            // For connection-mode sockets, `recvfrom`'s source address is
+            // the connected peer (RFC 793 + IEEE 1003.1).  An unconnected
+            // listener wouldn't have any in-band data to read here, so a
+            // zero peer in that edge case is harmless.
+            let peer_ip   = sock.remote_ip;
+            let peer_port = sock.remote_port;
+            let local_port = sock.local_port;
+            drop(sockets);
+            let data = super::tcp::read(local_port);
+            Ok((data, peer_ip, peer_port))
+        }
+    }
+}
+
 /// Check if a socket has incoming data available (used by poll).
 pub fn socket_has_data(id: u64) -> bool {
     let sockets = SOCKETS.lock();
