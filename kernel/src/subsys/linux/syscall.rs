@@ -519,7 +519,17 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     now + ((timeout_ms as u64) / 10).max(1)
                 };
                 loop {
-                    crate::proc::sleep_ticks(1); // sleep 1 tick (10ms)
+                    // Park on the global IPC poll bell rather than spin-
+                    // sleeping at 100 Hz.  Any pipe write / eventfd post /
+                    // unix-socket message rings the bell (see
+                    // `crate::ipc::waitlist::ring_poll_bell`), waking us
+                    // promptly to re-evaluate the fd set.  The scheduler
+                    // tick wakes us anyway when `wake_tick == deadline`,
+                    // so a missed bell is bounded by the timeout (with
+                    // `u64::MAX` for infinite waits, the bell is the only
+                    // wake mechanism — its single firing point is every
+                    // pipe/eventfd write).
+                    crate::ipc::waitlist::wait_poll_event(deadline_tick);
                     // Pump X11 so replies appear in socket buffers.
                     crate::x11::poll();
                     let r = do_check(true, true);
@@ -528,6 +538,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         if pid >= 1 { crate::serial_println!("[POLL_RET] pid={} ret={} (woke)", pid, r); }
                         return r;
                     }
+                    if signal_pending(pid) { return -4; } // EINTR
                     let now = crate::arch::x86_64::irq::get_ticks();
                     if now >= deadline_tick { break; }
                 }
@@ -2853,7 +2864,12 @@ fn sys_select_linux(
                 now.saturating_add(((timeout_ms as u64) / 10).max(1))
             };
             loop {
-                crate::proc::sleep_ticks(1); // 10ms
+                // Park on the global poll bell — see the matching change
+                // in sys_poll for why this replaces the prior 10 ms tick
+                // sleep.  The bell wakes us when any pipe/eventfd state
+                // change occurs; the scheduler tick wakes us at the
+                // deadline.  Either path drops back into the rescan.
+                crate::ipc::waitlist::wait_poll_event(deadline_tick);
                 crate::x11::poll();
                 do_rescan(&mut ready);
                 if ready > 0 { break; }
@@ -2981,10 +2997,49 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
     if crate::syscall::is_pipe_fd(pid, fd as usize) {
         let pipe_id = crate::syscall::get_pipe_id(pid, fd as usize);
         let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, count) };
-        return match crate::ipc::pipe::pipe_read(pipe_id, buf) {
-            Some(n) => n as i64,
-            None => -9,
+        // Per `man 7 pipe` and `man 2 read`: a read on an empty pipe with the
+        // write end still open blocks until data arrives (or a signal fires)
+        // unless O_NONBLOCK is set.  EOF (write end closed) returns 0.  Pre-
+        // fix this branch returned `Some(0)` immediately, leaving callers to
+        // busy-spin via repeated read+poll cycles in user space.
+        let nonblock = {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            procs.iter().find(|p| p.pid == pid)
+                .and_then(|p| p.file_descriptors.get(fd as usize).and_then(|f| f.as_ref()))
+                .map(|f| (f.flags & 0x0800) != 0)
+                .unwrap_or(false)
         };
+        loop {
+            match crate::ipc::pipe::pipe_read(pipe_id, buf) {
+                None => return -9, // EBADF — pipe vanished (both ends closed).
+                Some(n) if n > 0 => return n as i64,
+                Some(_) => {
+                    // 0 bytes returned: either EOF or empty-but-open.
+                    if crate::ipc::pipe::pipe_is_eof(pipe_id) {
+                        return 0; // EOF — peer closed the write end.
+                    }
+                    if nonblock {
+                        return -11; // EAGAIN
+                    }
+                    if signal_pending(pid) {
+                        return -4; // EINTR
+                    }
+                    // Park the caller atomically against pipe_write's wake.
+                    let tid = crate::proc::current_tid();
+                    match crate::ipc::pipe::wait_readable(pipe_id, u64::MAX) {
+                        crate::ipc::pipe::WaitOutcome::Ready => continue,
+                        crate::ipc::pipe::WaitOutcome::Gone  => return -9, // EBADF
+                        crate::ipc::pipe::WaitOutcome::Enqueued => {
+                            crate::sched::schedule();
+                            // Cleanup any stale entry (e.g. timeout path) so
+                            // we never leak a dead waiter on the per-pipe
+                            // wait list.
+                            crate::ipc::pipe::waiter_cleanup_reader(pipe_id, tid);
+                        }
+                    }
+                }
+            }
+        }
     } else if crate::syscall::is_unix_socket_fd(pid, fd as usize) {
         let unix_id = crate::syscall::get_unix_socket_id(pid, fd as usize);
         let avail = crate::net::unix::bytes_available(unix_id);
@@ -3029,11 +3084,20 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
                 }
                 Err(-11) if nonblock => return -11, // EAGAIN
                 Err(-11) => {
-                    // Block: yield until counter becomes non-zero or a
-                    // signal interrupts us.  10 ms tick polling matches the
-                    // shape used by sys_select/poll above.
+                    // Atomic check-then-park against the per-eventfd wait
+                    // list.  Replaces the prior `sleep_ticks(1)` busy-poll
+                    // (10 ms latency, full CPU budget) with a real block
+                    // that wakes promptly when `eventfd::write` posts.
                     if signal_pending(pid) { return -4; } // EINTR
-                    crate::proc::sleep_ticks(1);
+                    let tid = crate::proc::current_tid();
+                    match crate::ipc::eventfd::wait_readable(efd_id, u64::MAX) {
+                        crate::ipc::eventfd::WaitOutcome::Ready => continue,
+                        crate::ipc::eventfd::WaitOutcome::Gone  => return -9, // EBADF
+                        crate::ipc::eventfd::WaitOutcome::Enqueued => {
+                            crate::sched::schedule();
+                            crate::ipc::eventfd::waiter_cleanup(efd_id, tid);
+                        }
+                    }
                 }
                 Err(e) => return e,
             }
@@ -3209,7 +3273,16 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
         let pipe_id = crate::syscall::get_pipe_id(pid, fd as usize);
         let slice = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
         return match crate::ipc::pipe::pipe_write(pipe_id, slice) {
-            Some(n) => n as i64,
+            Some(n) => {
+                // Per `man 7 pipe`: writes that deposit data MUST wake any
+                // readers parked on this pipe (the matching wait list lives
+                // in `crate::ipc::pipe::PIPE_READ_WAITERS`).  Skip the wake
+                // on a zero-byte write — the buffer state did not change.
+                if n > 0 {
+                    crate::ipc::pipe::wake_readers_all(pipe_id);
+                }
+                n as i64
+            }
             None => -9,
         };
     } else if crate::syscall::is_unix_socket_fd(pid, fd as usize) {
@@ -3229,7 +3302,13 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
         let efd_id = crate::syscall::get_eventfd_id(pid, fd as usize);
         let val = unsafe { core::ptr::read_unaligned(buf_ptr as *const u64) };
         return match crate::ipc::eventfd::write(efd_id, u64::from_le(val)) {
-            Ok(()) => 8,
+            Ok(()) => {
+                // Per `man 2 eventfd`: a write that bumps the counter must
+                // wake any reader parked on a zero counter (see the per-
+                // eventfd wait list in `crate::ipc::eventfd`).
+                crate::ipc::eventfd::wake_readers_all(efd_id);
+                8
+            }
             Err(e) => e,
         };
     }
@@ -5721,7 +5800,12 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
             now.saturating_add(((timeout_ms as u64) / 10).max(1))
         };
         loop {
-            crate::proc::sleep_ticks(1); // 10ms granularity
+            // Park on the global poll bell.  Pipe/eventfd writes ring it
+            // (see `crate::ipc::waitlist::ring_poll_bell`); the scheduler
+            // tick wakes us at the deadline.  Replaces the prior
+            // 10 ms-tick sleep loop and is the change responsible for
+            // closing the post-PR-#119 epoll-spin plateau.
+            crate::ipc::waitlist::wait_poll_event(deadline_tick);
             do_poll(&mut fired);
             if !fired.is_empty() { break; }
             // Signal pending → return -EINTR per spec.

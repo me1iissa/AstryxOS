@@ -323,11 +323,24 @@ pub fn write(id: u64, data: &[u8]) -> i64 {
         // n == data.len() because we checked space above.
         peer.seq_lens[peer.seq_tail] = n as u32;
         peer.seq_tail = (peer.seq_tail + 1) % SEQ_QUEUE_CAP;
+        // Drop the table lock before ringing the global poll bell so a
+        // poller waking on the bell does not contend on TABLE on its
+        // re-evaluation pass.
+        drop(t);
+        crate::ipc::waitlist::ring_poll_bell();
         return n as i64;
     }
 
     // STREAM: byte-stream, partial writes permitted.
     let n = t.0[peer_id as usize].push(data);
+    drop(t);
+    if n > 0 {
+        // Wake any poll/epoll/select caller watching the peer fd.  The
+        // pre-existing read path returns -EAGAIN when the buffer is empty,
+        // so without this kick the caller would wait for the next 10 ms
+        // tick to discover the new bytes.
+        crate::ipc::waitlist::ring_poll_bell();
+    }
     if n == 0 { -11 } else { n as i64 }
 }
 
