@@ -2441,14 +2441,23 @@ pub(crate) fn alloc_unix_socket_fd(pid: u64, unix_id: u64) -> i64 {
 
 /// uname buffer layout (5 fields, 65 bytes each = 325 bytes):
 ///   sysname, nodename, release, version, machine
+///
+/// We report sysname="Linux" with a Linux-shaped release string so that
+/// glibc, NSS, NSPR, and applications such as Mozilla Firefox take their
+/// regular Linux code paths (their feature detection branches on
+/// `uname.sysname == "Linux"` and parses release as
+/// `<major>.<minor>.<patch>`; values < 3.0 disable modern features).
+/// The Linux-compatible release embeds an "-astryx" suffix so the OS is
+/// still self-identifying, and the version field carries the AstryxOS
+/// branding for any caller that prints it.  Per POSIX `uname(2)`.
 pub(crate) fn sys_uname(buf: *mut u8) -> i64 {
     const FIELD_LEN: usize = 65;
     let fields: [&[u8]; 5] = [
-        b"AstryxOS",      // sysname
-        b"astryx",        // nodename
-        b"0.1.0",         // release
-        b"Phase 6",       // version
-        b"x86_64",        // machine
+        b"Linux",                       // sysname
+        b"astryx",                      // nodename
+        b"5.15.0-astryx",               // release (Linux-compat, parses as 5.15.0)
+        b"#1 SMP AstryxOS Aether",      // version
+        b"x86_64",                      // machine
     ];
 
     let out = unsafe { core::slice::from_raw_parts_mut(buf, FIELD_LEN * 5) };
