@@ -1270,6 +1270,10 @@ pub fn run() -> ! {
     total += 1;
     if test_rt_sigaction_flags_mask_roundtrip() { passed += 1; }
 
+    // ── Test 195: FUTEX_WAIT atomic check-then-queue (lost-wakeup race) ──
+    total += 1;
+    if test_futex_wait_atomic_check_then_queue() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -21993,5 +21997,222 @@ fn test_rt_sigaction_flags_mask_roundtrip() -> bool {
     let _ = &mut reset_act; // silence unused-mut
 
     test_pass!("rt_sigaction — sa_flags + sa_mask round-trip via oldact");
+    true
+}
+
+// ── Test 195: FUTEX_WAIT atomic check-then-queue (lost-wakeup race) ──────────
+//
+// Regression test for a kernel-side lost-wakeup race in FUTEX_WAIT.  Before
+// the fix, the wait path executed (a) read `*uaddr`, (b) compare to `val`,
+// (c) take FUTEX_WAITERS lock, (d) push tid as separate critical sections.
+// A concurrent FUTEX_WAKE that grabbed the lock between (b) and (c) saw an
+// empty queue and returned `woken=0`; the waiter then enqueued itself with
+// no future wake on the way, deadlocking glibc's `__lll_lock_wait_private`
+// (the pthread_mutex slow path) and any pthread_cond_wait whose producer
+// fired during the race window.
+//
+// The fix collapses (a)–(d) plus the THREAD_TABLE Blocked transition into a
+// single critical section under FUTEX_WAITERS.  The helper
+// `futex_wait_check_and_enqueue` is the canonical entry point used by
+// `sys_futex_linux`; this test invokes it directly with a kernel-mode
+// reader so the same critical section is exercised without needing a real
+// user-space mapping.
+//
+// Stress shape:
+//   - N waiter kernel threads each spin until FUTEX_WORD == EXPECTED, then
+//     call the helper.  They block until a waker dequeues them.
+//   - M waker kernel threads each call `futex_wake_for_exit(SYNTH_PID,
+//     SYNTH_UADDR, 1)` in a tight loop until they have woken at least
+//     `WAKES_PER_WAKER` waiters.
+//   - After all wakers have completed and the kernel has had time to drain
+//     any in-flight wake (yielded loop), the test asserts:
+//       * No waiter remains on FUTEX_WAITERS for (SYNTH_PID, SYNTH_UADDR).
+//       * Every waiter thread reached its DONE counter (i.e. nothing is
+//         still parked).
+//
+// Pre-fix this test was flaky/failing under SMP (waiters end up parked
+// without a corresponding wake); post-fix it passes deterministically
+// because every wake either (i) finds the waiter in the queue, or (ii)
+// the waiter sees `*uaddr != val` under the lock and returns EAGAIN.
+fn test_futex_wait_atomic_check_then_queue() -> bool {
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use crate::syscall::{FUTEX_WAITERS, FutexWaitOutcome, futex_wait_check_and_enqueue,
+                          futex_wake_for_exit};
+
+    test_header!("FUTEX_WAIT atomic check-then-queue (lost-wakeup race) — issue: pre-PR");
+
+    // Synthetic (pid, uaddr) pair — high values so we don't collide with
+    // any live mapping.  uaddr is just a key into the BTreeMap; the helper
+    // never dereferences it because we pass an in-kernel `read_u32` closure.
+    const SYNTH_PID: u64    = 0xCAFE_BABE_DEAD_BEEF;
+    const SYNTH_UADDR: u64  = 0x7EFF_F123_0000_0000;
+    const EXPECTED_VAL: u32 = 0x4243_4445; // arbitrary sentinel
+
+    // Shared kernel-mode "futex word" the closure reads under the lock.
+    static FUTEX_WORD: AtomicU32 = AtomicU32::new(0);
+    // How many waiters are still parked (decremented after schedule() returns).
+    static WAITERS_DONE: AtomicU32 = AtomicU32::new(0);
+    // How many waiters successfully enqueued (vs. hit ValueMismatch / Fault).
+    static WAITERS_ENQUEUED: AtomicU32 = AtomicU32::new(0);
+    // Total wakes posted by waker threads.
+    static WAKES_POSTED: AtomicU64 = AtomicU64::new(0);
+    // Termination flags for waker threads.
+    static STOP_WAKERS: AtomicU32 = AtomicU32::new(0);
+    // Reset counters in case an earlier test invocation left them set.
+    FUTEX_WORD.store(EXPECTED_VAL, Ordering::SeqCst);
+    WAITERS_DONE.store(0, Ordering::SeqCst);
+    WAITERS_ENQUEUED.store(0, Ordering::SeqCst);
+    WAKES_POSTED.store(0, Ordering::SeqCst);
+    STOP_WAKERS.store(0, Ordering::SeqCst);
+    // Remove any stale queue entry from a prior test run.
+    FUTEX_WAITERS.lock().remove(&(SYNTH_PID, SYNTH_UADDR));
+
+    const N_WAITERS: u32 = 4;
+    const N_WAKERS:  u32 = 2;
+
+    fn waiter_entry() {
+        // Capture our own tid for the enqueue call.
+        let tid = crate::proc::current_tid();
+        // Ensure interrupts are on so the per-CPU timer can preempt us
+        // off this thread when we transition to Blocked.
+        crate::hal::enable_interrupts();
+        // Single attempt: check-then-queue, then schedule().  If the
+        // helper returns ValueMismatch we count as "done" (a benign
+        // EAGAIN — wake-side beat us via the FUTEX_WORD update).
+        let outcome = futex_wait_check_and_enqueue(
+            SYNTH_PID, SYNTH_UADDR, EXPECTED_VAL as u64, tid,
+            u64::MAX, // indefinite
+            || Some(FUTEX_WORD.load(Ordering::SeqCst)),
+        );
+        match outcome {
+            FutexWaitOutcome::Enqueued => {
+                WAITERS_ENQUEUED.fetch_add(1, Ordering::SeqCst);
+                // Block until a wake transitions us back to Ready.
+                crate::sched::schedule();
+                // Cleanup: dequeue self if still on the list (timeout path).
+                {
+                    let mut waiters = FUTEX_WAITERS.lock();
+                    if let Some(list) = waiters.get_mut(&(SYNTH_PID, SYNTH_UADDR)) {
+                        list.retain(|&t| t != tid);
+                        if list.is_empty() {
+                            waiters.remove(&(SYNTH_PID, SYNTH_UADDR));
+                        }
+                    }
+                }
+            }
+            FutexWaitOutcome::ValueMismatch | FutexWaitOutcome::Fault => {
+                // Either a benign EAGAIN (waker raced ahead) or an unreachable
+                // EFAULT (our closure never returns None).  Counts as done.
+            }
+        }
+        WAITERS_DONE.fetch_add(1, Ordering::SeqCst);
+        crate::proc::exit_thread(0);
+    }
+
+    fn waker_entry() {
+        crate::hal::enable_interrupts();
+        // Wake one waiter at a time and yield, letting the scheduler hand
+        // a freshly-Ready waiter onto a different CPU before we issue the
+        // next wake.  Each call is the same code path
+        // `futex_wake_for_exit` uses for CLONE_CHILD_CLEARTID.
+        while STOP_WAKERS.load(Ordering::SeqCst) == 0 {
+            futex_wake_for_exit(SYNTH_PID, SYNTH_UADDR, 1);
+            WAKES_POSTED.fetch_add(1, Ordering::SeqCst);
+            // Yield so the woken thread (if any) gets a slot.
+            crate::sched::yield_cpu();
+            // Cap the loop: once every waiter is done we exit.
+            if WAITERS_DONE.load(Ordering::SeqCst) >= N_WAITERS {
+                break;
+            }
+        }
+        crate::proc::exit_thread(0);
+    }
+
+    let was_active = crate::sched::is_active();
+    if !was_active { crate::sched::enable(); }
+
+    // Spawn waiters first so they all enqueue before wakers begin.
+    for i in 0..N_WAITERS {
+        let pid = crate::proc::create_kernel_process(
+            "futex_wait_stress_waiter", waiter_entry as *const () as u64);
+        test_println!("  spawned waiter #{} pid={} ✓", i, pid);
+    }
+    // Brief yield so waiters reach the helper before wakers start posting.
+    for _ in 0..32u32 {
+        crate::sched::yield_cpu();
+        crate::hal::enable_interrupts();
+        for _ in 0..200u32 { core::hint::spin_loop(); }
+    }
+    for i in 0..N_WAKERS {
+        let pid = crate::proc::create_kernel_process(
+            "futex_wait_stress_waker", waker_entry as *const () as u64);
+        test_println!("  spawned waker  #{} pid={} ✓", i, pid);
+    }
+
+    // Wait up to ~3000 yield iterations (well above the SMP-blocking-state
+    // test's 4000-cap budget) for all waiters to complete.  Heartbeat every
+    // 256 iterations so the harness watchdog doesn't think we hung.
+    let mut all_done = false;
+    for i in 0..3000u32 {
+        crate::sched::yield_cpu();
+        crate::hal::enable_interrupts();
+        for _ in 0..500u32 { core::hint::spin_loop(); }
+        if WAITERS_DONE.load(Ordering::SeqCst) >= N_WAITERS {
+            all_done = true;
+            STOP_WAKERS.store(1, Ordering::SeqCst);
+            break;
+        }
+        if i != 0 && i % 256 == 0 {
+            test_println!(
+                "  futex_wait_stress: still waiting (done={}/{}, enq={}, wakes={}, iter {})",
+                WAITERS_DONE.load(Ordering::SeqCst), N_WAITERS,
+                WAITERS_ENQUEUED.load(Ordering::SeqCst),
+                WAKES_POSTED.load(Ordering::SeqCst), i);
+        }
+    }
+
+    // Tell wakers to stop and let them drain.
+    STOP_WAKERS.store(1, Ordering::SeqCst);
+    for _ in 0..256u32 {
+        crate::sched::yield_cpu();
+        crate::hal::enable_interrupts();
+        for _ in 0..200u32 { core::hint::spin_loop(); }
+    }
+
+    if !was_active { crate::sched::disable(); }
+
+    let done = WAITERS_DONE.load(Ordering::SeqCst);
+    let enq  = WAITERS_ENQUEUED.load(Ordering::SeqCst);
+    let wakes = WAKES_POSTED.load(Ordering::SeqCst);
+    test_println!("  done={}/{} enqueued={} wakes_posted={}",
+        done, N_WAITERS, enq, wakes);
+
+    // Invariant 1: every waiter must have made it past schedule().  Pre-fix,
+    // a missed wake would leave one or more waiters parked in Blocked and
+    // WAITERS_DONE would be < N_WAITERS.
+    if !all_done || done < N_WAITERS {
+        // Best-effort cleanup so a failed run does not leak the queue entry.
+        FUTEX_WAITERS.lock().remove(&(SYNTH_PID, SYNTH_UADDR));
+        test_fail!("futex_wait_atomic_check_then_queue",
+            "only {}/{} waiters completed (lost wakeup — {} still parked)",
+            done, N_WAITERS, N_WAITERS - done);
+        return false;
+    }
+
+    // Invariant 2: FUTEX_WAITERS must not contain a stale entry for our key.
+    let leftover = {
+        let waiters = FUTEX_WAITERS.lock();
+        waiters.get(&(SYNTH_PID, SYNTH_UADDR)).map(|v| v.len()).unwrap_or(0)
+    };
+    if leftover != 0 {
+        FUTEX_WAITERS.lock().remove(&(SYNTH_PID, SYNTH_UADDR));
+        test_fail!("futex_wait_atomic_check_then_queue",
+            "{} waiter(s) left on FUTEX_WAITERS after drain (leaked queue entry)",
+            leftover);
+        return false;
+    }
+
+    test_println!("  all {} waiters drained, no leaked queue entries ✓", N_WAITERS);
+    test_pass!("FUTEX_WAIT atomic check-then-queue (lost-wakeup race)");
     true
 }
