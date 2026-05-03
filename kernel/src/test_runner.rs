@@ -1232,6 +1232,23 @@ pub fn run() -> ! {
     total += 1;
     if test_recvfrom_truncated_addrlen() { passed += 1; }
 
+    // ── Tests 195–199: shutdown(2) half-close (Phase NDE-4) ──────────────
+
+    total += 1;
+    if test_shutdown_tcp_wr_sends_fin() { passed += 1; }
+
+    total += 1;
+    if test_shutdown_tcp_rd_returns_eof() { passed += 1; }
+
+    total += 1;
+    if test_shutdown_tcp_send_after_wr_epipe() { passed += 1; }
+
+    total += 1;
+    if test_shutdown_tcp_rdwr_breaks_both() { passed += 1; }
+
+    total += 1;
+    if test_shutdown_unconnected_tcp_enotconn() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -20865,6 +20882,184 @@ fn test_recvfrom_truncated_addrlen() -> bool {
 
     test_println!("  cap=8 → 8 bytes copied, *addrlen=16, tail untouched ✓");
     test_pass!("recvfrom — sockaddr truncation honours addrlen in/out");
+    true
+}
+
+// ── Tests 195–199: shutdown(2) half-close (Phase NDE-4) ──────────────────────
+//
+// IEEE 1003.1 §shutdown + RFC 793 §3.5: SHUT_RD disables further receives,
+// SHUT_WR sends FIN to peer + future sends fail with EPIPE, SHUT_RDWR is
+// the union.  shutdown on an unconnected stream socket returns ENOTCONN.
+//
+// TCP tests use the kdb-only `test_inject_established` helper to avoid
+// driving the full SLIRP 3WHS — the focus is the half-close state machine,
+// not connection establishment.  Peers live on 127/8 so the FIN that
+// `socket_shutdown` emits short-circuits via the loopback pseudo-device
+// instead of blocking ~500 ms × MAX_RETRIES on ARP.
+
+/// Build an injected Established TCB + matching connected Socket entry.
+/// Returns the socket id; the caller is responsible for `tcp::abort(port)`
+/// when done.
+#[cfg(feature = "kdb")]
+fn nde4_setup_pair(label: &str, port: u16, peer_ip: [u8; 4], peer_port: u16,
+                    queued: &[u8]) -> Option<u64>
+{
+    use crate::net::{socket, tcp};
+    use crate::net::socket::SocketType;
+    if let Err(e) = tcp::test_inject_established(port, peer_ip, peer_port, queued) {
+        test_fail!(label, "inject failed: {}", e);
+        return None;
+    }
+    let id = socket::socket_create(SocketType::Tcp);
+    let mut socks = socket::SOCKETS.lock();
+    let s = socks.iter_mut().find(|s| s.id == id)?;
+    s.local_port  = port;
+    s.remote_ip   = peer_ip;
+    s.remote_port = peer_port;
+    s.bound       = true;
+    s.connected   = true;
+    Some(id)
+}
+
+#[cfg(feature = "kdb")]
+fn test_shutdown_tcp_wr_sends_fin() -> bool {
+    test_header!("shutdown — SHUT_WR transitions Established → FinWait1");
+    use crate::net::{socket, tcp};
+    const PORT: u16 = 47210;
+    let peer = [127, 0, 0, 1];
+    let id = match nde4_setup_pair("shutdown_wr", PORT, peer, 51111, b"") {
+        Some(i) => i, None => return false,
+    };
+    let rc = socket::socket_shutdown(id, socket::SHUT_WR);
+    let state = tcp::snapshot_connections().iter()
+        .find(|c| c.local_port == PORT && c.remote_ip == peer)
+        .map(|c| c.state);
+    let _ = tcp::abort(PORT);
+    if rc != 0 || state != Some(tcp::TcpState::FinWait1) {
+        test_fail!("shutdown_wr", "rc={}, state={:?} (want 0, FinWait1)", rc, state);
+        return false;
+    }
+    test_println!("  Established → FinWait1 ✓");
+    test_pass!("shutdown — SHUT_WR transitions Established → FinWait1");
+    true
+}
+
+#[cfg(not(feature = "kdb"))]
+fn test_shutdown_tcp_wr_sends_fin() -> bool {
+    test_header!("shutdown — SHUT_WR (kdb-only stub)");
+    test_pass!("shutdown — SHUT_WR (kdb-only stub)");
+    true
+}
+
+#[cfg(feature = "kdb")]
+fn test_shutdown_tcp_rd_returns_eof() -> bool {
+    test_header!("shutdown — SHUT_RD: subsequent recv returns 0 (EOF)");
+    use crate::net::{socket, tcp};
+    const PORT: u16 = 47211;
+    let id = match nde4_setup_pair("shutdown_rd", PORT, [127, 0, 0, 2], 51112,
+                                    b"queued bytes from peer") {
+        Some(i) => i, None => return false,
+    };
+    let _ = socket::socket_shutdown(id, socket::SHUT_RD);
+    // Even though the TCB has QUEUED bytes pending, recv must return EOF.
+    let recv_result = socket::socket_recv(id);
+    let _ = tcp::abort(PORT);
+    match recv_result {
+        Ok(d) if d.is_empty() => {
+            test_println!("  recv after SHUT_RD → 0 bytes (EOF) ✓");
+            test_pass!("shutdown — SHUT_RD: subsequent recv returns 0 (EOF)");
+            true
+        }
+        Ok(d) => { test_fail!("shutdown_rd", "got {} bytes", d.len()); false }
+        Err(e) => { test_fail!("shutdown_rd", "recv error: {}", e); false }
+    }
+}
+
+#[cfg(not(feature = "kdb"))]
+fn test_shutdown_tcp_rd_returns_eof() -> bool {
+    test_header!("shutdown — SHUT_RD (kdb-only stub)");
+    test_pass!("shutdown — SHUT_RD (kdb-only stub)");
+    true
+}
+
+#[cfg(feature = "kdb")]
+fn test_shutdown_tcp_send_after_wr_epipe() -> bool {
+    test_header!("shutdown — send after SHUT_WR returns -EPIPE");
+    use crate::net::{socket, tcp};
+    const PORT: u16 = 47212;
+    let id = match nde4_setup_pair("shutdown_epipe", PORT, [127, 0, 0, 3], 51113, b"") {
+        Some(i) => i, None => return false,
+    };
+    let _ = socket::socket_shutdown(id, socket::SHUT_WR);
+    let send_err = socket::socket_send(id, b"after-shutdown");
+    let _ = tcp::abort(PORT);
+    match send_err {
+        Err("EPIPE") => {
+            test_println!("  socket_send → Err(\"EPIPE\") ✓");
+            test_pass!("shutdown — send after SHUT_WR returns -EPIPE");
+            true
+        }
+        Err(e) => { test_fail!("shutdown_epipe", "want EPIPE, got Err({})", e); false }
+        Ok(n)  => { test_fail!("shutdown_epipe", "want EPIPE, got Ok({})", n); false }
+    }
+}
+
+#[cfg(not(feature = "kdb"))]
+fn test_shutdown_tcp_send_after_wr_epipe() -> bool {
+    test_header!("shutdown — SHUT_WR EPIPE (kdb-only stub)");
+    test_pass!("shutdown — SHUT_WR EPIPE (kdb-only stub)");
+    true
+}
+
+#[cfg(feature = "kdb")]
+fn test_shutdown_tcp_rdwr_breaks_both() -> bool {
+    test_header!("shutdown — SHUT_RDWR breaks both directions");
+    use crate::net::{socket, tcp};
+    const PORT: u16 = 47213;
+    let peer = [127, 0, 0, 4];
+    let id = match nde4_setup_pair("shutdown_rdwr", PORT, peer, 51114, b"buffered") {
+        Some(i) => i, None => return false,
+    };
+    let _ = socket::socket_shutdown(id, socket::SHUT_RDWR);
+    let recv_ok    = matches!(socket::socket_recv(id), Ok(ref d) if d.is_empty());
+    let send_epipe = matches!(socket::socket_send(id, b"x"), Err("EPIPE"));
+    let state = tcp::snapshot_connections().iter()
+        .find(|c| c.local_port == PORT && c.remote_ip == peer).map(|c| c.state);
+    let _ = tcp::abort(PORT);
+    if !recv_ok || !send_epipe || state != Some(tcp::TcpState::FinWait1) {
+        test_fail!("shutdown_rdwr",
+            "recv_ok={}, send_epipe={}, state={:?}", recv_ok, send_epipe, state);
+        return false;
+    }
+    test_println!("  recv→EOF, send→EPIPE, state→FinWait1 ✓");
+    test_pass!("shutdown — SHUT_RDWR breaks both directions");
+    true
+}
+
+#[cfg(not(feature = "kdb"))]
+fn test_shutdown_tcp_rdwr_breaks_both() -> bool {
+    test_header!("shutdown — SHUT_RDWR (kdb-only stub)");
+    test_pass!("shutdown — SHUT_RDWR (kdb-only stub)");
+    true
+}
+
+fn test_shutdown_unconnected_tcp_enotconn() -> bool {
+    test_header!("shutdown — unconnected TCP returns -ENOTCONN");
+
+    use crate::net::socket;
+    use crate::net::socket::SocketType;
+
+    let id = socket::socket_create(SocketType::Tcp);
+    let rc = socket::socket_shutdown(id, socket::SHUT_RDWR);
+    socket::socket_close(id);
+
+    if rc != -107 {
+        test_fail!("shutdown_enotconn",
+            "expected -107 (ENOTCONN) on unconnected TCP, got {}", rc);
+        return false;
+    }
+    test_println!("  socket_shutdown → -107 (ENOTCONN) ✓");
+    test_pass!("shutdown — unconnected TCP returns -ENOTCONN");
     true
 }
 

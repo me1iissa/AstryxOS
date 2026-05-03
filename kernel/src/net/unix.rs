@@ -43,6 +43,13 @@ struct UnixSocket {
     recv_tail:   usize,
     backlog:     [u64; BACKLOG_CAP],
     backlog_len: usize,
+    /// Per IEEE 1003.1 §shutdown.  `shut_rd` makes subsequent local reads
+    /// return 0 (EOF).  `shut_wr` makes subsequent local writes fail with
+    /// -EPIPE *and* causes the peer's reads to observe EOF — modelled by
+    /// flipping the peer's `shut_rd`, since we have no FIN-equivalent on
+    /// the in-memory pipe.
+    shut_rd:     bool,
+    shut_wr:     bool,
 }
 
 impl UnixSocket {
@@ -57,6 +64,8 @@ impl UnixSocket {
             recv_tail:   0,
             backlog:     [u64::MAX; BACKLOG_CAP],
             backlog_len: 0,
+            shut_rd:     false,
+            shut_wr:     false,
         }
     }
 
@@ -67,6 +76,8 @@ impl UnixSocket {
         self.recv_head   = 0;
         self.recv_tail   = 0;
         self.backlog_len = 0;
+        self.shut_rd     = false;
+        self.shut_wr     = false;
     }
 
     fn recv_available(&self) -> usize {
@@ -232,6 +243,8 @@ pub fn write(id: u64, data: &[u8]) -> i64 {
     let peer_id = {
         let s = &t.0[id as usize];
         if s.state != UnixState::Connected { return -32; }
+        // SHUT_WR locally → -EPIPE per IEEE 1003.1 §shutdown.
+        if s.shut_wr { return -32; }
         s.peer_id
     };
     if peer_id as usize >= MAX_UNIX_SOCKETS { return -32; }
@@ -244,8 +257,38 @@ pub fn read(id: u64, buf: &mut [u8]) -> i64 {
     let mut t = TABLE.lock();
     let s = &mut t.0[id as usize];
     if s.state == UnixState::Free { return -9; }
+    // SHUT_RD locally → return 0 (orderly EOF) regardless of any data
+    // still queued in our recv_buf.  Matches Linux AF_UNIX behaviour.
+    if s.shut_rd { return 0; }
     if s.recv_available() == 0 { return -11; }
     s.pop(buf) as i64
+}
+
+/// Half-close per IEEE 1003.1 §shutdown.  `shut_rd_flag` / `shut_wr_flag`
+/// each, when true, mark the corresponding direction closed.
+///
+/// Because the AF_UNIX backend uses an in-memory ring, a SHUT_WR has no
+/// FIN-equivalent on the wire; instead we propagate the semantic by
+/// flipping the *peer's* `shut_rd`, so the peer's next `read` returns 0
+/// (orderly EOF).  This mirrors Linux AF_UNIX where one half-closing
+/// the write side surfaces as EOF on the peer's recv path.
+///
+/// Returns 0 on success, -EBADF for an invalid id, -ENOTCONN for an
+/// unconnected stream socket (POSIX requirement).
+pub fn shutdown(id: u64, shut_rd_flag: bool, shut_wr_flag: bool) -> i64 {
+    if id as usize >= MAX_UNIX_SOCKETS { return -9; }
+    let mut t = TABLE.lock();
+    let s = &t.0[id as usize];
+    if s.state == UnixState::Free { return -9; }
+    if s.state != UnixState::Connected { return -107; } // ENOTCONN
+    let peer_id = s.peer_id;
+    let s = &mut t.0[id as usize];
+    if shut_rd_flag { s.shut_rd = true; }
+    if shut_wr_flag { s.shut_wr = true; }
+    if shut_wr_flag && (peer_id as usize) < MAX_UNIX_SOCKETS {
+        t.0[peer_id as usize].shut_rd = true;
+    }
+    0
 }
 
 pub fn close(id: u64) {

@@ -744,12 +744,14 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         let ip = [bytes[4], bytes[5], bytes[6], bytes[7]];
                         match crate::net::socket::socket_sendto(socket_id, ip, port, data) {
                             Ok(n) => n as i64,
+                            Err("EPIPE") => -32,
                             Err(_) => -104,
                         }
                     } else { len as i64 }
                 } else {
                     match crate::net::socket::socket_send(socket_id, data) {
                         Ok(n) => n as i64,
+                        Err("EPIPE") => -32,
                         Err(_) => -104,
                     }
                 }
@@ -830,6 +832,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     let socket_id = crate::syscall::get_socket_id(pid, fd);
                     match crate::net::socket::socket_send(socket_id, data) {
                         Ok(n) => total += n,
+                        Err("EPIPE") => return -32,
                         Err(_) => return -104,
                     }
                 }
@@ -955,8 +958,27 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             }
             bytes_read
         }
-        // 48: shutdown(sockfd, how) — stub success
-        48 => 0,
+        // 48: shutdown(sockfd, how) — half-close per IEEE 1003.1 §shutdown
+        // and RFC 793 §3.5.  `how` ∈ {SHUT_RD=0, SHUT_WR=1, SHUT_RDWR=2}.
+        // Returns 0 on success, -EBADF for a non-socket fd, -ENOTCONN for
+        // an unconnected stream socket, -EINVAL on bad `how`.
+        48 => {
+            let pid = crate::proc::current_pid();
+            let fd  = arg1 as usize;
+            let how = arg2 as i32;
+            if how < 0 || how > 2 { return -22; }
+            let want_rd = how == 0 || how == 2;
+            let want_wr = how == 1 || how == 2;
+            if crate::syscall::is_unix_socket_fd(pid, fd) {
+                let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
+                crate::net::unix::shutdown(unix_id, want_rd, want_wr)
+            } else if crate::syscall::is_socket_fd(pid, fd) {
+                let socket_id = crate::syscall::get_socket_id(pid, fd);
+                crate::net::socket::socket_shutdown(socket_id, how) as i64
+            } else {
+                -9 // EBADF
+            }
+        }
         // 49: bind(sockfd, addr, addrlen)
         49 => {
             let pid = crate::proc::current_pid();
@@ -3043,6 +3065,7 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
         let data = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
         return match crate::net::socket::socket_send(socket_id, data) {
             Ok(n) => n as i64,
+            Err("EPIPE") => -32, // EPIPE — caller did SHUT_WR
             Err(_) => -104, // ECONNRESET
         };
     } else if crate::syscall::is_eventfd_fd(pid, fd as usize) {
