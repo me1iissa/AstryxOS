@@ -2431,7 +2431,13 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // glibc calls this as a vDSO fallback; returning an error here makes
         // `time(NULL)` appear to fail with the kernel's errno, confusing callers.
         201 => {
-            let wall_secs: i64 = crate::drivers::rtc::read_unix_time() as i64;
+            // Per `man 2 time`: seconds since the UNIX epoch — must agree
+            // with __vdso_time / clock_gettime(CLOCK_REALTIME).  See
+            // `kernel/src/proc/vdso.rs::wall_secs_at_boot()` for the
+            // canonical formula.
+            let ticks = crate::arch::x86_64::irq::get_ticks();
+            let wall_secs: i64 = crate::proc::vdso::wall_secs_at_boot()
+                .saturating_add(ticks / 100) as i64;
             if arg1 != 0 {
                 // Validate the user pointer before writing — a userspace
                 // caller passing a kernel address (or any non-writable
@@ -3580,8 +3586,24 @@ pub fn sys_set_tid_address(tidptr: u64) -> i64 {
 /// clock_gettime(clockid, tp) — Get time from a clock.
 ///
 /// tp points to a struct timespec { u64 tv_sec, u64 tv_nsec }.
-/// CLOCK_REALTIME (0): wall-clock time from CMOS RTC + PIT sub-second.
+/// CLOCK_REALTIME (0): wall-clock time = boot_wall_secs + monotonic ticks.
 /// CLOCK_MONOTONIC (1) and others: monotonic PIT ticks since boot.
+///
+/// Per `man 2 clock_gettime`, both clocks must advance smoothly at the
+/// same rate (CLOCK_REALTIME differs from CLOCK_MONOTONIC only by an
+/// epoch offset).  Re-reading the CMOS RTC on every call is incorrect:
+/// the host RTC's second-tick edge does not align with our PIT-tick
+/// edge, so two consecutive calls — or a vDSO read followed by a syscall
+/// read — could observe the wall-clock seconds component running up to
+/// 1 s ahead of the monotonic component.  glibc's `sem_timedwait` and
+/// `pthread_cond_timedwait` then read CLOCK_REALTIME via vDSO, add a
+/// short relative timeout, and pass the absolute deadline back to the
+/// kernel; if the kernel's CLOCK_REALTIME has independently advanced
+/// past the deadline, every wait returns ETIMEDOUT immediately.
+///
+/// The fix is to compute CLOCK_REALTIME from the boot-time wall-clock
+/// seconds (`vdso::wall_secs_at_boot()`) plus the monotonic tick delta —
+/// the same formula as `__vdso_clock_gettime` (see `kernel/vdso/vdso.S`).
 pub fn sys_clock_gettime(clk_id: u64, tp: u64) -> i64 {
     const CLOCK_REALTIME:  u64 = 0;
     const CLOCK_MONOTONIC: u64 = 1;
@@ -3589,22 +3611,19 @@ pub fn sys_clock_gettime(clk_id: u64, tp: u64) -> i64 {
         return -22; // EINVAL
     }
     let ticks = crate::arch::x86_64::irq::get_ticks();
-    let (secs, nsecs) = if clk_id == CLOCK_REALTIME {
-        // Read wall-clock seconds from CMOS RTC; add sub-second from PIT.
-        let wall_secs = crate::drivers::rtc::read_unix_time();
-        let sub_nsecs = (ticks % 100) * 10_000_000u64; // 10 ms per PIT tick
-        (wall_secs, sub_nsecs)
+    let mono_secs = ticks / 100;
+    let sub_nsecs = (ticks % 100) * 10_000_000u64; // 10 ms per PIT tick
+    let secs = if clk_id == CLOCK_REALTIME {
+        // boot_wall_secs + monotonic seconds — matches vDSO exactly.
+        crate::proc::vdso::wall_secs_at_boot().saturating_add(mono_secs)
     } else {
         // CLOCK_MONOTONIC / CLOCK_MONOTONIC_RAW / CLOCK_PROCESS_CPUTIME_ID etc.
-        // All return PIT-tick-based monotonic time.
-        let s = ticks / 100;
-        let ns = (ticks % 100) * 10_000_000u64;
-        (s, ns)
+        mono_secs
     };
     let _ = CLOCK_MONOTONIC; // suppress unused warning
     let buf = unsafe { core::slice::from_raw_parts_mut(tp as *mut u8, 16) };
     buf[0..8].copy_from_slice(&secs.to_le_bytes());
-    buf[8..16].copy_from_slice(&nsecs.to_le_bytes());
+    buf[8..16].copy_from_slice(&sub_nsecs.to_le_bytes());
     0
 }
 
@@ -4136,12 +4155,18 @@ fn sys_access(pathname: u64, mode: u64) -> i64 {
 /// gettimeofday(tv, tz) — Get the time of day.
 ///
 /// tv points to struct timeval { u64 tv_sec, u64 tv_usec }.
+///
+/// Per `man 2 gettimeofday`, this returns wall-clock time (seconds since
+/// the UNIX epoch).  It must match `__vdso_gettimeofday` byte-for-byte:
+///   tv_sec  = boot_wall_secs + ticks / TICK_HZ
+///   tv_usec = (ticks % TICK_HZ) * US_PER_TICK
 fn sys_gettimeofday(tv: u64, _tz: u64) -> i64 {
     if tv == 0 {
         return 0;
     }
     let ticks = crate::arch::x86_64::irq::get_ticks();
-    let secs = ticks / 100;
+    let secs  = crate::proc::vdso::wall_secs_at_boot()
+        .saturating_add(ticks / 100);
     let usecs = (ticks % 100) * 10_000; // 10ms per tick → microseconds
     let buf = unsafe { core::slice::from_raw_parts_mut(tv as *mut u8, 16) };
     buf[0..8].copy_from_slice(&secs.to_le_bytes());
@@ -4726,14 +4751,27 @@ pub fn sys_futex_linux(
 
         if abs_realtime {
             // Convert absolute CLOCK_REALTIME deadline to a relative duration.
-            // CLOCK_REALTIME advances with wall-clock time: seconds since the
-            // Unix epoch, sub-second from the PIT tick fraction (matching
-            // sys_clock_gettime).
-            let wall_secs  = crate::drivers::rtc::read_unix_time();
+            // CLOCK_REALTIME advances at the monotonic tick rate from a
+            // boot-time wall-clock anchor — the same formula as
+            // `sys_clock_gettime(CLOCK_REALTIME)` and `__vdso_clock_gettime`.
+            //
+            // Per `man 2 futex` (FUTEX_CLOCK_REALTIME) and `man 2
+            // clock_gettime`: the kernel's notion of "now" for an absolute
+            // CLOCK_REALTIME deadline MUST agree with the value userspace
+            // would read from `clock_gettime(CLOCK_REALTIME)`.  glibc's
+            // `sem_timedwait` and `pthread_cond_timedwait` derive their
+            // deadline from `clock_gettime(CLOCK_REALTIME)` (vDSO) and pass
+            // the absolute timestamp back here; if the two formulas differ,
+            // the deadline appears already-expired and ETIMEDOUT fires
+            // immediately, breaking every timed wait.
             let wall_ticks = crate::arch::x86_64::irq::get_ticks();
-            let now_ns = wall_secs
+            let mono_secs  = wall_ticks / 100;
+            let sub_nsecs  = (wall_ticks % 100) * 10_000_000;
+            let now_secs   = crate::proc::vdso::wall_secs_at_boot()
+                .saturating_add(mono_secs);
+            let now_ns = now_secs
                 .saturating_mul(1_000_000_000)
-                .saturating_add((wall_ticks % 100) * 10_000_000);
+                .saturating_add(sub_nsecs);
             if raw_ns <= now_ns {
                 TimeoutNs::AlreadyExpired
             } else {
