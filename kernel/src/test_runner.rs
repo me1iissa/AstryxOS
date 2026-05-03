@@ -9712,6 +9712,111 @@ fn test_epoll_and_proc_fd() -> bool {
             }
         }
 
+        // ─── 7b. epoll_wait blocking contract (timeout actually waits) ──────
+        //
+        // Per `man 2 epoll_wait`: a non-zero positive timeout must block at
+        // least that long (modulo tick granularity) before returning 0 when
+        // no fd becomes ready.  Returning 0 early causes self-pipe-wakeup
+        // patterns to busy-loop.
+        {
+            // Empty epoll set (no watches) with timeout=30ms.
+            // Open a fresh epoll fd to avoid mutating the outer one.
+            let epfd2 = dispatch(291, 0, 0, 0, 0, 0, 0);
+            if epfd2 >= 0 {
+                let mut buf = [[0u8; 12]; 4];
+                let t0 = crate::arch::x86_64::irq::get_ticks();
+                let r = dispatch(232, epfd2 as u64, buf[0].as_mut_ptr() as u64,
+                                 4, 30, 0, 0); // timeout_ms=30
+                let t1 = crate::arch::x86_64::irq::get_ticks();
+                let elapsed_ticks = t1.saturating_sub(t0);
+                // 30ms = 3 ticks @ 100Hz; allow 2..=10 to absorb scheduling jitter.
+                if r == 0 && elapsed_ticks >= 2 {
+                    test_println!(
+                        "  epoll_wait(timeout=30ms) blocked {} ticks ok",
+                        elapsed_ticks);
+                } else {
+                    test_fail!("epoll_wait timeout block",
+                        "r={} elapsed_ticks={} (expected r=0, ticks>=2)",
+                        r, elapsed_ticks);
+                    ok = false;
+                }
+                let _ = dispatch(3, epfd2 as u64, 0, 0, 0, 0, 0);
+            } else {
+                test_println!("  epoll_wait timeout block: skipped (epoll_create1 failed)");
+            }
+        }
+
+        // ─── 7c. epoll_wait returns immediately when data already pending ──
+        //
+        // Sanity check: the retry loop must NOT introduce an unconditional
+        // sleep — when an fd is already ready at entry, the syscall must
+        // return without yielding.
+        {
+            let epfd3 = dispatch(291, 0, 0, 0, 0, 0, 0);
+            if epfd3 >= 0 {
+                let mut pipe_fds: [u64; 2] = [u64::MAX; 2];
+                if dispatch(22, pipe_fds.as_mut_ptr() as u64, 0, 0, 0, 0, 0) == 0 {
+                    let rfd = pipe_fds[0] as usize;
+                    let wfd = pipe_fds[1] as usize;
+                    let ev = make_ev(EPOLLIN, rfd as u64);
+                    let _ = dispatch(233, epfd3 as u64, CTL_ADD, rfd as u64,
+                                     ev.as_ptr() as u64, 0, 0);
+                    // Pre-write so the read-end is already readable.
+                    let msg = b"y";
+                    let _ = dispatch(1, wfd as u64, msg.as_ptr() as u64, 1, 0, 0, 0);
+
+                    let mut buf = [[0u8; 12]; 4];
+                    let t0 = crate::arch::x86_64::irq::get_ticks();
+                    // Use a long timeout so any erroneous sleep would show up.
+                    let r = dispatch(232, epfd3 as u64, buf[0].as_mut_ptr() as u64,
+                                     4, 1000, 0, 0);
+                    let t1 = crate::arch::x86_64::irq::get_ticks();
+                    let elapsed_ticks = t1.saturating_sub(t0);
+                    if r == 1 && elapsed_ticks <= 1 && (ev_events(&buf[0]) & EPOLLIN) != 0 {
+                        test_println!(
+                            "  epoll_wait returns immediately when ready ({} tick) ok",
+                            elapsed_ticks);
+                    } else {
+                        test_fail!("epoll_wait ready-fast-path",
+                            "r={} elapsed_ticks={} events={:#x}",
+                            r, elapsed_ticks, ev_events(&buf[0]));
+                        ok = false;
+                    }
+                    let _ = crate::vfs::close(pid, rfd);
+                    let _ = crate::vfs::close(pid, wfd);
+                }
+                let _ = dispatch(3, epfd3 as u64, 0, 0, 0, 0, 0);
+            }
+        }
+
+        // ─── 7d. select(2) blocking contract (timeval actually waits) ──────
+        //
+        // Mirror the epoll case for select: a non-NULL non-zero timeval must
+        // block until the deadline when no fd is ready.  Pass nfds=0 so the
+        // bitmasks are untouched and the call has no fds of interest.
+        {
+            // struct timeval { tv_sec: i64; tv_usec: i64 } = 30ms.
+            #[repr(C)]
+            struct Timeval { tv_sec: i64, tv_usec: i64 }
+            let tv = Timeval { tv_sec: 0, tv_usec: 30_000 };
+            let t0 = crate::arch::x86_64::irq::get_ticks();
+            // syscall 23: select(nfds, readfds, writefds, exceptfds, timeout)
+            let r = dispatch(23, 0, 0, 0, 0,
+                &tv as *const Timeval as u64, 0);
+            let t1 = crate::arch::x86_64::irq::get_ticks();
+            let elapsed_ticks = t1.saturating_sub(t0);
+            if r == 0 && elapsed_ticks >= 2 {
+                test_println!(
+                    "  select(timeout=30ms) blocked {} ticks ok",
+                    elapsed_ticks);
+            } else {
+                test_fail!("select timeout block",
+                    "r={} elapsed_ticks={} (expected r=0, ticks>=2)",
+                    r, elapsed_ticks);
+                ok = false;
+            }
+        }
+
         // ─── 8. close(epfd) cleans up ────────────────────────────────────────
         {
             let r = dispatch(3, epfd as u64, 0, 0, 0, 0, 0);
