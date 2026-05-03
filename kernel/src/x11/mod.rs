@@ -210,7 +210,7 @@ fn prop_arr_del(arr: &mut [Option<resource::PropertyEntry>; resource::MAX_PROPER
 /// Bind and listen on `/tmp/.X11-unix/X0`.
 pub fn init() {
     let _ = crate::vfs::mkdir("/tmp/.X11-unix");
-    let fd = unix::create();
+    let fd = unix::create(unix::SockKind::Stream);
     let r  = unix::bind(fd, SOCKET_PATH);
     if r < 0 {
         crate::serial_println!("[X11] bind failed: {}", r);
