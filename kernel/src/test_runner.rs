@@ -9247,17 +9247,41 @@ fn test_phase1_linux_syscalls() -> bool {
         }
     }
 
-    // ─── uname (63): check sysname filled ───────────────────────────────────
+    // ─── uname (63): sysname must be "Linux" and release must parse ≥ 3.0 ─
+    //
+    // Userspace (glibc, NSPR, Mozilla, etc.) branches on sysname == "Linux"
+    // for feature detection and parses release as <major>.<minor>.<patch>.
+    // Anything else routes apps onto non-Linux fallback paths and disables
+    // modern features (epoll, futex, clone3 ...).
     {
         // struct utsname: 6 × 65-byte fields = 390 bytes
         let mut buf = [0u8; 390];
         let r = dispatch(63, buf.as_mut_ptr() as u64, 0, 0, 0, 0, 0);
         let sysname_end = buf[..65].iter().position(|&b| b == 0).unwrap_or(65);
         let sysname = core::str::from_utf8(&buf[..sysname_end]).unwrap_or("");
-        if r == 0 && !sysname.is_empty() {
-            test_println!("  uname: sysname = \"{}\" ✓", sysname);
+        let release_end = buf[130..195].iter().position(|&b| b == 0).unwrap_or(65);
+        let release = core::str::from_utf8(&buf[130..130 + release_end]).unwrap_or("");
+        let machine_end = buf[260..325].iter().position(|&b| b == 0).unwrap_or(65);
+        let machine = core::str::from_utf8(&buf[260..260 + machine_end]).unwrap_or("");
+
+        // Parse "<major>.<minor>...." — major must be ≥ 3 for Mozilla etc.
+        let major: u32 = release
+            .split('.')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        if r == 0 && sysname == "Linux" && major >= 3 && machine == "x86_64" {
+            test_println!(
+                "  uname: sysname=\"{}\" release=\"{}\" machine=\"{}\" ✓",
+                sysname, release, machine,
+            );
         } else {
-            test_fail!("uname", "r={} sysname len={}", r, sysname_end);
+            test_fail!(
+                "uname",
+                "r={} sysname=\"{}\" release=\"{}\" major={} machine=\"{}\"",
+                r, sysname, release, major, machine,
+            );
             ok = false;
         }
     }
