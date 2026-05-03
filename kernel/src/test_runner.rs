@@ -600,6 +600,11 @@ pub fn run() -> ! {
     total += 1;
     if test_clock_gettime_realtime() { passed += 1; }
 
+    // ── Test 80b: monotonic-tick rate is BSP-only (CPU-count invariant) ──────
+
+    total += 1;
+    if test_clock_monotonic_rate_invariant() { passed += 1; }
+
     // ── Test 81: mlock/execveat/copy_file_range stubs ────────────────────────
 
     total += 1;
@@ -13101,6 +13106,166 @@ fn test_clock_gettime_realtime() -> bool {
     test_println!("  CLOCK_MONOTONIC tv_sec={} (uptime, < wall-clock) ✓", mono_sec);
 
     test_pass!("clock_gettime — CLOCK_REALTIME returns wall-clock time");
+    true
+}
+
+// ── Test 80b: monotonic-tick rate is independent of online CPU count ─────────
+//
+// Asserts the invariant fixed by `fix/timer-rate-calibration`: `TICK_COUNT`
+// (the source of CLOCK_MONOTONIC and the userspace vvar fast path) advances
+// at wall-clock-locked ~`TICK_HZ` regardless of how many CPUs are online.
+//
+// Pre-fix bug: every online CPU's LAPIC timer ISR did `TICK_COUNT.fetch_add(1)`,
+// so the global counter advanced `online_cpus × ~LAPIC_HZ`, making
+// `clock_gettime` race forward and breaking every userspace event loop that
+// schedules deadlines from a monotonic clock (Mozilla's nsThread dispatcher
+// is the canonical victim — see investigator a19df46c's report).
+//
+// Post-fix design: TICK_COUNT is TSC-derived.  Whichever CPU's ISR fires next
+// computes `expected_ticks = (tsc_now - tsc_at_boot) / tsc_per_tick` and
+// CAS-bumps TICK_COUNT monotonically.  Multiple CPUs racing converge to the
+// same value.
+//
+// Method:
+//   1. Snapshot TICK_COUNT, TICK_COUNT_BUMPS, per-CPU ISR counters, TSC.
+//   2. Spin until TICK_COUNT has advanced by TARGET_TICKS (with a TSC-based
+//      fail-fast budget so a wedged ISR can't hang the test).
+//   3. Recompute the wall-clock-equivalent tick count from TSC.
+//   4. Verify TICK_COUNT delta is within ±20% of the TSC-derived expectation —
+//      this is the wall-clock invariant.  Pre-fix the delta would have been
+//      `online_cpus ×` larger; post-fix it tracks wall.
+//   5. Verify TICK_COUNT_BUMPS delta is plausible (≥ ticks delta — at most
+//      one bump per CAS-success per ISR firing, multiple firings can publish
+//      the same value if no time passed, so bumps ≥ ticks).
+//   6. Print per-CPU ISR deltas for diagnostics.
+fn test_clock_monotonic_rate_invariant() -> bool {
+    test_header!("clock_gettime — monotonic-tick rate is wall-clock-locked");
+
+    use core::sync::atomic::Ordering;
+    use crate::arch::x86_64::apic::{cpu_count, MAX_CPUS};
+    use crate::arch::x86_64::irq::{
+        TICK_COUNT, TICK_COUNT_BUMPS, TIMER_ISR_PER_CPU, TSC_PER_TICK,
+        get_ticks, TICK_HZ,
+    };
+
+    const TARGET_TICKS: u64 = 50; // ~500 ms wall at TICK_HZ=100
+
+    let rdtsc = || -> u64 {
+        let lo: u32; let hi: u32;
+        unsafe {
+            core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi,
+                             options(nomem, nostack));
+        }
+        ((hi as u64) << 32) | lo as u64
+    };
+
+    // Calibration must be published before the test is meaningful.
+    let tsc_per_tick = TSC_PER_TICK.load(Ordering::Acquire);
+    if tsc_per_tick == 0 {
+        test_fail!("monotonic-rate",
+                   "TSC_PER_TICK not calibrated — apic::init must run first");
+        return false;
+    }
+
+    // Snapshot pre-state.
+    let bumps0  = TICK_COUNT_BUMPS.load(Ordering::Relaxed);
+    let ticks0  = TICK_COUNT.load(Ordering::Relaxed);
+    let tsc0    = rdtsc();
+    let mut isr0 = [0u64; MAX_CPUS];
+    for i in 0..MAX_CPUS { isr0[i] = TIMER_ISR_PER_CPU[i].load(Ordering::Relaxed); }
+    let n_cpus = cpu_count() as usize;
+    test_println!("  online CPUs={}, t0_ticks={}, t0_bumps={}, tsc_per_tick={}",
+                  n_cpus, ticks0, bumps0, tsc_per_tick);
+
+    // Spin until TICK_COUNT advances by TARGET_TICKS, with a TSC fail-fast.
+    // 50 ticks × 10 ms = 500 ms wall.  Budget 5 seconds via TSC.
+    let tsc_budget = tsc_per_tick.saturating_mul(500); // ~5 s at 10 ms/tick
+    loop {
+        let now = get_ticks();
+        if now.wrapping_sub(ticks0) >= TARGET_TICKS { break; }
+        if rdtsc().wrapping_sub(tsc0) > tsc_budget {
+            test_fail!("monotonic-rate",
+                       "TICK_COUNT did not advance {} ticks in ~5 s wall — \
+                        timer ISR may be wedged on every online CPU",
+                       TARGET_TICKS);
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+
+    // Snapshot post-state.
+    let bumps1 = TICK_COUNT_BUMPS.load(Ordering::Relaxed);
+    let ticks1 = TICK_COUNT.load(Ordering::Relaxed);
+    let tsc1   = rdtsc();
+    let mut isr1 = [0u64; MAX_CPUS];
+    for i in 0..MAX_CPUS { isr1[i] = TIMER_ISR_PER_CPU[i].load(Ordering::Relaxed); }
+
+    let dticks      = ticks1.wrapping_sub(ticks0);
+    let dbumps      = bumps1.wrapping_sub(bumps0);
+    let dtsc        = tsc1.wrapping_sub(tsc0);
+    let expected    = dtsc / tsc_per_tick;     // wall-locked ticks
+    test_println!("  d_ticks={} d_bumps={} expected_from_tsc={} (TICK_HZ={})",
+                  dticks, dbumps, expected, TICK_HZ);
+
+    // (a) TICK_COUNT advanced by at least TARGET_TICKS (already enforced
+    //     above by the spin condition; re-check defensively).
+    if dticks < TARGET_TICKS {
+        test_fail!("monotonic-rate", "TICK_COUNT advanced only {} < {}",
+                   dticks, TARGET_TICKS);
+        return false;
+    }
+
+    // (b) The wall-clock invariant: dticks must track expected_from_tsc.
+    //     Pre-fix bug had dticks ≈ online_cpus × expected, which trips
+    //     the lower bound on `expected_from_tsc / dticks` ratio.
+    //     Tolerance: ±20% — generous because we sample TSC at slightly
+    //     different points than the ISR does, and tsc_per_tick is itself
+    //     measured under VM time-base noise.
+    if expected == 0 {
+        test_fail!("monotonic-rate",
+                   "expected_from_tsc=0 — TSC delta {} too small for tsc_per_tick {}",
+                   dtsc, tsc_per_tick);
+        return false;
+    }
+    // ratio_pct = dticks * 100 / expected.  Want 80..125.
+    let ratio_pct = dticks.saturating_mul(100) / expected;
+    if !(80..=125).contains(&ratio_pct) {
+        test_fail!("monotonic-rate",
+                   "TICK_COUNT advance ratio {}% of wall (expected 80–125%) — \
+                    dticks={}, expected_from_tsc={}",
+                   ratio_pct, dticks, expected);
+        return false;
+    }
+    test_println!("  wall-clock ratio = {}% of expected (must be 80–125%) ✓",
+                  ratio_pct);
+
+    // (c) BUMPS ≥ TICKS: every published value is one CAS success; multiple
+    //     ISRs can publish the same value (no advance), but no advance can
+    //     happen without at least one bump.
+    if dbumps < dticks {
+        test_fail!("monotonic-rate",
+                   "TICK_COUNT_BUMPS delta {} < TICK_COUNT delta {} — \
+                    counter advanced without recording a bump",
+                   dbumps, dticks);
+        return false;
+    }
+
+    // (d) Diagnostic: print per-CPU ISR firings so the "no CPU is firing"
+    //     regression is visible.
+    let mut total_isrs = 0u64;
+    for i in 0..n_cpus.min(MAX_CPUS) {
+        let d = isr1[i].wrapping_sub(isr0[i]);
+        total_isrs = total_isrs.saturating_add(d);
+        test_println!("  cpu{} timer-ISR delta={}", i, d);
+    }
+    if total_isrs == 0 {
+        test_fail!("monotonic-rate",
+                   "no CPU delivered a timer interrupt during the {} ticks of advance",
+                   dticks);
+        return false;
+    }
+
+    test_pass!("clock_gettime — monotonic-tick rate is wall-clock-locked");
     true
 }
 
