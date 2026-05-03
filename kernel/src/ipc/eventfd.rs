@@ -2,8 +2,17 @@
 //!
 //! An eventfd holds a u64 counter.  Writing adds to the counter; reading
 //! returns the current value (or decrements by 1 in `EFD_SEMAPHORE` mode)
-//! and clears it (or decrements it).  If the counter is zero, reads block
-//! (or return EAGAIN when O_NONBLOCK / EFD_NONBLOCK is set).
+//! and clears it (or decrements it).  Per `man 2 eventfd`:
+//!
+//! > If the eventfd counter is zero at the time of the call, then the call
+//! > either blocks until the counter becomes nonzero (at which time, the
+//! > read(2) proceeds as described above) or fails with the error EAGAIN if
+//! > the file descriptor has been made nonblocking.
+//!
+//! The blocking decision is made at the syscall layer (which knows the
+//! per-fd O_NONBLOCK status).  This module provides a non-blocking
+//! `try_read` primitive plus a helper to inspect the EFD_NONBLOCK creation
+//! flag so the caller can decide.
 //!
 //! This implementation stores counters in a fixed-size global table.
 
@@ -55,10 +64,15 @@ pub fn create(initval: u64, flags: u32) -> u64 {
     u64::MAX // No free slot
 }
 
-/// Read from eventfd.  Returns the current counter as a u64 LE value (8
-/// bytes), then resets the counter to 0 (or decrements by 1 in semaphore
-/// mode).  Returns `Err(-11)` (EAGAIN) if counter is 0.
-pub fn read(id: u64) -> Result<u64, i64> {
+/// Non-blocking read from eventfd.  Returns the current counter as a u64
+/// (caller serializes to 8 LE bytes), then resets the counter to 0 (or
+/// decrements by 1 in `EFD_SEMAPHORE` mode).  Returns `Err(-11)` (EAGAIN)
+/// if counter is 0.
+///
+/// The blocking-vs-non-blocking decision lives at the syscall layer; this
+/// primitive never blocks.  See `is_efd_nonblock` to query the
+/// EFD_NONBLOCK creation flag.
+pub fn try_read(id: u64) -> Result<u64, i64> {
     let mut table = TABLE.lock();
     let slot = match table.get_mut(id as usize) {
         Some(s) if s.in_use => s,
@@ -77,6 +91,24 @@ pub fn read(id: u64) -> Result<u64, i64> {
         v
     };
     Ok(val)
+}
+
+/// Backwards-compatible alias of [`try_read`].  Older call sites that did
+/// not implement blocking semantics relied on the unconditional EAGAIN
+/// behaviour; new callers should prefer `try_read` for clarity.
+pub fn read(id: u64) -> Result<u64, i64> {
+    try_read(id)
+}
+
+/// Was this eventfd created with `EFD_NONBLOCK`?  Per `man 2 eventfd`,
+/// EFD_NONBLOCK is shorthand for setting `O_NONBLOCK` on the resulting fd.
+/// The syscall layer combines this with the per-fd O_NONBLOCK status
+/// (which may be toggled later via `fcntl(F_SETFL)`).
+pub fn is_efd_nonblock(id: u64) -> bool {
+    let table = TABLE.lock();
+    table.get(id as usize)
+        .map(|s| s.in_use && (s.flags & EFD_NONBLOCK) != 0)
+        .unwrap_or(false)
 }
 
 /// Write to eventfd — add `val` to the counter.  Returns 0 on success or
