@@ -51,6 +51,7 @@ mod win32;
 mod subsys;
 mod x11;
 mod init;
+mod util;
 
 use astryx_shared::{BootInfo, BOOT_INFO_MAGIC};
 
