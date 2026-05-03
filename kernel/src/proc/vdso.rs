@@ -311,6 +311,32 @@ pub fn vvar_ticks_for_test() -> u64 {
 
 /// Read the current vvar `wall_secs` field (for tests / introspection).
 pub fn vvar_wall_secs_for_test() -> u64 {
+    wall_secs_at_boot()
+}
+
+/// Boot-time wall-clock seconds (UNIX epoch), as captured during `init()`.
+///
+/// This is the canonical in-kernel source of "wall_secs at boot" for any
+/// CLOCK_REALTIME computation that must agree with the vDSO fast path:
+///
+///     CLOCK_REALTIME(now) = wall_secs_at_boot() + ticks/TICK_HZ (sec)
+///                         + (ticks % TICK_HZ) * NS_PER_TICK    (nsec)
+///
+/// vDSO `__vdso_clock_gettime`, `__vdso_gettimeofday`, and `__vdso_time`
+/// all compute their result from this stored value plus the current
+/// monotonic tick count.  The kernel `clock_gettime(CLOCK_REALTIME)`,
+/// `gettimeofday(2)`, `time(2)` syscall fallbacks and the FUTEX absolute
+/// CLOCK_REALTIME-deadline conversion MUST use the same formula — see
+/// `man 2 clock_gettime`, `man 2 futex` (FUTEX_CLOCK_REALTIME).  Otherwise
+/// glibc threading primitives (`sem_timedwait`, `pthread_cond_timedwait`)
+/// can read a vDSO timestamp, hand it back to the kernel as an absolute
+/// deadline, and observe the kernel's clock running ahead — producing
+/// ETIMEDOUT immediately instead of parking for the requested interval.
+///
+/// Returns 0 if `init()` has not yet run; callers that need to be safe
+/// against pre-init reads should treat 0 as "vvar not ready".
+#[inline]
+pub fn wall_secs_at_boot() -> u64 {
     let phys = VVAR_PHYS.load(Ordering::Relaxed);
     if phys == 0 {
         return 0;
