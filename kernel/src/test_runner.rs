@@ -878,6 +878,12 @@ pub fn run() -> ! {
     total += 1;
     if test_umount_removes_mount() { passed += 1; }
 
+    // ── Test 198: GDI PNG screenshot — render shapes + encode PNG headlessly
+    // Runs here (before userspace ELF tests) because it only needs GDI + VFS.
+
+    total += 1;
+    if test_gdi_png_screenshot() { passed += 1; }
+
     // ── Test 120: glibc hello — oracle test for glibc dynamic linker ───────
 
     total += 1;
@@ -23128,6 +23134,163 @@ fn test_dup_clears_cloexec() -> bool {
     crate::subsys::linux::syscall::sys_close_test(orig_fd as u64);
 
     test_pass!("dup/dup2 clear FD_CLOEXEC on duplicate");
+    true
+}
+
+// ── Test 198: GDI PNG screenshot ─────────────────────────────────────────────
+//
+// Exercises the full headless rendering pipeline:
+//   1. Allocate a 160×120 Surface using the kernel GDI Surface type.
+//   2. Draw a scene: gradient background, filled rectangles, filled ellipse,
+//      bitmap text — using existing GDI primitives and the 8×16 VGA font.
+//   3. Encode the surface to PNG using `gdi::png::encode_surface_to_png`.
+//      The encoder uses zlib with stored (non-compressed) deflate blocks
+//      (RFC 1951 §3.2.4), producing a spec-valid PNG without requiring a
+//      Huffman implementation.
+//   4. Write the PNG bytes to `/tmp/screenshot.png` via the VFS.
+//   5. Verify the file can be read back and starts with the 8-byte PNG
+//      signature (0x89 'P' 'N' 'G' \r \n 0x1a \n).
+//   6. Emit a `[SCREENSHOT]` line to the serial console so the harness can
+//      grep for the result.
+//
+// Pass criterion: VFS write succeeds; read-back starts with PNG_SIGNATURE.
+fn test_gdi_png_screenshot() -> bool {
+    test_header!("GDI PNG screenshot — render shapes + encode PNG headlessly");
+
+    // ── 1. Allocate surface ──────────────────────────────────────────────────
+    let mut surface = crate::gdi::Surface::new(160, 120);
+
+    // ── 2. Draw a scene ──────────────────────────────────────────────────────
+    // Background: vertical gradient from deep blue to dark navy.
+    crate::gdi::primitives::gradient_fill_v(
+        &mut surface, 0, 0, 160, 120,
+        0xFF1A3A6A, // top: deep blue
+        0xFF0A1020, // bottom: near black
+    );
+
+    // Red filled rectangle (title bar analogue).
+    {
+        use crate::gdi::dc::{DeviceContext, Pen, Brush, PenStyle, BrushStyle};
+        let mut dc = DeviceContext::new(0);
+        dc.pen   = Pen   { style: PenStyle::Null,  width: 0, color: 0 };
+        dc.brush = Brush { style: BrushStyle::Solid, color: 0xFFCC2233 };
+        crate::gdi::primitives::fill_rectangle(&mut surface, &dc, 10, 10, 150, 30);
+    }
+
+    // White border around the red rectangle.
+    crate::gdi::primitives::frame_rect(&mut surface, 0xFFFFFFFF, 10, 10, 150, 30);
+
+    // Green filled ellipse (content indicator).
+    {
+        use crate::gdi::dc::{DeviceContext, Pen, Brush, PenStyle, BrushStyle};
+        let mut dc = DeviceContext::new(0);
+        dc.pen   = Pen   { style: PenStyle::Solid,  width: 1, color: 0xFF00FF00 };
+        dc.brush = Brush { style: BrushStyle::Solid, color: 0xFF22AA44 };
+        crate::gdi::primitives::fill_ellipse(&mut surface, &dc, 80, 75, 50, 30);
+    }
+
+    // Diagonal line (Bresenham).
+    {
+        use crate::gdi::dc::{DeviceContext, Pen, Brush, PenStyle, BrushStyle};
+        let mut dc = DeviceContext::new(0);
+        dc.pen   = Pen   { style: PenStyle::Solid, width: 1, color: 0xFFFFFF00 };
+        dc.brush = Brush { style: BrushStyle::Null, color: 0 };
+        crate::gdi::primitives::line(&mut surface, &dc, 10, 40, 150, 110);
+    }
+
+    // Text in the title bar.
+    {
+        use crate::gdi::dc::{DeviceContext, BgMode};
+        let mut dc = DeviceContext::new(0);
+        dc.text_color = 0xFFFFFFFF; // white text
+        dc.bg_mode    = BgMode::Transparent;
+        crate::gdi::text::text_out(&mut surface, &dc, 14, 14, "AstryxOS");
+    }
+
+    // Small label below the ellipse.
+    {
+        use crate::gdi::dc::{DeviceContext, BgMode};
+        let mut dc = DeviceContext::new(0);
+        dc.text_color = 0xFFCCCCCC;
+        dc.bg_mode    = BgMode::Transparent;
+        crate::gdi::text::text_out(&mut surface, &dc, 10, 105, "NRS-1");
+    }
+
+    // ── 3. Encode to PNG ─────────────────────────────────────────────────────
+    let png_bytes = crate::gdi::png::encode_surface_to_png(&surface);
+    let png_len = png_bytes.len();
+
+    // ── 4. Write to VFS ──────────────────────────────────────────────────────
+    let png_path = "/tmp/screenshot.png";
+    // Ensure /tmp exists (ramfs root already has /tmp in most builds, but
+    // create_dir is idempotent if it does exist).
+    let _ = crate::vfs::mkdir("/tmp");
+
+    match crate::vfs::create_file(png_path) {
+        Ok(()) => {}
+        Err(e) => {
+            test_fail!("gdi_png_screenshot", "create_file({}) failed: {:?}", png_path, e);
+            return false;
+        }
+    }
+
+    match crate::vfs::write_file(png_path, &png_bytes) {
+        Ok(n) => {
+            if n != png_bytes.len() {
+                test_fail!(
+                    "gdi_png_screenshot",
+                    "write_file({}) wrote {} of {} bytes",
+                    png_path, n, png_bytes.len()
+                );
+                return false;
+            }
+        }
+        Err(e) => {
+            test_fail!("gdi_png_screenshot", "write_file({}) failed: {:?}", png_path, e);
+            return false;
+        }
+    }
+
+    test_println!("  wrote {} bytes to '{}'", png_len, png_path);
+
+    // ── 5. Read back and verify PNG signature ─────────────────────────────────
+    let read_back = match crate::vfs::read_file(png_path) {
+        Ok(v) => v,
+        Err(e) => {
+            test_fail!("gdi_png_screenshot", "read_file({}) failed: {:?}", png_path, e);
+            return false;
+        }
+    };
+
+    if read_back.len() < 8 {
+        test_fail!(
+            "gdi_png_screenshot",
+            "read-back too short: {} bytes (expected ≥8)",
+            read_back.len()
+        );
+        return false;
+    }
+
+    let sig = &read_back[..8];
+    let expected = crate::gdi::png::PNG_SIGNATURE;
+    if sig != expected {
+        test_fail!(
+            "gdi_png_screenshot",
+            "PNG signature mismatch: got {:02X?}, expected {:02X?}",
+            sig, expected
+        );
+        return false;
+    }
+
+    test_println!("  PNG signature {:02X?} ✓", sig);
+
+    // ── 6. Emit harness-greppable summary line ────────────────────────────────
+    test_println!(
+        "[SCREENSHOT] path={} size={} signature_ok=true",
+        png_path, png_len
+    );
+
+    test_pass!("GDI PNG screenshot — render shapes + encode PNG headlessly");
     true
 }
 
