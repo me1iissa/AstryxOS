@@ -295,28 +295,50 @@ pub fn notify_event(dir_path: &str, filename: &str, mask: u32, cookie: u32) {
         alloc::format!("{}/{}", dir_path, filename)
     };
 
-    let mut table = TABLE.lock();
-    for slot in table.iter_mut().flatten() {
-        // Collect matching (wd, effective_mask, emit_name) tuples first so we
-        // don't hold an immutable borrow while calling push_event (mutable).
-        let mut hits: Vec<(i32, u32, bool)> = Vec::new(); // (wd, eff_mask, is_dir_watch)
+    let mut any_new_event = false;
+    {
+        let mut table = TABLE.lock();
+        for slot in table.iter_mut().flatten() {
+            // Collect matching (wd, effective_mask, emit_name) tuples first so we
+            // don't hold an immutable borrow while calling push_event (mutable).
+            let mut hits: Vec<(i32, u32, bool)> = Vec::new(); // (wd, eff_mask, is_dir_watch)
 
-        for w in &slot.watches {
-            if w.mask & mask == 0 { continue; }
-            // Directory watch: path matches the parent directory.
-            let dir_match = w.path == dir_path;
-            // Self watch: path matches the full path of the changed file.
-            let self_match = !filename.is_empty() && w.path == full_path;
-            if dir_match {
-                hits.push((w.wd, w.mask & mask, true));
-            } else if self_match {
-                hits.push((w.wd, w.mask & mask, false));
+            for w in &slot.watches {
+                if w.mask & mask == 0 { continue; }
+                // Directory watch: path matches the parent directory.
+                let dir_match = w.path == dir_path;
+                // Self watch: path matches the full path of the changed file.
+                let self_match = !filename.is_empty() && w.path == full_path;
+                if dir_match {
+                    hits.push((w.wd, w.mask & mask, true));
+                } else if self_match {
+                    hits.push((w.wd, w.mask & mask, false));
+                }
+            }
+
+            for (wd, eff_mask, is_dir_watch) in hits {
+                let name = if is_dir_watch { filename } else { "" };
+                let was_empty = slot.queue.is_empty();
+                slot.push_event(QueuedEvent::new(wd, eff_mask, cookie, name));
+                // Track empty→non-empty transitions so we only ring the
+                // bell when we actually flipped at least one instance's
+                // readiness — pre-existing events have already woken
+                // any prior poller, ringing again is wasted wakeups.
+                if was_empty && !slot.queue.is_empty() {
+                    any_new_event = true;
+                }
             }
         }
-
-        for (wd, eff_mask, is_dir_watch) in hits {
-            let name = if is_dir_watch { filename } else { "" };
-            slot.push_event(QueuedEvent::new(wd, eff_mask, cookie, name));
-        }
+    } // drop table lock
+    if any_new_event {
+        // Wake every `poll`/`epoll_wait`/`select` caller watching an
+        // inotify fd whose queue just became non-empty.  Per
+        // `man 7 inotify`: the fd becomes readable as soon as one or
+        // more events are queued, and `epoll_wait` must wake within
+        // its timeout when that happens.  Without this bell ring, a
+        // file-system watcher would stall on the resync floor before
+        // seeing the event.
+        crate::ipc::waitlist::ring_poll_bell_for(
+            crate::ipc::waitlist::PollBellSource::Inotify);
     }
 }

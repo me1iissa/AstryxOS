@@ -1794,7 +1794,7 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
         qemu-harness.py kdb <sid> fd-table 6
         qemu-harness.py kdb <sid> syscall-trend 10 4
     """
-    if op in ("ping", "proc-list", "vfs-mounts", "trace-status"):
+    if op in ("ping", "proc-list", "vfs-mounts", "trace-status", "bell-stats"):
         return {"op": op}
     if op == "proc":
         if not rest: raise ValueError("proc requires <pid>")
@@ -4676,6 +4676,7 @@ def main():
         "ping", "proc-list", "proc", "proc-tree", "fd-table",
         "syscall-trend", "vfs-mounts",
         "dmesg", "syms", "mem", "tframe", "user-mem", "trace-status",
+        "bell-stats",
     ])
     p_kdb.add_argument("args", nargs="*",
                         help="Op-specific positional args: "

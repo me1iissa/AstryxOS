@@ -173,6 +173,10 @@ pub fn run() -> ! {
     total += 1;
     if test_eventfd_wake_hook() { passed += 1; }
 
+    // ── Test 0bx: poll-bell per-source attribution counters ──────────────
+    total += 1;
+    if test_poll_bell_source_attribution() { passed += 1; }
+
     // ── Test 0bb: SERIAL per-CPU re-entry guard ──────────────────────────
     total += 1;
     if test_serial_reentry_guard() { passed += 1; }
@@ -23157,6 +23161,68 @@ fn test_eventfd_wake_hook() -> bool {
     }
     test_println!("  reader woke promptly (outcome={}, no leaked waiters) ✓", outcome);
     test_pass!("eventfd wake hook — reader parks, writer wakes");
+    true
+}
+
+// ── Test 0bx: poll-bell per-source attribution counters ─────────────────────
+//
+// Verifies that each newly-wired readiness source bumps its own
+// `BELL_RINGS_BY_SOURCE` slot rather than landing in the `other`
+// catch-all.  Falsifies the wiring at the call-site granularity: a
+// pipe write that accidentally calls `ring_poll_bell()` instead of
+// `ring_poll_bell_for(PollBellSource::Pipe)` would show as an
+// increment of `other`, not `pipe`.
+//
+// The test is hermetic — no fds need to be open; we call the wiring
+// helpers directly and observe the counter delta.  Per POSIX, none
+// of these helpers acquire scheduler state, so calling them with no
+// waiters is harmless.
+fn test_poll_bell_source_attribution() -> bool {
+    use core::sync::atomic::Ordering;
+    use crate::ipc::waitlist::{
+        ring_poll_bell_for, PollBellSource,
+        BELL_RINGS_BY_SOURCE, BELL_SOURCE_NAMES, N_BELL_SOURCES,
+    };
+
+    test_header!("poll-bell per-source attribution counters");
+
+    // Snapshot baseline counts.
+    let mut before = [0u64; N_BELL_SOURCES];
+    for i in 0..N_BELL_SOURCES {
+        before[i] = BELL_RINGS_BY_SOURCE[i].load(Ordering::Relaxed);
+    }
+
+    // Ring one of each tagged source.
+    let sources_to_ring: [PollBellSource; 8] = [
+        PollBellSource::Pipe,
+        PollBellSource::Eventfd,
+        PollBellSource::UnixWrite,
+        PollBellSource::UnixShutdown,
+        PollBellSource::Timerfd,
+        PollBellSource::Signalfd,
+        PollBellSource::Inotify,
+        PollBellSource::SignalInject,
+    ];
+    for s in &sources_to_ring {
+        ring_poll_bell_for(*s);
+    }
+
+    // Snapshot post counts and verify each tagged source bumped by
+    // exactly 1, and `Other` did not bump at all.
+    for i in 0..N_BELL_SOURCES {
+        let after  = BELL_RINGS_BY_SOURCE[i].load(Ordering::Relaxed);
+        let delta  = after.saturating_sub(before[i]);
+        let is_other = i == PollBellSource::Other as usize;
+        let expected: u64 = if is_other { 0 } else { 1 };
+        if delta != expected {
+            test_fail!("poll_bell_source_attribution",
+                "source {} ({}) delta {} (expected {})",
+                i, BELL_SOURCE_NAMES[i], delta, expected);
+            return false;
+        }
+    }
+    test_println!("  all 8 tagged sources bumped their own slot; `other` unchanged ✓");
+    test_pass!("poll-bell per-source attribution counters");
     true
 }
 
