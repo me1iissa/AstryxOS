@@ -891,6 +891,7 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
         gdb_wait=gdb_wait,
         kvm=kvm,
         cpu_override=cpu_model,
+        warn_on_missing_data_img=True,
     )
 
     # Override -smp count if caller asked for non-default. astryx_qemu.py
@@ -983,6 +984,40 @@ def cmd_start(args):
     except FileNotFoundError as e:
         _err(f"Cannot freeze ESP: {e}")
 
+    # ── data.img presence check (W13/W15 silent-wedge guard) ─────────────────
+    # Agent worktrees omit build/data.img (.gitignored). Without it, QEMU boots
+    # without a /disk drive: firefox-test wedges at sc=0/pf=0 with no output,
+    # causing verifiers to mis-attribute the stall to the PR under review.
+    # Fix: (1) auto-symlink from the source-of-truth if reachable, (2) emit a
+    # visible banner regardless so the operator always knows the state.
+    _data_img_path = Path(wt.DATA_IMG)
+    _data_img_missing = not _data_img_path.exists()
+    if _data_img_missing:
+        _CANONICAL_DATA_IMG = Path("/home/ubuntu/AstryxOS/build/data.img")
+        if _CANONICAL_DATA_IMG.exists():
+            _data_img_path.parent.mkdir(parents=True, exist_ok=True)
+            _data_img_path.symlink_to(_CANONICAL_DATA_IMG)
+            _data_img_missing = False
+            print(
+                "╔══════════════════════════════════════════════════════════════╗\n"
+                "║  WARNING: data disk image auto-symlinked                     ║\n"
+                f"║  {str(_data_img_path)[:60]:<60}  ║\n"
+                f"║  -> {str(_CANONICAL_DATA_IMG)[:57]:<57}  ║\n"
+                "║  (worktree lacked data.img; symlinked from repo build/)      ║\n"
+                "╚══════════════════════════════════════════════════════════════╝",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "╔══════════════════════════════════════════════════════════════╗\n"
+                "║  WARNING: data disk image not found                          ║\n"
+                f"║  expected: {str(_data_img_path)[:51]:<51}  ║\n"
+                "║  firefox-test paths will fail; /disk will not mount.         ║\n"
+                "║  Symlink from /home/ubuntu/AstryxOS/build/data.img to fix.   ║\n"
+                "╚══════════════════════════════════════════════════════════════╝",
+                file=sys.stderr,
+            )
+
     kvm_arg: Optional[bool]
     if getattr(args, "no_kvm", False):
         kvm_arg = False
@@ -1016,6 +1051,10 @@ def cmd_start(args):
         "smp":         smp,
         "cpu_model":   cpu_model or "default",
         "breakpoints": [],
+        # True when data.img was absent at session start (after any auto-symlink
+        # attempt). Agents inspecting this field can immediately distinguish a
+        # firefox-test wedge caused by missing /disk from a real regression.
+        "data_img_missing": _data_img_missing,
         # Session-scoped kernel binary (concurrent-rebuild clobber fix).
         # NOTE: snapshot files saved via `qemu-harness.py snap save` are tied
         # to the kernel binary loaded at the time. Loading a snapshot in a
@@ -1040,6 +1079,9 @@ def cmd_start(args):
 
     _out({"sid": sid, "pid": proc.pid, "serial_log": serial_log,
           "gdb_port": gdb_port, "kdb_host_port": kdb_host_port,
+          # True when data.img was absent (even after auto-symlink attempt).
+          # Agents should treat this as a hard warning for firefox-test runs.
+          "data_img_missing": _data_img_missing,
           # Session-scoped kernel binary path (additive field — agents that
           # want to verify the running binary's SHA against a known-good
           # reference can read this directly).
