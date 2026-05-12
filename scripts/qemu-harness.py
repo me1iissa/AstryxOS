@@ -761,6 +761,75 @@ def _build(features: str) -> bool:
     return r3.returncode == 0
 
 
+# ── Session-scoped ESP (concurrent-rebuild clobber fix) ──────────────────────
+#
+# Bug: QEMU opens the ESP directory via its `vvfat` driver, which re-reads
+# host files on guest access. If another concurrent build (or the same agent
+# running `cargo build` directly) rewrites `target/.../kernel.bin` or the
+# staged `ESP/EFI/astryx/kernel.bin` while the session is running, the guest
+# can pick up the NEW binary mid-boot, *and* any later `--no-build` restart
+# silently picks up the new on-disk version — invalidating reproducibility.
+#
+# Fix: at session start, snapshot the ESP directory into
+# `~/.astryx-harness/<sid>.esp/` and point QEMU there. Subsequent rebuilds
+# from other sessions touch the in-tree `build/esp/...` but the session's
+# frozen copy is untouched.
+#
+# Note: the data disk is already protected via `-drive snapshot=on` (host
+# writes to data.img are not seen by the guest mid-run), and OVMF_VARS is
+# already per-session. Only the ESP was missing this protection.
+
+_SESSION_ESP_REL_KERNEL   = ("EFI", "astryx", "kernel.bin")
+_SESSION_ESP_REL_BOOT_EFI = ("EFI", "BOOT",   "BOOTX64.EFI")
+
+
+def _session_esp_dir(sid: str) -> Path:
+    return HARNESS_DIR / f"{sid}.esp"
+
+
+def _freeze_session_esp(sid: str, src_esp_dir: Path) -> dict:
+    """
+    Copy the in-tree ESP into a per-session directory so concurrent rebuilds
+    from other workspaces cannot clobber this session's kernel binary.
+
+    Returns a dict with the resolved paths, suitable for merging into the
+    session-state JSON: {session_esp_dir, session_kernel_path,
+    session_boot_efi_path}.
+
+    Raises FileNotFoundError if either expected file is missing from the
+    in-tree ESP — callers must run `_build()` first, or use `--no-build` on
+    a tree that has previously been built.
+    """
+    dst_esp = _session_esp_dir(sid)
+    # Clean any stale directory left from a previous session reusing the sid
+    # (uuid collisions are vanishingly rare, but defensive).
+    if dst_esp.exists():
+        shutil.rmtree(dst_esp, ignore_errors=True)
+
+    src_kernel   = src_esp_dir.joinpath(*_SESSION_ESP_REL_KERNEL)
+    src_boot_efi = src_esp_dir.joinpath(*_SESSION_ESP_REL_BOOT_EFI)
+    if not src_kernel.exists():
+        raise FileNotFoundError(
+            f"kernel.bin missing at {src_kernel} — run a build first")
+    if not src_boot_efi.exists():
+        raise FileNotFoundError(
+            f"BOOTX64.EFI missing at {src_boot_efi} — run a build first")
+
+    dst_kernel   = dst_esp.joinpath(*_SESSION_ESP_REL_KERNEL)
+    dst_boot_efi = dst_esp.joinpath(*_SESSION_ESP_REL_BOOT_EFI)
+    dst_kernel.parent.mkdir(parents=True, exist_ok=True)
+    dst_boot_efi.parent.mkdir(parents=True, exist_ok=True)
+    # copy2 preserves mtime — useful when humans diff sessions.
+    shutil.copy2(src_kernel,   dst_kernel)
+    shutil.copy2(src_boot_efi, dst_boot_efi)
+
+    return {
+        "session_esp_dir":       str(dst_esp),
+        "session_kernel_path":   str(dst_kernel),
+        "session_boot_efi_path": str(dst_boot_efi),
+    }
+
+
 # ── QEMU launch (harness variant) ────────────────────────────────────────────
 
 def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
@@ -771,7 +840,9 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
                           kvm: Optional[bool] = None,
                           smp: int = 2,
                           cpu_model: Optional[str] = None,
-                          qga_sock: str = "") -> subprocess.Popen:
+                          esp_dir_override: Optional[str] = None,
+                          qga_sock: str = "",
+                          ) -> subprocess.Popen:
     """
     Launch QEMU with a per-session serial log and QMP socket.
 
@@ -781,10 +852,14 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
         guest 10.0.2.15:9999 for the kdb introspection server.
     kvm: tri-state. None = autodetect; True = force-enable; False = force-disable
         (matches CI which has no /dev/kvm — useful for reproducing CI hangs locally).
+    esp_dir_override: if set, use this ESP directory instead of the in-tree
+        `build/esp`. Used by cmd_start to point at the session-scoped frozen
+        copy under `~/.astryx-harness/<sid>.esp/`, isolating the running QEMU
+        from concurrent rebuilds in the in-tree ESP.
     """
     wt = _get_watch_test()
     ROOT     = wt.ROOT
-    ESP_DIR  = wt.ESP_DIR
+    ESP_DIR  = Path(esp_dir_override) if esp_dir_override else wt.ESP_DIR
     DATA_IMG = wt.DATA_IMG
     OVMF_CODE     = wt.OVMF_CODE
     OVMF_VARS_SRC = wt.OVMF_VARS_SRC
@@ -891,6 +966,23 @@ def cmd_start(args):
         if not ok:
             _err("Build failed")
 
+    # Snapshot the in-tree ESP into a session-scoped directory so concurrent
+    # rebuilds from other workspaces cannot clobber the kernel binary this
+    # session is running. See _freeze_session_esp() docstring for the bug
+    # this fixes (W3 trials 4-5 / 2026-05-12 and W6 session 622bbe4ed14b).
+    #
+    # `--no-build` semantics: we freeze whatever is currently staged at the
+    # in-tree ESP. If the user passed --no-build expecting to reuse a prior
+    # session's exact binary, they should pass --reuse-esp <sid> in a future
+    # extension; for now, --no-build + freeze means "use whatever the in-tree
+    # ESP holds right now, then isolate it from further changes". This is
+    # strictly safer than the prior behaviour (always race-prone).
+    wt = _get_watch_test()
+    try:
+        esp_paths = _freeze_session_esp(sid, wt.ESP_DIR)
+    except FileNotFoundError as e:
+        _err(f"Cannot freeze ESP: {e}")
+
     kvm_arg: Optional[bool]
     if getattr(args, "no_kvm", False):
         kvm_arg = False
@@ -906,6 +998,7 @@ def cmd_start(args):
                                  kvm=kvm_arg,
                                  smp=smp,
                                  cpu_model=cpu_model,
+                                 esp_dir_override=esp_paths["session_esp_dir"],
                                  qga_sock=qga_sock)
 
     session = {
@@ -923,6 +1016,12 @@ def cmd_start(args):
         "smp":         smp,
         "cpu_model":   cpu_model or "default",
         "breakpoints": [],
+        # Session-scoped kernel binary (concurrent-rebuild clobber fix).
+        # NOTE: snapshot files saved via `qemu-harness.py snap save` are tied
+        # to the kernel binary loaded at the time. Loading a snapshot in a
+        # *different* session that froze a different kernel will fail or
+        # misbehave — snapshots are kernel-version-specific.
+        **esp_paths,
     }
     _save_session(session)
 
@@ -940,7 +1039,11 @@ def cmd_start(args):
     _save_session(session)
 
     _out({"sid": sid, "pid": proc.pid, "serial_log": serial_log,
-          "gdb_port": gdb_port, "kdb_host_port": kdb_host_port})
+          "gdb_port": gdb_port, "kdb_host_port": kdb_host_port,
+          # Session-scoped kernel binary path (additive field — agents that
+          # want to verify the running binary's SHA against a known-good
+          # reference can read this directly).
+          "session_kernel_path": esp_paths["session_kernel_path"]})
 
 
 def cmd_stop(args):
@@ -982,6 +1085,13 @@ def cmd_stop(args):
             Path(qga_sock).unlink()
         except OSError:
             pass
+
+    # Clean up session-scoped ESP directory (10-20 MB per session). Tolerant
+    # of legacy sessions that pre-date the freeze feature and have no
+    # `session_esp_dir` field.
+    sess_esp = sess.get("session_esp_dir", "")
+    if sess_esp and Path(sess_esp).exists():
+        shutil.rmtree(sess_esp, ignore_errors=True)
 
     _out({"ok": True})
 
@@ -2510,13 +2620,16 @@ def cmd_prune(args):
     now = time.time()
 
     # Group files by sid stem. We recognise the well-known suffix set:
-    # .json, .serial.log, .events.jsonl, .qmp.sock, .OVMF_VARS.fd
+    # .json, .serial.log, .events.jsonl, .qmp.sock, .OVMF_VARS.fd, .esp (dir)
     known_suffixes = (
         ".json",
         ".serial.log",
         ".events.jsonl",
         ".qmp.sock",
         ".OVMF_VARS.fd",
+        ".esp",          # session-scoped ESP directory (10-20 MB)
+        ".kdb.json",     # kdb introspection cache (see cmd_kdb)
+        ".gdb.lock",     # gdb-stub mutex file (see cmd_rip_sample)
     )
 
     groups: dict = {}  # sid -> list[Path]
@@ -2527,7 +2640,9 @@ def cmd_prune(args):
         return
 
     for p in entries:
-        if not p.is_file():
+        # Accept both files and directories (the `.esp` entry is a directory
+        # tree containing the session-scoped kernel.bin + BOOTX64.EFI).
+        if not (p.is_file() or p.is_dir()):
             continue
         name = p.name
         sid = None
@@ -2578,17 +2693,28 @@ def cmd_prune(args):
             kept += 1
             continue
 
-        # Prune: delete every file in the group.
+        # Prune: delete every file/dir in the group. Directories (e.g. the
+        # `<sid>.esp` session-scoped ESP tree) get rmtree'd; files get
+        # unlinked. Permission/race errors are swallowed so one bad entry
+        # doesn't abort the whole sweep.
         for fp in files:
             try:
-                sz = fp.stat().st_size
+                if fp.is_dir():
+                    # Sum sizes recursively before deleting.
+                    sz = 0
+                    for child in fp.rglob("*"):
+                        try:
+                            if child.is_file():
+                                sz += child.stat().st_size
+                        except OSError:
+                            continue
+                    shutil.rmtree(fp, ignore_errors=True)
+                    freed_bytes += sz
+                else:
+                    sz = fp.stat().st_size
+                    fp.unlink()
+                    freed_bytes += sz
             except OSError:
-                sz = 0
-            try:
-                fp.unlink()
-                freed_bytes += sz
-            except OSError:
-                # Permission denied or race with another pruner — skip.
                 continue
         pruned.append(sid)
 
