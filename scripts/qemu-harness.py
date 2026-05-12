@@ -767,6 +767,39 @@ def _build(features: str) -> bool:
     return r3.returncode == 0
 
 
+def _check(features: str) -> tuple[int, str]:
+    """
+    Run `cargo +nightly check` against the kernel package for `features`.
+
+    Returns (rc, stderr_tail) — rc==0 on success.  Stderr is forwarded
+    truncated to the last 4 KB so callers can surface the failing diagnostic
+    without flooding the JSON envelope.
+
+    `features` is passed VERBATIM (comma-separated, e.g. "test-mode,kdb").
+    Empty string → no `--features` flag (default desktop kernel).
+    """
+    wt = _get_watch_test()
+    ROOT = wt.ROOT
+    KERNEL_TARGET = wt.KERNEL_TARGET
+
+    cmd = ["cargo", "+nightly", "check",
+           "--package", "astryx-kernel",
+           f"--target={KERNEL_TARGET}",
+           "--profile", "release"]
+    if features:
+        cmd += ["--features", features]
+    cmd += ["-Zbuild-std=core,alloc,compiler_builtins",
+            "-Zbuild-std-features=compiler-builtins-mem",
+            "-Zjson-target-spec"]
+
+    proc = subprocess.run(cmd, cwd=ROOT,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE,
+                          text=True)
+    tail = (proc.stderr or "")[-4096:]
+    return proc.returncode, tail
+
+
 # ── Session-scoped ESP (concurrent-rebuild clobber fix) ──────────────────────
 #
 # Bug: QEMU opens the ESP directory via its `vvfat` driver, which re-reads
@@ -932,6 +965,24 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
 # ══════════════════════════════════════════════════════════════════════════════
 # Subcommand implementations
 # ══════════════════════════════════════════════════════════════════════════════
+
+def cmd_check(args):
+    """
+    Run `cargo +nightly check` against the kernel package and emit a JSON
+    verdict.  No QEMU is launched.  Useful for sweeping feature-flag matrices
+    after a code change.
+    """
+    rc, tail = _check(args.features or "")
+    out = {
+        "ok": rc == 0,
+        "features": args.features or "",
+        "rc": rc,
+    }
+    if rc != 0:
+        out["stderr_tail"] = tail
+    print(json.dumps(out, indent=2))
+    return rc
+
 
 def cmd_start(args):
     sid = uuid.uuid4().hex[:12]
@@ -4922,6 +4973,16 @@ def main():
              "(default 120000 = 2 min, covers build + boot + test run)"
     )
 
+    # check: run `cargo check` against a feature-flag combination without
+    # spinning up QEMU.  Used by hotfix verification sweeps that need to
+    # confirm a regression is closed across N feature combos before
+    # committing to a full boot.
+    p_check = sub.add_parser("check",
+                              help="Run `cargo +nightly check` for given --features")
+    p_check.add_argument("--features", default="", metavar="FLAGS",
+                          help="Feature flags passed VERBATIM to cargo. "
+                               "Empty string → default desktop kernel.")
+
     # _watch: private subcommand used internally by `start` to run the
     # background watcher in a detached process. Not shown in help.
     p_watch = sub.add_parser("_watch")
@@ -4930,6 +4991,7 @@ def main():
     args = parser.parse_args()
 
     dispatch = {
+        "check":  cmd_check,
         "start":  cmd_start,
         "stop":   cmd_stop,
         "list":   cmd_list,
@@ -4974,7 +5036,9 @@ def main():
         "read-png": cmd_read_png,
         "_watch":  cmd_run_watcher,
     }
-    dispatch[args.cmd](args)
+    rc = dispatch[args.cmd](args)
+    if isinstance(rc, int) and rc != 0:
+        sys.exit(rc)
 
 
 if __name__ == "__main__":

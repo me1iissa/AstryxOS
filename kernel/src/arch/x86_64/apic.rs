@@ -337,6 +337,16 @@ pub fn ioapic_route_irq(irq: u8, vector: u8, dest_apic_id: u8) {
     ioapic_write(redtbl_offset, lo);
 }
 
+/// Read back a (lo, hi) IO-APIC redirect entry for diagnostics.  Used by
+/// driver `arm_irq()` paths to confirm that the route they programmed
+/// actually landed (shared-IRQ debugging is otherwise blind).
+pub fn ioapic_read_entry(irq: u8) -> (u32, u32) {
+    let redtbl_offset = IOAPIC_REDTBL + irq * 2;
+    let lo = ioapic_read(redtbl_offset);
+    let hi = ioapic_read(redtbl_offset + 1);
+    (lo, hi)
+}
+
 /// Route a PCI IRQ through the I/O APIC (level-triggered, active-low — for PCI INTx).
 pub fn ioapic_route_irq_level(irq: u8, vector: u8, dest_apic_id: u8) {
     let redtbl_offset = IOAPIC_REDTBL + irq * 2;
