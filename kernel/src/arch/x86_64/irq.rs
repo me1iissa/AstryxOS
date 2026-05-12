@@ -469,6 +469,7 @@ extern "C" fn timer_tick() {
 irq_stub!(irq_mouse_handler, mouse_interrupt);
 irq_stub!(irq_e1000_handler, e1000_interrupt);
 irq_stub!(irq_virtio_blk_handler, virtio_blk_interrupt);
+irq_stub!(irq_virtio_serial_handler, virtio_serial_interrupt);
 
 /// Virtio-blk PCI INTx interrupt logic.
 ///
@@ -482,6 +483,25 @@ extern "C" fn virtio_blk_interrupt() {
     // EOI is sent by handle_irq itself (LAPIC) — keep this stub narrow so
     // the ack-then-EOI ordering matches the rest of the device's spec
     // contract (read ISR before EOI for level-triggered PCI INTx).
+}
+
+/// Virtio-serial PCI INTx interrupt logic.  Same contract as virtio-blk —
+/// ack via ISR_STATUS read, walk used ring for received bytes, deposit
+/// into the driver's rx ring buffer, wake any thread parked in
+/// `read_blocking()`, then LAPIC EOI.  The driver implements the entire
+/// sequence; this stub exists purely to route the IDT vector.
+extern "C" fn virtio_serial_interrupt() {
+    // The virtio_serial driver module is only compiled with `--features qga`;
+    // when absent, IDT[46] is still wired (idt.rs) so the stub stays present,
+    // but it must not reference the missing module.  No-op in that build —
+    // QEMU only fires this vector when a virtio-serial device is exposed,
+    // which is itself gated by the host launching with `-device virtio-serial`
+    // (QGA feature only).
+    #[cfg(feature = "qga")]
+    {
+        crate::perf::record_interrupt(crate::drivers::virtio_serial::VIRTIO_SERIAL_IRQ_VECTOR);
+        crate::drivers::virtio_serial::handle_irq();
+    }
 }
 
 /// E1000 NIC interrupt logic.
