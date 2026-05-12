@@ -16,6 +16,7 @@ pub mod primitives;
 pub mod text;
 pub mod bitblt;
 pub mod region;
+pub mod png;
 
 pub use surface::Surface;
 pub use dc::{DeviceContext, Pen, Brush, PenStyle, BrushStyle, Rop2, BgMode, Rect};
