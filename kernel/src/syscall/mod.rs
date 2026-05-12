@@ -2299,14 +2299,30 @@ pub(crate) fn is_socket_fd(pid: u64, fd_num: usize) -> bool {
 }
 
 /// Allocate a new socket fd for the given process, returning the fd number.
-pub(crate) fn alloc_socket_fd(pid: u64, socket_id: u64, sock_type: u32) -> i64 {
+///
+/// `cloexec` and `nonblock` are extracted from the `type` argument of
+/// `socket(2)` (SOCK_CLOEXEC = 0x80000, SOCK_NONBLOCK = 0x800) and must be
+/// applied to the resulting fd atomically — POSIX.1-2017 socket(2).
+/// O_NONBLOCK is stored as bit 0x0800 in the fd flags field so that
+/// subsequent `fcntl(F_GETFL)` calls see it correctly.
+pub(crate) fn alloc_socket_fd(
+    pid: u64,
+    socket_id: u64,
+    sock_type: u32,
+    cloexec: bool,
+    nonblock: bool,
+) -> i64 {
+    let mut flag_bits: u32 = 0x4000_0000 | (sock_type & 0x03); // SOCKET_FD | type
+    if nonblock {
+        flag_bits |= 0x0800; // O_NONBLOCK
+    }
     let fd = crate::vfs::FileDescriptor {
         mount_idx: usize::MAX,
         inode: socket_id,
         offset: 0,
-        flags: 0x4000_0000 | (sock_type & 0x03), // SOCKET_FD | type
+        flags: flag_bits,
         is_console: false,
-        cloexec: false,
+        cloexec,
         file_type: crate::vfs::FileType::CharDevice,
         open_path: alloc::string::String::new(),
     };
