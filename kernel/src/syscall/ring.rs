@@ -631,6 +631,7 @@ pub fn dump_futex_wait_stack(tid: u64, pid: u64, uaddr: u64, cr3: u64,
     // Stack-scan pass first — catches return addresses where the rbp chain
     // is unreliable (libxul / libnspr are -fomit-frame-pointer in release
     // builds, so the rbp-chain walk often dies after f1-f2 inside libc).
+    #[cfg(feature = "futex-wait-scan")]
     dump_futex_wait_scan(tid, pid, cr3, rsp);
     const MAX_FRAMES: u32 = 7;
     // Build the suffix incrementally so we emit a single line.  An empty
