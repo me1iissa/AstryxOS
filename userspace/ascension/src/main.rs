@@ -13,7 +13,12 @@
 //! # Future
 //! In later phases, Ascension will:
 //! - Fork and exec Orbit (the user shell)
-//! - Spawn system services (daemons)
+//! - Spawn system services (daemons) — including the QGA daemon at
+//!   `/sbin/qga` (Phase QGA-2; today the kernel launches `proc::qga_elf`
+//!   directly in `main.rs` because Ascension is a hand-crafted ELF and
+//!   lacks fork/execve logic).  When Ascension gains a real C/Rust
+//!   runtime this becomes a `sys::fork()` + `sys::execve("/sbin/qga")`
+//!   call from the main loop.
 //! - Handle SIGCHLD and reap orphaned processes
 //! - Perform orderly shutdown on SYS_EXIT from PID 0
 

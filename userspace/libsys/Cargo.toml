@@ -6,8 +6,10 @@ description = "AstryxOS userspace syscall library — raw syscall wrappers and r
 authors = ["AstryxOS"]
 
 # NOTE: This crate requires a custom x86_64 freestanding target to build.
-# It is NOT part of the workspace Cargo.toml members.
-# Currently the programs are embedded as hand-crafted ELF binaries in the kernel.
-# This source exists as documentation and for future toolchain support.
+# It is NOT part of the workspace Cargo.toml members.  When the kernel `qga`
+# feature is enabled, kernel/build.rs invokes `cargo build` against
+# `userspace/qga/`, which depends on this crate via `path = "../libsys"`.
+
+[workspace]
 
 [dependencies]
