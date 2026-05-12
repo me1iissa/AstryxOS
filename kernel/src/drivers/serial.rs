@@ -11,29 +11,42 @@
 //! blind window to every CPU that calls `serial_println!` — degrading
 //! scheduler responsiveness and inflating interrupt latency.
 //!
-//! The fix is two-pronged (Option B, NS16550A datasheet §8):
+//! The previous iteration tried to fix this with a **per-byte** cli/sti
+//! window.  Under KVM that pattern is pathological: every `cli`/`outb`/
+//! `sti` triple traps to the hypervisor (VM-exit on cli, port I/O exit
+//! on outb, VM-exit on sti), so a single 256-byte serial line consumes
+//! ~768 VM-exits — orders of magnitude more wall time than the IRQ
+//! latency we were trying to preserve.  Profiling under
+//! `firefox-test,syscall-trace` showed 81–87 % of CPU 2 pinned in
+//! `WriteAdapter::write_str` across three QEMU CPU models.
+//!
+//! The current design is two-pronged (NS16550A datasheet §8, OSDev Wiki
+//! "Serial Ports"):
 //!
 //! 1. **16550A FIFO enabled at init** (FCR = 0xC7: FIFO_EN + both-reset +
-//!    14-byte RX trigger).  With a 16-byte TX FIFO the UART accepts a
-//!    burst of 16 bytes from the THR in one polling round-trip; the chip
-//!    then shifts them out independently.  At 115200 baud the 16-byte FIFO
-//!    drains in ~1.4 ms — the host sees the output at the same rate, but
-//!    the CPU is unblocked sooner and the IRQ blackout per byte is shorter.
+//!    14-byte RX trigger).  The 16-byte TX FIFO accepts a burst of up to
+//!    16 bytes in one polling round-trip; the chip then clocks them out
+//!    independently while the CPU is unblocked.
 //!
-//! 2. **Per-byte IRQ window in `_serial_print`**.  Interrupts are disabled
-//!    only for the minimal critical section: one LSR poll + one THR write.
-//!    Between each byte the original RFLAGS.IF is restored so the timer ISR,
-//!    IPI delivery, and LAPIC interrupts can fire.  The total blackout per
-//!    byte is ~200 ns (two port-I/O cycles on a typical KVM host) instead of
-//!    the old ~87 µs.
+//! 2. **Chunked cli/sti in `_serial_print`** — interrupts are disabled
+//!    once per 16-byte FIFO chunk, the LSR.THRE bit is polled exactly
+//!    once per chunk (with a bounded spin so a wedged UART cannot hang
+//!    the kernel), all 16 bytes are written to THR back-to-back, then
+//!    the caller's RFLAGS.IF is restored.  Compared to the per-byte
+//!    design this reduces VM-exits and cli/sti traps by ~16× while
+//!    keeping the IRQ-off window bounded: at 115200 baud, 16 bytes
+//!    take ~1.4 ms to physically shift out, but the FIFO write itself
+//!    completes in a handful of port-I/O cycles (~µs scale), so the
+//!    cli window per chunk is well under 100 µs in practice.
 //!
 //! # Reentrancy / SMP safety
 //!
 //! The `SERIAL` `spin::Mutex` prevents concurrent FIFO writers from two
-//! CPUs interleaving bytes.  The per-byte cli prevents the *same* CPU's
-//! timer ISR from calling `serial_println!` while the mutex is already held
-//! on that CPU (which would deadlock, since `spin::Mutex` is not reentrant).
-//! Together they give: one writer at a time, no deadlock, minimal IRQ blackout.
+//! CPUs interleaving bytes.  The per-chunk cli prevents the *same* CPU's
+//! timer ISR from calling `serial_println!` while the mutex is already
+//! held on that CPU (which would deadlock, since `spin::Mutex` is not
+//! reentrant).  Together they give: one writer at a time, no deadlock,
+//! bounded IRQ blackout per chunk.
 //!
 //! The 16550A FIFO is safe under SMP because only the one CPU holding the
 //! `SERIAL` mutex ever writes to the UART at a time — no concurrent writers
@@ -86,8 +99,14 @@ const LSR_TEMT: u8 = 0x40;
 /// Reference: OSDev Wiki "Serial Ports" — https://wiki.osdev.org/Serial_Ports
 const FCR_FIFO_ENABLE: u8 = 0xC7;
 
-/// Maximum spins waiting for THRE before dropping a byte rather than hanging.
+/// Maximum spins waiting for THRE before giving up rather than hanging.
 const THRE_SPIN_LIMIT: u32 = 100_000;
+
+/// Depth of the NS16550A TX FIFO in bytes.  When LSR.THRE is set we may push
+/// up to this many bytes back-to-back before re-polling.  Larger chunks
+/// reduce per-byte VM-exit overhead under KVM at the cost of a slightly
+/// longer cli window per chunk.  The 16550A datasheet §8 fixes this at 16.
+const FIFO_DEPTH: usize = 16;
 
 /// Global serial port instance.
 static SERIAL: Mutex<SerialPort> = Mutex::new(SerialPort { base: COM1 });
@@ -137,6 +156,39 @@ impl SerialPort {
                 }
             }
             hal::outb(self.base, byte);
+        }
+    }
+
+    /// Push up to `FIFO_DEPTH` bytes into the TX FIFO with a single LSR poll.
+    ///
+    /// The caller must guarantee `bytes.len() <= FIFO_DEPTH` (the 16550A
+    /// TX FIFO depth).  We poll LSR.THRE once: when set, the FIFO is empty,
+    /// so all `bytes.len()` bytes fit without overrun.  The bounded spin
+    /// drops the chunk rather than hanging if the UART is wedged.
+    ///
+    /// Under KVM this collapses what was ~3 VM-exits per byte (cli, outb,
+    /// sti) into ~3 VM-exits per chunk (one LSR read, one cli/sti pair
+    /// owned by the caller, and a burst of port-I/O exits that the
+    /// hypervisor can coalesce into a tight outb sequence).  Net cost is
+    /// ~one LSR read + N outb's per chunk instead of N × (LSR + outb).
+    #[inline]
+    fn write_chunk(&self, bytes: &[u8]) {
+        debug_assert!(bytes.len() <= FIFO_DEPTH);
+        // SAFETY: Port I/O on the COM1 (0x3F8–0x3FF) range.  Spin is
+        // bounded.  Burst writes are safe because we polled THRE just
+        // above and chunk size ≤ FIFO_DEPTH ≤ TX-FIFO capacity.
+        unsafe {
+            let mut n = 0u32;
+            while hal::inb(self.base + LSR) & LSR_THRE == 0 {
+                core::hint::spin_loop();
+                n += 1;
+                if n >= THRE_SPIN_LIMIT {
+                    return; // UART wedged — drop the chunk rather than hang
+                }
+            }
+            for &b in bytes {
+                hal::outb(self.base, b);
+            }
         }
     }
 
@@ -216,28 +268,36 @@ pub fn stop() {
 ///
 /// # IRQ-window discipline
 ///
-/// We snapshot RFLAGS.IF once on entry and restore it between each byte
-/// written.  The critical section per byte is:
+/// We snapshot RFLAGS.IF once on entry and restore it between FIFO chunks.
+/// Each chunk is at most `FIFO_DEPTH` (16) bytes; the critical section per
+/// chunk is:
 ///
-///   cli → (LSR poll, at most one busy spin with FIFO almost always ready)
-///        → outb to THR → restore IF
+///   cli → LSR.THRE poll (bounded spin) → outb × N (N ≤ 16) → restore IF
 ///
-/// At 115200 baud with the 16-byte TX FIFO enabled, THRE is almost always
-/// set immediately (the FIFO has room), so the busy-spin body rarely runs.
-/// The cli window is therefore ~2 port-I/O round-trips per byte (~200 ns
-/// on a KVM host) instead of the full ~87 µs byte-time of the old approach.
+/// At 115200 baud with the 16-byte TX FIFO enabled, THRE is set whenever
+/// the FIFO has room.  With the FIFO drained by the chip in the background,
+/// successive chunks of a long string typically find THRE set on the first
+/// LSR read.  Per-chunk cost on a KVM host is roughly one LSR read + N
+/// outb's = ~17 port-I/O cycles, instead of the old per-byte design's
+/// ~2 × N port-I/O cycles + 2 × N VM-exits for cli/sti.
 ///
-/// Between bytes IF is restored, allowing the timer ISR, IPI delivery, and
-/// LAPIC interrupts to fire at normal cadence.
+/// Between chunks IF is restored, allowing the timer ISR, IPI delivery,
+/// and LAPIC interrupts to fire at normal cadence.  The worst-case cli
+/// window is bounded by the time to push 16 bytes back-to-back to the
+/// THR (~µs scale on real hardware, ~16 port-I/O exits under KVM) plus
+/// at most one LSR-poll busy-wait of `THRE_SPIN_LIMIT` iterations — the
+/// same bound the original per-byte path used.
 ///
 /// # Why cli at all?
 ///
 /// The `SERIAL` `spin::Mutex` serialises concurrent CPUs.  But if a timer
 /// ISR fires on the *same* CPU while we hold the mutex and calls
 /// `serial_println!`, it would attempt to lock `SERIAL` again — deadlock,
-/// because `spin::Mutex` is not reentrant.  The per-byte cli prevents
-/// that ISR from running between "mutex acquired" and "mutex released on
-/// that byte's write cycle".  No ISR runs during those ~200 ns windows.
+/// because `spin::Mutex` is not reentrant.  The per-chunk cli prevents
+/// that ISR from running between "mutex acquired" and "FIFO chunk
+/// committed".  No ISR runs while a chunk is being written, but the IRQ
+/// window re-opens between chunks so a 4 KiB write still admits hundreds
+/// of timer/IPI events during its lifetime.
 ///
 /// # Bugcheck path
 ///
@@ -247,7 +307,7 @@ pub fn stop() {
 pub fn _serial_print(args: fmt::Arguments) {
     use fmt::Write;
 
-    // Snapshot RFLAGS.IF once; restore it between bytes.
+    // Snapshot RFLAGS.IF once; restore it between chunks.
     // SAFETY: pushfq/pop is a pure register read with no memory side effects.
     let rflags: u64;
     unsafe {
@@ -259,39 +319,66 @@ pub fn _serial_print(args: fmt::Arguments) {
     }
     let if_was_set = rflags & (1 << 9) != 0;
 
-    // Disable IRQs before acquiring the mutex so that the timer ISR
-    // cannot fire in the tiny window between "lock succeeded" and "first
-    // byte written".  The IRQ window is re-opened per-byte below.
+    // Disable IRQs before acquiring the mutex so that the timer ISR cannot
+    // fire in the tiny window between "lock succeeded" and "first chunk
+    // committed".  The IRQ window is re-opened per-chunk below.
     crate::hal::disable_interrupts();
     let mut port = SERIAL.lock();
 
-    // WriteAdapter wraps SerialPort and implements the per-byte IRQ-window
-    // pattern: cli → write → restore IF, repeated for every byte in the
-    // format string.  The mutex is held for the full write, preventing byte
-    // interleaving across CPUs.
+    // WriteAdapter wraps SerialPort and implements a chunked IRQ-window
+    // pattern: gather up to FIFO_DEPTH (16) bytes into a stack buffer,
+    // expanding '\n' to "\r\n" inline, then push the buffer to the FIFO
+    // under a single cli/sti.  The mutex is held for the full write,
+    // preventing byte interleaving across CPUs.
     struct WriteAdapter<'a> {
         port: &'a mut SerialPort,
         if_was_set: bool,
     }
 
+    impl<'a> WriteAdapter<'a> {
+        /// Commit a fully-populated chunk: one cli/sti pair owns one LSR
+        /// poll plus `chunk.len()` THR writes.
+        #[inline]
+        fn flush_chunk(&mut self, chunk: &[u8]) {
+            if chunk.is_empty() {
+                return;
+            }
+            crate::hal::disable_interrupts();
+            self.port.write_chunk(chunk);
+            // SAFETY: restoring IF to exactly what the caller had on entry.
+            if self.if_was_set {
+                crate::hal::enable_interrupts();
+            }
+        }
+    }
+
     impl<'a> fmt::Write for WriteAdapter<'a> {
         fn write_str(&mut self, s: &str) -> fmt::Result {
+            // Stack-allocated batching buffer.  Bytes accumulate here until
+            // we hit FIFO_DEPTH or the input is exhausted; then we commit.
+            // Newlines expand to "\r\n" inline, which means a single input
+            // byte can append two output bytes — we therefore flush
+            // whenever fewer than 2 slots remain to keep the chunk
+            // size ≤ FIFO_DEPTH.
+            let mut buf = [0u8; FIFO_DEPTH];
+            let mut len: usize = 0;
+
             for byte in s.bytes() {
-                // Per-byte critical section: cli → outb → restore IF.
-                // With the 16-byte TX FIFO this is typically 2 port I/Os.
-                crate::hal::disable_interrupts();
-
                 if byte == b'\n' {
-                    self.port.write_byte(b'\r');
+                    buf[len] = b'\r';
+                    len += 1;
                 }
-                self.port.write_byte(byte);
+                buf[len] = byte;
+                len += 1;
 
-                // Re-open the IRQ window between bytes.
-                // SAFETY: restoring IF to exactly what the caller had.
-                if self.if_was_set {
-                    crate::hal::enable_interrupts();
+                // Flush when no room for another \r\n pair guaranteed.
+                if len >= FIFO_DEPTH - 1 {
+                    self.flush_chunk(&buf[..len]);
+                    len = 0;
                 }
             }
+            // Flush the partial trailing chunk.
+            self.flush_chunk(&buf[..len]);
             Ok(())
         }
     }
