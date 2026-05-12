@@ -3475,6 +3475,33 @@ fn sys_open_linux_inner(pathname: u64, flags: u64, _mode: u64) -> i64 {
         }
     }
 
+    // ── /dev/vport0p0 — QGA transport (virtio-serial port 0, Phase QGA-1) ─
+    // Returns ENODEV when QGA was not compiled in or no virtio-serial-pci
+    // device was discovered during PCI scan, so the userspace daemon
+    // (Phase QGA-2) can probe-and-fall-back cleanly.
+    if path == "/dev/vport0p0" {
+        #[cfg(feature = "qga")]
+        {
+            if !crate::drivers::virtio_serial::is_available() {
+                return -19; // ENODEV
+            }
+            match crate::vfs::open(pid, path, flags as u32) {
+                Ok(fd_num) => {
+                    let mut procs = crate::proc::PROCESS_TABLE.lock();
+                    if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                        if let Some(Some(f)) = p.file_descriptors.get_mut(fd_num) {
+                            f.flags |= 0x0040_0000;
+                        }
+                    }
+                    return fd_num as i64;
+                }
+                Err(e) => return crate::subsys::linux::errno::vfs_err(e),
+            }
+        }
+        #[cfg(not(feature = "qga"))]
+        { return -19; } // ENODEV
+    }
+
     // ── PTY: /dev/ptmx → allocate pair, return master fd ─────────────────
     if path == "/dev/ptmx" {
         return match crate::drivers::pty::alloc() {
