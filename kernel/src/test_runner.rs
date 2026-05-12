@@ -180,6 +180,13 @@ pub fn run() -> ! {
         if test_virtio_serial_qga1() { passed += 1; }
     }
 
+    // ── Test 0d: QGA daemon end-to-end ping (Phase QGA-2) ────────────────
+    #[cfg(feature = "qga")]
+    {
+        total += 1;
+        if test_qga_daemon_ping_qga2() { passed += 1; }
+    }
+
     // ── Test 1: Network Configuration ───────────────────────────────────
 
     total += 1;
@@ -22858,6 +22865,149 @@ fn test_virtio_serial_qga1() -> bool {
 
     test_pass!("virtio-serial / /dev/vport0p0 (Phase QGA-1)");
     true
+}
+
+// ── Test 0d: QGA daemon end-to-end ping (Phase QGA-2) ────────────────────────
+//
+// Spawns the embedded QGA daemon ELF, injects a `guest-ping` frame into the
+// virtio-serial rx queue (simulating the host), and drains the tx queue for
+// the daemon's reply.  Asserts the reply is `{"return":{}}` within a
+// bounded scheduler-tick budget.
+//
+// This is the closest we can get to the QGA-3 harness round-trip from
+// inside a test-mode boot — the host side isn't connected to the chardev
+// socket, so we use the loopback helpers `test_inject_rx` / `test_drain_tx`
+// to play both ends of the wire.  Together with the QGA-1 driver smoke test
+// this confirms the full path: ELF load → libsys `open(/dev/vport0p0)` →
+// kernel routing → virtio-serial rx → JSON dispatch → tx reply.
+#[cfg(feature = "qga")]
+fn test_qga_daemon_ping_qga2() -> bool {
+    test_header!("QGA daemon end-to-end ping (Phase QGA-2)");
+
+    if !crate::drivers::virtio_serial::is_available() {
+        test_println!("  SKIP: no virtio-serial-pci device on bus (harness without --features qga?)");
+        test_pass!("QGA daemon end-to-end ping (skipped — no device)");
+        return true;
+    }
+
+    // ELF sanity — embedded blob must parse before we attempt a spawn.
+    if !crate::proc::elf::is_elf(crate::proc::qga_elf::QGA_ELF) {
+        test_fail!("qga_daemon_ping", "embedded QGA_ELF fails is_elf() check");
+        return false;
+    }
+    test_println!("  embedded QGA_ELF parses as ELF ({} bytes) ✓",
+        crate::proc::qga_elf::QGA_ELF.len());
+
+    // Spawn the daemon as an Aether-native process so its syscalls dispatch
+    // through subsys/aether/syscall.rs with the small AstryxOS numbering
+    // (matches `userspace/libsys/`).  `create_user_process` would mark it
+    // linux_abi=true and steer SYS_EXIT (=0 native) to Linux's read(0,…)
+    // — see Phase QGA-2 design doc for the dispatch boundary.
+    let pid = match crate::proc::usermode::create_aether_process(
+        "qga",
+        crate::proc::qga_elf::QGA_ELF,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            test_fail!("qga_daemon_ping", "spawn failed: {:?}", e);
+            return false;
+        }
+    };
+    test_println!("  spawned QGA daemon as PID {} ✓", pid);
+
+    // Enable the scheduler for the duration of this test so user threads
+    // get picked up by yield_cpu().  In test-mode boots the scheduler is
+    // off by default and the test runner thread holds the CPU.
+    let was_active = crate::sched::is_active();
+    if !was_active { crate::sched::enable(); }
+
+    // Give the daemon a head start so it can open /dev/vport0p0 and reach
+    // the read() loop before we inject input.  ~50 scheduler yields is more
+    // than enough: open() + write(stdout banner) + first read() returns
+    // EAGAIN cleanly, then the daemon is parked polling.
+    for _ in 0..50 {
+        crate::sched::yield_cpu();
+    }
+
+    // Inject a guest-ping frame as if the host had written it.
+    let probe = b"{\"execute\":\"guest-ping\",\"id\":777}\n";
+    if !crate::drivers::virtio_serial::test_inject_rx(probe) {
+        test_fail!("qga_daemon_ping", "test_inject_rx returned false");
+        return false;
+    }
+    test_println!("  injected {} bytes of guest-ping into rx ring ✓", probe.len());
+
+    // Drain the tx ring until the daemon publishes its reply (or we time out).
+    // The daemon's write loop must yield back to the scheduler between
+    // attempts, so we interleave yields with drains.  Budget: 200 yields —
+    // ~2 scheduler quanta, well under the 100ms wall-clock target stated in
+    // the QGA-2 design doc.
+    //
+    // We track an `avail` watermark and ask test_drain_tx to copy whatever
+    // descriptor the daemon most recently published past that mark.  Seed
+    // the watermark with the *current* avail.idx so we don't accidentally
+    // re-read the QGA-1 driver smoke test's probe write that lives in the
+    // tx scratch buffer at this point in the run.
+    let mut reply = [0u8; 256];
+    let mut got = 0usize;
+    let mut avail_watermark = crate::drivers::virtio_serial::stats()
+        .map(|s| s.tx_next_avail)
+        .unwrap_or(0);
+    let mut budget = 200u32;
+    while budget > 0 {
+        let (n, new_watermark) = crate::drivers::virtio_serial::test_drain_tx(
+            &mut reply[got..], avail_watermark);
+        if n > 0 {
+            got += n;
+            avail_watermark = new_watermark;
+            if reply[..got].contains(&b'\n') {
+                break;
+            }
+        }
+        crate::sched::yield_cpu();
+        budget -= 1;
+    }
+
+    // Restore scheduler state before returning regardless of the outcome.
+    if !was_active { crate::sched::disable(); }
+
+    if got == 0 || !reply[..got].contains(&b'\n') {
+        test_fail!("qga_daemon_ping",
+            "no complete reply within budget (got {} bytes)", got);
+        return false;
+    }
+
+    let reply_str = core::str::from_utf8(&reply[..got]).unwrap_or("<non-utf8>");
+    test_println!("  daemon reply ({} bytes): {}", got, reply_str.trim_end());
+
+    // Validate the reply shape.  We don't want to ship a full JSON parser in
+    // the test, so do byte-string checks for the two fields that must be
+    // present per the QGA spec: `"return":{}` and the echoed `"id":777`.
+    let trimmed = &reply[..got];
+    let has_return = contains_subseq(trimmed, b"\"return\":{}");
+    let has_id = contains_subseq(trimmed, b"\"id\":777");
+    if !has_return {
+        test_fail!("qga_daemon_ping",
+            "reply missing \"return\":{{}} field");
+        return false;
+    }
+    if !has_id {
+        test_fail!("qga_daemon_ping",
+            "reply missing \"id\":777 echo");
+        return false;
+    }
+    test_println!("  reply contains \"return\":{{}} and \"id\":777 echo ✓");
+
+    test_pass!("QGA daemon end-to-end ping (Phase QGA-2)");
+    true
+}
+
+#[cfg(feature = "qga")]
+fn contains_subseq(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 // ── Test 197: eventfd wake hook — reader parks, write wakes ──────────────────

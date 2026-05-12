@@ -1,0 +1,31 @@
+[package]
+name = "astryx-qga"
+version = "0.1.0"
+edition = "2021"
+description = "AstryxOS QEMU Guest Agent daemon — native userspace, opens /dev/vport0p0 and speaks the QGA JSON-RPC subset"
+authors = ["AstryxOS"]
+
+# Native AstryxOS userspace binary.  Built by kernel/build.rs for the
+# `x86_64-unknown-none` target whenever the kernel `qga` feature is on,
+# then embedded via include_bytes! in proc/qga_elf.rs.  Not a workspace member.
+
+[[bin]]
+name = "qga"
+path = "src/main.rs"
+
+# Keep this crate out of the kernel workspace — it is built standalone with a
+# freestanding x86_64 target by kernel/build.rs.
+[workspace]
+
+[dependencies]
+astryx-libsys = { path = "../libsys" }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+panic = "abort"
