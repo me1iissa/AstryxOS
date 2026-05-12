@@ -736,7 +736,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     _ => crate::net::socket::SocketType::Udp,
                 };
                 let socket_id = crate::net::socket::socket_create(net_type);
-                crate::syscall::alloc_socket_fd(pid, socket_id, sock_type as u32)
+                // Per socket(2): SOCK_CLOEXEC and SOCK_NONBLOCK in the `type`
+                // argument must be applied atomically to the returned fd —
+                // POSIX.1-2017 socket(2), same contract as AF_UNIX above.
+                crate::syscall::alloc_socket_fd(pid, socket_id, sock_type as u32, cloexec, nonblock)
             } else {
                 -22 // EINVAL — unsupported domain
             }
@@ -1007,15 +1010,20 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 // when the receiver buffer was shorter than the sender message.
                 // msghdr.msg_flags lives at byte-offset 48 (i32) per the Linux
                 // x86_64 ABI for `struct msghdr`.
+                //
+                // Per recvmsg(2): "The msg_flags field in the msghdr is set on
+                // return of recvmsg()" — the kernel OVERWRITES the field on
+                // return; it does not OR into whatever the caller left there.
+                // Callers that zero the struct see the same result, but any
+                // sentinel the caller placed in msg_flags must not survive.
                 const MSG_TRUNC: u32 = 0x20;
                 bytes_read = match crate::net::unix::read_msg(unix_id, buf) {
                     Ok((n, discarded)) => {
-                        if discarded > 0 {
-                            unsafe {
-                                let flags_ptr = (arg2 + 48) as *mut u32;
-                                let cur = core::ptr::read_unaligned(flags_ptr);
-                                core::ptr::write_unaligned(flags_ptr, cur | MSG_TRUNC);
-                            }
+                        // Overwrite (not OR) msg_flags — recvmsg(2) man page.
+                        let computed: u32 = if discarded > 0 { MSG_TRUNC } else { 0 };
+                        unsafe {
+                            let flags_ptr = (arg2 + 48) as *mut u32;
+                            core::ptr::write_unaligned(flags_ptr, computed);
                         }
                         n as i64
                     }
