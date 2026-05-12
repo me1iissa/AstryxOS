@@ -10,10 +10,27 @@
 
 extern crate alloc;
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
 /// Max concurrent timerfds.
 const MAX_TIMERFDS: usize = 64;
+
+/// Lockless hint: earliest `next_expiry` (in scheduler ticks) across
+/// all armed timerfds, or `u64::MAX` if no timerfd is armed.  Read by
+/// the timer ISR every tick to decide whether to ring the poll bell
+/// without ever taking `TABLE` from interrupt context — `TABLE` is
+/// also held by syscall paths (`read`, `is_readable`, `settime`) and
+/// taking it from the ISR would deadlock the same CPU if a syscall
+/// holds it mid-edit.
+///
+/// Written by `settime` (the only path that arms or disarms a timer),
+/// and reset by `maybe_ring_from_tick` after a bell fire so the bell
+/// does not re-ring every tick until the next `settime`.  Reset by
+/// `update_expirations` is intentionally avoided — the
+/// `update_expirations` path holds `TABLE` and racing the timer ISR
+/// against the slot edit would be uncomfortable.
+static EARLIEST_TIMERFD_EXPIRY: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// Nanoseconds per PIT tick (100 Hz → 10 ms).
 const NS_PER_TICK: u64 = 10_000_000;
@@ -98,6 +115,17 @@ pub fn settime(id: u64, flags: u32, value_ns: u64, interval_ns: u64) -> Option<(
         }
     }
 
+    // Recompute the lockless earliest-expiry hint so the timer ISR can
+    // ring the bell at expiry without taking TABLE.  Walk the slot
+    // array once — bounded by MAX_TIMERFDS (=64) so the cost is fixed.
+    let mut earliest = u64::MAX;
+    for s in table.iter() {
+        if s.in_use && s.next_expiry != 0 && s.next_expiry < earliest {
+            earliest = s.next_expiry;
+        }
+    }
+    EARLIEST_TIMERFD_EXPIRY.store(earliest, Ordering::Release);
+
     Some((old_interval, old_value))
 }
 
@@ -121,6 +149,11 @@ pub fn gettime(id: u64) -> (u64, u64) {
 }
 
 /// Advance expiration counter for elapsed ticks (called before read/poll).
+///
+/// On a repeating timer this advances `next_expiry` to the first
+/// future tick; the bell-fire hint is then refreshed via
+/// `recompute_hint_min` so the timer ISR rings the bell again at the
+/// next period without the caller needing to re-arm via `settime`.
 fn update_expirations(slot: &mut TimerFdEntry, now: u64) {
     if slot.next_expiry == 0 || now < slot.next_expiry {
         return;
@@ -131,6 +164,12 @@ fn update_expirations(slot: &mut TimerFdEntry, now: u64) {
         let count   = elapsed / slot.interval_ticks + 1;
         slot.expirations  += count;
         slot.next_expiry  += count * slot.interval_ticks;
+        // Periodic-timer hint update: propagate the freshly-advanced
+        // next_expiry into the lockless hint so the ISR sees it.
+        let prev = EARLIEST_TIMERFD_EXPIRY.load(Ordering::Acquire);
+        if slot.next_expiry < prev {
+            EARLIEST_TIMERFD_EXPIRY.store(slot.next_expiry, Ordering::Release);
+        }
     } else {
         // One-shot.
         slot.expirations += 1;
@@ -173,5 +212,48 @@ pub fn close(id: u64) {
     let mut table = TABLE.lock();
     if let Some(slot) = table.get_mut(id as usize) {
         *slot = TimerFdEntry::empty();
+    }
+    // Recompute the earliest-expiry hint after disarming this slot.
+    let mut earliest = u64::MAX;
+    for s in table.iter() {
+        if s.in_use && s.next_expiry != 0 && s.next_expiry < earliest {
+            earliest = s.next_expiry;
+        }
+    }
+    EARLIEST_TIMERFD_EXPIRY.store(earliest, Ordering::Release);
+}
+
+/// Called from the timer ISR each tick.  Lockless: reads the
+/// earliest-expiry hint and rings the poll bell only when at least
+/// one armed timer has reached or passed its scheduled tick.  On a
+/// fire, the hint is bumped to `u64::MAX` so the bell does not re-ring
+/// every tick — `settime` (the only path that arms a new timer) will
+/// re-populate the hint on its next call.  Periodic timers are kept
+/// firing because each `read` advances `next_expiry` and the next
+/// `settime` (or the syscall path itself, via `update_expirations` →
+/// `settime` not being called) is not invoked; instead, the lazy
+/// rescan on the wake-up satisfies any periodic timerfd because the
+/// poller calls `is_readable` which updates `expirations`.
+///
+/// Safe to call from interrupt context: it never blocks, only takes
+/// a single atomic Acquire load and (on fire) two Acquire/Release
+/// CAS-equivalent stores plus the bell-ring path's brief
+/// `POLL_BELL` lock.  `POLL_BELL` is never acquired by ISR-only code
+/// other than this hook, so no nested-ISR deadlock is possible.
+#[inline]
+pub fn maybe_ring_from_tick(now_tick: u64) {
+    let earliest = EARLIEST_TIMERFD_EXPIRY.load(Ordering::Acquire);
+    if earliest == u64::MAX || now_tick < earliest {
+        return;
+    }
+    // Race-tolerant CAS to claim the ring: if another CPU already
+    // bumped the hint to u64::MAX, leave them to it — the bell will
+    // only fire once per arm cycle.
+    if EARLIEST_TIMERFD_EXPIRY
+        .compare_exchange(earliest, u64::MAX, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+    {
+        crate::ipc::waitlist::ring_poll_bell_for(
+            crate::ipc::waitlist::PollBellSource::Timerfd);
     }
 }
