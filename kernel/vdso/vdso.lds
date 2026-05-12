@@ -48,10 +48,14 @@ SECTIONS {
 	 */
 	. = -0x1000;
 
-	vvar_seq       = . + 0x00;   /* u32 — sequence counter        */
-	vvar_tick_hz   = . + 0x04;   /* u32 — PIT frequency           */
-	vvar_ticks     = . + 0x08;   /* u64 — monotonic PIT ticks     */
-	vvar_wall_secs = . + 0x10;   /* u64 — UNIX seconds at boot    */
+	vvar_seq            = . + 0x00; /* u32 — sequence counter           */
+	vvar_tick_hz        = . + 0x04; /* u32 — PIT frequency              */
+	vvar_ticks          = . + 0x08; /* u64 — monotonic PIT ticks        */
+	vvar_wall_secs      = . + 0x10; /* u64 — UNIX seconds at boot       */
+	vvar_tsc_at_boot    = . + 0x18; /* u64 — TSC reading at boot epoch  */
+	vvar_tsc_ns_mult    = . + 0x20; /* u64 — ns = (tsc_delta * mult)    */
+	vvar_tsc_ns_shift   = . + 0x28; /* u32 —          >> shift          */
+	vvar_tsc_per_tick   = . + 0x30; /* u64 — TSC cycles per 10 ms tick  */
 
 	/*
 	 * Place ELF header + program headers + dynamic info at vaddr 0

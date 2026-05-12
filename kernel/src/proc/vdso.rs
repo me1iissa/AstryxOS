@@ -102,10 +102,24 @@ pub const AT_SYSINFO_EHDR: u64 = 33;
 
 /// vvar field offsets (must match the absolute symbol values produced
 /// by `kernel/vdso/vdso.lds`).
-const VVAR_OFF_SEQ:        usize = 0x00; // u32
-const VVAR_OFF_TICK_HZ:    usize = 0x04; // u32
-const VVAR_OFF_TICKS:      usize = 0x08; // u64
-const VVAR_OFF_WALL_SECS:  usize = 0x10; // u64
+const VVAR_OFF_SEQ:            usize = 0x00; // u32
+const VVAR_OFF_TICK_HZ:        usize = 0x04; // u32
+const VVAR_OFF_TICKS:          usize = 0x08; // u64
+const VVAR_OFF_WALL_SECS:      usize = 0x10; // u64
+/// TSC value captured at calibration time.  vDSO subtracts this from a
+/// runtime `rdtsc` to get a monotonic cycle delta.  Set once by
+/// [`publish_tsc_calibration`] right after LAPIC calibration completes.
+const VVAR_OFF_TSC_AT_BOOT:    usize = 0x18; // u64
+/// Mul-shift pair so that `ns = (tsc_delta * mult) >> shift` matches
+/// the host TSC frequency.  The pair is precomputed once at calibration
+/// time; vDSO performs the multiply in 128 bits via `mulq` + `shrd`
+/// to retain full precision over multi-day uptimes.
+const VVAR_OFF_TSC_NS_MULT:    usize = 0x20; // u64
+const VVAR_OFF_TSC_NS_SHIFT:   usize = 0x28; // u32 (only low byte used)
+/// TSC cycles per 10 ms tick — kept available so an in-kernel CLOCK_*
+/// path can derive the same ns value the vDSO computes, and so a future
+/// CLOCK_*_COARSE fast path can use it without re-deriving.
+const VVAR_OFF_TSC_PER_TICK:   usize = 0x30; // u64
 
 /// Physical address of the kernel-allocated, globally-shared vvar page.
 /// Set once by [`init`].
@@ -188,6 +202,17 @@ pub fn init() {
     }
     VDSO_PHYS.store(vdso_phys, Ordering::Relaxed);
 
+    // If TSC calibration was already published before vvar existed (this
+    // happens whenever apic::init() races vdso::init() on the BSP), mirror
+    // the in-kernel atomics into the freshly allocated vvar page so the
+    // first userspace clock_gettime read uses a real epoch instead of
+    // tripping the `mult == 0` fallback.
+    let tsc_at_boot  = crate::arch::x86_64::irq::TSC_AT_BOOT.load(Ordering::Acquire);
+    let tsc_per_tick = crate::arch::x86_64::irq::TSC_PER_TICK.load(Ordering::Acquire);
+    if tsc_per_tick != 0 {
+        publish_tsc_calibration(tsc_at_boot, tsc_per_tick);
+    }
+
     crate::serial_println!(
         "[vDSO] init: vvar_phys={:#x} vdso_phys={:#x} elf={} bytes wall_secs={}",
         vvar_phys, vdso_phys, VDSO_IMAGE.len(),
@@ -263,6 +288,115 @@ pub fn map_vdso(cr3: u64, vmas: &mut Vec<VmArea>) -> Option<u64> {
     });
 
     Some(VDSO_ELF_BASE)
+}
+
+/// Shift used when packing the TSC-to-ns reciprocal into a (mult, shift)
+/// pair.  32 is a safe balance for x86_64 TSCs in the 1 GHz–10 GHz range:
+///
+///   mult = (1u128 << 32) * 1_000_000_000 / tsc_freq_hz
+///
+/// fits comfortably in u64 (≈1.4 × 10^9 for a 3 GHz TSC), and the
+/// 128-bit `delta * mult` headroom covers years of uptime before the
+/// product overflows the 128-bit accumulator.
+pub const TSC_NS_SHIFT: u32 = 32;
+
+/// Compute the mul-shift pair for an arbitrary TSC frequency.
+///
+/// `ns = (tsc_delta * mult) >> shift` where `shift = TSC_NS_SHIFT`.
+/// `tsc_freq_hz` must be non-zero; the caller has already validated
+/// calibration before reaching this path.
+#[inline]
+fn tsc_to_ns_mult(tsc_freq_hz: u64) -> u64 {
+    if tsc_freq_hz == 0 {
+        return 0;
+    }
+    // 128-bit numerator avoids precision loss; the divide-by-tsc_freq
+    // then fits the result in u64 for any TSC > ~250 MHz.
+    let num: u128 = (1u128 << TSC_NS_SHIFT) * 1_000_000_000u128;
+    (num / tsc_freq_hz as u128) as u64
+}
+
+/// Publish the TSC calibration into the vvar page.
+///
+/// Called once from the LAPIC calibration path on the BSP after
+/// `crate::arch::x86_64::irq::set_tsc_calibration` has populated the
+/// in-kernel atomics.  The vvar fields are seqlock-guarded for
+/// consistency with `vvar_tick`, but in practice this is a one-shot
+/// boot-time write: by the time userspace can observe vvar fields,
+/// AT_SYSINFO_EHDR has not yet been handed to any user process.
+///
+/// `tsc_at_boot` is the canonical "TSC == 0 ns since boot" reference;
+/// every CLOCK_MONOTONIC or CLOCK_REALTIME read derives ns by
+/// `(rdtsc - tsc_at_boot) * mult >> shift`.
+pub fn publish_tsc_calibration(tsc_at_boot: u64, tsc_per_tick: u64) {
+    let phys = VVAR_PHYS.load(Ordering::Relaxed);
+    if phys == 0 || tsc_per_tick == 0 {
+        return;
+    }
+    let tsc_freq_hz = tsc_per_tick.saturating_mul(crate::arch::x86_64::irq::TICK_HZ);
+    let mult = tsc_to_ns_mult(tsc_freq_hz);
+
+    unsafe {
+        let p = phys_to_virt(phys);
+        let seq = &*(p.add(VVAR_OFF_SEQ) as *const AtomicU32);
+        let cur = seq.load(Ordering::Relaxed);
+        // Bump seq to odd → readers retry → write fields → bump seq to even.
+        seq.store(cur.wrapping_add(1), Ordering::Release);
+        write_u64(p, VVAR_OFF_TSC_AT_BOOT,  tsc_at_boot);
+        write_u64(p, VVAR_OFF_TSC_NS_MULT,  mult);
+        write_u32(p, VVAR_OFF_TSC_NS_SHIFT, TSC_NS_SHIFT);
+        write_u64(p, VVAR_OFF_TSC_PER_TICK, tsc_per_tick);
+        seq.store(cur.wrapping_add(2), Ordering::Release);
+    }
+
+    crate::serial_println!(
+        "[vDSO] tsc-calibration published: tsc_at_boot={:#x} tsc_per_tick={} \
+         tsc_freq_hz={} ns_mult={} ns_shift={}",
+        tsc_at_boot, tsc_per_tick, tsc_freq_hz, mult, TSC_NS_SHIFT,
+    );
+}
+
+/// Compute monotonic nanoseconds since boot using the published TSC
+/// calibration — same formula as the vDSO fast path.
+///
+/// Returns 0 if calibration has not been published yet (extremely
+/// early boot before `apic::init`).  All in-kernel CLOCK_MONOTONIC /
+/// CLOCK_REALTIME paths should call this so the kernel and the vDSO
+/// agree to the cycle, eliminating spurious ETIMEDOUT from
+/// FUTEX_WAIT_BITSET deadlines computed from a vDSO read.
+#[inline]
+pub fn monotonic_ns() -> u64 {
+    let phys = VVAR_PHYS.load(Ordering::Relaxed);
+    if phys == 0 {
+        return 0;
+    }
+    // Reading at most three u64 fields plus seq; we accept transient
+    // re-reads on the (extremely rare) write window.
+    unsafe {
+        let p = phys_to_virt(phys);
+        let seq = &*(p.add(VVAR_OFF_SEQ) as *const AtomicU32);
+        loop {
+            let s1 = seq.load(Ordering::Acquire);
+            if s1 & 1 != 0 { core::hint::spin_loop(); continue; }
+            let tsc_at_boot = read_u64(p, VVAR_OFF_TSC_AT_BOOT);
+            let mult        = read_u64(p, VVAR_OFF_TSC_NS_MULT);
+            let shift       = read_u64(p, VVAR_OFF_TSC_NS_SHIFT) as u32;
+            let s2 = seq.load(Ordering::Acquire);
+            if s2 != s1 { continue; }
+            if mult == 0 { return 0; } // calibration not published
+            let now_tsc = {
+                let lo: u32; let hi: u32;
+                core::arch::asm!("rdtsc",
+                    out("eax") lo, out("edx") hi,
+                    options(nomem, nostack, preserves_flags));
+                ((hi as u64) << 32) | lo as u64
+            };
+            let delta = now_tsc.wrapping_sub(tsc_at_boot);
+            // 128-bit multiply to avoid overflow for multi-hour uptimes.
+            let prod = (delta as u128).wrapping_mul(mult as u128);
+            return (prod >> shift) as u64;
+        }
+    }
 }
 
 /// Update the vvar `ticks` field.  Called from the PIT timer ISR on every
