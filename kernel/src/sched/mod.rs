@@ -333,6 +333,18 @@ pub fn schedule() {
                     unsafe {
                         core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
                     }
+                    // Re-check SCHEDULER_ACTIVE after waking from hlt.
+                    // If another CPU called sched::disable() while we were
+                    // halted, timer_tick_schedule() now short-circuits and
+                    // will never flip a peer to Ready or set NEED_RESCHEDULE
+                    // — `continue 'pick` would loop forever in sti;hlt;cli.
+                    // Treat disable as "drop out of the picker"; the caller's
+                    // schedule() prologue already returns when is_active() is
+                    // false, so unwinding to it preserves existing semantics.
+                    if !is_active() {
+                        crate::hal::enable_interrupts();
+                        return;
+                    }
                     continue 'pick;
                 }
                 _ => {
@@ -351,6 +363,11 @@ pub fn schedule() {
                     crate::perf::record_idle_tick();
                     unsafe {
                         core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                    }
+                    // See is_active() recheck rationale above.
+                    if !is_active() {
+                        crate::hal::enable_interrupts();
+                        return;
                     }
                     continue 'pick;
                 }
@@ -500,6 +517,14 @@ pub fn schedule() {
                         unsafe {
                             core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
                         }
+                        // Re-check SCHEDULER_ACTIVE after waking from hlt.
+                        // sched::disable() on another CPU silently disarms
+                        // timer_tick_schedule()'s wake hooks, so without
+                        // this guard the loop would spin sti;hlt;cli forever.
+                        if !is_active() {
+                            crate::hal::enable_interrupts();
+                            return;
+                        }
                         continue 'pick;
                     }
                     _ => {
@@ -509,6 +534,11 @@ pub fn schedule() {
                         crate::perf::record_idle_tick();
                         unsafe {
                             core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                        }
+                        // See is_active() recheck rationale above.
+                        if !is_active() {
+                            crate::hal::enable_interrupts();
+                            return;
                         }
                         continue 'pick;
                     }
