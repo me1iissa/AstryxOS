@@ -88,7 +88,7 @@ def _detect_kvm() -> bool:
 
 # ── Block assemblers ──────────────────────────────────────────────────────────
 
-def _cpu_args(mode: str, kvm: bool) -> list[str]:
+def _cpu_args(mode: str, kvm: bool, cpu_override: Optional[str] = None) -> list[str]:
     """
     CPU model. Under KVM we prefer `host` because that matches what a
     real-hardware boot would encounter — critical for Firefox and any
@@ -102,7 +102,13 @@ def _cpu_args(mode: str, kvm: bool) -> list[str]:
     firefox-test forces `-cpu host` because its perf target is
     unreachable under TCG; if KVM is absent the run will be slow but
     correct.
+
+    `cpu_override` (if set) bypasses every other rule and passes
+    `-cpu <value>` verbatim. Used by perf investigations that need to
+    sweep CPU models (e.g. `-cpu max`, `-cpu Cascadelake-Server`).
     """
+    if cpu_override:
+        return ["-cpu", cpu_override]
     if mode == "firefox-test":
         return ["-cpu", "host"]
     if kvm:
@@ -232,6 +238,7 @@ def build_qemu_cmd(
     kvm: Optional[bool] = None,
     show_window: bool = False,
     extra_args: Optional[list[str]] = None,
+    cpu_override: Optional[str] = None,
 ) -> list[str]:
     """
     Return the full argv for `qemu-system-x86_64` for an AstryxOS test run.
@@ -275,7 +282,7 @@ def build_qemu_cmd(
 
     cmd: list[str] = ["qemu-system-x86_64"]
     cmd += _machine_args()
-    cmd += _cpu_args(mode, kvm)
+    cmd += _cpu_args(mode, kvm, cpu_override)
     cmd += _memory_args(mode)
     cmd += _smp_args()
     cmd += _serial_args(serial_path)
