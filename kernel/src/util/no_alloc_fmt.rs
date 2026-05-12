@@ -31,10 +31,23 @@
 
 use crate::hal;
 
-/// COM1 base I/O port — duplicated here so the bugcheck path does not
-/// pull in [`crate::drivers::serial`] (which owns a `Mutex`).  This MUST
-/// stay in sync with the constant in `drivers/serial.rs`.
-const COM1: u16 = 0x3F8;
+/// COM1 base I/O port — re-used from [`crate::drivers::serial::COM1`].
+///
+/// We deliberately re-export the canonical constant from `drivers::serial`
+/// rather than duplicate the literal here; previously the value lived
+/// in two places and an update to one would silently desynchronise the
+/// bugcheck path from the normal serial driver.
+///
+/// **Fault-immunity contract.**  The referenced item is a plain
+/// `pub const u16` — a compile-time integer literal with no
+/// initialiser, no allocator dependency, no `Mutex`, and no transitive
+/// path through `drivers::serial::SERIAL`.  Importing the name does
+/// **not** pull in any of the driver's lock-bearing machinery; the
+/// bugcheck path still polls LSR directly and never takes the
+/// `SERIAL` mutex.  If `drivers::serial::COM1` is ever changed to
+/// anything other than a plain `pub const`, the bugcheck contract is
+/// violated and this `use` must be reverted to a private literal.
+use crate::drivers::serial::COM1;
 
 /// LSR.THRE bit — set when the transmit holding register is empty and
 /// the next byte may be written to the data register.
