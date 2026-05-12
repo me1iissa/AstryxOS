@@ -34,6 +34,12 @@ Tier 2 — GDB stub integration (requires --gdb-port on start):
     python3 scripts/qemu-harness.py cont <sid>
     python3 scripts/qemu-harness.py pause <sid>
     python3 scripts/qemu-harness.py resume <sid>
+
+QGA bridge (requires --features qga on start):
+    python3 scripts/qemu-harness.py qga-ping <sid> [--timeout S]
+    python3 scripts/qemu-harness.py qga-info <sid> [--timeout S]
+    python3 scripts/qemu-harness.py qga-sync <sid> [--id N] [--timeout S]
+    python3 scripts/qemu-harness.py qga-file-read <sid> --path <P> [--max-bytes N]
 """
 
 import argparse
@@ -1082,6 +1088,11 @@ def cmd_start(args):
           # True when data.img was absent (even after auto-symlink attempt).
           # Agents should treat this as a hard warning for firefox-test runs.
           "data_img_missing": _data_img_missing,
+          # Per-session QGA UNIX chardev socket path. Empty string when the
+          # session was started without --features qga; non-empty paths may
+          # not yet exist on disk if QEMU hasn't bound the socket yet
+          # (the qga-* subcommands report `socket missing` until then).
+          "qga_sock_path": qga_sock,
           # Session-scoped kernel binary path (additive field — agents that
           # want to verify the running binary's SHA against a known-good
           # reference can read this directly).
@@ -1883,6 +1894,214 @@ def cmd_kdb(args):
     except OSError: pass
 
     _out(resp)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# QGA (QEMU Guest Agent) subcommands — one-shot calls into the in-guest daemon
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# These commands speak qemu-guest-agent-compatible NDJSON over the UNIX-domain
+# chardev socket QEMU exposes on the host side of the virtio-serial port. The
+# socket path is per-session: ~/.astryx-harness/<sid>.qga.sock, recorded as
+# `qga_sock` in the session JSON. Each invocation here opens the socket, sends
+# one request, reads one reply, closes. See `scripts/qga_client.py` for the
+# wire helper that takes care of framing, timeouts, and the `0xff` stale-data
+# delimiter quirk (sync-delimited path; documented at
+# https://wiki.qemu.org/Features/GuestAgent).
+#
+# The session must have been started with `--features qga` (or a feature set
+# that pulls it in) for the daemon to spawn and the host socket to bind. When
+# the socket is absent, the wrappers return a structured `connect failed`
+# error rather than raising.
+
+# qga_client lives next to this file — already imported above via the sys.path
+# manipulation that pulled in astryx_qemu.
+import qga_client  # noqa: E402
+
+
+def _qga_sock_or_err(sess: dict) -> str:
+    """
+    Resolve the QGA socket path from a session dict.
+
+    Returns the path string; if the session was not started with QGA
+    enabled, prints a structured error and exits non-zero. Callers can
+    therefore treat the return value as a guaranteed non-empty path.
+    """
+    sock = (sess.get("qga_sock") or "").strip()
+    if not sock:
+        _out({
+            "ok": False,
+            "error": "session was not started with --features qga "
+                     "(no qga_sock in session JSON)",
+        })
+        sys.exit(2)
+    return sock
+
+
+def cmd_qga_ping(args):
+    """guest-ping — round-trip latency probe."""
+    sess = _load_session(args.sid)
+    sock = _qga_sock_or_err(sess)
+    timeout = float(getattr(args, "timeout", 5.0) or 5.0)
+    res = qga_client.qga_ping(sock, timeout=timeout)
+    # Project the qga_client structured result onto the harness contract:
+    #   {"ok": bool, "latency_ms": int, "error"?: str, "response"?: ...}
+    out = {"ok": bool(res.get("ok")), "latency_ms": int(res.get("latency_ms", 0))}
+    if not res.get("ok"):
+        out["error"] = res.get("error", "unknown error")
+        if "raw" in res:
+            out["raw"] = res["raw"]
+    else:
+        out["response"] = res.get("response")
+    _out(out)
+    sys.exit(0 if out["ok"] else 2)
+
+
+def cmd_qga_info(args):
+    """guest-info — daemon version + supported-commands list."""
+    sess = _load_session(args.sid)
+    sock = _qga_sock_or_err(sess)
+    timeout = float(getattr(args, "timeout", 5.0) or 5.0)
+    res = qga_client.qga_info(sock, timeout=timeout)
+    out = {"ok": bool(res.get("ok")), "latency_ms": int(res.get("latency_ms", 0))}
+    if not res.get("ok"):
+        out["error"] = res.get("error", "unknown error")
+        if "raw" in res:
+            out["raw"] = res["raw"]
+    else:
+        # Surface the daemon's `return` payload at the top level so agents
+        # can read `version` / `supported_commands` without descending into
+        # the QGA envelope.
+        resp = res.get("response") or {}
+        ret = resp.get("return") if isinstance(resp, dict) else None
+        out["response"] = resp
+        if isinstance(ret, dict):
+            out["return"] = ret
+    _out(out)
+    sys.exit(0 if out["ok"] else 2)
+
+
+def cmd_qga_sync(args):
+    """guest-sync — verify the daemon round-trip ID matches.
+
+    Useful as a liveness probe before any other QGA call; the daemon
+    echoes the supplied integer, so a mismatch flags a stale or mis-
+    framed reply (e.g. a crash-restart between calls). Default id is
+    a random 31-bit positive integer to keep concurrent callers
+    independent; pass --id to pin a specific value (handy in tests
+    that compare on exact JSON output).
+    """
+    sess = _load_session(args.sid)
+    sock = _qga_sock_or_err(sess)
+    timeout = float(getattr(args, "timeout", 5.0) or 5.0)
+    sync_id = getattr(args, "id", None)
+    res = qga_client.qga_sync(sock, timeout=timeout, sync_id=sync_id)
+    out = {
+        "ok": bool(res.get("ok")),
+        "latency_ms": int(res.get("latency_ms", 0)),
+        "id": res.get("id"),
+    }
+    if not res.get("ok"):
+        out["error"] = res.get("error", "unknown error")
+        if "raw" in res:
+            out["raw"] = res["raw"]
+    else:
+        out["response"] = res.get("response")
+    _out(out)
+    sys.exit(0 if out["ok"] else 2)
+
+
+def cmd_qga_file_read(args):
+    """guest-file-open → guest-file-read → guest-file-close in one call.
+
+    Returns:
+        On success: {"ok":true,"bytes_b64":"...","len":N,"path":...}
+        On any failure: {"ok":false,"error":"...","stage":"open|read|close"}
+
+    The `stage` field identifies which underlying QGA call failed, so a
+    caller can distinguish "file not found" (open) from "guest read
+    error" (read). The close step is best-effort: if open+read both
+    succeeded but close failed, we still return ok=true and surface the
+    close diagnostic under `close_error`.
+    """
+    sess = _load_session(args.sid)
+    sock = _qga_sock_or_err(sess)
+    timeout = float(getattr(args, "timeout", 5.0) or 5.0)
+    path = args.path
+    # Cap at 4 KiB by default — matches the daemon's MAX_READ_CHUNK so a
+    # caller asking for more wouldn't get more anyway. Larger reads would
+    # need iterated guest-file-read calls (out of scope for QGA-3).
+    max_bytes = int(getattr(args, "max_bytes", 4096) or 4096)
+    if max_bytes <= 0:
+        _out({"ok": False, "error": "max-bytes must be positive", "stage": "args"})
+        sys.exit(2)
+    if max_bytes > 4096:
+        max_bytes = 4096
+
+    # ── open ────────────────────────────────────────────────────────────────
+    open_res = qga_client.qga_file_open(sock, path, mode="r", timeout=timeout)
+    if not open_res.get("ok"):
+        out = {
+            "ok": False,
+            "stage": "open",
+            "error": open_res.get("error", "open failed"),
+            "path": path,
+            "latency_ms": int(open_res.get("latency_ms", 0)),
+        }
+        if "raw" in open_res:
+            out["raw"] = open_res["raw"]
+        _out(out)
+        sys.exit(2)
+
+    handle_raw = (open_res.get("response") or {}).get("return")
+    try:
+        handle = int(handle_raw)
+    except (TypeError, ValueError):
+        _out({
+            "ok": False,
+            "stage": "open",
+            "error": f"daemon returned non-integer handle: {handle_raw!r}",
+            "path": path,
+        })
+        sys.exit(2)
+
+    # ── read ────────────────────────────────────────────────────────────────
+    read_res = qga_client.qga_file_read(sock, handle, max_bytes, timeout=timeout)
+    if not read_res.get("ok"):
+        # Best-effort close, then report the read failure.
+        qga_client.qga_file_close(sock, handle, timeout=timeout)
+        out = {
+            "ok": False,
+            "stage": "read",
+            "error": read_res.get("error", "read failed"),
+            "path": path,
+            "handle": handle,
+            "latency_ms": int(read_res.get("latency_ms", 0)),
+        }
+        if "raw" in read_res:
+            out["raw"] = read_res["raw"]
+        _out(out)
+        sys.exit(2)
+
+    ret = (read_res.get("response") or {}).get("return") or {}
+    bytes_b64 = ret.get("buf-b64") or ""
+    length = int(ret.get("count") or 0)
+
+    # ── close ───────────────────────────────────────────────────────────────
+    close_res = qga_client.qga_file_close(sock, handle, timeout=timeout)
+
+    out = {
+        "ok": True,
+        "path": path,
+        "handle": handle,
+        "bytes_b64": bytes_b64,
+        "len": length,
+        "latency_ms": int(read_res.get("latency_ms", 0)),
+    }
+    if not close_res.get("ok"):
+        out["close_error"] = close_res.get("error", "close failed")
+    _out(out)
+    sys.exit(0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4468,6 +4687,46 @@ def main():
     p_kdb.add_argument("--timeout", type=float, default=5.0,
                         help="Socket timeout in seconds (default 5.0)")
 
+    # qga-ping / qga-info / qga-sync / qga-file-read — QEMU Guest Agent
+    # bridge.  Requires --features qga at start; talks NDJSON over the
+    # per-session UNIX chardev socket at ~/.astryx-harness/<sid>.qga.sock.
+    p_qga_ping = sub.add_parser(
+        "qga-ping",
+        help="QGA: round-trip ping the in-guest QEMU Guest Agent daemon")
+    p_qga_ping.add_argument("sid")
+    p_qga_ping.add_argument("--timeout", type=float, default=5.0,
+                             help="Socket timeout in seconds (default 5.0)")
+
+    p_qga_info = sub.add_parser(
+        "qga-info",
+        help="QGA: fetch daemon version + supported-commands list")
+    p_qga_info.add_argument("sid")
+    p_qga_info.add_argument("--timeout", type=float, default=5.0,
+                             help="Socket timeout in seconds (default 5.0)")
+
+    p_qga_sync = sub.add_parser(
+        "qga-sync",
+        help="QGA: send guest-sync, verify the daemon echoes the same id "
+             "(liveness probe before other QGA calls)")
+    p_qga_sync.add_argument("sid")
+    p_qga_sync.add_argument("--id", dest="id", type=int, default=None,
+                             help="Sync id (default: random 31-bit positive int)")
+    p_qga_sync.add_argument("--timeout", type=float, default=5.0,
+                             help="Socket timeout in seconds (default 5.0)")
+
+    p_qga_fread = sub.add_parser(
+        "qga-file-read",
+        help="QGA: open + read + close a guest file in one call. "
+             "Returns base64-encoded bytes (capped at 4 KiB per QGA-2)")
+    p_qga_fread.add_argument("sid")
+    p_qga_fread.add_argument("--path", required=True,
+                              help="Absolute guest path (e.g. /disk/opt/firefox/firefox-bin)")
+    p_qga_fread.add_argument("--max-bytes", dest="max_bytes",
+                              type=int, default=4096,
+                              help="Max bytes to read (1..4096, default 4096)")
+    p_qga_fread.add_argument("--timeout", type=float, default=5.0,
+                              help="Socket timeout in seconds (default 5.0)")
+
     # prune — housekeeping for ~/.astryx-harness/
     p_prune = sub.add_parser("prune",
         help="Delete state/log files for dead sessions older than --ttl days")
@@ -4691,6 +4950,11 @@ def main():
         "resume": cmd_resume,
         # Tier 1
         "kdb":    cmd_kdb,
+        # QGA bridge
+        "qga-ping":      cmd_qga_ping,
+        "qga-info":      cmd_qga_info,
+        "qga-sync":      cmd_qga_sync,
+        "qga-file-read": cmd_qga_file_read,
         # Housekeeping / reporting
         "prune":   cmd_prune,
         "results": cmd_results,
