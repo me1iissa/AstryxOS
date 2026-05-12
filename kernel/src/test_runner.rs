@@ -24144,6 +24144,15 @@ fn run_bugcheck_self_test() -> ! {
     }
     test_println!("[BUGCHECK-SELFTEST] formatters OK");
 
+    // When the dedicated re-entry test feature is enabled, advertise it
+    // so the harness can adjust its grep expectations.  The bugcheck
+    // path itself routes through `ke_bugcheck`'s `bugcheck-reentry-test`
+    // hook after emitting the full banner; that hook forces a second
+    // #PF, which re-enters the bugcheck and emits the
+    // "RE-ENTERED BUGCHECK" line via the minimal-format guard arm.
+    #[cfg(feature = "bugcheck-reentry-test")]
+    test_println!("[BUGCHECK-SELFTEST] re-entry mode: printer will fault after banner");
+
     test_println!("[BUGCHECK-SELFTEST] triggering kernel-mode page fault at 0xfffffffffffffff8");
     // Small delay so the test_println! output has time to drain before
     // the fault.  Spin (not halt) — interrupts may still be off.

@@ -52,7 +52,16 @@ use core::fmt;
 use spin::Mutex;
 
 /// COM1 base I/O port.
-const COM1: u16 = 0x3F8;
+///
+/// `pub` so the fault-immune bugcheck path in
+/// [`crate::util::no_alloc_fmt`] can reference the same constant — there
+/// must be exactly one source of truth for the UART base address, or the
+/// two paths can drift and one of them ends up talking to a different
+/// (or no) device.  This is a plain compile-time `u16` literal: it has
+/// no initialiser, no allocator dependency, and no `Mutex`-protected
+/// state, so re-exporting it does not compromise the fault-immunity
+/// contract documented in `kernel/src/ke/bugcheck.rs`.
+pub const COM1: u16 = 0x3F8;
 
 /// LSR register offset from base.
 const LSR: u16 = 5;
