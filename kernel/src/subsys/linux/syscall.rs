@@ -1541,6 +1541,24 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     .and_then(|p| p.exe_path.as_ref())
                     .map(|s| s.clone())
                     .unwrap_or_else(|| alloc::string::String::from("/bin/init"))
+            } else if path_str == "/proc/self/cwd"
+                || path_str == "/proc/self/root"
+            {
+                // /proc/self/cwd — readlink returns the process's working
+                // directory (per proc(5)).  /proc/self/root — the process's
+                // root directory; on AstryxOS this is always "/" because
+                // chroot(2) is a stub.  Mozilla / glibc both call readlink
+                // here when resolving relative paths — ENOENT/EINVAL caused
+                // them to fall back to "/" with a noisy warning.
+                let pid = crate::proc::current_pid_lockless();
+                let procs = crate::proc::PROCESS_TABLE.lock();
+                if path_str == "/proc/self/cwd" {
+                    procs.iter().find(|p| p.pid == pid)
+                        .map(|p| p.cwd.clone())
+                        .unwrap_or_else(|| alloc::string::String::from("/"))
+                } else {
+                    alloc::string::String::from("/")
+                }
             } else if path_str.starts_with("/proc/self/fd/") {
                 // /proc/self/fd/<N> — returns the open_path for fd N.
                 let fd_part = &path_str["/proc/self/fd/".len()..];
@@ -2253,7 +2271,11 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             };
             let buf = arg3 as *mut u8;
             let bufsiz = arg4 as usize;
-            // /proc/self/exe special case
+            // /proc/self/exe, /proc/self/cwd, /proc/self/root, /proc/self/fd/<N>
+            // are special-cased: they are symlinks whose targets are derived
+            // from live process state, not stored on disk.  Falling through
+            // to vfs::readlink() for these would return EINVAL on the symlink
+            // dispatch (per proc(5)).
             let target: alloc::string::String = if full_path == "/proc/self/exe" {
                 let pid = crate::proc::current_pid_lockless();
                 let procs = crate::proc::PROCESS_TABLE.lock();
@@ -2261,6 +2283,25 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     .and_then(|p| p.exe_path.as_ref())
                     .map(|s| s.clone())
                     .unwrap_or_else(|| alloc::string::String::from("/bin/init"))
+            } else if full_path == "/proc/self/cwd" {
+                let pid = crate::proc::current_pid_lockless();
+                let procs = crate::proc::PROCESS_TABLE.lock();
+                procs.iter().find(|p| p.pid == pid)
+                    .map(|p| p.cwd.clone())
+                    .unwrap_or_else(|| alloc::string::String::from("/"))
+            } else if full_path == "/proc/self/root" {
+                alloc::string::String::from("/")
+            } else if full_path.starts_with("/proc/self/fd/") {
+                let fd_part = &full_path["/proc/self/fd/".len()..];
+                let fd_num = fd_part.parse::<usize>().unwrap_or(usize::MAX);
+                let pid = crate::proc::current_pid_lockless();
+                let procs = crate::proc::PROCESS_TABLE.lock();
+                procs.iter().find(|p| p.pid == pid)
+                    .and_then(|p| p.file_descriptors.get(fd_num))
+                    .and_then(|f| f.as_ref())
+                    .map(|f| f.open_path.clone())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| alloc::format!("/dev/fd/{}", fd_num))
             } else {
                 match crate::vfs::readlink(&full_path) {
                     Ok(t) => t,
