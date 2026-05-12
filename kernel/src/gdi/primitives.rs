@@ -451,6 +451,105 @@ pub fn gradient_fill_v(
     }
 }
 
+/// Draw a horizontal gradient rectangle, interpolating from `left_color` to `right_color`.
+pub fn gradient_fill_h(
+    surface: &mut Surface,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    left_color: u32,
+    right_color: u32,
+) {
+    let width = right - left;
+    if width <= 0 || bottom <= top {
+        return;
+    }
+    let sw = surface.width() as i32;
+    let sh = surface.height() as i32;
+
+    let la = ((left_color >> 24) & 0xFF) as i32;
+    let lr = ((left_color >> 16) & 0xFF) as i32;
+    let lg = ((left_color >>  8) & 0xFF) as i32;
+    let lb = ( left_color        & 0xFF) as i32;
+
+    let ra = ((right_color >> 24) & 0xFF) as i32;
+    let rr = ((right_color >> 16) & 0xFF) as i32;
+    let rg = ((right_color >>  8) & 0xFF) as i32;
+    let rb = ( right_color        & 0xFF) as i32;
+
+    for col in 0..width {
+        let x = left + col;
+        if x < 0 || x >= sw {
+            continue;
+        }
+        let a = (la + (ra - la) * col / width).clamp(0, 255) as u32;
+        let r = (lr + (rr - lr) * col / width).clamp(0, 255) as u32;
+        let g = (lg + (rg - lg) * col / width).clamp(0, 255) as u32;
+        let b = (lb + (rb - lb) * col / width).clamp(0, 255) as u32;
+        let color = (a << 24) | (r << 16) | (g << 8) | b;
+        for y in top..bottom {
+            if y >= 0 && y < sh {
+                surface.set_pixel(x as u32, y as u32, color);
+            }
+        }
+    }
+}
+
+/// Draw `count` concentric ring outlines (circles) centered at `(cx, cy)`.
+///
+/// The innermost ring has radius `start_r`; successive rings are spaced `spacing`
+/// pixels apart.  Color is linearly interpolated from `inner_color` to `outer_color`.
+/// Each ring is drawn as a 1-pixel-wide ellipse outline (circle: rx == ry).
+pub fn draw_concentric_rings(
+    surface: &mut Surface,
+    cx: i32,
+    cy: i32,
+    start_r: i32,
+    spacing: i32,
+    count: u32,
+    inner_color: u32,
+    outer_color: u32,
+) {
+    if count == 0 || spacing <= 0 {
+        return;
+    }
+
+    // Decompose colors for interpolation.
+    let ia = ((inner_color >> 24) & 0xFF) as i32;
+    let ir = ((inner_color >> 16) & 0xFF) as i32;
+    let ig = ((inner_color >>  8) & 0xFF) as i32;
+    let ib = ( inner_color        & 0xFF) as i32;
+
+    let oa = ((outer_color >> 24) & 0xFF) as i32;
+    let or_ = ((outer_color >> 16) & 0xFF) as i32;
+    let og = ((outer_color >>  8) & 0xFF) as i32;
+    let ob = ( outer_color        & 0xFF) as i32;
+
+    // Minimal DC for the outline call.
+    use super::dc::{DeviceContext, Pen, Brush, PenStyle, BrushStyle};
+
+    for i in 0..count {
+        let t = i as i32;
+        let n = (count - 1).max(1) as i32;
+        let a = (ia + (oa - ia) * t / n).clamp(0, 255) as u32;
+        let r = (ir + (or_ - ir) * t / n).clamp(0, 255) as u32;
+        let g = (ig + (og - ig) * t / n).clamp(0, 255) as u32;
+        let b = (ib + (ob - ib) * t / n).clamp(0, 255) as u32;
+        let color = (a << 24) | (r << 16) | (g << 8) | b;
+
+        let radius = start_r + i as i32 * spacing;
+        if radius <= 0 {
+            continue;
+        }
+
+        let mut dc = DeviceContext::new(0);
+        dc.pen   = Pen   { style: PenStyle::Solid, width: 1, color };
+        dc.brush = Brush { style: BrushStyle::Null, color: 0 };
+        draw_ellipse_outline(surface, &dc, cx, cy, radius, radius);
+    }
+}
+
 /// Draw a rounded rectangle: outline with DC's pen, fill with DC's brush.
 ///
 /// `radius` is the corner circle radius.
