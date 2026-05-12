@@ -50,6 +50,10 @@ pub const TRAMPOLINE_LINUX_OFFSET: u64 = 16;
 /// Physical address of the trampoline page (set once during init).
 static TRAMPOLINE_PHYS: AtomicU64 = AtomicU64::new(0);
 
+/// Counts how many times signal_check_on_syscall_return took the fast path
+/// (no pending signals, no PROCESS_TABLE lock acquired).  Used by Test 201.
+pub static SIGNAL_FAST_PATH_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Signal frame pushed onto the user stack when delivering a signal to a
 /// user-mode handler.  The handler sees RSP pointing at `restorer` (which
 /// acts as its return address).  On `ret`, execution jumps to the trampoline
@@ -140,6 +144,14 @@ impl SignalState {
         }
     }
 
+    /// Queue a signal and update the fast-path hint for `pid`.
+    pub fn send_for_pid(&mut self, sig: u8, pid: u64) {
+        if sig > 0 && sig < MAX_SIGNAL {
+            self.pending |= 1u64 << sig;
+            crate::proc::signal_pending_hint_set(pid, self.pending);
+        }
+    }
+
     /// Dequeue the highest-priority deliverable signal.
     /// Returns the signal number if one is pending and not blocked.
     pub fn dequeue(&mut self) -> Option<u8> {
@@ -150,6 +162,16 @@ impl SignalState {
         // Find lowest set bit
         let sig = deliverable.trailing_zeros() as u8;
         self.pending &= !(1u64 << sig);
+        Some(sig)
+    }
+
+    /// Dequeue and clear the fast-path hint for `pid`.
+    pub fn dequeue_for_pid(&mut self, pid: u64) -> Option<u8> {
+        let deliverable = self.pending & !self.blocked;
+        if deliverable == 0 { return None; }
+        let sig = deliverable.trailing_zeros() as u8;
+        self.pending &= !(1u64 << sig);
+        crate::proc::signal_pending_hint_set(pid, self.pending);
         Some(sig)
     }
 
@@ -256,8 +278,9 @@ pub fn kill(target_pid: u64, sig: u8) -> i64 {
         for proc in procs.iter_mut() {
             if proc.pgid == pgid && proc.state != crate::proc::ProcessState::Zombie {
                 found = true;
+                let pid = proc.pid;
                 if let Some(ref mut ss) = proc.signal_state {
-                    ss.send(sig);
+                    ss.send_for_pid(sig, pid);
                 }
             }
         }
@@ -281,7 +304,7 @@ pub fn kill(target_pid: u64, sig: u8) -> i64 {
     };
 
     if let Some(ref mut sig_state) = proc.signal_state {
-        sig_state.send(sig);
+        sig_state.send_for_pid(sig, target_pid);
     } else {
         // No signal state — handle default action directly
         match SignalState::default_action(sig) {
@@ -313,7 +336,7 @@ pub fn check_signals() -> bool {
         None => return false,
     };
 
-    let sig = match sig_state.dequeue() {
+    let sig = match sig_state.dequeue_for_pid(pid) {
         Some(s) => s,
         None => return false,
     };
@@ -362,7 +385,7 @@ pub fn check_signals() -> bool {
             // If we reach here (called from scheduler), just log and skip.
             crate::serial_println!("[SIGNAL] Process {} has handler for signal {} (delivery via syscall return path)", pid, sig);
             // Re-queue the signal so the syscall-return path can pick it up.
-            sig_state.send(sig);
+            sig_state.send_for_pid(sig, pid);
             false
         }
     }
@@ -399,9 +422,19 @@ pub fn check_signals() -> bool {
 /// stub can place it in RDI.  Returns 0 when no signal was delivered.
 #[no_mangle]
 pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
+    // ── Lock-free fast path ─────────────────────────────────────────────────
+    // Read the per-PID hint atomically (Acquire) before touching any lock.
+    // If the hint is zero, no signals are pending: Release store in
+    // send_for_pid/dequeue_for_pid guarantees visibility.
+    let pid = crate::proc::current_pid_lockless();
+    if crate::proc::signal_pending_hint_get(pid) == 0 {
+        SIGNAL_FAST_PATH_COUNT.fetch_add(1, Ordering::Relaxed);
+        return 0;
+    }
+
+    // ── Slow path: at least one signal may be pending ───────────────────────
     let pid = crate::proc::current_pid();
 
-    // Fast path: most syscalls have no pending signals.
     let mut procs = crate::proc::PROCESS_TABLE.lock();
     let proc_entry = match procs.iter_mut().find(|p| p.pid == pid) {
         Some(p) => p,
@@ -416,11 +449,7 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
         None => return 0,
     };
 
-    if !sig_state.has_pending() {
-        return 0;
-    }
-
-    let sig = match sig_state.dequeue() {
+    let sig = match sig_state.dequeue_for_pid(pid) {
         Some(s) => s,
         None => return 0,
     };
