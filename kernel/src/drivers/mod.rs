@@ -18,6 +18,8 @@ pub mod pty;
 pub mod tty;
 pub mod usb;
 pub mod virtio_blk;
+#[cfg(feature = "qga")]
+pub mod virtio_serial;
 pub mod vmware_svga;
 
 use astryx_shared::BootInfo;
@@ -40,6 +42,12 @@ pub fn init(boot_info: &BootInfo) {
     usb::init();
     if virtio_blk::init() {
         crate::serial_println!("[DRIVERS] Virtio-blk initialized");
+    }
+    #[cfg(feature = "qga")]
+    {
+        if virtio_serial::init() {
+            crate::serial_println!("[DRIVERS] Virtio-serial initialized (/dev/vport0p0)");
+        }
     }
     // Note: vmware_svga::init() is called later in Phase 10b (after PCI init)
     crate::serial_println!("[DRIVERS] All drivers initialized");
