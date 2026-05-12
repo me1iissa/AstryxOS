@@ -237,8 +237,8 @@ pub fn dispatch(
             crate::syscall::sys_unlink(arg1 as *const u8, arg2 as usize)
         }
         SYS_GETRANDOM => {
-            // getrandom(buf, count) -> count or -errno
-            crate::syscall::sys_getrandom(arg1 as *mut u8, arg2 as usize)
+            // getrandom(buf, count, flags) -> count or -errno
+            crate::syscall::sys_getrandom(arg1 as *mut u8, arg2 as usize, arg3 as u32)
         }
         SYS_KILL => {
             // kill(pid, sig) -> 0 or -errno

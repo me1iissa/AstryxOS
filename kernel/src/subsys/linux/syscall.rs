@@ -1900,7 +1900,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             0
         }
         // 318: getrandom(buf, buflen, flags)
-        318 => crate::syscall::sys_getrandom(arg1 as *mut u8, arg2 as usize),
+        318 => crate::syscall::sys_getrandom(arg1 as *mut u8, arg2 as usize, arg3 as u32),
         // 324: membarrier(cmd, flags, cpu_id)
         // Used by glibc's rseq fallback path and by jemalloc.
         // MEMBARRIER_CMD_QUERY (0)             — return supported command bitmask
