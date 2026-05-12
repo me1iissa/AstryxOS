@@ -158,15 +158,30 @@ def _boot_disk_args(esp_dir: str) -> list[str]:
     return ["-drive", f"format=raw,file=fat:rw:{esp_dir}"]
 
 
-def _data_disk_args(data_img: str) -> list[str]:
+def _data_disk_args(data_img: str, warn_on_missing: bool = False) -> list[str]:
     """
     Canonical data-disk attachment: virtio-blk-pci with snapshot=on.
 
     Returns an empty list if `data_img` is missing — callers that
     require the data disk (e.g. firefox-test mode) must check for its
     presence themselves and error out before calling this function.
+
+    NOTE (W13/W15 incident): when `data_img` is absent, this function
+    silently returns [] and QEMU boots without /disk. In firefox-test
+    mode the guest then wedges at sc=0/pf=0 with no diagnostic output.
+    The root cause is agent worktrees omitting the .gitignored
+    build/data.img. `qemu-harness.py::cmd_start` now emits a banner
+    WARNING and attempts an auto-symlink when data_img is missing; set
+    `warn_on_missing=True` (as cmd_start does) to also print to stderr
+    here.
     """
+    import sys as _sys
     if not data_img or not Path(data_img).exists():
+        if warn_on_missing:
+            print(
+                f"[astryx_qemu] WARNING: data disk image not found: {data_img}",
+                file=_sys.stderr,
+            )
         return []
     return [
         "-drive", f"file={data_img},format=raw,if=none,id=data0,snapshot=on",
@@ -262,6 +277,7 @@ def build_qemu_cmd(
     show_window: bool = False,
     extra_args: Optional[list[str]] = None,
     cpu_override: Optional[str] = None,
+    warn_on_missing_data_img: bool = False,
 ) -> list[str]:
     """
     Return the full argv for `qemu-system-x86_64` for an AstryxOS test run.
@@ -287,6 +303,9 @@ def build_qemu_cmd(
         running headless.
       extra_args:  Appended verbatim to the final argv — an escape
         hatch for per-launcher quirks. Prefer a new kwarg.
+      warn_on_missing_data_img: If True, print a stderr warning when
+        `data_img` does not exist. Set by `qemu-harness.py` which also
+        emits a full banner and attempts an auto-symlink.
 
     The returned list is safe to pass to `subprocess.Popen` without
     shell quoting.
@@ -315,7 +334,7 @@ def build_qemu_cmd(
     cmd += _display_args(mode, show_window)
     cmd += _firmware_args(ovmf_code, ovmf_vars)
     cmd += _boot_disk_args(esp_dir)
-    cmd += _data_disk_args(data_img)
+    cmd += _data_disk_args(data_img, warn_on_missing=warn_on_missing_data_img)
     cmd += _net_args()
     cmd += _gdb_args(gdb_port, gdb_wait)
 
