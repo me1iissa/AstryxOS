@@ -712,7 +712,7 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
         &envp_strs
     };
 
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
 
     // Check if the current process has a VmSpace (user-mode caller).
     // If not, fall back to creating a new process (kernel-mode caller).
@@ -955,7 +955,7 @@ pub(crate) fn sys_fork_impl(clone_flags: u64, child_tidptr: u64) -> i64 {
     const CLONE_CHILD_SETTID: u64 = 0x01000000;
     const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
 
-    let parent_pid = crate::proc::current_pid();
+    let parent_pid = crate::proc::current_pid_lockless();
     let parent_tid = crate::proc::current_tid();
 
     // Capture parent's callee-saved regs from the syscall entry frame BEFORE
@@ -1089,7 +1089,7 @@ pub(crate) fn write_u32_to_user(cr3: u64, vaddr: u64, val: u32) {
 ///
 /// Returns the PID of the process that changed state, or negative errno.
 pub(crate) fn sys_waitpid(pid: i64, options: u32) -> i64 {
-    let parent_pid = crate::proc::current_pid();
+    let parent_pid = crate::proc::current_pid_lockless();
     let wnohang = (options & 1) != 0; // WNOHANG = 1
 
     crate::serial_println!("[SYSCALL] waitpid({}, opts=0x{:x}) from PID {}", pid, options, parent_pid);
@@ -1146,7 +1146,7 @@ pub(crate) fn sys_ioctl(fd_num: usize, request: u64, arg_ptr: *mut u8) -> i64 {
 
     // Look up the fd's open_path and file_type.
     let (open_path, file_type, inode) = {
-        let pid = crate::proc::current_pid();
+        let pid = crate::proc::current_pid_lockless();
         let procs = crate::proc::PROCESS_TABLE.lock();
         let fd_opt = procs.iter()
             .find(|p| p.pid == pid)
@@ -1453,7 +1453,7 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
     }
 
     let length = page_align_up(length);
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
 
     // MAP_FIXED_NOREPLACE (Linux 4.17+, flag 0x100000): like MAP_FIXED but the
     // kernel should return EEXIST if the range is already mapped.  Modern glibc
@@ -1738,7 +1738,7 @@ pub(crate) fn sys_munmap(addr: u64, length: u64) -> i64 {
     }
 
     let length = page_align_up(length);
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
 
     // ── Phase 1 (lock) — capture cr3 AND remove the VMA records first. ────
     //
@@ -1780,7 +1780,7 @@ pub(crate) fn sys_munmap(addr: u64, length: u64) -> i64 {
 /// If `new_brk` is 0, returns the current break.
 /// Otherwise sets the break and returns the new value.
 pub(crate) fn sys_brk(new_brk: u64) -> i64 {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
 
     let mut procs = crate::proc::PROCESS_TABLE.lock();
     let proc = match procs.iter_mut().find(|p| p.pid == pid) {
@@ -1803,7 +1803,7 @@ pub(crate) fn sys_brk(new_brk: u64) -> i64 {
 // ===== Identity / credential syscalls =======================================
 
 pub(crate) fn sys_getppid() -> i64 {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let procs = crate::proc::PROCESS_TABLE.lock();
     match procs.iter().find(|p| p.pid == pid) {
         Some(p) => p.parent_pid as i64,
@@ -1812,7 +1812,7 @@ pub(crate) fn sys_getppid() -> i64 {
 }
 
 pub(crate) fn sys_getuid() -> i64 {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let procs = crate::proc::PROCESS_TABLE.lock();
     match procs.iter().find(|p| p.pid == pid) {
         Some(p) => p.uid as i64,
@@ -1821,7 +1821,7 @@ pub(crate) fn sys_getuid() -> i64 {
 }
 
 pub(crate) fn sys_getgid() -> i64 {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let procs = crate::proc::PROCESS_TABLE.lock();
     match procs.iter().find(|p| p.pid == pid) {
         Some(p) => p.gid as i64,
@@ -1830,7 +1830,7 @@ pub(crate) fn sys_getgid() -> i64 {
 }
 
 pub(crate) fn sys_geteuid() -> i64 {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let procs = crate::proc::PROCESS_TABLE.lock();
     match procs.iter().find(|p| p.pid == pid) {
         Some(p) => p.euid as i64,
@@ -1839,7 +1839,7 @@ pub(crate) fn sys_geteuid() -> i64 {
 }
 
 pub(crate) fn sys_getegid() -> i64 {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let procs = crate::proc::PROCESS_TABLE.lock();
     match procs.iter().find(|p| p.pid == pid) {
         Some(p) => p.egid as i64,
@@ -1848,7 +1848,7 @@ pub(crate) fn sys_getegid() -> i64 {
 }
 
 pub(crate) fn sys_umask(new_mask: u32) -> i64 {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let mut procs = crate::proc::PROCESS_TABLE.lock();
     match procs.iter_mut().find(|p| p.pid == pid) {
         Some(p) => {
@@ -1867,7 +1867,7 @@ pub(crate) fn sys_getcwd(buf: *mut u8, size: usize) -> i64 {
         return -22; // EINVAL
     }
 
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let procs = crate::proc::PROCESS_TABLE.lock();
     let proc = match procs.iter().find(|p| p.pid == pid) {
         Some(p) => p,
@@ -1906,7 +1906,7 @@ pub(crate) fn sys_chdir(path_ptr: *const u8, path_len: usize) -> i64 {
         Err(e) => return crate::subsys::linux::errno::vfs_err(e),
     }
 
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let mut procs = crate::proc::PROCESS_TABLE.lock();
     match procs.iter_mut().find(|p| p.pid == pid) {
         Some(p) => {
@@ -2004,7 +2004,7 @@ pub(crate) fn sys_stat(path_ptr: *const u8, path_len: usize, stat_buf: *mut u8) 
 }
 
 pub(crate) fn sys_fstat(fd_num: usize, stat_buf: *mut u8) -> i64 {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let procs = crate::proc::PROCESS_TABLE.lock();
     let proc = match procs.iter().find(|p| p.pid == pid) {
         Some(p) => p,
@@ -2049,7 +2049,7 @@ pub(crate) fn sys_fstat(fd_num: usize, stat_buf: *mut u8) -> i64 {
 }
 
 pub(crate) fn sys_lseek(fd_num: usize, offset: i64, whence: u32) -> i64 {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let mut procs = crate::proc::PROCESS_TABLE.lock();
     let proc = match procs.iter_mut().find(|p| p.pid == pid) {
         Some(p) => p,
@@ -2095,7 +2095,7 @@ pub(crate) fn sys_lseek(fd_num: usize, offset: i64, whence: u32) -> i64 {
 }
 
 pub(crate) fn sys_dup(old_fd: usize) -> i64 {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let mut procs = crate::proc::PROCESS_TABLE.lock();
     let proc = match procs.iter_mut().find(|p| p.pid == pid) {
         Some(p) => p,
@@ -2129,7 +2129,7 @@ pub(crate) fn sys_dup(old_fd: usize) -> i64 {
 }
 
 pub(crate) fn sys_dup2(old_fd: usize, new_fd: usize) -> i64 {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let mut procs = crate::proc::PROCESS_TABLE.lock();
     let proc = match procs.iter_mut().find(|p| p.pid == pid) {
         Some(p) => p,
@@ -2168,7 +2168,7 @@ pub(crate) fn sys_pipe(fds_out: *mut u64) -> i64 {
     }
 
     let pipe_id = crate::ipc::pipe::create_pipe();
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
 
     let mut procs = crate::proc::PROCESS_TABLE.lock();
     let proc = match procs.iter_mut().find(|p| p.pid == pid) {
@@ -2590,7 +2590,7 @@ pub(crate) fn sys_sigaction(sig: u8, handler_addr: u64) -> i64 {
         return -22; // EINVAL — can't change SIGKILL/SIGSTOP
     }
 
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let mut procs = crate::proc::PROCESS_TABLE.lock();
     let proc = match procs.iter_mut().find(|p| p.pid == pid) {
         Some(p) => p,
@@ -2617,7 +2617,7 @@ pub(crate) fn sys_sigprocmask(how: u32, new_mask: u64) -> i64 {
     const SIG_UNBLOCK: u32 = 1;
     const SIG_SETMASK: u32 = 2;
 
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let mut procs = crate::proc::PROCESS_TABLE.lock();
     let proc = match procs.iter_mut().find(|p| p.pid == pid) {
         Some(p) => p,
@@ -2690,7 +2690,7 @@ pub(crate) fn sys_sigreturn() -> i64 {
 
     // Restore the blocked-signal mask.
     {
-        let pid = crate::proc::current_pid();
+        let pid = crate::proc::current_pid_lockless();
         let mut procs = crate::proc::PROCESS_TABLE.lock();
         if let Some(proc_entry) = procs.iter_mut().find(|p| p.pid == pid) {
             if let Some(ref mut ss) = proc_entry.signal_state {
@@ -2888,7 +2888,7 @@ pub fn sys_write_test(fd_num: usize, buf: *const u8, count: usize) -> i64 {
 
 /// Close file descriptor `fd_num` in the current process.
 pub fn sys_close_test(fd_num: usize) -> i64 {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     match crate::vfs::close(pid, fd_num) {
         Ok(()) => 0,
         Err(e) => crate::subsys::linux::errno::vfs_err(e),
