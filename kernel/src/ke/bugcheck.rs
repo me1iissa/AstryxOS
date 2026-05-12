@@ -271,6 +271,21 @@ pub fn ke_bugcheck(code: u32, p1: u64, p2: u64, p3: u64, p4: u64) -> ! {
     if BUGCHECK_REENTRY.swap(true, Ordering::AcqRel) {
         bugcheck_serial_write_str(
             "\n*** AETHER KERNEL BUGCHECK *** RE-ENTERED BUGCHECK — halting CPU\n");
+        // In test-mode, exit QEMU from the re-entry path too so the
+        // `bugcheck-reentry-test` harness can capture the banner and
+        // verify behaviour without QEMU spinning until its hard timeout.
+        // The same isa-debug-exit write is used by the normal exit
+        // sequence below; doing it here keeps the re-entry path one
+        // straight line of byte writes — no allocator, no `format!`,
+        // no `Display::fmt`.
+        #[cfg(feature = "test-mode")]
+        {
+            // SAFETY: writing to the isa-debug-exit port is the
+            // standard test-harness escape hatch; absent device is a
+            // no-op fall-through.  Exit code `1` produces QEMU status
+            // (1*2)+1 = 3 (the canonical bugcheck-failure code).
+            unsafe { crate::hal::outl(0xF4, 1); }
+        }
         loop { unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)); } }
     }
 
@@ -415,7 +430,34 @@ pub fn ke_bugcheck(code: u32, p1: u64, p2: u64, p3: u64, p4: u64) -> ! {
     bugcheck_serial_write_str(
         "================================================================================\n");
 
-    // ── Step 8: exit or halt ─────────────────────────────────────────
+    // ── Step 8a: deliberate re-entry under bugcheck-reentry-test ─────
+    // The PR #127 review asked for a direct test that the re-entrancy
+    // guard fires when the printer itself faults *after* the first
+    // banner has been emitted.  We can synthesise that condition by
+    // taking a fresh #PF here — the IDT handler will route back into
+    // `ke_bugcheck`, the `BUGCHECK_REENTRY.swap(true)` at the top
+    // returns the previously-set true, and the minimal "RE-ENTERED
+    // BUGCHECK" line is emitted from the guard arm.  This path is
+    // gated behind its own feature so it never compiles into release
+    // or default-test-mode kernels.
+    #[cfg(feature = "bugcheck-reentry-test")]
+    {
+        bugcheck_serial_write_str(
+            "[BUGCHECK-REENTRY-TEST] forcing printer fault to exercise re-entry guard\n");
+        // SAFETY: deliberate fault — same shape as the initial trigger.
+        // We write to a non-canonical kernel address so the IDT routes
+        // back through `ke_bugcheck`.  Volatile so the optimiser
+        // cannot elide it.
+        unsafe {
+            let bad: *mut u64 = 0xFFFF_FFFF_FFFF_FFE0u64 as *mut u64;
+            core::ptr::write_volatile(bad, 0xDEAD_BEEF_C0FE_BABEu64);
+        }
+        // Unreachable in practice — control transfers to the IDT.
+        bugcheck_serial_write_str(
+            "[BUGCHECK-REENTRY-TEST] FATAL: synthetic fault did not trap\n");
+    }
+
+    // ── Step 8b: exit or halt ────────────────────────────────────────
     #[cfg(feature = "test-mode")]
     {
         bugcheck_serial_write_str("[BUGCHECK] test-mode: exiting QEMU (code 3)\n");

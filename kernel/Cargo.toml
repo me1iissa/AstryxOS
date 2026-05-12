@@ -56,6 +56,17 @@ ci-skip-test-104 = []
 # vCPU on completion (the bugcheck path exits QEMU via isa-debug-exit
 # in test-mode), so this feature is OFF by default.
 bugcheck-test = []
+# PR #127 review caveat: direct test of the re-entrancy guard inside
+# `ke::bugcheck`.  When enabled, the bugcheck printer takes a fresh
+# deliberate #PF *after* it has emitted its full banner, re-entering
+# `ke_bugcheck`; the entry-point guard then emits a single
+# "RE-ENTERED BUGCHECK" line and exits QEMU.  The harness verifies the
+# RE-ENTERED line is present in the serial log and the QEMU exit code
+# is the bugcheck-failure code.  Like `bugcheck-test`, this feature
+# is mutually exclusive with a clean test-suite pass (the bugcheck
+# path exits QEMU before the normal suite finishes), so it is OFF
+# by default and gated behind its own CI job.
+bugcheck-reentry-test = ["bugcheck-test"]
 # Detailed stack dump (128 words from RSP) on every FUTEX_WAIT registration.
 # Expensive under IRQs-off (~130ms cli per FUTEX_WAIT); disabled by default
 # even in firefox-test. Use `--features futex-wait-scan` explicitly when

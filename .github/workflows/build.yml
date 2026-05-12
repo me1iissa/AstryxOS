@@ -58,6 +58,16 @@ jobs:
       - name: rustfmt (advisory only — won't fail the build)
         run: cargo +nightly fmt --all -- --check || true
 
+      # PR #127 caveat: enforce the fault-immunity contract for
+      # `ke::bugcheck` and `util::no_alloc_fmt` — these two files must
+      # remain allocator-free and serial-mutex-free.  A grep-based
+      # lint is sufficient: any `format!`, `String`, `Box`,
+      # `serial_println!`, `vec!`, `panic!`, or `alloc::*` use here
+      # silently defeats the bugcheck banner contract.  Failing this
+      # step gates the PR.
+      - name: check fault-immunity tokens (ke::bugcheck + no_alloc_fmt)
+        run: bash scripts/check_fault_immune.sh
+
   kernel-build:
     name: bootloader + kernel builds
     runs-on: ubuntu-latest
