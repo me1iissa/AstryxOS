@@ -326,8 +326,10 @@ pub fn get_current_kernel_rsp() -> u64 {
 /// with its true APIC ID (read via LAPIC MMIO while the kernel CR3 is still
 /// active) at the very start of `ap_rust_entry()`.
 ///
-/// After this call `current_apic_id()` returns the correct per-CPU index from
-/// `rdmsr(IA32_TSC_AUX)`, which works regardless of which CR3 is loaded.
+/// After this call `cpu_index()` / `current_apic_id()` return the correct
+/// per-CPU index via `RDTSCP` (which reads `IA32_TSC_AUX` into ECX without
+/// a VMEXIT — see `arch::x86_64::apic::cpu_index` for the rationale).
+/// That path works regardless of which CR3 is loaded.
 pub fn set_per_cpu_id(cpu_id: u8) {
     unsafe {
         crate::hal::wrmsr(0xC000_0103, cpu_id as u64);

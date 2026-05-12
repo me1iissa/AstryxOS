@@ -1388,6 +1388,15 @@ pub fn run() -> ! {
     total += 1;
     if test_af_inet_socket_cloexec_nonblock() { passed += 1; }
 
+    // ── Test 205: cpu_index() RDTSCP fast path — KVM VMEXIT regression ────
+    // Verifies that `arch::x86_64::apic::cpu_index()` uses the RDTSCP
+    // instruction (not RDMSR(IA32_TSC_AUX), which traps as a VMEXIT under
+    // KVM at ≈46k cycles/call).  Asserts both correctness (returned index
+    // in [0, MAX_CPUS)) and cost (< 200 cycles/call, leaving massive
+    // headroom over the expected ~30 cyc).
+    total += 1;
+    if test_cpu_index_rdtscp_microbench() { passed += 1; }
+
     // (Tests 199/200 run earlier — right after Test 80c — so the vDSO
     // TSC fast path is verified before the slow PNG screenshot test.
     // Stream-A pipe / eventfd wake-hook tests run first — see Tests
@@ -24444,6 +24453,87 @@ fn test_af_inet_socket_cloexec_nonblock() -> bool {
         getfd_both, getfl_both);
 
     test_pass!("socket(2) AF_INET SOCK_CLOEXEC+SOCK_NONBLOCK (PR #129 caveat)");
+    true
+}
+
+// ── Test 205: cpu_index() RDTSCP fast path — KVM VMEXIT regression ─────────
+//
+// Background: `arch::x86_64::apic::cpu_index()` was reading IA32_TSC_AUX via
+// `RDMSR`, which under KVM unconditionally traps as a VMEXIT (cost ≈46,000
+// cycles per call on the AstryxOS CI host).  Because `cpu_index()` is called
+// ~5-10× per Linux syscall (via `current_pid_lockless` and friends), a 10k-
+// syscalls/sec workload would burn ≈1.25 s of every wall-second on CPU-id
+// lookups alone.  Intel SDM Vol 2B documents `RDTSCP` as a non-trapping read
+// of `IA32_TSC_AUX` (returned in ECX); switching to `RDTSCP` brings the cost
+// to ≈30 cycles/call (≈1,500× speedup).
+//
+// This test microbenches `cpu_index()` and asserts:
+//   1. correctness — returned index is in `[0, MAX_CPUS)`;
+//   2. cost — average cycles per call is well under 200 (target ~30 cyc;
+//      pre-fix was ≈46,477 cyc under KVM, so 200 is a generous ceiling that
+//      still falsifies any accidental return to the RDMSR path).
+//
+// Iteration count (200,000) was chosen to amortise rdtsc-bracket overhead
+// to << 1 cyc/iteration while remaining a tiny fraction of a wall second
+// even at the slow (pre-fix) cost.
+fn test_cpu_index_rdtscp_microbench() -> bool {
+    test_header!("cpu_index() RDTSCP fast path (KVM VMEXIT regression)");
+
+    let rdtsc = || -> u64 {
+        let (lo, hi): (u32, u32);
+        unsafe {
+            core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi,
+                             options(nomem, nostack, preserves_flags));
+        }
+        ((hi as u64) << 32) | (lo as u64)
+    };
+
+    // Correctness probe first — a single call to surface a wrong-value
+    // failure (e.g. uninitialised IA32_TSC_AUX) without burying it in the
+    // benchmark output.
+    let probe = crate::arch::x86_64::apic::cpu_index();
+    if probe >= crate::arch::x86_64::apic::MAX_CPUS {
+        test_fail!("cpu_index_rdtscp_microbench",
+            "cpu_index() returned {} (>= MAX_CPUS); RDTSCP/IA32_TSC_AUX init broken",
+            probe);
+        return false;
+    }
+    test_println!("  cpu_index() = {} (in [0, MAX_CPUS)) ✓", probe);
+
+    const ITERS: u64 = 200_000;
+
+    // Warm up — pull instruction cache + branch predictor.  Read each
+    // return via core::hint::black_box so the optimiser can't elide the
+    // call into a constant.
+    for _ in 0..1024u32 {
+        let v = crate::arch::x86_64::apic::cpu_index();
+        let _ = core::hint::black_box(v);
+    }
+
+    let t0 = rdtsc();
+    for _ in 0..ITERS {
+        let v = crate::arch::x86_64::apic::cpu_index();
+        let _ = core::hint::black_box(v);
+    }
+    let t1 = rdtsc();
+
+    let cycles_total = t1.wrapping_sub(t0);
+    let cycles_per_call = cycles_total / ITERS;
+    test_println!("  {} iters in {} cyc — {} cyc/call",
+        ITERS, cycles_total, cycles_per_call);
+
+    // Generous ceiling.  RDTSCP target is ~30 cyc.  Pre-fix RDMSR-via-
+    // VMEXIT was ≈46,477 cyc/call under KVM and ≈30 cyc/call under TCG.
+    // 200 cyc cleanly separates the two regimes on either accelerator.
+    const CEILING: u64 = 200;
+    if cycles_per_call >= CEILING {
+        test_fail!("cpu_index_rdtscp_microbench",
+            "cpu_index() costs {} cyc/call (ceiling {}) — likely VMEXIT path back",
+            cycles_per_call, CEILING);
+        return false;
+    }
+
+    test_pass!("cpu_index() RDTSCP fast path (KVM VMEXIT regression)");
     true
 }
 
