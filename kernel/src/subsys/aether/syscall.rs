@@ -122,6 +122,33 @@ pub fn dispatch(
             };
 
             let pid = crate::proc::current_pid();
+
+            // ── /dev/vport0p0 — QGA transport routing (Phase QGA-2) ─────
+            // The native AstryxOS QGA daemon (userspace/qga/) opens
+            // /dev/vport0p0 via this syscall.  Mirror the Linux subsystem's
+            // bit-22 tagging so the existing VFS dispatch in fd_read /
+            // fd_write forwards bytes to the virtio-serial driver.  Without
+            // the tag a regular VFS file read would be attempted and the
+            // daemon would never see host JSON frames.
+            #[cfg(feature = "qga")]
+            if path == "/dev/vport0p0" {
+                if !crate::drivers::virtio_serial::is_available() {
+                    return -19; // ENODEV
+                }
+                match crate::vfs::open(pid, path, flags) {
+                    Ok(fd_num) => {
+                        let mut procs = crate::proc::PROCESS_TABLE.lock();
+                        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                            if let Some(Some(f)) = p.file_descriptors.get_mut(fd_num) {
+                                f.flags |= 0x0040_0000;
+                            }
+                        }
+                        return fd_num as i64;
+                    }
+                    Err(e) => return crate::subsys::linux::errno::vfs_err(e),
+                }
+            }
+
             match crate::vfs::open(pid, path, flags) {
                 Ok(fd) => fd as i64,
                 Err(e) => crate::subsys::linux::errno::vfs_err(e),
