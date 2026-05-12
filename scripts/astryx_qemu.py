@@ -221,6 +221,28 @@ def _gdb_args(gdb_port: Optional[int], gdb_wait: bool) -> list[str]:
     return args
 
 
+def _qga_args(qga_sock: Optional[str]) -> list[str]:
+    """
+    QEMU CLI fragment exposing a virtio-serial port for the QEMU Guest Agent
+    (QGA) transport.  Three pieces:
+
+      -chardev socket,id=qga0,path=...,server=on,wait=off
+      -device virtio-serial-pci,id=vio-serial0
+      -device virtserialport,chardev=qga0,name=org.qemu.guest_agent.0
+
+    The named-port string is the QGA well-known name; QEMU routes the
+    Unix-socket chardev to that port in the multiport virtio-console
+    handshake.  See virtio 1.2 §5.3.  Returns [] when `qga_sock` is None.
+    """
+    if not qga_sock:
+        return []
+    return [
+        "-chardev", f"socket,id=qga0,path={qga_sock},server=on,wait=off",
+        "-device", "virtio-serial-pci,id=vio-serial0",
+        "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
+    ]
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def build_qemu_cmd(
@@ -233,6 +255,7 @@ def build_qemu_cmd(
     ovmf_vars: str,
     esp_dir: Optional[str] = None,
     qmp_sock: Optional[str] = None,
+    qga_sock: Optional[str] = None,
     gdb_port: Optional[int] = None,
     gdb_wait: bool = False,
     kvm: Optional[bool] = None,
@@ -288,6 +311,7 @@ def build_qemu_cmd(
     cmd += _serial_args(serial_path)
     cmd += _ISA_DEBUG_EXIT
     cmd += _qmp_args(qmp_sock)
+    cmd += _qga_args(qga_sock)
     cmd += _display_args(mode, show_window)
     cmd += _firmware_args(ovmf_code, ovmf_vars)
     cmd += _boot_disk_args(esp_dir)

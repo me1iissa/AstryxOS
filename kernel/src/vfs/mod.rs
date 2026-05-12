@@ -390,6 +390,12 @@ pub fn init() {
     let _ = mkdir("/dev/dri");
     let _ = create_file("/dev/dri/card0");
 
+    // virtio-serial port 0 (QGA transport, Phase QGA-1).  The node is always
+    // created so userspace probes get -ENODEV from the open path when QGA
+    // was not compiled in or the device was not discovered, rather than
+    // -ENOENT.
+    let _ = create_file("/dev/vport0p0");
+
     // Create /etc/hostname with default content.
     if let Ok(()) = create_file("/etc/hostname") {
         let _ = write_file("/etc/hostname", b"astryx\n");
@@ -1548,6 +1554,16 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
                 }
                 return Ok(count);
             }
+            // bit 22 = /dev/vport0p0 → drain bytes from virtio-serial rx queue.
+            // Non-blocking: WouldBlock when the device has nothing to deliver,
+            // mirroring how PTY reads signal "no data yet".  See virtio 1.2 §5.3.
+            #[cfg(feature = "qga")]
+            if flags & 0x0040_0000 != 0 {
+                let slice = unsafe { core::slice::from_raw_parts_mut(buf, count) };
+                let n = crate::drivers::virtio_serial::read(slice);
+                if n == 0 { return Err(VfsError::WouldBlock); }
+                return Ok(n);
+            }
 
             // ── Dynamic /proc entries ──────────────────────────────────────────
             // C4: /proc/<N>/... paths store the original path in open_path; parse
@@ -1838,6 +1854,14 @@ pub fn fd_write(pid: crate::proc::Pid, fd_num: usize, buf: *const u8, count: usi
     // producing 16-bit little-endian stereo PCM at the configured rate).
     if fd_flags & 0x0080_0000 != 0 {
         let n = crate::drivers::ac97::play_buffer(data);
+        return Ok(n);
+    }
+
+    // bit 22 (0x0040_0000) = /dev/vport0p0 — push bytes to virtio-serial tx.
+    // See virtio 1.2 §5.3.  Writes spin on the used ring inside the driver.
+    #[cfg(feature = "qga")]
+    if fd_flags & 0x0040_0000 != 0 {
+        let n = crate::drivers::virtio_serial::write(data);
         return Ok(n);
     }
 
