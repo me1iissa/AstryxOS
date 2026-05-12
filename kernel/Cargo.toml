@@ -29,6 +29,17 @@ bitmap-title-fallback = []
 # alongside `firefox-test` when debugging user-mode regressions via
 # `qemu-harness.py grep <sid> '^\[SC\] '`. See docs/HARNESS.md.
 syscall-trace = []
+# Verbose firefox-test tracing.  By default `firefox-test` keeps only the
+# essential per-syscall pair (`[SC]` / `[SC-RET]` under `syscall-trace`) plus
+# boot banners and the periodic `tick=...` heartbeat — the minimum signal
+# needed to measure demo throughput.  Enable this flag to also emit
+# `[LINUX-SYS]`, `[MMAP]`, `[FFTEST/mmap-so]`, and `[SC-USTACK]` traces, which
+# are useful when symbolising libxul stacks or debugging early mmap failures
+# but add ~300 bytes of serial output per syscall.  At ~3 KVM VM-exits per
+# 16-byte FIFO chunk that extra volume directly pins CPU 2 in the serial
+# driver under nested-virt KVM and prevents the post-#140 throughput from
+# being observed.  See drivers/serial.rs for the FIFO-batched write path.
+firefox-trace-verbose = []
 # Tier-0 page-fault tracing. Emits one `[PF] cr2=.. rip=.. code=.. pid=.. tid=..`
 # line per #PF (before VMA resolution). Pairs with `syscall-trace` to make a
 # full cause-and-effect stream for Ring 3 crashes. See docs/HARNESS.md.
