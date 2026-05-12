@@ -23137,83 +23137,183 @@ fn test_dup_clears_cloexec() -> bool {
     true
 }
 
-// ── Test 198: GDI PNG screenshot ─────────────────────────────────────────────
+// ── Test 198: GDI PNG screenshot (NRS-3 — public-demo visual polish) ─────────
 //
 // Exercises the full headless rendering pipeline:
-//   1. Allocate a 160×120 Surface using the kernel GDI Surface type.
-//   2. Draw a scene: gradient background, filled rectangles, filled ellipse,
-//      bitmap text — using existing GDI primitives and the 8×16 VGA font.
+//   1. Allocate an 800×450 (16∶9) Surface using the kernel GDI Surface type.
+//   2. Render a boot-splash composition:
+//        - Deep-space vertical gradient background (navy → near-black)
+//        - Decorative concentric rings (right side — kernel privilege rings motif)
+//        - 3-px cyan accent bar at top
+//        - "AstryxOS" wordmark at 3× scale, horizontally centred
+//        - Cyan underline below the wordmark
+//        - "Native Microkernel" subtitle at 2× scale
+//        - Version/arch line at 1× scale in muted grey
+//        - Status bar strip at bottom with left/centre/right labels
 //   3. Encode the surface to PNG using `gdi::png::encode_surface_to_png`.
 //      The encoder uses zlib with stored (non-compressed) deflate blocks
-//      (RFC 1951 §3.2.4), producing a spec-valid PNG without requiring a
-//      Huffman implementation.
+//      (RFC 1951 §3.2.4), producing a spec-valid PNG without a Huffman impl.
 //   4. Write the PNG bytes to `/tmp/screenshot.png` via the VFS.
 //   5. Verify the file can be read back and starts with the 8-byte PNG
 //      signature (0x89 'P' 'N' 'G' \r \n 0x1a \n).
-//   6. Emit a `[SCREENSHOT]` line to the serial console so the harness can
-//      grep for the result.
+//   6. Emit a `[SCREENSHOT]` line + chunked `[SCREENSHOT-B64:…]` data over
+//      the serial console for host-side extraction by the harness.
 //
 // Pass criterion: VFS write succeeds; read-back starts with PNG_SIGNATURE.
 fn test_gdi_png_screenshot() -> bool {
-    test_header!("GDI PNG screenshot — render shapes + encode PNG headlessly");
+    test_header!("GDI PNG screenshot — render boot-splash demo headlessly");
 
-    // ── 1. Allocate surface ──────────────────────────────────────────────────
-    let mut surface = crate::gdi::Surface::new(160, 120);
+    // ── Colour palette ────────────────────────────────────────────────────────
+    //   bg_top     deep space blue   #0D1B2A
+    //   bg_bottom  near-black navy   #050D14
+    //   accent     electric cyan     #00C8E8
+    //   accent2    soft teal         #00889A
+    //   white      pure white        #FFFFFF
+    //   dim        muted grey        #7A8FA8
+    //   ring_out   faint cyan ghost  #00384A (transparent-ish)
+    const BG_TOP:      u32 = 0xFF0D1B2A;
+    const BG_BOTTOM:   u32 = 0xFF050D14;
+    const ACCENT:      u32 = 0xFF00C8E8;
+    const ACCENT2:     u32 = 0xFF00889A;
+    const WHITE:       u32 = 0xFFFFFFFF;
+    const DIM:         u32 = 0xFF7A8FA8;
+    const RING_INNER:  u32 = 0xFF005878;  // visible teal
+    const RING_OUTER:  u32 = 0xFF001822;  // nearly invisible — fades to black
+    const STATUSBG:    u32 = 0xFF06131D;  // slightly lighter than bg_bottom
+    const ACCENTBAR:   u32 = 0xFF00A0C0;  // top accent bar
 
-    // ── 2. Draw a scene ──────────────────────────────────────────────────────
-    // Background: vertical gradient from deep blue to dark navy.
+    // ── 1. Allocate surface (800 × 450, 16∶9) ────────────────────────────────
+    const W: u32 = 800;
+    const H: u32 = 450;
+    let mut surface = crate::gdi::Surface::new(W, H);
+
+    // ── 2. Background gradient (deep space, vertical) ─────────────────────────
     crate::gdi::primitives::gradient_fill_v(
-        &mut surface, 0, 0, 160, 120,
-        0xFF1A3A6A, // top: deep blue
-        0xFF0A1020, // bottom: near black
+        &mut surface, 0, 0, W as i32, H as i32,
+        BG_TOP, BG_BOTTOM,
     );
 
-    // Red filled rectangle (title bar analogue).
+    // ── 3. Decorative element: concentric rings (right side) ──────────────────
+    //   Suggests kernel privilege rings.  Centre at (610, 225) — right third.
+    //   18 rings from r=20 to r=20+17*22=394, spaced 22 px.
+    crate::gdi::primitives::draw_concentric_rings(
+        &mut surface,
+        610, 225,   // centre (cx, cy)
+        20,         // innermost radius
+        22,         // spacing between rings
+        18,         // count
+        RING_INNER,
+        RING_OUTER,
+    );
+
+    // ── 4. Top accent bar (3 px tall, full width, cyan → teal) ───────────────
+    crate::gdi::primitives::gradient_fill_h(
+        &mut surface, 0, 0, W as i32, 3,
+        ACCENT, ACCENT2,
+    );
+
+    // ── 5. Status bar at bottom (22 px) ──────────────────────────────────────
     {
         use crate::gdi::dc::{DeviceContext, Pen, Brush, PenStyle, BrushStyle};
         let mut dc = DeviceContext::new(0);
         dc.pen   = Pen   { style: PenStyle::Null,  width: 0, color: 0 };
-        dc.brush = Brush { style: BrushStyle::Solid, color: 0xFFCC2233 };
-        crate::gdi::primitives::fill_rectangle(&mut surface, &dc, 10, 10, 150, 30);
+        dc.brush = Brush { style: BrushStyle::Solid, color: STATUSBG };
+        crate::gdi::primitives::fill_rectangle(
+            &mut surface, &dc, 0, (H - 22) as i32, W as i32, H as i32,
+        );
     }
+    // 1 px separator line above status bar (accent colour)
+    crate::gdi::primitives::gradient_fill_h(
+        &mut surface, 0, (H - 23) as i32, W as i32, (H - 22) as i32,
+        ACCENT, ACCENT2,
+    );
 
-    // White border around the red rectangle.
-    crate::gdi::primitives::frame_rect(&mut surface, 0xFFFFFFFF, 10, 10, 150, 30);
-
-    // Green filled ellipse (content indicator).
-    {
-        use crate::gdi::dc::{DeviceContext, Pen, Brush, PenStyle, BrushStyle};
-        let mut dc = DeviceContext::new(0);
-        dc.pen   = Pen   { style: PenStyle::Solid,  width: 1, color: 0xFF00FF00 };
-        dc.brush = Brush { style: BrushStyle::Solid, color: 0xFF22AA44 };
-        crate::gdi::primitives::fill_ellipse(&mut surface, &dc, 80, 75, 50, 30);
-    }
-
-    // Diagonal line (Bresenham).
-    {
-        use crate::gdi::dc::{DeviceContext, Pen, Brush, PenStyle, BrushStyle};
-        let mut dc = DeviceContext::new(0);
-        dc.pen   = Pen   { style: PenStyle::Solid, width: 1, color: 0xFFFFFF00 };
-        dc.brush = Brush { style: BrushStyle::Null, color: 0 };
-        crate::gdi::primitives::line(&mut surface, &dc, 10, 40, 150, 110);
-    }
-
-    // Text in the title bar.
+    // ── 6. Wordmark: "AstryxOS" at 3× scale, horizontally centred ────────────
+    //   3× scale: each glyph is 24 px wide, 48 px tall.
+    //   "AstryxOS" = 8 chars → 8 × 24 = 192 px wide.
+    //   Centre vertically slightly above mid (at y=148 → top=148, bottom=148+48=196).
     {
         use crate::gdi::dc::{DeviceContext, BgMode};
+        let wordmark = "AstryxOS";
+        let scale: u32 = 3;
+        let (tw, _th) = crate::gdi::text::measure_text_scaled(wordmark, scale);
+        let tx = ((W as i32) - tw as i32) / 2;
+        let ty = 148;
         let mut dc = DeviceContext::new(0);
-        dc.text_color = 0xFFFFFFFF; // white text
+        dc.text_color = WHITE;
         dc.bg_mode    = BgMode::Transparent;
-        crate::gdi::text::text_out(&mut surface, &dc, 14, 14, "AstryxOS");
+        crate::gdi::text::text_out_scaled(&mut surface, &dc, tx, ty, wordmark, scale);
     }
 
-    // Small label below the ellipse.
+    // Thin cyan underline below the wordmark (full wordmark width + 8 px padding).
+    {
+        let scale: u32 = 3;
+        let wordmark = "AstryxOS";
+        let (tw, _) = crate::gdi::text::measure_text_scaled(wordmark, scale);
+        let tx = ((W as i32) - tw as i32) / 2;
+        let underline_y = 148 + (16 * scale as i32) + 4; // 4 px gap
+        crate::gdi::primitives::gradient_fill_h(
+            &mut surface,
+            tx - 4, underline_y, tx + tw as i32 + 4, underline_y + 2,
+            ACCENT, ACCENT2,
+        );
+    }
+
+    // ── 7. Subtitle: "Native Microkernel" at 2× scale ────────────────────────
     {
         use crate::gdi::dc::{DeviceContext, BgMode};
+        let subtitle = "Native Microkernel";
+        let scale: u32 = 2;
+        let (tw, _) = crate::gdi::text::measure_text_scaled(subtitle, scale);
+        let tx = ((W as i32) - tw as i32) / 2;
+        let ty = 220; // below wordmark + underline
         let mut dc = DeviceContext::new(0);
-        dc.text_color = 0xFFCCCCCC;
+        dc.text_color = ACCENT;
         dc.bg_mode    = BgMode::Transparent;
-        crate::gdi::text::text_out(&mut surface, &dc, 10, 105, "NRS-1");
+        crate::gdi::text::text_out_scaled(&mut surface, &dc, tx, ty, subtitle, scale);
+    }
+
+    // ── 8. Version line: "v0.1-dev  |  x86_64" at 1× scale ──────────────────
+    {
+        use crate::gdi::dc::{DeviceContext, BgMode};
+        let version = "v0.1-dev  |  x86_64";
+        let (tw, _) = crate::gdi::text::measure_text(version);
+        let tx = ((W as i32) - tw as i32) / 2;
+        let ty = 256;
+        let mut dc = DeviceContext::new(0);
+        dc.text_color = DIM;
+        dc.bg_mode    = BgMode::Transparent;
+        crate::gdi::text::text_out(&mut surface, &dc, tx, ty, version);
+    }
+
+    // ── 9. Status bar content ────────────────────────────────────────────────
+    //   Left:   "Kernel: astryx-dev"    Right: "Tests: passing"
+    {
+        use crate::gdi::dc::{DeviceContext, BgMode};
+        let ty = (H - 16) as i32;
+
+        let left_label  = "Kernel: astryx-0.1-dev";
+        let right_label = "Arch: x86_64  Mode: headless";
+        let (lw, _) = crate::gdi::text::measure_text(left_label);
+        let (rw, _) = crate::gdi::text::measure_text(right_label);
+
+        let mut dc = DeviceContext::new(0);
+        dc.bg_mode = BgMode::Transparent;
+
+        dc.text_color = DIM;
+        crate::gdi::text::text_out(&mut surface, &dc, 12, ty, left_label);
+
+        dc.text_color = DIM;
+        let rx = (W as i32) - rw as i32 - 12;
+        crate::gdi::text::text_out(&mut surface, &dc, rx, ty, right_label);
+
+        // Centre label in status bar
+        let centre_label = "astryx.dev";
+        let (cw, _) = crate::gdi::text::measure_text(centre_label);
+        let cx = ((W as i32) - cw as i32) / 2;
+        dc.text_color = ACCENT2;
+        crate::gdi::text::text_out(&mut surface, &dc, cx, ty, centre_label);
+        let _ = (lw, rw); // suppress unused warnings
     }
 
     // ── 3. Encode to PNG ─────────────────────────────────────────────────────

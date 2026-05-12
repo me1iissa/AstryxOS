@@ -17,8 +17,13 @@ pub const BOOT_INFO_MAGIC: u64 = 0x4153_5452_5958_4F53; // "ASTRYXOS" in hex-ish
 pub const KERNEL_PHYS_BASE: u64 = 0x10_0000; // 1 MiB
 
 /// Fixed physical address for BootInfo handoff.
-/// Placed at 3 MiB — safely past kernel .text/.data/.bss (BSS ends ~0x209000).
-pub const BOOT_INFO_PHYS_BASE: u64 = 0x30_0000; // 3 MiB
+///
+/// Must be placed past the end of the kernel's static sections (.text, .rodata,
+/// .data, .bss).  As the kernel grows the BSS end advances; 7 MiB gives ample
+/// headroom relative to the current ~5.8 MiB BSS end.  The UEFI identity map
+/// and the kernel's own higher-half mapping both cover this address (it is below
+/// the 1 GiB minimum guest RAM for every AstryxOS test configuration).
+pub const BOOT_INFO_PHYS_BASE: u64 = 0x70_0000; // 7 MiB
 
 /// Higher-half virtual base for the kernel.
 pub const KERNEL_VIRT_BASE: u64 = 0xFFFF_8000_0000_0000;
