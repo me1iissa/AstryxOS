@@ -6302,20 +6302,36 @@ fn check_and_deliver_alarm(pid: u64) {
         return;
     }
     // Alarm has expired — queue SIGALRM and re-arm if interval is set.
-    let mut procs = crate::proc::PROCESS_TABLE.lock();
-    if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-        let interval = p.alarm_interval_ticks;
-        if interval > 0 {
-            // Periodic timer: advance deadline by one (or more) intervals so
-            // we never fall behind more than one period.
-            let periods = ((now - p.alarm_deadline_ticks) / interval) + 1;
-            p.alarm_deadline_ticks += periods * interval;
-        } else {
-            p.alarm_deadline_ticks = 0; // one-shot: disarm
+    let mut queued = false;
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            let interval = p.alarm_interval_ticks;
+            if interval > 0 {
+                // Periodic timer: advance deadline by one (or more) intervals so
+                // we never fall behind more than one period.
+                let periods = ((now - p.alarm_deadline_ticks) / interval) + 1;
+                p.alarm_deadline_ticks += periods * interval;
+            } else {
+                p.alarm_deadline_ticks = 0; // one-shot: disarm
+            }
+            if let Some(ref mut ss) = p.signal_state {
+                ss.send(crate::signal::SIGALRM);
+                // Keep the fast-path hint coherent after the direct
+                // `send` (the `ss.send` overload doesn't update it).
+                crate::proc::signal_pending_hint_set(pid, ss.pending);
+                queued = true;
+            }
         }
-        if let Some(ref mut ss) = p.signal_state {
-            ss.send(crate::signal::SIGALRM);
-        }
+    } // drop procs lock before bell-ring
+    if queued {
+        crate::ipc::waitlist::ring_poll_bell_for(
+            crate::ipc::waitlist::PollBellSource::SignalInject);
+        // Mirror the dual-attribution from signal::kill — signalfd
+        // readability is a direct function of `pending`.
+        crate::ipc::waitlist::BELL_RINGS_BY_SOURCE
+            [crate::ipc::waitlist::PollBellSource::Signalfd as usize]
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 }
 

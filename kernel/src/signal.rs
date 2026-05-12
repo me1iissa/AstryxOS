@@ -284,6 +284,16 @@ pub fn kill(target_pid: u64, sig: u8) -> i64 {
                 }
             }
         }
+        drop(procs);
+        if found {
+            // Wake any `epoll_pwait`/`pselect6`/`ppoll` caller whose
+            // temporary sigmask just admitted a pending signal, and
+            // any signalfd watcher whose mask includes this signal —
+            // both readiness sources flip as soon as `pending` is
+            // updated.  See `man 2 epoll_pwait2` §RETURN VALUE
+            // (interrupted by signal handler → EINTR).
+            ring_signal_bell();
+        }
         return if found { 0 } else { -3 }; // ESRCH
     }
 
@@ -315,8 +325,29 @@ pub fn kill(target_pid: u64, sig: u8) -> i64 {
             _ => {}
         }
     }
+    drop(procs);
+    // Wake any blocking syscall (`epoll_pwait*`, `pselect6`, `ppoll`,
+    // `signalfd`-driven `read`) that is now interruptible because
+    // `pending` was just updated.  Lock order: PROCESS_TABLE released
+    // above before touching POLL_BELL.
+    ring_signal_bell();
 
     0
+}
+
+/// Ring the poll bell for a signal-injection event.  Encapsulated so
+/// `kill()` and any future signal-source helper share a single
+/// attribution point under `PollBellSource::SignalInject`.
+#[inline]
+fn ring_signal_bell() {
+    crate::ipc::waitlist::ring_poll_bell_for(
+        crate::ipc::waitlist::PollBellSource::SignalInject);
+    // signalfd readability is a direct function of `pending`, so the
+    // same fire also represents a Signalfd readiness change.  Counted
+    // separately so the kdb `bell-stats` table shows both attributions.
+    crate::ipc::waitlist::BELL_RINGS_BY_SOURCE
+        [crate::ipc::waitlist::PollBellSource::Signalfd as usize]
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Check and deliver pending signals for the current process.

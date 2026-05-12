@@ -276,6 +276,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "syms"           => op_syms(req, out),
         "mem"            => op_mem(req, out),
         "trace-status"   => op_trace_status(out),
+        "bell-stats"     => op_bell_stats(out),
         _ => {
             out.push_str(r#"{"error":"unknown op: "#);
             for c in op.chars().take(64) {
@@ -734,6 +735,46 @@ fn op_trace_status(out: &mut String) {
     use core::fmt::Write;
     let _ = write!(out, r#"{{"syscall_trace":{},"pf_trace":{},"build":"kdb"}}"#,
                    cfg!(feature = "syscall-trace"), cfg!(feature = "pf-trace"));
+}
+
+// ── bell-stats ───────────────────────────────────────────────────────────────
+//
+// Dump the per-source `POLL_BELL` ring counters plus the
+// bell-vs-resync wake classification.  Used by the firefox-test
+// post-fix verification step (the demo-gate exit criterion is that
+// `epoll_wait` returns on bell-ring rather than resync ≥ 90% of the
+// time).  The output is one JSON object with:
+//   sources: {<name>: <count>, ...}    one entry per PollBellSource
+//   bell_wakes:    cumulative wakes attributed to a bell ring
+//   resync_wakes:  cumulative wakes attributed to the resync floor
+//   bell_ratio:    bell_wakes / (bell_wakes + resync_wakes) × 1000
+//                  (integer per-mille so the JSON stays integer-only)
+
+fn op_bell_stats(out: &mut String) {
+    use core::fmt::Write;
+    let (counts, bell_wakes, resync_wakes) = crate::ipc::waitlist::bell_stats();
+    let total_wakes = bell_wakes.saturating_add(resync_wakes);
+    let bell_ratio_permille = if total_wakes == 0 {
+        0u64
+    } else {
+        // Integer per-mille — caller divides by 10 for percent.
+        bell_wakes.saturating_mul(1000) / total_wakes
+    };
+
+    out.push_str(r#"{"sources":{"#);
+    for (i, (name, count)) in crate::ipc::waitlist::BELL_SOURCE_NAMES
+        .iter()
+        .zip(counts.iter())
+        .enumerate()
+    {
+        if i > 0 { out.push(','); }
+        let _ = write!(out, r#""{}":{}"#, name, count);
+    }
+    let _ = write!(
+        out,
+        r#"}},"bell_wakes":{},"resync_wakes":{},"bell_ratio_permille":{}}}"#,
+        bell_wakes, resync_wakes, bell_ratio_permille
+    );
 }
 // ── proc-tree ────────────────────────────────────────────────────────────────
 //

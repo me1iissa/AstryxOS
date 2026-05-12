@@ -433,6 +433,14 @@ extern "C" fn timer_tick() {
         }
     }
 
+    // Wake any poll/epoll/select caller watching a timerfd whose
+    // scheduled expiry has just been reached.  Lockless check via
+    // the earliest-expiry hint; rings the bell at most once per arm
+    // cycle (the hint is bumped to u64::MAX on fire) so a quiescent
+    // armed timer does not incur a tick-cost ring storm.  See
+    // `crate::ipc::timerfd::maybe_ring_from_tick`.
+    crate::ipc::timerfd::maybe_ring_from_tick(tick);
+
     // Notify the scheduler about the tick.
     crate::sched::timer_tick_schedule();
 

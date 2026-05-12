@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
-use crate::ipc::waitlist::{ring_poll_bell, wake_tids, WaitList};
+use crate::ipc::waitlist::{ring_poll_bell_for, wake_tids, PollBellSource, WaitList};
 
 /// Pipe buffer size (4 KiB).
 const PIPE_BUF_SIZE: usize = 4096;
@@ -340,8 +340,8 @@ pub fn wake_readers_all(pipe_id: u64) {
     wake_tids(&drained);
     // Also kick the global poll bell so any poll/epoll/select caller
     // watching this pipe re-evaluates immediately rather than waiting
-    // for its 10 ms tick.
-    ring_poll_bell();
+    // for its resync tick.
+    ring_poll_bell_for(PollBellSource::Pipe);
 }
 
 /// Wake every writer parked on `pipe_id`.
@@ -358,7 +358,7 @@ pub fn wake_writers_all(pipe_id: u64) {
         }
     };
     wake_tids(&drained);
-    ring_poll_bell();
+    ring_poll_bell_for(PollBellSource::Pipe);
 }
 
 /// Best-effort cleanup: remove `tid` from this pipe's reader wait list.

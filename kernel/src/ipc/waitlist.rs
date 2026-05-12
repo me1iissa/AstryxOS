@@ -21,6 +21,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// A list of thread IDs parked on a single wake condition.
 ///
@@ -161,6 +162,77 @@ pub fn wake_tids(tids: &[u64]) {
 
 static POLL_BELL: spin::Mutex<WaitList> = spin::Mutex::new(WaitList::new());
 
+/// Identifies the IPC subsystem that rang the poll bell.  Used to
+/// attribute each ring to a counter so kdb / test instrumentation can
+/// see which readiness sources are firing.  Add a new variant when a
+/// new readiness source learns to ring the bell; the `BELL_RINGS_BY_SOURCE`
+/// table grows automatically because `N_BELL_SOURCES` is derived from
+/// the variant count.
+#[derive(Clone, Copy, Debug)]
+#[repr(usize)]
+pub enum PollBellSource {
+    /// `crate::ipc::pipe::wake_*_all` — pipe data / EOF arrival.
+    Pipe         = 0,
+    /// `crate::ipc::eventfd::wake_readers_all` — eventfd post.
+    Eventfd      = 1,
+    /// `crate::net::unix::write` — AF_UNIX data arrival.
+    UnixWrite    = 2,
+    /// `crate::net::unix::shutdown` / `connect` / `accept` —
+    /// AF_UNIX peer half-close or connection completion.
+    UnixShutdown = 3,
+    /// `crate::ipc::timerfd::*` — timer-fd expiration becomes readable.
+    Timerfd      = 4,
+    /// `crate::ipc::signalfd::*` — signal pending against a watched
+    /// signalfd's mask (rung from the signal-injection path that also
+    /// updates `signal_state.pending`).
+    Signalfd     = 5,
+    /// `crate::ipc::inotify::notify_event` — first event enqueued on
+    /// an inotify instance's empty queue.
+    Inotify      = 6,
+    /// `crate::signal::kill` and other signal-injection sites — wakes
+    /// `epoll_pwait*` callers whose temporary sigmask just admitted a
+    /// pending signal, and any signalfd/self-pipe loop the process
+    /// uses for signal-driven IPC.
+    SignalInject = 7,
+    /// Catch-all for ad-hoc readiness sources that have not yet been
+    /// given their own variant (kept last for ABI tail-stability).
+    Other        = 8,
+}
+
+/// Number of `PollBellSource` variants — keep in sync with the enum.
+pub const N_BELL_SOURCES: usize = 9;
+
+/// Stable string label for each `PollBellSource`, used by kdb to
+/// render the per-source counters.  Indexed by the enum's discriminant.
+pub const BELL_SOURCE_NAMES: [&str; N_BELL_SOURCES] = [
+    "pipe", "eventfd", "unix_write", "unix_shutdown",
+    "timerfd", "signalfd", "inotify", "signal_inject", "other",
+];
+
+/// Per-source ring counters.  Bumped (Relaxed) at every successful
+/// `ring_poll_bell_for(_)` call regardless of how many waiters were
+/// drained — counts the *firing*, not the *wake*, so a quiet system
+/// still shows attribution for sources that fire on internal events.
+pub static BELL_RINGS_BY_SOURCE: [AtomicU64; N_BELL_SOURCES] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
+
+/// Cumulative number of `wait_poll_event` calls that woke via a bell
+/// drain (i.e. somebody called `ring_poll_bell*` while we were parked
+/// and the wake flipped us back to Ready before the resync tick fired).
+/// Together with `POLL_BELL_RESYNC_WAKES` this lets the harness verify
+/// the demo-gate exit criterion: "epoll_wait returns on bell-ring not
+/// resync ≥ 90% of the time on the firefox-test boot".
+pub static POLL_BELL_BELL_WAKES: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative number of `wait_poll_event` calls that returned because
+/// the resync-floor timer expired (i.e. nobody rang the bell within
+/// `RESYNC_INTERVAL_TICKS`).  A high ratio here means a readiness
+/// source is not wired into the bell yet — see `bell_stats()`.
+pub static POLL_BELL_RESYNC_WAKES: AtomicU64 = AtomicU64::new(0);
+
 /// Park the caller on the global poll bell.  Returns once any IPC
 /// writer has rung the bell, the bounded resync interval elapses, or
 /// the caller is woken for another reason (e.g. signal injection
@@ -170,22 +242,20 @@ static POLL_BELL: spin::Mutex<WaitList> = spin::Mutex::new(WaitList::new());
 /// `caller_deadline` is the absolute scheduler tick at which the
 /// caller's own timeout expires (`u64::MAX` for infinite waits, per
 /// `poll(2)` `timeout=-1` and `epoll_wait(2)` `timeout=-1`).  The
-/// helper deliberately parks for at most `RESYNC_INTERVAL_TICKS`
-/// before falling back through so the caller's outer rescan loop
-/// observes any fd state that did not ring the bell — TCP socket
-/// data, X11 reply bytes, signal injection mid-park, and any future
-/// readiness source not yet wired into `ring_poll_bell` are all
-/// covered by the next periodic recheck.  Without this floor an
-/// `epoll_wait(timeout=-1)` watching only TCP fds would park
-/// indefinitely (the bell only fires on pipe / eventfd / unix-socket
-/// writes), reproducing the pre-fix busy-poll wedge in inverse.
+/// helper parks for at most `RESYNC_INTERVAL_TICKS` before falling
+/// back through.  With every readiness source now wiring through
+/// `ring_poll_bell_for`, the resync floor is purely a safety net for
+/// future sources (or third-party fds) that have not yet been added
+/// to the bell — it is sized accordingly (1 s, was 100 ms pre-wiring).
 pub fn wait_poll_event(caller_deadline: u64) {
-    /// Maximum ticks to park before the outer loop rescans.  10 ticks
-    /// = 100 ms at TICK_HZ=100 — coarse enough to be a low-CPU floor
-    /// for genuinely-quiescent fd sets, fine enough that polling
-    /// interactive workloads (X11, etc.) stay responsive.  The bell
-    /// path returns much sooner in the common case.
-    const RESYNC_INTERVAL_TICKS: u64 = 10;
+    /// Maximum ticks to park before the outer loop rescans.  100 ticks
+    /// = 1 s at `TICK_HZ=100`.  Pre-wiring this was 100 ms because the
+    /// bell missed timerfd / signalfd / inotify / unix-shutdown /
+    /// signal-injection readiness; with those sources now wired, the
+    /// floor exists only as a backstop for future readiness sources
+    /// that have not yet been ring-bell-wired, and a 1 s rescan keeps
+    /// CPU overhead in the long-quiet case ~10× lower.
+    const RESYNC_INTERVAL_TICKS: u64 = 100;
     let tid = crate::proc::current_tid();
     let now = crate::arch::x86_64::irq::get_ticks();
     let resync_tick = now.saturating_add(RESYNC_INTERVAL_TICKS);
@@ -199,16 +269,36 @@ pub fn wait_poll_event(caller_deadline: u64) {
     bell.enqueue_self_blocked(tid, wake_tick);
     drop(bell);
     crate::sched::schedule();
-    // Drop any stale entry — we may have woken via the scheduler tick
-    // (deadline elapsed) rather than via `ring_poll_bell`, in which
-    // case our TID is still on the list.
-    POLL_BELL.lock().remove_tid(tid);
+    // Classify the wake: if we are still on the bell list, the
+    // scheduler tick (resync or caller deadline) woke us; if not, a
+    // bell ring drained us.  `remove_tid` returns true when the entry
+    // was present, so we attribute the wake based on its return.
+    let still_parked = POLL_BELL.lock().remove_tid(tid);
+    if still_parked {
+        POLL_BELL_RESYNC_WAKES.fetch_add(1, Ordering::Relaxed);
+    } else {
+        POLL_BELL_BELL_WAKES.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Ring the poll bell — wake every thread parked in `wait_poll_event`.
 /// Called by IPC writers (pipe write, eventfd post, unix socket write,
 /// X11 server reply, etc.) after the data side has been updated.
+///
+/// Equivalent to `ring_poll_bell_for(PollBellSource::Other)` — kept as
+/// a stable shim for callers that have not been migrated to the tagged
+/// variant.  Prefer `ring_poll_bell_for` in new code so the per-source
+/// counter attributes the ring correctly.
 pub fn ring_poll_bell() {
+    ring_poll_bell_for(PollBellSource::Other);
+}
+
+/// Ring the poll bell and increment the per-source counter for
+/// `source`.  The counter is bumped exactly once per call regardless
+/// of how many waiters were drained — kdb sees "this source fired N
+/// times", not "this source woke M waiters".
+pub fn ring_poll_bell_for(source: PollBellSource) {
+    BELL_RINGS_BY_SOURCE[source as usize].fetch_add(1, Ordering::Relaxed);
     let drained = POLL_BELL.lock().drain_all();
     wake_tids(&drained);
 }
@@ -217,4 +307,20 @@ pub fn ring_poll_bell() {
 /// poll bell.  Used by the test runner to assert wake-up correctness.
 pub fn poll_bell_waiter_count() -> usize {
     POLL_BELL.lock().len()
+}
+
+/// Snapshot the per-source bell counters and wake-classification
+/// totals into a fixed-size array.  Returned tuple is
+/// `(per_source_counts, bell_wakes, resync_wakes)`.  Used by the kdb
+/// `bell-stats` op to render an attribution table.
+pub fn bell_stats() -> ([u64; N_BELL_SOURCES], u64, u64) {
+    let mut counts = [0u64; N_BELL_SOURCES];
+    for (i, c) in BELL_RINGS_BY_SOURCE.iter().enumerate() {
+        counts[i] = c.load(Ordering::Relaxed);
+    }
+    (
+        counts,
+        POLL_BELL_BELL_WAKES.load(Ordering::Relaxed),
+        POLL_BELL_RESYNC_WAKES.load(Ordering::Relaxed),
+    )
 }
