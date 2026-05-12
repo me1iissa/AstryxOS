@@ -254,6 +254,14 @@ pub fn connect(id: u64, path: &[u8]) -> i64 {
         srv.backlog[srv.backlog_len] = peer_id;
         srv.backlog_len += 1;
     }
+    // Drop the table lock before ringing — a `poll`/`epoll_wait`
+    // caller blocked on the listener fd for `POLLIN` (the
+    // connection-pending readiness signal per `accept(2)`) re-checks
+    // `has_pending()` on its rescan and proceeds to `accept` without
+    // waiting for the resync floor.
+    drop(t);
+    crate::ipc::waitlist::ring_poll_bell_for(
+        crate::ipc::waitlist::PollBellSource::UnixShutdown);
     0
 }
 
@@ -266,6 +274,13 @@ pub fn accept(id: u64) -> i64 {
     let peer_id = s.backlog[0];
     for i in 0..s.backlog_len - 1 { s.backlog[i] = s.backlog[i + 1]; }
     s.backlog_len -= 1;
+    drop(t);
+    // The newly-accepted peer fd is immediately writable (and may
+    // already have buffered data from a fast connect-write client).
+    // Wake any pre-existing poller that registered the peer fd before
+    // accept completed so it does not stall on the resync floor.
+    crate::ipc::waitlist::ring_poll_bell_for(
+        crate::ipc::waitlist::PollBellSource::UnixShutdown);
     peer_id as i64
 }
 
@@ -327,7 +342,8 @@ pub fn write(id: u64, data: &[u8]) -> i64 {
         // poller waking on the bell does not contend on TABLE on its
         // re-evaluation pass.
         drop(t);
-        crate::ipc::waitlist::ring_poll_bell();
+        crate::ipc::waitlist::ring_poll_bell_for(
+            crate::ipc::waitlist::PollBellSource::UnixWrite);
         return n as i64;
     }
 
@@ -337,9 +353,10 @@ pub fn write(id: u64, data: &[u8]) -> i64 {
     if n > 0 {
         // Wake any poll/epoll/select caller watching the peer fd.  The
         // pre-existing read path returns -EAGAIN when the buffer is empty,
-        // so without this kick the caller would wait for the next 10 ms
+        // so without this kick the caller would wait for the next resync
         // tick to discover the new bytes.
-        crate::ipc::waitlist::ring_poll_bell();
+        crate::ipc::waitlist::ring_poll_bell_for(
+            crate::ipc::waitlist::PollBellSource::UnixWrite);
     }
     if n == 0 { -11 } else { n as i64 }
 }
@@ -420,6 +437,18 @@ pub fn shutdown(id: u64, shut_rd_flag: bool, shut_wr_flag: bool) -> i64 {
     if shut_wr_flag && (peer_id as usize) < MAX_UNIX_SOCKETS {
         t.0[peer_id as usize].shut_rd = true;
     }
+    // Drop the table lock before ringing — per `man 2 shutdown` and
+    // `man 7 unix`, a half-close surfaces on the peer as an orderly
+    // EOF on subsequent `read()` and as `POLLIN | POLLRDHUP` /
+    // `POLLHUP` on `poll`/`epoll_wait`.  Local listeners that watch
+    // the peer fd would otherwise stall on the resync floor before
+    // observing the new readiness — this is exactly the wedge the
+    // Mozilla parent IPC bus tripped on, where the child's
+    // `SHUT_RDWR` was invisible to the parent's `epoll_pwait2` until
+    // the 1 s rescan.
+    drop(t);
+    crate::ipc::waitlist::ring_poll_bell_for(
+        crate::ipc::waitlist::PollBellSource::UnixShutdown);
     0
 }
 
