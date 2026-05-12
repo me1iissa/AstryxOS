@@ -56,6 +56,12 @@ ci-skip-test-104 = []
 # vCPU on completion (the bugcheck path exits QEMU via isa-debug-exit
 # in test-mode), so this feature is OFF by default.
 bugcheck-test = []
+# Detailed stack dump (128 words from RSP) on every FUTEX_WAIT registration.
+# Expensive under IRQs-off (~130ms cli per FUTEX_WAIT); disabled by default
+# even in firefox-test. Use `--features futex-wait-scan` explicitly when
+# debugging user-mode futex choreography. Pairs with [FUTEX_WAIT_STACK] and
+# [FUTEX_WAIT_REG] lines to form a complete per-waiter trace.
+futex-wait-scan = []
 
 [dependencies]
 astryx-shared = { path = "../shared" }
