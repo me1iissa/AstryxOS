@@ -81,8 +81,13 @@ fn memfd_seals_add(inode: u64, new_seals: u32) -> i64 {
 // static musl-linked "hello world" (printf + file I/O + malloc).
 
 /// Check whether the current process uses the Linux syscall ABI.
+///
+/// Reads the per-CPU lockless PID first — fast path, correct whenever a
+/// user thread is currently scheduled.  Falls back to a kernel-stack-top
+/// walk (see slow path below) for the brief context-switch window when
+/// `PER_CPU_CURRENT_PID` reads as 0 but a user syscall is in flight.
 pub(crate) fn is_linux_abi() -> bool {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     if pid != 0 {
         // Fast path: PER_CPU_CURRENT_TID is correct.
         let procs = crate::proc::PROCESS_TABLE.lock();
@@ -222,7 +227,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         let caller_rip = crate::syscall::get_user_caller_rip();
         crate::serial_println!(
             "[SC] pid={} tid={} nr={} rip={:#x} cr={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x} a6={:#x}",
-            crate::proc::current_pid(),
+            crate::proc::current_pid_lockless(),
             crate::proc::current_tid(),
             num,
             user_rip,
@@ -260,7 +265,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         // current bringup ordering; bump this if the boot chain grows.
         const FIRST_USERLAND_PID: u64 = 12;
 
-        let pid_now = crate::proc::current_pid();
+        let pid_now = crate::proc::current_pid_lockless();
         let tid_now = crate::proc::current_tid();
         let is_hot = matches!(num,
             96 | 228 |        // gettimeofday, clock_gettime
@@ -294,7 +299,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
 
     // ── Per-PID debug trace ───────────────────────────────────────────────────
     let trace_pid = crate::syscall::DEBUG_TRACE_PID.load(core::sync::atomic::Ordering::Relaxed);
-    let do_trace = trace_pid != 0 && crate::proc::current_pid() == trace_pid;
+    let do_trace = trace_pid != 0 && crate::proc::current_pid_lockless() == trace_pid;
     if do_trace {
         crate::serial_println!("[TRACE] pid={} sys={} a1={:#x} a2={:#x} a3={:#x}",
             trace_pid, num, arg1, arg2, arg3);
@@ -302,7 +307,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
 
     // ── Global syscall counter (used by Firefox oracle test) ─────────────────
     {
-        let pid = crate::proc::current_pid();
+        let pid = crate::proc::current_pid_lockless();
         if pid >= 1 {
             crate::syscall::FIREFOX_SYSCALL_COUNT
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -315,7 +320,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     // patch the return value after the match dispatch completes.
     #[cfg(feature = "firefox-test")]
     let ring_entry_idx = {
-        let pid = crate::proc::current_pid();
+        let pid = crate::proc::current_pid_lockless();
         // Auto-track every user-process PID >= 1 that makes a Linux syscall —
         // this includes Firefox (pid 28 in the current harness run) plus any
         // children it spawns.  Enabling is idempotent.
@@ -341,7 +346,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     {
         static TRACE_N: core::sync::atomic::AtomicU64 =
             core::sync::atomic::AtomicU64::new(0);
-        let pid = crate::proc::current_pid();
+        let pid = crate::proc::current_pid_lockless();
         if pid >= 1 {
             let n = TRACE_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             if n < 10000 {
@@ -353,7 +358,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     {
         static TRACE_N: core::sync::atomic::AtomicU64 =
             core::sync::atomic::AtomicU64::new(0);
-        let pid = crate::proc::current_pid();
+        let pid = crate::proc::current_pid_lockless();
         if pid >= 12 {
             let n = TRACE_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             if n < 500 {
@@ -366,7 +371,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     // detected here instead.  This guarantees delivery within one syscall of
     // expiry, which meets POSIX requirements for non-real-time scheduling.
     {
-        let pid = crate::proc::current_pid();
+        let pid = crate::proc::current_pid_lockless();
         if pid >= 1 {
             check_and_deliver_alarm(pid);
         }
@@ -387,7 +392,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     // ── Close out the ring entry with the syscall's return value ─────────────
     #[cfg(feature = "firefox-test")]
     {
-        let pid = crate::proc::current_pid();
+        let pid = crate::proc::current_pid_lockless();
         crate::syscall::ring::end(pid, ring_entry_idx, ret);
         crate::subsys::linux::syscall_ring::clear_current_entry();
     }
@@ -401,7 +406,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     #[cfg(feature = "syscall-trace")]
     crate::serial_println!(
         "[SC-RET] pid={} tid={} nr={} ret={:#x}",
-        crate::proc::current_pid(),
+        crate::proc::current_pid_lockless(),
         crate::proc::current_tid(),
         num,
         ret as u64,
@@ -425,7 +430,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // 3: close(fd)
         3 => {
             let fd = arg1 as usize;
-            let pid = crate::proc::current_pid();
+            let pid = crate::proc::current_pid_lockless();
             // If it's a unix socket fd, close the underlying unix socket.
             if crate::syscall::is_unix_socket_fd(pid, fd) {
                 let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
@@ -511,11 +516,11 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             0
         }
         // 39: getpid
-        39 => crate::proc::current_pid() as i64,
+        39 => crate::proc::current_pid_lockless() as i64,
         // 7: poll(fds, nfds, timeout) — wait for events on fds
         7 => {
             let nfds = arg2 as i64;
-            let pid  = crate::proc::current_pid();
+            let pid  = crate::proc::current_pid_lockless();
             let timeout_ms = arg3 as i64; // -1 = block; 0 = no wait
 
             if nfds <= 0 || arg1 == 0 {
@@ -615,7 +620,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let buf = arg2 as *mut u8;
             let count = arg3 as usize;
             let offset = arg4 as i64;
-            let pid = crate::proc::current_pid();
+            let pid = crate::proc::current_pid_lockless();
             // Save, seek, read, restore
             let saved = crate::syscall::sys_lseek(fd, 0, 1 /*SEEK_CUR*/);
             let sk = crate::syscall::sys_lseek(fd, offset, 0 /*SEEK_SET*/);
@@ -633,7 +638,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let buf = arg2 as *const u8;
             let count = arg3 as usize;
             let offset = arg4 as i64;
-            let pid = crate::proc::current_pid();
+            let pid = crate::proc::current_pid_lockless();
             let saved = crate::syscall::sys_lseek(fd, 0, 1);
             let sk = crate::syscall::sys_lseek(fd, offset, 0);
             if sk < 0 { return sk; }
@@ -667,7 +672,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let ret = crate::syscall::sys_dup2(arg1 as usize, arg2 as usize);
             #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
             {
-                let pid = crate::proc::current_pid();
+                let pid = crate::proc::current_pid_lockless();
                 if pid == 1 || crate::syscall::ring::is_tracked(pid) {
                     crate::serial_println!("[FF/dup2] pid={} old={} new={} ret={}", pid, arg1, arg2, ret);
                 }
@@ -693,7 +698,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             // type argument and must be honoured on the resulting fd.
             let cloexec  = (arg2 & 0x80000) != 0;
             let nonblock = (arg2 & 0x00800) != 0;
-            let pid = crate::proc::current_pid();
+            let pid = crate::proc::current_pid_lockless();
             if domain == 1 {
                 // AF_UNIX: use net::unix module.
                 // SOCK_STREAM=1, SOCK_DGRAM=2, SOCK_SEQPACKET=5.
@@ -721,7 +726,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         }
         // 42: connect(sockfd, addr, addrlen)
         42 => {
-            let pid = crate::proc::current_pid();
+            let pid = crate::proc::current_pid_lockless();
             let fd = arg1 as usize;
             let addr_ptr = arg2;
             let addrlen = arg3 as usize;
@@ -790,7 +795,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // arg4 carries `flags` for accept4(2): SOCK_CLOEXEC | SOCK_NONBLOCK.
         // Plain accept(2) (#43) leaves arg4 = 0; accept4(2) (#288) forwards it.
         43 => {
-            let pid = crate::proc::current_pid();
+            let pid = crate::proc::current_pid_lockless();
             let fd = arg1 as usize;
             // accept4 flag bits: SOCK_CLOEXEC = 0x80000, SOCK_NONBLOCK = 0x800.
             let cloexec  = (arg4 & 0x80000) != 0;
@@ -810,7 +815,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         }
         // 44: sendto(sockfd, buf, len, flags, addr, addrlen)
         44 => {
-            let pid = crate::proc::current_pid();
+            let pid = crate::proc::current_pid_lockless();
             let fd = arg1 as usize;
             let buf_ptr = arg2 as *const u8;
             let len = arg3 as usize;
@@ -857,7 +862,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // AF_UNIX SOCK_DGRAM is not implemented yet, so the AF_UNIX path
         // continues to ignore the address out-params.
         45 => {
-            let pid = crate::proc::current_pid();
+            let pid = crate::proc::current_pid_lockless();
             let fd = arg1 as usize;
             let buf_ptr = arg2 as *mut u8;
             let len = arg3 as usize;
@@ -894,7 +899,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         }
         // 46: sendmsg(sockfd, msg, flags) — use single-buffer fast path
         46 => {
-            let pid = crate::proc::current_pid();
+            let pid = crate::proc::current_pid_lockless();
             let fd = arg1 as usize;
             let msghdr_ptr = arg2 as *const u64;
             if msghdr_ptr.is_null() { return -22; }
@@ -966,7 +971,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         }
         // 47: recvmsg(sockfd, msg, flags) — via socket_recv / unix::read
         47 => {
-            let pid = crate::proc::current_pid();
+            let pid = crate::proc::current_pid_lockless();
             let fd = arg1 as usize;
             let msghdr_ptr = arg2 as *const u64;
             if msghdr_ptr.is_null() { return -22; }
@@ -1068,7 +1073,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // Returns 0 on success, -EBADF for a non-socket fd, -ENOTCONN for
         // an unconnected stream socket, -EINVAL on bad `how`.
         48 => {
-            let pid = crate::proc::current_pid();
+            let pid = crate::proc::current_pid_lockless();
             let fd  = arg1 as usize;
             let how = arg2 as i32;
             if how < 0 || how > 2 { return -22; }
@@ -1086,7 +1091,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         }
         // 49: bind(sockfd, addr, addrlen)
         49 => {
-            let pid = crate::proc::current_pid();
+            let pid = crate::proc::current_pid_lockless();
             let fd = arg1 as usize;
             let addr_ptr = arg2;
             let addrlen = arg3 as usize;
@@ -1116,7 +1121,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         }
         // 50: listen(sockfd, backlog)
         50 => {
-            let pid = crate::proc::current_pid();
+            let pid = crate::proc::current_pid_lockless();
             let fd = arg1 as usize;
             if crate::syscall::is_unix_socket_fd(pid, fd) {
                 let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
@@ -1133,7 +1138,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // `*addrlen` is read as the buffer cap (truncation only) and on
         // return holds the unmarshalled struct's full size.
         51 => {
-            let pid = crate::proc::current_pid();
+            let pid = crate::proc::current_pid_lockless();
             let fd = arg1 as usize;
             let addr_ptr = arg2;
             let addrlen_ptr = arg3 as *mut u32;
@@ -1168,7 +1173,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // connected.  AF_UNIX peer reporting mirrors getsockname's
         // unnamed-socket reply.
         52 => {
-            let pid = crate::proc::current_pid();
+            let pid = crate::proc::current_pid_lockless();
             let fd = arg1 as usize;
             let addr_ptr = arg2;
             let addrlen_ptr = arg3 as *mut u32;
@@ -1244,7 +1249,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             // common known bits are SOCK_CLOEXEC and SOCK_NONBLOCK only).
             // We accept those plus the type field; anything else passes
             // through silently to match Linux leniency.
-            let pid = crate::proc::current_pid();
+            let pid = crate::proc::current_pid_lockless();
             let (a, b) = crate::net::unix::socketpair(kind);
             if a == u64::MAX { return -24; }
             let fd_a = crate::syscall::alloc_unix_socket_fd(pid, a, cloexec, nonblock);
@@ -1276,7 +1281,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         }
         // 54: setsockopt(sockfd, level, optname, optval, optlen)
         54 => {
-            let pid   = crate::proc::current_pid();
+            let pid   = crate::proc::current_pid_lockless();
             let fd    = arg1 as usize;
             let level = arg2;
             let opt   = arg3;
@@ -1291,7 +1296,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         }
         // 55: getsockopt(sockfd, level, optname, optval, optlen)
         55 => {
-            let pid    = crate::proc::current_pid();
+            let pid    = crate::proc::current_pid_lockless();
             let fd     = arg1 as usize;
             let level  = arg2;
             let opt    = arg3;
@@ -1319,7 +1324,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         if !optval.is_null() {
                             unsafe {
                                 let p = optval as *mut u8;
-                                core::ptr::write(p as *mut u32, crate::proc::current_pid() as u32);
+                                core::ptr::write(p as *mut u32, crate::proc::current_pid_lockless() as u32);
                                 core::ptr::write(p.add(4) as *mut u32, 0); // uid
                                 core::ptr::write(p.add(8) as *mut u32, 0); // gid
                             }
@@ -1363,7 +1368,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 // pthread_create-style clone: new thread in same address space.
                 let user_rip = unsafe { crate::syscall::get_user_rip() };
                 let tls_val = if flags & CLONE_SETTLS != 0 { tls } else { 0 };
-                let pid = crate::proc::current_pid();
+                let pid = crate::proc::current_pid_lockless();
                 let parent_tidptr = arg3; // rdx = parent_tid
                 let child_tidptr  = arg4; // r10 = child_tid
                 match crate::proc::usermode::create_user_thread(pid, user_rip, new_stack, tls_val, 0, 0) {
@@ -1408,7 +1413,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 const CLONE_VFORK: u64 = 0x00004000;
                 let is_vfork = flags & CLONE_VFORK != 0;
                 let parent_tid = crate::proc::current_tid();
-                let pid = crate::proc::current_pid();
+                let pid = crate::proc::current_pid_lockless();
                 crate::serial_println!("[VFORK] pid={} flags={:#x} vfork={} parent_tid={} new_stack={:#x} tls={:#x}",
                     pid, flags, is_vfork, parent_tid, new_stack, tls);
 
@@ -1476,7 +1481,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         75 => 0,
         // 77: ftruncate(fd, length) — truncate open file to given length
         77 => {
-            let pid = crate::proc::current_pid();
+            let pid = crate::proc::current_pid_lockless();
             match crate::vfs::fd_truncate(pid, arg1 as usize, arg2) {
                 Ok(()) => 0,
                 Err(e) => crate::subsys::linux::errno::vfs_err(e),
@@ -1505,7 +1510,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let target_str: alloc::string::String = if path_str == "/proc/self/exe"
                 || path_str == "/proc/self/fd/exe"
             {
-                let pid = crate::proc::current_pid();
+                let pid = crate::proc::current_pid_lockless();
                 let procs = crate::proc::PROCESS_TABLE.lock();
                 procs.iter().find(|p| p.pid == pid)
                     .and_then(|p| p.exe_path.as_ref())
@@ -1515,7 +1520,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 // /proc/self/fd/<N> — returns the open_path for fd N.
                 let fd_part = &path_str["/proc/self/fd/".len()..];
                 let fd_num = fd_part.parse::<usize>().unwrap_or(usize::MAX);
-                let pid = crate::proc::current_pid();
+                let pid = crate::proc::current_pid_lockless();
                 let procs = crate::proc::PROCESS_TABLE.lock();
                 procs.iter().find(|p| p.pid == pid)
                     .and_then(|p| p.file_descriptors.get(fd_num))
@@ -1576,7 +1581,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 }
                 PR_SET_NO_NEW_PRIVS      => {
                     if arg2 == 1 {
-                        let pid = crate::proc::current_pid();
+                        let pid = crate::proc::current_pid_lockless();
                         let mut procs = crate::proc::PROCESS_TABLE.lock();
                         if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
                             p.no_new_privs = true;
@@ -1585,7 +1590,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     0
                 }
                 PR_GET_NO_NEW_PRIVS      => {
-                    let pid = crate::proc::current_pid();
+                    let pid = crate::proc::current_pid_lockless();
                     let procs = crate::proc::PROCESS_TABLE.lock();
                     procs.iter().find(|p| p.pid == pid)
                         .map(|p| if p.no_new_privs { 1i64 } else { 0i64 })
@@ -1776,7 +1781,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             // struct __user_cap_data_struct: effective(u32), permitted(u32), inheritable(u32)
             // For version 3 (0x20080522), two consecutive structs are expected (64-bit caps).
             if arg2 != 0 && crate::syscall::validate_user_ptr(arg2, 24) {
-                let pid = crate::proc::current_pid();
+                let pid = crate::proc::current_pid_lockless();
                 let procs = crate::proc::PROCESS_TABLE.lock();
                 let (eff, perm) = procs.iter().find(|p| p.pid == pid)
                     .map(|p| (p.cap_effective as u32, p.cap_permitted as u32))
@@ -1800,7 +1805,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         126 => {
             // Accept capability drops; update effective/permitted in PCB.
             if arg2 != 0 && crate::syscall::validate_user_ptr(arg2, 12) {
-                let pid = crate::proc::current_pid();
+                let pid = crate::proc::current_pid_lockless();
                 let mut procs = crate::proc::PROCESS_TABLE.lock();
                 if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
                     let dp = arg2 as *const u32;
@@ -1818,7 +1823,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             if resource >= 16 { return -22; } // EINVAL
             if !crate::syscall::validate_user_ptr(arg2, 16) { return -14; } // EFAULT
             let soft = unsafe { core::ptr::read_unaligned(arg2 as *const u64) };
-            let pid = crate::proc::current_pid();
+            let pid = crate::proc::current_pid_lockless();
             let mut procs = crate::proc::PROCESS_TABLE.lock();
             if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
                 p.rlimits_soft[resource] = soft;
@@ -1891,7 +1896,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             // SET new limit if provided
             if arg3 != 0 && (arg2 as usize) < 16 && crate::syscall::validate_user_ptr(arg3, 16) {
                 let soft = unsafe { core::ptr::read_unaligned(arg3 as *const u64) };
-                let pid  = crate::proc::current_pid();
+                let pid  = crate::proc::current_pid_lockless();
                 let mut procs = crate::proc::PROCESS_TABLE.lock();
                 if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
                     p.rlimits_soft[arg2 as usize] = soft;
@@ -1986,7 +1991,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 let thread_arg = arg5; // Linux r8  = thread argument (glibc's saved rcx)
                 let user_rip   = unsafe { crate::syscall::get_user_rip() };
                 let tls_val    = if clone_flags & CLONE_SETTLS != 0 { tls } else { 0 };
-                let pid        = crate::proc::current_pid();
+                let pid        = crate::proc::current_pid_lockless();
                 crate::serial_println!(
                     "[CLONE3] CLONE_THREAD pid={} rip={:#x} sp={:#x} tls={:#x} func={:#x} arg={:#x}",
                     pid, user_rip, sp, tls_val, func, thread_arg
@@ -2032,7 +2037,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 let func = arg3; // RDX at clone3 = func pointer
                 let thread_arg = arg5; // R8 at clone3 = arg pointer (via RCX→R8)
                 let original_rip = unsafe { crate::syscall::get_user_rip() };
-                let pid = crate::proc::current_pid();
+                let pid = crate::proc::current_pid_lockless();
                 let parent_tid = crate::proc::current_tid();
                 let parent_regs = crate::syscall::read_fork_user_regs();
 
@@ -2102,7 +2107,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let op = arg2;
             let nonblock = (op & LOCK_NB) != 0;
             let op_base = op & !LOCK_NB;
-            let pid = crate::proc::current_pid();
+            let pid = crate::proc::current_pid_lockless();
 
             // Resolve (mount_idx, inode) from the fd.
             let (mount_idx, inode) = {
@@ -2202,7 +2207,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 alloc::string::String::from(path_str)
             } else {
                 // Relative path — prepend fd's directory
-                let pid = crate::proc::current_pid();
+                let pid = crate::proc::current_pid_lockless();
                 let base = {
                     let procs = crate::proc::PROCESS_TABLE.lock();
                     let proc = match procs.iter().find(|p| p.pid == pid) {
@@ -2225,7 +2230,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let bufsiz = arg4 as usize;
             // /proc/self/exe special case
             let target: alloc::string::String = if full_path == "/proc/self/exe" {
-                let pid = crate::proc::current_pid();
+                let pid = crate::proc::current_pid_lockless();
                 let procs = crate::proc::PROCESS_TABLE.lock();
                 procs.iter().find(|p| p.pid == pid)
                     .and_then(|p| p.exe_path.as_ref())
@@ -2308,7 +2313,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         }
         // 91: fchmod(fd, mode) — set permission bits on an open fd
         91 => {
-            let pid = crate::proc::current_pid();
+            let pid = crate::proc::current_pid_lockless();
             match crate::vfs::fchmod(pid, arg1 as usize, arg2 as u32) {
                 Ok(()) => 0,
                 Err(e) => crate::subsys::linux::errno::vfs_err(e),
@@ -2324,7 +2329,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         97 => sys_getrlimit(arg1, arg2),
         // 109: setpgid(pid, pgid) — real: update pgid in PCB
         109 => {
-            let target = if arg1 == 0 { crate::proc::current_pid() } else { arg1 };
+            let target = if arg1 == 0 { crate::proc::current_pid_lockless() } else { arg1 };
             let new_pgid = if arg2 == 0 { target as u32 } else { arg2 as u32 };
             let mut procs = crate::proc::PROCESS_TABLE.lock();
             match procs.iter_mut().find(|p| p.pid == target) {
@@ -2334,13 +2339,13 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         }
         // 111: getpgrp() — return caller's pgid
         111 => {
-            let pid = crate::proc::current_pid();
+            let pid = crate::proc::current_pid_lockless();
             let procs = crate::proc::PROCESS_TABLE.lock();
             procs.iter().find(|p| p.pid == pid).map(|p| p.pgid as i64).unwrap_or(pid as i64)
         }
         // 112: setsid() — become session leader with new sid/pgid
         112 => {
-            let pid = crate::proc::current_pid();
+            let pid = crate::proc::current_pid_lockless();
             let mut procs = crate::proc::PROCESS_TABLE.lock();
             if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
                 p.pgid = pid as u32;
@@ -2350,13 +2355,13 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         }
         // 121: getpgid(pid) — return pgid of target (0 = caller)
         121 => {
-            let target = if arg1 == 0 { crate::proc::current_pid() } else { arg1 };
+            let target = if arg1 == 0 { crate::proc::current_pid_lockless() } else { arg1 };
             let procs = crate::proc::PROCESS_TABLE.lock();
             procs.iter().find(|p| p.pid == target).map(|p| p.pgid as i64).unwrap_or(-3)
         }
         // 122: getsid(pid) — return session id
         122 => {
-            let target = if arg1 == 0 { crate::proc::current_pid() } else { arg1 };
+            let target = if arg1 == 0 { crate::proc::current_pid_lockless() } else { arg1 };
             let procs = crate::proc::PROCESS_TABLE.lock();
             procs.iter().find(|p| p.pid == target).map(|p| p.sid as i64).unwrap_or(-3)
         }
@@ -2367,7 +2372,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let ret = crate::syscall::sys_dup2(arg1 as usize, arg2 as usize);
             if ret >= 0 && (arg3 & 0x0008_0000) != 0 {
                 // O_CLOEXEC: set cloexec on the new fd
-                let pid = crate::proc::current_pid();
+                let pid = crate::proc::current_pid_lockless();
                 let mut procs = crate::proc::PROCESS_TABLE.lock();
                 if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
                     if let Some(Some(f)) = proc.file_descriptors.get_mut(arg2 as usize) {
@@ -2377,7 +2382,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             }
             #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
             {
-                let pid = crate::proc::current_pid();
+                let pid = crate::proc::current_pid_lockless();
                 if pid == 1 || crate::syscall::ring::is_tracked(pid) {
                     crate::serial_println!("[FF/dup2] pid={} old={} new={} flags={:#x} ret={} (dup3)", pid, arg1, arg2, arg3, ret);
                 }
@@ -2629,7 +2634,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // 436: close_range(first, last, flags) — close a range of fds
         // (also mapped at 355 for backwards compat, but 436 is the correct x86_64 number)
         436 | 355 => {
-            let pid = crate::proc::current_pid();
+            let pid = crate::proc::current_pid_lockless();
             let first = arg1 as usize;
             let last = (arg2 as usize).min(4095);
             for fd in first..=last {
@@ -2791,7 +2796,7 @@ fn sys_getrlimit(resource: u64, rlim_ptr: u64) -> i64 {
     };
     // Read per-process soft limit.
     let soft = if resource < 16 {
-        let pid = crate::proc::current_pid();
+        let pid = crate::proc::current_pid_lockless();
         let procs = crate::proc::PROCESS_TABLE.lock();
         procs.iter().find(|p| p.pid == pid)
             .map(|p| p.rlimits_soft[resource as usize])
@@ -2815,7 +2820,7 @@ fn sys_getrlimit(resource: u64, rlim_ptr: u64) -> i64 {
 fn sys_select_linux(
     nfds: u64, readfds: u64, writefds: u64, _exceptfds: u64, timeout: u64,
 ) -> i64 {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let nfds = nfds.min(1024) as usize;
     let mut ready = 0i64;
 
@@ -2950,7 +2955,7 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
     if advice != MADV_DONTNEED && advice != MADV_FREE { return 0; }
     if len == 0 { return 0; }
 
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let start = addr & !0xFFF;
     let end   = (addr + len + 0xFFF) & !0xFFF;
 
@@ -3047,7 +3052,7 @@ fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64, new_addr:
 pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
     let buf_ptr = buf as *mut u8;
     let count = count as usize;
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
 
     // ── Special fd types take priority over the fd-number shortcuts ─────────
     // Must check these BEFORE the `fd == 0` stdin branch because kernel tests
@@ -3269,7 +3274,7 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
 
     #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
     {
-        let pid = crate::proc::current_pid();
+        let pid = crate::proc::current_pid_lockless();
         if pid == 1 || crate::syscall::ring::is_tracked(pid) {
             // Skip ultra-short non-printable bursts (e.g. the 1-byte `\n`
             // ping-pongs some stdio buffers emit) unless clearly human-visible
@@ -3326,7 +3331,7 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
     // ── Special fd types take priority over the fd-number shortcuts ─────────
     // Must check these BEFORE the `fd == 1/2` stdout/stderr branch because
     // kernel tests and user processes may allocate pipe/socket/eventfd at fd 1.
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     if crate::syscall::is_pipe_fd(pid, fd as usize) {
         let pipe_id = crate::syscall::get_pipe_id(pid, fd as usize);
         let slice = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
@@ -3398,7 +3403,7 @@ pub fn sys_open_linux(pathname: u64, flags: u64, _mode: u64) -> i64 {
     let ret = sys_open_linux_inner(pathname, flags, _mode);
     #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
     {
-        let pid = crate::proc::current_pid();
+        let pid = crate::proc::current_pid_lockless();
         if pid == 1 || crate::syscall::ring::is_tracked(pid) {
             crate::serial_println!(
                 "[FF/open-ret] pid={} path={} ret={}",
@@ -3425,7 +3430,7 @@ fn sys_open_linux_inner(pathname: u64, flags: u64, _mode: u64) -> i64 {
         Ok(s) => s,
         Err(_) => return -22,
     };
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
     if pid == 1 || crate::syscall::ring::is_tracked(pid) {
         crate::serial_println!("[FF/open] pid={} path={}", pid, path);
@@ -3552,7 +3557,7 @@ fn sys_stat_linux(pathname: u64, stat_buf: u64) -> i64 {
 
 /// Linux fstat(fd, statbuf) — uses Linux stat layout.
 fn sys_fstat_linux(fd_num: usize, stat_buf: *mut u8) -> i64 {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let procs = crate::proc::PROCESS_TABLE.lock();
     let proc_entry = match procs.iter().find(|p| p.pid == pid) {
         Some(p) => p,
@@ -3603,7 +3608,7 @@ fn sys_chdir_linux(pathname: u64) -> i64 {
 
 /// fchdir(fd) — change CWD to the directory referred to by `fd`.
 fn sys_fchdir_linux(fd: u64) -> i64 {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let open_path = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         let proc = match procs.iter().find(|p| p.pid == pid) {
@@ -3629,7 +3634,7 @@ fn sys_faccessat_linux(dirfd: u64, pathname: u64, mode: u64) -> i64 {
         return sys_access(pathname, mode);
     }
     // Try to get the base directory from the fd and reconstruct full path
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let base = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         let proc = match procs.iter().find(|p| p.pid == pid) {
@@ -3819,25 +3824,49 @@ pub fn sys_set_tid_address(tidptr: u64) -> i64 {
 /// seconds (`vdso::wall_secs_at_boot()`) plus the monotonic tick delta —
 /// the same formula as `__vdso_clock_gettime` (see `kernel/vdso/vdso.S`).
 pub fn sys_clock_gettime(clk_id: u64, tp: u64) -> i64 {
-    const CLOCK_REALTIME:  u64 = 0;
-    const CLOCK_MONOTONIC: u64 = 1;
+    // clk_id values per clock_gettime(2): 0=REALTIME, 1=MONOTONIC,
+    // 4=MONOTONIC_RAW, 5=REALTIME_COARSE, 6=MONOTONIC_COARSE.
+    const CLOCK_REALTIME:         u64 = 0;
+    const CLOCK_MONOTONIC:        u64 = 1;
+    const CLOCK_MONOTONIC_RAW:    u64 = 4;
+    const CLOCK_REALTIME_COARSE:  u64 = 5;
+    const CLOCK_MONOTONIC_COARSE: u64 = 6;
     if tp == 0 {
         return -22; // EINVAL
     }
-    let ticks = crate::arch::x86_64::irq::get_ticks();
-    let mono_secs = ticks / 100;
-    let sub_nsecs = (ticks % 100) * 10_000_000u64; // 10 ms per PIT tick
-    let secs = if clk_id == CLOCK_REALTIME {
-        // boot_wall_secs + monotonic seconds — matches vDSO exactly.
-        crate::proc::vdso::wall_secs_at_boot().saturating_add(mono_secs)
-    } else {
-        // CLOCK_MONOTONIC / CLOCK_MONOTONIC_RAW / CLOCK_PROCESS_CPUTIME_ID etc.
-        mono_secs
-    };
     let _ = CLOCK_MONOTONIC; // suppress unused warning
+
+    // HRES paths use TSC-derived ns — identical to the vDSO fast path so
+    // futex absolute deadlines stay coherent.  COARSE paths use the 10 ms
+    // tick counter per clock_gettime(2) "coarse resolution" semantics.
+    let is_coarse = clk_id == CLOCK_REALTIME_COARSE || clk_id == CLOCK_MONOTONIC_COARSE;
+    let (secs, nsecs) = if is_coarse {
+        let ticks = crate::arch::x86_64::irq::get_ticks();
+        let mono_secs = ticks / 100;
+        let sub_ns = (ticks % 100) * 10_000_000u64;
+        (mono_secs, sub_ns)
+    } else {
+        let ns_total = crate::proc::vdso::monotonic_ns();
+        if ns_total == 0 {
+            // Calibration not yet published — fall back to tick granularity.
+            let ticks = crate::arch::x86_64::irq::get_ticks();
+            (ticks / 100, (ticks % 100) * 10_000_000u64)
+        } else {
+            (ns_total / 1_000_000_000, ns_total % 1_000_000_000)
+        }
+    };
+
+    let is_realtime = clk_id == CLOCK_REALTIME || clk_id == CLOCK_REALTIME_COARSE;
+    let _ = CLOCK_MONOTONIC_RAW;
+    let secs = if is_realtime {
+        crate::proc::vdso::wall_secs_at_boot().saturating_add(secs)
+    } else {
+        secs
+    };
+
     let buf = unsafe { core::slice::from_raw_parts_mut(tp as *mut u8, 16) };
     buf[0..8].copy_from_slice(&secs.to_le_bytes());
-    buf[8..16].copy_from_slice(&sub_nsecs.to_le_bytes());
+    buf[8..16].copy_from_slice(&nsecs.to_le_bytes());
     0
 }
 
@@ -3863,7 +3892,7 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
     let base  = page_align_down(addr);
     let end   = page_align_up(addr.wrapping_add(len));
     let prot  = prot as u32;
-    let pid   = crate::proc::current_pid();
+    let pid   = crate::proc::current_pid_lockless();
 
     let mut procs = crate::proc::PROCESS_TABLE.lock();
     let proc = match procs.iter_mut().find(|p| p.pid == pid) {
@@ -4028,7 +4057,7 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> i64 {
     const F_RDLCK: i16 = 0;
     const F_WRLCK: i16 = 1;
     const F_UNLCK: i16 = 2;
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     match cmd {
         F_GETLK | F_SETLK | F_SETLKW => {
             if arg == 0 { return -22; } // EINVAL: null flock pointer
@@ -4213,7 +4242,7 @@ fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: u64, count: usize) -> i
     if count == 0 { return 0; }
     let max_chunk: usize = 65536; // send at most 64 KiB at a time
     let len = count.min(max_chunk);
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
 
     // Snapshot in_fd info and the read offset.
     let (in_mount, in_inode, in_offset_cur) = {
@@ -4405,13 +4434,19 @@ fn sys_gettimeofday(tv: u64, _tz: u64) -> i64 {
     if tv == 0 {
         return 0;
     }
-    let ticks = crate::arch::x86_64::irq::get_ticks();
-    let secs  = crate::proc::vdso::wall_secs_at_boot()
-        .saturating_add(ticks / 100);
-    let usecs = (ticks % 100) * 10_000; // 10ms per tick → microseconds
+    // TSC-derived ns for vDSO/syscall parity; falls back to tick
+    // granularity before TSC calibration is published (pre-apic::init).
+    let mono_ns = crate::proc::vdso::monotonic_ns();
+    let (mono_secs, sub_usecs) = if mono_ns != 0 {
+        (mono_ns / 1_000_000_000, (mono_ns % 1_000_000_000) / 1000)
+    } else {
+        let ticks = crate::arch::x86_64::irq::get_ticks();
+        (ticks / 100, (ticks % 100) * 10_000)
+    };
+    let secs = crate::proc::vdso::wall_secs_at_boot().saturating_add(mono_secs);
     let buf = unsafe { core::slice::from_raw_parts_mut(tv as *mut u8, 16) };
     buf[0..8].copy_from_slice(&secs.to_le_bytes());
-    buf[8..16].copy_from_slice(&usecs.to_le_bytes());
+    buf[8..16].copy_from_slice(&sub_usecs.to_le_bytes());
     0
 }
 
@@ -4419,7 +4454,7 @@ fn sys_gettimeofday(tv: u64, _tz: u64) -> i64 {
 ///
 /// Each entry: { d_ino: u64, d_off: u64, d_reclen: u16, d_type: u8, d_name: [u8] }
 fn sys_getdents64(fd: u64, buf: u64, count: u64) -> i64 {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let (mount_idx, inode, offset, open_path) = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         let proc_entry = match procs.iter().find(|p| p.pid == pid) {
@@ -4612,7 +4647,7 @@ fn sys_openat(dirfd: u64, pathname: u64, flags: u64, mode: u64) -> i64 {
     }
 
     // Get the directory path from the dirfd.
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     // Resolve dirfd → directory path under PROCESS_TABLE, then drop the lock
     // explicitly before any ring::* call. Keeping ring access strictly
     // disjoint from PROCESS_TABLE prevents an ABBA against any other path
@@ -4685,7 +4720,7 @@ fn sys_newfstatat(dirfd: u64, pathname: u64, statbuf: u64, flags: u64) -> i64 {
     }
 
     // Relative path with real dirfd — resolve relative to dirfd's path.
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let dir_path = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         let proc_entry = match procs.iter().find(|p| p.pid == pid) {
@@ -4788,7 +4823,7 @@ fn sys_rt_sigaction_linux(sig: u64, act: u64, oldact: u64, _sigsetsize: u64) -> 
 
     // Step 2: take the lock, swap in the new action, and capture the prior
     // one for later write-back.  No user-pointer dereferences inside.
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let prior_handler_addr: u64;
     let prior_restorer_addr: u64;
     let prior_sa_flags: u64;
@@ -4879,7 +4914,7 @@ fn sys_rt_sigprocmask_linux(how: u64, set: u64, oldset: u64, _sigsetsize: u64) -
 
     // Step 2: take the lock, fold in the new mask, capture the prior mask
     // for write-back.  No user-pointer dereferences inside this block.
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let prior_mask: u64 = {
         let mut procs = crate::proc::PROCESS_TABLE.lock();
         let proc_entry = match procs.iter_mut().find(|p| p.pid == pid) {
@@ -4951,7 +4986,7 @@ pub fn sys_futex_linux(
 
     let op = futex_op & 0x7F; // Strip FUTEX_PRIVATE_FLAG and FUTEX_CLOCK_REALTIME
     let abs_realtime = (futex_op & FUTEX_CLOCK_REALTIME) != 0;
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
 
     // Read the timespec at `timeout_ptr` (NULL means "no timeout") and convert
     // it to a *relative* nanosecond duration that the rest of the handler can
@@ -5005,10 +5040,18 @@ pub fn sys_futex_linux(
             // the absolute timestamp back here; if the two formulas differ,
             // the deadline appears already-expired and ETIMEDOUT fires
             // immediately, breaking every timed wait.
-            let wall_ticks = crate::arch::x86_64::irq::get_ticks();
-            let mono_secs  = wall_ticks / 100;
-            let sub_nsecs  = (wall_ticks % 100) * 10_000_000;
-            let now_secs   = crate::proc::vdso::wall_secs_at_boot()
+            // TSC-derived ns for parity with __vdso_clock_gettime and
+            // sys_clock_gettime — if these three formulas differ, an
+            // absolute deadline computed via the vDSO can appear
+            // already-expired here and fire ETIMEDOUT immediately.
+            let mono_ns_total = crate::proc::vdso::monotonic_ns();
+            let (mono_secs, sub_nsecs) = if mono_ns_total != 0 {
+                (mono_ns_total / 1_000_000_000, mono_ns_total % 1_000_000_000)
+            } else {
+                let wall_ticks = crate::arch::x86_64::irq::get_ticks();
+                (wall_ticks / 100, (wall_ticks % 100) * 10_000_000)
+            };
+            let now_secs = crate::proc::vdso::wall_secs_at_boot()
                 .saturating_add(mono_secs);
             let now_ns = now_secs
                 .saturating_mul(1_000_000_000)
@@ -5315,7 +5358,7 @@ fn sys_eventfd_linux(initval: u64, flags: u32) -> i64 {
         return -24; // EMFILE
     }
 
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let mut procs = crate::proc::PROCESS_TABLE.lock();
     let proc = match procs.iter_mut().find(|p| p.pid == pid) {
         Some(p) => p,
@@ -5371,7 +5414,7 @@ fn sys_pipe2_linux(fds_out: *mut u32, flags: u32) -> i64 {
     }
 
     let pipe_id = crate::ipc::pipe::create_pipe();
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
 
     let mut procs = crate::proc::PROCESS_TABLE.lock();
     let proc = match procs.iter_mut().find(|p| p.pid == pid) {
@@ -5525,7 +5568,7 @@ fn sys_memfd_create(_name: u64, flags: u64) -> i64 {
     }
 
     let seq = MEMFD_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
 
     // Build path /tmp/.memfd_NNNN
     let mut path_buf = [0u8; 32];
@@ -5815,7 +5858,7 @@ fn signal_pending(pid: u64) -> bool {
 
 /// epoll_create / epoll_create1 — allocate a new epoll fd.
 fn sys_epoll_create1(_flags: u32) -> i64 {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let mut procs = crate::proc::PROCESS_TABLE.lock();
     let proc = match procs.iter_mut().find(|p| p.pid == pid) {
         Some(p) => p,
@@ -5848,7 +5891,7 @@ fn sys_epoll_create1(_flags: u32) -> i64 {
 /// epoll_ctl — add/modify/delete a watched fd.
 fn sys_epoll_ctl(epfd: usize, op: u64, fd: usize, event_ptr: u64) -> i64 {
     use crate::ipc::epoll::{EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, EpollEvent};
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
 
     // Read the caller's epoll_event (only needed for ADD / MOD).
     let (events, data) = if event_ptr != 0 && op != EPOLL_CTL_DEL {
@@ -5894,7 +5937,7 @@ fn sys_epoll_ctl(epfd: usize, op: u64, fd: usize, event_ptr: u64) -> i64 {
 fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i32) -> i64 {
     use crate::ipc::epoll::{EpollEvent, EPOLLERR};
     if maxevents == 0 { return -22; } // EINVAL
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
 
     // ── Step 1: snapshot the watch list while briefly holding the lock ────────
     let watches_snap: alloc::vec::Vec<(usize, u32, u64)> = {
@@ -5986,7 +6029,7 @@ fn sys_timerfd_create(clockid: u32) -> i64 {
     let slot_id = crate::ipc::timerfd::create(clockid);
     if slot_id == u64::MAX { return -24; } // EMFILE
 
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let fd = crate::vfs::FileDescriptor::timer_fd(slot_id);
 
     let mut procs = crate::proc::PROCESS_TABLE.lock();
@@ -6014,7 +6057,7 @@ fn sys_timerfd_create(clockid: u32) -> i64 {
 /// `new_value` is a `struct itimerspec { it_interval, it_value }` where each
 /// timespec is `{ tv_sec: i64, tv_nsec: i64 }` (16 bytes each, 32 bytes total).
 fn sys_timerfd_settime(fd_num: u64, flags: u32, new_value_ptr: u64, old_value_ptr: u64) -> i64 {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     if !crate::syscall::is_timerfd_fd(pid, fd_num as usize) { return -9; } // EBADF
     let slot_id = crate::syscall::get_timerfd_id(pid, fd_num as usize);
 
@@ -6055,7 +6098,7 @@ fn sys_timerfd_settime(fd_num: u64, flags: u32, new_value_ptr: u64, old_value_pt
 
 /// `timerfd_gettime(fd, *curr_value)` — read current timer setting.
 fn sys_timerfd_gettime(fd_num: u64, curr_value_ptr: u64) -> i64 {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     if !crate::syscall::is_timerfd_fd(pid, fd_num as usize) { return -9; } // EBADF
     let slot_id = crate::syscall::get_timerfd_id(pid, fd_num as usize);
     let (interval_ns, value_ns) = crate::ipc::timerfd::gettime(slot_id);
@@ -6086,7 +6129,7 @@ fn sys_timerfd_gettime(fd_num: u64, curr_value_ptr: u64) -> i64 {
 fn sys_signalfd4(fd_num: u64, mask_ptr: u64, sizemask: u64, _flags: u32) -> i64 {
     if sizemask < 8 || !crate::syscall::validate_user_ptr(mask_ptr, 8) { return -22; } // EINVAL/EFAULT
     let sigmask = unsafe { *(mask_ptr as *const u64) };
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
 
     // fd == u64::MAX means -1 (create new).
     if fd_num == u64::MAX || fd_num as i64 == -1 {
@@ -6129,7 +6172,7 @@ fn sys_inotify_init1(_flags: u32) -> i64 {
     let slot_id = crate::ipc::inotify::create();
     if slot_id == u64::MAX { return -24; } // EMFILE
 
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let fd = crate::vfs::FileDescriptor::inotify_fd(slot_id);
 
     let mut procs = crate::proc::PROCESS_TABLE.lock();
@@ -6154,7 +6197,7 @@ fn sys_inotify_init1(_flags: u32) -> i64 {
 
 /// `inotify_add_watch(fd, pathname, mask)` — add a watch descriptor.
 fn sys_inotify_add_watch(fd_num: u64, path_ptr: u64, mask: u32) -> i64 {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     if !crate::syscall::is_inotify_fd(pid, fd_num as usize) { return -9; } // EBADF
     let id = crate::syscall::get_inotify_id(pid, fd_num as usize);
     let path_bytes = read_cstring_from_user(path_ptr);
@@ -6165,7 +6208,7 @@ fn sys_inotify_add_watch(fd_num: u64, path_ptr: u64, mask: u32) -> i64 {
 
 /// `inotify_rm_watch(fd, wd)` — remove a watch descriptor.
 fn sys_inotify_rm_watch(fd_num: u64, wd: i32) -> i64 {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     if !crate::syscall::is_inotify_fd(pid, fd_num as usize) { return -9; } // EBADF
     let id = crate::syscall::get_inotify_id(pid, fd_num as usize);
     if crate::ipc::inotify::rm_watch(id, wd) { 0 } else { -22 }
@@ -6231,7 +6274,7 @@ fn check_and_deliver_alarm(pid: u64) {
 /// Returns the number of seconds remaining in any previously scheduled alarm,
 /// or 0 if no alarm was set.
 fn sys_alarm(seconds: u64) -> i64 {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let now = crate::arch::x86_64::irq::get_ticks();
     let mut procs = crate::proc::PROCESS_TABLE.lock();
     let proc = match procs.iter_mut().find(|p| p.pid == pid) {
@@ -6271,7 +6314,7 @@ fn sys_setitimer(which: u64, new_val_ptr: u64, old_val_ptr: u64) -> i64 {
         return -22; // EINVAL
     }
 
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let now = crate::arch::x86_64::irq::get_ticks();
 
     // Read the new itimerval before acquiring the process lock.
@@ -6336,7 +6379,7 @@ fn sys_getitimer(which: u64, val_ptr: u64) -> i64 {
     if val_ptr == 0 || !crate::syscall::validate_user_ptr(val_ptr, 32) {
         return -14; // EFAULT
     }
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let now = crate::arch::x86_64::irq::get_ticks();
     let procs = crate::proc::PROCESS_TABLE.lock();
     let proc = match procs.iter().find(|p| p.pid == pid) {
@@ -6374,7 +6417,7 @@ fn resolve_at_path(dirfd: u64, rel_ptr: u64) -> Result<alloc::string::String, i6
     }
     // Relative path with AT_FDCWD: use process CWD.
     if dirfd as i64 == AT_FDCWD {
-        let pid = crate::proc::current_pid();
+        let pid = crate::proc::current_pid_lockless();
         let procs = crate::proc::PROCESS_TABLE.lock();
         let cwd = procs.iter().find(|p| p.pid == pid)
             .map(|p| p.cwd.clone())
@@ -6387,7 +6430,7 @@ fn resolve_at_path(dirfd: u64, rel_ptr: u64) -> Result<alloc::string::String, i6
         });
     }
     // Relative path with a real directory fd: get dir path from fd table.
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let dir_path = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         let proc = procs.iter().find(|p| p.pid == pid).ok_or(-3i64)?;
@@ -6461,7 +6504,7 @@ fn sys_renameat(olddirfd: u64, oldpath: u64, newdirfd: u64, newpath: u64) -> i64
 ///
 /// Per man 2 getdents: d_type is at offset d_reclen-1 (last byte of the record).
 fn sys_getdents(fd: u64, buf: u64, count: u64) -> i64 {
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let (mount_idx, inode, offset) = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         let proc_entry = match procs.iter().find(|p| p.pid == pid) {
@@ -6556,7 +6599,7 @@ fn sys_getdents(fd: u64, buf: u64, count: u64) -> i64 {
 fn sys_preadv(fd: u64, iov_ptr: u64, iovcnt: u64, offset: i64) -> i64 {
     if iovcnt == 0 { return 0; }
     if iovcnt > 1024 { return -22; } // EINVAL: IOV_MAX
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     // Save, seek to offset, scatter-read, restore.
     let saved = crate::syscall::sys_lseek(fd as usize, 0, 1 /*SEEK_CUR*/);
     let sk = crate::syscall::sys_lseek(fd as usize, offset, 0 /*SEEK_SET*/);
@@ -6592,7 +6635,7 @@ fn sys_preadv(fd: u64, iov_ptr: u64, iovcnt: u64, offset: i64) -> i64 {
 fn sys_pwritev(fd: u64, iov_ptr: u64, iovcnt: u64, offset: i64) -> i64 {
     if iovcnt == 0 { return 0; }
     if iovcnt > 1024 { return -22; } // EINVAL: IOV_MAX
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let saved = crate::syscall::sys_lseek(fd as usize, 0, 1 /*SEEK_CUR*/);
     let sk = crate::syscall::sys_lseek(fd as usize, offset, 0 /*SEEK_SET*/);
     if sk < 0 { return sk; }
@@ -6649,7 +6692,7 @@ fn emit_user_stack_snapshot(num: u64, sample_idx: u64) {
     const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
     const MAX_FRAMES: usize = 16;
 
-    let pid = crate::proc::current_pid();
+    let pid = crate::proc::current_pid_lockless();
     let tid = crate::proc::current_tid();
     let (user_rsp, user_rbp) = crate::syscall::get_user_rsp_rbp();
     let leaf_rip = unsafe { crate::syscall::get_user_rip() };
