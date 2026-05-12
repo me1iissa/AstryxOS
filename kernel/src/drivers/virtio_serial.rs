@@ -640,6 +640,13 @@ pub fn init() -> bool {
         // (PORT_NAME, etc.)"; PORT_OPEN flips the host's
         // `host_connected` flag for the chardev backend and authorises
         // data delivery into vq4.
+        //
+        // Spec deviation: virtio-console §5.3.6 has the guest first consume
+        // the host's PORT_ADD on cq_rx before announcing PORT_READY/PORT_OPEN.
+        // QEMU tolerates the inversion (PORT_READY/OPEN sent ahead of seeing
+        // PORT_ADD on the rx side) and the alternative — block init waiting
+        // for cq_rx — would force IRQ-driven completion or an arbitrary spin,
+        // both of which complicate boot ordering for no functional gain.
         send_control_msg(&mut dev, QGA_PORT_ID, VIRTIO_CONSOLE_PORT_READY, 1);
         send_control_msg(&mut dev, QGA_PORT_ID, VIRTIO_CONSOLE_PORT_OPEN,  1);
     }
@@ -1294,12 +1301,6 @@ pub fn stats() -> Option<Stats> {
 pub fn spurious_irq_count() -> u64 {
     SPURIOUS_IRQS.load(Ordering::Relaxed)
 }
-
-// Anchor for the unused atomic re-export so a future capability-list
-// rework can land its imports without churn.  Kept #[allow(dead_code)]
-// because the IRQ path uses AtomicU16 transitively via Mutex spinlock.
-#[allow(dead_code)]
-fn _atomic_u16_anchor() -> AtomicU16 { AtomicU16::new(0) }
 
 // ── Loopback test helpers (Phase QGA-2) ─────────────────────────────────────
 //
