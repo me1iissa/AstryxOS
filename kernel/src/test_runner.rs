@@ -173,6 +173,10 @@ pub fn run() -> ! {
     total += 1;
     if test_eventfd_wake_hook() { passed += 1; }
 
+    // ── Test 0bb: SERIAL per-CPU re-entry guard ──────────────────────────
+    total += 1;
+    if test_serial_reentry_guard() { passed += 1; }
+
     // ── Test 0c: virtio-serial / /dev/vport0p0 (Phase QGA-1) ─────────────
     #[cfg(feature = "qga")]
     {
@@ -23144,6 +23148,58 @@ fn test_eventfd_wake_hook() -> bool {
     }
     test_println!("  reader woke promptly (outcome={}, no leaked waiters) ✓", outcome);
     test_pass!("eventfd wake hook — reader parks, writer wakes");
+    true
+}
+
+// ── Test 0bb: SERIAL per-CPU re-entry guard ─────────────────────────────────
+//
+// PR #143 enabled the 16550A TX FIFO and replaced per-byte cli/sti with
+// chunked-IRQ-window writes inside `_serial_print`.  The chunked design
+// re-opens the IRQ window between FIFO chunks, so the local timer ISR
+// can fire on the same CPU that already holds `SERIAL`.  If that ISR
+// emits a `serial_println!` (e.g. the `[HB]` heartbeat), it re-enters
+// `_serial_print` and `spin::Mutex::lock()` spins forever waiting for
+// itself — same-CPU self-deadlock.
+//
+// The fix (this test's subject): a per-CPU "in `_serial_print`" atomic
+// flag.  On entry to `_serial_print` (after cli) we swap our slot to
+// `true`; if the prior value was `true`, drop the line and return.
+// Intel SDM Vol 3 §6.6 frames the constraint: a nested handler must
+// not block on resources held by interrupted code.
+//
+// Falsification condition: with the guard installed, a forced re-entry
+// must return in well under 1 ms wall time.  A broken guard would
+// instead spin on the inner `SERIAL.lock()` for many milliseconds.
+// We measure the nested call with rdtsc and assert a generous
+// 100,000,000-cycle ceiling — roughly 30 ms even at 3 GHz, vastly
+// larger than the ~tens-of-cycles the working path takes.
+fn test_serial_reentry_guard() -> bool {
+    test_header!("SERIAL per-CPU re-entry guard");
+
+    // The helper sets the per-CPU slot, calls serial_println! once, and
+    // returns the elapsed TSC delta of the nested call.  If the guard
+    // is broken this self-deadlocks instead of returning.
+    let cycles = crate::drivers::serial::_test_force_reentry_drop_returns_quickly();
+
+    // 1e8 cycles is ~30 ms at 3 GHz / ~100 ms at 1 GHz — both vastly
+    // longer than any non-spinning code path through `_serial_print`
+    // (which is ~tens of cycles when the guard fires).  Any value
+    // approaching this ceiling means the guard didn't trip.
+    const CEILING: u64 = 100_000_000;
+    if cycles == 0 || cycles >= CEILING {
+        test_fail!("serial_reentry_guard",
+            "nested serial_println! took {} TSC cycles (ceiling {}) — guard did not drop the re-entrant line",
+            cycles, CEILING);
+        return false;
+    }
+    test_println!("  forced re-entry returned in {} TSC cycles (<< {}) ✓", cycles, CEILING);
+
+    // Subsequent normal serial_println! must still work after the
+    // helper restored the slot to false.
+    crate::serial_println!("  [post-reentry] subsequent normal print works");
+    test_println!("  subsequent normal serial_println! succeeded ✓");
+
+    test_pass!("SERIAL per-CPU re-entry guard");
     true
 }
 

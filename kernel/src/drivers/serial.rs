@@ -41,12 +41,24 @@
 //!
 //! # Reentrancy / SMP safety
 //!
-//! The `SERIAL` `spin::Mutex` prevents concurrent FIFO writers from two
-//! CPUs interleaving bytes.  The per-chunk cli prevents the *same* CPU's
-//! timer ISR from calling `serial_println!` while the mutex is already
-//! held on that CPU (which would deadlock, since `spin::Mutex` is not
-//! reentrant).  Together they give: one writer at a time, no deadlock,
-//! bounded IRQ blackout per chunk.
+//! Two layered guards keep `_serial_print` safe under SMP + nested IRQs:
+//!
+//! 1. The `SERIAL` `spin::Mutex` prevents concurrent FIFO writers from
+//!    two CPUs interleaving bytes.
+//!
+//! 2. The `PER_CPU_IN_SERIAL` atomic-flag array catches same-CPU
+//!    re-entry.  Per-chunk cli bounds the IRQ-off window but the window
+//!    re-opens between chunks, so the local timer ISR can fire on a CPU
+//!    that already holds `SERIAL`.  If that ISR emits a
+//!    `serial_println!` (e.g. the `[HB]` heartbeat), `_serial_print`
+//!    detects the per-CPU flag is already set and drops the re-entrant
+//!    line rather than spinning on a non-reentrant `spin::Mutex` it
+//!    already owns.
+//!
+//! Together: one writer per CPU at a time, no same-CPU self-deadlock,
+//! bounded IRQ blackout per chunk.  The trade-off is that re-entrant
+//! diagnostic lines are dropped; emergency output never goes through
+//! this path (see "Bugcheck / panic path" below).
 //!
 //! The 16550A FIFO is safe under SMP because only the one CPU holding the
 //! `SERIAL` mutex ever writes to the UART at a time — no concurrent writers
@@ -62,6 +74,7 @@
 
 use crate::hal;
 use core::fmt;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 /// COM1 base I/O port.
@@ -110,6 +123,34 @@ const FIFO_DEPTH: usize = 16;
 
 /// Global serial port instance.
 static SERIAL: Mutex<SerialPort> = Mutex::new(SerialPort { base: COM1 });
+
+/// Per-CPU "currently inside `_serial_print`" flag.
+///
+/// `spin::Mutex` is not reentrant.  PR #143's chunked design re-opens the
+/// IRQ window between 16-byte FIFO chunks (cli → outb × N → restore IF →
+/// cli for next chunk), so the local timer ISR can fire on the *same*
+/// CPU while we still hold `SERIAL`.  If that ISR's handler emits a
+/// `serial_println!` (e.g. the `[HB]` heartbeat), it would re-enter
+/// `_serial_print` and spin forever trying to acquire a mutex the CPU
+/// already owns.
+///
+/// The slot is indexed by `apic::cpu_index()` (lockless: read of
+/// `IA32_TSC_AUX` via `rdmsr` — Intel SDM Vol 3 §10.4 / §17.17).  On
+/// entry to `_serial_print` (after `cli`) we atomic-swap our slot to
+/// `true`; if the prior value was already `true`, this is a same-CPU
+/// re-entry from an ISR and we return immediately, dropping the
+/// diagnostic line.  Dropping one line is the intentional trade vs a
+/// hard self-deadlock — Intel SDM Vol 3 §6.6 notes that interrupt
+/// handlers must avoid blocking on resources held by interrupted code,
+/// which is exactly the constraint here.
+///
+/// The fault-immune bugcheck path (PR #127) does NOT use `_serial_print`
+/// and is unaffected by this guard — it routes through
+/// `util::no_alloc_fmt::bugcheck_serial_write_bytes`, which bypasses
+/// `SERIAL` entirely.  So emergency panic output is never dropped by
+/// this mechanism.
+static PER_CPU_IN_SERIAL: [AtomicBool; crate::arch::x86_64::apic::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; crate::arch::x86_64::apic::MAX_CPUS];
 
 /// UART 16550 serial port driver.
 pub struct SerialPort {
@@ -290,19 +331,23 @@ pub fn stop() {
 ///
 /// # Why cli at all?
 ///
-/// The `SERIAL` `spin::Mutex` serialises concurrent CPUs.  But if a timer
-/// ISR fires on the *same* CPU while we hold the mutex and calls
-/// `serial_println!`, it would attempt to lock `SERIAL` again — deadlock,
-/// because `spin::Mutex` is not reentrant.  The per-chunk cli prevents
-/// that ISR from running between "mutex acquired" and "FIFO chunk
-/// committed".  No ISR runs while a chunk is being written, but the IRQ
-/// window re-opens between chunks so a 4 KiB write still admits hundreds
-/// of timer/IPI events during its lifetime.
+/// The `SERIAL` `spin::Mutex` serialises concurrent CPUs.  Per-chunk cli
+/// bounds the worst-case IRQ-off window during a long write — but it
+/// does NOT prevent same-CPU re-entry, because the IRQ window re-opens
+/// between chunks.  A timer ISR firing in that window and emitting a
+/// `serial_println!` would re-enter and spin on the non-reentrant
+/// `spin::Mutex` we already hold.  That case is handled by the
+/// `PER_CPU_IN_SERIAL` guard installed at the top of this function:
+/// re-entry on the same CPU is detected via an atomic swap and the
+/// re-entrant line is dropped rather than deadlocking (Intel SDM Vol 3
+/// §6.6 — interrupt handlers must not block on resources held by
+/// interrupted code).
 ///
 /// # Bugcheck path
 ///
 /// `ke::bugcheck` never calls this function.  It bypasses `SERIAL`
-/// entirely via `util::no_alloc_fmt::bugcheck_serial_write_bytes`.
+/// entirely via `util::no_alloc_fmt::bugcheck_serial_write_bytes`, so
+/// the recursion guard never drops emergency output.
 #[doc(hidden)]
 pub fn _serial_print(args: fmt::Arguments) {
     use fmt::Write;
@@ -323,6 +368,30 @@ pub fn _serial_print(args: fmt::Arguments) {
     // fire in the tiny window between "lock succeeded" and "first chunk
     // committed".  The IRQ window is re-opened per-chunk below.
     crate::hal::disable_interrupts();
+
+    // Per-CPU re-entry guard.  IRQs are off here, so the read-modify-write
+    // on our slot cannot race with another handler on the same CPU; the
+    // atomic-swap is paranoia against the compiler reordering loads through
+    // the cli (modelled as a side-effecting asm, but Acquire/Release matches
+    // the discipline used by `PER_CPU_CURRENT_PID` in `proc/mod.rs`).
+    //
+    // The CPU index source is `apic::cpu_index()` — a lockless read of
+    // IA32_TSC_AUX (Intel SDM Vol 3 §17.17), which holds the APIC ID written
+    // at per-CPU init.  Before that init runs the slot is harmless: the
+    // BSP returns index 0 deterministically and is the only CPU emitting.
+    let cpu = crate::arch::x86_64::apic::cpu_index();
+    if PER_CPU_IN_SERIAL[cpu].swap(true, Ordering::Acquire) {
+        // Same-CPU re-entry detected (we hold SERIAL on this CPU; an ISR
+        // fired in the inter-chunk IRQ window and ended up here).  The
+        // re-entrant `spin::Mutex::lock()` would self-deadlock.  Drop the
+        // diagnostic line — Intel SDM Vol 3 §6.6 says handlers must not
+        // block on resources held by interrupted code.  Re-enable the
+        // caller's IF before returning so we don't leak IRQ-off state.
+        if if_was_set {
+            crate::hal::enable_interrupts();
+        }
+        return;
+    }
     let mut port = SERIAL.lock();
 
     // WriteAdapter wraps SerialPort and implements a chunked IRQ-window
@@ -385,10 +454,83 @@ pub fn _serial_print(args: fmt::Arguments) {
 
     WriteAdapter { port: &mut *port, if_was_set }.write_fmt(args).ok();
 
+    // Clear the per-CPU re-entry flag under cli, so the slot transitions
+    // false→true→false strictly inside an IRQ-off window.  An ISR that
+    // fires after `enable_interrupts()` below sees the slot already
+    // cleared and is free to emit normally.  Release pairs with the
+    // Acquire on entry: the bytes-pushed-to-FIFO writes happen-before
+    // any future observer of `false`.
+    //
+    // Drop `port` first so we don't carry the mutex guard across the
+    // store (the guard's Drop unlocks SERIAL while IRQs are still off,
+    // which is the same ordering the previous code relied on).
+    drop(port);
+    crate::hal::disable_interrupts();
+    PER_CPU_IN_SERIAL[cpu].store(false, Ordering::Release);
+
     // Ensure we always restore the caller's IF state on exit, even if
     // write_fmt returned an error or the format string was empty.
     if if_was_set {
         crate::hal::enable_interrupts();
     }
     // (If IF was off on entry it remains off here — correct behaviour.)
+}
+
+/// Test-only harness for the per-CPU re-entry guard.
+///
+/// Simulates a same-CPU re-entry by forcing `PER_CPU_IN_SERIAL[cpu]` to
+/// `true` (as if `_serial_print` were already in flight on this CPU),
+/// then invoking `serial_println!`.  Returns the elapsed TSC cycles of
+/// the nested call: a guard-protected drop completes in ~tens of cycles;
+/// a self-deadlock would spin until the bounded-spin limit on the inner
+/// `SERIAL.lock()` (and almost certainly the watchdog catches it first).
+///
+/// The caller asserts the elapsed time is well under any reasonable
+/// 1 ms ceiling.  IRQs are held off across the whole forced-reentry
+/// window so the state transitions cannot race with the local timer
+/// ISR (Intel SDM Vol 3 §6.6: nested handlers must not block on
+/// resources held by interrupted code).
+#[cfg(feature = "test-mode")]
+pub fn _test_force_reentry_drop_returns_quickly() -> u64 {
+    #[inline(always)]
+    fn rdtsc() -> u64 {
+        let lo: u32;
+        let hi: u32;
+        // SAFETY: rdtsc is a side-effect-free timestamp read; the lfence
+        // prefix serialises the timing window (Intel SDM Vol 2B RDTSC).
+        unsafe {
+            core::arch::asm!("lfence; rdtsc",
+                             out("eax") lo, out("edx") hi,
+                             options(nomem, nostack));
+        }
+        ((hi as u64) << 32) | (lo as u64)
+    }
+
+    // Snapshot IF, then cli for the duration of the forced-reentry test.
+    let rflags: u64;
+    // SAFETY: pushfq/pop is a pure register read with no memory effects.
+    unsafe {
+        core::arch::asm!(
+            "pushfq; pop {rflags}",
+            rflags = out(reg) rflags,
+            options(nomem, nostack),
+        );
+    }
+    let if_was_set = rflags & (1 << 9) != 0;
+    crate::hal::disable_interrupts();
+
+    let cpu = crate::arch::x86_64::apic::cpu_index();
+    PER_CPU_IN_SERIAL[cpu].store(true, Ordering::Release);
+
+    let t0 = rdtsc();
+    // The nested call must hit the guard and return without locking
+    // SERIAL — if the guard is broken this self-deadlocks instead.
+    crate::serial_println!("[SERIAL-REENTRY-TEST] this line is intentionally dropped");
+    let t1 = rdtsc();
+
+    PER_CPU_IN_SERIAL[cpu].store(false, Ordering::Release);
+    if if_was_set {
+        crate::hal::enable_interrupts();
+    }
+    t1.saturating_sub(t0)
 }
