@@ -89,32 +89,6 @@ const FCR_FIFO_ENABLE: u8 = 0xC7;
 /// Maximum spins waiting for THRE before dropping a byte rather than hanging.
 const THRE_SPIN_LIMIT: u32 = 100_000;
 
-/// LSR register offset from base.
-const LSR: u16 = 5;
-
-/// LSR.THRE — transmit holding register empty; safe to write next byte to THR.
-const LSR_THRE: u8 = 0x20;
-
-/// LSR.TEMT — transmitter entirely empty (THR + shift register drained).
-/// Used by `stop()` to wait for the last byte to physically leave the UART.
-const LSR_TEMT: u8 = 0x40;
-
-/// FCR value that enables the NS16550A 16-byte TX/RX FIFOs.
-///
-/// Bit layout (OSDev Wiki "Serial Ports", NS16550A datasheet §8):
-///   bit 0    = FIFO_EN:  enable both TX and RX FIFOs
-///   bit 1    = RCVR_RST: reset RX FIFO (clears stale bytes on init)
-///   bit 2    = XMIT_RST: reset TX FIFO
-///   bits 6-7 = ITL=0b11: RX interrupt trigger at 14 bytes (FIFO nearly full)
-///
-/// Setting ITL=14 matches the widely-used default for 16-byte FIFOs and
-/// gives the CPU ample time to drain the FIFO before a stall.
-/// Reference: OSDev Wiki "Serial Ports" — https://wiki.osdev.org/Serial_Ports
-const FCR_FIFO_ENABLE: u8 = 0xC7;
-
-/// Maximum spins waiting for THRE before dropping a byte rather than hanging.
-const THRE_SPIN_LIMIT: u32 = 100_000;
-
 /// Global serial port instance.
 static SERIAL: Mutex<SerialPort> = Mutex::new(SerialPort { base: COM1 });
 
