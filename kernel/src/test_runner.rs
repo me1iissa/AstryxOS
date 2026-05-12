@@ -23290,6 +23290,76 @@ fn test_gdi_png_screenshot() -> bool {
         png_path, png_len
     );
 
+    // ── 7. Emit base64-encoded PNG over serial for host extraction ─────────────
+    //
+    // Protocol (RFC 4648 §4 base64):
+    //   [SCREENSHOT-B64:N/M] <76-char base64 chunk>   (N = 0-based chunk index)
+    //   [SCREENSHOT-B64-END]
+    //
+    // 76 base64 chars = 57 input bytes per line (MIME line length, RFC 2045 §6.8).
+    // The harness `read-png` subcommand collects all M chunks, decodes, and
+    // writes the result to a host-side file.
+    {
+        const CHUNK_BYTES: usize = 57; // → 76 base64 chars per line
+        const B64_ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+        // Count total chunks (ceiling division).
+        let total_chunks = (read_back.len() + CHUNK_BYTES - 1) / CHUNK_BYTES;
+        // Handle the degenerate empty-PNG case gracefully (shouldn't happen
+        // given we verified the signature, but avoid a 0-total edge case).
+        let total_chunks = if total_chunks == 0 { 1 } else { total_chunks };
+
+        for chunk_idx in 0..total_chunks {
+            let start = chunk_idx * CHUNK_BYTES;
+            let end   = (start + CHUNK_BYTES).min(read_back.len());
+            let src   = &read_back[start..end];
+
+            // Encode `src` to a fixed-size stack buffer.
+            // Max encoded length: ceil(57 / 3) * 4 = 76 bytes.
+            let mut enc = [0u8; 76];
+            let mut enc_len = 0usize;
+
+            let mut i = 0;
+            while i + 2 < src.len() {
+                let b0 = src[i] as usize;
+                let b1 = src[i + 1] as usize;
+                let b2 = src[i + 2] as usize;
+                enc[enc_len]     = B64_ALPHABET[(b0 >> 2)                           ];
+                enc[enc_len + 1] = B64_ALPHABET[((b0 & 0x3) << 4) | (b1 >> 4)      ];
+                enc[enc_len + 2] = B64_ALPHABET[((b1 & 0xf) << 2) | (b2 >> 6)      ];
+                enc[enc_len + 3] = B64_ALPHABET[ b2 & 0x3f                          ];
+                enc_len += 4;
+                i += 3;
+            }
+            // Remaining 1 or 2 bytes + padding.
+            if i < src.len() {
+                let b0 = src[i] as usize;
+                let b1 = if i + 1 < src.len() { src[i + 1] as usize } else { 0 };
+                enc[enc_len]     = B64_ALPHABET[(b0 >> 2)                      ];
+                enc[enc_len + 1] = B64_ALPHABET[((b0 & 0x3) << 4) | (b1 >> 4) ];
+                enc[enc_len + 2] = if i + 1 < src.len() {
+                    B64_ALPHABET[(b1 & 0xf) << 2]
+                } else {
+                    b'='
+                };
+                enc[enc_len + 3] = b'=';
+                enc_len += 4;
+            }
+
+            // SAFETY: enc contains only ASCII bytes from B64_ALPHABET / b'='.
+            let enc_str = core::str::from_utf8(&enc[..enc_len])
+                .unwrap_or("(b64-encode-error)");
+
+            test_println!(
+                "[SCREENSHOT-B64:{}/{}] {}",
+                chunk_idx, total_chunks, enc_str
+            );
+        }
+
+        test_println!("[SCREENSHOT-B64-END]");
+    }
+
     test_pass!("GDI PNG screenshot — render shapes + encode PNG headlessly");
     true
 }
