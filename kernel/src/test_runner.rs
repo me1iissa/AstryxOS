@@ -177,6 +177,10 @@ pub fn run() -> ! {
     total += 1;
     if test_poll_bell_source_attribution() { passed += 1; }
 
+    // ── Test 0bc: POLLHUP on pipe read-end after writer close ─────────────
+    total += 1;
+    if test_pipe_pollhup_on_writer_close() { passed += 1; }
+
     // ── Test 0bb: SERIAL per-CPU re-entry guard ──────────────────────────
     total += 1;
     if test_serial_reentry_guard() { passed += 1; }
@@ -23223,6 +23227,118 @@ fn test_poll_bell_source_attribution() -> bool {
     }
     test_println!("  all 8 tagged sources bumped their own slot; `other` unchanged ✓");
     test_pass!("poll-bell per-source attribution counters");
+    true
+}
+
+// ── Test 0bc: POLLHUP on pipe read-end after writer close ───────────────────
+//
+// Verifies the helper state that `poll_revents` consumes per POSIX
+// `poll(2)`: a pipe whose every writer has closed must drive `POLLHUP`
+// regardless of whether unread data remains in the buffer.  When buffered
+// data is still present the kernel reports `POLLIN | POLLHUP` so a
+// draining reader can consume the tail before observing EOF; once the
+// buffer empties only `POLLHUP` (plus the EOF condition that drives
+// `read(2)` to return 0) remains.
+fn test_pipe_pollhup_on_writer_close() -> bool {
+    test_header!("pipe POLLHUP — writer close drives POLLHUP regardless of buffered data");
+
+    let pipe_id = crate::ipc::pipe::create_pipe();
+    test_println!("  created pipe id={} ✓", pipe_id);
+
+    // Initial state: no writer has closed, no data.
+    if crate::ipc::pipe::pipe_writer_closed(pipe_id) {
+        test_fail!("pipe_pollhup", "fresh pipe reports writer_closed = true");
+        crate::ipc::pipe::pipe_close_writer(pipe_id);
+        crate::ipc::pipe::pipe_close_reader(pipe_id);
+        return false;
+    }
+    if crate::ipc::pipe::pipe_has_data(pipe_id) {
+        test_fail!("pipe_pollhup", "fresh pipe reports pipe_has_data = true");
+        crate::ipc::pipe::pipe_close_writer(pipe_id);
+        crate::ipc::pipe::pipe_close_reader(pipe_id);
+        return false;
+    }
+    if crate::ipc::pipe::pipe_is_eof(pipe_id) {
+        test_fail!("pipe_pollhup", "fresh pipe reports pipe_is_eof = true");
+        crate::ipc::pipe::pipe_close_writer(pipe_id);
+        crate::ipc::pipe::pipe_close_reader(pipe_id);
+        return false;
+    }
+    test_println!("  initial: !writer_closed, !has_data, !is_eof ✓");
+
+    // Write payload — pipe has data but writer is still open.
+    let n = crate::ipc::pipe::pipe_write(pipe_id, b"glxtest").unwrap_or(0);
+    if n != 7 {
+        test_fail!("pipe_pollhup", "pipe_write returned {} (expected 7)", n);
+        crate::ipc::pipe::pipe_close_writer(pipe_id);
+        crate::ipc::pipe::pipe_close_reader(pipe_id);
+        return false;
+    }
+    if !crate::ipc::pipe::pipe_has_data(pipe_id) {
+        test_fail!("pipe_pollhup", "after write, pipe_has_data is false");
+        crate::ipc::pipe::pipe_close_writer(pipe_id);
+        crate::ipc::pipe::pipe_close_reader(pipe_id);
+        return false;
+    }
+    if crate::ipc::pipe::pipe_writer_closed(pipe_id) {
+        test_fail!("pipe_pollhup", "after write (writer still open), writer_closed is true");
+        crate::ipc::pipe::pipe_close_writer(pipe_id);
+        crate::ipc::pipe::pipe_close_reader(pipe_id);
+        return false;
+    }
+    test_println!("  wrote 7B, writer still open: has_data && !writer_closed ✓");
+
+    // Close writer.  This is the Mozilla glxtest scenario: helper child
+    // exits, parent's poll(read_end) must see POLLHUP even though there
+    // is still data to drain.
+    crate::ipc::pipe::pipe_close_writer(pipe_id);
+    if !crate::ipc::pipe::pipe_writer_closed(pipe_id) {
+        test_fail!("pipe_pollhup", "after pipe_close_writer, writer_closed is false");
+        crate::ipc::pipe::pipe_close_reader(pipe_id);
+        return false;
+    }
+    if !crate::ipc::pipe::pipe_has_data(pipe_id) {
+        test_fail!("pipe_pollhup", "after writer close (data still buffered), pipe_has_data is false");
+        crate::ipc::pipe::pipe_close_reader(pipe_id);
+        return false;
+    }
+    if crate::ipc::pipe::pipe_is_eof(pipe_id) {
+        test_fail!("pipe_pollhup", "after writer close with data still buffered, pipe_is_eof is true (should be false until drained)");
+        crate::ipc::pipe::pipe_close_reader(pipe_id);
+        return false;
+    }
+    test_println!("  writer closed, data still buffered: writer_closed && has_data && !is_eof ✓");
+    test_println!("  → poll(read_end) would return POLLIN | POLLHUP (Mozilla glxtest unblock path)");
+
+    // Drain.  Now both writer is closed AND buffer is empty.
+    let mut drain = [0u8; 7];
+    let r = crate::ipc::pipe::pipe_read(pipe_id, &mut drain).unwrap_or(0);
+    if r != 7 || &drain != b"glxtest" {
+        test_fail!("pipe_pollhup", "drain returned {} bytes (expected 7) or wrong content", r);
+        crate::ipc::pipe::pipe_close_reader(pipe_id);
+        return false;
+    }
+    if crate::ipc::pipe::pipe_has_data(pipe_id) {
+        test_fail!("pipe_pollhup", "after drain, pipe_has_data is true");
+        crate::ipc::pipe::pipe_close_reader(pipe_id);
+        return false;
+    }
+    if !crate::ipc::pipe::pipe_is_eof(pipe_id) {
+        test_fail!("pipe_pollhup", "after drain + writer closed, pipe_is_eof is false");
+        crate::ipc::pipe::pipe_close_reader(pipe_id);
+        return false;
+    }
+    if !crate::ipc::pipe::pipe_writer_closed(pipe_id) {
+        test_fail!("pipe_pollhup", "after drain, writer_closed is false (regressed)");
+        crate::ipc::pipe::pipe_close_reader(pipe_id);
+        return false;
+    }
+    test_println!("  drained: !has_data && writer_closed && is_eof ✓");
+    test_println!("  → poll(read_end) would return POLLHUP only (writer hung up, no data left)");
+
+    crate::ipc::pipe::pipe_close_reader(pipe_id);
+
+    test_pass!("pipe POLLHUP — writer close drives POLLHUP regardless of buffered data");
     true
 }
 
