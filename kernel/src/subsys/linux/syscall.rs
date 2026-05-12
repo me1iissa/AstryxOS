@@ -254,7 +254,15 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     // 202=futex, 232=epoll_wait, 271=ppoll, 270=pselect6, 449=futex_waitv)
     // so we can confirm the Phase 3C "zero sleeping syscalls" observation
     // empirically rather than from the histogram alone.
-    #[cfg(feature = "firefox-test")]
+    //
+    // Each snapshot is a ~256–512 byte serial line (the leaf RIP, the
+    // RBP-walked frames, and up to 16 stack-scan candidates).  Under the
+    // chunked 16550 driver that costs ~16–32 cli windows per snapshot, so
+    // we gate this behind `firefox-trace-verbose` and keep the demo-path
+    // build clean.  The default `firefox-test` still emits the `[SC]` line
+    // (under `syscall-trace`), which carries the leaf RIP and caller RIP —
+    // sufficient for throughput measurement.
+    #[cfg(all(feature = "firefox-test", feature = "firefox-trace-verbose"))]
     {
         // First PID at which the user-stack snapshot emitter starts firing.
         // Lower PIDs belong to the kernel bringup chain (idle, init, X11
@@ -342,7 +350,16 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     let _ring_entry_idx: Option<usize> = None;
 
     // ── Transient debug trace: log Linux syscalls from user processes ─────────
-    #[cfg(feature = "firefox-test")]
+    //
+    // Each `[LINUX-SYS]` line is ~70–90 bytes; emitting one per syscall under
+    // `firefox-test,syscall-trace` more than doubles the per-syscall serial
+    // output and, under KVM, pins CPU 2 in the 16550 driver before Firefox
+    // can reach steady state.  Demote to the opt-in `firefox-trace-verbose`
+    // feature — the `[SC]` / `[SC-RET]` pair (under `syscall-trace`) already
+    // identifies every syscall by number, pid, tid, and full argv.  Keep the
+    // non-`firefox-test` branch (which limits to 500 lines from pid >= 12)
+    // since it is bounded and useful for early-boot diagnostics.
+    #[cfg(all(feature = "firefox-test", feature = "firefox-trace-verbose"))]
     {
         static TRACE_N: core::sync::atomic::AtomicU64 =
             core::sync::atomic::AtomicU64::new(0);
@@ -6713,7 +6730,7 @@ fn sys_pwritev(fd: u64, iov_ptr: u64, iovcnt: u64, offset: i64) -> i64 {
 // frame pointers are omitted (common in JIT code), which is harmless —
 // we still get the leaf, the libc-wrapper caller (`cr=` in [SC]), and as
 // many native frames as the compiler preserved.
-#[cfg(feature = "firefox-test")]
+#[cfg(all(feature = "firefox-test", feature = "firefox-trace-verbose"))]
 fn emit_user_stack_snapshot(num: u64, sample_idx: u64) {
     use core::fmt::Write as _;
     const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
