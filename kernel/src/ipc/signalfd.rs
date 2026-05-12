@@ -136,6 +136,8 @@ pub fn read(id: u64, buf: *mut u8, count: usize) -> Result<usize, i64> {
                     if masked == 0 { break; }
                     let bit = masked.trailing_zeros(); // lowest matching signal
                     ss.pending &= !(1u64 << bit);
+                    // Keep the fast-path hint coherent after direct pending mutation.
+                    crate::proc::signal_pending_hint_set(p.pid, ss.pending);
                     (bit + 1) as u32 // convert to signal number (1-based)
                 }
             }

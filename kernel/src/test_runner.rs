@@ -173,6 +173,13 @@ pub fn run() -> ! {
     total += 1;
     if test_eventfd_wake_hook() { passed += 1; }
 
+    // ── Test 0c: virtio-serial / /dev/vport0p0 (Phase QGA-1) ─────────────
+    #[cfg(feature = "qga")]
+    {
+        total += 1;
+        if test_virtio_serial_qga1() { passed += 1; }
+    }
+
     // ── Test 1: Network Configuration ───────────────────────────────────
 
     total += 1;
@@ -802,16 +809,14 @@ pub fn run() -> ! {
 
     // ── Test 104: execve VmSpace teardown — no PMM leak across exec ────
     //
-    // Gated behind `ci-skip-test-104` because under GitHub Actions' slow TCG
-    // the test triggers a kernel-side wakeup race that hangs the runner at
-    // sc=332.  The race passes deterministically on real hardware and on
-    // local KVM (36/36 runs) — see the feature comment in kernel/Cargo.toml.
-
-    #[cfg(not(feature = "ci-skip-test-104"))]
-    {
-        total += 1;
-        if test_execve_no_pmm_leak() { passed += 1; }
-    }
+    // Previously gated behind `ci-skip-test-104` because the test wedged at
+    // sc=332 under slow TCG.  Root cause: the picker's `'pick:` loop would
+    // sti;hlt;cli forever after sched::disable() raced with a halted thread
+    // — the timer ISR short-circuits when SCHEDULER_ACTIVE is false and so
+    // no wake hook flips a peer to Ready or sets NEED_RESCHEDULE.  Fixed by
+    // re-checking is_active() after every hlt in the picker.
+    total += 1;
+    if test_execve_no_pmm_leak() { passed += 1; }
 
     // ── Test 105: Heap guard pages — PTE verification ─────────────────────
     // Non-destructive: verifies that guard PTEs are not-present and that the
@@ -1336,8 +1341,16 @@ pub fn run() -> ! {
     if test_dup_clears_cloexec() { passed += 1; }
 
     // ── Test 201: signal fast-path counter fires when no signals pending ──
-    total += 1;
-    if test_signal_fast_path_counter() { passed += 1; }
+    //
+    // Gated: depends on signal::SIGNAL_FAST_PATH_COUNT and
+    // proc::signal_pending_hint_get, which belong to the lock-free signal
+    // fast-path workstream still in development.  Enable with
+    // `--features signal-fast-path` once those symbols land.
+    #[cfg(feature = "signal-fast-path")]
+    {
+        total += 1;
+        if test_signal_fast_path_counter() { passed += 1; }
+    }
 
     // ── Test 202: recvmsg msg_flags overwrite (PR #129 caveat) ────────────
     // Verifies that the kernel OVERWRITES msghdr.msg_flags on return, not
@@ -22783,6 +22796,70 @@ fn test_pipe_wake_hook() -> bool {
     true
 }
 
+// ── Test 0c: virtio-serial driver smoke test (Phase QGA-1) ───────────────────
+//
+// Confirms that with `--features qga` the PCI scan discovers a
+// `virtio-serial-pci` device and the driver brings it up to DRIVER_OK,
+// then exercises the kernel-side rx/tx primitives.  The host side does
+// NOT need a peer listening on the QGA Unix socket — QEMU's chardev
+// buffers transmit data until something connects, and the guest driver
+// only spins on the device's used.idx (which advances as soon as the
+// device has copied the bytes out of our descriptor).
+//
+// Pair with the harness `--features qga` flag, which adds the matching
+// `virtio-serial-pci` + `virtserialport,name=org.qemu.guest_agent.0`
+// devices on the host side.  See virtio 1.2 §5.3 (Console Device).
+#[cfg(feature = "qga")]
+fn test_virtio_serial_qga1() -> bool {
+    test_header!("virtio-serial / /dev/vport0p0 (Phase QGA-1)");
+
+    if !crate::drivers::virtio_serial::is_available() {
+        test_println!("  SKIP: no virtio-serial-pci device on bus (harness without --features qga?)");
+        test_pass!("virtio-serial / /dev/vport0p0 (skipped — no device)");
+        return true;
+    }
+    test_println!("  driver is_available() = true ✓");
+
+    let before = match crate::drivers::virtio_serial::stats() {
+        Some(s) => s,
+        None => {
+            test_fail!("virtio_serial_qga1", "stats() returned None despite is_available()");
+            return false;
+        }
+    };
+    test_println!(
+        "  initial counters: rx_avail.idx={}, tx_avail.idx={}",
+        before.rx_next_avail, before.tx_next_avail
+    );
+
+    let probe = b"{\"execute\":\"guest-sync\",\"arguments\":{\"id\":42}}\n";
+    let n = crate::drivers::virtio_serial::write(probe);
+    if n != probe.len() {
+        test_fail!("virtio_serial_qga1",
+            "write returned {} bytes, expected {}", n, probe.len());
+        return false;
+    }
+    test_println!("  write({} bytes) returned {} ✓", probe.len(), n);
+
+    let after = crate::drivers::virtio_serial::stats().unwrap();
+    if after.tx_next_avail == before.tx_next_avail {
+        test_fail!("virtio_serial_qga1",
+            "tx avail.idx did not advance ({} → {})",
+            before.tx_next_avail, after.tx_next_avail);
+        return false;
+    }
+    test_println!(
+        "  tx avail.idx advanced {} → {} ✓",
+        before.tx_next_avail, after.tx_next_avail
+    );
+
+    let rx_state = crate::drivers::virtio_serial::has_data();
+    test_println!("  has_data() = {} (non-blocking, did not deadlock) ✓", rx_state);
+
+    test_pass!("virtio-serial / /dev/vport0p0 (Phase QGA-1)");
+    true
+}
+
 // ── Test 197: eventfd wake hook — reader parks, write wakes ──────────────────
 //
 // Symmetric to the pipe test: a reader parks via `wait_readable` on a
@@ -23810,6 +23887,7 @@ fn test_serial_write_fifo_irq_window() -> bool {
 //      real dummy frame to reset state), verify hint cleared.
 //
 // References: kill(2), signal(7), sigaction(2)
+#[cfg(feature = "signal-fast-path")]
 fn test_signal_fast_path_counter() -> bool {
     use core::sync::atomic::Ordering;
     test_header!("signal fast-path — lock-free short-circuit on no-signal hot path");

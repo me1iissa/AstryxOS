@@ -328,6 +328,45 @@ static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 /// Next TID counter.
 static NEXT_TID: AtomicU64 = AtomicU64::new(1);
 
+// ── Per-PID signal-pending hint table ──────────────────────────────────────
+//
+// A flat array of AtomicU64 — one entry per PID — tracking the raw `pending`
+// bitmask for that process.  The signal_check_on_syscall_return() fast path
+// reads this without acquiring PROCESS_TABLE, short-circuiting the lock on the
+// common case of no pending signals.
+//
+// Invariant: hint[pid] == 0  ⟹  no signals are pending for that process.
+// A non-zero hint may be a false positive (e.g. signal was blocked but pending
+// stays set) — the slow path (under PROCESS_TABLE lock) resolves ambiguity.
+// A false negative (hint == 0 but a signal IS pending) is impossible given
+// Release/Acquire ordering on every write/read pair.
+
+/// Upper bound on PIDs covered by the hint table.
+pub const SIGNAL_HINT_TABLE_SIZE: usize = 256;
+
+static SIGNAL_PENDING_HINT: [AtomicU64; SIGNAL_HINT_TABLE_SIZE] =
+    [const { AtomicU64::new(0) }; SIGNAL_HINT_TABLE_SIZE];
+
+/// Update the signal-pending hint for `pid`.
+/// Must be called (with Release ordering) whenever `SignalState::pending` changes.
+#[inline]
+pub fn signal_pending_hint_set(pid: Pid, pending: u64) {
+    if (pid as usize) < SIGNAL_HINT_TABLE_SIZE {
+        SIGNAL_PENDING_HINT[pid as usize].store(pending, Ordering::Release);
+    }
+}
+
+/// Read the signal-pending hint for `pid` (Acquire ordering).
+/// Returns 1 (conservative: forces slow path) for out-of-range PIDs.
+#[inline]
+pub fn signal_pending_hint_get(pid: Pid) -> u64 {
+    if (pid as usize) < SIGNAL_HINT_TABLE_SIZE {
+        SIGNAL_PENDING_HINT[pid as usize].load(Ordering::Acquire)
+    } else {
+        1 // out-of-range: conservatively force the slow path
+    }
+}
+
 /// Process table.
 pub static PROCESS_TABLE: Mutex<Vec<Process>> = Mutex::new(Vec::new());
 /// Thread table.
