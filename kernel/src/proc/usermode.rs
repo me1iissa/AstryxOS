@@ -221,7 +221,7 @@ pub fn user_mode_bootstrap() {
         }
     }
 
-    let (entry_rip, entry_rsp, entry_rdx, entry_r8, kernel_stack_top, user_cr3, tls_base, gs_base) = {
+    let (entry_rip, entry_rsp, entry_rdx, entry_r8, kernel_stack_top, mut user_cr3, tls_base, gs_base, pid) = {
         let tid = proc::current_tid();
         let threads = THREAD_TABLE.lock();
         let thread = match threads.iter().find(|t| t.tid == tid) {
@@ -242,8 +242,36 @@ pub fn user_mode_bootstrap() {
             thread.context.cr3,
             thread.tls_base,
             thread.gs_base,
+            thread.pid,
         )
     };
+
+    // Defensive: if the thread's context.cr3 was never propagated by the
+    // creator (e.g. a future code path creates the thread before the
+    // owning process's cr3 is known, or a fork/clone helper forgets to
+    // copy it), fall back to the owning process's cr3.  Without this
+    // recovery user_mode_bootstrap would IRETQ with stale-or-zero CR3
+    // and #PF immediately on the first user instruction.  Persist the
+    // value back to the thread so any subsequent re-entry into bootstrap
+    // (or schedule()'s CR3 switch) sees a consistent non-zero cr3.
+    if user_cr3 == 0 {
+        let p_cr3 = {
+            let procs = PROCESS_TABLE.lock();
+            procs.iter().find(|p| p.pid == pid).map(|p| p.cr3).unwrap_or(0)
+        };
+        if p_cr3 != 0 {
+            crate::serial_println!(
+                "[BOOT] tid={} pid={}: context.cr3 was 0, propagating from process cr3={:#x}",
+                proc::current_tid(), pid, p_cr3
+            );
+            user_cr3 = p_cr3;
+            let tid = proc::current_tid();
+            let mut threads = THREAD_TABLE.lock();
+            if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+                t.context.cr3 = p_cr3;
+            }
+        }
+    }
 
     crate::serial_println!(
         "[USER] Bootstrap tid={}: Ring 3 at RIP={:#x} RSP={:#x} CR3={:#x} RDX={:#x} R8={:#x}",
