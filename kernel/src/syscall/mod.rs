@@ -2448,9 +2448,16 @@ pub(crate) fn get_inotify_id(pid: u64, fd_num: usize) -> u64 {
 
 /// Compute revents for a single fd given the requested events mask.
 /// Returns 0 if fd is not ready for any of the requested events.
+///
+/// `POLLHUP` is *unconditional* per POSIX `poll(2)` — it is reported
+/// regardless of whether the caller requested it in `events`.  On a pipe
+/// read-end whose every writer has closed, the kernel must set
+/// `POLLHUP`; if data is still buffered it must coexist with `POLLIN`
+/// so userspace can drain the remainder before observing EOF.
 pub(crate) fn poll_revents(pid: u64, fd: usize, events: u16) -> u16 {
     const POLLIN:  u16 = 0x0001;
     const POLLOUT: u16 = 0x0004;
+    const POLLHUP: u16 = 0x0010;
     if fd <= 2 {
         if fd == 0 { events & POLLIN } else { events & POLLOUT }
     } else if is_eventfd_fd(pid, fd) {
@@ -2486,7 +2493,21 @@ pub(crate) fn poll_revents(pid: u64, fd: usize, events: u16) -> u16 {
                 .unwrap_or(false)
         };
         if is_read_end {
-            if crate::ipc::pipe::pipe_has_data(pipe_id) { events & POLLIN } else { 0 }
+            // Per POSIX `poll(2)`:
+            //   * `POLLIN`  — data is available to read.
+            //   * `POLLHUP` — the peer (writer) has closed; reported even
+            //                 when the caller did not request it.  When
+            //                 buffered data remains, `POLLHUP` is set
+            //                 alongside `POLLIN` so a draining reader can
+            //                 consume the tail before observing EOF.
+            let mut rev = 0u16;
+            if crate::ipc::pipe::pipe_has_data(pipe_id) {
+                rev |= events & POLLIN;
+            }
+            if crate::ipc::pipe::pipe_writer_closed(pipe_id) {
+                rev |= POLLHUP;
+            }
+            rev
         } else {
             events & POLLOUT
         }

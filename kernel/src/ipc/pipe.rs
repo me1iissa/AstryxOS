@@ -237,6 +237,20 @@ pub fn pipe_is_eof(pipe_id: u64) -> bool {
         .unwrap_or(true)
 }
 
+/// Check if every write end has been closed, regardless of whether the
+/// ring buffer still has unread data.  POSIX `poll(2)` requires `POLLHUP`
+/// on a pipe read-end whose writer has hung up; if data is still buffered
+/// the kernel must report `POLLIN | POLLHUP` so userspace can drain the
+/// remainder before observing EOF.  `pipe_is_eof` only fires once the
+/// buffer is also empty, so it cannot drive the `POLLIN | POLLHUP`
+/// composition on its own.
+pub fn pipe_writer_closed(pipe_id: u64) -> bool {
+    let pipes = PIPE_TABLE.lock();
+    pipes.iter().find(|p| p.id == pipe_id)
+        .map(|p| p.writer_closed())
+        .unwrap_or(true)
+}
+
 // ── Wait / wake hooks ─────────────────────────────────────────────────────────
 
 /// Atomic check-then-park for a reader on `pipe_id`.
