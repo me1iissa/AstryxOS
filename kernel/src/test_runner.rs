@@ -633,6 +633,14 @@ pub fn run() -> ! {
     total += 1;
     if test_clock_realtime_futex_parity() { passed += 1; }
 
+    // ── Test 199: vDSO clock_gettime — TSC-derived sub-tick ns granularity ────
+    total += 1;
+    if test_vdso_clock_gettime_subtick_ns() { passed += 1; }
+
+    // ── Test 200: vDSO clock_gettime — sub-tick wall-clock progress ───────────
+    total += 1;
+    if test_vdso_clock_gettime_progress_subms() { passed += 1; }
+
     // ── Test 80d: socketpair(2) — type / SOCK_CLOEXEC / SOCK_NONBLOCK + SEQPACKET
 
     total += 1;
@@ -1321,17 +1329,11 @@ pub fn run() -> ! {
     total += 1;
     if test_dup_clears_cloexec() { passed += 1; }
 
-    // ── Test 199: vDSO clock_gettime — TSC-precise ns granularity ───────
-    total += 1;
-    if test_vdso_clock_gettime_subtick_ns() { passed += 1; }
-
-    // ── Test 200: vDSO clock_gettime — wall-clock progress under 1 ms ───
-    total += 1;
-    if test_vdso_clock_gettime_progress_subms() { passed += 1; }
-
-    // (Stream-A pipe / eventfd wake-hook tests run first — see Tests 0a/0b
-    // at the top of this function so failures surface before the suite's
-    // long network/disk pre-amble.)
+    // (Tests 199/200 run earlier — right after Test 80c — so the vDSO
+    // TSC fast path is verified before the slow PNG screenshot test.
+    // Stream-A pipe / eventfd wake-hook tests run first — see Tests
+    // 0a/0b at the top of this function so failures surface before the
+    // suite's long network/disk pre-amble.)
 
     // ── Summary ─────────────────────────────────────────────────────────
 

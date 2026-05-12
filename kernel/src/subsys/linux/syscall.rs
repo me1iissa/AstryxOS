@@ -4434,13 +4434,19 @@ fn sys_gettimeofday(tv: u64, _tz: u64) -> i64 {
     if tv == 0 {
         return 0;
     }
-    let ticks = crate::arch::x86_64::irq::get_ticks();
-    let secs  = crate::proc::vdso::wall_secs_at_boot()
-        .saturating_add(ticks / 100);
-    let usecs = (ticks % 100) * 10_000; // 10ms per tick → microseconds
+    // TSC-derived ns for vDSO/syscall parity; falls back to tick
+    // granularity before TSC calibration is published (pre-apic::init).
+    let mono_ns = crate::proc::vdso::monotonic_ns();
+    let (mono_secs, sub_usecs) = if mono_ns != 0 {
+        (mono_ns / 1_000_000_000, (mono_ns % 1_000_000_000) / 1000)
+    } else {
+        let ticks = crate::arch::x86_64::irq::get_ticks();
+        (ticks / 100, (ticks % 100) * 10_000)
+    };
+    let secs = crate::proc::vdso::wall_secs_at_boot().saturating_add(mono_secs);
     let buf = unsafe { core::slice::from_raw_parts_mut(tv as *mut u8, 16) };
     buf[0..8].copy_from_slice(&secs.to_le_bytes());
-    buf[8..16].copy_from_slice(&usecs.to_le_bytes());
+    buf[8..16].copy_from_slice(&sub_usecs.to_le_bytes());
     0
 }
 
@@ -5034,10 +5040,18 @@ pub fn sys_futex_linux(
             // the absolute timestamp back here; if the two formulas differ,
             // the deadline appears already-expired and ETIMEDOUT fires
             // immediately, breaking every timed wait.
-            let wall_ticks = crate::arch::x86_64::irq::get_ticks();
-            let mono_secs  = wall_ticks / 100;
-            let sub_nsecs  = (wall_ticks % 100) * 10_000_000;
-            let now_secs   = crate::proc::vdso::wall_secs_at_boot()
+            // TSC-derived ns for parity with __vdso_clock_gettime and
+            // sys_clock_gettime — if these three formulas differ, an
+            // absolute deadline computed via the vDSO can appear
+            // already-expired here and fire ETIMEDOUT immediately.
+            let mono_ns_total = crate::proc::vdso::monotonic_ns();
+            let (mono_secs, sub_nsecs) = if mono_ns_total != 0 {
+                (mono_ns_total / 1_000_000_000, mono_ns_total % 1_000_000_000)
+            } else {
+                let wall_ticks = crate::arch::x86_64::irq::get_ticks();
+                (wall_ticks / 100, (wall_ticks % 100) * 10_000_000)
+            };
+            let now_secs = crate::proc::vdso::wall_secs_at_boot()
                 .saturating_add(mono_secs);
             let now_ns = now_secs
                 .saturating_mul(1_000_000_000)
