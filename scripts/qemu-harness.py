@@ -769,7 +769,8 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
                           gdb_wait: bool = False,
                           kdb_host_port: int = 0,
                           kvm: Optional[bool] = None,
-                          smp: int = 2) -> subprocess.Popen:
+                          smp: int = 2,
+                          cpu_model: Optional[str] = None) -> subprocess.Popen:
     """
     Launch QEMU with a per-session serial log and QMP socket.
 
@@ -812,6 +813,7 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
         gdb_port=gdb_port if gdb_port and gdb_port > 0 else None,
         gdb_wait=gdb_wait,
         kvm=kvm,
+        cpu_override=cpu_model,
     )
 
     # Override -smp count if caller asked for non-default. astryx_qemu.py
@@ -887,11 +889,13 @@ def cmd_start(args):
     else:
         kvm_arg = None  # autodetect
     smp = int(getattr(args, "smp", 2) or 2)
+    cpu_model = getattr(args, "cpu_model", None)
     proc = _launch_qemu_harness(sid, serial_log, qmp_sock, ovmf_vars,
                                  gdb_port=gdb_port, gdb_wait=gdb_wait,
                                  kdb_host_port=kdb_host_port,
                                  kvm=kvm_arg,
-                                 smp=smp)
+                                 smp=smp,
+                                 cpu_model=cpu_model)
 
     session = {
         "sid":        sid,
@@ -905,6 +909,7 @@ def cmd_start(args):
         "gdb_wait":   gdb_wait,
         "kdb_host_port": kdb_host_port,
         "smp":         smp,
+        "cpu_model":   cpu_model or "default",
         "breakpoints": [],
     }
     _save_session(session)
@@ -4153,6 +4158,13 @@ def main():
                           help="Number of QEMU vCPUs (default 2). Plan-C "
                                "experiment uses 16 to test Mozilla "
                                "nsThreadPool sizing under wider _SC_NPROCESSORS_ONLN.")
+    p_start.add_argument("--cpu", dest="cpu_model", default=None, metavar="MODEL",
+                          help="Override QEMU -cpu model verbatim (e.g. 'host', "
+                               "'max', 'Cascadelake-Server', 'EPYC-Genoa-v1', "
+                               "'qemu64'). When unset, astryx_qemu.py picks: "
+                               "'host' under KVM, otherwise "
+                               "'qemu64,+rdtscp,+ssse3,+sse4_1,+sse4_2'. Used "
+                               "by perf sweeps to vary VMEXIT surface.")
 
     # stop
     p_stop = sub.add_parser("stop", help="Kill a QEMU session")
