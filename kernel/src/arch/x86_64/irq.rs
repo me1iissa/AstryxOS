@@ -483,8 +483,17 @@ extern "C" fn virtio_blk_interrupt() {
 /// `read_blocking()`, then LAPIC EOI.  The driver implements the entire
 /// sequence; this stub exists purely to route the IDT vector.
 extern "C" fn virtio_serial_interrupt() {
-    crate::perf::record_interrupt(crate::drivers::virtio_serial::VIRTIO_SERIAL_IRQ_VECTOR);
-    crate::drivers::virtio_serial::handle_irq();
+    // The virtio_serial driver module is only compiled with `--features qga`;
+    // when absent, IDT[46] is still wired (idt.rs) so the stub stays present,
+    // but it must not reference the missing module.  No-op in that build —
+    // QEMU only fires this vector when a virtio-serial device is exposed,
+    // which is itself gated by the host launching with `-device virtio-serial`
+    // (QGA feature only).
+    #[cfg(feature = "qga")]
+    {
+        crate::perf::record_interrupt(crate::drivers::virtio_serial::VIRTIO_SERIAL_IRQ_VECTOR);
+        crate::drivers::virtio_serial::handle_irq();
+    }
 }
 
 /// E1000 NIC interrupt logic.

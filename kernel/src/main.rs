@@ -144,6 +144,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // (none today, but keep in mind for future early-FS code) use the
     // poll fallback, see drivers/virtio_blk.rs::submit_request.
     drivers::virtio_blk::arm_irq();
+    #[cfg(feature = "qga")]
     drivers::virtio_serial::arm_irq();
     serial_println!("[Aether] Phase 5b: APIC OK");
 
