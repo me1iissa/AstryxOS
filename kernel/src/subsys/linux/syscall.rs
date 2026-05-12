@@ -2868,7 +2868,13 @@ fn sys_select_linux(
         } else if crate::syscall::is_eventfd_fd(pid, fd) {
             crate::ipc::eventfd::is_readable(crate::syscall::get_eventfd_id(pid, fd))
         } else if crate::syscall::is_pipe_fd(pid, fd) {
-            crate::ipc::pipe::pipe_has_data(crate::syscall::get_pipe_id(pid, fd))
+            // Per POSIX `select(2)`: a pipe read-end whose writer has
+            // closed must be reported readable so the userspace `read()`
+            // can return 0 (EOF).  Otherwise glibc / Firefox would block
+            // forever waiting for data that can never arrive.
+            let pid_id = crate::syscall::get_pipe_id(pid, fd);
+            crate::ipc::pipe::pipe_has_data(pid_id)
+                || crate::ipc::pipe::pipe_writer_closed(pid_id)
         } else if crate::syscall::is_unix_socket_fd(pid, fd) {
             let uid = crate::syscall::get_unix_socket_id(pid, fd);
             crate::net::unix::has_data(uid) || crate::net::unix::has_pending(uid)
@@ -2913,7 +2919,12 @@ fn sys_select_linux(
                 && unsafe { *((writefds + byte_off) as *const u8) & bit != 0 };
             if !r_req && !w_req { continue; }
             let revents = crate::syscall::poll_revents(pid, fd, if r_req { 0x0001 } else { 0x0004 });
-            if r_req && revents & 0x0001 != 0 { *ready += 1; }
+            // Per POSIX `select(2)`: a hung-up pipe read-end is reported
+            // readable so the userspace `read()` returns 0 (EOF).  POLLHUP
+            // (0x0010) here therefore counts as a readable signal in
+            // addition to POLLIN (0x0001).
+            const READABLE_MASK: u16 = 0x0001 | 0x0010;
+            if r_req && revents & READABLE_MASK != 0 { *ready += 1; }
             else if r_req { unsafe { *((readfds + byte_off) as *mut u8) &= !bit; } }
             if w_req && revents & 0x0004 != 0 { *ready += 1; }
             else if w_req { unsafe { *((writefds + byte_off) as *mut u8) &= !bit; } }
