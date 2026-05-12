@@ -809,12 +809,24 @@ pub fn run() -> ! {
 
     // ── Test 104: execve VmSpace teardown — no PMM leak across exec ────
     //
-    // Previously gated behind `ci-skip-test-104` because the test wedged at
-    // sc=332 under slow TCG.  Root cause: the picker's `'pick:` loop would
-    // sti;hlt;cli forever after sched::disable() raced with a halted thread
-    // — the timer ISR short-circuits when SCHEDULER_ACTIVE is false and so
-    // no wake hook flips a peer to Ready or sets NEED_RESCHEDULE.  Fixed by
-    // re-checking is_active() after every hlt in the picker.
+    // The wedge previously hidden behind `ci-skip-test-104` had two root
+    // causes; both are fixed.
+    //
+    //   1. The picker's `'pick:` loop could sti;hlt;cli forever after
+    //      sched::disable() raced with a halted thread — closed by PR #149
+    //      (re-check `SCHEDULER_ACTIVE` after every hlt).
+    //
+    //   2. `test_clock_realtime_futex_parity` issued an absolute-deadline
+    //      futex with `now + 1 hour` while assuming the scheduler was
+    //      disabled.  In practice an earlier test left the scheduler
+    //      enabled, so the futex actually parked TID 0 (the BSP test
+    //      runner) Blocked for the full hour; by the time test 104 ran
+    //      the picker had no Ready peer to switch to on CPU 0 and the
+    //      whole suite wedged in the idle hlt loop with
+    //      `wake_sleeping_threads` waiting for a wake_tick ~360 000 ticks
+    //      in the future.  Fixed by saving/restoring the scheduler-active
+    //      flag around the futex call and shortening the deadline to
+    //      `now + 1 s` so a future enable still bounds recovery time.
     total += 1;
     if test_execve_no_pmm_leak() { passed += 1; }
 
@@ -13482,43 +13494,45 @@ fn test_clock_realtime_futex_parity() -> bool {
     test_println!("  syscall tv_sec={} matches vDSO formula (boot={} + ticks~{}/100) ✓",
                   tp[0], boot, post_ticks);
 
-    // Sub-case 3: a futex absolute-CLOCK_REALTIME deadline far in the
+    // Sub-case 3: a futex absolute-CLOCK_REALTIME deadline shortly in the
     // future MUST NOT be classified as AlreadyExpired.  Pre-fix the
     // kernel's `now_ns` was independently re-read from the CMOS RTC, so a
     // userspace-computed deadline of `now + 10 ms` could appear to be in
     // the past; the futex returned ETIMEDOUT immediately at the
     // AlreadyExpired arm.
     //
-    // We use a `now + 1 hour` deadline so the AlreadyExpired path is
-    // unreachable for any plausible formula skew (post-fix), while pre-fix
-    // it would still be classified expired only when the RTC second-tick
-    // happened to fall in the window — making this test flaky on pre-fix.
-    // To make it deterministic on pre-fix as well, we ALSO check the
-    // FUTEX_WAITERS map: if the futex actually parked, our (pid, uaddr)
-    // entry will be present at observation time.  AlreadyExpired returns
-    // -110 without ever touching the wait queue.
+    // Originally this used a `now + 1 hour` deadline expecting the test
+    // runner to have the scheduler disabled, in which case `schedule()`
+    // would be a no-op and the futex code would fall through to its
+    // self-cleanup path and return -110.  In practice a sibling test
+    // (madvise / oom / etc.) leaves the scheduler enabled by the time we
+    // get here, so the futex actually parked TID 0 (the BSP test runner)
+    // for the full hour — the picker then halted both CPUs in idle hlt
+    // because TID 0 is the only Ready candidate on CPU 0, and the wake
+    // never arrived.  See `wake_sleeping_threads` in `sched/mod.rs` and
+    // PR notes for the symptom (`[BLK-TRAP] futex_wait TID 0
+    // wake_tick=~360000+`).
     //
-    // The scheduler is disabled during the test_runner, so the futex
-    // call's sched::schedule() returns immediately as a no-op and the
-    // call returns -110 (timed_out=true because we removed ourselves
-    // from the queue).  But before the cleanup runs, the entry was
-    // present — and we observe that via a peek into FUTEX_WAITERS from
-    // INSIDE the dispatch closure?  No: the call is synchronous, the
-    // entry is gone by the time control returns to us.  Instead we
-    // detect AlreadyExpired by the timing of the return: it must take
-    // at least one syscall round trip (a few µs); the futex code path
-    // that parks-and-cleans-up is observably slower than the early-out.
-    // We do NOT attempt to measure that here — sub-cases 1+2 already
-    // catch the formula divergence.  Sub-case 3 just exercises the futex
-    // code path with a far-future deadline and confirms it returns -110
-    // (because the test_runner has the scheduler disabled).
+    // The post-fix shape: force the scheduler disabled for the duration
+    // of the futex call so `schedule()` is reliably a no-op, and use a
+    // short deadline (`now + 1 s`) so even if a future refactor enables
+    // the scheduler underneath us the BSP picks itself back up promptly
+    // rather than wedging for an hour.  Both invariants together close
+    // the wedge: scheduler-disabled keeps `schedule()` a no-op (matching
+    // the original test contract), and `+1 s` bounds the worst-case
+    // recovery time.  CLOCK_REALTIME(now + 1 s) is still well past any
+    // plausible formula skew, so the AlreadyExpired arm remains
+    // unreachable.
     let mut now_ts: [u64; 2] = [0, 0];
     if crate::syscall::sys_clock_gettime(0, now_ts.as_mut_ptr() as u64) != 0 {
         test_fail!("clock_realtime_parity", "clock_gettime for deadline failed");
         return false;
     }
     let mut deadline_ts = now_ts;
-    deadline_ts[0] = deadline_ts[0].saturating_add(3600); // +1 hour
+    deadline_ts[0] = deadline_ts[0].saturating_add(1); // +1 second
+
+    let was_active = crate::sched::is_active();
+    if was_active { crate::sched::disable(); }
 
     let futex_word: u32 = 0;
     let r = unsafe {
@@ -13532,14 +13546,17 @@ fn test_clock_realtime_futex_parity() -> bool {
             0xFFFF_FFFF_u64,                // bitset = MATCH_ANY
         )
     };
+
+    if was_active { crate::sched::enable(); }
+
     if r != -110 {
         test_fail!("clock_realtime_parity",
-                   "futex WAIT_BITSET|CLOCK_REALTIME (now+1hr) returned {} (expected -110 \
+                   "futex WAIT_BITSET|CLOCK_REALTIME (now+1s) returned {} (expected -110 \
                     via scheduler-disabled fast cleanup)",
                    r);
         return false;
     }
-    test_println!("  futex CLOCK_REALTIME (now+1hr) → {} (queue cleanup path) ✓", r);
+    test_println!("  futex CLOCK_REALTIME (now+1s) → {} (queue cleanup path) ✓", r);
     let _ = Ordering::Relaxed; // silence unused-import warning when conditions disable use sites
 
     test_pass!("clock_gettime CLOCK_REALTIME — vDSO/syscall formula parity");
