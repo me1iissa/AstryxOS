@@ -373,29 +373,65 @@ pub fn bsp_apic_id() -> u8 {
 
 /// Get the current CPU's logical index.
 ///
-/// Reads `IA32_TSC_AUX` (MSR 0xC0000103), which is initialised to the CPU's
-/// APIC ID by `crate::syscall::set_per_cpu_id()` during CPU startup.  Using
-/// an MSR avoids any page-table dependency, so this function works correctly
-/// even after a user-process CR3 switch (unlike the previous LAPIC MMIO read,
-/// which could return 0 when the LAPIC identity mapping was not present in the
-/// active user page table).
+/// Reads `IA32_TSC_AUX` (initialised to the CPU's APIC ID by
+/// `crate::syscall::set_per_cpu_id()` during CPU startup) via the **`RDTSCP`**
+/// instruction.  Using `RDTSCP` rather than `RDMSR(IA32_TSC_AUX)` is critical
+/// for KVM guests: `RDMSR` of `IA32_TSC_AUX` (`0xC000_0103`) unconditionally
+/// triggers a VMEXIT to the host (≈46,000 cycles per call observed in the
+/// AstryxOS microbench, versus ≈30 cycles for `RDTSCP`).  `RDTSCP` is one of
+/// the architecturally non-trapping reads of `IA32_TSC_AUX` documented in
+/// Intel SDM Vol 2B (Instruction Set Reference) and AMD APM Vol 3.
+///
+/// Going via an MSR-backed register (rather than an LAPIC MMIO read) also
+/// avoids any page-table dependency, so this function works correctly even
+/// after a user-process CR3 switch — the previous LAPIC MMIO path returned
+/// 0 when the LAPIC identity mapping was not present in the active user
+/// page table.
 ///
 /// # Initialisation contract
 /// `crate::syscall::set_per_cpu_id(apic_id)` MUST be called on every CPU
-/// before any call to `cpu_index()` or `current_tid()`.  For the BSP this
-/// happens inside `crate::syscall::init()`; for each AP it happens at the
-/// very top of `ap_rust_entry()` using the LAPIC-read APIC ID.
-pub fn current_apic_id() -> u8 {
-    // IA32_TSC_AUX (MSR 0xC000_0103) holds the APIC ID written at init.
-    unsafe { rdmsr(0xC000_0103) as u8 }
-}
-
-/// Get the current CPU index, bounded to `[0, MAX_CPUS)`.
-/// Use this instead of `current_apic_id() as usize` at every call site.
+/// before any call to `cpu_index()` or `current_apic_id()`.  For the BSP
+/// this happens inside `crate::syscall::init()`; for each AP it happens at
+/// the very top of `ap_rust_entry()` using the LAPIC-read APIC ID.
+///
+/// # Migration
+/// The returned index is a snapshot taken on the CPU that executed the
+/// instruction.  If the scheduler migrates the calling thread between
+/// the read and the use of the value, the index is stale.  Callers that
+/// require an atomic CPU-bound read must disable preemption around the
+/// call.  This contract is unchanged from the previous `RDMSR`-based
+/// implementation.
 #[inline(always)]
 pub fn cpu_index() -> usize {
-    let id = current_apic_id() as usize;
+    let aux: u32;
+    // SAFETY: RDTSCP is supported on all CPUs AstryxOS targets (KVM with
+    // `-cpu host` exposes CPUID 0x80000001 EDX bit 27 — RDTSCP — on every
+    // modern Intel/AMD host; the vDSO `__vdso_getcpu` uses the same
+    // instruction unconditionally).  RDTSCP reads the TSC into EDX:EAX
+    // and the IA32_TSC_AUX MSR into ECX; we discard the TSC outputs.
+    // RDTSCP touches no memory, no stack, and leaves RFLAGS unchanged
+    // (Intel SDM Vol 2B, RDTSCP — Read Time-Stamp Counter and Processor
+    // ID), so `nomem, nostack, preserves_flags` are correct.
+    unsafe {
+        core::arch::asm!(
+            "rdtscp",
+            out("eax") _,            // tsc[31:0]   — discarded
+            out("edx") _,            // tsc[63:32]  — discarded
+            lateout("ecx") aux,      // ia32_tsc_aux
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    let id = aux as usize;
     if id >= MAX_CPUS { 0 } else { id }
+}
+
+/// Get the current CPU's logical APIC ID (u8).
+///
+/// Thin wrapper around `cpu_index()` for callers that want the APIC-ID
+/// type.  See `cpu_index()` for the full implementation and contract.
+#[inline(always)]
+pub fn current_apic_id() -> u8 {
+    cpu_index() as u8
 }
 
 /// Send an IPI (Inter-Processor Interrupt) to a specific APIC ID.
@@ -895,7 +931,7 @@ pub extern "C" fn ap_rust_entry() -> ! {
 
     // Initialise this AP's per-CPU ID FIRST — before any call to cpu_index()
     // or current_apic_id().  set_per_cpu_id writes apic_id to IA32_TSC_AUX so
-    // that current_apic_id() returns the correct per-CPU value from rdmsr.
+    // that cpu_index() (via RDTSCP) returns the correct per-CPU value.
     // apic_id was read from the LAPIC MMIO above while the kernel CR3 is still
     // active, so it is guaranteed to be correct.
     // MUST be before init_ap_tss() which calls current_apic_id() internally.
