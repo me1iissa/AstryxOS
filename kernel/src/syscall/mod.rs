@@ -2735,19 +2735,31 @@ pub(crate) fn sys_sigreturn() -> i64 {
 
 /// getrandom — Fill a buffer with pseudo-random bytes.
 ///
-/// Uses RDRAND if available, otherwise a simple xorshift PRNG seeded from
-/// the TSC.
-pub(crate) fn sys_getrandom(buf: *mut u8, count: usize) -> i64 {
+/// Per getrandom(2): on success returns the number of bytes filled, which
+/// equals `count` when called without GRND_NONBLOCK and no signal interrupts.
+///
+/// Flags:
+///   GRND_NONBLOCK (0x01) — return EAGAIN if the entropy pool is not ready.
+///                          We treat our PRNG as always ready, so this flag
+///                          is accepted but never causes EAGAIN.
+///   GRND_RANDOM   (0x02) — draw from /dev/random pool (legacy). We have one
+///                          pool, so this is accepted and ignored.
+///
+/// Implementation: attempt RDRAND up to 10 retries per 8-byte word; if
+/// RDRAND is unavailable or consistently fails (CF=0), fall back to a
+/// xorshift64 PRNG seeded from the TSC.  Either path fills exactly `count`
+/// bytes and returns `count`.
+pub(crate) fn sys_getrandom(buf: *mut u8, count: usize, _flags: u32) -> i64 {
     if buf.is_null() || count == 0 {
-        return -22;
+        return -22; // EINVAL
     }
 
     let out = unsafe { core::slice::from_raw_parts_mut(buf, count) };
 
-    // Try RDRAND first
+    // Detect RDRAND support via CPUID leaf 1, ECX bit 30.
     let has_rdrand = unsafe {
         let mut ecx: u32;
-        // rbx is reserved by LLVM, so save/restore it manually.
+        // rbx is reserved by LLVM as the PIC base; save/restore manually.
         core::arch::asm!(
             "push rbx",
             "cpuid",
@@ -2759,34 +2771,56 @@ pub(crate) fn sys_getrandom(buf: *mut u8, count: usize) -> i64 {
         ecx & (1 << 30) != 0
     };
 
+    // Try RDRAND with a bounded retry budget.  Intel recommends up to 10
+    // retries; if all fail the hardware RNG is busy or absent.  Fall back to
+    // the TSC-seeded xorshift rather than spinning forever.
+    let mut rdrand_succeeded = false;
     if has_rdrand {
         let mut i = 0;
-        while i < count {
-            let mut val: u64;
-            let ok: u8;
-            unsafe {
-                core::arch::asm!(
-                    "rdrand {val}",
-                    "setc {ok}",
-                    val = out(reg) val,
-                    ok = out(reg_byte) ok,
-                );
+        'fill: while i < count {
+            let mut filled = false;
+            for _ in 0..10 {
+                let mut val: u64;
+                let ok: u8;
+                unsafe {
+                    core::arch::asm!(
+                        "rdrand {val}",
+                        "setc {ok}",
+                        val = out(reg) val,
+                        ok = out(reg_byte) ok,
+                    );
+                }
+                if ok != 0 {
+                    let bytes = val.to_le_bytes();
+                    let n = (count - i).min(8);
+                    out[i..i + n].copy_from_slice(&bytes[..n]);
+                    i += n;
+                    filled = true;
+                    break;
+                }
             }
-            if ok != 0 {
-                let bytes = val.to_le_bytes();
-                let n = (count - i).min(8);
-                out[i..i + n].copy_from_slice(&bytes[..n]);
-                i += n;
+            if !filled {
+                // RDRAND exhausted retries — abandon and fall back.
+                break 'fill;
             }
         }
-    } else {
-        // Fallback: xorshift64 seeded from TSC
+        if i >= count {
+            rdrand_succeeded = true;
+        }
+    }
+
+    if !rdrand_succeeded {
+        // xorshift64 seeded from the TSC.  Mix in a pointer address for
+        // additional entropy across calls in the same TSC window.
         let mut state: u64 = unsafe {
             let lo: u32;
             let hi: u32;
             core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi);
             ((hi as u64) << 32) | lo as u64
         };
+        // XOR with the output buffer address to differentiate concurrent
+        // callers that happen to read the TSC at the same tick.
+        state ^= buf as u64;
         if state == 0 {
             state = 0xDEAD_BEEF_CAFE_BABE;
         }
@@ -2798,6 +2832,7 @@ pub(crate) fn sys_getrandom(buf: *mut u8, count: usize) -> i64 {
         }
     }
 
+    // Per getrandom(2): return the number of bytes filled on success.
     count as i64
 }
 
