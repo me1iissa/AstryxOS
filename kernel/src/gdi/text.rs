@@ -359,3 +359,79 @@ pub fn measure_text(text: &str) -> (u32, u32) {
     let len = text.chars().filter(|c| *c >= ' ' && *c <= '~').count();
     (len as u32 * FONT_WIDTH, FONT_HEIGHT)
 }
+
+/// Render a text string onto a surface with uniform pixel scaling.
+///
+/// `scale` is an integer magnification factor (1 = normal, 2 = double, 3 = triple …).
+/// Each source pixel from the 8×16 VGA glyph is painted as a `scale×scale` block,
+/// producing a crisp blocky enlargement without any filtering.  This matches the
+/// aesthetic of classic boot-splash renderers that pixel-double VGA fonts.
+///
+/// Only printable ASCII (0x20–0x7E) is rendered; other code points are skipped.
+pub fn text_out_scaled(
+    surface: &mut Surface,
+    dc: &DeviceContext,
+    x: i32,
+    y: i32,
+    text: &str,
+    scale: u32,
+) {
+    if scale == 0 {
+        return;
+    }
+    if scale == 1 {
+        text_out(surface, dc, x, y, text);
+        return;
+    }
+
+    let s = scale as i32;
+    let sw = surface.width as i32;
+    let sh = surface.height as i32;
+
+    let mut cx = x + dc.origin_x;
+    let cy     = y + dc.origin_y;
+
+    for ch in text.chars() {
+        if ch == '\n' {
+            continue;
+        }
+        let c = ch as u32;
+        if c < 0x20 || c > 0x7E {
+            cx += (FONT_WIDTH as i32) * s;
+            continue;
+        }
+        let glyph_offset = ((c - 0x20) as usize) * 16;
+
+        for row in 0..16i32 {
+            let byte = VGA_FONT_8X16[glyph_offset + row as usize];
+            for col in 0..8i32 {
+                let lit = (byte >> (7 - col)) & 1 != 0;
+                if !lit && dc.bg_mode != BgMode::Opaque {
+                    continue;
+                }
+                let color = if lit { dc.text_color } else { dc.bg_color };
+                // Paint a scale×scale block.
+                for dy in 0..s {
+                    let py = cy + row * s + dy;
+                    if py < 0 || py >= sh {
+                        continue;
+                    }
+                    for dx in 0..s {
+                        let px = cx + col * s + dx;
+                        if px < 0 || px >= sw {
+                            continue;
+                        }
+                        surface.pixels[py as usize * surface.width as usize + px as usize] = color;
+                    }
+                }
+            }
+        }
+        cx += (FONT_WIDTH as i32) * s;
+    }
+}
+
+/// Measure text dimensions with a scale factor, in pixels (width, height).
+pub fn measure_text_scaled(text: &str, scale: u32) -> (u32, u32) {
+    let (w, h) = measure_text(text);
+    (w * scale, h * scale)
+}
