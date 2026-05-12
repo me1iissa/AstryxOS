@@ -18,6 +18,8 @@ pub mod hello_pe;
 pub mod hello_win32_pe;
 pub mod orbit_elf;
 pub mod pe;
+#[cfg(feature = "qga")]
+pub mod qga_elf;
 pub mod thread;
 pub mod usermode;
 pub mod vdso;

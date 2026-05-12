@@ -206,6 +206,23 @@ struct VirtioSerialDevice {
 static VIRTIO_SERIAL: Mutex<Option<VirtioSerialDevice>> = Mutex::new(None);
 static VIRTIO_SERIAL_AVAILABLE: AtomicBool = AtomicBool::new(false);
 
+/// Mutex-free snapshot of the virtqueue physical/runtime addresses used by
+/// the loopback test helpers (`test_inject_rx` / `test_drain_tx`).  These are
+/// set exactly once during `init()` and never change afterwards, so we can
+/// reach into the queues without contending against the device-mutex spin
+/// inside `write()`.  Without this, a daemon parked spinning on tx
+/// completion would block the test runner from ever advancing used.idx.
+#[cfg(feature = "qga")]
+#[derive(Clone, Copy)]
+struct LoopbackHandles {
+    rxq_phys: u64,
+    rxq_size: u16,
+    txq_phys: u64,
+    txq_size: u16,
+}
+#[cfg(feature = "qga")]
+static LOOPBACK: Mutex<Option<LoopbackHandles>> = Mutex::new(None);
+
 /// IRQ vector reserved for Phase QGA-1b.  Vectors 32-45 are taken by timer,
 /// keyboard, e1000, mouse, virtio-blk; pick the next free slot.
 #[allow(dead_code)]
@@ -356,6 +373,18 @@ pub fn init() -> bool {
     unsafe {
         replenish_rx(&mut dev.rxq);
         hal::outw(io_base + VIRTIO_REG_QUEUE_NOTIFY, 0);
+    }
+
+    // Stash the queue physical addresses + sizes for mutex-free loopback
+    // access from the test helpers (Phase QGA-2 only).
+    #[cfg(feature = "qga")]
+    {
+        *LOOPBACK.lock() = Some(LoopbackHandles {
+            rxq_phys:  dev.rxq.phys,
+            rxq_size:  dev.rxq.queue_size,
+            txq_phys:  dev.txq.phys,
+            txq_size:  dev.txq.queue_size,
+        });
     }
 
     *VIRTIO_SERIAL.lock() = Some(dev);
@@ -512,3 +541,116 @@ pub fn stats() -> Option<Stats> {
 // import without rewriting the use block.
 #[allow(dead_code)]
 fn _atomic_u16_anchor() -> AtomicU16 { AtomicU16::new(0) }
+
+// ── Loopback test helpers (Phase QGA-2) ─────────────────────────────────────
+//
+// In a normal boot the host drives both ends of the virtio-serial pair: it
+// sends QGA frames into the rx queue (which becomes guest-visible) and
+// consumes the daemon's replies from the tx queue.  In `test-mode` boots no
+// host is present, so the test runner needs a way to forge a host into the
+// loop: push bytes into rx so the daemon's `read()` returns them, and pull
+// bytes from tx so the daemon's `write()` completes.
+//
+// These helpers manipulate the same virtqueue memory the device would
+// touch.  They run only from kernel test code (no syscall surface) and
+// only when the `qga` feature is on.  The split-ring layout we operate on
+// matches §2.6 of the virtio 1.2 spec.
+
+/// Inject `bytes` into the rx queue as if the host had written them.
+///
+/// Returns `false` if the device is not initialised or `bytes` is larger
+/// than a single descriptor's scratch buffer (4 KiB).  Otherwise copies the
+/// bytes into the rx scratch slot, bumps the used-ring length, and advances
+/// `used.idx` so a subsequent `read()` consumes the data.
+///
+/// This helper does NOT take the device mutex — it operates on the
+/// LOOPBACK snapshot of the queue's physical addresses.  That is essential
+/// for the QGA-2 test: the daemon spins inside `virtio_serial::write`
+/// holding the device mutex, and a peer that needs to advance used.idx
+/// would otherwise deadlock waiting on the lock.
+#[cfg(feature = "qga")]
+pub fn test_inject_rx(bytes: &[u8]) -> bool {
+    if !VIRTIO_SERIAL_AVAILABLE.load(Ordering::Acquire) {
+        return false;
+    }
+    if bytes.len() > SCRATCH_BUF_LEN {
+        return false;
+    }
+    let h = match *LOOPBACK.lock() {
+        Some(h) => h,
+        None => return false,
+    };
+    // SAFETY: the queue physical pages were allocated in init() and never
+    // freed; we have a stable virtual mapping via phys_to_virt.  The bytes
+    // we write here will be observed by the driver's subsequent `read()`
+    // via the same memory.
+    unsafe {
+        let desc_virt = phys_to_virt::<u8>(h.rxq_phys);
+        let scratch_virt = desc_virt.add(scratch_buf_offset(h.rxq_size));
+        let avail_virt = desc_virt.add(avail_ring_offset(h.rxq_size));
+        let used_virt = desc_virt.add(used_ring_offset(h.rxq_size));
+
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), scratch_virt, bytes.len());
+
+        let cur_used = (used_virt.add(2) as *const u16).read_volatile();
+        let next_used = cur_used.wrapping_add(1);
+        let slot_idx = (cur_used % h.rxq_size) as usize;
+        let slot = used_virt.add(4 + slot_idx * 8);
+        (slot as *mut u32).write_volatile(0); // descriptor id 0
+        (slot.add(4) as *mut u32).write_volatile(bytes.len() as u32);
+        core::sync::atomic::fence(Ordering::SeqCst);
+        (used_virt.add(2) as *mut u16).write_volatile(next_used);
+        let _ = avail_virt; // referenced for completeness; rx avail is driver-driven
+    }
+    LoopbackHandles::touch(); // suppress dead_code on the helper-only path
+    true
+}
+
+/// Drain bytes from the tx queue's scratch buffer, capturing whatever the
+/// daemon most recently wrote to `/dev/vport0p0`.  Returns `Some(n)` with
+/// the number of bytes copied when there is a new descriptor since the
+/// caller's `last_avail` watermark; `None` otherwise.  Also returns the
+/// new watermark so the caller can poll without observing the same
+/// descriptor twice.
+///
+/// Unlike a normal host-side virtio consumer, this helper does NOT bump
+/// `used.idx` — that is done by QEMU's emulated device whenever bytes
+/// pass through the chardev to the host socket.  In test mode the host
+/// socket may have a peer (real harness) or no peer at all; either way
+/// the scratch buffer holds the most recently published payload.
+///
+/// Like `test_inject_rx`, this helper deliberately bypasses the device
+/// mutex (see that function's doc comment for the rationale).
+#[cfg(feature = "qga")]
+pub fn test_drain_tx(out: &mut [u8], last_avail: u16) -> (usize, u16) {
+    if !VIRTIO_SERIAL_AVAILABLE.load(Ordering::Acquire) || out.is_empty() {
+        return (0, last_avail);
+    }
+    let h = match *LOOPBACK.lock() {
+        Some(h) => h,
+        None => return (0, last_avail),
+    };
+    // SAFETY: see `test_inject_rx`.  We observe the daemon's tx state
+    // through volatile reads of the queue memory.
+    unsafe {
+        let desc_virt = phys_to_virt::<u8>(h.txq_phys);
+        let scratch_virt = desc_virt.add(scratch_buf_offset(h.txq_size));
+        let avail_virt = desc_virt.add(avail_ring_offset(h.txq_size));
+
+        let avail_idx = (avail_virt.add(2) as *const u16).read_volatile();
+        if avail_idx == last_avail {
+            return (0, last_avail);
+        }
+        // Descriptor 0 carries (addr, len, flags) for the daemon's write.
+        let len = (desc_virt.add(8) as *const u32).read_volatile() as usize;
+        let n = core::cmp::min(len, out.len());
+        core::ptr::copy_nonoverlapping(scratch_virt, out.as_mut_ptr(), n);
+        (n, avail_idx)
+    }
+}
+
+#[cfg(feature = "qga")]
+impl LoopbackHandles {
+    #[inline(always)]
+    fn touch() {}
+}

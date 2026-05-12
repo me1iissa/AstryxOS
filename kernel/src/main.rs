@@ -322,6 +322,28 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             x11::init();
             serial_println!("[FFTEST] X11 server ready");
 
+            // ── QGA daemon (Phase QGA-2) ────────────────────────────────
+            // Spawn the native userspace QEMU Guest Agent daemon BEFORE
+            // Firefox so the host can extract /tmp/out.png via the QGA
+            // socket once the headless screenshot lands.  See
+            // userspace/qga/ for the daemon source.
+            //
+            // The daemon exits cleanly when the kernel was built without
+            // a discoverable virtio-serial-pci device (open /dev/vport0p0
+            // returns -ENODEV), so this call is safe even when the harness
+            // forgets to add `--features qga` on the host CLI.
+            #[cfg(feature = "qga")]
+            {
+                serial_println!("[FFTEST] Spawning QGA daemon (Phase QGA-2)...");
+                match proc::usermode::create_aether_process(
+                    "qga",
+                    &proc::qga_elf::QGA_ELF,
+                ) {
+                    Ok(pid) => serial_println!("[FFTEST] QGA daemon launched as PID {}", pid),
+                    Err(e) => serial_println!("[FFTEST] QGA daemon spawn failed: {:?}", e),
+                }
+            }
+
             // Create a visible X11 test window BEFORE Firefox launches
             serial_println!("[X11-VIS] Creating X11 visual test window...");
             {
@@ -560,6 +582,19 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         match proc::usermode::create_user_process("orbit", &proc::orbit_elf::ORBIT_ELF) {
             Ok(pid) => serial_println!("[Aether] Orbit launched as PID {}", pid),
             Err(e) => serial_println!("[Aether] Failed to launch Orbit: {:?}", e),
+        }
+
+        // Launch QGA — the native QEMU Guest Agent daemon (Phase QGA-2).
+        // Ascension will eventually own this spawn (via sys::fork + exec
+        // of /sbin/qga); for now Aether launches it directly during boot
+        // so the host can talk to /dev/vport0p0 immediately after init.
+        #[cfg(feature = "qga")]
+        {
+            serial_println!("[Aether] Launching QGA daemon (Phase QGA-2)...");
+            match proc::usermode::create_aether_process("qga", &proc::qga_elf::QGA_ELF) {
+                Ok(pid) => serial_println!("[Aether] QGA daemon launched as PID {}", pid),
+                Err(e) => serial_println!("[Aether] Failed to launch QGA daemon: {:?}", e),
+            }
         }
 
         serial_println!("[Aether] Phase 13: Userspace processes launched.");

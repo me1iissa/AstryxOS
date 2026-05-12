@@ -82,7 +82,7 @@ pub fn create_user_process_with_args(
     argv: &[&str],
     envp: &[&str],
 ) -> Result<proc::Pid, elf::ElfError> {
-    create_user_process_impl(name, elf_data, argv, envp, true)
+    create_user_process_impl(name, elf_data, argv, envp, true, true)
 }
 
 /// Like `create_user_process_with_args` but leaves the initial thread
@@ -96,7 +96,30 @@ pub fn create_user_process_with_args_blocked(
     argv: &[&str],
     envp: &[&str],
 ) -> Result<proc::Pid, elf::ElfError> {
-    create_user_process_impl(name, elf_data, argv, envp, false)
+    create_user_process_impl(name, elf_data, argv, envp, false, true)
+}
+
+/// Create a native AstryxOS (Aether) user-mode process from an ELF binary.
+///
+/// Unlike `create_user_process`, the resulting process has `linux_abi = false`
+/// and `SubsystemType::Aether`, so its syscalls dispatch through
+/// `subsys/aether/syscall.rs` and use the small AstryxOS numbering scheme
+/// (`SYS_EXIT=0`, `SYS_WRITE=1`, ...).  Use this for binaries built against
+/// `userspace/libsys/` — e.g. the QGA daemon (Phase QGA-2).
+///
+/// The thread is immediately marked Ready so the scheduler can run it.
+pub fn create_aether_process(
+    name: &str,
+    elf_data: &[u8],
+) -> Result<proc::Pid, elf::ElfError> {
+    create_user_process_impl(
+        name,
+        elf_data,
+        &[name],
+        &["HOME=/", "PATH=/bin:/disk/bin"],
+        true,   // start_ready
+        false,  // linux_abi = false → Aether dispatch
+    )
 }
 
 fn create_user_process_impl(
@@ -105,6 +128,7 @@ fn create_user_process_impl(
     argv: &[&str],
     envp: &[&str],
     start_ready: bool,
+    linux_abi: bool,
 ) -> Result<proc::Pid, elf::ElfError> {
     crate::serial_println!("[USER] Loading ELF binary '{}' ({} bytes)", name, elf_data.len());
 
@@ -140,16 +164,23 @@ fn create_user_process_impl(
     let pid = proc::create_kernel_process_suspended(name, user_mode_bootstrap as *const () as u64);
 
     // Patch the process with our per-process page table and exe path.
-    // Set linux_abi HERE (before the thread is marked Ready) to eliminate
-    // the race where the AP schedules the thread before the caller can set it.
+    // Set linux_abi / subsystem HERE (before the thread is marked Ready) to
+    // eliminate the race where the AP schedules the thread before the
+    // caller can set it.  Aether-native callers (e.g. the QGA daemon)
+    // pass linux_abi=false so syscalls dispatch through
+    // `subsys/aether/syscall.rs` with the small AstryxOS numbering.
     {
         let mut procs = PROCESS_TABLE.lock();
         if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
             p.cr3 = user_cr3;
             p.vm_space = Some(vm_space);
             p.exe_path = Some(alloc::string::String::from(name));
-            p.linux_abi = true;
-            p.subsystem = crate::win32::SubsystemType::Linux;
+            p.linux_abi = linux_abi;
+            p.subsystem = if linux_abi {
+                crate::win32::SubsystemType::Linux
+            } else {
+                crate::win32::SubsystemType::Aether
+            };
             // Store auxv/envp for /proc/self/auxv and /proc/self/environ.
             p.auxv = result.auxv.clone();
             p.envp = envp.iter().map(|s| alloc::string::String::from(*s)).collect();
