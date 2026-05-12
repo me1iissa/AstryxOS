@@ -23,6 +23,7 @@ Tier 1 — session management:
     python3 scripts/qemu-harness.py snap <sid> save|load <name>
     python3 scripts/qemu-harness.py prune [--ttl DAYS]
     python3 scripts/qemu-harness.py results <sid>
+    python3 scripts/qemu-harness.py read-png <sid> <dst.png> [--timeout-ms MS]
 
 Tier 2 — GDB stub integration (requires --gdb-port on start):
     python3 scripts/qemu-harness.py regs <sid>
@@ -2584,6 +2585,163 @@ _FF_EXIT_TICKS_RE = re.compile(r"\[FFTEST\]\s+Firefox exited after\s+(\d+)\s+tic
 _FF_EXIT_CODE_RE  = re.compile(r"\[FFTEST\]\s+Firefox exit code[:= ]+(-?\d+)")
 _TICK_RE          = re.compile(r"tick[=:\s]+(\d+)")
 
+# [SC] full-line regex — includes cr= a4= a5= a6= which _SC_ENTRY_RE omits.
+_SC_FULL_RE = re.compile(
+    r"\[SC\]\s+pid=(\d+)\s+tid=(\d+)\s+nr=(\d+)\s+rip=(0x[0-9a-fA-F]+)"
+)
+# [SC-RET] regex
+_SC_RET_FULL_RE = re.compile(
+    r"\[SC-RET\]\s+pid=(\d+)\s+tid=(\d+)\s+nr=(\d+)\s+ret=(-?\d+|0x[0-9a-fA-F]+)"
+)
+
+# Linux syscall number → name table (x86_64, abbreviated to the set Firefox uses).
+_NR_NAME = {
+    0: "read", 1: "write", 2: "open", 3: "close", 4: "stat", 5: "fstat",
+    6: "lstat", 7: "poll", 8: "lseek", 9: "mmap", 10: "mprotect",
+    11: "munmap", 12: "brk", 13: "rt_sigaction", 14: "rt_sigprocmask",
+    15: "rt_sigreturn", 16: "ioctl", 17: "pread64", 18: "pwrite64",
+    19: "readv", 20: "writev", 21: "access", 22: "pipe", 23: "select",
+    24: "sched_yield", 25: "mremap", 26: "msync", 28: "madvise",
+    29: "shmget", 30: "shmat", 31: "shmctl", 32: "dup", 33: "dup2",
+    34: "pause", 35: "nanosleep", 36: "getitimer", 37: "alarm",
+    38: "setitimer", 39: "getpid", 41: "socket", 42: "connect",
+    43: "accept", 44: "sendto", 45: "recvfrom", 46: "sendmsg",
+    47: "recvmsg", 48: "shutdown", 49: "bind", 50: "listen",
+    51: "getsockname", 52: "getpeername", 53: "socketpair",
+    54: "setsockopt", 55: "getsockopt", 56: "clone",
+    57: "fork", 58: "vfork", 59: "execve", 60: "exit",
+    61: "wait4", 62: "kill", 63: "uname", 72: "fcntl", 73: "flock",
+    74: "fsync", 75: "fdatasync", 76: "truncate", 77: "ftruncate",
+    78: "getdents", 79: "getcwd", 80: "chdir", 81: "fchdir",
+    83: "mkdir", 84: "rmdir", 85: "creat", 86: "link", 87: "unlink",
+    88: "symlink", 89: "readlink", 90: "chmod", 91: "fchmod",
+    97: "getrlimit", 98: "getrusage", 99: "sysinfo", 100: "times",
+    102: "getuid", 104: "getgid", 105: "setuid", 106: "setgid",
+    107: "geteuid", 108: "getegid", 110: "getppid", 111: "getpgrp",
+    112: "setsid", 158: "arch_prctl", 160: "setrlimit",
+    186: "gettid", 201: "time", 202: "futex",
+    218: "set_tid_address", 228: "clock_gettime", 229: "clock_getres",
+    230: "clock_nanosleep", 231: "exit_group", 232: "epoll_wait",
+    233: "epoll_ctl", 234: "tgkill", 257: "openat", 262: "newfstatat",
+    273: "set_robust_list", 302: "prlimit64", 318: "getrandom",
+    319: "memfd_create", 334: "rseq", 435: "clone3",
+}
+
+
+def _nr_to_name(nr: int) -> str:
+    return _NR_NAME.get(nr, f"nr{nr}")
+
+
+def cmd_sc_histogram(args):
+    """Scan [SC] trace lines from the serial log; produce a per-tid syscall
+    count histogram plus a global top-N sorted by call frequency.
+
+    Also scans [SC-RET] lines to identify syscalls that return errors
+    (negative return values) which may indicate ABI divergence from Linux.
+
+    Output schema:
+      {
+        "total_sc_lines": <int>,
+        "tids_seen": [<tid>, ...],
+        "global_top": [{"name": str, "nr": int, "count": int}, ...],
+        "per_tid": {
+          "<tid>": {
+            "total": <int>,
+            "top": [{"name": str, "nr": int, "count": int}, ...]
+          }
+        },
+        "error_returns": [{"name": str, "nr": int, "ret": str, "count": int}, ...],
+      }
+    """
+    sess = _load_session(args.sid)
+    serial_log = sess["serial_log"]
+    filter_tid = args.tid
+    top_n = max(1, int(args.top))
+    since_line = args.since_line
+
+    # Per-tid: {tid: {nr: count}}
+    per_tid: dict[int, dict[int, int]] = {}
+    # Global: {nr: count}
+    global_hist: dict[int, int] = {}
+    # Error returns: {(tid, nr): {ret_str: count}}
+    error_hist: dict[tuple, dict[str, int]] = {}
+
+    total_sc = 0
+    line_no = 0
+
+    try:
+        with Path(serial_log).open("r", errors="replace") as fh:
+            for ln in fh:
+                line_no += 1
+                if since_line is not None and line_no < since_line:
+                    continue
+                # [SC] entry lines
+                m = _SC_FULL_RE.search(ln)
+                if m:
+                    tid = int(m.group(2))
+                    nr  = int(m.group(3))
+                    if filter_tid is not None and tid != filter_tid:
+                        continue
+                    total_sc += 1
+                    per_tid.setdefault(tid, {})
+                    per_tid[tid][nr] = per_tid[tid].get(nr, 0) + 1
+                    global_hist[nr] = global_hist.get(nr, 0) + 1
+                    continue
+                # [SC-RET] lines — track negative returns as errors
+                m = _SC_RET_FULL_RE.search(ln)
+                if m:
+                    tid = int(m.group(2))
+                    nr  = int(m.group(3))
+                    if filter_tid is not None and tid != filter_tid:
+                        continue
+                    ret_s = m.group(4)
+                    try:
+                        ret_v = int(ret_s, 0)
+                    except ValueError:
+                        continue
+                    # Only track negative returns (errors) or interesting values
+                    if ret_v < 0 or (nr == 202 and ret_v == 11):  # 202=futex, EAGAIN=11
+                        key = (tid, nr)
+                        error_hist.setdefault(key, {})
+                        error_hist[key][ret_s] = error_hist[key].get(ret_s, 0) + 1
+    except OSError as e:
+        _err(f"Cannot read serial log: {e}")
+
+    # Build global top-N
+    global_top = sorted(
+        [{"name": _nr_to_name(nr), "nr": nr, "count": c}
+         for nr, c in global_hist.items()],
+        key=lambda x: -x["count"]
+    )[:top_n]
+
+    # Build per-tid top-N
+    per_tid_out = {}
+    for tid, hist in sorted(per_tid.items()):
+        top = sorted(
+            [{"name": _nr_to_name(nr), "nr": nr, "count": c}
+             for nr, c in hist.items()],
+            key=lambda x: -x["count"]
+        )[:top_n]
+        per_tid_out[str(tid)] = {"total": sum(hist.values()), "top": top}
+
+    # Flatten error histogram
+    error_list = []
+    for (tid, nr), ret_counts in sorted(error_hist.items()):
+        for ret_s, count in sorted(ret_counts.items(), key=lambda kv: -kv[1]):
+            error_list.append({
+                "tid": tid, "name": _nr_to_name(nr), "nr": nr,
+                "ret": ret_s, "count": count
+            })
+    error_list.sort(key=lambda x: -x["count"])
+
+    _out({
+        "total_sc_lines": total_sc,
+        "tids_seen": sorted(per_tid.keys()),
+        "global_top": global_top,
+        "per_tid": per_tid_out,
+        "error_returns": error_list[:50],
+    })
+
 
 def cmd_results(args):
     """
@@ -3772,6 +3930,195 @@ def cmd_wake_attempts(args):
     })
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# read-png — extract a PNG screenshot from the guest via serial base64
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Protocol emitted by the kernel's test_gdi_png_screenshot (Test 198):
+#
+#   [SCREENSHOT-B64:N/M] <76-char base64 chunk>   (N = 0-based index, M = total)
+#   [SCREENSHOT-B64-END]
+#
+# This subcommand:
+#   1. Waits for the first [SCREENSHOT-B64:0/M] line (up to --timeout-ms).
+#   2. Scans the serial log for all M chunks (0..M-1) in order.
+#   3. Validates the chunk count matches M.
+#   4. Decodes the concatenated base64 (RFC 4648 §4) and writes to <dst>.
+#   5. Verifies the PNG signature (8-byte magic, W3C PNG §5.2).
+#   6. Prints JSON: {"ok": true, "path": dst, "bytes": N, "chunks": M}
+#      or {"ok": false, "error": "...", ...} on failure.
+#
+# Output is additive to the existing [SCREENSHOT] summary line — Test 198
+# continues to PASS regardless of whether read-png was waiting.
+
+_B64_FIRST_RE = re.compile(
+    r"\[SCREENSHOT-B64:0/(\d+)\]\s+([A-Za-z0-9+/=]+)"
+)
+_B64_CHUNK_RE = re.compile(
+    r"\[SCREENSHOT-B64:(\d+)/(\d+)\]\s+([A-Za-z0-9+/=]+)"
+)
+_B64_END_RE = re.compile(r"\[SCREENSHOT-B64-END\]")
+
+_PNG_SIGNATURE = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+
+
+def cmd_read_png(args):
+    """
+    Collect base64-encoded PNG chunks from the serial log and write to <dst>.
+
+    Waits for the first [SCREENSHOT-B64:0/M] line, then scans for all M chunks,
+    decodes, verifies the PNG signature, and writes to args.dst.
+    """
+    import base64
+
+    sess       = _load_session(args.sid)
+    serial_log = sess["serial_log"]
+    dst        = args.dst
+    timeout_ms = args.timeout_ms
+
+    # ── 1. Wait for the first chunk (index 0) ─────────────────────────────────
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    total_chunks: Optional[int] = None
+    first_chunk: Optional[str]  = None
+    file_pos = 0
+
+    while time.monotonic() < deadline:
+        try:
+            with open(serial_log, "r", errors="replace") as fh:
+                fh.seek(file_pos)
+                chunk = fh.read(131072)
+        except OSError:
+            time.sleep(0.1)
+            continue
+
+        if chunk:
+            for ln in chunk.splitlines():
+                m = _B64_FIRST_RE.search(ln)
+                if m:
+                    total_chunks = int(m.group(1))
+                    first_chunk  = m.group(2)
+                    break
+            file_pos += len(chunk.encode("utf-8", errors="replace"))
+
+        if first_chunk is not None:
+            break
+
+        # Check if QEMU has already exited (no point waiting further).
+        pid = sess.get("pid", 0)
+        if pid and not _pid_alive(pid):
+            break
+
+        time.sleep(0.1)
+
+    if first_chunk is None or total_chunks is None:
+        _err(f"read-png: timed out waiting for [SCREENSHOT-B64:0/M] "
+             f"(waited {timeout_ms} ms). Is the session running test-mode?")
+
+    # ── 2. Collect all M chunks from the serial log ───────────────────────────
+    # We have chunk 0 already. Scan the full log for chunks 0..M-1 in case
+    # some arrived before we started (serial log is append-only; we can always
+    # re-scan from the beginning).
+    chunks: dict[int, str] = {0: first_chunk}
+
+    # Allow extra time for the remaining chunks (the PNG is ~77 KB → ~1370 lines
+    # at 115200 baud ≈ 10 s; we give 2× margin).
+    collect_deadline = time.monotonic() + 30.0
+
+    while len(chunks) < total_chunks and time.monotonic() < collect_deadline:
+        try:
+            with open(serial_log, "r", errors="replace") as fh:
+                for ln in fh:
+                    m = _B64_CHUNK_RE.search(ln)
+                    if m:
+                        idx = int(m.group(1))
+                        tot = int(m.group(2))
+                        b64 = m.group(3)
+                        if tot == total_chunks and idx < total_chunks:
+                            chunks[idx] = b64
+        except OSError:
+            pass
+
+        if len(chunks) < total_chunks:
+            # Still missing some chunks — wait briefly and rescan.
+            pid = sess.get("pid", 0)
+            if pid and not _pid_alive(pid):
+                # QEMU exited; do one final rescan below.
+                break
+            time.sleep(0.2)
+
+    # Final rescan after QEMU may have exited.
+    if len(chunks) < total_chunks:
+        try:
+            with open(serial_log, "r", errors="replace") as fh:
+                for ln in fh:
+                    m = _B64_CHUNK_RE.search(ln)
+                    if m:
+                        idx = int(m.group(1))
+                        tot = int(m.group(2))
+                        b64 = m.group(3)
+                        if tot == total_chunks and idx < total_chunks:
+                            chunks[idx] = b64
+        except OSError:
+            pass
+
+    # ── 3. Validate chunk count ────────────────────────────────────────────────
+    missing = [i for i in range(total_chunks) if i not in chunks]
+    if missing:
+        _out({
+            "ok":          False,
+            "error":       "missing_chunks",
+            "total":       total_chunks,
+            "received":    len(chunks),
+            "missing":     missing[:20],
+        })
+        sys.exit(1)
+
+    # ── 4. Decode base64 ─────────────────────────────────────────────────────
+    b64_concat = "".join(chunks[i] for i in range(total_chunks))
+    try:
+        png_bytes = base64.b64decode(b64_concat, validate=True)
+    except Exception as exc:
+        _out({
+            "ok":    False,
+            "error": f"base64_decode_failed: {exc}",
+            "chunks": total_chunks,
+        })
+        sys.exit(1)
+
+    # ── 5. Verify PNG signature ────────────────────────────────────────────────
+    if len(png_bytes) < 8 or png_bytes[:8] != _PNG_SIGNATURE:
+        got = png_bytes[:8].hex() if len(png_bytes) >= 8 else png_bytes.hex()
+        _out({
+            "ok":    False,
+            "error": "png_signature_mismatch",
+            "got":   got,
+            "expected": _PNG_SIGNATURE.hex(),
+            "chunks": total_chunks,
+            "bytes":  len(png_bytes),
+        })
+        sys.exit(1)
+
+    # ── 6. Write to dst ───────────────────────────────────────────────────────
+    dst_path = Path(dst)
+    try:
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        dst_path.write_bytes(png_bytes)
+    except OSError as exc:
+        _out({
+            "ok":    False,
+            "error": f"write_failed: {exc}",
+            "path":  dst,
+        })
+        sys.exit(1)
+
+    _out({
+        "ok":     True,
+        "path":   str(dst_path.resolve()),
+        "bytes":  len(png_bytes),
+        "chunks": total_chunks,
+    })
+
+
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 def main():
@@ -4084,6 +4431,38 @@ def main():
                           help="Disk staging root for symbol lookup "
                                "(see `ustack --disk-root`)")
 
+    # sc-histogram — syscall count histogram from [SC] trace lines
+    p_schist = sub.add_parser(
+        "sc-histogram",
+        help="Parse [SC] trace lines from serial log; produce per-tid syscall "
+             "count histogram and total call counts sorted by frequency. "
+             "Requires --features syscall-trace at start."
+    )
+    p_schist.add_argument("sid")
+    p_schist.add_argument("--tid", type=int, default=None,
+                          help="Restrict to a single TID (default: all tids)")
+    p_schist.add_argument("--top", type=int, default=20,
+                          help="Report the top N syscalls by count (default 20)")
+    p_schist.add_argument("--since-line", type=int, default=None, dest="since_line",
+                          help="Skip serial log lines before this line number "
+                               "(useful to restrict to post-plateau window)")
+
+    # read-png — extract the guest PNG screenshot to a host-side file
+    p_read_png = sub.add_parser(
+        "read-png",
+        help="Collect base64-encoded PNG from the serial log (Test 198 emits "
+             "[SCREENSHOT-B64:N/M] lines) and write to <dst.png>.  "
+             "Verifies the PNG signature before writing.  "
+             "Example: read-png <sid> /tmp/extracted.png"
+    )
+    p_read_png.add_argument("sid")
+    p_read_png.add_argument("dst", help="Host-side destination path for the PNG file")
+    p_read_png.add_argument(
+        "--timeout-ms", type=int, default=120000, dest="timeout_ms",
+        help="Milliseconds to wait for the first [SCREENSHOT-B64:0/M] line "
+             "(default 120000 = 2 min, covers build + boot + test run)"
+    )
+
     # _watch: private subcommand used internally by `start` to run the
     # background watcher in a detached process. Not shown in help.
     p_watch = sub.add_parser("_watch")
@@ -4122,11 +4501,13 @@ def main():
         "parked-tids": cmd_parked_tids,
         "parked-stacks": cmd_parked_stacks,
         "wake-attempts": cmd_wake_attempts,
+        "sc-histogram": cmd_sc_histogram,
         "rip-sample": cmd_rip_sample,
         "qmp-regs": cmd_qmp_regs,
         "qmp-xv":   cmd_qmp_xv,
         "qmp-xp":   cmd_qmp_xp,
         "rip-walk": cmd_rip_walk,
+        "read-png": cmd_read_png,
         "_watch":  cmd_run_watcher,
     }
     dispatch[args.cmd](args)
