@@ -1308,6 +1308,28 @@ fn redirect_proc_pid_path(path: &str) -> Option<alloc::string::String> {
     Some(alloc::format!("/proc/self{}", suffix))
 }
 
+/// True when `open_path` is `/proc/self/<leaf>` or `/proc/<N>/<leaf>` for the
+/// given `leaf` (no nested components).  Avoids the ambiguity of the previous
+/// `.ends_with("/leaf")` test which would falsely match `/proc/self/fd/leaf`,
+/// `/disk/proc/cgroup`, or any other path coincidentally ending in `/leaf`.
+fn is_proc_self_path(open_path: &str, leaf: &str) -> bool {
+    let rest = match open_path.strip_prefix("/proc/") {
+        Some(r) => r,
+        None => return false,
+    };
+    let after_pid = match rest.split_once('/') {
+        Some((pid, tail)) => {
+            // Must be "self" or all-digits.
+            if pid != "self" && (pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit())) {
+                return false;
+            }
+            tail
+        }
+        None => return false,
+    };
+    after_pid == leaf
+}
+
 /// Extract the target PID from a `/proc/<N>/...` open_path.
 /// Returns `None` for `/proc/self/...` (caller should use its own PID).
 fn proc_target_pid(open_path: &str) -> Option<u64> {
@@ -1626,6 +1648,23 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
             // spin that hangs in the kernel indefinitely.
             if open_path == "/proc/mounts" {
                 let content = procfs::generate_mounts();
+                return serve_dynamic_read(&content, offset, buf, count, pid, fd_num);
+            }
+            // /proc/self/mountinfo (and /proc/<pid>/mountinfo) — same lock
+            // hazard as /proc/mounts: generate_mountinfo() takes MOUNTS.lock(),
+            // so it must be served from here (outside any FS dispatch path).
+            //
+            // Mozilla's sandbox policy builder enumerates filesystems via this
+            // file; an ENOENT previously made it fall back to refuse-all,
+            // which prevented the GPU-probe child from ever being spawned
+            // (see W39 trace: 2× ENOENT on mountinfo + zero subsequent execve).
+            if is_proc_self_path(&open_path, "mountinfo") {
+                let content = procfs::generate_mountinfo();
+                return serve_dynamic_read(&content, offset, buf, count, pid, fd_num);
+            }
+            // /proc/self/cgroup — cgroup v2 unified hierarchy root reply.
+            if is_proc_self_path(&open_path, "cgroup") {
+                let content = procfs::generate_cgroup();
                 return serve_dynamic_read(&content, offset, buf, count, pid, fd_num);
             }
 
