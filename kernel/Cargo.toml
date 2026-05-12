@@ -73,6 +73,12 @@ bugcheck-reentry-test = ["bugcheck-test"]
 # debugging user-mode futex choreography. Pairs with [FUTEX_WAIT_STACK] and
 # [FUTEX_WAIT_REG] lines to form a complete per-waiter trace.
 futex-wait-scan = []
+# QGA (QEMU Guest Agent) transport: enables the virtio-serial driver and the
+# `/dev/vport0p0` character device node that the future userspace QGA daemon
+# (Phase QGA-2) will open.  Pair with the harness `--features qga` flag,
+# which adds the matching `virtio-serial-pci` + `virtserialport` device on
+# the host side.  See virtio 1.2 §5.3 (Console Device).
+qga = []
 
 [dependencies]
 astryx-shared = { path = "../shared" }

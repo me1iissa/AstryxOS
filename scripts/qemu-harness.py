@@ -841,6 +841,7 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
                           smp: int = 2,
                           cpu_model: Optional[str] = None,
                           esp_dir_override: Optional[str] = None,
+                          qga_sock: str = "",
                           ) -> subprocess.Popen:
     """
     Launch QEMU with a per-session serial log and QMP socket.
@@ -885,6 +886,7 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
         ovmf_vars=str(ovmf_vars_dst),
         esp_dir=str(ESP_DIR),
         qmp_sock=str(qmp_sock),
+        qga_sock=str(qga_sock) if qga_sock else None,
         gdb_port=gdb_port if gdb_port and gdb_port > 0 else None,
         gdb_wait=gdb_wait,
         kvm=kvm,
@@ -938,11 +940,19 @@ def cmd_start(args):
     # resolved by a linear-probe in the derivation itself (not bindable
     # ports are just forwarded; only the SLIRP side binds inside QEMU).
     features_str = (args.features or "")
+    feats = [f.strip() for f in features_str.split(",")]
     kdb_host_port = 0
-    if "kdb" in [f.strip() for f in features_str.split(",")]:
+    if "kdb" in feats:
         # Derive deterministically from sid so reruns are stable and two
         # concurrent sessions almost certainly land on distinct ports.
         kdb_host_port = 9990 + (int(sid, 16) % 1000)
+
+    # QGA transport (Phase QGA-1): when the kernel was built with the `qga`
+    # feature, expose a virtio-serial port + matching host Unix socket so
+    # the future userspace daemon (Phase QGA-2) has a path out to the host.
+    qga_sock = ""
+    if "qga" in feats:
+        qga_sock = str(HARNESS_DIR / f"{sid}.qga.sock")
 
     # Build unless --no-build.
     # Redirect all build output to stderr so stdout stays JSON-only.
@@ -988,13 +998,15 @@ def cmd_start(args):
                                  kvm=kvm_arg,
                                  smp=smp,
                                  cpu_model=cpu_model,
-                                 esp_dir_override=esp_paths["session_esp_dir"])
+                                 esp_dir_override=esp_paths["session_esp_dir"],
+                                 qga_sock=qga_sock)
 
     session = {
         "sid":        sid,
         "pid":        proc.pid,
         "serial_log": serial_log,
         "qmp_sock":   qmp_sock,
+        "qga_sock":   qga_sock,
         "ovmf_vars":  ovmf_vars,
         "started_at": time.time(),
         "features":   args.features or "",
@@ -1064,6 +1076,13 @@ def cmd_stop(args):
     if qmp_sock and Path(qmp_sock).exists():
         try:
             Path(qmp_sock).unlink()
+        except OSError:
+            pass
+    # Clean up QGA socket (Phase QGA-1)
+    qga_sock = sess.get("qga_sock", "")
+    if qga_sock and Path(qga_sock).exists():
+        try:
+            Path(qga_sock).unlink()
         except OSError:
             pass
 
