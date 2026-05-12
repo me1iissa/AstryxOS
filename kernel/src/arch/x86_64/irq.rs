@@ -105,12 +105,26 @@ pub const TICK_HZ: u64 = 100;
 /// Record the TSC frequency the BSP measured during LAPIC calibration so
 /// `timer_tick` can derive a wall-locked `TICK_COUNT`.  Must be called
 /// once on the BSP after `calibrate_lapic_timer` completes.
+///
+/// Also publishes the calibration into the vDSO vvar page so userspace
+/// `__vdso_clock_gettime` can compute TSC-precise ns without entering
+/// the kernel.  Prior implementations published only `TICK_COUNT` (10 ms
+/// quantum), which silently coarsened every Mozilla/glibc TimeStamp
+/// reading by ~10000× — see `vdso.S` for the user-side formula.
 pub fn set_tsc_calibration(tsc_per_10ms: u64) {
     if tsc_per_10ms == 0 { return; }
+    let now_tsc = rdtsc();
     let _ = TSC_AT_BOOT.compare_exchange(
-        0, rdtsc(), Ordering::AcqRel, Ordering::Relaxed);
+        0, now_tsc, Ordering::AcqRel, Ordering::Relaxed);
     let _ = TSC_PER_TICK.compare_exchange(
         0, tsc_per_10ms, Ordering::AcqRel, Ordering::Relaxed);
+    // Mirror the calibration into the vvar page so userspace reads the
+    // same epoch the in-kernel monotonic path uses.  Order of operations
+    // matters: the atomics above MUST be populated first so any concurrent
+    // in-kernel `vdso::monotonic_ns()` call sees a consistent pair.
+    let tsc_at_boot  = TSC_AT_BOOT.load(Ordering::Acquire);
+    let tsc_per_tick = TSC_PER_TICK.load(Ordering::Acquire);
+    crate::proc::vdso::publish_tsc_calibration(tsc_at_boot, tsc_per_tick);
 }
 
 /// Keyboard scancode buffer (simple ring buffer).

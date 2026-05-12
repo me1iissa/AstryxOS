@@ -1321,6 +1321,14 @@ pub fn run() -> ! {
     total += 1;
     if test_dup_clears_cloexec() { passed += 1; }
 
+    // ── Test 199: vDSO clock_gettime — TSC-precise ns granularity ───────
+    total += 1;
+    if test_vdso_clock_gettime_subtick_ns() { passed += 1; }
+
+    // ── Test 200: vDSO clock_gettime — wall-clock progress under 1 ms ───
+    total += 1;
+    if test_vdso_clock_gettime_progress_subms() { passed += 1; }
+
     // (Stream-A pipe / eventfd wake-hook tests run first — see Tests 0a/0b
     // at the top of this function so failures surface before the suite's
     // long network/disk pre-amble.)
@@ -23134,6 +23142,183 @@ fn test_dup_clears_cloexec() -> bool {
     crate::subsys::linux::syscall::sys_close_test(orig_fd as u64);
 
     test_pass!("dup/dup2 clear FD_CLOEXEC on duplicate");
+    true
+}
+
+// ── Test 199: vDSO clock_gettime — TSC-precise ns granularity ────────────────
+//
+// Asserts the in-kernel CLOCK_MONOTONIC formula returns sub-millisecond ns
+// values: a second-quantised or 10 ms-quantised clock would report
+// `tv_nsec % 10_000_000 == 0` every time, trapping any timing loop that
+// asks "did at least 100 µs elapse?" in a zero-elapsed-time spin.
+//
+// Pre-fix: vvar_ticks * 10_000_000 / 100 always yielded multiples of
+// 10 ms.  Post-fix: TSC-derived ns has at least cycle-level granularity
+// (sub-microsecond on modern hosts).
+//
+// Test exercises `sys_clock_gettime(CLOCK_MONOTONIC)` (which uses the
+// same monotonic_ns() helper the vDSO computes from) and checks that
+// at least one of N back-to-back samples has tv_nsec NOT aligned to the
+// 10 ms quantum.  Strict equality to "every sample is non-coarse" would
+// flake at multiples of 10 ms — the bound here is "at least one sample
+// across the burst proves sub-tick precision".
+//
+// Public references:
+//   clock_gettime(2) — CLOCK_MONOTONIC tv_nsec semantics
+//   vdso(7)         — AT_SYSINFO_EHDR + clock_gettime fast path
+fn test_vdso_clock_gettime_subtick_ns() -> bool {
+    test_header!("vDSO clock_gettime — TSC-derived sub-tick ns granularity");
+
+    let tsc_per_tick = crate::arch::x86_64::irq::TSC_PER_TICK
+        .load(core::sync::atomic::Ordering::Acquire);
+    if tsc_per_tick == 0 {
+        test_fail!("vdso_subtick_ns",
+            "TSC_PER_TICK = 0 — apic::init / calibration did not run");
+        return false;
+    }
+    test_println!("  TSC_PER_TICK = {} (≈{:.2} GHz)", tsc_per_tick,
+        (tsc_per_tick as f64) * 100.0 / 1.0e9);
+
+    // Take 128 back-to-back samples; expect overwhelming majority to be
+    // non-coarse (not multiples of 10 ms in tv_nsec).
+    let mut non_coarse = 0u32;
+    let mut last_ts: [u64; 2] = [0; 2];
+    let mut monotone_breaks = 0u32;
+    const N: u32 = 128;
+    for i in 0..N {
+        let mut tp = [0u8; 16];
+        let r = crate::syscall::sys_clock_gettime(1 /*CLOCK_MONOTONIC*/,
+            tp.as_mut_ptr() as u64);
+        if r != 0 {
+            test_fail!("vdso_subtick_ns",
+                "clock_gettime returned {} on sample {}", r, i);
+            return false;
+        }
+        let sec  = u64::from_le_bytes(tp[0..8].try_into().unwrap());
+        let nsec = u64::from_le_bytes(tp[8..16].try_into().unwrap());
+        if nsec >= 1_000_000_000 {
+            test_fail!("vdso_subtick_ns",
+                "sample {}: tv_nsec={} >= 10^9 (formula bug)", i, nsec);
+            return false;
+        }
+        // Coarse-quantised iff tv_nsec is an exact multiple of 10 ms.
+        if (nsec % 10_000_000) != 0 { non_coarse += 1; }
+        if i > 0 {
+            let now_total = sec.saturating_mul(1_000_000_000).saturating_add(nsec);
+            let prev_total = last_ts[0].saturating_mul(1_000_000_000)
+                .saturating_add(last_ts[1]);
+            if now_total < prev_total { monotone_breaks += 1; }
+        }
+        last_ts[0] = sec; last_ts[1] = nsec;
+    }
+    test_println!("  {} of {} samples had sub-tick ns (tv_nsec % 10ms != 0)",
+        non_coarse, N);
+    test_println!("  monotone violations across burst: {}", monotone_breaks);
+
+    if monotone_breaks > 0 {
+        test_fail!("vdso_subtick_ns",
+            "{} non-monotone samples in burst of {} — TSC math is wrong",
+            monotone_breaks, N);
+        return false;
+    }
+    // Pre-fix: 0 / 128 sub-tick.  Post-fix: vast majority should be
+    // sub-tick.  Strict bound is "at least one" to avoid flake at
+    // 10 ms boundary alignment.
+    if non_coarse == 0 {
+        test_fail!("vdso_subtick_ns",
+            "0 of {} samples had sub-tick ns — clock_gettime still \
+             reports tick-quantised time",
+            N);
+        return false;
+    }
+
+    test_pass!("vDSO clock_gettime — TSC-derived sub-tick ns granularity");
+    true
+}
+
+// ── Test 200: vDSO clock_gettime — wall-clock progress under 1 ms ────────────
+//
+// Asserts CLOCK_MONOTONIC advances on a per-call basis without needing
+// a full PIT tick to elapse.  Pre-fix: two clock_gettime calls within
+// the same 10 ms window returned the same (sec, nsec).  Post-fix: a
+// modest busy-wait between calls produces a measurable ns delta.
+//
+// The check is "any positive delta inside a bounded TSC budget".
+// We spin for ~1 ms of TSC cycles between samples — well under the
+// 10 ms tick quantum, so a tick-quantised clock would report zero
+// delta with overwhelming probability.
+fn test_vdso_clock_gettime_progress_subms() -> bool {
+    test_header!("vDSO clock_gettime — sub-tick wall-clock progress");
+
+    let tsc_per_tick = crate::arch::x86_64::irq::TSC_PER_TICK
+        .load(core::sync::atomic::Ordering::Acquire);
+    if tsc_per_tick == 0 {
+        test_fail!("vdso_subms_progress", "TSC_PER_TICK = 0 — calibration not run");
+        return false;
+    }
+    // ~1 ms of TSC at the calibrated frequency.
+    let budget_tsc = tsc_per_tick / 10;
+
+    let rdtsc = || -> u64 {
+        let lo: u32; let hi: u32;
+        unsafe {
+            core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi,
+                options(nomem, nostack));
+        }
+        ((hi as u64) << 32) | lo as u64
+    };
+
+    // Take the first reading.
+    let mut tp_a = [0u8; 16];
+    let r = crate::syscall::sys_clock_gettime(1, tp_a.as_mut_ptr() as u64);
+    if r != 0 {
+        test_fail!("vdso_subms_progress", "first clock_gettime returned {}", r);
+        return false;
+    }
+    let sec_a  = u64::from_le_bytes(tp_a[0..8].try_into().unwrap());
+    let nsec_a = u64::from_le_bytes(tp_a[8..16].try_into().unwrap());
+    let total_a = sec_a.saturating_mul(1_000_000_000).saturating_add(nsec_a);
+
+    // Busy-wait ~1 ms via TSC (NOT via clock_gettime — that would couple
+    // the test's wait loop to the very thing under test).
+    let start = rdtsc();
+    while rdtsc().wrapping_sub(start) < budget_tsc {
+        core::hint::spin_loop();
+    }
+
+    let mut tp_b = [0u8; 16];
+    let r = crate::syscall::sys_clock_gettime(1, tp_b.as_mut_ptr() as u64);
+    if r != 0 {
+        test_fail!("vdso_subms_progress", "second clock_gettime returned {}", r);
+        return false;
+    }
+    let sec_b  = u64::from_le_bytes(tp_b[0..8].try_into().unwrap());
+    let nsec_b = u64::from_le_bytes(tp_b[8..16].try_into().unwrap());
+    let total_b = sec_b.saturating_mul(1_000_000_000).saturating_add(nsec_b);
+
+    if total_b < total_a {
+        test_fail!("vdso_subms_progress",
+            "second sample {} ns precedes first {} ns — monotonicity violated",
+            total_b, total_a);
+        return false;
+    }
+    let delta_ns = total_b - total_a;
+    test_println!("  busy-waited ~1ms; clock advanced {} ns ({}.{:03} ms)",
+        delta_ns, delta_ns / 1_000_000, (delta_ns % 1_000_000) / 1000);
+
+    // Pre-fix: a tick-quantised clock reads 0 or 10_000_000 ns delta with
+    // a strong bias toward 0 (the 1 ms wait is shorter than a tick).
+    // Post-fix: should be ~1 ms (give or take call overhead).  Require
+    // a positive delta AND < 5 ms — anything larger suggests we waited
+    // through a real PIT tick (unlikely but possible under VM jitter).
+    if delta_ns == 0 {
+        test_fail!("vdso_subms_progress",
+            "1 ms TSC busy-wait produced 0 ns clock_gettime delta — \
+             clock is tick-quantised");
+        return false;
+    }
+
+    test_pass!("vDSO clock_gettime — sub-tick wall-clock progress");
     true
 }
 
