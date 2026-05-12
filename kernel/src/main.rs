@@ -144,6 +144,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // (none today, but keep in mind for future early-FS code) use the
     // poll fallback, see drivers/virtio_blk.rs::submit_request.
     drivers::virtio_blk::arm_irq();
+    drivers::virtio_serial::arm_irq();
     serial_println!("[Aether] Phase 5b: APIC OK");
 
     // Phase 6: Syscall interface
@@ -588,12 +589,23 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         // Ascension will eventually own this spawn (via sys::fork + exec
         // of /sbin/qga); for now Aether launches it directly during boot
         // so the host can talk to /dev/vport0p0 immediately after init.
+        //
+        // Enabling the scheduler is required for the daemon to actually
+        // run — `shell::launch()` below blocks the BSP in a kernel-mode
+        // input loop that only enables the scheduler when the user
+        // types `exec`.  Without an explicit `sched::enable()` here the
+        // QGA daemon process exists but never gets a quantum, so host
+        // requests to `/dev/vport0p0` time out (the PR #158 wedge that
+        // QGA-3 surfaced even on a working IRQ-driven RX path).
         #[cfg(feature = "qga")]
         {
             serial_println!("[Aether] Launching QGA daemon (Phase QGA-2)...");
             match proc::usermode::create_aether_process("qga", &proc::qga_elf::QGA_ELF) {
                 Ok(pid) => serial_println!("[Aether] QGA daemon launched as PID {}", pid),
                 Err(e) => serial_println!("[Aether] Failed to launch QGA daemon: {:?}", e),
+            }
+            if !sched::is_active() {
+                sched::enable();
             }
         }
 

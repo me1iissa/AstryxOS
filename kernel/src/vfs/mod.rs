@@ -1555,12 +1555,24 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
                 return Ok(count);
             }
             // bit 22 = /dev/vport0p0 → drain bytes from virtio-serial rx queue.
-            // Non-blocking: WouldBlock when the device has nothing to deliver,
-            // mirroring how PTY reads signal "no data yet".  See virtio 1.2 §5.3.
+            // Honour O_NONBLOCK (0x0000_0800): non-blocking opens return
+            // WouldBlock immediately on an empty queue; blocking opens park
+            // the caller via `read_blocking` and only return once at least
+            // one byte is available (POSIX `read(2)` semantics).  See
+            // virtio 1.2 §5.3 for the rx-side delivery model.  Before
+            // `arm_irq()` has fired (early-boot test paths), the blocking
+            // variant short-circuits to the non-blocking path and lets the
+            // caller cooperate via `yield_cpu` — the QGA-2 loopback test
+            // exercises that fallback.
             #[cfg(feature = "qga")]
             if flags & 0x0040_0000 != 0 {
                 let slice = unsafe { core::slice::from_raw_parts_mut(buf, count) };
-                let n = crate::drivers::virtio_serial::read(slice);
+                let non_block = flags & 0x0000_0800 != 0;
+                let n = if non_block {
+                    crate::drivers::virtio_serial::read(slice)
+                } else {
+                    crate::drivers::virtio_serial::read_blocking(slice)
+                };
                 if n == 0 { return Err(VfsError::WouldBlock); }
                 return Ok(n);
             }
