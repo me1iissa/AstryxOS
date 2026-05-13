@@ -1453,6 +1453,14 @@ pub fn run() -> ! {
     total += 1;
     if test_exit_group_wakes_siblings() { passed += 1; }
 
+    // ── Test 211: get_user_rsp_rbp rejects a stale per-CPU frame (W86) ────
+    // Regression guard for the kernel bugcheck observed when the IDT
+    // user-mode fatal-exception path called proc::exit_group and the
+    // firefox-test diagnostic dump dereferenced a stale syscall-frame
+    // pointer left behind by an earlier syscall on the same CPU.
+    total += 1;
+    if test_get_user_rsp_rbp_rejects_stale_frame() { passed += 1; }
+
     // (Tests 199/200 run earlier — right after Test 80c — so the vDSO
     // TSC fast path is verified before the slow PNG screenshot test.
     // Stream-A pipe / eventfd wake-hook tests run first — see Tests
@@ -26136,6 +26144,129 @@ fn test_exit_group_wakes_siblings() -> bool {
     test_println!("  THREAD_TABLE swept for all {} dying-process tids ✓", 3);
 
     test_pass!("exit_group wakes parked sibling threads (W59)");
+    true
+}
+
+/// Test 211 — `get_user_rsp_rbp` rejects a stale per-CPU frame pointer.
+///
+/// Regression guard for W86: when a user-mode fatal CPU exception is routed
+/// to `proc::exit_group` (per PR #166), the IDT handler did NOT pass through
+/// `syscall_entry`, so the per-CPU `PER_CPU_SYSCALL[cpu].frame_rsp` slot
+/// still held the kernel-stack pointer left behind by an earlier syscall on
+/// the same CPU.  That pointer aliased kernel memory that had since been
+/// overwritten (by ISR pushes / scheduler activity) or — in the worst case
+/// — freed entirely.  The unguarded raw deref inside `get_user_rsp_rbp`
+/// then either page-faulted or returned poison that propagated through
+/// `dump_exit_stack` / `dump_for_exit` until the kernel IRET'd to RIP=0 and
+/// hit a KERNEL_PAGE_FAULT bugcheck.
+///
+/// The fix bounds-checks the saved frame pointer against the current
+/// thread's kernel stack window before dereferencing; out-of-range pointers
+/// are treated as stale and return `(0, 0)`.  This test poisons
+/// `frame_rsp` with a value that lies outside the test-runner's kernel
+/// stack and asserts the safe-default return — exercising the W86 path
+/// without needing a real user-mode #UD.
+fn test_get_user_rsp_rbp_rejects_stale_frame() -> bool {
+    test_header!("get_user_rsp_rbp rejects stale per-CPU frame (W86)");
+
+    let cpu = crate::arch::x86_64::apic::cpu_index();
+
+    // Snapshot the slot so we can restore it after the test.  The
+    // test-runner thread isn't in the middle of a syscall on this CPU,
+    // so frame_rsp is either 0 (post-SYSRETQ stale) or a kernel-stack
+    // address from a previous syscall — either way, save and restore.
+    let saved_frame_rsp = unsafe { crate::syscall::PER_CPU_SYSCALL[cpu].frame_rsp };
+
+    // Case 1 — pointer outside any kernel stack (low non-canonical-ish
+    // address).  Validation must reject and return (0, 0) without
+    // dereferencing.  If the bounds check is missing, the deref of
+    // 0x1000 + 14*8 = 0x1070 page-faults and the test bugchecks.
+    unsafe {
+        crate::syscall::PER_CPU_SYSCALL[cpu].frame_rsp = 0x1000;
+    }
+    let (rsp1, rbp1) = crate::syscall::get_user_rsp_rbp();
+    if rsp1 != 0 || rbp1 != 0 {
+        unsafe { crate::syscall::PER_CPU_SYSCALL[cpu].frame_rsp = saved_frame_rsp; }
+        test_fail!("get_user_rsp_rbp_rejects_stale_frame",
+            "low-address case: got ({:#x}, {:#x}), expected (0, 0)", rsp1, rbp1);
+        return false;
+    }
+    test_println!("  low non-kernel pointer rejected ✓");
+
+    // Case 2 — pointer in the higher half but well above the per-CPU
+    // kernel_rsp top (frame extends past kstack_top).  Must also
+    // reject.  Using kernel_rsp + 64 KiB ensures the saturating_add
+    // overflow check trips even on a 256 KiB stack span.
+    let kstack_top = unsafe { crate::syscall::PER_CPU_SYSCALL[cpu].kernel_rsp };
+    if kstack_top == 0 {
+        // No active user thread on this CPU → can't exercise the
+        // "above-top" branch cleanly.  Skip with a soft pass on this
+        // sub-assertion rather than failing the whole test.
+        test_println!("  skipping above-top case: per-CPU kernel_rsp=0 (test-runner thread has no user stack)");
+    } else {
+        unsafe {
+            crate::syscall::PER_CPU_SYSCALL[cpu].frame_rsp = kstack_top.wrapping_add(0x1_0000);
+        }
+        let (rsp2, rbp2) = crate::syscall::get_user_rsp_rbp();
+        if rsp2 != 0 || rbp2 != 0 {
+            unsafe { crate::syscall::PER_CPU_SYSCALL[cpu].frame_rsp = saved_frame_rsp; }
+            test_fail!("get_user_rsp_rbp_rejects_stale_frame",
+                "above-top case: got ({:#x}, {:#x}), expected (0, 0)", rsp2, rbp2);
+            return false;
+        }
+        test_println!("  above-kstack-top pointer rejected ✓");
+    }
+
+    // Case 3 — misaligned pointer (well-formed within stack but not
+    // 8-byte aligned).  Must reject.  A syscall_entry-produced
+    // frame_rsp is always 8-byte aligned (RSP after a chain of pushes);
+    // anything else is corruption.
+    if kstack_top != 0 {
+        unsafe {
+            crate::syscall::PER_CPU_SYSCALL[cpu].frame_rsp = kstack_top.wrapping_sub(7);
+        }
+        let (rsp3, rbp3) = crate::syscall::get_user_rsp_rbp();
+        if rsp3 != 0 || rbp3 != 0 {
+            unsafe { crate::syscall::PER_CPU_SYSCALL[cpu].frame_rsp = saved_frame_rsp; }
+            test_fail!("get_user_rsp_rbp_rejects_stale_frame",
+                "misaligned case: got ({:#x}, {:#x}), expected (0, 0)", rsp3, rbp3);
+            return false;
+        }
+        test_println!("  misaligned pointer rejected ✓");
+    }
+
+    // Case 4 — `invalidate_syscall_frame()` zeros the slot.  After the
+    // call, the early `rsp == 0` short-circuit in `get_user_rsp_rbp`
+    // must return (0, 0) regardless of the bounds-check outcome.  Also
+    // verifies the IDT-path entry point compiles and is callable from
+    // ordinary kernel code without unsafe ceremony at the call site.
+    unsafe {
+        crate::syscall::PER_CPU_SYSCALL[cpu].frame_rsp =
+            kstack_top.wrapping_sub(15 * 8); // would-be-valid frame
+    }
+    crate::syscall::invalidate_syscall_frame();
+    let after = unsafe { crate::syscall::PER_CPU_SYSCALL[cpu].frame_rsp };
+    if after != 0 {
+        unsafe { crate::syscall::PER_CPU_SYSCALL[cpu].frame_rsp = saved_frame_rsp; }
+        test_fail!("get_user_rsp_rbp_rejects_stale_frame",
+            "invalidate_syscall_frame: frame_rsp={:#x}, expected 0", after);
+        return false;
+    }
+    let (rsp4, rbp4) = crate::syscall::get_user_rsp_rbp();
+    if rsp4 != 0 || rbp4 != 0 {
+        unsafe { crate::syscall::PER_CPU_SYSCALL[cpu].frame_rsp = saved_frame_rsp; }
+        test_fail!("get_user_rsp_rbp_rejects_stale_frame",
+            "post-invalidate: got ({:#x}, {:#x}), expected (0, 0)", rsp4, rbp4);
+        return false;
+    }
+    test_println!("  invalidate_syscall_frame zeros slot + short-circuits ✓");
+
+    // Restore the slot.  Leaving an unrelated value here would not
+    // crash the kernel (everything that reads it is now bounds-checked)
+    // but could confuse downstream diagnostics that scan PER_CPU_SYSCALL.
+    unsafe { crate::syscall::PER_CPU_SYSCALL[cpu].frame_rsp = saved_frame_rsp; }
+
+    test_pass!("get_user_rsp_rbp rejects stale per-CPU frame (W86)");
     true
 }
 
