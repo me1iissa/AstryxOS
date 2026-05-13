@@ -319,9 +319,12 @@ pub fn user_mode_bootstrap() {
     if user_cr3 != 0 && user_cr3 != current_cr3 {
         // Bracket the CR3 write with active-CPU mask updates so the
         // TLB shootdown protocol can target this CPU correctly.
-        crate::mm::tlb::note_cr3_unload(current_cr3);
-        unsafe { crate::mm::vmm::switch_cr3(user_cr3); }
+        // Order: set NEW bit → write CR3 → clear OLD bit.  This avoids
+        // the "neither bit set" window in which a concurrent shootdown
+        // for the new CR3 could miss this CPU.  See mm/tlb.rs.
         crate::mm::tlb::note_cr3_load(user_cr3);
+        unsafe { crate::mm::vmm::switch_cr3(user_cr3); }
+        crate::mm::tlb::note_cr3_unload(current_cr3);
     }
 
     // Set kernel stack for Ring 3 → Ring 0 transitions.
