@@ -371,6 +371,71 @@ def run_tier3(no_build: bool = False):
     print()
 
 
+def run_staleness_check():
+    """
+    Tier 1.5 host-only check: exercise `_data_img_staleness` directly to confirm
+    the W7 staleness detector works on fresh, stale, and missing-input inputs.
+
+    This is a pure host-side import test — no QEMU launched. The point is that
+    a future refactor of qemu-harness.py cannot accidentally break the
+    auto-regen guard without this smoke test failing first.
+    """
+    print("=== Tier 1.5: data.img staleness detector (host-only) ===")
+    print()
+    import importlib.util
+    import os
+    import tempfile
+    spec = importlib.util.spec_from_file_location("qh_smoke_load", str(HARNESS))
+    mod = importlib.util.module_from_spec(spec)
+    # Module-level side effects only mkdir ~/.astryx-harness — no QEMU.
+    _orig_argv = sys.argv
+    sys.argv = ["qemu-harness.py", "list"]
+    try:
+        spec.loader.exec_module(mod)
+    except SystemExit:
+        pass
+    finally:
+        sys.argv = _orig_argv
+
+    fn = getattr(mod, "_data_img_staleness", None)
+    check("staleness fn importable", fn is not None, "")
+    if fn is None:
+        return
+
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        img = tdp / "data.img"
+        disk = tdp / "disk"
+        disk.mkdir()
+        f1 = disk / "lib.so"
+        f1.write_text("x")
+        # Case A: data.img missing — soft-fail with error string.
+        r = fn(img, disk)
+        check("missing data.img → stale=False",  not r["stale"])
+        check("missing data.img → error set",    bool(r["error"]))
+
+        # Case B: data.img newer than every disk file — not stale.
+        img.write_text("img")
+        os.utime(img, (time.time() + 60, time.time() + 60))
+        r = fn(img, disk)
+        check("fresh data.img → stale=False",    not r["stale"], str(r))
+        check("fresh data.img → error=None",     r["error"] is None, str(r))
+        check("fresh data.img → files_scanned",  r["files_scanned"] >= 1, str(r))
+
+        # Case C: a disk file newer than data.img — stale=True.
+        os.utime(img, (time.time() - 60, time.time() - 60))
+        r = fn(img, disk)
+        check("stale data.img → stale=True",     r["stale"], str(r))
+        check("stale data.img → newest_path",    bool(r["newest_path"]), str(r))
+
+        # Case D: disk dir missing — soft-fail.
+        r = fn(img, tdp / "nope")
+        check("missing disk_dir → stale=False",  not r["stale"])
+        check("missing disk_dir → error set",    bool(r["error"]))
+
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="AstryxOS qemu-harness smoke test")
@@ -382,6 +447,9 @@ def main():
                          help="TCP port for GDB stub in Tier 2 (default 1234)")
     parser.add_argument("--no-build", action="store_true",
                          help="Skip cargo build; use existing kernel.bin")
+    parser.add_argument("--staleness-only", action="store_true",
+                         help="Run only the host-side staleness detector check "
+                              "(no QEMU); fast (<1s).")
     args = parser.parse_args()
 
     print(f"[{INFO}] AstryxOS qemu-harness smoke test")
@@ -391,6 +459,22 @@ def main():
     if args.tier3:
         print(f"[{INFO}] Tier 3 kdb hostfwd smoke enabled")
     print()
+
+    # Always run the host-only staleness detector check — it's < 1 second and
+    # protects the W7 silent-wedge guard against future refactors.
+    run_staleness_check()
+
+    if args.staleness_only:
+        # Early exit for CI cycles that just want the cheap detector check.
+        n_fail = len(failures)
+        if n_fail == 0:
+            print(f"\033[32m\nStaleness check passed.\033[0m")
+            sys.exit(0)
+        else:
+            print(f"\033[31m\n{n_fail} check(s) FAILED:\033[0m")
+            for f in failures:
+                print(f"  - {f}")
+            sys.exit(1)
 
     run_tier1(no_build=args.no_build)
 
