@@ -1757,6 +1757,201 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
     Some((child_pid, child_tid))
 }
 
+/// Fork a process under `CLONE_VM` semantics: the child shares the parent's
+/// virtual memory (no copy-on-write).  Writes by the child are immediately
+/// visible to the parent and vice-versa.
+///
+/// This mirrors `fork_process` but skips the page-table clone step and instead
+/// reuses the parent's `cr3` directly.  The child's `Process` carries
+/// `vm_space = None` so that `free_process_memory` / `free_vm_space` are no-ops
+/// on the child's exit path — the parent retains exclusive ownership of the
+/// address space.
+///
+/// Per `clone3(2)`: when `CLONE_VM` is specified without `CLONE_THREAD`, glibc
+/// uses this path to implement both `vfork(2)` and the `posix_spawn(3)`
+/// fast-path (`__spawnix`).  The child typically calls `execve(2)` shortly
+/// after — at which point a fresh VmSpace replaces the shared one.
+///
+/// The caller is responsible for:
+///  - Overriding `user_entry_rip`, `user_entry_rsp`, `user_entry_rdx`,
+///    `user_entry_r8` on the child thread before unblocking, so the child
+///    lands at the clone3 return site with the new stack and helper-fn args.
+///  - Setting `vfork_parent_tid` and blocking the parent when `CLONE_VFORK`
+///    is also set.
+pub fn fork_process_share_vm(
+    parent_pid: Pid,
+    _parent_tid: Tid,
+    parent_regs: &ForkUserRegs,
+) -> Option<(Pid, Tid)> {
+    let child_pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+    let child_tid = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+
+    // Allocate a fresh kernel stack for the child.  Kernel stacks are never
+    // shared — only user-mode memory follows `CLONE_VM`.
+    let (stack_base, stack_top) = alloc_kernel_stack()?;
+
+    // Copy parent's file descriptors, CWD, and security credentials.
+    // Per clone3(2): without CLONE_FILES, the child gets its own table.  We
+    // currently always copy (the simpler conservative choice) — the demo path
+    // (__spawnix → execve) closes/replaces all FDs on exec anyway.
+    let (fds, cwd, parent_name, parent_uid, parent_gid, parent_euid, parent_egid,
+         parent_groups, parent_umask, parent_linux_abi, parent_subsystem, parent_token_id,
+         parent_pgid, parent_sid, parent_no_new_privs, parent_cap_permitted,
+         parent_cap_effective, parent_rlimits_soft, parent_cr3) = {
+        let procs = PROCESS_TABLE.lock();
+        let parent = procs.iter().find(|p| p.pid == parent_pid)?;
+        (
+            parent.file_descriptors.clone(),
+            parent.cwd.clone(),
+            parent.name,
+            parent.uid, parent.gid, parent.euid, parent.egid,
+            parent.supplementary_groups.clone(),
+            parent.umask, parent.linux_abi, parent.subsystem, parent.token_id,
+            parent.pgid, parent.sid, parent.no_new_privs,
+            parent.cap_permitted, parent.cap_effective, parent.rlimits_soft,
+            parent.cr3,
+        )
+    };
+
+    // RLIMIT_NPROC.
+    {
+        let procs = PROCESS_TABLE.lock();
+        let count = procs.iter().filter(|p| p.state != ProcessState::Zombie).count();
+        if count >= parent_rlimits_soft[6] as usize {
+            return None; // EAGAIN
+        }
+    }
+
+    // Read parent's user-mode return site and TLS base.  RIP/RSP from the
+    // parent's syscall frame; the caller will override them per clone_args.
+    let (user_rip, user_rsp, parent_tls_base) = {
+        let threads = THREAD_TABLE.lock();
+        if let Some(parent_thread) = threads.iter().find(|t| t.tid == _parent_tid) {
+            let tls = parent_thread.tls_base;
+            if parent_thread.kernel_stack_base > 0 && parent_thread.kernel_stack_size > 0 {
+                let kstack_top = parent_thread.kernel_stack_base + parent_thread.kernel_stack_size;
+                unsafe {
+                    let rip = *((kstack_top - 16) as *const u64);
+                    let rsp = *((kstack_top - 8) as *const u64);
+                    (rip, rsp, tls)
+                }
+            } else { (0u64, 0u64, tls) }
+        } else { (0u64, 0u64, 0u64) }
+    };
+
+    // Map the signal-return trampoline into the (shared) parent CR3.  This is
+    // idempotent — `map_trampoline` already accepts being called against a
+    // CR3 that has the trampoline mapped.
+    crate::signal::map_trampoline(parent_cr3);
+
+    // Build the child's kernel stack with the standard user_mode_bootstrap
+    // entry path.  user_mode_bootstrap will load user_entry_rip/rsp/rdx/r8
+    // from the THREAD_TABLE and IRETQ to Ring 3.
+    let initial_rsp = thread::init_thread_stack(
+        stack_top, crate::proc::usermode::user_mode_bootstrap as *const () as u64,
+    );
+
+    let context = CpuContext {
+        rsp: initial_rsp,
+        rbp: 0,
+        rbx: crate::proc::thread::fixup_fn_ptr(
+            crate::proc::usermode::user_mode_bootstrap as *const () as u64
+        ),
+        r12: 0, r13: 0, r14: 0, r15: 0,
+        rflags: 0x202,
+        cr3: parent_cr3, // SHARED — same page tables as parent
+    };
+
+    // Child name = parent name + ".vm" suffix for debug logs.
+    let mut child_name = [0u8; 64];
+    let name_len = parent_name.iter().position(|&b| b == 0).unwrap_or(parent_name.len());
+    let base_len = name_len.min(60);
+    child_name[..base_len].copy_from_slice(&parent_name[..base_len]);
+    let suffix = b".vm";
+    let suf_len = suffix.len().min(64 - base_len);
+    child_name[base_len..base_len+suf_len].copy_from_slice(&suffix[..suf_len]);
+
+    let mut thread_name = [0u8; 32];
+    thread_name[..4].copy_from_slice(b"main");
+
+    let child_proc = Process {
+        pid: child_pid,
+        parent_pid,
+        name: child_name,
+        state: ProcessState::Active,
+        cr3: parent_cr3, // SHARED — scheduler will load the parent's PML4
+        threads: Vec::from([child_tid]),
+        exit_code: 0,
+        file_descriptors: fds,
+        cwd,
+        uid: parent_uid, gid: parent_gid, euid: parent_euid, egid: parent_egid,
+        pgid: parent_pgid, sid: parent_sid,
+        no_new_privs: parent_no_new_privs,
+        cap_permitted: parent_cap_permitted,
+        cap_effective: parent_cap_effective,
+        rlimits_soft: parent_rlimits_soft,
+        supplementary_groups: parent_groups,
+        umask: parent_umask,
+        // vm_space = None signals "shared address space owned by parent".
+        // free_process_memory / free_vm_space short-circuit on None, so
+        // child exit never touches the parent's page tables or frames.
+        vm_space: None,
+        signal_state: Some(crate::signal::SignalState::new()),
+        linux_abi: parent_linux_abi,
+        handle_table: Some(crate::ob::handle::HandleTable::new()),
+        subsystem: parent_subsystem,
+        token_id: parent_token_id,
+        exe_path: None,
+        epoll_sets: alloc::vec::Vec::new(),
+        auxv: Vec::new(),
+        envp: Vec::new(),
+        alarm_deadline_ticks: 0,
+        alarm_interval_ticks: 0,
+    };
+
+    let child_thread = Thread {
+        tid: child_tid,
+        pid: child_pid,
+        // Start Blocked so the clone3 dispatcher can fill user_entry_*
+        // before the scheduler picks the child.
+        state: ThreadState::Blocked,
+        context: alloc::boxed::Box::new(context),
+        kernel_stack_base: stack_base,
+        kernel_stack_size: KERNEL_STACK_SIZE,
+        wake_tick: u64::MAX,
+        name: thread_name,
+        exit_code: 0,
+        fpu_state: None,
+        user_entry_rip: user_rip, // overridden by clone3 dispatcher
+        user_entry_rsp: user_rsp,
+        user_entry_rdx: 0,
+        user_entry_r8:  0,
+        priority: PRIORITY_NORMAL,
+        base_priority: PRIORITY_NORMAL,
+        tls_base: parent_tls_base,
+        cpu_affinity: None,
+        last_cpu: 0,
+        first_run: true,
+        ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
+        clear_child_tid: 0,
+        fork_user_regs: *parent_regs,
+        vfork_parent_tid: None,
+        gs_base: 0,
+        robust_list_head: 0,
+        robust_list_len: 0,
+    };
+
+    PROCESS_TABLE.lock().push(child_proc);
+    THREAD_TABLE.lock().push(child_thread);
+
+    crate::serial_println!(
+        "[PROC] fork_share_vm: child PID {} TID {} (parent PID {} CR3={:#x}, shared)",
+        child_pid, child_tid, parent_pid, parent_cr3
+    );
+
+    Some((child_pid, child_tid))
+}
+
 /// Create a vfork child: new process (new PID) sharing the parent's address space.
 ///
 /// Unlike `fork_process` (CoW clone), this shares the parent's CR3 directly.
