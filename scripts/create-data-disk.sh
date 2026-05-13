@@ -86,6 +86,23 @@ if [ -f "${ROOT_DIR}/scripts/install-firefox-stubs.sh" ] && \
         echo "[DATA-DISK] WARNING: install-firefox-stubs.sh failed — stub libs may be absent"
 fi
 
+# ── Overlay REAL libfontconfig + libfreetype (non-fatal) ─────────────────────
+# install-firefox-stubs.sh writes 13-65 KB stub copies of libfontconfig.so.1
+# and libfreetype.so.6.  Mozilla iterates Fc* results during gfxPlatformFont
+# List init and derefs returned strings — the stubs surface NULL/zero and
+# Mozilla faults (W66/W70/W76/W82/W87 + post-PR#176 libxul cluster).
+# install-fonts-real.sh overlays REAL upstream binaries (~2 MiB total) over
+# the two stubs, keeping every other GTK/X11/cairo/pango stub in place for
+# the call paths headless mode genuinely does not exercise.  Must run
+# AFTER install-firefox-stubs.sh so its `ln -sf` evicts the stub at the
+# soname path.
+if [ -f "${ROOT_DIR}/scripts/install-fonts-real.sh" ]; then
+    FONTS_FLAGS=""
+    [ "${FORCE}" = true ] && FONTS_FLAGS="--force"
+    bash "${ROOT_DIR}/scripts/install-fonts-real.sh" ${FONTS_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
+        echo "[DATA-DISK] WARNING: install-fonts-real.sh failed — fontconfig/freetype stubs remain"
+fi
+
 # ── Compile glibc_hello oracle binary if source present ──────────────────────
 GLIBC_HELLO_SRC="${ROOT_DIR}/userspace/glibc_hello.c"
 GLIBC_HELLO_BIN="${BUILD_DIR}/glibc_hello"
