@@ -10171,6 +10171,66 @@ fn test_epoll_and_proc_fd() -> bool {
             }
         }
 
+        // ─── 7c-bis. AF_UNIX socketpair + epoll EPOLLIN coherence ──────────
+        //
+        // Regression test: before W111 the epoll readiness path returned
+        // `EPOLLIN | EPOLLOUT` unconditionally for any socket fd, which
+        // made `epoll_wait` report a freshly-created AF_UNIX socket as
+        // readable even though `recv` would immediately return -EAGAIN.
+        // Mozilla's IPC bus tripped on this and burned ~5000 syscalls/s
+        // in a recv→epoll spin loop.  After the fix, EPOLLIN must only
+        // fire once the peer has actually written; EPOLLOUT remains
+        // asserted for the in-memory ring (always writable for partial
+        // writes — IEEE 1003.1 §poll, §write on AF_UNIX streams).
+        {
+            let epfd4 = dispatch(291, 0, 0, 0, 0, 0, 0);
+            if epfd4 >= 0 {
+                let mut sp: [u64; 2] = [u64::MAX; 2];
+                // socketpair(AF_UNIX=1, SOCK_STREAM=1, 0, sp)
+                let spr = dispatch(53, 1, 1, 0, sp.as_mut_ptr() as u64, 0, 0);
+                if spr == 0 {
+                    let a = sp[0] as usize;
+                    let b = sp[1] as usize;
+                    let ev = make_ev(EPOLLIN | EPOLLOUT, a as u64);
+                    let _ = dispatch(233, epfd4 as u64, CTL_ADD, a as u64,
+                                     ev.as_ptr() as u64, 0, 0);
+
+                    // 1. With no data buffered, EPOLLIN must NOT be set.
+                    //    EPOLLOUT is fine (write-ready).
+                    let mut buf = [[0u8; 12]; 4];
+                    let r1 = dispatch(232, epfd4 as u64, buf[0].as_mut_ptr() as u64,
+                                      4, 0, 0, 0); // timeout=0 → non-blocking
+                    let ev1 = if r1 >= 1 { ev_events(&buf[0]) } else { 0 };
+                    let in_before = ev1 & EPOLLIN != 0;
+
+                    // 2. Peer writes one byte; EPOLLIN must now fire.
+                    let msg = b"u";
+                    let _ = dispatch(1, b as u64, msg.as_ptr() as u64, 1, 0, 0, 0);
+                    let r2 = dispatch(232, epfd4 as u64, buf[0].as_mut_ptr() as u64,
+                                      4, 1000, 0, 0);
+                    let ev2 = ev_events(&buf[0]);
+                    let in_after = r2 >= 1 && ev2 & EPOLLIN != 0;
+
+                    if !in_before && in_after {
+                        test_println!(
+                            "  AF_UNIX socketpair epoll: EPOLLIN gated on data ok (before={:#x} after={:#x})",
+                            ev1, ev2);
+                    } else {
+                        test_fail!("unix socketpair EPOLLIN gating",
+                            "before r={} ev={:#x} (expect no EPOLLIN), after r={} ev={:#x} (expect EPOLLIN)",
+                            r1, ev1, r2, ev2);
+                        ok = false;
+                    }
+
+                    let _ = crate::vfs::close(pid, a);
+                    let _ = crate::vfs::close(pid, b);
+                } else {
+                    test_println!("  AF_UNIX socketpair epoll: skipped (socketpair() = {})", spr);
+                }
+                let _ = dispatch(3, epfd4 as u64, 0, 0, 0, 0, 0);
+            }
+        }
+
         // ─── 7d. select(2) blocking contract (timeval actually waits) ──────
         //
         // Mirror the epoll case for select: a non-NULL non-zero timeval must
