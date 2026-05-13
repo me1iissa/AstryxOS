@@ -425,7 +425,13 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
                 // Dump IRET frame fields
                 crate::serial_println!("  RFLAGS={:#018x}", frame.rflags);
             }
-            crate::proc::exit_thread(-11i64); // SIGSEGV
+            // POSIX signal(7): the default action for SIGSEGV is "terminate
+            // the process (core dump)" — the entire thread group, not just
+            // the faulting thread.  Calling exit_thread would leave sibling
+            // threads parked on the dead thread's condvars / semaphores /
+            // futexes indefinitely.  Use exit_group so the whole thread
+            // group is torn down.
+            crate::proc::exit_group(-11i64); // SIGSEGV
             return;
         }
 
@@ -492,7 +498,12 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
         crate::serial_println!("  User GPRs: RAX={:#x} RCX={:#x} RDX={:#x} RSI={:#x} RDI={:#x} R8={:#x}",
             rax, rcx, rdx, rsi, rdi, r8);
         crate::serial_println!("  Killing user process (exception in Ring 3)");
-        crate::proc::exit_thread(-(vector as i64));
+        // POSIX signal(7): synchronous fatal CPU exceptions in user mode
+        // (#DE → SIGFPE, #UD → SIGILL, #DF / #SS / #GP / #AC / #MC → SIGBUS|SIGSEGV)
+        // default to thread-group termination.  Calling exit_thread would
+        // leave sibling threads in the same process parked on condvars,
+        // semaphores, or futexes that the dead thread was meant to signal.
+        crate::proc::exit_group(-(vector as i64));
         return;
     }
 
