@@ -252,7 +252,7 @@ pub fn user_mode_bootstrap() {
         }
     }
 
-    let (entry_rip, entry_rsp, entry_rdx, entry_r8, kernel_stack_top, mut user_cr3, tls_base, gs_base, pid) = {
+    let (entry_rip, entry_rsp, entry_rdx, entry_r8, kernel_stack_top, mut user_cr3, tls_base, gs_base, pid, fork_regs) = {
         let tid = proc::current_tid();
         let threads = THREAD_TABLE.lock();
         let thread = match threads.iter().find(|t| t.tid == tid) {
@@ -274,6 +274,11 @@ pub fn user_mode_bootstrap() {
             thread.tls_base,
             thread.gs_base,
             thread.pid,
+            // Snapshot fork_user_regs by value while the lock is held; we
+            // pass it by pointer below, but copying onto our own stack means
+            // the pointer remains valid after the THREAD_TABLE lock drops
+            // even if the Vec reallocates.
+            thread.fork_user_regs,
         )
     };
 
@@ -332,10 +337,23 @@ pub fn user_mode_bootstrap() {
     }
 
     // Jump to user mode via IRETQ. This never returns.
+    //
+    // `fork_regs` is `ForkUserRegs::default()` (all zeros) for every code path
+    // except fork/vfork/clone3 children — in those cases it holds the parent's
+    // callee-saved register snapshot (RBP/RBX/R12-R15) captured in the syscall
+    // entry frame.  Propagating them is required by POSIX clone(2): the child
+    // sees the same register state the parent had at the clone() callsite, so
+    // glibc's `_Fork` epilogue (which reads `-0x18(%rbp)` for its stack canary)
+    // does not fault on a NULL base pointer.
+    //
+    // Pass a pointer to the on-stack snapshot rather than the values directly
+    // — `jump_to_user_mode` is a 4-arg naked function and we already use all
+    // four argument registers (RDI/RSI/RDX/RCX) for RIP/RSP/RDX_val/R8_val.
     crate::serial_println!(
-        "[BOOT] jump_to_user_mode: rip={:#x} rsp={:#x} rdx={:#x} r8={:#x}",
-        entry_rip, entry_rsp, entry_rdx, entry_r8);
-    unsafe { jump_to_user_mode(entry_rip, entry_rsp, entry_rdx, entry_r8); }
+        "[BOOT] jump_to_user_mode: rip={:#x} rsp={:#x} rdx={:#x} r8={:#x} fork_regs=[rbp={:#x} rbx={:#x} r12={:#x}]",
+        entry_rip, entry_rsp, entry_rdx, entry_r8,
+        fork_regs.rbp, fork_regs.rbx, fork_regs.r12);
+    unsafe { jump_to_user_mode(entry_rip, entry_rsp, entry_rdx, entry_r8, &fork_regs as *const _); }
 }
 
 /// Transition to user mode (Ring 3) via IRETQ.
@@ -343,47 +361,76 @@ pub fn user_mode_bootstrap() {
 /// Pushes an interrupt return frame onto the current stack and executes
 /// IRETQ to atomically switch to Ring 3 with the given RIP, RSP, RDX, and R8.
 ///
+/// `fork_regs` carries the parent's callee-saved register snapshot for fork /
+/// vfork / clone3 children.  For brand-new processes / threads (initial exec,
+/// `create_user_thread`), the caller passes a pointer to an all-zero
+/// `ForkUserRegs` so the child enters userspace with cleared callee-saves —
+/// preserving the original kernel-data-leak protection.
+///
+/// # Arguments
+/// RDI = entry_rip, RSI = entry_rsp, RDX = entry_rdx, RCX = entry_r8,
+/// R8 (incoming, SysV arg 5) = pointer to ForkUserRegs
+///
 /// # Safety
 /// - `entry_rip` must point to valid, executable, Ring 3-accessible code.
 /// - `entry_rsp` must point to a valid, Ring 3-accessible stack.
 /// - `entry_rdx` / `entry_r8`: thread function and argument for glibc clone3 children
 ///   (glibc 2.34+ passes `func` in RDX and `arg` in R8 through the clone3 syscall;
 ///   set both to 0 for initial processes and clone2-style threads).
+/// - `fork_regs` must be a valid pointer to a `ForkUserRegs` (`#[repr(C)]`,
+///   6 × u64 in order rbp/rbx/r12/r13/r14/r15) that lives at least until iretq.
 /// - This function never returns.
-/// Transition to user mode via IRETQ.
-///
-/// # Arguments
-/// RDI = entry_rip, RSI = entry_rsp, RDX = entry_rdx, RCX = entry_r8
-///
-/// # Safety
-/// Must be called with valid user-space RIP/RSP.
 #[unsafe(naked)]
-pub unsafe extern "C" fn jump_to_user_mode(_entry_rip: u64, _entry_rsp: u64, _entry_rdx: u64, _entry_r8: u64) -> ! {
+pub unsafe extern "C" fn jump_to_user_mode(
+    _entry_rip: u64,
+    _entry_rsp: u64,
+    _entry_rdx: u64,
+    _entry_r8: u64,
+    _fork_regs: *const crate::proc::ForkUserRegs,
+) -> ! {
     core::arch::naked_asm!(
-        // Args: rdi=rip, rsi=rsp, rdx=rdx_val, rcx=r8_val
-        // Build IRETQ frame
-        "push 0x1B",       // SS = USER_DATA_SELECTOR
-        "push rsi",        // RSP = user stack pointer (arg2)
-        "push 0x202",      // RFLAGS (IF set)
-        "push 0x23",       // CS = USER_CODE_SELECTOR
-        "push rdi",        // RIP = entry point (arg1)
-        // Set R8 from arg4 (rcx), RDX stays as arg3
+        // Args (System V AMD64 ABI):
+        //   rdi = rip, rsi = rsp, rdx = rdx_val, rcx = r8_val, r8 = fork_regs ptr
+        //
+        // Strategy:
+        //   1. Build IRETQ frame from rdi/rsi (caller-saved by ABI, free to clobber).
+        //   2. Move r8_val into r8 — but r8 currently holds fork_regs.  Use r9 as
+        //      a scratch first: stash fork_regs in r9 (also caller-saved), then
+        //      mov r8 = rcx (r8_val), then load callee-saves from [r9 + offsets].
+        //   3. After loading all callee-saves and arg-pass regs, xor the caller-
+        //      saved scratch regs (rax/rcx/rdi/rsi/r9/r10/r11) and iretq.
+        //
+        // ForkUserRegs layout (#[repr(C)] — see proc/mod.rs):
+        //   +0  = rbp, +8  = rbx, +16 = r12, +24 = r13, +32 = r14, +40 = r15
+        //
+        // Build IRETQ frame.
+        "push 0x1B",        // SS = USER_DATA_SELECTOR
+        "push rsi",         // RSP = user stack pointer (arg2)
+        "push 0x202",       // RFLAGS (IF set)
+        "push 0x23",        // CS = USER_CODE_SELECTOR
+        "push rdi",         // RIP = entry point (arg1)
+        // Stash fork_regs pointer in r9 before clobbering r8.
+        "mov r9, r8",
+        // r8 = entry_r8 value (from arg4 / rcx).
         "mov r8, rcx",
-        // RAX = 0 (fork child return value / harmless for initial process)
+        // Load callee-saved registers from the ForkUserRegs struct pointed to by r9.
+        // For fresh processes the caller passes an all-zero struct, so this is a
+        // no-op (and the protection of zeroing kernel data is preserved).
+        "mov rbp, [r9 + 0]",     // ForkUserRegs.rbp
+        "mov rbx, [r9 + 8]",     // ForkUserRegs.rbx
+        "mov r12, [r9 + 16]",    // ForkUserRegs.r12
+        "mov r13, [r9 + 24]",    // ForkUserRegs.r13
+        "mov r14, [r9 + 32]",    // ForkUserRegs.r14
+        "mov r15, [r9 + 40]",    // ForkUserRegs.r15
+        // Zero the remaining caller-saved regs that might still hold kernel data.
+        // RDX and R8 already hold the values the child expects to see.
         "xor eax, eax",
-        // Zero all other GPRs to prevent kernel address leaks
         "xor esi, esi",
         "xor edi, edi",
         "xor ecx, ecx",
         "xor r9d, r9d",
         "xor r10d, r10d",
         "xor r11d, r11d",
-        "xor ebx, ebx",
-        "xor ebp, ebp",
-        "xor r12d, r12d",
-        "xor r13d, r13d",
-        "xor r14d, r14d",
-        "xor r15d, r15d",
         "iretq",
     );
 }
