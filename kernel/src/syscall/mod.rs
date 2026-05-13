@@ -837,6 +837,17 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
         set_kernel_rsp(kstack_top);
     }
 
+    // 5b. vfork completion: wake the blocked parent NOW.  The new mm is
+    //     installed, the old one is reclaimed, the CR3 is loaded, and the
+    //     kernel stack is rebound to TSS — the child is fully ready to run
+    //     the new image even before we finish patching the syscall return
+    //     frame below.  Waking here closes the parent-unblock latency to
+    //     a few µs (vs the 500-tick safety timeout that previously masked
+    //     this).  Per `vfork(2)` and the POSIX `posix_spawn(3)` contract,
+    //     the parent must unblock when the child successfully installs a
+    //     new image — reaching this point in execve(2) is that moment.
+    wake_vfork_parent();
+
     // 6. Modify the syscall return frame on the kernel stack so that when
     //    we return through syscall_entry's epilogue, SYSRETQ jumps to the
     //    new entry point with the new stack.
@@ -864,9 +875,7 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
 
     crate::serial_println!("[SYSCALL] exec: process image replaced, returning to new entry");
 
-    // vfork completion: if this is a vfork child, wake the blocked parent.
-    // Linux: mm_release() → complete_vfork_done() in fs/exec.c:1459.
-    wake_vfork_parent();
+    // (vfork wake already happened in step 5b above — see comment there.)
 
     // Return 0 — dispatch puts this in RAX. When syscall_entry does SYSRETQ,
     // it restores the modified frame and jumps to the new entry point.
