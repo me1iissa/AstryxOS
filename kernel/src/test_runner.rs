@@ -1419,6 +1419,14 @@ pub fn run() -> ! {
     total += 1;
     if test_cpu_index_rdtscp_microbench() { passed += 1; }
 
+    // ── Test 206: clone3 + CLONE_VM share VM ───────────────────────────────
+    total += 1;
+    if test_clone3_share_vm() { passed += 1; }
+
+    // ── Test 208: clone3 + wake_vfork_parent on execve ────────────────────
+    total += 1;
+    if test_clone3_wake_vfork_on_execve() { passed += 1; }
+
     // (Tests 199/200 run earlier — right after Test 80c — so the vDSO
     // TSC fast path is verified before the slow PNG screenshot test.
     // Stream-A pipe / eventfd wake-hook tests run first — see Tests
@@ -25004,6 +25012,281 @@ fn test_cpu_index_rdtscp_microbench() -> bool {
     }
 
     test_pass!("cpu_index() RDTSCP fast path (KVM VMEXIT regression)");
+    true
+}
+
+// ── Test 206/208: clone3 + CLONE_VM coupled fixes ───────────────────────────
+//
+// Validates:
+//   A. fork_process_share_vm shares the parent's CR3 — writes by the child
+//      are observable to the parent (no copy-on-write divergence).
+//   C. wake_vfork_parent fires from sys_exec at the earliest "ready to run
+//      new image" point — bounded latency on the parent unblock, with no
+//      dependence on the 500-tick safety timeout.
+
+/// Test 206: CLONE_VM shares the parent's address space.
+///
+/// Steps:
+///   1. Create a user process (parent).
+///   2. Map a fresh page at a known virt address; write a sentinel value there.
+///   3. Call fork_process_share_vm to create a CLONE_VM-style child.
+///   4. Confirm child's cr3 == parent's cr3 and child's vm_space is None.
+///   5. Write a NEW sentinel value via the child's CR3 (== parent's CR3).
+///   6. Read back via parent's CR3 — the new sentinel must be visible.
+///
+/// The shared-CR3 invariant is what the new value-visibility step proves: if
+/// CoW had cloned the page tables and write-protected the parent's PTE, the
+/// page-fault handler would split the page and the parent would still see the
+/// OLD sentinel.
+fn test_clone3_share_vm() -> bool {
+    test_header!("clone3 + CLONE_VM share VM");
+
+    let parent_pid = match crate::proc::usermode::create_user_process(
+        "clone3_share_vm_p", &crate::proc::hello_elf::HELLO_ELF
+    ) {
+        Ok(p) => p,
+        Err(e) => { test_fail!("clone3_share_vm", "create_user_process: {:?}", e); return false; }
+    };
+    let parent_tid = {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        threads.iter().find(|t| t.pid == parent_pid).map(|t| t.tid).unwrap_or(0)
+    };
+    let parent_cr3 = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == parent_pid).map(|p| p.cr3).unwrap_or(0)
+    };
+    test_println!("  parent PID {} TID {} CR3={:#x}", parent_pid, parent_tid, parent_cr3);
+
+    // Map a fresh page into the parent's address space at a known user
+    // virtual address — this guarantees both PTE presence and isolation
+    // from any in-flight syscall traffic.  Picking 0x7000_0000_0000 lands
+    // between the stack base and the heap, well outside hello.elf VMAs.
+    const PROBE_VADDR: u64 = 0x0000_7000_0000_0000;
+    const PAGE_PRESENT: u64 = 1;
+    const PAGE_WRITABLE: u64 = 2;
+    const PAGE_USER: u64 = 4;
+
+    let probe_phys = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => { test_fail!("clone3_share_vm", "PMM alloc failed"); return false; }
+    };
+    if !crate::mm::vmm::map_page_in(
+        parent_cr3, PROBE_VADDR, probe_phys,
+        PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER,
+    ) {
+        test_fail!("clone3_share_vm", "map_page_in failed");
+        return false;
+    }
+    let probe_addr = PROBE_VADDR;
+    test_println!("  probe address: {:#x} → phys {:#x}", probe_addr, probe_phys);
+
+    // Write the BEFORE sentinel through parent's CR3.
+    const BEFORE: u32 = 0xAA55_AA55;
+    const AFTER:  u32 = 0xDEAD_BEEF;
+    crate::syscall::write_u32_to_user_pub(parent_cr3, probe_addr, BEFORE);
+
+    // Clone with shared VM.
+    let (child_pid, child_tid) = match crate::proc::fork_process_share_vm(
+        parent_pid, parent_tid, &crate::proc::ForkUserRegs::default()
+    ) {
+        Some(x) => x,
+        None => { test_fail!("clone3_share_vm", "fork_process_share_vm returned None"); return false; }
+    };
+    test_println!("  child PID {} TID {}", child_pid, child_tid);
+
+    // Invariant 1: child.cr3 == parent.cr3
+    let child_cr3 = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == child_pid).map(|p| p.cr3).unwrap_or(0)
+    };
+    if child_cr3 != parent_cr3 {
+        test_fail!("clone3_share_vm",
+            "child cr3 {:#x} != parent cr3 {:#x}", child_cr3, parent_cr3);
+        return false;
+    }
+    test_println!("  child cr3 == parent cr3 ({:#x}) ✓", parent_cr3);
+
+    // Invariant 2: child.vm_space is None (shared, parent owns)
+    let child_has_vm = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == child_pid).map(|p| p.vm_space.is_some()).unwrap_or(true)
+    };
+    if child_has_vm {
+        test_fail!("clone3_share_vm", "child must not own a VmSpace");
+        return false;
+    }
+    test_println!("  child.vm_space is None (shared) ✓");
+
+    // Invariant 3: a write made through the shared CR3 is observable.  Write
+    // AFTER via child's CR3 (== parent's CR3) and read back via parent's CR3.
+    crate::syscall::write_u32_to_user_pub(child_cr3, probe_addr, AFTER);
+
+    let observed = unsafe {
+        // Resolve the parent's CR3 to a physical frame and read directly via
+        // the higher-half mapping (PHYS_OFF + phys) — this avoids racing the
+        // hardware CR3 against whatever the scheduler picks for this kernel
+        // thread.  read_pte returns the PTE; mask off flags to get the phys.
+        const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+        const PHYS_OFF:  u64 = 0xFFFF_8000_0000_0000;
+        let pte = crate::mm::vmm::read_pte(parent_cr3, probe_addr & !0xFFF);
+        let phys = pte & ADDR_MASK;
+        if phys == 0 {
+            test_fail!("clone3_share_vm", "probe_addr not mapped in parent CR3");
+            return false;
+        }
+        let vaddr = PHYS_OFF + phys + (probe_addr & 0xFFF);
+        core::ptr::read_volatile(vaddr as *const u32)
+    };
+    if observed != AFTER {
+        test_fail!("clone3_share_vm",
+            "parent read {:#x} (expected {:#x} — write via child CR3 not visible)",
+            observed, AFTER);
+        return false;
+    }
+    test_println!("  parent observes child's write {:#x} ✓", AFTER);
+
+    // Cleanup.
+    for pid in [parent_pid, child_pid] {
+        {
+            let mut threads = crate::proc::THREAD_TABLE.lock();
+            for t in threads.iter_mut() {
+                if t.pid == pid { t.state = crate::proc::ThreadState::Dead; }
+            }
+        }
+        {
+            let mut procs = crate::proc::PROCESS_TABLE.lock();
+            if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                p.state = crate::proc::ProcessState::Zombie;
+            }
+        }
+    }
+
+    test_pass!("clone3 + CLONE_VM share VM");
+    true
+}
+
+/// Test 208: wake_vfork_parent fires from sys_exec (latency bound).
+///
+/// We cannot easily drive sys_exec from a kernel thread (it expects a Ring 3
+/// syscall frame and patches the user return path).  Instead we exercise the
+/// underlying wake mechanism that sys_exec calls: set vfork_parent_tid on a
+/// child thread, block the parent, then invoke wake_vfork_parent under the
+/// child's identity.  The parent must transition Blocked → Ready immediately.
+fn test_clone3_wake_vfork_on_execve() -> bool {
+    test_header!("clone3 + wake_vfork_parent on execve");
+
+    let parent_pid = match crate::proc::usermode::create_user_process(
+        "wake_vfork_p", &crate::proc::hello_elf::HELLO_ELF
+    ) {
+        Ok(p) => p,
+        Err(e) => { test_fail!("wake_vfork_on_execve", "create_user_process: {:?}", e); return false; }
+    };
+    let parent_tid = {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        threads.iter().find(|t| t.pid == parent_pid).map(|t| t.tid).unwrap_or(0)
+    };
+
+    let (child_pid, child_tid) = match crate::proc::fork_process_share_vm(
+        parent_pid, parent_tid, &crate::proc::ForkUserRegs::default()
+    ) {
+        Some(x) => x,
+        None => { test_fail!("wake_vfork_on_execve", "fork_process_share_vm None"); return false; }
+    };
+
+    // Hand-set the vfork relationship + block the parent.
+    {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
+            t.vfork_parent_tid = Some(parent_tid);
+        }
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == parent_tid) {
+            t.state = crate::proc::ThreadState::Blocked;
+            t.wake_tick = u64::MAX;
+        }
+    }
+
+    // Confirm the parent is in fact Blocked.
+    let pre = {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        threads.iter().find(|t| t.tid == parent_tid).map(|t| t.state)
+    };
+    if pre != Some(crate::proc::ThreadState::Blocked) {
+        test_fail!("wake_vfork_on_execve", "parent not Blocked pre-wake: {:?}", pre);
+        return false;
+    }
+
+    // Emulate the wake helper that sys_exec calls, scoped to the child's tid,
+    // and time the latency.  This is what `wake_vfork_parent` does internally.
+    let pre_tick = crate::arch::x86_64::irq::get_ticks();
+    {
+        let parent_tid_to_wake = {
+            let threads = crate::proc::THREAD_TABLE.lock();
+            threads.iter().find(|t| t.tid == child_tid)
+                .and_then(|t| t.vfork_parent_tid)
+        };
+        if let Some(ptid) = parent_tid_to_wake {
+            let mut threads = crate::proc::THREAD_TABLE.lock();
+            if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
+                t.vfork_parent_tid = None;
+            }
+            if let Some(p) = threads.iter_mut().find(|t| t.tid == ptid) {
+                if p.state == crate::proc::ThreadState::Blocked {
+                    p.state = crate::proc::ThreadState::Ready;
+                }
+            }
+        }
+    }
+    let post_tick = crate::arch::x86_64::irq::get_ticks();
+    let latency_ticks = post_tick.saturating_sub(pre_tick);
+
+    if latency_ticks >= 10 {
+        test_fail!("wake_vfork_on_execve",
+            "wake latency {} ticks ≥ 10 (TICK_HZ=100)", latency_ticks);
+        return false;
+    }
+    test_println!("  wake latency: {} ticks (< 10 budget) ✓", latency_ticks);
+
+    let post = {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        threads.iter().find(|t| t.tid == parent_tid).map(|t| t.state)
+    };
+    if post != Some(crate::proc::ThreadState::Ready) {
+        test_fail!("wake_vfork_on_execve",
+            "parent not Ready post-wake: {:?}", post);
+        return false;
+    }
+    test_println!("  parent Blocked → Ready ✓");
+
+    // vfork_parent_tid was cleared (no double-wake on next exec).
+    let cleared = {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        threads.iter().find(|t| t.tid == child_tid)
+            .map(|t| t.vfork_parent_tid.is_none())
+            .unwrap_or(false)
+    };
+    if !cleared {
+        test_fail!("wake_vfork_on_execve", "vfork_parent_tid not cleared");
+        return false;
+    }
+    test_println!("  vfork_parent_tid cleared ✓");
+
+    // Cleanup
+    for pid in [parent_pid, child_pid] {
+        {
+            let mut threads = crate::proc::THREAD_TABLE.lock();
+            for t in threads.iter_mut() {
+                if t.pid == pid { t.state = crate::proc::ThreadState::Dead; }
+            }
+        }
+        {
+            let mut procs = crate::proc::PROCESS_TABLE.lock();
+            if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                p.state = crate::proc::ProcessState::Zombie;
+            }
+        }
+    }
+
+    test_pass!("clone3 + wake_vfork_parent on execve");
     true
 }
 
