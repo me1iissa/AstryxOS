@@ -648,7 +648,7 @@ pub unsafe fn deliver_sigsegv_from_isr(
     // later `&mut sig_state` borrow.  The actual print happens at the
     // end of this function so PROCESS_TABLE is not held across the
     // serial writes.  See the `[SIGNAL/VMA]` emission block below.
-    let vma_snapshot = signal_vma_snapshot(proc_entry.vm_space.as_ref(), user_rip);
+    let vma_snapshot = signal_vma_snapshot(proc_entry.vm_space.as_ref(), user_rip, cr2);
 
     let sig_state = match proc_entry.signal_state.as_mut() {
         Some(s) => s,
@@ -765,7 +765,7 @@ pub unsafe fn deliver_sigsegv_from_isr(
         "[SIGNAL] SIGSEGV ISR delivery: PID={} CR2={:#x} user_rip={:#x} handler={:#x} new_rsp={:#x}",
         pid, cr2, user_rip, handler_addr, new_rsp
     );
-    emit_signal_vma_banner(pid, user_rip, &vma_snapshot);
+    emit_signal_vma_banner(pid, user_rip, cr2, &vma_snapshot);
 
     true
 }
@@ -774,6 +774,11 @@ pub unsafe fn deliver_sigsegv_from_isr(
 ///
 /// `name` is `&'static str` (the same lifetime as `VmArea::name`), so the
 /// snapshot is cheap to build and carry across the lock drop.
+///
+/// `file_offset` is the byte offset within the backing file of the VMA's
+/// first byte (zero for anonymous/device mappings).  Combined with
+/// `user_rip - base` it gives the file offset that `objdump -d --start-address`
+/// expects when symbolicating a shared-library RIP.
 #[derive(Copy, Clone)]
 pub(crate) struct VmaSnap {
     pub(crate) base: u64,
@@ -781,14 +786,25 @@ pub(crate) struct VmaSnap {
     pub(crate) prot: u32,
     pub(crate) name: &'static str,
     pub(crate) file_backed: bool,
+    pub(crate) anonymous: bool,
+    pub(crate) file_offset: u64,
     pub(crate) contains_rip: bool,
+    pub(crate) contains_cr2: bool,
 }
 
-/// Capture the VMA covering `user_rip` plus a small number of executable,
-/// file-backed neighbours that are likely shared-library load segments.
+/// Highest user-space address (one byte past).  Anything `>=` this is in the
+/// kernel half (PML4 entries 256-511, base `0xFFFF_8000_0000_0000`).
+const USER_ADDR_END: u64 = 0x0000_8000_0000_0000;
+
+/// Capture the VMA covering `user_rip` (and, if distinct, the VMA covering
+/// `cr2`) plus a small number of executable, file-backed neighbours that are
+/// likely shared-library load segments.
 ///
 /// Capped at 8 entries to keep serial volume bounded — emitting every VMA
-/// of a libxul-loading process would push hundreds of lines per fault.
+/// of a libxul-loading process would push hundreds of lines per fault.  The
+/// RIP-containing and CR2-containing VMAs are always preserved even when the
+/// cap is otherwise hit, so the symbolicating investigator never loses them
+/// to neighbour overflow.
 ///
 /// Visible to `test_runner` via `pub(crate)` so the snapshot policy can
 /// be unit-tested against a synthetic `VmSpace` without standing up a
@@ -796,6 +812,7 @@ pub(crate) struct VmaSnap {
 pub(crate) fn signal_vma_snapshot(
     space: Option<&crate::mm::vma::VmSpace>,
     user_rip: u64,
+    cr2: u64,
 ) -> alloc::vec::Vec<VmaSnap> {
     use crate::mm::vma::{PROT_EXEC, VmBacking};
     let mut out: alloc::vec::Vec<VmaSnap> = alloc::vec::Vec::new();
@@ -804,13 +821,26 @@ pub(crate) fn signal_vma_snapshot(
         None => return out,
     };
     for a in space.areas.iter() {
-        let file_backed = matches!(a.backing, VmBacking::File { .. });
-        let contains = a.contains(user_rip);
-        // Always include the VMA containing user_rip.  For neighbours,
-        // only include executable file-backed mappings (shared-library
-        // text segments) — those are the symbolication-useful ones.
-        let keep = contains || (file_backed && (a.prot & PROT_EXEC) != 0);
+        let (file_backed, file_offset) = match a.backing {
+            VmBacking::File { offset, .. } => (true, offset),
+            _ => (false, 0u64),
+        };
+        let anonymous = matches!(a.backing, VmBacking::Anonymous);
+        let contains_rip = a.contains(user_rip);
+        let contains_cr2 = a.contains(cr2);
+        // Always include the VMA(s) containing user_rip / cr2.  For
+        // neighbours, only include executable file-backed mappings
+        // (shared-library text segments) — those are the symbolication-
+        // useful ones.
+        let keep = contains_rip
+            || contains_cr2
+            || (file_backed && (a.prot & PROT_EXEC) != 0);
         if !keep {
+            continue;
+        }
+        // RIP/CR2-containing entries bypass the cap so we never lose them
+        // to neighbour overflow.  Neighbour-only entries respect the cap.
+        if !contains_rip && !contains_cr2 && out.len() >= 8 {
             continue;
         }
         out.push(VmaSnap {
@@ -819,11 +849,11 @@ pub(crate) fn signal_vma_snapshot(
             prot: a.prot,
             name: a.name,
             file_backed,
-            contains_rip: contains,
+            anonymous,
+            file_offset,
+            contains_rip,
+            contains_cr2,
         });
-        if out.len() >= 8 {
-            break;
-        }
     }
     out
 }
@@ -831,36 +861,112 @@ pub(crate) fn signal_vma_snapshot(
 /// Emit `[SIGNAL/VMA]` lines for the snapshot captured at fault time.
 ///
 /// Format (one line per kept VMA):
-///   `[SIGNAL/VMA] pid=<n> name=<label> base=<vaddr> end=<vaddr> size=<bytes> prot=<rwx> file=<0|1> rip=<0|1> [offset=<within>]`
+///   `[SIGNAL/VMA] pid=<n> name=<label> base=<vaddr> end=<vaddr> size=<bytes> prot=<rwx> file=<0|1> rip=<0|1> cr2=<0|1> [offset_in_vma=<…> offset_in_file=<…>] [anon=1]`
 ///
-/// `rip=1` marks the VMA that contains `user_rip`; that entry also carries an
-/// `offset=` field giving `user_rip - base` so the next investigator can
-/// addr2line directly against the `[FFTEST/mmap-so]` base for that VMA's
-/// underlying file.
-fn emit_signal_vma_banner(pid: u64, user_rip: u64, snap: &[VmaSnap]) {
+/// `rip=1` marks the VMA that contains `user_rip`; `cr2=1` marks the VMA
+/// that contains the faulting address.  When the same VMA contains both
+/// `user_rip` and `cr2` a single entry is emitted with `rip=1 cr2=1` and
+/// the per-address offsets are split into `rip_offset_in_vma=…
+/// cr2_offset_in_vma=…` (plus `rip_offset_in_file=…` when file-backed).
+///
+/// Special cases (emitted before iterating the snapshot):
+///   * `user_rip >= 0xFFFF_8000_…` — kernel-side RIP (signal-from-IRQ
+///     delivery path).  We log a kernel-RIP banner and SKIP the user-VMA
+///     iteration around RIP.
+///   * `user_rip` has no containing VMA — emit `rip_unmapped=1`.  We still
+///     iterate the snapshot so the CR2-containing entry (e.g. stack) and
+///     neighbours can be inspected.
+fn emit_signal_vma_banner(pid: u64, user_rip: u64, cr2: u64, snap: &[VmaSnap]) {
     use crate::mm::vma::{PROT_EXEC, PROT_READ, PROT_WRITE};
+
+    // ── RIP locality pre-amble ───────────────────────────────────────────────
+    let rip_in_kernel = user_rip >= USER_ADDR_END;
+    let rip_vma_present = snap.iter().any(|v| v.contains_rip);
+    if rip_in_kernel {
+        crate::serial_println!(
+            "[SIGNAL/VMA] pid={} user_rip={:#x} rip_in_kernel=1 (signal-from-IRQ or kernel-mode fault)",
+            pid, user_rip
+        );
+    } else if !rip_vma_present {
+        // RIP is in user space but no VMA covers it — likely jump to an
+        // unmapped page (poisoned function pointer, freed shared-object
+        // text, etc.).  This is the single most useful symbolication clue
+        // in that scenario.
+        crate::serial_println!(
+            "[SIGNAL/VMA] pid={} user_rip={:#x} rip_unmapped=1 (no VMA covers RIP — possible jump to unmapped page)",
+            pid, user_rip
+        );
+    }
+
     if snap.is_empty() {
         crate::serial_println!(
-            "[SIGNAL/VMA] pid={} user_rip={:#x} no_vma_match=1",
-            pid, user_rip
+            "[SIGNAL/VMA] pid={} user_rip={:#x} cr2={:#x} no_vma_match=1",
+            pid, user_rip, cr2
         );
         return;
     }
+
     for v in snap.iter() {
         let r = if v.prot & PROT_READ  != 0 { 'r' } else { '-' };
         let w = if v.prot & PROT_WRITE != 0 { 'w' } else { '-' };
         let x = if v.prot & PROT_EXEC  != 0 { 'x' } else { '-' };
-        if v.contains_rip {
-            crate::serial_println!(
-                "[SIGNAL/VMA] pid={} name={} base={:#x} end={:#x} size={:#x} prot={}{}{} file={} rip=1 offset={:#x}",
-                pid, v.name, v.base, v.end, v.end - v.base, r, w, x,
-                v.file_backed as u8, user_rip - v.base
-            );
+        let anon_tag = if v.anonymous { " anon=1" } else { "" };
+        let rip_flag = v.contains_rip as u8;
+        let cr2_flag = v.contains_cr2 as u8;
+
+        if v.contains_rip && v.contains_cr2 {
+            // Same VMA covers both RIP and CR2 — emit one combined line.
+            let rip_off_vma = user_rip - v.base;
+            let cr2_off_vma = cr2 - v.base;
+            if v.file_backed {
+                crate::serial_println!(
+                    "[SIGNAL/VMA] pid={} name={} base={:#x} end={:#x} size={:#x} prot={}{}{} file=1 rip=1 cr2=1 rip_offset_in_vma={:#x} rip_offset_in_file={:#x} cr2_offset_in_vma={:#x}{}",
+                    pid, v.name, v.base, v.end, v.end - v.base, r, w, x,
+                    rip_off_vma, rip_off_vma + v.file_offset, cr2_off_vma, anon_tag
+                );
+            } else {
+                crate::serial_println!(
+                    "[SIGNAL/VMA] pid={} name={} base={:#x} end={:#x} size={:#x} prot={}{}{} file=0 rip=1 cr2=1 rip_offset_in_vma={:#x} cr2_offset_in_vma={:#x}{}",
+                    pid, v.name, v.base, v.end, v.end - v.base, r, w, x,
+                    rip_off_vma, cr2_off_vma, anon_tag
+                );
+            }
+        } else if v.contains_rip {
+            let off_vma = user_rip - v.base;
+            if v.file_backed {
+                crate::serial_println!(
+                    "[SIGNAL/VMA] pid={} name={} base={:#x} end={:#x} size={:#x} prot={}{}{} file=1 rip=1 cr2=0 offset_in_vma={:#x} offset_in_file={:#x}{}",
+                    pid, v.name, v.base, v.end, v.end - v.base, r, w, x,
+                    off_vma, off_vma + v.file_offset, anon_tag
+                );
+            } else {
+                crate::serial_println!(
+                    "[SIGNAL/VMA] pid={} name={} base={:#x} end={:#x} size={:#x} prot={}{}{} file=0 rip=1 cr2=0 offset_in_vma={:#x}{}",
+                    pid, v.name, v.base, v.end, v.end - v.base, r, w, x,
+                    off_vma, anon_tag
+                );
+            }
+        } else if v.contains_cr2 {
+            let off_vma = cr2 - v.base;
+            if v.file_backed {
+                crate::serial_println!(
+                    "[SIGNAL/VMA] pid={} name={} base={:#x} end={:#x} size={:#x} prot={}{}{} file=1 rip=0 cr2=1 offset_in_vma={:#x} offset_in_file={:#x}{}",
+                    pid, v.name, v.base, v.end, v.end - v.base, r, w, x,
+                    off_vma, off_vma + v.file_offset, anon_tag
+                );
+            } else {
+                crate::serial_println!(
+                    "[SIGNAL/VMA] pid={} name={} base={:#x} end={:#x} size={:#x} prot={}{}{} file=0 rip=0 cr2=1 offset_in_vma={:#x}{}",
+                    pid, v.name, v.base, v.end, v.end - v.base, r, w, x,
+                    off_vma, anon_tag
+                );
+            }
         } else {
+            // Neighbour (executable file-backed, not containing rip/cr2).
             crate::serial_println!(
-                "[SIGNAL/VMA] pid={} name={} base={:#x} end={:#x} size={:#x} prot={}{}{} file={} rip=0",
+                "[SIGNAL/VMA] pid={} name={} base={:#x} end={:#x} size={:#x} prot={}{}{} file={} rip={} cr2={}{}",
                 pid, v.name, v.base, v.end, v.end - v.base, r, w, x,
-                v.file_backed as u8
+                v.file_backed as u8, rip_flag, cr2_flag, anon_tag
             );
         }
     }
