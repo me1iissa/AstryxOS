@@ -1321,14 +1321,34 @@ def cmd_start(args):
                 )
 
     kvm_arg: Optional[bool]
-    if getattr(args, "no_kvm", False):
+    no_kvm_flag = bool(getattr(args, "no_kvm", False))
+    force_kvm_flag = bool(getattr(args, "force_kvm", False))
+    if no_kvm_flag:
         kvm_arg = False
-    elif getattr(args, "force_kvm", False):
+    elif force_kvm_flag:
         kvm_arg = True
     else:
         kvm_arg = None  # autodetect
     smp = int(getattr(args, "smp", 2) or 2)
     cpu_model = getattr(args, "cpu_model", None)
+
+    # Resolve effective KVM state + CPU model up-front so we can log the
+    # decision (W106: catches "TCG run with -cpu host advertising AVX-512
+    # → glibc IFUNC trap → spurious #UD" misconfiguration before launch).
+    kvm_effective = (
+        kvm_arg if kvm_arg is not None else astryx_qemu._detect_kvm()
+    )
+    cpu_model_resolved, cpu_model_reason = astryx_qemu.cpu_model_for(
+        mode="test", kvm=kvm_effective, cpu_override=cpu_model,
+    )
+    kvm_available = astryx_qemu._detect_kvm()
+    print(
+        f"[harness] cpu_model={cpu_model_resolved} reason={cpu_model_reason} "
+        f"(kvm_available={kvm_available}, no_kvm_flag={no_kvm_flag}, "
+        f"force_kvm_flag={force_kvm_flag})",
+        file=sys.stderr,
+    )
+
     proc = _launch_qemu_harness(sid, serial_log, qmp_sock, ovmf_vars,
                                  gdb_port=gdb_port, gdb_wait=gdb_wait,
                                  kdb_host_port=kdb_host_port,
@@ -1352,6 +1372,16 @@ def cmd_start(args):
         "kdb_host_port": kdb_host_port,
         "smp":         smp,
         "cpu_model":   cpu_model or "default",
+        # W106: capture the resolved CPU model + reason so post-hoc
+        # investigations can tell whether a run was on `-cpu host` (KVM
+        # fidelity path) or the TCG-safe baseline. Additive — never
+        # rename these keys without updating downstream agents.
+        "cpu_model_resolved": cpu_model_resolved,
+        "cpu_model_reason":   cpu_model_reason,
+        "kvm_available":      kvm_available,
+        "kvm_effective":      bool(kvm_effective),
+        "no_kvm_flag":        no_kvm_flag,
+        "force_kvm_flag":     force_kvm_flag,
         "breakpoints": [],
         # True when data.img was absent at session start (after any auto-symlink
         # attempt). Agents inspecting this field can immediately distinguish a
@@ -1389,8 +1419,30 @@ def cmd_start(args):
     session["watcher_pid"] = watcher_proc.pid
     _save_session(session)
 
+    # W106: record the CPU-model decision in the event stream so a single
+    # `events <sid>` invocation reveals whether the run was on KVM fidelity
+    # or the TCG-safe baseline. Investigations of "spurious #UD" / SIGSEGV
+    # clusters check this first.
+    _emit_event(sid, {
+        "kind": "cpu_model",
+        "model": cpu_model_resolved,
+        "reason": cpu_model_reason,
+        "kvm_available": kvm_available,
+        "kvm_effective": bool(kvm_effective),
+        "no_kvm_flag": no_kvm_flag,
+        "force_kvm_flag": force_kvm_flag,
+        "cpu_override": cpu_model,
+    })
+
     _out({"sid": sid, "pid": proc.pid, "serial_log": serial_log,
           "gdb_port": gdb_port, "kdb_host_port": kdb_host_port,
+          # W106: structured CPU-model fields. `cpu_model_resolved` is
+          # the literal string passed to QEMU `-cpu`; `cpu_model_reason`
+          # is one of "override" | "kvm-host" | "tcg-safe".
+          "cpu_model_resolved": cpu_model_resolved,
+          "cpu_model_reason":   cpu_model_reason,
+          "kvm_available":      kvm_available,
+          "kvm_effective":      bool(kvm_effective),
           # True when data.img was absent (even after auto-symlink attempt).
           # Agents should treat this as a hard warning for firefox-test runs.
           "data_img_missing": _data_img_missing,
@@ -4882,9 +4934,10 @@ def main():
                           help="Override QEMU -cpu model verbatim (e.g. 'host', "
                                "'max', 'Cascadelake-Server', 'EPYC-Genoa-v1', "
                                "'qemu64'). When unset, astryx_qemu.py picks: "
-                               "'host' under KVM, otherwise "
-                               "'qemu64,+rdtscp,+ssse3,+sse4_1,+sse4_2'. Used "
-                               "by perf sweeps to vary VMEXIT surface.")
+                               "'host' under KVM, otherwise the TCG-safe "
+                               "qemu64+SSE4.2/AVX2/FMA baseline (no AVX-512, "
+                               "no AVX10, no SHA-NI — see astryx_qemu._TCG_SAFE_CPU). "
+                               "Used by perf sweeps to vary VMEXIT surface.")
     p_start.add_argument("--no-regen-data-img", action="store_true",
                           dest="no_regen_data_img",
                           help="Skip the auto-regen of build/data.img when "

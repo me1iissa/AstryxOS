@@ -31,14 +31,19 @@ differences are therefore visible in one file.
    controllers, so the ATA probe sees hardware regardless of where
    the data.img is attached.
 
-2. **CPU — `host` when KVM available, `qemu64,+rdtscp,+sse4_2` under TCG.**
+2. **CPU — `host` under KVM, a TCG-safe baseline under TCG.**
 
-   Rationale: `host` matches what a physical boot would encounter on
-   the developer's workstation (the target surface Firefox actually
-   hits). `qemu64,+rdtscp,+sse4_2` is the minimum feature set we rely
-   on in the kernel (rdtscp for vDSO-style timing, sse4.2 for
-   compiler-generated string ops). Firefox-test mode can force `host`
-   because it requires KVM to be fast enough anyway.
+   Rationale: under KVM, `host` matches what a physical boot would
+   encounter on the developer's workstation (the target surface
+   Firefox actually hits). Under TCG, we must NOT advertise host
+   CPUID — glibc's IFUNC resolver reads CPUID and selects
+   AVX-512/AVX10/SHA-NI variants of `memcpy`/`strcmp`/etc that TCG
+   cannot decode at runtime, triggering #UD and looking like a
+   userspace crash. The TCG baseline (`qemu64` + safe extensions
+   through AVX2/FMA, no AVX-512, no AVX10, no SHA-NI) gives glibc
+   enough ISA to pick fast SSE/AVX2 variants while staying inside
+   TCG's emulated instruction set. See QEMU `docs/system/i386/cpu.rst`
+   for the per-feature decode status.
 
 3. **Memory — 1 GiB default, 2 GiB for firefox mode.**
 
@@ -78,6 +83,29 @@ _SMP = int(os.environ.get("ASTRYX_SMP", "2"))
 #: 1 → QEMU exit(3)=fail. Shared with run-test.sh semantics.
 _ISA_DEBUG_EXIT = ["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]
 
+#: TCG-safe CPU baseline. `qemu64` is the QEMU-defined model whose
+#: feature set TCG fully decodes; the `+` extensions below are all
+#: TCG-decoded in QEMU >= 7 and give glibc's IFUNC resolver enough
+#: ISA surface to pick a fast (SSE4.2 / AVX2 / FMA) variant of
+#: `memcpy`, `strcmp`, etc. Critically we do NOT advertise:
+#:   • AVX-512* (any flavour) — TCG decodes a subset only; many
+#:     vector ops trap as #UD at runtime
+#:   • AVX10 (Intel) — not in TCG
+#:   • SHA-NI (Intel SHA extension) — Mozilla NSS picks this when
+#:     present; TCG decodes only a subset and the resolver falls
+#:     into a path that issues an unsupported opcode
+#: When KVM is in use we want `-cpu host` instead so guest CPUID
+#: matches hardware exactly.
+_TCG_SAFE_CPU = (
+    "qemu64"
+    ",+ssse3,+sse4_1,+sse4_2"   # SSE family — palignr, pcmpistri
+    ",+avx,+avx2,+fma"           # AVX2 + FMA for memcpy/memmove
+    ",+rdtscp"                   # vDSO-style timing path
+    ",+popcnt"                   # std::popcount IFUNC
+    ",+aes,+pclmulqdq"           # NSS AES-NI / CRC32C
+    ",+cmov"                     # universally assumed since P6
+)
+
 
 # ── Host feature detection ────────────────────────────────────────────────────
 
@@ -88,32 +116,38 @@ def _detect_kvm() -> bool:
 
 # ── Block assemblers ──────────────────────────────────────────────────────────
 
-def _cpu_args(mode: str, kvm: bool, cpu_override: Optional[str] = None) -> list[str]:
+def cpu_model_for(mode: str, kvm: bool,
+                  cpu_override: Optional[str] = None) -> tuple[str, str]:
     """
-    CPU model. Under KVM we prefer `host` because that matches what a
-    real-hardware boot would encounter — critical for Firefox and any
-    test that exercises CPUID. Under TCG we fall back to a feature set
-    that mirrors what glibc's IFUNC dispatcher will select on a typical
-    modern host (+rdtscp, +ssse3, +sse4.1, +sse4.2): glibc's optimised
-    string routines (strcmp, strncmp, memcpy) emit `palignr` (SSSE3)
-    and `pcmpistri` (SSE4.2), so omitting either makes the very first
-    libc call from any non-trivial userspace process raise #UD.
+    Return ``(cpu_model, reason)`` for the given mode + KVM state.
 
-    firefox-test forces `-cpu host` because its perf target is
-    unreachable under TCG; if KVM is absent the run will be slow but
-    correct.
+    ``reason`` is a short tag suitable for structured logging:
+      * ``"override"``  — caller passed ``cpu_override`` verbatim
+      * ``"kvm-host"``  — KVM available, using ``-cpu host`` for fidelity
+      * ``"tcg-safe"``  — TCG path, using the AVX2/FMA-capped baseline
+                          to avoid AVX-512/AVX10/SHA-NI IFUNC traps
 
-    `cpu_override` (if set) bypasses every other rule and passes
-    `-cpu <value>` verbatim. Used by perf investigations that need to
-    sweep CPU models (e.g. `-cpu max`, `-cpu Cascadelake-Server`).
+    The "firefox-test forces host" special case (formerly here) has
+    been removed: under TCG it would advertise host CPUID, glibc's
+    IFUNC resolver would pick AVX-512 ``memcpy`` variants, and TCG
+    would fault on the first unsupported vector op. Firefox-test under
+    TCG is slow regardless; correctness wins.
     """
     if cpu_override:
-        return ["-cpu", cpu_override]
-    if mode == "firefox-test":
-        return ["-cpu", "host"]
+        return cpu_override, "override"
     if kvm:
-        return ["-cpu", "host"]
-    return ["-cpu", "qemu64,+rdtscp,+ssse3,+sse4_1,+sse4_2"]
+        return "host", "kvm-host"
+    return _TCG_SAFE_CPU, "tcg-safe"
+
+
+def _cpu_args(mode: str, kvm: bool, cpu_override: Optional[str] = None) -> list[str]:
+    """
+    QEMU ``-cpu`` argv fragment. Delegates the model choice to
+    :func:`cpu_model_for`; this wrapper exists so callers that only
+    want the argv (most of them) need not unpack the reason tag.
+    """
+    model, _reason = cpu_model_for(mode, kvm, cpu_override)
+    return ["-cpu", model]
 
 
 def _memory_args(mode: str) -> list[str]:
