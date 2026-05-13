@@ -794,10 +794,16 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
     // Resolve `#!` shebangs. If the file is already an ELF, this is a no-op.
     // Otherwise it reads the interpreter chain (up to SHEBANG_MAX_RECURSION
     // levels), rewrites argv, and returns the final interpreter ELF + argv.
-    let (elf_data, argv_owned) = {
+    //
+    // `final_path` is what `/proc/self/exe` and AT_EXECFN should resolve to —
+    // i.e. the interpreter for a shebang-dispatched script, or the user-
+    // requested path for a direct ELF execve(2).  Per Linux `proc(5)`:
+    //   "/proc/[pid]/exe is a symbolic link containing the actual pathname
+    //    of the executed command."
+    let (elf_data, argv_owned, final_path) = {
         let argv_refs: alloc::vec::Vec<&str> = argv_owned.iter().map(|s| s.as_str()).collect();
         match crate::proc::elf::resolve_shebang(path, file_data, &argv_refs) {
-            Ok(r) => (r.elf_data, r.argv),
+            Ok(r) => (r.elf_data, r.argv, r.interp_path),
             Err(e) => {
                 crate::serial_println!("[SYSCALL] exec: shebang/load error: {}", e);
                 return e;
@@ -806,18 +812,24 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
     };
 
     // Log the final argv so content-process roles (--contentproc <type> <fd>)
-    // are visible in the serial trace.  Truncated to 8 args and 256 cumulative
-    // bytes to avoid log spam on deeply-nested command lines.
+    // are visible in the serial trace.  Truncated to 16 args and 2 KiB
+    // cumulative bytes to avoid log spam on deeply-nested command lines while
+    // still capturing rich Mozilla/Firefox child-process command lines that
+    // typically run to 12-14 args including JSON/--appdir/--profile pairs
+    // (W120/W121 motivating case).  If truncation occurs, an `[EXEC argv-cont]`
+    // continuation line emits the remaining args' tail.
     {
+        const MAX_ARGS_SHOWN: usize = 16;
+        const BYTE_BUDGET: usize = 2048;
+        const BUF: usize = 2304; // headroom for quotes/spaces/binary placeholders
         let pid = crate::proc::current_pid_lockless();
         let tid = crate::proc::current_tid();
         let total_args = argv_owned.len();
         // Build a compact representation into a fixed-size stack buffer.
         // We use a simple byte-array writer to stay no_std / no-alloc.
-        const BUF: usize = 320;
         let mut buf = [0u8; BUF];
         let mut pos = 0usize;
-        let mut byte_budget: usize = 256;
+        let mut byte_budget: usize = BYTE_BUDGET;
         let mut args_shown: usize = 0;
 
         macro_rules! push_byte {
@@ -837,7 +849,7 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
         }
 
         for (i, arg) in argv_owned.iter().enumerate() {
-            if i >= 8 || byte_budget == 0 {
+            if i >= MAX_ARGS_SHOWN || byte_budget == 0 {
                 break;
             }
             if i > 0 {
@@ -857,8 +869,9 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
                 push_str!("<binary len=");
                 // Emit decimal length inline.
                 let n = arg.len();
-                if n >= 100 { push_byte!(b'0' + (n / 100) as u8); }
-                if n >= 10  { push_byte!(b'0' + ((n / 10) % 10) as u8); }
+                if n >= 1000 { push_byte!(b'0' + ((n / 1000) % 10) as u8); }
+                if n >= 100  { push_byte!(b'0' + ((n / 100) % 10) as u8); }
+                if n >= 10   { push_byte!(b'0' + ((n / 10) % 10) as u8); }
                 push_byte!(b'0' + (n % 10) as u8);
                 push_byte!(b'>');
             }
@@ -875,6 +888,44 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
                 "[EXEC] pid={} tid={} argv={} ({} of {} args shown)",
                 pid, tid, shown, args_shown, total_args
             );
+            // Emit a continuation line if there are more args to show — keeps
+            // long Mozilla command lines (~14 args including IPC fds, JSON
+            // prefs, etc.) fully greppable from the serial trace.
+            if total_args > args_shown {
+                let mut cont = [0u8; BUF];
+                let mut cpos = 0usize;
+                let mut cbudget: usize = BYTE_BUDGET;
+                macro_rules! cpush_byte {
+                    ($b:expr) => {
+                        if cpos < BUF - 1 {
+                            cont[cpos] = $b;
+                            cpos += 1;
+                        }
+                    };
+                }
+                for (j, arg) in argv_owned.iter().enumerate().skip(args_shown) {
+                    if j - args_shown >= MAX_ARGS_SHOWN || cbudget == 0 {
+                        break;
+                    }
+                    if cpos > 0 { cpush_byte!(b' '); }
+                    cpush_byte!(b'"');
+                    let all_print = arg.bytes().all(|b| b >= 0x20 && b < 0x7f);
+                    if all_print {
+                        let take = arg.len().min(cbudget);
+                        for b in arg.as_bytes()[..take].iter() { cpush_byte!(*b); }
+                        cbudget = cbudget.saturating_sub(arg.len());
+                    } else {
+                        for b in b"<binary>" { cpush_byte!(*b); }
+                    }
+                    cpush_byte!(b'"');
+                }
+                cont[cpos] = 0;
+                let cshown = unsafe { core::str::from_utf8_unchecked(&cont[..cpos]) };
+                crate::serial_println!(
+                    "[EXEC argv-cont] pid={} tid={} argv={}",
+                    pid, tid, cshown
+                );
+            }
         } else {
             crate::serial_println!(
                 "[EXEC] pid={} tid={} argv={} ({} args)",
@@ -936,7 +987,9 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
 
     if !has_vm_space && !is_shared_vm_child {
         // (A) Kernel caller — create a new user process (legacy path).
-        match crate::proc::usermode::create_user_process_with_args(path, &elf_data, argv_slice, envp_slice) {
+        // Use `final_path` (post-shebang interpreter path) so /proc/self/exe
+        // resolves to the actual ELF that runs, not the script entry point.
+        match crate::proc::usermode::create_user_process_with_args(final_path.as_str(), &elf_data, argv_slice, envp_slice) {
             Ok(new_pid) => {
                 // ELFs loaded from disk use the Linux syscall ABI.
                 {
@@ -1021,6 +1074,16 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
             // ELFs loaded from disk use the Linux syscall ABI.
             p.linux_abi = true;
             p.subsystem = crate::win32::SubsystemType::Linux;
+            // Update /proc/self/exe to the new image's path.  Per `proc(5)`,
+            // the symlink target follows the executed program across
+            // execve(2) — including the case where the caller forked from
+            // another binary (posix_spawn fast path, vfork+exec).  Without
+            // this update, readlink("/proc/self/exe") in the new image would
+            // return the *parent's* path (or the fallback for case-C), which
+            // breaks any program that derives sibling resource paths from
+            // its own location (Mozilla's dependentlibs.list is the W120
+            // motivating case).
+            p.exe_path = Some(final_path.clone());
             // Close all FDs marked close-on-exec (O_CLOEXEC / FD_CLOEXEC).
             for fd_slot in p.file_descriptors.iter_mut() {
                 if matches!(fd_slot, Some(f) if f.cloexec) {
