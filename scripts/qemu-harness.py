@@ -9,6 +9,23 @@ Session state is stored in ~/.astryx-harness/<sid>.json.
 Events are written to ~/.astryx-harness/<sid>.events.jsonl.
 QMP socket: ~/.astryx-harness/<sid>.qmp.sock
 
+## KVM default (W139 recommendation)
+
+When /dev/kvm is available the harness uses KVM automatically — no flag
+required. A 10-trial soak (W139, 2026-05-13) showed KVM consistently reaches
+deeper than TCG on this host:
+
+  * Mean syscall count:        +58 % (4 893 TCG vs 7 751 KVM)
+  * quit-application-granted:   0/5 TCG vs 3/5 KVM
+  * W127-cluster SIGSEGV rate: 80 % TCG vs 40 % KVM
+
+W109 confirmed that the KVM serial-port recursion deadlock (W107) is closed
+by PR #156 on master, so KVM is safe for all current firefox-test runs.
+
+Do NOT pass --no-kvm unless you are explicitly reproducing a TCG-only
+environment or testing on a host without /dev/kvm. The harness will emit a
+WARNING to stderr when --no-kvm is used and /dev/kvm is available.
+
 Tier 1 — session management:
     python3 scripts/qemu-harness.py start [--features FLAGS] [--no-build]
                                           [--gdb-port PORT] [--gdb-wait]
@@ -1325,6 +1342,19 @@ def cmd_start(args):
     force_kvm_flag = bool(getattr(args, "force_kvm", False))
     if no_kvm_flag:
         kvm_arg = False
+        # W139 deprecation warning: --no-kvm degrades firefox-test fidelity.
+        # Emit when /dev/kvm is present so agents and humans see the cost
+        # of opting out. Suppressed on hosts without KVM (where TCG is the
+        # only option and the flag is a no-op).
+        if astryx_qemu._detect_kvm():
+            print(
+                "WARNING: --no-kvm passed but /dev/kvm is available. "
+                "KVM disabled — firefox-test progresses 58% further under KVM "
+                "per W139 soak (2026-05-13): sc +58%, quit-application-granted "
+                "3/5 KVM vs 0/5 TCG. Remove --no-kvm unless reproducing a "
+                "TCG-specific regression.",
+                file=sys.stderr,
+            )
     elif force_kvm_flag:
         kvm_arg = True
     else:
@@ -4920,9 +4950,13 @@ def main():
     p_start.add_argument("--gdb-wait", action="store_true",
                           help="Start QEMU frozen (-S); debugger must 'cont' to unfreeze")
     p_start.add_argument("--no-kvm", dest="no_kvm", action="store_true",
-                          help="Force-disable KVM acceleration. Reproduces CI's "
-                               "TCG-only environment (qemu64 CPU model). Useful "
-                               "when a test hangs only without KVM.")
+                          help="[DEPRECATED] Force-disable KVM acceleration. "
+                               "Use only to reproduce a TCG-only environment or "
+                               "on hosts without /dev/kvm. A 10-trial soak "
+                               "(W139, 2026-05-13) showed KVM reaches 58%% more "
+                               "syscalls and hit quit-application-granted 3/5 vs "
+                               "0/5 for TCG — avoid this flag for firefox-test "
+                               "unless you have a specific TCG regression to chase.")
     p_start.add_argument("--kvm", dest="force_kvm", action="store_true",
                           help="Force-enable KVM acceleration. Errors out if "
                                "/dev/kvm is unavailable.")
