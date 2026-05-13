@@ -336,6 +336,64 @@ _EXACT_CATEGORY = {
     # Returning a modern version steers Mozilla into the safer new path.
     # Spec: https://fontconfig.org/fontconfig-devel/fcgetversion.html
     'FcGetVersion':            'fc_version',
+    # ── Pango typed stubs ────────────────────────────────────────────────────
+    # Mozilla's gfxFcPlatformFontList and gfxFontconfigFontEntry call several
+    # Pango API functions during font-list construction and text-shaping setup.
+    # The default 'null' classifier returns 0/NULL which is technically valid
+    # per each individual Pango spec entry, but Mozilla's callers dereference
+    # the results without NULL-checking — matching the same caller-side bug
+    # class that FcPatternGet* exposed (closed W91/W128 via libfontconfig-
+    # interposer).
+    #
+    # pango_attr_iterator_range(PangoAttrIterator *, int *start, int *end):
+    #   Void — MUST write *start and *end.  Spec: GLib Pango docs §PangoAttrIterator.
+    #   Default 'null' stub returns immediately, leaving *start and *end with
+    #   whatever stack garbage the caller had.  Mozilla's text-run iteration
+    #   uses [start, end) as a byte range for the current attribute span and
+    #   passes those values into subsequent malloc/memcpy-sized allocations,
+    #   propagating the garbage into heap metadata and eventually into wild
+    #   writes or code-fetch faults (the W141 libxul+0x4b8db40/+0x4ba7804
+    #   cluster, observed in 60–80 % of TCG runs).
+    #   Fix: populate *start = 0, *end = G_MAXINT (0x7fffffff) so the iterator
+    #   appears to cover the entire text span — the conservative safe default.
+    #   Spec: https://docs.gtk.org/Pango/method.AttrIterator.range.html
+    'pango_attr_iterator_range':          'pango_attr_range',
+    # pango_font_description_get_family(const PangoFontDescription *) -> const char*:
+    #   May return NULL if the family field was never set.  In our stub world,
+    #   PangoFontDescription objects are &_stub_placeholder (all-zero struct);
+    #   pango_font_description_set_family is a void-noop stub so the family
+    #   field is always "unset", so the default 'null' stub (returning NULL)
+    #   mirrors what a real libpango would do here.  BUT Mozilla's
+    #   nsFont/gfxFont constructors call get_family and pass the result directly
+    #   into nsAutoCString(family) without a NULL guard.  Return our canonical
+    #   stub family name so the constructor gets a valid empty-ish string.
+    #   Spec: https://docs.gtk.org/Pango/method.FontDescription.get_family.html
+    'pango_font_description_get_family':  'pango_family_str',
+    # pango_font_description_get_weight(const PangoFontDescription *) -> PangoWeight:
+    #   Returns an int (PangoWeight enum).  Default 0 maps to
+    #   PANGO_WEIGHT_THIN (100) which is a defined but very-light weight.
+    #   PANGO_WEIGHT_NORMAL = 400 is the safe default — matches what every
+    #   unstyled font has and avoids triggering "thin font" or "ultra-bold"
+    #   code paths that might behave differently.
+    #   Spec: https://docs.gtk.org/Pango/enum.Weight.html
+    'pango_font_description_get_weight':  'pango_weight_normal',
+    # pango_font_description_get_size(const PangoFontDescription *) -> int:
+    #   Returns size in Pango units (points * PANGO_SCALE = points * 1024).
+    #   Default 0 maps to a 0-point font which collapses glyph metrics to zero
+    #   and may trigger divide-by-zero in stride / advance calculations.
+    #   12 * 1024 = 12288 gives a sane 12-point body-text size.
+    #   Spec: https://docs.gtk.org/Pango/method.FontDescription.get_size.html
+    'pango_font_description_get_size':    'pango_size_12pt',
+    # pango_get_log_attrs(text, length, level, language, *log_attrs, attrs_len):
+    #   Void — fills log_attrs[0..attrs_len] with per-character LogAttr flags.
+    #   Default 'null' stub does nothing, leaving log_attrs uninitialized.
+    #   Mozilla's text-layout engine walks every LogAttr entry; uninitialized
+    #   values cause arbitrary branch decisions in is_line_break / is_word_start
+    #   checks that can corrupt the layout state machine.  Zero-initialise all
+    #   entries (all flags = 0) so every character is treated as a non-break
+    #   non-word-start run — safe conservative default.
+    #   Spec: https://docs.gtk.org/Pango/func.get_log_attrs.html
+    'pango_get_log_attrs':                'pango_log_attrs_zero',
 }
 
 # Pattern-based rules applied when no exact match.
@@ -896,6 +954,79 @@ def emit_stub(name, cat):
         return (
             f'int {name}(void) {{\n'
             f'    return 21300;\n'
+            f'}}\n'
+        )
+    elif cat == 'pango_attr_range':
+        # pango_attr_iterator_range(PangoAttrIterator *iter,
+        #     gint *start, gint *end) — void.
+        # Populate *start = 0 and *end = G_MAXINT (0x7fffffff) so Mozilla's
+        # text-run code sees a span covering the entire text buffer.  Leaving
+        # the out-parameters uninitialised (the 'null' stub behaviour) causes
+        # the caller to use stack garbage as byte offsets, propagating into
+        # heap allocation sizes and eventually into the W141 wild-write cluster.
+        # Spec: https://docs.gtk.org/Pango/method.AttrIterator.range.html
+        return (
+            f'void {name}(const void* iter, int* start, int* end) {{\n'
+            f'    (void)iter;\n'
+            f'    if (start) *start = 0;\n'
+            f'    if (end)   *end   = 0x7fffffff; /* G_MAXINT */\n'
+            f'}}\n'
+        )
+    elif cat == 'pango_family_str':
+        # pango_font_description_get_family(const PangoFontDescription *desc)
+        #   -> const char* (family name, or NULL if unset).
+        # Our PangoFontDescription objects are &_stub_placeholder (all-zero),
+        # so the family field is always "unset".  Return our canonical font
+        # family string so callers that pass the result directly into string
+        # constructors without a NULL check get a valid object.
+        # Spec: https://docs.gtk.org/Pango/method.FontDescription.get_family.html
+        return (
+            f'const char* {name}(const void* desc) {{\n'
+            f'    (void)desc;\n'
+            f'    return _stub_font_family;\n'
+            f'}}\n'
+        )
+    elif cat == 'pango_weight_normal':
+        # pango_font_description_get_weight(const PangoFontDescription *desc)
+        #   -> PangoWeight (int).
+        # PANGO_WEIGHT_NORMAL = 400; safe default for unstyled text.
+        # Spec: https://docs.gtk.org/Pango/method.FontDescription.get_weight.html
+        return (
+            f'int {name}(const void* desc) {{\n'
+            f'    (void)desc;\n'
+            f'    return 400; /* PANGO_WEIGHT_NORMAL */\n'
+            f'}}\n'
+        )
+    elif cat == 'pango_size_12pt':
+        # pango_font_description_get_size(const PangoFontDescription *desc)
+        #   -> gint (size in Pango units = points * PANGO_SCALE = points * 1024).
+        # 12 * 1024 = 12288 — standard 12-point body text.  Returning 0 would
+        # collapse glyph advance widths to zero and can trigger divide-by-zero
+        # in stride / line-height calculations.
+        # Spec: https://docs.gtk.org/Pango/method.FontDescription.get_size.html
+        return (
+            f'int {name}(const void* desc) {{\n'
+            f'    (void)desc;\n'
+            f'    return 12288; /* 12 * PANGO_SCALE — 12-point body text */\n'
+            f'}}\n'
+        )
+    elif cat == 'pango_log_attrs_zero':
+        # pango_get_log_attrs(const char *text, gint length, gint level,
+        #     PangoLanguage *language, PangoLogAttr *log_attrs, gint attrs_len)
+        #   -> void.
+        # Zero-initialise log_attrs[0..attrs_len] so Mozilla's line-breaking
+        # and word-boundary logic sees all-false flags rather than stack garbage.
+        # All-zero PangoLogAttr = no break, no word boundary — conservative.
+        # Spec: https://docs.gtk.org/Pango/func.get_log_attrs.html
+        return (
+            f'void {name}(const char* text, int length, int level,\n'
+            f'              const void* language,\n'
+            f'              void* log_attrs, int attrs_len) {{\n'
+            f'    (void)text; (void)length; (void)level; (void)language;\n'
+            f'    if (log_attrs && attrs_len > 0)\n'
+            f'        __builtin_memset(log_attrs, 0,\n'
+            f'                         (unsigned long)attrs_len * 16u);\n'
+            f'    /* sizeof(PangoLogAttr) == 16 per public Pango ABI. */\n'
             f'}}\n'
         )
     elif cat == 'spawn_with_pipes':
