@@ -91,6 +91,13 @@ qga = []
 # the 1s deadline in `resolve_path_opts` is *not* feature-gated and is always
 # on.
 vfs-trace = []
+# VFS / FAT32 lock-discipline debug-asserts (W92).  When enabled, FAT32
+# panics if `inner` is held at any site that issues block-device I/O
+# (read_sectors / write_sectors).  Catches accidental re-introductions of
+# the spin-Mutex-across-yield deadlock that triggered the W92 scheduler
+# bugcheck (sc=1161 under firefox-test).  Off by default — the runtime
+# cost is one extra `try_lock` per device call.
+vfs-debug = []
 
 [dependencies]
 astryx-shared = { path = "../shared" }

@@ -20,7 +20,24 @@ use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
+
+/// Global count of times any FAT32 lock-discipline assertion observed that
+/// `inner` was held across a device-I/O call (W92 regression probe).
+///
+/// Zero in a healthy build.  Test 212 reads this counter to verify the
+/// invariant.  Even without `--features vfs-debug` enabled, every direct
+/// `device.{read,write}_sectors` site in this module bumps this counter
+/// when it detects a violation, so the invariant is enforced at all times
+/// — `vfs-debug` only adds the panic-on-detect behaviour.
+static LOCK_HELD_VIOLATIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Read the cumulative count of W92 lock-held-across-IO violations
+/// observed since boot.  Test-runner accessor.
+pub fn lock_held_violations() -> usize {
+    LOCK_HELD_VIOLATIONS.load(Ordering::Relaxed)
+}
 
 use crate::drivers::block::{BlockDevice, SECTOR_SIZE};
 use super::{FileSystemOps, FileStat, FileType, VfsError, VfsResult, alloc_inode_number};
@@ -614,98 +631,212 @@ impl Fat32Fs {
 
     // ── Cache helpers ───────────────────────────────────────────────────
 
-    /// Ensure a sector is in the sparse cache, loading from device if needed.
-    fn ensure_sector(inner: &mut Fat32Inner, device: &dyn BlockDevice, lba: u64) -> Result<(), VfsError> {
-        if !inner.sector_cache.contains_key(&lba) {
-            // Evict old sectors if cache is too large (prevents OOM for large file reads).
-            // 8K sectors × 512 bytes = 4MB maximum sector cache footprint.
-            const MAX_SECTOR_CACHE: usize = 8192;
-            if inner.sector_cache.len() >= MAX_SECTOR_CACHE {
-                // Evict the first half (lowest LBAs — likely already consumed).
-                // CRITICAL (FAT32-2): dirty sectors must be flushed before
-                // eviction. FAT sectors live at the lowest LBAs and are the
-                // most likely victims; dropping a dirty FAT sector silently
-                // loses the cluster-allocation update.
-                let to_remove: alloc::vec::Vec<u64> = inner.sector_cache.keys()
-                    .take(MAX_SECTOR_CACHE / 2).copied().collect();
-                for k in to_remove {
-                    if inner.dirty.contains(&k) {
-                        if let Some(sector) = inner.sector_cache.get(&k) {
-                            let data = *sector;
-                            if device.write_sectors(k, 1, &data).is_ok() {
-                                inner.dirty.remove(&k);
-                                crate::serial_println!(
-                                    "[FAT32] flushed dirty sector {} during eviction", k);
-                            } else {
-                                // Write failed — keep the sector cached so
-                                // a later `do_sync` can retry. Skip eviction
-                                // of this entry.
-                                crate::serial_println!(
-                                    "[FAT32] WARN: failed to flush dirty sector {} during eviction; \
-                                     keeping in cache", k);
-                                continue;
-                            }
-                        }
-                    }
-                    inner.sector_cache.remove(&k);
-                }
-            }
+    /// Ensure a sector is resident in the sparse cache, loading from device
+    /// if needed.
+    ///
+    /// **Lock discipline (W92 / scheduler-deadlock fix).**  The `inner`
+    /// `spin::Mutex` is NOT yield-aware: holding it across
+    /// `device.read_sectors()` — which routes through the virtio-blk
+    /// completion path and may call `sched::schedule()` — wedges the
+    /// scheduler.  Two VFS threads on different CPUs entering this function
+    /// concurrently would otherwise spin-wait forever and trip the
+    /// scheduler-deadlock watchdog (`BUGCHECK_SCHEDULER_DEADLOCK`).
+    ///
+    /// To remove the divergence this method now takes `&self` and acquires
+    /// `inner` *briefly*: once to check the cache (and bail on hit), and
+    /// once at the end to install the prefetched window.  All device I/O
+    /// happens with NO lock held.  Eviction is handled by
+    /// [`Self::evict_if_needed`] which uses the same drop-around-IO pattern.
+    fn ensure_sector(&self, lba: u64) -> Result<(), VfsError> {
+        // Fast path: already cached.  Drop the lock immediately so we
+        // never hold it across any yielding code below.
+        if self.inner.lock().sector_cache.contains_key(&lba) {
+            return Ok(());
+        }
 
-            // Batch prefetch: read up to 128 consecutive sectors (64 KiB)
-            // at once.  A single block-device call carries a single transport
-            // request through to the underlying driver, so amortising the
-            // per-request overhead across 128 sectors reduces the round-trip
-            // count by 16x for sequential reads (one cluster = 8 sectors).
-            //
-            // The buffer is heap-allocated (not stack) — 64 KiB on a 256 KiB
-            // kernel stack would consume a quarter of the stack inside a
-            // call already nested several frames deep (VFS → FAT32 →
-            // BlockDevice).
-            //
-            // The prefetched window is aligned to a BATCH-sector boundary
-            // and clamped to the device capacity so reads never run off the
-            // end of the disk.  Sectors past `last_lba` are simply not
-            // populated; the caller will fault them in on the next miss.
-            //
-            // BATCH is intentionally kept modest (128 sectors) so that
-            // inserting prefetched sectors into the small BTreeMap-backed
-            // sector cache stays cheap.  Bulk readers that would otherwise
-            // overflow the cache call `read_contiguous_run` below, which
-            // streams data straight from the device without populating the
-            // sector cache at all.
-            const BATCH: u32 = 128;
-            let device_capacity = device.sector_count();
-            let batch_start = lba & !(BATCH as u64 - 1);
-            let mut batch_count = BATCH;
-            if batch_start + batch_count as u64 > device_capacity {
-                // Clamp to device end (won't underflow because lba < capacity
-                // — the caller already validated this).
-                batch_count = (device_capacity - batch_start) as u32;
-            }
-            let batch_bytes = batch_count as usize * SECTOR_SIZE;
-            let mut multi_buf: alloc::vec::Vec<u8> = alloc::vec![0u8; batch_bytes];
-            if device.read_sectors(batch_start, batch_count, &mut multi_buf).is_ok() {
-                for i in 0..batch_count {
-                    let sector_lba = batch_start + i as u64;
-                    if !inner.sector_cache.contains_key(&sector_lba) {
-                        let mut sector = [0u8; SECTOR_SIZE];
-                        let off = i as usize * SECTOR_SIZE;
-                        sector.copy_from_slice(&multi_buf[off..off + SECTOR_SIZE]);
-                        inner.sector_cache.insert(sector_lba, sector);
-                    }
+        // Evict before issuing the new read, so a near-full cache doesn't
+        // overflow when the prefetch window installs ≤128 fresh sectors.
+        // `evict_if_needed` drops the lock around its own device writes,
+        // so it is safe to call here.
+        self.evict_if_needed()?;
+
+        // Batch prefetch: read up to 128 consecutive sectors (64 KiB) at
+        // once.  A single block-device call carries a single transport
+        // request through to the underlying driver, so amortising the
+        // per-request overhead across 128 sectors reduces the round-trip
+        // count by 16x for sequential reads (one cluster = 8 sectors).
+        //
+        // The buffer is heap-allocated (not stack) — 64 KiB on a 256 KiB
+        // kernel stack would consume a quarter of the stack inside a
+        // call already nested several frames deep (VFS → FAT32 →
+        // BlockDevice).
+        //
+        // The prefetched window is aligned to a BATCH-sector boundary
+        // and clamped to the device capacity so reads never run off the
+        // end of the disk.  Sectors past `last_lba` are simply not
+        // populated; the caller will fault them in on the next miss.
+        //
+        // BATCH is intentionally kept modest (128 sectors) so that
+        // inserting prefetched sectors into the small BTreeMap-backed
+        // sector cache stays cheap.  Bulk readers that would otherwise
+        // overflow the cache call `read_contiguous_run` below, which
+        // streams data straight from the device without populating the
+        // sector cache at all.
+        const BATCH: u32 = 128;
+        let device_capacity = self.device.sector_count();
+        let batch_start = lba & !(BATCH as u64 - 1);
+        let mut batch_count = BATCH;
+        if batch_start + batch_count as u64 > device_capacity {
+            // Clamp to device end (won't underflow because lba < capacity
+            // — the caller already validated this).
+            batch_count = (device_capacity - batch_start) as u32;
+        }
+        let batch_bytes = batch_count as usize * SECTOR_SIZE;
+        let mut multi_buf: alloc::vec::Vec<u8> = alloc::vec![0u8; batch_bytes];
+
+        // Device I/O happens with NO inner lock held (W92).
+        self.assert_inner_unlocked("ensure_sector::read_sectors");
+        let prefetch_ok = self.device
+            .read_sectors(batch_start, batch_count, &mut multi_buf)
+            .is_ok();
+
+        if prefetch_ok {
+            let mut inner = self.inner.lock();
+            for i in 0..batch_count {
+                let sector_lba = batch_start + i as u64;
+                if !inner.sector_cache.contains_key(&sector_lba) {
+                    let mut sector = [0u8; SECTOR_SIZE];
+                    let off = i as usize * SECTOR_SIZE;
+                    sector.copy_from_slice(&multi_buf[off..off + SECTOR_SIZE]);
+                    inner.sector_cache.insert(sector_lba, sector);
                 }
-            } else {
-                // Fallback to a single-sector read for the requested LBA only.
-                let mut buf = [0u8; SECTOR_SIZE];
-                device.read_sector(lba, &mut buf).map_err(|_| VfsError::Io)?;
-                inner.sector_cache.insert(lba, buf);
             }
+        } else {
+            // Fallback to a single-sector read for the requested LBA only.
+            // The device call again happens with NO lock held.
+            let mut buf = [0u8; SECTOR_SIZE];
+            self.assert_inner_unlocked("ensure_sector::read_sector_fallback");
+            self.device.read_sector(lba, &mut buf).map_err(|_| VfsError::Io)?;
+            let mut inner = self.inner.lock();
+            inner.sector_cache.insert(lba, buf);
         }
         Ok(())
     }
 
+    /// Evict half of the sector cache when it exceeds [`MAX_SECTOR_CACHE`].
+    /// Dirty sectors are flushed first; clean sectors are simply dropped.
+    ///
+    /// **Lock discipline (W92).**  The lock is acquired three times:
+    ///   1. To snapshot eviction candidates and copy the dirty payloads.
+    ///   2. (Implicitly dropped) — the actual `device.write_sectors` flush
+    ///      happens with NO lock held, because the virtio-blk completion
+    ///      path may call `sched::schedule()`.
+    ///   3. To remove successfully-flushed and clean entries from the
+    ///      cache, and to clear their dirty bits.
+    fn evict_if_needed(&self) -> Result<(), VfsError> {
+        // 8K sectors × 512 bytes = 4MB maximum sector cache footprint.
+        const MAX_SECTOR_CACHE: usize = 8192;
+
+        // Phase 1: snapshot eviction candidates and their dirty payloads
+        // under the lock, then release.
+        let (dirty_to_flush, clean_to_drop): (
+            alloc::vec::Vec<(u64, [u8; SECTOR_SIZE])>,
+            alloc::vec::Vec<u64>,
+        ) = {
+            let inner = self.inner.lock();
+            if inner.sector_cache.len() < MAX_SECTOR_CACHE {
+                return Ok(());
+            }
+            // Evict the first half (lowest LBAs — likely already consumed).
+            // FAT sectors live at the lowest LBAs and are the most likely
+            // victims; dropping a dirty FAT sector silently loses the
+            // cluster-allocation update (FAT32-2 guard).
+            let candidates: alloc::vec::Vec<u64> = inner.sector_cache.keys()
+                .take(MAX_SECTOR_CACHE / 2).copied().collect();
+            let mut dirty = alloc::vec::Vec::new();
+            let mut clean = alloc::vec::Vec::new();
+            for k in candidates {
+                if inner.dirty.contains(&k) {
+                    if let Some(sector) = inner.sector_cache.get(&k) {
+                        dirty.push((k, *sector));
+                    }
+                } else {
+                    clean.push(k);
+                }
+            }
+            (dirty, clean)
+        };
+
+        // Phase 2: flush dirty sectors with the lock dropped.  The device
+        // write may call `sched::schedule()` via the virtio-blk completion
+        // path; holding the spin-mutex across that would deadlock the
+        // scheduler.
+        let mut flushed: alloc::vec::Vec<u64> =
+            alloc::vec::Vec::with_capacity(dirty_to_flush.len());
+        let mut failed_count = 0usize;
+        for (lba, data) in &dirty_to_flush {
+            self.assert_inner_unlocked("evict_if_needed::write_sectors");
+            if self.device.write_sectors(*lba, 1, data).is_ok() {
+                flushed.push(*lba);
+            } else {
+                failed_count += 1;
+            }
+        }
+
+        // Phase 3: re-acquire the lock and prune successfully-flushed and
+        // clean entries.  Sectors whose flush failed are left in place so
+        // a later `do_sync` retry can pick them up.
+        {
+            let mut inner = self.inner.lock();
+            for lba in &flushed {
+                inner.dirty.remove(lba);
+                inner.sector_cache.remove(lba);
+            }
+            for lba in &clean_to_drop {
+                inner.sector_cache.remove(lba);
+            }
+        }
+
+        if failed_count > 0 {
+            crate::serial_println!(
+                "[FAT32] WARN: failed to flush {} dirty sector(s) during eviction; \
+                 keeping in cache for retry",
+                failed_count);
+        }
+        Ok(())
+    }
+
+    /// Probe: the `inner` mutex must NOT be held by the current execution
+    /// context when this is called.  Bumps [`LOCK_HELD_VIOLATIONS`] on a
+    /// violation.  Used to guard every direct `device.*_sectors` call inside
+    /// this module so the W92 lock-held-across-yield regression cannot
+    /// silently return.
+    ///
+    /// Under `--features vfs-debug` the probe additionally panics so a
+    /// developer catches the regression at first occurrence rather than at
+    /// post-test inspection.  Without the feature the cost is one
+    /// uncontended `try_lock` per device call (a single atomic CAS).
+    #[inline(always)]
+    fn assert_inner_unlocked(&self, _site: &'static str) {
+        let held = self.inner.try_lock().is_none();
+        if held {
+            LOCK_HELD_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+            crate::serial_println!(
+                "[FAT32] BUG (W92): inner mutex held across device IO at {}", _site);
+            #[cfg(feature = "vfs-debug")]
+            panic!("FAT32 lock-held-across-IO at {}", _site);
+        }
+        // Note: `try_lock` returns a guard that is immediately dropped
+        // when `held == false`, so no lock is left acquired.
+    }
+
     /// Read bytes from the sparse sector cache at a given absolute byte offset.
     /// Loads sectors on demand from the block device.
+    ///
+    /// W92 lock discipline: prime every sector first via `ensure_sector`
+    /// (which drops the lock across device I/O), then acquire the lock once
+    /// and copy out.  If a sector was evicted between priming and copy-out,
+    /// the missing-sector branch re-primes that LBA and retries.
     fn cache_read(&self, offset: usize, len: usize) -> Result<Vec<u8>, VfsError> {
         if len == 0 {
             return Ok(Vec::new());
@@ -713,31 +844,46 @@ impl Fat32Fs {
         let first_sector = (offset / SECTOR_SIZE) as u64;
         let last_sector = ((offset + len - 1) / SECTOR_SIZE) as u64;
 
-        let mut inner = self.inner.lock();
+        // Phase 1: prime every needed sector with NO lock held.
         for lba in first_sector..=last_sector {
-            Self::ensure_sector(&mut inner, &*self.device, lba)?;
+            self.ensure_sector(lba)?;
         }
 
+        // Phase 2: acquire the lock and copy out.  An LBA that was evicted
+        // between the prime loop and now is re-primed inside the copy loop;
+        // we drop the lock for the re-prime call, then re-acquire.
         let mut result = Vec::with_capacity(len);
         let mut pos = offset;
         let mut remaining = len;
-        while remaining > 0 {
+        loop {
+            if remaining == 0 {
+                break;
+            }
             let sector_lba = (pos / SECTOR_SIZE) as u64;
             let sector_off = pos % SECTOR_SIZE;
             let avail = SECTOR_SIZE - sector_off;
             let to_copy = core::cmp::min(avail, remaining);
 
-            let sector_data = inner.sector_cache.get(&sector_lba).ok_or(VfsError::Io)?;
-            result.extend_from_slice(&sector_data[sector_off..sector_off + to_copy]);
-
-            pos += to_copy;
-            remaining -= to_copy;
+            {
+                let inner = self.inner.lock();
+                if let Some(sector_data) = inner.sector_cache.get(&sector_lba) {
+                    result.extend_from_slice(&sector_data[sector_off..sector_off + to_copy]);
+                    pos += to_copy;
+                    remaining -= to_copy;
+                    continue;
+                }
+            }
+            // Race: sector evicted between prime and copy.  Re-prime (lock
+            // is released around the device read) and retry.
+            self.ensure_sector(sector_lba)?;
         }
         Ok(result)
     }
 
     /// Write bytes into the sparse sector cache and mark sectors dirty.
     /// Loads sectors on demand so partial-sector writes are correct.
+    ///
+    /// W92 lock discipline: same pattern as [`Self::cache_read`].
     fn cache_write(&self, offset: usize, data: &[u8]) -> Result<(), VfsError> {
         if data.is_empty() {
             return Ok(());
@@ -745,26 +891,36 @@ impl Fat32Fs {
         let first_sector = (offset / SECTOR_SIZE) as u64;
         let last_sector = ((offset + data.len() - 1) / SECTOR_SIZE) as u64;
 
-        let mut inner = self.inner.lock();
+        // Phase 1: prime every needed sector with NO lock held.
         for lba in first_sector..=last_sector {
-            Self::ensure_sector(&mut inner, &*self.device, lba)?;
+            self.ensure_sector(lba)?;
         }
 
+        // Phase 2: acquire the lock and copy in.  Re-prime on eviction race.
         let mut written = 0usize;
         let mut pos = offset;
-        while written < data.len() {
+        loop {
+            if written >= data.len() {
+                break;
+            }
             let sector_lba = (pos / SECTOR_SIZE) as u64;
             let sector_off = pos % SECTOR_SIZE;
             let avail = SECTOR_SIZE - sector_off;
             let to_copy = core::cmp::min(avail, data.len() - written);
 
-            let sector_data = inner.sector_cache.get_mut(&sector_lba).ok_or(VfsError::Io)?;
-            sector_data[sector_off..sector_off + to_copy]
-                .copy_from_slice(&data[written..written + to_copy]);
-            inner.dirty.insert(sector_lba);
-
-            pos += to_copy;
-            written += to_copy;
+            {
+                let mut inner = self.inner.lock();
+                if let Some(sector_data) = inner.sector_cache.get_mut(&sector_lba) {
+                    sector_data[sector_off..sector_off + to_copy]
+                        .copy_from_slice(&data[written..written + to_copy]);
+                    inner.dirty.insert(sector_lba);
+                    pos += to_copy;
+                    written += to_copy;
+                    continue;
+                }
+            }
+            // Race: sector evicted between prime and write.  Re-prime.
+            self.ensure_sector(sector_lba)?;
         }
         Ok(())
     }
@@ -783,10 +939,14 @@ impl Fat32Fs {
 
     /// Write a FAT entry and update both the in-memory FAT vec and the
     /// sector cache bytes (for both FAT copies).
+    ///
+    /// W92 lock discipline: sectors are primed via `ensure_sector` BEFORE
+    /// the lock is taken, so device I/O never happens with `inner` held.
     fn fat_write(&self, cluster: u32, value: u32) {
-        let mut inner = self.inner.lock();
         let idx = cluster as usize;
-        if idx >= inner.fat.len() {
+
+        // Bounds-check under a brief lock.
+        if idx >= self.inner.lock().fat.len() {
             return;
         }
         let masked = value & FAT_ENTRY_MASK;
@@ -796,10 +956,31 @@ impl Fat32Fs {
         let sector_lba = (fat_byte_offset / SECTOR_SIZE) as u64;
         let sector_off = fat_byte_offset % SECTOR_SIZE;
 
-        // Ensure sector is cached.
-        let _ = Self::ensure_sector(&mut inner, &*self.device, sector_lba);
+        // Prime FAT #1 sector with NO lock held.
+        if self.ensure_sector(sector_lba).is_err() {
+            // Best-effort: continue so we at least update the in-memory FAT
+            // vec; a later read of this sector will see the original disk
+            // contents and the dirty bit won't fire, but that matches the
+            // prior best-effort semantics of this routine.
+        }
 
-        // Read old value to preserve upper 4 bits.
+        // Optionally prime FAT #2.
+        let fat2 = if self.bpb.num_fats >= 2 {
+            let fat2_byte_offset =
+                fat_byte_offset + (self.bpb.fat_size as usize) * SECTOR_SIZE;
+            let sector2_lba = (fat2_byte_offset / SECTOR_SIZE) as u64;
+            let sector2_off = fat2_byte_offset % SECTOR_SIZE;
+            let _ = self.ensure_sector(sector2_lba);
+            Some((sector2_lba, sector2_off))
+        } else {
+            None
+        };
+
+        // Now mutate the in-memory FAT vec and the cached sector bytes
+        // under the lock.  No device I/O happens below this point.
+        let mut inner = self.inner.lock();
+
+        // Read old FAT #1 sector value to preserve upper 4 bits.
         let old_val = if let Some(s) = inner.sector_cache.get(&sector_lba) {
             u32::from_le_bytes([s[sector_off], s[sector_off+1], s[sector_off+2], s[sector_off+3]])
         } else {
@@ -817,11 +998,7 @@ impl Fat32Fs {
         inner.dirty.insert(sector_lba);
 
         // Update FAT #2 (if present).
-        if self.bpb.num_fats >= 2 {
-            let fat2_byte_offset = fat_byte_offset + (self.bpb.fat_size as usize) * SECTOR_SIZE;
-            let sector2_lba = (fat2_byte_offset / SECTOR_SIZE) as u64;
-            let sector2_off = fat2_byte_offset % SECTOR_SIZE;
-            let _ = Self::ensure_sector(&mut inner, &*self.device, sector2_lba);
+        if let Some((sector2_lba, sector2_off)) = fat2 {
             if let Some(s) = inner.sector_cache.get_mut(&sector2_lba) {
                 s[sector2_off..sector2_off + 4].copy_from_slice(&new_bytes);
             }
@@ -906,6 +1083,10 @@ impl Fat32Fs {
     }
 
     /// Read all data from a cluster chain, loading sectors on demand.
+    ///
+    /// W92 lock discipline: every cluster's sectors are primed via
+    /// `ensure_sector` (which drops the lock for each device call) BEFORE
+    /// the lock is taken for the copy-out.
     fn read_chain(&self, start_cluster: u32, max_bytes: usize) -> Result<Vec<u8>, VfsError> {
         let chain = self.follow_chain(start_cluster);
         let cluster_size = self.bpb.cluster_size as usize;
@@ -915,31 +1096,43 @@ impl Fat32Fs {
             max_bytes,
         ));
 
-        let mut inner = self.inner.lock();
         for &cluster in &chain {
             if data.len() >= max_bytes {
                 break;
             }
             let first_sector = self.bpb.cluster_to_sector(cluster) as u64;
-            // Ensure all sectors of this cluster are cached.
+
+            // Phase 1: prime every sector of this cluster with NO lock held.
             for s in 0..spc {
-                Self::ensure_sector(&mut inner, &*self.device, first_sector + s)?;
+                self.ensure_sector(first_sector + s)?;
             }
 
             let remaining = max_bytes - data.len();
             let copy_len = core::cmp::min(cluster_size, remaining);
 
-            // Copy from cached sectors.
+            // Phase 2: copy from cached sectors under the lock.  Re-prime
+            // any sector that was evicted between phase 1 and phase 2.
             let mut copied = 0;
-            for s in 0..spc {
-                if copied >= copy_len {
-                    break;
-                }
+            let mut s = 0u64;
+            while s < spc && copied < copy_len {
                 let lba = first_sector + s;
-                let sector_data = inner.sector_cache.get(&lba).ok_or(VfsError::Io)?;
                 let to_copy = core::cmp::min(SECTOR_SIZE, copy_len - copied);
-                data.extend_from_slice(&sector_data[..to_copy]);
-                copied += to_copy;
+                let got = {
+                    let inner = self.inner.lock();
+                    if let Some(sector_data) = inner.sector_cache.get(&lba) {
+                        data.extend_from_slice(&sector_data[..to_copy]);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if got {
+                    copied += to_copy;
+                    s += 1;
+                } else {
+                    // Eviction race: re-prime and retry the same sector.
+                    self.ensure_sector(lba)?;
+                }
             }
         }
 
@@ -957,14 +1150,29 @@ impl Fat32Fs {
         let spc = self.bpb.sectors_per_cluster as u64;
 
         // Collect all directory data, ensuring sectors are cached on demand.
+        //
+        // W92 lock discipline: prime each sector with NO lock held, then
+        // acquire the lock briefly to copy out.  Re-prime if a sector is
+        // missing from the cache (eviction race).
         let mut dir_data = Vec::new();
-        {
-            let mut inner = self.inner.lock();
-            for &cluster in &chain {
-                let first_sector = self.bpb.cluster_to_sector(cluster) as u64;
-                for s in 0..spc {
-                    let lba = first_sector + s;
-                    Self::ensure_sector(&mut inner, &*self.device, lba)?;
+        for &cluster in &chain {
+            let first_sector = self.bpb.cluster_to_sector(cluster) as u64;
+            for s in 0..spc {
+                let lba = first_sector + s;
+                self.ensure_sector(lba)?;
+                let got = {
+                    let inner = self.inner.lock();
+                    if let Some(sector_data) = inner.sector_cache.get(&lba) {
+                        dir_data.extend_from_slice(sector_data);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !got {
+                    // Re-prime and retry once.
+                    self.ensure_sector(lba)?;
+                    let inner = self.inner.lock();
                     if let Some(sector_data) = inner.sector_cache.get(&lba) {
                         dir_data.extend_from_slice(sector_data);
                     }
@@ -1107,22 +1315,31 @@ impl Fat32Fs {
         let sector_lba = (off / SECTOR_SIZE) as u64;
         let sector_off = off % SECTOR_SIZE;
 
-        let mut inner = self.inner.lock();
-        Self::ensure_sector(&mut inner, &*self.device, sector_lba)?;
-
-        let sector_data = inner.sector_cache.get_mut(&sector_lba).ok_or(VfsError::Io)?;
-        // Update first cluster high (bytes 20-21).
-        let cluster_hi = ((node.first_cluster >> 16) & 0xFFFF) as u16;
-        sector_data[sector_off + 20..sector_off + 22].copy_from_slice(&cluster_hi.to_le_bytes());
-        // Update first cluster low (bytes 26-27).
-        let cluster_lo = (node.first_cluster & 0xFFFF) as u16;
-        sector_data[sector_off + 26..sector_off + 28].copy_from_slice(&cluster_lo.to_le_bytes());
-        // Update file size (bytes 28-31).
-        let size = node.size as u32;
-        sector_data[sector_off + 28..sector_off + 32].copy_from_slice(&size.to_le_bytes());
-
-        inner.dirty.insert(sector_lba);
-        Ok(())
+        // W92 lock discipline: prime FIRST (drops the lock around device
+        // I/O), then mutate under the lock.  Retry the mutation if the
+        // sector was evicted between prime and mutate.
+        loop {
+            self.ensure_sector(sector_lba)?;
+            let mut inner = self.inner.lock();
+            let sector_data = match inner.sector_cache.get_mut(&sector_lba) {
+                Some(s) => s,
+                None => continue, // eviction race — re-prime
+            };
+            // Update first cluster high (bytes 20-21).
+            let cluster_hi = ((node.first_cluster >> 16) & 0xFFFF) as u16;
+            sector_data[sector_off + 20..sector_off + 22]
+                .copy_from_slice(&cluster_hi.to_le_bytes());
+            // Update first cluster low (bytes 26-27).
+            let cluster_lo = (node.first_cluster & 0xFFFF) as u16;
+            sector_data[sector_off + 26..sector_off + 28]
+                .copy_from_slice(&cluster_lo.to_le_bytes());
+            // Update file size (bytes 28-31).
+            let size = node.size as u32;
+            sector_data[sector_off + 28..sector_off + 32]
+                .copy_from_slice(&size.to_le_bytes());
+            inner.dirty.insert(sector_lba);
+            return Ok(());
+        }
     }
 
     /// Make an 8.3 short name from a user-supplied filename.
@@ -1160,26 +1377,31 @@ impl Fat32Fs {
         let spc = self.bpb.sectors_per_cluster as u64;
 
         // Scan existing clusters for a free or end-of-directory slot.
-        {
-            let mut inner = self.inner.lock();
-            for &cluster in &chain {
-                let first_sector = self.bpb.cluster_to_sector(cluster) as u64;
-                for s in 0..spc {
-                    let lba = first_sector + s;
-                    Self::ensure_sector(&mut inner, &*self.device, lba)?;
-                }
+        //
+        // W92 lock discipline: prime each sector with NO lock held, then
+        // peek under the lock.  We do not hold the lock across `ensure_sector`.
+        for &cluster in &chain {
+            let first_sector = self.bpb.cluster_to_sector(cluster) as u64;
+            for s in 0..spc {
+                self.ensure_sector(first_sector + s)?;
+            }
 
-                let base = (first_sector as usize) * SECTOR_SIZE;
-                let entries_per_cluster = cluster_size / DIR_ENTRY_SIZE;
-                for e in 0..entries_per_cluster {
-                    let off = base + e * DIR_ENTRY_SIZE;
-                    let entry_sector = (off / SECTOR_SIZE) as u64;
-                    let entry_offset = off % SECTOR_SIZE;
-                    if let Some(sector_data) = inner.sector_cache.get(&entry_sector) {
-                        let first = sector_data[entry_offset];
-                        if first == 0x00 || first == 0xE5 {
-                            return Ok(off);
-                        }
+            let base = (first_sector as usize) * SECTOR_SIZE;
+            let entries_per_cluster = cluster_size / DIR_ENTRY_SIZE;
+            for e in 0..entries_per_cluster {
+                let off = base + e * DIR_ENTRY_SIZE;
+                let entry_sector = (off / SECTOR_SIZE) as u64;
+                let entry_offset = off % SECTOR_SIZE;
+                // Peek under a brief lock.  If the sector was evicted, the
+                // outer caller will re-encounter the slot on a later scan.
+                let found = {
+                    let inner = self.inner.lock();
+                    inner.sector_cache.get(&entry_sector)
+                        .map(|sd| sd[entry_offset])
+                };
+                if let Some(first) = found {
+                    if first == 0x00 || first == 0xE5 {
+                        return Ok(off);
                     }
                 }
             }
@@ -1249,31 +1471,35 @@ impl Fat32Fs {
             (count, lowest.unwrap_or(0xFFFFFFFF))
         };
 
-        let mut inner = self.inner.lock();
-        Self::ensure_sector(&mut inner, &*self.device, lba)?;
-        let sector = match inner.sector_cache.get_mut(&lba) {
-            Some(s) => s,
-            None => return Ok(()),
-        };
+        // W92 lock discipline: prime with NO lock held, then mutate.
+        // Retry on eviction race.
+        loop {
+            self.ensure_sector(lba)?;
+            let mut inner = self.inner.lock();
+            let sector = match inner.sector_cache.get_mut(&lba) {
+                Some(s) => s,
+                None => continue, // eviction race — re-prime
+            };
 
-        // Validate FSInfo signatures. Misplaced/wrong FSInfo pointer is a
-        // real-world BPB bug — don't stomp on a non-FSInfo sector.
-        let sig1 = u32::from_le_bytes([sector[0], sector[1], sector[2], sector[3]]);
-        let sig2 = u32::from_le_bytes([sector[484], sector[485], sector[486], sector[487]]);
-        let sig3 = u32::from_le_bytes([sector[508], sector[509], sector[510], sector[511]]);
-        if sig1 != 0x41615252 || sig2 != 0x61417272 || sig3 != 0xAA550000 {
-            crate::serial_println!(
-                "[FAT32] FSInfo sector {} signatures invalid ({:#x}/{:#x}/{:#x}); \
-                 skipping update", lba, sig1, sig2, sig3);
+            // Validate FSInfo signatures. Misplaced/wrong FSInfo pointer is a
+            // real-world BPB bug — don't stomp on a non-FSInfo sector.
+            let sig1 = u32::from_le_bytes([sector[0], sector[1], sector[2], sector[3]]);
+            let sig2 = u32::from_le_bytes([sector[484], sector[485], sector[486], sector[487]]);
+            let sig3 = u32::from_le_bytes([sector[508], sector[509], sector[510], sector[511]]);
+            if sig1 != 0x41615252 || sig2 != 0x61417272 || sig3 != 0xAA550000 {
+                crate::serial_println!(
+                    "[FAT32] FSInfo sector {} signatures invalid ({:#x}/{:#x}/{:#x}); \
+                     skipping update", lba, sig1, sig2, sig3);
+                return Ok(());
+            }
+
+            // Free-cluster count at offset 488 (4 bytes LE).
+            sector[488..492].copy_from_slice(&free_count.to_le_bytes());
+            // Next-free-cluster hint at offset 492 (4 bytes LE).
+            sector[492..496].copy_from_slice(&next_free_hint.to_le_bytes());
+            inner.dirty.insert(lba);
             return Ok(());
         }
-
-        // Free-cluster count at offset 488 (4 bytes LE).
-        sector[488..492].copy_from_slice(&free_count.to_le_bytes());
-        // Next-free-cluster hint at offset 492 (4 bytes LE).
-        sector[492..496].copy_from_slice(&next_free_hint.to_le_bytes());
-        inner.dirty.insert(lba);
-        Ok(())
     }
 
     /// Flush all dirty sectors from cache to the underlying block device.
@@ -1309,6 +1535,8 @@ impl Fat32Fs {
                     }
                 }
             };
+            // W92: device write happens with the inner lock dropped.
+            Self::assert_inner_unlocked(self, "do_sync::write_sectors");
             self.device.write_sectors(lba, 1, &data).map_err(|_| VfsError::Io)?;
         }
 
@@ -1485,33 +1713,44 @@ impl FileSystemOps for Fat32Fs {
         // LFN entries (attr byte 11 == 0x0F) as deleted. Otherwise orphaned
         // LFN entries re-associate with the next short-name entry on the next
         // scan, producing ghost filenames (FAT32-5).
+        //
+        // W92 lock discipline: each sector is primed via `ensure_sector`
+        // (which drops the lock around device I/O) BEFORE the mutation
+        // under the lock.
+        let off = node.dir_entry_offset;
+        let sector_lba = (off / SECTOR_SIZE) as u64;
+        let sector_off = off % SECTOR_SIZE;
+        let _ = self.ensure_sector(sector_lba);
         {
             let mut inner = self.inner.lock();
-            let off = node.dir_entry_offset;
-            let sector_lba = (off / SECTOR_SIZE) as u64;
-            let sector_off = off % SECTOR_SIZE;
-            let _ = Self::ensure_sector(&mut inner, &*self.device, sector_lba);
             if let Some(sector_data) = inner.sector_cache.get_mut(&sector_lba) {
                 sector_data[sector_off] = 0xE5;
                 inner.dirty.insert(sector_lba);
             }
+        }
 
-            // FAT32-5: scan backwards 32 bytes at a time, crossing cluster
-            // boundaries along the parent directory's chain. Stop at the
-            // first non-LFN entry or when we run out of chain.
-            let mut cur_off = off;
-            loop {
-                // Step back 32 bytes, handling cluster-boundary wrap-around.
-                let new_off_opt = prev_dir_slot(cur_off, &dir_chain, &self.bpb, cluster_size);
-                let prev_off = match new_off_opt {
-                    Some(v) => v,
-                    None => break, // at the very start of the directory chain
-                };
-                let prev_lba = (prev_off / SECTOR_SIZE) as u64;
-                let prev_in  = prev_off % SECTOR_SIZE;
-                if Self::ensure_sector(&mut inner, &*self.device, prev_lba).is_err() {
-                    break;
-                }
+        // FAT32-5: scan backwards 32 bytes at a time, crossing cluster
+        // boundaries along the parent directory's chain. Stop at the
+        // first non-LFN entry or when we run out of chain.
+        let mut cur_off = off;
+        loop {
+            // Step back 32 bytes, handling cluster-boundary wrap-around.
+            let new_off_opt = prev_dir_slot(cur_off, &dir_chain, &self.bpb, cluster_size);
+            let prev_off = match new_off_opt {
+                Some(v) => v,
+                None => break, // at the very start of the directory chain
+            };
+            let prev_lba = (prev_off / SECTOR_SIZE) as u64;
+            let prev_in  = prev_off % SECTOR_SIZE;
+
+            // Prime sector with NO lock held.
+            if self.ensure_sector(prev_lba).is_err() {
+                break;
+            }
+
+            // Inspect + mutate under a brief lock.
+            let advanced = {
+                let mut inner = self.inner.lock();
                 let is_lfn = if let Some(s) = inner.sector_cache.get(&prev_lba) {
                     // Don't reap already-deleted (0xE5) entries as LFN —
                     // they belonged to a prior short-name entry's LFN run.
@@ -1520,16 +1759,24 @@ impl FileSystemOps for Fat32Fs {
                     false
                 };
                 if !is_lfn {
-                    break;
+                    false
+                } else {
+                    if let Some(s) = inner.sector_cache.get_mut(&prev_lba) {
+                        s[prev_in] = 0xE5;
+                        inner.dirty.insert(prev_lba);
+                    }
+                    true
                 }
-                if let Some(s) = inner.sector_cache.get_mut(&prev_lba) {
-                    s[prev_in] = 0xE5;
-                    inner.dirty.insert(prev_lba);
-                }
-                cur_off = prev_off;
+            };
+            if !advanced {
+                break;
             }
+            cur_off = prev_off;
+        }
 
-            // Remove node from in-memory list.
+        // Remove node from in-memory list.
+        {
+            let mut inner = self.inner.lock();
             inner.nodes.retain(|n| n.inode != node.inode);
 
             // If we just removed a directory, its cluster is freed and may
@@ -1678,7 +1925,11 @@ impl FileSystemOps for Fat32Fs {
             // multi-sector block-device call.  The kernel heap is one
             // physically contiguous range so the virtio descriptor sees one
             // contiguous segment regardless of run size.
+            //
+            // W92: device I/O happens with NO inner lock held — the
+            // chain snapshot above released the lock before this call.
             let mut run_buf: alloc::vec::Vec<u8> = alloc::vec![0u8; run_sectors * SECTOR_SIZE];
+            Self::assert_inner_unlocked(self, "read::read_sectors");
             self.device
                 .read_sectors(first_sector, run_sectors as u32, &mut run_buf)
                 .map_err(|_| VfsError::Io)?;
