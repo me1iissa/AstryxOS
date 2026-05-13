@@ -353,38 +353,60 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
             if error_code & 16 != 0 { "IFETCH" } else { "" },
         );
 
-        // Dump user GPRs saved on the ISR stack (below the InterruptFrame).
-        // The isr_with_error stub pushes: rax,rbx,rcx,rdx,rsi,rdi,r8,r9,r10,r11,r12,r13,r14,r15,rbp
-        // in that order (rax first at highest address / last pushed).
-        // The saved regs are BELOW frame (lower addresses) since the CPU pushed error+frame
-        // THEN the stub pushed caller-saved regs.
-        #[cfg(feature = "firefox-test")]
+        // Dump all 16 user GPRs saved on the ISR stack (below the InterruptFrame).
+        //
+        // isr_with_error push order (see macro comment for full layout):
+        //   rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11, rbx, rbp, r12, r13, r14, r15
+        // frame[-1]=error_code, frame[-2]=rax, ..., frame[-16]=r15
         if error_code & 4 != 0 {
-            // Read saved GPRs from the ISR stack.  Layout below frame:
-            //   [frame-8]   = error_code (pushed by CPU)
-            //   [frame-16]  = rax
-            //   [frame-24]  = rbx
-            //   [frame-32]  = rcx
-            //   [frame-40]  = rdx
-            //   [frame-48]  = rsi
-            //   [frame-56]  = rdi
-            //   [frame-64]  = r8  ... etc
-            // ISR stub push order: rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11
-            // frame[-1]=error_code, frame[-2]=rax, frame[-3]=rcx, frame[-4]=rdx,
-            // frame[-5]=rsi, frame[-6]=rdi, frame[-7]=r8, frame[-8]=r9, frame[-9]=r10, frame[-10]=r11
             let base = frame as *const InterruptFrame as *const u64;
-            unsafe {
+            let (rax, rcx, rdx, rsi, rdi, r8,
+                 r9,  r10, r11, rbx, rbp, r12, r13, r14, r15,
+                 fs_base, gs_base) = unsafe {
                 let rax = *base.sub(2);
                 let rcx = *base.sub(3);
                 let rdx = *base.sub(4);
                 let rsi = *base.sub(5);
                 let rdi = *base.sub(6);
                 let r8  = *base.sub(7);
-                crate::serial_println!(
-                    "  User GPRs: RAX={:#x} RCX={:#x} RDX={:#x} RSI={:#x} RDI={:#x} R8={:#x}",
-                    rax, rcx, rdx, rsi, rdi, r8
-                );
-            }
+                let r9  = *base.sub(8);
+                let r10 = *base.sub(9);
+                let r11 = *base.sub(10);
+                let rbx = *base.sub(11);
+                let rbp = *base.sub(12);
+                let r12 = *base.sub(13);
+                let r13 = *base.sub(14);
+                let r14 = *base.sub(15);
+                let r15 = *base.sub(16);
+                // FS.base (IA32_FS_BASE, MSR 0xC000_0100) — used for TLS base
+                // Intel SDM Vol 3A §10.6: RDMSR is safe at CPL 0.
+                let fs_base = crate::hal::rdmsr(0xC000_0100);
+                // GS.base (IA32_GS_BASE, MSR 0xC000_0101) — used for per-CPU/TLS
+                let gs_base = crate::hal::rdmsr(0xC000_0101);
+                (rax, rcx, rdx, rsi, rdi, r8,
+                 r9, r10, r11, rbx, rbp, r12, r13, r14, r15,
+                 fs_base, gs_base)
+            };
+            crate::serial_println!(
+                "[#PF/regs] rax={:#018x} rcx={:#018x} rdx={:#018x} rsi={:#018x}",
+                rax, rcx, rdx, rsi
+            );
+            crate::serial_println!(
+                "[#PF/regs] rdi={:#018x} r8 ={:#018x} r9 ={:#018x} r10={:#018x}",
+                rdi, r8, r9, r10
+            );
+            crate::serial_println!(
+                "[#PF/regs] r11={:#018x} rbx={:#018x} rbp={:#018x} r12={:#018x}",
+                r11, rbx, rbp, r12
+            );
+            crate::serial_println!(
+                "[#PF/regs] r13={:#018x} r14={:#018x} r15={:#018x}",
+                r13, r14, r15
+            );
+            crate::serial_println!(
+                "[#PF/regs] fs_base={:#018x} gs_base={:#018x}",
+                fs_base, gs_base
+            );
         }
 
         // If the fault came from Ring 3, try to deliver SIGSEGV first.
@@ -490,22 +512,42 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
 
     // If the fault came from Ring 3, kill the process instead of halting
     if frame.cs & 3 == 3 {
-        // Print saved GPRs from ISR stack for debugging.
-        // ISR stub pushes: rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11, then error_code, then IRETQ frame.
-        // frame points to IRETQ frame. Saved regs are below: frame-8=err, frame-16=rax, frame-24=rcx, ...
-        let fp = frame as *const InterruptFrame as u64;
-        let (rax, rcx, rdx, rsi, rdi, r8) = unsafe {
+        // Print all 16 saved GPRs from ISR stack for debugging.
+        // See isr_with_error / isr_no_error macro comments for the full stack layout.
+        // frame[-1]=error_code, frame[-2]=rax, ..., frame[-16]=r15
+        let base = frame as *const InterruptFrame as *const u64;
+        let (rax, rcx, rdx, rsi, rdi, r8,
+             r9, r10, r11, rbx, rbp, r12, r13, r14, r15) = unsafe {
             (
-                *((fp - 16) as *const u64),  // RAX
-                *((fp - 24) as *const u64),  // RCX
-                *((fp - 32) as *const u64),  // RDX
-                *((fp - 40) as *const u64),  // RSI
-                *((fp - 48) as *const u64),  // RDI
-                *((fp - 56) as *const u64),  // R8
+                *base.sub(2),   // RAX
+                *base.sub(3),   // RCX
+                *base.sub(4),   // RDX
+                *base.sub(5),   // RSI
+                *base.sub(6),   // RDI
+                *base.sub(7),   // R8
+                *base.sub(8),   // R9
+                *base.sub(9),   // R10
+                *base.sub(10),  // R11
+                *base.sub(11),  // RBX
+                *base.sub(12),  // RBP
+                *base.sub(13),  // R12
+                *base.sub(14),  // R13
+                *base.sub(15),  // R14
+                *base.sub(16),  // R15
             )
         };
-        crate::serial_println!("  User GPRs: RAX={:#x} RCX={:#x} RDX={:#x} RSI={:#x} RDI={:#x} R8={:#x}",
-            rax, rcx, rdx, rsi, rdi, r8);
+        crate::serial_println!(
+            "  [exc/regs] rax={:#018x} rcx={:#018x} rdx={:#018x} rsi={:#018x}",
+            rax, rcx, rdx, rsi);
+        crate::serial_println!(
+            "  [exc/regs] rdi={:#018x} r8 ={:#018x} r9 ={:#018x} r10={:#018x}",
+            rdi, r8, r9, r10);
+        crate::serial_println!(
+            "  [exc/regs] r11={:#018x} rbx={:#018x} rbp={:#018x} r12={:#018x}",
+            r11, rbx, rbp, r12);
+        crate::serial_println!(
+            "  [exc/regs] r13={:#018x} r14={:#018x} r15={:#018x}",
+            r13, r14, r15);
         crate::serial_println!("  Killing user process (exception in Ring 3)");
         // POSIX signal(7): synchronous fatal CPU exceptions in user mode
         // (#DE → SIGFPE, #UD → SIGILL, #DF / #SS / #GP / #AC / #MC → SIGBUS|SIGSEGV)
@@ -1195,14 +1237,53 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
     false
 }
 
-// ISR stub macro — creates a naked function that pushes state and calls exception_handler
+// ISR stub macro — creates a naked function that pushes state and calls exception_handler.
+//
+// Stack layout on entry to exception_handler (addresses increase upward):
+//
+//   [rsp+0]   r15   ← last pushed (lowest addr)
+//   [rsp+8]   r14
+//   [rsp+16]  r13
+//   [rsp+24]  r12
+//   [rsp+32]  rbp
+//   [rsp+40]  rbx
+//   [rsp+48]  r11
+//   [rsp+56]  r10
+//   [rsp+64]  r9
+//   [rsp+72]  r8
+//   [rsp+80]  rdi
+//   [rsp+88]  rsi
+//   [rsp+96]  rdx
+//   [rsp+104] rcx
+//   [rsp+112] rax   ← first pushed (highest addr before InterruptFrame)
+//   [rsp+120] error_code (real for isr_with_error, 0 for isr_no_error)
+//   [rsp+128] InterruptFrame { rip, cs, rflags, rsp, ss }  ← rdx arg to handler
+//
+// Equivalently, from an `InterruptFrame*` pointer `frame`:
+//   frame[-1] = error_code
+//   frame[-2] = rax
+//   frame[-3] = rcx
+//   frame[-4] = rdx
+//   frame[-5] = rsi
+//   frame[-6] = rdi
+//   frame[-7] = r8
+//   frame[-8] = r9
+//   frame[-9] = r10
+//   frame[-10]= r11
+//   frame[-11]= rbx
+//   frame[-12]= rbp
+//   frame[-13]= r12
+//   frame[-14]= r13
+//   frame[-15]= r14
+//   frame[-16]= r15
 macro_rules! isr_no_error {
     ($name:ident, $vector:expr) => {
         #[unsafe(naked)]
         extern "C" fn $name() {
-            // Naked ISR stub. Saves registers, pushes vector/error code, calls handler.
+            // Naked ISR stub. Saves all GPRs, calls handler, restores, irets.
             core::arch::naked_asm!(
                 "push 0",           // Fake error code
+                // caller-saved (scratch) registers
                 "push rax",
                 "push rcx",
                 "push rdx",
@@ -1212,10 +1293,23 @@ macro_rules! isr_no_error {
                 "push r9",
                 "push r10",
                 "push r11",
-                "mov rdi, {vector}", // arg1: vector
-                "mov rsi, 0",        // arg2: error code (0)
-                "lea rdx, [rsp + 80]", // arg3: pointer to InterruptFrame
+                // callee-saved registers (needed for full GPR dump)
+                "push rbx",
+                "push rbp",
+                "push r12",
+                "push r13",
+                "push r14",
+                "push r15",
+                "mov rdi, {vector}",   // arg1: vector
+                "mov rsi, 0",          // arg2: error code (0)
+                "lea rdx, [rsp + 128]", // arg3: pointer to InterruptFrame
                 "call {handler}",
+                "pop r15",
+                "pop r14",
+                "pop r13",
+                "pop r12",
+                "pop rbp",
+                "pop rbx",
                 "pop r11",
                 "pop r10",
                 "pop r9",
@@ -1241,6 +1335,7 @@ macro_rules! isr_with_error {
             // Naked ISR stub for exceptions that push an error code.
             core::arch::naked_asm!(
                 // Error code already on stack from CPU
+                // caller-saved (scratch) registers
                 "push rax",
                 "push rcx",
                 "push rdx",
@@ -1250,10 +1345,23 @@ macro_rules! isr_with_error {
                 "push r9",
                 "push r10",
                 "push r11",
-                "mov rdi, {vector}", // arg1: vector
-                "mov rsi, [rsp + 72]", // arg2: error code (at offset)
-                "lea rdx, [rsp + 80]", // arg3: pointer to InterruptFrame
+                // callee-saved registers (needed for full GPR dump)
+                "push rbx",
+                "push rbp",
+                "push r12",
+                "push r13",
+                "push r14",
+                "push r15",
+                "mov rdi, {vector}",    // arg1: vector
+                "mov rsi, [rsp + 120]", // arg2: error code (rax×8 + callee×6 = 15×8 = 120 above rsp)
+                "lea rdx, [rsp + 128]", // arg3: pointer to InterruptFrame (15 regs + error = 128)
                 "call {handler}",
+                "pop r15",
+                "pop r14",
+                "pop r13",
+                "pop r12",
+                "pop rbp",
+                "pop rbx",
                 "pop r11",
                 "pop r10",
                 "pop r9",
