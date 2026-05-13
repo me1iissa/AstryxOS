@@ -716,17 +716,40 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
 
     let pid = crate::proc::current_pid_lockless();
 
-    // Check if the current process has a VmSpace (user-mode caller).
-    // If not, fall back to creating a new process (kernel-mode caller).
-    let has_vm_space = {
+    // Classify the caller into one of three execve(2) dispatch cases:
+    //
+    //   (A) Kernel-mode caller — no user address space at all.  We synthesise
+    //       a fresh user process from the ELF (legacy path).  Identified by:
+    //       `vm_space.is_none() && (cr3 == 0 || cr3 == kernel_cr3)`.
+    //
+    //   (B) User-mode caller that owns its own VmSpace.  Standard execve(2):
+    //       build a new VmSpace, swap it in, free the old.  Identified by:
+    //       `vm_space.is_some()`.
+    //
+    //   (C) User-mode caller in a shared-VM state — the canonical
+    //       `posix_spawn(3) / vfork(2)` shape after `fork_process_share_vm`:
+    //       no owned VmSpace but a user CR3 inherited from the parent.  We
+    //       build a fresh VmSpace, install it, switch CR3 — but we MUST NOT
+    //       free the old CR3 (it belongs to the parent and is still in use).
+    //       Identified by: `vm_space.is_none() && cr3 != kernel_cr3 && cr3 != 0`.
+    //
+    // Per POSIX `posix_spawn(3)` and `vfork(2)`, the parent unblocks the
+    // moment the child successfully installs a new image — case (C) calls
+    // `wake_vfork_parent()` once the new CR3 is loaded, closing the
+    // parent-unblock latency from the 500-tick safety timeout to a few µs.
+    let kernel_cr3 = crate::mm::vmm::get_kernel_cr3();
+    let (has_vm_space, proc_cr3) = {
         let procs = crate::proc::PROCESS_TABLE.lock();
-        procs.iter().find(|p| p.pid == pid)
-            .map(|p| p.vm_space.is_some())
-            .unwrap_or(false)
+        match procs.iter().find(|p| p.pid == pid) {
+            Some(p) => (p.vm_space.is_some(), p.cr3),
+            None    => (false, 0),
+        }
     };
+    let is_shared_vm_child =
+        !has_vm_space && proc_cr3 != 0 && proc_cr3 != kernel_cr3;
 
-    if !has_vm_space {
-        // Kernel caller — create a new user process (legacy path).
+    if !has_vm_space && !is_shared_vm_child {
+        // (A) Kernel caller — create a new user process (legacy path).
         match crate::proc::usermode::create_user_process_with_args(path, &elf_data, argv_slice, envp_slice) {
             Ok(new_pid) => {
                 // ELFs loaded from disk use the Linux syscall ABI.
@@ -748,6 +771,18 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
     }
 
     // ── User-mode exec: replace the current process image ──────────
+    // Both (B) and (C) share most of the replace-image work.  The only
+    // difference is the post-condition handling of the old address space:
+    //   (B): `old_vm_space = Some(_)` → must be freed.
+    //   (C): `old_vm_space = None`    → nothing to free; parent retains its
+    //        page tables.  We log the shared-VM exec so the timeline of a
+    //        posix_spawn cycle is greppable.
+    if is_shared_vm_child {
+        crate::serial_println!(
+            "[SYSCALL] exec: shared-VM child PID {} cr3={:#x} → installing fresh VmSpace",
+            pid, proc_cr3,
+        );
+    }
 
     // 1. Create a fresh address space and load the new ELF into it.
     let mut new_vm_space = match crate::mm::vma::VmSpace::new_user() {
@@ -791,8 +826,11 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
         if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
             // Swap in the new address space.
             p.cr3 = new_cr3;
-            // mem::replace gives us the old VmSpace (may be None for kernel
-            // processes, but we already checked has_vm_space above).
+            // Option::replace returns the prior value:
+            //   (B) `Some(old)` — the previous private VmSpace, must be freed.
+            //   (C) `None`      — the shared-VM child case: there was nothing
+            //                     here, and the parent still owns its own
+            //                     `vm_space` + `cr3`.  We must NOT touch those.
             extracted = p.vm_space.replace(new_vm_space);
             // ELFs loaded from disk use the Linux syscall ABI.
             p.linux_abi = true;
@@ -827,6 +865,11 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
     //     structures (PT/PD/PDPT/PML4) back to the PMM.
     //     This is safe: we hold no locks, the new CR3 is active, and the old
     //     VmSpace is local (not referenced by any other thread or CPU).
+    //
+    //     For Case (C) — shared-VM child — `old_vm_space` is None.  The
+    //     parent still owns the page tables we were borrowing, and the
+    //     `if let` arm is skipped: we do NOT free anything.  This is the
+    //     invariant that keeps vfork(2)/posix_spawn(3) safe.
     if let Some(old_space) = old_vm_space {
         crate::proc::free_vm_space(old_space);
     }
@@ -836,6 +879,17 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
         crate::arch::x86_64::gdt::update_tss_rsp0(kstack_top);
         set_kernel_rsp(kstack_top);
     }
+
+    // 5b. vfork completion: wake the blocked parent NOW.  The new mm is
+    //     installed, the old one is reclaimed, the CR3 is loaded, and the
+    //     kernel stack is rebound to TSS — the child is fully ready to run
+    //     the new image even before we finish patching the syscall return
+    //     frame below.  Waking here closes the parent-unblock latency to
+    //     a few µs (vs the 500-tick safety timeout that previously masked
+    //     this).  Per `vfork(2)` and the POSIX `posix_spawn(3)` contract,
+    //     the parent must unblock when the child successfully installs a
+    //     new image — reaching this point in execve(2) is that moment.
+    wake_vfork_parent();
 
     // 6. Modify the syscall return frame on the kernel stack so that when
     //    we return through syscall_entry's epilogue, SYSRETQ jumps to the
@@ -864,9 +918,7 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
 
     crate::serial_println!("[SYSCALL] exec: process image replaced, returning to new entry");
 
-    // vfork completion: if this is a vfork child, wake the blocked parent.
-    // Linux: mm_release() → complete_vfork_done() in fs/exec.c:1459.
-    wake_vfork_parent();
+    // (vfork wake already happened in step 5b above — see comment there.)
 
     // Return 0 — dispatch puts this in RAX. When syscall_entry does SYSRETQ,
     // it restores the modified frame and jumps to the new entry point.

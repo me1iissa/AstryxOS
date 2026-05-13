@@ -437,6 +437,14 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
 /// falls through to the exit hooks (ring::end(), [SC-RET]) rather than
 /// bypassing them.
 fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, arg6: u64) -> i64 {
+    // Linux UAPI clone(2)/clone3(2) flag bits.  Hoisted to function scope so
+    // the clone / clone3 / fork-style branches share a single source of truth
+    // instead of redeclaring them in every match arm.  Values per
+    // `include/uapi/linux/sched.h`.
+    const CLONE_SIGHAND:       u64 = 0x00000800;
+    const CLONE_VFORK:         u64 = 0x00004000;
+    const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
+
     match num {
         // 0: read(fd, buf, count)
         0 => sys_read_linux(arg1, arg2, arg3),
@@ -1422,49 +1430,42 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     None => -11, // EAGAIN
                 }
             } else if flags & (CLONE_VM as u64) != 0 {
-                // CLONE_VM without CLONE_THREAD = vfork-style.
-                // CLONE_VM means SHARED address space — the child runs in the
-                // parent's memory. This is how glibc implements vfork():
+                // CLONE_VM without CLONE_THREAD = vfork-/posix_spawn-style.
+                // CLONE_VM means SHARED address space per clone(2): the child
+                // runs in the parent's memory.  glibc uses this for vfork():
                 //   clone(CLONE_VM | CLONE_VFORK | SIGCHLD)
-                // The child shares the parent's page tables and must only call
-                // execve() or _exit(). execve() replaces the child with a new
-                // process; _exit() kills the child. Either way, the parent
-                // unblocks when the child signals completion.
-                //
-                // Implementation: create a new thread in the SAME process
-                // (shared address space via same PID) that returns to the
-                // clone() return point with RAX=0. This is identical to
-                // CLONE_THREAD but without the TID-sharing semantics.
-                const CLONE_VFORK: u64 = 0x00004000;
+                // and for the posix_spawn(3) fast-path.  The child must only
+                // call execve(2) or _exit(2); intermediate writes to shared
+                // memory (e.g. `args.err = errno`) are observable to the parent.
                 let is_vfork = flags & CLONE_VFORK != 0;
                 let parent_tid = crate::proc::current_tid();
                 let pid = crate::proc::current_pid_lockless();
                 crate::serial_println!("[VFORK] pid={} flags={:#x} vfork={} parent_tid={} new_stack={:#x} tls={:#x}",
                     pid, flags, is_vfork, parent_tid, new_stack, tls);
 
-                // Create a child process via CoW fork. Although CLONE_VM means
-                // "shared address space", Firefox uses this for content processes
-                // that run Firefox code (not exec a different binary). CoW fork
-                // gives the child its own stack (avoiding "stack smashing detected"
-                // from shared-stack vfork). The parent is NOT blocked (no deadlock).
+                // Share the parent's CR3 directly (no copy-on-write).  The
+                // child gets its own kernel stack but uses the parent's user
+                // address space until execve(2) installs a new one.
                 let parent_regs = crate::syscall::read_fork_user_regs();
                 let child_tidptr = arg4; // r10 = ctid
-                match crate::proc::fork_process(pid, parent_tid, &parent_regs) {
+                match crate::proc::fork_process_share_vm(pid, parent_tid, &parent_regs) {
                     Some((child_pid, child_tid)) => {
-                        crate::serial_println!("[VFORK] child PID {} TID {} created", child_pid, child_tid);
+                        crate::serial_println!("[VFORK] child PID {} TID {} created (shared VM)", child_pid, child_tid);
 
-                        // Override child's user RSP to the new_stack provided by glibc.
-                        // glibc's __clone placed fn/arg on this stack before the syscall.
-                        // The child will `pop rax; pop rdi; call *rax` on this stack.
-                        // Override child's RSP to use the new_stack provided to clone().
-                        // SandboxLaunch/glibc placed fn/arg on this stack before syscall.
-                        // The child goes through glibc's clone child path:
-                        //   test rax,rax; je .child; .child: pop rax; pop rdi; call *rax
-                        // where rax = the function that sets up sandbox + calls execve.
-                        // Keep the user_entry_rip = user_rip+7 and user_entry_rsp = parent's RSP
-                        // as set by fork_process. The child returns from clone() on the parent's
-                        // stack, skipping glibc's child path (pop/call), and the caller checks
-                        // pid==0 to call execve.
+                        // If glibc passed a `new_stack`, switch the child to it.
+                        // glibc's __clone wrapper placed fn/arg on this stack
+                        // before the syscall (Linux clone(2) ABI).  Without
+                        // CLONE_VFORK the child returns from __clone's child
+                        // path (pop fn; call *fn) using new_stack.  With
+                        // CLONE_VFORK glibc's vfork() shim passes new_stack=0
+                        // so the child shares the parent's user stack (correct
+                        // vfork semantics — parent is suspended).
+                        if new_stack != 0 {
+                            let mut threads = crate::proc::THREAD_TABLE.lock();
+                            if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
+                                t.user_entry_rsp = new_stack;
+                            }
+                        }
 
                         // Unblock the child so the scheduler can run it.
                         crate::proc::unblock_process(child_pid);
@@ -2073,7 +2074,12 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     None => -11, // EAGAIN
                 }
             } else if clone_flags & CLONE_VM != 0 {
-                // CLONE_VM without CLONE_THREAD via clone3 = vfork-style.
+                // CLONE_VM without CLONE_THREAD via clone3 = vfork-/posix_spawn-style.
+                // The child SHARES the parent's page tables — writes by the child
+                // to parent-visible addresses (e.g. glibc's `args.err = errno`)
+                // must be observable to the parent.  See clone3(2) and the
+                // posix_spawn(3) fast-path "spawnix" implementation contract.
+                //
                 // glibc's __clone3 passes func in RDX and arg in R8/RCX.
                 // The child path does: mov rdi, r8; call *rdx.
                 // We must set entry_rdx/entry_r8 BEFORE unblocking the child.
@@ -2084,14 +2090,31 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 let parent_tid = crate::proc::current_tid();
                 let parent_regs = crate::syscall::read_fork_user_regs();
 
-                const CLONE_VFORK: u64 = 0x00004000;
+                // CLONE_CLEAR_SIGHAND lives in the upper half of clone_args.flags
+                // (bit 32) per clone3(2).  It cannot be combined with CLONE_SIGHAND.
                 let is_vfork = clone_flags & CLONE_VFORK != 0;
 
-                crate::serial_println!("[CLONE3-VFORK] pid={} func={:#x} arg={:#x} rip={:#x} sp={:#x}",
-                    pid, func, thread_arg, original_rip, sp);
+                // Reject the explicitly-illegal combination per clone3(2).
+                if clone_flags & CLONE_CLEAR_SIGHAND != 0
+                    && clone_flags & CLONE_SIGHAND != 0
+                {
+                    return -22; // EINVAL
+                }
 
-                match crate::proc::fork_process(pid, parent_tid, &parent_regs) {
+                crate::serial_println!("[CLONE3-VM] pid={} func={:#x} arg={:#x} rip={:#x} sp={:#x} clear_sighand={}",
+                    pid, func, thread_arg, original_rip, sp,
+                    clone_flags & CLONE_CLEAR_SIGHAND != 0);
+
+                match crate::proc::fork_process_share_vm(pid, parent_tid, &parent_regs) {
                     Some((child_pid, child_tid)) => {
+                        // CLONE_CLEAR_SIGHAND: reset child's sigactions (SIG_IGN
+                        // preserved, everything else → SIG_DFL).  Done AFTER
+                        // fork_process_share_vm so the child has its own fresh
+                        // SignalState to mutate.  Per clone3(2).
+                        if clone_flags & CLONE_CLEAR_SIGHAND != 0 {
+                            crate::proc::clear_sighand(child_pid);
+                        }
+
                         // Set func/arg and original RIP BEFORE unblocking
                         {
                             let mut threads = crate::proc::THREAD_TABLE.lock();
@@ -2105,7 +2128,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             }
                         }
                         crate::serial_println!(
-                            "[CLONE3-VFORK] child PID {} TID {} rdx={:#x} r8={:#x} rip={:#x} rsp={:#x}",
+                            "[CLONE3-VM] child PID {} TID {} rdx={:#x} r8={:#x} rip={:#x} rsp={:#x}",
                             child_pid, child_tid, func, thread_arg, original_rip, sp);
 
                         // NOW unblock the child
