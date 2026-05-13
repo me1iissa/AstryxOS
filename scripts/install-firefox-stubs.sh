@@ -361,52 +361,71 @@ _C_PREAMBLE = """\
 
 extern char **environ;
 
-/* "Return zero" trampoline: target of every slot in _stub_placeholder.
+/* "Return zero" trampoline + vtable building blocks — staged for a
+ * targeted classifier category, not yet routed into the default
+ * placeholder.
  *
- * Mozilla's XPCOM glue and several GTK/GLib helpers cast our placeholder
- * pointer to a C++-style object with a virtual-method table at offset 0,
- * load slot N, and `call *rax`.  When the slot holds a literal 0 the
- * indirect call dispatches to address 0 and the process takes a SIGSEGV
- * with CR2 in the low bytes (e.g. 0x0 / 0x6 / 0x10 depending on which
- * vtable index was used).
+ * Diagnostic context: the original _stub_placeholder is zero-filled and
+ * causes a SIGSEGV at CR2 ≈ vtable_index when Mozilla's XPCOM glue
+ * treats the placeholder as a C++ object and dispatches a virtual
+ * method (vptr = *(void**)placeholder = 0; call *vtable[N] → fault).
  *
- * Giving every slot a pointer to this trampoline turns "indirect call
- * into the placeholder" into "indirect call returning 0", which is the
- * same return value Mozilla would have seen from a 'null' stub.  The
- * caller takes its "no result" branch and proceeds.
+ * Empirical observation (firefox-test trial against a full
+ * `_stub_placeholder[128] = { [0..127] = &_stub_trampoline }` layout):
+ * filling every slot with a trampoline pointer eliminates the call-
+ * through-zero CR2=0x6 wedge but introduces an *earlier* CR2=0x0 load
+ * fault.  Mozilla calls the (now-trampoline) virtual method, the
+ * trampoline returns 0, and Mozilla immediately dereferences that 0
+ * as if it were a non-NULL object pointer — pushing the failure into
+ * a data-load-from-zero crash before the original wedge is reached.
+ * Mozilla's C++ object hierarchy assumes either (a) a real non-NULL
+ * subobject is returned or (b) the dispatched method aborts the
+ * whole code path; "returns 0 but caller treats it as object" is the
+ * pathological middle ground.
  *
- * Compiled as plain C; GCC at -O2 produces roughly `xor %eax, %eax; ret`
- * (3 bytes).  Lives in .text, which is properly executable — no need to
- * rely on .rodata being R+X. */
+ * So both the all-zero placeholder and the all-trampoline placeholder
+ * crash early — the latter just at a different RIP.  The next move is
+ * to plumb a 'vtable_ptr' classifier category that, for a positively
+ * identified subset of C++-object-returning stubs (e.g. specific
+ * nsISupports / nsThread getters), returns a placeholder whose vptr
+ * is non-NULL — and arranges for the trampoline at slot 0 to return
+ * a real non-NULL sub-object pointer rather than 0.  That work is
+ * out of scope here; this commit ships only the infrastructure (the
+ * trampoline + vtable arrays) and keeps the default placeholder
+ * zero-filled so the baseline progression (sc ≈ 5341, WorkerLauncher
+ * wedge) is preserved.
+ *
+ * Compiled as plain C; GCC at -O2 emits roughly `xor %eax, %eax; ret`
+ * (3 bytes).  Lives in .text. */
 static long _stub_trampoline(void) { return 0; }
+
+/* Vtable of trampoline pointers — 128 slots × 8 bytes = 1024 bytes,
+ * every slot points at _stub_trampoline.  Reserved as a building block
+ * for the planned 'vtable_ptr' classifier category — currently
+ * unreferenced from any exported stub.  Marked __attribute__((used)) so
+ * the linker keeps it even when no caller dereferences it. */
+static long const _stub_vtable[128] __attribute__((used)) = {
+    [0 ... 127] = (long)(void *)_stub_trampoline,
+};
 
 /* Singleton placeholder: returned by object-constructor stubs.
  * Read-only, always non-NULL, safe to pass back into unref/free stubs.
  *
- * Sized at 128 slots × 8 bytes = 1024 bytes.  Every slot is pre-populated
- * with the address of _stub_trampoline above so that callers which treat
- * the placeholder as a vtable (loading a function pointer and calling it)
- * dispatch to a valid "return zero" stub instead of address 0.
+ * Sized at 128 slots × 8 bytes = 1024 bytes — bigger than strictly
+ * necessary for the FcFontSet { int nfont; int sfont; FcPattern **fonts; }
+ * (16 bytes) and nsRefPtr-style shape/lang-tag walks (~64 bytes) so
+ * callers that reach further into the "object" still observe zero.
  *
- * Trade-off: callers that read the same memory as integer struct fields
- * (e.g. fontconfig FcFontSet { int nfont; int sfont; FcPattern **fonts; }
- * — nfont @ offset 0 drives a for-loop bound) now observe the low bits
- * of _stub_trampoline's address rather than 0.  In practice the dominant
- * failure mode on the demo path is vtable dispatch through zero
- * (observed: jmp through a zero-valued function-pointer slot, CR2 in the
- * low bytes), so we optimise for that — pointer-typed fields stay
- * non-NULL (which Mozilla expects from a constructor's return) and
- * integer-typed fields are tolerated by the iteration-bounded code
- * paths.  If a future iteration regresses on the integer-field side we
- * can switch to a hybrid layout (first few slots trampoline-filled,
- * rest zero) without touching callers.
+ * Kept zero-filled (rather than trampoline-filled) per the diagnostic
+ * comment above _stub_trampoline — trampoline-fill produced an earlier
+ * regression in our firefox-test cohort.  A future targeted classifier
+ * (the 'vtable_ptr' category) is the path that will reuse _stub_vtable
+ * for specific C++-object-returning symbols.
  *
  * Spec: https://fontconfig.org/fontconfig-devel/fcfontsetcreate.html
  * (FcFontSet layout: nfont @ offset 0 — the loop-bound — drives every
  * Mozilla iterator that calls these stubs.) */
-static long * const _stub_placeholder[128] = {
-    [0 ... 127] = (long *)(void *)_stub_trampoline,
-};
+static const long _stub_placeholder[128] = {0};
 
 /* GSpawnFlags bits we honour (spec: GLib docs — GSpawnFlags).
  * Others (LEAVE_DESCRIPTORS_OPEN, FILE_AND_ARGV_ZERO, etc.) are ignored —
