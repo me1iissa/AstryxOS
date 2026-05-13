@@ -3933,30 +3933,76 @@ fn test_signal_vma_snapshot() -> bool {
         ],
         mmap_hint: 0, brk: 0, brk_start: 0,
     };
-    // user_rip lands inside the libxul .text VMA at offset 0x1234.
+    // user_rip lands inside the libxul .text VMA at offset 0x1234, cr2 lands
+    // inside the anonymous heap (typical post-#176 RIP-far-from-CR2 cluster).
     let user_rip = 0x10_0000 + 0x1234;
-    let snap = crate::signal::signal_vma_snapshot(Some(&space), user_rip);
-    if snap.len() != 2 {
+    let cr2      = 0x40_0000 + 0x40;
+    let snap = crate::signal::signal_vma_snapshot(Some(&space), user_rip, cr2);
+    // Expected entries: libxul .text (rip), libc .text (neighbour),
+    // anonymous heap (cr2 — kept despite not being exec/file-backed).
+    if snap.len() != 3 {
         test_fail!("[SIGNAL/VMA] snapshot policy",
-                   "expected 2 entries (libxul .text + libc .text), got {}", snap.len());
+                   "expected 3 entries (libxul .text + libc .text + cr2 heap), got {}", snap.len());
         return false;
     }
-    // First entry must be the libxul .text (contains user_rip).
-    if !snap[0].contains_rip || snap[0].base != 0x10_0000 || !snap[0].file_backed {
+    // Entry 0: libxul .text — contains_rip, file-backed, file_offset=0,
+    // not contains_cr2, not anonymous.
+    if !snap[0].contains_rip || snap[0].contains_cr2 || snap[0].base != 0x10_0000
+        || !snap[0].file_backed || snap[0].anonymous || snap[0].file_offset != 0
+    {
         test_fail!("[SIGNAL/VMA] snapshot policy",
-                   "entry 0 should be libxul .text containing rip (base={:#x} rip={} file={})",
-                   snap[0].base, snap[0].contains_rip, snap[0].file_backed);
+                   "entry 0 must be libxul .text rip-containing (base={:#x} rip={} cr2={} file={} anon={} foff={:#x})",
+                   snap[0].base, snap[0].contains_rip, snap[0].contains_cr2,
+                   snap[0].file_backed, snap[0].anonymous, snap[0].file_offset);
         return false;
     }
-    // Second entry must be libc .text (executable, file-backed, no rip).
-    if snap[1].contains_rip || snap[1].base != 0x30_0000 || !snap[1].file_backed {
+    // Entry 1: libc .text — neighbour (no rip, no cr2, file-backed).
+    if snap[1].contains_rip || snap[1].contains_cr2 || snap[1].base != 0x30_0000
+        || !snap[1].file_backed
+    {
         test_fail!("[SIGNAL/VMA] snapshot policy",
-                   "entry 1 should be libc .text (base={:#x} rip={} file={})",
-                   snap[1].base, snap[1].contains_rip, snap[1].file_backed);
+                   "entry 1 must be libc .text neighbour (base={:#x} rip={} cr2={} file={})",
+                   snap[1].base, snap[1].contains_rip, snap[1].contains_cr2,
+                   snap[1].file_backed);
+        return false;
+    }
+    // Entry 2: anonymous heap — contains_cr2, anonymous=1, file_backed=0.
+    if !snap[2].contains_cr2 || snap[2].contains_rip || snap[2].base != 0x40_0000
+        || snap[2].file_backed || !snap[2].anonymous
+    {
+        test_fail!("[SIGNAL/VMA] snapshot policy",
+                   "entry 2 must be heap cr2-containing (base={:#x} rip={} cr2={} file={} anon={})",
+                   snap[2].base, snap[2].contains_rip, snap[2].contains_cr2,
+                   snap[2].file_backed, snap[2].anonymous);
+        return false;
+    }
+    // RIP-and-CR2-in-same-VMA case: snapshot must mark a single entry with
+    // both flags set (we test by placing both inside libxul .text).
+    let same_rip = 0x10_0000 + 0x1234;
+    let same_cr2 = 0x10_0000 + 0x5678;
+    let same_snap = crate::signal::signal_vma_snapshot(Some(&space), same_rip, same_cr2);
+    let same_entry = same_snap.iter()
+        .find(|v| v.contains_rip && v.contains_cr2);
+    if same_entry.is_none() {
+        test_fail!("[SIGNAL/VMA] snapshot policy",
+                   "expected one entry with contains_rip && contains_cr2 (got {} entries, flags={:?})",
+                   same_snap.len(),
+                   same_snap.iter().map(|v| (v.contains_rip, v.contains_cr2))
+                       .collect::<alloc::vec::Vec<_>>());
+        return false;
+    }
+    // RIP-in-kernel case: snapshot should return whatever covers cr2 (and
+    // executable neighbours).  No entry should claim contains_rip because
+    // the kernel address is outside every user VMA.
+    let kernel_rip: u64 = 0xFFFF_8000_0010_0000;
+    let kernel_snap = crate::signal::signal_vma_snapshot(Some(&space), kernel_rip, cr2);
+    if kernel_snap.iter().any(|v| v.contains_rip) {
+        test_fail!("[SIGNAL/VMA] snapshot policy",
+                   "kernel rip should NOT match any user VMA, got contains_rip entry");
         return false;
     }
     // None-space case: snapshot must return empty.
-    let empty = crate::signal::signal_vma_snapshot(None, 0);
+    let empty = crate::signal::signal_vma_snapshot(None, 0, 0);
     if !empty.is_empty() {
         test_fail!("[SIGNAL/VMA] snapshot policy",
                    "None space should produce empty snapshot, got {}", empty.len());
