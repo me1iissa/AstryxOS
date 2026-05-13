@@ -1489,6 +1489,23 @@ pub fn run() -> ! {
     total += 1;
     if test_fork_callee_saved_propagation() { passed += 1; }
 
+    // ── Test 214: exe_path propagation through fork+exec (W121) ──────────
+    // Regression guard for the contentproc-spawn gate: Mozilla derives
+    // sibling resource paths (dependentlibs.list, components/) from
+    // `readlink("/proc/self/exe")`.  Before this fix, fork(2) cleared the
+    // child's exe_path to None and execve(2) never repopulated it — so
+    // /proc/self/exe in the new image returned the placeholder "/bin/init"
+    // and Mozilla's content process tried to read "/bin/dependentlibs.list",
+    // got ENOENT, and exited 255 with "Couldn't load XPCOM."
+    //
+    // Per `proc(5)`: "/proc/[pid]/exe is a symbolic link containing the
+    // actual pathname of the executed command."  Per POSIX clone(2): a fork
+    // child inherits "the parent's open file descriptions, controlling
+    // terminal, and other process state" — including the executable
+    // identity until/unless the child execve(2)s.
+    total += 1;
+    if test_exe_path_propagation_w121() { passed += 1; }
+
     // (Tests 199/200 run earlier — right after Test 80c — so the vDSO
     // TSC fast path is verified before the slow PNG screenshot test.
     // Stream-A pipe / eventfd wake-hook tests run first — see Tests
@@ -26715,6 +26732,160 @@ fn test_fork_callee_saved_propagation() -> bool {
     }
 
     test_pass!("fork callee-saved register propagation (W113)");
+    true
+}
+
+/// Test 214: exe_path propagation through fork+exec (W121).
+///
+/// Verifies that fork(2)/clone(2) children inherit the parent's `exe_path`
+/// (so `readlink("/proc/self/exe")` works immediately after fork), and that
+/// the child's storage is independent of the parent's (so a subsequent
+/// execve(2) in the child does not corrupt the parent's `exe_path`).
+///
+/// Direct end-to-end execve(2) is not exercised here because the test runner
+/// cannot safely IRETQ-to-Ring-3 from the BSP thread.  Instead, the test
+/// covers the kernel-side invariants:
+///
+///   1. After `fork_process` / `fork_process_share_vm` / `vfork_process`,
+///      child.exe_path == parent.exe_path.
+///   2. Mutating child.exe_path (the operation sys_exec performs after a
+///      successful image swap) does NOT change parent.exe_path.
+///   3. No child ever ends up with exe_path "/bin/init" (the prior buggy
+///      fallback that drove Mozilla's "Couldn't load XPCOM" abort).
+fn test_exe_path_propagation_w121() -> bool {
+    test_header!("exe_path propagation through fork+exec (W121)");
+
+    let parent_pid = match crate::proc::usermode::create_user_process(
+        "w121_parent", &crate::proc::hello_elf::HELLO_ELF
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            test_fail!("w121", "create_user_process: {:?}", e);
+            return false;
+        }
+    };
+    let parent_tid = {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        threads.iter().find(|t| t.pid == parent_pid).map(|t| t.tid).unwrap_or(0)
+    };
+
+    // Force the parent's exe_path to a known canonical value mimicking the
+    // shape Mozilla expects: a multi-component absolute path.
+    let known_exe = alloc::string::String::from("/disk/opt/firefox/firefox-bin");
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == parent_pid) {
+            p.exe_path = Some(known_exe.clone());
+        }
+    }
+    test_println!("  parent PID {} exe_path = {:?}", parent_pid, known_exe);
+
+    let dummy_regs = crate::proc::ForkUserRegs::default();
+
+    // ── Path 1: CoW fork ─────────────────────────────────────────────────
+    let (child_cow, _ctid_cow) = match crate::proc::fork_process(
+        parent_pid, parent_tid, &dummy_regs
+    ) {
+        Some(x) => x,
+        None => { test_fail!("w121", "fork_process returned None"); return false; }
+    };
+
+    // ── Path 2: shared-VM clone (posix_spawn fast path) ──────────────────
+    let (child_sv, _ctid_sv) = match crate::proc::fork_process_share_vm(
+        parent_pid, parent_tid, &dummy_regs
+    ) {
+        Some(x) => x,
+        None => { test_fail!("w121", "fork_process_share_vm None"); return false; }
+    };
+
+    // ── Path 3: vfork ────────────────────────────────────────────────────
+    let (child_vf, _ctid_vf) = match crate::proc::vfork_process(
+        parent_pid, parent_tid, &dummy_regs
+    ) {
+        Some(x) => x,
+        None => { test_fail!("w121", "vfork_process None"); return false; }
+    };
+
+    // Snapshot all four exe_paths in one lock acquisition.
+    let (p_exe, c_cow_exe, c_sv_exe, c_vf_exe) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        let getp = |pid: crate::proc::Pid| -> Option<alloc::string::String> {
+            procs.iter().find(|p| p.pid == pid)
+                .and_then(|p| p.exe_path.clone())
+        };
+        (getp(parent_pid), getp(child_cow), getp(child_sv), getp(child_vf))
+    };
+
+    for (label, exe) in [
+        ("parent",  &p_exe),
+        ("CoW",     &c_cow_exe),
+        ("share-VM",&c_sv_exe),
+        ("vfork",   &c_vf_exe),
+    ] {
+        match exe {
+            Some(s) if s == &known_exe => {
+                test_println!("  {} exe_path = {:?} ✓", label, s);
+            }
+            Some(s) if s == "/bin/init" => {
+                test_fail!("w121",
+                    "{} child exe_path is the buggy /bin/init fallback (W120)",
+                    label);
+                return false;
+            }
+            Some(s) => {
+                test_fail!("w121",
+                    "{} exe_path mismatch: got {:?}, expected {:?}",
+                    label, s, &known_exe);
+                return false;
+            }
+            None => {
+                test_fail!("w121",
+                    "{} exe_path is None — fork failed to propagate executable identity",
+                    label);
+                return false;
+            }
+        }
+    }
+
+    // ── Invariant 2: mutating a child's exe_path must NOT touch parent's ──
+    // (Replicates what sys_exec does in the in-place image-replace branch.)
+    let new_child_exe = alloc::string::String::from("/disk/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2");
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == child_cow) {
+            p.exe_path = Some(new_child_exe.clone());
+        }
+    }
+    let parent_after = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == parent_pid)
+            .and_then(|p| p.exe_path.clone())
+    };
+    if parent_after.as_deref() != Some(known_exe.as_str()) {
+        test_fail!("w121",
+            "parent exe_path leaked to child mutation: got {:?}, expected {:?}",
+            parent_after, &known_exe);
+        return false;
+    }
+    test_println!("  parent exe_path unchanged after child execve simulation ✓");
+
+    // Cleanup.
+    for pid in [parent_pid, child_cow, child_sv, child_vf] {
+        {
+            let mut threads = crate::proc::THREAD_TABLE.lock();
+            for t in threads.iter_mut() {
+                if t.pid == pid { t.state = crate::proc::ThreadState::Dead; }
+            }
+        }
+        {
+            let mut procs = crate::proc::PROCESS_TABLE.lock();
+            if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                p.state = crate::proc::ProcessState::Zombie;
+            }
+        }
+    }
+
+    test_pass!("exe_path propagation through fork+exec (W121)");
     true
 }
 
