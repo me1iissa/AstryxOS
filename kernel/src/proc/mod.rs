@@ -1411,15 +1411,25 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
     // By keeping the caller in its current state (Running → Ready on preemption),
     // if preempted it will be rescheduled and finish the Zombie/parent-wake steps.
     // We mark the caller Dead last, just before calling schedule().
+    //
+    // INVARIANT: do NOT touch `ctx_rsp_valid` on siblings.  Sibling threads are
+    // Blocked / Ready / Sleeping when we reach here, meaning their context was
+    // saved long ago by switch_context_asm and `ctx_rsp_valid` is true.  The
+    // reaper at `sched::reap_dead_threads_sched` filters Dead threads by
+    // `ctx_rsp_valid == true` precisely so it can safely free a kernel stack
+    // whose context-save has completed.  Forcing the flag false here would
+    // strand every sibling as Dead-but-unreapable, leaking its 16 KiB kernel
+    // stack until the process slot itself is recycled.  Mozilla's 51-thread
+    // worker pool would lose ~800 KiB per teardown.  Only the caller of
+    // exit_group (which is still executing on its own stack) gets
+    // `ctx_rsp_valid=false`, and only on the yield_self path below where
+    // switch_context_asm will re-set it after saving RSP.
     {
         let mut threads = THREAD_TABLE.lock();
         for t in threads.iter_mut() {
             if t.pid == pid && t.tid != calling_tid && t.state != ThreadState::Dead {
                 t.state = ThreadState::Dead;
                 t.exit_code = exit_code;
-                // Stop a peer CPU from racing to save/restore stale context
-                // onto a thread that's about to lose its kernel stack.
-                t.ctx_rsp_valid.store(false, core::sync::atomic::Ordering::Release);
             }
         }
     }
@@ -1490,6 +1500,22 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
     }
     // Free user memory (no locks held).
     free_process_memory(pid);
+
+    // vfork completion: if the caller is a vfork child fatal-faulting mid-
+    // execve (e.g. a synchronous fatal CPU exception routed here from
+    // arch/x86_64/idt.rs), the parent is parked in TASK_KILLABLE-style sleep
+    // on `vfork_parent_tid` and only this wake will release it.  Without it,
+    // the parent stays Blocked until the 5-second vfork timeout fires.
+    // Linux: exit_mm_release() → mm_release() → complete_vfork_done().
+    //
+    // Lock discipline: wake_vfork_parent() takes THREAD_TABLE.  We hold no
+    // locks here (the sibling-Dead pass at the top released THREAD_TABLE,
+    // and futex_drain_pid / PROCESS_TABLE / FILE_LOCKS sections have all
+    // completed).  Out-of-band callers (yield_self == false) skip this:
+    // they are healthy threads in a different process — not a vfork child.
+    if yield_self {
+        crate::syscall::wake_vfork_parent();
+    }
 
     // Wake parent threads blocked in waitpid, and mark calling thread Dead
     // (only when the caller is itself a thread of the dying process).
