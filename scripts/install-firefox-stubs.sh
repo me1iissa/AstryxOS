@@ -361,21 +361,52 @@ _C_PREAMBLE = """\
 
 extern char **environ;
 
+/* "Return zero" trampoline: target of every slot in _stub_placeholder.
+ *
+ * Mozilla's XPCOM glue and several GTK/GLib helpers cast our placeholder
+ * pointer to a C++-style object with a virtual-method table at offset 0,
+ * load slot N, and `call *rax`.  When the slot holds a literal 0 the
+ * indirect call dispatches to address 0 and the process takes a SIGSEGV
+ * with CR2 in the low bytes (e.g. 0x0 / 0x6 / 0x10 depending on which
+ * vtable index was used).
+ *
+ * Giving every slot a pointer to this trampoline turns "indirect call
+ * into the placeholder" into "indirect call returning 0", which is the
+ * same return value Mozilla would have seen from a 'null' stub.  The
+ * caller takes its "no result" branch and proceeds.
+ *
+ * Compiled as plain C; GCC at -O2 produces roughly `xor %eax, %eax; ret`
+ * (3 bytes).  Lives in .text, which is properly executable — no need to
+ * rely on .rodata being R+X. */
+static long _stub_trampoline(void) { return 0; }
+
 /* Singleton placeholder: returned by object-constructor stubs.
  * Read-only, always non-NULL, safe to pass back into unref/free stubs.
  *
- * Sized at 128 bytes so callers that treat the result as a struct and
- * read fields beyond the first int (e.g. fontconfig FcFontSet has
- * {int nfont; int sfont; FcPattern **fonts;} — 16 bytes; nsRefPtr-wrapped
- * Mozilla iterators dereference offsets up to ~64 bytes during shape /
- * lang-tag walks) all observe zero values rather than adjacent rodata.
- * For pointer-returning getters this gives a safe "empty zero-initialised
- * object" without ever needing a real backing allocation.
+ * Sized at 128 slots × 8 bytes = 1024 bytes.  Every slot is pre-populated
+ * with the address of _stub_trampoline above so that callers which treat
+ * the placeholder as a vtable (loading a function pointer and calling it)
+ * dispatch to a valid "return zero" stub instead of address 0.
+ *
+ * Trade-off: callers that read the same memory as integer struct fields
+ * (e.g. fontconfig FcFontSet { int nfont; int sfont; FcPattern **fonts; }
+ * — nfont @ offset 0 drives a for-loop bound) now observe the low bits
+ * of _stub_trampoline's address rather than 0.  In practice the dominant
+ * failure mode on the demo path is vtable dispatch through zero
+ * (observed: jmp through a zero-valued function-pointer slot, CR2 in the
+ * low bytes), so we optimise for that — pointer-typed fields stay
+ * non-NULL (which Mozilla expects from a constructor's return) and
+ * integer-typed fields are tolerated by the iteration-bounded code
+ * paths.  If a future iteration regresses on the integer-field side we
+ * can switch to a hybrid layout (first few slots trampoline-filled,
+ * rest zero) without touching callers.
  *
  * Spec: https://fontconfig.org/fontconfig-devel/fcfontsetcreate.html
  * (FcFontSet layout: nfont @ offset 0 — the loop-bound — drives every
  * Mozilla iterator that calls these stubs.) */
-static const long _stub_placeholder[16] = {0};
+static long * const _stub_placeholder[128] = {
+    [0 ... 127] = (long *)(void *)_stub_trampoline,
+};
 
 /* GSpawnFlags bits we honour (spec: GLib docs — GSpawnFlags).
  * Others (LEAVE_DESCRIPTORS_OPEN, FILE_AND_ARGV_ZERO, etc.) are ignored —
