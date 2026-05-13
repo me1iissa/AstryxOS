@@ -431,6 +431,15 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
             // threads parked on the dead thread's condvars / semaphores /
             // futexes indefinitely.  Use exit_group so the whole thread
             // group is torn down.
+            //
+            // Invalidate the per-CPU saved-syscall-frame pointer first: we
+            // did NOT pass through `syscall_entry`, so any value still
+            // sitting in `frame_rsp` belongs to a prior syscall on this CPU
+            // and points at kernel memory that has since been reused.  The
+            // firefox-test diagnostic dump inside `exit_group` reads that
+            // slot via `syscall::get_user_rsp_rbp()`; without this clear
+            // the deref produced a KERNEL_PAGE_FAULT bugcheck (W86).
+            crate::syscall::invalidate_syscall_frame();
             crate::proc::exit_group(-11i64); // SIGSEGV
             return;
         }
@@ -503,6 +512,15 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
         // default to thread-group termination.  Calling exit_thread would
         // leave sibling threads in the same process parked on condvars,
         // semaphores, or futexes that the dead thread was meant to signal.
+        //
+        // Invalidate the per-CPU saved-syscall-frame pointer first.  See
+        // the matching call in the user-mode #PF SIGSEGV path above for
+        // the full rationale: `exit_group`'s firefox-test diagnostic dump
+        // reads `syscall::PER_CPU_SYSCALL[cpu].frame_rsp` which was set
+        // by a prior syscall and now aliases freed-or-overwritten kernel
+        // memory.  Without the clear, the dump's raw deref produced a
+        // KERNEL_PAGE_FAULT bugcheck under firefox-test (W86).
+        crate::syscall::invalidate_syscall_frame();
         crate::proc::exit_group(-(vector as i64));
         return;
     }

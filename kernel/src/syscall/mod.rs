@@ -285,20 +285,82 @@ pub unsafe fn get_user_rip() -> u64 {
 /// Read the user RSP / RBP values captured at syscall entry on the current
 /// CPU.  Returns `(0, 0)` if no syscall frame is active — e.g. when called
 /// from a context that did not enter via SYSCALL (int 0x80 path, test
-/// harness).  The values come from the per-CPU `frame_rsp` slot populated
-/// by `syscall_entry`; see its frame-layout comment for offsets.
+/// harness, IDT exception path).  The values come from the per-CPU
+/// `frame_rsp` slot populated by `syscall_entry`; see its frame-layout
+/// comment for offsets.
+///
+/// SAFETY: `frame_rsp` is written by `syscall_entry` and is NEVER cleared
+/// on SYSRETQ — it remains stale across the syscall return.  A caller that
+/// reaches this function from outside the syscall path (most importantly
+/// the IDT exception path that calls `proc::exit_group` on a fatal user
+/// fault, per PR #166) would otherwise dereference a pointer to whatever
+/// kernel memory used to host the prior syscall's saved-register frame,
+/// which has since been overwritten by ISR pushes, scheduler context
+/// saves, or — in the worst case — freed entirely with its underlying
+/// physical pages reallocated to unrelated kernel objects.  A raw deref
+/// in that state produced a KERNEL_PAGE_FAULT bugcheck under firefox-test
+/// when the corrupted return path eventually IRET'd to RIP=0 (W86).
+///
+/// Defence: validate that the saved frame pointer lies inside the **current
+/// thread's** kernel stack range before dereferencing.  The current
+/// thread's kernel stack top is `PER_CPU_SYSCALL[cpu].kernel_rsp`; the
+/// stack extends downward by `KERNEL_STACK_SIZE_BYTES`.  If `frame_rsp`
+/// falls outside this window, treat it as stale and return `(0, 0)` —
+/// downstream callers (`dump_exit_stack`, `dump_for_exit`) treat zero as
+/// "no usable frame" and emit empty diagnostic output rather than fault.
 ///
 /// Used by the firefox-test exit-time stack snapshot.
 pub fn get_user_rsp_rbp() -> (u64, u64) {
     let cpu = cpu_index();
-    let rsp = unsafe { PER_CPU_SYSCALL[cpu as usize].frame_rsp };
+    let pcs = unsafe { &PER_CPU_SYSCALL[cpu as usize] };
+    let rsp = pcs.frame_rsp;
+    let kstack_top = pcs.kernel_rsp;
     if rsp == 0 { return (0, 0); }
+
+    // The frame must occupy 15 u64 slots starting at `rsp`, so the entire
+    // window [rsp, rsp + 15*8) must lie within the current thread's
+    // kernel stack [kstack_top - KERNEL_STACK_SIZE_BYTES, kstack_top).
+    // Reject anything outside that window as a stale pointer left behind
+    // by a prior syscall on a different thread (or by a context that did
+    // not pass through `syscall_entry` at all).
+    const FRAME_TOP_OFF: u64 = 15 * 8;
+    let stack_low = kstack_top.saturating_sub(KERNEL_STACK_SIZE_BYTES);
+    if kstack_top == 0
+        || rsp < stack_low
+        || rsp.saturating_add(FRAME_TOP_OFF) > kstack_top
+        || rsp & 0x7 != 0
+    {
+        return (0, 0);
+    }
     unsafe {
         let p = rsp as *const u64;
         // Frame layout from syscall_entry:
         //   [11]=rbp   [14]=user_rsp
         (*p.add(14), *p.add(11))
     }
+}
+
+/// Maximum kernel-stack span used by `get_user_rsp_rbp` / `read_fork_user_regs`
+/// to validate a saved syscall frame pointer.  Mirrors the per-thread
+/// `KERNEL_STACK_PAGES * 4096` allocation in `proc::mod` (64 pages = 256 KiB).
+/// Kept private here to avoid a cross-module `pub` of an internal constant;
+/// any drift will be caught by Test 211 (which exercises both the in-range
+/// and out-of-range branches).
+const KERNEL_STACK_SIZE_BYTES: u64 = 64 * 4096;
+
+/// Mark the per-CPU syscall frame as invalid.  Called from the IDT exception
+/// path (`arch/x86_64/idt.rs`) just before delivering a fatal user-mode
+/// signal via `proc::exit_group`, so that the firefox-test diagnostic dump
+/// inside `exit_group` does not consult the previous syscall's saved frame
+/// (which has since been overwritten or freed; see `get_user_rsp_rbp` for
+/// the full rationale and W86 for the user-visible symptom).
+///
+/// Idempotent and lock-free.  Safe to call from any context where
+/// `cpu_index()` is valid.
+#[inline]
+pub fn invalidate_syscall_frame() {
+    let cpu = cpu_index();
+    unsafe { PER_CPU_SYSCALL[cpu as usize].frame_rsp = 0; }
 }
 
 /// Read the user-mode caller return address at `[rsp]`.  For System V x86_64,
@@ -506,8 +568,25 @@ pub fn dispatch_aether(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg
 ///   [12]=r11  [13]=rcx  [14]=user_rsp
 pub(crate) fn read_fork_user_regs() -> crate::proc::ForkUserRegs {
     let cpu = cpu_index();
-    let rsp = unsafe { PER_CPU_SYSCALL[cpu as usize].frame_rsp };
+    let pcs = unsafe { &PER_CPU_SYSCALL[cpu as usize] };
+    let rsp = pcs.frame_rsp;
+    let kstack_top = pcs.kernel_rsp;
     if rsp == 0 {
+        return crate::proc::ForkUserRegs::default();
+    }
+    // Same bounds check as `get_user_rsp_rbp`: refuse to read from a
+    // saved-frame pointer that does not lie inside the current thread's
+    // kernel stack, which would otherwise risk a kernel #PF if the page
+    // were unmapped or returning garbage if it had been overwritten by
+    // unrelated kernel work since the prior syscall.  The 15-slot frame
+    // span matches the syscall_entry pushes (see layout comment above).
+    const FRAME_TOP_OFF: u64 = 15 * 8;
+    let stack_low = kstack_top.saturating_sub(KERNEL_STACK_SIZE_BYTES);
+    if kstack_top == 0
+        || rsp < stack_low
+        || rsp.saturating_add(FRAME_TOP_OFF) > kstack_top
+        || rsp & 0x7 != 0
+    {
         return crate::proc::ForkUserRegs::default();
     }
     unsafe {
