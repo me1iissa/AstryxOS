@@ -135,10 +135,30 @@ static STAT_SHOOTDOWNS_HANDLED: AtomicU64 = AtomicU64::new(0);
 static SMP_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Mark the system as having ≥2 active CPUs.  Called from [`apic::start_aps`]
-/// after all APs are online.  Before this is set, [`shootdown_range`]
-/// short-circuits to a local-only `invlpg` since no other CPU can be
-/// touching the TLB.
+/// after all APs are online as a belt-and-braces backstop.  In practice each
+/// AP flips the flag itself via [`mark_self_smp_online`] before it enables
+/// interrupts, so by the time `start_aps` returns the flag is already set.
+/// Before this is set, [`shootdown_range`] short-circuits to a local-only
+/// `invlpg` since no other CPU can be touching the TLB.
 pub fn mark_smp_active() {
+    SMP_ACTIVE.store(true, Ordering::Release);
+}
+
+/// Called from each AP on its own entry path immediately before it enables
+/// interrupts and joins the scheduler.  Flips the global SMP_ACTIVE flag
+/// so that subsequent [`shootdown_range`] calls — including ones issued
+/// from the BSP while later APs are still booting — emit IPIs to this CPU
+/// instead of short-circuiting to a local-only `invlpg`.
+///
+/// The previous design only set `SMP_ACTIVE` once `start_aps` had finished
+/// bringing up every AP.  That left a per-AP window between
+/// "AP records its CR3 via `note_cr3_load`" and "BSP flips the global
+/// flag" during which a shootdown from the BSP for an address space this
+/// AP had loaded would silently miss this CPU.  Having each AP set the
+/// flag itself, after its CR3 bookkeeping and IDT are live, closes that
+/// window without changing the BSP-side call.  Multiple concurrent flips
+/// are harmless (idempotent monotonic store).
+pub fn mark_self_smp_online() {
     SMP_ACTIVE.store(true, Ordering::Release);
 }
 
