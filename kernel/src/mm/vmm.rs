@@ -549,10 +549,23 @@ pub fn unmap_and_free_range_in(pml4_phys: u64, base: u64, length: u64) -> usize 
     let mut freed = 0usize;
     let mut pg = base;
     let end = base.saturating_add(length);
+    let mut first_unmapped: Option<u64> = None;
+    let mut last_unmapped: u64 = 0;
     while pg < end {
         if let Some(phys) = virt_to_phys_in(pml4_phys, pg) {
             unmap_page_in(pml4_phys, pg);
-            invlpg(pg);
+            // Defer the per-page TLB invalidation to a single coalesced
+            // shootdown after the loop so we send at most one IPI per
+            // unmap call instead of one per page.  The local CPU's TLB
+            // still contains stale entries until that point but the
+            // kernel is single-threaded inside this critical section
+            // (no syscall can touch the same VA range until we return)
+            // so no other AstryxOS code observes the stale translation.
+            // The deferred shootdown also covers other CPUs.
+            if first_unmapped.is_none() {
+                first_unmapped = Some(pg);
+            }
+            last_unmapped = pg + 0x1000;
             let new_rc = crate::mm::refcount::page_ref_dec(phys);
             if new_rc == 0 {
                 pmm::free_page(phys);
@@ -560,6 +573,9 @@ pub fn unmap_and_free_range_in(pml4_phys: u64, base: u64, length: u64) -> usize 
             }
         }
         pg += 0x1000;
+    }
+    if let Some(lo) = first_unmapped {
+        crate::mm::tlb::shootdown_range(pml4_phys, lo, last_unmapped);
     }
     freed
 }
