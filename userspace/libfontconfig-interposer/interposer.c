@@ -33,6 +33,16 @@
  * path writes a defined sentinel value into *out so the buggy caller
  * dereferences a valid object instead of NULL.
  *
+ * W137 found an additional failure mode: when the primary SIGSEGV is
+ * caused by a corrupted FcPattern* (observed rbx=1 and rbx=4 — tiny
+ * integer constants, not valid heap pointers), Mozilla's signal handler
+ * re-enters FcPatternGet* with the same corrupted pointer, producing a
+ * double-fault that prevents the crash diagnostic from printing.  The
+ * fc_ptr_is_plausible() guard below catches this: any pointer below the
+ * first readable page boundary (0x1000) is treated as corrupt and the
+ * wrapper returns NoMatch with a safe sentinel immediately, without
+ * calling into the real libfontconfig or touching the bad address.
+ *
  * The interposer must be loaded before libfontconfig.so.1.  Inject via
  * LD_PRELOAD=/lib64/libfontconfig-interposer.so in the firefox-test
  * environment — set in kernel/src/gui/terminal.rs.  Real libfontconfig
@@ -46,6 +56,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /* fontconfig public ABI (from <fontconfig/fontconfig.h>).
  *
@@ -86,6 +97,32 @@ typedef void         *FT_Face;     /* opaque pointer */
 #define FC_RESULT_NO_MATCH    1
 
 /* ────────────────────────────────────────────────────────────────────
+ * Pointer plausibility guard (W137 double-fault prevention).
+ *
+ * When a primary SIGSEGV is caused by a corrupted FcPattern* — W137
+ * observed rbx=1 and rbx=4, small integer constants never produced by
+ * malloc — Mozilla's signal handler re-enters the same FcPatternGet*
+ * wrapper with the identically corrupted pointer, causing a second
+ * fault before the crash diagnostic can be printed.
+ *
+ * Any userspace heap or .data pointer will be above the first 4 KiB
+ * page boundary (address 0x1000).  A pointer below that threshold
+ * cannot be a valid FcPattern* and must be treated as corrupt.  We
+ * return NoMatch with a safe sentinel immediately rather than passing
+ * the bad address into libfontconfig or dereferencing it ourselves.
+ *
+ * The threshold is deliberately conservative — 0x1000 (4096).  Real
+ * heap allocations on x86-64 Linux are at minimum around 0x100000 in
+ * practice; 0x1000 gives a wide margin without risking false positives
+ * on low-but-valid pointers such as .text or vDSO mappings.
+ * ──────────────────────────────────────────────────────────────────── */
+static inline int
+fc_ptr_is_plausible(const void *p)
+{
+    return p != NULL && ((uintptr_t)p) >= 0x1000u;
+}
+
+/* ────────────────────────────────────────────────────────────────────
  * Sentinel storage for non-NULL writes on the NoMatch path.
  *
  * For string output we use a small NUL-terminated literal so a caller
@@ -122,6 +159,12 @@ FcPatternGetString(const FcPattern *p, const char *object, int n,
         real = (FcPatternGetString_t)dlsym(RTLD_NEXT, "FcPatternGetString");
     }
 
+    /* Bogus FcPattern* — bail before touching the bad address. */
+    if (!fc_ptr_is_plausible(p)) {
+        if (s) *s = (FcChar8 *)fc_stub_family;
+        return FC_RESULT_NO_MATCH;
+    }
+
     if (!s) {
         return real ? real(p, object, n, s) : FC_RESULT_NO_MATCH;
     }
@@ -151,6 +194,12 @@ FcPatternGetBool(const FcPattern *p, const char *object, int n, FcBool *b)
 
     if (!real) {
         real = (FcPatternGetBool_t)dlsym(RTLD_NEXT, "FcPatternGetBool");
+    }
+
+    /* Bogus FcPattern* — bail before touching the bad address. */
+    if (!fc_ptr_is_plausible(p)) {
+        if (b) *b = 0;
+        return FC_RESULT_NO_MATCH;
     }
 
     if (!b) {
@@ -187,6 +236,12 @@ FcPatternGetInteger(const FcPattern *p, const char *object, int n, int *i)
         real = (FcPatternGetInteger_t)dlsym(RTLD_NEXT, "FcPatternGetInteger");
     }
 
+    /* Bogus FcPattern* — bail before touching the bad address. */
+    if (!fc_ptr_is_plausible(p)) {
+        if (i) *i = 0;
+        return FC_RESULT_NO_MATCH;
+    }
+
     if (!i) {
         return real ? real(p, object, n, i) : FC_RESULT_NO_MATCH;
     }
@@ -216,6 +271,12 @@ FcPatternGetDouble(const FcPattern *p, const char *object, int n, double *d)
 
     if (!real) {
         real = (FcPatternGetDouble_t)dlsym(RTLD_NEXT, "FcPatternGetDouble");
+    }
+
+    /* Bogus FcPattern* — bail before touching the bad address. */
+    if (!fc_ptr_is_plausible(p)) {
+        if (d) *d = 0.0;
+        return FC_RESULT_NO_MATCH;
     }
 
     if (!d) {
@@ -250,6 +311,12 @@ FcPatternGetMatrix(const FcPattern *p, const char *object, int n, FcMatrix **m)
 
     if (!real) {
         real = (FcPatternGetMatrix_t)dlsym(RTLD_NEXT, "FcPatternGetMatrix");
+    }
+
+    /* Bogus FcPattern* — bail before touching the bad address. */
+    if (!fc_ptr_is_plausible(p)) {
+        if (m) *m = &fc_stub_identity_matrix;
+        return FC_RESULT_NO_MATCH;
     }
 
     if (!m) {
@@ -288,6 +355,12 @@ FcPatternGetCharSet(const FcPattern *p, const char *object, int n,
         real = (FcPatternGetCharSet_t)dlsym(RTLD_NEXT, "FcPatternGetCharSet");
     }
 
+    /* Bogus FcPattern* — bail before touching the bad address. */
+    if (!fc_ptr_is_plausible(p)) {
+        if (c) *c = (FcCharSet *)fc_stub_charset;
+        return FC_RESULT_NO_MATCH;
+    }
+
     if (!c) {
         return real ? real(p, object, n, c) : FC_RESULT_NO_MATCH;
     }
@@ -318,6 +391,12 @@ FcPatternGetLangSet(const FcPattern *p, const char *object, int n,
 
     if (!real) {
         real = (FcPatternGetLangSet_t)dlsym(RTLD_NEXT, "FcPatternGetLangSet");
+    }
+
+    /* Bogus FcPattern* — bail before touching the bad address. */
+    if (!fc_ptr_is_plausible(p)) {
+        if (l) *l = (FcLangSet *)fc_stub_langset;
+        return FC_RESULT_NO_MATCH;
     }
 
     if (!l) {
@@ -355,6 +434,12 @@ FcPatternGetFTFace(const FcPattern *p, const char *object, int n, FT_Face *f)
         real = (FcPatternGetFTFace_t)dlsym(RTLD_NEXT, "FcPatternGetFTFace");
     }
 
+    /* Bogus FcPattern* — bail before touching the bad address. */
+    if (!fc_ptr_is_plausible(p)) {
+        if (f) *f = NULL;
+        return FC_RESULT_NO_MATCH;
+    }
+
     if (!f) {
         return real ? real(p, object, n, f) : FC_RESULT_NO_MATCH;
     }
@@ -385,6 +470,12 @@ FcPatternGetRange(const FcPattern *p, const char *object, int n, FcRange **r)
 
     if (!real) {
         real = (FcPatternGetRange_t)dlsym(RTLD_NEXT, "FcPatternGetRange");
+    }
+
+    /* Bogus FcPattern* — bail before touching the bad address. */
+    if (!fc_ptr_is_plausible(p)) {
+        if (r) *r = (FcRange *)fc_stub_range;
+        return FC_RESULT_NO_MATCH;
     }
 
     if (!r) {
