@@ -652,6 +652,12 @@ pub fn start_aps() {
         total,
         bsp_id
     );
+
+    // SMP is now live — enable the full cross-CPU TLB shootdown protocol.
+    // Until this point only the BSP exists, so local invlpg was sufficient.
+    if total > 1 {
+        crate::mm::tlb::mark_smp_active();
+    }
 }
 
 /// Ensure that the page containing `phys_addr` is executable (clear the NX bit).

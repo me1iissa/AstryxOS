@@ -221,6 +221,13 @@ pub fn shmdt(shmaddr: u64) -> i64 {
         let vaddr = shmaddr + i * PAGE_SIZE;
         crate::mm::vmm::unmap_page_in(cr3, vaddr);
     }
+    // Coalesced TLB shootdown over the SHM range — other CPUs that had
+    // attached the same segment must drop their cached translations
+    // before the kernel hands the physical frames back to the next
+    // user of the segment.
+    if n_pages > 0 {
+        crate::mm::tlb::shootdown_range(cr3, shmaddr, shmaddr + n_pages * PAGE_SIZE);
+    }
 
     // Decrement refcount on the segment
     {

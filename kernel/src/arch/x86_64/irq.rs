@@ -470,6 +470,16 @@ irq_stub!(irq_mouse_handler, mouse_interrupt);
 irq_stub!(irq_e1000_handler, e1000_interrupt);
 irq_stub!(irq_virtio_blk_handler, virtio_blk_interrupt);
 irq_stub!(irq_virtio_serial_handler, virtio_serial_interrupt);
+irq_stub!(irq_tlb_shootdown_handler, tlb_shootdown_interrupt);
+
+/// Cross-CPU TLB shootdown IPI logic.
+///
+/// Reads this CPU's shootdown payload slot, invalidates the requested
+/// range if the active CR3 matches the target, and acknowledges via
+/// `pending=0`.  EOIs the LAPIC at the end.  See `mm/tlb.rs`.
+extern "C" fn tlb_shootdown_interrupt() {
+    crate::mm::tlb::handle_shootdown_ipi();
+}
 
 /// Virtio-blk PCI INTx interrupt logic.
 ///

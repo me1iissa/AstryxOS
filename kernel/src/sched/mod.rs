@@ -664,7 +664,10 @@ pub fn schedule() {
         let kernel_cr3 = crate::mm::vmm::get_kernel_cr3();
         let current_cr3 = crate::mm::vmm::get_cr3();
         if kernel_cr3 != 0 && current_cr3 != kernel_cr3 {
+            // See note in the unconditional CR3-load block below.
+            crate::mm::tlb::note_cr3_unload(current_cr3);
             unsafe { crate::mm::vmm::switch_cr3(kernel_cr3); }
+            crate::mm::tlb::note_cr3_load(kernel_cr3);
         }
     }
 
@@ -720,7 +723,15 @@ pub fn schedule() {
         };
         let current_cr3 = crate::mm::vmm::get_cr3();
         if effective_cr3 != current_cr3 {
+            // Update the per-CR3 active-CPU mask in tandem with the
+            // hardware CR3 load.  Clear the bit for the outgoing CR3
+            // BEFORE the write so a concurrent shootdown does not
+            // address a stale CPU; set the bit for the new CR3
+            // AFTER the write so the TLB is already coherent by the
+            // time a sender observes the bit.  See mm/tlb.rs.
+            crate::mm::tlb::note_cr3_unload(current_cr3);
             unsafe { crate::mm::vmm::switch_cr3(effective_cr3); }
+            crate::mm::tlb::note_cr3_load(effective_cr3);
         }
 
         // Idle thread invariant: PID 0 must always have kernel CR3.
