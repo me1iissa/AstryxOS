@@ -2084,13 +2084,33 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 let parent_regs = crate::syscall::read_fork_user_regs();
 
                 const CLONE_VFORK: u64 = 0x00004000;
+                // CLONE_CLEAR_SIGHAND is in the upper half of clone_args.flags
+                // (bit 32) per clone3(2).  Cannot be combined with CLONE_SIGHAND.
+                const CLONE_SIGHAND:       u64 = 0x00000800;
+                const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
                 let is_vfork = clone_flags & CLONE_VFORK != 0;
 
-                crate::serial_println!("[CLONE3-VM] pid={} func={:#x} arg={:#x} rip={:#x} sp={:#x}",
-                    pid, func, thread_arg, original_rip, sp);
+                // Reject the explicitly-illegal combination per clone3(2).
+                if clone_flags & CLONE_CLEAR_SIGHAND != 0
+                    && clone_flags & CLONE_SIGHAND != 0
+                {
+                    return -22; // EINVAL
+                }
+
+                crate::serial_println!("[CLONE3-VM] pid={} func={:#x} arg={:#x} rip={:#x} sp={:#x} clear_sighand={}",
+                    pid, func, thread_arg, original_rip, sp,
+                    clone_flags & CLONE_CLEAR_SIGHAND != 0);
 
                 match crate::proc::fork_process_share_vm(pid, parent_tid, &parent_regs) {
                     Some((child_pid, child_tid)) => {
+                        // CLONE_CLEAR_SIGHAND: reset child's sigactions (SIG_IGN
+                        // preserved, everything else → SIG_DFL).  Done AFTER
+                        // fork_process_share_vm so the child has its own fresh
+                        // SignalState to mutate.  Per clone3(2).
+                        if clone_flags & CLONE_CLEAR_SIGHAND != 0 {
+                            crate::proc::clear_sighand(child_pid);
+                        }
+
                         // Set func/arg and original RIP BEFORE unblocking
                         {
                             let mut threads = crate::proc::THREAD_TABLE.lock();

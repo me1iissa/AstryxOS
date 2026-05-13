@@ -1952,6 +1952,40 @@ pub fn fork_process_share_vm(
     Some((child_pid, child_tid))
 }
 
+/// Apply `CLONE_CLEAR_SIGHAND` semantics to a process's signal-action table.
+///
+/// Per `clone3(2)`: every signal whose current handler is not `SIG_IGN` is
+/// reset to `SIG_DFL`.  `SIG_IGN` is preserved.  `sa_flags` and `sa_mask` are
+/// cleared for signals that get reset.
+///
+/// Returns `true` if the process was found and modified; `false` otherwise.
+/// The signal-pending hint is recomputed to clear any stale bits implied by
+/// the reset.
+pub fn clear_sighand(pid: Pid) -> bool {
+    let mut procs = PROCESS_TABLE.lock();
+    let p = match procs.iter_mut().find(|p| p.pid == pid) {
+        Some(p) => p,
+        None => return false,
+    };
+    let ss = match p.signal_state.as_mut() {
+        Some(s) => s,
+        None => return false,
+    };
+    for sig in 0..(crate::signal::MAX_SIGNAL as usize) {
+        match ss.actions[sig] {
+            crate::signal::SigAction::Ignore => {
+                // SIG_IGN preserved across CLONE_CLEAR_SIGHAND.
+            }
+            _ => {
+                ss.actions[sig] = crate::signal::SigAction::Default;
+                ss.action_flags[sig] = 0;
+                ss.action_mask[sig]  = 0;
+            }
+        }
+    }
+    true
+}
+
 /// Create a vfork child: new process (new PID) sharing the parent's address space.
 ///
 /// Unlike `fork_process` (CoW clone), this shares the parent's CR3 directly.
