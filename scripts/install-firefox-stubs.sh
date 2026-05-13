@@ -255,13 +255,67 @@ _EXACT_CATEGORY = {
     'g_spawn_close_pid':        'void_noop',
     'g_spawn_check_exit_status':'bool_true',
     'g_spawn_check_wait_status':'bool_true',
+    # --- fontconfig: pointer-returning entries Mozilla's font-list init
+    # path expects to be non-NULL.  These either don't match the
+    # constructor pattern rule (no trailing _new) or are getters that
+    # legitimately produce FcConfig* / FcFontSet* / FcPattern* objects.
+    # gfxFcPlatformFontList iterates set->nfont in a for-loop; pointing
+    # at the zero-initialised _stub_placeholder makes the loop body
+    # execute zero times and the function returns cleanly without
+    # touching set->fonts. Spec: https://fontconfig.org/ — FcFontSet
+    # is {int nfont; int sfont; FcPattern **fonts;}.
+    'FcPatternCreate':         'opaque_ptr',
+    'FcPatternDuplicate':      'opaque_ptr',
+    'FcNameParse':             'opaque_ptr',
+    'FcObjectSetBuild':        'opaque_ptr',
+    'FcConfigGetCurrent':      'opaque_ptr',
+    'FcConfigGetFonts':        'opaque_ptr',
+    'FcConfigReference':       'opaque_ptr',
+    'FcFontList':              'opaque_ptr',
+    'FcFontMatch':             'opaque_ptr',
+    'FcFontSort':              'opaque_ptr',
+    'FcFontRenderPrepare':     'opaque_ptr',
+    # FcNameUnparse returns char* (FcChar8*) — Mozilla wraps in
+    # nsDependentCString which deref's the buffer; pointing at the
+    # zeroed placeholder gives it a valid empty NUL-terminated string.
+    'FcNameUnparse':           'opaque_ptr',
+    # FcInitBringUptoDate returns FcBool — TRUE (1) keeps Mozilla's
+    # init-success path; default 'null' returns 0/FALSE which can
+    # trigger fallback paths that re-read the (still NULL) config.
+    'FcInitBringUptoDate':     'bool_true',
+    # FcGetVersion returns int (e.g. 21300 = "2.13.0"). gfxFcPlatformFontList
+    # gates several "old fontconfig" code paths on FcGetVersion() < 20900.
+    # Default 'null' returns 0, which forces the OLD path that then calls
+    # FcNameUnparse and constructs nsDependentCString on the result.
+    # Returning a modern version steers Mozilla into the safer new path.
+    # Spec: https://fontconfig.org/fontconfig-devel/fcgetversion.html
+    'FcGetVersion':            'fc_version',
 }
 
 # Pattern-based rules applied when no exact match.
 # Each entry: (compiled_regex, category)
+#
+# Conventions seen in libxul's undefined-symbol set:
+#   *_new       — GLib/GTK/Pango idiom (lowercase, trailing _new)
+#   *_alloc     — generic
+#   *_create    — Cairo / XCB / wayland idiom (lowercase, trailing _create
+#                 or _create_<variant> e.g. cairo_image_surface_create,
+#                 cairo_image_surface_create_for_data)
+#   *Create     — fontconfig / X11 idiom (CamelCase, trailing Create
+#                 e.g. FcPatternCreate, XDamageCreate)
+# Every one of these is a pointer-returning constructor that, when
+# stubbed to return NULL, gives Mozilla a NULL ref-counted handle which
+# is then dereferenced further in.  Classify them all as opaque_ptr so
+# the stub returns the zeroed _stub_placeholder.
 _PATTERN_RULES = [
-    # allocators: names ending with _new, _alloc, _malloc, _calloc
+    # constructors: names ending with _new, _alloc, _malloc, _calloc
     (re.compile(r'(?:_new|_alloc|_malloc|_calloc)$'),          'opaque_ptr'),
+    # constructors (Cairo/XCB idiom): _create, or _create_<variant>
+    # e.g. cairo_image_surface_create, cairo_image_surface_create_for_data
+    (re.compile(r'_create(?:_[A-Za-z0-9_]+)?$'),               'opaque_ptr'),
+    # constructors (fontconfig/X11 idiom): trailing CamelCase Create
+    # e.g. FcPatternCreate, XDamageCreate, XCompositeCreateRegion-style
+    (re.compile(r'[A-Z][A-Za-z0-9]+Create(?:[A-Z][A-Za-z0-9]*)?$'), 'opaque_ptr'),
     # free/unref: names ending with _free, _unref, _destroy, _close, _release
     (re.compile(r'(?:_free|_unref|_destroy|_close|_release)$'), 'unref_noop'),
     # ref: names ending with _ref or _ref_sink
@@ -308,8 +362,20 @@ _C_PREAMBLE = """\
 extern char **environ;
 
 /* Singleton placeholder: returned by object-constructor stubs.
- * Read-only, always non-NULL, safe to pass back into unref/free stubs. */
-static const int _stub_placeholder = 0;
+ * Read-only, always non-NULL, safe to pass back into unref/free stubs.
+ *
+ * Sized at 128 bytes so callers that treat the result as a struct and
+ * read fields beyond the first int (e.g. fontconfig FcFontSet has
+ * {int nfont; int sfont; FcPattern **fonts;} — 16 bytes; nsRefPtr-wrapped
+ * Mozilla iterators dereference offsets up to ~64 bytes during shape /
+ * lang-tag walks) all observe zero values rather than adjacent rodata.
+ * For pointer-returning getters this gives a safe "empty zero-initialised
+ * object" without ever needing a real backing allocation.
+ *
+ * Spec: https://fontconfig.org/fontconfig-devel/fcfontsetcreate.html
+ * (FcFontSet layout: nfont @ offset 0 — the loop-bound — drives every
+ * Mozilla iterator that calls these stubs.) */
+static const long _stub_placeholder[16] = {0};
 
 /* GSpawnFlags bits we honour (spec: GLib docs — GSpawnFlags).
  * Others (LEAVE_DESCRIPTORS_OPEN, FILE_AND_ARGV_ZERO, etc.) are ignored —
@@ -591,6 +657,17 @@ def emit_stub(name, cat):
         return (
             f'void* {name}(...) {{\n'
             f'    return (void*)&_stub_placeholder;\n'
+            f'}}\n'
+        )
+    elif cat == 'fc_version':
+        # FcGetVersion() returns int (encoded major*10000+minor*100+rev).
+        # 21300 = fontconfig 2.13.0 — picked to (a) clear the < 20900
+        # legacy-fontconfig branch at gfxFcPlatformFontList:1673 and
+        # (b) avoid the 21094..21101 charset-parse-bug range. Spec:
+        # https://fontconfig.org/fontconfig-devel/fcgetversion.html
+        return (
+            f'int {name}(void) {{\n'
+            f'    return 21300;\n'
             f'}}\n'
         )
     elif cat == 'spawn_with_pipes':

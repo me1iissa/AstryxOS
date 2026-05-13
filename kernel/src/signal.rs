@@ -743,9 +743,14 @@ pub unsafe fn deliver_sigsegv_from_isr(
     sig_state.blocked |= 1u64 << SIGSEGV;
     sig_state.blocked &= !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
 
+    // user_rip is the userspace instruction pointer at fault time (before
+    // the IRET redirect to handler_addr).  Logging it inline saves post-
+    // mortem investigators a kdb step: with the libxul base address from
+    // dmesg they can subtract it to get the file offset and addr2line the
+    // exact source line that faulted.
     crate::serial_println!(
-        "[SIGNAL] SIGSEGV ISR delivery: PID={} CR2={:#x} handler={:#x} new_rsp={:#x}",
-        pid, cr2, handler_addr, new_rsp
+        "[SIGNAL] SIGSEGV ISR delivery: PID={} CR2={:#x} user_rip={:#x} handler={:#x} new_rsp={:#x}",
+        pid, cr2, user_rip, handler_addr, new_rsp
     );
 
     true
