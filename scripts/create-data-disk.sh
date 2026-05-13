@@ -124,6 +124,41 @@ if [ -f "${ROOT_DIR}/scripts/install-dbus-real.sh" ]; then
         echo "[DATA-DISK] WARNING: install-dbus-real.sh failed — libdbus-1 stub remains"
 fi
 
+# ── Build libfontconfig-interposer.so (defensive wrapper) ────────────────────
+# Real libfontconfig (installed by install-fonts-real.sh above) follows the
+# spec strictly: FcPatternGetString leaves *out untouched on FcResultNoMatch.
+# Firefox's gfxFcPlatformFontList caller dereferences *out unconditionally on
+# that path (post-PR #179 W91 regression — libxul+0x185b8a4 / +0x4056429
+# %rbx=NULL faults).  The interposer wraps FcPatternGetString, calls through
+# to real libfontconfig via dlsym(RTLD_NEXT, ...), and on NoMatch writes a
+# non-NULL sentinel ("DejaVu Sans") into *out.  Loaded via LD_PRELOAD in the
+# firefox-test envp (see kernel/src/gui/terminal.rs).
+# Spec: https://fontconfig.org/fontconfig-devel/fcpatternget.html
+INTERPOSER_DIR="${ROOT_DIR}/userspace/libfontconfig-interposer"
+INTERPOSER_SO="libfontconfig-interposer.so"
+if [ -d "${INTERPOSER_DIR}" ] && command -v gcc &>/dev/null; then
+    INTERPOSER_OUT="${BUILD_DIR}/disk/lib64/${INTERPOSER_SO}"
+    if [ ! -f "${INTERPOSER_OUT}" ] || [ "${FORCE}" = true ] || \
+       [ "${INTERPOSER_DIR}/interposer.c" -nt "${INTERPOSER_OUT}" ]; then
+        if make -C "${INTERPOSER_DIR}" \
+                SONAME="${INTERPOSER_SO}" \
+                OUTDIR="${BUILD_DIR}/disk/lib64" \
+                >/dev/null 2>&1; then
+            echo "[DATA-DISK] Built libfontconfig-interposer.so ($(stat -c%s "${INTERPOSER_OUT}") bytes)"
+            # Mirror to /lib/x86_64-linux-gnu/ so LD_LIBRARY_PATH lookups
+            # also resolve it (LD_PRELOAD uses the absolute path, but
+            # mirroring keeps the multiarch tree consistent).
+            mkdir -p "${BUILD_DIR}/disk/lib/x86_64-linux-gnu"
+            cp "${INTERPOSER_OUT}" \
+               "${BUILD_DIR}/disk/lib/x86_64-linux-gnu/${INTERPOSER_SO}"
+        else
+            echo "[DATA-DISK] WARNING: libfontconfig-interposer build failed"
+        fi
+    else
+        echo "[DATA-DISK] libfontconfig-interposer.so up to date"
+    fi
+fi
+
 # ── Compile glibc_hello oracle binary if source present ──────────────────────
 GLIBC_HELLO_SRC="${ROOT_DIR}/userspace/glibc_hello.c"
 GLIBC_HELLO_BIN="${BUILD_DIR}/glibc_hello"
