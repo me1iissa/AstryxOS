@@ -5922,48 +5922,93 @@ fn write_hex64(out: &mut Vec<u8>, mut v: u64) {
 fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
     use crate::ipc::epoll::{EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP};
 
-    // Snapshot fd metadata with a brief lock hold.
-    let info: Option<(u64, u32, bool, bool, crate::vfs::FileType)> = {
+    // Snapshot fd metadata with a brief lock hold.  `mount_idx == usize::MAX`
+    // together with the SOCKET_FD bit (`0x4000_0000`) in `flags` identifies a
+    // socket fd; the UNIX_SOCKET_FLAG bit (`0x0080_0000`) disambiguates
+    // AF_UNIX from AF_INET/AF_INET6 — matching `is_socket_fd` /
+    // `is_unix_socket_fd` in `crate::syscall`.
+    let info: Option<(u64, u32, bool, bool, crate::vfs::FileType, usize)> = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         procs.iter().find(|p| p.pid == pid).and_then(|proc| {
             proc.file_descriptors.get(fd)?.as_ref().map(|f| {
                 let is_epoll = f.open_path.as_str() == "[epoll]";
-                (f.inode, f.flags, f.is_console, is_epoll, f.file_type)
+                (f.inode, f.flags, f.is_console, is_epoll, f.file_type, f.mount_idx)
             })
         })
     };
 
+    const SOCKET_FD_BIT:  u32 = 0x4000_0000;
+    const UNIX_SOCK_BIT:  u32 = 0x0080_0000;
+    const PIPE_FD_BIT:    u32 = 0x8000_0000;
+    const O_WRONLY_BIT:   u32 = 0x01;
+
     match info {
         None => match fd { 0 => 0, 1 | 2 => EPOLLOUT, _ => EPOLLERR },
-        Some((_, _, _, true, _)) => 0,
-        Some((_, _, true, _, _)) => EPOLLOUT,
-        Some((inode, _flags, false, false, crate::vfs::FileType::EventFd)) => {
+        Some((_, _, _, true, _, _)) => 0,
+        Some((_, _, true, _, _, _)) => EPOLLOUT,
+        Some((inode, _flags, false, false, crate::vfs::FileType::EventFd, _)) => {
             if crate::ipc::eventfd::is_readable(inode) { EPOLLIN } else { 0 }
         }
-        Some((inode, _flags, false, false, crate::vfs::FileType::TimerFd)) => {
+        Some((inode, _flags, false, false, crate::vfs::FileType::TimerFd, _)) => {
             if crate::ipc::timerfd::is_readable(inode) { EPOLLIN } else { 0 }
         }
-        Some((inode, _flags, false, false, crate::vfs::FileType::SignalFd)) => {
+        Some((inode, _flags, false, false, crate::vfs::FileType::SignalFd, _)) => {
             if crate::ipc::signalfd::is_readable(inode) { EPOLLIN } else { 0 }
         }
-        Some((_inode, _flags, false, false, crate::vfs::FileType::InotifyFd)) => {
+        Some((_inode, _flags, false, false, crate::vfs::FileType::InotifyFd, _)) => {
             0 // stub: never delivers events
         }
-        Some((inode, _flags, false, false, crate::vfs::FileType::PtyMaster)) => {
+        Some((inode, _flags, false, false, crate::vfs::FileType::PtyMaster, _)) => {
             if crate::drivers::pty::master_readable(inode as u8) { EPOLLIN | EPOLLOUT } else { EPOLLOUT }
         }
-        Some((inode, _flags, false, false, crate::vfs::FileType::PtySlave)) => {
+        Some((inode, _flags, false, false, crate::vfs::FileType::PtySlave, _)) => {
             if crate::drivers::pty::slave_readable(inode as u8) { EPOLLIN | EPOLLOUT } else { EPOLLOUT }
         }
-        Some((inode, flags, false, false, _)) => {
-            if flags & 0x8000_0000 != 0 {
-                // Pipe fd
-                if flags & 0x01 == 0 {
+        Some((inode, flags, false, false, _, mount_idx)) => {
+            // Pipe — readable end signals EPOLLIN on data and EPOLLHUP on
+            // writer-close EOF.  Per POSIX `poll(2)`, `POLLHUP` is set even
+            // when not requested and may coexist with `POLLIN` while data
+            // remains buffered.
+            if flags & PIPE_FD_BIT != 0 {
+                if flags & O_WRONLY_BIT == 0 {
                     if crate::ipc::pipe::pipe_has_data(inode)    { EPOLLIN }
                     else if crate::ipc::pipe::pipe_is_eof(inode) { EPOLLHUP }
                     else { 0 }
                 } else {
                     EPOLLOUT
+                }
+            } else if mount_idx == usize::MAX && flags & SOCKET_FD_BIT != 0 {
+                // Socket fd.  AF_UNIX uses an in-memory ring (always
+                // writable for partial writes) — gate EPOLLIN on the
+                // backend `has_data()` instead of asserting readability
+                // unconditionally, which would make `epoll_wait` return
+                // readable for an empty socket and force userspace to
+                // burn cycles on `recvmsg → -EAGAIN` (POSIX `epoll_wait(2)`
+                // edge-trigger spurious-wake guidance, and the Mozilla
+                // IPC spin pattern observed under firefox-test).
+                //
+                // AF_INET goes through the protocol's `socket_has_data`
+                // — same shape, distinct backend.
+                if flags & UNIX_SOCK_BIT != 0 {
+                    let mut ev = EPOLLOUT;
+                    let has_d = crate::net::unix::has_data(inode);
+                    if has_d {
+                        ev |= EPOLLIN;
+                    }
+                    if crate::net::unix::peer_closed(inode) {
+                        // Buffered bytes win over EOF for the EPOLLIN
+                        // signal but coexist with EPOLLHUP so a draining
+                        // reader can finish before observing the
+                        // half-close — per `poll(2)`/`epoll_wait(2)`.
+                        ev |= EPOLLHUP;
+                    }
+                    ev
+                } else {
+                    let mut ev = EPOLLOUT;
+                    if crate::net::socket::socket_has_data(inode) {
+                        ev |= EPOLLIN;
+                    }
+                    ev
                 }
             } else {
                 EPOLLIN | EPOLLOUT
