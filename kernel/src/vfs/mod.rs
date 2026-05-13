@@ -50,6 +50,14 @@ pub enum VfsError {
     Unsupported = 95,   // EOPNOTSUPP
     Io = 5,             // EIO
     WouldBlock = 11,    // EAGAIN / EWOULDBLOCK
+    /// Operation could not complete within an internal wall-clock budget.
+    /// Currently emitted by `resolve_path_opts` when a single path resolution
+    /// exceeds the 1s deadline — see W83 wedge (`/usr → /disk/usr` symlink
+    /// traversal hung indefinitely in 2/3 firefox-test trials).  POSIX `open(2)`
+    /// does not list ETIMEDOUT, but Linux uses it for several FS paths under
+    /// extreme contention (e.g. NFS) and it cleanly distinguishes a hang from
+    /// EIO or ENOENT in serial logs.
+    TimedOut = 110,     // ETIMEDOUT
 }
 
 impl From<VfsError> for astryx_shared::NtStatus {
@@ -69,6 +77,7 @@ impl From<VfsError> for astryx_shared::NtStatus {
             VfsError::Unsupported => STATUS_NOT_SUPPORTED,
             VfsError::Io => STATUS_IO_DEVICE_ERROR,
             VfsError::WouldBlock => STATUS_NO_MORE_FILES,
+            VfsError::TimedOut => STATUS_TIMEOUT,
         }
     }
 }
@@ -889,13 +898,92 @@ fn init_ata_disks() {
 
 /// Resolve a path to (mount_index, inode), following all symlinks.
 pub fn resolve_path(path: &str) -> VfsResult<(usize, u64)> {
-    resolve_path_opts(path, 0, true)
+    let deadline = resolve_deadline_ticks();
+    let mut tctx = ResolveTrace::new();
+    resolve_path_opts(path, 0, true, deadline, &mut tctx)
 }
 
 /// Resolve a path but do NOT follow the final component if it is a symlink.
 /// Intermediate symlinks are still followed.  Used by lstat() and readlink().
 fn resolve_path_no_follow(path: &str) -> VfsResult<(usize, u64)> {
-    resolve_path_opts(path, 0, false)
+    let deadline = resolve_deadline_ticks();
+    let mut tctx = ResolveTrace::new();
+    resolve_path_opts(path, 0, false, deadline, &mut tctx)
+}
+
+/// Test-only entrypoint to resolve a path with a caller-supplied deadline.
+///
+/// Exposed so `test_runner` can verify that the W83 deadline fires when the
+/// budget has already expired.  Production callers must use [`resolve_path`].
+#[doc(hidden)]
+pub fn _test_resolve_with_deadline(path: &str, deadline_ticks: u64) -> VfsResult<(usize, u64)> {
+    let mut tctx = ResolveTrace::new();
+    resolve_path_opts(path, 0, true, deadline_ticks, &mut tctx)
+}
+
+/// Compute the absolute tick value at which a path resolution must give up.
+///
+/// PIT runs at ~100 Hz (`arch::x86_64::irq::init`), so 100 ticks ≈ 1 s.  See
+/// the docstring on [`resolve_path_opts`] for why this bound exists.  When
+/// the tick counter hasn't been wired up yet (extremely early boot), we set
+/// the deadline to `u64::MAX` so the deadline check is a no-op — the boot
+/// path that runs before IRQs are unmasked must not be capable of being
+/// "timed out" because there's no clock to measure against.
+#[inline]
+fn resolve_deadline_ticks() -> u64 {
+    let now = crate::arch::x86_64::irq::get_ticks();
+    if now == 0 {
+        // PIT not yet ticking — disable the deadline rather than fail closed.
+        u64::MAX
+    } else {
+        now.saturating_add(100)
+    }
+}
+
+/// Per-resolution trace state.
+///
+/// We cap to a small number of lines per outermost resolve to keep the
+/// serial log readable even on a wedged path (which would otherwise emit
+/// one line per loop iteration × symlink-recursion-depth combinations).
+struct ResolveTrace {
+    /// Lines already emitted by this outermost resolve call (and its
+    /// recursive descendants).
+    emitted: u32,
+}
+
+impl ResolveTrace {
+    const MAX_LINES: u32 = 20;
+    #[inline]
+    fn new() -> Self { Self { emitted: 0 } }
+}
+
+/// Emit one `[VFS/resolve]` trace line, respecting the per-resolve cap.
+///
+/// Gated behind the `vfs-trace` feature flag (always-on diagnostic) and
+/// `firefox-test` (default-on for the browser bring-up).  In a release build
+/// without either flag, this compiles to nothing — the deadline still fires,
+/// but per-component spew does not.  The serial log on the `firefox-test`
+/// path is already dense; capping the emitter avoids flooding it when a path
+/// genuinely needs >20 iterations to resolve.
+#[inline]
+fn resolve_trace(tctx: &mut ResolveTrace, args: core::fmt::Arguments<'_>) {
+    #[cfg(any(feature = "vfs-trace", feature = "firefox-test"))]
+    {
+        if tctx.emitted < ResolveTrace::MAX_LINES {
+            crate::serial_println!("{}", args);
+            tctx.emitted += 1;
+            if tctx.emitted == ResolveTrace::MAX_LINES {
+                crate::serial_println!(
+                    "[VFS/resolve] (trace cap reached, suppressing further per-component lines)"
+                );
+            }
+        }
+    }
+    #[cfg(not(any(feature = "vfs-trace", feature = "firefox-test")))]
+    {
+        let _ = tctx;
+        let _ = args;
+    }
 }
 
 /// Inner resolver with symlink depth tracking and final-follow control.
@@ -903,7 +991,34 @@ fn resolve_path_no_follow(path: &str) -> VfsResult<(usize, u64)> {
 /// * `follow_final` – when `true`, follow the last path component if it is a
 ///   symlink (stat / open behaviour).  When `false`, stop at the symlink inode
 ///   itself (lstat / readlink behaviour).
-fn resolve_path_opts(path: &str, depth: u32, follow_final: bool) -> VfsResult<(usize, u64)> {
+///
+/// # Wall-clock deadline (W83 safety net)
+///
+/// Some pathological combinations of mount-table layout, symlinks, and
+/// concrete-FS state can cause path resolution to make no forward progress
+/// (W83 reproducer: every `firefox-test` trial wedged on the first traversal
+/// of `/usr → /disk/usr/.../libGL.so.1`).  To bound the worst case we compute
+/// an absolute 1s deadline at the outermost call (`resolve_path` /
+/// `resolve_path_no_follow`) and thread it through `resolve_path_opts` as an
+/// explicit argument, so a symlink chase cannot reset the budget by
+/// recursing.  When the deadline expires we return [`VfsError::TimedOut`]
+/// (`ETIMEDOUT`, errno 110) and emit `[VFS/resolve] DEADLINE EXCEEDED` to the
+/// serial log along with the partial-resolved path — the exact diagnostic
+/// that names the hang point.
+///
+/// One second is intentionally generous: every block-backed FS in this
+/// kernel has its own sub-second IRQ-or-poll budget per disk request and a
+/// directory of a few hundred entries reads in well under that limit even
+/// on virtio-blk poll-fallback (~100ms worst case, per `wait_completion`).
+/// If a real workload ever legitimately exceeds 1s of pure VFS work, raise
+/// the bound — don't remove it.
+fn resolve_path_opts(
+    path: &str,
+    depth: u32,
+    follow_final: bool,
+    deadline_ticks: u64,
+    tctx: &mut ResolveTrace,
+) -> VfsResult<(usize, u64)> {
     const MAX_SYMLINK_DEPTH: u32 = 16;
     if depth > MAX_SYMLINK_DEPTH {
         return Err(VfsError::NotFound); // symlink loop
@@ -951,6 +1066,21 @@ fn resolve_path_opts(path: &str, depth: u32, follow_final: bool) -> VfsResult<(u
     for (i, component) in remaining.iter().enumerate() {
         let is_final = i + 1 == remaining.len();
 
+        // ── W83 trace: per-component progress marker ────────────────────────
+        resolve_trace(tctx, format_args!(
+            "[VFS/resolve] depth={} component='{}' cur_mount={} resolved_so_far='{}'",
+            depth, component, cur_mount, resolved_so_far,
+        ));
+
+        // ── W83 deadline: bail out before the next concrete-FS dispatch ────
+        if crate::arch::x86_64::irq::get_ticks() >= deadline_ticks {
+            crate::serial_println!(
+                "[VFS/resolve] DEADLINE EXCEEDED depth={} stuck-at='{}' next-component='{}' input-path='{}'",
+                depth, resolved_so_far, component, path,
+            );
+            return Err(VfsError::TimedOut);
+        }
+
         // Snapshot the current FS handle before each dispatch.  Holding
         // `MOUNTS` across `lookup` / `stat` / `readlink` would deadlock if
         // the FS implementation faults on a user-supplied or file-backed
@@ -975,10 +1105,12 @@ fn resolve_path_opts(path: &str, depth: u32, follow_final: bool) -> VfsResult<(u
             let target = fs.readlink(child_inode)?;
 
             // Build the new path: target + remaining components after this one.
+            // We borrow `target` here rather than moving it so the W83 trace
+            // below can still print its raw value.
             let rest: Vec<&str> = remaining[i + 1..].to_vec();
-            let new_path = if rest.is_empty() {
+            let new_path: String = if rest.is_empty() {
                 if target.starts_with('/') {
-                    target
+                    target.clone()
                 } else {
                     alloc::format!("{}/{}", resolved_so_far.trim_end_matches('/'), target)
                 }
@@ -993,7 +1125,11 @@ fn resolve_path_opts(path: &str, depth: u32, follow_final: bool) -> VfsResult<(u
             // Recurse with incremented depth.  When following intermediate
             // symlinks the recursive call always follows the final component
             // (the rest of the path after the symlink).
-            return resolve_path_opts(&new_path, depth + 1, true);
+            resolve_trace(tctx, format_args!(
+                "[VFS/resolve] follow-symlink depth={} from='{}' target='{}' new_path='{}'",
+                depth, resolved_so_far, target, new_path,
+            ));
+            return resolve_path_opts(&new_path, depth + 1, true, deadline_ticks, tctx);
         }
 
         // Not a symlink — advance.
