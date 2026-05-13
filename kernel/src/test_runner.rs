@@ -303,6 +303,11 @@ pub fn run() -> ! {
     total += 1;
     if test_signal_subsystem() { passed += 1; }
 
+    // ── Test 18b: [SIGNAL/VMA] snapshot policy ──────────────────────────
+
+    total += 1;
+    if test_signal_vma_snapshot() { passed += 1; }
+
     // ── Test 19: Buffer Cache + File-Backed mmap ────────────────────────
 
     total += 1;
@@ -3851,6 +3856,87 @@ fn test_signal_subsystem() -> bool {
     test_println!("  default_action(SIGKILL)=Terminate, SIGCHLD=Ignore, SIGSTOP=Stop ✓");
 
     test_pass!("Signal delivery trampoline");
+    true
+}
+
+// ── Test 18b: [SIGNAL/VMA] snapshot policy ──────────────────────────────────
+
+/// Verifies `signal::signal_vma_snapshot()` picks:
+///   * the VMA containing `user_rip` (with `contains_rip=true`), and
+///   * neighbouring executable file-backed VMAs (likely shared libraries),
+/// while skipping non-executable or anonymous neighbours.
+///
+/// This is the snapshot that feeds the `[SIGNAL/VMA]` banner emitted at
+/// SIGSEGV ISR delivery time — see `kernel/src/signal.rs::emit_signal_vma_banner`.
+fn test_signal_vma_snapshot() -> bool {
+    test_header!("[SIGNAL/VMA] snapshot policy");
+    use crate::mm::vma::{VmArea, VmBacking, VmSpace,
+                         PROT_READ, PROT_WRITE, PROT_EXEC,
+                         MAP_PRIVATE, MAP_ANONYMOUS};
+    let space = VmSpace {
+        cr3: 0,
+        areas: alloc::vec![
+            // libxul .text (executable, file-backed) — should appear
+            VmArea {
+                base: 0x10_0000, length: 0x10_0000,
+                prot: PROT_READ | PROT_EXEC, flags: MAP_PRIVATE,
+                backing: VmBacking::File { mount_idx: 0, inode: 1, offset: 0 },
+                name: "[mmap-file]",
+            },
+            // libxul .data (rw, file-backed, NOT exec) — should be skipped
+            VmArea {
+                base: 0x20_0000, length: 0x1_0000,
+                prot: PROT_READ | PROT_WRITE, flags: MAP_PRIVATE,
+                backing: VmBacking::File { mount_idx: 0, inode: 1, offset: 0x10_0000 },
+                name: "[mmap-file]",
+            },
+            // libc .text (executable, file-backed) — should appear
+            VmArea {
+                base: 0x30_0000, length: 0x4_0000,
+                prot: PROT_READ | PROT_EXEC, flags: MAP_PRIVATE,
+                backing: VmBacking::File { mount_idx: 0, inode: 2, offset: 0 },
+                name: "[mmap-file]",
+            },
+            // Anonymous heap (rw, not file-backed) — should be skipped
+            VmArea {
+                base: 0x40_0000, length: 0x1000,
+                prot: PROT_READ | PROT_WRITE, flags: MAP_PRIVATE | MAP_ANONYMOUS,
+                backing: VmBacking::Anonymous,
+                name: "[heap]",
+            },
+        ],
+        mmap_hint: 0, brk: 0, brk_start: 0,
+    };
+    // user_rip lands inside the libxul .text VMA at offset 0x1234.
+    let user_rip = 0x10_0000 + 0x1234;
+    let snap = crate::signal::signal_vma_snapshot(Some(&space), user_rip);
+    if snap.len() != 2 {
+        test_fail!("[SIGNAL/VMA] snapshot policy",
+                   "expected 2 entries (libxul .text + libc .text), got {}", snap.len());
+        return false;
+    }
+    // First entry must be the libxul .text (contains user_rip).
+    if !snap[0].contains_rip || snap[0].base != 0x10_0000 || !snap[0].file_backed {
+        test_fail!("[SIGNAL/VMA] snapshot policy",
+                   "entry 0 should be libxul .text containing rip (base={:#x} rip={} file={})",
+                   snap[0].base, snap[0].contains_rip, snap[0].file_backed);
+        return false;
+    }
+    // Second entry must be libc .text (executable, file-backed, no rip).
+    if snap[1].contains_rip || snap[1].base != 0x30_0000 || !snap[1].file_backed {
+        test_fail!("[SIGNAL/VMA] snapshot policy",
+                   "entry 1 should be libc .text (base={:#x} rip={} file={})",
+                   snap[1].base, snap[1].contains_rip, snap[1].file_backed);
+        return false;
+    }
+    // None-space case: snapshot must return empty.
+    let empty = crate::signal::signal_vma_snapshot(None, 0);
+    if !empty.is_empty() {
+        test_fail!("[SIGNAL/VMA] snapshot policy",
+                   "None space should produce empty snapshot, got {}", empty.len());
+        return false;
+    }
+    test_pass!("[SIGNAL/VMA] snapshot policy");
     true
 }
 
