@@ -313,9 +313,18 @@ _PATTERN_RULES = [
     # constructors (Cairo/XCB idiom): _create, or _create_<variant>
     # e.g. cairo_image_surface_create, cairo_image_surface_create_for_data
     (re.compile(r'_create(?:_[A-Za-z0-9_]+)?$'),               'opaque_ptr'),
-    # constructors (fontconfig/X11 idiom): trailing CamelCase Create
-    # e.g. FcPatternCreate, XDamageCreate, XCompositeCreateRegion-style
-    (re.compile(r'[A-Z][A-Za-z0-9]+Create(?:[A-Z][A-Za-z0-9]*)?$'), 'opaque_ptr'),
+    # constructors (fontconfig/X11 idiom): CamelCase Create — covers both
+    # the SUFFIX form (FcPatternCreate, XDamageCreate, XFixesCreateRegion)
+    # and the PREFIX form (XCreatePixmap, XCreateGC, XCreateBitmapFromData,
+    # XCreateImage, XCreateWindow, XCreateColormap, XCreateRegion).
+    # The leading char class is `[A-Z][A-Za-z0-9]*` (≥1 char) — previously
+    # ≥2 chars, which silently excluded the X-prefix family.  All matched
+    # names are pointer-returning constructors per the Xlib spec; returning
+    # the zeroed _stub_placeholder is safe because Mozilla's worker init
+    # paths use these results as opaque handles (Pixmap/GC/Colormap IDs
+    # are XIDs treated as resources, not dereferenced in the stub library).
+    # Spec: X11 protocol §10, Xlib programming manual.
+    (re.compile(r'[A-Z][A-Za-z0-9]*Create(?:[A-Z][A-Za-z0-9]*)?$'), 'opaque_ptr'),
     # free/unref: names ending with _free, _unref, _destroy, _close, _release
     (re.compile(r'(?:_free|_unref|_destroy|_close|_release)$'), 'unref_noop'),
     # ref: names ending with _ref or _ref_sink
