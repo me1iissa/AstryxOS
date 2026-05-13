@@ -93,7 +93,15 @@ impl Default for CpuContext {
 /// User-mode callee-saved registers captured at fork() time.
 /// The fork child restores these before iretq so that the parent's
 /// stack frame (e.g. glibc's __fork epilogue) looks identical in the child.
+///
+/// `#[repr(C)]` is required because `jump_to_user_mode`'s naked asm reads
+/// the six fields via fixed byte offsets (0, 8, 16, 24, 32, 40).  Changing
+/// field order without updating the offsets in `usermode.rs` would silently
+/// corrupt the fork child's register state.  See POSIX clone(2):
+/// "The contents of [callee-saved registers] are unchanged in the child."
+/// (https://man7.org/linux/man-pages/man2/clone.2.html)
 #[derive(Clone, Copy, Default)]
+#[repr(C)]
 pub struct ForkUserRegs {
     pub rbp: u64,
     pub rbx: u64,
@@ -1823,7 +1831,13 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
         first_run: true, // goes through user_mode_bootstrap (CR3 switch, TSS, TLS)
         ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
-        fork_user_regs: ForkUserRegs::default(),
+        // Propagate parent's callee-saved regs (RBP/RBX/R12-R15) into the child.
+        // glibc's _Fork@@GLIBC_2.34 epilogue reads `-0x18(%rbp)` for its stack
+        // canary check immediately after the clone3 syscall — if %rbp is zero
+        // in the child the load faults at -0x18 and the child dies before any
+        // IPC handshake.  Per POSIX clone(2), callee-saved registers must be
+        // unchanged in the child relative to the parent's clone() callsite.
+        fork_user_regs: *parent_regs,
         vfork_parent_tid: None,
         gs_base: 0,
         robust_list_head: 0,
@@ -2236,7 +2250,10 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
         first_run: true,  // Goes through user_mode_bootstrap (handles CR3, TSS, TLS)
         ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
-        fork_user_regs: ForkUserRegs::default(),
+        // Propagate parent callee-saved regs into the vfork child for the same
+        // reason as fork_process: glibc's clone wrapper / `_Fork` epilogue
+        // touches %rbp on return.  Per POSIX clone(2).
+        fork_user_regs: *parent_regs,
         vfork_parent_tid: None,
         gs_base: 0,
         robust_list_head: 0,

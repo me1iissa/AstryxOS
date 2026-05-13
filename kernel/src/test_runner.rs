@@ -1474,6 +1474,21 @@ pub fn run() -> ! {
     total += 1;
     if test_fat32_lock_discipline_w92() { passed += 1; }
 
+    // ── Test 213: fork callee-saved register propagation (W113) ──────────
+    // Regression guard for the contentproc-spawn gate: glibc's
+    // `_Fork@@GLIBC_2.34` epilogue reads `-0x18(%rbp)` for its stack-canary
+    // check right after the clone3 syscall.  Before this fix,
+    // `jump_to_user_mode` unconditionally `xor`-ed RBX/RBP/R12-R15, so fork
+    // children entered userspace with %rbp=0 and faulted on the canary
+    // load.  Per POSIX clone(2), callee-saved registers must be unchanged
+    // in the child relative to the parent's clone() callsite.  This test
+    // verifies that `fork_process` and `fork_process_share_vm` copy the
+    // parent's ForkUserRegs snapshot into the child's `fork_user_regs`
+    // field — which `user_mode_bootstrap` then hands to
+    // `jump_to_user_mode` for restoration before IRETQ.
+    total += 1;
+    if test_fork_callee_saved_propagation() { passed += 1; }
+
     // (Tests 199/200 run earlier — right after Test 80c — so the vDSO
     // TSC fast path is verified before the slow PNG screenshot test.
     // Stream-A pipe / eventfd wake-hook tests run first — see Tests
@@ -26535,6 +26550,171 @@ fn test_fat32_lock_discipline_w92() -> bool {
     test_println!("  no lock-held-across-IO violations ({} ops checked)", final_violations);
 
     test_pass!("FAT32 lock discipline (W92)");
+    true
+}
+
+/// Test 213: fork callee-saved register propagation (W113).
+///
+/// Verifies that both `fork_process` (CoW path) and `fork_process_share_vm`
+/// (CLONE_VM path) copy the parent's `ForkUserRegs` snapshot into the
+/// child's `fork_user_regs` thread field.
+///
+/// Why this matters: `user_mode_bootstrap` reads `fork_user_regs` and hands
+/// it to `jump_to_user_mode`, whose naked-asm trampoline loads the six
+/// callee-saved registers (RBP/RBX/R12-R15) immediately before IRETQ.
+/// Before this fix, `jump_to_user_mode` unconditionally zeroed those
+/// registers — so fork children entered userspace with %rbp=0 and faulted
+/// in glibc's `_Fork@@GLIBC_2.34` epilogue at the stack-canary load
+/// `mov -0x18(%rbp), %rax`.  Per POSIX clone(2): "The contents of [callee-
+/// saved] registers are unchanged in the child."
+///
+/// The test calls the fork helpers directly (rather than driving a full
+/// user-mode child) because IRETQ-to-userland is not safe to exercise from
+/// the test runner's BSP thread.  Validation here is "the kernel stores
+/// the right bytes in the right place"; end-to-end behaviour is covered
+/// by firefox-test reaching past the previous PID-3 SIGSEGV plateau.
+fn test_fork_callee_saved_propagation() -> bool {
+    test_header!("fork callee-saved register propagation (W113)");
+
+    let parent_pid = match crate::proc::usermode::create_user_process(
+        "w113_parent", &crate::proc::hello_elf::HELLO_ELF
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            test_fail!("w113", "create_user_process: {:?}", e);
+            return false;
+        }
+    };
+    let parent_tid = {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        threads.iter().find(|t| t.pid == parent_pid).map(|t| t.tid).unwrap_or(0)
+    };
+    test_println!("  parent PID {} TID {}", parent_pid, parent_tid);
+
+    // Distinct non-zero values for every callee-saved slot make a wrong-
+    // field-order regression easy to spot in the failure log.
+    let parent_regs = crate::proc::ForkUserRegs {
+        rbp: 0x1111_1111_1111_1111,
+        rbx: 0x2222_2222_2222_2222,
+        r12: 0x3333_3333_3333_3333,
+        r13: 0x4444_4444_4444_4444,
+        r14: 0x5555_5555_5555_5555,
+        r15: 0x6666_6666_6666_6666,
+    };
+
+    // ── Path 1: CoW fork (sys_fork / clone-without-CLONE_VM) ──────────────
+    let (child_pid_cow, child_tid_cow) = match crate::proc::fork_process(
+        parent_pid, parent_tid, &parent_regs
+    ) {
+        Some(x) => x,
+        None => {
+            test_fail!("w113", "fork_process returned None");
+            return false;
+        }
+    };
+
+    let child_regs_cow = {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        threads.iter().find(|t| t.tid == child_tid_cow)
+            .map(|t| t.fork_user_regs)
+            .unwrap_or_default()
+    };
+    if child_regs_cow.rbp != parent_regs.rbp
+        || child_regs_cow.rbx != parent_regs.rbx
+        || child_regs_cow.r12 != parent_regs.r12
+        || child_regs_cow.r13 != parent_regs.r13
+        || child_regs_cow.r14 != parent_regs.r14
+        || child_regs_cow.r15 != parent_regs.r15
+    {
+        test_fail!("w113",
+            "CoW child regs mismatch: rbp={:#x}/{:#x} rbx={:#x}/{:#x} r12={:#x}/{:#x} r13={:#x}/{:#x} r14={:#x}/{:#x} r15={:#x}/{:#x}",
+            child_regs_cow.rbp, parent_regs.rbp,
+            child_regs_cow.rbx, parent_regs.rbx,
+            child_regs_cow.r12, parent_regs.r12,
+            child_regs_cow.r13, parent_regs.r13,
+            child_regs_cow.r14, parent_regs.r14,
+            child_regs_cow.r15, parent_regs.r15,
+        );
+        return false;
+    }
+    test_println!("  CoW child PID {} TID {} fork_user_regs match parent ✓",
+        child_pid_cow, child_tid_cow);
+
+    // ── Path 2: shared-VM clone (clone3 + CLONE_VM, the posix_spawn path) ─
+    let (child_pid_sv, child_tid_sv) = match crate::proc::fork_process_share_vm(
+        parent_pid, parent_tid, &parent_regs
+    ) {
+        Some(x) => x,
+        None => {
+            test_fail!("w113", "fork_process_share_vm returned None");
+            return false;
+        }
+    };
+
+    let child_regs_sv = {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        threads.iter().find(|t| t.tid == child_tid_sv)
+            .map(|t| t.fork_user_regs)
+            .unwrap_or_default()
+    };
+    if child_regs_sv.rbp != parent_regs.rbp
+        || child_regs_sv.rbx != parent_regs.rbx
+        || child_regs_sv.r12 != parent_regs.r12
+        || child_regs_sv.r13 != parent_regs.r13
+        || child_regs_sv.r14 != parent_regs.r14
+        || child_regs_sv.r15 != parent_regs.r15
+    {
+        test_fail!("w113",
+            "share-VM child regs mismatch: rbp={:#x}/{:#x} rbx={:#x}/{:#x} r12={:#x}/{:#x} r13={:#x}/{:#x} r14={:#x}/{:#x} r15={:#x}/{:#x}",
+            child_regs_sv.rbp, parent_regs.rbp,
+            child_regs_sv.rbx, parent_regs.rbx,
+            child_regs_sv.r12, parent_regs.r12,
+            child_regs_sv.r13, parent_regs.r13,
+            child_regs_sv.r14, parent_regs.r14,
+            child_regs_sv.r15, parent_regs.r15,
+        );
+        return false;
+    }
+    test_println!("  share-VM child PID {} TID {} fork_user_regs match parent ✓",
+        child_pid_sv, child_tid_sv);
+
+    // ── ForkUserRegs struct layout invariant ─────────────────────────────
+    // `jump_to_user_mode` indexes this struct by raw byte offsets in its
+    // naked-asm trampoline (proc/usermode.rs).  Catch field-reorder
+    // regressions here rather than at the IRETQ landing site.
+    assert_eq!(core::mem::size_of::<crate::proc::ForkUserRegs>(), 48,
+        "ForkUserRegs must be 6 × u64 with no padding");
+    let probe = crate::proc::ForkUserRegs {
+        rbp: 1, rbx: 2, r12: 3, r13: 4, r14: 5, r15: 6,
+    };
+    unsafe {
+        let p = &probe as *const _ as *const u64;
+        if *p.add(0) != 1 || *p.add(1) != 2 || *p.add(2) != 3
+            || *p.add(3) != 4 || *p.add(4) != 5 || *p.add(5) != 6
+        {
+            test_fail!("w113", "ForkUserRegs field order ≠ rbp/rbx/r12/r13/r14/r15");
+            return false;
+        }
+    }
+    test_println!("  ForkUserRegs layout = [rbp, rbx, r12, r13, r14, r15] ✓");
+
+    // Cleanup.
+    for pid in [parent_pid, child_pid_cow, child_pid_sv] {
+        {
+            let mut threads = crate::proc::THREAD_TABLE.lock();
+            for t in threads.iter_mut() {
+                if t.pid == pid { t.state = crate::proc::ThreadState::Dead; }
+            }
+        }
+        {
+            let mut procs = crate::proc::PROCESS_TABLE.lock();
+            if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                p.state = crate::proc::ProcessState::Zombie;
+            }
+        }
+    }
+
+    test_pass!("fork callee-saved register propagation (W113)");
     true
 }
 
