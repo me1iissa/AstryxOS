@@ -259,22 +259,46 @@ _EXACT_CATEGORY = {
     # path expects to be non-NULL.  These either don't match the
     # constructor pattern rule (no trailing _new) or are getters that
     # legitimately produce FcConfig* / FcFontSet* / FcPattern* objects.
-    # gfxFcPlatformFontList iterates set->nfont in a for-loop; pointing
-    # at the zero-initialised _stub_placeholder makes the loop body
-    # execute zero times and the function returns cleanly without
-    # touching set->fonts. Spec: https://fontconfig.org/ — FcFontSet
-    # is {int nfont; int sfont; FcPattern **fonts;}.
+    #
+    # gfxFcPlatformFontList walks systemFonts->nfont in a for-loop and
+    # asserts MOZ_RELEASE_ASSERT(mFontFamilies.Count() > 0) at the end.
+    # If nfont==0 the loop body never runs, mFontFamilies stays empty,
+    # and the assert fires when GetDefaultFontFamily falls back.  We
+    # therefore route FcConfigGetFonts / FcFontList / FcFontSort to the
+    # 'fcfontset_one' stub — a single-element FcFontSet pointing at a
+    # real-ish FcPattern for DejaVu Sans, so the iterator finds exactly
+    # one font and AddPatternToFontList inserts one mFontFamilies entry.
+    # FcFontMatch / FcFontRenderPrepare return the same pattern.  Spec:
+    # https://fontconfig.org/fontconfig-devel/fcfontsetcreate.html and
+    # https://fontconfig.org/fontconfig-devel/fcpatterncreate.html.
     'FcPatternCreate':         'opaque_ptr',
     'FcPatternDuplicate':      'opaque_ptr',
     'FcNameParse':             'opaque_ptr',
     'FcObjectSetBuild':        'opaque_ptr',
     'FcConfigGetCurrent':      'opaque_ptr',
-    'FcConfigGetFonts':        'opaque_ptr',
+    'FcConfigGetFonts':        'fcfontset_one',
     'FcConfigReference':       'opaque_ptr',
-    'FcFontList':              'opaque_ptr',
-    'FcFontMatch':             'opaque_ptr',
-    'FcFontSort':              'opaque_ptr',
-    'FcFontRenderPrepare':     'opaque_ptr',
+    'FcFontList':              'fcfontset_one',
+    'FcFontMatch':             'fcpattern_one',
+    'FcFontSort':              'fcfontset_one',
+    'FcFontRenderPrepare':     'fcpattern_one',
+    # FcPatternGet* — typed stubs that return FcResult (int).  The
+    # default 'null' category returns 0 (= FcResultMatch) but leaves the
+    # out-pointer untouched, so Mozilla then dereferences uninitialised
+    # stack memory.  Explicit 'fc_no_match' returns FcResultNoMatch (1)
+    # for everything *except* FcPatternGetString, which has its own
+    # typed body that recognises FC_FILE / FC_FAMILY and writes a real
+    # DejaVu Sans descriptor — that's what lets AddPatternToFontList
+    # insert one entry into mFontFamilies. Spec:
+    # https://fontconfig.org/fontconfig-devel/fcpatternget.html
+    'FcPatternGetString':      'fc_pattern_get_string',
+    'FcPatternGetBool':        'fc_no_match',
+    'FcPatternGetInteger':     'fc_no_match',
+    'FcPatternGetDouble':      'fc_no_match',
+    'FcPatternGetCharSet':     'fc_no_match',
+    'FcPatternGetLangSet':     'fc_no_match',
+    'FcPatternGetFTFace':      'fc_no_match',
+    'FcPatternGet':            'fc_no_match',
     # FcNameUnparse returns char* (FcChar8*) — Mozilla wraps in
     # nsDependentCString which deref's the buffer; pointing at the
     # zeroed placeholder gives it a valid empty NUL-terminated string.
@@ -385,6 +409,59 @@ extern char **environ;
  * (FcFontSet layout: nfont @ offset 0 — the loop-bound — drives every
  * Mozilla iterator that calls these stubs.) */
 static const long _stub_placeholder[16] = {0};
+
+/* ── FcFontSet one-element stub ───────────────────────────────────────────
+ * Mozilla's gfxFcPlatformFontList iterates set->nfont; if the value is
+ * zero the assert MOZ_RELEASE_ASSERT(mFontFamilies.Count() > 0) fires.
+ * We expose a single-element FcFontSet whose only FcPattern is a typed
+ * marker that FcPatternGetString recognises as "DejaVu Sans / file =
+ * /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf".  AddFontSetFamilies
+ * then calls access(F_OK|R_OK) on the path — the TTF is installed on
+ * the data disk by create-data-disk.sh, so the access() succeeds and
+ * one entry is inserted into mFontFamilies.  Layout per public spec:
+ *   typedef struct _FcFontSet {
+ *       int nfont;        // [+0] number of fonts in set
+ *       int sfont;        // [+4] allocated capacity
+ *       FcPattern **fonts;// [+8] array of pattern pointers
+ *   } FcFontSet;
+ * Spec: https://fontconfig.org/fontconfig-devel/fcfontset-type.html */
+
+/* Sentinel value distinguishing the DejaVu pattern from _stub_placeholder.
+ * FcPatternGetString reads this first word; if it matches, the typed
+ * string-return path runs.  Other FcPattern* pointers fall through to
+ * the generic NoMatch path. */
+#define _STUB_FCPATTERN_MAGIC 0x5354554246434641UL  /* "AFCFBUTS" */
+
+static const unsigned long _stub_fcpattern_one[8]
+    __attribute__((unused)) = {
+    _STUB_FCPATTERN_MAGIC, 0, 0, 0, 0, 0, 0, 0,
+};
+
+static void * const _stub_fcfontset_fonts[1]
+    __attribute__((unused)) = {
+    (void *)&_stub_fcpattern_one,
+};
+
+/* C99 designated initialisers keep the layout robust if FcFontSet ever
+ * grows trailing fields.  We zero everything else and pin the three
+ * fields the public ABI specifies. */
+static const struct {
+    int    nfont;
+    int    sfont;
+    void * fonts;
+} _stub_fcfontset_one __attribute__((unused)) = {
+    .nfont = 1,
+    .sfont = 1,
+    .fonts = (void *)_stub_fcfontset_fonts,
+};
+
+/* The single font we advertise.  Path matches the canonical Debian /
+ * Ubuntu DejaVu install location and the build/disk staging path used
+ * by create-data-disk.sh. */
+static const char _stub_font_path[]   __attribute__((unused))
+    = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+static const char _stub_font_family[] __attribute__((unused))
+    = "DejaVu Sans";
 
 /* GSpawnFlags bits we honour (spec: GLib docs — GSpawnFlags).
  * Others (LEAVE_DESCRIPTORS_OPEN, FILE_AND_ARGV_ZERO, etc.) are ignored —
@@ -666,6 +743,72 @@ def emit_stub(name, cat):
         return (
             f'void* {name}(...) {{\n'
             f'    return (void*)&_stub_placeholder;\n'
+            f'}}\n'
+        )
+    elif cat == 'fcfontset_one':
+        # FcConfigGetFonts / FcFontList / FcFontSort — return the
+        # singleton one-element FcFontSet so Mozilla's per-font iterator
+        # finds exactly one entry.  Variadic signature handles the
+        # different argument counts (FcConfigGetFonts takes 2, FcFontList
+        # takes 4, FcFontSort takes 5).  Spec:
+        # https://fontconfig.org/fontconfig-devel/fcconfiggetfonts.html
+        return (
+            f'void* {name}(...) {{\n'
+            f'    return (void*)&_stub_fcfontset_one;\n'
+            f'}}\n'
+        )
+    elif cat == 'fcpattern_one':
+        # FcFontMatch / FcFontRenderPrepare — return the singleton
+        # DejaVu Sans FcPattern.  Mozilla's render-pattern path then
+        # calls FcPatternGetString(p, FC_FILE, ...) which our typed
+        # stub satisfies.  Spec:
+        # https://fontconfig.org/fontconfig-devel/fcfontmatch.html
+        return (
+            f'void* {name}(...) {{\n'
+            f'    return (void*)&_stub_fcpattern_one;\n'
+            f'}}\n'
+        )
+    elif cat == 'fc_no_match':
+        # FcPatternGet* (Bool / Integer / CharSet / LangSet / FTFace /
+        # Double / generic) — return FcResultNoMatch (1) so Mozilla
+        # treats the field as absent and falls through to its
+        # default-handling branches.  Critically NOT 'null' (which
+        # returns 0 = FcResultMatch and leaves the out-pointer
+        # uninitialised, causing downstream UB).  Spec:
+        # https://fontconfig.org/fontconfig-devel/fcresult.html
+        return (
+            f'int {name}(...) {{\n'
+            f'    return 1; /* FcResultNoMatch */\n'
+            f'}}\n'
+        )
+    elif cat == 'fc_pattern_get_string':
+        # FcResult FcPatternGetString(const FcPattern *p, const char
+        # *object, int id, FcChar8 **s).  Returns FcResultMatch (0) for
+        # FC_FILE / FC_FAMILY queries against the DejaVu Sans pattern
+        # and FcResultNoMatch (1) otherwise.  Only id == 0 satisfies a
+        # match — the per-language loops in FindCanonicalNameIndex /
+        # AddPatternToFontList's otherFamilyNames walk increment id
+        # past zero and need the NoMatch to terminate.  Spec:
+        # https://fontconfig.org/fontconfig-devel/fcpatterngetstring.html
+        return (
+            f'int {name}(const void* p, const char* object, int id, const char** out) {{\n'
+            f'    if (!out) return 1;\n'
+            f'    *out = (const char*)0;\n'
+            f'    /* Only the DejaVu pattern carries real strings.  Other\n'
+            f'     * FcPattern pointers (e.g. _stub_placeholder) fall through. */\n'
+            f'    if (!p) return 1;\n'
+            f'    const unsigned long* w = (const unsigned long*)p;\n'
+            f'    if (w[0] != {hex(0x5354554246434641)}UL) return 1;\n'
+            f'    if (id != 0 || !object) return 1;\n'
+            f'    if (strcmp(object, "file") == 0) {{\n'
+            f'        *out = _stub_font_path;\n'
+            f'        return 0;\n'
+            f'    }}\n'
+            f'    if (strcmp(object, "family") == 0) {{\n'
+            f'        *out = _stub_font_family;\n'
+            f'        return 0;\n'
+            f'    }}\n'
+            f'    return 1;\n'
             f'}}\n'
         )
     elif cat == 'fc_version':

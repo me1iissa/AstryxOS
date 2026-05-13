@@ -28,6 +28,28 @@ for arg in "$@"; do
     esac
 done
 
+# ── Stage at least one TTF font for Mozilla's font-list init ─────────────────
+# Mozilla's gfxFcPlatformFontList walks the FcFontSet returned by
+# FcConfigGetFonts() and asserts that mFontFamilies.Count() > 0 at the end of
+# init.  Our fontconfig stub returns a single-element FcFontSet pointing at
+# DejaVuSans.ttf; the corresponding TTF file must therefore exist on the data
+# disk for AddFontSetFamilies's access(F_OK|R_OK) check to succeed.  Copy the
+# host DejaVu install (apt: fonts-dejavu) into build/disk staging if it isn't
+# already there; the later "Copy host fonts" step propagates it into data.img.
+HOST_DEJAVU="/usr/share/fonts/truetype/dejavu"
+STAGE_DEJAVU="${BUILD_DIR}/disk/usr/share/fonts/truetype/dejavu"
+if [ -f "${HOST_DEJAVU}/DejaVuSans.ttf" ]; then
+    if [ ! -f "${STAGE_DEJAVU}/DejaVuSans.ttf" ] || [ "${FORCE}" = true ]; then
+        mkdir -p "${STAGE_DEJAVU}"
+        cp -f "${HOST_DEJAVU}/DejaVuSans.ttf" "${STAGE_DEJAVU}/DejaVuSans.ttf"
+        echo "[DATA-DISK] Staged DejaVuSans.ttf for Mozilla font-list init"
+    fi
+else
+    echo "[DATA-DISK] WARNING: ${HOST_DEJAVU}/DejaVuSans.ttf not found on host;"
+    echo "[DATA-DISK]          install with 'apt-get install fonts-dejavu' so the"
+    echo "[DATA-DISK]          fontconfig stub's pattern resolves on the data disk."
+fi
+
 # ── Stage glibc runtime libraries (non-fatal) ─────────────────────────────────
 # install-glibc.sh copies host glibc to build/disk/lib64 and
 # build/disk/lib/x86_64-linux-gnu.  We call it here so any --force re-run also
@@ -219,6 +241,10 @@ EOF
     fi
     HOST_FONTS="${BUILD_DIR}/disk/usr/share/fonts"
     if [ -d "${HOST_FONTS}/truetype/dejavu" ]; then
+        # ::usr may not exist yet if HOST_USR_LIB was missing — create the
+        # full chain idempotently here so the font copy still succeeds
+        # when only fonts (and not the GTK runtime) have been staged.
+        mmd -i "${DATA_IMG}" "::usr"                          2>/dev/null || true
         mmd -i "${DATA_IMG}" "::usr/share"                    2>/dev/null || true
         mmd -i "${DATA_IMG}" "::usr/share/fonts"              2>/dev/null || true
         mmd -i "${DATA_IMG}" "::usr/share/fonts/truetype"     2>/dev/null || true
