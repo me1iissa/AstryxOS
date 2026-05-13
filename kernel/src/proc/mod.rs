@@ -1330,11 +1330,30 @@ fn free_user_page_tables(cr3: u64) {
 }
 
 /// exit_group(status) — Linux semantics: terminate ALL threads in the process,
-/// then mark the process as Zombie.  Called by the exit_group(231) syscall.
+/// then mark the process as Zombie.  Called by:
+///   - the exit_group(231) syscall (cooperative termination)
+///   - synchronous fatal CPU exceptions in user mode (#GP, #PF, #UD, #DE …)
+///     when no signal handler is installed; see arch/x86_64/idt.rs.
+///
+/// POSIX (signal(7)) requires that default actions for SIGSEGV / SIGBUS /
+/// SIGFPE / SIGILL terminate the **entire thread group**, not just the
+/// faulting thread.  Otherwise sibling threads parked on POSIX semaphores,
+/// pthread condition variables, or futexes that the dead thread was meant
+/// to signal would deadlock indefinitely.
+///
+/// The implementation lives in `exit_group_inner`; this wrapper resolves the
+/// caller's pid/tid and yields after teardown.  Tests use
+/// `exit_group_pid` to drive teardown on a synthetic target process without
+/// killing the test runner thread itself.
 pub fn exit_group(exit_code: i64) {
     let tid = recover_current_tid();
-    let pid;
-    let parent_pid;
+    let pid = {
+        let threads = THREAD_TABLE.lock();
+        match threads.iter().find(|t| t.tid == tid) {
+            Some(t) => t.pid,
+            None => { crate::sched::schedule(); return; }
+        }
+    };
 
     // ── Firefox-test diagnostic dump ─────────────────────────────────────────
     // On non-zero exit, first dump a userspace stack snapshot (RSP/RBP,
@@ -1345,20 +1364,43 @@ pub fn exit_group(exit_code: i64) {
     // takes locks that conflict with the teardown below.
     #[cfg(feature = "firefox-test")]
     {
-        let cur_pid = current_pid();
-        if cur_pid >= 1 {
+        if pid >= 1 {
             if exit_code != 0 {
                 let (user_rsp, user_rbp) = crate::syscall::get_user_rsp_rbp();
                 let cr3 = crate::mm::vmm::get_cr3();
-                crate::syscall::ring::dump_exit_stack(cur_pid, cr3, user_rsp, user_rbp);
-                crate::syscall::ring::dump_for_exit(cur_pid, exit_code);
+                crate::syscall::ring::dump_exit_stack(pid, cr3, user_rsp, user_rbp);
+                crate::syscall::ring::dump_for_exit(pid, exit_code);
             } else {
-                crate::syscall::ring::drop_ring(cur_pid);
+                crate::syscall::ring::drop_ring(pid);
             }
         }
     }
 
-    // Kill every OTHER thread in the process immediately, but NOT the caller.
+    exit_group_inner(pid, tid, exit_code, /* yield_self = */ true);
+}
+
+/// Out-of-band exit_group: terminate every thread in `pid` and mark the
+/// process Zombie.  The caller is **not** assumed to be one of the dying
+/// threads — useful when the test runner triggers teardown of a synthetic
+/// target process, or when a future kernel watchdog needs to reap a
+/// runaway process from a different context.
+///
+/// The calling thread is left in whatever state it was in (Running) and
+/// returns normally to its caller after teardown.
+pub fn exit_group_pid(pid: Pid, exit_code: i64) {
+    // calling_tid = 0 means "no thread in the dying group is special";
+    // every thread gets the Dead transition in one pass.
+    exit_group_inner(pid, 0, exit_code, /* yield_self = */ false);
+}
+
+fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool) {
+    crate::serial_println!(
+        "[PROC] PID {} exit_group({}) caller_tid={}",
+        pid, exit_code, calling_tid
+    );
+
+    // Kill every OTHER thread in the process immediately, but NOT the caller
+    // (if the caller is itself a thread of this process).
     //
     // CRITICAL: interrupts are re-enabled in syscall_entry before dispatch() is
     // called (STI at step 3).  If the calling thread marks ITSELF as Dead here,
@@ -1369,20 +1411,38 @@ pub fn exit_group(exit_code: i64) {
     // By keeping the caller in its current state (Running → Ready on preemption),
     // if preempted it will be rescheduled and finish the Zombie/parent-wake steps.
     // We mark the caller Dead last, just before calling schedule().
+    //
+    // INVARIANT: do NOT touch `ctx_rsp_valid` on siblings.  Sibling threads are
+    // Blocked / Ready / Sleeping when we reach here, meaning their context was
+    // saved long ago by switch_context_asm and `ctx_rsp_valid` is true.  The
+    // reaper at `sched::reap_dead_threads_sched` filters Dead threads by
+    // `ctx_rsp_valid == true` precisely so it can safely free a kernel stack
+    // whose context-save has completed.  Forcing the flag false here would
+    // strand every sibling as Dead-but-unreapable, leaking its 16 KiB kernel
+    // stack until the process slot itself is recycled.  Mozilla's 51-thread
+    // worker pool would lose ~800 KiB per teardown.  Only the caller of
+    // exit_group (which is still executing on its own stack) gets
+    // `ctx_rsp_valid=false`, and only on the yield_self path below where
+    // switch_context_asm will re-set it after saving RSP.
     {
         let mut threads = THREAD_TABLE.lock();
-        let my_thread = threads.iter().find(|t| t.tid == tid);
-        pid = match my_thread {
-            Some(t) => t.pid,
-            None => { crate::sched::schedule(); return; }
-        };
         for t in threads.iter_mut() {
-            if t.pid == pid && t.tid != tid && t.state != ThreadState::Dead {
+            if t.pid == pid && t.tid != calling_tid && t.state != ThreadState::Dead {
                 t.state = ThreadState::Dead;
                 t.exit_code = exit_code;
             }
         }
     }
+
+    // Drain the futex wait queue of any entries owned by this process.  The
+    // sibling threads we just marked Dead may have been parked on FUTEX_WAIT
+    // (e.g. inside pthread_cond_wait / sem_wait / pthread_join).  The
+    // scheduler will never reschedule a Dead thread, but leaving stale TIDs
+    // in `FUTEX_WAITERS` poisons future diagnostics and would let a phantom
+    // FUTEX_WAKE on the same uaddr from an unrelated process try to wake
+    // dead TIDs.  Per futex(2): if the task whose stack hosts the futex
+    // word dies, the kernel owes any future operation a clean state.
+    crate::syscall::futex_drain_pid(pid);
 
     // Close pipe fds before marking Zombie so readers see EOF promptly.
     // Iterate a snapshot of (pipe_id, is_write) to avoid holding PROCESS_TABLE
@@ -1412,9 +1472,9 @@ pub fn exit_group(exit_code: i64) {
 
     // Mark the process as Zombie, record exit code, and re-parent its live children
     // to PID 1 (orphan adoption) so they don't accumulate as un-reapable zombies.
-    {
+    let parent_pid = {
         let mut procs = PROCESS_TABLE.lock();
-        parent_pid = procs.iter().find(|p| p.pid == pid).map(|p| p.parent_pid).unwrap_or(0);
+        let pp = procs.iter().find(|p| p.pid == pid).map(|p| p.parent_pid).unwrap_or(0);
         if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
             proc.state = ProcessState::Zombie;
             proc.exit_code = exit_code as i32;
@@ -1425,12 +1485,13 @@ pub fn exit_group(exit_code: i64) {
                 p.parent_pid = 1;
             }
         }
-    }
+        pp
+    };
 
     // Switch to the kernel page tables BEFORE freeing user page tables.
-    // Same race as in exit_thread: another CPU can allocate+zero the freed
-    // user PML4 page before the scheduler switches this CPU's CR3.
-    {
+    // Only relevant when the caller is on the user CR3 of the dying process —
+    // out-of-band callers (yield_self == false) are already on the kernel CR3.
+    if yield_self {
         let kc3 = crate::mm::vmm::get_kernel_cr3();
         let cur = crate::mm::vmm::get_cr3();
         if kc3 != 0 && cur != kc3 {
@@ -1440,7 +1501,24 @@ pub fn exit_group(exit_code: i64) {
     // Free user memory (no locks held).
     free_process_memory(pid);
 
-    // Wake parent threads blocked in waitpid, and mark calling thread Dead.
+    // vfork completion: if the caller is a vfork child fatal-faulting mid-
+    // execve (e.g. a synchronous fatal CPU exception routed here from
+    // arch/x86_64/idt.rs), the parent is parked in TASK_KILLABLE-style sleep
+    // on `vfork_parent_tid` and only this wake will release it.  Without it,
+    // the parent stays Blocked until the 5-second vfork timeout fires.
+    // Linux: exit_mm_release() → mm_release() → complete_vfork_done().
+    //
+    // Lock discipline: wake_vfork_parent() takes THREAD_TABLE.  We hold no
+    // locks here (the sibling-Dead pass at the top released THREAD_TABLE,
+    // and futex_drain_pid / PROCESS_TABLE / FILE_LOCKS sections have all
+    // completed).  Out-of-band callers (yield_self == false) skip this:
+    // they are healthy threads in a different process — not a vfork child.
+    if yield_self {
+        crate::syscall::wake_vfork_parent();
+    }
+
+    // Wake parent threads blocked in waitpid, and mark calling thread Dead
+    // (only when the caller is itself a thread of the dying process).
     {
         let mut threads = THREAD_TABLE.lock();
         for t in threads.iter_mut() {
@@ -1448,13 +1526,15 @@ pub fn exit_group(exit_code: i64) {
                 t.state = ThreadState::Ready;
             }
         }
-        if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
-            t.state = ThreadState::Dead;
-            t.exit_code = exit_code;
-            // Signal that the CPU is about to leave this thread's kernel stack.
-            // switch_context_asm will set ctx_rsp_valid=true after saving RSP,
-            // which is the AP's cue that the stack is safe to free.
-            t.ctx_rsp_valid.store(false, core::sync::atomic::Ordering::Release);
+        if yield_self {
+            if let Some(t) = threads.iter_mut().find(|t| t.tid == calling_tid) {
+                t.state = ThreadState::Dead;
+                t.exit_code = exit_code;
+                // Signal that the CPU is about to leave this thread's kernel stack.
+                // switch_context_asm will set ctx_rsp_valid=true after saving RSP,
+                // which is the AP's cue that the stack is safe to free.
+                t.ctx_rsp_valid.store(false, core::sync::atomic::Ordering::Release);
+            }
         }
     }
 
@@ -1463,8 +1543,12 @@ pub fn exit_group(exit_code: i64) {
         let _ = crate::signal::kill(parent_pid, crate::signal::SIGCHLD);
     }
 
-    // Yield — we're dead and should never return.
-    crate::sched::schedule();
+    // Yield — we're dead and should never return.  Out-of-band callers
+    // (yield_self == false) return normally; the caller is a healthy thread
+    // in a different process and has more work to do.
+    if yield_self {
+        crate::sched::schedule();
+    }
 }
 
 /// Put the current thread to sleep for `ticks` timer ticks.

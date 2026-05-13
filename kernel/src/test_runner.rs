@@ -1435,6 +1435,14 @@ pub fn run() -> ! {
     total += 1;
     if test_exec_from_shared_vm_child() { passed += 1; }
 
+    // ── Test 210: exit_group wakes parked sibling threads (W59) ───────────
+    // Verifies that synchronous-fatal-exception teardown terminates the
+    // entire thread group (POSIX signal(7)) and drains the futex wait
+    // queue — closes the W59 worker-zombie regression caught by
+    // firefox-test after PR #164.
+    total += 1;
+    if test_exit_group_wakes_siblings() { passed += 1; }
+
     // (Tests 199/200 run earlier — right after Test 80c — so the vDSO
     // TSC fast path is verified before the slow PNG screenshot test.
     // Stream-A pipe / eventfd wake-hook tests run first — see Tests
@@ -25773,6 +25781,202 @@ fn test_exec_from_shared_vm_child() -> bool {
     }
 
     test_pass!("sys_exec from shared-VM child");
+    true
+}
+
+/// Test 210: exit_group wakes parked sibling threads (W59 regression).
+///
+/// Background — W59 captured firefox-test post-PR #164 where TID 1 took a
+/// Ring-3 #GP during Mozilla worker init.  The kernel called
+/// `exit_thread(-13)` (the catch-all exception path in idt.rs), which
+/// terminated only the faulting thread.  Sibling worker threads parked on
+/// pthread_cond_clockwait / sem_wait — whose sole signaler was TID 1 —
+/// remained Blocked indefinitely, hanging the harness.
+///
+/// POSIX signal(7) requires that the default action for synchronous fatal
+/// signals (SIGSEGV / SIGBUS / SIGFPE / SIGILL) terminate the **entire
+/// thread group**.  This test verifies that `exit_group_pid` —
+/// invoked from the same exception path post-fix — transitions every
+/// thread of the target process to `Dead`, drains the futex wait queue of
+/// entries owned by the dying process, and marks the process Zombie with
+/// the supplied exit code.
+fn test_exit_group_wakes_siblings() -> bool {
+    use crate::proc::{PROCESS_TABLE, THREAD_TABLE, ThreadState, ProcessState};
+    use crate::syscall::FUTEX_WAITERS;
+
+    test_header!("exit_group wakes parked sibling threads (W59)");
+
+    // ── 1. Build a target process with three threads — a "main" thread and
+    //       two siblings parked on FUTEX_WAIT on distinct uaddrs A and B.
+    let target_pid = match crate::proc::usermode::create_user_process(
+        "exit_grp_target", &crate::proc::hello_elf::HELLO_ELF
+    ) {
+        Ok(p) => p,
+        Err(e) => { test_fail!("exit_group_wakes_siblings",
+            "create_user_process: {:?}", e); return false; }
+    };
+    let main_tid = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().find(|t| t.pid == target_pid).map(|t| t.tid).unwrap_or(0)
+    };
+    if main_tid == 0 {
+        test_fail!("exit_group_wakes_siblings", "no main thread for target");
+        return false;
+    }
+
+    // Add two real sibling thread entries (Blocked from creation; their
+    // kernel stacks are allocated but their context never executes because
+    // exit_group transitions them straight from Blocked → Dead).
+    const UADDR_A: u64 = 0x0000_7220_0000_1000;
+    const UADDR_B: u64 = 0x0000_7220_0000_2000;
+
+    let sib_a_tid = match crate::proc::create_thread_blocked(
+        target_pid, "sibling-a", 0
+    ) {
+        Some(t) => t,
+        None => {
+            test_fail!("exit_group_wakes_siblings", "create sibling A failed");
+            return false;
+        }
+    };
+    let sib_b_tid = match crate::proc::create_thread_blocked(
+        target_pid, "sibling-b", 0
+    ) {
+        Some(t) => t,
+        None => {
+            test_fail!("exit_group_wakes_siblings", "create sibling B failed");
+            return false;
+        }
+    };
+
+    // Park the two siblings on FUTEX_WAIT(uaddr_A) and FUTEX_WAIT(uaddr_B).
+    {
+        let mut waiters = FUTEX_WAITERS.lock();
+        waiters.entry((target_pid, UADDR_A)).or_insert_with(alloc::vec::Vec::new)
+               .push(sib_a_tid);
+        waiters.entry((target_pid, UADDR_B)).or_insert_with(alloc::vec::Vec::new)
+               .push(sib_b_tid);
+    }
+    test_println!("  target PID {}: main TID {}, siblings TID {}/{} parked on futex",
+        target_pid, main_tid, sib_a_tid, sib_b_tid);
+
+    // Sanity check — all three threads should be present and not Dead.
+    let pre_states = {
+        let threads = THREAD_TABLE.lock();
+        let states: alloc::vec::Vec<_> = [main_tid, sib_a_tid, sib_b_tid].iter()
+            .map(|&t| threads.iter().find(|th| th.tid == t).map(|th| th.state))
+            .collect();
+        states
+    };
+    for (tid, st) in [main_tid, sib_a_tid, sib_b_tid].iter().zip(&pre_states) {
+        if matches!(st, Some(ThreadState::Dead)) || st.is_none() {
+            test_fail!("exit_group_wakes_siblings",
+                "pre-condition: tid={} state={:?} (expected alive)", tid, st);
+            return false;
+        }
+    }
+    test_println!("  pre-condition: all 3 threads alive ✓");
+
+    // ── 2. Trigger exit_group out-of-band on behalf of the synthetic target.
+    //
+    // The path tested mirrors the synchronous-fatal-exception fix in
+    // arch/x86_64/idt.rs: a fault handler on the dying thread's stack
+    // calling exit_group(-13).  Using exit_group_pid lets us drive that
+    // teardown from the test runner thread without taking down the runner.
+    const FAULT_EXIT_CODE: i64 = -13; // SIGSEGV-vector style
+    crate::proc::exit_group_pid(target_pid, FAULT_EXIT_CODE);
+
+    // ── 3. Post-conditions ────────────────────────────────────────────────
+    // (a) All three threads transitioned to Dead.
+    let post_states = {
+        let threads = THREAD_TABLE.lock();
+        let states: alloc::vec::Vec<_> = [main_tid, sib_a_tid, sib_b_tid].iter()
+            .map(|&t| threads.iter().find(|th| th.tid == t).map(|th| th.state))
+            .collect();
+        states
+    };
+    for (tid, st) in [main_tid, sib_a_tid, sib_b_tid].iter().zip(&post_states) {
+        if !matches!(st, Some(ThreadState::Dead)) {
+            test_fail!("exit_group_wakes_siblings",
+                "post-condition: tid={} state={:?} (expected Dead)", tid, st);
+            return false;
+        }
+    }
+    test_println!("  all 3 threads transitioned to Dead ✓");
+
+    // (b) Both futex queue entries for target_pid drained.
+    {
+        let waiters = FUTEX_WAITERS.lock();
+        let lingering: alloc::vec::Vec<_> = waiters.keys()
+            .filter(|&&(p, _)| p == target_pid).copied().collect();
+        if !lingering.is_empty() {
+            test_fail!("exit_group_wakes_siblings",
+                "FUTEX_WAITERS still contains entries for dead pid: {:?}",
+                lingering);
+            return false;
+        }
+    }
+    test_println!("  FUTEX_WAITERS drained for pid {} ✓", target_pid);
+
+    // (c) Process transitioned to Zombie with the supplied exit code.
+    let (final_state, final_code) = {
+        let procs = PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == target_pid)
+            .map(|p| (p.state, p.exit_code))
+            .unwrap_or((ProcessState::Active, 0))
+    };
+    if final_state != ProcessState::Zombie {
+        test_fail!("exit_group_wakes_siblings",
+            "process state {:?} != Zombie", final_state);
+        return false;
+    }
+    if final_code as i64 != FAULT_EXIT_CODE {
+        test_fail!("exit_group_wakes_siblings",
+            "process exit_code {} != expected {}", final_code, FAULT_EXIT_CODE);
+        return false;
+    }
+    test_println!("  process Zombie + exit_code={} ✓", final_code);
+
+    // (d) Kernel-stack reap: drive one pass of the scheduler reaper and assert
+    //     every dying-process TID has been swept from THREAD_TABLE.
+    //
+    //     `reap_dead_threads_sched` filters Dead threads on `ctx_rsp_valid ==
+    //     true`.  Sibling threads created via `create_thread_blocked` already
+    //     have `ctx_rsp_valid=true` (saved long before they parked), so the
+    //     exit_group_inner siblings loop must leave that flag alone or it
+    //     would strand them as Dead-but-unreapable, leaking ~16 KiB per
+    //     thread (≈800 KiB across Mozilla's 51-thread crash).  This step
+    //     guards against the W58 review finding.
+    //
+    //     `schedule()` early-returns when the scheduler is inactive, so we
+    //     bracket the call with enable/disable to match the rest of the
+    //     test suite's pattern (see e.g. lines 2567 / 2571).
+    //
+    //     The test-runner thread is current, so it survives this pass — but
+    //     none of its TIDs intersect with target_pid's threads, so all three
+    //     should be reaped in one shot.
+    let was_active = crate::sched::is_active();
+    if !was_active { crate::sched::enable(); }
+    crate::sched::schedule();
+    if !was_active { crate::sched::disable(); }
+
+    {
+        let threads = THREAD_TABLE.lock();
+        let lingering: alloc::vec::Vec<u64> = [main_tid, sib_a_tid, sib_b_tid].iter()
+            .filter(|&&t| threads.iter().any(|th| th.tid == t))
+            .copied()
+            .collect();
+        if !lingering.is_empty() {
+            test_fail!("exit_group_wakes_siblings",
+                "THREAD_TABLE still contains tids {:?} after schedule() — \
+                 reaper did not sweep (likely ctx_rsp_valid clobbered)",
+                lingering);
+            return false;
+        }
+    }
+    test_println!("  THREAD_TABLE swept for all {} dying-process tids ✓", 3);
+
+    test_pass!("exit_group wakes parked sibling threads (W59)");
     true
 }
 
