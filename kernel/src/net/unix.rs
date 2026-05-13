@@ -452,9 +452,38 @@ pub fn shutdown(id: u64, shut_rd_flag: bool, shut_wr_flag: bool) -> i64 {
     0
 }
 
+/// Tear down an AF_UNIX socket.
+///
+/// In addition to resetting the local slot we propagate the close as a
+/// half-shutdown to the connected peer — flipping its `shut_rd` so any
+/// subsequent local read on that peer returns 0 (orderly EOF) and any
+/// epoll/poll waiter observes `EPOLLHUP` / `POLLHUP`.  This mirrors
+/// Linux AF_UNIX where closing one end surfaces on the other as EOF
+/// and a poll-readiness wake — IEEE 1003.1 §close / §poll, and the
+/// `man 7 unix` description of stream-socket teardown.
+///
+/// We ring `PollBellSource::UnixShutdown` so any thread currently parked
+/// in `epoll_wait` / `poll` on the peer fd is woken in the same tick
+/// rather than waiting out the 1 s resync floor — the wedge that caused
+/// the Mozilla parent IPC bus to spin on a closed child socket.
 pub fn close(id: u64) {
     if id as usize >= MAX_UNIX_SOCKETS { return; }
-    TABLE.lock().0[id as usize].reset();
+    let mut t = TABLE.lock();
+    let peer_id = t.0[id as usize].peer_id;
+    t.0[id as usize].reset();
+    let mut ring = false;
+    if (peer_id as usize) < MAX_UNIX_SOCKETS {
+        let peer = &mut t.0[peer_id as usize];
+        if peer.state == UnixState::Connected {
+            peer.shut_rd = true;
+            ring = true;
+        }
+    }
+    drop(t);
+    if ring {
+        crate::ipc::waitlist::ring_poll_bell_for(
+            crate::ipc::waitlist::PollBellSource::UnixShutdown);
+    }
 }
 
 pub fn has_data(id: u64) -> bool {
@@ -466,6 +495,26 @@ pub fn has_data(id: u64) -> bool {
     } else {
         s.recv_available() > 0
     }
+}
+
+/// Returns true if the local side has been half-closed for reading
+/// (either by a local `shutdown(SHUT_RD)` or by the peer's `shutdown(SHUT_WR)`
+/// / `close()` propagation per `shutdown()` / `close()` below) and is
+/// therefore at EOF for subsequent reads.  Epoll callers use this to
+/// raise `EPOLLHUP` once any buffered data has been drained — POSIX
+/// `poll(2)` / IEEE 1003.1 §poll require `POLLHUP` to coexist with
+/// `POLLIN` while bytes remain, and to be reported regardless of
+/// whether the caller asked for it.
+pub fn peer_closed(id: u64) -> bool {
+    if id as usize >= MAX_UNIX_SOCKETS { return false; }
+    let t = TABLE.lock();
+    let s = &t.0[id as usize];
+    if s.state == UnixState::Free { return true; }
+    if s.shut_rd { return true; }
+    let peer = s.peer_id;
+    if peer == u64::MAX { return false; }
+    if (peer as usize) >= MAX_UNIX_SOCKETS { return false; }
+    t.0[peer as usize].state == UnixState::Free
 }
 
 pub fn bytes_available(id: u64) -> usize {
