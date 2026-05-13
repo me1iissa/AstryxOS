@@ -965,6 +965,165 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
 # ══════════════════════════════════════════════════════════════════════════════
 # Subcommand implementations
 # ══════════════════════════════════════════════════════════════════════════════
+#
+# Data-disk staleness detection (W7 silent-wedge guard)
+#
+# Pattern: agents stage updated runtime libraries / stubs under build/disk/
+# (e.g. install-firefox-stubs.sh writes libglib-2.0.so.0 there) but forget
+# to re-pack them into build/data.img via create-data-disk.sh --force.
+# QEMU then boots with the OLD data.img — the guest sees the OLD libraries
+# regardless of what's on the host. The failure mode is silent: no warning,
+# tests behave as if the fix never landed, and verifiers mis-attribute the
+# stall to whichever PR is currently under test.
+#
+# The check is timestamp-based: if any regular file under build/disk/ has an
+# mtime newer than build/data.img, the image is stale and must be repacked.
+# We bound the scan (max files / time budget) so a giant /opt/firefox tree
+# can never wedge `start`.
+
+# Soft cap on files scanned per staleness check. The full build/disk tree
+# during firefox-test work has ~3000-5000 files; we don't need to look at
+# every byte to detect staleness — finding *any* file newer than data.img
+# is sufficient. We early-exit on the first newer file.
+_STALENESS_SCAN_FILE_BUDGET = 20000
+_STALENESS_SCAN_TIME_BUDGET_S = 4.0
+
+
+def _data_img_staleness(data_img: Path, disk_dir: Path) -> dict:
+    """
+    Check whether `data_img` is older than any regular file under `disk_dir`.
+
+    Returns a dict with:
+      stale: bool                 — True iff a newer file was found
+      newest_path: Optional[str]  — first newer file (early-exit; not the global newest)
+      newest_mtime: Optional[float]
+      data_img_mtime: Optional[float]
+      files_scanned: int
+      scan_seconds: float
+      error: Optional[str]        — set when the check could not run (soft-fail)
+
+    The check is best-effort: any I/O error returns `stale=False` with `error`
+    populated. Callers should treat `error` as "could not determine" — boot
+    proceeds either way.
+    """
+    out = {
+        "stale": False,
+        "newest_path": None,
+        "newest_mtime": None,
+        "data_img_mtime": None,
+        "files_scanned": 0,
+        "scan_seconds": 0.0,
+        "error": None,
+    }
+    try:
+        if not data_img.exists():
+            out["error"] = "data_img missing"
+            return out
+        if not disk_dir.exists() or not disk_dir.is_dir():
+            out["error"] = f"disk_dir not present: {disk_dir}"
+            return out
+        di_mtime = data_img.stat().st_mtime
+        out["data_img_mtime"] = di_mtime
+        deadline = time.monotonic() + _STALENESS_SCAN_TIME_BUDGET_S
+        scanned = 0
+        t0 = time.monotonic()
+        # os.scandir-based walk is meaningfully faster than Path.rglob on
+        # the large /opt/firefox subtree (~3000 files). Stop scanning on
+        # first hit — even one newer file is sufficient evidence.
+        stack = [disk_dir]
+        while stack:
+            d = stack.pop()
+            try:
+                with os.scandir(d) as it:
+                    for entry in it:
+                        # Budget guards: bail out cleanly if we've spent too
+                        # much time or seen too many files. We prefer a
+                        # false-negative (boot the stale image) over delaying
+                        # the harness start by seconds.
+                        if scanned >= _STALENESS_SCAN_FILE_BUDGET:
+                            out["error"] = (
+                                f"file-budget exhausted ({scanned} files)"
+                            )
+                            out["files_scanned"] = scanned
+                            out["scan_seconds"] = time.monotonic() - t0
+                            return out
+                        if time.monotonic() > deadline:
+                            out["error"] = (
+                                f"time-budget exhausted "
+                                f"({_STALENESS_SCAN_TIME_BUDGET_S:.1f}s)"
+                            )
+                            out["files_scanned"] = scanned
+                            out["scan_seconds"] = time.monotonic() - t0
+                            return out
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(Path(entry.path))
+                                continue
+                            if not entry.is_file(follow_symlinks=False):
+                                continue
+                            scanned += 1
+                            st = entry.stat(follow_symlinks=False)
+                            if st.st_mtime > di_mtime:
+                                out["stale"] = True
+                                out["newest_path"] = entry.path
+                                out["newest_mtime"] = st.st_mtime
+                                out["files_scanned"] = scanned
+                                out["scan_seconds"] = time.monotonic() - t0
+                                return out
+                        except (OSError, PermissionError):
+                            continue
+            except (OSError, PermissionError):
+                continue
+        out["files_scanned"] = scanned
+        out["scan_seconds"] = time.monotonic() - t0
+        return out
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+        return out
+
+
+def _regen_data_img(root_dir: Path) -> dict:
+    """
+    Invoke `scripts/create-data-disk.sh --force` and capture its outcome.
+
+    Returns:
+      ok: bool        — True iff the script exited 0
+      rc: int
+      duration_s: float
+      tail: str       — last ~1500 chars of stderr (so a failure surfaces)
+
+    The script logs to stdout (mixed with stderr by some sub-scripts); we
+    fold both streams together and keep the tail for diagnostics.
+    """
+    script = root_dir / "scripts" / "create-data-disk.sh"
+    out = {"ok": False, "rc": -1, "duration_s": 0.0, "tail": ""}
+    if not script.exists():
+        out["tail"] = f"create-data-disk.sh not found at {script}"
+        return out
+    t0 = time.monotonic()
+    try:
+        proc = subprocess.run(
+            ["bash", str(script), "--force"],
+            cwd=str(root_dir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=900,  # 15 min — generous; full Firefox copy is ~3 min
+        )
+        out["rc"] = proc.returncode
+        out["ok"] = proc.returncode == 0
+        merged = proc.stdout.decode("utf-8", errors="replace") if proc.stdout else ""
+        out["tail"] = merged[-1500:]
+    except subprocess.TimeoutExpired as e:
+        out["rc"] = -2
+        out["tail"] = f"timeout after {e.timeout}s"
+    except Exception as e:
+        out["rc"] = -3
+        out["tail"] = f"{type(e).__name__}: {e}"
+    out["duration_s"] = time.monotonic() - t0
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 
 def cmd_check(args):
     """
@@ -1075,6 +1234,92 @@ def cmd_start(args):
                 file=sys.stderr,
             )
 
+    # ── data.img staleness check (W7 silent-wedge guard) ─────────────────────
+    # Pattern: `install-firefox-stubs.sh` (and other build helpers) writes
+    # updated runtime libraries into build/disk/ but does NOT repack
+    # build/data.img. Subsequent firefox-test runs boot the OLD image and
+    # silently exercise the OLD stubs/libraries. The trap is invisible at
+    # boot — symptoms only show up deep in the test run (e.g. glxtest
+    # spinning on an unopened pipe fd, or an exec'd helper running the
+    # last-decade version of libxul).
+    #
+    # We detect this by mtime: if any file under build/disk/ is newer than
+    # data.img, the image is stale. Default action: auto-regenerate via
+    # `scripts/create-data-disk.sh --force`. The user can opt out with
+    # --no-regen-data-img, in which case we still emit a loud WARNING so
+    # the next "why doesn't my fix work?" is one harness invocation away.
+    #
+    # Soft-fail throughout: any I/O or scan error → boot proceeds without
+    # the auto-regen. We surface the situation through stderr + session
+    # state, never through a hard exit.
+    _data_img_stale = False
+    _data_img_regenerated = False
+    _data_img_staleness_info: dict = {}
+    _data_img_regen_info: dict = {}
+    _no_regen = bool(getattr(args, "no_regen_data_img", False))
+    if not _data_img_missing:
+        _disk_dir = Path(wt.ROOT) / "build" / "disk"
+        _data_img_staleness_info = _data_img_staleness(_data_img_path, _disk_dir)
+        _data_img_stale = bool(_data_img_staleness_info.get("stale"))
+    if _data_img_stale:
+        _newest = _data_img_staleness_info.get("newest_path") or "?"
+        _di_mt  = _data_img_staleness_info.get("data_img_mtime")
+        _new_mt = _data_img_staleness_info.get("newest_mtime")
+        try:
+            _di_age = time.strftime("%Y-%m-%d %H:%M",
+                                    time.localtime(_di_mt)) if _di_mt else "?"
+            _ne_age = time.strftime("%Y-%m-%d %H:%M",
+                                    time.localtime(_new_mt)) if _new_mt else "?"
+        except Exception:
+            _di_age, _ne_age = "?", "?"
+        # `_newest` may be a long path — keep a short tail for the banner.
+        _newest_short = _newest
+        if len(_newest_short) > 56:
+            _newest_short = "..." + _newest_short[-53:]
+        print(
+            "╔══════════════════════════════════════════════════════════════╗\n"
+            "║  WARNING: data disk image is STALE                           ║\n"
+            f"║  data.img  mtime: {_di_age:<43}║\n"
+            f"║  newer file:      {_newest_short:<43}║\n"
+            f"║  newer mtime:     {_ne_age:<43}║\n"
+            "║  (build/disk/ has updates not yet packed into data.img)      ║\n"
+            "╚══════════════════════════════════════════════════════════════╝",
+            file=sys.stderr,
+        )
+        if _no_regen:
+            print(
+                "║  --no-regen-data-img set; booting stale image as requested.  ║",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "║  Auto-regenerating via scripts/create-data-disk.sh --force … ║",
+                file=sys.stderr,
+            )
+            _data_img_regen_info = _regen_data_img(Path(wt.ROOT))
+            _data_img_regenerated = bool(_data_img_regen_info.get("ok"))
+            if _data_img_regenerated:
+                # Re-scan; the regen should have updated data.img mtime so the
+                # follow-up check is informational only.
+                try:
+                    _data_img_staleness_info = _data_img_staleness(
+                        _data_img_path, _disk_dir)
+                    _data_img_stale = bool(_data_img_staleness_info.get("stale"))
+                except Exception:
+                    pass
+                _dur = _data_img_regen_info.get("duration_s", 0.0)
+                print(
+                    f"║  data.img regenerated in {_dur:.1f}s.                          ║",
+                    file=sys.stderr,
+                )
+            else:
+                _tail = (_data_img_regen_info.get("tail") or "")[-400:]
+                print(
+                    "║  REGEN FAILED — booting stale image; check stderr above.    ║\n"
+                    f"║  rc={_data_img_regen_info.get('rc')}, tail: {_tail!r:<48}",
+                    file=sys.stderr,
+                )
+
     kvm_arg: Optional[bool]
     if getattr(args, "no_kvm", False):
         kvm_arg = False
@@ -1112,6 +1357,16 @@ def cmd_start(args):
         # attempt). Agents inspecting this field can immediately distinguish a
         # firefox-test wedge caused by missing /disk from a real regression.
         "data_img_missing": _data_img_missing,
+        # True iff a file under build/disk/ was newer than data.img at session
+        # start. When `data_img_regenerated` is also True, the image was
+        # rebuilt before launch and the stale flag describes the pre-launch
+        # state. When `data_img_regenerated` is False, the boot ran against
+        # the stale image (either --no-regen-data-img was set or the regen
+        # script failed — see `data_img_regen_tail`).
+        "data_img_stale": _data_img_stale,
+        "data_img_regenerated": _data_img_regenerated,
+        "data_img_staleness_info": _data_img_staleness_info,
+        "data_img_regen_info": _data_img_regen_info,
         # Session-scoped kernel binary (concurrent-rebuild clobber fix).
         # NOTE: snapshot files saved via `qemu-harness.py snap save` are tied
         # to the kernel binary loaded at the time. Loading a snapshot in a
@@ -1139,6 +1394,14 @@ def cmd_start(args):
           # True when data.img was absent (even after auto-symlink attempt).
           # Agents should treat this as a hard warning for firefox-test runs.
           "data_img_missing": _data_img_missing,
+          # True iff build/disk/ had files newer than data.img at session
+          # start. False after a successful auto-regen (the post-regen value
+          # is stored — pre-regen state is in `data_img_staleness_info`).
+          "data_img_stale": _data_img_stale,
+          # True iff the harness auto-ran create-data-disk.sh --force this
+          # session. False when not needed, when --no-regen-data-img was set,
+          # or when the regen script failed (check `data_img_regen_info`).
+          "data_img_regenerated": _data_img_regenerated,
           # Per-session QGA UNIX chardev socket path. Empty string when the
           # session was started without --features qga; non-empty paths may
           # not yet exist on disk if QEMU hasn't bound the socket yet
@@ -4622,6 +4885,14 @@ def main():
                                "'host' under KVM, otherwise "
                                "'qemu64,+rdtscp,+ssse3,+sse4_1,+sse4_2'. Used "
                                "by perf sweeps to vary VMEXIT surface.")
+    p_start.add_argument("--no-regen-data-img", action="store_true",
+                          dest="no_regen_data_img",
+                          help="Skip the auto-regen of build/data.img when "
+                               "build/disk/ has files newer than the image "
+                               "(W7 silent-wedge guard). The staleness banner "
+                               "still prints to stderr so the situation is "
+                               "never hidden. Use when reproducing a bug that "
+                               "depends on the existing data.img contents.")
 
     # stop
     p_stop = sub.add_parser("stop", help="Kill a QEMU session")
