@@ -373,18 +373,26 @@ extern char **environ;
 /* Singleton placeholder: returned by object-constructor stubs.
  * Read-only, always non-NULL, safe to pass back into unref/free stubs.
  *
- * Sized at 128 bytes so callers that treat the result as a struct and
- * read fields beyond the first int (e.g. fontconfig FcFontSet has
- * {int nfont; int sfont; FcPattern **fonts;} — 16 bytes; nsRefPtr-wrapped
- * Mozilla iterators dereference offsets up to ~64 bytes during shape /
- * lang-tag walks) all observe zero values rather than adjacent rodata.
- * For pointer-returning getters this gives a safe "empty zero-initialised
- * object" without ever needing a real backing allocation.
+ * Sized at 1024 bytes (128 longs).  Callers that treat the result as a
+ * struct read fields at varying offsets:
+ *   - fontconfig FcFontSet  — {int nfont; int sfont; FcPattern **fonts;}
+ *     (16 bytes; iterator loop-bound at offset 0)
+ *   - GLib GObject / GTypeInstance — header up to ~64 bytes
+ *   - Cairo / Pango / GIO opaque handles — observed accesses up to
+ *     offset ~0xa8 (168 bytes) during Mozilla shape / lang-tag / X11
+ *     screen-init walks before the call reaches a real implementation
+ *
+ * 1 KiB gives all known struct shapes room to live entirely inside the
+ * zero-initialised buffer, so any field read at any plausible offset
+ * sees zero rather than adjacent rodata bytes (which on some link
+ * orderings happen to be non-zero string constants that look like
+ * valid pointers, then trigger a second-level fault).  Still well
+ * under one page so the BSS footprint per stub library is trivial.
  *
  * Spec: https://fontconfig.org/fontconfig-devel/fcfontsetcreate.html
  * (FcFontSet layout: nfont @ offset 0 — the loop-bound — drives every
  * Mozilla iterator that calls these stubs.) */
-static const long _stub_placeholder[16] = {0};
+static const long _stub_placeholder[128] = {0};
 
 /* GSpawnFlags bits we honour (spec: GLib docs — GSpawnFlags).
  * Others (LEAVE_DESCRIPTORS_OPEN, FILE_AND_ARGV_ZERO, etc.) are ignored —
