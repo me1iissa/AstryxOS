@@ -1069,6 +1069,35 @@ pub fn write_u32_to_user_pub(cr3: u64, vaddr: u64, val: u32) {
     write_u32_to_user(cr3, vaddr, val);
 }
 
+/// Drain all FUTEX_WAITERS entries belonging to `pid`.
+///
+/// Called from `proc::exit_group` (and its synchronous-fault callers) once
+/// every thread of the dying process has been marked `Dead`.  The dead
+/// threads are already unschedulable, but leaving their TIDs in the wait
+/// queue would:
+///   1. Poison diagnostics — `kdb futex` and the `[FUTEX_WAKE_EXIT]` trace
+///      would show ghost waiters that can never be woken.
+///   2. Cause future `futex_wake` calls on the same `(pid, uaddr)` key
+///      (possible if a future PID-reuse occurs before the key is GC'd) to
+///      attempt to wake threads that no longer exist.
+///
+/// Per futex(2) NOTES: "If a process exits while threads of that process
+/// are blocked on a futex, those threads are woken (with a wake-up
+/// indicating the futex is in an inconsistent state)."  We achieve the
+/// equivalent here: the threads themselves are already Dead, so we just
+/// clean up the queue keyed by `(pid, _)`.
+pub fn futex_drain_pid(pid: u64) {
+    let mut waiters = FUTEX_WAITERS.lock();
+    let dead_keys: alloc::vec::Vec<(u64, u64)> = waiters
+        .keys()
+        .filter(|&&(p, _)| p == pid)
+        .copied()
+        .collect();
+    for key in dead_keys {
+        waiters.remove(&key);
+    }
+}
+
 /// Wake futex waiters from the exit path (CLONE_CHILD_CLEARTID).
 /// This is called from proc::exit_thread when a thread with clear_child_tid exits.
 pub fn futex_wake_for_exit(pid: u64, uaddr: u64, max_wake: u64) {
