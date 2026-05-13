@@ -103,6 +103,27 @@ if [ -f "${ROOT_DIR}/scripts/install-fonts-real.sh" ]; then
         echo "[DATA-DISK] WARNING: install-fonts-real.sh failed — fontconfig/freetype stubs remain"
 fi
 
+# ── Overlay REAL libdbus-1 + libsystemd (non-fatal) ──────────────────────────
+# install-firefox-stubs.sh writes a 36 KiB stub libdbus-1.so.3.  Mozilla
+# initialises a DBus client during nsAppShell::Init / proxy / AT-SPI setup
+# even with no session bus running; the stub returns NULL/0 for every entry
+# point, including DBusError-out-pointer setters, which Mozilla turns into
+# NULL-deref faults (W97 verifier flagged the "I"/"M" auth-handshake bytes
+# on fd=19 as the next-likely blocker class after PR #179).
+# install-dbus-real.sh overlays the real upstream libdbus-1 (~314 KiB) plus
+# its libsystemd.so.0 transitive dep (~1102 KiB) over the stub, keeping the
+# libdbus-glib-1 stub in place (deprecated wrapper, not on the host).  Must
+# run AFTER install-firefox-stubs.sh so its `ln -sf` evicts the stub at the
+# soname path.  No DBus daemon is shipped — DBUS_SESSION_BUS_ADDRESS stays
+# unset, real libdbus returns NULL with org.freedesktop.DBus.Error.NoServer,
+# and Mozilla's nsAppShell falls through to its no-DBus path.
+if [ -f "${ROOT_DIR}/scripts/install-dbus-real.sh" ]; then
+    DBUS_FLAGS=""
+    [ "${FORCE}" = true ] && DBUS_FLAGS="--force"
+    bash "${ROOT_DIR}/scripts/install-dbus-real.sh" ${DBUS_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
+        echo "[DATA-DISK] WARNING: install-dbus-real.sh failed — libdbus-1 stub remains"
+fi
+
 # ── Compile glibc_hello oracle binary if source present ──────────────────────
 GLIBC_HELLO_SRC="${ROOT_DIR}/userspace/glibc_hello.c"
 GLIBC_HELLO_BIN="${BUILD_DIR}/glibc_hello"
