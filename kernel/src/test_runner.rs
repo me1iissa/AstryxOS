@@ -25937,6 +25937,45 @@ fn test_exit_group_wakes_siblings() -> bool {
     }
     test_println!("  process Zombie + exit_code={} ✓", final_code);
 
+    // (d) Kernel-stack reap: drive one pass of the scheduler reaper and assert
+    //     every dying-process TID has been swept from THREAD_TABLE.
+    //
+    //     `reap_dead_threads_sched` filters Dead threads on `ctx_rsp_valid ==
+    //     true`.  Sibling threads created via `create_thread_blocked` already
+    //     have `ctx_rsp_valid=true` (saved long before they parked), so the
+    //     exit_group_inner siblings loop must leave that flag alone or it
+    //     would strand them as Dead-but-unreapable, leaking ~16 KiB per
+    //     thread (≈800 KiB across Mozilla's 51-thread crash).  This step
+    //     guards against the W58 review finding.
+    //
+    //     `schedule()` early-returns when the scheduler is inactive, so we
+    //     bracket the call with enable/disable to match the rest of the
+    //     test suite's pattern (see e.g. lines 2567 / 2571).
+    //
+    //     The test-runner thread is current, so it survives this pass — but
+    //     none of its TIDs intersect with target_pid's threads, so all three
+    //     should be reaped in one shot.
+    let was_active = crate::sched::is_active();
+    if !was_active { crate::sched::enable(); }
+    crate::sched::schedule();
+    if !was_active { crate::sched::disable(); }
+
+    {
+        let threads = THREAD_TABLE.lock();
+        let lingering: alloc::vec::Vec<u64> = [main_tid, sib_a_tid, sib_b_tid].iter()
+            .filter(|&&t| threads.iter().any(|th| th.tid == t))
+            .copied()
+            .collect();
+        if !lingering.is_empty() {
+            test_fail!("exit_group_wakes_siblings",
+                "THREAD_TABLE still contains tids {:?} after schedule() — \
+                 reaper did not sweep (likely ctx_rsp_valid clobbered)",
+                lingering);
+            return false;
+        }
+    }
+    test_println!("  THREAD_TABLE swept for all {} dying-process tids ✓", 3);
+
     test_pass!("exit_group wakes parked sibling threads (W59)");
     true
 }

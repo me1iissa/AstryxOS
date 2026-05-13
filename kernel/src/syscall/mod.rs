@@ -150,11 +150,40 @@ where
     waiters.entry((pid, uaddr)).or_insert_with(Vec::new).push(tid);
 
     // Mark Blocked under THREAD_TABLE while still holding FUTEX_WAITERS.
+    //
+    // Race hazard guarded here: between our `waiters.push(tid)` above and the
+    // THREAD_TABLE acquisition below, a peer CPU running `exit_group_inner`
+    // for this process can have already taken THREAD_TABLE, transitioned us
+    // to Dead, released THREAD_TABLE, and be spinning on FUTEX_WAITERS (which
+    // we still hold).  Without the guard below we would unconditionally
+    // overwrite Dead with Blocked, leaving a "Blocked but not in any wait
+    // queue" thread that schedule() never picks and the reaper never reaps.
+    //
+    // Defensive: if state is already Dead, undo our queue push (exit_group's
+    // `futex_drain_pid` will run when we release FUTEX_WAITERS, but draining
+    // is keyed on (pid, _) and we have just made the queue non-empty under a
+    // valid key — the drain still works, but it costs an extra branch.  Pop
+    // explicitly so the queue is clean immediately).  Skip the state write.
+    // Returning Enqueued is the right outcome: the caller will call
+    // schedule(), which will skip this Dead thread, and the next pass of
+    // reap_dead_threads_sched will reclaim it.
     {
         let mut threads = crate::proc::THREAD_TABLE.lock();
         if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
-            t.state = crate::proc::ThreadState::Blocked;
-            t.wake_tick = wake_tick;
+            if t.state == crate::proc::ThreadState::Dead {
+                // Undo the queue push we just made.
+                if let Some(list) = waiters.get_mut(&(pid, uaddr)) {
+                    if let Some(pos) = list.iter().rposition(|&x| x == tid) {
+                        list.remove(pos);
+                    }
+                    if list.is_empty() {
+                        waiters.remove(&(pid, uaddr));
+                    }
+                }
+            } else {
+                t.state = crate::proc::ThreadState::Blocked;
+                t.wake_tick = wake_tick;
+            }
         }
     }
 
