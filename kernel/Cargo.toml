@@ -8,6 +8,11 @@ default = []
 test-mode = []
 gui-test = []
 firefox-test = []
+# W133: opt-out for cross-CPU TLB shootdown.  Default builds run the full
+# shootdown protocol (IPI vector 0xF0, per-CPU active-CR3 mask).  Enable
+# this feature only for bisect/baseline runs where you want to compare
+# against the pre-PR behaviour — correctness on SMP requires shootdown.
+tlb-shootdown-off = []
 # Opt-in "soft-pass" network tests that depend on QEMU SLIRP actually
 # delivering ICMP echo replies and forwarding DNS queries.  These tests
 # (Test 5 ping 8.8.8.8, Test 6 DNS, Test 32 IPv6 DNS, Test 33 IPv6 ping)

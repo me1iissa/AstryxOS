@@ -443,8 +443,16 @@ impl VmSpace {
         }
 
         // Flush TLB: parent PTEs were write-protected so stale entries must
-        // be evicted so the next write triggers a CoW page fault.
-        crate::mm::vmm::flush_tlb();
+        // be evicted on every CPU that has the parent's CR3 loaded — without
+        // a cross-CPU shootdown, a sibling thread on another core would keep
+        // writing through its cached writable translation and silently
+        // corrupt the page the new CoW child also sees.  We pass the full
+        // user-VA range (0..2^47) so the local handler falls through to
+        // a CR3 reload, which drops every TLB entry tagged with this CR3
+        // in a single operation.  Senders that have switched CPUs since
+        // the original mapping are still covered because the per-CR3
+        // active-CPU mask is consulted at shootdown time.
+        crate::mm::tlb::shootdown_range(self.cr3, 0, 0x0000_8000_0000_0000);
         crate::serial_println!("[FORK-COW] total {} 4KB pages CoW'd into child CR3={:#x}", total_pages_cow, child_pml4_phys);
 
         // Copy VMA list to child.
@@ -665,12 +673,16 @@ impl VmSpace {
                 }
             }
 
-            // Unmap pages in [new_brk, old_brk)
+            // Unmap pages in [new_brk, old_brk).  TLB invalidation is
+            // coalesced into a single cross-CPU shootdown after the
+            // loop — one IPI for the whole brk shrink.
             let mut page_addr = new_brk;
             while page_addr < old_brk {
                 crate::mm::vmm::unmap_page_in(self.cr3, page_addr);
-                crate::mm::vmm::invlpg(page_addr);
                 page_addr += 0x1000;
+            }
+            if new_brk < old_brk {
+                crate::mm::tlb::shootdown_range(self.cr3, new_brk, old_brk);
             }
         }
 

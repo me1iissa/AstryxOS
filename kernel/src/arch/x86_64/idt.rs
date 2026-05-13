@@ -156,6 +156,12 @@ pub fn init() {
             IDT[45].set_handler(fix(super::irq::irq_virtio_blk_handler as *const () as u64), kernel_cs, 0, 0);
             IDT[46].set_handler(fix(super::irq::irq_virtio_serial_handler as *const () as u64), kernel_cs, 0, 0);
 
+            // Cross-CPU TLB shootdown IPI (vector 0xF0).  Sender is the
+            // remote CPU that just rewrote a PTE; this handler runs the
+            // local invalidation and acks the per-CPU payload slot.
+            // See `mm/tlb.rs` and Intel SDM Vol 3A §10.6.1.
+            IDT[0xF0].set_handler(fix(super::irq::irq_tlb_shootdown_handler as *const () as u64), kernel_cs, 0, 0);
+
             // Syscall interrupt (vector 0x80) — for int 0x80 style syscalls
             IDT[0x80].set_handler(fix(isr_syscall_int80 as *const () as u64), kernel_cs, 0, 3);
 
@@ -730,7 +736,11 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 crate::mm::refcount::page_ref_dec(old_phys);
                 crate::mm::refcount::page_ref_set(new_phys, 1);
                 crate::mm::vmm::map_page_in(cr3, page_addr, new_phys, page_flags);
-                crate::mm::vmm::invlpg(page_addr);
+                // Cross-CPU shootdown: sibling threads sharing the
+                // parent's CR3 may have the old read-only translation
+                // cached.  Without this they keep faulting on every
+                // write until their TLB happens to evict the entry.
+                crate::mm::tlb::shootdown_page(cr3, page_addr);
                 return true;
             }
             return false; // OOM
@@ -738,7 +748,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
             // Single owner — just make it writable
             let new_pte = old_phys | page_flags | PAGE_PRESENT;
             crate::mm::vmm::write_pte(cr3, page_addr, new_pte);
-            crate::mm::vmm::invlpg(page_addr);
+            crate::mm::tlb::shootdown_page(cr3, page_addr);
             return true;
         }
     }
@@ -778,10 +788,13 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
     if is_present && is_ifetch && (vma.prot & crate::mm::vma::PROT_EXEC != 0) {
         let pte = crate::mm::vmm::read_pte(cr3, page_addr);
         if pte & crate::mm::vmm::PAGE_NO_EXECUTE != 0 {
-            // Clear NX bit to allow execution
+            // Clear NX bit to allow execution.  Cross-CPU shootdown
+            // because another thread on another CPU might be holding
+            // an NX-marked TLB entry for the same page and #PF on the
+            // first ifetch.
             let new_pte = pte & !crate::mm::vmm::PAGE_NO_EXECUTE;
             crate::mm::vmm::write_pte(cr3, page_addr, new_pte);
-            crate::mm::vmm::invlpg(page_addr);
+            crate::mm::tlb::shootdown_page(cr3, page_addr);
             return true;
         }
     }

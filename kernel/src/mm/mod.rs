@@ -8,6 +8,7 @@ pub mod heap;
 pub mod oom;
 pub mod pmm;
 pub mod refcount;
+pub mod tlb;
 pub mod vma;
 pub mod vmm;
 

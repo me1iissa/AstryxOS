@@ -317,7 +317,11 @@ pub fn user_mode_bootstrap() {
     // Switch to the per-process page table.
     let current_cr3 = crate::mm::vmm::get_cr3();
     if user_cr3 != 0 && user_cr3 != current_cr3 {
+        // Bracket the CR3 write with active-CPU mask updates so the
+        // TLB shootdown protocol can target this CPU correctly.
+        crate::mm::tlb::note_cr3_unload(current_cr3);
         unsafe { crate::mm::vmm::switch_cr3(user_cr3); }
+        crate::mm::tlb::note_cr3_load(user_cr3);
     }
 
     // Set kernel stack for Ring 3 → Ring 0 transitions.
