@@ -1055,6 +1055,15 @@ pub extern "C" fn ap_rust_entry() -> ! {
     // in syscall::init() (Phase 6), but APs bypass that path.
     crate::syscall::init_ap();
 
+    // Publish ourselves as a viable TLB-shootdown target BEFORE enabling
+    // interrupts.  IDT, GDT, per-CPU TSC_AUX, idle-thread bookkeeping, and
+    // the LAPIC are all live at this point, so handle_shootdown_ipi() on
+    // vector 0xF0 can execute safely.  Doing this here, rather than waiting
+    // for `start_aps` to return on the BSP, closes the per-AP window where
+    // the BSP could shoot down an address space this AP had already loaded
+    // but where SMP_ACTIVE was still false.  See mm/tlb.rs.
+    crate::mm::tlb::mark_self_smp_online();
+
     // Enable interrupts and enter scheduling loop.
     // After each timer interrupt wakes this AP from HLT, check if a reschedule
     // is needed and switch to any ready thread.  check_reschedule() is safe
