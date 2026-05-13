@@ -849,32 +849,42 @@ def emit_stub(name, cat):
         )
     elif cat == 'fc_pattern_get_string':
         # FcResult FcPatternGetString(const FcPattern *p, const char
-        # *object, int id, FcChar8 **s).  Returns FcResultMatch (0) for
-        # FC_FILE / FC_FAMILY queries against the DejaVu Sans pattern
-        # and FcResultNoMatch (1) otherwise.  Only id == 0 satisfies a
-        # match — the per-language loops in FindCanonicalNameIndex /
-        # AddPatternToFontList's otherFamilyNames walk increment id
-        # past zero and need the NoMatch to terminate.  Spec:
+        # *object, int id, FcChar8 **s).  ALWAYS populates *out with a
+        # valid non-NULL C string and returns FcResultMatch (0).
+        #
+        # Rationale: Mozilla's gfxFcPlatformFontList iterates per-language
+        # aliases by calling FcPatternGetString(p, ..., &out) repeatedly.
+        # When the stub previously returned NoMatch for non-sentinel
+        # patterns it left *out unset / NULL for non-matching slots; later
+        # code dereferenced the NULL string and faulted at libxul+0x185b8a4
+        # (mov reg, +const(%rbx) with %rbx=NULL) and libxul+0x4056429.
+        # Mirroring the fc_get_{bool,integer,double}_zero treatment (PR
+        # #175) and the precedent of always-populated FcPatternGet*: keep
+        # the AFCFBUTS-sentinel pattern's typed discrimination
+        # (object="file" → TTF path) so the access(F_OK|R_OK) check still
+        # succeeds, and for every other pattern / object / id return the
+        # family name "DejaVu Sans".  The NULL-out-pointer guard still
+        # returns NoMatch — a caller that didn't supply a buffer cannot
+        # read the result.  Spec:
         # https://fontconfig.org/fontconfig-devel/fcpatterngetstring.html
         return (
             f'int {name}(const void* p, const char* object, int id, const char** out) {{\n'
-            f'    if (!out) return 1;\n'
-            f'    *out = (const char*)0;\n'
-            f'    /* Only the DejaVu pattern carries real strings.  Other\n'
-            f'     * FcPattern pointers (e.g. _stub_placeholder) fall through. */\n'
-            f'    if (!p) return 1;\n'
-            f'    const unsigned long* w = (const unsigned long*)p;\n'
-            f'    if (w[0] != {hex(0x5354554246434641)}UL) return 1;\n'
-            f'    if (id != 0 || !object) return 1;\n'
-            f'    if (strcmp(object, "file") == 0) {{\n'
-            f'        *out = _stub_font_path;\n'
-            f'        return 0;\n'
+            f'    (void)id;\n'
+            f'    if (!out) return 1; /* defensive: NULL out-pointer → NoMatch */\n'
+            f'    /* AFCFBUTS-sentinel pattern with object="file" id=0 returns\n'
+            f'     * the TTF path so AddFontSetFamilies access() succeeds. */\n'
+            f'    if (p && object && strcmp(object, "file") == 0) {{\n'
+            f'        const unsigned long* w = (const unsigned long*)p;\n'
+            f'        if (w[0] == {hex(0x5354554246434641)}UL) {{\n'
+            f'            *out = _stub_font_path;\n'
+            f'            return 0;\n'
+            f'        }}\n'
             f'    }}\n'
-            f'    if (strcmp(object, "family") == 0) {{\n'
-            f'        *out = _stub_font_family;\n'
-            f'        return 0;\n'
-            f'    }}\n'
-            f'    return 1;\n'
+            f'    /* All other queries (any p incl. NULL, any object incl. NULL,\n'
+            f'     * any id): populate with the family name so Mozilla\'s per-\n'
+            f'     * language alias loops never see a NULL *out. */\n'
+            f'    *out = _stub_font_family;\n'
+            f'    return 0; /* FcResultMatch */\n'
             f'}}\n'
         )
     elif cat == 'fc_version':
