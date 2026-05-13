@@ -867,6 +867,20 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         "MOZ_ACCELERATED=0",
         "LIBGL_ALWAYS_SOFTWARE=1",
         "LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/disk/lib/firefox",
+        // libfontconfig-interposer.so — defensive FcPatternGetString *out
+        // wrapper.  Real libfontconfig (PR #179) leaves *out untouched on
+        // FcResultNoMatch per spec; Mozilla's gfxFcPlatformFontList caller
+        // dereferences *out unconditionally on that path, faulting at
+        // libxul+0x185b8a4 / +0x4056429 with %rbx=NULL (W91 regression).
+        // The interposer dlsym's the real FcPatternGetString via
+        // RTLD_NEXT, calls through, and on NoMatch writes a non-NULL
+        // sentinel into *out so the buggy caller dereferences a valid
+        // empty string instead of NULL.  Built by create-data-disk.sh
+        // from userspace/libfontconfig-interposer/.  Absolute path so
+        // ld-linux loads it without searching LD_LIBRARY_PATH.
+        // Spec: https://fontconfig.org/fontconfig-devel/fcpatternget.html
+        // Reference: man 8 ld.so on LD_PRELOAD ordering.
+        "LD_PRELOAD=/lib64/libfontconfig-interposer.so",
         "XDG_RUNTIME_DIR=/tmp",
         "XDG_CONFIG_HOME=/tmp/.config",
         "FONTCONFIG_PATH=/disk/lib/firefox/fonts",
