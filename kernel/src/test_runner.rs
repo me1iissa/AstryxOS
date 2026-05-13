@@ -1431,6 +1431,10 @@ pub fn run() -> ! {
     total += 1;
     if test_clone3_wake_vfork_on_execve() { passed += 1; }
 
+    // ── Test 209: shared-VM-child execve installs fresh VmSpace ───────────
+    total += 1;
+    if test_exec_from_shared_vm_child() { passed += 1; }
+
     // (Tests 199/200 run earlier — right after Test 80c — so the vDSO
     // TSC fast path is verified before the slow PNG screenshot test.
     // Stream-A pipe / eventfd wake-hook tests run first — see Tests
@@ -25506,6 +25510,269 @@ fn test_clone3_wake_vfork_on_execve() -> bool {
     }
 
     test_pass!("clone3 + wake_vfork_parent on execve");
+    true
+}
+
+/// Test 209: execve(2) from a shared-VM child must install a fresh VmSpace
+/// without touching the parent's address space.
+///
+/// This is the regression test for the `sys_exec` 3-branch dispatch.  Before
+/// the fix, a child created via `fork_process_share_vm` (vm_space=None,
+/// cr3==parent's cr3) routed through Branch A of `sys_exec` and synthesised
+/// a new unrelated process — never reaching `wake_vfork_parent()` and
+/// stranding the parent on its 500-tick safety timeout.
+///
+/// Per `execve(2)` and `posix_spawn(3)` semantics, when the child is in a
+/// shared-VM state with the parent, execve must:
+///   1. Allocate a new private VmSpace for the child.
+///   2. Load the new image into that VmSpace.
+///   3. Switch the child's CR3 to the new private one.
+///   4. NOT free the previous (None) vm_space — i.e. NOT touch the parent's
+///      page tables.
+///   5. Wake the vfork-blocked parent immediately.
+///
+/// We emulate the same atomic sequence `sys_exec` Case (C) performs and
+/// assert the invariants from the kernel-thread context (we cannot trivially
+/// re-enter Ring 3 inside test_runner, so we exercise the state-transition
+/// rather than the SYSRETQ epilogue).
+fn test_exec_from_shared_vm_child() -> bool {
+    test_header!("sys_exec from shared-VM child");
+
+    use crate::proc::{PROCESS_TABLE, THREAD_TABLE, ThreadState, ProcessState};
+
+    // ── 1. Build a parent process with a private VmSpace + marker page. ──
+    let parent_pid = match crate::proc::usermode::create_user_process(
+        "exec_shvm_p", &crate::proc::hello_elf::HELLO_ELF
+    ) {
+        Ok(p) => p,
+        Err(e) => { test_fail!("exec_shvm", "create_user_process: {:?}", e); return false; }
+    };
+    let parent_tid = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().find(|t| t.pid == parent_pid).map(|t| t.tid).unwrap_or(0)
+    };
+    let parent_cr3 = {
+        let procs = PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == parent_pid).map(|p| p.cr3).unwrap_or(0)
+    };
+    test_println!("  parent PID {} TID {} CR3={:#x}", parent_pid, parent_tid, parent_cr3);
+
+    // Plant an exit-code marker page in the parent's address space at a
+    // known VA.  After the child execs, the marker must still read its
+    // original value — this proves Case (C) did NOT free the parent's
+    // pages.
+    const MARKER_VADDR: u64 = 0x0000_7100_0000_0000;
+    const MARKER_VALUE: u32 = 0xAAAA_AA00;
+    const PAGE_PRESENT: u64 = 1;
+    const PAGE_WRITABLE: u64 = 2;
+    const PAGE_USER: u64 = 4;
+    const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+    const PHYS_OFF:  u64 = 0xFFFF_8000_0000_0000;
+
+    let marker_phys = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => { test_fail!("exec_shvm", "PMM alloc failed"); return false; }
+    };
+    if !crate::mm::vmm::map_page_in(
+        parent_cr3, MARKER_VADDR, marker_phys,
+        PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER,
+    ) {
+        test_fail!("exec_shvm", "map_page_in failed");
+        return false;
+    }
+    crate::syscall::write_u32_to_user_pub(parent_cr3, MARKER_VADDR, MARKER_VALUE);
+
+    // ── 2. Create a shared-VM child mirroring fork_process_share_vm. ─────
+    let (child_pid, child_tid) = match crate::proc::fork_process_share_vm(
+        parent_pid, parent_tid, &crate::proc::ForkUserRegs::default()
+    ) {
+        Some(x) => x,
+        None => { test_fail!("exec_shvm", "fork_process_share_vm None"); return false; }
+    };
+    test_println!("  child PID {} TID {} (shared CR3)", child_pid, child_tid);
+
+    // Pre-conditions: child has no own VmSpace, child.cr3 == parent.cr3.
+    {
+        let procs = PROCESS_TABLE.lock();
+        let c = match procs.iter().find(|p| p.pid == child_pid) {
+            Some(c) => c,
+            None => { test_fail!("exec_shvm", "child vanished"); return false; }
+        };
+        if c.vm_space.is_some() {
+            test_fail!("exec_shvm", "pre-exec child must not own a VmSpace");
+            return false;
+        }
+        if c.cr3 != parent_cr3 {
+            test_fail!("exec_shvm", "pre-exec child cr3 {:#x} != parent {:#x}",
+                c.cr3, parent_cr3);
+            return false;
+        }
+    }
+
+    // Hand-set vfork relationship + block the parent.  This is the state
+    // sys_exec Case (C) will see when called from a shared-VM child.
+    {
+        let mut threads = THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
+            t.vfork_parent_tid = Some(parent_tid);
+        }
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == parent_tid) {
+            t.state = ThreadState::Blocked;
+            t.wake_tick = u64::MAX;
+        }
+    }
+
+    // ── 3. Emulate sys_exec Case (C): build new VmSpace, install into ────
+    //      child, swap CR3, do NOT free the old (None) VmSpace, wake parent.
+    let pre_tick = crate::arch::x86_64::irq::get_ticks();
+
+    let mut new_vm_space = match crate::mm::vma::VmSpace::new_user() {
+        Some(vs) => vs,
+        None => { test_fail!("exec_shvm", "VmSpace::new_user OOM"); return false; }
+    };
+    let elf_data = &crate::proc::hello_elf::HELLO_ELF;
+    let argv: &[&str] = &["exec_shvm_c"];
+    let envp: &[&str] = &["HOME=/", "PATH=/bin"];
+    let result = match crate::proc::elf::load_elf_with_args(
+        elf_data, new_vm_space.cr3, argv, envp
+    ) {
+        Ok(r) => r,
+        Err(e) => { test_fail!("exec_shvm", "load_elf_with_args: {:?}", e); return false; }
+    };
+    for vma in result.vmas { let _ = new_vm_space.insert_vma(vma); }
+    let new_cr3 = new_vm_space.cr3;
+
+    // Install into the child's Process.  Case (C) invariant: replace()
+    // returns None — the previous vm_space was None.  We assert that and
+    // therefore do NOT free anything.
+    let old_extracted = {
+        let mut procs = PROCESS_TABLE.lock();
+        let mut extracted = None;
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == child_pid) {
+            p.cr3 = new_cr3;
+            extracted = p.vm_space.replace(new_vm_space);
+            p.linux_abi = true;
+        }
+        extracted
+    };
+    if old_extracted.is_some() {
+        test_fail!("exec_shvm", "old vm_space was not None — would have freed parent's tables!");
+        return false;
+    }
+
+    // Wake the vfork parent inline (mirrors wake_vfork_parent body — we
+    // cannot call it directly because the helper uses current_tid()).
+    {
+        let parent_tid_to_wake = {
+            let threads = THREAD_TABLE.lock();
+            threads.iter().find(|t| t.tid == child_tid)
+                .and_then(|t| t.vfork_parent_tid)
+        };
+        if let Some(ptid) = parent_tid_to_wake {
+            let mut threads = THREAD_TABLE.lock();
+            if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
+                t.vfork_parent_tid = None;
+            }
+            if let Some(p) = threads.iter_mut().find(|t| t.tid == ptid) {
+                if p.state == ThreadState::Blocked {
+                    p.state = ThreadState::Ready;
+                }
+            }
+        }
+    }
+    let post_tick = crate::arch::x86_64::irq::get_ticks();
+    let latency_ticks = post_tick.saturating_sub(pre_tick);
+
+    // ── 4. Post-condition invariants. ────────────────────────────────────
+
+    // (a) Child now owns a private VmSpace.
+    let child_owns_vm = {
+        let procs = PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == child_pid)
+            .map(|p| p.vm_space.is_some()).unwrap_or(false)
+    };
+    if !child_owns_vm {
+        test_fail!("exec_shvm", "child must own a VmSpace post-exec");
+        return false;
+    }
+    test_println!("  child.vm_space is Some() ✓");
+
+    // (b) Child's CR3 differs from parent's (no longer shared).
+    let child_cr3_post = {
+        let procs = PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == child_pid).map(|p| p.cr3).unwrap_or(0)
+    };
+    if child_cr3_post == parent_cr3 || child_cr3_post != new_cr3 {
+        test_fail!("exec_shvm", "child cr3 {:#x} should be new {:#x} ≠ parent {:#x}",
+            child_cr3_post, new_cr3, parent_cr3);
+        return false;
+    }
+    test_println!("  child cr3 {:#x} ≠ parent cr3 {:#x} ✓", child_cr3_post, parent_cr3);
+
+    // (c) Parent's address space untouched — marker still readable.
+    let marker_observed = unsafe {
+        let pte = crate::mm::vmm::read_pte(parent_cr3, MARKER_VADDR & !0xFFF);
+        let phys = pte & ADDR_MASK;
+        if phys == 0 {
+            test_fail!("exec_shvm", "parent's marker page no longer mapped!");
+            return false;
+        }
+        let vaddr = PHYS_OFF + phys + (MARKER_VADDR & 0xFFF);
+        core::ptr::read_volatile(vaddr as *const u32)
+    };
+    if marker_observed != MARKER_VALUE {
+        test_fail!("exec_shvm",
+            "parent marker read {:#x} (expected {:#x} — parent VM was clobbered!)",
+            marker_observed, MARKER_VALUE);
+        return false;
+    }
+    test_println!("  parent marker {:#x} intact ✓", MARKER_VALUE);
+
+    // (d) Parent transitioned Blocked → Ready within < 10 ticks.
+    let parent_state = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().find(|t| t.tid == parent_tid).map(|t| t.state)
+    };
+    if parent_state != Some(ThreadState::Ready) {
+        test_fail!("exec_shvm", "parent state {:?} ≠ Ready", parent_state);
+        return false;
+    }
+    if latency_ticks >= 10 {
+        test_fail!("exec_shvm", "wake latency {} ticks ≥ 10", latency_ticks);
+        return false;
+    }
+    test_println!("  parent Blocked → Ready in {} ticks (< 10 budget) ✓", latency_ticks);
+
+    // (e) vfork_parent_tid cleared on the child so a future execve does
+    //     not double-wake a stale parent tid.
+    let cleared = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().find(|t| t.tid == child_tid)
+            .map(|t| t.vfork_parent_tid.is_none()).unwrap_or(false)
+    };
+    if !cleared {
+        test_fail!("exec_shvm", "child vfork_parent_tid not cleared");
+        return false;
+    }
+    test_println!("  child vfork_parent_tid cleared ✓");
+
+    // ── 5. Cleanup ───────────────────────────────────────────────────────
+    for pid in [parent_pid, child_pid] {
+        {
+            let mut threads = THREAD_TABLE.lock();
+            for t in threads.iter_mut() {
+                if t.pid == pid { t.state = ThreadState::Dead; }
+            }
+        }
+        {
+            let mut procs = PROCESS_TABLE.lock();
+            if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                p.state = ProcessState::Zombie;
+            }
+        }
+    }
+
+    test_pass!("sys_exec from shared-VM child");
     true
 }
 

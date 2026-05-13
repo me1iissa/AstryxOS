@@ -437,6 +437,14 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
 /// falls through to the exit hooks (ring::end(), [SC-RET]) rather than
 /// bypassing them.
 fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, arg6: u64) -> i64 {
+    // Linux UAPI clone(2)/clone3(2) flag bits.  Hoisted to function scope so
+    // the clone / clone3 / fork-style branches share a single source of truth
+    // instead of redeclaring them in every match arm.  Values per
+    // `include/uapi/linux/sched.h`.
+    const CLONE_SIGHAND:       u64 = 0x00000800;
+    const CLONE_VFORK:         u64 = 0x00004000;
+    const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
+
     match num {
         // 0: read(fd, buf, count)
         0 => sys_read_linux(arg1, arg2, arg3),
@@ -1429,7 +1437,6 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 // and for the posix_spawn(3) fast-path.  The child must only
                 // call execve(2) or _exit(2); intermediate writes to shared
                 // memory (e.g. `args.err = errno`) are observable to the parent.
-                const CLONE_VFORK: u64 = 0x00004000;
                 let is_vfork = flags & CLONE_VFORK != 0;
                 let parent_tid = crate::proc::current_tid();
                 let pid = crate::proc::current_pid_lockless();
@@ -2083,11 +2090,8 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 let parent_tid = crate::proc::current_tid();
                 let parent_regs = crate::syscall::read_fork_user_regs();
 
-                const CLONE_VFORK: u64 = 0x00004000;
-                // CLONE_CLEAR_SIGHAND is in the upper half of clone_args.flags
-                // (bit 32) per clone3(2).  Cannot be combined with CLONE_SIGHAND.
-                const CLONE_SIGHAND:       u64 = 0x00000800;
-                const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
+                // CLONE_CLEAR_SIGHAND lives in the upper half of clone_args.flags
+                // (bit 32) per clone3(2).  It cannot be combined with CLONE_SIGHAND.
                 let is_vfork = clone_flags & CLONE_VFORK != 0;
 
                 // Reject the explicitly-illegal combination per clone3(2).

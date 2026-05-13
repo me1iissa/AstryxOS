@@ -1791,9 +1791,16 @@ pub fn fork_process_share_vm(
     let (stack_base, stack_top) = alloc_kernel_stack()?;
 
     // Copy parent's file descriptors, CWD, and security credentials.
-    // Per clone3(2): without CLONE_FILES, the child gets its own table.  We
-    // currently always copy (the simpler conservative choice) — the demo path
-    // (__spawnix → execve) closes/replaces all FDs on exec anyway.
+    // Per clone(2)/clone3(2):
+    //   - WITH CLONE_FILES, the child SHARES the parent's descriptor table
+    //     (writes are mutually visible).
+    //   - WITHOUT CLONE_FILES, the child gets its OWN COPY of the parent's
+    //     table at clone time (independent after that point).
+    // We always copy — the safer of the two semantics for callers that
+    // forgot CLONE_FILES.  The posix_spawn(3) fast-path (__spawnix → execve)
+    // then drops any FDs flagged O_CLOEXEC / FD_CLOEXEC at execve time;
+    // FDs without CLOEXEC survive into the new image, which is the
+    // intended POSIX behaviour.
     let (fds, cwd, parent_name, parent_uid, parent_gid, parent_euid, parent_egid,
          parent_groups, parent_umask, parent_linux_abi, parent_subsystem, parent_token_id,
          parent_pgid, parent_sid, parent_no_new_privs, parent_cap_permitted,
