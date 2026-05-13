@@ -730,6 +730,11 @@ pub fn run() -> ! {
     total += 1;
     if test_vfs_file_locking() { passed += 1; }
 
+    // ── Test 87b: VFS — resolve_path_opts trace + 1s deadline (W83 safety net)
+
+    total += 1;
+    if test_vfs_resolve_deadline() { passed += 1; }
+
     // ── Test 88: VFS C4 — /proc/<PID>/ dynamic per-process directory ────────
 
     total += 1;
@@ -14509,6 +14514,74 @@ fn test_vfs_file_locking() -> bool {
     }
 
     if ok { test_pass!("VFS C1: POSIX file locking"); }
+    ok
+}
+
+// ── VFS resolve_path_opts — W83 trace + 1s deadline safety net ──────────────
+//
+// Two sub-cases:
+//   (a) Happy path: a deeply-nested directory chain plus a symlink resolves
+//       well within the 1s budget, returns Ok.
+//   (b) Forced-timeout: invoke the private `_test_resolve_with_deadline`
+//       entrypoint with `deadline_ticks = 0` (already in the past) and assert
+//       it returns `VfsError::TimedOut` — proving the deadline check on the
+//       hot path fires before the next concrete-FS dispatch.
+//
+// The happy-path leg is the regression guard: if a future change accidentally
+// makes deep-path resolution take seconds (e.g. by holding a global lock
+// across a slow disk read), this test will start failing.
+fn test_vfs_resolve_deadline() -> bool {
+    test_header!("VFS resolve_path_opts: trace + 1s deadline (W83)");
+    let mut ok = true;
+
+    // ── (a) Deep nesting + symlink resolves quickly ─────────────────────
+    let _ = crate::vfs::mkdir("/tmp/w83");
+    let _ = crate::vfs::mkdir("/tmp/w83/a");
+    let _ = crate::vfs::mkdir("/tmp/w83/a/b");
+    let _ = crate::vfs::mkdir("/tmp/w83/a/b/c");
+    let _ = crate::vfs::mkdir("/tmp/w83/a/b/c/d");
+    let _ = crate::vfs::create_file("/tmp/w83/a/b/c/d/target.txt");
+    let _ = crate::vfs::write_file("/tmp/w83/a/b/c/d/target.txt", b"hi");
+
+    // /tmp/w83/link → a/b/c/d/target.txt (relative symlink)
+    let _ = crate::vfs::symlink("/tmp/w83/link", "a/b/c/d/target.txt");
+
+    let t0 = crate::arch::x86_64::irq::get_ticks();
+    let res = crate::vfs::resolve_path("/tmp/w83/link");
+    let elapsed = crate::arch::x86_64::irq::get_ticks().saturating_sub(t0);
+    if res.is_ok() && elapsed < 100 {
+        test_println!("  (a) deep symlink resolved in {} ticks (< 1s) ✓", elapsed);
+    } else {
+        test_fail!("VFS resolve deadline",
+            "(a) deep symlink: res={:?} elapsed={} ticks (expected Ok and <100)", res, elapsed);
+        ok = false;
+    }
+
+    // ── (b) Forced-expired deadline returns ETIMEDOUT ──────────────────
+    // Use deadline_ticks = 0 — strictly less than any get_ticks() value on
+    // a booted system, so the very first iteration of the resolve loop
+    // observes get_ticks() >= 0 and bails out.
+    match crate::vfs::_test_resolve_with_deadline("/tmp/w83/a/b/c/d/target.txt", 0) {
+        Err(crate::vfs::VfsError::TimedOut) => {
+            test_println!("  (b) deadline=0 → VfsError::TimedOut (errno 110) ✓");
+        }
+        other => {
+            test_fail!("VFS resolve deadline",
+                "(b) deadline=0 expected TimedOut, got {:?}", other);
+            ok = false;
+        }
+    }
+
+    // ── Cleanup ─────────────────────────────────────────────────────────
+    let _ = crate::vfs::remove("/tmp/w83/link");
+    let _ = crate::vfs::remove("/tmp/w83/a/b/c/d/target.txt");
+    let _ = crate::vfs::remove("/tmp/w83/a/b/c/d");
+    let _ = crate::vfs::remove("/tmp/w83/a/b/c");
+    let _ = crate::vfs::remove("/tmp/w83/a/b");
+    let _ = crate::vfs::remove("/tmp/w83/a");
+    let _ = crate::vfs::remove("/tmp/w83");
+
+    if ok { test_pass!("VFS resolve_path_opts: trace + 1s deadline (W83)"); }
     ok
 }
 

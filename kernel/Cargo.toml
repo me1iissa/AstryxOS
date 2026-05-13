@@ -82,6 +82,15 @@ futex-wait-scan = []
 # which adds the matching `virtio-serial-pci` + `virtserialport` device on
 # the host side.  See virtio 1.2 §5.3 (Console Device).
 qga = []
+# VFS path-resolution tracing (W83 diagnostic).  Emits one `[VFS/resolve]` line
+# per directory component traversed in `vfs::resolve_path_opts` and one extra
+# line per symlink follow.  Capped at 20 lines per outermost resolve to bound
+# log volume.  Implied by `firefox-test`; standalone for headless diagnostic
+# runs (e.g. tracking down a hang in a non-Firefox workload).  When neither
+# this nor `firefox-test` is enabled, the trace helper compiles to nothing —
+# the 1s deadline in `resolve_path_opts` is *not* feature-gated and is always
+# on.
+vfs-trace = []
 
 [dependencies]
 astryx-shared = { path = "../shared" }
