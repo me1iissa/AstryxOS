@@ -1533,6 +1533,13 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let bufsiz = arg3 as usize;
 
             // /proc/self/exe — resolve to current process exe path.
+            //
+            // If the process has no `exe_path` (kernel-only process, transient
+            // setup race), return an empty string — same shape Linux uses for
+            // processes whose `mm_struct->exe_file` is NULL (dead/kernel
+            // threads).  Returning a fake path like `/bin/init` is harmful: it
+            // misleads programs that derive sibling resources from their
+            // executable path (Mozilla's dependentlibs.list — W120/W121).
             let target_str: alloc::string::String = if path_str == "/proc/self/exe"
                 || path_str == "/proc/self/fd/exe"
             {
@@ -1541,7 +1548,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 procs.iter().find(|p| p.pid == pid)
                     .and_then(|p| p.exe_path.as_ref())
                     .map(|s| s.clone())
-                    .unwrap_or_else(|| alloc::string::String::from("/bin/init"))
+                    .unwrap_or_else(alloc::string::String::new)
             } else if path_str == "/proc/self/cwd"
                 || path_str == "/proc/self/root"
             {
@@ -2300,12 +2307,15 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             // to vfs::readlink() for these would return EINVAL on the symlink
             // dispatch (per proc(5)).
             let target: alloc::string::String = if full_path == "/proc/self/exe" {
+                // See `readlink(2)` arm above (case 89) — empty string for
+                // processes without an exe_path; never the fake "/bin/init"
+                // fallback that misleads dependentlibs path resolution.
                 let pid = crate::proc::current_pid_lockless();
                 let procs = crate::proc::PROCESS_TABLE.lock();
                 procs.iter().find(|p| p.pid == pid)
                     .and_then(|p| p.exe_path.as_ref())
                     .map(|s| s.clone())
-                    .unwrap_or_else(|| alloc::string::String::from("/bin/init"))
+                    .unwrap_or_else(alloc::string::String::new)
             } else if full_path == "/proc/self/cwd" {
                 let pid = crate::proc::current_pid_lockless();
                 let procs = crate::proc::PROCESS_TABLE.lock();

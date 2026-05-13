@@ -1648,7 +1648,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
     let (fds, cwd, parent_name, parent_uid, parent_gid, parent_euid, parent_egid,
          parent_groups, parent_umask, parent_linux_abi, parent_subsystem, parent_token_id,
          parent_pgid, parent_sid, parent_no_new_privs, parent_cap_permitted,
-         parent_cap_effective, parent_rlimits_soft) = {
+         parent_cap_effective, parent_rlimits_soft, parent_exe_path) = {
         let procs = PROCESS_TABLE.lock();
         let parent = procs.iter().find(|p| p.pid == parent_pid)?;
         (
@@ -1670,6 +1670,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
             parent.cap_permitted,
             parent.cap_effective,
             parent.rlimits_soft,
+            parent.exe_path.clone(),
         )
     };
 
@@ -1797,7 +1798,11 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
         handle_table: Some(crate::ob::handle::HandleTable::new()),
         subsystem: parent_subsystem,
         token_id: parent_token_id,
-        exe_path: None,
+        // POSIX: the executable identity survives fork(2).  /proc/self/exe in
+        // the child must resolve to the same image as the parent until the
+        // child calls execve(2).  Linux propagates `mm->exe_file` through
+        // copy_mm()/dup_mm(); we mirror that by cloning `parent.exe_path`.
+        exe_path: parent_exe_path,
         epoll_sets: alloc::vec::Vec::new(),
         auxv: Vec::new(),
         envp: Vec::new(),
@@ -1902,7 +1907,7 @@ pub fn fork_process_share_vm(
     let (fds, cwd, parent_name, parent_uid, parent_gid, parent_euid, parent_egid,
          parent_groups, parent_umask, parent_linux_abi, parent_subsystem, parent_token_id,
          parent_pgid, parent_sid, parent_no_new_privs, parent_cap_permitted,
-         parent_cap_effective, parent_rlimits_soft, parent_cr3) = {
+         parent_cap_effective, parent_rlimits_soft, parent_cr3, parent_exe_path) = {
         let procs = PROCESS_TABLE.lock();
         let parent = procs.iter().find(|p| p.pid == parent_pid)?;
         (
@@ -1915,6 +1920,7 @@ pub fn fork_process_share_vm(
             parent.pgid, parent.sid, parent.no_new_privs,
             parent.cap_permitted, parent.cap_effective, parent.rlimits_soft,
             parent.cr3,
+            parent.exe_path.clone(),
         )
     };
 
@@ -2006,7 +2012,12 @@ pub fn fork_process_share_vm(
         handle_table: Some(crate::ob::handle::HandleTable::new()),
         subsystem: parent_subsystem,
         token_id: parent_token_id,
-        exe_path: None,
+        // Per POSIX clone(2)/fork(2): the child's executable identity matches
+        // the parent until/unless the child execve(2)s.  /proc/self/exe must
+        // therefore resolve to the parent's exe path immediately after the
+        // clone returns — critical for posix_spawn(3) middleware that calls
+        // `readlink("/proc/self/exe")` *before* the exec stage runs.
+        exe_path: parent_exe_path,
         epoll_sets: alloc::vec::Vec::new(),
         auxv: Vec::new(),
         envp: Vec::new(),
@@ -2106,13 +2117,14 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
 
     // Copy parent's file descriptors and credentials.
     let (fds, cwd, parent_name, parent_cr3, parent_tls_base,
-         parent_linux_abi, parent_pgid, parent_sid) = {
+         parent_linux_abi, parent_pgid, parent_sid, parent_exe_path) = {
         let procs = PROCESS_TABLE.lock();
         let parent = procs.iter().find(|p| p.pid == parent_pid)?;
         let fds = parent.file_descriptors.clone();
         let cwd = parent.cwd.clone();
         let mut name = parent.name;
-        (fds, cwd, name, parent.cr3, 0u64, parent.linux_abi, parent.pgid, parent.sid)
+        (fds, cwd, name, parent.cr3, 0u64, parent.linux_abi, parent.pgid, parent.sid,
+         parent.exe_path.clone())
     };
 
     // Get parent's TLS base from thread struct.
@@ -2219,7 +2231,9 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
         handle_table: Some(crate::ob::handle::HandleTable::new()),
         subsystem: crate::win32::SubsystemType::Native,
         token_id: None,
-        exe_path: None,
+        // vfork child inherits the parent's executable identity until exec(2);
+        // see fork_process for rationale (POSIX clone(2)/fork(2)).
+        exe_path: parent_exe_path,
         epoll_sets: alloc::vec::Vec::new(),
         auxv: Vec::new(),
         envp: Vec::new(),
