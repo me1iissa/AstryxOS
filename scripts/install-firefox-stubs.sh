@@ -282,19 +282,41 @@ _EXACT_CATEGORY = {
     'FcFontMatch':             'fcpattern_one',
     'FcFontSort':              'fcfontset_one',
     'FcFontRenderPrepare':     'fcpattern_one',
-    # FcPatternGet* — typed stubs that return FcResult (int).  The
-    # default 'null' category returns 0 (= FcResultMatch) but leaves the
-    # out-pointer untouched, so Mozilla then dereferences uninitialised
-    # stack memory.  Explicit 'fc_no_match' returns FcResultNoMatch (1)
-    # for everything *except* FcPatternGetString, which has its own
-    # typed body that recognises FC_FILE / FC_FAMILY and writes a real
-    # DejaVu Sans descriptor — that's what lets AddPatternToFontList
-    # insert one entry into mFontFamilies. Spec:
-    # https://fontconfig.org/fontconfig-devel/fcpatternget.html
+    # FcPatternGet* — typed stubs that return FcResult (int).
+    #
+    # Mozilla's gfxFontconfigFontEntry / gfxFontconfigUtils helpers call
+    # FcPatternGetBool/Integer/Double on the FcPattern result of
+    # FcFontMatch / FcFontRenderPrepare, then on EVERY return path check
+    # `if (result) { /* failure */ }`.  Several of those failure branches
+    # then write back into the pattern pointer (`pat->flags |= FOO`) —
+    # which faults if `pat` is NULL (i.e. the caller passed an
+    # uninitialised handle on the no-pattern path).
+    #
+    # The 'fc_no_match' classifier returns 1 = FcResultNoMatch unmodified,
+    # which is spec-correct but pushes Mozilla into those NULL-deref
+    # failure branches.  Pre-PR-#172 the default 'null' classifier
+    # returned 0 = FcResultMatch and left `*[arg4]` uninitialised; on the
+    # lucky-zero stack frame Mozilla took the success branch with b=0 and
+    # never derefed the NULL pattern, which is why the issue was hidden.
+    #
+    # The 'fc_get_*_zero' classifiers reproduce that lucky-zero behaviour
+    # deterministically: populate `*[arg4]` with a zero value of the
+    # correct type, then return 0 = FcResultMatch.  Mozilla takes the
+    # success branch with b=0/i=0/d=0.0, doesn't touch the (possibly
+    # NULL) pattern pointer, and continues init.
+    #
+    # FcPatternGetString already has a typed populate-output body
+    # (recognises the DejaVu Sans sentinel pattern, writes a real
+    # path/family for FC_FILE / FC_FAMILY).  FcPatternGetCharSet /
+    # LangSet / FTFace remain on 'fc_no_match' — their callers in
+    # Mozilla's font-list path handle the NoMatch return cleanly and do
+    # not write back into the (possibly NULL) pattern.
+    #
+    # Spec: https://fontconfig.org/fontconfig-devel/fcpatternget.html
     'FcPatternGetString':      'fc_pattern_get_string',
-    'FcPatternGetBool':        'fc_no_match',
-    'FcPatternGetInteger':     'fc_no_match',
-    'FcPatternGetDouble':      'fc_no_match',
+    'FcPatternGetBool':        'fc_get_bool_zero',
+    'FcPatternGetInteger':     'fc_get_int_zero',
+    'FcPatternGetDouble':      'fc_get_double_zero',
     'FcPatternGetCharSet':     'fc_no_match',
     'FcPatternGetLangSet':     'fc_no_match',
     'FcPatternGetFTFace':      'fc_no_match',
@@ -769,16 +791,60 @@ def emit_stub(name, cat):
             f'}}\n'
         )
     elif cat == 'fc_no_match':
-        # FcPatternGet* (Bool / Integer / CharSet / LangSet / FTFace /
-        # Double / generic) — return FcResultNoMatch (1) so Mozilla
-        # treats the field as absent and falls through to its
-        # default-handling branches.  Critically NOT 'null' (which
-        # returns 0 = FcResultMatch and leaves the out-pointer
-        # uninitialised, causing downstream UB).  Spec:
+        # FcPatternGet* (CharSet / LangSet / FTFace / generic) — return
+        # FcResultNoMatch (1) so Mozilla treats the field as absent and
+        # falls through to its default-handling branches.  Critically
+        # NOT 'null' (which returns 0 = FcResultMatch and leaves the
+        # out-pointer uninitialised, causing downstream UB).  Spec:
         # https://fontconfig.org/fontconfig-devel/fcresult.html
         return (
             f'int {name}(...) {{\n'
             f'    return 1; /* FcResultNoMatch */\n'
+            f'}}\n'
+        )
+    elif cat == 'fc_get_bool_zero':
+        # FcResult FcPatternGetBool(const FcPattern *p, const char
+        # *object, int id, FcBool *b).  Populate *b with FcFalse (0)
+        # and return FcResultMatch (0) so Mozilla takes the success
+        # branch with b == 0 and never falls into failure paths that
+        # may dereference the (possibly NULL) pattern pointer to set
+        # error flags (orb $0x2, 0x9c(%rbx) at libxul+0x185b8a4).
+        # The NULL-out-pointer guard returns NoMatch — if the caller
+        # didn't supply a buffer they can't read uninitialised data.
+        # Spec: https://fontconfig.org/fontconfig-devel/fcpatterngetbool.html
+        # (FcBool is int per fontconfig.h.)
+        return (
+            f'int {name}(const void* p, const char* object, int id, int* b) {{\n'
+            f'    (void)p; (void)object; (void)id;\n'
+            f'    if (!b) return 1; /* defensive: NULL out-pointer → NoMatch */\n'
+            f'    *b = 0; /* FcFalse */\n'
+            f'    return 0; /* FcResultMatch */\n'
+            f'}}\n'
+        )
+    elif cat == 'fc_get_int_zero':
+        # FcResult FcPatternGetInteger(const FcPattern *p, const char
+        # *object, int id, int *i).  Same shape as fc_get_bool_zero:
+        # populate *i with 0 and return Match.  Spec:
+        # https://fontconfig.org/fontconfig-devel/fcpatterngetinteger.html
+        return (
+            f'int {name}(const void* p, const char* object, int id, int* i) {{\n'
+            f'    (void)p; (void)object; (void)id;\n'
+            f'    if (!i) return 1;\n'
+            f'    *i = 0;\n'
+            f'    return 0;\n'
+            f'}}\n'
+        )
+    elif cat == 'fc_get_double_zero':
+        # FcResult FcPatternGetDouble(const FcPattern *p, const char
+        # *object, int id, double *d).  Populate *d with 0.0 and return
+        # Match.  Spec:
+        # https://fontconfig.org/fontconfig-devel/fcpatterngetdouble.html
+        return (
+            f'int {name}(const void* p, const char* object, int id, double* d) {{\n'
+            f'    (void)p; (void)object; (void)id;\n'
+            f'    if (!d) return 1;\n'
+            f'    *d = 0.0;\n'
+            f'    return 0;\n'
             f'}}\n'
         )
     elif cat == 'fc_pattern_get_string':
