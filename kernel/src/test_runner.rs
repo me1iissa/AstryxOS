@@ -1461,6 +1461,19 @@ pub fn run() -> ! {
     total += 1;
     if test_get_user_rsp_rbp_rejects_stale_frame() { passed += 1; }
 
+    // ── Test 212: FAT32 lock-discipline (W92) ──────────────────────────────
+    // Regression guard for the BUGCHECK_SCHEDULER_DEADLOCK (0xDEAD_0004)
+    // that fired at sc=1161 in firefox-test on commit a219ceb9.  Two
+    // concurrent VFS readers entered `Fat32Fs::ensure_sector` while the
+    // virtio-blk completion path was calling `sched::schedule()` with the
+    // FAT32 inner `spin::Mutex` still held by the first thread, wedging
+    // the scheduler.  The fix refactors every lock-across-yield call site
+    // to a snapshot-drop-call-reacquire pattern; this test exercises the
+    // same paths in sequence and asserts the LOCK_HELD_VIOLATIONS probe
+    // counter remains zero.
+    total += 1;
+    if test_fat32_lock_discipline_w92() { passed += 1; }
+
     // (Tests 199/200 run earlier — right after Test 80c — so the vDSO
     // TSC fast path is verified before the slow PNG screenshot test.
     // Stream-A pipe / eventfd wake-hook tests run first — see Tests
@@ -26267,6 +26280,155 @@ fn test_get_user_rsp_rbp_rejects_stale_frame() -> bool {
     unsafe { crate::syscall::PER_CPU_SYSCALL[cpu].frame_rsp = saved_frame_rsp; }
 
     test_pass!("get_user_rsp_rbp rejects stale per-CPU frame (W86)");
+    true
+}
+
+/// Test 212 — FAT32 lock discipline (W92 scheduler-deadlock regression).
+///
+/// Reproduces the call pattern that wedged the kernel scheduler at sc=1161
+/// in firefox-test on commit `a219ceb9`:
+///   - VFS thread A enters `Fat32Fs::ensure_sector` and acquires `inner`.
+///   - The virtio-blk completion path inside `device.read_sectors()` calls
+///     `sched::schedule()` while the spin-mutex is still held.
+///   - VFS thread B on a sibling CPU then spins on the same lock forever,
+///     the scheduler watchdog fires `BUGCHECK_SCHEDULER_DEADLOCK`.
+///
+/// The fix refactors every lock-held-across-IO site in `kernel/src/vfs/fat32.rs`
+/// to a snapshot-drop-call-reacquire pattern.  This test exercises the same
+/// paths — `read`, `cache_read` (via read), `cache_write` (via write),
+/// `fat_write` (via allocation), `read_chain`, `read_directory_raw`,
+/// `find_free_dir_slot`, `flush_dir_entry`, `refresh_fsinfo` (via sync),
+/// `remove`'s LFN scan, and the eviction path — and asserts the
+/// `fat32::lock_held_violations()` probe counter remains zero throughout.
+/// Each direct `device.{read,write}_sectors` call in the FAT32 module
+/// bumps that counter if the inner mutex was held when it entered.
+fn test_fat32_lock_discipline_w92() -> bool {
+    use crate::vfs::FileSystemOps;
+    test_header!("FAT32 lock discipline (W92)");
+
+    let baseline = crate::vfs::fat32::lock_held_violations();
+    test_println!("  baseline violations: {}", baseline);
+
+    // ── Build a backing FAT32 image and mount it ─────────────────────────
+    let image = crate::vfs::fat32::create_test_image();
+    let image_static: &'static [u8] = alloc::boxed::Box::leak(image.into_boxed_slice());
+    let device = alloc::boxed::Box::new(
+        crate::drivers::block::MemoryBlockDevice::new(image_static));
+    let fs = match crate::vfs::fat32::Fat32Fs::new(device) {
+        Ok(f) => f,
+        Err(e) => {
+            test_fail!("test_fat32_lock_discipline_w92", "Fat32Fs::new failed: {:?}", e);
+            return false;
+        }
+    };
+    let root = fs.root_inode();
+
+    // ── Exercise the read paths ──────────────────────────────────────────
+    // `readdir` walks the root cluster chain — covers `read_directory_raw`.
+    let entries = match fs.readdir(root) {
+        Ok(e) => e,
+        Err(e) => {
+            test_fail!("test_fat32_lock_discipline_w92", "readdir failed: {:?}", e);
+            return false;
+        }
+    };
+    if entries.is_empty() {
+        test_fail!("test_fat32_lock_discipline_w92", "readdir returned no entries");
+        return false;
+    }
+    test_println!("  readdir: {} entries", entries.len());
+
+    // `read` walks the file's cluster chain — covers `read_chain` plus the
+    // contiguous-run path that calls `device.read_sectors` directly.
+    let hello_ino = match fs.lookup(root, "hello.txt") {
+        Ok(i) => i,
+        Err(e) => {
+            test_fail!("test_fat32_lock_discipline_w92", "lookup hello.txt: {:?}", e);
+            return false;
+        }
+    };
+    let mut buf = [0u8; 64];
+    if let Err(e) = fs.read(hello_ino, 0, &mut buf) {
+        test_fail!("test_fat32_lock_discipline_w92", "read hello.txt: {:?}", e);
+        return false;
+    }
+
+    // Read a few overlapping ranges to fault more sectors through the
+    // cache and exercise `ensure_sector` repeatedly.
+    for off in [0u64, 1, 8, 17] {
+        let _ = fs.read(hello_ino, off, &mut buf);
+    }
+
+    // ── Exercise the write / allocate / flush paths ──────────────────────
+    // Create a new file → exercises `create_file`, `find_free_dir_slot`,
+    // `cache_write`, `write_dir_entry_at`, and `do_sync` (via the implicit
+    // sync hook in `create_file`).
+    let new_ino = match fs.create_file(root, "w92test.txt") {
+        Ok(i) => i,
+        Err(e) => {
+            test_fail!("test_fat32_lock_discipline_w92", "create_file: {:?}", e);
+            return false;
+        }
+    };
+
+    // Write enough bytes to require at least two sectors → exercises
+    // `cache_write`, `fat_write` (cluster allocation + extend), and
+    // `flush_dir_entry`.
+    let payload = [0xA5u8; 600];
+    let n = match fs.write(new_ino, 0, &payload) {
+        Ok(n) => n,
+        Err(e) => {
+            test_fail!("test_fat32_lock_discipline_w92", "write: {:?}", e);
+            return false;
+        }
+    };
+    if n != payload.len() {
+        test_fail!("test_fat32_lock_discipline_w92",
+            "short write: {} != {}", n, payload.len());
+        return false;
+    }
+
+    // Truncate down then up → exercises the shrink and grow paths.
+    if let Err(e) = fs.truncate(new_ino, 128) {
+        test_fail!("test_fat32_lock_discipline_w92", "truncate-down: {:?}", e);
+        return false;
+    }
+    if let Err(e) = fs.truncate(new_ino, 700) {
+        test_fail!("test_fat32_lock_discipline_w92", "truncate-up: {:?}", e);
+        return false;
+    }
+
+    // Read back to force fresh `ensure_sector` calls into the rewritten
+    // sectors → exercises the prime / re-prime path.
+    let mut readback = [0u8; 256];
+    if let Err(e) = fs.read(new_ino, 0, &mut readback) {
+        test_fail!("test_fat32_lock_discipline_w92", "readback: {:?}", e);
+        return false;
+    }
+
+    // Remove the file → exercises the FAT32-5 LFN backward scan.
+    if let Err(e) = fs.remove(root, "w92test.txt") {
+        test_fail!("test_fat32_lock_discipline_w92", "remove: {:?}", e);
+        return false;
+    }
+
+    // Explicit sync → exercises `do_sync` and `refresh_fsinfo`.  The
+    // backing `MemoryBlockDevice` is read-only, so `sync()` returns
+    // `Err(Io)` — we ignore that here because the W92 probe runs inside
+    // the device call regardless of its outcome.
+    let _ = fs.sync();
+
+    // ── Verify the probe counter ─────────────────────────────────────────
+    let final_violations = crate::vfs::fat32::lock_held_violations();
+    let delta = final_violations - baseline;
+    if delta != 0 {
+        test_fail!("test_fat32_lock_discipline_w92",
+            "W92 regression: {} lock-held-across-IO violation(s) observed", delta);
+        return false;
+    }
+    test_println!("  no lock-held-across-IO violations ({} ops checked)", final_violations);
+
+    test_pass!("FAT32 lock discipline (W92)");
     true
 }
 
