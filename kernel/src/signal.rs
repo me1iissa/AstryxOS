@@ -640,6 +640,16 @@ pub unsafe fn deliver_sigsegv_from_isr(
     let is_linux = proc_entry.linux_abi
         || proc_entry.subsystem == crate::win32::SubsystemType::Linux;
 
+    let user_rip = (*frame).rip;
+
+    // Snapshot the VMA containing user_rip plus up to a handful of
+    // executable file-backed neighbours.  Done now, BEFORE we reborrow
+    // `proc_entry.signal_state`, so the snapshot does not alias the
+    // later `&mut sig_state` borrow.  The actual print happens at the
+    // end of this function so PROCESS_TABLE is not held across the
+    // serial writes.  See the `[SIGNAL/VMA]` emission block below.
+    let vma_snapshot = signal_vma_snapshot(proc_entry.vm_space.as_ref(), user_rip);
+
     let sig_state = match proc_entry.signal_state.as_mut() {
         Some(s) => s,
         None => return false,
@@ -651,7 +661,6 @@ pub unsafe fn deliver_sigsegv_from_isr(
         _ => return false, // Default or Ignore — caller kills the process
     };
 
-    let user_rip = (*frame).rip;
     let user_rsp = (*frame).rsp;
     let user_rflags = (*frame).rflags;
     let saved_mask = sig_state.blocked;
@@ -748,10 +757,111 @@ pub unsafe fn deliver_sigsegv_from_isr(
     // mortem investigators a kdb step: with the libxul base address from
     // dmesg they can subtract it to get the file offset and addr2line the
     // exact source line that faulted.
+    //
+    // Drop PROCESS_TABLE before the serial writes — a slow COM1 should
+    // never block other CPUs from looking up their own process entry.
+    drop(procs);
     crate::serial_println!(
         "[SIGNAL] SIGSEGV ISR delivery: PID={} CR2={:#x} user_rip={:#x} handler={:#x} new_rsp={:#x}",
         pid, cr2, user_rip, handler_addr, new_rsp
     );
+    emit_signal_vma_banner(pid, user_rip, &vma_snapshot);
 
     true
+}
+
+/// Compact VMA descriptor captured at SIGSEGV delivery time.
+///
+/// `name` is `&'static str` (the same lifetime as `VmArea::name`), so the
+/// snapshot is cheap to build and carry across the lock drop.
+#[derive(Copy, Clone)]
+pub(crate) struct VmaSnap {
+    pub(crate) base: u64,
+    pub(crate) end: u64,
+    pub(crate) prot: u32,
+    pub(crate) name: &'static str,
+    pub(crate) file_backed: bool,
+    pub(crate) contains_rip: bool,
+}
+
+/// Capture the VMA covering `user_rip` plus a small number of executable,
+/// file-backed neighbours that are likely shared-library load segments.
+///
+/// Capped at 8 entries to keep serial volume bounded — emitting every VMA
+/// of a libxul-loading process would push hundreds of lines per fault.
+///
+/// Visible to `test_runner` via `pub(crate)` so the snapshot policy can
+/// be unit-tested against a synthetic `VmSpace` without standing up a
+/// full `Process`.
+pub(crate) fn signal_vma_snapshot(
+    space: Option<&crate::mm::vma::VmSpace>,
+    user_rip: u64,
+) -> alloc::vec::Vec<VmaSnap> {
+    use crate::mm::vma::{PROT_EXEC, VmBacking};
+    let mut out: alloc::vec::Vec<VmaSnap> = alloc::vec::Vec::new();
+    let space = match space {
+        Some(s) => s,
+        None => return out,
+    };
+    for a in space.areas.iter() {
+        let file_backed = matches!(a.backing, VmBacking::File { .. });
+        let contains = a.contains(user_rip);
+        // Always include the VMA containing user_rip.  For neighbours,
+        // only include executable file-backed mappings (shared-library
+        // text segments) — those are the symbolication-useful ones.
+        let keep = contains || (file_backed && (a.prot & PROT_EXEC) != 0);
+        if !keep {
+            continue;
+        }
+        out.push(VmaSnap {
+            base: a.base,
+            end: a.end(),
+            prot: a.prot,
+            name: a.name,
+            file_backed,
+            contains_rip: contains,
+        });
+        if out.len() >= 8 {
+            break;
+        }
+    }
+    out
+}
+
+/// Emit `[SIGNAL/VMA]` lines for the snapshot captured at fault time.
+///
+/// Format (one line per kept VMA):
+///   `[SIGNAL/VMA] pid=<n> name=<label> base=<vaddr> end=<vaddr> size=<bytes> prot=<rwx> file=<0|1> rip=<0|1> [offset=<within>]`
+///
+/// `rip=1` marks the VMA that contains `user_rip`; that entry also carries an
+/// `offset=` field giving `user_rip - base` so the next investigator can
+/// addr2line directly against the `[FFTEST/mmap-so]` base for that VMA's
+/// underlying file.
+fn emit_signal_vma_banner(pid: u64, user_rip: u64, snap: &[VmaSnap]) {
+    use crate::mm::vma::{PROT_EXEC, PROT_READ, PROT_WRITE};
+    if snap.is_empty() {
+        crate::serial_println!(
+            "[SIGNAL/VMA] pid={} user_rip={:#x} no_vma_match=1",
+            pid, user_rip
+        );
+        return;
+    }
+    for v in snap.iter() {
+        let r = if v.prot & PROT_READ  != 0 { 'r' } else { '-' };
+        let w = if v.prot & PROT_WRITE != 0 { 'w' } else { '-' };
+        let x = if v.prot & PROT_EXEC  != 0 { 'x' } else { '-' };
+        if v.contains_rip {
+            crate::serial_println!(
+                "[SIGNAL/VMA] pid={} name={} base={:#x} end={:#x} size={:#x} prot={}{}{} file={} rip=1 offset={:#x}",
+                pid, v.name, v.base, v.end, v.end - v.base, r, w, x,
+                v.file_backed as u8, user_rip - v.base
+            );
+        } else {
+            crate::serial_println!(
+                "[SIGNAL/VMA] pid={} name={} base={:#x} end={:#x} size={:#x} prot={}{}{} file={} rip=0",
+                pid, v.name, v.base, v.end, v.end - v.base, r, w, x,
+                v.file_backed as u8
+            );
+        }
+    }
 }
