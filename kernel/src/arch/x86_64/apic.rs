@@ -652,6 +652,12 @@ pub fn start_aps() {
         total,
         bsp_id
     );
+
+    // SMP is now live — enable the full cross-CPU TLB shootdown protocol.
+    // Until this point only the BSP exists, so local invlpg was sufficient.
+    if total > 1 {
+        crate::mm::tlb::mark_smp_active();
+    }
 }
 
 /// Ensure that the page containing `phys_addr` is executable (clear the NX bit).
@@ -1048,6 +1054,15 @@ pub extern "C" fn ap_rust_entry() -> ! {
     // configured before any user thread runs on this CPU.  The BSP does this
     // in syscall::init() (Phase 6), but APs bypass that path.
     crate::syscall::init_ap();
+
+    // Publish ourselves as a viable TLB-shootdown target BEFORE enabling
+    // interrupts.  IDT, GDT, per-CPU TSC_AUX, idle-thread bookkeeping, and
+    // the LAPIC are all live at this point, so handle_shootdown_ipi() on
+    // vector 0xF0 can execute safely.  Doing this here, rather than waiting
+    // for `start_aps` to return on the BSP, closes the per-AP window where
+    // the BSP could shoot down an address space this AP had already loaded
+    // but where SMP_ACTIVE was still false.  See mm/tlb.rs.
+    crate::mm::tlb::mark_self_smp_online();
 
     // Enable interrupts and enter scheduling loop.
     // After each timer interrupt wakes this AP from HLT, check if a reschedule

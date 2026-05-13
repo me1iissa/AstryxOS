@@ -3079,6 +3079,7 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
 
     const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
     let mut page = start;
+    let mut had_unmap = false;
     while page < end {
         let pte = crate::mm::vmm::read_pte(cr3, page);
         if pte & 1 != 0 {
@@ -3089,7 +3090,7 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
                 core::ptr::write_bytes((PHYS_OFF + phys) as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
             }
             crate::mm::vmm::write_pte(cr3, page, 0);
-            crate::mm::vmm::invlpg(page);
+            had_unmap = true;
             let rc = crate::mm::refcount::page_ref_count(phys);
             if rc <= 1 {
                 crate::mm::refcount::page_ref_set(phys, 0);
@@ -3099,6 +3100,9 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
             }
         }
         page += crate::mm::pmm::PAGE_SIZE as u64;
+    }
+    if had_unmap {
+        crate::mm::tlb::shootdown_range(cr3, start, end);
     }
     0
 }
@@ -4014,7 +4018,7 @@ pub fn sys_clock_gettime(clk_id: u64, tp: u64) -> i64 {
 /// field so future page-fault allocations use the right flags.
 fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
     use crate::mm::vma::{page_align_down, page_align_up, PROT_READ, PROT_WRITE, PROT_EXEC};
-    use crate::mm::vmm::{read_pte, write_pte, invlpg, PAGE_PRESENT, PAGE_WRITABLE,
+    use crate::mm::vmm::{read_pte, write_pte, PAGE_PRESENT, PAGE_WRITABLE,
                          PAGE_USER, PAGE_NO_EXECUTE};
 
     if len == 0 {
@@ -4114,7 +4118,9 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
         i += n;
     }
 
-    // Walk every page and retag PTEs.
+    // Walk every page and retag PTEs.  TLB invalidation is coalesced
+    // into a single shootdown over [base, end) after the loop so that
+    // mprotect of a 1000-page range issues one IPI not 1000.
     let mut page = base;
     while page < end {
         let pte = read_pte(cr3, page);
@@ -4129,9 +4135,11 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
                 new_flags |= PAGE_NO_EXECUTE;
             }
             write_pte(cr3, page, phys | new_flags);
-            invlpg(page);
         }
         page = page.wrapping_add(0x1000);
+    }
+    if end > base {
+        crate::mm::tlb::shootdown_range(cr3, base, end);
     }
 
     0

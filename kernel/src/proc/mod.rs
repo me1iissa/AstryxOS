@@ -1073,7 +1073,13 @@ pub fn exit_thread(exit_code: i64) {
         let kc3 = crate::mm::vmm::get_kernel_cr3();
         let cur = crate::mm::vmm::get_cr3();
         if kc3 != 0 && cur != kc3 {
+            // Order: set the NEW (kernel) bit, write CR3, clear the OLD bit.
+            // At every intermediate state at least one mask names this CPU
+            // so a concurrent shootdown cannot miss us; the IPI handler's
+            // running-CR3 equality check filters out wrong-CR3 invalidations.
+            crate::mm::tlb::note_cr3_load(kc3);
             unsafe { crate::mm::vmm::switch_cr3(kc3); }
+            crate::mm::tlb::note_cr3_unload(cur);
         }
     }
 
@@ -1191,6 +1197,15 @@ pub fn free_process_memory(pid: Pid) {
 
     let cr3 = vm_space.cr3;
 
+    // Shoot down every TLB entry tagged with this CR3 across every CPU
+    // BEFORE the backing frames are recycled.  Without this an AP that
+    // briefly held the CR3 might still cache a translation pointing at
+    // a frame the PMM is about to hand to a different process —
+    // classic use-after-free, observable as a GPF in random user code.
+    // The full-range request triggers a CR3-reload on each target
+    // (cheaper than per-page invlpg over the entire user half).
+    crate::mm::tlb::shootdown_full_user(cr3);
+
     // Walk all VMAs and free physical frames (anonymous pages only).
     // File-backed pages are managed by the page cache; device pages are MMIO.
     const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
@@ -1250,6 +1265,13 @@ pub fn free_vm_space(vm_space: crate::mm::vma::VmSpace) {
         return;
     }
 
+    // Shoot down the entire user half BEFORE recycling frames; see the
+    // matching comment in free_process_memory above.  Even though the
+    // caller has already switched away from this CR3, sibling threads
+    // on other CPUs that have not yet reached the next context-switch
+    // could still hold cached translations into this address space.
+    crate::mm::tlb::shootdown_full_user(cr3);
+
     // Walk all anonymous VMAs and decrement/free the backing physical pages.
     // File-backed pages belong to the page cache; device pages are MMIO.
     const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
@@ -1301,6 +1323,13 @@ fn free_user_page_tables(cr3: u64) {
     // Guard: don't free kernel CR3 or a zero/already-freed CR3.
     let kernel_cr3 = crate::mm::vmm::get_kernel_cr3();
     if cr3 == 0 || cr3 == kernel_cr3 { return; }
+
+    // Drop the per-CR3 active-CPU tracking entry — no CPU should be
+    // running on this address space any more (the caller has switched
+    // every still-live thread off it before invoking the teardown
+    // path), and leaving the entry would leak BTreeMap nodes across
+    // the lifetime of the kernel.
+    crate::mm::tlb::forget_cr3(cr3);
 
     /// Convert physical address to a kernel-accessible virtual pointer
     /// using the higher-half direct map (not identity map).
@@ -1503,7 +1532,11 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
         let kc3 = crate::mm::vmm::get_kernel_cr3();
         let cur = crate::mm::vmm::get_cr3();
         if kc3 != 0 && cur != kc3 {
+            // Same bracket order as elsewhere: set NEW bit, write CR3,
+            // clear OLD bit.  See sched/mod.rs for the rationale.
+            crate::mm::tlb::note_cr3_load(kc3);
             unsafe { crate::mm::vmm::switch_cr3(kc3); }
+            crate::mm::tlb::note_cr3_unload(cur);
         }
     }
     // Free user memory (no locks held).
