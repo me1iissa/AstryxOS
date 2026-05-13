@@ -805,6 +805,84 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
         }
     };
 
+    // Log the final argv so content-process roles (--contentproc <type> <fd>)
+    // are visible in the serial trace.  Truncated to 8 args and 256 cumulative
+    // bytes to avoid log spam on deeply-nested command lines.
+    {
+        let pid = crate::proc::current_pid_lockless();
+        let tid = crate::proc::current_tid();
+        let total_args = argv_owned.len();
+        // Build a compact representation into a fixed-size stack buffer.
+        // We use a simple byte-array writer to stay no_std / no-alloc.
+        const BUF: usize = 320;
+        let mut buf = [0u8; BUF];
+        let mut pos = 0usize;
+        let mut byte_budget: usize = 256;
+        let mut args_shown: usize = 0;
+
+        macro_rules! push_byte {
+            ($b:expr) => {
+                if pos < BUF - 1 {
+                    buf[pos] = $b;
+                    pos += 1;
+                }
+            };
+        }
+        macro_rules! push_str {
+            ($s:expr) => {
+                for b in $s.as_bytes() {
+                    push_byte!(*b);
+                }
+            };
+        }
+
+        for (i, arg) in argv_owned.iter().enumerate() {
+            if i >= 8 || byte_budget == 0 {
+                break;
+            }
+            if i > 0 {
+                push_byte!(b' ');
+            }
+            push_byte!(b'"');
+            // Check for non-printable bytes; if any, emit <binary len=N> instead.
+            let all_print = arg.bytes().all(|b| b >= 0x20 && b < 0x7f);
+            if all_print {
+                let take = arg.len().min(byte_budget);
+                for b in arg.as_bytes()[..take].iter() {
+                    push_byte!(*b);
+                }
+                byte_budget = byte_budget.saturating_sub(arg.len());
+            } else {
+                // Non-printable: emit placeholder without counting against budget.
+                push_str!("<binary len=");
+                // Emit decimal length inline.
+                let n = arg.len();
+                if n >= 100 { push_byte!(b'0' + (n / 100) as u8); }
+                if n >= 10  { push_byte!(b'0' + ((n / 10) % 10) as u8); }
+                push_byte!(b'0' + (n % 10) as u8);
+                push_byte!(b'>');
+            }
+            push_byte!(b'"');
+            args_shown += 1;
+        }
+
+        // NUL-terminate for safety, then convert the used slice.
+        buf[pos] = 0;
+        let shown = unsafe { core::str::from_utf8_unchecked(&buf[..pos]) };
+        let truncated = total_args > args_shown || byte_budget == 0;
+        if truncated {
+            crate::serial_println!(
+                "[EXEC] pid={} tid={} argv={} ({} of {} args shown)",
+                pid, tid, shown, args_shown, total_args
+            );
+        } else {
+            crate::serial_println!(
+                "[EXEC] pid={} tid={} argv={} ({} args)",
+                pid, tid, shown, total_args
+            );
+        }
+    }
+
     // Validate it's an ELF binary (resolve_shebang guarantees this on Ok).
     if !crate::proc::elf::is_elf(&elf_data) {
         crate::serial_println!("[SYSCALL] exec: not an ELF binary");
