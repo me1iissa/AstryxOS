@@ -452,7 +452,7 @@ impl VmSpace {
         // in a single operation.  Senders that have switched CPUs since
         // the original mapping are still covered because the per-CR3
         // active-CPU mask is consulted at shootdown time.
-        crate::mm::tlb::shootdown_range(self.cr3, 0, 0x0000_8000_0000_0000);
+        crate::mm::tlb::shootdown_full_user(self.cr3);
         crate::serial_println!("[FORK-COW] total {} 4KB pages CoW'd into child CR3={:#x}", total_pages_cow, child_pml4_phys);
 
         // Copy VMA list to child.

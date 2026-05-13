@@ -4018,7 +4018,7 @@ pub fn sys_clock_gettime(clk_id: u64, tp: u64) -> i64 {
 /// field so future page-fault allocations use the right flags.
 fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
     use crate::mm::vma::{page_align_down, page_align_up, PROT_READ, PROT_WRITE, PROT_EXEC};
-    use crate::mm::vmm::{read_pte, write_pte, invlpg, PAGE_PRESENT, PAGE_WRITABLE,
+    use crate::mm::vmm::{read_pte, write_pte, PAGE_PRESENT, PAGE_WRITABLE,
                          PAGE_USER, PAGE_NO_EXECUTE};
 
     if len == 0 {
