@@ -1073,9 +1073,13 @@ pub fn exit_thread(exit_code: i64) {
         let kc3 = crate::mm::vmm::get_kernel_cr3();
         let cur = crate::mm::vmm::get_cr3();
         if kc3 != 0 && cur != kc3 {
-            crate::mm::tlb::note_cr3_unload(cur);
-            unsafe { crate::mm::vmm::switch_cr3(kc3); }
+            // Order: set the NEW (kernel) bit, write CR3, clear the OLD bit.
+            // At every intermediate state at least one mask names this CPU
+            // so a concurrent shootdown cannot miss us; the IPI handler's
+            // running-CR3 equality check filters out wrong-CR3 invalidations.
             crate::mm::tlb::note_cr3_load(kc3);
+            unsafe { crate::mm::vmm::switch_cr3(kc3); }
+            crate::mm::tlb::note_cr3_unload(cur);
         }
     }
 
@@ -1528,9 +1532,11 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
         let kc3 = crate::mm::vmm::get_kernel_cr3();
         let cur = crate::mm::vmm::get_cr3();
         if kc3 != 0 && cur != kc3 {
-            crate::mm::tlb::note_cr3_unload(cur);
-            unsafe { crate::mm::vmm::switch_cr3(kc3); }
+            // Same bracket order as elsewhere: set NEW bit, write CR3,
+            // clear OLD bit.  See sched/mod.rs for the rationale.
             crate::mm::tlb::note_cr3_load(kc3);
+            unsafe { crate::mm::vmm::switch_cr3(kc3); }
+            crate::mm::tlb::note_cr3_unload(cur);
         }
     }
     // Free user memory (no locks held).
