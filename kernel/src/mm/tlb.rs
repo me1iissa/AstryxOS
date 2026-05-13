@@ -66,10 +66,13 @@ use crate::arch::x86_64::apic;
 /// 0x80).  See Intel SDM Vol 3A §10.6.1 (Interrupt Command Register).
 pub const TLB_SHOOTDOWN_VECTOR: u8 = 0xF0;
 
-/// Threshold above which a range invalidation falls back to a full TLB
-/// reload (write CR3) instead of per-page `invlpg`.  Mirrors the policy
-/// used by other x86_64 kernels; `invlpg` per page costs ~100 cycles
-/// each so above ~32 pages a CR3 reload is cheaper than the loop.
+/// Threshold (in pages) at and above which a range invalidation falls back
+/// to a full TLB reload (write CR3) instead of per-page `invlpg`.  Any range
+/// covering **more than** `FULL_FLUSH_PAGES_THRESHOLD` pages takes the
+/// full-flush path; up to and including the threshold it remains a per-page
+/// `invlpg` loop.  Mirrors the policy used by other x86_64 kernels;
+/// `invlpg` per page costs ~100 cycles each so above this threshold a CR3
+/// reload is cheaper than the loop.
 const FULL_FLUSH_PAGES_THRESHOLD: usize = 32;
 
 /// Per-CPU shootdown payload slot.
@@ -207,10 +210,27 @@ pub fn note_cr3_unload(cr3: u64) {
 /// [`crate::proc::free_user_page_tables`] once the address space has
 /// been torn down: no CPU can have it loaded any longer, so the
 /// associated bitmask is no longer meaningful.
+///
+/// In debug builds this asserts that the active-CPU mask is zero —
+/// i.e. that every CPU which ever ran on `cr3` has since called
+/// `note_cr3_unload(cr3)`.  A non-zero mask at forget time indicates a
+/// missing `note_cr3_unload` somewhere in the scheduler path, which
+/// would leave a stale bit pointing at this freed CR3 and could cause
+/// a later `shootdown_range` to target a CPU that has long since
+/// switched away — pessimal but not catastrophic, since the IPI
+/// handler's running-CR3 check rejects the stale invalidation.  We
+/// still want this caught in tests rather than allowed to drift.
 pub fn forget_cr3(cr3: u64) {
     if cr3 == 0 {
         return;
     }
+    debug_assert_eq!(
+        snapshot_active_mask(cr3),
+        0,
+        "forget_cr3({:#x}) called with non-zero active-CPU mask — a CPU \
+         is still bookkept as running on this CR3 (missing note_cr3_unload)",
+        cr3,
+    );
     let mut map = CR3_ACTIVE_CPUS.lock();
     map.remove(&cr3);
 }
@@ -301,6 +321,24 @@ pub fn shootdown_range(cr3: u64, va_lo: u64, va_hi: u64) {
         }
 
         STAT_SHOOTDOWNS_SENT.fetch_add(1, Ordering::Relaxed);
+
+        // Order the caller's PTE writes (write-back cacheable memory)
+        // against the upcoming payload Release-store and the LAPIC IPI
+        // MMIO write.  Per Intel SDM Vol 3A §4.10.4.2 (TLB shootdown
+        // protocol) and §8.2.5 (memory-ordering instructions), MFENCE
+        // serializes all prior loads and stores (including WB writes
+        // to the page-table memory the caller has just mutated) with
+        // respect to all later loads and stores from this processor.
+        // Without it, the architectural memory-order rules allow the
+        // PTE store to be globally visible after the slot Release-store
+        // — so a target CPU could observe `pending = 1`, acquire the
+        // payload, run `invlpg`, and STILL walk a stale PTE if the
+        // PTE update has not yet drained.  The slot's own Release fence
+        // orders the slot fields against `pending = 1`, but Release
+        // does NOT order earlier WB stores against the IPI MMIO write.
+        // MFENCE here, before the payload publish, plugs that gap for
+        // every target CPU in one shot.
+        core::sync::atomic::fence(Ordering::SeqCst);
 
         // Per Intel SDM Vol 3A §10.6.1, a fixed-mode IPI's delivery
         // status is reflected in ICR_LO bit 12.  send_ipi() already
@@ -400,6 +438,16 @@ pub fn shootdown_page(cr3: u64, va: u64) {
     shootdown_range(cr3, lo, lo + 0x1000);
 }
 
+/// Convenience wrapper for the "all of the user half" shootdown that
+/// process-teardown sites need.  Covers the canonical lower-half VA
+/// range `[0, 0x0000_8000_0000_0000)`.  Page-count above the
+/// `FULL_FLUSH_PAGES_THRESHOLD` so it always takes the CR3-reload
+/// (full TLB flush) fast path on every receiving CPU.
+#[inline]
+pub fn shootdown_full_user(cr3: u64) {
+    shootdown_range(cr3, 0, 0x0000_8000_0000_0000);
+}
+
 /// IPI handler.  Invoked from [`crate::arch::x86_64::idt`] when the LAPIC
 /// delivers a [`TLB_SHOOTDOWN_VECTOR`] interrupt to this CPU.
 ///
@@ -410,9 +458,23 @@ pub extern "C" fn handle_shootdown_ipi() {
     let cpu = apic::cpu_index();
     if cpu < apic::MAX_CPUS {
         let slot = &SHOOTDOWN_SLOTS[cpu];
-        // Acquire pairs with the Release in the sender so we observe
-        // the cr3/va_lo/va_hi published before pending=1.
-        if slot.pending.load(Ordering::Acquire) != 0 {
+        // Atomically claim the slot.  The single-writer rule on
+        // `pending` (one sender publishes 1, one handler invocation
+        // clears to 0) is enforced architecturally by the per-CPU
+        // shootdown protocol: only one IPI per target is in flight at
+        // a time because the sender spins on this slot's ack before
+        // re-using it.  We use a compare-exchange anyway so a spurious
+        // IPI delivery (vector 0xF0 arriving at a CPU whose slot is
+        // already drained, e.g. after a previously-timed-out sender
+        // cleared it) is observably handled exactly once.  AcqRel on
+        // success pairs with the sender's Release-store of `pending=1`
+        // and the matching Release-store of the ack-clear below, so we
+        // see the published cr3/va_lo/va_hi before the invalidation.
+        if slot
+            .pending
+            .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
             let target_cr3 = slot.cr3.load(Ordering::Relaxed);
             let va_lo = slot.va_lo.load(Ordering::Relaxed);
             let va_hi = slot.va_hi.load(Ordering::Relaxed);
@@ -422,11 +484,11 @@ pub extern "C" fn handle_shootdown_ipi() {
                 local_invlpg_range(va_lo, va_hi);
             }
             // Even if the CR3 has since changed, ack — the bit in the
-            // active-CPU mask is gone (the scheduler cleared it before
+            // active-CPU mask is gone (the scheduler cleared it after
             // the new mov cr3) so the sender will not target this CPU
-            // again with the same payload.
+            // again with the same payload.  The ack-clear is implicit
+            // in the compare_exchange above; no second store needed.
 
-            slot.pending.store(0, Ordering::Release);
             STAT_SHOOTDOWNS_HANDLED.fetch_add(1, Ordering::Relaxed);
         }
     }

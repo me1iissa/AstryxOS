@@ -1204,7 +1204,7 @@ pub fn free_process_memory(pid: Pid) {
     // classic use-after-free, observable as a GPF in random user code.
     // The full-range request triggers a CR3-reload on each target
     // (cheaper than per-page invlpg over the entire user half).
-    crate::mm::tlb::shootdown_range(cr3, 0, 0x0000_8000_0000_0000);
+    crate::mm::tlb::shootdown_full_user(cr3);
 
     // Walk all VMAs and free physical frames (anonymous pages only).
     // File-backed pages are managed by the page cache; device pages are MMIO.
@@ -1270,7 +1270,7 @@ pub fn free_vm_space(vm_space: crate::mm::vma::VmSpace) {
     // caller has already switched away from this CR3, sibling threads
     // on other CPUs that have not yet reached the next context-switch
     // could still hold cached translations into this address space.
-    crate::mm::tlb::shootdown_range(cr3, 0, 0x0000_8000_0000_0000);
+    crate::mm::tlb::shootdown_full_user(cr3);
 
     // Walk all anonymous VMAs and decrement/free the backing physical pages.
     // File-backed pages belong to the page cache; device pages are MMIO.
