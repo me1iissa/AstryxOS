@@ -453,6 +453,18 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
                 // Dump IRET frame fields
                 crate::serial_println!("  RFLAGS={:#018x}", frame.rflags);
             }
+            // Walk the RBP-linked frame chain to emit a caller-chain backtrace.
+            // RBP is saved at frame[-12] by the ISR push sequence:
+            //   frame[-2]=rax … frame[-11]=rbx frame[-12]=rbp (see isr_with_error layout).
+            // Per System V AMD64 ABI §3.4.1, with -fno-omit-frame-pointer each
+            // frame satisfies [rbp+0]=saved_rbp, [rbp+8]=return_address.
+            {
+                let base = frame as *const InterruptFrame as *const u64;
+                let rbp_at_fault = unsafe { *base.sub(12) };
+                let pid = crate::proc::current_pid_lockless();
+                let tid = crate::proc::current_tid();
+                crate::proc::stack_walk::stack_walk_user(pid, tid, frame.rip, rbp_at_fault);
+            }
             // POSIX signal(7): the default action for SIGSEGV is "terminate
             // the process (core dump)" — the entire thread group, not just
             // the faulting thread.  Calling exit_thread would leave sibling
@@ -751,6 +763,18 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
             }
         }
 
+        // Walk the RBP-linked frame chain to emit a caller-chain backtrace
+        // before tearing down the process.  RBP is at frame[-12] in the
+        // ISR push sequence (see isr_with_error / isr_no_error layout).
+        // Per System V AMD64 ABI §3.4.1, with -fno-omit-frame-pointer each
+        // frame satisfies [rbp+0]=saved_rbp, [rbp+8]=return_address.
+        {
+            let base = frame as *const InterruptFrame as *const u64;
+            let rbp_at_fault = unsafe { *base.sub(12) };
+            let pid = crate::proc::current_pid_lockless();
+            let tid = crate::proc::current_tid();
+            crate::proc::stack_walk::stack_walk_user(pid, tid, frame.rip, rbp_at_fault);
+        }
         // POSIX signal(7): synchronous fatal CPU exceptions in user mode
         // (#DE → SIGFPE, #UD → SIGILL, #DF / #SS / #GP / #AC / #MC → SIGBUS|SIGSEGV)
         // default to thread-group termination.  Calling exit_thread would
