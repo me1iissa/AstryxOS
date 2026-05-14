@@ -1304,10 +1304,9 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     // Guard ref + the ref we'd have used for the PTE both drop;
                     // cache::evict_if_phys already released the cache ref if it
                     // matched, so we only need to release the guard ref here.
-                    let _ = crate::mm::refcount::page_ref_dec(phys);
-                    // If the guard ref was the last reference (cache evict
-                    // succeeded), page_ref_dec returns 0 → return phys to PMM.
-                    if crate::mm::refcount::page_ref_count(phys) == 0 {
+                    // page_ref_dec returns the new count; if zero, the frame has
+                    // no remaining holders and must be returned to the PMM.
+                    if crate::mm::refcount::page_ref_dec(phys) == 0 {
                         crate::mm::pmm::free_page(phys);
                     }
                     crate::mm::vmm::invlpg(vaddr);
