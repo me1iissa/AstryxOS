@@ -4104,11 +4104,13 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
         // Helper: adjust file offset in backing for a split piece
         let adjust_backing = |b: &crate::mm::vma::VmBacking, piece_base: u64| -> crate::mm::vma::VmBacking {
             match b {
-                crate::mm::vma::VmBacking::File { mount_idx, inode, offset } => {
+                crate::mm::vma::VmBacking::File { mount_idx, inode, offset, elf_load_delta } => {
                     crate::mm::vma::VmBacking::File {
                         mount_idx: *mount_idx,
                         inode: *inode,
                         offset: offset + (piece_base - vma_base),
+                        // delta is segment-level constant; unchanged by mprotect split
+                        elf_load_delta: *elf_load_delta,
                     }
                 }
                 other => other.clone(),

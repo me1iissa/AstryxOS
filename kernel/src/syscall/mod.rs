@@ -1919,10 +1919,29 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
                 }
                 Some(fd_entry) if !fd_entry.is_console => {
                     let page_offset = offset & !0xFFF;
+                    // For MAP_FIXED / MAP_FIXED_NOREPLACE file mappings the
+                    // caller (typically the dynamic linker) places the segment
+                    // at the ELF link-time virtual address, so we can recover
+                    // the segment's p_vaddr from the chosen base.  The delta
+                    // `(p_vaddr & !0xfff) - (p_offset & !0xfff)` is a constant
+                    // across the whole segment and is used by the #UD / #GP
+                    // diagnostic paths to convert `offset_in_file` → the ELF
+                    // virtual address that addr2line expects.
+                    //
+                    // For auto-placed (non-fixed) mappings there is no ELF
+                    // relationship — set delta to 0.
+                    //
+                    // Ref: ELF-64 Object File Format §3 (Program Loading).
+                    let elf_load_delta = if is_fixed {
+                        chosen_base.wrapping_sub(page_offset)
+                    } else {
+                        0
+                    };
                     (VmBacking::File {
                         mount_idx: fd_entry.mount_idx,
                         inode: fd_entry.inode,
                         offset: page_offset,
+                        elf_load_delta,
                     }, "[mmap-file]")
                 }
                 _ => return -9, // EBADF

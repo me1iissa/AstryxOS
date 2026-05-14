@@ -3964,21 +3964,21 @@ fn test_signal_vma_snapshot() -> bool {
             VmArea {
                 base: 0x10_0000, length: 0x10_0000,
                 prot: PROT_READ | PROT_EXEC, flags: MAP_PRIVATE,
-                backing: VmBacking::File { mount_idx: 0, inode: 1, offset: 0 },
+                backing: VmBacking::File { mount_idx: 0, inode: 1, offset: 0, elf_load_delta: 0 },
                 name: "[mmap-file]",
             },
             // libxul .data (rw, file-backed, NOT exec) — should be skipped
             VmArea {
                 base: 0x20_0000, length: 0x1_0000,
                 prot: PROT_READ | PROT_WRITE, flags: MAP_PRIVATE,
-                backing: VmBacking::File { mount_idx: 0, inode: 1, offset: 0x10_0000 },
+                backing: VmBacking::File { mount_idx: 0, inode: 1, offset: 0x10_0000, elf_load_delta: 0 },
                 name: "[mmap-file]",
             },
             // libc .text (executable, file-backed) — should appear
             VmArea {
                 base: 0x30_0000, length: 0x4_0000,
                 prot: PROT_READ | PROT_EXEC, flags: MAP_PRIVATE,
-                backing: VmBacking::File { mount_idx: 0, inode: 2, offset: 0 },
+                backing: VmBacking::File { mount_idx: 0, inode: 2, offset: 0, elf_load_delta: 0 },
                 name: "[mmap-file]",
             },
             // Anonymous heap (rw, not file-backed) — should be skipped
@@ -4065,6 +4065,61 @@ fn test_signal_vma_snapshot() -> bool {
         test_fail!("[SIGNAL/VMA] snapshot policy",
                    "None space should produce empty snapshot, got {}", empty.len());
         return false;
+    }
+
+    // elf_load_delta propagation: a VMA with a non-zero delta must pass it
+    // through to the VmaSnap so the diagnostic path can compute vaddr_in_elf.
+    //
+    // Scenario: libxul text segment mapped at vma_base=0x7eff_f000_0000,
+    // backed by file offset p_offset_page=0x5f5000, p_vaddr_page=0x10bd000.
+    // delta = 0x10bd000 - 0x5f5000 = 0xac8000.
+    // For a fault at vma_base+0x1234:
+    //   offset_in_file = 0x5f5000 + 0x1234 = 0x5f6234
+    //   vaddr_in_elf   = 0x5f6234 + 0xac8000 = 0x10be234  (addr2line input)
+    {
+        use crate::mm::vma::{VmArea, VmBacking, VmSpace, PROT_READ, PROT_EXEC, MAP_PRIVATE};
+        let delta_vma_base: u64 = 0x7eff_f000_0000;
+        let file_off: u64       = 0x5f5000;
+        let elf_delta: u64      = 0xac8000; // (0x10bd000 - 0x5f5000)
+        let delta_space = VmSpace {
+            cr3: 0,
+            areas: alloc::vec![
+                VmArea {
+                    base: delta_vma_base, length: 0x100_0000,
+                    prot: PROT_READ | PROT_EXEC, flags: MAP_PRIVATE,
+                    backing: VmBacking::File {
+                        mount_idx: 0, inode: 99,
+                        offset: file_off,
+                        elf_load_delta: elf_delta,
+                    },
+                    name: "[mmap-file]",
+                },
+            ],
+            mmap_hint: 0, brk: 0, brk_start: 0,
+        };
+        let rip_in_seg = delta_vma_base + 0x1234;
+        let snap2 = crate::signal::signal_vma_snapshot(Some(&delta_space), rip_in_seg, 0);
+        if snap2.is_empty() {
+            test_fail!("[SIGNAL/VMA] elf_load_delta",
+                       "expected one snap entry for rip={:#x}", rip_in_seg);
+            return false;
+        }
+        let entry = &snap2[0];
+        if entry.elf_load_delta != elf_delta {
+            test_fail!("[SIGNAL/VMA] elf_load_delta",
+                       "expected elf_load_delta={:#x}, got {:#x}",
+                       elf_delta, entry.elf_load_delta);
+            return false;
+        }
+        let off_file = (rip_in_seg - delta_vma_base) + file_off;
+        let vaddr_elf = off_file.wrapping_add(elf_delta);
+        let expected_vaddr: u64 = 0x10be234;
+        if vaddr_elf != expected_vaddr {
+            test_fail!("[SIGNAL/VMA] elf_load_delta",
+                       "vaddr_in_elf computation: expected {:#x}, got {:#x}",
+                       expected_vaddr, vaddr_elf);
+            return false;
+        }
     }
     test_pass!("[SIGNAL/VMA] snapshot policy");
     true
@@ -4162,12 +4217,12 @@ fn test_buffer_cache() -> bool {
             length: 0x1000,
             prot: PROT_READ,
             flags: MAP_PRIVATE,
-            backing: VmBacking::File { mount_idx: 0, inode: 42, offset: 0 },
+            backing: VmBacking::File { mount_idx: 0, inode: 42, offset: 0, elf_load_delta: 0 },
             name: "[test]",
         };
         match &vma.backing {
-            VmBacking::File { mount_idx, inode, offset } => {
-                if *mount_idx != 0 || *inode != 42 || *offset != 0 {
+            VmBacking::File { mount_idx, inode, offset, elf_load_delta } => {
+                if *mount_idx != 0 || *inode != 42 || *offset != 0 || *elf_load_delta != 0 {
                     test_fail!("Buffer cache", "VmBacking::File field mismatch");
                     return false;
                 }

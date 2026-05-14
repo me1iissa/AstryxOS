@@ -788,6 +788,11 @@ pub(crate) struct VmaSnap {
     pub(crate) file_backed: bool,
     pub(crate) anonymous: bool,
     pub(crate) file_offset: u64,
+    /// `(p_vaddr & !0xfff) - (p_offset & !0xfff)` for ELF PT_LOAD segments;
+    /// 0 for non-ELF or anonymous mappings.  Lets addr2line-based symbolication
+    /// convert `offset_in_file` to the link-time ELF virtual address without
+    /// offline arithmetic.  See `VmBacking::File::elf_load_delta`.
+    pub(crate) elf_load_delta: u64,
     pub(crate) contains_rip: bool,
     pub(crate) contains_cr2: bool,
 }
@@ -821,9 +826,9 @@ pub(crate) fn signal_vma_snapshot(
         None => return out,
     };
     for a in space.areas.iter() {
-        let (file_backed, file_offset) = match a.backing {
-            VmBacking::File { offset, .. } => (true, offset),
-            _ => (false, 0u64),
+        let (file_backed, file_offset, elf_load_delta) = match a.backing {
+            VmBacking::File { offset, elf_load_delta, .. } => (true, offset, elf_load_delta),
+            _ => (false, 0u64, 0u64),
         };
         let anonymous = matches!(a.backing, VmBacking::Anonymous);
         let contains_rip = a.contains(user_rip);
@@ -851,6 +856,7 @@ pub(crate) fn signal_vma_snapshot(
             file_backed,
             anonymous,
             file_offset,
+            elf_load_delta,
             contains_rip,
             contains_cr2,
         });
@@ -919,10 +925,17 @@ fn emit_signal_vma_banner(pid: u64, user_rip: u64, cr2: u64, snap: &[VmaSnap]) {
             let rip_off_vma = user_rip - v.base;
             let cr2_off_vma = cr2 - v.base;
             if v.file_backed {
+                let rip_off_file = rip_off_vma + v.file_offset;
+                let rip_vaddr_elf = rip_off_file.wrapping_add(v.elf_load_delta);
+                let elf_tag = if v.elf_load_delta != 0 {
+                    alloc::format!(" vaddr_in_elf={:#x}", rip_vaddr_elf)
+                } else {
+                    alloc::string::String::new()
+                };
                 crate::serial_println!(
-                    "[SIGNAL/VMA] pid={} name={} base={:#x} end={:#x} size={:#x} prot={}{}{} file=1 rip=1 cr2=1 rip_offset_in_vma={:#x} rip_offset_in_file={:#x} cr2_offset_in_vma={:#x}{}",
+                    "[SIGNAL/VMA] pid={} name={} base={:#x} end={:#x} size={:#x} prot={}{}{} file=1 rip=1 cr2=1 rip_offset_in_vma={:#x} rip_offset_in_file={:#x} cr2_offset_in_vma={:#x}{}{}",
                     pid, v.name, v.base, v.end, v.end - v.base, r, w, x,
-                    rip_off_vma, rip_off_vma + v.file_offset, cr2_off_vma, anon_tag
+                    rip_off_vma, rip_off_file, cr2_off_vma, elf_tag, anon_tag
                 );
             } else {
                 crate::serial_println!(
@@ -934,10 +947,17 @@ fn emit_signal_vma_banner(pid: u64, user_rip: u64, cr2: u64, snap: &[VmaSnap]) {
         } else if v.contains_rip {
             let off_vma = user_rip - v.base;
             if v.file_backed {
+                let off_file = off_vma + v.file_offset;
+                let vaddr_elf = off_file.wrapping_add(v.elf_load_delta);
+                let elf_tag = if v.elf_load_delta != 0 {
+                    alloc::format!(" vaddr_in_elf={:#x}", vaddr_elf)
+                } else {
+                    alloc::string::String::new()
+                };
                 crate::serial_println!(
-                    "[SIGNAL/VMA] pid={} name={} base={:#x} end={:#x} size={:#x} prot={}{}{} file=1 rip=1 cr2=0 offset_in_vma={:#x} offset_in_file={:#x}{}",
+                    "[SIGNAL/VMA] pid={} name={} base={:#x} end={:#x} size={:#x} prot={}{}{} file=1 rip=1 cr2=0 offset_in_vma={:#x} offset_in_file={:#x}{}{}",
                     pid, v.name, v.base, v.end, v.end - v.base, r, w, x,
-                    off_vma, off_vma + v.file_offset, anon_tag
+                    off_vma, off_file, elf_tag, anon_tag
                 );
             } else {
                 crate::serial_println!(
@@ -949,10 +969,17 @@ fn emit_signal_vma_banner(pid: u64, user_rip: u64, cr2: u64, snap: &[VmaSnap]) {
         } else if v.contains_cr2 {
             let off_vma = cr2 - v.base;
             if v.file_backed {
+                let off_file = off_vma + v.file_offset;
+                let vaddr_elf = off_file.wrapping_add(v.elf_load_delta);
+                let elf_tag = if v.elf_load_delta != 0 {
+                    alloc::format!(" vaddr_in_elf={:#x}", vaddr_elf)
+                } else {
+                    alloc::string::String::new()
+                };
                 crate::serial_println!(
-                    "[SIGNAL/VMA] pid={} name={} base={:#x} end={:#x} size={:#x} prot={}{}{} file=1 rip=0 cr2=1 offset_in_vma={:#x} offset_in_file={:#x}{}",
+                    "[SIGNAL/VMA] pid={} name={} base={:#x} end={:#x} size={:#x} prot={}{}{} file=1 rip=0 cr2=1 offset_in_vma={:#x} offset_in_file={:#x}{}{}",
                     pid, v.name, v.base, v.end, v.end - v.base, r, w, x,
-                    off_vma, off_vma + v.file_offset, anon_tag
+                    off_vma, off_file, elf_tag, anon_tag
                 );
             } else {
                 crate::serial_println!(
