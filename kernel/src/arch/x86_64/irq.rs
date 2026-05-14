@@ -254,6 +254,16 @@ macro_rules! irq_stub {
 // - schedule()'s switch_context saves RSP; when rescheduled, RSP is restored
 //   to point to our saved regs, and schedule() returns to us
 // - FPU state is saved/restored by schedule() via fxsave/fxrstor
+//
+// Stack layout just after the 15 register pushes (and immediately before
+// `call {timer_tick}`):
+//   rsp+  0 .. rsp+112  : 15 saved GPRs (r15 at +0 → rax at +112)
+//   rsp+120             : interrupted RIP (CPU-pushed IRETQ frame start)
+//   rsp+128             : interrupted CS
+//   rsp+136             : interrupted RFLAGS
+//   rsp+144             : interrupted RSP
+//   rsp+152             : interrupted SS
+// The saved RBP is at rsp+32 (r15, r14, r13, r12 = 4 slots above it).
 #[unsafe(naked)]
 pub extern "C" fn irq_timer_handler() {
     core::arch::naked_asm!(
@@ -265,6 +275,14 @@ pub extern "C" fn irq_timer_handler() {
         "push r12", "push r13", "push r14", "push r15",
         // Call timer handler (tick count, scheduler bookkeeping, EOI)
         "call {timer_tick}",
+        // Userspace-RIP sampler (W149 / W152).  Behind `firefox-test`;
+        // the sym below resolves to a no-op stub in non-firefox builds.
+        // Args (System V x86-64):
+        //   rdi = &InterruptFrame (the CPU-pushed IRET frame at rsp+120)
+        //   rsi = saved user RBP  (pushed at rsp+32 in the prologue above)
+        "lea rdi, [rsp + 120]",
+        "mov rsi, [rsp + 32]",
+        "call {sample_tick}",
         // Check if we should preempt: is the interrupted context Ring 3?
         // IRETQ frame CS is at RSP + 15*8 (15 pushed regs) + 8 (RIP) = RSP + 128
         "mov rax, [rsp + 128]",  // interrupted CS
@@ -281,8 +299,39 @@ pub extern "C" fn irq_timer_handler() {
         "pop rdx",  "pop rcx",  "pop rax",
         "iretq",
         timer_tick = sym timer_tick,
+        sample_tick = sym sample_tick_trampoline,
         check_resched = sym crate::sched::check_reschedule,
     );
+}
+
+/// Trampoline from the timer-ISR asm into the userspace-RIP sampler.
+///
+/// Receives `(frame_ptr, saved_rbp)` System-V style (RDI/RSI).  The asm
+/// stub is structurally identical regardless of whether the sampler is
+/// compiled in, so we provide a no-op stub when `firefox-test` is off
+/// and dispatch into [`crate::proc::sample::maybe_sample`] otherwise.
+///
+/// SAFETY: `frame_ptr` is guaranteed valid by the ISR stub — it points
+/// into the interrupted thread's kernel stack at the CPU-pushed IRETQ
+/// frame.  The frame lives until the matching IRETQ at the end of the
+/// stub, so the borrow created here is valid for the lifetime of this
+/// function call.
+#[no_mangle]
+extern "C" fn sample_tick_trampoline(
+    _frame_ptr: *const super::idt::InterruptFrame,
+    _saved_rbp: u64,
+) {
+    #[cfg(feature = "firefox-test")]
+    {
+        // Skip the sampler entirely while a bugcheck is in flight; the
+        // interrupted state may already be garbage and we don't want to
+        // multiply diagnostic output.
+        if crate::ke::bugcheck::is_bugcheck_active() { return; }
+        let tick = TICK_COUNT.load(Ordering::Relaxed);
+        // SAFETY: see the function-level doc comment.
+        let frame = unsafe { &*_frame_ptr };
+        crate::proc::sample::maybe_sample(tick, frame, _saved_rbp);
+    }
 }
 
 irq_stub!(irq_keyboard_handler, keyboard_interrupt);

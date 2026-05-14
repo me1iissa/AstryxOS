@@ -1,0 +1,266 @@
+//! Userspace RIP sampler — periodically dump the user RIP, RSP, RBP and a
+//! frame-pointer chain walk for any thread that has been preempted while
+//! running in Ring 3 without issuing a syscall for several seconds.
+//!
+//! # Why
+//!
+//! Some Mozilla wedges leave the main thread (pid=1, tid=1) spinning in
+//! userspace on a condition variable or POSIX semaphore that the kernel
+//! cannot observe — the lock is owned entirely by the userspace runtime
+//! and never reaches the futex ABI.  The kernel's heartbeat shows a
+//! plateau in `sc=` (syscall count) and there is no clue which userspace
+//! function is parked.  This module emits a periodic `[SAMPLE]` line
+//! with the interrupted user RIP and a short RBP chain so the offending
+//! libxul function can be identified offline with `addr2line` / `objdump`.
+//!
+//! # When it fires
+//!
+//! From the LAPIC timer ISR every [`SAMPLE_INTERVAL_TICKS`] ticks (~5 s at
+//! 100 Hz), provided that:
+//!   1. The interrupted context was Ring 3 (CS & 3 == 3) — kernel-mode
+//!      preemptions are ignored.
+//!   2. The current TID is non-zero — idle threads are skipped.
+//!   3. The current TID has been the same across the last
+//!      [`SILENT_THRESHOLD_TICKS`] without issuing a syscall.
+//!
+//! # Cost
+//!
+//! Behind `firefox-test`.  Hot path is a single atomic load + branch in
+//! the syscall dispatch (`record_syscall`) and the timer ISR
+//! (`maybe_sample`).  The walk itself is rate-limited by the
+//! "consecutive silent ticks" check, so a healthy thread issuing
+//! syscalls regularly never pays the walk cost.
+//!
+//! # Safety
+//!
+//! The sampler runs in interrupt context with IF=0.  It MUST NOT take
+//! any kernel mutex, and MUST NOT fault.  All user-memory reads go
+//! through [`crate::mm::vmm::virt_to_phys_in`] which walks the page
+//! tables in software — an unmapped page returns `None` rather than
+//! faulting on the in-flight read.  See Intel SDM Vol 3A §4.5 for the
+//! 4-level paging walk used by the resolver.
+
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use crate::arch::x86_64::apic::MAX_CPUS;
+use crate::arch::x86_64::idt::InterruptFrame;
+
+/// Tick interval between consecutive sample emissions for a given thread.
+/// 500 ticks at 100 Hz = ~5 s.
+const SAMPLE_INTERVAL_TICKS: u64 = 500;
+
+/// Number of ticks of "no syscall from this thread" required before the
+/// sampler considers the thread to be parked in userspace.
+/// 500 ticks = ~5 s.  Long enough that ordinary CPU-bound work (font cache
+/// build, ICU init) does not trigger; short enough that a real wedge is
+/// caught well before the 10-minute firefox-test watchdog limit.
+const SILENT_THRESHOLD_TICKS: u64 = 500;
+
+/// Per-Tid syscall-activity table.  Direct-mapped by `tid % TID_SLOTS`.
+///
+/// Each slot is a `(tid, last_syscall_tick, last_sample_tick)` triple of
+/// relaxed atomics — the entire structure is lock-free.  The `tid` field
+/// disambiguates which thread last wrote to the slot, since two thread
+/// IDs that hash to the same slot would otherwise race on the tick.  When
+/// the slot's TID does not match the thread we're sampling, we treat the
+/// slot as "no data for this thread" and skip.
+///
+/// 256 slots covers a typical Mozilla worker pool (~150 threads) without
+/// frequent collisions on the dense low-TID range that the most interesting
+/// threads (pid=1 tid=1, the renderer main) occupy.  On collision the
+/// behaviour is benign: the sampler simply waits one more "real" syscall
+/// from the colliding thread before producing useful output.
+const TID_SLOTS: usize = 256;
+
+/// One slot in the syscall-activity table.
+#[repr(C, align(64))] // cache-line aligned to avoid false sharing
+struct TidSlot {
+    tid: AtomicU64,
+    last_syscall_tick: AtomicU64,
+    last_sample_tick: AtomicU64,
+}
+
+static TID_TABLE: [TidSlot; TID_SLOTS] = [
+    const { TidSlot {
+        tid: AtomicU64::new(0),
+        last_syscall_tick: AtomicU64::new(u64::MAX),
+        last_sample_tick: AtomicU64::new(0),
+    } }; TID_SLOTS
+];
+
+#[inline]
+fn slot_for(tid: u64) -> &'static TidSlot {
+    &TID_TABLE[(tid as usize) & (TID_SLOTS - 1)]
+}
+
+/// Record a syscall entry: stamp the calling thread's last-syscall tick.
+///
+/// Called from [`crate::syscall::dispatch`] on every Linux/Aether syscall.
+/// Lock-free: two relaxed atomic stores in the common case (slot already
+/// owned by this TID).  Safe from any context where `current_tid()` and
+/// `cpu_index()` are valid — the syscall entry runs at CPL 0 on the
+/// thread's own kernel stack, so this trivially holds.
+#[inline]
+pub fn record_syscall(tid: u64, tick: u64) {
+    let slot = slot_for(tid);
+    // Claim the slot (no CAS — last writer wins on hash collisions).
+    // The TID write is published before the tick so a concurrent reader
+    // either sees a stale TID (ignore) or the new TID + a fresh tick.
+    slot.tid.store(tid, Ordering::Relaxed);
+    slot.last_syscall_tick.store(tick, Ordering::Relaxed);
+}
+
+/// Maybe emit a userspace RIP sample from the timer ISR.
+///
+/// `frame` is the IRETQ-frame the CPU pushed when interrupting the user
+/// thread; `saved_rbp` is the value of RBP that the timer-ISR naked stub
+/// pushed onto the kernel stack just before calling `timer_tick`.
+///
+/// # Caller contract
+///
+/// Runs in interrupt context with IF=0 on the kernel stack of the
+/// interrupted thread.  The function takes no kernel locks (it uses
+/// `current_pid_lockless` and per-CPU atomics) and performs no
+/// allocation.  User-memory reads use software page-table walks and
+/// return `None` on unmapped pages — they cannot fault.
+pub fn maybe_sample(tick: u64, frame: &InterruptFrame, saved_rbp: u64) {
+    // Only sample on Ring 3 preemptions.  Kernel-mode preemptions surface
+    // their own diagnostics through the bugcheck / watchdog paths.
+    if frame.cs & 3 != 3 {
+        return;
+    }
+
+    let cpu = crate::arch::x86_64::apic::cpu_index();
+    if cpu >= MAX_CPUS { return; }
+
+    let tid = crate::proc::current_tid();
+    if tid == 0 {
+        // Idle thread — never sample.
+        return;
+    }
+
+    // Has this thread been continuously running in Ring 3 for
+    // SILENT_THRESHOLD_TICKS without issuing a syscall?  The per-Tid slot
+    // is direct-mapped by tid hash; if the slot holds a different TID
+    // (collision or never-recorded), skip — we'll sample once the thread
+    // issues at least one syscall.
+    let slot = slot_for(tid);
+    let slot_tid = slot.tid.load(Ordering::Relaxed);
+    if slot_tid != tid {
+        return;
+    }
+    let last_sc   = slot.last_syscall_tick.load(Ordering::Relaxed);
+    let last_smpl = slot.last_sample_tick.load(Ordering::Relaxed);
+    if last_sc == u64::MAX {
+        return;
+    }
+    let silent_for = tick.saturating_sub(last_sc);
+    if silent_for < SILENT_THRESHOLD_TICKS {
+        return;
+    }
+    // Throttle: at most one block per SAMPLE_INTERVAL_TICKS.
+    if tick.saturating_sub(last_smpl) < SAMPLE_INTERVAL_TICKS {
+        return;
+    }
+    slot.last_sample_tick.store(tick, Ordering::Relaxed);
+
+    // Read FS_BASE for TLS context.  RDMSR is safe at CPL 0; this is the
+    // active thread's FS.base because the scheduler restored it on its
+    // last switch-in.  Intel SDM Vol 3A §4.10: IA32_FS_BASE MSR 0xC000_0100.
+    // SAFETY: RDMSR with the architectural FS.base MSR is always safe at
+    // CPL 0; the timer ISR runs at CPL 0.
+    let fs_base = unsafe { crate::hal::rdmsr(0xC000_0100) };
+    let pid = crate::proc::current_pid_lockless();
+
+    crate::serial_println!(
+        "[SAMPLE] tid={} pid={} cpu={} tick={} silent_for={} \
+         user_rip={:#018x} user_rsp={:#018x} rbp={:#018x} fs_base={:#018x}",
+        tid, pid, cpu, tick, silent_for,
+        frame.rip, frame.rsp, saved_rbp, fs_base,
+    );
+
+    // Walk the RBP chain in user memory.  Each frame in a -fno-omit-frame-
+    // pointer build follows the System V x86-64 convention:
+    //   [rbp + 0] = saved caller RBP
+    //   [rbp + 8] = return RIP into caller
+    // We bail on the first unmapped slot, on misaligned / kernel-half
+    // pointers, and on any descent (cycle guard).
+    //
+    // Use the active CR3 to translate user VAs — we are on the same page
+    // tables as the interrupted thread because the timer ISR did not
+    // switch CR3.
+    let cr3 = read_cr3();
+    walk_user_rbp_chain(cr3, saved_rbp);
+}
+
+/// Walk and print up to 5 frames of the user RBP chain.
+fn walk_user_rbp_chain(cr3: u64, start_rbp: u64) {
+    const MAX_FRAMES: u32 = 5;
+    let mut cur = start_rbp;
+    for i in 0..MAX_FRAMES {
+        if cur == 0 || cur < 0x1000 { break; }
+        if cur >= astryx_shared::KERNEL_VIRT_BASE { break; }
+        if cur & 0x7 != 0 { break; }
+        let saved_rbp = match read_user_u64(cr3, cur) {
+            Some(v) => v,
+            None => break,
+        };
+        let saved_rip = match read_user_u64(cr3, cur.wrapping_add(8)) {
+            Some(v) => v,
+            None => break,
+        };
+        crate::serial_println!(
+            "[SAMPLE] frame[{}] rbp={:#018x} rip={:#018x}",
+            i, saved_rbp, saved_rip
+        );
+        // Cycle / descent guard: frame pointers walk UP the stack.
+        if saved_rbp <= cur { break; }
+        cur = saved_rbp;
+    }
+}
+
+/// Page-fault-safe read of a u64 from user VA `va` under page table `cr3`.
+/// Mirrors `crate::syscall::ring::read_user_u64_safe` but is duplicated
+/// here to keep that helper private to its module.  Software walks the
+/// 4-level page tables — see Intel SDM Vol 3A §4.5.
+fn read_user_u64(cr3: u64, va: u64) -> Option<u64> {
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+
+    if va >= astryx_shared::KERNEL_VIRT_BASE { return None; }
+    let end = va.checked_add(8)?;
+    if end > astryx_shared::KERNEL_VIRT_BASE { return None; }
+
+    let phys0 = crate::mm::vmm::virt_to_phys_in(cr3, va)?;
+    let page_off = va & 0xFFF;
+    if page_off + 8 > 0x1000 {
+        // Cross-page: resolve second page once, splice the two halves.
+        let va_next = (va & !0xFFF).wrapping_add(0x1000);
+        let phys_next = crate::mm::vmm::virt_to_phys_in(cr3, va_next)?;
+        let first_len = (0x1000 - page_off) as usize;
+        let mut bytes = [0u8; 8];
+        unsafe {
+            for i in 0..first_len {
+                bytes[i] = core::ptr::read_volatile(
+                    (PHYS_OFF + phys0 + i as u64) as *const u8);
+            }
+            for i in first_len..8 {
+                bytes[i] = core::ptr::read_volatile(
+                    (PHYS_OFF + phys_next + (i - first_len) as u64) as *const u8);
+            }
+        }
+        return Some(u64::from_le_bytes(bytes));
+    }
+    unsafe {
+        Some(core::ptr::read_unaligned((PHYS_OFF + phys0) as *const u64))
+    }
+}
+
+#[inline]
+fn read_cr3() -> u64 {
+    let cr3: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) cr3,
+                         options(nomem, nostack, preserves_flags));
+    }
+    cr3
+}
