@@ -1096,10 +1096,22 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         crate::mm::vmm::map_page_in(cr3, page_addr, private_phys, page_flags);
                         crate::mm::vmm::invlpg(page_addr);
                     } else {
-                        // OOM fallback: share the cached page (may cause issues)
-                        crate::mm::refcount::page_ref_inc(cached_phys);
-                        crate::mm::vmm::map_page_in(cr3, page_addr, cached_phys, page_flags);
-                        crate::mm::vmm::invlpg(page_addr);
+                        // PMM exhausted: cannot allocate a private copy.
+                        //
+                        // Aliasing the shared cache page with PAGE_WRITABLE set
+                        // is unsafe — a subsequent write (e.g., ld-linux GOT
+                        // relocation) would corrupt the cache frame, which may
+                        // be concurrently mapped read-only into other processes.
+                        // Those processes would inherit PIE-biased pointers from
+                        // an unrelated address space, producing SIGSEGV / #GP at
+                        // random virtual addresses (W184/W185 root cause).
+                        //
+                        // Fail the fault instead.  Per POSIX mmap(2) and
+                        // Intel SDM Vol. 3A §4.10.5, demand-paging is permitted
+                        // to signal the faulting thread (SIGSEGV) when physical
+                        // backing cannot be allocated, giving the same visible
+                        // behaviour as an ENOMEM mmap failure.
+                        return false;
                     }
                 } else {
                     // MAP_SHARED writable, or any read-only mapping: alias
@@ -1337,12 +1349,25 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         // Drop guard ref — steady state: cache ref(phys) = 1.
                         let _ = crate::mm::refcount::page_ref_dec(phys);
                     } else {
-                        // OOM fallback: share the cache page (may cause reloc
-                        // corruption on MAP_PRIVATE writes — documented limit).
-                        crate::mm::refcount::page_ref_inc(phys);
-                        crate::mm::vmm::map_page_in(cr3, vaddr, phys, page_flags);
-                        // Drop guard ref — steady state: cache(1) + PTE(1) = 2.
+                        // PMM exhausted: cannot allocate a private copy.
+                        //
+                        // Aliasing the shared cache page with PAGE_WRITABLE set
+                        // is unsafe: a subsequent ld-linux GOT relocation would
+                        // corrupt the cache frame, which may be concurrently
+                        // mapped read-only into other processes.  Those processes
+                        // would inherit PIE-biased pointers, producing SIGSEGV /
+                        // #GP at random VAs (W184/W185 root cause).
+                        //
+                        // Fail the fault instead.  Per POSIX mmap(2) and
+                        // Intel SDM Vol. 3A §4.10.5, demand-paging is permitted
+                        // to signal the faulting thread (SIGSEGV) when physical
+                        // backing cannot be allocated.
+                        //
+                        // Refcount accounting: guard ref acquired at the top of
+                        // this iteration must be released; cache::insert already
+                        // holds the cache ref (rc → 1 steady state after drop).
                         let _ = crate::mm::refcount::page_ref_dec(phys);
+                        return false;
                     }
                 } else {
                     // MAP_SHARED writable, or any read-only mapping: alias
