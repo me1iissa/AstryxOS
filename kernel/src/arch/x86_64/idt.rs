@@ -555,6 +555,56 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
             "  [exc/regs] r13={:#018x} r14={:#018x} r15={:#018x}",
             r13, r14, r15);
         crate::serial_println!("  Killing user process (exception in Ring 3)");
+
+        // For Ring-3 #UD (vector 6) emit a VMA-range line so the faulting
+        // instruction can be symbolicated against the shared-library load
+        // base (which varies with ASLR).  This mirrors the [SIGNAL/VMA]
+        // banner emitted on SIGSEGV but is scoped to just the VMA that
+        // covers RIP — #UD carries no secondary fault address.
+        //
+        // Lock ordering: PROCESS_TABLE is not held by any path that delivers
+        // a #UD from Ring 3; the snapshot is taken and released before
+        // invalidate_syscall_frame / exit_group.
+        if vector == 6 {
+            let rip = frame.rip;
+            let pid = crate::proc::current_pid_lockless();
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            if let Some(proc_entry) = procs.iter().find(|p| p.pid == pid) {
+                if let Some(vm_space) = proc_entry.vm_space.as_ref() {
+                    if let Some(vma) = vm_space.find_vma(rip) {
+                        use crate::mm::vma::VmBacking;
+                        let (file_name, file_offset) = match &vma.backing {
+                            VmBacking::File { offset, .. } => (vma.name, *offset),
+                            _ => ("<anon>", 0u64),
+                        };
+                        let offset_in_vma  = rip - vma.base;
+                        let offset_in_file = file_offset + offset_in_vma;
+                        crate::serial_println!(
+                            "[UD/VMA] pid={} tid={} rip={:#x} vma_base={:#x} vma_end={:#x} \
+                             file={} offset_in_file={:#x} offset_in_vma={:#x}",
+                            pid,
+                            crate::proc::current_tid(),
+                            rip,
+                            vma.base,
+                            vma.end(),
+                            file_name,
+                            offset_in_file,
+                            offset_in_vma,
+                        );
+                    } else {
+                        crate::serial_println!(
+                            "[UD/VMA] pid={} tid={} rip={:#x} no_vma_match=1",
+                            pid,
+                            crate::proc::current_tid(),
+                            rip,
+                        );
+                    }
+                }
+            }
+            // Drop PROCESS_TABLE before exit_group — exit_group acquires it.
+            drop(procs);
+        }
+
         // POSIX signal(7): synchronous fatal CPU exceptions in user mode
         // (#DE → SIGFPE, #UD → SIGILL, #DF / #SS / #GP / #AC / #MC → SIGBUS|SIGSEGV)
         // default to thread-group termination.  Calling exit_thread would
