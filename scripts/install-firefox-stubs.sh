@@ -1025,8 +1025,9 @@ def emit_stub(name, cat):
             f'    (void)text; (void)length; (void)level; (void)language;\n'
             f'    if (log_attrs && attrs_len > 0)\n'
             f'        __builtin_memset(log_attrs, 0,\n'
-            f'                         (unsigned long)attrs_len * 16u);\n'
-            f'    /* sizeof(PangoLogAttr) == 16 per public Pango ABI. */\n'
+            f'                         (unsigned long)attrs_len * 4u);\n'
+            f'    /* sizeof(PangoLogAttr) == 4 (one uint32 of bitfields) per\n'
+            f'     * docs.gtk.org/Pango/struct.LogAttr.html */\n'
             f'}}\n'
         )
     elif cat == 'spawn_with_pipes':
