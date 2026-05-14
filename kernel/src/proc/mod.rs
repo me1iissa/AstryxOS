@@ -20,6 +20,8 @@ pub mod orbit_elf;
 pub mod pe;
 #[cfg(feature = "qga")]
 pub mod qga_elf;
+#[cfg(feature = "firefox-test")]
+pub mod sample;
 pub mod thread;
 pub mod usermode;
 pub mod vdso;
