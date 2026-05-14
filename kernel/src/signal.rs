@@ -422,32 +422,95 @@ pub fn check_signals() -> bool {
     }
 }
 
+// ── SA_SIGINFO flag constant (per POSIX.1-2017 sigaction(2)) ────────────────
+
+/// Handler is SA_SIGINFO style: void handler(int, siginfo_t *, ucontext_t *).
+/// Stored in SignalState::action_flags[]; value matches Linux x86_64 ABI.
+pub const SA_SIGINFO: u64 = 0x0000_0004;
+
+// ── ucontext_t layout (x86_64 System V ABI / POSIX.1-2017) ─────────────────
+//
+// Per the x86_64 System V psABI §3.4 and POSIX.1-2017 <ucontext.h>:
+//
+//   offset   0: uc_flags  (u64)
+//   offset   8: uc_link   (u64, pointer to chained ucontext_t)
+//   offset  16: uc_stack  (stack_t, 24 bytes: ss_sp u64, ss_flags i32+pad, ss_size u64)
+//   offset  40: uc_mcontext (mcontext_t, 256 bytes):
+//                 offset  40: gregs[23] (long long [23], 184 bytes) — REG_R8..REG_CR2
+//                 offset 224: fpregs    (u64, pointer to fpregset_t; NULL = no FPU state)
+//                 offset 232: __reserved1 ([u64; 8], 64 bytes)
+//   offset 296: uc_sigmask (sigset_t, 128 bytes — glibc uses 128 B; kernel uses 8 B)
+//
+// Total: 424 bytes.  We allocate this much on the user stack for correctness;
+// only the fields listed below need valid data for the handlers we care about.
+//
+// gregs[] index constants (from <sys/ucontext.h>, x86_64):
+//   REG_R8=0  REG_R9=1  REG_R10=2  REG_R11=3  REG_R12=4  REG_R13=5  REG_R14=6  REG_R15=7
+//   REG_RDI=8  REG_RSI=9  REG_RBP=10  REG_RBX=11  REG_RDX=12  REG_RAX=13  REG_RCX=14
+//   REG_RSP=15  REG_RIP=16  REG_EFL=17  REG_CSGSFS=18  REG_ERR=19  REG_TRAPNO=20
+//   REG_OLDMASK=21  REG_CR2=22
+//
+// This struct is written directly to user memory via raw pointer; #[repr(C)]
+// guarantees the layout matches the ABI.
+
+#[repr(C)]
+pub(crate) struct UContext {
+    uc_flags:         u64,       //   0
+    uc_link:          u64,       //   8
+    uc_stack_ss_sp:   u64,       //  16
+    uc_stack_ss_flags: u32,      //  24
+    _pad_stack:       u32,       //  28
+    uc_stack_ss_size: u64,       //  32
+    // uc_mcontext.gregs[23] starts at offset 40
+    gregs:            [u64; 23], //  40..224   (184 bytes)
+    fpregs:           u64,       // 224        (pointer to fpregset, NULL = none)
+    _reserved:        [u64; 8],  // 232..296   (64 bytes)
+    // uc_sigmask: glibc sigset_t is 128 bytes (16 × u64); only [0] is meaningful
+    uc_sigmask:       [u64; 16], // 296..424   (128 bytes)
+}
+
+const _UCONTEXT_SIZE_CHECK: () = {
+    assert!(core::mem::size_of::<UContext>() == 424);
+};
+
+/// Stack allocation needed for one ucontext_t.
+pub(crate) const UCONTEXT_SIZE: u64 = 424;
+
+/// Re-exported for test_runner (test 18c).
+pub type UContextExport = UContext;
+/// Re-exported for test_runner (test 18c).
+pub const UCONTEXT_SIZE_EXPORT: u64 = UCONTEXT_SIZE;
+
 // ── Signal Delivery on Syscall Return ───────────────────────────────────────
 
 /// Called from the `syscall_entry` assembly stub after `dispatch()` returns.
 ///
-/// `frame` points to the saved register state on the kernel stack:
+/// `frame` points to the saved register state on the kernel stack.  After the
+/// rdi/rsi saves were added (PR #186) the layout is:
 ///
 /// ```text
-/// frame[0]  = saved RAX (syscall result, pushed by asm)
-/// frame[1]  = saved RDX (user rdx — kept on stack past signal_check)
-/// frame[2]  = saved R8  (user r8)
-/// frame[3]  = saved R9  (user r9)
-/// frame[4]  = saved R10 (user r10)
-/// frame[5]  = saved R15
-/// frame[6]  = saved R14
-/// frame[7]  = saved R13
-/// frame[8]  = saved R12
-/// frame[9]  = saved RBX
-/// frame[10] = saved RBP
-/// frame[11] = saved R11 (RFLAGS)
-/// frame[12] = saved RCX (user RIP)
-/// frame[13] = saved user RSP
+/// frame[0]  = saved RAX (syscall result)
+/// frame[1]  = saved RDI (user rdi — syscall arg1)
+/// frame[2]  = saved RSI (user rsi — syscall arg2)
+/// frame[3]  = saved RDX (user rdx — syscall arg3)
+/// frame[4]  = saved R8  (user r8  — syscall arg5)
+/// frame[5]  = saved R9  (user r9  — syscall arg6)
+/// frame[6]  = saved R10 (user r10 — syscall arg4)
+/// frame[7]  = saved R15
+/// frame[8]  = saved R14
+/// frame[9]  = saved R13
+/// frame[10] = saved R12
+/// frame[11] = saved RBX
+/// frame[12] = saved RBP
+/// frame[13] = saved R11 (user RFLAGS — SYSCALL instruction stores these)
+/// frame[14] = saved RCX (user RIP — SYSCALL instruction stores return address here)
+/// frame[15] = saved user RSP
 /// ```
 ///
 /// If a pending signal has a user handler, this function builds a `SignalFrame`
-/// on the user stack and rewrites `frame[12]` (RIP → handler) and `frame[13]`
-/// (RSP → signal frame).
+/// on the user stack and rewrites `frame[14]` (RIP → handler) and `frame[15]`
+/// (RSP → signal frame).  For SA_SIGINFO handlers it also builds a `ucontext_t`
+/// and patches `frame[2]` (RSI → &siginfo_t) and `frame[3]` (RDX → &ucontext_t).
 ///
 /// Returns the signal number (> 0) when a handler was delivered so the asm
 /// stub can place it in RDI.  Returns 0 when no signal was delivered.
@@ -527,19 +590,34 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
         }
         SigAction::Handler { addr: handler_addr, restorer } => {
             // ── Build signal frame on user stack ────────────────────────
+            //
+            // Frame layout (see syscall_entry in arch/x86_64/idt.rs):
+            //   frame[0]=rax  frame[1]=rdi  frame[2]=rsi  frame[3]=rdx
+            //   frame[4]=r8   frame[5]=r9   frame[6]=r10
+            //   frame[7]=r15  frame[8]=r14  frame[9]=r13  frame[10]=r12
+            //   frame[11]=rbx frame[12]=rbp
+            //   frame[13]=r11(RFLAGS)  frame[14]=rcx(user_RIP)  frame[15]=user_RSP
 
-            // Read saved context from the kernel stack frame.
             let saved_rax = unsafe { *frame.add(0) };
-            let saved_r15 = unsafe { *frame.add(5) };
-            let saved_r14 = unsafe { *frame.add(6) };
-            let saved_r13 = unsafe { *frame.add(7) };
-            let saved_r12 = unsafe { *frame.add(8) };
-            let saved_rbx = unsafe { *frame.add(9) };
-            let saved_rbp = unsafe { *frame.add(10) };
-            let saved_r11 = unsafe { *frame.add(11) };
-            let saved_rcx = unsafe { *frame.add(12) };
-            let saved_rsp = unsafe { *frame.add(13) };
+            let saved_rdi = unsafe { *frame.add(1) };
+            let saved_rsi = unsafe { *frame.add(2) };
+            let saved_rdx = unsafe { *frame.add(3) };
+            let saved_r8  = unsafe { *frame.add(4) };
+            let saved_r9  = unsafe { *frame.add(5) };
+            let saved_r10 = unsafe { *frame.add(6) };
+            let saved_r15 = unsafe { *frame.add(7) };
+            let saved_r14 = unsafe { *frame.add(8) };
+            let saved_r13 = unsafe { *frame.add(9) };
+            let saved_r12 = unsafe { *frame.add(10) };
+            let saved_rbx = unsafe { *frame.add(11) };
+            let saved_rbp = unsafe { *frame.add(12) };
+            let saved_r11 = unsafe { *frame.add(13) }; // RFLAGS
+            let saved_rcx = unsafe { *frame.add(14) }; // user RIP
+            let saved_rsp = unsafe { *frame.add(15) }; // user RSP
             let saved_mask = sig_state.blocked;
+
+            let action_flags = sig_state.action_flags[sig as usize];
+            let want_siginfo = (action_flags & SA_SIGINFO) != 0;
 
             // Determine the restorer (trampoline) address.
             let restorer_addr = if restorer != 0 {
@@ -550,38 +628,112 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
                 TRAMPOLINE_VADDR
             };
 
-            // Compute new user RSP for the signal frame.
-            // SignalFrame is 112 bytes (14 × 8).  We want the handler to
-            // enter with RSP ≡ 8 (mod 16) — standard "just called" ABI.
-            let frame_size = core::mem::size_of::<SignalFrame>() as u64; // 112
-            let new_rsp = (saved_rsp - frame_size) & !0xFu64;
-            // new_rsp is 16-aligned.  Subtract 8 so RSP % 16 == 8.
-            let new_rsp = new_rsp.wrapping_sub(8);
-            // Ensure the frame fits (new_rsp + frame_size <= saved_rsp).
+            // ── User stack layout (growing downward) ─────────────────────
+            // For SA_SIGINFO handlers:
+            //   new_rsp + 0   .. +112  : SignalFrame  (restorer at [new_rsp])
+            //   new_rsp + 112 .. +536  : ucontext_t (424 bytes)
+            //   new_rsp + 536 .. +664  : siginfo_t (128 bytes)
+            //
+            // For classic handlers (no SA_SIGINFO):
+            //   new_rsp + 0 .. +112 : SignalFrame only (as before)
+            let sigframe_size = core::mem::size_of::<SignalFrame>() as u64; // 112
+            let total = if want_siginfo {
+                sigframe_size + UCONTEXT_SIZE + 128u64  // 112 + 424 + 128 = 664
+            } else {
+                sigframe_size
+            };
+
+            // 16-align the allocation base, then subtract 8 for "just-called" ABI.
+            let base    = (saved_rsp.wrapping_sub(total)) & !0xFu64;
+            let new_rsp = base.wrapping_sub(8);
+
+            let sig_frame_ptr  = new_rsp as *mut SignalFrame;
+            let ucontext_ptr   = (new_rsp + sigframe_size) as *mut UContext;
+            let siginfo_ptr    = (new_rsp + sigframe_size + UCONTEXT_SIZE) as *mut u8;
 
             // Write the signal frame to user memory.
-            let sig_frame_ptr = new_rsp as *mut SignalFrame;
             unsafe {
-                (*sig_frame_ptr).restorer  = restorer_addr;
-                (*sig_frame_ptr).sig_num   = sig as u64;
+                (*sig_frame_ptr).restorer   = restorer_addr;
+                (*sig_frame_ptr).sig_num    = sig as u64;
                 (*sig_frame_ptr).saved_mask = saved_mask;
-                (*sig_frame_ptr).saved_rsp = saved_rsp;
-                (*sig_frame_ptr).saved_r15 = saved_r15;
-                (*sig_frame_ptr).saved_r14 = saved_r14;
-                (*sig_frame_ptr).saved_r13 = saved_r13;
-                (*sig_frame_ptr).saved_r12 = saved_r12;
-                (*sig_frame_ptr).saved_rbx = saved_rbx;
-                (*sig_frame_ptr).saved_rbp = saved_rbp;
-                (*sig_frame_ptr).saved_r11 = saved_r11;
-                (*sig_frame_ptr).saved_rcx = saved_rcx;
-                (*sig_frame_ptr).saved_rax = saved_rax;
-                (*sig_frame_ptr)._pad      = 0;
+                (*sig_frame_ptr).saved_rsp  = saved_rsp;
+                (*sig_frame_ptr).saved_r15  = saved_r15;
+                (*sig_frame_ptr).saved_r14  = saved_r14;
+                (*sig_frame_ptr).saved_r13  = saved_r13;
+                (*sig_frame_ptr).saved_r12  = saved_r12;
+                (*sig_frame_ptr).saved_rbx  = saved_rbx;
+                (*sig_frame_ptr).saved_rbp  = saved_rbp;
+                (*sig_frame_ptr).saved_r11  = saved_r11;
+                (*sig_frame_ptr).saved_rcx  = saved_rcx;
+                (*sig_frame_ptr).saved_rax  = saved_rax;
+                (*sig_frame_ptr)._pad       = 0;
+            }
+
+            if want_siginfo {
+                // ── Write ucontext_t ──────────────────────────────────────
+                // Per x86_64 System V psABI §3.4 and POSIX.1-2017 sigaction(2):
+                // the third argument to an SA_SIGINFO handler is a pointer to a
+                // ucontext_t populated with the interrupted register state.
+                unsafe {
+                    core::ptr::write_bytes(ucontext_ptr, 0, 1);
+                    let uc = &mut *ucontext_ptr;
+                    // uc_flags, uc_link, uc_stack — all zero (no alt-stack)
+                    // Populate gregs[]; indices per <sys/ucontext.h> x86_64:
+                    //   0=R8 1=R9 2=R10 3=R11 4=R12 5=R13 6=R14 7=R15
+                    //   8=RDI 9=RSI 10=RBP 11=RBX 12=RDX 13=RAX 14=RCX
+                    //   15=RSP 16=RIP 17=EFL 18=CSGSFS 19=ERR 20=TRAPNO
+                    //   21=OLDMASK 22=CR2
+                    uc.gregs[0]  = saved_r8;
+                    uc.gregs[1]  = saved_r9;
+                    uc.gregs[2]  = saved_r10;
+                    uc.gregs[3]  = saved_r11; // RFLAGS at syscall entry (saved in r11 by SYSCALL)
+                    uc.gregs[4]  = saved_r12;
+                    uc.gregs[5]  = saved_r13;
+                    uc.gregs[6]  = saved_r14;
+                    uc.gregs[7]  = saved_r15;
+                    uc.gregs[8]  = saved_rdi;
+                    uc.gregs[9]  = saved_rsi;
+                    uc.gregs[10] = saved_rbp;
+                    uc.gregs[11] = saved_rbx;
+                    uc.gregs[12] = saved_rdx;
+                    uc.gregs[13] = saved_rax;
+                    uc.gregs[14] = saved_rcx; // user RIP (saved in rcx by SYSCALL)
+                    uc.gregs[15] = saved_rsp;
+                    uc.gregs[16] = saved_rcx; // REG_RIP = user RIP
+                    uc.gregs[17] = saved_r11; // REG_EFL = user RFLAGS
+                    // REG_CSGSFS (18): CS=0x33 for user; GS/FS managed by kernel
+                    uc.gregs[18] = 0x33;
+                    // REG_ERR (19) = 0 (no hardware error code for syscall path)
+                    // REG_TRAPNO (20) = 0 (not a hardware trap)
+                    uc.gregs[21] = saved_mask; // REG_OLDMASK
+                    // REG_CR2 (22) = 0 (not a page fault)
+                    // fpregs = NULL (no FPU state saved on syscall path)
+                    uc.uc_sigmask[0] = saved_mask;
+                }
+
+                // ── Write minimal siginfo_t ───────────────────────────────
+                // POSIX.1-2017 §2.4.3: si_signo, si_errno, si_code.
+                // For software-posted signals (kill/tgkill/sigqueue), si_code = SI_USER (0).
+                unsafe {
+                    core::ptr::write_bytes(siginfo_ptr, 0, 128);
+                    core::ptr::write(siginfo_ptr.add(0)  as *mut i32, sig as i32);
+                    // si_errno = 0, si_code = 0 (SI_USER)
+                }
+
+                // Patch RSI and RDX in the kernel frame for the 3-arg ABI.
+                unsafe {
+                    *frame.add(2) = siginfo_ptr as u64;   // RSI → &siginfo_t
+                    *frame.add(3) = ucontext_ptr as u64;  // RDX → &ucontext_t
+                }
             }
 
             // Rewrite the kernel stack frame so sysretq enters the handler.
+            // frame[14] = RCX = user RIP (restored by SYSRETQ as RIP)
+            // frame[15] = user RSP (restored from kernel stack slot by syscall_entry epilogue)
             unsafe {
-                *frame.add(12) = handler_addr; // RCX → handler RIP
-                *frame.add(13) = new_rsp;      // user RSP → signal frame
+                *frame.add(1)  = sig as u64;   // RDI = signo (first arg)
+                *frame.add(14) = handler_addr; // RCX → handler RIP
+                *frame.add(15) = new_rsp;      // user RSP → signal frame
             }
 
             // Block the current signal during handler execution.
@@ -590,8 +742,9 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
             sig_state.blocked &= !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
 
             crate::serial_println!(
-                "[SIGNAL] Delivering signal {} to PID {} handler={:#x} frame={:#x}",
-                sig, pid, handler_addr, new_rsp
+                "[SIGNAL] Delivering signal {} to PID {} handler={:#x} frame={:#x} siginfo={}",
+                sig, pid, handler_addr, new_rsp,
+                if want_siginfo { "SA_SIGINFO" } else { "classic" }
             );
 
             sig as u64
@@ -620,9 +773,13 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
 ///
 /// # Safety
 /// * `frame` must be the `InterruptFrame` produced by the `isr_with_error`
-///   naked stub for vector 14 (page fault).  The 80 bytes *below* `frame` in
-///   memory (lower virtual addresses) are the 9 pushed caller-saved registers
-///   followed by the CPU-pushed error code, as laid out by that stub.
+///   or `isr_no_error` naked stub.  The 128 bytes *below* `frame` in memory
+///   (lower virtual addresses) are the 15 pushed GPRs followed by the error
+///   code (or fake zero), as documented in `arch/x86_64/idt.rs`:
+///     frame[-1]=error_code, frame[-2]=rax, frame[-3]=rcx, frame[-4]=rdx,
+///     frame[-5]=rsi,  frame[-6]=rdi,  frame[-7]=r8,   frame[-8]=r9,
+///     frame[-9]=r10,  frame[-10]=r11, frame[-11]=rbx, frame[-12]=rbp,
+///     frame[-13]=r12, frame[-14]=r13, frame[-15]=r14, frame[-16]=r15.
 /// * `frame.rsp` must be a mapped, writable user stack page.  A write fault
 ///   here would cause a nested kernel-mode page fault (CPU halts anyway).
 pub unsafe fn deliver_sigsegv_from_isr(
@@ -673,19 +830,40 @@ pub unsafe fn deliver_sigsegv_from_isr(
         TRAMPOLINE_VADDR
     };
 
+    let action_flags = sig_state.action_flags[SIGSEGV as usize];
+    let want_siginfo = (action_flags & SA_SIGINFO) != 0;
+
     // ── User stack layout (growing downward) ─────────────────────────────────
+    // For SA_SIGINFO handlers (standard Linux x86_64 signal ABI):
     //   new_rsp + 0   .. +112  : SignalFrame  (restorer at [new_rsp] = return addr)
-    //   new_rsp + 112 .. +240  : siginfo_t (128 bytes)   ← RSI points here
+    //   new_rsp + 112 .. +536  : ucontext_t (424 bytes)  ← RDX points here
+    //   new_rsp + 536 .. +664  : siginfo_t  (128 bytes)  ← RSI points here
+    //
+    // For classic (non-SA_SIGINFO) handlers:
+    //   new_rsp + 0   .. +112  : SignalFrame only
+    //   new_rsp + 112 .. +240  : siginfo_t (128 bytes)  ← RSI points here
+    //
+    // Per POSIX.1-2017 sigaction(2): SA_SIGINFO handlers receive
+    // (int signo, siginfo_t *info, ucontext_t *uctx) in (RDI, RSI, RDX).
     let sigframe_size = core::mem::size_of::<SignalFrame>() as u64; // 112
-    let siginfo_size  = 128u64;
-    let total = sigframe_size + siginfo_size; // 240
+    let total = if want_siginfo {
+        sigframe_size + UCONTEXT_SIZE + 128u64  // 112 + 424 + 128 = 664
+    } else {
+        sigframe_size + 128u64                  // 112 + 128 = 240 (legacy)
+    };
 
     // 16-align the allocation base, then subtract 8 for "just-called" ABI.
     let base    = (user_rsp.wrapping_sub(total)) & !0xFu64;
     let new_rsp = base.wrapping_sub(8);
 
     let sig_frame_ptr = new_rsp as *mut SignalFrame;
-    let siginfo_ptr   = (new_rsp + sigframe_size) as *mut u8;
+    let ucontext_ptr  = (new_rsp + sigframe_size) as *mut UContext;
+    // For SA_SIGINFO: siginfo follows ucontext. For classic: siginfo follows sigframe.
+    let siginfo_ptr   = if want_siginfo {
+        (new_rsp + sigframe_size + UCONTEXT_SIZE) as *mut u8
+    } else {
+        (new_rsp + sigframe_size) as *mut u8
+    };
 
     // ── Guard: verify user stack is mapped before writing ────────────────────
     // If the user stack is unmapped, writing the signal frame would fault in
@@ -701,31 +879,95 @@ pub unsafe fn deliver_sigsegv_from_isr(
         }
     }
 
+    // ── Read all saved GPRs from the ISR kernel stack ────────────────────────
+    // Layout documented in arch/x86_64/idt.rs (from InterruptFrame* base):
+    //   base[-1]=error_code  base[-2]=rax   base[-3]=rcx   base[-4]=rdx
+    //   base[-5]=rsi         base[-6]=rdi   base[-7]=r8    base[-8]=r9
+    //   base[-9]=r10         base[-10]=r11  base[-11]=rbx  base[-12]=rbp
+    //   base[-13]=r12        base[-14]=r13  base[-15]=r14  base[-16]=r15
+    let frame_u64 = frame as u64;
+    // Caller-saved (pushed by isr stubs):
+    let isr_rax = *((frame_u64 - 16)  as *const u64);
+    let isr_rcx = *((frame_u64 - 24)  as *const u64);
+    let isr_rdx = *((frame_u64 - 32)  as *const u64);
+    let isr_rsi = *((frame_u64 - 40)  as *const u64);
+    let isr_rdi = *((frame_u64 - 48)  as *const u64);
+    let isr_r8  = *((frame_u64 - 56)  as *const u64);
+    let isr_r9  = *((frame_u64 - 64)  as *const u64);
+    let isr_r10 = *((frame_u64 - 72)  as *const u64);
+    let isr_r11 = *((frame_u64 - 80)  as *const u64);
+    // Callee-saved (pushed by isr stubs since PR #187):
+    let isr_rbx = *((frame_u64 - 88)  as *const u64);
+    let isr_rbp = *((frame_u64 - 96)  as *const u64);
+    let isr_r12 = *((frame_u64 - 104) as *const u64);
+    let isr_r13 = *((frame_u64 - 112) as *const u64);
+    let isr_r14 = *((frame_u64 - 120) as *const u64);
+    let isr_r15 = *((frame_u64 - 128) as *const u64);
+
     // ── Write SignalFrame ─────────────────────────────────────────────────────
     (*sig_frame_ptr).restorer    = restorer_addr;
     (*sig_frame_ptr).sig_num     = SIGSEGV as u64;
     (*sig_frame_ptr).saved_mask  = saved_mask;
     (*sig_frame_ptr).saved_rsp   = user_rsp;
-    (*sig_frame_ptr).saved_r15   = 0; // callee-saved — unavailable from ISR
-    (*sig_frame_ptr).saved_r14   = 0;
-    (*sig_frame_ptr).saved_r13   = 0;
-    (*sig_frame_ptr).saved_r12   = 0;
-    (*sig_frame_ptr).saved_rbx   = 0;
-    (*sig_frame_ptr).saved_rbp   = 0;
+    (*sig_frame_ptr).saved_r15   = isr_r15;
+    (*sig_frame_ptr).saved_r14   = isr_r14;
+    (*sig_frame_ptr).saved_r13   = isr_r13;
+    (*sig_frame_ptr).saved_r12   = isr_r12;
+    (*sig_frame_ptr).saved_rbx   = isr_rbx;
+    (*sig_frame_ptr).saved_rbp   = isr_rbp;
     (*sig_frame_ptr).saved_r11   = user_rflags;
     (*sig_frame_ptr).saved_rcx   = user_rip;
-    (*sig_frame_ptr).saved_rax   = 0;
+    (*sig_frame_ptr).saved_rax   = isr_rax;
     (*sig_frame_ptr)._pad        = 0;
 
-    // ── Write minimal siginfo_t (Linux x86_64 layout) ─────────────────────────
-    // offset  0: si_signo (i32) = 11
+    // ── Write ucontext_t (SA_SIGINFO handlers only) ───────────────────────────
+    // Per x86_64 System V psABI §3.4 and POSIX.1-2017 sigaction(2):
+    // an SA_SIGINFO handler is called as handler(signo, siginfo_t*, ucontext_t*).
+    // RDX must point to a valid ucontext_t with the interrupted machine state.
+    if want_siginfo {
+        core::ptr::write_bytes(ucontext_ptr, 0, 1);
+        let uc = &mut *ucontext_ptr;
+        // uc_flags, uc_link, uc_stack — all zero (no alternate signal stack)
+        // gregs[]: indices per <sys/ucontext.h> x86_64:
+        //   0=R8 1=R9 2=R10 3=R11 4=R12 5=R13 6=R14 7=R15
+        //   8=RDI 9=RSI 10=RBP 11=RBX 12=RDX 13=RAX 14=RCX
+        //   15=RSP 16=RIP 17=EFL 18=CSGSFS 19=ERR 20=TRAPNO
+        //   21=OLDMASK 22=CR2
+        uc.gregs[0]  = isr_r8;
+        uc.gregs[1]  = isr_r9;
+        uc.gregs[2]  = isr_r10;
+        uc.gregs[3]  = isr_r11;
+        uc.gregs[4]  = isr_r12;
+        uc.gregs[5]  = isr_r13;
+        uc.gregs[6]  = isr_r14;
+        uc.gregs[7]  = isr_r15;
+        uc.gregs[8]  = isr_rdi;
+        uc.gregs[9]  = isr_rsi;
+        uc.gregs[10] = isr_rbp;
+        uc.gregs[11] = isr_rbx;
+        uc.gregs[12] = isr_rdx;
+        uc.gregs[13] = isr_rax;
+        uc.gregs[14] = isr_rcx;
+        uc.gregs[15] = user_rsp;
+        uc.gregs[16] = user_rip;   // REG_RIP = faulting instruction
+        uc.gregs[17] = user_rflags; // REG_EFL
+        // REG_CSGSFS (18): pack CS (low 16 b) from InterruptFrame; GS/FS = 0
+        uc.gregs[18] = (*frame).cs & 0xFFFF;
+        uc.gregs[19] = error_code;  // REG_ERR (page-fault error code bits)
+        uc.gregs[20] = 14;          // REG_TRAPNO = 14 (Intel SDM: #PF is vector 14)
+        uc.gregs[21] = saved_mask;  // REG_OLDMASK
+        uc.gregs[22] = cr2;         // REG_CR2 = faulting virtual address
+        // fpregs = NULL (no FPU state; Mozilla does not read it in the fault path)
+        uc.uc_sigmask[0] = saved_mask;
+    }
+
+    // ── Write siginfo_t (Linux x86_64 layout, POSIX.1-2017 §2.4.2) ──────────
+    // offset  0: si_signo (i32) = SIGSEGV
     // offset  4: si_errno (i32) = 0
-    // offset  8: si_code  (i32) = 1 (SEGV_MAPERR) | 2 (SEGV_ACCERR)
-    // offset 12: _pad     (i32) = 0
-    // offset 16: si_addr  (u64) = cr2
-    // offset 24..128: zeroed
+    // offset  8: si_code  (i32) = SEGV_MAPERR (1) or SEGV_ACCERR (2)
+    // offset 16: si_addr  (u64) = cr2 (faulting virtual address)
     core::ptr::write_bytes(siginfo_ptr, 0, 128);
-    let si_code: i32 = if error_code & 1 != 0 { 2 } else { 1 }; // present→ACCERR
+    let si_code: i32 = if error_code & 1 != 0 { 2 } else { 1 }; // present=ACCERR, not-present=MAPERR
     core::ptr::write(siginfo_ptr.add(0)  as *mut i32, SIGSEGV as i32);
     core::ptr::write(siginfo_ptr.add(4)  as *mut i32, 0i32);
     core::ptr::write(siginfo_ptr.add(8)  as *mut i32, si_code);
@@ -735,35 +977,33 @@ pub unsafe fn deliver_sigsegv_from_isr(
     (*frame).rip = handler_addr;
     (*frame).rsp = new_rsp;
 
-    // ── Patch saved RDI/RSI on the ISR kernel stack ───────────────────────────
-    // The `isr_with_error` stub pushes (from bottom = lower address → higher):
-    //   [frame - 80] rax  [frame - 72] rcx  [frame - 64] rdx
-    //   [frame - 56] rsi  [frame - 48] rdi
-    //   [frame - 40] r8   [frame - 32] r9   [frame - 24] r10
-    //   [frame - 16] r11  [frame -  8] error_code
-    //   [frame +  0] InterruptFrame (rip, cs, rflags, rsp, ss)
-    let frame_u64 = frame as u64;
-    let saved_rdi = (frame_u64 - 48) as *mut u64;
-    let saved_rsi = (frame_u64 - 56) as *mut u64;
-    *saved_rdi = SIGSEGV as u64;        // RDI = signo
-    *saved_rsi = siginfo_ptr as u64;    // RSI = &siginfo_t
+    // ── Patch saved RDI/RSI/RDX on the ISR kernel stack ──────────────────────
+    // After iretq, the ISR stub pops these back into the live registers, so
+    // patching them here sets the handler's RDI/RSI/RDX at entry.
+    // Offsets per arch/x86_64/idt.rs layout (frame = InterruptFrame*):
+    //   RDI at frame[-6] = frame_u64 - 48
+    //   RSI at frame[-5] = frame_u64 - 40
+    //   RDX at frame[-4] = frame_u64 - 32
+    let p_rdi = (frame_u64 - 48) as *mut u64;
+    let p_rsi = (frame_u64 - 40) as *mut u64;
+    *p_rdi = SIGSEGV as u64;            // RDI = signo (arg1, always set)
+    *p_rsi = siginfo_ptr as u64;        // RSI = &siginfo_t (arg2, always set)
+    if want_siginfo {
+        let p_rdx = (frame_u64 - 32) as *mut u64;
+        *p_rdx = ucontext_ptr as u64;   // RDX = &ucontext_t (arg3, SA_SIGINFO only)
+    }
 
     // Block SIGSEGV during handler execution (re-enabled by sigreturn).
     sig_state.blocked |= 1u64 << SIGSEGV;
     sig_state.blocked &= !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
 
-    // user_rip is the userspace instruction pointer at fault time (before
-    // the IRET redirect to handler_addr).  Logging it inline saves post-
-    // mortem investigators a kdb step: with the libxul base address from
-    // dmesg they can subtract it to get the file offset and addr2line the
-    // exact source line that faulted.
-    //
-    // Drop PROCESS_TABLE before the serial writes — a slow COM1 should
+    // Drop PROCESS_TABLE before the serial writes — COM1 is slow and should
     // never block other CPUs from looking up their own process entry.
     drop(procs);
     crate::serial_println!(
-        "[SIGNAL] SIGSEGV ISR delivery: PID={} CR2={:#x} user_rip={:#x} handler={:#x} new_rsp={:#x}",
-        pid, cr2, user_rip, handler_addr, new_rsp
+        "[SIGNAL] SIGSEGV ISR delivery: PID={} CR2={:#x} user_rip={:#x} handler={:#x} new_rsp={:#x} siginfo={}",
+        pid, cr2, user_rip, handler_addr, new_rsp,
+        if want_siginfo { "SA_SIGINFO" } else { "classic" }
     );
     emit_signal_vma_banner(pid, user_rip, cr2, &vma_snapshot);
 
