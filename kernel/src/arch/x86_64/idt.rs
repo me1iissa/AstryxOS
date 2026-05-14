@@ -929,7 +929,10 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         crate::mm::pmm::PAGE_SIZE,
                     );
                 }
-                crate::mm::refcount::page_ref_dec(old_phys);
+                // CoW: old_phys may still be shared with the parent; we
+                // only release this process's reference.  The CoW copy
+                // (new_phys) takes sole ownership, refcount set to 1 below.
+                let _ = crate::mm::refcount::page_ref_dec(old_phys);
                 crate::mm::refcount::page_ref_set(new_phys, 1);
                 crate::mm::vmm::map_page_in(cr3, page_addr, new_phys, page_flags);
                 // Cross-CPU shootdown: sibling threads sharing the

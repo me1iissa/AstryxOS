@@ -43,7 +43,9 @@ pub fn insert(mount_idx: usize, inode: u64, page_offset: u64, phys: u64) {
         PageCacheEntry { phys, dirty: false },
     ) {
         // Replaced an existing entry — drop old cache reference.
-        crate::mm::refcount::page_ref_dec(old.phys);
+        // Intentional discard: rc may still be > 0 (user PTEs keep
+        // their own references); we only dec the cache's reference.
+        let _ = crate::mm::refcount::page_ref_dec(old.phys);
     }
     // The cache now holds a reference to this page.
     crate::mm::refcount::page_ref_inc(phys);
@@ -61,7 +63,10 @@ pub fn mark_dirty(mount_idx: usize, inode: u64, page_offset: u64) {
 pub fn evict(mount_idx: usize, inode: u64, page_offset: u64) -> Option<u64> {
     let mut cache = PAGE_CACHE.lock();
     if let Some(entry) = cache.remove(&(mount_idx, inode, page_offset)) {
-        crate::mm::refcount::page_ref_dec(entry.phys);
+        // Caller takes ownership of the phys frame; freeing it (with proper
+        // shootdown) is the caller's responsibility.  Here we only release
+        // the cache's reference.
+        let _ = crate::mm::refcount::page_ref_dec(entry.phys);
         Some(entry.phys)
     } else {
         None

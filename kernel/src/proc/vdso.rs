@@ -264,9 +264,11 @@ pub fn map_vdso(cr3: u64, vmas: &mut Vec<VmArea>) -> Option<u64> {
             // Roll back the vvar + any prior vDSO mappings on failure.
             // (Not strictly necessary — the process will be killed if
             // its VmSpace can't be built — but keeps refcounts accurate.)
-            refcount::page_ref_dec(vvar_phys);
+            // Rollback on failure: the process is about to be killed so
+            // no shootdown is required; just balance the refcounts.
+            let _ = refcount::page_ref_dec(vvar_phys);
             for j in 0..i {
-                refcount::page_ref_dec(vdso_phys + (j * PAGE_SIZE) as u64);
+                let _ = refcount::page_ref_dec(vdso_phys + (j * PAGE_SIZE) as u64);
             }
             return None;
         }
