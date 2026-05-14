@@ -176,10 +176,12 @@ impl ProcFs {
             INO_MOUNTS  => Some(generate_mounts()),
             INO_STAT    => Some(generate_stat()),
             INO_CMDLINE => Some(b"astryx_kernel root=/dev/ramdisk0 console=fb0\n".to_vec()),
-            // /proc/self/maps, /proc/self/status, /proc/self/stat, /proc/self/cmdline
-            // are intercepted by fd_read() before fs.read() is called.
-            // Return a non-empty stub so stat().size > 0 doesn't confuse callers.
-            INO_SELF_MAPS     => Some(b"0000000000000000-0000000000001000 r--p 00000000 00:00 0 [vvar]\n".to_vec()),
+            // /proc/self/maps — real content from the calling process's VMA table.
+            // fd_read() intercepts this path first (see vfs/mod.rs) and delegates
+            // to generate_proc_maps() with the caller's PID.  This arm is the
+            // fallback when ProcFs::read() is invoked directly (e.g. from the
+            // kernel debug shell or a stat-only probe).
+            INO_SELF_MAPS     => Some(generate_proc_maps(crate::proc::current_pid())),
             INO_SELF_STATUS   => Some(b"Name:\tastryx\nState:\tR (running)\nPid:\t1\nPPid:\t0\n".to_vec()),
             INO_SELF_CMDLINE  => Some(b"astryx\0".to_vec()),
             INO_SELF_STAT     => Some(b"1 (astryx) R 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 0 65536 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n".to_vec()),
@@ -921,6 +923,118 @@ pub fn generate_mountinfo() -> Vec<u8> {
 /// and the controller-list is empty.
 pub fn generate_cgroup() -> Vec<u8> {
     b"0::/\n".to_vec()
+}
+
+/// Generate `/proc/<pid>/maps` content from the process's live VMA table.
+///
+/// Each line follows the canonical six-field format specified in proc(5):
+///
+/// ```text
+/// address           perms offset   dev   inode  pathname
+/// 00400000-00452000 r-xp 00000000 00:00 0       /bin/foo
+/// ```
+///
+/// Fields:
+/// * `address`  — `start-end` in hex, no `0x` prefix, not zero-padded to a
+///                fixed width (plain `%lx` per the kernel ABI).
+/// * `perms`    — four characters: `r`/`-`, `w`/`-`, `x`/`-`,
+///                `p` (private/CoW) or `s` (shared).  A mapping is shared
+///                when `MAP_SHARED` is set in the VMA's flags; all other
+///                mappings — including anonymous and file-backed private ones —
+///                are private (`p`).
+/// * `offset`   — file offset of the first byte mapped, 8-digit zero-padded
+///                hex; zero for anonymous / device VMAs.
+/// * `dev`      — device as `major:minor` in hex.  AstryxOS does not track
+///                device IDs in the VMA table, so this is always `00:00`.
+/// * `inode`    — decimal inode number of the mapped file; 0 for anonymous.
+/// * `pathname` — file path, or a bracketed tag such as `[heap]`, `[stack]`,
+///                `[vdso]`, `[vvar]`, `[anon]`.  May be empty for unnamed
+///                anonymous ranges.  Separated from the inode field by spaces
+///                to align to column 73 (matching the Linux kernel convention).
+///
+/// Output is capped at 100 KiB to bound allocation for processes with many
+/// fine-grained mappings (e.g. dynamically-linked C++ binaries).
+///
+/// The output is sorted by start address; the VMA list is always maintained
+/// in sorted order (`VmSpace::insert_vma`), so no re-sorting is needed here.
+///
+/// This function is the single source of truth for maps content.  Both the
+/// VFS `fd_read` hot-path (`vfs/mod.rs`) and the ProcFs inode fallback
+/// delegate to it.
+pub fn generate_proc_maps(pid: crate::proc::Pid) -> Vec<u8> {
+    use crate::mm::vma::{PROT_READ, PROT_WRITE, PROT_EXEC, MAP_SHARED, VmBacking};
+
+    // Snapshot the VMA list while briefly holding PROCESS_TABLE, then release
+    // the lock before formatting to keep the critical section tight.
+    let vmas: Vec<crate::mm::vma::VmArea> = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter()
+            .find(|p| p.pid == pid)
+            .and_then(|p| p.vm_space.as_ref().map(|vs| vs.areas.clone()))
+            .unwrap_or_default()
+    };
+
+    // Upper bound: ~100 KiB.  Each line is at most ~100 bytes; 1024 VMAs fits
+    // in that budget.  Truncate beyond that to avoid unbounded allocation.
+    const MAX_BYTES: usize = 100 * 1024;
+    let mut out = Vec::with_capacity(vmas.len().min(256) * 80);
+
+    for vma in &vmas {
+        if out.len() >= MAX_BYTES {
+            break;
+        }
+
+        let r = if vma.prot & PROT_READ  != 0 { b'r' } else { b'-' };
+        let w = if vma.prot & PROT_WRITE != 0 { b'w' } else { b'-' };
+        let x = if vma.prot & PROT_EXEC  != 0 { b'x' } else { b'-' };
+        // Shared iff MAP_SHARED is set; every other mapping (anonymous,
+        // file-backed private, stack, heap) is private (CoW).
+        let p = if vma.flags & MAP_SHARED != 0 { b's' } else { b'p' };
+
+        // Extract offset and inode from the backing descriptor.
+        let (offset, inode) = match &vma.backing {
+            VmBacking::File { offset, inode, .. } => (*offset, *inode),
+            _ => (0u64, 0u64),
+        };
+
+        // Format: start-end perms offset dev inode pathname\n
+        // Use core::fmt::Write into a stack-local String to avoid nested allocs.
+        use core::fmt::Write as FmtWrite;
+        let mut line = alloc::string::String::with_capacity(96);
+        let _ = write!(
+            line,
+            "{:x}-{:x} {}{}{}{} {:08x} 00:00 {}",
+            vma.base,
+            vma.end(),
+            r as char, w as char, x as char, p as char,
+            offset,
+            inode,
+        );
+        // Pathname field: align to column 73 (matching the kernel's seq_printf
+        // convention), then append the name.  Use at least one space.
+        if !vma.name.is_empty() {
+            // Pad with spaces so pathname starts at column 73 when possible.
+            // Column index of the current end (0-based): line.len() chars so far.
+            let col = line.len();
+            let spaces = if col < 72 { 72 - col } else { 1 };
+            for _ in 0..spaces {
+                line.push(' ');
+            }
+            line.push_str(vma.name);
+        }
+        line.push('\n');
+        out.extend_from_slice(line.as_bytes());
+    }
+
+    if out.is_empty() {
+        // Safety net for kernel threads / processes with no user VMAs: emit
+        // the vvar placeholder so parsers that require at least one line succeed.
+        out.extend_from_slice(
+            b"0000000000000000-0000000000001000 r--p 00000000 00:00 0 [vvar]\n"
+        );
+    }
+
+    out
 }
 
 /// Generate `/proc/stat` content.

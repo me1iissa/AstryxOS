@@ -1859,32 +1859,11 @@ fn serve_dynamic_read(content: &[u8], offset: u64, buf: *mut u8, count: usize,
 }
 
 /// Generate /proc/self/maps content from the process's VMAs.
+///
+/// Delegates to `procfs::generate_proc_maps`, which is the single canonical
+/// implementation of the proc(5) /proc/<pid>/maps format.
 fn generate_proc_maps(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
-    use alloc::string::ToString;
-    let vmas = {
-        let procs = crate::proc::PROCESS_TABLE.lock();
-        procs.iter().find(|p| p.pid == pid)
-            .and_then(|p| p.vm_space.as_ref().map(|vs| vs.areas.clone()))
-            .unwrap_or_default()
-    };
-    let mut out = alloc::vec::Vec::new();
-    for vma in &vmas {
-        use crate::mm::vma::{PROT_READ, PROT_WRITE, PROT_EXEC, MAP_ANONYMOUS};
-        let r = if vma.prot & PROT_READ  != 0 { 'r' } else { '-' };
-        let w = if vma.prot & PROT_WRITE != 0 { 'w' } else { '-' };
-        let x = if vma.prot & PROT_EXEC  != 0 { 'x' } else { '-' };
-        let s = if vma.flags & MAP_ANONYMOUS != 0 { 'p' } else { 's' };
-        let line = alloc::format!(
-            "{:016x}-{:016x} {}{}{}{} 00000000 00:00 0 {}\n",
-            vma.base, vma.base + vma.length, r, w, x, s, vma.name
-        );
-        out.extend_from_slice(line.as_bytes());
-    }
-    if out.is_empty() {
-        // Fallback for processes without VmSpace (kernel threads).
-        out.extend_from_slice(b"0000000000000000-0000000000001000 r--p 00000000 00:00 0 [vvar]\n");
-    }
-    out
+    procfs::generate_proc_maps(pid)
 }
 
 /// Generate /proc/self/status content for the process.

@@ -9532,9 +9532,11 @@ fn test_proc_maps_content() -> bool {
     test_println!("  read {} bytes ✓", n);
 
     let content = &buf[..n as usize];
-    // Check that at least one line has hex address range format "xxxxxxxxxxxxxxxx-"
-    let has_addr = content.windows(17).any(|w| {
-        w[16] == b'-' && w[..16].iter().all(|&c| c.is_ascii_hexdigit())
+    // Check that at least one line has a hex address range — format is
+    // "%lx-%lx" per proc(5), so width varies (8–16 hex digits) depending
+    // on the actual address value.  Match any run of hex digits followed by '-'.
+    let has_addr = content.iter().zip(content.iter().skip(1)).any(|(&a, &b)| {
+        a.is_ascii_hexdigit() && b == b'-'
     });
     if !has_addr {
         // Warn but don't fail — VmSpace may be empty in test mode
