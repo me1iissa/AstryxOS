@@ -909,12 +909,17 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         // read-deadline.  Extractable post-run via QGA guest-file-read.
         // See https://firefox-source-docs.mozilla.org/xpcom/logging.html
         "MOZ_LOG_FILE=/tmp/mozlog",
-        // Ask ld-linux to narrate every library load, symbol lookup, and
-        // binding it performs.  LD_DEBUG_OUTPUT directs the output to
-        // /tmp/lddbg.<pid> (glibc rtld appends the PID automatically) so
-        // it survives past process exit and can be extracted via QGA.
+        // Ask ld-linux to narrate every library load and per-symbol lookup.
+        // "bindings" is intentionally omitted: it emits one line per PLT/GOT
+        // entry resolved, which for a libxul-sized binary produces >200 K
+        // lines and saturates the kernel serial path at ~7 KB/s, preventing
+        // any trial from reaching Firefox execution within a 30-minute
+        // window (W196/W197).  Re-enable "bindings" only when investigating
+        // a specific symbol-binding question on a short-lived binary.
+        // LD_DEBUG_OUTPUT directs output to /tmp/lddbg.<pid> (glibc rtld
+        // appends the PID automatically) so it survives past process exit.
         // Defined by glibc's dynamic linker; see ld.so(8) §LD_DEBUG.
-        "LD_DEBUG=files,symbols,bindings",
+        "LD_DEBUG=files,symbols",
         "LD_DEBUG_OUTPUT=/tmp/lddbg",
     ];
 
