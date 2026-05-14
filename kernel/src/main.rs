@@ -452,6 +452,25 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             serial_println!("[FFTEST] Page cache: {} pages total", total);
             serial_println!("[FFTEST] Pre-load complete — launching Firefox");
 
+            // W150: write /tmp/hello.html to the VFS ramdisk so that
+            // Mozilla's HeadlessShell cmdline handler can resolve the
+            // file:///tmp/hello.html target passed on the command line.
+            //
+            // The file is staged in the FAT32 image as /disk/tmp/hello.html
+            // by scripts/install-firefox.sh, but /tmp is a separate ramdisk
+            // mount.  Without this write, the handler hits ENOENT and the
+            // headless screenshot capture fails silently.
+            //
+            // See: https://firefox-source-docs.mozilla.org/widget/headless.html
+            // (HeadlessShell command-line handling, --screenshot flag)
+            const HELLO_HTML: &[u8] = b"<!doctype html><html><head><title>AstryxOS Headless Firefox</title></head><body style=\"background:#fff;color:#222;font:14pt sans-serif;text-align:center;margin-top:120px\"><h1>AstryxOS</h1><p>Firefox 115 ESR \xe2\x80\x94 headless screenshot demo</p></body></html>\n";
+            let _ = crate::vfs::mkdir("/tmp");
+            let _ = crate::vfs::create_file("/tmp/hello.html");
+            match crate::vfs::write_file("/tmp/hello.html", HELLO_HTML) {
+                Ok(_)  => serial_println!("[FFTEST] Wrote /tmp/hello.html ({} bytes) to VFS ramdisk", HELLO_HTML.len()),
+                Err(e) => serial_println!("[FFTEST] WARNING: could not write /tmp/hello.html: {:?}", e),
+            }
+
             serial_println!("[FFTEST] Launching /disk/opt/firefox/firefox-bin ...");
             // Headless mode: pass `--headless` so libxul takes the IsHeadless()
             // path and does not call XOpenDisplay() / gdk_display_open().  With
@@ -466,10 +485,9 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // drives the HeadlessShell command-line handler (see Mozilla's
             // browser/components/shell/HeadlessShell.sys.mjs).  Passing it
             // causes the handler to load the URL and write a PNG, which is
-            // the headless demo bar for issue #88.  /tmp/hello.html is staged
-            // into the data image by scripts/create-data-disk.sh.  Reaching
-            // the handler requires the JS event loop to advance to cmdline-
-            // handler dispatch — see issue #88 for the current barrier.
+            // the headless demo bar for issue #88.  /tmp/hello.html is now
+            // written to the ramdisk above (W150) so the handler will not
+            // hit ENOENT when it resolves file:///tmp/hello.html.
             gui::terminal::launch_process(
                 "/disk/opt/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png file:///tmp/hello.html",
             );
