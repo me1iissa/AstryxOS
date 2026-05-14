@@ -465,6 +465,18 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
                 let tid = crate::proc::current_tid();
                 crate::proc::stack_walk::stack_walk_user(pid, tid, frame.rip, rbp_at_fault);
             }
+            // Aliasing-detection diagnostic: emit [FAULT/PHYS] +
+            // [FAULT/RIP-CONTENT] so two trials with the same vma_offset
+            // can be cross-checked for physical-frame identity.  Different
+            // rip_phys at the same vma_offset proves the libxul code page
+            // is aliased into multiple address spaces (W196 / W190-H_A).
+            // Cite: Intel SDM Vol. 3A §4.10 (paging-structure caches).
+            {
+                let cr3_now: u64;
+                unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3_now, options(nomem, nostack, preserves_flags)); }
+                let pid = crate::proc::current_pid_lockless();
+                crate::signal::emit_fault_phys_for_fatal(pid, frame.rip, cr2, cr3_now);
+            }
             // POSIX signal(7): the default action for SIGSEGV is "terminate
             // the process (core dump)" — the entire thread group, not just
             // the faulting thread.  Calling exit_thread would leave sibling
@@ -774,6 +786,18 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
             let pid = crate::proc::current_pid_lockless();
             let tid = crate::proc::current_tid();
             crate::proc::stack_walk::stack_walk_user(pid, tid, frame.rip, rbp_at_fault);
+        }
+        // Aliasing-detection diagnostic: emit [FAULT/PHYS] +
+        // [FAULT/RIP-CONTENT] for fatal #UD/#GP/#AC so the same mismatch
+        // test that applies to fatal #PF (Ring-3 SIGSEGV path above) also
+        // covers exceptions whose terminal cause may be aliased text bytes
+        // misinterpreted as opcodes.  cr2 has no meaning for non-#PF
+        // vectors here, so pass 0.  Cite: Intel SDM Vol. 3A §4.10.
+        {
+            let cr3_now: u64;
+            unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3_now, options(nomem, nostack, preserves_flags)); }
+            let pid = crate::proc::current_pid_lockless();
+            crate::signal::emit_fault_phys_for_fatal(pid, frame.rip, 0, cr3_now);
         }
         // POSIX signal(7): synchronous fatal CPU exceptions in user mode
         // (#DE → SIGFPE, #UD → SIGILL, #DF / #SS / #GP / #AC / #MC → SIGBUS|SIGSEGV)
