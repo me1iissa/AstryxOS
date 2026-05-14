@@ -1470,22 +1470,72 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 // for the same (mount,inode,offset) can evict our entry and
                 // drop phys's refcount to zero — handing the frame to the PMM
                 // for reuse — in the window between cache::insert returning and
-                // page_ref_inc(phys) installing the PTE reference.
+                // the PTE installation below.
                 crate::mm::refcount::page_ref_inc(phys);
                 crate::mm::cache::insert(mount_idx, inode, file_page_offset, phys);
-                // Single-page fallback always aliases the cache frame
-                // regardless of MAP_SHARED / MAP_PRIVATE.  This is correct
-                // for MAP_SHARED + writable and read-only mappings; for
-                // MAP_PRIVATE + writable it is the same lossy behaviour
-                // the OOM-fallback arm in the readahead path exhibits when
-                // alloc_page() returns None (the comment at line ~983
-                // documents the consequence).  Pre-fix behaviour, left
-                // unchanged.
-                crate::mm::refcount::page_ref_inc(phys); // PTE reference
-                crate::mm::vmm::map_page_in(cr3, page_addr, phys, page_flags);
-                crate::mm::vmm::invlpg(page_addr);
-                // Release guard — steady state: cache(1) + PTE(1) = 2.
-                let _ = crate::mm::refcount::page_ref_dec(phys);
+
+                // Bug-C fix (single-page fallback): MAP_PRIVATE + writable
+                // mappings must receive a private copy of the cache page, not
+                // an alias.  Aliasing the shared frame with PAGE_WRITABLE set
+                // allows ld-linux GOT relocations to corrupt the cache page,
+                // which any concurrent MAP_PRIVATE reader of the same
+                // (mount,inode,offset) will inherit — yielding PIE-biased
+                // pointers that fault at random virtual addresses depending on
+                // which process's base they were computed for (W184/W185/W188
+                // root cause).
+                //
+                // Mirrors the same guard applied in the cache-hit path
+                // (lines ~1098-1122) and the readahead OOM-fallback path
+                // (lines ~1349-1370).  Per POSIX mmap(2) and Intel SDM
+                // Vol. 3A §4.10.5, demand-paging may fail with SIGSEGV when
+                // physical backing cannot be obtained — observable behaviour
+                // identical to ENOMEM from mmap(2).
+                let is_writable_spf = page_flags & crate::mm::vmm::PAGE_WRITABLE != 0;
+                let needs_private_copy_spf = is_writable_spf && !is_shared;
+                if needs_private_copy_spf {
+                    if let Some(private_phys) = crate::mm::pmm::alloc_page() {
+                        const COW_SPF: u64 = 0xFFFF_8000_0000_0000;
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                (COW_SPF + phys) as *const u8,
+                                (COW_SPF + private_phys) as *mut u8,
+                                crate::mm::pmm::PAGE_SIZE,
+                            );
+                        }
+                        crate::mm::refcount::page_ref_set(private_phys, 1);
+                        crate::mm::vmm::map_page_in(cr3, page_addr, private_phys, page_flags);
+                        crate::mm::vmm::invlpg(page_addr);
+                        // Cache keeps its own ref to phys (clean shared copy).
+                        // Release guard — steady state: cache ref(phys) = 1.
+                        let _ = crate::mm::refcount::page_ref_dec(phys);
+                    } else {
+                        // PMM exhausted: cannot allocate a private copy.
+                        //
+                        // Aliasing the shared cache page with PAGE_WRITABLE set
+                        // is unsafe — a subsequent write (e.g., ld-linux GOT
+                        // relocation) would corrupt the cache frame for all
+                        // other concurrent mappers of this (mount,inode,offset).
+                        // Fail the fault instead.  Per POSIX mmap(2) and
+                        // Intel SDM Vol. 3A §4.10.5, demand-paging is permitted
+                        // to signal the faulting thread (SIGSEGV) when physical
+                        // backing cannot be allocated.
+                        //
+                        // Refcount accounting: cache::insert holds the cache ref
+                        // (rc → 1 steady state after guard drop); release only
+                        // the guard ref acquired above.
+                        let _ = crate::mm::refcount::page_ref_dec(phys);
+                        return false;
+                    }
+                } else {
+                    // MAP_SHARED writable, or any read-only mapping: alias the
+                    // cache page directly.  Writes via MAP_SHARED are visible to
+                    // all other mappers — required by mmap(2) MAP_SHARED contract.
+                    crate::mm::refcount::page_ref_inc(phys); // PTE reference
+                    crate::mm::vmm::map_page_in(cr3, page_addr, phys, page_flags);
+                    crate::mm::vmm::invlpg(page_addr);
+                    // Release guard — steady state: cache(1) + PTE(1) = 2.
+                    let _ = crate::mm::refcount::page_ref_dec(phys);
+                }
                 return true;
             }
             return false; // OOM
