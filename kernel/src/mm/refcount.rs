@@ -57,7 +57,15 @@ pub fn page_ref_inc(phys_addr: u64) {
 }
 
 /// Decrement the reference count for a physical page.
-/// Returns the new count. If it reaches 0, the page can be freed.
+///
+/// Returns the **new** count after the decrement.  Callers MUST check the
+/// return value: when it is zero the frame has no remaining references and
+/// must be freed via `pmm::free_page` only AFTER a completed TLB shootdown
+/// on every CPU that may hold a cached translation to this frame
+/// (see Intel SDM Vol. 3A §4.10.5).
+#[must_use = "dropping the return value of page_ref_dec silently loses the \
+              information needed to decide when to free the frame; check \
+              whether the count reached zero and schedule a shootdown+free"]
 pub fn page_ref_dec(phys_addr: u64) -> u16 {
     let idx = pfn(phys_addr);
     let rc = refcounts();
