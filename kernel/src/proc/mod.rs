@@ -22,6 +22,7 @@ pub mod pe;
 pub mod qga_elf;
 #[cfg(feature = "firefox-test")]
 pub mod sample;
+pub mod stack_walk;
 pub mod thread;
 pub mod usermode;
 pub mod vdso;
