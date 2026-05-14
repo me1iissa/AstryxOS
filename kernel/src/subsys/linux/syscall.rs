@@ -3352,7 +3352,16 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
         }
         Err(crate::vfs::VfsError::BadFd) if fd == 0 => { /* fall through to TTY stdin */ }
         Err(_) if fd == 0 => { /* fall through to TTY stdin */ }
-        Err(_) => return -9, // EBADF for non-stdin fds
+        Err(e) => {
+            // Map VfsError to its POSIX errno value (the enum discriminants
+            // are the POSIX numbers by design — see `vfs::VfsError`).  This
+            // distinguishes EIO from EBADF so callers like glibc's
+            // dynamic-linker `read()` retry path can react appropriately;
+            // see W160 (virtio-blk EBADF on transient I/O timeout, which
+            // previously collapsed to -9 here and tricked ld-linux into
+            // reporting an invalid ELF header).
+            return -(e as i64);
+        }
     }
 
     // fd 0 with no VFS file → stdin via TTY line discipline.

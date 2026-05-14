@@ -16,17 +16,24 @@
 //!
 //! * **Poll fallback** — used during early boot before the IO-APIC and the
 //!   scheduler are ready (mount of root FS happens in this window).  The
-//!   submitter spins on the used-ring index after writing the doorbell.
+//!   submitter spins on its slot's status byte after writing the doorbell.
 //!
-//! * **IRQ-driven** — armed once the APIC is up via [`arm_irq`].  The
-//!   submitter publishes its TID + a per-request "done" flag, marks itself
-//!   `Blocked`, and yields via `schedule()`.  The virtio-blk ISR walks the
-//!   used ring, sets the per-request flag, and flips the waker thread back
-//!   to `Ready`.
+//! * **IRQ-driven** — armed once the APIC is up via [`arm_irq`].  Each
+//!   submission allocates one of [`MAX_INFLIGHT`] completion slots, publishes
+//!   its TID into that slot, drops the device mutex, and waits.  The
+//!   virtio-blk ISR walks the used ring, looks each completed descriptor
+//!   chain head up to its owning slot, copies the status byte, and wakes
+//!   the waiter that registered against that slot.
+//!
+//! Per-slot state means concurrent submitters (e.g. two threads issuing
+//! reads while a third's request is parked in `wait_completion`) do not
+//! clobber each other's done-flag, status, or waiter TID.  See the
+//! W160 investigation for the symptoms before this restructure.
 //!
 //! # References
 //! - Virtio 1.0 spec, Section 5.2 (Block Device)
-//! - Virtio 1.0 spec, Section 2.4 (Virtqueue Interrupt Suppression)
+//! - Virtio 1.0 spec, Section 2.4 (Virtqueue Interrupt Suppression),
+//!   §2.4.8 (used ring `id` is the head descriptor index)
 //! - Virtio 1.0 spec, Section 4.1.4 (PCI legacy device init)
 //! - Legacy interface: <https://docs.oasis-open.org/virtio/virtio/v1.0/cs04/virtio-v1.0-cs04.html>
 
@@ -111,13 +118,33 @@ fn used_ring_offset(queue_size: u16) -> usize {
     (avail_end + 4095) & !4095
 }
 
+/// Calculate the byte offset of the per-slot request-header array within
+/// the virtqueue page.  Headers are 16 bytes each, MAX_INFLIGHT total,
+/// placed immediately after the used ring (16-byte aligned per the
+/// device's natural alignment for `VirtioBlkReqHeader`).
+#[inline]
+fn header_array_offset(queue_size: u16) -> usize {
+    let used_end = used_ring_offset(queue_size) + 4 + (queue_size as usize) * 8;
+    (used_end + 15) & !15
+}
+
+/// Calculate the byte offset of the per-slot status-byte array within
+/// the virtqueue page.  One byte per slot, placed immediately after the
+/// header array (no further alignment required — devices write bytes
+/// independently).
+#[inline]
+fn status_array_offset(queue_size: u16) -> usize {
+    header_array_offset(queue_size) + MAX_INFLIGHT * 16
+}
+
 /// Calculate the total bytes needed for a virtqueue with the given size.
+/// Includes the per-slot header + status scratch arrays so the entire
+/// driver-private region fits in the same physically-contiguous allocation.
 #[inline]
 fn virtqueue_total_bytes(queue_size: u16) -> usize {
-    let used_off = used_ring_offset(queue_size);
-    let used_end = used_off + 4 + (queue_size as usize) * 8;
+    let scratch_end = status_array_offset(queue_size) + MAX_INFLIGHT;
     // Align up to page boundary.
-    (used_end + 4095) & !4095
+    (scratch_end + 4095) & !4095
 }
 
 // ── Request Header ──────────────────────────────────────────────────────────
@@ -162,37 +189,74 @@ static VIRTIO_BLK_AVAILABLE: AtomicBool = AtomicBool::new(false);
 
 // ── IRQ-Driven Completion State ─────────────────────────────────────────────
 //
-// The driver serialises requests with `VIRTIO_BLK.lock()`, so at most one
-// request is ever in flight.  The submitter publishes its TID and the
-// per-request "done" flag here, then blocks; the ISR reads them, sets
-// `done = true`, and wakes the waiter.  Both fields are atomic so the ISR
-// can read them without touching the device mutex (which the submitter
-// still holds throughout its critical section).
+// Each request occupies one of [`MAX_INFLIGHT`] completion slots.  A slot
+// owns a private 3-descriptor chain (heads `3*N`, `3*N+1`, `3*N+2`), a
+// 16-byte request header, and a 1-byte status byte — all carved out of
+// the virtqueue page in [`init`] / [`restart_device`].  The submitter:
+//
+//   1. Allocates a free slot (CAS on `Completion::in_use`) — done while
+//      the device mutex is held so descriptor builds don't race.
+//   2. Builds descriptors, writes the header, sets the status sentinel,
+//      and pre-arms the slot's `done` / `waiter_tid` / `status`.
+//   3. Drops the device mutex and waits on its slot's `done` flag.
+//
+// The ISR walks the used ring; for each newly-completed entry it computes
+// `slot_idx = used.ring[i].id / 3` and (a) copies the slot's status byte
+// from the virtqueue scratch area into the slot, (b) sets `done`, (c)
+// wakes the registered TID.
 //
 // `IRQS_ARMED` gates the entire path: until `arm_irq()` has registered the
-// IO-APIC route the driver falls back to spin-polling.  This keeps the
-// early-boot mount sequence (which runs before APIC init) working.
+// IO-APIC route the driver falls back to spin-polling on the slot's
+// virtqueue status byte.  This keeps the early-boot mount sequence
+// (which runs before APIC init) working.
 
 /// Set to `true` by [`arm_irq`] once the IO-APIC route is live; the submit
 /// path then prefers blocking over polling.
 static IRQS_ARMED: AtomicBool = AtomicBool::new(false);
 
-/// TID of the thread blocked on the in-flight request, or [`NO_WAITER`]
-/// (`u64::MAX`) when no request is in flight.
-///
-/// Note: zero is a valid TID (the BSP idle thread / kernel-init thread runs
-/// as TID 0, and it issues disk reads during early Firefox setup), so we
-/// can't use 0 as a "no waiter" sentinel.
+/// Maximum concurrent in-flight virtio-blk requests.  Each slot consumes
+/// 3 descriptor table entries (header + data + status), so this bounds
+/// the descriptor-table footprint at `MAX_INFLIGHT * 3`.  QEMU's
+/// virtio-blk-pci legacy device exposes 128-deep queues, so 32 slots
+/// (96 descriptors) leaves headroom for non-paged callers and aligns
+/// the per-slot scratch onto cache lines.
+pub const MAX_INFLIGHT: usize = 32;
+
+/// Sentinel meaning "no thread is currently registered to be woken on
+/// this slot's completion".  Zero is a valid TID (BSP idle / kernel-init
+/// thread issues disk reads during Firefox bring-up), so we use `u64::MAX`.
 const NO_WAITER: u64 = u64::MAX;
-static WAITER_TID: AtomicU64 = AtomicU64::new(NO_WAITER);
 
-/// Per-request completion flag.  The submitter clears this before submitting
-/// and re-checks after wake; the ISR sets it after walking the used ring.
-static REQUEST_DONE: AtomicBool = AtomicBool::new(false);
+/// Per-slot completion record.  Cache-line aligned to keep ISR / waiter
+/// updates from creating false sharing across the slot array.
+#[repr(align(64))]
+struct Completion {
+    /// Slot allocation flag.  `acquire_slot` CAS-set to `true`; the
+    /// waiter clears it after consuming `done` + `status`.
+    in_use: AtomicBool,
+    /// Set by ISR (or the polled fallback in `wait_completion`) once the
+    /// device has retired this slot's descriptor chain.
+    done: AtomicBool,
+    /// Last-seen virtio-blk request status byte for this slot
+    /// (0 = OK, non-zero = device error).
+    status: AtomicU8,
+    /// TID of the thread blocked on this slot, or [`NO_WAITER`].
+    waiter_tid: AtomicU64,
+}
 
-/// Last-seen virtio-blk request status byte (0 = OK, non-zero = device error).
-/// The ISR copies the per-request status here before signalling `REQUEST_DONE`.
-static REQUEST_STATUS: AtomicU8 = AtomicU8::new(0);
+impl Completion {
+    const fn new() -> Self {
+        Self {
+            in_use: AtomicBool::new(false),
+            done: AtomicBool::new(false),
+            status: AtomicU8::new(0),
+            waiter_tid: AtomicU64::new(NO_WAITER),
+        }
+    }
+}
+
+static COMPLETIONS: [Completion; MAX_INFLIGHT] =
+    [const { Completion::new() }; MAX_INFLIGHT];
 
 /// Spurious-IRQ counter (ISR fired but no used-ring progress).  Useful for
 /// detecting shared-IRQ wiring mistakes; surfaced via [`spurious_count`].
@@ -203,17 +267,46 @@ static TOTAL_IRQS: AtomicU64 = AtomicU64::new(0);
 
 /// Completions discovered via the poll-fallback in `wait_completion`.
 /// Non-zero values indicate the IRQ wiring is unreliable on the host —
-/// the wait loop's used-ring read picked up the completion before the
+/// the wait loop's status-byte read picked up the completion before the
 /// ISR did.  Zero in steady state means IRQ delivery is working as
 /// designed and the schedule() yield happens once per request.
 static POLLED_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 
+/// Acquire a free slot via CAS scan; returns `Some(slot_idx)` on success.
+/// Caller must hold the device mutex while submitting against this slot
+/// (so descriptor and header writes are serialised), but the wait runs
+/// without the mutex held.  Returns `None` if every slot is busy — the
+/// caller spins (with `core::hint::spin_loop`) and retries.
+fn acquire_slot() -> Option<usize> {
+    for i in 0..MAX_INFLIGHT {
+        if COMPLETIONS[i]
+            .in_use
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // Reset slot state for new request.
+            COMPLETIONS[i].done.store(false, Ordering::Release);
+            COMPLETIONS[i].status.store(0xFF, Ordering::Relaxed);
+            COMPLETIONS[i].waiter_tid.store(NO_WAITER, Ordering::Release);
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Release a slot for reuse.  Must be called by the same waiter that
+/// acquired it, after the wait has consumed `done` + `status`.
+fn release_slot(slot_idx: usize) {
+    COMPLETIONS[slot_idx].waiter_tid.store(NO_WAITER, Ordering::Release);
+    COMPLETIONS[slot_idx].in_use.store(false, Ordering::Release);
+}
+
 // ── Lock-Free Snapshot for the ISR ──────────────────────────────────────────
 //
-// The submit path holds `VIRTIO_BLK.lock()` for the full lifetime of a request
-// (descriptor build → doorbell → wait → completion).  The ISR therefore must
-// NOT touch that mutex — `try_lock` would always fail while a thread is
-// blocked mid-request, and the IRQ-driven wake would never fire.
+// The submit path holds `VIRTIO_BLK.lock()` only during descriptor build +
+// doorbell write; it drops the mutex before waiting.  The ISR therefore
+// must not touch that mutex (it might be held by an in-flight submitter
+// on another CPU) — `try_lock` would fail unpredictably and lose IRQs.
 //
 // These atomics hold the post-init values that never change for the lifetime
 // of the device (or change only inside `restart_device`, which runs with
@@ -302,6 +395,19 @@ pub fn init() -> bool {
         if queue_size == 0 {
             crate::serial_println!("[VIRTIO-BLK] Queue 0 not available");
             hal::outb(io_base + VIRTIO_REG_DEVICE_STATUS, 0); // reset
+            return false;
+        }
+        // The per-slot descriptor layout consumes `MAX_INFLIGHT * 3`
+        // descriptor table entries.  Refuse to run on a queue that can't
+        // hold them — virtio §2.4 leaves the queue size to the device,
+        // but the legacy QEMU virtio-blk-pci default is 128, well above
+        // our 96-entry need.
+        if (queue_size as usize) < MAX_INFLIGHT * 3 {
+            crate::serial_println!(
+                "[VIRTIO-BLK] Queue size {} < required {} (MAX_INFLIGHT={} * 3)",
+                queue_size, MAX_INFLIGHT * 3, MAX_INFLIGHT
+            );
+            hal::outb(io_base + VIRTIO_REG_DEVICE_STATUS, 0);
             return false;
         }
         crate::serial_println!("[VIRTIO-BLK] Queue 0 size: {}", queue_size);
@@ -433,6 +539,11 @@ pub fn arm_irq() {
         }
     }
 
+    // `IRQ_LAST_USED_IDX` is kept current by the poll-fallback path in
+    // `submit_request`, which advances it on every completion.  By the
+    // time `arm_irq` runs it already matches the device's `used.idx`,
+    // so the ISR's first walk starts from the correct cursor.
+
     IRQS_ARMED.store(true, Ordering::Release);
     crate::serial_println!(
         "[VIRTIO-BLK] IRQ armed: PCI {:02x}:{:02x}.{} line={} -> vector {} (BSP APIC {})",
@@ -496,19 +607,23 @@ pub fn spurious_count() -> u64 {
 /// The handler must:
 ///   1. Read `ISR_STATUS` to clear the device's INTx assertion (virtio 1.0
 ///      §4.1.4.5 — read-to-clear).
-///   2. Compare `used.idx` against `IRQ_LAST_USED_IDX` to detect completions.
-///   3. Copy the per-request status byte while still in the ISR.
-///   4. Signal `REQUEST_DONE` and try to flip the waker thread to `Ready`.
+///   2. Walk used.ring from `IRQ_LAST_USED_IDX` to the device's current
+///      `used.idx`, demultiplexing each completed chain to its owning slot
+///      (slot N's head descriptor is index `3*N`, virtio 1.0 §2.4.8).
+///   3. Copy each completed slot's status byte from the per-slot virtqueue
+///      scratch into `COMPLETIONS[slot].status`.
+///   4. Signal `COMPLETIONS[slot].done` and try to flip the registered
+///      waiter thread to `Ready`.
 ///   5. Send LAPIC EOI.
 ///
 /// Lock discipline: the ISR NEVER takes [`VIRTIO_BLK`] (the submit path
-/// holds it for the full request lifetime, so a `try_lock` here is
-/// guaranteed to fail) and uses `try_lock` only for [`THREAD_TABLE`].
-/// All device state needed by the ISR is read from the lock-free atomics
-/// populated by [`publish_irq_snapshot`].  If `THREAD_TABLE` is contended,
-/// the wake is deferred — the submitter's `wake_tick = now + 1` safety
-/// floor lets the next timer ISR's [`crate::sched::wake_sleeping_threads`]
-/// pick up the missed wake.
+/// only holds it briefly during descriptor build) and uses `try_lock`
+/// only for [`THREAD_TABLE`].  All device state needed by the ISR is
+/// read from the lock-free atomics populated by [`publish_irq_snapshot`]
+/// plus the per-slot `COMPLETIONS` array.  If `THREAD_TABLE` is contended,
+/// the wake is deferred — the slot's `done` flag is already set, so the
+/// waiter's polled fallback in [`wait_completion`] picks the completion
+/// up on its next iteration.
 pub(crate) fn handle_irq() {
     TOTAL_IRQS.fetch_add(1, Ordering::Relaxed);
     let io_base = IRQ_IO_BASE.load(Ordering::Acquire);
@@ -523,66 +638,128 @@ pub(crate) fn handle_irq() {
         unsafe { crate::hal::inb(io_base + VIRTIO_REG_ISR_STATUS) }
     } else { 0 };
 
-    // 2. Walk used ring lock-free.  If the snapshot is empty (driver
-    //    not yet up) skip — only the EOI matters.
-    let mut completed = false;
-    let mut status_byte: u8 = 0xFF;
-    if qs != 0 && vq_virt != 0 {
-        // SAFETY: Reading `used.idx` from our owned virtqueue memory.
-        // `vq_virt` is the kernel higher-half mapping of the virtqueue
-        // PFN we passed to QUEUE_ADDRESS; valid until `restart_device`
-        // republishes it (in which case IRQS_ARMED gating prevents new
-        // requests from racing with the republish).
-        let cur_used = unsafe {
-            let used_idx_ptr = (vq_virt as *const u8).add(used_ring_offset(qs) + 2) as *const u16;
-            used_idx_ptr.read_volatile()
-        };
-        let last_seen = IRQ_LAST_USED_IDX.load(Ordering::Acquire);
-        if cur_used != last_seen {
-            // The submit path always uses descriptor 0 as the head and
-            // places the status byte at a fixed offset (see `submit_request`).
-            let used_ring_end = used_ring_offset(qs) + 4 + (qs as usize) * 8;
-            let header_offset = (used_ring_end + 15) & !15;
-            let status_offset = header_offset + 16;
-            // SAFETY: Status byte was written by the device into our
-            // virtqueue-local scratch slot before it advanced used.idx.
-            status_byte = unsafe {
-                let p = (vq_virt as *const u8).add(status_offset);
-                p.read_volatile()
-            };
-            IRQ_LAST_USED_IDX.store(cur_used, Ordering::Release);
-            completed = true;
-        }
-    }
+    // 2. Walk the used ring and wake every completed slot's waiter.
+    let completed_any = if qs != 0 && vq_virt != 0 {
+        drain_used_ring(qs, vq_virt) > 0
+    } else {
+        false
+    };
 
-    if completed {
-        REQUEST_STATUS.store(status_byte, Ordering::Relaxed);
-        REQUEST_DONE.store(true, Ordering::Release);
-
-        // 3. Try to wake the waiter directly.  If THREAD_TABLE is contended
-        //    the submitter's wake_tick=now+1 floor will catch it on the
-        //    next timer tick.
-        let waker = WAITER_TID.load(Ordering::Acquire);
-        if waker != NO_WAITER {
-            if let Some(mut threads) = crate::proc::THREAD_TABLE.try_lock() {
-                if let Some(t) = threads.iter_mut().find(|t| t.tid == waker) {
-                    if t.state == crate::proc::ThreadState::Blocked {
-                        t.state = crate::proc::ThreadState::Ready;
-                        t.wake_tick = 0;
-                    }
-                }
-            }
-        }
-    } else if isr_bits & 1 != 0 {
-        // Device asserted "used ring update" but we couldn't see one —
-        // probably already serviced by a previous IRQ.  Count for diagnostics.
+    if !completed_any && isr_bits & 1 != 0 {
+        // Device asserted "used ring update" but we couldn't see any new
+        // entries — probably already serviced by a previous IRQ or by
+        // the polled fallback in `wait_completion`.
         SPURIOUS_IRQS.fetch_add(1, Ordering::Relaxed);
     }
 
-    // 4. EOI.
+    // 3. EOI.
     if crate::arch::x86_64::apic::is_enabled() {
         crate::arch::x86_64::apic::lapic_eoi();
     }
+}
+
+/// Walk the used ring from `IRQ_LAST_USED_IDX` to the device's current
+/// `used.idx`, marking every completed slot's `COMPLETIONS[slot].done`
+/// and waking its registered TID.  Returns the number of entries
+/// processed.
+///
+/// Used by both [`handle_irq`] and the polled fallback inside
+/// [`wait_completion`] to keep the ISR's view of the ring consistent
+/// with the polled view.  Per virtio 1.0 §2.4.8 each used-ring entry's
+/// `id` is the head descriptor index — slot N's head is descriptor `3*N`.
+///
+/// Concurrent walks (ISR vs polled fallback on another CPU) are
+/// serialised by a CAS on the cursor: each entry index is processed
+/// by exactly one caller.  This avoids the race where a stale read of
+/// a long-since-recycled ring slot would incorrectly flip a freshly-
+/// reused completion slot's `done` flag.
+fn drain_used_ring(qs: u16, vq_virt: u64) -> u32 {
+    // SAFETY: `vq_virt` is the kernel higher-half mapping of the
+    // virtqueue PFN we passed to QUEUE_ADDRESS; valid until
+    // `restart_device` republishes it (in which case IRQS_ARMED gating
+    // prevents new requests from racing with the republish).
+    let used_ring_base = unsafe { (vq_virt as *const u8).add(used_ring_offset(qs)) };
+    let cur_used = unsafe {
+        let used_idx_ptr = used_ring_base.add(2) as *const u16;
+        used_idx_ptr.read_volatile()
+    };
+    let mut count: u32 = 0;
+    loop {
+        // Take a single ring index for this iteration.  CAS guarantees
+        // that exactly one caller observes each index value, even when
+        // the ISR runs while a polled-fallback walk is in progress on
+        // a different CPU.
+        let last_seen = IRQ_LAST_USED_IDX.load(Ordering::Acquire);
+        if last_seen == cur_used {
+            break;
+        }
+        let next = last_seen.wrapping_add(1);
+        if IRQ_LAST_USED_IDX
+            .compare_exchange(last_seen, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // Another walker advanced the cursor — retry from the new
+            // baseline.  This is rare in practice (one IRQ + at most
+            // one polled walker per CPU).
+            continue;
+        }
+
+        // used.ring is at +4 from used_ring_base; each entry is 8 bytes
+        // (`u32 id`, `u32 len`).  See virtio 1.0 §2.4.8.
+        let slot_in_ring = (last_seen as usize) % (qs as usize);
+        let entry_off = 4 + slot_in_ring * 8;
+        let head_id = unsafe {
+            let p = used_ring_base.add(entry_off) as *const u32;
+            p.read_volatile()
+        };
+        // Recover slot index from head descriptor index.  Slot N's head
+        // is descriptor 3N (see `submit_request`); any other id value
+        // means the device returned a chain we did not submit (spec
+        // violation), skip rather than indexing out of range.
+        let slot_idx = (head_id / 3) as usize;
+        if (head_id % 3) == 0 && slot_idx < MAX_INFLIGHT {
+            let status_off = status_array_offset(qs) + slot_idx;
+            // SAFETY: Device writes the status byte into the slot's
+            // scratch before it advances used.idx (virtio 1.0 §2.4.7.2).
+            //
+            // QEMU's virtio-blk-pci-legacy backend can advance used.idx
+            // before the status-byte write has propagated to guest-visible
+            // memory.  Spin briefly on the 0xFF sentinel until the real
+            // status arrives so the wake doesn't carry a phantom value.
+            // In practice the window is < 1000 spin iterations on KVM.
+            let status_byte = unsafe {
+                let p = (vq_virt as *const u8).add(status_off);
+                let mut s = p.read_volatile();
+                let mut spins = 0u32;
+                while s == 0xFF && spins < 100_000 {
+                    core::hint::spin_loop();
+                    s = p.read_volatile();
+                    spins += 1;
+                }
+                s
+            };
+            COMPLETIONS[slot_idx].status.store(status_byte, Ordering::Relaxed);
+            COMPLETIONS[slot_idx].done.store(true, Ordering::Release);
+
+            // Wake the registered waiter, if any.  `try_lock` only — if
+            // THREAD_TABLE is contended, the slot's `done` flag is
+            // already set, so the waiter's polled fallback inside
+            // `wait_completion` picks the completion up next iteration.
+            let waker = COMPLETIONS[slot_idx].waiter_tid.load(Ordering::Acquire);
+            if waker != NO_WAITER {
+                if let Some(mut threads) = crate::proc::THREAD_TABLE.try_lock() {
+                    if let Some(t) = threads.iter_mut().find(|t| t.tid == waker) {
+                        if t.state == crate::proc::ThreadState::Blocked {
+                            t.state = crate::proc::ThreadState::Ready;
+                            t.wake_tick = 0;
+                        }
+                    }
+                }
+            }
+            count += 1;
+        }
+    }
+    count
 }
 
 // ── PCI Discovery ───────────────────────────────────────────────────────────
@@ -611,46 +788,53 @@ fn find_virtio_blk_pci() -> Option<super::pci::PciDevice> {
 
 // ── I/O Operations ──────────────────────────────────────────────────────────
 
-/// Submit a virtio-blk request.
+/// Outcome of [`submit_request`].
+enum SubmitOutcome {
+    /// Request completed inline via the early-boot poll fallback.  No
+    /// further wait is required and the slot has already been released.
+    PollDone,
+    /// Request was submitted on the IRQ path; caller must drop the device
+    /// mutex and call [`wait_completion`] with the returned slot index.
+    IrqWait { slot: usize },
+}
+
+/// Submit a virtio-blk request against an already-acquired completion slot.
 ///
 /// `req_type` is VIRTIO_BLK_T_IN (read) or VIRTIO_BLK_T_OUT (write).
 /// `sector` is the starting LBA.
 /// `data` points to the data buffer (count * 512 bytes).
-/// `count` is the number of sectors.
+/// `data_len` is the buffer length in bytes.
+/// `slot` is a slot index returned by [`acquire_slot`]; the submitter
+/// owns it for the duration of the request.
 ///
-/// Returns Ok(true) when the request must be awaited via the IRQ path
-/// (caller drops the device lock and calls [`wait_completion`]) and
-/// Ok(false) on the poll fallback (which already completed inside this
-/// function).  Err on submission/poll failure.
+/// Per-slot descriptor layout: slot N owns descriptor heads `3*N`,
+/// `3*N+1`, `3*N+2` in the shared descriptor table.  Per-slot scratch
+/// (header + status byte) lives at fixed offsets in the virtqueue page
+/// so concurrent submitters do not stomp each other's request data.
 fn submit_request(
     dev: &mut VirtioBlkDevice,
     req_type: u32,
     sector: u64,
     data: *mut u8,
     data_len: usize,
-) -> Result<bool, BlockError> {
+    slot: usize,
+) -> Result<SubmitOutcome, BlockError> {
+    debug_assert!(slot < MAX_INFLIGHT);
     let io_base = dev.io_base;
     let qs = dev.queue_size;
     let vq_base = phys_to_virt::<u8>(dev.vq_phys);
 
-    // We use 3 descriptors per request.  Pick descriptors 0, 1, 2.
-    // Since we hold the mutex, only one request is in flight at a time,
-    // so we can always reuse the same descriptor indices.
+    // Per-slot descriptor head index: slot N → descriptors 3N, 3N+1, 3N+2.
+    let desc0_idx: u16 = (slot as u16) * 3;
+    let desc1_idx: u16 = desc0_idx + 1;
+    let desc2_idx: u16 = desc0_idx + 2;
     let desc_base = vq_base; // descriptor table at offset 0
     let avail_base = unsafe { vq_base.add(avail_ring_offset(qs)) };
-    let used_base = unsafe { vq_base.add(used_ring_offset(qs)) };
 
-    // ── Build Request Header (on the virtqueue page itself) ─────────
-
-    // We need the header in a physically contiguous location.  Use a small
-    // region right after the used ring for the header + status byte.
-    // The used ring ends at: used_ring_offset + 4 + qs*8.
-    // We place:
-    //   - req header (16 bytes) at used_ring_end
-    //   - status byte (1 byte) at used_ring_end + 16
-    let used_ring_end = used_ring_offset(qs) + 4 + (qs as usize) * 8;
-    let header_offset = (used_ring_end + 15) & !15; // align to 16
-    let status_offset = header_offset + 16;
+    // Per-slot scratch: header at `header_array_offset + slot*16`,
+    // status at `status_array_offset + slot`.
+    let header_offset = header_array_offset(qs) + slot * 16;
+    let status_offset = status_array_offset(qs) + slot;
 
     let header_virt = unsafe { vq_base.add(header_offset) } as *mut VirtioBlkReqHeader;
     let status_virt = unsafe { vq_base.add(status_offset) } as *mut u8;
@@ -658,13 +842,14 @@ fn submit_request(
     let header_phys = dev.vq_phys + header_offset as u64;
     let status_phys = dev.vq_phys + status_offset as u64;
 
-    // SAFETY: We exclusively own this memory region while holding the mutex.
-    // The header and status are within the allocated virtqueue pages.
+    // SAFETY: Slot allocation gives this submitter exclusive access to its
+    // header + status scratch, and the device mutex serialises descriptor
+    // writes for the lifetime of submit_request.
     unsafe {
         (*header_virt).type_ = req_type;
         (*header_virt).reserved = 0;
         (*header_virt).sector = sector;
-        *status_virt = 0xFF; // sentinel — device will overwrite with 0 on success
+        core::ptr::write_volatile(status_virt, 0xFFu8); // sentinel
     }
 
     // Convert data pointer to physical address.
@@ -679,30 +864,31 @@ fn submit_request(
     };
 
     // ── Fill Descriptor Table ───────────────────────────────────────
+    // Descriptor offsets are 16 bytes each, indexed by the slot's
+    // per-slot head/middle/tail indices computed above.
 
-    // Descriptor 0: request header (device reads).
+    // Descriptor 3*slot (head): request header (device reads).
+    let desc0 = unsafe { desc_base.add((desc0_idx as usize) * 16) };
     // SAFETY: Writing to the descriptor table within our allocated virtqueue memory.
     unsafe {
-        let d0 = desc_base as *mut u64;
-        // addr
+        let d0 = desc0 as *mut u64;
         d0.write_volatile(header_phys);
-        // len (u32) + flags (u16) + next (u16) packed into second u64
-        let d0_meta = desc_base.add(8) as *mut u32;
+        let d0_meta = desc0.add(8) as *mut u32;
         d0_meta.write_volatile(16); // len = 16 bytes
-        let d0_flags = desc_base.add(12) as *mut u16;
-        d0_flags.write_volatile(VRING_DESC_F_NEXT); // has next
-        let d0_next = desc_base.add(14) as *mut u16;
-        d0_next.write_volatile(1); // next = descriptor 1
+        let d0_flags = desc0.add(12) as *mut u16;
+        d0_flags.write_volatile(VRING_DESC_F_NEXT);
+        let d0_next = desc0.add(14) as *mut u16;
+        d0_next.write_volatile(desc1_idx);
     }
 
-    // Descriptor 1: data buffer.
-    let desc1 = unsafe { desc_base.add(16) };
+    // Descriptor 3*slot + 1: data buffer.
+    let desc1 = unsafe { desc_base.add((desc1_idx as usize) * 16) };
     let data_flags = if req_type == VIRTIO_BLK_T_IN {
         VRING_DESC_F_NEXT | VRING_DESC_F_WRITE // device writes to buffer (read request)
     } else {
         VRING_DESC_F_NEXT // device reads from buffer (write request)
     };
-    // SAFETY: Writing to descriptor 1 within our allocated virtqueue memory.
+    // SAFETY: Writing within our allocated virtqueue memory.
     unsafe {
         let d1_addr = desc1 as *mut u64;
         d1_addr.write_volatile(data_phys);
@@ -711,21 +897,39 @@ fn submit_request(
         let d1_flags = desc1.add(12) as *mut u16;
         d1_flags.write_volatile(data_flags);
         let d1_next = desc1.add(14) as *mut u16;
-        d1_next.write_volatile(2); // next = descriptor 2
+        d1_next.write_volatile(desc2_idx);
     }
 
-    // Descriptor 2: status byte (device writes).
-    let desc2 = unsafe { desc_base.add(32) };
-    // SAFETY: Writing to descriptor 2 within our allocated virtqueue memory.
+    // Descriptor 3*slot + 2: status byte (device writes).
+    let desc2 = unsafe { desc_base.add((desc2_idx as usize) * 16) };
+    // SAFETY: Writing within our allocated virtqueue memory.
     unsafe {
         let d2_addr = desc2 as *mut u64;
         d2_addr.write_volatile(status_phys);
         let d2_len = desc2.add(8) as *mut u32;
         d2_len.write_volatile(1);
         let d2_flags = desc2.add(12) as *mut u16;
-        d2_flags.write_volatile(VRING_DESC_F_WRITE); // device writes status
+        d2_flags.write_volatile(VRING_DESC_F_WRITE);
         let d2_next = desc2.add(14) as *mut u16;
-        d2_next.write_volatile(0); // no next
+        d2_next.write_volatile(0);
+    }
+
+    // ── Pre-arm completion state BEFORE doorbell ────────────────────
+    //
+    // Once the device sees the bumped avail.idx it can complete and IRQ
+    // at any time; the ISR must be able to find a valid waker TID and
+    // cleared done flag in this slot.  The slot was already initialised
+    // by `acquire_slot`, but we set `waiter_tid` here (the caller's TID)
+    // and ensure `done` is still false.  Done so before the doorbell
+    // even on the poll-fallback path so a concurrent IRQ entry never
+    // races with the slot's state.
+    let irq_path = IRQS_ARMED.load(Ordering::Acquire) && crate::sched::is_active();
+    COMPLETIONS[slot].done.store(false, Ordering::Release);
+    COMPLETIONS[slot].status.store(0xFF, Ordering::Relaxed);
+    if irq_path {
+        COMPLETIONS[slot]
+            .waiter_tid
+            .store(crate::proc::current_tid(), Ordering::Release);
     }
 
     // ── Submit to Available Ring ────────────────────────────────────
@@ -736,9 +940,9 @@ fn submit_request(
         let avail_idx_ptr = avail_base.add(2) as *mut u16;
         let idx = avail_idx_ptr.read_volatile();
 
-        // Write descriptor chain head (0) at ring[idx % qs].
+        // Write descriptor chain head at ring[idx % qs].
         let ring_entry = avail_base.add(4 + ((idx % qs) as usize) * 2) as *mut u16;
-        ring_entry.write_volatile(0); // head descriptor index
+        ring_entry.write_volatile(desc0_idx);
 
         // Memory barrier — ensure descriptor writes are visible before we
         // advance the index.
@@ -748,28 +952,10 @@ fn submit_request(
         avail_idx_ptr.write_volatile(idx.wrapping_add(1));
     }
 
-    // Pre-arm the IRQ-completion state BEFORE the doorbell write.  Once the
-    // device sees the new avail.idx it can complete and IRQ at any time;
-    // the ISR must be able to find a valid waker tid + cleared done flag.
-    let irq_path = IRQS_ARMED.load(Ordering::Acquire) && crate::sched::is_active();
-    if irq_path {
-        REQUEST_DONE.store(false, Ordering::Release);
-        REQUEST_STATUS.store(0xFF, Ordering::Relaxed);
-        WAITER_TID.store(crate::proc::current_tid(), Ordering::Release);
-        // Synchronise the ISR's last-seen index with what the device has
-        // already produced from the poll path.  Without this, the polled
-        // fallback inside `wait_completion` would see the prior poll-path
-        // completions (cur_used != last_seen=0) and falsely declare the
-        // current request done before the device has touched its status
-        // byte — which then reads back the 0xFF sentinel above.
-        IRQ_LAST_USED_IDX.store(dev.last_used_idx, Ordering::Release);
-    }
-
-    // Bump our local used-idx counter to match what the device will produce.
-    // On the IRQ path the ISR also bumps `IRQ_LAST_USED_IDX`; we use
-    // `dev.last_used_idx` only for the poll fallback's expected_used check.
+    // Track total submissions for diagnostic last_used_idx (still useful
+    // for spurious-IRQ accounting; no longer load-bearing for completion
+    // detection now that we read the per-slot status byte).
     dev.last_used_idx = dev.last_used_idx.wrapping_add(1);
-    let expected_used = dev.last_used_idx;
 
     // ── Notify Device ──────────────────────────────────────────────
 
@@ -779,38 +965,49 @@ fn submit_request(
     }
 
     if irq_path {
-        // Caller will drop the device mutex and call `wait_completion`.
-        return Ok(true);
+        // Caller will drop the device mutex and call `wait_completion(slot)`.
+        return Ok(SubmitOutcome::IrqWait { slot });
     }
 
     // ── Poll Fallback ──────────────────────────────────────────────
     //
-    // Only used during early boot before `arm_irq` has run (e.g. FAT32
-    // mount during VFS init at Phase 7, before the scheduler is active).
-    let used_idx_ptr = unsafe { used_base.add(2) as *const u16 };
-
+    // Used whenever the IRQ path is unavailable: during early boot
+    // before `arm_irq` (FAT32 mount at Phase 7), and between `arm_irq`
+    // and `sched::enable` (the FFTEST `prepopulate_file` path runs
+    // hundreds of disk reads here on the BSP idle thread).  We poll
+    // the slot's status byte directly: the device writes the real
+    // status (0 = OK, non-zero = err) before advancing used.idx, so
+    // any value other than the 0xFF sentinel means the request retired.
+    //
+    // We also keep `IRQ_LAST_USED_IDX` in step with the device's
+    // `used.idx` on every completion so the first post-poll IRQ-path
+    // request does not start from a stale cursor and find hundreds of
+    // phantom completed entries from this poll-fallback era.
     let mut timeout = 10_000_000u32;
+    let used_idx_ptr = unsafe {
+        (vq_base as *const u8).add(used_ring_offset(qs) + 2) as *const u16
+    };
     loop {
-        // SAFETY: Reading the used ring index from our virtqueue memory.
-        let current_used = unsafe { used_idx_ptr.read_volatile() };
-        if current_used == expected_used {
-            break;
+        // SAFETY: Reading the per-slot status byte from our virtqueue memory.
+        let s = unsafe { status_virt.read_volatile() };
+        if s != 0xFF {
+            // SAFETY: Reading the device's used.idx from owned VQ memory.
+            let cur_used = unsafe { used_idx_ptr.read_volatile() };
+            IRQ_LAST_USED_IDX.store(cur_used, Ordering::Release);
+            // Release the slot now since the caller won't enter wait_completion.
+            release_slot(slot);
+            if s != 0 {
+                crate::serial_println!("[VIRTIO-BLK] Request failed: status={}", s);
+                return Err(BlockError::IoError);
+            }
+            return Ok(SubmitOutcome::PollDone);
         }
-        timeout = timeout.checked_sub(1).ok_or(BlockError::IoError)?;
+        timeout = timeout.checked_sub(1).ok_or_else(|| {
+            release_slot(slot);
+            BlockError::IoError
+        })?;
         core::hint::spin_loop();
     }
-
-    // ── Check Status Byte ──────────────────────────────────────────
-
-    // SAFETY: The device has written the status byte; we read it back.
-    let status = unsafe { status_virt.read_volatile() };
-
-    if status != 0 {
-        crate::serial_println!("[VIRTIO-BLK] Request failed: status={}", status);
-        return Err(BlockError::IoError);
-    }
-
-    Ok(false)
 }
 
 /// Diagnostic: number of times we entered wait_completion (one per IRQ-path
@@ -818,7 +1015,7 @@ fn submit_request(
 /// is silent during early bring-up.
 static WAIT_ENTRIES: AtomicU64 = AtomicU64::new(0);
 
-/// Wait for the in-flight virtio-blk request to complete.
+/// Wait for the in-flight virtio-blk request on `slot` to complete.
 ///
 /// MUST be called with the [`VIRTIO_BLK`] mutex *not* held — the ISR runs
 /// lock-free (it reads device state from `IRQ_*` atomics), but holding
@@ -826,13 +1023,14 @@ static WAIT_ENTRIES: AtomicU64 = AtomicU64::new(0);
 /// that tries to issue disk I/O.
 ///
 /// Three-stage wait:
-///   1. Bounded micro-spin on `REQUEST_DONE` (most KVM completions land here
-///      because the ISR runs immediately).
-///   2. Polled used-ring read + scheduler yield: if the IRQ hasn't fired
-///      promptly, we walk the used ring ourselves and yield via
-///      `schedule()` to let other threads run.  This is the load-bearing
-///      path for hosts where the IO-APIC route doesn't actually deliver
-///      to vector 45 (UEFI quirk, shared-IRQ corner case, etc.).
+///   1. Bounded micro-spin on `COMPLETIONS[slot].done` (most KVM
+///      completions land here because the ISR runs immediately).
+///   2. Polled per-slot status-byte read + scheduler yield: if the IRQ
+///      hasn't fired promptly, we read the slot's status byte directly
+///      and yield via `schedule()` to let other threads run.  This is
+///      the load-bearing path for hosts where the IO-APIC route doesn't
+///      actually deliver to vector 45 (UEFI quirk, shared-IRQ corner
+///      case, etc.).
 ///   3. Hard deadline at 1s wall-clock — a wedged device fails-fast
 ///      rather than hanging the kernel.
 ///
@@ -841,76 +1039,66 @@ static WAIT_ENTRIES: AtomicU64 = AtomicU64::new(0);
 /// (no work to do) and we re-poll.  When other threads ARE Ready, the
 /// scheduler dispatches them while our request is in flight — which is
 /// the SMP-fairness win this driver is after.
-fn wait_completion() -> Result<(), BlockError> {
+///
+/// Always releases `slot` before returning (Ok or Err).
+fn wait_completion(slot: usize) -> Result<(), BlockError> {
+    debug_assert!(slot < MAX_INFLIGHT);
     let _ = WAIT_ENTRIES.fetch_add(1, Ordering::Relaxed);
 
     // Stage 1: cheap micro-spin.
     let mut spin_budget = 1024u32;
-    while spin_budget > 0 && !REQUEST_DONE.load(Ordering::Acquire) {
+    while spin_budget > 0 && !COMPLETIONS[slot].done.load(Ordering::Acquire) {
         core::hint::spin_loop();
         spin_budget -= 1;
     }
 
-    if !REQUEST_DONE.load(Ordering::Acquire) {
+    if !COMPLETIONS[slot].done.load(Ordering::Acquire) {
         let qs = IRQ_QUEUE_SIZE.load(Ordering::Acquire);
         let vq_virt = IRQ_VQ_VIRT.load(Ordering::Acquire);
-        let used_idx_off = if qs != 0 { used_ring_offset(qs) + 2 } else { 0 };
-        let status_off = if qs != 0 {
-            let used_ring_end = used_ring_offset(qs) + 4 + (qs as usize) * 8;
-            ((used_ring_end + 15) & !15) + 16
-        } else { 0 };
 
         let start_tick = crate::arch::x86_64::irq::get_ticks();
         let deadline = start_tick.saturating_add(100); // ~1s @ 100Hz
 
         loop {
-            if REQUEST_DONE.load(Ordering::Acquire) {
+            if COMPLETIONS[slot].done.load(Ordering::Acquire) {
                 break;
             }
 
-            // Walk the used ring ourselves.  The ISR may have already
-            // updated `IRQ_LAST_USED_IDX` and `REQUEST_DONE`, in which
-            // case the load above caught it; otherwise we look at the
-            // device's published `used.idx` directly.
+            // Walk the used ring ourselves.  The ISR may have missed
+            // entries (e.g. the IO-APIC route silently drops vector 45
+            // on some UEFI configurations), or the IRQ may not have
+            // fired yet.  We mirror the ISR's demultiplex logic so each
+            // newly-completed slot's `done` flag is set and the global
+            // cursor advances past every completed entry — keeping the
+            // ISR's view consistent with ours.
             if qs != 0 && vq_virt != 0 {
-                // SAFETY: vq_virt is the kernel virt of our owned virtqueue.
-                let cur_used = unsafe {
-                    let p = (vq_virt as *const u8).add(used_idx_off) as *const u16;
-                    p.read_volatile()
-                };
-                let last_seen = IRQ_LAST_USED_IDX.load(Ordering::Acquire);
-                if cur_used != last_seen {
-                    // SAFETY: status byte was written by the device.
-                    let status_byte = unsafe {
-                        let p = (vq_virt as *const u8).add(status_off);
-                        p.read_volatile()
-                    };
-                    IRQ_LAST_USED_IDX.store(cur_used, Ordering::Release);
-                    REQUEST_STATUS.store(status_byte, Ordering::Relaxed);
-                    REQUEST_DONE.store(true, Ordering::Release);
-                    POLLED_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-                    break;
-                }
+                drain_used_ring(qs, vq_virt);
+            }
+
+            if COMPLETIONS[slot].done.load(Ordering::Acquire) {
+                POLLED_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+                break;
             }
 
             if crate::arch::x86_64::irq::get_ticks() >= deadline {
-                crate::serial_println!("[VIRTIO-BLK] wait_completion timeout");
-                WAITER_TID.store(NO_WAITER, Ordering::Release);
+                crate::serial_println!(
+                    "[VIRTIO-BLK] wait_completion timeout (slot={})",
+                    slot
+                );
+                release_slot(slot);
                 return Err(BlockError::IoError);
             }
 
             // Yield to the scheduler.  If another thread is Ready on this
             // CPU, schedule() picks it; we resume on the next round.  If
             // not, schedule() is essentially a no-op and we go straight
-            // back to the polled used-ring check.  Either way, the
-            // scheduler runs and other CPUs are not blocked.
+            // back to the polled status check.
             crate::sched::schedule();
         }
     }
 
-    WAITER_TID.store(NO_WAITER, Ordering::Release);
-
-    let status = REQUEST_STATUS.load(Ordering::Relaxed);
+    let status = COMPLETIONS[slot].status.load(Ordering::Relaxed);
+    release_slot(slot);
     if status != 0 {
         crate::serial_println!("[VIRTIO-BLK] Request failed: status={}", status);
         return Err(BlockError::IoError);
@@ -991,25 +1179,69 @@ fn do_io(req_type: u32, lba: u64, count: u32, buf: *mut u8) -> Result<(), BlockE
         // SAFETY: caller has already validated `buf` covers `count` sectors.
         let data_ptr = unsafe { buf.add(offset) };
 
-        // ── Submit + doorbell (lock held) ──────────────────────────────
-        let needs_irq_wait = {
+        // ── Acquire a completion slot (lock-free spin) ─────────────────
+        //
+        // Slot acquisition is independent of the device mutex — it just
+        // claims an entry in COMPLETIONS[].  If every slot is busy
+        // (MAX_INFLIGHT concurrent requests, unlikely in practice), we
+        // yield and retry.  Sched availability is checked because early
+        // boot has no scheduler to yield to; in that window the slot is
+        // almost always free anyway (single-threaded mount path).
+        let slot = loop {
+            if let Some(s) = acquire_slot() {
+                break s;
+            }
+            if crate::sched::is_active() {
+                crate::sched::schedule();
+            } else {
+                core::hint::spin_loop();
+            }
+        };
+
+        // ── Submit + doorbell (lock held only across submission) ──────
+        let outcome = {
             let mut guard = VIRTIO_BLK.lock();
-            let dev = guard.as_mut().ok_or(BlockError::IoError)?;
+            let dev = match guard.as_mut() {
+                Some(d) => d,
+                None => {
+                    release_slot(slot);
+                    return Err(BlockError::IoError);
+                }
+            };
             if lba + count as u64 > dev.capacity {
+                drop(guard);
+                release_slot(slot);
                 return Err(BlockError::OutOfRange);
             }
-            submit_request(
+            match submit_request(
                 dev,
                 req_type,
                 lba + sector_idx as u64,
                 data_ptr,
                 batch_len,
-            )?
+                slot,
+            ) {
+                Ok(o) => o,
+                Err(e) => {
+                    // submit_request releases the slot on its poll-fallback
+                    // error path, but the IRQ-path error path here means
+                    // we never armed the slot — release it ourselves.
+                    drop(guard);
+                    release_slot(slot);
+                    return Err(e);
+                }
+            }
         };
 
         // ── Wait (lock dropped) ────────────────────────────────────────
-        if needs_irq_wait {
-            wait_completion()?;
+        match outcome {
+            SubmitOutcome::IrqWait { slot } => {
+                // wait_completion releases the slot in both Ok and Err.
+                wait_completion(slot)?;
+            }
+            SubmitOutcome::PollDone => {
+                // Slot already released inside submit_request.
+            }
         }
 
         sector_idx += batch;
