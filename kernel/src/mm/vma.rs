@@ -47,10 +47,33 @@ pub enum VmBacking {
     /// Anonymous memory (zero-filled on first access).
     Anonymous,
     /// File-backed mapping (inode + mount index + file offset).
+    ///
+    /// `elf_load_delta` encodes the difference between the ELF segment's
+    /// page-aligned virtual address (`p_vaddr & !0xfff`) and its page-aligned
+    /// file offset (`p_offset & !0xfff`), i.e.:
+    ///
+    ///   `elf_load_delta = (p_vaddr & !0xfff) - (p_offset & !0xfff)`
+    ///
+    /// This constant is zero for non-ELF mappings (anonymous mmap, heap, etc.)
+    /// and for ELF segments where `p_vaddr == p_offset` (rare but valid).
+    ///
+    /// Given a runtime virtual address `va` inside this VMA:
+    ///
+    ///   `offset_in_file = backing.offset + (va - vma.base)`
+    ///   `vaddr_in_elf   = offset_in_file + elf_load_delta`
+    ///
+    /// The `vaddr_in_elf` value is what addr2line and nm expect — it is the
+    /// link-time virtual address, independent of load-time ASLR bias.
+    ///
+    /// See ELF-64 Object File Format §3 (Program Loading) for the relationship
+    /// between `p_vaddr`, `p_offset`, and the runtime load address.
     File {
         mount_idx: usize,
         inode: u64,
+        /// Page-aligned file offset of the first byte mapped by this VMA.
         offset: u64,
+        /// `(p_vaddr_page - p_offset_page)` for ELF PT_LOAD segments; 0 otherwise.
+        elf_load_delta: u64,
     },
     /// Device memory (framebuffer, MMIO) — never swapped, identity-mapped.
     Device {
@@ -545,10 +568,12 @@ impl VmSpace {
                     name: vma.name,
                 };
                 let right_backing = match &vma.backing {
-                    VmBacking::File { mount_idx, inode, offset } => VmBacking::File {
+                    VmBacking::File { mount_idx, inode, offset, elf_load_delta } => VmBacking::File {
                         mount_idx: *mount_idx,
                         inode: *inode,
                         offset: offset + right_delta,
+                        // delta is a segment-level constant; unchanged by split
+                        elf_load_delta: *elf_load_delta,
                     },
                     other => other.clone(),
                 };
