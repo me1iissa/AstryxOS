@@ -3133,18 +3133,29 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
                 crate::mm::vmm::write_pte(cr3, page, 0);
                 any_unmap = true;
 
-                // Decrement the reference count.  Collect for deferred free
-                // only if the count reaches zero.
-                let rc = crate::mm::refcount::page_ref_count(phys);
-                if rc <= 1 {
-                    crate::mm::refcount::page_ref_set(phys, 0);
+                // Atomic decrement (W198 / W190-H_G fix).  Pre-fix code
+                // performed a non-atomic `page_ref_count` followed by
+                // `page_ref_set(phys, 0)`, which silently wiped any
+                // concurrent `page_ref_inc` from the readahead path or
+                // a sibling `clone_for_fork` — driving the new count to
+                // zero, freeing the frame, and creating an aliasing path
+                // for the sibling whose still-installed PTE pointed at
+                // the recycled frame.
+                //
+                // `page_ref_dec` returns the new count atomically
+                // (fetch_sub).  Collect for deferred free iff it reaches
+                // zero; otherwise the frame is still referenced (CoW
+                // sibling, page cache) and the dec already accounts for
+                // this PTE's released reference.
+                //
+                // Cite: Intel SDM Vol. 3A §4.10.5 (TLB consistency);
+                // POSIX madvise(2) MADV_DONTNEED — the kernel may free
+                // the pages but must do so without violating concurrent
+                // mapping invariants.
+                let new_rc = crate::mm::refcount::page_ref_dec(phys);
+                if new_rc == 0 {
                     to_free[n] = phys;
                     n += 1;
-                } else {
-                    // rc > 1: shared page (CoW or cache); release one
-                    // reference without freeing.  No shootdown needed here
-                    // because the PTE was cleared above and pass 2 covers it.
-                    let _ = crate::mm::refcount::page_ref_dec(phys);
                 }
             }
             page += crate::mm::pmm::PAGE_SIZE as u64;

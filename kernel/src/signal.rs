@@ -1007,6 +1007,17 @@ pub unsafe fn deliver_sigsegv_from_isr(
     );
     emit_signal_vma_banner(pid, user_rip, cr2, &vma_snapshot);
 
+    // ── [FAULT/PHYS] + [FAULT/RIP-CONTENT] — physical-frame identity ─────────
+    // Aliasing-detection diagnostic.  Two fault deliveries with the same
+    // (vma_offset, library) must resolve to the same physical frame backing
+    // the user RIP page; if they differ we have proven the executable page is
+    // aliased between processes.  See W196 / W190-H_A.
+    {
+        let cr3_now: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) cr3_now, options(nomem, nostack, preserves_flags));
+        emit_fault_phys_diagnostic(pid, user_rip, cr3_now, &vma_snapshot);
+    }
+
     true
 }
 
@@ -1234,6 +1245,156 @@ fn emit_signal_vma_banner(pid: u64, user_rip: u64, cr2: u64, snap: &[VmaSnap]) {
                 "[SIGNAL/VMA] pid={} name={} base={:#x} end={:#x} size={:#x} prot={}{}{} file={} rip={} cr2={}{}",
                 pid, v.name, v.base, v.end, v.end - v.base, r, w, x,
                 v.file_backed as u8, rip_flag, cr2_flag, anon_tag
+            );
+        }
+    }
+}
+
+/// Emit `[FAULT/PHYS]` + `[FAULT/RIP-CONTENT]` for fatal Ring-3 faults.
+///
+/// Convenience entry point for the `idt.rs` paths that kill the process
+/// without delivering a signal (no installed handler, or fatal #UD/#GP/#PF).
+/// Builds the VMA snapshot internally so callers do not need to plumb one
+/// through.  Acquires `PROCESS_TABLE` briefly to read the VmSpace; lock is
+/// released before the diagnostic prints.
+///
+/// `cr3` is the live CR3 read by the caller in ISR context (always equal
+/// to the faulting process's PML4 phys; we cannot derive it from the VmSpace
+/// here without re-acquiring locks already dropped).
+pub fn emit_fault_phys_for_fatal(pid: u64, user_rip: u64, cr2: u64, cr3: u64) {
+    // Snapshot under the PROCESS_TABLE lock, then release before printing.
+    let snap = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        let space = procs.iter().find(|p| p.pid == pid).and_then(|p| p.vm_space.as_ref());
+        signal_vma_snapshot(space, user_rip, cr2)
+    };
+    emit_fault_phys_diagnostic(pid, user_rip, cr3, &snap);
+}
+
+/// Emit `[FAULT/PHYS]` and `[FAULT/RIP-CONTENT]` diagnostic lines.
+///
+/// `[FAULT/PHYS]` exposes the physical frame backing the user RIP page so
+/// two trials with identical `vma_offset` can be cross-checked: a healthy
+/// page cache returns the same `rip_phys` for the same (mount, inode,
+/// page_offset); aliasing produces different `rip_phys` values.
+///
+/// Format:
+///   `[FAULT/PHYS] pid=<n> tid=<n> rip=<vaddr> rip_phys=<paddr|UNMAPPED> vma_offset=<off|NO_VMA>`
+///
+/// `[FAULT/RIP-CONTENT]` dumps the first 16 bytes at the user RIP so the
+/// executed instruction stream can be compared against the on-disk libxul.
+/// A mismatch confirms page aliasing or content corruption.
+///
+/// Format:
+///   `[FAULT/RIP-CONTENT] rip=<vaddr> bytes=<32 hex chars + spaces>`
+///   `[FAULT/RIP-CONTENT] rip=<vaddr> unmapped_or_fault`
+///
+/// Cite: Intel SDM Vol. 3A §4.10 (TLB / paging-structure caches), §4.5
+/// (4-Level Paging).
+///
+/// Lock-safe: callable from ISR context (no PROCESS_TABLE / MOUNTS).
+/// Uses `virt_to_phys_in` directly off `cr3`, mirroring the existing
+/// `[UD/RIP-BYTES]` pattern in `arch/x86_64/idt.rs`.
+pub(crate) fn emit_fault_phys_diagnostic(
+    pid: u64,
+    user_rip: u64,
+    cr3: u64,
+    vma_snapshot: &[VmaSnap],
+) {
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    const KERNEL_BASE: u64 = 0x0000_8000_0000_0000;
+    let tid = crate::proc::current_tid();
+
+    // ── [FAULT/PHYS] ────────────────────────────────────────────────────────
+    let rip_page = user_rip & !0xFFFu64;
+    let rip_phys = if user_rip < KERNEL_BASE {
+        crate::mm::vmm::virt_to_phys_in(cr3, rip_page)
+    } else {
+        None
+    };
+
+    // Find the VMA containing user_rip in the snapshot to report
+    // vma_offset (the in-VMA byte offset of the faulting instruction).
+    // Cross-trial equality of vma_offset is the prerequisite for the
+    // rip_phys mismatch test to be conclusive.
+    let mut vma_off: Option<u64> = None;
+    for v in vma_snapshot.iter() {
+        if v.contains_rip {
+            vma_off = Some(user_rip - v.base);
+            break;
+        }
+    }
+
+    match (rip_phys, vma_off) {
+        (Some(p), Some(off)) => {
+            crate::serial_println!(
+                "[FAULT/PHYS] pid={} tid={} rip={:#x} rip_phys={:#x} vma_offset={:#x}",
+                pid, tid, user_rip, p, off,
+            );
+        }
+        (Some(p), None) => {
+            crate::serial_println!(
+                "[FAULT/PHYS] pid={} tid={} rip={:#x} rip_phys={:#x} vma_offset=NO_VMA",
+                pid, tid, user_rip, p,
+            );
+        }
+        (None, Some(off)) => {
+            crate::serial_println!(
+                "[FAULT/PHYS] pid={} tid={} rip={:#x} rip_phys=UNMAPPED vma_offset={:#x}",
+                pid, tid, user_rip, off,
+            );
+        }
+        (None, None) => {
+            crate::serial_println!(
+                "[FAULT/PHYS] pid={} tid={} rip={:#x} rip_phys=UNMAPPED vma_offset=NO_VMA",
+                pid, tid, user_rip,
+            );
+        }
+    }
+
+    // ── [FAULT/RIP-CONTENT] ─────────────────────────────────────────────────
+    // 16 bytes at the user RIP, mirroring the [UD/RIP-BYTES] format.  A
+    // healthy libxul .text page must show the same opcode bytes across
+    // trials at the same vma_offset; a mismatch is direct evidence the
+    // physical page contents differ from what the ELF says (aliasing or
+    // post-load corruption).
+    if user_rip < KERNEL_BASE {
+        const N: usize = 16;
+        let mut buf = [0u8; N];
+        let mut got = 0usize;
+        for i in 0..N {
+            let va = user_rip.wrapping_add(i as u64);
+            if va >= KERNEL_BASE { break; }
+            match crate::mm::vmm::virt_to_phys_in(cr3, va) {
+                Some(phys) => {
+                    buf[i] = unsafe {
+                        core::ptr::read_volatile((PHYS_OFF + phys) as *const u8)
+                    };
+                    got += 1;
+                }
+                None => break,
+            }
+        }
+        if got > 0 {
+            const HEX: &[u8] = b"0123456789abcdef";
+            let mut hex = [0u8; N * 3];
+            for i in 0..got {
+                hex[i * 3]     = HEX[(buf[i] >> 4) as usize];
+                hex[i * 3 + 1] = HEX[(buf[i] & 0xF) as usize];
+                hex[i * 3 + 2] = b' ';
+            }
+            // SAFETY: HEX bytes are ASCII; trailing space exists for got >= 1.
+            let hex_str = unsafe {
+                core::str::from_utf8_unchecked(&hex[..got * 3 - 1])
+            };
+            crate::serial_println!(
+                "[FAULT/RIP-CONTENT] rip={:#x} bytes={}",
+                user_rip, hex_str,
+            );
+        } else {
+            crate::serial_println!(
+                "[FAULT/RIP-CONTENT] rip={:#x} unmapped_or_fault",
+                user_rip,
             );
         }
     }
