@@ -532,8 +532,7 @@ pub fn unmap_page_in(pml4_phys: u64, virt_addr: u64) {
 
 /// Unmap every present page in `[base, base+length)` from an arbitrary page
 /// table, drop one reference on the underlying physical frame, and free the
-/// frame when the last reference goes away.  Each cleared PTE is followed by
-/// `invlpg` on the calling CPU.
+/// frame when the last reference goes away.
 ///
 /// This helper exists so the upper-level mmap / munmap paths can run the
 /// expensive bulk-unmap loop **without holding `PROCESS_TABLE`**.  It only
@@ -543,40 +542,78 @@ pub fn unmap_page_in(pml4_phys: u64, virt_addr: u64) {
 /// `base` and `length` are caller-validated to be page-aligned and bounded
 /// to a user-process VMA range.
 ///
+/// ## SMP ordering invariant (Intel SDM Vol. 3A §4.10.5)
+///
+/// Paging-structure changes must be propagated to all processors before the
+/// physical frames are returned to the allocator.  The required sequence is:
+///
+/// 1. Clear the PTE(s) on the modifying processor.
+/// 2. **Synchronously shootdown TLB entries on every sibling CPU** — via IPI,
+///    waiting for acknowledgement from each target before continuing.
+/// 3. Only then return physical frames to the PMM.
+///
+/// Freeing a frame before step 2 completes creates a window where a sibling
+/// user-mode thread — sharing the same CR3 — still holds a stale TLB entry
+/// mapping a user VA to the recycled frame.  If the kernel allocates that
+/// frame in the meantime (e.g. for a heap Vec, a cache chunk, or a page-table
+/// level), the sibling thread can read kernel data through the stale mapping.
+/// This is NOT prevented by any critical-section discipline: user-mode threads
+/// on other CPUs run concurrently with the syscall handler on this CPU.
+///
+/// The implementation below uses a fixed-size batch buffer to avoid allocator
+/// dependence in this low-level path.  For ranges larger than `BATCH` pages,
+/// it performs multiple shootdown-then-free rounds, each covering at most
+/// `BATCH` pages, so the IPI overhead is bounded.
+///
 /// Returns the number of frames actually freed (rc reached zero).  Pages
 /// that were never demand-paged are skipped.
 pub fn unmap_and_free_range_in(pml4_phys: u64, base: u64, length: u64) -> usize {
+    // Maximum physical addresses to defer per shootdown round.  1024 pages =
+    // 4 MiB.  Keeping the batch finite bounds stack-pressure (this runs on
+    // the kernel stack, not a heap-allocated buffer).
+    const BATCH: usize = 1024;
+
     let mut freed = 0usize;
     let mut pg = base;
     let end = base.saturating_add(length);
-    let mut first_unmapped: Option<u64> = None;
-    let mut last_unmapped: u64 = 0;
+
     while pg < end {
-        if let Some(phys) = virt_to_phys_in(pml4_phys, pg) {
-            unmap_page_in(pml4_phys, pg);
-            // Defer the per-page TLB invalidation to a single coalesced
-            // shootdown after the loop so we send at most one IPI per
-            // unmap call instead of one per page.  The local CPU's TLB
-            // still contains stale entries until that point but the
-            // kernel is single-threaded inside this critical section
-            // (no syscall can touch the same VA range until we return)
-            // so no other AstryxOS code observes the stale translation.
-            // The deferred shootdown also covers other CPUs.
-            if first_unmapped.is_none() {
-                first_unmapped = Some(pg);
+        // --- Pass 1: clear PTEs and collect physical addresses to free. ---
+        // Do NOT free frames yet: TLB entries on sibling CPUs still point at
+        // them and must be invalidated first (see invariant above).
+        let batch_start = pg;
+        let mut to_free = [0u64; BATCH];
+        let mut n = 0usize;
+
+        while pg < end && n < BATCH {
+            if let Some(phys) = virt_to_phys_in(pml4_phys, pg) {
+                unmap_page_in(pml4_phys, pg);
+                let new_rc = crate::mm::refcount::page_ref_dec(phys);
+                if new_rc == 0 {
+                    to_free[n] = phys;
+                    n += 1;
+                }
             }
-            last_unmapped = pg + 0x1000;
-            let new_rc = crate::mm::refcount::page_ref_dec(phys);
-            if new_rc == 0 {
-                pmm::free_page(phys);
+            pg += 0x1000;
+        }
+        let batch_end = pg; // exclusive upper bound for this batch
+
+        if batch_end > batch_start {
+            // --- Pass 2: synchronous TLB shootdown across all CPUs. ---
+            // shootdown_range spins until every target CPU has acknowledged
+            // the IPI and executed invlpg (or a CR3 reload).  On return,
+            // no CPU holds a cached translation for [batch_start, batch_end).
+            crate::mm::tlb::shootdown_range(pml4_phys, batch_start, batch_end);
+
+            // --- Pass 3: return frames to the PMM. ---
+            // Safe now: every stale TLB entry has been evicted by pass 2.
+            for i in 0..n {
+                pmm::free_page(to_free[i]);
                 freed += 1;
             }
         }
-        pg += 0x1000;
     }
-    if let Some(lo) = first_unmapped {
-        crate::mm::tlb::shootdown_range(pml4_phys, lo, last_unmapped);
-    }
+
     freed
 }
 

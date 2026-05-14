@@ -3089,32 +3089,78 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
     };
     let cr3 = match cr3_opt { Some(c) => c, None => return 0 };
 
+    // SMP ordering invariant (Intel SDM Vol. 3A §4.10.5): PTEs must be cleared
+    // and a synchronous TLB shootdown must complete on all CPUs BEFORE physical
+    // frames are returned to the PMM.  Freeing a frame before the shootdown
+    // creates a window where a sibling user-mode thread's stale TLB entry still
+    // maps the freed frame; if the kernel allocates that frame in the meantime,
+    // the sibling thread reads kernel data through the stale mapping.
+    //
+    // Three-pass approach:
+    //   Pass 1 — zero and clear PTEs, collect physical addresses to free.
+    //   Pass 2 — synchronous shootdown (IPI + ack) across all CPUs.
+    //   Pass 3 — return frames to the PMM (safe after pass 2 completes).
+    //
+    // The batch buffer uses the same BATCH constant as unmap_and_free_range_in.
+    // For MADV_DONTNEED the typical range is a handful of pages (stack trim,
+    // arena shrink), so a single pass of 1024 is more than sufficient.
     const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    const BATCH: usize = 1024;
+
     let mut page = start;
-    let mut had_unmap = false;
+    let mut any_unmap = false;
+
     while page < end {
-        let pte = crate::mm::vmm::read_pte(cr3, page);
-        if pte & 1 != 0 {
-            // Present — free the physical page.
-            let phys = pte & 0x000F_FFFF_FFFF_F000;
-            // Zero-out and unmap; next access demand-pages a fresh zeroed page.
-            unsafe {
-                core::ptr::write_bytes((PHYS_OFF + phys) as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
+        // --- Pass 1: zero backing storage, clear PTEs, collect to_free. ---
+        let batch_start = page;
+        let mut to_free = [0u64; BATCH];
+        let mut n = 0usize;
+
+        while page < end && n < BATCH {
+            let pte = crate::mm::vmm::read_pte(cr3, page);
+            if pte & 1 != 0 {
+                let phys = pte & 0x000F_FFFF_FFFF_F000;
+                // Zero the backing storage now (while we still own the frame)
+                // so the next demand-fault sees a fresh zeroed page.
+                unsafe {
+                    core::ptr::write_bytes(
+                        (PHYS_OFF + phys) as *mut u8,
+                        0,
+                        crate::mm::pmm::PAGE_SIZE,
+                    );
+                }
+                // Clear the PTE.  Do NOT free the frame yet.
+                crate::mm::vmm::write_pte(cr3, page, 0);
+                any_unmap = true;
+
+                // Decrement the reference count.  Collect for deferred free
+                // only if the count reaches zero.
+                let rc = crate::mm::refcount::page_ref_count(phys);
+                if rc <= 1 {
+                    crate::mm::refcount::page_ref_set(phys, 0);
+                    to_free[n] = phys;
+                    n += 1;
+                } else {
+                    // rc > 1: shared page (CoW or cache); release one
+                    // reference without freeing.  No shootdown needed here
+                    // because the PTE was cleared above and pass 2 covers it.
+                    let _ = crate::mm::refcount::page_ref_dec(phys);
+                }
             }
-            crate::mm::vmm::write_pte(cr3, page, 0);
-            had_unmap = true;
-            let rc = crate::mm::refcount::page_ref_count(phys);
-            if rc <= 1 {
-                crate::mm::refcount::page_ref_set(phys, 0);
-                crate::mm::pmm::free_page(phys);
-            } else {
-                crate::mm::refcount::page_ref_dec(phys);
+            page += crate::mm::pmm::PAGE_SIZE as u64;
+        }
+        let batch_end = page;
+
+        if any_unmap && batch_end > batch_start {
+            // --- Pass 2: synchronous shootdown. ---
+            // On return every CPU has evicted TLB entries for [batch_start, batch_end).
+            crate::mm::tlb::shootdown_range(cr3, batch_start, batch_end);
+
+            // --- Pass 3: free frames now that no stale TLB entries remain. ---
+            for i in 0..n {
+                crate::mm::pmm::free_page(to_free[i]);
             }
         }
-        page += crate::mm::pmm::PAGE_SIZE as u64;
-    }
-    if had_unmap {
-        crate::mm::tlb::shootdown_range(cr3, start, end);
     }
     0
 }

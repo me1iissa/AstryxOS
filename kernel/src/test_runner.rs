@@ -15454,7 +15454,8 @@ fn test_madvise_dontneed() -> bool {
             crate::mm::refcount::page_ref_set(phys, 0);
             crate::mm::pmm::free_page(phys);
         } else {
-            crate::mm::refcount::page_ref_dec(phys);
+            // rc > 1: shared; dec without freeing.
+            let _ = crate::mm::refcount::page_ref_dec(phys);
         }
     }
 
