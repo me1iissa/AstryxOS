@@ -905,6 +905,17 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         // See https://firefox-source-docs.mozilla.org/xpcom/logging.html
         "MOZ_LOG=all:5,nsresult:5,xpcom:5",
         "NSPR_LOG_MODULES=all:5",
+        // Redirect MOZ_LOG output to a file so it survives past any pipe
+        // read-deadline.  Extractable post-run via QGA guest-file-read.
+        // See https://firefox-source-docs.mozilla.org/xpcom/logging.html
+        "MOZ_LOG_FILE=/tmp/mozlog",
+        // Ask ld-linux to narrate every library load, symbol lookup, and
+        // binding it performs.  LD_DEBUG_OUTPUT directs the output to
+        // /tmp/lddbg.<pid> (glibc rtld appends the PID automatically) so
+        // it survives past process exit and can be extracted via QGA.
+        // Defined by glibc's dynamic linker; see ld.so(8) §LD_DEBUG.
+        "LD_DEBUG=files,symbols,bindings",
+        "LD_DEBUG_OUTPUT=/tmp/lddbg",
     ];
 
     // Spawn blocked so we can attach the pipe before the child can run.
