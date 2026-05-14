@@ -225,6 +225,38 @@ pub fn prepopulate_file(path: &str) -> usize {
     cached
 }
 
+/// Conditionally evict a cache entry, but only if the stored physical address
+/// matches `expected_phys`.
+///
+/// This is used by the demand-paging path to reclaim a redundant frame when a
+/// concurrent `cache::insert` on the same (mount, inode, offset) key has
+/// already replaced the entry with a different physical address.  A plain
+/// `evict` would incorrectly discard the winner's entry and leak a reference.
+///
+/// Returns `true` if the entry was found, matched, and removed.
+pub fn evict_if_phys(
+    mount_idx: usize,
+    inode: u64,
+    page_offset: u64,
+    expected_phys: u64,
+) -> bool {
+    let key = (mount_idx, inode, page_offset);
+    let mut cache = PAGE_CACHE.lock();
+    // Peek before removing so we don't evict a different winner's entry.
+    let matches = cache
+        .get(&key)
+        .map(|e| e.phys == expected_phys)
+        .unwrap_or(false);
+    if matches {
+        cache.remove(&key);
+        // Release the cache's reference to the evicted frame.
+        let _ = crate::mm::refcount::page_ref_dec(expected_phys);
+        true
+    } else {
+        false
+    }
+}
+
 /// Return cache statistics: (total_entries, dirty_entries).
 pub fn stats() -> (usize, usize) {
     let cache = PAGE_CACHE.lock();
