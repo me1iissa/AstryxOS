@@ -1265,8 +1265,54 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
             let mapped_faulting = n_pages > 0;
             for i in 0..n_pages {
                 let (vaddr, phys, foff) = pages_to_map[i];
+
+                // ---- Bug-B fix: guard reference ----------------------------
+                // Acquire a guard reference on `phys` BEFORE inserting it into
+                // the page cache.  Without this, the following race is possible
+                // on SMP systems:
+                //
+                //  CPU-A: cache::insert(foff, phys_A)  → cache ref = 1
+                //  CPU-B: cache::insert(foff, phys_B)  → evicts phys_A
+                //                                        cache ref(phys_A) → 0
+                //                                        PMM frees phys_A
+                //  CPU-A: page_ref_inc(phys_A)         → refcount resurrected
+                //  CPU-A: map_page_in(vaddr, phys_A)   → PTE → kernel frame
+                //
+                // Holding a guard ref keeps phys alive even if the cache
+                // evicts our entry before we finish installing the PTE.
+                // The guard ref is released after the PTE install is complete
+                // (or after we decide to discard the frame), restoring the
+                // steady-state of cache-ref(1) + PTE-ref(1) = 2 for aliased
+                // pages, or cache-ref(1) for private-copy paths.
+                crate::mm::refcount::page_ref_inc(phys);
+
                 // Always insert the clean page into the shared cache.
                 crate::mm::cache::insert(mount_idx, inode, foff, phys);
+
+                // If another CPU already installed a PTE for this address,
+                // discard our redundant frame: remove our cache entry (only if
+                // it still names our phys — a concurrent insert may have
+                // already replaced it with a different frame) and drop the
+                // guard ref.  With the guard still held, phys cannot have been
+                // handed to the PMM yet, so the dec-to-zero here is safe.
+                let existing_pte = crate::mm::vmm::read_pte(cr3, vaddr);
+                if existing_pte & crate::mm::vmm::PAGE_PRESENT != 0 {
+                    // Another CPU won the race for this vaddr.  Our frame is
+                    // redundant.  Conditionally evict from cache (only if our
+                    // phys is still the cached value) then release the guard.
+                    crate::mm::cache::evict_if_phys(mount_idx, inode, foff, phys);
+                    // Guard ref + the ref we'd have used for the PTE both drop;
+                    // cache::evict_if_phys already released the cache ref if it
+                    // matched, so we only need to release the guard ref here.
+                    // page_ref_dec returns the new count; if zero, the frame has
+                    // no remaining holders and must be returned to the PMM.
+                    if crate::mm::refcount::page_ref_dec(phys) == 0 {
+                        crate::mm::pmm::free_page(phys);
+                    }
+                    crate::mm::vmm::invlpg(vaddr);
+                    continue;
+                }
+
                 // MAP_PRIVATE + writable: give this process a private copy so
                 // writes (GOT relocations, BSS init, etc.) don't corrupt the
                 // cache page (which a parallel loader of the same .so still
@@ -1287,16 +1333,24 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         }
                         crate::mm::refcount::page_ref_set(private_phys, 1);
                         crate::mm::vmm::map_page_in(cr3, vaddr, private_phys, page_flags);
+                        // Cache keeps its ref to phys (the clean shared copy).
+                        // Drop guard ref — steady state: cache ref(phys) = 1.
+                        let _ = crate::mm::refcount::page_ref_dec(phys);
                     } else {
-                        // OOM fallback: share the cache page (may cause reloc corruption)
+                        // OOM fallback: share the cache page (may cause reloc
+                        // corruption on MAP_PRIVATE writes — documented limit).
                         crate::mm::refcount::page_ref_inc(phys);
                         crate::mm::vmm::map_page_in(cr3, vaddr, phys, page_flags);
+                        // Drop guard ref — steady state: cache(1) + PTE(1) = 2.
+                        let _ = crate::mm::refcount::page_ref_dec(phys);
                     }
                 } else {
                     // MAP_SHARED writable, or any read-only mapping: alias
                     // the cache page directly.
                     crate::mm::refcount::page_ref_inc(phys);
                     crate::mm::vmm::map_page_in(cr3, vaddr, phys, page_flags);
+                    // Drop guard ref — steady state: cache(1) + PTE(1) = 2.
+                    let _ = crate::mm::refcount::page_ref_dec(phys);
                 }
                 crate::mm::vmm::invlpg(vaddr);
             }
@@ -1385,6 +1439,14 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     crate::mm::pmm::free_page(phys);
                     return false;
                 }
+                // Bug-B fix (single-page fallback): hold a guard reference
+                // before inserting into the cache, mirroring the readahead-
+                // path fix above.  Without the guard, a concurrent cache::insert
+                // for the same (mount,inode,offset) can evict our entry and
+                // drop phys's refcount to zero — handing the frame to the PMM
+                // for reuse — in the window between cache::insert returning and
+                // page_ref_inc(phys) installing the PTE reference.
+                crate::mm::refcount::page_ref_inc(phys);
                 crate::mm::cache::insert(mount_idx, inode, file_page_offset, phys);
                 // Single-page fallback always aliases the cache frame
                 // regardless of MAP_SHARED / MAP_PRIVATE.  This is correct
@@ -1394,9 +1456,11 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 // alloc_page() returns None (the comment at line ~983
                 // documents the consequence).  Pre-fix behaviour, left
                 // unchanged.
-                crate::mm::refcount::page_ref_inc(phys);
+                crate::mm::refcount::page_ref_inc(phys); // PTE reference
                 crate::mm::vmm::map_page_in(cr3, page_addr, phys, page_flags);
                 crate::mm::vmm::invlpg(page_addr);
+                // Release guard — steady state: cache(1) + PTE(1) = 2.
+                let _ = crate::mm::refcount::page_ref_dec(phys);
                 return true;
             }
             return false; // OOM
