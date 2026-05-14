@@ -556,53 +556,199 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
             r13, r14, r15);
         crate::serial_println!("  Killing user process (exception in Ring 3)");
 
-        // For Ring-3 #UD (vector 6) emit a VMA-range line so the faulting
-        // instruction can be symbolicated against the shared-library load
-        // base (which varies with ASLR).  This mirrors the [SIGNAL/VMA]
-        // banner emitted on SIGSEGV but is scoped to just the VMA that
-        // covers RIP — #UD carries no secondary fault address.
+        // For Ring-3 #UD (vector 6) emit three diagnostic lines:
         //
-        // Lock ordering: PROCESS_TABLE is not held by any path that delivers
-        // a #UD from Ring 3; the snapshot is taken and released before
-        // invalidate_syscall_frame / exit_group.
+        //   [UD/VMA]       — VMA range + ELF virtual address for addr2line
+        //   [UD/RIP-BYTES] — 16 bytes at RIP (distinguishes ud2/vtable/garbage)
+        //   [UD/RDI-BYTES] — 64 bytes at RDI (C++ `this` pointer; vtable at [0])
+        //
+        // Together the three lines let an investigator run addr2line directly on
+        // `vaddr_in_elf` without offline arithmetic, identify whether the fault
+        // is a `ud2` (0f 0b) macro, a vtable dispatch (48 8b 07 ff 60 XX), or a
+        // mid-instruction jump to garbage, and inspect the object header for
+        // heap-corruption signatures (0xe2e2..., 0xdeadbeef, NUL pad, etc.).
+        //
+        // Lock ordering: PROCESS_TABLE is not held on any path that delivers a
+        // Ring-3 #UD; the snapshot and byte reads are done before the lock is
+        // dropped and before invalidate_syscall_frame / exit_group.
+        //
+        // RIP/RDI reads use virt_to_phys_in + PHYS_OFF — the same safe-user-read
+        // pattern used elsewhere in this file.  A non-canonical or unmapped
+        // address emits `unmapped_or_fault` rather than panicking.
         if vector == 6 {
+            // Read current CR3 for user page-table walks.
+            let ud_cr3: u64;
+            unsafe { core::arch::asm!("mov {}, cr3", out(reg) ud_cr3, options(nomem, nostack)); }
+
             let rip = frame.rip;
             let pid = crate::proc::current_pid_lockless();
+            let tid = crate::proc::current_tid();
             let procs = crate::proc::PROCESS_TABLE.lock();
             if let Some(proc_entry) = procs.iter().find(|p| p.pid == pid) {
                 if let Some(vm_space) = proc_entry.vm_space.as_ref() {
                     if let Some(vma) = vm_space.find_vma(rip) {
                         use crate::mm::vma::VmBacking;
-                        let (file_name, file_offset) = match &vma.backing {
-                            VmBacking::File { offset, .. } => (vma.name, *offset),
-                            _ => ("<anon>", 0u64),
+                        let (file_name, file_offset, elf_load_delta) = match &vma.backing {
+                            VmBacking::File { offset, elf_load_delta, .. } => {
+                                (vma.name, *offset, *elf_load_delta)
+                            }
+                            _ => ("<anon>", 0u64, 0u64),
                         };
                         let offset_in_vma  = rip - vma.base;
                         let offset_in_file = file_offset + offset_in_vma;
-                        crate::serial_println!(
-                            "[UD/VMA] pid={} tid={} rip={:#x} vma_base={:#x} vma_end={:#x} \
-                             file={} offset_in_file={:#x} offset_in_vma={:#x}",
-                            pid,
-                            crate::proc::current_tid(),
-                            rip,
-                            vma.base,
-                            vma.end(),
-                            file_name,
-                            offset_in_file,
-                            offset_in_vma,
-                        );
+                        // vaddr_in_elf: the link-time ELF virtual address, i.e. the
+                        // value addr2line expects.  Defined by ELF-64 §3 (Program
+                        // Loading): for each PT_LOAD segment, runtime_va - bias =
+                        // p_vaddr, and file_offset = p_offset + (runtime_va - bias -
+                        // p_vaddr + p_offset_page).  The delta encodes
+                        // (p_vaddr_page - p_offset_page) which is constant for the
+                        // segment.
+                        if elf_load_delta != 0 {
+                            let vaddr_in_elf = offset_in_file.wrapping_add(elf_load_delta);
+                            crate::serial_println!(
+                                "[UD/VMA] pid={} tid={} rip={:#x} vma_base={:#x} vma_end={:#x} \
+                                 file={} offset_in_file={:#x} offset_in_vma={:#x} vaddr_in_elf={:#x}",
+                                pid, tid, rip, vma.base, vma.end(),
+                                file_name, offset_in_file, offset_in_vma, vaddr_in_elf,
+                            );
+                        } else {
+                            crate::serial_println!(
+                                "[UD/VMA] pid={} tid={} rip={:#x} vma_base={:#x} vma_end={:#x} \
+                                 file={} offset_in_file={:#x} offset_in_vma={:#x}",
+                                pid, tid, rip, vma.base, vma.end(),
+                                file_name, offset_in_file, offset_in_vma,
+                            );
+                        }
                     } else {
                         crate::serial_println!(
                             "[UD/VMA] pid={} tid={} rip={:#x} no_vma_match=1",
-                            pid,
-                            crate::proc::current_tid(),
+                            pid, tid, rip,
+                        );
+                    }
+                }
+            }
+            // Drop PROCESS_TABLE — all subsequent work uses ud_cr3 directly.
+            drop(procs);
+
+            // ── [UD/RIP-BYTES]: 16 bytes at RIP ────────────────────────────────
+            // Allows instant classification:
+            //   0f 0b      → ud2 (MOZ_CRASH / MOZ_RELEASE_ASSERT macro)
+            //   48 8b 07 ff 60 XX → vtable slot XX/8 indirect call (C++ vtable dispatch)
+            //   other      → mid-instruction jump-to-garbage / stack smash / etc.
+            //
+            // Intel SDM Vol 2B §4.3: UD2 encoding is 0F 0B.
+            {
+                const N: usize = 16;
+                const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+                const KERNEL_BASE: u64 = 0x0000_8000_0000_0000;
+
+                if rip < KERNEL_BASE {
+                    let mut buf = [0u8; N];
+                    let mut got = 0usize;
+                    for i in 0..N {
+                        let va = rip.wrapping_add(i as u64);
+                        if va >= KERNEL_BASE { break; }
+                        match crate::mm::vmm::virt_to_phys_in(ud_cr3, va) {
+                            Some(phys) => {
+                                buf[i] = unsafe {
+                                    core::ptr::read_volatile((PHYS_OFF + phys) as *const u8)
+                                };
+                                got += 1;
+                            }
+                            None => break,
+                        }
+                    }
+                    if got > 0 {
+                        // Format as space-separated hex pairs (e.g. "0f 0b 66 2e").
+                        let mut hex = [0u8; N * 3];
+                        const HEX: &[u8] = b"0123456789abcdef";
+                        for i in 0..got {
+                            hex[i * 3]     = HEX[(buf[i] >> 4) as usize];
+                            hex[i * 3 + 1] = HEX[(buf[i] & 0xF) as usize];
+                            hex[i * 3 + 2] = b' ';
+                        }
+                        // SAFETY: hex contains only ASCII bytes from HEX + spaces.
+                        let hex_str = unsafe {
+                            core::str::from_utf8_unchecked(&hex[..got * 3 - 1])
+                        };
+                        crate::serial_println!(
+                            "[UD/RIP-BYTES] rip={:#x} bytes={}",
+                            rip, hex_str,
+                        );
+                    } else {
+                        crate::serial_println!(
+                            "[UD/RIP-BYTES] rip={:#x} unmapped_or_fault",
                             rip,
                         );
                     }
                 }
             }
-            // Drop PROCESS_TABLE before exit_group — exit_group acquires it.
-            drop(procs);
+
+            // ── [UD/RDI-BYTES]: 64 bytes at RDI ────────────────────────────────
+            // x86_64 System V ABI §3.2.3: the first integer/pointer argument
+            // (and the C++ implicit `this` pointer for member functions) is
+            // passed in %rdi.  The vtable pointer of a polymorphic C++ object
+            // lives at offset 0 of `this`, so the first 8 bytes give the vtable
+            // address.  The remaining bytes expose object fields that may show
+            // heap-corruption patterns (0xe2e2…, 0xdeadbeef, ASCII slop).
+            {
+                const N: usize = 64;
+                const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+                const KERNEL_BASE: u64 = 0x0000_8000_0000_0000;
+
+                if rdi < KERNEL_BASE && rdi != 0 {
+                    let mut buf = [0u8; N];
+                    let mut got = 0usize;
+                    for i in 0..N {
+                        let va = rdi.wrapping_add(i as u64);
+                        if va >= KERNEL_BASE { break; }
+                        match crate::mm::vmm::virt_to_phys_in(ud_cr3, va) {
+                            Some(phys) => {
+                                buf[i] = unsafe {
+                                    core::ptr::read_volatile((PHYS_OFF + phys) as *const u8)
+                                };
+                                got += 1;
+                            }
+                            None => break,
+                        }
+                    }
+                    if got > 0 {
+                        // Emit as four lines of 16 hex pairs each for readability.
+                        const HEX: &[u8] = b"0123456789abcdef";
+                        let rows = (got + 15) / 16;
+                        for row in 0..rows {
+                            let start = row * 16;
+                            let end   = (start + 16).min(got);
+                            let mut hex = [0u8; 16 * 3];
+                            let row_len = end - start;
+                            for i in 0..row_len {
+                                hex[i * 3]     = HEX[(buf[start + i] >> 4) as usize];
+                                hex[i * 3 + 1] = HEX[(buf[start + i] & 0xF) as usize];
+                                hex[i * 3 + 2] = b' ';
+                            }
+                            let hex_str = unsafe {
+                                core::str::from_utf8_unchecked(&hex[..row_len * 3 - 1])
+                            };
+                            crate::serial_println!(
+                                "[UD/RDI-BYTES] rdi={:#x} off={:#x} bytes={}",
+                                rdi, start, hex_str,
+                            );
+                        }
+                    } else {
+                        crate::serial_println!(
+                            "[UD/RDI-BYTES] rdi={:#x} unmapped_or_fault",
+                            rdi,
+                        );
+                    }
+                } else if rdi == 0 {
+                    crate::serial_println!("[UD/RDI-BYTES] rdi=0x0 null_this_pointer");
+                } else {
+                    crate::serial_println!(
+                        "[UD/RDI-BYTES] rdi={:#x} kernel_address_skip",
+                        rdi,
+                    );
+                }
+            }
         }
 
         // POSIX signal(7): synchronous fatal CPU exceptions in user mode
@@ -862,7 +1008,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
         // get the per-process COW copy that protects the cache from GOT/PLT
         // relocations bleeding between independent loads of the same .so.
         let file_info = match &vma.backing {
-            crate::mm::vma::VmBacking::File { mount_idx, inode, offset } => {
+            crate::mm::vma::VmBacking::File { mount_idx, inode, offset, .. } => {
                 let is_shared = vma.flags & crate::mm::vma::MAP_SHARED != 0;
                 Some((*mount_idx, *inode, *offset, vma.base, vma.base + vma.length, is_shared))
             }
