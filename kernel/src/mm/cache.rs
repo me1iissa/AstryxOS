@@ -31,6 +31,58 @@ pub fn lookup(mount_idx: usize, inode: u64, page_offset: u64) -> Option<u64> {
         .map(|e| e.phys)
 }
 
+/// Look up a cached page and atomically acquire a guard reference on it.
+///
+/// The reference count is incremented while the cache lock is still held, so
+/// the caller's view of the returned physical address is guaranteed to be alive
+/// until a matching `page_ref_dec` is issued.  Without this atomicity, a bare
+/// `lookup` + later `page_ref_inc` pair admits a window in which:
+///
+///   1. A concurrent `cache::insert` collision evicts the old entry and drops
+///      the cache's own reference (`page_ref_dec` in `insert`).
+///   2. A sibling process's `munmap` / `execve` teardown drops the last PTE
+///      reference, driving the refcount to zero.
+///   3. `pmm::alloc_page` on a third CPU recycles the frame into a different
+///      VMA before the faulting CPU reaches its own `page_ref_inc`.
+///
+/// The faulting CPU would then install a stale PTE pointing at a recycled
+/// frame, aliasing two unrelated virtual address spaces against the same
+/// physical frame.  Holding the cache lock across the refcount increment
+/// collapses the race window to zero: no concurrent insert can evict the entry,
+/// and therefore no munmap can drive the refcount to zero, while this function
+/// executes.
+///
+/// Per Intel SDM Vol. 3A §4.10.5 (page-level coherence requirements) and
+/// POSIX mmap(2) MAP_SHARED visibility semantics, every path that installs
+/// a PTE must ensure the target frame is alive at the moment of install and
+/// remains so until the PTE is removed.  This function satisfies that
+/// requirement for the cache-hit path.
+///
+/// # Caller contract
+///
+/// The caller MUST release the acquired reference via `page_ref_dec` once it
+/// has either:
+///   (a) installed a PTE whose own refcount now covers the frame — the acquired
+///       guard ref is then redundant and must be dropped; or
+///   (b) aborted before PTE installation (OOM, error, etc.) — the acquired
+///       guard ref is the last reference and dropping it may free the frame.
+///
+/// In the alias arm (MAP_SHARED or PROT_READ), the guard ref IS the PTE ref
+/// (no separate `page_ref_inc` before `map_page_in` is needed or correct).
+/// In the private-copy arm the guard ref is purely protective: after the
+/// `copy_nonoverlapping` completes, drop the guard via `page_ref_dec` because
+/// the installed PTE refers to `private_phys`, not `cached_phys`.
+pub fn lookup_and_acquire(mount_idx: usize, inode: u64, page_offset: u64) -> Option<u64> {
+    let cache = PAGE_CACHE.lock();
+    let phys = cache.get(&(mount_idx, inode, page_offset))?.phys;
+    // Bump the refcount while the cache lock is still held.  This prevents any
+    // concurrent `cache::insert` (which holds the same lock before its own
+    // `page_ref_dec` on eviction) from driving the count to zero between our
+    // lookup and the caller's eventual PTE install.
+    crate::mm::refcount::page_ref_inc(phys);
+    Some(phys)
+}
+
 /// Insert a page into the cache.
 ///
 /// Increments the page's reference count to represent the cache's own

@@ -1065,8 +1065,26 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 }
             }
 
-            // 1. Check the page cache
-            if let Some(cached_phys) = crate::mm::cache::lookup(mount_idx, inode, file_page_offset) {
+            // 1. Check the page cache (atomic lookup-and-acquire)
+            //
+            // `lookup_and_acquire` increments the physical frame's reference
+            // count while the cache lock is still held.  This closes the
+            // W190-H_A race: a bare `cache::lookup` followed by a separate
+            // `page_ref_inc` admits a window in which a concurrent
+            // `cache::insert` collision can evict the entry (dropping the
+            // cache's ref), a sibling `munmap`/`execve` can drop the last PTE
+            // ref (driving rc → 0), and `pmm::alloc_page` can recycle the
+            // frame before this CPU reaches its own `page_ref_inc`.  By
+            // acquiring the guard ref under the cache lock that window is
+            // reduced to zero: no insert eviction can execute against the
+            // same key while we hold the lock, so no munmap can concurrently
+            // drive rc to zero.
+            //
+            // Per Intel SDM Vol. 3A §4.10.5 and POSIX mmap(2), every PTE
+            // installation must guarantee the target frame is alive at the
+            // moment of install.  The guard ref from `lookup_and_acquire`
+            // satisfies that guarantee for all three sub-arms below.
+            if let Some(cached_phys) = crate::mm::cache::lookup_and_acquire(mount_idx, inode, file_page_offset) {
                 // MAP_PRIVATE + writable: give the process a private copy so
                 // writes (e.g., GOT/PLT relocations) don't corrupt the shared
                 // cache page. Without this, a second process loading the same
@@ -1086,6 +1104,11 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     if let Some(private_phys) = crate::mm::pmm::alloc_page() {
                         const COW_OFF: u64 = 0xFFFF_8000_0000_0000;
                         unsafe {
+                            // SAFETY: `lookup_and_acquire` guarantees `cached_phys`
+                            // is alive for the duration of this block by holding a
+                            // guard ref.  The copy reads from the cache frame and
+                            // writes to the freshly-allocated `private_phys` frame;
+                            // there is no aliasing between source and destination.
                             core::ptr::copy_nonoverlapping(
                                 (COW_OFF + cached_phys) as *const u8,
                                 (COW_OFF + private_phys) as *mut u8,
@@ -1095,6 +1118,11 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         crate::mm::refcount::page_ref_set(private_phys, 1);
                         crate::mm::vmm::map_page_in(cr3, page_addr, private_phys, page_flags);
                         crate::mm::vmm::invlpg(page_addr);
+                        // Release the guard ref acquired by `lookup_and_acquire`.
+                        // The PTE now refers to `private_phys`, not `cached_phys`;
+                        // the cache still holds its own independent reference to
+                        // `cached_phys`, so this dec will not free the frame.
+                        let _ = crate::mm::refcount::page_ref_dec(cached_phys);
                     } else {
                         // PMM exhausted: cannot allocate a private copy.
                         //
@@ -1111,15 +1139,27 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         // to signal the faulting thread (SIGSEGV) when physical
                         // backing cannot be allocated, giving the same visible
                         // behaviour as an ENOMEM mmap failure.
+                        //
+                        // Release the guard ref before returning so the cache's
+                        // reference remains the sole holder.  If the cache entry
+                        // was evicted between our lookup and now this dec may
+                        // be the last ref; the frame is freed correctly.
+                        let _ = crate::mm::refcount::page_ref_dec(cached_phys);
                         return false;
                     }
                 } else {
                     // MAP_SHARED writable, or any read-only mapping: alias
                     // the cache page directly so writes are visible to other
                     // mappers and reads see the latest content.
-                    crate::mm::refcount::page_ref_inc(cached_phys);
+                    //
+                    // The guard ref from `lookup_and_acquire` IS the PTE's
+                    // reference — do NOT call `page_ref_inc` again here.
+                    // Steady state after install: cache holds one ref,
+                    // this PTE holds one ref (the promoted guard ref) = rc ≥ 2.
                     crate::mm::vmm::map_page_in(cr3, page_addr, cached_phys, page_flags);
                     crate::mm::vmm::invlpg(page_addr);
+                    // Guard ref is intentionally NOT released — it has been
+                    // promoted to the PTE reference.
                 }
                 #[cfg(feature = "firefox-test")]
                 {
