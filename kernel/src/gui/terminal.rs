@@ -11,12 +11,21 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 
 /// Set when a child exec is running so `poll_output()` skips the TERMINAL
 /// mutex acquisition in the common idle case.
 static EXEC_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// PID of the most recently launched async child process.  0 = none.
+/// Stored so that `is_firefox_running()` can consult the thread table
+/// directly and detect exit even before `poll_output()` has reaped the
+/// zombie via `waitpid`.  On POSIX, a process that has called exit(3) /
+/// exit_group(2) transitions all its threads to the Dead state before the
+/// process entry itself becomes a Zombie; reading the thread table is
+/// therefore the earliest possible signal of process termination.
+static EXEC_PID: AtomicU64 = AtomicU64::new(0);
 
 use crate::wm::window::{self, WindowHandle};
 
@@ -285,6 +294,7 @@ pub fn handle_key(msg: u32, wparam: u64, _lparam: u64) {
                     match spawn_async(trimmed) {
                         Ok((pid, pipe_id)) => {
                             state.running_exec = Some((pid, pipe_id));
+                            EXEC_PID.store(pid, Ordering::Release);
                             EXEC_RUNNING.store(true, Ordering::Release);
                             // Don't draw prompt yet — poll_output() will do it on exit.
                         }
@@ -934,6 +944,7 @@ pub fn launch_process(path: &str) {
             let mut guard = TERMINAL.lock();
             if let Some(ref mut state) = *guard {
                 state.running_exec = Some((pid, pipe_id));
+                EXEC_PID.store(pid, Ordering::Release);
                 EXEC_RUNNING.store(true, core::sync::atomic::Ordering::Release);
             }
         }
@@ -949,8 +960,56 @@ pub fn launch_process(path: &str) {
 
 /// Returns true if a child process launched via `launch_process` is currently
 /// running.  Used by the `firefox-test` feature to detect Firefox exit.
+///
+/// Detection is two-pronged:
+///
+/// 1. **Fast path**: `EXEC_RUNNING` is false.  `poll_output()` clears this flag
+///    once it has successfully reaped the zombie via `waitpid`.  Under normal
+///    circumstances this is sufficient.
+///
+/// 2. **Zombie fallback**: even if `poll_output()` has not yet reaped the zombie
+///    (e.g. the scheduler ran `exit_group` on the AP between two `poll_output`
+///    calls), we check the thread table directly.  A process that has completed
+///    `exit_group(2)` has all its threads in `ThreadState::Dead` — that state
+///    is visible in the thread table before the process entry in the process
+///    table transitions to `ProcessState::Zombie` and before `waitpid` removes
+///    it.  Treating "all threads Dead" as "process exited" allows the FFTEST
+///    loop to break within one tick of the `exit_group` call, rather than
+///    waiting for `poll_output`'s `waitpid` to win its PROCESS_TABLE lock race.
+///
+/// `try_lock` is used on the thread table so that a temporarily contended lock
+/// (e.g. the AP is still inside `exit_group`) does not stall the BSP poll loop;
+/// in that case we conservatively return `true` (still running) and retry next
+/// tick — a bounded one-tick delay, not a minutes-long spin.
 pub fn is_firefox_running() -> bool {
-    EXEC_RUNNING.load(Ordering::Acquire)
+    // Fast path: poll_output() already reaped the child.
+    if !EXEC_RUNNING.load(Ordering::Acquire) {
+        return false;
+    }
+
+    // Zombie fallback: check whether the child's threads are all Dead.
+    // If EXEC_PID is 0 the child was never launched — treat as not running.
+    let pid = EXEC_PID.load(Ordering::Acquire);
+    if pid == 0 {
+        return false;
+    }
+
+    // try_lock: if the table is momentarily held by exit_group on the AP,
+    // return true (assume still running) and check again next tick.
+    let threads = match crate::proc::THREAD_TABLE.try_lock() {
+        Some(t) => t,
+        None    => return true,
+    };
+
+    // If any thread belonging to this PID is not Dead, the process is alive.
+    // If NO thread for this PID exists at all (already fully reaped), treat
+    // that as exited too.
+    let any_alive = threads
+        .iter()
+        .filter(|t| t.pid == pid)
+        .any(|t| !matches!(t.state, crate::proc::ThreadState::Dead));
+
+    any_alive
 }
 
 // ---------------------------------------------------------------------------
@@ -1037,6 +1096,7 @@ pub fn poll_output() {
             state2.write_str_colored("\r\n", DEFAULT_FG);
         }
         state2.running_exec = None;
+        EXEC_PID.store(0, Ordering::Release);
         EXEC_RUNNING.store(false, Ordering::Release);
         state2.draw_prompt();
         state2.scroll_offset = 0;
