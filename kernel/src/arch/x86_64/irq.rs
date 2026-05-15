@@ -490,6 +490,13 @@ extern "C" fn timer_tick() {
     // `crate::ipc::timerfd::maybe_ring_from_tick`.
     crate::ipc::timerfd::maybe_ring_from_tick(tick);
 
+    // Advance TLB quarantine-free grace-period tracking.  Must be called
+    // from every CPU's timer ISR so that `tlb::on_cpu_tick` can compute
+    // the global minimum tick and drain entries whose quiescent state
+    // has been satisfied.  This call is inexpensive when the quarantine
+    // ring is empty (a single atomic load that fast-paths out).
+    crate::mm::tlb::on_cpu_tick(tick);
+
     // Notify the scheduler about the tick.
     crate::sched::timer_tick_schedule();
 

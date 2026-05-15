@@ -88,19 +88,50 @@ pub fn lookup_and_acquire(mount_idx: usize, inode: u64, page_offset: u64) -> Opt
 /// Increments the page's reference count to represent the cache's own
 /// reference.  If the key already exists the old entry is replaced and
 /// its cache reference is released.
+///
+/// When the evicted entry's reference count reaches zero, the physical
+/// frame is routed through [`crate::mm::tlb::quarantine_free`] rather
+/// than freed immediately.  A TLB entry for the evicted frame's virtual
+/// address may still be live on a sibling CPU (the cache does not track
+/// which CPUs have mapped each frame), so the quarantine grace period —
+/// at least one timer ISR on every online CPU — is necessary to
+/// guarantee that the stale TLB entry is retired before the frame is
+/// recycled.  Per Intel SDM Vol. 3A §4.10.5, paging-structure changes
+/// must be propagated to all processors before the physical frame is
+/// repurposed.
 pub fn insert(mount_idx: usize, inode: u64, page_offset: u64, phys: u64) {
-    let mut cache = PAGE_CACHE.lock();
-    if let Some(old) = cache.insert(
-        (mount_idx, inode, page_offset),
-        PageCacheEntry { phys, dirty: false },
-    ) {
-        // Replaced an existing entry — drop old cache reference.
-        // Intentional discard: rc may still be > 0 (user PTEs keep
-        // their own references); we only dec the cache's reference.
-        let _ = crate::mm::refcount::page_ref_dec(old.phys);
+    // Capture the evicted frame (if any) before releasing the lock so
+    // we can call quarantine_free without holding the cache mutex, which
+    // would create a lock-order cycle (cache → TLB quarantine → PMM).
+    let evicted_zero_rc: Option<u64>;
+
+    {
+        let mut cache = PAGE_CACHE.lock();
+        let old = cache.insert(
+            (mount_idx, inode, page_offset),
+            PageCacheEntry { phys, dirty: false },
+        );
+        // The cache now holds a reference to the new page.
+        crate::mm::refcount::page_ref_inc(phys);
+
+        if let Some(old_entry) = old {
+            // Drop the cache's own reference to the evicted page.
+            // If rc reaches zero, the frame has no remaining references
+            // (no live PTEs, no other cache users) and must be freed.
+            let new_rc = crate::mm::refcount::page_ref_dec(old_entry.phys);
+            evicted_zero_rc = if new_rc == 0 { Some(old_entry.phys) } else { None };
+        } else {
+            evicted_zero_rc = None;
+        }
+    } // release cache lock
+
+    if let Some(old_phys) = evicted_zero_rc {
+        // Defer PMM release through the quarantine to ensure any stale
+        // TLB entry on a sibling CPU is retired before the frame is
+        // recycled.  See module-level doc for the quiescent-state
+        // guarantee.
+        crate::mm::tlb::quarantine_free(old_phys);
     }
-    // The cache now holds a reference to this page.
-    crate::mm::refcount::page_ref_inc(phys);
 }
 
 /// Mark a cached page as dirty (written to).
