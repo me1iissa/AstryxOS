@@ -258,7 +258,7 @@ EOF
     # or manually compiled in userspace/.
     USERSPACE="${ROOT_DIR}/userspace"
     # glibc_hello is the oracle binary for all glibc compat work
-    TEST_BINS=(hello mmap_test dynamic_hello dynamic_hello_pie clone_thread_test socket_test glibc_hello)
+    TEST_BINS=(hello mmap_test dynamic_hello dynamic_hello_pie clone_thread_test socket_test glibc_hello alias_test)
     for bin in "${TEST_BINS[@]}"; do
         SRC=""
         if [ -f "${BUILD_DIR}/${bin}" ]; then
@@ -429,7 +429,7 @@ EOF
             [ -f "${f}" ] || continue
             bn="$(basename "${f}")"
             case "${bn}" in
-                busybox|busybox.applets|tcc|firefox|hello|mmap_test|dynamic_hello|dynamic_hello_pie|clone_thread_test|socket_test|glibc_hello)
+                busybox|busybox.applets|tcc|firefox|hello|mmap_test|dynamic_hello|dynamic_hello_pie|clone_thread_test|socket_test|glibc_hello|alias_test)
                     continue ;;
             esac
             mcopy -o -i "${DATA_IMG}" "${f}" "::bin/${bn}" 2>/dev/null && \
