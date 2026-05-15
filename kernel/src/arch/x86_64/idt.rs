@@ -1133,6 +1133,66 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
             // moment of install.  The guard ref from `lookup_and_acquire`
             // satisfies that guarantee for all three sub-arms below.
             if let Some(cached_phys) = crate::mm::cache::lookup_and_acquire(mount_idx, inode, file_page_offset) {
+                // === W216 H_4h fix: re-validate VMA before installing cache-hit PTE ===
+                //
+                // PROCESS_TABLE was dropped at line ~1071 and interrupts re-enabled
+                // before this branch.  A concurrent sys_mmap(MAP_FIXED) on a sibling
+                // CPU could have replaced the captured VMA between that drop and now:
+                //   Phase 2a — old VMA removed from VmSpace, frames unmapped+freed
+                //   Phase 2b — pages returned to PMM; PMM may re-issue them
+                //   Phase 3  — new VMA (different backing) inserted
+                //
+                // Without this check we would install `cached_phys` — content valid
+                // for the OLD (inode, file_page_offset) — at a VA whose current VMA
+                // describes a different backing object.  Because libxul is fully
+                // prepopulated, `cached_phys` holds non-zero bytes from the PREVIOUS
+                // offset rather than kernel-page bytes, which is exactly the "non-zero
+                // bytes from a different libxul offset" symptom observed in the W215
+                // post-all-4-fixes verifier.
+                //
+                // The fix mirrors the identical guard PR #226 (W216 Hypothesis-V)
+                // applied to the readahead and single-page paths: re-acquire
+                // PROCESS_TABLE briefly, confirm the (mount_idx, inode,
+                // file_base_offset, vma_base, vma_end) tuple still matches the
+                // snapshot captured before interrupts were re-enabled, and abandon
+                // if it has changed.
+                //
+                // If the VMA is stale we release the guard ref from
+                // `lookup_and_acquire` so the cache's own reference remains the sole
+                // holder (freeing the frame only if the cache has also evicted it).
+                // The user will re-fault against the new VMA and receive correct data.
+                //
+                // Lock ordering preserved: PROCESS_TABLE (top) → nothing else.
+                // MOUNTS is NOT held here; cache/PMM locks are NOT held here.
+                let still_valid = {
+                    let procs = crate::proc::PROCESS_TABLE.lock();
+                    procs.iter()
+                        .find(|p| p.pid == target_pid)
+                        .and_then(|p| p.vm_space.as_ref())
+                        .and_then(|vs| vs.find_vma(faulting_addr))
+                        .map(|v| {
+                            matches!(&v.backing,
+                                crate::mm::vma::VmBacking::File {
+                                    mount_idx: m, inode: ino, offset: o, ..
+                                } if *m == mount_idx && *ino == inode && *o == file_base_offset)
+                            && v.base == vma_base
+                            && v.base + v.length == vma_end
+                        })
+                        .unwrap_or(false)
+                };
+                if !still_valid {
+                    // Release the guard ref — cache's own ref keeps the frame
+                    // alive, or frees it if the cache evicted the entry between
+                    // our lookup and now.
+                    let _ = crate::mm::refcount::page_ref_dec(cached_phys);
+                    #[cfg(feature = "firefox-test")]
+                    crate::serial_println!(
+                        "[PF/revalidate] CACHE-HIT VMA stale addr={:#x} \
+                         mount={} inode={} foff={:#x} — abandoning",
+                        faulting_addr, mount_idx, inode, file_page_offset);
+                    return false;
+                }
+
                 // MAP_PRIVATE + writable: give the process a private copy so
                 // writes (e.g., GOT/PLT relocations) don't corrupt the shared
                 // cache page. Without this, a second process loading the same
