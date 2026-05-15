@@ -3839,14 +3839,17 @@ fn test_linux_syscall_compat() -> bool {
     test_println!();
     test_println!("  writev(stdout, 2 iovecs) → {} bytes ✓", ret);
 
-    // 5. dispatch_linux is reachable — rseq (334) returns ENOSYS
+    // 5. dispatch_linux is reachable — rseq (334) returns 0 (success, W210) or -ENOSYS
+    // PR #218 intentionally changed rseq to return 0 so glibc 2.34 __rseq_init() does
+    // not abort the thread.  Accept both 0 (current) and -38 (legacy stub) so neither
+    // a regression to ENOSYS nor a future real implementation breaks this gate.
     test_println!("  Testing dispatch_linux routing...");
     let ret = crate::syscall::dispatch_linux(334, 0, 0, 0, 0, 0, 0);
-    if ret != -38 {
-        test_fail!("Linux syscall compat", "rseq returned {} (expected -38/ENOSYS)", ret);
+    if ret != 0 && ret != -38 {
+        test_fail!("Linux syscall compat", "rseq returned {} (expected 0 or -38/ENOSYS)", ret);
         return false;
     }
-    test_println!("  dispatch_linux(334/rseq) → {} (ENOSYS) ✓", ret);
+    test_println!("  dispatch_linux(334/rseq) → {} (0=stub-success or -38=ENOSYS, both OK) ✓", ret);
 
     // 6. mprotect — real implementation; EINVAL in kernel-context is expected (no user vm_space)
     let ret = crate::syscall::dispatch_linux(10, 0x1000, 0x1000, 0x3, 0, 0, 0);
@@ -18597,23 +18600,33 @@ fn test_sched_getaffinity_shows_all_cpus() -> bool {
     true
 }
 
-// ── Test 126: rseq returns -ENOSYS (sentinel — must not regress) ─────────────
+// ── Test 126: rseq stub returns a valid value ─────────────────────────────────
+//
+// PR #218 (W210): rseq now returns 0 (success) so glibc 2.34 __rseq_init()
+// does not abort content-process threads before reaching the rendering stage.
+// Accept 0 (current stub) or -38/ENOSYS (should we ever revert to a pure
+// stub).  Reject any other value — a random non-zero non-ENOSYS return would
+// indicate a broken dispatch path.
 
 fn test_rseq_enosys() -> bool {
-    test_header!("rseq(334): must return -ENOSYS (38) — no real implementation yet");
+    test_header!("rseq(334): stub returns 0 (W210) or -ENOSYS — not a random value");
 
     // rseq(NULL, 0, 0, 0) — minimal call
     let r = crate::syscall::dispatch_linux(334, 0, 0, 0, 0, 0, 0);
     test_println!("  rseq(334) = {}", r);
 
-    if r != -38 {
+    if r != 0 && r != -38 {
         test_fail!("rseq_enosys",
-            "returned {} (expected -38/ENOSYS) — rseq may have been accidentally enabled",
+            "returned {} (expected 0 or -38/ENOSYS) — broken dispatch or unexpected rseq impl",
             r);
         return false;
     }
 
-    test_pass!("rseq: returns -ENOSYS ✓ (glibc fallback path safe)");
+    if r == 0 {
+        test_pass!("rseq: returns 0 (stub-success, W210) ✓");
+    } else {
+        test_pass!("rseq: returns -ENOSYS ✓ (glibc slow-path safe)");
+    }
     true
 }
 // ── Test 120: ELF DT_RELR — packed relative relocations are applied ───────────
