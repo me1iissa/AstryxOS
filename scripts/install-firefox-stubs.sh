@@ -1277,16 +1277,80 @@ while IFS= read -r soname; do
 done < "${STUB_DIR}/libs.txt"
 
 # ── Always-required empty stubs ───────────────────────────────────────────────
-# These libraries appear in libxul.so's DT_NEEDED list but import zero symbols
-# that can be attributed to them by the classify() function above (because the
-# actual callers go through gdk/gtk wrappers, etc.).  ld-linux still refuses to
-# start the process if the .so file is absent — so we emit empty stubs here.
+# These libraries either (a) appear in libxul.so's DT_NEEDED list but import
+# zero symbols attributable by classify(), or (b) are dlopen'd at runtime by
+# real libraries we ship (e.g. libfreetype.so.6 dlopen's libharfbuzz.so.0).
+# In either case the .so must be present at the search-path locations.
 declare -A FORCED_STUBS=(
     [libXrender.so.1]="stub_libXrender_so_1"
     [libXtst.so.6]="stub_libXtst_so_6"
     [libXcursor.so.1]="stub_libXcursor_so_1"
     [libpangocairo-1.0.so.0]="stub_libpangocairo_1_0_so_0"
+    [libharfbuzz.so.0]="stub_libharfbuzz_so_0"
 )
+
+# libharfbuzz.so.0 — bespoke stub
+# libfreetype.so.6 dlopen("libharfbuzz.so.0") and then dlsym's a set of hb_*
+# symbols to enable HarfBuzz-assisted glyph shaping.  The first symbol it
+# checks is hb_version_atleast (added in HarfBuzz 2.6.0); if dlopen succeeds
+# but that symbol is absent the shaper is disabled.  Returning 1 signals "yes,
+# at least the requested version" which is the safe default — libfreetype only
+# uses this to gate version-conditional fast paths that are safe to enable.
+# All other hb_* symbols are stubbed as no-ops / NULL returns; headless Firefox
+# performs no real glyph shaping so these code paths are never exercised.
+# Ref: https://harfbuzz.github.io/harfbuzz-hb-version.html#hb-version-atleast
+cat > "${STUB_DIR}/stub_libharfbuzz_so_0.c" << 'C_EOF'
+/* AstryxOS stub: libharfbuzz.so.0
+ * Satisfies libfreetype.so.6 runtime dlopen("libharfbuzz.so.0").
+ * hb_version_atleast returns 1 (true) so libfreetype enables the
+ * HarfBuzz shaper; remaining symbols are safe no-ops / NULL returns.
+ * Ref: https://harfbuzz.github.io/harfbuzz-hb-version.html */
+#include <stddef.h>
+
+/* hb_bool_t is a plain int in all HarfBuzz releases. */
+typedef int hb_bool_t;
+
+/* Version gate — always claim "yes, at least the requested version". */
+hb_bool_t hb_version_atleast(unsigned int major, unsigned int minor,
+                              unsigned int micro)
+{ (void)major; (void)minor; (void)micro; return 1; }
+
+/* All other symbols libfreetype dlsym's: safe no-ops / NULL returns.
+ * Using variadic signatures avoids ABI mismatches for pointer/integer args. */
+void* hb_blob_create(...)           { return NULL; }
+void  hb_blob_destroy(...)          {}
+void* hb_buffer_create(...)         { return NULL; }
+void  hb_buffer_destroy(...)        {}
+void  hb_buffer_add_utf8(...)       {}
+void  hb_buffer_clear_contents(...) {}
+void* hb_buffer_get_glyph_infos(...)     { return NULL; }
+void* hb_buffer_get_glyph_positions(...) { return NULL; }
+unsigned int hb_buffer_get_length(...)   { return 0; }
+void  hb_buffer_guess_segment_properties(...) {}
+void* hb_face_create(...)           { return NULL; }
+void* hb_face_create_for_tables(...){ return NULL; }
+void  hb_face_destroy(...)          {}
+void  hb_face_set_index(...)        {}
+void  hb_face_set_upem(...)         {}
+void* hb_font_create(...)           { return NULL; }
+void  hb_font_destroy(...)          {}
+void* hb_font_get_face(...)         { return NULL; }
+void  hb_font_set_scale(...)        {}
+void  hb_ot_layout_collect_lookups(...) {}
+void  hb_ot_layout_lookup_collect_glyphs(...) {}
+hb_bool_t hb_ot_layout_lookup_would_substitute(...) { return 0; }
+void  hb_ot_tags_from_script_and_language(...) {}
+void* hb_set_create(...)            { return NULL; }
+void  hb_set_destroy(...)           {}
+void  hb_set_add(...)               {}
+void  hb_set_clear(...)             {}
+void  hb_set_del(...)               {}
+hb_bool_t hb_set_has(...)          { return 0; }
+hb_bool_t hb_set_is_empty(...)     { return 1; }
+hb_bool_t hb_set_next(...)         { return 0; }
+void  hb_set_subtract(...)          {}
+hb_bool_t hb_shape(...)            { return 0; }
+C_EOF
 
 for soname in "${!FORCED_STUBS[@]}"; do
     base="${FORCED_STUBS[$soname]}"
