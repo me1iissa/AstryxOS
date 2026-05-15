@@ -603,12 +603,30 @@ pub fn unmap_and_free_range_in(pml4_phys: u64, base: u64, length: u64) -> usize 
             // shootdown_range spins until every target CPU has acknowledged
             // the IPI and executed invlpg (or a CR3 reload).  On return,
             // no CPU holds a cached translation for [batch_start, batch_end).
-            crate::mm::tlb::shootdown_range(pml4_phys, batch_start, batch_end);
+            let shootdown_clean =
+                crate::mm::tlb::shootdown_range(pml4_phys, batch_start, batch_end);
 
             // --- Pass 3: return frames to the PMM. ---
-            // Safe now: every stale TLB entry has been evicted by pass 2.
+            //
+            // If the shootdown completed cleanly (all ACKs received),
+            // every stale TLB entry for [batch_start, batch_end) has
+            // been evicted and the frames are safe to recycle immediately.
+            //
+            // If the shootdown timed out on one or more CPUs, those CPUs
+            // may still hold live TLB entries for freed virtual addresses.
+            // Recycling the physical frames now would allow those CPUs to
+            // read or write the new owner's data through the stale mapping.
+            // Instead, route frames through `quarantine_free`: the frame
+            // is held until every CPU has passed through a timer ISR
+            // (quiescent state), guaranteeing TLB drain before PMM reuse.
+            // Per Intel SDM Vol. 3A §4.10.5, page-table writes must be
+            // globally visible before the physical frame is repurposed.
             for i in 0..n {
-                pmm::free_page(to_free[i]);
+                if shootdown_clean {
+                    pmm::free_page(to_free[i]);
+                } else {
+                    crate::mm::tlb::quarantine_free(to_free[i]);
+                }
                 freed += 1;
             }
         }

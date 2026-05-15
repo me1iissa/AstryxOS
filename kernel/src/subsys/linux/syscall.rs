@@ -3165,11 +3165,18 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
         if any_unmap && batch_end > batch_start {
             // --- Pass 2: synchronous shootdown. ---
             // On return every CPU has evicted TLB entries for [batch_start, batch_end).
-            crate::mm::tlb::shootdown_range(cr3, batch_start, batch_end);
+            let shootdown_clean =
+                crate::mm::tlb::shootdown_range(cr3, batch_start, batch_end);
 
             // --- Pass 3: free frames now that no stale TLB entries remain. ---
+            // Route through quarantine if the shootdown did not complete
+            // cleanly (see unmap_and_free_range_in for the full rationale).
             for i in 0..n {
-                crate::mm::pmm::free_page(to_free[i]);
+                if shootdown_clean {
+                    crate::mm::pmm::free_page(to_free[i]);
+                } else {
+                    crate::mm::tlb::quarantine_free(to_free[i]);
+                }
             }
         }
     }
