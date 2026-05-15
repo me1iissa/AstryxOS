@@ -2523,6 +2523,17 @@ pub(crate) fn sys_dup(old_fd: usize) -> i64 {
     // close-on-exec flag cleared."
     fd_clone.cloexec = false;
 
+    // Bump the underlying resource's open-file-description refcount so
+    // that a close(2) on either the old or new fd does not prematurely
+    // destroy the shared object.  Per POSIX.1-2017 §2.14 and dup(2):
+    // "the duplicate and original file descriptors refer to the same open
+    // file description".
+    if fd_clone.file_type == crate::vfs::FileType::Socket
+        && fd_clone.mount_idx == usize::MAX
+    {
+        crate::net::unix::inc_ref(fd_clone.inode);
+    }
+
     // Find lowest free fd
     for i in 0..proc.file_descriptors.len() {
         if proc.file_descriptors[i].is_none() {
@@ -2563,6 +2574,14 @@ pub(crate) fn sys_dup2(old_fd: usize, new_fd: usize) -> i64 {
 
     // Per POSIX dup2(2): the duplicate's close-on-exec flag is cleared.
     fd_clone.cloexec = false;
+
+    // Bump the underlying resource's open-file-description refcount.
+    // Same rationale as sys_dup above (POSIX.1-2017 §2.14 / dup2(2)).
+    if fd_clone.file_type == crate::vfs::FileType::Socket
+        && fd_clone.mount_idx == usize::MAX
+    {
+        crate::net::unix::inc_ref(fd_clone.inode);
+    }
 
     // Grow the table if needed
     while proc.file_descriptors.len() <= new_fd {

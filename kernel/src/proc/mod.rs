@@ -1534,20 +1534,28 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
     // word dies, the kernel owes any future operation a clean state.
     crate::syscall::futex_drain_pid(pid);
 
-    // Close pipe fds before marking Zombie so readers see EOF promptly.
-    // Iterate a snapshot of (pipe_id, is_write) to avoid holding PROCESS_TABLE
-    // while calling into PIPE_TABLE (lock ordering: PIPE_TABLE before PROCESS_TABLE).
-    let pipe_ends: alloc::vec::Vec<(u64, bool)> = {
+    // Close pipe and socket fds before marking Zombie so peers see EOF / peer-close
+    // promptly.  Iterate a snapshot to avoid holding PROCESS_TABLE while calling
+    // into PIPE_TABLE / unix socket TABLE (lock ordering: resource table before
+    // PROCESS_TABLE).
+    let (pipe_ends, socket_ids): (alloc::vec::Vec<(u64, bool)>, alloc::vec::Vec<u64>) = {
         let procs = PROCESS_TABLE.lock();
-        procs.iter().find(|p| p.pid == pid)
-            .map(|p| p.file_descriptors.iter()
-                .filter_map(|f| f.as_ref())
-                .filter(|f| f.file_type == crate::vfs::FileType::Pipe
-                         && f.mount_idx == usize::MAX
-                         && f.flags & 0x8000_0000 != 0)
-                .map(|f| (f.inode, f.flags & 1 == 1))
-                .collect())
-            .unwrap_or_default()
+        let (mut pipes, mut sockets) = (alloc::vec::Vec::new(), alloc::vec::Vec::new());
+        if let Some(p) = procs.iter().find(|p| p.pid == pid) {
+            for f in p.file_descriptors.iter().filter_map(|f| f.as_ref()) {
+                if f.file_type == crate::vfs::FileType::Pipe
+                    && f.mount_idx == usize::MAX
+                    && f.flags & 0x8000_0000 != 0
+                {
+                    pipes.push((f.inode, f.flags & 1 == 1));
+                } else if f.file_type == crate::vfs::FileType::Socket
+                    && f.mount_idx == usize::MAX
+                {
+                    sockets.push(f.inode);
+                }
+            }
+        }
+        (pipes, sockets)
     };
     for (pipe_id, is_write) in pipe_ends {
         if is_write {
@@ -1555,6 +1563,11 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
         } else {
             crate::ipc::pipe::pipe_close_reader(pipe_id);
         }
+    }
+    // Decrement the refcount on each inherited unix socket; only the last
+    // close tears the slot down and notifies the peer.
+    for socket_id in socket_ids {
+        crate::net::unix::close(socket_id);
     }
 
     // Release POSIX file locks held by this process (C1).
@@ -1708,6 +1721,26 @@ pub fn set_fork_user_regs(pid: Pid, tid: Tid, regs: ForkUserRegs) {
     }
 }
 
+/// Increment the open-file-description reference count for every socket fd
+/// in `fds`.
+///
+/// Called immediately after the fd table is duplicated during `fork(2)` /
+/// `clone(2)` (without `CLONE_FILES`).  Without this bump, a `close(2)` in
+/// the child or parent would decrement the count to zero and destroy the
+/// shared socket object, leaving the other process with a dangling reference.
+///
+/// Per POSIX.1-2017 §2.14 and `man 2 fork`: "open file descriptors shall
+/// be duplicated in the child process; the duplicate descriptors in the
+/// child refer to the same open file descriptions as the corresponding
+/// descriptors in the parent."
+fn inc_socket_refs_for_fork(fds: &[Option<crate::vfs::FileDescriptor>]) {
+    for fd in fds.iter().filter_map(|f| f.as_ref()) {
+        if fd.file_type == crate::vfs::FileType::Socket && fd.mount_idx == usize::MAX {
+            crate::net::unix::inc_ref(fd.inode);
+        }
+    }
+}
+
 /// Fork a process: create a child that is a copy of the parent.
 ///
 /// If the parent has a VmSpace, performs Copy-on-Write (CoW) fork:
@@ -1759,6 +1792,11 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
             parent.exe_path.clone(),
         )
     };
+
+    // Bump the refcount on every socket fd now held by both parent and child.
+    // Without this, the first close(2) from either process would drop the
+    // count to zero and destroy the shared socket object, breaking the peer.
+    inc_socket_refs_for_fork(&fds);
 
     // Enforce RLIMIT_NPROC: count non-zombie processes.
     {
@@ -2010,6 +2048,10 @@ pub fn fork_process_share_vm(
         )
     };
 
+    // Bump socket fd refcounts for the duplicated table (same rationale as
+    // fork_process — POSIX.1-2017 §2.14 / man 2 fork).
+    inc_socket_refs_for_fork(&fds);
+
     // RLIMIT_NPROC.
     {
         let procs = PROCESS_TABLE.lock();
@@ -2208,10 +2250,14 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
         let parent = procs.iter().find(|p| p.pid == parent_pid)?;
         let fds = parent.file_descriptors.clone();
         let cwd = parent.cwd.clone();
-        let mut name = parent.name;
+        let name = parent.name;
         (fds, cwd, name, parent.cr3, 0u64, parent.linux_abi, parent.pgid, parent.sid,
          parent.exe_path.clone())
     };
+
+    // Bump socket fd refcounts for the duplicated table (same rationale as
+    // fork_process — POSIX.1-2017 §2.14 / man 2 fork).
+    inc_socket_refs_for_fork(&fds);
 
     // Get parent's TLS base from thread struct.
     let parent_tls = {
