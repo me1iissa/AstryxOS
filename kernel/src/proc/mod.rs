@@ -1247,20 +1247,20 @@ pub fn free_process_memory(pid: Pid) {
             if pte & PAGE_PRESENT != 0 {
                 let phys = pte & ADDR_MASK;
                 if refcount::page_ref_dec(phys) == 0 {
-                    // If the shootdown did not receive all ACKs, defer the
-                    // PMM release until every CPU has passed through a
-                    // quiescent state (timer ISR tick), guaranteeing TLB
-                    // drain before the frame is recycled.
-                    if shootdown_clean {
-                        pmm::free_page(phys);
-                    } else {
-                        crate::mm::tlb::quarantine_free(phys);
-                    }
+                    // Always route through quarantine_free, regardless of
+                    // shootdown_clean.  See the matching comment in
+                    // vmm::unmap_and_free_range_in for the full ordering
+                    // argument (W216 H_5i).  The one-tick grace period
+                    // (~10 ms at TICK_HZ=100) closes the window between a
+                    // sibling CPU's cache::lookup_and_acquire snapshot and
+                    // the PMM recycling the frame.
+                    crate::mm::tlb::quarantine_free(phys);
                 }
             }
             addr += 0x1000;
         }
     }
+    let _ = shootdown_clean; // diagnostic only; fast-path eliminated (W216 H_5i)
 
     // Free the private user-half page table structures.
     free_user_page_tables(cr3);
@@ -1337,16 +1337,17 @@ pub fn free_vm_space(vm_space: crate::mm::vma::VmSpace) {
             if pte & PAGE_PRESENT != 0 {
                 let phys = pte & ADDR_MASK;
                 if refcount::page_ref_dec(phys) == 0 {
-                    if shootdown_clean {
-                        pmm::free_page(phys);
-                    } else {
-                        crate::mm::tlb::quarantine_free(phys);
-                    }
+                    // Always route through quarantine_free, regardless of
+                    // shootdown_clean.  See the matching comment in
+                    // vmm::unmap_and_free_range_in for the full ordering
+                    // argument (W216 H_5i).
+                    crate::mm::tlb::quarantine_free(phys);
                 }
             }
             addr += 0x1000;
         }
     }
+    let _ = shootdown_clean; // diagnostic only; fast-path eliminated (W216 H_5i)
 
     // Free the private user-half page table structures (PDPT / PD / PT / PML4).
     free_user_page_tables(cr3);
