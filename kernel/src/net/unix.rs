@@ -87,6 +87,19 @@ struct UnixSocket {
     /// the in-memory pipe.
     shut_rd:     bool,
     shut_wr:     bool,
+    /// Count of open file-description references to this socket slot.
+    ///
+    /// `socket(2)` / `socketpair(2)` initialise this to 1.  Every call that
+    /// duplicates an open file description pointing at this slot — `dup(2)`,
+    /// `dup2(2)`, `dup3(2)`, and the fd-table copy performed by `fork(2)` and
+    /// `clone(2)` without `CLONE_FILES` — must call `inc_ref(id)` to bump this
+    /// count.  `close(2)` decrements it; only when the count reaches zero is
+    /// the slot actually recycled and the peer notified of the orderly close.
+    /// This mirrors the POSIX requirement that "all file descriptors referring
+    /// to the same open socket description" share a single underlying object
+    /// (POSIX.1-2017 §2.14, `man 2 fork`: "file descriptors shall be
+    /// duplicated", `man 2 dup`).
+    ref_count:   u32,
 }
 
 impl UnixSocket {
@@ -107,6 +120,7 @@ impl UnixSocket {
             backlog_len: 0,
             shut_rd:     false,
             shut_wr:     false,
+            ref_count:   0,
         }
     }
 
@@ -122,6 +136,7 @@ impl UnixSocket {
         self.backlog_len = 0;
         self.shut_rd     = false;
         self.shut_wr     = false;
+        self.ref_count   = 0;
     }
 
     fn recv_available(&self) -> usize {
@@ -168,8 +183,9 @@ pub fn create(kind: SockKind) -> u64 {
     for (i, s) in t.0.iter_mut().enumerate() {
         if s.state == UnixState::Free {
             s.reset();
-            s.state = UnixState::Unbound;
-            s.kind  = kind;
+            s.state     = UnixState::Unbound;
+            s.kind      = kind;
+            s.ref_count = 1;
             return i as u64;
         }
     }
@@ -238,9 +254,10 @@ pub fn connect(id: u64, path: &[u8]) -> i64 {
         for (i, s) in t.0.iter_mut().enumerate() {
             if i as u64 != id && s.state == UnixState::Free {
                 s.reset();
-                s.state   = UnixState::Connected;
-                s.kind    = server_kind;
-                s.peer_id = id;
+                s.state     = UnixState::Connected;
+                s.kind      = server_kind;
+                s.peer_id   = id;
+                s.ref_count = 1; // one reference: the fd returned by accept(2)
                 found = i as u64;
                 break;
             }
@@ -295,13 +312,15 @@ pub fn socketpair(kind: SockKind) -> (u64, u64) {
         if s.state == UnixState::Free {
             if a == u64::MAX {
                 s.reset();
-                s.state = UnixState::Connected;
-                s.kind  = kind;
+                s.state     = UnixState::Connected;
+                s.kind      = kind;
+                s.ref_count = 1; // one reference: fd[0] returned by socketpair(2)
                 a = i as u64;
             } else {
                 s.reset();
-                s.state = UnixState::Connected;
-                s.kind  = kind;
+                s.state     = UnixState::Connected;
+                s.kind      = kind;
+                s.ref_count = 1; // one reference: fd[1] returned by socketpair(2)
                 b = i as u64;
                 break;
             }
@@ -455,25 +474,60 @@ pub fn shutdown(id: u64, shut_rd_flag: bool, shut_wr_flag: bool) -> i64 {
     0
 }
 
-/// Tear down an AF_UNIX socket.
+/// Increment the open-file-description reference count for socket `id`.
 ///
-/// In addition to resetting the local slot we propagate the close as a
+/// Must be called whenever an existing fd pointing at this socket slot is
+/// duplicated — by `dup(2)`, `dup2(2)`, `dup3(2)`, or the fd-table copy
+/// performed inside `fork(2)` / `clone(2)` (without `CLONE_FILES`).
+/// Mirrors the `get_file()` increment in POSIX `dup_fd()`.  Per
+/// POSIX.1-2017 §2.14 and `man 2 fork`: "open file descriptors shall be
+/// duplicated"; the duplicated descriptors refer to the same open file
+/// description and therefore the same underlying socket object.
+pub fn inc_ref(id: u64) {
+    if id as usize >= MAX_UNIX_SOCKETS { return; }
+    let mut t = TABLE.lock();
+    let s = &mut t.0[id as usize];
+    if s.state != UnixState::Free {
+        s.ref_count = s.ref_count.saturating_add(1);
+    }
+}
+
+/// Tear down an AF_UNIX socket file description.
+///
+/// Decrements the open-file-description reference count.  The slot is only
+/// recycled — and the peer notified of the orderly close — when the count
+/// reaches zero, i.e. every fd that pointed at this socket across all
+/// processes has been closed.  This satisfies POSIX.1-2017 §2.14:
+/// "closing a file descriptor does not affect other file descriptors that
+/// refer to the same open file description".
+///
+/// When the last reference is dropped we propagate the close as a
 /// half-shutdown to the connected peer — flipping its `shut_rd` so any
 /// subsequent local read on that peer returns 0 (orderly EOF) and any
-/// epoll/poll waiter observes `EPOLLHUP` / `POLLHUP`.  This mirrors
-/// Linux AF_UNIX where closing one end surfaces on the other as EOF
-/// and a poll-readiness wake — IEEE 1003.1 §close / §poll, and the
-/// `man 7 unix` description of stream-socket teardown.
-///
-/// We ring `PollBellSource::UnixShutdown` so any thread currently parked
-/// in `epoll_wait` / `poll` on the peer fd is woken in the same tick
-/// rather than waiting out the 1 s resync floor — the wedge that caused
-/// the Mozilla parent IPC bus to spin on a closed child socket.
+/// epoll/poll waiter observes `EPOLLHUP` / `POLLHUP`.  We ring
+/// `PollBellSource::UnixShutdown` so any thread currently parked in
+/// `epoll_wait` / `poll` on the peer fd is woken in the same tick.
 pub fn close(id: u64) {
     if id as usize >= MAX_UNIX_SOCKETS { return; }
     let mut t = TABLE.lock();
-    let peer_id = t.0[id as usize].peer_id;
-    t.0[id as usize].reset();
+    let s = &mut t.0[id as usize];
+    if s.state == UnixState::Free { return; }
+    // Catch double-close or close-without-inc_ref in debug builds.
+    // ref_count==0 here means a slot is being closed more times than it
+    // was acquired, which is a kernel bookkeeping bug — not a user error.
+    debug_assert!(s.ref_count > 0,
+        "net::unix::close: id={} ref_count already 0 (double-close or \
+         missing inc_ref on dup/fork)", id);
+    // Decrement the reference count.  Only proceed with teardown when
+    // the last open reference is released (count reaches zero).
+    if s.ref_count > 1 {
+        s.ref_count -= 1;
+        return;
+    }
+    // ref_count == 1 (or 0 for legacy slots created before this field
+    // was added — treat as "last reference").
+    let peer_id = s.peer_id;
+    s.reset();
     let mut ring = false;
     if (peer_id as usize) < MAX_UNIX_SOCKETS {
         let peer = &mut t.0[peer_id as usize];
