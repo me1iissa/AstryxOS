@@ -1,5 +1,6 @@
 /*
- * libfontconfig-interposer.so — defensive FcPatternGet* *out wrappers.
+ * libfontconfig-interposer.so — defensive FcPatternGet* *out wrappers
+ * and PKCS#11 v3.0 shims for libipcclientcerts.so.
  *
  * Real upstream libfontconfig follows the spec strictly: when an
  * FcPatternGet* getter returns a non-Match FcResult (e.g.
@@ -51,12 +52,37 @@
  * This is a userspace-side workaround for a Mozilla caller bug; the
  * upstream libfontconfig binary is never patched, preserving the
  * "no upstream binary edits" invariant.
+ *
+ * ── PKCS#11 v3.0 C_GetInterface shim ────────────────────────────────
+ *
+ * W212: Firefox's content process (pid=3) loads libipcclientcerts.so as
+ * a PKCS#11 module.  NSS's module loader resolves C_GetInterface (the
+ * PKCS#11 v3.0 entry point defined in OASIS PKCS #11 v3.0 §5.5) from
+ * the loaded module handle.  libipcclientcerts.so only exports the v2.x
+ * entry point C_GetFunctionList; C_GetInterface is absent.  NSS treats
+ * the missing symbol as fatal → pid=3 SIGABRT.
+ *
+ * Fix: this interposer wraps dlsym().  When the caller looks up
+ * "C_GetInterface" on any handle, we return a stub that returns
+ * CKR_FUNCTION_NOT_SUPPORTED (0x54 per PKCS #11 v3.0 Table 1), telling
+ * NSS that the module does not implement the v3.0 interface.  NSS then
+ * falls back to the v2.x C_GetFunctionList path that libipcclientcerts
+ * exports correctly.
+ *
+ * The interposer is already LD_PRELOADed before every Firefox child
+ * process, so this wrapper fires for every dlsym() call in the process
+ * regardless of which library issued it.
+ *
+ * Reference: OASIS PKCS #11 Cryptographic Token Interface Base
+ * Specification v3.0 §5.5 C_GetInterface, §11 Return values.
+ * https://docs.oasis-open.org/pkcs11/pkcs11-base/v3.0/pkcs11-base-v3.0.html
  */
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 /* fontconfig public ABI (from <fontconfig/fontconfig.h>).
  *
@@ -492,4 +518,83 @@ FcPatternGetRange(const FcPattern *p, const char *object, int n, FcRange **r)
         *r = (FcRange *)fc_stub_range;
     }
     return res;
+}
+
+/* ────────────────────────────────────────────────────────────────────
+ * PKCS#11 v3.0 C_GetInterface stub.
+ *
+ * OASIS PKCS #11 v3.0 §5.5:
+ *   CK_RV C_GetInterface(CK_UTF8CHAR_PTR pInterfaceName,
+ *                        CK_VERSION_PTR  pVersion,
+ *                        CK_INTERFACE_PTR_PTR ppInterface,
+ *                        CK_FLAGS flags);
+ *
+ * All PKCS#11 types are ultimately either pointers or unsigned longs.
+ * We use void* / unsigned long here to avoid pulling in the full
+ * PKCS#11 header; the ABI is identical on x86-64 System V.
+ *
+ * Returning CKR_FUNCTION_NOT_SUPPORTED (0x54) is the correct response
+ * when a v2.x-only module is queried for a v3.0 interface: the caller
+ * (NSS) must fall back to C_GetFunctionList per PKCS #11 v3.0 §6.1.
+ * ──────────────────────────────────────────────────────────────────── */
+static unsigned long
+pkcs11_C_GetInterface_not_supported(void *pInterfaceName,
+                                    void *pVersion,
+                                    void **ppInterface,
+                                    unsigned long flags)
+{
+    (void)pInterfaceName;
+    (void)pVersion;
+    (void)ppInterface;
+    (void)flags;
+    /* CKR_FUNCTION_NOT_SUPPORTED = 0x00000054 per PKCS #11 v3.0 Table 1. */
+    return 0x00000054UL;
+}
+
+/* ────────────────────────────────────────────────────────────────────
+ * dlsym wrapper — intercept C_GetInterface lookups.
+ *
+ * glibc's dlsym(handle, name) finds only symbols exported by <handle>
+ * and its transitive DT_NEEDED dependencies.  libipcclientcerts.so
+ * exports only C_GetFunctionList (v2.x); C_GetInterface is absent.
+ * We interpose dlsym so that any lookup for "C_GetInterface" — on any
+ * handle — returns our stub above, giving NSS the graceful-failure
+ * response instead of a NULL that it treats as fatal.
+ *
+ * Bootstrap problem: dlsym cannot call dlsym(RTLD_NEXT, "dlsym") to
+ * find itself (infinite recursion).  The POSIX-standard workaround is
+ * dlvsym, which bypasses the wrapper because it requests a versioned
+ * symbol — the version node lives at a different PLT slot.
+ * GLIBC_2.2.5 is the version under which dlsym has been exported since
+ * glibc 2.2.5; all Firefox-target systems carry it.
+ *
+ * All other lookups are forwarded to the real dlsym.
+ * ──────────────────────────────────────────────────────────────────── */
+typedef void *(*dlsym_fn)(void *handle, const char *name);
+
+void *
+dlsym(void *handle, const char *name)
+{
+    static dlsym_fn real_dlsym = NULL;
+
+    /* Intercept first: avoids any risk of a reentrant bootstrap call
+     * while real_dlsym is being initialised on the first dlsym call.
+     * POSIX dlsym(3) guarantees name is non-NULL. */
+    if (strcmp(name, "C_GetInterface") == 0) {
+        return (void *)pkcs11_C_GetInterface_not_supported;
+    }
+
+    /* Bootstrap the real dlsym via dlvsym.  dlvsym is NOT interposed by
+     * this wrapper (different symbol name), so this call does not
+     * recurse.  The version string "GLIBC_2.2.5" is the stable glibc
+     * ABI version for dlsym on all Linux x86-64 platforms. */
+    if (!real_dlsym) {
+        real_dlsym = (dlsym_fn)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
+    }
+
+    if (!real_dlsym) {
+        return NULL;
+    }
+
+    return real_dlsym(handle, name);
 }
