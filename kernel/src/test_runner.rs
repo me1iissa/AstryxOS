@@ -19,8 +19,15 @@ const EXIT_SUCCESS: u32 = 0x00; // QEMU exits with code 1
 const EXIT_FAILURE: u32 = 0x01; // QEMU exits with code 3
 
 fn qemu_exit(code: u32) -> ! {
+    // Emit a terminal marker BEFORE the outl so the serial watcher can
+    // detect the exit attempt and terminate immediately without waiting
+    // for the 30-second idle timeout.  The marker is structured so
+    // watch-test.py and qemu-harness.py can both grep for it.
+    crate::serial_println!("[QEMU-EXIT] code={}", code);
     unsafe { crate::hal::outl(QEMU_EXIT_PORT, code); }
-    // If debug-exit device isn't present, halt instead
+    // Fallback if the isa-debug-exit device is absent: spin on hlt.
+    // The serial marker above lets the watcher kill QEMU cleanly even
+    // if the outl has no effect.
     loop { unsafe { core::arch::asm!("cli; hlt"); } }
 }
 
@@ -1557,6 +1564,16 @@ pub fn run() -> ! {
     // page-aliasing race.  See `test_mm_sem_registry_w216` doc comment.
     total += 1;
     if test_mm_sem_registry_w216() { passed += 1; }
+
+    // ── Test 219: socket-fd refcount survives child close (W216 H_A) ────
+    // Regression guard for the W216 Hypothesis A bug: clone_for_fork did
+    // not increment ref_count on inherited socket FDs, so the first
+    // close(2) from either the parent or child destroyed the shared socket
+    // object (POSIX.1-2017 §2.14).  Without PR #233 this test fails:
+    // the simulated "child close" drops ref_count to 0, resets the slot,
+    // and the subsequent write/read yields -EPIPE / -EBADF.
+    total += 1;
+    if test_socketpair_survives_child_close_w216() { passed += 1; }
 
     // (Tests 199/200 run earlier — right after Test 80c — so the vDSO
     // TSC fast path is verified before the slow PNG screenshot test.
@@ -27761,6 +27778,104 @@ fn test_mm_sem_registry_w216() -> bool {
 
     if ok { test_pass!("per-VmSpace mm_sem RwLock contract (W216)"); }
     ok
+}
+
+// ── Test 219: socket-fd refcount survives child close (W216 H_A) ────────────
+//
+// Exercises the POSIX.1-2017 §2.14 invariant that closing one file descriptor
+// pointing at an open socket description must not affect other descriptors
+// pointing at the same description.
+//
+// Sequence:
+//   1. socketpair(AF_UNIX, SOCK_STREAM) → (id_a, id_b), both at ref_count=1.
+//   2. inc_ref(id_b) — simulates the fd-table copy that fork(2) performs;
+//      ref_count for id_b rises to 2 (parent holds one, child holds one).
+//   3. close(id_b) — simulates the child's pre-exec fd cleanup;
+//      ref_count drops to 1.  The slot must NOT be freed yet.
+//   4. Assert state(id_b) == Connected.  Without PR #233 the slot is
+//      already Free here, and the write below would return -EPIPE.
+//   5. Assert peer_closed(id_a) == false (peer not yet notified of close).
+//   6. Write "ping" through id_a (delivered into id_b's recv buffer).
+//   7. Read from id_b, assert payload == "ping".
+//   8. Final close(id_b) + close(id_a) — tears both slots down.
+fn test_socketpair_survives_child_close_w216() -> bool {
+    test_header!("socketpair refcount survives child close (W216 H_A)");
+    use crate::net::unix::{self, SockKind, UnixState};
+
+    // Step 1: create a connected pair.
+    let (id_a, id_b) = unix::socketpair(SockKind::Stream);
+    if id_a == u64::MAX || id_b == u64::MAX {
+        test_fail!("socketpair_survives_child_close_w216",
+            "socketpair returned invalid ids ({}, {})", id_a, id_b);
+        return false;
+    }
+    test_println!("  socketpair → id_a={}, id_b={} ✓", id_a, id_b);
+
+    // Step 2: simulate fork's fd-table copy — bump ref_count on id_b.
+    unix::inc_ref(id_b);
+    test_println!("  inc_ref(id_b) — simulates fork fd-table copy ✓");
+
+    // Step 3: simulate child's close(id_b).  With PR #233 this decrements
+    // ref_count 2→1 and returns without freeing the slot.  Without it the
+    // slot would be reset here and steps 4–7 would fail.
+    unix::close(id_b);
+    test_println!("  close(id_b) — simulates child close ✓");
+
+    // Step 4: slot must still be Connected.
+    let st = unix::state(id_b);
+    if st != UnixState::Connected {
+        test_fail!("socketpair_survives_child_close_w216",
+            "state(id_b) = {:?} after child close (want Connected); \
+             missing inc_ref-on-fork?", st);
+        return false;
+    }
+    test_println!("  state(id_b) == Connected ✓");
+
+    // Step 5: id_a must not observe a peer-close notification yet.
+    if unix::peer_closed(id_a) {
+        test_fail!("socketpair_survives_child_close_w216",
+            "peer_closed(id_a) = true after child close (want false)");
+        return false;
+    }
+    test_println!("  peer_closed(id_a) == false ✓");
+
+    // Step 6: write "ping" through id_a — delivers into id_b's recv buffer.
+    let msg = b"ping";
+    let n = unix::write(id_a, msg);
+    if n != msg.len() as i64 {
+        test_fail!("socketpair_survives_child_close_w216",
+            "write(id_a, \"ping\") returned {} (expected {})", n, msg.len());
+        return false;
+    }
+    test_println!("  write(id_a, {:?}) → {} ✓", core::str::from_utf8(msg).unwrap_or("?"), n);
+
+    // Step 7: read back from id_b.
+    let mut buf = [0u8; 16];
+    let nr = unix::read(id_b, &mut buf);
+    if nr != msg.len() as i64 {
+        test_fail!("socketpair_survives_child_close_w216",
+            "read(id_b) returned {} (expected {})", nr, msg.len());
+        return false;
+    }
+    if &buf[..nr as usize] != msg {
+        test_fail!("socketpair_survives_child_close_w216",
+            "payload mismatch: got {:?}", &buf[..nr as usize]);
+        return false;
+    }
+    test_println!("  read(id_b) → {:?} ✓", core::str::from_utf8(&buf[..nr as usize]).unwrap_or("?"));
+
+    // Step 8: final teardown — last references released.
+    unix::close(id_b);
+    unix::close(id_a);
+    if unix::state(id_b) != UnixState::Free {
+        test_fail!("socketpair_survives_child_close_w216",
+            "state(id_b) not Free after final close");
+        return false;
+    }
+    test_println!("  final close — both slots freed ✓");
+
+    test_pass!("socketpair refcount survives child close (W216 H_A)");
+    true
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
