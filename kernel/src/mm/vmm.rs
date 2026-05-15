@@ -623,6 +623,14 @@ pub fn unmap_and_free_range_in(pml4_phys: u64, base: u64, length: u64) -> usize 
     let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
     let _mm_read = _mm_guard.as_ref().map(|s| s.read());
 
+    // W216 H_5j-B: notify any in-flight PFH install loop that frames in this
+    // address space are being freed.  The PFH samples the generation after
+    // the post-I/O VMA revalidate (PR #226 / #230) and re-checks before each
+    // cache::insert + map_page_in iteration; bumping here ensures the loop
+    // aborts before it can install a PTE pointing at a frame this routine
+    // has just queued for free.
+    crate::mm::vma::bump_generation_for_cr3(pml4_phys);
+
     let mut freed = 0usize;
     let mut pg = base;
     let end = base.saturating_add(length);
