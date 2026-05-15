@@ -17075,7 +17075,37 @@ fn test_execve_no_pmm_leak() -> bool {
 
     if !was_active { crate::sched::disable(); }
 
-    // 4. Check PMM free page count after all iterations.
+    // 4. Flush the quarantine ring before measuring PMM state.
+    //
+    // PR #231 (W216 H_5i) unconditionally routes freed frames through
+    // quarantine_free(), which defers their return to the PMM until every
+    // CPU's timer ISR has advanced past the enqueue tick (the quiescent-state
+    // condition).  Without this drain, frames freed during the exec loop sit
+    // in the quarantine ring and make the PMM count appear lower than it
+    // should be — they are NOT leaked, merely deferred.
+    //
+    // We simulate the timer ISR advancing two ticks beyond the current global
+    // tick on every online CPU.  on_cpu_tick() updates each CPU's
+    // CPU_LAST_TICK stamp and then drains any quarantine entry whose
+    // enqueue_tick < min(CPU_LAST_TICK[*]).  After ncpu calls the condition
+    // is met and all deferred frames are returned to the PMM before we take
+    // the post-exec snapshot below.
+    {
+        use core::sync::atomic::Ordering;
+        let drain_tick = crate::arch::x86_64::irq::TICK_COUNT
+            .load(Ordering::Relaxed)
+            .saturating_add(2);
+        let ncpus = (crate::arch::x86_64::apic::cpu_count() as usize)
+            .min(crate::arch::x86_64::apic::MAX_CPUS)
+            .max(1);
+        for _cpu in 0..ncpus {
+            crate::mm::tlb::on_cpu_tick(drain_tick);
+        }
+        test_println!("  Quarantine drain: simulated tick={} across {} CPU(s) ✓",
+            drain_tick, ncpus);
+    }
+
+    // 5. Check PMM free page count after all iterations.
     let pages_after = crate::mm::pmm::free_page_count();
     let tolerance = TOLERANCE_PER_ITER * ITERS as u64;
     test_println!("  PMM free pages before: {}", pages_before);
