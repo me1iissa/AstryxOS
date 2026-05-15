@@ -1985,8 +1985,22 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 _ => -22, // EINVAL — unknown command
             }
         }
-        // 334: rseq(rseq, rseq_len, flags, sig)
-        334 => -38, // ENOSYS
+        // 334: rseq(rseq_ptr, rseq_len, flags, sig) — restartable sequences.
+        //
+        // The rseq syscall registers a per-thread shared memory area that the
+        // kernel updates on preemption/migration so that user-space can restart
+        // in-flight per-CPU operations without a syscall.  We do not implement
+        // the rseq ABI; returning 0 (success) tells glibc 2.34 that rseq is
+        // available.  glibc's fast paths use the rseq region only as an
+        // optimisation; when the kernel never writes to the region, glibc falls
+        // back to its non-rseq atomic primitives transparently.
+        //
+        // Returning ENOSYS (-38) caused glibc 2.34 __rseq_init() to treat the
+        // thread as broken and abort browser content-process initialisation
+        // before any rendering work could begin (W210 investigation).
+        //
+        // Reference: https://man7.org/linux/man-pages/man2/rseq.2.html
+        334 => 0, // success — rseq accepted but not implemented
 
         // ─── Phase 6 additions ────────────────────────────────────────────
 
