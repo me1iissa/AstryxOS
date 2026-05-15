@@ -4,6 +4,11 @@
 //! Called once per compositor tick via [`pump_input`].  Reads the PS/2
 //! keyboard scancode ring-buffer and current mouse state, performs hit
 //! testing, and posts the appropriate `WM_*` / `WM_NC*` messages.
+//!
+//! In addition to delivering events to native WM windows, this module
+//! forwards the same events to the Xastryx X11 server via
+//! [`crate::x11::inject_key_event`] and [`crate::x11::inject_mouse_event`].
+//! The X11 paths are no-ops when Xastryx is not yet initialised.
 
 extern crate alloc;
 
@@ -18,6 +23,32 @@ use crate::wm::desktop;
 use crate::wm::hittest::{self, HitTestResult};
 use crate::wm::window::{self, WindowHandle};
 use crate::wm::zorder;
+
+// ── PS/2 Set 1 → X11 keycode mapping ──────────────────────────────────────
+//
+// X11 keycodes follow the X.Org / evdev convention: keycode = AT scancode + 8.
+// For the PS/2 Set 1 make-codes the relationship is direct: most keys simply
+// add 8.  A small number of keys require an explicit entry because their Set 1
+// scancode differs from the corresponding AT scancode (e.g. extended E0-prefix
+// keys that the IRQ1 handler has already stripped to a single byte).
+//
+// Reference: X Window System Protocol §5 (keycodes 8–255); X.Org xf86-input-*
+// scancode tables (public spec); PC/AT keyboard controller specification.
+
+/// Translate a PS/2 Set 1 base scancode (break bit already cleared) to the
+/// corresponding X11 keycode.  Returns `None` for unrecognised scancodes that
+/// would produce a keycode outside the valid 8–255 range.
+fn ps2_to_x11_keycode(sc: u8) -> Option<u8> {
+    // The vast majority of Set 1 make-codes map directly: x11 = sc + 8.
+    // Verify with the test-runner constant: 'A' is Set 1 sc=0x1E → 0x1E+8=0x26,
+    // which matches KEYCODE_A=0x26 in test_runner.rs.
+    let kc = sc.saturating_add(8);
+    // Discard anything outside the valid X11 keycode range.
+    if kc < 8 {
+        return None;
+    }
+    Some(kc)
+}
 
 // ── Win32 HT* constants ────────────────────────────────────────────────────
 
@@ -108,6 +139,15 @@ pub fn pump_input() {
 
     if mouse_moved || buttons_changed {
         process_mouse(&state, mx, my, buttons);
+
+        // ── X11 mouse forwarding ───────────────────────────────────────
+        // Forward to Xastryx unconditionally (not gated on a native window
+        // being hit) so that X11 clients receive root-window pointer events
+        // even when the cursor is over the desktop background.
+        // inject_mouse_event is a no-op when Xastryx is not yet initialised.
+        let x11_x = mx.min(i16::MAX as i32).max(i16::MIN as i32) as i16;
+        let x11_y = my.min(i16::MAX as i32).max(i16::MIN as i32) as i16;
+        crate::x11::inject_mouse_event(x11_x, x11_y, buttons, state.prev_buttons);
     }
 
     // Update previous mouse state *after* processing.
@@ -254,6 +294,14 @@ fn process_keyboard(state: &mut InputState) {
             // Route to the active (focused) window.
             msg.hwnd = active_hwnd;
             queue::post_message(msg.hwnd, msg.msg, msg.wparam, msg.lparam);
+        }
+
+        // ── X11 forwarding ────────────────────────────────────────────
+        // Translate PS/2 Set 1 scancode to X11 keycode and inject into
+        // Xastryx.  inject_key_event is a no-op when Xastryx is not yet
+        // initialised, so this is safe at any boot phase.
+        if let Some(x11_kc) = ps2_to_x11_keycode(base_sc) {
+            crate::x11::inject_key_event(x11_kc, pressed);
         }
     }
 }
