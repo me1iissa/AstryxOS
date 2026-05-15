@@ -2559,7 +2559,19 @@ pub fn reap_dead_threads() -> usize {
         threads.swap_remove(idx);
         reaped += 1;
 
-        // Free kernel stack pages (convert higher-half back to physical)
+        // Free kernel stack pages (convert higher-half back to physical).
+        //
+        // Zero each page before returning it to PMM.  A dead thread's
+        // kernel stack contains saved register state (RIP, RSP, callee-
+        // saved GPRs) and local kernel pointers that look like valid
+        // kernel-space addresses (0xFFFF_8000… range).  PMM does not
+        // zero on free or alloc, so a subsequent pmm::alloc_page call
+        // from the page-cache fill path (or any other path that performs
+        // a partial write) could expose these bytes to user-space.  The
+        // unconditional wipe makes freed kernel-stack pages opaque — any
+        // future short-read or partial-copy path sees zeros rather than
+        // kernel pointer fragments.  Per Intel SDM Vol. 3A §4.10.5, the
+        // hardware applies no such guarantee.
         if stack_base > 0 && stack_pages > 0 {
             let phys_base = if stack_base >= KERNEL_VIRT_OFFSET {
                 stack_base - KERNEL_VIRT_OFFSET
@@ -2567,7 +2579,20 @@ pub fn reap_dead_threads() -> usize {
                 stack_base // Legacy physical-address stacks (TID 0)
             };
             for p in 0..stack_pages {
-                crate::mm::pmm::free_page(phys_base + (p * 4096) as u64);
+                let pa = phys_base + (p * 4096) as u64;
+                // SAFETY: the virtual address KERNEL_VIRT_OFFSET + pa is the
+                // higher-half direct-map alias of this physical page.  The
+                // thread has been removed from THREAD_TABLE; no other CPU
+                // holds a reference to this stack (the context-switch path
+                // ensures the thread is not scheduled after is_reapable()).
+                unsafe {
+                    core::ptr::write_bytes(
+                        (KERNEL_VIRT_OFFSET + pa) as *mut u8,
+                        0,
+                        4096,
+                    );
+                }
+                crate::mm::pmm::free_page(pa);
             }
         }
 

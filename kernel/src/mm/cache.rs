@@ -254,9 +254,33 @@ pub fn prepopulate_file(path: &str) -> usize {
         // sector range, and issues large multi-sector block-device calls —
         // one virtio request per up-to-1 MiB-aligned segment of the burst.
         // (`fs` was snapshotted above; MOUNTS is not held during the read.)
+        //
+        // Per POSIX read(2), a successful read may return fewer bytes than
+        // requested (short read).  We MUST honour the returned length —
+        // bytes beyond it in chunk_buf are stale heap content from prior
+        // iterations and must not be installed into the page cache.
         let read_buf = &mut chunk_buf[..this_chunk];
-        if fs.read(inode, chunk_start, read_buf).is_err() {
-            break;
+        let bytes_read = match fs.read(inode, chunk_start, read_buf) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if bytes_read == 0 {
+            // EOF or transient zero-return: skip this chunk and advance so
+            // the outer loop does not spin forever.
+            offset = chunk_start + this_chunk as u64;
+            continue;
+        }
+        // Zero-fill the unread tail of chunk_buf so subsequent page-slicing
+        // below never copies stale heap bytes into the page cache.
+        if bytes_read < this_chunk {
+            // SAFETY: read_buf covers [0..this_chunk]; bytes_read <= this_chunk.
+            unsafe {
+                core::ptr::write_bytes(
+                    read_buf.as_mut_ptr().add(bytes_read),
+                    0,
+                    this_chunk - bytes_read,
+                );
+            }
         }
 
         // Split the chunk into 4 KiB pages, allocating a PMM frame for each
@@ -277,10 +301,17 @@ pub fn prepopulate_file(path: &str) -> usize {
                 // SAFETY: PMM hands out an exclusive 4 KiB physical frame.
                 // The higher-half identity map covers it, and the page cache
                 // is the sole owner once we insert.
+                //
+                // Always zero the destination frame before copying.  PMM does
+                // not guarantee zeroed pages on alloc (Intel SDM Vol. 3A,
+                // §4.10.5 describes no such invariant), so any partial copy
+                // — whether from a short fs.read or a tail-of-file page —
+                // would expose PMM-recycled content to user-space if we only
+                // zero when copy_len < page_size.  The unconditional bzero is
+                // inexpensive relative to the prior disk I/O and eliminates
+                // the class of stale-content faults entirely.
                 unsafe {
-                    if copy_len < page_size as usize {
-                        core::ptr::write_bytes(dst, 0, page_size as usize);
-                    }
+                    core::ptr::write_bytes(dst, 0, page_size as usize);
                     core::ptr::copy_nonoverlapping(
                         chunk_buf.as_ptr().add(page_off_in_chunk),
                         dst,
