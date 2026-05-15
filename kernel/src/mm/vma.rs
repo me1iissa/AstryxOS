@@ -868,16 +868,17 @@ impl VmSpace {
                 }
             }
 
-            // Unmap pages in [new_brk, old_brk).  TLB invalidation is
-            // coalesced into a single cross-CPU shootdown after the
-            // loop — one IPI for the whole brk shrink.
-            let mut page_addr = new_brk;
-            while page_addr < old_brk {
-                crate::mm::vmm::unmap_page_in(self.cr3, page_addr);
-                page_addr += 0x1000;
-            }
+            // Unmap pages in [new_brk, old_brk) and return their frames to the
+            // PMM.  `unmap_and_free_range_in` clears each PTE, decrements the
+            // page refcount, performs a cross-CPU TLB shootdown, and frees any
+            // frame whose refcount reaches zero (or routes through quarantine if
+            // the shootdown timed out).  This replaces the former
+            // unmap_page_in + shootdown_range pair, which cleared PTEs and
+            // issued the TLB shootdown but never called page_ref_dec or
+            // pmm::free_page — leaking every shrunk heap page permanently into
+            // the PMM until process exit (W216 audit brk-shrink finding).
             if new_brk < old_brk {
-                crate::mm::tlb::shootdown_range(self.cr3, new_brk, old_brk);
+                crate::mm::vmm::unmap_and_free_range_in(self.cr3, new_brk, old_brk - new_brk);
             }
         }
 
