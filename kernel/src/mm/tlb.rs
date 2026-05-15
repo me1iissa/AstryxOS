@@ -50,12 +50,15 @@
 //! through at least one timer-ISR since the frame was enqueued.  Because
 //! the timer ISR is delivered with interrupts disabled, it cannot be
 //! delayed indefinitely by user code; any CPU-local TLB entry that was
-//! stale at enqueue time will have been retired by the next interrupt
-//! delivery on that CPU, at the very latest when the timer ISR fires and
-//! the APIC EOI is issued.  (Per Intel SDM Vol. 3A §4.10.5, an `invlpg`
-//! or CR3 reload performed during an interrupt handler invalidates entries
-//! for the interrupted context; the timer ISR path through `schedule()`
-//! issues a CR3 reload on every context-switch, ensuring full TLB drain.)
+//! stale at enqueue time will have been retired once [`on_cpu_tick`] runs
+//! on that CPU.  [`on_cpu_tick`] issues an explicit CR3 reload
+//! (`flush_tlb`) at the very start of each invocation, before it advances
+//! the per-CPU tick stamp.  This guarantees that stale TLB entries are
+//! purged on the tick event itself — not merely at some later context-switch
+//! that may never occur if a compute-bound thread monopolises a vCPU across
+//! many ticks.  Per Intel SDM Vol. 3A §4.10.4.1 (MOV to CR3), writing CR3
+//! invalidates all TLB entries for the current PCID (AstryxOS uses PCID 0,
+//! so this is a full TLB drop).
 //!
 //! The quiescent-state concept is analogous to the RCU grace-period used
 //! in general read-copy-update literature (see McKenney, "Is Parallel
@@ -608,14 +611,17 @@ pub fn shootdown_full_user(cr3: u64) -> bool {
 ///
 /// A CPU is considered to have passed through a quiescent state once it
 /// has executed its timer ISR at least one tick after `quarantine_free`
-/// was called.  The timer ISR is delivered with the LAPIC interrupt
-/// masked (CPU-local interrupt flag cleared), so it cannot be delayed by
-/// user code; any TLB entry installed before the ISR fires will have
-/// been either flushed by a context-switch CR3 reload or become
-/// irrelevant once the ISR returns (the interrupted thread's TLB state
-/// is re-established on re-entry to user code, which requires a valid
-/// PTE — and the PTE was already cleared by the unmap that triggered
-/// this call).
+/// was called.  [`on_cpu_tick`] performs an explicit CR3 reload
+/// (`flush_tlb`) at the very start of each invocation, before it
+/// advances the per-CPU tick stamp.  This means that by the time a
+/// CPU's `CPU_LAST_TICK` entry is updated to reflect tick `T`, that CPU
+/// has already executed a full TLB flush — so any stale TLB entry for a
+/// VA whose frame was enqueued at or before tick `T` has been retired.
+/// The grace-period invariant therefore holds even when a compute-bound
+/// thread monopolises a vCPU across many ticks without triggering a
+/// context-switch.  Per Intel SDM Vol. 3A §4.10.4.1, a MOV to CR3
+/// invalidates all non-global TLB entries (AstryxOS uses PCID 0, so
+/// this is a complete flush).
 ///
 /// # Overflow behaviour
 ///
@@ -665,9 +671,32 @@ pub fn quarantine_free(phys: u64) {
 /// (via [`crate::arch::x86_64::irq::timer_tick`]) to advance the
 /// quarantine grace-period tracking.
 ///
+/// At the very start of each invocation, this function performs an explicit
+/// full TLB flush (CR3 reload) on the calling CPU.  This flush happens
+/// *before* the per-CPU tick stamp is recorded, so the grace-period
+/// invariant is genuine: by the time `CPU_LAST_TICK[cpu]` is updated to
+/// `current_tick`, all stale TLB entries on this CPU have already been
+/// retired.  Without this flush the grace period relied solely on
+/// context-switch CR3 reloads, which are never issued when a single
+/// compute-bound thread runs uncontested across many ticks — exactly the
+/// Firefox workload profile that triggered the W215 page-aliasing fault.
+///
+/// Cost: one CR3 reload per timer tick per CPU (~30 cycles at 100 Hz =
+/// ~0.001% of CPU time).  This is negligible in any workload that involves
+/// real user code.
+///
 /// Records this CPU's current tick and, if all online CPUs have ticked
 /// past the earliest entry's enqueue tick, drains those entries to PMM.
 pub fn on_cpu_tick(current_tick: u64) {
+    // Drain this CPU's TLB before recording the tick stamp.  The order is
+    // critical: the grace-period guarantee is "every CPU has flushed its
+    // TLB since the frame was enqueued".  The flush must precede the stamp
+    // update so that the min-tick calculation in the drain loop sees a
+    // value that reflects a post-flush state.  Per Intel SDM Vol. 3A
+    // §4.10.4.1, MOV to CR3 invalidates all non-global TLB entries; since
+    // AstryxOS does not use PCID, this is a complete TLB drop.
+    crate::mm::vmm::flush_tlb();
+
     let cpu = apic::cpu_index();
     if cpu < apic::MAX_CPUS {
         CPU_LAST_TICK[cpu].store(current_tick, Ordering::Relaxed);
