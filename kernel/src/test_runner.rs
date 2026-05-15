@@ -27679,12 +27679,70 @@ fn test_mm_sem_registry_w216() -> bool {
             "child cr3={:#x} still in registry after drop", child_cr3);
         ok = false;
     }
+    // Release the test's own Arc clone before dropping the VmSpace so the
+    // strong_count reaches exactly 2 (vs + registry) at drop time.  The
+    // Drop impl guards removal with count == 2; retaining `parent_arc` here
+    // would inflate the count to 3 and incorrectly block deregistration.
+    drop(parent_arc);
     drop(vs);
     if vma::mm_sem_for_cr3(cr3).is_none() {
         test_println!("  drop(parent) deregistered cr3={:#x} ✓", cr3);
     } else {
         test_fail!("mm_sem_registry_w216",
             "parent cr3={:#x} still in registry after drop", cr3);
+        ok = false;
+    }
+
+    // Property 6: vfork-style shared mm_sem — from_existing_cr3 gap (W216 review).
+    //
+    // Build a new parent VmSpace, then construct a vfork-style child via
+    // `from_existing_cr3` sharing the parent's Arc.  Drop the child and verify
+    // that the parent's registry entry and mm_sem are still intact — this is
+    // the gap the review identified: the old code allocated a fresh Arc for the
+    // child, overwrote the registry slot, and child-drop removed the entry,
+    // leaving the parent with a None lookup that silently skipped mm_sem
+    // acquisition on every subsequent PTE-mutating call.
+    test_println!("  property 6: vfork-style shared mm_sem (from_existing_cr3)");
+    let parent_vs = match vma::VmSpace::new_user() {
+        Some(v) => v,
+        None => {
+            test_println!("  new_user failed for p6 — skip");
+            if ok { test_pass!("per-VmSpace mm_sem RwLock contract (W216)"); }
+            return ok;
+        }
+    };
+    let p6_cr3         = parent_vs.cr3;
+    let p6_parent_arc  = parent_vs.mm_sem.clone();
+    // Build a vfork child sharing the parent's mm_sem.
+    let p6_child = vma::VmSpace::from_existing_cr3(p6_cr3, p6_parent_arc.clone());
+    // Drop child: registry entry must SURVIVE (strong_count was > 1).
+    drop(p6_child);
+    match vma::mm_sem_for_cr3(p6_cr3) {
+        Some(ref looked) if alloc::sync::Arc::ptr_eq(looked, &p6_parent_arc) => {
+            test_println!("  vfork child drop preserved parent registry entry ✓");
+        }
+        Some(_) => {
+            test_fail!("mm_sem_registry_w216",
+                "vfork child drop replaced registry Arc (should have shared parent's)");
+            ok = false;
+        }
+        None => {
+            test_fail!("mm_sem_registry_w216",
+                "vfork child drop evicted parent registry entry at cr3={:#x}", p6_cr3);
+            ok = false;
+        }
+    }
+    // Drop parent: registry entry must now be gone.
+    // Release the test-local Arc clone first so the strong_count at
+    // parent_vs drop is exactly 2 (parent_vs + registry) — the condition
+    // the Drop impl requires to evict the registry slot.
+    drop(p6_parent_arc);
+    drop(parent_vs);
+    if vma::mm_sem_for_cr3(p6_cr3).is_none() {
+        test_println!("  vfork parent drop deregistered cr3={:#x} ✓", p6_cr3);
+    } else {
+        test_fail!("mm_sem_registry_w216",
+            "vfork parent cr3={:#x} still in registry after parent drop", p6_cr3);
         ok = false;
     }
 

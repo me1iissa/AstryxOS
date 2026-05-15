@@ -249,12 +249,15 @@ impl fmt::Debug for VmArea {
 ///
 /// ## Construction
 ///
-/// `mm_sem` is an `Arc<RwLock<()>>`.  All in-kernel constructors
-/// (`new_kernel`, `new_user`, `from_existing_cr3`, `clone_for_fork`)
-/// allocate a fresh lock.  Test helpers in `kernel/src/test_runner.rs`
+/// `mm_sem` is an `Arc<RwLock<()>>`.  Constructors that create a new address
+/// space (`new_kernel`, `new_user`, `clone_for_fork`) allocate a fresh lock.
+/// `from_existing_cr3` SHARES the caller-supplied Arc (the parent's lock) so
+/// that vfork-child and parent share the same `mm_sem`; the Drop impl guards
+/// registry removal with `Arc::strong_count == 2` (only self + registry) so
+/// the parent's entry survives the child's drop.  Test helpers in `kernel/src/test_runner.rs`
 /// that build `VmSpace` via struct-literal syntax call
-/// `make_mm_sem_for_test()`.  The child of a fork gets its OWN lock —
-/// the parent and child are independent address spaces post-fork.
+/// `make_mm_sem_for_test()`.  The child of a `clone_for_fork` gets its OWN
+/// lock — the parent and child are independent address spaces post-fork.
 pub struct VmSpace {
     /// Physical address of the PML4 page table root.
     pub cr3: u64,
@@ -354,24 +357,34 @@ impl VmSpace {
     /// Create a VmSpace that uses an existing CR3 (e.g., for vfork children
     /// that share the parent's page tables but need their own VMA tracking).
     ///
-    /// The new VmSpace gets its own fresh `mm_sem`, even though it shares
-    /// `cr3` with the parent.  Both processes' `mm_sem`s will serialise the
-    /// SAME `cr3`-keyed registry slot — only the most-recently-registered
-    /// holder is visible.  Vfork semantics (`vfork(2)`) require the parent
-    /// to be suspended until the child execs or exits, so concurrent
-    /// page-table mutation through both VmSpaces is precluded by the
-    /// process state machine; the registry slot transition between
-    /// parent-owned and child-owned is therefore safe.
-    pub fn from_existing_cr3(cr3: u64) -> Self {
-        let mm_sem = Arc::new(RwLock::new(()));
-        register_mm_sem(cr3, mm_sem.clone());
+    /// `parent_mm_sem` must be the `Arc<RwLock<()>>` already registered under
+    /// `cr3` in `MM_REGISTRY` — typically `parent_vm_space.mm_sem.clone()`.
+    /// The child VmSpace shares this same Arc so that:
+    ///
+    ///   * Both parent and child calls to `mm_sem_for_cr3(cr3)` return the
+    ///     SAME lock object, serialising concurrent PTE mutations against any
+    ///     `clone_for_fork` / `free_vm_space` write-lock acquisition.
+    ///   * The registry entry is only removed when the LAST owner drops —
+    ///     see the `Drop` impl which guards removal with `Arc::strong_count`.
+    ///
+    /// Allocating a fresh Arc here (as the pre-fix code did) would overwrite
+    /// the registry slot with a new lock object, so the parent's subsequent
+    /// `mm_sem_for_cr3` lookups return a different (child-owned) lock.  When
+    /// the child later drops its VmSpace the registry slot is removed, and
+    /// every subsequent PTE-mutating call on the parent silently skips the
+    /// lock acquisition — re-opening the W215 race.
+    pub fn from_existing_cr3(cr3: u64, parent_mm_sem: Arc<RwLock<()>>) -> Self {
+        // The Arc clone bumps the strong count; the registry entry is already
+        // present (the parent's VmSpace registered it at construction).  No
+        // re-registration is needed — `mm_sem_for_cr3(cr3)` already returns
+        // this Arc.
         Self {
             cr3,
             areas: Vec::new(),
             mmap_hint: MMAP_BASE,
             brk: HEAP_BASE,
             brk_start: HEAP_BASE,
-            mm_sem,
+            mm_sem: parent_mm_sem,
         }
     }
 
@@ -886,19 +899,50 @@ impl VmSpace {
 /// any reader that already obtained a clone via `mm_sem_for_cr3` — the
 /// `RwLock` outlives the map entry by exactly the time it takes the last
 /// in-flight reader/writer to release its guard.
+///
+/// ## vfork-style shared mm_sem
+///
+/// When a vfork child's VmSpace is built via `from_existing_cr3`, it shares
+/// the parent's `Arc<RwLock<()>>`.  The registry slot must NOT be removed
+/// when the child drops — the parent still needs the entry.
+///
+/// While the registry Mutex is held during `drop`, `Arc::strong_count`
+/// counts:
+///   * `self.mm_sem` — the VmSpace being dropped (+1), and
+///   * `reg[self.cr3]` — the registry's own stored Arc (+1).
+///
+/// A count of exactly 2 means only self and the registry hold refs → safe
+/// to evict.  A count > 2 means at least one other VmSpace (the vfork parent
+/// while the child is dropping) still holds a clone; in that case we leave
+/// the registry entry intact.
+///
+/// External callers that obtained a clone via `mm_sem_for_cr3` (short-lived
+/// PTE-mutation guards) always drop their clone before the VmSpace drops, so
+/// they never inflate the count at `VmSpace::drop` time.
 impl Drop for VmSpace {
     fn drop(&mut self) {
-        // Best-effort dedup: only deregister if the slot still names our
-        // `Arc`.  A subsequent `register_mm_sem(cr3, other)` (e.g. exec or
-        // fork that reused the same PML4 phys after PMM recycled it) may
-        // have rebound the entry; in that case the slot's `Arc::as_ptr`
-        // differs from ours and we must leave it alone.
+        // Sentinel: cr3=0 is used by test fixtures and kernel threads without
+        // a registered VmSpace.
         if self.cr3 == 0 {
             return;
         }
         let mut reg = MM_REGISTRY.lock();
         if let Some(slot) = reg.get(&self.cr3) {
-            if Arc::ptr_eq(slot, &self.mm_sem) {
+            // Only remove if:
+            //   1. The slot still names our Arc (not a replacement from exec
+            //      or a PMM-recycled cr3 reuse), AND
+            //   2. No other VmSpace also holds a clone of this Arc.
+            //
+            // While the registry Mutex is held, strong_count accounts for:
+            //   * `self.mm_sem`    — this VmSpace being dropped (+1)
+            //   * `reg[self.cr3]` — the registry's own stored Arc (+1)
+            //   * Any other VmSpace that shares this Arc (vfork child/parent)
+            //
+            // If strong_count == 2 only self and the registry hold refs →
+            // safe to evict.  A count > 2 means at least one other VmSpace
+            // (e.g. the vfork parent while the child is dropping, or vice
+            // versa) still holds a clone — leave the registry entry intact.
+            if Arc::ptr_eq(slot, &self.mm_sem) && Arc::strong_count(&self.mm_sem) == 2 {
                 reg.remove(&self.cr3);
             }
         }
