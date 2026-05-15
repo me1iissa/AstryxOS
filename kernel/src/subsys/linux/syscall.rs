@@ -3103,6 +3103,25 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
     };
     let cr3 = match cr3_opt { Some(c) => c, None => return 0 };
 
+    // Acquire the per-address-space read lock for the full clear→shootdown→free
+    // sequence.  This serialises against any concurrent `clone_for_fork` that
+    // holds the write side of the same mm_sem while walking the PML4.  Without
+    // this guard a racing `clone_for_fork` on another CPU can observe and
+    // resurrect PTEs that we are in the middle of clearing, re-inserting a
+    // frame reference just before we return the frame to the PMM — the same
+    // W215 aliasing race the PR #222 fix targets.
+    //
+    // The lock is held across ALL batches (the entire while-page-<-end loop)
+    // so the protection gap between batches is also closed.  A single hoisted
+    // acquisition is cheaper than re-acquiring per-batch and matches the shape
+    // used by `unmap_and_free_range_in` in mm/vmm.rs.
+    //
+    // `mm_sem_for_cr3` returns `None` for kernel threads and AP bootstrap
+    // contexts that have no registered VmSpace; those take the unlocked path
+    // (no user page tables to protect).
+    let _mm_guard = crate::mm::vma::mm_sem_for_cr3(cr3);
+    let _mm_read  = _mm_guard.as_ref().map(|s| s.read());
+
     // SMP ordering invariant (Intel SDM Vol. 3A §4.10.5): PTEs must be cleared
     // and a synchronous TLB shootdown must complete on all CPUs BEFORE physical
     // frames are returned to the PMM.  Freeing a frame before the shootdown

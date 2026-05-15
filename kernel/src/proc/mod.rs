@@ -1200,6 +1200,13 @@ pub fn free_process_memory(pid: Pid) {
 
     let cr3 = vm_space.cr3;
 
+    // W216 mm_sem write-lock: exclude every concurrent PTE-mutating reader
+    // (page-fault demand-page, mmap/munmap/mprotect/madvise/brk) until the
+    // bulk free completes.  Holding the lock across the shootdown ensures
+    // no reader can race the PTE clear and resurrect a frame we are about
+    // to return to the PMM.
+    let _mm_write = vm_space.mm_sem.write();
+
     // Shoot down every TLB entry tagged with this CR3 across every CPU
     // BEFORE the backing frames are recycled.  Without this an AP that
     // briefly held the CR3 might still cache a translation pointing at
@@ -1274,6 +1281,14 @@ pub fn free_vm_space(vm_space: crate::mm::vma::VmSpace) {
     if cr3 == 0 || cr3 == kernel_cr3 {
         return;
     }
+
+    // W216 mm_sem write-lock: see matching commentary in
+    // `free_process_memory`.  The exec teardown path is at lower risk than
+    // free_process_memory because exec already replaced the cr3 in the
+    // process table, but a sibling syscall in flight before the cr3 swap
+    // could still hold a `mm_sem` read guard; the write here drains it
+    // before any frame returns to the PMM.
+    let _mm_write = vm_space.mm_sem.write();
 
     // Shoot down the entire user half BEFORE recycling frames; see the
     // matching comment in free_process_memory above.  Even though the
