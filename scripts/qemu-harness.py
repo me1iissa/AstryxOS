@@ -1006,9 +1006,18 @@ _STALENESS_SCAN_FILE_BUDGET = 20000
 _STALENESS_SCAN_TIME_BUDGET_S = 4.0
 
 
-def _data_img_staleness(data_img: Path, disk_dir: Path) -> dict:
+def _data_img_staleness(data_img: Path, disk_dir: Path,
+                         extra_src_dirs: "list[Path] | None" = None) -> dict:
     """
-    Check whether `data_img` is older than any regular file under `disk_dir`.
+    Check whether `data_img` is older than any regular file under `disk_dir`
+    OR under any directory in `extra_src_dirs`.
+
+    `extra_src_dirs` is used to cover source files that compile into disk_dir
+    artifacts (e.g. userspace/libfontconfig-interposer/interposer.c compiles
+    to build/disk/lib64/libfontconfig-interposer.so). Without it, a source
+    update that hasn't yet triggered a `make` produces a stale .so inside
+    build/disk/ — older than data.img — so the mtime check falsely reports
+    "not stale" and the old binary ships in the next boot image.
 
     Returns a dict with:
       stale: bool                 — True iff a newer file was found
@@ -1047,7 +1056,11 @@ def _data_img_staleness(data_img: Path, disk_dir: Path) -> dict:
         # os.scandir-based walk is meaningfully faster than Path.rglob on
         # the large /opt/firefox subtree (~3000 files). Stop scanning on
         # first hit — even one newer file is sufficient evidence.
+        # Seed the stack with disk_dir first, then any extra source dirs.
         stack = [disk_dir]
+        for d in (extra_src_dirs or []):
+            if d.exists() and d.is_dir():
+                stack.append(d)
         while stack:
             d = stack.pop()
             try:
@@ -1276,7 +1289,18 @@ def cmd_start(args):
     _no_regen = bool(getattr(args, "no_regen_data_img", False))
     if not _data_img_missing:
         _disk_dir = Path(wt.ROOT) / "build" / "disk"
-        _data_img_staleness_info = _data_img_staleness(_data_img_path, _disk_dir)
+        # Extra source directories whose compiled outputs land in build/disk/.
+        # A source file newer than its compiled artifact inside build/disk/ will
+        # make the artifact appear older than data.img — the normal disk_dir scan
+        # then falsely reports "not stale" even though a rebuild is needed.
+        # Adding the source dirs here means ANY updated source file is enough to
+        # trigger a create-data-disk.sh --force, which recompiles and repacks.
+        _extra_src_dirs = [
+            # interposer.c compiles to build/disk/lib64/libfontconfig-interposer.so
+            Path(wt.ROOT) / "userspace" / "libfontconfig-interposer",
+        ]
+        _data_img_staleness_info = _data_img_staleness(
+            _data_img_path, _disk_dir, extra_src_dirs=_extra_src_dirs)
         _data_img_stale = bool(_data_img_staleness_info.get("stale"))
     if _data_img_stale:
         _newest = _data_img_staleness_info.get("newest_path") or "?"
@@ -1320,7 +1344,8 @@ def cmd_start(args):
                 # follow-up check is informational only.
                 try:
                     _data_img_staleness_info = _data_img_staleness(
-                        _data_img_path, _disk_dir)
+                        _data_img_path, _disk_dir,
+                        extra_src_dirs=_extra_src_dirs)
                     _data_img_stale = bool(_data_img_staleness_info.get("stale"))
                 except Exception:
                     pass
