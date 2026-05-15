@@ -1342,6 +1342,71 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 }
             }
 
+            // === W216 Hypothesis-V fix: post-I/O VMA re-validation (readahead path) ===
+            //
+            // The PROCESS_TABLE lock was dropped at line ~1071 before the
+            // filesystem read(s) above.  During the I/O, a sibling CPU could have
+            // executed sys_mmap(MAP_FIXED) Phase 2a+2b — removing the old VMA from
+            // the VmSpace and unmapping+freeing the underlying physical frames —
+            // before installing the replacement VMA in Phase 3.  If we proceed to
+            // install freshly-read frames into PTEs whose VMA has been replaced, the
+            // user will see old-file bytes at an address that now belongs to an
+            // anonymous or different-file mapping, replicating the W215 aliasing
+            // observed as [FAULT/PHYS] events in libxul's 0x4b*-region.
+            //
+            // The fix: re-acquire PROCESS_TABLE (briefly), re-look-up the VMA for
+            // `faulting_addr`, and confirm the tuple (mount_idx, inode,
+            // file_base_offset, vma_base, vma_end) still matches the snapshot
+            // captured before the I/O.  If it has changed (different backing, or
+            // VMA removed entirely) we abandon all freshly-allocated frames —
+            // returning them to the PMM — and return false.  The user's access will
+            // re-fault against the new VMA, which the kernel will then service
+            // correctly.
+            //
+            // We intentionally do NOT widen mm_sem to a write lock on
+            // map_page_in / unmap_and_free_range_in: that would serialise every
+            // fault against every concurrent munmap/MAP_FIXED, causing major
+            // throughput regression on Firefox's heavy-mmap workload (per W216
+            // audit recommendation).  The re-validation window is negligible —
+            // a single PROCESS_TABLE lock/unlock — and the abandonment cost
+            // (re-fault + one wasted I/O batch) is rare in practice.
+            //
+            // Lock ordering preserved: PROCESS_TABLE (top) → nothing else here.
+            // MOUNTS is NOT held at this point; cache/PMM locks are NOT held yet.
+            if n_pages > 0 {
+                let still_valid = {
+                    let procs = crate::proc::PROCESS_TABLE.lock();
+                    procs.iter()
+                        .find(|p| p.pid == target_pid)
+                        .and_then(|p| p.vm_space.as_ref())
+                        .and_then(|vs| vs.find_vma(faulting_addr))
+                        .map(|v| {
+                            matches!(&v.backing,
+                                crate::mm::vma::VmBacking::File {
+                                    mount_idx: m, inode: ino, offset: o, ..
+                                } if *m == mount_idx && *ino == inode && *o == file_base_offset)
+                            && v.base == vma_base
+                            && v.base + v.length == vma_end
+                        })
+                        .unwrap_or(false)
+                };
+                if !still_valid {
+                    // VMA replaced or removed during I/O.  Free all frames we
+                    // allocated, then abandon the fault.  The user will re-fault
+                    // against the new VMA and receive correct data.
+                    #[cfg(feature = "firefox-test")]
+                    crate::serial_println!(
+                        "[PF/revalidate] READAHEAD VMA stale after I/O addr={:#x} \
+                         mount={} inode={} foff={:#x} — dropping {} pages",
+                        faulting_addr, mount_idx, inode, file_base_offset, n_pages);
+                    for i in 0..n_pages {
+                        let (_vaddr, phys, _foff) = pages_to_map[i];
+                        crate::mm::pmm::free_page(phys);
+                    }
+                    return false;
+                }
+            }
+
             // Map all readahead pages and insert into cache.  Three regimes
             // need to be distinguished and the per-arm logic below must match
             // the cache-hit path (lines ~786-820):
@@ -1551,6 +1616,41 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     // zero page — fail the fault.
                     crate::mm::pmm::free_page(phys);
                     return false;
+                }
+                // === W216 Hypothesis-V fix: post-I/O VMA re-validation (single-page path) ===
+                //
+                // Same race as the readahead path above.  Between the PROCESS_TABLE
+                // drop (before I/O) and here, a sibling CPU running sys_mmap
+                // MAP_FIXED Phase 2b may have freed the frames backing this VA and
+                // replaced the VMA with a new one.  Re-validate before installing.
+                {
+                    let still_valid = {
+                        let procs = crate::proc::PROCESS_TABLE.lock();
+                        procs.iter()
+                            .find(|p| p.pid == target_pid)
+                            .and_then(|p| p.vm_space.as_ref())
+                            .and_then(|vs| vs.find_vma(faulting_addr))
+                            .map(|v| {
+                                matches!(&v.backing,
+                                    crate::mm::vma::VmBacking::File {
+                                        mount_idx: m, inode: ino, offset: o, ..
+                                    } if *m == mount_idx && *ino == inode && *o == file_base_offset)
+                                && v.base == vma_base
+                                && v.base + v.length == vma_end
+                            })
+                            .unwrap_or(false)
+                    };
+                    if !still_valid {
+                        // VMA replaced during I/O.  Release the frame and let
+                        // the user re-fault against the replacement VMA.
+                        #[cfg(feature = "firefox-test")]
+                        crate::serial_println!(
+                            "[PF/revalidate] SINGLE-PAGE VMA stale after I/O addr={:#x} \
+                             mount={} inode={} foff={:#x} — dropping frame",
+                            faulting_addr, mount_idx, inode, file_page_offset);
+                        crate::mm::pmm::free_page(phys);
+                        return false;
+                    }
                 }
                 // Bug-B fix (single-page fallback): hold a guard reference
                 // before inserting into the cache, mirroring the readahead-
