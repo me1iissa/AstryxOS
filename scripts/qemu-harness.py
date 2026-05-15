@@ -2226,6 +2226,12 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
     if op == "fd-table":
         if not rest: raise ValueError("fd-table requires <pid>")
         return {"op": "fd-table", "pid": int(rest[0], 0)}
+    if op == "fd-map":
+        pid = int(rest[0], 0) if rest else 0  # 0 = all processes
+        req: dict = {"op": "fd-map"}
+        if pid != 0:
+            req["pid"] = pid
+        return req
     if op == "syscall-trend":
         seconds = int(rest[0], 0) if len(rest) >= 1 else 5
         pid     = int(rest[1], 0) if len(rest) >= 2 else 0
@@ -2313,6 +2319,97 @@ def cmd_kdb(args):
     state.setdefault("last_response", {})[args.op] = resp
     try: cache.write_text(json.dumps(state))
     except OSError: pass
+
+    _out(resp)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# fd-map — cross-process FD map with socketpair peer resolution (W216)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Wraps `kdb fd-map` with two additional capabilities:
+#   --save <name>  Persist the snapshot to ~/.astryx-harness/<sid>.fdmap.<name>.json
+#   --diff <name>  Compare the current snapshot with a previously saved one and
+#                  print the diff as JSON.  Useful for differentiating:
+#     Hypothesis A (FD routing bug): PID-1 fd=70 peer resolves to a DIFFERENT
+#                  (pid, fd) than the one PID-4 writes its fd=27 to.
+#     Hypothesis B (kernel wake bug): peer is correct but poll never fires.
+
+def cmd_fd_map(args):
+    """Cross-process FD map with socketpair/pipe peer resolution.
+
+    Calls kdb op 'fd-map' and returns structured JSON.  Each entry is:
+      { pid, fd, kind, socket_id, peer_socket_id, peer_pid, peer_fd }   (socket)
+      { pid, fd, kind, pipe_id, pipe_end, peer_pid, peer_fd }           (pipe)
+
+    Optionally saves or diffs snapshots to differentiate IPC routing bugs.
+    """
+    sess = _load_session(args.sid)
+    port = int(sess.get("kdb_host_port") or 0)
+    if port <= 0:
+        _out({"error": "session was not started with --features kdb"})
+        sys.exit(1)
+
+    pid = getattr(args, "pid", 0) or 0
+    req: dict = {"op": "fd-map"}
+    if pid:
+        req["pid"] = pid
+
+    timeout = float(getattr(args, "timeout", 5.0) or 5.0)
+    try:
+        raw = _kdb_recv(port, req, timeout=timeout)
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        _out({"error": f"kdb connect failed on 127.0.0.1:{port}: {e}"})
+        sys.exit(1)
+    try:
+        resp = json.loads(raw.strip().decode("utf-8", errors="replace"))
+    except (json.JSONDecodeError, ValueError) as e:
+        _out({"error": f"malformed kdb response: {e}",
+              "raw": raw.decode(errors="replace")})
+        sys.exit(1)
+
+    snap_name = getattr(args, "save", None)
+    diff_name = getattr(args, "diff", None)
+
+    if snap_name:
+        path = HARNESS_DIR / f"{args.sid}.fdmap.{snap_name}.json"
+        try:
+            path.write_text(json.dumps(resp))
+            resp["_saved"] = str(path)
+        except OSError as e:
+            resp["_save_error"] = str(e)
+
+    if diff_name:
+        path = HARNESS_DIR / f"{args.sid}.fdmap.{diff_name}.json"
+        if not path.exists():
+            _out({"error": f"no saved snapshot '{diff_name}' at {path}"})
+            sys.exit(1)
+        try:
+            prev = json.loads(path.read_text())
+        except Exception as e:
+            _out({"error": f"could not load snapshot '{diff_name}': {e}"})
+            sys.exit(1)
+
+        def _entry_key(e: dict) -> str:
+            return f"{e.get('pid')}/{e.get('fd')}"
+
+        prev_map = {_entry_key(e): e for e in prev.get("entries", [])}
+        curr_map = {_entry_key(e): e for e in resp.get("entries", [])}
+
+        added   = [curr_map[k] for k in curr_map if k not in prev_map]
+        removed = [prev_map[k] for k in prev_map if k not in curr_map]
+        changed = []
+        for k in curr_map:
+            if k in prev_map and curr_map[k] != prev_map[k]:
+                changed.append({"key": k, "before": prev_map[k], "after": curr_map[k]})
+
+        resp = {
+            "diff_against": diff_name,
+            "added":   added,
+            "removed": removed,
+            "changed": changed,
+            "snapshot": resp,
+        }
 
     _out(resp)
 
@@ -5107,7 +5204,7 @@ def main():
              "(requires --features kdb at start)")
     p_kdb.add_argument("sid")
     p_kdb.add_argument("op", choices=[
-        "ping", "proc-list", "proc", "proc-tree", "fd-table",
+        "ping", "proc-list", "proc", "proc-tree", "fd-table", "fd-map",
         "syscall-trend", "vfs-mounts",
         "dmesg", "syms", "mem", "tframe", "user-mem", "trace-status",
         "bell-stats",
@@ -5116,11 +5213,28 @@ def main():
                         help="Op-specific positional args: "
                              "proc <pid>, proc-tree [<root_pid>] (def 1), "
                              "fd-table <pid>, "
+                             "fd-map [<pid>] (0 or omit = all processes), "
                              "syscall-trend [<seconds> [<pid>]] (def 5 0), "
                              "dmesg [tail], syms <name|0xaddr>, "
                              "mem <addr> <len>")
     p_kdb.add_argument("--timeout", type=float, default=5.0,
                         help="Socket timeout in seconds (default 5.0)")
+
+    # fd-map — dedicated top-level subcommand with snapshot/diff support
+    p_fdmap = sub.add_parser(
+        "fd-map",
+        help="[Tier1] Cross-process FD map: resolves socketpair/pipe peer "
+             "(pid,fd) pairs. Wraps kdb fd-map with --save/--diff for "
+             "two-snapshot Hypothesis A vs B diagnosis (W216 IPC forensic).")
+    p_fdmap.add_argument("sid")
+    p_fdmap.add_argument("--pid", type=lambda x: int(x, 0), default=0,
+                          help="Filter to one PID (0 or omit = all processes)")
+    p_fdmap.add_argument("--save", metavar="NAME", default=None,
+                          help="Save snapshot to ~/.astryx-harness/<sid>.fdmap.<NAME>.json")
+    p_fdmap.add_argument("--diff", metavar="NAME", default=None,
+                          help="Diff current snapshot against a previously --save'd NAME")
+    p_fdmap.add_argument("--timeout", type=float, default=5.0,
+                          help="kdb socket timeout in seconds (default 5.0)")
 
     # qga-ping / qga-info / qga-sync / qga-file-read — QEMU Guest Agent
     # bridge.  Requires --features qga at start; talks NDJSON over the
@@ -5396,6 +5510,7 @@ def main():
         "resume": cmd_resume,
         # Tier 1
         "kdb":    cmd_kdb,
+        "fd-map": cmd_fd_map,
         # QGA bridge
         "qga-ping":      cmd_qga_ping,
         "qga-info":      cmd_qga_info,

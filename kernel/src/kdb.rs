@@ -270,6 +270,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "proc"           => op_proc(req, out),
         "proc-tree"      => op_proc_tree(req, out),
         "fd-table"       => op_fd_table(req, out),
+        "fd-map"         => op_fd_map(req, out),
         "syscall-trend"  => op_syscall_trend(req, out),
         "vfs-mounts"     => op_vfs_mounts(out),
         "dmesg"          => op_dmesg(req, out),
@@ -1051,6 +1052,195 @@ fn op_fd_table(req: &str, out: &mut String) {
         out.push_str(r#","truncated":true"#);
     }
     out.push('}');
+}
+
+// ── fd-map ───────────────────────────────────────────────────────────────────
+//
+// Cross-process FD map: for every open FD in the requested process(es),
+// emit the FD number, kind, and — critically for socketpair/pipe diagnosis —
+// the resolved (peer_pid, peer_fd) for socket and pipe endpoints.
+//
+// This answers Hypothesis A vs B in the T1 IPC-handshake forensic:
+//   A (routing bug):  PID-1 fd=70 peer resolves to a DIFFERENT (pid,fd) than
+//                     the one PID-4 TID-78 writes fd=27 to.
+//   B (wake bug):     PID-1 fd=70 peer == (PID-4, fd=27) but poll never fires.
+//
+// The resolution algorithm:
+//   sockets: snapshot the unix TABLE once; for a socket FD with id=X,
+//            peer_id = TABLE[X].peer_id.  Scan all processes to find which
+//            (pid, fd_n) has file_type=Socket and inode==peer_id.
+//   pipes:   two FDs sharing the same inode (pipe_id) are a pair.
+//            The one with flags bit-0 set is the write-end; the other is read.
+//
+// Output: { "pid": N | "all", "entries": [ { pid, fd, kind, socket_id,
+//   peer_socket_id, peer_pid, peer_fd, pipe_id, pipe_end, path } ] }
+
+fn op_fd_map(req: &str, out: &mut String) {
+    use core::fmt::Write;
+
+    // Optional pid filter — 0 means "all".
+    let pid_filter: u64 = extract_field(req, "pid")
+        .and_then(|s| parse_u64(&s))
+        .unwrap_or(0);
+
+    // ── Stage 1: snapshot the process table ───────────────────────────────
+    //
+    // Collect (pid, fd_index, file_type, inode, flags, open_path) for
+    // every open FD across all processes (or just the filtered one).
+    // We release PROCESS_TABLE before touching the unix TABLE.
+
+    struct FdSnap {
+        pid:       u64,
+        fd:        usize,
+        file_type: crate::vfs::FileType,
+        inode:     u64,   // socket_id or pipe_id depending on kind
+        flags:     u32,
+        path:      alloc::string::String,
+    }
+
+    let fd_snaps: alloc::vec::Vec<FdSnap> = match try_lock_brief(&PROCESS_TABLE) {
+        Some(g) => {
+            let mut v = alloc::vec::Vec::new();
+            for p in g.iter() {
+                if pid_filter != 0 && p.pid != pid_filter { continue; }
+                for (i, slot) in p.file_descriptors.iter().enumerate() {
+                    let fd = match slot { Some(f) => f, None => continue };
+                    if fd.is_console { continue; }
+                    use crate::vfs::FileType::*;
+                    match fd.file_type {
+                        Socket | Pipe => {}
+                        _ => continue, // only emit types with meaningful peers
+                    }
+                    v.push(FdSnap {
+                        pid:       p.pid,
+                        fd:        i,
+                        file_type: fd.file_type,
+                        inode:     fd.inode,
+                        flags:     fd.flags,
+                        path:      fd.open_path.clone(),
+                    });
+                }
+            }
+            v
+        }
+        None => {
+            out.push_str(r#"{"busy":"PROCESS_TABLE held","entries":[]}"#);
+            return;
+        }
+    };
+
+    if fd_snaps.is_empty() {
+        // No socket/pipe FDs for the requested filter.
+        if pid_filter != 0 {
+            let _ = write!(out, r#"{{"pid":{},"entries":[]}}"#, pid_filter);
+        } else {
+            out.push_str(r#"{"pid":"all","entries":[]}"#);
+        }
+        return;
+    }
+
+    // ── Stage 2: snapshot the unix socket TABLE ────────────────────────────
+    //
+    // Build a map from socket_id → peer_socket_id from one lock
+    // acquisition rather than calling get_peer() per FD.
+
+    let sock_snaps = crate::net::unix::snapshot_all();
+
+    // ── Stage 3: resolve peer (pid, fd) for each socket FD ────────────────
+    //
+    // For socket FD with inode=S: peer_socket_id = sock_snaps[S].peer_id.
+    // Then find the FdSnap whose inode == peer_socket_id.
+
+    // Helper: find (pid, fd_n) for a given socket_id.
+    let find_socket_owner = |target_socket_id: u64| -> Option<(u64, usize)> {
+        fd_snaps.iter()
+            .find(|s| {
+                matches!(s.file_type, crate::vfs::FileType::Socket)
+                    && s.inode == target_socket_id
+            })
+            .map(|s| (s.pid, s.fd))
+    };
+
+    // ── Stage 4: emit JSON ─────────────────────────────────────────────────
+
+    if pid_filter != 0 {
+        let _ = write!(out, r#"{{"pid":{},"entries":["#, pid_filter);
+    } else {
+        out.push_str(r#"{"pid":"all","entries":["#);
+    }
+
+    let mut first = true;
+    for snap in &fd_snaps {
+        if !first { out.push(','); }
+        first = false;
+        out.push('{');
+        j_kv(out, "pid", &alloc::format!("{}", snap.pid));
+        j_kv(out, "fd",  &alloc::format!("{}", snap.fd));
+
+        match snap.file_type {
+            crate::vfs::FileType::Socket => {
+                j_kv_str(out, "kind", "socket");
+                j_kv(out, "socket_id", &alloc::format!("{}", snap.inode));
+
+                // Resolve peer socket id from the snapshot.
+                let peer_socket_id = sock_snaps.iter()
+                    .find(|s| s.id == snap.inode)
+                    .map(|s| s.peer_id)
+                    .unwrap_or(u64::MAX);
+
+                if peer_socket_id == u64::MAX {
+                    j_kv_str(out, "peer_socket_id", "none");
+                    j_kv_str(out, "peer_pid", "none");
+                    j_kv_str(out, "peer_fd",  "none");
+                } else {
+                    j_kv(out, "peer_socket_id", &alloc::format!("{}", peer_socket_id));
+                    match find_socket_owner(peer_socket_id) {
+                        Some((ppid, pfd)) => {
+                            j_kv(out, "peer_pid", &alloc::format!("{}", ppid));
+                            j_kv(out, "peer_fd",  &alloc::format!("{}", pfd));
+                        }
+                        None => {
+                            // Peer socket exists in TABLE but no process owns it yet
+                            // (e.g. created but not yet dup'd/installed in any FD table).
+                            j_kv_str(out, "peer_pid", "unowned");
+                            j_kv_str(out, "peer_fd",  "unowned");
+                        }
+                    }
+                }
+            }
+            crate::vfs::FileType::Pipe => {
+                j_kv_str(out, "kind", "pipe");
+                j_kv(out, "pipe_id", &alloc::format!("{}", snap.inode));
+                // Bit 0 of flags: 1 = write end (see FileDescriptor::pipe_write_end)
+                let is_write = snap.flags & 1 == 1;
+                j_kv_str(out, "pipe_end", if is_write { "write" } else { "read" });
+
+                // Find the complementary end (same pipe_id, opposite direction).
+                let peer = fd_snaps.iter().find(|s| {
+                    matches!(s.file_type, crate::vfs::FileType::Pipe)
+                        && s.inode == snap.inode
+                        && (s.flags & 1 == 1) != is_write // opposite end
+                });
+                match peer {
+                    Some(p) => {
+                        j_kv(out, "peer_pid", &alloc::format!("{}", p.pid));
+                        j_kv(out, "peer_fd",  &alloc::format!("{}", p.fd));
+                    }
+                    None => {
+                        j_kv_str(out, "peer_pid", "none");
+                        j_kv_str(out, "peer_fd",  "none");
+                    }
+                }
+            }
+            _ => { j_kv_str(out, "kind", "other"); }
+        }
+
+        if !snap.path.is_empty() { j_kv_str(out, "path", &snap.path); }
+        j_trim_comma(out);
+        out.push('}');
+    }
+
+    out.push_str("]}");
 }
 
 // ── syscall-trend ────────────────────────────────────────────────────────────
