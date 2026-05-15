@@ -171,11 +171,20 @@ def _serial_args(serial_path: str) -> list[str]:
     """
     File-backed serial chardev named `ser0`. The chardev id is
     important: `qemu-harness.py send` targets it via QMP `chardev-write`.
+
+    NOTE: we pass ``-no-reboot`` to prevent infinite reset loops on
+    triple-fault, but we do NOT pass ``-no-shutdown``.  ``-no-shutdown``
+    intercepts the guest's ACPI / isa-debug-exit shutdown signal and
+    transitions QEMU into a paused state instead of exiting.  That means
+    ``qemu_exit()`` in test_runner.rs never terminates the process —
+    the watcher sees no new serial output and declares the run HUNG after
+    30 s.  Removing ``-no-shutdown`` lets the isa-debug-exit device cause
+    the expected ``qemu-system-x86_64`` process exit.
     """
     return [
         "-chardev", f"file,id=ser0,path={serial_path},append=off",
         "-serial", "chardev:ser0",
-        "-no-reboot", "-no-shutdown",
+        "-no-reboot",
     ]
 
 
