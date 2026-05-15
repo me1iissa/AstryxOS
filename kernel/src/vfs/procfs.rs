@@ -236,10 +236,23 @@ impl FileSystemOps for ProcFs {
             (INO_ROOT, "stat")              => Ok(INO_STAT),
             (INO_ROOT, "self")              => Ok(INO_SELF_DIR),
             (INO_ROOT, "sys")               => Ok(INO_SYS_DIR),
-            // /proc/<numeric-pid> — redirect to self (the VFS open() layer also
-            // does this via redirect_proc_pid_path, but lookup may be called
-            // directly without the redirect, e.g. from stat()).
-            (INO_ROOT, name) if name.bytes().all(|b| b.is_ascii_digit()) && !name.is_empty() => {
+            // /proc/<numeric-pid> — resolve to INO_SELF_DIR so that child
+            // lookups (maps, status, …) use the shared per-process inode set.
+            // The fd's open_path retains the original numeric path so fd_read()
+            // can serve the *target* process's data (see vfs/mod.rs C4).
+            //
+            // Per proc(5): accessing /proc/<pid>/ for a nonexistent PID must
+            // return ENOENT — we validate here rather than at read time so
+            // that open(2) itself fails with the correct error code.
+            (INO_ROOT, name) if !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()) => {
+                let target_pid: crate::proc::Pid = name.parse().map_err(|_| VfsError::NotFound)?;
+                let exists = {
+                    let procs = crate::proc::PROCESS_TABLE.lock();
+                    procs.iter().any(|p| p.pid == target_pid)
+                };
+                if !exists {
+                    return Err(VfsError::NotFound);
+                }
                 Ok(INO_SELF_DIR)
             }
             (INO_SELF_DIR, "maps")          => Ok(INO_SELF_MAPS),

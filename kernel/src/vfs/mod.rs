@@ -1497,8 +1497,24 @@ fn proc_task_tid_from_stat_path(open_path: &str) -> Option<u64> {
 pub fn open(pid: crate::proc::Pid, path: &str, open_flags: u32) -> VfsResult<usize> {
     // C4: redirect /proc/<N>/... to /proc/self/... for inode resolution,
     // while preserving the original path in the fd for target-PID detection.
+    //
+    // Per proc(5): accessing /proc/<pid>/ for a nonexistent PID returns ENOENT.
+    // We validate the target PID HERE (before the redirect) so open(2) itself
+    // fails with the correct error code — the redirect would otherwise bypass
+    // the PID-existence check in procfs::lookup().
     let redirected;
     let lookup_path: &str = if let Some(r) = redirect_proc_pid_path(path) {
+        // Extract and validate the numeric PID embedded in the original path.
+        // proc_target_pid returns None for /proc/self/... (no validation needed).
+        if let Some(target_pid) = proc_target_pid(path) {
+            let exists = {
+                let procs = crate::proc::PROCESS_TABLE.lock();
+                procs.iter().any(|p| p.pid == target_pid)
+            };
+            if !exists {
+                return Err(VfsError::NotFound);
+            }
+        }
         redirected = r;
         &redirected
     } else {
