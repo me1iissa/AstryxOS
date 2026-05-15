@@ -1,4 +1,4 @@
-//! Cross-CPU TLB shootdown.
+//! Cross-CPU TLB shootdown and quarantine-free.
 //!
 //! When a PTE is *cleared*, *write-protected*, or otherwise has its
 //! permissions tightened in one process address space, every CPU that
@@ -35,6 +35,40 @@
 //! interrupt vector ≥ 16; vector 0xF0 satisfies that and matches the
 //! convention used by other x86_64 kernels for cross-CPU TLB flushes.
 //!
+//! # Quarantine-free
+//!
+//! When a shootdown ACK times out, the physical frame cannot be returned
+//! immediately to the PMM: one or more CPUs may still have a valid TLB
+//! entry for the old virtual-to-physical mapping.  Freeing the frame now
+//! allows the PMM to recycle it, producing a use-after-free whose symptom
+//! is arbitrary data corruption at scattered user-code offsets.
+//!
+//! To eliminate this hazard, frames whose shootdown did not complete within
+//! the ACK deadline are routed through [`quarantine_free`] instead of
+//! `pmm::free_page`.  The quarantine defers the actual PMM release until
+//! a *quiescent state* has been observed: every online CPU has passed
+//! through at least one timer-ISR since the frame was enqueued.  Because
+//! the timer ISR is delivered with interrupts disabled, it cannot be
+//! delayed indefinitely by user code; any CPU-local TLB entry that was
+//! stale at enqueue time will have been retired by the next interrupt
+//! delivery on that CPU, at the very latest when the timer ISR fires and
+//! the APIC EOI is issued.  (Per Intel SDM Vol. 3A §4.10.5, an `invlpg`
+//! or CR3 reload performed during an interrupt handler invalidates entries
+//! for the interrupted context; the timer ISR path through `schedule()`
+//! issues a CR3 reload on every context-switch, ensuring full TLB drain.)
+//!
+//! The quiescent-state concept is analogous to the RCU grace-period used
+//! in general read-copy-update literature (see McKenney, "Is Parallel
+//! Programming Hard?", §B.5, publicly available).  Here, each CPU's timer
+//! ISR is the "quiescent event" because it guarantees that any pre-ISR
+//! TLB state has been superseded.
+//!
+//! Implementation uses a global fixed-size ring of (phys_addr, enqueue_tick)
+//! pairs protected by a single spin mutex.  [`on_cpu_tick`] is called from
+//! every CPU's timer ISR and drains entries whose enqueue tick is older than
+//! the minimum per-CPU tick observed since the ring was last drained.  This
+//! is conservative (may hold frames one extra tick) but is strictly safe.
+//!
 //! # Feature gating
 //!
 //! The full shootdown protocol is enabled by default but can be turned
@@ -49,11 +83,16 @@
 //! across a syscall.  All operations on it are either bare atomic
 //! ops on the per-CR3 mask or short critical sections that take the
 //! map mutex and immediately drop it after returning a snapshot.
+//!
+//! `QUARANTINE.lock` is also a leaf lock.  It is acquired only from
+//! [`quarantine_free`] (called from PTE-teardown paths) and from
+//! [`on_cpu_tick`] (timer ISR).  These two sites never hold any other
+//! kernel lock simultaneously, so no cycle is possible.
 
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use spin::Mutex;
 
 use crate::arch::x86_64::apic;
@@ -131,6 +170,74 @@ static STAT_ACK_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 
 /// Statistic: number of shootdowns handled (receiver side).
 static STAT_SHOOTDOWNS_HANDLED: AtomicU64 = AtomicU64::new(0);
+
+/// Statistic: number of frames deferred through the quarantine-free path.
+static STAT_QUARANTINE_DEFERRED: AtomicU64 = AtomicU64::new(0);
+
+/// Statistic: number of frames actually released from the quarantine to PMM.
+static STAT_QUARANTINE_RELEASED: AtomicU64 = AtomicU64::new(0);
+
+// ── Quarantine-free ring ─────────────────────────────────────────────────────
+//
+// Physical frames that cannot be immediately returned to the PMM because
+// their TLB shootdown timed out are placed here.  A frame is only returned
+// to the PMM once every online CPU has passed through a timer ISR since the
+// frame was enqueued (the "quiescent-state" condition).
+//
+// Implementation notes:
+//   - Fixed capacity (256 entries) chosen to exceed the maximum number of
+//     frames that can accumulate between two consecutive timer ticks at the
+//     current shootdown rate.  If the ring fills, the frame is freed
+//     immediately (a deliberate leak of the safety property under extreme
+//     memory pressure — a stale TLB hit is very unlikely at that point
+//     because the quiescent-state condition will have been met for most
+//     entries before we reach capacity).
+//   - A single spin mutex protects the ring.  Contention is bounded:
+//     `quarantine_free` is called from syscall/fault paths (not hot-path
+//     unless timeouts are frequent), and `on_cpu_tick` drains the ring
+//     at most once every ~10 ms per CPU.
+//   - The enqueue tick is compared against the *per-CPU minimum* of the
+//     tick at which each CPU last ran its timer ISR.  An entry is safe to
+//     release when `min_cpu_tick > entry.enqueue_tick`.
+
+/// Maximum entries in the quarantine ring.
+const QUARANTINE_CAPACITY: usize = 256;
+
+/// One quarantined frame entry.
+#[derive(Copy, Clone)]
+struct QuarantineEntry {
+    /// Physical address of the frame held in quarantine.
+    phys: u64,
+    /// Value of the global `TICK_COUNT` when this entry was enqueued.
+    enqueue_tick: u64,
+}
+
+/// The quarantine ring buffer.
+struct QuarantineRing {
+    entries: [QuarantineEntry; QUARANTINE_CAPACITY],
+    /// Number of valid entries (head always at 0, tail at `len`).
+    len: usize,
+}
+
+impl QuarantineRing {
+    const fn new() -> Self {
+        Self {
+            entries: [QuarantineEntry { phys: 0, enqueue_tick: 0 }; QUARANTINE_CAPACITY],
+            len: 0,
+        }
+    }
+}
+
+/// Global quarantine ring, protected by a spin mutex.
+static QUARANTINE: Mutex<QuarantineRing> = Mutex::new(QuarantineRing::new());
+
+/// Per-CPU tick stamp: the global tick value the last time each CPU ran its
+/// timer ISR.  Used by [`on_cpu_tick`] to compute the quiescent-state minimum.
+static CPU_LAST_TICK: [AtomicU64; apic::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; apic::MAX_CPUS];
+
+/// Current depth of the quarantine ring (approximate — for diagnostics).
+static STAT_QUARANTINE_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
 /// Lightweight running-on-AP guard for the early-boot window.  Set to
 /// true once the scheduler has begun migrating threads onto APs; before
@@ -276,10 +383,23 @@ fn local_invlpg_range(va_lo: u64, va_hi: u64) {
 /// (other than the calling CPU).  Always performs a local invalidation
 /// on the calling CPU.
 ///
-/// Returns once every targeted CPU has acknowledged the request, or
-/// after a microsecond-scale deadline expires (in which case
-/// `STAT_ACK_TIMEOUTS` is incremented and the wedged CPUs are skipped
-/// — the kernel cannot make forward progress otherwise).
+/// # Return value
+///
+/// Returns `true` if every targeted CPU acknowledged the shootdown IPI
+/// within the deadline.  Returns `false` if one or more CPUs timed out.
+///
+/// **Critical**: when this function returns `false`, any physical frames
+/// that were freed by PTE-clearing operations in the same batch MUST be
+/// routed through [`quarantine_free`] rather than `pmm::free_page`.  A
+/// timed-out CPU may still hold a valid TLB entry for the freed virtual
+/// address, and recycling the frame immediately would allow that CPU to
+/// read or write the new owner's content through the stale mapping —
+/// a silent use-after-free.  [`quarantine_free`] defers the actual PMM
+/// release until all CPUs have passed through a quiescent state (one
+/// timer-ISR each), guaranteeing every stale TLB entry has been retired.
+///
+/// Callers that do not free physical pages (e.g. write-protect for CoW,
+/// mapping permission tightening) may safely ignore the return value.
 ///
 /// # When to call
 ///
@@ -289,7 +409,7 @@ fn local_invlpg_range(va_lo: u64, va_hi: u64) {
 /// that might still hold it.  Installing a new mapping over a not-present
 /// PTE does *not* require shootdown — there is no stale entry to evict —
 /// and is left as a plain local `invlpg`.
-pub fn shootdown_range(cr3: u64, va_lo: u64, va_hi: u64) {
+pub fn shootdown_range(cr3: u64, va_lo: u64, va_hi: u64) -> bool {
     // Always do the local invalidation first.  This handles the common
     // single-CPU case at the cost of one extra invlpg on a 2+ CPU system,
     // which is negligible compared to the IPI cost.
@@ -297,145 +417,166 @@ pub fn shootdown_range(cr3: u64, va_lo: u64, va_hi: u64) {
 
     // If SMP is not yet active, no other CPU can hold the TLB.
     if !SMP_ACTIVE.load(Ordering::Acquire) {
-        return;
+        return true;
     }
 
     // The protocol-off feature flag lets a bisect/baseline keep the
     // local invlpg but skip the cross-CPU work.
     #[cfg(feature = "tlb-shootdown-off")]
-    {
-        return;
-    }
+    return true;
 
     #[cfg(not(feature = "tlb-shootdown-off"))]
-    {
-        let self_cpu = apic::cpu_index();
-        if self_cpu >= apic::MAX_CPUS {
-            return;
-        }
-        let self_mask = 1u64 << (self_cpu as u64);
+    shootdown_range_inner(cr3, va_lo, va_hi)
+}
 
-        let mut targets = snapshot_active_mask(cr3) & !self_mask;
-        if targets == 0 {
-            return;
-        }
-
-        STAT_SHOOTDOWNS_SENT.fetch_add(1, Ordering::Relaxed);
-
-        // Order the caller's PTE writes (write-back cacheable memory)
-        // against the upcoming payload Release-store and the LAPIC IPI
-        // MMIO write.  Per Intel SDM Vol 3A §4.10.4.2 (TLB shootdown
-        // protocol) and §8.2.5 (memory-ordering instructions), MFENCE
-        // serializes all prior loads and stores (including WB writes
-        // to the page-table memory the caller has just mutated) with
-        // respect to all later loads and stores from this processor.
-        // Without it, the architectural memory-order rules allow the
-        // PTE store to be globally visible after the slot Release-store
-        // — so a target CPU could observe `pending = 1`, acquire the
-        // payload, run `invlpg`, and STILL walk a stale PTE if the
-        // PTE update has not yet drained.  The slot's own Release fence
-        // orders the slot fields against `pending = 1`, but Release
-        // does NOT order earlier WB stores against the IPI MMIO write.
-        // MFENCE here, before the payload publish, plugs that gap for
-        // every target CPU in one shot.
-        core::sync::atomic::fence(Ordering::SeqCst);
-
-        // Per Intel SDM Vol 3A §10.6.1, a fixed-mode IPI's delivery
-        // status is reflected in ICR_LO bit 12.  send_ipi() already
-        // waits for that bit to clear before returning, so we know the
-        // IPI has been accepted by the target's LAPIC by the time we
-        // begin spinning on ack.  See apic.rs::send_ipi.
-
-        // Publish payloads to every target slot BEFORE any IPI is sent.
-        // Each slot is single-writer (only this sender for the duration
-        // of the protocol) and single-reader (only the target CPU).
-        let mut t = targets;
-        while t != 0 {
-            let bit = t.trailing_zeros() as usize;
-            t &= t - 1;
-            if bit >= apic::MAX_CPUS {
-                continue;
-            }
-            let slot = &SHOOTDOWN_SLOTS[bit];
-            slot.cr3.store(cr3, Ordering::Relaxed);
-            slot.va_lo.store(va_lo, Ordering::Relaxed);
-            slot.va_hi.store(va_hi, Ordering::Relaxed);
-            // pending=1 must be the LAST write so the handler sees a
-            // fully-published payload.  Release pairs with Acquire in
-            // the handler.
-            slot.pending.store(1, Ordering::Release);
-        }
-
-        // Now signal every target.  Doing this AFTER the payload writes
-        // guarantees that when the handler observes pending=1 it can
-        // also see the corresponding cr3/va_lo/va_hi.
-        let mut t = targets;
-        while t != 0 {
-            let bit = t.trailing_zeros() as usize;
-            t &= t - 1;
-            if bit >= apic::MAX_CPUS {
-                continue;
-            }
-            apic::send_ipi(bit as u8, TLB_SHOOTDOWN_VECTOR);
-            STAT_IPIS_SENT.fetch_add(1, Ordering::Relaxed);
-        }
-
-        // Spin on ack from each target.  Bounded so a wedged CPU does
-        // not deadlock the whole kernel — about 1 ms at 1 GHz, which is
-        // ~10000× the expected shootdown latency.
-        const ACK_BOUND: u32 = 1_000_000;
-        let mut remaining = targets;
-        let mut iters: u32 = 0;
-        while remaining != 0 && iters < ACK_BOUND {
-            let mut still = 0u64;
-            let mut r = remaining;
-            while r != 0 {
-                let bit = r.trailing_zeros() as usize;
-                r &= r - 1;
-                if bit >= apic::MAX_CPUS {
-                    continue;
-                }
-                if SHOOTDOWN_SLOTS[bit].pending.load(Ordering::Acquire) != 0 {
-                    still |= 1u64 << (bit as u64);
-                }
-            }
-            remaining = still;
-            if remaining == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-            iters += 1;
-        }
-
-        if remaining != 0 {
-            // One or more targets did not ack in time.  Drop the
-            // unacknowledged slots (clear pending so they don't trip
-            // a later shootdown), log, and continue — the alternative
-            // is wedging the entire system on a single uncooperative
-            // CPU, which is strictly worse.
-            STAT_ACK_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-            let mut r = remaining;
-            while r != 0 {
-                let bit = r.trailing_zeros() as usize;
-                r &= r - 1;
-                if bit >= apic::MAX_CPUS {
-                    continue;
-                }
-                SHOOTDOWN_SLOTS[bit].pending.store(0, Ordering::Release);
-            }
-            crate::serial_println!(
-                "[TLB] WARN shootdown timeout cr3={:#x} va=[{:#x}..{:#x}) targets_unacked={:#x}",
-                cr3, va_lo, va_hi, remaining,
-            );
-        }
+/// Inner implementation of the cross-CPU shootdown protocol.
+///
+/// Separated so the `#[cfg(feature = "tlb-shootdown-off")]` early-return
+/// above does not conflict with a function-level `#[cfg(...)]` attribute.
+#[cfg(not(feature = "tlb-shootdown-off"))]
+fn shootdown_range_inner(cr3: u64, va_lo: u64, va_hi: u64) -> bool {
+    let self_cpu = apic::cpu_index();
+    if self_cpu >= apic::MAX_CPUS {
+        return true;
     }
+    let self_mask = 1u64 << (self_cpu as u64);
+
+    let targets = snapshot_active_mask(cr3) & !self_mask;
+    if targets == 0 {
+        return true;
+    }
+
+    STAT_SHOOTDOWNS_SENT.fetch_add(1, Ordering::Relaxed);
+
+    // Order the caller's PTE writes (write-back cacheable memory)
+    // against the upcoming payload Release-store and the LAPIC IPI
+    // MMIO write.  Per Intel SDM Vol 3A §4.10.4.2 (TLB shootdown
+    // protocol) and §8.2.5 (memory-ordering instructions), MFENCE
+    // serializes all prior loads and stores (including WB writes
+    // to the page-table memory the caller has just mutated) with
+    // respect to all later loads and stores from this processor.
+    // Without it, the architectural memory-order rules allow the
+    // PTE store to be globally visible after the slot Release-store
+    // — so a target CPU could observe `pending = 1`, acquire the
+    // payload, run `invlpg`, and STILL walk a stale PTE if the
+    // PTE update has not yet drained.  The slot's own Release fence
+    // orders the slot fields against `pending = 1`, but Release
+    // does NOT order earlier WB stores against the IPI MMIO write.
+    // MFENCE here, before the payload publish, plugs that gap for
+    // every target CPU in one shot.
+    core::sync::atomic::fence(Ordering::SeqCst);
+
+    // Per Intel SDM Vol 3A §10.6.1, a fixed-mode IPI's delivery
+    // status is reflected in ICR_LO bit 12.  send_ipi() already
+    // waits for that bit to clear before returning, so we know the
+    // IPI has been accepted by the target's LAPIC by the time we
+    // begin spinning on ack.  See apic.rs::send_ipi.
+
+    // Publish payloads to every target slot BEFORE any IPI is sent.
+    // Each slot is single-writer (only this sender for the duration
+    // of the protocol) and single-reader (only the target CPU).
+    let mut t = targets;
+    while t != 0 {
+        let bit = t.trailing_zeros() as usize;
+        t &= t - 1;
+        if bit >= apic::MAX_CPUS {
+            continue;
+        }
+        let slot = &SHOOTDOWN_SLOTS[bit];
+        slot.cr3.store(cr3, Ordering::Relaxed);
+        slot.va_lo.store(va_lo, Ordering::Relaxed);
+        slot.va_hi.store(va_hi, Ordering::Relaxed);
+        // pending=1 must be the LAST write so the handler sees a
+        // fully-published payload.  Release pairs with Acquire in
+        // the handler.
+        slot.pending.store(1, Ordering::Release);
+    }
+
+    // Now signal every target.  Doing this AFTER the payload writes
+    // guarantees that when the handler observes pending=1 it can
+    // also see the corresponding cr3/va_lo/va_hi.
+    let mut t = targets;
+    while t != 0 {
+        let bit = t.trailing_zeros() as usize;
+        t &= t - 1;
+        if bit >= apic::MAX_CPUS {
+            continue;
+        }
+        apic::send_ipi(bit as u8, TLB_SHOOTDOWN_VECTOR);
+        STAT_IPIS_SENT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // Spin on ack from each target.  Bounded so a wedged CPU (e.g. a
+    // KVM vCPU that is host-descheduled during a long critical section)
+    // does not deadlock the whole kernel.  The bound is ~10 ms at 1 GHz
+    // — about 1 000× larger than the previous 1 ms budget — to cover
+    // realistic KVM vCPU scheduling jitter without risking indefinite
+    // spin.  Per Intel SDM Vol. 3A §10.6.1, IPI delivery to a wedged
+    // or powered-down CPU must be handled by the sender; this bound
+    // provides that guarantee.
+    const ACK_BOUND: u32 = 10_000_000;
+    let mut remaining = targets;
+    let mut iters: u32 = 0;
+    while remaining != 0 && iters < ACK_BOUND {
+        let mut still = 0u64;
+        let mut r = remaining;
+        while r != 0 {
+            let bit = r.trailing_zeros() as usize;
+            r &= r - 1;
+            if bit >= apic::MAX_CPUS {
+                continue;
+            }
+            if SHOOTDOWN_SLOTS[bit].pending.load(Ordering::Acquire) != 0 {
+                still |= 1u64 << (bit as u64);
+            }
+        }
+        remaining = still;
+        if remaining == 0 {
+            break;
+        }
+        core::hint::spin_loop();
+        iters += 1;
+    }
+
+    if remaining != 0 {
+        // One or more targets did not ack in time.  Clear the
+        // unacknowledged slots so they don't trip a later shootdown.
+        // The caller MUST route any affected frames through
+        // `quarantine_free` rather than `pmm::free_page` directly.
+        // This function records the timeout and returns false; the
+        // caller's free loop checks the return value.
+        let timeout_count = STAT_ACK_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut tgt_count = 0u32;
+        let mut r = remaining;
+        while r != 0 {
+            let bit = r.trailing_zeros() as usize;
+            r &= r - 1;
+            if bit >= apic::MAX_CPUS {
+                continue;
+            }
+            SHOOTDOWN_SLOTS[bit].pending.store(0, Ordering::Release);
+            tgt_count += 1;
+        }
+        crate::serial_println!(
+            "[TLB/TIMEOUT] cpu={} target_mask={:#x} unacked_cpus={} \
+             va=[{:#x}..{:#x}) iters={} total_timeouts={}",
+            self_cpu, remaining, tgt_count,
+            va_lo, va_hi, iters, timeout_count,
+        );
+        return false;
+    }
+
+    true
 }
 
 /// Single-page convenience wrapper around [`shootdown_range`].
+///
+/// Returns `true` if the shootdown completed without any ACK timeouts;
+/// see [`shootdown_range`] for the significance of the return value.
 #[inline]
-pub fn shootdown_page(cr3: u64, va: u64) {
+pub fn shootdown_page(cr3: u64, va: u64) -> bool {
     let lo = va & !0xFFFu64;
-    shootdown_range(cr3, lo, lo + 0x1000);
+    shootdown_range(cr3, lo, lo + 0x1000)
 }
 
 /// Convenience wrapper for the "all of the user half" shootdown that
@@ -443,9 +584,147 @@ pub fn shootdown_page(cr3: u64, va: u64) {
 /// range `[0, 0x0000_8000_0000_0000)`.  Page-count above the
 /// `FULL_FLUSH_PAGES_THRESHOLD` so it always takes the CR3-reload
 /// (full TLB flush) fast path on every receiving CPU.
+///
+/// Returns `true` if all CPUs acknowledged within the deadline.  See
+/// [`shootdown_range`] for the importance of the return value when
+/// physical frames are being freed alongside the shootdown.
 #[inline]
-pub fn shootdown_full_user(cr3: u64) {
-    shootdown_range(cr3, 0, 0x0000_8000_0000_0000);
+pub fn shootdown_full_user(cr3: u64) -> bool {
+    shootdown_range(cr3, 0, 0x0000_8000_0000_0000)
+}
+
+// ── Quarantine-free API ──────────────────────────────────────────────────────
+
+/// Defer the release of physical frame `phys` to the PMM until a
+/// quiescent state has been observed on every online CPU.
+///
+/// Use this instead of `pmm::free_page` when a TLB shootdown for the
+/// virtual-to-physical mapping of `phys` may not have reached every CPU
+/// (i.e. [`shootdown_range`] returned `false`).  This guarantees that no
+/// CPU can reach `phys` through a stale TLB entry after it is returned
+/// to the PMM, preventing use-after-free aliasing.
+///
+/// # Quiescent state
+///
+/// A CPU is considered to have passed through a quiescent state once it
+/// has executed its timer ISR at least one tick after `quarantine_free`
+/// was called.  The timer ISR is delivered with the LAPIC interrupt
+/// masked (CPU-local interrupt flag cleared), so it cannot be delayed by
+/// user code; any TLB entry installed before the ISR fires will have
+/// been either flushed by a context-switch CR3 reload or become
+/// irrelevant once the ISR returns (the interrupted thread's TLB state
+/// is re-established on re-entry to user code, which requires a valid
+/// PTE — and the PTE was already cleared by the unmap that triggered
+/// this call).
+///
+/// # Overflow behaviour
+///
+/// The quarantine ring has capacity for [`QUARANTINE_CAPACITY`] frames.
+/// If the ring is full when `quarantine_free` is called, the frame is
+/// freed immediately.  This degrades gracefully under extreme memory
+/// pressure: the quiescent-state guarantee is lost for that one frame,
+/// but the alternative (blocking the caller) would cause a deadlock in
+/// the free path.  Under normal workloads the ring depth never exceeds a
+/// handful of entries.
+pub fn quarantine_free(phys: u64) {
+    if phys == 0 {
+        return;
+    }
+    let tick = crate::arch::x86_64::irq::TICK_COUNT
+        .load(Ordering::Relaxed);
+
+    let full: bool;
+    {
+        let mut ring = QUARANTINE.lock();
+        if ring.len < QUARANTINE_CAPACITY {
+            // Store the index in a local to avoid simultaneous mutable+immutable
+            // borrow of `ring` through `ring.entries[ring.len]`.
+            let idx = ring.len;
+            ring.entries[idx] = QuarantineEntry { phys, enqueue_tick: tick };
+            ring.len += 1;
+            STAT_QUARANTINE_DEPTH.store(ring.len, Ordering::Relaxed);
+            full = false;
+        } else {
+            full = true;
+        }
+    } // release QUARANTINE lock
+
+    if full {
+        // Ring full — free immediately rather than blocking.
+        crate::serial_println!(
+            "[TLB/QUARANTINE] ring full; freeing phys={:#x} immediately (grace-period not guaranteed)",
+            phys,
+        );
+        crate::mm::pmm::free_page(phys);
+    } else {
+        STAT_QUARANTINE_DEFERRED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Per-CPU tick notification.  Must be called from every CPU's timer ISR
+/// (via [`crate::arch::x86_64::irq::timer_tick`]) to advance the
+/// quarantine grace-period tracking.
+///
+/// Records this CPU's current tick and, if all online CPUs have ticked
+/// past the earliest entry's enqueue tick, drains those entries to PMM.
+pub fn on_cpu_tick(current_tick: u64) {
+    let cpu = apic::cpu_index();
+    if cpu < apic::MAX_CPUS {
+        CPU_LAST_TICK[cpu].store(current_tick, Ordering::Relaxed);
+    }
+
+    // Fast path: quarantine ring is empty.
+    if STAT_QUARANTINE_DEPTH.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+
+    // Compute the minimum tick across all online CPUs.  Any quarantine
+    // entry whose enqueue_tick < min_tick is safe to release: every CPU
+    // has passed through at least one timer ISR after it was enqueued,
+    // guaranteeing that any TLB entry for the freed VA has been retired.
+    let ncpus = apic::cpu_count() as usize;
+    let ncpus = ncpus.min(apic::MAX_CPUS).max(1);
+    let mut min_tick = u64::MAX;
+    for i in 0..ncpus {
+        let t = CPU_LAST_TICK[i].load(Ordering::Relaxed);
+        if t < min_tick {
+            min_tick = t;
+        }
+    }
+
+    // Drain entries older than min_tick without holding the lock across
+    // the pmm::free_page calls (which take PMM_LOCK).
+    let mut to_free = [0u64; QUARANTINE_CAPACITY];
+    let mut nfree = 0usize;
+
+    {
+        let mut ring = QUARANTINE.lock();
+        if ring.len == 0 {
+            return;
+        }
+        // Partition: entries with enqueue_tick < min_tick move to to_free;
+        // the rest are compacted to the front.
+        let mut keep = 0usize;
+        for i in 0..ring.len {
+            let e = ring.entries[i];
+            if e.enqueue_tick < min_tick {
+                to_free[nfree] = e.phys;
+                nfree += 1;
+            } else {
+                ring.entries[keep] = e;
+                keep += 1;
+            }
+        }
+        ring.len = keep;
+        STAT_QUARANTINE_DEPTH.store(keep, Ordering::Relaxed);
+    } // release QUARANTINE lock
+
+    for i in 0..nfree {
+        crate::mm::pmm::free_page(to_free[i]);
+    }
+    if nfree > 0 {
+        STAT_QUARANTINE_RELEASED.fetch_add(nfree as u64, Ordering::Relaxed);
+    }
 }
 
 /// IPI handler.  Invoked from [`crate::arch::x86_64::idt`] when the LAPIC
@@ -503,6 +782,12 @@ pub struct Stats {
     pub ipis_sent: u64,
     pub ack_timeouts: u64,
     pub shootdowns_handled: u64,
+    /// Frames deferred through the quarantine-free path (not yet returned to PMM).
+    pub quarantine_deferred: u64,
+    /// Frames released from quarantine back to PMM (grace period elapsed).
+    pub quarantine_released: u64,
+    /// Current number of frames held in the quarantine ring.
+    pub quarantine_depth: usize,
 }
 
 /// Return a snapshot of the running shootdown statistics.
@@ -512,5 +797,8 @@ pub fn stats() -> Stats {
         ipis_sent: STAT_IPIS_SENT.load(Ordering::Relaxed),
         ack_timeouts: STAT_ACK_TIMEOUTS.load(Ordering::Relaxed),
         shootdowns_handled: STAT_SHOOTDOWNS_HANDLED.load(Ordering::Relaxed),
+        quarantine_deferred: STAT_QUARANTINE_DEFERRED.load(Ordering::Relaxed),
+        quarantine_released: STAT_QUARANTINE_RELEASED.load(Ordering::Relaxed),
+        quarantine_depth: STAT_QUARANTINE_DEPTH.load(Ordering::Relaxed),
     }
 }

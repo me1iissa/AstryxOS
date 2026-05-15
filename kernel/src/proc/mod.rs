@@ -1207,7 +1207,7 @@ pub fn free_process_memory(pid: Pid) {
     // classic use-after-free, observable as a GPF in random user code.
     // The full-range request triggers a CR3-reload on each target
     // (cheaper than per-page invlpg over the entire user half).
-    crate::mm::tlb::shootdown_full_user(cr3);
+    let shootdown_clean = crate::mm::tlb::shootdown_full_user(cr3);
 
     // Walk all VMAs and free physical frames (anonymous pages only).
     // File-backed pages are managed by the page cache; device pages are MMIO.
@@ -1225,7 +1225,14 @@ pub fn free_process_memory(pid: Pid) {
             if pte & PAGE_PRESENT != 0 {
                 let phys = pte & ADDR_MASK;
                 if refcount::page_ref_dec(phys) == 0 {
-                    pmm::free_page(phys);
+                    // If the shootdown did not receive all ACKs, defer the
+                    // PMM release until every CPU has passed through a
+                    // quiescent state (timer ISR), guaranteeing TLB drain.
+                    if shootdown_clean {
+                        pmm::free_page(phys);
+                    } else {
+                        crate::mm::tlb::quarantine_free(phys);
+                    }
                 }
             }
             addr += 0x1000;
@@ -1273,7 +1280,7 @@ pub fn free_vm_space(vm_space: crate::mm::vma::VmSpace) {
     // caller has already switched away from this CR3, sibling threads
     // on other CPUs that have not yet reached the next context-switch
     // could still hold cached translations into this address space.
-    crate::mm::tlb::shootdown_full_user(cr3);
+    let shootdown_clean = crate::mm::tlb::shootdown_full_user(cr3);
 
     // Walk all anonymous VMAs and decrement/free the backing physical pages.
     // File-backed pages belong to the page cache; device pages are MMIO.
@@ -1291,7 +1298,11 @@ pub fn free_vm_space(vm_space: crate::mm::vma::VmSpace) {
             if pte & PAGE_PRESENT != 0 {
                 let phys = pte & ADDR_MASK;
                 if refcount::page_ref_dec(phys) == 0 {
-                    pmm::free_page(phys);
+                    if shootdown_clean {
+                        pmm::free_page(phys);
+                    } else {
+                        crate::mm::tlb::quarantine_free(phys);
+                    }
                 }
             }
             addr += 0x1000;
