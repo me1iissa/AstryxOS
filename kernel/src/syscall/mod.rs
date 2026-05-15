@@ -1841,10 +1841,28 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
         // For vfork children (vm_space=None, shared parent CR3): create a VmSpace
         // that uses the process's actual CR3 (shared with parent) so mmap pages
         // go into the correct page table.
+        //
+        // We share the parent's mm_sem Arc rather than allocating a fresh one,
+        // so that when the child's VmSpace is later dropped its Drop impl does
+        // NOT evict the registry entry (strong_count will be > 1 while the
+        // parent's VmSpace is still alive).  Using the registry helper avoids a
+        // second linear scan of PROCESS_TABLE: mm_sem_for_cr3 returns the Arc
+        // already registered under this cr3, which belongs to the parent.
         if proc.vm_space.is_none() {
             let proc_cr3 = proc.cr3;
             if proc_cr3 != 0 {
-                proc.vm_space = Some(VmSpace::from_existing_cr3(proc_cr3));
+                // Borrow the parent's mm_sem via the registry (no second table
+                // scan needed; the parent's VmSpace construction already
+                // registered it).
+                let parent_sem = crate::mm::vma::mm_sem_for_cr3(proc_cr3)
+                    .unwrap_or_else(|| {
+                        // No parent entry — fall back to a fresh lock and
+                        // register it so subsequent lookups succeed.
+                        let fresh = alloc::sync::Arc::new(spin::RwLock::new(()));
+                        crate::mm::vma::register_mm_sem(proc_cr3, fresh.clone());
+                        fresh
+                    });
+                proc.vm_space = Some(VmSpace::from_existing_cr3(proc_cr3, parent_sem));
             } else {
                 proc.vm_space = Some(VmSpace::new_kernel());
             }

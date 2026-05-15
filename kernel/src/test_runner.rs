@@ -1552,6 +1552,12 @@ pub fn run() -> ! {
     total += 1;
     if test_proc_arbitrary_pid_maps_w216() { passed += 1; }
 
+    // ── Test 218: per-VmSpace mm_sem RwLock contract (W216) ────────────
+    // Verifies the address-space lock plumbing that closes W215 systemic
+    // page-aliasing race.  See `test_mm_sem_registry_w216` doc comment.
+    total += 1;
+    if test_mm_sem_registry_w216() { passed += 1; }
+
     // (Tests 199/200 run earlier — right after Test 80c — so the vDSO
     // TSC fast path is verified before the slow PNG screenshot test.
     // Stream-A pipe / eventfd wake-hook tests run first — see Tests
@@ -3979,6 +3985,7 @@ fn test_signal_vma_snapshot() -> bool {
                          MAP_PRIVATE, MAP_ANONYMOUS};
     let space = VmSpace {
         cr3: 0,
+        mm_sem: crate::mm::vma::make_mm_sem_for_test(),
         areas: alloc::vec![
             // libxul .text (executable, file-backed) — should appear
             VmArea {
@@ -4103,6 +4110,7 @@ fn test_signal_vma_snapshot() -> bool {
         let elf_delta: u64      = 0xac8000; // (0x10bd000 - 0x5f5000)
         let delta_space = VmSpace {
             cr3: 0,
+            mm_sem: crate::mm::vma::make_mm_sem_for_test(),
             areas: alloc::vec![
                 VmArea {
                     base: delta_vma_base, length: 0x100_0000,
@@ -27535,6 +27543,210 @@ fn test_proc_arbitrary_pid_maps_w216() -> bool {
     }
 
     if ok { test_pass!("procfs: /proc/<N>/maps returns target PID's VMA table (W216)"); }
+    ok
+}
+
+// ── Test 218: per-VmSpace mm_sem RwLock contract (W216) ─────────────────────
+//
+// Verifies the address-space lock plumbing that closes the W215 systemic
+// page-aliasing race:
+//
+//   1. `VmSpace::new_user` allocates a fresh mm_sem and registers it under
+//      its CR3 in `MM_REGISTRY`.
+//   2. `mm_sem_for_cr3(cr3)` returns an `Arc` pointing at the same lock.
+//   3. While a read-guard is held, `try_write()` fails (writers wait for
+//      readers).  While a write-guard is held, `try_read()` fails.
+//   4. `clone_for_fork` produces a child VmSpace whose `mm_sem` is a
+//      DIFFERENT Arc instance (parent and child are independent address
+//      spaces).
+//   5. Dropping the VmSpace removes its entry from `MM_REGISTRY`.
+//
+// Together these properties guarantee that the read-lock acquisition in
+// `mm/vmm.rs::{map_page_in, unmap_page_in, unmap_and_free_range_in,
+// write_pte}` blocks while `clone_for_fork` holds the write lock — which
+// is the synchronisation the W215 audit identified as missing.
+//
+// This is a deterministic single-thread unit test of the lock invariants.
+// The userspace alias_test (Test 44b) and a 5-min Firefox trial provide
+// the multi-CPU stress coverage.
+fn test_mm_sem_registry_w216() -> bool {
+    test_header!("per-VmSpace mm_sem RwLock contract (W216)");
+    use crate::mm::vma;
+    let mut ok = true;
+
+    let vs = match vma::VmSpace::new_user() {
+        Some(v) => v,
+        None => {
+            test_println!("  VmSpace::new_user failed (PMM exhausted) — SKIP");
+            test_pass!("mm_sem_registry_w216 (skipped)");
+            return true;
+        }
+    };
+    let cr3 = vs.cr3;
+    test_println!("  VmSpace cr3={:#x}", cr3);
+
+    // Property 1+2: registry lookup returns the same Arc.
+    let looked_up = vma::mm_sem_for_cr3(cr3);
+    match looked_up {
+        Some(other) => {
+            if alloc::sync::Arc::ptr_eq(&other, &vs.mm_sem) {
+                test_println!("  mm_sem_for_cr3 returns matching Arc ✓");
+            } else {
+                test_fail!("mm_sem_registry_w216",
+                    "mm_sem_for_cr3 returned a different Arc instance");
+                ok = false;
+            }
+            drop(other);
+        }
+        None => {
+            test_fail!("mm_sem_registry_w216",
+                "mm_sem_for_cr3({:#x}) returned None — registry not populated", cr3);
+            ok = false;
+        }
+    }
+
+    // Property 3a: holding a read guard blocks writer.
+    {
+        let _r = vs.mm_sem.read();
+        if vs.mm_sem.try_write().is_some() {
+            test_fail!("mm_sem_registry_w216",
+                "try_write succeeded while read guard held");
+            ok = false;
+        } else {
+            test_println!("  read-held: try_write fails ✓");
+        }
+    }
+
+    // Property 3b: holding a write guard blocks readers AND writers.
+    {
+        let _w = vs.mm_sem.write();
+        if vs.mm_sem.try_read().is_some() {
+            test_fail!("mm_sem_registry_w216",
+                "try_read succeeded while write guard held");
+            ok = false;
+        } else {
+            test_println!("  write-held: try_read fails ✓");
+        }
+        if vs.mm_sem.try_write().is_some() {
+            test_fail!("mm_sem_registry_w216",
+                "second try_write succeeded while write guard held");
+            ok = false;
+        } else {
+            test_println!("  write-held: second try_write fails ✓");
+        }
+    }
+
+    // Property 4: clone_for_fork → child has a distinct Arc.
+    // We need a fresh local VmSpace to fork because clone_for_fork takes
+    // `&mut self`.  Re-bind `vs` as mutable.
+    let mut vs = vs;
+    let parent_arc = vs.mm_sem.clone();
+    let child = match vs.clone_for_fork(cr3) {
+        Some(c) => c,
+        None => {
+            test_println!("  clone_for_fork failed (PMM exhausted) — SKIP fork sub-checks");
+            // Still drop and check property 5.
+            drop(vs);
+            if vma::mm_sem_for_cr3(cr3).is_none() {
+                test_println!("  drop deregistered cr3 from registry ✓");
+            }
+            if ok { test_pass!("mm_sem_registry_w216 (partial)"); }
+            return ok;
+        }
+    };
+    if alloc::sync::Arc::ptr_eq(&parent_arc, &child.mm_sem) {
+        test_fail!("mm_sem_registry_w216",
+            "parent and child share the same mm_sem Arc — must be independent");
+        ok = false;
+    } else {
+        test_println!("  parent and child have distinct mm_sem Arcs ✓");
+    }
+    let child_cr3 = child.cr3;
+    if vma::mm_sem_for_cr3(child_cr3).is_some() {
+        test_println!("  child cr3={:#x} registered ✓", child_cr3);
+    } else {
+        test_fail!("mm_sem_registry_w216",
+            "child cr3={:#x} missing from registry", child_cr3);
+        ok = false;
+    }
+
+    // Property 5: drop deregisters.
+    drop(child);
+    if vma::mm_sem_for_cr3(child_cr3).is_none() {
+        test_println!("  drop(child) deregistered cr3={:#x} ✓", child_cr3);
+    } else {
+        test_fail!("mm_sem_registry_w216",
+            "child cr3={:#x} still in registry after drop", child_cr3);
+        ok = false;
+    }
+    // Release the test's own Arc clone before dropping the VmSpace so the
+    // strong_count reaches exactly 2 (vs + registry) at drop time.  The
+    // Drop impl guards removal with count == 2; retaining `parent_arc` here
+    // would inflate the count to 3 and incorrectly block deregistration.
+    drop(parent_arc);
+    drop(vs);
+    if vma::mm_sem_for_cr3(cr3).is_none() {
+        test_println!("  drop(parent) deregistered cr3={:#x} ✓", cr3);
+    } else {
+        test_fail!("mm_sem_registry_w216",
+            "parent cr3={:#x} still in registry after drop", cr3);
+        ok = false;
+    }
+
+    // Property 6: vfork-style shared mm_sem — from_existing_cr3 gap (W216 review).
+    //
+    // Build a new parent VmSpace, then construct a vfork-style child via
+    // `from_existing_cr3` sharing the parent's Arc.  Drop the child and verify
+    // that the parent's registry entry and mm_sem are still intact — this is
+    // the gap the review identified: the old code allocated a fresh Arc for the
+    // child, overwrote the registry slot, and child-drop removed the entry,
+    // leaving the parent with a None lookup that silently skipped mm_sem
+    // acquisition on every subsequent PTE-mutating call.
+    test_println!("  property 6: vfork-style shared mm_sem (from_existing_cr3)");
+    let parent_vs = match vma::VmSpace::new_user() {
+        Some(v) => v,
+        None => {
+            test_println!("  new_user failed for p6 — skip");
+            if ok { test_pass!("per-VmSpace mm_sem RwLock contract (W216)"); }
+            return ok;
+        }
+    };
+    let p6_cr3         = parent_vs.cr3;
+    let p6_parent_arc  = parent_vs.mm_sem.clone();
+    // Build a vfork child sharing the parent's mm_sem.
+    let p6_child = vma::VmSpace::from_existing_cr3(p6_cr3, p6_parent_arc.clone());
+    // Drop child: registry entry must SURVIVE (strong_count was > 1).
+    drop(p6_child);
+    match vma::mm_sem_for_cr3(p6_cr3) {
+        Some(ref looked) if alloc::sync::Arc::ptr_eq(looked, &p6_parent_arc) => {
+            test_println!("  vfork child drop preserved parent registry entry ✓");
+        }
+        Some(_) => {
+            test_fail!("mm_sem_registry_w216",
+                "vfork child drop replaced registry Arc (should have shared parent's)");
+            ok = false;
+        }
+        None => {
+            test_fail!("mm_sem_registry_w216",
+                "vfork child drop evicted parent registry entry at cr3={:#x}", p6_cr3);
+            ok = false;
+        }
+    }
+    // Drop parent: registry entry must now be gone.
+    // Release the test-local Arc clone first so the strong_count at
+    // parent_vs drop is exactly 2 (parent_vs + registry) — the condition
+    // the Drop impl requires to evict the registry slot.
+    drop(p6_parent_arc);
+    drop(parent_vs);
+    if vma::mm_sem_for_cr3(p6_cr3).is_none() {
+        test_println!("  vfork parent drop deregistered cr3={:#x} ✓", p6_cr3);
+    } else {
+        test_fail!("mm_sem_registry_w216",
+            "vfork parent cr3={:#x} still in registry after parent drop", p6_cr3);
+        ok = false;
+    }
+
+    if ok { test_pass!("per-VmSpace mm_sem RwLock contract (W216)"); }
     ok
 }
 
