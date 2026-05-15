@@ -1430,34 +1430,31 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
             // recycled physical frames (the residual 5th-class aliasing that
             // remained after PRs #222 / #225 / #226 / #230).
             //
-            // Fix: after the cheap revalidate succeeds, ESCALATE `mm_sem` to write
-            // for the duration of the install loop.  This excludes any concurrent
-            // teardown (munmap / madvise / MAP_FIXED Phase 2b) until every PTE is
-            // installed.  The cost is only paid on file-backed faults that
-            // actually allocated readahead pages; the revalidate fast-path keeps
-            // the cost away from the stale-VMA case entirely.
-            //
-            // Lock ordering: PROCESS_TABLE (already dropped) → MOUNTS (already
-            // dropped) → mm_sem.write (acquired below) → MM_REGISTRY (leaf,
-            // transient inside `mm_sem_for_cr3`) → VMM_LOCK / PMM_LOCK /
-            // PAGE_CACHE (leaves, taken by the install primitives).  This matches
-            // the invariant documented in `kernel/src/mm/vma.rs`.
-            //
-            // Scope: this exclusion is per-VmSpace and only spans the install
-            // loop (microseconds, no I/O held under the lock).  It does NOT
-            // serialise the whole address-space against the PMM globally —
-            // independent VmSpaces remain fully parallel, and any reader on the
-            // same VmSpace (e.g. another #PF on a different VA) blocks only for
-            // the install duration.  Per Intel SDM Vol. 3A §4.10.5, PTE writes
-            // must be globally ordered with respect to other PTE mutators on the
-            // same paging hierarchy; the write-lock provides exactly that
-            // ordering for the duration of the multi-page install.
+            // Lock ordering preserved: PROCESS_TABLE (top) → nothing else here.
+            // MOUNTS is NOT held at this point; cache/PMM locks are NOT held yet.
+            // W216 H_5j-B: also capture the VmSpace generation Arc + a
+            // post-revalidate sample so we can detect any further VMA-list
+            // mutation that happens BETWEEN this revalidate and each
+            // cache::insert + map_page_in iteration in the install loop
+            // below.  PR #226's revalidate alone catches mutations that
+            // happened during the I/O phase; the install loop itself can
+            // span microseconds during which a sibling CPU running
+            // sys_munmap / MAP_FIXED Phase 2b / MADV_DONTNEED can drain
+            // frames out from under us.  See `VmSpace::generation`.
+            let mut vm_generation: Option<alloc::sync::Arc<core::sync::atomic::AtomicU64>> = None;
+            let mut gen_at_revalidate: u64 = 0;
             if n_pages > 0 {
                 let still_valid = {
                     let procs = crate::proc::PROCESS_TABLE.lock();
-                    procs.iter()
+                    let vs_opt = procs.iter()
                         .find(|p| p.pid == target_pid)
-                        .and_then(|p| p.vm_space.as_ref())
+                        .and_then(|p| p.vm_space.as_ref());
+                    if let Some(vs) = vs_opt {
+                        vm_generation = Some(vs.generation.clone());
+                        gen_at_revalidate =
+                            vs.generation.load(core::sync::atomic::Ordering::Acquire);
+                    }
+                    vs_opt
                         .and_then(|vs| vs.find_vma(faulting_addr))
                         .map(|v| {
                             matches!(&v.backing,
@@ -1508,39 +1505,42 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
             let needs_private_copy_vma = is_writable_vma && !is_shared;
             let mapped_faulting = n_pages > 0;
 
-            // W216 H_5j-A: escalate mm_sem to write across the install loop.
-            //
-            // The guard is bound for the duration of `_install_guard` and
-            // dropped automatically on any path out of the block — including
-            // the early-return at OOM-during-private-copy below — by Rust
-            // RAII.  `map_page_in_locked` is used inside the loop because
-            // `map_page_in` would otherwise recursively acquire `mm_sem` in
-            // read mode (and `spin::RwLock` is non-reentrant — that would
-            // self-deadlock).
-            //
-            // The OOM-fallback to single-page (n_pages == 0, mapped_faulting
-            // == false) skips this block entirely and the lock is never
-            // taken, so the single-page arm acquires its own write lock
-            // below without contending against ourselves.
-            let _install_sem = if n_pages > 0 {
-                crate::mm::vma::mm_sem_for_cr3(cr3)
-            } else {
-                None
-            };
-            let _install_guard = _install_sem.as_ref().map(|s| s.write());
-            #[cfg(feature = "firefox-test")]
-            if n_pages > 0 {
-                static PF_INSTALL_LOCK_N: core::sync::atomic::AtomicU64 =
-                    core::sync::atomic::AtomicU64::new(0);
-                let nl = PF_INSTALL_LOCK_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                if nl < 5 || nl % 500 == 0 {
-                    crate::serial_println!(
-                        "[PF/install-lock] readahead #{} addr={:#x} pages={}",
-                        nl, page_addr, n_pages);
-                }
-            }
             for i in 0..n_pages {
                 let (vaddr, phys, foff) = pages_to_map[i];
+
+                // W216 H_5j-B: per-iteration generation re-check.  Any sibling
+                // CPU that mutated the address space (sys_munmap, MAP_FIXED
+                // Phase 2b, MADV_DONTNEED, mprotect, sysv_shm push/remove,
+                // brk grow/shrink, clone_for_fork CoW write-protect) since
+                // the post-revalidate sample bumps `vm_space.generation`.
+                // A mismatch means the snapshot we computed before this
+                // iteration is no longer authoritative — abort the install
+                // loop, free remaining frames, return false so the user
+                // re-faults against the new VMA.  Per Intel SDM Vol. 3A
+                // §8.2.3, this Acquire load pairs with the Release fetch_add
+                // in `bump_generation_for_cr3` and `VmSpace::*` mutators.
+                if let Some(g) = vm_generation.as_ref() {
+                    let gen_now = g.load(core::sync::atomic::Ordering::Acquire);
+                    if gen_now != gen_at_revalidate {
+                        #[cfg(feature = "firefox-test")]
+                        crate::serial_println!(
+                            "[PF/gen-abort] READAHEAD addr={:#x} mount={} inode={} \
+                             foff={:#x} gen_at_rev={} gen_now={} — releasing {} \
+                             unmapped frames",
+                            faulting_addr, mount_idx, inode, file_base_offset,
+                            gen_at_revalidate, gen_now, n_pages.saturating_sub(i));
+                        // Release every frame we have not yet installed.
+                        // Frames already installed in earlier iterations (i'
+                        // < i) are reachable via PTE refs and the cache, so
+                        // they remain valid; the user keeps observing them
+                        // through the existing PTEs.
+                        for j in i..n_pages {
+                            let (_v, p, _f) = pages_to_map[j];
+                            crate::mm::pmm::free_page(p);
+                        }
+                        return false;
+                    }
+                }
 
                 // ---- Bug-B fix: guard reference ----------------------------
                 // Acquire a guard reference on `phys` BEFORE inserting it into
@@ -1608,10 +1608,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                             );
                         }
                         crate::mm::refcount::page_ref_set(private_phys, 1);
-                        // W216 H_5j-A: we hold `mm_sem.write` already — call the
-                        // `_locked` variant to avoid `spin::RwLock` non-reentrant
-                        // self-deadlock.  See block-level comment above.
-                        crate::mm::vmm::map_page_in_locked(cr3, vaddr, private_phys, page_flags);
+                        crate::mm::vmm::map_page_in(cr3, vaddr, private_phys, page_flags);
                         // Cache keeps its ref to phys (the clean shared copy).
                         // Drop guard ref — steady state: cache ref(phys) = 1.
                         let _ = crate::mm::refcount::page_ref_dec(phys);
@@ -1640,8 +1637,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     // MAP_SHARED writable, or any read-only mapping: alias
                     // the cache page directly.
                     crate::mm::refcount::page_ref_inc(phys);
-                    // W216 H_5j-A: see _locked rationale on private-copy arm.
-                    crate::mm::vmm::map_page_in_locked(cr3, vaddr, phys, page_flags);
+                    crate::mm::vmm::map_page_in(cr3, vaddr, phys, page_flags);
                     // Drop guard ref — steady state: cache(1) + PTE(1) = 2.
                     let _ = crate::mm::refcount::page_ref_dec(phys);
                 }
@@ -1738,12 +1734,27 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 // drop (before I/O) and here, a sibling CPU running sys_mmap
                 // MAP_FIXED Phase 2b may have freed the frames backing this VA and
                 // replaced the VMA with a new one.  Re-validate before installing.
+                // W216 H_5j-B: capture the VmSpace generation post-revalidate
+                // and re-check it just before the cache::insert + map_page_in
+                // below.  Single-page path has one install, but a sibling CPU
+                // can still mutate the address space between the revalidate
+                // critical section and the install — same race class as the
+                // readahead arm above.  See `VmSpace::generation` doc comment.
+                let mut sp_vm_generation:
+                    Option<alloc::sync::Arc<core::sync::atomic::AtomicU64>> = None;
+                let mut sp_gen_at_revalidate: u64 = 0;
                 {
                     let still_valid = {
                         let procs = crate::proc::PROCESS_TABLE.lock();
-                        procs.iter()
+                        let vs_opt = procs.iter()
                             .find(|p| p.pid == target_pid)
-                            .and_then(|p| p.vm_space.as_ref())
+                            .and_then(|p| p.vm_space.as_ref());
+                        if let Some(vs) = vs_opt {
+                            sp_vm_generation = Some(vs.generation.clone());
+                            sp_gen_at_revalidate =
+                                vs.generation.load(core::sync::atomic::Ordering::Acquire);
+                        }
+                        vs_opt
                             .and_then(|vs| vs.find_vma(faulting_addr))
                             .map(|v| {
                                 matches!(&v.backing,
@@ -1767,35 +1778,20 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         return false;
                     }
                 }
-                // W216 H_5j-A: escalate mm_sem to write across the single-page
-                // install.  See the readahead arm above for the full rationale:
-                // the cheap PR #226 revalidate closes the racing
-                // TEARDOWN-then-INSTALL case, but the cache::insert →
-                // read_pte → map_page_in_locked install sequence below also
-                // needs exclusion against a concurrent munmap / MAP_FIXED
-                // Phase 2b on a sibling CPU.  `map_page_in_locked` is used
-                // because we hold `mm_sem.write` and `spin::RwLock` is
-                // non-reentrant.
-                //
-                // Lock ordering: PROCESS_TABLE (already dropped) → MOUNTS
-                // (already dropped) → mm_sem.write → VMM_LOCK / PMM_LOCK /
-                // PAGE_CACHE (leaves).  Per Intel SDM Vol. 3A §4.10.5 the
-                // write-lock provides PTE-write ordering for the install.
-                let _spf_sem = crate::mm::vma::mm_sem_for_cr3(cr3);
-                let _spf_guard = _spf_sem.as_ref().map(|s| s.write());
-                #[cfg(feature = "firefox-test")]
-                {
-                    static PF_INSTALL_LOCK_N_SPF: core::sync::atomic::AtomicU64 =
-                        core::sync::atomic::AtomicU64::new(0);
-                    let nl = PF_INSTALL_LOCK_N_SPF
-                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    if nl < 5 || nl % 500 == 0 {
+                // W216 H_5j-B: re-check generation immediately before install.
+                if let Some(g) = sp_vm_generation.as_ref() {
+                    let gen_now = g.load(core::sync::atomic::Ordering::Acquire);
+                    if gen_now != sp_gen_at_revalidate {
+                        #[cfg(feature = "firefox-test")]
                         crate::serial_println!(
-                            "[PF/install-lock] single-page #{} addr={:#x}",
-                            nl, page_addr);
+                            "[PF/gen-abort] SINGLE-PAGE addr={:#x} mount={} inode={} \
+                             foff={:#x} gen_at_rev={} gen_now={} — dropping frame",
+                            faulting_addr, mount_idx, inode, file_page_offset,
+                            sp_gen_at_revalidate, gen_now);
+                        crate::mm::pmm::free_page(phys);
+                        return false;
                     }
                 }
-
                 // Bug-B fix (single-page fallback): hold a guard reference
                 // before inserting into the cache, mirroring the readahead-
                 // path fix above.  Without the guard, a concurrent cache::insert
@@ -1835,8 +1831,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                             );
                         }
                         crate::mm::refcount::page_ref_set(private_phys, 1);
-                        // W216 H_5j-A: _locked variant; mm_sem.write is held.
-                        crate::mm::vmm::map_page_in_locked(cr3, page_addr, private_phys, page_flags);
+                        crate::mm::vmm::map_page_in(cr3, page_addr, private_phys, page_flags);
                         crate::mm::vmm::invlpg(page_addr);
                         // Cache keeps its own ref to phys (clean shared copy).
                         // Release guard — steady state: cache ref(phys) = 1.
@@ -1864,8 +1859,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     // cache page directly.  Writes via MAP_SHARED are visible to
                     // all other mappers — required by mmap(2) MAP_SHARED contract.
                     crate::mm::refcount::page_ref_inc(phys); // PTE reference
-                    // W216 H_5j-A: _locked variant; mm_sem.write is held.
-                    crate::mm::vmm::map_page_in_locked(cr3, page_addr, phys, page_flags);
+                    crate::mm::vmm::map_page_in(cr3, page_addr, phys, page_flags);
                     crate::mm::vmm::invlpg(page_addr);
                     // Release guard — steady state: cache(1) + PTE(1) = 2.
                     let _ = crate::mm::refcount::page_ref_dec(phys);

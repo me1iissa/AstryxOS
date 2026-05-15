@@ -171,6 +171,9 @@ pub fn shmat(shmid: u32, shmaddr: u64, _shmflg: i32) -> i64 {
                     backing: crate::mm::vma::VmBacking::Device { phys_base },
                     name:    "[shm]",
                 });
+                // W216 H_5j-B: notify the PFH install loop of the VMA-list
+                // mutation (this site bypasses insert_vma).
+                vs.generation.fetch_add(1, core::sync::atomic::Ordering::Release);
             }
         }
     }
@@ -205,6 +208,9 @@ pub fn shmdt(shmaddr: u64) -> i64 {
         match idx {
             Some(i) => {
                 let vma = vs.areas.remove(i);
+                // W216 H_5j-B: notify the PFH install loop of the VMA-list
+                // mutation (this site bypasses remove_range).
+                vs.generation.fetch_add(1, core::sync::atomic::Ordering::Release);
                 match vma.backing {
                     crate::mm::vma::VmBacking::Device { phys_base } => (phys_base, vma.length),
                     _ => unreachable!(),
