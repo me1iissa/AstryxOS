@@ -134,6 +134,13 @@ fi
 # non-NULL sentinel ("DejaVu Sans") into *out.  Loaded via LD_PRELOAD in the
 # firefox-test envp (see kernel/src/gui/terminal.rs).
 # Spec: https://fontconfig.org/fontconfig-devel/fcpatternget.html
+#
+# W212: the interposer also wraps dlsym() to intercept lookups for
+# "C_GetInterface" (PKCS#11 v3.0 §5.5) — libipcclientcerts.so only exports
+# the v2.x entry point C_GetFunctionList; NSS treats a NULL dlsym return for
+# C_GetInterface as fatal.  Our dlsym wrapper returns CKR_FUNCTION_NOT_SUPPORTED
+# (0x54) so NSS falls back to the v2.x code path.
+# Ref: https://docs.oasis-open.org/pkcs11/pkcs11-base/v3.0/pkcs11-base-v3.0.html
 INTERPOSER_DIR="${ROOT_DIR}/userspace/libfontconfig-interposer"
 INTERPOSER_SO="libfontconfig-interposer.so"
 if [ -d "${INTERPOSER_DIR}" ] && command -v gcc &>/dev/null; then
