@@ -15,6 +15,9 @@
 //! All state is protected by a single global Mutex.  Safe on AstryxOS's
 //! single-CPU non-preemptive kernel model.
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use spin::Mutex;
 
 // ── Limits ───────────────────────────────────────────────────────────────────
@@ -553,4 +556,37 @@ pub fn state(id: u64) -> UnixState {
 pub fn get_peer(id: u64) -> u64 {
     if id as usize >= MAX_UNIX_SOCKETS { return u64::MAX; }
     TABLE.lock().0[id as usize].peer_id
+}
+
+/// Snapshot of one slot in the global unix socket TABLE.
+/// Used by kdb `fd-map` to resolve socketpair peer relationships
+/// without holding the TABLE lock across the entire traversal.
+pub struct SocketSnap {
+    pub id:       u64,
+    pub state:    UnixState,
+    pub kind:     SockKind,
+    pub peer_id:  u64,
+    pub recv_avail: usize,
+    pub path:     [u8; UNIX_PATH_MAX],
+    pub path_len: usize,
+}
+
+/// Snapshot all non-Free unix socket slots in one lock acquisition.
+/// Returns at most `MAX_UNIX_SOCKETS` entries.
+pub fn snapshot_all() -> Vec<SocketSnap> {
+    let t = TABLE.lock();
+    let mut out = Vec::new();
+    for (i, s) in t.0.iter().enumerate() {
+        if s.state == UnixState::Free { continue; }
+        out.push(SocketSnap {
+            id:          i as u64,
+            state:       s.state,
+            kind:        s.kind,
+            peer_id:     s.peer_id,
+            recv_avail:  s.recv_available(),
+            path:        s.path,
+            path_len:    s.path_len,
+        });
+    }
+    out
 }
