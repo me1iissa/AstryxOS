@@ -19,8 +19,15 @@ const EXIT_SUCCESS: u32 = 0x00; // QEMU exits with code 1
 const EXIT_FAILURE: u32 = 0x01; // QEMU exits with code 3
 
 fn qemu_exit(code: u32) -> ! {
+    // Emit a terminal marker BEFORE the outl so the serial watcher can
+    // detect the exit attempt and terminate immediately without waiting
+    // for the 30-second idle timeout.  The marker is structured so
+    // watch-test.py and qemu-harness.py can both grep for it.
+    crate::serial_println!("[QEMU-EXIT] code={}", code);
     unsafe { crate::hal::outl(QEMU_EXIT_PORT, code); }
-    // If debug-exit device isn't present, halt instead
+    // Fallback if the isa-debug-exit device is absent: spin on hlt.
+    // The serial marker above lets the watcher kill QEMU cleanly even
+    // if the outl has no effect.
     loop { unsafe { core::arch::asm!("cli; hlt"); } }
 }
 
