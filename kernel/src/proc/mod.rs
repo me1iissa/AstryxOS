@@ -1169,9 +1169,9 @@ pub fn exit_thread(exit_code: i64) {
 
 /// Free all physical memory owned by a process (user page frames + page tables).
 ///
-/// Walks the process's VmSpace VMAs, decrements refcounts of all present anonymous
-/// pages, and frees any whose refcount reaches zero.  Also frees the private
-/// user-half page table structures (PT → PD → PDPT → PML4).
+/// Walks the process's VmSpace VMAs, decrements refcounts of all present pages
+/// (both anonymous and file-backed), and frees any whose refcount reaches zero.
+/// Also frees the private user-half page table structures (PT → PD → PDPT → PML4).
 ///
 /// Call after marking the process Zombie and after all threads are Dead, but
 /// before removing the process from PROCESS_TABLE.  Safe to call from the
@@ -1216,16 +1216,31 @@ pub fn free_process_memory(pid: Pid) {
     // (cheaper than per-page invlpg over the entire user half).
     let shootdown_clean = crate::mm::tlb::shootdown_full_user(cr3);
 
-    // Walk all VMAs and free physical frames (anonymous pages only).
-    // File-backed pages are managed by the page cache; device pages are MMIO.
+    // Walk all VMAs and free physical frames.
+    //
+    // Both anonymous and file-backed VMAs have their frames ref-counted: every
+    // present PTE holds one reference that was incremented when the page was
+    // faulted or mapped in.  File-backed pages are shared with the page cache
+    // (cache holds rc=1, each mapping PTE adds rc=1); decrementing here drops
+    // the mapping ref.  If the cache also drops its ref later (eviction), rc
+    // reaches zero and the frame is freed then.  Device VMAs are MMIO — they
+    // have no backing frames in the PMM and must be skipped.
+    //
+    // Skipping file-backed PTEs (the pre-fix behaviour) left a permanent rc=1
+    // from the mapping ref, preventing the cache from ever reclaiming those
+    // frames.  Under Firefox bringup, every shared library segment leaked its
+    // entire working set, inflating PMM pressure and increasing the probability
+    // that the next-fit allocator wrapped around into frames still cached by
+    // the page-aliasing path (W216 audit).
     const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
     const PAGE_PRESENT: u64 = 1;
 
     for vma in &vm_space.areas {
-        match &vma.backing {
-            VmBacking::File { .. } | VmBacking::Device { .. } => continue,
-            VmBacking::Anonymous => {}
-        }
+        // Skip MMIO device VMAs — their "physical addresses" are I/O registers,
+        // not PMM-tracked frames; decrementing their refcount would corrupt the
+        // PMM's bookkeeping.
+        if let VmBacking::Device { .. } = &vma.backing { continue; }
+
         let mut addr = vma.base;
         while addr < vma.base + vma.length {
             let pte = vmm::read_pte(cr3, addr);
@@ -1234,7 +1249,8 @@ pub fn free_process_memory(pid: Pid) {
                 if refcount::page_ref_dec(phys) == 0 {
                     // If the shootdown did not receive all ACKs, defer the
                     // PMM release until every CPU has passed through a
-                    // quiescent state (timer ISR), guaranteeing TLB drain.
+                    // quiescent state (timer ISR tick), guaranteeing TLB
+                    // drain before the frame is recycled.
                     if shootdown_clean {
                         pmm::free_page(phys);
                     } else {
@@ -1258,10 +1274,10 @@ pub fn free_process_memory(pid: Pid) {
 /// and passes the old one in by value.  Ownership is consumed, so there is no
 /// risk of double-free.
 ///
-/// Walks every anonymous VMA, decrements the per-page refcount, and frees any
-/// physical frame whose refcount reaches zero (CoW pages shared with a child
-/// are not freed until the last reference drops).  Then frees the private
-/// user-half page table structures (PT → PD → PDPT → PML4).
+/// Walks every anonymous and file-backed VMA, decrements the per-page refcount,
+/// and frees any physical frame whose refcount reaches zero (CoW pages shared
+/// with a child are not freed until the last reference drops).  Then frees the
+/// private user-half page table structures (PT → PD → PDPT → PML4).
 ///
 /// # Safety contract for the caller
 /// The caller MUST have already switched the hardware CR3 away from this
@@ -1297,16 +1313,24 @@ pub fn free_vm_space(vm_space: crate::mm::vma::VmSpace) {
     // could still hold cached translations into this address space.
     let shootdown_clean = crate::mm::tlb::shootdown_full_user(cr3);
 
-    // Walk all anonymous VMAs and decrement/free the backing physical pages.
-    // File-backed pages belong to the page cache; device pages are MMIO.
+    // Walk all VMAs and decrement/free the backing physical pages.
+    //
+    // Identical semantics to the free_process_memory path: both anonymous and
+    // file-backed VMAs hold one refcount per mapped PTE.  File-backed mappings
+    // share frames with the page cache (cache holds rc=1, PTE holds rc=1);
+    // dropping the PTE ref here allows the cache to reclaim the frame on
+    // eviction.  Device VMAs are MMIO and must be skipped.
+    //
+    // The pre-fix code skipped file-backed VMAs, leaking the PTE ref
+    // permanently and preventing cache reclamation of every shared-library
+    // segment loaded by execve — the dominant allocation pattern during
+    // Firefox bringup (W216 audit teardown-leak finding).
     const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
     const PAGE_PRESENT: u64 = 1;
 
     for vma in &vm_space.areas {
-        match &vma.backing {
-            VmBacking::File { .. } | VmBacking::Device { .. } => continue,
-            VmBacking::Anonymous => {}
-        }
+        if let VmBacking::Device { .. } = &vma.backing { continue; }
+
         let mut addr = vma.base;
         while addr < vma.base + vma.length {
             let pte = vmm::read_pte(cr3, addr);
