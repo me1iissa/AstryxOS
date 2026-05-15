@@ -476,9 +476,24 @@ pub fn virt_to_phys(virt_addr: u64) -> Option<u64> {
 /// This does NOT modify the current CR3 — it writes to the specified page table.
 /// Used for setting up mappings in a new process's address space.
 ///
+/// # W216 mm_sem invariant
+///
+/// The per-VmSpace `mm_sem` (looked up by `pml4_phys` via the
+/// `mm::vma::MM_REGISTRY`) is held in read mode for the duration of the
+/// PTE write so that a concurrent `VmSpace::clone_for_fork` on this
+/// address space (which holds the same lock in write mode) cannot race
+/// the PTE walk and resurrect a PTE pointing at a frame that another
+/// path is about to return to the PMM.  See `kernel/src/mm/vma.rs`.
+///
 /// # Safety
 /// `pml4_phys` must point to a valid PML4 page table.
 pub fn map_page_in(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -> bool {
+    // Acquire the per-VmSpace address-space read lock if this `cr3` is
+    // registered.  Kernel-only CR3s, the bootstrap CR3, and the AP idle
+    // path may invoke `map_page_in` without a registered VmSpace; the
+    // `None` arm is a no-op (no concurrent fork to serialise against).
+    let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
+    let _mm_read = _mm_guard.as_ref().map(|s| s.read());
     let _lock = VMM_LOCK.lock();
 
     let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
@@ -508,7 +523,11 @@ pub fn map_page_in(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -
 }
 
 /// Unmap a virtual page in an arbitrary page table.
+///
+/// See `map_page_in` for the W216 `mm_sem` read-lock invariant.
 pub fn unmap_page_in(pml4_phys: u64, virt_addr: u64) {
+    let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
+    let _mm_read = _mm_guard.as_ref().map(|s| s.read());
     let _lock = VMM_LOCK.lock();
 
     let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
@@ -572,6 +591,15 @@ pub fn unmap_and_free_range_in(pml4_phys: u64, base: u64, length: u64) -> usize 
     // 4 MiB.  Keeping the batch finite bounds stack-pressure (this runs on
     // the kernel stack, not a heap-allocated buffer).
     const BATCH: usize = 1024;
+
+    // W216 mm_sem read-lock: held across PTE clear → shootdown → free so a
+    // sibling CPU executing `clone_for_fork` on the same address space (which
+    // holds the same lock in write mode) cannot resurrect a PTE for one of
+    // the frames this loop is about to return to the PMM.  Re-acquisition by
+    // the inner `unmap_page_in` is a recursive read; spin::RwLock supports
+    // multiple readers concurrently, so the nested acquire is safe.
+    let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
+    let _mm_read = _mm_guard.as_ref().map(|s| s.read());
 
     let mut freed = 0usize;
     let mut pg = base;
@@ -661,7 +689,12 @@ pub fn read_pte(pml4_phys: u64, virt_addr: u64) -> u64 {
 
 /// Write a PTE in an arbitrary page table (used for CoW flag manipulation).
 /// Does NOT create intermediate table levels — the mapping must already exist.
+///
+/// See `map_page_in` for the W216 `mm_sem` read-lock invariant.
 pub fn write_pte(pml4_phys: u64, virt_addr: u64, pte: u64) {
+    let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
+    let _mm_read = _mm_guard.as_ref().map(|s| s.read());
+
     let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
     let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;
     let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;

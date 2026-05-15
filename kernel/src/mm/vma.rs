@@ -14,8 +14,11 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
+use spin::{Mutex, RwLock};
 
 /// VMA protection flags (mmap-compatible).
 pub type VmProt = u32;
@@ -212,6 +215,46 @@ impl fmt::Debug for VmArea {
 // ============================================================================
 
 /// A process's virtual address space: a CR3 + collection of VMAs.
+///
+/// # `mm_sem` — per-VmSpace address-space lock (W216 fix)
+///
+/// `mm_sem` is a per-process `RwLock` mirroring the POSIX equivalent of
+/// Linux's `mmap_lock` (formerly `mmap_sem`).  It serialises page-table
+/// edits against bulk address-space rewrites such as `clone_for_fork`
+/// and process teardown.  Without it, a sibling CPU running
+/// `clone_for_fork` while another CPU is mid-`unmap_and_free_range_in`
+/// can resurrect a page-table entry pointing at a physical frame that is
+/// about to be returned to the PMM, producing the systemic page-aliasing
+/// race documented as W215 / W216.
+///
+/// ## Acquisition rules
+///
+/// * **Write lock** — held while mutating PTEs in bulk across the
+///   address space.  Required by `clone_for_fork`, `free_process_memory`,
+///   `free_vm_space`, and any future address-space rewrite (e.g. exec).
+/// * **Read lock** — held while mutating a small number of PTEs (one
+///   page-fault arm, one syscall such as `mmap`, `munmap`, `mprotect`,
+///   `madvise`, `brk`).  Multiple readers can proceed concurrently — the
+///   write lock only excludes when the bulk-rewrite path is active.
+///
+/// ## Lock ordering invariant
+///
+/// `PROCESS_TABLE` (top) → `VmSpace::mm_sem` (per-process)
+/// → `MM_REGISTRY` (leaf, brief lookup) → `VMM_LOCK` (leaf)
+/// → `PMM_LOCK` (leaf) → `PAGE_CACHE` (leaf, sibling).
+///
+/// Per-process `mm_sem`s are independent across processes — no cycle is
+/// possible across them.  Within one process only read OR write is held
+/// at a time per `RwLock` semantics.
+///
+/// ## Construction
+///
+/// `mm_sem` is an `Arc<RwLock<()>>`.  All in-kernel constructors
+/// (`new_kernel`, `new_user`, `from_existing_cr3`, `clone_for_fork`)
+/// allocate a fresh lock.  Test helpers in `kernel/src/test_runner.rs`
+/// that build `VmSpace` via struct-literal syntax call
+/// `make_mm_sem_for_test()`.  The child of a fork gets its OWN lock —
+/// the parent and child are independent address spaces post-fork.
 pub struct VmSpace {
     /// Physical address of the PML4 page table root.
     pub cr3: u64,
@@ -223,6 +266,12 @@ pub struct VmSpace {
     pub brk: u64,
     /// Start of the heap segment.
     pub brk_start: u64,
+    /// Per-VmSpace address-space lock — see struct-level docs for usage.
+    ///
+    /// Reference-counted so that `MM_REGISTRY` and the owning `VmSpace`
+    /// can both hold a handle; the registry deregisters when the
+    /// `VmSpace` is dropped and the last `Arc` ref vanishes.
+    pub mm_sem: Arc<RwLock<()>>,
 }
 
 /// Default user-space mmap starting address.
@@ -231,27 +280,98 @@ const MMAP_BASE: u64 = 0x0000_7F00_0000_0000;
 /// Default user-space heap start.
 const HEAP_BASE: u64 = 0x0000_0040_0000_0000;
 
+// ============================================================================
+// MM registry — maps cr3 → VmSpace::mm_sem so PTE-mutating helpers in
+// `mm/vmm.rs` can acquire the right per-process lock without changing their
+// signatures.  See the `VmSpace::mm_sem` docs for the lock-ordering rules.
+// ============================================================================
+
+/// Per-`cr3` lookup table for the address-space `mm_sem` lock.
+///
+/// `register_mm_sem` inserts on `VmSpace` construction; `unregister_mm_sem`
+/// removes on `VmSpace` drop.  Look-ups (`mm_sem_for_cr3`) take the registry
+/// lock only long enough to clone the `Arc` out of the map.
+static MM_REGISTRY: Mutex<BTreeMap<u64, Arc<RwLock<()>>>> = Mutex::new(BTreeMap::new());
+
+/// Insert (cr3 → mm_sem) into the registry.
+///
+/// Idempotent: if a different sem is already registered under this cr3 (e.g.
+/// because exec swapped the VmSpace but the old one has not yet been dropped),
+/// the new entry replaces the old.  The old `Arc` survives in any reader that
+/// already grabbed it — `RwLock` correctness is preserved.
+pub(crate) fn register_mm_sem(cr3: u64, sem: Arc<RwLock<()>>) {
+    if cr3 == 0 {
+        return; // Sentinel for "no VmSpace yet" or kernel-only.
+    }
+    let mut reg = MM_REGISTRY.lock();
+    reg.insert(cr3, sem);
+}
+
+/// Remove a registry entry (no-op if absent).
+pub(crate) fn unregister_mm_sem(cr3: u64) {
+    if cr3 == 0 {
+        return;
+    }
+    let mut reg = MM_REGISTRY.lock();
+    reg.remove(&cr3);
+}
+
+/// Look up the mm_sem associated with `cr3`, returning `None` for unknown CR3s
+/// (kernel threads, idle, AP bootstrap).
+pub fn mm_sem_for_cr3(cr3: u64) -> Option<Arc<RwLock<()>>> {
+    if cr3 == 0 {
+        return None;
+    }
+    let reg = MM_REGISTRY.lock();
+    reg.get(&cr3).cloned()
+}
+
+/// Allocate a fresh `mm_sem` handle for use in test struct-literal
+/// `VmSpace { ... }` construction.  Production code paths should construct
+/// `VmSpace` via `new_kernel`, `new_user`, `from_existing_cr3`, or
+/// `clone_for_fork`; those constructors install the registry entry.  The
+/// test helper does NOT register because most tests use cr3=0 (synthetic).
+pub fn make_mm_sem_for_test() -> Arc<RwLock<()>> {
+    Arc::new(RwLock::new(()))
+}
+
 impl VmSpace {
     /// Create a new empty address space for a kernel process (shares kernel CR3).
     pub fn new_kernel() -> Self {
-        Self {
-            cr3: crate::mm::vmm::get_cr3(),
-            areas: Vec::new(),
-            mmap_hint: MMAP_BASE,
-            brk: HEAP_BASE,
-            brk_start: HEAP_BASE,
-        }
-    }
-
-    /// Create a VmSpace that uses an existing CR3 (e.g., for vfork children
-    /// that share the parent's page tables but need their own VMA tracking).
-    pub fn from_existing_cr3(cr3: u64) -> Self {
+        let cr3 = crate::mm::vmm::get_cr3();
+        let mm_sem = Arc::new(RwLock::new(()));
+        register_mm_sem(cr3, mm_sem.clone());
         Self {
             cr3,
             areas: Vec::new(),
             mmap_hint: MMAP_BASE,
             brk: HEAP_BASE,
             brk_start: HEAP_BASE,
+            mm_sem,
+        }
+    }
+
+    /// Create a VmSpace that uses an existing CR3 (e.g., for vfork children
+    /// that share the parent's page tables but need their own VMA tracking).
+    ///
+    /// The new VmSpace gets its own fresh `mm_sem`, even though it shares
+    /// `cr3` with the parent.  Both processes' `mm_sem`s will serialise the
+    /// SAME `cr3`-keyed registry slot — only the most-recently-registered
+    /// holder is visible.  Vfork semantics (`vfork(2)`) require the parent
+    /// to be suspended until the child execs or exits, so concurrent
+    /// page-table mutation through both VmSpaces is precluded by the
+    /// process state machine; the registry slot transition between
+    /// parent-owned and child-owned is therefore safe.
+    pub fn from_existing_cr3(cr3: u64) -> Self {
+        let mm_sem = Arc::new(RwLock::new(()));
+        register_mm_sem(cr3, mm_sem.clone());
+        Self {
+            cr3,
+            areas: Vec::new(),
+            mmap_hint: MMAP_BASE,
+            brk: HEAP_BASE,
+            brk_start: HEAP_BASE,
+            mm_sem,
         }
     }
 
@@ -305,12 +425,15 @@ impl VmSpace {
         // own memory accesses, so PML4[0] is not needed by any kernel subsystem
         // after the higher-half switch.
 
+        let mm_sem = Arc::new(RwLock::new(()));
+        register_mm_sem(new_pml4, mm_sem.clone());
         Some(Self {
             cr3: new_pml4,
             areas: Vec::new(),
             mmap_hint: MMAP_BASE,
             brk: HEAP_BASE,
             brk_start: HEAP_BASE,
+            mm_sem,
         })
     }
 
@@ -333,6 +456,32 @@ impl VmSpace {
         use crate::mm::refcount::page_ref_inc;
 
         const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+
+        // === W216 fix: serialise against concurrent PTE-mutating syscalls ====
+        //
+        // Acquire the parent's mm_sem in write mode for the entire walk.  Any
+        // sibling thread on another CPU that is currently inside
+        // `unmap_and_free_range_in`, `map_page_in`, `sys_madvise(MADV_DONTNEED)`,
+        // `sys_mprotect`, or `sys_brk` for this same address space is holding
+        // the read side of the same `mm_sem`; the write acquisition below
+        // blocks until they all complete.  Once we hold the write lock no new
+        // reader can start until we release it after the walk.
+        //
+        // Without this, the timeline in W216 fires:
+        //   CPU A — clone_for_fork: reads parent_pt[X] = F | RW | PRESENT
+        //   CPU B — unmap_and_free_range_in: clears PTE_Y referencing F,
+        //           refcount goes to 0, F is queued for free
+        //   CPU A — writes parent_pt[X] = F | RO  (resurrects the PTE!)
+        //   CPU A — writes child_pt[X]  = F | RO  (+ page_ref_inc to 1)
+        //   CPU B — shootdown completes for Y but NOT for X
+        //   CPU B — pmm::free_page(F) — F returns to the free pool
+        //   CPU B — third allocator hands F to a kernel page-table page
+        //   CPU A — child or parent demand-loads from X → reads stale F.
+        //
+        // Holding mm_sem write across the entire PML4→PT walk closes the
+        // window: CPU B's `_lock = read_lock(mm_sem)` at the head of
+        // `unmap_and_free_range_in` cannot run while this write is held.
+        let _mm_guard = self.mm_sem.write();
 
         let hw_cr3: u64;
         unsafe { core::arch::asm!("mov {}, cr3", out(reg) hw_cr3, options(nomem, nostack)); }
@@ -484,12 +633,20 @@ impl VmSpace {
             child_areas.push(vma.clone());
         }
 
+        // Child gets a fresh, independent `mm_sem`.  Parent and child are now
+        // separate address spaces; their PTE-mutating sites must not contend
+        // on a single shared lock.  The `register_mm_sem` call associates
+        // the new lock with the child's freshly-allocated PML4.
+        let child_mm_sem = Arc::new(RwLock::new(()));
+        register_mm_sem(child_pml4_phys, child_mm_sem.clone());
+
         Some(VmSpace {
             cr3: child_pml4_phys,
             areas: child_areas,
             mmap_hint: self.mmap_hint,
             brk: self.brk,
             brk_start: self.brk_start,
+            mm_sem: child_mm_sem,
         })
     }
 
@@ -720,6 +877,30 @@ impl VmSpace {
         crate::serial_println!("  VmSpace CR3={:#x}, {} VMAs, brk={:#x}:", self.cr3, self.areas.len(), self.brk);
         for vma in &self.areas {
             crate::serial_println!("    {:?}", vma);
+        }
+    }
+}
+
+/// Deregister this VmSpace's `mm_sem` from the cr3 registry when the
+/// `VmSpace` is dropped.  The `Arc<RwLock<()>>` itself remains alive for
+/// any reader that already obtained a clone via `mm_sem_for_cr3` — the
+/// `RwLock` outlives the map entry by exactly the time it takes the last
+/// in-flight reader/writer to release its guard.
+impl Drop for VmSpace {
+    fn drop(&mut self) {
+        // Best-effort dedup: only deregister if the slot still names our
+        // `Arc`.  A subsequent `register_mm_sem(cr3, other)` (e.g. exec or
+        // fork that reused the same PML4 phys after PMM recycled it) may
+        // have rebound the entry; in that case the slot's `Arc::as_ptr`
+        // differs from ours and we must leave it alone.
+        if self.cr3 == 0 {
+            return;
+        }
+        let mut reg = MM_REGISTRY.lock();
+        if let Some(slot) = reg.get(&self.cr3) {
+            if Arc::ptr_eq(slot, &self.mm_sem) {
+                reg.remove(&self.cr3);
+            }
         }
     }
 }
