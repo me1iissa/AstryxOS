@@ -1549,7 +1549,7 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
                 {
                     pipes.push((f.inode, f.flags & 1 == 1));
                 } else if f.file_type == crate::vfs::FileType::Socket
-                    && f.mount_idx == usize::MAX
+                    && f.flags & crate::syscall::UNIX_SOCKET_FLAG != 0
                 {
                     sockets.push(f.inode);
                 }
@@ -1735,7 +1735,12 @@ pub fn set_fork_user_regs(pid: Pid, tid: Tid, regs: ForkUserRegs) {
 /// descriptors in the parent."
 fn inc_socket_refs_for_fork(fds: &[Option<crate::vfs::FileDescriptor>]) {
     for fd in fds.iter().filter_map(|f| f.as_ref()) {
-        if fd.file_type == crate::vfs::FileType::Socket && fd.mount_idx == usize::MAX {
+        // Gate on UNIX_SOCKET_FLAG (bit 23) rather than mount_idx alone:
+        // AF_INET sockets also use mount_idx==usize::MAX but are tracked
+        // separately and must not be passed to net::unix::inc_ref.
+        if fd.file_type == crate::vfs::FileType::Socket
+            && fd.flags & crate::syscall::UNIX_SOCKET_FLAG != 0
+        {
             crate::net::unix::inc_ref(fd.inode);
         }
     }

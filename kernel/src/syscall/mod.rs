@@ -2527,9 +2527,11 @@ pub(crate) fn sys_dup(old_fd: usize) -> i64 {
     // that a close(2) on either the old or new fd does not prematurely
     // destroy the shared object.  Per POSIX.1-2017 §2.14 and dup(2):
     // "the duplicate and original file descriptors refer to the same open
-    // file description".
+    // file description".  Gate on UNIX_SOCKET_FLAG rather than mount_idx
+    // alone: AF_INET sockets also use mount_idx==usize::MAX but have a
+    // distinct refcount path.
     if fd_clone.file_type == crate::vfs::FileType::Socket
-        && fd_clone.mount_idx == usize::MAX
+        && fd_clone.flags & UNIX_SOCKET_FLAG != 0
     {
         crate::net::unix::inc_ref(fd_clone.inode);
     }
@@ -2577,8 +2579,9 @@ pub(crate) fn sys_dup2(old_fd: usize, new_fd: usize) -> i64 {
 
     // Bump the underlying resource's open-file-description refcount.
     // Same rationale as sys_dup above (POSIX.1-2017 §2.14 / dup2(2)).
+    // Use UNIX_SOCKET_FLAG to exclude AF_INET sockets (W216 review).
     if fd_clone.file_type == crate::vfs::FileType::Socket
-        && fd_clone.mount_idx == usize::MAX
+        && fd_clone.flags & UNIX_SOCKET_FLAG != 0
     {
         crate::net::unix::inc_ref(fd_clone.inode);
     }
@@ -2923,7 +2926,7 @@ pub(crate) fn poll_revents(pid: u64, fd: usize, events: u16) -> u16 {
 
 // ── AF_UNIX socket helpers ────────────────────────────────────────────────────
 
-const UNIX_SOCKET_FLAG: u32 = 0x0080_0000; // bit 23: fd is an AF_UNIX socket
+pub(crate) const UNIX_SOCKET_FLAG: u32 = 0x0080_0000; // bit 23: fd is an AF_UNIX socket
 
 /// Check if a file descriptor is an AF_UNIX socket.
 pub(crate) fn is_unix_socket_fd(pid: u64, fd_num: usize) -> bool {

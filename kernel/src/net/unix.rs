@@ -512,6 +512,12 @@ pub fn close(id: u64) {
     let mut t = TABLE.lock();
     let s = &mut t.0[id as usize];
     if s.state == UnixState::Free { return; }
+    // Catch double-close or close-without-inc_ref in debug builds.
+    // ref_count==0 here means a slot is being closed more times than it
+    // was acquired, which is a kernel bookkeeping bug — not a user error.
+    debug_assert!(s.ref_count > 0,
+        "net::unix::close: id={} ref_count already 0 (double-close or \
+         missing inc_ref on dup/fork)", id);
     // Decrement the reference count.  Only proceed with teardown when
     // the last open reference is released (count reaches zero).
     if s.ref_count > 1 {
