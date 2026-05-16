@@ -178,6 +178,14 @@ pub fn init() {
             // See `mm/tlb.rs` and Intel SDM Vol 3A §10.6.1.
             IDT[0xF0].set_handler(fix(super::irq::irq_tlb_shootdown_handler as *const () as u64), kernel_cs, 0, 0);
 
+            // W215 Arm-1 DR0/DR7 sync IPI (vector 0xF1).  Per Intel SDM
+            // Vol. 3B §17.2.4, DR0–DR3 are per-CPU; this vector lets the
+            // sender CPU publish a new (addr, ctrl) pair and have every
+            // online CPU pick it up by reprogramming its own DRs.
+            // Diagnostic-only; gated on `firefox-test`.
+            #[cfg(feature = "firefox-test")]
+            IDT[0xF1].set_handler(fix(super::irq::irq_w215_dr_sync_handler as *const () as u64), kernel_cs, 0, 0);
+
             // Syscall interrupt (vector 0x80) — for int 0x80 style syscalls
             IDT[0x80].set_handler(fix(isr_syscall_int80 as *const () as u64), kernel_cs, 0, 3);
 
@@ -226,6 +234,22 @@ pub fn init() {
 /// Common exception handler called from stubs.
 #[no_mangle]
 extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut InterruptFrame) {
+    // W215 Arm-1 diagnostic: a `#DB` (vector 1) trap may originate from the
+    // hardware write-watchpoint armed by the cache CRC walker.  Dispatch
+    // to the W215 handler first; if it consumes the trap, return to the
+    // interrupted RIP without printing any further diagnostics.  Per
+    // Intel SDM Vol. 3B §17.2.5 (Debug Status Register DR6), B0..B3
+    // identify which DRn triggered.  Diagnostic-only; gated on
+    // `firefox-test`.
+    #[cfg(feature = "firefox-test")]
+    if vector == 1 {
+        if crate::arch::x86_64::debug_reg::handle_db_exception(
+            frame.rip, frame.rsp, frame.rflags, frame.cs,
+        ) {
+            return;
+        }
+    }
+
     // Debug trace for non-page-fault exceptions from user mode.
     if frame.cs & 3 == 3 && vector != 14 {
         crate::serial_println!(

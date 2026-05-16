@@ -130,11 +130,14 @@ pub fn insert(mount_idx: usize, inode: u64, page_offset: u64, phys: u64) {
             let new_rc = crate::mm::refcount::page_ref_dec(old_entry.phys);
             evicted_zero_rc = if new_rc == 0 { Some(old_entry.phys) } else { None };
             #[cfg(feature = "firefox-test")]
-            crate::mm::w215_diag::prov_record(
-                old_entry.phys,
-                crate::mm::w215_diag::KIND_EVICT,
-                crate::mm::w215_diag::pack_cache_key(inode, page_offset),
-            );
+            {
+                crate::mm::w215_diag::prov_record(
+                    old_entry.phys,
+                    crate::mm::w215_diag::KIND_EVICT,
+                    crate::mm::w215_diag::pack_cache_key(inode, page_offset),
+                );
+                crate::mm::w215_crc::record_evict(old_entry.phys);
+            }
         } else {
             evicted_zero_rc = None;
         }
@@ -150,6 +153,10 @@ pub fn insert(mount_idx: usize, inode: u64, page_offset: u64, phys: u64) {
             crate::mm::w215_diag::pack_cache_key(inode, page_offset),
         );
         let _ = crate::mm::w215_diag::preins_clear_on_insert(phys);
+        // Arm-1 CRC walker shadow-table snapshot.  Done AFTER the cache
+        // lock is released so we do not hold two locks at once; the
+        // shadow-table mutex is the only lock involved.
+        crate::mm::w215_crc::record_insert(phys, inode, page_offset);
     }
 
     if let Some(old_phys) = evicted_zero_rc {
@@ -190,6 +197,7 @@ pub fn evict(mount_idx: usize, inode: u64, page_offset: u64) -> Option<u64> {
                 crate::mm::w215_diag::OP_EVICT,
                 ((page_offset >> 12) & 0xFFFF_FFFF) as u32,
             );
+            crate::mm::w215_crc::record_evict(entry.phys);
         }
         Some(entry.phys)
     } else {
@@ -431,11 +439,14 @@ pub fn evict_if_phys(
         // Release the cache's reference to the evicted frame.
         let _ = crate::mm::refcount::page_ref_dec(expected_phys);
         #[cfg(feature = "firefox-test")]
-        crate::mm::w215_diag::prov_record(
-            expected_phys,
-            crate::mm::w215_diag::KIND_EVICT,
-            crate::mm::w215_diag::pack_cache_key(inode, page_offset),
-        );
+        {
+            crate::mm::w215_diag::prov_record(
+                expected_phys,
+                crate::mm::w215_diag::KIND_EVICT,
+                crate::mm::w215_diag::pack_cache_key(inode, page_offset),
+            );
+            crate::mm::w215_crc::record_evict(expected_phys);
+        }
         true
     } else {
         false
