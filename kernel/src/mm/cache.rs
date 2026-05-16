@@ -80,6 +80,15 @@ pub fn lookup_and_acquire(mount_idx: usize, inode: u64, page_offset: u64) -> Opt
     // `page_ref_dec` on eviction) from driving the count to zero between our
     // lookup and the caller's eventual PTE install.
     crate::mm::refcount::page_ref_inc(phys);
+    // W215 diagnostic Arm-2: a lookup_acquire reaching a phys that has an
+    // in-flight pre-insert witness implies a sibling-CPU reader has obtained
+    // a handle to bytes that the original installer has not yet copied in.
+    #[cfg(feature = "firefox-test")]
+    crate::mm::w215_diag::preins_check_op(
+        phys,
+        crate::mm::w215_diag::OP_LOOKUP_ACQUIRE,
+        ((page_offset >> 12) & 0xFFFF_FFFF) as u32,
+    );
     Some(phys)
 }
 
@@ -120,10 +129,28 @@ pub fn insert(mount_idx: usize, inode: u64, page_offset: u64, phys: u64) {
             // (no live PTEs, no other cache users) and must be freed.
             let new_rc = crate::mm::refcount::page_ref_dec(old_entry.phys);
             evicted_zero_rc = if new_rc == 0 { Some(old_entry.phys) } else { None };
+            #[cfg(feature = "firefox-test")]
+            crate::mm::w215_diag::prov_record(
+                old_entry.phys,
+                crate::mm::w215_diag::KIND_EVICT,
+                crate::mm::w215_diag::pack_cache_key(inode, page_offset),
+            );
         } else {
             evicted_zero_rc = None;
         }
     } // release cache lock
+
+    // W215 diagnostic Arm-1: record the INSERT event for `phys`.  Arm-2:
+    // clear the pre-insert witness, if any — the happy path.
+    #[cfg(feature = "firefox-test")]
+    {
+        crate::mm::w215_diag::prov_record(
+            phys,
+            crate::mm::w215_diag::KIND_INSERT,
+            crate::mm::w215_diag::pack_cache_key(inode, page_offset),
+        );
+        let _ = crate::mm::w215_diag::preins_clear_on_insert(phys);
+    }
 
     if let Some(old_phys) = evicted_zero_rc {
         // Defer PMM release through the quarantine to ensure any stale
@@ -150,6 +177,20 @@ pub fn evict(mount_idx: usize, inode: u64, page_offset: u64) -> Option<u64> {
         // shootdown) is the caller's responsibility.  Here we only release
         // the cache's reference.
         let _ = crate::mm::refcount::page_ref_dec(entry.phys);
+        // W215 diagnostic Arm-1 / Arm-2.
+        #[cfg(feature = "firefox-test")]
+        {
+            crate::mm::w215_diag::prov_record(
+                entry.phys,
+                crate::mm::w215_diag::KIND_EVICT,
+                crate::mm::w215_diag::pack_cache_key(inode, page_offset),
+            );
+            crate::mm::w215_diag::preins_check_op(
+                entry.phys,
+                crate::mm::w215_diag::OP_EVICT,
+                ((page_offset >> 12) & 0xFFFF_FFFF) as u32,
+            );
+        }
         Some(entry.phys)
     } else {
         None
@@ -298,6 +339,22 @@ pub fn prepopulate_file(path: &str) -> usize {
                     this_chunk - page_off_in_chunk,
                 );
                 let dst = (phys_off + phys) as *mut u8;
+                // W215 diagnostic Arm-1+2: record the PHYS_OFF pre-insert
+                // write intent.  preins_register opens the race window;
+                // the matching cache::insert below will close it.
+                #[cfg(feature = "firefox-test")]
+                {
+                    crate::mm::w215_diag::prov_record(
+                        phys,
+                        crate::mm::w215_diag::KIND_PHYS_OFF_WRITE_PRE_INSERT,
+                        crate::mm::w215_diag::pack_cache_key(inode, page_off),
+                    );
+                    crate::mm::w215_diag::preins_register(
+                        phys,
+                        crate::mm::w215_diag::SITE_CACHE_PREPOPULATE,
+                        mount_idx, inode, page_off,
+                    );
+                }
                 // SAFETY: PMM hands out an exclusive 4 KiB physical frame.
                 // The higher-half identity map covers it, and the page cache
                 // is the sole owner once we insert.
@@ -355,6 +412,14 @@ pub fn evict_if_phys(
     expected_phys: u64,
 ) -> bool {
     let key = (mount_idx, inode, page_offset);
+    // W215 diagnostic Arm-2: an evict_if_phys call against a phys with an
+    // in-flight pre-insert witness is a race candidate.
+    #[cfg(feature = "firefox-test")]
+    crate::mm::w215_diag::preins_check_op(
+        expected_phys,
+        crate::mm::w215_diag::OP_EVICT_IF_PHYS,
+        ((page_offset >> 12) & 0xFFFF_FFFF) as u32,
+    );
     let mut cache = PAGE_CACHE.lock();
     // Peek before removing so we don't evict a different winner's entry.
     let matches = cache
@@ -365,6 +430,12 @@ pub fn evict_if_phys(
         cache.remove(&key);
         // Release the cache's reference to the evicted frame.
         let _ = crate::mm::refcount::page_ref_dec(expected_phys);
+        #[cfg(feature = "firefox-test")]
+        crate::mm::w215_diag::prov_record(
+            expected_phys,
+            crate::mm::w215_diag::KIND_EVICT,
+            crate::mm::w215_diag::pack_cache_key(inode, page_offset),
+        );
         true
     } else {
         false
@@ -391,6 +462,12 @@ pub fn stats() -> (usize, usize) {
 /// key and frames are 4 KiB-aligned, so a u64 equality test is sufficient.
 #[cfg(feature = "firefox-test")]
 pub fn is_phys_in_cache(phys: u64) -> Option<(usize, u64, u64)> {
+    // W215 diagnostic Arm-2: probe BEFORE taking the cache lock so the
+    // witness check is not serialised against insert.  A racing pre-insert
+    // window straddles the cache-lock boundary at the insert site.
+    crate::mm::w215_diag::preins_check_op(
+        phys, crate::mm::w215_diag::OP_IS_PHYS_IN_CACHE, 0,
+    );
     let cache = PAGE_CACHE.lock();
     for ((mount_idx, inode, page_offset), entry) in cache.iter() {
         if entry.phys == phys {

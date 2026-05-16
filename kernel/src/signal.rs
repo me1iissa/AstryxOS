@@ -1447,6 +1447,14 @@ pub(crate) fn emit_fault_phys_diagnostic(
                             rip_phys,
                             actual_key.0, actual_key.1, actual_key.2,
                         );
+                        // W215 diagnostic Arm-1: dump the per-phys provenance
+                        // ring so the corrupting writer's history is visible
+                        // at the moment of fault.  Per Intel SDM Vol. 3A
+                        // §4.10.5, the page must have been alive in the
+                        // cache continuously from insert to fault — the ring
+                        // reveals which other operations touched it in that
+                        // window.
+                        crate::mm::w215_diag::dump_prov_for_phys(rip_phys);
                     }
                     Some(actual_key) => {
                         FAULT_CACHE_KEY_BUCKET_B.fetch_add(1, Ordering::Relaxed);

@@ -282,6 +282,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "cache-aliasing"   => op_cache_aliasing(out),
         "fault-cache-keys" => op_fault_cache_keys(out),
         "tlb-stats"        => op_tlb_stats(out),
+        "w215-diag"        => op_w215_diag(out),
         "coverage-flush" => op_coverage_flush(out),
         _ => {
             out.push_str(r#"{"error":"unknown op: "#);
@@ -877,6 +878,46 @@ fn op_fault_cache_keys(out: &mut String) {
 //
 // Output: single flat JSON object; all fields present in every build (H2 fields
 // read as 0 when the feature is absent so the harness needs no per-build logic).
+
+// ── w215-diag ────────────────────────────────────────────────────────────────
+//
+// W215 two-arm diagnostic readout.  Returns:
+//   { window_race, install_race, prov_ring_overflow,
+//     top_traced: [[phys, count], ...] }
+//
+// window_race > 0   → PREINS Arm-2 axis A confirmed at the cache-op layer.
+// install_race > 0  → PREINS Arm-2 axis A confirmed at the PFH install layer.
+// prov_ring_overflow > 0 (small) → some buckets are hotter than 16 entries;
+//                                  acceptable.  Large → bucket sizing wrong.
+//
+// Requires: --features firefox-test.
+
+fn op_w215_diag(out: &mut String) {
+    #[cfg(feature = "firefox-test")]
+    {
+        use core::fmt::Write;
+        let window_race = crate::mm::w215_diag::window_race_count();
+        let install_race = crate::mm::w215_diag::install_race_count();
+        let overflow = crate::mm::w215_diag::prov_ring_overflow_count();
+        let mut top: [(u64, u32); 5] = [(0, 0); 5];
+        let n = crate::mm::w215_diag::top_traced_physes(&mut top);
+        out.push('{');
+        let _ = write!(out,
+            r#""window_race":{window_race},"install_race":{install_race},"prov_ring_overflow":{overflow}"#,
+        );
+        let _ = write!(out, r#","top_traced":["#);
+        for i in 0..n {
+            if i != 0 { out.push(','); }
+            let _ = write!(out, r#"[{},{}]"#, top[i].0, top[i].1);
+        }
+        out.push(']');
+        out.push('}');
+    }
+    #[cfg(not(feature = "firefox-test"))]
+    {
+        out.push_str(r#"{"error":"w215-diag requires firefox-test feature"}"#);
+    }
+}
 
 fn op_tlb_stats(out: &mut String) {
     use core::fmt::Write;
