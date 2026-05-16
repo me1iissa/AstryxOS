@@ -44,9 +44,28 @@ pub fn init() {
 }
 
 /// Get the refcount array, panicking if not yet initialised.
+///
+/// Internal helper for callers that must only run post-`init()`.
 #[inline]
 fn refcounts() -> &'static [AtomicU16] {
     REFCOUNTS.get().expect("refcount::init() not called")
+}
+
+/// Get the refcount array if already initialised, or `None` during early boot.
+///
+/// Used by read-only / diagnostic paths (e.g. `page_ref_count`) that can be
+/// reached before `refcount::init()` via the early-boot allocator chain:
+/// `vmm::init() → separate_higher_half_pds() → pmm::alloc_page() →
+/// alloc_page_locked() → [firefox-test diagnostic] → page_ref_count()`.
+/// At that point the heap is not yet set up, so REFCOUNTS is `None`.
+/// Returning `None` here lets the caller return a safe sentinel (0) instead
+/// of panicking with "refcount::init() not called".
+#[inline]
+fn refcounts_opt() -> Option<&'static [AtomicU16]> {
+    // REFCOUNTS stores a &'static [AtomicU16]; Once::get() returns
+    // Option<&&'static [AtomicU16]>, so one deref is needed to get the
+    // inner &'static slice back.
+    REFCOUNTS.get().copied()
 }
 
 /// Page frame number from a physical address.
@@ -91,9 +110,16 @@ pub fn page_ref_dec(phys_addr: u64) -> u16 {
 }
 
 /// Get the current reference count for a physical page.
+///
+/// Returns 0 if the refcount table has not yet been initialised (early-boot
+/// allocator calls arrive before `refcount::init()` — returning 0 is correct
+/// because no PTE references have been recorded yet).
 pub fn page_ref_count(phys_addr: u64) -> u16 {
+    let rc = match refcounts_opt() {
+        Some(r) => r,
+        None => return 0, // pre-init: no refs tracked yet
+    };
     let idx = pfn(phys_addr);
-    let rc = refcounts();
     if idx < rc.len() {
         rc[idx].load(Ordering::Relaxed)
     } else {
@@ -110,8 +136,11 @@ pub fn page_ref_count(phys_addr: u64) -> u16 {
 /// the frame is not freed, but its refcount is silently lowered, possibly
 /// below the number of live PTEs that still reference it.
 pub fn page_ref_set(phys_addr: u64, count: u16) {
+    let rc = match refcounts_opt() {
+        Some(r) => r,
+        None => return, // pre-init: table does not exist yet, silently no-op
+    };
     let idx = pfn(phys_addr);
-    let rc = refcounts();
     if idx < rc.len() {
         // H1 diagnostic: observe decreasing set-over-nonzero transitions.
         #[cfg(feature = "firefox-test")]
