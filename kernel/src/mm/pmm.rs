@@ -7,6 +7,75 @@ use astryx_shared::{BootInfo, MemoryType};
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
+// ── H2 diagnostic: recent-free ring ─────────────────────────────────────────
+//
+// Tracks the last RECENT_FREE_CAP frames returned to the PMM, together with
+// the tick at which they were freed.  When `alloc_page_locked` hands out a
+// frame, it checks whether that same frame appears in the ring within the last
+// RECENT_FREE_WINDOW_TICKS ticks.  A hit means a frame was recycled too soon
+// — the time-axis manifestation of H2 (TLB shootdown declared clean before
+// invalidation committed, frame returned to PMM, re-allocated, alias stale
+// TLB still points at it for the original virtual address).
+//
+// The ring is protected by PMM_LOCK (already held at every alloc_page_locked
+// and free_page call), so no additional synchronisation is needed.
+//
+// RECENT_FREE_WINDOW_TICKS: 10 ms at TICK_HZ = 100 → 1 tick.  Using 2 ticks
+// for safety margin; matches the W203 1 ms historical threshold scaled to the
+// quarantine grace-period (≥1 full tick guaranteed by `on_cpu_tick`).
+
+#[cfg(feature = "firefox-test")]
+const RECENT_FREE_CAP: usize = 64;
+
+#[cfg(feature = "firefox-test")]
+const RECENT_FREE_WINDOW_TICKS: u64 = 2;
+
+#[cfg(feature = "firefox-test")]
+#[derive(Copy, Clone)]
+struct RecentFreeEntry { phys: u64, freed_tick: u64 }
+
+#[cfg(feature = "firefox-test")]
+struct RecentFreeRing {
+    entries: [RecentFreeEntry; RECENT_FREE_CAP],
+    next: usize,
+}
+
+#[cfg(feature = "firefox-test")]
+impl RecentFreeRing {
+    const fn new() -> Self {
+        Self {
+            entries: [RecentFreeEntry { phys: 0, freed_tick: 0 }; RECENT_FREE_CAP],
+            next: 0,
+        }
+    }
+    fn push(&mut self, phys: u64, tick: u64) {
+        self.entries[self.next] = RecentFreeEntry { phys, freed_tick: tick };
+        self.next = (self.next + 1) % RECENT_FREE_CAP;
+    }
+    /// Return the entry for `phys` if it was freed within `window` ticks of
+    /// `now`, or `None`.
+    fn find(&self, phys: u64, now: u64, window: u64) -> Option<u64> {
+        for e in &self.entries {
+            if e.phys == phys && e.freed_tick != 0
+                && now.saturating_sub(e.freed_tick) <= window
+            {
+                return Some(e.freed_tick);
+            }
+        }
+        None
+    }
+}
+
+#[cfg(feature = "firefox-test")]
+static RECENT_FREE_RING: Mutex<RecentFreeRing> = Mutex::new(RecentFreeRing::new());
+
+/// H2 diagnostic counter: physical frames re-allocated within
+/// `RECENT_FREE_WINDOW_TICKS` ticks of their most recent free.  A non-zero
+/// value indicates that the PMM is recycling frames faster than the
+/// quarantine grace-period guarantees — the time-axis condition for H2.
+#[cfg(feature = "firefox-test")]
+pub(crate) static PMM_ALLOC_RECENT_FREE: AtomicU64 = AtomicU64::new(0);
+
 /// Page size: 4 KiB.
 pub const PAGE_SIZE: usize = 4096;
 
@@ -143,6 +212,37 @@ unsafe fn alloc_page_locked() -> Option<u64> {
                                 }
                             }
                         }
+                        // H2 diagnostic: check if this frame was freed very
+                        // recently (within RECENT_FREE_WINDOW_TICKS).  Uses
+                        // `try_lock` to avoid holding two spinlocks; a missed
+                        // check under contention is acceptable for a diagnostic.
+                        #[cfg(feature = "firefox-test")]
+                        if let Some(mut ring) = RECENT_FREE_RING.try_lock() {
+                            let now = crate::arch::x86_64::irq::TICK_COUNT
+                                .load(Ordering::Relaxed);
+                            if let Some(freed_tick) =
+                                ring.find(phys, now, RECENT_FREE_WINDOW_TICKS)
+                            {
+                                let total = PMM_ALLOC_RECENT_FREE
+                                    .fetch_add(1, Ordering::Relaxed) + 1;
+                                let delta_ticks = now.saturating_sub(freed_tick);
+                                // 1 tick ≈ 10 ms at TICK_HZ=100; express
+                                // delta in µs for readability (approximate).
+                                let delta_us = delta_ticks.saturating_mul(10_000);
+                                crate::serial_println!(
+                                    "[PMM/ALLOC-RECENT-FREE] phys={:#x} \
+                                     freed_at_tick={} now_tick={} \
+                                     delta_us\u{2248}={} count_total={}",
+                                    phys, freed_tick, now, delta_us, total
+                                );
+                                // Clear the matched entry so it doesn't
+                                // double-count on the next allocation of the
+                                // same frame.
+                                for e in ring.entries.iter_mut() {
+                                    if e.phys == phys { e.phys = 0; break; }
+                                }
+                            }
+                        }
                         return Some(phys);
                     }
                 }
@@ -207,6 +307,15 @@ pub fn free_page(phys_addr: u64) {
         mark_page_free(page);
     }
     USED_PAGES.fetch_sub(1, Ordering::Relaxed);
+
+    // H2 diagnostic: record this free in the recent-free ring so that
+    // a rapid re-allocation of the same frame triggers PMM_ALLOC_RECENT_FREE.
+    #[cfg(feature = "firefox-test")]
+    if let Some(mut ring) = RECENT_FREE_RING.try_lock() {
+        let tick = crate::arch::x86_64::irq::TICK_COUNT
+            .load(Ordering::Relaxed);
+        ring.push(phys_addr, tick);
+    }
 }
 
 /// Allocate `count` contiguous physical pages.
@@ -271,6 +380,20 @@ pub fn stats() -> (u64, u64) {
         TOTAL_PAGES.load(Ordering::Relaxed),
         USED_PAGES.load(Ordering::Relaxed),
     )
+}
+
+/// H2 diagnostic: return the cumulative count of physical frames that were
+/// re-allocated within `RECENT_FREE_WINDOW_TICKS` ticks of their most recent
+/// free.  Returns 0 in non-firefox-test builds.
+pub fn pmm_alloc_recent_free_count() -> u64 {
+    #[cfg(feature = "firefox-test")]
+    {
+        PMM_ALLOC_RECENT_FREE.load(Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "firefox-test"))]
+    {
+        0
+    }
 }
 
 /// Returns the number of free (unallocated) physical pages.
