@@ -1193,6 +1193,88 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     return false;
                 }
 
+                // W216 H_5j-C: escalate mm_sem to write before installing the
+                // cache-hit PTE.
+                //
+                // The PR #230 revalidate above (`still_valid`) closes the case
+                // where PROCESS_TABLE reveals the VMA was already replaced before
+                // we entered this branch.  However, PROCESS_TABLE is dropped
+                // after the check, and the write lock is not yet held.  A
+                // concurrent MAP_FIXED on a sibling CPU can interleave as:
+                //
+                //   T0  CPU-A: still_valid → true  (VMA intact at check time)
+                //   T1  CPU-A: PROCESS_TABLE dropped, no write lock held
+                //   T2  CPU-B: MAP_FIXED Phase 2a — old VMA removed from VmSpace
+                //   T3  CPU-B: MAP_FIXED Phase 2b — old pages unmapped, freed
+                //   T4  CPU-B: MAP_FIXED Phase 3  — new VMA inserted (diff backing)
+                //   T5  CPU-A: map_page_in() installs cached_phys at page_addr
+                //              ↑ PTE now points at the cache frame for the OLD
+                //              (inode, file_page_offset) but the VMA at page_addr
+                //              describes a DIFFERENT backing object — aliasing.
+                //   T6  Userspace reads from page_addr → receives stale bytes
+                //              from cached_phys → SIGSEGV / #UD
+                //
+                // The fix mirrors PR #234 H_5j-A (readahead arm) and H_5j-B
+                // (single-page arm): acquire mm_sem.write() so that no MAP_FIXED
+                // unmap/remap can execute against this address space between
+                // T1 and T5.  Re-validate the VMA under the write lock; if it
+                // changed between T0 and now, free private_phys (if allocated)
+                // and release the guard ref, then return false so the faulting
+                // instruction retries against the new VMA.
+                //
+                // `map_page_in_locked` replaces `map_page_in` below because we
+                // already hold mm_sem.write() and spin::RwLock is non-reentrant
+                // — a second acquire in the same mode on the same CPU self-deadlocks.
+                //
+                // Lock ordering: PROCESS_TABLE (dropped) → MOUNTS (not held) →
+                // mm_sem.write → VMM_LOCK / PMM_LOCK / PAGE_CACHE (leaves).
+                // Per Intel SDM Vol. 3A §4.10.5 and §8.2.2, the write-lock
+                // provides the store-ordering guarantee for PTE installation.
+                let _ch_sem = crate::mm::vma::mm_sem_for_cr3(cr3);
+                let _ch_guard = _ch_sem.as_ref().map(|s| s.write());
+
+                // Re-validate under the write lock.  Between the outer
+                // `still_valid` check and this point, a concurrent MAP_FIXED
+                // Phase 2a may have replaced the VMA.
+                let still_valid_locked = {
+                    let procs = crate::proc::PROCESS_TABLE.lock();
+                    procs.iter()
+                        .find(|p| p.pid == target_pid)
+                        .and_then(|p| p.vm_space.as_ref())
+                        .and_then(|vs| vs.find_vma(faulting_addr))
+                        .map(|v| {
+                            matches!(&v.backing,
+                                crate::mm::vma::VmBacking::File {
+                                    mount_idx: m, inode: ino, offset: o, ..
+                                } if *m == mount_idx && *ino == inode && *o == file_base_offset)
+                            && v.base == vma_base
+                            && v.base + v.length == vma_end
+                        })
+                        .unwrap_or(false)
+                };
+                if !still_valid_locked {
+                    let _ = crate::mm::refcount::page_ref_dec(cached_phys);
+                    #[cfg(feature = "firefox-test")]
+                    crate::serial_println!(
+                        "[PF/revalidate] CACHE-HIT VMA stale under lock addr={:#x} \
+                         mount={} inode={} foff={:#x} — abandoning",
+                        faulting_addr, mount_idx, inode, file_page_offset);
+                    return false;
+                }
+
+                #[cfg(feature = "firefox-test")]
+                {
+                    static PF_INSTALL_LOCK_N_CH: core::sync::atomic::AtomicU64 =
+                        core::sync::atomic::AtomicU64::new(0);
+                    let nl = PF_INSTALL_LOCK_N_CH
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    if nl < 5 || nl % 500 == 0 {
+                        crate::serial_println!(
+                            "[PF/install-lock] cache-hit #{} addr={:#x} cached_phys={:#x}",
+                            nl, page_addr, cached_phys);
+                    }
+                }
+
                 // MAP_PRIVATE + writable: give the process a private copy so
                 // writes (e.g., GOT/PLT relocations) don't corrupt the shared
                 // cache page. Without this, a second process loading the same
@@ -1224,7 +1306,9 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                             );
                         }
                         crate::mm::refcount::page_ref_set(private_phys, 1);
-                        crate::mm::vmm::map_page_in(cr3, page_addr, private_phys, page_flags);
+                        // mm_sem.write is held via _ch_guard — use the locked
+                        // variant to avoid a non-reentrant re-acquire.
+                        crate::mm::vmm::map_page_in_locked(cr3, page_addr, private_phys, page_flags);
                         crate::mm::vmm::invlpg(page_addr);
                         // Release the guard ref acquired by `lookup_and_acquire`.
                         // The PTE now refers to `private_phys`, not `cached_phys`;
@@ -1264,7 +1348,9 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     // reference — do NOT call `page_ref_inc` again here.
                     // Steady state after install: cache holds one ref,
                     // this PTE holds one ref (the promoted guard ref) = rc ≥ 2.
-                    crate::mm::vmm::map_page_in(cr3, page_addr, cached_phys, page_flags);
+                    //
+                    // mm_sem.write is held via _ch_guard — use the locked variant.
+                    crate::mm::vmm::map_page_in_locked(cr3, page_addr, cached_phys, page_flags);
                     crate::mm::vmm::invlpg(page_addr);
                     // Guard ref is intentionally NOT released — it has been
                     // promoted to the PTE reference.
