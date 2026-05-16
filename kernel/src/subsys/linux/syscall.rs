@@ -3243,6 +3243,19 @@ fn sys_select_linux(
     ready
 }
 
+/// W215 telemetry: number of MADV_DONTNEED/MADV_FREE per-page zero-fills
+/// suppressed by the file-backed guard.  Read from kdb / serial logging.
+#[cfg(feature = "firefox-test")]
+static MADV_ZERO_SUPPRESSED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Number of zero-fills the W215 file-backed guard has suppressed.  Always 0
+/// on non-firefox-test builds.
+#[cfg(feature = "firefox-test")]
+pub fn madv_zero_suppressed_count() -> u64 {
+    MADV_ZERO_SUPPRESSED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// madvise(addr, len, advice) — memory usage hint.
 ///
 /// MADV_DONTNEED (4) and MADV_FREE (8): free physical pages in range so the
@@ -3257,13 +3270,35 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
     let start = addr & !0xFFF;
     let end   = (addr + len + 0xFFF) & !0xFFF;
 
-    let cr3_opt = {
+    // Capture cr3 AND a snapshot of file-backed VMA ranges that overlap
+    // [start, end).  The snapshot is used below to suppress the per-page
+    // zero-fill on file-backed pages, which (when a frame is also held by
+    // the page cache) would silently corrupt the cache content shared with
+    // other VmSpaces and future faulters — the W215 root cause.  See the
+    // detailed rationale at the zero-fill site for the bug shape.
+    //
+    // Snapshot size is tiny in practice: a single madvise range typically
+    // overlaps one VMA, occasionally two when straddling an arena boundary.
+    let (cr3_opt, file_ranges) = {
         let procs = crate::proc::PROCESS_TABLE.lock();
-        procs.iter().find(|p| p.pid == pid)
-            .and_then(|p| p.vm_space.as_ref())
-            .map(|vs| vs.cr3)
+        let p = procs.iter().find(|p| p.pid == pid);
+        let cr3 = p.and_then(|p| p.vm_space.as_ref()).map(|vs| vs.cr3);
+        let mut ranges: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+        if let Some(vs) = p.and_then(|p| p.vm_space.as_ref()) {
+            for vma in vs.areas.iter() {
+                if !vma.overlaps(start, end - start) { continue; }
+                if matches!(vma.backing, crate::mm::vma::VmBacking::File { .. }) {
+                    ranges.push((vma.base, vma.end()));
+                }
+            }
+        }
+        (cr3, ranges)
     };
     let cr3 = match cr3_opt { Some(c) => c, None => return 0 };
+    // Closure: O(file_ranges.len()) per page, where len is typically 0-2.
+    let is_file_backed = |page: u64| -> bool {
+        file_ranges.iter().any(|&(b, e)| page >= b && page < e)
+    };
 
     // W216 H_5j-B: MADV_DONTNEED clears PTEs and frees frames; the area list
     // itself is not mutated, but the PFH install loop must abort if it has
@@ -3321,14 +3356,42 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
             let pte = crate::mm::vmm::read_pte(cr3, page);
             if pte & 1 != 0 {
                 let phys = pte & 0x000F_FFFF_FFFF_F000;
-                // Zero the backing storage now (while we still own the frame)
-                // so the next demand-fault sees a fresh zeroed page.
-                unsafe {
-                    core::ptr::write_bytes(
-                        (PHYS_OFF + phys) as *mut u8,
-                        0,
-                        crate::mm::pmm::PAGE_SIZE,
-                    );
+                // Zero the backing storage on anonymous pages only.  Per POSIX
+                // madvise(2), MADV_DONTNEED on an anonymous region must cause
+                // subsequent reads to return zeros, which the kernel achieves
+                // here by zeroing the frame in place before the deferred-free.
+                //
+                // For file-backed VMAs the frame is typically co-owned by the
+                // page cache (the cache holds rc=1, this PTE holds rc=1, so a
+                // page_ref_dec returns new_rc=1 and the frame stays alive).
+                // An unconditional zero-fill in that case clobbers the cache
+                // content shared with every other VmSpace that holds — or will
+                // hold — a PTE to the same `(mount_idx, inode, page_offset)`.
+                // The next cache-hit faulter then maps in a frame whose
+                // contents are zero, and pid 1's instruction fetch from the
+                // shared libxul .text page reads zero bytes → SIGSEGV/#UD
+                // with RIP bytes all-zero (the W215 fingerprint).  POSIX is
+                // satisfied for file-backed ranges by clearing the PTE alone:
+                // the next access re-faults via `cache::lookup_and_acquire`
+                // and sees the authoritative file content.
+                if !is_file_backed(page) {
+                    unsafe {
+                        core::ptr::write_bytes(
+                            (PHYS_OFF + phys) as *mut u8,
+                            0,
+                            crate::mm::pmm::PAGE_SIZE,
+                        );
+                    }
+                } else {
+                    // Telemetry: count zero-fills suppressed by the file-backed
+                    // guard.  A non-zero count after a clean Firefox boot
+                    // confirms the W215 corruption path is being avoided in
+                    // practice; a zero count under the same workload would
+                    // mean the guard is dead code (e.g. file-backed regions
+                    // never receiving MADV_DONTNEED) and the actual writer is
+                    // elsewhere.
+                    #[cfg(feature = "firefox-test")]
+                    MADV_ZERO_SUPPRESSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
                 // Clear the PTE.  Do NOT free the frame yet.
                 crate::mm::vmm::write_pte(cr3, page, 0);
