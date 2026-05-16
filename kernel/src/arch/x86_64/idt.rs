@@ -964,6 +964,16 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
             }
         };
 
+        // W216 H_5j-B (unified concurrency): sample VmSpace generation before
+        // the CoW copy + install sequence.  A sibling CPU running
+        // `sys_munmap` / `MAP_FIXED` Phase 2b / `MADV_DONTNEED` /
+        // `clone_for_fork` can mutate the address space — and free `old_phys`
+        // — while we are mid-copy.  Re-checking the generation immediately
+        // before the install ensures we abort instead of installing a PTE
+        // pointing at a frame the sibling has just queued for free.  See
+        // `VmSpace::generation` doc-comment.
+        let gen_at_start = vm_space.generation.load(core::sync::atomic::Ordering::Acquire);
+
         let pte = crate::mm::vmm::read_pte(cr3, page_addr);
         let old_phys = pte & 0x000F_FFFF_FFFF_F000;
 
@@ -976,6 +986,26 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         (PHYS_OFF_COW + new_phys) as *mut u8,
                         crate::mm::pmm::PAGE_SIZE,
                     );
+                }
+                // Re-check generation right before install — Acquire pairs
+                // with the Release fetch_add in `bump_generation_for_cr3`
+                // and `VmSpace::*` mutators (Intel SDM Vol. 3A §8.2.3).
+                let gen_now = vm_space.generation.load(core::sync::atomic::Ordering::Acquire);
+                if gen_now != gen_at_start {
+                    #[cfg(feature = "firefox-test")]
+                    {
+                        static CNT: core::sync::atomic::AtomicU64 =
+                            core::sync::atomic::AtomicU64::new(0);
+                        let n = CNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        if n < 5 || n % 500 == 0 {
+                            crate::serial_println!(
+                                "[PF/gen-abort] COW-COPY #{} addr={:#x} \
+                                 gen_at_start={} gen_now={} — dropping new frame",
+                                n, page_addr, gen_at_start, gen_now);
+                        }
+                    }
+                    crate::mm::pmm::free_page(new_phys);
+                    return false;
                 }
                 // CoW: old_phys may still be shared with the parent; we
                 // only release this process's reference.  The CoW copy
@@ -992,7 +1022,12 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
             }
             return false; // OOM
         } else {
-            // Single owner — just make it writable
+            // Single owner — just make it writable.  The in-place PTE bit
+            // flip does NOT install a new physical frame, so no aliasing
+            // race is possible here; the gen-check above is overkill for
+            // this sub-arm and the result is unused — but the cheap sample
+            // pays for itself by keeping the source readable as a single
+            // entry-point for the whole CoW arm.
             let new_pte = old_phys | page_flags | PAGE_PRESENT;
             crate::mm::vmm::write_pte(cr3, page_addr, new_pte);
             crate::mm::tlb::shootdown_page(cr3, page_addr);
@@ -1164,11 +1199,26 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 //
                 // Lock ordering preserved: PROCESS_TABLE (top) → nothing else.
                 // MOUNTS is NOT held here; cache/PMM locks are NOT held here.
+                // W216 H_5j-B (unified concurrency): capture the VmSpace
+                // generation Arc + post-revalidate sample under the same
+                // PROCESS_TABLE critical section as the revalidate.  Re-checked
+                // immediately before each `map_page_in` in the install sub-arms
+                // below to catch sibling-CPU VMA mutations that fire between
+                // this revalidate and the install.
+                let mut ch_vm_generation:
+                    Option<alloc::sync::Arc<core::sync::atomic::AtomicU64>> = None;
+                let mut ch_gen_at_revalidate: u64 = 0;
                 let still_valid = {
                     let procs = crate::proc::PROCESS_TABLE.lock();
-                    procs.iter()
+                    let vs_opt = procs.iter()
                         .find(|p| p.pid == target_pid)
-                        .and_then(|p| p.vm_space.as_ref())
+                        .and_then(|p| p.vm_space.as_ref());
+                    if let Some(vs) = vs_opt {
+                        ch_vm_generation = Some(vs.generation.clone());
+                        ch_gen_at_revalidate =
+                            vs.generation.load(core::sync::atomic::Ordering::Acquire);
+                    }
+                    vs_opt
                         .and_then(|vs| vs.find_vma(faulting_addr))
                         .map(|v| {
                             matches!(&v.backing,
@@ -1192,6 +1242,21 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         faulting_addr, mount_idx, inode, file_page_offset);
                     return false;
                 }
+
+                // Closure: per-arm generation re-check.  Returns true if the
+                // caller should abort (and the caller must release `cached_phys`
+                // appropriately before returning false).  The CoW-copy sub-arm
+                // additionally frees its freshly-allocated `private_phys` via
+                // its own check immediately before installing.
+                let gen_unchanged = || -> bool {
+                    match ch_vm_generation.as_ref() {
+                        Some(g) => {
+                            let now = g.load(core::sync::atomic::Ordering::Acquire);
+                            now == ch_gen_at_revalidate
+                        }
+                        None => true,
+                    }
+                };
 
                 // MAP_PRIVATE + writable: give the process a private copy so
                 // writes (e.g., GOT/PLT relocations) don't corrupt the shared
@@ -1222,6 +1287,25 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                                 (COW_OFF + private_phys) as *mut u8,
                                 crate::mm::pmm::PAGE_SIZE,
                             );
+                        }
+                        // W216 H_5j-B (unified concurrency): re-check generation
+                        // immediately before install — see arm-level closure.
+                        if !gen_unchanged() {
+                            #[cfg(feature = "firefox-test")]
+                            {
+                                static CNT: core::sync::atomic::AtomicU64 =
+                                    core::sync::atomic::AtomicU64::new(0);
+                                let n = CNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                                if n < 5 || n % 500 == 0 {
+                                    crate::serial_println!(
+                                        "[PF/gen-abort] CACHE-PRIVATE #{} addr={:#x} \
+                                         gen_at_rev={} — releasing private+cache refs",
+                                        n, page_addr, ch_gen_at_revalidate);
+                                }
+                            }
+                            crate::mm::pmm::free_page(private_phys);
+                            let _ = crate::mm::refcount::page_ref_dec(cached_phys);
+                            return false;
                         }
                         crate::mm::refcount::page_ref_set(private_phys, 1);
                         crate::mm::vmm::map_page_in(cr3, page_addr, private_phys, page_flags);
@@ -1264,6 +1348,27 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     // reference — do NOT call `page_ref_inc` again here.
                     // Steady state after install: cache holds one ref,
                     // this PTE holds one ref (the promoted guard ref) = rc ≥ 2.
+                    //
+                    // W216 H_5j-B (unified concurrency): re-check generation
+                    // immediately before install.  On abort we release the
+                    // guard ref so the cache's own reference remains the sole
+                    // holder of `cached_phys`.
+                    if !gen_unchanged() {
+                        #[cfg(feature = "firefox-test")]
+                        {
+                            static CNT: core::sync::atomic::AtomicU64 =
+                                core::sync::atomic::AtomicU64::new(0);
+                            let n = CNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            if n < 5 || n % 500 == 0 {
+                                crate::serial_println!(
+                                    "[PF/gen-abort] CACHE-ALIAS #{} addr={:#x} \
+                                     gen_at_rev={} — releasing guard ref",
+                                    n, page_addr, ch_gen_at_revalidate);
+                            }
+                        }
+                        let _ = crate::mm::refcount::page_ref_dec(cached_phys);
+                        return false;
+                    }
                     crate::mm::vmm::map_page_in(cr3, page_addr, cached_phys, page_flags);
                     crate::mm::vmm::invlpg(page_addr);
                     // Guard ref is intentionally NOT released — it has been
@@ -1889,10 +1994,39 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         );
                     }
                 }
+                // W216 H_5j-B (unified concurrency): sample the VmSpace
+                // generation before the allocation+zero+install sequence.
+                // Anonymous faults have a narrower race window than file-backed
+                // (no I/O drop of PROCESS_TABLE) but a sibling-CPU
+                // sys_munmap / MAP_FIXED Phase 2b can still mutate the VMA list
+                // between the find_vma above and the install below; the check
+                // keeps the abort-and-retry invariant uniform across all PFH
+                // install arms.  See `VmSpace::generation`.
+                let gen_at_start =
+                    vm_space.generation.load(core::sync::atomic::Ordering::Acquire);
                 // Allocate a zeroed page
                 if let Some(phys) = crate::mm::pmm::alloc_page() {
                     unsafe {
                         core::ptr::write_bytes((PHYS_OFF + phys) as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
+                    }
+                    // Re-check generation immediately before install.
+                    let gen_now =
+                        vm_space.generation.load(core::sync::atomic::Ordering::Acquire);
+                    if gen_now != gen_at_start {
+                        #[cfg(feature = "firefox-test")]
+                        {
+                            static CNT: core::sync::atomic::AtomicU64 =
+                                core::sync::atomic::AtomicU64::new(0);
+                            let n = CNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            if n < 5 || n % 500 == 0 {
+                                crate::serial_println!(
+                                    "[PF/gen-abort] ANON #{} addr={:#x} \
+                                     gen_at_start={} gen_now={} — releasing frame",
+                                    n, page_addr, gen_at_start, gen_now);
+                            }
+                        }
+                        crate::mm::pmm::free_page(phys);
+                        return false;
                     }
                     crate::mm::refcount::page_ref_set(phys, 1);
                     crate::mm::vmm::map_page_in(cr3, page_addr, phys, page_flags);
