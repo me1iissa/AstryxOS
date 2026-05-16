@@ -2526,7 +2526,8 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
         qemu-harness.py kdb <sid> syscall-trend 10 4
     """
     if op in ("ping", "proc-list", "vfs-mounts", "trace-status",
-              "bell-stats", "cache-audit", "cache-aliasing", "tlb-stats",
+              "bell-stats", "cache-audit", "cache-aliasing",
+              "fault-cache-keys", "tlb-stats",
               "coverage-flush"):
         return {"op": op}
     if op == "proc":
@@ -2874,6 +2875,96 @@ def cmd_cache_aliasing(args):
         resp["_verdict"] = "ABORT-AND-ESCALATE: both H3a counters zero — escalate to H3b"
     else:
         resp["_verdict"] = "UNKNOWN: check for error field"
+
+    _out(resp)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# fault-cache-keys — W215 action-(C) diagnostic: 3-bucket cache-key classifier
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Wraps kdb op 'fault-cache-keys' (firefox-test kernel builds only).
+# The response carries three counters, one per exhaustive bucket:
+#
+#   bucket_a_same_key_inplace      — FAULT/PHYS frame still in cache under
+#                                    the correct (mount,inode,page_offset) key.
+#                                    Content corrupted in-place by a physmap or
+#                                    MAP_SHARED+RW writer.
+#
+#   bucket_b_cross_key_aliased     — FAULT/PHYS frame in cache under a DIFFERENT
+#                                    key.  Cache aliasing between two file pages.
+#
+#   bucket_c_post_evict_stale_pte  — FAULT/PHYS frame NOT in cache at all.
+#                                    PTE outlived the cache entry (stale PTE after
+#                                    eviction, no shootdown).
+#
+# Verdict annotations (per tech-lead cross-walk):
+#   A dominates → writer-into-cache-frame instrumentation (physmap or SHARED+RW audit)
+#   B dominates → cache::insert/lookup_and_acquire phys-collision audit
+#   C dominates → VMA-shootdown-on-evict audit
+#   All zero    → INCONCLUSIVE (W215 cluster has not fired yet; re-run)
+
+def cmd_fault_cache_keys(args):
+    """W215 action-(C) diagnostic: FAULT/PHYS 3-bucket cache-key classifier.
+
+    Sends kdb op 'fault-cache-keys' and returns structured JSON with three
+    counters (bucket_a/b/c) plus a _verdict field annotating the dominant bucket
+    and the recommended next dispatch.
+
+    Requires the session to have been started with --features firefox-test,kdb.
+    Counters read as zero before any W215-cluster fault fires (idle state is
+    'INCONCLUSIVE').
+    """
+    sess = _load_session(args.sid)
+    port = int(sess.get("kdb_host_port") or 0)
+    if port <= 0:
+        _out({"error": "session was not started with --features kdb"})
+        sys.exit(1)
+
+    req: dict = {"op": "fault-cache-keys"}
+    timeout = float(getattr(args, "timeout", 10.0) or 10.0)
+    try:
+        raw = _kdb_recv(port, req, timeout=timeout)
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        _out({"error": f"kdb connect/io failed on 127.0.0.1:{port}: {e}"})
+        sys.exit(1)
+    try:
+        resp = json.loads(raw.strip().decode("utf-8", errors="replace"))
+    except (json.JSONDecodeError, ValueError) as e:
+        _out({"error": f"malformed kdb response: {e}",
+              "raw": raw.decode(errors="replace")})
+        sys.exit(1)
+
+    a = resp.get("bucket_a_same_key_inplace", -1)
+    b = resp.get("bucket_b_cross_key_aliased", -1)
+    c = resp.get("bucket_c_post_evict_stale_pte", -1)
+
+    if not all(isinstance(v, int) for v in [a, b, c]):
+        resp["_verdict"] = "UNKNOWN: missing or malformed counter fields — check for error field"
+    elif a == 0 and b == 0 and c == 0:
+        resp["_verdict"] = (
+            "INCONCLUSIVE — W215 cluster has not fired yet; re-run after a fault occurs"
+        )
+    else:
+        dom = max((a, "A"), (b, "B"), (c, "C"), key=lambda t: t[0])
+        if dom[1] == "A":
+            resp["_verdict"] = (
+                f"BUCKET-A dominates (count={a}) — in-place corruption of cache frame "
+                "under the same key — next dispatch: writer-into-cache-frame "
+                "instrumentation (kernel direct-physmap audit OR same-inode "
+                "SHARED+RW user-PTE audit)"
+            )
+        elif dom[1] == "B":
+            resp["_verdict"] = (
+                f"BUCKET-B dominates (count={b}) — cross-key cache aliasing — "
+                "next dispatch: cache::insert / cache::lookup_and_acquire "
+                "phys-collision audit"
+            )
+        else:
+            resp["_verdict"] = (
+                f"BUCKET-C dominates (count={c}) — post-evict stale PTE — "
+                "next dispatch: VMA-shootdown-on-evict audit"
+            )
 
     _out(resp)
 
@@ -5938,6 +6029,17 @@ def main():
     p_cache_aliasing.add_argument("--timeout", type=float, default=10.0,
                                    help="kdb socket timeout in seconds (default 10.0)")
 
+    # fault-cache-keys — W215 action-(C) diagnostic: 3-bucket cache-key classifier
+    p_fault_cache_keys = sub.add_parser(
+        "fault-cache-keys",
+        help="[W215 action-(C) diag] Dump FAULT/PHYS 3-bucket cache-key classifier: "
+             "bucket_a (same-key in-place corruption), bucket_b (cross-key aliased), "
+             "bucket_c (post-evict stale PTE).  Reads as zero before any W215-cluster "
+             "fault fires.  Requires --features firefox-test,kdb.")
+    p_fault_cache_keys.add_argument("sid")
+    p_fault_cache_keys.add_argument("--timeout", type=float, default=10.0,
+                                    help="kdb socket timeout in seconds (default 10.0)")
+
     # coverage — LLVM source-based coverage collection + reporting.
     # Requires the session was started with --features coverage,test-mode
     # (and ideally kdb, for the on-demand flush op).  See _build()'s
@@ -6277,9 +6379,10 @@ def main():
         "kdb":         cmd_kdb,
         "tlb-stats":   cmd_tlb_stats,
         "fd-map":      cmd_fd_map,
-        "cache-audit":     cmd_cache_audit,
-        "cache-aliasing":  cmd_cache_aliasing,
-        "coverage":        cmd_coverage,
+        "cache-audit":       cmd_cache_audit,
+        "cache-aliasing":    cmd_cache_aliasing,
+        "fault-cache-keys":  cmd_fault_cache_keys,
+        "coverage":          cmd_coverage,
         # QGA bridge
         "qga-ping":      cmd_qga_ping,
         "qga-info":      cmd_qga_info,

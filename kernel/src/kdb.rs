@@ -277,10 +277,11 @@ pub fn dispatch(req: &str, out: &mut String) {
         "syms"           => op_syms(req, out),
         "mem"            => op_mem(req, out),
         "trace-status"   => op_trace_status(out),
-        "bell-stats"     => op_bell_stats(out),
-        "cache-audit"    => op_cache_audit(out),
-        "cache-aliasing" => op_cache_aliasing(out),
-        "tlb-stats"      => op_tlb_stats(out),
+        "bell-stats"       => op_bell_stats(out),
+        "cache-audit"      => op_cache_audit(out),
+        "cache-aliasing"   => op_cache_aliasing(out),
+        "fault-cache-keys" => op_fault_cache_keys(out),
+        "tlb-stats"        => op_tlb_stats(out),
         "coverage-flush" => op_coverage_flush(out),
         _ => {
             out.push_str(r#"{"error":"unknown op: "#);
@@ -812,6 +813,44 @@ fn op_cache_aliasing(out: &mut String) {
     #[cfg(not(feature = "firefox-test"))]
     {
         out.push_str(r#"{"error":"cache-aliasing requires firefox-test feature"}"#);
+    }
+}
+
+// ── fault-cache-keys ──────────────────────────────────────────────────────────
+//
+// W215 action-(C) diagnostic: dump the three FAULT/CACHE-KEY bucket counters
+// that classify each FAULT/PHYS event by the corrupted frame's cache state.
+//
+// Bucket A — same-key in-place corruption: frame still in cache under the
+//   correct (mount,inode,page_offset) key; content corrupted by a writer with
+//   direct physmap or MAP_SHARED+RW access.  Next dispatch: kernel physmap /
+//   same-inode SHARED+RW user-PTE audit.
+//
+// Bucket B — cross-key aliased: frame in cache under a *different* key; a
+//   second cache::insert raced the PFH install and evicted + reused the frame.
+//   Next dispatch: cache::insert / cache::lookup_and_acquire phys-collision audit.
+//
+// Bucket C — not in cache (post-evict stale PTE): cache evicted the frame
+//   but the PTE was not shot down; PMM may have recycled the frame.  Next
+//   dispatch: VMA-shootdown-on-evict audit.
+//
+// Requires: --features firefox-test,kdb.
+// Returns zero for all buckets before any W215-cluster fault fires (idle state).
+
+fn op_fault_cache_keys(out: &mut String) {
+    #[cfg(feature = "firefox-test")]
+    {
+        use core::fmt::Write;
+        let (a, b, c) = crate::signal::fault_cache_key_bucket_counts();
+        out.push('{');
+        let _ = write!(out,
+            r#""bucket_a_same_key_inplace":{a},"bucket_b_cross_key_aliased":{b},"bucket_c_post_evict_stale_pte":{c}"#,
+        );
+        out.push('}');
+    }
+    #[cfg(not(feature = "firefox-test"))]
+    {
+        out.push_str(r#"{"error":"fault-cache-keys requires firefox-test feature"}"#);
     }
 }
 
