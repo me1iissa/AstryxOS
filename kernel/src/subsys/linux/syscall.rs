@@ -2400,6 +2400,8 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // 98: getrusage(who, usage) — resource usage; return zeroed struct
         98 => {
             if arg2 != 0 {
+                #[cfg(feature = "firefox-test")]
+                crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Getrusage, arg2 as *const u8, 144);
                 unsafe { core::ptr::write_bytes(arg2 as *mut u8, 0, 144); }
             }
             0
@@ -2408,6 +2410,8 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         99 => {
             if arg1 != 0 {
                 // struct sysinfo: 11 fields, 64 bytes total
+                #[cfg(feature = "firefox-test")]
+                crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Sysinfo, arg1 as *const u8, 64);
                 unsafe { core::ptr::write_bytes(arg1 as *mut u8, 0, 64); }
                 // uptime (seconds) at offset 0
                 let ticks = crate::arch::x86_64::irq::get_ticks();
@@ -2693,6 +2697,8 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 Ok(st) => {
                     // struct statx is 256 bytes; zero the whole thing first
                     let base = arg5 as *mut u8;
+                    #[cfg(feature = "firefox-test")]
+                    crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Statx, base, 256);
                     unsafe { core::ptr::write_bytes(base, 0, 256); }
                     unsafe {
                         // stx_mask (offset 0): populate BASIC_STATS fields
@@ -2752,6 +2758,8 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // 100: times(buf) — CPU usage times; return zero struct
         100 => {
             if arg1 != 0 && crate::syscall::validate_user_ptr(arg1, 32) {
+                #[cfg(feature = "firefox-test")]
+                crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Times, arg1 as *const u8, 32);
                 unsafe { core::ptr::write_bytes(arg1 as *mut u8, 0, 32); }
             }
             0
@@ -2791,6 +2799,8 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // 127: rt_sigpending(set, sigsetsize) — stub: no pending signals
         127 => {
             if arg1 != 0 && crate::syscall::validate_user_ptr(arg1, arg2 as usize) {
+                #[cfg(feature = "firefox-test")]
+                crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Memset, arg1 as *const u8, arg2 as usize);
                 unsafe { core::ptr::write_bytes(arg1 as *mut u8, 0, arg2 as usize); }
             }
             0
@@ -6067,6 +6077,8 @@ fn sys_fstatfs_linux(_fd: usize, buf: *mut u8) -> i64 {
 /// Write a plausible statfs structure into `buf` (120 bytes).
 fn fill_statfs_buf(buf: *mut u8) {
     // Wipe first.
+    #[cfg(feature = "firefox-test")]
+    crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Preadv120, buf, 120);
     unsafe { core::ptr::write_bytes(buf, 0, 120); }
     // Use EXT2_SUPER_MAGIC (0xEF53) as f_type — widely recognised.
     let p = buf as *mut u64;

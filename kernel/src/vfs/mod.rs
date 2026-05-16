@@ -1717,6 +1717,8 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
             if flags & 0x0400_0000 != 0 { return Ok(0); }
             // bit 25 = /dev/zero  → fill buffer with zeros
             if flags & 0x0200_0000 != 0 {
+                #[cfg(feature = "firefox-test")]
+                crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::DevZero, buf, count);
                 unsafe { core::ptr::write_bytes(buf, 0, count); }
                 return Ok(count);
             }
