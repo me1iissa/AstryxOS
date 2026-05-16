@@ -50,6 +50,22 @@ pub const KIND_REFINC: u8                      = 4;
 pub const KIND_REFDEC: u8                      = 5;
 pub const KIND_PHYS_OFF_WRITE_PRE_INSERT: u8   = 6;
 pub const KIND_PFH_INSTALL: u8                 = 7;
+// ── Forensic-ring kinds (cluster-filtered time-ordered ring) ────────────────
+pub const KIND_FREE: u8                        = 8;
+pub const KIND_QUARANTINE_FREE: u8             = 9;
+pub const KIND_WRITE_DETECTED: u8              = 10;
+pub const KIND_DUP_PHYS_AT_INSERT: u8          = 11;
+pub const KIND_CACHE_DUP_FOUND: u8             = 12;
+pub const KIND_COW_COPY_SRC: u8                = 13;
+pub const KIND_COW_COPY_DST: u8                = 14;
+pub const KIND_PT_ZERO: u8                     = 15;
+
+// ── Forensic-ring writer-site IDs (for KIND_WRITE_DETECTED) ─────────────────
+pub const W_SITE_PREPOPULATE_COPY: u8 = 1;  // mm/cache.rs prepopulate copy
+pub const W_SITE_PFH_READAHEAD_ZERO: u8 = 2; // arch/x86_64/idt.rs readahead zero
+pub const W_SITE_PFH_SINGLEPAGE_ZERO: u8 = 3; // arch/x86_64/idt.rs single-page zero
+pub const W_SITE_COW_PHYSOFF_COPY: u8 = 4; // arch/x86_64/idt.rs CoW PHYS_OFF copy
+pub const W_SITE_VMM_NEW_PT_ZERO: u8  = 5; // mm/vmm.rs new page-table zero
 
 // ── Writer site IDs for Arm-2 PREINS witness map ────────────────────────────
 
@@ -418,15 +434,408 @@ fn op_str(o: u8) -> &'static str {
     }
 }
 
+// ── Forensic provenance ring (time-ordered, cluster-filtered) ───────────────
+//
+// A single global ring buffer that records every event touching a phys in
+// the empirically-observed W215 cluster range.  Entries are written in
+// monotonic head-index order; on overflow oldest entries are overwritten.
+// Filtering on the cluster range keeps the ring noise-free across long
+// runs (~100 K events) while still covering >95% of historical bucket-A
+// hits (phys cluster 0x32ed*-0x330* across all five iterations of the
+// W215 saga, per Intel SDM Vol. 3A §4.10.5 paging-structure coherence
+// invariants).
+//
+// Lock-free: a single AtomicU64 head; per-slot stores are Relaxed.  A
+// concurrent reader (dump_prov_ring_for_phys) walks the ring with a
+// snapshot of head — it may observe partial writes on slots being
+// updated, which is acceptable because:
+//   (a) the filter range constrains writers to a small phys window, so
+//       cross-slot interleaving is rare in practice;
+//   (b) the dump is post-fault, by which time the ring is quiescent for
+//       most physes;
+//   (c) any torn entry is recognizable (phys=0 or impossible kind) and
+//       skipped.
+
+/// Lower bound of the W215 cluster phys filter (inclusive).  Observed
+/// cluster: 0x32ed*-0x330* across all bucket-A hits in the W215 saga.
+/// Widened to a round 1 MiB boundary on each side for safety.
+const W215_CLUSTER_LO: u64 = 0x3280_0000;
+const W215_CLUSTER_HI: u64 = 0x3380_0000;
+
+#[inline]
+fn in_cluster(phys: u64) -> bool {
+    phys >= W215_CLUSTER_LO && phys < W215_CLUSTER_HI
+}
+
+/// One forensic-ring entry.  Sized 48 bytes (6 * u64) for cache-line
+/// alignment friendliness.
+#[repr(C, align(64))]
+struct RingEntry {
+    tsc_or_tick: AtomicU64,
+    /// Bit layout:
+    ///   [63:48] reserved (0)
+    ///   [47:40] cpu
+    ///   [39:32] kind
+    ///   [31:0]  key_off_lo (low 32 bits of file_offset >> 12 page index)
+    packed_a: AtomicU64,
+    phys: AtomicU64,
+    /// Bit layout:
+    ///   [63:32] key_inode_lo32
+    ///   [31:0]  key_mount_lo32
+    packed_b: AtomicU64,
+    rip: AtomicU64,
+    cr3: AtomicU64,
+}
+
+impl RingEntry {
+    const fn new() -> Self {
+        Self {
+            tsc_or_tick: AtomicU64::new(0),
+            packed_a: AtomicU64::new(0),
+            phys: AtomicU64::new(0),
+            packed_b: AtomicU64::new(0),
+            rip: AtomicU64::new(0),
+            cr3: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Ring capacity (power of two — index = head & (CAP-1)).
+const RING_CAP: usize = 4096;
+
+#[repr(C, align(64))]
+struct Ring {
+    entries: [RingEntry; RING_CAP],
+}
+
+impl Ring {
+    const fn new() -> Self {
+        const E: RingEntry = RingEntry::new();
+        Self { entries: [E; RING_CAP] }
+    }
+}
+
+static RING: Ring = Ring::new();
+
+/// Monotonically-increasing head index.  Position in ring = head & (CAP-1).
+static RING_HEAD: AtomicU64 = AtomicU64::new(0);
+
+/// Total entries pushed (saturates if astronomically high).  Equal to
+/// RING_HEAD post-saturation except in the no-overflow case.
+static RING_PUSHES: AtomicU64 = AtomicU64::new(0);
+
+/// Entries discarded by the cluster filter (out of range).
+static RING_FILTERED: AtomicU64 = AtomicU64::new(0);
+
+/// Wraps where a not-recently-touched slot was overwritten by the head.
+static RING_WRAPS: AtomicU64 = AtomicU64::new(0);
+
+/// Push one ring entry.  Caller provides the kind + phys + cache key + rip.
+/// Filter: phys must be in the W215 cluster range — otherwise the call is
+/// a no-op (filtered count incremented).
+#[inline]
+pub fn ring_push(
+    kind: u8,
+    phys: u64,
+    mount_idx: usize,
+    inode: u64,
+    file_offset_bytes: u64,
+    rip: u64,
+) {
+    if !in_cluster(phys) {
+        RING_FILTERED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let head = RING_HEAD.fetch_add(1, Ordering::Relaxed);
+    if head >= RING_CAP as u64 {
+        RING_WRAPS.fetch_add(1, Ordering::Relaxed);
+    }
+    RING_PUSHES.fetch_add(1, Ordering::Relaxed);
+    let slot = &RING.entries[(head as usize) & (RING_CAP - 1)];
+
+    let cpu = crate::arch::x86_64::apic::cpu_index() as u64;
+    let tick = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+    let key_off_lo = ((file_offset_bytes >> 12) & 0xFFFF_FFFF) as u64;
+    let packed_a = (cpu << 40) | ((kind as u64) << 32) | key_off_lo;
+    let packed_b = ((inode & 0xFFFF_FFFF) << 32) | ((mount_idx as u64) & 0xFFFF_FFFF);
+    let cr3 = crate::mm::vmm::get_cr3();
+
+    slot.tsc_or_tick.store(tick, Ordering::Relaxed);
+    slot.packed_a.store(packed_a, Ordering::Relaxed);
+    slot.phys.store(phys, Ordering::Relaxed);
+    slot.packed_b.store(packed_b, Ordering::Relaxed);
+    slot.rip.store(rip, Ordering::Relaxed);
+    slot.cr3.store(cr3, Ordering::Relaxed);
+}
+
+/// Push a ring entry without a cache key (alloc/free events).  rip optional.
+#[inline]
+pub fn ring_push_nokey(kind: u8, phys: u64, rip: u64) {
+    ring_push(kind, phys, 0, 0, 0, rip);
+}
+
+#[inline]
+fn kind_str_full(k: u8) -> &'static str {
+    match k {
+        KIND_ALLOC => "ALLOC",
+        KIND_INSERT => "INSERT",
+        KIND_EVICT => "EVICT",
+        KIND_REFINC => "REFINC",
+        KIND_REFDEC => "REFDEC",
+        KIND_PHYS_OFF_WRITE_PRE_INSERT => "PREINS_W",
+        KIND_PFH_INSTALL => "PFH_INSTALL",
+        KIND_FREE => "FREE",
+        KIND_QUARANTINE_FREE => "QUAR_FREE",
+        KIND_WRITE_DETECTED => "WRITE_DETECTED",
+        KIND_DUP_PHYS_AT_INSERT => "DUP_PHYS_AT_INSERT",
+        KIND_CACHE_DUP_FOUND => "CACHE_DUP_FOUND",
+        KIND_COW_COPY_SRC => "COW_COPY_SRC",
+        KIND_COW_COPY_DST => "COW_COPY_DST",
+        KIND_PT_ZERO => "PT_ZERO",
+        _ => "?",
+    }
+}
+
+/// Dump the last `max_entries` ring events matching `phys` to the serial
+/// console.  Called from the FAULT/PHYS bucket-A path so the corrupting
+/// writer's history is visible at the moment of fault.  Newest-first.
+pub fn dump_prov_ring_for_phys(phys: u64) {
+    if !in_cluster(phys) {
+        crate::serial_println!(
+            "[W215/PROV-RING] phys={:#x} entries=0 (out of cluster filter [{:#x},{:#x}))",
+            phys, W215_CLUSTER_LO, W215_CLUSTER_HI,
+        );
+        return;
+    }
+    let head = RING_HEAD.load(Ordering::Relaxed);
+    let pushes = RING_PUSHES.load(Ordering::Relaxed);
+    // Walk backwards from head, emit up to MAX_DUMP entries matching phys.
+    const MAX_DUMP: usize = 64;
+    let scan_limit = core::cmp::min(head as usize, RING_CAP);
+    let mut emitted: usize = 0;
+
+    crate::serial_println!(
+        "[W215/PROV-RING] phys={:#x} head={} pushes_total={} scan_limit={}",
+        phys, head, pushes, scan_limit,
+    );
+
+    for back in 1..=scan_limit {
+        if emitted >= MAX_DUMP { break; }
+        let idx = ((head - back as u64) as usize) & (RING_CAP - 1);
+        let slot = &RING.entries[idx];
+        let p = slot.phys.load(Ordering::Relaxed);
+        if p != phys { continue; }
+        let tick = slot.tsc_or_tick.load(Ordering::Relaxed);
+        let pa = slot.packed_a.load(Ordering::Relaxed);
+        let pb = slot.packed_b.load(Ordering::Relaxed);
+        let rip = slot.rip.load(Ordering::Relaxed);
+        let cr3 = slot.cr3.load(Ordering::Relaxed);
+        let cpu = ((pa >> 40) & 0xFF) as u8;
+        let kind = ((pa >> 32) & 0xFF) as u8;
+        let key_off_lo = (pa & 0xFFFF_FFFF) as u32;
+        let key_mount = (pb & 0xFFFF_FFFF) as u32;
+        let key_inode = ((pb >> 32) & 0xFFFF_FFFF) as u32;
+        crate::serial_println!(
+            "[W215/PROV-RING/E] i={} tick={} cpu={} op={} phys={:#x} \
+             key=(m={},ino_lo={:#x},off_idx={:#x}) rip={:#x} cr3={:#x}",
+            emitted, tick, cpu, kind_str_full(kind),
+            p, key_mount, key_inode, key_off_lo, rip, cr3,
+        );
+        emitted += 1;
+    }
+    if emitted == 0 {
+        crate::serial_println!(
+            "[W215/PROV-RING/E] phys={:#x} (no matching entries in ring)",
+            phys,
+        );
+    }
+}
+
+/// WRITE_DETECTED helper.  Call BEFORE a PHYS_OFF write at one of the five
+/// instrumented sites.  Checks whether `phys` is currently cache-resident;
+/// on hit, emits a structured `[W215/WRITE-DETECT]` serial line and pushes
+/// a WRITE_DETECTED entry to the ring.  Does NOT modify the write.
+///
+/// `caller_rip` should be the return address of the calling instruction
+/// — typical use is to pass `0` and let the compiler/optimizer omit RIP,
+/// or capture via `core::intrinsics::caller_location()` upstream.
+#[inline]
+pub fn write_detect(site: u8, phys: u64, caller_rip: u64) {
+    if !in_cluster(phys) {
+        return;
+    }
+    // Capture cache key if any.  is_phys_in_cache is O(n) over the cache
+    // (≤40 K entries) but only fires in-cluster — bounded total impact.
+    if let Some((m, ino, off)) = crate::mm::cache::is_phys_in_cache(phys) {
+        let n = WRITE_DETECT_TOTAL.fetch_add(1, Ordering::Relaxed);
+        // Sample serial line to avoid flood.  Always push to ring.
+        if n < 16 || n % 256 == 0 {
+            crate::serial_println!(
+                "[W215/WRITE-DETECT] site={} phys={:#x} \
+                 cache_key=(m={},ino={:#x},off={:#x}) rip={:#x} n={}",
+                w_site_str(site), phys, m, ino, off, caller_rip, n,
+            );
+        }
+        ring_push(KIND_WRITE_DETECTED, phys, m, ino, off, caller_rip);
+        match site {
+            W_SITE_PREPOPULATE_COPY     => WRITE_DETECT_PREPOP.fetch_add(1, Ordering::Relaxed),
+            W_SITE_PFH_READAHEAD_ZERO   => WRITE_DETECT_PFH_RA.fetch_add(1, Ordering::Relaxed),
+            W_SITE_PFH_SINGLEPAGE_ZERO  => WRITE_DETECT_PFH_SP.fetch_add(1, Ordering::Relaxed),
+            W_SITE_COW_PHYSOFF_COPY     => WRITE_DETECT_COW.fetch_add(1, Ordering::Relaxed),
+            W_SITE_VMM_NEW_PT_ZERO      => WRITE_DETECT_PTZ.fetch_add(1, Ordering::Relaxed),
+            _ => 0,
+        };
+    }
+}
+
+#[inline]
+fn w_site_str(s: u8) -> &'static str {
+    match s {
+        W_SITE_PREPOPULATE_COPY    => "prepop_copy",
+        W_SITE_PFH_READAHEAD_ZERO  => "pfh_readahead_zero",
+        W_SITE_PFH_SINGLEPAGE_ZERO => "pfh_singlepage_zero",
+        W_SITE_COW_PHYSOFF_COPY    => "cow_physoff_copy",
+        W_SITE_VMM_NEW_PT_ZERO     => "vmm_new_pt_zero",
+        _ => "?",
+    }
+}
+
+// ── Cache duplicate-phys audit (axis-C double-bind detector) ────────────────
+//
+// Every CACHE_DUP_AUDIT_EVERY cache::insert calls, scan the cache for any
+// two distinct keys pointing at the same phys.  A hit is structural axis-C
+// evidence: `is_phys_in_cache` returns the FIRST match it encounters, so a
+// double-bind silently presents as a "consistent cache key" to the bucket
+// classifier while the actual PTE may have been installed via the other
+// binding.
+
+const CACHE_DUP_AUDIT_EVERY: u64 = 1000;
+static INSERT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Called from cache::insert after the lock is dropped.  Schedules an audit
+/// every CACHE_DUP_AUDIT_EVERY inserts.  This bound keeps the cumulative
+/// O(n²) cost manageable: ~40 inserts/s × 40 K cache entries = ~1.6 M ops/s
+/// at peak, scaled to one full audit per 25 s — negligible.
+#[inline]
+pub fn maybe_audit_cache_dup() {
+    let n = INSERT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if n % CACHE_DUP_AUDIT_EVERY != 0 {
+        return;
+    }
+    if let Some((phys, key1, key2)) = crate::mm::cache::audit_duplicate_phys() {
+        CACHE_DUP_HITS.fetch_add(1, Ordering::Relaxed);
+        crate::serial_println!(
+            "[W215/CACHE-DUP] phys={:#x} key1=(m={},ino={:#x},off={:#x}) \
+             key2=(m={},ino={:#x},off={:#x})",
+            phys,
+            key1.0, key1.1, key1.2,
+            key2.0, key2.1, key2.2,
+        );
+        ring_push(KIND_CACHE_DUP_FOUND, phys,
+                  key1.0, key1.1, key1.2, 0);
+    }
+}
+
+/// Probe at insert time: if `phys` is already bound to a DIFFERENT cache key
+/// at the moment of insert, that's a DUP_PHYS_AT_INSERT event.  Call this
+/// from cache::insert before the actual map.insert occurs.
+#[inline]
+pub fn check_dup_phys_at_insert(
+    incoming_mount: usize,
+    incoming_inode: u64,
+    incoming_off: u64,
+    phys: u64,
+) {
+    if let Some((m, ino, off)) = crate::mm::cache::is_phys_in_cache(phys) {
+        if m != incoming_mount || ino != incoming_inode || off != incoming_off {
+            DUP_PHYS_AT_INSERT_HITS.fetch_add(1, Ordering::Relaxed);
+            crate::serial_println!(
+                "[W215/DUP-PHYS-AT-INSERT] phys={:#x} \
+                 existing_key=(m={},ino={:#x},off={:#x}) \
+                 incoming_key=(m={},ino={:#x},off={:#x})",
+                phys, m, ino, off,
+                incoming_mount, incoming_inode, incoming_off,
+            );
+            ring_push(KIND_DUP_PHYS_AT_INSERT, phys,
+                      incoming_mount, incoming_inode, incoming_off, 0);
+        }
+    }
+}
+
 // ── Counters readable via kdb ───────────────────────────────────────────────
 
 static WINDOW_RACE: AtomicU64 = AtomicU64::new(0);
 static INSTALL_RACE: AtomicU64 = AtomicU64::new(0);
 static PROV_RING_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+// Forensic-ring counters
+static WRITE_DETECT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WRITE_DETECT_PREPOP: AtomicU64 = AtomicU64::new(0);
+static WRITE_DETECT_PFH_RA: AtomicU64 = AtomicU64::new(0);
+static WRITE_DETECT_PFH_SP: AtomicU64 = AtomicU64::new(0);
+static WRITE_DETECT_COW: AtomicU64 = AtomicU64::new(0);
+static WRITE_DETECT_PTZ: AtomicU64 = AtomicU64::new(0);
+static DUP_PHYS_AT_INSERT_HITS: AtomicU64 = AtomicU64::new(0);
+static CACHE_DUP_HITS: AtomicU64 = AtomicU64::new(0);
 
 pub fn window_race_count() -> u64 { WINDOW_RACE.load(Ordering::Relaxed) }
 pub fn install_race_count() -> u64 { INSTALL_RACE.load(Ordering::Relaxed) }
 pub fn prov_ring_overflow_count() -> u64 { PROV_RING_OVERFLOW.load(Ordering::Relaxed) }
+
+/// Forensic-ring counter readout for kdb `w215-prov-ring` op.
+///
+/// Order: (head, pushes, filtered, wraps, write_detect_total,
+///         wd_prepop, wd_pfh_ra, wd_pfh_sp, wd_cow, wd_ptz,
+///         dup_phys_at_insert, cache_dup_hits)
+pub fn forensic_ring_counters() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+    (
+        RING_HEAD.load(Ordering::Relaxed),
+        RING_PUSHES.load(Ordering::Relaxed),
+        RING_FILTERED.load(Ordering::Relaxed),
+        RING_WRAPS.load(Ordering::Relaxed),
+        WRITE_DETECT_TOTAL.load(Ordering::Relaxed),
+        WRITE_DETECT_PREPOP.load(Ordering::Relaxed),
+        WRITE_DETECT_PFH_RA.load(Ordering::Relaxed),
+        WRITE_DETECT_PFH_SP.load(Ordering::Relaxed),
+        WRITE_DETECT_COW.load(Ordering::Relaxed),
+        WRITE_DETECT_PTZ.load(Ordering::Relaxed),
+        DUP_PHYS_AT_INSERT_HITS.load(Ordering::Relaxed),
+        CACHE_DUP_HITS.load(Ordering::Relaxed),
+    )
+}
+
+/// Dump the most-recent `max_entries` ring entries (any phys) to serial.
+/// Used by kdb's `w215-prov-ring` op.
+pub fn dump_prov_ring_tail(max_entries: usize) {
+    let head = RING_HEAD.load(Ordering::Relaxed);
+    let pushes = RING_PUSHES.load(Ordering::Relaxed);
+    let scan_limit = core::cmp::min(head as usize, RING_CAP);
+    let cap = core::cmp::min(max_entries, scan_limit);
+    crate::serial_println!(
+        "[W215/PROV-RING] tail dump head={} pushes_total={} emit={}",
+        head, pushes, cap,
+    );
+    for back in 1..=cap {
+        let idx = ((head - back as u64) as usize) & (RING_CAP - 1);
+        let slot = &RING.entries[idx];
+        let p = slot.phys.load(Ordering::Relaxed);
+        if p == 0 { continue; }
+        let tick = slot.tsc_or_tick.load(Ordering::Relaxed);
+        let pa = slot.packed_a.load(Ordering::Relaxed);
+        let pb = slot.packed_b.load(Ordering::Relaxed);
+        let rip = slot.rip.load(Ordering::Relaxed);
+        let cpu = ((pa >> 40) & 0xFF) as u8;
+        let kind = ((pa >> 32) & 0xFF) as u8;
+        let key_off_lo = (pa & 0xFFFF_FFFF) as u32;
+        let key_mount = (pb & 0xFFFF_FFFF) as u32;
+        let key_inode = ((pb >> 32) & 0xFFFF_FFFF) as u32;
+        crate::serial_println!(
+            "[W215/PROV-RING/T] i={} tick={} cpu={} op={} phys={:#x} \
+             key=(m={},ino_lo={:#x},off_idx={:#x}) rip={:#x}",
+            back - 1, tick, cpu, kind_str_full(kind),
+            p, key_mount, key_inode, key_off_lo, rip,
+        );
+    }
+}
 
 /// Snapshot the top entries in the provenance table by occupancy.
 /// Used by kdb's `w215-diag` op for sanity-checking the ring is alive.

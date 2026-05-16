@@ -150,6 +150,21 @@ pub fn insert(mount_idx: usize, inode: u64, page_offset: u64, phys: u64) {
             crate::mm::w215_diag::pack_cache_key(inode, page_offset),
         );
         let _ = crate::mm::w215_diag::preins_clear_on_insert(phys);
+        // Forensic ring: time-ordered INSERT event (cluster-filtered).
+        crate::mm::w215_diag::ring_push(
+            crate::mm::w215_diag::KIND_INSERT,
+            phys, mount_idx, inode, page_offset, 0,
+        );
+        // W215 axis-C: detect if `phys` is already bound to a different
+        // cache key at the moment of insert (silent double-bind).  Note:
+        // is_phys_in_cache walks live cache; since we just released the
+        // lock above, a concurrent insert can race in, but for the W215
+        // long-lived libxul cache this is a vanishingly rare race.
+        crate::mm::w215_diag::check_dup_phys_at_insert(
+            mount_idx, inode, page_offset, phys,
+        );
+        // Periodic cache-walk audit for duplicate phys across keys.
+        crate::mm::w215_diag::maybe_audit_cache_dup();
     }
 
     if let Some(old_phys) = evicted_zero_rc {
@@ -367,6 +382,11 @@ pub fn prepopulate_file(path: &str) -> usize {
                 // zero when copy_len < page_size.  The unconditional bzero is
                 // inexpensive relative to the prior disk I/O and eliminates
                 // the class of stale-content faults entirely.
+                #[cfg(feature = "firefox-test")]
+                crate::mm::w215_diag::write_detect(
+                    crate::mm::w215_diag::W_SITE_PREPOPULATE_COPY,
+                    phys, 0,
+                );
                 unsafe {
                     core::ptr::write_bytes(dst, 0, page_size as usize);
                     core::ptr::copy_nonoverlapping(
@@ -460,6 +480,46 @@ pub fn stats() -> (usize, usize) {
 ///
 /// Per-entry `phys` comparison is exact — the cache holds one physical frame per
 /// key and frames are 4 KiB-aligned, so a u64 equality test is sufficient.
+/// Scan the cache for two distinct keys pointing at the same physical frame.
+///
+/// Used by the W215 forensic provenance ring's axis-C double-bind detector.
+/// `is_phys_in_cache` returns the FIRST match it finds; a duplicate
+/// presents as "consistent cache key" to the classifier while the actual
+/// PTE may have been installed via the other binding (see Intel SDM
+/// Vol. 3A §4.10.5 — a frame must have a single authoritative VA-to-PA
+/// mapping at any time it is observed live by user code).
+///
+/// O(n²) in the worst case but the cache is bounded (~40 K entries) and
+/// this is only invoked every 1000 inserts.  Returns the FIRST duplicate
+/// pair encountered; absence does not prove uniqueness if the cache
+/// changes during the walk, which is acceptable for a diagnostic.
+#[cfg(feature = "firefox-test")]
+pub fn audit_duplicate_phys() -> Option<(u64, (usize, u64, u64), (usize, u64, u64))> {
+    let cache = PAGE_CACHE.lock();
+    // Collect (phys, key) pairs and look for duplicate phys.  For typical
+    // workloads (≤40 K entries) one pass with a small linear scan is fine.
+    let mut prev_phys: Option<u64> = None;
+    let mut prev_key: Option<(usize, u64, u64)> = None;
+    // Pull into a vec to sort by phys; BTreeMap iter is by key, not phys.
+    let mut entries: alloc::vec::Vec<(u64, (usize, u64, u64))> =
+        alloc::vec::Vec::with_capacity(cache.len());
+    for ((m, i, off), e) in cache.iter() {
+        entries.push((e.phys, (*m, *i, *off)));
+    }
+    drop(cache);
+    entries.sort_by_key(|(p, _)| *p);
+    for (p, k) in entries.iter() {
+        if let (Some(pp), Some(pk)) = (prev_phys, prev_key) {
+            if pp == *p {
+                return Some((*p, pk, *k));
+            }
+        }
+        prev_phys = Some(*p);
+        prev_key = Some(*k);
+    }
+    None
+}
+
 #[cfg(feature = "firefox-test")]
 pub fn is_phys_in_cache(phys: u64) -> Option<(usize, u64, u64)> {
     // W215 diagnostic Arm-2: probe BEFORE taking the cache lock so the
