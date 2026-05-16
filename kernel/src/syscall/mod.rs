@@ -3196,6 +3196,15 @@ pub(crate) fn sys_sigreturn() -> i64 {
     // user_rsp points to sig_num (offset 8 in SignalFrame).
     // restorer was consumed by ret → it's at user_rsp - 8.
     let frame_base = user_rsp.wrapping_sub(8);
+    // Validate the entire frame lies within the user-space address range
+    // before dereferencing any field.  A crafted frame_base pointing into
+    // kernel VA would allow a ring-3 caller to read arbitrary kernel memory
+    // via the field reads below.  Per POSIX sigaction(2) / ABI contract,
+    // the signal frame is always a user-space stack allocation; a kernel-VA
+    // value is unambiguously invalid — return EFAULT (§14.4 POSIX.1-2017).
+    if !validate_user_ptr(frame_base, core::mem::size_of::<crate::signal::SignalFrame>()) {
+        return -crate::subsys::linux::errno::EFAULT;
+    }
     let frame_ptr = frame_base as *const crate::signal::SignalFrame;
 
     let (sig_num, saved_mask, saved_rsp, saved_r15, saved_r14, saved_r13,
