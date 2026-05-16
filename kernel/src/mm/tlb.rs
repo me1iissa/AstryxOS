@@ -180,6 +180,41 @@ static STAT_QUARANTINE_DEFERRED: AtomicU64 = AtomicU64::new(0);
 /// Statistic: number of frames actually released from the quarantine to PMM.
 static STAT_QUARANTINE_RELEASED: AtomicU64 = AtomicU64::new(0);
 
+/// H2 diagnostic counter: number of times `shootdown_range_inner` returned
+/// `true` (clean) but at least one target CPU had not yet set its per-CPU
+/// `SHOOTDOWN_DONE_FLAGS` bit by the time the sender polled post-return.
+///
+/// A non-zero value is direct evidence that the protocol declares the
+/// shootdown complete while the receiving CPU's `local_invlpg_range` may
+/// not yet be committed to the hardware TLB, making the W215 frame-aliasing
+/// class mechanically plausible.  Gated behind `#[cfg(feature = "firefox-test")]`.
+#[cfg(feature = "firefox-test")]
+pub(crate) static STAT_CLEAN_ACK_LATE: AtomicU64 = AtomicU64::new(0);
+
+/// H2 diagnostic counter: number of times `shootdown_range_inner` returned
+/// `false` (unclean → quarantine path).  Provides a baseline rate so the
+/// `CLEAN_ACK_LATE` false-positive rate can be contextualised.
+/// Gated behind `#[cfg(feature = "firefox-test")]`.
+#[cfg(feature = "firefox-test")]
+pub(crate) static STAT_UNCLEAN_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Per-CPU "done" flag set by `handle_shootdown_ipi` immediately AFTER the
+/// local invalidation completes.  The sender clears a CPU's slot to 0 before
+/// publishing the IPI payload; the handler sets it to 1 after `invlpg`.
+/// The sender reads these flags (Acquire) after observing `pending=0` (the
+/// existing ack path) to verify that the invalidation actually ran, not merely
+/// that the IPI was received.
+///
+/// Addressing: indexed by `cpu_index()`.  One `AtomicU8` per slot (same width
+/// as `ShootdownSlot::pending`); natural alignment guarantees no false sharing
+/// with the payload fields.
+///
+/// Only materialised under `firefox-test`; in production the slot's `pending`
+/// flag is the sole synchronisation point and carries no extra overhead.
+#[cfg(feature = "firefox-test")]
+static SHOOTDOWN_DONE_FLAGS: [AtomicU8; apic::MAX_CPUS] =
+    [const { AtomicU8::new(0) }; apic::MAX_CPUS];
+
 // ── Quarantine-free ring ─────────────────────────────────────────────────────
 //
 // Physical frames that cannot be immediately returned to the PMM because
@@ -489,6 +524,12 @@ fn shootdown_range_inner(cr3: u64, va_lo: u64, va_hi: u64) -> bool {
         slot.cr3.store(cr3, Ordering::Relaxed);
         slot.va_lo.store(va_lo, Ordering::Relaxed);
         slot.va_hi.store(va_hi, Ordering::Relaxed);
+        // H2 diagnostic: clear the done flag before publishing the
+        // payload so the handler's subsequent store of 1 is
+        // unambiguously for *this* shootdown, not a residual from a prior
+        // one.  Must precede the Release-store of pending below.
+        #[cfg(feature = "firefox-test")]
+        SHOOTDOWN_DONE_FLAGS[bit].store(0, Ordering::Relaxed);
         // pending=1 must be the LAST write so the handler sees a
         // fully-published payload.  Release pairs with Acquire in
         // the handler.
@@ -566,7 +607,63 @@ fn shootdown_range_inner(cr3: u64, va_lo: u64, va_hi: u64) -> bool {
             self_cpu, remaining, tgt_count,
             va_lo, va_hi, iters, timeout_count,
         );
+        // H2 diagnostic: count this unclean shootdown for baseline comparison
+        // with CLEAN_ACK_LATE.
+        #[cfg(feature = "firefox-test")]
+        STAT_UNCLEAN_TOTAL.fetch_add(1, Ordering::Relaxed);
         return false;
+    }
+
+    // All targets acked (pending cleared).  Poll the done flags to verify
+    // that the local invalidation actually committed on each target CPU —
+    // not merely that the IPI was received and the slot was acknowledged.
+    // Per Intel SDM Vol. 3A §4.10.4.2, the `invlpg` must complete before
+    // the handler clears pending (the AcqRel compare_exchange in
+    // `handle_shootdown_ipi` provides that ordering guarantee relative to
+    // the pending clear); the done flag provides a second, independent
+    // readback point that is set AFTER the invalidation instruction
+    // completes, giving us a measurement of whether the two signals race.
+    #[cfg(feature = "firefox-test")]
+    {
+        // Brief spin on the done flags: 4000 iterations ≈ a few µs, far
+        // cheaper than the ACK_BOUND above, but enough to cover any IPI
+        // delivery jitter between `pending=0` and the done flag store.
+        let mut late_mask: u64 = targets;
+        for _ in 0..4_000u32 {
+            let mut still = 0u64;
+            let mut r = late_mask;
+            while r != 0 {
+                let bit = r.trailing_zeros() as usize;
+                r &= r - 1;
+                if bit < apic::MAX_CPUS
+                    && SHOOTDOWN_DONE_FLAGS[bit].load(Ordering::Acquire) == 0
+                {
+                    still |= 1u64 << (bit as u64);
+                }
+            }
+            late_mask = still;
+            if late_mask == 0 { break; }
+            core::hint::spin_loop();
+        }
+        if late_mask != 0 {
+            // At least one CPU cleared pending but has not yet stored
+            // done=1.  The shootdown was declared clean prematurely.
+            let total = STAT_CLEAN_ACK_LATE.fetch_add(1, Ordering::Relaxed) + 1;
+            // Collect the late CPU list for the log line (max 8 entries).
+            let mut late_cpus = [0u8; 8];
+            let mut nlate = 0usize;
+            let mut r = late_mask;
+            while r != 0 && nlate < 8 {
+                let bit = r.trailing_zeros() as usize;
+                r &= r - 1;
+                late_cpus[nlate] = bit as u8;
+                nlate += 1;
+            }
+            crate::serial_println!(
+                "[TLB/CLEAN-ACK-LATE] cr3={:#x} late_cpus={:?} count_total={}",
+                cr3, &late_cpus[..nlate], total
+            );
+        }
     }
 
     true
@@ -797,6 +894,15 @@ pub extern "C" fn handle_shootdown_ipi() {
             // again with the same payload.  The ack-clear is implicit
             // in the compare_exchange above; no second store needed.
 
+            // H2 diagnostic: signal the sender that the local invalidation
+            // has committed.  The Release fence here pairs with the Acquire
+            // poll in `shootdown_range_inner` so the sender observes the
+            // completed `invlpg` ordering, not just the `pending` clear.
+            #[cfg(feature = "firefox-test")]
+            if cpu < apic::MAX_CPUS {
+                SHOOTDOWN_DONE_FLAGS[cpu].store(1, Ordering::Release);
+            }
+
             STAT_SHOOTDOWNS_HANDLED.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -817,6 +923,14 @@ pub struct Stats {
     pub quarantine_released: u64,
     /// Current number of frames held in the quarantine ring.
     pub quarantine_depth: usize,
+    /// H2 diagnostic (firefox-test only): shootdowns declared clean while at
+    /// least one target CPU had not yet committed the local invalidation.
+    /// Always 0 in non-firefox-test builds.
+    pub clean_ack_late: u64,
+    /// H2 diagnostic (firefox-test only): shootdowns that returned false
+    /// (unclean → quarantine).  Baseline rate for the above counter.
+    /// Always 0 in non-firefox-test builds.
+    pub unclean_total: u64,
 }
 
 /// Return a snapshot of the running shootdown statistics.
@@ -829,5 +943,13 @@ pub fn stats() -> Stats {
         quarantine_deferred: STAT_QUARANTINE_DEFERRED.load(Ordering::Relaxed),
         quarantine_released: STAT_QUARANTINE_RELEASED.load(Ordering::Relaxed),
         quarantine_depth: STAT_QUARANTINE_DEPTH.load(Ordering::Relaxed),
+        #[cfg(feature = "firefox-test")]
+        clean_ack_late: STAT_CLEAN_ACK_LATE.load(Ordering::Relaxed),
+        #[cfg(not(feature = "firefox-test"))]
+        clean_ack_late: 0,
+        #[cfg(feature = "firefox-test")]
+        unclean_total: STAT_UNCLEAN_TOTAL.load(Ordering::Relaxed),
+        #[cfg(not(feature = "firefox-test"))]
+        unclean_total: 0,
     }
 }
