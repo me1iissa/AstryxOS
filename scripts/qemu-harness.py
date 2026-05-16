@@ -1155,6 +1155,44 @@ def _regen_data_img(root_dir: Path) -> dict:
 
 # ══════════════════════════════════════════════════════════════════════════════
 
+def cmd_context(args):
+    """
+    Front-end for scripts/agent-context.py — shared session-context management.
+
+    Delegates directly to agent-context.py with the supplied sub-subcommand and
+    arguments.  Agents that already know to use qemu-harness.py can access the
+    context layer through this single entry point without needing to remember a
+    separate script path.
+
+    Usage:
+      python3 scripts/qemu-harness.py context read-current [--section S] [--json]
+      python3 scripts/qemu-harness.py context summary
+      python3 scripts/qemu-harness.py context register-dispatch --agent-id ID \\
+                                                                 --role ROLE \\
+                                                                 --task TASK
+      python3 scripts/qemu-harness.py context register-completion --agent-id ID \\
+                                                                   --outcome TEXT \\
+                                                                   [--commits SHAs]\\
+                                                                   [--pr #NNN]
+      python3 scripts/qemu-harness.py context append-event KIND \\
+                                                             --agent-id ID \\
+                                                             --payload JSON
+      python3 scripts/qemu-harness.py context digest-since TIMESTAMP
+      python3 scripts/qemu-harness.py context prune-current [--max-lines N]
+    """
+    import subprocess as _sp
+    agent_ctx = Path(__file__).parent / "agent-context.py"
+    if not agent_ctx.exists():
+        _out({"ok": False, "error": f"agent-context.py not found at {agent_ctx}"})
+        return 1
+    # Pass everything after "context" directly to the helper script.
+    cmd = [sys.executable, str(agent_ctx)] + (args.context_args or [])
+    result = _sp.run(cmd)
+    return result.returncode
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+
 def cmd_check(args):
     """
     Run `cargo +nightly check` against the kernel package and emit a JSON
@@ -5480,6 +5518,19 @@ def main():
                           help="Feature flags passed VERBATIM to cargo. "
                                "Empty string → default desktop kernel.")
 
+    # context — shared session-context management (delegates to agent-context.py)
+    p_ctx = sub.add_parser(
+        "context",
+        help="Shared session-context management: read CURRENT.md, register "
+             "dispatch/completion events, append arbitrary events, summarise. "
+             "All subcommands are forwarded verbatim to scripts/agent-context.py. "
+             "Example: context read-current --section Goal",
+    )
+    p_ctx.add_argument(
+        "context_args", nargs=argparse.REMAINDER,
+        help="Subcommand + arguments forwarded to agent-context.py",
+    )
+
     # _watch: private subcommand used internally by `start` to run the
     # background watcher in a detached process. Not shown in help.
     p_watch = sub.add_parser("_watch")
@@ -5532,6 +5583,8 @@ def main():
         "qmp-xp":   cmd_qmp_xp,
         "rip-walk": cmd_rip_walk,
         "read-png": cmd_read_png,
+        # Shared session context
+        "context": cmd_context,
         "_watch":  cmd_run_watcher,
     }
     rc = dispatch[args.cmd](args)
