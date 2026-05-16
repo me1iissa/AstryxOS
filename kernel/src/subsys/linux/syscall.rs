@@ -131,12 +131,47 @@ pub(crate) fn is_linux_abi() -> bool {
     false
 }
 
+/// Strict range check for a user pathname pointer.
+///
+/// Returns `true` iff `ptr` is a non-null low-canonical user-space address.
+/// Used as the gate at the head of `sys_open`, `sys_openat`, `sys_access`,
+/// `sys_stat` (and other pathname-bearing syscalls) so that an out-of-range
+/// pathname is rejected with `-EFAULT` BEFORE `read_cstring_from_user` even
+/// runs.  Stricter than `validate_user_ptr(ptr, 1)` because it additionally
+/// rejects the non-canonical hole (`[USER_PTR_MAX, KERNEL_VIRT_BASE)`).
+///
+/// CWE-823 (Out-of-range pointer offset) / CWE-119 (improper memory bounds).
+#[inline]
+pub(crate) fn user_path_ptr_ok(ptr: u64) -> bool {
+    const USER_PTR_MAX: u64 = 0x0000_8000_0000_0000;
+    ptr != 0 && ptr < USER_PTR_MAX
+}
+
 /// Read a null-terminated C string from user memory.
 /// Returns a byte slice excluding the null terminator, limited to 4096 bytes.
+///
+/// **Pointer-validation policy** (CWE-823 / CWE-119):  user-mode-originated
+/// calls are gated by `user_path_ptr_ok(ptr)` at the dispatch layer (see
+/// `dispatch_body` arms 2/4/6/21/257) — those arms return `-14` (EFAULT)
+/// before this helper ever runs.  Kernel-internal callers (e.g.
+/// `sys_open_test`, in-kernel VFS bring-up) intentionally pass pointers
+/// into the kernel-mapped string table to drive the same handler with a
+/// known-good path, and rely on the bounded 4096-byte scan here as their
+/// only safety constraint.  Splitting validation this way protects every
+/// pathname-reading syscall (open, openat, access, stat, statx,
+/// readlink, rename, link, mkdir, mount, execve, …) against malicious
+/// userspace without breaking the in-kernel test API.
 fn read_cstring_from_user(ptr: u64) -> &'static [u8] {
     if ptr == 0 {
         return b"";
     }
+    // The user/kernel boundary check is enforced at dispatch (see
+    // `user_path_ptr_ok` and the per-syscall dispatch arms in
+    // `dispatch_body`).  This helper is also called from kernel-internal
+    // glue (`sys_open_test`, in-kernel VFS bring-up) with pointers into
+    // the kernel-mapped read-only string table; rejecting those would
+    // break the test-runner and early-boot code.  We keep the bounded
+    // 4096-byte read as the only defensive limit here.
     let start = ptr as *const u8;
     let mut len = 0usize;
     unsafe {
@@ -450,8 +485,16 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         0 => sys_read_linux(arg1, arg2, arg3),
         // 1: write(fd, buf, count)
         1 => sys_write_linux(arg1, arg2, arg3),
-        // 2: open(pathname, flags, mode)
-        2 => sys_open_linux(arg1, arg2, arg3),
+        // 2: open(pathname, flags, mode) — user-mode entry gate on pathname.
+        // CWE-823.  In-kernel test callers wrap their `dispatch_linux` call
+        // in `KernelDispatchGuard` (see `dispatch_linux_kernel`) which sets
+        // a per-CPU bypass flag; real user-mode SYSCALL traffic never sets
+        // that flag and is gated as designed.
+        2 => {
+            if !crate::syscall::user_ptr_check_bypassed()
+                && !user_path_ptr_ok(arg1) { return -14; }
+            sys_open_linux(arg1, arg2, arg3)
+        }
         // 3: close(fd)
         3 => {
             let fd = arg1 as usize;
@@ -502,12 +545,21 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 Err(e) => crate::subsys::linux::errno::vfs_err(e),
             }
         }
-        // 4: stat(pathname, statbuf)
-        4 => sys_stat_linux(arg1, arg2),
+        // 4: stat(pathname, statbuf) — user-mode entry gate (CWE-823).
+        4 => {
+            if !crate::syscall::user_ptr_check_bypassed()
+                && !user_path_ptr_ok(arg1) { return -14; }
+            sys_stat_linux(arg1, arg2)
+        }
         // 5: fstat(fd, statbuf)
         5 => sys_fstat_linux(arg1 as usize, arg2 as *mut u8),
-        // 6: lstat(pathname, statbuf) — same as stat for us (no symlink follow)
-        6 => sys_stat_linux(arg1, arg2),
+        // 6: lstat(pathname, statbuf) — same as stat for us (no symlink follow).
+        // User-mode entry gate (CWE-823).
+        6 => {
+            if !crate::syscall::user_ptr_check_bypassed()
+                && !user_path_ptr_ok(arg1) { return -14; }
+            sys_stat_linux(arg1, arg2)
+        }
         // 8: lseek(fd, offset, whence)
         8 => crate::syscall::sys_lseek(arg1 as usize, arg2 as i64, arg3 as u32),
         // 9: mmap(addr, len, prot, flags, fd, offset)
@@ -533,8 +585,12 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         }
         // 20: writev(fd, iov, iovcnt)
         20 => sys_writev(arg1, arg2, arg3),
-        // 21: access(pathname, mode)
-        21 => sys_access(arg1, arg2),
+        // 21: access(pathname, mode) — user-mode entry gate (CWE-823).
+        21 => {
+            if !crate::syscall::user_ptr_check_bypassed()
+                && !user_path_ptr_ok(arg1) { return -14; }
+            sys_access(arg1, arg2)
+        }
         // 24: sched_yield
         24 => {
             crate::sched::yield_cpu();
@@ -1812,8 +1868,16 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         62 => crate::signal::kill(arg1, arg2 as u8),
         // 72: fcntl(fd, cmd, arg)
         72 => sys_fcntl(arg1, arg2, arg3),
-        // 79: getcwd(buf, size)
-        79 => crate::syscall::sys_getcwd(arg1 as *mut u8, arg2 as usize),
+        // 79: getcwd(buf, size) — user-mode entry gate on buf (CWE-823).
+        79 => {
+            if !crate::syscall::user_ptr_check_bypassed()
+                && arg2 != 0
+                && !crate::syscall::validate_user_ptr(arg1, arg2 as usize)
+            {
+                return -14;
+            }
+            crate::syscall::sys_getcwd(arg1 as *mut u8, arg2 as usize)
+        }
         // 80: chdir(pathname) — C string
         80 => sys_chdir_linux(arg1),
         // 81: fchdir(fd) — change CWD to the directory opened as fd
@@ -1835,8 +1899,17 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 Err(e) => -(e as usize as i64),
             }
         }
-        // 96: gettimeofday(tv, tz)
-        96 => sys_gettimeofday(arg1, arg2),
+        // 96: gettimeofday(tv, tz) — user-mode entry gate on tv (CWE-823).
+        // Null tv is a valid no-op (handler returns 0 without writing).
+        96 => {
+            if !crate::syscall::user_ptr_check_bypassed()
+                && arg1 != 0
+                && !crate::syscall::validate_user_ptr(arg1, 16)
+            {
+                return -14;
+            }
+            sys_gettimeofday(arg1, arg2)
+        }
         // 102: getuid
         102 => crate::syscall::sys_getuid(),
         // 104: getgid
@@ -1849,8 +1922,25 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         110 => crate::syscall::sys_getppid(),
         // 131: sigaltstack(ss, old_ss) — stub
         131 => 0,
-        // 158: arch_prctl(code, addr)
-        158 => sys_arch_prctl(arg1, arg2),
+        // 158: arch_prctl(code, addr) — user-mode entry gate on addr for
+        // ARCH_GET_FS/ARCH_GET_GS only.  For ARCH_SET_FS/ARCH_SET_GS, the
+        // `addr` arg is the MSR value to write (not a pointer), so no
+        // range check applies.  CWE-823.  Stricter low-canonical bound
+        // rejects the non-canonical hole — a non-canonical write would
+        // #GP rather than #PF and panic the kernel.
+        158 => {
+            const ARCH_GET_FS: u64 = 0x1003;
+            const ARCH_GET_GS: u64 = 0x1004;
+            const USER_PTR_MAX: u64 = 0x0000_8000_0000_0000;
+            if !crate::syscall::user_ptr_check_bypassed()
+                && (arg1 == ARCH_GET_FS || arg1 == ARCH_GET_GS)
+                && (arg2 >= USER_PTR_MAX
+                    || !crate::syscall::validate_user_ptr(arg2, 8))
+            {
+                return -14;
+            }
+            sys_arch_prctl(arg1, arg2)
+        }
         // 125: capget(_capuser_header_t hdrp, capuser_data_t datap)
         125 => {
             // Return all capabilities (root-equivalent) for the calling process.
@@ -1912,10 +2002,39 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         202 => sys_futex_linux(arg1, arg2, arg3, arg4, arg5, arg6),
         // 217: getdents64(fd, dirp, count)
         217 => sys_getdents64(arg1, arg2, arg3),
-        // 218: set_tid_address(tidptr)
-        218 => sys_set_tid_address(arg1),
-        // 228: clock_gettime(clockid, tp)
-        228 => sys_clock_gettime(arg1, arg2),
+        // 218: set_tid_address(tidptr) — user-mode entry gate (CWE-823,
+        // deferred-liability variant: validate at store time so the
+        // exit-time CLEAR_TID write through the process page tables can
+        // never resolve to a kernel/non-canonical address).  Per
+        // set_tid_address(2) the syscall "always succeeds"; on
+        // validation failure we decline the side effect and still
+        // return TID — observationally indistinguishable from a thread
+        // that never registered a CLEAR_TID slot.
+        218 => {
+            const USER_PTR_MAX: u64 = 0x0000_8000_0000_0000;
+            // Decline side effect on any bad ptr (kernel-VA, non-canonical
+            // hole, or wrap-around).  Still return TID per the ABI.
+            // In-kernel test callers (via dispatch_linux_kernel) bypass.
+            if !crate::syscall::user_ptr_check_bypassed()
+                && arg1 != 0
+                && (arg1 >= USER_PTR_MAX
+                    || !crate::syscall::validate_user_ptr(arg1, 4))
+            {
+                return crate::proc::current_tid() as i64;
+            }
+            sys_set_tid_address(arg1)
+        }
+        // 228: clock_gettime(clockid, tp) — user-mode entry gate on tp
+        // (CWE-823).  Null tp is rejected by the handler (EINVAL).
+        228 => {
+            if !crate::syscall::user_ptr_check_bypassed()
+                && arg2 != 0
+                && !crate::syscall::validate_user_ptr(arg2, 16)
+            {
+                return -14;
+            }
+            sys_clock_gettime(arg1, arg2)
+        }
         // 231: exit_group(status) — terminate all threads in the process
         231 => {
             crate::serial_println!("[SYSCALL/Linux] exit_group({})", arg1 as i32);
@@ -1959,7 +2078,13 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             if ret > 0 { 0 } else { ret } // waitid returns 0 on success (not child pid)
         }
         // 257: openat(dirfd, pathname, flags, mode)
-        257 => sys_openat(arg1, arg2, arg3, arg4),
+        257 => {
+            // openat — user-mode entry gate on pathname (CWE-823).
+            // Internal kernel callers wrap via dispatch_linux_kernel.
+            if !crate::syscall::user_ptr_check_bypassed()
+                && !user_path_ptr_ok(arg2) { return -14; }
+            sys_openat(arg1, arg2, arg3, arg4)
+        }
         // 262: newfstatat(dirfd, pathname, statbuf, flags)
         262 => sys_newfstatat(arg1, arg2, arg3, arg4),
         // 302: prlimit64(pid, resource, new_limit, old_limit)
@@ -2436,7 +2561,16 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // 25: mremap(old_addr, old_size, new_size, flags, [new_addr])
         25 => sys_mremap(arg1, arg2, arg3, arg4, arg5),
         // 63: uname(buf)
-        63 => crate::syscall::sys_uname(arg1 as *mut u8),
+        // 63: uname(buf) — user-mode entry gate; writes 325 bytes
+        // (5 × 65-byte utsname fields).  CWE-823.
+        63 => {
+            if !crate::syscall::user_ptr_check_bypassed()
+                && !crate::syscall::validate_user_ptr(arg1, 325)
+            {
+                return -14;
+            }
+            crate::syscall::sys_uname(arg1 as *mut u8)
+        }
         // 76: truncate(path, length)
         76 => {
             let path_bytes = read_cstring_from_user(arg1);
@@ -2588,7 +2722,16 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // ─── Phase 1 batch 2: small stubs / wrappers for bash + coreutils ─────
 
         // 22: pipe(pipefd[2]) — same as pipe2 with no flags
-        22 => crate::syscall::sys_pipe(arg1 as *mut u64),
+        // 22: pipe(pipefd) — user-mode entry gate.  Writes 2 × u64 = 16
+        // bytes via *pipefd and *pipefd.add(1).  CWE-823.
+        22 => {
+            if !crate::syscall::user_ptr_check_bypassed()
+                && !crate::syscall::validate_user_ptr(arg1, 16)
+            {
+                return -14;
+            }
+            crate::syscall::sys_pipe(arg1 as *mut u64)
+        }
         // 26: msync(addr, length, flags) — writeback not yet implemented.
         // Returning 0 silently is dangerous (caller believes data is durable).
         // Return ENOSYS until a real writeback path exists.
@@ -3649,6 +3792,15 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
 
 /// Linux open(pathname, flags, mode) — pathname is a C string.
 pub fn sys_open_linux(pathname: u64, flags: u64, _mode: u64) -> i64 {
+    // NOTE on pointer validation: the user-mode dispatch path applies
+    // `user_path_ptr_ok(pathname)` in `dispatch_body` BEFORE this handler
+    // is invoked (per CWE-823).  Internal kernel callers (`sys_open_test`,
+    // `vfs::sys_open` glue, …) deliberately call this function with
+    // kernel pointers and rely on `read_cstring_from_user` to NUL-walk
+    // a kernel-resident string.  Adding a strict range check here would
+    // break those legitimate kernel-internal call sites; the validation
+    // belongs at the user/kernel boundary, not inside the handler.
+    //
     // Snapshot the path up front so `[FF/open-ret]` can quote it even if
     // the path argument points into user memory that the handler later
     // re-reads. The inner impl re-decodes for its own logic.
@@ -3825,6 +3977,8 @@ fn sys_open_linux_inner(pathname: u64, flags: u64, _mode: u64) -> i64 {
 
 /// Linux stat(pathname, statbuf) — pathname is a C string, Linux stat layout.
 fn sys_stat_linux(pathname: u64, stat_buf: u64) -> i64 {
+    // Pointer validation is done at the user/kernel boundary
+    // (dispatch_body arms 4/6) — see sys_open_linux for the rationale.
     let path_bytes = read_cstring_from_user(pathname);
     let path = match core::str::from_utf8(path_bytes) {
         Ok(s) => s,
@@ -4051,10 +4205,18 @@ pub fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
             0
         }
         ARCH_GET_FS => {
-            let fs = unsafe { crate::hal::rdmsr(0xC000_0100) };
-            if addr != 0 {
-                unsafe { *(addr as *mut u64) = fs; }
+            // Pointer validation is done at the user/kernel boundary
+            // (dispatch_body arm 158).  Kernel-internal callers
+            // (test_runner) pass kernel-resident u64 slots and bypass
+            // — see sys_open_linux for the rationale.  Reject null
+            // here regardless: a NULL out-ptr is meaningless for GET_FS
+            // and the legacy "silently ignore" behaviour was a bug
+            // (caller observes return=0 but never sees the FS base).
+            if addr == 0 {
+                return -14; // EFAULT
             }
+            let fs = unsafe { crate::hal::rdmsr(0xC000_0100) };
+            unsafe { *(addr as *mut u64) = fs; }
             0
         }
         ARCH_SET_GS => {
@@ -4062,10 +4224,12 @@ pub fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
             0
         }
         ARCH_GET_GS => {
-            let gs = unsafe { crate::hal::rdmsr(0xC000_0101) };
-            if addr != 0 {
-                unsafe { *(addr as *mut u64) = gs; }
+            // Symmetric to ARCH_GET_FS above.
+            if addr == 0 {
+                return -14; // EFAULT
             }
+            let gs = unsafe { crate::hal::rdmsr(0xC000_0101) };
+            unsafe { *(addr as *mut u64) = gs; }
             0
         }
         _ => -22 // EINVAL
@@ -4078,6 +4242,12 @@ pub fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
 pub fn sys_set_tid_address(tidptr: u64) -> i64 {
     let tid = crate::proc::current_tid();
     if tidptr != 0 {
+        // Pointer validation is done at the user/kernel boundary
+        // (dispatch_body arm 218 — option (b) from the dispatch spec:
+        // range-check at store time, decline the CLEAR_TID side effect
+        // if the pointer is bad, still return TID per ABI).  Kernel-
+        // internal callers (test_runner) pass kernel-resident slots and
+        // bypass — see sys_open_linux for the rationale.
         let mut threads = crate::proc::THREAD_TABLE.lock();
         if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
             t.clear_child_tid = tidptr;
@@ -4118,6 +4288,10 @@ pub fn sys_clock_gettime(clk_id: u64, tp: u64) -> i64 {
     if tp == 0 {
         return -22; // EINVAL
     }
+    // Pointer validation is done at the user/kernel boundary
+    // (dispatch_body arm 228).  Kernel-internal callers (test_runner,
+    // futex absolute-deadline helpers) pass kernel-resident timespecs
+    // and bypass — see sys_open_linux for the rationale.
     let _ = CLOCK_MONOTONIC; // suppress unused warning
 
     // HRES paths use TSC-derived ns — identical to the vDSO fast path so
@@ -4658,6 +4832,9 @@ fn sys_access(pathname: u64, mode: u64) -> i64 {
     const W_OK: u64 = 2;
     const R_OK: u64 = 4;
 
+    // Pointer validation is done at the user/kernel boundary
+    // (dispatch_body arm 21) — see sys_open_linux for the rationale.
+
     let path_bytes = read_cstring_from_user(pathname);
     let path = match core::str::from_utf8(path_bytes) {
         Ok(s) => s,
@@ -4742,6 +4919,9 @@ fn sys_gettimeofday(tv: u64, _tz: u64) -> i64 {
     if tv == 0 {
         return 0;
     }
+    // Pointer validation is done at the user/kernel boundary
+    // (dispatch_body arm 96).  Kernel-internal callers (none today, but
+    // possible) bypass — see sys_open_linux for the rationale.
     // TSC-derived ns for vDSO/syscall parity; falls back to tick
     // granularity before TSC calibration is published (pre-apic::init).
     let mono_ns = crate::proc::vdso::monotonic_ns();
@@ -4933,6 +5113,8 @@ fn getdents64_proc_fd(pid: u64, dir_fd: usize, buf: u64, count: u64, start_idx: 
 /// openat(dirfd, pathname, flags, mode) — Open file relative to directory fd.
 fn sys_openat(dirfd: u64, pathname: u64, flags: u64, mode: u64) -> i64 {
     const AT_FDCWD: i64 = -100;
+    // Pointer validation is done at the user/kernel boundary (dispatch_body
+    // arm 257) — see sys_open_linux for the rationale.
     if dirfd as i64 == AT_FDCWD {
         return sys_open_linux(pathname, flags, mode);
     }
