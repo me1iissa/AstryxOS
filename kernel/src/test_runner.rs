@@ -1655,6 +1655,17 @@ pub fn run() -> ! {
         }
     }
 
+    // LLVM source-based coverage flush (test-coverage audit session 5).
+    // Dumps __llvm_prf_cnts / __llvm_prf_data / __llvm_prf_names plus the
+    // static __llvm_covmap / __llvm_covfun regions as hex `[COV-CHUNK]`
+    // serial lines, followed by `[COV-SUMMARY] {...}` and the per-PR
+    // `[COVERAGE] kernel=X% ...` summary line.  No-op on builds without
+    // the `coverage` feature (the call site is fully cfg-gated).
+    #[cfg(feature = "coverage")]
+    {
+        crate::coverage::dump_profile();
+    }
+
     if passed == total {
         test_println!("[TEST SUITE] ✓ ALL TESTS PASSED");
         #[cfg(feature = "kdb")]
