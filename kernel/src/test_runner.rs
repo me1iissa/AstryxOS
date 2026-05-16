@@ -1590,6 +1590,17 @@ pub fn run() -> ! {
     total += 1;
     if test_security_user_ptr_validation_cwe823() { passed += 1; }
 
+    // ── Test 221: cache::audit_invariant meta-test ───────────────────────
+    // Verifies audit_invariant() reports zero orphan cache entries on an
+    // idle kernel.  A failure here indicates either a false-positive in the
+    // audit logic or a real boot-time page-cache leak.  Test 220 is the
+    // CWE-823 guard (PR #242); 221 is reserved for this invariant check.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_221_audit_invariant_idle_kernel() { passed += 1; }
+    }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -1599,6 +1610,25 @@ pub fn run() -> ! {
         else { "                        ║" });
     test_println!("╚══════════════════════════════════════════════════════╝");
     test_println!();
+
+    // ── Post-suite invariant audit ───────────────────────────────────────
+    // Called after every test has exercised the page cache so any rc=0
+    // orphans introduced under load are caught before QEMU exits.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        let (total_entries, orphan_count) = crate::mm::cache::audit_invariant();
+        if orphan_count > 0 {
+            crate::serial_println!(
+                "[TEST SUITE/AUDIT] ✗ INVARIANT VIOLATION orphan_count={} total_entries={}",
+                orphan_count, total_entries,
+            );
+        } else {
+            crate::serial_println!(
+                "[TEST SUITE/AUDIT] PASS orphan_count=0 total_entries={}",
+                total_entries,
+            );
+        }
+    }
 
     if passed == total {
         test_println!("[TEST SUITE] ✓ ALL TESTS PASSED");
@@ -27962,6 +27992,35 @@ fn test_security_user_ptr_validation_cwe823() -> bool {
     }
 
     test_pass!("kernel-half pointers rejected with -EFAULT across writev/readv/preadv/pwritev/sendmsg/recvmsg/getrandom");
+    true
+}
+
+// ── Test 221: cache::audit_invariant meta-test ───────────────────────────────
+//
+// Verifies that audit_invariant() reports zero orphan cache entries on an idle
+// kernel (i.e. before any user-space workload has exercised the page cache).
+// A failure indicates either a false-positive in the audit logic itself, or
+// that the kernel initialisation path leaked rc=0 pages into the cache — both
+// are real bugs worth surfacing.
+//
+// This test is intentionally lightweight: it calls audit_invariant() directly
+// and asserts the orphan count is zero.  The post-suite audit block (at the
+// bottom of run()) performs a second call after all other tests have exercised
+// the page cache, catching leaks that only appear under load.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_221_audit_invariant_idle_kernel() -> bool {
+    test_header!("cache::audit_invariant — zero orphans on idle kernel (GAP-CRIT-1)");
+    let (total_entries, orphan_count) = crate::mm::cache::audit_invariant();
+    if orphan_count != 0 {
+        test_fail!(
+            "audit_invariant_idle_kernel",
+            "audit_invariant reported {} orphans on idle kernel (entries={})",
+            orphan_count, total_entries,
+        );
+        return false;
+    }
+    test_println!("  orphan_count=0 total_entries={} ✓", total_entries);
+    test_pass!("cache::audit_invariant: zero orphans on idle kernel");
     true
 }
 

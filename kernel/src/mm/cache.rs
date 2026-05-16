@@ -396,7 +396,7 @@ pub fn stats() -> (usize, usize) {
 /// At most 16 orphan lines are emitted per call to avoid serial flood.
 ///
 /// Returns `(total_entries, orphan_count)`.
-#[cfg(feature = "firefox-test")]
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
 pub fn audit_invariant() -> (usize, usize) {
     use crate::mm::refcount::page_ref_count;
     use core::fmt::Write as _;
