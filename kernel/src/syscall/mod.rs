@@ -3436,9 +3436,9 @@ pub use crate::subsys::linux::syscall::{
 /// guard, Drop still decrements.  Real user-mode SYSCALL traffic never
 /// passes through this counter — the asm `syscall_entry` path leaves the
 /// counter at zero, so the dispatch arms enforce validation as designed.
-pub static KERNEL_DISPATCH_BYPASS: [core::sync::atomic::AtomicU64; 8] = {
+pub static KERNEL_DISPATCH_BYPASS: [core::sync::atomic::AtomicU64; MAX_CPUS] = {
     const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-    [Z, Z, Z, Z, Z, Z, Z, Z]
+    [Z; MAX_CPUS]
 };
 
 /// Returns `true` if the current CPU is inside a `KernelDispatchGuard`
