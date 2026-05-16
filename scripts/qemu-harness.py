@@ -2527,7 +2527,8 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
     """
     if op in ("ping", "proc-list", "vfs-mounts", "trace-status",
               "bell-stats", "cache-audit", "cache-aliasing",
-              "fault-cache-keys", "tlb-stats", "w215-diag",
+              "fault-cache-keys", "w215-cache-residency",
+              "tlb-stats", "w215-diag",
               "coverage-flush"):
         return {"op": op}
     if op == "proc":
@@ -5967,7 +5968,7 @@ def main():
         "syscall-trend", "vfs-mounts",
         "dmesg", "syms", "mem", "tframe", "user-mem", "trace-status",
         "bell-stats", "cache-audit", "cache-aliasing", "fault-cache-keys",
-        "tlb-stats", "w215-diag",
+        "w215-cache-residency", "tlb-stats", "w215-diag",
         "coverage-flush",
     ])
     p_kdb.add_argument("args", nargs="*",
