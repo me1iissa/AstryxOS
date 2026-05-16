@@ -1,6 +1,8 @@
-//! W215 two-arm diagnostic instrumentation (firefox-test gated).
+//! W215 combined diagnostic instrumentation (firefox-test gated).
 //!
-//! ## Goal
+//! ## Arms
+//!
+//! ### Arm 1 + 2 (PROV + PREINS — from W215 H2 diagnostic, PR #255)
 //!
 //! Two structurally-isolated diagnostics that disambiguate the remaining
 //! candidate W215 corruption mechanisms after the dispositive soak
@@ -23,6 +25,23 @@
 //!   present in the map emits `[PREINS/INSTALL_RACE]` and increments
 //!   `INSTALL_RACE`.
 //!
+//! ### Axis B — per-writer cache-residency probes (PR #256)
+//!
+//! Diagnostic-only instrumentation: identifies which kernel writer is the
+//! W215 trigger by checking, before each candidate write, whether the
+//! destination user buffer's physical page is currently resident in the
+//! page cache.  A cache-resident frame being written through any path
+//! other than the cache's own write-back machinery is the W215 bucket-A
+//! corruption fingerprint (FAULT/PHYS classifier from PR #252).
+//!
+//! Decision matrix (see dispatch brief):
+//!   - exactly one counter ticks  → that writer is the W215 trigger
+//!   - multiple counters tick     → multi-writer class; need copy_to_user
+//!                                  helper migration
+//!   - none tick & W215 fires     → axis B is wrong; pivot to PHYS_OFF
+//!                                  kernel-internal writers (cache.rs,
+//!                                  elf.rs, vmm.rs zero-fill paths).
+//!
 //! ## Public spec citations
 //!
 //! - Intel SDM Vol. 3A §4.10.5 (paging-structure cache coherence) — the
@@ -39,7 +58,7 @@
 
 #![cfg(feature = "firefox-test")]
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 // ── Event kinds for Arm-1 provenance ring ───────────────────────────────────
 
@@ -418,7 +437,7 @@ fn op_str(o: u8) -> &'static str {
     }
 }
 
-// ── Counters readable via kdb ───────────────────────────────────────────────
+// ── Counters readable via kdb (Arm-1/2) ────────────────────────────────────
 
 static WINDOW_RACE: AtomicU64 = AtomicU64::new(0);
 static INSTALL_RACE: AtomicU64 = AtomicU64::new(0);
@@ -475,4 +494,178 @@ pub fn top_traced_physes(out: &mut [(u64, u32)]) -> usize {
         out[j] = cur;
     }
     filled
+}
+
+// ── Axis B: per-writer cache-residency counters ─────────────────────────────
+
+/// Counters — one per instrumented writer.  All `Relaxed`: read by kdb at
+/// human pace, no ordering requirement against the corruption itself.
+pub static DEVZERO_OVER_CACHE:    AtomicU64 = AtomicU64::new(0);
+pub static STATX_OVER_CACHE:      AtomicU64 = AtomicU64::new(0);
+pub static GETRANDOM_OVER_CACHE:  AtomicU64 = AtomicU64::new(0);
+pub static GETRUSAGE_OVER_CACHE:  AtomicU64 = AtomicU64::new(0);
+pub static SYSINFO_OVER_CACHE:    AtomicU64 = AtomicU64::new(0);
+pub static TIMES_OVER_CACHE:      AtomicU64 = AtomicU64::new(0);
+pub static MEMSET_OVER_CACHE:     AtomicU64 = AtomicU64::new(0);
+pub static PREADV120_OVER_CACHE:  AtomicU64 = AtomicU64::new(0);
+pub static CLEARTID_OVER_CACHE:   AtomicU64 = AtomicU64::new(0);
+pub static SIGFRAME_OVER_CACHE:   AtomicU64 = AtomicU64::new(0);
+
+/// One "first-hit serial line emitted" flag per writer, to avoid drowning
+/// the serial log when a single corrupting path fires thousands of times.
+/// The counters still tick on every hit; only the structured serial line is
+/// rate-limited to one per writer per boot.
+static FIRST_LINE_DEVZERO:   AtomicBool = AtomicBool::new(false);
+static FIRST_LINE_STATX:     AtomicBool = AtomicBool::new(false);
+static FIRST_LINE_GETRANDOM: AtomicBool = AtomicBool::new(false);
+static FIRST_LINE_GETRUSAGE: AtomicBool = AtomicBool::new(false);
+static FIRST_LINE_SYSINFO:   AtomicBool = AtomicBool::new(false);
+static FIRST_LINE_TIMES:     AtomicBool = AtomicBool::new(false);
+static FIRST_LINE_MEMSET:    AtomicBool = AtomicBool::new(false);
+static FIRST_LINE_PREADV120: AtomicBool = AtomicBool::new(false);
+static FIRST_LINE_CLEARTID:  AtomicBool = AtomicBool::new(false);
+static FIRST_LINE_SIGFRAME:  AtomicBool = AtomicBool::new(false);
+
+/// Identifies one of the ten instrumented writers.  The name is embedded
+/// in the structured serial line so a downstream parser can attribute each
+/// `[H_W/<name>]` event back to its source-of-truth callsite.
+#[derive(Copy, Clone)]
+pub enum Writer {
+    DevZero,
+    Statx,
+    Getrandom,
+    Getrusage,
+    Sysinfo,
+    Times,
+    Memset,
+    Preadv120,
+    ClearTid,
+    Sigframe,
+}
+
+impl Writer {
+    fn name(self) -> &'static str {
+        match self {
+            Writer::DevZero   => "dev-zero",
+            Writer::Statx     => "statx",
+            Writer::Getrandom => "getrandom",
+            Writer::Getrusage => "getrusage",
+            Writer::Sysinfo   => "sysinfo",
+            Writer::Times     => "times",
+            Writer::Memset    => "memset",
+            Writer::Preadv120 => "preadv120",
+            Writer::ClearTid  => "clear-tid",
+            Writer::Sigframe  => "sigframe",
+        }
+    }
+
+    fn counter(self) -> &'static AtomicU64 {
+        match self {
+            Writer::DevZero   => &DEVZERO_OVER_CACHE,
+            Writer::Statx     => &STATX_OVER_CACHE,
+            Writer::Getrandom => &GETRANDOM_OVER_CACHE,
+            Writer::Getrusage => &GETRUSAGE_OVER_CACHE,
+            Writer::Sysinfo   => &SYSINFO_OVER_CACHE,
+            Writer::Times     => &TIMES_OVER_CACHE,
+            Writer::Memset    => &MEMSET_OVER_CACHE,
+            Writer::Preadv120 => &PREADV120_OVER_CACHE,
+            Writer::ClearTid  => &CLEARTID_OVER_CACHE,
+            Writer::Sigframe  => &SIGFRAME_OVER_CACHE,
+        }
+    }
+
+    fn first_line(self) -> &'static AtomicBool {
+        match self {
+            Writer::DevZero   => &FIRST_LINE_DEVZERO,
+            Writer::Statx     => &FIRST_LINE_STATX,
+            Writer::Getrandom => &FIRST_LINE_GETRANDOM,
+            Writer::Getrusage => &FIRST_LINE_GETRUSAGE,
+            Writer::Sysinfo   => &FIRST_LINE_SYSINFO,
+            Writer::Times     => &FIRST_LINE_TIMES,
+            Writer::Memset    => &FIRST_LINE_MEMSET,
+            Writer::Preadv120 => &FIRST_LINE_PREADV120,
+            Writer::ClearTid  => &FIRST_LINE_CLEARTID,
+            Writer::Sigframe  => &FIRST_LINE_SIGFRAME,
+        }
+    }
+}
+
+/// Resolve `buf` through the current CR3 to a physical page and ask the
+/// cache whether that frame is currently resident.  Returns the first
+/// (vaddr, phys, cache_key) tuple where the cache says "yes".
+///
+/// `len == 0` is treated as `len == 1` so a zero-length buffer is still
+/// page-checked at `buf`.
+///
+/// Walks 4 KiB pages over `[buf, buf+len)` using the current process's
+/// CR3.  Caller is responsible for the buffer being in user space; this
+/// function only translates and looks up, it does not deref the buffer.
+fn check_user_buf_over_cache(
+    buf: *const u8,
+    len: usize,
+) -> Option<(u64, u64, (usize, u64, u64))> {
+    if buf.is_null() { return None; }
+    let len = if len == 0 { 1 } else { len };
+    let start = buf as u64;
+    let end   = start.checked_add(len as u64)?;
+    let first_page = start & !0xFFFu64;
+    let last_page  = (end - 1) & !0xFFFu64;
+
+    // Use the current CR3 — the writer is in syscall context, so the
+    // active CR3 is the calling process's PML4.
+    let cr3 = crate::mm::vmm::get_cr3();
+
+    let mut va = first_page;
+    loop {
+        if let Some(phys_with_offset) = crate::mm::vmm::virt_to_phys_in(cr3, va) {
+            let phys = phys_with_offset & !0xFFFu64;
+            if let Some(key) = crate::mm::cache::is_phys_in_cache(phys) {
+                return Some((va, phys, key));
+            }
+        }
+        if va == last_page { break; }
+        va += 0x1000;
+    }
+    None
+}
+
+/// Probe `[buf, buf+len)`; if any page maps to a cache-resident phys
+/// frame, bump the per-writer counter and (on the first hit per writer)
+/// emit a structured `[H_W/<name>]` serial line.
+///
+/// Observation-only: returns no value, does not alter the write.
+///
+/// ISR-safe: uses the PAGE_CACHE Mutex (spin, no sleep) and a CR3 read
+/// (asm).  Safe to call from syscall, exit-thread, and signal-delivery
+/// contexts.
+#[inline]
+pub fn probe(writer: Writer, buf: *const u8, len: usize) {
+    if let Some((vaddr, phys, (mount, inode, offset))) =
+        check_user_buf_over_cache(buf, len)
+    {
+        writer.counter().fetch_add(1, Ordering::Relaxed);
+        if !writer.first_line().swap(true, Ordering::Relaxed) {
+            let pid = crate::proc::current_pid_lockless();
+            crate::serial_println!(
+                "[H_W/{}] pid={} vaddr={:#x} phys={:#x} key=({},{:#x},{:#x})",
+                writer.name(), pid, vaddr, phys, mount, inode, offset,
+            );
+        }
+    }
+}
+
+/// Read all ten counters; used by the `kdb w215-cache-residency` op.
+pub fn counts() -> [(&'static str, u64); 10] {
+    [
+        ("dev-zero",  DEVZERO_OVER_CACHE.load(Ordering::Relaxed)),
+        ("statx",     STATX_OVER_CACHE.load(Ordering::Relaxed)),
+        ("getrandom", GETRANDOM_OVER_CACHE.load(Ordering::Relaxed)),
+        ("getrusage", GETRUSAGE_OVER_CACHE.load(Ordering::Relaxed)),
+        ("sysinfo",   SYSINFO_OVER_CACHE.load(Ordering::Relaxed)),
+        ("times",     TIMES_OVER_CACHE.load(Ordering::Relaxed)),
+        ("memset",    MEMSET_OVER_CACHE.load(Ordering::Relaxed)),
+        ("preadv120", PREADV120_OVER_CACHE.load(Ordering::Relaxed)),
+        ("clear-tid", CLEARTID_OVER_CACHE.load(Ordering::Relaxed)),
+        ("sigframe",  SIGFRAME_OVER_CACHE.load(Ordering::Relaxed)),
+    ]
 }

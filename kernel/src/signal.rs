@@ -651,6 +651,16 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
             let ucontext_ptr   = (new_rsp + sigframe_size) as *mut UContext;
             let siginfo_ptr    = (new_rsp + sigframe_size + UCONTEXT_SIZE) as *mut u8;
 
+            // W215 axis-B probe: signal-frame delivery into a user stack
+            // that happens to back onto a cache-resident frame (e.g. a
+            // libxul mmap aliasing the worker thread's signal stack).
+            #[cfg(feature = "firefox-test")]
+            crate::mm::w215_diag::probe(
+                crate::mm::w215_diag::Writer::Sigframe,
+                new_rsp as *const u8,
+                total as usize,
+            );
+
             // Write the signal frame to user memory.
             unsafe {
                 (*sig_frame_ptr).restorer   = restorer_addr;
@@ -903,6 +913,16 @@ pub unsafe fn deliver_sigsegv_from_isr(
     let isr_r13 = *((frame_u64 - 112) as *const u64);
     let isr_r14 = *((frame_u64 - 120) as *const u64);
     let isr_r15 = *((frame_u64 - 128) as *const u64);
+
+    // W215 axis-B probe: SIGSEGV synth-frame delivery into a user stack
+    // backed by a cache-resident frame.  Same Writer::Sigframe counter as
+    // the regular delivery path; the per-writer first-line gate de-dupes.
+    #[cfg(feature = "firefox-test")]
+    crate::mm::w215_diag::probe(
+        crate::mm::w215_diag::Writer::Sigframe,
+        new_rsp as *const u8,
+        total as usize,
+    );
 
     // ── Write SignalFrame ─────────────────────────────────────────────────────
     (*sig_frame_ptr).restorer    = restorer_addr;

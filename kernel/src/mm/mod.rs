@@ -11,7 +11,6 @@ pub mod refcount;
 pub mod tlb;
 pub mod vma;
 pub mod vmm;
-
 #[cfg(feature = "firefox-test")]
 pub mod w215_diag;
 

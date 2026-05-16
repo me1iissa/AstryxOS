@@ -281,6 +281,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "cache-audit"      => op_cache_audit(out),
         "cache-aliasing"   => op_cache_aliasing(out),
         "fault-cache-keys" => op_fault_cache_keys(out),
+        "w215-cache-residency" => op_w215_cache_residency(out),
         "tlb-stats"        => op_tlb_stats(out),
         "w215-diag"        => op_w215_diag(out),
         "coverage-flush" => op_coverage_flush(out),
@@ -852,6 +853,42 @@ fn op_fault_cache_keys(out: &mut String) {
     #[cfg(not(feature = "firefox-test"))]
     {
         out.push_str(r#"{"error":"fault-cache-keys requires firefox-test feature"}"#);
+    }
+}
+
+// ── w215-cache-residency ────────────────────────────────────────────────────
+//
+// W215 axis-B per-writer cache-residency probe readout.  Each counter
+// represents one instrumented kernel writer; the value is the number of
+// times that writer attempted to write into a user buffer whose backing
+// physical frame was at that moment resident in the page cache (i.e. a
+// W215 bucket-A in-place corruption opportunity, per Intel SDM Vol. 3A
+// §4.10.5 page-content coherence semantics).
+//
+// Decision matrix:
+//   - exactly one counter > 0  → that writer is the W215 trigger
+//   - multiple counters > 0    → multi-writer class; need copy_to_user
+//   - all counters = 0         → axis B is wrong; pivot to PHYS_OFF
+//                                kernel-internal writers
+//
+// The first hit per writer also emits a `[H_W/<name>]` serial line with
+// pid/vaddr/phys/key for provenance.  Requires --features firefox-test.
+
+fn op_w215_cache_residency(out: &mut String) {
+    #[cfg(feature = "firefox-test")]
+    {
+        use core::fmt::Write;
+        out.push('{');
+        let counts = crate::mm::w215_diag::counts();
+        for (i, (name, val)) in counts.iter().enumerate() {
+            if i > 0 { out.push(','); }
+            let _ = write!(out, r#""{name}":{val}"#);
+        }
+        out.push('}');
+    }
+    #[cfg(not(feature = "firefox-test"))]
+    {
+        out.push_str(r#"{"error":"w215-cache-residency requires firefox-test feature"}"#);
     }
 }
 
