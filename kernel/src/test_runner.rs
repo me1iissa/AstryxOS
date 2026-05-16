@@ -1626,6 +1626,37 @@ pub fn run() -> ! {
         if test_223_sigreturn_rflags_sanitiser() { passed += 1; }
     }
 
+    // ── Test 224: PMM alloc/free round-trip property test (session 6) ────
+    // PROP-1: 200 random single/multi-page alloc+free cycles; verifies the
+    // USED_PAGES counter returns to its pre-allocation value after each
+    // round-trip.  Closes the "0 property-based tests" gap (GAP-G5) from
+    // the 2026-05-16 test coverage audit.
+    #[cfg(feature = "test-mode")]
+    {
+        total += 1;
+        if test_224_prop_pmm_alloc_free_roundtrip() { passed += 1; }
+    }
+
+    // ── Test 225: page_ref_count monotonicity property test (session 6) ──
+    // PROP-2: 500 random inc/dec sequences on freshly allocated frames;
+    // asserts the observed refcount always equals the expected mathematical
+    // sum.  Exercises mm::refcount atomicity and the W216 H1 invariant.
+    #[cfg(feature = "test-mode")]
+    {
+        total += 1;
+        if test_225_prop_refcount_monotonicity() { passed += 1; }
+    }
+
+    // ── Test 226: cache insert/lookup_and_acquire round-trip (session 6) ─
+    // PROP-3: 300 random insert→lookup_and_acquire→evict→free cycles; verifies
+    // refcount discipline across the cache lifecycle.  Directly targets the
+    // H3-class invariant from the W215 aliasing saga.
+    #[cfg(feature = "test-mode")]
+    {
+        total += 1;
+        if test_226_prop_cache_insert_lookup_roundtrip() { passed += 1; }
+    }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -28463,4 +28494,302 @@ fn run_bugcheck_self_test() -> ! {
     test_println!("[BUGCHECK-SELFTEST] FATAL: write_volatile to bad address returned");
     unsafe { crate::hal::outl(QEMU_EXIT_PORT, EXIT_FAILURE); }
     loop { unsafe { core::arch::asm!("cli; hlt"); } }
+}
+
+// ── Test 224: PMM alloc/free round-trip property test (GAP-G5 / session 6) ──
+//
+// Closes the "0 property-based tests" gap identified by the 2026-05-16 test
+// coverage audit (Phase 1.1, GAP-G5).  For each of 200 randomly-drawn page
+// counts (1–4 pages), the test allocates, writes a recognisable pattern, frees,
+// and verifies that the PMM free-page counter returns to its pre-allocation
+// value.  This exercises the PMM alloc/free round-trip and catches any leak in
+// the bookkeeping path (USED_PAGES counter drift, bitmap double-free, etc.).
+//
+// Uses the bespoke `prop_test::run_prop_test` framework (kernel/src/prop_test.rs)
+// rather than an external proptest crate, which would require no-std adaptation.
+// The PRNG seed is logged via `[PROP-SEED]` so any failure is exactly
+// reproducible.
+#[cfg(feature = "test-mode")]
+fn test_224_prop_pmm_alloc_free_roundtrip() -> bool {
+    test_header!("PROP-1: PMM alloc/free round-trip property test (200 iterations)");
+
+    // Physical-to-virtual offset: the kernel's direct 1:1 higher-half map.
+    // Physical address P is accessible at KERNEL_VIRT_BASE + P as a kernel ptr.
+    const PHYS_OFFSET: u64 = astryx_shared::KERNEL_VIRT_BASE;
+
+    let ok = crate::prop_test::run_prop_test(
+        "pmm_alloc_free_roundtrip",
+        200,
+        |rng| {
+            // Draw a random page count in [1, 4].
+            let count = (rng.gen_range_usize(4) + 1).min(4);
+
+            let (_, used_before) = crate::mm::pmm::stats();
+
+            // Allocate `count` contiguous pages.
+            let phys = crate::mm::pmm::alloc_pages(count)
+                .ok_or_else(|| alloc::format!("alloc_pages({}) returned None", count))?;
+
+            // Verify alignment.
+            if phys % 4096 != 0 {
+                return Err(alloc::format!(
+                    "alloc_pages({}) returned unaligned phys={:#x}", count, phys
+                ));
+            }
+
+            // Write a recognisable sentinel pattern to the first 8 bytes of
+            // each allocated page via the direct physical map.
+            // SAFETY: phys is a valid PMM frame we just allocated; the kernel
+            // direct map covers all physical RAM up to 4 GiB; the write is
+            // 8-byte aligned.
+            let pattern: u64 = 0xA5A5_DEAD_BEEF_5A5A;
+            for page_i in 0..count {
+                let page_virt = PHYS_OFFSET + phys + (page_i as u64 * 4096);
+                unsafe {
+                    core::ptr::write_volatile(page_virt as *mut u64, pattern);
+                }
+            }
+
+            // Free the pages one at a time (PMM exposes single-page free).
+            for page_i in 0..count {
+                crate::mm::pmm::free_page(phys + (page_i as u64 * 4096));
+            }
+
+            // Verify used page count returned to the pre-allocation value.
+            let (_, used_after) = crate::mm::pmm::stats();
+            if used_after != used_before {
+                return Err(alloc::format!(
+                    "used_pages mismatch: before={} after={} (count={})",
+                    used_before, used_after, count,
+                ));
+            }
+
+            Ok(())
+        },
+    );
+
+    ok
+}
+
+// ── Test 225: page_ref_count monotonicity property test (session 6) ──────────
+//
+// For each of 500 iterations, allocates a physical frame, performs a random
+// sequence of reference-count increments and decrements (tracking the expected
+// value in a local counter), and asserts that the kernel's reference-count
+// table always matches the expected value exactly.  This exercises the
+// atomicity and correctness of `page_ref_inc` / `page_ref_dec` / `page_ref_count`
+// from `mm::refcount`, which are the invariants that the W216 aliasing saga
+// relied on.
+//
+// Property tested: "for any sequence of ref_inc/ref_dec calls on a freshly
+// allocated frame, the observed reference count equals the mathematical sum of
+// +1 and −1 operations applied in order, with no underflow below zero."
+#[cfg(feature = "test-mode")]
+fn test_225_prop_refcount_monotonicity() -> bool {
+    test_header!("PROP-2: page_ref_count monotonicity property test (500 iterations)");
+
+    let ok = crate::prop_test::run_prop_test(
+        "refcount_monotonicity",
+        500,
+        |rng| {
+            // Allocate a fresh physical frame to use as a refcount test subject.
+            let phys = crate::mm::pmm::alloc_page()
+                .ok_or_else(|| alloc::string::String::from("alloc_page() returned None"))?;
+
+            // At allocation, the refcount starts at 0 (PMM does not bump it).
+            let initial_rc = crate::mm::refcount::page_ref_count(phys);
+            if initial_rc != 0 {
+                // Free and bail — this indicates a PMM/refcount invariant bug
+                // that is separately covered by test_224 and the post-suite audit.
+                crate::mm::pmm::free_page(phys);
+                return Err(alloc::format!(
+                    "fresh frame phys={:#x} has nonzero rc={} at allocation",
+                    phys, initial_rc,
+                ));
+            }
+
+            // Draw N in [1, 8]: the number of increments to apply first.
+            let n_inc = rng.gen_range_usize(8) + 1;
+            // Draw M in [0, n_inc]: the number of decrements to apply after.
+            // We keep M ≤ n_inc so the refcount never underflows.
+            let n_dec = rng.gen_range_usize(n_inc + 1);
+
+            // Apply increments.
+            for _ in 0..n_inc {
+                crate::mm::refcount::page_ref_inc(phys);
+            }
+            let expected_after_inc = n_inc as u16;
+            let observed_after_inc = crate::mm::refcount::page_ref_count(phys);
+            if observed_after_inc != expected_after_inc {
+                // Restore state before returning error.
+                for _ in 0..n_inc {
+                    let _ = crate::mm::refcount::page_ref_dec(phys);
+                }
+                crate::mm::pmm::free_page(phys);
+                return Err(alloc::format!(
+                    "after {} inc: expected rc={} got rc={}",
+                    n_inc, expected_after_inc, observed_after_inc,
+                ));
+            }
+
+            // Apply decrements.
+            for _ in 0..n_dec {
+                let _ = crate::mm::refcount::page_ref_dec(phys);
+            }
+            let expected_final = (n_inc - n_dec) as u16;
+            let observed_final = crate::mm::refcount::page_ref_count(phys);
+            if observed_final != expected_final {
+                // Restore state before returning error.
+                let remaining = crate::mm::refcount::page_ref_count(phys);
+                for _ in 0..remaining {
+                    let _ = crate::mm::refcount::page_ref_dec(phys);
+                }
+                crate::mm::pmm::free_page(phys);
+                return Err(alloc::format!(
+                    "after {} inc, {} dec: expected rc={} got rc={}",
+                    n_inc, n_dec, expected_final, observed_final,
+                ));
+            }
+
+            // Bring refcount to 0 so the frame can be freed cleanly.
+            let remaining = crate::mm::refcount::page_ref_count(phys);
+            for _ in 0..remaining {
+                let _ = crate::mm::refcount::page_ref_dec(phys);
+            }
+            crate::mm::pmm::free_page(phys);
+            Ok(())
+        },
+    );
+
+    ok
+}
+
+// ── Test 226: cache insert/lookup_and_acquire round-trip property test ────────
+//
+// For each of 300 iterations, allocates a physical frame, inserts it into the
+// page cache under a synthetic key (mount=99, inode=random, offset=0), verifies
+// the refcount reflects the cache's own reference, retrieves it via
+// `lookup_and_acquire` (verifying the guard-ref bumps the count), releases the
+// guard ref, evicts the entry, and frees the frame.  Also verifies that
+// `lookup_and_acquire` returns `None` after eviction.
+//
+// This property directly targets the H3-class invariant from the W215 aliasing
+// saga: "a cache entry's physical frame must remain live (refcount ≥ 1) for as
+// long as the cache holds it, and must be releasable to the PMM exactly once
+// after eviction."
+//
+// Uses mount_idx=99 / inode drawn from the RNG to avoid colliding with any
+// real filesystem entries in the cache (FAT32 mounts use indices 0..4).
+#[cfg(feature = "test-mode")]
+fn test_226_prop_cache_insert_lookup_roundtrip() -> bool {
+    test_header!("PROP-3: cache insert/lookup_and_acquire round-trip property test (300 iterations)");
+
+    // Synthetic mount index unlikely to collide with real mounts (0..4 used by FAT32).
+    const TEST_MOUNT_IDX: usize = 99;
+
+    let ok = crate::prop_test::run_prop_test(
+        "cache_insert_lookup_roundtrip",
+        300,
+        |rng| {
+            // Use a random inode and offset so entries don't collide between iterations.
+            let inode: u64 = rng.next_u64() | 0x8000_0000_0000_0000; // high bit set — no real FS uses these
+            let page_off: u64 = 0;
+
+            // Allocate a physical frame for this cache entry.
+            let phys = crate::mm::pmm::alloc_page()
+                .ok_or_else(|| alloc::string::String::from("alloc_page() returned None"))?;
+
+            // Verify the frame starts with rc=0.
+            let rc0 = crate::mm::refcount::page_ref_count(phys);
+            if rc0 != 0 {
+                crate::mm::pmm::free_page(phys);
+                return Err(alloc::format!(
+                    "fresh frame phys={:#x} has rc={} before insert", phys, rc0
+                ));
+            }
+
+            // Insert into the page cache.  cache::insert calls page_ref_inc
+            // so rc should become 1 after this.
+            crate::mm::cache::insert(TEST_MOUNT_IDX, inode, page_off, phys);
+            let rc_after_insert = crate::mm::refcount::page_ref_count(phys);
+            if rc_after_insert != 1 {
+                // Evict to clean up, then error.
+                let _ = crate::mm::cache::evict(TEST_MOUNT_IDX, inode, page_off);
+                crate::mm::pmm::free_page(phys);
+                return Err(alloc::format!(
+                    "after insert: expected rc=1 got rc={}", rc_after_insert
+                ));
+            }
+
+            // lookup_and_acquire should return the same phys and bump rc to 2.
+            let found = crate::mm::cache::lookup_and_acquire(TEST_MOUNT_IDX, inode, page_off)
+                .ok_or_else(|| alloc::string::String::from("lookup_and_acquire returned None after insert"))?;
+            if found != phys {
+                // Release guard and clean up.
+                let _ = crate::mm::refcount::page_ref_dec(found);
+                let _ = crate::mm::cache::evict(TEST_MOUNT_IDX, inode, page_off);
+                crate::mm::pmm::free_page(phys);
+                return Err(alloc::format!(
+                    "lookup_and_acquire returned phys={:#x} expected={:#x}", found, phys
+                ));
+            }
+            let rc_with_guard = crate::mm::refcount::page_ref_count(phys);
+            if rc_with_guard != 2 {
+                let _ = crate::mm::refcount::page_ref_dec(phys); // release guard
+                let _ = crate::mm::cache::evict(TEST_MOUNT_IDX, inode, page_off);
+                crate::mm::pmm::free_page(phys);
+                return Err(alloc::format!(
+                    "after lookup_and_acquire: expected rc=2 got rc={}", rc_with_guard
+                ));
+            }
+
+            // Release the guard ref (simulating: caller aborted before PTE install).
+            // rc drops from 2 back to 1 (cache still holds its reference).
+            let _ = crate::mm::refcount::page_ref_dec(phys);
+            let rc_after_guard_drop = crate::mm::refcount::page_ref_count(phys);
+            if rc_after_guard_drop != 1 {
+                let _ = crate::mm::cache::evict(TEST_MOUNT_IDX, inode, page_off);
+                crate::mm::pmm::free_page(phys);
+                return Err(alloc::format!(
+                    "after guard drop: expected rc=1 got rc={}", rc_after_guard_drop
+                ));
+            }
+
+            // Evict the entry.  cache::evict calls page_ref_dec, rc → 0.
+            // The evicted phys is returned but NOT freed by evict — caller owns it.
+            let evicted = crate::mm::cache::evict(TEST_MOUNT_IDX, inode, page_off);
+            if evicted != Some(phys) {
+                // Free whatever we can and bail.
+                if let Some(e) = evicted { crate::mm::pmm::free_page(e); }
+                return Err(alloc::format!(
+                    "evict returned {:?} expected Some({:#x})", evicted, phys
+                ));
+            }
+
+            // After eviction, rc should be 0.
+            let rc_after_evict = crate::mm::refcount::page_ref_count(phys);
+            if rc_after_evict != 0 {
+                crate::mm::pmm::free_page(phys);
+                return Err(alloc::format!(
+                    "after evict: expected rc=0 got rc={}", rc_after_evict
+                ));
+            }
+
+            // Verify lookup returns None after eviction.
+            let after_evict = crate::mm::cache::lookup(TEST_MOUNT_IDX, inode, page_off);
+            if after_evict.is_some() {
+                crate::mm::pmm::free_page(phys);
+                return Err(alloc::format!(
+                    "lookup after evict returned Some({:#x}) — entry not removed",
+                    after_evict.unwrap()
+                ));
+            }
+
+            // Return the physical frame to PMM.
+            crate::mm::pmm::free_page(phys);
+            Ok(())
+        },
+    );
+
+    ok
 }
