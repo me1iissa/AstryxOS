@@ -1657,6 +1657,15 @@ pub fn run() -> ! {
         if test_226_prop_cache_insert_lookup_roundtrip() { passed += 1; }
     }
 
+    // ── Test 227: sigreturn frame_base user-pointer validation (H3 follow-up)
+    // Verifies that validate_user_ptr rejects kernel-VA addresses for the
+    // SignalFrame size, closing the H3 finding from docs/SECURITY_AUDIT_2026-05-16.md.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_227_sigreturn_frame_base_ptr_validation() { passed += 1; }
+    }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -28827,4 +28836,70 @@ fn test_226_prop_cache_insert_lookup_roundtrip() -> bool {
     );
 
     ok
+}
+
+// ── Test 227: sigreturn frame_base user-pointer validation (H3) ──────────────
+//
+// Finding H3 from docs/SECURITY_AUDIT_2026-05-16.md: sys_sigreturn read the
+// signal frame without first verifying that frame_base lies in user space.
+// A crafted frame_base pointing into kernel VA would allow ring-3 to trigger
+// kernel memory reads from user context.
+//
+// The fix (PR #243 follow-up to PR #242) adds a validate_user_ptr check on
+// frame_base before any SignalFrame field access.  This test verifies that
+// validate_user_ptr correctly rejects kernel-VA addresses for the full
+// SignalFrame size, and accepts a representative user-space address.
+//
+// Per POSIX.1-2017 §14.4 sigaction: signal frames are allocated on the
+// user-mode signal stack; a kernel-VA pointer is unconditionally invalid.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_227_sigreturn_frame_base_ptr_validation() -> bool {
+    test_header!("sigreturn frame_base user-pointer validation — kernel-VA rejected (H3)");
+
+    let frame_size = core::mem::size_of::<crate::signal::SignalFrame>();
+
+    // Kernel-VA addresses that must be rejected (frame_base in kernel space
+    // would let ring-3 read kernel memory on sigreturn).
+    let kernel_va_cases: &[u64] = &[
+        astryx_shared::KERNEL_VIRT_BASE,                  // exact base
+        astryx_shared::KERNEL_VIRT_BASE + 0x100_0000,     // kernel text
+        0xFFFF_FFFF_FFFF_FF00,                             // near top
+        0xFFFF_8000_0080_0000,                             // kernel heap VA
+    ];
+    // A representative user-space address that must be accepted.
+    let user_va_ok: u64 = 0x0000_7FFF_FFFF_0000u64
+        .wrapping_sub(frame_size as u64);  // top of user stack region
+
+    let mut failed: u32 = 0;
+
+    for &kva in kernel_va_cases {
+        let ok = crate::syscall::validate_user_ptr(kva, frame_size);
+        crate::serial_println!(
+            "[TEST/SIGRET-H3] kernel_va={:#x} size={} validate={}  {}",
+            kva, frame_size, ok,
+            if !ok { "OK (rejected)" } else { "FAIL (accepted!)" }
+        );
+        if ok {
+            failed += 1; // must NOT accept a kernel VA
+        }
+    }
+
+    // User-space base must be accepted (non-null, within range, no overflow).
+    let accepted = crate::syscall::validate_user_ptr(user_va_ok, frame_size);
+    crate::serial_println!(
+        "[TEST/SIGRET-H3] user_va={:#x} size={} validate={}  {}",
+        user_va_ok, frame_size, accepted,
+        if accepted { "OK (accepted)" } else { "FAIL (rejected!)" }
+    );
+    if !accepted {
+        failed += 1;
+    }
+
+    if failed > 0 {
+        test_fail!("sigreturn_frame_base_ptr_validation",
+            "{} case(s) had wrong validate_user_ptr result", failed);
+        return false;
+    }
+    test_pass!("validate_user_ptr rejects kernel-VA frame_base for SignalFrame size");
+    true
 }
