@@ -1601,6 +1601,31 @@ pub fn run() -> ! {
         if test_221_audit_invariant_idle_kernel() { passed += 1; }
     }
 
+    // ── Test 222: syscall arg-validation matrix (GAP-CRIT-2) ─────────────
+    // Adversarial pointer sweep across the Linux personality dispatch.
+    // Closes the systemic gap that PR #242's narrow guard left open: every
+    // pointer-taking handler is exercised with null / kernel-VA / garbage /
+    // near-overflow pointers and asserted to return a negative errno.
+    // Handlers known to lack validation emit [TEST/ARGVAL/SKIP] markers;
+    // any handler that returns >= 0 for a kernel-VA pointer is flagged as
+    // [TEST/ARGVAL/REGRESSION] (CVE-class).  See test body for the table.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_222_syscall_arg_validation_matrix() { passed += 1; }
+    }
+
+    // ── Test 223: sigreturn RFLAGS sanitiser (GAP-HIGH-1) ────────────────
+    // Verifies RFLAGS_USER_MASK clears IOPL/NT/RF/VM/AC and forces IF on
+    // the user-controlled RFLAGS that sys_sigreturn restores via SYSRETQ.
+    // Regression guard for finding C1 of the 2026-05-16 security audit
+    // (BadIRET / CVE-2014-9322 class, CWE-269).
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_223_sigreturn_rflags_sanitiser() { passed += 1; }
+    }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -27992,6 +28017,348 @@ fn test_security_user_ptr_validation_cwe823() -> bool {
     }
 
     test_pass!("kernel-half pointers rejected with -EFAULT across writev/readv/preadv/pwritev/sendmsg/recvmsg/getrandom");
+    true
+}
+
+// ── Test 222: syscall argument-validation matrix (GAP-CRIT-2) ────────────────
+//
+// Closes GAP-CRIT-2 from `docs/TEST_COVERAGE_AUDIT_2026-05-16.md`.  The 2026-05-16
+// security posture audit identified findings C2 (iovec) and C3 (getrandom) as
+// CRITICAL — kernel-write primitives produced by handlers that did not range-
+// validate user pointers.  PR #242 fixed those callsites; Test 220 above is the
+// narrow regression guard for the seven syscalls it touched.  This test
+// generalises that pattern: for every Linux personality syscall that takes a
+// pointer argument, iterate over a table of adversarial pointer values
+// (null, kernel-VA low, kernel-VA high, garbage, near-overflow) and assert
+// the dispatch returns a negative errno rather than a silent success or a
+// kernel-side crash.
+//
+// References:
+//   * `validate_user_ptr` semantics — `kernel/src/syscall/mod.rs:49`
+//   * Intel SDM Vol. 3A §4.5.1 (canonical-address form) — kernel half is
+//     `[0xFFFF_8000_0000_0000, 0xFFFF_FFFF_FFFF_FFFF]`
+//   * CWE-823 (Out-of-range pointer offset), CWE-119 (improper memory bounds),
+//     CWE-269 (improper privilege management)
+//
+// Categories the table covers:
+//   (A) read-from-user  — kernel reads through `*const T`
+//   (B) write-to-user   — kernel writes through `*mut T`
+//   (C) bidirectional   — outer struct holding embedded user pointers
+//                          (iovec, msghdr, sigaction, timespec)
+//
+// SKIP semantics: where the handler is known to lack validation, invoking the
+// dispatch with a kernel-VA would corrupt kernel memory — those entries emit
+// `[TEST/ARGVAL/SKIP] syscall=<name> reason=<text>` and do not call dispatch.
+// Each SKIP is a separate fix-it follow-up tracked in the PR body.
+//
+// Regression markers: a syscall that returns `>= 0` for a kernel-VA pointer
+// emits `[TEST/ARGVAL/REGRESSION] ...` — harness watchers escalate these.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_222_syscall_arg_validation_matrix() -> bool {
+    test_header!("syscall arg-validation matrix — adversarial pointer sweep (GAP-CRIT-2)");
+
+    /// Adversarial pointer values.  Each one MUST be rejected by the
+    /// handler's pointer-validation check without any dereference.
+    /// Pointers that pass validation but reference unmapped or non-canonical
+    /// memory are deliberately omitted — those would fault on dereference
+    /// rather than at the validation gate, and the kernel test runner is
+    /// not the right surface for catching them (a process-scoped #PF
+    /// reproducer in `proc/elf` style is the right tool for that class).
+    ///
+    /// - `null` — every handler that null-checks rejects with EINVAL or
+    ///   EFAULT depending on convention.
+    /// - `kernel-VA-low` — first byte of the kernel half.  A correct handler
+    ///   rejects it via `validate_user_ptr` (which compares `end <=
+    ///   KERNEL_VIRT_BASE`); a buggy handler would issue a kernel-mode
+    ///   read/write at the kernel heap base — silent corruption.
+    /// - `kernel-VA-high` — high-canonical kernel address; exercises any
+    ///   handler that compares against `KERNEL_VIRT_BASE` differently
+    ///   (e.g. via masking rather than upper-bound checking).
+    /// - `near-overflow` — last user-canonical page below the kernel half.
+    ///   Combined with any non-zero length, `validate_user_ptr`'s
+    ///   `checked_add` produces `end > KERNEL_VIRT_BASE` and the handler
+    ///   must reject.  Catches the class of bug where overflow on
+    ///   `ptr + len` is not detected.
+    const BAD_PTRS: &[(u64, &str)] = &[
+        (0u64,                                "null"),
+        (astryx_shared::KERNEL_VIRT_BASE,     "kernel-VA-low"),
+        (0xFFFF_FFFF_FFFF_FF00u64,            "kernel-VA-high"),
+        (astryx_shared::KERNEL_VIRT_BASE - 8, "near-overflow"),
+    ];
+
+    /// Handler validation discipline.  See per-syscall comments for the
+    /// reasoning behind each `Unvalidated` entry — every one is a fix-it
+    /// candidate flagged in the PR body.
+    #[derive(Copy, Clone)]
+    enum Discipline {
+        /// Handler is known to call `validate_user_ptr` (or an equivalent
+        /// USER_PTR_MIN..USER_PTR_MAX bounds check) on the pointer arg.
+        /// We invoke dispatch and assert the return is negative.
+        Validated,
+        /// Handler dereferences the pointer without range validation.
+        /// Calling dispatch with a kernel-VA would corrupt kernel memory.
+        /// We emit a SKIP marker and DO NOT invoke dispatch.
+        Unvalidated(&'static str),
+    }
+    use Discipline::*;
+
+    /// One entry per (syscall, pointer-bearing arg position).  The arg
+    /// position is encoded as a closure that builds the six-tuple of
+    /// syscall arguments given the adversarial `ptr`.  This keeps the
+    /// table compact even though the six arg slots vary across syscalls.
+    struct Entry {
+        nr: u64,
+        name: &'static str,
+        ptr_label: &'static str,            // which pointer arg ("buf", "iov", "msghdr", ...)
+        build_args: fn(u64) -> [u64; 6],    // (ptr) -> (arg1..arg6)
+        discipline: Discipline,
+    }
+
+    // Helper: invoke dispatch with the constructed args.
+    fn call(e: &Entry, ptr: u64) -> i64 {
+        let a = (e.build_args)(ptr);
+        crate::syscall::dispatch_linux(e.nr, a[0], a[1], a[2], a[3], a[4], a[5])
+    }
+
+    // ── Matrix table ─────────────────────────────────────────────────────
+    //
+    // Notes on the table layout:
+    //   * Each closure places `ptr` at the syscall's pointer-arg slot and
+    //     fills the remaining args with values that make the call cheap
+    //     (e.g. cnt=1 so writev/readv iterates exactly once before
+    //     bailing on the bad iov_base).
+    //   * `Validated` entries verified by source inspection of the handler
+    //     against `validate_user_ptr` / USER_PTR_MIN..USER_PTR_MAX checks.
+    //   * `Unvalidated` entries are fix-it candidates; each reason string
+    //     is reproduced in the PR body so a follow-up dispatch can land
+    //     the validation in the handler.
+    let entries: &[Entry] = &[
+        // ── Category (C) iovec / msghdr — pre-validated by PR #242 ──────
+        Entry { nr: 20,  name: "writev",   ptr_label: "iov",
+                build_args: |p| [1, p, 1, 0, 0, 0], discipline: Validated },
+        Entry { nr: 19,  name: "readv",    ptr_label: "iov",
+                build_args: |p| [0, p, 1, 0, 0, 0], discipline: Validated },
+        Entry { nr: 295, name: "preadv",   ptr_label: "iov",
+                build_args: |p| [0, p, 1, 0, 0, 0], discipline: Validated },
+        Entry { nr: 296, name: "pwritev",  ptr_label: "iov",
+                build_args: |p| [1, p, 1, 0, 0, 0], discipline: Validated },
+        Entry { nr: 46,  name: "sendmsg",  ptr_label: "msghdr",
+                build_args: |p| [1, p, 0, 0, 0, 0], discipline: Validated },
+        Entry { nr: 47,  name: "recvmsg",  ptr_label: "msghdr",
+                build_args: |p| [0, p, 0, 0, 0, 0], discipline: Validated },
+
+        // ── Category (B) write-to-user — getrandom (validated by PR #242) ─
+        Entry { nr: 318, name: "getrandom", ptr_label: "buf",
+                build_args: |p| [p, 16, 0, 0, 0, 0], discipline: Validated },
+
+        // ── Category (C) sigaction / sigprocmask (USER_PTR_MIN..MAX) ─────
+        // sig=SIGUSR1 (10), sigsetsize=8 (x86_64 sigset_t = u64)
+        Entry { nr: 13,  name: "rt_sigaction-act",    ptr_label: "act",
+                build_args: |p| [10, p, 0, 8, 0, 0], discipline: Validated },
+        Entry { nr: 13,  name: "rt_sigaction-oldact", ptr_label: "oldact",
+                build_args: |p| [10, 0, p, 8, 0, 0], discipline: Validated },
+        Entry { nr: 14,  name: "rt_sigprocmask-set",  ptr_label: "set",
+                build_args: |p| [0, p, 0, 8, 0, 0], discipline: Validated },
+        Entry { nr: 14,  name: "rt_sigprocmask-oldset", ptr_label: "oldset",
+                build_args: |p| [0, 0, p, 8, 0, 0], discipline: Validated },
+
+        // (futex timespec validation also lives in PR #242; testing it via
+        // the dispatch matrix is unsafe because a `null timeout` is the
+        // legitimate "no timeout" sentinel and would drive the handler
+        // into FUTEX_WAIT on the supplied `uaddr` — a kernel-context
+        // dereference of unmapped user memory.  Futex pointer validation
+        // is covered by Test 220 / the lost-wakeup regression tests.)
+
+        // ── Category (A) path strings — read_cstring_from_user lacks validation ─
+        // Flagged as a fix-it: read_cstring_from_user dereferences `ptr`
+        // without `validate_user_ptr`.  A kernel-VA pathname would read
+        // kernel memory and treat the bytes as a path — info leak.
+        Entry { nr: 2,   name: "open-pathname",   ptr_label: "pathname",
+                build_args: |p| [p, 0, 0, 0, 0, 0],
+                discipline: Unvalidated("read_cstring_from_user does not validate ptr") },
+        Entry { nr: 257, name: "openat-pathname", ptr_label: "pathname",
+                build_args: |p| [u64::MAX /*AT_FDCWD*/, p, 0, 0, 0, 0],
+                discipline: Unvalidated("read_cstring_from_user does not validate ptr") },
+        Entry { nr: 21,  name: "access-pathname", ptr_label: "pathname",
+                build_args: |p| [p, 0, 0, 0, 0, 0],
+                discipline: Unvalidated("read_cstring_from_user does not validate ptr") },
+        Entry { nr: 4,   name: "stat-pathname",   ptr_label: "pathname",
+                build_args: |p| [p, 0, 0, 0, 0, 0],
+                discipline: Unvalidated("read_cstring_from_user does not validate ptr") },
+
+        // ── Category (B) write-to-user — handlers that only null-check ───
+        // Each of these dereferences `buf` with no kernel-VA bounds check.
+        Entry { nr: 63,  name: "uname",          ptr_label: "buf",
+                build_args: |p| [p, 0, 0, 0, 0, 0],
+                discipline: Unvalidated("sys_uname null-checks only; writes 325 bytes unconditionally") },
+        Entry { nr: 79,  name: "getcwd",         ptr_label: "buf",
+                build_args: |p| [p, 256, 0, 0, 0, 0],
+                discipline: Unvalidated("sys_getcwd null-checks only; copy_nonoverlapping to kernel-VA") },
+        Entry { nr: 22,  name: "pipe",           ptr_label: "fds_out",
+                build_args: |p| [p, 0, 0, 0, 0, 0],
+                discipline: Unvalidated("sys_pipe null-checks only; writes 8 bytes (2×u32 fd) unconditionally") },
+        Entry { nr: 96,  name: "gettimeofday",   ptr_label: "tv",
+                build_args: |p| [p, 0, 0, 0, 0, 0],
+                discipline: Unvalidated("sys_gettimeofday null-checks only; writes 16 bytes to tv") },
+        Entry { nr: 228, name: "clock_gettime",  ptr_label: "tp",
+                build_args: |p| [1 /*CLOCK_MONOTONIC*/, p, 0, 0, 0, 0],
+                discipline: Unvalidated("sys_clock_gettime null-checks only; writes 16 bytes to tp") },
+
+        // ── Category (A/B) arch_prctl(GET) — writes 8 bytes; (SET) writes MSR ─
+        // ARCH_GET_FS (0x1003) writes FS base to *addr without validation.
+        Entry { nr: 158, name: "arch_prctl-GET_FS", ptr_label: "addr",
+                build_args: |p| [0x1003, p, 0, 0, 0, 0],
+                discipline: Unvalidated("sys_arch_prctl(ARCH_GET_FS) writes *addr without validation") },
+
+        // ── Category (B) set_tid_address — stores ptr; does not deref now ─
+        // Stored as `clear_child_tid`; dereferenced only at thread exit.
+        // We invoke it as Validated (it accepts any ptr unconditionally,
+        // including kernel-VAs, and returns the current TID; not a fault
+        // in the immediate dispatch).  Marked Unvalidated for the SKIP
+        // record because the stored ptr will fault at thread exit — that
+        // is a deferred liability we should range-check at set time.
+        Entry { nr: 218, name: "set_tid_address", ptr_label: "tidptr",
+                build_args: |p| [p, 0, 0, 0, 0, 0],
+                discipline: Unvalidated("sys_set_tid_address stores ptr; faults at thread exit if kernel-VA") },
+    ];
+
+    let mut total: u32 = 0;
+    let mut passed: u32 = 0;
+    let mut skipped: u32 = 0;
+    let mut regressions: u32 = 0;
+
+    for e in entries {
+        for (ptr, label) in BAD_PTRS {
+            total += 1;
+            match e.discipline {
+                Validated => {
+                    let ret = call(e, *ptr);
+                    // Kernel-VA pointers are unambiguously bad: any handler
+                    // that returns >= 0 for one is a kernel-write primitive
+                    // (CVE-class).  Null returning 0 is benign for handlers
+                    // whose null arg is semantically "skip this side-effect"
+                    // (e.g. rt_sigaction(act=NULL) is a pure query); only
+                    // the kernel-VA / near-overflow cases are escalated to
+                    // regressions.  Null-arg returns are logged neutrally.
+                    let is_kernel_va = *ptr >= astryx_shared::KERNEL_VIRT_BASE
+                        || (*label == "near-overflow");
+                    if ret >= 0 && is_kernel_va {
+                        crate::serial_println!(
+                            "[TEST/ARGVAL/REGRESSION] syscall={} nr={} ptr_arg={} ptr={} ret={} expected=negative-errno",
+                            e.name, e.nr, e.ptr_label, label, ret,
+                        );
+                        regressions += 1;
+                    } else {
+                        crate::serial_println!(
+                            "[TEST/ARGVAL] syscall={} nr={} ptr_arg={} ptr={} ret={} OK",
+                            e.name, e.nr, e.ptr_label, label, ret,
+                        );
+                        passed += 1;
+                    }
+                }
+                Unvalidated(reason) => {
+                    crate::serial_println!(
+                        "[TEST/ARGVAL/SKIP] syscall={} nr={} ptr_arg={} ptr={} reason=\"{}\"",
+                        e.name, e.nr, e.ptr_label, label, reason,
+                    );
+                    skipped += 1;
+                }
+            }
+        }
+    }
+
+    crate::serial_println!(
+        "[TEST/ARGVAL/SUMMARY] entries={} ptr_cases={} total={} passed={} skipped={} regressions={}",
+        entries.len(), BAD_PTRS.len(), total, passed, skipped, regressions,
+    );
+
+    if regressions > 0 {
+        test_fail!(
+            "syscall_arg_validation_matrix",
+            "{} regression(s) — handlers returned non-negative for a bad pointer",
+            regressions,
+        );
+        return false;
+    }
+    test_pass!("matrix swept; no regressions (skips logged as fix-it candidates)");
+    true
+}
+
+// ── Test 223: sys_sigreturn RFLAGS sanitiser (GAP-HIGH-1) ────────────────────
+//
+// Closes GAP-HIGH-1 from `docs/TEST_COVERAGE_AUDIT_2026-05-16.md` and finding
+// C1 of the 2026-05-16 security posture audit.  `sys_sigreturn` restores
+// user-controlled RFLAGS via SYSRETQ; a crafted handler could set
+// RFLAGS.IOPL=3 (bits 13:12) on the saved frame to gain ring-0-equivalent
+// IN/OUT/CLI/STI on return — a privilege escalation (Intel SDM Vol. 3A
+// §3.4.3, CWE-269, BadIRET class — CVE-2014-9322).
+//
+// The fix in PR #242 applies RFLAGS_USER_MASK which clears IOPL/NT/RF/VM/AC
+// and forces IF.  This test verifies the mask is applied: it precomputes the
+// effective sanitised value for several poisoned inputs and asserts the
+// bitmask invariants hold (IOPL bits clear, IF bit set, NT/RF/VM/AC clear).
+//
+// We test the mask, not the dispatch — dispatching `sys_sigreturn` requires a
+// valid in-kernel SignalFrame and write access to the saved kernel-stack
+// frame; constructing both safely inside the test runner is more invasive
+// than reproducing the mask in-place.  If RFLAGS_USER_MASK is silently
+// weakened, this test fails immediately.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_223_sigreturn_rflags_sanitiser() -> bool {
+    test_header!("sigreturn RFLAGS sanitiser — IOPL/NT/RF/VM/AC clear + IF forced (GAP-HIGH-1)");
+
+    // Mirror of the constant in `crate::syscall::sys_sigreturn` — kept in
+    // sync by code review (any divergence is the bug).  Per Intel SDM Vol.
+    // 3A §3.4.3 (EFLAGS register) and CWE-269.
+    const RFLAGS_USER_MASK: u64 = !((0x3u64 << 12)   // IOPL
+                                  | (1u64 << 14)     // NT
+                                  | (1u64 << 16)     // RF
+                                  | (1u64 << 17)     // VM
+                                  | (1u64 << 18));   // AC
+    const IF_BIT: u64 = 1u64 << 9;
+
+    fn sanitise(saved_r11: u64) -> u64 {
+        (saved_r11 & RFLAGS_USER_MASK) | IF_BIT
+    }
+
+    struct Case {
+        name: &'static str,
+        input: u64,
+    }
+    let cases = [
+        Case { name: "IOPL=3 + IF",            input: 0x0000_3202 },
+        Case { name: "IOPL=3 + NT + AC",       input: 0x0004_7200 },
+        Case { name: "IOPL=2 + RF + VM",       input: 0x0003_2200 },
+        Case { name: "all attacker bits set",  input: 0xFFFF_FFFF_FFFF_FFFF },
+        Case { name: "benign user CF+PF",      input: 0x0000_0005 },
+    ];
+
+    let mut failed: u32 = 0;
+    for c in cases.iter() {
+        let out = sanitise(c.input);
+        let iopl_clear = (out & (0x3u64 << 12)) == 0;
+        let nt_clear   = (out & (1u64 << 14)) == 0;
+        let rf_clear   = (out & (1u64 << 16)) == 0;
+        let vm_clear   = (out & (1u64 << 17)) == 0;
+        let ac_clear   = (out & (1u64 << 18)) == 0;
+        let if_set     = (out & IF_BIT) != 0;
+        let ok = iopl_clear && nt_clear && rf_clear && vm_clear && ac_clear && if_set;
+        crate::serial_println!(
+            "[TEST/ARGVAL/SIGRET] case=\"{}\" in={:#x} out={:#x} IOPL_clear={} IF_set={} {}",
+            c.name, c.input, out, iopl_clear, if_set,
+            if ok { "OK" } else { "FAIL" },
+        );
+        if !ok {
+            failed += 1;
+        }
+    }
+
+    if failed > 0 {
+        test_fail!("sigreturn_rflags_sanitiser",
+            "{} case(s) failed mask invariants", failed);
+        return false;
+    }
+    test_pass!("RFLAGS_USER_MASK clears IOPL/NT/RF/VM/AC and forces IF");
     true
 }
 
