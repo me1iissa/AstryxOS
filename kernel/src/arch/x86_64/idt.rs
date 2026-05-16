@@ -14,6 +14,22 @@ use spin::Once;
 static PAGE_FAULT_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub fn page_fault_count() -> u64 { PAGE_FAULT_TOTAL.load(Ordering::Relaxed) }
 
+/// W215 H3a diagnostic: number of times a writable PTE install aliased a
+/// physical frame that is simultaneously held as a *different* key in the page
+/// cache.  A non-zero value means some caller is installing a PAGE_WRITABLE PTE
+/// whose backing frame the cache knows under a different (mount,inode,offset)
+/// tuple — i.e., a MAP_SHARED+PROT_WRITE mapping of a cache-resident file page,
+/// where the installer's intent differs from the cache's recorded key.
+///
+/// Only armed in `firefox-test` builds; zero cost in all others.
+#[cfg(feature = "firefox-test")]
+pub(crate) static PFH_WRITABLE_ALIAS_CACHE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "firefox-test")]
+pub fn pfh_writable_alias_cache_count() -> u64 {
+    PFH_WRITABLE_ALIAS_CACHE.load(Ordering::Relaxed)
+}
+
 /// Number of IDT entries (256 vectors).
 const IDT_ENTRIES: usize = 256;
 
@@ -1369,6 +1385,38 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         let _ = crate::mm::refcount::page_ref_dec(cached_phys);
                         return false;
                     }
+                    // W215 H3a diagnostic: check whether cached_phys is held
+                    // under a different key in the cache — which would mean a
+                    // MAP_SHARED+PROT_WRITE PTE is about to alias a page the cache
+                    // knows under a different (mount,inode,offset) identity.
+                    // Only file-backed installs (is_shared && is_writable) reach
+                    // this arm; anonymous frames are never in the cache.
+                    #[cfg(feature = "firefox-test")]
+                    if is_writable {
+                        if let Some((c_mount, c_inode, c_off)) =
+                            crate::mm::cache::is_phys_in_cache(cached_phys)
+                        {
+                            // The cache key recorded at insert time should match
+                            // our installer's key.  A mismatch means the frame has
+                            // been re-inserted under a different identity since the
+                            // readahead/prepopulate inserted it, or a concurrent
+                            // cache::insert replaced our entry with a different frame
+                            // and then re-used this phys under a new key — both
+                            // are aliasing bugs.
+                            if c_mount != mount_idx || c_inode != inode || c_off != file_page_offset {
+                                PFH_WRITABLE_ALIAS_CACHE.fetch_add(1, Ordering::Relaxed);
+                                crate::serial_println!(
+                                    "[H3a] ALIAS-CACHE writable phys={:#x} \
+                                     cache_key=({},{:#x},{:#x}) installer_key=({},{:#x},{:#x}) \
+                                     rip={:#x}",
+                                    cached_phys,
+                                    c_mount, c_inode, c_off,
+                                    mount_idx, inode, file_page_offset,
+                                    _frame.rip,
+                                );
+                            }
+                        }
+                    }
                     crate::mm::vmm::map_page_in(cr3, page_addr, cached_phys, page_flags);
                     crate::mm::vmm::invlpg(page_addr);
                     // Guard ref is intentionally NOT released — it has been
@@ -1741,6 +1789,33 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 } else {
                     // MAP_SHARED writable, or any read-only mapping: alias
                     // the cache page directly.
+                    //
+                    // W215 H3a diagnostic: the cache entry for (mount,inode,foff)
+                    // was just inserted by us (cache::insert above), so under
+                    // normal operation the cache key WILL match our installer key.
+                    // A mismatch here means another CPU raced in with a different
+                    // key for the same phys between our insert and this check —
+                    // a structural aliasing bug distinct from the MAP_SHARED case
+                    // in the cache-hit arm above.
+                    #[cfg(feature = "firefox-test")]
+                    if is_writable_vma {
+                        if let Some((c_mount, c_inode, c_off)) =
+                            crate::mm::cache::is_phys_in_cache(phys)
+                        {
+                            if c_mount != mount_idx || c_inode != inode || c_off != foff {
+                                PFH_WRITABLE_ALIAS_CACHE.fetch_add(1, Ordering::Relaxed);
+                                crate::serial_println!(
+                                    "[H3a] ALIAS-CACHE readahead phys={:#x} \
+                                     cache_key=({},{:#x},{:#x}) installer_key=({},{:#x},{:#x}) \
+                                     rip={:#x}",
+                                    phys,
+                                    c_mount, c_inode, c_off,
+                                    mount_idx, inode, foff,
+                                    _frame.rip,
+                                );
+                            }
+                        }
+                    }
                     crate::mm::refcount::page_ref_inc(phys);
                     crate::mm::vmm::map_page_in(cr3, vaddr, phys, page_flags);
                     // Drop guard ref — steady state: cache(1) + PTE(1) = 2.
@@ -1963,6 +2038,30 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     // MAP_SHARED writable, or any read-only mapping: alias the
                     // cache page directly.  Writes via MAP_SHARED are visible to
                     // all other mappers — required by mmap(2) MAP_SHARED contract.
+                    //
+                    // W215 H3a diagnostic: mirror the readahead-arm check.
+                    // The single-page path inserts under (mount_idx, inode,
+                    // file_page_offset); if is_phys_in_cache returns a different
+                    // key, a concurrent re-insertion race has occurred.
+                    #[cfg(feature = "firefox-test")]
+                    if is_writable_spf {
+                        if let Some((c_mount, c_inode, c_off)) =
+                            crate::mm::cache::is_phys_in_cache(phys)
+                        {
+                            if c_mount != mount_idx || c_inode != inode || c_off != file_page_offset {
+                                PFH_WRITABLE_ALIAS_CACHE.fetch_add(1, Ordering::Relaxed);
+                                crate::serial_println!(
+                                    "[H3a] ALIAS-CACHE single-page phys={:#x} \
+                                     cache_key=({},{:#x},{:#x}) installer_key=({},{:#x},{:#x}) \
+                                     rip={:#x}",
+                                    phys,
+                                    c_mount, c_inode, c_off,
+                                    mount_idx, inode, file_page_offset,
+                                    _frame.rip,
+                                );
+                            }
+                        }
+                    }
                     crate::mm::refcount::page_ref_inc(phys); // PTE reference
                     crate::mm::vmm::map_page_in(cr3, page_addr, phys, page_flags);
                     crate::mm::vmm::invlpg(page_addr);

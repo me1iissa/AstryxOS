@@ -279,6 +279,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "trace-status"   => op_trace_status(out),
         "bell-stats"     => op_bell_stats(out),
         "cache-audit"    => op_cache_audit(out),
+        "cache-aliasing" => op_cache_aliasing(out),
         "tlb-stats"      => op_tlb_stats(out),
         _ => {
             out.push_str(r#"{"error":"unknown op: "#);
@@ -779,6 +780,40 @@ fn op_bell_stats(out: &mut String) {
         bell_wakes, resync_wakes, bell_ratio_permille
     );
 }
+// ── cache-aliasing ────────────────────────────────────────────────────────────
+//
+// W215 H3a diagnostic: dump the two new counters that instrument the
+// "writer into cache frame" axis.
+//
+// Output (firefox-test builds):
+//   {
+//     "pfh_writable_alias_cache":      N,   -- writable installs aliasing a cache frame
+//     "sys_mmap_shared_write_filebacked": M, -- MAP_SHARED|PROT_WRITE filebacked mmaps
+//   }
+//
+// Disambiguation per W215_H3_CACHE_HIT_COW_2026-05-16.md §188-196:
+//   sys_mmap_shared_write_filebacked > 0 AND inode matches libxul  → H3a confirmed (mmap path)
+//   pfh_writable_alias_cache > 0 AND key mismatch with installer   → H3a confirmed (PFH path)
+//   both == 0 AND W215 still fires                                  → H3a dead; escalate to H3b
+//   pfh_writable_alias_cache > 0 but key matches installer          → NULL; re-frame
+
+fn op_cache_aliasing(out: &mut String) {
+    #[cfg(feature = "firefox-test")]
+    {
+        use core::fmt::Write;
+        let pfh_alias = crate::arch::x86_64::idt::pfh_writable_alias_cache_count();
+        let mmap_sw   = crate::syscall::sys_mmap_shared_write_filebacked_count();
+        out.push('{');
+        let _ = write!(out, r#""pfh_writable_alias_cache":{},"sys_mmap_shared_write_filebacked":{}"#,
+            pfh_alias, mmap_sw);
+        out.push('}');
+    }
+    #[cfg(not(feature = "firefox-test"))]
+    {
+        out.push_str(r#"{"error":"cache-aliasing requires firefox-test feature"}"#);
+    }
+}
+
 // ── tlb-stats ────────────────────────────────────────────────────────────────
 //
 // Unified TLB shootdown + PMM recent-free diagnostic readout.
