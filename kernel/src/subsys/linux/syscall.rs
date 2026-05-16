@@ -931,9 +931,18 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let fd = arg1 as usize;
             let msghdr_ptr = arg2 as *const u64;
             if msghdr_ptr.is_null() { return -22; }
+            // CWE-823: validate msghdr is in user space before dereferencing
+            // any field. The msghdr layout (x86_64 Linux ABI) is 56 bytes
+            // ending at msg_flags (offset 48–52); ctrl writes touch up to
+            // ctrl_ptr + ctrl_len which is validated separately below.
+            if !crate::syscall::validate_user_ptr(arg2, 56) { return -14; }
             let iov_ptr = unsafe { core::ptr::read_unaligned(msghdr_ptr.add(2)) }; // offset 16
             let iov_len = unsafe { core::ptr::read_unaligned(msghdr_ptr.add(3)) }; // offset 24
             if iov_ptr == 0 || iov_len == 0 { return 0; }
+            if iov_len > 1024 { return -22; } // IOV_MAX per POSIX sendmsg(2)
+            if !crate::syscall::validate_user_ptr(iov_ptr, (iov_len as usize).saturating_mul(16)) {
+                return -14;
+            }
             let iovecs = unsafe { core::slice::from_raw_parts(iov_ptr as *const [u64; 2], iov_len as usize) };
             let mut total = 0usize;
             for iov in iovecs {
@@ -1003,9 +1012,19 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let fd = arg1 as usize;
             let msghdr_ptr = arg2 as *const u64;
             if msghdr_ptr.is_null() { return -22; }
+            // CWE-823: validate msghdr is in user space (see sendmsg above).
+            if !crate::syscall::validate_user_ptr(arg2, 56) { return -14; }
             let iov_ptr = unsafe { core::ptr::read_unaligned(msghdr_ptr.add(2)) };
             let iov_len = unsafe { core::ptr::read_unaligned(msghdr_ptr.add(3)) };
             if iov_ptr == 0 || iov_len == 0 { return -22; }
+            if iov_len > 1024 { return -22; } // IOV_MAX per POSIX recvmsg(2)
+            // Only iov[0] is consumed below, but validate the full iovec array
+            // size the caller advertised so a malformed iov_len cannot mask a
+            // kernel-address iov_ptr; the dereferenced iov_base is bounded by
+            // the cap below and reaches fd_read via socket_recv.
+            if !crate::syscall::validate_user_ptr(iov_ptr, (iov_len as usize).saturating_mul(16)) {
+                return -14;
+            }
             let iov = unsafe { core::slice::from_raw_parts(iov_ptr as *const [u64; 2], 1) };
             let dst = iov[0][0] as *mut u8;
             let cap = iov[0][1] as usize;
@@ -4280,6 +4299,14 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
 pub fn sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64 {
     // struct iovec { void *iov_base; size_t iov_len; } = [u64; 2]
     if iovcnt == 0 { return 0; }
+    if iovcnt > 1024 { return -22; } // EINVAL: IOV_MAX per POSIX writev(2)
+    // Range-validate iov_ptr is in user space and the entire array fits.
+    // CWE-823: Use of Out-of-range Pointer Offset. Without this a caller
+    // can pass a kernel address as iov_ptr and direct the kernel to read
+    // arbitrary kernel memory as the iov_base/iov_len descriptor.
+    if !crate::syscall::validate_user_ptr(iov_ptr, (iovcnt as usize).saturating_mul(16)) {
+        return -14; // EFAULT
+    }
     let iovecs = unsafe {
         core::slice::from_raw_parts(iov_ptr as *const [u64; 2], iovcnt as usize)
     };
@@ -4301,6 +4328,11 @@ pub fn sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64 {
 /// struct iovec { void *iov_base; size_t iov_len; } = [u64; 2] on x86_64.
 fn sys_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64 {
     if iovcnt == 0 { return 0; }
+    if iovcnt > 1024 { return -22; } // EINVAL: IOV_MAX per POSIX readv(2)
+    // CWE-823: range-validate iov_ptr (see sys_writev for full rationale).
+    if !crate::syscall::validate_user_ptr(iov_ptr, (iovcnt as usize).saturating_mul(16)) {
+        return -14; // EFAULT
+    }
     let iovecs = unsafe {
         core::slice::from_raw_parts(iov_ptr as *const [u64; 2], iovcnt as usize)
     };
@@ -6936,12 +6968,17 @@ fn sys_getdents(fd: u64, buf: u64, count: u64) -> i64 {
 fn sys_preadv(fd: u64, iov_ptr: u64, iovcnt: u64, offset: i64) -> i64 {
     if iovcnt == 0 { return 0; }
     if iovcnt > 1024 { return -22; } // EINVAL: IOV_MAX
+    // CWE-823: range-validate iov_ptr (see sys_writev for full rationale).
+    if !crate::syscall::validate_user_ptr(iov_ptr, (iovcnt as usize).saturating_mul(16)) {
+        return -14; // EFAULT
+    }
     let pid = crate::proc::current_pid_lockless();
     // Save, seek to offset, scatter-read, restore.
     let saved = crate::syscall::sys_lseek(fd as usize, 0, 1 /*SEEK_CUR*/);
     let sk = crate::syscall::sys_lseek(fd as usize, offset, 0 /*SEEK_SET*/);
     if sk < 0 { return sk; }
-    // SAFETY: iovcnt validated above; caller is responsible for valid iov array.
+    // SAFETY: iov_ptr range-validated above; iov_base/iov_len validated by
+    // the per-iov fd_read path (vfs handles short reads).
     let iovecs = unsafe {
         core::slice::from_raw_parts(iov_ptr as *const [u64; 2], iovcnt as usize)
     };
@@ -6972,11 +7009,16 @@ fn sys_preadv(fd: u64, iov_ptr: u64, iovcnt: u64, offset: i64) -> i64 {
 fn sys_pwritev(fd: u64, iov_ptr: u64, iovcnt: u64, offset: i64) -> i64 {
     if iovcnt == 0 { return 0; }
     if iovcnt > 1024 { return -22; } // EINVAL: IOV_MAX
+    // CWE-823: range-validate iov_ptr (see sys_writev for full rationale).
+    if !crate::syscall::validate_user_ptr(iov_ptr, (iovcnt as usize).saturating_mul(16)) {
+        return -14; // EFAULT
+    }
     let pid = crate::proc::current_pid_lockless();
     let saved = crate::syscall::sys_lseek(fd as usize, 0, 1 /*SEEK_CUR*/);
     let sk = crate::syscall::sys_lseek(fd as usize, offset, 0 /*SEEK_SET*/);
     if sk < 0 { return sk; }
-    // SAFETY: iovcnt validated above; caller is responsible for valid iov array.
+    // SAFETY: iov_ptr range-validated above; iov_base/iov_len reach fd_write
+    // via the vfs which handles short writes.
     let iovecs = unsafe {
         core::slice::from_raw_parts(iov_ptr as *const [u64; 2], iovcnt as usize)
     };

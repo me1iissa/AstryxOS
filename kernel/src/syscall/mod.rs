@@ -3185,10 +3185,25 @@ pub(crate) fn sys_sigreturn() -> i64 {
     //   ksp - 64 = R14
     //   ksp - 72 = R15
     let ksp = unsafe { PER_CPU_SYSCALL[cpu_index()].kernel_rsp };
+    // Sanitise RFLAGS before restoring it as the user's EFLAGS via SYSRETQ.
+    // The signal frame is user-controlled memory; a crafted handler can
+    // request RFLAGS.IOPL=3 (bits 13:12) to enable IN/OUT/CLI/STI from
+    // ring 3 — a privilege escalation to ring-0-equivalent I/O capability.
+    // We also clear NT (bit 14), RF (bit 16), VM (bit 17), and AC (bit 18,
+    // SMAP-bypass when SMAP becomes active), and force IF (bit 9) so a
+    // sigreturn cannot leave the user with interrupts permanently masked.
+    // Per Intel SDM Vol. 3A §3.4.3 (EFLAGS register) and the BadIRET class
+    // (CVE-2014-9322); CWE-269 (Improper Privilege Management).
+    const RFLAGS_USER_MASK: u64 = !((0x3u64 << 12)   // IOPL
+                                  | (1u64 << 14)     // NT
+                                  | (1u64 << 16)     // RF
+                                  | (1u64 << 17)     // VM
+                                  | (1u64 << 18));   // AC
+    let sanitised_rflags = (saved_r11 & RFLAGS_USER_MASK) | (1u64 << 9); // force IF
     unsafe {
         *((ksp -  8) as *mut u64) = saved_rsp;
         *((ksp - 16) as *mut u64) = saved_rcx;  // user RIP
-        *((ksp - 24) as *mut u64) = saved_r11;  // RFLAGS
+        *((ksp - 24) as *mut u64) = sanitised_rflags;
         *((ksp - 32) as *mut u64) = saved_rbp;
         *((ksp - 40) as *mut u64) = saved_rbx;
         *((ksp - 48) as *mut u64) = saved_r12;
@@ -3223,6 +3238,15 @@ pub(crate) fn sys_sigreturn() -> i64 {
 pub(crate) fn sys_getrandom(buf: *mut u8, count: usize, _flags: u32) -> i64 {
     if buf.is_null() || count == 0 {
         return -22; // EINVAL
+    }
+    // Range-validate the destination buffer is wholly in user space.
+    // Without this check a process can pass a kernel address (e.g. the
+    // kernel heap base) and obtain a kernel-mode write primitive whose
+    // contents are attacker-influenceable via repeated calls — CWE-119
+    // (Improper Restriction of Operations within the Bounds of a Memory
+    // Buffer); see also CWE-823 (Use of Out-of-range Pointer Offset).
+    if !validate_user_ptr(buf as u64, count) {
+        return -14; // EFAULT
     }
 
     let out = unsafe { core::slice::from_raw_parts_mut(buf, count) };
