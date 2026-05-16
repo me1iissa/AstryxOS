@@ -899,11 +899,20 @@ fn op_w215_diag(out: &mut String) {
         let window_race = crate::mm::w215_diag::window_race_count();
         let install_race = crate::mm::w215_diag::install_race_count();
         let overflow = crate::mm::w215_diag::prov_ring_overflow_count();
+        let wd_cow_hit   = crate::mm::w215_diag::cow_cache_hit_over_cache_count();
+        let wd_cow_ra    = crate::mm::w215_diag::cow_readahead_over_cache_count();
+        let wd_cow_sp    = crate::mm::w215_diag::cow_singlepage_over_cache_count();
+        let wd_anon_zf   = crate::mm::w215_diag::anon_zerofill_over_cache_count();
         let mut top: [(u64, u32); 5] = [(0, 0); 5];
         let n = crate::mm::w215_diag::top_traced_physes(&mut top);
         out.push('{');
         let _ = write!(out,
             r#""window_race":{window_race},"install_race":{install_race},"prov_ring_overflow":{overflow}"#,
+        );
+        // Arm-2 cross-check (WRITE-DETECT) per-site counters.  Additive JSON
+        // fields: existing harness consumers ignore unknown keys.
+        let _ = write!(out,
+            r#","cow_cache_hit_over_cache":{wd_cow_hit},"cow_readahead_over_cache":{wd_cow_ra},"cow_singlepage_over_cache":{wd_cow_sp},"anon_zerofill_over_cache":{wd_anon_zf}"#,
         );
         let _ = write!(out, r#","top_traced":["#);
         for i in 0..n {
