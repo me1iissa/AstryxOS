@@ -1292,6 +1292,17 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 if needs_private_copy {
                     if let Some(private_phys) = crate::mm::pmm::alloc_page() {
                         const COW_OFF: u64 = 0xFFFF_8000_0000_0000;
+                        // W215 Arm-2 cross-check: probe `private_phys` BEFORE the
+                        // CoW write.  A fresh PMM alloc that still appears in the
+                        // cache implies a refcount/reuse miss — the imminent write
+                        // would aliase a frame the cache thinks it owns.  Per
+                        // Intel SDM Vol. 3A §4.10.5.
+                        #[cfg(feature = "firefox-test")]
+                        crate::mm::w215_diag::write_detect(
+                            private_phys,
+                            crate::mm::w215_diag::WSITE_COW_CACHE_HIT,
+                            _frame.rip,
+                        );
                         unsafe {
                             // SAFETY: `lookup_and_acquire` guarantees `cached_phys`
                             // is alive for the duration of this block by holding a
@@ -1791,6 +1802,16 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 // Read-only VMAs: alias the cache page (saves memory).
                 if needs_private_copy_vma {
                     if let Some(private_phys) = crate::mm::pmm::alloc_page() {
+                        // W215 Arm-2 cross-check: probe `private_phys` BEFORE the
+                        // CoW write at the readahead path.  A counter hit names
+                        // this site as a phys/cache-alias writer.  Per Intel SDM
+                        // Vol. 3A §4.10.5.
+                        #[cfg(feature = "firefox-test")]
+                        crate::mm::w215_diag::write_detect(
+                            private_phys,
+                            crate::mm::w215_diag::WSITE_COW_READAHEAD,
+                            _frame.rip,
+                        );
                         unsafe {
                             core::ptr::copy_nonoverlapping(
                                 (PHYS_COW + phys) as *const u8,
@@ -2064,6 +2085,15 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 if needs_private_copy_spf {
                     if let Some(private_phys) = crate::mm::pmm::alloc_page() {
                         const COW_SPF: u64 = 0xFFFF_8000_0000_0000;
+                        // W215 Arm-2 cross-check: probe `private_phys` BEFORE the
+                        // CoW write at the single-page fallback path.  Per Intel
+                        // SDM Vol. 3A §4.10.5.
+                        #[cfg(feature = "firefox-test")]
+                        crate::mm::w215_diag::write_detect(
+                            private_phys,
+                            crate::mm::w215_diag::WSITE_COW_SINGLEPAGE,
+                            _frame.rip,
+                        );
                         unsafe {
                             core::ptr::copy_nonoverlapping(
                                 (COW_SPF + phys) as *const u8,
@@ -2175,6 +2205,21 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     vm_space.generation.load(core::sync::atomic::Ordering::Acquire);
                 // Allocate a zeroed page
                 if let Some(phys) = crate::mm::pmm::alloc_page() {
+                    // W215 Arm-2 cross-check (TOP CANDIDATE): probe `phys` BEFORE
+                    // the anonymous fault zero-fill.  This is the highest-prior
+                    // candidate writer for the FAULT/PHYS bucket-A cluster: if a
+                    // freshly-PMM-allocated frame still appears in the page cache
+                    // under any key, the imminent `write_bytes(_, 0, PAGE_SIZE)`
+                    // will overwrite file-cache content that other processes are
+                    // currently mapping through their PTEs.  Per Intel SDM Vol. 3A
+                    // §4.10.5 (paging-structure cache coherence) and POSIX
+                    // 1003.1-2024 mmap(2) MAP_SHARED visibility semantics.
+                    #[cfg(feature = "firefox-test")]
+                    crate::mm::w215_diag::write_detect(
+                        phys,
+                        crate::mm::w215_diag::WSITE_ANON_ZEROFILL,
+                        _frame.rip,
+                    );
                     unsafe {
                         core::ptr::write_bytes((PHYS_OFF + phys) as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
                     }
