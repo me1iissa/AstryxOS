@@ -78,15 +78,87 @@ struct PendingSession {
 
 static KDB_SESSIONS: Mutex<Vec<PendingSession>> = Mutex::new(Vec::new());
 static INITED: AtomicBool = AtomicBool::new(false);
+static PUMP_THREAD_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Initialise the kdb listener.  Safe to call multiple times.
+///
+/// Also spawns a dedicated PRIORITY_HIGH kernel thread (`kdb_pump`) that
+/// services the TCP/9999 socket independently of the BSP main loop.  The
+/// BSP runs as the idle thread and is starved under heavy userland load
+/// (e.g. ~40 libxul threads at PRIORITY_NORMAL); without this pump thread
+/// the in-kernel debugger appears wedged to the host even though the
+/// kernel itself is healthy and continues to make forward progress.
 pub fn init() {
     if INITED.swap(true, Ordering::SeqCst) { return; }
     match tcp::listen(KDB_PORT) {
-        Ok(()) => crate::serial_println!("[KDB] listening on 0.0.0.0:{}", KDB_PORT),
+        Ok(()) => {
+            crate::serial_println!("[KDB] listening on 0.0.0.0:{}", KDB_PORT);
+            start_pump_thread();
+        }
         Err(e) => {
             crate::serial_println!("[KDB] listen({}) failed: {}", KDB_PORT, e);
             INITED.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Dedicated kdb-pump kernel thread entry point.
+///
+/// Runs at PRIORITY_HIGH so it stays scheduled even when ~40 userland threads
+/// (e.g. libxul + content processes) are saturating CPU at PRIORITY_NORMAL.
+/// The BSP main loop also calls `net::poll()`, but the BSP runs as the idle
+/// thread (PRIORITY_IDLE = 0) and is starved by any Ready peer — so under
+/// heavy load it can go minutes without polling, and the in-kernel TCP/9999
+/// debugger appears wedged to the host even though the kernel is healthy.
+///
+/// Sleeping 1 timer tick (~10 ms) between iterations keeps overhead bounded
+/// to one schedule + one `net::poll` per ~10 ms.  `net::poll()` itself is
+/// already designed for periodic 10 ms cadence (see its docstring), so this
+/// thread effectively replaces the BSP's polling on the kdb hot path while
+/// letting the BSP keep doing X11/compositor work between its (rarer) slices.
+fn pump_thread_entry() {
+    crate::serial_println!("[KDB] pump thread started (TID {})",
+                           crate::proc::current_tid());
+    loop {
+        // Service NIC RX + TCP timers + kdb pump.  Locks are taken inside
+        // each callee; concurrent calls from the BSP main loop are
+        // serialised by those locks (TCP_CONNECTIONS, KDB_SESSIONS).
+        crate::net::poll();
+        // Yield for 1 tick.  At the firefox-test BSP cadence of ~100 Hz
+        // this gives ~100 kdb-pump opportunities per second, well above
+        // the ~5 cycles a single kdb exchange (handshake + req + resp +
+        // close) needs to complete.
+        crate::proc::sleep_ticks(1);
+    }
+}
+
+/// Spawn the dedicated kdb-pump kernel thread.  Idempotent: returns
+/// immediately if already started.  Must be called AFTER `init()` (so the
+/// TCP listener exists) and AFTER `proc::init()` (so `create_thread` can
+/// allocate a kernel stack).
+///
+/// Spawned in PID 0 (idle process) — the thread shares the kernel CR3 so
+/// it can call `net::poll()` safely regardless of which user CR3 the BSP
+/// happens to be on when the thread is scheduled in.
+pub fn start_pump_thread() {
+    if !INITED.load(Ordering::Acquire) { return; }
+    if PUMP_THREAD_STARTED.swap(true, Ordering::SeqCst) { return; }
+    match crate::proc::create_thread(
+        0,                                          // PID 0 (idle/kernel)
+        "kdb_pump",
+        pump_thread_entry as *const () as u64,
+    ) {
+        Some(tid) => {
+            // Bump to PRIORITY_HIGH so we beat userland (PRIORITY_NORMAL).
+            // Without this bump the new thread also runs at PRIORITY_NORMAL
+            // and gets starved 1:N alongside libxul's many threads.
+            let _ = crate::proc::set_thread_priority(
+                tid, crate::proc::PRIORITY_HIGH);
+            crate::serial_println!("[KDB] pump thread spawned as TID {} (PRIORITY_HIGH)", tid);
+        }
+        None => {
+            PUMP_THREAD_STARTED.store(false, Ordering::SeqCst);
+            crate::serial_println!("[KDB] WARNING: failed to spawn pump thread; kdb will rely on BSP polling");
         }
     }
 }
