@@ -3967,7 +3967,7 @@ fn test_linux_syscall_compat() -> bool {
     // not abort the thread.  Accept both 0 (current) and -38 (legacy stub) so neither
     // a regression to ENOSYS nor a future real implementation breaks this gate.
     test_println!("  Testing dispatch_linux routing...");
-    let ret = crate::syscall::dispatch_linux(334, 0, 0, 0, 0, 0, 0);
+    let ret = crate::syscall::dispatch_linux_kernel(334, 0, 0, 0, 0, 0, 0);
     if ret != 0 && ret != -38 {
         test_fail!("Linux syscall compat", "rseq returned {} (expected 0 or -38/ENOSYS)", ret);
         return false;
@@ -3975,7 +3975,7 @@ fn test_linux_syscall_compat() -> bool {
     test_println!("  dispatch_linux(334/rseq) → {} (0=stub-success or -38=ENOSYS, both OK) ✓", ret);
 
     // 6. mprotect — real implementation; EINVAL in kernel-context is expected (no user vm_space)
-    let ret = crate::syscall::dispatch_linux(10, 0x1000, 0x1000, 0x3, 0, 0, 0);
+    let ret = crate::syscall::dispatch_linux_kernel(10, 0x1000, 0x1000, 0x3, 0, 0, 0);
     // Accept 0 (stub/success) or -22 (EINVAL — real impl, no vm_space in test context)
     if ret != 0 && ret != -22 {
         test_fail!("Linux syscall compat", "mprotect returned unexpected value {}", ret);
@@ -9353,7 +9353,7 @@ fn test_mprotect_syscall() -> bool {
     test_header!("mprotect — page-table protection changes");
 
     // 1. Allocate an anonymous page via mmap.
-    let addr = crate::syscall::dispatch_linux(
+    let addr = crate::syscall::dispatch_linux_kernel(
         9, // mmap
         0, 0x1000,          // addr=0 (any), len=4096
         3,                   // prot = PROT_READ|PROT_WRITE
@@ -9374,7 +9374,7 @@ fn test_mprotect_syscall() -> bool {
     test_println!("  Wrote sentinel to page ✓");
 
     // 3. mprotect → PROT_READ only.
-    let r = crate::syscall::dispatch_linux(10, addr as u64, 0x1000, 1 /*PROT_READ*/, 0, 0, 0);
+    let r = crate::syscall::dispatch_linux_kernel(10, addr as u64, 0x1000, 1 /*PROT_READ*/, 0, 0, 0);
     if r != 0 {
         test_fail!("mprotect", "mprotect(PROT_READ) failed: {}", r);
         return false;
@@ -9382,7 +9382,7 @@ fn test_mprotect_syscall() -> bool {
     test_println!("  mprotect(PROT_READ) → 0 ✓");
 
     // 4. mprotect → PROT_READ|PROT_EXEC (JIT scenario).
-    let r = crate::syscall::dispatch_linux(10, addr as u64, 0x1000, 5 /*PROT_READ|PROT_EXEC*/, 0, 0, 0);
+    let r = crate::syscall::dispatch_linux_kernel(10, addr as u64, 0x1000, 5 /*PROT_READ|PROT_EXEC*/, 0, 0, 0);
     if r != 0 {
         test_fail!("mprotect", "mprotect(PROT_READ|PROT_EXEC) failed: {}", r);
         return false;
@@ -9390,7 +9390,7 @@ fn test_mprotect_syscall() -> bool {
     test_println!("  mprotect(PROT_READ|PROT_EXEC) → 0 ✓");
 
     // 5. Restore R/W and verify sentinel.
-    let r = crate::syscall::dispatch_linux(10, addr as u64, 0x1000, 3 /*PROT_RW*/, 0, 0, 0);
+    let r = crate::syscall::dispatch_linux_kernel(10, addr as u64, 0x1000, 3 /*PROT_RW*/, 0, 0, 0);
     if r != 0 {
         test_fail!("mprotect", "mprotect(PROT_RW restore) failed: {}", r);
         return false;
@@ -9403,7 +9403,7 @@ fn test_mprotect_syscall() -> bool {
     test_println!("  Sentinel intact after prot changes: {:#x} ✓", val);
 
     // 6. munmap.
-    let r = crate::syscall::dispatch_linux(11, addr as u64, 0x1000, 0, 0, 0, 0);
+    let r = crate::syscall::dispatch_linux_kernel(11, addr as u64, 0x1000, 0, 0, 0, 0);
     if r != 0 {
         test_fail!("mprotect", "munmap failed: {}", r);
         return false;
@@ -9425,7 +9425,7 @@ fn test_eventfd_syscall() -> bool {
     // empty-counter read returns -EAGAIN rather than blocking the test
     // thread.  Per `man 2 eventfd`, EFD_NONBLOCK = O_NONBLOCK on the fd.
     const EFD_NONBLOCK: u64 = 0x0800;
-    let efd = crate::syscall::dispatch_linux(290 /*eventfd2*/, 0, EFD_NONBLOCK, 0, 0, 0, 0);
+    let efd = crate::syscall::dispatch_linux_kernel(290 /*eventfd2*/, 0, EFD_NONBLOCK, 0, 0, 0, 0);
     if efd < 0 {
         test_fail!("eventfd", "eventfd2() syscall failed: {}", efd);
         return false;
@@ -9435,7 +9435,7 @@ fn test_eventfd_syscall() -> bool {
     // 2. Read from empty fd — should return EAGAIN (-11) because we set
     // EFD_NONBLOCK at creation time.
     let buf = alloc::vec![0u8; 8];
-    let n = crate::syscall::dispatch_linux(0 /*read*/, efd as u64, buf.as_ptr() as u64, 8, 0, 0, 0);
+    let n = crate::syscall::dispatch_linux_kernel(0 /*read*/, efd as u64, buf.as_ptr() as u64, 8, 0, 0, 0);
     if n != -11 {
         test_fail!("eventfd", "Read on empty eventfd returned {} (expected -11 EAGAIN)", n);
         return false;
@@ -9445,7 +9445,7 @@ fn test_eventfd_syscall() -> bool {
     // 3. Write 42 to the eventfd.
     let write_val: u64 = 42;
     let write_buf = write_val.to_le_bytes();
-    let n = crate::syscall::dispatch_linux(1 /*write*/, efd as u64, write_buf.as_ptr() as u64, 8, 0, 0, 0);
+    let n = crate::syscall::dispatch_linux_kernel(1 /*write*/, efd as u64, write_buf.as_ptr() as u64, 8, 0, 0, 0);
     if n != 8 {
         test_fail!("eventfd", "Write to eventfd returned {} (expected 8)", n);
         return false;
@@ -9454,7 +9454,7 @@ fn test_eventfd_syscall() -> bool {
 
     // 4. Read back — should return 42 and clear the counter.
     let mut read_buf = [0u8; 8];
-    let n = crate::syscall::dispatch_linux(0 /*read*/, efd as u64, read_buf.as_ptr() as u64, 8, 0, 0, 0);
+    let n = crate::syscall::dispatch_linux_kernel(0 /*read*/, efd as u64, read_buf.as_ptr() as u64, 8, 0, 0, 0);
     if n != 8 {
         test_fail!("eventfd", "Read from eventfd returned {} (expected 8)", n);
         return false;
@@ -9467,7 +9467,7 @@ fn test_eventfd_syscall() -> bool {
     test_println!("  Read from eventfd → {} ✓", read_val);
 
     // 5. Counter cleared — should EAGAIN again.
-    let n = crate::syscall::dispatch_linux(0 /*read*/, efd as u64, read_buf.as_ptr() as u64, 8, 0, 0, 0);
+    let n = crate::syscall::dispatch_linux_kernel(0 /*read*/, efd as u64, read_buf.as_ptr() as u64, 8, 0, 0, 0);
     if n != -11 {
         test_fail!("eventfd", "Read after clear returned {} (expected EAGAIN)", n);
         return false;
@@ -9475,7 +9475,7 @@ fn test_eventfd_syscall() -> bool {
     test_println!("  Counter cleared, re-reading → EAGAIN ✓");
 
     // 6. close(efd).
-    let r = crate::syscall::dispatch_linux(3 /*close*/, efd as u64, 0, 0, 0, 0, 0);
+    let r = crate::syscall::dispatch_linux_kernel(3 /*close*/, efd as u64, 0, 0, 0, 0, 0);
     if r != 0 {
         test_fail!("eventfd", "close(efd) failed: {}", r);
         return false;
@@ -9495,7 +9495,7 @@ fn test_pipe2_statfs() -> bool {
 
     // Create a pipe with O_CLOEXEC.
     let mut fds = [0u32; 2];
-    let r = crate::syscall::dispatch_linux(
+    let r = crate::syscall::dispatch_linux_kernel(
         293 /*pipe2*/,
         fds.as_mut_ptr() as u64,
         0x0008_0000, // O_CLOEXEC
@@ -9510,7 +9510,7 @@ fn test_pipe2_statfs() -> bool {
 
     // Write "pipe2 test" into the write end.
     let msg = b"pipe2 test";
-    let n = crate::syscall::dispatch_linux(1 /*write*/, wfd, msg.as_ptr() as u64, msg.len() as u64, 0, 0, 0);
+    let n = crate::syscall::dispatch_linux_kernel(1 /*write*/, wfd, msg.as_ptr() as u64, msg.len() as u64, 0, 0, 0);
     if n as usize != msg.len() {
         test_fail!("pipe2", "write to pipe returned {} (expected {})", n, msg.len());
         return false;
@@ -9519,7 +9519,7 @@ fn test_pipe2_statfs() -> bool {
 
     // Read it back.
     let mut buf = [0u8; 16];
-    let n = crate::syscall::dispatch_linux(0 /*read*/, rfd, buf.as_mut_ptr() as u64, 16, 0, 0, 0);
+    let n = crate::syscall::dispatch_linux_kernel(0 /*read*/, rfd, buf.as_mut_ptr() as u64, 16, 0, 0, 0);
     if n as usize != msg.len() {
         test_fail!("pipe2", "read from pipe returned {} (expected {})", n, msg.len());
         return false;
@@ -9531,15 +9531,15 @@ fn test_pipe2_statfs() -> bool {
     test_println!("  read {:?} back ✓", core::str::from_utf8(&buf[..n as usize]).unwrap_or("?"));
 
     // Close both ends.
-    crate::syscall::dispatch_linux(3, rfd, 0, 0, 0, 0, 0);
-    crate::syscall::dispatch_linux(3, wfd, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, rfd, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, wfd, 0, 0, 0, 0, 0);
     test_println!("  closed pipe fds ✓");
 
     // ─── Part B: statfs ───────────────────────────────────────────────────
 
     let path = b"/disk\0";
     let mut statfs_buf = [0u8; 120];
-    let r = crate::syscall::dispatch_linux(
+    let r = crate::syscall::dispatch_linux_kernel(
         137 /*statfs*/,
         path.as_ptr() as u64,
         statfs_buf.as_mut_ptr() as u64,
@@ -9554,7 +9554,7 @@ fn test_pipe2_statfs() -> bool {
     test_println!("  statfs('/disk') f_type={:#x} ✓", f_type);
 
     // fstatfs on fd 1 (stdout) — always returns 0.
-    let r = crate::syscall::dispatch_linux(138 /*fstatfs*/, 1, statfs_buf.as_mut_ptr() as u64, 0, 0, 0, 0);
+    let r = crate::syscall::dispatch_linux_kernel(138 /*fstatfs*/, 1, statfs_buf.as_mut_ptr() as u64, 0, 0, 0, 0);
     if r != 0 {
         test_fail!("statfs", "fstatfs(1) returned {}", r);
         return false;
@@ -9576,7 +9576,7 @@ fn test_futex_requeue() -> bool {
     let uaddr2: u32 = 0;
     let r = unsafe {
         // sys_futex(uaddr_ptr, FUTEX_REQUEUE=4, val=0, val2=0, uaddr2_ptr)
-        crate::syscall::dispatch_linux(
+        crate::syscall::dispatch_linux_kernel(
             202, // futex
             &uaddr  as *const u32 as u64,
             4,   // FUTEX_REQUEUE
@@ -9599,7 +9599,7 @@ fn test_futex_requeue() -> bool {
     // timespec {tv_sec=0, tv_nsec=1}
     let ts: [u64; 2] = [0, 1]; // 1 ns timeout
     let r = unsafe {
-        crate::syscall::dispatch_linux(
+        crate::syscall::dispatch_linux_kernel(
             202, // futex
             &futex_word as *const u32 as u64,
             9,   // FUTEX_WAIT_BITSET
@@ -9627,7 +9627,7 @@ fn test_futex_requeue() -> bool {
     let futex_word: u32 = 0;
     let past_ts: [u64; 2] = [1, 0]; // 1 second after Unix epoch — long since past.
     let r = unsafe {
-        crate::syscall::dispatch_linux(
+        crate::syscall::dispatch_linux_kernel(
             202,
             &futex_word as *const u32 as u64,
             0x109, // FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME
@@ -9663,7 +9663,7 @@ fn test_futex_requeue() -> bool {
         fut_ts[0] += 1;
     }
     let r = unsafe {
-        crate::syscall::dispatch_linux(
+        crate::syscall::dispatch_linux_kernel(
             202,
             &futex_word as *const u32 as u64,
             0x109,
@@ -9690,7 +9690,7 @@ fn test_unix_socketpair() -> bool {
 
     // socketpair(AF_UNIX=1, SOCK_STREAM=1, 0, fds[2])
     let mut fds = [0i32; 2];
-    let r = crate::syscall::dispatch_linux(
+    let r = crate::syscall::dispatch_linux_kernel(
         53, // socketpair
         1,  // AF_UNIX
         1,  // SOCK_STREAM
@@ -9706,7 +9706,7 @@ fn test_unix_socketpair() -> bool {
 
     // Write "hello" from fd[0] → arrives in fd[1]'s recv buffer
     let msg = b"hello";
-    let n = crate::syscall::dispatch_linux(
+    let n = crate::syscall::dispatch_linux_kernel(
         1, // write
         fds[0] as u64,
         msg.as_ptr() as u64,
@@ -9721,7 +9721,7 @@ fn test_unix_socketpair() -> bool {
 
     // Read from fd[1]
     let mut buf = [0u8; 16];
-    let n = crate::syscall::dispatch_linux(
+    let n = crate::syscall::dispatch_linux_kernel(
         0, // read
         fds[1] as u64,
         buf.as_mut_ptr() as u64,
@@ -9739,8 +9739,8 @@ fn test_unix_socketpair() -> bool {
     test_println!("  read back {:?} ✓", core::str::from_utf8(&buf[..n as usize]).unwrap_or("?"));
 
     // Close both
-    crate::syscall::dispatch_linux(3, fds[0] as u64, 0, 0, 0, 0, 0);
-    crate::syscall::dispatch_linux(3, fds[1] as u64, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, fds[0] as u64, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, fds[1] as u64, 0, 0, 0, 0, 0);
 
     test_pass!("AF_UNIX socketpair round-trip");
     true
@@ -9752,7 +9752,7 @@ fn test_unix_bind_connect() -> bool {
     test_header!("AF_UNIX bind/listen/connect/accept");
 
     // Server socket
-    let server_fd = crate::syscall::dispatch_linux(41 /*socket*/, 1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0, 0, 0, 0);
+    let server_fd = crate::syscall::dispatch_linux_kernel(41 /*socket*/, 1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0, 0, 0, 0);
     if server_fd < 0 {
         test_fail!("unix_server", "socket() returned {}", server_fd);
         return false;
@@ -9764,7 +9764,7 @@ fn test_unix_bind_connect() -> bool {
     addr[0] = 1; addr[1] = 0; // sa_family = AF_UNIX (LE u16 = 1)
     let path = b"/tmp/test.sock\0";
     addr[2..2 + path.len()].copy_from_slice(path);
-    let r = crate::syscall::dispatch_linux(
+    let r = crate::syscall::dispatch_linux_kernel(
         49 /*bind*/, server_fd as u64,
         addr.as_ptr() as u64, addr.len() as u64,
         0, 0, 0,
@@ -9776,7 +9776,7 @@ fn test_unix_bind_connect() -> bool {
     test_println!("  bind(/tmp/test.sock) ✓");
 
     // listen
-    let r = crate::syscall::dispatch_linux(50 /*listen*/, server_fd as u64, 5, 0, 0, 0, 0);
+    let r = crate::syscall::dispatch_linux_kernel(50 /*listen*/, server_fd as u64, 5, 0, 0, 0, 0);
     if r != 0 {
         test_fail!("unix_listen", "listen() returned {}", r);
         return false;
@@ -9784,12 +9784,12 @@ fn test_unix_bind_connect() -> bool {
     test_println!("  listen() ✓");
 
     // Client socket + connect
-    let client_fd = crate::syscall::dispatch_linux(41, 1, 1, 0, 0, 0, 0);
+    let client_fd = crate::syscall::dispatch_linux_kernel(41, 1, 1, 0, 0, 0, 0);
     if client_fd < 0 {
         test_fail!("unix_client", "socket() returned {}", client_fd);
         return false;
     }
-    let r = crate::syscall::dispatch_linux(
+    let r = crate::syscall::dispatch_linux_kernel(
         42 /*connect*/, client_fd as u64,
         addr.as_ptr() as u64, addr.len() as u64,
         0, 0, 0,
@@ -9801,7 +9801,7 @@ fn test_unix_bind_connect() -> bool {
     test_println!("  client connect() ✓");
 
     // accept
-    let accepted_fd = crate::syscall::dispatch_linux(43 /*accept*/, server_fd as u64, 0, 0, 0, 0, 0);
+    let accepted_fd = crate::syscall::dispatch_linux_kernel(43 /*accept*/, server_fd as u64, 0, 0, 0, 0, 0);
     if accepted_fd < 0 {
         test_fail!("unix_accept", "accept() returned {}", accepted_fd);
         return false;
@@ -9810,22 +9810,22 @@ fn test_unix_bind_connect() -> bool {
 
     // Write from client, read on accepted
     let msg = b"world";
-    let n = crate::syscall::dispatch_linux(1, client_fd as u64, msg.as_ptr() as u64, msg.len() as u64, 0, 0, 0);
+    let n = crate::syscall::dispatch_linux_kernel(1, client_fd as u64, msg.as_ptr() as u64, msg.len() as u64, 0, 0, 0);
     if n != msg.len() as i64 {
         test_fail!("unix_write", "write returned {}", n);
         return false;
     }
     let mut buf = [0u8; 16];
-    let n = crate::syscall::dispatch_linux(0, accepted_fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0);
+    let n = crate::syscall::dispatch_linux_kernel(0, accepted_fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0);
     if n != msg.len() as i64 || &buf[..n as usize] != msg {
         test_fail!("unix_read", "read returned {} or data mismatch", n);
         return false;
     }
     test_println!("  write/read {:?} ✓", core::str::from_utf8(&buf[..n as usize]).unwrap_or("?"));
 
-    crate::syscall::dispatch_linux(3, server_fd as u64, 0, 0, 0, 0, 0);
-    crate::syscall::dispatch_linux(3, client_fd as u64, 0, 0, 0, 0, 0);
-    crate::syscall::dispatch_linux(3, accepted_fd as u64, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, server_fd as u64, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, client_fd as u64, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, accepted_fd as u64, 0, 0, 0, 0, 0);
 
     test_pass!("AF_UNIX bind/listen/connect/accept");
     true
@@ -9838,7 +9838,7 @@ fn test_proc_maps_content() -> bool {
 
     // open("/proc/self/maps", O_RDONLY)
     let path = b"/proc/self/maps\0";
-    let fd = crate::syscall::dispatch_linux(
+    let fd = crate::syscall::dispatch_linux_kernel(
         2 /*open*/,
         path.as_ptr() as u64,
         0, // O_RDONLY
@@ -9852,14 +9852,14 @@ fn test_proc_maps_content() -> bool {
 
     // Read up to 4096 bytes
     let mut buf = [0u8; 4096];
-    let n = crate::syscall::dispatch_linux(
+    let n = crate::syscall::dispatch_linux_kernel(
         0 /*read*/,
         fd as u64,
         buf.as_mut_ptr() as u64,
         buf.len() as u64,
         0, 0, 0,
     );
-    crate::syscall::dispatch_linux(3, fd as u64, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, fd as u64, 0, 0, 0, 0, 0);
 
     if n <= 0 {
         test_fail!("proc_maps", "read returned {}", n);
@@ -10029,7 +10029,7 @@ fn test_firefox() -> bool {
 // ── Test 57: Phase 1 Linux syscalls ──────────────────────────────────────────
 fn test_phase1_linux_syscalls() -> bool {
     test_header!("Phase 1 Linux Syscalls (nanosleep/getrlimit/mremap/select/ftruncate/uname/…)");
-    let dispatch = crate::syscall::dispatch_linux;
+    let dispatch = crate::syscall::dispatch_linux_kernel;
 
     // ─── Setup: mark current process as Linux ABI ───────────────────────────
     let pid = crate::proc::current_pid();
@@ -10309,7 +10309,7 @@ fn test_phase1_linux_syscalls() -> bool {
 // ── Test 58: Phase 1 batch 2 ─────────────────────────────────────────────────
 fn test_phase1_batch2_syscalls() -> bool {
     test_header!("Phase 1 Batch 2 (pipe/msync/getgroups/getresuid/umask/pselect6/times/sync)");
-    let dispatch = crate::syscall::dispatch_linux;
+    let dispatch = crate::syscall::dispatch_linux_kernel;
 
     // ─── Setup: mark current process as Linux ABI ───────────────────────────
     let pid = crate::proc::current_pid();
@@ -10515,7 +10515,7 @@ fn test_phase1_batch2_syscalls() -> bool {
 // ── Test 59: epoll + /proc/self/fd + /proc/self/status ───────────────────────
 fn test_epoll_and_proc_fd() -> bool {
     test_header!("epoll (create/ctl/wait) + /proc/self/fd (readlink+getdents) + /proc/self/status");
-    let dispatch = crate::syscall::dispatch_linux;
+    let dispatch = crate::syscall::dispatch_linux_kernel;
 
     // ─── Setup: Linux ABI ────────────────────────────────────────────────────
     let pid = crate::proc::current_pid();
@@ -10943,7 +10943,7 @@ fn test_epoll_and_proc_fd() -> bool {
 fn test_bash_compat() -> bool {
     test_header!("bash compat (job-ctrl ioctls + /etc stubs + prctl-ext)");
 
-    use crate::subsys::linux::dispatch as dispatch;
+    use crate::syscall::dispatch_linux_kernel as dispatch;
     let mut ok = true;
 
     // Set up a minimal Linux process context so ioctls reach tty_ioctl.
@@ -13994,14 +13994,14 @@ fn test_syscall_completeness() -> bool {
     }
 
     // 2. fsync and fdatasync return 0 for fd 0
-    let fsync_ret = crate::syscall::dispatch_linux(74, 0, 0, 0, 0, 0, 0);
+    let fsync_ret = crate::syscall::dispatch_linux_kernel(74, 0, 0, 0, 0, 0, 0);
     if fsync_ret != 0 {
         test_fail!("fsync", "fsync(0) returned {} (expected 0)", fsync_ret);
         ok = false;
     } else {
         test_println!("  fsync(0) → 0 ✓");
     }
-    let fdatasync_ret = crate::syscall::dispatch_linux(75, 0, 0, 0, 0, 0, 0);
+    let fdatasync_ret = crate::syscall::dispatch_linux_kernel(75, 0, 0, 0, 0, 0, 0);
     if fdatasync_ret != 0 {
         test_fail!("fdatasync", "fdatasync(0) returned {} (expected 0)", fdatasync_ret);
         ok = false;
@@ -14375,7 +14375,7 @@ fn test_clock_realtime_futex_parity() -> bool {
 
     let futex_word: u32 = 0;
     let r = unsafe {
-        crate::syscall::dispatch_linux(
+        crate::syscall::dispatch_linux_kernel(
             202,                            // futex
             &futex_word as *const u32 as u64,
             0x109,                          // FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME
@@ -14435,7 +14435,7 @@ fn test_socketpair_type_flags() -> bool {
     const EPROTONOSUPPORT: i64 = -93;
 
     let sp = |type_arg: u64, sv: &mut [u32; 2]| -> i64 {
-        crate::syscall::dispatch_linux(53, AF_UNIX, type_arg, 0, sv.as_mut_ptr() as u64, 0, 0)
+        crate::syscall::dispatch_linux_kernel(53, AF_UNIX, type_arg, 0, sv.as_mut_ptr() as u64, 0, 0)
     };
 
     // ── Sub-case 1: STREAM, no flags ────────────────────────────────────────
@@ -14447,8 +14447,8 @@ fn test_socketpair_type_flags() -> bool {
     }
     test_println!("  STREAM            → fds=[{},{}] ✓", sv[0], sv[1]);
     // Cleanup.
-    let _ = crate::syscall::dispatch_linux(3, sv[0] as u64, 0, 0, 0, 0, 0);
-    let _ = crate::syscall::dispatch_linux(3, sv[1] as u64, 0, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux_kernel(3, sv[0] as u64, 0, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux_kernel(3, sv[1] as u64, 0, 0, 0, 0, 0);
 
     // ── Sub-case 2: SEQPACKET, no flags ─────────────────────────────────────
     let mut sv = [0xFFFF_FFFFu32; 2];
@@ -14480,8 +14480,8 @@ fn test_socketpair_type_flags() -> bool {
         test_fail!("socketpair", "STREAM|CLOEXEC: rc={}", r);
         return false;
     }
-    let g0 = crate::syscall::dispatch_linux(72, sv[0] as u64, F_GETFD, 0, 0, 0, 0);
-    let g1 = crate::syscall::dispatch_linux(72, sv[1] as u64, F_GETFD, 0, 0, 0, 0);
+    let g0 = crate::syscall::dispatch_linux_kernel(72, sv[0] as u64, F_GETFD, 0, 0, 0, 0);
+    let g1 = crate::syscall::dispatch_linux_kernel(72, sv[1] as u64, F_GETFD, 0, 0, 0, 0);
     if g0 != FD_CLOEXEC || g1 != FD_CLOEXEC {
         test_fail!("socketpair",
                    "SOCK_CLOEXEC not propagated: F_GETFD on fd[0]={}, fd[1]={} (want {})",
@@ -14489,8 +14489,8 @@ fn test_socketpair_type_flags() -> bool {
         return false;
     }
     test_println!("  STREAM|CLOEXEC    → F_GETFD={},{} (FD_CLOEXEC) ✓", g0, g1);
-    let _ = crate::syscall::dispatch_linux(3, sv[0] as u64, 0, 0, 0, 0, 0);
-    let _ = crate::syscall::dispatch_linux(3, sv[1] as u64, 0, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux_kernel(3, sv[0] as u64, 0, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux_kernel(3, sv[1] as u64, 0, 0, 0, 0, 0);
 
     // ── Sub-case 4: STREAM | SOCK_NONBLOCK ──────────────────────────────────
     let mut sv = [0u32; 2];
@@ -14499,8 +14499,8 @@ fn test_socketpair_type_flags() -> bool {
         test_fail!("socketpair", "STREAM|NONBLOCK: rc={}", r);
         return false;
     }
-    let f0 = crate::syscall::dispatch_linux(72, sv[0] as u64, F_GETFL, 0, 0, 0, 0);
-    let f1 = crate::syscall::dispatch_linux(72, sv[1] as u64, F_GETFL, 0, 0, 0, 0);
+    let f0 = crate::syscall::dispatch_linux_kernel(72, sv[0] as u64, F_GETFL, 0, 0, 0, 0);
+    let f1 = crate::syscall::dispatch_linux_kernel(72, sv[1] as u64, F_GETFL, 0, 0, 0, 0);
     if (f0 & O_NONBLOCK) == 0 || (f1 & O_NONBLOCK) == 0 {
         test_fail!("socketpair",
                    "SOCK_NONBLOCK not propagated: F_GETFL on fd[0]={:#x}, fd[1]={:#x}",
@@ -14508,8 +14508,8 @@ fn test_socketpair_type_flags() -> bool {
         return false;
     }
     test_println!("  STREAM|NONBLOCK   → F_GETFL={:#x},{:#x} (O_NONBLOCK) ✓", f0, f1);
-    let _ = crate::syscall::dispatch_linux(3, sv[0] as u64, 0, 0, 0, 0, 0);
-    let _ = crate::syscall::dispatch_linux(3, sv[1] as u64, 0, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux_kernel(3, sv[0] as u64, 0, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux_kernel(3, sv[1] as u64, 0, 0, 0, 0, 0);
 
     // ── Sub-case 5: unknown sock_type → -EPROTONOSUPPORT ───────────────────
     let mut sv = [0u32; 2];
@@ -14581,8 +14581,8 @@ fn test_socketpair_type_flags() -> bool {
     }
     test_println!("  SEQPACKET truncate: 100-byte msg → 32-byte read, tail discarded ✓");
 
-    let _ = crate::syscall::dispatch_linux(3, seq_fd_a, 0, 0, 0, 0, 0);
-    let _ = crate::syscall::dispatch_linux(3, seq_fd_b, 0, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux_kernel(3, seq_fd_a, 0, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux_kernel(3, seq_fd_b, 0, 0, 0, 0, 0);
 
     test_pass!("socketpair(2) — type / SOCK_CLOEXEC / SOCK_NONBLOCK / SEQPACKET");
     true
@@ -14595,10 +14595,10 @@ fn test_new_syscall_stubs() -> bool {
     let mut ok = true;
 
     // mlock(149) / munlock(150) / mlockall(151) / munlockall(152) — must return 0
-    let mlock_ret  = crate::syscall::dispatch_linux(149, 0x400000, 0x1000, 0, 0, 0, 0);
-    let munlock_ret = crate::syscall::dispatch_linux(150, 0x400000, 0x1000, 0, 0, 0, 0);
-    let mlockall_ret = crate::syscall::dispatch_linux(151, 3, 0, 0, 0, 0, 0); // MCL_CURRENT|MCL_FUTURE
-    let munlockall_ret = crate::syscall::dispatch_linux(152, 0, 0, 0, 0, 0, 0);
+    let mlock_ret  = crate::syscall::dispatch_linux_kernel(149, 0x400000, 0x1000, 0, 0, 0, 0);
+    let munlock_ret = crate::syscall::dispatch_linux_kernel(150, 0x400000, 0x1000, 0, 0, 0, 0);
+    let mlockall_ret = crate::syscall::dispatch_linux_kernel(151, 3, 0, 0, 0, 0, 0); // MCL_CURRENT|MCL_FUTURE
+    let munlockall_ret = crate::syscall::dispatch_linux_kernel(152, 0, 0, 0, 0, 0, 0);
     if mlock_ret != 0 {
         test_fail!("mlock", "returned {} (expected 0)", mlock_ret);
         ok = false;
@@ -14617,7 +14617,7 @@ fn test_new_syscall_stubs() -> bool {
 
     // execveat(322) with empty path should return ENOSYS (-38)
     let empty: [u8; 1] = [0u8];
-    let execveat_ret = crate::syscall::dispatch_linux(322, 0, empty.as_ptr() as u64, 0, 0, 0x1000, 0);
+    let execveat_ret = crate::syscall::dispatch_linux_kernel(322, 0, empty.as_ptr() as u64, 0, 0, 0x1000, 0);
     if execveat_ret != -38 {
         test_fail!("execveat empty-path", "returned {} (expected -38/ENOSYS)", execveat_ret);
         ok = false;
@@ -18455,7 +18455,7 @@ fn test_statx_regular_file() -> bool {
     let path: &[u8] = b"/etc/passwd\0";
 
     // statx(AT_FDCWD=-100, path, 0, STATX_BASIC_STATS=0x7ff, &sx)
-    let r = crate::syscall::dispatch_linux(
+    let r = crate::syscall::dispatch_linux_kernel(
         332,
         (-100i64) as u64,   // dirfd = AT_FDCWD
         path.as_ptr() as u64,
@@ -18506,7 +18506,7 @@ fn test_getrandom_fills_buffer() -> bool {
     let mut buf = [0u8; 64];
 
     // getrandom(buf, 64, 0) — no flags
-    let r = crate::syscall::dispatch_linux(
+    let r = crate::syscall::dispatch_linux_kernel(
         318,
         buf.as_mut_ptr() as u64,
         64,
@@ -18540,7 +18540,7 @@ fn test_mremap_shrink() -> bool {
     test_header!("mremap(25): shrink 4-page → 2-page, first 2 pages readable");
 
     // mmap 4 anonymous pages (16 KiB), PROT_RW, MAP_PRIVATE|MAP_ANONYMOUS
-    let addr = crate::syscall::dispatch_linux(
+    let addr = crate::syscall::dispatch_linux_kernel(
         9, 0, 0x4000, 3, 0x22, u64::MAX, 0,
     );
     if addr <= 0 {
@@ -18553,7 +18553,7 @@ fn test_mremap_shrink() -> bool {
     unsafe { core::ptr::write(addr as *mut u64, 0xCAFE_BABE_1234_5678u64); }
 
     // mremap(addr, 0x4000, 0x2000, 0) — shrink to 2 pages, no MAYMOVE
-    let r = crate::syscall::dispatch_linux(
+    let r = crate::syscall::dispatch_linux_kernel(
         25,
         addr as u64, // old_addr
         0x4000,      // old_size
@@ -18577,7 +18577,7 @@ fn test_mremap_shrink() -> bool {
     }
 
     // Cleanup: munmap the remaining 2 pages
-    let _ = crate::syscall::dispatch_linux(11, addr as u64, 0x2000, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux_kernel(11, addr as u64, 0x2000, 0, 0, 0, 0);
 
     test_pass!("mremap shrink: sentinel readable, addr unchanged ✓");
     true
@@ -18594,7 +18594,7 @@ fn test_set_robust_list_roundtrip() -> bool {
     let fake_len:  u64 = 24; // sizeof(struct robust_list_head)
 
     // set_robust_list(head, len)
-    let set_r = crate::syscall::dispatch_linux(273, fake_head, fake_len, 0, 0, 0, 0);
+    let set_r = crate::syscall::dispatch_linux_kernel(273, fake_head, fake_len, 0, 0, 0, 0);
     test_println!("  set_robust_list({:#x}, {}) = {}", fake_head, fake_len, set_r);
     if set_r != 0 {
         test_fail!("set_robust_list_roundtrip", "set returned {} (expected 0)", set_r);
@@ -18604,7 +18604,7 @@ fn test_set_robust_list_roundtrip() -> bool {
     // get_robust_list(0 = calling thread, &head_out, &len_out)
     let mut head_out: u64 = 0;
     let mut len_out:  u64 = 0;
-    let get_r = crate::syscall::dispatch_linux(
+    let get_r = crate::syscall::dispatch_linux_kernel(
         274,
         0,                             // pid=0 → calling thread
         &mut head_out as *mut u64 as u64,
@@ -18636,7 +18636,7 @@ fn test_membarrier_query() -> bool {
     test_header!("membarrier(324): QUERY returns mask including GLOBAL (bit 0x1)");
 
     // membarrier(MEMBARRIER_CMD_QUERY=0, flags=0, cpu_id=0)
-    let r = crate::syscall::dispatch_linux(324, 0, 0, 0, 0, 0, 0);
+    let r = crate::syscall::dispatch_linux_kernel(324, 0, 0, 0, 0, 0, 0);
     test_println!("  membarrier(QUERY) = {:#x}", r as u64);
 
     if r <= 0 {
@@ -18650,7 +18650,7 @@ fn test_membarrier_query() -> bool {
     }
 
     // Also verify GLOBAL command executes without error
-    let r2 = crate::syscall::dispatch_linux(324, 1, 0, 0, 0, 0, 0);
+    let r2 = crate::syscall::dispatch_linux_kernel(324, 1, 0, 0, 0, 0, 0);
     test_println!("  membarrier(GLOBAL) = {}", r2);
     if r2 != 0 {
         test_fail!("membarrier_query", "GLOBAL command returned {} (expected 0)", r2);
@@ -18672,7 +18672,7 @@ fn test_sched_getaffinity_shows_all_cpus() -> bool {
     // ── Sub-test 1: normal-sized buffer (128 bytes) ──────────────────────────
     // Per `man 2 sched_getaffinity`: raw syscall returns bytes-copied (>0).
     let mut cpuset = [0u8; 128];
-    let r = crate::syscall::dispatch_linux(
+    let r = crate::syscall::dispatch_linux_kernel(
         204,
         0,                             // pid = 0 → caller
         128,                           // cpusetsize
@@ -18698,7 +18698,7 @@ fn test_sched_getaffinity_shows_all_cpus() -> bool {
 
     // ── Sub-test 2: small buffer (8 bytes) → must return exactly 8 ───────────
     let mut small = [0xFFu8; 8];
-    let r2 = crate::syscall::dispatch_linux(
+    let r2 = crate::syscall::dispatch_linux_kernel(
         204, 0, 8, small.as_mut_ptr() as u64, 0, 0, 0,
     );
     test_println!("  sched_getaffinity(bufsiz=8) = {}", r2);
@@ -18713,7 +18713,7 @@ fn test_sched_getaffinity_shows_all_cpus() -> bool {
     }
 
     // ── Sub-test 3: NULL buffer — preserve existing permissive behavior (0) ─
-    let r3 = crate::syscall::dispatch_linux(204, 0, 128, 0, 0, 0, 0);
+    let r3 = crate::syscall::dispatch_linux_kernel(204, 0, 128, 0, 0, 0, 0);
     test_println!("  sched_getaffinity(NULL) = {}", r3);
     if r3 != 0 {
         test_fail!("sched_getaffinity_shows_all_cpus",
@@ -18737,7 +18737,7 @@ fn test_rseq_enosys() -> bool {
     test_header!("rseq(334): stub returns 0 (W210) or -ENOSYS — not a random value");
 
     // rseq(NULL, 0, 0, 0) — minimal call
-    let r = crate::syscall::dispatch_linux(334, 0, 0, 0, 0, 0, 0);
+    let r = crate::syscall::dispatch_linux_kernel(334, 0, 0, 0, 0, 0, 0);
     test_println!("  rseq(334) = {}", r);
 
     if r != 0 && r != -38 {
@@ -20082,7 +20082,7 @@ fn test_syscall_number_alignment_sem_family() -> bool {
 
 // ── T0/T1 syscall tests ─────────────────────────────────────────────────────
 
-use crate::subsys::linux::syscall::dispatch;
+use crate::syscall::dispatch_linux_kernel as dispatch;
 
 /// Test creat(85) — creates a new file via O_CREAT|O_WRONLY|O_TRUNC.
 fn test_syscall_creat() -> bool {
@@ -20667,7 +20667,7 @@ fn test_syscall_pwritev_scatter_write() -> bool {
 // ── Test 154: chmod persists ─────────────────────────────────────────────────
 fn test_chmod_persists() -> bool {
     test_header!("chmod persists — stat reflects updated mode bits");
-    let dispatch = crate::syscall::dispatch_linux;
+    let dispatch = crate::syscall::dispatch_linux_kernel;
 
     // Setup: mark current process as Linux ABI.
     let pid = crate::proc::current_pid();
@@ -20731,7 +20731,7 @@ fn test_chmod_persists() -> bool {
 // and that a simulated second-process lock conflicts (by inserting a raw entry).
 fn test_flock_exclusive_blocks_second() -> bool {
     test_header!("flock — LOCK_EX acquire/release + conflict detection");
-    let dispatch = crate::syscall::dispatch_linux;
+    let dispatch = crate::syscall::dispatch_linux_kernel;
 
     let pid = crate::proc::current_pid();
     {
@@ -20836,7 +20836,7 @@ fn test_flock_exclusive_blocks_second() -> bool {
 // ── Test 144: msync returns sane errno ───────────────────────────────────────
 fn test_msync_returns_sane_errno() -> bool {
     test_header!("msync returns -ENOSYS (honest: no writeback infrastructure)");
-    let dispatch = crate::syscall::dispatch_linux;
+    let dispatch = crate::syscall::dispatch_linux_kernel;
 
     let pid = crate::proc::current_pid();
     {
@@ -20873,7 +20873,7 @@ fn test_msync_returns_sane_errno() -> bool {
 // ── Test 145: chroot returns ENOSYS or works ──────────────────────────────────
 fn test_chroot_returns_enosys_or_works() -> bool {
     test_header!("chroot returns -ENOSYS or sets per-task root (not silent 0)");
-    let dispatch = crate::syscall::dispatch_linux;
+    let dispatch = crate::syscall::dispatch_linux_kernel;
 
     let pid = crate::proc::current_pid();
     {
@@ -21081,7 +21081,7 @@ fn test_pipe2_cloexec() -> bool {
 
     let mut fds = [0u32; 2];
     // pipe2(fds, O_CLOEXEC=0x80000)
-    let r = crate::syscall::dispatch_linux(293, fds.as_mut_ptr() as u64, 0x0008_0000, 0, 0, 0, 0);
+    let r = crate::syscall::dispatch_linux_kernel(293, fds.as_mut_ptr() as u64, 0x0008_0000, 0, 0, 0, 0);
     if r != 0 {
         test_fail!("pipe2_cloexec", "pipe2(O_CLOEXEC) returned {}", r);
         return false;
@@ -21090,25 +21090,25 @@ fn test_pipe2_cloexec() -> bool {
     test_println!("  pipe2(O_CLOEXEC) → r={} w={} ✓", rfd, wfd);
 
     // F_GETFD = 1; FD_CLOEXEC = 1
-    let r_flags = crate::syscall::dispatch_linux(72 /*fcntl*/, rfd, 1 /*F_GETFD*/, 0, 0, 0, 0);
-    let w_flags = crate::syscall::dispatch_linux(72 /*fcntl*/, wfd, 1 /*F_GETFD*/, 0, 0, 0, 0);
+    let r_flags = crate::syscall::dispatch_linux_kernel(72 /*fcntl*/, rfd, 1 /*F_GETFD*/, 0, 0, 0, 0);
+    let w_flags = crate::syscall::dispatch_linux_kernel(72 /*fcntl*/, wfd, 1 /*F_GETFD*/, 0, 0, 0, 0);
 
     if r_flags & 1 == 0 {
         test_fail!("pipe2_cloexec", "read-end FD_CLOEXEC not set (fcntl={:#x})", r_flags);
-        crate::syscall::dispatch_linux(3, rfd, 0, 0, 0, 0, 0);
-        crate::syscall::dispatch_linux(3, wfd, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, rfd, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd, 0, 0, 0, 0, 0);
         return false;
     }
     if w_flags & 1 == 0 {
         test_fail!("pipe2_cloexec", "write-end FD_CLOEXEC not set (fcntl={:#x})", w_flags);
-        crate::syscall::dispatch_linux(3, rfd, 0, 0, 0, 0, 0);
-        crate::syscall::dispatch_linux(3, wfd, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, rfd, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, wfd, 0, 0, 0, 0, 0);
         return false;
     }
     test_println!("  F_GETFD read-end={:#x} write-end={:#x} (FD_CLOEXEC set) ✓", r_flags, w_flags);
 
-    crate::syscall::dispatch_linux(3, rfd, 0, 0, 0, 0, 0);
-    crate::syscall::dispatch_linux(3, wfd, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, rfd, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, wfd, 0, 0, 0, 0, 0);
     test_pass!("pipe2 O_CLOEXEC — FD_CLOEXEC on both ends");
     true
 }
@@ -21120,7 +21120,7 @@ fn test_dup3_cloexec() -> bool {
 
     // Open a file to get a base fd.
     let path = b"/etc/passwd\0";
-    let base_fd = crate::syscall::dispatch_linux(
+    let base_fd = crate::syscall::dispatch_linux_kernel(
         2 /*open*/, path.as_ptr() as u64, 0 /*O_RDONLY*/, 0, 0, 0, 0,
     );
     if base_fd < 0 {
@@ -21131,28 +21131,28 @@ fn test_dup3_cloexec() -> bool {
 
     // dup3(base_fd, target_fd, O_CLOEXEC) — pick target_fd = base_fd+10
     let target_fd = (base_fd + 10) as u64;
-    let r = crate::syscall::dispatch_linux(
+    let r = crate::syscall::dispatch_linux_kernel(
         292 /*dup3*/, base_fd as u64, target_fd, 0x0008_0000 /*O_CLOEXEC*/, 0, 0, 0,
     );
     if r != target_fd as i64 {
         test_fail!("dup3_cloexec", "dup3() returned {} (expected {})", r, target_fd);
-        crate::syscall::dispatch_linux(3, base_fd as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, base_fd as u64, 0, 0, 0, 0, 0);
         return false;
     }
     test_println!("  dup3({}, {}, O_CLOEXEC) → {} ✓", base_fd, target_fd, r);
 
     // F_GETFD should return FD_CLOEXEC (1).
-    let flags = crate::syscall::dispatch_linux(72 /*fcntl*/, target_fd, 1 /*F_GETFD*/, 0, 0, 0, 0);
+    let flags = crate::syscall::dispatch_linux_kernel(72 /*fcntl*/, target_fd, 1 /*F_GETFD*/, 0, 0, 0, 0);
     if flags & 1 == 0 {
         test_fail!("dup3_cloexec", "FD_CLOEXEC not set on dup'd fd (fcntl={:#x})", flags);
-        crate::syscall::dispatch_linux(3, base_fd as u64, 0, 0, 0, 0, 0);
-        crate::syscall::dispatch_linux(3, target_fd, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, base_fd as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, target_fd, 0, 0, 0, 0, 0);
         return false;
     }
     test_println!("  F_GETFD → {:#x} (FD_CLOEXEC set) ✓", flags);
 
-    crate::syscall::dispatch_linux(3, base_fd as u64, 0, 0, 0, 0, 0);
-    crate::syscall::dispatch_linux(3, target_fd, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, base_fd as u64, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, target_fd, 0, 0, 0, 0, 0);
     test_pass!("dup3 O_CLOEXEC — FD_CLOEXEC on dup'd fd");
     true
 }
@@ -21163,7 +21163,7 @@ fn test_eventfd_roundtrip() -> bool {
     test_header!("eventfd roundtrip — initval=5, r→5, w=3, r→3");
 
     // eventfd(5, 0)
-    let efd = crate::syscall::dispatch_linux(284 /*eventfd*/, 5, 0, 0, 0, 0, 0);
+    let efd = crate::syscall::dispatch_linux_kernel(284 /*eventfd*/, 5, 0, 0, 0, 0, 0);
     if efd < 0 {
         test_fail!("eventfd_roundtrip", "eventfd(5, 0) returned {}", efd);
         return false;
@@ -21172,16 +21172,16 @@ fn test_eventfd_roundtrip() -> bool {
 
     // read 8 bytes → should be 5
     let mut buf = [0u8; 8];
-    let n = crate::syscall::dispatch_linux(0 /*read*/, efd as u64, buf.as_mut_ptr() as u64, 8, 0, 0, 0);
+    let n = crate::syscall::dispatch_linux_kernel(0 /*read*/, efd as u64, buf.as_mut_ptr() as u64, 8, 0, 0, 0);
     if n != 8 {
         test_fail!("eventfd_roundtrip", "read returned {} (expected 8)", n);
-        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, efd as u64, 0, 0, 0, 0, 0);
         return false;
     }
     let val = u64::from_le_bytes(buf);
     if val != 5 {
         test_fail!("eventfd_roundtrip", "read value {} (expected 5)", val);
-        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, efd as u64, 0, 0, 0, 0, 0);
         return false;
     }
     test_println!("  read → {} ✓", val);
@@ -21189,30 +21189,30 @@ fn test_eventfd_roundtrip() -> bool {
     // write 3
     let write_val: u64 = 3u64.to_le();
     let wbuf = write_val.to_le_bytes();
-    let n = crate::syscall::dispatch_linux(1 /*write*/, efd as u64, wbuf.as_ptr() as u64, 8, 0, 0, 0);
+    let n = crate::syscall::dispatch_linux_kernel(1 /*write*/, efd as u64, wbuf.as_ptr() as u64, 8, 0, 0, 0);
     if n != 8 {
         test_fail!("eventfd_roundtrip", "write returned {} (expected 8)", n);
-        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, efd as u64, 0, 0, 0, 0, 0);
         return false;
     }
     test_println!("  write(3) → 8 bytes ✓");
 
     // read → 3
-    let n = crate::syscall::dispatch_linux(0 /*read*/, efd as u64, buf.as_mut_ptr() as u64, 8, 0, 0, 0);
+    let n = crate::syscall::dispatch_linux_kernel(0 /*read*/, efd as u64, buf.as_mut_ptr() as u64, 8, 0, 0, 0);
     if n != 8 {
         test_fail!("eventfd_roundtrip", "second read returned {} (expected 8)", n);
-        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, efd as u64, 0, 0, 0, 0, 0);
         return false;
     }
     let val2 = u64::from_le_bytes(buf);
     if val2 != 3 {
         test_fail!("eventfd_roundtrip", "second read value {} (expected 3)", val2);
-        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, efd as u64, 0, 0, 0, 0, 0);
         return false;
     }
     test_println!("  read → {} ✓", val2);
 
-    crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, efd as u64, 0, 0, 0, 0, 0);
     test_pass!("eventfd roundtrip — initval=5, r→5, w=3, r→3");
     true
 }
@@ -21223,7 +21223,7 @@ fn test_eventfd2_nonblock() -> bool {
     test_header!("eventfd2 EFD_NONBLOCK — read on empty → -EAGAIN");
 
     // eventfd2(0, EFD_NONBLOCK=0x800)
-    let efd = crate::syscall::dispatch_linux(290 /*eventfd2*/, 0, 0x0800 /*EFD_NONBLOCK*/, 0, 0, 0, 0);
+    let efd = crate::syscall::dispatch_linux_kernel(290 /*eventfd2*/, 0, 0x0800 /*EFD_NONBLOCK*/, 0, 0, 0, 0);
     if efd < 0 {
         test_fail!("eventfd2_nonblock", "eventfd2(0, EFD_NONBLOCK) returned {}", efd);
         return false;
@@ -21232,15 +21232,15 @@ fn test_eventfd2_nonblock() -> bool {
 
     // read on empty counter → -EAGAIN (-11)
     let mut buf = [0u8; 8];
-    let n = crate::syscall::dispatch_linux(0 /*read*/, efd as u64, buf.as_mut_ptr() as u64, 8, 0, 0, 0);
+    let n = crate::syscall::dispatch_linux_kernel(0 /*read*/, efd as u64, buf.as_mut_ptr() as u64, 8, 0, 0, 0);
     if n != -11 {
         test_fail!("eventfd2_nonblock", "read on empty returned {} (expected -11 EAGAIN)", n);
-        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, efd as u64, 0, 0, 0, 0, 0);
         return false;
     }
     test_println!("  read on empty eventfd2 → -EAGAIN ✓");
 
-    crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, efd as u64, 0, 0, 0, 0, 0);
     test_pass!("eventfd2 EFD_NONBLOCK — read on empty → -EAGAIN");
     true
 }
@@ -21279,7 +21279,7 @@ fn test_rt_tgsigqueueinfo_delivers() -> bool {
     siginfo[0..4].copy_from_slice(&(SIGUSR1 as u32).to_le_bytes());
 
     // rt_tgsigqueueinfo(tgid=pid, tid=tid, sig=SIGUSR1, uinfo=&siginfo)
-    let r = crate::syscall::dispatch_linux(
+    let r = crate::syscall::dispatch_linux_kernel(
         297,
         pid as u64,
         tid as u64,
@@ -21330,7 +21330,7 @@ fn test_prlimit64_getrlimit_equivalence() -> bool {
 
     // getrlimit(RLIMIT_STACK, &r)
     let mut gr = [0u64; 2];
-    let r = crate::syscall::dispatch_linux(
+    let r = crate::syscall::dispatch_linux_kernel(
         97 /*getrlimit*/, RLIMIT_STACK, gr.as_mut_ptr() as u64, 0, 0, 0, 0,
     );
     if r != 0 {
@@ -21341,7 +21341,7 @@ fn test_prlimit64_getrlimit_equivalence() -> bool {
 
     // prlimit64(0 = calling process, RLIMIT_STACK, NULL, &old)
     let mut pl = [0u64; 2];
-    let r = crate::syscall::dispatch_linux(
+    let r = crate::syscall::dispatch_linux_kernel(
         302 /*prlimit64*/,
         0,             // pid = 0 means calling process
         RLIMIT_STACK,
@@ -21374,7 +21374,7 @@ fn test_syncfs_on_file() -> bool {
 
     // Open /etc/passwd to get a valid fd.
     let path = b"/etc/passwd\0";
-    let fd = crate::syscall::dispatch_linux(
+    let fd = crate::syscall::dispatch_linux_kernel(
         2 /*open*/, path.as_ptr() as u64, 0 /*O_RDONLY*/, 0, 0, 0, 0,
     );
     if fd < 0 {
@@ -21384,15 +21384,15 @@ fn test_syncfs_on_file() -> bool {
     test_println!("  open(/etc/passwd) → fd {} ✓", fd);
 
     // syncfs(fd) should return 0.
-    let r = crate::syscall::dispatch_linux(306 /*syncfs*/, fd as u64, 0, 0, 0, 0, 0);
+    let r = crate::syscall::dispatch_linux_kernel(306 /*syncfs*/, fd as u64, 0, 0, 0, 0, 0);
     if r != 0 {
         test_fail!("syncfs", "syncfs({}) returned {}", fd, r);
-        crate::syscall::dispatch_linux(3, fd as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, fd as u64, 0, 0, 0, 0, 0);
         return false;
     }
     test_println!("  syncfs({}) → 0 ✓", fd);
 
-    crate::syscall::dispatch_linux(3, fd as u64, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, fd as u64, 0, 0, 0, 0, 0);
     test_pass!("syncfs(fd) — returns 0 on open file");
     true
 }
@@ -21403,7 +21403,7 @@ fn test_pkey_alloc_default() -> bool {
     test_header!("pkey_alloc(0,0)→0; pkey_free(0)→-EINVAL");
 
     // pkey_alloc(flags=0, access_rights=0) — must return 0 (default key).
-    let key = crate::syscall::dispatch_linux(330 /*pkey_alloc*/, 0, 0, 0, 0, 0, 0);
+    let key = crate::syscall::dispatch_linux_kernel(330 /*pkey_alloc*/, 0, 0, 0, 0, 0, 0);
     if key != 0 {
         test_fail!("pkey_alloc", "pkey_alloc(0,0) returned {} (expected 0)", key);
         return false;
@@ -21411,7 +21411,7 @@ fn test_pkey_alloc_default() -> bool {
     test_println!("  pkey_alloc(0, 0) → 0 ✓");
 
     // pkey_alloc with non-zero flags → -EINVAL.
-    let r = crate::syscall::dispatch_linux(330 /*pkey_alloc*/, 1, 0, 0, 0, 0, 0);
+    let r = crate::syscall::dispatch_linux_kernel(330 /*pkey_alloc*/, 1, 0, 0, 0, 0, 0);
     if r != -22 {
         test_fail!("pkey_alloc", "pkey_alloc(1,0) returned {} (expected -EINVAL)", r);
         return false;
@@ -21419,7 +21419,7 @@ fn test_pkey_alloc_default() -> bool {
     test_println!("  pkey_alloc(1, 0) → -EINVAL ✓");
 
     // pkey_free(0) — pkey 0 is the default key; freeing it must fail with -EINVAL.
-    let r = crate::syscall::dispatch_linux(331 /*pkey_free*/, 0, 0, 0, 0, 0, 0);
+    let r = crate::syscall::dispatch_linux_kernel(331 /*pkey_free*/, 0, 0, 0, 0, 0, 0);
     if r != -22 {
         test_fail!("pkey_free", "pkey_free(0) returned {} (expected -EINVAL)", r);
         return false;
@@ -21444,7 +21444,7 @@ fn test_openat2_basic() -> bool {
 
     let path = b"/etc/passwd\0";
     // openat2(AT_FDCWD=-100, path, &how, sizeof(how)=24)
-    let fd = crate::syscall::dispatch_linux(
+    let fd = crate::syscall::dispatch_linux_kernel(
         437 /*openat2*/,
         (-100i64) as u64,          // AT_FDCWD
         path.as_ptr() as u64,
@@ -21460,15 +21460,15 @@ fn test_openat2_basic() -> bool {
 
     // Verify the fd is readable — read a few bytes.
     let mut buf = [0u8; 8];
-    let n = crate::syscall::dispatch_linux(0 /*read*/, fd as u64, buf.as_mut_ptr() as u64, 8, 0, 0, 0);
+    let n = crate::syscall::dispatch_linux_kernel(0 /*read*/, fd as u64, buf.as_mut_ptr() as u64, 8, 0, 0, 0);
     if n <= 0 {
         test_fail!("openat2_basic", "read from fd returned {}", n);
-        crate::syscall::dispatch_linux(3, fd as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, fd as u64, 0, 0, 0, 0, 0);
         return false;
     }
     test_println!("  read {} bytes → valid fd ✓", n);
 
-    crate::syscall::dispatch_linux(3, fd as u64, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, fd as u64, 0, 0, 0, 0, 0);
     test_pass!("openat2(437) basic — open /etc/passwd with open_how");
     true
 }
@@ -23469,7 +23469,7 @@ fn test_eventfd_blocking_read_wakes() -> bool {
     test_header!("eventfd — blocking read returns counter, never EAGAIN");
 
     // eventfd2(0, 0) — flags=0 means BLOCKING.
-    let efd = crate::syscall::dispatch_linux(290 /*eventfd2*/, 0, 0 /*flags=0*/, 0, 0, 0, 0);
+    let efd = crate::syscall::dispatch_linux_kernel(290 /*eventfd2*/, 0, 0 /*flags=0*/, 0, 0, 0, 0);
     if efd < 0 {
         test_fail!("eventfd_blocking_read", "eventfd2(0, 0) returned {}", efd);
         return false;
@@ -23478,10 +23478,10 @@ fn test_eventfd_blocking_read_wakes() -> bool {
     // Write 7 to the counter.
     let wval: u64 = 7u64.to_le();
     let wbuf = wval.to_le_bytes();
-    let n = crate::syscall::dispatch_linux(1 /*write*/, efd as u64, wbuf.as_ptr() as u64, 8, 0, 0, 0);
+    let n = crate::syscall::dispatch_linux_kernel(1 /*write*/, efd as u64, wbuf.as_ptr() as u64, 8, 0, 0, 0);
     if n != 8 {
         test_fail!("eventfd_blocking_read", "write(7) returned {} (expected 8)", n);
-        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, efd as u64, 0, 0, 0, 0, 0);
         return false;
     }
 
@@ -23489,27 +23489,27 @@ fn test_eventfd_blocking_read_wakes() -> bool {
     // (counter is already non-zero).  Critically, it must NOT return -EAGAIN,
     // which is the bug that prevented Mozilla's IPC channel from advancing.
     let mut rbuf = [0u8; 8];
-    let n = crate::syscall::dispatch_linux(0 /*read*/, efd as u64, rbuf.as_mut_ptr() as u64, 8, 0, 0, 0);
+    let n = crate::syscall::dispatch_linux_kernel(0 /*read*/, efd as u64, rbuf.as_mut_ptr() as u64, 8, 0, 0, 0);
     if n == -11 {
         test_fail!("eventfd_blocking_read",
             "blocking eventfd returned -EAGAIN despite counter=7 (regression)");
-        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, efd as u64, 0, 0, 0, 0, 0);
         return false;
     }
     if n != 8 {
         test_fail!("eventfd_blocking_read", "read returned {} (expected 8)", n);
-        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, efd as u64, 0, 0, 0, 0, 0);
         return false;
     }
     let val = u64::from_le_bytes(rbuf);
     if val != 7 {
         test_fail!("eventfd_blocking_read", "read value {} (expected 7)", val);
-        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, efd as u64, 0, 0, 0, 0, 0);
         return false;
     }
     test_println!("  blocking read on eventfd(counter=7) → {} ✓", val);
 
-    crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, efd as u64, 0, 0, 0, 0, 0);
     test_pass!("eventfd — blocking read returns counter, never EAGAIN");
     true
 }
@@ -23523,43 +23523,43 @@ fn test_eventfd_blocking_read_wakes() -> bool {
 fn test_eventfd_fcntl_setfl_nonblock() -> bool {
     test_header!("eventfd — fcntl(F_SETFL,O_NONBLOCK) toggles non-blocking semantics");
 
-    let efd = crate::syscall::dispatch_linux(290 /*eventfd2*/, 0, 0, 0, 0, 0, 0);
+    let efd = crate::syscall::dispatch_linux_kernel(290 /*eventfd2*/, 0, 0, 0, 0, 0, 0);
     if efd < 0 {
         test_fail!("eventfd_setfl", "eventfd2(0, 0) returned {}", efd);
         return false;
     }
 
     // Apply O_NONBLOCK via fcntl(F_SETFL).  F_SETFL = 4.  O_NONBLOCK = 0x800.
-    let r = crate::syscall::dispatch_linux(72 /*fcntl*/, efd as u64, 4 /*F_SETFL*/, 0x0800, 0, 0, 0);
+    let r = crate::syscall::dispatch_linux_kernel(72 /*fcntl*/, efd as u64, 4 /*F_SETFL*/, 0x0800, 0, 0, 0);
     if r != 0 {
         test_fail!("eventfd_setfl", "fcntl(F_SETFL,O_NONBLOCK) returned {} (expected 0)", r);
-        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, efd as u64, 0, 0, 0, 0, 0);
         return false;
     }
     test_println!("  fcntl(F_SETFL,O_NONBLOCK) → 0 ✓");
 
     // F_GETFL should now report O_NONBLOCK set.
-    let flags = crate::syscall::dispatch_linux(72 /*fcntl*/, efd as u64, 3 /*F_GETFL*/, 0, 0, 0, 0);
+    let flags = crate::syscall::dispatch_linux_kernel(72 /*fcntl*/, efd as u64, 3 /*F_GETFL*/, 0, 0, 0, 0);
     if flags < 0 || (flags as u64) & 0x0800 == 0 {
         test_fail!("eventfd_setfl",
             "F_GETFL returned {:#x}, expected O_NONBLOCK set", flags);
-        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, efd as u64, 0, 0, 0, 0, 0);
         return false;
     }
     test_println!("  F_GETFL after F_SETFL → {:#x} (O_NONBLOCK set) ✓", flags);
 
     // Read on empty counter → -EAGAIN now that O_NONBLOCK is set.
     let mut buf = [0u8; 8];
-    let n = crate::syscall::dispatch_linux(0 /*read*/, efd as u64, buf.as_mut_ptr() as u64, 8, 0, 0, 0);
+    let n = crate::syscall::dispatch_linux_kernel(0 /*read*/, efd as u64, buf.as_mut_ptr() as u64, 8, 0, 0, 0);
     if n != -11 {
         test_fail!("eventfd_setfl",
             "read after F_SETFL,O_NONBLOCK returned {} (expected -11 EAGAIN)", n);
-        crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+        crate::syscall::dispatch_linux_kernel(3, efd as u64, 0, 0, 0, 0, 0);
         return false;
     }
     test_println!("  read on empty NONBLOCK eventfd → -EAGAIN ✓");
 
-    crate::syscall::dispatch_linux(3, efd as u64, 0, 0, 0, 0, 0);
+    crate::syscall::dispatch_linux_kernel(3, efd as u64, 0, 0, 0, 0, 0);
     test_pass!("eventfd — fcntl(F_SETFL,O_NONBLOCK) toggles non-blocking semantics");
     true
 }
@@ -23602,7 +23602,7 @@ fn test_rt_sigaction_flags_mask_roundtrip() -> bool {
     new_act[24..32].copy_from_slice(&want_mask.to_le_bytes());
 
     // setact: act=&new_act, oldact=NULL.
-    let r = crate::syscall::dispatch_linux(
+    let r = crate::syscall::dispatch_linux_kernel(
         13, SIGCHLD, new_act.as_ptr() as u64, 0, 8, 0, 0,
     );
     if r != 0 {
@@ -23615,7 +23615,7 @@ fn test_rt_sigaction_flags_mask_roundtrip() -> bool {
 
     // getact: act=NULL, oldact=&buf.
     let mut old_act = [0u8; 32];
-    let r = crate::syscall::dispatch_linux(
+    let r = crate::syscall::dispatch_linux_kernel(
         13, SIGCHLD, 0, old_act.as_mut_ptr() as u64, 8, 0, 0,
     );
     if r != 0 {
@@ -23650,7 +23650,7 @@ fn test_rt_sigaction_flags_mask_roundtrip() -> bool {
     // Reset SIGCHLD to default so other tests aren't affected.
     let mut reset_act = [0u8; 32];
     // sa_handler=0 (SIG_DFL), all-zero flags/mask.
-    let _ = crate::syscall::dispatch_linux(
+    let _ = crate::syscall::dispatch_linux_kernel(
         13, SIGCHLD, reset_act.as_ptr() as u64, 0, 8, 0, 0,
     );
     let _ = &mut reset_act; // silence unused-mut
@@ -25625,8 +25625,8 @@ fn test_recvmsg_msg_flags_overwrite() -> bool {
     let w = crate::net::unix::write(id_a, &msg);
     if w != 64 {
         test_fail!("recvmsg_flags", "write returned {} (want 64)", w);
-        let _ = crate::syscall::dispatch_linux(3, fd_a as u64, 0, 0, 0, 0, 0);
-        let _ = crate::syscall::dispatch_linux(3, fd_b as u64, 0, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_a as u64, 0, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_b as u64, 0, 0, 0, 0, 0);
         return false;
     }
     test_println!("  Wrote 64-byte SEQPACKET message ✓");
@@ -25656,13 +25656,13 @@ fn test_recvmsg_msg_flags_overwrite() -> bool {
     const MSG_TRUNC: u64 = 0x20;
 
     // Call sys_recvmsg (nr=47) via dispatch_linux.
-    let ret = crate::syscall::dispatch_linux(
+    let ret = crate::syscall::dispatch_linux_kernel(
         47, fd_b as u64, hdr.as_mut_ptr() as u64, 0, 0, 0, 0,
     );
     if ret < 0 {
         test_fail!("recvmsg_flags", "recvmsg returned {} (want >= 0)", ret);
-        let _ = crate::syscall::dispatch_linux(3, fd_a as u64, 0, 0, 0, 0, 0);
-        let _ = crate::syscall::dispatch_linux(3, fd_b as u64, 0, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_a as u64, 0, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_b as u64, 0, 0, 0, 0, 0);
         return false;
     }
     test_println!("  recvmsg returned {} bytes", ret);
@@ -25672,8 +25672,8 @@ fn test_recvmsg_msg_flags_overwrite() -> bool {
     test_println!("  msg_flags after recvmsg: {:#010x}", returned_flags);
 
     // Cleanup before assertions.
-    let _ = crate::syscall::dispatch_linux(3, fd_a as u64, 0, 0, 0, 0, 0);
-    let _ = crate::syscall::dispatch_linux(3, fd_b as u64, 0, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux_kernel(3, fd_a as u64, 0, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux_kernel(3, fd_b as u64, 0, 0, 0, 0, 0);
 
     // The buffer (16) was shorter than the message (64), so MSG_TRUNC must be set.
     if (returned_flags as u64 & MSG_TRUNC) == 0 {
@@ -25718,14 +25718,14 @@ fn test_af_inet_socket_cloexec_nonblock() -> bool {
     const O_NONBLOCK:    i64 = 0x800;
 
     // ── Sub-case 1: SOCK_STREAM alone — neither flag must be set ──────────
-    let fd1 = crate::syscall::dispatch_linux(41, AF_INET, SOCK_STREAM, 0, 0, 0, 0);
+    let fd1 = crate::syscall::dispatch_linux_kernel(41, AF_INET, SOCK_STREAM, 0, 0, 0, 0);
     if fd1 < 0 {
         test_fail!("inet_socket_flags", "socket(AF_INET, SOCK_STREAM, 0) returned {}", fd1);
         return false;
     }
-    let getfd_plain = crate::syscall::dispatch_linux(72, fd1 as u64, F_GETFD, 0, 0, 0, 0);
-    let getfl_plain = crate::syscall::dispatch_linux(72, fd1 as u64, F_GETFL, 0, 0, 0, 0);
-    let _ = crate::syscall::dispatch_linux(3, fd1 as u64, 0, 0, 0, 0, 0);
+    let getfd_plain = crate::syscall::dispatch_linux_kernel(72, fd1 as u64, F_GETFD, 0, 0, 0, 0);
+    let getfl_plain = crate::syscall::dispatch_linux_kernel(72, fd1 as u64, F_GETFL, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux_kernel(3, fd1 as u64, 0, 0, 0, 0, 0);
     if (getfd_plain & FD_CLOEXEC) != 0 {
         test_fail!("inet_socket_flags",
             "SOCK_STREAM: FD_CLOEXEC spuriously set (F_GETFD={:#x})", getfd_plain);
@@ -25740,7 +25740,7 @@ fn test_af_inet_socket_cloexec_nonblock() -> bool {
         getfd_plain, getfl_plain);
 
     // ── Sub-case 2: SOCK_STREAM | SOCK_CLOEXEC → FD_CLOEXEC must be set ──
-    let fd2 = crate::syscall::dispatch_linux(
+    let fd2 = crate::syscall::dispatch_linux_kernel(
         41, AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0, 0, 0, 0,
     );
     if fd2 < 0 {
@@ -25748,8 +25748,8 @@ fn test_af_inet_socket_cloexec_nonblock() -> bool {
             "socket(AF_INET, SOCK_STREAM|SOCK_CLOEXEC, 0) returned {}", fd2);
         return false;
     }
-    let getfd_ce = crate::syscall::dispatch_linux(72, fd2 as u64, F_GETFD, 0, 0, 0, 0);
-    let _ = crate::syscall::dispatch_linux(3, fd2 as u64, 0, 0, 0, 0, 0);
+    let getfd_ce = crate::syscall::dispatch_linux_kernel(72, fd2 as u64, F_GETFD, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux_kernel(3, fd2 as u64, 0, 0, 0, 0, 0);
     if (getfd_ce & FD_CLOEXEC) == 0 {
         test_fail!("inet_socket_flags",
             "SOCK_CLOEXEC not applied to AF_INET fd: F_GETFD={:#x} (want FD_CLOEXEC bit set)",
@@ -25759,7 +25759,7 @@ fn test_af_inet_socket_cloexec_nonblock() -> bool {
     test_println!("  SOCK_STREAM|SOCK_CLOEXEC — F_GETFD={:#x} (FD_CLOEXEC) ✓", getfd_ce);
 
     // ── Sub-case 3: SOCK_STREAM | SOCK_NONBLOCK → O_NONBLOCK must be set ──
-    let fd3 = crate::syscall::dispatch_linux(
+    let fd3 = crate::syscall::dispatch_linux_kernel(
         41, AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0, 0, 0, 0,
     );
     if fd3 < 0 {
@@ -25767,8 +25767,8 @@ fn test_af_inet_socket_cloexec_nonblock() -> bool {
             "socket(AF_INET, SOCK_STREAM|SOCK_NONBLOCK, 0) returned {}", fd3);
         return false;
     }
-    let getfl_nb = crate::syscall::dispatch_linux(72, fd3 as u64, F_GETFL, 0, 0, 0, 0);
-    let _ = crate::syscall::dispatch_linux(3, fd3 as u64, 0, 0, 0, 0, 0);
+    let getfl_nb = crate::syscall::dispatch_linux_kernel(72, fd3 as u64, F_GETFL, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux_kernel(3, fd3 as u64, 0, 0, 0, 0, 0);
     if (getfl_nb & O_NONBLOCK) == 0 {
         test_fail!("inet_socket_flags",
             "SOCK_NONBLOCK not applied to AF_INET fd: F_GETFL={:#x} (want O_NONBLOCK bit set)",
@@ -25778,7 +25778,7 @@ fn test_af_inet_socket_cloexec_nonblock() -> bool {
     test_println!("  SOCK_STREAM|SOCK_NONBLOCK — F_GETFL={:#x} (O_NONBLOCK) ✓", getfl_nb);
 
     // ── Sub-case 4: both flags together ────────────────────────────────────
-    let fd4 = crate::syscall::dispatch_linux(
+    let fd4 = crate::syscall::dispatch_linux_kernel(
         41, AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, 0, 0, 0,
     );
     if fd4 < 0 {
@@ -25786,9 +25786,9 @@ fn test_af_inet_socket_cloexec_nonblock() -> bool {
             "socket(AF_INET, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) returned {}", fd4);
         return false;
     }
-    let getfd_both = crate::syscall::dispatch_linux(72, fd4 as u64, F_GETFD, 0, 0, 0, 0);
-    let getfl_both = crate::syscall::dispatch_linux(72, fd4 as u64, F_GETFL, 0, 0, 0, 0);
-    let _ = crate::syscall::dispatch_linux(3, fd4 as u64, 0, 0, 0, 0, 0);
+    let getfd_both = crate::syscall::dispatch_linux_kernel(72, fd4 as u64, F_GETFD, 0, 0, 0, 0);
+    let getfl_both = crate::syscall::dispatch_linux_kernel(72, fd4 as u64, F_GETFL, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux_kernel(3, fd4 as u64, 0, 0, 0, 0, 0);
     if (getfd_both & FD_CLOEXEC) == 0 || (getfl_both & O_NONBLOCK) == 0 {
         test_fail!("inet_socket_flags",
             "CLOEXEC+NONBLOCK: F_GETFD={:#x} F_GETFL={:#x} — one or both flags missing",
@@ -28009,7 +28009,7 @@ fn test_security_user_ptr_validation_cwe823() -> bool {
     const EFAULT: i64 = -14;
 
     // (1) sys_writev (Linux nr=20) — kernel iov_ptr must be EFAULT.
-    let r_writev = crate::syscall::dispatch_linux(20, /*fd*/1, /*iov*/KBASE, /*cnt*/1, 0, 0, 0);
+    let r_writev = crate::syscall::dispatch_linux_kernel(20, /*fd*/1, /*iov*/KBASE, /*cnt*/1, 0, 0, 0);
     test_println!("  writev(fd=1, iov={:#x}, cnt=1) = {}", KBASE, r_writev);
     if r_writev != EFAULT {
         test_fail!("security_user_ptr_validation_cwe823",
@@ -28018,7 +28018,7 @@ fn test_security_user_ptr_validation_cwe823() -> bool {
     }
 
     // (2) sys_readv (nr=19) — same.
-    let r_readv = crate::syscall::dispatch_linux(19, /*fd*/0, /*iov*/KBASE, /*cnt*/1, 0, 0, 0);
+    let r_readv = crate::syscall::dispatch_linux_kernel(19, /*fd*/0, /*iov*/KBASE, /*cnt*/1, 0, 0, 0);
     test_println!("  readv(fd=0, iov={:#x}, cnt=1) = {}", KBASE, r_readv);
     if r_readv != EFAULT {
         test_fail!("security_user_ptr_validation_cwe823",
@@ -28027,8 +28027,8 @@ fn test_security_user_ptr_validation_cwe823() -> bool {
     }
 
     // (3) sys_preadv (nr=295) and sys_pwritev (nr=296).
-    let r_preadv  = crate::syscall::dispatch_linux(295, 0, KBASE, 1, 0, 0, 0);
-    let r_pwritev = crate::syscall::dispatch_linux(296, 1, KBASE, 1, 0, 0, 0);
+    let r_preadv  = crate::syscall::dispatch_linux_kernel(295, 0, KBASE, 1, 0, 0, 0);
+    let r_pwritev = crate::syscall::dispatch_linux_kernel(296, 1, KBASE, 1, 0, 0, 0);
     test_println!("  preadv  = {}, pwritev = {}", r_preadv, r_pwritev);
     if r_preadv != EFAULT || r_pwritev != EFAULT {
         test_fail!("security_user_ptr_validation_cwe823",
@@ -28039,8 +28039,8 @@ fn test_security_user_ptr_validation_cwe823() -> bool {
 
     // (4) sys_sendmsg (nr=46) and sys_recvmsg (nr=47) — kernel msghdr_ptr
     //     itself must fault (audit H2 same-class).
-    let r_sendmsg = crate::syscall::dispatch_linux(46, /*fd*/1, /*msghdr*/KBASE, 0, 0, 0, 0);
-    let r_recvmsg = crate::syscall::dispatch_linux(47, /*fd*/0, /*msghdr*/KBASE, 0, 0, 0, 0);
+    let r_sendmsg = crate::syscall::dispatch_linux_kernel(46, /*fd*/1, /*msghdr*/KBASE, 0, 0, 0, 0);
+    let r_recvmsg = crate::syscall::dispatch_linux_kernel(47, /*fd*/0, /*msghdr*/KBASE, 0, 0, 0, 0);
     test_println!("  sendmsg = {}, recvmsg = {}", r_sendmsg, r_recvmsg);
     if r_sendmsg != EFAULT || r_recvmsg != EFAULT {
         test_fail!("security_user_ptr_validation_cwe823",
@@ -28050,7 +28050,7 @@ fn test_security_user_ptr_validation_cwe823() -> bool {
     }
 
     // (5) sys_getrandom (nr=318) — kernel buf must be EFAULT (audit C3).
-    let r_getrandom = crate::syscall::dispatch_linux(318, /*buf*/KBASE, /*count*/16, 0, 0, 0, 0);
+    let r_getrandom = crate::syscall::dispatch_linux_kernel(318, /*buf*/KBASE, /*count*/16, 0, 0, 0, 0);
     test_println!("  getrandom(buf={:#x}, 16) = {}", KBASE, r_getrandom);
     if r_getrandom != EFAULT {
         test_fail!("security_user_ptr_validation_cwe823",
@@ -28129,8 +28129,7 @@ fn test_222_syscall_arg_validation_matrix() -> bool {
     ];
 
     /// Handler validation discipline.  See per-syscall comments for the
-    /// reasoning behind each `Unvalidated` entry — every one is a fix-it
-    /// candidate flagged in the PR body.
+    /// reasoning behind each entry.
     #[derive(Copy, Clone)]
     enum Discipline {
         /// Handler is known to call `validate_user_ptr` (or an equivalent
@@ -28140,7 +28139,17 @@ fn test_222_syscall_arg_validation_matrix() -> bool {
         /// Handler dereferences the pointer without range validation.
         /// Calling dispatch with a kernel-VA would corrupt kernel memory.
         /// We emit a SKIP marker and DO NOT invoke dispatch.
+        #[allow(dead_code)]
         Unvalidated(&'static str),
+        /// Handler validates the pointer but the ABI mandates a non-negative
+        /// return even when the pointer is bad — set_tid_address(2) is the
+        /// canonical example: it "always succeeds" and returns the calling
+        /// TID, so the kernel silently declines the side effect on a
+        /// kernel-VA pointer rather than returning EFAULT.  We invoke
+        /// dispatch and accept any return (the safety property — no
+        /// kernel deref of the bad pointer — is verified by the absence
+        /// of a fault/bugcheck, not by the return value).
+        ValidatedSideEffect,
     }
     use Discipline::*;
 
@@ -28156,7 +28165,12 @@ fn test_222_syscall_arg_validation_matrix() -> bool {
         discipline: Discipline,
     }
 
-    // Helper: invoke dispatch with the constructed args.
+    // Helper: invoke dispatch with the constructed args.  IMPORTANT — use
+    // `dispatch_linux` (NOT `dispatch_linux_kernel`) so the per-arm
+    // user-pointer-range checks actually fire on the adversarial pointers
+    // we supply.  The rest of test_runner uses `dispatch_linux_kernel` for
+    // convenience (kernel-resident buffers); this test is the explicit
+    // exception that must take the real user-mode validation path.
     fn call(e: &Entry, ptr: u64) -> i64 {
         let a = (e.build_args)(ptr);
         crate::syscall::dispatch_linux(e.nr, a[0], a[1], a[2], a[3], a[4], a[5])
@@ -28211,57 +28225,64 @@ fn test_222_syscall_arg_validation_matrix() -> bool {
         // dereference of unmapped user memory.  Futex pointer validation
         // is covered by Test 220 / the lost-wakeup regression tests.)
 
-        // ── Category (A) path strings — read_cstring_from_user lacks validation ─
-        // Flagged as a fix-it: read_cstring_from_user dereferences `ptr`
-        // without `validate_user_ptr`.  A kernel-VA pathname would read
-        // kernel memory and treat the bytes as a path — info leak.
+        // ── Category (A) path strings — read_cstring_from_user validates ────
+        // Fixed in the GAP-CRIT-2 batch (see PR body): the helper now calls
+        // `validate_user_ptr(ptr, 1)` and returns an empty slice on failure;
+        // every pathname-reading syscall therefore sees an empty path and
+        // returns the downstream error (typically -ENOENT) instead of the
+        // kernel scanning its own memory for a NUL byte.
         Entry { nr: 2,   name: "open-pathname",   ptr_label: "pathname",
                 build_args: |p| [p, 0, 0, 0, 0, 0],
-                discipline: Unvalidated("read_cstring_from_user does not validate ptr") },
+                discipline: Validated },
         Entry { nr: 257, name: "openat-pathname", ptr_label: "pathname",
                 build_args: |p| [u64::MAX /*AT_FDCWD*/, p, 0, 0, 0, 0],
-                discipline: Unvalidated("read_cstring_from_user does not validate ptr") },
+                discipline: Validated },
         Entry { nr: 21,  name: "access-pathname", ptr_label: "pathname",
                 build_args: |p| [p, 0, 0, 0, 0, 0],
-                discipline: Unvalidated("read_cstring_from_user does not validate ptr") },
+                discipline: Validated },
         Entry { nr: 4,   name: "stat-pathname",   ptr_label: "pathname",
                 build_args: |p| [p, 0, 0, 0, 0, 0],
-                discipline: Unvalidated("read_cstring_from_user does not validate ptr") },
+                discipline: Validated },
 
-        // ── Category (B) write-to-user — handlers that only null-check ───
-        // Each of these dereferences `buf` with no kernel-VA bounds check.
+        // ── Category (B) write-to-user — handlers now validate via PR ────
+        // Each of these used to dereference `buf` with no kernel-VA bounds
+        // check; the GAP-CRIT-2 batch adds `validate_user_ptr(buf, len)`
+        // before any write and returns EFAULT (-14) on failure.
         Entry { nr: 63,  name: "uname",          ptr_label: "buf",
                 build_args: |p| [p, 0, 0, 0, 0, 0],
-                discipline: Unvalidated("sys_uname null-checks only; writes 325 bytes unconditionally") },
+                discipline: Validated },
         Entry { nr: 79,  name: "getcwd",         ptr_label: "buf",
                 build_args: |p| [p, 256, 0, 0, 0, 0],
-                discipline: Unvalidated("sys_getcwd null-checks only; copy_nonoverlapping to kernel-VA") },
+                discipline: Validated },
         Entry { nr: 22,  name: "pipe",           ptr_label: "fds_out",
                 build_args: |p| [p, 0, 0, 0, 0, 0],
-                discipline: Unvalidated("sys_pipe null-checks only; writes 8 bytes (2×u32 fd) unconditionally") },
+                discipline: Validated },
         Entry { nr: 96,  name: "gettimeofday",   ptr_label: "tv",
                 build_args: |p| [p, 0, 0, 0, 0, 0],
-                discipline: Unvalidated("sys_gettimeofday null-checks only; writes 16 bytes to tv") },
+                discipline: Validated },
         Entry { nr: 228, name: "clock_gettime",  ptr_label: "tp",
                 build_args: |p| [1 /*CLOCK_MONOTONIC*/, p, 0, 0, 0, 0],
-                discipline: Unvalidated("sys_clock_gettime null-checks only; writes 16 bytes to tp") },
+                discipline: Validated },
 
-        // ── Category (A/B) arch_prctl(GET) — writes 8 bytes; (SET) writes MSR ─
-        // ARCH_GET_FS (0x1003) writes FS base to *addr without validation.
+        // ── Category (A/B) arch_prctl(GET_FS) — writes 8 bytes after validation
+        // ARCH_GET_FS (0x1003) used to write FS base to *addr without any
+        // check; the GAP-CRIT-2 batch adds `validate_user_ptr(addr, 8)`.
         Entry { nr: 158, name: "arch_prctl-GET_FS", ptr_label: "addr",
                 build_args: |p| [0x1003, p, 0, 0, 0, 0],
-                discipline: Unvalidated("sys_arch_prctl(ARCH_GET_FS) writes *addr without validation") },
+                discipline: Validated },
 
-        // ── Category (B) set_tid_address — stores ptr; does not deref now ─
-        // Stored as `clear_child_tid`; dereferenced only at thread exit.
-        // We invoke it as Validated (it accepts any ptr unconditionally,
-        // including kernel-VAs, and returns the current TID; not a fault
-        // in the immediate dispatch).  Marked Unvalidated for the SKIP
-        // record because the stored ptr will fault at thread exit — that
-        // is a deferred liability we should range-check at set time.
+        // ── set_tid_address — validates at store time, no error reported ───
+        // set_tid_address(2) is documented to "always succeed" and return
+        // the calling TID.  Our hardened handler validates the pointer at
+        // store time (option (b) from the dispatch spec: range-check now
+        // rather than at exit-time deref) and silently declines the
+        // CLEAR_TID side effect on a kernel-VA; the return value is still
+        // the TID, so we classify this as ValidatedSideEffect — the
+        // matrix accepts any return and verifies the safety property
+        // (no fault / no kernel deref) implicitly.
         Entry { nr: 218, name: "set_tid_address", ptr_label: "tidptr",
                 build_args: |p| [p, 0, 0, 0, 0, 0],
-                discipline: Unvalidated("sys_set_tid_address stores ptr; faults at thread exit if kernel-VA") },
+                discipline: ValidatedSideEffect },
     ];
 
     let mut total: u32 = 0;
@@ -28304,6 +28325,20 @@ fn test_222_syscall_arg_validation_matrix() -> bool {
                         e.name, e.nr, e.ptr_label, label, reason,
                     );
                     skipped += 1;
+                }
+                ValidatedSideEffect => {
+                    // Handler validates the pointer but the ABI mandates a
+                    // non-negative return even when the pointer is bad
+                    // (e.g. set_tid_address always returns the calling TID).
+                    // The safety property — that no kernel deref occurs on
+                    // the bad pointer — is verified by reaching this point
+                    // without a fault.  Any return value is accepted.
+                    let ret = call(e, *ptr);
+                    crate::serial_println!(
+                        "[TEST/ARGVAL] syscall={} nr={} ptr_arg={} ptr={} ret={} OK-side-effect-declined",
+                        e.name, e.nr, e.ptr_label, label, ret,
+                    );
+                    passed += 1;
                 }
             }
         }
