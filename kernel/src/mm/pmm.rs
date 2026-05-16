@@ -192,6 +192,11 @@ unsafe fn alloc_page_locked() -> Option<u64> {
                         let next = (byte_idx + 1) % BITMAP_SIZE;
                         NEXT_FIT_BYTE.store(next as u64, Ordering::Relaxed);
                         let phys = (page * PAGE_SIZE) as u64;
+                        // W215 diagnostic Arm-1: record the ALLOC event.
+                        #[cfg(feature = "firefox-test")]
+                        crate::mm::w215_diag::prov_record(
+                            phys, crate::mm::w215_diag::KIND_ALLOC, 0,
+                        );
                         // H1 diagnostic: check whether this frame still
                         // carries a live refcount — a mismatch between the
                         // PMM bitmap (free) and the refcount table (in-use).

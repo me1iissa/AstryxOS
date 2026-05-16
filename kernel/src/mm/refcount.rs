@@ -81,6 +81,11 @@ pub fn page_ref_inc(phys_addr: u64) {
     if idx < rc.len() {
         rc[idx].fetch_add(1, Ordering::Relaxed);
     }
+    // W215 diagnostic Arm-1: record the REFINC event.
+    #[cfg(feature = "firefox-test")]
+    crate::mm::w215_diag::prov_record(
+        phys_addr, crate::mm::w215_diag::KIND_REFINC, 0,
+    );
 }
 
 /// Decrement the reference count for a physical page.
@@ -94,6 +99,11 @@ pub fn page_ref_inc(phys_addr: u64) {
               information needed to decide when to free the frame; check \
               whether the count reached zero and schedule a shootdown+free"]
 pub fn page_ref_dec(phys_addr: u64) -> u16 {
+    // W215 diagnostic Arm-1: record the REFDEC event.
+    #[cfg(feature = "firefox-test")]
+    crate::mm::w215_diag::prov_record(
+        phys_addr, crate::mm::w215_diag::KIND_REFDEC, 0,
+    );
     let idx = pfn(phys_addr);
     let rc = refcounts();
     if idx < rc.len() {
