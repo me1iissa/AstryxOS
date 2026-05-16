@@ -32,6 +32,15 @@ static USED_PAGES: AtomicU64 = AtomicU64::new(0);
 /// Avoids O(N) scans from 0 when low physical frames are all in use.
 static NEXT_FIT_BYTE: AtomicU64 = AtomicU64::new(0);
 
+/// Diagnostic counter (firefox-test only): number of times `alloc_page`
+/// returned a frame whose refcount was already non-zero at the moment of
+/// allocation.  A non-zero count is a direct indicator of H1 (cache-vs-PMM
+/// bitmap drift): the PMM believes a frame is free (bitmap bit clear) but
+/// the refcount table still holds a live reference — indicating the previous
+/// owner never called `page_ref_dec` before the frame was recycled.
+#[cfg(feature = "firefox-test")]
+static PMM_ALLOC_NONZERO_RC: AtomicU64 = AtomicU64::new(0);
+
 /// Initialize the PMM from the UEFI memory map.
 pub fn init(boot_info: &BootInfo) {
     let _lock = PMM_LOCK.lock();
@@ -113,7 +122,28 @@ unsafe fn alloc_page_locked() -> Option<u64> {
                         // Advance cursor past this byte for next call.
                         let next = (byte_idx + 1) % BITMAP_SIZE;
                         NEXT_FIT_BYTE.store(next as u64, Ordering::Relaxed);
-                        return Some((page * PAGE_SIZE) as u64);
+                        let phys = (page * PAGE_SIZE) as u64;
+                        // H1 diagnostic: check whether this frame still
+                        // carries a live refcount — a mismatch between the
+                        // PMM bitmap (free) and the refcount table (in-use).
+                        // Gated on firefox-test to keep production builds
+                        // identical.
+                        #[cfg(feature = "firefox-test")]
+                        {
+                            let rc = crate::mm::refcount::page_ref_count(phys);
+                            if rc != 0 {
+                                let total = PMM_ALLOC_NONZERO_RC
+                                    .fetch_add(1, Ordering::Relaxed) + 1;
+                                // Log first 8, then every 1000th occurrence.
+                                if total <= 8 || total % 1000 == 0 {
+                                    crate::serial_println!(
+                                        "[PMM/ALLOC-NONZERO-RC] pfn={} phys={:#x} rc_at_alloc={} count_total={}",
+                                        page, phys, rc, total,
+                                    );
+                                }
+                            }
+                        }
+                        return Some(phys);
                     }
                 }
             }
@@ -248,6 +278,17 @@ pub fn free_page_count() -> u64 {
     let total = TOTAL_PAGES.load(Ordering::Relaxed);
     let used = USED_PAGES.load(Ordering::Relaxed);
     total.saturating_sub(used)
+}
+
+/// Read the cumulative `PMM_ALLOC_NONZERO_RC` counter.
+///
+/// Returns the number of times an `alloc_page` call returned a frame whose
+/// refcount was already non-zero.  Always 0 on non-firefox-test builds.
+pub fn pmm_alloc_nonzero_rc_count() -> u64 {
+    #[cfg(feature = "firefox-test")]
+    { PMM_ALLOC_NONZERO_RC.load(Ordering::Relaxed) }
+    #[cfg(not(feature = "firefox-test"))]
+    { 0 }
 }
 
 /// Mark a page as used in the bitmap.

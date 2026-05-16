@@ -378,3 +378,54 @@ pub fn stats() -> (usize, usize) {
     let dirty = cache.values().filter(|e| e.dirty).count();
     (total, dirty)
 }
+
+/// Audit the page cache for H1 invariant violations: any cached entry whose
+/// physical frame has a reference count of zero.
+///
+/// A zero-refcount entry indicates the cache holds a pointer to a physical
+/// frame that has no live PTE covering it.  If the PMM later recycles that
+/// frame via `alloc_page`, the next cache-hit demand fault installs a PTE to
+/// the wrong physical page — the aliasing class under investigation (W215).
+///
+/// This is a purely read-only walk; it never modifies cache or refcount state.
+/// The serial output format is structured for `qemu-harness.py grep` / `wait`:
+///
+///   `[CACHE/AUDIT] total_entries=N orphan_count=M`
+///   `[CACHE/AUDIT/ORPHAN] key=(mount,inode,0xOFFSET) phys=0xPHYS rc=0`
+///
+/// At most 16 orphan lines are emitted per call to avoid serial flood.
+///
+/// Returns `(total_entries, orphan_count)`.
+#[cfg(feature = "firefox-test")]
+pub fn audit_invariant() -> (usize, usize) {
+    use crate::mm::refcount::page_ref_count;
+    use core::fmt::Write as _;
+
+    let cache = PAGE_CACHE.lock();
+    let total = cache.len();
+    let mut orphan_count = 0usize;
+    let mut logged = 0usize;
+
+    for ((mount_idx, inode, page_offset), entry) in cache.iter() {
+        let rc = page_ref_count(entry.phys);
+        if rc == 0 {
+            orphan_count += 1;
+            if logged < 16 {
+                let mut buf = alloc::string::String::with_capacity(128);
+                let _ = write!(
+                    buf,
+                    "[CACHE/AUDIT/ORPHAN] key=({},{},{:#x}) phys={:#x} rc=0",
+                    mount_idx, inode, page_offset, entry.phys,
+                );
+                crate::serial_println!("{}", buf);
+                logged += 1;
+            }
+        }
+    }
+
+    crate::serial_println!(
+        "[CACHE/AUDIT] total_entries={} orphan_count={}",
+        total, orphan_count,
+    );
+    (total, orphan_count)
+}

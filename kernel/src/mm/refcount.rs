@@ -12,8 +12,16 @@
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use spin::Once;
+
+/// Diagnostic counter (firefox-test only): number of times `page_ref_set` was
+/// called with `val < existing_rc` on a frame that already had a non-zero
+/// refcount.  A decreasing set-over-nonzero is the H1 signature for a caller
+/// that resets a live frame's refcount without going through `page_ref_dec`,
+/// bypassing the zero-check that would trigger `pmm::free_page`.
+#[cfg(feature = "firefox-test")]
+static REFCOUNT_SET_OVER_NONZERO: AtomicU64 = AtomicU64::new(0);
 
 /// Maximum physical pages we track (same as PMM: 4 GiB / 4 KiB = 1M pages).
 const MAX_PAGES: usize = 1024 * 1024;
@@ -94,10 +102,43 @@ pub fn page_ref_count(phys_addr: u64) -> u16 {
 }
 
 /// Set the reference count for a physical page (used during initialization).
+///
+/// Under the `firefox-test` feature gate, this function observes any case
+/// where `count` is less than the existing non-zero refcount.  Such a
+/// decreasing set-over-nonzero bypasses the zero-transition that would
+/// normally trigger `pmm::free_page`, which is a potential H1 aliasing path:
+/// the frame is not freed, but its refcount is silently lowered, possibly
+/// below the number of live PTEs that still reference it.
 pub fn page_ref_set(phys_addr: u64, count: u16) {
     let idx = pfn(phys_addr);
     let rc = refcounts();
     if idx < rc.len() {
+        // H1 diagnostic: observe decreasing set-over-nonzero transitions.
+        #[cfg(feature = "firefox-test")]
+        {
+            let existing = rc[idx].load(Ordering::Relaxed);
+            if existing > 0 && count != existing && count < existing {
+                let total = REFCOUNT_SET_OVER_NONZERO
+                    .fetch_add(1, Ordering::Relaxed) + 1;
+                if total <= 8 || total % 1000 == 0 {
+                    crate::serial_println!(
+                        "[REFCOUNT/SET-OVER-NONZERO] phys={:#x} existing_rc={} new_rc={} count_total={}",
+                        phys_addr, existing, count, total,
+                    );
+                }
+            }
+        }
         rc[idx].store(count, Ordering::Relaxed);
     }
+}
+
+/// Read the cumulative `REFCOUNT_SET_OVER_NONZERO` counter.
+///
+/// Returns the number of times `page_ref_set` decreased a non-zero refcount.
+/// Always 0 on non-firefox-test builds.
+pub fn refcount_set_over_nonzero_count() -> u64 {
+    #[cfg(feature = "firefox-test")]
+    { REFCOUNT_SET_OVER_NONZERO.load(Ordering::Relaxed) }
+    #[cfg(not(feature = "firefox-test"))]
+    { 0 }
 }
