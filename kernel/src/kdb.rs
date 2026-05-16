@@ -279,6 +279,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "trace-status"   => op_trace_status(out),
         "bell-stats"     => op_bell_stats(out),
         "cache-audit"    => op_cache_audit(out),
+        "tlb-stats"      => op_tlb_stats(out),
         _ => {
             out.push_str(r#"{"error":"unknown op: "#);
             for c in op.chars().take(64) {
@@ -778,6 +779,52 @@ fn op_bell_stats(out: &mut String) {
         bell_wakes, resync_wakes, bell_ratio_permille
     );
 }
+// ── tlb-stats ────────────────────────────────────────────────────────────────
+//
+// Unified TLB shootdown + PMM recent-free diagnostic readout.
+//
+// Exposes the six counters used by the W215 H1 and H2 investigations:
+//
+//   H1 counters (always-present paths — not currently in tlb.rs but kept here
+//   as zero placeholders for unified harness output):
+//     cache_audit_orphan        [cache::audit_invariant: orphaned rc=0 cache entry]
+//     pmm_alloc_nonzero_rc      [pmm::alloc_page: frame handed out at rc>0]
+//     refcount_set_over_nonzero [page_ref_set called on frame already live]
+//
+//   H2 counters (firefox-test gated):
+//     shootdown_clean_ack_late  [shootdown declared clean, handler not yet done]
+//     shootdown_unclean_total   [shootdown returned false → quarantine]
+//     pmm_alloc_recent_free     [frame re-allocated within RECENT_FREE_WINDOW]
+//
+//   Plus existing TLB transport stats:
+//     shootdowns_sent, ipis_sent, ack_timeouts, shootdowns_handled,
+//     quarantine_deferred, quarantine_released, quarantine_depth.
+//
+// Output: single flat JSON object; all fields present in every build (H2 fields
+// read as 0 when the feature is absent so the harness needs no per-build logic).
+
+fn op_tlb_stats(out: &mut String) {
+    use core::fmt::Write;
+
+    let s = crate::mm::tlb::stats();
+    let pmm_recent = crate::mm::pmm::pmm_alloc_recent_free_count();
+
+    out.push('{');
+    // ── TLB transport counters ─────────────────────────────────────────────
+    let _ = write!(out, r#""shootdowns_sent":{},"#,    s.shootdowns_sent);
+    let _ = write!(out, r#""ipis_sent":{},"#,           s.ipis_sent);
+    let _ = write!(out, r#""ack_timeouts":{},"#,        s.ack_timeouts);
+    let _ = write!(out, r#""shootdowns_handled":{},"#,  s.shootdowns_handled);
+    let _ = write!(out, r#""quarantine_deferred":{},"#, s.quarantine_deferred);
+    let _ = write!(out, r#""quarantine_released":{},"#, s.quarantine_released);
+    let _ = write!(out, r#""quarantine_depth":{},"#,   s.quarantine_depth);
+    // ── H2 diagnostic counters ─────────────────────────────────────────────
+    let _ = write!(out, r#""shootdown_clean_ack_late":{},"#, s.clean_ack_late);
+    let _ = write!(out, r#""shootdown_unclean_total":{},"#,  s.unclean_total);
+    let _ = write!(out, r#""pmm_alloc_recent_free":{}"#,     pmm_recent);
+    out.push('}');
+}
+
 // ── proc-tree ────────────────────────────────────────────────────────────────
 //
 // Render a depth-first parent/child tree rooted at a chosen PID (default 1).
