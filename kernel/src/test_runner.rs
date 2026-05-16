@@ -1581,6 +1581,15 @@ pub fn run() -> ! {
     // 0a/0b at the top of this function so failures surface before the
     // suite's long network/disk pre-amble.)
 
+    // ── Test 220: security — iovec / getrandom kernel-pointer rejection ─
+    // Regression guard for CWE-823 / CWE-119 findings C2 + C3 of the
+    // 2026-05-16 security posture audit. Verifies that writev/readv/preadv/
+    // pwritev/sendmsg/recvmsg reject iov_ptr in the kernel half, and that
+    // getrandom rejects a kernel-address buffer.  Without these checks any
+    // process can issue a kernel-mode arbitrary read/write primitive.
+    total += 1;
+    if test_security_user_ptr_validation_cwe823() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -27877,6 +27886,82 @@ fn test_socketpair_survives_child_close_w216() -> bool {
     test_println!("  final close — both slots freed ✓");
 
     test_pass!("socketpair refcount survives child close (W216 H_A)");
+    true
+}
+
+// ── Test 220: security — iovec / getrandom kernel-pointer rejection ─────────
+//
+// Regression guard for the 2026-05-16 security audit findings C2 + C3.
+// Before this fix, sys_writev / sys_readv / sys_preadv / sys_pwritev /
+// sendmsg / recvmsg called `core::slice::from_raw_parts(iov_ptr as ..)`
+// after only a null/zero check on `iov_ptr`, and `sys_getrandom` wrote
+// into `buf` after only a null check. A process passing a kernel address
+// as `iov_ptr` could direct the kernel to interpret kernel memory as the
+// `iov_base`/`iov_len` descriptor and then read/write at attacker-chosen
+// kernel offsets — CWE-823 (Use of Out-of-range Pointer Offset) and
+// CWE-119 (Improper Restriction of Operations within the Bounds of a
+// Memory Buffer).
+//
+// This test invokes each affected syscall with `iov_ptr` /  `buf` pointing
+// just inside the kernel half (KERNEL_VIRT_BASE) and confirms each call
+// returns -EFAULT (-14) without performing the dereference.
+fn test_security_user_ptr_validation_cwe823() -> bool {
+    test_header!("security: iovec/getrandom kernel-ptr → EFAULT (CWE-823, audit C2+C3)");
+
+    const KBASE: u64 = astryx_shared::KERNEL_VIRT_BASE;
+    const EFAULT: i64 = -14;
+
+    // (1) sys_writev (Linux nr=20) — kernel iov_ptr must be EFAULT.
+    let r_writev = crate::syscall::dispatch_linux(20, /*fd*/1, /*iov*/KBASE, /*cnt*/1, 0, 0, 0);
+    test_println!("  writev(fd=1, iov={:#x}, cnt=1) = {}", KBASE, r_writev);
+    if r_writev != EFAULT {
+        test_fail!("security_user_ptr_validation_cwe823",
+            "writev returned {} (expected {})", r_writev, EFAULT);
+        return false;
+    }
+
+    // (2) sys_readv (nr=19) — same.
+    let r_readv = crate::syscall::dispatch_linux(19, /*fd*/0, /*iov*/KBASE, /*cnt*/1, 0, 0, 0);
+    test_println!("  readv(fd=0, iov={:#x}, cnt=1) = {}", KBASE, r_readv);
+    if r_readv != EFAULT {
+        test_fail!("security_user_ptr_validation_cwe823",
+            "readv returned {} (expected {})", r_readv, EFAULT);
+        return false;
+    }
+
+    // (3) sys_preadv (nr=295) and sys_pwritev (nr=296).
+    let r_preadv  = crate::syscall::dispatch_linux(295, 0, KBASE, 1, 0, 0, 0);
+    let r_pwritev = crate::syscall::dispatch_linux(296, 1, KBASE, 1, 0, 0, 0);
+    test_println!("  preadv  = {}, pwritev = {}", r_preadv, r_pwritev);
+    if r_preadv != EFAULT || r_pwritev != EFAULT {
+        test_fail!("security_user_ptr_validation_cwe823",
+            "preadv/pwritev did not reject kernel iov_ptr (got {}, {})",
+            r_preadv, r_pwritev);
+        return false;
+    }
+
+    // (4) sys_sendmsg (nr=46) and sys_recvmsg (nr=47) — kernel msghdr_ptr
+    //     itself must fault (audit H2 same-class).
+    let r_sendmsg = crate::syscall::dispatch_linux(46, /*fd*/1, /*msghdr*/KBASE, 0, 0, 0, 0);
+    let r_recvmsg = crate::syscall::dispatch_linux(47, /*fd*/0, /*msghdr*/KBASE, 0, 0, 0, 0);
+    test_println!("  sendmsg = {}, recvmsg = {}", r_sendmsg, r_recvmsg);
+    if r_sendmsg != EFAULT || r_recvmsg != EFAULT {
+        test_fail!("security_user_ptr_validation_cwe823",
+            "sendmsg/recvmsg did not reject kernel msghdr_ptr (got {}, {})",
+            r_sendmsg, r_recvmsg);
+        return false;
+    }
+
+    // (5) sys_getrandom (nr=318) — kernel buf must be EFAULT (audit C3).
+    let r_getrandom = crate::syscall::dispatch_linux(318, /*buf*/KBASE, /*count*/16, 0, 0, 0, 0);
+    test_println!("  getrandom(buf={:#x}, 16) = {}", KBASE, r_getrandom);
+    if r_getrandom != EFAULT {
+        test_fail!("security_user_ptr_validation_cwe823",
+            "getrandom returned {} (expected {})", r_getrandom, EFAULT);
+        return false;
+    }
+
+    test_pass!("kernel-half pointers rejected with -EFAULT across writev/readv/preadv/pwritev/sendmsg/recvmsg/getrandom");
     true
 }
 
