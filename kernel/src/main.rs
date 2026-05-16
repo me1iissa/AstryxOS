@@ -40,6 +40,8 @@ mod shell;
 mod syscall;
 #[cfg(feature = "test-mode")]
 mod test_runner;
+#[cfg(feature = "test-mode")]
+mod prop_test;
 mod gdi;
 mod gui;
 #[cfg(feature = "kdb")]
