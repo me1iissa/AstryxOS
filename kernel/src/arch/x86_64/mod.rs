@@ -1,6 +1,8 @@
 //! x86_64 architecture-specific code.
 
 pub mod apic;
+#[cfg(feature = "firefox-test")]
+pub mod debug_reg;
 pub mod gdt;
 pub mod idt;
 pub mod irq;

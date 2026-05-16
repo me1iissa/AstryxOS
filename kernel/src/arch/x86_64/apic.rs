@@ -1067,6 +1067,13 @@ pub extern "C" fn ap_rust_entry() -> ! {
     // but where SMP_ACTIVE was still false.  See mm/tlb.rs.
     crate::mm::tlb::mark_self_smp_online();
 
+    // W215 Arm-1 diagnostic: if a CRC-walker mismatch already armed the
+    // DR0 write-watchpoint before this AP came online, apply it now.
+    // Per Intel SDM Vol. 3B §17.2.4, DR0–DR3 are per-CPU and must be
+    // programmed on every CPU that should participate in the trap.
+    #[cfg(feature = "firefox-test")]
+    crate::arch::x86_64::debug_reg::apply_pending_to_this_cpu();
+
     // Enable interrupts and enter scheduling loop.
     // After each timer interrupt wakes this AP from HLT, check if a reschedule
     // is needed and switch to any ready thread.  check_reschedule() is safe
