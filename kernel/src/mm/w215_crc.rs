@@ -252,7 +252,20 @@ pub fn crc_walk_tick(_cpu: u32) {
         Some(table) => {
             for i in 0..slice_n {
                 let idx = (start + i) & (SNAPSHOT_CAP - 1);
-                let e = &table.entries[idx];
+                // Snapshot the entry into a stack local ONCE so the
+                // subsequent validity check and the value we copy into
+                // `buf[n]` agree byte-for-byte.  Reading `e.phys` for
+                // the filter and then reading it again for the buf
+                // copy admits a torn read: a concurrent `record_insert`
+                // (which holds the mutex, so we cannot collide here)
+                // is not the threat, but a memcpy / static-data writer
+                // racing the walker through `PHYS_OFF` is — that race
+                // produced the historical ~60-per-trial `phys=0x201`
+                // noise floor, where the filter saw a stable 4 KiB-aligned
+                // value but the latched copy disagreed (low-32-bit
+                // tear on the 64-bit `phys` field).  A single read into
+                // a stack local removes the second load entirely.
+                let snap: CrcEntry = table.entries[idx];
                 // Skip slots with bogus phys values.  PMM never hands out
                 // sub-MiB frames (kernel ELF + BIOS + identity-mapped
                 // bootloader page tables occupy that region per
@@ -260,11 +273,9 @@ pub fn crc_walk_tick(_cpu: u32) {
                 // is either a still-being-initialised slot (torn read of
                 // a concurrently writing `record_insert`) or a stale 4 KiB
                 // field of a CrcEntry struct.  Either way, do not CRC it
-                // against expected — that's how the bogus
-                // `phys=0x201`-style emissions in early sessions were
-                // produced.
-                // Filters on phys to skip torn reads of concurrently
-                // written slots:
+                // against expected.
+                //
+                // Filters on phys:
                 //   (a) ≥ 0x10_0000 — PMM never hands out sub-MiB frames.
                 //   (b) ≤ 0x4_0000_0000 (16 GiB) — far above any realistic
                 //       AstryxOS RAM ceiling; an over-large `phys` is
@@ -274,11 +285,11 @@ pub fn crc_walk_tick(_cpu: u32) {
                 //       bit is set would push `PHYS_OFF + phys` past the
                 //       canonical range and #GPF the walker.
                 //   (c) 4 KiB-aligned (low 12 bits zero) — PMM invariant.
-                if e.phys >= 0x10_0000
-                    && e.phys <= 0x4_0000_0000
-                    && (e.phys & 0xFFF) == 0
+                if snap.phys >= 0x10_0000
+                    && snap.phys <= 0x4_0000_0000
+                    && (snap.phys & 0xFFF) == 0
                 {
-                    buf[n] = (e.phys, e.crc32, e.key_packed);
+                    buf[n] = (snap.phys, snap.crc32, snap.key_packed);
                     n += 1;
                 }
             }
@@ -345,9 +356,11 @@ pub fn crc_walk_tick(_cpu: u32) {
 /// investigator wants to see the diagnostic's accumulated counts.
 pub fn dump_stats() {
     let (arm_count, fire_count) = crate::arch::x86_64::debug_reg::stats();
+    let per_slot = crate::arch::x86_64::debug_reg::per_slot_fires();
     crate::serial_println!(
         "[W215/ARM1/STATS] inserts={} walks={} mismatches={} false_pos={} \
-         overflow_drop={} live={} dr_arms={} dr_fires={}",
+         overflow_drop={} live={} dr_arms={} dr_fires={} \
+         per_slot=[dr0={},dr1={},dr2={},dr3={}]",
         STAT_INSERTS.load(Ordering::Relaxed),
         STAT_WALKS.load(Ordering::Relaxed),
         STAT_MISMATCH.load(Ordering::Relaxed),
@@ -355,5 +368,6 @@ pub fn dump_stats() {
         STAT_OVERFLOW_DROP.load(Ordering::Relaxed),
         LIVE_COUNT.load(Ordering::Relaxed),
         arm_count, fire_count,
+        per_slot[0], per_slot[1], per_slot[2], per_slot[3],
     );
 }

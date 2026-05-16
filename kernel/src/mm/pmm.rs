@@ -136,6 +136,37 @@ extern "C" {
     static __kernel_end: u8;
 }
 
+/// Physical base address of the kernel image, latched in `init` from
+/// `boot_info.kernel_phys_base`.  A value of 0 means PMM has not yet been
+/// initialised.  Used by the W215 cache::insert protector.
+static KERNEL_IMAGE_PHYS_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// Exclusive physical end of the kernel image (incl. .bss), latched in
+/// `init` from the `__kernel_end` linker symbol.
+static KERNEL_IMAGE_PHYS_END: AtomicU64 = AtomicU64::new(0);
+
+/// Returns `(phys_base, phys_end_exclusive)` of the kernel image, in bytes.
+/// Both values are page-aligned.  Returns `(0, 0)` if PMM is not yet
+/// initialised; callers must treat that as "no protection active".
+pub fn kernel_image_phys_range() -> (u64, u64) {
+    (
+        KERNEL_IMAGE_PHYS_BASE.load(Ordering::Relaxed),
+        KERNEL_IMAGE_PHYS_END.load(Ordering::Relaxed),
+    )
+}
+
+/// True if `phys` lies inside the kernel image's physical range (.text /
+/// .rodata / .data / .bss), as latched at PMM init from the linker symbol.
+///
+/// The caller passes a page-aligned phys; the check is range-only, no
+/// section discrimination (the kernel image is contiguous in physical
+/// memory per the linker script + AstryxBoot handoff).
+pub fn is_kernel_static_phys(phys: u64) -> bool {
+    let base = KERNEL_IMAGE_PHYS_BASE.load(Ordering::Relaxed);
+    let end = KERNEL_IMAGE_PHYS_END.load(Ordering::Relaxed);
+    base != 0 && end != 0 && phys >= base && phys < end
+}
+
 /// Initialize the PMM from the UEFI memory map.
 pub fn init(boot_info: &BootInfo) {
     let _lock = PMM_LOCK.lock();
@@ -184,6 +215,12 @@ pub fn init(boot_info: &BootInfo) {
         kernel_end_phys,
         image_bytes / 1024,
     );
+
+    // Latch the kernel image phys range for the W215 cache::insert protector.
+    // Uses the BSS-inclusive `kernel_end_phys` so the protector covers the
+    // full kernel image including zero-initialised statics.
+    KERNEL_IMAGE_PHYS_BASE.store(kernel_start_phys, Ordering::Relaxed);
+    KERNEL_IMAGE_PHYS_END.store(kernel_end_phys, Ordering::Relaxed);
 
     // Mark kernel region as used (kernel image incl. .bss + 256 pages slack
     // for BootInfo and early structures placed past __kernel_end).
