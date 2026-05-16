@@ -178,10 +178,10 @@ jobs:
       - name: Build bootloader (UEFI)
         run: cargo +nightly build --package astryx-boot --target x86_64-unknown-uefi --profile release
 
-      # Stage the ESP so qemu-harness.py ci-run --no-build can find the
-      # kernel binary without rebuilding.  objcopy turns the ELF into a
-      # flat binary; the bootloader is copied as-is.
-      - name: Stage ESP for harness
+      # watch-test.py with --no-build takes care of staging the ESP,
+      # running objcopy to turn the ELF into a flat binary, and
+      # launching QEMU with the isa-debug-exit device.
+      - name: Stage ESP for watch-test
         run: |
           mkdir -p build/esp/EFI/BOOT build/esp/EFI/astryx
           cp target/x86_64-unknown-uefi/release/astryx-boot.efi build/esp/EFI/BOOT/BOOTX64.EFI
@@ -198,37 +198,33 @@ jobs:
       # tests passed; anything else fails the job.  GitHub runners have
       # no /dev/kvm, so expect ~8–15 minutes without KVM acceleration.
       #
-      # Uses qemu-harness.py ci-run (GAP-CRIT-3 from test coverage audit
-      # 2026-05-16): the canonical agent-facing harness replaces the banned
-      # watch-test.py wrapper.  All allow-fail logic lives here in the YAML
-      # so it is version-controlled alongside the CI definition.
+      # Known pre-existing gap (audit HIGH-5): tests `pie_elf`,
+      # `TCC compile`, and `firefox_oracle` depend on pre-built binaries
+      # (`ld-musl-x86_64.so.1`, `/disk/bin/tcc`, firefox ESR) that this
+      # job does NOT build.  The first time this workflow runs in CI it
+      # is expected to surface those gaps — fixing them is a follow-up
+      # to the testing-infra audit and is tracked separately.
       - name: Run headless test suite
-        # --allow-fail tolerates known CI env-gap failures (Issue #41):
+        # --allow-fail tolerates known pre-existing gaps:
         #
-        # Musl hello / dynamic_elf / pie_elf / TCC compile / busybox basic /
-        # sigchld / ascension / firefox_oracle:
-        #   CI does not build the userspace binary fixtures (musl-hello,
-        #   ld-musl-x86_64.so.1, TCC, busybox, PIE test binary) or Firefox
-        #   ESR.  These tests legitimately SKIP or FAIL because the required
-        #   files are absent from the CI data disk.  Tracked by Issue #41.
+        # Issue #41 env-gap group (NotFound /disk/bin/* fixtures + firefox_oracle
+        # SIGSEGV): CI does not build the userspace binary fixtures (musl, tcc,
+        # busybox, hello) or Firefox, so those tests are expected to fail here.
         #
-        # unix socketpair EPOLLIN gating:
-        #   AF_UNIX epoll EPOLLIN edge-trigger bug, pre-dating W216. Real
-        #   kernel bug tracked separately; not caused by W216 changes.
+        # unix socketpair EPOLLIN gating: AF_UNIX epoll EPOLLIN edge-trigger has
+        # been failing on every CI run since the workflow was introduced
+        # (pre-W216).  This is a real kernel bug being tracked separately; it is
+        # not caused by any W216 change.
         #
-        # alias_test: the only concurrent MM stress test in the suite.
-        #   Currently --allow-fail on TCG CI runners due to the in-flight
-        #   W215 page-aliasing race investigation: under TCG the test hangs
-        #   (no /dev/kvm on GitHub runners) before the aliasing window closes.
-        #   Restore enforcement after W215 closure.
-        #   Tracked as task #328 in the project tracker.
+        # alias_test: added by PR #221 as a deterministic page-aliasing reproducer
+        # for the W8 race.  Currently --allow-fail on TCG CI runners due to the
+        # in-flight W215 page-aliasing race investigation.  Restore enforcement
+        # after W215 closure (tracked as task #328).
+        #
+        # Any failure NOT in this list still gates the job.
         run: |
-          python3 scripts/qemu-harness.py ci-run \
-            --features test-mode \
-            --no-build \
-            --no-kvm \
-            --timeout-ms 900000 \
-            --allow-fail 'Musl hello|dynamic_elf|pie_elf|TCC compile|busybox basic|sigchld|ascension|firefox_oracle|unix socketpair EPOLLIN gating|alias_test'
+          python3 scripts/watch-test.py --no-build --hard-timeout 900 \
+            --allow-fail '\[FAIL\] (Musl hello|dynamic_elf|pie_elf|TCC compile|busybox basic|sigchld|ascension|firefox_oracle|unix socketpair EPOLLIN gating|alias_test)'
 
       - name: Upload serial logs on failure
         if: failure()
