@@ -1676,21 +1676,18 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
             for i in 0..n_pages {
                 let (vaddr, phys, foff) = pages_to_map[i];
 
-                // W215 diagnostic Arm-1+2: record this PFH install attempt
-                // and probe whether the destination phys still has an
-                // in-flight pre-insert witness — the smoking-gun race for
-                // axis A.
+                // W215 diagnostic Arm-1: record the install event for the
+                // provenance ring.  The install-race witness probe is
+                // deferred to AFTER `cache::insert` below — by then this
+                // CPU's own pre-insert witness has been cleared by
+                // `preins_clear_on_insert`, so a remaining witness means
+                // a DIFFERENT CPU is mid-write on the same phys.
                 #[cfg(feature = "firefox-test")]
-                {
-                    crate::mm::w215_diag::prov_record(
-                        phys,
-                        crate::mm::w215_diag::KIND_PFH_INSTALL,
-                        crate::mm::w215_diag::pack_cache_key(inode, foff),
-                    );
-                    crate::mm::w215_diag::preins_check_install(
-                        phys, mount_idx, inode, foff,
-                    );
-                }
+                crate::mm::w215_diag::prov_record(
+                    phys,
+                    crate::mm::w215_diag::KIND_PFH_INSTALL,
+                    crate::mm::w215_diag::pack_cache_key(inode, foff),
+                );
 
                 // W216 H_5j-B: per-iteration generation re-check.  Any sibling
                 // CPU that mutated the address space (sys_munmap, MAP_FIXED
@@ -1748,6 +1745,16 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
 
                 // Always insert the clean page into the shared cache.
                 crate::mm::cache::insert(mount_idx, inode, foff, phys);
+
+                // W215 diagnostic Arm-2: my own pre-insert witness is now
+                // cleared (by preins_clear_on_insert inside cache::insert).
+                // If a witness for this phys is STILL present, a sibling
+                // CPU registered a pre-insert for the same phys — the
+                // smoking-gun race for axis A.
+                #[cfg(feature = "firefox-test")]
+                crate::mm::w215_diag::preins_check_install(
+                    phys, mount_idx, inode, foff,
+                );
 
                 // If another CPU already installed a PTE for this address,
                 // discard our redundant frame: remove our cache entry (only if
@@ -2028,6 +2035,14 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 crate::mm::refcount::page_ref_inc(phys);
                 crate::mm::cache::insert(mount_idx, inode, file_page_offset, phys);
 
+                // W215 diagnostic Arm-2 (single-page fallback): same
+                // semantic as the readahead path — own witness now cleared,
+                // a residual witness is a sibling-CPU race on the same phys.
+                #[cfg(feature = "firefox-test")]
+                crate::mm::w215_diag::preins_check_install(
+                    phys, mount_idx, inode, file_page_offset,
+                );
+
                 // Bug-C fix (single-page fallback): MAP_PRIVATE + writable
                 // mappings must receive a private copy of the cache page, not
                 // an alias.  Aliasing the shared frame with PAGE_WRITABLE set
@@ -2108,18 +2123,15 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                             }
                         }
                     }
-                    // W215 diagnostic Arm-1+2 (single-page alias install).
+                    // W215 diagnostic Arm-1 (single-page alias install
+                    // — install-race witness already probed above after
+                    // cache::insert).
                     #[cfg(feature = "firefox-test")]
-                    {
-                        crate::mm::w215_diag::prov_record(
-                            phys,
-                            crate::mm::w215_diag::KIND_PFH_INSTALL,
-                            crate::mm::w215_diag::pack_cache_key(inode, file_page_offset),
-                        );
-                        crate::mm::w215_diag::preins_check_install(
-                            phys, mount_idx, inode, file_page_offset,
-                        );
-                    }
+                    crate::mm::w215_diag::prov_record(
+                        phys,
+                        crate::mm::w215_diag::KIND_PFH_INSTALL,
+                        crate::mm::w215_diag::pack_cache_key(inode, file_page_offset),
+                    );
                     crate::mm::refcount::page_ref_inc(phys); // PTE reference
                     crate::mm::vmm::map_page_in(cr3, page_addr, phys, page_flags);
                     crate::mm::vmm::invlpg(page_addr);
