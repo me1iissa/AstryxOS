@@ -192,8 +192,8 @@ static STAT_QUARANTINE_RELEASED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static STAT_CLEAN_ACK_LATE: AtomicU64 = AtomicU64::new(0);
 
 /// H2 diagnostic counter: number of times `shootdown_range_inner` returned
-/// `false` (unclean → quarantine path).  Provides a baseline rate so the
-/// `CLEAN_ACK_LATE` false-positive rate can be contextualised.
+/// `false` (unclean → quarantine path).  Counts timed-out shootdowns routed
+/// to quarantine — these never reach the done-flag poll.
 /// Gated behind `#[cfg(feature = "firefox-test")]`.
 #[cfg(feature = "firefox-test")]
 pub(crate) static STAT_UNCLEAN_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -529,7 +529,7 @@ fn shootdown_range_inner(cr3: u64, va_lo: u64, va_hi: u64) -> bool {
         // unambiguously for *this* shootdown, not a residual from a prior
         // one.  Must precede the Release-store of pending below.
         #[cfg(feature = "firefox-test")]
-        SHOOTDOWN_DONE_FLAGS[bit].store(0, Ordering::Relaxed);
+        SHOOTDOWN_DONE_FLAGS[bit].store(0, Ordering::Release);
         // pending=1 must be the LAST write so the handler sees a
         // fully-published payload.  Release pairs with Acquire in
         // the handler.
