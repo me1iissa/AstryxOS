@@ -497,6 +497,16 @@ extern "C" fn timer_tick() {
     // ring is empty (a single atomic load that fast-paths out).
     crate::mm::tlb::on_cpu_tick(tick);
 
+    // W215 Arm-1 diagnostic: walk a small slice of the page cache and
+    // CRC32 each entry against the value captured at insert time.  On
+    // mismatch, arm a hardware DR0 write-watchpoint via
+    // `arch::x86_64::debug_reg::arm_write_watchpoint` so the offending
+    // kernel write site self-identifies through `#DB`.  Per Intel SDM
+    // Vol. 3B §17.2.4 (Debug Address Registers).  Diagnostic-only;
+    // does nothing without the `firefox-test` feature.
+    #[cfg(feature = "firefox-test")]
+    crate::mm::w215_crc::crc_walk_tick(cpu as u32);
+
     // Notify the scheduler about the tick.
     crate::sched::timer_tick_schedule();
 
@@ -527,6 +537,16 @@ irq_stub!(irq_e1000_handler, e1000_interrupt);
 irq_stub!(irq_virtio_blk_handler, virtio_blk_interrupt);
 irq_stub!(irq_virtio_serial_handler, virtio_serial_interrupt);
 irq_stub!(irq_tlb_shootdown_handler, tlb_shootdown_interrupt);
+#[cfg(feature = "firefox-test")]
+irq_stub!(irq_w215_dr_sync_handler, w215_dr_sync_interrupt);
+
+/// W215 Arm-1 DR0/DR7 sync IPI body.  Programs this CPU's DR0/DR7 from
+/// the values published by `arch::x86_64::debug_reg::arm_write_watchpoint`.
+/// EOIs the LAPIC.  Diagnostic-only.
+#[cfg(feature = "firefox-test")]
+extern "C" fn w215_dr_sync_interrupt() {
+    crate::arch::x86_64::debug_reg::handle_w215_dr_sync_ipi();
+}
 
 /// Cross-CPU TLB shootdown IPI logic.
 ///
