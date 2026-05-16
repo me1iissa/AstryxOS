@@ -938,6 +938,9 @@ pub extern "C" fn ap_rust_entry() -> ! {
 
     // Enable SSE on this AP (BSP does it in arch::x86_64::init)
     crate::arch::x86_64::enable_sse();
+    // Enable CR4.SMEP on this AP. Each CPU has its own CR4, so the BSP's
+    // setting does not propagate. Per Intel SDM Vol. 3A §2.5.
+    crate::arch::x86_64::enable_cpu_security_features();
 
     // Enable local APIC
     let apic_base_msr = unsafe { rdmsr(IA32_APIC_BASE_MSR) };
