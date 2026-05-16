@@ -1193,6 +1193,232 @@ def cmd_context(args):
 
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+def cmd_ci_run(args):
+    """
+    ci-run: Build, boot, and run the full kernel test suite in one command.
+
+    Intended for CI use (replaces the banned watch-test.py wrapper):
+      - Builds the kernel with --features (default: test-mode)
+      - Launches QEMU and waits for the test suite to complete
+      - Parses [TEST-JSON] lines from the serial log
+      - Applies --allow-fail regex to downgrade listed failures
+      - Exits 0 on pass (or when all failures are allow-listed), 1 on failure
+
+    Example (CI):
+      python3 scripts/qemu-harness.py ci-run \\
+        --features test-mode \\
+        --timeout-ms 900000 \\
+        --allow-fail 'Musl hello|dynamic_elf|pie_elf|TCC compile|busybox basic|sigchld|ascension|firefox_oracle|unix socketpair EPOLLIN gating'
+
+    Output (to stdout, JSON):
+      {"ok": true/false, "passed": N, "failed": N, "allowed_failures": [...],
+       "real_failures": [...], "sid": "...", "exit_cause": "..."}
+    """
+    import types
+
+    features = args.features or "test-mode"
+    timeout_ms = args.timeout_ms
+    allow_fail_pat = args.allow_fail or ""
+    no_build = getattr(args, "no_build", False)
+    no_kvm = getattr(args, "no_kvm", False)
+
+    # Compile the allow-fail regex once so a bad pattern is caught up front.
+    allow_re = None
+    if allow_fail_pat:
+        try:
+            allow_re = re.compile(allow_fail_pat)
+        except re.error as e:
+            _err(f"--allow-fail is not a valid regex: {e}")
+
+    # --- Step 1: build ---
+    if not no_build:
+        print("[ci-run] building kernel ...", file=sys.stderr)
+        ok = _build(features)
+        if not ok:
+            result = {"ok": False, "error": "build_failed", "features": features}
+            print(json.dumps(result, indent=2))
+            return 1
+
+    # --- Step 2: start QEMU ---
+    # Synthesise a minimal args namespace that cmd_start expects.
+    start_args = types.SimpleNamespace(
+        features=features,
+        no_build=True,          # build already done above
+        gdb_port=0,
+        gdb_wait=False,
+        no_kvm=no_kvm,
+        force_kvm=False,
+        smp=2,
+        cpu_model=None,
+        no_regen_data_img=False,
+    )
+    # cmd_start prints a JSON start record to stdout.  Redirect stdout to
+    # stderr during the call so it doesn't pollute our final JSON output.
+    before_sids = {p.stem for p in HARNESS_DIR.glob("*.json")}
+
+    print("[ci-run] launching QEMU ...", file=sys.stderr)
+    _orig_stdout = sys.stdout
+    sys.stdout = sys.stderr
+    try:
+        cmd_start(start_args)  # may call sys.exit() on hard error
+    finally:
+        sys.stdout = _orig_stdout
+
+    after_sids = {p.stem for p in HARNESS_DIR.glob("*.json")}
+    new_sids = after_sids - before_sids
+    if not new_sids:
+        result = {"ok": False, "error": "session_not_created"}
+        print(json.dumps(result, indent=2))
+        return 1
+    sid = sorted(new_sids)[-1]
+    print(f"[ci-run] session sid={sid}", file=sys.stderr)
+
+    # --- Step 3: wait for test suite completion marker ---
+    # The kernel prints either:
+    #   [TEST SUITE] ✓ ALL TESTS PASSED
+    #   [TEST SUITE] ✗ N TESTS FAILED
+    # Both end the test run; we scan for the common prefix.
+    suite_done_re = r"\[TEST SUITE\]"
+    print(f"[ci-run] waiting up to {timeout_ms // 1000}s for [TEST SUITE] ...",
+          file=sys.stderr)
+
+    # Inline wait loop (mirrors cmd_wait logic but doesn't need a separate
+    # args namespace — avoids calling cmd_wait which prints JSON to stdout).
+    sess = _load_session(sid)
+    serial_log = sess["serial_log"]
+    pattern = re.compile(suite_done_re)
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    file_pos = 0
+    suite_found = False
+    while time.monotonic() < deadline:
+        pid = sess.get("pid", 0)
+        try:
+            with Path(serial_log).open("r", errors="replace") as fh:
+                fh.seek(file_pos)
+                chunk = fh.read(65536)
+                if chunk:
+                    for ln in chunk.splitlines(keepends=True):
+                        if pattern.search(ln):
+                            suite_found = True
+                            break
+                    file_pos += len(chunk.encode("utf-8", errors="replace"))
+        except OSError:
+            pass
+        if suite_found:
+            break
+        if pid and not _pid_alive(pid):
+            # QEMU exited — do a final drain
+            try:
+                with Path(serial_log).open("r", errors="replace") as fh:
+                    fh.seek(file_pos)
+                    for ln in fh.readlines():
+                        if pattern.search(ln):
+                            suite_found = True
+                            break
+            except OSError:
+                pass
+            break
+        time.sleep(0.5)
+
+    # --- Step 4: stop the session ---
+    # Redirect stdout during stop so cmd_stop's JSON doesn't pollute ours.
+    try:
+        stop_args = types.SimpleNamespace(sid=sid)
+        _s = sys.stdout
+        sys.stdout = sys.stderr
+        try:
+            cmd_stop(stop_args)
+        finally:
+            sys.stdout = _s
+    except Exception:
+        pass
+
+    if not suite_found:
+        # QEMU died or timed out before printing the suite banner.
+        exit_cause = _classify_exit_cause(serial_log, False)
+        result = {
+            "ok": False,
+            "error": "suite_not_completed",
+            "sid": sid,
+            "exit_cause": exit_cause,
+            "timeout_ms": timeout_ms,
+        }
+        print(json.dumps(result, indent=2))
+        return 1
+
+    # --- Step 5: parse test results from serial log ---
+    tests: list = []
+    libs_loaded: list = []
+    failed_opens: list = []
+    try:
+        with Path(serial_log).open("rb") as fh:
+            buf = b""
+            while True:
+                chunk = fh.read(64 * 1024)
+                if not chunk:
+                    if buf:
+                        _scan_line(buf, tests, libs_loaded, failed_opens)
+                    break
+                buf += chunk
+                while True:
+                    nl = buf.find(b"\n")
+                    if nl < 0:
+                        break
+                    line_b = buf[:nl]
+                    buf = buf[nl + 1:]
+                    _scan_line(line_b, tests, libs_loaded, failed_opens)
+    except OSError as e:
+        _err(f"Cannot read serial log {serial_log}: {e}")
+
+    # --- Step 6: apply --allow-fail filtering ---
+    passed_tests = [t for t in tests if t.get("result") == "pass"]
+    failed_tests = [t for t in tests if t.get("result") == "fail"]
+
+    allowed_failures = []
+    real_failures = []
+    for t in failed_tests:
+        name = t.get("name", "")
+        if allow_re and allow_re.search(name):
+            allowed_failures.append(name)
+        else:
+            real_failures.append(name)
+
+    exit_cause = _classify_exit_cause(serial_log, False)
+    overall_ok = len(real_failures) == 0
+
+    result = {
+        "ok": overall_ok,
+        "sid": sid,
+        "exit_cause": exit_cause,
+        "features": features,
+        "passed": len(passed_tests),
+        "failed": len(failed_tests),
+        "allowed_failures": allowed_failures,
+        "real_failures": real_failures,
+        "total_tests": len(tests),
+    }
+    print(json.dumps(result, indent=2))
+
+    if not overall_ok:
+        print(
+            f"[ci-run] FAILED — {len(real_failures)} unallowed failure(s): "
+            f"{real_failures}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"[ci-run] PASSED — {len(passed_tests)} pass, "
+            f"{len(allowed_failures)} allowed-fail, "
+            f"{len(real_failures)} real-fail",
+            file=sys.stderr,
+        )
+
+    return 0 if overall_ok else 1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+
 def cmd_check(args):
     """
     Run `cargo +nightly check` against the kernel package and emit a JSON
@@ -5623,6 +5849,31 @@ def main():
              "(default 120000 = 2 min, covers build + boot + test run)"
     )
 
+    # ci-run: one-shot build+boot+test+report for CI.  Replaces the banned
+    # watch-test.py wrapper.  All filtering (--allow-fail) is applied here
+    # rather than at the CI YAML level, keeping the logic in one place.
+    p_ci = sub.add_parser(
+        "ci-run",
+        help="Build, boot, run the full test suite, and report pass/fail "
+             "(CI replacement for the banned watch-test.py wrapper). "
+             "Exits 0 on pass or when all failures match --allow-fail.",
+    )
+    p_ci.add_argument("--features", default="test-mode", metavar="FLAGS",
+                      help="Kernel feature flags (default: test-mode)")
+    p_ci.add_argument("--no-build", action="store_true", dest="no_build",
+                      help="Skip cargo build; use existing kernel.bin")
+    p_ci.add_argument("--timeout-ms", type=int, default=900000,
+                      dest="timeout_ms",
+                      help="Total budget in ms for suite to complete "
+                           "(default 900000 = 15 min)")
+    p_ci.add_argument("--allow-fail", default="", metavar="REGEX",
+                      dest="allow_fail",
+                      help="Regex of test names to tolerate failing. "
+                           "Matched failures are reported but do not set "
+                           "exit code 1. Example: 'Musl hello|pie_elf'")
+    p_ci.add_argument("--no-kvm", dest="no_kvm", action="store_true",
+                      help="Disable KVM (GitHub runners have no /dev/kvm)")
+
     # check: run `cargo check` against a feature-flag combination without
     # spinning up QEMU.  Used by hotfix verification sweeps that need to
     # confirm a regression is closed across N feature combos before
@@ -5654,6 +5905,7 @@ def main():
     args = parser.parse_args()
 
     dispatch = {
+        "ci-run": cmd_ci_run,
         "check":  cmd_check,
         "start":  cmd_start,
         "stop":   cmd_stop,

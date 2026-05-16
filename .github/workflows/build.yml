@@ -217,10 +217,9 @@ jobs:
         # not caused by any W216 change.
         #
         # alias_test: added by PR #221 as a deterministic page-aliasing reproducer
-        # for the W8 race.  The test is *expected* to fail (exit -11/SIGSEGV)
-        # until the aliasing root cause is fully fixed — that is the point of the
-        # reproducer.  It is included in the suite so CI catches accidental
-        # regressions in alias behavior over time.
+        # for the W8 race.  Currently --allow-fail on TCG CI runners due to the
+        # in-flight W215 page-aliasing race investigation.  Restore enforcement
+        # after W215 closure (tracked as task #328).
         #
         # Any failure NOT in this list still gates the job.
         run: |
