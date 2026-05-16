@@ -18,6 +18,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::{Mutex, RwLock};
 
 /// VMA protection flags (mmap-compatible).
@@ -275,6 +276,26 @@ pub struct VmSpace {
     /// can both hold a handle; the registry deregisters when the
     /// `VmSpace` is dropped and the last `Arc` ref vanishes.
     pub mm_sem: Arc<RwLock<()>>,
+    /// Monotonic counter bumped on every VMA-list mutation (W216 H_5j-B,
+    /// 5th systemic aliasing path).  The page-fault handler in
+    /// `arch/x86_64/idt.rs` samples this counter immediately after the
+    /// PR #226 / #230 post-I/O VMA re-validation succeeds, then re-loads
+    /// it before each `cache::insert + map_page_in` install iteration in
+    /// the readahead and single-page fallback arms.  A mismatch indicates
+    /// that a sibling CPU mutated the address space between revalidate
+    /// and the current iteration; the install loop aborts and the user
+    /// re-faults against the new VMA, mirroring the abort-and-retry
+    /// pattern used elsewhere in the PFH for stale snapshots.
+    ///
+    /// The counter is shared (`Arc<AtomicU64>`) so that low-level helpers
+    /// like `unmap_and_free_range_in` — which only have a `cr3`, not a
+    /// `&VmSpace` — can bump the generation via `bump_generation_for_cr3`.
+    /// Acquire/Release ordering is per Intel SDM Vol. 3A §8.2.3 (memory-
+    /// ordering guarantees of LOCK-prefixed atomics on x86-64): a
+    /// release-store on the mutator side happens-before an acquire-load
+    /// on the PFH side, so any VMA-list write that preceded the bump is
+    /// visible to a PFH iteration that observes the new generation.
+    pub generation: Arc<AtomicU64>,
 }
 
 /// Default user-space mmap starting address.
@@ -329,6 +350,58 @@ pub fn mm_sem_for_cr3(cr3: u64) -> Option<Arc<RwLock<()>>> {
     reg.get(&cr3).cloned()
 }
 
+// ============================================================================
+// MM generation registry — parallel to MM_REGISTRY, keyed by cr3.
+// Allows low-level helpers (unmap_and_free_range_in, MADV_DONTNEED bulk
+// teardown) that only have a cr3 to bump the owning VmSpace's generation
+// without threading a `&VmSpace` reference through the call graph.
+// See `VmSpace::generation` doc-comment for the use case.
+// ============================================================================
+
+static MM_GEN_REGISTRY: Mutex<BTreeMap<u64, Arc<AtomicU64>>> = Mutex::new(BTreeMap::new());
+
+/// Insert (cr3 → generation counter) into the parallel registry.  Idempotent
+/// (replaces any prior entry) for the same reasons described in
+/// `register_mm_sem`.
+pub(crate) fn register_mm_generation(cr3: u64, gen_arc: Arc<AtomicU64>) {
+    if cr3 == 0 {
+        return;
+    }
+    let mut reg = MM_GEN_REGISTRY.lock();
+    reg.insert(cr3, gen_arc);
+}
+
+/// Remove the generation counter entry for `cr3` (no-op if absent).
+#[allow(dead_code)]
+pub(crate) fn unregister_mm_generation(cr3: u64) {
+    if cr3 == 0 {
+        return;
+    }
+    let mut reg = MM_GEN_REGISTRY.lock();
+    reg.remove(&cr3);
+}
+
+/// Bump the VmSpace generation counter associated with `cr3`.  Called by
+/// PTE-mutating helpers that only have a `cr3` (see `mm/vmm.rs`).  Cheap
+/// (registry lookup + one atomic fetch_add); no-op for unknown CR3s.
+///
+/// The fetch_add uses Release ordering so that VMA-list / PTE writes that
+/// precede the bump on the same CPU are observable to any other CPU that
+/// subsequently performs an Acquire load of the counter (Intel SDM
+/// Vol. 3A §8.2.3).
+pub fn bump_generation_for_cr3(cr3: u64) {
+    if cr3 == 0 {
+        return;
+    }
+    let arc = {
+        let reg = MM_GEN_REGISTRY.lock();
+        reg.get(&cr3).cloned()
+    };
+    if let Some(g) = arc {
+        g.fetch_add(1, Ordering::Release);
+    }
+}
+
 /// Allocate a fresh `mm_sem` handle for use in test struct-literal
 /// `VmSpace { ... }` construction.  Production code paths should construct
 /// `VmSpace` via `new_kernel`, `new_user`, `from_existing_cr3`, or
@@ -338,12 +411,20 @@ pub fn make_mm_sem_for_test() -> Arc<RwLock<()>> {
     Arc::new(RwLock::new(()))
 }
 
+/// Allocate a fresh generation counter for use in test struct-literal
+/// `VmSpace { ... }` construction.  Mirrors `make_mm_sem_for_test`.
+pub fn make_generation_for_test() -> Arc<AtomicU64> {
+    Arc::new(AtomicU64::new(0))
+}
+
 impl VmSpace {
     /// Create a new empty address space for a kernel process (shares kernel CR3).
     pub fn new_kernel() -> Self {
         let cr3 = crate::mm::vmm::get_cr3();
         let mm_sem = Arc::new(RwLock::new(()));
         register_mm_sem(cr3, mm_sem.clone());
+        let generation = Arc::new(AtomicU64::new(0));
+        register_mm_generation(cr3, generation.clone());
         Self {
             cr3,
             areas: Vec::new(),
@@ -351,6 +432,7 @@ impl VmSpace {
             brk: HEAP_BASE,
             brk_start: HEAP_BASE,
             mm_sem,
+            generation,
         }
     }
 
@@ -378,6 +460,20 @@ impl VmSpace {
         // present (the parent's VmSpace registered it at construction).  No
         // re-registration is needed — `mm_sem_for_cr3(cr3)` already returns
         // this Arc.
+        //
+        // Generation counter: shares the parent's counter so any mutation made
+        // by either share-CR3 sibling is observed by both at the PFH check.
+        // Falls back to a fresh counter if the parent is no longer registered
+        // (defensive — should not occur in practice).
+        let generation = {
+            let reg = MM_GEN_REGISTRY.lock();
+            reg.get(&cr3).cloned()
+        }
+        .unwrap_or_else(|| {
+            let g = Arc::new(AtomicU64::new(0));
+            register_mm_generation(cr3, g.clone());
+            g
+        });
         Self {
             cr3,
             areas: Vec::new(),
@@ -385,6 +481,7 @@ impl VmSpace {
             brk: HEAP_BASE,
             brk_start: HEAP_BASE,
             mm_sem: parent_mm_sem,
+            generation,
         }
     }
 
@@ -440,6 +537,8 @@ impl VmSpace {
 
         let mm_sem = Arc::new(RwLock::new(()));
         register_mm_sem(new_pml4, mm_sem.clone());
+        let generation = Arc::new(AtomicU64::new(0));
+        register_mm_generation(new_pml4, generation.clone());
         Some(Self {
             cr3: new_pml4,
             areas: Vec::new(),
@@ -447,6 +546,7 @@ impl VmSpace {
             brk: HEAP_BASE,
             brk_start: HEAP_BASE,
             mm_sem,
+            generation,
         })
     }
 
@@ -652,6 +752,13 @@ impl VmSpace {
         // the new lock with the child's freshly-allocated PML4.
         let child_mm_sem = Arc::new(RwLock::new(()));
         register_mm_sem(child_pml4_phys, child_mm_sem.clone());
+        let child_generation = Arc::new(AtomicU64::new(0));
+        register_mm_generation(child_pml4_phys, child_generation.clone());
+
+        // Bump the parent's generation: the CoW write-protect pass above
+        // mutated parent PTEs (clear PAGE_WRITABLE), which the PFH treats
+        // analogously to a VMA-list mutation for race-detection purposes.
+        self.generation.fetch_add(1, Ordering::Release);
 
         Some(VmSpace {
             cr3: child_pml4_phys,
@@ -660,6 +767,7 @@ impl VmSpace {
             brk: self.brk,
             brk_start: self.brk_start,
             mm_sem: child_mm_sem,
+            generation: child_generation,
         })
     }
 
@@ -689,6 +797,8 @@ impl VmSpace {
         let pos = self.areas.iter().position(|v| v.base > vma.base)
             .unwrap_or(self.areas.len());
         self.areas.insert(pos, vma);
+        // W216 H_5j-B: notify the PFH install loop that the VMA list changed.
+        self.generation.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -703,6 +813,11 @@ impl VmSpace {
     /// remnant reservation pages, corrupting its internal load-address
     /// structures and producing garbage mprotect/relocation addresses.
     pub fn remove_range(&mut self, base: u64, length: u64) -> Result<(), VmaError> {
+        // W216 H_5j-B: notify the PFH install loop that the VMA list is about
+        // to change.  Bumped before the mutation so any PFH iteration that
+        // observes the new generation will also (via the lock acquisition in
+        // `unmap_and_free_range_in`) see the post-mutation areas list.
+        self.generation.fetch_add(1, Ordering::Release);
         let end = base + length;
         let mut i = 0;
 
@@ -839,6 +954,11 @@ impl VmSpace {
             return self.brk;
         }
 
+        // W216 H_5j-B: heap VMA grow/shrink mutates the area list; notify the
+        // PFH install loop.  insert_vma below also bumps on the create-heap
+        // path; double-bump is harmless (counter is monotonic).
+        self.generation.fetch_add(1, Ordering::Release);
+
         if new_brk > self.brk {
             // Expanding: ensure we have a heap VMA
             if let Some(heap_vma) = self.areas.iter_mut().find(|v| v.name == "[heap]") {
@@ -945,6 +1065,19 @@ impl Drop for VmSpace {
             // versa) still holds a clone — leave the registry entry intact.
             if Arc::ptr_eq(slot, &self.mm_sem) && Arc::strong_count(&self.mm_sem) == 2 {
                 reg.remove(&self.cr3);
+                // Generation registry tracks the same lifecycle (per-cr3,
+                // shared with from_existing_cr3 vfork siblings).  Remove the
+                // entry only when the sem entry was also removed so the two
+                // registries stay coherent.
+                drop(reg);
+                let mut greg = MM_GEN_REGISTRY.lock();
+                if let Some(gslot) = greg.get(&self.cr3) {
+                    if Arc::ptr_eq(gslot, &self.generation)
+                        && Arc::strong_count(&self.generation) == 2
+                    {
+                        greg.remove(&self.cr3);
+                    }
+                }
             }
         }
     }
