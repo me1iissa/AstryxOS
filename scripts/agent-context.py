@@ -7,7 +7,7 @@ structured output. File locking ensures safe concurrent appends from parallel
 agents.
 
 Session files:
-  .claude/session/CURRENT.md   — coordinator-maintained live state (≤200 lines)
+  .claude/session/CURRENT.md   — coordinator-maintained live state (≤200 lines default, see _DEFAULT_MAX_LINES)
   .claude/session/EVENTS.jsonl — append-only event stream (one JSON per line)
 
 Subcommands:

@@ -37,7 +37,7 @@ If a readiness gap requires engineering work to resolve, produce the finding and
 Every readiness assessment is a structured checklist. Line items are PASS / FAIL / WAIVER-REQUIRED:
 
 **Stability gates**
-- [ ] Baseline KVM 5-trial sc-count ≥ threshold (per `project_demo_focus.md` current bar)
+- [ ] Baseline KVM 5-trial sc-count within expected range — read `~/.claude/projects/-home-ubuntu-AstryxOS/memory/project_demo_focus.md` AND the latest `project_baseline_*_full_*.md` to determine current expected range; as of mid-2026 the range is 5,000–13,000 depending on whether contentproc spawns
 - [ ] Zero CRITICAL security findings open (from most recent `docs/SECURITY_AUDIT_*.md`)
 - [ ] Zero known kernel panics / bugchecks in last 10 test runs
 - [ ] No REGRESSION vs previous release baseline on key metrics

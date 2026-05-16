@@ -71,7 +71,7 @@ grep -r "aliasing" ~/.claude/projects/-home-ubuntu-AstryxOS/memory/ 2>/dev/null
 1. Read the current contents.
 2. Update the "Current wedge" / "Latest baseline" / "Active investigations" sections.
 3. Add a one-line entry to the "Recent events" log (with window number and date).
-4. Keep CURRENT.md under 100 lines — it's a snapshot, not a history. History goes in topic files and MEMORY.md.
+4. Keep CURRENT.md under 200 lines — it's a snapshot, not a history. History goes in topic files and MEMORY.md. (200 is the canonical limit enforced by `scripts/agent-context.py` `_DEFAULT_MAX_LINES`; that tool is authoritative.)
 
 If `.claude/session/CURRENT.md` doesn't exist, create it with a minimal structure:
 ```markdown
