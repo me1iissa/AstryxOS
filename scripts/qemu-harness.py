@@ -2254,7 +2254,7 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
         qemu-harness.py kdb <sid> syscall-trend 10 4
     """
     if op in ("ping", "proc-list", "vfs-mounts", "trace-status",
-              "bell-stats", "cache-audit"):
+              "bell-stats", "cache-audit", "tlb-stats"):
         return {"op": op}
     if op == "proc":
         if not rest: raise ValueError("proc requires <pid>")
@@ -2373,6 +2373,44 @@ def cmd_kdb(args):
 #     Hypothesis A (FD routing bug): PID-1 fd=70 peer resolves to a DIFFERENT
 #                  (pid, fd) than the one PID-4 writes its fd=27 to.
 #     Hypothesis B (kernel wake bug): peer is correct but poll never fires.
+
+def cmd_tlb_stats(args):
+    """One-shot TLB shootdown + PMM recent-free diagnostic readout.
+
+    Calls kdb op 'tlb-stats' and returns a flat JSON object containing:
+
+    TLB transport counters (always present):
+      shootdowns_sent, ipis_sent, ack_timeouts, shootdowns_handled,
+      quarantine_deferred, quarantine_released, quarantine_depth
+
+    H2 diagnostic counters (firefox-test feature; zero in other builds):
+      shootdown_clean_ack_late  -- shootdowns declared clean before handler done
+      shootdown_unclean_total   -- shootdowns routed to quarantine (baseline rate)
+      pmm_alloc_recent_free     -- frames recycled faster than quarantine window
+
+    W215 H2 verdict gate (for the 5-trial soak):
+      PROCEED-TO-FIX  : shootdown_clean_ack_late > 0 OR pmm_alloc_recent_free > 0
+      ABORT-ESCALATE  : all counters zero AND W215 cluster reproduces
+      NULL            : W215 does not reproduce
+    """
+    sess = _load_session(args.sid)
+    port = int(sess.get("kdb_host_port") or 0)
+    if port <= 0:
+        _out({"error": "session was not started with --features kdb"})
+        sys.exit(1)
+    timeout = float(getattr(args, "timeout", 5.0) or 5.0)
+    try:
+        raw = _kdb_recv(port, {"op": "tlb-stats"}, timeout=timeout)
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        _out({"error": f"kdb connect/io failed on 127.0.0.1:{port}: {e}"})
+        sys.exit(1)
+    try:
+        result = json.loads(raw.strip().decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as e:
+        _out({"error": f"malformed kdb response: {e}",
+              "raw": raw[:256].decode("utf-8", errors="replace")})
+        sys.exit(1)
+    _out(result)
 
 def cmd_fd_map(args):
     """Cross-process FD map with socketpair/pipe peer resolution.
@@ -5301,7 +5339,7 @@ def main():
         "ping", "proc-list", "proc", "proc-tree", "fd-table", "fd-map",
         "syscall-trend", "vfs-mounts",
         "dmesg", "syms", "mem", "tframe", "user-mem", "trace-status",
-        "bell-stats", "cache-audit",
+        "bell-stats", "cache-audit", "tlb-stats",
     ])
     p_kdb.add_argument("args", nargs="*",
                         help="Op-specific positional args: "
@@ -5313,6 +5351,15 @@ def main():
                              "mem <addr> <len>")
     p_kdb.add_argument("--timeout", type=float, default=5.0,
                         help="Socket timeout in seconds (default 5.0)")
+
+    # tlb-stats — dedicated top-level subcommand for W215 H2 TLB diagnostic
+    p_tlb_stats = sub.add_parser(
+        "tlb-stats",
+        help="[Tier1] TLB shootdown + PMM recent-free H2 diagnostic snapshot "
+             "(requires --features kdb+firefox-test at start).")
+    p_tlb_stats.add_argument("sid")
+    p_tlb_stats.add_argument("--timeout", type=float, default=5.0,
+                              help="kdb socket timeout in seconds (default 5.0)")
 
     # fd-map — dedicated top-level subcommand with snapshot/diff support
     p_fdmap = sub.add_parser(
@@ -5629,6 +5676,7 @@ def main():
         "resume": cmd_resume,
         # Tier 1
         "kdb":         cmd_kdb,
+        "tlb-stats":   cmd_tlb_stats,
         "fd-map":      cmd_fd_map,
         "cache-audit": cmd_cache_audit,
         # QGA bridge
