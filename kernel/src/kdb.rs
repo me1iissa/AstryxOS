@@ -278,6 +278,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "mem"            => op_mem(req, out),
         "trace-status"   => op_trace_status(out),
         "bell-stats"     => op_bell_stats(out),
+        "cache-audit"    => op_cache_audit(out),
         _ => {
             out.push_str(r#"{"error":"unknown op: "#);
             for c in op.chars().take(64) {
@@ -1310,4 +1311,50 @@ fn op_syscall_trend(req: &str, out: &mut String) {
         out.push_str(r#","more":true"#);
     }
     out.push('}');
+}
+
+// ── cache-audit ───────────────────────────────────────────────────────────────
+//
+// Run `cache::audit_invariant()` (firefox-test only) and return structured
+// JSON.  Also reads the PMM and refcount diagnostic counters accumulated since
+// boot.
+//
+// Output (firefox-test builds):
+//   {
+//     "total_entries": N,
+//     "orphan_count":  M,
+//     "pmm_alloc_nonzero_rc": P,
+//     "refcount_set_over_nonzero": Q,
+//     "orphans": [ {"key":"(m,i,0xoff)", "phys":"0x...", "rc":0}, ... ]
+//   }
+//
+// On non-firefox-test builds the op returns a capabilities note instead.
+
+fn op_cache_audit(out: &mut String) {
+    #[cfg(feature = "firefox-test")]
+    {
+        use core::fmt::Write;
+
+        // Run the audit — also emits serial lines for grep.
+        let (total, orphan_count) = crate::mm::cache::audit_invariant();
+
+        // Read the PMM and refcount counters.
+        let pmm_nonzero = crate::mm::pmm::pmm_alloc_nonzero_rc_count();
+        let rc_set_over = crate::mm::refcount::refcount_set_over_nonzero_count();
+
+        // We already logged individual orphans via serial in audit_invariant.
+        // The JSON response carries the aggregate numbers plus a note that
+        // full orphan detail is in the serial log.
+        out.push('{');
+        let _ = write!(out, r#""total_entries":{},"orphan_count":{},"pmm_alloc_nonzero_rc":{},"refcount_set_over_nonzero":{}"#,
+            total, orphan_count, pmm_nonzero, rc_set_over,
+        );
+        // Indicate where to find per-orphan detail.
+        out.push_str(r#","note":"per-orphan detail in serial log [CACHE/AUDIT/ORPHAN] lines""#);
+        out.push('}');
+    }
+    #[cfg(not(feature = "firefox-test"))]
+    {
+        out.push_str(r#"{"error":"cache-audit requires firefox-test feature"}"#);
+    }
 }
