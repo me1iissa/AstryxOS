@@ -494,28 +494,6 @@ pub fn map_page_in(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -
     // `None` arm is a no-op (no concurrent fork to serialise against).
     let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
     let _mm_read = _mm_guard.as_ref().map(|s| s.read());
-    map_page_in_locked(pml4_phys, virt_addr, phys_addr, flags)
-}
-
-/// Variant of [`map_page_in`] that **does not** acquire `mm_sem`.
-///
-/// The caller must already hold the per-VmSpace `mm_sem` in either read or
-/// write mode for `pml4_phys` (or know that no `VmSpace` is registered for
-/// this CR3 — kernel-only / AP-idle paths).  This exists so the page-fault
-/// handler can escalate `mm_sem` to a write lock for the duration of a
-/// multi-page install loop (W216 H_5j-A — see
-/// `kernel/src/arch/x86_64/idt.rs`) without provoking the non-reentrant
-/// `spin::RwLock` recursion that the unconditional read-acquire in
-/// `map_page_in` would otherwise cause.
-///
-/// `VMM_LOCK` is still taken — it serialises raw page-table edits across
-/// CPUs.  Per Intel SDM Vol. 3A §4.10.5 the PTE write itself must be ordered
-/// with respect to other PTE mutators on the same paging hierarchy.
-///
-/// # Safety
-/// `pml4_phys` must point to a valid PML4 page table, and the caller must
-/// hold `mm_sem_for_cr3(pml4_phys)` in read or write mode.
-pub fn map_page_in_locked(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -> bool {
     let _lock = VMM_LOCK.lock();
 
     let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
