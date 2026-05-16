@@ -761,10 +761,56 @@ def _build(features: str) -> bool:
                   "--profile", "release"]
     if features:
         kernel_cmd += ["--features", features]
-    kernel_cmd += ["-Zbuild-std=core,alloc",
-                   "-Zbuild-std-features=compiler-builtins-mem",
+
+    # `--features coverage` (test-coverage audit session 5) requires three
+    # build-time adjustments that we keep entirely out of the default
+    # build path so non-coverage artefacts remain byte-identical to the
+    # pre-coverage kernel:
+    #
+    #   1. Include `profiler_builtins` in `-Zbuild-std` so rustc finds a
+    #      crate with the `#![profiler_runtime]` attribute (the only way
+    #      to satisfy the E0463 check that `-C instrument-coverage`
+    #      triggers).  We point its build script at an empty stub
+    #      `libclang_rt.profile-x86_64.a` via `LLVM_PROFILER_RT_LIB` so
+    #      the std build does not try to compile compiler-rt from C
+    #      source (which would need LLVM compiler-rt source on the host).
+    #      The kernel never CALLS into the profile runtime — the counter
+    #      increments LLVM emits are inline, and `dump_profile()` walks
+    #      the sections directly — so a content-free `.a` is sufficient.
+    #
+    #   2. Apply `-C instrument-coverage` to ONLY the astryx-kernel crate
+    #      via per-package `profile.release.package."astryx-kernel".rustflags`
+    #      (requires the `profile-rustflags` cargo feature, which we
+    #      opt into at the workspace root).  If we set the flag globally
+    #      `profiler_builtins` itself recurses on E0463.  Scoping to one
+    #      crate keeps `core` / `alloc` un-instrumented, which is fine —
+    #      kernel test coverage is the audit's only goal.
+    #
+    #   3. Ensure the empty stub archive exists on disk before invoking
+    #      cargo.  Cached across calls under HARNESS_DIR.
+    coverage_extra: list = []
+    env = None
+    if features and "coverage" in [f.strip() for f in features.split(",")]:
+        stub_lib = HARNESS_DIR / "libclang_rt.profile-x86_64.a"
+        if not stub_lib.exists():
+            # `ar`-format empty archive header (8-byte magic + nothing else).
+            stub_lib.write_bytes(b"!<arch>\n")
+        # Inject build flags + LLVM_PROFILER_RT_LIB into a copy of the env.
+        env = dict(os.environ)
+        env["LLVM_PROFILER_RT_LIB"] = str(stub_lib)
+        coverage_extra = [
+            "--config",
+            'profile.release.package."astryx-kernel".rustflags = '
+            '["-C","instrument-coverage"]',
+        ]
+        kernel_cmd += ["-Zbuild-std=core,alloc,profiler_builtins"]
+    else:
+        kernel_cmd += ["-Zbuild-std=core,alloc"]
+    kernel_cmd += ["-Zbuild-std-features=compiler-builtins-mem",
                    "-Zjson-target-spec"]
-    r2 = subprocess.run(kernel_cmd, cwd=ROOT)
+    kernel_cmd += coverage_extra
+
+    r2 = subprocess.run(kernel_cmd, cwd=ROOT, env=env)
     if r2.returncode != 0:
         return False
 
@@ -2480,7 +2526,8 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
         qemu-harness.py kdb <sid> syscall-trend 10 4
     """
     if op in ("ping", "proc-list", "vfs-mounts", "trace-status",
-              "bell-stats", "cache-audit", "cache-aliasing", "tlb-stats"):
+              "bell-stats", "cache-audit", "cache-aliasing", "tlb-stats",
+              "coverage-flush"):
         return {"op": op}
     if op == "proc":
         if not rest: raise ValueError("proc requires <pid>")
@@ -2829,6 +2876,204 @@ def cmd_cache_aliasing(args):
         resp["_verdict"] = "UNKNOWN: check for error field"
 
     _out(resp)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# coverage — LLVM source-based coverage collection + reporting
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Backs `scripts/qemu-harness.py coverage`.  Workflow:
+#
+#   1. Start a kernel session with `--features coverage,test-mode,kdb` (the
+#      `_build` helper injects `-C instrument-coverage` automatically when
+#      `coverage` is in the feature set).
+#   2. After the test suite emits `[COVERAGE] kernel=...` (or anytime via
+#      kdb op `coverage-flush`), run:
+#         coverage --collect <sid>
+#      The collector tails the session's serial log, reassembles every
+#      [COV-CHUNK] line into per-section raw bytes, writes them to
+#      ~/.astryx-harness/<sid>.coverage/<section>.bin, and snapshots the
+#      [COV-SUMMARY] JSON to ~/.astryx-harness/<sid>.coverage/summary.json.
+#   3. `coverage --report` then reads the summary(ies) and emits structured
+#      JSON for downstream consumers (CI gate, claudemon, PR comment bot).
+#
+# Per-PR-friendly summary line (parseable by the future task #315 gate):
+#   [COVERAGE] kernel=X.YZ% regions=A/B files=C/D
+# Where files=C/D is derived from the static __llvm_covmap dump.  The
+# region-level number is the authoritative metric for the gate; the
+# files-level number is informational.
+#
+# The collected raw bytes are NOT a complete .profraw file — they are the
+# section payloads.  A host-side post-processor with the matching LLVM
+# toolchain version can synthesise the header and run `llvm-profdata
+# merge` against them.  That step lives outside this harness for now;
+# only the audit's "structured per-region summary" deliverable is
+# implemented in-tree to keep the CI gate hook self-contained.
+
+def _coverage_dir(sid: str) -> Path:
+    p = HARNESS_DIR / f"{sid}.coverage"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def cmd_coverage(args):
+    """LLVM source-based coverage collection + reporting.
+
+    With `--collect <sid>` (default): triggers an in-kernel flush via the
+    kdb `coverage-flush` op (if the session is kdb-enabled), then scans
+    the session's serial log for `[COV-CHUNK]` / `[COV-SUMMARY]` lines
+    and writes per-section raw bytes + a summary JSON to
+    `~/.astryx-harness/<sid>.coverage/`.
+
+    With `--report` (optionally combined with `--collect`): reads every
+    `~/.astryx-harness/*.coverage/summary.json` (or just the one named
+    via `--sid`) and emits a unified structured report.
+    """
+    do_collect = bool(getattr(args, "collect", None))
+    do_report  = bool(getattr(args, "report", False))
+    if not (do_collect or do_report):
+        _out({"error": "coverage: pass --collect <sid> or --report (or both)"})
+        sys.exit(2)
+
+    out: dict = {}
+
+    if do_collect:
+        sid = args.collect
+        sess_path = HARNESS_DIR / f"{sid}.json"
+        if not sess_path.exists():
+            _out({"error": f"no session {sid} at {sess_path}"})
+            sys.exit(1)
+        sess = _load_session(sid)
+
+        # Best-effort: trigger an explicit flush via kdb so we never
+        # collect a stale snapshot.  Silently skipped on non-kdb builds —
+        # the test-runner's pre-exit hook still emits chunks.
+        kdb_port = int(sess.get("kdb_host_port") or 0)
+        flush_resp = None
+        if kdb_port > 0:
+            try:
+                raw = _kdb_recv(kdb_port, {"op": "coverage-flush"}, timeout=15.0)
+                flush_resp = json.loads(raw.strip().decode("utf-8", errors="replace"))
+            except (socket.timeout, ConnectionRefusedError, OSError, ValueError):
+                flush_resp = {"warning": "kdb coverage-flush failed; using log as-is"}
+
+        # Read the serial log and reassemble chunks per section.
+        serial_log = HARNESS_DIR / f"{sid}.serial.log"
+        if not serial_log.exists():
+            _out({"error": f"no serial log at {serial_log}"})
+            sys.exit(1)
+        text = serial_log.read_text(errors="replace")
+
+        sections: dict = {}  # name -> list of (offset, hexbytes)
+        summary: Optional[dict] = None
+        chunk_re = re.compile(
+            r"^\[COV-CHUNK\] sec=(?P<sec>[a-z]+) off=(?P<off>\d+) hex=(?P<hex>[0-9a-f]+)\s*$",
+            re.MULTILINE,
+        )
+        for m in chunk_re.finditer(text):
+            sec = m.group("sec")
+            off = int(m.group("off"))
+            hx  = m.group("hex")
+            sections.setdefault(sec, []).append((off, hx))
+        sum_re = re.compile(r"^\[COV-SUMMARY\] (\{.*\})\s*$", re.MULTILINE)
+        sm = list(sum_re.finditer(text))
+        if sm:
+            # Take the LAST summary — multiple flushes are possible.
+            try:
+                summary = json.loads(sm[-1].group(1))
+            except json.JSONDecodeError:
+                summary = None
+
+        cov_dir = _coverage_dir(sid)
+        wrote: dict = {}
+        for sec, parts in sections.items():
+            parts.sort(key=lambda t: t[0])
+            buf = bytearray()
+            for off, hx in parts:
+                # Tolerate gaps by zero-padding; in practice chunks are
+                # contiguous from offset 0 because the kernel emits in
+                # 256-byte increments.
+                if off > len(buf):
+                    buf.extend(b"\x00" * (off - len(buf)))
+                buf.extend(bytes.fromhex(hx))
+            dest = cov_dir / f"{sec}.bin"
+            dest.write_bytes(bytes(buf))
+            wrote[sec] = {"path": str(dest), "bytes": len(buf)}
+
+        if summary is None:
+            summary = {"regions_covered": 0, "regions_total": 0, "pct": "0.00", "bytes_dumped": 0}
+        summary_path = cov_dir / "summary.json"
+        merged = dict(summary)
+        merged["sections"]    = wrote
+        merged["serial_log"]  = str(serial_log)
+        merged["flush_resp"]  = flush_resp
+        summary_path.write_text(json.dumps(merged, indent=2))
+
+        out["collect"] = {
+            "sid": sid,
+            "summary_path": str(summary_path),
+            "sections":     wrote,
+            "summary":      summary,
+            "flush_resp":   flush_resp,
+        }
+
+    if do_report:
+        # Pick which summaries to include.
+        sid = getattr(args, "sid", None) or getattr(args, "collect", None)
+        if sid:
+            candidates = [HARNESS_DIR / f"{sid}.coverage" / "summary.json"]
+        else:
+            candidates = sorted(HARNESS_DIR.glob("*.coverage/summary.json"))
+
+        per_session = []
+        agg_covered = 0
+        agg_total   = 0
+        agg_bytes   = 0
+        for path in candidates:
+            if not path.exists():
+                continue
+            try:
+                s = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            rc = int(s.get("regions_covered", 0))
+            rt = int(s.get("regions_total",   0))
+            agg_covered += rc
+            agg_total   += rt
+            agg_bytes   += int(s.get("bytes_dumped", 0))
+            per_session.append({"path": str(path), **s})
+
+        pct_x100 = (agg_covered * 10000 // agg_total) if agg_total else 0
+        pct = f"{pct_x100 // 100}.{pct_x100 % 100:02d}"
+        # Files-level placeholder — full file-mapping requires parsing
+        # the __llvm_covmap section, which is downstream of the
+        # collected `.bin` files.  Surface a 0/0 placeholder so the
+        # per-PR summary line shape is stable for the CI gate.
+        files_total = 0
+        files_covered = 0
+
+        # Structured report for programmatic consumers.
+        report = {
+            "regions_covered": agg_covered,
+            "regions_total":   agg_total,
+            "pct":             pct,
+            "files_covered":   files_covered,
+            "files_total":     files_total,
+            "bytes_dumped":    agg_bytes,
+            "sessions":        per_session,
+            # The single line a CI gate / PR comment bot can grep for.
+            # Matches the [COVERAGE] format the kernel itself emits so
+            # the gate parser can use a single regex against either
+            # source of truth.
+            "summary_line": (
+                f"[COVERAGE] kernel={pct}% "
+                f"regions={agg_covered}/{agg_total} "
+                f"files={files_covered}/{files_total}"
+            ),
+        }
+        out["report"] = report
+
+    _out(out)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5480,7 +5725,13 @@ def main():
                           help="Kernel feature flags passed VERBATIM to cargo "
                                "(comma-separated, e.g. 'test-mode,kdb'). "
                                "Empty string → default desktop kernel. "
-                               "Nothing is injected silently.")
+                               "Nothing is injected silently.  Special case: "
+                               "'coverage' (test-coverage audit session 5) "
+                               "additionally injects -C instrument-coverage "
+                               "into RUSTFLAGS so LLVM emits the __llvm_prf_* "
+                               "and __llvm_cov* sections; the test runner's "
+                               "pre-exit hook then dumps them as [COV-CHUNK] "
+                               "serial lines for `coverage --collect`.")
     p_start.add_argument("--no-build", action="store_true",
                           help="Skip cargo build; use existing kernel.bin")
     p_start.add_argument("--gdb-port", type=int, default=0, metavar="PORT",
@@ -5625,6 +5876,7 @@ def main():
         "syscall-trend", "vfs-mounts",
         "dmesg", "syms", "mem", "tframe", "user-mem", "trace-status",
         "bell-stats", "cache-audit", "cache-aliasing", "tlb-stats",
+        "coverage-flush",
     ])
     p_kdb.add_argument("args", nargs="*",
                         help="Op-specific positional args: "
@@ -5685,6 +5937,30 @@ def main():
     p_cache_aliasing.add_argument("sid")
     p_cache_aliasing.add_argument("--timeout", type=float, default=10.0,
                                    help="kdb socket timeout in seconds (default 10.0)")
+
+    # coverage — LLVM source-based coverage collection + reporting.
+    # Requires the session was started with --features coverage,test-mode
+    # (and ideally kdb, for the on-demand flush op).  See _build()'s
+    # CARGO_ENCODED_RUSTFLAGS hook that pairs the feature flag with
+    # -C instrument-coverage so LLVM actually emits the section payloads.
+    p_cov = sub.add_parser(
+        "coverage",
+        help="LLVM source-based coverage: --collect <sid> reassembles the "
+             "in-kernel [COV-CHUNK] dump from a session's serial log into "
+             "per-section binary blobs + summary.json; --report aggregates "
+             "previously collected summaries and emits a CI-gate-friendly "
+             "[COVERAGE] kernel=X% regions=Y/Z files=A/B line.  Hooks for "
+             "task #315 (CI coverage gate) are left in the report shape.")
+    p_cov.add_argument("--collect", metavar="SID", default=None,
+                        help="Session id whose serial log to scan and whose "
+                             "kdb endpoint to flush before collection.")
+    p_cov.add_argument("--report", action="store_true",
+                        help="Aggregate every ~/.astryx-harness/*.coverage/"
+                             "summary.json (or just --sid's) and emit a "
+                             "unified structured report.")
+    p_cov.add_argument("--sid", default=None,
+                        help="When --report is passed without --collect, "
+                             "limit the aggregation to this one session id.")
 
     # qga-ping / qga-info / qga-sync / qga-file-read — QEMU Guest Agent
     # bridge.  Requires --features qga at start; talks NDJSON over the
@@ -6003,6 +6279,7 @@ def main():
         "fd-map":      cmd_fd_map,
         "cache-audit":     cmd_cache_audit,
         "cache-aliasing":  cmd_cache_aliasing,
+        "coverage":        cmd_coverage,
         # QGA bridge
         "qga-ping":      cmd_qga_ping,
         "qga-info":      cmd_qga_info,
