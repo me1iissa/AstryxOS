@@ -4006,6 +4006,7 @@ fn test_signal_vma_snapshot() -> bool {
     let space = VmSpace {
         cr3: 0,
         mm_sem: crate::mm::vma::make_mm_sem_for_test(),
+        generation: crate::mm::vma::make_generation_for_test(),
         areas: alloc::vec![
             // libxul .text (executable, file-backed) — should appear
             VmArea {
@@ -4131,6 +4132,7 @@ fn test_signal_vma_snapshot() -> bool {
         let delta_space = VmSpace {
             cr3: 0,
             mm_sem: crate::mm::vma::make_mm_sem_for_test(),
+            generation: crate::mm::vma::make_generation_for_test(),
             areas: alloc::vec![
                 VmArea {
                     base: delta_vma_base, length: 0x100_0000,

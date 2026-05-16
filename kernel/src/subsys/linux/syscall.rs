@@ -3103,6 +3103,12 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
     };
     let cr3 = match cr3_opt { Some(c) => c, None => return 0 };
 
+    // W216 H_5j-B: MADV_DONTNEED clears PTEs and frees frames; the area list
+    // itself is not mutated, but the PFH install loop must abort if it has
+    // any in-flight install for the same address space (otherwise it could
+    // map a stale `pages_to_map[i]` whose underlying frame we just freed).
+    crate::mm::vma::bump_generation_for_cr3(cr3);
+
     // Acquire the per-address-space read lock for the full clear→shootdown→free
     // sequence.  This serialises against any concurrent `clone_for_fork` that
     // holds the write side of the same mm_sem while walking the PML4.  Without
@@ -4164,6 +4170,11 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
         None => return -22,
     };
     let cr3 = space.cr3;
+
+    // W216 H_5j-B: mprotect rewrites VMA prot/areas in place; bump generation
+    // to invalidate any in-flight PFH install loop that snapshotted the old
+    // VMA before this call.
+    space.generation.fetch_add(1, core::sync::atomic::Ordering::Release);
 
     // Update VMA prot fields that overlap this range, splitting VMAs as needed
     // so that only the exact [base, end) portion gets the new prot.
