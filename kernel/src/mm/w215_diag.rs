@@ -388,11 +388,21 @@ pub fn preins_check_install(phys: u64, mount_idx: usize, inode: u64, file_offset
     if slot.phys.load(Ordering::Relaxed) != phys { return; }
     let meta = slot.meta.load(Ordering::Relaxed);
     let site = ((meta >> 16) & 0xFF) as u8;
+    let w_cpu = ((meta >> 24) & 0xFF) as u8;
+    let w_inode_low16 = (meta & 0xFFFF) as u16;
+    let w_off_low32 = ((meta >> 32) & 0xFFFF_FFFF) as u32;
+    let w_tick = slot.tick_zerofill.load(Ordering::Relaxed);
+    let now_tick = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+    let here_cpu = crate::arch::x86_64::apic::cpu_index() as u8;
     INSTALL_RACE.fetch_add(1, Ordering::Relaxed);
     crate::serial_println!(
         "[PREINS/INSTALL_RACE] phys={:#x} site={} \
-         installer_key=({},{:#x},{:#x})",
-        phys, site, mount_idx, inode, file_offset,
+         installer_key=({},{:#x},{:#x}) installer_cpu={} \
+         witness_cpu={} witness_inode_low16={:#x} \
+         witness_off_low32={:#x} witness_age_ticks={}",
+        phys, site, mount_idx, inode, file_offset, here_cpu,
+        w_cpu, w_inode_low16, w_off_low32,
+        now_tick.saturating_sub(w_tick),
     );
 }
 
