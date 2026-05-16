@@ -38,6 +38,28 @@ pub mod ring {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// W215 H3a diagnostic counters
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Number of `mmap(MAP_SHARED|PROT_WRITE, fd≥0)` calls on file-backed fds.
+///
+/// A non-zero count indicates that some caller created a MAP_SHARED+writable
+/// mapping of a regular file (not a memfd, not /dev/*).  If the file is the
+/// libxul binary, any write through this mapping lands directly in the page
+/// cache frame, corrupting the content every other MAP_PRIVATE reader copies
+/// from the cache — which is precisely the W215 H3a failure chain.
+///
+/// Only armed in `firefox-test` builds.  Zero cost in all others.
+#[cfg(feature = "firefox-test")]
+static SYS_MMAP_SHARED_WRITE_FILEBACKED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "firefox-test")]
+pub fn sys_mmap_shared_write_filebacked_count() -> u64 {
+    SYS_MMAP_SHARED_WRITE_FILEBACKED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // User pointer validation
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1991,6 +2013,29 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
         feature = "test-mode",
     )))]
     let (cr3, backing, name, base) = mmap_setup;
+
+    // W215 H3a diagnostic: count MAP_SHARED+PROT_WRITE file-backed mappings.
+    //
+    // The check is after argument decode and backing resolution (above), but
+    // before any phase-2/3 VMA edit, so the metadata is stable.  Per POSIX
+    // mmap(2), MAP_SHARED+PROT_WRITE on a regular file installs a user PTE
+    // that aliases the page-cache frame directly with PAGE_WRITABLE set — any
+    // store through the mapping writes into the cache frame itself.  If the
+    // file is a shared library (.so), subsequent MAP_PRIVATE+PROT_WRITE
+    // demand-page faults copy the already-written (e.g. relocated) content
+    // into their private frame, producing wrong code bytes at the original
+    // file offset (the W215 H3a hypothesis).
+    #[cfg(feature = "firefox-test")]
+    if (flags & MAP_SHARED as u32 != 0) && (prot & PROT_WRITE != 0) {
+        if let VmBacking::File { mount_idx: m, inode: ino, .. } = &backing {
+            SYS_MMAP_SHARED_WRITE_FILEBACKED
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            crate::serial_println!(
+                "[H3a/mmap] SHARED+WRITE filebacked mount={} inode={:#x} fd={} len={:#x} off={:#x} pid={}",
+                m, ino, fd, length, offset, pid,
+            );
+        }
+    }
 
     // Emit shared-library mmap trace AFTER the PROCESS_TABLE lock is dropped
     // so a slow serial path cannot block the process table.  Format:

@@ -2480,7 +2480,7 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
         qemu-harness.py kdb <sid> syscall-trend 10 4
     """
     if op in ("ping", "proc-list", "vfs-mounts", "trace-status",
-              "bell-stats", "cache-audit", "tlb-stats"):
+              "bell-stats", "cache-audit", "cache-aliasing", "tlb-stats"):
         return {"op": op}
     if op == "proc":
         if not rest: raise ValueError("proc requires <pid>")
@@ -2766,6 +2766,65 @@ def cmd_cache_audit(args):
         resp["_verdict"] = "PROCEED-TO-FIX: at least one H1 counter non-zero"
     elif all(v == 0 for v in [orphans, pmm_nz, rc_set_ov] if isinstance(v, int)):
         resp["_verdict"] = "ABORT-OR-NULL: all H1 counters zero"
+    else:
+        resp["_verdict"] = "UNKNOWN: check for error field"
+
+    _out(resp)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# cache-aliasing — W215 H3a diagnostic: writable alias + SHARED+WRITE mmap counters
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Wraps kdb op 'cache-aliasing' (firefox-test kernel builds only).
+# The response carries:
+#   pfh_writable_alias_cache           — writable installs that aliased a cache frame
+#                                        under a different (mount,inode,offset) key
+#   sys_mmap_shared_write_filebacked   — MAP_SHARED|PROT_WRITE mmap calls on file fds
+#
+# Disambiguation table (per docs/W215_H3_CACHE_HIT_COW_2026-05-16.md §188-196):
+#   sys_mmap_shared_write_filebacked > 0   → H3a confirmed (mmap path); check inode in log
+#   pfh_writable_alias_cache > 0           → H3a confirmed (PFH path)
+#   both == 0 AND W215 still fires         → H3a dead; escalate to H3b (kalloc recycled frame)
+
+def cmd_cache_aliasing(args):
+    """W215 H3a diagnostic: writable cache-frame alias + SHARED+WRITE mmap counters.
+
+    Sends kdb op 'cache-aliasing' and returns structured JSON with
+    pfh_writable_alias_cache and sys_mmap_shared_write_filebacked counters.
+
+    Requires the session to have been started with --features firefox-test,kdb.
+    """
+    sess = _load_session(args.sid)
+    port = int(sess.get("kdb_host_port") or 0)
+    if port <= 0:
+        _out({"error": "session was not started with --features kdb"})
+        sys.exit(1)
+
+    req: dict = {"op": "cache-aliasing"}
+    timeout = float(getattr(args, "timeout", 10.0) or 10.0)
+    try:
+        raw = _kdb_recv(port, req, timeout=timeout)
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        _out({"error": f"kdb connect failed on 127.0.0.1:{port}: {e}"})
+        sys.exit(1)
+    try:
+        resp = json.loads(raw.strip().decode("utf-8", errors="replace"))
+    except (json.JSONDecodeError, ValueError) as e:
+        _out({"error": f"malformed kdb response: {e}",
+              "raw": raw.decode(errors="replace")})
+        sys.exit(1)
+
+    # Annotate with a verdict per the H3a disambiguation table.
+    pfh_alias = resp.get("pfh_writable_alias_cache", -1)
+    mmap_sw   = resp.get("sys_mmap_shared_write_filebacked", -1)
+    if isinstance(pfh_alias, int) and pfh_alias > 0:
+        resp["_verdict"] = "PROCEED-TO-FIX (H3a via PFH path): pfh_writable_alias_cache > 0"
+    elif isinstance(mmap_sw, int) and mmap_sw > 0:
+        resp["_verdict"] = ("PROCEED-TO-FIX (H3a via mmap path): sys_mmap_shared_write_filebacked > 0 "
+                            "— check [H3a/mmap] lines in serial log for inode match")
+    elif isinstance(pfh_alias, int) and isinstance(mmap_sw, int) and pfh_alias == 0 and mmap_sw == 0:
+        resp["_verdict"] = "ABORT-AND-ESCALATE: both H3a counters zero — escalate to H3b"
     else:
         resp["_verdict"] = "UNKNOWN: check for error field"
 
@@ -5565,7 +5624,7 @@ def main():
         "ping", "proc-list", "proc", "proc-tree", "fd-table", "fd-map",
         "syscall-trend", "vfs-mounts",
         "dmesg", "syms", "mem", "tframe", "user-mem", "trace-status",
-        "bell-stats", "cache-audit", "tlb-stats",
+        "bell-stats", "cache-audit", "cache-aliasing", "tlb-stats",
     ])
     p_kdb.add_argument("args", nargs="*",
                         help="Op-specific positional args: "
@@ -5614,6 +5673,18 @@ def main():
     p_cacheaudit.add_argument("sid")
     p_cacheaudit.add_argument("--timeout", type=float, default=10.0,
                                help="kdb socket timeout in seconds (default 10.0)")
+
+    # cache-aliasing — W215 H3a diagnostic: writable cache-frame alias + filebacked SHARED+WRITE mmap
+    p_cache_aliasing = sub.add_parser(
+        "cache-aliasing",
+        help="[W215 H3a diag] Dump PFH_WRITABLE_ALIAS_CACHE and "
+             "SYS_MMAP_SHARED_WRITE_FILEBACKED counters "
+             "(requires --features firefox-test,kdb). "
+             "Non-zero pfh_writable_alias_cache or sys_mmap_shared_write_filebacked "
+             "confirms H3a (MAP_SHARED+PROT_WRITE file-backed mapping aliases cache frame).")
+    p_cache_aliasing.add_argument("sid")
+    p_cache_aliasing.add_argument("--timeout", type=float, default=10.0,
+                                   help="kdb socket timeout in seconds (default 10.0)")
 
     # qga-ping / qga-info / qga-sync / qga-file-read — QEMU Guest Agent
     # bridge.  Requires --features qga at start; talks NDJSON over the
@@ -5930,7 +6001,8 @@ def main():
         "kdb":         cmd_kdb,
         "tlb-stats":   cmd_tlb_stats,
         "fd-map":      cmd_fd_map,
-        "cache-audit": cmd_cache_audit,
+        "cache-audit":     cmd_cache_audit,
+        "cache-aliasing":  cmd_cache_aliasing,
         # QGA bridge
         "qga-ping":      cmd_qga_ping,
         "qga-info":      cmd_qga_info,

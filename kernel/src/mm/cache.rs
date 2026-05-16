@@ -379,6 +379,27 @@ pub fn stats() -> (usize, usize) {
     (total, dirty)
 }
 
+/// Walk the page cache and return the cache key for a given physical frame.
+///
+/// Returns `Some((mount_idx, inode, page_offset))` if any live cache entry holds
+/// `phys` as its backing physical frame; `None` otherwise.  An O(n) walk is
+/// acceptable here: this predicate is only reachable from `#[cfg(feature =
+/// "firefox-test")]` PFH instrumentation where `n` ≈ 40 K (libxul) and the
+/// call happens at most once per writable PTE install.
+///
+/// Per-entry `phys` comparison is exact — the cache holds one physical frame per
+/// key and frames are 4 KiB-aligned, so a u64 equality test is sufficient.
+#[cfg(feature = "firefox-test")]
+pub fn is_phys_in_cache(phys: u64) -> Option<(usize, u64, u64)> {
+    let cache = PAGE_CACHE.lock();
+    for ((mount_idx, inode, page_offset), entry) in cache.iter() {
+        if entry.phys == phys {
+            return Some((*mount_idx, *inode, *page_offset));
+        }
+    }
+    None
+}
+
 /// Audit the page cache for H1 invariant violations: any cached entry whose
 /// physical frame has a reference count of zero.
 ///
