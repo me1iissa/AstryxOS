@@ -2568,30 +2568,62 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
     raise ValueError(f"unknown kdb op: {op}")
 
 
-def _kdb_recv(port: int, req: dict, timeout: float = 5.0) -> bytes:
-    """Send one JSON kdb request, return the raw response bytes."""
+def _kdb_recv(port: int, req: dict, timeout: float = 30.0) -> bytes:
+    """Send one JSON kdb request, return the raw response bytes.
+
+    `timeout` is the OVERALL DEADLINE (not per-attempt).  The harness retries
+    connect/send/read on `ConnectionRefused` / `socket.timeout` /
+    `ConnectionReset` / empty-read with exponential backoff until the
+    deadline is reached.  This tolerates transient BSP starvation under
+    heavy guest load without forcing every caller to wrap a retry loop.
+    The connection is closed on every attempt — kdb is one-request-per-
+    connection, so a partial response cannot be resumed.
+    """
     payload = (json.dumps(req) + "\n").encode("utf-8")
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(timeout)
-    try:
-        s.connect(("127.0.0.1", port))
-        s.sendall(payload)
-        buf = b""
-        while not buf.endswith(b"\n"):
-            chunk = s.recv(65536)
-            if not chunk: break
-            buf += chunk
-            if len(buf) > 128 * 1024: break
-    finally:
-        s.close()
-    return buf
+    deadline = time.monotonic() + max(timeout, 0.1)
+    backoff = 0.1
+    last_err: Exception | None = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise last_err or socket.timeout(f"kdb deadline {timeout}s exceeded")
+        # Per-attempt socket timeout bounded so a stuck single attempt
+        # doesn't burn the whole deadline.
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(min(3.0, max(0.5, remaining)))
+        try:
+            s.connect(("127.0.0.1", port))
+            s.sendall(payload)
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > 128 * 1024:
+                    break
+            if buf.endswith(b"\n"):
+                return buf
+            last_err = ConnectionResetError(
+                "kdb peer closed before newline (incomplete response)")
+        except (socket.timeout, ConnectionRefusedError,
+                ConnectionResetError, BrokenPipeError, OSError) as e:
+            last_err = e
+        finally:
+            s.close()
+        sleep_for = min(backoff, max(0.0, deadline - time.monotonic()))
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        backoff = min(backoff * 2.0, 1.0)
 
 
-def _kdb_call(port: int, req: dict, timeout: float = 5.0) -> dict:
+def _kdb_call(port: int, req: dict, timeout: float = 30.0) -> dict:
     """One-shot kdb call.  Connects, sends one JSON line, reads one line back,
-    closes.  Returns the parsed response.  For diagnostic access to the raw
-    bytes (e.g. to surface them in a malformed-response error), use
-    `_kdb_recv` and `json.loads` separately."""
+    closes.  Returns the parsed response.  `timeout` is the overall deadline;
+    `_kdb_recv` will retry under transient TCP/poll-cycle stalls.
+
+    For diagnostic access to the raw bytes (e.g. to surface them in a
+    malformed-response error), use `_kdb_recv` and `json.loads` separately."""
     return json.loads(_kdb_recv(port, req, timeout).strip().decode("utf-8", errors="replace"))
 
 
@@ -5978,8 +6010,9 @@ def main():
                              "syscall-trend [<seconds> [<pid>]] (def 5 0), "
                              "dmesg [tail], syms <name|0xaddr>, "
                              "mem <addr> <len>")
-    p_kdb.add_argument("--timeout", type=float, default=5.0,
-                        help="Socket timeout in seconds (default 5.0)")
+    p_kdb.add_argument("--timeout", type=float, default=30.0,
+                        help="Overall deadline in seconds (default 30.0). "
+                             "Wraps retry/backoff for BSP starvation tolerance.")
 
     # tlb-stats — dedicated top-level subcommand for W215 H2 TLB diagnostic
     p_tlb_stats = sub.add_parser(
@@ -5987,8 +6020,8 @@ def main():
         help="[Tier1] TLB shootdown + PMM recent-free H2 diagnostic snapshot "
              "(requires --features kdb+firefox-test at start).")
     p_tlb_stats.add_argument("sid")
-    p_tlb_stats.add_argument("--timeout", type=float, default=5.0,
-                              help="kdb socket timeout in seconds (default 5.0)")
+    p_tlb_stats.add_argument("--timeout", type=float, default=30.0,
+                              help="kdb overall deadline (default 30.0s); retried internally.")
 
     # fd-map — dedicated top-level subcommand with snapshot/diff support
     p_fdmap = sub.add_parser(
@@ -6003,8 +6036,8 @@ def main():
                           help="Save snapshot to ~/.astryx-harness/<sid>.fdmap.<NAME>.json")
     p_fdmap.add_argument("--diff", metavar="NAME", default=None,
                           help="Diff current snapshot against a previously --save'd NAME")
-    p_fdmap.add_argument("--timeout", type=float, default=5.0,
-                          help="kdb socket timeout in seconds (default 5.0)")
+    p_fdmap.add_argument("--timeout", type=float, default=30.0,
+                          help="kdb overall deadline (default 30.0s); retried internally.")
 
     # cache-audit — W215 H1 diagnostic: walk the page cache checking for
     # zero-refcount entries.  Requires --features firefox-test,kdb at start.
@@ -6015,8 +6048,8 @@ def main():
              "total_entries, orphan_count (rc=0 entries), and the cumulative "
              "PMM_ALLOC_NONZERO_RC and REFCOUNT_SET_OVER_NONZERO counters.")
     p_cacheaudit.add_argument("sid")
-    p_cacheaudit.add_argument("--timeout", type=float, default=10.0,
-                               help="kdb socket timeout in seconds (default 10.0)")
+    p_cacheaudit.add_argument("--timeout", type=float, default=30.0,
+                               help="kdb overall deadline (default 30.0s); retried internally.")
 
     # cache-aliasing — W215 H3a diagnostic: writable cache-frame alias + filebacked SHARED+WRITE mmap
     p_cache_aliasing = sub.add_parser(
@@ -6027,8 +6060,8 @@ def main():
              "Non-zero pfh_writable_alias_cache or sys_mmap_shared_write_filebacked "
              "confirms H3a (MAP_SHARED+PROT_WRITE file-backed mapping aliases cache frame).")
     p_cache_aliasing.add_argument("sid")
-    p_cache_aliasing.add_argument("--timeout", type=float, default=10.0,
-                                   help="kdb socket timeout in seconds (default 10.0)")
+    p_cache_aliasing.add_argument("--timeout", type=float, default=30.0,
+                                   help="kdb overall deadline (default 30.0s); retried internally.")
 
     # fault-cache-keys — W215 action-(C) diagnostic: 3-bucket cache-key classifier
     p_fault_cache_keys = sub.add_parser(
@@ -6038,8 +6071,8 @@ def main():
              "bucket_c (post-evict stale PTE).  Reads as zero before any W215-cluster "
              "fault fires.  Requires --features firefox-test,kdb.")
     p_fault_cache_keys.add_argument("sid")
-    p_fault_cache_keys.add_argument("--timeout", type=float, default=10.0,
-                                    help="kdb socket timeout in seconds (default 10.0)")
+    p_fault_cache_keys.add_argument("--timeout", type=float, default=30.0,
+                                    help="kdb overall deadline (default 30.0s); retried internally.")
 
     # coverage — LLVM source-based coverage collection + reporting.
     # Requires the session was started with --features coverage,test-mode
