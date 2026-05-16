@@ -2324,6 +2324,10 @@ pub(crate) fn sys_getcwd(buf: *mut u8, size: usize) -> i64 {
         return -22; // EINVAL
     }
 
+    // Pointer validation is done at the user/kernel boundary (Linux
+    // dispatch_body arm 79; Aether dispatch).  Kernel-internal callers
+    // bypass — see sys_open_linux for the rationale.
+
     let pid = crate::proc::current_pid_lockless();
     let procs = crate::proc::PROCESS_TABLE.lock();
     let proc = match procs.iter().find(|p| p.pid == pid) {
@@ -2645,6 +2649,10 @@ pub(crate) fn sys_pipe(fds_out: *mut u64) -> i64 {
     if fds_out.is_null() {
         return -22; // EINVAL
     }
+
+    // Pointer validation is done at the user/kernel boundary (Linux
+    // dispatch_body arm 22; Aether dispatch).  Kernel-internal callers
+    // bypass — see sys_open_linux for the rationale.
 
     let pipe_id = crate::ipc::pipe::create_pipe();
     let pid = crate::proc::current_pid_lockless();
@@ -3050,6 +3058,14 @@ pub(crate) fn alloc_unix_socket_fd(pid: u64, unix_id: u64, cloexec: bool, nonblo
 /// branding for any caller that prints it.  Per POSIX `uname(2)`.
 pub(crate) fn sys_uname(buf: *mut u8) -> i64 {
     const FIELD_LEN: usize = 65;
+    const TOTAL_LEN: usize = FIELD_LEN * 5; // 325 bytes (5 × utsname fields)
+
+    // Pointer validation is done at the user/kernel boundary (the Linux
+    // dispatch_body arm for syscall 63, and the Aether dispatch arm for
+    // syscall 0x32).  Internal kernel callers (test_runner, etc.) pass
+    // kernel-resident buffers and must bypass the strict user check —
+    // see the same pattern in sys_open_linux.
+
     let fields: [&[u8]; 5] = [
         b"Linux",                       // sysname
         b"astryx",                      // nodename
@@ -3058,7 +3074,7 @@ pub(crate) fn sys_uname(buf: *mut u8) -> i64 {
         b"x86_64",                      // machine
     ];
 
-    let out = unsafe { core::slice::from_raw_parts_mut(buf, FIELD_LEN * 5) };
+    let out = unsafe { core::slice::from_raw_parts_mut(buf, TOTAL_LEN) };
     for b in out.iter_mut() {
         *b = 0;
     }
@@ -3408,6 +3424,69 @@ pub use crate::subsys::linux::syscall::{
 // suite without going through the full syscall dispatch path.  They are
 // only used from test_runner.rs and are safe to call from kernel context
 // (current_pid() returns the test process PID, which is always valid).
+
+/// Per-CPU bypass counter for the user-mode pointer-range checks at the
+/// Linux dispatch arms.  In-kernel test code that drives `dispatch_linux`
+/// with kernel-VA buffers (e.g. `b"/etc/passwd\0".as_ptr()`) must wrap the
+/// call in [`KernelDispatchGuard`] so the per-arm `validate_user_ptr` /
+/// `user_path_ptr_ok` gates skip the check for the lifetime of the guard.
+///
+/// The bypass is INTENTIONALLY scoped (RAII) so a forgotten guard cannot
+/// permanently disable the security check; if a test panics inside the
+/// guard, Drop still decrements.  Real user-mode SYSCALL traffic never
+/// passes through this counter — the asm `syscall_entry` path leaves the
+/// counter at zero, so the dispatch arms enforce validation as designed.
+pub static KERNEL_DISPATCH_BYPASS: [core::sync::atomic::AtomicU64; MAX_CPUS] = {
+    const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [Z; MAX_CPUS]
+};
+
+/// Returns `true` if the current CPU is inside a `KernelDispatchGuard`
+/// scope and the per-arm user-pointer validation should be skipped.
+#[inline]
+pub fn user_ptr_check_bypassed() -> bool {
+    let cpu = cpu_index();
+    KERNEL_DISPATCH_BYPASS[cpu].load(core::sync::atomic::Ordering::Acquire) > 0
+}
+
+/// RAII guard that enables [`user_ptr_check_bypassed`] for the current CPU
+/// for its lifetime.  Used by in-kernel test wrappers (e.g.
+/// [`dispatch_linux_kernel`]) that legitimately pass kernel pointers to
+/// the Linux dispatcher.
+pub struct KernelDispatchGuard {
+    cpu: usize,
+}
+
+impl KernelDispatchGuard {
+    #[inline]
+    pub fn new() -> Self {
+        let cpu = cpu_index();
+        KERNEL_DISPATCH_BYPASS[cpu]
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        Self { cpu }
+    }
+}
+
+impl Drop for KernelDispatchGuard {
+    #[inline]
+    fn drop(&mut self) {
+        KERNEL_DISPATCH_BYPASS[self.cpu]
+            .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Kernel-test wrapper around [`dispatch_linux`] that bypasses the
+/// user-pointer range checks for its duration.  Use this from
+/// `test_runner.rs` when driving a syscall with kernel-resident buffers
+/// (e.g. `b"/etc/passwd\0".as_ptr()`).
+///
+/// Real user-mode SYSCALL traffic must NOT use this — it would defeat
+/// the CWE-823 validation gates.
+pub fn dispatch_linux_kernel(num: u64, arg1: u64, arg2: u64, arg3: u64,
+                              arg4: u64, arg5: u64, arg6: u64) -> i64 {
+    let _g = KernelDispatchGuard::new();
+    dispatch_linux(num, arg1, arg2, arg3, arg4, arg5, arg6)
+}
 
 /// Open a file from a kernel string literal.  Equivalent to `open(path, flags, 0)`
 /// but callable without a user-space address-space context.
