@@ -1441,6 +1441,29 @@ pub(crate) fn write_u32_to_user(cr3: u64, vaddr: u64, val: u32) {
     let pte = read_pte(cr3, vaddr);
     if pte & PAGE_PRESENT == 0 { return; }
     let phys = (pte & ADDR_MASK) + (vaddr & 0xFFF);
+    // W215 axis-B probe: check if the resolved phys page is cache-resident.
+    // This writer hits via PHYS_OFF direct map, bypassing user-PTE permission
+    // bits — a candidate W215 corruption path.
+    #[cfg(feature = "firefox-test")]
+    {
+        let phys_page = phys & !0xFFFu64;
+        if let Some(key) = crate::mm::cache::is_phys_in_cache(phys_page) {
+            use core::sync::atomic::Ordering;
+            crate::mm::w215_diag::CLEARTID_OVER_CACHE.fetch_add(1, Ordering::Relaxed);
+            // Per-writer first-line gate handled internally by the
+            // `probe` helper; we replicate that here because we already
+            // have the phys/key in hand and don't want to re-walk.
+            static FIRST: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            if !FIRST.swap(true, Ordering::Relaxed) {
+                let pid = crate::proc::current_pid_lockless();
+                crate::serial_println!(
+                    "[H_W/clear-tid] pid={} vaddr={:#x} phys={:#x} key=({},{:#x},{:#x})",
+                    pid, vaddr, phys_page, key.0, key.1, key.2,
+                );
+            }
+        }
+    }
     unsafe {
         core::ptr::write_volatile((PHYS_OFF + phys) as *mut u32, val);
     }
@@ -3318,6 +3341,9 @@ pub(crate) fn sys_getrandom(buf: *mut u8, count: usize, _flags: u32) -> i64 {
     if !validate_user_ptr(buf as u64, count) {
         return -14; // EFAULT
     }
+
+    #[cfg(feature = "firefox-test")]
+    crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Getrandom, buf, count);
 
     let out = unsafe { core::slice::from_raw_parts_mut(buf, count) };
 
