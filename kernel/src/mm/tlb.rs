@@ -733,6 +733,16 @@ pub fn quarantine_free(phys: u64) {
     if phys == 0 {
         return;
     }
+    // W215 forensic ring: time-ordered QUARANTINE_FREE event
+    // (cluster-filtered).  Distinct from the immediate FREE event in
+    // pmm::free_page — quarantine defers the actual PMM release until a
+    // quiescent state, so a phys can spend several ticks in quarantine
+    // before becoming truly free.  Both events on the same phys in a
+    // short window are the structural signature of axis-E.
+    #[cfg(feature = "firefox-test")]
+    crate::mm::w215_diag::ring_push_nokey(
+        crate::mm::w215_diag::KIND_QUARANTINE_FREE, phys, 0,
+    );
     let tick = crate::arch::x86_64::irq::TICK_COUNT
         .load(Ordering::Relaxed);
 

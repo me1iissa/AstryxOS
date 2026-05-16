@@ -283,6 +283,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "fault-cache-keys" => op_fault_cache_keys(out),
         "tlb-stats"        => op_tlb_stats(out),
         "w215-diag"        => op_w215_diag(out),
+        "w215-prov-ring"   => op_w215_prov_ring(out),
         "coverage-flush" => op_coverage_flush(out),
         _ => {
             out.push_str(r#"{"error":"unknown op: "#);
@@ -916,6 +917,42 @@ fn op_w215_diag(out: &mut String) {
     #[cfg(not(feature = "firefox-test"))]
     {
         out.push_str(r#"{"error":"w215-diag requires firefox-test feature"}"#);
+    }
+}
+
+// ── w215-prov-ring ──────────────────────────────────────────────────────────
+//
+// W215 forensic provenance ring readout + last-128 tail dump to serial.
+//
+// JSON: { head, pushes, filtered, wraps,
+//         write_detect_total, wd_prepop, wd_pfh_ra, wd_pfh_sp,
+//         wd_cow, wd_ptz, dup_phys_at_insert, cache_dup_hits }
+//
+// Side effect: dumps up to 128 most-recent ring entries to serial as
+// `[W215/PROV-RING/T]` lines.  The harness's grep can then scan the
+// serial log for the dump.  This double-channel design keeps the kdb
+// JSON small while exposing the full ring contents.
+
+fn op_w215_prov_ring(out: &mut String) {
+    #[cfg(feature = "firefox-test")]
+    {
+        use core::fmt::Write;
+        let (head, pushes, filtered, wraps, wd_total,
+             wd_prepop, wd_pfh_ra, wd_pfh_sp, wd_cow, wd_ptz,
+             dup_phys, cache_dup) = crate::mm::w215_diag::forensic_ring_counters();
+        crate::mm::w215_diag::dump_prov_ring_tail(128);
+        let _ = write!(out,
+            r#"{{"head":{head},"pushes":{pushes},"filtered":{filtered},"wraps":{wraps},"#);
+        let _ = write!(out,
+            r#""write_detect_total":{wd_total},"wd_prepop":{wd_prepop},"wd_pfh_ra":{wd_pfh_ra},"#);
+        let _ = write!(out,
+            r#""wd_pfh_sp":{wd_pfh_sp},"wd_cow":{wd_cow},"wd_ptz":{wd_ptz},"#);
+        let _ = write!(out,
+            r#""dup_phys_at_insert":{dup_phys},"cache_dup_hits":{cache_dup}}}"#);
+    }
+    #[cfg(not(feature = "firefox-test"))]
+    {
+        out.push_str(r#"{"error":"w215-prov-ring requires firefox-test feature"}"#);
     }
 }
 

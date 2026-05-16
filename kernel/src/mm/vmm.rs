@@ -424,6 +424,21 @@ unsafe fn get_or_create_entry(table_phys: u64, index: usize, flags: u64) -> Opti
         // Allocate a new page table page
         let new_page = pmm::alloc_page()?;
 
+        // W215 forensic ring: detect cache-resident phys being repurposed
+        // as a fresh page-table.  If this fires, the PMM has handed out a
+        // frame the cache still owns — a structural axis-C silent recycle.
+        #[cfg(feature = "firefox-test")]
+        {
+            crate::mm::w215_diag::write_detect(
+                crate::mm::w215_diag::W_SITE_VMM_NEW_PT_ZERO,
+                new_page, 0,
+            );
+            crate::mm::w215_diag::ring_push_nokey(
+                crate::mm::w215_diag::KIND_PT_ZERO,
+                new_page, 0,
+            );
+        }
+
         // Zero the new page via higher-half (identity-map may be corrupted).
         core::ptr::write_bytes((PHYS_OFF + new_page) as *mut u8, 0, pmm::PAGE_SIZE);
 

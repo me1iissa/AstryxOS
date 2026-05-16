@@ -194,9 +194,16 @@ unsafe fn alloc_page_locked() -> Option<u64> {
                         let phys = (page * PAGE_SIZE) as u64;
                         // W215 diagnostic Arm-1: record the ALLOC event.
                         #[cfg(feature = "firefox-test")]
-                        crate::mm::w215_diag::prov_record(
-                            phys, crate::mm::w215_diag::KIND_ALLOC, 0,
-                        );
+                        {
+                            crate::mm::w215_diag::prov_record(
+                                phys, crate::mm::w215_diag::KIND_ALLOC, 0,
+                            );
+                            // Forensic ring: time-ordered ALLOC event
+                            // (cluster-filtered inside ring_push_nokey).
+                            crate::mm::w215_diag::ring_push_nokey(
+                                crate::mm::w215_diag::KIND_ALLOC, phys, 0,
+                            );
+                        }
                         // H1 diagnostic: check whether this frame still
                         // carries a live refcount — a mismatch between the
                         // PMM bitmap (free) and the refcount table (in-use).
@@ -321,6 +328,11 @@ pub fn free_page(phys_addr: u64) {
             .load(Ordering::Relaxed);
         ring.push(phys_addr, tick);
     }
+    // W215 forensic ring: time-ordered FREE event.  cluster-filtered.
+    #[cfg(feature = "firefox-test")]
+    crate::mm::w215_diag::ring_push_nokey(
+        crate::mm::w215_diag::KIND_FREE, phys_addr, 0,
+    );
 }
 
 /// Allocate `count` contiguous physical pages.

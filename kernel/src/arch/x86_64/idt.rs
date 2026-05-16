@@ -996,6 +996,27 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
         if crate::mm::refcount::page_ref_count(old_phys) > 1 {
             // Shared page — make a private copy
             if let Some(new_phys) = crate::mm::pmm::alloc_page() {
+                // W215 forensic ring: detect cache-resident src/dst phys
+                // at the CoW PHYS_OFF copy site.  Both arms emit.
+                #[cfg(feature = "firefox-test")]
+                {
+                    crate::mm::w215_diag::write_detect(
+                        crate::mm::w215_diag::W_SITE_COW_PHYSOFF_COPY,
+                        old_phys, _frame.rip,
+                    );
+                    crate::mm::w215_diag::write_detect(
+                        crate::mm::w215_diag::W_SITE_COW_PHYSOFF_COPY,
+                        new_phys, _frame.rip,
+                    );
+                    crate::mm::w215_diag::ring_push_nokey(
+                        crate::mm::w215_diag::KIND_COW_COPY_SRC,
+                        old_phys, _frame.rip,
+                    );
+                    crate::mm::w215_diag::ring_push_nokey(
+                        crate::mm::w215_diag::KIND_COW_COPY_DST,
+                        new_phys, _frame.rip,
+                    );
+                }
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         (PHYS_OFF_COW + old_phys) as *const u8,
@@ -1516,6 +1537,13 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         if existing & 1 != 0 { continue; } // already present
                     }
                     if let Some(phys) = crate::mm::pmm::alloc_page() {
+                        // W215 forensic ring: detect a cache-resident frame
+                        // being targeted by the readahead zero-fill.
+                        #[cfg(feature = "firefox-test")]
+                        crate::mm::w215_diag::write_detect(
+                            crate::mm::w215_diag::W_SITE_PFH_READAHEAD_ZERO,
+                            phys, _frame.rip,
+                        );
                         unsafe {
                             core::ptr::write_bytes((PHYS_OFF_FILE + phys) as *mut u8, 0, 0x1000);
                         }
@@ -1532,6 +1560,10 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                                 phys,
                                 crate::mm::w215_diag::SITE_PFH_READAHEAD,
                                 mount_idx, inode, foff,
+                            );
+                            crate::mm::w215_diag::ring_push(
+                                crate::mm::w215_diag::KIND_PHYS_OFF_WRITE_PRE_INSERT,
+                                phys, mount_idx, inode, foff, _frame.rip,
                             );
                         }
                         let buf = unsafe {
@@ -1880,6 +1912,13 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
 
             // Fallback: readahead failed entirely — allocate single page.
             if let Some(phys) = crate::mm::pmm::alloc_page() {
+                // W215 forensic ring: detect cache-resident phys at the
+                // single-page fallback zero-fill.
+                #[cfg(feature = "firefox-test")]
+                crate::mm::w215_diag::write_detect(
+                    crate::mm::w215_diag::W_SITE_PFH_SINGLEPAGE_ZERO,
+                    phys, _frame.rip,
+                );
                 unsafe {
                     core::ptr::write_bytes((PHYS_OFF_FILE + phys) as *mut u8, 0, 0x1000);
                 }
@@ -1896,6 +1935,10 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         phys,
                         crate::mm::w215_diag::SITE_PFH_SINGLEPAGE,
                         mount_idx, inode, file_page_offset,
+                    );
+                    crate::mm::w215_diag::ring_push(
+                        crate::mm::w215_diag::KIND_PHYS_OFF_WRITE_PRE_INSERT,
+                        phys, mount_idx, inode, file_page_offset, _frame.rip,
                     );
                 }
                 // Snapshot the FS handle out of MOUNTS (one short critical

@@ -1455,6 +1455,13 @@ pub(crate) fn emit_fault_phys_diagnostic(
                         // reveals which other operations touched it in that
                         // window.
                         crate::mm::w215_diag::dump_prov_for_phys(rip_phys);
+                        // Forensic time-ordered ring: dump the most recent
+                        // entries matching the faulting phys.  Distinct from
+                        // the per-phys ring: this ring is cluster-filtered
+                        // and globally time-ordered, so adjacent slots show
+                        // the actual interleaving of writers/allocators
+                        // around the faulting frame.
+                        crate::mm::w215_diag::dump_prov_ring_for_phys(rip_phys);
                     }
                     Some(actual_key) => {
                         FAULT_CACHE_KEY_BUCKET_B.fetch_add(1, Ordering::Relaxed);
