@@ -1046,6 +1046,12 @@ pub(crate) struct VmaSnap {
     pub(crate) elf_load_delta: u64,
     pub(crate) contains_rip: bool,
     pub(crate) contains_cr2: bool,
+    /// Cache-key identity for file-backed VMAs: (mount_idx, inode) from
+    /// `VmBacking::File`.  Both are 0 for anonymous / device VMAs.
+    /// Used by the W215 action-(C) diagnostic to classify the corrupted
+    /// physical frame's cache-entry state.
+    pub(crate) mount_idx: usize,
+    pub(crate) inode: u64,
 }
 
 /// Highest user-space address (one byte past).  Anything `>=` this is in the
@@ -1077,9 +1083,11 @@ pub(crate) fn signal_vma_snapshot(
         None => return out,
     };
     for a in space.areas.iter() {
-        let (file_backed, file_offset, elf_load_delta) = match a.backing {
-            VmBacking::File { offset, elf_load_delta, .. } => (true, offset, elf_load_delta),
-            _ => (false, 0u64, 0u64),
+        let (file_backed, file_offset, elf_load_delta, mount_idx, inode) = match a.backing {
+            VmBacking::File { offset, elf_load_delta, mount_idx, inode } => {
+                (true, offset, elf_load_delta, mount_idx, inode)
+            }
+            _ => (false, 0u64, 0u64, 0usize, 0u64),
         };
         let anonymous = matches!(a.backing, VmBacking::Anonymous);
         let contains_rip = a.contains(user_rip);
@@ -1110,6 +1118,8 @@ pub(crate) fn signal_vma_snapshot(
             elf_load_delta,
             contains_rip,
             contains_cr2,
+            mount_idx,
+            inode,
         });
     }
     out
@@ -1250,6 +1260,66 @@ fn emit_signal_vma_banner(pid: u64, user_rip: u64, cr2: u64, snap: &[VmaSnap]) {
     }
 }
 
+// ── W215 action-(C): cache-key 3-bucket diagnostic counters ─────────────────
+//
+// These three counters classify every FAULT/PHYS event (W215 cluster) by the
+// relationship between the corrupted physical frame and the page cache:
+//
+//   Bucket A — "same-key in-place corruption": the cache still holds the frame
+//     under the correct (mount,inode,page_offset) key.  The frame content was
+//     corrupted in place by an in-kernel or user MAP_SHARED+RW writer while
+//     the cache entry was live.
+//
+//   Bucket B — "cross-key aliased": the cache holds the frame, but under a
+//     *different* key.  The PTE was installed from one cache entry; the cache
+//     entry was later evicted + re-used for a different file page; the PTE now
+//     refers to the wrong content.
+//
+//   Bucket C — "post-evict stale PTE": the frame is not in the cache at all.
+//     The cache evicted the entry without shooting down the PTE; subsequent
+//     PMM recycling may have overwritten the frame.
+//
+// All counters are `#[cfg(feature = "firefox-test")]`-gated and `Relaxed` —
+// they are read by the kdb `fault-cache-keys` op at human pace, never under
+// timing pressure.  ISR-safe: no allocation, no sleeping locks.
+#[cfg(feature = "firefox-test")]
+pub static FAULT_CACHE_KEY_BUCKET_A: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "firefox-test")]
+pub static FAULT_CACHE_KEY_BUCKET_B: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "firefox-test")]
+pub static FAULT_CACHE_KEY_BUCKET_C: AtomicU64 = AtomicU64::new(0);
+
+/// Read-only accessor for the kdb `fault-cache-keys` op.
+#[cfg(feature = "firefox-test")]
+pub fn fault_cache_key_bucket_counts() -> (u64, u64, u64) {
+    (
+        FAULT_CACHE_KEY_BUCKET_A.load(Ordering::Relaxed),
+        FAULT_CACHE_KEY_BUCKET_B.load(Ordering::Relaxed),
+        FAULT_CACHE_KEY_BUCKET_C.load(Ordering::Relaxed),
+    )
+}
+
+/// Extract the expected cache key `(mount_idx, inode, page_aligned_file_offset)`
+/// for the page that backs `fault_va` in a file-backed VmaSnap.
+///
+/// `fault_va` is the raw user virtual address of the faulting instruction.
+/// The returned page_offset is page-aligned (bottom 12 bits clear) and equals
+/// `vma.file_offset + (fault_va_page - vma.base)`.
+///
+/// Returns `None` for anonymous or device VMAs (no cache entry exists for them).
+#[cfg(feature = "firefox-test")]
+fn vma_file_key(vma: &VmaSnap, fault_va: u64) -> Option<(usize, u64, u64)> {
+    if !vma.file_backed {
+        return None;
+    }
+    // Page-aligned offset of fault_va within the VMA.
+    let vma_page_off = (fault_va & !0xFFF).saturating_sub(vma.base & !0xFFF);
+    // Page-aligned file offset: VMA's file_offset is already page-aligned per
+    // how mmap(2) and the ELF loader construct VMAs (POSIX §2.5.3).
+    let file_page_off = vma.file_offset.wrapping_add(vma_page_off);
+    Some((vma.mount_idx, vma.inode, file_page_off))
+}
+
 /// Emit `[FAULT/PHYS]` + `[FAULT/RIP-CONTENT]` for fatal Ring-3 faults.
 ///
 /// Convenience entry point for the `idt.rs` paths that kill the process
@@ -1349,6 +1419,59 @@ pub(crate) fn emit_fault_phys_diagnostic(
                 "[FAULT/PHYS] pid={} tid={} rip={:#x} rip_phys=UNMAPPED vma_offset=NO_VMA",
                 pid, tid, user_rip,
             );
+        }
+    }
+
+    // ── [FAULT/CACHE-KEY] (W215 action-(C) diagnostic) ──────────────────────
+    // Classify the corrupted physical frame into one of three exhaustive buckets
+    // based on its current presence in the page cache.  Only emitted for
+    // firefox-test builds and only when (a) rip_phys is known and (b) the
+    // faulting VMA is file-backed — anonymous fault pages are never cached so
+    // the lookup would always return None, which would spuriously inflate
+    // bucket-C and produce a misleading soak verdict.
+    //
+    // ISR-safe: `is_phys_in_cache` takes PAGE_CACHE.lock() (spin, no sleep).
+    // `vma_file_key` is pure arithmetic.  No allocation.
+    #[cfg(feature = "firefox-test")]
+    if let Some(rip_phys) = rip_phys {
+        // Find the VMA that contains user_rip so we know its file identity.
+        let rip_vma = vma_snapshot.iter().find(|v| v.contains_rip);
+        if let Some(vma) = rip_vma {
+            if let Some(expected_key) = vma_file_key(vma, user_rip) {
+                match crate::mm::cache::is_phys_in_cache(rip_phys) {
+                    Some(actual_key) if actual_key == expected_key => {
+                        FAULT_CACHE_KEY_BUCKET_A.fetch_add(1, Ordering::Relaxed);
+                        crate::serial_println!(
+                            "[FAULT/CACHE-KEY] bucket=A (same-key in-place corruption) \
+                             rip_phys={:#x} key=(mount={},inode={:#x},off={:#x})",
+                            rip_phys,
+                            actual_key.0, actual_key.1, actual_key.2,
+                        );
+                    }
+                    Some(actual_key) => {
+                        FAULT_CACHE_KEY_BUCKET_B.fetch_add(1, Ordering::Relaxed);
+                        crate::serial_println!(
+                            "[FAULT/CACHE-KEY] bucket=B (cross-key aliased) \
+                             rip_phys={:#x} \
+                             expected=(mount={},inode={:#x},off={:#x}) \
+                             actual=(mount={},inode={:#x},off={:#x})",
+                            rip_phys,
+                            expected_key.0, expected_key.1, expected_key.2,
+                            actual_key.0, actual_key.1, actual_key.2,
+                        );
+                    }
+                    None => {
+                        FAULT_CACHE_KEY_BUCKET_C.fetch_add(1, Ordering::Relaxed);
+                        crate::serial_println!(
+                            "[FAULT/CACHE-KEY] bucket=C (not in cache; post-evict stale PTE) \
+                             rip_phys={:#x} \
+                             expected=(mount={},inode={:#x},off={:#x})",
+                            rip_phys,
+                            expected_key.0, expected_key.1, expected_key.2,
+                        );
+                    }
+                }
+            }
         }
     }
 
