@@ -12,6 +12,9 @@ pub mod tlb;
 pub mod vma;
 pub mod vmm;
 
+#[cfg(feature = "firefox-test")]
+pub mod w215_diag;
+
 use astryx_shared::BootInfo;
 
 /// Initialize the memory management subsystem.
