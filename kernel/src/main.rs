@@ -44,6 +44,8 @@ mod gdi;
 mod gui;
 #[cfg(feature = "kdb")]
 mod kdb;
+#[cfg(feature = "coverage")]
+mod coverage;
 mod msg;
 mod vfs;
 mod wm;
