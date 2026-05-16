@@ -2253,7 +2253,8 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
         qemu-harness.py kdb <sid> fd-table 6
         qemu-harness.py kdb <sid> syscall-trend 10 4
     """
-    if op in ("ping", "proc-list", "vfs-mounts", "trace-status", "bell-stats"):
+    if op in ("ping", "proc-list", "vfs-mounts", "trace-status",
+              "bell-stats", "cache-audit"):
         return {"op": op}
     if op == "proc":
         if not rest: raise ValueError("proc requires <pid>")
@@ -2448,6 +2449,61 @@ def cmd_fd_map(args):
             "changed": changed,
             "snapshot": resp,
         }
+
+    _out(resp)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# cache-audit — W215 H1 diagnostic: page-cache refcount invariant walker
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Wraps kdb op 'cache-audit' (firefox-test kernel builds only) and pretty-
+# prints the result.  The response carries:
+#   total_entries           — number of entries currently in PAGE_CACHE
+#   orphan_count            — entries with page_ref_count == 0 (H1 smoke gun)
+#   pmm_alloc_nonzero_rc    — times alloc_page returned a frame with rc > 0
+#   refcount_set_over_nonzero — times page_ref_set decreased a non-zero rc
+#
+# PROCEED-TO-FIX (per PM verdict) iff any of the three counters are non-zero.
+
+def cmd_cache_audit(args):
+    """W215 H1 diagnostic: audit page-cache vs refcount table invariants.
+
+    Sends kdb op 'cache-audit' and returns structured JSON with orphan_count,
+    pmm_alloc_nonzero_rc, and refcount_set_over_nonzero counters.
+
+    Requires the session to have been started with --features firefox-test,kdb.
+    """
+    sess = _load_session(args.sid)
+    port = int(sess.get("kdb_host_port") or 0)
+    if port <= 0:
+        _out({"error": "session was not started with --features kdb"})
+        sys.exit(1)
+
+    req: dict = {"op": "cache-audit"}
+    timeout = float(getattr(args, "timeout", 10.0) or 10.0)
+    try:
+        raw = _kdb_recv(port, req, timeout=timeout)
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        _out({"error": f"kdb connect failed on 127.0.0.1:{port}: {e}"})
+        sys.exit(1)
+    try:
+        resp = json.loads(raw.strip().decode("utf-8", errors="replace"))
+    except (json.JSONDecodeError, ValueError) as e:
+        _out({"error": f"malformed kdb response: {e}",
+              "raw": raw.decode(errors="replace")})
+        sys.exit(1)
+
+    # Annotate with a human-readable verdict for the PM's classification rules.
+    orphans    = resp.get("orphan_count", -1)
+    pmm_nz     = resp.get("pmm_alloc_nonzero_rc", -1)
+    rc_set_ov  = resp.get("refcount_set_over_nonzero", -1)
+    if any(v > 0 for v in [orphans, pmm_nz, rc_set_ov] if isinstance(v, int)):
+        resp["_verdict"] = "PROCEED-TO-FIX: at least one H1 counter non-zero"
+    elif all(v == 0 for v in [orphans, pmm_nz, rc_set_ov] if isinstance(v, int)):
+        resp["_verdict"] = "ABORT-OR-NULL: all H1 counters zero"
+    else:
+        resp["_verdict"] = "UNKNOWN: check for error field"
 
     _out(resp)
 
@@ -5245,7 +5301,7 @@ def main():
         "ping", "proc-list", "proc", "proc-tree", "fd-table", "fd-map",
         "syscall-trend", "vfs-mounts",
         "dmesg", "syms", "mem", "tframe", "user-mem", "trace-status",
-        "bell-stats",
+        "bell-stats", "cache-audit",
     ])
     p_kdb.add_argument("args", nargs="*",
                         help="Op-specific positional args: "
@@ -5273,6 +5329,18 @@ def main():
                           help="Diff current snapshot against a previously --save'd NAME")
     p_fdmap.add_argument("--timeout", type=float, default=5.0,
                           help="kdb socket timeout in seconds (default 5.0)")
+
+    # cache-audit — W215 H1 diagnostic: walk the page cache checking for
+    # zero-refcount entries.  Requires --features firefox-test,kdb at start.
+    p_cacheaudit = sub.add_parser(
+        "cache-audit",
+        help="[W215 diag] Audit page-cache refcount invariants via kdb op "
+             "cache-audit (requires --features firefox-test,kdb). Reports "
+             "total_entries, orphan_count (rc=0 entries), and the cumulative "
+             "PMM_ALLOC_NONZERO_RC and REFCOUNT_SET_OVER_NONZERO counters.")
+    p_cacheaudit.add_argument("sid")
+    p_cacheaudit.add_argument("--timeout", type=float, default=10.0,
+                               help="kdb socket timeout in seconds (default 10.0)")
 
     # qga-ping / qga-info / qga-sync / qga-file-read — QEMU Guest Agent
     # bridge.  Requires --features qga at start; talks NDJSON over the
@@ -5560,8 +5628,9 @@ def main():
         "pause":  cmd_pause,
         "resume": cmd_resume,
         # Tier 1
-        "kdb":    cmd_kdb,
-        "fd-map": cmd_fd_map,
+        "kdb":         cmd_kdb,
+        "fd-map":      cmd_fd_map,
+        "cache-audit": cmd_cache_audit,
         # QGA bridge
         "qga-ping":      cmd_qga_ping,
         "qga-info":      cmd_qga_info,
