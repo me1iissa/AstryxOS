@@ -1519,6 +1519,21 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         unsafe {
                             core::ptr::write_bytes((PHYS_OFF_FILE + phys) as *mut u8, 0, 0x1000);
                         }
+                        // W215 diagnostic Arm-1+2: open the pre-insert
+                        // race window for `phys` at the readahead site.
+                        #[cfg(feature = "firefox-test")]
+                        {
+                            crate::mm::w215_diag::prov_record(
+                                phys,
+                                crate::mm::w215_diag::KIND_PHYS_OFF_WRITE_PRE_INSERT,
+                                crate::mm::w215_diag::pack_cache_key(inode, foff),
+                            );
+                            crate::mm::w215_diag::preins_register(
+                                phys,
+                                crate::mm::w215_diag::SITE_PFH_READAHEAD,
+                                mount_idx, inode, foff,
+                            );
+                        }
                         let buf = unsafe {
                             core::slice::from_raw_parts_mut(
                                 (PHYS_OFF_FILE + phys) as *mut u8, 0x1000)
@@ -1660,6 +1675,22 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
 
             for i in 0..n_pages {
                 let (vaddr, phys, foff) = pages_to_map[i];
+
+                // W215 diagnostic Arm-1+2: record this PFH install attempt
+                // and probe whether the destination phys still has an
+                // in-flight pre-insert witness — the smoking-gun race for
+                // axis A.
+                #[cfg(feature = "firefox-test")]
+                {
+                    crate::mm::w215_diag::prov_record(
+                        phys,
+                        crate::mm::w215_diag::KIND_PFH_INSTALL,
+                        crate::mm::w215_diag::pack_cache_key(inode, foff),
+                    );
+                    crate::mm::w215_diag::preins_check_install(
+                        phys, mount_idx, inode, foff,
+                    );
+                }
 
                 // W216 H_5j-B: per-iteration generation re-check.  Any sibling
                 // CPU that mutated the address space (sys_munmap, MAP_FIXED
@@ -1844,6 +1875,21 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
             if let Some(phys) = crate::mm::pmm::alloc_page() {
                 unsafe {
                     core::ptr::write_bytes((PHYS_OFF_FILE + phys) as *mut u8, 0, 0x1000);
+                }
+                // W215 diagnostic Arm-1+2: open the pre-insert race window
+                // for `phys` at the single-page fallback site.
+                #[cfg(feature = "firefox-test")]
+                {
+                    crate::mm::w215_diag::prov_record(
+                        phys,
+                        crate::mm::w215_diag::KIND_PHYS_OFF_WRITE_PRE_INSERT,
+                        crate::mm::w215_diag::pack_cache_key(inode, file_page_offset),
+                    );
+                    crate::mm::w215_diag::preins_register(
+                        phys,
+                        crate::mm::w215_diag::SITE_PFH_SINGLEPAGE,
+                        mount_idx, inode, file_page_offset,
+                    );
                 }
                 // Snapshot the FS handle out of MOUNTS (one short critical
                 // section) and dispatch the read with the lock released.
@@ -2061,6 +2107,18 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                                 );
                             }
                         }
+                    }
+                    // W215 diagnostic Arm-1+2 (single-page alias install).
+                    #[cfg(feature = "firefox-test")]
+                    {
+                        crate::mm::w215_diag::prov_record(
+                            phys,
+                            crate::mm::w215_diag::KIND_PFH_INSTALL,
+                            crate::mm::w215_diag::pack_cache_key(inode, file_page_offset),
+                        );
+                        crate::mm::w215_diag::preins_check_install(
+                            phys, mount_idx, inode, file_page_offset,
+                        );
                     }
                     crate::mm::refcount::page_ref_inc(phys); // PTE reference
                     crate::mm::vmm::map_page_in(cr3, page_addr, phys, page_flags);
