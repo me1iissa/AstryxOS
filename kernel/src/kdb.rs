@@ -281,6 +281,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "cache-audit"    => op_cache_audit(out),
         "cache-aliasing" => op_cache_aliasing(out),
         "tlb-stats"      => op_tlb_stats(out),
+        "coverage-flush" => op_coverage_flush(out),
         _ => {
             out.push_str(r#"{"error":"unknown op: "#);
             for c in op.chars().take(64) {
@@ -1438,5 +1439,44 @@ fn op_cache_audit(out: &mut String) {
     #[cfg(not(feature = "firefox-test"))]
     {
         out.push_str(r#"{"error":"cache-audit requires firefox-test feature"}"#);
+    }
+}
+
+// ── coverage-flush ────────────────────────────────────────────────────────────
+//
+// Triggers the in-kernel LLVM source-based coverage dump (see
+// `crate::coverage::dump_profile`).  Walks `__llvm_prf_cnts` /
+// `__llvm_prf_data` / `__llvm_prf_names` plus the static `__llvm_covmap` /
+// `__llvm_covfun` regions and emits hex `[COV-CHUNK]` lines plus a
+// `[COV-SUMMARY]` JSON line on the serial port.  Returns the region-level
+// summary as a JSON envelope so the harness can confirm flush completion
+// without re-grepping the serial log.
+//
+// Resets the once-per-boot idempotency latch first so an interactive
+// caller can re-flush after additional work has executed.  Requires the
+// `coverage` feature (which in turn implies the `-C instrument-coverage`
+// rustflag, set by the harness).
+
+fn op_coverage_flush(out: &mut String) {
+    #[cfg(feature = "coverage")]
+    {
+        use core::fmt::Write;
+        crate::coverage::reset();
+        let (covered, total, bytes) = crate::coverage::dump_profile();
+        let pct_x100 = if total == 0 { 0 } else { (covered as u64 * 10_000) / total as u64 };
+        let pct_whole = pct_x100 / 100;
+        let pct_frac = pct_x100 % 100;
+        out.push('{');
+        let _ = write!(out,
+            r#""regions_covered":{},"regions_total":{},"pct":"{}.{}{}","bytes_dumped":{}"#,
+            covered, total, pct_whole,
+            if pct_frac < 10 { "0" } else { "" }, pct_frac, bytes,
+        );
+        out.push_str(r#","note":"raw chunks in serial log [COV-CHUNK] lines""#);
+        out.push('}');
+    }
+    #[cfg(not(feature = "coverage"))]
+    {
+        out.push_str(r#"{"error":"coverage-flush requires coverage feature"}"#);
     }
 }

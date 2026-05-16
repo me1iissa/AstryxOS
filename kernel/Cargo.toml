@@ -103,6 +103,19 @@ vfs-trace = []
 # bugcheck (sc=1161 under firefox-test).  Off by default — the runtime
 # cost is one extra `try_lock` per device call.
 vfs-debug = []
+# LLVM source-based code-coverage instrumentation (test-coverage audit
+# session 5 / docs/TEST_COVERAGE_AUDIT_2026-05-16.md).  When enabled, the
+# kernel must additionally be built with `-C instrument-coverage` (see
+# scripts/qemu-harness.py `--features coverage` path, which sets RUSTFLAGS
+# accordingly).  At test-suite exit the kernel walks the linker-delimited
+# `__llvm_prf_cnts` / `__llvm_prf_data` / `__llvm_prf_names` sections plus
+# the static `__llvm_covmap` / `__llvm_covfun` regions and emits the bytes
+# as hex `[COV-CHUNK]` lines plus a `[COV-SUMMARY]` JSON line containing
+# the region-level coverage percentage.  The harness's `coverage`
+# subcommand parses these and produces a per-PR-friendly report.  Default
+# / firefox-test / test-mode builds remain byte-identical when this
+# feature is OFF.  See docs/HARNESS.md.
+coverage = []
 
 [dependencies]
 astryx-shared = { path = "../shared" }

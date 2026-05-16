@@ -1,3 +1,11 @@
+# Enables `profile.release.package.<name>.rustflags`, used by the
+# coverage-build path so `-C instrument-coverage` applies ONLY to the
+# astryx-kernel crate and not to `core` / `alloc` from -Zbuild-std.
+# Without this scoping the std build pulls in `profiler_builtins` which
+# in turn requires compiler-rt source, which is not a reasonable host
+# dependency.  See docs/TEST_COVERAGE_AUDIT_2026-05-16.md (session 5).
+cargo-features = ["profile-rustflags"]
+
 [workspace]
 resolver = "2"
 members = [
