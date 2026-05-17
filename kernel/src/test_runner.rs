@@ -1780,6 +1780,17 @@ pub fn run() -> ! {
         if test_236_dead_stack_zeroing() { passed += 1; }
     }
 
+    // ── Test 237: IPv4 total_length clamp (H6) ───────────────────────────
+    // RFC 791 §3.1 — verifies `clamp_payload_to_total_length` produces
+    // the right byte offset across truncation, padding, and adversarial
+    // total_length values.  Regression guard for finding H6 of the
+    // 2026-05-16 security audit.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_237_ipv4_total_length_clamp() { passed += 1; }
+    }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -30637,5 +30648,76 @@ fn test_236_dead_stack_zeroing() -> bool {
     }
 
     test_pass!("push_dead_stack → pop_dead_stack: full kstack zeroed (CWE-244)");
+    true
+}
+
+// ── Test 237: IPv4 total_length payload clamp (audit H6) ───────────────────
+//
+// Closes finding H6 from `docs/SECURITY_AUDIT_2026-05-16.md`.  RFC 791 §3.1
+// defines `total_length` as the length of the entire IP datagram including
+// header and data.  Ethernet frames have a 46-byte minimum payload, so a
+// short IP datagram arrives padded with trailer bytes; before the H6 fix
+// those trailer bytes leaked into ICMP / UDP receive paths.  Verifies the
+// extracted clamp helper across the boundary conditions an attacker can
+// reach:
+//
+//   (a) total_length advertises FEWER bytes than the frame contains
+//       (legitimate trailer padding, or attacker-shaped trailer).  Expected:
+//       end == total_length — trailer is dropped.
+//   (b) total_length advertises MORE bytes than the frame contains
+//       (truncated capture, or attacker tries to read past buffer).
+//       Expected: end == frame_len — never overrun the buffer.
+//   (c) total_length < payload_start (attacker fakes a tiny header
+//       declaration).  Expected: end == payload_start — never underflow,
+//       slice is empty.
+//   (d) total_length == frame_len, total_length > frame_len, and the
+//       degenerate frame_len == payload_start case.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_237_ipv4_total_length_clamp() -> bool {
+    test_header!("security: IPv4 total_length payload clamp (audit H6, RFC 791 §3.1)");
+
+    use crate::net::ipv4::clamp_payload_to_total_length as clamp;
+
+    // (a) total_length 28 (20-byte IP header + 8-byte UDP), frame_len 60
+    //     (Ethernet minimum padded).  Expected: 28 — trailer dropped.
+    let r = clamp(28, 20, 60);
+    test_println!("  (a) total=28 start=20 frame=60 → end={}", r);
+    if r != 28 { test_fail!("test237", "(a) expected 28 got {}", r); return false; }
+
+    // (b) total_length 1500 (max-MTU datagram), frame_len 800 (truncated).
+    //     Expected: 800 — never overrun.
+    let r = clamp(1500, 20, 800);
+    test_println!("  (b) total=1500 start=20 frame=800 → end={}", r);
+    if r != 800 { test_fail!("test237", "(b) expected 800 got {}", r); return false; }
+
+    // (c) total_length 10 (smaller than the IHL=5 → header_len=20).
+    //     Expected: 20 — clamp from below so the slice is empty.
+    let r = clamp(10, 20, 60);
+    test_println!("  (c) total=10 start=20 frame=60 → end={}", r);
+    if r != 20 { test_fail!("test237", "(c) expected 20 got {}", r); return false; }
+
+    // (d.1) total == frame_len exactly.  Expected: total.
+    let r = clamp(60, 20, 60);
+    test_println!("  (d.1) total=60 start=20 frame=60 → end={}", r);
+    if r != 60 { test_fail!("test237", "(d.1) expected 60 got {}", r); return false; }
+
+    // (d.2) total > frame_len.  Expected: frame_len.
+    let r = clamp(120, 20, 60);
+    test_println!("  (d.2) total=120 start=20 frame=60 → end={}", r);
+    if r != 60 { test_fail!("test237", "(d.2) expected 60 got {}", r); return false; }
+
+    // (d.3) frame_len == payload_start (degenerate header-only frame).
+    //     With total declaring more bytes, end clamps to payload_start.
+    let r = clamp(28, 20, 20);
+    test_println!("  (d.3) total=28 start=20 frame=20 → end={}", r);
+    if r != 20 { test_fail!("test237", "(d.3) expected 20 got {}", r); return false; }
+
+    // (d.4) total == 0 (degenerate attacker value).  Expected: clamp
+    //       from below to payload_start so the slice is empty.
+    let r = clamp(0, 20, 60);
+    test_println!("  (d.4) total=0 start=20 frame=60 → end={}", r);
+    if r != 20 { test_fail!("test237", "(d.4) expected 20 got {}", r); return false; }
+
+    test_pass!("IPv4 total_length payload clamp — all 6 boundary cases (RFC 791 §3.1)");
     true
 }
