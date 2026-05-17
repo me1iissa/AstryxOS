@@ -110,6 +110,32 @@ static NEXT_FIT_BYTE: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "firefox-test")]
 static PMM_ALLOC_NONZERO_RC: AtomicU64 = AtomicU64::new(0);
 
+// ── Kernel image linker symbols ────────────────────────────────────────────
+//
+// The bootloader passes `kernel_size = kernel_data.len()`, which is the size
+// of `kernel.bin` — a flat binary produced by `objcopy -O binary` from the
+// ELF.  Per the ELF specification (System V ABI, ELF gABI §4, "Sections"),
+// `objcopy -O binary` writes only sections that have both `SHF_ALLOC` and
+// non-zero file content (i.e. `.text`, `.rodata`, `.data`, and instrumented
+// coverage sections).  Sections of type `SHT_NOBITS` — notably `.bss` — are
+// allocated at runtime but carry no file image, so their extent is **not**
+// reflected in the flat binary's length and therefore not in `kernel_size`.
+//
+// The kernel linker script (`kernel/linker.ld`) exports `__kernel_end` as a
+// 4 KiB-aligned symbol immediately after `.bss`, which is the true upper
+// bound of the kernel image in physical memory.  Using it here closes the
+// gap where BSS pages would otherwise be left in the PMM's free pool and
+// handed out to subsequent allocators — producing frame aliasing between
+// kernel statics and any in-memory page-cache, mmap, or per-process page
+// table that subsequently allocates them.
+//
+// Reference: Intel SDM Vol. 3A §4.10.5 (paging-structure coherence) — frames
+// backing kernel-resident structures must remain reserved against PMM
+// recycling for the lifetime of any mapping that uses them.
+extern "C" {
+    static __kernel_end: u8;
+}
+
 /// Initialize the PMM from the UEFI memory map.
 pub fn init(boot_info: &BootInfo) {
     let _lock = PMM_LOCK.lock();
@@ -133,11 +159,37 @@ pub fn init(boot_info: &BootInfo) {
         }
     }
 
-    // Mark kernel region as used (1 MiB + kernel size)
-    let kernel_start = (boot_info.kernel_phys_base / PAGE_SIZE as u64) as usize;
-    let kernel_pages = ((boot_info.kernel_size + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64) as usize;
+    // Compute the true kernel-image extent.
+    //
+    // The bootloader passes `kernel_size = kernel.bin file length`, which
+    // omits the .bss section (NOBITS — no file content).  Read `__kernel_end`
+    // from the linker script and translate its higher-half VMA back to its
+    // physical LMA via `__kernel_end - KERNEL_VIRT_BASE`.  Take the maximum
+    // of the bootloader-reported extent and the linker-derived extent so
+    // either source can safely overstate (e.g. if the bootloader counts a
+    // padded LOADER_DATA region) and the reservation still covers BSS.
+    let kernel_start_phys = boot_info.kernel_phys_base;
+    let bss_kernel_end_va = unsafe { &__kernel_end as *const u8 as u64 };
+    let bss_kernel_end_phys = bss_kernel_end_va
+        .saturating_sub(astryx_shared::KERNEL_VIRT_BASE);
+    let bin_kernel_end_phys = kernel_start_phys.saturating_add(boot_info.kernel_size);
+    let kernel_end_phys = core::cmp::max(bin_kernel_end_phys, bss_kernel_end_phys);
+    let image_bytes = kernel_end_phys.saturating_sub(kernel_start_phys);
+
+    crate::serial_println!(
+        "[PMM] Kernel image: phys_base={:#x} bin_end={:#x} bss_end={:#x} reserved_end={:#x} ({} KiB)",
+        kernel_start_phys,
+        bin_kernel_end_phys,
+        bss_kernel_end_phys,
+        kernel_end_phys,
+        image_bytes / 1024,
+    );
+
+    // Mark kernel region as used (kernel image incl. .bss + 256 pages slack
+    // for BootInfo and early structures placed past __kernel_end).
+    let kernel_start = (kernel_start_phys / PAGE_SIZE as u64) as usize;
+    let kernel_pages = ((image_bytes + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64) as usize;
     for page in kernel_start..kernel_start + kernel_pages + 256 {
-        // +256 pages for boot info and early structures
         if page < MAX_PAGES {
             // SAFETY: We hold the PMM lock and page is in bounds.
             unsafe {
@@ -146,6 +198,24 @@ pub fn init(boot_info: &BootInfo) {
             if total_available > 0 {
                 total_available -= 1;
             }
+        }
+    }
+
+    // Reserve the BootInfo page explicitly.  The bootloader writes BootInfo
+    // at `BOOT_INFO_PHYS_BASE` (a fixed offset past the kernel image) but
+    // UEFI's exit_boot_services memory map reports the underlying region as
+    // BOOT_SERVICES_DATA, which our converter maps to `Available` — so
+    // without an explicit reservation the very page holding BootInfo can be
+    // handed out to later allocators.  One 4 KiB page is sufficient for the
+    // BootInfo struct (single-digit KiB, repr(C), pinned at this address).
+    let boot_info_page = (astryx_shared::BOOT_INFO_PHYS_BASE / PAGE_SIZE as u64) as usize;
+    if boot_info_page < MAX_PAGES {
+        // SAFETY: We hold the PMM lock and page is in bounds.
+        unsafe {
+            mark_page_used(boot_info_page);
+        }
+        if total_available > 0 {
+            total_available -= 1;
         }
     }
 
