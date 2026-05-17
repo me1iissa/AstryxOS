@@ -110,6 +110,19 @@ static NEXT_FIT_BYTE: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "firefox-test")]
 static PMM_ALLOC_NONZERO_RC: AtomicU64 = AtomicU64::new(0);
 
+/// Cumulative count of `free_page` calls that were refused because the
+/// frame still had residual PTE references (`pte_share_count > 0`) at the
+/// moment of free.  Each refusal also leaks the frame for the remainder of
+/// the boot — that is the conservative, race-free choice when the
+/// invariant fails: the frame may still be reached through a stale PTE on
+/// some sibling CPU, so handing it back to the allocator would resurface
+/// the W215 use-after-recycle fault.
+///
+/// Always 0 on builds without the assertion (none currently; the assertion
+/// is unconditional because the cost is a single atomic load on the free
+/// path, dwarfed by the bitmap-clear under PMM_LOCK).
+static PMM_FREE_RESIDUAL_REFS: AtomicU64 = AtomicU64::new(0);
+
 // ── Kernel image linker symbols ────────────────────────────────────────────
 //
 // The bootloader passes `kernel_size = kernel_data.len()`, which is the size
@@ -406,10 +419,86 @@ pub fn alloc_page() -> Option<u64> {
     None
 }
 
+/// Best-effort caller-RIP capture used by the residual-PTE-reference
+/// diagnostic.  Walks one frame up using `rbp`; if the prologue did not
+/// save RBP (LTO / `-fomit-frame-pointer`) this returns 0 — the
+/// `[PMM/PTE-REFS]` line is still useful from the phys + residual count
+/// alone.  Diagnostic-only.
+#[inline(never)]
+fn caller_rip() -> u64 {
+    let rbp: u64;
+    // SAFETY: reading the frame pointer is always safe; the subsequent
+    // dereference is guarded by alignment + higher-half checks below.
+    unsafe {
+        core::arch::asm!(
+            "mov {}, rbp",
+            out(reg) rbp,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    if rbp == 0 || (rbp & 7) != 0 || rbp < 0xFFFF_8000_0000_0000 {
+        return 0;
+    }
+    // [rbp+8] = saved return address into `free_page`'s caller.
+    // SAFETY: rbp has passed the higher-half + alignment guard above.
+    unsafe { core::ptr::read_volatile((rbp + 8) as *const u64) }
+}
+
 /// Free a physical page frame.
+///
+/// ## W215 PTE-share-count free-time invariant
+///
+/// A physical frame must not return to the PMM free list while any user
+/// PTE still references it (see [`crate::mm::refcount::pte_share_count`]
+/// for the full invariant statement).  If the residual PTE-reference
+/// count is non-zero at the moment of free, the frame is **quarantined**
+/// — not returned to the allocator — for the remainder of the boot.
+/// This is the conservative choice: a stale PTE on some sibling CPU may
+/// still map a user VA to `phys`, so returning the frame to the allocator
+/// would let it be repurposed under that live PTE.  The frame is
+/// effectively leaked, but the alternative (use-after-recycle) is the
+/// W215 fault class itself.
+///
+/// Per Intel SDM Vol. 3A §4.10.5 (paging-structure changes must be
+/// propagated to all processors before the physical frame is repurposed)
+/// and POSIX mmap(2) (user-visible page contents must remain valid for
+/// the lifetime of the mapping), the only safe outcome under residual
+/// references is to keep the frame out of circulation.
+///
+/// Every `[PMM/PTE-REFS]` line emitted here identifies a real upstream
+/// bug: a caller cleared a PTE without the matching `page_ref_dec`, or
+/// dropped a `page_ref_inc` somewhere along the install path.  The
+/// caller-RIP captured in the line is the locus of the upstream fix.
 pub fn free_page(phys_addr: u64) {
     let page = (phys_addr / PAGE_SIZE as u64) as usize;
     if page >= MAX_PAGES {
+        return;
+    }
+
+    // W215 PTE-share-count free-time invariant — see function-level doc.
+    // The check is performed BEFORE the bitmap is cleared so that a
+    // refused free leaves no PMM-side state change.  An out-of-range
+    // page (caught above) and a phys backed by a refcount slot whose
+    // bookkeeping has never been touched (kernel-static, page-table
+    // levels, sysv_shm Device frames) both load 0 — the assertion is
+    // a no-op for them.
+    let residual = crate::mm::refcount::pte_share_count(phys_addr);
+    if residual > 0 {
+        let total = PMM_FREE_RESIDUAL_REFS.fetch_add(1, Ordering::Relaxed) + 1;
+        let rip = caller_rip();
+        // Log first 16 fires, then every 1000th, to bound serial bandwidth
+        // under a sustained-fault workload while keeping the smoking-gun
+        // line visible during normal triage.
+        if total <= 16 || total % 1000 == 0 {
+            crate::serial_println!(
+                "[PMM/PTE-REFS] refusing free of phys={:#x} — residual \
+                 pte_share_count={} caller_rip={:#x} refused_total={}",
+                phys_addr, residual, rip, total,
+            );
+        }
+        // Quarantine the frame for the remainder of the boot: do NOT
+        // clear the bitmap bit, do NOT decrement USED_PAGES.  The frame
+        // stays out of the allocator's free pool — leaked, but safe.
         return;
     }
 
@@ -524,6 +613,16 @@ pub fn pmm_alloc_nonzero_rc_count() -> u64 {
     { PMM_ALLOC_NONZERO_RC.load(Ordering::Relaxed) }
     #[cfg(not(feature = "firefox-test"))]
     { 0 }
+}
+
+/// Read the cumulative `PMM_FREE_RESIDUAL_REFS` counter.
+///
+/// Returns the number of times [`free_page`] was refused because the
+/// frame still had a non-zero `pte_share_count` at the moment of free.
+/// Each refusal corresponds to one quarantined (leaked) frame and one
+/// upstream PTE-decref bug that needs investigation.
+pub fn pmm_free_residual_refs_count() -> u64 {
+    PMM_FREE_RESIDUAL_REFS.load(Ordering::Relaxed)
 }
 
 /// Mark a page as used in the bitmap.

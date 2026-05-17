@@ -1680,13 +1680,14 @@ fn op_cache_audit(out: &mut String) {
         // Read the PMM and refcount counters.
         let pmm_nonzero = crate::mm::pmm::pmm_alloc_nonzero_rc_count();
         let rc_set_over = crate::mm::refcount::refcount_set_over_nonzero_count();
+        let pmm_residual = crate::mm::pmm::pmm_free_residual_refs_count();
 
         // We already logged individual orphans via serial in audit_invariant.
         // The JSON response carries the aggregate numbers plus a note that
         // full orphan detail is in the serial log.
         out.push('{');
-        let _ = write!(out, r#""total_entries":{},"orphan_count":{},"pmm_alloc_nonzero_rc":{},"refcount_set_over_nonzero":{}"#,
-            total, orphan_count, pmm_nonzero, rc_set_over,
+        let _ = write!(out, r#""total_entries":{},"orphan_count":{},"pmm_alloc_nonzero_rc":{},"refcount_set_over_nonzero":{},"pmm_free_residual_refs":{}"#,
+            total, orphan_count, pmm_nonzero, rc_set_over, pmm_residual,
         );
         // Indicate where to find per-orphan detail.
         out.push_str(r#","note":"per-orphan detail in serial log [CACHE/AUDIT/ORPHAN] lines""#);
