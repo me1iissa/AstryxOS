@@ -1729,6 +1729,16 @@ pub fn run() -> ! {
     total += 1;
     if test_230_so_peercred_returns_peer_pid() { passed += 1; }
 
+    // ── Test 230b: client-side SO_PEERCRED via connect() path ────────────
+    // Exercises the connect(2) code path: the client calls connect(), and
+    // peer_creds(client_fd) must return the SERVER's identity (not the
+    // client's own).  Regression for the accept-side stamping bug (PR #274
+    // review finding): previously the accept-side socket was stamped with
+    // client_creds instead of server_creds, so the client saw its own pid
+    // via SO_PEERCRED.  Cite unix(7) SO_PEERCRED; CWE-287.
+    total += 1;
+    if test_230b_peercred_connect_path() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -9646,32 +9656,92 @@ fn test_pipe2_statfs() -> bool {
 }
 
 // ── Test 52: futex REQUEUE + WAIT_BITSET ─────────────────────────────────────
+//
+// Covers futex(2) ABI hygiene fixes from the post-H1-SMAP follow-up bundle:
+//   * FUTEX_REQUEUE  op=3 (was incorrectly dispatched as op=4 before the fix)
+//   * FUTEX_CMP_REQUEUE op=4 with correct val3 comparison via arg6
+//   * FUTEX_WAKE_OP op=5 returns ENOSYS (stub, not implemented)
+//
+// References: futex(2) Linux man-page; Linux UAPI <linux/futex.h>.
 
 fn test_futex_requeue() -> bool {
-    test_header!("futex — REQUEUE + WAIT_BITSET");
+    test_header!("futex — REQUEUE + CMP_REQUEUE + WAKE_OP stub + WAIT_BITSET");
 
-    // Verify FUTEX_REQUEUE (4) doesn't crash: wake 0 waiters from uaddr,
-    // requeue INT32_MAX to uaddr2 (both with value 0 — no waiters to move).
+    // ── FUTEX_REQUEUE (op=3): wake 0 waiters, requeue 0 to uaddr2 ──────────
+    // With no waiters, woken count = 0; return value must be 0 (not negative).
+    // Per futex(2): return value is the number of waiters woken (not requeued).
     let uaddr:  u32 = 0;
     let uaddr2: u32 = 0;
     let r = unsafe {
-        // sys_futex(uaddr_ptr, FUTEX_REQUEUE=4, val=0, val2=0, uaddr2_ptr)
+        // futex(uaddr, FUTEX_REQUEUE=3, val=0, val2=0, uaddr2)
         crate::syscall::dispatch_linux_kernel(
             202, // futex
             &uaddr  as *const u32 as u64,
-            4,   // FUTEX_REQUEUE
-            0,   // val (wake count)
-            0,   // val2 (requeue count) passed as timeout_ptr slot
+            3,   // FUTEX_REQUEUE — op number per futex(2)
+            0,   // val (max threads to wake)
+            0,   // val2 (max threads to requeue) passed in timeout_ptr slot
             &uaddr2 as *const u32 as u64,
             0,
         )
     };
-    // With no waiters, returns 0 (woke 0 threads)
     if r < 0 {
-        test_fail!("futex_requeue", "FUTEX_REQUEUE returned {}", r);
+        test_fail!("futex_requeue", "FUTEX_REQUEUE op=3 returned {} (expected 0)", r);
         return false;
     }
-    test_println!("  FUTEX_REQUEUE (no waiters) → {} ✓", r);
+    test_println!("  FUTEX_REQUEUE op=3 (no waiters) → {} ✓", r);
+
+    // ── FUTEX_CMP_REQUEUE (op=4): *uaddr==val3 check ───────────────────────
+    // With *uaddr=0 and val3=0 the comparison passes; no waiters → woken=0.
+    let uaddr_cmp: u32 = 0;
+    let r = unsafe {
+        // futex(uaddr, FUTEX_CMP_REQUEUE=4, val=0, val2=0, uaddr2, val3=0)
+        crate::syscall::dispatch_linux_kernel(
+            202,
+            &uaddr_cmp as *const u32 as u64,
+            4,   // FUTEX_CMP_REQUEUE
+            0,   // val (wake count)
+            0,   // val2 (requeue count) in timeout_ptr slot
+            &uaddr2 as *const u32 as u64,
+            0,   // val3 — must match *uaddr (0) to proceed
+        )
+    };
+    if r < 0 {
+        test_fail!("futex_cmp_requeue", "FUTEX_CMP_REQUEUE op=4 returned {} (expected 0)", r);
+        return false;
+    }
+    test_println!("  FUTEX_CMP_REQUEUE op=4 (*uaddr==val3, no waiters) → {} ✓", r);
+
+    // FUTEX_CMP_REQUEUE with val3 mismatch must return EAGAIN (-11).
+    let uaddr_cmp2: u32 = 7; // *uaddr = 7
+    let r = unsafe {
+        crate::syscall::dispatch_linux_kernel(
+            202,
+            &uaddr_cmp2 as *const u32 as u64,
+            4,   // FUTEX_CMP_REQUEUE
+            0,
+            0,
+            &uaddr2 as *const u32 as u64,
+            99,  // val3 = 99 ≠ *uaddr (7) → EAGAIN
+        )
+    };
+    if r != -11 {
+        test_fail!("futex_cmp_requeue_mismatch",
+            "FUTEX_CMP_REQUEUE val3 mismatch returned {} (expected -11 EAGAIN)", r);
+        return false;
+    }
+    test_println!("  FUTEX_CMP_REQUEUE op=4 (*uaddr≠val3) → {} (EAGAIN) ✓", r);
+
+    // ── FUTEX_WAKE_OP (op=5): stub must return ENOSYS (-38) ────────────────
+    let r = unsafe {
+        crate::syscall::dispatch_linux_kernel(202, &uaddr as *const u32 as u64,
+            5, 0, 0, &uaddr2 as *const u32 as u64, 0)
+    };
+    if r != -38 {
+        test_fail!("futex_wake_op_stub",
+            "FUTEX_WAKE_OP op=5 returned {} (expected -38 ENOSYS)", r);
+        return false;
+    }
+    test_println!("  FUTEX_WAKE_OP op=5 → {} (ENOSYS stub) ✓", r);
 
     // Verify FUTEX_WAIT_BITSET (9) with a timeout of 1ns returns ETIMEDOUT (-110).
     // We use a stack value == 0 and check val == *uaddr (0 == 0) so it waits.
@@ -23824,6 +23894,126 @@ fn test_230_so_peercred_returns_peer_pid() -> bool {
     true
 }
 
+// ── Test 230b: client-side SO_PEERCRED via connect() path ───────────────────
+//
+// unix(7) SO_PEERCRED: "Returns the credentials of the peer process connected
+// to this socket.  The credentials are those that were in effect at the time of
+// the call to connect(2) or socketpair(2)."  For a connect(2)-established pair:
+//
+//   * The CLIENT calls `peer_creds(client_fd)` → peer is the accept-side slot
+//     → accept-side slot must carry the SERVER's creator credentials.
+//   * The SERVER calls `peer_creds(server_fd)` → peer is the client slot
+//     → client slot carries the client's creator credentials (already correct).
+//
+// Pre-fix, connect() stamped the accept-side slot with `client_creds` (the
+// connecting process's identity), so peer_creds(client_fd) returned the client's
+// own pid — a CWE-287 (Improper Authentication) bug that defeated every IPC auth
+// scheme relying on SO_PEERCRED to identify the SERVER (D-Bus service activation,
+// Firefox IPC broker gating, systemd PrivateUsers checks).
+//
+// This test drives the kernel-level primitives directly without a second process:
+//   1. Create a server socket (PID=9000), bind, listen.
+//   2. Create a client socket (PID=8000), connect.
+//   3. Assert peer_creds(client_fd) == 9000 (server's identity).
+//   4. Assert peer_creds(accepted_fd) == 8000 (client's identity).
+//
+// References: unix(7) SO_PEERCRED; POSIX.1-2017 §getsockopt; CWE-287.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_230b_peercred_connect_path() -> bool {
+    test_header!("AF_UNIX SO_PEERCRED client-side stamping via connect() path");
+
+    let server_creds = crate::net::unix::PeerCreds { pid: 9000, uid: 1, gid: 2 };
+    let client_creds = crate::net::unix::PeerCreds { pid: 8000, uid: 3, gid: 4 };
+
+    // Create the server socket and bind it to a test path.
+    let srv_id = crate::net::unix::create(crate::net::unix::SockKind::Stream, server_creds);
+    if srv_id == u64::MAX {
+        test_fail!("peercred_connect", "server create() failed");
+        return false;
+    }
+    let bind_path = b"/tmp/.test230b_srv\0";
+    let r = crate::net::unix::bind(srv_id, bind_path);
+    if r != 0 {
+        test_fail!("peercred_connect", "server bind() returned {}", r);
+        crate::net::unix::close(srv_id);
+        return false;
+    }
+    let r = crate::net::unix::listen(srv_id);
+    if r != 0 {
+        test_fail!("peercred_connect", "server listen() returned {}", r);
+        crate::net::unix::close(srv_id);
+        return false;
+    }
+
+    // Create the client socket and connect.
+    let cli_id = crate::net::unix::create(crate::net::unix::SockKind::Stream, client_creds);
+    if cli_id == u64::MAX {
+        test_fail!("peercred_connect", "client create() failed");
+        crate::net::unix::close(srv_id);
+        return false;
+    }
+    let r = crate::net::unix::connect(cli_id, bind_path, client_creds);
+    if r != 0 {
+        test_fail!("peercred_connect", "client connect() returned {}", r);
+        crate::net::unix::close(cli_id);
+        crate::net::unix::close(srv_id);
+        return false;
+    }
+
+    // Accept: pull the first pending connection from the backlog.
+    let acc_raw = crate::net::unix::accept(srv_id);
+    if acc_raw < 0 {
+        test_fail!("peercred_connect", "server accept() returned {}", acc_raw);
+        crate::net::unix::close(cli_id);
+        crate::net::unix::close(srv_id);
+        return false;
+    }
+    let acc_id = acc_raw as u64;
+
+    let mut failed: u32 = 0;
+
+    // peer_creds(client_fd) must return the SERVER's identity.
+    match crate::net::unix::peer_creds(cli_id) {
+        Some(c) if c.pid == 9000 && c.uid == 1 && c.gid == 2 => {
+            test_println!("  peer_creds(client_fd) = (pid=9000 uid=1 gid=2) ✓ (server identity)");
+        }
+        other => {
+            test_println!(
+                "  peer_creds(client_fd) = {:?}; expected pid=9000 (server) ✗", other);
+            failed += 1;
+        }
+    }
+
+    // peer_creds(accepted_fd) must return the CLIENT's identity.
+    match crate::net::unix::peer_creds(acc_id) {
+        Some(c) if c.pid == 8000 && c.uid == 3 && c.gid == 4 => {
+            test_println!("  peer_creds(accepted_fd) = (pid=8000 uid=3 gid=4) ✓ (client identity)");
+        }
+        other => {
+            test_println!(
+                "  peer_creds(accepted_fd) = {:?}; expected pid=8000 (client) ✗", other);
+            failed += 1;
+        }
+    }
+
+    crate::net::unix::close(cli_id);
+    crate::net::unix::close(acc_id);
+    crate::net::unix::close(srv_id);
+
+    if failed > 0 {
+        test_fail!(
+            "peercred_connect",
+            "{} case(s) wrong; accept-side socket must carry server creds per unix(7)",
+            failed
+        );
+        return false;
+    }
+    test_pass!(
+        "connect() accept-side stamped with server_creds; client sees server identity (CWE-287)"
+    );
+    true
+}
+
 // ── Test 192: eventfd blocking read wakes after a write ─────────────────────
 //
 // Per `man 2 eventfd`: "If the eventfd counter is zero at the time of the
@@ -28996,6 +29186,38 @@ fn test_222_syscall_arg_validation_matrix() -> bool {
         "[TEST/ARGVAL/SUMMARY] entries={} ptr_cases={} total={} passed={} skipped={} regressions={}",
         entries.len(), BAD_PTRS.len(), total, passed, skipped, regressions,
     );
+
+    // ── Aether SYS_PIPE pointer-validation smoke test ────────────────────
+    // The Aether dispatch arm for SYS_PIPE (nr=24) now calls
+    // validate_user_ptr(fds_out, 16) before delegating to sys_pipe().
+    // Verify that a kernel-VA pointer returns EFAULT (-14).
+    // Uses dispatch_aether (NOT dispatch_linux) to exercise the Aether path.
+    // Per CWE-119 (memory bounds violation), defence-in-depth at the
+    // user/kernel boundary.
+    for (ptr, label) in BAD_PTRS {
+        let is_kernel_va = *ptr >= astryx_shared::KERNEL_VIRT_BASE
+            || (*label == "near-overflow");
+        let r = crate::syscall::dispatch_aether(
+            24,   // Aether SYS_PIPE
+            *ptr, // fds_out — adversarial pointer
+            0, 0, 0, 0, 0,
+        );
+        if is_kernel_va && r >= 0 {
+            crate::serial_println!(
+                "[TEST/ARGVAL/REGRESSION] syscall=aether-pipe nr=24 ptr_arg=fds_out \
+                 ptr={} ret={} expected=negative-errno",
+                label, r,
+            );
+            regressions += 1;
+        } else {
+            crate::serial_println!(
+                "[TEST/ARGVAL] syscall=aether-pipe nr=24 ptr_arg=fds_out ptr={} ret={} OK",
+                label, r,
+            );
+            passed += 1;
+        }
+        total += 1;
+    }
 
     if regressions > 0 {
         test_fail!(
