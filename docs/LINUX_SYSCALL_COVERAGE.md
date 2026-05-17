@@ -189,7 +189,7 @@ Ranked by frequency in real program traces. Syscalls that would most unblock rea
 | 166 | `umount` | Full; delegates to vfs::sys_umount (flags=0) |
 | 169 | `umount2` | Full; delegates to vfs::sys_umount with flags |
 | 186 | `gettid` | Full |
-| 202 | `futex` | Full; WAIT, WAKE, REQUEUE, CMP_REQUEUE, WAIT_BITSET, WAKE_BITSET |
+| 202 | `futex` | Full; WAIT, WAKE, REQUEUE, CMP_REQUEUE, WAIT_BITSET, WAKE_BITSET; under `firefox-test` / `test-mode` features a bounded broadcast-within-cluster wake compensation runs when `FUTEX_WAKE` finds 0 waiters (glibc BZ 25847 mitigation, runtime-gated via `kdb futex-set-cluster-wake`) |
 | 204 | `sched_getaffinity` | Full; writes per-CPU bitmask |
 | 213 | `epoll_create` | Full |
 | 217 | `getdents64` | Full |
