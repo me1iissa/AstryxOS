@@ -79,6 +79,16 @@ pub const BUGCHECK_MANUAL_CRASH: u32 = 0xDEAD_0000;
 pub const BUGCHECK_KERNEL_PAGE_FAULT: u32 = 0xDEAD_0006;
 /// AstryxOS: general protection fault in kernel mode
 pub const BUGCHECK_KERNEL_GPF: u32 = 0xDEAD_0007;
+/// AstryxOS: W215 page-cache insert observed contents that diverged from
+/// the source-file bytes the install path just read.  Indicates a
+/// concurrent writer mutated the just-allocated PMM frame between the
+/// successful `fs.read` and the cache::insert that publishes the frame
+/// into the page-cache namespace.  Per Intel SDM Vol. 3A §4.10.5 the
+/// install path holds the only kernel-side handle to that frame in that
+/// window; any divergence implies a sibling-CPU writer with a still-live
+/// PTE on the PMM-recycled frame (the residual aliasing class behind
+/// W215).  P1=phys, P2=mount_idx, P3=inode, P4=page_offset.
+pub const BUGCHECK_W215_INSERT_WRONG_CONTENT: u32 = 0xDEAD_0008;
 
 /// Human-readable bug-check name, returned as a `&'static str` from a
 /// match against rodata literals.  This MUST NOT allocate — the
@@ -96,6 +106,7 @@ pub fn bugcheck_name(code: u32) -> &'static str {
         BUGCHECK_MANUAL_CRASH        => "MANUAL_CRASH",
         BUGCHECK_KERNEL_PAGE_FAULT   => "KERNEL_PAGE_FAULT",
         BUGCHECK_KERNEL_GPF          => "KERNEL_GPF",
+        BUGCHECK_W215_INSERT_WRONG_CONTENT => "W215_INSERT_WRONG_CONTENT",
         _                            => "UNKNOWN_BUGCHECK",
     }
 }
