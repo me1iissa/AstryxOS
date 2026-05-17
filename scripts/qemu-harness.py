@@ -2562,6 +2562,18 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
     if op == "tframe":
         if len(rest) < 2: raise ValueError("tframe requires <pid> <tid>")
         return {"op": "tframe", "pid": int(rest[0], 0), "tid": int(rest[1], 0)}
+    if op == "arm-phys":
+        # Manually arm a write-only DR watchpoint on a specific physical
+        # address (bypasses cache::insert pre-arm key filter).  Phys is
+        # passed verbatim as a string so the kernel-side parse_u64 sees
+        # the "0x..." prefix.  Requires the kernel built with
+        # --features w215-diag.
+        if not rest: raise ValueError("arm-phys requires <phys>")
+        # Validate parseability host-side and round-trip as canonical hex
+        # so a caller's "0X..." / "29d91000" forms both reach the kernel
+        # as "0x29d91000".
+        phys = int(rest[0], 0)
+        return {"op": "arm-phys", "phys": f"0x{phys:x}"}
     if op == "user-mem":
         if len(rest) < 3: raise ValueError("user-mem requires <pid> <addr> <len>")
         return {"op": "user-mem", "pid": int(rest[0], 0),
@@ -6001,6 +6013,7 @@ def main():
         "dmesg", "syms", "mem", "tframe", "user-mem", "trace-status",
         "bell-stats", "cache-audit", "cache-aliasing", "fault-cache-keys",
         "w215-cache-residency", "tlb-stats", "w215-diag",
+        "arm-phys",
         "coverage-flush", "proc-metrics",
     ])
     p_kdb.add_argument("args", nargs="*",
