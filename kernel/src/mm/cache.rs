@@ -34,19 +34,26 @@ struct PageCacheEntry {
 /// Global page cache.
 static PAGE_CACHE: Mutex<BTreeMap<CacheKey, PageCacheEntry>> = Mutex::new(BTreeMap::new());
 
-/// W215 pre-arm policy: the `(mount, inode)` pair that identifies the
-/// libxul cache key cluster in the Firefox demo run.  Any cache::insert
-/// whose key matches will attempt to arm a hardware DR1/DR2/DR3 watch on
-/// the inserted phys at insert time, so the upstream writer that mutates
-/// the cache-resident frame is caught the moment its store retires.
+/// W215 pre-arm policy: the `(mount, inode)` tuples that identify the
+/// libxul-cluster cache keys in the Firefox demo run.  Any cache::insert
+/// whose key matches one of these will attempt to arm a hardware
+/// DR1/DR2/DR3 watch on the inserted phys at insert time, so the
+/// upstream writer that mutates the cache-resident frame is caught the
+/// moment its store retires.
 ///
 /// The exact `(mount, inode)` values are tuned for the current Firefox
-/// build's libxul; if the disk image changes the values can shift.  Set
-/// to `Some((mount, inode))` to filter, or `None` to disable filtering
-/// entirely (every cache::insert pre-arms — only viable for early-boot
-/// debug because the DR pool is just 3 slots).
+/// build: 0x9b is libxul main; 265 / 283 / 289 are the satellite
+/// libraries (libpng / libcairo-class) loaded through the libxul dlopen
+/// chain that have shown post-hoc CRC mismatches in earlier diagnostic
+/// trials.  An empty slice falls back to "match every insert" — only
+/// viable for early-boot debug because the DR pool is just 3 slots.
 #[cfg(feature = "w215-diag")]
-const W215_PREARM_KEY: Option<(usize, u64)> = Some((4, 0x9b));
+const W215_PREARM_KEYS: &[(usize, u64)] = &[
+    (4, 0x9b),   // libxul main
+    (4, 265),    // satellite library — CRC mismatch in PR #265 trial
+    (4, 283),    // satellite library — CRC mismatch in PR #265 trial
+    (4, 289),    // satellite library — CRC mismatch in PR #265 trial
+];
 
 /// W215 pre-arm cluster-range filter on phys.  Inserts with phys outside
 /// this range are not interesting — the historical fingerprint cluster
@@ -273,9 +280,12 @@ pub fn insert(mount_idx: usize, inode: u64, page_offset: u64, phys: u64) {
         // per fire-and-recycle cycle in steady state.
         #[cfg(feature = "w215-diag")]
         if !PREPOPULATE_ACTIVE.load(Ordering::Acquire) {
-            let want_prearm = match W215_PREARM_KEY {
-                Some((m, i)) => mount_idx == m && inode == i,
-                None => true,
+            let want_prearm = if W215_PREARM_KEYS.is_empty() {
+                true
+            } else {
+                W215_PREARM_KEYS
+                    .iter()
+                    .any(|&(m, i)| mount_idx == m && inode == i)
             };
             if want_prearm
                 && phys >= W215_PREARM_PHYS_LO
