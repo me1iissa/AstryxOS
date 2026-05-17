@@ -3420,23 +3420,55 @@ fn sys_select_linux(
     let nfds = nfds.min(1024) as usize;
     let mut ready = 0i64;
 
+    // When called from kernel-test dispatch (dispatch_linux_kernel / KernelDispatchGuard),
+    // the fd_set pointers may be kernel-resident stack/heap addresses that fail
+    // validate_user_ptr's user-range check (ptr < KERNEL_VIRT_BASE).  In that case
+    // we skip both the range check and the SMAP guard — we are already in ring-0
+    // with full kernel-VA access.  Real user-mode calls always arrive without the
+    // bypass flag and get the full SMAP discipline.
+    //
+    // Intel SDM Vol. 3A §4.6.1: STAC/CLAC (SMAP) guards are only needed when
+    // ring-0 accesses user-mode (below KERNEL_VIRT_BASE) virtual addresses.
+    // Accesses to kernel-mode addresses never require STAC.
+    let kernel_dispatch = crate::syscall::user_ptr_check_bypassed();
+
+    // Read one bit from an fd_set pointer.  Handles both the user-pointer path
+    // (validate + SMAP guard) and the kernel-dispatch bypass path (direct read).
+    // Safety: caller ensures `ptr` is non-null and `ptr + byte_off` is readable.
+    #[inline(always)]
+    fn fdset_read_bit(ptr: u64, byte_off: u64, bit: u8, kernel_dispatch: bool) -> bool {
+        if kernel_dispatch {
+            // Kernel address — no SMAP guard needed; no user-range check.
+            unsafe { *((ptr + byte_off) as *const u8) & bit != 0 }
+        } else {
+            crate::syscall::validate_user_ptr(ptr + byte_off, 1)
+                && unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    *((ptr + byte_off) as *const u8) & bit != 0
+                }
+        }
+    }
+
+    // Clear one bit in an fd_set pointer.
+    // Safety: caller ensures `ptr` is non-null and `ptr + byte_off` is writable.
+    #[inline(always)]
+    fn fdset_clear_bit(ptr: u64, byte_off: u64, bit: u8, kernel_dispatch: bool) {
+        if kernel_dispatch {
+            unsafe { *((ptr + byte_off) as *mut u8) &= !bit; }
+        } else {
+            unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                *((ptr + byte_off) as *mut u8) &= !bit;
+            }
+        }
+    }
+
     for fd in 0..nfds {
         let byte_off = (fd / 8) as u64;
         let bit      = 1u8 << (fd % 8);
 
-        // SMAP-bracketed reads of user fd_set bits.
-        let r_req = readfds  != 0
-            && crate::syscall::validate_user_ptr(readfds  + byte_off, 1)
-            && unsafe {
-                let _g = crate::arch::x86_64::smap::UserGuard::new();
-                *((readfds  + byte_off) as *const u8) & bit != 0
-            };
-        let w_req = writefds != 0
-            && crate::syscall::validate_user_ptr(writefds + byte_off, 1)
-            && unsafe {
-                let _g = crate::arch::x86_64::smap::UserGuard::new();
-                *((writefds + byte_off) as *const u8) & bit != 0
-            };
+        let r_req = readfds  != 0 && fdset_read_bit(readfds,  byte_off, bit, kernel_dispatch);
+        let w_req = writefds != 0 && fdset_read_bit(writefds, byte_off, bit, kernel_dispatch);
 
         if !r_req && !w_req { continue; }
 
@@ -3473,19 +3505,13 @@ fn sys_select_linux(
             if can_read { ready += 1; }
             else {
                 // Clear unready bit
-                unsafe {
-                    let _g = crate::arch::x86_64::smap::UserGuard::new();
-                    *((readfds + byte_off) as *mut u8) &= !bit;
-                }
+                fdset_clear_bit(readfds, byte_off, bit, kernel_dispatch);
             }
         }
         if w_req {
             if can_write { ready += 1; }
             else {
-                unsafe {
-                    let _g = crate::arch::x86_64::smap::UserGuard::new();
-                    *((writefds + byte_off) as *mut u8) &= !bit;
-                }
+                fdset_clear_bit(writefds, byte_off, bit, kernel_dispatch);
             }
         }
     }
@@ -3495,18 +3521,8 @@ fn sys_select_linux(
         for fd in 0..nfds {
             let byte_off = (fd / 8) as u64;
             let bit      = 1u8 << (fd % 8);
-            let r_req = readfds != 0
-                && crate::syscall::validate_user_ptr(readfds + byte_off, 1)
-                && unsafe {
-                    let _g = crate::arch::x86_64::smap::UserGuard::new();
-                    *((readfds + byte_off) as *const u8) & bit != 0
-                };
-            let w_req = writefds != 0
-                && crate::syscall::validate_user_ptr(writefds + byte_off, 1)
-                && unsafe {
-                    let _g = crate::arch::x86_64::smap::UserGuard::new();
-                    *((writefds + byte_off) as *const u8) & bit != 0
-                };
+            let r_req = readfds  != 0 && fdset_read_bit(readfds,  byte_off, bit, kernel_dispatch);
+            let w_req = writefds != 0 && fdset_read_bit(writefds, byte_off, bit, kernel_dispatch);
             if !r_req && !w_req { continue; }
             let revents = crate::syscall::poll_revents(pid, fd, if r_req { 0x0001 } else { 0x0004 });
             // Per POSIX `select(2)`: a hung-up pipe read-end is reported
@@ -3516,17 +3532,11 @@ fn sys_select_linux(
             const READABLE_MASK: u16 = 0x0001 | 0x0010;
             if r_req && revents & READABLE_MASK != 0 { *ready += 1; }
             else if r_req {
-                unsafe {
-                    let _g = crate::arch::x86_64::smap::UserGuard::new();
-                    *((readfds + byte_off) as *mut u8) &= !bit;
-                }
+                fdset_clear_bit(readfds, byte_off, bit, kernel_dispatch);
             }
             if w_req && revents & 0x0004 != 0 { *ready += 1; }
             else if w_req {
-                unsafe {
-                    let _g = crate::arch::x86_64::smap::UserGuard::new();
-                    *((writefds + byte_off) as *mut u8) &= !bit;
-                }
+                fdset_clear_bit(writefds, byte_off, bit, kernel_dispatch);
             }
         }
     };
@@ -3540,8 +3550,8 @@ fn sys_select_linux(
         crate::x11::poll();
         let timeout_ms: i64 = if timeout == 0 {
             -1 // NULL → infinite
-        } else if !crate::syscall::validate_user_ptr(timeout, 16) {
-            -1 // bad pointer — treat as infinite to be conservative
+        } else if !kernel_dispatch && !crate::syscall::validate_user_ptr(timeout, 16) {
+            -1 // bad user pointer — treat as infinite to be conservative
         } else {
             // struct timeval { tv_sec: i64, tv_usec: i64 } on x86_64.
             let (tv_sec, tv_usec) = unsafe {
@@ -4174,12 +4184,22 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
                     && crate::syscall::is_eventfd_fd(pid, fd as usize);
 
     if is_pipe || is_unix || is_inet || is_evfd {
-        if !crate::syscall::validate_user_ptr(buf as u64, count) {
+        // User-pointer check: required for real user-space callers to prevent
+        // ring-0 from writing kernel memory on behalf of a user process (CWE-823).
+        // Bypassed when called from dispatch_linux_kernel (KernelDispatchGuard),
+        // where the caller deliberately passes kernel-resident buffers — the
+        // test_runner pipe write/read path is the canonical example.
+        if !crate::syscall::user_ptr_check_bypassed()
+            && !crate::syscall::validate_user_ptr(buf as u64, count)
+        {
             return -14; // EFAULT
         }
-        // Snapshot the entire buffer to kernel memory under one bracket.
-        // Bracket-scope is tight: STAC fires, the snapshot copies bytes
-        // through `to_vec`, then CLAC fires before any downstream call.
+        // Snapshot the entire buffer to kernel memory.  For user-mode callers,
+        // the SMAP bracket (STAC/CLAC) prevents the copy from trapping on a
+        // user page with CR4.SMAP set.  For kernel-dispatch callers the bracket
+        // is harmless — STAC on an already-kernel-readable address is a no-op.
+        // Intel SDM Vol. 3A §4.6.1: SMAP only restricts supervisor accesses to
+        // user-mode (non-supervisor) pages; kernel pages are always accessible.
         let snapshot: alloc::vec::Vec<u8> = unsafe {
             let _g = crate::arch::x86_64::smap::UserGuard::new();
             core::slice::from_raw_parts(buf_ptr, count).to_vec()
