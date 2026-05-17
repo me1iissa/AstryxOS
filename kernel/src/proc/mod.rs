@@ -1156,6 +1156,21 @@ pub fn exit_thread(exit_code: i64) {
         let _ = crate::signal::kill(parent_pid, crate::signal::SIGCHLD);
     }
 
+    // ── Metrics: clear last-syscall slot when this thread's exit completes
+    //               the process's teardown ────────────────────────────────
+    //
+    // Same rationale as in `exit_group_inner`: exit_thread is `-> !`, so
+    // `proc_metrics::leave_syscall` is never invoked from the normal
+    // syscall-return path.  Without this clear, the dump would report
+    // `STUCK_IN_NR=60@<N>t` (exit) for the now-zombie process every interval
+    // until it is reaped.  Only clear when this thread's exit transitioned
+    // the process to Zombie (`all_dead`); other threads in the same process
+    // may still be alive and their syscall activity will overwrite the slot
+    // normally.
+    if all_dead {
+        proc_metrics::leave_syscall(pid);
+    }
+
     // Yield to scheduler — we're dead, should never return.
     // Wrap in a loop: if the scheduler is disabled (between tests on SMP),
     // schedule() returns early.  Without the loop, exit_thread (which is -> !)
@@ -1578,21 +1593,81 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
 
     // Mark the process as Zombie, record exit code, and re-parent its live children
     // to PID 1 (orphan adoption) so they don't accumulate as un-reapable zombies.
-    let parent_pid = {
+    //
+    // Also collect any of THIS process's own Zombie children: their would-be
+    // reaper (us) is now dying, so re-parenting them to PID 1 only helps if PID 1
+    // is alive and reaping.  When PID 1 is itself the exiting process — common in
+    // the Firefox-on-AstryxOS case where firefox-bin is the only userspace
+    // process — they would orphan to "no one" and leak their PROCESS_TABLE entry
+    // and metrics slot for the rest of the kernel's lifetime.  Reap them inline
+    // before yielding so the table stays bounded.
+    //
+    // Per POSIX wait(2): "If the parent terminates without waiting for the child,
+    // the init process shall inherit the child."  Without a userspace init,
+    // we play that role here for any zombie whose adoptive parent (PID 1) is
+    // itself exiting or already a zombie.
+    let (parent_pid, orphan_zombie_pids): (Pid, alloc::vec::Vec<(Pid, alloc::vec::Vec<Tid>)>) = {
         let mut procs = PROCESS_TABLE.lock();
         let pp = procs.iter().find(|p| p.pid == pid).map(|p| p.parent_pid).unwrap_or(0);
         if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
             proc.state = ProcessState::Zombie;
             proc.exit_code = exit_code as i32;
         }
-        // Orphan adoption: re-parent surviving children to PID 1.
+        // Determine whether the conventional adopter (PID 1) is alive and able
+        // to eventually reap: if PID 1 is the dying process, missing, or itself
+        // a Zombie, downstream zombies will never be reaped through wait4().
+        // In that case promote them to "ready to reap" right here.
+        let pid1_alive = pid != 1 && procs.iter().any(|p|
+            p.pid == 1 && p.state != ProcessState::Zombie);
+        // Re-parent surviving (non-Zombie) children to PID 1.  Their lifecycle
+        // continues normally; PID 1's exit will sweep them via the same path.
         for p in procs.iter_mut() {
             if p.parent_pid == pid && p.state != ProcessState::Zombie {
                 p.parent_pid = 1;
             }
         }
-        pp
+        // Collect Zombie children of the dying PID (and, when PID 1 cannot
+        // reap, Zombie children of PID 1 too — they are about to be doubly
+        // orphaned).  Returned to the caller as (pid, [tid, …]) and removed
+        // from PROCESS_TABLE in the same critical section to keep observers
+        // from racing against half-removed entries.
+        let mut orphans: alloc::vec::Vec<(Pid, alloc::vec::Vec<Tid>)> =
+            alloc::vec::Vec::new();
+        let mut i = 0;
+        while i < procs.len() {
+            let p = &procs[i];
+            let direct_orphan = p.parent_pid == pid && p.state == ProcessState::Zombie;
+            let pid1_orphan = !pid1_alive
+                && p.parent_pid == 1
+                && p.state == ProcessState::Zombie
+                && p.pid != pid;
+            if direct_orphan || pid1_orphan {
+                let cpid = p.pid;
+                let tids = p.threads.clone();
+                procs.swap_remove(i);
+                orphans.push((cpid, tids));
+                continue;
+            }
+            i += 1;
+        }
+        (pp, orphans)
     };
+    // Drop reaped orphans' threads + metrics outside the PROCESS_TABLE lock
+    // (lock order: PROCESS_TABLE then THREAD_TABLE — see waitpid()).
+    if !orphan_zombie_pids.is_empty() {
+        let mut threads = THREAD_TABLE.lock();
+        for (_cpid, tids) in &orphan_zombie_pids {
+            threads.retain(|t| !tids.contains(&t.tid));
+        }
+        drop(threads);
+        for (cpid, _) in &orphan_zombie_pids {
+            proc_metrics::unregister(*cpid);
+            crate::serial_println!(
+                "[PROC] auto-reaped orphan zombie PID {} (parent {} exiting)",
+                cpid, pid
+            );
+        }
+    }
 
     // Switch to the kernel page tables BEFORE freeing user page tables.
     // Only relevant when the caller is on the user CR3 of the dying process —
@@ -1652,6 +1727,25 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
     if parent_pid != 0 {
         let _ = crate::signal::kill(parent_pid, crate::signal::SIGCHLD);
     }
+
+    // ── Metrics: clear the dying process's last-syscall slot ────────────────
+    //
+    // `proc_metrics::leave_syscall` is normally called at the tail of the
+    // syscall dispatcher after the match returns.  exit_group(231) never
+    // returns to the dispatcher (the caller is marked Dead and yields to
+    // `schedule()` below, which never comes back), so the slot's
+    // `last_sc_nr` would remain pinned at 231 long after teardown is
+    // complete.  The periodic dump then reports `STUCK_IN_NR=231@<N>t`
+    // for the exited process every interval until the parent reaps it
+    // (via `waitpid` → `unregister`) — and forever if no one reaps.
+    //
+    // Clear it explicitly here so the diagnostic correctly reflects the
+    // truth: teardown is done; the process is a zombie awaiting reap, not
+    // a thread stuck in a syscall.  Symmetric with `leave_syscall` from
+    // the normal return path.  `proc_metrics::leave_syscall` is wait-free
+    // and takes no locks (one atomic store), so it is safe to invoke even
+    // immediately before `schedule()` switches us off-CPU permanently.
+    proc_metrics::leave_syscall(pid);
 
     // Yield — we're dead and should never return.  Out-of-band callers
     // (yield_self == false) return normally; the caller is a healthy thread
