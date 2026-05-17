@@ -6717,6 +6717,9 @@ def main():
         "arm-phys",
         "coverage-flush", "proc-metrics", "thread-park-audit",
         "futex-ghost-hist",
+        # FUTEX_WAKE cluster-wake compensation (firefox-test/test-mode only).
+        # See subsys/linux/futex_cluster.rs.
+        "futex-stats", "futex-set-cluster-wake",
     ])
     p_kdb.add_argument("args", nargs="*",
                         help="Op-specific positional args: "
