@@ -11,7 +11,11 @@ pub mod refcount;
 pub mod tlb;
 pub mod vma;
 pub mod vmm;
-#[cfg(feature = "firefox-test")]
+// W215 Arm-1 diagnostic (CRC walker + DR plumbing).  Gated behind
+// `w215-diag` (a strict superset of `firefox-test`) so the 2 MiB
+// shadow-table BSS is only present when the diagnostic is requested.
+// See `Cargo.toml` for the underlying PMM-vs-BSS rationale.
+#[cfg(feature = "w215-diag")]
 pub mod w215_crc;
 #[cfg(feature = "firefox-test")]
 pub mod w215_diag;
