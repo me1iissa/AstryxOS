@@ -424,11 +424,24 @@ pub fn alloc_page() -> Option<u64> {
 /// save RBP (LTO / `-fomit-frame-pointer`) this returns 0 — the
 /// `[PMM/PTE-REFS]` line is still useful from the phys + residual count
 /// alone.  Diagnostic-only.
+///
+/// Defensive range check: kernel stacks live in the higher-half
+/// direct-map at `[KERNEL_VIRT_OFFSET, KERNEL_VIRT_OFFSET + 4 GiB)`
+/// (see `kernel/src/proc/mod.rs::alloc_kernel_stack` and
+/// `mm/pmm.rs::MAX_PAGES`).  A bare "higher-half" check accepts any
+/// VA ≥ 0xFFFF_8000_0000_0000 — including unmapped holes between the
+/// direct map, the kernel heap, and per-CPU regions.  If bookkeeping
+/// corruption ever placed RBP into one of those holes, the
+/// `read_volatile` below would page-fault in kernel mode (likely
+/// fatal during a diagnostic that exists to AID triage of a separate
+/// fault).  Restricting RBP to the direct-map range keeps the read
+/// safe: every address in `[KERNEL_VIRT_OFFSET, +4 GiB)` is mapped by
+/// the higher-half PML4 entries set up at boot.
 #[inline(never)]
 fn caller_rip() -> u64 {
     let rbp: u64;
     // SAFETY: reading the frame pointer is always safe; the subsequent
-    // dereference is guarded by alignment + higher-half checks below.
+    // dereference is guarded by alignment + range checks below.
     unsafe {
         core::arch::asm!(
             "mov {}, rbp",
@@ -436,11 +449,21 @@ fn caller_rip() -> u64 {
             options(nomem, nostack, preserves_flags),
         );
     }
-    if rbp == 0 || (rbp & 7) != 0 || rbp < 0xFFFF_8000_0000_0000 {
+    // Direct-map bounds: 4 GiB of physical RAM identity-mapped into
+    // the higher half (MAX_PAGES * PAGE_SIZE = 4 GiB).
+    const DIRECT_MAP_BASE: u64 = crate::proc::KERNEL_VIRT_OFFSET;
+    const DIRECT_MAP_END:  u64 = DIRECT_MAP_BASE + (MAX_PAGES * PAGE_SIZE) as u64;
+    if rbp == 0
+        || (rbp & 7) != 0
+        || rbp < DIRECT_MAP_BASE
+        || rbp.saturating_add(8) >= DIRECT_MAP_END
+    {
         return 0;
     }
     // [rbp+8] = saved return address into `free_page`'s caller.
-    // SAFETY: rbp has passed the higher-half + alignment guard above.
+    // SAFETY: rbp + 8 has passed the direct-map range + alignment
+    // guard above; the entire direct-map window is mapped via the
+    // higher-half PML4 entries.
     unsafe { core::ptr::read_volatile((rbp + 8) as *const u64) }
 }
 
