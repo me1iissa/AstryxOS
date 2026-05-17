@@ -42,30 +42,82 @@ const WALK_BUDGET_PER_TICK: usize = 4096;
 
 /// One entry in the shadow CRC table.  `phys == 0` means "free slot"
 /// (PMM never hands out phys=0 on AstryxOS — see `pmm::init`).
+///
+/// Layout (default `repr(Rust)` lets the compiler order fields to minimise
+/// padding): three u64-sized buckets totalling 24 bytes.  `crc32` and
+/// `gen_ws` share a u64-aligned pair so the bool-vs-counter discrimination
+/// must use a single u32 with a flag bit rather than a separate `bool`
+/// field — adding a trailing `bool` re-pads the struct to 32 bytes and
+/// pushes `.bss` past `BOOT_INFO_PHYS_BASE = 0x700000`, corrupting the
+/// bootloader handoff page during `_start` BSS zeroing.  Cite System V
+/// AMD64 ABI §3.1.2 (aggregate alignment) and Intel SDM Vol. 3A §2.5
+/// (page-table identity-mapped low memory used for boot info).
 #[derive(Copy, Clone)]
 struct CrcEntry {
     phys: u64,
-    crc32: u32,
-    /// Cache-key fingerprint: `inode << 32 | (offset >> 12)` truncated to
-    /// 64 bits.  Diagnostic only; the writer-discrimination evidence is
-    /// the kernel RIP, not the key.
+    /// Cache-key fingerprint: `inode << 16 | (offset >> 12) & 0xFFFF`.
+    /// Diagnostic only; the writer-discrimination evidence is the kernel
+    /// RIP, not the key.
     key_packed: u64,
-    /// Generation stamp incremented every time the CRC is re-recorded.
-    /// Used as a coarse staleness signal in the report.
-    generation: u32,
-    /// True when the page was inserted under a MAP_SHARED + PROT_WRITE mapping
-    /// (e.g. a writable mmap of cookies.sqlite or a SQLite WAL file).  Per
-    /// POSIX mmap(2), MAP_SHARED writes are immediately visible to all other
-    /// mappings of the same file, so CRC mutations on this frame are expected
-    /// and legitimate.  The walker skips CRC-MISMATCH emission for these
-    /// entries to suppress the 21-50 false-positive lines per firefox-test trial
-    /// produced by SQLite WAL/journal writes.
-    writable_shared: bool,
+    crc32: u32,
+    /// Packed `(generation: 31 bits, writable_shared: 1 bit)`.
+    ///
+    /// - Bit 31 (`WS_BIT`): `writable_shared`.  Set when the page was
+    ///   inserted under a MAP_SHARED + PROT_WRITE mapping (e.g. a writable
+    ///   mmap of cookies.sqlite or a SQLite WAL file).  Per POSIX mmap(2),
+    ///   MAP_SHARED writes are immediately visible to all other mappings of
+    ///   the same file, so CRC mutations on this frame are expected and
+    ///   legitimate.  The walker skips CRC-MISMATCH emission for entries
+    ///   with this bit set to suppress the 21-50 false-positive lines per
+    ///   firefox-test trial produced by SQLite WAL/journal writes.
+    /// - Bits 0..31 (`GEN_MASK`): generation counter incremented every time
+    ///   the CRC is re-recorded.  Used as a coarse staleness signal in the
+    ///   report; saturates rather than overflowing into the WS bit.
+    gen_ws: u32,
 }
+
+/// Mask covering the 31-bit generation counter in `CrcEntry::gen_ws`.
+const GEN_MASK: u32 = 0x7FFF_FFFF;
+/// Bit position of the `writable_shared` flag in `CrcEntry::gen_ws`.
+const WS_BIT: u32 = 1 << 31;
 
 impl CrcEntry {
     const fn empty() -> Self {
-        Self { phys: 0, crc32: 0, key_packed: 0, generation: 0, writable_shared: false }
+        Self { phys: 0, key_packed: 0, crc32: 0, gen_ws: 0 }
+    }
+
+    /// Returns the 31-bit generation counter.
+    #[inline]
+    fn generation(&self) -> u32 {
+        self.gen_ws & GEN_MASK
+    }
+
+    /// Returns `true` if the `writable_shared` flag is set.
+    #[inline]
+    fn writable_shared(&self) -> bool {
+        (self.gen_ws & WS_BIT) != 0
+    }
+
+    /// Sets the `writable_shared` flag.
+    #[inline]
+    fn set_writable_shared(&mut self) {
+        self.gen_ws |= WS_BIT;
+    }
+
+    /// Increments the 31-bit generation counter, saturating before it
+    /// would touch the `writable_shared` bit.
+    #[inline]
+    fn bump_generation(&mut self) {
+        let gen = self.gen_ws & GEN_MASK;
+        let next = if gen == GEN_MASK { gen } else { gen + 1 };
+        self.gen_ws = (self.gen_ws & WS_BIT) | next;
+    }
+
+    /// Build a fresh `gen_ws` value with `generation = 1` and the optional
+    /// `writable_shared` flag baked in.
+    #[inline]
+    fn pack_initial(writable_shared: bool) -> u32 {
+        if writable_shared { WS_BIT | 1 } else { 1 }
     }
 }
 
@@ -186,8 +238,7 @@ pub fn record_insert(phys: u64, inode: u64, file_offset: u64, writable_shared: b
                 phys,
                 crc32: crc,
                 key_packed,
-                generation: 1,
-                writable_shared,
+                gen_ws: CrcEntry::pack_initial(writable_shared),
             };
             LIVE_COUNT.fetch_add(1, Ordering::Relaxed);
             STAT_INSERTS.fetch_add(1, Ordering::Relaxed);
@@ -196,10 +247,12 @@ pub fn record_insert(phys: u64, inode: u64, file_offset: u64, writable_shared: b
         if e.phys == phys && e.key_packed == key_packed {
             // Refresh in place — same key, same phys.
             e.crc32 = crc;
-            e.generation = e.generation.wrapping_add(1);
+            e.bump_generation();
             // Propagate writable_shared in case the mapping changed (e.g.
             // an initially read-only mapping was re-mmap'd as MAP_SHARED+RW).
-            e.writable_shared |= writable_shared;
+            if writable_shared {
+                e.set_writable_shared();
+            }
             STAT_INSERTS.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -224,7 +277,7 @@ pub fn mark_writable_shared(phys: u64) {
     if let Some(mut table) = CRC_TABLE.try_lock() {
         for e in table.entries.iter_mut() {
             if e.phys == phys {
-                e.writable_shared = true;
+                e.set_writable_shared();
             }
         }
     }
@@ -332,7 +385,7 @@ pub fn crc_walk_tick(_cpu: u32) {
                     && snap.phys <= 0x4_0000_0000
                     && (snap.phys & 0xFFF) == 0
                 {
-                    buf[n] = (snap.phys, snap.crc32, snap.key_packed, snap.writable_shared);
+                    buf[n] = (snap.phys, snap.crc32, snap.key_packed, snap.writable_shared());
                     n += 1;
                 }
             }
@@ -396,7 +449,7 @@ pub fn crc_walk_tick(_cpu: u32) {
                     for e in table.entries.iter_mut() {
                         if e.phys == phys {
                             e.crc32 = actual2;
-                            e.generation = e.generation.wrapping_add(1);
+                            e.bump_generation();
                         }
                     }
                 }
