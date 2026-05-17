@@ -497,6 +497,18 @@ extern "C" fn timer_tick() {
     // ring is empty (a single atomic load that fast-paths out).
     crate::mm::tlb::on_cpu_tick(tick);
 
+    // W215 Arm-1 diagnostic: cheap fast-path that re-syncs this CPU's
+    // DR0–DR3 + DR7 from the global publish state if another CPU armed
+    // (or disarmed) a watchpoint since this CPU last looked.  Replaces
+    // the prior IPI-based cross-CPU sync, which deadlocked under ISR-to-
+    // ISR LAPIC contention (originator's `[W215/DR-ARM]` line never
+    // emitted).  See `debug_reg.rs` module-level docs.  Fast path is two
+    // atomic loads + compare; slow path is bounded by `program_local_drs`
+    // (≤ 4 DR writes + 1 DR7 write).  Must run BEFORE the CRC walker so
+    // a peer-CPU arm propagates before this CPU re-evaluates the cache.
+    #[cfg(feature = "w215-diag")]
+    crate::arch::x86_64::debug_reg::apply_pending_if_stale();
+
     // Per-process activity-metrics dump.  Wait-free fast path: one
     // atomic load + a saturating subtract; only the CPU whose tick
     // crosses the boundary CAS-claims the publish slot and emits.  See
