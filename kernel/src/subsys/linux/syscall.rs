@@ -6051,6 +6051,18 @@ fn sys_rt_sigprocmask_linux(how: u64, set: u64, oldset: u64, _sigsetsize: u64) -
     0
 }
 
+/// FUTEX_WAKE_GHOST emission counter — incremented every time the
+/// `[FUTEX_WAKE_GHOST]` diagnostic fires.  Used by the in-kernel test
+/// harness (Test 238) to assert the diagnostic is reachable without
+/// having to grep the serial transcript from inside the kernel.  Compiled
+/// under both `firefox-test` (where the diagnostic is exercised against
+/// real userspace) and `test-mode` (where Test 238 drives it with a
+/// synthetic waiter).  Both features are diagnostic-only configurations
+/// and the 8-byte atomic has no cost on the default build.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+pub(crate) static FUTEX_WAKE_GHOST_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// futex — Wait/Wake/Requeue implementation for musl/pthread compatibility.
 ///
 /// Supported ops (op numbers per `futex(2)` Linux man-page and UAPI header):
@@ -6378,6 +6390,62 @@ pub fn sys_futex_linux(
                 "[FUTEX_WAKE] tid={} pid={} uaddr={:#x} woken={} max={} op={:#x}",
                 crate::proc::current_tid(), pid, uaddr, woken, val, futex_op
             );
+
+            // [FUTEX_WAKE_GHOST] diagnostic — issued only when this WAKE
+            // returned woken=0 yet another uaddr within the same 256-byte
+            // cluster has parked waiters.  The shape is the typical "signal
+            // posted to the wrong cond_var inside an enclosing object"
+            // pattern: e.g. a Mozilla `Monitor` containing two
+            // `pthread_cond_t` fields (each 48 bytes, so two fit in 256
+            // bytes); the signaler updates and wakes field A while the
+            // waiter is parked on field B.  Per POSIX
+            // pthread_cond_signal(3p) "If no threads are blocked on the
+            // condition variable, then pthread_cond_signal() shall have no
+            // effect."  A genuine woken=0 with no nearby waiters is normal.
+            // A woken=0 with nearby waiters is the diagnostic of interest.
+            //
+            // The cluster window is fixed at 256 bytes — wide enough to
+            // span a small composite locking object holding multiple
+            // condvar fields, narrow enough to avoid picking up unrelated
+            // futexes in the same page.  Lookup is a bounded BTreeMap
+            // range query; we hold FUTEX_WAITERS for the scan only, so the
+            // critical section stays short.
+            //
+            // Compiled under `firefox-test` (the primary consumer — the
+            // demo path drives this against real userspace) and under
+            // `test-mode` (where Test 238 exercises it with a synthetic
+            // waiter so the diagnostic can be verified deterministically
+            // in CI).  The FUTEX_WAITERS scan and the per-event serial
+            // output are diagnostic-only — the default build pays no
+            // overhead.
+            #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+            if woken == 0 && (op == 1 || op == 10) {
+                const FUTEX_GHOST_CLUSTER: u64 = 256;
+                let cluster_lo = uaddr & !(FUTEX_GHOST_CLUSTER - 1);
+                let cluster_hi = cluster_lo + FUTEX_GHOST_CLUSTER;
+                let waiters = crate::syscall::FUTEX_WAITERS.lock();
+                // BTreeMap::range over the half-open [(pid, cluster_lo),
+                // (pid, cluster_hi)) interval lets us find sibling uaddrs
+                // in O(log n + k) without scanning the whole table.
+                for (&(wpid, wuaddr), tids) in waiters
+                    .range((pid, cluster_lo)..(pid, cluster_hi))
+                {
+                    if wpid != pid || wuaddr == uaddr { continue; }
+                    if let Some(&first_tid) = tids.first() {
+                        crate::serial_println!(
+                            "[FUTEX_WAKE_GHOST] tid={} pid={} caller_uaddr={:#x} \
+                             sibling_uaddr={:#x} sibling_tid={} sibling_count={} \
+                             cluster_lo={:#x} cluster_hi={:#x}",
+                            crate::proc::current_tid(), pid, uaddr,
+                            wuaddr, first_tid, tids.len(),
+                            cluster_lo, cluster_hi
+                        );
+                        FUTEX_WAKE_GHOST_COUNT.fetch_add(
+                            1, core::sync::atomic::Ordering::Relaxed
+                        );
+                    }
+                }
+            }
 
             woken as i64
         }
