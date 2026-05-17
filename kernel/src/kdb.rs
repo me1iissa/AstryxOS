@@ -356,6 +356,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "w215-cache-residency" => op_w215_cache_residency(out),
         "tlb-stats"        => op_tlb_stats(out),
         "w215-diag"        => op_w215_diag(out),
+        "arm-phys"         => op_arm_phys(req, out),
         "coverage-flush" => op_coverage_flush(out),
         "proc-metrics"   => op_proc_metrics(out),
         _ => {
@@ -1026,6 +1027,71 @@ fn op_w215_diag(out: &mut String) {
     #[cfg(not(feature = "firefox-test"))]
     {
         out.push_str(r#"{"error":"w215-diag requires firefox-test feature"}"#);
+    }
+}
+
+// ── arm-phys ─────────────────────────────────────────────────────────────────
+//
+// Manually arm a write-only hardware watchpoint on a specific physical
+// address, bypassing the cache::insert pre-arm key filter.  Used when the
+// CRC walker has identified a corrupted phys (W215 saga) and the caller
+// wants to catch the next write to it irrespective of cache-key heuristics.
+//
+// Request:   {"op":"arm-phys","phys":"0x29d91000"}   (hex or decimal)
+// Response:  {"armed":true,"slot":N}                       on success
+//            {"armed":false,"error":"<reason>"}            otherwise
+//
+// Reasons: "not_aligned" (phys not 4 KiB-aligned),
+//          "out_of_range" (phys >= installed RAM top),
+//          "pool_exhausted" (all four DR slots busy),
+//          "missing_phys" (no phys field in request),
+//          "bad_phys" (phys field not parseable as u64),
+//          "requires_w215_diag" (kernel built without --features w215-diag).
+//
+// Requires: --features w215-diag.
+
+fn op_arm_phys(req: &str, out: &mut String) {
+    #[cfg(feature = "w215-diag")]
+    {
+        use core::fmt::Write;
+        let phys_str = match extract_field(req, "phys") {
+            Some(v) => v,
+            None => {
+                out.push_str(r#"{"armed":false,"error":"missing_phys"}"#);
+                return;
+            }
+        };
+        let phys = match parse_u64(&phys_str) {
+            Some(v) => v,
+            None => {
+                out.push_str(r#"{"armed":false,"error":"bad_phys"}"#);
+                return;
+            }
+        };
+        use crate::arch::x86_64::debug_reg::{arm_phys_watchpoint, ArmPhysResult};
+        match arm_phys_watchpoint(phys) {
+            ArmPhysResult::Armed(slot) => {
+                let _ = write!(
+                    out,
+                    r#"{{"armed":true,"slot":{},"phys":"{:#x}"}}"#,
+                    slot, phys,
+                );
+            }
+            ArmPhysResult::NotAligned => {
+                out.push_str(r#"{"armed":false,"error":"not_aligned"}"#);
+            }
+            ArmPhysResult::OutOfRange => {
+                out.push_str(r#"{"armed":false,"error":"out_of_range"}"#);
+            }
+            ArmPhysResult::PoolExhausted => {
+                out.push_str(r#"{"armed":false,"error":"pool_exhausted"}"#);
+            }
+        }
+    }
+    #[cfg(not(feature = "w215-diag"))]
+    {
+        let _ = req;
+        out.push_str(r#"{"armed":false,"error":"requires_w215_diag"}"#);
     }
 }
 
