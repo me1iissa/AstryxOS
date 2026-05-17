@@ -359,6 +359,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "arm-phys"         => op_arm_phys(req, out),
         "coverage-flush" => op_coverage_flush(out),
         "proc-metrics"   => op_proc_metrics(out),
+        "thread-park-audit" => op_thread_park_audit(req, out),
         _ => {
             out.push_str(r#"{"error":"unknown op: "#);
             for c in op.chars().take(64) {
@@ -1797,4 +1798,557 @@ fn op_proc_metrics(out: &mut String) {
     }
     out.push(']');
     out.push('}');
+}
+
+// ── thread-park-audit ────────────────────────────────────────────────────────
+//
+// PNG-1 plateau characterisation (post-W215-closure).  For every thread
+// currently in the THREAD_TABLE that is not Dead, emit:
+//
+//   { tid, pid, name, state, rip, rsp, wake_tick,
+//     syscall: { nr, name, arg0 } | null,
+//     blocked_for_ticks,                 // tick_now - last_syscall_tick
+//     wait: { kind, ... }                // classification (best effort)
+//   }
+//
+// `kind` is one of:
+//   "futex"          → uaddr resolved from FUTEX_WAITERS reverse lookup
+//   "poll-bell"      → last syscall was poll/ppoll/epoll_wait/select; the
+//                      thread is parked on the global POLL_BELL.  arg0 is
+//                      the fd-array pointer (poll) or epfd (epoll_wait).
+//   "vfork-complete" → vfork_parent_tid is set; child waits for execve/exit
+//   "sleep"          → sleeping with finite wake_tick (nanosleep/clock_nanosleep)
+//   "fd-blocked"     → last syscall is a blocking fd op (read/recvmsg/sendmsg/
+//                      pread/preadv/accept) and the thread is Blocked.  arg0
+//                      is the fd; we resolve the FD via the process table and
+//                      walk the unix-socket snapshot to find the peer.
+//   "unknown"        → no classifier matched.
+//
+// Per-thread `last_syscall_*` comes from `proc::sample::read_sample(tid)`
+// (firefox-test only; populated on every syscall dispatch entry).  For
+// non-firefox-test builds the syscall field is `null` and `wait.kind` is
+// always "unknown" — the op stays usable but degraded.
+//
+// Optional pid filter: `{"op":"thread-park-audit","pid":N}`.  pid=0 (or
+// omitted) means all PIDs.
+//
+// References:
+//   - POSIX `poll(2)` and `epoll_wait(2)` for wait semantics
+//   - `man 2 futex` for FUTEX_WAIT registration
+//   - Intel SDM Vol 3A §8.2.3 (total store order for in-cache writes)
+//     justifies the read-back order in `sample::read_sample`.
+
+// Linux syscall numbers we classify (x86_64).  Kept inline rather than
+// imported from subsys/linux/syscall.rs to avoid a kdb→subsys dependency
+// for what is, fundamentally, a diagnostic-side lookup table.
+const NR_READ:        u64 = 0;
+const NR_POLL:        u64 = 7;
+const NR_PREAD64:     u64 = 17;
+const NR_PREADV:      u64 = 295;
+const NR_NANOSLEEP:   u64 = 35;
+const NR_CLOCK_NANOSLEEP: u64 = 230;
+const NR_RECVMSG:     u64 = 47;
+const NR_SENDMSG:     u64 = 46;
+const NR_RECVFROM:    u64 = 45;
+const NR_ACCEPT:      u64 = 43;
+const NR_ACCEPT4:     u64 = 288;
+const NR_SELECT:      u64 = 23;
+const NR_PSELECT6:    u64 = 270;
+const NR_PPOLL:       u64 = 271;
+const NR_EPOLL_WAIT:  u64 = 232;
+const NR_EPOLL_PWAIT: u64 = 281;
+const NR_FUTEX:       u64 = 202;
+
+fn is_poll_family(nr: u64) -> bool {
+    matches!(nr, NR_POLL | NR_PPOLL | NR_SELECT | NR_PSELECT6
+                | NR_EPOLL_WAIT | NR_EPOLL_PWAIT)
+}
+fn is_fd_blocking(nr: u64) -> bool {
+    matches!(nr, NR_READ | NR_PREAD64 | NR_PREADV | NR_RECVMSG
+                | NR_RECVFROM | NR_ACCEPT | NR_ACCEPT4 | NR_SENDMSG)
+}
+
+fn op_thread_park_audit(req: &str, out: &mut String) {
+    use core::fmt::Write;
+
+    let pid_filter: u64 = extract_field(req, "pid")
+        .and_then(|s| parse_u64(&s))
+        .unwrap_or(0);
+
+    let tick_now = crate::arch::x86_64::irq::get_ticks();
+    let sc_total = crate::syscall::syscall_count();
+
+    // ── Stage 1: snapshot all live threads of interest ─────────────────
+    struct ThreadSnap {
+        tid: u64, pid: u64, name: String,
+        state: &'static str, rip: u64, rsp: u64,
+        wake_tick: u64, clear_child_tid: u64,
+        vfork_parent_tid: Option<u64>,
+    }
+    let thread_snaps: Vec<ThreadSnap> = match try_lock_brief(&THREAD_TABLE) {
+        Some(tt) => tt.iter()
+            .filter(|t| t.state != crate::proc::ThreadState::Dead)
+            .filter(|t| pid_filter == 0 || t.pid == pid_filter)
+            .map(|t| ThreadSnap {
+                tid: t.tid, pid: t.pid,
+                name: {
+                    let end = t.name.iter().position(|&b| b == 0).unwrap_or(t.name.len());
+                    String::from_utf8_lossy(&t.name[..end]).into_owned()
+                },
+                state: thread_state_str(t.state),
+                rip: t.user_entry_rip, rsp: t.context.rsp,
+                wake_tick: t.wake_tick,
+                clear_child_tid: t.clear_child_tid,
+                vfork_parent_tid: t.vfork_parent_tid,
+            }).collect(),
+        None => {
+            out.push_str(r#"{"busy":"THREAD_TABLE held","threads":[]}"#);
+            return;
+        }
+    };
+
+    // ── Stage 2: snapshot the per-PID process names + FD tables ────────
+    // Only fetch what we need for "fd-blocked" peer resolution.  Note we
+    // intentionally do NOT honour `pid_filter` here — when one thread is
+    // blocked on a socket, its peer process can be ANY pid, and the FD
+    // tables of those peer pids are needed to render the (peer_pid, peer_fd)
+    // tuple even when the caller filtered the thread view to one pid.
+    // Tuple shape: (pid, proc_name, fds[(fd, file_type, inode, flags, path)]).
+    let proc_snaps: Vec<ProcFdRow> = match try_lock_brief(&PROCESS_TABLE) {
+        Some(pt) => pt.iter()
+            .map(|p| (
+                p.pid,
+                proc_name_string(&p.name),
+                p.file_descriptors.iter().enumerate()
+                    .filter_map(|(i, fd)| fd.as_ref().map(|fd|
+                        (i, fd.file_type, fd.inode, fd.flags, fd.open_path.clone())))
+                    .collect::<Vec<_>>(),
+            )).collect(),
+        None => Vec::new(), // best-effort: emit per-thread state without FD resolution
+    };
+
+    // ── Stage 3: snapshot FUTEX waiters (for futex reverse-lookup) ─────
+    // Map tid → (pid, uaddr) so the per-thread emit can answer "this TID
+    // is waiting on which futex".  Best-effort: a long-held FUTEX_WAITERS
+    // (e.g. mid-FUTEX_WAKE across a busy contentproc) is common under
+    // Firefox load; rather than block the kdb listener thread we fall
+    // back to the empty map so "wait.kind":"futex" classification is
+    // skipped on contention but every other field still surfaces.  The
+    // try_lock_brief discipline matches op_proc_list / op_fd_map.
+    let mut tid_to_futex: alloc::collections::BTreeMap<u64, (u64, u64)> =
+        alloc::collections::BTreeMap::new();
+    let futex_busy = match try_lock_brief(&crate::syscall::FUTEX_WAITERS) {
+        Some(waiters) => {
+            for ((pid_k, uaddr), tids) in waiters.iter() {
+                for tid in tids {
+                    tid_to_futex.insert(*tid, (*pid_k, *uaddr));
+                }
+            }
+            false
+        }
+        None => true,
+    };
+
+    // ── Stage 4: snapshot unix sockets (for fd-blocked peer lookup) ────
+    let sock_snaps = crate::net::unix::snapshot_all();
+
+    // ── Stage 5: emit JSON ─────────────────────────────────────────────
+    out.push('{');
+    let _ = write!(out, r#""tick":{},"sc_total":{},"pid_filter":{},"#,
+                   tick_now, sc_total, pid_filter);
+    if futex_busy {
+        out.push_str(r#""futex_waiters_busy":true,"#);
+    }
+    out.push_str(r#""threads":["#);
+
+    // Emission budget: each thread renders ~250-450 B of JSON; cap at
+    // 24 KB so the full envelope (including overhead) clears the 32 KB
+    // kernel-side MAX_RESP_BYTES truncation threshold.  If we hit the cap
+    // we emit `truncated_at_thread:N` and stop — the caller can re-issue
+    // with `--pid N` for a narrower view.
+    //
+    // Additionally, every per-thread record is mirrored to the serial log
+    // as `[THREAD-PARK]` so the harness can recover from a TCP send-buffer
+    // stall (rare but observed: the in-kernel TCP stack drains the
+    // response over multiple pump ticks via tcp_timer_tick, and a kdb
+    // response > 1 MSS may not fully arrive before the host's recv
+    // deadline expires).  Serial is unconditionally drained on each
+    // emission, so the lines reach the harness even if the JSON envelope
+    // is truncated mid-flight.  The serial format mirrors the JSON shape
+    // 1:1 so the harness can synthesise the response from serial alone.
+    const EMIT_BUDGET_BYTES: usize = 24 * 1024;
+    let mut first = true;
+    let mut emitted = 0usize;
+    let mut truncated_at: Option<u64> = None;
+    let audit_id = tick_now;  // marker so harness can scope its parse
+    crate::serial_println!("[THREAD-PARK] BEGIN audit_id={} tick={} sc_total={} pid_filter={} threads={}",
+                            audit_id, tick_now, sc_total, pid_filter, thread_snaps.len());
+    for ts in &thread_snaps {
+        if out.len() > EMIT_BUDGET_BYTES {
+            truncated_at = Some(ts.tid);
+            // Still emit the remaining threads to serial for harness recovery.
+            // (we just skip pushing into `out`).
+        }
+        let in_budget = out.len() <= EMIT_BUDGET_BYTES;
+        if in_budget {
+            if !first { out.push(','); }
+            first = false;
+            emitted += 1;
+        }
+
+        // Per-thread sample lookup (firefox-test only).
+        #[cfg(feature = "firefox-test")]
+        let sample = crate::proc::sample::read_sample(ts.tid);
+        #[cfg(not(feature = "firefox-test"))]
+        let sample: Option<crate::proc::sample::TidSyscallSample> = None;
+
+        // Resolve owning process name (lookup in proc_snaps).
+        let proc_name = proc_snaps.iter().find(|(p, _, _)| *p == ts.pid)
+            .map(|(_, n, _)| n.as_str()).unwrap_or("?");
+
+        let (nr_opt, arg0_opt, blocked_for) = match &sample {
+            Some(s) => (Some(s.last_syscall_nr), Some(s.last_syscall_arg0),
+                        tick_now.saturating_sub(s.last_syscall_tick)),
+            None => (None, None, 0u64),
+        };
+
+        // ── JSON emission (budget-gated) ─────────────────────────────
+        if in_budget {
+            out.push('{');
+            j_kv(out, "tid", &alloc::format!("{}", ts.tid));
+            j_kv(out, "pid", &alloc::format!("{}", ts.pid));
+            j_kv_str(out, "proc_name", proc_name);
+            j_kv_str(out, "thread_name", &ts.name);
+            j_kv_str(out, "state", ts.state);
+            j_str(out, "rip"); out.push(':'); j_hex(out, ts.rip); out.push(',');
+            j_str(out, "rsp"); out.push(':'); j_hex(out, ts.rsp); out.push(',');
+            let _ = write!(out, r#""wake_tick":{},"#, ts.wake_tick);
+            let _ = write!(out, r#""blocked_for_ticks":{},"#, blocked_for);
+            match (nr_opt, arg0_opt) {
+                (Some(nr), Some(arg0)) => {
+                    out.push_str(r#""syscall":{"#);
+                    let _ = write!(out, r#""nr":{},"#, nr);
+                    j_kv_str(out, "name", crate::perf::linux_syscall_name(nr));
+                    j_str(out, "arg0"); out.push(':'); j_hex(out, arg0);
+                    out.push_str("},");
+                }
+                _ => {
+                    out.push_str(r#""syscall":null,"#);
+                }
+            }
+            out.push_str(r#""wait":"#);
+            emit_wait_classification(
+                out,
+                ts.tid, ts.pid, ts.wake_tick,
+                ts.clear_child_tid, ts.vfork_parent_tid,
+                sample.as_ref(),
+                &tid_to_futex, &proc_snaps, &sock_snaps,
+            );
+            out.push('}');
+        }
+
+        // ── Serial-log mirror (always emitted; harness fallback) ────
+        // Single line per thread.  Keys are stable so the harness regex
+        // is also stable.  Wait classification is rendered as a compact
+        // `wait=KIND[,kv]*` suffix; the harness parses it into the same
+        // shape it would synthesise from the JSON path.
+        let (sn, sa0): (i64, u64) = match (nr_opt, arg0_opt) {
+            (Some(n), Some(a)) => (n as i64, a),
+            _                  => (-1, 0),
+        };
+        let mut wait_buf = String::with_capacity(96);
+        render_wait_compact(&mut wait_buf,
+                            ts.tid, ts.pid, ts.wake_tick,
+                            ts.clear_child_tid, ts.vfork_parent_tid,
+                            sample.as_ref(),
+                            &tid_to_futex, &proc_snaps, &sock_snaps);
+        crate::serial_println!(
+            "[THREAD-PARK] id={} tid={} pid={} pname={} tname={} state={} \
+             rip={:#x} rsp={:#x} wake_tick={} blocked_for={} sc_nr={} sc_arg0={:#x} {}",
+            audit_id, ts.tid, ts.pid, proc_name, ts.name, ts.state,
+            ts.rip, ts.rsp, ts.wake_tick, blocked_for, sn, sa0, wait_buf,
+        );
+    }
+    crate::serial_println!("[THREAD-PARK] END audit_id={} emitted_json={} threads_total={}",
+                            audit_id, emitted, thread_snaps.len());
+    out.push(']');
+    let _ = write!(out, r#","emitted":{}"#, emitted);
+    if let Some(tid) = truncated_at {
+        let _ = write!(out, r#","truncated_at_tid":{}"#, tid);
+    }
+    out.push('}');
+}
+
+// Concrete shape mirrored from op_thread_park_audit's local `ProcFdSnap`.
+// Kept module-private; the op_thread_park_audit function builds a Vec of
+// these and passes it by reference to emit_wait_classification.
+type ProcFdRow = (u64, String, Vec<(usize, crate::vfs::FileType, u64, u32, String)>);
+
+
+/// Emit the `"wait":{...}` object for one thread.  Best-effort classifier;
+/// see the op_thread_park_audit doc-comment for the kind taxonomy.
+///
+/// `proc_snaps` is a parallel slice of `(pid, name, fds)` per Stage 2 of
+/// op_thread_park_audit.  Passed as primitive references rather than via
+/// a trait so the function-local snapshot structs can stay encapsulated.
+#[allow(clippy::too_many_arguments)]
+fn emit_wait_classification(
+    out: &mut String,
+    tid: u64,
+    pid: u64,
+    wake_tick: u64,
+    clear_child_tid: u64,
+    vfork_parent_tid: Option<u64>,
+    sample: Option<&crate::proc::sample::TidSyscallSample>,
+    tid_to_futex: &alloc::collections::BTreeMap<u64, (u64, u64)>,
+    proc_snaps: &[ProcFdRow],
+    sock_snaps: &[crate::net::unix::SocketSnap],
+) {
+    use core::fmt::Write;
+
+    // 1. Futex: highest-confidence — direct reverse lookup from the
+    //    kernel's wait queue.
+    if let Some((futex_pid, uaddr)) = tid_to_futex.get(&tid).copied() {
+        out.push('{');
+        j_kv_str(out, "kind", "futex");
+        let _ = write!(out, r#""pid":{},"#, futex_pid);
+        j_str(out, "uaddr"); out.push(':'); j_hex(out, uaddr);
+        out.push('}');
+        return;
+    }
+
+    // 2. vfork-complete: child blocked until execve/exit wakes parent.
+    if let Some(parent_tid) = vfork_parent_tid {
+        out.push('{');
+        j_kv_str(out, "kind", "vfork-complete");
+        let _ = write!(out, r#""parent_tid":{}"#, parent_tid);
+        out.push('}');
+        return;
+    }
+
+    // 3/4/5. Sample-driven classifications (require firefox-test).
+    if let Some(s) = sample {
+        let nr = s.last_syscall_nr;
+        let arg0 = s.last_syscall_arg0;
+        if matches!(nr, NR_NANOSLEEP | NR_CLOCK_NANOSLEEP)
+            && wake_tick != u64::MAX && wake_tick != 0 {
+            out.push('{');
+            j_kv_str(out, "kind", "sleep");
+            let _ = write!(out, r#""wake_tick":{}"#, wake_tick);
+            out.push('}');
+            return;
+        }
+        if is_poll_family(nr) {
+            out.push('{');
+            j_kv_str(out, "kind", "poll-bell");
+            let _ = write!(out, r#""nr":{},"#, nr);
+            j_str(out, "arg0"); out.push(':'); j_hex(out, arg0);
+            out.push('}');
+            return;
+        }
+        if is_fd_blocking(nr) {
+            // arg0 is the fd; resolve it via the process FD table.
+            let fd = arg0 as usize;
+            let resolved = proc_snaps.iter().find(|(p, _, _)| *p == pid)
+                .and_then(|(_, _, fds)| fds.iter()
+                    .find(|(i, _, _, _, _)| *i == fd));
+            out.push('{');
+            j_kv_str(out, "kind", "fd-blocked");
+            let _ = write!(out, r#""nr":{},"#, nr);
+            let _ = write!(out, r#""fd":{},"#, fd);
+            match resolved {
+                Some((_, ft, inode, flags, path)) => {
+                    let ft_str = file_type_str(*ft);
+                    j_kv_str(out, "fd_kind", ft_str);
+                    let _ = write!(out, r#""inode":{},"#, inode);
+                    // For sockets: resolve peer via sock_snaps.
+                    if matches!(ft, crate::vfs::FileType::Socket) {
+                        let peer_socket_id = sock_snaps.iter()
+                            .find(|s| s.id == *inode)
+                            .map(|s| s.peer_id)
+                            .unwrap_or(u64::MAX);
+                        if peer_socket_id == u64::MAX {
+                            j_kv_str(out, "peer_pid", "none");
+                            j_kv_str(out, "peer_fd",  "none");
+                        } else {
+                            // Find which (pid, fd) owns peer_socket_id.
+                            let owner = proc_snaps.iter().find_map(|(ppid, _, fds)|
+                                fds.iter().find(|(_, ft2, inode2, _, _)|
+                                    matches!(ft2, crate::vfs::FileType::Socket)
+                                    && *inode2 == peer_socket_id)
+                                .map(|(fd2, _, _, _, _)| (*ppid, *fd2)));
+                            match owner {
+                                Some((ppid, pfd)) => {
+                                    let _ = write!(out, r#""peer_pid":{},"peer_fd":{},"#, ppid, pfd);
+                                }
+                                None => {
+                                    j_kv_str(out, "peer_pid", "unowned");
+                                    j_kv_str(out, "peer_fd",  "unowned");
+                                }
+                            }
+                        }
+                    }
+                    // For pipes: find the opposite end.
+                    if matches!(ft, crate::vfs::FileType::Pipe) {
+                        let is_write = flags & 1 == 1;
+                        let peer = proc_snaps.iter().find_map(|(ppid, _, fds)|
+                            fds.iter().find(|(_, ft2, inode2, fl, _)|
+                                matches!(ft2, crate::vfs::FileType::Pipe)
+                                && *inode2 == *inode
+                                && (fl & 1 == 1) != is_write)
+                            .map(|(fd2, _, _, _, _)| (*ppid, *fd2)));
+                        match peer {
+                            Some((ppid, pfd)) => {
+                                let _ = write!(out, r#""peer_pid":{},"peer_fd":{},"#, ppid, pfd);
+                            }
+                            None => {
+                                j_kv_str(out, "peer_pid", "none");
+                                j_kv_str(out, "peer_fd",  "none");
+                            }
+                        }
+                    }
+                    if !path.is_empty() { j_kv_str(out, "path", path); }
+                }
+                None => {
+                    j_kv_str(out, "fd_kind", "unresolved");
+                }
+            }
+            j_trim_comma(out);
+            out.push('}');
+            return;
+        }
+        if nr == NR_FUTEX {
+            // FUTEX waiter without a queue entry — likely either FUTEX_WAKE
+            // beat us out of the wait queue (and we just haven't returned
+            // yet) or a non-WAIT futex op.  Surface arg0 (uaddr) so the
+            // caller can still cross-reference.
+            out.push('{');
+            j_kv_str(out, "kind", "futex-other");
+            j_str(out, "uaddr"); out.push(':'); j_hex(out, arg0);
+            out.push('}');
+            return;
+        }
+    }
+
+    // 6. Catch-all: state may still be informative even without a syscall.
+    out.push('{');
+    j_kv_str(out, "kind", "unknown");
+    if clear_child_tid != 0 {
+        // Newly-spawned thread or one that's about to exit cleanly.
+        j_str(out, "clear_child_tid"); out.push(':'); j_hex(out, clear_child_tid);
+        out.push(',');
+    }
+    j_trim_comma(out);
+    out.push('}');
+}
+
+/// Render a one-line `wait=KIND[,kv]*` description for the serial mirror.
+/// Mirrors `emit_wait_classification`'s taxonomy but in a flat suffix shape
+/// the harness can `wait=(.*)$` capture.  Same classifier inputs.
+#[allow(clippy::too_many_arguments)]
+fn render_wait_compact(
+    out: &mut String,
+    tid: u64,
+    pid: u64,
+    wake_tick: u64,
+    clear_child_tid: u64,
+    vfork_parent_tid: Option<u64>,
+    sample: Option<&crate::proc::sample::TidSyscallSample>,
+    tid_to_futex: &alloc::collections::BTreeMap<u64, (u64, u64)>,
+    proc_snaps: &[ProcFdRow],
+    sock_snaps: &[crate::net::unix::SocketSnap],
+) {
+    use core::fmt::Write;
+    if let Some((fp, uaddr)) = tid_to_futex.get(&tid).copied() {
+        let _ = write!(out, "wait=futex,fpid={},uaddr={:#x}", fp, uaddr);
+        return;
+    }
+    if let Some(parent_tid) = vfork_parent_tid {
+        let _ = write!(out, "wait=vfork-complete,parent_tid={}", parent_tid);
+        return;
+    }
+    if let Some(s) = sample {
+        let nr = s.last_syscall_nr;
+        let arg0 = s.last_syscall_arg0;
+        if matches!(nr, NR_NANOSLEEP | NR_CLOCK_NANOSLEEP)
+            && wake_tick != u64::MAX && wake_tick != 0 {
+            let _ = write!(out, "wait=sleep,wake_tick={}", wake_tick);
+            return;
+        }
+        if is_poll_family(nr) {
+            let _ = write!(out, "wait=poll-bell,nr={},arg0={:#x}", nr, arg0);
+            return;
+        }
+        if is_fd_blocking(nr) {
+            let fd = arg0 as usize;
+            let resolved = proc_snaps.iter().find(|(p, _, _)| *p == pid)
+                .and_then(|(_, _, fds)| fds.iter()
+                    .find(|(i, _, _, _, _)| *i == fd));
+            let _ = write!(out, "wait=fd-blocked,nr={},fd={}", nr, fd);
+            match resolved {
+                Some((_, ft, inode, flags, _path)) => {
+                    let _ = write!(out, ",fd_kind={},inode={}", file_type_str(*ft), inode);
+                    if matches!(ft, crate::vfs::FileType::Socket) {
+                        let peer_socket_id = sock_snaps.iter()
+                            .find(|s| s.id == *inode)
+                            .map(|s| s.peer_id).unwrap_or(u64::MAX);
+                        if peer_socket_id == u64::MAX {
+                            out.push_str(",peer=none");
+                        } else {
+                            let owner = proc_snaps.iter().find_map(|(ppid, _, fds)|
+                                fds.iter().find(|(_, ft2, inode2, _, _)|
+                                    matches!(ft2, crate::vfs::FileType::Socket)
+                                    && *inode2 == peer_socket_id)
+                                .map(|(fd2, _, _, _, _)| (*ppid, *fd2)));
+                            match owner {
+                                Some((pp, pf)) => { let _ = write!(out, ",peer_pid={},peer_fd={}", pp, pf); }
+                                None => out.push_str(",peer=unowned"),
+                            }
+                        }
+                    } else if matches!(ft, crate::vfs::FileType::Pipe) {
+                        let is_write = flags & 1 == 1;
+                        let peer = proc_snaps.iter().find_map(|(ppid, _, fds)|
+                            fds.iter().find(|(_, ft2, inode2, fl, _)|
+                                matches!(ft2, crate::vfs::FileType::Pipe)
+                                && *inode2 == *inode
+                                && (fl & 1 == 1) != is_write)
+                            .map(|(fd2, _, _, _, _)| (*ppid, *fd2)));
+                        match peer {
+                            Some((pp, pf)) => { let _ = write!(out, ",peer_pid={},peer_fd={}", pp, pf); }
+                            None => out.push_str(",peer=none"),
+                        }
+                    }
+                }
+                None => out.push_str(",fd_kind=unresolved"),
+            }
+            return;
+        }
+        if nr == NR_FUTEX {
+            let _ = write!(out, "wait=futex-other,uaddr={:#x}", arg0);
+            return;
+        }
+    }
+    out.push_str("wait=unknown");
+    if clear_child_tid != 0 {
+        let _ = write!(out, ",clear_child_tid={:#x}", clear_child_tid);
+    }
+}
+
+fn file_type_str(ft: crate::vfs::FileType) -> &'static str {
+    use crate::vfs::FileType::*;
+    match ft {
+        Socket => "socket",
+        Pipe => "pipe",
+        RegularFile => "regular",
+        Directory => "directory",
+        SymLink => "symlink",
+        CharDevice => "char-device",
+        BlockDevice => "block-device",
+        EventFd => "eventfd",
+        TimerFd => "timerfd",
+        SignalFd => "signalfd",
+        InotifyFd => "inotifyfd",
+        PtyMaster => "pty-master",
+        PtySlave => "pty-slave",
+    }
 }
