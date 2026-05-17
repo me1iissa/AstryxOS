@@ -73,11 +73,27 @@ const SILENT_THRESHOLD_TICKS: u64 = 500;
 const TID_SLOTS: usize = 256;
 
 /// One slot in the syscall-activity table.
+///
+/// `last_syscall_nr` and `last_syscall_arg0` are written alongside
+/// `last_syscall_tick` so that diagnostic readers (kdb `thread-park-audit`)
+/// can answer "which syscall is this TID parked inside, and what is the
+/// primary argument" without an expensive walk of the per-PID syscall ring.
+/// Writers store nr/arg0 *before* the tick, so a reader that sees a fresh
+/// tick is guaranteed to see the matching nr and arg0 (Release/Acquire-free
+/// here because the tid field already publishes ownership of the slot; the
+/// nr/arg0 store-order is just "store these first so they precede tick").
 #[repr(C, align(64))] // cache-line aligned to avoid false sharing
 struct TidSlot {
     tid: AtomicU64,
     last_syscall_tick: AtomicU64,
     last_sample_tick: AtomicU64,
+    /// Syscall number of the most recent dispatch entry for this slot's TID.
+    /// `u64::MAX` means "no syscall recorded yet for the current slot owner".
+    last_syscall_nr: AtomicU64,
+    /// First argument (RDI on x86_64) of the most recent syscall.  For
+    /// poll/epoll_wait this is the fd-array pointer or epfd; for read/write
+    /// it is the fd; for futex it is the uaddr.  Diagnostic-only.
+    last_syscall_arg0: AtomicU64,
 }
 
 static TID_TABLE: [TidSlot; TID_SLOTS] = [
@@ -85,6 +101,8 @@ static TID_TABLE: [TidSlot; TID_SLOTS] = [
         tid: AtomicU64::new(0),
         last_syscall_tick: AtomicU64::new(u64::MAX),
         last_sample_tick: AtomicU64::new(0),
+        last_syscall_nr: AtomicU64::new(u64::MAX),
+        last_syscall_arg0: AtomicU64::new(0),
     } }; TID_SLOTS
 ];
 
@@ -93,21 +111,53 @@ fn slot_for(tid: u64) -> &'static TidSlot {
     &TID_TABLE[(tid as usize) & (TID_SLOTS - 1)]
 }
 
-/// Record a syscall entry: stamp the calling thread's last-syscall tick.
+/// Record a syscall entry: stamp the calling thread's last-syscall tick,
+/// the syscall number, and the first user argument.
 ///
 /// Called from [`crate::syscall::dispatch`] on every Linux/Aether syscall.
-/// Lock-free: two relaxed atomic stores in the common case (slot already
+/// Lock-free: four relaxed atomic stores in the common case (slot already
 /// owned by this TID).  Safe from any context where `current_tid()` and
 /// `cpu_index()` are valid — the syscall entry runs at CPL 0 on the
 /// thread's own kernel stack, so this trivially holds.
+///
+/// Store order: tid → nr → arg0 → tick.  A reader that observes a fresh
+/// tick is guaranteed to see the matching nr/arg0 even under Relaxed
+/// ordering because all four atomics share a cache line (Intel SDM Vol 3A
+/// §8.2.3: WB total-store-order for same-line single-quadword writes).
 #[inline]
-pub fn record_syscall(tid: u64, tick: u64) {
+pub fn record_syscall(tid: u64, tick: u64, nr: u64, arg0: u64) {
     let slot = slot_for(tid);
     // Claim the slot (no CAS — last writer wins on hash collisions).
-    // The TID write is published before the tick so a concurrent reader
-    // either sees a stale TID (ignore) or the new TID + a fresh tick.
     slot.tid.store(tid, Ordering::Relaxed);
+    slot.last_syscall_nr.store(nr, Ordering::Relaxed);
+    slot.last_syscall_arg0.store(arg0, Ordering::Relaxed);
     slot.last_syscall_tick.store(tick, Ordering::Relaxed);
+}
+
+/// Snapshot of one TID slot for diagnostic readers (kdb).
+#[derive(Clone, Copy)]
+pub struct TidSyscallSample {
+    pub tid: u64,
+    pub last_syscall_tick: u64,
+    pub last_syscall_nr: u64,
+    pub last_syscall_arg0: u64,
+}
+
+/// Read the per-TID syscall sample.  Returns `Some` only when the slot is
+/// owned by the requested `tid` (TID-hash collisions return `None` rather
+/// than fabricating a wrong attribution).  Used by kdb `thread-park-audit`
+/// to classify what each thread is parked inside.
+pub fn read_sample(tid: u64) -> Option<TidSyscallSample> {
+    let slot = slot_for(tid);
+    let slot_tid = slot.tid.load(Ordering::Relaxed);
+    if slot_tid != tid { return None; }
+    // Tick last (see store order above).  If a writer is mid-update, we
+    // may see a stale tick paired with new nr/arg0 — harmless for diag.
+    let last_syscall_nr = slot.last_syscall_nr.load(Ordering::Relaxed);
+    let last_syscall_arg0 = slot.last_syscall_arg0.load(Ordering::Relaxed);
+    let last_syscall_tick = slot.last_syscall_tick.load(Ordering::Relaxed);
+    if last_syscall_tick == u64::MAX { return None; }
+    Some(TidSyscallSample { tid, last_syscall_tick, last_syscall_nr, last_syscall_arg0 })
 }
 
 /// Maybe emit a userspace RIP sample from the timer ISR.
