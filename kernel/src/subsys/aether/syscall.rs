@@ -233,6 +233,12 @@ pub fn dispatch(
         }
         SYS_PIPE => {
             // pipe(fds_out) -> 0 or -errno
+            // Validate the user pointer before handing off: `sys_pipe` writes
+            // two u64 file descriptor numbers (16 bytes) to `fds_out`.
+            // Defence-in-depth at the user/kernel boundary per CWE-119.
+            if !crate::syscall::validate_user_ptr(arg1, 16) {
+                return -14; // EFAULT
+            }
             crate::syscall::sys_pipe(arg1 as *mut u64)
         }
         SYS_UNAME => {
