@@ -428,6 +428,21 @@ pub fn insert_with_expected(
                     reference[28], reference[29], reference[30], reference[31],
                 );
                 crate::serial_println!(
+                    "[W215/INSERT-WRONG-CONTENT/REF2] {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x}",
+                    reference[32], reference[33], reference[34], reference[35],
+                    reference[36], reference[37], reference[38], reference[39],
+                    reference[40], reference[41], reference[42], reference[43],
+                    reference[44], reference[45], reference[46], reference[47],
+                    reference[48], reference[49], reference[50], reference[51],
+                    reference[52], reference[53], reference[54], reference[55],
+                    reference[56], reference[57], reference[58], reference[59],
+                    reference[60], reference[61], reference[62], reference[63],
+                );
+                crate::serial_println!(
                     "[W215/INSERT-WRONG-CONTENT/OBS]  {:02x}{:02x}{:02x}{:02x} \
                      {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} \
                      {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} \
@@ -441,6 +456,21 @@ pub fn insert_with_expected(
                     sample[20], sample[21], sample[22], sample[23],
                     sample[24], sample[25], sample[26], sample[27],
                     sample[28], sample[29], sample[30], sample[31],
+                );
+                crate::serial_println!(
+                    "[W215/INSERT-WRONG-CONTENT/OBS2] {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x}",
+                    sample[32], sample[33], sample[34], sample[35],
+                    sample[36], sample[37], sample[38], sample[39],
+                    sample[40], sample[41], sample[42], sample[43],
+                    sample[44], sample[45], sample[46], sample[47],
+                    sample[48], sample[49], sample[50], sample[51],
+                    sample[52], sample[53], sample[54], sample[55],
+                    sample[56], sample[57], sample[58], sample[59],
+                    sample[60], sample[61], sample[62], sample[63],
                 );
                 crate::ke::bugcheck::ke_bugcheck(
                     crate::ke::bugcheck::BUGCHECK_W215_INSERT_WRONG_CONTENT,
