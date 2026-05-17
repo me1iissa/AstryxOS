@@ -6626,6 +6626,13 @@ pub fn sys_futex_linux(
                 }
             }
 
+            // Record this waiter in the per-CPU FUTEX_WAIT history ring so
+            // the cluster-wake compensation (below) can use "this TGID
+            // recently parked here" as a safety-harness signal when a
+            // future FUTEX_WAKE on a nearby uaddr misses.
+            #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+            crate::subsys::linux::futex_cluster::record_wait(pid, uaddr);
+
             crate::sched::schedule();
 
             // Woken (or timed out). Clean up from wait queue.
@@ -6718,6 +6725,49 @@ pub fn sys_futex_linux(
                 "[FUTEX_WAKE] tid={} pid={} uaddr={:#x} woken={} max={} op={:#x}",
                 crate::proc::current_tid(), pid, uaddr, woken, val, futex_op
             );
+
+            // Record this WAKE in the per-CPU history ring (regardless of
+            // `woken`) so the cluster-wake compensation can use "this TID
+            // recently issued a wake at this uaddr" as a safety-harness
+            // signal on a subsequent ghost wake at a nearby slot.  Cheap
+            // — bounded ring, ≤ 64 entries.
+            #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+            crate::subsys::linux::futex_cluster::record_wake(
+                crate::proc::current_tid(), uaddr,
+            );
+
+            // ── Bounded broadcast-within-cluster compensation ──────────
+            //
+            // When the original wake produced `woken == 0`, scan a 256-byte
+            // window centred on `uaddr` and consider waking adjacent waiters
+            // that pass the safety harness (canonical pthread_cond_t slot
+            // offset OR same-TID recent wake / same-TGID recent wait).
+            //
+            // Per POSIX `pthread_cond_signal(3p)` (POSIX:2017 §2.9.5):
+            // "If any threads are blocked on the condition variable, the
+            // pthread_cond_signal() function shall unblock at least one of
+            // those threads."  Older glibc condvar implementations race
+            // between updating `__g_signals[g]` and parking on the matching
+            // slot (public bug:
+            // <https://sourceware.org/bugzilla/show_bug.cgi?id=25847>);
+            // since we run upstream binaries unmodified, the recovery lives
+            // here.
+            //
+            // The path is gated by a runtime toggle (default ON under
+            // `firefox-test`, OFF in stock builds) and behind the same
+            // feature gates as the GHOST diagnostic above.  See
+            // `subsys/linux/futex_cluster.rs` for the full algorithm.
+            #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+            let extra_woken = if woken == 0 && (op == 1 || op == 10) {
+                crate::subsys::linux::futex_cluster::compensate(
+                    pid, crate::proc::current_tid(), uaddr, max_wake,
+                )
+            } else {
+                0
+            };
+            #[cfg(not(any(feature = "firefox-test", feature = "test-mode")))]
+            let extra_woken: u64 = 0;
+            woken = woken.saturating_add(extra_woken);
 
             // [FUTEX_WAKE_GHOST] diagnostic — issued only when this WAKE
             // returned woken=0 yet another uaddr within the same 256-byte

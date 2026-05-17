@@ -34,6 +34,15 @@ pub mod errno;
 /// Extracted from `kernel/src/syscall/mod.rs` in Phase 0.2.
 pub mod syscall;
 
+/// Bounded broadcast-within-cluster compensation for FUTEX_WAKE.  Mitigates
+/// the older-glibc `pthread_cond_signal` race
+/// (<https://sourceware.org/bugzilla/show_bug.cgi?id=25847>) by
+/// optionally waking nearby waiters when a `FUTEX_WAKE(uaddr, n)` would
+/// otherwise leave a recently-parked sibling stranded.  See
+/// `futex_cluster.rs` for the safety harness.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+pub mod futex_cluster;
+
 /// Firefox-test diagnostic ring helpers — tiny shim that holds the "current
 /// syscall's ring-entry index" so sys_read_linux / sys_open_linux can attach
 /// path / read-content context without threading it through every signature.
