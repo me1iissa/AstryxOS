@@ -210,7 +210,12 @@ fn prop_arr_del(arr: &mut [Option<resource::PropertyEntry>; resource::MAX_PROPER
 /// Bind and listen on `/tmp/.X11-unix/X0`.
 pub fn init() {
     let _ = crate::vfs::mkdir("/tmp/.X11-unix");
-    let fd = unix::create(unix::SockKind::Stream);
+    // The X11 server is a kernel-owned listener; record pid=0 as the
+    // creator so SO_PEERCRED on an accepted connection still resolves
+    // to a structurally-detectable "kernel listener" identity for any
+    // client that inspects it.  Per unix(7) SO_PEERCRED.
+    let fd = unix::create(unix::SockKind::Stream,
+        unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
     let r  = unix::bind(fd, SOCKET_PATH);
     if r < 0 {
         crate::serial_println!("[X11] bind failed: {}", r);

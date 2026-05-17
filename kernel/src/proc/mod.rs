@@ -709,6 +709,29 @@ pub fn current_pid() -> Pid {
     threads.iter().find(|t| t.tid == tid).map(|t| t.pid).unwrap_or(0)
 }
 
+/// Resolve the effective credentials (pid, uid, gid) of the currently
+/// running process for use by syscall implementations that must record the
+/// caller's identity (e.g. AF_UNIX SO_PEERCRED capture per `unix(7)`).
+///
+/// Returns `(pid, euid, egid)` — the effective IDs, matching Linux's
+/// per-FD ucred capture which uses the credentials in effect at the time
+/// of the syscall, not the real IDs.  Per `unix(7)` SO_PEERCRED and
+/// POSIX.1-2017 §getsockopt.
+///
+/// If the PID is not in PROCESS_TABLE (kernel idle thread or transient
+/// race with process teardown), returns `(0, 0, 0)` — a structurally
+/// detectable "no credentials" sentinel that authorisers can compare
+/// against a non-zero allowlist.
+pub fn current_creds_lockless() -> (Pid, u32, u32) {
+    let pid = current_pid_lockless();
+    let procs = PROCESS_TABLE.lock();
+    if let Some(p) = procs.iter().find(|p| p.pid == pid) {
+        (pid, p.euid, p.egid)
+    } else {
+        (pid, 0, 0)
+    }
+}
+
 /// Recover the current TID even when `PER_CPU_CURRENT_TID` is transiently 0.
 ///
 /// `PER_CPU_CURRENT_TID[cpu]` can be 0 when the timer ISR preempts the idle

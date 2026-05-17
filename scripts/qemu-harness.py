@@ -862,7 +862,12 @@ def _check(features: str) -> tuple[int, str]:
                           stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE,
                           text=True)
-    tail = (proc.stderr or "")[-4096:]
+    # Surface enough trailing stderr to capture the actual rustc error
+    # diagnostic when the build fails — 4 KB was below the rustc warning
+    # noise floor for large diffs and only showed warnings, hiding the
+    # real error.  16 KB clears typical multi-error tails without
+    # exploding the JSON envelope.
+    tail = (proc.stderr or "")[-16384:]
     return proc.returncode, tail
 
 

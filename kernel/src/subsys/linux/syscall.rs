@@ -807,7 +807,13 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     // supported — return -EPROTONOSUPPORT per POSIX.
                     _ => return -93,
                 };
-                let unix_id = crate::net::unix::create(kind);
+                // Capture caller's effective credentials so a later
+                // getsockopt(SO_PEERCRED) on this socket's peer can report
+                // them per unix(7) SO_PEERCRED — finding H7 of the
+                // 2026-05-16 security audit (CWE-287).
+                let (cpid, cuid, cgid) = crate::proc::current_creds_lockless();
+                let creds = crate::net::unix::PeerCreds { pid: cpid, uid: cuid, gid: cgid };
+                let unix_id = crate::net::unix::create(kind, creds);
                 if unix_id == u64::MAX { return -24; } // EMFILE
                 crate::syscall::alloc_unix_socket_fd(pid, unix_id, cloexec, nonblock)
             } else if domain == 2 || domain == 10 {
@@ -849,7 +855,13 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         crate::serial_println!("[FF/connect] pid={} path={}", pid, p);
                     }
                 }
-                crate::net::unix::connect(unix_id, &path_bytes[..plen])
+                // Record the connecting client's effective credentials on
+                // the new accept-side socket so the server's
+                // getsockopt(SO_PEERCRED) returns the client's identity
+                // per unix(7) — finding H7 (CWE-287).
+                let (cpid, cuid, cgid) = crate::proc::current_creds_lockless();
+                let creds = crate::net::unix::PeerCreds { pid: cpid, uid: cuid, gid: cgid };
+                crate::net::unix::connect(unix_id, &path_bytes[..plen], creds)
             } else {
                 if !crate::syscall::is_socket_fd(pid, fd) { return -9; }
                 let socket_id = crate::syscall::get_socket_id(pid, fd);
@@ -1375,7 +1387,12 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             // We accept those plus the type field; anything else passes
             // through silently to match Linux leniency.
             let pid = crate::proc::current_pid_lockless();
-            let (a, b) = crate::net::unix::socketpair(kind);
+            // Both halves of a socketpair belong to the same process per
+            // socketpair(2); record its effective credentials on both so
+            // SO_PEERCRED on either end identifies the creator (unix(7)).
+            let (cpid, cuid, cgid) = crate::proc::current_creds_lockless();
+            let creds = crate::net::unix::PeerCreds { pid: cpid, uid: cuid, gid: cgid };
+            let (a, b) = crate::net::unix::socketpair(kind, creds);
             if a == u64::MAX { return -24; }
             let fd_a = crate::syscall::alloc_unix_socket_fd(pid, a, cloexec, nonblock);
             if fd_a < 0 {
@@ -1445,16 +1462,37 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     (SOL_SOCKET, SO_SNDBUF) => 131072,
                     (SOL_SOCKET, SO_ERROR)  => 0,
                     (SOL_SOCKET, SO_PEERCRED) => {
-                        // Return struct ucred { pid, uid, gid } = 12 bytes
-                        if !optval.is_null() {
-                            unsafe {
-                                let p = optval as *mut u8;
-                                core::ptr::write(p as *mut u32, crate::proc::current_pid_lockless() as u32);
-                                core::ptr::write(p.add(4) as *mut u32, 0); // uid
-                                core::ptr::write(p.add(8) as *mut u32, 0); // gid
-                            }
+                        // Return struct ucred { pid: u32, uid: u32, gid: u32 } = 12 bytes.
+                        //
+                        // Per unix(7) SO_PEERCRED: "Returns the credentials
+                        // of the foreign process connected to this socket."
+                        // The foreign process is identified by the *peer*
+                        // endpoint's recorded creator credentials (captured
+                        // at socket(2)/socketpair(2)/connect(2) time).  The
+                        // pre-PR behaviour returned the calling process's
+                        // own pid, which is an authentication bypass for
+                        // every IPC protocol that uses SO_PEERCRED as a
+                        // peer identifier (D-Bus auth, sandbox brokers) —
+                        // finding H7 of the 2026-05-16 audit, CWE-287
+                        // (Improper Authentication).
+                        let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
+                        let peer = crate::net::unix::peer_creds(unix_id)
+                            .unwrap_or(crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+                        if !crate::syscall::validate_user_ptr(optval as u64, 12) {
+                            return -14; // EFAULT
                         }
-                        if !optlen.is_null() { unsafe { core::ptr::write(optlen, 12u32); } }
+                        unsafe {
+                            let p = optval as *mut u8;
+                            core::ptr::write_unaligned(p as *mut u32, peer.pid as u32);
+                            core::ptr::write_unaligned(p.add(4) as *mut u32, peer.uid);
+                            core::ptr::write_unaligned(p.add(8) as *mut u32, peer.gid);
+                        }
+                        if !optlen.is_null() {
+                            if !crate::syscall::validate_user_ptr(optlen as u64, 4) {
+                                return -14;
+                            }
+                            unsafe { core::ptr::write_unaligned(optlen, 12u32); }
+                        }
                         return 0i64;
                     }
                     _ => 0,
