@@ -19,11 +19,28 @@ pub const KERNEL_PHYS_BASE: u64 = 0x10_0000; // 1 MiB
 /// Fixed physical address for BootInfo handoff.
 ///
 /// Must be placed past the end of the kernel's static sections (.text, .rodata,
-/// .data, .bss).  As the kernel grows the BSS end advances; 7 MiB gives ample
-/// headroom relative to the current ~5.8 MiB BSS end.  The UEFI identity map
-/// and the kernel's own higher-half mapping both cover this address (it is below
-/// the 1 GiB minimum guest RAM for every AstryxOS test configuration).
-pub const BOOT_INFO_PHYS_BASE: u64 = 0x70_0000; // 7 MiB
+/// .data, .bss).  As the kernel grows the BSS end advances; we deliberately
+/// leave several MiB of headroom so adding a per-CPU arena or diagnostic table
+/// does not silently clobber the handoff page during `_start`'s BSS zero-fill.
+///
+/// Current snapshot (master tip post-PR #285, `firefox-test,kdb,w215-diag`
+/// features): `.data` ends at virt 0x47B840, `.bss` Size = 0x28F7E0 → BSS end
+/// at phys 0x70B7E0, which is **past** the prior 7 MiB anchor.  An earlier
+/// 7 MiB choice (PR #284) survived the immediate post-fix snapshot but every
+/// subsequent BSS-adding change risked re-running the same panic
+/// ("Invalid BootInfo magic" — `_start` zeros from `__bss_start` to
+/// `__bss_end`, which on overrun overwrites the bootloader's freshly-written
+/// magic before the kernel's first PROC-METRICS tick).
+///
+/// 16 MiB (0x100_0000) gives ~8 MiB of free headroom over the current BSS
+/// extent — enough for several future diagnostic features without revisiting
+/// this constant.  The UEFI identity map and the kernel's own higher-half
+/// mapping both cover this address (it remains below the 1 GiB minimum guest
+/// RAM for every AstryxOS test configuration; the bootloader identity-maps
+/// the first 4 GiB).  Per the System V AMD64 ABI §3.1.2 (aggregate alignment)
+/// the BSS extent is sensitive to struct repacking, so over-provisioning the
+/// gap is preferable to repeatedly auditing every static.
+pub const BOOT_INFO_PHYS_BASE: u64 = 0x100_0000; // 16 MiB
 
 /// Higher-half virtual base for the kernel.
 pub const KERNEL_VIRT_BASE: u64 = 0xFFFF_8000_0000_0000;
