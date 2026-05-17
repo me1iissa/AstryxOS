@@ -25,14 +25,38 @@
 //!
 //! DR0–DR7 are per-CPU registers (Intel SDM Vol. 3B §17.2).  To watch a
 //! set of linear addresses on every CPU we publish the desired per-slot
-//! `(addr, ctrl)` pairs to static atomic arrays and broadcast a
-//! lightweight IPI on vector `W215_DR_SYNC_VECTOR`.  Each receiver loads
-//! the published values and programs its own DR0–DR3 + DR7 from them.
+//! `(addr, ctrl)` pairs to static atomic arrays, bump a global
+//! `SYNC_GENERATION`, and rely on each CPU to notice the gen-bump on its
+//! next pass through `apply_pending_if_stale()` (called from the timer
+//! ISR) and re-program its own DR0–DR3 + DR7 from the published atomics.
 //!
-//! The sync protocol is one-shot per arm: the sender does not block on an
-//! ack, because a missed IPI on a quiescent CPU is harmless — the next
-//! timer interrupt on that CPU is followed by the same publish-and-load
-//! pattern in `handle_w215_dr_sync_ipi`.
+//! ### Why no IPI broadcast
+//!
+//! Both arm sites (`arm_write_watchpoint`, post-hoc from the CRC walker,
+//! and the `#DB` fire path in `handle_db_exception`) run in interrupt
+//! context with `IF=0`.  A `send_ipi`-style broadcast from inside the
+//! timer ISR can interact badly with peer CPUs that are themselves in
+//! their own timer ISR — both spinning on `LAPIC ICR_LO bit 12`
+//! ("delivery status", Intel SDM Vol. 3A §10.6.1) while the destination's
+//! `IF=0` keeps the IPI undispatched.  Empirically the broadcast path
+//! deadlocked under multi-CPU contention: the originator's
+//! `[W215/DR-ARM]` `serial_println!` (sequenced **after** the broadcast)
+//! never emitted, and no peer ever ran the IPI handler.
+//!
+//! Linux follows the same restriction: `arch_install_hw_breakpoint`
+//! programs only the local CPU and is `lockdep_assert_irqs_disabled()`
+//! (atomic, this-cpu only); cross-CPU installation in Linux is deferred
+//! to `smp_call_function`, which only runs in process context with `IF=1`.
+//! See `Documentation/locking/hwspinlock.rst` and Intel SDM Vol. 3B
+//! §17.2.4 for the per-CPU DR programming contract.
+//!
+//! The lazy-gen protocol is one-shot per arm: the originator publishes
+//! per-slot atomics, increments `SYNC_GENERATION`, and programs its own
+//! DRs immediately.  Every other CPU calls `apply_pending_if_stale()` at
+//! the top of its timer ISR (cheap fast-path: one atomic load + compare);
+//! when its locally cached generation lags the global, it re-runs
+//! `program_local_drs`.  Worst-case latency is one timer tick
+//! (`TICK_HZ = 100`, i.e. ≤ 10 ms) — far below the W215 capture window.
 //!
 //! ## Public surface
 //!
@@ -41,11 +65,15 @@
 //! - `arm_preinsert_watchpoint(linear_addr, len, phys, inode, file_offset)` —
 //!     insert-time arm on DR1/DR2/DR3 round-robin; returns `Some(slot)`
 //!     if a slot was free, `None` if all three were busy.
-//! - `handle_w215_dr_sync_ipi()` — IPI handler.
+//! - `apply_pending_if_stale()` — call from each CPU's timer ISR.  Fast
+//!     path (gen-equal) is two atomic loads; slow path reprograms DRs.
+//! - `apply_pending_to_this_cpu()` — unconditional re-program; called
+//!     from `ap_rust_entry` so a CPU that comes online after arm picks
+//!     up the watchpoints.
+//! - `handle_w215_dr_sync_ipi()` — IPI handler; back-compat only, no
+//!     current sender (cross-CPU sync went lazy-gen-polled).
 //! - `handle_db_exception(...)` — `#DB` dispatcher; returns `true` if the
 //!   trap belonged to W215 and was consumed.
-//! - `apply_pending_to_this_cpu()` — called from `ap_rust_entry` so a CPU
-//!   that comes online after arm picks up the watchpoints.
 //! - `is_armed()` — back-compat: true if DR0 is armed.
 //! - `stats()` — `(arm_count, fire_count)` summary.
 //!
@@ -103,6 +131,22 @@ static ARM_COUNT: AtomicU32 = AtomicU32::new(0);
 /// outside the per-slot atomic array because the policy is "pick first
 /// free starting from cursor, then advance".
 static PREINS_CURSOR: AtomicU32 = AtomicU32::new(0);
+
+/// Global publish generation.  Incremented every time any slot's published
+/// state (`ARMED`, `ARMED_ADDR`, `ARMED_CTRL`) changes.  Peer CPUs compare
+/// this to their `LOCAL_SYNC_GENERATION` slot at the top of their timer
+/// ISR via `apply_pending_if_stale()`; a stale local gen triggers a
+/// re-`program_local_drs` so the slot's enable bits in DR7 reach every CPU
+/// within one tick (≤ 10 ms at `TICK_HZ = 100`).
+static SYNC_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Per-CPU cached snapshot of `SYNC_GENERATION` at the last
+/// `program_local_drs` on that CPU.  Sized to `super::apic::MAX_CPUS`.
+/// Equal to global → DRs are up to date; less than global → re-program.
+static LOCAL_SYNC_GENERATION: [AtomicU64; super::apic::MAX_CPUS] = {
+    const Z: AtomicU64 = AtomicU64::new(0);
+    [Z; super::apic::MAX_CPUS]
+};
 
 /// Per-slot DR7 R/W and LEN field positions.
 ///
@@ -219,9 +263,49 @@ fn program_local_drs() {
 
 /// Apply the currently armed watchpoints to this CPU.  Called from
 /// `apic::ap_rust_entry` so a CPU that comes online after Arm-1 fires
-/// picks up the watchpoint, and from the IPI handler.
+/// picks up the watchpoint, and from the IPI handler (retained for
+/// back-compat — the IPI path is no longer the primary sync mechanism).
+///
+/// Always re-programs; the local-gen snapshot is updated as a side effect.
 pub fn apply_pending_to_this_cpu() {
+    // Sample the global gen BEFORE programming so a concurrent
+    // arm/disarm that bumps the gen between our DR write and our
+    // snapshot store causes the next `apply_pending_if_stale` to
+    // re-program rather than miss the update.
+    let gen = SYNC_GENERATION.load(Ordering::Acquire);
     program_local_drs();
+    let cpu = super::apic::cpu_index();
+    if cpu < super::apic::MAX_CPUS {
+        LOCAL_SYNC_GENERATION[cpu].store(gen, Ordering::Release);
+    }
+}
+
+/// Cheap fast-path called at the top of every CPU's timer ISR.  If the
+/// per-CPU cached `LOCAL_SYNC_GENERATION` matches the global
+/// `SYNC_GENERATION`, returns immediately (two atomic loads + compare).
+/// Otherwise re-programs DR0–DR3 + DR7 on the current CPU and refreshes
+/// the local snapshot.
+///
+/// This is the cross-CPU sync mechanism — see the module-level docs for
+/// why we use a polled-gen instead of an IPI broadcast.  Safe to call
+/// from ISR context: never holds a lock, never sends an IPI, never
+/// calls `serial_println!` on the fast path.
+#[inline]
+pub fn apply_pending_if_stale() {
+    let global = SYNC_GENERATION.load(Ordering::Acquire);
+    let cpu = super::apic::cpu_index();
+    if cpu >= super::apic::MAX_CPUS {
+        return;
+    }
+    let local = LOCAL_SYNC_GENERATION[cpu].load(Ordering::Acquire);
+    if local == global {
+        return;
+    }
+    // Stale — refresh.  Sample the global again BEFORE programming so
+    // we don't store a snapshot newer than what we just programmed.
+    let g2 = SYNC_GENERATION.load(Ordering::Acquire);
+    program_local_drs();
+    LOCAL_SYNC_GENERATION[cpu].store(g2, Ordering::Release);
 }
 
 /// Internal: attempt to claim slot `slot`, returning `true` on success.
@@ -251,6 +335,13 @@ fn try_arm_slot(
 
 /// Post-hoc arm on DR0 (the CRC walker's slot).  Returns `true` if DR0
 /// was free and got armed.  Back-compat name with PR #260.
+///
+/// Cross-CPU sync is **lazy** via `SYNC_GENERATION` — we bump the gen
+/// and program our own DRs; peer CPUs notice the gen-bump in their
+/// next `apply_pending_if_stale()` (timer ISR top).  See the
+/// module-level docs for the rationale (the prior `broadcast_dr_sync`
+/// IPI path deadlocked from ISR-to-ISR contention and the post-hoc
+/// `[W215/DR-ARM]` `serial_println!` never emitted).
 pub fn arm_write_watchpoint(
     linear_addr: u64,
     len: u8,
@@ -261,13 +352,30 @@ pub fn arm_write_watchpoint(
     if !try_arm_slot(0, linear_addr, len, phys, inode, file_offset) {
         return false;
     }
-    program_local_drs();
-    broadcast_dr_sync();
     ARM_COUNT.fetch_add(1, Ordering::Relaxed);
+    // Emit the [W215/DR-ARM] line BEFORE programming DRs so the arm is
+    // recorded in the serial log even if a downstream step (program, gen
+    // bump) hangs or aborts.  The original ordering put the println after
+    // `broadcast_dr_sync` — when the broadcast deadlocked, the line was
+    // never emitted and the diagnostic looked silent.
     crate::serial_println!(
         "[W215/DR-ARM] slot=0 linear={:#x} phys={:#x} inode={} offset={:#x}",
         linear_addr, phys, inode, file_offset,
     );
+    // Bump the publish gen FIRST so a peer CPU racing into
+    // `apply_pending_if_stale` after our program_local_drs returns sees
+    // the new global gen and re-programs.  Release pairs with the
+    // Acquire on `SYNC_GENERATION` in `apply_pending_if_stale`.
+    SYNC_GENERATION.fetch_add(1, Ordering::Release);
+    program_local_drs();
+    // Refresh our own local-gen snapshot so we don't loop on stale.
+    let cpu = super::apic::cpu_index();
+    if cpu < super::apic::MAX_CPUS {
+        LOCAL_SYNC_GENERATION[cpu].store(
+            SYNC_GENERATION.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+    }
     true
 }
 
@@ -288,46 +396,60 @@ pub fn arm_preinsert_watchpoint(
     for off in 0..3usize {
         let slot = 1 + ((start + off) % 3);
         if try_arm_slot(slot, linear_addr, len, phys, inode, file_offset) {
-            // Program this CPU's DRs.  We DO NOT broadcast a sync IPI
-            // from the cache::insert hot path — the cost is meaningful
-            // during prepopulate, and remote CPUs pick up the new arm
-            // lazily via `apply_pending_to_this_cpu` on the next path
-            // through the IDT (timer ISR, TLB shootdown IPI, etc.).
-            // For the cache-aliasing writer we want to catch, the
-            // writer is overwhelmingly likely to be on the same CPU
-            // that committed the insert (CoW / memset paths run in
-            // thread context on the faulting CPU), so the local DR
-            // programming is exactly what matters.
-            program_local_drs();
             ARM_COUNT.fetch_add(1, Ordering::Relaxed);
+            // Emit println BEFORE DR programming and gen bump so the arm
+            // is recorded even if a downstream step aborts.  Matches the
+            // post-hoc `arm_write_watchpoint` ordering.
             crate::serial_println!(
                 "[W215/DR-ARM] slot={} linear={:#x} phys={:#x} inode={} offset={:#x} kind=preinsert",
                 slot, linear_addr, phys, inode, file_offset,
             );
+            // Bump the publish gen so peer CPUs pick up this slot on
+            // their next timer-ISR `apply_pending_if_stale` call.  We DO
+            // NOT broadcast a sync IPI from the cache::insert hot path:
+            //   - Insert can run with cache locks held;
+            //   - the cost of an IPI on every steady-state insert is
+            //     meaningful during prepopulate;
+            //   - the writer the watch is meant to catch is
+            //     overwhelmingly likely to be on the same CPU that
+            //     committed the insert (CoW / memset paths run in
+            //     thread context on the faulting CPU), so the local
+            //     program_local_drs below is what matters most.
+            SYNC_GENERATION.fetch_add(1, Ordering::Release);
+            program_local_drs();
+            let cpu = super::apic::cpu_index();
+            if cpu < super::apic::MAX_CPUS {
+                LOCAL_SYNC_GENERATION[cpu].store(
+                    SYNC_GENERATION.load(Ordering::Acquire),
+                    Ordering::Release,
+                );
+            }
             return Some(slot as u8);
         }
     }
     None
 }
 
-/// Broadcast the pending DR update to all other online CPUs via
-/// `W215_DR_SYNC_VECTOR`.  Best-effort.
-fn broadcast_dr_sync() {
-    let me = super::apic::cpu_index() as u8;
-    let total = super::apic::cpu_count() as usize;
-    let max = total.min(super::apic::MAX_CPUS);
-    for cpu in 0..max {
-        if cpu as u8 == me {
-            continue;
-        }
-        super::apic::send_ipi(cpu as u8, W215_DR_SYNC_VECTOR);
-    }
-}
-
-/// IPI handler for `W215_DR_SYNC_VECTOR`.  Programs this CPU's DR0–DR3 +
-/// DR7 from the published atomics and EOIs the LAPIC.
+/// IPI handler for `W215_DR_SYNC_VECTOR`.
+///
+/// Retained for IDT-slot back-compat (the IDT vector `0xF1` is wired in
+/// `idt.rs`; removing the slot would shift other vectors), but no caller
+/// currently sends this vector — cross-CPU DR sync went lazy-gen-polled
+/// (`apply_pending_if_stale` from each CPU's timer ISR) after the
+/// IPI-from-ISR deadlock investigation.  See module-level docs.
+///
+/// If the vector ever does fire (e.g. a future caller restores the
+/// broadcast path for non-ISR contexts), the handler does the right
+/// thing: re-program this CPU's DRs and EOI.
 pub extern "C" fn handle_w215_dr_sync_ipi() {
     program_local_drs();
+    let cpu = super::apic::cpu_index();
+    if cpu < super::apic::MAX_CPUS {
+        LOCAL_SYNC_GENERATION[cpu].store(
+            SYNC_GENERATION.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+    }
     super::apic::lapic_eoi();
 }
 
@@ -441,11 +563,24 @@ pub fn handle_db_exception(
     write_dr6(dr6 & !0xF);
 
     if consumed {
+        // Bump publish gen so peer CPUs notice the disarm and re-program
+        // (clearing the disarmed slot's enable bits in their DR7).
+        // Release pairs with Acquire in `apply_pending_if_stale`.
+        SYNC_GENERATION.fetch_add(1, Ordering::Release);
         // Re-program local DRs (this also clears DR7 enable bits for the
         // disarmed slots — the explicit-DR7-clear fix from PR #260 Issue 1).
         program_local_drs();
-        // Re-broadcast to peer CPUs so they disarm too.
-        broadcast_dr_sync();
+        // Refresh local-gen snapshot.
+        if cpu < super::apic::MAX_CPUS {
+            LOCAL_SYNC_GENERATION[cpu].store(
+                SYNC_GENERATION.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+        }
+        // NOTE: no IPI broadcast — `#DB` is an ISR context (`IF=0`); see
+        // module-level docs for the IPI-from-ISR deadlock that this
+        // closes.  Peer CPUs disarm on their next `apply_pending_if_stale`
+        // call (one timer-tick latency, ≤ 10 ms).
         true
     } else {
         // Hit bits set but no W215 slot owns them — let the generic
