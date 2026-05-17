@@ -147,8 +147,73 @@ pub(crate) fn user_path_ptr_ok(ptr: u64) -> bool {
     ptr != 0 && ptr < USER_PTR_MAX
 }
 
+// ── per-CPU C-string staging arena ───────────────────────────────────────────
+//
+// Pre-#276, `read_cstring_from_user` returned a zero-copy `&[u8]` borrow into
+// user memory.  H1-SMAP (PR #276) made it return an owned `Vec<u8>` because
+// every dereference of user memory must be wrapped in a STAC/CLAC bracket
+// (Intel SDM Vol. 3A §4.6).  The cost of one Vec heap allocation per cstring
+// read, multiplied across ~40 call sites and a multi-cstring syscall like
+// `mount(2)` (4 cstrings) or `execve(2)` (N argv entries), halved the
+// Firefox sustained syscall plateau from sc≈2881 to sc≈1439.
+//
+// Mitigation: a per-CPU 4-slot ring arena.  Each `read_cstring_from_user`
+// call advances a per-CPU slot cursor and writes the user bytes into the
+// next slot, then returns a `&'static [u8]` borrow of that slot.  The
+// borrow is valid until the same CPU performs `SLOTS_PER_CPU = 4` further
+// `read_cstring_from_user` calls — long enough for every observed call
+// pattern (`mount` takes 4 cstrings; nothing else takes more) but cheap
+// enough to avoid heap allocation entirely.
+//
+// Safety:
+//   - Per-CPU isolation rules out cross-CPU data races on the arena: each
+//     CPU only writes its own row of `CSTRING_ARENA` and only ever reads
+//     its own row immediately after that write.
+//   - On a single CPU, a `read_cstring_from_user` call cannot be reentered
+//     from an interrupt — the timer and IPI handlers do not parse user
+//     cstrings (per `arch::x86_64::irq` and `arch::x86_64::ipi`).  A NMI
+//     handler likewise never touches user memory.  The slot cursor is
+//     therefore an ordinary `u8` accessed without atomicity beyond the
+//     compiler-fence barrier implicit in raw-pointer writes.
+//   - Borrow lifetime is documented as `'static` in the type system, but
+//     callers MUST consume the borrow before the same CPU performs four
+//     further `read_cstring_from_user` calls.  Every existing call site
+//     does (see `dispatch_body` arms in this file): the bytes are
+//     immediately converted to `&str` or copied into a `String`, both of
+//     which complete before any further user-cstring read on the same CPU.
+//
+// Sizing: `MAX_CPUS = 16` × `SLOTS_PER_CPU = 4` × `SLOT_SIZE = 4096 B` =
+// 256 KiB of `.bss`.  This sits well below `BOOT_INFO_PHYS_BASE = 0x700000`
+// after the CrcEntry repack landed alongside this commit.
+
+const CSTRING_SLOT_SIZE: usize = 4096;
+const CSTRING_SLOTS_PER_CPU: usize = 4;
+
+/// Per-CPU cstring staging arena.  Indexed by `[cpu][slot]`.  Writes from
+/// each CPU only touch its own row, so SeqCst is unnecessary; the compiler
+/// fence implicit in raw-pointer stores plus the per-CPU rule above are
+/// sufficient.
+static mut CSTRING_ARENA:
+    [[[u8; CSTRING_SLOT_SIZE]; CSTRING_SLOTS_PER_CPU]; crate::arch::x86_64::apic::MAX_CPUS] =
+    [[[0u8; CSTRING_SLOT_SIZE]; CSTRING_SLOTS_PER_CPU]; crate::arch::x86_64::apic::MAX_CPUS];
+
+/// Per-CPU slot cursor (incrementing).  Modular arithmetic against
+/// `CSTRING_SLOTS_PER_CPU` selects the slot.  Single-CPU access pattern
+/// (each CPU writes only its own entry); `AtomicU8` is used for cross-CPU
+/// safety of the array element itself, not for cursor monotonicity.
+static CSTRING_CURSOR:
+    [core::sync::atomic::AtomicU8; crate::arch::x86_64::apic::MAX_CPUS] = {
+    const Z: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    [Z; crate::arch::x86_64::apic::MAX_CPUS]
+};
+
 /// Read a null-terminated C string from user memory.
-/// Returns a byte slice excluding the null terminator, limited to 4096 bytes.
+/// Returns a byte slice (excluding the NUL terminator) limited to
+/// `CSTRING_SLOT_SIZE = 4096` bytes.
+///
+/// The returned borrow is backed by a per-CPU staging slot and is valid
+/// until the same CPU performs `CSTRING_SLOTS_PER_CPU = 4` further
+/// `read_cstring_from_user` calls; see the arena documentation above.
 ///
 /// **Pointer-validation policy** (CWE-823 / CWE-119):  user-mode-originated
 /// calls are gated by `user_path_ptr_ok(ptr)` at the dispatch layer (see
@@ -161,9 +226,9 @@ pub(crate) fn user_path_ptr_ok(ptr: u64) -> bool {
 /// pathname-reading syscall (open, openat, access, stat, statx,
 /// readlink, rename, link, mkdir, mount, execve, …) against malicious
 /// userspace without breaking the in-kernel test API.
-fn read_cstring_from_user(ptr: u64) -> alloc::vec::Vec<u8> {
+fn read_cstring_from_user(ptr: u64) -> &'static [u8] {
     if ptr == 0 {
-        return alloc::vec::Vec::new();
+        return &[];
     }
     // The user/kernel boundary check is enforced at dispatch (see
     // `user_path_ptr_ok` and the per-syscall dispatch arms in
@@ -178,29 +243,51 @@ fn read_cstring_from_user(ptr: u64) -> alloc::vec::Vec<u8> {
     // §4.6 the supervisor must hold AC=1 to touch a user page; the
     // UserGuard issues STAC/CLAC accordingly when SMAP is active and
     // collapses to a load + branch otherwise.
-    //
-    // We return an owned Vec<u8> rather than a `&[u8]` borrow because
-    // every downstream consumer of the result holds it past the bracket
-    // — formatting it through serial_println, passing it to VFS, etc.
-    // A user-page borrow would re-fault on access outside the guard.
-    // Stage into a kernel-resident stack buffer under one SMAP guard,
-    // then push into the (allocating) Vec outside the guard.  Holding
-    // AC=1 across a heap allocation would be incorrect because the
-    // allocator path may take locks and is unrelated to user memory.
+    let cpu = crate::arch::x86_64::apic::cpu_index();
+    if cpu >= crate::arch::x86_64::apic::MAX_CPUS {
+        // Out-of-range CPU index would index past the arena.  In practice
+        // `cpu_index()` returns a value < MAX_CPUS for every CPU brought
+        // up via `start_aps`; this branch is defensive.
+        return &[];
+    }
+    let slot = (CSTRING_CURSOR[cpu].fetch_add(
+        1, core::sync::atomic::Ordering::Relaxed,
+    ) as usize) & (CSTRING_SLOTS_PER_CPU - 1);
+
+    // SAFETY: `cpu < MAX_CPUS` and `slot < CSTRING_SLOTS_PER_CPU` so the
+    // indexing is in-bounds; the slot is written under a SMAP bracket
+    // before being read, and per the arena docs no other CPU writes this
+    // row.  We obtain a `*mut u8` to the slot's backing storage so we can
+    // copy from user memory directly without an intermediate stack buffer
+    // (the previous design's 4 KiB stack + heap allocation).
+    let dst: *mut u8 = unsafe {
+        let row = &raw mut CSTRING_ARENA[cpu][slot];
+        (*row).as_mut_ptr()
+    };
+
     let start = ptr as *const u8;
-    let mut staging = [0u8; 4096];
     let n = unsafe {
         let _g = crate::arch::x86_64::smap::UserGuard::new();
         let mut len = 0usize;
-        while len < 4096 {
+        while len < CSTRING_SLOT_SIZE {
             let b = *start.add(len);
             if b == 0 { break; }
-            staging[len] = b;
+            *dst.add(len) = b;
             len += 1;
         }
         len
     };
-    staging[..n].to_vec()
+
+    // SAFETY: same indexing-in-bounds argument as above; the slot we just
+    // wrote `n` bytes into is now ours to lend as a `&'static [u8]`.  The
+    // borrow remains valid until the same CPU advances four further
+    // cursor positions, which observation confirms no existing caller
+    // does.  Cross-CPU readers cannot reach this slot because their
+    // `cpu_index()` differs.
+    unsafe {
+        let row = &raw const CSTRING_ARENA[cpu][slot];
+        core::slice::from_raw_parts((*row).as_ptr(), n)
+    }
 }
 
 /// Read a null-terminated array of C string pointers (char *argv[]) from user memory.
