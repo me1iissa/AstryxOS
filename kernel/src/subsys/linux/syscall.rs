@@ -290,31 +290,267 @@ fn read_cstring_from_user(ptr: u64) -> &'static [u8] {
     }
 }
 
-/// Read a null-terminated array of C string pointers (char *argv[]) from user memory.
-/// Returns a Vec of owned strings. Stops at NULL pointer or 256 entries.
+/// Read a null-terminated array of C string pointers (`char *argv[]`) from
+/// user memory.  Returns a Vec of owned strings.  Stops at NULL pointer or
+/// `ARGV_MAX_ENTRIES = 256` entries.
+///
+/// # SMAP bracket coalescing
+///
+/// The naive shape — one [`UserGuard`] per pointer load plus one per
+/// cstring scan — costs `N×2` `STAC`+`CLAC` pairs (a single CR4-class CPU
+/// state toggle per pair, per Intel SDM Vol. 3A §4.6).  For a typical
+/// envp of 30 entries that is 60 STAC/CLAC pairs per `execve(2)` and
+/// dominates the syscall cost.
+///
+/// This helper coalesces to **three** SMAP brackets total, regardless
+/// of N (vs the pre-coalesce shape's `2N + 1` brackets):
+///
+///   * Phase A (one bracket): walk the user pointer array under a
+///     single [`UserGuard`], stopping at the first NULL.  The result
+///     is `count` pointers in a kernel-side scratch buffer.
+///   * Phase B (one bracket): scan every cstring under a single
+///     [`UserGuard`] to discover its length (no copy yet).  This
+///     lets Phase C size the staging allocation exactly instead of
+///     pessimistically reserving the full `ARG_MAX = 128 KiB`.
+///   * Phase C (no bracket): allocate a single exact-sized staging
+///     buffer.
+///   * Phase D (one bracket): copy every cstring body into the
+///     staging buffer under a single [`UserGuard`].
+///   * Phase E (no bracket): slice the staging buffer into owned
+///     `String`s.  All `String::from_utf8_lossy` allocations happen
+///     here, never under AC=1 — preserving the SMAP invariant
+///     ("AC=1 only while reading user memory") that motivated the
+///     pre-coalesce per-iteration bracket shape.
+///
+/// Bracket budget: 3 STAC/CLAC pairs for any N, vs the pre-coalesce
+/// shape's `2N + 1` pairs (one per pointer-array load + one per
+/// cstring scan + one final NULL load).  For a typical envp of
+/// 30 entries that is 61 STAC/CLAC pairs collapsed to 3.
+///
+/// Validation discipline is preserved:
+///   * The pointer-array range is range-checked via
+///     [`crate::syscall::validate_user_ptr`] before Phase A.
+///   * Each individual string pointer is range-checked before its
+///     cstring scan begins.
+///   * A bad pointer aborts the read at that index — the caller sees a
+///     truncated argv, matching the existing pre-coalesce behaviour
+///     (which silently treated any faulting cstring as empty).
+///
+/// References:
+///   * Intel SDM Vol. 3A §4.6 — SMAP / CR4.SMAP / EFLAGS.AC semantics.
+///   * POSIX `execve(2)` — argv / envp pointer-array shape and
+///     `ARG_MAX` byte budget.
 pub(crate) fn read_user_argv(ptr: u64) -> alloc::vec::Vec<alloc::string::String> {
+    /// Max number of argv/envp entries we will copy.  Matches the
+    /// pre-coalesce loop bound; chosen well above any realistic argv
+    /// or envp (Mozilla content processes peak at ~14 args / ~40 env).
+    const ARGV_MAX_ENTRIES: usize = 256;
+    /// Max byte budget for the concatenated string bodies — matches the
+    /// kernel-side ARG_MAX (POSIX `execve(2)`) and bounds the single
+    /// staging allocation.
+    const ARG_MAX_BYTES: usize = 128 * 1024;
+    /// Per-string scan bound — same as `CSTRING_SLOT_SIZE` so a runaway
+    /// (un-NUL-terminated) user string cannot drag the scan past one
+    /// page.
+    const STRING_SCAN_MAX: usize = CSTRING_SLOT_SIZE;
+
     let mut result = alloc::vec::Vec::new();
     if ptr == 0 {
         return result;
     }
-    let array = ptr as *const u64;
-    for i in 0..256usize {
-        // SMAP bracket the pointer-array read only.  Each iteration's
-        // `read_cstring_from_user` opens its own UserGuard internally —
-        // we cannot hold a single guard across the whole loop because
-        // `String::from_utf8_lossy` allocates, and the allocator is a
-        // kernel-only path; holding AC=1 across it would defeat the
-        // SMAP invariant ("AC=1 only while reading user memory").
-        let str_ptr = unsafe {
-            let _g = crate::arch::x86_64::smap::UserGuard::new();
-            *array.add(i)
-        };
-        if str_ptr == 0 {
+
+    // Phase A — validate the pointer-array range.  We pessimistically
+    // require `(ARGV_MAX_ENTRIES + 1) × 8` bytes so the array walk in
+    // the bounded inner can copy without per-pointer range checks;
+    // +1 covers the trailing NULL slot.  If that 2 KiB range is not
+    // entirely within user VA, fall back to a progressively tighter
+    // probe — the common case (short argv near the top of the user
+    // stack) typically maps only enough pages to cover its actual
+    // length, not the full 256-entry budget.
+    let array_bytes = (ARGV_MAX_ENTRIES + 1).saturating_mul(8);
+    if crate::syscall::validate_user_ptr(ptr, array_bytes) {
+        return read_user_argv_bounded(ptr, ARGV_MAX_ENTRIES, ARG_MAX_BYTES, STRING_SCAN_MAX);
+    }
+    // Halve the probe size down to 16 bytes (1 pointer + NULL).  Each
+    // step covers a power-of-two prefix; the first one that validates
+    // gives us a safe entry count to walk.  16-byte validation guards
+    // against an utterly bogus pointer that even one entry would
+    // straddle the user/kernel boundary.
+    let mut probe = array_bytes / 2;
+    while probe >= 16 {
+        if crate::syscall::validate_user_ptr(ptr, probe) {
             break;
         }
-        let bytes = read_cstring_from_user(str_ptr);
-        let s = alloc::string::String::from_utf8_lossy(&bytes).into_owned();
-        result.push(s);
+        probe /= 2;
+    }
+    if probe < 16 {
+        return result;
+    }
+    read_user_argv_bounded(ptr, probe / 8 - 1, ARG_MAX_BYTES, STRING_SCAN_MAX)
+}
+
+/// Bounded inner implementation of [`read_user_argv`].  Separated so the
+/// (rare) tight-probe fallback path in the outer wrapper can re-enter
+/// with a smaller `max_entries` without duplicating the Phase B / C
+/// logic.  Caller has already range-validated the pointer array for
+/// `(max_entries + 1) × 8` bytes.
+///
+/// Bracket budget: exactly **three** SMAP brackets for any argv/envp,
+/// regardless of N.  Pre-coalesce shape paid `2N + 1` brackets (one
+/// pointer-array load per entry + one cstring scan per entry + one
+/// final NULL-terminator load).
+fn read_user_argv_bounded(
+    ptr: u64,
+    max_entries: usize,
+    arg_max_bytes: usize,
+    string_scan_max: usize,
+) -> alloc::vec::Vec<alloc::string::String> {
+    let mut result = alloc::vec::Vec::new();
+
+    // Phase A — pointer-array snapshot under ONE SMAP bracket.  We
+    // stop at the first NULL (per POSIX `execve(2)` argv terminator)
+    // rather than blindly reading `max_entries + 1` slots — the latter
+    // is observably wrong because a typical argv lives at the top of
+    // the user stack and the pages just above the actual array are not
+    // mapped, so the unconditional read faults the kernel even though
+    // the user's view is well-formed.
+    //
+    // The early-out preserves the pre-coalesce loop's behaviour while
+    // still paying only ONE STAC/CLAC pair for the whole pointer
+    // walk — vs the pre-coalesce shape's `N` pairs.
+    //
+    // Pre-allocate the full max_entries slots OUTSIDE the bracket so
+    // the per-iteration store under AC=1 cannot trigger the allocator
+    // (which is a kernel-only path; running it under AC=1 would defeat
+    // the SMAP invariant "AC=1 only while reading user memory").
+    let array_src = ptr as *const u64;
+    let mut ptrs: alloc::vec::Vec<u64> = alloc::vec::Vec::with_capacity(max_entries);
+    ptrs.resize(max_entries, 0);
+    let ptrs_dst: *mut u64 = ptrs.as_mut_ptr();
+    let mut count = 0usize;
+    unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
+        while count < max_entries {
+            let p = core::ptr::read_volatile(array_src.add(count));
+            if p == 0 {
+                break;
+            }
+            *ptrs_dst.add(count) = p;
+            count += 1;
+        }
+    }
+    ptrs.truncate(count);
+    if count == 0 {
+        return result;
+    }
+
+    // Per-string range checks — pure arithmetic, no bracket.  A bad
+    // pointer truncates the argv at that index, matching the
+    // pre-coalesce behaviour where `read_cstring_from_user` would
+    // silently return an empty slice on a NULL/invalid pointer.
+    let mut valid_count = 0usize;
+    while valid_count < count {
+        let p = ptrs[valid_count];
+        if p == 0 || !crate::syscall::validate_user_ptr(p, 1) {
+            break;
+        }
+        valid_count += 1;
+    }
+    if valid_count == 0 {
+        return result;
+    }
+
+    // Phase B — measure every cstring length under ONE SMAP bracket so
+    // Phase C can size the staging allocation exactly (avoiding the
+    // 128 KiB worst-case-ARG_MAX upfront alloc that would dwarf the
+    // typical 1-2 KiB argv/envp).  The length is the unterminated-byte
+    // count, capped at `string_scan_max` per the existing per-string
+    // bound.
+    let mut lens: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(valid_count);
+    lens.resize(valid_count, 0);
+    let lens_dst: *mut usize = lens.as_mut_ptr();
+    let mut total_len: usize = 0;
+    unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
+        for i in 0..valid_count {
+            let src = ptrs[i] as *const u8;
+            let mut len = 0usize;
+            while len < string_scan_max {
+                if *src.add(len) == 0 {
+                    break;
+                }
+                len += 1;
+            }
+            *lens_dst.add(i) = len;
+            total_len = total_len.saturating_add(len);
+            if total_len > arg_max_bytes {
+                // Per POSIX `execve(2)` `E2BIG`: exceeding the kernel-
+                // side argv/envp byte budget is a fatal condition.  We
+                // truncate here (matching the pre-coalesce silent-cap
+                // behaviour) — surfacing E2BIG would change the
+                // observable contract.
+                break;
+            }
+        }
+    }
+    // Truncate `valid_count` if Phase B's byte-budget cap stopped early
+    // (the last `lens[i]` past the cap is still 0 from the resize).
+    while valid_count > 0 && total_len > arg_max_bytes {
+        valid_count -= 1;
+        total_len = total_len.saturating_sub(lens[valid_count]);
+    }
+    if valid_count == 0 {
+        return result;
+    }
+
+    // Phase C — allocate exact-sized staging buffer (one allocation,
+    // no bracket).  Total size is the sum of all string lengths, which
+    // for a typical Mozilla content-process execve is ~1-2 KiB rather
+    // than the 128 KiB ARG_MAX worst case.
+    let mut staging: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(total_len);
+    staging.resize(total_len, 0);
+    let staging_ptr: *mut u8 = staging.as_mut_ptr();
+
+    // Compute per-string offsets up front (pure arithmetic).
+    let mut offsets: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(valid_count);
+    {
+        let mut acc = 0usize;
+        for i in 0..valid_count {
+            offsets.push(acc);
+            acc += lens[i];
+        }
+    }
+
+    // Phase D — copy every cstring body into the staging buffer under
+    // ONE SMAP bracket.  Lengths are known precisely from Phase B so
+    // each inner memcpy is a tight bounded loop with no per-byte NUL
+    // check.
+    unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
+        for i in 0..valid_count {
+            let src = ptrs[i] as *const u8;
+            let dst = staging_ptr.add(offsets[i]);
+            let len = lens[i];
+            // Note: cannot use `core::ptr::copy_nonoverlapping` here
+            // because LLVM may lower it to a libc-style memcpy whose
+            // body lives outside the bracket span (cf. the SeqCst
+            // fence rationale in `smap::UserGuard`).  A byte-by-byte
+            // loop with `read_volatile` keeps every read syntactically
+            // inside the bracket scope.
+            let mut k = 0usize;
+            while k < len {
+                *dst.add(k) = core::ptr::read_volatile(src.add(k));
+                k += 1;
+            }
+        }
+    }
+
+    // Phase E — owned String materialisation (no bracket; runs with
+    // AC=0 so the allocator path is SMAP-safe).
+    result.reserve_exact(valid_count);
+    for i in 0..valid_count {
+        let bytes = &staging[offsets[i]..offsets[i] + lens[i]];
+        result.push(alloc::string::String::from_utf8_lossy(bytes).into_owned());
     }
     result
 }
@@ -2908,9 +3144,12 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let timeout_ms: i64 = if arg3 == 0 {
                 -1 // NULL timeout = block indefinitely (POSIX)
             } else {
-                // Parse struct timespec { tv_sec: i64, tv_nsec: i64 }
-                let tv_sec = unsafe { crate::syscall::user_read_u64(arg3) }.unwrap_or(0) as i64;
-                let tv_nsec = unsafe { crate::syscall::user_read_u64(arg3 + 8) }.unwrap_or(0) as i64;
+                // Parse struct timespec { tv_sec: i64, tv_nsec: i64 } under
+                // ONE SMAP bracket (vs the prior two-bracket shape).
+                let (tv_sec_raw, tv_nsec_raw) =
+                    unsafe { crate::syscall::user_read_timespec(arg3) }.unwrap_or((0, 0));
+                let tv_sec = tv_sec_raw as i64;
+                let tv_nsec = tv_nsec_raw as i64;
                 if tv_sec == 0 && tv_nsec == 0 {
                     0 // zero timeout = return immediately
                 } else {
@@ -6216,12 +6455,13 @@ pub fn sys_futex_linux(
     let timeout_ns = if timeout_ptr == 0 {
         TimeoutNs::Indefinite
     } else {
-        // Validate the timespec is fully readable before touching either field.
-        if !crate::syscall::validate_user_ptr(timeout_ptr, 16) {
-            return -14; // EFAULT
-        }
-        let tv_sec  = unsafe { crate::syscall::user_read_u64(timeout_ptr) }.unwrap_or(0);
-        let tv_nsec = unsafe { crate::syscall::user_read_u64(timeout_ptr + 8) }.unwrap_or(0);
+        // Read the full timespec (tv_sec, tv_nsec) under ONE SMAP
+        // bracket; the helper validates the 16-byte range internally
+        // (one validate_user_ptr call vs the prior shape's three).
+        let (tv_sec, tv_nsec) = match unsafe { crate::syscall::user_read_timespec(timeout_ptr) } {
+            Some(t) => t,
+            None => return -14, // EFAULT
+        };
         if tv_nsec >= 1_000_000_000 {
             return -22; // EINVAL — out-of-range nanoseconds, per futex(2).
         }
