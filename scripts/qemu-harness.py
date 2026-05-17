@@ -2600,10 +2600,20 @@ def _kdb_recv(port: int, req: dict, timeout: float = 30.0) -> bytes:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise last_err or socket.timeout(f"kdb deadline {timeout}s exceeded")
-        # Per-attempt socket timeout bounded so a stuck single attempt
-        # doesn't burn the whole deadline.
+        # Per-attempt socket timeout.  For connect-refused / RST we want
+        # to retry quickly, but once the connection IS established a
+        # large response (multiple MSS) drains over several TCP round-
+        # trips and `recv` may legitimately block longer than 3 s for a
+        # single chunk.  Use the FULL remaining deadline as the socket
+        # timeout — connect-refused still fires fast (kernel returns
+        # ECONNREFUSED immediately, no need to wait), but a slow drain
+        # gets its fair share of the deadline.  The earlier 3 s cap was
+        # specifically a problem for ops that emit >1460 B (one MSS):
+        # the kdb server is one-response-per-connection, so a retry on
+        # the original short timeout reopens a fresh socket whose new
+        # 4-tuple the server has already marked responded=true.
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(min(3.0, max(0.5, remaining)))
+        s.settimeout(max(0.5, remaining))
         try:
             s.connect(("127.0.0.1", port))
             s.sendall(payload)
@@ -2805,6 +2815,282 @@ def cmd_fd_map(args):
             "removed": removed,
             "changed": changed,
             "snapshot": resp,
+        }
+
+    _out(resp)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# thread-park-audit — PNG-1 plateau characterisation
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Wraps kdb op 'thread-park-audit' (requires --features firefox-test,kdb).
+# Returns the structured per-thread view documented in kernel/src/kdb.rs;
+# adds --save/--diff support for cross-snapshot characterisation so the
+# PNG-1 dispatch can confirm determinism across 3 trials.
+#
+# Output shape (one entry per non-Dead thread):
+#   {
+#     "tick": N, "sc_total": M, "pid_filter": F,
+#     "threads": [
+#       { "tid", "pid", "proc_name", "thread_name", "state",
+#         "rip", "rsp", "wake_tick", "blocked_for_ticks",
+#         "syscall": {"nr","name","arg0"} | null,
+#         "wait": { "kind": "futex"|"poll-bell"|"fd-blocked"|"sleep"
+#                   |"vfork-complete"|"futex-other"|"unknown", ... }
+#       }, ...
+#     ]
+#   }
+#
+# Useful invocations:
+#   thread-park-audit <sid>                       — full snapshot
+#   thread-park-audit <sid> --pid 1               — Mozilla parent only
+#   thread-park-audit <sid> --save plateau-1      — save for later diff
+#   thread-park-audit <sid> --diff plateau-1      — diff current vs saved
+
+# Regex for the per-thread serial-mirror lines emitted by op_thread_park_audit.
+# Captured groups feed _thread_park_from_serial's record reconstruction.
+_THREAD_PARK_LINE_RE = re.compile(
+    r"\[THREAD-PARK\] id=(\d+) tid=(\d+) pid=(\d+) pname=(\S+) tname=(\S+) "
+    r"state=(\S+) rip=(0x[0-9a-fA-F]+) rsp=(0x[0-9a-fA-F]+) "
+    r"wake_tick=(\d+) blocked_for=(\d+) sc_nr=(-?\d+) sc_arg0=(0x[0-9a-fA-F]+) "
+    r"wait=(\S+)$"
+)
+_THREAD_PARK_BEGIN_RE = re.compile(
+    r"\[THREAD-PARK\] BEGIN audit_id=(\d+) tick=(\d+) sc_total=(\d+) "
+    r"pid_filter=(\d+) threads=(\d+)"
+)
+_THREAD_PARK_END_RE = re.compile(
+    r"\[THREAD-PARK\] END audit_id=(\d+) emitted_json=(\d+) threads_total=(\d+)"
+)
+
+
+def _thread_park_parse_wait(wait_suffix: str) -> dict:
+    """Parse the compact `wait=KIND[,kv]*` suffix into the JSON-shape dict."""
+    parts = wait_suffix.split(",")
+    kind = parts[0]
+    if "=" in kind:
+        # No leading kind — empty wait field; treat as unknown.
+        return {"kind": "unknown"}
+    out: dict = {"kind": kind}
+    for p in parts[1:]:
+        if "=" not in p: continue
+        k, v = p.split("=", 1)
+        if v.startswith("0x"):
+            out[k] = v
+        else:
+            try: out[k] = int(v)
+            except ValueError: out[k] = v
+    return out
+
+
+def _thread_park_from_serial(sess: dict, sid: str, pid_filter: int) -> dict:
+    """Reconstruct the thread-park-audit response from serial-log lines.
+
+    Reads the session's serial log, finds the MOST RECENT BEGIN/END pair,
+    and synthesises a dict shaped like the kdb JSON.  Returns
+    `{"threads": []}` if no markers found.
+    """
+    serial_path = sess.get("serial_log")
+    if not serial_path:
+        return {"threads": []}
+    try:
+        lines = Path(serial_path).read_text(errors="replace").splitlines()
+    except OSError:
+        return {"threads": []}
+
+    # Walk backwards: find the most recent END, then the matching BEGIN.
+    end_idx: int | None = None
+    end_audit_id: int | None = None
+    for i in range(len(lines) - 1, -1, -1):
+        m = _THREAD_PARK_END_RE.search(lines[i])
+        if m:
+            end_idx = i
+            end_audit_id = int(m.group(1))
+            break
+    if end_idx is None or end_audit_id is None:
+        return {"threads": []}
+    begin_idx: int | None = None
+    begin_meta: dict = {}
+    for i in range(end_idx - 1, -1, -1):
+        m = _THREAD_PARK_BEGIN_RE.search(lines[i])
+        if m and int(m.group(1)) == end_audit_id:
+            begin_idx = i
+            begin_meta = {
+                "tick":       int(m.group(2)),
+                "sc_total":   int(m.group(3)),
+                "pid_filter": int(m.group(4)),
+            }
+            break
+    if begin_idx is None:
+        return {"threads": []}
+
+    threads: list[dict] = []
+    for ln in lines[begin_idx + 1: end_idx]:
+        m = _THREAD_PARK_LINE_RE.search(ln)
+        if not m: continue
+        if int(m.group(1)) != end_audit_id: continue
+        tid = int(m.group(2)); pid = int(m.group(3))
+        if pid_filter and pid != pid_filter: continue
+        sc_nr   = int(m.group(11))
+        sc_arg0 = m.group(12)
+        syscall = None
+        if sc_nr >= 0:
+            syscall = {
+                "nr":   sc_nr,
+                "name": _syscall_name_lite(sc_nr),
+                "arg0": sc_arg0,
+            }
+        threads.append({
+            "tid":               tid,
+            "pid":               pid,
+            "proc_name":         m.group(4),
+            "thread_name":       m.group(5),
+            "state":             m.group(6),
+            "rip":               m.group(7),
+            "rsp":               m.group(8),
+            "wake_tick":         int(m.group(9)),
+            "blocked_for_ticks": int(m.group(10)),
+            "syscall":           syscall,
+            "wait":              _thread_park_parse_wait(m.group(13)),
+        })
+    return {
+        **begin_meta,
+        "threads": threads,
+    }
+
+
+def _syscall_name_lite(nr: int) -> str:
+    """Tiny name table for the syscalls the audit classifier cares about.
+
+    Mirrors kernel/src/perf.linux_syscall_name for the subset that turns
+    up in `wait=` classifiers; unknown numbers render as `nr=N`.
+    """
+    table = {
+        0: "read", 7: "poll", 17: "pread64", 23: "select",
+        35: "nanosleep", 43: "accept", 45: "recvfrom", 46: "sendmsg",
+        47: "recvmsg", 202: "futex", 230: "clock_nanosleep",
+        232: "epoll_wait", 270: "pselect6", 271: "ppoll",
+        281: "epoll_pwait", 288: "accept4", 295: "preadv",
+    }
+    return table.get(nr, f"nr={nr}")
+
+
+def cmd_thread_park_audit(args):
+    """PNG-1 plateau characterisation: per-thread wait-object classifier.
+
+    For every thread not in state=Dead, classifies what kernel object the
+    thread is parked on (futex/poll-bell/fd-blocked/sleep/vfork-complete)
+    using the FUTEX_WAITERS reverse-lookup table, the per-TID last-syscall
+    sample, and the process FD tables.  See kernel/src/kdb.rs for the full
+    `wait.kind` taxonomy.
+
+    Requires the session to have been started with --features firefox-test,kdb.
+    """
+    sess = _load_session(args.sid)
+    port = int(sess.get("kdb_host_port") or 0)
+    if port <= 0:
+        _out({"error": "session was not started with --features kdb"})
+        sys.exit(1)
+
+    pid = getattr(args, "pid", 0) or 0
+    req: dict = {"op": "thread-park-audit"}
+    if pid:
+        req["pid"] = pid
+
+    timeout = float(getattr(args, "timeout", 30.0) or 30.0)
+    # We trigger the op via kdb (so the kernel emits BOTH the JSON
+    # response AND the per-thread serial mirror), then fall back to
+    # parsing the serial log when the kdb response is unparseable or
+    # truncated.  The kernel TCP stack is observed to drain large
+    # responses over multiple pump ticks; for pid=1 (Mozilla, 19+
+    # threads) the host's recv deadline may expire before the full
+    # JSON arrives.  The serial mirror is unconditionally complete.
+    kdb_err: str | None = None
+    resp: dict
+    try:
+        raw = _kdb_recv(port, req, timeout=timeout)
+        try:
+            resp = json.loads(raw.strip().decode("utf-8", errors="replace"))
+        except (json.JSONDecodeError, ValueError) as e:
+            kdb_err = f"malformed kdb response (likely TCP-stalled): {e}"
+            resp = _thread_park_from_serial(sess, args.sid, pid)
+            if not resp.get("threads"):
+                _out({"error": kdb_err,
+                      "raw": raw.decode(errors="replace")})
+                sys.exit(1)
+            resp["_kdb_fallback"] = kdb_err
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        kdb_err = f"kdb connect failed on 127.0.0.1:{port}: {e}"
+        # Even on socket timeout the kernel may have emitted the serial
+        # mirror — try the fallback before giving up.
+        resp = _thread_park_from_serial(sess, args.sid, pid)
+        if not resp.get("threads"):
+            _out({"error": kdb_err})
+            sys.exit(1)
+        resp["_kdb_fallback"] = kdb_err
+
+    # Optional summary: counts per wait.kind, helpful at-a-glance triage.
+    if isinstance(resp, dict) and isinstance(resp.get("threads"), list):
+        kinds: dict[str, int] = {}
+        for t in resp["threads"]:
+            w = (t.get("wait") or {})
+            k = w.get("kind", "unknown")
+            kinds[k] = kinds.get(k, 0) + 1
+        resp["_summary"] = {
+            "thread_count": len(resp["threads"]),
+            "by_kind": dict(sorted(kinds.items(), key=lambda kv: -kv[1])),
+        }
+
+    snap_name = getattr(args, "save", None)
+    diff_name = getattr(args, "diff", None)
+
+    if snap_name:
+        path = HARNESS_DIR / f"{args.sid}.thread-park.{snap_name}.json"
+        try:
+            path.write_text(json.dumps(resp))
+            resp["_saved"] = str(path)
+        except OSError as e:
+            resp["_save_error"] = str(e)
+
+    if diff_name:
+        path = HARNESS_DIR / f"{args.sid}.thread-park.{diff_name}.json"
+        if not path.exists():
+            _out({"error": f"no saved snapshot '{diff_name}' at {path}"})
+            sys.exit(1)
+        try:
+            prev = json.loads(path.read_text())
+        except Exception as e:
+            _out({"error": f"could not load snapshot '{diff_name}': {e}"})
+            sys.exit(1)
+
+        def _entry_key(e: dict) -> str:
+            return f"{e.get('pid')}/{e.get('tid')}"
+        # For per-thread diffs we care primarily about the wait.kind
+        # transitions: a thread that flipped from futex→poll-bell between
+        # snapshots is much more interesting than one that just advanced
+        # blocked_for_ticks.  We emit both raw added/removed/changed and
+        # a "kind_changed" subset for fast triage.
+        prev_map = {_entry_key(e): e for e in prev.get("threads", [])}
+        curr_map = {_entry_key(e): e for e in resp.get("threads", [])}
+        added    = [curr_map[k] for k in curr_map if k not in prev_map]
+        removed  = [prev_map[k] for k in prev_map if k not in curr_map]
+        kind_changed = []
+        for k in curr_map:
+            if k not in prev_map: continue
+            old_kind = (prev_map[k].get("wait") or {}).get("kind")
+            new_kind = (curr_map[k].get("wait") or {}).get("kind")
+            if old_kind != new_kind:
+                kind_changed.append({
+                    "key": k, "from": old_kind, "to": new_kind,
+                    "before": prev_map[k], "after": curr_map[k],
+                })
+        resp = {
+            "diff_against": diff_name,
+            "added":         added,
+            "removed":       removed,
+            "kind_changed":  kind_changed,
+            "snapshot":      resp,
         }
 
     _out(resp)
@@ -6014,7 +6300,7 @@ def main():
         "bell-stats", "cache-audit", "cache-aliasing", "fault-cache-keys",
         "w215-cache-residency", "tlb-stats", "w215-diag",
         "arm-phys",
-        "coverage-flush", "proc-metrics",
+        "coverage-flush", "proc-metrics", "thread-park-audit",
     ])
     p_kdb.add_argument("args", nargs="*",
                         help="Op-specific positional args: "
@@ -6052,6 +6338,25 @@ def main():
                           help="Diff current snapshot against a previously --save'd NAME")
     p_fdmap.add_argument("--timeout", type=float, default=30.0,
                           help="kdb overall deadline (default 30.0s); retried internally.")
+
+    # thread-park-audit — PNG-1 plateau characterisation
+    p_tpa = sub.add_parser(
+        "thread-park-audit",
+        help="[PNG-1] Per-thread wait-object classifier (futex/poll-bell/"
+             "fd-blocked/sleep/vfork-complete/unknown). Cross-references "
+             "FUTEX_WAITERS, per-TID last-syscall sample, and FD tables. "
+             "Requires --features firefox-test,kdb.")
+    p_tpa.add_argument("sid")
+    p_tpa.add_argument("--pid", type=lambda x: int(x, 0), default=0,
+                        help="Filter to one PID (0 or omit = all processes)")
+    p_tpa.add_argument("--save", metavar="NAME", default=None,
+                        help="Save snapshot to "
+                             "~/.astryx-harness/<sid>.thread-park.<NAME>.json")
+    p_tpa.add_argument("--diff", metavar="NAME", default=None,
+                        help="Diff current snapshot against a previously --save'd NAME; "
+                             "emits added/removed/kind_changed for fast triage")
+    p_tpa.add_argument("--timeout", type=float, default=30.0,
+                        help="kdb overall deadline (default 30.0s); retried internally.")
 
     # cache-audit — W215 H1 diagnostic: walk the page cache checking for
     # zero-refcount entries.  Requires --features firefox-test,kdb at start.
@@ -6427,6 +6732,7 @@ def main():
         "kdb":         cmd_kdb,
         "tlb-stats":   cmd_tlb_stats,
         "fd-map":      cmd_fd_map,
+        "thread-park-audit": cmd_thread_park_audit,
         "cache-audit":       cmd_cache_audit,
         "cache-aliasing":    cmd_cache_aliasing,
         "fault-cache-keys":  cmd_fault_cache_keys,

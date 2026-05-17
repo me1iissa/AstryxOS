@@ -538,14 +538,17 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     // Userspace-RIP-sampler bookkeeping: stamp the current CPU's
     // last-syscall tick so the timer ISR can detect threads that have
     // not issued any syscall for SILENT_THRESHOLD_TICKS while still
-    // running in Ring 3 (W149 / W152).  Lock-free; two relaxed atomic
-    // stores.  Behind firefox-test so production builds pay nothing.
+    // running in Ring 3 (W149 / W152).  Also stash the syscall nr and
+    // arg0 so kdb `thread-park-audit` (PNG-1) can classify what each
+    // blocked thread is parked inside without a syscall-ring walk.
+    // Lock-free; four relaxed atomic stores. Behind firefox-test so
+    // production builds pay nothing.
     #[cfg(feature = "firefox-test")]
     {
         let tid = crate::proc::current_tid();
         let tick = crate::arch::x86_64::irq::TICK_COUNT
             .load(core::sync::atomic::Ordering::Relaxed);
-        crate::proc::sample::record_syscall(tid, tick);
+        crate::proc::sample::record_syscall(tid, tick, num, arg1);
     }
 
     let result = if crate::subsys::linux::syscall::is_linux_abi() {
