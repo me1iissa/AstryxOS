@@ -119,6 +119,30 @@ pub fn page_ref_dec(phys_addr: u64) -> u16 {
     }
 }
 
+/// Number of user-PTE references the kernel believes are alive on `phys`.
+///
+/// This is a thin alias for [`page_ref_count`] that documents the W215
+/// `pte_share_count` invariant: every user-PTE install path
+/// (page-fault handler, ELF loader, fork CoW, MAP_FIXED) MUST pair its
+/// `map_page_in` with a matching `page_ref_inc`, and every PTE-clearing
+/// path (unmap, mremap, mprotect→PROT_NONE, process exit) MUST pair its
+/// PTE-clear with a matching `page_ref_dec`.  When the invariant holds,
+/// the value returned here is the count of live user PTEs that reference
+/// `phys`.  When [`crate::mm::pmm::free_page`] is about to return a frame
+/// to the PMM free list, this value MUST be zero — otherwise the frame
+/// would be repurposed while a stale PTE still maps a user VA to it,
+/// producing the W215 fault class (post-evict execution from a recycled
+/// physical frame).
+///
+/// Per Intel SDM Vol. 3A §4.10.5, paging-structure changes must be
+/// propagated to every processor before a physical frame is repurposed.
+/// Per POSIX mmap(2), the page contents observable through a mapping
+/// must remain valid for the lifetime of the mapping.
+#[inline]
+pub fn pte_share_count(phys_addr: u64) -> u16 {
+    page_ref_count(phys_addr)
+}
+
 /// Get the current reference count for a physical page.
 ///
 /// Returns 0 if the refcount table has not yet been initialised (early-boot
