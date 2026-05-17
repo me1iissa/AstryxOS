@@ -375,6 +375,129 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
             }
         }
 
+        // ── SMAP-fault triage ─────────────────────────────────────────────
+        // Per Intel SDM Vol. 3A §4.6, when CR4.SMAP=1 and EFLAGS.AC=0, a
+        // supervisor-mode access to a user-mapped page (PTE.U=1) faults with
+        // the same #PF error-code shape as an ordinary access fault.  The
+        // CoW / demand-paging arms below "resolve" such a fault by tweaking
+        // the PTE, but the PTE was never the problem — AC=0 is — so the
+        // retry on IRET re-fires the same fault.  Result: 400M+ #PF / sec
+        // until the scheduler watchdog bugchecks (observed: PID 2 glxtest
+        // stuck >60K ticks at CR2=0x7ffffffedfe8).  Catch the loop here:
+        // when the fault is from supervisor mode (error bit 2 clear) AND
+        // SMAP is enabled AND the faulting frame had AC=0 AND the PTE has
+        // U=1 AND the CR2 is a user-half address, this is a kernel bug —
+        // a kernel codepath dereferenced a user pointer without bracketing
+        // it in `crate::arch::x86_64::smap::UserGuard`.  Surface the RIP
+        // and bugcheck so the offending site is named in the dump rather
+        // than burning the CPU in a silent retry storm.
+        if (error_code & 4) == 0
+            && crate::arch::x86_64::smap::SMAP_ENABLED.load(Ordering::Relaxed)
+            && (frame.rflags & (1u64 << 18)) == 0
+            && cr2 < 0x0000_8000_0000_0000
+        {
+            // Inspect the PTE: only flag this as SMAP if the page is user-mapped
+            // (PTE.U=1).  A supervisor access to a kernel page (PTE.U=0) is a
+            // genuine kernel bug of a different class (e.g. NULL deref); let
+            // the normal handler path take it through the bugcheck.
+            let cr3_now: u64;
+            unsafe { asm!("mov {}, cr3", out(reg) cr3_now, options(nomem, nostack, preserves_flags)); }
+            let page_addr = cr2 & !0xFFF;
+            let pte = crate::mm::vmm::read_pte(cr3_now, page_addr);
+            // PAGE_USER = 1 << 2; PAGE_PRESENT = 1 << 0.
+            if pte & 1 != 0 && pte & 4 != 0 {
+                // Dump the ISR-saved GPRs BEFORE invoking ke_bugcheck (which
+                // clobbers them).  Layout per isr_with_error macro:
+                //   frame[-2]=rax  frame[-3]=rcx  frame[-4]=rdx  frame[-5]=rsi
+                //   frame[-6]=rdi  frame[-7]=r8   frame[-8]=r9   frame[-9]=r10
+                //   frame[-10]=r11 frame[-11]=rbx frame[-12]=rbp frame[-13]=r12
+                //   frame[-14]=r13 frame[-15]=r14 frame[-16]=r15
+                // The faulting RIP almost always pinpoints the inner copy
+                // primitive; the caller is recovered from RDI/RSI (the
+                // copy_nonoverlapping dst/src) and the RBP-chain backtrace.
+                let base = frame as *const InterruptFrame as *const u64;
+                let (rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11,
+                     rbx, rbp, r12, r13, r14, r15) = unsafe {(
+                    *base.sub(2),  *base.sub(3),  *base.sub(4),
+                    *base.sub(5),  *base.sub(6),  *base.sub(7),
+                    *base.sub(8),  *base.sub(9),  *base.sub(10),
+                    *base.sub(11), *base.sub(12), *base.sub(13),
+                    *base.sub(14), *base.sub(15), *base.sub(16),
+                )};
+                crate::serial_println!(
+                    "\n[SMAP/FAULT] supervisor access to user page \
+                     cr2={:#x} rip={:#x} code={:#x} pte={:#x} cr3={:#x} \
+                     rflags={:#x} cpu={} pid={} tid={}",
+                    cr2, frame.rip, error_code, pte, cr3_now, frame.rflags,
+                    crate::arch::x86_64::apic::cpu_index(),
+                    crate::proc::current_pid_lockless(),
+                    crate::proc::current_tid(),
+                );
+                crate::serial_println!(
+                    "[SMAP/FAULT/regs] rax={:#018x} rcx={:#018x} rdx={:#018x} rsi={:#018x}",
+                    rax, rcx, rdx, rsi);
+                crate::serial_println!(
+                    "[SMAP/FAULT/regs] rdi={:#018x} r8 ={:#018x} r9 ={:#018x} r10={:#018x}",
+                    rdi, r8, r9, r10);
+                crate::serial_println!(
+                    "[SMAP/FAULT/regs] r11={:#018x} rbx={:#018x} rbp={:#018x} r12={:#018x}",
+                    r11, rbx, rbp, r12);
+                crate::serial_println!(
+                    "[SMAP/FAULT/regs] r13={:#018x} r14={:#018x} r15={:#018x} rsp={:#018x}",
+                    r13, r14, r15, frame.rsp);
+                // Walk a few kernel return addresses from the saved RBP so
+                // the caller chain is visible without GDB attach.  Stops at
+                // first non-canonical / unmapped frame.
+                {
+                    let mut bp = rbp;
+                    for depth in 0..8 {
+                        if bp == 0 || bp < 0xFFFF_8000_0000_0000
+                                   || bp > 0xFFFF_FFFF_FFFF_F000 {
+                            break;
+                        }
+                        let saved_rip = unsafe {
+                            core::ptr::read_volatile((bp + 8) as *const u64)
+                        };
+                        let next_bp = unsafe {
+                            core::ptr::read_volatile(bp as *const u64)
+                        };
+                        crate::serial_println!(
+                            "[SMAP/FAULT/bt] #{} rbp={:#x} ret={:#x}",
+                            depth, bp, saved_rip);
+                        if next_bp <= bp { break; }
+                        bp = next_bp;
+                    }
+                }
+                // RBP may be 0 or a non-pointer (memcpy's `rep` setup blows
+                // it away in many compilations).  As a fallback dump a few
+                // u64s near the top of the kernel stack — the immediate
+                // memcpy caller's return address is at [RSP] (it pushed
+                // nothing) and surrounding slots often pin the actual
+                // calling frame for slow-stepping.
+                {
+                    let ksp = frame.rsp;
+                    if ksp >= 0xFFFF_8000_0000_0000 && ksp < 0xFFFF_FFFF_FFFF_F000 {
+                        for i in 0..16usize {
+                            let addr = ksp + (i * 8) as u64;
+                            let v = unsafe {
+                                core::ptr::read_volatile(addr as *const u64)
+                            };
+                            crate::serial_println!(
+                                "[SMAP/FAULT/stk] +{:#04x} {:#x} = {:#x}",
+                                i*8, addr, v);
+                        }
+                    }
+                }
+                crate::ke::bugcheck::ke_bugcheck(
+                    crate::ke::bugcheck::BUGCHECK_KERNEL_PAGE_FAULT,
+                    cr2,
+                    error_code,
+                    frame.rip,
+                    pte,
+                );
+            }
+        }
+
         if handle_page_fault(cr2, error_code, frame) {
             // Deferred preemption: check if a reschedule is pending.
             // This is a safe point — all locks released, returning to user mode.

@@ -48,8 +48,9 @@ const WALK_BUDGET_PER_TICK: usize = 4096;
 /// `gen_ws` share a u64-aligned pair so the bool-vs-counter discrimination
 /// must use a single u32 with a flag bit rather than a separate `bool`
 /// field — adding a trailing `bool` re-pads the struct to 32 bytes and
-/// pushes `.bss` past `BOOT_INFO_PHYS_BASE = 0x700000`, corrupting the
-/// bootloader handoff page during `_start` BSS zeroing.  Cite System V
+/// pushes `.bss` past `BOOT_INFO_PHYS_BASE` (see `shared/src/lib.rs`),
+/// corrupting the bootloader handoff page during `_start` BSS zeroing.
+/// Cite System V
 /// AMD64 ABI §3.1.2 (aggregate alignment) and Intel SDM Vol. 3A §2.5
 /// (page-table identity-mapped low memory used for boot info).
 #[derive(Copy, Clone)]
