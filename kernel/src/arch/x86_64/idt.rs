@@ -182,8 +182,11 @@ pub fn init() {
             // Vol. 3B §17.2.4, DR0–DR3 are per-CPU; this vector lets the
             // sender CPU publish a new (addr, ctrl) pair and have every
             // online CPU pick it up by reprogramming its own DRs.
-            // Diagnostic-only; gated on `firefox-test`.
-            #[cfg(feature = "firefox-test")]
+            // Diagnostic-only; gated on `w215-diag` (superset of
+            // `firefox-test`).  When the feature is off the vector
+            // stays unassigned and the spurious-IRQ handler catches any
+            // stray IPI — see the IPI-broadcast `cpu_count` invariant.
+            #[cfg(feature = "w215-diag")]
             IDT[0xF1].set_handler(fix(super::irq::irq_w215_dr_sync_handler as *const () as u64), kernel_cs, 0, 0);
 
             // Syscall interrupt (vector 0x80) — for int 0x80 style syscalls
@@ -240,8 +243,8 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
     // interrupted RIP without printing any further diagnostics.  Per
     // Intel SDM Vol. 3B §17.2.5 (Debug Status Register DR6), B0..B3
     // identify which DRn triggered.  Diagnostic-only; gated on
-    // `firefox-test`.
-    #[cfg(feature = "firefox-test")]
+    // `w215-diag` so non-diagnostic builds carry no DR0 dispatch.
+    #[cfg(feature = "w215-diag")]
     if vector == 1 {
         if crate::arch::x86_64::debug_reg::handle_db_exception(
             frame.rip, frame.rsp, frame.rflags, frame.cs,

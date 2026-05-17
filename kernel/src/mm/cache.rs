@@ -136,6 +136,7 @@ pub fn insert(mount_idx: usize, inode: u64, page_offset: u64, phys: u64) {
                     crate::mm::w215_diag::KIND_EVICT,
                     crate::mm::w215_diag::pack_cache_key(inode, page_offset),
                 );
+                #[cfg(feature = "w215-diag")]
                 crate::mm::w215_crc::record_evict(old_entry.phys);
             }
         } else {
@@ -155,7 +156,10 @@ pub fn insert(mount_idx: usize, inode: u64, page_offset: u64, phys: u64) {
         let _ = crate::mm::w215_diag::preins_clear_on_insert(phys);
         // Arm-1 CRC walker shadow-table snapshot.  Done AFTER the cache
         // lock is released so we do not hold two locks at once; the
-        // shadow-table mutex is the only lock involved.
+        // shadow-table mutex is the only lock involved.  Gated behind
+        // `w215-diag` so the demo path does not perform the per-insert
+        // 4 KiB CRC scan that touches the ~2 MiB shadow table.
+        #[cfg(feature = "w215-diag")]
         crate::mm::w215_crc::record_insert(phys, inode, page_offset);
     }
 
@@ -197,6 +201,7 @@ pub fn evict(mount_idx: usize, inode: u64, page_offset: u64) -> Option<u64> {
                 crate::mm::w215_diag::OP_EVICT,
                 ((page_offset >> 12) & 0xFFFF_FFFF) as u32,
             );
+            #[cfg(feature = "w215-diag")]
             crate::mm::w215_crc::record_evict(entry.phys);
         }
         Some(entry.phys)
@@ -445,6 +450,7 @@ pub fn evict_if_phys(
                 crate::mm::w215_diag::KIND_EVICT,
                 crate::mm::w215_diag::pack_cache_key(inode, page_offset),
             );
+            #[cfg(feature = "w215-diag")]
             crate::mm::w215_crc::record_evict(expected_phys);
         }
         true

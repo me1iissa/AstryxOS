@@ -45,7 +45,7 @@
 //! `docs/W215_DISPOSITIVE_SOAK_2026-05-16.md` for the soak context that
 //! motivates this approach.
 
-#![cfg(feature = "firefox-test")]
+#![cfg(feature = "w215-diag")]
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, Ordering};
 

@@ -503,8 +503,10 @@ extern "C" fn timer_tick() {
     // `arch::x86_64::debug_reg::arm_write_watchpoint` so the offending
     // kernel write site self-identifies through `#DB`.  Per Intel SDM
     // Vol. 3B §17.2.4 (Debug Address Registers).  Diagnostic-only;
-    // does nothing without the `firefox-test` feature.
-    #[cfg(feature = "firefox-test")]
+    // gated behind `w215-diag` (a superset of `firefox-test`) because
+    // the walker's shadow table is a ~2 MiB BSS static that exposes a
+    // latent PMM-vs-BSS reservation gap on the demo path.
+    #[cfg(feature = "w215-diag")]
     crate::mm::w215_crc::crc_walk_tick(cpu as u32);
 
     // Notify the scheduler about the tick.
@@ -537,13 +539,13 @@ irq_stub!(irq_e1000_handler, e1000_interrupt);
 irq_stub!(irq_virtio_blk_handler, virtio_blk_interrupt);
 irq_stub!(irq_virtio_serial_handler, virtio_serial_interrupt);
 irq_stub!(irq_tlb_shootdown_handler, tlb_shootdown_interrupt);
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "w215-diag")]
 irq_stub!(irq_w215_dr_sync_handler, w215_dr_sync_interrupt);
 
 /// W215 Arm-1 DR0/DR7 sync IPI body.  Programs this CPU's DR0/DR7 from
 /// the values published by `arch::x86_64::debug_reg::arm_write_watchpoint`.
-/// EOIs the LAPIC.  Diagnostic-only.
-#[cfg(feature = "firefox-test")]
+/// EOIs the LAPIC.  Diagnostic-only; gated behind `w215-diag`.
+#[cfg(feature = "w215-diag")]
 extern "C" fn w215_dr_sync_interrupt() {
     crate::arch::x86_64::debug_reg::handle_w215_dr_sync_ipi();
 }

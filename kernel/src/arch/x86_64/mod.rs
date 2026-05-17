@@ -1,7 +1,9 @@
 //! x86_64 architecture-specific code.
 
 pub mod apic;
-#[cfg(feature = "firefox-test")]
+// DR0 W-watchpoint plumbing for the W215 Arm-1 CRC walker.
+// Gated behind `w215-diag` together with the walker itself.
+#[cfg(feature = "w215-diag")]
 pub mod debug_reg;
 pub mod gdt;
 pub mod idt;
