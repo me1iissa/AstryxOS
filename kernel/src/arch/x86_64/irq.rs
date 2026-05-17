@@ -497,6 +497,12 @@ extern "C" fn timer_tick() {
     // ring is empty (a single atomic load that fast-paths out).
     crate::mm::tlb::on_cpu_tick(tick);
 
+    // Per-process activity-metrics dump.  Wait-free fast path: one
+    // atomic load + a saturating subtract; only the CPU whose tick
+    // crosses the boundary CAS-claims the publish slot and emits.  See
+    // `crate::proc::proc_metrics::maybe_emit_periodic`.
+    crate::proc::proc_metrics::maybe_emit_periodic(tick);
+
     // W215 Arm-1 diagnostic: walk a small slice of the page cache and
     // CRC32 each entry against the value captured at insert time.  On
     // mismatch, arm a hardware DR0 write-watchpoint via

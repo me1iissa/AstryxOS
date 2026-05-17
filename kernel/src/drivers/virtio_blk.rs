@@ -1169,6 +1169,24 @@ fn do_io(req_type: u32, lba: u64, count: u32, buf: *mut u8) -> Result<(), BlockE
         return Err(BlockError::IoError);
     }
 
+    // Per-process disk-byte counter.  Attributed to the currently-running
+    // PID — either the user task that issued the syscall (read/write/mmap
+    // page-cache miss) or PID 0 for kernel-internal IO (mount, page-cache
+    // readahead from a kernel worker).  Counted at submission time so the
+    // sample reflects what the process actually requested, regardless of
+    // whether the IO subsequently succeeds.  Bumped exactly once per do_io
+    // call (i.e. per logical caller request) rather than per MAX_SECTORS
+    // batch.
+    {
+        let _io_pid = crate::proc::current_pid_lockless();
+        let bytes = (count as u64) * (SECTOR_SIZE as u64);
+        if req_type == VIRTIO_BLK_T_IN {
+            crate::proc::proc_metrics::bump_disk_read(_io_pid, bytes);
+        } else if req_type == VIRTIO_BLK_T_OUT {
+            crate::proc::proc_metrics::bump_disk_write(_io_pid, bytes);
+        }
+    }
+
     const MAX_SECTORS: u32 = 2048;
     let mut sector_idx = 0u32;
 
