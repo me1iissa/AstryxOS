@@ -6390,6 +6390,353 @@ fn sys_rt_sigprocmask_linux(how: u64, set: u64, oldset: u64, _sigsetsize: u64) -
 pub(crate) static FUTEX_WAKE_GHOST_COUNT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// History-based FUTEX_WAKE_GHOST detection (BZ 25847 measurement)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// The snapshot-based `[FUTEX_WAKE_GHOST]` diagnostic above only counts a
+// "ghost wake" when a sibling waiter is parked AT THAT INSTANT inside the
+// 256-byte cluster around the caller's uaddr.  This understates the
+// glibc cond_var two-group cycling pattern: under that pattern, the
+// signaller wakes group N while the prior waiter on group N-1 has already
+// transitioned and been removed from the wait queue, so the snapshot lookup
+// finds nothing even though the cycling structure is exactly the same as
+// the literal-concurrent case.
+//
+// The history-based detector below records every FUTEX_WAIT entry in a
+// bounded global ring buffer (uaddr, pid, tid, tick).  When a FUTEX_WAKE
+// returns `woken=0`, the WAKE path scans the recent history (default
+// window: 10 ticks ≈ 100 ms at 100 Hz) for any waiter on the same pid
+// within ±128 bytes of the wake uaddr.  A hit increments the history-hits
+// counter and bumps an offset-bucketed histogram, and a rate-limited
+// `[FUTEX_WAKE_GHOST_HIST]` line is emitted.
+//
+// Per glibc BZ 25847 (cond_var __g_refs[2] dual-group bookkeeping):
+//   https://sourceware.org/bugzilla/show_bug.cgi?id=25847
+// The canonical __g_refs offsets inside `pthread_cond_t` are +0x50 and
+// +0x54 (group-0 and group-1 ref counters).  A wake to one group while
+// the prior generation's waiter was parked on the other group is the
+// dominant signature of the BZ 25847 cycling pattern.
+//
+// Per futex(2): `FUTEX_WAKE returns the number of waiters that were woken
+// up`; a return of 0 with no nearby waiter is legitimate (no thread was
+// parked).  A return of 0 with a recent nearby waiter is the diagnostic of
+// interest.  Per POSIX pthread_cond_signal(3p): `If no threads are blocked
+// on the condition variable, then pthread_cond_signal() shall have no
+// effect`.
+//
+// The ring is global (not per-process) — per the dispatch trade-off note,
+// touching the Process struct for a ring field would surface across every
+// init site; a global ring with TGID filtering at correlate-time keeps the
+// patch localised and additive.  TGID filtering is cheap (one u64 compare
+// per ring entry scanned, ≤ 256 entries per scan).
+//
+// Memory footprint: 256 entries × 32 bytes = 8 KB total (single
+// allocation, owned by `FUTEX_WAIT_HISTORY`).  Lazy: the ring lives in
+// kernel BSS and is only touched when the `firefox-test` or `test-mode`
+// feature is enabled.  Zero overhead on the default build.
+
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+pub(crate) mod ghost_hist {
+    //! History-based FUTEX_WAKE_GHOST detection helpers.
+    //!
+    //! Hooked into `sys_futex_linux` at two well-defined points so the
+    //! diagnostic side is clearly separable from the FUTEX_WAKE decision
+    //! path (so it does not conflict with the parallel BZ 25847
+    //! broadcast-within-cluster compensation work):
+    //!
+    //!   - FUTEX_WAIT enqueue → `record_wait()`
+    //!   - FUTEX_WAKE post-decision, when `woken == 0` → `correlate_wake()`
+    //!
+    //! Neither helper modifies the wake decision; they observe and report.
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    /// Single history entry: a recorded FUTEX_WAIT call.
+    ///
+    /// `tick == 0` flags a slot as empty (un-occupied).  The first WAIT
+    /// recorded always lands at tick ≥ 1 (assigned via `get_ticks()`),
+    /// so 0 is a safe sentinel.
+    #[derive(Clone, Copy)]
+    pub struct WaitEntry {
+        pub pid:   u64,
+        pub tid:   u64,
+        pub uaddr: u64,
+        pub tick:  u64, // 0 = empty slot
+    }
+
+    impl WaitEntry {
+        const EMPTY: WaitEntry = WaitEntry { pid: 0, tid: 0, uaddr: 0, tick: 0 };
+    }
+
+    /// Ring-buffer capacity.  256 entries × 32 B = 8 KB, sized to capture
+    /// roughly the last 5–10 seconds of cond_var traffic at the rates we
+    /// observe in Firefox under firefox-test.
+    pub const HIST_CAPACITY: usize = 256;
+
+    /// Correlation window in PIT ticks (100 Hz → 1 tick = 10 ms).
+    /// 10 ticks = 100 ms, matching the "recent" window the dispatch
+    /// brief specifies.  Wakes more than 100 ms after the last recorded
+    /// matching wait are not counted.
+    pub const HIST_WINDOW_TICKS: u64 = 10;
+
+    /// Half-width of the cluster window in bytes.  Wake uaddr is matched
+    /// against history entries within `[wake-128, wake+128]`.
+    pub const HIST_CLUSTER_HALF: u64 = 128;
+
+    /// Number of offset buckets in the histogram, indexed by
+    /// `(offset / 4) + (HIST_CLUSTER_HALF/4)` for offsets in
+    /// `[-HIST_CLUSTER_HALF, +HIST_CLUSTER_HALF)` rounded to 4 B
+    /// granularity.  Plus one "other" bucket for anything outside the
+    /// half-window or non-4 B-aligned.
+    ///
+    /// 64 + 1 buckets = 65 entries × 8 B = 520 B fixed BSS overhead.
+    pub const N_OFFSET_BUCKETS: usize = 65;
+    pub const OTHER_BUCKET: usize = N_OFFSET_BUCKETS - 1;
+
+    /// Rate-limiting modulus for the per-event serial line.  One in
+    /// every `HIST_HIT_PRINT_EVERY` history-hits prints a
+    /// `[FUTEX_WAKE_GHOST_HIST]` line; the counters always update.
+    /// 256 chosen so that a busy 10 k-wake trial emits ~40 lines —
+    /// readable but not flooding.
+    pub const HIST_HIT_PRINT_EVERY: u64 = 256;
+
+    /// Global enable flag.  Default ON when `firefox-test` is enabled;
+    /// can be toggled at runtime via `kdb futex set-ghost-hist on|off`.
+    /// The default is OFF under `test-mode` alone so the in-kernel test
+    /// suite does not accumulate history from the wider test corpus.
+    #[cfg(feature = "firefox-test")]
+    pub static GHOST_HIST_ENABLED: AtomicBool = AtomicBool::new(true);
+    #[cfg(all(feature = "test-mode", not(feature = "firefox-test")))]
+    pub static GHOST_HIST_ENABLED: AtomicBool = AtomicBool::new(false);
+
+    /// Counts.
+    pub static GHOST_HIST_TOTAL_WAKES: AtomicU64 = AtomicU64::new(0);
+    pub static GHOST_HIST_WOKEN_ZERO: AtomicU64  = AtomicU64::new(0);
+    pub static GHOST_HIST_HITS:       AtomicU64  = AtomicU64::new(0);
+    pub static GHOST_HIST_WAITS:      AtomicU64  = AtomicU64::new(0);
+
+    /// Per-offset histogram of correlated wake/wait distance, in 4 B
+    /// buckets.  Bucket `i` (for i ∈ 0..64) corresponds to byte offset
+    /// `(i as i64 - 32) * 4`.  Bucket 64 (`OTHER_BUCKET`) accumulates
+    /// anything that doesn't fit (e.g. mis-aligned hits inside the
+    /// half-window).  See `offset_to_bucket()`.
+    pub static GHOST_HIST_OFFSET_COUNTS: [AtomicU64; N_OFFSET_BUCKETS] = {
+        // Const-initialise an array of atomics.  `AtomicU64::new(0)` is
+        // const-fn since Rust 1.41 so this works in `static` context.
+        const Z: AtomicU64 = AtomicU64::new(0);
+        [Z; N_OFFSET_BUCKETS]
+    };
+
+    /// History ring + write-cursor.  Holds the spinlock for O(1) writes
+    /// and O(HIST_CAPACITY) reads.  Lock is held only for the duration
+    /// of the ring access — no other kernel locks are taken inside
+    /// (lookups against THREAD_TABLE or FUTEX_WAITERS happen outside
+    /// this critical section, in the WAKE path that calls us).
+    pub struct HistoryRing {
+        pub entries: [WaitEntry; HIST_CAPACITY],
+        pub next:    usize, // write cursor, wraps mod HIST_CAPACITY
+    }
+
+    impl HistoryRing {
+        const fn new() -> Self {
+            Self { entries: [WaitEntry::EMPTY; HIST_CAPACITY], next: 0 }
+        }
+    }
+
+    pub static FUTEX_WAIT_HISTORY: spin::Mutex<HistoryRing> =
+        spin::Mutex::new(HistoryRing::new());
+
+    /// Map a (signed) byte offset to a histogram bucket index.
+    /// Offsets in [-128, +124] rounded down to 4 B granularity map to
+    /// buckets 0..64; anything outside or mis-aligned maps to
+    /// `OTHER_BUCKET`.
+    #[inline]
+    pub fn offset_to_bucket(off: i64) -> usize {
+        if off < -(HIST_CLUSTER_HALF as i64) || off >= HIST_CLUSTER_HALF as i64 {
+            return OTHER_BUCKET;
+        }
+        if off % 4 != 0 { return OTHER_BUCKET; }
+        // Centre bucket index at 32 so off=0 → bucket 32, off=-128 → 0,
+        // off=+124 → 63.
+        ((off / 4) + 32) as usize
+    }
+
+    /// Inverse of `offset_to_bucket` for printing.  Returns the byte
+    /// offset corresponding to bucket `i`; `OTHER_BUCKET` returns 0
+    /// (callers handle that bucket specially).
+    #[inline]
+    pub fn bucket_to_offset(i: usize) -> i64 {
+        if i >= OTHER_BUCKET { return 0; }
+        (i as i64 - 32) * 4
+    }
+
+    /// Record a FUTEX_WAIT enqueue in the history ring.  Called from
+    /// the FUTEX_WAIT arm of `sys_futex_linux` immediately after the
+    /// waiter has been enqueued + marked Blocked (so the ordering with
+    /// the wake-side scan is clear: a wake racing us either sees us in
+    /// FUTEX_WAITERS already or sees us in history within HIST_WINDOW_TICKS).
+    ///
+    /// No-op if `GHOST_HIST_ENABLED` is false.  Cheap (one atomic load
+    /// + one mutex critical section bounded to O(1)).
+    pub fn record_wait(pid: u64, tid: u64, uaddr: u64) {
+        if !GHOST_HIST_ENABLED.load(Ordering::Relaxed) { return; }
+        let tick = crate::arch::x86_64::irq::get_ticks().max(1);
+        let mut ring = FUTEX_WAIT_HISTORY.lock();
+        let idx = ring.next % HIST_CAPACITY;
+        ring.entries[idx] = WaitEntry { pid, tid, uaddr, tick };
+        ring.next = ring.next.wrapping_add(1);
+        drop(ring);
+        GHOST_HIST_WAITS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Correlate a `woken=0` FUTEX_WAKE against the per-process wait
+    /// history.  Returns the number of distinct (pid, tid, uaddr)
+    /// history entries within `[uaddr - HIST_CLUSTER_HALF, uaddr +
+    /// HIST_CLUSTER_HALF)` whose recorded tick is within the last
+    /// `HIST_WINDOW_TICKS` ticks of `now`.
+    ///
+    /// Also updates the offset histogram and the hit counter.  Emits a
+    /// rate-limited `[FUTEX_WAKE_GHOST_HIST]` serial line per hit so a
+    /// harness can grep it out.
+    ///
+    /// Returns 0 if `GHOST_HIST_ENABLED` is false.
+    pub fn correlate_wake(pid: u64, wake_tid: u64, wake_uaddr: u64) -> u64 {
+        if !GHOST_HIST_ENABLED.load(Ordering::Relaxed) { return 0; }
+        let now = crate::arch::x86_64::irq::get_ticks();
+        let cutoff = now.saturating_sub(HIST_WINDOW_TICKS);
+        let lo = wake_uaddr.wrapping_sub(HIST_CLUSTER_HALF);
+        let hi = wake_uaddr.wrapping_add(HIST_CLUSTER_HALF);
+
+        let mut hits: u64 = 0;
+        // Collect a small fixed-size sample of (offset, waiter_uaddr,
+        // waiter_tid, age_ticks) tuples for the rate-limited line.
+        // The full per-bucket histogram is updated unconditionally —
+        // only the per-event print is sampled.
+        let mut first_hit: Option<(i64, u64, u64, u64)> = None;
+
+        let ring = FUTEX_WAIT_HISTORY.lock();
+        for entry in ring.entries.iter() {
+            if entry.tick == 0 { continue; }            // empty slot
+            if entry.pid != pid { continue; }           // different process
+            if entry.tick < cutoff { continue; }        // outside time window
+            if entry.uaddr < lo || entry.uaddr >= hi { continue; } // outside cluster
+            // Compute signed offset (waiter - wake).
+            let off = entry.uaddr as i64 - wake_uaddr as i64;
+            let bucket = offset_to_bucket(off);
+            GHOST_HIST_OFFSET_COUNTS[bucket].fetch_add(1, Ordering::Relaxed);
+            hits = hits.saturating_add(1);
+            if first_hit.is_none() {
+                let age = now.saturating_sub(entry.tick);
+                first_hit = Some((off, entry.uaddr, entry.tid, age));
+            }
+        }
+        drop(ring);
+
+        if hits > 0 {
+            let total_hits = GHOST_HIST_HITS.fetch_add(hits, Ordering::Relaxed)
+                .saturating_add(hits);
+            if let Some((off, waddr, wtid, age_ticks)) = first_hit {
+                // Rate-limit the serial line: 1 in HIST_HIT_PRINT_EVERY.
+                if total_hits % HIST_HIT_PRINT_EVERY == 0 || total_hits <= 4 {
+                    let age_ms = age_ticks.saturating_mul(10); // 10 ms/tick
+                    crate::serial_println!(
+                        "[FUTEX_WAKE_GHOST_HIST] tid={} tgid={} wake={:#x} \
+                         waiter={:#x} waiter_tid={} offset={} age_ms={} \
+                         woken_now=0 hits={}",
+                        wake_tid, pid, wake_uaddr, waddr, wtid,
+                        off, age_ms, hits
+                    );
+                }
+            }
+        }
+        hits
+    }
+
+    /// Emit the `[GHOST_HIST_SUMMARY]` block.  Called at firefox-test
+    /// exit (from `main.rs`) and from `kdb futex-ghost-hist` so an
+    /// agent can request it on demand.
+    ///
+    /// Format intentionally matches the structured shape called out in
+    /// the dispatch — the harness parses these lines line-by-line.
+    pub fn dump_summary() {
+        let total_wakes = GHOST_HIST_TOTAL_WAKES.load(Ordering::Relaxed);
+        let woken_zero  = GHOST_HIST_WOKEN_ZERO.load(Ordering::Relaxed);
+        let hits        = GHOST_HIST_HITS.load(Ordering::Relaxed);
+        let waits       = GHOST_HIST_WAITS.load(Ordering::Relaxed);
+        crate::serial_println!(
+            "[GHOST_HIST_SUMMARY] total_wakes={} woken_zero={} hist_hits={} waits_recorded={}",
+            total_wakes, woken_zero, hits, waits
+        );
+        // Per-offset histogram — emit non-zero buckets in order.
+        let off_50  = offset_to_bucket(0x50);
+        let off_54  = offset_to_bucket(0x54);
+        let off_08  = offset_to_bucket(0x08);
+        let off_04  = offset_to_bucket(0x04);
+        let off_00  = offset_to_bucket(0x00);
+        let off_n08 = offset_to_bucket(-0x08);
+        let v_50  = GHOST_HIST_OFFSET_COUNTS[off_50].load(Ordering::Relaxed);
+        let v_54  = GHOST_HIST_OFFSET_COUNTS[off_54].load(Ordering::Relaxed);
+        let v_08  = GHOST_HIST_OFFSET_COUNTS[off_08].load(Ordering::Relaxed);
+        let v_04  = GHOST_HIST_OFFSET_COUNTS[off_04].load(Ordering::Relaxed);
+        let v_00  = GHOST_HIST_OFFSET_COUNTS[off_00].load(Ordering::Relaxed);
+        let v_n08 = GHOST_HIST_OFFSET_COUNTS[off_n08].load(Ordering::Relaxed);
+        let v_other = GHOST_HIST_OFFSET_COUNTS[OTHER_BUCKET].load(Ordering::Relaxed);
+        // Sum all other named (non-canonical) buckets so the total
+        // reconciles with hits.  Anything not surfaced as a named offset
+        // is folded into v_named_other below.
+        let mut v_named_other: u64 = 0;
+        for (i, slot) in GHOST_HIST_OFFSET_COUNTS.iter().enumerate() {
+            if i == off_50 || i == off_54 || i == off_08
+            || i == off_04 || i == off_00 || i == off_n08
+            || i == OTHER_BUCKET {
+                continue;
+            }
+            v_named_other = v_named_other.saturating_add(
+                slot.load(Ordering::Relaxed)
+            );
+        }
+        crate::serial_println!(
+            "  offset_+0x50={} (canonical __g_refs[0])", v_50);
+        crate::serial_println!(
+            "  offset_+0x54={} (canonical __g_refs[1])", v_54);
+        crate::serial_println!("  offset_+0x08={}", v_08);
+        crate::serial_println!("  offset_+0x04={}", v_04);
+        crate::serial_println!("  offset_+0x00={}", v_00);
+        crate::serial_println!("  offset_-0x08={}", v_n08);
+        crate::serial_println!("  offset_other_aligned={}", v_named_other);
+        crate::serial_println!("  offset_unaligned_or_out_of_range={}", v_other);
+    }
+
+    /// Clear all history-mode state.  Used by tests that need a clean
+    /// baseline.  Holds the ring lock + zeroes the counters; cheap.
+    pub fn reset_for_test() {
+        let mut ring = FUTEX_WAIT_HISTORY.lock();
+        for e in ring.entries.iter_mut() { *e = WaitEntry::EMPTY; }
+        ring.next = 0;
+        drop(ring);
+        GHOST_HIST_TOTAL_WAKES.store(0, Ordering::Relaxed);
+        GHOST_HIST_WOKEN_ZERO.store(0, Ordering::Relaxed);
+        GHOST_HIST_HITS.store(0, Ordering::Relaxed);
+        GHOST_HIST_WAITS.store(0, Ordering::Relaxed);
+        for slot in GHOST_HIST_OFFSET_COUNTS.iter() {
+            slot.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Runtime toggle.  Setting `false` quiesces the diagnostic without
+    /// rebuilding the kernel — useful in long-running firefox-test runs
+    /// where the test driver wants to compare with/without history-mode
+    /// statistics on the same boot.
+    pub fn set_enabled(on: bool) {
+        GHOST_HIST_ENABLED.store(on, Ordering::Relaxed);
+    }
+
+    /// Returns the current enabled state, for kdb status reporting.
+    pub fn is_enabled() -> bool {
+        GHOST_HIST_ENABLED.load(Ordering::Relaxed)
+    }
+}
+
 /// futex — Wait/Wake/Requeue implementation for musl/pthread compatibility.
 ///
 /// Supported ops (op numbers per `futex(2)` Linux man-page and UAPI header):
@@ -6600,6 +6947,16 @@ pub fn sys_futex_linux(
                 crate::syscall::FutexWaitOutcome::ValueMismatch => return -11, // EAGAIN
                 crate::syscall::FutexWaitOutcome::Fault         => return -14, // EFAULT
             }
+
+            // Record the waiter into the history-mode diagnostic ring.
+            // This runs AFTER the waiter is enqueued + marked Blocked (so
+            // the ring entry never names a TID that was never actually
+            // parked) and BEFORE schedule(), so a concurrent wake
+            // correlating against history during our sleep sees this
+            // entry.  No-op if `ghost_hist::GHOST_HIST_ENABLED` is false.
+            // See `ghost_hist::record_wait` for the BZ 25847 reference.
+            #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+            ghost_hist::record_wait(pid, tid, uaddr);
 
             // ── Diagnostics live OUTSIDE the critical section ──────────────
             //
@@ -6822,6 +7179,27 @@ pub fn sys_futex_linux(
                             1, core::sync::atomic::Ordering::Relaxed
                         );
                     }
+                }
+            }
+
+            // History-mode GHOST correlation — observe-only.  This bumps
+            // GHOST_HIST_TOTAL_WAKES on every FUTEX_WAKE/_BITSET and, for
+            // the woken=0 subset, scans the per-process wait history for
+            // any waiter on the same pid within ±128 bytes of the wake
+            // uaddr that has been recorded within the last
+            // HIST_WINDOW_TICKS ticks.  See the `ghost_hist` module for
+            // the BZ 25847 framing.  The correlation does NOT modify
+            // `woken`; the wake decision above is unchanged.
+            #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+            if op == 1 || op == 10 {
+                ghost_hist::GHOST_HIST_TOTAL_WAKES
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if woken == 0 {
+                    ghost_hist::GHOST_HIST_WOKEN_ZERO
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    let _ = ghost_hist::correlate_wake(
+                        pid, crate::proc::current_tid(), uaddr
+                    );
                 }
             }
 
