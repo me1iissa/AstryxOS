@@ -1278,6 +1278,16 @@ pub fn write_file(path: &str, data: &[u8]) -> VfsResult<usize> {
         fs.truncate(inode, 0)?;
         fs.write(inode, 0, data)?
     };
+    // Page-cache coherency (POSIX mmap(2) MAP_SHARED + write(2) contract):
+    // update any cache pages that overlap the written range so existing
+    // mmap'd readers observe the new bytes immediately.  See
+    // `mm::cache::update_range` for the contract details.
+    if n > 0 {
+        crate::mm::cache::update_range(mount_idx, inode, 0, &data[..n]);
+    }
+    // Path-keyed read cache (`FILE_READ_CACHE`) must be invalidated so
+    // subsequent `read_file(path)` does not return the stale snapshot.
+    invalidate_path_read_cache(path);
     // Fire IN_MODIFY so inotify watchers (and poll/epoll) see the update.
     // This mirrors the notification in the fd-based write() syscall path.
     let (parent_dir, filename) = split_parent_name(path);
@@ -1325,7 +1335,30 @@ pub fn append_file(path: &str, data: &[u8]) -> VfsResult<usize> {
     let (mount_idx, inode) = resolve_path(path)?;
     let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
     let stat = fs.stat(inode)?;
-    fs.write(inode, stat.size, data)
+    let append_off = stat.size;
+    let n = fs.write(inode, append_off, data)?;
+    // Page-cache coherency (POSIX mmap(2) MAP_SHARED + write(2) contract):
+    // update any cache pages that overlap the appended range — usually
+    // only the tail page of the original file if it was partial.
+    if n > 0 {
+        crate::mm::cache::update_range(mount_idx, inode, append_off, &data[..n]);
+    }
+    // Path-keyed read cache must be invalidated as well.
+    invalidate_path_read_cache(path);
+    Ok(n)
+}
+
+/// Drop the cached snapshot for `path` from `FILE_READ_CACHE`, if any.
+///
+/// `FILE_READ_CACHE` is a path-keyed convenience cache layered on top of
+/// the VFS for slow ATA PIO; it must be invalidated whenever a write
+/// updates the underlying file or `read_file(path)` would return a
+/// pre-write snapshot indefinitely (the cache has no TTL).  Callers in
+/// the write path invoke this after a successful write; the cost is a
+/// single mutex acquire plus an O(n≤8) scan.
+fn invalidate_path_read_cache(path: &str) {
+    let mut cache = FILE_READ_CACHE.lock();
+    cache.retain(|(p, _)| p != path);
 }
 
 /// Sync (flush) all dirty data in all mounted filesystems to their backing store.
@@ -1659,6 +1692,17 @@ pub fn close(pid: crate::proc::Pid, fd_num: usize) -> VfsResult<()> {
 }
 
 /// Read from a file descriptor.
+///
+/// Forward-direction coherency (write(2) visible to a subsequent read or
+/// mmap reader) is maintained by `fd_write` / `write_file` via
+/// `mm::cache::update_range`.  The reverse direction — a write through a
+/// MAP_SHARED+PROT_WRITE PTE visible to a subsequent `read(2)` — is not
+/// currently served from the page cache; this path goes straight to
+/// `fs.read`, which on tmpfs/ramfs returns the in-memory file content
+/// (consistent with mmap'd writes IF those writes have also been flushed
+/// back to FS storage).  Adding a read-through cache lookup here is a
+/// follow-up — see W215 docs/W215_CRC_MISMATCH_INVESTIGATION_*.md for the
+/// scope discussion.
 pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize) -> VfsResult<usize> {
     // SMAP bracket — fd_read writes data into `buf` which is typically
     // a user-VA from the syscall path.  The function does not call
@@ -2085,6 +2129,23 @@ pub fn fd_write(pid: crate::proc::Pid, fd_num: usize, buf: *const u8, count: usi
     };
 
     let n = fs.write(inode, write_offset, data)?;
+
+    // Page-cache coherency: any process that previously mmap'd this file
+    // has a cache-page-backed PTE that points at the pre-write bytes.
+    // Per POSIX mmap(2) the MAP_SHARED region must observe the same
+    // bytes as `read(2)` after a `write(2)` to the same file.  Update
+    // every overlapping cache page in place so existing mappers (and any
+    // future mmap fault that hits the cache) see the new content.  Only
+    // the bytes that were actually written are copied; pages outside the
+    // cache are unaffected.  See `mm::cache::update_range` for the
+    // POSIX citations and locking discipline.
+    if n > 0 && mount_idx != usize::MAX {
+        crate::mm::cache::update_range(mount_idx, inode, write_offset, &data[..n]);
+        // Invalidate the path-keyed `FILE_READ_CACHE` snapshot for this
+        // file (if any) so a subsequent `read_file(path)` does not
+        // return a pre-write copy.
+        invalidate_path_read_cache(&open_path);
+    }
 
     // Update offset.
     {

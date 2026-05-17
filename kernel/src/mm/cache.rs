@@ -502,6 +502,90 @@ pub fn mark_dirty(mount_idx: usize, inode: u64, page_offset: u64) {
     }
 }
 
+/// Update any cache pages that overlap the file range `[offset, offset + data.len())`
+/// so their bytes match `data`.  Pages outside the cache are left untouched.
+///
+/// This is the write-through cohort for the page cache: after `fs.write`
+/// succeeds, the on-disk bytes are correct, but any process that previously
+/// mmap'd the file has a still-live cache-page-backed PTE pointing at the
+/// pre-write content.  Per POSIX mmap(2): "The mmap() function shall add
+/// an extra reference to the file ... If a process maps the same file
+/// MAP_SHARED, the memory object shall be a region of the file."  And per
+/// POSIX write(2): subsequent reads of the file shall observe the new
+/// data.  The two contracts compose: a `write(2)` must be visible to a
+/// concurrent mmap reader, which in this codebase means the cache page
+/// itself (the only handle to the file's bytes that other mappers share)
+/// must be brought up to date in place.
+///
+/// "Update in place" preserves existing mmap'd PTEs without TLB shootdown:
+/// every mapper continues to see the same physical frame, but now with
+/// the post-write bytes.  This matches the semantics every UNIX-class
+/// kernel exposes to `mmap(MAP_SHARED) + write(2)` interleavings.
+///
+/// `mount_idx`, `inode` identify the file; `offset` is the file offset of
+/// the first written byte; `data` is the bytes that were written.  The
+/// function walks the page-aligned cohort of cache keys
+/// `(mount_idx, inode, page_aligned_offset)` for every page touched by
+/// `[offset, offset + data.len())` and, for each existing entry, copies
+/// the appropriate slice of `data` into the cache page through the kernel
+/// higher-half identity map.
+///
+/// Cache pages are marked dirty after the update so a future writeback
+/// path (when implemented) treats them as needing flush.  The cache lock
+/// is held across the per-page copies — the copies are small (at most
+/// 4 KiB each) and bounded by the data length; no FS or PMM dispatch
+/// happens while the lock is held.
+///
+/// Safety: each cache entry's `phys` is alive while the cache lock is
+/// held (the cache itself holds a reference), so the `PHYS_OFF + phys`
+/// write is guaranteed to land in valid memory.  The kernel higher-half
+/// identity-mapping (`0xFFFF_8000_0000_0000 + phys`) covers all PMM
+/// frames per Intel SDM Vol. 3A §4.10.5 paging model.
+pub fn update_range(mount_idx: usize, inode: u64, offset: u64, data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    const PAGE: u64 = 4096;
+    const PHYS_OFFSET: u64 = 0xFFFF_8000_0000_0000;
+
+    let start = offset;
+    let end = offset.saturating_add(data.len() as u64);
+    let first_page = start & !(PAGE - 1);
+    // Last page boundary inclusive: the byte at end-1 lies in
+    // page (end-1) & !(PAGE-1).  Compute the exclusive upper page bound.
+    let last_page_exclusive = (end + PAGE - 1) & !(PAGE - 1);
+
+    let mut cache = PAGE_CACHE.lock();
+    let mut page = first_page;
+    while page < last_page_exclusive {
+        if let Some(entry) = cache.get_mut(&(mount_idx, inode, page)) {
+            // Compute the [page, page+PAGE) ∩ [start, end) slice in file
+            // coordinates, then map it into both the cache page (offset
+            // from `page`) and `data` (offset from `start`).
+            let slice_start = core::cmp::max(page, start);
+            let slice_end   = core::cmp::min(page + PAGE, end);
+            // The intersection is non-empty by construction of the
+            // [first_page, last_page_exclusive) loop bounds.
+            debug_assert!(slice_start < slice_end);
+            let cache_off = (slice_start - page) as usize;
+            let data_off  = (slice_start - start) as usize;
+            let n         = (slice_end - slice_start) as usize;
+            let dst = (PHYS_OFFSET + entry.phys + cache_off as u64) as *mut u8;
+            let src = unsafe { data.as_ptr().add(data_off) };
+            // SAFETY: cache page is 4 KiB; cache_off + n ≤ PAGE by
+            // construction (slice_end - page ≤ PAGE).  `data[data_off..
+            // data_off+n]` is in-bounds because slice_end ≤ end =
+            // start + data.len().  Source and destination are distinct
+            // allocations (kernel heap vs. PMM frame).
+            unsafe {
+                core::ptr::copy_nonoverlapping(src, dst, n);
+            }
+            entry.dirty = true;
+        }
+        page += PAGE;
+    }
+}
+
 /// Evict a page from the cache, releasing the cache's reference.
 /// Returns the physical address of the evicted page, if any.
 pub fn evict(mount_idx: usize, inode: u64, page_offset: u64) -> Option<u64> {
