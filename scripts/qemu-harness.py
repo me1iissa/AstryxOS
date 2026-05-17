@@ -2602,6 +2602,32 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
         if len(rest) < 3: raise ValueError("user-mem requires <pid> <addr> <len>")
         return {"op": "user-mem", "pid": int(rest[0], 0),
                 "addr": rest[1], "len": int(rest[2], 0)}
+    if op == "futex-ghost-hist":
+        # History-based FUTEX_WAKE_GHOST diagnostic.  Optional positional
+        # token controls the kernel-side toggle / counter reset:
+        #   kdb <sid> futex-ghost-hist                  → snapshot
+        #   kdb <sid> futex-ghost-hist on               → enable + snapshot
+        #   kdb <sid> futex-ghost-hist off              → disable + snapshot
+        #   kdb <sid> futex-ghost-hist reset            → reset + snapshot
+        # Snapshot is always returned in the response.  The kernel
+        # additionally mirrors a [GHOST_HIST_SUMMARY] block to serial
+        # on every invocation so the harness has a structured side
+        # channel.  Requires --features firefox-test or test-mode.
+        req: dict = {"op": "futex-ghost-hist"}
+        if rest:
+            tok = rest[0].lower()
+            if tok in ("on", "enable", "true", "1"):
+                req["enable"] = "true"
+            elif tok in ("off", "disable", "false", "0"):
+                req["enable"] = "false"
+            elif tok in ("reset", "clear"):
+                req["reset"] = "true"
+            else:
+                raise ValueError(
+                    f"futex-ghost-hist: unknown sub-arg {rest[0]!r} "
+                    "(expected on|off|reset or none)"
+                )
+        return req
     raise ValueError(f"unknown kdb op: {op}")
 
 
@@ -6690,6 +6716,7 @@ def main():
         "w215-cache-residency", "tlb-stats", "w215-diag",
         "arm-phys",
         "coverage-flush", "proc-metrics", "thread-park-audit",
+        "futex-ghost-hist",
     ])
     p_kdb.add_argument("args", nargs="*",
                         help="Op-specific positional args: "
