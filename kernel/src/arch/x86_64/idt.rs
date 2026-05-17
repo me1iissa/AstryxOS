@@ -889,6 +889,15 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
 /// - Bit 4: Instruction fetch
 fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut InterruptFrame) -> bool {
     PAGE_FAULT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    // Per-process PF counter.  Lockless: takes neither THREAD_TABLE nor
+    // PROCESS_TABLE; one bounds-check + one Acquire load + one Relaxed
+    // bump in the live-PID path.  Safe from interrupt context.
+    {
+        let _pf_pid = crate::proc::current_pid_lockless();
+        if _pf_pid >= 1 {
+            crate::proc::proc_metrics::bump_page_fault(_pf_pid);
+        }
+    }
     let is_present = error_code & 1 != 0;
     let is_write = error_code & 2 != 0;
     let _is_user = error_code & 4 != 0;
