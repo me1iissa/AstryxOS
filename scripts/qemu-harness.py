@@ -6013,6 +6013,7 @@ def main():
         "dmesg", "syms", "mem", "tframe", "user-mem", "trace-status",
         "bell-stats", "cache-audit", "cache-aliasing", "fault-cache-keys",
         "w215-cache-residency", "tlb-stats", "w215-diag",
+        "arm-phys",
         "coverage-flush", "proc-metrics",
     ])
     p_kdb.add_argument("args", nargs="*",
