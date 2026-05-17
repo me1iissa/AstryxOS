@@ -53,11 +53,19 @@ struct CrcEntry {
     /// Generation stamp incremented every time the CRC is re-recorded.
     /// Used as a coarse staleness signal in the report.
     generation: u32,
+    /// True when the page was inserted under a MAP_SHARED + PROT_WRITE mapping
+    /// (e.g. a writable mmap of cookies.sqlite or a SQLite WAL file).  Per
+    /// POSIX mmap(2), MAP_SHARED writes are immediately visible to all other
+    /// mappings of the same file, so CRC mutations on this frame are expected
+    /// and legitimate.  The walker skips CRC-MISMATCH emission for these
+    /// entries to suppress the 21-50 false-positive lines per firefox-test trial
+    /// produced by SQLite WAL/journal writes.
+    writable_shared: bool,
 }
 
 impl CrcEntry {
     const fn empty() -> Self {
-        Self { phys: 0, crc32: 0, key_packed: 0, generation: 0 }
+        Self { phys: 0, crc32: 0, key_packed: 0, generation: 0, writable_shared: false }
     }
 }
 
@@ -154,7 +162,14 @@ unsafe fn crc_of_phys(phys: u64) -> u32 {
 /// Linear-probe within 8 slots; on collision overflow we drop the record
 /// (incrementing `STAT_OVERFLOW_DROP`) — the cache is bigger than the
 /// shadow table, but the libxul working set is well under capacity.
-pub fn record_insert(phys: u64, inode: u64, file_offset: u64) {
+///
+/// `writable_shared` must be `true` when the page was inserted under a
+/// MAP_SHARED + PROT_WRITE mapping (e.g. a writable mmap of a SQLite WAL
+/// or journal file).  The walker suppresses CRC-MISMATCH emission for such
+/// entries because MAP_SHARED writes to the same file page are visible across
+/// all mappings by definition — they are not aliasing bugs.  Per POSIX
+/// mmap(2) and `unix(7)` MAP_SHARED semantics.
+pub fn record_insert(phys: u64, inode: u64, file_offset: u64, writable_shared: bool) {
     if phys == 0 {
         return;
     }
@@ -172,6 +187,7 @@ pub fn record_insert(phys: u64, inode: u64, file_offset: u64) {
                 crc32: crc,
                 key_packed,
                 generation: 1,
+                writable_shared,
             };
             LIVE_COUNT.fetch_add(1, Ordering::Relaxed);
             STAT_INSERTS.fetch_add(1, Ordering::Relaxed);
@@ -181,11 +197,37 @@ pub fn record_insert(phys: u64, inode: u64, file_offset: u64) {
             // Refresh in place — same key, same phys.
             e.crc32 = crc;
             e.generation = e.generation.wrapping_add(1);
+            // Propagate writable_shared in case the mapping changed (e.g.
+            // an initially read-only mapping was re-mmap'd as MAP_SHARED+RW).
+            e.writable_shared |= writable_shared;
             STAT_INSERTS.fetch_add(1, Ordering::Relaxed);
             return;
         }
     }
     STAT_OVERFLOW_DROP.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Called from the page-fault handler immediately after `cache::insert` when
+/// the inserted page is mapped under MAP_SHARED + PROT_WRITE.  Marks the
+/// shadow entry for `phys` so the CRC walker suppresses mismatch emission —
+/// MAP_SHARED writes to the page are visible across all aliases and are
+/// legitimate (POSIX mmap(2) MAP_SHARED contract).
+///
+/// This is a best-effort update: if the shadow table lock is contended, or if
+/// `phys` is not yet present in the shadow table (insert raced ahead of
+/// mark), the walker may emit one spurious mismatch before the next
+/// record_insert refresh picks up the flag.  That is acceptable — the flag
+/// suppresses the steady-state false-positive stream, not every possible
+/// first-occurrence line.
+pub fn mark_writable_shared(phys: u64) {
+    if phys == 0 { return; }
+    if let Some(mut table) = CRC_TABLE.try_lock() {
+        for e in table.entries.iter_mut() {
+            if e.phys == phys {
+                e.writable_shared = true;
+            }
+        }
+    }
 }
 
 /// Called from `cache::evict` and other paths that remove a (phys, key)
@@ -245,7 +287,8 @@ pub fn crc_walk_tick(_cpu: u32) {
     // `lock()` would self-deadlock because the holder cannot release it
     // until the ISR returns.  Skipping a slice when contended is
     // harmless — the next tick will pick up where we left off.
-    let mut buf: [(u64, u32, u64); 64] = [(0u64, 0u32, 0u64); 64];
+    // Each entry is (phys, expected_crc, key_packed, writable_shared).
+    let mut buf: [(u64, u32, u64, bool); 64] = [(0u64, 0u32, 0u64, false); 64];
     let slice_n = per_cpu_budget.min(buf.len());
     let mut n = 0usize;
     match CRC_TABLE.try_lock() {
@@ -289,7 +332,7 @@ pub fn crc_walk_tick(_cpu: u32) {
                     && snap.phys <= 0x4_0000_0000
                     && (snap.phys & 0xFFF) == 0
                 {
-                    buf[n] = (snap.phys, snap.crc32, snap.key_packed);
+                    buf[n] = (snap.phys, snap.crc32, snap.key_packed, snap.writable_shared);
                     n += 1;
                 }
             }
@@ -302,7 +345,7 @@ pub fn crc_walk_tick(_cpu: u32) {
     STAT_WALKS.fetch_add(n as u64, Ordering::Relaxed);
 
     for i in 0..n {
-        let (phys, expected, key_packed) = buf[i];
+        let (phys, expected, key_packed, writable_shared) = buf[i];
         let actual = unsafe { crc_of_phys(phys) };
         if actual == expected {
             continue;
@@ -310,6 +353,16 @@ pub fn crc_walk_tick(_cpu: u32) {
         // Re-CRC once for false-positive filter (torn-read window).
         let actual2 = unsafe { crc_of_phys(phys) };
         if actual2 == expected {
+            STAT_FALSE_POSITIVE.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+
+        // MAP_SHARED + PROT_WRITE mappings (e.g. SQLite WAL, cookies.sqlite)
+        // are expected to mutate the cache page in-place — that is the
+        // MAP_SHARED contract per POSIX mmap(2).  Emitting CRC-MISMATCH for
+        // these pages produces 21-50 false-positive lines per firefox-test
+        // trial.  Skip emission and count as a suppressed false positive.
+        if writable_shared {
             STAT_FALSE_POSITIVE.fetch_add(1, Ordering::Relaxed);
             continue;
         }
