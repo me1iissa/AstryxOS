@@ -81,7 +81,17 @@ pub fn handle_ipv4(data: &[u8]) {
 
     let payload_start = header.header_len();
     if data.len() < payload_start { return; }
-    let payload = &data[payload_start..];
+
+    // RFC 791 §3.1: clamp the upper-layer payload to the IP datagram's
+    // declared total_length so attacker-shaped Ethernet trailer bytes
+    // cannot leak into ICMP / UDP / TCP parsers.  See
+    // `clamp_payload_to_total_length` for the full rationale.
+    let payload_end = clamp_payload_to_total_length(
+        header.total_length as usize,
+        payload_start,
+        data.len(),
+    );
+    let payload = &data[payload_start..payload_end];
 
     match header.protocol {
         PROTO_ICMP => super::icmp::handle_icmp(header.src_ip, payload),
@@ -91,6 +101,51 @@ pub fn handle_ipv4(data: &[u8]) {
             crate::serial_println!("[IPv4] Unknown protocol: {}", header.protocol);
         }
     }
+}
+
+/// Compute the upper-layer payload end offset within the link-layer frame.
+///
+/// Per RFC 791 §3.1 ("Total Length"): "Total Length is the length of the
+/// datagram, measured in octets, including internet header and data."
+/// The Ethernet frame that delivered this datagram may be *larger* than
+/// the IP datagram itself — Ethernet has a 46-byte minimum payload, so
+/// an IP datagram smaller than 46 bytes arrives padded with arbitrary
+/// trailer bytes.  Legitimately the NIC hardware zero-pads; under an
+/// active on-path attacker the trailer bytes can be attacker-shaped.
+///
+/// Before this clamp, the payload slice handed to ICMP / UDP / TCP
+/// included these trailer bytes.  ICMP and UDP did not re-clamp against
+/// `total_length` themselves, so the trailer bytes were interpreted as
+/// part of the datagram payload — an unbounded attacker-controlled
+/// appendix to every accepted IPv4 packet, useful for fingerprinting
+/// the host, smuggling bytes past length-aware checksum comparisons,
+/// or fooling downstream parsers that scan past the documented end.
+/// TCP's `handle_tcp` already uses `hdr.header_len().min(data.len())`
+/// as a defence-in-depth clamp, so it was largely insulated; clamping
+/// here ensures the upper layer sees identical bytes regardless of
+/// protocol.
+///
+/// Returns the byte offset (within `data`) where the upper-layer
+/// payload ends.  The slice `[payload_start..end]` is what should be
+/// handed to the per-protocol handler.
+///
+/// Edge cases:
+///  * `total_length < payload_start` (attacker-faked tiny total_length):
+///    return `payload_start` (empty payload, no panic from wrapping
+///    subtraction).
+///  * `total_length > data.len()` (caller-truncated frame): return
+///    `data.len()` (cannot read past the buffer end).
+#[inline]
+pub(crate) fn clamp_payload_to_total_length(
+    total_length: usize,
+    payload_start: usize,
+    frame_len: usize,
+) -> usize {
+    // First clamp against the frame size — never read past the buffer.
+    let end = total_length.min(frame_len);
+    // Then clamp from below — never produce an end < payload_start that
+    // would underflow the subsequent slice subtraction.
+    if end < payload_start { payload_start } else { end }
 }
 
 /// Calculate the Internet Checksum (RFC 1071).

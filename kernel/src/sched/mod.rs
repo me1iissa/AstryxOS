@@ -205,7 +205,48 @@ const MAX_DEAD_STACKS: usize = 64;
 static DEAD_STACK_CACHE: spin::Mutex<alloc::vec::Vec<u64>> = spin::Mutex::new(alloc::vec::Vec::new());
 
 /// Try to push a dead stack to the cache. Returns true if cached, false if full.
+///
+/// Zeroes the full stack region before caching so a recycled stack does not
+/// carry the previous thread's saved register state, syscall arguments, or
+/// kernel pointers across the lifetime boundary into the new thread that
+/// pops it.  Without this, `pop_dead_stack` returns a base whose top frame
+/// still contains the prior occupant's RIP / RBP / scratch values; any
+/// kernel code that subsequently reads from the stack — speculatively or
+/// architecturally — observes another thread's secret state.  CWE-244
+/// (Improper Clean Up on Thrown Exception in the broader "improper resource
+/// shutdown" class — recycled-resource leak of residual data).
+///
+/// Cost: one `write_bytes(..,0,KERNEL_STACK_SIZE)` per reaped thread.  At
+/// 64 pages = 256 KiB this is ~12 µs on a modern core, paid once per
+/// thread death — comparable to the page-zeroing cost paid on the
+/// non-cached path (`pmm::free_page` → `pmm::alloc_page` zero on the
+/// allocation side).  The cache exists to skip TLB shootdowns and the
+/// PMM round-trip, not to skip zeroing.
 fn push_dead_stack(stack_base_virt: u64) -> bool {
+    // Bulk-zero the kernel stack via the higher-half virtual base BEFORE
+    // taking the cache lock — keeps the lock window tight (a few CPU
+    // cycles to push the entry; the ~12 µs zero runs outside the lock).
+    // The cached entry is not observable to any reader until we acquire
+    // the lock below, so the zero is guaranteed to be visible to the
+    // first `pop_dead_stack` caller that recycles this base.
+    //
+    // The caller (sched reaper) only caches stacks of
+    // `KERNEL_STACK_PAGES_PUB` pages (verified at the call site in
+    // `reap_dead_threads_sched`), so the zero length is fixed and known.
+    let stack_size = crate::proc::KERNEL_STACK_PAGES_PUB * 0x1000;
+    // SAFETY: `stack_base_virt` is a kernel higher-half virtual address
+    // that was previously allocated as a kernel stack for a thread that
+    // is now Dead and removed from THREAD_TABLE (see
+    // `reap_dead_threads_sched`).  The caller runs with interrupts
+    // disabled; no other CPU can be executing on this stack — Dead
+    // state is set by the thread's last `schedule()` call, after which
+    // the per-CPU `current_tid` moves away from this thread.  The
+    // mapping is in the kernel half (above KERNEL_VIRT_BASE) so a
+    // user-mode access cannot reach it.
+    unsafe {
+        core::ptr::write_bytes(stack_base_virt as *mut u8, 0u8, stack_size);
+    }
+
     let mut cache = DEAD_STACK_CACHE.lock();
     if cache.len() >= MAX_DEAD_STACKS {
         return false;
