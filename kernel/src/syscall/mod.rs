@@ -168,6 +168,34 @@ pub(crate) unsafe fn user_read_u64(addr: u64) -> Option<u64> {
     Some(core::ptr::read_volatile(addr as *const u64))
 }
 
+/// Read a Linux `struct timespec` (two consecutive `u64` fields,
+/// `tv_sec` and `tv_nsec`) from a validated user address under a
+/// **single** SMAP bracket.
+///
+/// The naive shape — `user_read_u64(p)` + `user_read_u64(p + 8)` —
+/// pays two `STAC` + `CLAC` pairs and two `validate_user_ptr` calls
+/// for what should be one bracket and one range check.  This helper
+/// validates the full 16-byte range once and reads both fields under
+/// one [`UserGuard`].  Per Intel SDM Vol. 3A §4.6 the bracket cost is
+/// the CR4-class CPU state toggle, which dominates the per-read cost
+/// for these tiny reads.
+///
+/// Returns `None` (caller surfaces `-EFAULT`) on a misaligned or
+/// out-of-range pointer.  Returns the raw `(tv_sec, tv_nsec)` pair;
+/// callers must apply the POSIX `timespec` validity check
+/// (`tv_nsec < 1_000_000_000`) themselves since the appropriate error
+/// code (`EINVAL` vs caller-specific) is syscall-dependent.
+#[inline]
+pub(crate) unsafe fn user_read_timespec(addr: u64) -> Option<(u64, u64)> {
+    if !validate_user_ptr(addr, 16) { return None; }
+    if addr % 8 != 0 { return None; } // alignment check
+    let _g = crate::arch::x86_64::smap::UserGuard::new();
+    let p = addr as *const u64;
+    let tv_sec  = core::ptr::read_volatile(p);
+    let tv_nsec = core::ptr::read_volatile(p.add(1));
+    Some((tv_sec, tv_nsec))
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Futex wait queue — keyed by virtual address
 // ═══════════════════════════════════════════════════════════════════════════════
