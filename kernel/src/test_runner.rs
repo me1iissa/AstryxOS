@@ -192,6 +192,10 @@ pub fn run() -> ! {
     total += 1;
     if test_serial_reentry_guard() { passed += 1; }
 
+    // ── Test 0bd: per-process activity metrics — bucketing + snapshot ────
+    total += 1;
+    if test_proc_metrics_self() { passed += 1; }
+
     // ── Test 0c: virtio-serial / /dev/vport0p0 (Phase QGA-1) ─────────────
     #[cfg(feature = "qga")]
     {
@@ -23883,6 +23887,24 @@ fn test_futex_wait_atomic_check_then_queue() -> bool {
     test_println!("  all {} waiters drained, no leaked queue entries ✓", N_WAITERS);
     test_pass!("FUTEX_WAIT atomic check-then-queue (lost-wakeup race)");
     true
+}
+
+// ── Test: per-process activity metrics — bucket + snapshot self-test ────
+//
+// Exercises the syscall-category bucketing, register/unregister liveness,
+// the page-fault and disk/net byte bumpers, and the leave_syscall sentinel
+// reset.  Implementation lives in `crate::proc::proc_metrics::run_self_test`;
+// the wrapper here just frames it for the harness's test summary.
+fn test_proc_metrics_self() -> bool {
+    test_header!("proc_metrics — bucketing + register/snapshot self-test");
+    let ok = crate::proc::proc_metrics::run_self_test();
+    if ok {
+        test_pass!("proc_metrics self-test");
+        true
+    } else {
+        test_fail!("proc_metrics self-test", "category bucketing or snapshot mismatch");
+        false
+    }
 }
 
 // ── Test 196: pipe wake hook — reader parks, writer wakes ────────────────────

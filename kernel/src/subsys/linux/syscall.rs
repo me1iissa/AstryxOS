@@ -357,6 +357,16 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         }
     }
 
+    // ── Per-process activity metrics: enter ──────────────────────────────────
+    // Single bounds-check + one Acquire load + one Relaxed counter bump in
+    // the live-PID path.  See `crate::proc::proc_metrics::enter_syscall`.
+    // The tick read is wait-free (Relaxed atomic load).
+    let _metrics_pid = crate::proc::current_pid_lockless();
+    if _metrics_pid >= 1 {
+        let tick = crate::arch::x86_64::irq::get_ticks();
+        crate::proc::proc_metrics::enter_syscall(_metrics_pid, num, tick);
+    }
+
     // ── Per-process syscall ring buffer (firefox-test only) ──────────────────
     // Record the call at entry so that the path/return-value hooks inside
     // sys_read_linux / sys_open_linux can attach extra context before we
@@ -447,6 +457,13 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         let pid = crate::proc::current_pid_lockless();
         crate::syscall::ring::end(pid, ring_entry_idx, ret);
         crate::subsys::linux::syscall_ring::clear_current_entry();
+    }
+
+    // ── Per-process activity metrics: leave ──────────────────────────────────
+    // Clears `last_sc_nr` to -1 so the periodic dump's stuck detector does
+    // not flag a syscall that legitimately returned to user-mode.
+    if _metrics_pid >= 1 {
+        crate::proc::proc_metrics::leave_syscall(_metrics_pid);
     }
 
     // ── Tier-0 trace: paired return value line ────────────────────────────

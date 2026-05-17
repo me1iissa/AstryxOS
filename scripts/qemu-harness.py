@@ -2529,7 +2529,7 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
               "bell-stats", "cache-audit", "cache-aliasing",
               "fault-cache-keys", "w215-cache-residency",
               "tlb-stats", "w215-diag",
-              "coverage-flush"):
+              "coverage-flush", "proc-metrics"):
         return {"op": op}
     if op == "proc":
         if not rest: raise ValueError("proc requires <pid>")
@@ -6001,7 +6001,7 @@ def main():
         "dmesg", "syms", "mem", "tframe", "user-mem", "trace-status",
         "bell-stats", "cache-audit", "cache-aliasing", "fault-cache-keys",
         "w215-cache-residency", "tlb-stats", "w215-diag",
-        "coverage-flush",
+        "coverage-flush", "proc-metrics",
     ])
     p_kdb.add_argument("args", nargs="*",
                         help="Op-specific positional args: "

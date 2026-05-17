@@ -247,7 +247,7 @@ pub fn socket_send(id: u64, data: &[u8]) -> Result<usize, &'static str> {
     let bound = sock.bound;
     drop(sockets);
 
-    match socket_type {
+    let r = match socket_type {
         SocketType::Udp => {
             if remote_ip == [0; 4] {
                 return Err("no destination");
@@ -261,7 +261,13 @@ pub fn socket_send(id: u64, data: &[u8]) -> Result<usize, &'static str> {
             }
             super::tcp::send_data(local_port, data)
         }
+    };
+    // Attribute outbound bytes to the caller.  Counted on success only.
+    if let Ok(n) = r.as_ref() {
+        crate::proc::proc_metrics::bump_net_write(
+            crate::proc::current_pid_lockless(), *n as u64);
     }
+    r
 }
 
 /// Send data to a specific destination (UDP).
@@ -284,6 +290,8 @@ pub fn socket_sendto(
     }
 
     super::udp::send(dst_ip, sock.local_port, dst_port, data);
+    crate::proc::proc_metrics::bump_net_write(
+        crate::proc::current_pid_lockless(), data.len() as u64);
     Ok(data.len())
 }
 
@@ -299,7 +307,7 @@ pub fn socket_recv(id: u64) -> Result<Vec<u8>, &'static str> {
         return Ok(Vec::new());
     }
 
-    match sock.socket_type {
+    let r = match sock.socket_type {
         SocketType::Udp => {
             if !sock.bound {
                 return Err("not bound");
@@ -316,7 +324,14 @@ pub fn socket_recv(id: u64) -> Result<Vec<u8>, &'static str> {
             }
             Ok(super::tcp::read(sock.local_port))
         }
+    };
+    if let Ok(d) = r.as_ref() {
+        if !d.is_empty() {
+            crate::proc::proc_metrics::bump_net_read(
+                crate::proc::current_pid_lockless(), d.len() as u64);
+        }
     }
+    r
 }
 
 /// Receive data and the sender 4-tuple (for `recvfrom(2)`).
@@ -342,7 +357,7 @@ pub fn socket_recvfrom(id: u64) -> Result<(Vec<u8>, Ipv4Address, u16), &'static 
         return Ok((Vec::new(), sock.remote_ip, sock.remote_port));
     }
 
-    match sock.socket_type {
+    let r = match sock.socket_type {
         SocketType::Udp => {
             if !sock.bound {
                 return Err("not bound");
@@ -372,7 +387,14 @@ pub fn socket_recvfrom(id: u64) -> Result<(Vec<u8>, Ipv4Address, u16), &'static 
             let data = super::tcp::read(local_port);
             Ok((data, peer_ip, peer_port))
         }
+    };
+    if let Ok((d, _, _)) = r.as_ref() {
+        if !d.is_empty() {
+            crate::proc::proc_metrics::bump_net_read(
+                crate::proc::current_pid_lockless(), d.len() as u64);
+        }
     }
+    r
 }
 
 /// Check if a socket has incoming data available (used by poll).

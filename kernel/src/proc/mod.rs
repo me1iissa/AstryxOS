@@ -18,6 +18,7 @@ pub mod hello_pe;
 pub mod hello_win32_pe;
 pub mod orbit_elf;
 pub mod pe;
+pub mod proc_metrics;
 #[cfg(feature = "qga")]
 pub mod qga_elf;
 #[cfg(feature = "firefox-test")]
@@ -638,6 +639,7 @@ pub fn init() {
 
     PROCESS_TABLE.lock().push(idle_proc);
     THREAD_TABLE.lock().push(idle_thread);
+    proc_metrics::register(0);
     set_current_tid(0);
     set_current_pid(0);
 
@@ -862,6 +864,7 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
 
     PROCESS_TABLE.lock().push(process);
     THREAD_TABLE.lock().push(thread);
+    proc_metrics::register(pid);
 
     crate::serial_println!("[PROC] Created kernel process '{}' PID {} TID {}", name, pid, tid);
     pid
@@ -1980,6 +1983,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
 
     PROCESS_TABLE.lock().push(child_proc);
     THREAD_TABLE.lock().push(child_thread);
+    proc_metrics::register(child_pid);
 
     crate::serial_println!(
         "[PROC] fork: child PID {} TID {} (parent PID {}, CoW={})",
@@ -2192,6 +2196,7 @@ pub fn fork_process_share_vm(
 
     PROCESS_TABLE.lock().push(child_proc);
     THREAD_TABLE.lock().push(child_thread);
+    proc_metrics::register(child_pid);
 
     crate::serial_println!(
         "[PROC] fork_share_vm: child PID {} TID {} (parent PID {} CR3={:#x}, shared)",
@@ -2413,6 +2418,7 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
 
     PROCESS_TABLE.lock().push(child_proc);
     THREAD_TABLE.lock().push(child_thread);
+    proc_metrics::register(child_pid);
 
     Some((child_pid, child_tid))
 }
@@ -2487,6 +2493,9 @@ pub fn waitpid(parent_pid: Pid, wait_pid: i64) -> Option<(Pid, i32)> {
         let mut threads = THREAD_TABLE.lock();
         threads.retain(|t| !thread_tids.contains(&t.tid));
     }
+
+    // Free per-process metrics slot so the PID can be reused.
+    proc_metrics::unregister(child_pid);
 
     crate::serial_println!(
         "[PROC] waitpid: reaped PID {} (exit_code={})",
