@@ -100,6 +100,20 @@ struct UnixSocket {
     /// (POSIX.1-2017 §2.14, `man 2 fork`: "file descriptors shall be
     /// duplicated", `man 2 dup`).
     ref_count:   u32,
+    /// Credentials of the process that created (or, in the case of an
+    /// accept-side socket, connected) this socket endpoint.  Captured at the
+    /// moment the slot transitions out of `Free` so that subsequent
+    /// `getsockopt(SO_PEERCRED)` calls on the peer can return the credentials
+    /// of *this* endpoint's creator — per `unix(7)` SO_PEERCRED: "returns the
+    /// credentials of the peer process connected to this socket … the
+    /// credentials are those that were in effect at the time of the call to
+    /// connect(2) or socketpair(2)."  Stored as PID/UID/GID; default values
+    /// of (0, 0, 0) before initialisation are deliberately equivalent to
+    /// "kernel-owned" and surface a structurally-detectable absence to
+    /// authorisers that compare against a non-zero allowlist.
+    creator_pid: u64,
+    creator_uid: u32,
+    creator_gid: u32,
 }
 
 impl UnixSocket {
@@ -121,6 +135,9 @@ impl UnixSocket {
             shut_rd:     false,
             shut_wr:     false,
             ref_count:   0,
+            creator_pid: 0,
+            creator_uid: 0,
+            creator_gid: 0,
         }
     }
 
@@ -137,6 +154,9 @@ impl UnixSocket {
         self.shut_rd     = false;
         self.shut_wr     = false;
         self.ref_count   = 0;
+        self.creator_pid = 0;
+        self.creator_uid = 0;
+        self.creator_gid = 0;
     }
 
     fn recv_available(&self) -> usize {
@@ -178,14 +198,34 @@ impl UnixSocket { const ZERO: Self = Self::zeroed(); }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-pub fn create(kind: SockKind) -> u64 {
+/// Credentials of the process opening / connecting / creating a socket end.
+///
+/// Captured at the moment the kernel allocates a socket slot on behalf of a
+/// userland call (socket(2), connect(2), accept(2), socketpair(2)) so that a
+/// later `getsockopt(SO_PEERCRED)` on the peer end can return the credentials
+/// of the process that built this end — per `unix(7)` SO_PEERCRED, which
+/// requires the *peer's* identity at connect/socketpair time, not the
+/// caller's.  All authorisation flows that rely on SO_PEERCRED (D-Bus
+/// authentication, the Mozilla content-process sandbox broker) depend on
+/// this semantic.
+#[derive(Clone, Copy, Debug)]
+pub struct PeerCreds {
+    pub pid: u64,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+pub fn create(kind: SockKind, creds: PeerCreds) -> u64 {
     let mut t = TABLE.lock();
     for (i, s) in t.0.iter_mut().enumerate() {
         if s.state == UnixState::Free {
             s.reset();
-            s.state     = UnixState::Unbound;
-            s.kind      = kind;
-            s.ref_count = 1;
+            s.state       = UnixState::Unbound;
+            s.kind        = kind;
+            s.ref_count   = 1;
+            s.creator_pid = creds.pid;
+            s.creator_uid = creds.uid;
+            s.creator_gid = creds.gid;
             return i as u64;
         }
     }
@@ -227,7 +267,7 @@ pub fn listen(id: u64) -> i64 {
     }
 }
 
-pub fn connect(id: u64, path: &[u8]) -> i64 {
+pub fn connect(id: u64, path: &[u8], client_creds: PeerCreds) -> i64 {
     if id as usize >= MAX_UNIX_SOCKETS { return -9; }
     // Strip trailing NUL to match paths stored by bind.
     let raw_len = path.iter().position(|&b| b == 0).unwrap_or(path.len());
@@ -254,10 +294,19 @@ pub fn connect(id: u64, path: &[u8]) -> i64 {
         for (i, s) in t.0.iter_mut().enumerate() {
             if i as u64 != id && s.state == UnixState::Free {
                 s.reset();
-                s.state     = UnixState::Connected;
-                s.kind      = server_kind;
-                s.peer_id   = id;
-                s.ref_count = 1; // one reference: the fd returned by accept(2)
+                s.state       = UnixState::Connected;
+                s.kind        = server_kind;
+                s.peer_id     = id;
+                s.ref_count   = 1; // one reference: the fd returned by accept(2)
+                // The accept-side socket's *creator* is the connecting
+                // client.  A later getsockopt(SO_PEERCRED) on the client
+                // fd looks up the peer (this accept-side socket) and
+                // returns its creator — i.e. the client itself for a
+                // localhost connection, or the actual remote process for
+                // a cross-process IPC pair.  Per unix(7) SO_PEERCRED.
+                s.creator_pid = client_creds.pid;
+                s.creator_uid = client_creds.uid;
+                s.creator_gid = client_creds.gid;
                 found = i as u64;
                 break;
             }
@@ -268,6 +317,11 @@ pub fn connect(id: u64, path: &[u8]) -> i64 {
 
     t.0[id as usize].state   = UnixState::Connected;
     t.0[id as usize].peer_id = peer_id;
+    // The client-side socket retains its own creator credentials
+    // (captured at create-time).  A getsockopt(SO_PEERCRED) on the
+    // server-accepted fd will look up THIS socket's creator and return
+    // those credentials — the connecting client's identity, as required
+    // by unix(7) SO_PEERCRED.
 
     let srv = &mut t.0[server_id as usize];
     if srv.backlog_len < BACKLOG_CAP {
@@ -304,7 +358,7 @@ pub fn accept(id: u64) -> i64 {
     peer_id as i64
 }
 
-pub fn socketpair(kind: SockKind) -> (u64, u64) {
+pub fn socketpair(kind: SockKind, creds: PeerCreds) -> (u64, u64) {
     let mut t = TABLE.lock();
     let mut a = u64::MAX;
     let mut b = u64::MAX;
@@ -312,15 +366,21 @@ pub fn socketpair(kind: SockKind) -> (u64, u64) {
         if s.state == UnixState::Free {
             if a == u64::MAX {
                 s.reset();
-                s.state     = UnixState::Connected;
-                s.kind      = kind;
-                s.ref_count = 1; // one reference: fd[0] returned by socketpair(2)
+                s.state       = UnixState::Connected;
+                s.kind        = kind;
+                s.ref_count   = 1; // one reference: fd[0] returned by socketpair(2)
+                s.creator_pid = creds.pid;
+                s.creator_uid = creds.uid;
+                s.creator_gid = creds.gid;
                 a = i as u64;
             } else {
                 s.reset();
-                s.state     = UnixState::Connected;
-                s.kind      = kind;
-                s.ref_count = 1; // one reference: fd[1] returned by socketpair(2)
+                s.state       = UnixState::Connected;
+                s.kind        = kind;
+                s.ref_count   = 1; // one reference: fd[1] returned by socketpair(2)
+                s.creator_pid = creds.pid;
+                s.creator_uid = creds.uid;
+                s.creator_gid = creds.gid;
                 b = i as u64;
                 break;
             }
@@ -604,6 +664,57 @@ pub fn bytes_available(id: u64) -> usize {
 pub fn kind(id: u64) -> SockKind {
     if id as usize >= MAX_UNIX_SOCKETS { return SockKind::Stream; }
     TABLE.lock().0[id as usize].kind
+}
+
+/// Test-only override of a socket endpoint's creator credentials.
+///
+/// Used by `kernel/src/test_runner.rs` Test 230 to simulate an
+/// asymmetric `connect(2)`-established socket pair where the two ends
+/// have distinct creator pids — driving the same `peer_creds()` lookup
+/// the SO_PEERCRED syscall path would.  Not exposed to userland in any
+/// build.
+#[cfg(feature = "test-mode")]
+pub fn test_only_set_creds(id: u64, creds: PeerCreds) {
+    if id as usize >= MAX_UNIX_SOCKETS { return; }
+    let mut t = TABLE.lock();
+    let s = &mut t.0[id as usize];
+    if s.state == UnixState::Free { return; }
+    s.creator_pid = creds.pid;
+    s.creator_uid = creds.uid;
+    s.creator_gid = creds.gid;
+}
+
+/// Return the credentials of the **peer** of the socket referred to by `id`.
+///
+/// Implements the lookup required by `getsockopt(SO_PEERCRED)` per
+/// `unix(7)` SO_PEERCRED and POSIX-style local-domain credential passing:
+/// "the credentials of the peer process connected to this socket."  For a
+/// `socketpair(2)` the peer is the other half of the pair; for a
+/// `connect(2)`/`accept(2)` pair the peer is the process at the far end
+/// of the established stream.
+///
+/// Returns `None` when the socket is invalid, free, or has no connected
+/// peer.  Callers (the SO_PEERCRED implementation) should translate that
+/// into the kernel-default ucred `{ pid: 0, uid: 0, gid: 0 }` so legacy
+/// callers that ignore the return value still see a well-defined struct.
+///
+/// Cite POSIX.1-2017 §getsockopt; Linux `unix(7)` SO_PEERCRED.  CWE-287
+/// (Improper Authentication) — finding H7 of the 2026-05-16 AstryxOS
+/// security audit.
+pub fn peer_creds(id: u64) -> Option<PeerCreds> {
+    if id as usize >= MAX_UNIX_SOCKETS { return None; }
+    let t = TABLE.lock();
+    let s = &t.0[id as usize];
+    if s.state == UnixState::Free { return None; }
+    let peer = s.peer_id;
+    if peer == u64::MAX || (peer as usize) >= MAX_UNIX_SOCKETS { return None; }
+    let p = &t.0[peer as usize];
+    if p.state == UnixState::Free { return None; }
+    Some(PeerCreds {
+        pid: p.creator_pid,
+        uid: p.creator_uid,
+        gid: p.creator_gid,
+    })
 }
 
 pub fn has_pending(id: u64) -> bool {
