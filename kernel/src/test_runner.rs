@@ -9458,7 +9458,14 @@ fn test_mprotect_syscall() -> bool {
     test_println!("  mmap anon page @ {:#x} ✓", addr);
 
     // 2. Write a sentinel value to the page.
+    //
+    // The mmap'd address is a user-VA (PTE.U=1).  With CR4.SMAP set, any
+    // supervisor-mode access to a user-mapped page without EFLAGS.AC=1
+    // raises #PF (Intel SDM Vol. 3A §4.6).  UserGuard issues STAC on
+    // construction and CLAC on drop, bracketing this intentional
+    // kernel→user dereference so SMAP enforcement is temporarily lifted.
     unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
         *(addr as *mut u64) = 0xDEAD_BEEF_CAFE_BABE;
     }
     test_println!("  Wrote sentinel to page ✓");
@@ -9485,7 +9492,11 @@ fn test_mprotect_syscall() -> bool {
         test_fail!("mprotect", "mprotect(PROT_RW restore) failed: {}", r);
         return false;
     }
-    let val = unsafe { *(addr as *const u64) };
+    // Verify sentinel through UserGuard (user-VA; same SMAP rationale as above).
+    let val = unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
+        *(addr as *const u64)
+    };
     if val != 0xDEAD_BEEF_CAFE_BABE {
         test_fail!("mprotect", "sentinel corrupted: {:#x}", val);
         return false;
@@ -10259,12 +10270,20 @@ fn test_phase1_linux_syscalls() -> bool {
         // mmap(0, 4096, PROT_RW, MAP_ANON, -1, 0)
         let addr = dispatch(9, 0, 4096, 3, 0x22, u64::MAX, 0);
         if addr > 0 {
-            // Write a canary byte
-            unsafe { *(addr as *mut u8) = 0xAB; }
+            // Write a canary byte.  UserGuard required: addr is a user-VA
+            // (PTE.U=1) and CR4.SMAP is set — supervisor-mode access without
+            // EFLAGS.AC raises #PF.  Per Intel SDM Vol. 3A §4.6.
+            unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                *(addr as *mut u8) = 0xAB;
+            }
             // mremap: grow to 8192 (MREMAP_MAYMOVE=1)
             let new_addr = dispatch(25, addr as u64, 4096, 8192, 1 /*MAYMOVE*/, 0, 0);
             // The canary must still be readable at the (possibly moved) base.
-            let canary = unsafe { *(new_addr as *const u8) };
+            let canary = unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                *(new_addr as *const u8)
+            };
             if new_addr > 0 && canary == 0xAB {
                 test_println!("  mremap(grow 4096→8192) = {:#x} ✓", new_addr);
                 // Clean up
@@ -18723,8 +18742,12 @@ fn test_mremap_shrink() -> bool {
     }
     test_println!("  mmap 4 pages @ {:#x} ✓", addr);
 
-    // Write a sentinel into the first page
-    unsafe { core::ptr::write(addr as *mut u64, 0xCAFE_BABE_1234_5678u64); }
+    // Write a sentinel into the first page.  UserGuard: user-VA, CR4.SMAP
+    // active — per Intel SDM Vol. 3A §4.6.
+    unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
+        core::ptr::write(addr as *mut u64, 0xCAFE_BABE_1234_5678u64);
+    }
 
     // mremap(addr, 0x4000, 0x2000, 0) — shrink to 2 pages, no MAYMOVE
     let r = crate::syscall::dispatch_linux_kernel(
@@ -18743,8 +18766,11 @@ fn test_mremap_shrink() -> bool {
         return false;
     }
 
-    // Sentinel in first page must still be readable
-    let sentinel = unsafe { core::ptr::read(addr as *const u64) };
+    // Sentinel in first page must still be readable.  UserGuard: user-VA.
+    let sentinel = unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
+        core::ptr::read(addr as *const u64)
+    };
     if sentinel != 0xCAFE_BABE_1234_5678u64 {
         test_fail!("mremap_shrink", "sentinel corrupted: {:#x}", sentinel);
         return false;
