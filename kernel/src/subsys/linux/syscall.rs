@@ -1162,18 +1162,36 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             if crate::syscall::is_unix_socket_fd(pid, fd) {
                 // SMAP bracket — read msghdr.msg_control / msg_controllen
                 // and the cmsghdr fields under a single guard.
+                //
+                // CWE-823: ctrl_ptr is read from user-controlled
+                // msghdr.msg_control and immediately dereferenced for
+                // cmsg_len/level/type.  Like msghdr_ptr itself, it must be
+                // range-validated against ctrl_len before any kernel-mode
+                // read; otherwise a malicious caller can place a kernel-VA
+                // in msg_control and have the kernel splice attacker-named
+                // kernel bytes into the SCM_RIGHTS path.  Per sendmsg(2),
+                // msg_control is user memory at all times.  SMAP catches
+                // user-page accesses without AC=1 but does *not* catch
+                // kernel-VA dereferences — only the range check does.
                 let (ctrl_ptr, ctrl_len, cmsg_len, cmsg_level, cmsg_type) = unsafe {
                     let _g = crate::arch::x86_64::smap::UserGuard::new();
                     let cp = core::ptr::read_unaligned(msghdr_ptr.add(4));
                     let cl = core::ptr::read_unaligned(msghdr_ptr.add(5)) as usize;
-                    if cp != 0 && cl >= 16 {
+                    if cp != 0
+                        && cl >= 16
+                        && crate::syscall::validate_user_ptr(cp, cl)
+                    {
                         let ctrl = cp as *const u8;
                         (cp, cl,
                          core::ptr::read_unaligned(ctrl as *const u64) as usize,
                          core::ptr::read_unaligned((cp + 8)  as *const i32),
                          core::ptr::read_unaligned((cp + 12) as *const i32))
                     } else {
-                        (cp, cl, 0usize, 0i32, 0i32)
+                        // Caller-supplied ctrl_ptr is null / too short / kernel-VA.
+                        // Zero out the cmsghdr fields so the guard below treats
+                        // this as "no SCM_RIGHTS to deliver" rather than
+                        // dereferencing the bad pointer.
+                        (0u64, 0usize, 0usize, 0i32, 0i32)
                     }
                 };
                 if ctrl_ptr != 0 && ctrl_len >= 16 {
@@ -1288,12 +1306,28 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         // Write SCM_RIGHTS cmsghdr into msg_control.  All
                         // reads/writes here target user memory — single
                         // SMAP guard spanning the whole block.
+                        //
+                        // CWE-823: ctrl_ptr is read from user-controlled
+                        // msghdr.msg_control and is the destination of
+                        // kernel writes below.  Range-validate against the
+                        // exact byte span the writes will touch (`needed`)
+                        // before any write so a kernel-VA in msg_control
+                        // cannot direct the kernel to overwrite arbitrary
+                        // kernel memory with attacker-shaped cmsghdr bytes
+                        // (SOL_SOCKET=1, SCM_RIGHTS=1, then the receiver's
+                        // freshly-installed fd numbers).  SMAP catches the
+                        // missing-AC=1 case for user pages but does not
+                        // catch supervisor writes to kernel-VA; the range
+                        // check is the only line of defence for that.
+                        let needed = 16 + new_fd_nums.len() * 4;
                         unsafe {
                             let _g = crate::arch::x86_64::smap::UserGuard::new();
                             let ctrl_ptr = core::ptr::read_unaligned(msghdr_ptr.add(4));
                             let ctrl_len = core::ptr::read_unaligned(msghdr_ptr.add(5)) as usize;
-                            if ctrl_ptr != 0 && ctrl_len >= 16 + new_fd_nums.len() * 4 {
-                                let needed = 16 + new_fd_nums.len() * 4;
+                            if ctrl_ptr != 0
+                                && ctrl_len >= needed
+                                && crate::syscall::validate_user_ptr(ctrl_ptr, needed)
+                            {
                                 core::ptr::write_unaligned(ctrl_ptr as *mut u64, needed as u64);
                                 core::ptr::write_unaligned((ctrl_ptr + 8)  as *mut i32, 1i32); // SOL_SOCKET
                                 core::ptr::write_unaligned((ctrl_ptr + 12) as *mut i32, 1i32); // SCM_RIGHTS
@@ -1302,7 +1336,11 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                 }
                                 core::ptr::write_unaligned(msghdr_ptr.add(5) as *mut u64, needed as u64);
                             } else if ctrl_ptr != 0 {
-                                // No room — zero out msg_controllen.
+                                // No room or ctrl_ptr not in user space.  The
+                                // msghdr_ptr was already user-range-validated
+                                // at the top of the recvmsg arm, so this
+                                // single field write is safe even when
+                                // ctrl_ptr is rejected.
                                 core::ptr::write_unaligned(msghdr_ptr.add(5) as *mut u64, 0u64);
                             }
                         }
