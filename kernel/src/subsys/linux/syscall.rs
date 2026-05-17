@@ -4267,7 +4267,11 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
     // the special-fd paths above: TTY's write() reads every byte of the slice
     // into the line buffer, holding the read past the UserGuard would risk a
     // mismatched bracket.  Snapshot first.
-    if !crate::syscall::validate_user_ptr(buf as u64, count) {
+    // Bypassed when called from dispatch_linux_kernel (KernelDispatchGuard):
+    // kernel-test callers legitimately pass kernel-resident buffers.
+    if !crate::syscall::user_ptr_check_bypassed()
+        && !crate::syscall::validate_user_ptr(buf as u64, count)
+    {
         return -14; // EFAULT
     }
     let tty_snap: alloc::vec::Vec<u8> = unsafe {
@@ -4976,7 +4980,14 @@ pub fn sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64 {
     // CWE-823: Use of Out-of-range Pointer Offset. Without this a caller
     // can pass a kernel address as iov_ptr and direct the kernel to read
     // arbitrary kernel memory as the iov_base/iov_len descriptor.
-    if !crate::syscall::validate_user_ptr(iov_ptr, (iovcnt as usize).saturating_mul(16)) {
+    //
+    // Bypassed when called from dispatch_linux_kernel (KernelDispatchGuard):
+    // kernel-test callers legitimately pass kernel-resident iovec arrays.
+    // Intel SDM Vol. 3A §4.6.1: STAC/CLAC guards cover user-mode pages only;
+    // kernel-VA accesses are always permitted in ring-0.
+    if !crate::syscall::user_ptr_check_bypassed()
+        && !crate::syscall::validate_user_ptr(iov_ptr, (iovcnt as usize).saturating_mul(16))
+    {
         return -14; // EFAULT
     }
     // SMAP-bracketed copy of the iovec array into kernel memory so the
@@ -5005,7 +5016,11 @@ fn sys_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64 {
     if iovcnt == 0 { return 0; }
     if iovcnt > 1024 { return -22; } // EINVAL: IOV_MAX per POSIX readv(2)
     // CWE-823: range-validate iov_ptr (see sys_writev for full rationale).
-    if !crate::syscall::validate_user_ptr(iov_ptr, (iovcnt as usize).saturating_mul(16)) {
+    // Bypassed when called from dispatch_linux_kernel (KernelDispatchGuard):
+    // kernel-test callers legitimately pass kernel-resident iovec arrays.
+    if !crate::syscall::user_ptr_check_bypassed()
+        && !crate::syscall::validate_user_ptr(iov_ptr, (iovcnt as usize).saturating_mul(16))
+    {
         return -14; // EFAULT
     }
     let iovecs_owned: alloc::vec::Vec<[u64; 2]> = unsafe {
