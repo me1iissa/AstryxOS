@@ -11629,9 +11629,21 @@ fn test_kernel32_stubs() -> bool {
                     test_fail!("kernel32 stubs", "HeapAlloc returned NULL");
                     ok = false;
                 } else {
-                    // Write a sentinel and read it back
-                    unsafe { core::ptr::write_volatile(ptr as u64 as *mut u64, 0xDEAD_BEEF_CAFE_BABEu64); }
-                    let v = unsafe { core::ptr::read_volatile(ptr as u64 as *const u64) };
+                    // Write a sentinel and read it back.
+                    // HeapAlloc returns a user-VA (mmap-backed, PTE.U=1).  With
+                    // CR4.SMAP set, a supervisor-mode access to a user-mapped page
+                    // without EFLAGS.AC=1 raises #PF (Intel SDM Vol. 3A §4.6.1).
+                    // UserGuard issues STAC on construction and CLAC on drop so
+                    // SMAP enforcement is lifted for this intentional
+                    // kernel→user-VA dereference only.
+                    unsafe {
+                        let _g = crate::arch::x86_64::smap::UserGuard::new();
+                        core::ptr::write_volatile(ptr as u64 as *mut u64, 0xDEAD_BEEF_CAFE_BABEu64);
+                    }
+                    let v = unsafe {
+                        let _g = crate::arch::x86_64::smap::UserGuard::new();
+                        core::ptr::read_volatile(ptr as u64 as *const u64)
+                    };
                     if v != 0xDEAD_BEEF_CAFE_BABEu64 {
                         test_fail!("kernel32 stubs", "HeapAlloc memory write/read mismatch: {:#x}", v);
                         ok = false;
@@ -11665,8 +11677,18 @@ fn test_kernel32_stubs() -> bool {
                 test_fail!("kernel32 stubs", "VirtualAlloc returned {:#x}", ptr);
                 ok = false;
             } else {
-                unsafe { core::ptr::write_volatile(ptr as u64 as *mut u32, 0xABCD_1234); }
-                let v = unsafe { core::ptr::read_volatile(ptr as u64 as *const u32) };
+                // VirtualAlloc returns a user-VA (mmap-backed, PTE.U=1).  Same
+                // SMAP discipline as the HeapAlloc block above: STAC/CLAC via
+                // UserGuard required for each kernel→user dereference.
+                // Per Intel SDM Vol. 3A §4.6.1.
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    core::ptr::write_volatile(ptr as u64 as *mut u32, 0xABCD_1234);
+                }
+                let v = unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    core::ptr::read_volatile(ptr as u64 as *const u32)
+                };
                 if v != 0xABCD_1234 {
                     test_fail!("kernel32 stubs", "VirtualAlloc memory r/w mismatch: {:#x}", v);
                     ok = false;
