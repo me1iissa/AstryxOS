@@ -13,6 +13,8 @@
 //! Implementation bodies live here; the forwarding stub in
 //! `crate::subsys::aether::dispatch()` delegates to this function.
 
+extern crate alloc;
+
 use astryx_shared::syscall::*;
 
 /// Aether native syscall dispatch.
@@ -37,10 +39,21 @@ pub fn dispatch(
 
             if count == 0 { return 0; }
 
-            let slice = match unsafe { crate::syscall::user_slice(arg2, count) } {
-                Some(s) => s,
-                None => return -14, // EFAULT
+            // Snapshot user buffer into a kernel Vec under a single SMAP
+            // bracket.  Per Intel SDM Vol. 3A §4.6 a supervisor read of a
+            // user page (PTE.U=1) requires EFLAGS.AC=1; UserGuard's RAII
+            // issues STAC/CLAC.  Downstream consumers (pipe_write, TTY
+            // write, the optional UTF-8 debug formatter) all read every
+            // byte of the data after the guard would drop, so snapshot
+            // first instead of borrowing the user page.
+            if !crate::syscall::validate_user_ptr(arg2, count) {
+                return -14; // EFAULT
+            }
+            let snapshot: alloc::vec::Vec<u8> = unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                core::slice::from_raw_parts(arg2 as *const u8, count).to_vec()
             };
+            let slice: &[u8] = &snapshot;
 
             // Special fd types take priority over fd-number shortcuts
             let pid = crate::proc::current_pid();
@@ -54,6 +67,8 @@ pub fn dispatch(
                 // Try VFS first; fall back to TTY for fd 1/2 if no file open.
                 #[cfg(feature = "firefox-test")]
                 if fd == 2 {
+                    // `slice` is a kernel-resident snapshot — from_utf8 is
+                    // safe outside any SMAP bracket.
                     let s = core::str::from_utf8(slice).unwrap_or("<binary>");
                     crate::serial_println!("[FF/stderr] pid={} {:?}", pid, s);
                 }
@@ -71,15 +86,27 @@ pub fn dispatch(
             let fd = arg1;
             let count = arg3 as usize;
 
-            let buf = match unsafe { crate::syscall::user_slice_mut(arg2, count) } {
-                Some(s) => s,
-                None => return -14, // EFAULT
-            };
+            if count == 0 { return 0; }
+
+            // Validate the user buffer up front so EFAULT is reported
+            // before any I/O is performed.  The downstream paths bracket
+            // their own kernel→user writes (pipe_read / tty::read / VFS
+            // fd_read), so we don't need to hold a UserGuard here — they
+            // each acquire one when actually touching user memory.
+            if !crate::syscall::validate_user_ptr(arg2, count) {
+                return -14; // EFAULT
+            }
 
             // Special fd types take priority over fd-number shortcuts
             let pid = crate::proc::current_pid();
             if crate::syscall::is_pipe_fd(pid, fd as usize) {
                 let pipe_id = crate::syscall::get_pipe_id(pid, fd as usize);
+                // pipe_read does not bracket — it writes through the
+                // supplied &mut [u8].  Bracket the entire call so the
+                // writes execute with AC=1.  The borrow stays inside
+                // the guard scope.
+                let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+                let buf = unsafe { core::slice::from_raw_parts_mut(arg2 as *mut u8, count) };
                 match crate::ipc::pipe::pipe_read(pipe_id, buf) {
                     Some(n) => n as i64,
                     None => -9, // EBADF
@@ -89,12 +116,16 @@ pub fn dispatch(
                 match crate::vfs::fd_read(pid, fd as usize, arg2 as *mut u8, count) {
                     Ok(n) => n as i64,
                     Err(_) if fd == 0 => {
-                        // stdin — read through TTY line discipline
+                        // stdin — read through TTY line discipline.
+                        // tty.read writes directly into the supplied
+                        // &mut [u8] so we bracket each spin iteration.
                         let mut attempts = 0u32;
                         loop {
                             {
                                 let mut tty = crate::drivers::tty::TTY0.lock();
                                 crate::drivers::tty::pump_keyboard(&mut tty);
+                                let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+                                let buf = unsafe { core::slice::from_raw_parts_mut(arg2 as *mut u8, count) };
                                 let n = tty.read(buf, count);
                                 if n > 0 {
                                     return n as i64;
@@ -116,10 +147,20 @@ pub fn dispatch(
             let path_len = arg2 as usize;
             let flags = arg3 as u32;
 
-            let path = match unsafe { crate::syscall::user_slice(arg1, path_len) } {
-                Some(s) => core::str::from_utf8(s).unwrap_or(""),
-                None => return -14, // EFAULT
+            // Snapshot the path into a kernel Vec under one SMAP bracket.
+            // `core::str::from_utf8` walks every byte for validation, so
+            // calling it on a `&[u8]` that still borrows the user page
+            // would fault under SMAP after the materialisation's internal
+            // UserGuard drops.  See Intel SDM Vol. 3A §4.6.  Use
+            // user_slice_snapshot in new code (this site predates it).
+            if !crate::syscall::validate_user_ptr(arg1, path_len) {
+                return -14; // EFAULT
+            }
+            let path_buf: alloc::vec::Vec<u8> = unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                core::slice::from_raw_parts(arg1 as *const u8, path_len).to_vec()
             };
+            let path = core::str::from_utf8(&path_buf).unwrap_or("");
 
             let pid = crate::proc::current_pid();
 

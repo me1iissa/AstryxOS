@@ -3165,8 +3165,19 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 if !crate::syscall::validate_user_ptr(arg1, 8) {
                     return -14; // EFAULT
                 }
-                let buf = unsafe { core::slice::from_raw_parts_mut(arg1 as *mut u8, 8) };
-                buf.copy_from_slice(&wall_secs.to_le_bytes());
+                // SMAP bracket — the slice materialisation and the
+                // copy_from_slice write below both touch a user page
+                // (PTE.U=1).  Per Intel SDM Vol. 3A §4.6 the supervisor
+                // must hold EFLAGS.AC=1 to issue these stores.  UserGuard
+                // RAII issues STAC on construction and CLAC on drop, so
+                // the bracket covers the write regardless of fault unwind.
+                // glibc's `time(t)` vDSO fallback (man 2 time) takes this
+                // path whenever a userspace caller passes a non-NULL tloc.
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    let buf = core::slice::from_raw_parts_mut(arg1 as *mut u8, 8);
+                    buf.copy_from_slice(&wall_secs.to_le_bytes());
+                }
             }
             wall_secs
         }
@@ -3184,8 +3195,23 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         437 => {
             // openat2 struct how: { flags: u64, mode: u64, resolve: u64 }
             // arg1=dirfd, arg2=path, arg3=*how, arg4=sizeof(how)
-            let how_flags = if arg3 != 0 { unsafe { *(arg3 as *const u64) } } else { 0 };
-            let how_mode  = if arg3 != 0 { unsafe { *((arg3 + 8) as *const u64) } } else { 0o644 };
+            //
+            // SMAP bracket — both reads target user memory.  Validate the
+            // range up front (16 B covers flags+mode), then dereference
+            // under a single UserGuard.  Per Intel SDM Vol. 3A §4.6 and
+            // openat2(2) man page (which specifies a `struct open_how`).
+            let (how_flags, how_mode) = if arg3 != 0 {
+                if !crate::syscall::validate_user_ptr(arg3, 16) {
+                    return -14; // EFAULT
+                }
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    (core::ptr::read_unaligned(arg3 as *const u64),
+                     core::ptr::read_unaligned((arg3 + 8) as *const u64))
+                }
+            } else {
+                (0, 0o644)
+            };
             dispatch(257, arg1, arg2, how_flags, how_mode, 0, 0) // openat
         }
         // 316: renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
@@ -4129,42 +4155,75 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
     // Must check these BEFORE the `fd == 1/2` stdout/stderr branch because
     // kernel tests and user processes may allocate pipe/socket/eventfd at fd 1.
     let pid = crate::proc::current_pid_lockless();
-    if crate::syscall::is_pipe_fd(pid, fd as usize) {
-        let pipe_id = crate::syscall::get_pipe_id(pid, fd as usize);
-        let slice = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
-        return match crate::ipc::pipe::pipe_write(pipe_id, slice) {
-            Some(n) => {
-                // Per `man 7 pipe`: writes that deposit data MUST wake any
-                // readers parked on this pipe (the matching wait list lives
-                // in `crate::ipc::pipe::PIPE_READ_WAITERS`).  Skip the wake
-                // on a zero-byte write — the buffer state did not change.
-                if n > 0 {
-                    crate::ipc::pipe::wake_readers_all(pipe_id);
+
+    // Decide once whether the destination is a kernel-internal fd type that
+    // will hold the slice past the UserGuard scope (pipe/socket/unix/eventfd
+    // queue the bytes into kernel buffers; UDP packetises into its own Vec;
+    // TCP enqueues into the send window).  For all of these we must snapshot
+    // the user buffer into a kernel Vec BEFORE invoking the downstream code,
+    // otherwise the downstream's `extend_from_slice` / queue copy reads user
+    // memory with AC=0 and faults under SMAP (Intel SDM Vol. 3A §4.6).
+    //
+    // The VFS fd_write path below threads the raw user pointer through into
+    // its own STAC/CLAC-bracketed copy helpers, so we don't need to snapshot
+    // for that case — keeping the zero-copy fast path intact.
+    let is_pipe   = crate::syscall::is_pipe_fd(pid, fd as usize);
+    let is_unix   = !is_pipe && crate::syscall::is_unix_socket_fd(pid, fd as usize);
+    let is_inet   = !is_pipe && !is_unix && crate::syscall::is_socket_fd(pid, fd as usize);
+    let is_evfd   = !is_pipe && !is_unix && !is_inet
+                    && crate::syscall::is_eventfd_fd(pid, fd as usize);
+
+    if is_pipe || is_unix || is_inet || is_evfd {
+        if !crate::syscall::validate_user_ptr(buf as u64, count) {
+            return -14; // EFAULT
+        }
+        // Snapshot the entire buffer to kernel memory under one bracket.
+        // Bracket-scope is tight: STAC fires, the snapshot copies bytes
+        // through `to_vec`, then CLAC fires before any downstream call.
+        let snapshot: alloc::vec::Vec<u8> = unsafe {
+            let _g = crate::arch::x86_64::smap::UserGuard::new();
+            core::slice::from_raw_parts(buf_ptr, count).to_vec()
+        };
+        let data: &[u8] = &snapshot;
+
+        if is_pipe {
+            let pipe_id = crate::syscall::get_pipe_id(pid, fd as usize);
+            return match crate::ipc::pipe::pipe_write(pipe_id, data) {
+                Some(n) => {
+                    // Per `man 7 pipe`: writes that deposit data MUST wake
+                    // any readers parked on this pipe (the matching wait
+                    // list lives in `crate::ipc::pipe::PIPE_READ_WAITERS`).
+                    // Skip the wake on a zero-byte write — the buffer state
+                    // did not change.
+                    if n > 0 {
+                        crate::ipc::pipe::wake_readers_all(pipe_id);
+                    }
+                    n as i64
                 }
-                n as i64
-            }
-            None => -9,
-        };
-    } else if crate::syscall::is_unix_socket_fd(pid, fd as usize) {
-        let data = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
-        let unix_id = crate::syscall::get_unix_socket_id(pid, fd as usize);
-        return crate::net::unix::write(unix_id, data);
-    } else if crate::syscall::is_socket_fd(pid, fd as usize) {
-        let socket_id = crate::syscall::get_socket_id(pid, fd as usize);
-        let data = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
-        return match crate::net::socket::socket_send(socket_id, data) {
-            Ok(n) => n as i64,
-            Err("EPIPE") => -32, // EPIPE — caller did SHUT_WR
-            Err(_) => -104, // ECONNRESET
-        };
-    } else if crate::syscall::is_eventfd_fd(pid, fd as usize) {
+                None => -9,
+            };
+        }
+        if is_unix {
+            let unix_id = crate::syscall::get_unix_socket_id(pid, fd as usize);
+            return crate::net::unix::write(unix_id, data);
+        }
+        if is_inet {
+            let socket_id = crate::syscall::get_socket_id(pid, fd as usize);
+            return match crate::net::socket::socket_send(socket_id, data) {
+                Ok(n) => n as i64,
+                Err("EPIPE") => -32, // EPIPE — caller did SHUT_WR
+                Err(_) => -104, // ECONNRESET
+            };
+        }
+        // is_evfd
         if count < 8 { return -22; } // EINVAL
         let efd_id = crate::syscall::get_eventfd_id(pid, fd as usize);
-        let val = unsafe {
-            let _g = crate::arch::x86_64::smap::UserGuard::new();
-            core::ptr::read_unaligned(buf_ptr as *const u64)
-        };
-        return match crate::ipc::eventfd::write(efd_id, u64::from_le(val)) {
+        let val_bytes: [u8; 8] = [
+            data[0], data[1], data[2], data[3],
+            data[4], data[5], data[6], data[7],
+        ];
+        let val = u64::from_le_bytes(val_bytes);
+        return match crate::ipc::eventfd::write(efd_id, val) {
             Ok(()) => {
                 // Per `man 2 eventfd`: a write that bumps the counter must
                 // wake any reader parked on a zero counter (see the per-
@@ -4184,9 +4243,18 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
         Err(_) => return -9, // EBADF for other fds
     }
 
-    // fd 1/2 with no VFS file → TTY stdout/stderr.
-    let slice = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
-    crate::drivers::tty::TTY0.lock().write(slice);
+    // fd 1/2 with no VFS file → TTY stdout/stderr.  Same SMAP discipline as
+    // the special-fd paths above: TTY's write() reads every byte of the slice
+    // into the line buffer, holding the read past the UserGuard would risk a
+    // mismatched bracket.  Snapshot first.
+    if !crate::syscall::validate_user_ptr(buf as u64, count) {
+        return -14; // EFAULT
+    }
+    let tty_snap: alloc::vec::Vec<u8> = unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
+        core::slice::from_raw_parts(buf_ptr, count).to_vec()
+    };
+    crate::drivers::tty::TTY0.lock().write(&tty_snap);
     count as i64
 }
 
@@ -5159,8 +5227,20 @@ fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: u64, count: usize) -> i
             None => return -9,
         }
     };
+    // Per sendfile(2): if `offset` is non-NULL, kernel reads the starting
+    // offset from `*offset` and writes the post-read offset back on success.
+    // Validate the 8-byte range and bracket the read with STAC/CLAC so the
+    // supervisor access to a user page does not raise #PF when SMAP is
+    // active (Intel SDM Vol. 3A §4.6).  An invalid pointer must surface as
+    // EFAULT (errno 14), per the man page.
     let read_offset: u64 = if offset_ptr != 0 {
-        unsafe { core::ptr::read_unaligned(offset_ptr as *const u64) }
+        if !crate::syscall::validate_user_ptr(offset_ptr, 8) {
+            return -14; // EFAULT
+        }
+        unsafe {
+            let _g = crate::arch::x86_64::smap::UserGuard::new();
+            core::ptr::read_unaligned(offset_ptr as *const u64)
+        }
     } else {
         in_offset_cur
     };
@@ -5219,9 +5299,16 @@ fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: u64, count: usize) -> i
         }
     }
 
-    // Update the read offset.
+    // Update the read offset.  Per sendfile(2): on a non-NULL offset
+    // pointer the kernel writes back the post-read offset.  validate_user_ptr
+    // already passed at the top of the function (we never NULL it between
+    // there and here), but we re-bracket with STAC/CLAC because the write
+    // touches a user page (Intel SDM Vol. 3A §4.6).
     if offset_ptr != 0 {
-        unsafe { core::ptr::write_unaligned(offset_ptr as *mut u64, read_offset + n as u64); }
+        unsafe {
+            let _g = crate::arch::x86_64::smap::UserGuard::new();
+            core::ptr::write_unaligned(offset_ptr as *mut u64, read_offset + n as u64);
+        }
     } else {
         let mut procs = crate::proc::PROCESS_TABLE.lock();
         if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {

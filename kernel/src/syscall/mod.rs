@@ -79,36 +79,64 @@ pub(crate) fn validate_user_ptr(ptr: u64, len: usize) -> bool {
     }
 }
 
-/// Validate and create a slice from a user pointer. Returns `None` on failure.
+/// Snapshot a user buffer into a kernel-resident `Vec<u8>` under one
+/// SMAP bracket.
 ///
-/// The returned slice borrows directly from user memory; SMAP enforcement
-/// will fault on any access made AFTER the caller's `UserGuard` scope
-/// (per Intel SDM Vol. 3A §4.6).  Callers that intend to perform reads
-/// against this slice must bracket those accesses themselves — typically
-/// by copying through `core::slice::copy_from_slice` or `iter().copied()`
-/// inside an explicit guard.  In practice almost every caller copies the
-/// slice into a kernel buffer right after this returns, so we bracket
-/// here so the SLICE materialisation itself is safe and the caller's
-/// downstream copies (which read the user page) inherit a kernel buffer.
+/// This is the **preferred** helper for any caller that intends to read
+/// every byte of a user buffer — it eliminates the footgun shape of
+/// returning a borrowed `&[u8]` whose backing memory is still a user
+/// page (which faults under SMAP, per Intel SDM Vol. 3A §4.6, once the
+/// caller's `UserGuard` scope ends).
+///
+/// On invalid pointer / overflow returns `None` (caller should surface
+/// EFAULT to the user).  On `len == 0` returns `Some(empty)`.
+///
+/// # Safety
+///
+/// Caller must ensure no concurrent kernel thread is writing to the
+/// same user page during the snapshot — the snapshot is non-atomic.
 #[inline]
-pub(crate) unsafe fn user_slice<'a>(ptr: u64, len: usize) -> Option<&'a [u8]> {
+pub(crate) unsafe fn user_slice_snapshot(ptr: u64, len: usize) -> Option<alloc::vec::Vec<u8>> {
+    if len == 0 { return Some(alloc::vec::Vec::new()); }
+    if !validate_user_ptr(ptr, len) { return None; }
+    let buf: alloc::vec::Vec<u8> = {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
+        core::slice::from_raw_parts(ptr as *const u8, len).to_vec()
+    };
+    Some(buf)
+}
+
+/// Validate and create a *borrowed* slice over user memory.
+///
+/// **Footgun warning**: the returned `&[u8]` borrows directly from a
+/// user page.  This function brackets the *materialisation* with
+/// STAC/CLAC, but the bracket drops on return — any caller that
+/// reads from the returned slice afterwards needs its **own**
+/// `UserGuard` scope wrapping those reads, or the access will fault
+/// under SMAP (Intel SDM Vol. 3A §4.6).  Prefer
+/// [`user_slice_snapshot`] when the caller will hold the data past
+/// a single tight bracket.
+///
+/// # Safety
+///
+/// In addition to the SMAP discipline above, the caller assumes
+/// responsibility for ensuring the underlying user memory remains
+/// mapped and unmodified for the slice's borrow lifetime (TOCTOU).
+#[inline]
+pub(crate) unsafe fn user_slice_unbracketed<'a>(ptr: u64, len: usize) -> Option<&'a [u8]> {
     if len == 0 { return Some(&[]); }
     if !validate_user_ptr(ptr, len) { return None; }
-    // Slice materialisation does not deref, but every realistic caller
-    // immediately reads from the slice; keep the guard live until the
-    // function returns so the &[u8] is hot under AC=1.  The caller still
-    // needs its own UserGuard for accesses that outlive this function.
     let _g = crate::arch::x86_64::smap::UserGuard::new();
     Some(core::slice::from_raw_parts(ptr as *const u8, len))
 }
 
-/// Validate and create a mutable slice from a user pointer.
-///
-/// See [`user_slice`] for the SMAP bracketing caveat — the caller MUST
-/// wrap any writes through the returned `&mut [u8]` in a `UserGuard`
-/// scope (or use one of the bracketed copy helpers).
+/// Mutable counterpart to [`user_slice_unbracketed`] — same footgun
+/// warning applies.  The caller MUST wrap any writes through the
+/// returned `&mut [u8]` in a `UserGuard` scope (or use a bracketed
+/// copy helper).  Prefer copy-out-then-copy-in patterns when the
+/// write set is bounded.
 #[inline]
-pub(crate) unsafe fn user_slice_mut<'a>(ptr: u64, len: usize) -> Option<&'a mut [u8]> {
+pub(crate) unsafe fn user_slice_mut_unbracketed<'a>(ptr: u64, len: usize) -> Option<&'a mut [u8]> {
     if len == 0 { return Some(&mut []); }
     if !validate_user_ptr(ptr, len) { return None; }
     let _g = crate::arch::x86_64::smap::UserGuard::new();
