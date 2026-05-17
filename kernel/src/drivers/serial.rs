@@ -138,11 +138,15 @@ static SERIAL: Mutex<SerialPort> = Mutex::new(SerialPort { base: COM1 });
 /// `IA32_TSC_AUX` via `rdmsr` — Intel SDM Vol 3 §10.4 / §17.17).  On
 /// entry to `_serial_print` (after `cli`) we atomic-swap our slot to
 /// `true`; if the prior value was already `true`, this is a same-CPU
-/// re-entry from an ISR and we return immediately, dropping the
-/// diagnostic line.  Dropping one line is the intentional trade vs a
-/// hard self-deadlock — Intel SDM Vol 3 §6.6 notes that interrupt
-/// handlers must avoid blocking on resources held by interrupted code,
-/// which is exactly the constraint here.
+/// re-entry from an ISR.  We route the message to
+/// `write_fallback_direct`, which formats it into a stack buffer and
+/// writes the bytes directly to the COM1 THR with a bounded-spin LSR
+/// poll, bypassing the SERIAL mutex (Intel SDM Vol 3 §6.6 — interrupt
+/// handlers must avoid blocking on resources held by interrupted code;
+/// here we take the lock-free direct path instead).  Byte ordering
+/// inside the inner line is preserved; cross-writer interleave with
+/// the outer caller's chunk bursts is possible at FIFO_DEPTH boundaries
+/// but is purely cosmetic.
 ///
 /// The fault-immune bugcheck path (PR #127) does NOT use `_serial_print`
 /// and is unaffected by this guard — it routes through
@@ -383,10 +387,37 @@ pub fn _serial_print(args: fmt::Arguments) {
     if PER_CPU_IN_SERIAL[cpu].swap(true, Ordering::Acquire) {
         // Same-CPU re-entry detected (we hold SERIAL on this CPU; an ISR
         // fired in the inter-chunk IRQ window and ended up here).  The
-        // re-entrant `spin::Mutex::lock()` would self-deadlock.  Drop the
-        // diagnostic line — Intel SDM Vol 3 §6.6 says handlers must not
-        // block on resources held by interrupted code.  Re-enable the
-        // caller's IF before returning so we don't leak IRQ-off state.
+        // re-entrant `spin::Mutex::lock()` would self-deadlock.  We MUST
+        // NOT take the mutex — but we still want the diagnostic line to
+        // reach the log: dropping it caused the W215 DR-arm diagnostic
+        // to look silent for many trials (the post-hoc
+        // `[W215/DR-ARM]` `serial_println!` from inside the timer ISR's
+        // CRC walker fires while the BSP is mid-`_serial_print` from a
+        // VFS-resolve trace, the guard rejects it, and the only sign of
+        // the arm is `ARM_COUNT` advancing — not enough to identify
+        // the writer).
+        //
+        // The fallback: format the args into a small stack buffer and
+        // push the bytes DIRECTLY to the UART FIFO with a bounded-spin
+        // LSR poll, **bypassing the SERIAL mutex**.  The outer caller is
+        // mid-formatting and only writes to the FIFO in 16-byte chunks
+        // between cli/sti pairs, so the two writers may interleave at
+        // FIFO_DEPTH-byte boundaries — a cosmetic visual interleave in
+        // the log but the inner line WILL appear, with all its bytes
+        // intact (the NS16550A TX FIFO sequences port-I/O writes; per
+        // datasheet §8 there is no data-race on outb to the THR).
+        //
+        // SAFETY of bypassing the mutex: SERIAL serialises chunk-burst
+        // writers to keep multi-byte messages from cross-CPU interleave
+        // *across whole lines*.  Within a single CPU, the OUTER writer
+        // is in a non-IRQ path (otherwise the per-CPU guard would have
+        // been set by it) and the INNER writer (here) is in an ISR or
+        // bugcheck-adjacent path.  An interleaved line is strictly
+        // better than a silently dropped line for any diagnostic use.
+        //
+        // We do NOT clear PER_CPU_IN_SERIAL[cpu] here — the OUTER
+        // caller still owns it.  We restore IF and return.
+        write_fallback_direct(args);
         if if_was_set {
             crate::hal::enable_interrupts();
         }
@@ -474,6 +505,83 @@ pub fn _serial_print(args: fmt::Arguments) {
         crate::hal::enable_interrupts();
     }
     // (If IF was off on entry it remains off here — correct behaviour.)
+}
+
+/// Direct-to-UART fallback writer used when `_serial_print` detects
+/// same-CPU re-entry (PER_CPU_IN_SERIAL[cpu] already set).  Bypasses the
+/// SERIAL mutex; pushes bytes directly to the COM1 THR with a bounded
+/// LSR.THRE poll per byte.
+///
+/// Buffer size: 384 bytes is the empirical ceiling for the longest W215
+/// diagnostic line (`[W215/DR-WATCH-FIRE]` with full register dump),
+/// rounded up for safety.  Excess bytes are truncated with a trailing
+/// `…\n` marker to signal that the line was clipped — better a truncated
+/// diagnostic than silent loss.
+///
+/// Newline expansion (LF → CRLF) is done inline so the buffer's logical
+/// capacity is ~190 input bytes.  All current W215 diagnostic lines fit.
+///
+/// Per Intel SDM Vol. 3B §17.2.5 and NS16550A datasheet §8: outb to the
+/// THR after polling LSR.THRE is the canonical single-byte send path,
+/// safe under concurrent writers as long as each individual outb is
+/// atomic (which it is — port I/O is single-instruction on x86).
+fn write_fallback_direct(args: fmt::Arguments) {
+    use fmt::Write;
+
+    const FALLBACK_CAP: usize = 384;
+    struct StackBuf {
+        buf: [u8; FALLBACK_CAP],
+        len: usize,
+        truncated: bool,
+    }
+    impl fmt::Write for StackBuf {
+        fn write_str(&mut self, s: &str) -> fmt::Result {
+            for byte in s.bytes() {
+                // Account for the LF→CRLF expansion so we don't write
+                // a half-pair at the buffer's tail.
+                let needed = if byte == b'\n' { 2 } else { 1 };
+                if self.len + needed > self.buf.len() {
+                    self.truncated = true;
+                    return Ok(()); // soft-truncate; let the trailer add `\n`
+                }
+                if byte == b'\n' {
+                    self.buf[self.len] = b'\r';
+                    self.len += 1;
+                }
+                self.buf[self.len] = byte;
+                self.len += 1;
+            }
+            Ok(())
+        }
+    }
+    let mut sbuf = StackBuf { buf: [0u8; FALLBACK_CAP], len: 0, truncated: false };
+    let _ = sbuf.write_fmt(args);
+    if sbuf.truncated {
+        // Append a "…\n" trailer if there is room (3 bytes incl. CRLF).
+        let trailer = b"...\r\n";
+        let room = sbuf.buf.len().saturating_sub(sbuf.len);
+        let n = core::cmp::min(room, trailer.len());
+        sbuf.buf[sbuf.len..sbuf.len + n].copy_from_slice(&trailer[..n]);
+        sbuf.len += n;
+    }
+
+    // Bounded-spin per-byte direct write to COM1 THR.
+    // SAFETY: COM1 is in the reserved 0x3F8–0x3FF port range.  Per-byte
+    // poll-then-outb sequence is the same as `SerialPort::write_byte`,
+    // hoisted out of the struct so we don't need to acquire SERIAL.
+    unsafe {
+        for &b in &sbuf.buf[..sbuf.len] {
+            let mut n = 0u32;
+            while hal::inb(COM1 + LSR) & LSR_THRE == 0 {
+                core::hint::spin_loop();
+                n += 1;
+                if n >= THRE_SPIN_LIMIT {
+                    return; // UART wedged — drop the rest rather than hang
+                }
+            }
+            hal::outb(COM1, b);
+        }
+    }
 }
 
 /// Test-only harness for the per-CPU re-entry guard.
