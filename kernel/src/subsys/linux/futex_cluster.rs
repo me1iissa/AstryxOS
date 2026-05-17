@@ -131,6 +131,13 @@ pub static CLUSTER_WAKE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 /// kdb counters above accumulate unconditionally.
 const DIAG_RATE_DIVISOR: u64 = 1024;
 
+/// Emit the first `DIAG_FIRST_N` recoveries verbatim so the path is
+/// visibly exercised on any run that fires it — operators reading the
+/// serial log can see the compensation engaging without having to query
+/// kdb.  Beyond that, `DIAG_RATE_DIVISOR` takes over to bound serial
+/// volume on long soaks.
+const DIAG_FIRST_N: u64 = 4;
+
 /// Runtime gate.  Default ON when `firefox-test` is the active feature
 /// (the workload the compensation was designed for); OFF otherwise so a
 /// stock build never executes the path.  Operator can flip at runtime via
@@ -418,9 +425,16 @@ pub fn compensate(pid: u64, wake_tid: u64, wake_uaddr: u64, nr_wake: u64) -> u64
     for cand in cands.iter() {
         if wake_one_candidate(pid, cand).is_some() {
             woken_extra += 1;
-            // Rate-limited diagnostic line.
-            let attempt = CLUSTER_WAKE_ATTEMPTS.load(Ordering::Relaxed);
-            if attempt % DIAG_RATE_DIVISOR == 1 {
+            // Rate-limited diagnostic line.  Always emit the first
+            // `DIAG_FIRST_N` recoveries (so the path is visibly
+            // exercised on any run that fires it), then 1 in
+            // `DIAG_RATE_DIVISOR` thereafter (so a long firefox-test
+            // soak doesn't flood the serial budget).
+            let attempt    = CLUSTER_WAKE_ATTEMPTS.load(Ordering::Relaxed);
+            let recoveries = CLUSTER_WAKE_RECOVERIES.load(Ordering::Relaxed);
+            let should_emit = recoveries < DIAG_FIRST_N
+                              || attempt % DIAG_RATE_DIVISOR == 1;
+            if should_emit {
                 let reason_s = match cand.reason {
                     CandidateReason::CondSlot    => "cond_slot",
                     CandidateReason::WakeHistory => "wake_history",
