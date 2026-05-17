@@ -7,26 +7,53 @@
 
 ## Headline
 
-The post-W215 plateau (sc≈3559 per global heartbeat; pid=1 sc=2907) is an
-**H1 STATIC FUTEX_WAKE deadlock**, but the producer is not who PNG-1
-initially identified.
+The post-W215 plateau (sc≈3557-3559 per global heartbeat; pid=1
+sc=2907) is an **H1 STATIC FUTEX_WAKE deadlock**, but the producer is
+**TID 13** (a clone-child worker), not TID 2 (Mozilla main) as PNG-1
+initially hypothesised.
+
+3-trial KVM soak, all trials reached the plateau within 3-4 min wall
+time. Per-trial drill on TID 13:
+
+| Trial | TID 13 wakes | wake uaddr      | woken/wakes | Jaccard(first,last) |
+|-------|-------------:|-----------------|-------------|---------------------|
+|   1   |           37 | 0x7effff4f1ea0  |       0/37  |                1.00 |
+|   2   |           38 | 0x7effff4f1be0  |       0/38  |                1.00 |
+|   3   |           37 | 0x7effff4f1df0  |       0/37  |                1.00 |
+
+The wake target uaddr shifts across trials (ASLR) but the structural
+pattern is identical and deterministic. Single static uaddr, single
+RIP pair (wait `0x7effffa84ae2`, wake `0x7effffa78c67`), all wakes
+return woken=0.
+
+Per-trial drill on TID 2:
+
+| Trial | TID 2 wakes  | Jaccard(first,last) | verdict      |
+|-------|-------------:|---------------------|--------------|
+|   1   |            9 |                0.00 | H2_CHURNING  |
+|   2   |           16 |                0.00 | H2_CHURNING  |
+|   3   |            9 |                0.00 | H2_CHURNING  |
+
+TID 2's wake set rotates completely between buckets — main thread is
+NOT the wedge.
 
 The new `futex-wake-drill` subcommand (added in this PR) parses
 `[FUTEX_WAKE]` and `[FUTEX_WAKE_REQ]` lines from the serial log, buckets
 them temporally, and computes Jaccard similarity of per-bucket wake-uaddr
-sets:
+sets. Trial-1 producer histogram:
 
 | TID | wakes | woken/wakes | Jaccard(first,last) | verdict |
 |-----|------:|------------:|--------------------:|---------|
 | 2   |     9 |       8 / 9 |               0.00  | H2_CHURNING (normal main-thread activity, not stuck) |
-| 13  |    37 |       0 / 37|               1.00  | **H1_STATIC** (single uaddr 0x7effff4f1ea0, 6/6 buckets) |
+| 13  |    37 |       0 / 37|               1.00  | **H1_STATIC** (single uaddr, 6/6 buckets) |
 | 16  |     2 |       1 / 2 |                  —  | minor |
 | 15  |     1 |       0 / 1 |                  —  | minor |
 
-**TID 13** issues 37 FUTEX_WAKE calls — all on the same address
-`0x7effff4f1ea0`, all returning `woken=0`. The wakes are in a tight loop
-with FUTEX_WAIT(`0x7eff6d19f9ec`) → ETIMEDOUT → FUTEX_WAKE(`0x7effff4f1ea0`)
-→ woken=0 → repeat. Same RIP pair on every iteration:
+**TID 13** issues ~37 FUTEX_WAKE calls per trial — all on a SINGLE
+address (`0x7effff4f1ea0` / `0x7effff4f1be0` / `0x7effff4f1df0`
+across the three trials), all returning `woken=0`. The wakes are in a
+tight loop with FUTEX_WAIT(other-uaddr) → ETIMEDOUT → FUTEX_WAKE(stuck-
+uaddr) → woken=0 → repeat. Same RIP pair on every iteration:
 
 - wait RIP `0x7effffa84ae2`
 - wake RIP `0x7effffa78c67`
