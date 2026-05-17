@@ -5321,8 +5321,15 @@ fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: u64, count: usize) -> i
         let mounts = crate::vfs::MOUNTS.lock();
         match mounts.get(out_mount) {
             Some(m) => {
-                let _ = m.fs.write(out_inode, out_offset, &buf);
+                let n_w = m.fs.write(out_inode, out_offset, &buf).unwrap_or(0);
                 drop(mounts);
+                // Page-cache coherency: same contract as `vfs::fd_write`
+                // (POSIX mmap(2) MAP_SHARED + write(2) visibility).
+                if n_w > 0 {
+                    crate::mm::cache::update_range(
+                        out_mount, out_inode, out_offset, &buf[..n_w],
+                    );
+                }
                 let mut procs = crate::proc::PROCESS_TABLE.lock();
                 if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
                     if let Some(Some(fd)) = proc.file_descriptors.get_mut(out_fd) {
