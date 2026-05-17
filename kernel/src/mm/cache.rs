@@ -308,7 +308,10 @@ pub fn insert_with_expected(
         // `w215-diag` so the demo path does not perform the per-insert
         // 4 KiB CRC scan that touches the ~2 MiB shadow table.
         #[cfg(feature = "w215-diag")]
-        crate::mm::w215_crc::record_insert(phys, inode, page_offset);
+        // writable_shared is unknown at this generic insert path — callers
+        // that know the mapping flags call `w215_crc::mark_writable_shared`
+        // immediately after to update the shadow entry.
+        crate::mm::w215_crc::record_insert(phys, inode, page_offset, false);
 
         // W215 Arm-1.5 pre-arm: for cache-keys that fall in the libxul
         // cluster (configured via `W215_PREARM_KEY`), arm a hardware
