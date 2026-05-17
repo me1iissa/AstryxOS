@@ -8,6 +8,7 @@ pub mod debug_reg;
 pub mod gdt;
 pub mod idt;
 pub mod irq;
+pub mod smap;
 
 /// Initialize all x86_64 architecture components.
 pub fn init() {
@@ -16,7 +17,7 @@ pub fn init() {
     irq::init();
     enable_sse();
     enable_cpu_security_features();
-    crate::serial_println!("[x86_64] Architecture initialized (GDT, IDT, IRQ, SSE, SMEP)");
+    crate::serial_println!("[x86_64] Architecture initialized (GDT, IDT, IRQ, SSE, SMEP, SMAP)");
 }
 
 /// Enable SSE/SSE2 support on the current CPU.
@@ -55,24 +56,32 @@ pub fn enable_sse() {
 /// not advertise the feature raises #GP, so the bit is gated on the
 /// CPUID probe.
 ///
-/// SMAP (CR4 bit 21, CPUID 7:0 EBX[20]) is intentionally NOT enabled
-/// here. Enabling SMAP requires every legitimate kernel access to user
-/// memory to be bracketed by STAC/CLAC (EFLAGS.AC=1) per Intel SDM
-/// Vol. 3A §4.6.1; the current `validate_user_ptr` family performs raw
-/// dereferences without that bracketing, so enabling SMAP without first
-/// refactoring those helpers would cause a #PF on every legitimate user
-/// copy. SMAP enablement is deferred to a follow-up that introduces
-/// `stac()`/`clac()` wrappers and audits every unsafe user pointer
-/// dereference.
+/// Also enables CR4.SMAP (bit 21) when CPUID.(EAX=07H,ECX=00H):EBX[bit
+/// 20] advertises support and after the STAC/CLAC bracketing in the
+/// syscall layer has been audited (see `arch::x86_64::smap` module).
+/// With SMAP set, the CPU raises #PF on any supervisor-mode access to
+/// a user-mapped page (PTE.U/S=1) unless EFLAGS.AC=1.  Per Intel SDM
+/// Vol. 3A §4.6, this defeats the class of kernel bugs that
+/// inadvertently dereference an attacker-controlled user pointer —
+/// converting an arbitrary-write primitive into a fail-stop fault.
+///
+/// SMAP enablement publishes `smap::SMAP_ENABLED = true`; every
+/// legitimate user-pointer access in the kernel goes through a
+/// `UserGuard` (or `stac_if_smap`/`clac_if_smap`) which reads that
+/// atomic and issues STAC/CLAC accordingly.  Tests / kernel paths that
+/// drive a syscall handler with a kernel-VA buffer are unaffected:
+/// SMAP only fires on user-mapped pages.
 ///
 /// Called on the BSP from `init()` and on each AP from `apic::ap_main`.
 ///
 /// Mitigates: CVE-2017-7308-class kernel-pointer-corruption exploits
 /// (CWE-119 / CWE-269) by removing the user-mapped-page execution
 /// primitive even when a kernel UAF or vtable confusion gives the
-/// attacker control of an indirect-branch target.
+/// attacker control of an indirect-branch target.  SMAP additionally
+/// closes the BadIRET / ret2usr-data class (CVE-2014-9322) by
+/// converting unintentional user-pointer dereferences into faults.
 pub fn enable_cpu_security_features() {
-    let (smep_supported, _smap_supported) = unsafe {
+    let (smep_supported, smap_supported) = unsafe {
         let ebx: u32;
         // CPUID leaf 7, sub-leaf 0: structured extended feature flags.
         // EBX bit 7 = SMEP, EBX bit 20 = SMAP (Intel SDM Vol. 2A §3.2).
@@ -96,9 +105,27 @@ pub fn enable_cpu_security_features() {
     }
 
     unsafe {
-        let cr4: u64;
+        let mut cr4: u64;
         core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
-        let cr4 = cr4 | (1u64 << 20); // CR4.SMEP
+        cr4 |= 1u64 << 20; // CR4.SMEP
+        if smap_supported {
+            cr4 |= 1u64 << 21; // CR4.SMAP
+        }
         core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack));
+    }
+
+    if smap_supported {
+        // Publish AFTER CR4 has actually been written so any STAC issued
+        // through a UserGuard cannot precede the SMAP-on transition.
+        // `Relaxed` is sufficient: bracketing helpers do their own
+        // dependent loads on the same atomic, and the publication
+        // happens once per CPU, on that CPU, before any user pointer is
+        // dereferenced — there is no cross-thread visibility ordering
+        // to enforce (the atomic exists to gate runtime instruction
+        // emission, not to synchronise data).
+        smap::SMAP_ENABLED.store(true, core::sync::atomic::Ordering::Relaxed);
+        crate::serial_println!("[x86_64] SMAP enabled (CR4.SMAP=1, EFLAGS.AC gated by STAC/CLAC)");
+    } else {
+        crate::serial_println!("[x86_64] SMAP not advertised by CPU — skipping");
     }
 }

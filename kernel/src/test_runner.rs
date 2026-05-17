@@ -1594,6 +1594,29 @@ pub fn run() -> ! {
     total += 1;
     if test_security_user_ptr_validation_cwe823() { passed += 1; }
 
+    // ── Test 220b: SMAP CR4 + UserGuard coherence (H1-SMAP) ──────────────
+    // Verifies CR4.SMAP, CPUID, and smap::SMAP_ENABLED are mutually
+    // consistent and that UserGuard's STAC/CLAC bracket actually toggles
+    // EFLAGS.AC.  See `docs/SECURITY_AUDIT_2026-05-16.md` finding H1.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_security_smap_h1_state() { passed += 1; }
+    }
+
+    // ── Test 220c: SMAP UserGuard nested/early-drop regression ──────────
+    // Stronger negative-shape coverage than 220b: verifies the AC state
+    // machine across nested guards, mid-scope explicit `drop`, and an
+    // accessor that returns a borrowed slice (a known footgun shape —
+    // the borrow must NOT outlive AC=1 if there's no caller-side bracket).
+    // Regression guard against an unbracketed user-memory deref slipping
+    // back in.  Per Intel SDM Vol. 3A §4.6 + CWE-823.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_220c_smap_userguard_nesting() { passed += 1; }
+    }
+
     // ── Test 221: cache::audit_invariant meta-test ───────────────────────
     // Verifies audit_invariant() reports zero orphan cache entries on an
     // idle kernel.  A failure here indicates either a false-positive in the
@@ -28424,6 +28447,266 @@ fn test_security_user_ptr_validation_cwe823() -> bool {
     }
 
     test_pass!("kernel-half pointers rejected with -EFAULT across writev/readv/preadv/pwritev/sendmsg/recvmsg/getrandom");
+    true
+}
+
+// ── Test 221: SMAP STAC/CLAC bracket regression ──────────────────────────────
+//
+// Closes finding H1-SMAP from `docs/SECURITY_AUDIT_2026-05-16.md`.  PR #250
+// landed CR4.SMEP and deferred SMAP.  The follow-up landed CR4.SMAP after
+// bracketing every legitimate user-pointer dereference with STAC/CLAC.
+//
+// This is a static-state regression guard: it verifies that the SMAP feature
+// has been correctly detected via CPUID and that CR4.SMAP / smap::SMAP_ENABLED
+// are coherent.  Per Intel SDM Vol. 3A §4.6, when SMAP is enabled the CPU
+// raises #PF on any supervisor access to a user-mapped page unless
+// EFLAGS.AC=1.  A kernel that runs userspace without faulting (which we
+// already exercise via the firefox-test boot in CI) is the dynamic proof
+// that bracketing is in place; this test is the cheap static sanity check.
+//
+// References:
+//   * Intel SDM Vol. 3A §4.6 (Supervisor Mode Access Prevention)
+//   * CPUID.(EAX=07H,ECX=00H):EBX[bit 20] = SMAP support
+//   * CWE-269 (Improper Privilege Management) — SMAP closes the
+//     unintentional-user-pointer-deref escalation primitive
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_security_smap_h1_state() -> bool {
+    test_header!("security: SMAP CR4.SMAP coherent with smap::SMAP_ENABLED (H1)");
+
+    // Probe CPUID for SMAP support (EBX bit 20 of leaf 7, sub-leaf 0).
+    let smap_supported = unsafe {
+        let ebx: u32;
+        core::arch::asm!(
+            "push rbx",
+            "cpuid",
+            "mov {ebx:e}, ebx",
+            "pop rbx",
+            ebx = out(reg) ebx,
+            inout("eax") 7u32 => _,
+            inout("ecx") 0u32 => _,
+            out("edx") _,
+        );
+        (ebx & (1 << 20)) != 0
+    };
+
+    let smap_enabled_flag = crate::arch::x86_64::smap::SMAP_ENABLED
+        .load(core::sync::atomic::Ordering::Relaxed);
+
+    let cr4: u64 = unsafe {
+        let v: u64;
+        core::arch::asm!("mov {}, cr4", out(reg) v, options(nomem, nostack));
+        v
+    };
+    let cr4_smap = (cr4 & (1u64 << 21)) != 0;
+
+    test_println!("  cpuid_smap={} cr4_smap={} flag={}",
+        smap_supported, cr4_smap, smap_enabled_flag);
+
+    if !smap_supported {
+        // Acceptable: an older CPU (or TCG without `+smap`) can't enable SMAP.
+        // The flag must agree (cleared) and CR4.SMAP must be 0.
+        if smap_enabled_flag || cr4_smap {
+            test_fail!("security_smap_h1_state",
+                "SMAP not in CPUID but flag={} cr4_smap={}",
+                smap_enabled_flag, cr4_smap);
+            return false;
+        }
+        test_pass!("SMAP not advertised by CPU — flag + CR4 correctly cleared");
+        return true;
+    }
+
+    // CPUID says supported → CR4.SMAP and SMAP_ENABLED must both be set.
+    if !cr4_smap {
+        test_fail!("security_smap_h1_state",
+            "CPUID advertises SMAP but CR4.SMAP=0");
+        return false;
+    }
+    if !smap_enabled_flag {
+        test_fail!("security_smap_h1_state",
+            "CR4.SMAP=1 but smap::SMAP_ENABLED=false (gating helpers will no-op)");
+        return false;
+    }
+
+    // Smoke test: verify STAC/CLAC can be issued safely on this CPU and that
+    // UserGuard's drop clears AC.  Reading EFLAGS via pushfq lets us check
+    // bit 18 before/after.
+    let ac_before = unsafe {
+        let f: u64;
+        core::arch::asm!("pushfq; pop {}", out(reg) f, options(nomem));
+        (f & (1u64 << 18)) != 0
+    };
+    let ac_in_guard;
+    let ac_after;
+    {
+        let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+        ac_in_guard = unsafe {
+            let f: u64;
+            core::arch::asm!("pushfq; pop {}", out(reg) f, options(nomem));
+            (f & (1u64 << 18)) != 0
+        };
+    }
+    ac_after = unsafe {
+        let f: u64;
+        core::arch::asm!("pushfq; pop {}", out(reg) f, options(nomem));
+        (f & (1u64 << 18)) != 0
+    };
+
+    test_println!("  AC before={} in-guard={} after={}", ac_before, ac_in_guard, ac_after);
+    if !ac_in_guard {
+        test_fail!("security_smap_h1_state",
+            "AC=0 inside UserGuard — STAC did not fire");
+        return false;
+    }
+    if ac_after {
+        test_fail!("security_smap_h1_state",
+            "AC=1 after UserGuard dropped — CLAC did not fire");
+        return false;
+    }
+
+    test_pass!("SMAP enabled coherently and STAC/CLAC bracket UserGuard correctly");
+    true
+}
+
+// ── Test 220c: SMAP UserGuard nested/early-drop regression ──────────────────
+//
+// 220b verified the basic state machine.  220c is the stronger negative-shape
+// test: it exercises the situations where /review caught real bugs in PR #276
+// — borrowed user slices, early guard drops, nested guards.  Each scenario
+// reads AC after the bracket should have closed and fails if it's still
+// asserted (i.e. CLAC didn't fire).  Combined with the syscall-level fixes
+// in this PR, future regressions where someone forgets a bracket get caught
+// by either this state-machine test or the syscall arg-validation matrix
+// (Test 222).
+//
+// Threat model:
+//   * Attacker = sandboxed userspace process with code execution privilege
+//   * Capability: pass an attacker-controlled address into any syscall that
+//     dereferences a user pointer
+//   * Target: arbitrary kernel write via a corrupted/spoofed function
+//     pointer that the kernel deref's at AC=0 (CVE-2014-9322 class, CWE-269)
+//
+// References:
+//   * Intel SDM Vol. 3A §4.6 (SMAP enforcement)
+//   * CWE-823 (Use of Out-of-range Pointer Offset)
+//   * CWE-119 (Buffer Errors with Improper Bounds Checking)
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_220c_smap_userguard_nesting() -> bool {
+    test_header!("security: UserGuard nested/early-drop AC-state regression");
+
+    let smap_enabled = crate::arch::x86_64::smap::SMAP_ENABLED
+        .load(core::sync::atomic::Ordering::Relaxed);
+
+    // Helper to read EFLAGS.AC.
+    #[inline(always)]
+    fn ac_bit() -> bool {
+        let f: u64;
+        unsafe { core::arch::asm!("pushfq; pop {}", out(reg) f, options(nomem)); }
+        (f & (1u64 << 18)) != 0
+    }
+
+    if !smap_enabled {
+        // On non-SMAP CPUs the bracket is a no-op; AC always reads 0.
+        // The test only verifies the gating helpers don't crash.
+        unsafe {
+            let _g = crate::arch::x86_64::smap::UserGuard::new();
+            let _ = ac_bit();
+        }
+        test_pass!("SMAP not advertised — UserGuard collapsed to no-op cleanly");
+        return true;
+    }
+
+    // ── Scenario A: nested guards.  Both must hold AC=1 throughout; the
+    // outer guard must keep AC=1 even after the inner one drops.
+    let (a_inner, a_after_inner_drop, a_after_outer_drop) = unsafe {
+        let _outer = crate::arch::x86_64::smap::UserGuard::new();
+        let mid: bool;
+        let after_inner: bool;
+        {
+            let _inner = crate::arch::x86_64::smap::UserGuard::new();
+            mid = ac_bit();
+        }
+        after_inner = ac_bit();
+        drop(_outer);
+        let after_outer = ac_bit();
+        (mid, after_inner, after_outer)
+    };
+
+    if !a_inner {
+        test_fail!("220c_smap_userguard_nesting",
+            "AC=0 inside nested guards — STAC missing on inner construct");
+        return false;
+    }
+    if !a_after_inner_drop {
+        test_fail!("220c_smap_userguard_nesting",
+            "AC=0 after inner guard drop while outer is live — outer guard's STAC was clobbered");
+        return false;
+    }
+    if a_after_outer_drop {
+        test_fail!("220c_smap_userguard_nesting",
+            "AC=1 after outer guard drop — CLAC did not fire");
+        return false;
+    }
+
+    // ── Scenario B: explicit early drop mid-scope.  This is the exact
+    // shape where /review caught the user_slice footgun — the slice
+    // borrow outlives the guard and any subsequent deref would fault.
+    // We don't deref (would panic the kernel without an extable), we
+    // just verify AC=0 after the explicit drop, before the scope ends.
+    let (b_before_drop, b_after_drop) = unsafe {
+        let g = crate::arch::x86_64::smap::UserGuard::new();
+        let before = ac_bit();
+        drop(g);
+        let after = ac_bit();
+        (before, after)
+    };
+
+    if !b_before_drop {
+        test_fail!("220c_smap_userguard_nesting",
+            "AC=0 before explicit drop — STAC missing");
+        return false;
+    }
+    if b_after_drop {
+        test_fail!("220c_smap_userguard_nesting",
+            "AC=1 after explicit drop — CLAC did not fire on Drop");
+        return false;
+    }
+
+    // ── Scenario C: function-boundary leak.  Confirm a helper that
+    // constructs a UserGuard and returns *without* the guard does NOT
+    // leak AC=1 to the caller.  user_slice_unbracketed / _mut have
+    // exactly this shape — they return a borrowed slice but the
+    // bracket has closed.
+    #[inline(never)]
+    fn make_guard_and_drop() {
+        unsafe {
+            let _g = crate::arch::x86_64::smap::UserGuard::new();
+            // do nothing; guard drops on function return.
+        }
+    }
+    make_guard_and_drop();
+    let c_after_helper = ac_bit();
+    if c_after_helper {
+        test_fail!("220c_smap_userguard_nesting",
+            "AC=1 after helper function returned — guard leaked across call boundary");
+        return false;
+    }
+
+    // ── Scenario D: validate that user_slice_snapshot leaves AC=0 on
+    // return (the new safe helper from Improvement 6).  This catches
+    // regressions where someone changes the helper to return a borrow
+    // again without re-introducing the bracket.
+    //
+    // We pass len=0 + ptr=0 (always-valid empty case) so no real user
+    // memory is touched.
+    let _snap = unsafe { crate::syscall::user_slice_snapshot(0, 0) };
+    let d_after_snapshot = ac_bit();
+    if d_after_snapshot {
+        test_fail!("220c_smap_userguard_nesting",
+            "AC=1 after user_slice_snapshot returned — internal guard leaked");
+        return false;
+    }
+
+    test_pass!("UserGuard AC state machine is correct across nesting/early-drop/helper boundaries");
     true
 }
 
