@@ -7,7 +7,18 @@
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
+#[cfg(feature = "w215-diag")]
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
+
+/// True while `prepopulate_file` is actively bulk-loading pages.  The
+/// W215 pre-arm hook in `insert` consults this flag and skips arming
+/// during the bulk-load phase so the boot-time prepopulate (which
+/// inserts ~50 K libxul pages back-to-back) is not perturbed by the
+/// DR programming side-effects.  Set by `prepopulate_file` around its
+/// inner loop; cleared on exit (and on early return / break).
+#[cfg(feature = "w215-diag")]
+static PREPOPULATE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Cache key: (mount_index, inode_number, page_aligned_file_offset).
 type CacheKey = (usize, u64, u64);
@@ -22,6 +33,55 @@ struct PageCacheEntry {
 
 /// Global page cache.
 static PAGE_CACHE: Mutex<BTreeMap<CacheKey, PageCacheEntry>> = Mutex::new(BTreeMap::new());
+
+/// W215 pre-arm policy: the `(mount, inode)` pair that identifies the
+/// libxul cache key cluster in the Firefox demo run.  Any cache::insert
+/// whose key matches will attempt to arm a hardware DR1/DR2/DR3 watch on
+/// the inserted phys at insert time, so the upstream writer that mutates
+/// the cache-resident frame is caught the moment its store retires.
+///
+/// The exact `(mount, inode)` values are tuned for the current Firefox
+/// build's libxul; if the disk image changes the values can shift.  Set
+/// to `Some((mount, inode))` to filter, or `None` to disable filtering
+/// entirely (every cache::insert pre-arms — only viable for early-boot
+/// debug because the DR pool is just 3 slots).
+#[cfg(feature = "w215-diag")]
+const W215_PREARM_KEY: Option<(usize, u64)> = Some((4, 0x9b));
+
+/// W215 pre-arm cluster-range filter on phys.  Inserts with phys outside
+/// this range are not interesting — the historical fingerprint cluster
+/// spans phys roughly 0x32E*–0x39F* (850 MiB – 920 MiB).  We use a
+/// generous [256 MiB, 1 GiB) window so the diagnostic is robust to small
+/// per-boot layout drift while still excluding the bulk of cold-start
+/// prepopulate inserts (which cluster well below 256 MiB).
+#[cfg(feature = "w215-diag")]
+const W215_PREARM_PHYS_LO: u64 = 0x1000_0000;   // 256 MiB
+#[cfg(feature = "w215-diag")]
+const W215_PREARM_PHYS_HI: u64 = 0x4000_0000;   // 1 GiB
+
+/// PHYS → kernel-higher-half offset.  Same constant as `mm/pmm.rs` /
+/// `mm/w215_crc.rs`; duplicated here to keep this file self-contained.
+#[cfg(feature = "w215-diag")]
+const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+
+/// Best-effort caller-RIP capture.  Walks one frame up using `rbp`; if
+/// the prologue did not save RBP (LTO / `-fomit-frame-pointer`) this
+/// returns 0 — the line is still useful from the (mount, inode, phys)
+/// triple alone.  Diagnostic-only.
+#[cfg(feature = "w215-diag")]
+#[inline(never)]
+fn caller_rip() -> u64 {
+    let rbp: u64;
+    unsafe {
+        core::arch::asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack, preserves_flags));
+    }
+    if rbp == 0 || (rbp & 7) != 0 || rbp < 0xFFFF_8000_0000_0000 {
+        return 0;
+    }
+    // [rbp+8] = saved return address into `cache::insert`'s caller.
+    let ret = unsafe { core::ptr::read_volatile((rbp + 8) as *const u64) };
+    ret
+}
 
 /// Look up a cached page.  Returns the physical address if found.
 pub fn lookup(mount_idx: usize, inode: u64, page_offset: u64) -> Option<u64> {
@@ -109,6 +169,37 @@ pub fn lookup_and_acquire(mount_idx: usize, inode: u64, page_offset: u64) -> Opt
 /// must be propagated to all processors before the physical frame is
 /// repurposed.
 pub fn insert(mount_idx: usize, inode: u64, page_offset: u64, phys: u64) {
+    // W215 structural-invariant guard: a cache::insert MUST NOT install a
+    // frame whose physical address lies inside the kernel image
+    // (.text/.rodata/.data/.bss).  The page cache is for filesystem-backed
+    // pages; a kernel-static frame as cache contents would mean the kernel
+    // is about to be overwritten by a memset/zero-fill in the page-fault
+    // install path the moment a userspace mapping demand-faults on the
+    // aliased VMA.  This was the observed symptom in the W215
+    // `Console::scroll_region_up` corruption (PR #260 trial: Console.fb
+    // overwritten because its phys was aliased into a libxul cache key).
+    // Emit a single line with full provenance and refuse the insert —
+    // diagnostic-only, the caller will then take the cold-path that does
+    // not alias kernel static data.
+    #[cfg(feature = "w215-diag")]
+    {
+        if crate::mm::pmm::is_kernel_static_phys(phys) {
+            let (kbase, kend) = crate::mm::pmm::kernel_image_phys_range();
+            // Best-effort RIP capture: read the caller's return address
+            // through the saved frame pointer.  This is a one-shot
+            // diagnostic; if RBP is clobbered we just log 0.
+            let rip = caller_rip();
+            crate::serial_println!(
+                "[W215/INSERT-OF-KERNEL-STATIC] phys={:#x} mount={} inode={} \
+                 offset={:#x} kernel_phys=[{:#x},{:#x}) caller_rip={:#x}",
+                phys, mount_idx, inode, page_offset, kbase, kend, rip,
+            );
+            // Bail out — do NOT insert.  The page cache must not own a
+            // kernel-static phys.
+            return;
+        }
+    }
+
     // Capture the evicted frame (if any) before releasing the lock so
     // we can call quarantine_free without holding the cache mutex, which
     // would create a lock-order cycle (cache → TLB quarantine → PMM).
@@ -161,6 +252,48 @@ pub fn insert(mount_idx: usize, inode: u64, page_offset: u64, phys: u64) {
         // 4 KiB CRC scan that touches the ~2 MiB shadow table.
         #[cfg(feature = "w215-diag")]
         crate::mm::w215_crc::record_insert(phys, inode, page_offset);
+
+        // W215 Arm-1.5 pre-arm: for cache-keys that fall in the libxul
+        // cluster (configured via `W215_PREARM_KEY`), arm a hardware
+        // DR1/DR2/DR3 write-watchpoint on the just-inserted frame.  The
+        // DR pool is shared between concurrent pre-arms — most inserts
+        // are no-ops because the pool is already saturated; that's fine,
+        // the goal is to catch the *next* corruption while a victim is
+        // armed.  See `arch/x86_64/debug_reg.rs::arm_preinsert_watchpoint`
+        // for the slot-allocation policy.
+        //
+        // BOOT-PHASE GUARD: the prepopulate path inserts ~50 K libxul
+        // pages through this code path during boot.  We only want to
+        // arm during the *steady-state* fault-driven cache::insert path
+        // (the one where the W215 fingerprint reproduces), NOT during
+        // the bulk-prepopulate phase where every page goes through here.
+        // The prepopulate hook signals it is active via
+        // `crate::mm::cache::PREPOPULATE_ACTIVE`; if that's set, skip the
+        // arm.  This bounds the arm activity to ~3 IPI-free DR programmings
+        // per fire-and-recycle cycle in steady state.
+        #[cfg(feature = "w215-diag")]
+        if !PREPOPULATE_ACTIVE.load(Ordering::Acquire) {
+            let want_prearm = match W215_PREARM_KEY {
+                Some((m, i)) => mount_idx == m && inode == i,
+                None => true,
+            };
+            if want_prearm
+                && phys >= W215_PREARM_PHYS_LO
+                && phys < W215_PREARM_PHYS_HI
+                && (phys & 0xFFF) == 0
+            {
+                let linear = PHYS_OFF + phys;
+                // 8-byte W-only — matches the post-hoc DR0 width so the same
+                // dispatcher path can interpret the fire.  The first qword
+                // of the frame is as good a witness as any: any writer that
+                // mutates the page is overwhelmingly likely to write at
+                // least one qword starting at the page base (memset, memcpy,
+                // struct store).
+                let _ = crate::arch::x86_64::debug_reg::arm_preinsert_watchpoint(
+                    linear, 8, phys, inode, page_offset,
+                );
+            }
+        }
     }
 
     if let Some(old_phys) = evicted_zero_rc {
@@ -262,6 +395,25 @@ pub fn prepopulate_file(path: &str) -> usize {
     let page_size = crate::mm::pmm::PAGE_SIZE as u64;
     let mut cached = 0usize;
     let phys_off: u64 = 0xFFFF_8000_0000_0000;
+
+    // W215 pre-arm guard: suppress the cache::insert pre-arm hook for
+    // the duration of this bulk-prepopulate.  The hook is intended to
+    // fire on steady-state fault-driven inserts (the path where the
+    // W215 fingerprint reproduces), not on this back-to-back load that
+    // touches every libxul page once at boot.
+    #[cfg(feature = "w215-diag")]
+    PREPOPULATE_ACTIVE.store(true, Ordering::Release);
+    // Restore-on-exit pattern via a small RAII guard.
+    #[cfg(feature = "w215-diag")]
+    struct PrepGuard;
+    #[cfg(feature = "w215-diag")]
+    impl Drop for PrepGuard {
+        fn drop(&mut self) {
+            PREPOPULATE_ACTIVE.store(false, Ordering::Release);
+        }
+    }
+    #[cfg(feature = "w215-diag")]
+    let _prep_guard = PrepGuard;
 
     // Read in 2 MiB bursts.  Sized to match the BlockDevice multi-sector
     // batch window so each `read` translates into a small number of
