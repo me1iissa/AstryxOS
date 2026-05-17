@@ -41,6 +41,9 @@ Tier 1 — session management:
     python3 scripts/qemu-harness.py prune [--ttl DAYS]
     python3 scripts/qemu-harness.py results <sid>
     python3 scripts/qemu-harness.py read-png <sid> <dst.png> [--timeout-ms MS]
+    python3 scripts/qemu-harness.py futex-wake-drill <sid> [--tid N]
+                                            [--bucket-count K] [--window-lines L]
+                                            [--cross-park]
 
 Tier 2 — GDB stub integration (requires --gdb-port on start):
     python3 scripts/qemu-harness.py regs <sid>
@@ -3094,6 +3097,371 @@ def cmd_thread_park_audit(args):
         }
 
     _out(resp)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# futex-wake-drill — PNG-2 post-W215 plateau: TID-2 FUTEX_WAKE pattern classifier
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Post-W215 (PR #270) the demo plateau settled at sc≈2886 with no contentproc
+# spawn.  PNG-1 (PR #272 thread-park-audit) identified TID 2 (Mozilla main
+# thread) as the FUTEX_WAKE producer — issuing wakes on a worker pool but
+# never advancing past the plateau.  Two competing hypotheses:
+#
+#   H1 STATIC deadlock: TID 2 wakes the SAME futex addresses over and over;
+#                       a worker consumes the wakes but never makes forward
+#                       progress.  Wake-set is small + stable across time.
+#
+#   H2 CHURNING/overhead: TID 2's wake addresses CHANGE between time windows
+#                         (workers ARE progressing, just slowly).  Plateau is
+#                         init/overhead, not deadlock.
+#
+# This subcommand reads the existing `[FUTEX_WAKE]` and `[FUTEX_WAKE_REQ]`
+# diagnostic lines from the serial log (both already emitted unconditionally
+# under firefox-test), filters by the producer TID (default 2), splits the
+# matched lines into N temporal buckets, and computes Jaccard set-similarity
+# of the per-bucket uaddr sets.
+#
+# Classification rules (matching the PNG-2 dispatch spec):
+#   |J(b_last, b_first)| ≥ 0.80  → STATIC (H1)
+#   |J(b_last, b_first)| ≤ 0.20  → CHURNING (H2)
+#   else                          → HYBRID (mixed)
+#
+# Output schema:
+#   {
+#     "ok": true,
+#     "tid_filter": N, "bucket_count": K, "window_lines": L,
+#     "total_wakes": M, "total_wake_reqs": M',
+#     "bucket_summary": [
+#       { "i": 0, "lines": [a,b], "wake_count": N, "wake_req_count": N',
+#         "unique_uaddrs": K, "top_uaddrs": [
+#             { "uaddr": "0x...", "wakes": n, "woken_total": w, "max_woken": m,
+#               "wake_reqs": r }
+#         ] }, ... ],
+#     "jaccard": {
+#       "first_vs_last":  0.xx,         # primary classifier
+#       "adjacent":      [0.xx, ...],   # bucket[i] vs bucket[i+1]
+#     },
+#     "verdict": "H1_STATIC" | "H2_CHURNING" | "HYBRID",
+#     "verdict_reason": "...",
+#     "static_uaddrs": [             # uaddrs present in ALL buckets (H1 evidence)
+#         { "uaddr": "0x...", "wakes_per_bucket": [...], "buckets_present": K }
+#     ],
+#     "churn_metrics": {
+#       "uaddrs_in_first_only":  K_a,
+#       "uaddrs_in_last_only":   K_b,
+#       "uaddrs_in_both":        K_c,
+#     }
+#   }
+#
+# References:
+#   - POSIX `futex(2)` — FUTEX_WAKE semantics
+#   - Intel SDM Vol 3A §8.2.3 (total store order — relied on by sample slots)
+#   - Mozilla CondVarPOSIX: https://searchfox.org/mozilla-central/source/mozglue/misc/PlatformConditionVariable.h
+
+_FUTEX_WAKE_FULL_RE = re.compile(
+    r"\[FUTEX_WAKE\] tid=(\d+) pid=(\d+) uaddr=(0x[0-9a-fA-F]+) "
+    r"woken=(\d+) max=(\d+|MAX)"
+)
+_FUTEX_WAKE_REQ_FULL_RE = re.compile(
+    r"\[FUTEX_WAKE_REQ\] tid=(\d+) pid=(\d+) uaddr=(0x[0-9a-fA-F]+) max=(\d+|MAX)"
+)
+
+
+def _futex_drill_jaccard(a: set, b: set) -> float:
+    """Jaccard similarity coefficient of two sets (|A∩B| / |A∪B|).
+
+    Returns 1.0 when both sets are empty (treated as "no change"), and 0.0
+    when one is empty and the other is not.  Used to classify wake-set
+    drift across temporal buckets.
+    """
+    if not a and not b: return 1.0
+    union = a | b
+    if not union: return 1.0
+    return len(a & b) / len(union)
+
+
+def cmd_futex_wake_drill(args):
+    """PNG-2 TID-2 FUTEX_WAKE drill: STATIC deadlock vs CHURNING overhead.
+
+    Reads `[FUTEX_WAKE]` and `[FUTEX_WAKE_REQ]` lines from the serial log,
+    filters by `--tid` (default 2 = Mozilla parent main), splits the matched
+    lines into `--bucket-count` (default 2) equal temporal buckets, and
+    classifies the wake-set drift via Jaccard similarity.
+
+    With `--cross-park` the live kdb thread-park-audit is queried alongside
+    and uaddr-set is joined against still-parked futex waiters — for each
+    uaddr TID is waking, the joined table shows whether any thread is parked
+    on it (deadlock-confirming) or no parked waiter exists (consumed wake).
+    """
+    sess = _load_session(args.sid)
+    serial_log = sess.get("serial_log")
+    if not serial_log:
+        _out({"error": "session has no serial log"})
+        sys.exit(1)
+
+    tid_filter   = int(getattr(args, "tid", 2) or 2)
+    bucket_count = max(2, int(getattr(args, "bucket_count", 2) or 2))
+    window_lines = int(getattr(args, "window_lines", 0) or 0)
+    cross_park   = bool(getattr(args, "cross_park", False))
+
+    try:
+        lines = Path(serial_log).read_text(errors="replace").splitlines()
+    except OSError as e:
+        _out({"error": f"cannot read serial log: {e}"})
+        sys.exit(1)
+
+    # Collect every matching WAKE / WAKE_REQ line for our tid.  We keep
+    # (line_idx, kind, uaddr, woken, max) tuples in chronological order so
+    # the bucket split below is deterministic and reproducible.
+    wake_rows: list[tuple] = []
+    req_rows:  list[tuple] = []
+    for i, ln in enumerate(lines):
+        m = _FUTEX_WAKE_FULL_RE.search(ln)
+        if m and int(m.group(1)) == tid_filter:
+            wake_rows.append((i, m.group(3),
+                              int(m.group(4)),
+                              m.group(5)))
+            continue
+        m = _FUTEX_WAKE_REQ_FULL_RE.search(ln)
+        if m and int(m.group(1)) == tid_filter:
+            req_rows.append((i, m.group(3), m.group(4)))
+
+    # Optionally restrict to the most-recent N lines (post-plateau window
+    # so early init noise doesn't dominate the classification).
+    if window_lines > 0 and lines:
+        first_keep = max(0, len(lines) - window_lines)
+        wake_rows = [r for r in wake_rows if r[0] >= first_keep]
+        req_rows  = [r for r in req_rows  if r[0] >= first_keep]
+
+    if not wake_rows and not req_rows:
+        _out({
+            "ok": False,
+            "tid_filter": tid_filter,
+            "error": "no [FUTEX_WAKE] or [FUTEX_WAKE_REQ] lines found "
+                     "for this tid; was the kernel built with "
+                     "--features firefox-test?",
+            "lines_scanned": len(lines),
+        })
+        return
+
+    # Bucket split: divide WAKE rows into K equal-count slices.  We split
+    # on WAKE rather than WAKE_REQ because WAKE is the act-on-real-state
+    # signal (REQ logs an attempt regardless of whether any waiter matched).
+    # If no WAKE rows exist (only REQ), fall back to REQ-based bucketing
+    # so the diagnostic remains useful even when every wake is a no-op.
+    rows_for_bucket = wake_rows if wake_rows else req_rows
+    n = len(rows_for_bucket)
+    bucket_count_eff = min(bucket_count, n) if n > 0 else 0
+    if bucket_count_eff < 2:
+        _out({
+            "ok": False,
+            "tid_filter": tid_filter,
+            "error": f"too few wake/wake_req rows ({n}) for bucket_count={bucket_count}",
+            "wake_count": len(wake_rows),
+            "wake_req_count": len(req_rows),
+        })
+        return
+
+    # Compute bucket boundaries by row-index (chronological), not by line
+    # number — guarantees roughly equal sample sizes per bucket even when
+    # the wake-rate varies wildly across the run.
+    edges_row: list[int] = []
+    for b in range(bucket_count_eff + 1):
+        edges_row.append((b * n) // bucket_count_eff)
+    # Translate row-edges back into serial-line ranges for human readability.
+    line_edges: list[tuple] = []
+    for b in range(bucket_count_eff):
+        lo_row = edges_row[b]; hi_row = edges_row[b + 1]
+        if hi_row > lo_row:
+            lo_line = rows_for_bucket[lo_row][0]
+            hi_line = rows_for_bucket[hi_row - 1][0]
+        else:
+            lo_line = hi_line = 0
+        line_edges.append((lo_line, hi_line))
+
+    # Per-bucket aggregation.  uaddr → (wake_count, woken_total, max_woken,
+    # wake_req_count).
+    buckets: list[dict] = []
+    for b in range(bucket_count_eff):
+        lo_row = edges_row[b]; hi_row = edges_row[b + 1]
+        # Translate to a (lo_line, hi_line) inclusive range for slicing
+        # the OTHER row-list (WAKE_REQ) — important so wake/wake_req counts
+        # in the same bucket cover the same serial-log window.
+        lo_line, hi_line = line_edges[b]
+        agg: dict[str, dict] = {}
+        for (_, uaddr, woken, mx) in wake_rows[
+                _lo_idx(wake_rows, lo_line):
+                _hi_idx(wake_rows, hi_line)]:
+            row = agg.setdefault(uaddr, {
+                "uaddr": uaddr, "wakes": 0, "woken_total": 0,
+                "max_woken": 0, "wake_reqs": 0,
+            })
+            row["wakes"] += 1
+            row["woken_total"] += woken
+            if woken > row["max_woken"]:
+                row["max_woken"] = woken
+        for (_, uaddr, _mx) in req_rows[
+                _lo_idx(req_rows, lo_line):
+                _hi_idx(req_rows, hi_line)]:
+            row = agg.setdefault(uaddr, {
+                "uaddr": uaddr, "wakes": 0, "woken_total": 0,
+                "max_woken": 0, "wake_reqs": 0,
+            })
+            row["wake_reqs"] += 1
+        # Top-N for human triage.
+        top = sorted(agg.values(),
+                     key=lambda r: (-r["wakes"], -r["wake_reqs"]))[:10]
+        buckets.append({
+            "i": b,
+            "lines": [lo_line, hi_line],
+            "row_range": [lo_row, hi_row],
+            "wake_count":     sum(r["wakes"]     for r in agg.values()),
+            "wake_req_count": sum(r["wake_reqs"] for r in agg.values()),
+            "unique_uaddrs":  len(agg),
+            "top_uaddrs":     top,
+            "_uaddr_set":     set(agg.keys()),
+        })
+
+    # Jaccard similarity classification.
+    first_set = buckets[0]["_uaddr_set"]
+    last_set  = buckets[-1]["_uaddr_set"]
+    j_first_last = _futex_drill_jaccard(first_set, last_set)
+    j_adjacent = [
+        _futex_drill_jaccard(buckets[i]["_uaddr_set"],
+                              buckets[i + 1]["_uaddr_set"])
+        for i in range(len(buckets) - 1)
+    ]
+
+    if j_first_last >= 0.80:
+        verdict = "H1_STATIC"
+        reason  = (f"first-vs-last Jaccard={j_first_last:.2f} ≥ 0.80: "
+                   f"TID {tid_filter} is waking the same uaddr set across "
+                   f"the entire {bucket_count_eff}-bucket window — STATIC "
+                   f"deadlock pattern.")
+    elif j_first_last <= 0.20:
+        verdict = "H2_CHURNING"
+        reason  = (f"first-vs-last Jaccard={j_first_last:.2f} ≤ 0.20: "
+                   f"TID {tid_filter}'s wake set has rotated over time — "
+                   f"workers ARE making progress, plateau is overhead/cost.")
+    else:
+        verdict = "HYBRID"
+        reason  = (f"first-vs-last Jaccard={j_first_last:.2f} in (0.20, 0.80): "
+                   f"partial overlap — some uaddrs persist across the window "
+                   f"(potential deadlock subset) while others rotate.")
+
+    # Static-uaddrs (present in EVERY bucket) — the H1 evidence list.
+    common: set[str] = set(buckets[0]["_uaddr_set"])
+    for b in buckets[1:]:
+        common &= b["_uaddr_set"]
+    static_uaddrs = []
+    for ua in sorted(common):
+        per_bucket = [
+            next((r["wakes"] for r in b["top_uaddrs"] if r["uaddr"] == ua), 0)
+            for b in buckets
+        ]
+        static_uaddrs.append({
+            "uaddr": ua,
+            "wakes_per_bucket": per_bucket,
+            "buckets_present":  len(buckets),
+        })
+
+    churn_metrics = {
+        "uaddrs_in_first_only": len(first_set - last_set),
+        "uaddrs_in_last_only":  len(last_set  - first_set),
+        "uaddrs_in_both":       len(first_set & last_set),
+    }
+
+    # Drop the internal _uaddr_set field before JSON-serialising.
+    for b in buckets:
+        b.pop("_uaddr_set", None)
+
+    resp: dict = {
+        "ok":              True,
+        "tid_filter":      tid_filter,
+        "bucket_count":    bucket_count_eff,
+        "window_lines":    window_lines,
+        "lines_scanned":   len(lines),
+        "total_wakes":     len(wake_rows),
+        "total_wake_reqs": len(req_rows),
+        "bucket_summary":  buckets,
+        "jaccard": {
+            "first_vs_last": round(j_first_last, 4),
+            "adjacent":      [round(j, 4) for j in j_adjacent],
+        },
+        "verdict":         verdict,
+        "verdict_reason":  reason,
+        "static_uaddrs":   static_uaddrs,
+        "churn_metrics":   churn_metrics,
+    }
+
+    # Optional: cross-reference live FUTEX_WAITERS via thread-park-audit.
+    # If --cross-park, we issue the live kdb query and join the WAKING uaddr
+    # set against the still-PARKED uaddr set.  For each waking uaddr we list
+    # any tids currently blocked on it — these are the worker(s) supposed to
+    # consume each wake.  Absence of parked waiters for a heavily-waked uaddr
+    # is strong evidence of either lost-wakeup or post-consume re-park.
+    if cross_park:
+        port = int(sess.get("kdb_host_port") or 0)
+        if port <= 0:
+            resp["cross_park_error"] = "session not started with --features kdb"
+        else:
+            try:
+                raw = _kdb_recv(port, {"op": "thread-park-audit"},
+                                timeout=float(getattr(args, "timeout", 30.0)))
+                park = json.loads(raw.strip().decode("utf-8", errors="replace"))
+                parked_by_uaddr: dict[str, list[dict]] = {}
+                for t in park.get("threads", []):
+                    w = t.get("wait") or {}
+                    if w.get("kind") != "futex": continue
+                    ua = w.get("uaddr")
+                    if not ua: continue
+                    parked_by_uaddr.setdefault(ua, []).append({
+                        "tid":         t.get("tid"),
+                        "pid":         t.get("pid"),
+                        "thread_name": t.get("thread_name"),
+                        "blocked_for_ticks": t.get("blocked_for_ticks"),
+                    })
+                # Join: for each TOP uaddr in the LAST bucket, attach parked
+                # waiters list.  Last bucket because that's the live state
+                # the cross-park snapshot is concurrent with.
+                joined = []
+                for row in buckets[-1].get("top_uaddrs", []):
+                    ua = row["uaddr"]
+                    waiters = parked_by_uaddr.get(ua, [])
+                    joined.append({
+                        **row,
+                        "parked_waiters_count": len(waiters),
+                        "parked_waiters":       waiters,
+                    })
+                resp["cross_park"] = {
+                    "live_parked_futex_uaddrs": len(parked_by_uaddr),
+                    "join_last_bucket":          joined,
+                }
+            except (socket.timeout, ConnectionRefusedError, OSError,
+                    json.JSONDecodeError, ValueError) as e:
+                resp["cross_park_error"] = f"kdb thread-park-audit failed: {e}"
+
+    _out(resp)
+
+
+def _lo_idx(rows: list[tuple], lo_line: int) -> int:
+    """Binary-search index of the first row with line_idx ≥ lo_line.
+
+    Assumes rows are sorted by line_idx ascending (always true: they were
+    accumulated in serial-log order).  O(log N) per call; the per-bucket
+    aggregation in cmd_futex_wake_drill calls this twice per bucket.
+    """
+    import bisect
+    keys = [r[0] for r in rows]
+    return bisect.bisect_left(keys, lo_line)
+
+
+def _hi_idx(rows: list[tuple], hi_line: int) -> int:
+    """Binary-search index one-past the last row with line_idx ≤ hi_line."""
+    import bisect
+    keys = [r[0] for r in rows]
+    return bisect.bisect_right(keys, hi_line)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -6358,6 +6726,32 @@ def main():
     p_tpa.add_argument("--timeout", type=float, default=30.0,
                         help="kdb overall deadline (default 30.0s); retried internally.")
 
+    # futex-wake-drill — PNG-2 TID-2 FUTEX_WAKE pattern classifier
+    p_fwd = sub.add_parser(
+        "futex-wake-drill",
+        help="[PNG-2] TID-2 FUTEX_WAKE drill: classify post-W215 plateau as "
+             "H1 STATIC deadlock vs H2 CHURNING overhead via Jaccard "
+             "similarity of per-bucket wake-uaddr sets. Parses "
+             "[FUTEX_WAKE]/[FUTEX_WAKE_REQ] from serial log; needs "
+             "--features firefox-test at start. With --cross-park, joins "
+             "against live FUTEX_WAITERS via thread-park-audit.")
+    p_fwd.add_argument("sid")
+    p_fwd.add_argument("--tid", type=int, default=2,
+                        help="TID filter (default 2 = Mozilla parent main)")
+    p_fwd.add_argument("--bucket-count", type=int, default=2,
+                        dest="bucket_count",
+                        help="Number of temporal buckets (default 2)")
+    p_fwd.add_argument("--window-lines", type=int, default=0,
+                        dest="window_lines",
+                        help="Restrict to most-recent N serial-log lines "
+                             "(0 = whole log; default 0)")
+    p_fwd.add_argument("--cross-park", action="store_true",
+                        dest="cross_park",
+                        help="Cross-reference live FUTEX_WAITERS via kdb "
+                             "thread-park-audit (requires --features kdb)")
+    p_fwd.add_argument("--timeout", type=float, default=30.0,
+                        help="kdb cross-park deadline (default 30s)")
+
     # cache-audit — W215 H1 diagnostic: walk the page cache checking for
     # zero-refcount entries.  Requires --features firefox-test,kdb at start.
     p_cacheaudit = sub.add_parser(
@@ -6733,6 +7127,7 @@ def main():
         "tlb-stats":   cmd_tlb_stats,
         "fd-map":      cmd_fd_map,
         "thread-park-audit": cmd_thread_park_audit,
+        "futex-wake-drill":  cmd_futex_wake_drill,
         "cache-audit":       cmd_cache_audit,
         "cache-aliasing":    cmd_cache_aliasing,
         "fault-cache-keys":  cmd_fault_cache_keys,
