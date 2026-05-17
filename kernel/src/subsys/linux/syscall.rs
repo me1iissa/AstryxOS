@@ -161,9 +161,9 @@ pub(crate) fn user_path_ptr_ok(ptr: u64) -> bool {
 /// pathname-reading syscall (open, openat, access, stat, statx,
 /// readlink, rename, link, mkdir, mount, execve, …) against malicious
 /// userspace without breaking the in-kernel test API.
-fn read_cstring_from_user(ptr: u64) -> &'static [u8] {
+fn read_cstring_from_user(ptr: u64) -> alloc::vec::Vec<u8> {
     if ptr == 0 {
-        return b"";
+        return alloc::vec::Vec::new();
     }
     // The user/kernel boundary check is enforced at dispatch (see
     // `user_path_ptr_ok` and the per-syscall dispatch arms in
@@ -172,14 +172,35 @@ fn read_cstring_from_user(ptr: u64) -> &'static [u8] {
     // the kernel-mapped read-only string table; rejecting those would
     // break the test-runner and early-boot code.  We keep the bounded
     // 4096-byte read as the only defensive limit here.
+    //
+    // SMAP bracket — every iteration below derefs through `start` which
+    // backs the user pointer in the syscall path.  Per Intel SDM Vol. 3A
+    // §4.6 the supervisor must hold AC=1 to touch a user page; the
+    // UserGuard issues STAC/CLAC accordingly when SMAP is active and
+    // collapses to a load + branch otherwise.
+    //
+    // We return an owned Vec<u8> rather than a `&[u8]` borrow because
+    // every downstream consumer of the result holds it past the bracket
+    // — formatting it through serial_println, passing it to VFS, etc.
+    // A user-page borrow would re-fault on access outside the guard.
+    // Stage into a kernel-resident stack buffer under one SMAP guard,
+    // then push into the (allocating) Vec outside the guard.  Holding
+    // AC=1 across a heap allocation would be incorrect because the
+    // allocator path may take locks and is unrelated to user memory.
     let start = ptr as *const u8;
-    let mut len = 0usize;
-    unsafe {
-        while len < 4096 && *start.add(len) != 0 {
+    let mut staging = [0u8; 4096];
+    let n = unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
+        let mut len = 0usize;
+        while len < 4096 {
+            let b = *start.add(len);
+            if b == 0 { break; }
+            staging[len] = b;
             len += 1;
         }
-        core::slice::from_raw_parts(start, len)
-    }
+        len
+    };
+    staging[..n].to_vec()
 }
 
 /// Read a null-terminated array of C string pointers (char *argv[]) from user memory.
@@ -191,12 +212,21 @@ pub(crate) fn read_user_argv(ptr: u64) -> alloc::vec::Vec<alloc::string::String>
     }
     let array = ptr as *const u64;
     for i in 0..256usize {
-        let str_ptr = unsafe { *array.add(i) };
+        // SMAP bracket the pointer-array read only.  Each iteration's
+        // `read_cstring_from_user` opens its own UserGuard internally —
+        // we cannot hold a single guard across the whole loop because
+        // `String::from_utf8_lossy` allocates, and the allocator is a
+        // kernel-only path; holding AC=1 across it would defeat the
+        // SMAP invariant ("AC=1 only while reading user memory").
+        let str_ptr = unsafe {
+            let _g = crate::arch::x86_64::smap::UserGuard::new();
+            *array.add(i)
+        };
         if str_ptr == 0 {
             break;
         }
         let bytes = read_cstring_from_user(str_ptr);
-        let s = alloc::string::String::from_utf8_lossy(bytes).into_owned();
+        let s = alloc::string::String::from_utf8_lossy(&bytes).into_owned();
         result.push(s);
     }
     result
@@ -226,7 +256,9 @@ fn write_sockaddr_in(addr_ptr: u64, addrlen_ptr: *mut u32,
     buf[6] = ip[2]; buf[7] = ip[3];          // sin_addr
     // sin_zero already zero.
     let n = cap.min(16);
+    // SMAP bracket — both writes target user buffers in the syscall path.
     unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
         core::ptr::copy_nonoverlapping(buf.as_ptr(), addr_ptr as *mut u8, n);
         core::ptr::write(addrlen_ptr, 16u32);
     }
@@ -635,22 +667,36 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
 
             // Inner check: evaluate all pollfds, write revents, return ready count.
             // struct pollfd { int fd; short events; short revents; } = 8 bytes
+            //
+            // SMAP discipline: bracket each pollfd access individually
+            // because crate::syscall::poll_revents is a kernel-only path
+            // (waitlist + fd table) — holding AC=1 across it would defeat
+            // SMAP's purpose of confining user-page access.
             let do_check = |clear: bool, log: bool| -> i64 {
                 let mut ready = 0i64;
                 for i in 0..nfds as u64 {
                     let base = (arg1 + i * 8) as *mut u8;
                     let (fd_val, events) = unsafe {
+                        let _g = crate::arch::x86_64::smap::UserGuard::new();
                         (core::ptr::read_unaligned(base as *const i32),
                          core::ptr::read_unaligned(base.add(4) as *const u16))
                     };
                     if fd_val < 0 {
-                        if clear { unsafe { core::ptr::write_unaligned(base.add(6) as *mut u16, 0); } }
+                        if clear {
+                            unsafe {
+                                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                                core::ptr::write_unaligned(base.add(6) as *mut u16, 0);
+                            }
+                        }
                         continue;
                     }
                     let revents = crate::syscall::poll_revents(pid, fd_val as usize, events);
                     // Per-fd poll logging disabled to reduce kernel stack pressure.
                     let _ = log;
-                    unsafe { core::ptr::write_unaligned(base.add(6) as *mut u16, revents); }
+                    unsafe {
+                        let _g = crate::arch::x86_64::smap::UserGuard::new();
+                        core::ptr::write_unaligned(base.add(6) as *mut u16, revents);
+                    }
                     if revents != 0 { ready += 1; }
                 }
                 ready
@@ -838,15 +884,24 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let addr_ptr = arg2;
             let addrlen = arg3 as usize;
             if addrlen < 2 || addr_ptr == 0 { return -22; }
-            let family = unsafe { core::ptr::read_unaligned(addr_ptr as *const u16) };
+            // SMAP bracket — the family read derefs a user pointer.
+            let family = unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                core::ptr::read_unaligned(addr_ptr as *const u16)
+            };
 
             if family == 1 {
                 // AF_UNIX — sockaddr_un { sa_family: u16, sun_path: [u8; 108] }
                 if !crate::syscall::is_unix_socket_fd(pid, fd) { return -9; }
                 let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
-                let path_bytes = if addrlen > 2 {
-                    unsafe { core::slice::from_raw_parts((addr_ptr + 2) as *const u8, (addrlen - 2).min(108)) }
+                // SMAP bracket — copy the path bytes into a kernel Vec so the
+                // downstream IPC work doesn't hold AC=1.
+                let path_owned: alloc::vec::Vec<u8> = if addrlen > 2 {
+                    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+                    let s = unsafe { core::slice::from_raw_parts((addr_ptr + 2) as *const u8, (addrlen - 2).min(108)) };
+                    s.to_vec()
                 } else { return -22; };
+                let path_bytes: &[u8] = &path_owned;
                 // Strip trailing NUL
                 let plen = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
                 #[cfg(feature = "firefox-test")]
@@ -866,8 +921,14 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 if !crate::syscall::is_socket_fd(pid, fd) { return -9; }
                 let socket_id = crate::syscall::get_socket_id(pid, fd);
                 if family == 2 && addrlen >= 16 {
-                    // sockaddr_in
-                    let bytes = unsafe { core::slice::from_raw_parts(addr_ptr as *const u8, 16) };
+                    // sockaddr_in — SMAP-bracketed copy into kernel-local
+                    // bytes so the connect / wait loop below runs without
+                    // AC=1.
+                    let mut bytes = [0u8; 16];
+                    unsafe {
+                        let _g = crate::arch::x86_64::smap::UserGuard::new();
+                        core::ptr::copy_nonoverlapping(addr_ptr as *const u8, bytes.as_mut_ptr(), 16);
+                    }
                     let port = u16::from_be_bytes([bytes[2], bytes[3]]);
                     let ip = [bytes[4], bytes[5], bytes[6], bytes[7]];
                     match crate::net::socket::socket_connect(socket_id, ip, port) {
@@ -932,7 +993,17 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let fd = arg1 as usize;
             let buf_ptr = arg2 as *const u8;
             let len = arg3 as usize;
-            let data = unsafe { core::slice::from_raw_parts(buf_ptr, len) };
+            // SMAP bracket — slice materialised under AC=1 because every
+            // path below copies (unix::write / socket_send / socket_sendto)
+            // reads through `data`.  The downstream net code is kernel-only
+            // and will copy the bytes into its own buffers; we don't hold
+            // the guard across those calls.  Materialise + immediately
+            // copy into a kernel Vec to keep AC=1 scope tight.
+            let data_owned: alloc::vec::Vec<u8> = {
+                let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+                unsafe { core::slice::from_raw_parts(buf_ptr, len) }.to_vec()
+            };
+            let data: &[u8] = &data_owned;
             if crate::syscall::is_unix_socket_fd(pid, fd) {
                 let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
                 crate::net::unix::write(unix_id, data)
@@ -942,7 +1013,11 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 let addr_ptr = arg5;
                 let addrlen = arg6 as usize;
                 if addr_ptr != 0 && addrlen >= 16 {
-                    let bytes = unsafe { core::slice::from_raw_parts(addr_ptr as *const u8, 16) };
+                    let mut bytes = [0u8; 16];
+                    unsafe {
+                        let _g = crate::arch::x86_64::smap::UserGuard::new();
+                        core::ptr::copy_nonoverlapping(addr_ptr as *const u8, bytes.as_mut_ptr(), 16);
+                    }
                     let family = u16::from_le_bytes([bytes[0], bytes[1]]);
                     if family == 2 {
                         let port = u16::from_be_bytes([bytes[2], bytes[3]]);
@@ -983,6 +1058,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let addrlen_ptr  = arg6 as *mut u32;
             if crate::syscall::is_unix_socket_fd(pid, fd) {
                 let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
+                // SMAP bracket — `buf` is a user slice; unix::read writes
+                // into it.  Bracket spans the call so the writes inside
+                // unix::read run with AC=1.
+                let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
                 let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, len) };
                 crate::net::unix::read(unix_id, buf)
             } else {
@@ -992,7 +1071,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     Ok((data, src_ip, src_port)) => {
                         let n = data.len().min(len);
                         if n > 0 {
-                            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, n); }
+                            unsafe {
+                                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                                core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, n);
+                            }
                         }
                         // Only marshal the source address when the caller
                         // asked for it (both pointers non-NULL) AND we
@@ -1001,7 +1083,12 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         // the contents of the sockaddr buffer are
                         // unspecified when no message was received.
                         if n > 0 && addr_ptr != 0 && !addrlen_ptr.is_null() {
-                            let cap = unsafe { core::ptr::read(addrlen_ptr) } as usize;
+                            let cap = unsafe {
+                                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                                core::ptr::read(addrlen_ptr)
+                            } as usize;
+                            // write_sockaddr_in opens its own UserGuard
+                            // for the marshalled writes.
                             write_sockaddr_in(addr_ptr, addrlen_ptr, src_ip, src_port, cap);
                         }
                         n as i64
@@ -1021,20 +1108,38 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             // ending at msg_flags (offset 48–52); ctrl writes touch up to
             // ctrl_ptr + ctrl_len which is validated separately below.
             if !crate::syscall::validate_user_ptr(arg2, 56) { return -14; }
-            let iov_ptr = unsafe { core::ptr::read_unaligned(msghdr_ptr.add(2)) }; // offset 16
-            let iov_len = unsafe { core::ptr::read_unaligned(msghdr_ptr.add(3)) }; // offset 24
+            // SMAP bracket the msghdr field reads (iov_ptr, iov_len).
+            let (iov_ptr, iov_len) = unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                (core::ptr::read_unaligned(msghdr_ptr.add(2)),  // offset 16
+                 core::ptr::read_unaligned(msghdr_ptr.add(3)))  // offset 24
+            };
             if iov_ptr == 0 || iov_len == 0 { return 0; }
             if iov_len > 1024 { return -22; } // IOV_MAX per POSIX sendmsg(2)
             if !crate::syscall::validate_user_ptr(iov_ptr, (iov_len as usize).saturating_mul(16)) {
                 return -14;
             }
-            let iovecs = unsafe { core::slice::from_raw_parts(iov_ptr as *const [u64; 2], iov_len as usize) };
+            // Copy the iovec array into kernel memory so the per-iov
+            // base/len reads do not need to re-enter user space; this
+            // also defangs any TOCTOU between validate and use.
+            let iovecs_owned: alloc::vec::Vec<[u64; 2]> = unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                core::slice::from_raw_parts(iov_ptr as *const [u64; 2], iov_len as usize).to_vec()
+            };
             let mut total = 0usize;
-            for iov in iovecs {
+            for iov in &iovecs_owned {
                 let base = iov[0] as *const u8;
                 let slen = iov[1] as usize;
                 if slen == 0 { continue; }
-                let data = unsafe { core::slice::from_raw_parts(base, slen) };
+                // SMAP bracket — slice materialises against the user iov
+                // buffer; copy into a kernel Vec immediately so the net
+                // layer's send (which may take locks / queue) runs
+                // outside AC=1.
+                let data_owned: alloc::vec::Vec<u8> = {
+                    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+                    unsafe { core::slice::from_raw_parts(base, slen) }.to_vec()
+                };
+                let data: &[u8] = &data_owned;
                 if crate::syscall::is_unix_socket_fd(pid, fd) {
                     let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
                     match crate::net::unix::write(unix_id, data) {
@@ -1055,14 +1160,23 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             // msghdr layout (x86_64): msg_control at byte-offset 32 (u64 index 4),
             // msg_controllen at byte-offset 40 (u64 index 5).
             if crate::syscall::is_unix_socket_fd(pid, fd) {
-                let ctrl_ptr = unsafe { core::ptr::read_unaligned(msghdr_ptr.add(4)) };
-                let ctrl_len = unsafe { core::ptr::read_unaligned(msghdr_ptr.add(5)) } as usize;
+                // SMAP bracket — read msghdr.msg_control / msg_controllen
+                // and the cmsghdr fields under a single guard.
+                let (ctrl_ptr, ctrl_len, cmsg_len, cmsg_level, cmsg_type) = unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    let cp = core::ptr::read_unaligned(msghdr_ptr.add(4));
+                    let cl = core::ptr::read_unaligned(msghdr_ptr.add(5)) as usize;
+                    if cp != 0 && cl >= 16 {
+                        let ctrl = cp as *const u8;
+                        (cp, cl,
+                         core::ptr::read_unaligned(ctrl as *const u64) as usize,
+                         core::ptr::read_unaligned((cp + 8)  as *const i32),
+                         core::ptr::read_unaligned((cp + 12) as *const i32))
+                    } else {
+                        (cp, cl, 0usize, 0i32, 0i32)
+                    }
+                };
                 if ctrl_ptr != 0 && ctrl_len >= 16 {
-                    let ctrl = ctrl_ptr as *const u8;
-                    // cmsghdr: cmsg_len(u64@0), cmsg_level(i32@8), cmsg_type(i32@12)
-                    let cmsg_len   = unsafe { core::ptr::read_unaligned(ctrl as *const u64) } as usize;
-                    let cmsg_level = unsafe { core::ptr::read_unaligned((ctrl_ptr + 8)  as *const i32) };
-                    let cmsg_type  = unsafe { core::ptr::read_unaligned((ctrl_ptr + 12) as *const i32) };
                     const SOL_SOCKET_I32: i32 = 1;
                     const SCM_RIGHTS_I32: i32 = 1;
                     if cmsg_level == SOL_SOCKET_I32 && cmsg_type == SCM_RIGHTS_I32 && cmsg_len > 16 {
@@ -1072,7 +1186,14 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             let procs = crate::proc::PROCESS_TABLE.lock();
                             if let Some(p) = procs.iter().find(|p| p.pid == pid) {
                                 (0..nfds).filter_map(|i| {
-                                    let fd_n = unsafe { core::ptr::read_unaligned(fd_arr.add(i)) } as usize;
+                                    // SMAP bracket each fd read.  The
+                                    // PROCESS_TABLE lock is held — keep
+                                    // the AC=1 region as narrow as
+                                    // possible.
+                                    let fd_n = unsafe {
+                                        let _g = crate::arch::x86_64::smap::UserGuard::new();
+                                        core::ptr::read_unaligned(fd_arr.add(i))
+                                    } as usize;
                                     if fd_n < p.file_descriptors.len() {
                                         p.file_descriptors[fd_n].clone()
                                     } else { None }
@@ -1099,8 +1220,12 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             if msghdr_ptr.is_null() { return -22; }
             // CWE-823: validate msghdr is in user space (see sendmsg above).
             if !crate::syscall::validate_user_ptr(arg2, 56) { return -14; }
-            let iov_ptr = unsafe { core::ptr::read_unaligned(msghdr_ptr.add(2)) };
-            let iov_len = unsafe { core::ptr::read_unaligned(msghdr_ptr.add(3)) };
+            // SMAP bracket the msghdr field reads.
+            let (iov_ptr, iov_len) = unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                (core::ptr::read_unaligned(msghdr_ptr.add(2)),
+                 core::ptr::read_unaligned(msghdr_ptr.add(3)))
+            };
             if iov_ptr == 0 || iov_len == 0 { return -22; }
             if iov_len > 1024 { return -22; } // IOV_MAX per POSIX recvmsg(2)
             // Only iov[0] is consumed below, but validate the full iovec array
@@ -1110,36 +1235,34 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             if !crate::syscall::validate_user_ptr(iov_ptr, (iov_len as usize).saturating_mul(16)) {
                 return -14;
             }
-            let iov = unsafe { core::slice::from_raw_parts(iov_ptr as *const [u64; 2], 1) };
-            let dst = iov[0][0] as *mut u8;
-            let cap = iov[0][1] as usize;
+            // SMAP-bracketed iov[0] read; we only consume the first element.
+            let (dst, cap) = unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                let iov = core::slice::from_raw_parts(iov_ptr as *const [u64; 2], 1);
+                (iov[0][0] as *mut u8, iov[0][1] as usize)
+            };
             let bytes_read: i64;
             if crate::syscall::is_unix_socket_fd(pid, fd) {
                 let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
-                let buf = unsafe { core::slice::from_raw_parts_mut(dst, cap) };
-                // Use read_msg so SOCK_SEQPACKET callers see one message per
-                // recvmsg and can observe MSG_TRUNC (msghdr.msg_flags bit 0x20)
-                // when the receiver buffer was shorter than the sender message.
-                // msghdr.msg_flags lives at byte-offset 48 (i32) per the Linux
-                // x86_64 ABI for `struct msghdr`.
-                //
-                // Per recvmsg(2): "The msg_flags field in the msghdr is set on
-                // return of recvmsg()" — the kernel OVERWRITES the field on
-                // return; it does not OR into whatever the caller left there.
-                // Callers that zero the struct see the same result, but any
-                // sentinel the caller placed in msg_flags must not survive.
+                // SMAP bracket — read_msg writes through `buf` into user
+                // memory.  Held for the call duration; we drop it before
+                // the subsequent allocations / table walks below.
                 const MSG_TRUNC: u32 = 0x20;
-                bytes_read = match crate::net::unix::read_msg(unix_id, buf) {
-                    Ok((n, discarded)) => {
-                        // Overwrite (not OR) msg_flags — recvmsg(2) man page.
-                        let computed: u32 = if discarded > 0 { MSG_TRUNC } else { 0 };
-                        unsafe {
-                            let flags_ptr = (arg2 + 48) as *mut u32;
-                            core::ptr::write_unaligned(flags_ptr, computed);
+                bytes_read = {
+                    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+                    let buf = unsafe { core::slice::from_raw_parts_mut(dst, cap) };
+                    match crate::net::unix::read_msg(unix_id, buf) {
+                        Ok((n, discarded)) => {
+                            // Overwrite (not OR) msg_flags — recvmsg(2) man page.
+                            let computed: u32 = if discarded > 0 { MSG_TRUNC } else { 0 };
+                            unsafe {
+                                let flags_ptr = (arg2 + 48) as *mut u32;
+                                core::ptr::write_unaligned(flags_ptr, computed);
+                            }
+                            n as i64
                         }
-                        n as i64
+                        Err(e) => e,
                     }
-                    Err(e) => e,
                 };
                 // Deliver pending SCM_RIGHTS fds into receiver's fd table.
                 if bytes_read >= 0 {
@@ -1162,29 +1285,35 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                 }).collect()
                             } else { Vec::new() }
                         };
-                        // Write SCM_RIGHTS cmsghdr into msg_control.
-                        let ctrl_ptr = unsafe { core::ptr::read_unaligned(msghdr_ptr.add(4)) };
-                        let ctrl_len = unsafe { core::ptr::read_unaligned(msghdr_ptr.add(5)) } as usize;
-                        if ctrl_ptr != 0 && ctrl_len >= 16 + new_fd_nums.len() * 4 {
-                            let needed = 16 + new_fd_nums.len() * 4;
-                            unsafe {
+                        // Write SCM_RIGHTS cmsghdr into msg_control.  All
+                        // reads/writes here target user memory — single
+                        // SMAP guard spanning the whole block.
+                        unsafe {
+                            let _g = crate::arch::x86_64::smap::UserGuard::new();
+                            let ctrl_ptr = core::ptr::read_unaligned(msghdr_ptr.add(4));
+                            let ctrl_len = core::ptr::read_unaligned(msghdr_ptr.add(5)) as usize;
+                            if ctrl_ptr != 0 && ctrl_len >= 16 + new_fd_nums.len() * 4 {
+                                let needed = 16 + new_fd_nums.len() * 4;
                                 core::ptr::write_unaligned(ctrl_ptr as *mut u64, needed as u64);
                                 core::ptr::write_unaligned((ctrl_ptr + 8)  as *mut i32, 1i32); // SOL_SOCKET
                                 core::ptr::write_unaligned((ctrl_ptr + 12) as *mut i32, 1i32); // SCM_RIGHTS
                                 for (i, &new_fd) in new_fd_nums.iter().enumerate() {
                                     core::ptr::write_unaligned((ctrl_ptr + 16 + i as u64 * 4) as *mut i32, new_fd);
                                 }
+                                core::ptr::write_unaligned(msghdr_ptr.add(5) as *mut u64, needed as u64);
+                            } else if ctrl_ptr != 0 {
+                                // No room — zero out msg_controllen.
+                                core::ptr::write_unaligned(msghdr_ptr.add(5) as *mut u64, 0u64);
                             }
-                            unsafe { core::ptr::write_unaligned(msghdr_ptr.add(5) as *mut u64, needed as u64); }
-                        } else if ctrl_ptr != 0 {
-                            // No room — zero out msg_controllen.
-                            unsafe { core::ptr::write_unaligned(msghdr_ptr.add(5) as *mut u64, 0u64); }
                         }
                     } else {
                         // No SCM to deliver — set msg_controllen to 0.
-                        let ctrl_ptr = unsafe { core::ptr::read_unaligned(msghdr_ptr.add(4)) };
-                        if ctrl_ptr != 0 {
-                            unsafe { core::ptr::write_unaligned(msghdr_ptr.add(5) as *mut u64, 0u64); }
+                        unsafe {
+                            let _g = crate::arch::x86_64::smap::UserGuard::new();
+                            let ctrl_ptr = core::ptr::read_unaligned(msghdr_ptr.add(4));
+                            if ctrl_ptr != 0 {
+                                core::ptr::write_unaligned(msghdr_ptr.add(5) as *mut u64, 0u64);
+                            }
                         }
                     }
                 }
@@ -1196,7 +1325,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         if data.is_empty() { 0 }
                         else {
                             let n = data.len().min(cap);
-                            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst, n); }
+                            unsafe {
+                                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                                core::ptr::copy_nonoverlapping(data.as_ptr(), dst, n);
+                            }
                             n as i64
                         }
                     }
@@ -1233,20 +1365,31 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let addr_ptr = arg2;
             let addrlen = arg3 as usize;
             if addrlen < 2 || addr_ptr == 0 { return -22; }
-            let family = unsafe { core::ptr::read_unaligned(addr_ptr as *const u16) };
+            // SMAP bracket family read.
+            let family = unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                core::ptr::read_unaligned(addr_ptr as *const u16)
+            };
             if family == 1 {
                 // AF_UNIX — sockaddr_un
                 if !crate::syscall::is_unix_socket_fd(pid, fd) { return -9; }
                 let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
-                let path_bytes = if addrlen > 2 {
-                    unsafe { core::slice::from_raw_parts((addr_ptr + 2) as *const u8, (addrlen - 2).min(108)) }
+                // SMAP-bracketed copy into kernel Vec.
+                let path_owned: alloc::vec::Vec<u8> = if addrlen > 2 {
+                    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+                    unsafe { core::slice::from_raw_parts((addr_ptr + 2) as *const u8, (addrlen - 2).min(108)) }.to_vec()
                 } else { return -22; };
+                let path_bytes: &[u8] = &path_owned;
                 let plen = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
                 crate::net::unix::bind(unix_id, &path_bytes[..plen])
             } else if family == 2 && addrlen >= 8 {
                 if !crate::syscall::is_socket_fd(pid, fd) { return -9; }
                 let socket_id = crate::syscall::get_socket_id(pid, fd);
-                let bytes = unsafe { core::slice::from_raw_parts(addr_ptr as *const u8, 8) };
+                let mut bytes = [0u8; 8];
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    core::ptr::copy_nonoverlapping(addr_ptr as *const u8, bytes.as_mut_ptr(), 8);
+                }
                 let port = u16::from_be_bytes([bytes[2], bytes[3]]);
                 match crate::net::socket::socket_bind(socket_id, port) {
                     Ok(()) => 0,
@@ -1280,7 +1423,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let addr_ptr = arg2;
             let addrlen_ptr = arg3 as *mut u32;
             if addr_ptr == 0 || addrlen_ptr.is_null() { return -22; }
-            let cap = unsafe { core::ptr::read(addrlen_ptr) } as usize;
+            let cap = unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                core::ptr::read(addrlen_ptr)
+            } as usize;
 
             if crate::syscall::is_unix_socket_fd(pid, fd) {
                 // AF_UNIX sockaddr_un — minimal: family=1, empty path.
@@ -1292,6 +1438,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 tmp[0] = 1; // AF_UNIX
                 let n = cap.min(want);
                 unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
                     core::ptr::copy_nonoverlapping(tmp.as_ptr(), addr_ptr as *mut u8, n);
                     core::ptr::write(addrlen_ptr, want as u32);
                 }
@@ -1315,7 +1462,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let addr_ptr = arg2;
             let addrlen_ptr = arg3 as *mut u32;
             if addr_ptr == 0 || addrlen_ptr.is_null() { return -22; }
-            let cap = unsafe { core::ptr::read(addrlen_ptr) } as usize;
+            let cap = unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                core::ptr::read(addrlen_ptr)
+            } as usize;
 
             if crate::syscall::is_unix_socket_fd(pid, fd) {
                 // Unconnected AF_UNIX → ENOTCONN.  Connected AF_UNIX
@@ -1330,6 +1480,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 tmp[0] = 1;
                 let n = cap.min(want);
                 unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
                     core::ptr::copy_nonoverlapping(tmp.as_ptr(), addr_ptr as *mut u8, n);
                     core::ptr::write(addrlen_ptr, want as u32);
                 }
@@ -1416,6 +1567,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 return fd_b;
             }
             unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
                 core::ptr::write(sv_ptr,       fd_a as u32);
                 core::ptr::write(sv_ptr.add(1), fd_b as u32);
             }
@@ -1427,7 +1579,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let fd    = arg1 as usize;
             let level = arg2;
             let opt   = arg3;
-            let val   = if arg4 != 0 { unsafe { core::ptr::read_unaligned(arg4 as *const u32) } }
+            let val   = if arg4 != 0 { unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                core::ptr::read_unaligned(arg4 as *const u32)
+            } }
                         else         { 0u32 };
             if crate::syscall::is_socket_fd(pid, fd) {
                 let sid = crate::syscall::get_socket_id(pid, fd);
@@ -1482,6 +1637,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             return -14; // EFAULT
                         }
                         unsafe {
+                            let _g = crate::arch::x86_64::smap::UserGuard::new();
                             let p = optval as *mut u8;
                             core::ptr::write_unaligned(p as *mut u32, peer.pid as u32);
                             core::ptr::write_unaligned(p.add(4) as *mut u32, peer.uid);
@@ -1491,7 +1647,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             if !crate::syscall::validate_user_ptr(optlen as u64, 4) {
                                 return -14;
                             }
-                            unsafe { core::ptr::write_unaligned(optlen, 12u32); }
+                            unsafe {
+                                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                                core::ptr::write_unaligned(optlen, 12u32);
+                            }
                         }
                         return 0i64;
                     }
@@ -1513,8 +1672,12 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     _ => 0,
                 }
             };
-            if !optval.is_null() { unsafe { core::ptr::write(optval, val); } }
-            if !optlen.is_null() { unsafe { core::ptr::write(optlen, 4u32); } }
+            // SMAP bracket — both writes target user pointers.
+            unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                if !optval.is_null() { core::ptr::write(optval, val); }
+                if !optlen.is_null() { core::ptr::write(optlen, 4u32); }
+            }
             0
         }
         // 56: clone(flags, stack, parent_tid, child_tid, tls)
@@ -1727,7 +1890,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let bytes = target_str.as_bytes();
             let len = bytes.len().min(bufsiz);
             if len > 0 {
-                unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, len); }
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, len);
+                }
             }
             len as i64
         }
@@ -1752,7 +1918,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 PR_GET_NAME => {
                     let buf = arg2 as *mut u8;
                     let name = b"astryx\0";
-                    unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), buf, name.len()); }
+                    unsafe {
+                        let _g = crate::arch::x86_64::smap::UserGuard::new();
+                        core::ptr::copy_nonoverlapping(name.as_ptr(), buf, name.len());
+                    }
                     0
                 }
                 PR_SET_DUMPABLE          => 0,
@@ -1762,7 +1931,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 PR_GET_CHILD_SUBREAPER   => {
                     // Report "not a subreaper"
                     if arg2 != 0 {
-                        unsafe { core::ptr::write_unaligned(arg2 as *mut u32, 0); }
+                        unsafe {
+                            let _g = crate::arch::x86_64::smap::UserGuard::new();
+                            core::ptr::write_unaligned(arg2 as *mut u32, 0);
+                        }
                     }
                     0
                 }
@@ -1828,6 +2000,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 let ncpus = ncpus.max(1); // always at least 1
                 // Zero the buffer, then set one bit per online CPU.
                 unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
                     core::ptr::write_bytes(buf, 0, written);
                     // Set bits 0..ncpus-1 in the cpuset bitmask (little-endian).
                     // Each byte covers 8 CPUs.  We support up to written*8 CPUs.
@@ -1883,12 +2056,11 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 let len  = t.robust_list_len;
                 drop(threads);
                 // Write head pointer into *head_ptr (arg2 is **robust_list_head)
-                if arg2 != 0 {
-                    unsafe { core::ptr::write(arg2 as *mut u64, head); }
-                }
-                // Write length into *len_ptr
-                if arg3 != 0 {
-                    unsafe { core::ptr::write(arg3 as *mut usize, len); }
+                // and length into *len_ptr — both user pointers.
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    if arg2 != 0 { core::ptr::write(arg2 as *mut u64, head); }
+                    if arg3 != 0 { core::ptr::write(arg3 as *mut usize, len); }
                 }
                 0
             } else {
@@ -1903,8 +2075,11 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         291 => sys_epoll_create1(arg1 as u32),
         // 309: getcpu(cpu, node, cache) — stub
         309 => {
-            if arg1 != 0 { unsafe { core::ptr::write(arg1 as *mut u32, 0); } }
-            if arg2 != 0 { unsafe { core::ptr::write(arg2 as *mut u32, 0); } }
+            unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                if arg1 != 0 { core::ptr::write(arg1 as *mut u32, 0); }
+                if arg2 != 0 { core::ptr::write(arg2 as *mut u32, 0); }
+            }
             0
         }
         // 59: execve(pathname, argv, envp) — pathname is C string
@@ -1947,8 +2122,8 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         88 => {
             let old_raw = read_cstring_from_user(arg1);
             let new_raw = read_cstring_from_user(arg2);
-            let old_str = core::str::from_utf8(old_raw).unwrap_or("");
-            let new_str = core::str::from_utf8(new_raw).unwrap_or("");
+            let old_str = core::str::from_utf8(&old_raw).unwrap_or("");
+            let new_str = core::str::from_utf8(&new_raw).unwrap_or("");
             match crate::vfs::symlink(old_str, new_str) {
                 Ok(()) => 0,
                 Err(e) => -(e as usize as i64),
@@ -2009,6 +2184,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     .unwrap_or((!0u32, !0u32));
                 drop(procs);
                 unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
                     let p = arg2 as *mut u32;
                     // struct 0: effective, permitted, inheritable
                     core::ptr::write_unaligned(p,         eff);
@@ -2030,8 +2206,11 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 let mut procs = crate::proc::PROCESS_TABLE.lock();
                 if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
                     let dp = arg2 as *const u32;
-                    let eff  = unsafe { core::ptr::read_unaligned(dp) };
-                    let perm = unsafe { core::ptr::read_unaligned(dp.add(1)) };
+                    let (eff, perm) = unsafe {
+                        let _g = crate::arch::x86_64::smap::UserGuard::new();
+                        (core::ptr::read_unaligned(dp),
+                         core::ptr::read_unaligned(dp.add(1)))
+                    };
                     p.cap_effective  = eff  as u64;
                     p.cap_permitted  = perm as u64;
                 }
@@ -2043,7 +2222,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let resource = arg1 as usize;
             if resource >= 16 { return -22; } // EINVAL
             if !crate::syscall::validate_user_ptr(arg2, 16) { return -14; } // EFAULT
-            let soft = unsafe { core::ptr::read_unaligned(arg2 as *const u64) };
+            let soft = unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                core::ptr::read_unaligned(arg2 as *const u64)
+            };
             let pid = crate::proc::current_pid_lockless();
             let mut procs = crate::proc::PROCESS_TABLE.lock();
             if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
@@ -2124,6 +2306,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 // si_code=CLD_EXITED(1), si_pid=child_pid, si_status=exit_code
                 // siginfo_t is 128 bytes; we only fill the first 20 bytes.
                 unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
                     core::ptr::write_bytes(infop, 0, 128);
                     core::ptr::write_unaligned(infop.add(0)  as *mut i32, 17); // si_signo = SIGCHLD
                     core::ptr::write_unaligned(infop.add(8)  as *mut i32, 1);  // si_code  = CLD_EXITED
@@ -2151,7 +2334,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             }
             // SET new limit if provided
             if arg3 != 0 && (arg2 as usize) < 16 && crate::syscall::validate_user_ptr(arg3, 16) {
-                let soft = unsafe { core::ptr::read_unaligned(arg3 as *const u64) };
+                let soft = unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    core::ptr::read_unaligned(arg3 as *const u64)
+                };
                 let pid  = crate::proc::current_pid_lockless();
                 let mut procs = crate::proc::PROCESS_TABLE.lock();
                 if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
@@ -2211,8 +2397,8 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         266 => {
             let old_raw = read_cstring_from_user(arg1);
             let new_raw = read_cstring_from_user(arg3);
-            let old_str = core::str::from_utf8(old_raw).unwrap_or("");
-            let new_str = core::str::from_utf8(new_raw).unwrap_or("");
+            let old_str = core::str::from_utf8(&old_raw).unwrap_or("");
+            let new_str = core::str::from_utf8(&new_raw).unwrap_or("");
             match crate::vfs::symlink(old_str, new_str) {
                 Ok(()) => 0,
                 Err(e) => -(e as usize as i64),
@@ -2240,12 +2426,16 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             // CLONE_ARGS_SIZE_VER0 = 64 bytes (covers flags..tls).  Anything
             // smaller cannot supply a tls offset; reject per clone(2).
             if arg2 < 64 || arg1 == 0 { return -22i64; } // EINVAL: struct too small
-            let clone_flags   = unsafe { *(arg1 as *const u64) };
-            let stack_ptr     = unsafe { *((arg1 + 40) as *const u64) };
-            let stack_size    = unsafe { *((arg1 + 48) as *const u64) };
-            let tls           = unsafe { *((arg1 + 56) as *const u64) };
-            let child_tidptr  = unsafe { *((arg1 + 16) as *const u64) };
-            let parent_tidptr = unsafe { *((arg1 + 24) as *const u64) };
+            // SMAP bracket the struct clone_args reads.
+            let (clone_flags, stack_ptr, stack_size, tls, child_tidptr, parent_tidptr) = unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                (*(arg1 as *const u64),
+                 *((arg1 + 40) as *const u64),
+                 *((arg1 + 48) as *const u64),
+                 *((arg1 + 56) as *const u64),
+                 *((arg1 + 16) as *const u64),
+                 *((arg1 + 24) as *const u64))
+            };
             #[cfg(feature = "firefox-test")]
             crate::serial_println!(
                 "[CLONE3] flags={:#x} child_tid={:#x} parent_tid={:#x} arg2_size={}",
@@ -2457,7 +2647,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             if arg2 != 0 {
                 #[cfg(feature = "firefox-test")]
                 crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Getrusage, arg2 as *const u8, 144);
-                unsafe { core::ptr::write_bytes(arg2 as *mut u8, 0, 144); }
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    core::ptr::write_bytes(arg2 as *mut u8, 0, 144);
+                }
             }
             0
         }
@@ -2467,13 +2660,14 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 // struct sysinfo: 11 fields, 64 bytes total
                 #[cfg(feature = "firefox-test")]
                 crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Sysinfo, arg1 as *const u8, 64);
-                unsafe { core::ptr::write_bytes(arg1 as *mut u8, 0, 64); }
                 // uptime (seconds) at offset 0
                 let ticks = crate::arch::x86_64::irq::get_ticks();
                 let uptime = (ticks / 100) as i64; // 100 Hz
-                unsafe { *(arg1 as *mut i64) = uptime; }
-                // totalram / freeram at offsets 8 / 16 (u64 each)
                 unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    core::ptr::write_bytes(arg1 as *mut u8, 0, 64);
+                    *(arg1 as *mut i64) = uptime;
+                    // totalram / freeram at offsets 8 / 16 (u64 each)
                     let p = arg1 as *mut u64;
                     *p.add(1) = 256 * 1024 * 1024; // 256 MiB totalram
                     *p.add(2) = 128 * 1024 * 1024; // 128 MiB freeram
@@ -2486,6 +2680,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         229 => {
             if arg2 != 0 {
                 unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
                     let ts = arg2 as *mut u64;
                     *ts       = 0; // tv_sec = 0
                     *ts.add(1) = 1; // tv_nsec = 1 (nanosecond resolution)
@@ -2497,7 +2692,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         267 => {
             const AT_FDCWD: i64 = -100;
             let raw = read_cstring_from_user(arg2);
-            let path_str = core::str::from_utf8(raw).unwrap_or("");
+            let path_str = core::str::from_utf8(&raw).unwrap_or("");
             // If AT_FDCWD or absolute path, delegate to readlink logic
             let full_path: alloc::string::String = if arg1 as i64 == AT_FDCWD || path_str.starts_with('/') {
                 alloc::string::String::from(path_str)
@@ -2572,7 +2767,12 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             };
             let bytes = target.as_bytes();
             let len = bytes.len().min(bufsiz);
-            if len > 0 { unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, len); } }
+            if len > 0 {
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, len);
+                }
+            }
             len as i64
         }
         // 271: ppoll(fds, nfds, tmo_p, sigmask, sigsetsize) — poll with timeout+mask
@@ -2633,7 +2833,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // 76: truncate(path, length)
         76 => {
             let path_bytes = read_cstring_from_user(arg1);
-            let path_str = core::str::from_utf8(path_bytes).unwrap_or("");
+            let path_str = core::str::from_utf8(&path_bytes).unwrap_or("");
             match crate::vfs::truncate_path(path_str, arg2) {
                 Ok(()) => 0,
                 Err(e) => crate::subsys::linux::errno::vfs_err(e),
@@ -2642,7 +2842,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // 90: chmod(pathname, mode)
         90 => {
             let path_bytes = read_cstring_from_user(arg1);
-            let path_str = core::str::from_utf8(path_bytes).unwrap_or("");
+            let path_str = core::str::from_utf8(&path_bytes).unwrap_or("");
             match crate::vfs::chmod(path_str, arg2 as u32) {
                 Ok(()) => 0,
                 Err(e) => crate::subsys::linux::errno::vfs_err(e),
@@ -2743,7 +2943,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         //   offset 56: stx_attributes_mask u64
         332 => {
             let path_bytes = read_cstring_from_user(arg2);
-            let path       = match core::str::from_utf8(path_bytes) { Ok(s) => s, Err(_) => return -22 };
+            let path       = match core::str::from_utf8(&path_bytes) { Ok(s) => s, Err(_) => return -22 };
             if arg5 == 0 { return -14; } // EFAULT
             // arg4 = requested mask; we always fill all fields we have.
             // STATX_BASIC_STATS = 0x7ff covers mode, nlink, uid, gid, ino, size, etc.
@@ -2754,8 +2954,14 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     let base = arg5 as *mut u8;
                     #[cfg(feature = "firefox-test")]
                     crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Statx, base, 256);
-                    unsafe { core::ptr::write_bytes(base, 0, 256); }
+                    let mode: u16 = match st.file_type {
+                        crate::vfs::FileType::Directory => 0o040_755,
+                        crate::vfs::FileType::SymLink   => 0o120_777,
+                        _                               => 0o100_644,
+                    };
                     unsafe {
+                        let _g = crate::arch::x86_64::smap::UserGuard::new();
+                        core::ptr::write_bytes(base, 0, 256);
                         // stx_mask (offset 0): populate BASIC_STATS fields
                         core::ptr::write(base.add(0) as *mut u32, 0x7ff_u32);
                         // stx_blksize (offset 4)
@@ -2763,11 +2969,6 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         // stx_nlink (offset 16)
                         core::ptr::write(base.add(16) as *mut u32, 1_u32);
                         // stx_mode (offset 28): file type bits + permission bits
-                        let mode: u16 = match st.file_type {
-                            crate::vfs::FileType::Directory => 0o040_755,
-                            crate::vfs::FileType::SymLink   => 0o120_777,
-                            _                               => 0o100_644,
-                        };
                         core::ptr::write(base.add(28) as *mut u16, mode);
                         // stx_ino (offset 32)
                         core::ptr::write(base.add(32) as *mut u64, st.inode);
@@ -2804,7 +3005,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         27 => {
             let pages = ((arg2 + 0xFFF) / 0x1000) as usize;
             if arg3 != 0 && crate::syscall::validate_user_ptr(arg3, pages) {
-                unsafe { core::ptr::write_bytes(arg3 as *mut u8, 1, pages); }
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    core::ptr::write_bytes(arg3 as *mut u8, 1, pages);
+                }
             }
             0
         }
@@ -2815,7 +3019,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             if arg1 != 0 && crate::syscall::validate_user_ptr(arg1, 32) {
                 #[cfg(feature = "firefox-test")]
                 crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Times, arg1 as *const u8, 32);
-                unsafe { core::ptr::write_bytes(arg1 as *mut u8, 0, 32); }
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    core::ptr::write_bytes(arg1 as *mut u8, 0, 32);
+                }
             }
             0
         }
@@ -2835,7 +3042,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         118 => {
             for ptr in [arg1, arg2, arg3] {
                 if ptr != 0 && crate::syscall::validate_user_ptr(ptr, 4) {
-                    unsafe { core::ptr::write(ptr as *mut u32, 0u32); }
+                    unsafe {
+                        let _g = crate::arch::x86_64::smap::UserGuard::new();
+                        core::ptr::write(ptr as *mut u32, 0u32);
+                    }
                 }
             }
             0
@@ -2846,7 +3056,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         120 => {
             for ptr in [arg1, arg2, arg3] {
                 if ptr != 0 && crate::syscall::validate_user_ptr(ptr, 4) {
-                    unsafe { core::ptr::write(ptr as *mut u32, 0u32); }
+                    unsafe {
+                        let _g = crate::arch::x86_64::smap::UserGuard::new();
+                        core::ptr::write(ptr as *mut u32, 0u32);
+                    }
                 }
             }
             0
@@ -2856,7 +3069,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             if arg1 != 0 && crate::syscall::validate_user_ptr(arg1, arg2 as usize) {
                 #[cfg(feature = "firefox-test")]
                 crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Memset, arg1 as *const u8, arg2 as usize);
-                unsafe { core::ptr::write_bytes(arg1 as *mut u8, 0, arg2 as usize); }
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    core::ptr::write_bytes(arg1 as *mut u8, 0, arg2 as usize);
+                }
             }
             0
         }
@@ -2887,16 +3103,16 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let fstype_raw = read_cstring_from_user(arg3);
             let flags = arg4;
             let data_raw  = read_cstring_from_user(arg5);
-            let source = core::str::from_utf8(source_raw).unwrap_or("");
-            let target = core::str::from_utf8(target_raw).unwrap_or("");
-            let fstype = core::str::from_utf8(fstype_raw).unwrap_or("");
-            let data   = core::str::from_utf8(data_raw).unwrap_or("");
+            let source = core::str::from_utf8(&source_raw).unwrap_or("");
+            let target = core::str::from_utf8(&target_raw).unwrap_or("");
+            let fstype = core::str::from_utf8(&fstype_raw).unwrap_or("");
+            let data   = core::str::from_utf8(&data_raw).unwrap_or("");
             crate::vfs::sys_mount(source, target, fstype, flags, data)
         }
         // 166: umount(target)
         166 => {
             let target_raw = read_cstring_from_user(arg1);
-            let target = core::str::from_utf8(target_raw).unwrap_or("");
+            let target = core::str::from_utf8(&target_raw).unwrap_or("");
             crate::vfs::sys_umount(target, 0)
         }
         // 167: swapon — stub ENOSYS (no swap on AstryxOS)
@@ -2910,7 +3126,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // 169: umount2(target, flags)
         169 => {
             let target_raw = read_cstring_from_user(arg1);
-            let target = core::str::from_utf8(target_raw).unwrap_or("");
+            let target = core::str::from_utf8(&target_raw).unwrap_or("");
             let flags  = arg2;
             crate::vfs::sys_umount(target, flags)
         }
@@ -2949,8 +3165,19 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 if !crate::syscall::validate_user_ptr(arg1, 8) {
                     return -14; // EFAULT
                 }
-                let buf = unsafe { core::slice::from_raw_parts_mut(arg1 as *mut u8, 8) };
-                buf.copy_from_slice(&wall_secs.to_le_bytes());
+                // SMAP bracket — the slice materialisation and the
+                // copy_from_slice write below both touch a user page
+                // (PTE.U=1).  Per Intel SDM Vol. 3A §4.6 the supervisor
+                // must hold EFLAGS.AC=1 to issue these stores.  UserGuard
+                // RAII issues STAC on construction and CLAC on drop, so
+                // the bracket covers the write regardless of fault unwind.
+                // glibc's `time(t)` vDSO fallback (man 2 time) takes this
+                // path whenever a userspace caller passes a non-NULL tloc.
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    let buf = core::slice::from_raw_parts_mut(arg1 as *mut u8, 8);
+                    buf.copy_from_slice(&wall_secs.to_le_bytes());
+                }
             }
             wall_secs
         }
@@ -2968,16 +3195,31 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         437 => {
             // openat2 struct how: { flags: u64, mode: u64, resolve: u64 }
             // arg1=dirfd, arg2=path, arg3=*how, arg4=sizeof(how)
-            let how_flags = if arg3 != 0 { unsafe { *(arg3 as *const u64) } } else { 0 };
-            let how_mode  = if arg3 != 0 { unsafe { *((arg3 + 8) as *const u64) } } else { 0o644 };
+            //
+            // SMAP bracket — both reads target user memory.  Validate the
+            // range up front (16 B covers flags+mode), then dereference
+            // under a single UserGuard.  Per Intel SDM Vol. 3A §4.6 and
+            // openat2(2) man page (which specifies a `struct open_how`).
+            let (how_flags, how_mode) = if arg3 != 0 {
+                if !crate::syscall::validate_user_ptr(arg3, 16) {
+                    return -14; // EFAULT
+                }
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    (core::ptr::read_unaligned(arg3 as *const u64),
+                     core::ptr::read_unaligned((arg3 + 8) as *const u64))
+                }
+            } else {
+                (0, 0o644)
+            };
             dispatch(257, arg1, arg2, how_flags, how_mode, 0, 0) // openat
         }
         // 316: renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
         316 => {
             let old_raw = read_cstring_from_user(arg2);
             let new_raw = read_cstring_from_user(arg4);
-            let old_str = core::str::from_utf8(old_raw).unwrap_or("");
-            let new_str = core::str::from_utf8(new_raw).unwrap_or("");
+            let old_str = core::str::from_utf8(&old_raw).unwrap_or("");
+            let new_str = core::str::from_utf8(&new_raw).unwrap_or("");
             match crate::vfs::rename(old_str, new_str) {
                 Ok(()) => 0,
                 Err(e) => crate::subsys::linux::errno::vfs_err(e),
@@ -3011,7 +3253,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         322 => {
             // If path is empty and AT_EMPTY_PATH (0x1000) set, exec fd directly — unsupported
             let path_bytes = read_cstring_from_user(arg2);
-            let path_str   = core::str::from_utf8(path_bytes).unwrap_or("");
+            let path_str   = core::str::from_utf8(&path_bytes).unwrap_or("");
             if path_str.is_empty() {
                 return -38; // ENOSYS — fd-based execveat not supported
             }
@@ -3117,6 +3359,7 @@ fn sys_nanosleep_linux(req_ptr: u64, _rem_ptr: u64) -> i64 {
     }
     if !crate::syscall::validate_user_ptr(req_ptr, 16) { return -14; } // EFAULT
     let (tv_sec, tv_nsec) = unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
         let p = req_ptr as *const i64;
         (core::ptr::read_unaligned(p), core::ptr::read_unaligned(p.add(1)))
     };
@@ -3157,6 +3400,7 @@ fn sys_getrlimit(resource: u64, rlim_ptr: u64) -> i64 {
         RLIM_INFINITY
     };
     unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
         let p = rlim_ptr as *mut u64;
         core::ptr::write_unaligned(p,        soft);
         core::ptr::write_unaligned(p.add(1), hard);
@@ -3180,12 +3424,19 @@ fn sys_select_linux(
         let byte_off = (fd / 8) as u64;
         let bit      = 1u8 << (fd % 8);
 
+        // SMAP-bracketed reads of user fd_set bits.
         let r_req = readfds  != 0
             && crate::syscall::validate_user_ptr(readfds  + byte_off, 1)
-            && unsafe { *((readfds  + byte_off) as *const u8) & bit != 0 };
+            && unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                *((readfds  + byte_off) as *const u8) & bit != 0
+            };
         let w_req = writefds != 0
             && crate::syscall::validate_user_ptr(writefds + byte_off, 1)
-            && unsafe { *((writefds + byte_off) as *const u8) & bit != 0 };
+            && unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                *((writefds + byte_off) as *const u8) & bit != 0
+            };
 
         if !r_req && !w_req { continue; }
 
@@ -3222,13 +3473,19 @@ fn sys_select_linux(
             if can_read { ready += 1; }
             else {
                 // Clear unready bit
-                unsafe { *((readfds + byte_off) as *mut u8) &= !bit; }
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    *((readfds + byte_off) as *mut u8) &= !bit;
+                }
             }
         }
         if w_req {
             if can_write { ready += 1; }
             else {
-                unsafe { *((writefds + byte_off) as *mut u8) &= !bit; }
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    *((writefds + byte_off) as *mut u8) &= !bit;
+                }
             }
         }
     }
@@ -3240,10 +3497,16 @@ fn sys_select_linux(
             let bit      = 1u8 << (fd % 8);
             let r_req = readfds != 0
                 && crate::syscall::validate_user_ptr(readfds + byte_off, 1)
-                && unsafe { *((readfds + byte_off) as *const u8) & bit != 0 };
+                && unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    *((readfds + byte_off) as *const u8) & bit != 0
+                };
             let w_req = writefds != 0
                 && crate::syscall::validate_user_ptr(writefds + byte_off, 1)
-                && unsafe { *((writefds + byte_off) as *const u8) & bit != 0 };
+                && unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    *((writefds + byte_off) as *const u8) & bit != 0
+                };
             if !r_req && !w_req { continue; }
             let revents = crate::syscall::poll_revents(pid, fd, if r_req { 0x0001 } else { 0x0004 });
             // Per POSIX `select(2)`: a hung-up pipe read-end is reported
@@ -3252,9 +3515,19 @@ fn sys_select_linux(
             // addition to POLLIN (0x0001).
             const READABLE_MASK: u16 = 0x0001 | 0x0010;
             if r_req && revents & READABLE_MASK != 0 { *ready += 1; }
-            else if r_req { unsafe { *((readfds + byte_off) as *mut u8) &= !bit; } }
+            else if r_req {
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    *((readfds + byte_off) as *mut u8) &= !bit;
+                }
+            }
             if w_req && revents & 0x0004 != 0 { *ready += 1; }
-            else if w_req { unsafe { *((writefds + byte_off) as *mut u8) &= !bit; } }
+            else if w_req {
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    *((writefds + byte_off) as *mut u8) &= !bit;
+                }
+            }
         }
     };
 
@@ -3271,8 +3544,11 @@ fn sys_select_linux(
             -1 // bad pointer — treat as infinite to be conservative
         } else {
             // struct timeval { tv_sec: i64, tv_usec: i64 } on x86_64.
-            let tv_sec  = unsafe { core::ptr::read_unaligned(timeout as *const i64) };
-            let tv_usec = unsafe { core::ptr::read_unaligned((timeout + 8) as *const i64) };
+            let (tv_sec, tv_usec) = unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                (core::ptr::read_unaligned(timeout as *const i64),
+                 core::ptr::read_unaligned((timeout + 8) as *const i64))
+            };
             if tv_sec == 0 && tv_usec == 0 {
                 0
             } else {
@@ -3546,6 +3822,7 @@ fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64, new_addr:
             let dest = crate::syscall::sys_mmap(0, new_size, 0x3, MAP_ANONYMOUS, u64::MAX, 0);
             if dest < 0 { return -12; } // ENOMEM
             unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
                 core::ptr::copy_nonoverlapping(
                     old_addr as *const u8, dest as *mut u8, old_size as usize);
             }
@@ -3559,6 +3836,7 @@ fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64, new_addr:
             MAP_ANONYMOUS | MAP_FIXED, u64::MAX, 0);
         if dest < 0 { return dest; }
         unsafe {
+            let _g = crate::arch::x86_64::smap::UserGuard::new();
             core::ptr::copy_nonoverlapping(
                 old_addr as *const u8, dest as *mut u8, old_size.min(new_size) as usize);
         }
@@ -3638,7 +3916,10 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
         return match crate::net::socket::socket_recv(socket_id) {
             Ok(data) => {
                 let n = data.len().min(count);
-                unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, n); }
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, n);
+                }
                 n as i64
             }
             Err(_) => -11, // EAGAIN
@@ -3661,7 +3942,10 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
             match crate::ipc::eventfd::try_read(efd_id) {
                 Ok(val) => {
                     let bytes = val.to_le_bytes();
-                    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr, 8); }
+                    unsafe {
+                        let _g = crate::arch::x86_64::smap::UserGuard::new();
+                        core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr, 8);
+                    }
                     return 8;
                 }
                 Err(-11) if nonblock => return -11, // EAGAIN
@@ -3690,7 +3974,10 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
         return match crate::ipc::timerfd::read(tfd_id) {
             Ok(val) => {
                 let bytes = val.to_le_bytes();
-                unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr, 8); }
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr, 8);
+                }
                 8
             }
             Err(e) => e,
@@ -3741,12 +4028,17 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
                     // Snapshot up to READ_BYTES (256) into a Vec we can feed
                     // to the ring-entry helper and to the inline log line.
                     let take = n.min(crate::syscall::ring::READ_BYTES);
-                    let mut snap = alloc::vec::Vec::with_capacity(take);
+                    // SMAP-bracketed snapshot — the buf_ptr derefs target
+                    // user memory.  Allocate the Vec upfront (outside the
+                    // guard) so the AC=1 region only spans the byte reads.
+                    let mut staging = [0u8; crate::syscall::ring::READ_BYTES];
                     unsafe {
+                        let _g = crate::arch::x86_64::smap::UserGuard::new();
                         for i in 0..take {
-                            snap.push(*buf_ptr.add(i));
+                            staging[i] = *buf_ptr.add(i);
                         }
                     }
+                    let snap: alloc::vec::Vec<u8> = staging[..take].to_vec();
                     let idx = crate::subsys::linux::syscall_ring::current_entry();
                     crate::syscall::ring::set_read_bytes(pid, idx, &snap);
                     crate::syscall::ring::log_synthetic_read(
@@ -3804,19 +4096,25 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
     {
         let pid = crate::proc::current_pid_lockless();
         if pid == 1 || crate::syscall::ring::is_tracked(pid) {
+            // SMAP-bracketed snapshot of the user buffer into a kernel
+            // Vec so the logging chatter below runs on kernel memory.
+            // The snapshot is capped at 512 bytes; everything we log
+            // (escape-printer, hex dump) reads from `snapshot` only.
+            let snap_take = count.min(512);
+            let snapshot: alloc::vec::Vec<u8> = unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                core::slice::from_raw_parts(buf_ptr, snap_take).to_vec()
+            };
             // Skip ultra-short non-printable bursts (e.g. the 1-byte `\n`
             // ping-pongs some stdio buffers emit) unless clearly human-visible
             // output.  ASCII-printable / whitespace passes through.
-            let should_log = count >= 4 || {
-                let s = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
-                s.iter().all(|&b| b == b'\n' || b == b'\r' || b == b'\t' || (0x20..=0x7e).contains(&b))
-            };
+            let should_log = count >= 4 || snapshot.iter().all(|&b| {
+                b == b'\n' || b == b'\r' || b == b'\t' || (0x20..=0x7e).contains(&b)
+            });
             if should_log {
                 let truncated = count > 512;
-                let take = count.min(512);
-                let slice = unsafe { core::slice::from_raw_parts(buf_ptr, take) };
-                let mut buf = alloc::string::String::with_capacity(take + 16);
-                for &b in slice {
+                let mut buf = alloc::string::String::with_capacity(snap_take + 16);
+                for &b in &snapshot {
                     match b {
                         b'\n' => buf.push_str("\\n"),
                         b'\r' => buf.push_str("\\r"),
@@ -3835,16 +4133,13 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
             // Full-fd coverage: capture writes to fds OTHER than 0/1/2 so we
             // see any diagnostic chatter that was redirected to a log file,
             // syslog socket, etc.  Hex-encode the first 64 bytes — we don't
-            // know the encoding so don't assume UTF-8.  The ring buffer
-            // already captures the fd and length; this line exposes the
-            // bytes.  Silent on pipes/sockets would be fine too, but log
-            // them — in Firefox they're almost always user-authored.
+            // know the encoding so don't assume UTF-8.
             if fd > 2 {
                 let take = count.min(64);
-                let slice = unsafe { core::slice::from_raw_parts(buf_ptr, take) };
+                let hex_src = &snapshot[..snapshot.len().min(take)];
                 let mut hex = alloc::string::String::with_capacity(take * 2);
                 const HEX: &[u8; 16] = b"0123456789abcdef";
-                for &b in slice {
+                for &b in hex_src {
                     hex.push(HEX[(b >> 4) as usize] as char);
                     hex.push(HEX[(b & 0xF) as usize] as char);
                 }
@@ -3860,39 +4155,75 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
     // Must check these BEFORE the `fd == 1/2` stdout/stderr branch because
     // kernel tests and user processes may allocate pipe/socket/eventfd at fd 1.
     let pid = crate::proc::current_pid_lockless();
-    if crate::syscall::is_pipe_fd(pid, fd as usize) {
-        let pipe_id = crate::syscall::get_pipe_id(pid, fd as usize);
-        let slice = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
-        return match crate::ipc::pipe::pipe_write(pipe_id, slice) {
-            Some(n) => {
-                // Per `man 7 pipe`: writes that deposit data MUST wake any
-                // readers parked on this pipe (the matching wait list lives
-                // in `crate::ipc::pipe::PIPE_READ_WAITERS`).  Skip the wake
-                // on a zero-byte write — the buffer state did not change.
-                if n > 0 {
-                    crate::ipc::pipe::wake_readers_all(pipe_id);
+
+    // Decide once whether the destination is a kernel-internal fd type that
+    // will hold the slice past the UserGuard scope (pipe/socket/unix/eventfd
+    // queue the bytes into kernel buffers; UDP packetises into its own Vec;
+    // TCP enqueues into the send window).  For all of these we must snapshot
+    // the user buffer into a kernel Vec BEFORE invoking the downstream code,
+    // otherwise the downstream's `extend_from_slice` / queue copy reads user
+    // memory with AC=0 and faults under SMAP (Intel SDM Vol. 3A §4.6).
+    //
+    // The VFS fd_write path below threads the raw user pointer through into
+    // its own STAC/CLAC-bracketed copy helpers, so we don't need to snapshot
+    // for that case — keeping the zero-copy fast path intact.
+    let is_pipe   = crate::syscall::is_pipe_fd(pid, fd as usize);
+    let is_unix   = !is_pipe && crate::syscall::is_unix_socket_fd(pid, fd as usize);
+    let is_inet   = !is_pipe && !is_unix && crate::syscall::is_socket_fd(pid, fd as usize);
+    let is_evfd   = !is_pipe && !is_unix && !is_inet
+                    && crate::syscall::is_eventfd_fd(pid, fd as usize);
+
+    if is_pipe || is_unix || is_inet || is_evfd {
+        if !crate::syscall::validate_user_ptr(buf as u64, count) {
+            return -14; // EFAULT
+        }
+        // Snapshot the entire buffer to kernel memory under one bracket.
+        // Bracket-scope is tight: STAC fires, the snapshot copies bytes
+        // through `to_vec`, then CLAC fires before any downstream call.
+        let snapshot: alloc::vec::Vec<u8> = unsafe {
+            let _g = crate::arch::x86_64::smap::UserGuard::new();
+            core::slice::from_raw_parts(buf_ptr, count).to_vec()
+        };
+        let data: &[u8] = &snapshot;
+
+        if is_pipe {
+            let pipe_id = crate::syscall::get_pipe_id(pid, fd as usize);
+            return match crate::ipc::pipe::pipe_write(pipe_id, data) {
+                Some(n) => {
+                    // Per `man 7 pipe`: writes that deposit data MUST wake
+                    // any readers parked on this pipe (the matching wait
+                    // list lives in `crate::ipc::pipe::PIPE_READ_WAITERS`).
+                    // Skip the wake on a zero-byte write — the buffer state
+                    // did not change.
+                    if n > 0 {
+                        crate::ipc::pipe::wake_readers_all(pipe_id);
+                    }
+                    n as i64
                 }
-                n as i64
-            }
-            None => -9,
-        };
-    } else if crate::syscall::is_unix_socket_fd(pid, fd as usize) {
-        let data = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
-        let unix_id = crate::syscall::get_unix_socket_id(pid, fd as usize);
-        return crate::net::unix::write(unix_id, data);
-    } else if crate::syscall::is_socket_fd(pid, fd as usize) {
-        let socket_id = crate::syscall::get_socket_id(pid, fd as usize);
-        let data = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
-        return match crate::net::socket::socket_send(socket_id, data) {
-            Ok(n) => n as i64,
-            Err("EPIPE") => -32, // EPIPE — caller did SHUT_WR
-            Err(_) => -104, // ECONNRESET
-        };
-    } else if crate::syscall::is_eventfd_fd(pid, fd as usize) {
+                None => -9,
+            };
+        }
+        if is_unix {
+            let unix_id = crate::syscall::get_unix_socket_id(pid, fd as usize);
+            return crate::net::unix::write(unix_id, data);
+        }
+        if is_inet {
+            let socket_id = crate::syscall::get_socket_id(pid, fd as usize);
+            return match crate::net::socket::socket_send(socket_id, data) {
+                Ok(n) => n as i64,
+                Err("EPIPE") => -32, // EPIPE — caller did SHUT_WR
+                Err(_) => -104, // ECONNRESET
+            };
+        }
+        // is_evfd
         if count < 8 { return -22; } // EINVAL
         let efd_id = crate::syscall::get_eventfd_id(pid, fd as usize);
-        let val = unsafe { core::ptr::read_unaligned(buf_ptr as *const u64) };
-        return match crate::ipc::eventfd::write(efd_id, u64::from_le(val)) {
+        let val_bytes: [u8; 8] = [
+            data[0], data[1], data[2], data[3],
+            data[4], data[5], data[6], data[7],
+        ];
+        let val = u64::from_le_bytes(val_bytes);
+        return match crate::ipc::eventfd::write(efd_id, val) {
             Ok(()) => {
                 // Per `man 2 eventfd`: a write that bumps the counter must
                 // wake any reader parked on a zero counter (see the per-
@@ -3912,9 +4243,18 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
         Err(_) => return -9, // EBADF for other fds
     }
 
-    // fd 1/2 with no VFS file → TTY stdout/stderr.
-    let slice = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
-    crate::drivers::tty::TTY0.lock().write(slice);
+    // fd 1/2 with no VFS file → TTY stdout/stderr.  Same SMAP discipline as
+    // the special-fd paths above: TTY's write() reads every byte of the slice
+    // into the line buffer, holding the read past the UserGuard would risk a
+    // mismatched bracket.  Snapshot first.
+    if !crate::syscall::validate_user_ptr(buf as u64, count) {
+        return -14; // EFAULT
+    }
+    let tty_snap: alloc::vec::Vec<u8> = unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
+        core::slice::from_raw_parts(buf_ptr, count).to_vec()
+    };
+    crate::drivers::tty::TTY0.lock().write(&tty_snap);
     count as i64
 }
 
@@ -3935,7 +4275,7 @@ pub fn sys_open_linux(pathname: u64, flags: u64, _mode: u64) -> i64 {
     #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
     let path_snapshot: alloc::string::String = {
         let bytes = read_cstring_from_user(pathname);
-        alloc::string::String::from_utf8_lossy(bytes).into_owned()
+        alloc::string::String::from_utf8_lossy(&bytes).into_owned()
     };
     let ret = sys_open_linux_inner(pathname, flags, _mode);
     #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
@@ -3963,7 +4303,7 @@ fn sys_open_linux_inner(pathname: u64, flags: u64, _mode: u64) -> i64 {
     }
 
     let path_bytes = read_cstring_from_user(pathname);
-    let path = match core::str::from_utf8(path_bytes) {
+    let path = match core::str::from_utf8(&path_bytes) {
         Ok(s) => s,
         Err(_) => return -22,
     };
@@ -4108,7 +4448,7 @@ fn sys_stat_linux(pathname: u64, stat_buf: u64) -> i64 {
     // Pointer validation is done at the user/kernel boundary
     // (dispatch_body arms 4/6) — see sys_open_linux for the rationale.
     let path_bytes = read_cstring_from_user(pathname);
-    let path = match core::str::from_utf8(path_bytes) {
+    let path = match core::str::from_utf8(&path_bytes) {
         Ok(s) => s,
         Err(_) => return -22,
     };
@@ -4215,7 +4555,7 @@ fn sys_faccessat_linux(dirfd: u64, pathname: u64, mode: u64) -> i64 {
         }
     };
     let rel_bytes = read_cstring_from_user(pathname);
-    let rel = match core::str::from_utf8(rel_bytes) {
+    let rel = match core::str::from_utf8(&rel_bytes) {
         Ok(s) => s,
         Err(_) => return -22,
     };
@@ -4262,6 +4602,8 @@ fn sys_unlink_linux(pathname: u64) -> i64 {
 const LINUX_STAT_SIZE: usize = 144;
 
 fn fill_linux_stat(buf: *mut u8, st: &crate::vfs::FileStat) {
+    // SMAP bracket — `buf` is a user pointer in the syscall path.
+    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
     let out = unsafe { core::slice::from_raw_parts_mut(buf, LINUX_STAT_SIZE) };
     for b in out.iter_mut() {
         *b = 0;
@@ -4344,7 +4686,10 @@ pub fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
                 return -14; // EFAULT
             }
             let fs = unsafe { crate::hal::rdmsr(0xC000_0100) };
-            unsafe { *(addr as *mut u64) = fs; }
+            unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                *(addr as *mut u64) = fs;
+            }
             0
         }
         ARCH_SET_GS => {
@@ -4357,7 +4702,10 @@ pub fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
                 return -14; // EFAULT
             }
             let gs = unsafe { crate::hal::rdmsr(0xC000_0101) };
-            unsafe { *(addr as *mut u64) = gs; }
+            unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                *(addr as *mut u64) = gs;
+            }
             0
         }
         _ => -22 // EINVAL
@@ -4450,6 +4798,8 @@ pub fn sys_clock_gettime(clk_id: u64, tp: u64) -> i64 {
         secs
     };
 
+    // SMAP bracket — `tp` is a user-VA timespec pointer.
+    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
     let buf = unsafe { core::slice::from_raw_parts_mut(tp as *mut u8, 16) };
     buf[0..8].copy_from_slice(&secs.to_le_bytes());
     buf[8..16].copy_from_slice(&nsecs.to_le_bytes());
@@ -4609,11 +4959,14 @@ pub fn sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64 {
     if !crate::syscall::validate_user_ptr(iov_ptr, (iovcnt as usize).saturating_mul(16)) {
         return -14; // EFAULT
     }
-    let iovecs = unsafe {
-        core::slice::from_raw_parts(iov_ptr as *const [u64; 2], iovcnt as usize)
+    // SMAP-bracketed copy of the iovec array into kernel memory so the
+    // loop body below never re-derefs user storage.
+    let iovecs_owned: alloc::vec::Vec<[u64; 2]> = unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
+        core::slice::from_raw_parts(iov_ptr as *const [u64; 2], iovcnt as usize).to_vec()
     };
     let mut total = 0i64;
-    for iov in iovecs {
+    for iov in &iovecs_owned {
         let base = iov[0];
         let len = iov[1] as usize;
         if len == 0 { continue; }
@@ -4635,11 +4988,12 @@ fn sys_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64 {
     if !crate::syscall::validate_user_ptr(iov_ptr, (iovcnt as usize).saturating_mul(16)) {
         return -14; // EFAULT
     }
-    let iovecs = unsafe {
-        core::slice::from_raw_parts(iov_ptr as *const [u64; 2], iovcnt as usize)
+    let iovecs_owned: alloc::vec::Vec<[u64; 2]> = unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
+        core::slice::from_raw_parts(iov_ptr as *const [u64; 2], iovcnt as usize).to_vec()
     };
     let mut total = 0i64;
-    for iov in iovecs {
+    for iov in &iovecs_owned {
         let base = iov[0];
         let len = iov[1] as usize;
         if len == 0 { continue; }
@@ -4671,9 +5025,13 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> i64 {
     match cmd {
         F_GETLK | F_SETLK | F_SETLKW => {
             if arg == 0 { return -22; } // EINVAL: null flock pointer
-            let l_type  = unsafe { *(arg as *const i16) };
-            let l_start = unsafe { *((arg + 8)  as *const i64) } as u64;
-            let l_len   = unsafe { *((arg + 16) as *const i64) } as u64;
+            // SMAP bracket the three user-pointer field reads.
+            let (l_type, l_start, l_len) = unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                (*(arg as *const i16),
+                 *((arg + 8)  as *const i64) as u64,
+                 *((arg + 16) as *const i64) as u64)
+            };
 
             // Get fd's backing (mount_idx, inode).
             let (mount_idx, inode) = {
@@ -4694,13 +5052,17 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> i64 {
                 });
                 if let Some(lk) = conflict {
                     unsafe {
+                        let _g = crate::arch::x86_64::smap::UserGuard::new();
                         *(arg as *mut i16)        = lk.lock_type;
                         *((arg + 8)  as *mut i64) = lk.start as i64;
                         *((arg + 16) as *mut i64) = lk.end as i64;
                         *((arg + 24) as *mut i32) = lk.pid as i32;
                     }
                 } else {
-                    unsafe { *(arg as *mut i16) = F_UNLCK; }
+                    unsafe {
+                        let _g = crate::arch::x86_64::smap::UserGuard::new();
+                        *(arg as *mut i16) = F_UNLCK;
+                    }
                 }
                 return 0;
             }
@@ -4865,8 +5227,20 @@ fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: u64, count: usize) -> i
             None => return -9,
         }
     };
+    // Per sendfile(2): if `offset` is non-NULL, kernel reads the starting
+    // offset from `*offset` and writes the post-read offset back on success.
+    // Validate the 8-byte range and bracket the read with STAC/CLAC so the
+    // supervisor access to a user page does not raise #PF when SMAP is
+    // active (Intel SDM Vol. 3A §4.6).  An invalid pointer must surface as
+    // EFAULT (errno 14), per the man page.
     let read_offset: u64 = if offset_ptr != 0 {
-        unsafe { core::ptr::read_unaligned(offset_ptr as *const u64) }
+        if !crate::syscall::validate_user_ptr(offset_ptr, 8) {
+            return -14; // EFAULT
+        }
+        unsafe {
+            let _g = crate::arch::x86_64::smap::UserGuard::new();
+            core::ptr::read_unaligned(offset_ptr as *const u64)
+        }
     } else {
         in_offset_cur
     };
@@ -4925,9 +5299,16 @@ fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: u64, count: usize) -> i
         }
     }
 
-    // Update the read offset.
+    // Update the read offset.  Per sendfile(2): on a non-NULL offset
+    // pointer the kernel writes back the post-read offset.  validate_user_ptr
+    // already passed at the top of the function (we never NULL it between
+    // there and here), but we re-bracket with STAC/CLAC because the write
+    // touches a user page (Intel SDM Vol. 3A §4.6).
     if offset_ptr != 0 {
-        unsafe { core::ptr::write_unaligned(offset_ptr as *mut u64, read_offset + n as u64); }
+        unsafe {
+            let _g = crate::arch::x86_64::smap::UserGuard::new();
+            core::ptr::write_unaligned(offset_ptr as *mut u64, read_offset + n as u64);
+        }
     } else {
         let mut procs = crate::proc::PROCESS_TABLE.lock();
         if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
@@ -4964,7 +5345,7 @@ fn sys_access(pathname: u64, mode: u64) -> i64 {
     // (dispatch_body arm 21) — see sys_open_linux for the rationale.
 
     let path_bytes = read_cstring_from_user(pathname);
-    let path = match core::str::from_utf8(path_bytes) {
+    let path = match core::str::from_utf8(&path_bytes) {
         Ok(s) => s,
         Err(_) => return -22, // EINVAL
     };
@@ -5060,6 +5441,8 @@ fn sys_gettimeofday(tv: u64, _tz: u64) -> i64 {
         (ticks / 100, (ticks % 100) * 10_000)
     };
     let secs = crate::proc::vdso::wall_secs_at_boot().saturating_add(mono_secs);
+    // SMAP bracket — `tv` is a user-VA timeval pointer.
+    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
     let buf = unsafe { core::slice::from_raw_parts_mut(tv as *mut u8, 16) };
     buf[0..8].copy_from_slice(&secs.to_le_bytes());
     buf[8..16].copy_from_slice(&sub_usecs.to_le_bytes());
@@ -5101,6 +5484,9 @@ fn sys_getdents64(fd: u64, buf: u64, count: u64) -> i64 {
         }
     };
 
+    // SMAP bracket — `buf` is a user-VA pointer the dirent records are
+    // marshalled into.
+    let _smap_g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
     let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, count as usize) };
     let mut pos = 0usize;
     let mut entry_idx = offset as usize;
@@ -5192,6 +5578,9 @@ fn getdents64_proc_fd(pid: u64, dir_fd: usize, buf: u64, count: u64, start_idx: 
         virtual_entries.push((name, ino, 10)); // DT_LNK
     }
 
+    // SMAP bracket — `buf` is a user-VA pointer the dirent records are
+    // marshalled into.
+    let _smap_g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
     let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, count as usize) };
     let mut pos = 0usize;
     let mut entry_idx = start_idx as usize;
@@ -5249,7 +5638,7 @@ fn sys_openat(dirfd: u64, pathname: u64, flags: u64, mode: u64) -> i64 {
 
     // Real directory fd — resolve pathname relative to it.
     let path_bytes = read_cstring_from_user(pathname);
-    let rel_path = match core::str::from_utf8(path_bytes) {
+    let rel_path = match core::str::from_utf8(&path_bytes) {
         Ok(s) => s,
         Err(_) => return -22, // EINVAL
     };
@@ -5327,7 +5716,7 @@ fn sys_newfstatat(dirfd: u64, pathname: u64, statbuf: u64, flags: u64) -> i64 {
     if path_bytes.is_empty() {
         return sys_fstat_linux(dirfd as usize, statbuf as *mut u8);
     }
-    let path_str = match core::str::from_utf8(path_bytes) {
+    let path_str = match core::str::from_utf8(&path_bytes) {
         Ok(s) => s,
         Err(_) => return -22,
     };
@@ -5413,7 +5802,12 @@ fn sys_rt_sigaction_linux(sig: u64, act: u64, oldact: u64, _sigsetsize: u64) -> 
     let new_sa_mask: u64;
     let new_action: Option<SigAction>;
     if act != 0 {
-        let inp = unsafe { core::slice::from_raw_parts(act as *const u8, 32) };
+        // SMAP-bracketed copy of the 32-byte sigaction into kernel mem.
+        let mut inp = [0u8; 32];
+        unsafe {
+            let _g = crate::arch::x86_64::smap::UserGuard::new();
+            core::ptr::copy_nonoverlapping(act as *const u8, inp.as_mut_ptr(), 32);
+        }
         let handler_addr = u64::from_le_bytes(inp[0..8].try_into().unwrap());
         let sa_flags    = u64::from_le_bytes(inp[8..16].try_into().unwrap());
         let sa_restorer = u64::from_le_bytes(inp[16..24].try_into().unwrap());
@@ -5478,11 +5872,15 @@ fn sys_rt_sigaction_linux(sig: u64, act: u64, oldact: u64, _sigsetsize: u64) -> 
     // round-trip — Mozilla's IPC layer compares the value it set against
     // the value it gets back to detect ABI mismatches.
     if oldact != 0 {
-        let out = unsafe { core::slice::from_raw_parts_mut(oldact as *mut u8, 32) };
+        let mut out = [0u8; 32];
         out[0..8].copy_from_slice(&prior_handler_addr.to_le_bytes());
         out[8..16].copy_from_slice(&prior_sa_flags.to_le_bytes());
         out[16..24].copy_from_slice(&prior_restorer_addr.to_le_bytes());
         out[24..32].copy_from_slice(&prior_sa_mask.to_le_bytes());
+        unsafe {
+            let _g = crate::arch::x86_64::smap::UserGuard::new();
+            core::ptr::copy_nonoverlapping(out.as_ptr(), oldact as *mut u8, 32);
+        }
     }
 
     0
@@ -5523,9 +5921,12 @@ fn sys_rt_sigprocmask_linux(how: u64, set: u64, oldset: u64, _sigsetsize: u64) -
     // kernel lock is held.  Demand-paging that user page may take
     // `PROCESS_TABLE`; doing it under our own held lock would deadlock.
     let new_mask: Option<u64> = if set != 0 {
-        Some(u64::from_le_bytes(unsafe {
-            core::slice::from_raw_parts(set as *const u8, 8)
-        }.try_into().unwrap()))
+        let mut bytes = [0u8; 8];
+        unsafe {
+            let _g = crate::arch::x86_64::smap::UserGuard::new();
+            core::ptr::copy_nonoverlapping(set as *const u8, bytes.as_mut_ptr(), 8);
+        }
+        Some(u64::from_le_bytes(bytes))
     } else {
         None
     };
@@ -5560,8 +5961,11 @@ fn sys_rt_sigprocmask_linux(how: u64, set: u64, oldset: u64, _sigsetsize: u64) -
     // Step 3: write the prior mask back to user memory AFTER releasing the
     // lock, again to keep demand-paging recursion-safe.
     if oldset != 0 {
-        let out = unsafe { core::slice::from_raw_parts_mut(oldset as *mut u8, 8) };
-        out[0..8].copy_from_slice(&prior_mask.to_le_bytes());
+        let bytes = prior_mask.to_le_bytes();
+        unsafe {
+            let _g = crate::arch::x86_64::smap::UserGuard::new();
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), oldset as *mut u8, 8);
+        }
     }
 
     0
@@ -6097,6 +6501,7 @@ fn sys_pipe2_linux(fds_out: *mut u32, flags: u32) -> i64 {
     proc.file_descriptors[wi] = Some(write_fd);
 
     unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
         core::ptr::write_unaligned(fds_out,          ri as u32);
         core::ptr::write_unaligned(fds_out.add(1),   wi as u32);
     }
@@ -6113,7 +6518,7 @@ fn sys_pipe2_linux(fds_out: *mut u32, flags: u32) -> i64 {
 fn sys_statfs_linux(path_ptr: u64, buf: *mut u8) -> i64 {
     if buf.is_null() { return -14; }
     let path_raw = read_cstring_from_user(path_ptr);
-    let path = core::str::from_utf8(path_raw).unwrap_or("");
+    let path = core::str::from_utf8(&path_raw).unwrap_or("");
 
     // Check the path exists (ignore error — statfs on /proc etc. always ok).
     let _ = crate::vfs::stat(path);
@@ -6134,6 +6539,8 @@ fn fill_statfs_buf(buf: *mut u8) {
     // Wipe first.
     #[cfg(feature = "firefox-test")]
     crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Preadv120, buf, 120);
+    // SMAP bracket — `buf` is a user-VA pointer.
+    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
     unsafe { core::ptr::write_bytes(buf, 0, 120); }
     // Use EXT2_SUPER_MAGIC (0xEF53) as f_type — widely recognised.
     let p = buf as *mut u64;
@@ -6560,7 +6967,10 @@ fn sys_epoll_ctl(epfd: usize, op: u64, fd: usize, event_ptr: u64) -> i64 {
 
     // Read the caller's epoll_event (only needed for ADD / MOD).
     let (events, data) = if event_ptr != 0 && op != EPOLL_CTL_DEL {
-        let ev = unsafe { core::ptr::read_unaligned(event_ptr as *const EpollEvent) };
+        let ev = unsafe {
+            let _g = crate::arch::x86_64::smap::UserGuard::new();
+            core::ptr::read_unaligned(event_ptr as *const EpollEvent)
+        };
         (ev.events, ev.data)
     } else {
         (0u32, 0u64)
@@ -6675,6 +7085,7 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
     let count = fired.len();
     if count > 0 && events_ptr != 0 {
         unsafe {
+            let _g = crate::arch::x86_64::smap::UserGuard::new();
             core::ptr::copy_nonoverlapping(
                 fired.as_ptr(),
                 events_ptr as *mut EpollEvent,
@@ -6866,7 +7277,7 @@ fn sys_inotify_add_watch(fd_num: u64, path_ptr: u64, mask: u32) -> i64 {
     if !crate::syscall::is_inotify_fd(pid, fd_num as usize) { return -9; } // EBADF
     let id = crate::syscall::get_inotify_id(pid, fd_num as usize);
     let path_bytes = read_cstring_from_user(path_ptr);
-    let path = core::str::from_utf8(path_bytes).unwrap_or("");
+    let path = core::str::from_utf8(&path_bytes).unwrap_or("");
     let wd = crate::ipc::inotify::add_watch(id, path, mask);
     if wd < 0 { -1 } else { wd as i64 }
 }
@@ -7088,7 +7499,7 @@ fn sys_getitimer(which: u64, val_ptr: u64) -> i64 {
 fn resolve_at_path(dirfd: u64, rel_ptr: u64) -> Result<alloc::string::String, i64> {
     const AT_FDCWD: i64 = -100;
     let path_bytes = read_cstring_from_user(rel_ptr);
-    let rel_str = core::str::from_utf8(path_bytes).map_err(|_| -22i64)?;
+    let rel_str = core::str::from_utf8(&path_bytes).map_err(|_| -22i64)?;
     if rel_str.is_empty() {
         return Err(-2); // ENOENT
     }
@@ -7214,6 +7625,8 @@ fn sys_getdents(fd: u64, buf: u64, count: u64) -> i64 {
     if buf == 0 || !crate::syscall::validate_user_ptr(buf, count as usize) {
         return -14; // EFAULT
     }
+    // SMAP bracket — `buf` is a user-VA pointer.
+    let _smap_g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
     let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, count as usize) };
     let mut pos = 0usize;
     let mut entry_idx = offset as usize;
@@ -7290,12 +7703,15 @@ fn sys_preadv(fd: u64, iov_ptr: u64, iovcnt: u64, offset: i64) -> i64 {
     let sk = crate::syscall::sys_lseek(fd as usize, offset, 0 /*SEEK_SET*/);
     if sk < 0 { return sk; }
     // SAFETY: iov_ptr range-validated above; iov_base/iov_len validated by
-    // the per-iov fd_read path (vfs handles short reads).
-    let iovecs = unsafe {
-        core::slice::from_raw_parts(iov_ptr as *const [u64; 2], iovcnt as usize)
+    // the per-iov fd_read path (vfs handles short reads).  SMAP-bracketed
+    // copy into kernel Vec so the loop reads the descriptor table from
+    // kernel memory.
+    let iovecs_owned: alloc::vec::Vec<[u64; 2]> = unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
+        core::slice::from_raw_parts(iov_ptr as *const [u64; 2], iovcnt as usize).to_vec()
     };
     let mut total = 0i64;
-    for iov in iovecs {
+    for iov in &iovecs_owned {
         let base = iov[0];
         let len  = iov[1] as usize;
         if len == 0 { continue; }
@@ -7330,12 +7746,13 @@ fn sys_pwritev(fd: u64, iov_ptr: u64, iovcnt: u64, offset: i64) -> i64 {
     let sk = crate::syscall::sys_lseek(fd as usize, offset, 0 /*SEEK_SET*/);
     if sk < 0 { return sk; }
     // SAFETY: iov_ptr range-validated above; iov_base/iov_len reach fd_write
-    // via the vfs which handles short writes.
-    let iovecs = unsafe {
-        core::slice::from_raw_parts(iov_ptr as *const [u64; 2], iovcnt as usize)
+    // via the vfs which handles short writes.  SMAP-bracketed copy.
+    let iovecs_owned: alloc::vec::Vec<[u64; 2]> = unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
+        core::slice::from_raw_parts(iov_ptr as *const [u64; 2], iovcnt as usize).to_vec()
     };
     let mut total = 0i64;
-    for iov in iovecs {
+    for iov in &iovecs_owned {
         let base = iov[0];
         let len  = iov[1] as usize;
         if len == 0 { continue; }

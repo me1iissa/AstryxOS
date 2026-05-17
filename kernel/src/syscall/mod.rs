@@ -79,35 +79,92 @@ pub(crate) fn validate_user_ptr(ptr: u64, len: usize) -> bool {
     }
 }
 
-/// Validate and create a slice from a user pointer. Returns `None` on failure.
+/// Snapshot a user buffer into a kernel-resident `Vec<u8>` under one
+/// SMAP bracket.
+///
+/// This is the **preferred** helper for any caller that intends to read
+/// every byte of a user buffer — it eliminates the footgun shape of
+/// returning a borrowed `&[u8]` whose backing memory is still a user
+/// page (which faults under SMAP, per Intel SDM Vol. 3A §4.6, once the
+/// caller's `UserGuard` scope ends).
+///
+/// On invalid pointer / overflow returns `None` (caller should surface
+/// EFAULT to the user).  On `len == 0` returns `Some(empty)`.
+///
+/// # Safety
+///
+/// Caller must ensure no concurrent kernel thread is writing to the
+/// same user page during the snapshot — the snapshot is non-atomic.
 #[inline]
-pub(crate) unsafe fn user_slice<'a>(ptr: u64, len: usize) -> Option<&'a [u8]> {
+pub(crate) unsafe fn user_slice_snapshot(ptr: u64, len: usize) -> Option<alloc::vec::Vec<u8>> {
+    if len == 0 { return Some(alloc::vec::Vec::new()); }
+    if !validate_user_ptr(ptr, len) { return None; }
+    let buf: alloc::vec::Vec<u8> = {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
+        core::slice::from_raw_parts(ptr as *const u8, len).to_vec()
+    };
+    Some(buf)
+}
+
+/// Validate and create a *borrowed* slice over user memory.
+///
+/// **Footgun warning**: the returned `&[u8]` borrows directly from a
+/// user page.  This function brackets the *materialisation* with
+/// STAC/CLAC, but the bracket drops on return — any caller that
+/// reads from the returned slice afterwards needs its **own**
+/// `UserGuard` scope wrapping those reads, or the access will fault
+/// under SMAP (Intel SDM Vol. 3A §4.6).  Prefer
+/// [`user_slice_snapshot`] when the caller will hold the data past
+/// a single tight bracket.
+///
+/// # Safety
+///
+/// In addition to the SMAP discipline above, the caller assumes
+/// responsibility for ensuring the underlying user memory remains
+/// mapped and unmodified for the slice's borrow lifetime (TOCTOU).
+#[inline]
+pub(crate) unsafe fn user_slice_unbracketed<'a>(ptr: u64, len: usize) -> Option<&'a [u8]> {
     if len == 0 { return Some(&[]); }
     if !validate_user_ptr(ptr, len) { return None; }
+    let _g = crate::arch::x86_64::smap::UserGuard::new();
     Some(core::slice::from_raw_parts(ptr as *const u8, len))
 }
 
-/// Validate and create a mutable slice from a user pointer.
+/// Mutable counterpart to [`user_slice_unbracketed`] — same footgun
+/// warning applies.  The caller MUST wrap any writes through the
+/// returned `&mut [u8]` in a `UserGuard` scope (or use a bracketed
+/// copy helper).  Prefer copy-out-then-copy-in patterns when the
+/// write set is bounded.
 #[inline]
-pub(crate) unsafe fn user_slice_mut<'a>(ptr: u64, len: usize) -> Option<&'a mut [u8]> {
+pub(crate) unsafe fn user_slice_mut_unbracketed<'a>(ptr: u64, len: usize) -> Option<&'a mut [u8]> {
     if len == 0 { return Some(&mut []); }
     if !validate_user_ptr(ptr, len) { return None; }
+    let _g = crate::arch::x86_64::smap::UserGuard::new();
     Some(core::slice::from_raw_parts_mut(ptr as *mut u8, len))
 }
 
 /// Read a u32 from a validated user address. Returns None on bad address.
+///
+/// STAC/CLAC bracketed (per Intel SDM Vol. 3A §4.6): when SMAP is
+/// enabled, the deref runs with EFLAGS.AC=1 and AC is cleared on
+/// return.  When SMAP is not enabled (older CPU / TCG without `+smap`)
+/// the bracket collapses to a single relaxed load + branch.
 #[inline]
 pub(crate) unsafe fn user_read_u32(addr: u64) -> Option<u32> {
     if !validate_user_ptr(addr, 4) { return None; }
     if addr % 4 != 0 { return None; } // alignment check
+    let _g = crate::arch::x86_64::smap::UserGuard::new();
     Some(core::ptr::read_volatile(addr as *const u32))
 }
 
 /// Read a u64 from a validated user address. Returns None on bad address.
+///
+/// SMAP-bracketed — see [`user_read_u32`].
 #[inline]
 pub(crate) unsafe fn user_read_u64(addr: u64) -> Option<u64> {
     if !validate_user_ptr(addr, 8) { return None; }
     if addr % 8 != 0 { return None; } // alignment check
+    let _g = crate::arch::x86_64::smap::UserGuard::new();
     Some(core::ptr::read_volatile(addr as *const u64))
 }
 
@@ -800,13 +857,22 @@ pub extern "C" fn syscall_int80_dispatch(
 ///
 /// Arguments: arg1 = path pointer, arg2 = path length.
 pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
-    let path = unsafe {
-        let slice = core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
+    // Copy the path into a kernel-resident String under a SMAP bracket so
+    // subsequent uses (logging, VFS lookup, shebang resolution) do not
+    // re-enter user space.  Anonymising the user borrow this way means we
+    // only need ONE UserGuard scope for the path read regardless of how
+    // far downstream the value travels.
+    let path_owned = {
+        let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+        let slice = unsafe {
+            core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize)
+        };
         match core::str::from_utf8(slice) {
-            Ok(s) => s,
+            Ok(s) => alloc::string::String::from(s),
             Err(_) => return -22, // EINVAL
         }
     };
+    let path = path_owned.as_str();
 
     crate::serial_println!("[SYSCALL] exec(\"{}\")", path);
 
@@ -1587,6 +1653,9 @@ pub(crate) fn sys_pty_master_ioctl(pty_n: u8, request: u64, arg_ptr: *mut u8) ->
     const TIOCGWINSZ: u64 = 0x5413;
     const TIOCSWINSZ: u64 = 0x5414;
 
+    // SMAP bracket — arg_ptr is a user-VA from the syscall arg.
+    // Bracketing once at the top covers all match arms.
+    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
     match request {
         TIOCGPTN => {
             if !arg_ptr.is_null() {
@@ -1655,6 +1724,8 @@ pub(crate) fn sys_fbdev_ioctl(request: u64, arg_ptr: *mut u8) -> i64 {
     let bpp:    u32 = 32;
     let line_length: u32 = pitch * (bpp / 8); // bytes per line
 
+    // SMAP bracket — arg_ptr is a user-VA for the syscall arg.
+    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
     match request {
         FBIOGET_VSCREENINFO => {
             // struct fb_var_screeninfo — 160 bytes
@@ -1737,6 +1808,8 @@ pub(crate) fn sys_input_ioctl(request: u64, arg_ptr: *mut u8) -> i64 {
     // We just check bits 0-23 (type + nr, ignore size).
     let req_lo = request & 0x0000_FFFF; // direction+type+nr stripped of size
 
+    // SMAP bracket — arg_ptr is a user-VA.
+    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
     match request {
         EVIOCGVERSION => {
             if !arg_ptr.is_null() {
@@ -1789,6 +1862,8 @@ pub(crate) fn sys_dsp_ioctl(request: u64, arg_ptr: *mut u8) -> i64 {
     // AFMT_S16_LE format tag
     const AFMT_S16_LE: i32 = 0x0000_0010;
 
+    // SMAP bracket — arg_ptr is a user-VA.
+    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
     match request {
         SNDCTL_DSP_SPEED => {
             // arg_ptr points to an int (sample rate); on success the driver
@@ -2366,7 +2441,10 @@ pub(crate) fn sys_getcwd(buf: *mut u8, size: usize) -> i64 {
         return -34; // ERANGE
     }
 
+    // SMAP-bracketed write to the user buffer.  The pointer was checked
+    // for null above; full range validation happens at the dispatch arm.
     unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
         core::ptr::copy_nonoverlapping(cwd.as_ptr(), buf, cwd.len());
         *buf.add(cwd.len()) = 0; // null-terminate
     }
@@ -2375,13 +2453,17 @@ pub(crate) fn sys_getcwd(buf: *mut u8, size: usize) -> i64 {
 }
 
 pub(crate) fn sys_chdir(path_ptr: *const u8, path_len: usize) -> i64 {
-    let path = unsafe {
-        let slice = core::slice::from_raw_parts(path_ptr, path_len);
+    // Owned copy under SMAP bracket — same pattern as sys_exec, so the
+    // downstream stat/PROCESS_TABLE work runs against a kernel String.
+    let path_owned = {
+        let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+        let slice = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
         match core::str::from_utf8(slice) {
-            Ok(s) => s,
+            Ok(s) => alloc::string::String::from(s),
             Err(_) => return -22,
         }
     };
+    let path = path_owned.as_str();
 
     // Verify the path exists and is a directory
     match crate::vfs::stat(path) {
@@ -2405,30 +2487,31 @@ pub(crate) fn sys_chdir(path_ptr: *const u8, path_len: usize) -> i64 {
 }
 
 pub(crate) fn sys_mkdir(path_ptr: *const u8, path_len: usize) -> i64 {
-    let path = unsafe {
-        let slice = core::slice::from_raw_parts(path_ptr, path_len);
+    // SMAP-bracketed copy — see sys_chdir for rationale.
+    let path_owned = {
+        let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+        let slice = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
         match core::str::from_utf8(slice) {
-            Ok(s) => s,
+            Ok(s) => alloc::string::String::from(s),
             Err(_) => return -22,
         }
     };
-
-    match crate::vfs::mkdir(path) {
+    match crate::vfs::mkdir(path_owned.as_str()) {
         Ok(()) => 0,
         Err(e) => crate::subsys::linux::errno::vfs_err(e),
     }
 }
 
 pub(crate) fn sys_rmdir(path_ptr: *const u8, path_len: usize) -> i64 {
-    let path = unsafe {
-        let slice = core::slice::from_raw_parts(path_ptr, path_len);
+    let path_owned = {
+        let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+        let slice = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
         match core::str::from_utf8(slice) {
-            Ok(s) => s,
+            Ok(s) => alloc::string::String::from(s),
             Err(_) => return -22,
         }
     };
-
-    match crate::vfs::remove(path) {
+    match crate::vfs::remove(path_owned.as_str()) {
         Ok(()) => 0,
         Err(e) => crate::subsys::linux::errno::vfs_err(e),
     }
@@ -2446,6 +2529,12 @@ pub(crate) fn sys_rmdir(path_ptr: *const u8, path_len: usize) -> i64 {
 const STAT_BUF_SIZE: usize = 64;
 
 pub(crate) fn fill_stat_buf(st: &crate::vfs::FileStat, buf: *mut u8) {
+    // SMAP bracket — the writes through `out` all hit user memory when
+    // `buf` is a user-VA (the common case from sys_stat / sys_fstat /
+    // sys_lstat).  Kernel-internal callers (test_runner) pass kernel
+    // buffers, for which SMAP is silent.  Bracketing here covers all
+    // sites that pass the buffer through fill_stat_buf.
+    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
     let out = unsafe { core::slice::from_raw_parts_mut(buf, STAT_BUF_SIZE) };
     // Zero everything first
     for b in out.iter_mut() {
@@ -2473,15 +2562,15 @@ pub(crate) fn fill_stat_buf(st: &crate::vfs::FileStat, buf: *mut u8) {
 }
 
 pub(crate) fn sys_stat(path_ptr: *const u8, path_len: usize, stat_buf: *mut u8) -> i64 {
-    let path = unsafe {
-        let slice = core::slice::from_raw_parts(path_ptr, path_len);
+    let path_owned = {
+        let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+        let slice = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
         match core::str::from_utf8(slice) {
-            Ok(s) => s,
+            Ok(s) => alloc::string::String::from(s),
             Err(_) => return -22,
         }
     };
-
-    match crate::vfs::stat(path) {
+    match crate::vfs::stat(path_owned.as_str()) {
         Ok(st) => {
             fill_stat_buf(&st, stat_buf);
             0
@@ -2753,6 +2842,7 @@ pub(crate) fn sys_pipe(fds_out: *mut u64) -> i64 {
 
     // Write [read_fd, write_fd] to user buffer
     unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
         *fds_out = ri as u64;
         *fds_out.add(1) = wi as u64;
     }
@@ -3100,6 +3190,8 @@ pub(crate) fn sys_uname(buf: *mut u8) -> i64 {
         b"x86_64",                      // machine
     ];
 
+    // SMAP bracket — `buf` is a user-VA for the syscall path.
+    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
     let out = unsafe { core::slice::from_raw_parts_mut(buf, TOTAL_LEN) };
     for b in out.iter_mut() {
         *b = 0;
@@ -3127,15 +3219,15 @@ pub(crate) fn sys_nanosleep(milliseconds: u64) -> i64 {
 }
 
 pub(crate) fn sys_unlink(path_ptr: *const u8, path_len: usize) -> i64 {
-    let path = unsafe {
-        let slice = core::slice::from_raw_parts(path_ptr, path_len);
+    let path_owned = {
+        let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+        let slice = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
         match core::str::from_utf8(slice) {
-            Ok(s) => s,
+            Ok(s) => alloc::string::String::from(s),
             Err(_) => return -22,
         }
     };
-
-    match crate::vfs::remove(path) {
+    match crate::vfs::remove(path_owned.as_str()) {
         Ok(()) => 0,
         Err(e) => crate::subsys::linux::errno::vfs_err(e),
     }
@@ -3235,7 +3327,10 @@ pub(crate) fn sys_sigreturn() -> i64 {
 
     let (sig_num, saved_mask, saved_rsp, saved_r15, saved_r14, saved_r13,
          saved_r12, saved_rbx, saved_rbp, saved_r11, saved_rcx, saved_rax);
+    // SMAP bracket — frame_base has already been range-validated by
+    // validate_user_ptr above so the UserGuard is safe to lift AC.
     unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
         sig_num   = (*frame_ptr).sig_num;
         saved_mask = (*frame_ptr).saved_mask;
         saved_rsp = (*frame_ptr).saved_rsp;
@@ -3348,6 +3443,12 @@ pub(crate) fn sys_getrandom(buf: *mut u8, count: usize, _flags: u32) -> i64 {
     #[cfg(feature = "firefox-test")]
     crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Getrandom, buf, count);
 
+    // SMAP bracket — every iteration below writes through `out` which
+    // backs the user buffer.  Held for the full fill so RDRAND and the
+    // xorshift fallback both run with AC=1.  CPUID / RDRAND themselves
+    // do not touch memory, so the AC region is purely the user write
+    // surface.
+    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
     let out = unsafe { core::slice::from_raw_parts_mut(buf, count) };
 
     // Detect RDRAND support via CPUID leaf 1, ECX bit 30.
