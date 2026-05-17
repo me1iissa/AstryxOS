@@ -9633,32 +9633,92 @@ fn test_pipe2_statfs() -> bool {
 }
 
 // ── Test 52: futex REQUEUE + WAIT_BITSET ─────────────────────────────────────
+//
+// Covers futex(2) ABI hygiene fixes from the post-H1-SMAP follow-up bundle:
+//   * FUTEX_REQUEUE  op=3 (was incorrectly dispatched as op=4 before the fix)
+//   * FUTEX_CMP_REQUEUE op=4 with correct val3 comparison via arg6
+//   * FUTEX_WAKE_OP op=5 returns ENOSYS (stub, not implemented)
+//
+// References: futex(2) Linux man-page; Linux UAPI <linux/futex.h>.
 
 fn test_futex_requeue() -> bool {
-    test_header!("futex — REQUEUE + WAIT_BITSET");
+    test_header!("futex — REQUEUE + CMP_REQUEUE + WAKE_OP stub + WAIT_BITSET");
 
-    // Verify FUTEX_REQUEUE (4) doesn't crash: wake 0 waiters from uaddr,
-    // requeue INT32_MAX to uaddr2 (both with value 0 — no waiters to move).
+    // ── FUTEX_REQUEUE (op=3): wake 0 waiters, requeue 0 to uaddr2 ──────────
+    // With no waiters, woken count = 0; return value must be 0 (not negative).
+    // Per futex(2): return value is the number of waiters woken (not requeued).
     let uaddr:  u32 = 0;
     let uaddr2: u32 = 0;
     let r = unsafe {
-        // sys_futex(uaddr_ptr, FUTEX_REQUEUE=4, val=0, val2=0, uaddr2_ptr)
+        // futex(uaddr, FUTEX_REQUEUE=3, val=0, val2=0, uaddr2)
         crate::syscall::dispatch_linux_kernel(
             202, // futex
             &uaddr  as *const u32 as u64,
-            4,   // FUTEX_REQUEUE
-            0,   // val (wake count)
-            0,   // val2 (requeue count) passed as timeout_ptr slot
+            3,   // FUTEX_REQUEUE — op number per futex(2)
+            0,   // val (max threads to wake)
+            0,   // val2 (max threads to requeue) passed in timeout_ptr slot
             &uaddr2 as *const u32 as u64,
             0,
         )
     };
-    // With no waiters, returns 0 (woke 0 threads)
     if r < 0 {
-        test_fail!("futex_requeue", "FUTEX_REQUEUE returned {}", r);
+        test_fail!("futex_requeue", "FUTEX_REQUEUE op=3 returned {} (expected 0)", r);
         return false;
     }
-    test_println!("  FUTEX_REQUEUE (no waiters) → {} ✓", r);
+    test_println!("  FUTEX_REQUEUE op=3 (no waiters) → {} ✓", r);
+
+    // ── FUTEX_CMP_REQUEUE (op=4): *uaddr==val3 check ───────────────────────
+    // With *uaddr=0 and val3=0 the comparison passes; no waiters → woken=0.
+    let uaddr_cmp: u32 = 0;
+    let r = unsafe {
+        // futex(uaddr, FUTEX_CMP_REQUEUE=4, val=0, val2=0, uaddr2, val3=0)
+        crate::syscall::dispatch_linux_kernel(
+            202,
+            &uaddr_cmp as *const u32 as u64,
+            4,   // FUTEX_CMP_REQUEUE
+            0,   // val (wake count)
+            0,   // val2 (requeue count) in timeout_ptr slot
+            &uaddr2 as *const u32 as u64,
+            0,   // val3 — must match *uaddr (0) to proceed
+        )
+    };
+    if r < 0 {
+        test_fail!("futex_cmp_requeue", "FUTEX_CMP_REQUEUE op=4 returned {} (expected 0)", r);
+        return false;
+    }
+    test_println!("  FUTEX_CMP_REQUEUE op=4 (*uaddr==val3, no waiters) → {} ✓", r);
+
+    // FUTEX_CMP_REQUEUE with val3 mismatch must return EAGAIN (-11).
+    let uaddr_cmp2: u32 = 7; // *uaddr = 7
+    let r = unsafe {
+        crate::syscall::dispatch_linux_kernel(
+            202,
+            &uaddr_cmp2 as *const u32 as u64,
+            4,   // FUTEX_CMP_REQUEUE
+            0,
+            0,
+            &uaddr2 as *const u32 as u64,
+            99,  // val3 = 99 ≠ *uaddr (7) → EAGAIN
+        )
+    };
+    if r != -11 {
+        test_fail!("futex_cmp_requeue_mismatch",
+            "FUTEX_CMP_REQUEUE val3 mismatch returned {} (expected -11 EAGAIN)", r);
+        return false;
+    }
+    test_println!("  FUTEX_CMP_REQUEUE op=4 (*uaddr≠val3) → {} (EAGAIN) ✓", r);
+
+    // ── FUTEX_WAKE_OP (op=5): stub must return ENOSYS (-38) ────────────────
+    let r = unsafe {
+        crate::syscall::dispatch_linux_kernel(202, &uaddr as *const u32 as u64,
+            5, 0, 0, &uaddr2 as *const u32 as u64, 0)
+    };
+    if r != -38 {
+        test_fail!("futex_wake_op_stub",
+            "FUTEX_WAKE_OP op=5 returned {} (expected -38 ENOSYS)", r);
+        return false;
+    }
+    test_println!("  FUTEX_WAKE_OP op=5 → {} (ENOSYS stub) ✓", r);
 
     // Verify FUTEX_WAIT_BITSET (9) with a timeout of 1ns returns ETIMEDOUT (-110).
     // We use a stack value == 0 and check val == *uaddr (0 == 0) so it waits.
