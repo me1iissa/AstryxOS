@@ -1071,7 +1071,7 @@ pub extern "C" fn ap_rust_entry() -> ! {
     // DR0 write-watchpoint before this AP came online, apply it now.
     // Per Intel SDM Vol. 3B §17.2.4, DR0–DR3 are per-CPU and must be
     // programmed on every CPU that should participate in the trap.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "w215-diag")]
     crate::arch::x86_64::debug_reg::apply_pending_to_this_cpu();
 
     // Enable interrupts and enter scheduling loop.

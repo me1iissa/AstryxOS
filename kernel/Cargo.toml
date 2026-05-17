@@ -8,6 +8,19 @@ default = []
 test-mode = []
 gui-test = []
 firefox-test = []
+# W215 Arm-1 diagnostic infrastructure: the page-cache CRC walker
+# (`mm/w215_crc.rs`, ~2 MiB BSS shadow table), the cross-CPU DR0
+# write-watchpoint plumbing (`arch/x86_64/debug_reg.rs`, IPI vector 0xF1),
+# and the matching `record_insert`/`record_evict` hooks in
+# `mm/cache.rs`.  Opt-in because the shadow table alone adds ~2 MiB of
+# BSS that the bootloader-side `kernel_size = file_size` accounting does
+# not reserve (the flat-binary `kernel.bin` excludes BSS), exposing a
+# latent PMM-vs-BSS overlap that can corrupt kernel page tables during
+# the firefox-test page-cache prepopulate burst.  Gating the diagnostic
+# behind its own feature keeps the demo path's BSS small while
+# preserving on-demand investigative access.  Implies `firefox-test`
+# because the diagnostic shares the firefox-test cache instrumentation.
+w215-diag = ["firefox-test"]
 # W133: opt-out for cross-CPU TLB shootdown.  Default builds run the full
 # shootdown protocol (IPI vector 0xF0, per-CPU active-CR3 mask).  Enable
 # this feature only for bisect/baseline runs where you want to compare
