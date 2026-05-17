@@ -614,3 +614,97 @@ pub fn per_slot_fires() -> [u32; N_DR_SLOTS] {
 pub fn is_armed() -> bool {
     ARMED[0].load(Ordering::Acquire)
 }
+
+/// Outcome of a `kdb arm-phys` request.  Reported back to the kdb caller
+/// verbatim as a small JSON object.
+#[derive(Copy, Clone, Debug)]
+pub enum ArmPhysResult {
+    /// Successfully armed DR{slot} on `PHYS_OFF + phys`.
+    Armed(u8),
+    /// `phys` is not page-aligned (4 KiB).
+    NotAligned,
+    /// `phys` lies above the highest installed RAM frame.  We refuse to
+    /// program a DR on a linear address that the bootloader's PHYS_OFF
+    /// identity map does not cover — the watch would never fire and would
+    /// instead consume a slot indefinitely.
+    OutOfRange,
+    /// All four DR slots are busy.  Caller should wait for an existing
+    /// watch to fire (one-shot disarm releases the slot) and retry.
+    PoolExhausted,
+}
+
+/// Manually arm a write-only watchpoint on `PHYS_OFF + phys` from a kdb
+/// command, bypassing the `cache::insert` pre-arm key filter.  Useful when
+/// a corrupted phys has already been observed by the CRC walker but the
+/// pre-arm path missed it (different cache key, or pool was full at insert
+/// time).
+///
+/// `len` is fixed at 8 bytes (a single qword starting at the supplied
+/// phys), per Intel SDM Vol. 3B §17.2.4 Table 17-2 — wider windows cost
+/// extra slots and the diagnostic only needs to catch the first write.
+///
+/// Slot selection: prefer DR1/DR2/DR3 (the pre-insert pool) so a manual
+/// arm doesn't clobber the CRC walker's post-hoc slot (DR0).  Fall back
+/// to DR0 only if all three pre-insert slots are busy.
+///
+/// Cross-CPU sync is the same lazy-gen protocol used by
+/// `arm_write_watchpoint` / `arm_preinsert_watchpoint`: bump
+/// `SYNC_GENERATION` and program our own DRs; peer CPUs pick up the
+/// change in their next `apply_pending_if_stale()` (≤ one timer tick).
+pub fn arm_phys_watchpoint(phys: u64) -> ArmPhysResult {
+    // Validate page alignment.  An unaligned phys would cause the watch
+    // to straddle two physical frames in the PHYS_OFF map, which is not
+    // what the diagnostic asks for.
+    if phys & 0xFFF != 0 {
+        return ArmPhysResult::NotAligned;
+    }
+    // Validate that the phys falls inside the installed RAM window.
+    // `pmm::stats().0` is the total number of physical frames the PMM
+    // knows about; the bootloader's PHYS_OFF identity map covers the
+    // same window.  Linear addresses above this would fault on access.
+    let (total_pages, _) = crate::mm::pmm::stats();
+    let ram_top = total_pages.saturating_mul(crate::mm::pmm::PAGE_SIZE as u64);
+    if phys >= ram_top {
+        return ArmPhysResult::OutOfRange;
+    }
+
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    let linear = PHYS_OFF.wrapping_add(phys);
+    let len: u8 = 8;
+    // inode/offset are unknown at the manual-arm site; the [W215/DR-WATCH-FIRE]
+    // line still tags the slot/phys/RIP, which is what the caller actually needs.
+    let inode: u64 = 0;
+    let file_offset: u64 = 0;
+
+    // Try DR1, DR2, DR3 first (manual arm should not steal DR0 from the
+    // CRC walker if avoidable), then fall back to DR0.
+    let mut armed_slot: Option<u8> = None;
+    for slot in [1usize, 2, 3, 0] {
+        if try_arm_slot(slot, linear, len, phys, inode, file_offset) {
+            armed_slot = Some(slot as u8);
+            break;
+        }
+    }
+    let Some(slot) = armed_slot else {
+        return ArmPhysResult::PoolExhausted;
+    };
+
+    ARM_COUNT.fetch_add(1, Ordering::Relaxed);
+    crate::serial_println!(
+        "[W215/DR-ARM] slot={} linear={:#x} phys={:#x} inode={} offset={:#x} kind=manual",
+        slot, linear, phys, inode, file_offset,
+    );
+    // Bump publish gen so peer CPUs pick up the new arm on their next
+    // timer-ISR `apply_pending_if_stale` call.  Release pairs with the
+    // Acquire in `apply_pending_if_stale`.
+    SYNC_GENERATION.fetch_add(1, Ordering::Release);
+    program_local_drs();
+    let cpu = super::apic::cpu_index();
+    if cpu < super::apic::MAX_CPUS {
+        LOCAL_SYNC_GENERATION[cpu].store(
+            SYNC_GENERATION.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+    }
+    ArmPhysResult::Armed(slot)
+}
