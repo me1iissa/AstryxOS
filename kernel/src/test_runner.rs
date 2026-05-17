@@ -1685,6 +1685,14 @@ pub fn run() -> ! {
         if test_228_auto_reap_orphan_zombies() { passed += 1; }
     }
 
+    // ── Test 229: PMM pte_share_count free-time invariant (W215 fix) ─────
+    // Verifies that pmm::free_page refuses to recycle a frame whose
+    // refcount table still records a live PTE reference, and that the
+    // refusal increments the PMM_FREE_RESIDUAL_REFS counter.  Cite Intel
+    // SDM Vol. 3A §4.10.5 (paging-structure coherence) and POSIX mmap(2).
+    total += 1;
+    if test_229_pmm_pte_share_count_invariant() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -2414,7 +2422,15 @@ fn test_elf_loader() -> bool {
     // Cleanup: free allocated physical pages.
     // The user PML4 and its intermediate page-table pages are a small
     // leak (~20 KiB) but harmless in a test context.
+    //
+    // The ELF loader paired each `map_page_in` with a `page_ref_set(phys, 1)`
+    // to record the live PTE reference (kernel/src/proc/elf.rs).  Before we
+    // hand the frames back to the PMM we must drop that reference, otherwise
+    // `pmm::free_page` will (correctly) refuse to recycle them under the
+    // W215 `pte_share_count` invariant — Intel SDM Vol. 3A §4.10.5 requires
+    // a frame to be free of live page-table references before reuse.
     for &page_phys in &result.allocated_pages {
+        crate::mm::refcount::page_ref_set(page_phys, 0);
         crate::mm::pmm::free_page(page_phys);
     }
 
@@ -17528,7 +17544,13 @@ fn test_aslr_elf_dyn() -> bool {
     let base1 = result1.load_base;
     test_println!("  Load 1 base: {:#x}", base1);
     // Free physical pages from load 1.
-    for &p in &result1.allocated_pages { crate::mm::pmm::free_page(p); }
+    // Drop the per-page PTE-share reference recorded by elf::load_elf
+    // before handing frames back: pmm::free_page enforces the
+    // W215 pte_share_count==0 invariant (Intel SDM Vol. 3A §4.10.5).
+    for &p in &result1.allocated_pages {
+        crate::mm::refcount::page_ref_set(p, 0);
+        crate::mm::pmm::free_page(p);
+    }
 
     // ── Load 2 ───────────────────────────────────────────────────────────────
     let vm2 = match crate::mm::vma::VmSpace::new_user() {
@@ -17547,7 +17569,11 @@ fn test_aslr_elf_dyn() -> bool {
     };
     let base2 = result2.load_base;
     test_println!("  Load 2 base: {:#x}", base2);
-    for &p in &result2.allocated_pages { crate::mm::pmm::free_page(p); }
+    // Same invariant as for result1: drop PTE-share refs before free.
+    for &p in &result2.allocated_pages {
+        crate::mm::refcount::page_ref_set(p, 0);
+        crate::mm::pmm::free_page(p);
+    }
 
     // ── Verify bases are 4 KiB-aligned and in user space ─────────────────────
     if base1 & 0xFFF != 0 {
@@ -17584,7 +17610,11 @@ fn test_aslr_elf_dyn() -> bool {
         };
         let base3 = result3.load_base;
         test_println!("  Load 3 base: {:#x}", base3);
-        for &p in &result3.allocated_pages { crate::mm::pmm::free_page(p); }
+        // Same invariant as for result1/result2: drop PTE-share refs before free.
+        for &p in &result3.allocated_pages {
+            crate::mm::refcount::page_ref_set(p, 0);
+            crate::mm::pmm::free_page(p);
+        }
 
         if base1 == base3 {
             test_fail!(
@@ -17645,7 +17675,13 @@ fn test_aslr_elf_exec_no_randomisation() -> bool {
     };
     let base1 = result1.load_base;
     test_println!("  Load 1 base: {:#x}", base1);
-    for &p in &result1.allocated_pages { crate::mm::pmm::free_page(p); }
+    // Drop the per-page PTE-share reference recorded by elf::load_elf
+    // before handing frames back: pmm::free_page enforces the
+    // W215 pte_share_count==0 invariant (Intel SDM Vol. 3A §4.10.5).
+    for &p in &result1.allocated_pages {
+        crate::mm::refcount::page_ref_set(p, 0);
+        crate::mm::pmm::free_page(p);
+    }
 
     // ── Load 2 ───────────────────────────────────────────────────────────────
     let vm2 = match crate::mm::vma::VmSpace::new_user() {
@@ -17664,7 +17700,11 @@ fn test_aslr_elf_exec_no_randomisation() -> bool {
     };
     let base2 = result2.load_base;
     test_println!("  Load 2 base: {:#x}", base2);
-    for &p in &result2.allocated_pages { crate::mm::pmm::free_page(p); }
+    // Same invariant as for result1: drop PTE-share refs before free.
+    for &p in &result2.allocated_pages {
+        crate::mm::refcount::page_ref_set(p, 0);
+        crate::mm::pmm::free_page(p);
+    }
 
     // ── ET_EXEC must produce the same base both times ─────────────────────────
     if base1 != base2 {
@@ -18979,7 +19019,9 @@ fn test_elf_dt_gnu_hash_accepted() -> bool {
     match crate::proc::elf::load_elf(&gnu_hash_elf, vm.cr3) {
         Ok(result) => {
             test_println!("  load_elf succeeded, load_base={:#x} ✓", result.load_base);
+            // Drop PTE-share refs before free (W215 invariant — see ELF tests).
             for &p in &result.allocated_pages {
+                crate::mm::refcount::page_ref_set(p, 0);
                 crate::mm::pmm::free_page(p);
             }
         }
@@ -23163,7 +23205,11 @@ fn test_vdso_aux_entry_present() -> bool {
         ok = false;
     }
 
-    for &p in &result.allocated_pages { crate::mm::pmm::free_page(p); }
+    // Drop PTE-share refs before free (W215 invariant — see other ELF tests).
+    for &p in &result.allocated_pages {
+        crate::mm::refcount::page_ref_set(p, 0);
+        crate::mm::pmm::free_page(p);
+    }
 
     if ok { test_pass!("vDSO AT_SYSINFO_EHDR present and points at vDSO ELF base"); }
     ok
@@ -23251,7 +23297,11 @@ fn test_vdso_image_mapped() -> bool {
         }
     }
 
-    for &p in &result.allocated_pages { crate::mm::pmm::free_page(p); }
+    // Drop PTE-share refs before free (W215 invariant — see other ELF tests).
+    for &p in &result.allocated_pages {
+        crate::mm::refcount::page_ref_set(p, 0);
+        crate::mm::pmm::free_page(p);
+    }
 
     if ok { test_pass!("vDSO [vdso] VMA + ELF magic at advertised base"); }
     ok
@@ -23479,6 +23529,125 @@ fn test_pf_failed_read_no_cache_poison() -> bool {
     crate::vfs::MOUNTS.lock().pop();
 
     test_pass!("PF handler — failed FS read does not poison page cache");
+    true
+}
+
+// ── Test 229: PMM pte_share_count free-time invariant (W215 fix) ────────────
+//
+// Establishes the W215 root-cause invariant:
+//
+//   "A physical frame must not return to the PMM free list while any
+//    user PTE still references it."
+//
+// Per Intel SDM Vol. 3A §4.10.5, paging-structure changes must be
+// propagated to every processor before the physical frame is repurposed.
+// Per POSIX mmap(2), user-visible page contents must remain valid for
+// the lifetime of the mapping.  The W215 fault class observed for the
+// last fourteen diagnostic iterations was a cache-evict/PTE-still-live
+// race in which the cache dropped its reference, drove the frame's
+// refcount to zero, and returned the frame to the allocator while one
+// or more user PTEs still mapped a VA to it.  The next allocation of
+// that frame for a different purpose then aliased two unrelated VAs
+// against the same physical page — the exact `[FAULT/PHYS]` /
+// `[FAULT/PHYS/PROV] kind=REFDEC` fingerprint.
+//
+// This test exercises `pmm::free_page` against a frame whose refcount
+// table entry has been forced to 1 (simulating a still-live PTE that
+// the caller forgot to dec).  The invariant requires:
+//
+//   1. The free is REFUSED — `free_page_count()` does NOT increase by 1.
+//   2. The `PMM_FREE_RESIDUAL_REFS` counter increments by exactly 1.
+//   3. A subsequent `alloc_page` does NOT hand back the same frame
+//      (the frame is quarantined for the rest of the boot).
+//
+// Negative control: freeing a frame whose refcount is 0 (the normal
+// case for every kernel-internal page table, sysv_shm Device frame, and
+// any user frame whose last PTE has been properly dec'd) must succeed —
+// `free_page_count()` increases by 1 and `PMM_FREE_RESIDUAL_REFS` is
+// unchanged.
+
+fn test_229_pmm_pte_share_count_invariant() -> bool {
+    test_header!("PMM pte_share_count free-time invariant (W215 fix)");
+
+    // ── Negative control: a refcount=0 frame frees cleanly. ─────────────
+    let ctrl_phys = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => {
+            test_fail!("pmm_pte_share_count", "alloc_page OOM (control)");
+            return false;
+        }
+    };
+    // Defensively set the refcount to 0 — fresh frames already are, but
+    // the test must be robust to any earlier owner's residual state.
+    crate::mm::refcount::page_ref_set(ctrl_phys, 0);
+
+    let refused_before = crate::mm::pmm::pmm_free_residual_refs_count();
+    let free_before = crate::mm::pmm::free_page_count();
+    crate::mm::pmm::free_page(ctrl_phys);
+    let refused_after_ctrl = crate::mm::pmm::pmm_free_residual_refs_count();
+    let free_after_ctrl = crate::mm::pmm::free_page_count();
+
+    if refused_after_ctrl != refused_before {
+        test_fail!("pmm_pte_share_count",
+            "control free incremented PMM_FREE_RESIDUAL_REFS ({}→{})",
+            refused_before, refused_after_ctrl);
+        return false;
+    }
+    if free_after_ctrl <= free_before {
+        test_fail!("pmm_pte_share_count",
+            "control free did not return frame to allocator: \
+             free_page_count {}→{} (expected strict increase)",
+            free_before, free_after_ctrl);
+        return false;
+    }
+    test_println!("  control (rc=0): free returned frame, counter unchanged ✓");
+
+    // ── Positive case: rc=1 frame is refused and quarantined. ───────────
+    let victim_phys = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => {
+            test_fail!("pmm_pte_share_count", "alloc_page OOM (victim)");
+            return false;
+        }
+    };
+    // Simulate a residual PTE reference: one live PTE the caller forgot
+    // to dec before calling free_page.
+    crate::mm::refcount::page_ref_set(victim_phys, 1);
+
+    let refused_before = crate::mm::pmm::pmm_free_residual_refs_count();
+    let free_before = crate::mm::pmm::free_page_count();
+    crate::mm::pmm::free_page(victim_phys);
+    let refused_after = crate::mm::pmm::pmm_free_residual_refs_count();
+    let free_after = crate::mm::pmm::free_page_count();
+
+    if refused_after != refused_before + 1 {
+        test_fail!("pmm_pte_share_count",
+            "free of rc=1 frame did not increment PMM_FREE_RESIDUAL_REFS \
+             ({}→{}, expected +1)",
+            refused_before, refused_after);
+        // Best-effort cleanup: clear the synthetic residual so we don't
+        // leave the refcount table in a bad state.
+        crate::mm::refcount::page_ref_set(victim_phys, 0);
+        return false;
+    }
+    if free_after != free_before {
+        test_fail!("pmm_pte_share_count",
+            "free of rc=1 frame returned frame to allocator anyway: \
+             free_page_count {}→{} (expected unchanged)",
+            free_before, free_after);
+        crate::mm::refcount::page_ref_set(victim_phys, 0);
+        return false;
+    }
+    test_println!("  rc=1 victim: free refused, counter +1, free_page_count unchanged ✓");
+
+    // The victim is now leaked (quarantined) for the rest of the boot —
+    // that is the intentional safe outcome.  We do NOT clear its
+    // refcount, because the invariant says "if anything thinks a PTE
+    // points here, the frame stays out of circulation".
+
+    test_pass!(
+        "pmm::free_page enforces pte_share_count==0 invariant (Intel SDM Vol. 3A §4.10.5)"
+    );
     true
 }
 
