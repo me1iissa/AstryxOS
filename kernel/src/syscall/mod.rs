@@ -3564,6 +3564,20 @@ pub use crate::subsys::linux::syscall::{
 // only used from test_runner.rs and are safe to call from kernel context
 // (current_pid() returns the test process PID, which is always valid).
 
+// ── Kernel-dispatch bypass machinery (test-mode / firefox-test only) ─────────
+//
+// Gated on `test-mode` and `firefox-test` features.  In production builds
+// these items are omitted entirely; `user_ptr_check_bypassed()` is provided
+// as a constant-false stub so all call sites compile without modification and
+// the compiler eliminates the dead `if !user_ptr_check_bypassed()` branches
+// through constant folding.
+//
+// The preemption hazard this gating prevents: a test thread holding
+// KernelDispatchGuard that is preempted (via schedule()) leaves the per-CPU
+// counter > 0 while the CPU runs a different task.  Any concurrent user-mode
+// syscall arriving on that CPU would then bypass validate_user_ptr.  Limiting
+// the machinery to test builds eliminates this exposure in production images.
+
 /// Per-CPU bypass counter for the user-mode pointer-range checks at the
 /// Linux dispatch arms.  In-kernel test code that drives `dispatch_linux`
 /// with kernel-VA buffers (e.g. `b"/etc/passwd\0".as_ptr()`) must wrap the
@@ -3575,6 +3589,9 @@ pub use crate::subsys::linux::syscall::{
 /// guard, Drop still decrements.  Real user-mode SYSCALL traffic never
 /// passes through this counter — the asm `syscall_entry` path leaves the
 /// counter at zero, so the dispatch arms enforce validation as designed.
+///
+/// Only present in `test-mode` and `firefox-test` builds.
+#[cfg(any(feature = "test-mode", feature = "firefox-test"))]
 pub static KERNEL_DISPATCH_BYPASS: [core::sync::atomic::AtomicU64; MAX_CPUS] = {
     const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     [Z; MAX_CPUS]
@@ -3582,20 +3599,35 @@ pub static KERNEL_DISPATCH_BYPASS: [core::sync::atomic::AtomicU64; MAX_CPUS] = {
 
 /// Returns `true` if the current CPU is inside a `KernelDispatchGuard`
 /// scope and the per-arm user-pointer validation should be skipped.
+///
+/// In production builds (neither `test-mode` nor `firefox-test`) this always
+/// returns `false` — the bypass machinery does not exist and validation is
+/// never skipped.  The compiler eliminates the surrounding dead branches.
 #[inline]
 pub fn user_ptr_check_bypassed() -> bool {
-    let cpu = cpu_index();
-    KERNEL_DISPATCH_BYPASS[cpu].load(core::sync::atomic::Ordering::Acquire) > 0
+    #[cfg(any(feature = "test-mode", feature = "firefox-test"))]
+    {
+        let cpu = cpu_index();
+        KERNEL_DISPATCH_BYPASS[cpu].load(core::sync::atomic::Ordering::Acquire) > 0
+    }
+    #[cfg(not(any(feature = "test-mode", feature = "firefox-test")))]
+    {
+        false
+    }
 }
 
 /// RAII guard that enables [`user_ptr_check_bypassed`] for the current CPU
 /// for its lifetime.  Used by in-kernel test wrappers (e.g.
 /// [`dispatch_linux_kernel`]) that legitimately pass kernel pointers to
 /// the Linux dispatcher.
+///
+/// Only present in `test-mode` and `firefox-test` builds.
+#[cfg(any(feature = "test-mode", feature = "firefox-test"))]
 pub struct KernelDispatchGuard {
     cpu: usize,
 }
 
+#[cfg(any(feature = "test-mode", feature = "firefox-test"))]
 impl KernelDispatchGuard {
     #[inline]
     pub fn new() -> Self {
@@ -3606,6 +3638,7 @@ impl KernelDispatchGuard {
     }
 }
 
+#[cfg(any(feature = "test-mode", feature = "firefox-test"))]
 impl Drop for KernelDispatchGuard {
     #[inline]
     fn drop(&mut self) {
@@ -3621,6 +3654,9 @@ impl Drop for KernelDispatchGuard {
 ///
 /// Real user-mode SYSCALL traffic must NOT use this — it would defeat
 /// the CWE-823 validation gates.
+///
+/// Only present in `test-mode` and `firefox-test` builds.
+#[cfg(any(feature = "test-mode", feature = "firefox-test"))]
 pub fn dispatch_linux_kernel(num: u64, arg1: u64, arg2: u64, arg3: u64,
                               arg4: u64, arg5: u64, arg6: u64) -> i64 {
     let _g = KernelDispatchGuard::new();
