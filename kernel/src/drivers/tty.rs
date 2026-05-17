@@ -384,13 +384,20 @@ impl Tty {
             return 0;
         }
 
+        // SMAP bracket — `buf` is typically a user-VA slice forwarded
+        // from sys_read_linux (stdin path).  Copies through `buf` run
+        // with AC=1; the surrounding cooked_buf / input_buf mutation
+        // is kernel-only and lives outside the bracket.
         if self.termios.c_lflag & ICANON != 0 {
             // Canonical mode: wait for a complete line
             if !self.input_ready {
                 return 0;
             }
             let avail = self.cooked_buf.len().min(n);
-            buf[..avail].copy_from_slice(&self.cooked_buf[..avail]);
+            unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                buf[..avail].copy_from_slice(&self.cooked_buf[..avail]);
+            }
             self.cooked_buf.drain(..avail);
             if self.cooked_buf.is_empty() {
                 self.input_ready = false;
@@ -404,7 +411,10 @@ impl Tty {
                 return 0;
             }
             let to_read = available.min(n);
-            buf[..to_read].copy_from_slice(&self.input_buf[..to_read]);
+            unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                buf[..to_read].copy_from_slice(&self.input_buf[..to_read]);
+            }
             self.input_buf.drain(..to_read);
             to_read
         }
@@ -417,20 +427,34 @@ impl Tty {
         let opost = self.termios.c_oflag & OPOST != 0;
         let onlcr = self.termios.c_oflag & ONLCR != 0;
 
-        if opost && onlcr {
-            // Convert \n to \r\n
-            for &b in data {
-                if b == b'\n' {
-                    write_console_byte(b'\r');
-                    write_console_byte(b'\n');
-                } else {
+        // SMAP bracket — `data` is typically a user-VA slice forwarded
+        // from sys_write_linux (stdout/stderr fallback).  Snapshot into
+        // a kernel stack buffer in bounded chunks so the console-write
+        // loop runs from kernel memory.  Per Intel SDM Vol. 3A §4.6.
+        let mut chunk = [0u8; 256];
+        let mut off = 0usize;
+        while off < data.len() {
+            let take = (data.len() - off).min(chunk.len());
+            unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                core::ptr::copy_nonoverlapping(
+                    data.as_ptr().add(off), chunk.as_mut_ptr(), take);
+            }
+            if opost && onlcr {
+                for &b in &chunk[..take] {
+                    if b == b'\n' {
+                        write_console_byte(b'\r');
+                        write_console_byte(b'\n');
+                    } else {
+                        write_console_byte(b);
+                    }
+                }
+            } else {
+                for &b in &chunk[..take] {
                     write_console_byte(b);
                 }
             }
-        } else {
-            for &b in data {
-                write_console_byte(b);
-            }
+            off += take;
         }
     }
 

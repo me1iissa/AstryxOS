@@ -1660,6 +1660,17 @@ pub fn close(pid: crate::proc::Pid, fd_num: usize) -> VfsResult<()> {
 
 /// Read from a file descriptor.
 pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize) -> VfsResult<usize> {
+    // SMAP bracket — fd_read writes data into `buf` which is typically
+    // a user-VA from the syscall path.  The function does not call
+    // `schedule()` internally; it is a pure-kernel critical section
+    // wrapping FS / device / IPC reads.  Holding the guard across the
+    // whole function covers every leaf that writes to `buf` (including
+    // those inside FS callbacks) without per-site instrumentation.
+    //
+    // Internal kernel callers that pass a kernel-VA `buf` are unaffected
+    // because SMAP only fires on PTE.U=1 pages.  See Intel SDM Vol. 3A
+    // §4.6.1 (SMAP enforcement).
+    let _smap_g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
     let (mount_idx, inode, offset, flags, file_type, open_path) = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         let proc = procs.iter().find(|p| p.pid == pid).ok_or(VfsError::InvalidArg)?;
@@ -1677,7 +1688,10 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
             match crate::ipc::timerfd::read(inode) {
                 Ok(val) => {
                     let bytes = val.to_le_bytes();
-                    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, 8); }
+                    unsafe {
+                        let _g = crate::arch::x86_64::smap::UserGuard::new();
+                        core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, 8);
+                    }
                     Ok(8)
                 }
                 Err(e) => Err(if e == -11 { VfsError::WouldBlock } else { VfsError::BadFd }),
@@ -1719,14 +1733,20 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
             if flags & 0x0200_0000 != 0 {
                 #[cfg(feature = "firefox-test")]
                 crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::DevZero, buf, count);
-                unsafe { core::ptr::write_bytes(buf, 0, count); }
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    core::ptr::write_bytes(buf, 0, count);
+                }
                 return Ok(count);
             }
             // bit 24 = /dev/urandom | /dev/random  → fill with pseudo-random bytes
             if flags & 0x0100_0000 != 0 {
                 let t = crate::arch::x86_64::irq::get_ticks();
-                for i in 0..count {
-                    unsafe { *buf.add(i) = (t.wrapping_add(i as u64).wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) & 0xFF) as u8; }
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    for i in 0..count {
+                        *buf.add(i) = (t.wrapping_add(i as u64).wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) & 0xFF) as u8;
+                    }
                 }
                 return Ok(count);
             }
@@ -2004,6 +2024,11 @@ fn generate_proc_environ(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
 
 /// Write to a file descriptor.
 pub fn fd_write(pid: crate::proc::Pid, fd_num: usize, buf: *const u8, count: usize) -> VfsResult<usize> {
+    // SMAP bracket — fd_write reads from `buf` which is typically a
+    // user-VA from the syscall path.  Same rationale as `fd_read`:
+    // pure-kernel critical section, no schedule points, all leaf
+    // reads against `buf` covered by a single guard.
+    let _smap_g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
     let (mount_idx, inode, offset, append, fd_flags, file_type, open_path) = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         let proc = procs.iter().find(|p| p.pid == pid).ok_or(VfsError::InvalidArg)?;

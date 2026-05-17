@@ -1594,6 +1594,16 @@ pub fn run() -> ! {
     total += 1;
     if test_security_user_ptr_validation_cwe823() { passed += 1; }
 
+    // ── Test 220b: SMAP CR4 + UserGuard coherence (H1-SMAP) ──────────────
+    // Verifies CR4.SMAP, CPUID, and smap::SMAP_ENABLED are mutually
+    // consistent and that UserGuard's STAC/CLAC bracket actually toggles
+    // EFLAGS.AC.  See `docs/SECURITY_AUDIT_2026-05-16.md` finding H1.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_security_smap_h1_state() { passed += 1; }
+    }
+
     // ── Test 221: cache::audit_invariant meta-test ───────────────────────
     // Verifies audit_invariant() reports zero orphan cache entries on an
     // idle kernel.  A failure here indicates either a false-positive in the
@@ -28424,6 +28434,123 @@ fn test_security_user_ptr_validation_cwe823() -> bool {
     }
 
     test_pass!("kernel-half pointers rejected with -EFAULT across writev/readv/preadv/pwritev/sendmsg/recvmsg/getrandom");
+    true
+}
+
+// ── Test 221: SMAP STAC/CLAC bracket regression ──────────────────────────────
+//
+// Closes finding H1-SMAP from `docs/SECURITY_AUDIT_2026-05-16.md`.  PR #250
+// landed CR4.SMEP and deferred SMAP.  The follow-up landed CR4.SMAP after
+// bracketing every legitimate user-pointer dereference with STAC/CLAC.
+//
+// This is a static-state regression guard: it verifies that the SMAP feature
+// has been correctly detected via CPUID and that CR4.SMAP / smap::SMAP_ENABLED
+// are coherent.  Per Intel SDM Vol. 3A §4.6, when SMAP is enabled the CPU
+// raises #PF on any supervisor access to a user-mapped page unless
+// EFLAGS.AC=1.  A kernel that runs userspace without faulting (which we
+// already exercise via the firefox-test boot in CI) is the dynamic proof
+// that bracketing is in place; this test is the cheap static sanity check.
+//
+// References:
+//   * Intel SDM Vol. 3A §4.6 (Supervisor Mode Access Prevention)
+//   * CPUID.(EAX=07H,ECX=00H):EBX[bit 20] = SMAP support
+//   * CWE-269 (Improper Privilege Management) — SMAP closes the
+//     unintentional-user-pointer-deref escalation primitive
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_security_smap_h1_state() -> bool {
+    test_header!("security: SMAP CR4.SMAP coherent with smap::SMAP_ENABLED (H1)");
+
+    // Probe CPUID for SMAP support (EBX bit 20 of leaf 7, sub-leaf 0).
+    let smap_supported = unsafe {
+        let ebx: u32;
+        core::arch::asm!(
+            "push rbx",
+            "cpuid",
+            "mov {ebx:e}, ebx",
+            "pop rbx",
+            ebx = out(reg) ebx,
+            inout("eax") 7u32 => _,
+            inout("ecx") 0u32 => _,
+            out("edx") _,
+        );
+        (ebx & (1 << 20)) != 0
+    };
+
+    let smap_enabled_flag = crate::arch::x86_64::smap::SMAP_ENABLED
+        .load(core::sync::atomic::Ordering::Relaxed);
+
+    let cr4: u64 = unsafe {
+        let v: u64;
+        core::arch::asm!("mov {}, cr4", out(reg) v, options(nomem, nostack));
+        v
+    };
+    let cr4_smap = (cr4 & (1u64 << 21)) != 0;
+
+    test_println!("  cpuid_smap={} cr4_smap={} flag={}",
+        smap_supported, cr4_smap, smap_enabled_flag);
+
+    if !smap_supported {
+        // Acceptable: an older CPU (or TCG without `+smap`) can't enable SMAP.
+        // The flag must agree (cleared) and CR4.SMAP must be 0.
+        if smap_enabled_flag || cr4_smap {
+            test_fail!("security_smap_h1_state",
+                "SMAP not in CPUID but flag={} cr4_smap={}",
+                smap_enabled_flag, cr4_smap);
+            return false;
+        }
+        test_pass!("SMAP not advertised by CPU — flag + CR4 correctly cleared");
+        return true;
+    }
+
+    // CPUID says supported → CR4.SMAP and SMAP_ENABLED must both be set.
+    if !cr4_smap {
+        test_fail!("security_smap_h1_state",
+            "CPUID advertises SMAP but CR4.SMAP=0");
+        return false;
+    }
+    if !smap_enabled_flag {
+        test_fail!("security_smap_h1_state",
+            "CR4.SMAP=1 but smap::SMAP_ENABLED=false (gating helpers will no-op)");
+        return false;
+    }
+
+    // Smoke test: verify STAC/CLAC can be issued safely on this CPU and that
+    // UserGuard's drop clears AC.  Reading EFLAGS via pushfq lets us check
+    // bit 18 before/after.
+    let ac_before = unsafe {
+        let f: u64;
+        core::arch::asm!("pushfq; pop {}", out(reg) f, options(nomem));
+        (f & (1u64 << 18)) != 0
+    };
+    let ac_in_guard;
+    let ac_after;
+    {
+        let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+        ac_in_guard = unsafe {
+            let f: u64;
+            core::arch::asm!("pushfq; pop {}", out(reg) f, options(nomem));
+            (f & (1u64 << 18)) != 0
+        };
+    }
+    ac_after = unsafe {
+        let f: u64;
+        core::arch::asm!("pushfq; pop {}", out(reg) f, options(nomem));
+        (f & (1u64 << 18)) != 0
+    };
+
+    test_println!("  AC before={} in-guard={} after={}", ac_before, ac_in_guard, ac_after);
+    if !ac_in_guard {
+        test_fail!("security_smap_h1_state",
+            "AC=0 inside UserGuard — STAC did not fire");
+        return false;
+    }
+    if ac_after {
+        test_fail!("security_smap_h1_state",
+            "AC=1 after UserGuard dropped — CLAC did not fire");
+        return false;
+    }
+
+    test_pass!("SMAP enabled coherently and STAC/CLAC bracket UserGuard correctly");
     true
 }
 
