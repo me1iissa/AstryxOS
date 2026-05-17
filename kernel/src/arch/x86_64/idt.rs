@@ -1817,6 +1817,15 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 #[cfg(not(feature = "w215-diag"))]
                 crate::mm::cache::insert(mount_idx, inode, foff, phys);
 
+                // W215 diagnostic: MAP_SHARED + PROT_WRITE pages are expected
+                // to mutate in-place (POSIX mmap(2) MAP_SHARED contract).  Mark
+                // the shadow CRC entry so the walker suppresses false-positive
+                // CRC-MISMATCH emission for these legitimate aliased writers.
+                #[cfg(feature = "w215-diag")]
+                if is_shared && is_writable_vma {
+                    crate::mm::w215_crc::mark_writable_shared(phys);
+                }
+
                 // W215 diagnostic Arm-2: my own pre-insert witness is now
                 // cleared (by preins_clear_on_insert inside cache::insert).
                 // If a witness for this phys is STILL present, a sibling
@@ -2128,6 +2137,16 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 );
                 #[cfg(not(feature = "w215-diag"))]
                 crate::mm::cache::insert(mount_idx, inode, file_page_offset, phys);
+
+                // W215 diagnostic: mark MAP_SHARED + PROT_WRITE pages as
+                // legitimate aliased writers so the CRC walker suppresses
+                // false-positive mismatch emission.  `is_writable_spf` is
+                // declared below; inline the flag expression here to keep
+                // this block in the natural insert-call sequence.
+                #[cfg(feature = "w215-diag")]
+                if is_shared && (page_flags & crate::mm::vmm::PAGE_WRITABLE != 0) {
+                    crate::mm::w215_crc::mark_writable_shared(phys);
+                }
 
                 // W215 diagnostic Arm-2 (single-page fallback): same
                 // semantic as the readahead path — own witness now cleared,
