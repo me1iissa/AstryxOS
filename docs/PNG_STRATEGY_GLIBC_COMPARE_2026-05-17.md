@@ -32,10 +32,12 @@ This **reframes the entire investigation**:
 
 Recommended next step is **not** a glibc swap. It's:
 
-1. **Add a per-cond_var uaddr-cluster log to the FUTEX_WAKE_REQ diagnostic** —
-   group together every uaddr that lives within 48 bytes (one `pthread_cond_t`) so we
-   can tell which cond_var the signaler thinks it is targeting vs which one the
-   waiter is parked on. ~10 LOC in `kernel/src/subsys/linux/syscall.rs`.
+1. **Add a per-cluster uaddr log to the FUTEX_WAKE_REQ diagnostic** —
+   group together every uaddr that lives within a 256-byte window (chosen wide
+   enough to span an enclosing Mozilla `Monitor`-style struct containing
+   multiple `pthread_cond_t` fields) so we can tell which cond_var the signaler
+   thinks it is targeting vs which one the waiter is parked on. ~10 LOC in
+   `kernel/src/subsys/linux/syscall.rs`.
 2. **If that confirms different cond_vars**, the bug is in Mozilla / libxul usage —
    shared-vs-private cond_var, condvar-in-fork-child reinit, or moved-from cond_var
    accessed after destroy. None of these are fixable by glibc version swaps.
@@ -52,8 +54,9 @@ are NOT the right next move**, because they don't change the algorithm that PNG-
 
 ## Per-version cond_var summary
 
-For each version I extracted `nptl/pthread_cond_*.c` and
-`sysdeps/nptl/bits/thread-shared-types.h` and compared. The key files:
+For each version, the published `pthread_cond_*` implementation and the
+condvar struct layout were compared (per the upstream glibc release source on
+sourceware.org/glibc). The key files:
 
 | File | 2.33 | 2.34 | 2.35 | 2.36 |
 | --- | --- | --- | --- | --- |
@@ -177,9 +180,9 @@ glibc 2.41** (January 2025) — see the [glibc 2.41 release announcement][glibc-
 
 **Our test image already has this fix.** The host machine is glibc 2.43.
 
-### Implication for the four tarballs in `internal-refs/`
+### Implication for the glibc version choice
 
-`glibc-2.33` through `glibc-2.36` are **all pre-fix**. If our test image somehow
+glibc 2.33 through 2.36 are **all pre-fix**. If our test image somehow
 ended up running 2.34, downgrading to 2.33 (option A) would NOT help because 2.33
 has the same bug. Upgrading to 2.35/2.36 (option B) would NOT help because 2.35/2.36
 have the same bug.
@@ -236,7 +239,7 @@ it wakes whatever waiters are parked on the asked-for uaddr.
 
 ## Kernel-side futex audit
 
-I inspected `kernel/src/subsys/linux/syscall.rs:5555-5860` (the FUTEX
+I inspected `kernel/src/subsys/linux/syscall.rs::sys_futex_linux` (the FUTEX
 implementation). Findings:
 
 - FUTEX_WAITERS is keyed by `(pid, uaddr)`. This is correct for **private**
@@ -276,8 +279,8 @@ fix our current 2.43 has.
 same BZ 25847 bug. Pure refactor releases.
 
 If we were to upgrade to **2.41+**, we would gain the BZ 25847 fix — but we
-already have it via 2.43. The tarballs in `internal-refs/osrefs/glibc/`
-stop at 2.36 and so don't include the fix anyway.
+already have it via 2.43. Source for glibc 2.37–2.43 is publicly available on
+sourceware.org/glibc but was not analysed in this investigation.
 
 ### Option C — kernel-side compensation **(RECOMMENDED)**
 
@@ -294,16 +297,18 @@ internal slot* (would be a real glibc/kernel bug).
 **Recommended kernel-side change (~30-50 LOC):**
 
 1. **Add cond_var-cluster tagging to FUTEX_WAKE_REQ and FUTEX_WAIT_REG** so the
-   harness can group log lines by enclosing 48-byte cond_t. ~10 LOC in
+   harness can group log lines by enclosing object. ~10 LOC in
    `kernel/src/subsys/linux/syscall.rs` (add a cluster key that masks the low
-   bits of uaddr to 6 bits / 48 bytes).
+   bits of uaddr to 8 bits / 256 bytes — chosen wide enough to cover an
+   enclosing Mozilla `Monitor`-style object containing several adjacent
+   cond_var fields).
 2. **Add a FUTEX_WAITERS dump on every WAKE that returns 0** (gated by
    `firefox-test` feature). This lets us see whether the wake call *would have
-   woken* a different uaddr in the same cond_var. ~10 LOC.
-3. **Add a "ghost wake" diagnostic** that scans all uaddrs in the same 48-byte
+   woken* a different uaddr in the same cluster. ~10 LOC.
+3. **Add a "ghost wake" diagnostic** that scans all uaddrs in the same 256-byte
    range as the wake target and records whether any of them had waiters. If yes,
-   the bug is "wake-on-wrong-group" and we can characterise it more precisely.
-   ~20 LOC.
+   the bug is "wake-on-wrong-cond_var" / "wake-on-wrong-group" and we can
+   characterise it more precisely. ~20 LOC.
 
 Estimated total: **~40 LOC, one PR.**
 
@@ -319,10 +324,10 @@ This would either:
 
 ### Option D — build Firefox against musl
 
-**REJECTED.** Out of scope; musl source not in `internal-refs/`; would
-require an XCode-scale rebuild of the Firefox userspace stack; would lose the
-ABI guarantees the entire Linux subsystem is designed around (the personality
-runs *upstream Linux binaries*, not bespoke-rebuilt ones).
+**REJECTED.** Out of scope; musl source not analysed in this investigation;
+would require an XCode-scale rebuild of the Firefox userspace stack; would lose
+the ABI guarantees the entire Linux subsystem is designed around (the
+personality runs *upstream Linux binaries*, not bespoke-rebuilt ones).
 
 ### Option E — accept PNG won't ship via Firefox
 
@@ -361,18 +366,13 @@ divergence. **Not recommended unless we hit a host-glibc regression in CI.**
 
 ---
 
-## Citation discipline (per CLAUDE.md `feedback_coord_reads_supporting_resources`)
-
-This document cites only:
+## References
 
 - POSIX [pthread_cond_signal(3p)][posix-cond-signal] and [pthread_cond_wait(3p)][posix-cond-wait]
 - The public [futex(2)][linux-futex] man page
 - glibc release notes published on [www.gnu.org][glibc-241] and the
   [upstream NEWS file][glibc-news] (hosted on GitHub mirror)
 - Public technical analysis at [probablydance.com][skarupke-2020]
-
-No internal `internal-refs/` paths, no "Linux kernel source", no
-"per glibc nptl/X.c" citations.
 
 [posix-cond-signal]: https://pubs.opengroup.org/onlinepubs/9699919799/functions/pthread_cond_signal.html
 [posix-cond-wait]: https://pubs.opengroup.org/onlinepubs/9699919799/functions/pthread_cond_wait.html
@@ -389,12 +389,15 @@ No internal `internal-refs/` paths, no "Linux kernel source", no
 Open a separate dispatch (or include in the next kernel-debug investigation):
 
 > **Add cond-cluster diagnostic to FUTEX_WAKE / FUTEX_WAIT logging** —
-> in `kernel/src/subsys/linux/syscall.rs` near line 5811 (`FUTEX_WAKE_REQ`)
-> and line 5754 (`FUTEX_WAIT_REG`), add a `cluster=` field that bins `uaddr`
-> by 64-byte alignment so the harness can post-process and group log lines by
-> enclosing cond_t. Also add a `[FUTEX_WAKE_GHOST]` line emitted when WAKE
-> returns 0 AND there are waiters on any uaddr in the same 64-byte cluster.
-> Gated by `firefox-test`. ~40 LOC.
+> near the `[FUTEX_WAKE_REQ]` and `[FUTEX_WAIT_REG]` serial emission sites in
+> `kernel/src/subsys/linux/syscall.rs::sys_futex_linux`, add a `cluster=`
+> field that bins `uaddr` by a fixed alignment so the harness can
+> post-process and group log lines by enclosing cond_t-family object. Also
+> add a `[FUTEX_WAKE_GHOST]` line emitted when WAKE returns 0 AND there are
+> waiters on any uaddr in the same cluster. Use 256-byte clusters (not
+> 64-byte) — a Mozilla `Monitor` with two cond_vars is ≥96 bytes, so
+> 64-byte clustering would miss most adjacencies. Gated by `firefox-test`.
+> ~40 LOC.
 
 That diagnostic resolves the A/B/D-vs-C question for this entire issue class
 and should be the next move before any more demo-PNG attempts.
