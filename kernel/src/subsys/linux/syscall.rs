@@ -5569,11 +5569,12 @@ fn sys_rt_sigprocmask_linux(how: u64, set: u64, oldset: u64, _sigsetsize: u64) -
 
 /// futex — Wait/Wake/Requeue implementation for musl/pthread compatibility.
 ///
-/// Supported ops:
+/// Supported ops (op numbers per `futex(2)` Linux man-page and UAPI header):
 ///   0  FUTEX_WAIT          Block if *uaddr==val, optional timeout in arg4
 ///   1  FUTEX_WAKE          Wake up to val waiters on uaddr
-///   4  FUTEX_REQUEUE       Wake val waiters, requeue up-to val2 to uaddr2
-///   5  FUTEX_CMP_REQUEUE   Like REQUEUE but check *uaddr==val3 first
+///   3  FUTEX_REQUEUE       Wake val waiters on uaddr, requeue up-to val2 to uaddr2
+///   4  FUTEX_CMP_REQUEUE   Like REQUEUE but atomically check *uaddr==val3 first
+///   5  FUTEX_WAKE_OP       Not yet implemented — returns ENOSYS
 ///   9  FUTEX_WAIT_BITSET   Like WAIT (bitset arg accepted but treated as MATCH_ANY)
 ///  10  FUTEX_WAKE_BITSET   Like WAKE (bitset arg accepted but treated as MATCH_ANY)
 ///
@@ -5896,21 +5897,30 @@ pub fn sys_futex_linux(
 
             woken as i64
         }
-        4 | 5 => {
-            // FUTEX_REQUEUE / FUTEX_CMP_REQUEUE
-            // arg3=val (wake count), arg4=val2 (requeue count), arg5=uaddr2
-            // For CMP_REQUEUE, also check *uaddr == val3 (we reuse val as val1, uaddr2 as uaddr2)
-            // val2 is passed in timeout_ptr slot (Linux ABI: arg4 = val2 for REQUEUE)
-            let val2 = timeout_ptr; // requeue limit (positional arg4)
+        // FUTEX_REQUEUE (3) and FUTEX_CMP_REQUEUE (4) — per futex(2):
+        //   arg1 = uaddr   (wait queue to drain)
+        //   arg3 = val     (max threads to wake)
+        //   arg4 = val2    (max threads to requeue; passed in the timeout_ptr slot)
+        //   arg5 = uaddr2  (destination wait queue)
+        //   arg6 = val3    (CMP_REQUEUE only: expected value at *uaddr)
+        //
+        // Return value: number of threads WOKEN (not woken+requeued).  Per
+        // futex(2): "On success, FUTEX_REQUEUE returns the number of waiters
+        // that were woken up."  The requeued count is not included.
+        3 | 4 => {
+            let val2 = timeout_ptr; // requeue limit (positional arg4 per futex(2) ABI)
 
-            if op == 5 {
-                // CMP_REQUEUE: verify *uaddr == val (the 6th argument would be val3, skip for simplicity)
+            if op == 4 {
+                // FUTEX_CMP_REQUEUE: atomically verify *uaddr == val3 before
+                // proceeding.  Per futex(2): if *uaddr != val3, return EAGAIN.
+                // `_val3` is arg6, the dedicated comparison value (distinct from
+                // `val`, which is the wake count).
                 let current = match unsafe { crate::syscall::user_read_u32(uaddr) } {
                     Some(v) => v,
-                    None => return -14,
+                    None => return -14, // EFAULT
                 };
-                if current as u64 != val {
-                    return -11; // EAGAIN
+                if current as u64 != _val3 {
+                    return -11; // EAGAIN — *uaddr changed under us
                 }
             }
 
@@ -5936,13 +5946,13 @@ pub fn sys_futex_linux(
                         requeued += 1;
                     }
                 }
-                // Requeue to uaddr2
+                // Requeue surviving waiters to uaddr2.
                 if !requeue_list.is_empty() {
                     waiters.entry((pid, uaddr2)).or_insert_with(Vec::new).extend(requeue_list.iter());
                 }
                 tids_to_wake = wake_list;
                 tids_to_requeue = requeue_list;
-                let _ = tids_to_requeue; // used above
+                let _ = tids_to_requeue; // live in the waiters map; used above
             }
 
             {
@@ -5957,8 +5967,14 @@ pub fn sys_futex_linux(
                 }
             }
 
-            (woken + requeued) as i64
+            // Return woken count only — not woken+requeued.  Per futex(2).
+            woken as i64
         }
+        // FUTEX_WAKE_OP (5) — compound wake + modify-second-futex operation.
+        // Not yet implemented; the operation is rarely needed by glibc/musl in
+        // the AstryxOS Firefox demo path.  Return ENOSYS so callers fall back
+        // to their non-WAKE_OP path.  Per futex(2).
+        5 => -38, // ENOSYS
         _ => -38, // ENOSYS
     }
 }
