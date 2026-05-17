@@ -60,6 +60,23 @@ core::arch::global_asm!(
     "push r13",
     "push r14",
     "push r15",
+    // Save RFLAGS — critical for SMAP (EFLAGS.AC bit 18).  A kernel thread
+    // that holds a `UserGuard` (STAC issued, AC=1) and blocks on disk I/O
+    // gets context-switched out via `schedule()`; without preserving AC
+    // here, the resumed thread runs with whatever AC value the previously
+    // context-saved sibling had (typically 0).  Subsequent user-pointer
+    // dereferences inside the *original* UserGuard scope then fault with
+    // SMAP, and the page-fault handler's CoW arm "resolves" the fault by
+    // tweaking the PTE — which leaves AC=0 unchanged — so the retry
+    // re-fires the same fault forever.  Observed: PID 2 (glxtest) stuck at
+    // CR2=0x7ffffffedfe8 with 400M+ #PF / sec inside Fat32Fs::read called
+    // from fd_read (which holds a function-scope `UserGuard`), until the
+    // scheduler watchdog bugchecks (BUGCHECK_SCHEDULER_DEADLOCK 0xDEAD_0004).
+    //
+    // Cite Intel SDM Vol. 3A §4.6 (SMAP — STAC/CLAC are the only way to
+    // toggle AC; AC is part of RFLAGS, must be saved/restored explicitly
+    // on any context switch that may span a STAC/CLAC bracket).
+    "pushfq",
     // Save current RSP to *old_rsp_ptr
     "mov [rdi], rsp",
     // Atomically signal that the saved RSP is now valid.
@@ -74,6 +91,12 @@ core::arch::global_asm!(
     "1:",
     // Load new RSP
     "mov rsp, rsi",
+    // Restore RFLAGS first (pairs with the pushfq above the save) — see the
+    // SMAP rationale on the pushfq line.  popfq must execute on the *new*
+    // thread's stack, after RSP swap and before the callee-saved pops, so
+    // the saved layout (highest-to-lowest: rbp, rbx, r12, r13, r14, r15,
+    // RFLAGS) is restored in reverse order on the new side.
+    "popfq",
     // Restore callee-saved registers from new stack
     "pop r15",
     "pop r14",
@@ -166,12 +189,16 @@ pub unsafe fn switch_context(old_rsp_ptr: *mut u64, new_rsp: u64, ctx_valid_ptr:
 ///   [stack_top - 48]  = 0                         (r13)
 ///   [stack_top - 56]  = 0                         (r14)
 ///   [stack_top - 64]  = 0                         (r15)
+///   [stack_top - 72]  = 0x202                     (saved RFLAGS — popfq target;
+///                                                   IF=1, AC=0; matches the
+///                                                   `pushfq` slot added to
+///                                                   `switch_context_asm`.)
 ///   ^ initial RSP
 /// ```
 ///
-/// After switch_context pops 6 registers (48 bytes) and does `ret` (+8 bytes),
-/// RSP ends up at `stack_top - 8`, which is 16-byte aligned + 8 — correct for
-/// the System V AMD64 ABI function entry convention.
+/// After switch_context pops 1 RFLAGS, 6 callee-saved registers (56 bytes total)
+/// and does `ret` (+8 bytes), RSP ends up at `stack_top - 8`, which is 16-byte
+/// aligned + 8 — correct for the System V AMD64 ABI function entry convention.
 pub fn init_thread_stack(stack_top: u64, entry_point: u64) -> u64 {
     let top = stack_top as *mut u64;
 
@@ -207,9 +234,15 @@ pub fn init_thread_stack(stack_top: u64, entry_point: u64) -> u64 {
         *top.sub(7) = 0;
         // r15 = 0
         *top.sub(8) = 0;
+        // Saved RFLAGS: IF=1 (bit 9), reserved bit 1 set, AC=0.  Popped by
+        // `popfq` at the head of `switch_context_asm`'s restore sequence.
+        // Without this slot the first switch-into would `popfq` whatever
+        // garbage was on the freshly-allocated stack — typically zero,
+        // which would also clear IF and wedge the thread on the next CLI.
+        *top.sub(9) = 0x202;
     }
-    // Initial RSP points just below the last pushed register
-    stack_top - 8 * 8
+    // Initial RSP points just below the last pushed slot (RFLAGS)
+    stack_top - 9 * 8
 }
 
 /// Fix a potentially truncated function pointer by adding KERNEL_VIRT_BASE.
@@ -240,24 +273,26 @@ pub fn fixup_fn_ptr(addr: u64) -> u64 {
 ///
 /// This is the Linux `copy_thread` + `ret_from_fork_asm` pattern.
 ///
-/// Stack layout (growing downward, top = high address):
+/// Stack layout (growing downward, top = high address).  Per-slot offsets
+/// reflect the post-pushfq layout of `switch_context_asm` — see that
+/// function's body for the matching pop order.
 /// ```text
-///   [stack_top - 8]   = 0                    (alignment padding)
-///   [stack_top - 16]  = ret_from_fork_asm    (return address for switch_context ret)
-///   [stack_top - 24]  = fork_regs.rbp        (rbp — popped by switch_context)
-///   [stack_top - 32]  = 0                    (rbx — switch_context pops, ignored)
-///   [stack_top - 40]  = fork_regs.r12        (r12 — popped by switch_context)
-///   [stack_top - 48]  = fork_regs.r13        (r13 — popped by switch_context)
-///   [stack_top - 56]  = fork_regs.r14        (r14 — popped by switch_context)
-///   [stack_top - 64]  = fork_regs.r15        (r15 — popped by switch_context)
-///   ── switch_context pops above, ret → ret_from_fork_asm ──
-///   [stack_top - 72]  = tls_base             (popped by ret_from_fork_asm → WRMSR FS_BASE)
-///   [stack_top - 80]  = fork_regs.rbx        (popped by ret_from_fork_asm → RBX)
-///   [stack_top - 88]  = 0x1B                 (SS — USER_DATA_SELECTOR)
-///   [stack_top - 96]  = user_rsp             (RSP — popped by IRETQ)
-///   [stack_top - 104] = 0x202                (RFLAGS — IF set)
-///   [stack_top - 112] = 0x23                 (CS — USER_CODE_SELECTOR)
-///   [stack_top - 120] = user_rip             (RIP — popped by IRETQ)
+///   [stack_top - 8]   = user_rip              (RIP — IRETQ pops first)
+///   [stack_top - 16]  = 0x23                  (CS — USER_CODE_SELECTOR)
+///   [stack_top - 24]  = 0x202                 (RFLAGS — IF=1, AC=0; user-mode)
+///   [stack_top - 32]  = user_rsp              (RSP — IRETQ pops)
+///   [stack_top - 40]  = 0x1B                  (SS — USER_DATA_SELECTOR; IRETQ pops last)
+///   [stack_top - 48]  = fork_regs.rbx         (popped by ret_from_fork_asm → RBX)
+///   [stack_top - 56]  = tls_base              (popped by ret_from_fork_asm → WRMSR FS_BASE)
+///   [stack_top - 64]  = ret_from_fork_asm     (return address for switch_context `ret`)
+///   [stack_top - 72]  = fork_regs.rbp         (popped by switch_context `pop rbp`)
+///   [stack_top - 80]  = 0                     (rbx placeholder — `pop rbx`, ignored)
+///   [stack_top - 88]  = fork_regs.r12         (popped by switch_context `pop r12`)
+///   [stack_top - 96]  = fork_regs.r13         (popped by switch_context `pop r13`)
+///   [stack_top - 104] = fork_regs.r14         (popped by switch_context `pop r14`)
+///   [stack_top - 112] = fork_regs.r15         (popped by switch_context `pop r15`)
+///   [stack_top - 120] = 0x202                 (kernel-side RFLAGS — popped by `popfq`
+///                                               at the head of switch_context restore)
 ///   ^ initial RSP
 /// ```
 pub fn init_fork_child_stack(
@@ -363,15 +398,20 @@ pub fn init_fork_child_stack(
         *top.sub(6) = fork_regs.rbx;                             // popped by `pop rbx`
         *top.sub(7) = tls_base;                                  // popped by `pop rax` (TLS)
 
-        // switch_context_asm frame (ret_addr at highest, r15 at lowest)
+        // switch_context_asm frame (ret_addr at highest, RFLAGS at lowest)
         *top.sub(8)  = ret_from_fork_asm as *const () as u64;    // `ret` pops this
         *top.sub(9)  = fork_regs.rbp;                            // `pop rbp`
         *top.sub(10) = 0;                                        // `pop rbx` (unused)
         *top.sub(11) = fork_regs.r12;                            // `pop r12`
         *top.sub(12) = fork_regs.r13;                            // `pop r13`
         *top.sub(13) = fork_regs.r14;                            // `pop r14`
-        *top.sub(14) = fork_regs.r15;                            // `pop r15` (first pop)
+        *top.sub(14) = fork_regs.r15;                            // `pop r15`
+        // Saved RFLAGS slot — `popfq` (added to switch_context_asm to
+        // preserve SMAP AC across blocks within a UserGuard scope) consumes
+        // this BEFORE the callee-saved pops.  Fresh fork-child kernel
+        // stacks need a sane RFLAGS prelude: IF=1 (bit 9), reserved bit 1.
+        *top.sub(15) = 0x202;                                    // popfq target
     }
     // initial_rsp = bottom of switch_context frame
-    stack_top - 14 * 8
+    stack_top - 15 * 8
 }

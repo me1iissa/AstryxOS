@@ -183,8 +183,9 @@ pub(crate) fn user_path_ptr_ok(ptr: u64) -> bool {
 //     which complete before any further user-cstring read on the same CPU.
 //
 // Sizing: `MAX_CPUS = 16` × `SLOTS_PER_CPU = 4` × `SLOT_SIZE = 4096 B` =
-// 256 KiB of `.bss`.  This sits well below `BOOT_INFO_PHYS_BASE = 0x700000`
-// after the CrcEntry repack landed alongside this commit.
+// 256 KiB of `.bss`.  `BOOT_INFO_PHYS_BASE` (see `shared/src/lib.rs`) sits
+// several MiB past the current BSS end, so this arena adds no risk of
+// clobbering the bootloader handoff page during `_start` BSS zeroing.
 
 const CSTRING_SLOT_SIZE: usize = 4096;
 const CSTRING_SLOTS_PER_CPU: usize = 4;
