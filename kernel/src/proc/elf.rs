@@ -698,7 +698,18 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
             if !already_mapped {
                 // Map the page into the target page table.
                 if !vmm::map_page_in(cr3, page_vaddr, phys, flags) {
+                    // Cleanup: every prior page in `allocated_pages` had
+                    // `page_ref_set(phys, 1)` applied after its successful
+                    // map_page_in.  The current iteration's page has NOT
+                    // had page_ref_set called yet (refcount==0 already), so
+                    // unconditionally clearing the refcount before free is
+                    // a no-op for it and the correct decrement for all
+                    // already-mapped predecessors.  Without this, the W215
+                    // pte_share_count free-time invariant would quarantine
+                    // every successfully-mapped frame on this OOM path,
+                    // leaking them for the rest of the boot.
                     for &page in &allocated_pages {
+                        crate::mm::refcount::page_ref_set(page, 0);
                         pmm::free_page(page);
                     }
                     return Err(ElfError::OutOfMemory);
@@ -783,7 +794,14 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
 
         let flags = vmm::PAGE_PRESENT | vmm::PAGE_WRITABLE | vmm::PAGE_USER | vmm::PAGE_NO_EXECUTE;
         if !vmm::map_page_in(cr3, page_vaddr, phys, flags) {
+            // Cleanup mirrors the PT_LOAD path above: clear refcount on
+            // every page before free so the W215 pte_share_count free-time
+            // invariant does not quarantine the successfully-mapped
+            // predecessors.  The current page is still at refcount==0
+            // (page_ref_set has not yet been called) so the clear is a
+            // no-op for it.
             for &page in &allocated_pages {
+                crate::mm::refcount::page_ref_set(page, 0);
                 pmm::free_page(page);
             }
             return Err(ElfError::OutOfMemory);
