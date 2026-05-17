@@ -19,7 +19,7 @@
 //!
 //! Diagnostic-only.  No fix-it logic.
 
-#![cfg(feature = "firefox-test")]
+#![cfg(feature = "w215-diag")]
 
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
