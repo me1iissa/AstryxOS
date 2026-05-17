@@ -1693,6 +1693,19 @@ pub fn run() -> ! {
     total += 1;
     if test_229_pmm_pte_share_count_invariant() { passed += 1; }
 
+    // ── Test 230: AF_UNIX SO_PEERCRED reports peer credentials (H7) ─────
+    // Regression guard for finding H7 of the 2026-05-16 security audit
+    // (CWE-287, Improper Authentication).  Before the fix, getsockopt
+    // SO_PEERCRED returned the *calling* process's PID, defeating any IPC
+    // auth flow that uses SO_PEERCRED to identify the peer (D-Bus auth,
+    // Firefox sandbox broker).  This test exercises the kernel-level
+    // peer_creds() lookup directly on a socketpair whose two halves were
+    // tagged with distinct PIDs at creation, and asserts each end sees
+    // the *other's* PID — never its own.  Cite unix(7) SO_PEERCRED;
+    // POSIX.1-2017 §getsockopt.
+    total += 1;
+    if test_230_so_peercred_returns_peer_pid() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -12133,13 +12146,13 @@ fn test_x11_hello() -> bool {
     // Init the X11 server here (not at boot) so Firefox doesn't block on it.
     crate::x11::init();
 
-    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream);
+    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream, crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
     if client == u64::MAX {
         test_fail!("x11_hello", "unix::create() failed");
         return false;
     }
 
-    let r = crate::net::unix::connect(client, b"/tmp/.X11-unix/X0\0");
+    let r = crate::net::unix::connect(client, b"/tmp/.X11-unix/X0\0", crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
     if r < 0 {
         test_fail!("x11_hello", "unix::connect() returned {}", r);
         crate::net::unix::close(client);
@@ -12196,12 +12209,12 @@ fn test_x11_intern_atom() -> bool {
     test_header!("X11 server — InternAtom(WM_NAME)");
 
     // ── Connect + perform setup ───────────────────────────────────────────
-    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream);
+    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream, crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
     if client == u64::MAX {
         test_fail!("x11_intern", "unix::create() failed");
         return false;
     }
-    let r = crate::net::unix::connect(client, b"/tmp/.X11-unix/X0\0");
+    let r = crate::net::unix::connect(client, b"/tmp/.X11-unix/X0\0", crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
     if r < 0 {
         test_fail!("x11_intern", "connect returned {}", r);
         crate::net::unix::close(client);
@@ -12288,12 +12301,12 @@ fn test_x11_draw_cycle() -> bool {
     test_header!("X11 CreateWindow + MapWindow + Draw cycle");
 
     // ── Connect + setup ──────────────────────────────────────────────────────
-    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream);
+    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream, crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
     if client == u64::MAX {
         test_fail!("x11_draw", "unix::create() failed");
         return false;
     }
-    if crate::net::unix::connect(client, b"/tmp/.X11-unix/X0\0") < 0 {
+    if crate::net::unix::connect(client, b"/tmp/.X11-unix/X0\0", crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
         test_fail!("x11_draw", "connect failed");
         crate::net::unix::close(client);
         return false;
@@ -12468,12 +12481,12 @@ fn test_x11_key_event() -> bool {
     test_header!("X11 key event injection + delivery");
 
     // ── Connect + setup ──────────────────────────────────────────────────────
-    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream);
+    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream, crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
     if client == u64::MAX {
         test_fail!("x11_key", "unix::create() failed");
         return false;
     }
-    if crate::net::unix::connect(client, b"/tmp/.X11-unix/X0\0") < 0 {
+    if crate::net::unix::connect(client, b"/tmp/.X11-unix/X0\0", crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
         test_fail!("x11_key", "connect failed");
         crate::net::unix::close(client);
         return false;
@@ -12585,12 +12598,12 @@ fn test_x11_render_query() -> bool {
     test_header!("X11 RENDER extension — QueryExtension + QueryVersion");
 
     // ── Connect + setup ──────────────────────────────────────────────────────
-    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream);
+    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream, crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
     if client == u64::MAX {
         test_fail!("x11_render_q", "unix::create() failed");
         return false;
     }
-    if crate::net::unix::connect(client, b"/tmp/.X11-unix/X0\0") < 0 {
+    if crate::net::unix::connect(client, b"/tmp/.X11-unix/X0\0", crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
         test_fail!("x11_render_q", "connect failed");
         crate::net::unix::close(client);
         return false;
@@ -12710,12 +12723,12 @@ fn test_x11_render_draw() -> bool {
     test_header!("X11 RENDER extension — CreatePixmap + Picture + FillRectangles");
 
     // ── Connect + setup ──────────────────────────────────────────────────────
-    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream);
+    let client = crate::net::unix::create(crate::net::unix::SockKind::Stream, crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
     if client == u64::MAX {
         test_fail!("x11_render_d", "unix::create() failed");
         return false;
     }
-    if crate::net::unix::connect(client, b"/tmp/.X11-unix/X0\0") < 0 {
+    if crate::net::unix::connect(client, b"/tmp/.X11-unix/X0\0", crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
         test_fail!("x11_render_d", "connect failed");
         crate::net::unix::close(client);
         return false;
@@ -13635,12 +13648,12 @@ fn test_x11_extensions() -> bool {
 
     // X11 server is already running (initialised by test_x11_hello earlier).
     // Connect a fresh client.
-    let cfd = crate::net::unix::create(crate::net::unix::SockKind::Stream);
+    let cfd = crate::net::unix::create(crate::net::unix::SockKind::Stream, crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
     if cfd == u64::MAX {
         test_fail!("x11_ext", "unix::create() failed");
         return false;
     }
-    if crate::net::unix::connect(cfd, b"/tmp/.X11-unix/X0\0") < 0 {
+    if crate::net::unix::connect(cfd, b"/tmp/.X11-unix/X0\0", crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
         test_fail!("x11_ext", "unix::connect() failed");
         crate::net::unix::close(cfd);
         return false;
@@ -15625,7 +15638,7 @@ fn test_scm_rights() -> bool {
     test_header!("SCM_RIGHTS fd passing over Unix domain socket");
 
     // Create a socketpair.
-    let (id_a, id_b) = crate::net::unix::socketpair(crate::net::unix::SockKind::Stream);
+    let (id_a, id_b) = crate::net::unix::socketpair(crate::net::unix::SockKind::Stream, crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
     if id_a == u64::MAX || id_b == u64::MAX {
         test_fail!("scm_rights", "socketpair() failed");
         return false;
@@ -15968,14 +15981,14 @@ fn test_x11_selection() -> bool {
     use crate::net::unix;
 
     // Connect client A (will own the selection).
-    let cfd_a = unix::create(unix::SockKind::Stream);
-    let cfd_b = unix::create(unix::SockKind::Stream);
+    let cfd_a = unix::create(unix::SockKind::Stream, unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    let cfd_b = unix::create(unix::SockKind::Stream, unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
     if cfd_a == u64::MAX || cfd_b == u64::MAX {
         test_fail!("x11_sel", "unix::create() failed");
         return false;
     }
-    if unix::connect(cfd_a, b"/tmp/.X11-unix/X0\0") < 0 ||
-       unix::connect(cfd_b, b"/tmp/.X11-unix/X0\0") < 0 {
+    if unix::connect(cfd_a, b"/tmp/.X11-unix/X0\0", unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 ||
+       unix::connect(cfd_b, b"/tmp/.X11-unix/X0\0", unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
         test_fail!("x11_sel", "connect failed");
         unix::close(cfd_a); unix::close(cfd_b);
         return false;
@@ -16082,9 +16095,9 @@ fn test_ewmh_net_supported() -> bool {
     use crate::x11::proto;
     use crate::net::unix;
 
-    let cfd = unix::create(unix::SockKind::Stream);
+    let cfd = unix::create(unix::SockKind::Stream, unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
     if cfd == u64::MAX { test_fail!("ewmh", "unix::create() failed"); return false; }
-    if unix::connect(cfd, b"/tmp/.X11-unix/X0\0") < 0 {
+    if unix::connect(cfd, b"/tmp/.X11-unix/X0\0", unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
         test_fail!("ewmh", "connect failed"); unix::close(cfd); return false;
     }
     let hello: [u8; 12] = [0x6C, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -19042,12 +19055,12 @@ fn test_elf_dt_gnu_hash_accepted() -> bool {
 // close on MAX).
 
 fn x11_connect_and_setup(tag: &str) -> u64 {
-    let fd = crate::net::unix::create(crate::net::unix::SockKind::Stream);
+    let fd = crate::net::unix::create(crate::net::unix::SockKind::Stream, crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
     if fd == u64::MAX {
         test_println!("  [{}] unix::create(unix::SockKind::Stream) failed", tag);
         return u64::MAX;
     }
-    if crate::net::unix::connect(fd, b"/tmp/.X11-unix/X0\0") < 0 {
+    if crate::net::unix::connect(fd, b"/tmp/.X11-unix/X0\0", crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
         test_println!("  [{}] connect failed", tag);
         crate::net::unix::close(fd);
         return u64::MAX;
@@ -23651,6 +23664,143 @@ fn test_229_pmm_pte_share_count_invariant() -> bool {
     true
 }
 
+// ── Test 230: AF_UNIX SO_PEERCRED returns the peer's credentials (H7) ──────
+//
+// Closes finding H7 of the 2026-05-16 security audit (CWE-287, Improper
+// Authentication).  Pre-fix, `getsockopt(SO_PEERCRED)` returned the
+// calling process's own PID — defeating every IPC auth scheme that uses
+// SO_PEERCRED to identify the peer (D-Bus authentication, the Firefox
+// content-process sandbox broker, systemd's PrivateUsers gate).  Per
+// `unix(7)` SO_PEERCRED: "Returns the credentials of the peer process
+// connected to this socket. The credentials are those that were in effect
+// at the time of the call to connect(2) or socketpair(2)."
+//
+// The fix records each socket endpoint's creator credentials at
+// create/socketpair/connect time and exposes a `peer_creds()` accessor
+// that returns the credentials of the OTHER endpoint.  This test drives
+// that accessor directly so it does not depend on a running second
+// process — we tag the two halves of a socketpair with distinct fake
+// PIDs and assert each end sees the other's PID, never its own.
+fn test_230_so_peercred_returns_peer_pid() -> bool {
+    test_header!("AF_UNIX SO_PEERCRED returns peer (not caller) credentials (H7)");
+
+    // Construct a socketpair stamped with PID/UID/GID = (1234, 5, 6) on
+    // BOTH halves — this is what socketpair(2) does for a real userland
+    // process (both ends are created by the same caller).
+    let creds_a = crate::net::unix::PeerCreds { pid: 1234, uid: 5, gid: 6 };
+    let (id_a, id_b) = crate::net::unix::socketpair(
+        crate::net::unix::SockKind::Stream, creds_a);
+    if id_a == u64::MAX || id_b == u64::MAX {
+        test_fail!("so_peercred",
+            "socketpair() failed: id_a={} id_b={}", id_a, id_b);
+        return false;
+    }
+
+    // For a socketpair the peer's creator is the same caller, so both
+    // ends see the same credentials via peer_creds() — but crucially the
+    // pid is the CALLER's pid (1234), not the caller of getsockopt
+    // (which would be the test runner's pid).  Pre-fix this was always
+    // current_pid_lockless().
+    let peer_of_a = crate::net::unix::peer_creds(id_a);
+    let peer_of_b = crate::net::unix::peer_creds(id_b);
+    let mut failed: u32 = 0;
+    match peer_of_a {
+        Some(c) if c.pid == 1234 && c.uid == 5 && c.gid == 6 => {
+            test_println!("  peer_creds(id_a) = (pid=1234 uid=5 gid=6) ✓");
+        }
+        Some(c) => {
+            test_println!(
+                "  peer_creds(id_a) returned ({}, {}, {}); expected (1234, 5, 6) ✗",
+                c.pid, c.uid, c.gid);
+            failed += 1;
+        }
+        None => {
+            test_println!("  peer_creds(id_a) returned None ✗");
+            failed += 1;
+        }
+    }
+    match peer_of_b {
+        Some(c) if c.pid == 1234 && c.uid == 5 && c.gid == 6 => {
+            test_println!("  peer_creds(id_b) = (pid=1234 uid=5 gid=6) ✓");
+        }
+        Some(c) => {
+            test_println!(
+                "  peer_creds(id_b) returned ({}, {}, {}); expected (1234, 5, 6) ✗",
+                c.pid, c.uid, c.gid);
+            failed += 1;
+        }
+        None => {
+            test_println!("  peer_creds(id_b) returned None ✗");
+            failed += 1;
+        }
+    }
+
+    // ── Asymmetric case: distinct creator pids on each end. ─────────────
+    // Simulates a connect(2)-established pair where the client side was
+    // created by PID=2000 and the server-accept side records the
+    // connecting PID=3000.  After establishing the peer link manually we
+    // verify SO_PEERCRED on each end returns the OTHER end's pid —
+    // never its own (the pre-fix bug returned the caller's pid).
+    //
+    // We use the unix module's primitive create() + a synthetic peer
+    // linkage to avoid needing a second running process — the goal is
+    // to exercise peer_creds()'s lookup discipline, not the connect
+    // path (which is covered by the syscall-level integration sites).
+    let creds_x = crate::net::unix::PeerCreds { pid: 2000, uid: 7, gid: 8 };
+    let creds_y = crate::net::unix::PeerCreds { pid: 3000, uid: 9, gid: 10 };
+    let (id_x, id_y) = crate::net::unix::socketpair(
+        crate::net::unix::SockKind::Stream, creds_x);
+    if id_x == u64::MAX || id_y == u64::MAX {
+        test_fail!("so_peercred", "second socketpair() failed");
+        // Best-effort cleanup of the first pair
+        crate::net::unix::close(id_a);
+        crate::net::unix::close(id_b);
+        return false;
+    }
+    // Manually stamp id_y with creds_y to simulate a cross-process
+    // connect (a real connect(2) call captures the connecting client's
+    // pid for the accept-side socket; here we set it directly).
+    crate::net::unix::test_only_set_creds(id_y, creds_y);
+
+    let pa = crate::net::unix::peer_creds(id_x);
+    let pb = crate::net::unix::peer_creds(id_y);
+    match pa {
+        Some(c) if c.pid == 3000 && c.uid == 9 && c.gid == 10 => {
+            test_println!("  peer_creds(id_x) = (pid=3000 uid=9 gid=10) ✓ (sees y's creds)");
+        }
+        other => {
+            test_println!("  peer_creds(id_x) = {:?} (expected pid=3000) ✗", other);
+            failed += 1;
+        }
+    }
+    match pb {
+        Some(c) if c.pid == 2000 && c.uid == 7 && c.gid == 8 => {
+            test_println!("  peer_creds(id_y) = (pid=2000 uid=7 gid=8) ✓ (sees x's creds)");
+        }
+        other => {
+            test_println!("  peer_creds(id_y) = {:?} (expected pid=2000) ✗", other);
+            failed += 1;
+        }
+    }
+
+    // Cleanup.
+    crate::net::unix::close(id_a);
+    crate::net::unix::close(id_b);
+    crate::net::unix::close(id_x);
+    crate::net::unix::close(id_y);
+
+    if failed > 0 {
+        test_fail!("so_peercred",
+            "{} peer_creds() case(s) returned wrong identity (H7 regression)",
+            failed);
+        return false;
+    }
+    test_pass!(
+        "SO_PEERCRED returns peer creator credentials per unix(7) (H7/CWE-287)"
+    );
+    true
+}
+
 // ── Test 192: eventfd blocking read wakes after a write ─────────────────────
 //
 // Per `man 2 eventfd`: "If the eventfd counter is zero at the time of the
@@ -25819,7 +25969,7 @@ fn test_recvmsg_msg_flags_overwrite() -> bool {
     test_header!("recvmsg msg_flags overwrite — sentinel must not survive (PR #129 caveat)");
 
     // Create a SEQPACKET socketpair via the kernel's unix module directly.
-    let (id_a, id_b) = crate::net::unix::socketpair(crate::net::unix::SockKind::SeqPacket);
+    let (id_a, id_b) = crate::net::unix::socketpair(crate::net::unix::SockKind::SeqPacket, crate::net::unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
     if id_a == u64::MAX || id_b == u64::MAX {
         test_fail!("recvmsg_flags", "socketpair(SEQPACKET) failed");
         return false;
@@ -28126,7 +28276,7 @@ fn test_socketpair_survives_child_close_w216() -> bool {
     use crate::net::unix::{self, SockKind, UnixState};
 
     // Step 1: create a connected pair.
-    let (id_a, id_b) = unix::socketpair(SockKind::Stream);
+    let (id_a, id_b) = unix::socketpair(SockKind::Stream, unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
     if id_a == u64::MAX || id_b == u64::MAX {
         test_fail!("socketpair_survives_child_close_w216",
             "socketpair returned invalid ids ({}, {})", id_a, id_b);
