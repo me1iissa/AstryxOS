@@ -4037,6 +4037,9 @@ fn test_linux_syscall_compat() -> bool {
     test_println!("  set_tid_address → TID {} ✓", ret);
 
     // 4. writev (write to stdout via iovecs)
+    // The iovecs array and the msg1/msg2 literals live in kernel memory.
+    // Use dispatch_linux_kernel (KernelDispatchGuard) so validate_user_ptr
+    // is bypassed — the same pattern as other in-kernel syscall tests.
     test_println!("  Testing writev...");
     let msg1 = b"musl-";
     let msg2 = b"stub";
@@ -4044,7 +4047,9 @@ fn test_linux_syscall_compat() -> bool {
         [msg1.as_ptr() as u64, msg1.len() as u64],
         [msg2.as_ptr() as u64, msg2.len() as u64],
     ];
-    let ret = crate::syscall::sys_writev(1, iovecs.as_ptr() as u64, 2);
+    let ret = crate::syscall::dispatch_linux_kernel(
+        20 /*writev*/, 1 /*fd=stdout*/, iovecs.as_ptr() as u64, 2, 0, 0, 0
+    );
     if ret != 9 { // "musl-" (5) + "stub" (4) = 9 bytes
         test_fail!("Linux syscall compat", "writev returned {} (expected 9)", ret);
         return false;
@@ -28635,7 +28640,12 @@ fn test_security_user_ptr_validation_cwe823() -> bool {
     const EFAULT: i64 = -14;
 
     // (1) sys_writev (Linux nr=20) — kernel iov_ptr must be EFAULT.
-    let r_writev = crate::syscall::dispatch_linux_kernel(20, /*fd*/1, /*iov*/KBASE, /*cnt*/1, 0, 0, 0);
+    // Use dispatch_linux directly (NOT dispatch_linux_kernel) so the
+    // KernelDispatchGuard bypass is NOT active.  The bypass was added to allow
+    // legitimate kernel-resident buffers (e.g. stack slices) to pass
+    // validate_user_ptr; here we are probing that a raw kernel-VA (KBASE)
+    // is still correctly rejected as an iovec pointer in non-bypassed context.
+    let r_writev = crate::syscall::dispatch_linux(20, /*fd*/1, /*iov*/KBASE, /*cnt*/1, 0, 0, 0);
     test_println!("  writev(fd=1, iov={:#x}, cnt=1) = {}", KBASE, r_writev);
     if r_writev != EFAULT {
         test_fail!("security_user_ptr_validation_cwe823",
@@ -28643,8 +28653,9 @@ fn test_security_user_ptr_validation_cwe823() -> bool {
         return false;
     }
 
-    // (2) sys_readv (nr=19) — same.
-    let r_readv = crate::syscall::dispatch_linux_kernel(19, /*fd*/0, /*iov*/KBASE, /*cnt*/1, 0, 0, 0);
+    // (2) sys_readv (nr=19) — same rationale: dispatch_linux (no bypass) to
+    // verify kernel-VA iov_ptr is rejected by validate_user_ptr (CWE-823).
+    let r_readv = crate::syscall::dispatch_linux(19, /*fd*/0, /*iov*/KBASE, /*cnt*/1, 0, 0, 0);
     test_println!("  readv(fd=0, iov={:#x}, cnt=1) = {}", KBASE, r_readv);
     if r_readv != EFAULT {
         test_fail!("security_user_ptr_validation_cwe823",
