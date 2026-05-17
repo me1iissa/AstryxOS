@@ -1670,6 +1670,21 @@ pub fn run() -> ! {
         if test_227_sigreturn_frame_base_ptr_validation() { passed += 1; }
     }
 
+    // ── Test 228: auto-reap doubly-orphaned zombie children on parent exit ─
+    // Verifies that exit_group_inner sweeps any Zombie child of the dying
+    // process from PROCESS_TABLE in-line (rather than leaving it to leak
+    // forever when the conventional adopter PID 1 is itself the dying
+    // process).  Closes the per-trial zombie / metrics-slot leak that the
+    // STUCK_IN_NR=231 investigation surfaced on 2026-05-17.  Per POSIX
+    // wait(2): "If the parent terminates without waiting for the child, the
+    // init process shall inherit the child."  AstryxOS plays that role for
+    // any zombie whose would-be reaper is itself dying.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_228_auto_reap_orphan_zombies() { passed += 1; }
+    }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -28923,5 +28938,120 @@ fn test_227_sigreturn_frame_base_ptr_validation() -> bool {
         return false;
     }
     test_pass!("validate_user_ptr rejects kernel-VA frame_base for SignalFrame size");
+    true
+}
+
+/// Test 228 — exit_group_inner auto-reaps Zombie children of the dying process.
+///
+/// Per POSIX wait(2): "If the parent terminates without waiting for the
+/// child, the init process shall inherit the child."  AstryxOS plays init
+/// for any zombie whose adoptive parent (PID 1) is itself exiting or
+/// already a zombie.  Without the sweep, the child's PROCESS_TABLE row
+/// and proc_metrics slot would leak for the rest of the kernel's lifetime,
+/// and the periodic PROC-METRICS dump would emit a misleading
+/// `STUCK_IN_NR=…` line for the zombie every interval.
+///
+/// Setup:
+///   1. Create two synthetic user processes A (parent) and C (child).
+///   2. Manually re-parent C to A in PROCESS_TABLE.
+///   3. Mark C Zombie out-of-band so it represents an unreaped exit.
+///   4. Call exit_group_pid(A, …) — A's teardown should sweep C.
+///
+/// Asserts:
+///   - PROCESS_TABLE no longer contains C after A's exit.
+///   - proc_metrics for C is unregistered (snapshot returns None).
+///   - C's threads are gone from THREAD_TABLE.
+fn test_228_auto_reap_orphan_zombies() -> bool {
+    use crate::proc::{PROCESS_TABLE, THREAD_TABLE, ProcessState};
+
+    test_header!("exit_group auto-reaps doubly-orphaned zombie children");
+
+    // ── 1. Two synthetic processes ───────────────────────────────────────
+    let parent_pid = match crate::proc::usermode::create_user_process(
+        "reap_parent", &crate::proc::hello_elf::HELLO_ELF
+    ) {
+        Ok(p) => p,
+        Err(e) => { test_fail!("auto_reap_orphan_zombies",
+            "create_user_process(parent): {:?}", e); return false; }
+    };
+    let child_pid = match crate::proc::usermode::create_user_process(
+        "reap_child", &crate::proc::hello_elf::HELLO_ELF
+    ) {
+        Ok(p) => p,
+        Err(e) => { test_fail!("auto_reap_orphan_zombies",
+            "create_user_process(child): {:?}", e); return false; }
+    };
+    if parent_pid == child_pid || parent_pid == 0 || child_pid == 0 {
+        test_fail!("auto_reap_orphan_zombies",
+            "bad pids parent={} child={}", parent_pid, child_pid);
+        return false;
+    }
+    test_println!("  parent PID {}, child PID {} ✓", parent_pid, child_pid);
+
+    // Collect the child's threads up front so the post-sweep check can
+    // confirm THREAD_TABLE is also cleaned up.
+    let child_tids: alloc::vec::Vec<u64> = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().filter(|t| t.pid == child_pid).map(|t| t.tid).collect()
+    };
+    if child_tids.is_empty() {
+        test_fail!("auto_reap_orphan_zombies",
+            "child pid {} has no threads", child_pid);
+        return false;
+    }
+    test_println!("  child has {} thread(s): {:?} ✓", child_tids.len(), child_tids);
+
+    // ── 2. Re-parent + mark child Zombie ─────────────────────────────────
+    {
+        let mut procs = PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == child_pid) {
+            p.parent_pid = parent_pid;
+            p.state = ProcessState::Zombie;
+            p.exit_code = 0x4242;
+        }
+    }
+    test_println!("  child re-parented to parent + marked Zombie ✓");
+
+    // ── 3. Trigger parent's exit_group out-of-band ───────────────────────
+    crate::proc::exit_group_pid(parent_pid, -1);
+
+    // ── 4. Post-conditions ───────────────────────────────────────────────
+    // (a) Child PROCESS_TABLE entry must be gone.
+    let child_present = {
+        let procs = PROCESS_TABLE.lock();
+        procs.iter().any(|p| p.pid == child_pid)
+    };
+    if child_present {
+        test_fail!("auto_reap_orphan_zombies",
+            "child PID {} still in PROCESS_TABLE after parent exit_group",
+            child_pid);
+        return false;
+    }
+    test_println!("  child PID {} swept from PROCESS_TABLE ✓", child_pid);
+
+    // (b) Metrics slot must be unregistered.
+    if crate::proc::proc_metrics::snapshot(child_pid).is_some() {
+        test_fail!("auto_reap_orphan_zombies",
+            "proc_metrics slot for child PID {} still registered", child_pid);
+        return false;
+    }
+    test_println!("  proc_metrics slot for child unregistered ✓");
+
+    // (c) Child threads must be gone from THREAD_TABLE.
+    {
+        let threads = THREAD_TABLE.lock();
+        let lingering: alloc::vec::Vec<u64> = child_tids.iter()
+            .filter(|&&t| threads.iter().any(|th| th.tid == t))
+            .copied().collect();
+        if !lingering.is_empty() {
+            test_fail!("auto_reap_orphan_zombies",
+                "THREAD_TABLE still contains child tids {:?} after sweep",
+                lingering);
+            return false;
+        }
+    }
+    test_println!("  child threads cleared from THREAD_TABLE ✓");
+
+    test_pass!("exit_group auto-reaps doubly-orphaned zombie children");
     true
 }
