@@ -1756,6 +1756,19 @@ pub fn run() -> ! {
         if test_234_cache_update_range_boundaries() { passed += 1; }
     }
 
+    // ── Test 235: ELF loader hardening (H4) ──────────────────────────────
+    // Three attacker-shaped images that the loader must reject:
+    //   (a) e_phnum > MAX_PHDRS  → ElfError::TooManyPhdrs (CWE-119)
+    //   (b) PT_LOAD p_filesz > p_memsz → ElfError::BadSegmentSize
+    //       (System V ABI Ch. 5)
+    //   (c) PT_LOAD PF_W | PF_X    → ElfError::WritableExecutable
+    //       (CWE-269, W^X enforcement)
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_235_elf_loader_hardening() { passed += 1; }
+    }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -30338,5 +30351,155 @@ fn test_234_cache_update_range_boundaries() -> bool {
     }
     let _ = crate::vfs::remove(path);
     test_pass!("mm::cache::update_range — page-boundary arithmetic");
+    true
+}
+
+// ── Test 235: ELF loader hardening (audit H4) ──────────────────────────────
+//
+// Closes finding H4 from `docs/SECURITY_AUDIT_2026-05-16.md`.  The ELF loader
+// is the first kernel surface to consume an attacker-supplied binary image —
+// before any syscalls, before any user instruction is fetched.  Three
+// hardening checks must be in place:
+//
+//   * `e_phnum <= MAX_PHDRS` (256) — caps the attacker's ability to force
+//     unbounded `unsafe` pointer reads through the program-header table.
+//     CWE-119.
+//   * `p_filesz <= p_memsz` per PT_LOAD — required by System V ABI Ch. 5
+//     ("Program Loading").  An image with `filesz > memsz` is malformed
+//     and the load-loop's downstream `min()` clamps would mask the
+//     issue.  CWE-119.
+//   * No PT_LOAD with both PF_W and PF_X — enforces W^X at load time so
+//     no statically-mapped pages are writable+executable.  JIT-style
+//     workloads must instead use `mprotect(2)` to transition between
+//     writable and executable.  CWE-269.
+//
+// Each adversarial image starts from the same valid ET_DYN base image and
+// flips exactly the field under test, so each rejection is attributable to
+// the corresponding check.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_235_elf_loader_hardening() -> bool {
+    test_header!("security: ELF loader hardening — phnum cap, filesz/memsz, W^X (audit H4)");
+
+    // Helper: build a minimal valid ET_DYN ELF with a single PT_LOAD
+    // covering the header + a trivial syscall stub.  Mirrors the ASLR
+    // self-test image shape but is built dynamically so we can mutate
+    // individual fields.
+    fn build_elf(
+        e_phnum: u16,
+        pt_load_filesz: u64,
+        pt_load_memsz: u64,
+        pt_load_flags: u32, // PF_R=4 | PF_W=2 | PF_X=1
+    ) -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec::Vec::with_capacity(181);
+        // ── ELF64 Header (64 bytes) ──
+        v.extend_from_slice(&[0x7F, b'E', b'L', b'F']); // magic
+        v.push(2); // ELFCLASS64
+        v.push(1); // ELFDATA2LSB
+        v.push(1); // EI_VERSION
+        v.push(0); // EI_OSABI
+        v.extend_from_slice(&[0u8; 8]); // padding
+        v.extend_from_slice(&3u16.to_le_bytes()); // e_type = ET_DYN
+        v.extend_from_slice(&62u16.to_le_bytes()); // e_machine = EM_X86_64
+        v.extend_from_slice(&1u32.to_le_bytes()); // e_version
+        v.extend_from_slice(&0x78u64.to_le_bytes()); // e_entry
+        v.extend_from_slice(&64u64.to_le_bytes()); // e_phoff = 64
+        v.extend_from_slice(&0u64.to_le_bytes());  // e_shoff = 0
+        v.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+        v.extend_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        v.extend_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        v.extend_from_slice(&e_phnum.to_le_bytes()); // e_phnum
+        v.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
+        v.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
+        v.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+        // ── ONE PT_LOAD header (56 bytes) ──
+        // (When e_phnum is large we still only write the one we use; the
+        // loader walks ph_count entries against bounds — we want it to
+        // reject before any walk on the first test variant.)
+        v.extend_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
+        v.extend_from_slice(&pt_load_flags.to_le_bytes()); // p_flags
+        v.extend_from_slice(&0u64.to_le_bytes()); // p_offset
+        v.extend_from_slice(&0u64.to_le_bytes()); // p_vaddr
+        v.extend_from_slice(&0u64.to_le_bytes()); // p_paddr
+        v.extend_from_slice(&pt_load_filesz.to_le_bytes()); // p_filesz
+        v.extend_from_slice(&pt_load_memsz.to_le_bytes());  // p_memsz
+        v.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
+        // Pad out so the image is at least 0xB5 bytes (matches the
+        // working ASLR self-test image and clears any downstream
+        // length-based bounds checks on the file image).
+        while v.len() < 0xB5 { v.push(0); }
+        v
+    }
+
+    use crate::proc::elf::ElfError;
+    use crate::mm::vma::VmSpace;
+
+    // (a) e_phnum > MAX_PHDRS (257 > 256) → TooManyPhdrs.
+    {
+        let elf = build_elf(257, 0xB5, 0xB5, 5); // PF_R | PF_X
+        // Fresh VM so a partial load does not leak into other tests.
+        let vm = match VmSpace::new_user() {
+            Some(v) => v,
+            None => { test_fail!("test235", "VmSpace::new_user() failed (a)"); return false; }
+        };
+        match crate::proc::elf::load_elf(&elf, vm.cr3) {
+            Err(ElfError::TooManyPhdrs) => {
+                test_println!("  (a) e_phnum=257 → TooManyPhdrs ✓");
+            }
+            Err(e) => {
+                test_fail!("test235", "e_phnum=257 returned {:?} (want TooManyPhdrs)", e);
+                return false;
+            }
+            Ok(_) => {
+                test_fail!("test235", "e_phnum=257 accepted (must be rejected)");
+                return false;
+            }
+        }
+    }
+
+    // (b) PT_LOAD p_filesz > p_memsz → BadSegmentSize.
+    {
+        let elf = build_elf(1, 0x2000, 0x1000, 5); // filesz=8K, memsz=4K
+        let vm = match VmSpace::new_user() {
+            Some(v) => v,
+            None => { test_fail!("test235", "VmSpace::new_user() failed (b)"); return false; }
+        };
+        match crate::proc::elf::load_elf(&elf, vm.cr3) {
+            Err(ElfError::BadSegmentSize) => {
+                test_println!("  (b) filesz > memsz → BadSegmentSize ✓");
+            }
+            Err(e) => {
+                test_fail!("test235", "filesz>memsz returned {:?} (want BadSegmentSize)", e);
+                return false;
+            }
+            Ok(_) => {
+                test_fail!("test235", "filesz>memsz accepted (must be rejected)");
+                return false;
+            }
+        }
+    }
+
+    // (c) PT_LOAD PF_W | PF_X → WritableExecutable.
+    {
+        let elf = build_elf(1, 0xB5, 0xB5, 7); // PF_R | PF_W | PF_X = 7
+        let vm = match VmSpace::new_user() {
+            Some(v) => v,
+            None => { test_fail!("test235", "VmSpace::new_user() failed (c)"); return false; }
+        };
+        match crate::proc::elf::load_elf(&elf, vm.cr3) {
+            Err(ElfError::WritableExecutable) => {
+                test_println!("  (c) PF_W | PF_X → WritableExecutable ✓");
+            }
+            Err(e) => {
+                test_fail!("test235", "W+X returned {:?} (want WritableExecutable)", e);
+                return false;
+            }
+            Ok(_) => {
+                test_fail!("test235", "W+X accepted (must be rejected)");
+                return false;
+            }
+        }
+    }
+
+    test_pass!("ELF loader rejects e_phnum>256, filesz>memsz, W+X PT_LOAD (CWE-119/CWE-269)");
     true
 }
