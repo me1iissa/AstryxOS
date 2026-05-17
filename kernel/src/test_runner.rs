@@ -1756,6 +1756,21 @@ pub fn run() -> ! {
         if test_234_cache_update_range_boundaries() { passed += 1; }
     }
 
+    // ── Test 238: FUTEX_WAKE_GHOST cluster diagnostic ─────────────────────
+    // Exercises the `[FUTEX_WAKE_GHOST]` diagnostic added near the
+    // FUTEX_WAKE arm of `sys_futex_linux`.  Per POSIX
+    // pthread_cond_signal(3p) and futex(2), FUTEX_WAKE legitimately
+    // returns woken=0 when no thread is parked on the asked uaddr — the
+    // diagnostic flags the subset where a sibling within the same
+    // 256-byte cluster IS parked, which is the PNG-2 shape.  Compiled in
+    // when either `firefox-test` (primary consumer) or `test-mode`
+    // (so the kernel test suite can verify the diagnostic) is enabled.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_238_futex_wake_ghost_cluster() { passed += 1; }
+    }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -30338,5 +30353,135 @@ fn test_234_cache_update_range_boundaries() -> bool {
     }
     let _ = crate::vfs::remove(path);
     test_pass!("mm::cache::update_range — page-boundary arithmetic");
+    true
+}
+
+// ── Test 238: FUTEX_WAKE_GHOST cluster diagnostic ────────────────────────
+//
+// Asserts that a `FUTEX_WAKE` syscall which returns `woken=0` AND has a
+// sibling waiter in the same 256-byte cluster as the caller's uaddr emits
+// the `[FUTEX_WAKE_GHOST]` diagnostic (visible via the
+// `FUTEX_WAKE_GHOST_COUNT` counter).
+//
+// The diagnostic is intended to characterise the PNG-2 plateau where
+// `pthread_cond_signal` issues `FUTEX_WAKE` returning `woken=0` while a
+// waiter is parked on an adjacent `pthread_cond_t` field inside an
+// enclosing object (typically a Mozilla `Monitor` containing several
+// cond_vars).  Cluster width is fixed at 256 bytes — wide enough to span a
+// small composite locking object holding multiple cond_var fields, narrow
+// enough to avoid picking up unrelated futexes elsewhere in the page.
+//
+// References:
+//   - POSIX pthread_cond_signal(3p): "If no threads are blocked on the
+//     condition variable, then pthread_cond_signal() shall have no
+//     effect."
+//   - futex(2) — FUTEX_WAKE returns the number of waiters woken, which may
+//     be zero.
+//
+// The test directly manipulates the kernel `FUTEX_WAITERS` map to enqueue
+// a synthetic sibling waiter, then invokes `sys_futex_linux` with op =
+// FUTEX_WAKE on a different uaddr in the same cluster.  No real userspace
+// threads are involved — the goal is to exercise the kernel-side
+// diagnostic logic deterministically.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_238_futex_wake_ghost_cluster() -> bool {
+    use core::sync::atomic::Ordering;
+    test_header!("subsys/linux: FUTEX_WAKE_GHOST cluster diagnostic");
+
+    let pid = crate::proc::current_pid_lockless();
+
+    // Choose a 256-byte cluster anchor in a region of the user VA space we
+    // will not actually dereference.  These uaddrs never get a backing
+    // store and are never read/written by the kernel — they are pure
+    // keys into FUTEX_WAITERS.  Pick an unmapped page in the user-VA
+    // half so any accidental access would fault loudly instead of
+    // corrupting state.  The first byte of the 4 KiB region whose VA is
+    // 0x0000_5555_dead_0000 is well outside both stack and heap on the
+    // test image.
+    let cluster_base: u64 = 0x0000_5555_dead_0000;
+    let uaddr_signal:  u64 = cluster_base;          // target of WAKE
+    let uaddr_sibling: u64 = cluster_base + 16;     // 16 B inside cluster
+    let uaddr_far:     u64 = cluster_base + 0x400;  // 1 KiB away — outside cluster
+
+    // Use a synthetic TID for the parked "waiter".  It does not need to
+    // correspond to a real thread; the diagnostic only reads the TID and
+    // logs it.
+    let fake_tid: u64 = 0xFE_DEAD_BEEF_F238u64;
+
+    // Snapshot pre-call counter.
+    let pre = crate::subsys::linux::syscall::FUTEX_WAKE_GHOST_COUNT
+        .load(Ordering::Relaxed);
+
+    // Inject a synthetic sibling waiter at `uaddr_sibling`.  Hold the
+    // lock for the minimum scope.
+    {
+        let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
+        waiters
+            .entry((pid, uaddr_sibling))
+            .or_insert_with(alloc::vec::Vec::new)
+            .push(fake_tid);
+    }
+    // Also inject a far-away waiter that lives outside the cluster — the
+    // diagnostic must NOT report this one.
+    {
+        let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
+        waiters
+            .entry((pid, uaddr_far))
+            .or_insert_with(alloc::vec::Vec::new)
+            .push(fake_tid.wrapping_add(1));
+    }
+    test_println!(
+        "  injected sibling waiter at uaddr={:#x} (+16) and far waiter at {:#x} (+0x400)",
+        uaddr_sibling, uaddr_far
+    );
+
+    // Call FUTEX_WAKE on the cluster anchor — no waiter is parked there,
+    // so woken=0 is expected.  This is the trigger for the GHOST scan.
+    //   op = 1 (FUTEX_WAKE), val = 1 (wake-one), all other args zero.
+    let woken = crate::subsys::linux::syscall::sys_futex_linux(
+        uaddr_signal, 1, 1, 0, 0, 0
+    );
+    test_println!("  sys_futex_linux WAKE returned {}", woken);
+
+    // Drain the synthetic waiters we injected so we leave the table clean
+    // regardless of pass/fail (subsequent tests must not see fake_tid).
+    {
+        let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
+        let _ = waiters.remove(&(pid, uaddr_sibling));
+        let _ = waiters.remove(&(pid, uaddr_far));
+    }
+
+    let post = crate::subsys::linux::syscall::FUTEX_WAKE_GHOST_COUNT
+        .load(Ordering::Relaxed);
+    let delta = post.wrapping_sub(pre);
+
+    if woken != 0 {
+        test_fail!("test238",
+            "FUTEX_WAKE returned {} expected 0 (no waiter on caller uaddr)",
+            woken);
+        return false;
+    }
+
+    if delta == 0 {
+        test_fail!("test238",
+            "FUTEX_WAKE_GHOST counter did not advance (pre={} post={}) — \
+             diagnostic did not fire despite sibling waiter at +16 B",
+            pre, post);
+        return false;
+    }
+    // Exactly one sibling at +16 B inside the cluster — exactly one ghost
+    // emission expected.  The +0x400 waiter is outside the cluster and
+    // must not contribute.
+    if delta != 1 {
+        test_fail!("test238",
+            "FUTEX_WAKE_GHOST counter advanced by {} expected 1 — \
+             far waiter (+0x400) outside cluster appears to have leaked in",
+            delta);
+        return false;
+    }
+    test_println!("  GHOST counter advanced by 1 (sibling in cluster) ✓");
+    test_println!("  far waiter (+0x400) did NOT trigger diagnostic ✓");
+
+    test_pass!("subsys/linux: FUTEX_WAKE_GHOST cluster diagnostic");
     true
 }
