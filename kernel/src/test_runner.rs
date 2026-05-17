@@ -1706,6 +1706,16 @@ pub fn run() -> ! {
     total += 1;
     if test_230_so_peercred_returns_peer_pid() { passed += 1; }
 
+    // ── Test 230b: client-side SO_PEERCRED via connect() path ────────────
+    // Exercises the connect(2) code path: the client calls connect(), and
+    // peer_creds(client_fd) must return the SERVER's identity (not the
+    // client's own).  Regression for the accept-side stamping bug (PR #274
+    // review finding): previously the accept-side socket was stamped with
+    // client_creds instead of server_creds, so the client saw its own pid
+    // via SO_PEERCRED.  Cite unix(7) SO_PEERCRED; CWE-287.
+    total += 1;
+    if test_230b_peercred_connect_path() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -23797,6 +23807,126 @@ fn test_230_so_peercred_returns_peer_pid() -> bool {
     }
     test_pass!(
         "SO_PEERCRED returns peer creator credentials per unix(7) (H7/CWE-287)"
+    );
+    true
+}
+
+// ── Test 230b: client-side SO_PEERCRED via connect() path ───────────────────
+//
+// unix(7) SO_PEERCRED: "Returns the credentials of the peer process connected
+// to this socket.  The credentials are those that were in effect at the time of
+// the call to connect(2) or socketpair(2)."  For a connect(2)-established pair:
+//
+//   * The CLIENT calls `peer_creds(client_fd)` → peer is the accept-side slot
+//     → accept-side slot must carry the SERVER's creator credentials.
+//   * The SERVER calls `peer_creds(server_fd)` → peer is the client slot
+//     → client slot carries the client's creator credentials (already correct).
+//
+// Pre-fix, connect() stamped the accept-side slot with `client_creds` (the
+// connecting process's identity), so peer_creds(client_fd) returned the client's
+// own pid — a CWE-287 (Improper Authentication) bug that defeated every IPC auth
+// scheme relying on SO_PEERCRED to identify the SERVER (D-Bus service activation,
+// Firefox IPC broker gating, systemd PrivateUsers checks).
+//
+// This test drives the kernel-level primitives directly without a second process:
+//   1. Create a server socket (PID=9000), bind, listen.
+//   2. Create a client socket (PID=8000), connect.
+//   3. Assert peer_creds(client_fd) == 9000 (server's identity).
+//   4. Assert peer_creds(accepted_fd) == 8000 (client's identity).
+//
+// References: unix(7) SO_PEERCRED; POSIX.1-2017 §getsockopt; CWE-287.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_230b_peercred_connect_path() -> bool {
+    test_header!("AF_UNIX SO_PEERCRED client-side stamping via connect() path");
+
+    let server_creds = crate::net::unix::PeerCreds { pid: 9000, uid: 1, gid: 2 };
+    let client_creds = crate::net::unix::PeerCreds { pid: 8000, uid: 3, gid: 4 };
+
+    // Create the server socket and bind it to a test path.
+    let srv_id = crate::net::unix::create(crate::net::unix::SockKind::Stream, server_creds);
+    if srv_id == u64::MAX {
+        test_fail!("peercred_connect", "server create() failed");
+        return false;
+    }
+    let bind_path = b"/tmp/.test230b_srv\0";
+    let r = crate::net::unix::bind(srv_id, bind_path);
+    if r != 0 {
+        test_fail!("peercred_connect", "server bind() returned {}", r);
+        crate::net::unix::close(srv_id);
+        return false;
+    }
+    let r = crate::net::unix::listen(srv_id);
+    if r != 0 {
+        test_fail!("peercred_connect", "server listen() returned {}", r);
+        crate::net::unix::close(srv_id);
+        return false;
+    }
+
+    // Create the client socket and connect.
+    let cli_id = crate::net::unix::create(crate::net::unix::SockKind::Stream, client_creds);
+    if cli_id == u64::MAX {
+        test_fail!("peercred_connect", "client create() failed");
+        crate::net::unix::close(srv_id);
+        return false;
+    }
+    let r = crate::net::unix::connect(cli_id, bind_path, client_creds);
+    if r != 0 {
+        test_fail!("peercred_connect", "client connect() returned {}", r);
+        crate::net::unix::close(cli_id);
+        crate::net::unix::close(srv_id);
+        return false;
+    }
+
+    // Accept: pull the first pending connection from the backlog.
+    let acc_raw = crate::net::unix::accept(srv_id);
+    if acc_raw < 0 {
+        test_fail!("peercred_connect", "server accept() returned {}", acc_raw);
+        crate::net::unix::close(cli_id);
+        crate::net::unix::close(srv_id);
+        return false;
+    }
+    let acc_id = acc_raw as u64;
+
+    let mut failed: u32 = 0;
+
+    // peer_creds(client_fd) must return the SERVER's identity.
+    match crate::net::unix::peer_creds(cli_id) {
+        Some(c) if c.pid == 9000 && c.uid == 1 && c.gid == 2 => {
+            test_println!("  peer_creds(client_fd) = (pid=9000 uid=1 gid=2) ✓ (server identity)");
+        }
+        other => {
+            test_println!(
+                "  peer_creds(client_fd) = {:?}; expected pid=9000 (server) ✗", other);
+            failed += 1;
+        }
+    }
+
+    // peer_creds(accepted_fd) must return the CLIENT's identity.
+    match crate::net::unix::peer_creds(acc_id) {
+        Some(c) if c.pid == 8000 && c.uid == 3 && c.gid == 4 => {
+            test_println!("  peer_creds(accepted_fd) = (pid=8000 uid=3 gid=4) ✓ (client identity)");
+        }
+        other => {
+            test_println!(
+                "  peer_creds(accepted_fd) = {:?}; expected pid=8000 (client) ✗", other);
+            failed += 1;
+        }
+    }
+
+    crate::net::unix::close(cli_id);
+    crate::net::unix::close(acc_id);
+    crate::net::unix::close(srv_id);
+
+    if failed > 0 {
+        test_fail!(
+            "peercred_connect",
+            "{} case(s) wrong; accept-side socket must carry server creds per unix(7)",
+            failed
+        );
+        return false;
+    }
+    test_pass!(
+        "connect() accept-side stamped with server_creds; client sees server identity (CWE-287)"
     );
     true
 }

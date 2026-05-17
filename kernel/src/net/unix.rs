@@ -267,7 +267,7 @@ pub fn listen(id: u64) -> i64 {
     }
 }
 
-pub fn connect(id: u64, path: &[u8], client_creds: PeerCreds) -> i64 {
+pub fn connect(id: u64, path: &[u8], _client_creds: PeerCreds) -> i64 {
     if id as usize >= MAX_UNIX_SOCKETS { return -9; }
     // Strip trailing NUL to match paths stored by bind.
     let raw_len = path.iter().position(|&b| b == 0).unwrap_or(path.len());
@@ -289,6 +289,15 @@ pub fn connect(id: u64, path: &[u8], client_creds: PeerCreds) -> i64 {
     // POSIX: connect on a wrong-type socket fails (Linux returns EPROTOTYPE).
     if client_kind != server_kind { return -91; } // EPROTOTYPE
 
+    // Snapshot the server's creator credentials before the mutable borrow
+    // below — we cannot hold a shared reference into `t.0[server_id]` while
+    // simultaneously iterating `t.0` mutably.
+    let server_creds = PeerCreds {
+        pid: t.0[server_id as usize].creator_pid,
+        uid: t.0[server_id as usize].creator_uid,
+        gid: t.0[server_id as usize].creator_gid,
+    };
+
     let peer_id = {
         let mut found = u64::MAX;
         for (i, s) in t.0.iter_mut().enumerate() {
@@ -298,15 +307,18 @@ pub fn connect(id: u64, path: &[u8], client_creds: PeerCreds) -> i64 {
                 s.kind        = server_kind;
                 s.peer_id     = id;
                 s.ref_count   = 1; // one reference: the fd returned by accept(2)
-                // The accept-side socket's *creator* is the connecting
-                // client.  A later getsockopt(SO_PEERCRED) on the client
-                // fd looks up the peer (this accept-side socket) and
-                // returns its creator — i.e. the client itself for a
-                // localhost connection, or the actual remote process for
-                // a cross-process IPC pair.  Per unix(7) SO_PEERCRED.
-                s.creator_pid = client_creds.pid;
-                s.creator_uid = client_creds.uid;
-                s.creator_gid = client_creds.gid;
+                // Per unix(7) SO_PEERCRED: "Returns the credentials of the peer
+                // process connected to this socket."  The peer of the CLIENT
+                // socket is this accept-side slot, so peer_creds(client_fd) looks
+                // up accept_side.creator_{pid,uid,gid}.  That must be the
+                // SERVER's identity — not the client's.
+                //
+                // Conversely, peer_creds(server_accepted_fd) looks up
+                // client_socket.creator_{pid,uid,gid}, which is set at create(2)
+                // time and already holds the client's identity (correct).
+                s.creator_pid = server_creds.pid;
+                s.creator_uid = server_creds.uid;
+                s.creator_gid = server_creds.gid;
                 found = i as u64;
                 break;
             }
@@ -317,11 +329,9 @@ pub fn connect(id: u64, path: &[u8], client_creds: PeerCreds) -> i64 {
 
     t.0[id as usize].state   = UnixState::Connected;
     t.0[id as usize].peer_id = peer_id;
-    // The client-side socket retains its own creator credentials
-    // (captured at create-time).  A getsockopt(SO_PEERCRED) on the
-    // server-accepted fd will look up THIS socket's creator and return
-    // those credentials — the connecting client's identity, as required
-    // by unix(7) SO_PEERCRED.
+    // The client-side socket retains its own creator credentials (captured at
+    // create(2) time).  peer_creds(server_accepted_fd) looks up THIS socket's
+    // creator_* and returns the connecting client's identity — per unix(7).
 
     let srv = &mut t.0[server_id as usize];
     if srv.backlog_len < BACKLOG_CAP {
