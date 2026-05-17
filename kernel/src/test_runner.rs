@@ -1739,6 +1739,23 @@ pub fn run() -> ! {
     total += 1;
     if test_230b_peercred_connect_path() { passed += 1; }
 
+    // ── Tests 232-234: VFS write-path page-cache coherency ────────────────
+    // POSIX mmap(2) MAP_SHARED + write(2) visibility — write_file /
+    // append_file / fd_write must propagate written bytes into any
+    // existing page-cache entries for the (mount, inode, page_offset)
+    // tuples touched, so subsequent mmap fault hits and existing
+    // mmap'd PTEs both observe the new content.  See
+    // `mm::cache::update_range` for the contract.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_232_vfs_write_page_cache_coherency() { passed += 1; }
+        total += 1;
+        if test_233_vfs_append_page_cache_coherency() { passed += 1; }
+        total += 1;
+        if test_234_cache_update_range_boundaries() { passed += 1; }
+    }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -23984,7 +24001,7 @@ fn test_230b_peercred_connect_path() -> bool {
         test_fail!("peercred_connect", "server create() failed");
         return false;
     }
-    let bind_path = b"/tmp/.test230b_srv\0";
+    let bind_path = b"/tmp/.test233b_srv\0";
     let r = crate::net::unix::bind(srv_id, bind_path);
     if r != 0 {
         test_fail!("peercred_connect", "server bind() returned {}", r);
@@ -29936,5 +29953,390 @@ fn test_228_auto_reap_orphan_zombies() -> bool {
     test_println!("  child threads cleared from THREAD_TABLE ✓");
 
     test_pass!("exit_group auto-reaps doubly-orphaned zombie children");
+    true
+}
+
+// ── Test 232: VFS write-path page-cache coherency (POSIX mmap+write) ──────
+//
+// Regression test for the cache-coherency gap discovered while
+// classifying the W215 residual CRC-MISMATCH events (post-PR-#270): the
+// `vfs::fd_write` / `vfs::write_file` paths called `fs.write` directly
+// without updating the page cache, so a subsequent mmap(MAP_SHARED)
+// fault on the same (mount, inode, file_offset) would see the
+// pre-write bytes (the cache-resident page) until the entry was
+// evicted.
+//
+// IEEE Std 1003.1-2017 mmap(2):
+//   "The MAP_SHARED flag shall require that the file mapping shall be
+//   shared with all other mappings of the same file ... Modifications
+//   to the file shall be visible to all processes that have mapped the
+//   file MAP_SHARED."
+//
+// IEEE Std 1003.1-2017 write(2):
+//   "After a successful return from write(), any successful read() from
+//   each byte position in the file that was modified by that write
+//   shall return the data specified by the write() for that position
+//   until such byte positions are again modified."
+//
+// Composed: a successful `write(2)` to a file must be visible to any
+// process that subsequently reads the file's bytes through a
+// MAP_SHARED mmap region — including any *currently-mapped* region,
+// because there is no userspace event between the write and the next
+// memory access.
+//
+// The test simulates the mmap'd region by directly inserting a
+// page-cache entry for a tmpfs inode (the same key shape the demand-
+// page fault handler uses), then issues a `vfs::write_file` and reads
+// the cache page through the higher-half identity map.  Pre-fix
+// behaviour: cache bytes unchanged (FAIL).  Post-fix: cache bytes
+// match the written data (PASS).
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_232_vfs_write_page_cache_coherency() -> bool {
+    test_header!("VFS sys_write / page-cache coherency (POSIX mmap+write contract)");
+
+    // Pre-conditions: /tmp is mounted (tmpfs).  Use a unique filename so the
+    // test is idempotent across re-runs.
+    let path = "/tmp/test232_cache_coh.bin";
+    let _ = crate::vfs::remove(path); // cleanup any prior run
+    if let Err(e) = crate::vfs::create_file(path) {
+        test_fail!("test232", "create_file({}) failed: {:?}", path, e);
+        return false;
+    }
+    test_println!("  created {} ✓", path);
+
+    // Write initial content "AAAA...AAAA" (one full page).
+    let initial: [u8; 4096] = [b'A'; 4096];
+    match crate::vfs::write_file(path, &initial) {
+        Ok(n) => {
+            if n != initial.len() {
+                test_fail!("test232", "initial write returned {} (expected {})", n, initial.len());
+                let _ = crate::vfs::remove(path);
+                return false;
+            }
+        }
+        Err(e) => {
+            test_fail!("test232", "write_file initial failed: {:?}", e);
+            let _ = crate::vfs::remove(path);
+            return false;
+        }
+    }
+    test_println!("  initial write 4096B 'A' ✓");
+
+    // Resolve (mount_idx, inode) so we can simulate the mmap-fault cache
+    // entry directly.  This is what the demand-page fault handler does:
+    // alloc a PMM frame, memcpy file bytes into it, `cache::insert`.
+    let (mount_idx, inode) = match crate::vfs::resolve_path(path) {
+        Ok(r) => r,
+        Err(e) => {
+            test_fail!("test232", "resolve_path failed: {:?}", e);
+            let _ = crate::vfs::remove(path);
+            return false;
+        }
+    };
+    test_println!("  resolved {} → (mount={}, inode={})", path, mount_idx, inode);
+
+    // Allocate a PMM frame, fill with the current file content (simulating
+    // a freshly demand-paged mmap), then insert into the page cache.
+    let phys = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => {
+            test_fail!("test232", "pmm::alloc_page failed");
+            let _ = crate::vfs::remove(path);
+            return false;
+        }
+    };
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    let cache_va = (PHYS_OFF + phys) as *mut u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(initial.as_ptr(), cache_va, 4096);
+    }
+    crate::mm::cache::insert(mount_idx, inode, 0, phys);
+    // Verify lookup returns our phys (sanity).
+    let cached = crate::mm::cache::lookup(mount_idx, inode, 0);
+    if cached != Some(phys) {
+        test_fail!("test232", "cache lookup returned {:?}, expected {:#x}", cached, phys);
+        let _ = crate::vfs::remove(path);
+        return false;
+    }
+    test_println!("  injected cache entry: phys={:#x} ✓", phys);
+
+    // Sanity: cache page currently holds 'A' bytes.
+    let pre_byte = unsafe { core::ptr::read_volatile(cache_va) };
+    if pre_byte != b'A' {
+        test_fail!("test232", "cache page first byte {:#x} (expected 'A')", pre_byte);
+        let _ = crate::vfs::remove(path);
+        return false;
+    }
+    test_println!("  pre-write cache[0] = 'A' ✓");
+
+    // Now issue write_file with NEW content — should propagate into the
+    // cache page in place per POSIX mmap(2) MAP_SHARED visibility.
+    let replacement: [u8; 4096] = [b'B'; 4096];
+    match crate::vfs::write_file(path, &replacement) {
+        Ok(n) => {
+            if n != replacement.len() {
+                test_fail!("test232", "replacement write returned {} (expected {})", n, replacement.len());
+                let _ = crate::vfs::remove(path);
+                return false;
+            }
+        }
+        Err(e) => {
+            test_fail!("test232", "write_file replacement failed: {:?}", e);
+            let _ = crate::vfs::remove(path);
+            return false;
+        }
+    }
+    test_println!("  write_file 4096B 'B' ✓");
+
+    // Verify: the cache page MUST now hold 'B' bytes.  Pre-fix: it still
+    // held 'A'.  Read the first byte and the last byte through the
+    // identity map.
+    let post_first = unsafe { core::ptr::read_volatile(cache_va) };
+    let post_last  = unsafe { core::ptr::read_volatile(cache_va.add(4095)) };
+    if post_first != b'B' || post_last != b'B' {
+        test_fail!("test232",
+            "cache[0]={:#x} cache[4095]={:#x} (both expected 'B'=0x42) — \
+             write_file did not propagate to page cache",
+            post_first, post_last);
+        // Best-effort cleanup: evict our injected entry, free phys.
+        let _ = crate::mm::cache::evict(mount_idx, inode, 0);
+        let _ = crate::vfs::remove(path);
+        return false;
+    }
+    test_println!("  post-write cache[0]='B', cache[4095]='B' ✓");
+
+    // Test fd_write path too: open file via Linux open(2), write, verify.
+    // Skipped here — kernel-test infrastructure for Linux syscalls is
+    // covered by the broader linux-syscall tests; this test focuses on
+    // the in-kernel coherency invariant which is the same regardless of
+    // entry path.
+
+    // Cleanup: evict, drop our reference, remove file.
+    let _ = crate::mm::cache::evict(mount_idx, inode, 0);
+    // After evict, the cache's own ref was released; if no other refs
+    // remain the frame is on the quarantine queue and will be freed
+    // by the TLB grace period.
+    let _ = crate::vfs::remove(path);
+    test_println!("  cleanup ✓");
+
+    test_pass!("VFS sys_write / page-cache coherency (POSIX mmap+write contract)");
+    true
+}
+
+// ── Test 233: VFS append_file page-cache coherency ───────────────────────
+//
+// The append path (`vfs::append_file`) was on the same code path as
+// `fd_write` with O_APPEND: it issued `fs.write(inode, EOF, data)`
+// without updating the page cache.  This means a writer that appended
+// to a file would not have those bytes reflected in any mmap'd region
+// that covered the appended-to tail page (the page that previously
+// held EOF and was extended into).
+//
+// IEEE Std 1003.1-2017 mmap(2) bounds map-sized to the file at mmap
+// time; the appended region beyond `file_size_at_mmap` is permitted
+// to produce SIGBUS.  But the *tail page* — the partial last page —
+// is in-bounds for the mapping and must observe the appended bytes
+// per the same MAP_SHARED visibility contract.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_233_vfs_append_page_cache_coherency() -> bool {
+    test_header!("VFS append_file / page-cache coherency (tail-page update)");
+
+    let path = "/tmp/test233_append_coh.bin";
+    let _ = crate::vfs::remove(path);
+    if let Err(e) = crate::vfs::create_file(path) {
+        test_fail!("test233", "create_file failed: {:?}", e);
+        return false;
+    }
+    // Write 100 bytes of 'A' (partial first page).
+    let initial: [u8; 100] = [b'A'; 100];
+    if let Err(e) = crate::vfs::write_file(path, &initial) {
+        test_fail!("test233", "initial write_file failed: {:?}", e);
+        let _ = crate::vfs::remove(path);
+        return false;
+    }
+    test_println!("  initial 100B 'A' ✓");
+
+    let (mount_idx, inode) = match crate::vfs::resolve_path(path) {
+        Ok(r) => r,
+        Err(e) => {
+            test_fail!("test233", "resolve_path failed: {:?}", e);
+            let _ = crate::vfs::remove(path);
+            return false;
+        }
+    };
+
+    // Simulate a mmap'd tail page: cache covers file offset 0 with
+    // current bytes.
+    let phys = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => {
+            test_fail!("test233", "pmm::alloc_page failed");
+            let _ = crate::vfs::remove(path);
+            return false;
+        }
+    };
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    let cache_va = (PHYS_OFF + phys) as *mut u8;
+    unsafe {
+        core::ptr::write_bytes(cache_va, 0, 4096);
+        core::ptr::copy_nonoverlapping(initial.as_ptr(), cache_va, 100);
+    }
+    crate::mm::cache::insert(mount_idx, inode, 0, phys);
+    test_println!("  injected cache page phys={:#x} (offset 0) ✓", phys);
+
+    // Append 50 bytes of 'C' — starts at file offset 100, still in the
+    // tail page that is cached.
+    let suffix: [u8; 50] = [b'C'; 50];
+    if let Err(e) = crate::vfs::append_file(path, &suffix) {
+        test_fail!("test233", "append_file failed: {:?}", e);
+        let _ = crate::mm::cache::evict(mount_idx, inode, 0);
+        let _ = crate::vfs::remove(path);
+        return false;
+    }
+    test_println!("  append 50B 'C' at offset 100 ✓");
+
+    // The cache page should now hold 'A'*100 + 'C'*50 + zero tail.
+    let byte_99   = unsafe { core::ptr::read_volatile(cache_va.add(99))  };
+    let byte_100  = unsafe { core::ptr::read_volatile(cache_va.add(100)) };
+    let byte_149  = unsafe { core::ptr::read_volatile(cache_va.add(149)) };
+    let byte_150  = unsafe { core::ptr::read_volatile(cache_va.add(150)) };
+    let ok = byte_99 == b'A' && byte_100 == b'C' && byte_149 == b'C' && byte_150 == 0;
+    if !ok {
+        test_fail!("test233",
+            "cache[99]={:#x} cache[100]={:#x} cache[149]={:#x} cache[150]={:#x} \
+             (expected 0x41 0x43 0x43 0x00) — append_file did not propagate",
+            byte_99, byte_100, byte_149, byte_150);
+        let _ = crate::mm::cache::evict(mount_idx, inode, 0);
+        let _ = crate::vfs::remove(path);
+        return false;
+    }
+    test_println!("  cache: [99]='A' [100]='C' [149]='C' [150]=0 ✓");
+
+    let _ = crate::mm::cache::evict(mount_idx, inode, 0);
+    let _ = crate::vfs::remove(path);
+    test_pass!("VFS append_file / page-cache coherency (tail-page update)");
+    true
+}
+
+// ── Test 234: cache::update_range unit test (boundaries) ─────────────────
+//
+// Property test for the new `mm::cache::update_range` helper: the
+// per-page intersection arithmetic must be correct across page
+// boundaries (page-aligned start, partial first page, partial last
+// page, multi-page write spanning whole interior pages, write entirely
+// within one page).
+//
+// The unit test inserts three contiguous cache pages (offsets 0, 4096,
+// 8192) for a synthetic inode in a real mount, then invokes
+// `update_range` with a span that starts inside page 0 and ends inside
+// page 2, and verifies that:
+//
+//   - page 0 retains its prefix (bytes before the write start)
+//   - page 0 has the write suffix
+//   - page 1 is entirely overwritten
+//   - page 2 has the write prefix (bytes up to write end)
+//   - page 2 retains its suffix (bytes after the write end)
+//
+// Uses `/tmp` (tmpfs) so the cache entries can be safely injected
+// against a real (mount, inode) without disturbing the rest of the
+// suite.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_234_cache_update_range_boundaries() -> bool {
+    test_header!("mm::cache::update_range — page-boundary arithmetic");
+
+    let path = "/tmp/test234_update_range.bin";
+    let _ = crate::vfs::remove(path);
+    if let Err(e) = crate::vfs::create_file(path) {
+        test_fail!("test234", "create_file failed: {:?}", e);
+        return false;
+    }
+    // Pre-extend the file to 12 KiB so the offsets we use are in-bounds
+    // for any tmpfs/ramfs sanity checks.
+    let zeros: [u8; 12 * 1024] = [0u8; 12 * 1024];
+    if let Err(e) = crate::vfs::write_file(path, &zeros) {
+        test_fail!("test234", "extend write failed: {:?}", e);
+        let _ = crate::vfs::remove(path);
+        return false;
+    }
+    let (mount_idx, inode) = match crate::vfs::resolve_path(path) {
+        Ok(r) => r,
+        Err(e) => {
+            test_fail!("test234", "resolve_path failed: {:?}", e);
+            let _ = crate::vfs::remove(path);
+            return false;
+        }
+    };
+
+    // Inject three cache pages filled with 'X' (the pre-write content).
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    let mut physes = [0u64; 3];
+    for (i, p) in physes.iter_mut().enumerate() {
+        let phys = match crate::mm::pmm::alloc_page() {
+            Some(p) => p,
+            None => {
+                test_fail!("test234", "pmm alloc_page #{} failed", i);
+                let _ = crate::vfs::remove(path);
+                return false;
+            }
+        };
+        *p = phys;
+        let va = (PHYS_OFF + phys) as *mut u8;
+        unsafe { core::ptr::write_bytes(va, b'X', 4096); }
+        crate::mm::cache::insert(mount_idx, inode, (i as u64) * 4096, phys);
+    }
+    test_println!("  injected 3 cache pages ({:#x},{:#x},{:#x}) ✓",
+        physes[0], physes[1], physes[2]);
+
+    // Write 'Y'*N bytes starting at offset 100 (mid-page 0) extending
+    // through to offset 100 + 4096*2 + 50 = 8246 (mid-page 2).
+    //   len = 8246 - 100 = 8146 bytes
+    //   page 0: [100, 4096) = 3996 'Y' bytes
+    //   page 1: [4096, 8192) = 4096 'Y' bytes
+    //   page 2: [8192, 8246) = 54 'Y' bytes
+    let write_start: u64 = 100;
+    let write_len: usize = 8146;
+    let payload: alloc::vec::Vec<u8> = alloc::vec![b'Y'; write_len];
+    crate::mm::cache::update_range(mount_idx, inode, write_start, &payload);
+
+    // Validate page 0: bytes [0, 100) = 'X'; bytes [100, 4096) = 'Y'.
+    let p0 = (PHYS_OFF + physes[0]) as *const u8;
+    let p0_99   = unsafe { *p0.add(99)   };
+    let p0_100  = unsafe { *p0.add(100)  };
+    let p0_4095 = unsafe { *p0.add(4095) };
+    // Validate page 1: entirely 'Y'.
+    let p1 = (PHYS_OFF + physes[1]) as *const u8;
+    let p1_0    = unsafe { *p1.add(0)    };
+    let p1_4095 = unsafe { *p1.add(4095) };
+    // Validate page 2: bytes [0, 54) = 'Y'; bytes [54, 4096) = 'X'.
+    let p2 = (PHYS_OFF + physes[2]) as *const u8;
+    let p2_0    = unsafe { *p2.add(0)    };
+    let p2_53   = unsafe { *p2.add(53)   };
+    let p2_54   = unsafe { *p2.add(54)   };
+    let p2_4095 = unsafe { *p2.add(4095) };
+
+    let ok = p0_99 == b'X' && p0_100 == b'Y' && p0_4095 == b'Y'
+        && p1_0 == b'Y' && p1_4095 == b'Y'
+        && p2_0 == b'Y' && p2_53 == b'Y' && p2_54 == b'X' && p2_4095 == b'X';
+    if !ok {
+        test_fail!("test234",
+            "page0[99,100,4095]=({:#x},{:#x},{:#x}) page1[0,4095]=({:#x},{:#x}) \
+             page2[0,53,54,4095]=({:#x},{:#x},{:#x},{:#x})",
+            p0_99, p0_100, p0_4095, p1_0, p1_4095,
+            p2_0, p2_53, p2_54, p2_4095);
+        for (i, _) in physes.iter().enumerate() {
+            let _ = crate::mm::cache::evict(mount_idx, inode, (i as u64) * 4096);
+        }
+        let _ = crate::vfs::remove(path);
+        return false;
+    }
+    test_println!("  page0: prefix 'X', suffix 'Y' ✓");
+    test_println!("  page1: all 'Y' ✓");
+    test_println!("  page2: prefix 'Y' (54B), suffix 'X' ✓");
+
+    for (i, _) in physes.iter().enumerate() {
+        let _ = crate::mm::cache::evict(mount_idx, inode, (i as u64) * 4096);
+    }
+    let _ = crate::vfs::remove(path);
+    test_pass!("mm::cache::update_range — page-boundary arithmetic");
     true
 }
