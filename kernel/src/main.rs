@@ -574,6 +574,16 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             }
 
             serial_println!("[FFTEST] firefox_exited={}", firefox_exited);
+            // Emit the history-based FUTEX_WAKE_GHOST summary block one
+            // last time before the QEMU shutdown port write below.  Per
+            // the BZ 25847 measurement plan: total_wakes, woken_zero,
+            // hist_hits, and per-offset histogram with the canonical
+            // __g_refs[0,1] offsets at +0x50 / +0x54 broken out.  Gated
+            // on firefox-test so test-mode boots (where the diagnostic
+            // is exercised by Test 239 only) do not emit a stray
+            // summary block at every kernel-test shutdown.
+            #[cfg(feature = "firefox-test")]
+            crate::subsys::linux::syscall::ghost_hist::dump_summary();
             serial_println!("[FFTEST] DONE");
 
             // Brief pause for QMP screendump, then exit.

@@ -364,6 +364,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "futex-stats"           => op_futex_stats(out),
         #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
         "futex-set-cluster-wake" => op_futex_set_cluster_wake(req, out),
+        "futex-ghost-hist" => op_futex_ghost_hist(req, out),
         _ => {
             out.push_str(r#"{"error":"unknown op: "#);
             for c in op.chars().take(64) {
@@ -2336,6 +2337,101 @@ fn render_wait_compact(
     if clear_child_tid != 0 {
         let _ = write!(out, ",clear_child_tid={:#x}", clear_child_tid);
     }
+}
+
+// ── futex-ghost-hist ─────────────────────────────────────────────────────────
+//
+// History-based FUTEX_WAKE_GHOST diagnostic snapshot.  Returns the
+// running counters (total_wakes, woken_zero, hist_hits, waits_recorded)
+// and the full per-offset histogram, then emits a `[GHOST_HIST_SUMMARY]`
+// block to serial so the harness can pick it up either way.
+//
+// Request shape:
+//   { "op": "futex-ghost-hist" }
+//   { "op": "futex-ghost-hist", "enable": true }    // turn on tracking
+//   { "op": "futex-ghost-hist", "enable": false }   // turn off
+//   { "op": "futex-ghost-hist", "reset": true }     // reset counters + ring
+//
+// Response shape:
+//   { "enabled": bool, "total_wakes": N, "woken_zero": N, "hist_hits": N,
+//     "waits_recorded": N,
+//     "offsets": [ { "off": N, "count": N }, ... ],   // non-zero buckets
+//     "other": N }
+//
+// The diagnostic state lives in `subsys::linux::syscall::ghost_hist`;
+// this op is the only structured way to read it back without scraping
+// the serial transcript.  The synchronous summary emission is
+// idempotent — calling it multiple times just refreshes the line.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn op_futex_ghost_hist(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    use core::sync::atomic::Ordering;
+    use crate::subsys::linux::syscall::ghost_hist;
+
+    // Process imperative flags first (enable/reset).  Each is independently
+    // optional; both can be present in one call.
+    if let Some(en) = extract_field(req, "enable") {
+        let on = matches!(en.as_str(), "true" | "1" | "on" | "yes");
+        ghost_hist::set_enabled(on);
+    }
+    if let Some(rs) = extract_field(req, "reset") {
+        if matches!(rs.as_str(), "true" | "1" | "on" | "yes") {
+            ghost_hist::reset_for_test();
+        }
+    }
+
+    // Snapshot the current counters.  Reads are independent atomics so
+    // we can race against a concurrent FUTEX_WAKE — the harness is
+    // tolerant of small inconsistencies between fields when called mid-trial.
+    let enabled = ghost_hist::is_enabled();
+    let total_wakes = ghost_hist::GHOST_HIST_TOTAL_WAKES.load(Ordering::Relaxed);
+    let woken_zero  = ghost_hist::GHOST_HIST_WOKEN_ZERO.load(Ordering::Relaxed);
+    let hist_hits   = ghost_hist::GHOST_HIST_HITS.load(Ordering::Relaxed);
+    let waits       = ghost_hist::GHOST_HIST_WAITS.load(Ordering::Relaxed);
+
+    out.push('{');
+    j_kv(out, "enabled", if enabled { "true" } else { "false" });
+    j_kv(out, "total_wakes", &alloc::format!("{}", total_wakes));
+    j_kv(out, "woken_zero",  &alloc::format!("{}", woken_zero));
+    j_kv(out, "hist_hits",   &alloc::format!("{}", hist_hits));
+    j_kv(out, "waits_recorded", &alloc::format!("{}", waits));
+    j_kv(out, "window_ticks", &alloc::format!("{}", ghost_hist::HIST_WINDOW_TICKS));
+    j_kv(out, "cluster_half_bytes",
+         &alloc::format!("{}", ghost_hist::HIST_CLUSTER_HALF));
+
+    // Per-offset histogram — emit ALL buckets with count > 0 so the
+    // caller sees the full distribution.  Each entry is
+    // {"off":N,"count":N}.  The "other" bucket (unaligned / out of
+    // half-window) is emitted separately as `other`.
+    out.push_str("\"offsets\":[");
+    let mut first = true;
+    for (i, slot) in ghost_hist::GHOST_HIST_OFFSET_COUNTS.iter().enumerate() {
+        if i == ghost_hist::OTHER_BUCKET { continue; }
+        let c = slot.load(Ordering::Relaxed);
+        if c == 0 { continue; }
+        if !first { out.push(','); }
+        first = false;
+        let off = ghost_hist::bucket_to_offset(i);
+        let _ = write!(out, "{{\"off\":{},\"count\":{}}}", off, c);
+    }
+    out.push_str("],");
+    j_kv(out, "other",
+         &alloc::format!("{}",
+                ghost_hist::GHOST_HIST_OFFSET_COUNTS[
+                    ghost_hist::OTHER_BUCKET].load(Ordering::Relaxed)));
+    j_trim_comma(out);
+    out.push('}');
+
+    // Mirror the human-readable summary block to serial so a harness
+    // that called this op via the network has a parallel serial
+    // record (kdb responses can race the serial pump under load; the
+    // [GHOST_HIST_SUMMARY] line is the reliable side channel).
+    ghost_hist::dump_summary();
+}
+
+#[cfg(not(any(feature = "firefox-test", feature = "test-mode")))]
+fn op_futex_ghost_hist(_req: &str, out: &mut String) {
+    out.push_str(r#"{"error":"futex-ghost-hist requires firefox-test or test-mode feature"}"#);
 }
 
 fn file_type_str(ft: crate::vfs::FileType) -> &'static str {

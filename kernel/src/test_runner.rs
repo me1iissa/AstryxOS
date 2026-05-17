@@ -1826,6 +1826,18 @@ pub fn run() -> ! {
         if test_239_futex_cluster_wake_compensation() { passed += 1; }
     }
 
+    // ── Test 240: history-based FUTEX_WAKE_GHOST detection ───────────────
+    // Verifies the history-mode counterpart of Test 238: the ring
+    // buffer records FUTEX_WAIT entries, and a later FUTEX_WAKE that
+    // returns woken=0 within HIST_WINDOW_TICKS of the recorded wait
+    // increments `hist_hits` plus the +0x50 offset bucket (canonical
+    // glibc pthread_cond_t __g_refs[0] offset per BZ 25847).
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_240_futex_wake_ghost_hist() { passed += 1; }
+    }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -30693,6 +30705,157 @@ fn test_239_futex_cluster_wake_compensation() -> bool {
     test_println!("  counters: recoveries +{} ✓ misses +{} ✓", d_rec, d_miss);
 
     test_pass!("subsys/linux: FUTEX_WAKE cluster-wake compensation");
+    true
+}
+
+// ── Test 240: history-based FUTEX_WAKE_GHOST detection ────────────────────
+//
+// Verifies the history-mode counterpart of Test 238.  Where Test 238
+// exercises the snapshot-based diagnostic (sibling waiter parked AT THE
+// INSTANT of the wake), Test 240 exercises the history-based detector:
+//
+//   1. Record a synthetic FUTEX_WAIT entry into the global ring at
+//      `cluster_base + 0x50` (the canonical glibc pthread_cond_t
+//      `__g_refs[0]` byte offset per BZ 25847) using
+//      `ghost_hist::record_wait()`.
+//   2. Call `sys_futex_linux` with op = FUTEX_WAKE on `cluster_base`
+//      where no waiter is parked.  This returns woken=0, which is the
+//      trigger for the correlate-against-history scan.
+//   3. Assert (a) wake returned 0, (b) the global `hist_hits` counter
+//      incremented by 1, (c) the `+0x50` offset bucket incremented by
+//      1, and (d) the `+0x100` bucket did NOT — verifying the cluster
+//      half-width bound.
+//
+// The history ring is reset at the start of the test (no
+// cross-test contamination) and the GHOST_HIST_ENABLED toggle is
+// driven explicitly to avoid the default-OFF posture under
+// `test-mode` alone (per `ghost_hist` module documentation).
+//
+// References:
+//   - glibc Bugzilla 25847 (cond_var __g_refs[2] dual-group bookkeeping):
+//     https://sourceware.org/bugzilla/show_bug.cgi?id=25847
+//   - futex(2): https://man7.org/linux/man-pages/man2/futex.2.html
+//   - POSIX pthread_cond_signal(3p)
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_240_futex_wake_ghost_hist() -> bool {
+    use core::sync::atomic::Ordering;
+    use crate::subsys::linux::syscall::ghost_hist;
+    test_header!("subsys/linux: FUTEX_WAKE_GHOST_HIST history-based diagnostic");
+
+    // Reset the diagnostic to a known-clean state (zero counters, empty
+    // ring) and force the toggle ON for the duration of the test.
+    let prev_enabled = ghost_hist::is_enabled();
+    ghost_hist::set_enabled(true);
+    ghost_hist::reset_for_test();
+
+    let pid = crate::proc::current_pid_lockless();
+
+    // Pick a 256 B cluster anchor in unused user-VA territory.  Same
+    // address family as Test 238 (uses `0x5555_dead_*`); pick a
+    // different anchor so the two tests cannot interfere if reordered.
+    let cluster_base: u64 = 0x0000_5555_dead_1000;
+    let uaddr_signal:    u64 = cluster_base;             // target of WAKE
+    let uaddr_waiter_50: u64 = cluster_base + 0x50;      // +0x50 = __g_refs[0]
+    let uaddr_far:       u64 = cluster_base + 0x100;     // outside half-window
+
+    // Synthetic TID for the recorded waiter — it's only used by the
+    // diagnostic for logging; nothing dereferences it.
+    let fake_tid: u64 = 0xFE_DEAD_BEEF_F239u64;
+
+    // Inject the history entry directly via the public helper so the
+    // tick stamping path matches what FUTEX_WAIT would record.
+    ghost_hist::record_wait(pid, fake_tid, uaddr_waiter_50);
+    // Also inject a far waiter outside the ±128 B half-window — the
+    // correlator must NOT count this one.
+    ghost_hist::record_wait(pid, fake_tid.wrapping_add(1), uaddr_far);
+
+    test_println!(
+        "  recorded waiter at uaddr={:#x} (+0x50) and far waiter at {:#x} (+0x100)",
+        uaddr_waiter_50, uaddr_far
+    );
+
+    let pre_hits = ghost_hist::GHOST_HIST_HITS.load(Ordering::Relaxed);
+    let pre_woken_zero = ghost_hist::GHOST_HIST_WOKEN_ZERO.load(Ordering::Relaxed);
+    let pre_total_wakes = ghost_hist::GHOST_HIST_TOTAL_WAKES.load(Ordering::Relaxed);
+    let pre_bucket_50 = ghost_hist::GHOST_HIST_OFFSET_COUNTS[
+        ghost_hist::offset_to_bucket(0x50)].load(Ordering::Relaxed);
+    let pre_bucket_100 = ghost_hist::GHOST_HIST_OFFSET_COUNTS[
+        ghost_hist::offset_to_bucket(0x100)].load(Ordering::Relaxed);
+
+    // Drive the WAKE — op = 1 (FUTEX_WAKE), val = 1 (wake-one), no
+    // waiter is parked on `uaddr_signal` so woken=0 is expected, which
+    // is the trigger for the correlate-against-history scan.
+    let woken = crate::subsys::linux::syscall::sys_futex_linux(
+        uaddr_signal, 1, 1, 0, 0, 0
+    );
+    test_println!("  sys_futex_linux WAKE returned {}", woken);
+
+    let post_hits = ghost_hist::GHOST_HIST_HITS.load(Ordering::Relaxed);
+    let post_woken_zero = ghost_hist::GHOST_HIST_WOKEN_ZERO.load(Ordering::Relaxed);
+    let post_total_wakes = ghost_hist::GHOST_HIST_TOTAL_WAKES.load(Ordering::Relaxed);
+    let post_bucket_50 = ghost_hist::GHOST_HIST_OFFSET_COUNTS[
+        ghost_hist::offset_to_bucket(0x50)].load(Ordering::Relaxed);
+    let post_bucket_100 = ghost_hist::GHOST_HIST_OFFSET_COUNTS[
+        ghost_hist::offset_to_bucket(0x100)].load(Ordering::Relaxed);
+
+    // Restore the previous toggle state (best-effort — other tests
+    // do not rely on a specific value).
+    ghost_hist::set_enabled(prev_enabled);
+
+    // Assertions.
+    if woken != 0 {
+        test_fail!("test239",
+            "FUTEX_WAKE returned {} expected 0 (no waiter on caller uaddr)",
+            woken);
+        return false;
+    }
+    if post_total_wakes.wrapping_sub(pre_total_wakes) == 0 {
+        test_fail!("test239",
+            "GHOST_HIST_TOTAL_WAKES did not advance (pre={} post={}) — \
+             WAKE path bookkeeping broken",
+            pre_total_wakes, post_total_wakes);
+        return false;
+    }
+    if post_woken_zero.wrapping_sub(pre_woken_zero) == 0 {
+        test_fail!("test239",
+            "GHOST_HIST_WOKEN_ZERO did not advance (pre={} post={}) — \
+             woken=0 branch bookkeeping broken",
+            pre_woken_zero, post_woken_zero);
+        return false;
+    }
+    let hit_delta = post_hits.wrapping_sub(pre_hits);
+    if hit_delta == 0 {
+        test_fail!("test239",
+            "GHOST_HIST_HITS did not advance (pre={} post={}) — \
+             history correlation did not find the recorded +0x50 waiter",
+            pre_hits, post_hits);
+        return false;
+    }
+    // The +0x50 bucket must have ticked up by exactly the same number
+    // of hits — the canonical glibc cond_var __g_refs[0] offset is the
+    // primary signal of BZ 25847 cycling.
+    let bucket_50_delta = post_bucket_50.wrapping_sub(pre_bucket_50);
+    if bucket_50_delta != hit_delta {
+        test_fail!("test239",
+            "+0x50 offset bucket advanced by {} expected {} (= hit_delta) — \
+             histogram bookkeeping inconsistent with hit counter",
+            bucket_50_delta, hit_delta);
+        return false;
+    }
+    // The +0x100 bucket is outside the ±128 B half-window — must NOT
+    // have moved.  (0x100 = 256 > HIST_CLUSTER_HALF=128.)
+    if post_bucket_100 != pre_bucket_100 {
+        test_fail!("test239",
+            "+0x100 bucket moved from {} to {} despite being outside ±128 B half-window — \
+             cluster-bound logic broken",
+            pre_bucket_100, post_bucket_100);
+        return false;
+    }
+    test_println!("  hist_hits advanced by {} (+0x50 waiter correlated) ✓", hit_delta);
+    test_println!("  +0x50 offset bucket advanced by {} ✓", bucket_50_delta);
+    test_println!("  +0x100 waiter did NOT contribute (outside half-window) ✓");
+
+    test_pass!("subsys/linux: FUTEX_WAKE_GHOST_HIST history-based diagnostic");
     true
 }
 
