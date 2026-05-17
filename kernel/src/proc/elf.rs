@@ -222,6 +222,18 @@ pub enum ElfError {
     InterpNotFound,
     /// PT_INTERP binary failed to load.
     InterpLoad,
+    /// `e_phnum` exceeds the implementation cap (defence against DoS via
+    /// huge program-header tables — System V ABI does not bound this, but
+    /// real binaries stay well below 64 entries).
+    TooManyPhdrs,
+    /// PT_LOAD segment with `p_filesz > p_memsz` — malformed per System V
+    /// ABI Chapter 5 ("Program Loading"), the file image must fit within
+    /// the memory image.
+    BadSegmentSize,
+    /// PT_LOAD segment requested both PF_W and PF_X (write+execute).
+    /// Rejected at load time to enforce W^X; runtime JIT pages must
+    /// instead `mprotect()` the writable→executable transition explicitly.
+    WritableExecutable,
 }
 
 impl From<ElfError> for astryx_shared::NtStatus {
@@ -239,9 +251,26 @@ impl From<ElfError> for astryx_shared::NtStatus {
             ElfError::AddressInKernelSpace => STATUS_INVALID_IMAGE_KERNEL_ADDR,
             ElfError::InterpNotFound => STATUS_INVALID_IMAGE_FORMAT,
             ElfError::InterpLoad => STATUS_INVALID_IMAGE_FORMAT,
+            ElfError::TooManyPhdrs => STATUS_INVALID_IMAGE_FORMAT,
+            ElfError::BadSegmentSize => STATUS_INVALID_IMAGE_FORMAT,
+            ElfError::WritableExecutable => STATUS_INVALID_IMAGE_FORMAT,
         }
     }
 }
+
+/// Maximum program-header entries accepted from an ELF image.
+///
+/// The ELF header field `e_phnum` is a u16, so a malicious image can
+/// advertise up to 65535 entries.  Real binaries observed in the wild —
+/// libxul, ld-linux, glibc, statically-linked Rust binaries — all stay
+/// well below 64 entries; a static OS kernel image with embedded vDSO
+/// uses ~16.  Capping at 256 leaves ~4× headroom for legitimate edge
+/// cases (heavily-instrumented or multi-NOTE binaries) while preventing
+/// a 65535-entry attacker payload from forcing 65535 `unsafe` pointer
+/// reads in the load loops.  Per System V ABI Chapter 5 this field is
+/// "the number of entries in the program header table" — the spec does
+/// not mandate a cap, so the cap is policy.  CWE-119.
+const MAX_PHDRS: usize = 256;
 
 /// Deterministic load base for ET_EXEC (fixed-address) executables.
 /// PIE / ET_DYN executables use a *randomised* base instead (see below).
@@ -537,6 +566,17 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
     let ph_size = header.e_phentsize as usize;
     let ph_count = header.e_phnum as usize;
 
+    // Cap `e_phnum` (CWE-119).  Without this cap a 65535-entry attacker
+    // image forces 65535 unsafe pointer reads through the load loops
+    // below — see MAX_PHDRS commentary for the rationale on the cap.
+    if ph_count > MAX_PHDRS {
+        crate::serial_println!(
+            "[ELF] reject e_phnum={} (exceeds cap of {}) — CWE-119",
+            ph_count, MAX_PHDRS,
+        );
+        return Err(ElfError::TooManyPhdrs);
+    }
+
     let mut interp_path: Option<alloc::string::String> = None;
     let mut phdr_vaddr: u64 = 0; // PT_PHDR virtual address (for AT_PHDR)
 
@@ -620,6 +660,36 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
         // Security: reject segments in kernel space.
         if vaddr >= 0xFFFF_8000_0000_0000 {
             return Err(ElfError::AddressInKernelSpace);
+        }
+
+        // Per System V ABI Chapter 5 ("Program Loading"): "The bytes from
+        // the file are mapped to the beginning of the memory segment; the
+        // remaining `p_memsz` minus `p_filesz` bytes are zero-filled."  An
+        // image with `p_filesz > p_memsz` is malformed — the file image is
+        // larger than the in-memory image it is supposed to fit inside.
+        // Reject it rather than rely on downstream `min()` clamps to mask
+        // the issue (defence in depth — CWE-119).
+        if filesz > memsz {
+            crate::serial_println!(
+                "[ELF] reject PT_LOAD p_filesz={:#x} > p_memsz={:#x} (System V ABI ch. 5 violation)",
+                filesz, memsz,
+            );
+            return Err(ElfError::BadSegmentSize);
+        }
+
+        // Enforce W^X at load time (CWE-269 — improper privilege
+        // management).  A PT_LOAD segment with both PF_W and PF_X set
+        // would land in memory as a writable+executable mapping — a
+        // ready-made code-injection target for any out-of-bounds write
+        // bug elsewhere in the process.  Legitimate JITs must request
+        // the writable→executable transition explicitly via mprotect(2),
+        // which gives the kernel a chance to enforce policy at the
+        // transition point.  ELF segments do not need W+X to function.
+        if phdr.p_flags & PF_W != 0 && phdr.p_flags & PF_X != 0 {
+            crate::serial_println!(
+                "[ELF] reject PT_LOAD with both PF_W and PF_X set (W^X policy — CWE-269)",
+            );
+            return Err(ElfError::WritableExecutable);
         }
 
         // Track load range.
@@ -1265,6 +1335,17 @@ fn load_elf_dyn(
     let ph_size   = header.e_phentsize as usize;
     let ph_count  = header.e_phnum as usize;
 
+    // Same MAX_PHDRS cap as the main loader (CWE-119) — see commentary on
+    // `MAX_PHDRS` for the rationale.  An untrusted interpreter image must
+    // not be allowed to force 65535 unsafe pointer reads.
+    if ph_count > MAX_PHDRS {
+        crate::serial_println!(
+            "[ELF/interp] reject e_phnum={} (exceeds cap of {}) — CWE-119",
+            ph_count, MAX_PHDRS,
+        );
+        return Err(ElfError::TooManyPhdrs);
+    }
+
     // Find the lowest PT_LOAD vaddr to compute the load bias.
     let mut min_vaddr = u64::MAX;
     for i in 0..ph_count {
@@ -1293,6 +1374,23 @@ fn load_elf_dyn(
         let file_off  = phdr.p_offset as usize;
 
         if vaddr >= 0xFFFF_8000_0000_0000 { return Err(ElfError::AddressInKernelSpace); }
+
+        // System V ABI Chapter 5: p_filesz must not exceed p_memsz.
+        if filesz > memsz {
+            crate::serial_println!(
+                "[ELF/interp] reject PT_LOAD p_filesz={:#x} > p_memsz={:#x}",
+                filesz, memsz,
+            );
+            return Err(ElfError::BadSegmentSize);
+        }
+
+        // W^X policy — reject simultaneous PF_W and PF_X (CWE-269).
+        if phdr.p_flags & PF_W != 0 && phdr.p_flags & PF_X != 0 {
+            crate::serial_println!(
+                "[ELF/interp] reject PT_LOAD with both PF_W and PF_X set (W^X policy)",
+            );
+            return Err(ElfError::WritableExecutable);
+        }
 
         let mut flags = vmm::PAGE_PRESENT | vmm::PAGE_USER;
         if phdr.p_flags & PF_W != 0 { flags |= vmm::PAGE_WRITABLE; }
