@@ -28844,6 +28844,38 @@ fn test_222_syscall_arg_validation_matrix() -> bool {
         entries.len(), BAD_PTRS.len(), total, passed, skipped, regressions,
     );
 
+    // ── Aether SYS_PIPE pointer-validation smoke test ────────────────────
+    // The Aether dispatch arm for SYS_PIPE (nr=24) now calls
+    // validate_user_ptr(fds_out, 16) before delegating to sys_pipe().
+    // Verify that a kernel-VA pointer returns EFAULT (-14).
+    // Uses dispatch_aether (NOT dispatch_linux) to exercise the Aether path.
+    // Per CWE-119 (memory bounds violation), defence-in-depth at the
+    // user/kernel boundary.
+    for (ptr, label) in BAD_PTRS {
+        let is_kernel_va = *ptr >= astryx_shared::KERNEL_VIRT_BASE
+            || (*label == "near-overflow");
+        let r = crate::syscall::dispatch_aether(
+            24,   // Aether SYS_PIPE
+            *ptr, // fds_out — adversarial pointer
+            0, 0, 0, 0, 0,
+        );
+        if is_kernel_va && r >= 0 {
+            crate::serial_println!(
+                "[TEST/ARGVAL/REGRESSION] syscall=aether-pipe nr=24 ptr_arg=fds_out \
+                 ptr={} ret={} expected=negative-errno",
+                label, r,
+            );
+            regressions += 1;
+        } else {
+            crate::serial_println!(
+                "[TEST/ARGVAL] syscall=aether-pipe nr=24 ptr_arg=fds_out ptr={} ret={} OK",
+                label, r,
+            );
+            passed += 1;
+        }
+        total += 1;
+    }
+
     if regressions > 0 {
         test_fail!(
             "syscall_arg_validation_matrix",
