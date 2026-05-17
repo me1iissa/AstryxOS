@@ -161,6 +161,20 @@ pub fn lookup_and_acquire(mount_idx: usize, inode: u64, page_offset: u64) -> Opt
 
 /// Insert a page into the cache.
 ///
+/// Convenience wrapper for [`insert_with_expected`] that supplies no
+/// reference bytes for the post-install source-content diagnostic.
+/// Callers that have just read the source bytes from the filesystem
+/// SHOULD prefer `insert_with_expected` so the W215 wrong-content guard
+/// can fire on a concurrent writer.  Paths that have no source bytes to
+/// hand (eviction-then-reinsert, future writeback paths) keep using
+/// this entry point.
+pub fn insert(mount_idx: usize, inode: u64, page_offset: u64, phys: u64) {
+    insert_with_expected(mount_idx, inode, page_offset, phys, None)
+}
+
+/// Insert a page into the cache, optionally verifying that the frame's
+/// contents match the source-file bytes the caller just read.
+///
 /// Increments the page's reference count to represent the cache's own
 /// reference.  If the key already exists the old entry is replaced and
 /// its cache reference is released.
@@ -175,7 +189,43 @@ pub fn lookup_and_acquire(mount_idx: usize, inode: u64, page_offset: u64) -> Opt
 /// recycled.  Per Intel SDM Vol. 3A §4.10.5, paging-structure changes
 /// must be propagated to all processors before the physical frame is
 /// repurposed.
-pub fn insert(mount_idx: usize, inode: u64, page_offset: u64, phys: u64) {
+///
+/// ## `expected` — W215 wrong-content guard
+///
+/// When `Some(reference)`, the diagnostic samples the first 64 bytes of
+/// the just-inserted frame and compares them against `reference`.  A
+/// mismatch indicates a writer mutated the frame between the caller's
+/// successful filesystem read and the cache install — under POSIX
+/// read(2) and the install-path contract there is no legitimate kernel
+/// writer in that window, so any divergence is a smoking-gun aliasing
+/// race (the residual W215 class).  The diagnostic emits a structured
+/// `[W215/INSERT-WRONG-CONTENT]` line and bugchecks via
+/// [`crate::ke::bugcheck::BUGCHECK_W215_INSERT_WRONG_CONTENT`] so the
+/// trial captures full register state at the moment of corruption.
+///
+/// The check is gated behind `cfg(feature = "w215-diag")` (implies
+/// `firefox-test`) and is skipped while `PREPOPULATE_ACTIVE` is set —
+/// the bulk-prepopulate phase legitimately overwrites every libxul
+/// page once at boot and its own pre-zero + memcpy sequence is the
+/// source of truth there, not an `fs.read` reference snapshot.
+///
+/// Genuinely all-zero source bytes (e.g. sparse-file holes, zero-filled
+/// `.bss` segments past the file's true end) are tolerated: if the
+/// supplied reference is entirely zero AND the page bytes are entirely
+/// zero, the check is skipped to avoid false fires on legitimate
+/// zero-content pages.
+pub fn insert_with_expected(
+    mount_idx: usize,
+    inode: u64,
+    page_offset: u64,
+    phys: u64,
+    expected: Option<&[u8; 64]>,
+) {
+    // Reference parameter is read only inside the `w215-diag` block; mark
+    // it used on non-diag builds so the cfg-out does not provoke a warn.
+    #[cfg(not(feature = "w215-diag"))]
+    let _ = expected;
+
     // W215 structural-invariant guard: a cache::insert MUST NOT install a
     // frame whose physical address lies inside the kernel image
     // (.text/.rodata/.data/.bss).  The page cache is for filesystem-backed
@@ -301,6 +351,133 @@ pub fn insert(mount_idx: usize, inode: u64, page_offset: u64, phys: u64) {
                 // struct store).
                 let _ = crate::arch::x86_64::debug_reg::arm_preinsert_watchpoint(
                     linear, 8, phys, inode, page_offset,
+                );
+            }
+        }
+    }
+
+    // ── W215 post-insert source-content guard ──────────────────────────────
+    //
+    // After the cache record is installed (and the existing diagnostic
+    // hooks have run), sample the first 64 bytes of the just-inserted
+    // frame and compare them against the reference snapshot the caller
+    // captured immediately after its `fs.read` returned.  Per POSIX
+    // read(2) the install path holds the only kernel-side handle to the
+    // freshly-allocated PMM frame from `pmm::alloc_page` through
+    // `cache::insert`; the bytes at the moment of insert MUST equal the
+    // bytes the FS driver wrote.  Any divergence implies a sibling-CPU
+    // writer with a still-live PTE to the recycled frame — the W215
+    // aliasing class under investigation.
+    //
+    // The check is skipped:
+    //   - while `PREPOPULATE_ACTIVE` is set (bulk-loader has its own
+    //     pre-zero + memcpy as the source of truth);
+    //   - when no reference snapshot was supplied (legacy `insert`
+    //     callers — eviction-then-reinsert, future writeback);
+    //   - when both reference and page contents are entirely zero
+    //     (sparse-file holes, zero-filled tails past EOF).
+    //
+    // On mismatch: emit a structured `[W215/INSERT-WRONG-CONTENT]` line
+    // with full provenance, then bugcheck via
+    // `BUGCHECK_W215_INSERT_WRONG_CONTENT` so the trial captures
+    // register state at the moment of the divergence.  Per Intel SDM
+    // Vol. 3A §4.10.5 the writer must have observed the PMM frame
+    // before the cache lock was acquired — a tractable invariant to
+    // hunt with the bugcheck stack.
+    #[cfg(feature = "w215-diag")]
+    if let Some(reference) = expected {
+        if !PREPOPULATE_ACTIVE.load(Ordering::Acquire) {
+            // SAFETY: the higher-half identity map covers every PMM
+            // frame, and the just-inserted frame is alive (cache holds
+            // a ref from `page_ref_inc` above).  We read 64 bytes
+            // through a volatile slice copy to avoid the compiler
+            // re-ordering the read past the install.
+            let mut sample = [0u8; 64];
+            let src = (PHYS_OFF + phys) as *const u8;
+            for i in 0..64 {
+                sample[i] = unsafe { core::ptr::read_volatile(src.add(i)) };
+            }
+            // Allow legitimate all-zero source pages (sparse file hole,
+            // .bss-extended tail).  If both sides are zero the install
+            // path is correct by definition.
+            let ref_all_zero = reference.iter().all(|&b| b == 0);
+            let sample_all_zero = sample.iter().all(|&b| b == 0);
+            let trivial_zero_match = ref_all_zero && sample_all_zero;
+            if !trivial_zero_match && sample[..] != reference[..] {
+                let rip = caller_rip();
+                // Emit hex pairs for ref/observed.  Use a fixed-format
+                // line so `qemu-harness.py wait` can match the prefix.
+                crate::serial_println!(
+                    "[W215/INSERT-WRONG-CONTENT] phys={:#x} mount={} inode={} \
+                     offset={:#x} caller_rip={:#x}",
+                    phys, mount_idx, inode, page_offset, rip,
+                );
+                crate::serial_println!(
+                    "[W215/INSERT-WRONG-CONTENT/REF]  {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x}",
+                    reference[0],  reference[1],  reference[2],  reference[3],
+                    reference[4],  reference[5],  reference[6],  reference[7],
+                    reference[8],  reference[9],  reference[10], reference[11],
+                    reference[12], reference[13], reference[14], reference[15],
+                    reference[16], reference[17], reference[18], reference[19],
+                    reference[20], reference[21], reference[22], reference[23],
+                    reference[24], reference[25], reference[26], reference[27],
+                    reference[28], reference[29], reference[30], reference[31],
+                );
+                crate::serial_println!(
+                    "[W215/INSERT-WRONG-CONTENT/REF2] {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x}",
+                    reference[32], reference[33], reference[34], reference[35],
+                    reference[36], reference[37], reference[38], reference[39],
+                    reference[40], reference[41], reference[42], reference[43],
+                    reference[44], reference[45], reference[46], reference[47],
+                    reference[48], reference[49], reference[50], reference[51],
+                    reference[52], reference[53], reference[54], reference[55],
+                    reference[56], reference[57], reference[58], reference[59],
+                    reference[60], reference[61], reference[62], reference[63],
+                );
+                crate::serial_println!(
+                    "[W215/INSERT-WRONG-CONTENT/OBS]  {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x}",
+                    sample[0],  sample[1],  sample[2],  sample[3],
+                    sample[4],  sample[5],  sample[6],  sample[7],
+                    sample[8],  sample[9],  sample[10], sample[11],
+                    sample[12], sample[13], sample[14], sample[15],
+                    sample[16], sample[17], sample[18], sample[19],
+                    sample[20], sample[21], sample[22], sample[23],
+                    sample[24], sample[25], sample[26], sample[27],
+                    sample[28], sample[29], sample[30], sample[31],
+                );
+                crate::serial_println!(
+                    "[W215/INSERT-WRONG-CONTENT/OBS2] {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} \
+                     {:02x}{:02x}{:02x}{:02x}",
+                    sample[32], sample[33], sample[34], sample[35],
+                    sample[36], sample[37], sample[38], sample[39],
+                    sample[40], sample[41], sample[42], sample[43],
+                    sample[44], sample[45], sample[46], sample[47],
+                    sample[48], sample[49], sample[50], sample[51],
+                    sample[52], sample[53], sample[54], sample[55],
+                    sample[56], sample[57], sample[58], sample[59],
+                    sample[60], sample[61], sample[62], sample[63],
+                );
+                crate::ke::bugcheck::ke_bugcheck(
+                    crate::ke::bugcheck::BUGCHECK_W215_INSERT_WRONG_CONTENT,
+                    phys,
+                    mount_idx as u64,
+                    inode,
+                    page_offset,
                 );
             }
         }

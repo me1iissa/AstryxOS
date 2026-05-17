@@ -1503,6 +1503,15 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
             // Allocate the faulting page + readahead pages (best effort).
             // Fixed-size array to avoid alloc dependency in the ISR path.
             let mut pages_to_map: [(u64, u64, u64); READAHEAD_PAGES as usize] = [(0, 0, 0); READAHEAD_PAGES as usize];
+            // W215 source-content reference snapshot — first 64 bytes of
+            // each readahead page's file contents captured immediately
+            // after `fs.read` returns Ok.  Passed through to
+            // `cache::insert_with_expected` so the post-install guard can
+            // detect a sibling-CPU writer that mutated the frame between
+            // the FS read and the cache install.  Diagnostic-only.
+            #[cfg(feature = "w215-diag")]
+            let mut pages_snapshot: [[u8; 64]; READAHEAD_PAGES as usize] =
+                [[0u8; 64]; READAHEAD_PAGES as usize];
             let mut n_pages = 0usize;
             // Recursive-lock hazard avoidance (closes #78, mirrors the
             // PROCESS_TABLE fix from PR #77 / issue #76):
@@ -1597,6 +1606,21 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                             // Stop the readahead burst — sequential pages from
                             // the same backing file are likely to fail too.
                             break;
+                        }
+                        // W215 reference snapshot: capture the first 64 bytes
+                        // of the just-read page right now, before any
+                        // intervening kernel work (VMA revalidate, gen-check,
+                        // sibling readahead iterations).  This is the moment
+                        // the kernel KNOWS the frame holds the file bytes;
+                        // any later divergence at cache::insert time is the
+                        // W215 writer.  See cache::insert_with_expected.
+                        #[cfg(feature = "w215-diag")]
+                        unsafe {
+                            let src = (PHYS_OFF_FILE + phys) as *const u8;
+                            for b in 0..64 {
+                                pages_snapshot[n_pages][b] =
+                                    core::ptr::read_volatile(src.add(b));
+                            }
                         }
                         pages_to_map[n_pages] = (vaddr, phys, foff);
                         n_pages += 1;
@@ -1780,6 +1804,17 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 crate::mm::refcount::page_ref_inc(phys);
 
                 // Always insert the clean page into the shared cache.
+                // Pass the reference snapshot captured immediately after
+                // fs.read so cache::insert can detect a sibling-CPU
+                // writer that mutated the frame in the window between
+                // the FS read and this cache install (W215 wrong-content
+                // guard).  On non-diag builds the snapshot array does
+                // not exist and we fall through to the plain insert.
+                #[cfg(feature = "w215-diag")]
+                crate::mm::cache::insert_with_expected(
+                    mount_idx, inode, foff, phys, Some(&pages_snapshot[i]),
+                );
+                #[cfg(not(feature = "w215-diag"))]
                 crate::mm::cache::insert(mount_idx, inode, foff, phys);
 
                 // W215 diagnostic Arm-2: my own pre-insert witness is now
@@ -1970,6 +2005,12 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         break None;
                     }
                 };
+                // W215 single-page reference snapshot — populated right
+                // after fs.read returns Ok, consumed by the
+                // cache::insert_with_expected call below.  See readahead-
+                // path snapshot for rationale.  Diagnostic-only.
+                #[cfg(feature = "w215-diag")]
+                let mut sp_snapshot: [u8; 64] = [0u8; 64];
                 if let Some(fs) = fs_opt {
                     let buf = unsafe {
                         core::slice::from_raw_parts_mut(
@@ -1989,6 +2030,15 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                             "[PF/io-err] single-page read failed inode={} foff={:#x} addr={:#x}",
                             inode, file_page_offset, page_addr);
                         return false;
+                    }
+                    // Snapshot the first 64 bytes immediately.  Any later
+                    // divergence at cache::insert is a sibling-CPU writer.
+                    #[cfg(feature = "w215-diag")]
+                    unsafe {
+                        let src = (PHYS_OFF_FILE + phys) as *const u8;
+                        for b in 0..64 {
+                            sp_snapshot[b] = core::ptr::read_volatile(src.add(b));
+                        }
                     }
                 } else {
                     // We never even reached the FS dispatch (MOUNTS spin
@@ -2069,6 +2119,14 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 // for reuse — in the window between cache::insert returning and
                 // the PTE installation below.
                 crate::mm::refcount::page_ref_inc(phys);
+                // Pass the post-fs.read snapshot so the cache insert can
+                // detect a sibling-CPU writer that mutated the frame in
+                // the window between the FS read and this install.
+                #[cfg(feature = "w215-diag")]
+                crate::mm::cache::insert_with_expected(
+                    mount_idx, inode, file_page_offset, phys, Some(&sp_snapshot),
+                );
+                #[cfg(not(feature = "w215-diag"))]
                 crate::mm::cache::insert(mount_idx, inode, file_page_offset, phys);
 
                 // W215 diagnostic Arm-2 (single-page fallback): same
