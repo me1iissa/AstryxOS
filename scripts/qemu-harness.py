@@ -2537,8 +2537,24 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
               "bell-stats", "cache-audit", "cache-aliasing",
               "fault-cache-keys", "w215-cache-residency",
               "tlb-stats", "w215-diag",
-              "coverage-flush", "proc-metrics"):
+              "coverage-flush", "proc-metrics",
+              "futex-stats"):
         return {"op": op}
+    if op == "futex-set-cluster-wake":
+        # Accepts:
+        #   futex-set-cluster-wake on
+        #   futex-set-cluster-wake off
+        #   futex-set-cluster-wake true|false|1|0
+        # Default queried via futex-stats (no toggle here).
+        if not rest:
+            raise ValueError("futex-set-cluster-wake requires on|off")
+        val = rest[0].strip().lower()
+        if val not in ("on", "off", "true", "false", "1", "0"):
+            raise ValueError(
+                f"futex-set-cluster-wake: unrecognised value '{rest[0]}' "
+                "(expected on|off|true|false|1|0)"
+            )
+        return {"op": "futex-set-cluster-wake", "on": val}
     if op == "proc":
         if not rest: raise ValueError("proc requires <pid>")
         return {"op": "proc", "pid": int(rest[0], 0)}
