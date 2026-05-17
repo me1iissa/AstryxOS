@@ -64,6 +64,12 @@ impl Pipe {
     /// Read up to `buf.len()` bytes from the pipe. Returns bytes read.
     pub fn read(&mut self, buf: &mut [u8]) -> usize {
         let to_read = buf.len().min(self.count);
+        // SMAP bracket — `buf` typically points to user memory (the
+        // syscall layer passes user `buf_ptr` through `from_raw_parts_mut`).
+        // The bounded copy below runs synchronously under the PIPE_TABLE
+        // lock, so AC=1 cannot leak past `to_read` iterations.  When
+        // SMAP is not enabled, UserGuard collapses to a relaxed load.
+        let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
         for i in 0..to_read {
             buf[i] = self.buffer[self.read_pos];
             self.read_pos = (self.read_pos + 1) % PIPE_BUF_SIZE;
@@ -76,6 +82,8 @@ impl Pipe {
     pub fn write(&mut self, data: &[u8]) -> usize {
         let space = PIPE_BUF_SIZE - self.count;
         let to_write = data.len().min(space);
+        // SMAP bracket — `data` typically points to user memory.
+        let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
         for i in 0..to_write {
             self.buffer[self.write_pos] = data[i];
             self.write_pos = (self.write_pos + 1) % PIPE_BUF_SIZE;

@@ -169,6 +169,12 @@ impl UnixSocket {
 
     fn push(&mut self, data: &[u8]) -> usize {
         let n = data.len().min(self.recv_space());
+        // SMAP bracket — `data` is typically a user-VA slice forwarded
+        // from the syscall layer (sys_write_linux / sendmsg / sendto).
+        // The bounded loop runs under the TABLE lock with no schedule
+        // points, so AC=1 cannot leak.  Collapses to a relaxed load on
+        // CPUs without SMAP.
+        let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
         for &b in &data[..n] {
             self.recv_buf[self.recv_tail] = b;
             self.recv_tail = (self.recv_tail + 1) % RECV_BUF_CAP;
@@ -178,6 +184,8 @@ impl UnixSocket {
 
     fn pop(&mut self, buf: &mut [u8]) -> usize {
         let n = buf.len().min(self.recv_available());
+        // SMAP bracket — `buf` is typically a user-VA slice.
+        let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
         for byte in &mut buf[..n] {
             *byte = self.recv_buf[self.recv_head];
             self.recv_head = (self.recv_head + 1) % RECV_BUF_CAP;
