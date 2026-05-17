@@ -357,6 +357,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "tlb-stats"        => op_tlb_stats(out),
         "w215-diag"        => op_w215_diag(out),
         "coverage-flush" => op_coverage_flush(out),
+        "proc-metrics"   => op_proc_metrics(out),
         _ => {
             out.push_str(r#"{"error":"unknown op: "#);
             for c in op.chars().take(64) {
@@ -1668,4 +1669,65 @@ fn op_coverage_flush(out: &mut String) {
     {
         out.push_str(r#"{"error":"coverage-flush requires coverage feature"}"#);
     }
+}
+
+// ── proc-metrics ─────────────────────────────────────────────────────────────
+//
+// One-shot snapshot of the per-process activity counters maintained in
+// `crate::proc::proc_metrics`.  Emits one JSON object per live PID, each
+// with its syscall-category breakdown, page-fault count, disk and network
+// byte totals, and a "currently inside syscall N for D ticks" flag for
+// stuck-thread diagnosis.  No locks held during emission beyond a brief
+// try_lock on PROCESS_TABLE for name resolution; contended PROCESS_TABLE
+// causes the names to be reported as "?".
+
+fn op_proc_metrics(out: &mut String) {
+    use core::fmt::Write;
+    let tick_now = crate::arch::x86_64::irq::get_ticks();
+
+    // Best-effort name lookup.  Mirror try_lock_brief discipline used by
+    // op_proc_list — never block the kdb listener thread.
+    let names: Vec<(u64, String)> = match try_lock_brief(&PROCESS_TABLE) {
+        Some(g) => g.iter().map(|p| (p.pid, proc_name_string(&p.name))).collect(),
+        None => Vec::new(),
+    };
+
+    out.push('{');
+    let _ = write!(out, r#""tick":{},"procs":["#, tick_now);
+    let mut first = true;
+    for pid in crate::proc::proc_metrics::live_pids() {
+        let Some(s) = crate::proc::proc_metrics::snapshot(pid) else { continue };
+        if !first { out.push(','); }
+        first = false;
+        let name = names.iter().find(|(p, _)| *p == pid)
+            .map(|(_, n)| n.as_str()).unwrap_or("?");
+        out.push('{');
+        j_kv(out, "pid", &alloc::format!("{}", pid));
+        j_kv_str(out, "name", name);
+        j_kv(out, "sc_total", &alloc::format!("{}", s.sc_total));
+        j_kv(out, "sc_vm",    &alloc::format!("{}", s.sc_vm));
+        j_kv(out, "sc_file",  &alloc::format!("{}", s.sc_file));
+        j_kv(out, "sc_net",   &alloc::format!("{}", s.sc_net));
+        j_kv(out, "sc_sync",  &alloc::format!("{}", s.sc_sync));
+        j_kv(out, "sc_proc",  &alloc::format!("{}", s.sc_proc));
+        j_kv(out, "sc_signal",&alloc::format!("{}", s.sc_signal));
+        j_kv(out, "sc_other", &alloc::format!("{}", s.sc_other));
+        j_kv(out, "pf_count", &alloc::format!("{}", s.pf_count));
+        j_kv(out, "disk_r_bytes", &alloc::format!("{}", s.disk_r_bytes));
+        j_kv(out, "disk_w_bytes", &alloc::format!("{}", s.disk_w_bytes));
+        j_kv(out, "net_r_bytes",  &alloc::format!("{}", s.net_r_bytes));
+        j_kv(out, "net_w_bytes",  &alloc::format!("{}", s.net_w_bytes));
+        // Currently-running syscall: -1 means none.  Compute the
+        // tick-delta so the caller can decide what counts as "stuck"
+        // without rounding decisions baked into the kernel.
+        j_kv(out, "last_sc_nr", &alloc::format!("{}", s.last_sc_nr));
+        let delta = if s.last_sc_nr >= 0 {
+            tick_now.saturating_sub(s.last_sc_tick)
+        } else { 0 };
+        j_kv(out, "in_sc_ticks", &alloc::format!("{}", delta));
+        j_trim_comma(out);
+        out.push('}');
+    }
+    out.push(']');
+    out.push('}');
 }

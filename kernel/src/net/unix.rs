@@ -366,6 +366,9 @@ pub fn write(id: u64, data: &[u8]) -> i64 {
         drop(t);
         crate::ipc::waitlist::ring_poll_bell_for(
             crate::ipc::waitlist::PollBellSource::UnixWrite);
+        // Attribute SEQPACKET bytes to the writer.
+        crate::proc::proc_metrics::bump_net_write(
+            crate::proc::current_pid_lockless(), n as u64);
         return n as i64;
     }
 
@@ -379,6 +382,9 @@ pub fn write(id: u64, data: &[u8]) -> i64 {
         // tick to discover the new bytes.
         crate::ipc::waitlist::ring_poll_bell_for(
             crate::ipc::waitlist::PollBellSource::UnixWrite);
+        // Attribute outbound AF_UNIX bytes to the writer.
+        crate::proc::proc_metrics::bump_net_write(
+            crate::proc::current_pid_lockless(), n as u64);
     }
     if n == 0 { -11 } else { n as i64 }
 }
@@ -388,6 +394,10 @@ pub fn read(id: u64, buf: &mut [u8]) -> i64 {
         Ok(v) => v,
         Err(e) => return e,
     };
+    if n > 0 {
+        crate::proc::proc_metrics::bump_net_read(
+            crate::proc::current_pid_lockless(), n as u64);
+    }
     n as i64
 }
 
