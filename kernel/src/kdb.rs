@@ -360,6 +360,10 @@ pub fn dispatch(req: &str, out: &mut String) {
         "coverage-flush" => op_coverage_flush(out),
         "proc-metrics"   => op_proc_metrics(out),
         "thread-park-audit" => op_thread_park_audit(req, out),
+        #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+        "futex-stats"           => op_futex_stats(out),
+        #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+        "futex-set-cluster-wake" => op_futex_set_cluster_wake(req, out),
         _ => {
             out.push_str(r#"{"error":"unknown op: "#);
             for c in op.chars().take(64) {
@@ -2350,5 +2354,71 @@ fn file_type_str(ft: crate::vfs::FileType) -> &'static str {
         InotifyFd => "inotifyfd",
         PtyMaster => "pty-master",
         PtySlave => "pty-slave",
+    }
+}
+
+// ── futex-stats ──────────────────────────────────────────────────────────────
+//
+// Surfaces the counters from `subsys::linux::futex_cluster` plus the existing
+// `FUTEX_WAKE_GHOST` counter from `subsys::linux::syscall`.  The qemu-harness
+// front-end uses this to verify the cluster-wake compensation is firing
+// during firefox-test runs.  Per POSIX `pthread_cond_signal(3p)` the wake
+// recovery upholds the at-least-one-unblocked guarantee when older glibc
+// loses the race documented at the public bug
+// <https://sourceware.org/bugzilla/show_bug.cgi?id=25847>.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn op_futex_stats(out: &mut String) {
+    use core::fmt::Write;
+    let s = crate::subsys::linux::futex_cluster::stats();
+    let ghost = crate::subsys::linux::syscall::FUTEX_WAKE_GHOST_COUNT
+        .load(core::sync::atomic::Ordering::Relaxed);
+    out.push('{');
+    let _ = write!(
+        out,
+        r#""cluster_wake_enabled":{},"#,
+        if s.enabled { "true" } else { "false" }
+    );
+    let _ = write!(out, r#""cluster_wake_attempts":{},"#,      s.attempts);
+    let _ = write!(out, r#""cluster_wake_recoveries":{},"#,    s.recoveries);
+    let _ = write!(out, r#""cluster_wake_misses":{},"#,        s.misses);
+    let _ = write!(out, r#""cluster_wake_no_candidates":{},"#, s.no_candidates);
+    let _ = write!(out, r#""futex_wake_ghost":{}"#,            ghost);
+    out.push('}');
+}
+
+// ── futex-set-cluster-wake ───────────────────────────────────────────────────
+//
+// Runtime toggle for the bounded broadcast-within-cluster wake compensation.
+// Request:
+//   {"op":"futex-set-cluster-wake","on":true}   or "false"
+// Default is ON when the kernel was built with `firefox-test`, OFF otherwise.
+// Production safety: operator must explicitly opt-in via this kdb command
+// on a stock build.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn op_futex_set_cluster_wake(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    let on_field = extract_field(req, "on").map(|v| v.to_ascii_lowercase());
+    let new_state = match on_field.as_deref() {
+        Some("true") | Some("1") | Some("on")  => Some(true),
+        Some("false") | Some("0") | Some("off") => Some(false),
+        _ => None,
+    };
+    match new_state {
+        Some(v) => {
+            crate::subsys::linux::futex_cluster::set_enabled(v);
+            let _ = write!(
+                out,
+                r#"{{"cluster_wake_enabled":{}}}"#,
+                if v { "true" } else { "false" }
+            );
+        }
+        None => {
+            let current = crate::subsys::linux::futex_cluster::is_enabled();
+            let _ = write!(
+                out,
+                r#"{{"error":"missing or unrecognised 'on' field","cluster_wake_enabled":{}}}"#,
+                if current { "true" } else { "false" }
+            );
+        }
     }
 }

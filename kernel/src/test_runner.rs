@@ -1806,6 +1806,26 @@ pub fn run() -> ! {
         if test_238_futex_wake_ghost_cluster() { passed += 1; }
     }
 
+    // ── Test 239: FUTEX_WAKE bounded-broadcast-within-cluster compensation ─
+    // Verifies the recovery path added to mitigate the older-glibc
+    // `pthread_cond_signal` race (public bug at
+    // https://sourceware.org/bugzilla/show_bug.cgi?id=25847).  Three
+    // sub-scenarios:
+    //   (a) positive control — a synthetic waiter at +0x04 (canonical
+    //       same-cond_t `__g_signals[1]` offset) MUST be woken without
+    //       requiring history.
+    //   (b) negative control — a waiter at +0x40 (unrelated futex inside
+    //       the 256-byte cluster) MUST NOT be woken when no history
+    //       admits it.
+    //   (c) history-gated path — a waiter at +0x10 (non-canonical
+    //       offset, inside cluster) IS woken if the same TGID recently
+    //       parked there.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_239_futex_cluster_wake_compensation() { passed += 1; }
+    }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -30518,6 +30538,161 @@ fn test_238_futex_wake_ghost_cluster() -> bool {
     test_println!("  far waiter (+0x400) did NOT trigger diagnostic ✓");
 
     test_pass!("subsys/linux: FUTEX_WAKE_GHOST cluster diagnostic");
+    true
+}
+
+// ── Test 239: FUTEX_WAKE bounded-broadcast-within-cluster compensation ──────
+//
+// Verifies the bounded-broadcast compensation added to mitigate the older-
+// glibc `pthread_cond_signal` race documented in the public bug at
+// <https://sourceware.org/bugzilla/show_bug.cgi?id=25847>.  The kernel
+// path is gated by `subsys::linux::futex_cluster::ENABLED`, default-on
+// under `firefox-test` and default-off otherwise; this test flips it ON
+// explicitly so the path runs regardless of build features.
+//
+// Per `pthread_cond_signal(3p)` POSIX:2017 §2.9.5, the spec the
+// compensation upholds is: "If any threads are blocked on the condition
+// variable, the pthread_cond_signal() function shall unblock at least
+// one of those threads."  When glibc's group-rotation race posts the
+// wake to one `__g_signals[g]` while a waiter is parked on the other,
+// the kernel wakes a candidate in the 256-byte cluster that passes the
+// safety harness (canonical-offset OR same-TID wake history OR same-TGID
+// wait history).
+//
+// Three sub-scenarios are exercised; all use synthetic TIDs (no real
+// threads exist) and a synthetic uaddr that we never dereference, so
+// failure modes are deterministic and isolated:
+//
+//   (a) Positive control — canonical offset (+0x04, the same-cond_t
+//       `__g_signals[0]` ↔ `__g_signals[1]` distance).  MUST wake.
+//
+//   (b) Negative control — non-canonical offset (+0x40), no history.
+//       MUST NOT wake (safety harness rejects it).
+//
+//   (c) History-gated — non-canonical offset (+0x10) with prior
+//       `record_wait(pid, +0x10)`.  MUST wake.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_239_futex_cluster_wake_compensation() -> bool {
+    use core::sync::atomic::Ordering;
+    test_header!("subsys/linux: FUTEX_WAKE cluster-wake compensation");
+
+    let pid = crate::proc::current_pid_lockless();
+    let fake_tid_caller: u64 = 0x238F_239A_0000_0001;
+
+    // Reserve a synthetic user-VA cluster anchor that nothing else owns.
+    let cluster_base:    u64 = 0x0000_5555_d239_0000;
+    let uaddr_wake:      u64 = cluster_base + 0x80;       // wake target (middle of cluster window)
+    let uaddr_cond_sib:  u64 = uaddr_wake  + 0x04;         // +0x04 = canonical __g_signals[1]
+    let uaddr_far:       u64 = uaddr_wake  + 0x40;         // +0x40 = inside cluster, NOT canonical
+    let uaddr_history:   u64 = uaddr_wake  + 0x10;         // +0x10 = inside cluster, NOT canonical
+
+    // Force ENABLED on for the duration of the test (so the test passes
+    // regardless of build features).  Save and restore.
+    let saved_enabled = crate::subsys::linux::futex_cluster::is_enabled();
+    crate::subsys::linux::futex_cluster::set_enabled(true);
+
+    let pre_recoveries = crate::subsys::linux::futex_cluster::CLUSTER_WAKE_RECOVERIES
+        .load(Ordering::Relaxed);
+    let pre_misses     = crate::subsys::linux::futex_cluster::CLUSTER_WAKE_MISSES
+        .load(Ordering::Relaxed);
+
+    // Helper: install a synthetic waiter at a given uaddr.
+    let install = |uaddr: u64, tid: u64| {
+        let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
+        waiters
+            .entry((pid, uaddr))
+            .or_insert_with(alloc::vec::Vec::new)
+            .push(tid);
+    };
+    // Helper: drain any synthetic waiters left behind so the test runner
+    // doesn't see fake TIDs in subsequent tests.
+    let drain = |uaddr: u64| {
+        let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
+        let _ = waiters.remove(&(pid, uaddr));
+    };
+
+    // ── (a) Positive control: canonical-offset wake ─────────────────────
+    install(uaddr_cond_sib, 0x0000_0239_A001_0001);
+    let woken_a = crate::subsys::linux::futex_cluster::_test_compensate(
+        pid, fake_tid_caller, uaddr_wake, 1
+    );
+    drain(uaddr_cond_sib);
+
+    if woken_a != 1 {
+        crate::subsys::linux::futex_cluster::set_enabled(saved_enabled);
+        test_fail!("test239",
+            "(a) canonical-offset wake expected 1 woken, got {} — \
+             safety harness rejected +0x04 candidate",
+            woken_a);
+        return false;
+    }
+    test_println!("  (a) canonical +0x04 → woken=1 ✓");
+
+    // ── (b) Negative control: non-canonical, no history ────────────────
+    install(uaddr_far, 0x0000_0239_A001_0002);
+    let woken_b = crate::subsys::linux::futex_cluster::_test_compensate(
+        pid, fake_tid_caller, uaddr_wake, 1
+    );
+    drain(uaddr_far);
+
+    if woken_b != 0 {
+        crate::subsys::linux::futex_cluster::set_enabled(saved_enabled);
+        test_fail!("test239",
+            "(b) non-canonical-no-history wake expected 0, got {} — \
+             safety harness admitted +0x40 without justification",
+            woken_b);
+        return false;
+    }
+    test_println!("  (b) non-canonical +0x40 (no history) → woken=0 ✓");
+
+    // ── (c) History-gated: non-canonical, with FUTEX_WAIT history ──────
+    // Inject the wait history first, then the synthetic waiter.  Order
+    // matters: the safety harness checks history at scan time.
+    crate::subsys::linux::futex_cluster::_test_record_wait(pid, uaddr_history);
+    install(uaddr_history, 0x0000_0239_A001_0003);
+    let woken_c = crate::subsys::linux::futex_cluster::_test_compensate(
+        pid, fake_tid_caller, uaddr_wake, 1
+    );
+    drain(uaddr_history);
+
+    if woken_c != 1 {
+        crate::subsys::linux::futex_cluster::set_enabled(saved_enabled);
+        test_fail!("test239",
+            "(c) history-gated wake at +0x10 expected 1 woken, got {} — \
+             record_wait history failed to admit candidate",
+            woken_c);
+        return false;
+    }
+    test_println!("  (c) history-gated +0x10 → woken=1 ✓");
+
+    // ── Counter invariants ─────────────────────────────────────────────
+    let post_recoveries = crate::subsys::linux::futex_cluster::CLUSTER_WAKE_RECOVERIES
+        .load(Ordering::Relaxed);
+    let post_misses     = crate::subsys::linux::futex_cluster::CLUSTER_WAKE_MISSES
+        .load(Ordering::Relaxed);
+
+    let d_rec  = post_recoveries.wrapping_sub(pre_recoveries);
+    let d_miss = post_misses.wrapping_sub(pre_misses);
+    crate::subsys::linux::futex_cluster::set_enabled(saved_enabled);
+
+    if d_rec != 2 {
+        test_fail!("test239",
+            "CLUSTER_WAKE_RECOVERIES expected +2, got +{} \
+             (a and c should both bump the counter)",
+            d_rec);
+        return false;
+    }
+    if d_miss != 1 {
+        test_fail!("test239",
+            "CLUSTER_WAKE_MISSES expected +1, got +{} \
+             (b should bump misses because cluster had a neighbour but \
+              safety harness rejected)",
+            d_miss);
+        return false;
+    }
+    test_println!("  counters: recoveries +{} ✓ misses +{} ✓", d_rec, d_miss);
+
+    test_pass!("subsys/linux: FUTEX_WAKE cluster-wake compensation");
     true
 }
 
