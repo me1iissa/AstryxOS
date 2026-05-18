@@ -1036,6 +1036,7 @@ pub extern "C" fn ap_rust_entry() -> ! {
             gs_base: 0,
             robust_list_head: 0,
             robust_list_len: 0,
+            vfork_isolated_stack: None,
         };
         THREAD_TABLE.lock().push(ap_thread);
     }

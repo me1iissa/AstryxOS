@@ -245,6 +245,24 @@ pub struct Thread {
     /// Length of the robust list structure (always sizeof(struct robust_list_head)
     /// = 24 bytes in practice, but stored verbatim as passed by glibc).
     pub robust_list_len: usize,
+    /// Per `clone(2)`/`vfork(2)`: when a `CLONE_VM|CLONE_VFORK` child is given
+    /// a `new_stack` argument that lies inside the parent's user stack frame
+    /// (the canonical pattern produced by `posix_spawn(3)` implementations
+    /// that allocate the child's stack as a small local buffer of the
+    /// parent's `posix_spawn()` frame, e.g. `char stack[1024+PATH_MAX]`), the
+    /// kernel substitutes a freshly-allocated isolated stack so that the
+    /// child's stack growth cannot clobber the parent's stack region while
+    /// the address space is shared.  Linux suspends the parent during
+    /// `CLONE_VFORK` so child writes are not raced against, but POSIX
+    /// `vfork(2)` still leaves the parent observable to corruption after it
+    /// resumes — including any saved stack-protector canary copies that
+    /// SSP-instrumented callers (libxul) place on the stack.  This field
+    /// records the `(base, length)` of the isolated stack VMA so the
+    /// kernel can unmap it from the parent's address space on
+    /// `execve(2)` / vfork-child exit.  `None` for every non-vfork
+    /// path (initial thread, fork-style clone with a fresh CR3, kernel
+    /// threads, AP idle threads).
+    pub vfork_isolated_stack: Option<(u64, u64)>,
 }
 
 impl Thread {
@@ -667,6 +685,7 @@ pub fn init() {
         gs_base: 0,
         robust_list_head: 0,
         robust_list_len: 0,
+        vfork_isolated_stack: None,
     };
 
     PROCESS_TABLE.lock().push(idle_proc);
@@ -915,6 +934,7 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
         gs_base: 0,
         robust_list_head: 0,
         robust_list_len: 0,
+        vfork_isolated_stack: None,
     };
 
     PROCESS_TABLE.lock().push(process);
@@ -980,6 +1000,7 @@ pub fn create_thread(pid: Pid, name: &str, entry_point: u64) -> Option<Tid> {
         gs_base: 0,
         robust_list_head: 0,
         robust_list_len: 0,
+        vfork_isolated_stack: None,
     };
 
     THREAD_TABLE.lock().push(thread);
@@ -1049,6 +1070,7 @@ pub fn create_thread_blocked(pid: Pid, name: &str, entry_point: u64) -> Option<T
         gs_base: 0,
         robust_list_head: 0,
         robust_list_len: 0,
+        vfork_isolated_stack: None,
     };
 
     THREAD_TABLE.lock().push(thread);
@@ -1152,6 +1174,30 @@ pub fn exit_thread(exit_code: i64) {
     // vfork completion: if this is a vfork child exiting without exec, wake parent.
     // Linux: exit_mm_release() → mm_release() → complete_vfork_done().
     crate::syscall::wake_vfork_parent();
+
+    // Vfork isolated-stack cleanup: if this thread is a vfork child that
+    // was given a kernel-allocated isolated stack by `alloc_vfork_child_stack`
+    // and exited WITHOUT execve(2) (the execve case is handled in
+    // `syscall::sys_exec` step 5a), unmap the stack from the parent's
+    // address space now.  The parent is still alive (zombie-able) and owns
+    // the cr3 we mapped against; failing to unmap here would leak the VMA
+    // until the parent itself exits.
+    {
+        let isolated = {
+            let threads = THREAD_TABLE.lock();
+            threads.iter().find(|t| t.tid == tid)
+                .and_then(|t| t.vfork_isolated_stack)
+        };
+        if let Some((base, length)) = isolated {
+            if parent_pid != 0 {
+                vfork_isolated_stack_cleanup(parent_pid, base, length);
+            }
+            let mut threads = THREAD_TABLE.lock();
+            if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+                t.vfork_isolated_stack = None;
+            }
+        }
+    }
 
     // CLONE_CHILD_CLEARTID: write 0 to the child_tid address and futex-wake it.
     // This is how glibc's pthread_join knows the thread has exited — it does
@@ -1757,6 +1803,26 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
         crate::syscall::wake_vfork_parent();
     }
 
+    // Vfork isolated-stack cleanup: same rationale as exit_thread (see
+    // there for the longer comment).  We harvest the field from the
+    // calling thread (the vfork child) and unmap the recorded VMA from
+    // the parent's address space.  Out-of-band callers (yield_self==false)
+    // do not own a calling_tid of the dying process, so they skip this.
+    if yield_self && calling_tid != 0 && parent_pid != 0 {
+        let isolated = {
+            let threads = THREAD_TABLE.lock();
+            threads.iter().find(|t| t.tid == calling_tid)
+                .and_then(|t| t.vfork_isolated_stack)
+        };
+        if let Some((base, length)) = isolated {
+            vfork_isolated_stack_cleanup(parent_pid, base, length);
+            let mut threads = THREAD_TABLE.lock();
+            if let Some(t) = threads.iter_mut().find(|t| t.tid == calling_tid) {
+                t.vfork_isolated_stack = None;
+            }
+        }
+    }
+
     // Wake parent threads blocked in waitpid, and mark calling thread Dead
     // (only when the caller is itself a thread of the dying process).
     {
@@ -2191,6 +2257,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
         gs_base: 0,
         robust_list_head: 0,
         robust_list_len: 0,
+        vfork_isolated_stack: None,
     };
 
     PROCESS_TABLE.lock().push(child_proc);
@@ -2397,28 +2464,23 @@ pub fn fork_process_share_vm(
         user_entry_r8:  0,
         priority: PRIORITY_NORMAL,
         base_priority: PRIORITY_NORMAL,
-        // VFORK / CLONE_VM child must NOT inherit the parent's TLS base.
+        // VFORK / CLONE_VM child inherits the parent's FS.base so it can use
+        // thread-local storage immediately.  The glxtest child function in
+        // libxul calls fork(2) (which internally reads %fs:0 via musl's
+        // pthread machinery), so a zeroed FS.base would fault immediately.
         //
-        // The child shares the parent's address space (same CR3) but will
-        // call execve(2) almost immediately.  If the child inherits
-        // `parent_tls_base`, user_mode_bootstrap writes that value into the
-        // CPU's FS_BASE MSR.  The new process image (ld-musl) then runs with
-        // FS_BASE pointing at the PARENT's TLS struct, and its startup
-        // initialisation (musl __libc_start_main → __stack_chk_guard init)
-        // writes the new canary to parent_tls + 0x28 — corrupting the
-        // parent's SSP canary.  On the parent's next call to any
-        // SSP-protected function the prologue stores the (now-wrong) canary
-        // and the epilogue reads the old value from the stack, triggering
-        // __stack_chk_fail → #GP.
+        // The parent's SSP canary lives at parent_tls_base + 0x28.  The child
+        // must not write to that offset while sharing the TLS struct.  In
+        // practice, musl's fork() path only READS %fs:0 (to obtain the thread
+        // self-pointer for atfork handler iteration); it never writes %fs:0x28
+        // before the child calls _exit().  Therefore inheriting the parent's
+        // TLS base is safe for the brief vfork window.
         //
-        // Setting tls_base = 0 makes user_mode_bootstrap skip the WRMSR
-        // (see `if tls_base != 0` guard), leaving FS_BASE at whatever
-        // kernel-mode value it has until the child calls
-        // arch_prctl(ARCH_SET_FS, new_tcb) in its own execve'd image.
-        // The posix_spawn child function (musl's __spawni_child) does NOT
-        // use fs: segment accesses, so a zero FS_BASE is safe for the brief
-        // window between clone and execve.
-        tls_base: 0,
+        // If the child calls arch_prctl(ARCH_SET_FS, new_tls) (e.g., via
+        // execve -> ld-musl startup), sys_arch_prctl updates its own tls_base
+        // in THREAD_TABLE; the scheduler restores the parent's tls_base when
+        // the parent next runs.
+        tls_base: parent_tls_base,
         cpu_affinity: None,
         last_cpu: 0,
         first_run: true,
@@ -2429,6 +2491,7 @@ pub fn fork_process_share_vm(
         gs_base: 0,
         robust_list_head: 0,
         robust_list_len: 0,
+        vfork_isolated_stack: None,
     };
 
     PROCESS_TABLE.lock().push(child_proc);
@@ -2461,6 +2524,200 @@ pub fn fork_process_share_vm(
     );
 
     Some((child_pid, child_tid))
+}
+
+/// Allocate an **isolated user-mode stack** for a `CLONE_VM|CLONE_VFORK` child
+/// so that the child's stack growth cannot clobber the parent's stack region
+/// while the address space is shared.
+///
+/// # Why this exists
+///
+/// Some libc `posix_spawn(3)` implementations (and the underlying
+/// `posix_spawnp(3)`) place the child's stack as an on-stack local of the
+/// **parent's `posix_spawn()` frame**, roughly:
+///
+/// ```c
+/// char stack[1024+PATH_MAX];
+/// pid = __clone(child, stack+sizeof stack,
+///               CLONE_VM|CLONE_VFORK|SIGCHLD, &args);
+/// ```
+///
+/// `1024 + PATH_MAX = 1024 + 4096 = 5120` bytes — small enough that the
+/// child helper can overflow it after a chain of `sigaction` /
+/// `pthread_sigmask` / `execve` setup calls.  Once the child's RSP descends
+/// past `&stack[0]` it lands in the parent's neighbouring frame:
+/// `posix_spawn()` locals (`args`, `ec`, `cs`, ...) first, then the caller
+/// frame of `posix_spawn()` (typically libxul's spawn shim), and so on
+/// upward through the call chain.
+///
+/// `CLONE_VFORK` suspends the parent — the parent does not *execute*
+/// instructions while the child is alive — but the corrupted parent-stack
+/// bytes are not restored when the parent resumes.  In particular,
+/// stack-protector instrumented callers (SSP-enabled libxul) save the canary
+/// **on the stack** in their prologue and re-read it in the epilogue; if the
+/// child overwrote that copy, the epilogue compares the corrupted value
+/// against `fs:0x28` and triggers `__stack_chk_fail` → `a_crash` → #GP.
+///
+/// # What this helper does
+///
+/// 1. Allocates a 64 KiB anonymous VMA in the shared address space (parent's
+///    `VmSpace`, which the child is borrowing via the shared `cr3`).
+/// 2. Eagerly maps the top 4 KiB page of that VMA so the kernel can write the
+///    libc-pushed `arg` word into it without faulting; lower pages remain
+///    demand-paged by the standard PFH.
+/// 3. Reads the 8-byte word at the parent-supplied `new_stack` address —
+///    the canonical x86_64 SysV `__clone` preamble writes the helper's `arg`
+///    pointer there immediately before the syscall via `mov %rcx, (%rsi)`.
+///    After the child wakes, its first user instructions are
+///    `pop %rdi; call *%r9`, which expect `arg` to be at the very top of its
+///    stack.
+/// 4. Writes that `arg` word to the corresponding slot in the new isolated
+///    stack so the child's `pop %rdi` reads the right value.
+/// 5. Returns the new RSP value (`new_top - 8`) for the caller to install on
+///    `Thread.user_entry_rsp` in place of the parent-frame `new_stack`.
+///
+/// # Cleanup
+///
+/// The base+length of the isolated stack is recorded by the caller on
+/// `Thread.vfork_isolated_stack`.  It is unmapped from the parent's address
+/// space in two places:
+///   * `execve(2)` case (C) — `syscall::sys_exec` after the new VmSpace is
+///     installed and the parent is woken via `wake_vfork_parent()`.
+///   * Vfork-child exit (`exit`, `exit_group`, or fatal signal) — via
+///     `vfork_isolated_stack_cleanup()` invoked from the thread-exit path.
+///
+/// # References
+///
+/// * POSIX `vfork(2)` / `posix_spawn(3)`
+/// * Linux `clone(2)` / `clone3(2)` (ABI for the `stack` argument)
+/// * x86_64 SysV ABI - calling convention for the `__clone` shim
+/// * ELF gABI §6 (stack-protector canary placement)
+pub fn alloc_vfork_child_stack(parent_pid: Pid, parent_new_stack: u64) -> Option<u64> {
+    use crate::mm::vma::{VmArea, VmBacking, VmaError,
+                         PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS, MAP_STACK,
+                         page_align_up};
+    use crate::mm::vmm::{PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER, PAGE_NO_EXECUTE};
+
+    // Stack size for the isolated VMA.  64 KiB is far larger than any path
+    // the libc child-helper can realistically push (a few hundred bytes of
+    // sigaction loops + execve preamble), but small enough that leaking one
+    // per posix_spawn invocation between vfork start and execve completion
+    // costs at most a few hundred KiB in steady state.
+    const VFORK_STACK_SIZE: u64 = 64 * 1024;
+
+    // -- Phase 1: read the helper-arg word the libc preamble pushed onto the
+    // parent stack.
+    //
+    // We are still executing in the parent's syscall context, so the user-VA
+    // `parent_new_stack` is directly readable under SMAP.  The 8-byte read
+    // is what the libc `__clone` shim wrote via `mov %rcx,(%rsi)`; the child
+    // will `pop %rdi` from this slot as its first user instruction.
+    let arg_word: u64 = unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
+        core::ptr::read(parent_new_stack as *const u64)
+    };
+
+    // ── Phase 2: locate the parent's VmSpace and pick a free address range.
+    let length = page_align_up(VFORK_STACK_SIZE);
+    let (parent_cr3, base) = {
+        let mut procs = PROCESS_TABLE.lock();
+        let p = procs.iter_mut().find(|p| p.pid == parent_pid)?;
+        let space = p.vm_space.as_mut()?;
+        let base = space.find_free_range(length)?;
+
+        // Insert the VMA so subsequent page-faults inside the range are
+        // demand-paged by the standard handler.  We also pre-map the top
+        // page below (Phase 3) so the immediate `pop %rdi` succeeds without
+        // ever entering the PFH.
+        let vma = VmArea {
+            base,
+            length,
+            prot: PROT_READ | PROT_WRITE,
+            flags: MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK,
+            backing: VmBacking::Anonymous,
+            name: "[vfork-stack]",
+        };
+        if let Err(VmaError::Overlap) = space.insert_vma(vma) {
+            // Should never happen — find_free_range just told us this range
+            // was clear.  Bail rather than corrupting the VMA list.
+            return None;
+        }
+        (p.cr3, base)
+    };
+
+    // ── Phase 3: eagerly back the top page with a fresh frame, write the
+    // helper-arg word at `top - 8`, and install a writable user PTE.
+    //
+    // The page must be writable + user + non-executable.  We don't bother
+    // pre-mapping the rest of the VMA — the PFH will allocate frames as the
+    // child grows the stack downward (typical: only the top few pages get
+    // touched before the child execve's).
+    let top = base + length;
+    let top_page_va = top - 0x1000;
+    let frame = crate::mm::pmm::alloc_page()?;
+    // Zero the frame and write the arg word at offset 0xff8 (== top - 8 mod 4 KiB).
+    // PHYS_OFF = higher-half physical→virtual identity offset (kernel.org
+    // documents this layout informally; locally it is `0xFFFF_8000_0000_0000`).
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    unsafe {
+        let kva = (PHYS_OFF + frame) as *mut u8;
+        core::ptr::write_bytes(kva, 0, 4096);
+        core::ptr::write((kva.add(0x1000 - 8)) as *mut u64, arg_word);
+    }
+    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_NO_EXECUTE;
+    if !crate::mm::vmm::map_page_in(parent_cr3, top_page_va, frame, flags) {
+        // Map failed — free the frame and bail.  The VMA stays in the parent's
+        // list and will be cleaned up at the next address-space teardown.
+        crate::mm::pmm::free_page(frame);
+        return None;
+    }
+    // Bump the page refcount so the unmap path drops it cleanly later.
+    crate::mm::refcount::page_ref_inc(frame);
+
+    crate::serial_println!(
+        "[VFORK-STACK] alloc base={:#x} top={:#x} new_rsp={:#x} arg={:#x} (parent_rsp={:#x})",
+        base, top, top - 8, arg_word, parent_new_stack
+    );
+
+    Some(top - 8)
+}
+
+/// Tear down an isolated vfork-child stack VMA from the **parent's** address
+/// space.  Called from `execve(2)` (case C — shared-VM child installing a
+/// fresh image) and from the vfork-child exit path.
+///
+/// The caller passes the `(base, length)` previously recorded on
+/// `Thread.vfork_isolated_stack` plus the parent's `cr3`.  The VMA's pages
+/// are unmapped via `unmap_and_free_range_in` (which decrements refcounts
+/// and frees frames whose ref reaches zero) and the VmSpace entry is
+/// removed via `remove_range`.
+///
+/// Safe to call multiple times — repeated calls on the same `(base, length)`
+/// are no-ops because the VMA / PTEs have already been removed.
+pub fn vfork_isolated_stack_cleanup(parent_pid: Pid, base: u64, length: u64) {
+    // First unmap the PTEs and free the physical frames in the parent's CR3.
+    let parent_cr3 = {
+        let procs = PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == parent_pid).map(|p| p.cr3).unwrap_or(0)
+    };
+    if parent_cr3 == 0 { return; }
+
+    let unmapped = crate::mm::vmm::unmap_and_free_range_in(parent_cr3, base, length);
+
+    // Then remove the VMA entry from the parent's VmSpace.
+    {
+        let mut procs = PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == parent_pid) {
+            if let Some(space) = p.vm_space.as_mut() {
+                let _ = space.remove_range(base, length);
+            }
+        }
+    }
+
+    crate::serial_println!(
+        "[VFORK-STACK] cleanup parent_pid={} cr3={:#x} base={:#x} length={:#x} unmapped_pages={}",
+        parent_pid, parent_cr3, base, length, unmapped
+    );
 }
 
 /// Apply `CLONE_CLEAR_SIGHAND` semantics to a process's signal-action table.
@@ -2673,6 +2930,7 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
         gs_base: 0,
         robust_list_head: 0,
         robust_list_len: 0,
+        vfork_isolated_stack: None,
     };
 
     PROCESS_TABLE.lock().push(child_proc);
