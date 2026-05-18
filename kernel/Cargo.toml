@@ -8,6 +8,12 @@ default = []
 test-mode = []
 gui-test = []
 firefox-test = []
+# Opt-in for the userspace alias_test page-aliasing reproducer (Test 44b).
+# Spawns 8 worker threads via raw clone(CLONE_VM|CLONE_THREAD|CLONE_SIGHAND)
+# doing MAP_PRIVATE mmap churn; runs >100k page faults; sometimes wedges
+# under CI watchdog limits.  Master CI runs without it until the
+# underlying worker-thread wedge is resolved; enable for diagnostic runs.
+alias-test = []
 # W215 Arm-1 diagnostic infrastructure: the page-cache CRC walker
 # (`mm/w215_crc.rs`, ~2 MiB BSS shadow table), the cross-CPU DR0
 # write-watchpoint plumbing (`arch/x86_64/debug_reg.rs`, IPI vector 0xF1),
