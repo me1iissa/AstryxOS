@@ -1606,19 +1606,36 @@ fn setup_user_stack(
 
     let mut sp = stack_top;
 
-    // 16 random bytes for AT_RANDOM
+    // 16 random bytes for AT_RANDOM (Linux ELF aux-vector ABI, getauxval(3)).
+    //
+    // The auxiliary vector entry AT_RANDOM points to 16 bytes of high-entropy
+    // data that the C runtime consumes to seed __stack_chk_guard (and, on
+    // glibc, the pointer-mangling cookie).  Per the ELF gABI §6
+    // stack-protector convention the userspace runtime is responsible for
+    // zeroing one byte of the canary (musl zeroes byte 1; glibc zeroes
+    // byte 0) so that string-manipulation bugs cannot leak the canary in
+    // full — the kernel MUST supply 16 high-entropy bytes regardless.
+    //
+    // Previously this slot was filled by a per-byte arithmetic expression
+    // whose (i+1) increment was lost in the high-bit truncation
+    // `(seed*K + i+1) >> 33` — all 16 bytes resolved to the same value,
+    // producing fill patterns like 0x9a9a9a9a9a9a9a9a.  After musl's
+    // byte-1 zeroing the runtime canary became 0x9a9a9a9a9a9a009a, which
+    // is statistically distinguishable from a random canary and, more
+    // importantly, identical across every musl process — defeating SSP's
+    // exploit-mitigation purpose entirely.
+    //
+    // Use the kernel RNG (RDRAND when available, RDTSC+xorshift fallback)
+    // for two 64-bit draws to fill the slot.  Each draw is independent so
+    // all 16 bytes carry full entropy.
     sp -= 16;
     let at_random_addr = sp;
-    // Use RDRAND if available, otherwise use a simple seed from the PIT tick counter.
     let random_bytes: [u8; 16] = {
+        let lo = crate::security::rand::rand_u64();
+        let hi = crate::security::rand::rand_u64();
         let mut buf = [0u8; 16];
-        let seed = crate::arch::x86_64::irq::TICK_COUNT
-            .load(core::sync::atomic::Ordering::Relaxed);
-        for i in 0..16 {
-            // Simple PRNG: xorshift-like mixing of seed + index
-            let v = seed.wrapping_mul(6364136223846793005).wrapping_add(i as u64 + 1);
-            buf[i] = (v >> 33) as u8;
-        }
+        buf[0..8].copy_from_slice(&lo.to_le_bytes());
+        buf[8..16].copy_from_slice(&hi.to_le_bytes());
         buf
     };
     stack_write_bytes(stack_pages, stack_bottom, at_random_addr, &random_bytes);
