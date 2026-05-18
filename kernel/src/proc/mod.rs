@@ -1171,10 +1171,6 @@ pub fn exit_thread(exit_code: i64) {
         free_process_memory(pid);
     }
 
-    // vfork completion: if this is a vfork child exiting without exec, wake parent.
-    // Linux: exit_mm_release() → mm_release() → complete_vfork_done().
-    crate::syscall::wake_vfork_parent();
-
     // Vfork isolated-stack cleanup: if this thread is a vfork child that
     // was given a kernel-allocated isolated stack by `alloc_vfork_child_stack`
     // and exited WITHOUT execve(2) (the execve case is handled in
@@ -1182,6 +1178,12 @@ pub fn exit_thread(exit_code: i64) {
     // address space now.  The parent is still alive (zombie-able) and owns
     // the cr3 we mapped against; failing to unmap here would leak the VMA
     // until the parent itself exits.
+    //
+    // Ordering: this runs BEFORE `wake_vfork_parent()` to match the
+    // canonical sys_exec Case C order — the parent must observe the
+    // teardown completed (mapping unmapped, TLB shootdown ack'd) before
+    // it is unblocked, so a parent thread that immediately runs and
+    // reuses the same VA range cannot race against our pending unmap.
     {
         let isolated = {
             let threads = THREAD_TABLE.lock();
@@ -1198,6 +1200,11 @@ pub fn exit_thread(exit_code: i64) {
             }
         }
     }
+
+    // vfork completion: if this is a vfork child exiting without exec, wake parent.
+    // Per POSIX vfork(2): the parent resumes only after the child terminates
+    // or has called one of the exec(3) family.
+    crate::syscall::wake_vfork_parent();
 
     // CLONE_CHILD_CLEARTID: write 0 to the child_tid address and futex-wake it.
     // This is how glibc's pthread_join knows the thread has exited — it does
@@ -1787,27 +1794,15 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
     // Free user memory (no locks held).
     free_process_memory(pid);
 
-    // vfork completion: if the caller is a vfork child fatal-faulting mid-
-    // execve (e.g. a synchronous fatal CPU exception routed here from
-    // arch/x86_64/idt.rs), the parent is parked in TASK_KILLABLE-style sleep
-    // on `vfork_parent_tid` and only this wake will release it.  Without it,
-    // the parent stays Blocked until the 5-second vfork timeout fires.
-    // Linux: exit_mm_release() → mm_release() → complete_vfork_done().
-    //
-    // Lock discipline: wake_vfork_parent() takes THREAD_TABLE.  We hold no
-    // locks here (the sibling-Dead pass at the top released THREAD_TABLE,
-    // and futex_drain_pid / PROCESS_TABLE / FILE_LOCKS sections have all
-    // completed).  Out-of-band callers (yield_self == false) skip this:
-    // they are healthy threads in a different process — not a vfork child.
-    if yield_self {
-        crate::syscall::wake_vfork_parent();
-    }
-
     // Vfork isolated-stack cleanup: same rationale as exit_thread (see
     // there for the longer comment).  We harvest the field from the
     // calling thread (the vfork child) and unmap the recorded VMA from
     // the parent's address space.  Out-of-band callers (yield_self==false)
     // do not own a calling_tid of the dying process, so they skip this.
+    //
+    // Ordering: runs BEFORE `wake_vfork_parent()` to match sys_exec
+    // Case C — the parent must observe a fully torn-down mapping before
+    // it is unblocked.
     if yield_self && calling_tid != 0 && parent_pid != 0 {
         let isolated = {
             let threads = THREAD_TABLE.lock();
@@ -1821,6 +1816,22 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
                 t.vfork_isolated_stack = None;
             }
         }
+    }
+
+    // vfork completion: if the caller is a vfork child fatal-faulting mid-
+    // execve (e.g. a synchronous fatal CPU exception routed here from
+    // arch/x86_64/idt.rs), the parent is parked in TASK_KILLABLE-style sleep
+    // on `vfork_parent_tid` and only this wake will release it.  Without it,
+    // the parent stays Blocked until the 5-second vfork timeout fires.
+    // Per POSIX vfork(2): parent resumes only after child terminates or execs.
+    //
+    // Lock discipline: wake_vfork_parent() takes THREAD_TABLE.  We hold no
+    // locks here (the sibling-Dead pass at the top released THREAD_TABLE,
+    // and futex_drain_pid / PROCESS_TABLE / FILE_LOCKS sections have all
+    // completed).  Out-of-band callers (yield_self == false) skip this:
+    // they are healthy threads in a different process — not a vfork child.
+    if yield_self {
+        crate::syscall::wake_vfork_parent();
     }
 
     // Wake parent threads blocked in waitpid, and mark calling thread Dead
@@ -2464,23 +2475,25 @@ pub fn fork_process_share_vm(
         user_entry_r8:  0,
         priority: PRIORITY_NORMAL,
         base_priority: PRIORITY_NORMAL,
-        // VFORK / CLONE_VM child inherits the parent's FS.base so it can use
-        // thread-local storage immediately.  The glxtest child function in
-        // libxul calls fork(2) (which internally reads %fs:0 via musl's
-        // pthread machinery), so a zeroed FS.base would fault immediately.
+        // TLS base is set to 0 for CLONE_VM|CLONE_VFORK children.  This is
+        // a hard safety invariant — see the unconditional WRMSR site in
+        // `proc::usermode::enter_user_mode` (~L347-353): when `tls_base == 0`
+        // the user-mode entry path explicitly zeros FS.base via WRMSR before
+        // jumping to user mode.  Skipping that WRMSR (i.e. inheriting the
+        // parent's FS.base by leaving the MSR alone) would let the child's
+        // stack-guard epilogue read a valid-looking parent canary from
+        // %fs:0x28 and so corrupt the SSP comparison.
         //
-        // The parent's SSP canary lives at parent_tls_base + 0x28.  The child
-        // must not write to that offset while sharing the TLS struct.  In
-        // practice, musl's fork() path only READS %fs:0 (to obtain the thread
-        // self-pointer for atfork handler iteration); it never writes %fs:0x28
-        // before the child calls _exit().  Therefore inheriting the parent's
-        // TLS base is safe for the brief vfork window.
+        // Any change to TLS-inheritance behavior for CLONE_VM|CLONE_VFORK
+        // children must be preceded by empirical falsification — saved-canary
+        // and master-canary snapshot-pair diagnostics — and a binding
+        // cross-walk on the tree.  See POSIX clone(2) for the semantics of
+        // tls/CLONE_SETTLS (we ignore parent_tls_base here precisely so that
+        // an execve(2)-driven `arch_prctl(ARCH_SET_FS, new_tls)` is the only
+        // way the child's FS.base ever becomes non-zero).
         //
-        // If the child calls arch_prctl(ARCH_SET_FS, new_tls) (e.g., via
-        // execve -> ld-musl startup), sys_arch_prctl updates its own tls_base
-        // in THREAD_TABLE; the scheduler restores the parent's tls_base when
-        // the parent next runs.
-        tls_base: parent_tls_base,
+        // Refs: POSIX clone(2); Intel SDM Vol. 3A §6.8 (WRMSR FS_BASE).
+        tls_base: 0,
         cpu_affinity: None,
         last_cpu: 0,
         first_run: true,
@@ -2516,11 +2529,13 @@ pub fn fork_process_share_vm(
     let child_uses_parent_stack = user_rsp != 0;
     crate::serial_println!(
         "[VFORK/CHILD-STACK] pid={} parent_pid={} child_rsp_at_entry={:#x} \
-         child_uses_parent_stack={} parent_user_rsp={:#x}",
+         child_uses_parent_stack={} parent_user_rsp={:#x} \
+         parent_tls_base={:#x} child_tls_base=0",
         child_pid, parent_pid,
         user_rsp,
         child_uses_parent_stack,
         user_rsp,
+        parent_tls_base,
     );
 
     Some((child_pid, child_tid))
