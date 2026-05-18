@@ -1,13 +1,44 @@
 //! Per-Process Handle Table
 //!
-//! Maps integer handles to kernel objects in the OB namespace.
-//! Inspired by the NT Executive handle table (ntoskrnl/ex/handle.c).
+//! Maps integer handles to kernel objects in the OB namespace.  Public
+//! reference for the NT-style handle-table model: Microsoft Learn /
+//! Windows Driver Kit "Handles and Objects" (`ZwClose`, `OBJECT_HANDLE_INFORMATION`).
 //!
 //! # Handle Values
 //! - Handle 0 is reserved/invalid.
 //! - Handle values are multiples of 4 (NT convention), starting from 4.
 //! - Each handle carries the object path, type, granted access mask, and
 //!   an inheritable flag for child process inheritance.
+//!
+//! # Reference-count discipline
+//!
+//! Every `allocate` / `duplicate` call increments the reference count on
+//! the underlying object in the OB namespace via [`crate::ob::obref_inc`].
+//! Every `close` decrements via [`crate::ob::obref_dec`].  Together with
+//! [`crate::ob::remove_object_if_unreferenced`] this enforces the WDK
+//! discipline that an object cannot be removed while a live handle
+//! references it.
+//!
+//! Refcount calls are *best-effort* against the namespace lookup —
+//! handles may carry ephemeral paths that were never inserted (e.g. test
+//! fixtures that construct a `HandleEntry` directly without first calling
+//! `ob::insert_object`).  For those, `obref_inc` returns `None` and we
+//! treat the handle as free-floating; `close` likewise no-ops the decrement.
+//! This preserves backward compatibility while still extending the
+//! namespace-integrated path with correctness when both halves are in
+//! play.  Public test cases (test 23 in `test_runner.rs`) cover both
+//! patterns to lock the discipline in place.
+//!
+//! # Lock order
+//!
+//! Both `allocate` / `duplicate` / `close` and `Drop` call into the
+//! refcount helpers in [`crate::ob`], which acquire `NAMESPACE.lock()`.
+//! Callers therefore MUST NOT hold `NAMESPACE.lock()` when invoking
+//! these methods or when dropping a `HandleTable` — doing so would
+//! re-enter the namespace mutex and deadlock.  The convention is:
+//! acquire the handle table's outer mutex (per-process), then call the
+//! handle-table method, which transiently takes `NAMESPACE.lock()`
+//! internally and releases it before returning.
 
 extern crate alloc;
 
@@ -44,7 +75,17 @@ impl HandleTable {
     }
 
     /// Allocate a new handle for the given entry. Returns the handle value.
+    ///
+    /// Calls [`crate::ob::obref_inc`] for the entry's `object_path`; if the
+    /// path is not in the namespace, the increment is silently skipped (the
+    /// handle is treated as carrying a free-floating reference, matching
+    /// pre-refcount semantics).
     pub fn allocate(&mut self, entry: HandleEntry) -> u32 {
+        // Best-effort refcount bump.  Discarded result: a return of `None`
+        // simply means the path is not (yet) in the namespace and the
+        // handle is free-floating — caller is responsible for ensuring
+        // the eventual `close` matches.
+        let _ = crate::ob::obref_inc(&entry.object_path);
         let handle = self.next_handle;
         self.next_handle += 4; // NT-style: multiples of 4
         self.entries.insert(handle, entry);
@@ -57,12 +98,26 @@ impl HandleTable {
     }
 
     /// Close (remove) a handle. Returns true if the handle existed.
+    ///
+    /// Calls [`crate::ob::obref_dec`] for the entry's `object_path` (best
+    /// effort — see [`Self::allocate`] for the same discipline).
     pub fn close(&mut self, handle: u32) -> bool {
-        self.entries.remove(&handle).is_some()
+        match self.entries.remove(&handle) {
+            Some(e) => {
+                let _ = crate::ob::obref_dec(&e.object_path);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Duplicate a handle, optionally changing the granted access mask.
     /// Returns the new handle value, or None if the source handle doesn't exist.
+    ///
+    /// Calls [`crate::ob::obref_inc`] for the entry's `object_path` so the
+    /// duplicate is reference-balanced — each handle holds exactly one
+    /// reference to the underlying object regardless of how it was created
+    /// (`allocate` or `duplicate`).
     pub fn duplicate(&mut self, src_handle: u32, desired_access: u32) -> Option<u32> {
         let src = self.entries.get(&src_handle)?;
         let new_entry = HandleEntry {
@@ -71,6 +126,8 @@ impl HandleTable {
             granted_access: desired_access,
             inheritable: src.inheritable,
         };
+        // The duplicate carries its own reference — best-effort bump.
+        let _ = crate::ob::obref_inc(&new_entry.object_path);
         let new_handle = self.next_handle;
         self.next_handle += 4;
         self.entries.insert(new_handle, new_entry);
@@ -80,5 +137,18 @@ impl HandleTable {
     /// Return the number of open handles.
     pub fn count(&self) -> usize {
         self.entries.len()
+    }
+}
+
+impl Drop for HandleTable {
+    /// Releases every outstanding handle's reference at table teardown.
+    /// Without this, a process whose `HandleTable` is destroyed (e.g. on
+    /// reap) leaks `obref_inc`s for every still-open handle and the
+    /// corresponding namespace objects can never be freed via
+    /// [`crate::ob::remove_object_if_unreferenced`].
+    fn drop(&mut self) {
+        for (_h, e) in self.entries.iter() {
+            let _ = crate::ob::obref_dec(&e.object_path);
+        }
     }
 }

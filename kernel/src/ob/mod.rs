@@ -1,9 +1,10 @@
 //! NT Object Manager — Kernel Object Namespace
 //!
-//! Inspired by the Windows NT Object Manager (ntoskrnl/ob/), this subsystem
-//! provides a hierarchical namespace for kernel objects. Every kernel entity
-//! (device, file, process, semaphore, etc.) is represented as a named object
-//! in this namespace.
+//! Implements an NT-style hierarchical kernel object namespace.  Public
+//! reference for the model: Microsoft Learn / Windows Driver Kit
+//! "Kernel-Mode Driver Programming — Windows Kernel Objects".  Every
+//! kernel entity (device, file, process, semaphore, etc.) is represented
+//! as a named object in this namespace.
 //!
 //! # Architecture
 //! - `KernelObject` trait — common interface for all object types
@@ -317,6 +318,97 @@ pub fn lookup_object_type(path: &str) -> Option<ObjectType> {
     }
 }
 
+/// Increment the reference count on the object at `path`.  Returns the
+/// **new** count, or `None` if no object exists at that path (the caller
+/// holds a free-floating path that was never inserted into the namespace —
+/// e.g. an ephemeral `HandleEntry::object_path` used purely for handle-table
+/// bookkeeping).  Public reference for the model: WDK
+/// `ObReferenceObject` documentation on Microsoft Learn — the sanctioned
+/// way to keep an object alive across a window where another caller
+/// might attempt to delete it.  Per the design intent of this module,
+/// an object with a live handle (or other named-object reference) must
+/// not vanish from the namespace just because some other path called
+/// `remove_object` on the same name — the recycle-while-aliased pattern
+/// is the dual of the W215 page-aliasing class in physical memory.
+///
+/// Note on ordering: `NAMESPACE.lock()` already serialises every public
+/// entry point here, so the per-slot `AcqRel` on the atomic increment is
+/// strictly redundant for cross-thread visibility under the namespace
+/// lock.  We keep `AcqRel` for symmetry with [`obref_dec`] (whose CAS
+/// loop uses the same ordering, see Intel SDM Vol. 3A §8.2.2) and to
+/// keep the atomic semantically explicit in isolation.
+pub fn obref_inc(path: &str) -> Option<usize> {
+    let ns = NAMESPACE.lock();
+    let root = ns.as_ref()?;
+    match walk_namespace(root, path)? {
+        NamespaceEntry::Object(h) => Some(h.ref_count.fetch_add(1, Ordering::AcqRel) + 1),
+        NamespaceEntry::Directory(_) => None,
+    }
+}
+
+/// Decrement the reference count on the object at `path`.  Returns the
+/// **new** count, or `None` if no object exists at that path.  A return
+/// value of `Some(0)` indicates the caller has released the last reference
+/// and the object may now be safely removed via [`remove_object`].  The
+/// decrement uses a compare-exchange loop so a count that is already 0 is
+/// left at 0 (the pre-loop `fetch_sub(1)` form would wrap an `AtomicUsize`
+/// through `usize::MAX`, leaking the slot to "live forever" status).
+///
+/// The use pattern mirrors the WDK `ObDereferenceObject` discipline: pair
+/// every `obref_inc(path)` with exactly one `obref_dec(path)`.  This
+/// module does NOT auto-delete when the count reaches zero — callers
+/// who want refcount-driven deletion call `remove_object` themselves once
+/// they observe `Some(0)`; this keeps the namespace operation explicit
+/// rather than buried inside a refcount decrement, matching how
+/// `pmm::free_page` is explicit at the physical-frame layer.
+///
+/// The CAS uses `AcqRel` on success and `Acquire` on failure so that any
+/// non-free-path consumer that orders a subsequent action on the
+/// observed-zero result sees a proper acquire fence.  Per Intel SDM
+/// Vol. 3A §8.2.2 `LOCK CMPXCHG` is already fully ordered on x86, so
+/// this is a no-op at runtime but more semantically explicit and forward-
+/// portable to weaker-ordered ISAs.
+pub fn obref_dec(path: &str) -> Option<usize> {
+    let ns = NAMESPACE.lock();
+    let root = ns.as_ref()?;
+    let header = match walk_namespace(root, path)? {
+        NamespaceEntry::Object(h) => h,
+        NamespaceEntry::Directory(_) => return None,
+    };
+    // CAS-loop so a slot at 0 is left at 0 (cf. the same discipline applied
+    // to physical-frame refcounts in `mm::refcount::page_ref_dec`).
+    let mut cur = header.ref_count.load(Ordering::Acquire);
+    loop {
+        if cur == 0 {
+            return Some(0);
+        }
+        match header.ref_count.compare_exchange_weak(
+            cur,
+            cur - 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(cur - 1),
+            Err(observed) => cur = observed,
+        }
+    }
+}
+
+/// Snapshot the current reference count for the object at `path`.  Returns
+/// `None` if no object exists at that path.  Diagnostic / test-only —
+/// the name carries the "this is a snapshot, do not race on it" semantics
+/// explicitly: kernel code that depends on the count's value MUST use
+/// the `obref_inc` / `obref_dec` pair to keep the underlying object alive
+/// rather than acting on the value returned here.
+pub fn peek_object_refcount(path: &str) -> Option<usize> {
+    let ns = NAMESPACE.lock();
+    let root = ns.as_ref()?;
+    match walk_namespace(root, path)? {
+        NamespaceEntry::Object(h) => Some(h.ref_count.load(Ordering::Acquire)),
+        NamespaceEntry::Directory(_) => None,
+    }
+}
+
 /// Check whether an object exists at the given path.
 pub fn has_object(path: &str) -> bool {
     let ns = NAMESPACE.lock();
@@ -350,6 +442,18 @@ pub fn get_object_security_descriptor(path: &str) -> Option<SecurityDescriptor> 
 }
 
 /// Remove an object from the namespace. Returns true if it was found and removed.
+///
+/// **Forcible removal** — this function does not consult the object's
+/// reference count.  Callers that want to defer removal until every handle
+/// has been closed should use [`remove_object_if_unreferenced`] instead.
+/// The two-variant API mirrors the NT object manager split between
+/// `ObCloseHandle` (which decrements and may auto-cleanup) and
+/// `ObMakeTemporaryObject` + final dereference (which sets the temporary
+/// flag and lets the last reference release trigger the cleanup).
+///
+/// Forcible removal remains the right primitive for fixed-namespace
+/// cleanup paths (e.g. test-suite teardown, driver unload) where the
+/// caller has already proved no other component holds a reference.
 pub fn remove_object(path: &str) -> bool {
     let mut ns = NAMESPACE.lock();
     let root = match ns.as_mut() {
@@ -371,6 +475,75 @@ pub fn remove_object(path: &str) -> bool {
 
     let name = *parts.last().unwrap();
     current.remove(name).is_some()
+}
+
+/// Outcome of [`remove_object_if_unreferenced`].  Names every distinct
+/// state explicitly so callers can pattern-match on intent rather than
+/// disambiguating `Ok(true)` / `Ok(false)` / `Err(())` at call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveOutcome {
+    /// Object existed with refcount ≤ 1 and was removed.
+    Removed,
+    /// Object existed but had refcount > 1; removal refused.  The slot is
+    /// left in place so the live referrers continue to observe a valid
+    /// object at this path.
+    RefusedRefcount,
+    /// No object at `path` to remove (caller can treat this the same as
+    /// "already removed").
+    NotFound,
+}
+
+/// Remove the object at `path` only if its reference count is at most 1
+/// (i.e. no caller has bumped the refcount via [`obref_inc`]).
+///
+/// Returns a [`RemoveOutcome`] naming the disposition explicitly.  The
+/// "≤ 1" threshold (rather than "== 0") accommodates the convention set
+/// by [`insert_inner`]: every freshly-inserted object starts with
+/// `ref_count = 1` representing the namespace's own ownership of the
+/// slot.  A caller that has not bumped the count via [`obref_inc`] sees
+/// refcount 1 and the removal succeeds; an additional `obref_inc` (e.g.
+/// via [`crate::ob::handle::HandleTable::allocate`]) pushes the count to
+/// 2+ and removal is refused until the matching [`obref_dec`] runs.
+pub fn remove_object_if_unreferenced(path: &str) -> RemoveOutcome {
+    let mut ns = NAMESPACE.lock();
+    let root = match ns.as_mut() {
+        Some(r) => r,
+        None => return RemoveOutcome::NotFound,
+    };
+
+    let parts = parse_path(path);
+    if parts.is_empty() { return RemoveOutcome::NotFound; }
+
+    let mut current: &mut BTreeMap<String, NamespaceEntry> = root;
+    for i in 0..parts.len() - 1 {
+        let part = parts[i];
+        match current.get_mut(part) {
+            Some(NamespaceEntry::Directory(sub)) => current = sub,
+            _ => return RemoveOutcome::NotFound,
+        }
+    }
+
+    let name = *parts.last().unwrap();
+    // Inspect the refcount under the namespace lock so a concurrent
+    // `obref_inc` cannot squeeze in between the check and the removal.
+    match current.get(name) {
+        Some(NamespaceEntry::Object(h)) => {
+            if h.ref_count.load(Ordering::Acquire) > 1 {
+                return RemoveOutcome::RefusedRefcount;
+            }
+        }
+        Some(NamespaceEntry::Directory(_)) => {
+            // Directories have no ref_count of their own; leave the
+            // existing forcible-removal semantics to `remove_object`.
+            return RemoveOutcome::NotFound;
+        }
+        None => return RemoveOutcome::NotFound,
+    }
+    if current.remove(name).is_some() {
+        RemoveOutcome::Removed
+    } else {
+        RemoveOutcome::NotFound
+    }
 }
 
 /// Dump the namespace at the given path for shell display.

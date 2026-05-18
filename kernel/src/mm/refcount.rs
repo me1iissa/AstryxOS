@@ -23,6 +23,17 @@ use spin::Once;
 #[cfg(feature = "firefox-test")]
 static REFCOUNT_SET_OVER_NONZERO: AtomicU64 = AtomicU64::new(0);
 
+/// Cumulative count of `page_ref_dec` calls that found the refcount already
+/// at zero.  Every increment names a real upstream bug: a caller either
+/// paired a `page_ref_inc` with two `page_ref_dec` calls, or decremented a
+/// frame whose refcount was never bumped.  Pre-fix the function silently
+/// wrapped through `0xFFFF` and then raced its recovery store against any
+/// concurrent `page_ref_inc`, which could lose increments and re-corrupt
+/// the table.  See `page_ref_dec` for the CAS-loop discipline that replaces
+/// the racy recovery.  Always 0 outside `firefox-test` builds.
+#[cfg(feature = "firefox-test")]
+static PAGE_REF_DEC_UNDERFLOW: AtomicU64 = AtomicU64::new(0);
+
 /// Maximum physical pages we track (same as PMM: 4 GiB / 4 KiB = 1M pages).
 const MAX_PAGES: usize = 1024 * 1024;
 
@@ -95,6 +106,33 @@ pub fn page_ref_inc(phys_addr: u64) {
 /// must be freed via `pmm::free_page` only AFTER a completed TLB shootdown
 /// on every CPU that may hold a cached translation to this frame
 /// (see Intel SDM Vol. 3A §4.10.5).
+///
+/// # Underflow safety
+///
+/// Earlier versions of this function used `fetch_sub(1, Relaxed)` and then,
+/// on observing a pre-decrement value of 0, performed a `store(0, Relaxed)`
+/// recovery.  That recovery was racy against a concurrent `page_ref_inc`:
+/// `fetch_sub(1)` on a `0u16` wraps the slot to `0xFFFF`, and if a peer
+/// CPU's `fetch_add(1, Relaxed)` interleaved between the wrap and the
+/// recovery store, the increment was silently lost — observable as a
+/// later W215-class use-after-recycle once `pmm::free_page` was reached
+/// on a frame that still had a live PTE referencing it.
+///
+/// The CAS loop below maintains the invariant "the slot never holds a
+/// negative count" without using a recovery store: if the current value
+/// is already 0, the decrement is rejected and `PAGE_REF_DEC_UNDERFLOW`
+/// is bumped (every increment names a real upstream paired-call bug that
+/// the maintainer should chase).  If the slot has decreased to 0 since
+/// our last read but a concurrent `page_ref_inc` then bumped it, the CAS
+/// reloads and retries with the new value — no increment can be lost.
+///
+/// Per the x86-64 memory model (Intel SDM Vol. 3A §8.2.2), `LOCK CMPXCHG`
+/// is fully ordered and is the natural primitive for this pattern.  We use
+/// `Ordering::Relaxed` for the success ordering because the refcount table
+/// participates only in its own logical ordering (no cross-data invariant
+/// relies on a stronger fence here); the consumer that decides to free the
+/// frame must already serialise through the TLB-shootdown protocol, which
+/// supplies the cross-CPU acquire fence.
 #[must_use = "dropping the return value of page_ref_dec silently loses the \
               information needed to decide when to free the frame; check \
               whether the count reached zero and schedule a shootdown+free"]
@@ -106,17 +144,57 @@ pub fn page_ref_dec(phys_addr: u64) -> u16 {
     );
     let idx = pfn(phys_addr);
     let rc = refcounts();
-    if idx < rc.len() {
-        let prev = rc[idx].fetch_sub(1, Ordering::Relaxed);
-        if prev == 0 {
-            // Underflow protection — shouldn't happen but be safe
-            rc[idx].store(0, Ordering::Relaxed);
+    if idx >= rc.len() {
+        return 0;
+    }
+    let slot = &rc[idx];
+    let mut cur = slot.load(Ordering::Relaxed);
+    loop {
+        if cur == 0 {
+            // Refuse the underflow: leave the slot at 0 and return 0 so
+            // the caller's "did we reach zero?" check still fires (it would
+            // already have fired on the legitimate decrement that took the
+            // count to zero; this second call is the bug).
+            #[cfg(feature = "firefox-test")]
+            {
+                let total = PAGE_REF_DEC_UNDERFLOW
+                    .fetch_add(1, Ordering::Relaxed) + 1;
+                if total <= 8 || total % 1000 == 0 {
+                    crate::serial_println!(
+                        "[REFCOUNT/DEC-UNDERFLOW] phys={:#x} count_total={}",
+                        phys_addr, total,
+                    );
+                }
+            }
             return 0;
         }
-        prev - 1
-    } else {
-        0
+        // Try to install `cur - 1`.  On CAS failure (some peer CPU
+        // updated the slot between our load and CAS), reload `cur` from
+        // the failure result and retry.
+        match slot.compare_exchange_weak(
+            cur,
+            cur - 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return cur - 1,
+            Err(observed) => cur = observed,
+        }
     }
+}
+
+/// Read the cumulative `PAGE_REF_DEC_UNDERFLOW` counter.
+///
+/// Returns the number of times [`page_ref_dec`] was called on a refcount
+/// slot that was already zero.  Each non-zero observation names one
+/// upstream paired-call bug (a caller decremented a frame twice, or
+/// decremented one whose `page_ref_inc` was missed).  Always 0 on
+/// non-`firefox-test` builds.
+pub fn page_ref_dec_underflow_count() -> u64 {
+    #[cfg(feature = "firefox-test")]
+    { PAGE_REF_DEC_UNDERFLOW.load(Ordering::Relaxed) }
+    #[cfg(not(feature = "firefox-test"))]
+    { 0 }
 }
 
 /// Number of user-PTE references the kernel believes are alive on `phys`.
