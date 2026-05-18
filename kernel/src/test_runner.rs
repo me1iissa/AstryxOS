@@ -1991,6 +1991,28 @@ pub fn run() -> ! {
         if test_256_property_notify_root_mask() { passed += 1; }
     }
 
+    // ── Test 257: CR4.UMIP enablement (cycle-3 security hardening) ───────
+    // Verifies that CR4.UMIP=1 on the BSP when the CPU advertises UMIP
+    // (CPUID.07H:ECX[2]).  Closes the kernel-address-leak recon class
+    // (SGDT / SIDT / SLDT / STR / SMSW) that future ROP-into-kernel
+    // exploits depend on.  CWE-200 / CWE-203.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_257_cr4_umip_enablement() { passed += 1; }
+    }
+
+    // ── Test 258: getrandom unknown-flag rejection (cycle-3 hardening) ───
+    // Verifies that sys_getrandom returns -EINVAL for any flag bit
+    // outside { GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE }.  Closes
+    // a CWE-20 (Improper Input Validation) hazard where a future flag
+    // with security-sensitive semantics would be silently accepted.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_258_getrandom_unknown_flag_rejection() { passed += 1; }
+    }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -17883,6 +17905,164 @@ fn test_256_property_notify_root_mask() -> bool {
     true
 }
 
+// ── Test 257: CR4.UMIP enablement (cycle-3 security hardening) ────────────
+//
+// Threat model: a sandboxed unprivileged process executes SGDT / SIDT /
+// SLDT / STR / SMSW.  Pre-UMIP these are CPL-3 instructions that leak
+// CPL-0 internal state — the linear addresses of the GDT and IDT, the
+// LDT/TR selectors, and the lower 16 bits of CR0.  An attacker uses the
+// leak to defeat kernel-base randomisation (when KASLR lands), locate
+// ROP/JOP gadgets at known offsets, or fingerprint the host across a
+// VM boundary.  CWE-200 (Exposure of Sensitive Information) /
+// CWE-203 (Observable Discrepancy).
+//
+// Fix: enable CR4.UMIP (bit 11) on every CPU after CPUID.07H:ECX[2]
+// indicates support (Intel SDM Vol. 3A §2.5).  With UMIP=1 the five
+// instructions above raise #GP when executed at CPL>0.
+//
+// This test reads CR4 from the current (kernel) CPU and asserts the
+// UMIP bit, gated on the same CPUID probe used by the enablement path
+// (a CPU that does not advertise UMIP cannot have CR4.UMIP set without
+// raising #GP, so a "missing" bit on such a CPU is correct behaviour).
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_257_cr4_umip_enablement() -> bool {
+    test_header!("CR4.UMIP enablement (cycle-3 — SGDT/SIDT/SLDT/STR/SMSW leak)");
+
+    // Probe CPUID.07H:ECX[2] — UMIP availability.  RBX is reserved as
+    // the PIC base, hence the push/pop preservation.
+    let umip_supported: bool = unsafe {
+        let ecx: u32;
+        core::arch::asm!(
+            "push rbx",
+            "cpuid",
+            "pop rbx",
+            inout("eax") 7u32 => _,
+            inout("ecx") 0u32 => ecx,
+            out("edx") _,
+        );
+        (ecx & (1u32 << 2)) != 0
+    };
+
+    let cr4: u64 = unsafe {
+        let v: u64;
+        core::arch::asm!("mov {}, cr4", out(reg) v, options(nomem, nostack));
+        v
+    };
+    let umip_in_cr4 = (cr4 & (1u64 << 11)) != 0;
+    let umip_published =
+        crate::arch::x86_64::UMIP_ENABLED.load(core::sync::atomic::Ordering::Relaxed);
+
+    crate::serial_println!(
+        "[TEST/CR4-UMIP] cpuid_07h_ecx_bit2={} cr4={:#x} cr4.umip={} published={}",
+        umip_supported, cr4, umip_in_cr4, umip_published,
+    );
+
+    if !umip_supported {
+        // CPU does not advertise UMIP — enablement skipped by design.
+        // Per Intel SDM Vol. 3A §2.5, writing CR4.UMIP on such a CPU
+        // would raise #GP.  Confirm both the CR4 bit and the published
+        // flag are clear, then PASS (the skip is the correct outcome).
+        if umip_in_cr4 || umip_published {
+            test_fail!(
+                "cr4_umip_enablement",
+                "CPU does not advertise UMIP but CR4 / published flag are set"
+            );
+            return false;
+        }
+        test_pass!("UMIP unsupported on this CPU — skip (CR4 clean)");
+        return true;
+    }
+
+    if !umip_in_cr4 {
+        test_fail!(
+            "cr4_umip_enablement",
+            "CPUID advertises UMIP but CR4.UMIP=0 (cr4={:#x})",
+            cr4,
+        );
+        return false;
+    }
+    if !umip_published {
+        test_fail!(
+            "cr4_umip_enablement",
+            "CR4.UMIP=1 but UMIP_ENABLED publication flag is false"
+        );
+        return false;
+    }
+    test_pass!("CR4.UMIP=1 — SGDT/SIDT/SLDT/STR/SMSW now #GP at CPL>0");
+    true
+}
+
+// ── Test 258: getrandom unknown-flag rejection (cycle-3 hardening) ────────
+//
+// Threat model: a future Linux kernel introduces a new GRND_* flag with
+// security-sensitive semantics (e.g. a "must be drawn from a particular
+// pool" guarantee).  If we silently accept any flag bits, a process
+// requesting the new behaviour gets a successful return but our old
+// PRNG path — leaving the caller with a false sense of compliance.
+// Failing-closed on unknown bits forces a deliberate ABI bump and
+// surfaces the divergence to the caller.
+//
+// Per getrandom(2) ERRORS and the Linux kernel implementation
+// (drivers/char/random.c::sys_getrandom), EINVAL is returned for any
+// flag not in { GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE }.
+//
+// CWE-20 (Improper Input Validation).
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_258_getrandom_unknown_flag_rejection() -> bool {
+    test_header!("sys_getrandom unknown-flag rejection (CWE-20)");
+
+    let mut buf = [0u8; 16];
+    let ptr = buf.as_mut_ptr();
+
+    // Cases:
+    //   - Known-good flags: 0, GRND_NONBLOCK (1), GRND_RANDOM (2),
+    //     GRND_INSECURE (4), and their union (7) MUST return `count`.
+    //   - Unknown flags: any bit outside the 0x07 mask MUST return -EINVAL.
+    struct Case { flags: u32, want_negative: bool, label: &'static str }
+    let cases: &[Case] = &[
+        Case { flags: 0,           want_negative: false, label: "0" },
+        Case { flags: 0x1,         want_negative: false, label: "GRND_NONBLOCK" },
+        Case { flags: 0x2,         want_negative: false, label: "GRND_RANDOM" },
+        Case { flags: 0x4,         want_negative: false, label: "GRND_INSECURE" },
+        Case { flags: 0x7,         want_negative: false, label: "ALL_KNOWN" },
+        Case { flags: 0x8,         want_negative: true,  label: "unknown-bit3" },
+        Case { flags: 0x10,        want_negative: true,  label: "unknown-bit4" },
+        Case { flags: 0xFF,        want_negative: true,  label: "0xFF" },
+        Case { flags: 0x8000_0000, want_negative: true,  label: "high-bit" },
+    ];
+
+    let mut regressions: u32 = 0;
+    for c in cases {
+        let ret = crate::syscall::sys_getrandom(ptr, buf.len(), c.flags);
+        let got_negative = ret < 0;
+        let ok = got_negative == c.want_negative;
+        if !ok {
+            crate::serial_println!(
+                "[TEST/GETRANDOM-FLAG/REGRESSION] flags={:#x} ({}) ret={} \
+                 want_negative={} got_negative={}",
+                c.flags, c.label, ret, c.want_negative, got_negative,
+            );
+            regressions += 1;
+        } else {
+            crate::serial_println!(
+                "[TEST/GETRANDOM-FLAG] flags={:#x} ({}) ret={} OK",
+                c.flags, c.label, ret,
+            );
+        }
+    }
+
+    if regressions > 0 {
+        test_fail!(
+            "getrandom_unknown_flag_rejection",
+            "{} regression(s) — unknown flag bits not rejected",
+            regressions,
+        );
+        return false;
+    }
+    test_pass!("unknown GRND_* flag bits → -EINVAL; known flags → fill");
+    true
+}
+
 // ── Test 97: vfork + _exit ─────────────────────────────────────────────────
 //
 // Verifies the vfork-as-CoW-fork implementation:
@@ -31095,6 +31275,33 @@ fn test_222_syscall_arg_validation_matrix() -> bool {
         Entry { nr: 218, name: "set_tid_address", ptr_label: "tidptr",
                 build_args: |p| [p, 0, 0, 0, 0, 0],
                 discipline: ValidatedSideEffect },
+
+        // ── Category (B) write-to-user — cycle-3 hardening (CWE-822) ─────
+        // Each of these previously dereferenced a user pointer with only
+        // a `!= 0` guard, allowing a sandboxed caller to supply a
+        // kernel-VA and obtain a constant-zero arbitrary-write primitive.
+        // SMAP only blocks PTE.U=1 user pages (Intel SDM Vol. 3A §4.6);
+        // PTE.U=0 kernel pages are not gated by SMAP at all.  The
+        // handlers now call `validate_user_ptr` before the write and
+        // return EFAULT (-14) on a kernel-VA / overflow pointer.  Same
+        // threat class as the audit's C2 finding (iovec kernel-VA).
+        Entry { nr: 309, name: "getcpu-cpu",      ptr_label: "cpu",
+                build_args: |p| [p, 0, 0, 0, 0, 0],
+                discipline: Validated },
+        Entry { nr: 309, name: "getcpu-node",     ptr_label: "node",
+                build_args: |p| [0, p, 0, 0, 0, 0],
+                discipline: Validated },
+        Entry { nr: 274, name: "get_robust_list-head", ptr_label: "head_ptr",
+                build_args: |p| [0 /*current tid*/, p, 0, 0, 0, 0],
+                discipline: Validated },
+        Entry { nr: 274, name: "get_robust_list-len",  ptr_label: "len_ptr",
+                build_args: |p| [0 /*current tid*/, 0, p, 0, 0, 0],
+                discipline: Validated },
+        // prctl(PR_GET_CHILD_SUBREAPER=37) writes a 4-byte "not a
+        // subreaper" sentinel to arg2.
+        Entry { nr: 157, name: "prctl-GET_CHILD_SUBREAPER", ptr_label: "out",
+                build_args: |p| [37, p, 0, 0, 0, 0],
+                discipline: Validated },
     ];
 
     let mut total: u32 = 0;
@@ -33522,17 +33729,25 @@ fn test_243_vfork_alloc_rejects_kernel_va() -> bool {
     }
     test_println!("  Case C: NULL pointer rejected ✓");
 
-    // Case D — boundary inclusion check.  `KERNEL_VIRT_BASE - 8` is the
+    // Case D — boundary inclusion check.  `USER_VA_LIMIT - 8` is the
     // largest 8-byte-aligned user-VA whose 8-byte span `[va, va+8)` does
-    // not cross into the kernel half.  `validate_user_ptr` must accept it
-    // (`end == KERNEL_VIRT_BASE` is the inclusive upper bound).
+    // not cross into the non-canonical hole.  `validate_user_ptr` must
+    // accept it (`end == USER_VA_LIMIT` is the inclusive upper bound;
+    // per Intel SDM Vol. 3A §3.3.7.1 the canonical user-half ends at
+    // 0x0000_8000_0000_0000, after which the non-canonical hole begins).
+    //
+    // Cycle-3 hardened `validate_user_ptr` from the looser "below
+    // KERNEL_VIRT_BASE" bound (which silently admitted the entire
+    // non-canonical hole — a deref there raises #GP, not #PF, and the
+    // PFH cannot recover) to the strict canonical bound documented in
+    // `USER_VA_LIMIT`.  This test exercises the new boundary.
     //
     // We test the validator directly rather than calling
     // `alloc_vfork_child_stack`: at this VA in the test runner's address
     // space the page is unmapped, and Phase 1's SMAP-bracketed
     // `core::ptr::read` would page-fault.  The behavior under test here
     // is the Phase 0 input-validation boundary, not the deref.
-    let max_aligned_user_va: u64 = astryx_shared::KERNEL_VIRT_BASE - 8;
+    let max_aligned_user_va: u64 = crate::syscall::USER_VA_LIMIT - 8;
     if max_aligned_user_va & 0x7 != 0 {
         test_fail!("test243",
             "Case D: boundary VA 0x{:x} is not 8-byte aligned — \
@@ -33544,13 +33759,30 @@ fn test_243_vfork_alloc_rejects_kernel_va() -> bool {
     if !validator_ok {
         test_fail!("test243",
             "Case D: validate_user_ptr rejected 0x{:x} (largest aligned \
-             user-VA — end == KERNEL_VIRT_BASE, the inclusive upper bound \
+             user-VA — end == USER_VA_LIMIT, the inclusive upper bound \
              must be accepted)",
             max_aligned_user_va);
         return false;
     }
     test_println!("  Case D: boundary user-VA 0x{:x} accepted by Phase 0 ✓",
                   max_aligned_user_va);
+
+    // Case E — non-canonical reject.  `KERNEL_VIRT_BASE - 8` sits in the
+    // non-canonical hole on x86_64; any deref there raises #GP.  The
+    // pre-cycle-3 validator silently admitted this range (`end <=
+    // KERNEL_VIRT_BASE`) — a CWE-119 / CWE-823 hazard where a syscall
+    // arm called the validator, got `true`, then panicked the kernel on
+    // the subsequent deref.  Tightened validate_user_ptr now rejects.
+    let non_canonical_va: u64 = astryx_shared::KERNEL_VIRT_BASE - 8;
+    if crate::syscall::validate_user_ptr(non_canonical_va, 8) {
+        test_fail!("test243",
+            "Case E: validate_user_ptr accepted non-canonical VA 0x{:x} \
+             (must reject: CPU raises #GP on any access in the non-canonical \
+             hole per Intel SDM Vol. 3A §3.3.7.1)",
+            non_canonical_va);
+        return false;
+    }
+    test_println!("  Case E: non-canonical VA 0x{:x} rejected ✓", non_canonical_va);
 
     test_pass!("alloc_vfork_child_stack input validation (CWE-822, CWE-200)");
     true

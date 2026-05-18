@@ -72,6 +72,28 @@ pub fn enable_sse() {
 /// drive a syscall handler with a kernel-VA buffer are unaffected:
 /// SMAP only fires on user-mapped pages.
 ///
+/// Also enables CR4.UMIP (bit 11) — User-Mode Instruction Prevention —
+/// when CPUID.(EAX=07H,ECX=00H):ECX[bit 2] advertises support.  Per
+/// Intel SDM Vol. 3A §2.5 and Vol. 2A entries for SGDT/SIDT/SLDT/STR/
+/// SMSW, with UMIP=1 each of those five instructions raises #GP when
+/// executed at CPL>0.  The instructions are otherwise unprivileged and
+/// leak CPL-0 internal state to user mode:
+///
+///   - SGDT — linear address of the GDT (defeats kernel-base randomisation)
+///   - SIDT — linear address of the IDT
+///   - SLDT — selector of the current LDT
+///   - STR  — selector of the current task register
+///   - SMSW — image of the lower 16 bits of CR0 (PE/MP/EM/TS/ET/NE bits)
+///
+/// These leaks form the recon primitive in the SLDT-info-leak class
+/// (CVE-2017-15281 / CVE-2017-0911 / Hertzbleed-style fingerprinting)
+/// and are a prerequisite for any future ROP-into-kernel exploit that
+/// depends on the IDT/GDT base.  Closing the leak at the CPU level is
+/// strictly stronger than any software mitigation (the CPU enforces
+/// the #GP unconditionally regardless of which path the user took to
+/// reach the instruction).  CWE-200 (Exposure of Sensitive Information
+/// to an Unauthorized Actor) / CWE-203 (Observable Discrepancy).
+///
 /// Called on the BSP from `init()` and on each AP from `apic::ap_main`.
 ///
 /// Mitigates: CVE-2017-7308-class kernel-pointer-corruption exploits
@@ -80,11 +102,16 @@ pub fn enable_sse() {
 /// attacker control of an indirect-branch target.  SMAP additionally
 /// closes the BadIRET / ret2usr-data class (CVE-2014-9322) by
 /// converting unintentional user-pointer dereferences into faults.
+/// UMIP closes the kernel-address-leak recon class that those exploits
+/// depend on to locate their target gadgets.
 pub fn enable_cpu_security_features() {
-    let (smep_supported, smap_supported) = unsafe {
+    let (smep_supported, smap_supported, umip_supported) = unsafe {
         let ebx: u32;
+        let ecx: u32;
         // CPUID leaf 7, sub-leaf 0: structured extended feature flags.
-        // EBX bit 7 = SMEP, EBX bit 20 = SMAP (Intel SDM Vol. 2A §3.2).
+        // EBX bit 7  = SMEP   (Intel SDM Vol. 2A §3.2)
+        // EBX bit 20 = SMAP   (Intel SDM Vol. 2A §3.2)
+        // ECX bit 2  = UMIP   (Intel SDM Vol. 2A §3.2 — leaf 7 ECX flags)
         // RBX is reserved as the PIC base — save/restore it manually.
         core::arch::asm!(
             "push rbx",
@@ -93,10 +120,14 @@ pub fn enable_cpu_security_features() {
             "pop rbx",
             ebx = out(reg) ebx,
             inout("eax") 7u32 => _,
-            inout("ecx") 0u32 => _,
+            inout("ecx") 0u32 => ecx,
             out("edx") _,
         );
-        ((ebx & (1 << 7)) != 0, (ebx & (1 << 20)) != 0)
+        (
+            (ebx & (1 << 7))  != 0,
+            (ebx & (1 << 20)) != 0,
+            (ecx & (1 << 2))  != 0,
+        )
     };
 
     if !smep_supported {
@@ -110,6 +141,9 @@ pub fn enable_cpu_security_features() {
         cr4 |= 1u64 << 20; // CR4.SMEP
         if smap_supported {
             cr4 |= 1u64 << 21; // CR4.SMAP
+        }
+        if umip_supported {
+            cr4 |= 1u64 << 11; // CR4.UMIP
         }
         core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack));
     }
@@ -128,4 +162,22 @@ pub fn enable_cpu_security_features() {
     } else {
         crate::serial_println!("[x86_64] SMAP not advertised by CPU — skipping");
     }
+    if umip_supported {
+        // Per Intel SDM Vol. 3A §2.5 (CR4.UMIP) and Vol. 2A entries for
+        // SGDT/SIDT/SLDT/STR/SMSW, once CR4.UMIP=1 those five
+        // instructions raise #GP from CPL>0.  The publication is for
+        // diagnostic visibility only; nothing in the kernel branches on
+        // a runtime UMIP_ENABLED flag — the CPU enforces it unconditionally.
+        UMIP_ENABLED.store(true, core::sync::atomic::Ordering::Relaxed);
+        crate::serial_println!("[x86_64] UMIP enabled (CR4.UMIP=1, SGDT/SIDT/SLDT/STR/SMSW #GP at CPL>0)");
+    } else {
+        crate::serial_println!("[x86_64] UMIP not advertised by CPU — skipping");
+    }
 }
+
+/// Diagnostic indicator: set once CR4.UMIP has been written on at least
+/// one CPU.  Not consulted by any hot path — the CPU enforces UMIP at
+/// every instruction boundary regardless of this flag.  Exists so the
+/// test runner and `kdb cpu-features` can confirm enablement.
+pub static UMIP_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);

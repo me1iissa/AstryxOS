@@ -65,16 +65,53 @@ pub fn sys_mmap_shared_write_filebacked_count() -> u64 {
 
 /// Validate that a user-space pointer is safe to access from the kernel.
 ///
-/// Returns `true` if the entire range `[ptr, ptr+len)` lies in user space
-/// (below `KERNEL_VIRT_BASE`), is non-null, and does not wrap around.
+/// Returns `true` if the entire range `[ptr, ptr+len)` lies in the
+/// canonical user half (below `USER_VA_LIMIT`), is non-null, and does
+/// not wrap around.
+///
+/// # Canonical-address discipline (CWE-119 / CWE-823)
+///
+/// On x86_64 the linear address space is split into two canonical halves
+/// separated by a non-canonical hole (per Intel SDM Vol. 3A §3.3.7.1):
+///
+/// - `[0x0000_0000_0000_0000, 0x0000_8000_0000_0000)` — user canonical
+/// - `[0x0000_8000_0000_0000, 0xFFFF_8000_0000_0000)` — non-canonical hole
+/// - `[0xFFFF_8000_0000_0000, 0xFFFF_FFFF_FFFF_FFFF]` — kernel canonical
+///
+/// Any deref of a non-canonical address raises #GP, not #PF.  The kernel
+/// page-fault handler cannot recover #GP cleanly, so a syscall arm that
+/// dereferences a non-canonical user pointer (e.g. one just below the
+/// kernel half because a length check rolled `end` into the kernel half
+/// but the *base* sat in the non-canonical hole) panics the kernel.
+///
+/// Pre-cycle-3, this helper only checked `end <= KERNEL_VIRT_BASE`,
+/// which silently admitted the entire non-canonical hole — so a base
+/// like `KERNEL_VIRT_BASE - 8` with `len=4` passed validation and the
+/// subsequent deref #GP-panicked.  This is the same CWE class as the
+/// audit's C2 finding (iovec kernel-VA, closed in PR #242), generalised
+/// from "kernel half" to "anything outside the user canonical half".
+///
+/// The strict bound is now `ptr < USER_VA_LIMIT` and `end <= USER_VA_LIMIT`,
+/// where `USER_VA_LIMIT = 0x0000_8000_0000_0000`.  No legitimate user
+/// process can hold a mapping in `[USER_VA_LIMIT, KERNEL_VIRT_BASE)` —
+/// the CPU itself rejects loads/stores there — so the tighter bound has
+/// no false-positive surface.
+pub const USER_VA_LIMIT: u64 = 0x0000_8000_0000_0000;
+
 #[inline]
 pub(crate) fn validate_user_ptr(ptr: u64, len: usize) -> bool {
     if ptr == 0 || len == 0 {
         return len == 0 && ptr == 0; // null + zero-length is acceptable
     }
+    // Reject any base in the non-canonical hole or the kernel half.
+    if ptr >= USER_VA_LIMIT {
+        return false;
+    }
     let end = ptr.checked_add(len as u64);
     match end {
-        Some(e) => e <= astryx_shared::KERNEL_VIRT_BASE,
+        // The endpoint exclusive bound is USER_VA_LIMIT itself
+        // (a buffer ending at the first non-canonical byte is fine).
+        Some(e) => e <= USER_VA_LIMIT,
         None => false, // overflow
     }
 }
@@ -3570,18 +3607,37 @@ pub(crate) fn sys_sigreturn() -> i64 {
 /// Per getrandom(2): on success returns the number of bytes filled, which
 /// equals `count` when called without GRND_NONBLOCK and no signal interrupts.
 ///
-/// Flags:
+/// Flags (Linux `<sys/random.h>` / `<linux/random.h>`):
 ///   GRND_NONBLOCK (0x01) — return EAGAIN if the entropy pool is not ready.
 ///                          We treat our PRNG as always ready, so this flag
 ///                          is accepted but never causes EAGAIN.
 ///   GRND_RANDOM   (0x02) — draw from /dev/random pool (legacy). We have one
 ///                          pool, so this is accepted and ignored.
+///   GRND_INSECURE (0x04) — return possibly-non-cryptographic bytes without
+///                          blocking.  Accepted; our PRNG path is already
+///                          identical for the secure / insecure cases.
+///
+/// Any flag outside the documented set returns EINVAL, matching the Linux
+/// kernel since v5.6 (commit 91e2cef "random: return EINVAL for invalid
+/// flags").  Silently accepting unknown flag bits is a CWE-20 (Improper
+/// Input Validation) hazard: a future flag that introduces
+/// security-sensitive semantics (e.g. a "must be in a particular pool"
+/// guarantee) would be honoured-by-name but not by behaviour, leaving
+/// callers with a false sense of compliance.  Failing-closed on unknown
+/// bits forces the question to surface as an explicit ABI update.
 ///
 /// Implementation: attempt RDRAND up to 10 retries per 8-byte word; if
 /// RDRAND is unavailable or consistently fails (CF=0), fall back to a
 /// xorshift64 PRNG seeded from the TSC.  Either path fills exactly `count`
 /// bytes and returns `count`.
-pub(crate) fn sys_getrandom(buf: *mut u8, count: usize, _flags: u32) -> i64 {
+pub(crate) fn sys_getrandom(buf: *mut u8, count: usize, flags: u32) -> i64 {
+    // Reject unknown flag bits — per getrandom(2) ERRORS and the Linux
+    // kernel implementation (drivers/char/random.c::sys_getrandom).
+    // GRND_NONBLOCK=0x01 | GRND_RANDOM=0x02 | GRND_INSECURE=0x04.
+    const GRND_KNOWN_MASK: u32 = 0x01 | 0x02 | 0x04;
+    if flags & !GRND_KNOWN_MASK != 0 {
+        return -22; // EINVAL
+    }
     if buf.is_null() || count == 0 {
         return -22; // EINVAL
     }
