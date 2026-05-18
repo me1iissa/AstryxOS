@@ -475,6 +475,30 @@ EOF
             fi
         done
         echo "[DATA-DISK] Copied ${local_count} musl support libs to /usr/lib/ (Alpine deps)"
+
+        # The canonical Mozilla tree must land at /usr/lib/firefox-esr/ on the
+        # FAT32 image — that is the DT_RUNPATH baked into firefox-bin,
+        # libxul.so, libmozsandbox.so, etc. (readelf -d shows
+        # RUNPATH=[/usr/lib/firefox-esr]).  Per the ELF gABI (System V ABI
+        # §5.4) and ld-musl(8), DT_RUNPATH is the third entry in the dynamic
+        # linker search order; without the tree at this path, libxul's
+        # transitive dlopen calls (e.g. libmozsandbox.so) fail with ENOENT
+        # and ld-musl exit_group()s at startup.
+        MUSL_FF_ESR="${BUILD_DIR}/disk/usr/lib/firefox-esr"
+        if [ -d "${MUSL_FF_ESR}" ]; then
+            echo "[DATA-DISK] Copying /usr/lib/firefox-esr (~206 MiB) to data image — this takes a moment..."
+            mmd -i "${DATA_IMG}" "::usr/lib/firefox-esr" 2>/dev/null || true
+            # mcopy -s walks the full tree (omni.ja, browser/, defaults/,
+            # fonts/, gmp-clearkey/, every .so file).  Tolerate failures for
+            # any deep symlink chains (none expected — install-firefox-musl.sh
+            # dereferences with cp -L during staging).
+            mcopy -s -o -i "${DATA_IMG}" "${MUSL_FF_ESR}/." \
+                "::usr/lib/firefox-esr/" 2>&1 | \
+                grep -v "^$" | grep -iv "^skipping" | head -20 || true
+            echo "[DATA-DISK] Copied /usr/lib/firefox-esr/ to data image (DT_RUNPATH target)"
+        else
+            echo "[DATA-DISK] WARNING: ${MUSL_FF_ESR} missing — musl FF DT_RUNPATH lookup will fail"
+        fi
     fi
     HOST_FONTS="${BUILD_DIR}/disk/usr/share/fonts"
     if [ -d "${HOST_FONTS}/truetype/dejavu" ]; then
