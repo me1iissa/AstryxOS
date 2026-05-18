@@ -71,6 +71,20 @@ if [ -f "${ROOT_DIR}/scripts/install-firefox.sh" ]; then
         echo "[DATA-DISK] WARNING: install-firefox.sh failed — /opt/firefox may be absent"
 fi
 
+# ── Inject debug .symtab into libxul.so (non-fatal) ──────────────────────────
+# inject-libxul-symbols.sh splices Mozilla's official Breakpad symbol names
+# into libxul.so as a proper ELF .symtab section, enabling nm / kdb
+# rip-trace-resolve to name functions in the stripped binary.
+# Run AFTER install-firefox.sh so any --force re-extraction does not clobber
+# the injected .symtab.  The script is idempotent (skips if .symtab present).
+if [ -f "${ROOT_DIR}/scripts/inject-libxul-symbols.sh" ] && \
+   [ -f "${BUILD_DIR}/disk/opt/firefox/libxul.so" ]; then
+    SYM_FLAGS=""
+    [ "${FORCE}" = true ] && SYM_FLAGS="--force"
+    bash "${ROOT_DIR}/scripts/inject-libxul-symbols.sh" ${SYM_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
+        echo "[DATA-DISK] WARNING: inject-libxul-symbols.sh failed — libxul.so will lack .symtab"
+fi
+
 # ── Build Firefox headless stub libraries (non-fatal) ────────────────────────
 # Firefox ESR 115 links libmozgtk.so and libxul.so against GTK3, ALSA, X11,
 # GLib/GObject, Cairo, Pango, DBus, and other system libraries.  In headless

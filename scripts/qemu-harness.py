@@ -44,6 +44,8 @@ Tier 1 — session management:
     python3 scripts/qemu-harness.py futex-wake-drill <sid> [--tid N]
                                             [--bucket-count K] [--window-lines L]
                                             [--cross-park]
+    python3 scripts/qemu-harness.py rip-trace-resolve <sid> <tid> [<ms>]
+                                            [--disk-root DIR]
 
 Tier 2 — GDB stub integration (requires --gdb-port on start):
     python3 scripts/qemu-harness.py regs <sid>
@@ -2755,6 +2757,199 @@ def cmd_kdb(args):
     except OSError: pass
 
     _out(resp)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# rip-trace-resolve — kdb rip-trace + host-side .symtab resolution
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Combines kdb rip-trace (userspace RIP sampler) with host-side symbol lookup
+# using the .symtab injected into libxul.so by scripts/inject-libxul-symtab.py.
+#
+# Workflow:
+#   1. Call kdb rip-trace <tid> <ms> to obtain the raw RIP histogram and
+#      RBP-chain prefixes.
+#   2. Parse [FFTEST/mmap-so] load-base table from the session serial log to
+#      find each library's runtime base address.
+#   3. For each sampled RIP, subtract the library's load base to get the
+#      ELF-relative VMA, then binary-search the host-side .symtab to resolve
+#      to <function>+<delta>.
+#
+# Output (additive superset of kdb rip-trace response):
+#   { ...rip-trace fields...,
+#     "resolved_rips": [
+#       { "rip": "0x...", "count": N, "library": str, "offset": "0x...",
+#         "symbol": str|null },
+#       ...
+#     ],
+#     "resolve_stats": { "total": N, "resolved": N, "pct": float },
+#   }
+
+_RIP_SYMTAB_CACHE: dict[str, list[tuple[int, int, str]]] = {}
+
+
+def _load_symtab_from_nm(host_path: str) -> list[tuple[int, int, str]]:
+    """Load defined symbols from a host-side .so file using nm.
+
+    Returns a sorted list of (vma, size, name) triples.  Parses nm output
+    directly — does not use pyelftools — so that the new .symtab injected by
+    inject-libxul-symtab.py is always used regardless of pyelftools' symbol-
+    section preference.
+
+    Result is cached per host_path for the process lifetime.
+    """
+    if host_path in _RIP_SYMTAB_CACHE:
+        return _RIP_SYMTAB_CACHE[host_path]
+    import bisect as _bisect
+    import subprocess as _sp
+    syms: list[tuple[int, int, str]] = []
+    try:
+        out = _sp.check_output(
+            ["nm", "--defined-only", host_path],
+            stderr=_sp.DEVNULL, timeout=60,
+        ).decode("utf-8", errors="replace")
+    except (_sp.CalledProcessError, FileNotFoundError, _sp.TimeoutExpired):
+        _RIP_SYMTAB_CACHE[host_path] = syms
+        return syms
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            addr = int(parts[0], 16)
+        except ValueError:
+            continue
+        syms.append((addr, 0, parts[2]))  # size unknown from nm; use 0
+    syms.sort(key=lambda t: t[0])
+    _RIP_SYMTAB_CACHE[host_path] = syms
+    return syms
+
+
+def _resolve_rip_with_symtab(rip: int, libs: list, disk_root: Optional[str]) -> dict:
+    """Resolve a single RIP to a library + function name.
+
+    Mirrors _resolve_user_rip but uses nm --defined-only (which reads .symtab)
+    instead of nm -D (which reads only .dynsym).  Falls back to _resolve_user_rip
+    if the library is not found on the host or has no .symtab entries.
+    """
+    import bisect
+    lib_path, off = _resolve_frame_to_lib(rip, libs)
+    result: dict = {
+        "rip": f"{rip:#x}",
+        "library": lib_path,
+        "offset": f"{off:#x}" if off is not None else None,
+        "symbol": None,
+    }
+    if lib_path is None:
+        return result
+    host = _resolve_path_on_host(lib_path, disk_root=disk_root)
+    if host and Path(host).exists():
+        syms = _load_symtab_from_nm(host)
+        if syms:
+            addrs = [s[0] for s in syms]
+            idx = bisect.bisect_right(addrs, off) - 1
+            if idx >= 0:
+                addr, _, name = syms[idx]
+                delta = off - addr
+                result["symbol"] = f"{name}+{delta:#x}"
+    if result["symbol"] is None:
+        # Fall back to dynsym-only resolution for libraries without .symtab.
+        sym = _try_symbolise(host, off) if host else None
+        result["symbol"] = sym
+    return result
+
+
+def cmd_rip_trace_resolve(args):
+    """Run kdb rip-trace and resolve all sampled RIPs to named functions.
+
+    Calls kdb rip-trace <tid> <ms> to collect a RIP histogram, then resolves
+    each top-RIP entry against the host-side .symtab of the owning library
+    (libxul.so, libc, etc.).  Requires --features kdb at session start.
+
+    The libxul.so in build/disk/opt/firefox/ must have .symtab populated
+    (via scripts/inject-libxul-symtab.py) for libxul symbols to resolve.
+
+    Output schema:
+      {
+        "tid": N, "pid": N, "ms_requested": N, "samples": N,
+        "errors": { ... },        -- from kdb rip-trace
+        "top_rips": [...],        -- raw RIP histogram from kdb rip-trace
+        "top_rbp_chains": [...],  -- raw chain histogram from kdb rip-trace
+        "resolved_rips": [
+          { "rip": "0x...", "count": N, "library": str|null,
+            "offset": "0x...|null", "symbol": str|null },
+          ...
+        ],
+        "resolve_stats": {
+          "total": N,    -- number of top_rips entries
+          "resolved": N, -- entries where symbol != null
+          "pct": float,  -- resolved / total * 100
+        },
+      }
+    """
+    sess = _load_session(args.sid)
+    port = int(sess.get("kdb_host_port") or 0)
+    if port <= 0:
+        _out({"error": "session was not started with --features kdb"})
+        sys.exit(1)
+
+    tid = int(args.tid)
+    ms  = int(args.ms)
+    disk_root = getattr(args, "disk_root", None)
+    timeout = float(getattr(args, "timeout", ms / 1000.0 + 10.0))
+
+    # ── 1. Run kdb rip-trace ─────────────────────────────────────────────────
+    try:
+        raw = _kdb_recv(port, {"op": "rip-trace", "tid": tid, "ms": ms},
+                        timeout=timeout)
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        _out({"error": f"kdb connect/io failed: {e}"}); sys.exit(1)
+    try:
+        resp = json.loads(raw.strip().decode("utf-8", errors="replace"))
+    except (json.JSONDecodeError, ValueError) as e:
+        _out({"error": f"malformed kdb response: {e}",
+              "raw": raw.decode(errors="replace")}); sys.exit(1)
+
+    if "error" in resp:
+        _out(resp); sys.exit(1)
+
+    # ── 2. Build load-base map from serial log ───────────────────────────────
+    serial_log = sess.get("serial_log", "")
+    try:
+        log_lines = Path(serial_log).read_text(errors="replace").splitlines()
+    except OSError:
+        log_lines = []
+    libs = _build_load_base_map(log_lines)
+
+    # ── 3. Resolve each sampled RIP ──────────────────────────────────────────
+    top_rips = resp.get("top_rips", [])
+    resolved_rips = []
+    resolved_count = 0
+    for entry in top_rips:
+        rip_str = entry.get("rip", "0x0")
+        try:
+            rip = int(rip_str, 16)
+        except (ValueError, TypeError):
+            rip = 0
+        count = entry.get("count", 0)
+        r = _resolve_rip_with_symtab(rip, libs, disk_root)
+        r["count"] = count
+        resolved_rips.append(r)
+        if r["symbol"] is not None:
+            resolved_count += 1
+
+    total = len(resolved_rips)
+    pct = (resolved_count / total * 100.0) if total > 0 else 0.0
+
+    # ── 4. Emit enriched response (additive superset of rip-trace) ──────────
+    out = dict(resp)
+    out["resolved_rips"] = resolved_rips
+    out["resolve_stats"] = {
+        "total": total,
+        "resolved": resolved_count,
+        "pct": round(pct, 1),
+    }
+    _out(out)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -6982,6 +7177,27 @@ def main():
                                "symbol lookup).  Defaults to ./build/disk and "
                                "./build relative to CWD.")
 
+    # rip-trace-resolve — kdb rip-trace + host-side .symtab resolution.
+    # The combined subcommand eliminates the manual two-step (rip-trace then
+    # addr2line) for W101-class userspace plateau investigations.
+    p_rtr = sub.add_parser(
+        "rip-trace-resolve",
+        help="[W101] kdb rip-trace + host-side .symtab resolution. "
+             "Samples TID <tid> for <ms> ms, then resolves every top-RIP "
+             "entry against the host-side libxul.so .symtab (requires "
+             "--features kdb at start and a .symtab-bearing libxul.so in "
+             "build/disk/opt/firefox/ — see scripts/inject-libxul-symtab.py)."
+    )
+    p_rtr.add_argument("sid")
+    p_rtr.add_argument("tid", help="TID to sample (e.g. 2)")
+    p_rtr.add_argument("ms", nargs="?", default="1000",
+                       help="Sampling window in milliseconds (default 1000)")
+    p_rtr.add_argument("--disk-root", default=None, metavar="DIR",
+                       help="Disk staging root for .so symbol lookup "
+                            "(default: ./build/disk)")
+    p_rtr.add_argument("--timeout", type=float, default=None,
+                       help="kdb deadline in seconds (default: ms/1000 + 10)")
+
     # rip-sample — sampling profiler (QMP stop + GDB g).  Requires --gdb-port.
     p_rip = sub.add_parser(
         "rip-sample",
@@ -7229,6 +7445,7 @@ def main():
         "qmp-xv":   cmd_qmp_xv,
         "qmp-xp":   cmd_qmp_xp,
         "rip-walk": cmd_rip_walk,
+        "rip-trace-resolve": cmd_rip_trace_resolve,
         "read-png": cmd_read_png,
         # Shared session context
         "context": cmd_context,
