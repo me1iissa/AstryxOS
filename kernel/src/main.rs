@@ -570,6 +570,20 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                     break;
                 }
 
+                // Yield CPU 0 so the scheduler can run Ready peers (Mozilla
+                // workers etc.) here instead of sitting idle.  Without
+                // this yield, the BSP polling loop runs
+                // forever in Ring 0; the timer ISR's check_reschedule()
+                // path only fires from Ring 3 (see arch/x86_64/irq.rs), so
+                // Ring-0 idle never enters schedule() on its own and Ready
+                // peers (cpu_affinity=None) are starved on CPU 0.  Together
+                // with the sched picker invariant (sched/mod.rs) this lets
+                // worker threads actually run on CPU 0 and unblock the
+                // condition-variable hand-offs that drive Mozilla's event
+                // loop.  Per POSIX SCHED_OTHER (1003.1-2017 §2.8) and
+                // sched(7), a CPU must never be idle while a runnable peer
+                // exists.
+                crate::sched::yield_cpu();
                 unsafe { core::arch::asm!("hlt"); }
             }
 

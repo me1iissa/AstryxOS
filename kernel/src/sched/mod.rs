@@ -425,8 +425,24 @@ pub fn schedule() {
         //   - affinity match (pinned to this cpu): +2
         //   - last_cpu match (cache-warm): +1
         //   - no match: +0
+        //
+        // INVARIANT (POSIX SCHED_OTHER hardening): a CPU MUST NEVER pick an idle thread
+        // while a non-idle Ready peer exists.  POSIX SCHED_OTHER and sched(7)
+        // both require that the per-CPU idle thread is the "schedule of last
+        // resort" — it runs ONLY when no runnable user/kernel work is
+        // available on this CPU.  The picker enforces this by doing TWO
+        // passes: pass 1 considers only NON-IDLE Ready peers; pass 2 (run
+        // only when pass 1 finds nothing) considers idle peers.  Without the
+        // two-pass split, a per-CPU idle thread with `cpu_affinity=Some(cpu)`
+        // (+2 affinity bonus) could in principle tie or beat a worker that
+        // has never run on this CPU (+0) at sufficiently low worker priority,
+        // even though SCHED_OTHER says workers must always win.  The two-pass
+        // structure also reads as a clear invariant in the source, making
+        // future picker edits less likely to regress.
         let mut best_idx: Option<usize> = None;
         let mut best_score: u16 = 0;
+        let mut idle_best_idx: Option<usize> = None;
+        let mut idle_best_score: u16 = 0;
 
         for i in 1..len {
             let idx = (current_idx + i) % len;
@@ -454,11 +470,45 @@ pub fn schedule() {
                 score += 1; // Ran here last — cache-warm preference.
             }
 
-            if score > best_score || best_idx.is_none() {
+            // AP idle threads (TID >= 0x1000 + apic_id, see
+            // arch/x86_64/apic.rs) are constructed at PRIORITY_IDLE with
+            // a per-CPU affinity pin and exist purely to give the AP a
+            // Ready thread to context-switch through when no other work
+            // is available.  Route them to the idle pool so non-idle
+            // peers always win pass 1.
+            //
+            // NB: the BSP idle thread (TID 0) is intentionally NOT in
+            // the idle pool.  TID 0 doubles as the BSP main thread that
+            // drives the kernel's polling loops (net::poll, x11::poll,
+            // gui::compositor::compose, the firefox-test heartbeat,
+            // etc.) — work that must keep advancing under load.
+            // Classifying TID 0 as idle would starve those polls when
+            // user threads saturate CPU 0, hanging the network stack and
+            // the framebuffer compositor.  Treat TID 0 as an ordinary
+            // PRIORITY_IDLE peer that loses to higher-priority workers
+            // on score alone but never falls into the schedule-of-last-
+            // resort bucket.
+            let is_idle_thread = t.tid >= 0x1000;
+            if is_idle_thread {
+                if score > idle_best_score || idle_best_idx.is_none() {
+                    idle_best_idx = Some(idx);
+                    idle_best_score = score;
+                }
+            } else if score > best_score || best_idx.is_none() {
                 best_idx = Some(idx);
                 best_score = score;
             }
         }
+
+        // Pass 2 fallback: if no non-idle Ready peer is available on this
+        // CPU, fall through to the idle thread.  This preserves the
+        // existing "no work → HLT" behaviour for genuinely idle systems
+        // while honouring the invariant above when work IS available.
+        if best_idx.is_none() {
+            best_idx = idle_best_idx;
+            best_score = idle_best_score;
+        }
+        let _ = best_score; // suppress "unused" if later edits drop the read
 
         match best_idx {
             Some(idx) => {
