@@ -1898,6 +1898,64 @@ fn inc_socket_refs_for_fork(fds: &[Option<crate::vfs::FileDescriptor>]) {
     }
 }
 
+/// Bump pipe reader/writer refcounts for every pipe fd that the child
+/// inherits via fork/vfork/clone-without-`CLONE_FILES`.  Each pipe end fd
+/// references the same in-kernel `Pipe` object, so a duplicate fd table
+/// must add one reader (or one writer) per copied pipe end.  Without this
+/// bump, the FIRST `close(2)` in either process would drop the counter to
+/// zero — making the surviving end either see a premature EOF (read side)
+/// or premature `EPIPE` (write side).
+///
+/// Per POSIX.1-2017 §2.14 and `man 2 fork`: "open file descriptors shall
+/// be duplicated in the child process; the duplicate descriptors in the
+/// child refer to the same open file descriptions as the corresponding
+/// descriptors in the parent."  The open file description (struct file in
+/// Linux terms) is the refcount-bearing entity, NOT the fd number itself.
+///
+/// Identifies pipe fds by the same shape used elsewhere
+/// (see `proc::handle_exit_or_kill_thread` and
+/// `vfs::FileDescriptor::pipe_{read,write}_end`):
+/// `file_type == Pipe`, `mount_idx == usize::MAX`, `flags & 0x8000_0000 != 0`.
+/// Bit 0 of `flags` distinguishes the write end (1) from the read end (0).
+fn inc_pipe_refs_for_fork(fds: &[Option<crate::vfs::FileDescriptor>]) {
+    for fd in fds.iter().filter_map(|f| f.as_ref()) {
+        if fd.file_type == crate::vfs::FileType::Pipe
+            && fd.mount_idx == usize::MAX
+            && fd.flags & 0x8000_0000 != 0
+        {
+            if fd.flags & 1 == 1 {
+                crate::ipc::pipe::pipe_add_writer(fd.inode);
+            } else {
+                crate::ipc::pipe::pipe_add_reader(fd.inode);
+            }
+        }
+    }
+}
+
+/// Drop the pipe-end refcount associated with a single `FileDescriptor`
+/// that is about to be cleared (e.g. by `close(2)`, by `execve(2)`'s
+/// `FD_CLOEXEC` purge, or by `dup2(2)` overwriting an existing slot).
+///
+/// Per POSIX `close(2)`: "If `fildes` is the last file descriptor referring
+/// to the open file description, the resources associated with the open
+/// file description shall be released."  For an anonymous pipe, "release"
+/// means decrementing the appropriate reader or writer count; when that
+/// count reaches zero the kernel wakes any peer parked on the other end so
+/// it observes EOF (`read(2)` returns 0) or `EPIPE` (`write(2)`).
+///
+/// Caller must have already removed the fd from the process's fd table
+/// before invoking this; the helper does not touch `PROCESS_TABLE`.
+pub fn close_pipe_fd(fd: &crate::vfs::FileDescriptor) {
+    if fd.file_type != crate::vfs::FileType::Pipe { return; }
+    if fd.mount_idx != usize::MAX { return; }
+    if fd.flags & 0x8000_0000 == 0 { return; }
+    if fd.flags & 1 == 1 {
+        crate::ipc::pipe::pipe_close_writer(fd.inode);
+    } else {
+        crate::ipc::pipe::pipe_close_reader(fd.inode);
+    }
+}
+
 /// Fork a process: create a child that is a copy of the parent.
 ///
 /// If the parent has a VmSpace, performs Copy-on-Write (CoW) fork:
@@ -1954,6 +2012,11 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
     // Without this, the first close(2) from either process would drop the
     // count to zero and destroy the shared socket object, breaking the peer.
     inc_socket_refs_for_fork(&fds);
+    // Same rationale for anonymous pipes — without this bump, parent's
+    // posix_spawn cancel-pipe loses one writer the moment the child's exec
+    // purges its CLOEXEC fd, so parent's `read` would see premature EOF
+    // (or worse, refcount underflow on the second close).
+    inc_pipe_refs_for_fork(&fds);
 
     // Enforce RLIMIT_NPROC: count non-zombie processes.
     {
@@ -2209,6 +2272,10 @@ pub fn fork_process_share_vm(
     // Bump socket fd refcounts for the duplicated table (same rationale as
     // fork_process — POSIX.1-2017 §2.14 / man 2 fork).
     inc_socket_refs_for_fork(&fds);
+    // And bump pipe fd refcounts so the parent's posix_spawn cancel-pipe
+    // (and any other inherited pipe end) survives until BOTH the parent's
+    // copy AND the child's copy are closed.  See `inc_pipe_refs_for_fork`.
+    inc_pipe_refs_for_fork(&fds);
 
     // RLIMIT_NPROC.
     {
@@ -2417,6 +2484,8 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
     // Bump socket fd refcounts for the duplicated table (same rationale as
     // fork_process — POSIX.1-2017 §2.14 / man 2 fork).
     inc_socket_refs_for_fork(&fds);
+    // And pipe fd refcounts.
+    inc_pipe_refs_for_fork(&fds);
 
     // Get parent's TLS base from thread struct.
     let parent_tls = {
