@@ -363,10 +363,40 @@ impl FileSystemOps for RamFs {
         }
     }
 
+    /// POSIX-compliant rename per `rename(2)`.
+    ///
+    /// References:
+    /// - POSIX.1-2017 rename(2) <https://pubs.opengroup.org/onlinepubs/9699919799/functions/rename.html>
+    /// - Linux rename(2) man page <https://man7.org/linux/man-pages/man2/rename.2.html>
+    ///
+    /// Error semantics enforced here (otherwise userspace tools relying on
+    /// `rename` for atomicity — config-file replace, mailbox spool, etc. —
+    /// see surprising results):
+    ///
+    /// * `old_name` / `new_name` of `.` or `..` → `EINVAL`.
+    /// * Source does not exist → `ENOENT`.
+    /// * Rename to self (same parent + same name) → success, no-op.
+    /// * Overwriting a non-empty directory → `ENOTEMPTY`.
+    /// * Mismatched types on overwrite:
+    ///   - non-dir over dir → `EISDIR`
+    ///   - dir over non-dir → `ENOTDIR`
+    /// * Renaming a directory into its own descendant → `EINVAL` (POSIX:
+    ///   "The new pathname contained a path prefix of the old.")
     fn rename(&self, old_parent: u64, old_name: &str, new_parent: u64, new_name: &str) -> VfsResult<()> {
+        // POSIX rename(2): "If either the old or new argument names `.` or
+        // `..`, rename() shall fail." (EINVAL).
+        if old_name == "." || old_name == ".." || new_name == "." || new_name == ".." {
+            return Err(VfsError::InvalidArg);
+        }
+        // Empty names are nonsensical at this layer; callers (`resolve_parent`)
+        // already reject them, but defend-in-depth here.
+        if old_name.is_empty() || new_name.is_empty() {
+            return Err(VfsError::InvalidArg);
+        }
+
         let mut inodes = self.inodes.lock();
 
-        // Find old entry inode.
+        // Locate source.  Both parents must exist and be directories.
         let old_parent_idx = Self::find_inode_idx(&inodes, old_parent).ok_or(VfsError::NotFound)?;
         let target_inode = match &inodes[old_parent_idx] {
             RamInode::Dir { entries, .. } => {
@@ -377,27 +407,124 @@ impl FileSystemOps for RamFs {
             _ => return Err(VfsError::NotADirectory),
         };
 
-        // Remove from old parent.
+        let new_parent_idx = Self::find_inode_idx(&inodes, new_parent).ok_or(VfsError::NotFound)?;
+        match &inodes[new_parent_idx] {
+            RamInode::Dir { .. } => {}
+            _ => return Err(VfsError::NotADirectory),
+        }
+
+        // POSIX: "If the old argument and the new argument resolve to either
+        // the same existing directory entry or different directory entries
+        // for the same existing file, rename() shall return successfully and
+        // perform no other action."  Same-parent + same-name is the trivial
+        // case; the cross-link case is not representable in ramfs (no hard
+        // links), so this check is sufficient here.
+        if old_parent == new_parent && old_name == new_name {
+            return Ok(());
+        }
+
+        // Determine source type — needed for type-mismatch checks below and
+        // for the descendant-loop check.
+        let target_idx = Self::find_inode_idx(&inodes, target_inode).ok_or(VfsError::NotFound)?;
+        let target_is_dir = matches!(&inodes[target_idx], RamInode::Dir { .. });
+
+        // POSIX EINVAL: "The link named by `new` is a directory that contains
+        // any entries that name an ancestor of the source."  Practically:
+        // forbid `rename("/a", "/a/b/c")` because that would orphan the
+        // sub-tree under "a" once we re-link it.
+        //
+        // Walk up from `new_parent` via entries scanning until we either find
+        // `target_inode` (loop!) or run out of parents.  Implemented as a
+        // bounded BFS over the entry graph because ramfs has no back-pointer.
+        if target_is_dir {
+            // Quick reject: if new_parent IS the target itself, that's a
+            // direct loop attempt.
+            if new_parent == target_inode {
+                return Err(VfsError::InvalidArg);
+            }
+            // Walk descendants of target_inode and check for new_parent.
+            // Bounded by the total number of inodes (cannot exceed the
+            // current FS size).
+            let mut stack: Vec<u64> = alloc::vec![target_inode];
+            let mut visited = 0usize;
+            let cap = inodes.len() + 1;
+            while let Some(cur) = stack.pop() {
+                visited += 1;
+                if visited > cap {
+                    // Defensive: cycle in directory graph (shouldn't happen
+                    // in ramfs, but corrupt state must not livelock the rename).
+                    break;
+                }
+                if cur == new_parent {
+                    return Err(VfsError::InvalidArg);
+                }
+                if let Some(ci) = Self::find_inode_idx(&inodes, cur) {
+                    if let RamInode::Dir { entries, .. } = &inodes[ci] {
+                        for e in entries {
+                            // Only recurse into dir children to keep the
+                            // traversal bounded; non-dirs cannot contain
+                            // new_parent.
+                            if let Some(ei) = Self::find_inode_idx(&inodes, e.inode) {
+                                if matches!(&inodes[ei], RamInode::Dir { .. }) {
+                                    stack.push(e.inode);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Handle overwrite: if `new_name` already exists in `new_parent`,
+        // POSIX requires atomic replace with type-compatibility rules.
+        let existing_target_inode: Option<u64> = {
+            if let RamInode::Dir { entries, .. } = &inodes[new_parent_idx] {
+                entries.iter().find(|e| e.name == new_name).map(|e| e.inode)
+            } else {
+                None
+            }
+        };
+
+        if let Some(existing) = existing_target_inode {
+            let existing_idx = Self::find_inode_idx(&inodes, existing).ok_or(VfsError::NotFound)?;
+            let existing_is_dir = matches!(&inodes[existing_idx], RamInode::Dir { .. });
+
+            // Type-compatibility (POSIX rename(2)):
+            //   * If `old` names a directory, `new` must either not exist
+            //     or be an empty directory.
+            //   * If `old` is not a directory, `new` must not be a directory.
+            if target_is_dir && !existing_is_dir {
+                return Err(VfsError::NotADirectory);
+            }
+            if !target_is_dir && existing_is_dir {
+                return Err(VfsError::IsADirectory);
+            }
+            if existing_is_dir {
+                // Must be empty.
+                if let RamInode::Dir { entries, .. } = &inodes[existing_idx] {
+                    if !entries.is_empty() {
+                        return Err(VfsError::NotEmpty);
+                    }
+                }
+            }
+
+            // Remove the displaced entry from new_parent and the displaced
+            // inode itself.
+            if let RamInode::Dir { entries, .. } = &mut inodes[new_parent_idx] {
+                entries.retain(|e| e.name != new_name);
+            }
+            inodes.retain(|n| n.inode_number() != existing);
+        }
+
+        // All checks passed — perform the rename atomically (single lock,
+        // single inodes vector mutation sequence).  Re-resolve indices
+        // because removals above may have shifted positions.
         let old_parent_idx = Self::find_inode_idx(&inodes, old_parent).ok_or(VfsError::NotFound)?;
         if let RamInode::Dir { entries, modified, .. } = &mut inodes[old_parent_idx] {
             entries.retain(|e| e.name != old_name);
             *modified = now_secs();
         }
 
-        // Remove any existing entry with the new name in the new parent (overwrite).
-        let new_parent_idx = Self::find_inode_idx(&inodes, new_parent).ok_or(VfsError::NotFound)?;
-        if let RamInode::Dir { entries, .. } = &inodes[new_parent_idx] {
-            if let Some(existing) = entries.iter().find(|e| e.name == new_name).map(|e| e.inode) {
-                // Remove the overwritten inode.
-                let new_parent_idx2 = Self::find_inode_idx(&inodes, new_parent).ok_or(VfsError::NotFound)?;
-                if let RamInode::Dir { entries, .. } = &mut inodes[new_parent_idx2] {
-                    entries.retain(|e| e.name != new_name);
-                }
-                inodes.retain(|n| n.inode_number() != existing);
-            }
-        }
-
-        // Add to new parent.
         let new_parent_idx = Self::find_inode_idx(&inodes, new_parent).ok_or(VfsError::NotFound)?;
         if let RamInode::Dir { entries, modified, .. } = &mut inodes[new_parent_idx] {
             entries.push(DirEntry {
