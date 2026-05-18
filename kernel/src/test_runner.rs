@@ -1885,6 +1885,24 @@ pub fn run() -> ! {
     total += 1;
     if test_243_vfork_alloc_rejects_kernel_va() { passed += 1; }
 
+    // ── Tests 244–246: RX checksum validation hardening ────────────────
+    // Per RFC 791 §3.1 / RFC 768 / RFC 792 + RFC 1122, a host stack MUST
+    // silently discard IPv4 / UDP (non-zero cksum) / ICMP packets whose
+    // 16-bit one's-complement Internet Checksum (RFC 1071) does not
+    // validate.  These tests pin the per-protocol counters and the
+    // accept/reject decision across hand-crafted loopback datagrams.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_244_ipv4_rx_checksum_validation() { passed += 1; }
+
+        total += 1;
+        if test_245_udp_rx_checksum_validation() { passed += 1; }
+
+        total += 1;
+        if test_246_icmp_rx_checksum_validation() { passed += 1; }
+    }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -32129,5 +32147,281 @@ fn test_243_vfork_alloc_rejects_kernel_va() -> bool {
                   max_aligned_user_va);
 
     test_pass!("alloc_vfork_child_stack input validation (CWE-822, CWE-200)");
+    true
+}
+
+// ── Test 244: IPv4 RX header-checksum validation (RFC 791 §3.1) ──────────────
+//
+// RFC 791 §3.1 ("Header Checksum") + RFC 1122 §3.2.1.2: a receiver MUST
+// verify the IPv4 header checksum and silently discard any datagram
+// whose checksum is invalid.  Until the fix landed alongside this test,
+// `handle_ipv4` accepted every parseable header regardless of the
+// `header_checksum` field — a NIC corruption or attacker-crafted bit
+// flip in the IP header was indistinguishable from valid traffic and
+// reached the L4 dispatch.
+//
+// The test drives `handle_ipv4` directly with crafted packets:
+//   (a) A well-formed UDP-in-IPv4 datagram destined for our loopback
+//       address with the correct header checksum.  `IPV4_RX_BAD_CSUM`
+//       must NOT advance.
+//   (b) The same datagram with one bit flipped inside the IP header
+//       (which the IP checksum covers).  `IPV4_RX_BAD_CSUM` MUST
+//       advance by exactly one.
+//   (c) Restore and re-checksum — counter must NOT advance again.
+//
+// Cite: RFC 791 §3.1, RFC 1071 §1 (Internet Checksum), RFC 1122 §3.2.1.2.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_244_ipv4_rx_checksum_validation() -> bool {
+    test_header!("net: IPv4 RX header checksum validation (RFC 791 §3.1)");
+
+    use crate::net::ipv4;
+
+    // Build a minimal IPv4 + UDP datagram of total length 28 bytes.
+    // IHL=5 (20-byte IP header), proto=UDP (17), TTL=64, ID=0x4321,
+    // DF set, src 127.0.0.1, dst 127.0.0.1, UDP src=1, dst=2, len=8.
+    let mut pkt = alloc::vec::Vec::with_capacity(28);
+    pkt.push(0x45);                                  // version|IHL
+    pkt.push(0x00);                                  // DSCP/ECN
+    pkt.extend_from_slice(&28u16.to_be_bytes());     // total_length
+    pkt.extend_from_slice(&0x4321u16.to_be_bytes()); // identification
+    pkt.extend_from_slice(&0x4000u16.to_be_bytes()); // flags|frag_off (DF)
+    pkt.push(64);                                    // TTL
+    pkt.push(ipv4::PROTO_UDP);                       // protocol
+    pkt.push(0); pkt.push(0);                        // header checksum placeholder
+    pkt.extend_from_slice(&[127, 0, 0, 1]);          // src IP
+    pkt.extend_from_slice(&[127, 0, 0, 1]);          // dst IP
+    let cks = ipv4::checksum(&pkt[..20]);
+    pkt[10] = (cks >> 8) as u8;
+    pkt[11] = (cks & 0xFF) as u8;
+    // UDP header — src=1, dst=2, len=8, no checksum (cksum=0).
+    pkt.extend_from_slice(&1u16.to_be_bytes());
+    pkt.extend_from_slice(&2u16.to_be_bytes());
+    pkt.extend_from_slice(&8u16.to_be_bytes());
+    pkt.push(0); pkt.push(0);
+
+    // (a) Valid checksum — accepted (counter must NOT advance).
+    let before_a = ipv4::rx_bad_csum_count();
+    ipv4::handle_ipv4(&pkt);
+    let after_a = ipv4::rx_bad_csum_count();
+    test_println!("  (a) valid checksum bad-csum drops: {} -> {}", before_a, after_a);
+    if after_a != before_a {
+        test_fail!("test244", "(a) valid datagram counted as bad ({} -> {})",
+                   before_a, after_a);
+        return false;
+    }
+
+    // (b) Flip TTL byte without recomputing the checksum — MUST be dropped.
+    pkt[8] ^= 0x01;
+    let before_b = ipv4::rx_bad_csum_count();
+    ipv4::handle_ipv4(&pkt);
+    let after_b = ipv4::rx_bad_csum_count();
+    test_println!("  (b) corrupted header bad-csum drops: {} -> {}", before_b, after_b);
+    if after_b != before_b + 1 {
+        test_fail!("test244",
+            "(b) expected exactly one drop, got {} -> {}",
+            before_b, after_b);
+        return false;
+    }
+
+    // (c) Restore + re-checksum — accepted again.
+    pkt[8] ^= 0x01;
+    pkt[10] = 0; pkt[11] = 0;
+    let cks = ipv4::checksum(&pkt[..20]);
+    pkt[10] = (cks >> 8) as u8;
+    pkt[11] = (cks & 0xFF) as u8;
+    let before_c = ipv4::rx_bad_csum_count();
+    ipv4::handle_ipv4(&pkt);
+    let after_c = ipv4::rx_bad_csum_count();
+    test_println!("  (c) repaired checksum bad-csum drops: {} -> {}", before_c, after_c);
+    if after_c != before_c {
+        test_fail!("test244", "(c) repaired datagram still counted as bad");
+        return false;
+    }
+
+    test_pass!("IPv4 RX header checksum validation (RFC 791 §3.1)");
+    true
+}
+
+// ── Test 245: UDP RX checksum validation (RFC 768, RFC 1122 §4.1.3.4) ────────
+//
+// RFC 768 + RFC 1122 §4.1.3.4 specify that a UDP receiver MUST silently
+// discard any datagram whose checksum is non-zero and does not validate
+// against the IPv4 pseudo-header.  A transmitted checksum of zero means
+// "checksum disabled by sender" and the receiver MUST NOT validate.
+//
+// Validation cases:
+//   (a) Datagram carrying a valid pseudo-header checksum — counter does
+//       NOT advance; payload reaches the bound port queue.
+//   (b) Same datagram with one payload byte flipped without recomputing
+//       the checksum — counter MUST advance and the payload MUST NOT
+//       reach the bound port queue.
+//   (c) Datagram with `checksum == 0` (sender opted out per RFC 768) —
+//       even with a "wrong" payload byte, the receiver MUST accept it
+//       without counting a drop.
+//
+// Cite: RFC 768, RFC 1122 §4.1.3.4, RFC 1071 §1 (Internet Checksum).
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_245_udp_rx_checksum_validation() -> bool {
+    test_header!("net: UDP RX checksum validation (RFC 768, RFC 1122 §4.1.3.4)");
+
+    use crate::net::{udp, ipv4};
+    const PORT: u16 = 17246;
+
+    if let Err(e) = udp::bind(PORT) {
+        test_fail!("test245", "bind({}) failed: {}", PORT, e);
+        return false;
+    }
+
+    // Build a UDP datagram with payload "AB" (2 bytes) -> udp_len=10.
+    let payload = [b'A', b'B'];
+    let udp_len: u16 = 8 + payload.len() as u16;
+    let mut udp_pkt = alloc::vec::Vec::with_capacity(udp_len as usize);
+    udp_pkt.extend_from_slice(&12345u16.to_be_bytes());  // src port
+    udp_pkt.extend_from_slice(&PORT.to_be_bytes());      // dst port
+    udp_pkt.extend_from_slice(&udp_len.to_be_bytes());   // length
+    udp_pkt.push(0); udp_pkt.push(0);                    // cksum placeholder
+    udp_pkt.extend_from_slice(&payload);
+
+    // Compute the pseudo-header + UDP checksum.
+    let src = [127, 0, 0, 1];
+    let dst = [127, 0, 0, 1];
+    let mut pseudo = alloc::vec::Vec::with_capacity(12 + udp_pkt.len());
+    pseudo.extend_from_slice(&src);
+    pseudo.extend_from_slice(&dst);
+    pseudo.push(0);
+    pseudo.push(ipv4::PROTO_UDP);
+    pseudo.extend_from_slice(&udp_len.to_be_bytes());
+    pseudo.extend_from_slice(&udp_pkt);
+    let cks = ipv4::checksum(&pseudo);
+    udp_pkt[6] = (cks >> 8) as u8;
+    udp_pkt[7] = (cks & 0xFF) as u8;
+
+    // Drain any pre-existing datagrams on the port.
+    while udp::recv(PORT).is_some() {}
+
+    // (a) Valid checksum — accepted.
+    let before_a = udp::rx_bad_csum_count();
+    udp::handle_udp(src, dst, &udp_pkt);
+    let after_a = udp::rx_bad_csum_count();
+    test_println!("  (a) valid checksum bad-csum drops: {} -> {}", before_a, after_a);
+    if after_a != before_a {
+        udp::unbind(PORT);
+        test_fail!("test245", "(a) valid datagram counted as bad");
+        return false;
+    }
+    let dg = udp::recv(PORT);
+    if dg.as_ref().map(|d| d.data.as_slice()) != Some(&payload[..]) {
+        udp::unbind(PORT);
+        test_fail!("test245", "(a) bound port did not receive valid payload");
+        return false;
+    }
+
+    // (b) Flip one payload byte without recomputing the checksum.
+    udp_pkt[8] ^= 0x80;
+    let before_b = udp::rx_bad_csum_count();
+    udp::handle_udp(src, dst, &udp_pkt);
+    let after_b = udp::rx_bad_csum_count();
+    test_println!("  (b) corrupted payload bad-csum drops: {} -> {}", before_b, after_b);
+    if after_b != before_b + 1 {
+        udp::unbind(PORT);
+        test_fail!("test245",
+            "(b) expected one drop on bad cksum, got {} -> {}",
+            before_b, after_b);
+        return false;
+    }
+    if udp::recv(PORT).is_some() {
+        udp::unbind(PORT);
+        test_fail!("test245", "(b) corrupted datagram leaked to bound port");
+        return false;
+    }
+
+    // (c) Restore byte, zero the checksum field (sender opt-out per RFC 768)
+    //     and corrupt the payload again — must still be accepted.
+    udp_pkt[8] ^= 0x80;
+    udp_pkt[6] = 0; udp_pkt[7] = 0;
+    udp_pkt[8] ^= 0x20;
+    let before_c = udp::rx_bad_csum_count();
+    udp::handle_udp(src, dst, &udp_pkt);
+    let after_c = udp::rx_bad_csum_count();
+    test_println!("  (c) sender opt-out (cksum=0) bad-csum drops: {} -> {}",
+                  before_c, after_c);
+    if after_c != before_c {
+        udp::unbind(PORT);
+        test_fail!("test245", "(c) cksum=0 datagram wrongly counted as bad");
+        return false;
+    }
+    if udp::recv(PORT).is_none() {
+        udp::unbind(PORT);
+        test_fail!("test245", "(c) cksum=0 datagram did not reach bound port");
+        return false;
+    }
+
+    udp::unbind(PORT);
+    test_pass!("UDP RX checksum validation (RFC 768, RFC 1122 §4.1.3.4)");
+    true
+}
+
+// ── Test 246: ICMP RX checksum validation (RFC 792, RFC 1122 §3.2.2) ─────────
+//
+// RFC 792 specifies the ICMP checksum as "the 16-bit one's complement
+// of the one's complement sum of the ICMP message starting with the
+// ICMP Type."  RFC 1122 §3.2.2 makes this a MUST for the receiver:
+// silently discard any ICMP message that fails the checksum.  Unlike
+// UDP there is no opt-out.
+//
+// Validation cases:
+//   (a) Well-formed ICMP echo *reply* (type=0) with the correct
+//       checksum — the counter does NOT advance.  We deliberately use
+//       echo-reply rather than echo-request so the handler's reply
+//       branch only stores LAST_REPLY; an echo-request would trigger
+//       `send_echo_reply` and pull the IPv4 send path into an ARP loop
+//       for the synthetic src_ip, hanging the test runner.
+//   (b) Same message with one byte flipped in the payload area — the
+//       checksum field is now wrong, counter MUST advance by one.
+//
+// Cite: RFC 792 (ICMP), RFC 1122 §3.2.2 ("Validity tests"), RFC 1071 §1.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_246_icmp_rx_checksum_validation() -> bool {
+    test_header!("net: ICMP RX checksum validation (RFC 792, RFC 1122 §3.2.2)");
+
+    use crate::net::{icmp, ipv4};
+
+    // Build a 16-byte ICMP echo reply (type=0): exercises the checksum
+    // path without triggering `send_echo_reply`.
+    let mut msg = alloc::vec::Vec::with_capacity(16);
+    msg.push(0);              // type: echo reply
+    msg.push(0);              // code
+    msg.push(0); msg.push(0); // checksum placeholder
+    msg.extend_from_slice(&1u16.to_be_bytes()); // id
+    msg.extend_from_slice(&1u16.to_be_bytes()); // seq
+    for i in 0u8..8 { msg.push(i); }
+    let cks = ipv4::checksum(&msg);
+    msg[2] = (cks >> 8) as u8;
+    msg[3] = (cks & 0xFF) as u8;
+
+    // (a) Valid checksum — accepted; counter does NOT advance.
+    let before_a = icmp::rx_bad_csum_count();
+    icmp::handle_icmp([10, 0, 2, 100], &msg);
+    let after_a = icmp::rx_bad_csum_count();
+    test_println!("  (a) valid checksum bad-csum drops: {} -> {}", before_a, after_a);
+    if after_a != before_a {
+        test_fail!("test246", "(a) valid ICMP echo counted as bad");
+        return false;
+    }
+
+    // (b) Corrupt one payload byte without recomputing the checksum.
+    msg[10] ^= 0xFF;
+    let before_b = icmp::rx_bad_csum_count();
+    icmp::handle_icmp([10, 0, 2, 100], &msg);
+    let after_b = icmp::rx_bad_csum_count();
+    test_println!("  (b) corrupted payload bad-csum drops: {} -> {}", before_b, after_b);
+    if after_b != before_b + 1 {
+        test_fail!("test246",
+            "(b) expected one drop on bad cksum, got {} -> {}",
+            before_b, after_b);
+        return false;
+    }
+
+    test_pass!("ICMP RX checksum validation (RFC 792)");
     true
 }
