@@ -32702,11 +32702,20 @@ fn test_244_libsys_syscall_numbers() -> bool {
 ///
 ///   * Case A — `new_stack` outside the user half of the address space
 ///     (`>= KERNEL_VIRT_BASE`).  Must return `None`, no kernel deref.
+///   * Case A2 — `new_stack` whose `+8` byte span crosses into the kernel
+///     half (the SMAP-bracketed Phase 1 read is 8 bytes wide).
 ///   * Case B — 8-byte-misaligned `new_stack` in the user half.  The
 ///     canonical libc `__clone` preamble stores the arg word with `mov
 ///     %rcx,(%rsi)` (an 8-byte aligned store), so a misaligned pointer
 ///     cannot be the genuine output of the preamble and is also rejected
 ///     to keep the read path well-defined.
+///   * Case C — NULL pointer.  `validate_user_ptr(0, 8)` returns false;
+///     the helper must short-circuit at Phase 0 with no deref.
+///   * Case D — boundary inclusion: the largest 8-byte-aligned user-VA
+///     (`KERNEL_VIRT_BASE - 8`) must be accepted by Phase 0's validator
+///     (the upper bound is inclusive).  Tested via `validate_user_ptr`
+///     directly so the helper's Phase 1 deref (which would fault on the
+///     unmapped boundary page) is not exercised.
 fn test_243_vfork_alloc_rejects_kernel_va() -> bool {
     test_header!("alloc_vfork_child_stack input validation (CWE-822, CWE-200)");
 
@@ -32758,6 +32767,52 @@ fn test_243_vfork_alloc_rejects_kernel_va() -> bool {
         return false;
     }
     test_println!("  Case B: misaligned user-VA 0x{:x} rejected ✓", misaligned_user_va);
+
+    // Case C — NULL pointer.  `validate_user_ptr(0, 8)` rejects (ptr == 0
+    // && len != 0) and the helper must return None without entering the
+    // deref path.  This documents that a `clone(2)` caller passing a NULL
+    // `new_stack` cannot smuggle a kernel-VA read through the
+    // SMAP-bracketed Phase 1.
+    let null_ptr: u64 = 0;
+    let case_c = crate::proc::alloc_vfork_child_stack(parent_pid, null_ptr);
+    if case_c.is_some() {
+        test_fail!("test243",
+            "Case C: alloc_vfork_child_stack accepted NULL new_stack \
+             (must reject — POSIX clone(2) requires new_stack in caller's \
+             address space)");
+        return false;
+    }
+    test_println!("  Case C: NULL pointer rejected ✓");
+
+    // Case D — boundary inclusion check.  `KERNEL_VIRT_BASE - 8` is the
+    // largest 8-byte-aligned user-VA whose 8-byte span `[va, va+8)` does
+    // not cross into the kernel half.  `validate_user_ptr` must accept it
+    // (`end == KERNEL_VIRT_BASE` is the inclusive upper bound).
+    //
+    // We test the validator directly rather than calling
+    // `alloc_vfork_child_stack`: at this VA in the test runner's address
+    // space the page is unmapped, and Phase 1's SMAP-bracketed
+    // `core::ptr::read` would page-fault.  The behavior under test here
+    // is the Phase 0 input-validation boundary, not the deref.
+    let max_aligned_user_va: u64 = astryx_shared::KERNEL_VIRT_BASE - 8;
+    if max_aligned_user_va & 0x7 != 0 {
+        test_fail!("test243",
+            "Case D: boundary VA 0x{:x} is not 8-byte aligned — \
+             test invariant broken",
+            max_aligned_user_va);
+        return false;
+    }
+    let validator_ok = crate::syscall::validate_user_ptr(max_aligned_user_va, 8);
+    if !validator_ok {
+        test_fail!("test243",
+            "Case D: validate_user_ptr rejected 0x{:x} (largest aligned \
+             user-VA — end == KERNEL_VIRT_BASE, the inclusive upper bound \
+             must be accepted)",
+            max_aligned_user_va);
+        return false;
+    }
+    test_println!("  Case D: boundary user-VA 0x{:x} accepted by Phase 0 ✓",
+                  max_aligned_user_va);
 
     test_pass!("alloc_vfork_child_stack input validation (CWE-822, CWE-200)");
     true
