@@ -201,12 +201,28 @@ pub fn from_kernel_ret(ret: i64) -> SysResult<u64> {
 /// Translate a raw kernel return treating it as a *signed* value (for
 /// syscalls like `lseek(2)` whose successful return is a signed offset
 /// and whose errors fit in `-MAX_ERRNO..-1`).
+///
+/// The success domain is clamped to `ret >= -MAX_ERRNO`: per the System V
+/// ABI x86_64 supplement §A.2.1, signed-return syscalls produce values in
+/// either `[-MAX_ERRNO, -1]` (errno) or `[-2^63, -MAX_ERRNO-1] ∪ [0, 2^63-1]`
+/// — but no current Linux-ABI syscall has a *legitimate* signed return
+/// below `-MAX_ERRNO` (unlike pointer-returning calls such as `mmap(2)`,
+/// for which see [`from_kernel_ret`]).  We therefore treat `ret < -MAX_ERRNO`
+/// as a kernel contract violation and surface it as [`SysError::EUnknown`]
+/// rather than silently returning a very-negative offset that no caller
+/// can safely use.
 #[inline]
 pub fn from_kernel_ret_signed(ret: i64) -> SysResult<i64> {
-    if ret < 0 && ret >= -MAX_ERRNO {
+    if ret >= 0 {
+        Ok(ret)
+    } else if ret >= -MAX_ERRNO {
+        // Errno band: [-4095, -1].
         Err(SysError::from_code(-ret as i32))
     } else {
-        Ok(ret)
+        // Below -MAX_ERRNO: no signed syscall returns this — contract
+        // violation by the kernel side.  Surface as EUnknown so callers
+        // see a typed error instead of an unusable offset.
+        Err(SysError::EUnknown)
     }
 }
 
@@ -260,5 +276,34 @@ mod tests {
         assert_eq!(from_kernel_ret_signed(-29), Err(SysError::ESpipe));
         // A genuinely-large offset on a 64-bit file remains a success:
         assert_eq!(from_kernel_ret_signed(i64::MAX), Ok(i64::MAX));
+    }
+
+    #[test]
+    fn signed_clamps_success_domain_below_max_errno() {
+        // -MAX_ERRNO is the last errno value (EUnknown for code 4095).
+        assert_eq!(
+            from_kernel_ret_signed(-MAX_ERRNO),
+            Err(SysError::EUnknown)
+        );
+        // One below: still a contract violation, NOT a successful offset.
+        // Per the System V ABI §A.2.1, signed-return syscalls do not emit
+        // values in (-2^63, -MAX_ERRNO); the prior implementation silently
+        // returned these as Ok(very_negative), which masks kernel bugs.
+        assert_eq!(
+            from_kernel_ret_signed(-MAX_ERRNO - 1),
+            Err(SysError::EUnknown)
+        );
+        // Far-below: same outcome — clamp protects callers from receiving
+        // a "successful" offset they cannot use.
+        assert_eq!(from_kernel_ret_signed(i64::MIN), Err(SysError::EUnknown));
+        // Boundary on the positive side: 0 stays success.
+        assert_eq!(from_kernel_ret_signed(0), Ok(0));
+        // Boundary just above the errno band: -4096 is OUTSIDE [-4095, -1].
+        // -4096 == -(MAX_ERRNO+1), below errno; treat as contract violation.
+        assert_eq!(from_kernel_ret_signed(-4096), Err(SysError::EUnknown));
+        // -4095 is the lowest legal errno code.
+        assert_eq!(from_kernel_ret_signed(-4095), Err(SysError::EUnknown));
+        // -1 is the most common errno: EPerm.
+        assert_eq!(from_kernel_ret_signed(-1), Err(SysError::EPerm));
     }
 }

@@ -1877,12 +1877,12 @@ pub fn run() -> ! {
     total += 1;
     if test_242_sched_picker_non_idle_precedence() { passed += 1; }
 
-    // ── Test 243: libsys Linux-ABI syscall-number contract ─────────────
+    // ── Test 244: libsys Linux-ABI syscall-number contract ─────────────
     // Pin the syscall numbers, AT_* tags and errno convention that
     // `userspace/libsys/` advertises so a kernel renumbering can never
     // silently divert AstryxOS-native callers to the wrong handler.
     total += 1;
-    if test_243_libsys_syscall_numbers() { passed += 1; }
+    if test_244_libsys_syscall_numbers() { passed += 1; }
 
     // ── Summary ─────────────────────────────────────────────────────────
 
@@ -32003,7 +32003,7 @@ fn test_242_sched_picker_non_idle_precedence() -> bool {
     true
 }
 
-// ── Test 243: libsys Linux-ABI syscall-number contract ─────────────────────
+// ── Test 244: libsys Linux-ABI syscall-number contract ─────────────────────
 //
 // `userspace/libsys/src/lib.rs` exposes the Linux x86_64 syscall numbers
 // used by AstryxOS-native binaries that opt into the Linux personality
@@ -32022,8 +32022,10 @@ fn test_242_sched_picker_non_idle_precedence() -> bool {
 //   * Linux UAPI x86_64 syscall table (man-pages).
 //   * `intro(2)` for the kernel-return errno convention libsys
 //     translates in `errno::from_kernel_ret`.
+//   * `vdso(7)` for the AstryxOS vDSO 4-symbol export contract that
+//     [`userspace/libsys/src/auxv.rs::vdso_lookup`] depends on.
 
-fn test_243_libsys_syscall_numbers() -> bool {
+fn test_244_libsys_syscall_numbers() -> bool {
     test_header!("libsys Linux-ABI syscall-number contract");
 
     // These constants mirror `userspace/libsys/src/lib.rs::linux::*`.
@@ -32104,6 +32106,29 @@ fn test_243_libsys_syscall_numbers() -> bool {
     }
     test_println!("  MAX_ERRNO = 4095 (System V ABI §A.2.1) ✓");
 
-    test_pass!("libsys Linux-ABI syscall-number + auxv + errno contract");
+    // vDSO export-count contract: `userspace/libsys/src/auxv.rs::vdso_lookup`
+    // bounds its .dynsym walk at 64 entries as a defence-in-depth fallback
+    // when the DT_STRTAB / DT_SYMTAB memory ordering is non-standard.  The
+    // AstryxOS vDSO (`kernel/vdso/vdso.lds`) exports exactly four symbols:
+    // __vdso_clock_gettime, __vdso_gettimeofday, __vdso_time, __vdso_getcpu
+    // (see `vdso(7)`).  Pin the count here so that if the vDSO export set
+    // grows, the libsys cap is re-evaluated rather than silently truncating
+    // the symbol table on lookup.
+    const ASTRYX_VDSO_N_EXPORTS: usize = 4;
+    const LIBSYS_VDSO_MAX_SYMS: usize = 64;
+    if ASTRYX_VDSO_N_EXPORTS > LIBSYS_VDSO_MAX_SYMS {
+        test_fail!(
+            "libsys_vdso_cap",
+            "vDSO exports {} > libsys cap {}",
+            ASTRYX_VDSO_N_EXPORTS, LIBSYS_VDSO_MAX_SYMS
+        );
+        return false;
+    }
+    test_println!(
+        "  vDSO exports {} ≤ libsys cap {} (vdso(7)) ✓",
+        ASTRYX_VDSO_N_EXPORTS, LIBSYS_VDSO_MAX_SYMS
+    );
+
+    test_pass!("libsys Linux-ABI syscall-number + auxv + errno + vDSO contract");
     true
 }
