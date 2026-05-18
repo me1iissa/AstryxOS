@@ -52,17 +52,19 @@ const FONT_ID_FIXED:    u32   = 0xF001;
 // ── Per-connection state ─────────────────────────────────────────────────────
 
 struct Client {
-    fd:           u64,
-    seq:          u16,
-    setup_done:   bool,
-    focus_window: u32,
-    resources:    Box<ResourceTable>,
+    fd:              u64,
+    seq:             u16,
+    setup_done:      bool,
+    /// Per-client event mask selected on the root window (updated by
+    /// ChangeWindowAttributes when the target is ROOT_WINDOW_ID).
+    root_event_mask: u32,
+    resources:       Box<ResourceTable>,
 }
 
 impl Client {
     fn new(fd: u64) -> Self {
         Client { fd, seq: 0, setup_done: false,
-                 focus_window: proto::ROOT_WINDOW_ID,
+                 root_event_mask: 0,
                  resources: Box::new(ResourceTable::new()) }
     }
     fn next_seq(&mut self) -> u16 { self.seq = self.seq.wrapping_add(1); self.seq }
@@ -114,6 +116,10 @@ struct Server {
     root_properties: [Option<resource::PropertyEntry>; resource::MAX_PROPERTIES],
     /// ICCCM selection ownership table.
     selections:      [SelectionOwner; MAX_SELECTIONS],
+    /// Server-global input focus window.  Per X11 protocol §SetInputFocus,
+    /// focus is a server-wide resource, not per-connection.  All clients share
+    /// this value; the last SetInputFocus request wins.
+    focus_window:    u32,
 }
 impl Server {
     const fn new() -> Self {
@@ -123,6 +129,7 @@ impl Server {
             clients:         [const { None }; MAX_CLIENTS],
             root_properties: [const { None }; resource::MAX_PROPERTIES],
             selections:      [SelectionOwner::empty(); MAX_SELECTIONS],
+            focus_window:    proto::ROOT_WINDOW_ID,
         }
     }
 }
@@ -228,7 +235,9 @@ pub fn init() {
         srv.initialized  = true;
 
         // ── EWMH: pre-populate _NET_SUPPORTED on the root window ─────────
-        // Intern the EWMH atoms we support.
+        // Per EWMH §3.1: the _NET_SUPPORTED property lists all EWMH atoms
+        // the window manager honours.  Clients (including GTK, Qt, xterm) read
+        // this on startup to decide which EWMH features to use.
         let net_supported            = atoms::intern("_NET_SUPPORTED",                false);
         let net_wm_state             = atoms::intern("_NET_WM_STATE",                 false);
         let net_wm_state_fullscreen  = atoms::intern("_NET_WM_STATE_FULLSCREEN",      false);
@@ -238,13 +247,15 @@ pub fn init() {
         let net_active_window        = atoms::intern("_NET_ACTIVE_WINDOW",            false);
         let net_wm_name              = atoms::intern("_NET_WM_NAME",                  false);
         let net_wm_window_type       = atoms::intern("_NET_WM_WINDOW_TYPE",           false);
+        let net_wm_window_type_normal= atoms::intern("_NET_WM_WINDOW_TYPE_NORMAL",    false);
+        let net_wm_ping              = atoms::intern("_NET_WM_PING",                  false);
         // Pack the supported-atom list as 32-bit LE values.
         let supported = [
             net_wm_state, net_wm_state_fullscreen, net_wm_state_max_vert,
             net_wm_state_max_horiz, net_wm_state_hidden, net_active_window,
-            net_wm_name, net_wm_window_type,
+            net_wm_name, net_wm_window_type, net_wm_window_type_normal, net_wm_ping,
         ];
-        let mut buf = [0u8; 64];
+        let mut buf = [0u8; 80];
         for (i, &a) in supported.iter().enumerate() {
             proto::write_u32le(&mut buf, i * 4, a);
         }
@@ -270,9 +281,10 @@ pub fn inject_key_event(keycode: u8, pressed: bool) {
     } else {
         proto::EVENT_MASK_KEY_RELEASE
     };
+    // Focus is server-global; all key events go to the single focused window.
+    let fw = srv.focus_window;
     for slot in srv.clients.iter_mut() {
         if let Some(c) = slot {
-            let fw = c.focus_window;
             // Check whether the focused window has registered for this event.
             let send_ev = {
                 let entries = &c.resources.entries;
@@ -306,9 +318,10 @@ pub fn inject_mouse_event(rx: i16, ry: i16, buttons: u8, prev_buttons: u8) {
     if !srv.initialized { return; }
     let tick = crate::arch::x86_64::irq::get_ticks() as u32;
     let state = (buttons as u16) << 8;
+    // Focus is server-global; pointer events are delivered to the focused window.
+    let fw = srv.focus_window;
     for slot in srv.clients.iter_mut() {
         if let Some(c) = slot {
-            let fw = c.focus_window;
             let evmask = {
                 let entries = &c.resources.entries;
                 entries.iter().filter_map(|s| s.as_ref())
@@ -556,7 +569,7 @@ fn handle_request(fd: u64, data: &[u8]) {
         proto::OP_SET_SELECTION_OWNER   => op_set_selection_owner(fd, data, seq),
         proto::OP_GET_SELECTION_OWNER   => op_get_selection_owner(fd, data, seq),
         proto::OP_CONVERT_SELECTION     => op_convert_selection(fd, data, seq),
-        proto::OP_SEND_EVENT            => {} // no reply — client routes event to window, no-op
+        proto::OP_SEND_EVENT            => op_send_event(fd, data, seq),
         proto::OP_GRAB_POINTER          => op_grab_reply(fd, seq),
         proto::OP_UNGRAB_POINTER        => {}
         proto::OP_GRAB_BUTTON           => {}
@@ -683,6 +696,27 @@ fn op_change_win_attrs(fd: u64, data: &[u8]) {
     let wid   = r32(data, 4);
     let vmask = r32(data, 8);
     with_client(fd, |c| {
+        if wid == proto::ROOT_WINDOW_ID {
+            // Root window has no per-client resource entry.  Track CWEventMask
+            // changes in Client::root_event_mask so that deliver_property_notify
+            // and op_send_event can respect the per-client root event mask.
+            // Per X11 protocol §ChangeWindowAttributes, setting CWEventMask on
+            // root registers the client's interest in root-window events.
+            let mut vi = 12usize;
+            if vmask & proto::CW_BACK_PIXMAP       != 0 { vi += 4; }
+            if vmask & proto::CW_BACK_PIXEL        != 0 { vi += 4; }
+            if vmask & proto::CW_BORDER_PIXMAP     != 0 { vi += 4; }
+            if vmask & proto::CW_BORDER_PIXEL      != 0 { vi += 4; }
+            if vmask & proto::CW_BIT_GRAVITY       != 0 { vi += 4; }
+            if vmask & proto::CW_WIN_GRAVITY       != 0 { vi += 4; }
+            if vmask & proto::CW_BACKING_STORE     != 0 { vi += 4; }
+            if vmask & proto::CW_BACKING_PLANES    != 0 { vi += 4; }
+            if vmask & proto::CW_BACKING_PIXEL     != 0 { vi += 4; }
+            if vmask & proto::CW_OVERRIDE_REDIRECT != 0 { vi += 4; }
+            if vmask & proto::CW_SAVE_UNDER        != 0 { vi += 4; }
+            if vmask & proto::CW_EVENT_MASK        != 0 { c.root_event_mask = r32(data, vi); }
+            return;
+        }
         if let Some(w) = c.resources.get_window_mut(wid) {
             let mut vi = 12usize;
             if vmask & proto::CW_BACK_PIXMAP       != 0 { vi += 4; }
@@ -881,6 +915,11 @@ fn op_get_atom_name(fd: u64, data: &[u8], seq: u16) {
 }
 
 // ── ChangeProperty (18) ───────────────────────────────────────────────────────
+//
+// Per X11 protocol §ChangeProperty: after updating the property, deliver a
+// PropertyNotify (28) event to every client that selected PropertyChangeMask
+// (0x0040_0000) on the target window.  ICCCM §4 requires this so that window
+// managers tracking WM_NAME, WM_HINTS, _NET_WM_NAME etc. learn of changes.
 
 fn op_change_property(fd: u64, data: &[u8]) {
     if data.len() < 24 { return; }
@@ -897,8 +936,50 @@ fn op_change_property(fd: u64, data: &[u8]) {
         prop_arr_set(&mut srv.root_properties, prop, type_, fmt, pdata, mode);
     } else {
         with_client(fd, |c| {
-            if let Some(w) = c.resources.get_window_mut(wid) { w.set_property(prop, type_, fmt, pdata, mode); }
+            if let Some(w) = c.resources.get_window_mut(wid) {
+                w.set_property(prop, type_, fmt, pdata, mode);
+            }
         });
+    }
+    // Deliver PropertyNotify to all clients watching this window.
+    deliver_property_notify(wid, prop, false);
+}
+
+/// Deliver a PropertyNotify event to all clients that selected
+/// PropertyChangeMask on `window`.  `deleted` is true for DeleteProperty.
+///
+/// Per X11 protocol §ChangeProperty, PropertyNotify on the root window is
+/// gated by PropertyChangeMask just like any other window.  Clients register
+/// their interest by calling ChangeWindowAttributes(root, CWEventMask,
+/// PropertyChangeMask), which is recorded in `Client::root_event_mask`.
+fn deliver_property_notify(window: u32, atom: u32, deleted: bool) {
+    let tick = crate::arch::x86_64::irq::get_ticks() as u32;
+    let mut srv = SERVER.lock();
+    for slot in srv.clients.iter_mut() {
+        if let Some(c) = slot {
+            // Check if the client has selected PropertyChangeMask on this window.
+            let has_mask = if window == proto::ROOT_WINDOW_ID {
+                // Root window: use the per-client root event mask set via
+                // ChangeWindowAttributes(root, CWEventMask, ...).
+                c.root_event_mask & proto::EVENT_MASK_PROPERTY_CHANGE != 0
+            } else {
+                c.resources.entries.iter()
+                    .filter_map(|s| s.as_ref())
+                    .find(|r| r.id == window)
+                    .map(|r| match &r.body {
+                        resource::ResourceBody::Window(w) =>
+                            w.event_mask & proto::EVENT_MASK_PROPERTY_CHANGE != 0,
+                        _ => false,
+                    })
+                    .unwrap_or(false)
+            };
+            if has_mask {
+                let seq = c.seq.wrapping_add(1);
+                c.seq = seq;
+                let ev = event::encode_property_notify(seq, window, atom, tick, deleted);
+                unix::write(c.fd, &ev);
+            }
+        }
     }
 }
 
@@ -914,6 +995,8 @@ fn op_delete_property(fd: u64, data: &[u8]) {
     } else {
         with_client(fd, |c| { if let Some(w) = c.resources.get_window_mut(wid) { w.delete_property(atom); } });
     }
+    // Deliver PropertyNotify (state=Deleted) per X11 protocol §DeleteProperty.
+    deliver_property_notify(wid, atom, true);
 }
 
 // ── GetProperty reply helper ──────────────────────────────────────────────────
@@ -1159,6 +1242,116 @@ fn op_convert_selection(fd: u64, data: &[u8], _seq: u16) {
     }
 }
 
+// ── SendEvent (25) ───────────────────────────────────────────────────────────
+//
+// Per X11 protocol §SendEvent:
+//   Request layout:
+//     [0]    opcode (25)
+//     [1]    propagate (BOOL)
+//     [2-3]  length (11 4-byte units = 44 bytes total)
+//     [4-7]  destination window (or 0=PointerWindow, 1=InputFocus)
+//     [8-11] event-mask (SETofEVENT: which event types to deliver)
+//     [12-43] event (32 bytes, the raw event packet)
+//
+// Server action: force the most significant bit of the event-type byte (byte 0
+// of the event) to 1 (to mark it as a synthetic event), set the sequence number,
+// then deliver the 32-byte event to every client that has selected any of the
+// event-mask bits on the destination window.
+//
+// Special destination values per spec:
+//   0 (PointerWindow): treat as the window containing the pointer (unimplemented
+//     here — we fall back to root).
+//   1 (InputFocus): deliver to the client whose input focus window matches.
+//
+// This is the mechanism ICCCM WM_DELETE_WINDOW uses: the WM sends a ClientMessage
+// (type=WM_PROTOCOLS, data[0]=WM_DELETE_WINDOW) to the window via SendEvent.
+
+fn op_send_event(fd: u64, data: &[u8], _seq: u16) {
+    if data.len() < 44 { return; }
+    let _propagate  = data[1] != 0;
+    let destination = r32(data, 4);
+    let event_mask  = r32(data, 8);
+
+    // Copy the 32-byte event payload, forcing bit 7 of the type byte (synthetic).
+    // ev[0] is set once here (synthetic MSB); ev[2..4] is overwritten per-client
+    // (per-client sequence number) inside the delivery loop below.
+    let mut ev = [0u8; 32];
+    ev.copy_from_slice(&data[12..44]);
+    ev[0] |= 0x80; // mark as synthetic per X11 protocol §SendEvent
+
+    // Resolve destination: 0=PointerWindow (root fallback), 1=InputFocus.
+    let dest_window = match destination {
+        0 => proto::ROOT_WINDOW_ID, // PointerWindow — fall back to root
+        1 => {
+            // InputFocus — deliver to the server-global focused window.
+            SERVER.lock().focus_window
+        }
+        w => {
+            // Explicit XID.  Per X11 protocol §SendEvent, if the window does not
+            // exist on any client, return BadWindow to the sender.
+            let exists = {
+                let srv = SERVER.lock();
+                w == proto::ROOT_WINDOW_ID
+                    || srv.clients.iter().filter_map(|s| s.as_ref())
+                        .any(|c| c.resources.entries.iter()
+                            .filter_map(|s| s.as_ref())
+                            .any(|r| r.id == w))
+            };
+            if !exists {
+                with_client(fd, |c| {
+                    c.send_error(proto::ERR_WINDOW, w, proto::OP_SEND_EVENT);
+                });
+                return;
+            }
+            w
+        }
+    };
+
+    // Deliver to every client that owns dest_window and has any of the
+    // event_mask bits selected on that window.  Root delivery respects the
+    // event-mask filter just like any other window (X11 protocol §SendEvent).
+    let mut srv = SERVER.lock();
+    for slot in srv.clients.iter_mut() {
+        if let Some(c) = slot {
+            // Determine whether this client receives the event.
+            // event_mask==0 (NoEventMask): deliver to the window owner only,
+            // unconditionally — per X11 §SendEvent, propagate=false + mask=0
+            // goes to the client that created the window.
+            let matches = if dest_window == proto::ROOT_WINDOW_ID {
+                // Root window: apply the per-client root event mask, just as
+                // any other window.  WMs register by setting their mask on root.
+                if event_mask == 0 {
+                    true // root always "owns" itself; deliver to all clients
+                } else {
+                    c.root_event_mask & event_mask != 0
+                }
+            } else if event_mask == 0 {
+                c.resources.entries.iter()
+                    .filter_map(|s| s.as_ref())
+                    .any(|r| r.id == dest_window)
+            } else {
+                c.resources.entries.iter()
+                    .filter_map(|s| s.as_ref())
+                    .find(|r| r.id == dest_window)
+                    .map(|r| match &r.body {
+                        resource::ResourceBody::Window(w) =>
+                            w.event_mask & event_mask != 0,
+                        _ => false,
+                    })
+                    .unwrap_or(false)
+            };
+            if matches {
+                // ev[2..4] is overwritten per-client (per-client sequence number).
+                let seq = c.seq.wrapping_add(1);
+                c.seq = seq;
+                ev[2] = (seq & 0xFF) as u8;
+                ev[3] = (seq >> 8) as u8;
+                unix::write(c.fd, &ev);
+            }
+        }
+    }
+}
+
 // ── QueryPointer (38) ───────────────────────────────────────────────────────
 
 fn op_query_pointer(fd: u64, seq: u16) {
@@ -1179,18 +1372,75 @@ fn op_grab_reply(fd: u64, seq: u16) {
 }
 
 // ── SetInputFocus (42) ──────────────────────────────────────────────────────
+//
+// Per X11 protocol §SetInputFocus: updates the input focus window.
+// We deliver FocusOut (10) to the previously focused window and FocusIn (9)
+// to the newly focused one, for every client that selected FocusChangeMask
+// (0x0020_0000) on the respective window.  This satisfies the ICCCM focus
+// model used by xterm, xclock, and toolkit input managers.
 
 fn op_set_input_focus(fd: u64, data: &[u8]) {
+    // data[1]  = revert-to (0=None, 1=PointerRoot, 2=Parent)
+    // data[4..8] = focus window XID
+    // data[8..12] = timestamp (CurrentTime = 0)
+    // TODO(revert-to): ignored; falls back to root on window destroy.
+    //   See X11 protocol §SetInputFocus.
     if data.len() < 8 { return; }
-    let focus = r32(data, 4);
-    with_client(fd, |c| c.focus_window = focus);
+    let new_focus = r32(data, 4);
+
+    // Focus is a server-global resource.  Read and update atomically so that
+    // the old value and the write are consistent even with multiple clients.
+    let old_focus = {
+        let mut srv = SERVER.lock();
+        let prev = srv.focus_window;
+        srv.focus_window = new_focus;
+        prev
+    };
+
+    if old_focus == new_focus { return; }
+
+    // Deliver FocusOut to the old focus window's owner(s).
+    deliver_focus_event(old_focus, false);
+    // Deliver FocusIn to the new focus window's owner(s).
+    deliver_focus_event(new_focus, true);
+}
+
+/// Send a FocusIn or FocusOut event to all clients that own `window` and
+/// have selected FocusChangeMask on it.
+fn deliver_focus_event(window: u32, focus_in: bool) {
+    let tick = crate::arch::x86_64::irq::get_ticks() as u32;
+    let _ = tick; // timestamp not used in focus event wire format
+
+    let mut srv = SERVER.lock();
+    for slot in srv.clients.iter_mut() {
+        if let Some(c) = slot {
+            let has_mask = c.resources.entries.iter()
+                .filter_map(|s| s.as_ref())
+                .find(|r| r.id == window)
+                .map(|r| match &r.body {
+                    resource::ResourceBody::Window(w) =>
+                        w.event_mask & proto::EVENT_MASK_FOCUS_CHANGE != 0,
+                    _ => false,
+                })
+                .unwrap_or(false);
+            if has_mask {
+                let seq = c.seq.wrapping_add(1);
+                c.seq = seq;
+                let ev = if focus_in {
+                    event::encode_focus_in(seq, window)
+                } else {
+                    event::encode_focus_out(seq, window)
+                };
+                unix::write(c.fd, &ev);
+            }
+        }
+    }
 }
 
 // ── GetInputFocus (43) ──────────────────────────────────────────────────────
 
 fn op_get_input_focus(fd: u64, seq: u16) {
-    let focus = SERVER.lock().clients.iter().filter_map(|s| s.as_ref())
-        .find(|c| c.fd == fd).map(|c| c.focus_window).unwrap_or(proto::ROOT_WINDOW_ID);
+    let focus = SERVER.lock().focus_window;
     let mut b = [0u8;32]; b[0]=1; b[1]=1; w16(&mut b,2,seq); w32(&mut b,8,focus);
     with_client(fd, |c| c.send(&b));
 }
