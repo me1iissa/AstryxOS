@@ -402,6 +402,28 @@ EOF
         mcopy -o -i "${DATA_IMG}" "${LIBC_MUSL}" "::lib/libc.musl-x86_64.so.1"
         echo "[DATA-DISK] Copied libc.musl-x86_64.so.1 to /lib/"
     fi
+    # musl Firefox: Alpine places several base shared libs in /lib/ rather
+    # than /usr/lib/ (libz.so.1, libcrypto.so.3, libssl.so.3, libblkid.so.1,
+    # libmount.so.1).  install-firefox-musl.sh stages the whole /lib/ tree
+    # into ${BUILD_DIR}/disk/lib/; copy every *.so* here so libxul's
+    # DT_NEEDED libz.so.1 etc. resolve at runtime.  See PR #298 trial for
+    # the missing-libz.so.1 ld-musl exit_group signature.
+    if [ "${FIREFOX_VARIANT}" = "musl" ]; then
+        lib_count=0
+        for f in "${BUILD_DIR}/disk/lib/"*.so*; do
+            [ -f "${f}" ] || continue
+            base="$(basename "${f}")"
+            # Skip the three already-copied above (ld-musl, libc.so, libc.musl).
+            case "${base}" in
+                ld-musl-x86_64.so.1|libc.so|libc.musl-x86_64.so.1) continue ;;
+            esac
+            mcopy -o -i "${DATA_IMG}" "${f}" "::lib/${base}" 2>/dev/null || true
+            lib_count=$((lib_count + 1))
+        done
+        if [ "${lib_count}" -gt 0 ]; then
+            echo "[DATA-DISK] Copied ${lib_count} musl base libs to /lib/ (Alpine /lib/ tree)"
+        fi
+    fi
 
     # ── Dynamic linker + glibc (needed by Firefox and other glibc binaries) ──
     if [ -d "${BUILD_DIR}/disk/lib64" ]; then
