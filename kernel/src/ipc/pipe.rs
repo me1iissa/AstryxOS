@@ -179,6 +179,18 @@ pub fn pipe_add_writer(pipe_id: u64) {
     }
 }
 
+/// Increment the reader count (e.g. when `fork(2)` duplicates the fd table
+/// and the child gains its own reference to the read-end).  Symmetric with
+/// `pipe_add_writer`; without this bump a subsequent `close(2)` in either
+/// process would drop the count to zero and cause the writer to observe a
+/// premature `EPIPE` per POSIX `write(2)`.
+pub fn pipe_add_reader(pipe_id: u64) {
+    let mut pipes = PIPE_TABLE.lock();
+    if let Some(pipe) = pipes.iter_mut().find(|p| p.id == pipe_id) {
+        pipe.readers = pipe.readers.saturating_add(1);
+    }
+}
+
 /// Close the write end of a pipe.  When the writer count reaches zero,
 /// every reader parked on `PIPE_READ_WAITERS` for this pipe id is woken
 /// so it observes EOF (per `man 7 pipe`: "If all file descriptors

@@ -1249,7 +1249,35 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
             // motivating case).
             p.exe_path = Some(final_path.clone());
             // Close all FDs marked close-on-exec (O_CLOEXEC / FD_CLOEXEC).
+            //
+            // Pipes, unix sockets, and other refcount-bearing objects
+            // need their open-file-description count dropped HERE, not
+            // just the fd slot zeroed.  Without this, the canonical musl
+            // posix_spawn(3) cancel-pipe pattern hangs: the parent calls
+            // `pipe2(O_CLOEXEC)` then clones; the child execve(2) into
+            // the new image purges its CLOEXEC fds but never tells the
+            // pipe that one writer just left, so the parent's blocked
+            // `read(2)` on the other end never observes EOF (per POSIX
+            // `read(2)`: "If no process has the pipe open for writing,
+            // read() shall return 0 to indicate end-of-file").  W101
+            // sc=1972 plateau motivating case.
             for fd_slot in p.file_descriptors.iter_mut() {
+                if let Some(f) = fd_slot.as_ref() {
+                    if f.cloexec {
+                        // Drop pipe refcounts before clearing the slot.
+                        crate::proc::close_pipe_fd(f);
+                        // Drop unix-socket refcount too — parallel of the
+                        // same gap for AF_UNIX inherit-through-vfork.  An
+                        // AF_INET socket reaches `crate::net::socket` via
+                        // its own table and is not refcounted via the
+                        // unix layer; gate accordingly.
+                        if f.file_type == crate::vfs::FileType::Socket
+                            && f.flags & crate::syscall::UNIX_SOCKET_FLAG != 0
+                        {
+                            crate::net::unix::close(f.inode);
+                        }
+                    }
+                }
                 if matches!(fd_slot, Some(f) if f.cloexec) {
                     *fd_slot = None;
                 }
@@ -2745,6 +2773,20 @@ pub(crate) fn sys_dup(old_fd: usize) -> i64 {
     {
         crate::net::unix::inc_ref(fd_clone.inode);
     }
+    // Same for anonymous pipe ends — the duplicate must count as an
+    // independent reader/writer reference.  Without this, `close(2)` on
+    // either fd drops the pipe's count to zero and the still-open end
+    // observes a phantom EOF / EPIPE.
+    if fd_clone.file_type == crate::vfs::FileType::Pipe
+        && fd_clone.mount_idx == usize::MAX
+        && fd_clone.flags & 0x8000_0000 != 0
+    {
+        if fd_clone.flags & 1 == 1 {
+            crate::ipc::pipe::pipe_add_writer(fd_clone.inode);
+        } else {
+            crate::ipc::pipe::pipe_add_reader(fd_clone.inode);
+        }
+    }
 
     // Find lowest free fd
     for i in 0..proc.file_descriptors.len() {
@@ -2795,13 +2837,36 @@ pub(crate) fn sys_dup2(old_fd: usize, new_fd: usize) -> i64 {
     {
         crate::net::unix::inc_ref(fd_clone.inode);
     }
+    // Same for anonymous pipe ends.
+    if fd_clone.file_type == crate::vfs::FileType::Pipe
+        && fd_clone.mount_idx == usize::MAX
+        && fd_clone.flags & 0x8000_0000 != 0
+    {
+        if fd_clone.flags & 1 == 1 {
+            crate::ipc::pipe::pipe_add_writer(fd_clone.inode);
+        } else {
+            crate::ipc::pipe::pipe_add_reader(fd_clone.inode);
+        }
+    }
 
     // Grow the table if needed
     while proc.file_descriptors.len() <= new_fd {
         proc.file_descriptors.push(None);
     }
 
-    // Close existing fd at new_fd (silently)
+    // Close existing fd at new_fd: per POSIX dup2(2), "If `fildes2` is
+    // already a valid open file descriptor, it shall be closed first,
+    // unless `fildes` is equal to `fildes2`."  Drop pipe-end refcounts
+    // (and unix-socket refcounts) on the displaced fd before overwriting
+    // the slot, so the underlying object sees the close.
+    if let Some(prev) = proc.file_descriptors[new_fd].take() {
+        crate::proc::close_pipe_fd(&prev);
+        if prev.file_type == crate::vfs::FileType::Socket
+            && prev.flags & UNIX_SOCKET_FLAG != 0
+        {
+            crate::net::unix::close(prev.inode);
+        }
+    }
     proc.file_descriptors[new_fd] = Some(fd_clone);
     new_fd as i64
 }
