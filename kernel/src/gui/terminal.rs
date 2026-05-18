@@ -876,7 +876,13 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         "MOZ_X11_EGL=0",
         "MOZ_ACCELERATED=0",
         "LIBGL_ALWAYS_SOFTWARE=1",
-        "LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/disk/lib/firefox",
+        // The path list covers both Firefox variants:
+        //   glibc: /lib/x86_64-linux-gnu (multiarch glibc tree)
+        //   musl : /usr/lib (Alpine's flat support-lib tree, plus /opt/firefox
+        //          for libxul.so + Mozilla's own .so files)
+        // /disk/lib/firefox is a legacy build-firefox.sh path retained for
+        // any caller using the in-tree built variant.
+        "LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/usr/lib:/opt/firefox:/disk/lib/firefox",
         // libfontconfig-interposer.so — defensive FcPatternGetString *out
         // wrapper.  Real libfontconfig (PR #179) leaves *out untouched on
         // FcResultNoMatch per spec; Mozilla's gfxFcPlatformFontList caller
