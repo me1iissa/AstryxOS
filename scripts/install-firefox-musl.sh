@@ -19,13 +19,25 @@
 #      ~/.cache/astryxos-firefox-musl/rootfs/ and `apk add firefox-esr`
 #      (pulls 122 transitive deps + the musl libc itself).
 #   3. Stage the rootfs into build/disk/ under the layout the kernel
-#      pre-cache + ELF loader expect:
+#      pre-cache + ELF loader + dynamic-linker DT_RUNPATH expect:
 #        - /disk/lib/ld-musl-x86_64.so.1     (interpreter, /lib/ in PT_INTERP)
-#        - /disk/lib/libc.musl-x86_64.so.1   (musl libc, symlink to ld-musl)
-#        - /disk/opt/firefox/firefox-bin     (the ELF; kernel pre-cache target)
-#        - /disk/opt/firefox/libxul.so       (kernel pre-cache target)
-#        - /disk/opt/firefox/...              (all other Mozilla artefacts)
-#        - /disk/usr/lib/                    (all Alpine support libs)
+#        - /disk/lib/libc.musl-x86_64.so.1   (musl libc, sibling of ld-musl)
+#        - /disk/usr/lib/firefox-esr/...     (canonical Mozilla tree, matches
+#                                              DT_RUNPATH baked into every
+#                                              Mozilla DSO — readelf -d shows
+#                                              RUNPATH=[/usr/lib/firefox-esr])
+#        - /disk/opt/firefox/firefox-bin     (launcher mirror — small, kept
+#                                              so the kernel launch and
+#                                              pre-cache paths remain stable)
+#        - /disk/usr/lib/                    (Alpine support libs flat:
+#                                              libnss, libnspr, libsqlite,
+#                                              ICU, GTK3, fontconfig, ...)
+#
+#      Per ELF gABI (System V ABI §5.4 "Shared Object Dependencies") and
+#      ld-musl(8), the dynamic linker searches in order: LD_LIBRARY_PATH,
+#      DT_RUNPATH, system defaults.  Placing Mozilla artefacts anywhere
+#      other than DT_RUNPATH means transitive dlopen calls (libxul →
+#      libmozsandbox.so etc.) fail with ENOENT and ld-musl exit_group()s.
 #
 # Idempotent — exits 0 if build/disk/opt/firefox/firefox-bin already exists
 # and looks musl-linked.  Pass --force to rebuild.
@@ -48,6 +60,14 @@ DISK_DIR="${BUILD_DIR}/disk"
 DISK_OPT="${DISK_DIR}/opt/firefox"
 DISK_LIB="${DISK_DIR}/lib"
 DISK_USR_LIB="${DISK_DIR}/usr/lib"
+# Mozilla artefacts ship with DT_RUNPATH=/usr/lib/firefox-esr baked into the
+# ELF .dynamic section.  Per the ELF gABI (System V ABI §5.4 "Dynamic Linking
+# — Shared Object Dependencies"), DT_RUNPATH is consulted when resolving
+# DT_NEEDED entries.  FAT32 has no symlinks, so the canonical Mozilla tree
+# (libxul.so, libmozsandbox.so, liblgpllibs.so, … and the browser/, defaults/,
+# fonts/, gmp-clearkey/ subdirs) MUST be staged at this absolute path on disk
+# for the dynamic linker to find them.
+DISK_FF_ESR="${DISK_DIR}/usr/lib/firefox-esr"
 FIREFOX_BIN="${DISK_OPT}/firefox-bin"
 
 CACHE_DIR="${HOME}/.cache/astryxos-firefox-musl"
@@ -76,15 +96,16 @@ done
 
 # ── Idempotency check ─────────────────────────────────────────────────────────
 # We consider the install up-to-date if firefox-bin exists, is musl-linked
-# (PT_INTERP = /lib/ld-musl-x86_64.so.1), AND the base shared libraries
-# we now stage from ${ROOTFS}/lib/ are all present in ${DISK_LIB}.  The
-# libz.so.1 sentinel covers older partial installs where /lib/ was not
-# staged (pre-PR build/musl-zlib-install) — those need a restage so
-# libxul's DT_NEEDED libz.so.1 resolves at runtime.
+# (PT_INTERP = /lib/ld-musl-x86_64.so.1), the base shared libraries we stage
+# from ${ROOTFS}/lib/ are present in ${DISK_LIB}, AND the canonical Mozilla
+# tree is present at ${DISK_FF_ESR} (DT_RUNPATH).  The libxul.so sentinel under
+# /usr/lib/firefox-esr covers older partial installs that staged Mozilla under
+# /opt/firefox/ only — those need a restage so DT_RUNPATH lookups succeed.
 if [ "${FORCE}" = false ] && [ -f "${FIREFOX_BIN}" ] && \
    file "${FIREFOX_BIN}" 2>/dev/null | grep -q 'ld-musl' && \
-   [ -e "${DISK_LIB}/libz.so.1" ]; then
-    echo "[FF-MUSL] ${FIREFOX_BIN} present and musl-linked, base libs staged — skipping (use --force to reinstall)"
+   [ -e "${DISK_LIB}/libz.so.1" ] && \
+   [ -e "${DISK_FF_ESR}/libxul.so" ]; then
+    echo "[FF-MUSL] ${FIREFOX_BIN} present and musl-linked, base + runpath staged — skipping (use --force to reinstall)"
     exit 0
 fi
 
@@ -210,42 +231,62 @@ for f in "${ROOTFS}"/lib/*; do
     fi
 done
 
-# (b) Firefox tree.  Clear any prior contents so we cannot end up with a
-# glibc/musl hybrid in /disk/opt/firefox/.
-rm -rf "${DISK_OPT}"
+# (b) Wipe prior /opt/firefox/ and /usr/lib/firefox-esr/ staging so we cannot
+# end up with a hybrid (e.g. glibc firefox-bin + musl libxul.so).  Step (c)
+# below will repopulate /usr/lib/firefox-esr/ from the rootfs.
+#
+# DT_RUNPATH context: every Mozilla ELF (firefox-bin, libxul.so,
+# libmozsandbox.so, ...) carries DT_RUNPATH=/usr/lib/firefox-esr per
+# readelf -d.  Per the ELF gABI (System V ABI §5.4 "Shared Object
+# Dependencies") and ld-musl(8), DT_RUNPATH is consulted after
+# LD_LIBRARY_PATH for DT_NEEDED resolution.  Placing the Mozilla tree
+# anywhere else means libxul's dlopen for its sibling .so files fails with
+# ENOENT and ld-musl exit_group()s.  The canonical tree must live at
+# /disk/usr/lib/firefox-esr/ (mapped to guest /usr/lib/firefox-esr by the
+# kernel's /usr → /disk/usr VFS symlink).
+#
+# We keep a minimal /opt/firefox/ duplicate consisting of firefox-bin alone
+# (~795 KiB) so the kernel's launch path (kernel/src/main.rs:508) and
+# pre-cache loader (kernel/src/main.rs:455) remain stable.  The launched
+# ELF's DT_RUNPATH is absolute, not relative to its on-disk location.
+rm -rf "${DISK_OPT}" "${DISK_FF_ESR}"
 mkdir -p "${DISK_OPT}"
-
-# Copy everything Alpine staged at /usr/lib/firefox-esr/ into /opt/firefox/.
-# This preserves Mozilla's expected internal layout (omni.ja, browser/,
-# defaults/, fonts/, etc.).
-cp -aL "${ROOTFS}/usr/lib/firefox-esr/." "${DISK_OPT}/" 2>/dev/null || \
-    cp -a  "${ROOTFS}/usr/lib/firefox-esr/." "${DISK_OPT}/"
-
-# Rename Alpine's "firefox-esr" → "firefox-bin" so the kernel pre-cache
-# path /disk/opt/firefox/firefox-bin works without kernel changes.  Also
-# create a "firefox" alias for any caller using the unsuffixed name.
-if [ -f "${DISK_OPT}/firefox-esr" ]; then
-    cp -f "${DISK_OPT}/firefox-esr" "${DISK_OPT}/firefox-bin"
-    cp -f "${DISK_OPT}/firefox-esr" "${DISK_OPT}/firefox"
-fi
-# firefox-esr-bin is an Alpine internal symlink to /usr/bin/firefox-esr (a
-# shell wrapper); strip it — we're using the resolved ELF directly.
-rm -f "${DISK_OPT}/firefox-esr-bin"
 
 # (c) Support libraries from Alpine's /usr/lib/.  Strip Alpine-specific
 # build helpers (apk db, pkgconfig data, header dirs) and keep only the
 # .so* files plus the directory structure.
 mkdir -p "${DISK_USR_LIB}"
-# Copy every regular file (cp -L derefs symlinks → real bytes under link name,
-# matching the FAT32-friendly approach used elsewhere in create-data-disk.sh).
-# We deliberately copy the whole /usr/lib tree (~120 MiB) so transitive deps
-# (icu, libnss/nspr/nssutil/smime/sqlite, ffi, ssl3, etc.) are all available.
+# We deliberately copy the whole /usr/lib tree (~325 MiB including the
+# /usr/lib/firefox-esr/ subdir = ~206 MiB) so transitive deps (icu, libnss /
+# nspr / nssutil / smime / sqlite, ffi, ssl3, GTK, libavcodec, ...) are all
+# available AND the canonical Mozilla tree lands at the DT_RUNPATH path.
+# `cp -aL` preserves hard-link relationships within the tree — Alpine ships
+# several library SONAMEs as hard links to the fully-versioned file
+# (libgtk-3.so.0 ↔ libgtk-3.so.0.2411.32, etc.).  Breaking those by
+# walking the tree file-by-file would inflate /usr/lib from ~120 MiB
+# (non-firefox-esr portion) to ~225 MiB.
 cp -aL "${ROOTFS}/usr/lib/." "${DISK_USR_LIB}/" 2>/dev/null || true
-# Drop the firefox-esr subdir from /usr/lib/ — we already staged it at
-# /opt/firefox/ above; keeping two copies would waste ~205 MiB.
-rm -rf "${DISK_USR_LIB}/firefox-esr"
 # Drop apk's bookkeeping; not useful at runtime.
-rm -rf "${DISK_USR_LIB}/apk" "${DISK_USR_LIB}/.." 2>/dev/null || true
+rm -rf "${DISK_USR_LIB}/apk" 2>/dev/null || true
+
+# Within ${DISK_FF_ESR}: rename Alpine's "firefox-esr" → "firefox-bin" so
+# callers that follow the launcher's readlink("/proc/self/exe") + "-bin"
+# convention resolve there.  Keep the original "firefox-esr" name as an
+# alias for any caller using Alpine's name.  firefox-esr-bin is an Alpine
+# internal symlink to /usr/bin/firefox-esr (a shell wrapper); strip it —
+# we are using the resolved ELF directly.
+if [ -f "${DISK_FF_ESR}/firefox-esr" ]; then
+    cp -f "${DISK_FF_ESR}/firefox-esr" "${DISK_FF_ESR}/firefox-bin"
+    cp -f "${DISK_FF_ESR}/firefox-esr" "${DISK_FF_ESR}/firefox"
+fi
+rm -f "${DISK_FF_ESR}/firefox-esr-bin"
+
+# Mirror firefox-bin into /disk/opt/firefox/ (kernel launch + pre-cache path
+# stability).  Do NOT mirror the .so files — DT_RUNPATH is /usr/lib/firefox-esr,
+# so a duplicate libxul at /opt/firefox/ would never be loaded and would waste
+# ~160 MiB of FAT32 capacity.
+cp -f "${DISK_FF_ESR}/firefox-bin" "${DISK_OPT}/firefox-bin"
+cp -f "${DISK_FF_ESR}/firefox-bin" "${DISK_OPT}/firefox"
 
 # (d) Etc — fontconfig / nss / dbus config that musl Firefox reads at runtime.
 mkdir -p "${DISK_DIR}/etc"
@@ -279,6 +320,19 @@ if [ ! -f "${DISK_LIB}/ld-musl-x86_64.so.1" ]; then
     echo "[FF-MUSL] ERROR: ${DISK_LIB}/ld-musl-x86_64.so.1 missing"
     exit 1
 fi
+# Verify the canonical Mozilla tree landed at DT_RUNPATH.  libxul.so under
+# /usr/lib/firefox-esr/ is the single most load-bearing file — every Mozilla
+# DSO dlopen indirects through DT_RUNPATH to that directory.  See readelf -d
+# output: firefox-bin, libxul.so, libmozsandbox.so all have
+# DT_RUNPATH=/usr/lib/firefox-esr per ELF gABI §5.4.
+if [ ! -f "${DISK_FF_ESR}/libxul.so" ]; then
+    echo "[FF-MUSL] ERROR: ${DISK_FF_ESR}/libxul.so missing — DT_RUNPATH lookup will fail"
+    exit 1
+fi
+if [ ! -f "${DISK_FF_ESR}/libmozsandbox.so" ]; then
+    echo "[FF-MUSL] ERROR: ${DISK_FF_ESR}/libmozsandbox.so missing — first DT_NEEDED of libxul will fail"
+    exit 1
+fi
 # Verify the base shared libs landed.  libz in particular is mandatory —
 # libxul DT_NEEDEDs it (via libpng16 / libxml2), and ld-musl will
 # exit_group on missing libz at first dlopen.  See PR #298 trial.
@@ -296,11 +350,14 @@ if [ -n "${MISSING_BASE_LIBS}" ]; then
 fi
 
 echo "[FF-MUSL] Staged:"
-echo "[FF-MUSL]   firefox-bin: $(stat -c%s "${FIREFOX_BIN}") bytes, musl PT_INTERP"
-echo "[FF-MUSL]   libxul.so:   $(stat -c%s "${DISK_OPT}/libxul.so") bytes"
-echo "[FF-MUSL]   ld-musl:     $(stat -c%s "${DISK_LIB}/ld-musl-x86_64.so.1") bytes"
-echo "[FF-MUSL]   libz.so.1:   $(stat -c%s "${DISK_LIB}/libz.so.1") bytes"
-echo "[FF-MUSL]   /lib:         $(du -sh "${DISK_LIB}" | cut -f1)"
-echo "[FF-MUSL]   /opt/firefox: $(du -sh "${DISK_OPT}" | cut -f1)"
-echo "[FF-MUSL]   /usr/lib:     $(du -sh "${DISK_USR_LIB}" | cut -f1)"
+echo "[FF-MUSL]   firefox-bin (launcher):  $(stat -c%s "${FIREFOX_BIN}") bytes, musl PT_INTERP"
+echo "[FF-MUSL]   firefox-bin (runpath):   $(stat -c%s "${DISK_FF_ESR}/firefox-bin") bytes"
+echo "[FF-MUSL]   libxul.so (runpath):     $(stat -c%s "${DISK_FF_ESR}/libxul.so") bytes"
+echo "[FF-MUSL]   libmozsandbox (runpath): $(stat -c%s "${DISK_FF_ESR}/libmozsandbox.so") bytes"
+echo "[FF-MUSL]   ld-musl:                 $(stat -c%s "${DISK_LIB}/ld-musl-x86_64.so.1") bytes"
+echo "[FF-MUSL]   libz.so.1:               $(stat -c%s "${DISK_LIB}/libz.so.1") bytes"
+echo "[FF-MUSL]   /lib:                    $(du -sh "${DISK_LIB}" | cut -f1)"
+echo "[FF-MUSL]   /opt/firefox (launcher): $(du -sh "${DISK_OPT}" | cut -f1)"
+echo "[FF-MUSL]   /usr/lib/firefox-esr:    $(du -sh "${DISK_FF_ESR}" | cut -f1)"
+echo "[FF-MUSL]   /usr/lib (total):        $(du -sh "${DISK_USR_LIB}" | cut -f1)"
 echo "[FF-MUSL] Done."

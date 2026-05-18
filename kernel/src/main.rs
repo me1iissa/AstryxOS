@@ -443,19 +443,25 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // later mmap()s these files, demand-paging hits the cache
             // (instant) instead of reading from disk (5+ minutes on WSL2/KVM).
             serial_println!("[FFTEST] Pre-populating page cache from disk (slow ATA PIO)...");
-            // We list both glibc and musl interpreter / libc paths.  Whichever
-            // variant is staged on the data disk resolves; the other returns
-            // 0 pages benignly (prepopulate_file → resolve_path Err → 0).
-            // /opt/firefox/firefox-bin and /opt/firefox/libxul.so are shared
-            // — install-firefox-musl.sh renames Alpine's firefox-esr binary
-            // to firefox-bin so this list works for both variants.
+            // We list both glibc and musl interpreter / libc paths plus both
+            // possible libxul.so locations.  Whichever variant is staged on
+            // the data disk resolves; the other returns 0 pages benignly
+            // (prepopulate_file → resolve_path Err → 0).
+            //
+            // libxul.so location by variant:
+            //   - glibc: /opt/firefox/libxul.so (kernel-internal staging path)
+            //   - musl : /usr/lib/firefox-esr/libxul.so (the DT_RUNPATH baked
+            //            into firefox-bin per readelf -d; ELF gABI §5.4)
+            // /opt/firefox/firefox-bin is mirrored for both variants so the
+            // kernel launch path stays stable.
             for path in &[
-                "/disk/lib64/ld-linux-x86-64.so.2",     // glibc — 236 KB
-                "/disk/lib/ld-musl-x86_64.so.1",        // musl  — 650 KB
-                "/disk/opt/firefox/firefox-bin",         // 671 KB — ~3s
-                "/disk/lib/x86_64-linux-gnu/libc.so.6",  // glibc — 2.0 MB
-                "/disk/lib/libc.musl-x86_64.so.1",       // musl  — symlink to ld-musl
-                "/disk/opt/firefox/libxul.so",           // 157 MB — ~10 min (but worth it)
+                "/disk/lib64/ld-linux-x86-64.so.2",         // glibc — 236 KB
+                "/disk/lib/ld-musl-x86_64.so.1",            // musl  — 650 KB
+                "/disk/opt/firefox/firefox-bin",            // 671 KB — ~3s
+                "/disk/lib/x86_64-linux-gnu/libc.so.6",     // glibc — 2.0 MB
+                "/disk/lib/libc.musl-x86_64.so.1",          // musl  — symlink to ld-musl
+                "/disk/opt/firefox/libxul.so",              // 157 MB — glibc variant
+                "/disk/usr/lib/firefox-esr/libxul.so",      // 130 MB — musl variant (DT_RUNPATH)
             ] {
                 let t0 = arch::x86_64::irq::get_ticks();
                 let pages = mm::cache::prepopulate_file(path);
