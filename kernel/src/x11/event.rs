@@ -215,7 +215,7 @@ pub fn encode_motion_notify(seq: u16, window: u32,
 pub fn encode_focus_in(seq: u16, window: u32) -> [u8; 32] {
     let mut b = [0u8; 32];
     b[0] = proto::EVENT_FOCUS_IN;
-    b[1] = 0; // detail = Ancestor (closest ancestor in focus change chain)
+    b[1] = 0; // detail = NotifyAncestor (0) per X11 protocol §FocusIn
     w16(&mut b, 2, seq);
     w32(&mut b, 4, window);
     b[8] = 0; // mode = Normal

@@ -1974,6 +1974,24 @@ pub fn run() -> ! {
     total += 1;
     if test_253_focus_in_out_events() { passed += 1; }
 
+    // ── Test 254: SendEvent BadWindow for unknown XID (H1) ───────────────
+    // Per X11 protocol §SendEvent, an explicit destination XID that no client
+    // owns must return BadWindow to the sender without delivering the event.
+    total += 1;
+    if test_254_send_event_bad_window() { passed += 1; }
+
+    // ── Test 255: SendEvent root respects event-mask filter (H2) ─────────
+    // Per X11 protocol §SendEvent, root delivery respects the event-mask
+    // filter: only clients that selected the matching mask on root receive it.
+    total += 1;
+    if test_255_send_event_root_mask_filter() { passed += 1; }
+
+    // ── Test 256: PropertyNotify root respects PropertyChangeMask (M1) ───
+    // Per X11 protocol §ChangeProperty, PropertyNotify on root is gated by
+    // PropertyChangeMask.  Only clients that selected it should receive it.
+    total += 1;
+    if test_256_property_notify_root_mask() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -17494,7 +17512,9 @@ fn test_253_focus_in_out_events() -> bool {
         crate::x11::poll();
     }
 
-    // Read FocusOut for A.
+    // Read FocusOut (for A) and FocusIn (for B).  Kernel socket buffering may
+    // deliver both 32-byte events in a single read returning 64 bytes; parse
+    // buf[0..32] for FocusOut and buf[32..64] for FocusIn deterministically.
     let mut buf2 = [0u8; 64];
     let n2 = unix::read(cfd, &mut buf2) as usize;
     if n2 < 32 {
@@ -17502,7 +17522,7 @@ fn test_253_focus_in_out_events() -> bool {
         unix::close(cfd);
         return false;
     }
-    test_println!("  SetInputFocus(wid_b) -> first event type=0x{:02x}", buf2[0]);
+    test_println!("  SetInputFocus(wid_b) -> read {} bytes, first event type=0x{:02x}", n2, buf2[0]);
     if buf2[0] != proto::EVENT_FOCUS_OUT {
         test_fail!("focus_events", "expected FocusOut (10) for wid_a got type={}", buf2[0]);
         unix::close(cfd);
@@ -17516,21 +17536,31 @@ fn test_253_focus_in_out_events() -> bool {
     }
     test_println!("  FocusOut for wid_a ✓");
 
-    // Read FocusIn for B.
-    let mut buf3 = [0u8; 64];
-    let n3 = unix::read(cfd, &mut buf3) as usize;
-    if n3 < 32 {
-        test_fail!("focus_events", "no FocusIn event for wid_b (n={})", n3);
+    // FocusIn for B — may arrive in the same read as FocusOut (bytes 32..64)
+    // or in a subsequent read.  Handle both cases.
+    let fi_buf: [u8; 32] = if n2 >= 64 {
+        // Both events arrived together.
+        let mut tmp = [0u8; 32];
+        tmp.copy_from_slice(&buf2[32..64]);
+        tmp
+    } else {
+        // Arrive separately; issue another read.
+        let mut buf3 = [0u8; 32];
+        let n3 = unix::read(cfd, &mut buf3) as usize;
+        if n3 < 32 {
+            test_fail!("focus_events", "no FocusIn event for wid_b (n={})", n3);
+            unix::close(cfd);
+            return false;
+        }
+        buf3
+    };
+    test_println!("  FocusIn event type=0x{:02x}", fi_buf[0]);
+    if fi_buf[0] != proto::EVENT_FOCUS_IN {
+        test_fail!("focus_events", "expected FocusIn (9) for wid_b got type={}", fi_buf[0]);
         unix::close(cfd);
         return false;
     }
-    test_println!("  second event type=0x{:02x}", buf3[0]);
-    if buf3[0] != proto::EVENT_FOCUS_IN {
-        test_fail!("focus_events", "expected FocusIn (9) for wid_b got type={}", buf3[0]);
-        unix::close(cfd);
-        return false;
-    }
-    let fi_win = u32::from_le_bytes([buf3[4], buf3[5], buf3[6], buf3[7]]);
+    let fi_win = u32::from_le_bytes([fi_buf[4], fi_buf[5], fi_buf[6], fi_buf[7]]);
     if fi_win != wid_b {
         test_fail!("focus_events", "FocusIn for wrong window: got {} want {}", fi_win, wid_b);
         unix::close(cfd);
@@ -17540,6 +17570,317 @@ fn test_253_focus_in_out_events() -> bool {
 
     unix::close(cfd);
     test_pass!("X11 FocusIn/FocusOut events delivered on SetInputFocus");
+    true
+}
+
+// ── Test 254: SendEvent BadWindow for unknown explicit XID ──────────────────
+//
+// Per X11 protocol §SendEvent: if the destination is an explicit window XID
+// that does not exist on any client, the server must return a BadWindow error
+// to the sender and must not deliver the event.
+
+fn test_254_send_event_bad_window() -> bool {
+    test_header!("X11 SendEvent BadWindow for unknown explicit XID");
+
+    use crate::x11::proto;
+    use crate::net::unix;
+
+    let cfd = unix::create(unix::SockKind::Stream, unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if cfd == u64::MAX { test_fail!("send_event_bad_win", "unix::create() failed"); return false; }
+    if unix::connect(cfd, b"/tmp/.X11-unix/X0\0", unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
+        test_fail!("send_event_bad_win", "connect failed");
+        unix::close(cfd);
+        return false;
+    }
+
+    // Perform X11 handshake.
+    let hello: [u8; 12] = [0x6C, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    unix::write(cfd, &hello);
+    crate::x11::poll();
+    let mut drain = [0u8; 512];
+    unix::read(cfd, &mut drain);
+
+    // Send SendEvent with a destination XID (0xDEAD_BEEF) that no client owns.
+    // Wire: opcode(1) propagate(1) length-words(2) dest(4) event-mask(4) event[32] = 44 bytes.
+    let bad_xid: u32 = 0xDEAD_BEEF;
+    let mut req = [0u8; 44];
+    req[0] = proto::OP_SEND_EVENT;
+    req[1] = 0; // propagate = false
+    proto::write_u16le(&mut req, 2, 11); // 44 / 4 = 11 words
+    proto::write_u32le(&mut req, 4, bad_xid);
+    proto::write_u32le(&mut req, 8, 0); // event_mask = 0
+    // event payload at [12..44]: type = ClientMessage (33), rest zeros.
+    req[12] = proto::EVENT_CLIENT_MESSAGE;
+    unix::write(cfd, &req);
+    crate::x11::poll();
+
+    // We expect a BadWindow error (code=3) back.
+    let mut resp = [0u8; 32];
+    let n = unix::read(cfd, &mut resp) as usize;
+    if n < 32 {
+        test_fail!("send_event_bad_win", "no response from server (n={})", n);
+        unix::close(cfd);
+        return false;
+    }
+    test_println!("  response[0]=0x{:02x} code={} opcode={}", resp[0], resp[1], resp[10]);
+    // resp[0] == 0: error reply; resp[1] == ERR_WINDOW (3); resp[10] == OP_SEND_EVENT (25).
+    if resp[0] != 0 {
+        test_fail!("send_event_bad_win", "expected error (0) got type={}", resp[0]);
+        unix::close(cfd);
+        return false;
+    }
+    if resp[1] != proto::ERR_WINDOW {
+        test_fail!("send_event_bad_win", "expected BadWindow ({}) got code={}", proto::ERR_WINDOW, resp[1]);
+        unix::close(cfd);
+        return false;
+    }
+    if resp[10] != proto::OP_SEND_EVENT {
+        test_fail!("send_event_bad_win", "error opcode field: expected {} got {}", proto::OP_SEND_EVENT, resp[10]);
+        unix::close(cfd);
+        return false;
+    }
+
+    unix::close(cfd);
+    test_pass!("X11 SendEvent BadWindow for unknown explicit XID");
+    true
+}
+
+// ── Test 255: SendEvent root delivery respects event-mask filter ─────────────
+//
+// Per X11 protocol §SendEvent, sending to the root window with a non-zero
+// event_mask must only deliver to clients whose root_event_mask intersects
+// the requested mask.  A client that has NOT selected the mask must NOT
+// receive the event.
+
+fn test_255_send_event_root_mask_filter() -> bool {
+    test_header!("X11 SendEvent root delivery respects event-mask filter");
+
+    use crate::x11::proto;
+    use crate::net::unix;
+
+    // Client A selects SubstructureNotifyMask (0x0008_0000) on root.
+    let cfd_a = unix::create(unix::SockKind::Stream, unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if cfd_a == u64::MAX { test_fail!("send_event_root_mask", "create A failed"); return false; }
+    if unix::connect(cfd_a, b"/tmp/.X11-unix/X0\0", unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
+        test_fail!("send_event_root_mask", "connect A failed");
+        unix::close(cfd_a);
+        return false;
+    }
+
+    // Client B does NOT select any mask — it should not receive the event.
+    let cfd_b = unix::create(unix::SockKind::Stream, unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if cfd_b == u64::MAX { test_fail!("send_event_root_mask", "create B failed"); unix::close(cfd_a); return false; }
+    if unix::connect(cfd_b, b"/tmp/.X11-unix/X0\0", unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
+        test_fail!("send_event_root_mask", "connect B failed");
+        unix::close(cfd_a); unix::close(cfd_b);
+        return false;
+    }
+
+    // Handshake for both.
+    let hello: [u8; 12] = [0x6C, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    unix::write(cfd_a, &hello);
+    unix::write(cfd_b, &hello);
+    crate::x11::poll();
+    let mut drain = [0u8; 512];
+    unix::read(cfd_a, &mut drain);
+    unix::read(cfd_b, &mut drain);
+
+    // Client A sets SubstructureNotifyMask on root.
+    {
+        let mut req = [0u8; 16];
+        req[0] = proto::OP_CHANGE_WINDOW_ATTRS;
+        req[2] = 4; // 16 bytes / 4 = 4 words
+        proto::write_u32le(&mut req, 4, proto::ROOT_WINDOW_ID);
+        proto::write_u32le(&mut req, 8, proto::CW_EVENT_MASK);
+        proto::write_u32le(&mut req, 12, proto::EVENT_MASK_SUBSTRUCTURE_NOTIFY);
+        unix::write(cfd_a, &req);
+        crate::x11::poll();
+    }
+
+    // A third client (sender) sends SendEvent to root with SubstructureNotifyMask.
+    let cfd_s = unix::create(unix::SockKind::Stream, unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if cfd_s == u64::MAX {
+        test_fail!("send_event_root_mask", "create sender failed");
+        unix::close(cfd_a); unix::close(cfd_b);
+        return false;
+    }
+    if unix::connect(cfd_s, b"/tmp/.X11-unix/X0\0", unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
+        test_fail!("send_event_root_mask", "connect sender failed");
+        unix::close(cfd_a); unix::close(cfd_b); unix::close(cfd_s);
+        return false;
+    }
+    unix::write(cfd_s, &hello);
+    crate::x11::poll();
+    unix::read(cfd_s, &mut drain);
+
+    // Send a ConfigureNotify (22) to root with SubstructureNotifyMask.
+    let mut req = [0u8; 44];
+    req[0] = proto::OP_SEND_EVENT;
+    req[1] = 0;
+    proto::write_u16le(&mut req, 2, 11); // 44 / 4 = 11
+    proto::write_u32le(&mut req, 4, proto::ROOT_WINDOW_ID);
+    proto::write_u32le(&mut req, 8, proto::EVENT_MASK_SUBSTRUCTURE_NOTIFY);
+    req[12] = proto::EVENT_CONFIGURE_NOTIFY | 0x80; // synthetic ConfigureNotify
+    unix::write(cfd_s, &req);
+    crate::x11::poll();
+
+    // Client A MUST receive the event.
+    let mut buf_a = [0u8; 32];
+    let na = unix::read(cfd_a, &mut buf_a) as usize;
+    test_println!("  client A read {} bytes, type=0x{:02x}", na, if na >= 1 { buf_a[0] } else { 0 });
+    if na < 32 || buf_a[0] != (proto::EVENT_CONFIGURE_NOTIFY | 0x80) {
+        test_fail!("send_event_root_mask",
+            "client A expected ConfigureNotify|0x80 ({}) got type={} (n={})",
+            proto::EVENT_CONFIGURE_NOTIFY | 0x80,
+            if na >= 1 { buf_a[0] } else { 0 }, na);
+        unix::close(cfd_a); unix::close(cfd_b); unix::close(cfd_s);
+        return false;
+    }
+    test_println!("  client A received event ✓");
+
+    // Client B MUST NOT receive the event.  A zero-length read (or no bytes
+    // in the buffer) indicates nothing was delivered.
+    let mut buf_b = [0u8; 32];
+    let nb = unix::read(cfd_b, &mut buf_b) as usize;
+    test_println!("  client B read {} bytes", nb);
+    if nb >= 32 {
+        test_fail!("send_event_root_mask",
+            "client B received unexpected event (type=0x{:02x}), mask filter broken",
+            buf_b[0]);
+        unix::close(cfd_a); unix::close(cfd_b); unix::close(cfd_s);
+        return false;
+    }
+    test_println!("  client B received no event ✓");
+
+    unix::close(cfd_a); unix::close(cfd_b); unix::close(cfd_s);
+    test_pass!("X11 SendEvent root delivery respects event-mask filter");
+    true
+}
+
+// ── Test 256: PropertyNotify root respects PropertyChangeMask ───────────────
+//
+// Per X11 protocol §ChangeProperty, PropertyNotify on the root window is
+// gated by PropertyChangeMask.  Client A selects it; client B does not.
+// A ChangeProperty on root must deliver PropertyNotify only to A.
+
+fn test_256_property_notify_root_mask() -> bool {
+    test_header!("X11 PropertyNotify root gated by PropertyChangeMask (M1)");
+
+    use crate::x11::proto;
+    use crate::net::unix;
+
+    // Client A selects PropertyChangeMask on root.
+    let cfd_a = unix::create(unix::SockKind::Stream, unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if cfd_a == u64::MAX { test_fail!("prop_notify_root", "create A failed"); return false; }
+    if unix::connect(cfd_a, b"/tmp/.X11-unix/X0\0", unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
+        test_fail!("prop_notify_root", "connect A failed");
+        unix::close(cfd_a);
+        return false;
+    }
+
+    // Client B does NOT select PropertyChangeMask.
+    let cfd_b = unix::create(unix::SockKind::Stream, unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if cfd_b == u64::MAX { test_fail!("prop_notify_root", "create B failed"); unix::close(cfd_a); return false; }
+    if unix::connect(cfd_b, b"/tmp/.X11-unix/X0\0", unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
+        test_fail!("prop_notify_root", "connect B failed");
+        unix::close(cfd_a); unix::close(cfd_b);
+        return false;
+    }
+
+    let hello: [u8; 12] = [0x6C, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    unix::write(cfd_a, &hello);
+    unix::write(cfd_b, &hello);
+    crate::x11::poll();
+    let mut drain = [0u8; 512];
+    unix::read(cfd_a, &mut drain);
+    unix::read(cfd_b, &mut drain);
+
+    // Client A selects PropertyChangeMask on root via ChangeWindowAttributes.
+    {
+        let mut req = [0u8; 16];
+        req[0] = proto::OP_CHANGE_WINDOW_ATTRS;
+        req[2] = 4;
+        proto::write_u32le(&mut req, 4, proto::ROOT_WINDOW_ID);
+        proto::write_u32le(&mut req, 8, proto::CW_EVENT_MASK);
+        proto::write_u32le(&mut req, 12, proto::EVENT_MASK_PROPERTY_CHANGE);
+        unix::write(cfd_a, &req);
+        crate::x11::poll();
+    }
+
+    // Intern a unique atom for this test property.
+    // "_TEST_PROP_NOTIFY_250" = 20 bytes, no padding needed (already 4-aligned).
+    // Wire: opcode(1) only-if-exists(1) length(2) name-len(2) pad(2) name[20] = 28 bytes.
+    let prop_name = b"_TEST_PROP_NOTIFY_250";
+    let mut ireq = [0u8; 28]; // 8 header + 20 name
+    ireq[0] = proto::OP_INTERN_ATOM;
+    ireq[1] = 0; // only-if-exists = false
+    proto::write_u16le(&mut ireq, 2, 7); // 28 / 4 = 7 words
+    proto::write_u16le(&mut ireq, 4, prop_name.len() as u16);
+    ireq[8..8+prop_name.len()].copy_from_slice(prop_name);
+    unix::write(cfd_a, &ireq);
+    crate::x11::poll();
+    let mut rep = [0u8; 32];
+    unix::read(cfd_a, &mut rep);
+    let prop_atom = proto::read_u32le(&rep, 8);
+    if prop_atom == 0 {
+        test_fail!("prop_notify_root", "InternAtom returned 0");
+        unix::close(cfd_a); unix::close(cfd_b);
+        return false;
+    }
+    test_println!("  interned atom {} for _TEST_PROP_NOTIFY_250", prop_atom);
+
+    // Client A issues ChangeProperty on root window.
+    // Wire: opcode(1) mode(1) length(2) wid(4) atom(4) type(4) format(1) pad(3) nunits(4) data(4).
+    // Total: 24 + 4 (data "test") = 28 bytes = 7 words.
+    let mut cp = [0u8; 28];
+    cp[0] = proto::OP_CHANGE_PROPERTY;
+    cp[1] = 0; // mode = Replace
+    proto::write_u16le(&mut cp, 2, 7); // 28 / 4 = 7 words
+    proto::write_u32le(&mut cp, 4, proto::ROOT_WINDOW_ID);
+    proto::write_u32le(&mut cp, 8, prop_atom);
+    proto::write_u32le(&mut cp, 12, crate::x11::atoms::ATOM_STRING);
+    cp[16] = 8; // format = 8
+    proto::write_u32le(&mut cp, 20, 4); // 4 units = 4 bytes
+    cp[24] = b't'; cp[25] = b'e'; cp[26] = b's'; cp[27] = b't';
+    unix::write(cfd_a, &cp);
+    crate::x11::poll();
+
+    // Client A MUST receive PropertyNotify.
+    let mut buf_a = [0u8; 32];
+    let na = unix::read(cfd_a, &mut buf_a) as usize;
+    test_println!("  client A read {} bytes, type=0x{:02x}", na, if na >= 1 { buf_a[0] } else { 0 });
+    if na < 32 || buf_a[0] != proto::EVENT_PROPERTY_NOTIFY {
+        test_fail!("prop_notify_root",
+            "client A expected PropertyNotify ({}) got type={} (n={})",
+            proto::EVENT_PROPERTY_NOTIFY,
+            if na >= 1 { buf_a[0] } else { 0 }, na);
+        unix::close(cfd_a); unix::close(cfd_b);
+        return false;
+    }
+    let recv_atom = proto::read_u32le(&buf_a, 8);
+    if recv_atom != prop_atom {
+        test_fail!("prop_notify_root",
+            "PropertyNotify atom mismatch: got {} want {}", recv_atom, prop_atom);
+        unix::close(cfd_a); unix::close(cfd_b);
+        return false;
+    }
+    test_println!("  client A received PropertyNotify for atom {} ✓", recv_atom);
+
+    // Client B MUST NOT receive PropertyNotify.
+    let mut buf_b = [0u8; 32];
+    let nb = unix::read(cfd_b, &mut buf_b) as usize;
+    test_println!("  client B read {} bytes", nb);
+    if nb >= 32 {
+        test_fail!("prop_notify_root",
+            "client B received unexpected event (type=0x{:02x}), mask filter broken",
+            buf_b[0]);
+        unix::close(cfd_a); unix::close(cfd_b);
+        return false;
+    }
+    test_println!("  client B received no PropertyNotify ✓");
+
+    unix::close(cfd_a); unix::close(cfd_b);
+    test_pass!("X11 PropertyNotify root gated by PropertyChangeMask (M1)");
     true
 }
 
