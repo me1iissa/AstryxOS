@@ -107,6 +107,15 @@ struct TidSlot {
     /// frame-pointer chain off-tick on the kdb thread without taking any
     /// per-thread lock.
     last_user_rbp: AtomicU64,
+    /// Last user-mode RSP observed alongside `last_user_rip`.  Required by
+    /// `rip-trace`'s RSP-scan fallback for binaries built with
+    /// `-fomit-frame-pointer` (the firefox-bin/libxul case as of 2026-05):
+    /// when the RBP-chain walk terminates at depth ≤ 1 because RBP is being
+    /// used as a general-purpose register, the scanner falls back to
+    /// inspecting words on the user stack for canonical user-code addresses
+    /// — the same heuristic the `[SC-USTACK]` exit-time dumper has used
+    /// since 2026-04.
+    last_user_rsp: AtomicU64,
     /// Monotonically incremented every time `last_user_rip` is updated.
     /// `rip-trace` reads this between successive samples to decide whether
     /// the kernel has produced a fresh observation since the previous
@@ -124,6 +133,7 @@ static TID_TABLE: [TidSlot; TID_SLOTS] = [
         last_syscall_arg0: AtomicU64::new(0),
         last_user_rip: AtomicU64::new(0),
         last_user_rbp: AtomicU64::new(0),
+        last_user_rsp: AtomicU64::new(0),
         rip_sample_seq: AtomicU64::new(0),
     } }; TID_SLOTS
 ];
@@ -226,6 +236,24 @@ pub fn read_user_rip(tid: u64) -> Option<(u64, u64, u64)> {
     Some((rip, rbp, seq))
 }
 
+/// Read the per-TID `(rip, rbp, rsp, seq)` snapshot.  Same atomic-loads
+/// contract as `read_user_rip` (returns `None` if a writer interleaved or
+/// the slot is owned by a different TID); used by `rip-trace`'s RSP-scan
+/// fallback for `-fomit-frame-pointer` binaries where the RBP chain
+/// terminates immediately.  See `op_rip_trace` for the scan heuristic.
+pub fn read_user_rip_rsp(tid: u64) -> Option<(u64, u64, u64, u64)> {
+    let slot = slot_for(tid);
+    if slot.tid.load(Ordering::Relaxed) != tid { return None; }
+    let seq = slot.rip_sample_seq.load(Ordering::Relaxed);
+    if seq == 0 { return None; }
+    let rip = slot.last_user_rip.load(Ordering::Relaxed);
+    let rbp = slot.last_user_rbp.load(Ordering::Relaxed);
+    let rsp = slot.last_user_rsp.load(Ordering::Relaxed);
+    let seq2 = slot.rip_sample_seq.load(Ordering::Relaxed);
+    if seq != seq2 { return None; }
+    Some((rip, rbp, rsp, seq))
+}
+
 /// Software walk a user-VA `u64` under `cr3`.  Exposed for kdb
 /// `rip-trace` so the kdb thread (running on its own kernel stack) can
 /// walk a *foreign* thread's frame-pointer chain without taking any
@@ -293,6 +321,7 @@ pub fn maybe_sample(tick: u64, frame: &InterruptFrame, saved_rbp: u64) {
     // additionally orders against any future kdb-thread Acquire.
     slot.last_user_rip.store(frame.rip, Ordering::Relaxed);
     slot.last_user_rbp.store(saved_rbp, Ordering::Relaxed);
+    slot.last_user_rsp.store(frame.rsp, Ordering::Relaxed);
     slot.rip_sample_seq.fetch_add(1, Ordering::Release);
 
     let last_sc   = slot.last_syscall_tick.load(Ordering::Relaxed);
