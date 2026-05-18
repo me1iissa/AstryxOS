@@ -21,8 +21,20 @@
 //! embedded in the kernel. This source serves as reference documentation.
 
 #![no_std]
+#![cfg_attr(test, allow(unused_imports))]
+
+#[cfg(test)]
+extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 use core::arch::asm;
+
+pub mod auxv;
+pub mod errno;
+pub mod posix;
+
+pub use errno::{from_kernel_ret, from_kernel_ret_signed, SysError, SysResult};
 
 pub const SYS_EXIT: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
@@ -322,4 +334,54 @@ pub fn munmap(addr: u64, length: u64) -> u64 {
 /// Sleep for a given number of milliseconds.
 pub fn nanosleep(millis: u64) -> u64 {
     unsafe { syscall1(SYS_NANOSLEEP, millis) }
+}
+
+// ── Raw Linux-numbered wrappers ─────────────────────────────────────
+//
+// These reach the kernel via the Linux syscall numbers in `linux::*`.
+// They are intended for AstryxOS-native binaries running under the
+// Linux personality (where the kernel dispatches by Linux number) or
+// for shared tooling that wants to drive both ABIs uniformly.  Each
+// wrapper here is a thin shim; for typed-error variants see `posix::`.
+
+/// `mprotect(addr, len, prot)` — change page-range protection.
+///
+/// Returns the kernel's raw `i64` (negative errno on failure, 0 on
+/// success).  For a `SysResult`-returning variant see
+/// [`posix::mprotect`].
+pub fn mprotect_raw(addr: *mut u8, len: usize, prot: u32) -> i64 {
+    unsafe {
+        syscall3(linux::SYS_MPROTECT, addr as u64, len as u64, prot as u64) as i64
+    }
+}
+
+/// `clock_gettime(clk_id, ts)` — kernel fast clock read.
+///
+/// Returns the kernel's raw `i64`.  Prefer [`posix::clock_gettime`] in
+/// new code; that wrapper provides a typed error and is well-suited to
+/// callers that hold the vDSO function pointer.
+pub fn clock_gettime_raw(clk_id: i32, ts: *mut u8) -> i64 {
+    unsafe { syscall2(linux::SYS_CLOCK_GETTIME, clk_id as u64, ts as u64) as i64 }
+}
+
+/// `tgkill(tgid, tid, sig)` — deliver signal to a specific thread.
+pub fn tgkill_raw(tgid: i32, tid: i32, sig: i32) -> i64 {
+    unsafe {
+        syscall3(linux::SYS_TGKILL, tgid as u64, tid as u64, sig as u64) as i64
+    }
+}
+
+/// `set_tid_address(tidptr)` — register a clear-child-TID address.
+pub fn set_tid_address_raw(tidptr: *mut i32) -> i64 {
+    unsafe { syscall1(linux::SYS_SET_TID_ADDRESS, tidptr as u64) as i64 }
+}
+
+/// `sched_yield()` via the Linux syscall number.
+pub fn sched_yield_raw() -> i64 {
+    unsafe { syscall0(linux::SYS_SCHED_YIELD) as i64 }
+}
+
+/// `gettimeofday(tv, NULL)`.
+pub fn gettimeofday_raw(tv: *mut u8) -> i64 {
+    unsafe { syscall2(linux::SYS_GETTIMEOFDAY, tv as u64, 0) as i64 }
 }
