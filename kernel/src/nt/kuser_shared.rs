@@ -68,8 +68,8 @@ pub const OFF_NT_MINOR_VERSION:                 usize = 0x270; // ULONG
 pub const OFF_PROCESSOR_FEATURES:               usize = 0x274; // BOOLEAN[64]
 pub const OFF_NUMBER_OF_PHYSICAL_PAGES:         usize = 0x2E8; // ULONG
 pub const OFF_SAFE_BOOT_MODE:                   usize = 0x2EC; // BOOLEAN
-pub const OFF_SYSTEM_CALL:                      usize = 0x308; // ULONG
 pub const OFF_QPC_FREQUENCY:                    usize = 0x300; // LONGLONG
+pub const OFF_SYSTEM_CALL:                      usize = 0x308; // ULONG
 pub const OFF_TICK_COUNT:                       usize = 0x320; // KSYSTEM_TIME / TickCountQuad union
 pub const OFF_COOKIE:                           usize = 0x330; // ULONG
 pub const OFF_ACTIVE_PROCESSOR_COUNT:           usize = 0x3C0; // ULONG
@@ -121,12 +121,13 @@ fn kernel_va() -> u64 {
     ptr as u64
 }
 
-/// Physical address of the static shared page.  The `KUSER_SHARED_PAGE`
-/// static lives in the kernel `.bss` (high-half kernel image, linked at
-/// `KERNEL_VIRT_BASE + KERNEL_PHYS_BASE`); the kernel image is contiguous
-/// in physical memory per `linker.ld`, so `phys = va - KERNEL_VIRT_BASE`.
+/// Physical address of the static shared page.  Resolved via
+/// [`crate::mm::vmm::virt_to_phys`] rather than a linker-base subtraction
+/// so the result stays correct if the kernel image is relocated or the
+/// `.bss` is moved into a separately-mapped region by the linker script.
 pub fn physical_address() -> u64 {
-    kernel_va().wrapping_sub(astryx_shared::KERNEL_VIRT_BASE)
+    crate::mm::vmm::virt_to_phys(kernel_va())
+        .expect("KUSER_SHARED_PAGE must be mapped in the kernel address space")
 }
 
 #[inline]
@@ -147,24 +148,50 @@ unsafe fn write_u64(off: usize, val: u64) {
     core::ptr::write_unaligned(page_ptr().add(off) as *mut u64, val);
 }
 
-/// Write a `KSYSTEM_TIME` value at `off`.  Performs the standard
-/// "High1Time, LowPart, High2Time" three-store sequence with a release
-/// fence between the two High writes so concurrent ring-3 readers can
-/// detect a torn read (per the published torn-read avoidance pattern; see
-/// the `KSYSTEM_TIME` reference in the structure definition cited at the
-/// top of this file).
+/// Write a `KSYSTEM_TIME` value at `off`.
+///
+/// The canonical NT writer protocol for the `KSYSTEM_TIME` torn-read
+/// avoidance pattern is a strictly-ordered three-store sequence:
+///
+///   1. **High2Time** (offset +8)
+///   2. **LowPart**   (offset +0)
+///   3. **High1Time** (offset +4)
+///
+/// with a compiler fence between each store so the compiler cannot
+/// reorder the writes.  The pairing reader protocol is:
+///
+/// ```ignore
+///   loop {
+///       let h1 = read(off + 4);          // High1
+///       compiler_fence(SeqCst);
+///       let lo = read(off + 0);          // LowPart
+///       compiler_fence(SeqCst);
+///       let h2 = read(off + 8);          // High2
+///       if h1 == h2 { return ((h1 as u64) << 32) | lo as u64; }
+///   }
+/// ```
+///
+/// Why this order matters: a reader that observes `H1 != H2` knows the
+/// writer was mid-update and retries.  If the writer published the new
+/// `High1Time` first (the inverted order), a reader could see
+/// `H1 == H2 == new_high` while `LowPart` is still the old value —
+/// passing the consistency check on stale data and surfacing as a
+/// ~4 GiB jump in `FILETIME` / `TickCount` to ring-3 callers.  See the
+/// `KSYSTEM_TIME` declaration in `ntddk.h` and Intel SDM Vol. 3A §8.2
+/// for the underlying memory-ordering model (single-writer is sufficient
+/// on x86-TSO with compiler fences; no `LOCK` prefix needed).
 #[inline]
 unsafe fn write_ksystem_time(off: usize, value_100ns: u64) {
     let low = value_100ns as u32;
     let high = (value_100ns >> 32) as u32;
-    // Step 1: High1Time
-    write_u32(off + 4, high);
-    core::sync::atomic::fence(Ordering::Release);
-    // Step 2: LowPart
-    write_u32(off + 0, low);
-    core::sync::atomic::fence(Ordering::Release);
-    // Step 3: High2Time
+    // Step 1: High2Time (off + 8)
     write_u32(off + 8, high);
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    // Step 2: LowPart (off + 0)
+    write_u32(off + 0, low);
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    // Step 3: High1Time (off + 4)
+    write_u32(off + 4, high);
 }
 
 /// Initialise the static page with the version / processor-feature fields
@@ -236,9 +263,13 @@ pub fn init() {
         // ── SystemCall: 0 (we do not advertise an altered syscall view) ───
         write_u32(OFF_SYSTEM_CALL, 0);
 
-        // ── Cookie: kernel RNG (or 0 if RNG unavailable) ──────────────────
+        // ── Cookie: deterministic ASCII tag (TODO: reseed from RNG) ───────
         // The cookie is documented as "Cookie for encoding pointers system
         // wide"; user-mode CRTs read it but tolerate any non-zero value.
+        // TODO(security): reseed from the kernel CSPRNG once the RNG surface
+        // stabilises so the cookie is unpredictable across boots — the
+        // current literal is deterministic and unsuitable for production
+        // pointer-encoding use.
         write_u32(OFF_COOKIE, 0x6261_5354 /* "TSab" ASCII tag */);
 
         // ── NtSystemRoot: "C:\\Windows" in UTF-16LE ────────────────────────
@@ -302,28 +333,49 @@ pub fn update_time_fields() {
     }
 }
 
+/// Read a `KSYSTEM_TIME` field at `off` using the canonical
+/// torn-read-safe protocol.  Pairs with [`write_ksystem_time`]:
+///
+///   1. Sample `High1Time` (off + 4)
+///   2. Sample `LowPart`   (off + 0)
+///   3. Sample `High2Time` (off + 8)
+///   4. If `H1 == H2`, return `(H1 << 32) | LowPart`; else retry.
+///
+/// With the writer publishing `H2 → L → H1`, observing `H1 == H2` means
+/// the writer either hadn't started a new update (both halves still old)
+/// or had completed it (both halves new) — and in either case `LowPart`
+/// matches the high halves we read.  See the `KSYSTEM_TIME` declaration
+/// in `ntddk.h` (`<https://learn.microsoft.com/windows-hardware/drivers/ddi/ntddk/ns-ntddk-kuser_shared_data>`).
+#[inline]
+unsafe fn read_ksystem_time(off: usize) -> u64 {
+    loop {
+        let h1 = core::ptr::read_unaligned(page_ptr().add(off + 4) as *const u32);
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        let lo = core::ptr::read_unaligned(page_ptr().add(off + 0) as *const u32);
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        let h2 = core::ptr::read_unaligned(page_ptr().add(off + 8) as *const u32);
+        if h1 == h2 {
+            return ((h1 as u64) << 32) | lo as u64;
+        }
+        // Torn read — writer was mid-update; spin and retry.  The writer
+        // is a single store-store-store sequence with no I/O between, so
+        // we never block here for more than a handful of instructions.
+        core::hint::spin_loop();
+    }
+}
+
 /// Read the current 64-bit SystemTime field (NT FILETIME, 100 ns ticks
 /// since 1601-01-01 UTC).  Used by `NtQuerySystemTime`.
 pub fn current_system_time() -> i64 {
     update_time_fields();
-    unsafe {
-        core::ptr::read_unaligned(page_ptr().add(OFF_SYSTEM_TIME + 0) as *const u32) as i64
-            | ((core::ptr::read_unaligned(page_ptr().add(OFF_SYSTEM_TIME + 4) as *const u32) as i64) << 32)
-    }
+    unsafe { read_ksystem_time(OFF_SYSTEM_TIME) as i64 }
 }
 
 /// Read the current 64-bit TickCountQuad field (milliseconds since boot).
 /// Mirrors `GetTickCount64` semantics from <https://learn.microsoft.com/windows/win32/api/sysinfoapi/nf-sysinfoapi-gettickcount64>.
 pub fn current_tick_count64() -> u64 {
     update_time_fields();
-    unsafe {
-        // LowPart at OFF+0, High2Time at OFF+8 — read in the documented
-        // torn-read-safe order.  The shared page guarantees High1Time ==
-        // High2Time when the writer (`update_time_fields`) is quiescent.
-        let lo = core::ptr::read_unaligned(page_ptr().add(OFF_TICK_COUNT + 0) as *const u32) as u64;
-        let hi = core::ptr::read_unaligned(page_ptr().add(OFF_TICK_COUNT + 8) as *const u32) as u64;
-        (hi << 32) | lo
-    }
+    unsafe { read_ksystem_time(OFF_TICK_COUNT) }
 }
 
 #[cfg(any(feature = "test-mode", feature = "firefox-test"))]
