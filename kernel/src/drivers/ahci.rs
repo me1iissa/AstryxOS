@@ -82,6 +82,10 @@ const FIS_TYPE_REG_H2D: u8 = 0x27;
 const ATA_CMD_READ_DMA_EXT: u8 = 0x25;
 /// WRITE DMA EXT (48-bit LBA).
 const ATA_CMD_WRITE_DMA_EXT: u8 = 0x35;
+/// FLUSH CACHE EXT (48-bit LBA) — T13 ACS-3 §7.10.  Forces the drive's
+/// write-back cache to non-volatile media.  No data transfer, no LBA, no
+/// sector count — just the command opcode in the H2D Register FIS.
+const ATA_CMD_FLUSH_CACHE_EXT: u8 = 0xEA;
 /// IDENTIFY DEVICE — returns 256 words (512 bytes) of device information.
 /// Defined in T13 ACS-3 §7.12.
 const ATA_CMD_IDENTIFY: u8 = 0xEC;
@@ -818,4 +822,49 @@ pub fn write_sectors(port: u8, lba: u64, count: u16, data: &[u8]) -> Result<(), 
     }
 
     Ok(())
+}
+
+/// Issue a FLUSH CACHE EXT command (ATA 0xEA, T13 ACS-3 §7.10) on the
+/// specified port and wait for completion.  This forces the drive's
+/// write-back cache (if any) to non-volatile media — the durability
+/// guarantee `fsync(2)` / `NtFlushBuffersFile` callers expect.
+///
+/// Some drives can take seconds to flush a full cache (T13 ACS-3 leaves
+/// the upper bound open).  The shared `issue_command` polling budget is
+/// 10M loop iterations; under TCG that is plenty for QEMU's modeled
+/// flush which completes instantly, and under real hardware it gives
+/// the drive multiple seconds before we bail out.
+///
+/// No data transfer is involved (PRDTL = 0, no sector count, no LBA);
+/// only the command opcode and the LBA-mode bit in byte 7 of the H2D
+/// Register FIS need to be set, matching the ATA-8 protocol.
+pub fn flush_cache(port: u8) -> Result<(), &'static str> {
+    let abar = *AHCI_BASE.lock();
+    if abar == 0 {
+        return Err("AHCI not initialized");
+    }
+    let pb = port_base(abar, port);
+
+    let ports = AHCI_PORT_STATE.lock();
+    let ps = ports.iter().find(|p| p.port_num == port)
+        .ok_or("AHCI flush: port not initialized")?;
+    let clb_phys = ps.clb_phys;
+    let ctbl_phys = ps.ctbl_phys;
+    drop(ports);
+
+    wait_port_idle(pb)?;
+
+    // SAFETY: ctbl/clb come from per-port DMA state allocated at init time
+    // and are owned by this driver for the device's lifetime.
+    unsafe {
+        // FLUSH CACHE EXT takes no LBA and no sector count, but
+        // build_h2d_fis defaults the unused fields to zero which is fine.
+        build_h2d_fis(ctbl_phys, ATA_CMD_FLUSH_CACHE_EXT, 0, 0);
+        // PRDTL = 0 — no data buffer.  The HBA still expects a valid
+        // command header.  We pass write=false; the W bit only matters
+        // when PRDTL > 0 (it sets the data direction for the DMA).
+        setup_cmd_header(clb_phys, ctbl_phys, false, 0);
+    }
+
+    issue_command(pb)
 }
