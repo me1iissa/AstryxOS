@@ -760,3 +760,30 @@ pub fn virt_to_phys_in(pml4_phys: u64, virt_addr: u64) -> Option<u64> {
         Some((pt_entry & ADDR_MASK) | offset)
     }
 }
+
+/// Look up the raw 4 KiB-leaf page-table entry for `virt_addr` in the
+/// given PML4.  Returns `None` if any level is non-present or if the
+/// translation terminates at a 2 MiB / 1 GiB huge page.  Used by tests
+/// that need to assert on flag bits (PAGE_USER / PAGE_WRITABLE / NX).
+pub fn lookup_pte_in(pml4_phys: u64, virt_addr: u64) -> Option<u64> {
+    let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
+    let pt_idx = ((virt_addr >> 12) & 0x1FF) as usize;
+
+    unsafe {
+        let pml4_entry = *p2v(pml4_phys).add(pml4_idx);
+        if pml4_entry & PAGE_PRESENT == 0 { return None; }
+
+        let pdpt_entry = *p2v(pml4_entry & ADDR_MASK).add(pdpt_idx);
+        if pdpt_entry & PAGE_PRESENT == 0 || pdpt_entry & PAGE_HUGE != 0 { return None; }
+
+        let pd_entry = *p2v(pdpt_entry & ADDR_MASK).add(pd_idx);
+        if pd_entry & PAGE_PRESENT == 0 || pd_entry & PAGE_HUGE != 0 { return None; }
+
+        let pt_entry = *p2v(pd_entry & ADDR_MASK).add(pt_idx);
+        if pt_entry & PAGE_PRESENT == 0 { return None; }
+
+        Some(pt_entry)
+    }
+}

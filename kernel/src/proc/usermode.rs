@@ -509,7 +509,36 @@ pub fn create_win32_process(name: &str, pe_data: &[u8]) -> Result<proc::Pid, cra
         name:    "[nt-trampoline]",
     });
 
-    // ── 3. Allocate a minimal TEB at 0x7FFE_F000 ─────────────────────────────
+    // ── 3a. Map KUSER_SHARED_DATA at the canonical user VA 0x7FFE_0000 ───────
+    // The kernel owns one statically-allocated 4 KiB page (see
+    // `crate::nt::kuser_shared`) that backs `KUSER_SHARED_DATA` for every
+    // Win32 process.  Map it read-only/NX into the new address space at
+    // the documented canonical VA so user-mode reads of time, version,
+    // and processor-feature fields work without an INT 0x2E round trip.
+    //
+    // Reference: `_KUSER_SHARED_DATA at 7ffe0000` — WinDbg `!kuser`
+    // extension (<https://learn.microsoft.com/windows-hardware/drivers/debuggercmds/-kuser>).
+    let kuser_phys = crate::nt::kuser_shared::physical_address();
+    if !crate::mm::vmm::map_page_in(
+        user_cr3,
+        crate::nt::kuser_shared::KUSER_SHARED_DATA_VA,
+        kuser_phys,
+        // PAGE_PRESENT | PAGE_USER (read-only, NX) — user-mode must not
+        // be able to forge fields the kernel reads back.  No WRITE bit.
+        crate::mm::vmm::PAGE_PRESENT | crate::mm::vmm::PAGE_USER | crate::mm::vmm::PAGE_NO_EXECUTE,
+    ) {
+        return Err(crate::proc::pe::PeError::MappingFailed);
+    }
+    let _ = vm_space.insert_vma(crate::mm::vma::VmArea {
+        base:    crate::nt::kuser_shared::KUSER_SHARED_DATA_VA,
+        length:  crate::mm::pmm::PAGE_SIZE as u64,
+        prot:    crate::mm::vma::PROT_READ,
+        flags:   crate::mm::vma::MAP_PRIVATE | crate::mm::vma::MAP_ANONYMOUS,
+        backing: crate::mm::vma::VmBacking::Anonymous,
+        name:    "[kuser-shared]",
+    });
+
+    // ── 3b. Allocate a minimal TEB at 0x7FFE_F000 ─────────────────────────────
     const TEB_VA: u64 = 0x7FFE_F000;
     let teb_phys = crate::mm::pmm::alloc_page()
         .ok_or(crate::proc::pe::PeError::MappingFailed)?;

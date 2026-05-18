@@ -70,11 +70,6 @@
       "name": "alias_test",
       "reason": "deterministic page-aliasing reproducer for W8 race; tolerated on TCG CI until W215 closure",
       "tracking": "#328"
-    },
-    {
-      "name": "kernel32 stubs",
-      "reason": "WriteConsoleA stub regression post-2026-05-18; tolerated until NT/Win32 console-stub re-audit",
-      "tracking": null
     }
   ]
 }

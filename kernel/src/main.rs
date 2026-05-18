@@ -196,6 +196,8 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     serial_println!("[Aether] Phase 9c: Registry OK");
     lpc::init();
     serial_println!("[Aether] Phase 9c: LPC OK");
+    nt::init();
+    serial_println!("[Aether] Phase 9c: NT subsystem (KUSER_SHARED_DATA) OK");
     win32::init();
     serial_println!("[Aether] Phase 9d: Win32 subsystem OK");
     serial_println!("[Aether] Phase 9: NT Executive OK");
