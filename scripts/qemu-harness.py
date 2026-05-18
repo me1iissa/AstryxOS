@@ -62,6 +62,19 @@ QGA bridge (requires --features qga on start):
     python3 scripts/qemu-harness.py qga-info <sid> [--timeout S]
     python3 scripts/qemu-harness.py qga-sync <sid> [--id N] [--timeout S]
     python3 scripts/qemu-harness.py qga-file-read <sid> --path <P> [--max-bytes N]
+
+CI / multi-trial aggregation:
+    python3 scripts/qemu-harness.py ci-run [--features F] [--timeout-ms MS]
+                                           [--allow-fail REGEX] [--no-kvm]
+    python3 scripts/qemu-harness.py soak --trials N [--features F]
+                                           [--use-allowlist] [--allow-fail R]
+                                           [--timeout-ms MS] [--no-kvm]
+    python3 scripts/qemu-harness.py allowlist list
+    python3 scripts/qemu-harness.py allowlist regex
+    python3 scripts/qemu-harness.py allowlist add --name N --reason R
+                                                    [--tracking T] [--regex]
+    python3 scripts/qemu-harness.py allowlist remove --name N
+    python3 scripts/qemu-harness.py allowlist check --serial-log PATH
 """
 
 import argparse
@@ -1471,6 +1484,491 @@ def cmd_ci_run(args):
             f"{len(real_failures)} real-fail",
             file=sys.stderr,
         )
+
+    return 0 if overall_ok else 1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# allowlist — manage ci/allow-fail.json (structured CI expected-fail registry)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Replaces a hand-edited regex string baked into .github/workflows/build.yml
+# with a structured JSON file at ci/allow-fail.json.  Agents and CI can
+# query / edit entries through one-shot argv calls (no manual YAML editing
+# in the workflow when a test like WriteConsoleA legitimately flips to
+# expected-fail mode while a fix lands).
+#
+# File schema:
+#   {
+#     "entries": [
+#       {"name": "<test name substring>",
+#        "reason": "<one-liner>",
+#        "tracking": "<issue / PR ref>" | null,
+#        "regex": false}              # optional; if true, name is a regex
+#     ]
+#   }
+#
+# The workflow renders this into the regex that `ci-run --allow-fail`
+# consumes by invoking `qemu-harness.py allowlist regex`.
+
+_ALLOWLIST_PATH_DEFAULT = "ci/allow-fail.json"
+
+
+def _allowlist_path(args) -> Path:
+    """Resolve the allowlist file path.
+
+    Order of precedence:
+      1. --file argument
+      2. ASTRYX_ALLOWLIST environment variable
+      3. <repo root>/ci/allow-fail.json   (repo root inferred from this script)
+    """
+    p = getattr(args, "file", None)
+    if p:
+        return Path(p).expanduser().resolve()
+    env = os.environ.get("ASTRYX_ALLOWLIST")
+    if env:
+        return Path(env).expanduser().resolve()
+    # Two levels up from scripts/qemu-harness.py → repo root.
+    return (Path(__file__).resolve().parent.parent / _ALLOWLIST_PATH_DEFAULT).resolve()
+
+
+def _allowlist_load(path: Path) -> dict:
+    """Load and minimally validate the allowlist JSON file.
+
+    Duplicate entries (same name + same regex-flag) are silently dropped,
+    keeping the first occurrence and emitting a warning to stderr per
+    dropped duplicate.  Without dedup the rendered regex would contain
+    repeated alternatives (``x|x``); harmless to the matcher but a sign
+    the file has been edited concurrently or by hand-merge.  Warn-and-
+    keep-first chosen over hard-reject so a live CI run is not blocked by
+    a typo a human can fix at leisure.
+    """
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {"entries": []}
+    except (OSError, json.JSONDecodeError) as e:
+        _err(f"cannot read allowlist {path}: {e}")
+    if not isinstance(data, dict):
+        _err(f"allowlist {path} is not a JSON object")
+    entries = data.get("entries", [])
+    if not isinstance(entries, list):
+        _err(f"allowlist {path}: 'entries' is not a list")
+    # De-duplicate, keeping first occurrence.  Key on (name, regex-flag)
+    # so a literal-name entry and a regex-name entry that happen to share
+    # the same string are not collapsed (they target different patterns).
+    seen: set = set()
+    deduped: list = []
+    for e in entries:
+        if not isinstance(e, dict):
+            # Preserve odd entries so the validation path stays loud
+            # downstream rather than silently dropping malformed data.
+            deduped.append(e)
+            continue
+        key = (e.get("name", ""), bool(e.get("regex")))
+        if key in seen:
+            print(f"[allowlist] {path}: dropping duplicate entry "
+                  f"name={key[0]!r} regex={key[1]} (keeping first)",
+                  file=sys.stderr)
+            continue
+        seen.add(key)
+        deduped.append(e)
+    # Drop any inline _comment field for consumers; tolerate extras.
+    return {"entries": deduped}
+
+
+def _allowlist_save(path: Path, data: dict, preserve_comment: bool = True) -> None:
+    """Save the allowlist back to disk.
+
+    Preserves any top-level "_comment" field that may already be present in
+    the file (the schema is described in a "_comment" array at the head of
+    ci/allow-fail.json — we don't want one-off edits to wipe it).
+    """
+    existing_comment = None
+    if preserve_comment and path.exists():
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                old = json.load(fh)
+            if isinstance(old, dict) and "_comment" in old:
+                existing_comment = old["_comment"]
+        except (OSError, json.JSONDecodeError):
+            pass
+    out: dict = {}
+    if existing_comment is not None:
+        out["_comment"] = existing_comment
+    out["entries"] = data.get("entries", [])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(out, indent=2) + "\n")
+    tmp.replace(path)
+
+
+_ALLOWLIST_NEVER_MATCH_SENTINEL = "(?!)"
+"""Sentinel regex returned when the allowlist renders to no usable entries.
+
+`(?!)` is a negative lookahead with an empty inner pattern; the empty
+pattern always matches, so the negative lookahead can never succeed.
+Spliced into the workflow's `--allow-fail "\\[FAIL\\] (...)"` template it
+yields a pattern that matches nothing — the only safe default when the
+allowlist is empty.
+
+Using a sentinel (rather than the empty string) closes a silent-CI-green
+hole: bash splicing `""` into `(...)` produces `()`, an empty group which
+matches every `[FAIL]` line.  See workflow comment in build.yml.
+"""
+
+
+def _allowlist_to_regex(entries: list) -> str:
+    """Render entries → an alternation regex suitable for ci-run --allow-fail.
+
+    Each entry's "name" is escaped (re.escape) unless "regex": true is set,
+    in which case it is taken verbatim.
+
+    When there are no usable entries we return a never-match sentinel
+    (``(?!)``) rather than an empty string — splicing ``""`` into the
+    workflow's ``\\[FAIL\\] (REGEX)`` template would produce ``()``, an
+    empty group that matches every ``[FAIL]`` line and silently turns a
+    wiped allowlist into a green CI build.  The sentinel matches nothing,
+    preserving the intended "tolerate no failures" semantics.
+    """
+    parts = []
+    for e in entries:
+        name = e.get("name", "")
+        if not name:
+            continue
+        if e.get("regex"):
+            parts.append(f"(?:{name})")
+        else:
+            parts.append(re.escape(name))
+    if not parts:
+        return _ALLOWLIST_NEVER_MATCH_SENTINEL
+    return "|".join(parts)
+
+
+def cmd_allowlist(args):
+    """
+    Manage ci/allow-fail.json (the structured CI expected-fail registry).
+
+    Subcommands:
+      list                     — print all entries as JSON
+      regex                    — print the rendered allow-fail regex string
+                                 (stdout has NO trailing newline; suitable
+                                 for `$(... allowlist regex)` in shell).
+      add --name N [--reason R] [--tracking T] [--regex]
+                               — append a new entry; refuses duplicates
+      remove --name N          — remove the first matching entry
+      check --serial-log P     — scan a serial log and report which [FAIL]
+                                 lines are matched by the allowlist, which
+                                 are not, and any entries that did NOT match
+                                 anything (potential drift).
+
+    All forms accept --file PATH to override the default ci/allow-fail.json.
+    """
+    sub = getattr(args, "alsub", None)
+    path = _allowlist_path(args)
+    data = _allowlist_load(path)
+    entries = data["entries"]
+
+    if sub == "list":
+        _out({"path": str(path), "entries": entries})
+        return 0
+
+    if sub == "regex":
+        # Print verbatim (no trailing newline) so callers can splice into
+        # other commands without trimming.  Also expose a JSON form on
+        # stderr so the call is debuggable.
+        rx = _allowlist_to_regex(entries)
+        sys.stdout.write(rx)
+        sys.stdout.flush()
+        print(f"[allowlist] {len(entries)} entry/entries, regex len={len(rx)}",
+              file=sys.stderr)
+        return 0
+
+    if sub == "add":
+        name = getattr(args, "name", "") or ""
+        if not name:
+            _err("allowlist add: --name is required")
+        for e in entries:
+            if e.get("name") == name and bool(e.get("regex")) == bool(getattr(args, "regex_flag", False)):
+                _out({"ok": False, "error": "duplicate", "entry": e,
+                      "path": str(path)})
+                return 1
+        new_entry: dict = {
+            "name": name,
+            "reason": getattr(args, "reason", "") or "",
+            "tracking": getattr(args, "tracking", None),
+        }
+        if getattr(args, "regex_flag", False):
+            new_entry["regex"] = True
+        entries.append(new_entry)
+        _allowlist_save(path, {"entries": entries})
+        _out({"ok": True, "added": new_entry, "total": len(entries),
+              "path": str(path)})
+        return 0
+
+    if sub == "remove":
+        name = getattr(args, "name", "") or ""
+        if not name:
+            _err("allowlist remove: --name is required")
+        for i, e in enumerate(entries):
+            if e.get("name") == name:
+                removed = entries.pop(i)
+                _allowlist_save(path, {"entries": entries})
+                _out({"ok": True, "removed": removed,
+                      "remaining": len(entries), "path": str(path)})
+                return 0
+        _out({"ok": False, "error": "not_found", "name": name,
+              "path": str(path)})
+        return 1
+
+    if sub == "check":
+        serial = getattr(args, "serial_log", "") or ""
+        if not serial:
+            _err("allowlist check: --serial-log is required")
+        if not Path(serial).exists():
+            _err(f"allowlist check: serial log {serial} does not exist")
+        # Compile per-entry regexes so we can attribute matches back to the
+        # specific allowlist line.
+        compiled: list = []
+        for e in entries:
+            pat = e.get("name", "")
+            if not pat:
+                continue
+            if not e.get("regex"):
+                pat = re.escape(pat)
+            try:
+                compiled.append((re.compile(pat), e))
+            except re.error as ex:
+                _err(f"allowlist check: bad regex for {e!r}: {ex}")
+        fail_re = re.compile(r"\[FAIL\]\s*(.+?)\s*$")
+        matched_entries: set = set()
+        allowed: list = []
+        unallowed: list = []
+        try:
+            with open(serial, "r", errors="replace") as fh:
+                for ln in fh:
+                    m = fail_re.search(ln)
+                    if not m:
+                        continue
+                    name = m.group(1)
+                    hit = None
+                    for (rx, e) in compiled:
+                        if rx.search(name):
+                            hit = e
+                            break
+                    if hit is not None:
+                        matched_entries.add(hit.get("name", ""))
+                        allowed.append({"name": name, "by": hit.get("name", "")})
+                    else:
+                        unallowed.append({"name": name})
+        except OSError as ex:
+            _err(f"allowlist check: cannot read {serial}: {ex}")
+        unused = [e for e in entries
+                  if e.get("name", "") and e.get("name") not in matched_entries]
+        _out({
+            "ok": len(unallowed) == 0,
+            "serial_log": serial,
+            "allowed_failures": allowed,
+            "unallowed_failures": unallowed,
+            "unused_entries": unused,
+            "total_entries": len(entries),
+        })
+        return 0 if len(unallowed) == 0 else 1
+
+    _err(f"allowlist: unknown subcommand {sub!r}")
+    return 1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# soak — run N trials of ci-run and aggregate results
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Cross-walk diagnostics repeatedly need 3–5 sequential ci-run invocations
+# with the results aggregated.  Doing this by hand wastes dispatch time and
+# the resulting per-trial JSON has to be glued together manually.
+#
+# `soak` does it once, structurally:
+#   * runs N trials of ci-run with the same features + allow-fail
+#   * builds the kernel ONCE up front (--no-build for the trials themselves)
+#   * collects per-trial pass / fail / real_failures + exit_cause
+#   * computes a flake report: tests that pass in some trials and fail in
+#     others (the most actionable signal for race investigations)
+#
+# Output schema (additive — extra keys are fine for callers):
+#   {
+#     "ok":              bool,                  # all N trials had ok=true
+#     "trials":          int,                   # N
+#     "trials_ok":       int,                   # how many had ok=true
+#     "features":        str,
+#     "per_trial":       [{"trial": i, "ok": ..., "passed": ..., ...}, ...],
+#     "flaky_tests":     [{"name": "...", "pass": k, "fail": N-k}, ...],
+#     "consistent_fail": [{"name": "...", "trials": N}, ...],
+#     "exit_causes":     {"clean": k, "panic": j, ...}
+#   }
+
+def cmd_soak(args):
+    """
+    Run ci-run N times and aggregate results.
+
+    Example:
+      python3 scripts/qemu-harness.py soak \\
+          --trials 3 \\
+          --features test-mode \\
+          --timeout-ms 900000 \\
+          --use-allowlist
+    """
+    import types
+    import io
+
+    trials = max(1, int(getattr(args, "trials", 3) or 3))
+    features = args.features or "test-mode"
+    timeout_ms = int(getattr(args, "timeout_ms", 900000) or 900000)
+    no_kvm = bool(getattr(args, "no_kvm", False))
+
+    # Resolve allow-fail: either explicit --allow-fail, or render from the
+    # allowlist file if --use-allowlist was passed.  An explicit --allow-fail
+    # always wins.
+    allow_fail = getattr(args, "allow_fail", "") or ""
+    if not allow_fail and getattr(args, "use_allowlist", False):
+        path = _allowlist_path(args)
+        data = _allowlist_load(path)
+        allow_fail = _allowlist_to_regex(data["entries"])
+        print(f"[soak] using allowlist {path} → {len(data['entries'])} entries",
+              file=sys.stderr)
+
+    # Single up-front build (mirrors what ci-run would do on trial 1) so the
+    # trials only differ in QEMU launch.  --no-build is force-passed to the
+    # per-trial ci-run calls.
+    no_build_outer = bool(getattr(args, "no_build", False))
+    if not no_build_outer:
+        print(f"[soak] building kernel once for {trials} trials ...",
+              file=sys.stderr)
+        ok = _build(features)
+        if not ok:
+            result = {"ok": False, "error": "build_failed",
+                      "features": features, "trials": trials}
+            print(json.dumps(result, indent=2))
+            return 1
+
+    per_trial: list = []
+    exit_causes: dict = {}
+    # Per-test fail counts across trials, indexed by test name.
+    fail_counts: dict = {}
+
+    for i in range(1, trials + 1):
+        print(f"[soak] === trial {i}/{trials} ===", file=sys.stderr)
+        ci_args = types.SimpleNamespace(
+            features=features,
+            no_build=True,            # always reuse the up-front build
+            timeout_ms=timeout_ms,
+            allow_fail=allow_fail,
+            no_kvm=no_kvm,
+        )
+        # Capture ci-run's stdout JSON (the function prints the JSON itself).
+        # Redirect stdout to a buffer, then parse it back.
+        #
+        # cmd_ci_run delegates to cmd_start, which calls _err() / sys.exit()
+        # on hard errors (QEMU spawn failure, missing data.img, frozen-ESP
+        # FileNotFoundError, etc.).  Without the outer try/except the first
+        # such failure would abort the entire soak before any aggregation —
+        # the worst possible outcome for a cross-walk diagnostic where the
+        # whole point is repeat sampling.  Catch SystemExit (and any other
+        # BaseException short of KeyboardInterrupt) and synthesise a
+        # trial_aborted record so the remaining trials still run.
+        _orig_stdout = sys.stdout
+        captured = io.StringIO()
+        sys.stdout = captured
+        # Snapshot sessions before the trial so we can best-effort clean up
+        # a session that the failing cmd_start may have left behind.
+        sids_before = {p.stem for p in HARNESS_DIR.glob("*.json")}
+        rc: int = 0
+        aborted_cause: str = ""
+        try:
+            try:
+                rc = cmd_ci_run(ci_args)
+            finally:
+                sys.stdout = _orig_stdout
+        except SystemExit as ex:
+            rc = int(ex.code) if isinstance(ex.code, int) else 1
+            aborted_cause = f"system_exit code={ex.code!r}"
+        except KeyboardInterrupt:
+            # Honour Ctrl-C immediately — don't bury it as a trial abort.
+            sys.stdout = _orig_stdout
+            raise
+        except BaseException as ex:  # noqa: BLE001 — intentional broad catch
+            rc = 1
+            aborted_cause = f"{type(ex).__name__}: {ex}"
+        raw = captured.getvalue().strip()
+        if aborted_cause:
+            # Best-effort: tear down any QEMU session the failing trial
+            # leaked so we don't accumulate zombies across trials.  Any
+            # new session file appearing during the trial is presumed
+            # ours (concurrent dispatch on this host is rare and the
+            # alternative is a leak).
+            sids_after = {p.stem for p in HARNESS_DIR.glob("*.json")}
+            for leaked_sid in sids_after - sids_before:
+                try:
+                    cmd_stop(types.SimpleNamespace(sid=leaked_sid))
+                except BaseException as cleanup_ex:  # noqa: BLE001
+                    print(f"[soak] cleanup of leaked sid={leaked_sid} "
+                          f"failed: {cleanup_ex}", file=sys.stderr)
+            obj = {
+                "ok": False,
+                "error": "trial_aborted",
+                "exit_cause": "trial_aborted",
+                "abort_cause": aborted_cause,
+                "stdout_tail": raw[:400],
+            }
+            print(f"[soak] trial {i} aborted: {aborted_cause}",
+                  file=sys.stderr)
+        else:
+            try:
+                obj = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                obj = {"_unparsable_stdout": raw[:400]}
+        obj["trial"] = i
+        obj["rc"] = rc
+        per_trial.append(obj)
+
+        cause = obj.get("exit_cause", "unknown")
+        exit_causes[cause] = exit_causes.get(cause, 0) + 1
+
+        for name in obj.get("real_failures", []) or []:
+            fail_counts[name] = fail_counts.get(name, 0) + 1
+
+    # Flake report: tests that failed in some but not all trials.
+    flaky: list = []
+    consistent_fail: list = []
+    for name, fc in fail_counts.items():
+        if fc == trials:
+            consistent_fail.append({"name": name, "trials": fc})
+        else:
+            flaky.append({"name": name, "fail": fc, "pass": trials - fc})
+
+    trials_ok = sum(1 for t in per_trial if t.get("ok") is True)
+    overall_ok = trials_ok == trials
+
+    result = {
+        "ok": overall_ok,
+        "trials": trials,
+        "trials_ok": trials_ok,
+        "features": features,
+        "allow_fail": allow_fail,
+        "per_trial": per_trial,
+        "flaky_tests": sorted(flaky, key=lambda x: (-x["fail"], x["name"])),
+        "consistent_fail": consistent_fail,
+        "exit_causes": exit_causes,
+    }
+    print(json.dumps(result, indent=2))
+
+    if not overall_ok:
+        print(f"[soak] FAILED — {trials_ok}/{trials} trials ok; "
+              f"flaky={len(flaky)} consistent_fail={len(consistent_fail)}",
+              file=sys.stderr)
+    else:
+        print(f"[soak] PASSED — {trials_ok}/{trials} trials ok",
+              file=sys.stderr)
 
     return 0 if overall_ok else 1
 
@@ -7553,6 +8051,65 @@ def main():
     p_ci.add_argument("--no-kvm", dest="no_kvm", action="store_true",
                       help="Disable KVM (GitHub runners have no /dev/kvm)")
 
+    # allowlist — manage ci/allow-fail.json (structured CI expected-fail list)
+    p_al = sub.add_parser(
+        "allowlist",
+        help="Manage ci/allow-fail.json (the structured CI expected-fail "
+             "registry). Render to regex, add/remove entries, audit a serial "
+             "log for drift. Replaces hand-edited regex in workflow files.",
+    )
+    p_al.add_argument("--file", default=None,
+                       help="Override allowlist path (default: ci/allow-fail.json)")
+    al_sub = p_al.add_subparsers(dest="alsub", required=True)
+    al_sub.add_parser("list", help="Print all entries as JSON")
+    al_sub.add_parser("regex", help="Render entries → alternation regex on stdout")
+    p_al_add = al_sub.add_parser("add", help="Append a new entry")
+    p_al_add.add_argument("--name", required=True,
+                          help="Test name (or regex if --regex)")
+    p_al_add.add_argument("--reason", default="",
+                          help="Short reason for tolerating the failure")
+    p_al_add.add_argument("--tracking", default=None,
+                          help="Issue or PR reference (e.g. #41)")
+    p_al_add.add_argument("--regex", dest="regex_flag", action="store_true",
+                          help="Treat --name as a regex, not a literal substring")
+    p_al_rm = al_sub.add_parser("remove", help="Remove the first matching entry")
+    p_al_rm.add_argument("--name", required=True,
+                         help="Test name to remove (exact match against 'name' field)")
+    p_al_chk = al_sub.add_parser(
+        "check",
+        help="Audit a serial log: which [FAIL] lines are/aren't covered, "
+             "and which allowlist entries did NOT match anything (drift).",
+    )
+    p_al_chk.add_argument("--serial-log", dest="serial_log", required=True,
+                          help="Path to a serial log to scan")
+
+    # soak — run N trials of ci-run and aggregate results (flake report)
+    p_soak = sub.add_parser(
+        "soak",
+        help="Run ci-run N times, aggregate pass/fail counts, detect "
+             "flaky tests (pass in some trials and fail in others). "
+             "Builds the kernel once up front; trials reuse the build.",
+    )
+    p_soak.add_argument("--trials", type=int, default=3,
+                         help="Number of ci-run trials to execute (default: 3)")
+    p_soak.add_argument("--features", default="test-mode", metavar="FLAGS",
+                         help="Kernel feature flags (default: test-mode)")
+    p_soak.add_argument("--no-build", action="store_true", dest="no_build",
+                         help="Skip the up-front build; reuse existing kernel.bin")
+    p_soak.add_argument("--timeout-ms", type=int, default=900000,
+                         dest="timeout_ms",
+                         help="Per-trial budget in ms (default 900000 = 15 min)")
+    p_soak.add_argument("--allow-fail", default="", metavar="REGEX",
+                         dest="allow_fail",
+                         help="Explicit allow-fail regex (overrides --use-allowlist)")
+    p_soak.add_argument("--use-allowlist", action="store_true",
+                         dest="use_allowlist",
+                         help="Render ci/allow-fail.json into the allow-fail regex")
+    p_soak.add_argument("--file", default=None,
+                         help="Override allowlist path (used with --use-allowlist)")
+    p_soak.add_argument("--no-kvm", dest="no_kvm", action="store_true",
+                         help="Disable KVM (GitHub runners have no /dev/kvm)")
+
     # check: run `cargo check` against a feature-flag combination without
     # spinning up QEMU.  Used by hotfix verification sweeps that need to
     # confirm a regression is closed across N feature combos before
@@ -7584,8 +8141,10 @@ def main():
     args = parser.parse_args()
 
     dispatch = {
-        "ci-run": cmd_ci_run,
-        "check":  cmd_check,
+        "ci-run":    cmd_ci_run,
+        "allowlist": cmd_allowlist,
+        "soak":      cmd_soak,
+        "check":     cmd_check,
         "start":  cmd_start,
         "stop":   cmd_stop,
         "list":   cmd_list,
