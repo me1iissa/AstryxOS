@@ -426,7 +426,7 @@ pub fn schedule() {
         //   - last_cpu match (cache-warm): +1
         //   - no match: +0
         //
-        // INVARIANT (W101 saga-closer): a CPU MUST NEVER pick an idle thread
+        // INVARIANT (POSIX SCHED_OTHER hardening): a CPU MUST NEVER pick an idle thread
         // while a non-idle Ready peer exists.  POSIX SCHED_OTHER and sched(7)
         // both require that the per-CPU idle thread is the "schedule of last
         // resort" — it runs ONLY when no runnable user/kernel work is

@@ -1859,7 +1859,7 @@ pub fn run() -> ! {
         if test_241_kdb_rip_trace_shape() { passed += 1; }
     }
 
-    // ── Test 242: scheduler picker non-idle precedence (W101 saga-closer) ──
+    // ── Test 242: scheduler picker non-idle precedence (POSIX SCHED_OTHER) ──
     // Verifies the picker invariant added in this PR: a CPU must never
     // pick an idle thread while a non-idle Ready peer exists on that CPU.
     // The test spawns N PRIORITY_NORMAL workers that sleep+yield in a loop,
@@ -31584,9 +31584,9 @@ fn test_241_kdb_rip_trace_shape() -> bool {
     true
 }
 
-// ── Test 242: scheduler picker non-idle precedence (W101 saga-closer) ──────
+// ── Test 242: scheduler picker non-idle precedence (POSIX SCHED_OTHER) ──────
 //
-// Regression test for the W101 scheduler-starvation saga.  The pre-fix
+// Regression test for the idle-thread-as-last-resort invariant.  The pre-fix
 // picker iterated all Ready peers in one pass and chose the highest-
 // scoring candidate.  On a 2-CPU system the BSP idle thread (TID 0,
 // PRIORITY_IDLE, cpu_affinity=Some(0)) and the AP idle thread
@@ -31617,7 +31617,7 @@ fn test_241_kdb_rip_trace_shape() -> bool {
 fn test_242_sched_picker_non_idle_precedence() -> bool {
     use core::sync::atomic::{AtomicU32, Ordering};
 
-    test_header!("scheduler picker non-idle precedence (W101 saga-closer)");
+    test_header!("scheduler picker non-idle precedence (POSIX SCHED_OTHER)");
 
     // Shared counter: each worker increments it once after completing its loops.
     static DONE_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -31748,6 +31748,6 @@ fn test_242_sched_picker_non_idle_precedence() -> bool {
     }
 
     test_println!("  all {} workers completed {} cycles each ✓", N_WORKERS, ITERS);
-    test_pass!("scheduler picker non-idle precedence (W101 saga-closer)");
+    test_pass!("scheduler picker non-idle precedence (POSIX SCHED_OTHER)");
     true
 }

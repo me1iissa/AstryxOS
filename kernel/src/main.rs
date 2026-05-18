@@ -571,8 +571,8 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 }
 
                 // Yield CPU 0 so the scheduler can run Ready peers (Mozilla
-                // workers etc.) here instead of sitting idle.  W101 saga-
-                // closer: without this yield, the BSP polling loop runs
+                // workers etc.) here instead of sitting idle.  Without
+                // this yield, the BSP polling loop runs
                 // forever in Ring 0; the timer ISR's check_reschedule()
                 // path only fires from Ring 3 (see arch/x86_64/irq.rs), so
                 // Ring-0 idle never enters schedule() on its own and Ready
