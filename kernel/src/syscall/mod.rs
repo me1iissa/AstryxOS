@@ -582,8 +582,36 @@ pub fn init_ap() {
         // Fix truncated function pointer from mcmodel=kernel.
         crate::hal::wrmsr(0xC000_0082, crate::proc::thread::fixup_fn_ptr(syscall_entry as *const () as u64));
 
-        // IA32_FMASK — RFLAGS mask on syscall (clear IF, TF, DF)
-        crate::hal::wrmsr(0xC000_0084, 0x700);
+        // IA32_FMASK — RFLAGS bits to clear on SYSCALL entry.
+        //
+        // Per Intel SDM Vol. 3A §6.8.8 (SYSCALL flag-masking) every bit set in
+        // FMASK is cleared in RFLAGS by the CPU as part of the SYSCALL
+        // transition into ring 0.  We mask:
+        //   - bit  8 (TF) — kernel must not run with single-step on a user-
+        //                   controlled bit.
+        //   - bit  9 (IF) — kernel must enter with interrupts disabled until
+        //                   the entry stub has switched to the kernel stack.
+        //   - bit 10 (DF) — System V AMD64 ABI requires DF=0 on call boundaries.
+        //   - bit 18 (AC) — CWE-269 / CWE-693.  Without this bit masked, an
+        //                   unprivileged ring-3 process can set EFLAGS.AC=1
+        //                   from userspace (the AC bit is not privileged) and
+        //                   issue SYSCALL.  The kernel then runs every code-
+        //                   path that lacks an explicit UserGuard with SMAP
+        //                   silently disabled, converting any latent
+        //                   unbracketed user-pointer dereference from a
+        //                   fail-stop fault into an arbitrary-kernel-write
+        //                   primitive.  Masking AC here forces the kernel to
+        //                   enter with AC=0 regardless of the user RFLAGS,
+        //                   so SMAP only relaxes via an explicit STAC from
+        //                   inside [`crate::arch::x86_64::smap::UserGuard`].
+        //                   The companion fix at the IDT-gate level
+        //                   (SMAP-gated CLAC prologue at the top of every
+        //                   ring-3-callable IDT stub in
+        //                   `kernel/src/arch/x86_64/idt.rs`) covers the
+        //                   INT 0x80 / INT 0x2E / exception entry paths,
+        //                   which bypass FMASK.
+        const FMASK: u64 = 0x40700;
+        crate::hal::wrmsr(0xC000_0084, FMASK);
 
         // ── Per-CPU data for SWAPGS ─────────────────────────────────
         // Set IA32_KERNEL_GS_BASE (0xC000_0102) to this CPU's slot in

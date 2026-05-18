@@ -124,9 +124,64 @@ pub unsafe fn clac_if_smap() {
     }
 }
 
+/// EFLAGS.AC — bit 18 per Intel SDM Vol. 1 §3.4.3 / Vol. 3A §2.5.
+/// Used by `UserGuard::new` to detect whether the current kernel
+/// codepath is already inside a STAC bracket (AC=1) so the new guard
+/// can nest as a passenger instead of issuing its own STAC/CLAC pair.
+const RFLAGS_AC: u64 = 1 << 18;
+
+/// Read the current RFLAGS via `pushfq` / `pop`.  Lifted out of
+/// `UserGuard::new` to keep that hot path branch-predictable.
+#[inline(always)]
+unsafe fn rflags() -> u64 {
+    let f: u64;
+    core::arch::asm!(
+        "pushfq",
+        "pop {0}",
+        out(reg) f,
+        options(nomem, preserves_flags),
+    );
+    f
+}
+
 /// RAII bracket for a user-pointer access region.  Sets AC on
-/// construction (when SMAP is active) and clears it on drop, including
-/// on a panic / fault unwind exit path.
+/// construction (when SMAP is active **and AC was not already set**)
+/// and clears it on drop, including on a panic / fault unwind exit
+/// path.
+///
+/// # Nesting (nest-safe behaviour)
+///
+/// Per Intel SDM Vol. 3A §4.6.1 and Vol. 2A (CLAC/STAC entries), AC is
+/// a single global EFLAGS bit on the executing CPU — there is no
+/// hardware "nest count".  Naively pairing every guard's `new` with a
+/// `Drop` that issues CLAC produces a real correctness bug whenever
+/// the inner callee constructs its own guard: when the inner guard
+/// drops it clears AC, but the **outer** caller still expects AC=1
+/// for the remainder of its scope, and a subsequent user-pointer
+/// dereference under the (logically still open) outer bracket faults
+/// with `[SMAP/FAULT] code=0x2 cr2=<user-VA> rflags AC=0`.
+///
+/// Concrete observed failure mode (post-PR #286, KVM
+/// `firefox-test,kdb,syscall-trace`):
+///
+/// ```text
+///   recvmsg arm:        let _g_outer = UserGuard::new();   // STAC → AC=1
+///                       read_msg(unix_id, buf)             // inner call:
+///                         unix::pop():
+///                           let _g_inner = UserGuard::new(); // already AC=1
+///                           memcpy(...);
+///                         } // _g_inner drops → CLAC → AC=0  ← bug
+///                       write user msg_flags;              // ← faults
+///                     } // _g_outer drops → CLAC (already clear)
+/// ```
+///
+/// Fix: on construction, sample EFLAGS.AC.  If AC was already 1, this
+/// guard is a **passenger** — it issues neither STAC nor CLAC, and
+/// `Drop` is a no-op.  Only the **outermost** guard (the one that
+/// flipped AC from 0 to 1) issues the matching CLAC at drop.  This
+/// matches the established Linux-kernel `user_access_begin` /
+/// `user_access_end` semantics where nesting is documented as
+/// expected behaviour rather than UB.
 ///
 /// # Usage
 ///
@@ -135,7 +190,7 @@ pub unsafe fn clac_if_smap() {
 /// let val = unsafe {
 ///     let _g = UserGuard::new();
 ///     core::ptr::read_volatile(user_ptr)
-/// }; // CLAC fires on `_g` drop here.
+/// }; // CLAC fires on `_g` drop here (if this is the outermost guard).
 /// ```
 ///
 /// # Safety
@@ -147,12 +202,18 @@ pub unsafe fn clac_if_smap() {
 ///    kernel-VA cannot slip through this guard.
 /// 2. Confine the guard's scope to the minimum needed for the user
 ///    access — anything else risks an unintended bypass.
-/// 3. NOT recurse into a kernel-only path while holding the guard, for
-///    the same reason.
+/// 3. Avoid recursing into a kernel-only path that itself performs
+///    unrelated user-pointer dereferences (those should be confined
+///    to their own bracket; this is a correctness-of-scope concern,
+///    not a soundness concern, since AC is preserved across nesting).
 pub struct UserGuard {
-    /// `true` if construction actually issued STAC.  Drop only issues
-    /// the matching CLAC in that case, so a nested guard on a non-SMAP
-    /// CPU collapses to two relaxed loads.
+    /// `true` if construction actually issued STAC and therefore owns
+    /// the matching CLAC.  `false` for two cases:
+    ///   1. SMAP is disabled on this CPU.
+    ///   2. AC was already set on entry (this guard is nested inside
+    ///      another open bracket).
+    /// In both cases `Drop` is a no-op for STAC/CLAC and the guard
+    /// collapses to a pair of compiler fences.
     armed: bool,
 }
 
@@ -164,7 +225,16 @@ impl UserGuard {
     /// user-VA, not a kernel-VA.
     #[inline(always)]
     pub unsafe fn new() -> Self {
-        let armed = SMAP_ENABLED.load(Ordering::Relaxed);
+        // Sample SMAP gate + current AC.  We arm (issue STAC) only
+        // when SMAP is enabled AND AC is currently clear — i.e. when
+        // this guard is the *outermost* bracket on the current CPU.
+        // A nested construction (AC already 1) is a no-op so the
+        // inner guard's Drop does NOT clear AC out from under the
+        // outer caller.  See type-level doc for the recvmsg bug
+        // class this prevents (Intel SDM Vol. 3A §4.6.1).
+        let smap_on = SMAP_ENABLED.load(Ordering::Relaxed);
+        let already_ac = smap_on && (rflags() & RFLAGS_AC) != 0;
+        let armed = smap_on && !already_ac;
         if armed {
             stac();
         }
@@ -189,7 +259,9 @@ impl Drop for UserGuard {
         // user-memory accesses past the drop boundary.
         core::sync::atomic::compiler_fence(Ordering::SeqCst);
         if self.armed {
-            // Safety: paired with the STAC issued in `new`.
+            // Safety: paired with the STAC issued in `new`.  Only the
+            // outermost guard sets `armed`; nested guards are
+            // passengers and do not touch AC here.
             unsafe { clac() };
         }
     }
