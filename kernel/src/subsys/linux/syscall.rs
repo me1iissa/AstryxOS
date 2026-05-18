@@ -80,6 +80,138 @@ fn memfd_seals_add(inode: u64, new_seals: u32) -> i64 {
 // numbers to AstryxOS handlers, adding Linux-specific syscalls needed for a
 // static musl-linked "hello world" (printf + file I/O + malloc).
 
+// ─── VFORK/CANARY diagnostic ────────────────────────────────────────────────
+//
+// Per POSIX.1-2017 §3.378 ("vfork was deprecated in POSIX.1-2008 because it
+// is impossible to use safely") and the Linux clone(2) man page (Linux
+// man-pages 6.7, §"CLONE_VM"), a CLONE_VM child shares the parent's address
+// space.  Linux's classical implementation blocks the parent and runs the
+// child on its OWN stack region; AstryxOS currently runs the child on the
+// parent's user RSP when the caller did not pass a `new_stack` argument
+// (see `fork_process_share_vm` in proc/mod.rs).  That makes any RSP-relative
+// store by the child visible to the parent at wake-up.
+//
+// The ELF gABI §6 stack-protector ("-fstack-protector") layout places the
+// per-frame canary at `[rbp - 8]` for functions whose prologue contains
+// `mov rax, fs:0x28; mov [rbp-8], rax`.  If the child's local-variable
+// spills land on top of a libxul caller's `[rbp-8]` slot, the canary mismatch
+// at function epilogue triggers `__stack_chk_fail` → musl's `HLT; RET`
+// abort sequence (a #GP from CPL3).
+//
+// `vfork_canary_snapshot` records the parent's IA32_FS_BASE MSR (Intel SDM
+// Vol. 3A §3.4.4.1), the user-stack window above the parent's RSP at vfork
+// entry, and the canary tag fetched via `fs:0x28` (musl's __stack_chk_guard
+// location).  The pre-block and post-wake snapshots together let downstream
+// analysis decide whether the child overwrote parent state during the
+// vfork window — without applying any fix.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn vfork_canary_snapshot(label: &str, pid: u32, parent_tid: u64) {
+    use core::fmt::Write;
+
+    // Parent's user RSP at syscall entry lives at `kstack_top - 8` (see
+    // `syscall_entry` save layout in syscall/mod.rs).  Look up via
+    // THREAD_TABLE so we work both pre-block (still in the parent's syscall
+    // frame) and post-wake (same frame, since `schedule()` returns to it).
+    let kstack_top = {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        threads.iter().find(|t| t.tid == parent_tid)
+            .map(|t| t.kernel_stack_base + t.kernel_stack_size)
+            .unwrap_or(0)
+    };
+    if kstack_top == 0 {
+        crate::serial_println!(
+            "[VFORK/CANARY] {} pid={} parent_tid={} state=no_kstack",
+            label, pid, parent_tid);
+        return;
+    }
+    let parent_user_rsp = unsafe { *((kstack_top - 8) as *const u64) };
+
+    // FS_BASE MSR (Intel SDM Vol. 3A §3.4.4.1, IA32_FS_BASE = 0xC000_0100).
+    // Captures the live FS_BASE for the currently-running thread, which —
+    // when this helper is called from the parent's syscall body — is the
+    // parent's TLS base.
+    let fs_base = unsafe { crate::hal::rdmsr(0xC000_0100) };
+
+    // TLS canary tag at `fs:0x28` per ELF gABI stack-protector §6.  The
+    // TLS block lives at fs_base[0..]; the canary tag sits at offset 0x28
+    // (`__stack_chk_guard`).  We snapshot it via the kernel-visible
+    // virtual address (fs_base + 0x28) under SMAP brackets.
+    let canary_addr = fs_base.wrapping_add(0x28);
+    let fs28: Option<u64> = if crate::syscall::validate_user_ptr(canary_addr, 8) {
+        unsafe { crate::syscall::user_read_u64(canary_addr) }
+    } else {
+        None
+    };
+
+    // Window above the parent's user RSP.  Empirically the #GP at
+    // `__stack_chk_fail` fires from a libxul `posix_spawn` caller frame
+    // ~0x1d60 bytes above the parent's RSP at vfork, so an 8 KiB window
+    // covers the entire stack region between vfork-entry and the
+    // SSP-failing caller frame.  Probe slots are chosen to bracket
+    // plausible `[rbp-8]` canary locations for libxul-shaped callers.
+    let win_base = parent_user_rsp;
+    let win_size: usize = 0x2000;
+    let mut stack_bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if win_base != 0 && crate::syscall::validate_user_ptr(win_base, win_size) {
+        if let Some(buf) = unsafe { crate::syscall::user_slice_snapshot(win_base, win_size) } {
+            stack_bytes = buf;
+        }
+    }
+
+    let read_slot = |off: usize| -> u64 {
+        if stack_bytes.len() >= off + 8 {
+            u64::from_le_bytes([
+                stack_bytes[off],     stack_bytes[off + 1], stack_bytes[off + 2], stack_bytes[off + 3],
+                stack_bytes[off + 4], stack_bytes[off + 5], stack_bytes[off + 6], stack_bytes[off + 7],
+            ])
+        } else { 0 }
+    };
+    let slot_1d8  = read_slot(0x1d8);
+    let slot_1e0  = read_slot(0x1e0);
+    let slot_d58  = read_slot(0xd58);
+    let slot_1d58 = read_slot(0x1d58);
+    let slot_1d60 = read_slot(0x1d60);
+
+    // Fletcher-32 over the whole window (no_std friendly; stable for diffing).
+    let mut sum1: u32 = 0;
+    let mut sum2: u32 = 0;
+    for b in &stack_bytes {
+        sum1 = (sum1.wrapping_add(*b as u32)) % 65535;
+        sum2 = (sum2.wrapping_add(sum1)) % 65535;
+    }
+    let win_crc: u32 = (sum2 << 16) | sum1;
+
+    // Read the first qword at fs_base.  Per the x86_64 psABI §3.4.6
+    // "Thread-Local Storage" (TLS Variant II) the TCB starts at FS_BASE
+    // and its first word is the TCB self-pointer.  If FS_BASE doesn't
+    // point at a valid TCB the read either faults (None) or returns a
+    // value that doesn't equal FS_BASE — both informative.
+    let tcb_self: Option<u64> = if crate::syscall::validate_user_ptr(fs_base, 8) {
+        unsafe { crate::syscall::user_read_u64(fs_base) }
+    } else {
+        None
+    };
+
+    let mut line = alloc::string::String::with_capacity(384);
+    let _ = write!(&mut line,
+        "[VFORK/CANARY] {} pid={} parent_tid={} \
+         fs_base={:#x} fs_28={} tcb_self={} \
+         user_rsp={:#x} \
+         s_1d8={:#x} s_1e0={:#x} s_d58={:#x} s_1d58={:#x} s_1d60={:#x} \
+         win_bytes={} win_crc={:#x}",
+        label, pid, parent_tid,
+        fs_base,
+        fs28.map(|v| alloc::format!("{:#x}", v)).unwrap_or_else(|| alloc::string::String::from("?")),
+        tcb_self.map(|v| alloc::format!("{:#x}", v)).unwrap_or_else(|| alloc::string::String::from("?")),
+        parent_user_rsp,
+        slot_1d8, slot_1e0, slot_d58, slot_1d58, slot_1d60,
+        stack_bytes.len(), win_crc);
+    crate::serial_println!("{}", line);
+}
+
+#[cfg(not(any(feature = "firefox-test", feature = "test-mode")))]
+fn vfork_canary_snapshot(_label: &str, _pid: u32, _parent_tid: u64) {}
+
 /// Check whether the current process uses the Linux syscall ABI.
 ///
 /// Reads the per-CPU lockless PID first — fast path, correct whenever a
@@ -2141,8 +2273,12 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                 t.wake_tick = now.saturating_add(500);
                             }
                             drop(threads);
+                            // VFORK/CANARY pre-block snapshot — see helper.
+                            vfork_canary_snapshot("pre_block.clone", pid as u32, parent_tid);
                             crate::sched::schedule();
                             // Resumed: child called exec/exit, or timeout expired.
+                            // VFORK/CANARY post-wake snapshot.
+                            vfork_canary_snapshot("post_wake.clone", pid as u32, parent_tid);
                         }
                         child_pid as i64
                     }
@@ -2924,7 +3060,11 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                 t.wake_tick = now.saturating_add(500);
                             }
                             drop(threads);
+                            // VFORK/CANARY pre-block snapshot — see helper.
+                            vfork_canary_snapshot("pre_block.clone3", pid as u32, parent_tid);
                             crate::sched::schedule();
+                            // VFORK/CANARY post-wake snapshot.
+                            vfork_canary_snapshot("post_wake.clone3", pid as u32, parent_tid);
                         }
                         child_pid as i64
                     }

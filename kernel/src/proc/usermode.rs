@@ -344,10 +344,13 @@ pub fn user_mode_bootstrap() {
         crate::syscall::set_kernel_rsp(kernel_stack_top);
     }
 
-    // Set per-thread TLS (FS.base) if assigned (clone(CLONE_SETTLS) or arch_prctl).
-    if tls_base != 0 {
-        unsafe { proc::write_fs_base(tls_base); }
-    }
+    // Set per-thread TLS (FS.base).  Write unconditionally — even when tls_base
+    // is 0 — so that a vfork/CLONE_VM child (which has tls_base=0) explicitly
+    // zeros FS.base on the CPU.  If we skip the WRMSR when tls_base==0 the CPU
+    // retains the parent thread's FS.base value; the child's stack-guard epilogue
+    // then reads a valid-looking (parent's) canary from %fs:0x28, corrupting the
+    // comparison and raising #GP in __stack_chk_fail.
+    unsafe { proc::write_fs_base(tls_base); }
 
     // Set GS.base to TEB address for Win32 threads.
     if gs_base != 0 {

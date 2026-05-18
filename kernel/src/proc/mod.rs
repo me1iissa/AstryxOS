@@ -2397,7 +2397,28 @@ pub fn fork_process_share_vm(
         user_entry_r8:  0,
         priority: PRIORITY_NORMAL,
         base_priority: PRIORITY_NORMAL,
-        tls_base: parent_tls_base,
+        // VFORK / CLONE_VM child must NOT inherit the parent's TLS base.
+        //
+        // The child shares the parent's address space (same CR3) but will
+        // call execve(2) almost immediately.  If the child inherits
+        // `parent_tls_base`, user_mode_bootstrap writes that value into the
+        // CPU's FS_BASE MSR.  The new process image (ld-musl) then runs with
+        // FS_BASE pointing at the PARENT's TLS struct, and its startup
+        // initialisation (musl __libc_start_main → __stack_chk_guard init)
+        // writes the new canary to parent_tls + 0x28 — corrupting the
+        // parent's SSP canary.  On the parent's next call to any
+        // SSP-protected function the prologue stores the (now-wrong) canary
+        // and the epilogue reads the old value from the stack, triggering
+        // __stack_chk_fail → #GP.
+        //
+        // Setting tls_base = 0 makes user_mode_bootstrap skip the WRMSR
+        // (see `if tls_base != 0` guard), leaving FS_BASE at whatever
+        // kernel-mode value it has until the child calls
+        // arch_prctl(ARCH_SET_FS, new_tcb) in its own execve'd image.
+        // The posix_spawn child function (musl's __spawni_child) does NOT
+        // use fs: segment accesses, so a zero FS_BASE is safe for the brief
+        // window between clone and execve.
+        tls_base: 0,
         cpu_affinity: None,
         last_cpu: 0,
         first_run: true,
@@ -2417,6 +2438,26 @@ pub fn fork_process_share_vm(
     crate::serial_println!(
         "[PROC] fork_share_vm: child PID {} TID {} (parent PID {} CR3={:#x}, shared)",
         child_pid, child_tid, parent_pid, parent_cr3
+    );
+
+    // VFORK/CHILD-STACK diagnostic — record the child's initial user RSP and
+    // whether the child will run on the parent's user stack (clone3's
+    // `new_stack` == 0 case).  Per POSIX vfork(2) and clone(2) Linux man-pages
+    // §"CLONE_VM" the child shares the parent's address space; the kernel
+    // does NOT carve out a private stack region for the child, so any
+    // RSP-relative store the child makes before execve(2) lands on the
+    // parent's user stack.  When `user_entry_rsp` equals the parent's RSP at
+    // the syscall instruction site the child's local-variable spills are
+    // inside the parent's frame chain — the precondition for SSP-canary
+    // aliasing per ELF gABI §6 stack-protector.
+    let child_uses_parent_stack = user_rsp != 0;
+    crate::serial_println!(
+        "[VFORK/CHILD-STACK] pid={} parent_pid={} child_rsp_at_entry={:#x} \
+         child_uses_parent_stack={} parent_user_rsp={:#x}",
+        child_pid, parent_pid,
+        user_rsp,
+        child_uses_parent_stack,
+        user_rsp,
     );
 
     Some((child_pid, child_tid))
@@ -2840,9 +2881,11 @@ pub fn restore_tls_for_current() {
         let threads = THREAD_TABLE.lock();
         threads.iter().find(|t| t.tid == tid).map(|t| t.tls_base).unwrap_or(0)
     };
-    if base != 0 {
-        unsafe { write_fs_base(base); }
-    }
+    // Write unconditionally: if base==0 (vfork/CLONE_VM child that was never
+    // assigned a TLS block) we must zero FS.base explicitly.  Skipping the
+    // WRMSR would leave the previous thread's FS.base on this CPU, causing the
+    // SSP epilogue to read the *parent's* canary and raise #GP.
+    unsafe { write_fs_base(base); }
 }
 
 // ── Thread Reaper ───────────────────────────────────────────────────────────

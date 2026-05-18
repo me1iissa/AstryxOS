@@ -362,6 +362,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "proc-metrics"   => op_proc_metrics(out),
         "thread-park-audit" => op_thread_park_audit(req, out),
         "rip-trace"      => op_rip_trace(req, out),
+        "procmaps"       => op_procmaps(req, out),
         #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
         "futex-stats"           => op_futex_stats(out),
         #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
@@ -2951,4 +2952,81 @@ fn op_futex_set_cluster_wake(req: &str, out: &mut String) {
             );
         }
     }
+}
+
+// ── procmaps ──────────────────────────────────────────────────────────────────
+//
+// Terse file-backed VMA map for one process.  Modeled on the Linux
+// /proc/<pid>/maps format documented in proc(5) (Linux man-pages 6.7,
+// §"/proc/[pid]/maps") but emitted as JSON for harness consumption.
+//
+// For each file-backed VMA we emit:
+//   base, end, prot, name, first_page_phys
+// `first_page_phys` is the physical address of the page mapping the first
+// byte of the VMA, derived by walking the process's PML4.  This anchors
+// the ASLR base for any ELF image (libxul, ld-musl, etc.) so a harness
+// caller can run `addr2line` on the kernel's symbol-bearing copy of the
+// binary.
+fn op_procmaps(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    let pid = match extract_field(req, "pid").and_then(|s| parse_u64(&s)) {
+        Some(p) => p,
+        None => { out.push_str(r#"{"error":"missing or bad 'pid'"}"#); return; }
+    };
+
+    struct VmaRow {
+        base: u64, end: u64, prot: u32, name: alloc::string::String, phys: Option<u64>,
+    }
+
+    let pt = match try_lock_brief(&PROCESS_TABLE) {
+        Some(g) => g,
+        None => {
+            out.push_str(r#"{"busy":"PROCESS_TABLE held"}"#);
+            return;
+        }
+    };
+    let snap: Option<(u64, alloc::vec::Vec<VmaRow>)> = pt.iter().find(|p| p.pid == pid).map(|p| {
+        let rows: alloc::vec::Vec<VmaRow> = match &p.vm_space {
+            Some(vs) => vs.areas.iter().map(|a| {
+                let phys = crate::mm::vmm::virt_to_phys_in(p.cr3, a.base);
+                VmaRow {
+                    base: a.base, end: a.end(), prot: a.prot,
+                    name: alloc::string::String::from(a.name),
+                    phys,
+                }
+            }).collect(),
+            None => alloc::vec::Vec::new(),
+        };
+        (p.cr3, rows)
+    });
+    drop(pt);
+
+    let (cr3, rows) = match snap {
+        Some(s) => s,
+        None => {
+            let _ = write!(out, r#"{{"error":"pid {} not found"}}"#, pid);
+            return;
+        }
+    };
+
+    out.push('{');
+    let _ = write!(out, r#""pid":{},"cr3":"{:#x}","vmas":["#, pid, cr3);
+    for (i, r) in rows.iter().take(512).enumerate() {
+        if i > 0 { out.push(','); }
+        out.push('{');
+        j_str(out, "base"); out.push(':'); j_hex(out, r.base); out.push(',');
+        j_str(out, "end");  out.push(':'); j_hex(out, r.end);  out.push(',');
+        let mut fb = [b'-'; 3];
+        if r.prot & crate::mm::vma::PROT_READ  != 0 { fb[0] = b'r'; }
+        if r.prot & crate::mm::vma::PROT_WRITE != 0 { fb[1] = b'w'; }
+        if r.prot & crate::mm::vma::PROT_EXEC  != 0 { fb[2] = b'x'; }
+        j_kv_str(out, "prot", core::str::from_utf8(&fb).unwrap_or("---"));
+        j_kv_str(out, "name", &r.name);
+        match r.phys {
+            Some(p) => { j_str(out, "first_page_phys"); out.push(':'); j_hex(out, p); }
+            None    => { out.push_str(r#""first_page_phys":null"#); }
+        }
+        out.push('}');
+    }
+    out.push_str("]}");
 }
