@@ -199,6 +199,63 @@ pub fn encode_motion_notify(seq: u16, window: u32,
     b
 }
 
+// ── FocusIn / FocusOut events (9 / 10) ───────────────────────────────────────
+//
+// Per X11 protocol (Appendix B, §Events):
+//   [0]   9 (FocusIn) or 10 (FocusOut)
+//   [1]   detail (0=Ancestor, 1=Virtual, 2=Inferior, 3=Nonlinear,
+//                 4=NonlinearVirtual, 5=Pointer, 6=PointerRoot, 7=None)
+//   [2-3] sequence-number
+//   [4-7] event-window
+//   [8]   mode (0=Normal, 1=Grab, 2=Ungrab, 3=WhileGrabbed)
+//   [9-31] pad
+//
+// We use detail=NotifyNormal (0) and mode=Normal (0) for programmatic focus.
+
+pub fn encode_focus_in(seq: u16, window: u32) -> [u8; 32] {
+    let mut b = [0u8; 32];
+    b[0] = proto::EVENT_FOCUS_IN;
+    b[1] = 0; // detail = Ancestor (closest ancestor in focus change chain)
+    w16(&mut b, 2, seq);
+    w32(&mut b, 4, window);
+    b[8] = 0; // mode = Normal
+    b
+}
+
+pub fn encode_focus_out(seq: u16, window: u32) -> [u8; 32] {
+    let mut b = [0u8; 32];
+    b[0] = proto::EVENT_FOCUS_OUT;
+    b[1] = 0; // detail = Ancestor
+    w16(&mut b, 2, seq);
+    w32(&mut b, 4, window);
+    b[8] = 0; // mode = Normal
+    b
+}
+
+// ── PropertyNotify event (28) ─────────────────────────────────────────────────
+//
+// Per X11 protocol (Appendix B, §Events):
+//   [0]   28 (PropertyNotify)
+//   [1]   pad
+//   [2-3] sequence-number
+//   [4-7] window
+//   [8-11] atom (the property that changed)
+//   [12-15] time
+//   [16]  state: 0=NewValue, 1=Deleted
+//   [17-31] pad
+
+pub fn encode_property_notify(seq: u16, window: u32, atom: u32,
+                               time: u32, deleted: bool) -> [u8; 32] {
+    let mut b = [0u8; 32];
+    b[0] = proto::EVENT_PROPERTY_NOTIFY;
+    w16(&mut b, 2, seq);
+    w32(&mut b, 4, window);
+    w32(&mut b, 8, atom);
+    w32(&mut b, 12, time);
+    b[16] = if deleted { 1 } else { 0 };
+    b
+}
+
 // ── ClientMessage event (33) ──────────────────────────────────────────────────
 
 pub fn encode_client_message(seq: u16, window: u32,

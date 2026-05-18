@@ -80,7 +80,21 @@ pub const ATOM_CAP_HEIGHT:          u32 = 66;
 pub const ATOM_WM_CLASS:            u32 = 67;
 pub const ATOM_WM_TRANSIENT_FOR:    u32 = 68;
 
-const BUILTIN_NAMES: [(&str, u32); 68] = [
+// ── ICCCM protocol atoms (69–71) ─────────────────────────────────────────────
+//
+// WM_PROTOCOLS, WM_DELETE_WINDOW, WM_TAKE_FOCUS are part of the Inter-Client
+// Communication Conventions Manual (ICCCM §4.1.2.7) and are interned at
+// stable IDs so that WM_PROTOCOLS property data (a list of atom IDs) can be
+// compared without per-session variance.
+
+/// WM_PROTOCOLS — ICCCM §4.1.2.7: list of supported window-manager protocols.
+pub const ATOM_WM_PROTOCOLS:        u32 = 69;
+/// WM_DELETE_WINDOW — ICCCM §4.2.8.1: client requests graceful close.
+pub const ATOM_WM_DELETE_WINDOW:    u32 = 70;
+/// WM_TAKE_FOCUS — ICCCM §4.1.7: WM requests client set its own focus.
+pub const ATOM_WM_TAKE_FOCUS:       u32 = 71;
+
+const BUILTIN_NAMES: [(&str, u32); 71] = [
     ("PRIMARY",             1), ("SECONDARY",            2),
     ("ARC",                 3), ("ATOM",                 4),
     ("BITMAP",              5), ("CARDINAL",             6),
@@ -115,12 +129,14 @@ const BUILTIN_NAMES: [(&str, u32); 68] = [
     ("FONT_NAME",          63), ("FAMILY_NAME",         64),
     ("FULL_NAME",          65), ("CAP_HEIGHT",          66),
     ("WM_CLASS",           67), ("WM_TRANSIENT_FOR",    68),
+    ("WM_PROTOCOLS",       69), ("WM_DELETE_WINDOW",    70),
+    ("WM_TAKE_FOCUS",      71),
 ];
 
 // ── Dynamic atom storage ──────────────────────────────────────────────────────
 
 const MAX_DYNAMIC_ATOMS: usize = 128;
-const FIRST_DYNAMIC_ATOM: u32  = 69;
+const FIRST_DYNAMIC_ATOM: u32  = 72;
 
 struct AtomEntry {
     id:   u32,
