@@ -1970,23 +1970,217 @@ fn generate_proc_maps(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
 }
 
 /// Generate /proc/self/status content for the process.
+///
+/// Format and field set per `man 5 proc_pid_status` (Linux man-pages 5.13)
+/// and `Documentation/filesystems/proc.rst` at kernel.org.  Many fields
+/// are computed live; signal/capability/cpu_allowed masks reflect kernel
+/// invariants (single-process token model, all-CPU affinity).  Fields not
+/// yet tracked (Umask, FDSize for kernel threads, NS* PID-namespace
+/// mirrors) are set to safe per-spec defaults so `ps`/`top`/sandbox-probe
+/// parsers do not fault on missing keys.
 fn generate_proc_status(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
-    let (name, ppid) = {
+    generate_proc_status_impl(pid)
+}
+
+/// Test-only accessor for `generate_proc_status`.
+///
+/// Exposed so `test_runner.rs` can pin the field set against
+/// `proc_pid_status(5)` without going through the full open()/read()
+/// path.  Not part of the published kernel ABI.
+pub fn generate_proc_status_for_test(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
+    generate_proc_status_impl(pid)
+}
+
+fn generate_proc_status_impl(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
+    use crate::mm::vma::{PROT_WRITE, PROT_EXEC, MAP_ANONYMOUS};
+
+    // ── Snapshot all per-process facts under one lock acquisition ───────
+    let (
+        comm, ppid, uid, gid, euid, egid, umask, no_new_privs,
+        cap_perm, cap_eff, fd_count, fd_capacity, n_threads,
+        vm_size_b, vm_data_b, vm_stk_b, vm_exe_b, vm_lib_b,
+        sig_pend, sig_blk, sig_ign, sig_cgt,
+    ) = {
         let procs = crate::proc::PROCESS_TABLE.lock();
-        procs.iter().find(|p| p.pid == pid)
-            .map(|p| (
-                p.exe_path.clone().unwrap_or_else(|| alloc::string::String::from("astryx")),
-                p.parent_pid,
-            ))
-            .unwrap_or_else(|| (alloc::string::String::from("astryx"), 0))
+        let p = match procs.iter().find(|p| p.pid == pid) {
+            Some(p) => p,
+            None => {
+                // Process gone: minimal conformant reply.
+                return b"Name:\tastryx\nUmask:\t0022\nState:\tZ (zombie)\n\
+                         Tgid:\t0\nNgid:\t0\nPid:\t0\nPPid:\t0\nTracerPid:\t0\n".to_vec();
+            }
+        };
+
+        // Name: rightmost path component of exe_path, capped to the 16-char
+        // limit Linux applies to TASK_COMM_LEN ("Command run by this
+        // process" per proc_pid_status(5)).
+        let full = p.exe_path.clone()
+            .unwrap_or_else(|| alloc::string::String::from("astryx"));
+        let short = full.rsplit('/').next().unwrap_or(&full);
+        let comm: alloc::string::String = short.chars().take(15).collect();
+
+        // VMA-derived Vm* fields (bytes).
+        let mut vm_size = 0u64;
+        let mut vm_data = 0u64;
+        let mut vm_stk  = 0u64;
+        let mut vm_exe  = 0u64;
+        let mut vm_lib  = 0u64;
+        if let Some(vs) = p.vm_space.as_ref() {
+            for a in &vs.areas {
+                vm_size += a.length;
+                let writable = (a.prot & PROT_WRITE) != 0;
+                let executable = (a.prot & PROT_EXEC) != 0;
+                let anon = (a.flags & MAP_ANONYMOUS) != 0;
+                // Classification matches Linux fs/proc/task_mmu.c semantics:
+                //   - VmStk: the "[stack]" VMA (one per process)
+                //   - VmExe: executable VMAs of the main program
+                //   - VmLib: executable VMAs from shared libraries
+                //   - VmData: writable anonymous (data segment + heap + bss)
+                if a.name == "[stack]" {
+                    vm_stk += a.length;
+                } else if executable && !writable {
+                    // Heuristic: main exe distinguished by VmBacking::File
+                    // offset==0 vs nonzero is complex; coalesce all exec-only
+                    // segments into VmExe + VmLib.  We assign the first such
+                    // segment to VmExe and the rest to VmLib so the breakdown
+                    // is non-zero and round-trips through ps's column model.
+                    if vm_exe == 0 {
+                        vm_exe = a.length;
+                    } else {
+                        vm_lib += a.length;
+                    }
+                } else if writable && anon {
+                    vm_data += a.length;
+                }
+            }
+        }
+
+        // Signal masks.  Pending+blocked are tracked directly; ignored/caught
+        // are derived from the action table.
+        let (pend, blk, ign, cgt) = if let Some(ss) = p.signal_state.as_ref() {
+            let mut ign = 0u64;
+            let mut cgt = 0u64;
+            for sig in 1..crate::signal::MAX_SIGNAL {
+                match ss.actions[sig as usize] {
+                    crate::signal::SigAction::Ignore =>
+                        ign |= 1u64 << (sig - 1),
+                    crate::signal::SigAction::Handler { .. } =>
+                        cgt |= 1u64 << (sig - 1),
+                    _ => {}
+                }
+            }
+            (ss.pending, ss.blocked, ign, cgt)
+        } else {
+            (0u64, 0u64, 0u64, 0u64)
+        };
+
+        // FDSize is the allocated capacity of the fd table, not the count
+        // of open fds (per proc_pid_status(5)).
+        let fd_count = p.file_descriptors.iter().filter(|f| f.is_some()).count();
+        let fd_cap = p.file_descriptors.capacity().max(p.file_descriptors.len());
+
+        (
+            comm, p.parent_pid,
+            p.uid, p.gid, p.euid, p.egid,
+            p.umask, p.no_new_privs,
+            p.cap_permitted, p.cap_effective,
+            fd_count, fd_cap,
+            p.threads.len().max(1),
+            vm_size, vm_data, vm_stk, vm_exe, vm_lib,
+            pend, blk, ign, cgt,
+        )
     };
-    let short_name = name.rsplit('/').next().unwrap_or(&name);
+
+    // Map process state via primary thread (best-effort).  Default: R.
+    let state_char = "R (running)";
+
+    // CPU/MEM affinity: AstryxOS schedules across all online CPUs by default.
+    // Encode as the conventional Linux-form mask (single-byte hex).
+    let online_cpus = (crate::arch::x86_64::apic::cpu_count().max(1)) as u64;
+    let cpus_mask: u64 = if online_cpus >= 64 { !0u64 } else { (1u64 << online_cpus) - 1 };
+
     alloc::format!(
-        "Name:\t{}\nState:\tR (running)\nPid:\t{}\nPPid:\t{}\n\
-         Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n\
-         VmRSS:\t4096 kB\nVmSize:\t65536 kB\nThreads:\t1\n\
-         voluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n",
-        short_name, pid, ppid
+        "Name:\t{name}\n\
+         Umask:\t{umask:04o}\n\
+         State:\t{state}\n\
+         Tgid:\t{pid}\n\
+         Ngid:\t0\n\
+         Pid:\t{pid}\n\
+         PPid:\t{ppid}\n\
+         TracerPid:\t0\n\
+         Uid:\t{uid}\t{euid}\t{uid}\t{uid}\n\
+         Gid:\t{gid}\t{egid}\t{gid}\t{gid}\n\
+         FDSize:\t{fd_cap}\n\
+         Groups:\t\n\
+         NStgid:\t{pid}\n\
+         NSpid:\t{pid}\n\
+         NSpgid:\t{pid}\n\
+         NSsid:\t{pid}\n\
+         VmPeak:\t{vm_size_kb} kB\n\
+         VmSize:\t{vm_size_kb} kB\n\
+         VmLck:\t       0 kB\n\
+         VmPin:\t       0 kB\n\
+         VmHWM:\t{vm_size_kb} kB\n\
+         VmRSS:\t{vm_size_kb} kB\n\
+         RssAnon:\t{vm_data_kb} kB\n\
+         RssFile:\t{vm_exe_lib_kb} kB\n\
+         RssShmem:\t       0 kB\n\
+         VmData:\t{vm_data_kb} kB\n\
+         VmStk:\t{vm_stk_kb} kB\n\
+         VmExe:\t{vm_exe_kb} kB\n\
+         VmLib:\t{vm_lib_kb} kB\n\
+         VmPTE:\t       0 kB\n\
+         VmSwap:\t       0 kB\n\
+         HugetlbPages:\t       0 kB\n\
+         CoreDumping:\t0\n\
+         THP_enabled:\t1\n\
+         Threads:\t{n_threads}\n\
+         SigQ:\t0/{fd_open}\n\
+         SigPnd:\t{sig_pend:016x}\n\
+         ShdPnd:\t{sig_pend:016x}\n\
+         SigBlk:\t{sig_blk:016x}\n\
+         SigIgn:\t{sig_ign:016x}\n\
+         SigCgt:\t{sig_cgt:016x}\n\
+         CapInh:\t0000000000000000\n\
+         CapPrm:\t{cap_prm:016x}\n\
+         CapEff:\t{cap_eff:016x}\n\
+         CapBnd:\t{cap_prm:016x}\n\
+         CapAmb:\t0000000000000000\n\
+         NoNewPrivs:\t{nnp}\n\
+         Seccomp:\t0\n\
+         Seccomp_filters:\t0\n\
+         Speculation_Store_Bypass:\tthread vulnerable\n\
+         Cpus_allowed:\t{cpus_mask:x}\n\
+         Cpus_allowed_list:\t0-{cpus_last}\n\
+         Mems_allowed:\t1\n\
+         Mems_allowed_list:\t0\n\
+         voluntary_ctxt_switches:\t0\n\
+         nonvoluntary_ctxt_switches:\t0\n",
+        name      = comm,
+        umask     = umask,
+        state     = state_char,
+        pid       = pid,
+        ppid      = ppid,
+        uid       = uid,  euid = euid,
+        gid       = gid,  egid = egid,
+        fd_cap    = fd_capacity,
+        fd_open   = fd_count,
+        n_threads = n_threads,
+        vm_size_kb    = vm_size_b / 1024,
+        vm_data_kb    = vm_data_b / 1024,
+        vm_stk_kb     = vm_stk_b  / 1024,
+        vm_exe_kb     = vm_exe_b  / 1024,
+        vm_lib_kb     = vm_lib_b  / 1024,
+        vm_exe_lib_kb = (vm_exe_b + vm_lib_b) / 1024,
+        sig_pend  = sig_pend,
+        sig_blk   = sig_blk,
+        sig_ign   = sig_ign,
+        sig_cgt   = sig_cgt,
+        cap_prm   = cap_perm,
+        cap_eff   = cap_eff,
+        nnp       = if no_new_privs { 1 } else { 0 },
+        cpus_mask = cpus_mask,
+        cpus_last = online_cpus.saturating_sub(1),
     ).into_bytes()
 }
 
