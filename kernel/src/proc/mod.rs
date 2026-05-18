@@ -2397,7 +2397,28 @@ pub fn fork_process_share_vm(
         user_entry_r8:  0,
         priority: PRIORITY_NORMAL,
         base_priority: PRIORITY_NORMAL,
-        tls_base: parent_tls_base,
+        // VFORK / CLONE_VM child must NOT inherit the parent's TLS base.
+        //
+        // The child shares the parent's address space (same CR3) but will
+        // call execve(2) almost immediately.  If the child inherits
+        // `parent_tls_base`, user_mode_bootstrap writes that value into the
+        // CPU's FS_BASE MSR.  The new process image (ld-musl) then runs with
+        // FS_BASE pointing at the PARENT's TLS struct, and its startup
+        // initialisation (musl __libc_start_main → __stack_chk_guard init)
+        // writes the new canary to parent_tls + 0x28 — corrupting the
+        // parent's SSP canary.  On the parent's next call to any
+        // SSP-protected function the prologue stores the (now-wrong) canary
+        // and the epilogue reads the old value from the stack, triggering
+        // __stack_chk_fail → #GP.
+        //
+        // Setting tls_base = 0 makes user_mode_bootstrap skip the WRMSR
+        // (see `if tls_base != 0` guard), leaving FS_BASE at whatever
+        // kernel-mode value it has until the child calls
+        // arch_prctl(ARCH_SET_FS, new_tcb) in its own execve'd image.
+        // The posix_spawn child function (musl's __spawni_child) does NOT
+        // use fs: segment accesses, so a zero FS_BASE is safe for the brief
+        // window between clone and execve.
+        tls_base: 0,
         cpu_affinity: None,
         last_cpu: 0,
         first_run: true,
