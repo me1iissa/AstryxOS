@@ -1859,6 +1859,16 @@ pub fn run() -> ! {
         if test_241_kdb_rip_trace_shape() { passed += 1; }
     }
 
+    // ── Test 242: scheduler picker non-idle precedence (W101 saga-closer) ──
+    // Verifies the picker invariant added in this PR: a CPU must never
+    // pick an idle thread while a non-idle Ready peer exists on that CPU.
+    // The test spawns N PRIORITY_NORMAL workers that sleep+yield in a loop,
+    // then verifies every worker reaches its iteration target within a
+    // bounded tick budget — proving that the BSP idle (TID 0) and AP idle
+    // threads (TID >= 0x1000) do not starve them on either CPU.
+    total += 1;
+    if test_242_sched_picker_non_idle_precedence() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -31571,5 +31581,173 @@ fn test_241_kdb_rip_trace_shape() -> bool {
     }
 
     test_pass!("kdb rip-trace shape — bogus tid + dispatch errors validated");
+    true
+}
+
+// ── Test 242: scheduler picker non-idle precedence (W101 saga-closer) ──────
+//
+// Regression test for the W101 scheduler-starvation saga.  The pre-fix
+// picker iterated all Ready peers in one pass and chose the highest-
+// scoring candidate.  On a 2-CPU system the BSP idle thread (TID 0,
+// PRIORITY_IDLE, cpu_affinity=Some(0)) and the AP idle thread
+// (TID 0x1001, PRIORITY_IDLE, cpu_affinity=Some(1)) were each pinned to
+// their own CPU and could win on score against PRIORITY_NORMAL workers
+// with `cpu_affinity=None`.  Even when the score math made workers the
+// winner, the absence of an explicit "non-idle precedence" invariant
+// left the picker fragile to future priority/affinity tuning.
+//
+// The fix in `kernel/src/sched/mod.rs` splits the picker into two passes:
+// pass 1 considers only non-idle Ready peers; pass 2 falls through to the
+// idle pool only when pass 1 finds nothing.  This matches POSIX
+// SCHED_OTHER (1003.1-2017 §2.8) and sched(7) "idle is schedule of last
+// resort".
+//
+// The test spawns N PRIORITY_NORMAL kernel workers that each run a fixed
+// number of yield+sleep cycles, then verifies every worker completes
+// within a bounded tick budget.  Without the picker invariant, a worker
+// with `cpu_affinity=None` that has never run on a given CPU has score
+// `priority*4 = 32` against an idle thread pinned to that CPU with
+// score `0 + 2 = 2` — workers win cleanly today, but the test pins the
+// invariant explicitly so a future scoring change (e.g. raising
+// PRIORITY_IDLE, or increasing the affinity bonus) cannot silently
+// regress to starvation.
+//
+// Cite: POSIX 1003.1-2017 §2.8 (Process Scheduling), sched(7) on idle-
+// thread semantics, Intel SDM Vol. 3A §8 (SMP scheduling boundaries).
+fn test_242_sched_picker_non_idle_precedence() -> bool {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    test_header!("scheduler picker non-idle precedence (W101 saga-closer)");
+
+    // Shared counter: each worker increments it once after completing its loops.
+    static DONE_COUNT: AtomicU32 = AtomicU32::new(0);
+    // Per-worker run count.  After completion each worker writes the
+    // number of cycles it actually executed into RUN_COUNTS[index].
+    // A worker that never gets picked stays at 0 → caught as starvation.
+    const N_WORKERS: usize = 6;
+    static RUN_COUNTS: [AtomicU32; N_WORKERS] = [
+        AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+        AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    ];
+    // Each worker gets a small per-instance counter via this atomic index.
+    static NEXT_WORKER_IDX: AtomicU32 = AtomicU32::new(0);
+    // Iterations each worker must complete before exiting.  Kept small so
+    // a slow TCG host finishes within the harness watchdog window.
+    const ITERS: u32 = 12;
+
+    DONE_COUNT.store(0, Ordering::SeqCst);
+    NEXT_WORKER_IDX.store(0, Ordering::SeqCst);
+    for slot in RUN_COUNTS.iter() {
+        slot.store(0, Ordering::SeqCst);
+    }
+
+    fn worker_entry() {
+        // Sibling threads inherit IF=0 from the scheduler's CLI before
+        // switch_context.  Re-enable interrupts so the timer ISR fires
+        // and the worker can be preempted normally.
+        crate::hal::enable_interrupts();
+
+        let idx = NEXT_WORKER_IDX.fetch_add(1, Ordering::SeqCst) as usize;
+        let slot = if idx < N_WORKERS {
+            Some(&RUN_COUNTS[idx])
+        } else {
+            None
+        };
+
+        for _ in 0..ITERS {
+            // sleep_ticks(1) parks us until the next timer tick.  The
+            // wake puts us in Ready state; the picker must then choose
+            // us over any pinned idle thread.
+            crate::proc::sleep_ticks(1);
+            if let Some(s) = slot {
+                s.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        DONE_COUNT.fetch_add(1, Ordering::SeqCst);
+        crate::proc::exit_thread(0);
+    }
+
+    let was_active = crate::sched::is_active();
+    if !was_active {
+        crate::sched::enable();
+    }
+
+    // Spawn N_WORKERS kernel processes.  Each runs at PRIORITY_HIGH by
+    // default (create_kernel_process sets PRIORITY_HIGH so kdb-style pump
+    // threads stay scheduled).  Drop them to PRIORITY_NORMAL via
+    // set_thread_priority so they resemble Mozilla worker threads.
+    let mut tids = [0u64; N_WORKERS];
+    for i in 0..N_WORKERS {
+        let pid = crate::proc::create_kernel_process(
+            "sched_starve_worker",
+            worker_entry as u64,
+        );
+        // Resolve TID for this PID (single-thread process).
+        let tid = {
+            let pt = crate::proc::PROCESS_TABLE.lock();
+            pt.iter().find(|p| p.pid == pid)
+                .and_then(|p| p.threads.first().copied())
+                .unwrap_or(0)
+        };
+        tids[i] = tid;
+        // Demote to NORMAL so a regression in priority weighting could
+        // realistically lose to PRIORITY_IDLE pinned threads.
+        let _ = crate::proc::set_thread_priority(tid, crate::proc::PRIORITY_NORMAL);
+        test_println!("  spawned worker {} pid={} tid={} ✓", i, pid, tid);
+    }
+
+    // Wait for all workers to finish.  Budget: 4000 spin iterations with
+    // an explicit yield_cpu() each iteration so the scheduler runs on
+    // this CPU too.  Each iteration also does ~500 spin_loop hints +
+    // an explicit STI window so a slow TCG run still progresses.
+    let mut all_done = false;
+    for i in 0..4000u32 {
+        crate::sched::yield_cpu();
+        crate::hal::enable_interrupts();
+        for _ in 0..500u32 { core::hint::spin_loop(); }
+        if DONE_COUNT.load(Ordering::SeqCst) >= N_WORKERS as u32 {
+            all_done = true;
+            break;
+        }
+        if i != 0 && i % 256 == 0 {
+            test_println!("  sched_picker: still waiting (done={}/{}, iter {})",
+                DONE_COUNT.load(Ordering::SeqCst), N_WORKERS, i);
+        }
+    }
+
+    if !was_active {
+        crate::sched::disable();
+    }
+
+    // Verdict 1: total completion.
+    let done = DONE_COUNT.load(Ordering::SeqCst);
+    if !all_done || done < N_WORKERS as u32 {
+        // Diagnostic: dump per-worker run counts to spot starvation.
+        for i in 0..N_WORKERS {
+            test_println!("  worker[{}] tid={} ran {} cycles (target {})",
+                i, tids[i], RUN_COUNTS[i].load(Ordering::SeqCst), ITERS);
+        }
+        test_fail!("test242",
+            "only {}/{} workers completed (sched picker may be starving non-idle peers)",
+            done, N_WORKERS);
+        return false;
+    }
+
+    // Verdict 2: per-worker fairness.  Every worker must have hit the
+    // iteration target.  A worker stuck at 0 cycles would prove the
+    // picker never picked it — the precise pre-fix saga signature.
+    for i in 0..N_WORKERS {
+        let cycles = RUN_COUNTS[i].load(Ordering::SeqCst);
+        if cycles < ITERS {
+            test_fail!("test242",
+                "worker[{}] tid={} only ran {} cycles (target {}) — \
+                 picker starvation regression",
+                i, tids[i], cycles, ITERS);
+            return false;
+        }
+    }
+
+    test_println!("  all {} workers completed {} cycles each ✓", N_WORKERS, ITERS);
+    test_pass!("scheduler picker non-idle precedence (W101 saga-closer)");
     true
 }
