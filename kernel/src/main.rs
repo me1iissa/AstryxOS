@@ -493,7 +493,32 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 Err(e) => serial_println!("[FFTEST] WARNING: could not write /tmp/hello.html: {:?}", e),
             }
 
-            serial_println!("[FFTEST] Launching /disk/opt/firefox/firefox-bin ...");
+            // The Mozilla launcher (firefox-bin) reads its dependentlibs.list,
+            // application.ini, omni.ja, defaults/, browser/, etc. via
+            // readlink("/proc/self/exe") + dirname, then opens those files
+            // relative to that resolved directory.  We therefore launch from
+            // wherever the FULL Mozilla tree is staged.
+            //
+            //   musl variant:  /disk/usr/lib/firefox-esr/firefox-bin
+            //                  (Alpine's package layout; DT_RUNPATH target;
+            //                   contains dependentlibs.list, application.ini,
+            //                   omni.ja, every Mozilla .so file)
+            //   glibc variant: /disk/opt/firefox/firefox-bin
+            //                  (in-tree convention; install-firefox.sh stages
+            //                   the tarball there directly)
+            //
+            // Prefer the musl path when present so readlink-relative file
+            // opens (notably dependentlibs.list — ENOENT here aborts the
+            // process at sc≈73) land in the right tree.  Both fall through
+            // to firefox-test's --headless --screenshot pipeline.
+            const CMDLINE_MUSL:  &str = "/disk/usr/lib/firefox-esr/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png file:///tmp/hello.html";
+            const CMDLINE_GLIBC: &str = "/disk/opt/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png file:///tmp/hello.html";
+            let cmdline = if crate::vfs::read_file("/disk/usr/lib/firefox-esr/firefox-bin").is_ok() {
+                CMDLINE_MUSL
+            } else {
+                CMDLINE_GLIBC
+            };
+            serial_println!("[FFTEST] Launching {} ...", cmdline.split(' ').next().unwrap_or(""));
             // Headless mode: pass `--headless` so libxul takes the IsHeadless()
             // path and does not call XOpenDisplay() / gdk_display_open().  With
             // a stub libX11.so XOpenDisplay returns NULL and Firefox prints
@@ -510,9 +535,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // the headless demo bar for issue #88.  /tmp/hello.html is now
             // written to the ramdisk above (W150) so the handler will not
             // hit ENOENT when it resolves file:///tmp/hello.html.
-            gui::terminal::launch_process(
-                "/disk/opt/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png file:///tmp/hello.html",
-            );
+            gui::terminal::launch_process(cmdline);
 
             // Run for up to 30000 ticks (~300 s), polling output and network.
             // We detect Firefox exit via EXEC_RUNNING going false (set by poll_output).
