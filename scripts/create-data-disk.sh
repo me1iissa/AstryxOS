@@ -20,13 +20,44 @@ SIZE_MB=2048
 FORCE=false
 FIREFOX=false
 
+# Firefox variant selector — picks which userspace ELF / libc combination
+# lands at /disk/opt/firefox/.
+#
+#   glibc (default) — upstream Mozilla ESR 115 binary linked against glibc;
+#                     paired with host glibc (install-glibc.sh), per-component
+#                     headless stubs (install-firefox-stubs.sh), and the real
+#                     fontconfig/freetype/libdbus overlays.  Hits the W101
+#                     plateau (sc=2902, TID 2 in NS_ProcessNextEvent — glibc
+#                     pthread_cond two-group cycling + arena-locked malloc
+#                     stress the Linux personality layer in a specific way).
+#
+#   musl            — Alpine Linux's prebuilt musl-linked Firefox ESR 115.
+#                     Brings its own /lib/ld-musl + libc + a complete /usr/lib
+#                     dependency closure.  Skips the entire glibc + stub
+#                     pipeline (none of them apply).  Tests whether the W101
+#                     plateau character is libc-specific or kernel-architectural.
+#
+# Selectable via CLI arg or env var; env var loses to explicit CLI arg.
+FIREFOX_VARIANT="${ASTRYXOS_FIREFOX_VARIANT:-glibc}"
+
 for arg in "$@"; do
     case "$arg" in
         --force) FORCE=true ;;
         --firefox) FIREFOX=true; FORCE=true ;;
+        --firefox-variant=*) FIREFOX_VARIANT="${arg#--firefox-variant=}" ;;
+        --firefox-variant) :;;   # next arg consumed by trailing path
         [0-9]*) SIZE_MB="$arg" ;;
     esac
 done
+
+case "${FIREFOX_VARIANT}" in
+    glibc|musl) ;;
+    *)
+        echo "[DATA-DISK] ERROR: unknown FIREFOX_VARIANT='${FIREFOX_VARIANT}' (expected glibc|musl)"
+        exit 1
+        ;;
+esac
+echo "[DATA-DISK] Firefox variant: ${FIREFOX_VARIANT}"
 
 # ── Stage at least one TTF font for Mozilla's font-list init ─────────────────
 # Mozilla's gfxFcPlatformFontList walks the FcFontSet returned by
@@ -50,6 +81,7 @@ else
     echo "[DATA-DISK]          fontconfig stub's pattern resolves on the data disk."
 fi
 
+if [ "${FIREFOX_VARIANT}" = "glibc" ]; then
 # ── Stage glibc runtime libraries (non-fatal) ─────────────────────────────────
 # install-glibc.sh copies host glibc to build/disk/lib64 and
 # build/disk/lib/x86_64-linux-gnu.  We call it here so any --force re-run also
@@ -180,6 +212,70 @@ if [ -d "${INTERPOSER_DIR}" ] && command -v gcc &>/dev/null; then
     fi
 fi
 
+else  # FIREFOX_VARIANT == musl
+# ── Musl Firefox pipeline ────────────────────────────────────────────────────
+# Alpine's prebuilt firefox-esr package brings its own complete dependency
+# closure (musl libc, musl ld, libstdc++, NSS, NSPR, GTK3, Pango, Cairo,
+# fontconfig, freetype, libdbus, ICU, etc.).  None of the glibc-tailored
+# stub builders (install-firefox-stubs.sh / install-fonts-real.sh /
+# install-dbus-real.sh / install-glibc.sh / install-firefox.sh) apply —
+# Alpine ships real working binaries for all of them.
+#
+# To avoid hybrid state (glibc firefox-bin + musl libxul.so etc.) we wipe
+# the directories that the glibc pipeline owns before the musl installer
+# stages its tree.  install-firefox-musl.sh already wipes /opt/firefox/
+# internally; we also clear /lib64 and /lib/x86_64-linux-gnu since those
+# are glibc-specific.  /usr/lib/x86_64-linux-gnu (host GTK runtime) is
+# preserved if present — it is harmless under musl (musl uses /usr/lib
+# directly) and rebuilding it requires the host apt cache.
+if [ -d "${BUILD_DIR}/disk/lib64" ]; then
+    rm -rf "${BUILD_DIR}/disk/lib64"
+fi
+if [ -d "${BUILD_DIR}/disk/lib/x86_64-linux-gnu" ]; then
+    rm -rf "${BUILD_DIR}/disk/lib/x86_64-linux-gnu"
+fi
+
+if [ -f "${ROOT_DIR}/scripts/install-firefox-musl.sh" ]; then
+    MUSL_FLAGS=""
+    [ "${FORCE}" = true ] && MUSL_FLAGS="--force"
+    bash "${ROOT_DIR}/scripts/install-firefox-musl.sh" ${MUSL_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
+        { echo "[DATA-DISK] FATAL: install-firefox-musl.sh failed"; exit 1; }
+fi
+
+# Stage a /tmp/hello.html for the headless oracle test — install-firefox.sh
+# does this in the glibc path, but we skipped that script.
+mkdir -p "${BUILD_DIR}/disk/tmp"
+cat > "${BUILD_DIR}/disk/tmp/hello.html" <<'HTML'
+<html><head><title>AstryxOS Firefox Oracle (musl)</title></head>
+<body><h1>Hi</h1><p>AstryxOS musl Firefox ESR headless oracle page.</p></body></html>
+HTML
+
+# Stage a minimal -profile so prefs.js mirrors the glibc oracle profile.
+PROFILE_DIR="${BUILD_DIR}/disk/opt/firefox/profile"
+mkdir -p "${PROFILE_DIR}"
+cat > "${PROFILE_DIR}/prefs.js" <<'PREFS'
+// AstryxOS minimal headless Firefox profile (musl variant)
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("browser.rights.3.shown", true);
+user_pref("startup.homepage_welcome_url", "");
+user_pref("browser.startup.page", 0);
+user_pref("app.update.enabled", false);
+user_pref("toolkit.telemetry.enabled", false);
+user_pref("toolkit.telemetry.unified", false);
+user_pref("datareporting.healthreport.service.enabled", false);
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("browser.safebrowsing.malware.enabled", false);
+user_pref("browser.safebrowsing.phishing.enabled", false);
+user_pref("browser.cache.disk.enable", false);
+user_pref("browser.cache.memory.enable", false);
+user_pref("network.captive-portal-service.enabled", false);
+user_pref("network.connectivity-service.enabled", false);
+user_pref("geo.enabled", false);
+PREFS
+
+fi  # end FIREFOX_VARIANT branch
+
 # ── Compile glibc_hello oracle binary if source present ──────────────────────
 GLIBC_HELLO_SRC="${ROOT_DIR}/userspace/glibc_hello.c"
 GLIBC_HELLO_BIN="${BUILD_DIR}/glibc_hello"
@@ -292,6 +388,7 @@ EOF
     mmd -i "${DATA_IMG}" "::lib" 2>/dev/null || true
     LD_MUSL="${BUILD_DIR}/disk/lib/ld-musl-x86_64.so.1"
     LIBC_SO="${BUILD_DIR}/disk/lib/libc.so"
+    LIBC_MUSL="${BUILD_DIR}/disk/lib/libc.musl-x86_64.so.1"
     if [ -f "${LD_MUSL}" ]; then
         mcopy -o -i "${DATA_IMG}" "${LD_MUSL}" "::lib/ld-musl-x86_64.so.1"
         echo "[DATA-DISK] Copied ld-musl to /lib/ld-musl-x86_64.so.1"
@@ -299,6 +396,11 @@ EOF
     if [ -f "${LIBC_SO}" ]; then
         mcopy -o -i "${DATA_IMG}" "${LIBC_SO}" "::lib/libc.so"
         echo "[DATA-DISK] Copied libc.so to /lib/libc.so"
+    fi
+    # musl Firefox: libc.musl-x86_64.so.1 is staged alongside ld-musl
+    if [ -f "${LIBC_MUSL}" ]; then
+        mcopy -o -i "${DATA_IMG}" "${LIBC_MUSL}" "::lib/libc.musl-x86_64.so.1"
+        echo "[DATA-DISK] Copied libc.musl-x86_64.so.1 to /lib/"
     fi
 
     # ── Dynamic linker + glibc (needed by Firefox and other glibc binaries) ──
@@ -332,6 +434,25 @@ EOF
                 "::usr/lib/x86_64-linux-gnu/$(basename "${f}")" 2>/dev/null || true
         done
         echo "[DATA-DISK] Copied usr/lib/x86_64-linux-gnu/ (host GTK3 runtime)"
+    fi
+    # musl Firefox: Alpine support libs at /usr/lib/ (no multiarch suffix).
+    # We copy regular files (top-level only — recursive mcopy of cairo/
+    # gtk-3.0/ etc. subdirs is handled by `mcopy -s` if the variant needs it,
+    # but musl Firefox resolves all its deps from /usr/lib/ flat so the
+    # top-level copy suffices for the headless oracle).
+    MUSL_USR_LIB="${BUILD_DIR}/disk/usr/lib"
+    if [ "${FIREFOX_VARIANT}" = "musl" ] && [ -d "${MUSL_USR_LIB}" ]; then
+        mmd -i "${DATA_IMG}" "::usr"                          2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/lib"                      2>/dev/null || true
+        local_count=0
+        for f in "${MUSL_USR_LIB}/"*.so*; do
+            if [ -f "${f}" ]; then
+                mcopy -o -i "${DATA_IMG}" "${f}" \
+                    "::usr/lib/$(basename "${f}")" 2>/dev/null || true
+                local_count=$((local_count + 1))
+            fi
+        done
+        echo "[DATA-DISK] Copied ${local_count} musl support libs to /usr/lib/ (Alpine deps)"
     fi
     HOST_FONTS="${BUILD_DIR}/disk/usr/share/fonts"
     if [ -d "${HOST_FONTS}/truetype/dejavu" ]; then
