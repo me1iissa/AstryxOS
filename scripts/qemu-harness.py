@@ -5557,9 +5557,14 @@ _MMAP_SO = re.compile(
 
 def _build_load_base_map(lines):
     """Walk the serial log and collect every library mmap, returning a list of
-    {pid, base, end, off, path} ranges.  Multiple LOADs per .so accumulate;
-    we use the lowest `base` for each path as the load base."""
-    by_path = {}
+    {pid, base, end, off, path} ranges.  Multiple LOADs of the same .so by
+    the same PID accumulate into one range (lowest base, highest end).  The
+    key is (pid, path) — a child process (PID 2+) re-mapping the SAME path
+    at a DIFFERENT base does NOT merge with the parent; it produces a
+    separate record.  Without this distinction, cross-process load-base
+    aggregation would create artificial multi-GiB ranges that swallow every
+    RIP between PID 1's and PID 2's base for the same library."""
+    by_key = {}
     for ln in lines:
         m = _MMAP_SO.search(ln)
         if not m: continue
@@ -5569,12 +5574,13 @@ def _build_load_base_map(lines):
         off  = int(m.group(4), 16)
         path = m.group(7)
         end  = base + leng
-        rec  = by_path.setdefault(path, {
+        key  = (pid, path)
+        rec  = by_key.setdefault(key, {
             "pid": pid, "path": path, "base": base, "end": end, "off": off,
         })
         if base < rec["base"]: rec["base"] = base
         if end  > rec["end"]:  rec["end"]  = end
-    return list(by_path.values())
+    return list(by_key.values())
 
 
 def _resolve_frame_to_lib(rip, libs):
@@ -5842,6 +5848,160 @@ def _resolve_user_rip(rip: int, libs: list, disk_root: Optional[str]) -> Optiona
         "offset":  f"{off:#x}",
         "symbol":  sym,
     }
+
+
+def cmd_rip_trace_sym(args):
+    """Run kdb rip-trace then symbolicate every address in the response.
+
+    Each of top_rips / top_rbp_chains / top_rsp_scan is augmented with a
+    `library` (guest path, e.g. /disk/opt/firefox/libxul.so) and a
+    `symbol` (nearest exported symbol + offset).  Addresses that don't
+    fall inside any [FFTEST/mmap-so]-traced VMA stay as raw hex with
+    `library: null` — handy hint that the kernel sampled inside the
+    vDSO, anonymous JIT/stack memory, or a library whose load base
+    wasn't traced.
+
+    This is the symbolisation companion to `kdb rip-trace`; the latter
+    returns bare addresses, the former turns them into readable names.
+    Used by the W101 saga-closer to identify the Mozilla event-loop
+    function spinning at the post-plateau wedge.
+    """
+    sess = _load_session(args.sid)
+    port = int(sess.get("kdb_host_port") or 0)
+    if port <= 0:
+        _out({"error": "session was not started with --features kdb"})
+        return 1
+
+    # ── 1. Issue the kdb rip-trace request directly ─────────────────────
+    req = {"op": "rip-trace", "tid": args.tid, "ms": args.ms}
+    timeout = float(getattr(args, "timeout", 30.0) or 30.0)
+    try:
+        raw = _kdb_recv(port, req, timeout=timeout)
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        _out({"error": f"kdb connect/io failed on 127.0.0.1:{port}: {e}"})
+        return 1
+    try:
+        resp = json.loads(raw.strip().decode("utf-8", errors="replace"))
+    except (json.JSONDecodeError, ValueError) as e:
+        _out({"error": f"malformed kdb response: {e}",
+              "raw": raw.decode(errors="replace")})
+        return 1
+    if "error" in resp:
+        _out(resp); return 1
+
+    # ── 2. Build load-base map from serial log ──────────────────────────
+    try:
+        log_lines = Path(sess["serial_log"]).read_text(errors="replace").splitlines()
+    except OSError as e:
+        _out({"error": f"could not read serial log: {e}"})
+        return 1
+    libs = _build_load_base_map(log_lines)
+    # Filter to PID 1 (the target Firefox process) — the cross-process map
+    # merges all PIDs' load bases and would have e.g. libXi.so.6 spanning
+    # from PID 1's base to PID 2's base (~3 GiB), trapping every RIP in
+    # between as "libXi.so.6+0x…".  Use the response's pid to filter.
+    target_pid = int(resp.get("pid") or 0)
+    if target_pid > 0:
+        libs = [L for L in libs if L.get("pid") == target_pid]
+    libs.sort(key=lambda L: L["base"])
+
+    # Cache nm -D output per host file (one subprocess per .so).
+    sym_cache: dict[str, list[tuple[int, str]]] = {}
+    disk_root = getattr(args, "disk_root", None)
+
+    def _sym_for(lib_path: str, offset: int):
+        # Lookup nearest exported symbol at or below offset.  Returns
+        # f"{symbol}+{delta:#x}" or None.
+        if lib_path not in sym_cache:
+            host = _resolve_path_on_host(lib_path, disk_root=disk_root)
+            if not host or not Path(host).exists():
+                sym_cache[lib_path] = []
+                return None
+            entries: list[tuple[int, str]] = []
+            try:
+                import subprocess as _sp
+                out = _sp.check_output(
+                    ["nm", "--defined-only", "-D", "--no-demangle", host],
+                    stderr=_sp.DEVNULL, timeout=10,
+                ).decode("utf-8", errors="replace")
+                for line in out.splitlines():
+                    parts = line.split(maxsplit=2)
+                    if len(parts) < 3: continue
+                    try: addr = int(parts[0], 16)
+                    except ValueError: continue
+                    if parts[1] not in ("T", "t", "W", "w"): continue
+                    entries.append((addr, parts[2]))
+                entries.sort(key=lambda e: e[0])
+            except (FileNotFoundError, _sp.CalledProcessError, _sp.TimeoutExpired):
+                pass
+            sym_cache[lib_path] = entries
+        entries = sym_cache[lib_path]
+        if not entries: return None
+        # Binary search for the largest addr <= offset.
+        import bisect
+        idx = bisect.bisect_right(entries, (offset, "\x7f")) - 1
+        if idx < 0: return None
+        addr, sym = entries[idx]
+        # Demangle on demand (best effort).
+        try:
+            import subprocess as _sp
+            d = _sp.check_output(["c++filt", "--no-strip-underscore"],
+                                 input=sym, text=True, timeout=2).strip()
+            sym = d if d else sym
+        except (FileNotFoundError, _sp.CalledProcessError, _sp.TimeoutExpired):
+            pass
+        return f"{sym}+{offset - addr:#x}"
+
+    def _resolve(addr_hex: str) -> dict:
+        rip = int(addr_hex, 16)
+        lib, off = _resolve_frame_to_lib(rip, libs)
+        return {
+            "addr": addr_hex,
+            "library": lib,
+            "offset": (f"{off:#x}" if off is not None else None),
+            "symbol": (_sym_for(lib, off) if lib is not None else None),
+        }
+
+    # ── 3. Decorate every address in the response ───────────────────────
+    out_top_rips = []
+    for entry in resp.get("top_rips", []):
+        d = _resolve(entry["rip"])
+        d["count"] = entry["count"]
+        d["page"]  = entry.get("page")
+        out_top_rips.append(d)
+
+    out_chains = []
+    for ch in resp.get("top_rbp_chains", []):
+        frames = [_resolve(a) for a in ch.get("chain", [])]
+        out_chains.append({
+            "chain": frames,
+            "count": ch["count"],
+        })
+
+    out_rsp_scan = []
+    for entry in resp.get("top_rsp_scan", []):
+        d = _resolve(entry["addr"])
+        d["count"] = entry["count"]
+        d["page"]  = entry.get("page")
+        out_rsp_scan.append(d)
+
+    result = {
+        "tid": resp.get("tid"),
+        "pid": resp.get("pid"),
+        "ms_requested":  resp.get("ms_requested"),
+        "ticks_polled":  resp.get("ticks_polled"),
+        "samples":       resp.get("samples"),
+        "errors":        resp.get("errors"),
+        "load_bases":    [
+            {"path": L["path"], "base": f"{L['base']:#x}", "end": f"{L['end']:#x}"}
+            for L in libs
+        ],
+        "top_rips":         out_top_rips,
+        "top_rbp_chains":   out_chains,
+        "top_rsp_scan":     out_rsp_scan,
+    }
+    _out(result)
+    return 0
 
 
 def cmd_rip_sample(args):
@@ -6998,6 +7158,28 @@ def main():
                        help="Disk staging root for userspace .so symbol lookup "
                             "(see `ustack --disk-root`)")
 
+    # rip-trace-sym — symbolicated wrapper around kdb rip-trace.  Runs the
+    # in-kernel sampler, then resolves every RIP / chain-frame / RSP-scan
+    # candidate against [FFTEST/mmap-so]-derived load bases and per-library
+    # nm exports.  This is the saga-closer companion for the W101 demo
+    # wedge: rip-trace alone reports addresses; rip-trace-sym names the
+    # function.
+    p_rt_sym = sub.add_parser(
+        "rip-trace-sym",
+        help="[Tier1] Symbolicated rip-trace: run kdb rip-trace then map "
+             "every RIP, RBP-chain frame, and RSP-scan candidate to "
+             "<library>:<symbol+offset> via [FFTEST/mmap-so] + nm.",
+    )
+    p_rt_sym.add_argument("sid")
+    p_rt_sym.add_argument("tid", type=lambda x: int(x, 0),
+                          help="Target TID (must be in PID 1's tree)")
+    p_rt_sym.add_argument("--ms", type=int, default=2000,
+                          help="Sampling window in ms (default 2000, max 5000)")
+    p_rt_sym.add_argument("--disk-root", default=None, metavar="DIR",
+                          help="Disk staging root for userspace .so symbol lookup")
+    p_rt_sym.add_argument("--timeout", type=float, default=30.0,
+                          help="kdb overall deadline in seconds (default 30.0)")
+
     # parked-tids — passive serial-log scan of FUTEX_WAIT_REG → leaf rip + sig.
     p_parked = sub.add_parser(
         "parked-tids",
@@ -7225,6 +7407,7 @@ def main():
         "wake-attempts": cmd_wake_attempts,
         "sc-histogram": cmd_sc_histogram,
         "rip-sample": cmd_rip_sample,
+        "rip-trace-sym": cmd_rip_trace_sym,
         "qmp-regs": cmd_qmp_regs,
         "qmp-xv":   cmd_qmp_xv,
         "qmp-xp":   cmd_qmp_xp,

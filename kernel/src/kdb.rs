@@ -2486,10 +2486,21 @@ fn render_wait_compact(
 //
 // Response shape:
 //   { "tid": N, "pid": N, "ms_requested": N, "samples": N,
-//     "errors": { "rbp_fault": N, "no_sample": N, "torn_read": N },
+//     "errors": { "rbp_fault": N, "no_sample": N, "torn_read": N,
+//                 "rsp_scan_faults": N },
 //     "top_rips": [ { "rip": "0x...", "count": N, "page": "0x..." }, ... ],
 //     "top_rbp_chains":
-//        [ { "chain": ["0x..", "0x..", "0x.."], "count": N }, ... ] }
+//        [ { "chain": ["0x..", "0x..", "0x.."], "count": N }, ... ],
+//     "top_rsp_scan":
+//        [ { "addr": "0x..", "count": N, "page": "0x..." }, ... ] }
+//
+// `top_rsp_scan` lists user-stack words above RSP that look like
+// canonical user-code return addresses, ranked by frequency across the
+// sampling window.  This is the fallback for `-fomit-frame-pointer`
+// binaries (firefox-bin/libxul) where the RBP chain terminates at depth
+// 1 because RBP is used as a general-purpose register; addresses that
+// occur in N out of N samples are almost certainly real saved-RIPs from
+// frames that the RBP walker could not reach.
 //
 // The op MUST NOT pause or freeze the target TID — it is purely
 // observational.  It is also bounded in cost: the histogram tables are
@@ -2503,8 +2514,13 @@ fn render_wait_compact(
 // 4-level paging walk and §8.2.3 for the same-cache-line TSO guarantee
 // that lets us read RIP/RBP/seq from the slot without locking.
 const RIP_TRACE_MAX_MS: u64 = 5_000;
-const RIP_TRACE_TOP_N: usize = 5;
+const RIP_TRACE_TOP_N: usize = 10;
 const RIP_TRACE_RBP_MAX_FRAMES: usize = 10;
+/// Words above RSP to scan for return-address candidates.  The 96-word
+/// (768 B) window picks up the typical 10-15 frames of an active call
+/// stack without inflating cost — each word is one software page-walk
+/// look-up via `proc::sample::read_user_u64_at`.
+const RIP_TRACE_RSP_SCAN_WORDS: u64 = 96;
 
 fn op_rip_trace(req: &str, out: &mut String) {
     use core::fmt::Write;
@@ -2572,18 +2588,27 @@ fn op_rip_trace(req: &str, out: &mut String) {
     let mut chain_hist:
         alloc::collections::BTreeMap<alloc::vec::Vec<u64>, u64> =
         alloc::collections::BTreeMap::new();
+    // RSP-scan histogram: words found above the user RSP that look like
+    // canonical user-code return addresses (canonical low-half, low bit
+    // clear, > 0x10000).  Mozilla's firefox-bin/libxul build with
+    // `-fomit-frame-pointer` so the RBP chain frequently terminates at
+    // depth 1.  Stack-word inspection is the standard fallback in any
+    // sampling profiler that lacks DWARF unwind info.
+    let mut rsp_scan_hist: alloc::collections::BTreeMap<u64, u64> =
+        alloc::collections::BTreeMap::new();
+    let mut rsp_scan_faults: u64 = 0;
 
     for _ in 0..ticks_to_run {
         crate::proc::sleep_ticks(1);
-        match crate::proc::sample::read_user_rip(tid) {
+        match crate::proc::sample::read_user_rip_rsp(tid) {
             None => { errors_no_sample += 1; }
-            Some((_, _, seq)) if seq == last_seq => {
+            Some((_, _, _, seq)) if seq == last_seq => {
                 // Same observation as last iteration — TID didn't run
                 // in Ring 3 during this tick (kernel-bound, off-CPU,
                 // or terminated).  Don't double-count.
                 errors_no_sample += 1;
             }
-            Some((rip, rbp, seq)) => {
+            Some((rip, rbp, rsp, seq)) => {
                 if rip == 0 {
                     // Slot owned by `tid` but the sampler has never
                     // observed a non-zero Ring-3 RIP — treat as a
@@ -2632,6 +2657,46 @@ fn op_rip_trace(req: &str, out: &mut String) {
                 }
                 if chain_faulted { errors_rbp_fault += 1; }
                 *chain_hist.entry(chain).or_insert(0) += 1;
+
+                // RSP-scan fallback.  Scan up to RIP_TRACE_RSP_SCAN_WORDS
+                // qwords above RSP.  Filter:
+                //   - canonical user-half (< KERNEL_VIRT_BASE) and not in
+                //     the kernel canonical hole
+                //   - non-trivial (> 0x10000 i.e. above the unmapped first
+                //     64 KiB)
+                //   - even-byte alignment (return addresses are byte-
+                //     aligned after `call`; we only require LSB clear
+                //     because most call-site successor instructions are
+                //     2-byte+ aligned in practice, but allow any byte)
+                //   - the candidate's PAGE must be mapped under cr3 (we
+                //     don't validate executability here — the caller's
+                //     symbol-table lookup will tell us if it's code)
+                //
+                // A real return address may share its page with data, so
+                // we cannot demand X-bit visibility from a software page
+                // walk (we don't know which library's text-section pages
+                // are R-X without an aux table).  This is a heuristic
+                // filter, not a proof.  False positives are tolerable —
+                // the caller groups by histogram count and only the most-
+                // frequent candidates are meaningful.
+                if rsp != 0 && rsp >= 0x1000 && rsp < astryx_shared::KERNEL_VIRT_BASE {
+                    for i in 0..RIP_TRACE_RSP_SCAN_WORDS {
+                        let va = rsp.wrapping_add(i * 8);
+                        if va >= astryx_shared::KERNEL_VIRT_BASE { break; }
+                        let w = match
+                            crate::proc::sample::read_user_u64_at(cr3, va)
+                        {
+                            Some(v) => v,
+                            None => { rsp_scan_faults += 1; break; }
+                        };
+                        // Canonical low-half user address?
+                        if w < 0x10000 { continue; }
+                        if w >= astryx_shared::KERNEL_VIRT_BASE { continue; }
+                        // Bucket by full address.  Caller resolves to
+                        // library/symbol via the FFTEST/mmap-so table.
+                        *rsp_scan_hist.entry(w).or_insert(0) += 1;
+                    }
+                }
             }
         }
     }
@@ -2647,13 +2712,19 @@ fn op_rip_trace(req: &str, out: &mut String) {
     chain_vec.sort_by(|a, b| b.1.cmp(&a.1));
     chain_vec.truncate(RIP_TRACE_TOP_N);
 
+    let mut rsp_scan_vec: alloc::vec::Vec<(u64, u64)> =
+        rsp_scan_hist.into_iter().collect();
+    rsp_scan_vec.sort_by(|a, b| b.1.cmp(&a.1));
+    rsp_scan_vec.truncate(RIP_TRACE_TOP_N * 2);  // wider window — caller filters by lib
+
     // ── Emit response JSON ───────────────────────────────────────────
     out.push('{');
     let _ = write!(out, r#""tid":{},"pid":{},"ms_requested":{},"#, tid, pid, ms);
     let _ = write!(out, r#""ticks_polled":{},"samples":{},"#, ticks_to_run, samples);
     out.push_str(r#""errors":{"#);
-    let _ = write!(out, r#""rbp_fault":{},"no_sample":{},"torn_read":{}"#,
-                   errors_rbp_fault, errors_no_sample, errors_torn_read);
+    let _ = write!(out, r#""rbp_fault":{},"no_sample":{},"torn_read":{},"rsp_scan_faults":{}"#,
+                   errors_rbp_fault, errors_no_sample, errors_torn_read,
+                   rsp_scan_faults);
     out.push_str("},");
     out.push_str(r#""top_rips":["#);
     for (i, (rip, count)) in rip_vec.iter().enumerate() {
@@ -2676,6 +2747,16 @@ fn op_rip_trace(req: &str, out: &mut String) {
         }
         out.push_str("],");
         let _ = write!(out, r#""count":{}"#, count);
+        out.push('}');
+    }
+    out.push_str("],");
+    out.push_str(r#""top_rsp_scan":["#);
+    for (i, (addr, count)) in rsp_scan_vec.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        out.push('{');
+        j_str(out, "addr"); out.push(':'); j_hex(out, *addr); out.push(',');
+        let _ = write!(out, r#""count":{},"#, count);
+        j_str(out, "page"); out.push(':'); j_hex(out, *addr & !0xFFFu64);
         out.push('}');
     }
     out.push_str("]}");
