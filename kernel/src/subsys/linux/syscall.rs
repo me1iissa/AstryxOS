@@ -3190,37 +3190,172 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             });
             0
         }
-        // 98: getrusage(who, usage) — resource usage; return zeroed struct
+        // 98: getrusage(who, usage)
+        //
+        // Per `man 2 getrusage` (Linux 5.13 / POSIX.1-2017):
+        //   `who` must be one of RUSAGE_SELF (0), RUSAGE_CHILDREN (-1) or
+        //   RUSAGE_THREAD (1).  Any other value yields -EINVAL.  A NULL
+        //   `usage` pointer is also -EINVAL.
+        //
+        // struct rusage (x86_64, 144 bytes) — populated fields tracked by
+        // Linux as documented in getrusage(2) "BUGS" / per-field notes:
+        //   off  0 ru_utime.tv_sec     — total user-mode time
+        //   off  8 ru_utime.tv_usec
+        //   off 16 ru_stime.tv_sec     — total kernel-mode time
+        //   off 24 ru_stime.tv_usec
+        //   off 32 ru_maxrss           — peak RSS in KiB
+        //   off 64 ru_minflt           — minor faults (no I/O)
+        //   off 72 ru_majflt           — major faults (with I/O)
+        //   off 88 ru_inblock          — block input ops (since 2.6.22)
+        //   off 96 ru_oublock          — block output ops
+        //   off 128 ru_nvcsw           — voluntary ctxt switches (since 2.6)
+        //   off 136 ru_nivcsw          — involuntary ctxt switches
+        // Fields ru_ixrss/ru_idrss/ru_isrss/ru_nswap/ru_msgsnd/ru_msgrcv/
+        // ru_nsignals are documented as "currently unused on Linux" and
+        // are left at zero.
         98 => {
-            if arg2 != 0 {
-                #[cfg(feature = "firefox-test")]
-                crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Getrusage, arg2 as *const u8, 144);
-                unsafe {
-                    let _g = crate::arch::x86_64::smap::UserGuard::new();
-                    core::ptr::write_bytes(arg2 as *mut u8, 0, 144);
-                }
+            const RUSAGE_CHILDREN: i64 = -1;
+            const RUSAGE_SELF: i64     = 0;
+            const RUSAGE_THREAD: i64   = 1;
+            let who = arg1 as i64;
+            if who != RUSAGE_SELF && who != RUSAGE_CHILDREN && who != RUSAGE_THREAD {
+                return -22; // EINVAL
+            }
+            // -EFAULT on NULL or kernel-VA / overflowing pointer.  Per
+            // getrusage(2) ERRORS and POSIX.1-2017 §3.143 (EFAULT).
+            // UserGuard's AC=1 only blocks user-mode kernel-VA writes; in
+            // kernel mode (where we run with CPL=0) we must explicitly
+            // reject kernel-VA pointers to prevent the user from steering
+            // a kernel-page write.  CWE-822 (untrusted pointer dereference).
+            if !crate::syscall::validate_user_ptr(arg2, 144) {
+                return -14; // EFAULT
+            }
+            #[cfg(feature = "firefox-test")]
+            crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Getrusage, arg2 as *const u8, 144);
+
+            // RUSAGE_CHILDREN: we don't currently track per-child rollups;
+            // a zero-filled struct is a conformant minimum (matches a freshly-
+            // forked process that hasn't reaped any children).
+            let (utime_us, max_rss_kb, minflt, inblock, oublock) = if who == RUSAGE_CHILDREN {
+                (0u64, 0u64, 0u64, 0u64, 0u64)
+            } else {
+                // user-time proxy: total uptime in microseconds.  We do not
+                // distinguish user vs kernel here — better to overstate
+                // ru_utime than to lie about ru_stime, since shell `time`
+                // builtins generally sum user+sys for "% CPU".
+                let ticks = crate::arch::x86_64::irq::get_ticks();
+                let utime_us = ticks.saturating_mul(10_000); // 100 Hz → 10 ms per tick → 10000 us
+                let pid = crate::proc::current_pid_lockless();
+                let (rss_kb, minflt, inb, oub) = if let Some(snap) =
+                    crate::proc::proc_metrics::snapshot(pid)
+                {
+                    // Block ops: a block is 512 bytes per the getrusage(2)
+                    // man page BUGS section (Linux man-pages 5.13).
+                    let inb = snap.disk_r_bytes / 512;
+                    let oub = snap.disk_w_bytes / 512;
+                    // VmRSS proxy: sum of writable VMA lengths (anonymous
+                    // pages we'll have actually touched).  Bounded above
+                    // by the address-space VMA total.
+                    let rss = {
+                        let procs = crate::proc::PROCESS_TABLE.lock();
+                        procs.iter().find(|p| p.pid == pid)
+                            .and_then(|p| p.vm_space.as_ref().map(|v| {
+                                let bytes: u64 = v.areas.iter()
+                                    .filter(|a| (a.prot & crate::mm::vma::PROT_WRITE) != 0)
+                                    .map(|a| a.length)
+                                    .sum();
+                                bytes / 1024
+                            }))
+                            .unwrap_or(0)
+                    };
+                    (rss, snap.pf_count, inb, oub)
+                } else {
+                    (0u64, 0u64, 0u64, 0u64)
+                };
+                (utime_us, rss_kb, minflt, inb, oub)
+            };
+
+            unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                // Zero the whole struct first (guarantees padding is clean).
+                core::ptr::write_bytes(arg2 as *mut u8, 0, 144);
+                let p = arg2 as *mut i64;
+                // ru_utime.tv_sec / tv_usec
+                *p          = (utime_us / 1_000_000) as i64;
+                *p.add(1)   = (utime_us % 1_000_000) as i64;
+                // ru_stime.tv_sec / tv_usec — left at zero (no per-PID kernel-
+                // time counter yet); future work would split user vs system.
+                // ru_maxrss at offset 32 (index 4)
+                *p.add(4)   = max_rss_kb as i64;
+                // ru_minflt at offset 64 (index 8)
+                *p.add(8)   = minflt as i64;
+                // ru_majflt — left at zero; no per-PID major-fault counter
+                // yet (would require distinguishing CoW/anon faults from
+                // file-backed page-ins in the page-fault handler).
+                *p.add(9)   = 0;
+                // ru_inblock at offset 88 (index 11)
+                *p.add(11)  = inblock as i64;
+                *p.add(12)  = oublock as i64; // ru_oublock at offset 96
+                // ru_nvcsw / ru_nivcsw at offsets 128, 136 — left at zero
+                // (no per-PID context-switch counter; safe minimum).
             }
             0
         }
-        // 99: sysinfo(info) — system statistics
+        // 99: sysinfo(info) — system statistics, per `man 2 sysinfo`.
+        //
+        // struct sysinfo on x86_64 is 112 bytes (NOT 64 as the legacy stub
+        // assumed).  Per <sys/sysinfo.h> (Linux 2.3.23+):
+        //   off  0  long          uptime      — seconds since boot
+        //   off  8  unsigned long loads[3]    — 1/5/15-min load averages
+        //   off 32  unsigned long totalram    — total memory (× mem_unit)
+        //   off 40  unsigned long freeram     — free memory
+        //   off 48  unsigned long sharedram
+        //   off 56  unsigned long bufferram
+        //   off 64  unsigned long totalswap
+        //   off 72  unsigned long freeswap
+        //   off 80  unsigned short procs      — process count
+        //   off 88  unsigned long totalhigh   — high memory total (zero on x86_64)
+        //   off 96  unsigned long freehigh
+        //   off 104 unsigned int  mem_unit    — memory unit size in bytes
+        //   off 108 char _f[0]                — no trailing padding on x86_64
+        //                                       since 20 - 2*8 - 4 == 0.
+        //
+        // Returns -EFAULT on NULL pointer (sysinfo(2) ERRORS).
         99 => {
-            if arg1 != 0 {
-                // struct sysinfo: 11 fields, 64 bytes total
-                #[cfg(feature = "firefox-test")]
-                crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Sysinfo, arg1 as *const u8, 64);
-                // uptime (seconds) at offset 0
-                let ticks = crate::arch::x86_64::irq::get_ticks();
-                let uptime = (ticks / 100) as i64; // 100 Hz
-                unsafe {
-                    let _g = crate::arch::x86_64::smap::UserGuard::new();
-                    core::ptr::write_bytes(arg1 as *mut u8, 0, 64);
-                    *(arg1 as *mut i64) = uptime;
-                    // totalram / freeram at offsets 8 / 16 (u64 each)
-                    let p = arg1 as *mut u64;
-                    *p.add(1) = 256 * 1024 * 1024; // 256 MiB totalram
-                    *p.add(2) = 128 * 1024 * 1024; // 128 MiB freeram
-                    *p.add(9) = 1; // mem_unit = 1 byte
-                }
+            // -EFAULT on NULL, kernel-VA, or overflowing pointer.  Per
+            // sysinfo(2) ERRORS.  UserGuard alone is insufficient — see
+            // CWE-822; kernel-mode writes ignore SMAP AC=1.
+            if !crate::syscall::validate_user_ptr(arg1, 112) {
+                return -14; // EFAULT
+            }
+            #[cfg(feature = "firefox-test")]
+            crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Sysinfo, arg1 as *const u8, 112);
+
+            // Live system state.
+            let ticks = crate::arch::x86_64::irq::get_ticks();
+            let uptime = (ticks / 100) as i64; // 100 Hz → seconds
+            // PMM stats (pages, each 4 KiB).  Express in bytes for
+            // consistency with mem_unit=1.
+            let (total_pages, used_pages) = crate::mm::pmm::stats();
+            let total_bytes = total_pages.saturating_mul(4096);
+            let free_bytes  = total_pages.saturating_sub(used_pages).saturating_mul(4096);
+            let procs       = crate::proc::process_count().min(u16::MAX as usize) as u16;
+
+            unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                // Zero the whole struct first (clean padding bytes).
+                core::ptr::write_bytes(arg1 as *mut u8, 0, 112);
+                // Byte-precise field writes (avoid pointer-arithmetic
+                // index ambiguity that bit the previous version).
+                let base = arg1 as *mut u8;
+                core::ptr::write_unaligned(base.add(0)  as *mut i64,  uptime);
+                // loads[0..3] left at zero (no load-average estimator yet).
+                core::ptr::write_unaligned(base.add(32) as *mut u64, total_bytes);
+                core::ptr::write_unaligned(base.add(40) as *mut u64, free_bytes);
+                // sharedram, bufferram, totalswap, freeswap left at zero.
+                core::ptr::write_unaligned(base.add(80) as *mut u16, procs);
+                // totalhigh, freehigh left at zero (none on x86_64).
+                core::ptr::write_unaligned(base.add(104) as *mut u32, 1u32); // mem_unit = 1 byte
             }
             0
         }
