@@ -35,6 +35,32 @@ const MAX_RETRIES: u8 = 5;
 /// TIME_WAIT duration in ticks (2 s, simplified from 2×MSL).
 const TIMEWAIT_TICKS: u64 = 200;
 
+/// Maximum number of `TcpConnection` entries retained in `TCP_CONNECTIONS`.
+///
+/// `TcpConnection` carries `Vec<u8>` send/recv buffers, a `VecDeque` of
+/// retransmit entries, and ~200 B of TCB fields.  In steady state every
+/// outbound or accepted connection allocates one entry; without an
+/// upper bound, long-soak workloads (a periodic host-side probe loop,
+/// a retry-storming client, or simply many short-lived control flows)
+/// accumulate Closed entries on the kernel heap until the 128 MiB heap
+/// guard at `HEAP_START + HEAP_SIZE` fires (idt.rs page-fault handler).
+///
+/// 1024 is generous for the in-kernel TCP stack — the demo workload has
+/// ≤ 10 live flows at any moment — and bounds the worst-case Closed
+/// pile at ~200 KiB even before periodic GC catches up.  Per BSD
+/// `net.inet.tcp.maxtcptw` / Linux `tcp_max_orphans` precedent the cap
+/// is conventional, not a correctness lever.
+const MAX_TCP_CONNECTIONS: usize = 1024;
+
+/// Grace period before a `Closed` connection is eligible for GC.
+///
+/// Connections enter `Closed` either via TIME_WAIT expiry, a peer RST,
+/// or a local close that completed cleanly.  We keep the entry for
+/// `CLOSED_GC_GRACE_TICKS` ≈ 500 ms (50 ticks at 100 Hz) so that a
+/// late-arriving segment for the same 4-tuple does not allocate a
+/// brand-new TCB (with all its zero-init buffers) before being RST'd.
+const CLOSED_GC_GRACE_TICKS: u64 = 50;
+
 // ── Data structures ────────────────────────────────────────────────────────────
 
 /// One unacknowledged segment sitting in the retransmit queue.
@@ -100,6 +126,14 @@ pub struct TcpConnection {
 
     // TIME_WAIT expiry
     timewait_start: u64,
+
+    /// Tick at which this connection most recently entered `Closed`.
+    /// Sentinel `0` means "never closed" (still live).  Used by
+    /// `gc_closed_in` to drop entries whose Closed dwell exceeds
+    /// `CLOSED_GC_GRACE_TICKS` — bounds `TCP_CONNECTIONS` growth on
+    /// long soaks where short-lived control flows would otherwise
+    /// pile up indefinitely on the heap.
+    closed_tick: u64,
 }
 
 // ── ISN generation ─────────────────────────────────────────────────────────────
@@ -125,6 +159,45 @@ pub fn new_isn() -> u32 {
 // ── Global table ───────────────────────────────────────────────────────────────
 
 static TCP_CONNECTIONS: Mutex<Vec<TcpConnection>> = Mutex::new(Vec::new());
+
+/// Diagnostic: number of entries in `TCP_CONNECTIONS`.  Brief try-lock;
+/// returns `None` if contended.  Used by `kdb heap-stats` to monitor
+/// long-soak growth without blocking the kdb pump thread.
+pub fn connection_count() -> Option<usize> {
+    for _ in 0..2048 {
+        if let Some(g) = TCP_CONNECTIONS.try_lock() { return Some(g.len()); }
+        core::hint::spin_loop();
+    }
+    None
+}
+
+/// Mark `conn` as Closed and record the tick for later GC.
+///
+/// All transitions to `TcpState::Closed` go through this helper so the
+/// dwell timer (`closed_tick`) is set consistently.  Without it, an
+/// entry torn down via a path that forgot to update `closed_tick`
+/// would sit at the `0` sentinel and survive every GC pass — exactly
+/// the leak pattern that produces the slow steady-state heap growth on
+/// long firefox-test soaks.
+#[inline]
+fn mark_closed(conn: &mut TcpConnection) {
+    conn.state = TcpState::Closed;
+    conn.closed_tick = crate::arch::x86_64::irq::get_ticks().max(1);
+}
+
+/// Drop entries whose Closed dwell exceeds `CLOSED_GC_GRACE_TICKS`.
+/// Caller must hold the `TCP_CONNECTIONS` lock.
+///
+/// `Vec::retain(false)` drops the discarded `TcpConnection` value in
+/// full, releasing the embedded `recv_buffer`/`send_buffer`/
+/// `retransmit_queue` capacity back to the kernel heap.
+fn gc_closed_in(conns: &mut alloc::vec::Vec<TcpConnection>, now: u64) {
+    conns.retain(|c| !(
+        c.state == TcpState::Closed
+            && c.closed_tick != 0
+            && now.wrapping_sub(c.closed_tick) >= CLOSED_GC_GRACE_TICKS
+    ));
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -288,7 +361,7 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
             c.remote_port == hdr.src_port
         ) {
             crate::serial_println!("[TCP] RST: closing port {}", c.local_port);
-            c.state = TcpState::Closed;
+            mark_closed(c);
             c.retransmit_queue.clear();
         }
         return;
@@ -325,6 +398,21 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
             let lip     = dst_ip;
             let lport   = conns[li].local_port;
             let rcv_nxt = hdr.seq_num.wrapping_add(1);
+            // Defensive cap: never grow `TCP_CONNECTIONS` past the upper
+            // bound.  If long-soak accumulation has filled the table,
+            // sweep first; if still full, drop the incoming SYN (peer
+            // will retry — RFC 793 §3.4).
+            let now = crate::arch::x86_64::irq::get_ticks();
+            if conns.len() >= MAX_TCP_CONNECTIONS {
+                gc_closed_in(&mut conns, now);
+                if conns.len() >= MAX_TCP_CONNECTIONS {
+                    drop(conns);
+                    crate::serial_println!(
+                        "[TCP] cap-reached: dropping SYN from {}.{}.{}.{}:{}",
+                        src_ip[0], src_ip[1], src_ip[2], src_ip[3], hdr.src_port);
+                    return;
+                }
+            }
             conns.push(TcpConnection {
                 local_ip:    lip,
                 local_port:  lport,
@@ -348,6 +436,7 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
                 rcvbuf:      87380,
                 sndbuf:      131072,
                 timewait_start: 0,
+                closed_tick: 0,
             });
             drop(conns);
             send_flags(lip, lport, src_ip, hdr.src_port, isn, rcv_nxt, SYN | ACK);
@@ -450,7 +539,7 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8]) {
         TcpState::LastAck => {
             // Our FIN has been acknowledged → connection done.
             if hdr.flags & ACK != 0 {
-                conn.state = TcpState::Closed;
+                mark_closed(conn);
                 conn.retransmit_queue.clear();
                 crate::serial_println!("[TCP] Closed (LastAck → Closed) port {}", lp);
             }
@@ -561,7 +650,7 @@ pub fn tcp_timer_tick() {
             // TIME_WAIT expiry.
             if conn.state == TcpState::TimeWait {
                 if now.wrapping_sub(conn.timewait_start) >= TIMEWAIT_TICKS {
-                    conn.state = TcpState::Closed;
+                    mark_closed(conn);
                 }
                 continue;
             }
@@ -583,7 +672,7 @@ pub fn tcp_timer_tick() {
                             seq: conn.send_next, ack: 0, flags: RST,
                             payload: Vec::new(),
                         });
-                        conn.state = TcpState::Closed;
+                        mark_closed(conn);
                         conn.retransmit_queue.clear();
                     } else {
                         e.retries   += 1;
@@ -628,6 +717,14 @@ pub fn tcp_timer_tick() {
         }
 
         conns.retain(|c| !(c.state == TcpState::Closed && aborted.contains(&c.local_port)));
+
+        // Reap Closed connections whose grace period has expired.  Bounds
+        // long-soak `TCP_CONNECTIONS` growth: every accepted/connected flow
+        // eventually transitions to `Closed`, and without this sweep the
+        // entries (plus their `Vec` send/recv buffers) accumulate on the
+        // kernel heap until the 128 MiB heap guard fires.  Driven from the
+        // 100 Hz timer tick — adds one O(n) retain per second.
+        gc_closed_in(&mut conns, now);
     }
 
     for job in jobs {
@@ -801,6 +898,13 @@ pub fn test_inject_established(local_port: u16, remote_ip: Ipv4Address,
         return Err("duplicate 4-tuple");
     }
     let isn = new_isn();
+    let now = crate::arch::x86_64::irq::get_ticks();
+    if conns.len() >= MAX_TCP_CONNECTIONS {
+        gc_closed_in(&mut conns, now);
+        if conns.len() >= MAX_TCP_CONNECTIONS {
+            return Err("TCP_CONNECTIONS cap reached");
+        }
+    }
     conns.push(TcpConnection {
         local_ip:    super::our_ip(),
         local_port,
@@ -824,6 +928,7 @@ pub fn test_inject_established(local_port: u16, remote_ip: Ipv4Address,
         rcvbuf:      87380,
         sndbuf:      131072,
         timewait_start: 0,
+        closed_tick: 0,
     });
     Ok(())
 }
@@ -863,6 +968,13 @@ pub fn listen(port: u16) -> Result<(), &'static str> {
         return Err("port already listening");
     }
     let isn = new_isn();
+    let now = crate::arch::x86_64::irq::get_ticks();
+    if conns.len() >= MAX_TCP_CONNECTIONS {
+        gc_closed_in(&mut conns, now);
+        if conns.len() >= MAX_TCP_CONNECTIONS {
+            return Err("TCP_CONNECTIONS cap reached");
+        }
+    }
     conns.push(TcpConnection {
         local_ip:    super::our_ip(),
         local_port:  port,
@@ -886,6 +998,7 @@ pub fn listen(port: u16) -> Result<(), &'static str> {
         rcvbuf:      87380,
         sndbuf:      131072,
         timewait_start: 0,
+        closed_tick: 0,
     });
     Ok(())
 }
@@ -899,6 +1012,13 @@ pub fn connect(remote_ip: Ipv4Address, remote_port: u16) -> Result<u16, &'static
 
     {
         let mut conns = TCP_CONNECTIONS.lock();
+        let now = crate::arch::x86_64::irq::get_ticks();
+        if conns.len() >= MAX_TCP_CONNECTIONS {
+            gc_closed_in(&mut conns, now);
+            if conns.len() >= MAX_TCP_CONNECTIONS {
+                return Err("TCP_CONNECTIONS cap reached");
+            }
+        }
         conns.push(TcpConnection {
             local_ip,
             local_port,
@@ -922,6 +1042,7 @@ pub fn connect(remote_ip: Ipv4Address, remote_port: u16) -> Result<u16, &'static
             rcvbuf:      87380,
             sndbuf:      131072,
             timewait_start: 0,
+            closed_tick: 0,
         });
     }
     send_flags(local_ip, local_port, remote_ip, remote_port, isn, 0, SYN);
@@ -965,7 +1086,7 @@ pub fn abort(port: u16) -> Result<(), &'static str> {
                 sn: conn.send_next, rn: conn.recv_next,
             })
         } else { None };
-        conn.state = TcpState::Closed;
+        mark_closed(conn);
         conn.retransmit_queue.clear();
         info
     };
