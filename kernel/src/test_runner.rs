@@ -1877,6 +1877,16 @@ pub fn run() -> ! {
     total += 1;
     if test_242_sched_picker_non_idle_precedence() { passed += 1; }
 
+    // ── Test 243: vfork stack alloc rejects untrusted pointers (CWE-822) ──
+    // Verifies the Phase 0 guard added to `alloc_vfork_child_stack`: a
+    // kernel-half `new_stack` (arg2 of clone(2)) must be rejected with
+    // None and must NOT create a `[vfork-stack]` VMA — without this
+    // check the SMAP-bracketed deref would yield an arbitrary
+    // kernel-memory read primitive (CWE-822 / CWE-200).  Also covers
+    // misaligned user pointers (POSIX clone(2) stack-arg ABI).
+    total += 1;
+    if test_vfork_alloc_rejects_kernel_va() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -31993,5 +32003,119 @@ fn test_242_sched_picker_non_idle_precedence() -> bool {
 
     test_println!("  all {} workers completed {} cycles each ✓", N_WORKERS, ITERS);
     test_pass!("scheduler picker non-idle precedence (POSIX SCHED_OTHER)");
+    true
+}
+
+// ── Test 243: vfork stack alloc rejects untrusted pointers (CWE-822 / CWE-200) ─
+//
+// `alloc_vfork_child_stack(parent_pid, parent_new_stack)` dereferences the
+// caller-supplied `parent_new_stack` inside a UserGuard (SMAP-disabled)
+// bracket and copies the resulting 8 bytes into a freshly mapped
+// PAGE_USER `[vfork-stack]` page.  Because `parent_new_stack` is arg2 of
+// `clone(2)` (sc 56) — fully attacker-controlled — without input
+// validation a canonical kernel-half VA would yield a clean arbitrary
+// kernel-memory read primitive (CWE-822 untrusted pointer dereference;
+// CWE-200 information exposure).
+//
+// This test verifies the Phase 0 guard in `alloc_vfork_child_stack`:
+//   1. A kernel-half pointer (>= KERNEL_VIRT_BASE) is rejected with `None`.
+//   2. A misaligned user pointer is rejected with `None`.
+// Both cases must complete without creating any `[vfork-stack]` VMA in
+// the supplied parent's VmSpace.
+fn test_vfork_alloc_rejects_kernel_va() -> bool {
+    test_header!("vfork stack alloc rejects untrusted pointers (CWE-822 / CWE-200)");
+
+    // Build a real parent process with a usable VmSpace so the test can
+    // distinguish "rejected at Phase 0" from "rejected later because the
+    // parent had no vm_space".  `fork_process_share_vm(0, ...)` returns a
+    // PID/TID pair whose process inherits the idle process's PML4 (giving
+    // it a non-zero CR3 and a fresh VmSpace).
+    let dummy_regs = crate::proc::ForkUserRegs::default();
+    let (parent_pid, parent_tid) = match crate::proc::fork_process_share_vm(0, 0, &dummy_regs) {
+        Some(pair) => pair,
+        None => {
+            test_fail!("vfork_alloc_rejects_kernel_va",
+                "could not stand up dummy parent process (ENOMEM/EAGAIN?)");
+            return false;
+        }
+    };
+
+    // Helper: count `[vfork-stack]` VMAs in `parent_pid`'s VmSpace.
+    let count_vfork_vmas = || -> usize {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == parent_pid).and_then(|p| p.vm_space.as_ref()) {
+            Some(vs) => vs.areas.iter().filter(|v| v.name == "[vfork-stack]").count(),
+            None => 0,
+        }
+    };
+
+    // Baseline: parent VmSpace has no [vfork-stack] entries.
+    let baseline = count_vfork_vmas();
+    if baseline != 0 {
+        test_fail!("vfork_alloc_rejects_kernel_va",
+            "dummy parent already has {} [vfork-stack] VMA(s); test setup broken",
+            baseline);
+        // Best-effort cleanup before bailing.
+        crate::proc::PROCESS_TABLE.lock().retain(|p| p.pid != parent_pid);
+        crate::proc::THREAD_TABLE.lock().retain(|t| t.tid != parent_tid);
+        return false;
+    }
+
+    // ── Case A: kernel-half pointer (canonical higher-half VA).
+    // Anything >= KERNEL_VIRT_BASE (0xFFFF_8000_0000_0000) must fail
+    // `validate_user_ptr` before the SMAP-bracketed deref runs.
+    let kernel_va = astryx_shared::KERNEL_VIRT_BASE; // 0xFFFF_8000_0000_0000
+    let r1 = crate::proc::alloc_vfork_child_stack(parent_pid, kernel_va);
+    if r1.is_some() {
+        test_fail!("vfork_alloc_rejects_kernel_va",
+            "kernel-half new_stack={:#x} accepted (returned {:?}) — arbitrary kernel-read primitive!",
+            kernel_va, r1);
+        crate::proc::PROCESS_TABLE.lock().retain(|p| p.pid != parent_pid);
+        crate::proc::THREAD_TABLE.lock().retain(|t| t.tid != parent_tid);
+        return false;
+    }
+    if count_vfork_vmas() != 0 {
+        test_fail!("vfork_alloc_rejects_kernel_va",
+            "kernel-half new_stack rejected but [vfork-stack] VMA still created (Phase 0 ran after VMA insert?)");
+        crate::proc::PROCESS_TABLE.lock().retain(|p| p.pid != parent_pid);
+        crate::proc::THREAD_TABLE.lock().retain(|t| t.tid != parent_tid);
+        return false;
+    }
+    test_println!("  case A: kernel-half new_stack={:#x} -> None, no VMA created ✓", kernel_va);
+
+    // ── Case B: misaligned user-half pointer.
+    // `validate_user_ptr` would accept this, but the explicit alignment
+    // check in Phase 0 rejects it before the deref.
+    let misaligned_user_va: u64 = 0x0000_7fff_ffff_f001;
+    let r2 = crate::proc::alloc_vfork_child_stack(parent_pid, misaligned_user_va);
+    if r2.is_some() {
+        test_fail!("vfork_alloc_rejects_kernel_va",
+            "misaligned user new_stack={:#x} accepted (returned {:?})",
+            misaligned_user_va, r2);
+        crate::proc::PROCESS_TABLE.lock().retain(|p| p.pid != parent_pid);
+        crate::proc::THREAD_TABLE.lock().retain(|t| t.tid != parent_tid);
+        return false;
+    }
+    if count_vfork_vmas() != 0 {
+        test_fail!("vfork_alloc_rejects_kernel_va",
+            "misaligned new_stack rejected but [vfork-stack] VMA still created");
+        crate::proc::PROCESS_TABLE.lock().retain(|p| p.pid != parent_pid);
+        crate::proc::THREAD_TABLE.lock().retain(|t| t.tid != parent_tid);
+        return false;
+    }
+    test_println!("  case B: misaligned user new_stack={:#x} -> None, no VMA created ✓",
+        misaligned_user_va);
+
+    // Cleanup: reap the dummy parent process + thread we created above.
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        procs.retain(|p| p.pid != parent_pid);
+    }
+    {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        threads.retain(|t| t.tid != parent_tid);
+    }
+
+    test_pass!("vfork stack alloc rejects untrusted pointers (CWE-822 / CWE-200)");
     true
 }

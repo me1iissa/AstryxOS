@@ -263,6 +263,24 @@ pub struct Thread {
     /// path (initial thread, fork-style clone with a fresh CR3, kernel
     /// threads, AP idle threads).
     pub vfork_isolated_stack: Option<(u64, u64)>,
+    /// Kernel-allocated isolated TLS page for a `CLONE_VM|CLONE_VFORK` child.
+    ///
+    /// A `CLONE_VM` child MUST NOT share the parent's `FS.base` TLS region.
+    /// musl's SSP epilogue (`xor [%fs:0x28], saved_canary; jnz __stack_chk_fail`)
+    /// zeroes the TLS canary slot on every successful function return.  If the
+    /// child shares the parent's `FS.base`, it zeroes the parent's canary slot
+    /// before the parent resumes; the parent's next SSP epilogue then compares
+    /// `0 XOR parent_canary != 0` and calls `__stack_chk_fail` → #GP.
+    ///
+    /// Fix: allocate a fresh 4 KiB page per vfork child, write the TLS
+    /// self-pointer at offset 0x00 (so `%fs:0x0` yields a valid pthread_self),
+    /// and leave offset 0x28 as zero (the SSP canary slot; SSP stores and
+    /// checks zero, producing no fault and no parent corruption).
+    ///
+    /// Recorded here so the kernel can unmap the page from the parent's
+    /// address space on `execve(2)` / vfork-child exit.  `None` for all
+    /// non-CLONE_VM threads.
+    pub vfork_isolated_tls: Option<u64>,
 }
 
 impl Thread {
@@ -686,6 +704,7 @@ pub fn init() {
         robust_list_head: 0,
         robust_list_len: 0,
         vfork_isolated_stack: None,
+        vfork_isolated_tls: None,
     };
 
     PROCESS_TABLE.lock().push(idle_proc);
@@ -935,6 +954,7 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
         robust_list_head: 0,
         robust_list_len: 0,
         vfork_isolated_stack: None,
+        vfork_isolated_tls: None,
     };
 
     PROCESS_TABLE.lock().push(process);
@@ -1001,6 +1021,7 @@ pub fn create_thread(pid: Pid, name: &str, entry_point: u64) -> Option<Tid> {
         robust_list_head: 0,
         robust_list_len: 0,
         vfork_isolated_stack: None,
+        vfork_isolated_tls: None,
     };
 
     THREAD_TABLE.lock().push(thread);
@@ -1071,6 +1092,7 @@ pub fn create_thread_blocked(pid: Pid, name: &str, entry_point: u64) -> Option<T
         robust_list_head: 0,
         robust_list_len: 0,
         vfork_isolated_stack: None,
+        vfork_isolated_tls: None,
     };
 
     THREAD_TABLE.lock().push(thread);
@@ -1175,26 +1197,34 @@ pub fn exit_thread(exit_code: i64) {
     // Linux: exit_mm_release() → mm_release() → complete_vfork_done().
     crate::syscall::wake_vfork_parent();
 
-    // Vfork isolated-stack cleanup: if this thread is a vfork child that
-    // was given a kernel-allocated isolated stack by `alloc_vfork_child_stack`
-    // and exited WITHOUT execve(2) (the execve case is handled in
-    // `syscall::sys_exec` step 5a), unmap the stack from the parent's
-    // address space now.  The parent is still alive (zombie-able) and owns
-    // the cr3 we mapped against; failing to unmap here would leak the VMA
-    // until the parent itself exits.
+    // Vfork isolated-stack + isolated-TLS cleanup: if this thread is a
+    // vfork child that was given kernel-allocated resources by the clone
+    // dispatcher and exited WITHOUT execve(2) (the execve case is handled
+    // in `syscall::sys_exec` step 5a), unmap them from the parent's address
+    // space now.  The parent is still alive (zombie-able) and owns the cr3
+    // we mapped against; failing to unmap here would leak the VMAs.
     {
-        let isolated = {
+        let (isolated_stack, isolated_tls) = {
             let threads = THREAD_TABLE.lock();
             threads.iter().find(|t| t.tid == tid)
-                .and_then(|t| t.vfork_isolated_stack)
+                .map(|t| (t.vfork_isolated_stack, t.vfork_isolated_tls))
+                .unwrap_or((None, None))
         };
-        if let Some((base, length)) = isolated {
+        if let Some((base, length)) = isolated_stack {
             if parent_pid != 0 {
                 vfork_isolated_stack_cleanup(parent_pid, base, length);
             }
+        }
+        if let Some(tls_va) = isolated_tls {
+            if parent_pid != 0 {
+                vfork_isolated_tls_cleanup(parent_pid, tls_va);
+            }
+        }
+        if isolated_stack.is_some() || isolated_tls.is_some() {
             let mut threads = THREAD_TABLE.lock();
             if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
                 t.vfork_isolated_stack = None;
+                t.vfork_isolated_tls = None;
             }
         }
     }
@@ -1803,22 +1833,26 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
         crate::syscall::wake_vfork_parent();
     }
 
-    // Vfork isolated-stack cleanup: same rationale as exit_thread (see
-    // there for the longer comment).  We harvest the field from the
-    // calling thread (the vfork child) and unmap the recorded VMA from
-    // the parent's address space.  Out-of-band callers (yield_self==false)
-    // do not own a calling_tid of the dying process, so they skip this.
+    // Vfork isolated-stack + isolated-TLS cleanup: same rationale as
+    // exit_thread.  Out-of-band callers (yield_self==false) skip this.
     if yield_self && calling_tid != 0 && parent_pid != 0 {
-        let isolated = {
+        let (isolated_stack, isolated_tls) = {
             let threads = THREAD_TABLE.lock();
             threads.iter().find(|t| t.tid == calling_tid)
-                .and_then(|t| t.vfork_isolated_stack)
+                .map(|t| (t.vfork_isolated_stack, t.vfork_isolated_tls))
+                .unwrap_or((None, None))
         };
-        if let Some((base, length)) = isolated {
+        if let Some((base, length)) = isolated_stack {
             vfork_isolated_stack_cleanup(parent_pid, base, length);
+        }
+        if let Some(tls_va) = isolated_tls {
+            vfork_isolated_tls_cleanup(parent_pid, tls_va);
+        }
+        if isolated_stack.is_some() || isolated_tls.is_some() {
             let mut threads = THREAD_TABLE.lock();
             if let Some(t) = threads.iter_mut().find(|t| t.tid == calling_tid) {
                 t.vfork_isolated_stack = None;
+                t.vfork_isolated_tls = None;
             }
         }
     }
@@ -2258,6 +2292,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
         robust_list_head: 0,
         robust_list_len: 0,
         vfork_isolated_stack: None,
+        vfork_isolated_tls: None,
     };
 
     PROCESS_TABLE.lock().push(child_proc);
@@ -2353,9 +2388,13 @@ pub fn fork_process_share_vm(
         }
     }
 
-    // Read parent's user-mode return site and TLS base.  RIP/RSP from the
-    // parent's syscall frame; the caller will override them per clone_args.
-    let (user_rip, user_rsp, parent_tls_base) = {
+    // Read parent's user-mode return site.  RIP/RSP from the parent's syscall
+    // frame; the caller will override them per clone_args.
+    // Note: parent_tls_base is intentionally NOT used here — the child gets
+    // its own isolated TLS page via `alloc_vfork_child_tls` in the clone
+    // dispatcher.  Inheriting parent_tls_base would cause SSP corruption
+    // (musl's `xor [%fs:0x28], canary` zeroes the parent's canary slot).
+    let (user_rip, user_rsp, _parent_tls_base) = {
         let threads = THREAD_TABLE.lock();
         if let Some(parent_thread) = threads.iter().find(|t| t.tid == _parent_tid) {
             let tls = parent_thread.tls_base;
@@ -2464,23 +2503,22 @@ pub fn fork_process_share_vm(
         user_entry_r8:  0,
         priority: PRIORITY_NORMAL,
         base_priority: PRIORITY_NORMAL,
-        // VFORK / CLONE_VM child inherits the parent's FS.base so it can use
-        // thread-local storage immediately.  The glxtest child function in
-        // libxul calls fork(2) (which internally reads %fs:0 via musl's
-        // pthread machinery), so a zeroed FS.base would fault immediately.
+        // VFORK / CLONE_VM child TLS: set to 0 here; the clone(2)/clone3(2)
+        // dispatcher immediately replaces this with a kernel-allocated
+        // isolated TLS page via `alloc_vfork_child_tls`.
         //
-        // The parent's SSP canary lives at parent_tls_base + 0x28.  The child
-        // must not write to that offset while sharing the TLS struct.  In
-        // practice, musl's fork() path only READS %fs:0 (to obtain the thread
-        // self-pointer for atfork handler iteration); it never writes %fs:0x28
-        // before the child calls _exit().  Therefore inheriting the parent's
-        // TLS base is safe for the brief vfork window.
+        // MUST NOT inherit `parent_tls_base` here:
+        // musl's SSP epilogue (`xor [%fs:0x28], saved_canary; jnz __stack_chk_fail`)
+        // zeroes the TLS canary slot on EVERY successful function return.  If
+        // the child shared the parent's FS.base, it would zero the parent's
+        // canary slot before the parent resumes.  The parent's next SSP
+        // epilogue then computes `0 XOR parent_canary != 0` and calls
+        // `__stack_chk_fail` → `hlt` in ring-3 → #GP.
         //
-        // If the child calls arch_prctl(ARCH_SET_FS, new_tls) (e.g., via
-        // execve -> ld-musl startup), sys_arch_prctl updates its own tls_base
-        // in THREAD_TABLE; the scheduler restores the parent's tls_base when
-        // the parent next runs.
-        tls_base: parent_tls_base,
+        // The isolated TLS page (allocated by `alloc_vfork_child_tls`) has
+        // a valid self-pointer at offset 0x00 and a zero canary at 0x28.
+        // SSP stores/checks 0; no fault, no parent corruption.
+        tls_base: 0,
         cpu_affinity: None,
         last_cpu: 0,
         first_run: true,
@@ -2492,6 +2530,7 @@ pub fn fork_process_share_vm(
         robust_list_head: 0,
         robust_list_len: 0,
         vfork_isolated_stack: None,
+        vfork_isolated_tls: None,
     };
 
     PROCESS_TABLE.lock().push(child_proc);
@@ -2587,12 +2626,47 @@ pub fn alloc_vfork_child_stack(parent_pid: Pid, parent_new_stack: u64) -> Option
     // costs at most a few hundred KiB in steady state.
     const VFORK_STACK_SIZE: u64 = 64 * 1024;
 
-    // ── Phase 1: read the helper-arg word musl pushed onto the parent stack.
+    // ── Phase 0: validate `parent_new_stack` is a well-formed user pointer.
     //
-    // We are still executing in the parent's syscall context, so the user-VA
-    // `parent_new_stack` is directly readable under SMAP.  The 8-byte read
-    // is what musl's `__clone` wrote via `mov %rcx,(%rsi)`; the child will
-    // `pop %rdi` from this slot as its first user instruction.
+    // `parent_new_stack` is `arg2` of `clone(2)` (sc 56) — fully
+    // attacker-controlled.  Phase 1 below dereferences it inside an
+    // SMAP-disabled `UserGuard` bracket and writes the resulting 8 bytes
+    // into a user-readable `[vfork-stack]` page, so without validation
+    // any canonical kernel-half VA would yield a clean arbitrary
+    // kernel-memory read primitive (CWE-822 untrusted pointer dereference
+    // / CWE-200 information exposure).
+    //
+    // Reject:
+    //   * any pointer outside the user half (>= KERNEL_VIRT_BASE), null,
+    //     or with `ptr + 8` wrapping — `validate_user_ptr` enforces all
+    //     three conditions.
+    //   * misaligned `parent_new_stack` — POSIX `clone(2)` requires the
+    //     stack argument to reference the caller's address space, and
+    //     the standard x86_64 helper-arg push (`mov %rcx,(%rsi)` style)
+    //     emits an 8-byte aligned write.  An unaligned value is either
+    //     a corrupted ABI or an exploit attempt; either way we refuse.
+    if !crate::syscall::validate_user_ptr(parent_new_stack, 8) {
+        crate::serial_println!(
+            "[VFORK-STACK] reject non-user new_stack={:#x}",
+            parent_new_stack
+        );
+        return None;
+    }
+    if parent_new_stack & 0x7 != 0 {
+        crate::serial_println!(
+            "[VFORK-STACK] reject misaligned new_stack={:#x}",
+            parent_new_stack
+        );
+        return None;
+    }
+
+    // ── Phase 1: read the helper-arg word the caller pushed onto the
+    // parent stack.  After the Phase 0 checks above, `parent_new_stack`
+    // is guaranteed to be a non-null, 8-byte aligned user VA whose
+    // 8-byte range does not cross into the kernel half.  We still
+    // bracket the read with `UserGuard` (Intel SDM Vol. 3A §4.6 STAC
+    // semantics); SMAP is therefore disabled only across this single
+    // load, never with an unvalidated pointer in EFLAGS.AC=1.
     let arg_word: u64 = unsafe {
         let _g = crate::arch::x86_64::smap::UserGuard::new();
         core::ptr::read(parent_new_stack as *const u64)
@@ -2698,6 +2772,127 @@ pub fn vfork_isolated_stack_cleanup(parent_pid: Pid, base: u64, length: u64) {
     crate::serial_println!(
         "[VFORK-STACK] cleanup parent_pid={} cr3={:#x} base={:#x} length={:#x} unmapped_pages={}",
         parent_pid, parent_cr3, base, length, unmapped
+    );
+}
+
+/// Allocate a minimal isolated TLS page for a `CLONE_VM|CLONE_VFORK` child.
+///
+/// ## Why this is needed
+///
+/// musl's SSP epilogue (`xor [%fs:0x28], saved_canary; jnz __stack_chk_fail`)
+/// zeroes the TLS canary slot (FS.base + 0x28) on **every successful function
+/// return**.  If the vfork child shared the parent's `FS.base`, it would zero
+/// the parent's canary word before the parent resumes.  The parent's next SSP
+/// epilogue computes `0 XOR parent_canary != 0` and calls `__stack_chk_fail`
+/// → `hlt` in ring-3 → #GP.
+///
+/// ## What this helper does
+///
+/// 1. Finds a free 4 KiB VA range in the parent's `VmSpace`.
+/// 2. Allocates one physical frame, zeroes it.
+/// 3. Writes a valid self-pointer at offset 0x00 (so `%fs:0x0` yields a
+///    non-NULL `pthread_self` pointer — required by musl's pthread machinery).
+/// 4. Leaves offset 0x28 as zero (the SSP canary slot).  SSP stores 0 into
+///    the slot on entry, verifies 0 on exit; no fault, no parent corruption.
+/// 5. Maps the page into the **parent's** CR3 (the shared address space) with
+///    PRESENT | WRITABLE | USER | NO_EXECUTE.
+/// 6. Records a `[vfork-tls]` VMA in the parent's `VmSpace`.
+///
+/// The caller (clone dispatcher) must:
+///   - Set `Thread.tls_base = returned_va` before unblocking the child.
+///   - Set `Thread.vfork_isolated_tls = Some(returned_va)`.
+///
+/// On `execve(2)` or vfork-child exit, `vfork_isolated_tls_cleanup` unmaps
+/// and frees the page.
+pub fn alloc_vfork_child_tls(parent_pid: Pid) -> Option<u64> {
+    use crate::mm::vma::{VmArea, VmBacking, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS};
+
+    const TLS_SIZE: u64 = 4096;
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+
+    // ── Find a free VA in the parent's address space and insert VMA. ────
+    let (parent_cr3, tls_va) = {
+        let mut procs = PROCESS_TABLE.lock();
+        let p = procs.iter_mut().find(|p| p.pid == parent_pid)?;
+        let cr3 = p.cr3;
+        let space = p.vm_space.as_mut()?;
+
+        let va = space.find_free_range(TLS_SIZE)?;
+
+        let vma = VmArea {
+            base: va,
+            length: TLS_SIZE,
+            prot: PROT_READ | PROT_WRITE,
+            flags: MAP_PRIVATE | MAP_ANONYMOUS,
+            backing: VmBacking::Anonymous,
+            name: "[vfork-tls]",
+        };
+        let _ = space.insert_vma(vma);
+        (cr3, va)
+    };
+
+    // ── Allocate and zero the physical frame. ───────────────────────────
+    let frame = crate::mm::pmm::alloc_page()?;
+    unsafe {
+        let virt = (PHYS_OFF + frame) as *mut u8;
+        core::ptr::write_bytes(virt, 0, 4096);
+
+        // Write self-pointer at offset 0x00.  musl's pthread_self() reads
+        // `%fs:0x0` and expects a non-NULL pointer to the TCB header.  We
+        // point the self-pointer back at the TLS page VA itself so that
+        // `pthread_self() != NULL` without requiring a fully-formed TCB.
+        *((PHYS_OFF + frame) as *mut u64) = tls_va; // [%fs:0x0] = self
+        // Offset 0x28 stays zero: SSP canary = 0; SSP stores 0 on prologue,
+        // checks 0 on epilogue — no fault, no parent-canary corruption.
+    }
+
+    // ── Map into the parent's CR3 (PRESENT|WRITABLE|USER|NX). ──────────
+    let page_flags = crate::mm::vmm::PAGE_PRESENT
+        | crate::mm::vmm::PAGE_WRITABLE
+        | crate::mm::vmm::PAGE_USER
+        | crate::mm::vmm::PAGE_NO_EXECUTE;
+    unsafe { crate::mm::vmm::map_page_in(parent_cr3, tls_va, frame, page_flags); }
+
+    // Bump the page refcount so the unmap path drops it cleanly.
+    crate::mm::refcount::page_ref_inc(frame);
+
+    crate::serial_println!(
+        "[VFORK-TLS] alloc va={:#x} parent_pid={} cr3={:#x}",
+        tls_va, parent_pid, parent_cr3
+    );
+
+    Some(tls_va)
+}
+
+/// Tear down an isolated vfork-child TLS page from the **parent's** address
+/// space.  Called from `execve(2)` (Case C — shared-VM child installing a
+/// fresh image) and from the vfork-child exit path.
+///
+/// The page is unmapped via `unmap_and_free_range_in` (which decrements the
+/// refcount and frees the frame when it reaches zero) and the VmSpace entry
+/// is removed via `remove_range`.  Safe to call repeatedly — repeated calls
+/// on the same `tls_va` are no-ops because the PTE / VMA are already gone.
+pub fn vfork_isolated_tls_cleanup(parent_pid: Pid, tls_va: u64) {
+    let parent_cr3 = {
+        let procs = PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == parent_pid).map(|p| p.cr3).unwrap_or(0)
+    };
+    if parent_cr3 == 0 { return; }
+
+    let unmapped = crate::mm::vmm::unmap_and_free_range_in(parent_cr3, tls_va, 4096);
+
+    {
+        let mut procs = PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == parent_pid) {
+            if let Some(space) = p.vm_space.as_mut() {
+                let _ = space.remove_range(tls_va, 4096);
+            }
+        }
+    }
+
+    crate::serial_println!(
+        "[VFORK-TLS] cleanup parent_pid={} cr3={:#x} va={:#x} unmapped={}",
+        parent_pid, parent_cr3, tls_va, unmapped
     );
 }
 
@@ -2912,6 +3107,7 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
         robust_list_head: 0,
         robust_list_len: 0,
         vfork_isolated_stack: None,
+        vfork_isolated_tls: None,
     };
 
     PROCESS_TABLE.lock().push(child_proc);

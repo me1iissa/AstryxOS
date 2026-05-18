@@ -1336,8 +1336,8 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
     //     blocked in `schedule()` with its own RSP elsewhere — so the
     //     unmap is race-free with respect to the parent thread.
     if is_shared_vm_child {
-        let (parent_pid, isolated_stack) = {
-            let tid = crate::proc::current_tid();
+        let tid = crate::proc::current_tid();
+        let (parent_pid, isolated_stack, isolated_tls) = {
             let procs = crate::proc::PROCESS_TABLE.lock();
             let threads = crate::proc::THREAD_TABLE.lock();
             let parent_pid = procs
@@ -1345,22 +1345,28 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
                 .find(|p| p.pid == pid)
                 .map(|p| p.parent_pid)
                 .unwrap_or(0);
-            let isolated = threads
-                .iter()
-                .find(|t| t.tid == tid)
-                .and_then(|t| t.vfork_isolated_stack);
-            (parent_pid, isolated)
+            let t = threads.iter().find(|t| t.tid == tid);
+            let isolated_stack = t.and_then(|t| t.vfork_isolated_stack);
+            let isolated_tls   = t.and_then(|t| t.vfork_isolated_tls);
+            (parent_pid, isolated_stack, isolated_tls)
         };
         if let Some((base, length)) = isolated_stack {
             if parent_pid != 0 {
                 crate::proc::vfork_isolated_stack_cleanup(parent_pid, base, length);
             }
-            // Clear the field so a later (e.g. exit) path does not try to
-            // unmap a now-stale range.
-            let tid = crate::proc::current_tid();
+        }
+        if let Some(tls_va) = isolated_tls {
+            if parent_pid != 0 {
+                crate::proc::vfork_isolated_tls_cleanup(parent_pid, tls_va);
+            }
+        }
+        if isolated_stack.is_some() || isolated_tls.is_some() {
+            // Clear the fields so a later (e.g. exit) path does not try to
+            // unmap now-stale ranges.
             let mut threads = crate::proc::THREAD_TABLE.lock();
             if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
                 t.vfork_isolated_stack = None;
+                t.vfork_isolated_tls = None;
             }
         }
     }
