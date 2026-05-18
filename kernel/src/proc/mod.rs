@@ -21,7 +21,13 @@ pub mod pe;
 pub mod proc_metrics;
 #[cfg(feature = "qga")]
 pub mod qga_elf;
-#[cfg(feature = "firefox-test")]
+// `sample` provides the per-TID syscall + Ring-3 RIP tracker.  Writers
+// (timer ISR + syscall dispatch) are gated behind `firefox-test`, but
+// the module itself is always compiled so kdb introspection ops
+// (proc-list / proc / thread-park-audit / rip-trace) can reference its
+// types and helpers unconditionally.  The static slot table is ~16 KiB
+// BSS — negligible.  Readers behave correctly when no writes have ever
+// happened (all slots return None / 0).
 pub mod sample;
 pub mod stack_walk;
 pub mod thread;

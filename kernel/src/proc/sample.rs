@@ -94,6 +94,25 @@ struct TidSlot {
     /// poll/epoll_wait this is the fd-array pointer or epfd; for read/write
     /// it is the fd; for futex it is the uaddr.  Diagnostic-only.
     last_syscall_arg0: AtomicU64,
+    /// Last user-mode RIP observed for this TID by the per-tick sampler.
+    /// Updated every Ring-3 timer-ISR tick, regardless of the silent-for
+    /// threshold that gates the serial `[SAMPLE]` emission.  Stays at 0
+    /// for kernel threads and TIDs that have never run in Ring 3 under
+    /// this slot.  Used by kdb `proc` / `proc-list` / `rip-trace` to
+    /// surface where a long-running thread is currently parked in
+    /// userspace (cf. `user_entry_rip` which is the frozen entry RIP).
+    last_user_rip: AtomicU64,
+    /// Last user-mode RBP observed alongside `last_user_rip`.  Same update
+    /// cadence and consumer set.  Required by `rip-trace` to walk the
+    /// frame-pointer chain off-tick on the kdb thread without taking any
+    /// per-thread lock.
+    last_user_rbp: AtomicU64,
+    /// Monotonically incremented every time `last_user_rip` is updated.
+    /// `rip-trace` reads this between successive samples to decide whether
+    /// the kernel has produced a fresh observation since the previous
+    /// loop iteration, so the histogram counts distinct ticks rather than
+    /// repeats of the same sample.
+    rip_sample_seq: AtomicU64,
 }
 
 static TID_TABLE: [TidSlot; TID_SLOTS] = [
@@ -103,6 +122,9 @@ static TID_TABLE: [TidSlot; TID_SLOTS] = [
         last_sample_tick: AtomicU64::new(0),
         last_syscall_nr: AtomicU64::new(u64::MAX),
         last_syscall_arg0: AtomicU64::new(0),
+        last_user_rip: AtomicU64::new(0),
+        last_user_rbp: AtomicU64::new(0),
+        rip_sample_seq: AtomicU64::new(0),
     } }; TID_SLOTS
 ];
 
@@ -135,18 +157,29 @@ pub fn record_syscall(tid: u64, tick: u64, nr: u64, arg0: u64) {
 }
 
 /// Snapshot of one TID slot for diagnostic readers (kdb).
+///
+/// `last_user_rip` / `last_user_rbp` / `rip_sample_seq` are populated by
+/// the per-tick sampler in `maybe_sample` on every Ring-3 preemption.
+/// They reflect the *current* user-mode RIP of the slot's TID, in
+/// contrast to `Thread::user_entry_rip` which is the immutable entry
+/// trampoline RIP set once at thread creation.  Both fields read 0 on a
+/// slot that has only ever held a kernel-mode thread.
 #[derive(Clone, Copy)]
 pub struct TidSyscallSample {
     pub tid: u64,
     pub last_syscall_tick: u64,
     pub last_syscall_nr: u64,
     pub last_syscall_arg0: u64,
+    pub last_user_rip: u64,
+    pub last_user_rbp: u64,
+    pub rip_sample_seq: u64,
 }
 
 /// Read the per-TID syscall sample.  Returns `Some` only when the slot is
 /// owned by the requested `tid` (TID-hash collisions return `None` rather
 /// than fabricating a wrong attribution).  Used by kdb `thread-park-audit`
-/// to classify what each thread is parked inside.
+/// to classify what each thread is parked inside, and by kdb `rip-trace`
+/// to poll the current user RIP across a sampling window.
 pub fn read_sample(tid: u64) -> Option<TidSyscallSample> {
     let slot = slot_for(tid);
     let slot_tid = slot.tid.load(Ordering::Relaxed);
@@ -156,8 +189,51 @@ pub fn read_sample(tid: u64) -> Option<TidSyscallSample> {
     let last_syscall_nr = slot.last_syscall_nr.load(Ordering::Relaxed);
     let last_syscall_arg0 = slot.last_syscall_arg0.load(Ordering::Relaxed);
     let last_syscall_tick = slot.last_syscall_tick.load(Ordering::Relaxed);
-    if last_syscall_tick == u64::MAX { return None; }
-    Some(TidSyscallSample { tid, last_syscall_tick, last_syscall_nr, last_syscall_arg0 })
+    let last_user_rip = slot.last_user_rip.load(Ordering::Relaxed);
+    let last_user_rbp = slot.last_user_rbp.load(Ordering::Relaxed);
+    let rip_sample_seq = slot.rip_sample_seq.load(Ordering::Relaxed);
+    if last_syscall_tick == u64::MAX && rip_sample_seq == 0 { return None; }
+    Some(TidSyscallSample {
+        tid,
+        last_syscall_tick,
+        last_syscall_nr,
+        last_syscall_arg0,
+        last_user_rip,
+        last_user_rbp,
+        rip_sample_seq,
+    })
+}
+
+/// Read just the per-TID user-RIP snapshot for `rip-trace` polling.
+///
+/// Returns `(rip, rbp, seq)` if the slot is owned by `tid` and the RIP
+/// has been written at least once; `None` otherwise.  The returned
+/// `seq` lets the caller distinguish a freshly-published sample from a
+/// repeat read of the previous one across loop iterations.  Pure
+/// atomic loads — safe from any context.
+pub fn read_user_rip(tid: u64) -> Option<(u64, u64, u64)> {
+    let slot = slot_for(tid);
+    if slot.tid.load(Ordering::Relaxed) != tid { return None; }
+    let seq = slot.rip_sample_seq.load(Ordering::Relaxed);
+    if seq == 0 { return None; }
+    // Read seq → rip → rbp → seq again.  If the second read sees a
+    // newer seq the writer ran between our two loads; bail (caller
+    // will retry on the next outer-loop iteration).
+    let rip = slot.last_user_rip.load(Ordering::Relaxed);
+    let rbp = slot.last_user_rbp.load(Ordering::Relaxed);
+    let seq2 = slot.rip_sample_seq.load(Ordering::Relaxed);
+    if seq != seq2 { return None; }
+    Some((rip, rbp, seq))
+}
+
+/// Software walk a user-VA `u64` under `cr3`.  Exposed for kdb
+/// `rip-trace` so the kdb thread (running on its own kernel stack) can
+/// walk a *foreign* thread's frame-pointer chain without taking any
+/// per-thread lock.  Returns `None` on unmapped, kernel-half, or
+/// cross-page-with-the-second-page-unmapped reads — never faults.  See
+/// Intel SDM Vol 3A §4.5 for the 4-level paging walk.
+pub fn read_user_u64_at(cr3: u64, va: u64) -> Option<u64> {
+    read_user_u64(cr3, va)
 }
 
 /// Maybe emit a userspace RIP sample from the timer ISR.
@@ -199,6 +275,26 @@ pub fn maybe_sample(tick: u64, frame: &InterruptFrame, saved_rbp: u64) {
     if slot_tid != tid {
         return;
     }
+
+    // ── Always-on lightweight RIP/RBP publish ────────────────────────
+    //
+    // Publish the interrupted user RIP+RBP on EVERY Ring-3 tick,
+    // independent of the silent-for / interval gates that throttle the
+    // serial `[SAMPLE]` block below.  This is the data source for
+    // kdb `rip-trace` (and the corrected `proc`/`proc-list` "current
+    // user RIP" column).  Two relaxed atomic stores per tick on the
+    // hot path; the cache line is already dirty in L1 because the slot
+    // owns the syscall counters this same TID just bumped.
+    //
+    // Store order: rip → rbp → seq (Release).  A reader that observes
+    // a fresh `seq` is guaranteed to see the matching rip/rbp because
+    // all three live in the same cache line (Intel SDM Vol 3A §8.2.3
+    // total-store-order for same-line writes); the Release on `seq`
+    // additionally orders against any future kdb-thread Acquire.
+    slot.last_user_rip.store(frame.rip, Ordering::Relaxed);
+    slot.last_user_rbp.store(saved_rbp, Ordering::Relaxed);
+    slot.rip_sample_seq.fetch_add(1, Ordering::Release);
+
     let last_sc   = slot.last_syscall_tick.load(Ordering::Relaxed);
     let last_smpl = slot.last_sample_tick.load(Ordering::Relaxed);
     if last_sc == u64::MAX {
