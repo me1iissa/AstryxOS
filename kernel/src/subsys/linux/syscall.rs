@@ -6800,7 +6800,26 @@ pub fn sys_futex_linux(
         Relative(u64),        // duration in nanoseconds
         AlreadyExpired,       // absolute deadline in the past
     }
-    let timeout_ns = if timeout_ptr == 0 {
+    // Per futex(2): the `timeout` argument is only consulted for operations
+    // that actually park the caller (WAIT, WAIT_BITSET, LOCK_PI, WAIT_REQUEUE_PI).
+    // For wake-class ops (WAKE, WAKE_OP, WAKE_BITSET, REQUEUE, CMP_REQUEUE,
+    // UNLOCK_PI, TRYLOCK_PI) the 4th syscall argument is reused as a count
+    // or comparison value and MUST NOT be dereferenced as a pointer — musl's
+    // pthread_cond_signal passes a non-zero non-pointer in this slot, so a
+    // blanket dereference here faults on a small integer (e.g. 0x8).
+    //
+    // Mainline Linux uses the same gate: `kernel/futex/syscalls.c` only
+    // calls `get_timespec64()` from the WAIT/LOCK_PI/WAIT_REQUEUE_PI paths,
+    // never from the WAKE paths.  See futex(2) "TIMEOUTS".
+    const FUTEX_OPS_WITH_TIMEOUT: [u64; 5] = [
+        0,  // FUTEX_WAIT
+        9,  // FUTEX_WAIT_BITSET
+        6,  // FUTEX_LOCK_PI
+        8,  // FUTEX_WAIT_REQUEUE_PI
+        11, // FUTEX_LOCK_PI2
+    ];
+    let timeout_consumed_by_op = FUTEX_OPS_WITH_TIMEOUT.contains(&op);
+    let timeout_ns = if timeout_ptr == 0 || !timeout_consumed_by_op {
         TimeoutNs::Indefinite
     } else {
         // Read the full timespec (tv_sec, tv_nsec) under ONE SMAP

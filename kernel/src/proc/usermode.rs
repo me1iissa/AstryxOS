@@ -39,6 +39,16 @@ pub fn create_user_thread(
         procs.iter().find(|p| p.pid == pid)?.cr3
     };
 
+    // Capture the parent's caller-saved register snapshot from the syscall
+    // entry frame.  The child of clone(CLONE_THREAD) must observe the same
+    // R9 (and callee-saves) the parent had at the syscall instruction so
+    // that musl's `__clone` epilogue can dispatch through R9 to the entry
+    // function.  For brand-new processes (which never hit this function)
+    // this would still be valid — they all observe whatever was on the
+    // syscall stack.  See `crate::syscall::read_fork_user_regs` and the
+    // doc on `ForkUserRegs::r9`.
+    let parent_regs = crate::syscall::read_fork_user_regs();
+
     // Populate the run-time fields and mark the thread Ready in one lock region.
     {
         let mut threads = THREAD_TABLE.lock();
@@ -49,13 +59,14 @@ pub fn create_user_thread(
             t.user_entry_r8  = entry_r8;
             t.tls_base       = tls;
             t.context.cr3    = cr3;
+            t.fork_user_regs = parent_regs;
             t.state          = proc::ThreadState::Ready; // safe to schedule now
         }
     }
 
     crate::serial_println!(
-        "[USER] Created clone thread TID {} in PID {}: RIP={:#x} RSP={:#x} TLS={:#x} RDX={:#x} R8={:#x}",
-        tid, pid, user_rip, user_rsp, tls, entry_rdx, entry_r8
+        "[USER] Created clone thread TID {} in PID {}: RIP={:#x} RSP={:#x} TLS={:#x} RDX={:#x} R8={:#x} R9={:#x}",
+        tid, pid, user_rip, user_rsp, tls, entry_rdx, entry_r8, parent_regs.r9
     );
     Some(tid)
 }
@@ -409,6 +420,7 @@ pub unsafe extern "C" fn jump_to_user_mode(
         //
         // ForkUserRegs layout (#[repr(C)] — see proc/mod.rs):
         //   +0  = rbp, +8  = rbx, +16 = r12, +24 = r13, +32 = r14, +40 = r15
+        //   +48 = r9 (parent's R9 at syscall site — musl __clone func pointer)
         //
         // Build IRETQ frame.
         "push 0x1B",        // SS = USER_DATA_SELECTOR
@@ -429,13 +441,18 @@ pub unsafe extern "C" fn jump_to_user_mode(
         "mov r13, [r9 + 24]",    // ForkUserRegs.r13
         "mov r14, [r9 + 32]",    // ForkUserRegs.r14
         "mov r15, [r9 + 40]",    // ForkUserRegs.r15
+        // R9 must be loaded LAST because it is also our pointer to ForkUserRegs.
+        // For brand-new processes the saved value is zero, preserving the old
+        // info-leak protection.  For clone(CLONE_THREAD) children this carries
+        // the parent's R9 = musl `__clone` entry-function pointer.
+        // See ForkUserRegs::r9 doc comment.
+        "mov r9, [r9 + 48]",     // ForkUserRegs.r9
         // Zero the remaining caller-saved regs that might still hold kernel data.
-        // RDX and R8 already hold the values the child expects to see.
+        // RDX, R8, and R9 already hold the values the child expects to see.
         "xor eax, eax",
         "xor esi, esi",
         "xor edi, edi",
         "xor ecx, ecx",
-        "xor r9d, r9d",
         "xor r10d, r10d",
         "xor r11d, r11d",
         "iretq",

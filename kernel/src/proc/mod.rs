@@ -119,6 +119,32 @@ pub struct ForkUserRegs {
     pub r13: u64,
     pub r14: u64,
     pub r15: u64,
+    /// Parent's R9 at the syscall site.
+    ///
+    /// musl libc's `__clone` (clone2 ABI, x86-64) stashes the thread entry
+    /// function pointer in R9 across the `syscall` instruction:
+    ///
+    /// ```text
+    ///   mov    %rdi,%r11        // r11 = func (caller's rdi)
+    ///   mov    %rdx,%rdi        // ...
+    ///   mov    %r11,%r9         // r9  = func (preserved across syscall)
+    ///   syscall                  // → kernel
+    ///   test   %eax,%eax
+    ///   jnz    1f
+    ///   xor    %ebp,%ebp
+    ///   pop    %rdi              // arg from new stack
+    ///   call   *%r9              // ← must hold parent's R9 (= func)
+    /// ```
+    ///
+    /// Per POSIX clone(2) and the Linux kernel x86-64 syscall ABI, all
+    /// caller-saved registers except RAX/RCX/R11 must survive a syscall
+    /// in both the parent and child paths.  Linux's `start_thread` for a
+    /// clone child returns from the syscall via IRETQ with the parent's
+    /// register snapshot intact (RAX zeroed for the child).  When the
+    /// kernel zeros R9 in the child, musl's `call *%r9` jumps to NULL.
+    ///
+    /// See: <https://git.musl-libc.org/cgit/musl/tree/src/thread/x86_64/clone.s>
+    pub r9: u64,
 }
 
 pub struct Thread {
