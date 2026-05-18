@@ -1997,9 +1997,9 @@ fn generate_proc_status_impl(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
     // ── Snapshot all per-process facts under one lock acquisition ───────
     let (
         comm, ppid, uid, gid, euid, egid, umask, no_new_privs,
-        cap_perm, cap_eff, fd_count, fd_capacity, n_threads,
+        cap_perm, cap_eff, _fd_count, fd_capacity, n_threads,
         vm_size_b, vm_data_b, vm_stk_b, vm_exe_b, vm_lib_b,
-        sig_pend, sig_blk, sig_ign, sig_cgt,
+        sig_pend, sig_blk, sig_ign, sig_cgt, sig_q_max,
     ) = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         let p = match procs.iter().find(|p| p.pid == pid) {
@@ -2031,7 +2031,8 @@ fn generate_proc_status_impl(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
                 let writable = (a.prot & PROT_WRITE) != 0;
                 let executable = (a.prot & PROT_EXEC) != 0;
                 let anon = (a.flags & MAP_ANONYMOUS) != 0;
-                // Classification matches Linux fs/proc/task_mmu.c semantics:
+                // VMA classification per proc_pid_status(5) "Vm* fields"
+                // (Linux man-pages 5.13):
                 //   - VmStk: the "[stack]" VMA (one per process)
                 //   - VmExe: executable VMAs of the main program
                 //   - VmLib: executable VMAs from shared libraries
@@ -2079,6 +2080,13 @@ fn generate_proc_status_impl(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
         let fd_count = p.file_descriptors.iter().filter(|f| f.is_some()).count();
         let fd_cap = p.file_descriptors.capacity().max(p.file_descriptors.len());
 
+        // SigQ second field is RLIMIT_SIGPENDING (per proc_pid_status(5)):
+        // the max queue length, not the open-fd count.  rlimits_soft index 11
+        // is RLIMIT_SIGPENDING per <sys/resource.h>; default_rlimits() leaves
+        // this at zero (not enforced), in which case we report 0 — that is
+        // the conformant "no limit set" reading per proc_pid_status(5).
+        let sig_q_max = p.rlimits_soft[11];
+
         (
             comm, p.parent_pid,
             p.uid, p.gid, p.euid, p.egid,
@@ -2087,7 +2095,7 @@ fn generate_proc_status_impl(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
             fd_count, fd_cap,
             p.threads.len().max(1),
             vm_size, vm_data, vm_stk, vm_exe, vm_lib,
-            pend, blk, ign, cgt,
+            pend, blk, ign, cgt, sig_q_max,
         )
     };
 
@@ -2099,6 +2107,12 @@ fn generate_proc_status_impl(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
     let online_cpus = (crate::arch::x86_64::apic::cpu_count().max(1)) as u64;
     let cpus_mask: u64 = if online_cpus >= 64 { !0u64 } else { (1u64 << online_cpus) - 1 };
 
+    // VmPeak/VmSize/VmHWM/VmRSS are reported as the VMA-total (vm_size_kb)
+    // — a deliberate conservative *over*-report: we lack per-page resident
+    // tracking, and over-stating RSS only causes monitors like `ps`/`top`
+    // to show a slightly larger memory column.  Under-reporting would risk
+    // OOM-killer-style heuristics making bad decisions, so we round up.
+    // Conformance is structural (the fields exist and parse), not numeric.
     alloc::format!(
         "Name:\t{name}\n\
          Umask:\t{umask:04o}\n\
@@ -2135,7 +2149,7 @@ fn generate_proc_status_impl(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
          CoreDumping:\t0\n\
          THP_enabled:\t1\n\
          Threads:\t{n_threads}\n\
-         SigQ:\t0/{fd_open}\n\
+         SigQ:\t0/{sig_q_max}\n\
          SigPnd:\t{sig_pend:016x}\n\
          ShdPnd:\t{sig_pend:016x}\n\
          SigBlk:\t{sig_blk:016x}\n\
@@ -2164,7 +2178,6 @@ fn generate_proc_status_impl(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
         uid       = uid,  euid = euid,
         gid       = gid,  egid = egid,
         fd_cap    = fd_capacity,
-        fd_open   = fd_count,
         n_threads = n_threads,
         vm_size_kb    = vm_size_b / 1024,
         vm_data_kb    = vm_data_b / 1024,
@@ -2176,6 +2189,7 @@ fn generate_proc_status_impl(pid: crate::proc::Pid) -> alloc::vec::Vec<u8> {
         sig_blk   = sig_blk,
         sig_ign   = sig_ign,
         sig_cgt   = sig_cgt,
+        sig_q_max = sig_q_max,
         cap_prm   = cap_perm,
         cap_eff   = cap_eff,
         nnp       = if no_new_privs { 1 } else { 0 },

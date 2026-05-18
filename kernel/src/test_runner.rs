@@ -33182,8 +33182,18 @@ fn test_248_sysinfo_layout() -> bool {
     let _loads0   = u64_at(8);
     let totalram  = u64_at(32);
     let freeram   = u64_at(40);
+    let freeswap  = u64_at(72);  // offset 72 per <sys/sysinfo.h>
     let procs     = u16_at(80);
     let mem_unit  = u32_at(104);
+
+    // Regression pin for the original p.add(9) clobber: the legacy 64-byte
+    // stub wrote `1` into what it thought was procs but landed on freeswap
+    // (offset 72).  Free-swap must be zero on a kernel with no swap.
+    if freeswap != 0 {
+        test_fail!("sysinfo_freeswap_clobber",
+            "freeswap clobbered: {} (expected 0 on swapless kernel)", freeswap);
+        return false;
+    }
 
     if uptime < 0 {
         test_fail!("sysinfo_uptime", "uptime negative: {}", uptime);
@@ -33227,6 +33237,17 @@ fn test_248_sysinfo_layout() -> bool {
     let rc_null = crate::syscall::dispatch_linux_kernel(99, 0, 0, 0, 0, 0, 0);
     if rc_null != -14 {
         test_fail!("sysinfo_null", "NULL info: expected -EFAULT (-14), got {}", rc_null);
+        return false;
+    }
+    // Kernel-VA case: caller must not be able to steer a kernel-page
+    // write by passing a pointer above KERNEL_VIRT_BASE.  This guards
+    // against CWE-822 (untrusted pointer dereference) — SMAP's AC=1
+    // only blocks kernel-mode user-page faults, not kernel-VA writes.
+    let kva = astryx_shared::KERNEL_VIRT_BASE;
+    let rc_kva = crate::syscall::dispatch_linux_kernel(99, kva, 0, 0, 0, 0, 0);
+    if rc_kva != -14 {
+        test_fail!("sysinfo_kva",
+            "kernel-VA info: expected -EFAULT (-14), got {}", rc_kva);
         return false;
     }
 
@@ -33300,6 +33321,16 @@ fn test_249_getrusage_validation() -> bool {
     if r != -14 {
         test_fail!("getrusage_efault",
             "NULL usage: expected -EFAULT (-14), got {}", r);
+        return false;
+    }
+    // Kernel-VA usage -> -EFAULT (-14).  Same CWE-822 guard as in
+    // test_248: the caller must not be able to steer a kernel-page
+    // write by passing a pointer above KERNEL_VIRT_BASE.
+    let kva = astryx_shared::KERNEL_VIRT_BASE;
+    let r_kva = crate::syscall::dispatch_linux_kernel(98, 0, kva, 0, 0, 0, 0);
+    if r_kva != -14 {
+        test_fail!("getrusage_kva",
+            "kernel-VA usage: expected -EFAULT (-14), got {}", r_kva);
         return false;
     }
     test_println!("  utime={}.{:06}s ✓ (who arg fully validated)",

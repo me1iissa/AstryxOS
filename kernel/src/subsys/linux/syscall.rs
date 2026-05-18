@@ -3221,8 +3221,14 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             if who != RUSAGE_SELF && who != RUSAGE_CHILDREN && who != RUSAGE_THREAD {
                 return -22; // EINVAL
             }
-            if arg2 == 0 {
-                return -14; // EFAULT — NULL output pointer
+            // -EFAULT on NULL or kernel-VA / overflowing pointer.  Per
+            // getrusage(2) ERRORS and POSIX.1-2017 §3.143 (EFAULT).
+            // UserGuard's AC=1 only blocks user-mode kernel-VA writes; in
+            // kernel mode (where we run with CPL=0) we must explicitly
+            // reject kernel-VA pointers to prevent the user from steering
+            // a kernel-page write.  CWE-822 (untrusted pointer dereference).
+            if !crate::syscall::validate_user_ptr(arg2, 144) {
+                return -14; // EFAULT
             }
             #[cfg(feature = "firefox-test")]
             crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Getrusage, arg2 as *const u8, 144);
@@ -3243,8 +3249,8 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 let (rss_kb, minflt, inb, oub) = if let Some(snap) =
                     crate::proc::proc_metrics::snapshot(pid)
                 {
-                    // Block ops: Linux defines a block as 512 bytes
-                    // (see getrusage(2) BUGS, fs/block_dev.c).
+                    // Block ops: a block is 512 bytes per the getrusage(2)
+                    // man page BUGS section (Linux man-pages 5.13).
                     let inb = snap.disk_r_bytes / 512;
                     let oub = snap.disk_w_bytes / 512;
                     // VmRSS proxy: sum of writable VMA lengths (anonymous
@@ -3283,7 +3289,9 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 *p.add(4)   = max_rss_kb as i64;
                 // ru_minflt at offset 64 (index 8)
                 *p.add(8)   = minflt as i64;
-                // ru_majflt — same as minflt since we don't distinguish yet.
+                // ru_majflt — left at zero; no per-PID major-fault counter
+                // yet (would require distinguishing CoW/anon faults from
+                // file-backed page-ins in the page-fault handler).
                 *p.add(9)   = 0;
                 // ru_inblock at offset 88 (index 11)
                 *p.add(11)  = inblock as i64;
@@ -3314,7 +3322,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         //
         // Returns -EFAULT on NULL pointer (sysinfo(2) ERRORS).
         99 => {
-            if arg1 == 0 {
+            // -EFAULT on NULL, kernel-VA, or overflowing pointer.  Per
+            // sysinfo(2) ERRORS.  UserGuard alone is insufficient — see
+            // CWE-822; kernel-mode writes ignore SMAP AC=1.
+            if !crate::syscall::validate_user_ptr(arg1, 112) {
                 return -14; // EFAULT
             }
             #[cfg(feature = "firefox-test")]
