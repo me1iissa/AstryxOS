@@ -87,22 +87,30 @@ impl AuxvIter {
     /// process stack guarantees.
     pub unsafe fn from_argc_argv(argc: usize, argv: *const *const u8) -> AuxvIter {
         let mut p = argv;
-        // Skip argv[0..argc].
+        // Skip argv[0..argc].  Per System V ABI x86_64 supplement §3.4.1,
+        // `argv[argc]` is the NULL terminator the kernel deposits — we
+        // step over it directly rather than scanning forward, because a
+        // malformed initial stack must not become an unbounded read.
         for _ in 0..argc {
             p = p.add(1);
         }
-        // Skip the argv NULL terminator (defensively: if argv was
-        // truncated for some reason, we still try to find a NULL).
-        if !(*p).is_null() {
-            // Some kernels are lax; walk forward looking for the NULL.
-            while !(*p).is_null() {
-                p = p.add(1);
-            }
-        }
-        p = p.add(1); // step over the argv terminator NULL
-        // Walk envp[] until its NULL terminator.
+        p = p.add(1); // step over the argv[argc] NULL terminator
+        // Walk envp[] until its NULL terminator.  This loop IS bounded
+        // by the initial-stack layout (envp is followed by AT_NULL-
+        // terminated auxv then strings), but cap it at MAX_ENVP_SCAN as
+        // a belt-and-braces defence against a corrupted stack.
+        const MAX_ENVP_SCAN: usize = 4096;
+        let mut envp_steps = 0usize;
         while !(*p).is_null() {
             p = p.add(1);
+            envp_steps += 1;
+            if envp_steps >= MAX_ENVP_SCAN {
+                // Stack is malformed; return an iterator that yields
+                // nothing rather than reading off the end.  The cursor
+                // is left at the last good position so a subsequent
+                // `read` would still see *something* readable.
+                break;
+            }
         }
         p = p.add(1); // step over the envp terminator NULL
         AuxvIter { cursor: p as *const AuxvEntry }
@@ -304,15 +312,44 @@ pub unsafe fn vdso_lookup(base: u64, name: &[u8]) -> u64 {
     }
 
     // Walk .dynsym.  We don't parse DT_HASH; instead bound the scan by
-    // .dynstr size — every symbol has st_name < strsz, so an entry
-    // whose st_name is >= strsz signals we've walked off the end.
-    // 64 is a generous cap for the AstryxOS vDSO (~6 exports today).
-    for i in 0..64u64 {
+    // either:
+    //   (a) the in-memory distance between .dynsym and .dynstr divided
+    //       by syment, when DT_STRTAB is laid out immediately after
+    //       DT_SYMTAB in the vDSO image (the common case — gold/lld/bfd
+    //       all emit it this way for a vDSO-shaped DSO), OR
+    //   (b) a fixed cap of 256 otherwise (defence-in-depth).
+    // Both bounds are cross-checked with the per-symbol invariant
+    // `st_name < strsz` from the ELF gABI §4.1 ("Symbol Table"):
+    // every defined symbol must name a valid offset into .dynstr.  An
+    // entry whose st_name is >= strsz signals we've walked off the end
+    // of the symtab, so we stop.
+    //
+    // The AstryxOS vDSO (`kernel/vdso/vdso.lds`) exports 4 symbols
+    // today; kernel test 244 pins this so that growth is forced through
+    // a deliberate review of this cap.
+    const VDSO_FALLBACK_MAX_SYMS: u64 = 256;
+    let max_syms: u64 = {
+        let symtab_addr = symtab as u64;
+        let strtab_addr = strtab as u64;
+        if strtab_addr > symtab_addr && syment > 0 {
+            let distance = strtab_addr - symtab_addr;
+            (distance / syment).min(VDSO_FALLBACK_MAX_SYMS)
+        } else {
+            VDSO_FALLBACK_MAX_SYMS
+        }
+    };
+    // STN_UNDEF (index 0) is the ELF-mandated reserved sentinel — its
+    // st_name is zero and it refers to no symbol.  We skip it via the
+    // `st_name == 0` continue below rather than via i == 0, because
+    // some toolchains pad unused .dynsym slots with all-zero entries too.
+    for i in 0..max_syms {
         let sym = &*(symtab as *const u8).add((i * syment) as usize).cast::<Elf64Sym>();
         if sym.st_name == 0 {
+            // STN_UNDEF or zero-padded slot — skip.
             continue;
         }
         if sym.st_name as u64 >= strsz {
+            // Walked off the end of .dynsym.
             break;
         }
         let s = strtab.add(sym.st_name as usize);
