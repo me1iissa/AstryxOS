@@ -2896,7 +2896,8 @@ def cmd_rip_trace_resolve(args):
     tid = int(args.tid)
     ms  = int(args.ms)
     disk_root = getattr(args, "disk_root", None)
-    timeout = float(getattr(args, "timeout", ms / 1000.0 + 10.0))
+    timeout_val = getattr(args, "timeout", None)
+    timeout = float(timeout_val) if timeout_val is not None else (ms / 1000.0 + 10.0)
 
     # ── 1. Run kdb rip-trace ─────────────────────────────────────────────────
     try:
