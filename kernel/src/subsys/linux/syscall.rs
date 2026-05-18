@@ -2168,6 +2168,27 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             }
                         }
 
+                        // Allocate an isolated TLS page for the child.
+                        // MUST happen before unblock_process so the child's
+                        // FS.base is set when the scheduler first runs it.
+                        // See `alloc_vfork_child_tls` for the SSP rationale.
+                        match crate::proc::alloc_vfork_child_tls(pid) {
+                            Some(tls_va) => {
+                                let mut threads = crate::proc::THREAD_TABLE.lock();
+                                if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
+                                    t.tls_base = tls_va;
+                                    t.vfork_isolated_tls = Some(tls_va);
+                                }
+                            }
+                            None => {
+                                crate::serial_println!(
+                                    "[VFORK] WARN: failed to allocate isolated TLS for child TID {}; \
+                                     parent SSP corruption risk",
+                                    child_tid
+                                );
+                            }
+                        }
+
                         // Unblock the child so the scheduler can run it.
                         crate::proc::unblock_process(child_pid);
 
@@ -2954,6 +2975,27 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         crate::serial_println!(
                             "[CLONE3-VM] child PID {} TID {} rdx={:#x} r8={:#x} rip={:#x} rsp={:#x}",
                             child_pid, child_tid, func, thread_arg, original_rip, sp);
+
+                        // Allocate an isolated TLS page for the child.
+                        // MUST happen before unblock_process so the child's
+                        // FS.base is set when the scheduler first runs it.
+                        // See `alloc_vfork_child_tls` for the SSP rationale.
+                        match crate::proc::alloc_vfork_child_tls(pid) {
+                            Some(tls_va) => {
+                                let mut threads = crate::proc::THREAD_TABLE.lock();
+                                if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
+                                    t.tls_base = tls_va;
+                                    t.vfork_isolated_tls = Some(tls_va);
+                                }
+                            }
+                            None => {
+                                crate::serial_println!(
+                                    "[CLONE3-VM] WARN: failed to allocate isolated TLS for child TID {}; \
+                                     parent SSP corruption risk",
+                                    child_tid
+                                );
+                            }
+                        }
 
                         // NOW unblock the child
                         crate::proc::unblock_process(child_pid);
