@@ -1838,6 +1838,18 @@ pub fn run() -> ! {
         if test_240_futex_wake_ghost_hist() { passed += 1; }
     }
 
+    // ── Test 241: kdb rip-trace op JSON shape sanity ──────────────────────
+    // Sanity check for the `rip-trace` kdb op (Deliverable B of the
+    // W101 plateau diagnostic).  Verifies the per-TID `read_user_rip`
+    // helper, the read_sample / record_syscall round-trip, and the
+    // dispatch error envelopes for unknown / invalid tid values.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(feature = "kdb")]
+    {
+        total += 1;
+        if test_241_kdb_rip_trace_shape() { passed += 1; }
+    }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -31202,5 +31214,114 @@ fn test_237_ipv4_total_length_clamp() -> bool {
     if r != 20 { test_fail!("test237", "(d.4) expected 20 got {}", r); return false; }
 
     test_pass!("IPv4 total_length payload clamp — all 6 boundary cases (RFC 791 §3.1)");
+    true
+}
+
+// ── Test 241: kdb rip-trace op JSON shape sanity ──────────────────────────
+// Sanity-only test for the `rip-trace` kdb op added in this PR.  Does not
+// (and cannot easily) exercise the live user-RIP path — that requires a
+// preempted Ring-3 thread which test_runner has no easy way to construct.
+// What this test DOES verify:
+//   (a) `proc::sample::read_user_rip` returns None for an unknown TID
+//   (b) After a kernel-controlled write into the per-TID slot via the
+//       module's own `record_syscall` (the only public writer), reads
+//       round-trip the TID identity gate but still return rip=0 (the
+//       caller hasn't published a Ring-3 sample yet).
+//   (c) A direct `kdb::dispatch("rip-trace", ...)` for an unknown TID
+//       returns well-formed JSON containing the documented error key.
+//   (d) A direct dispatch with `tid=0` is rejected with an error.
+//
+// Cite: Intel SDM Vol 3A §8.2.3 (TSO same-line ordering) — implicitly
+// justifies the (rip, rbp, seq) read-back invariant exercised here.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(feature = "kdb")]
+fn test_241_kdb_rip_trace_shape() -> bool {
+    test_header!("kdb rip-trace op JSON shape sanity");
+    use alloc::string::String;
+
+    // (a) Unknown TID → None (slot at hash(0xfeed_face_dead_beef) is
+    //     either empty or owned by some real low-numbered TID; either
+    //     way, the TID-identity gate causes read_user_rip to return
+    //     None for our synthetic value).
+    let bogus_tid: u64 = 0xfeed_face_dead_beef;
+    let pre = crate::proc::sample::read_user_rip(bogus_tid);
+    test_println!("  (a) read_user_rip(bogus_tid) = {:?}",
+                  pre.map(|(r, _, _)| r));
+    if pre.is_some() {
+        test_fail!("test241", "(a) expected None got Some");
+        return false;
+    }
+
+    // (b) record_syscall claims the slot for `bogus_tid` but does NOT
+    //     publish a Ring-3 sample.  read_user_rip should still return
+    //     None because the rip_sample_seq stays 0.
+    crate::proc::sample::record_syscall(bogus_tid, /*tick*/ 100, /*nr*/ 1, /*arg0*/ 0);
+    let after = crate::proc::sample::read_user_rip(bogus_tid);
+    test_println!("  (b) post-record_syscall read_user_rip = {:?}",
+                  after.map(|(r, b, s)| (r, b, s)));
+    if after.is_some() {
+        test_fail!("test241", "(b) expected None after pure record_syscall");
+        return false;
+    }
+    // The slot DID gain a syscall sample though — read_sample should
+    // now return Some with last_user_rip=0.
+    let sc_sample = crate::proc::sample::read_sample(bogus_tid);
+    match sc_sample {
+        Some(s) => {
+            test_println!("  (b) read_sample → nr={} arg0={:#x} \
+                           last_user_rip={:#x} seq={}",
+                          s.last_syscall_nr, s.last_syscall_arg0,
+                          s.last_user_rip, s.rip_sample_seq);
+            if s.last_user_rip != 0 || s.rip_sample_seq != 0 {
+                test_fail!("test241",
+                    "(b) expected last_user_rip=0 seq=0, got {:#x}/{}",
+                    s.last_user_rip, s.rip_sample_seq);
+                return false;
+            }
+        }
+        None => {
+            test_fail!("test241", "(b) read_sample returned None after \
+                                   record_syscall — slot gate broken");
+            return false;
+        }
+    }
+
+    // (c) Direct kdb dispatch with an unknown tid.  We pick a TID
+    //     value that is structurally impossible in the live table
+    //     (max u64) so the THREAD_TABLE lookup must fail.
+    let mut resp = String::with_capacity(256);
+    crate::kdb::dispatch(
+        r#"{"op":"rip-trace","tid":18446744073709551614,"ms":10}"#,
+        &mut resp,
+    );
+    test_println!("  (c) dispatch(unknown-tid) → {}", resp);
+    if !resp.contains(r#""error""#) {
+        test_fail!("test241", "(c) expected error key, got: {}", resp);
+        return false;
+    }
+    if !resp.contains("not found") && !resp.contains("no cr3") {
+        test_fail!("test241", "(c) expected 'not found' or 'no cr3' in error, got: {}", resp);
+        return false;
+    }
+
+    // (d) tid=0 (idle) must be rejected up front (we never sample
+    //     idle, and any rip-trace caller asking for tid=0 is buggy).
+    let mut resp2 = String::with_capacity(256);
+    crate::kdb::dispatch(
+        r#"{"op":"rip-trace","tid":0,"ms":10}"#,
+        &mut resp2,
+    );
+    test_println!("  (d) dispatch(tid=0) → {}", resp2);
+    if !resp2.contains(r#""error""#) {
+        test_fail!("test241", "(d) expected error for tid=0, got: {}", resp2);
+        return false;
+    }
+    if !resp2.contains("invalid") && !resp2.contains("missing") {
+        test_fail!("test241",
+            "(d) expected 'invalid'/'missing' in tid=0 error, got: {}", resp2);
+        return false;
+    }
+
+    test_pass!("kdb rip-trace shape — bogus tid + dispatch errors validated");
     true
 }
