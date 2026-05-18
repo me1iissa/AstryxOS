@@ -105,6 +105,15 @@ pub struct Ext2Fs {
 
 impl Ext2Fs {
     /// Try to mount an ext2 filesystem from the given block device reader.
+    ///
+    /// Validates the superblock against the constraints in the
+    /// second-extended-filesystem specification
+    /// (<https://www.nongnu.org/ext2-doc/ext2.html#superblock>) before
+    /// returning the mounted instance.  A malformed superblock — block size
+    /// out of range, `inodes_per_group == 0`, `inode_size` not a power of
+    /// two, etc. — must be rejected up front: every other method on
+    /// `Ext2Fs` trusts these fields and would otherwise panic in debug or
+    /// produce arbitrary memory reads in release.
     pub fn new(read_fn: fn(u64, u16, &mut [u8]) -> Result<(), &'static str>) -> Option<Self> {
         // Read superblock (at byte offset 1024, sector 2)
         let mut sb_buf = [0u8; 512];
@@ -120,8 +129,71 @@ impl Ext2Fs {
             return None;
         }
 
+        // ── Superblock validation (ext2 spec §2 "Superblock") ──────────────
+        // log_block_size of N means block_size = 1024 << N.  The ext2
+        // specification caps block size at 4096; mkfs.ext2 in practice
+        // accepts up to 65536 (log = 6).  Reject anything larger so the
+        // left-shift below cannot overflow a usize / produce a runaway
+        // block size that crashes the read path.
+        if sb.log_block_size > 6 {
+            crate::serial_println!(
+                "[EXT2] Invalid log_block_size={} (max 6 → 64 KiB)",
+                sb.log_block_size,
+            );
+            return None;
+        }
+        // The ext2 spec also requires log_frag_size == log_block_size on
+        // modern filesystems (fragments unused, fragment size == block
+        // size).  A divergence indicates either pre-spec ext2fs or a
+        // mangled superblock; reject either way.
+        if sb.log_frag_size != sb.log_block_size {
+            crate::serial_println!(
+                "[EXT2] log_frag_size={} != log_block_size={}",
+                sb.log_frag_size, sb.log_block_size,
+            );
+            return None;
+        }
         let block_size = 1024usize << sb.log_block_size;
-        let inode_size = if sb.rev_level >= 1 { sb.inode_size as usize } else { 128 };
+
+        // inodes_per_group / blocks_per_group are used as divisors by
+        // `read_inode`; zero would panic in debug and wrap in release.
+        if sb.inodes_per_group == 0 {
+            crate::serial_println!("[EXT2] inodes_per_group must be non-zero");
+            return None;
+        }
+        if sb.blocks_per_group == 0 {
+            crate::serial_println!("[EXT2] blocks_per_group must be non-zero");
+            return None;
+        }
+
+        // Determine inode size per the revision-level rules in the spec.
+        // Rev 0 has a fixed 128-byte inode; rev 1+ stores the size in the
+        // superblock and requires it to be a power of two, at least 128,
+        // and no larger than the block size.
+        let inode_size = if sb.rev_level >= 1 {
+            let isz = sb.inode_size as usize;
+            if isz < 128 || !isz.is_power_of_two() || isz > block_size {
+                crate::serial_println!(
+                    "[EXT2] Invalid inode_size={} (must be power of two in [128, {}])",
+                    isz, block_size,
+                );
+                return None;
+            }
+            isz
+        } else {
+            128
+        };
+
+        // blocks_per_group bounded by `block_size * 8` bits in the block
+        // bitmap (one bit per data block).  This is the canonical sanity
+        // check in the ext2 mount path.
+        if sb.blocks_per_group > (block_size as u32) * 8 {
+            crate::serial_println!(
+                "[EXT2] blocks_per_group={} exceeds bitmap capacity ({} bits)",
+                sb.blocks_per_group, block_size * 8,
+            );
+            return None;
+        }
 
         crate::serial_println!("[EXT2] Superblock valid: {} inodes, {} blocks, block_size={}",
             sb.inodes_count, sb.blocks_count, block_size);
@@ -132,6 +204,31 @@ impl Ext2Fs {
             block_size,
             inode_size,
         })
+    }
+
+    /// Test-only constructor that bypasses the disk read and uses an
+    /// in-memory `Superblock` for direct validation testing.  The
+    /// `read_fn` is unused; callers pass a no-op stub.
+    ///
+    /// Mirrors the validation in [`Ext2Fs::new`].  Returns `None` on the
+    /// same set of spec violations.
+    #[doc(hidden)]
+    pub fn try_from_superblock_for_test(
+        sb: Superblock,
+        read_fn: fn(u64, u16, &mut [u8]) -> Result<(), &'static str>,
+    ) -> Option<Self> {
+        if sb.magic != EXT2_MAGIC { return None; }
+        if sb.log_block_size > 6 { return None; }
+        if sb.log_frag_size != sb.log_block_size { return None; }
+        let block_size = 1024usize << sb.log_block_size;
+        if sb.inodes_per_group == 0 || sb.blocks_per_group == 0 { return None; }
+        let inode_size = if sb.rev_level >= 1 {
+            let isz = sb.inode_size as usize;
+            if isz < 128 || !isz.is_power_of_two() || isz > block_size { return None; }
+            isz
+        } else { 128 };
+        if sb.blocks_per_group > (block_size as u32) * 8 { return None; }
+        Some(Ext2Fs { read_fn, superblock: sb, block_size, inode_size })
     }
 
     /// Read a block from the filesystem.
@@ -272,23 +369,105 @@ impl Ext2Fs {
     }
 
     /// Read directory entries from an inode.
+    ///
+    /// Parses on-disk `ext2_dir_entry_2` records and enforces the integrity
+    /// constraints from the second-extended-filesystem specification.  See
+    /// <https://www.nongnu.org/ext2-doc/ext2.html#linked-directories>:
+    ///
+    /// * `rec_len` is at least `EXT2_DIR_REC_LEN(1) = 12` (the directory
+    ///   entry header (8 bytes) + at least one name byte, rounded up to a
+    ///   4-byte boundary).
+    /// * `rec_len` is a multiple of 4 (4-byte alignment).
+    /// * `rec_len` is large enough to hold the declared `name_len`
+    ///   (`rec_len >= 8 + name_len`).
+    /// * The entry does not span past the directory's logical size.
+    /// * `inode` field does not exceed the filesystem's inode count.
+    ///
+    /// On a corruption violation we stop parsing the current directory but
+    /// return whatever was parsed before — matching the conservative
+    /// behaviour mandated by POSIX `readdir(3)` (no entries lost from
+    /// before the bad slot).  The total iterations are also bounded by
+    /// `size / 8 + 1` so a self-referencing `rec_len` cannot livelock the
+    /// read loop.
     fn read_dir_entries(&self, inode: &Ext2Inode) -> Vec<(u32, String, u8)> {
+        const EXT2_DIR_HDR: usize = 8;
+        const EXT2_DIR_MIN_REC_LEN: usize = 12;
         let mut entries = Vec::new();
         let size = inode.size as usize;
+        if size < EXT2_DIR_HDR {
+            return entries;
+        }
         let mut data = alloc::vec![0u8; size];
         self.read_inode_data(inode, 0, &mut data);
 
-        let mut offset = 0;
-        while offset + 8 <= size {
-            let entry_inode = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
+        let max_inumber = self.superblock.inodes_count;
+        // Defensive iteration bound: each iteration must consume at least
+        // `EXT2_DIR_HDR = 8` bytes — if `rec_len` ever underflows we still
+        // stop after at most `size / 8 + 1` iterations.
+        let max_iter = size / EXT2_DIR_HDR + 1;
+        let mut iter = 0usize;
+        let mut offset = 0usize;
+        while offset + EXT2_DIR_HDR <= size {
+            iter += 1;
+            if iter > max_iter {
+                crate::serial_println!(
+                    "[EXT2] dir parse: iteration cap reached at offset={} size={}",
+                    offset, size,
+                );
+                break;
+            }
+            let entry_inode = u32::from_le_bytes(
+                [data[offset], data[offset+1], data[offset+2], data[offset+3]]);
             let rec_len = u16::from_le_bytes([data[offset+4], data[offset+5]]) as usize;
             let name_len = data[offset+6] as usize;
             let file_type = data[offset+7];
 
-            if rec_len == 0 { break; }
+            // ── Corruption guards (ext2 spec §3 "Linked directory entries") ──
+            // rec_len of zero or less than the spec minimum signals corruption.
+            if rec_len < EXT2_DIR_MIN_REC_LEN {
+                crate::serial_println!(
+                    "[EXT2] dir parse: short rec_len={} at offset={}",
+                    rec_len, offset,
+                );
+                break;
+            }
+            // rec_len must be a multiple of 4 (directory entries are aligned).
+            if rec_len & 3 != 0 {
+                crate::serial_println!(
+                    "[EXT2] dir parse: misaligned rec_len={} at offset={}",
+                    rec_len, offset,
+                );
+                break;
+            }
+            // rec_len must hold the declared name.
+            if rec_len < EXT2_DIR_HDR + name_len {
+                crate::serial_println!(
+                    "[EXT2] dir parse: rec_len={} too small for name_len={} at offset={}",
+                    rec_len, name_len, offset,
+                );
+                break;
+            }
+            // Entry must not extend past the directory's logical size.
+            if offset.checked_add(rec_len).map_or(true, |end| end > size) {
+                crate::serial_println!(
+                    "[EXT2] dir parse: entry overruns dir size offset={} rec_len={} size={}",
+                    offset, rec_len, size,
+                );
+                break;
+            }
+            // Inode field must fit in the filesystem's inode count (0 means
+            // "unused entry" — that's legal, only "out-of-bounds positive"
+            // is a corruption signal).
+            if entry_inode != 0 && entry_inode > max_inumber {
+                crate::serial_println!(
+                    "[EXT2] dir parse: inode={} > max_inumber={} at offset={}",
+                    entry_inode, max_inumber, offset,
+                );
+                break;
+            }
 
-            if entry_inode != 0 && name_len > 0 && offset + 8 + name_len <= size {
-                let name = core::str::from_utf8(&data[offset+8..offset+8+name_len])
+            if entry_inode != 0 && name_len > 0 {
+                let name = core::str::from_utf8(&data[offset+EXT2_DIR_HDR..offset+EXT2_DIR_HDR+name_len])
                     .unwrap_or("")
                     .to_string();
                 if !name.is_empty() {
@@ -299,6 +478,49 @@ impl Ext2Fs {
             offset += rec_len;
         }
 
+        entries
+    }
+
+    /// Test-only helper exercising the directory-entry validator against a
+    /// caller-supplied buffer.  Used by the corruption-resilience tests in
+    /// `test_runner.rs`.  Returns the parsed `(inode, name, file_type)`
+    /// tuples just like `read_dir_entries`.
+    #[doc(hidden)]
+    pub fn parse_dir_buf_for_test(&self, data: &[u8]) -> Vec<(u32, String, u8)> {
+        const EXT2_DIR_HDR: usize = 8;
+        const EXT2_DIR_MIN_REC_LEN: usize = 12;
+        let size = data.len();
+        let mut entries = Vec::new();
+        if size < EXT2_DIR_HDR {
+            return entries;
+        }
+        let max_inumber = self.superblock.inodes_count;
+        let max_iter = size / EXT2_DIR_HDR + 1;
+        let mut iter = 0usize;
+        let mut offset = 0usize;
+        while offset + EXT2_DIR_HDR <= size {
+            iter += 1;
+            if iter > max_iter { break; }
+            let entry_inode = u32::from_le_bytes(
+                [data[offset], data[offset+1], data[offset+2], data[offset+3]]);
+            let rec_len = u16::from_le_bytes([data[offset+4], data[offset+5]]) as usize;
+            let name_len = data[offset+6] as usize;
+            let file_type = data[offset+7];
+            if rec_len < EXT2_DIR_MIN_REC_LEN { break; }
+            if rec_len & 3 != 0 { break; }
+            if rec_len < EXT2_DIR_HDR + name_len { break; }
+            if offset.checked_add(rec_len).map_or(true, |end| end > size) { break; }
+            if entry_inode != 0 && entry_inode > max_inumber { break; }
+            if entry_inode != 0 && name_len > 0 {
+                let name = core::str::from_utf8(&data[offset+EXT2_DIR_HDR..offset+EXT2_DIR_HDR+name_len])
+                    .unwrap_or("")
+                    .to_string();
+                if !name.is_empty() {
+                    entries.push((entry_inode, name, file_type));
+                }
+            }
+            offset += rec_len;
+        }
         entries
     }
 }
