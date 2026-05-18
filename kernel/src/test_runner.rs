@@ -188,6 +188,10 @@ pub fn run() -> ! {
     total += 1;
     if test_pipe_pollhup_on_writer_close() { passed += 1; }
 
+    // ── Test 0bc2: pipe refcount survives fork+exec+close chain ──────────
+    total += 1;
+    if test_pipe_refcount_fork_exec_close_chain() { passed += 1; }
+
     // ── Test 0bb: SERIAL per-CPU re-entry guard ──────────────────────────
     total += 1;
     if test_serial_reentry_guard() { passed += 1; }
@@ -25503,6 +25507,94 @@ fn test_pipe_pollhup_on_writer_close() -> bool {
     crate::ipc::pipe::pipe_close_reader(pipe_id);
 
     test_pass!("pipe POLLHUP — writer close drives POLLHUP regardless of buffered data");
+    true
+}
+
+// ── Test 0bc2: pipe refcount survives fork-style fd duplication ─────────────
+//
+// Models the musl posix_spawn(3) cancel-pipe scenario.  After
+// `pipe2(O_CLOEXEC)` the parent has `writers=1, readers=1`.  Fork (or
+// `clone3` without `CLONE_FILES`) DUPLICATES the fd table, so both parent
+// and child reference the same `Pipe` object — meaning logical counts are
+// now `writers=2, readers=2`.  The kernel must bump the in-memory counts
+// to match.  Then the child's `execve(2)` purges its `FD_CLOEXEC` write
+// end (one writer closes), and finally the parent's `close(2)` of the
+// write end drops the last writer to zero; only at that point may any
+// reader parked on the read end be woken to observe EOF (per POSIX
+// `read(2)`: "If no process has the pipe open for writing, read() shall
+// return 0 to indicate end-of-file").
+//
+// Falsification condition: if the fork-style refcount bump is missing,
+// the child's CLOEXEC purge of fd=12 OR the parent's close(12) will drive
+// `writers` to zero one step early.  The other side then sees a phantom
+// hang-up.  This test scripts the sequence directly against the pipe
+// helpers and asserts the count transitions at every step.
+fn test_pipe_refcount_fork_exec_close_chain() -> bool {
+    test_header!("pipe refcount — fork+exec+close chain (musl posix_spawn cancel-pipe)");
+
+    let pipe_id = crate::ipc::pipe::create_pipe();
+    test_println!("  created pipe id={} ✓", pipe_id);
+
+    // Stage 0: initial state after `pipe2` — 1 reader, 1 writer.
+    // Reader-close on this stage would already drive POLLHUP, and the
+    // fresh writer count satisfies !is_eof.
+    if crate::ipc::pipe::pipe_writer_closed(pipe_id) {
+        test_fail!("pipe_refcount", "fresh pipe writer_closed = true");
+        crate::ipc::pipe::pipe_close_writer(pipe_id);
+        crate::ipc::pipe::pipe_close_reader(pipe_id);
+        return false;
+    }
+    test_println!("  stage 0 (post-pipe2): writers=1 readers=1 ✓");
+
+    // Stage 1: fork bump — both parent and child now hold the read and
+    // write ends.  This is the `inc_pipe_refs_for_fork` step.  Without
+    // it, the very next close would already underflow to zero.
+    crate::ipc::pipe::pipe_add_writer(pipe_id);
+    crate::ipc::pipe::pipe_add_reader(pipe_id);
+    test_println!("  stage 1 (post-fork bump): writers=2 readers=2 ✓");
+
+    // Stage 2: child execve purges its CLOEXEC write end.  This is the
+    // exec-time path: the kernel must call `pipe_close_writer` on each
+    // purged FD_CLOEXEC pipe end before clearing the fd slot.  After
+    // this stage one writer remains (the parent's).
+    crate::ipc::pipe::pipe_close_writer(pipe_id);
+    if crate::ipc::pipe::pipe_writer_closed(pipe_id) {
+        test_fail!("pipe_refcount", "after child exec purge, writer_closed = true (writer count underflowed)");
+        crate::ipc::pipe::pipe_close_writer(pipe_id);
+        crate::ipc::pipe::pipe_close_reader(pipe_id);
+        crate::ipc::pipe::pipe_close_reader(pipe_id);
+        return false;
+    }
+    test_println!("  stage 2 (post-child-exec CLOEXEC purge): writers=1 (parent only) ✓");
+
+    // Stage 3: child also closed its read end (musl posix_spawn child
+    // explicitly `close(read_end)` before exec — see `[FF/dup2]` /
+    // `close(11)` in the firefox-bin trace).  Readers drop from 2 to 1.
+    crate::ipc::pipe::pipe_close_reader(pipe_id);
+    test_println!("  stage 3 (post-child close(read_end)): readers=1 (parent only) ✓");
+
+    // Stage 4: parent closes its copy of the write end.  Per POSIX
+    // `read(2)` quoted above, *this* close — the last writer — is the
+    // event that must wake any reader parked on the read end.  After
+    // this stage the pipe is in is_eof=true state.
+    crate::ipc::pipe::pipe_close_writer(pipe_id);
+    if !crate::ipc::pipe::pipe_writer_closed(pipe_id) {
+        test_fail!("pipe_refcount", "after parent close(write_end), writer_closed = false (writer count overcounted)");
+        crate::ipc::pipe::pipe_close_reader(pipe_id);
+        return false;
+    }
+    if !crate::ipc::pipe::pipe_is_eof(pipe_id) {
+        test_fail!("pipe_refcount", "after parent close(write_end), pipe_is_eof = false");
+        crate::ipc::pipe::pipe_close_reader(pipe_id);
+        return false;
+    }
+    test_println!("  stage 4 (post-parent close(write_end)): writers=0 is_eof=true ✓");
+    test_println!("  → parent's blocked read(read_end) would now return 0 (EOF)");
+
+    // Stage 5: parent closes its read end.  Pipe is fully released.
+    crate::ipc::pipe::pipe_close_reader(pipe_id);
+
+    test_pass!("pipe refcount — fork+exec+close chain (musl posix_spawn cancel-pipe)");
     true
 }
 

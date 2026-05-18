@@ -1651,6 +1651,26 @@ pub fn close(pid: crate::proc::Pid, fd_num: usize) -> VfsResult<()> {
             FILE_LOCKS.lock().retain(|l| !(l.mount_idx == mount_idx && l.inode == inode && l.pid == pid));
         }
 
+        // Anonymous-pipe end: drop the appropriate reader/writer count
+        // on the underlying `Pipe` object.  When the count reaches zero,
+        // peers parked on the other end are woken so they observe EOF or
+        // `EPIPE` (per POSIX `read(2)` / `write(2)`).  Without this, a
+        // `close(2)` only clears the fd table slot — leaving the pipe's
+        // writer count above zero indefinitely and stranding a `read(2)`
+        // call that is waiting for the last writer to hang up.  This is
+        // the kernel-side gate for musl's posix_spawn(3) cancel-pipe
+        // pattern (W101 sc=1972 plateau).
+        if file_type == FileType::Pipe
+            && mount_idx == usize::MAX
+            && open_flags & 0x8000_0000 != 0
+        {
+            if open_flags & 1 == 1 {
+                crate::ipc::pipe::pipe_close_writer(inode);
+            } else {
+                crate::ipc::pipe::pipe_close_reader(inode);
+            }
+        }
+
         // C5: unlink-on-last-close — check if this inode was deferred-deleted.
         if !is_console && file_type == FileType::RegularFile && mount_idx != usize::MAX {
             // Check remaining open fds + atomically remove from DELETED_INODES if last.
