@@ -317,6 +317,25 @@ pub fn run() -> ! {
     total += 1;
     if test_linux_syscall_compat() { passed += 1; }
 
+    // ── VFS-RENAME-1: ramfs::rename POSIX corner cases ──────────────────────
+    //
+    // Registered early in the suite (before clone_thread, the desktop-launch
+    // tests, and the heavier mmap reproducers) so the new VFS hardening
+    // always reports a pass/fail even if a later test bugchecks the kernel.
+
+    total += 1;
+    if test_ramfs_rename_posix() { passed += 1; }
+
+    // ── EXT2-DIR-1: directory-entry corruption resilience ───────────────────
+
+    total += 1;
+    if test_ext2_dir_entry_corruption() { passed += 1; }
+
+    // ── EXT2-SB-1: superblock validation rejects malformed images ───────────
+
+    total += 1;
+    if test_ext2_superblock_validation() { passed += 1; }
+
     // ── Test 18: Signal Delivery Trampoline ─────────────────────────────
 
     total += 1;
@@ -4119,6 +4138,430 @@ fn test_fat32_ntres_case_preservation() -> bool {
     }
     test_pass!("FAT32-8 NTRes case preservation honoured");
     true
+}
+
+// ============================================================================
+// VFS-RENAME-1: ramfs::rename POSIX compliance
+// ============================================================================
+//
+// Exercises `rename(2)` corner cases that the previous implementation got
+// wrong: rename-to-self, ENOTEMPTY on directory overwrite, EISDIR/ENOTDIR
+// on type-mismatched overwrite, and EINVAL on directory-into-descendant.
+// References: POSIX.1-2017 rename(2)
+// <https://pubs.opengroup.org/onlinepubs/9699919799/functions/rename.html>.
+
+fn test_ramfs_rename_posix() -> bool {
+    test_header!("VFS-RENAME-1: ramfs rename POSIX corner cases");
+    use crate::vfs::ramfs::RamFs;
+    use crate::vfs::{FileSystemOps, VfsError};
+
+    let fs = RamFs::new();
+    let root = fs.root_inode();
+    let mut ok = true;
+
+    // Build /a (file with content), /b (file), /d1 (empty dir), /d2 (dir w/ child)
+    let _a = fs.create_file(root, "a").expect("create a");
+    let _b = fs.create_file(root, "b").expect("create b");
+    let d1 = fs.create_dir(root, "d1").expect("create d1");
+    let d2 = fs.create_dir(root, "d2").expect("create d2");
+    fs.create_file(d2, "inside").expect("create d2/inside");
+
+    // Case 1: rename to self is a successful no-op.
+    match fs.rename(root, "a", root, "a") {
+        Ok(()) => test_println!("  [1] rename-to-self → Ok"),
+        Err(e) => { test_fail!("VFS-RENAME-1", "rename-to-self returned {:?}, want Ok", e); ok = false; }
+    }
+    if fs.lookup(root, "a").is_err() {
+        test_fail!("VFS-RENAME-1", "rename-to-self lost the entry");
+        ok = false;
+    }
+
+    // Case 2: rename `.` / `..` rejected with EINVAL.
+    if !matches!(fs.rename(root, ".", root, "x"), Err(VfsError::InvalidArg)) {
+        test_fail!("VFS-RENAME-1", "rename(., x) did not return EINVAL");
+        ok = false;
+    }
+    if !matches!(fs.rename(root, "a", root, ".."), Err(VfsError::InvalidArg)) {
+        test_fail!("VFS-RENAME-1", "rename(a, ..) did not return EINVAL");
+        ok = false;
+    }
+    test_println!("  [2] rename of dot/dotdot → EINVAL");
+
+    // Case 3: non-dir over dir → EISDIR per POSIX rename(2)
+    // ("If the link named by `new` is a directory, the link named by `old`
+    //  shall also name a directory.").
+    if !matches!(fs.rename(root, "a", root, "d1"), Err(VfsError::IsADirectory)) {
+        test_fail!("VFS-RENAME-1", "rename(file → dir) did not return EISDIR");
+        ok = false;
+    }
+    test_println!("  [3] rename(file → dir) → EISDIR");
+
+    // Case 4: dir over non-dir → ENOTDIR.
+    if !matches!(fs.rename(root, "d1", root, "a"), Err(VfsError::NotADirectory)) {
+        test_fail!("VFS-RENAME-1", "rename(dir → file) did not return ENOTDIR");
+        ok = false;
+    }
+    test_println!("  [4] rename(dir → file) → ENOTDIR");
+
+    // Case 5: dir over non-empty dir → ENOTEMPTY.
+    if !matches!(fs.rename(root, "d1", root, "d2"), Err(VfsError::NotEmpty)) {
+        test_fail!("VFS-RENAME-1", "rename(d1 → non-empty d2) did not return ENOTEMPTY");
+        ok = false;
+    }
+    test_println!("  [5] rename(dir → non-empty dir) → ENOTEMPTY");
+
+    // Case 6: rename a directory into its own descendant → EINVAL.
+    // d2 contains "inside" — try moving d2 to /d2/inside_dir2.  First make
+    // /d2/sub a directory, then try to rename /d2 → /d2/sub/loop.
+    let sub = fs.create_dir(d2, "sub").expect("create d2/sub");
+    if !matches!(fs.rename(root, "d2", sub, "loop"), Err(VfsError::InvalidArg)) {
+        test_fail!("VFS-RENAME-1", "rename(d2 → d2/sub/loop) did not return EINVAL");
+        ok = false;
+    }
+    test_println!("  [6] rename(dir → own descendant) → EINVAL");
+
+    // Case 7: legal overwrite of empty dir by another empty dir succeeds.
+    let _d3 = fs.create_dir(root, "d3").expect("create d3");
+    let d4 = fs.create_dir(root, "d4").expect("create d4");
+    if let Err(e) = fs.rename(root, "d3", root, "d4") {
+        test_fail!("VFS-RENAME-1", "rename(d3 → empty d4) returned {:?}, want Ok", e);
+        ok = false;
+    } else {
+        if fs.lookup(root, "d3").is_ok() {
+            test_fail!("VFS-RENAME-1", "d3 still present after overwrite");
+            ok = false;
+        }
+        // d4 still exists (renamed-into target name).  Its inode is the
+        // ORIGINAL d3 inode — d4's old inode was discarded per POSIX.
+        let new_d4 = fs.lookup(root, "d4");
+        if new_d4 != Ok(_d3) {
+            test_fail!("VFS-RENAME-1", "d4 inode = {:?}, expected {} (was d3)", new_d4, _d3);
+            ok = false;
+        }
+        // The OLD d4 inode must have been freed (no stale inode entry).
+        if fs.stat(d4).is_ok() {
+            test_fail!("VFS-RENAME-1", "old d4 inode {} still resolvable after overwrite", d4);
+            ok = false;
+        }
+    }
+    test_println!("  [7] rename(empty dir → empty dir) overwrites cleanly");
+
+    if ok {
+        test_pass!("VFS-RENAME-1");
+    }
+    ok
+}
+
+// ============================================================================
+// EXT2-DIR-1: directory-entry corruption resilience
+// ============================================================================
+//
+// The on-disk ext2 directory format is a linked list of variable-length
+// records.  A corrupt `rec_len` (zero, misaligned, or larger than the
+// remaining directory space) used to either loop forever, panic on slice
+// indexing, or expose uninitialised memory through the name string.  This
+// test feeds the parser a sequence of crafted buffers and verifies the
+// validator stops cleanly at the first invalid record while keeping the
+// preceding good ones.  Spec: ext2 filesystem documentation §3 "Linked
+// directory entries" (<https://www.nongnu.org/ext2-doc/ext2.html>).
+
+fn test_ext2_dir_entry_corruption() -> bool {
+    test_header!("EXT2-DIR-1: directory-entry corruption resilience");
+    use crate::vfs::ext2::{Ext2Fs, Superblock};
+
+    // Build a minimum-valid Superblock for the test FS instance.  Values
+    // chosen to satisfy every validation rule in Ext2Fs::new but otherwise
+    // arbitrary.  `inodes_count = 100` is the upper bound used to detect
+    // out-of-range entry inode numbers.
+    let sb = Superblock {
+        inodes_count: 100,
+        blocks_count: 1024,
+        r_blocks_count: 0,
+        free_blocks_count: 1000,
+        free_inodes_count: 90,
+        first_data_block: 1,
+        log_block_size: 0, // 1024-byte blocks
+        log_frag_size: 0,
+        blocks_per_group: 8192,
+        frags_per_group: 8192,
+        inodes_per_group: 100,
+        mtime: 0,
+        wtime: 0,
+        mnt_count: 0,
+        max_mnt_count: 0,
+        magic: 0xEF53,
+        state: 1,
+        errors: 0,
+        minor_rev_level: 0,
+        lastcheck: 0,
+        checkinterval: 0,
+        creator_os: 0,
+        rev_level: 0,
+        def_resuid: 0,
+        def_resgid: 0,
+        first_ino: 11,
+        inode_size: 128,
+    };
+    fn dummy_read(_sector: u64, _count: u16, _buf: &mut [u8]) -> Result<(), &'static str> {
+        Err("unused in test")
+    }
+    let fs = Ext2Fs::try_from_superblock_for_test(sb, dummy_read)
+        .expect("test superblock must validate");
+
+    // Helper to encode a valid entry header at offset 0..8 in `buf`.
+    // rec_len is the on-disk record length; name_len is the declared name
+    // length; file_type is the type tag.
+    fn put_hdr(buf: &mut [u8], at: usize, inode: u32, rec_len: u16, name_len: u8, file_type: u8) {
+        buf[at..at+4].copy_from_slice(&inode.to_le_bytes());
+        buf[at+4..at+6].copy_from_slice(&rec_len.to_le_bytes());
+        buf[at+6] = name_len;
+        buf[at+7] = file_type;
+    }
+
+    let mut ok = true;
+
+    // ── Case 1: rec_len = 0 must stop the parser, not loop forever. ─────
+    {
+        let mut buf = [0u8; 64];
+        put_hdr(&mut buf, 0, 2, 0, 1, 2); // rec_len = 0 → invalid
+        let entries = fs.parse_dir_buf_for_test(&buf);
+        if !entries.is_empty() {
+            test_fail!("EXT2-DIR-1", "rec_len=0 produced {} entries, want 0", entries.len());
+            ok = false;
+        }
+        test_println!("  [1] rec_len=0 → 0 entries (no livelock)");
+    }
+
+    // ── Case 2: rec_len misaligned (not multiple of 4) must stop. ───────
+    {
+        let mut buf = [0u8; 64];
+        // First a valid entry (rec_len=12, name "a"), then a misaligned one.
+        put_hdr(&mut buf, 0, 2, 12, 1, 2);
+        buf[8] = b'a';
+        put_hdr(&mut buf, 12, 3, 13, 2, 1); // rec_len=13 not multiple of 4
+        buf[20] = b'b'; buf[21] = b'c';
+        let entries = fs.parse_dir_buf_for_test(&buf);
+        if entries.len() != 1 || entries[0].1 != "a" {
+            test_fail!("EXT2-DIR-1", "misaligned rec_len: got {:?}", entries);
+            ok = false;
+        }
+        test_println!("  [2] misaligned rec_len → stops, keeps prior entries");
+    }
+
+    // ── Case 3: rec_len too small for name_len must stop. ───────────────
+    {
+        let mut buf = [0u8; 64];
+        // rec_len=12 but claims name_len=10 (would need rec_len>=20).
+        put_hdr(&mut buf, 0, 2, 12, 10, 2);
+        let entries = fs.parse_dir_buf_for_test(&buf);
+        if !entries.is_empty() {
+            test_fail!("EXT2-DIR-1", "rec_len short for name_len: got {} entries", entries.len());
+            ok = false;
+        }
+        test_println!("  [3] rec_len < EXT2_DIR_REC_LEN(name_len) → 0 entries");
+    }
+
+    // ── Case 4: entry extending past dir size must stop. ────────────────
+    {
+        let mut buf = [0u8; 16];
+        // rec_len=32 but buf is only 16 bytes.
+        put_hdr(&mut buf, 0, 2, 32, 1, 2);
+        buf[8] = b'a';
+        let entries = fs.parse_dir_buf_for_test(&buf);
+        if !entries.is_empty() {
+            test_fail!("EXT2-DIR-1", "overrun: got {} entries", entries.len());
+            ok = false;
+        }
+        test_println!("  [4] rec_len > remaining buf → 0 entries");
+    }
+
+    // ── Case 5: entry inode > superblock.inodes_count must stop. ────────
+    {
+        let mut buf = [0u8; 32];
+        // First entry valid; second entry has inode=999 > inodes_count=100.
+        put_hdr(&mut buf, 0, 2, 12, 1, 2);
+        buf[8] = b'a';
+        put_hdr(&mut buf, 12, 999, 12, 1, 1);
+        buf[20] = b'b';
+        let entries = fs.parse_dir_buf_for_test(&buf);
+        if entries.len() != 1 || entries[0].1 != "a" {
+            test_fail!("EXT2-DIR-1", "phantom inode: got {:?}", entries);
+            ok = false;
+        }
+        test_println!("  [5] inode > inodes_count → stops, keeps prior entries");
+    }
+
+    // ── Case 6: a sequence of valid entries parses cleanly. ─────────────
+    {
+        let mut buf = [0u8; 36];
+        // Three entries: "a" (ino=2), "bb" (ino=3), "ccc" (ino=4). Each
+        // entry: 8-byte header + name padded to 4-byte align.  Last entry
+        // pads rec_len to consume the rest of the buffer.
+        put_hdr(&mut buf, 0, 2, 12, 1, 2); buf[8] = b'a';
+        put_hdr(&mut buf, 12, 3, 12, 2, 1); buf[20] = b'b'; buf[21] = b'b';
+        put_hdr(&mut buf, 24, 4, 12, 3, 1); buf[32] = b'c'; buf[33] = b'c'; buf[34] = b'c';
+        let entries = fs.parse_dir_buf_for_test(&buf);
+        if entries.len() != 3
+            || entries[0].1 != "a" || entries[1].1 != "bb" || entries[2].1 != "ccc"
+        {
+            test_fail!("EXT2-DIR-1", "happy-path: got {:?}", entries);
+            ok = false;
+        }
+        test_println!("  [6] three valid entries parse cleanly");
+    }
+
+    if ok {
+        test_pass!("EXT2-DIR-1");
+    }
+    ok
+}
+
+// ============================================================================
+// EXT2-SB-1: superblock-validation rejects malformed images
+// ============================================================================
+//
+// Before this hardening, `Ext2Fs::new` only checked the magic; a divisor
+// of zero in `inodes_per_group` would later panic in `read_inode`, and a
+// `log_block_size` of 50 would overflow the `1024 << N` shift.  Each case
+// in this test feeds a near-valid superblock with one field violated and
+// expects the constructor to reject it.  Spec reference: ext2 filesystem
+// documentation §2 "Superblock" (<https://www.nongnu.org/ext2-doc/ext2.html>).
+
+fn test_ext2_superblock_validation() -> bool {
+    test_header!("EXT2-SB-1: superblock validation rejects malformed images");
+    use crate::vfs::ext2::{Ext2Fs, Superblock};
+
+    fn dummy_read(_s: u64, _c: u16, _b: &mut [u8]) -> Result<(), &'static str> {
+        Err("unused")
+    }
+
+    fn base_sb() -> Superblock {
+        Superblock {
+            inodes_count: 100, blocks_count: 1024, r_blocks_count: 0,
+            free_blocks_count: 1000, free_inodes_count: 90, first_data_block: 1,
+            log_block_size: 0, log_frag_size: 0,
+            blocks_per_group: 8192, frags_per_group: 8192,
+            inodes_per_group: 100,
+            mtime: 0, wtime: 0, mnt_count: 0, max_mnt_count: 0,
+            magic: 0xEF53, state: 1, errors: 0, minor_rev_level: 0,
+            lastcheck: 0, checkinterval: 0, creator_os: 0, rev_level: 0,
+            def_resuid: 0, def_resgid: 0, first_ino: 11, inode_size: 128,
+        }
+    }
+
+    let mut ok = true;
+
+    // Sanity: the baseline must validate.
+    if Ext2Fs::try_from_superblock_for_test(base_sb(), dummy_read).is_none() {
+        test_fail!("EXT2-SB-1", "baseline superblock failed to validate");
+        return false;
+    }
+    test_println!("  baseline superblock validates");
+
+    // [1] Bad magic must be rejected.
+    {
+        let mut sb = base_sb();
+        sb.magic = 0xDEAD;
+        if Ext2Fs::try_from_superblock_for_test(sb, dummy_read).is_some() {
+            test_fail!("EXT2-SB-1", "bad magic accepted");
+            ok = false;
+        } else {
+            test_println!("  [1] bad magic → rejected");
+        }
+    }
+
+    // [2] log_block_size > 6 must be rejected (would overflow 1024 << N).
+    {
+        let mut sb = base_sb();
+        sb.log_block_size = 50;
+        sb.log_frag_size = 50;
+        if Ext2Fs::try_from_superblock_for_test(sb, dummy_read).is_some() {
+            test_fail!("EXT2-SB-1", "log_block_size=50 accepted");
+            ok = false;
+        } else {
+            test_println!("  [2] log_block_size=50 → rejected");
+        }
+    }
+
+    // [3] log_frag_size != log_block_size must be rejected.
+    {
+        let mut sb = base_sb();
+        sb.log_frag_size = 2; // mismatch
+        if Ext2Fs::try_from_superblock_for_test(sb, dummy_read).is_some() {
+            test_fail!("EXT2-SB-1", "log_frag_size mismatch accepted");
+            ok = false;
+        } else {
+            test_println!("  [3] log_frag_size != log_block_size → rejected");
+        }
+    }
+
+    // [4] inodes_per_group == 0 must be rejected (div-by-zero defence).
+    {
+        let mut sb = base_sb();
+        sb.inodes_per_group = 0;
+        if Ext2Fs::try_from_superblock_for_test(sb, dummy_read).is_some() {
+            test_fail!("EXT2-SB-1", "inodes_per_group=0 accepted");
+            ok = false;
+        } else {
+            test_println!("  [4] inodes_per_group=0 → rejected");
+        }
+    }
+
+    // [5] blocks_per_group == 0 must be rejected.
+    {
+        let mut sb = base_sb();
+        sb.blocks_per_group = 0;
+        if Ext2Fs::try_from_superblock_for_test(sb, dummy_read).is_some() {
+            test_fail!("EXT2-SB-1", "blocks_per_group=0 accepted");
+            ok = false;
+        } else {
+            test_println!("  [5] blocks_per_group=0 → rejected");
+        }
+    }
+
+    // [6] rev_level=1 with non-power-of-two inode_size must be rejected.
+    {
+        let mut sb = base_sb();
+        sb.rev_level = 1;
+        sb.inode_size = 200; // not a power of two
+        if Ext2Fs::try_from_superblock_for_test(sb, dummy_read).is_some() {
+            test_fail!("EXT2-SB-1", "inode_size=200 accepted at rev_level=1");
+            ok = false;
+        } else {
+            test_println!("  [6] rev1 non-power-of-two inode_size → rejected");
+        }
+    }
+
+    // [7] rev_level=1 with inode_size < 128 must be rejected.
+    {
+        let mut sb = base_sb();
+        sb.rev_level = 1;
+        sb.inode_size = 64;
+        if Ext2Fs::try_from_superblock_for_test(sb, dummy_read).is_some() {
+            test_fail!("EXT2-SB-1", "inode_size=64 accepted at rev_level=1");
+            ok = false;
+        } else {
+            test_println!("  [7] rev1 inode_size<128 → rejected");
+        }
+    }
+
+    // [8] blocks_per_group exceeding bitmap capacity must be rejected.
+    // For 1024-byte blocks, bitmap holds 8192 bits; 8193 is one over.
+    {
+        let mut sb = base_sb();
+        sb.blocks_per_group = 8193;
+        if Ext2Fs::try_from_superblock_for_test(sb, dummy_read).is_some() {
+            test_fail!("EXT2-SB-1", "blocks_per_group=8193 accepted with 1024-byte blocks");
+            ok = false;
+        } else {
+            test_println!("  [8] blocks_per_group > bitmap capacity → rejected");
+        }
+    }
+
+    if ok {
+        test_pass!("EXT2-SB-1");
+    }
+    ok
 }
 
 // ============================================================================
