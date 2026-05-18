@@ -721,6 +721,10 @@ pub(crate) fn read_fork_user_regs() -> crate::proc::ForkUserRegs {
             r13: *p.add(8),
             r14: *p.add(7),
             r15: *p.add(6),
+            // R9 lives at frame slot 4 per the layout comment above.
+            // Captured so clone(CLONE_THREAD) children can preserve the
+            // entry-function pointer that musl's `__clone` stashes there.
+            r9:  *p.add(4),
         }
     }
 }

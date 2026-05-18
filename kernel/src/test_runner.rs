@@ -28151,6 +28151,7 @@ fn test_fork_callee_saved_propagation() -> bool {
         r13: 0x4444_4444_4444_4444,
         r14: 0x5555_5555_5555_5555,
         r15: 0x6666_6666_6666_6666,
+        r9:  0x7777_7777_7777_7777,
     };
 
     // ── Path 1: CoW fork (sys_fork / clone-without-CLONE_VM) ──────────────
@@ -28233,17 +28234,22 @@ fn test_fork_callee_saved_propagation() -> bool {
     // `jump_to_user_mode` indexes this struct by raw byte offsets in its
     // naked-asm trampoline (proc/usermode.rs).  Catch field-reorder
     // regressions here rather than at the IRETQ landing site.
-    assert_eq!(core::mem::size_of::<crate::proc::ForkUserRegs>(), 48,
-        "ForkUserRegs must be 6 × u64 with no padding");
+    if core::mem::size_of::<crate::proc::ForkUserRegs>() != 56 {
+        test_fail!("w113",
+            "ForkUserRegs size {} ≠ 56 (expected 7 × u64 with no padding)",
+            core::mem::size_of::<crate::proc::ForkUserRegs>());
+        return false;
+    }
     let probe = crate::proc::ForkUserRegs {
-        rbp: 1, rbx: 2, r12: 3, r13: 4, r14: 5, r15: 6,
+        rbp: 1, rbx: 2, r12: 3, r13: 4, r14: 5, r15: 6, r9: 7,
     };
     unsafe {
         let p = &probe as *const _ as *const u64;
         if *p.add(0) != 1 || *p.add(1) != 2 || *p.add(2) != 3
             || *p.add(3) != 4 || *p.add(4) != 5 || *p.add(5) != 6
+            || *p.add(6) != 7
         {
-            test_fail!("w113", "ForkUserRegs field order ≠ rbp/rbx/r12/r13/r14/r15");
+            test_fail!("w113", "ForkUserRegs field order ≠ rbp/rbx/r12/r13/r14/r15/r9");
             return false;
         }
     }

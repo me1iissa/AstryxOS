@@ -796,18 +796,56 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
     }
 
     // ── Apply DT_RELR packed relative relocations (PIE + ASLR) ─────────
+    //
     // For ET_DYN with ASLR, all stored absolute pointers in .got/.data need
-    // to be adjusted by pie_bias.  The DT_RELR table encodes which slots to
-    // patch.  ET_EXEC binaries (pie_bias==0) need no patching.
-    if pie_bias != 0 {
+    // the load bias added.  The DT_RELR table encodes which slots to patch.
+    //
+    // CRITICAL ABI INVARIANT — only patch a STATIC PIE binary (no PT_INTERP):
+    //
+    //   Real Linux NEVER applies DT_RELR (or any relocations) to a
+    //   dynamically-linked ET_DYN binary.  The dynamic linker
+    //   (ld-linux-x86-64.so.2 / ld-musl-x86_64.so.1) applies DT_RELR itself
+    //   as part of `_dl_relocate_object` / `do_relr_relocs`, after running
+    //   its own bootstrap.  See:
+    //     * musl ldso/dynlink.c — `do_relr_relocs` (called from `reloc_all`)
+    //     * glibc elf/dl-reloc.c — `elf_dynamic_do_Rel*` path
+    //   ELF gABI says DT_REL* tables describe relocations to be performed
+    //   by the dynamic linker, not the kernel.
+    //
+    //   If the kernel also applies DT_RELR, each covered slot ends up with
+    //   `bias + bias + link_time_value` instead of `bias + link_time_value`
+    //   — the value's high bits land in the non-canonical / unmapped range
+    //   and the first indirect call through any such slot (init_array
+    //   entry, vtable, function-pointer table in .data.rel.ro) faults.
+    //
+    //   Static PIE binaries (ET_DYN with NO PT_INTERP) embed their own
+    //   `_dlstart` in `crt1.o` that self-applies relocations.  For those,
+    //   the kernel is the only relocator — we still need to apply DT_RELR.
+    //
+    //   ET_EXEC (pie_bias==0) and static PIE without DT_RELR are no-ops via
+    //   the guard inside `apply_relr_relocations`.
+    let is_static_pie = interp_path.is_none();
+    if pie_bias != 0 && is_static_pie {
         let (relr_off, relr_sz, _has_gnu_hash) =
             parse_dynamic_for_relr(data, header, 0 /* link-time bias = 0 for ET_DYN */);
         if relr_sz > 0 {
             crate::serial_println!(
-                "[ELF] DT_RELR: applying {} bytes at file offset {:#x} with bias={:#x}",
+                "[ELF] DT_RELR: applying {} bytes at file offset {:#x} with bias={:#x} (static PIE)",
                 relr_sz, relr_off, pie_bias
             );
             apply_relr_relocations(data, relr_off, relr_sz, pie_bias, &mapped_pages);
+        }
+    } else if pie_bias != 0 && interp_path.is_some() {
+        // Dynamic PIE: log that we are deliberately skipping kernel-side
+        // DT_RELR so post-mortem diagnostics can distinguish "skipped" from
+        // "no DT_RELR present".
+        let (_relr_off, relr_sz, _) =
+            parse_dynamic_for_relr(data, header, 0);
+        if relr_sz > 0 {
+            crate::serial_println!(
+                "[ELF] DT_RELR: deferring {} bytes to dynamic linker (PT_INTERP present)",
+                relr_sz
+            );
         }
     }
 
