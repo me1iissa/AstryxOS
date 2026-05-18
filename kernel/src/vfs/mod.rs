@@ -368,6 +368,7 @@ pub fn init() {
     let _ = symlink("/lib",   "/disk/lib");
     let _ = symlink("/lib64", "/disk/lib64");
     let _ = symlink("/usr",   "/disk/usr");
+    let _ = symlink("/opt",   "/disk/opt");
 
     // Create /dev/null and /dev/console.
     let _ = create_file("/dev/null");
