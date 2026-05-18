@@ -5,6 +5,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use super::{MacAddress, Ipv4Address, our_ip, our_mac, gateway_ip, subnet_mask, send_frame};
 use super::ethernet::{build_frame, ETHERTYPE_IPV4};
 
@@ -12,6 +13,19 @@ use super::ethernet::{build_frame, ETHERTYPE_IPV4};
 pub const PROTO_ICMP: u8 = 1;
 pub const PROTO_TCP: u8 = 6;
 pub const PROTO_UDP: u8 = 17;
+
+/// Count of IPv4 datagrams discarded on receive because the header
+/// checksum failed verification, per RFC 791 §3.1: "If the header
+/// checksum fails, the internet datagram is discarded at once by the
+/// entity which detects the error."  Exposed for tests and the
+/// `netstat`-style stats surface; loads/stores are Relaxed because the
+/// counter has no synchronisation duty.
+static IPV4_RX_BAD_CSUM: AtomicU64 = AtomicU64::new(0);
+
+/// Read the running count of IPv4 RX header-checksum drops.
+pub fn rx_bad_csum_count() -> u64 {
+    IPV4_RX_BAD_CSUM.load(Ordering::Relaxed)
+}
 
 /// An IPv4 header (parsed).
 pub struct Ipv4Header {
@@ -67,6 +81,28 @@ pub fn handle_ipv4(data: &[u8]) {
         None => return,
     };
 
+    // Per RFC 791 §3.1 ("Header Checksum") and RFC 1122 §3.2.1.2: the
+    // 16-bit one's-complement checksum is computed over the IP header
+    // only.  A receiver MUST verify and silently discard any datagram
+    // whose header checksum is invalid.  The Internet-checksum identity
+    // (RFC 1071 §1) lets us re-fold the header *with* the embedded
+    // `header_checksum` field in place — a valid sum yields 0x0000.
+    //
+    // The header length is bounded by the IHL nibble (5..=15 32-bit
+    // words = 20..=60 bytes); `Ipv4Header::parse` already enforced
+    // ihl>=5 and a 20-byte minimum, but the full IHL-byte range may
+    // extend past `data` for an attacker-truncated frame, so we clamp
+    // before checksumming to avoid an out-of-bounds slice.
+    let hlen = header.header_len();
+    if data.len() < hlen {
+        IPV4_RX_BAD_CSUM.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if !verify_checksum(&data[..hlen]) {
+        IPV4_RX_BAD_CSUM.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
     // Only accept packets addressed to us, broadcast, when we have no IP
     // yet (DHCP), or destined for the loopback prefix 127.0.0.0/8 (RFC
     // 1122 §3.2.1.3 — every host implicitly owns the entire 127/8 range).
@@ -79,7 +115,7 @@ pub fn handle_ipv4(data: &[u8]) {
         return;
     }
 
-    let payload_start = header.header_len();
+    let payload_start = hlen;
     if data.len() < payload_start { return; }
 
     // RFC 791 §3.1: clamp the upper-layer payload to the IP datagram's
@@ -146,6 +182,22 @@ pub(crate) fn clamp_payload_to_total_length(
     // Then clamp from below — never produce an end < payload_start that
     // would underflow the subsequent slice subtraction.
     if end < payload_start { payload_start } else { end }
+}
+
+/// Verify a buffer's embedded 16-bit Internet checksum (RFC 1071).
+///
+/// `data` must include the checksum field at the position the protocol
+/// specifies (e.g. for an IPv4 header that is bytes 10..12).  Because
+/// the checksum is the one's-complement of the one's-complement sum of
+/// the buffer, re-summing the *whole* buffer (with the checksum field
+/// in place) yields zero exactly when the embedded checksum is valid.
+/// Returns `true` for "valid", `false` for "mismatch".
+///
+/// For UDP (RFC 768) and TCP (RFC 793 §3.1) this same helper is used
+/// after the caller has prepended the IP pseudo-header.
+#[inline]
+pub fn verify_checksum(data: &[u8]) -> bool {
+    checksum(data) == 0
 }
 
 /// Calculate the Internet Checksum (RFC 1071).
