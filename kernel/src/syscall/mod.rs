@@ -1321,6 +1321,50 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
         set_kernel_rsp(kstack_top);
     }
 
+    // 5a. Vfork isolated-stack cleanup (Case C — shared-VM child).
+    //
+    //     If the clone(2)/vfork(2) machinery allocated a per-child stack
+    //     VMA in the parent's address space (so the child could not
+    //     overflow into the parent's frame — see
+    //     `proc::alloc_vfork_child_stack`), unmap it now before unblocking
+    //     the parent.  At this point the new VmSpace is installed and the
+    //     hardware CR3 is the child's NEW cr3, so the unmap targets the
+    //     **parent's** page tables (looked up via the parent's pid) — not
+    //     the address space we are currently executing on.
+    //
+    //     The parent never reads from the vfork stack region — it remains
+    //     blocked in `schedule()` with its own RSP elsewhere — so the
+    //     unmap is race-free with respect to the parent thread.
+    if is_shared_vm_child {
+        let (parent_pid, isolated_stack) = {
+            let tid = crate::proc::current_tid();
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            let threads = crate::proc::THREAD_TABLE.lock();
+            let parent_pid = procs
+                .iter()
+                .find(|p| p.pid == pid)
+                .map(|p| p.parent_pid)
+                .unwrap_or(0);
+            let isolated = threads
+                .iter()
+                .find(|t| t.tid == tid)
+                .and_then(|t| t.vfork_isolated_stack);
+            (parent_pid, isolated)
+        };
+        if let Some((base, length)) = isolated_stack {
+            if parent_pid != 0 {
+                crate::proc::vfork_isolated_stack_cleanup(parent_pid, base, length);
+            }
+            // Clear the field so a later (e.g. exit) path does not try to
+            // unmap a now-stale range.
+            let tid = crate::proc::current_tid();
+            let mut threads = crate::proc::THREAD_TABLE.lock();
+            if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+                t.vfork_isolated_stack = None;
+            }
+        }
+    }
+
     // 5b. vfork completion: wake the blocked parent NOW.  The new mm is
     //     installed, the old one is reclaimed, the CR3 is loaded, and the
     //     kernel stack is rebound to TSS — the child is fully ready to run

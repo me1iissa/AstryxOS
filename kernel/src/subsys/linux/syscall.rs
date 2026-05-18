@@ -2239,18 +2239,64 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     Some((child_pid, child_tid)) => {
                         crate::serial_println!("[VFORK] child PID {} TID {} created (shared VM)", child_pid, child_tid);
 
-                        // If glibc passed a `new_stack`, switch the child to it.
-                        // glibc's __clone wrapper placed fn/arg on this stack
-                        // before the syscall (Linux clone(2) ABI).  Without
-                        // CLONE_VFORK the child returns from __clone's child
-                        // path (pop fn; call *fn) using new_stack.  With
-                        // CLONE_VFORK glibc's vfork() shim passes new_stack=0
-                        // so the child shares the parent's user stack (correct
-                        // vfork semantics — parent is suspended).
+                        // If the caller passed a `new_stack`, the conventional
+                        // pattern is libc's `__clone` having pushed the
+                        // helper-fn `arg` to `*(new_stack-8)`.  POSIX
+                        // `vfork(2)` and `clone(2)` both leave the parent's
+                        // address space writable through the child, so a
+                        // sloppy or short caller-supplied stack can have the
+                        // child overflow it into the parent's frame.  The
+                        // canonical `posix_spawn(3)` pattern in some libc
+                        // implementations is a small `char stack[1024+PATH_MAX]`
+                        // local of the parent's `posix_spawn()` frame; the
+                        // helper chain (`__libc_sigaction` loop ->
+                        // `pthread_sigmask` -> `execve`) can easily push more
+                        // than 5 KiB and overflow downward.  When
+                        // SSP-instrumented callers (libxul) sit on the parent
+                        // stack, the child's overflow clobbers their saved
+                        // canary copies and the parent's epilogue traps to
+                        // `__stack_chk_fail`.
+                        //
+                        // Substitute a fresh kernel-allocated 64 KiB VMA in
+                        // the shared address space and copy the arg word so
+                        // the child's `pop %rdi; call *%r9` preamble still
+                        // works.  Recorded on `Thread.vfork_isolated_stack`
+                        // for cleanup on execve / vfork-child exit.
                         if new_stack != 0 {
-                            let mut threads = crate::proc::THREAD_TABLE.lock();
-                            if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
-                                t.user_entry_rsp = new_stack;
+                            match crate::proc::alloc_vfork_child_stack(pid, new_stack) {
+                                Some(child_rsp) => {
+                                    let mut threads = crate::proc::THREAD_TABLE.lock();
+                                    if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
+                                        t.user_entry_rsp = child_rsp;
+                                        // Record the isolated-stack VMA so
+                                        // we can unmap it later.  Base is
+                                        // computed from the RSP we just
+                                        // returned; see alloc_vfork_child_stack
+                                        // for the size constant.
+                                        const VFORK_STACK_SIZE: u64 = 64 * 1024;
+                                        // child_rsp = base + length - 8
+                                        let base = (child_rsp + 8) - VFORK_STACK_SIZE;
+                                        t.vfork_isolated_stack = Some((base, VFORK_STACK_SIZE));
+                                    }
+                                }
+                                None => {
+                                    // Fall back to caller-supplied stack with
+                                    // a warning — the saga continues if the
+                                    // child path is short enough that it
+                                    // doesn't overflow.  ENOMEM here would
+                                    // otherwise leave us with no place to
+                                    // run the child at all.
+                                    crate::serial_println!(
+                                        "[VFORK] WARN: failed to allocate isolated stack; \
+                                         using caller-supplied new_stack={:#x} \
+                                         (parent corruption risk)",
+                                        new_stack
+                                    );
+                                    let mut threads = crate::proc::THREAD_TABLE.lock();
+                                    if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
+                                        t.user_entry_rsp = new_stack;
+                                    }
+                                }
                             }
                         }
 
@@ -7578,6 +7624,8 @@ fn sys_pipe2_linux(fds_out: *mut u32, flags: u32) -> i64 {
 
     proc.file_descriptors[ri] = Some(read_fd);
     proc.file_descriptors[wi] = Some(write_fd);
+
+    crate::serial_println!("[PIPE2] pid={} read_fd={} write_fd={} flags={:#x}", pid, ri, wi, flags);
 
     unsafe {
         let _g = crate::arch::x86_64::smap::UserGuard::new();
