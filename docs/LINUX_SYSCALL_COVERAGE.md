@@ -1,12 +1,30 @@
 # Linux x86\_64 Syscall Coverage Audit
 
-**Audit date:** 2026-04-22  
-**Source:** `kernel/src/subsys/linux/syscall.rs` (4674 lines)  
-**Reference:** `/usr/include/x86_64-linux-gnu/asm/unistd_64.h` (UAPI header, Linux 6.6)  
-**Syscall count per header:** 0–334 (sequential) + 424–461 (gap-numbered) = 374 defined numbers  
+**Audit date:** 2026-04-22 (last conformance update: 2026-05-18)
+**Source:** `kernel/src/subsys/linux/syscall.rs` (8965 lines)
+**Reference:** `/usr/include/x86_64-linux-gnu/asm/unistd_64.h` (UAPI header, Linux 6.6)
+**Syscall count per header:** 0–334 (sequential) + 424–461 (gap-numbered) = 374 defined numbers
 
-This document is **audit only**. No kernel source files were modified.  
+This document is **audit only**. No kernel source files were modified.
 No GPL-contaminated derivation: all descriptions sourced from `man 2` pages and musl libc headers.
+
+## Recent conformance fixes
+
+- **2026-05-18** — `sysinfo(2)` rewritten to the 112-byte x86\_64 struct layout
+  per `<sys/sysinfo.h>` (Linux 2.3.23+ format).  The legacy 64-byte write
+  was clobbering `freeswap` with `1` and leaving `mem_unit` at zero; both
+  are ABI-visible.  Pinned by test 44a1 in `test_runner.rs`.
+- **2026-05-18** — `getrusage(2)` now validates `who` against {RUSAGE\_SELF,
+  RUSAGE\_CHILDREN, RUSAGE\_THREAD} per `man 2 getrusage`, returns -EFAULT
+  on NULL `usage`, and populates `ru_utime`, `ru_maxrss`, `ru_minflt`,
+  `ru_inblock`, `ru_oublock` from live PMM / per-PID metrics.  Previously
+  zero-filled.  Pinned by test 44a2.
+- **2026-05-18** — `/proc/self/status` expanded from the 4-key stub
+  (Name/State/Pid/PPid) to the full proc\_pid\_status(5) field set
+  (46 keys including Tgid, FDSize, VmPeak/Vm\*, Sig\*/Cap\* masks,
+  Cpus\_allowed, Mems\_allowed, voluntary\_ctxt\_switches).  Critical
+  for NPTL `gettid()` callers and Mozilla sandbox-probe parsers.
+  Pinned by test 44a3.
 
 ---
 

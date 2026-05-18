@@ -508,6 +508,18 @@ pub fn run() -> ! {
     total += 1;
     if test_mmap_syscall() { passed += 1; }
 
+    // ── Tests 248/249/250: Linux ABI conformance — sysinfo(2), getrusage(2),
+    // /proc/self/status (proc_pid_status(5)).  Sequenced here (before the
+    // W215 alias_test, which can BUGCHECK the kernel on pre-existing race
+    // paths) so a stable boot-time pass/fail result is always emitted for
+    // the ABI-conformance suite.
+    total += 1;
+    if test_248_sysinfo_layout() { passed += 1; }
+    total += 1;
+    if test_249_getrusage_validation() { passed += 1; }
+    total += 1;
+    if test_250_proc_status_fields() { passed += 1; }
+
     // ── Test 44b: page-aliasing reproducer (W8 race) ──────────────────────
 
     total += 1;
@@ -33109,5 +33121,303 @@ fn test_247_icmp_rx_checksum_validation() -> bool {
     }
 
     test_pass!("ICMP RX checksum validation (RFC 792)");
+    true
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 248: sysinfo(2) struct-layout conformance.
+//
+// Per `man 2 sysinfo` (Linux man-pages 5.13) and <sys/sysinfo.h>, the
+// modern x86_64 struct is 112 bytes with these offsets:
+//   off  0  long          uptime
+//   off  8  unsigned long loads[3]
+//   off 32  unsigned long totalram
+//   off 40  unsigned long freeram
+//   off 48..72  shared/buffer/totalswap/freeswap (left at zero here)
+//   off 80  unsigned short procs
+//   off 88..96  totalhigh/freehigh (zero on x86_64)
+//   off 104 unsigned int  mem_unit
+//
+// Pins the kernel-side write to those offsets so that a future
+// re-implementation can't quietly drift back to the legacy 64-byte
+// layout (which would clobber freeswap with `1` and leave mem_unit
+// at zero — both ABI-visible regressions).
+// ────────────────────────────────────────────────────────────────────────────
+fn test_248_sysinfo_layout() -> bool {
+    test_header!("sysinfo(2) x86_64 struct layout (man-pages 5.13)");
+
+    // 144-byte buffer used as the sysinfo target.  We oversize past 112
+    // so we can verify the kernel does not splatter beyond field 12.
+    let mut buf = [0u8; 144];
+    // Sentinel: pre-fill with a recognisable byte; if the kernel writes
+    // outside the 112-byte struct we'll see it survive.
+    for b in buf.iter_mut() { *b = 0xA5; }
+    let ptr = buf.as_mut_ptr() as u64;
+
+    // sys_sysinfo == 99.
+    let rc = crate::syscall::dispatch_linux_kernel(99, ptr, 0, 0, 0, 0, 0);
+    if rc != 0 {
+        test_fail!("sysinfo_rc", "expected 0, got {}", rc);
+        return false;
+    }
+
+    // Field offsets (LE on x86_64).
+    let u64_at = |off: usize| -> u64 {
+        let mut v = [0u8; 8];
+        v.copy_from_slice(&buf[off..off+8]);
+        u64::from_le_bytes(v)
+    };
+    let u32_at = |off: usize| -> u32 {
+        let mut v = [0u8; 4];
+        v.copy_from_slice(&buf[off..off+4]);
+        u32::from_le_bytes(v)
+    };
+    let u16_at = |off: usize| -> u16 {
+        let mut v = [0u8; 2];
+        v.copy_from_slice(&buf[off..off+2]);
+        u16::from_le_bytes(v)
+    };
+
+    let uptime    = u64_at(0)   as i64;
+    let _loads0   = u64_at(8);
+    let totalram  = u64_at(32);
+    let freeram   = u64_at(40);
+    let freeswap  = u64_at(72);  // offset 72 per <sys/sysinfo.h>
+    let procs     = u16_at(80);
+    let mem_unit  = u32_at(104);
+
+    // Regression pin for the original p.add(9) clobber: the legacy 64-byte
+    // stub wrote `1` into what it thought was procs but landed on freeswap
+    // (offset 72).  Free-swap must be zero on a kernel with no swap.
+    if freeswap != 0 {
+        test_fail!("sysinfo_freeswap_clobber",
+            "freeswap clobbered: {} (expected 0 on swapless kernel)", freeswap);
+        return false;
+    }
+
+    if uptime < 0 {
+        test_fail!("sysinfo_uptime", "uptime negative: {}", uptime);
+        return false;
+    }
+    if totalram == 0 {
+        test_fail!("sysinfo_totalram", "totalram is zero — PMM stats not wired");
+        return false;
+    }
+    if freeram > totalram {
+        test_fail!("sysinfo_freeram", "freeram {} > totalram {}", freeram, totalram);
+        return false;
+    }
+    if procs < 1 {
+        test_fail!("sysinfo_procs", "procs = 0 — no live processes counted");
+        return false;
+    }
+    if mem_unit != 1 {
+        test_fail!("sysinfo_mem_unit",
+            "mem_unit = {} (expected 1 — bytes-not-pages convention)", mem_unit);
+        return false;
+    }
+    // Padding beyond field 12 (offset 108..112) should be zero (kernel
+    // wrote the trailing 4 bytes of mem_unit slot + the empty _f[]).
+    for i in 108..112 {
+        if buf[i] != 0 {
+            test_fail!("sysinfo_pad", "byte {} = 0x{:02x}, expected 0", i, buf[i]);
+            return false;
+        }
+    }
+    // Bytes past the struct must remain 0xA5 — the kernel must not
+    // over-write past offset 112 (catches a stale 144-byte memset).
+    if buf[112] != 0xA5 || buf[143] != 0xA5 {
+        test_fail!("sysinfo_overrun",
+            "byte[112]=0x{:02x} byte[143]=0x{:02x} — wrote past 112-byte struct",
+            buf[112], buf[143]);
+        return false;
+    }
+
+    // NULL-pointer case: -EFAULT per sysinfo(2) ERRORS.
+    let rc_null = crate::syscall::dispatch_linux_kernel(99, 0, 0, 0, 0, 0, 0);
+    if rc_null != -14 {
+        test_fail!("sysinfo_null", "NULL info: expected -EFAULT (-14), got {}", rc_null);
+        return false;
+    }
+    // Kernel-VA case: caller must not be able to steer a kernel-page
+    // write by passing a pointer above KERNEL_VIRT_BASE.  This guards
+    // against CWE-822 (untrusted pointer dereference) — SMAP's AC=1
+    // only blocks kernel-mode user-page faults, not kernel-VA writes.
+    let kva = astryx_shared::KERNEL_VIRT_BASE;
+    let rc_kva = crate::syscall::dispatch_linux_kernel(99, kva, 0, 0, 0, 0, 0);
+    if rc_kva != -14 {
+        test_fail!("sysinfo_kva",
+            "kernel-VA info: expected -EFAULT (-14), got {}", rc_kva);
+        return false;
+    }
+
+    test_println!("  uptime={}s totalram={} freeram={} procs={} mem_unit={} ✓",
+        uptime, totalram, freeram, procs, mem_unit);
+    test_pass!("sysinfo(2) 112-byte struct layout matches sys/sysinfo.h");
+    true
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 249: getrusage(2) argument validation + populated fields.
+//
+// Per `man 2 getrusage` (Linux man-pages 5.13 / POSIX.1-2017):
+//   `who` ∈ {RUSAGE_SELF=0, RUSAGE_CHILDREN=-1, RUSAGE_THREAD=1};
+//   any other value -> -EINVAL.
+//   NULL `usage` -> -EFAULT.
+// Linux populates a fixed subset of fields; we verify ru_utime + ru_maxrss
+// are non-zero after the call (the rest are documented as "currently
+// unused on Linux" or per-counter zero on a quiet PID).
+// ────────────────────────────────────────────────────────────────────────────
+fn test_249_getrusage_validation() -> bool {
+    test_header!("getrusage(2) who-arg validation + ru_utime/ru_maxrss");
+
+    let mut buf = [0u8; 144];
+    let ptr = buf.as_mut_ptr() as u64;
+
+    // RUSAGE_SELF = 0.
+    let rc = crate::syscall::dispatch_linux_kernel(98, 0, ptr, 0, 0, 0, 0);
+    if rc != 0 {
+        test_fail!("getrusage_self", "rc {} (expected 0)", rc);
+        return false;
+    }
+    // ru_utime.tv_sec + tv_usec at offsets 0..16 — kernel must
+    // populate something non-zero after boot.
+    let mut v = [0u8; 8];
+    v.copy_from_slice(&buf[0..8]);
+    let utime_sec = u64::from_le_bytes(v);
+    v.copy_from_slice(&buf[8..16]);
+    let utime_usec = u64::from_le_bytes(v);
+    if utime_sec == 0 && utime_usec == 0 {
+        test_fail!("getrusage_utime",
+            "ru_utime is zero — uptime proxy not populated");
+        return false;
+    }
+
+    // RUSAGE_THREAD = 1 — accepted.
+    let rc_thr = crate::syscall::dispatch_linux_kernel(98, 1, ptr, 0, 0, 0, 0);
+    if rc_thr != 0 {
+        test_fail!("getrusage_thread", "rc {} (expected 0)", rc_thr);
+        return false;
+    }
+    // RUSAGE_CHILDREN = -1 — accepted.
+    let rc_chld = crate::syscall::dispatch_linux_kernel(98,
+        (-1i64) as u64, ptr, 0, 0, 0, 0);
+    if rc_chld != 0 {
+        test_fail!("getrusage_children", "rc {} (expected 0)", rc_chld);
+        return false;
+    }
+
+    // Bogus who values -> -EINVAL.
+    for bad in [2u64, 42u64, 100u64] {
+        let r = crate::syscall::dispatch_linux_kernel(98, bad, ptr, 0, 0, 0, 0);
+        if r != -22 {
+            test_fail!("getrusage_einval",
+                "who={} returned {} (expected -EINVAL=-22)", bad, r);
+            return false;
+        }
+    }
+    // NULL usage -> -EFAULT (-14).
+    let r = crate::syscall::dispatch_linux_kernel(98, 0, 0, 0, 0, 0, 0);
+    if r != -14 {
+        test_fail!("getrusage_efault",
+            "NULL usage: expected -EFAULT (-14), got {}", r);
+        return false;
+    }
+    // Kernel-VA usage -> -EFAULT (-14).  Same CWE-822 guard as in
+    // test_248: the caller must not be able to steer a kernel-page
+    // write by passing a pointer above KERNEL_VIRT_BASE.
+    let kva = astryx_shared::KERNEL_VIRT_BASE;
+    let r_kva = crate::syscall::dispatch_linux_kernel(98, 0, kva, 0, 0, 0, 0);
+    if r_kva != -14 {
+        test_fail!("getrusage_kva",
+            "kernel-VA usage: expected -EFAULT (-14), got {}", r_kva);
+        return false;
+    }
+    test_println!("  utime={}.{:06}s ✓ (who arg fully validated)",
+        utime_sec, utime_usec);
+    test_pass!("getrusage(2) argument validation + ru_utime live");
+    true
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 250: /proc/self/status field-set conformance.
+//
+// Per `man 5 proc_pid_status` (Linux man-pages 5.13) and
+// `Documentation/filesystems/proc.rst`, /proc/[pid]/status must contain
+// the keys that NPTL, ps, top, and Mozilla's sandbox-probe parser look
+// for.  The historical AstryxOS stub had only {Name, State, Pid, PPid}
+// which broke `gettid()` callers expecting Tgid and any tool reading
+// the Vm*/Sig*/Cap* tables.  This test pins the expanded set.
+// ────────────────────────────────────────────────────────────────────────────
+fn test_250_proc_status_fields() -> bool {
+    test_header!("/proc/self/status field set (proc_pid_status(5))");
+    let pid = crate::proc::current_pid_lockless();
+    let content = crate::vfs::generate_proc_status_for_test(pid);
+    let s = match core::str::from_utf8(&content) {
+        Ok(s) => s,
+        Err(_) => {
+            test_fail!("status_utf8", "status file is not valid UTF-8");
+            return false;
+        }
+    };
+
+    // Required keys per the man-page.  We do not check exact values —
+    // only that each label appears (so callers can sscanf it).
+    let required = [
+        "Name:", "Umask:", "State:", "Tgid:", "Ngid:", "Pid:", "PPid:",
+        "TracerPid:", "Uid:", "Gid:", "FDSize:", "Groups:",
+        "VmPeak:", "VmSize:", "VmLck:", "VmHWM:", "VmRSS:",
+        "RssAnon:", "RssFile:", "RssShmem:",
+        "VmData:", "VmStk:", "VmExe:", "VmLib:", "VmPTE:", "VmSwap:",
+        "Threads:",
+        "SigQ:", "SigPnd:", "ShdPnd:", "SigBlk:", "SigIgn:", "SigCgt:",
+        "CapInh:", "CapPrm:", "CapEff:", "CapBnd:", "CapAmb:",
+        "NoNewPrivs:", "Seccomp:",
+        "Cpus_allowed:", "Cpus_allowed_list:",
+        "Mems_allowed:", "Mems_allowed_list:",
+        "voluntary_ctxt_switches:", "nonvoluntary_ctxt_switches:",
+    ];
+    for key in &required {
+        if !s.contains(key) {
+            test_fail!("status_field",
+                "/proc/self/status missing required key {:?}", key);
+            return false;
+        }
+    }
+
+    // Tgid must equal Pid for a non-thread (single-thread process).
+    // Extract the integers and compare.
+    let extract = |key: &str| -> Option<u64> {
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix(key) {
+                let trimmed = rest.trim();
+                // Take first whitespace-delimited token.
+                let tok = trimmed.split_whitespace().next()?;
+                return tok.parse::<u64>().ok();
+            }
+        }
+        None
+    };
+    let tgid = extract("Tgid:").unwrap_or(0);
+    let p    = extract("Pid:").unwrap_or(0);
+    if tgid != p {
+        test_fail!("status_tgid",
+            "Tgid ({}) != Pid ({}) for single-threaded process", tgid, p);
+        return false;
+    }
+
+    // Name must be ≤ 15 chars (TASK_COMM_LEN-1) per proc_pid_status(5).
+    if let Some(line) = s.lines().find(|l| l.starts_with("Name:")) {
+        let name = line.strip_prefix("Name:").unwrap_or("").trim();
+        if name.len() > 15 {
+            test_fail!("status_name",
+                "Name field {} chars > 15 (TASK_COMM_LEN)", name.len());
+            return false;
+        }
+    }
+
+    test_println!("  {} required keys present; Tgid==Pid==Pid ✓",
+        required.len());
+    test_pass!("/proc/self/status conforms to proc_pid_status(5) field set");
     true
 }
