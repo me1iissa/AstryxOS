@@ -2500,6 +2500,21 @@ macro_rules! isr_no_error {
         extern "C" fn $name() {
             // Naked ISR stub. Saves all GPRs, calls handler, restores, irets.
             core::arch::naked_asm!(
+                // ── SMAP entry guard ────────────────────────────────────
+                // Force EFLAGS.AC=0 at the gate.  An IDT entry leaves AC
+                // at whatever the interrupted context held; for a ring-3
+                // entry an attacker may have set AC=1 from userspace
+                // (the AC bit is not privileged — CWE-269 / CWE-693).
+                // Without this clear, any latent unbracketed kernel-side
+                // user-pointer deref runs with SMAP disabled, converting
+                // a fail-stop fault into an arbitrary-kernel-write
+                // primitive.  Per Intel SDM Vol. 2A (CLAC) the
+                // instruction raises #UD if CR4.SMAP=0, so we gate the
+                // emit on the `SMAP_ENABLED` runtime flag.
+                "cmp byte ptr [rip + {smap_enabled}], 0",
+                "je 90f",
+                "clac",
+                "90:",
                 "push 0",           // Fake error code
                 // caller-saved (scratch) registers
                 "push rax",
@@ -2541,6 +2556,7 @@ macro_rules! isr_no_error {
                 "iretq",
                 vector = const $vector,
                 handler = sym exception_handler,
+                smap_enabled = sym crate::arch::x86_64::smap::SMAP_ENABLED,
             );
         }
     };
@@ -2552,6 +2568,18 @@ macro_rules! isr_with_error {
         extern "C" fn $name() {
             // Naked ISR stub for exceptions that push an error code.
             core::arch::naked_asm!(
+                // ── SMAP entry guard ────────────────────────────────────
+                // See `isr_no_error!` for the threat model.  Same
+                // rationale: clear EFLAGS.AC at the IDT gate so a
+                // ring-3 attacker cannot inherit AC=1 into the kernel
+                // and bypass SMAP on any unbracketed user-pointer
+                // deref.  Intel SDM Vol. 3A §4.6.1 (SMAP), §6.4
+                // (interrupt RFLAGS preserve), Vol. 2A (CLAC #UD on
+                // CR4.SMAP=0 — hence the runtime gate).
+                "cmp byte ptr [rip + {smap_enabled}], 0",
+                "je 90f",
+                "clac",
+                "90:",
                 // Error code already on stack from CPU
                 // caller-saved (scratch) registers
                 "push rax",
@@ -2593,6 +2621,7 @@ macro_rules! isr_with_error {
                 "iretq",
                 vector = const $vector,
                 handler = sym exception_handler,
+                smap_enabled = sym crate::arch::x86_64::smap::SMAP_ENABLED,
             );
         }
     };
@@ -2622,6 +2651,20 @@ isr_no_error!(isr_simd_fp, 19u64);
 #[unsafe(naked)]
 extern "C" fn isr_syscall_int80() {
     core::arch::naked_asm!(
+        // ── SMAP entry guard ────────────────────────────────────────────
+        // INT 0x80 enters from ring 3 with the user RFLAGS preserved per
+        // Intel SDM Vol. 3A §6.4 (interrupt RFLAGS preserve).  An
+        // attacker may set EFLAGS.AC=1 from userspace (the AC bit is not
+        // privileged — CWE-269 / CWE-693) and call INT 0x80 to enter the
+        // kernel with SMAP silently lifted.  Force AC=0 at the gate; the
+        // companion FMASK setting in `kernel/src/syscall/mod.rs` covers
+        // the SYSCALL path, which bypasses the IDT.  CLAC raises #UD on
+        // CR4.SMAP=0 (Intel SDM Vol. 2A), so the emit is gated on the
+        // runtime `SMAP_ENABLED` flag.
+        "cmp byte ptr [rip + {smap_enabled}], 0",
+        "je 90f",
+        "clac",
+        "90:",
         // Save all scratch registers
         "push 0",           // Fake error code placeholder (for uniform frame)
         "push rax",         // Save syscall number
@@ -2662,6 +2705,7 @@ extern "C" fn isr_syscall_int80() {
         "iretq",
 
         dispatch = sym crate::syscall::dispatch,
+        smap_enabled = sym crate::arch::x86_64::smap::SMAP_ENABLED,
     );
 }
 /// INT 0x2E syscall handler — NT-ABI gate for Win32 compatibility.
@@ -2678,6 +2722,16 @@ extern "C" fn isr_syscall_int80() {
 #[unsafe(naked)]
 extern "C" fn isr_syscall_int2e() {
     core::arch::naked_asm!(
+        // ── SMAP entry guard ────────────────────────────────────────────
+        // Same threat model as isr_syscall_int80 above: a ring-3
+        // attacker can pre-set EFLAGS.AC=1 and INT 0x2E into the kernel
+        // with SMAP silently lifted (CWE-269 / CWE-693).  Clear AC at
+        // the gate; gate on `SMAP_ENABLED` to avoid #UD on non-SMAP
+        // CPUs (Intel SDM Vol. 2A — CLAC).
+        "cmp byte ptr [rip + {smap_enabled}], 0",
+        "je 90f",
+        "clac",
+        "90:",
         // Save all scratch registers (same layout as isr_syscall_int80)
         "push 0",           // Fake error code placeholder
         "push rax",         // save syscall number (live: rax)  → [rsp+64]
@@ -2718,5 +2772,6 @@ extern "C" fn isr_syscall_int2e() {
         "iretq",
 
         dispatch = sym crate::nt::dispatch_nt_int2e,
+        smap_enabled = sym crate::arch::x86_64::smap::SMAP_ENABLED,
     );
 }
