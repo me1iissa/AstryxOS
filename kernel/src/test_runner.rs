@@ -1954,6 +1954,26 @@ pub fn run() -> ! {
         if test_247_icmp_rx_checksum_validation() { passed += 1; }
     }
 
+    // ── Test 251: X11 ICCCM atoms pre-registered at stable IDs ──────────
+    // WM_PROTOCOLS (69), WM_DELETE_WINDOW (70), WM_TAKE_FOCUS (71) must have
+    // stable IDs so that WM_PROTOCOLS property data (packed atom IDs) is
+    // unambiguous across multiple InternAtom calls.
+    total += 1;
+    if test_251_icccm_atoms_stable_ids() { passed += 1; }
+
+    // ── Test 252: X11 SendEvent delivers synthetic ClientMessage ─────────
+    // A ClientMessage sent via SendEvent must arrive at every client that
+    // owns the destination window with the synthetic-event MSB set (type|0x80).
+    // This is the WM_DELETE_WINDOW delivery path (ICCCM §4.2.8.1).
+    total += 1;
+    if test_252_send_event_client_message() { passed += 1; }
+
+    // ── Test 253: FocusIn/FocusOut delivered on SetInputFocus ────────────
+    // SetInputFocus must send FocusOut (10) to the old window and FocusIn (9)
+    // to the new window for clients that selected FocusChangeMask.
+    total += 1;
+    if test_253_focus_in_out_events() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -17181,6 +17201,345 @@ fn test_ewmh_net_supported() -> bool {
 
     unix::close(cfd);
     test_pass!("EWMH _NET_SUPPORTED on root window");
+    true
+}
+
+// ── Test 251: X11 ICCCM atoms pre-registered at stable IDs ─────────────────
+//
+// WM_PROTOCOLS (69), WM_DELETE_WINDOW (70), WM_TAKE_FOCUS (71) must be
+// interned at fixed atom IDs per ICCCM §4.1.2.7.  Stable IDs allow WMs to
+// compare property data (packed atom arrays) without per-session drift.
+
+fn test_251_icccm_atoms_stable_ids() -> bool {
+    test_header!("X11 ICCCM atoms WM_PROTOCOLS/WM_DELETE_WINDOW/WM_TAKE_FOCUS stable IDs");
+
+    use crate::x11::atoms;
+
+    // Check expected IDs via the atoms::intern API (identical to InternAtom).
+    let proto_id    = atoms::intern("WM_PROTOCOLS",    false);
+    let delete_id   = atoms::intern("WM_DELETE_WINDOW",false);
+    let takefoc_id  = atoms::intern("WM_TAKE_FOCUS",   false);
+
+    if proto_id != atoms::ATOM_WM_PROTOCOLS {
+        test_fail!("icccm_atoms", "WM_PROTOCOLS: got {} want {}", proto_id, atoms::ATOM_WM_PROTOCOLS);
+        return false;
+    }
+    test_println!("  WM_PROTOCOLS atom={} ✓", proto_id);
+
+    if delete_id != atoms::ATOM_WM_DELETE_WINDOW {
+        test_fail!("icccm_atoms", "WM_DELETE_WINDOW: got {} want {}", delete_id, atoms::ATOM_WM_DELETE_WINDOW);
+        return false;
+    }
+    test_println!("  WM_DELETE_WINDOW atom={} ✓", delete_id);
+
+    if takefoc_id != atoms::ATOM_WM_TAKE_FOCUS {
+        test_fail!("icccm_atoms", "WM_TAKE_FOCUS: got {} want {}", takefoc_id, atoms::ATOM_WM_TAKE_FOCUS);
+        return false;
+    }
+    test_println!("  WM_TAKE_FOCUS atom={} ✓", takefoc_id);
+
+    // Verify get_name round-trip.
+    if atoms::get_name(atoms::ATOM_WM_PROTOCOLS).as_deref() != Some("WM_PROTOCOLS") {
+        test_fail!("icccm_atoms", "get_name(WM_PROTOCOLS) did not round-trip");
+        return false;
+    }
+    if atoms::get_name(atoms::ATOM_WM_DELETE_WINDOW).as_deref() != Some("WM_DELETE_WINDOW") {
+        test_fail!("icccm_atoms", "get_name(WM_DELETE_WINDOW) did not round-trip");
+        return false;
+    }
+    if atoms::get_name(atoms::ATOM_WM_TAKE_FOCUS).as_deref() != Some("WM_TAKE_FOCUS") {
+        test_fail!("icccm_atoms", "get_name(WM_TAKE_FOCUS) did not round-trip");
+        return false;
+    }
+    test_println!("  get_name round-trips ✓");
+
+    // Dynamic atoms must start at 72, not collide with the ICCCM range.
+    let dynamic = atoms::intern("__ASTRYX_TEST_UNIQUE_ATOM_XYZ__", false);
+    if dynamic < 72 {
+        test_fail!("icccm_atoms", "dynamic atom {} < 72 (collides with ICCCM range)", dynamic);
+        return false;
+    }
+    test_println!("  first dynamic atom={} (>=72) ✓", dynamic);
+
+    test_pass!("X11 ICCCM atoms WM_PROTOCOLS/WM_DELETE_WINDOW/WM_TAKE_FOCUS stable IDs");
+    true
+}
+
+// ── Test 252: X11 SendEvent delivers synthetic ClientMessage ────────────────
+//
+// Verifies opcode 25 (SendEvent) actually routes the 32-byte event to the
+// destination window's owners with the synthetic-event MSB (type | 0x80) set.
+// This is the exact path used by ICCCM WM_DELETE_WINDOW.
+
+fn test_252_send_event_client_message() -> bool {
+    test_header!("X11 SendEvent delivers synthetic ClientMessage (ICCCM WM_DELETE_WINDOW path)");
+
+    use crate::x11::proto;
+    use crate::net::unix;
+
+    // Set up a client connection.
+    let cfd = unix::create(unix::SockKind::Stream, unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if cfd == u64::MAX { test_fail!("send_event", "unix::create() failed"); return false; }
+    if unix::connect(cfd, b"/tmp/.X11-unix/X0\0", unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
+        test_fail!("send_event", "connect failed");
+        unix::close(cfd);
+        return false;
+    }
+
+    // Connection setup.
+    let hello: [u8; 12] = [0x6C, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    unix::write(cfd, &hello);
+    crate::x11::poll();
+    let mut drain = [0u8; 512];
+    unix::read(cfd, &mut drain);
+
+    // CreateWindow — we need a window to target.
+    let wid: u32 = 0x00500001;
+    {
+        let mut req = [0u8; 32];
+        req[0] = proto::OP_CREATE_WINDOW;
+        req[2] = 8; // length = 8 words = 32 bytes
+        proto::write_u32le(&mut req, 4, wid);
+        proto::write_u32le(&mut req, 8, proto::ROOT_WINDOW_ID);
+        proto::write_u16le(&mut req, 12, 10); // x
+        proto::write_u16le(&mut req, 14, 10); // y
+        proto::write_u16le(&mut req, 16, 100); // width
+        proto::write_u16le(&mut req, 18, 100); // height
+        unix::write(cfd, &req);
+        crate::x11::poll();
+    }
+
+    // Select ClientMessage events on the window (CW_EVENT_MASK = 0x0800).
+    // Per X11 protocol, event-mask selection is via ChangeWindowAttrs (op 2).
+    {
+        let mut req = [0u8; 16];
+        req[0] = proto::OP_CHANGE_WINDOW_ATTRS;
+        req[2] = 4; // 16 bytes / 4 = 4 words
+        proto::write_u32le(&mut req, 4, wid);
+        proto::write_u32le(&mut req, 8, proto::CW_EVENT_MASK);
+        // EVENT_MASK for ClientMessage is bit 25 (0x0200_0000).
+        proto::write_u32le(&mut req, 12, 0x0200_0000);
+        unix::write(cfd, &req);
+        crate::x11::poll();
+    }
+
+    // Intern WM_PROTOCOLS and WM_DELETE_WINDOW.
+    let wm_protocols    = crate::x11::atoms::ATOM_WM_PROTOCOLS;
+    let wm_delete_window= crate::x11::atoms::ATOM_WM_DELETE_WINDOW;
+
+    // Build and send a SendEvent request containing a ClientMessage.
+    // The WM would typically do this to ask the app to close gracefully.
+    {
+        // Build the inner 32-byte ClientMessage event (un-marked — server sets MSB).
+        let mut inner = [0u8; 32];
+        inner[0] = proto::EVENT_CLIENT_MESSAGE; // type=33 (0x21)
+        inner[1] = 32; // format=32
+        // seq at [2-3] — server will overwrite with correct sequence
+        proto::write_u32le(&mut inner, 4, wid);         // window
+        proto::write_u32le(&mut inner, 8, wm_protocols);// message type
+        proto::write_u32le(&mut inner, 12, wm_delete_window); // data[0]
+
+        // SendEvent request: 44 bytes total.
+        let mut req = [0u8; 44];
+        req[0] = proto::OP_SEND_EVENT; // opcode 25
+        req[1] = 0; // propagate=false
+        req[2] = 11; // length = 44/4 = 11 words
+        proto::write_u32le(&mut req, 4, wid);       // destination
+        proto::write_u32le(&mut req, 8, 0x0200_0000); // event-mask (ClientMessage)
+        req[12..44].copy_from_slice(&inner);
+        unix::write(cfd, &req);
+        crate::x11::poll();
+    }
+
+    // Read back the delivered event.
+    let mut buf = [0u8; 64];
+    let n = unix::read(cfd, &mut buf) as usize;
+    if n < 32 {
+        test_fail!("send_event", "no event received after SendEvent (n={})", n);
+        unix::close(cfd);
+        return false;
+    }
+    test_println!("  received {} bytes, type=0x{:02x}", n, buf[0]);
+
+    // Verify: type byte must have MSB set (0x21 | 0x80 = 0xA1).
+    let expected_type = proto::EVENT_CLIENT_MESSAGE | 0x80;
+    if buf[0] != expected_type {
+        test_fail!("send_event", "synthetic MSB not set: got type=0x{:02x} want 0x{:02x}",
+                   buf[0], expected_type);
+        unix::close(cfd);
+        return false;
+    }
+    test_println!("  synthetic event type=0x{:02x} (MSB set) ✓", buf[0]);
+
+    // Verify the message-type atom in the ClientMessage data.
+    let msg_type = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    if msg_type != wm_protocols {
+        test_fail!("send_event", "ClientMessage type atom: got {} want {}", msg_type, wm_protocols);
+        unix::close(cfd);
+        return false;
+    }
+    test_println!("  ClientMessage WM_PROTOCOLS atom={} ✓", msg_type);
+
+    // Verify data[0] = WM_DELETE_WINDOW.
+    let data0 = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    if data0 != wm_delete_window {
+        test_fail!("send_event", "ClientMessage data[0]: got {} want {}", data0, wm_delete_window);
+        unix::close(cfd);
+        return false;
+    }
+    test_println!("  ClientMessage data[0]=WM_DELETE_WINDOW ({}) ✓", data0);
+
+    unix::close(cfd);
+    test_pass!("X11 SendEvent delivers synthetic ClientMessage (ICCCM WM_DELETE_WINDOW path)");
+    true
+}
+
+// ── Test 253: FocusIn/FocusOut delivered on SetInputFocus ───────────────────
+//
+// Per X11 protocol §SetInputFocus: when the focus window changes, FocusOut (10)
+// must be sent to the previous focus window and FocusIn (9) to the new one,
+// for clients that selected FocusChangeMask (0x0020_0000).
+
+fn test_253_focus_in_out_events() -> bool {
+    test_header!("X11 FocusIn/FocusOut events delivered on SetInputFocus");
+
+    use crate::x11::proto;
+    use crate::net::unix;
+
+    let cfd = unix::create(unix::SockKind::Stream, unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if cfd == u64::MAX { test_fail!("focus_events", "unix::create() failed"); return false; }
+    if unix::connect(cfd, b"/tmp/.X11-unix/X0\0", unix::PeerCreds { pid: 0, uid: 0, gid: 0 }) < 0 {
+        test_fail!("focus_events", "connect failed");
+        unix::close(cfd);
+        return false;
+    }
+
+    // Setup.
+    let hello: [u8; 12] = [0x6C, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    unix::write(cfd, &hello);
+    crate::x11::poll();
+    let mut drain = [0u8; 512];
+    unix::read(cfd, &mut drain);
+
+    // CreateWindow A and B.
+    let wid_a: u32 = 0x00600001;
+    let wid_b: u32 = 0x00600002;
+    for &wid in &[wid_a, wid_b] {
+        let mut req = [0u8; 32];
+        req[0] = proto::OP_CREATE_WINDOW;
+        req[2] = 8;
+        proto::write_u32le(&mut req, 4, wid);
+        proto::write_u32le(&mut req, 8, proto::ROOT_WINDOW_ID);
+        proto::write_u16le(&mut req, 16, 50);
+        proto::write_u16le(&mut req, 18, 50);
+        unix::write(cfd, &req);
+        crate::x11::poll();
+    }
+
+    // Select FocusChangeMask (0x0020_0000) on both windows via ChangeWindowAttrs.
+    for &wid in &[wid_a, wid_b] {
+        let mut req = [0u8; 16];
+        req[0] = proto::OP_CHANGE_WINDOW_ATTRS;
+        req[2] = 4;
+        proto::write_u32le(&mut req, 4, wid);
+        proto::write_u32le(&mut req, 8, proto::CW_EVENT_MASK);
+        proto::write_u32le(&mut req, 12, proto::EVENT_MASK_FOCUS_CHANGE);
+        unix::write(cfd, &req);
+        crate::x11::poll();
+    }
+
+    // SetInputFocus to window A (from root / default).
+    // Wire format: opcode(1) revert-to(1) length(2) focus-window(4) time(4) = 12 bytes = 3 words.
+    {
+        let mut req = [0u8; 12];
+        req[0] = proto::OP_SET_INPUT_FOCUS;
+        req[1] = 0; // revert-to = None
+        req[2] = 3; // 12 bytes / 4 = 3 words
+        proto::write_u32le(&mut req, 4, wid_a);
+        // timestamp = 0 (CurrentTime)
+        unix::write(cfd, &req);
+        crate::x11::poll();
+    }
+
+    // We expect a FocusIn event for window A.
+    let mut buf = [0u8; 64];
+    let n = unix::read(cfd, &mut buf) as usize;
+    if n < 32 {
+        test_fail!("focus_events", "no FocusIn event after focusing wid_a (n={})", n);
+        unix::close(cfd);
+        return false;
+    }
+    test_println!("  SetInputFocus(wid_a) -> event type=0x{:02x} window={}", buf[0], u32::from_le_bytes([buf[4],buf[5],buf[6],buf[7]]));
+    if buf[0] != proto::EVENT_FOCUS_IN {
+        test_fail!("focus_events", "expected FocusIn (9) got type={}", buf[0]);
+        unix::close(cfd);
+        return false;
+    }
+    let recv_win = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    if recv_win != wid_a {
+        test_fail!("focus_events", "FocusIn for wrong window: got {} want {}", recv_win, wid_a);
+        unix::close(cfd);
+        return false;
+    }
+    test_println!("  FocusIn event for wid_a ✓");
+
+    // Now SetInputFocus to window B — expect FocusOut for A, then FocusIn for B.
+    {
+        let mut req = [0u8; 12];
+        req[0] = proto::OP_SET_INPUT_FOCUS;
+        req[1] = 0;
+        req[2] = 3; // 12 bytes = 3 words
+        proto::write_u32le(&mut req, 4, wid_b);
+        unix::write(cfd, &req);
+        crate::x11::poll();
+    }
+
+    // Read FocusOut for A.
+    let mut buf2 = [0u8; 64];
+    let n2 = unix::read(cfd, &mut buf2) as usize;
+    if n2 < 32 {
+        test_fail!("focus_events", "no FocusOut event after focusing wid_b (n={})", n2);
+        unix::close(cfd);
+        return false;
+    }
+    test_println!("  SetInputFocus(wid_b) -> first event type=0x{:02x}", buf2[0]);
+    if buf2[0] != proto::EVENT_FOCUS_OUT {
+        test_fail!("focus_events", "expected FocusOut (10) for wid_a got type={}", buf2[0]);
+        unix::close(cfd);
+        return false;
+    }
+    let fo_win = u32::from_le_bytes([buf2[4], buf2[5], buf2[6], buf2[7]]);
+    if fo_win != wid_a {
+        test_fail!("focus_events", "FocusOut for wrong window: got {} want {}", fo_win, wid_a);
+        unix::close(cfd);
+        return false;
+    }
+    test_println!("  FocusOut for wid_a ✓");
+
+    // Read FocusIn for B.
+    let mut buf3 = [0u8; 64];
+    let n3 = unix::read(cfd, &mut buf3) as usize;
+    if n3 < 32 {
+        test_fail!("focus_events", "no FocusIn event for wid_b (n={})", n3);
+        unix::close(cfd);
+        return false;
+    }
+    test_println!("  second event type=0x{:02x}", buf3[0]);
+    if buf3[0] != proto::EVENT_FOCUS_IN {
+        test_fail!("focus_events", "expected FocusIn (9) for wid_b got type={}", buf3[0]);
+        unix::close(cfd);
+        return false;
+    }
+    let fi_win = u32::from_le_bytes([buf3[4], buf3[5], buf3[6], buf3[7]]);
+    if fi_win != wid_b {
+        test_fail!("focus_events", "FocusIn for wrong window: got {} want {}", fi_win, wid_b);
+        unix::close(cfd);
+        return false;
+    }
+    test_println!("  FocusIn for wid_b ✓");
+
+    unix::close(cfd);
+    test_pass!("X11 FocusIn/FocusOut events delivered on SetInputFocus");
     true
 }
 
