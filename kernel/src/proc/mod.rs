@@ -2605,6 +2605,30 @@ pub fn alloc_vfork_child_stack(parent_pid: Pid, parent_new_stack: u64) -> Option
     // costs at most a few hundred KiB in steady state.
     const VFORK_STACK_SIZE: u64 = 64 * 1024;
 
+    // -- Phase 0: validate the attacker-controlled `parent_new_stack` pointer.
+    //
+    // `parent_new_stack` is arg2 of `clone(2)` and is fully attacker-controlled
+    // from userspace.  Phase 1 below dereferences it inside a `UserGuard`
+    // (SMAP-disabled) bracket, which means a kernel-VA value would let an
+    // unprivileged caller read 8 bytes of arbitrary kernel memory via the
+    // ABI's normal return path.  Per Intel SDM Vol. 3A §4.6 SMAP only blocks
+    // userspace pointers being dereferenced WITHOUT an explicit AC toggle;
+    // the kernel is responsible for input validation before any STAC.
+    //
+    // Per POSIX `clone(2)`, `new_stack` must reference an address in the
+    // calling process's address space; per the SysV x86_64 ABI the libc
+    // `__clone` preamble writes the arg word at `(%rsi)` as a 8-byte store,
+    // so an 8-byte-misaligned value cannot be the genuine output of the
+    // preamble and is also rejected to keep the read path well-defined.
+    //
+    // Refs: POSIX clone(2), Intel SDM Vol. 3A §4.6, CWE-822, CWE-200.
+    if !crate::syscall::validate_user_ptr(parent_new_stack, 8) {
+        return None;
+    }
+    if parent_new_stack & 0x7 != 0 {
+        return None;
+    }
+
     // -- Phase 1: read the helper-arg word the libc preamble pushed onto the
     // parent stack.
     //
