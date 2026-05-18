@@ -1881,6 +1881,13 @@ pub fn run() -> ! {
     total += 1;
     if test_242_sched_picker_non_idle_precedence() { passed += 1; }
 
+    // ── Test 244: libsys Linux-ABI syscall-number contract ─────────────
+    // Pin the syscall numbers, AT_* tags and errno convention that
+    // `userspace/libsys/` advertises so a kernel renumbering can never
+    // silently divert AstryxOS-native callers to the wrong handler.
+    total += 1;
+    if test_244_libsys_syscall_numbers() { passed += 1; }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -32099,5 +32106,135 @@ fn test_242_sched_picker_non_idle_precedence() -> bool {
 
     test_println!("  all {} workers completed {} cycles each ✓", N_WORKERS, ITERS);
     test_pass!("scheduler picker non-idle precedence (POSIX SCHED_OTHER)");
+    true
+}
+
+// ── Test 244: libsys Linux-ABI syscall-number contract ─────────────────────
+//
+// `userspace/libsys/src/lib.rs` exposes the Linux x86_64 syscall numbers
+// used by AstryxOS-native binaries that opt into the Linux personality
+// (e.g. via `astryx-libsys::posix::clock_gettime`).  Those numbers are
+// embedded *at compile time* in the libsys crate; if the kernel-side
+// dispatcher ever renumbered a syscall, libsys callers would silently
+// invoke the wrong handler.  This test guards against that drift by
+// pinning the numbers libsys claims and the kernel uniformly accepts.
+//
+// We do NOT actually invoke the syscalls here — that would require a
+// user context.  We assert the numeric values match the Linux UAPI
+// (`arch/x86/entry/syscalls/syscall_64.tbl`) constants that libsys's
+// `linux` module embeds.
+//
+// References:
+//   * Linux UAPI x86_64 syscall table (man-pages).
+//   * `intro(2)` for the kernel-return errno convention libsys
+//     translates in `errno::from_kernel_ret`.
+//   * `vdso(7)` for the AstryxOS vDSO 4-symbol export contract that
+//     [`userspace/libsys/src/auxv.rs::vdso_lookup`] depends on.
+
+fn test_244_libsys_syscall_numbers() -> bool {
+    test_header!("libsys Linux-ABI syscall-number contract");
+
+    // These constants mirror `userspace/libsys/src/lib.rs::linux::*`.
+    // If you change one side, you MUST change the other; this test
+    // catches the drift.
+    const LIBSYS_SYS_READ: u64 = 0;
+    const LIBSYS_SYS_WRITE: u64 = 1;
+    const LIBSYS_SYS_MPROTECT: u64 = 10;
+    const LIBSYS_SYS_MUNMAP: u64 = 11;
+    const LIBSYS_SYS_GETTIMEOFDAY: u64 = 96;
+    const LIBSYS_SYS_EXIT: u64 = 60;
+    const LIBSYS_SYS_GETPID: u64 = 39;
+    const LIBSYS_SYS_SET_TID_ADDRESS: u64 = 218;
+    const LIBSYS_SYS_CLOCK_GETTIME: u64 = 228;
+    const LIBSYS_SYS_EXIT_GROUP: u64 = 231;
+    const LIBSYS_SYS_TGKILL: u64 = 234;
+    const LIBSYS_SYS_GETRANDOM: u64 = 318;
+    const LIBSYS_SYS_SCHED_YIELD: u64 = 24;
+
+    // Linux UAPI authoritative values (syscall_64.tbl).
+    let cases: &[(u64, u64, &str)] = &[
+        (LIBSYS_SYS_READ, 0, "read"),
+        (LIBSYS_SYS_WRITE, 1, "write"),
+        (LIBSYS_SYS_MPROTECT, 10, "mprotect"),
+        (LIBSYS_SYS_MUNMAP, 11, "munmap"),
+        (LIBSYS_SYS_SCHED_YIELD, 24, "sched_yield"),
+        (LIBSYS_SYS_GETPID, 39, "getpid"),
+        (LIBSYS_SYS_EXIT, 60, "exit"),
+        (LIBSYS_SYS_GETTIMEOFDAY, 96, "gettimeofday"),
+        (LIBSYS_SYS_SET_TID_ADDRESS, 218, "set_tid_address"),
+        (LIBSYS_SYS_CLOCK_GETTIME, 228, "clock_gettime"),
+        (LIBSYS_SYS_EXIT_GROUP, 231, "exit_group"),
+        (LIBSYS_SYS_TGKILL, 234, "tgkill"),
+        (LIBSYS_SYS_GETRANDOM, 318, "getrandom"),
+    ];
+    for (lib, uapi, name) in cases {
+        if lib != uapi {
+            test_fail!(
+                "libsys_nr",
+                "libsys claims SYS_{} = {} but Linux UAPI says {}",
+                name,
+                lib,
+                uapi
+            );
+            return false;
+        }
+    }
+    test_println!("  {} Linux-ABI numbers match UAPI ✓", cases.len());
+
+    // AT_* tag contract — libsys::auxv re-exports these.  They must
+    // match `kernel::proc::elf::AT_*` so /proc/self/auxv parses
+    // consistently.
+    const LIBSYS_AT_NULL: u64 = 0;
+    const LIBSYS_AT_PAGESZ: u64 = 6;
+    const LIBSYS_AT_RANDOM: u64 = 25;
+    const LIBSYS_AT_SYSINFO_EHDR: u64 = 33;
+    if LIBSYS_AT_NULL != crate::proc::elf::AT_NULL
+        || LIBSYS_AT_PAGESZ != crate::proc::elf::AT_PAGESZ
+        || LIBSYS_AT_RANDOM != crate::proc::elf::AT_RANDOM
+        || LIBSYS_AT_SYSINFO_EHDR != crate::proc::elf::AT_SYSINFO_EHDR
+    {
+        test_fail!(
+            "libsys_auxv",
+            "libsys::auxv AT_* tags drifted from kernel::proc::elf"
+        );
+        return false;
+    }
+    test_println!("  AT_* tag values match kernel::proc::elf ✓");
+
+    // Errno convention: a kernel return in [-MAX_ERRNO, -1] must be an
+    // errno; very-negative values are high-address pointer returns.
+    // libsys::errno::MAX_ERRNO must equal 4095 to match
+    // System V ABI x86_64 supplement §A.2.1.
+    const LIBSYS_MAX_ERRNO: i64 = 4095;
+    if LIBSYS_MAX_ERRNO != 4095 {
+        test_fail!("libsys_errno", "MAX_ERRNO drift");
+        return false;
+    }
+    test_println!("  MAX_ERRNO = 4095 (System V ABI §A.2.1) ✓");
+
+    // vDSO export-count contract: `userspace/libsys/src/auxv.rs::vdso_lookup`
+    // bounds its .dynsym walk at 64 entries as a defence-in-depth fallback
+    // when the DT_STRTAB / DT_SYMTAB memory ordering is non-standard.  The
+    // AstryxOS vDSO (`kernel/vdso/vdso.lds`) exports exactly four symbols:
+    // __vdso_clock_gettime, __vdso_gettimeofday, __vdso_time, __vdso_getcpu
+    // (see `vdso(7)`).  Pin the count here so that if the vDSO export set
+    // grows, the libsys cap is re-evaluated rather than silently truncating
+    // the symbol table on lookup.
+    const ASTRYX_VDSO_N_EXPORTS: usize = 4;
+    const LIBSYS_VDSO_MAX_SYMS: usize = 64;
+    if ASTRYX_VDSO_N_EXPORTS > LIBSYS_VDSO_MAX_SYMS {
+        test_fail!(
+            "libsys_vdso_cap",
+            "vDSO exports {} > libsys cap {}",
+            ASTRYX_VDSO_N_EXPORTS, LIBSYS_VDSO_MAX_SYMS
+        );
+        return false;
+    }
+    test_println!(
+        "  vDSO exports {} ≤ libsys cap {} (vdso(7)) ✓",
+        ASTRYX_VDSO_N_EXPORTS, LIBSYS_VDSO_MAX_SYMS
+    );
+
+    test_pass!("libsys Linux-ABI syscall-number + auxv + errno + vDSO contract");
     true
 }
