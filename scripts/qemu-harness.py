@@ -1533,7 +1533,16 @@ def _allowlist_path(args) -> Path:
 
 
 def _allowlist_load(path: Path) -> dict:
-    """Load and minimally validate the allowlist JSON file."""
+    """Load and minimally validate the allowlist JSON file.
+
+    Duplicate entries (same name + same regex-flag) are silently dropped,
+    keeping the first occurrence and emitting a warning to stderr per
+    dropped duplicate.  Without dedup the rendered regex would contain
+    repeated alternatives (``x|x``); harmless to the matcher but a sign
+    the file has been edited concurrently or by hand-merge.  Warn-and-
+    keep-first chosen over hard-reject so a live CI run is not blocked by
+    a typo a human can fix at leisure.
+    """
     try:
         with path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -1546,8 +1555,27 @@ def _allowlist_load(path: Path) -> dict:
     entries = data.get("entries", [])
     if not isinstance(entries, list):
         _err(f"allowlist {path}: 'entries' is not a list")
+    # De-duplicate, keeping first occurrence.  Key on (name, regex-flag)
+    # so a literal-name entry and a regex-name entry that happen to share
+    # the same string are not collapsed (they target different patterns).
+    seen: set = set()
+    deduped: list = []
+    for e in entries:
+        if not isinstance(e, dict):
+            # Preserve odd entries so the validation path stays loud
+            # downstream rather than silently dropping malformed data.
+            deduped.append(e)
+            continue
+        key = (e.get("name", ""), bool(e.get("regex")))
+        if key in seen:
+            print(f"[allowlist] {path}: dropping duplicate entry "
+                  f"name={key[0]!r} regex={key[1]} (keeping first)",
+                  file=sys.stderr)
+            continue
+        seen.add(key)
+        deduped.append(e)
     # Drop any inline _comment field for consumers; tolerate extras.
-    return {"entries": entries}
+    return {"entries": deduped}
 
 
 def _allowlist_save(path: Path, data: dict, preserve_comment: bool = True) -> None:
@@ -1576,15 +1604,34 @@ def _allowlist_save(path: Path, data: dict, preserve_comment: bool = True) -> No
     tmp.replace(path)
 
 
+_ALLOWLIST_NEVER_MATCH_SENTINEL = "(?!)"
+"""Sentinel regex returned when the allowlist renders to no usable entries.
+
+`(?!)` is a negative lookahead with an empty inner pattern; the empty
+pattern always matches, so the negative lookahead can never succeed.
+Spliced into the workflow's `--allow-fail "\\[FAIL\\] (...)"` template it
+yields a pattern that matches nothing — the only safe default when the
+allowlist is empty.
+
+Using a sentinel (rather than the empty string) closes a silent-CI-green
+hole: bash splicing `""` into `(...)` produces `()`, an empty group which
+matches every `[FAIL]` line.  See workflow comment in build.yml.
+"""
+
+
 def _allowlist_to_regex(entries: list) -> str:
     """Render entries → an alternation regex suitable for ci-run --allow-fail.
 
     Each entry's "name" is escaped (re.escape) unless "regex": true is set,
-    in which case it is taken verbatim.  Empty list → empty string (no
-    failures are tolerated).
+    in which case it is taken verbatim.
+
+    When there are no usable entries we return a never-match sentinel
+    (``(?!)``) rather than an empty string — splicing ``""`` into the
+    workflow's ``\\[FAIL\\] (REGEX)`` template would produce ``()``, an
+    empty group that matches every ``[FAIL]`` line and silently turns a
+    wiped allowlist into a green CI build.  The sentinel matches nothing,
+    preserving the intended "tolerate no failures" semantics.
     """
-    if not entries:
-        return ""
     parts = []
     for e in entries:
         name = e.get("name", "")
@@ -1594,6 +1641,8 @@ def _allowlist_to_regex(entries: list) -> str:
             parts.append(f"(?:{name})")
         else:
             parts.append(re.escape(name))
+    if not parts:
+        return _ALLOWLIST_NEVER_MATCH_SENTINEL
     return "|".join(parts)
 
 
@@ -1818,18 +1867,66 @@ def cmd_soak(args):
         )
         # Capture ci-run's stdout JSON (the function prints the JSON itself).
         # Redirect stdout to a buffer, then parse it back.
+        #
+        # cmd_ci_run delegates to cmd_start, which calls _err() / sys.exit()
+        # on hard errors (QEMU spawn failure, missing data.img, frozen-ESP
+        # FileNotFoundError, etc.).  Without the outer try/except the first
+        # such failure would abort the entire soak before any aggregation —
+        # the worst possible outcome for a cross-walk diagnostic where the
+        # whole point is repeat sampling.  Catch SystemExit (and any other
+        # BaseException short of KeyboardInterrupt) and synthesise a
+        # trial_aborted record so the remaining trials still run.
         _orig_stdout = sys.stdout
         captured = io.StringIO()
         sys.stdout = captured
+        # Snapshot sessions before the trial so we can best-effort clean up
+        # a session that the failing cmd_start may have left behind.
+        sids_before = {p.stem for p in HARNESS_DIR.glob("*.json")}
+        rc: int = 0
+        aborted_cause: str = ""
         try:
-            rc = cmd_ci_run(ci_args)
-        finally:
+            try:
+                rc = cmd_ci_run(ci_args)
+            finally:
+                sys.stdout = _orig_stdout
+        except SystemExit as ex:
+            rc = int(ex.code) if isinstance(ex.code, int) else 1
+            aborted_cause = f"system_exit code={ex.code!r}"
+        except KeyboardInterrupt:
+            # Honour Ctrl-C immediately — don't bury it as a trial abort.
             sys.stdout = _orig_stdout
+            raise
+        except BaseException as ex:  # noqa: BLE001 — intentional broad catch
+            rc = 1
+            aborted_cause = f"{type(ex).__name__}: {ex}"
         raw = captured.getvalue().strip()
-        try:
-            obj = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            obj = {"_unparsable_stdout": raw[:400]}
+        if aborted_cause:
+            # Best-effort: tear down any QEMU session the failing trial
+            # leaked so we don't accumulate zombies across trials.  Any
+            # new session file appearing during the trial is presumed
+            # ours (concurrent dispatch on this host is rare and the
+            # alternative is a leak).
+            sids_after = {p.stem for p in HARNESS_DIR.glob("*.json")}
+            for leaked_sid in sids_after - sids_before:
+                try:
+                    cmd_stop(types.SimpleNamespace(sid=leaked_sid))
+                except BaseException as cleanup_ex:  # noqa: BLE001
+                    print(f"[soak] cleanup of leaked sid={leaked_sid} "
+                          f"failed: {cleanup_ex}", file=sys.stderr)
+            obj = {
+                "ok": False,
+                "error": "trial_aborted",
+                "exit_cause": "trial_aborted",
+                "abort_cause": aborted_cause,
+                "stdout_tail": raw[:400],
+            }
+            print(f"[soak] trial {i} aborted: {aborted_cause}",
+                  file=sys.stderr)
+        else:
+            try:
+                obj = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                obj = {"_unparsable_stdout": raw[:400]}
         obj["trial"] = i
         obj["rc"] = rc
         per_trial.append(obj)
