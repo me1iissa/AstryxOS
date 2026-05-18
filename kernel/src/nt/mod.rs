@@ -25,6 +25,15 @@
 
 extern crate alloc;
 
+pub mod kuser_shared;
+
+/// One-shot NT subsystem init: populate the `KUSER_SHARED_DATA` page with
+/// version, processor-feature, and timing fields.  Safe to call multiple
+/// times; the page-level initialiser is idempotent.
+pub fn init() {
+    kuser_shared::init();
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // NT Service Numbers — AstryxOS custom SSDT
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -657,13 +666,18 @@ extern "C" fn nt_fn_release_mutant(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: 
     STATUS_NOT_IMPLEMENTED
 }
 
-/// NtQuerySystemTime(SystemTime: *mut i64)
+/// NtQuerySystemTime(SystemTime: *mut LARGE_INTEGER)
+///
+/// Writes the current system time as an NT FILETIME (100 ns ticks since
+/// 1601-01-01 UTC) to `*time_ptr`.  The value is taken from the live
+/// `KUSER_SHARED_DATA` SystemTime field (see the `KUSER_SHARED_DATA`
+/// reference at
+/// <https://learn.microsoft.com/windows-hardware/drivers/ddi/ntddk/ns-ntddk-kuser_shared_data>)
+/// so user-mode readers of `0x7FFE_0000+SystemTime` and callers of
+/// `NtQuerySystemTime` see a single, consistent value.
 extern "C" fn nt_fn_query_system_time(time_ptr: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> i64 {
     if time_ptr != 0 {
-        // Return current time as NT FILETIME (100ns ticks since 1601-01-01).
-        // Stub: return a plausible constant.
-        // 132000000000000000 = 2019-01-01 in NT time
-        let nt_time: i64 = 132_000_000_000_000_000i64;
+        let nt_time: i64 = kuser_shared::current_system_time();
         unsafe { core::ptr::write_volatile(time_ptr as *mut i64, nt_time); }
     }
     STATUS_SUCCESS

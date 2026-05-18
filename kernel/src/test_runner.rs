@@ -629,6 +629,11 @@ pub fn run() -> ! {
     total += 1;
     if test_kernel32_stubs() { passed += 1; }
 
+    // ── Test 62b: KUSER_SHARED_DATA layout + live time fields ──────────────────
+
+    total += 1;
+    if test_kuser_shared_data() { passed += 1; }
+
     // ── Test 63: TinyCC compiler — compile + execute C program in-kernel ──────
 
     total += 1;
@@ -12343,6 +12348,14 @@ fn test_kernel32_stubs() -> bool {
     }
 
     // ─── Sub-test 2: WriteConsoleA in stub table ──────────────────────────────
+    //
+    // `WriteConsoleA` internally calls `dispatch_linux(1, fd, buf, count, …)`
+    // which runs the `sys_write_linux` SMAP-bracketed user-pointer check
+    // (CWE-823 gate).  Real Ring-3 callers pass a user-VA buffer that passes
+    // `validate_user_ptr` and the SMAP `UserGuard` bracket; this test runs in
+    // kernel context with a static `.rodata` buffer (kernel VA), so we wrap
+    // the call in `KernelDispatchGuard` to set the per-CPU bypass flag — the
+    // same pattern documented for `dispatch_linux_kernel` in `syscall/mod.rs`.
     {
         let va = crate::nt::lookup_stub("kernel32.dll", "WriteConsoleA");
         test_println!("  [2] WriteConsoleA stub VA:     {:#x}", va);
@@ -12351,11 +12364,12 @@ fn test_kernel32_stubs() -> bool {
             ok = false;
         }
 
-        // Call WriteConsoleA(fd=1, "NT-WIN32\n", 9, &written, 0)
+        // Call WriteConsoleA(fd=1, "[TEST62] …", len, &written, 0)
         if va != 0 {
             static MSG: &[u8] = b"[TEST62] Hello from Win32 stubs\n";
             let mut written: u32 = 0;
             let r = unsafe {
+                let _g = crate::syscall::KernelDispatchGuard::new();
                 call_stub(va, 1, MSG.as_ptr() as u64, MSG.len() as u64,
                           &mut written as *mut u32 as u64, 0)
             };
@@ -12643,6 +12657,274 @@ fn test_kernel32_stubs() -> bool {
 
     if ok {
         test_pass!("kernel32 console/heap/environment stubs");
+    }
+    ok
+}
+
+// ── Test 62b: KUSER_SHARED_DATA layout + live time fields ────────────────────
+//
+// Validates the AstryxOS in-kernel `KUSER_SHARED_DATA` shared page against
+// the published layout in `ntddk.h`:
+//   - Version: NtMajorVersion / NtMinorVersion / NtBuildNumber populated
+//   - Architecture: NativeProcessorArchitecture = 9 (AMD64)
+//   - Image: ImageNumberLow/High = IMAGE_FILE_MACHINE_AMD64 (0x8664)
+//   - Time: SystemTime, TickCount, TickCountQuad advance after a busy wait
+//   - QpcFrequency = 10_000_000 (NT FILETIME units / sec)
+//
+// References:
+//   - KUSER_SHARED_DATA: https://learn.microsoft.com/windows-hardware/drivers/ddi/ntddk/ns-ntddk-kuser_shared_data
+//   - !kuser:           https://learn.microsoft.com/windows-hardware/drivers/debuggercmds/-kuser
+fn test_kuser_shared_data() -> bool {
+    test_header!("KUSER_SHARED_DATA layout + live time fields");
+    use crate::nt::kuser_shared as ku;
+
+    let mut ok = true;
+    let base = ku::page_base_for_test();
+
+    // Helper: read a u32 at the static offset (kernel-VA dereference).
+    let r32 = |off: usize| -> u32 {
+        unsafe { core::ptr::read_unaligned(base.add(off) as *const u32) }
+    };
+    let r16 = |off: usize| -> u16 {
+        unsafe { core::ptr::read_unaligned(base.add(off) as *const u16) }
+    };
+    let r64 = |off: usize| -> u64 {
+        unsafe { core::ptr::read_unaligned(base.add(off) as *const u64) }
+    };
+
+    // ─── Sub-test 1: Version fields ──────────────────────────────────────────
+    let maj = r32(ku::OFF_NT_MAJOR_VERSION);
+    let min = r32(ku::OFF_NT_MINOR_VERSION);
+    let bld = r32(ku::OFF_NT_BUILD_NUMBER);
+    test_println!("  [1] NtMajorVersion={} NtMinorVersion={} NtBuildNumber={}", maj, min, bld);
+    if maj != ku::NT_MAJOR_VERSION
+        || min != ku::NT_MINOR_VERSION
+        || bld != ku::NT_BUILD_NUMBER
+    {
+        test_fail!("kuser_shared", "version mismatch: {}.{}.{}", maj, min, bld);
+        ok = false;
+    }
+
+    // ─── Sub-test 2: Architecture + image number ─────────────────────────────
+    let arch = r16(ku::OFF_NATIVE_PROCESSOR_ARCHITECTURE);
+    let img_lo = r16(ku::OFF_IMAGE_NUMBER_LOW);
+    let img_hi = r16(ku::OFF_IMAGE_NUMBER_HIGH);
+    test_println!("  [2] NativeProcessorArchitecture={} ImageNumber=[{:#x},{:#x}]",
+        arch, img_lo, img_hi);
+    if arch != 9 {
+        test_fail!("kuser_shared", "NativeProcessorArchitecture={} (expect 9=AMD64)", arch);
+        ok = false;
+    }
+    if img_lo != ku::IMAGE_FILE_MACHINE_AMD64 || img_hi != ku::IMAGE_FILE_MACHINE_AMD64 {
+        test_fail!("kuser_shared", "ImageNumber range wrong: [{:#x},{:#x}]", img_lo, img_hi);
+        ok = false;
+    }
+
+    // ─── Sub-test 3: NtProductType + ProductTypeIsValid ──────────────────────
+    let prod = r32(ku::OFF_NT_PRODUCT_TYPE);
+    let pvalid = unsafe { *base.add(ku::OFF_PRODUCT_TYPE_IS_VALID) };
+    test_println!("  [3] NtProductType={} ProductTypeIsValid={}", prod, pvalid);
+    if prod != ku::NT_PRODUCT_WIN_NT || pvalid != 1 {
+        test_fail!("kuser_shared", "product type wrong: type={} valid={}", prod, pvalid);
+        ok = false;
+    }
+
+    // ─── Sub-test 4: QpcFrequency = NT_INTERVALS_PER_SEC ─────────────────────
+    let qpcf = r64(ku::OFF_QPC_FREQUENCY);
+    test_println!("  [4] QpcFrequency={} (expect {})", qpcf, ku::NT_INTERVALS_PER_SEC);
+    if qpcf != ku::NT_INTERVALS_PER_SEC {
+        test_fail!("kuser_shared", "QpcFrequency={} expect {}", qpcf, ku::NT_INTERVALS_PER_SEC);
+        ok = false;
+    }
+
+    // ─── Sub-test 5: Processor features (AMD64 baseline must be set) ─────────
+    // PF_COMPARE_EXCHANGE_DOUBLE=2 + MMX=3 + SSE=6 + RDTSC=8 +
+    // PF_PAE_ENABLED=9 + SSE2=10 + NX=12 + CMPXCHG16B=14 are architecture
+    // guarantees on AMD64 long mode (CMPXCHG8B in i486, PAE mandatory in
+    // long mode) and the page initialiser writes 1 to each of them.
+    // Indices documented in `winnt.h` PF_* constants.
+    for (idx, name) in [
+        (2u32, "CMPXCHG8B"),
+        (3,    "MMX"),
+        (6,    "SSE"),
+        (8,    "RDTSC"),
+        (9,    "PAE"),
+        (10,   "SSE2"),
+        (12,   "NX"),
+        (14,   "CMPXCHG16B"),
+    ] {
+        let val = unsafe { *base.add(ku::OFF_PROCESSOR_FEATURES + idx as usize) };
+        if val != 1 {
+            test_fail!("kuser_shared", "PF[{}]({}) = {} (expect 1)", idx, name, val);
+            ok = false;
+        }
+    }
+    test_println!("  [5] Processor features CMPXCHG8B/MMX/SSE/RDTSC/PAE/SSE2/NX/CMPXCHG16B all set ✓");
+
+    // ─── Sub-test 6: TickCountQuad advances on update ────────────────────────
+    let tc1 = ku::current_tick_count64();
+    // Busy-wait long enough for at least one tick at TICK_HZ = 100 Hz.
+    let start = crate::arch::x86_64::irq::get_ticks();
+    while crate::arch::x86_64::irq::get_ticks() < start.saturating_add(2) {
+        core::hint::spin_loop();
+    }
+    let tc2 = ku::current_tick_count64();
+    test_println!("  [6] TickCountQuad: {} → {} (Δ={})", tc1, tc2, tc2.saturating_sub(tc1));
+    if tc2 <= tc1 {
+        test_fail!("kuser_shared", "TickCountQuad did not advance ({} → {})", tc1, tc2);
+        ok = false;
+    }
+
+    // ─── Sub-test 7: SystemTime advances (forward progress) ──────────────────
+    let st1 = ku::current_system_time();
+    let start2 = crate::arch::x86_64::irq::get_ticks();
+    while crate::arch::x86_64::irq::get_ticks() < start2.saturating_add(2) {
+        core::hint::spin_loop();
+    }
+    let st2 = ku::current_system_time();
+    test_println!("  [7] SystemTime (NT FILETIME): {} → {} (Δ={})",
+        st1, st2, (st2 - st1).max(0));
+    if st2 <= st1 {
+        test_fail!("kuser_shared", "SystemTime did not advance ({} → {})", st1, st2);
+        ok = false;
+    }
+    // NT FILETIME should land in a sane window — after 2020-01-01 if the RTC
+    // is set, or at the NT epoch (1601) if RTC reads 0.  Either is fine; we
+    // only check that the value is non-negative (positive LARGE_INTEGER).
+    if st2 < 0 {
+        test_fail!("kuser_shared", "SystemTime negative: {}", st2);
+        ok = false;
+    }
+
+    // ─── Sub-test 8: NtSystemRoot prefix "C:\\Windows" ───────────────────────
+    let mut sysroot = [0u16; 11];
+    for i in 0..sysroot.len() {
+        sysroot[i] = r16(ku::OFF_NT_SYSTEM_ROOT + i * 2);
+    }
+    let prefix_ok = sysroot[0] == b'C' as u16
+        && sysroot[1] == b':' as u16
+        && sysroot[2] == b'\\' as u16
+        && sysroot[3] == b'W' as u16
+        && sysroot[10] == 0;
+    test_println!("  [8] NtSystemRoot prefix valid: {}", prefix_ok);
+    if !prefix_ok {
+        test_fail!("kuser_shared", "NtSystemRoot prefix wrong");
+        ok = false;
+    }
+
+    // ─── Sub-test 9: physical_address() round-trips via virt_to_phys ─────────
+    // M1 fix: physical_address() now uses vmm::virt_to_phys() instead of a
+    // linker-base subtraction.  Cross-check that the returned phys matches
+    // an independent walk and that reading the physical frame via the
+    // higher-half (PHYS_OFF) mapping returns the same bytes as the static.
+    {
+        let phys = ku::physical_address();
+        let want = unsafe { core::ptr::read_unaligned(base.add(ku::OFF_NT_BUILD_NUMBER) as *const u32) };
+        let phys_read = unsafe {
+            core::ptr::read_unaligned(
+                (0xFFFF_8000_0000_0000u64 + phys + ku::OFF_NT_BUILD_NUMBER as u64) as *const u32
+            )
+        };
+        test_println!("  [9] physical_address={:#x}; build via PHYS_OFF view={} (expect {})",
+            phys, phys_read, want);
+        if phys_read != want {
+            test_fail!("kuser_shared", "physical_address mismatch via PHYS_OFF: {} != {}", phys_read, want);
+            ok = false;
+        }
+    }
+
+    // ─── Sub-test 10: user-VA mapping in a real Win32 process (M2) ───────────
+    // Only meaningful when the win32-pe-test feature is enabled (so we have
+    // an embedded PE32+ and create_win32_process is wired up).  We spawn a
+    // process but do NOT schedule it — the address-space layout is fully
+    // established by the end of create_win32_process, so we can walk its
+    // CR3 directly and assert:
+    //
+    //   (a) virt_to_phys_in(child_cr3, 0x7FFE_0000) returns the same
+    //       physical frame the kernel maintains for the shared page;
+    //   (b) the leaf PTE has PAGE_USER set and PAGE_WRITABLE cleared
+    //       (the canonical read-only user mapping per `!kuser`);
+    //   (c) reading OFF_NT_MAJOR_VERSION via the PHYS_OFF window for that
+    //       frame returns the value the kernel wrote at init.
+    #[cfg(feature = "win32-pe-test")]
+    {
+        let pe_data = crate::proc::hello_win32_pe::HELLO_WIN32_PE;
+        match crate::proc::usermode::create_win32_process("kuser_m2_check.exe", pe_data) {
+            Ok(pid) => {
+                let child_cr3 = {
+                    let procs = crate::proc::PROCESS_TABLE.lock();
+                    procs.iter().find(|p| p.pid == pid).map(|p| p.cr3).unwrap_or(0)
+                };
+                if child_cr3 == 0 {
+                    test_fail!("kuser_shared", "child PID {} has no CR3", pid);
+                    ok = false;
+                } else {
+                    let kernel_phys = ku::physical_address();
+                    let user_phys = crate::mm::vmm::virt_to_phys_in(
+                        child_cr3, ku::KUSER_SHARED_DATA_VA,
+                    );
+                    test_println!("  [10] child cr3={:#x} kuser_phys(kernel)={:#x} kuser_phys(user)={:?}",
+                        child_cr3, kernel_phys, user_phys);
+                    match user_phys {
+                        Some(p) if p == kernel_phys => {}
+                        Some(p) => {
+                            test_fail!("kuser_shared", "user-VA phys {:#x} != kernel phys {:#x}", p, kernel_phys);
+                            ok = false;
+                        }
+                        None => {
+                            test_fail!("kuser_shared", "0x7FFE_0000 not mapped in child cr3");
+                            ok = false;
+                        }
+                    }
+
+                    // PTE flag assertions: PAGE_USER set, PAGE_WRITABLE clear.
+                    if let Some(pte) = crate::mm::vmm::lookup_pte_in(
+                        child_cr3, ku::KUSER_SHARED_DATA_VA,
+                    ) {
+                        let has_user     = pte & crate::mm::vmm::PAGE_USER     != 0;
+                        let has_writable = pte & crate::mm::vmm::PAGE_WRITABLE != 0;
+                        test_println!("  [10] PTE={:#x} user={} writable={}", pte, has_user, has_writable);
+                        if !has_user {
+                            test_fail!("kuser_shared", "PTE missing PAGE_USER: {:#x}", pte);
+                            ok = false;
+                        }
+                        if has_writable {
+                            test_fail!("kuser_shared", "PTE has PAGE_WRITABLE (must be RO): {:#x}", pte);
+                            ok = false;
+                        }
+                    } else {
+                        test_fail!("kuser_shared", "lookup_pte_in returned None for child mapping");
+                        ok = false;
+                    }
+
+                    // Read NtMajorVersion via PHYS_OFF for the child's mapped frame.
+                    let maj_via_phys = unsafe {
+                        core::ptr::read_unaligned(
+                            (0xFFFF_8000_0000_0000u64 + kernel_phys + ku::OFF_NT_MAJOR_VERSION as u64)
+                                as *const u32,
+                        )
+                    };
+                    if maj_via_phys != ku::NT_MAJOR_VERSION {
+                        test_fail!("kuser_shared", "NtMajorVersion via child frame = {} (expect {})",
+                            maj_via_phys, ku::NT_MAJOR_VERSION);
+                        ok = false;
+                    } else {
+                        test_println!("  [10] NtMajorVersion via child frame = {} ✓", maj_via_phys);
+                    }
+                }
+            }
+            Err(e) => {
+                test_println!("  [10] create_win32_process failed ({:?}) — skipping M2 user-VA mapping check", e);
+            }
+        }
+    }
+    #[cfg(not(feature = "win32-pe-test"))]
+    {
+        test_println!("  [10] win32-pe-test feature off — skipping M2 user-VA mapping check");
+    }
+
+    if ok {
+        test_pass!("KUSER_SHARED_DATA layout + live time fields");
     }
     ok
 }
