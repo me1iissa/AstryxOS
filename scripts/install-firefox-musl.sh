@@ -75,12 +75,16 @@ for arg in "$@"; do
 done
 
 # ── Idempotency check ─────────────────────────────────────────────────────────
-# We consider the install up-to-date if firefox-bin exists AND its PT_INTERP
-# is /lib/ld-musl-x86_64.so.1 (which proves it is the musl variant, not the
-# leftover glibc Firefox).
+# We consider the install up-to-date if firefox-bin exists, is musl-linked
+# (PT_INTERP = /lib/ld-musl-x86_64.so.1), AND the base shared libraries
+# we now stage from ${ROOTFS}/lib/ are all present in ${DISK_LIB}.  The
+# libz.so.1 sentinel covers older partial installs where /lib/ was not
+# staged (pre-PR build/musl-zlib-install) — those need a restage so
+# libxul's DT_NEEDED libz.so.1 resolves at runtime.
 if [ "${FORCE}" = false ] && [ -f "${FIREFOX_BIN}" ] && \
-   file "${FIREFOX_BIN}" 2>/dev/null | grep -q 'ld-musl'; then
-    echo "[FF-MUSL] ${FIREFOX_BIN} present and musl-linked — skipping (use --force to reinstall)"
+   file "${FIREFOX_BIN}" 2>/dev/null | grep -q 'ld-musl' && \
+   [ -e "${DISK_LIB}/libz.so.1" ]; then
+    echo "[FF-MUSL] ${FIREFOX_BIN} present and musl-linked, base libs staged — skipping (use --force to reinstall)"
     exit 0
 fi
 
@@ -163,12 +167,48 @@ echo "[FF-MUSL]   rootfs size: $(du -sh "${ROOTFS}" | cut -f1)"
 
 echo "[FF-MUSL] Staging musl Firefox into ${DISK_DIR}"
 
-# (a) musl interpreter + libc
+# (a) musl interpreter + libc + Alpine "base" shared libraries
+#
+# Alpine places several runtime libraries in /lib/ rather than /usr/lib/:
+# the musl interpreter (ld-musl-x86_64.so.1) and libc symlink, plus a
+# small but load-bearing set of "base" libs that firefox-esr's deps
+# transitively pull in:
+#
+#   libz.so.1            (zlib       — used by libpng, libxml2, fontconfig,
+#                                       libxul itself for compressed assets)
+#   libcrypto.so.3       (openssl    — NSS depends on it; libxul uses it
+#                                       for TLS / signature verification)
+#   libssl.so.3          (openssl    — same as above)
+#   libblkid.so.1        (util-linux — pulled by glib's GIO mount monitor)
+#   libmount.so.1        (util-linux — same as above)
+#
+# Missing libz.so.1 specifically caused musl-FF to abort at sc≈548 during
+# the library-load chain (libxul → libpng16 → libz lookup → ld-musl
+# exit_group(255) on the unresolved DT_NEEDED) — see PR #298 trial.  We
+# stage the entire /lib/ tree, dereferencing symlinks (FAT32 has none),
+# to mirror the /usr/lib/ approach in step (c) — Alpine version bumps
+# that move libs between /lib/ and /usr/lib/ then "just work" without
+# further script changes.
 mkdir -p "${DISK_LIB}"
-cp -f "${ROOTFS}/lib/ld-musl-x86_64.so.1" "${DISK_LIB}/ld-musl-x86_64.so.1"
-# libc.musl-x86_64.so.1 is a symlink to ld-musl in Alpine; FAT32 has no
-# symlinks, so we copy the resolved file under the link name.
-cp -fL "${ROOTFS}/lib/libc.musl-x86_64.so.1" "${DISK_LIB}/libc.musl-x86_64.so.1"
+for f in "${ROOTFS}"/lib/*; do
+    [ -e "${f}" ] || continue
+    name="$(basename "${f}")"
+    # Skip apk's bookkeeping (/lib/apk/db/...); not useful at runtime.
+    [ "${name}" = "apk" ] && continue
+    if [ -L "${f}" ]; then
+        # Symlink: dereference to a real file under the link name so the
+        # dynamic linker finds e.g. libz.so.1 as a real ELF, not a
+        # dangling link (FAT32 has no symlinks).
+        cp -fL "${f}" "${DISK_LIB}/${name}"
+    elif [ -f "${f}" ]; then
+        cp -f  "${f}" "${DISK_LIB}/${name}"
+    elif [ -d "${f}" ]; then
+        # Recurse for subdirs (none expected today, but defensive against
+        # Alpine layout changes).
+        cp -aL "${f}" "${DISK_LIB}/" 2>/dev/null || \
+            cp -a  "${f}" "${DISK_LIB}/"
+    fi
+done
 
 # (b) Firefox tree.  Clear any prior contents so we cannot end up with a
 # glibc/musl hybrid in /disk/opt/firefox/.
@@ -239,11 +279,28 @@ if [ ! -f "${DISK_LIB}/ld-musl-x86_64.so.1" ]; then
     echo "[FF-MUSL] ERROR: ${DISK_LIB}/ld-musl-x86_64.so.1 missing"
     exit 1
 fi
+# Verify the base shared libs landed.  libz in particular is mandatory —
+# libxul DT_NEEDEDs it (via libpng16 / libxml2), and ld-musl will
+# exit_group on missing libz at first dlopen.  See PR #298 trial.
+MISSING_BASE_LIBS=""
+for lib in libz.so.1 libcrypto.so.3 libssl.so.3; do
+    if [ ! -e "${DISK_LIB}/${lib}" ]; then
+        MISSING_BASE_LIBS="${MISSING_BASE_LIBS} ${lib}"
+    fi
+done
+if [ -n "${MISSING_BASE_LIBS}" ]; then
+    echo "[FF-MUSL] ERROR: required base libs missing from ${DISK_LIB}:${MISSING_BASE_LIBS}"
+    echo "[FF-MUSL]        Alpine may have moved them out of /lib/ in this release"
+    echo "[FF-MUSL]        — check ${ROOTFS}/usr/lib/ and extend stage step (a)."
+    exit 1
+fi
 
 echo "[FF-MUSL] Staged:"
 echo "[FF-MUSL]   firefox-bin: $(stat -c%s "${FIREFOX_BIN}") bytes, musl PT_INTERP"
 echo "[FF-MUSL]   libxul.so:   $(stat -c%s "${DISK_OPT}/libxul.so") bytes"
 echo "[FF-MUSL]   ld-musl:     $(stat -c%s "${DISK_LIB}/ld-musl-x86_64.so.1") bytes"
+echo "[FF-MUSL]   libz.so.1:   $(stat -c%s "${DISK_LIB}/libz.so.1") bytes"
+echo "[FF-MUSL]   /lib:         $(du -sh "${DISK_LIB}" | cut -f1)"
 echo "[FF-MUSL]   /opt/firefox: $(du -sh "${DISK_OPT}" | cut -f1)"
 echo "[FF-MUSL]   /usr/lib:     $(du -sh "${DISK_USR_LIB}" | cut -f1)"
 echo "[FF-MUSL] Done."
