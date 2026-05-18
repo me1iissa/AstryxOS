@@ -2050,12 +2050,9 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
         // can emit a `[FFTEST/mmap-so]` trace AFTER dropping the lock.  Letting
         // the print happen under PROCESS_TABLE could block other CPUs on a
         // slow serial port.  The capture is gated to match the emit cfg
-        // below — `test-mode` (always) or `firefox-test+firefox-trace-verbose`
-        // — so we don't pay the String allocation in demo-throughput builds.
-        #[cfg(any(
-            all(feature = "firefox-test", feature = "firefox-trace-verbose"),
-            feature = "test-mode",
-        ))]
+        // below — `test-mode` or `firefox-test` — so we don't pay the
+        // String allocation in throughput-only builds.
+        #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
         let so_trace_path: Option<alloc::string::String> = {
             let fd_num = fd as usize;
             proc.file_descriptors
@@ -2117,30 +2114,18 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
             }
         };
 
-        #[cfg(any(
-            all(feature = "firefox-test", feature = "firefox-trace-verbose"),
-            feature = "test-mode",
-        ))]
+        #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
         {
             (space.cr3, vma_backing, vma_name, chosen_base, so_trace_path)
         }
-        #[cfg(not(any(
-            all(feature = "firefox-test", feature = "firefox-trace-verbose"),
-            feature = "test-mode",
-        )))]
+        #[cfg(not(any(feature = "firefox-test", feature = "test-mode")))]
         {
             (space.cr3, vma_backing, vma_name, chosen_base)
         }
     };
-    #[cfg(any(
-        all(feature = "firefox-test", feature = "firefox-trace-verbose"),
-        feature = "test-mode",
-    ))]
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
     let (cr3, backing, name, base, so_trace_path_out) = mmap_setup;
-    #[cfg(not(any(
-        all(feature = "firefox-test", feature = "firefox-trace-verbose"),
-        feature = "test-mode",
-    )))]
+    #[cfg(not(any(feature = "firefox-test", feature = "test-mode")))]
     let (cr3, backing, name, base) = mmap_setup;
 
     // W215 H3a diagnostic: count MAP_SHARED+PROT_WRITE file-backed mappings.
@@ -2174,15 +2159,16 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
     // later segments are placed by ld-linux at base+seg_vaddr via MAP_FIXED.
     //
     // The host symboliser in `qemu-harness.py` consumes these lines to
-    // resolve user RIPs to `<library>+offset`.  Under demo-throughput builds
-    // (`firefox-test` without verbose tracing) we skip emission — the
-    // symboliser is only useful for stack-walk investigations.  The
-    // `test-mode` branch still emits because headless dynamic-linker tests
-    // depend on the trace to verify load-base placement.
-    #[cfg(any(
-        all(feature = "firefox-test", feature = "firefox-trace-verbose"),
-        feature = "test-mode",
-    ))]
+    // resolve user RIPs to `<library>+offset`.  Emit on any of:
+    //   - `firefox-test` (W101 plateau investigation requires symbolised
+    //     RIP samples; the cost is one log line per mmap, ~80 lines total
+    //     across a Firefox boot)
+    //   - `test-mode` (headless dynamic-linker tests verify placement)
+    // The previous `firefox-trace-verbose` gate was an oversight — without
+    // mmap-so traces the harness symbolicator cannot resolve user RIPs to
+    // `<lib>+offset`, which made `rip-trace`'s output uninterpretable for
+    // PIE binaries.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
     if let Some(path) = so_trace_path_out {
         crate::serial_println!(
             "[FFTEST/mmap-so] pid={} base={:#x} len={:#x} off={:#x} prot={:#x} fd={} path={}",
