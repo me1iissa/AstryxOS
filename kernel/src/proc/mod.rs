@@ -2440,6 +2440,26 @@ pub fn fork_process_share_vm(
         child_pid, child_tid, parent_pid, parent_cr3
     );
 
+    // VFORK/CHILD-STACK diagnostic — record the child's initial user RSP and
+    // whether the child will run on the parent's user stack (clone3's
+    // `new_stack` == 0 case).  Per POSIX vfork(2) and clone(2) Linux man-pages
+    // §"CLONE_VM" the child shares the parent's address space; the kernel
+    // does NOT carve out a private stack region for the child, so any
+    // RSP-relative store the child makes before execve(2) lands on the
+    // parent's user stack.  When `user_entry_rsp` equals the parent's RSP at
+    // the syscall instruction site the child's local-variable spills are
+    // inside the parent's frame chain — the precondition for SSP-canary
+    // aliasing per ELF gABI §6 stack-protector.
+    let child_uses_parent_stack = user_rsp != 0;
+    crate::serial_println!(
+        "[VFORK/CHILD-STACK] pid={} parent_pid={} child_rsp_at_entry={:#x} \
+         child_uses_parent_stack={} parent_user_rsp={:#x}",
+        child_pid, parent_pid,
+        user_rsp,
+        child_uses_parent_stack,
+        user_rsp,
+    );
+
     Some((child_pid, child_tid))
 }
 

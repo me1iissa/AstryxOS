@@ -2564,6 +2564,11 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
     if op == "proc":
         if not rest: raise ValueError("proc requires <pid>")
         return {"op": "proc", "pid": int(rest[0], 0)}
+    if op == "procmaps":
+        # Terse file-backed VMA map for ASLR-base / addr2line symbolication.
+        # Emits one JSON object per VMA with first_page_phys via PML4 walk.
+        if not rest: raise ValueError("procmaps requires <pid>")
+        return {"op": "procmaps", "pid": int(rest[0], 0)}
     if op == "proc-tree":
         pid = int(rest[0], 0) if rest else 1
         return {"op": "proc-tree", "pid": pid}
@@ -7098,6 +7103,8 @@ def main():
         "coverage-flush", "proc-metrics", "thread-park-audit",
         "rip-trace",
         "futex-ghost-hist",
+        # Terse file-backed VMA map; one entry per VMA with first_page_phys.
+        "procmaps",
         # FUTEX_WAKE cluster-wake compensation (firefox-test/test-mode only).
         # See subsys/linux/futex_cluster.rs.
         "futex-stats", "futex-set-cluster-wake",
