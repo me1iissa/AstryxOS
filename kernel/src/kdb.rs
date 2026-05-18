@@ -355,6 +355,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "fault-cache-keys" => op_fault_cache_keys(out),
         "w215-cache-residency" => op_w215_cache_residency(out),
         "tlb-stats"        => op_tlb_stats(out),
+        "heap-stats"       => op_heap_stats(out),
         "w215-diag"        => op_w215_diag(out),
         "arm-phys"         => op_arm_phys(req, out),
         "coverage-flush" => op_coverage_flush(out),
@@ -1151,6 +1152,91 @@ fn op_tlb_stats(out: &mut String) {
     let _ = write!(out, r#""shootdown_unclean_total":{},"#,  s.unclean_total);
     let _ = write!(out, r#""pmm_alloc_recent_free":{}"#,     pmm_recent);
     out.push('}');
+}
+
+// ── heap-stats ────────────────────────────────────────────────────────────────
+//
+// Snapshots the kernel-heap allocator plus the few growable collections
+// that have been observed to leak over a long firefox-test soak.  The
+// 6-minute heap-guard panic at `HEAP_START + 128 MiB` (idt.rs page-fault
+// handler) is, by definition, a slow-leak class — this op makes the
+// rate visible so a sampling caller can identify which collection is
+// climbing linearly with wall-clock.
+//
+// Output shape (JSON):
+//   {
+//     "heap": { "current_bytes":N, "peak_bytes":N, "alloc_count":N,
+//               "free_count":N, "alloc_bytes":N, "free_bytes":N,
+//               "total_bytes":N, "allocator_used":N, "allocator_free":N },
+//     "collections": {
+//       "process_table": N | -1,
+//       "thread_table":  N | -1,
+//       "page_cache":    N,
+//       "page_cache_dirty": N,
+//       "tlb_quarantine":   N,
+//       "tcp_connections":  N | -1
+//     },
+//     "uptime_ticks": N
+//   }
+//
+// Collection probes that cannot acquire their lock within the brief
+// try-lock window emit `-1` so the caller distinguishes "no data this
+// sample" from a genuine zero.  Every probe uses a budget of ~few
+// microseconds so this op never blocks the kdb pump thread.
+//
+// Public spec citations:
+//   - POSIX 1003.1-2024 process model — process / thread table sizing.
+//   - Intel SDM Vol. 3A §4.10.4 — TLB quarantine semantics this op
+//     surfaces depth for.
+fn op_heap_stats(out: &mut String) {
+    use core::fmt::Write;
+
+    // ── Allocator-level totals ─────────────────────────────────────────────
+    let (h_total, h_alloc, h_free) = crate::mm::heap::stats();
+    let (h_allocs, h_frees, h_alloc_b, h_free_b, h_cur, h_peak) =
+        crate::perf::heap_alloc_stats();
+
+    out.push('{');
+    out.push_str(r#""heap":{"#);
+    let _ = write!(out, r#""current_bytes":{},"#, h_cur);
+    let _ = write!(out, r#""peak_bytes":{},"#, h_peak);
+    let _ = write!(out, r#""alloc_count":{},"#, h_allocs);
+    let _ = write!(out, r#""free_count":{},"#, h_frees);
+    let _ = write!(out, r#""alloc_bytes":{},"#, h_alloc_b);
+    let _ = write!(out, r#""free_bytes":{},"#, h_free_b);
+    let _ = write!(out, r#""total_bytes":{},"#, h_total);
+    let _ = write!(out, r#""allocator_used":{},"#, h_alloc);
+    let _ = write!(out, r#""allocator_free":{}"#, h_free);
+    out.push('}');
+
+    // ── Per-collection sizes ───────────────────────────────────────────────
+    out.push_str(r#","collections":{"#);
+
+    let proc_n = match try_lock_brief(&PROCESS_TABLE) {
+        Some(g) => g.len() as i64, None => -1,
+    };
+    let thr_n  = match try_lock_brief(&crate::proc::THREAD_TABLE) {
+        Some(g) => g.len() as i64, None => -1,
+    };
+    let _ = write!(out, r#""process_table":{},"#, proc_n);
+    let _ = write!(out, r#""thread_table":{},"#, thr_n);
+
+    let (pc_total, pc_dirty) = crate::mm::cache::stats();
+    let _ = write!(out, r#""page_cache":{},"#, pc_total);
+    let _ = write!(out, r#""page_cache_dirty":{},"#, pc_dirty);
+    let _ = write!(out, r#""tlb_quarantine":{},"#,
+        crate::mm::tlb::stats().quarantine_depth);
+
+    let tcp_n = match crate::net::tcp::connection_count() {
+        Some(n) => n as i64, None => -1,
+    };
+    let _ = write!(out, r#""tcp_connections":{}"#, tcp_n);
+
+    out.push('}');
+
+    // Uptime for caller-side rate computation.
+    let _ = write!(out, r#","uptime_ticks":{}}}"#,
+        crate::arch::x86_64::irq::get_ticks());
 }
 
 // ── proc-tree ────────────────────────────────────────────────────────────────

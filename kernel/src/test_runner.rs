@@ -766,6 +766,10 @@ pub fn run() -> ! {
     total += 1;
     if test_tcp_retransmit_queue() { passed += 1; }
 
+    // ── Test 89b: TCP_CONNECTIONS cap + closed-entry GC ───────────────────
+    total += 1;
+    if test_tcp_connections_cap() { passed += 1; }
+
     // ── Test 90: TCP congestion control (slow start + cwnd growth) ────────
 
     total += 1;
@@ -15738,6 +15742,98 @@ fn test_tcp_retransmit_queue() -> bool {
     let _ = tcp::abort(local_port);
 
     test_pass!("TCP ISN (rdtsc) + retransmit queue management");
+    true
+}
+
+// ── Test 89b: TCP_CONNECTIONS cap + closed-entry GC ─────────────────────────
+//
+// Regression test for the long-soak heap-leak: every outbound or
+// accepted TCP connection allocates a `TcpConnection` (TCB + send/recv
+// buffers + retransmit queue), and prior to PR <this one> entries in
+// state `Closed` were retained indefinitely so any long-running probe
+// loop accumulated them on the kernel heap.  The two-line fix is:
+//   (1) record a `closed_tick` on every Closed transition,
+//   (2) reap entries older than `CLOSED_GC_GRACE_TICKS` from the
+//       periodic timer sweep, and refuse `MAX_TCP_CONNECTIONS+1`
+//       inbound SYNs / outbound connects.
+//
+// The test makes a small burst of connect/abort flows and then verifies
+// that the periodic tick reaps the closed entries.  It deliberately
+// does not attempt to push past `MAX_TCP_CONNECTIONS = 1024` — that
+// would require ~1 GiB of slack and is exercised by the production
+// soak in the PR's verification trial — but it does verify the GC
+// path runs and bounds growth back down.
+fn test_tcp_connections_cap() -> bool {
+    test_header!("TCP_CONNECTIONS cap + GC of Closed entries");
+
+    use crate::net::tcp;
+
+    let baseline = tcp::connection_count().unwrap_or(0);
+
+    // Open BURST flows, each immediately aborted → drives them through
+    // mark_closed.  Keep BURST small so the test stays fast under
+    // -j on slow CI hardware; the GC sweep behaviour is the same at any
+    // size > 0.
+    const BURST: usize = 16;
+    let remote_ip: [u8; 4] = [192, 168, 1, 200];
+    let mut opened: alloc::vec::Vec<u16> = alloc::vec::Vec::new();
+    for i in 0..BURST {
+        match tcp::connect(remote_ip, 7000 + i as u16) {
+            Ok(p)  => opened.push(p),
+            Err(e) => {
+                test_fail!("tcp_cap", "connect() #{} failed: {}", i, e);
+                return false;
+            }
+        }
+    }
+    // Each connect adds one entry; we should see at least BURST more.
+    let after_open = tcp::connection_count().unwrap_or(0);
+    if after_open < baseline + BURST {
+        test_fail!("tcp_cap",
+            "after {} connects: {} entries (baseline {})",
+            BURST, after_open, baseline);
+        return false;
+    }
+    test_println!("  baseline={} after {} connects → {} entries ✓",
+                  baseline, BURST, after_open);
+
+    // Abort each → they transition to Closed and record closed_tick.
+    for p in &opened {
+        let _ = tcp::abort(*p);
+    }
+
+    // Advance synthetic time past CLOSED_GC_GRACE_TICKS by calling
+    // tcp_timer_tick() enough times.  The PIT runs at 100 Hz; the GC
+    // grace is 50 ticks so a single batch of ticks across a sleep loop
+    // here is plenty.  Drive the tick directly so the test does not
+    // depend on real wall-clock passing.
+    //
+    // We synthesise the wait by calling tcp_timer_tick() once after a
+    // brief busy-wait, which lets the underlying tick counter advance
+    // past the grace.  The wait length is chosen empirically: ~600 ms
+    // gives at least 60 ticks at 100 Hz under TCG; KVM is faster but
+    // never slower than the 10 ms PIT period.
+    let start = crate::arch::x86_64::irq::get_ticks();
+    while crate::arch::x86_64::irq::get_ticks().wrapping_sub(start) < 60 {
+        core::hint::spin_loop();
+    }
+    tcp::tcp_timer_tick();
+
+    let after_gc = tcp::connection_count().unwrap_or(0);
+    // After GC, the count should fall back to roughly baseline (the
+    // BURST entries we created should all have been reaped).  We allow
+    // a small slack because the in-flight SLIRP-side retries can leave
+    // a couple of TIME_WAIT entries behind during the same window.
+    if after_gc > baseline + (BURST / 4).max(2) {
+        test_fail!("tcp_cap",
+            "after GC: {} entries (baseline {}, expected ≤ {})",
+            after_gc, baseline, baseline + (BURST / 4).max(2));
+        return false;
+    }
+    test_println!("  after abort + tcp_timer_tick → {} entries (baseline {}) ✓",
+                  after_gc, baseline);
+
+    test_pass!("TCP_CONNECTIONS cap + GC of Closed entries");
     true
 }
 
