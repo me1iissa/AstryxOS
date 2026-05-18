@@ -952,6 +952,7 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
                           cpu_model: Optional[str] = None,
                           esp_dir_override: Optional[str] = None,
                           qga_sock: str = "",
+                          extra_qemu_args: Optional[list[str]] = None,
                           ) -> subprocess.Popen:
     """
     Launch QEMU with a per-session serial log and QMP socket.
@@ -1001,6 +1002,7 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
         gdb_wait=gdb_wait,
         kvm=kvm,
         cpu_override=cpu_model,
+        extra_args=list(extra_qemu_args) if extra_qemu_args else None,
         warn_on_missing_data_img=True,
     )
 
@@ -1722,6 +1724,7 @@ def cmd_start(args):
         file=sys.stderr,
     )
 
+    extra_qemu_args = list(getattr(args, "extra_qemu_args", None) or [])
     proc = _launch_qemu_harness(sid, serial_log, qmp_sock, ovmf_vars,
                                  gdb_port=gdb_port, gdb_wait=gdb_wait,
                                  kdb_host_port=kdb_host_port,
@@ -1729,7 +1732,8 @@ def cmd_start(args):
                                  smp=smp,
                                  cpu_model=cpu_model,
                                  esp_dir_override=esp_paths["session_esp_dir"],
-                                 qga_sock=qga_sock)
+                                 qga_sock=qga_sock,
+                                 extra_qemu_args=extra_qemu_args)
 
     session = {
         "sid":        sid,
@@ -2536,7 +2540,7 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
     if op in ("ping", "proc-list", "vfs-mounts", "trace-status",
               "bell-stats", "cache-audit", "cache-aliasing",
               "fault-cache-keys", "w215-cache-residency",
-              "tlb-stats", "w215-diag",
+              "tlb-stats", "heap-stats", "w215-diag",
               "coverage-flush", "proc-metrics",
               "futex-stats"):
         return {"op": op}
@@ -2602,6 +2606,18 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
         if len(rest) < 3: raise ValueError("user-mem requires <pid> <addr> <len>")
         return {"op": "user-mem", "pid": int(rest[0], 0),
                 "addr": rest[1], "len": int(rest[2], 0)}
+    if op == "rip-trace":
+        # Periodic userspace RIP sampler for one TID over a fixed
+        # wall-clock window.  Used to characterise userspace plateaux
+        # where kernel-side metrics (sc/clone3/futex counts) plateau
+        # but the target thread is alive and looping in libxul (the
+        # post-PR-#287/#288/#289 JIT plateau pattern; see the W101
+        # firefox plateau memory for the same shape in May).
+        if not rest:
+            raise ValueError("rip-trace requires <tid> [<ms>] (default ms=1000)")
+        tid = int(rest[0], 0)
+        ms  = int(rest[1], 0) if len(rest) >= 2 else 1000
+        return {"op": "rip-trace", "tid": tid, "ms": ms}
     if op == "futex-ghost-hist":
         # History-based FUTEX_WAKE_GHOST diagnostic.  Optional positional
         # token controls the kernel-side toggle / counter reset:
@@ -6599,6 +6615,14 @@ def main():
                                "qemu64+SSE4.2/AVX2/FMA baseline (no AVX-512, "
                                "no AVX10, no SHA-NI — see astryx_qemu._TCG_SAFE_CPU). "
                                "Used by perf sweeps to vary VMEXIT surface.")
+    p_start.add_argument("--extra-arg", dest="extra_qemu_args", action="append",
+                          default=None, metavar="ARG",
+                          help="Repeatable: append a verbatim argv token to the "
+                               "QEMU command line. For multi-token flags like "
+                               "'-overcommit cpu-pm=off', pass --extra-arg twice: "
+                               "--extra-arg -overcommit --extra-arg cpu-pm=off. "
+                               "Used by CPU-model sweeps to vary VMEXIT surface "
+                               "knobs that are not covered by --cpu.")
     p_start.add_argument("--no-regen-data-img", action="store_true",
                           dest="no_regen_data_img",
                           help="Skip the auto-regen of build/data.img when "
@@ -6713,9 +6737,10 @@ def main():
         "syscall-trend", "vfs-mounts",
         "dmesg", "syms", "mem", "tframe", "user-mem", "trace-status",
         "bell-stats", "cache-audit", "cache-aliasing", "fault-cache-keys",
-        "w215-cache-residency", "tlb-stats", "w215-diag",
+        "w215-cache-residency", "tlb-stats", "heap-stats", "w215-diag",
         "arm-phys",
         "coverage-flush", "proc-metrics", "thread-park-audit",
+        "rip-trace",
         "futex-ghost-hist",
         # FUTEX_WAKE cluster-wake compensation (firefox-test/test-mode only).
         # See subsys/linux/futex_cluster.rs.
@@ -6728,7 +6753,8 @@ def main():
                              "fd-map [<pid>] (0 or omit = all processes), "
                              "syscall-trend [<seconds> [<pid>]] (def 5 0), "
                              "dmesg [tail], syms <name|0xaddr>, "
-                             "mem <addr> <len>")
+                             "mem <addr> <len>, "
+                             "rip-trace <tid> [<ms>] (def ms=1000)")
     p_kdb.add_argument("--timeout", type=float, default=30.0,
                         help="Overall deadline in seconds (default 30.0). "
                              "Wraps retry/backoff for BSP starvation tolerance.")
