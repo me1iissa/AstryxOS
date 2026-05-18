@@ -1,3 +1,25 @@
+# AstryxOS Rust toolchain
+# ─────────────────────────────────────────────────────────────────────────────
+# Channel policy:
+#   AstryxOS pins to the floating `nightly` channel because the kernel relies
+#   on several -Z flags (`-Zbuild-std`, `-Zbuild-std-features`,
+#   `-Zjson-target-spec`) that are not yet stabilised.  Nightly drift can
+#   break the build at any time — when it does, the fix is to pin to the
+#   last-good dated nightly here while upstream lands the regression fix,
+#   e.g.:
+#
+#     channel = "nightly-2026-04-30"
+#
+#   Local devs should `rustup toolchain install nightly` periodically and
+#   CI uses `dtolnay/rust-toolchain@nightly` (always pulls the latest
+#   nightly) — so a date pin here is the chokepoint when CI starts failing
+#   for toolchain reasons rather than code reasons.  After landing a date
+#   pin, mirror it into `.github/workflows/build.yml` (`toolchain:` field
+#   on each `dtolnay/rust-toolchain` step) to keep CI and local in sync.
+#
+# Required components / targets are listed below; do NOT remove them
+# without first confirming each consumer (kernel ELF target spec,
+# UEFI bootloader, `objcopy` in `build.sh`) is happy.
 [toolchain]
 channel = "nightly"
 components = ["rust-src", "llvm-tools-preview"]

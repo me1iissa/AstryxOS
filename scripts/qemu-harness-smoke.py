@@ -436,6 +436,105 @@ def run_staleness_check():
     print()
 
 
+def run_allowlist_check():
+    """
+    Tier 1.5 host-only check: exercise `allowlist` subcommands directly.
+
+    Validates:
+      * `allowlist regex` produces a non-empty alternation regex
+      * `allowlist list` returns a JSON envelope with an entries list
+      * `allowlist check --serial-log` correctly classifies known [FAIL]
+        lines as allowed vs. unallowed
+      * `allowlist add/remove` round-trip preserves the file _comment
+
+    No QEMU launched; runs in < 1s.  Locked down so future refactors of
+    qemu-harness.py cannot silently break the CI-side rendering of
+    ci/allow-fail.json.
+    """
+    import tempfile
+    print("=== Tier 1.5: ci/allow-fail.json allowlist (host-only) ===")
+    print()
+
+    # ── list ──────────────────────────────────────────────────────────────────
+    obj, raw, rc = _h("allowlist", "list")
+    check("allowlist list returns JSON",   obj is not None, raw[:120])
+    check("allowlist list rc=0",           rc == 0, f"rc={rc}")
+    if obj is not None:
+        check("allowlist.entries is a list",
+              isinstance(obj.get("entries"), list),
+              str(type(obj.get("entries"))))
+
+    # ── regex (printed verbatim, no trailing newline) ─────────────────────────
+    # _h() parses stdout as JSON; allowlist regex prints a raw string, so we
+    # need to call it without parsing.
+    import subprocess
+    r = subprocess.run([PYTHON, str(HARNESS), "allowlist", "regex"],
+                       capture_output=True, text=True)
+    check("allowlist regex rc=0",  r.returncode == 0, f"rc={r.returncode}")
+    check("allowlist regex non-empty",
+          len(r.stdout) > 0, f"stdout={r.stdout[:80]!r}")
+    check("allowlist regex no trailing newline",
+          not r.stdout.endswith("\n"), repr(r.stdout[-10:]))
+
+    # ── check against a synthetic serial log ──────────────────────────────────
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as fh:
+        fh.write("[OK] something\n")
+        fh.write("[PASS] another\n")
+        fh.write("[FAIL] Musl hello: errno 2\n")
+        fh.write("[FAIL] WriteConsoleA: stub not registered\n")
+        synthetic = fh.name
+    try:
+        obj, raw, rc = _h("allowlist", "check", "--serial-log", synthetic)
+        check("allowlist check returns JSON", obj is not None, raw[:120])
+        if obj is not None:
+            check("allowlist check found 1 allowed",
+                  len(obj.get("allowed_failures", [])) == 1,
+                  f"allowed={obj.get('allowed_failures')}")
+            check("allowlist check found 1 unallowed (WriteConsoleA)",
+                  len(obj.get("unallowed_failures", [])) == 1,
+                  f"unallowed={obj.get('unallowed_failures')}")
+            check("allowlist check rc=1 (drift)",
+                  rc == 1, f"rc={rc}")
+    finally:
+        Path(synthetic).unlink(missing_ok=True)
+
+    # ── add/remove round-trip (against a temp copy so we don't touch ci/) ────
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+        # Seed with a _comment to confirm preservation across edits.
+        fh.write('{"_comment": "test", "entries": []}\n')
+        tmp_path = fh.name
+    try:
+        obj, raw, rc = _h("allowlist", "--file", tmp_path,
+                          "add", "--name", "smoke_x", "--reason", "test",
+                          "--tracking", "#999")
+        check("allowlist add ok=true",
+              bool(obj and obj.get("ok")), str(obj))
+        # Duplicate add → ok=false
+        obj, raw, rc = _h("allowlist", "--file", tmp_path,
+                          "add", "--name", "smoke_x")
+        check("allowlist add duplicate ok=false",
+              bool(obj and obj.get("ok") is False), str(obj))
+        # _comment preserved
+        with open(tmp_path) as f:
+            data = json.load(f)
+        check("allowlist add preserves _comment",
+              data.get("_comment") == "test", str(data))
+        # Remove
+        obj, raw, rc = _h("allowlist", "--file", tmp_path,
+                          "remove", "--name", "smoke_x")
+        check("allowlist remove ok=true",
+              bool(obj and obj.get("ok")), str(obj))
+        with open(tmp_path) as f:
+            data = json.load(f)
+        check("allowlist remove leaves 0 entries",
+              len(data.get("entries", [])) == 0, str(data))
+        check("allowlist remove preserves _comment",
+              data.get("_comment") == "test", str(data))
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="AstryxOS qemu-harness smoke test")
@@ -460,15 +559,18 @@ def main():
         print(f"[{INFO}] Tier 3 kdb hostfwd smoke enabled")
     print()
 
-    # Always run the host-only staleness detector check — it's < 1 second and
-    # protects the W7 silent-wedge guard against future refactors.
+    # Always run the host-only checks — each is < 1 second and protects
+    # the corresponding silent-wedge guards (W7 staleness; ci/allow-fail
+    # registry) against future refactors of qemu-harness.py.
     run_staleness_check()
+    run_allowlist_check()
 
     if args.staleness_only:
-        # Early exit for CI cycles that just want the cheap detector check.
+        # Early exit for CI cycles that just want the cheap host-only checks.
+        # (Name retained for back-compat; now covers all Tier-1.5 host checks.)
         n_fail = len(failures)
         if n_fail == 0:
-            print(f"\033[32m\nStaleness check passed.\033[0m")
+            print(f"\033[32m\nHost-only checks passed.\033[0m")
             sys.exit(0)
         else:
             print(f"\033[31m\n{n_fail} check(s) FAILED:\033[0m")

@@ -198,33 +198,55 @@ jobs:
       # tests passed; anything else fails the job.  GitHub runners have
       # no /dev/kvm, so expect ~8–15 minutes without KVM acceleration.
       #
-      # Known pre-existing gap (audit HIGH-5): tests `pie_elf`,
-      # `TCC compile`, and `firefox_oracle` depend on pre-built binaries
-      # (`ld-musl-x86_64.so.1`, `/disk/bin/tcc`, firefox ESR) that this
-      # job does NOT build.  The first time this workflow runs in CI it
-      # is expected to surface those gaps — fixing them is a follow-up
-      # to the testing-infra audit and is tracked separately.
+      # The allow-fail list is structured: ci/allow-fail.json carries one
+      # entry per tolerated [FAIL], each with a reason and tracking
+      # reference.  `qemu-harness.py allowlist regex` renders it into the
+      # regex consumed by `ci-run --allow-fail`.  Anything not in the list
+      # still gates the job.  Use `allowlist add/remove` to update (no need
+      # to edit this workflow file when an entry shifts).
+      #
+      # Note: we keep using watch-test.py here to preserve historical exit
+      # code shape (the CI parser expects the watch-test output banner);
+      # ci-run is exposed for parity and used by `soak`.  Migrating fully
+      # to `ci-run` is tracked separately.
+      - name: Render allow-fail regex from ci/allow-fail.json
+        id: allowlist
+        run: |
+          set -euo pipefail
+          REGEX=$(python3 scripts/qemu-harness.py allowlist regex)
+          # GHA: write to GITHUB_OUTPUT so the next step can use it
+          {
+            echo "regex<<EOF"
+            echo "$REGEX"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          NUM=$(python3 -c 'import json,sys; print(len(json.load(open("ci/allow-fail.json"))["entries"]))')
+          echo "[ci] rendered allow-fail regex from $NUM entries"
+
       - name: Run headless test suite
-        # --allow-fail tolerates known pre-existing gaps:
-        #
-        # Issue #41 env-gap group (NotFound /disk/bin/* fixtures + firefox_oracle
-        # SIGSEGV): CI does not build the userspace binary fixtures (musl, tcc,
-        # busybox, hello) or Firefox, so those tests are expected to fail here.
-        #
-        # unix socketpair EPOLLIN gating: AF_UNIX epoll EPOLLIN edge-trigger has
-        # been failing on every CI run since the workflow was introduced
-        # (pre-W216).  This is a real kernel bug being tracked separately; it is
-        # not caused by any W216 change.
-        #
-        # alias_test: added by PR #221 as a deterministic page-aliasing reproducer
-        # for the W8 race.  Currently --allow-fail on TCG CI runners due to the
-        # in-flight W215 page-aliasing race investigation.  Restore enforcement
-        # after W215 closure (tracked as task #328).
-        #
-        # Any failure NOT in this list still gates the job.
         run: |
           python3 scripts/watch-test.py --no-build --hard-timeout 900 \
-            --allow-fail '\[FAIL\] (Musl hello|dynamic_elf|pie_elf|TCC compile|busybox basic|sigchld|ascension|firefox_oracle|unix socketpair EPOLLIN gating|alias_test)'
+            --allow-fail "\[FAIL\] (${{ steps.allowlist.outputs.regex }})"
+
+      - name: Allowlist drift check (informational, always runs)
+        # If any allowlist entry did NOT match a failure this run, flag it
+        # — the underlying gap may have closed and the entry can come out.
+        # Informational only: does not fail the job.
+        if: always()
+        run: |
+          set -uo pipefail
+          # Prefer the harness session log (when ci-run is used in future);
+          # fall back to watch-test's build/test-serial.log.
+          for c in ~/.astryx-harness/*.serial.log build/test-serial.log; do
+            for f in $c; do
+              if [ -e "$f" ]; then
+                echo "[ci] drift check against $f"
+                python3 scripts/qemu-harness.py allowlist check --serial-log "$f" || true
+                exit 0
+              fi
+            done
+          done
+          echo "[ci] no serial log found — skipping drift check"
 
       - name: Upload serial logs on failure
         if: failure()

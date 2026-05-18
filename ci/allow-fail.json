@@ -1,0 +1,75 @@
+{
+  "_comment": [
+    "Structured allow-fail list for the kernel-smoke CI job.",
+    "",
+    "Each entry is a kernel test name (the string after [FAIL] / [PASS] in the",
+    "serial log) together with a short reason and an optional tracking issue.",
+    "The CI workflow renders this file into a regex via the harness:",
+    "",
+    "    python3 scripts/qemu-harness.py allowlist regex",
+    "",
+    "and passes the result to `ci-run --allow-fail`. Anything not in the list",
+    "still gates the job.",
+    "",
+    "When you ADD an entry, include a 'reason' and (if possible) a 'tracking'",
+    "field so future agents can decide whether the entry is still load-bearing.",
+    "When you REMOVE an entry, the change should be visible in `git log -- ci/`",
+    "so we can audit drift — see `allowlist drift` in the harness.",
+    "",
+    "Note: names are matched as substrings (regex-quoted), so 'Musl hello'",
+    "matches [FAIL] Musl hello. If a test name contains regex metacharacters,",
+    "set 'regex': true and write the entry as a regex; otherwise it is escaped."
+  ],
+  "entries": [
+    {
+      "name": "Musl hello",
+      "reason": "env-gap: CI does not build /disk/bin/* fixtures (issue #41)",
+      "tracking": "#41"
+    },
+    {
+      "name": "dynamic_elf",
+      "reason": "env-gap: requires ld-musl-x86_64.so.1 fixture (issue #41)",
+      "tracking": "#41"
+    },
+    {
+      "name": "pie_elf",
+      "reason": "env-gap: requires PIE musl binary fixture (issue #41)",
+      "tracking": "#41"
+    },
+    {
+      "name": "TCC compile",
+      "reason": "env-gap: requires /disk/bin/tcc fixture (issue #41)",
+      "tracking": "#41"
+    },
+    {
+      "name": "busybox basic",
+      "reason": "env-gap: requires busybox fixture (issue #41)",
+      "tracking": "#41"
+    },
+    {
+      "name": "sigchld",
+      "reason": "env-gap: SIGSEGV on missing userspace fixture (issue #41)",
+      "tracking": "#41"
+    },
+    {
+      "name": "ascension",
+      "reason": "env-gap: requires hello fixture (issue #41)",
+      "tracking": "#41"
+    },
+    {
+      "name": "firefox_oracle",
+      "reason": "env-gap: CI does not build Firefox ESR (issue #41)",
+      "tracking": "#41"
+    },
+    {
+      "name": "unix socketpair EPOLLIN gating",
+      "reason": "pre-existing kernel bug: AF_UNIX epoll EPOLLIN edge-trigger; predates W216",
+      "tracking": null
+    },
+    {
+      "name": "alias_test",
+      "reason": "deterministic page-aliasing reproducer for W8 race; tolerated on TCG CI until W215 closure",
+      "tracking": "#328"
+    }
+  ]
+}
