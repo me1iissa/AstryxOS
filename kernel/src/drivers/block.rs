@@ -55,6 +55,51 @@ pub trait BlockDevice: Send + Sync {
     fn write_sector(&self, lba: u64, data: &[u8; SECTOR_SIZE]) -> Result<(), BlockError> {
         self.write_sectors(lba, 1, data)
     }
+
+    /// Flush the device's write-back cache so previously-acknowledged writes
+    /// are durable across power loss.
+    ///
+    /// Callers issuing `fsync(2)` / `NtFlushBuffersFile` / FAT32 directory
+    /// updates should invoke this after the relevant write_sectors() calls.
+    /// Returns `Ok(())` immediately for devices that have no write-back
+    /// cache or whose cache is implicitly write-through.
+    ///
+    /// Default implementation is a no-op (safe for read-only / in-memory
+    /// devices). Real drivers (virtio-blk, AHCI) override with a device
+    /// FLUSH command.
+    ///
+    /// Wire reference:
+    /// - virtio-blk: VIRTIO_BLK_T_FLUSH (legacy feature bit 9 — see virtio
+    ///   1.2 §5.2 Block Device, command type 4).
+    /// - ATA/SATA: FLUSH CACHE EXT (0xEA) for 48-bit LBA devices,
+    ///   FLUSH CACHE (0xE7) for 28-bit LBA — T13 ACS-3 §7.9 / §7.10.
+    fn flush(&self) -> Result<(), BlockError> {
+        Ok(())
+    }
+
+    /// True if the device is read-only (mounted RO, or backed by a
+    /// read-only image / RO-bit set in the device's feature set).
+    ///
+    /// Filesystems should consult this at mount time to refuse RW mounts
+    /// of an RO device with `STATUS_MEDIA_WRITE_PROTECTED` rather than
+    /// discovering it lazily on the first failed write.
+    ///
+    /// Default `false` (writable) for backward compatibility.
+    fn is_readonly(&self) -> bool {
+        false
+    }
+
+    /// Logical block size in bytes — the smallest unit the device addresses
+    /// at the LBA level. Returns [`SECTOR_SIZE`] (512) by default, which is
+    /// correct for legacy ATA and the vast majority of virtio-blk devices.
+    ///
+    /// Drivers that negotiate `VIRTIO_BLK_F_BLK_SIZE` (virtio 1.2 §5.2.4) or
+    /// query `IDENTIFY DEVICE` words 117-118 (T13 ACS-3 §7.12.6) override
+    /// this with the device-reported value. Filesystem and partition-table
+    /// code should align I/O to this size for best performance.
+    fn logical_block_size(&self) -> u32 {
+        SECTOR_SIZE as u32
+    }
 }
 
 /// A block device backed by an in-memory byte slice.
@@ -143,5 +188,11 @@ impl BlockDevice for AhciBlockDevice {
         }
         super::ahci::write_sectors(self.port, lba, count as u16, data)
             .map_err(|_| BlockError::IoError)
+    }
+
+    fn flush(&self) -> Result<(), BlockError> {
+        // ATA FLUSH CACHE EXT (0xEA) — T13 ACS-3 §7.10. Forces the drive's
+        // volatile write-back cache (if any) to non-volatile media.
+        super::ahci::flush_cache(self.port).map_err(|_| BlockError::IoError)
     }
 }

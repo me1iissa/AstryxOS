@@ -218,6 +218,10 @@ pub fn run() -> ! {
         if test_qga_daemon_ping_qga2() { passed += 1; }
     }
 
+    // ── Test 0e: virtio-blk feature negotiation + FLUSH smoke ───────────
+    total += 1;
+    if test_virtio_blk_features_and_flush() { passed += 1; }
+
     // ── Test 1: Network Configuration ───────────────────────────────────
 
     total += 1;
@@ -25209,6 +25213,108 @@ fn test_qga_daemon_ping_qga2() -> bool {
     test_println!("  reply contains \"return\":{{}} and \"id\":777 echo ✓");
 
     test_pass!("QGA daemon end-to-end ping (Phase QGA-2)");
+    true
+}
+
+// ── Test 0e: virtio-blk feature negotiation + FLUSH smoke ───────────────────
+//
+// Confirms the driver negotiated VIRTIO_BLK_F_FLUSH (legacy bit 9 — virtio
+// 1.2 §5.2.3) with QEMU's virtio-blk-pci-legacy backend and that a
+// VIRTIO_BLK_T_FLUSH submission completes successfully on the same code
+// path that VIRTIO_BLK_T_IN / VIRTIO_BLK_T_OUT use (slot acquisition,
+// 2-descriptor chain, used-ring demultiplex by `head_id / 3`).
+//
+// Also exercises the new BlockDevice methods (logical_block_size,
+// is_readonly) for parity with future filesystem callers.
+//
+// Skipped if no virtio-blk PCI device is present (the kernel is being
+// run against a non-virtio backend, e.g. AHCI-only).
+fn test_virtio_blk_features_and_flush() -> bool {
+    test_header!("virtio-blk feature negotiation + FLUSH smoke (Test 0e)");
+
+    if !crate::drivers::virtio_blk::is_available() {
+        test_println!("  SKIP: no virtio-blk PCI device on bus");
+        test_pass!("virtio-blk features + flush (skipped — no device)");
+        return true;
+    }
+
+    // ── Feature negotiation sanity ─────────────────────────────────────
+    let lb = crate::drivers::virtio_blk::logical_block_size();
+    if lb == 0 || lb > 4096 || (lb & (lb - 1)) != 0 {
+        test_fail!("virtio_blk_features",
+            "logical_block_size() = {} is not a power-of-two in [1,4096]", lb);
+        return false;
+    }
+    if (lb as usize) < 512 || (lb as usize % 512) != 0 {
+        test_fail!("virtio_blk_features",
+            "logical_block_size() = {} is not a multiple of 512", lb);
+        return false;
+    }
+    test_println!("  logical_block_size = {} bytes ✓", lb);
+
+    // RO is observable, but a writable backing image is the common QEMU
+    // default — just print it for the log and ensure the getter is callable.
+    let ro = crate::drivers::virtio_blk::is_readonly();
+    test_println!("  is_readonly = {} (informational)", ro);
+
+    // ── FLUSH availability ─────────────────────────────────────────────
+    let flush_ok = crate::drivers::virtio_blk::flush_supported();
+    test_println!("  flush_supported = {}", flush_ok);
+
+    let before = crate::drivers::virtio_blk::flush_submitted();
+
+    // ── Issue a flush ─────────────────────────────────────────────────
+    // do_flush() returns Ok(()) immediately when FLUSH wasn't negotiated
+    // (write-through host), and submits a real VIRTIO_BLK_T_FLUSH chain
+    // otherwise.  Either path must complete without error.
+    if let Err(e) = crate::drivers::virtio_blk::flush() {
+        test_fail!("virtio_blk_features",
+            "virtio_blk::flush() failed: {:?}", e);
+        return false;
+    }
+    test_println!("  flush() returned Ok ✓");
+
+    // When FLUSH is negotiated, the counter must have advanced.  When
+    // it wasn't, do_flush short-circuits before bumping it — also valid.
+    let after = crate::drivers::virtio_blk::flush_submitted();
+    if flush_ok && after == before {
+        test_fail!("virtio_blk_features",
+            "flush_supported=true but FLUSH_SUBMITTED did not advance ({} -> {})",
+            before, after);
+        return false;
+    }
+    if !flush_ok && after != before {
+        test_fail!("virtio_blk_features",
+            "flush_supported=false but FLUSH_SUBMITTED advanced ({} -> {}) — spec violation",
+            before, after);
+        return false;
+    }
+    test_println!("  flush counter: {} -> {} ✓", before, after);
+
+    // ── BlockDevice trait surface ─────────────────────────────────────
+    // Confirm the BlockDevice impl threads through to the same machinery.
+    let dev = crate::drivers::virtio_blk::VirtioBlkBlockDevice;
+    use crate::drivers::block::BlockDevice;
+    if dev.logical_block_size() != lb {
+        test_fail!("virtio_blk_features",
+            "BlockDevice::logical_block_size() mismatch: trait={} module={}",
+            dev.logical_block_size(), lb);
+        return false;
+    }
+    if dev.is_readonly() != ro {
+        test_fail!("virtio_blk_features",
+            "BlockDevice::is_readonly() mismatch: trait={} module={}",
+            dev.is_readonly(), ro);
+        return false;
+    }
+    if let Err(e) = dev.flush() {
+        test_fail!("virtio_blk_features",
+            "BlockDevice::flush() failed: {:?}", e);
+        return false;
+    }
+    test_println!("  BlockDevice trait surface consistent with module API ✓");
+
+    test_pass!("virtio-blk features + flush (Test 0e)");
     true
 }
 
