@@ -2536,7 +2536,7 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
     if op in ("ping", "proc-list", "vfs-mounts", "trace-status",
               "bell-stats", "cache-audit", "cache-aliasing",
               "fault-cache-keys", "w215-cache-residency",
-              "tlb-stats", "w215-diag",
+              "tlb-stats", "heap-stats", "w215-diag",
               "coverage-flush", "proc-metrics",
               "futex-stats"):
         return {"op": op}
@@ -6713,7 +6713,7 @@ def main():
         "syscall-trend", "vfs-mounts",
         "dmesg", "syms", "mem", "tframe", "user-mem", "trace-status",
         "bell-stats", "cache-audit", "cache-aliasing", "fault-cache-keys",
-        "w215-cache-residency", "tlb-stats", "w215-diag",
+        "w215-cache-residency", "tlb-stats", "heap-stats", "w215-diag",
         "arm-phys",
         "coverage-flush", "proc-metrics", "thread-park-audit",
         "futex-ghost-hist",
