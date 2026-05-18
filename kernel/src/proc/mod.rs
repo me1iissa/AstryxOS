@@ -2861,9 +2861,11 @@ pub fn restore_tls_for_current() {
         let threads = THREAD_TABLE.lock();
         threads.iter().find(|t| t.tid == tid).map(|t| t.tls_base).unwrap_or(0)
     };
-    if base != 0 {
-        unsafe { write_fs_base(base); }
-    }
+    // Write unconditionally: if base==0 (vfork/CLONE_VM child that was never
+    // assigned a TLS block) we must zero FS.base explicitly.  Skipping the
+    // WRMSR would leave the previous thread's FS.base on this CPU, causing the
+    // SSP epilogue to read the *parent's* canary and raise #GP.
+    unsafe { write_fs_base(base); }
 }
 
 // ── Thread Reaper ───────────────────────────────────────────────────────────
