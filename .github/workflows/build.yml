@@ -214,6 +214,18 @@ jobs:
         run: |
           set -euo pipefail
           REGEX=$(python3 scripts/qemu-harness.py allowlist regex)
+          # Defence-in-depth: refuse to spliced an empty regex into the next
+          # step's --allow-fail "\[FAIL\] (REGEX)" template.  Empty would
+          # become "\[FAIL\] ()" which matches every [FAIL] line and turns
+          # a wiped or malformed allowlist into a silent green build.  The
+          # harness emits a never-match sentinel `(?!)` for the empty case
+          # so this branch is a guard against future render regressions.
+          if [ -z "$REGEX" ]; then
+            echo "[ci] FATAL: allowlist regex rendered empty — aborting." >&2
+            echo "[ci] Splicing an empty regex into '\\[FAIL\\] (REGEX)' would" >&2
+            echo "[ci] match every [FAIL] line and produce a silently green CI." >&2
+            exit 1
+          fi
           # GHA: write to GITHUB_OUTPUT so the next step can use it
           {
             echo "regex<<EOF"
