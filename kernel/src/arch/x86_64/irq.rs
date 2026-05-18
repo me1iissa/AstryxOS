@@ -224,11 +224,31 @@ pub fn get_ticks() -> u64 {
 /// Generate a naked ISR stub that saves caller-saved registers, calls
 /// `$handler`, then restores and `iretq`s.  All four hardware IRQ stubs
 /// are identical in structure; this macro removes the duplication.
+///
+/// ## SMAP entry guard
+///
+/// Hardware IRQs fire asynchronously on ring-3 contexts and per Intel SDM
+/// Vol. 3A §6.4 the CPU pushes the interrupted RFLAGS unchanged onto the
+/// kernel stack — leaving the live EFLAGS.AC at whatever the user held.
+/// EFLAGS.AC is not a privileged bit, so a ring-3 attacker can set AC=1
+/// and rely on an asynchronous IRQ to enter the kernel with SMAP silently
+/// lifted (CWE-269 / CWE-693).  Today the hardware-IRQ paths below only
+/// touch the kernel direct-physical map, but the post-#302 invariant —
+/// "AC=0 at every ring-3 → ring-0 boundary unless inside a nested
+/// `UserGuard`" — must hold for every entry to keep the property
+/// composable.  Per Intel SDM Vol. 2A (CLAC) the instruction raises #UD
+/// if CR4.SMAP=0, so the emit is gated on the runtime `SMAP_ENABLED`
+/// flag set by `arch::x86_64::enable_cpu_security_features`.
 macro_rules! irq_stub {
     ($name:ident, $handler:ident) => {
         #[unsafe(naked)]
         pub extern "C" fn $name() {
             core::arch::naked_asm!(
+                // ── SMAP entry guard — see macro-level doc comment ──
+                "cmp byte ptr [rip + {smap_enabled}], 0",
+                "je 90f",
+                "clac",
+                "90:",
                 "push rax", "push rcx", "push rdx",
                 "push rsi", "push rdi",
                 "push r8",  "push r9",  "push r10", "push r11",
@@ -238,6 +258,7 @@ macro_rules! irq_stub {
                 "pop rdx",  "pop rcx",  "pop rax",
                 "iretq",
                 handler = sym $handler,
+                smap_enabled = sym crate::arch::x86_64::smap::SMAP_ENABLED,
             );
         }
     };
@@ -267,6 +288,24 @@ macro_rules! irq_stub {
 #[unsafe(naked)]
 pub extern "C" fn irq_timer_handler() {
     core::arch::naked_asm!(
+        // ── SMAP entry guard ────────────────────────────────────────────
+        // Asynchronous LAPIC timer IRQ may land on a ring-3 context that
+        // set EFLAGS.AC=1 in userspace (the AC bit is not privileged —
+        // CWE-269 / CWE-693).  Per Intel SDM Vol. 3A §6.4 the CPU
+        // preserves the interrupted RFLAGS into the IRETQ frame and
+        // leaves the live AC bit alone, so a kernel-side user-pointer
+        // deref taken in the ISR would run with SMAP silently lifted.
+        // The timer ISR itself does not deref user pointers today, but
+        // the post-#302 invariant — "AC=0 at every ring-3 → ring-0
+        // boundary unless inside a nested `UserGuard`" — must hold here
+        // for the property to compose with any future user-mode helper
+        // the timer path calls (e.g. activity-metrics probes).  CLAC
+        // raises #UD if CR4.SMAP=0 (Intel SDM Vol. 2A), so the emit is
+        // gated on the runtime `SMAP_ENABLED` flag.
+        "cmp byte ptr [rip + {smap_enabled}], 0",
+        "je 90f",
+        "clac",
+        "90:",
         // Save ALL registers (caller + callee saved)
         "push rax", "push rcx", "push rdx",
         "push rsi", "push rdi",
@@ -301,6 +340,7 @@ pub extern "C" fn irq_timer_handler() {
         timer_tick = sym timer_tick,
         sample_tick = sym sample_tick_trampoline,
         check_resched = sym crate::sched::check_reschedule,
+        smap_enabled = sym crate::arch::x86_64::smap::SMAP_ENABLED,
     );
 }
 
