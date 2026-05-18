@@ -5,9 +5,23 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 use super::{Ipv4Address, our_ip};
 use super::ipv4;
+
+/// Count of UDP datagrams discarded on receive because the checksum
+/// field was non-zero and did not validate, per RFC 1122 §4.1.3.4:
+/// "If a UDP datagram is received with a checksum that is non-zero and
+/// invalid, UDP MUST silently discard the datagram."  Exposed for
+/// tests and the stats surface.  Loads/stores are Relaxed — the
+/// counter has no synchronisation duty.
+static UDP_RX_BAD_CSUM: AtomicU64 = AtomicU64::new(0);
+
+/// Read the running count of UDP RX checksum drops.
+pub fn rx_bad_csum_count() -> u64 {
+    UDP_RX_BAD_CSUM.load(Ordering::Relaxed)
+}
 
 /// A UDP header (parsed).
 pub struct UdpHeader {
@@ -46,13 +60,37 @@ struct UdpBinding {
 static UDP_BINDINGS: Mutex<Vec<UdpBinding>> = Mutex::new(Vec::new());
 
 /// Handle an incoming UDP packet.
-pub fn handle_udp(src_ip: Ipv4Address, _dst_ip: Ipv4Address, data: &[u8]) {
+pub fn handle_udp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
     let header = match UdpHeader::parse(data) {
         Some(h) => h,
         None => return,
     };
 
-    let payload = &data[8..];
+    // RFC 768 §"Length": UDP header `Length` field counts the header
+    // and payload combined.  Clamp the datagram to the declared length
+    // so a frame whose IP `total_length` overshoots cannot leak trailer
+    // bytes into our checksum or into the receive queue.  An undersized
+    // declaration (length < 8) is an attacker-crafted header — drop.
+    let udp_len = header.length as usize;
+    if udp_len < 8 || udp_len > data.len() {
+        UDP_RX_BAD_CSUM.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let datagram = &data[..udp_len];
+
+    // RFC 768 + RFC 1122 §4.1.3.4: a transmitted checksum of 0x0000
+    // means "checksum disabled by sender" — the receiver MUST NOT
+    // validate.  A non-zero checksum that fails validation MUST cause
+    // the datagram to be silently discarded.  The validation runs over
+    // an IPv4 pseudo-header (src_ip || dst_ip || 0 || proto || udp_len)
+    // followed by the UDP header and payload with the checksum field
+    // in place, per the Internet-checksum identity (RFC 1071).
+    if header.checksum != 0 && !verify_udp_checksum(src_ip, dst_ip, datagram) {
+        UDP_RX_BAD_CSUM.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    let payload = &datagram[8..];
 
     crate::serial_println!("[UDP] {}:{} -> port {} ({} bytes)",
         src_ip[0], src_ip[1],
@@ -67,6 +105,21 @@ pub fn handle_udp(src_ip: Ipv4Address, _dst_ip: Ipv4Address, data: &[u8]) {
             data: Vec::from(payload),
         });
     }
+}
+
+/// Verify a UDP datagram's checksum using the IPv4 pseudo-header per
+/// RFC 768 + RFC 1122 §4.1.3.4.  `datagram` is the UDP header followed
+/// by the payload, exactly `header.length` bytes, with the embedded
+/// checksum field still in place.  Returns true when valid.
+fn verify_udp_checksum(src_ip: Ipv4Address, dst_ip: Ipv4Address, datagram: &[u8]) -> bool {
+    let mut buf = Vec::with_capacity(12 + datagram.len());
+    buf.extend_from_slice(&src_ip);
+    buf.extend_from_slice(&dst_ip);
+    buf.push(0);
+    buf.push(ipv4::PROTO_UDP);
+    buf.extend_from_slice(&(datagram.len() as u16).to_be_bytes());
+    buf.extend_from_slice(datagram);
+    ipv4::verify_checksum(&buf)
 }
 
 /// Bind a UDP port for receiving.
@@ -125,8 +178,19 @@ pub fn send(dst_ip: Ipv4Address, src_port: u16, dst_port: u16, payload: &[u8]) {
     packet.push(0);
     packet.extend_from_slice(payload);
 
-    // Compute UDP checksum over pseudo-header + UDP packet.
-    let cksum = udp_checksum(our_ip(), dst_ip, &packet);
+    // The UDP pseudo-header carries the IPv4 source address.  Match the
+    // address the IPv4 layer will *actually* place in the outbound
+    // header — `ipv4::send_ipv4` reflects loopback destinations into the
+    // source field (RFC 1122 §3.2.1.3) so a packet sent to 127.x bears
+    // src=127.x, not our globally-routable address.  Without this
+    // mirroring the receive-side RFC 1122 §4.1.3.4 checksum check would
+    // fail every loopback UDP datagram.
+    let src_for_pseudo = if super::loopback::is_loopback_addr(dst_ip) {
+        dst_ip
+    } else {
+        our_ip()
+    };
+    let cksum = udp_checksum(src_for_pseudo, dst_ip, &packet);
     packet[6] = (cksum >> 8) as u8;
     packet[7] = (cksum & 0xFF) as u8;
 
