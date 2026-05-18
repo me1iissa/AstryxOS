@@ -360,6 +360,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "coverage-flush" => op_coverage_flush(out),
         "proc-metrics"   => op_proc_metrics(out),
         "thread-park-audit" => op_thread_park_audit(req, out),
+        "rip-trace"      => op_rip_trace(req, out),
         #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
         "futex-stats"           => op_futex_stats(out),
         #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
@@ -486,13 +487,21 @@ fn op_proc_list(out: &mut String) {
         }
     };
 
-    let mut tmap: alloc::collections::BTreeMap<u64, u64> = alloc::collections::BTreeMap::new();
+    // tmap: per-PID (thread0_tid, entry_rip) so we can also resolve the
+    // *current* sampled user RIP for thread0 below.  The "rip" key in the
+    // response now reports the live user RIP from proc::sample (data source
+    // for diagnosing userspace plateaux — see PSE memory on post-#287/#288/
+    // #289 JIT plateau, which misread the frozen entry_rip as "current"),
+    // while "entry_rip" preserves the historical value for callers that
+    // want the immutable trampoline entry.
+    let mut tmap: alloc::collections::BTreeMap<u64, (u64, u64)> =
+        alloc::collections::BTreeMap::new();
     let thread_table_busy = match try_lock_brief(&THREAD_TABLE) {
         Some(tt) => {
             for r in &rows {
                 if let Some(tid) = r.thread0 {
                     if let Some(t) = tt.iter().find(|t| t.tid == tid) {
-                        tmap.insert(r.pid, t.user_entry_rip);
+                        tmap.insert(r.pid, (tid, t.user_entry_rip));
                     }
                 }
             }
@@ -524,8 +533,18 @@ fn op_proc_list(out: &mut String) {
         j_kv_str(out, "state", r.state);
         j_kv_str(out, "name", &r.name);
         j_kv(out, "threads", &alloc::format!("{}", r.num_threads));
-        let rip = tmap.get(&r.pid).copied().unwrap_or(0);
-        j_str(out, "rip"); out.push(':'); j_hex(out, rip); out.push(',');
+        let (thread0_tid, entry_rip) = tmap.get(&r.pid).copied().unwrap_or((0, 0));
+        // `rip` reports the live user RIP from the per-tick sampler when
+        // available, falling back to entry_rip so the key is never absent
+        // for callers that already parse it.  `entry_rip` and `tid0` are
+        // additive companions so old behaviour can be reconstructed.
+        let live_rip = crate::proc::sample::read_user_rip(thread0_tid)
+            .map(|(rip, _, _)| rip)
+            .filter(|r| *r != 0)
+            .unwrap_or(entry_rip);
+        j_str(out, "rip"); out.push(':'); j_hex(out, live_rip); out.push(',');
+        j_str(out, "entry_rip"); out.push(':'); j_hex(out, entry_rip); out.push(',');
+        j_kv(out, "tid0", &alloc::format!("{}", thread0_tid));
         j_kv(out, "pf_count", "0");
         j_trim_comma(out);
         out.push('}');
@@ -585,13 +604,17 @@ fn op_proc(req: &str, out: &mut String) {
         }
     };
 
-    // Stage 2: per-thread data under a different lock.
-    struct TR { tid: u64, state: &'static str, rip: u64, rsp: u64 }
+    // Stage 2: per-thread data under a different lock.  `entry_rip` is
+    // the immutable trampoline entry RIP from thread creation; the live
+    // `rip` field below is populated post-lock from proc::sample so a
+    // long-running thread reports where it is actually parked in
+    // userspace right now (cf. PSE memory on JIT-plateau misread).
+    struct TR { tid: u64, state: &'static str, entry_rip: u64, rsp: u64 }
     let trs: Vec<TR> = match try_lock_brief(&THREAD_TABLE) {
         Some(tt) => snap.threads.iter()
             .filter_map(|tid| tt.iter().find(|t| t.tid == *tid).map(|t| TR {
                 tid: t.tid, state: thread_state_str(t.state),
-                rip: t.user_entry_rip, rsp: t.context.rsp,
+                entry_rip: t.user_entry_rip, rsp: t.context.rsp,
             })).collect(),
         None => Vec::new(), // Lock contended — emit threads array empty.
     };
@@ -612,7 +635,14 @@ fn op_proc(req: &str, out: &mut String) {
         out.push('{');
         j_kv(out, "tid", &alloc::format!("{}", t.tid));
         j_kv_str(out, "state", t.state);
-        j_str(out, "rip"); out.push(':'); j_hex(out, t.rip); out.push(',');
+        // Live user RIP/RBP if the sampler has observed this TID in
+        // Ring 3; falls back to entry_rip so `rip` is never null.
+        let (live_rip, live_rbp) = crate::proc::sample::read_user_rip(t.tid)
+            .map(|(r, b, _)| (if r != 0 { r } else { t.entry_rip }, b))
+            .unwrap_or((t.entry_rip, 0));
+        j_str(out, "rip"); out.push(':'); j_hex(out, live_rip); out.push(',');
+        j_str(out, "entry_rip"); out.push(':'); j_hex(out, t.entry_rip); out.push(',');
+        j_str(out, "rbp"); out.push(':'); j_hex(out, live_rbp); out.push(',');
         j_str(out, "rsp"); out.push(':'); j_hex(out, t.rsp);
         out.push('}');
     }
@@ -1886,7 +1916,7 @@ fn op_thread_park_audit(req: &str, out: &mut String) {
     // ── Stage 1: snapshot all live threads of interest ─────────────────
     struct ThreadSnap {
         tid: u64, pid: u64, name: String,
-        state: &'static str, rip: u64, rsp: u64,
+        state: &'static str, entry_rip: u64, rsp: u64,
         wake_tick: u64, clear_child_tid: u64,
         vfork_parent_tid: Option<u64>,
     }
@@ -1901,7 +1931,7 @@ fn op_thread_park_audit(req: &str, out: &mut String) {
                     String::from_utf8_lossy(&t.name[..end]).into_owned()
                 },
                 state: thread_state_str(t.state),
-                rip: t.user_entry_rip, rsp: t.context.rsp,
+                entry_rip: t.user_entry_rip, rsp: t.context.rsp,
                 wake_tick: t.wake_tick,
                 clear_child_tid: t.clear_child_tid,
                 vfork_parent_tid: t.vfork_parent_tid,
@@ -2001,11 +2031,10 @@ fn op_thread_park_audit(req: &str, out: &mut String) {
             emitted += 1;
         }
 
-        // Per-thread sample lookup (firefox-test only).
-        #[cfg(feature = "firefox-test")]
+        // Per-thread sample lookup.  Returns `None` when the writer (gated
+        // behind `firefox-test`) has never fired; the downstream
+        // classifier is correct under either case.
         let sample = crate::proc::sample::read_sample(ts.tid);
-        #[cfg(not(feature = "firefox-test"))]
-        let sample: Option<crate::proc::sample::TidSyscallSample> = None;
 
         // Resolve owning process name (lookup in proc_snaps).
         let proc_name = proc_snaps.iter().find(|(p, _, _)| *p == ts.pid)
@@ -2017,6 +2046,14 @@ fn op_thread_park_audit(req: &str, out: &mut String) {
             None => (None, None, 0u64),
         };
 
+        // Live user RIP/RBP from per-tick sampler.  Falls back to
+        // entry_rip so the `rip` key is never null for callers that
+        // already parse it.
+        let (live_rip, live_rbp) = match &sample {
+            Some(s) if s.last_user_rip != 0 => (s.last_user_rip, s.last_user_rbp),
+            _ => (ts.entry_rip, 0u64),
+        };
+
         // ── JSON emission (budget-gated) ─────────────────────────────
         if in_budget {
             out.push('{');
@@ -2025,7 +2062,9 @@ fn op_thread_park_audit(req: &str, out: &mut String) {
             j_kv_str(out, "proc_name", proc_name);
             j_kv_str(out, "thread_name", &ts.name);
             j_kv_str(out, "state", ts.state);
-            j_str(out, "rip"); out.push(':'); j_hex(out, ts.rip); out.push(',');
+            j_str(out, "rip"); out.push(':'); j_hex(out, live_rip); out.push(',');
+            j_str(out, "entry_rip"); out.push(':'); j_hex(out, ts.entry_rip); out.push(',');
+            j_str(out, "rbp"); out.push(':'); j_hex(out, live_rbp); out.push(',');
             j_str(out, "rsp"); out.push(':'); j_hex(out, ts.rsp); out.push(',');
             let _ = write!(out, r#""wake_tick":{},"#, ts.wake_tick);
             let _ = write!(out, r#""blocked_for_ticks":{},"#, blocked_for);
@@ -2069,9 +2108,10 @@ fn op_thread_park_audit(req: &str, out: &mut String) {
                             &tid_to_futex, &proc_snaps, &sock_snaps);
         crate::serial_println!(
             "[THREAD-PARK] id={} tid={} pid={} pname={} tname={} state={} \
-             rip={:#x} rsp={:#x} wake_tick={} blocked_for={} sc_nr={} sc_arg0={:#x} {}",
+             rip={:#x} entry_rip={:#x} rsp={:#x} wake_tick={} blocked_for={} \
+             sc_nr={} sc_arg0={:#x} {}",
             audit_id, ts.tid, ts.pid, proc_name, ts.name, ts.state,
-            ts.rip, ts.rsp, ts.wake_tick, blocked_for, sn, sa0, wait_buf,
+            live_rip, ts.entry_rip, ts.rsp, ts.wake_tick, blocked_for, sn, sa0, wait_buf,
         );
     }
     crate::serial_println!("[THREAD-PARK] END audit_id={} emitted_json={} threads_total={}",
@@ -2337,6 +2377,233 @@ fn render_wait_compact(
     if clear_child_tid != 0 {
         let _ = write!(out, ",clear_child_tid={:#x}", clear_child_tid);
     }
+}
+
+// ── rip-trace ────────────────────────────────────────────────────────────────
+//
+// Userspace RIP sampler for one TID over a fixed time window.  Polls the
+// per-TID `proc::sample` slot every kernel tick (~10 ms at the 100 Hz
+// scheduler cadence) for the requested wall-clock window, walks the
+// user-mode frame-pointer chain on each fresh sample, and returns a
+// top-N histogram of RIPs and unique RBP-chain prefixes.
+//
+// Motivation: kdb `proc-list` / `proc` / `thread-park-audit` emit the
+// frozen `user_entry_rip` (set once at thread creation), which is
+// misleading for diagnosing userspace plateaux — a long-running thread
+// looks parked at ld.so's trampoline forever even when it is actively
+// looping inside libxul.  This op samples the *current* user RIP across
+// the window so the host can decide which library / function is
+// responsible without an external profiler.
+//
+// Request shape:
+//   { "op": "rip-trace", "tid": N, "ms": N }
+//
+// Response shape:
+//   { "tid": N, "pid": N, "ms_requested": N, "samples": N,
+//     "errors": { "rbp_fault": N, "no_sample": N, "torn_read": N },
+//     "top_rips": [ { "rip": "0x...", "count": N, "page": "0x..." }, ... ],
+//     "top_rbp_chains":
+//        [ { "chain": ["0x..", "0x..", "0x.."], "count": N }, ... ] }
+//
+// The op MUST NOT pause or freeze the target TID — it is purely
+// observational.  It is also bounded in cost: the histogram tables are
+// fixed-capacity and trimmed before emit, and the sample loop yields
+// one tick per iteration via `proc::sleep_ticks(1)` (the same cadence
+// the kdb pump thread itself uses between TCP polls).
+//
+// Page-table walks of foreign user memory use the target process's
+// CR3 (loaded once at op entry) via the same software-walk path as
+// `proc::sample::maybe_sample` — see Intel SDM Vol 3A §4.5 for the
+// 4-level paging walk and §8.2.3 for the same-cache-line TSO guarantee
+// that lets us read RIP/RBP/seq from the slot without locking.
+const RIP_TRACE_MAX_MS: u64 = 5_000;
+const RIP_TRACE_TOP_N: usize = 5;
+const RIP_TRACE_RBP_MAX_FRAMES: usize = 10;
+
+fn op_rip_trace(req: &str, out: &mut String) {
+    use core::fmt::Write;
+
+    let tid = match extract_field(req, "tid").and_then(|s| parse_u64(&s)) {
+        Some(t) if t != 0 => t,
+        _ => { out.push_str(r#"{"error":"missing or invalid 'tid'"}"#); return; }
+    };
+    let ms = extract_field(req, "ms")
+        .and_then(|s| parse_u64(&s))
+        .unwrap_or(1000);
+    let ms = ms.clamp(1, RIP_TRACE_MAX_MS);
+
+    // Resolve the owning PID and its CR3 up front.  If the thread is
+    // gone by the time we ask, return a deterministic error rather
+    // than silently producing an empty histogram.
+    let pid = {
+        let threads = match try_lock_brief(&THREAD_TABLE) {
+            Some(g) => g,
+            None => { out.push_str(r#"{"busy":"THREAD_TABLE held"}"#); return; }
+        };
+        match threads.iter().find(|t| t.tid == tid) {
+            Some(t) => t.pid,
+            None => {
+                let _ = write!(out,
+                    r#"{{"error":"tid {} not found"}}"#, tid);
+                return;
+            }
+        }
+    };
+    let cr3 = match crate::proc::get_process_cr3(pid) {
+        Some(c) => c,
+        None => {
+            let _ = write!(out, r#"{{"error":"pid {} has no cr3"}}"#, pid);
+            return;
+        }
+    };
+
+    // ── Sampling loop ───────────────────────────────────────────────
+    //
+    // Each iteration: sleep 1 tick, then read the slot's (rip, rbp,
+    // seq) triple.  Only count a sample if `seq` advanced since the
+    // previous observation — otherwise the kernel hasn't produced a
+    // new Ring-3 tick for this TID (either the thread was off-CPU or
+    // in kernel mode the whole interval) and we'd otherwise inflate
+    // the histogram by repeating the same RIP.
+    let ticks_to_run = (ms.saturating_add(9) / 10).max(1);  // 10 ms/tick
+    let mut last_seq: u64 = 0;
+    let mut samples: u64 = 0;
+    let mut errors_no_sample: u64 = 0;
+    let mut errors_rbp_fault: u64 = 0;
+    // `errors_torn_read` is reserved for future extension when the
+    // sampler exposes a "writer was mid-update" channel; today
+    // `read_user_rip` collapses that case to None and we count it as
+    // a no_sample tick.  Emitted as 0 to keep the JSON schema stable
+    // for future-proofed callers.
+    let errors_torn_read: u64 = 0;
+
+    // Small bounded histograms.  RIP buckets keyed by full RIP (we
+    // don't bucket by page here because the response includes the
+    // page for the caller anyway).  RBP chain keyed by tuple-encoded
+    // string (cheap; max RIP_TRACE_RBP_MAX_FRAMES frames).
+    let mut rip_hist: alloc::collections::BTreeMap<u64, u64> =
+        alloc::collections::BTreeMap::new();
+    let mut chain_hist:
+        alloc::collections::BTreeMap<alloc::vec::Vec<u64>, u64> =
+        alloc::collections::BTreeMap::new();
+
+    for _ in 0..ticks_to_run {
+        crate::proc::sleep_ticks(1);
+        match crate::proc::sample::read_user_rip(tid) {
+            None => { errors_no_sample += 1; }
+            Some((_, _, seq)) if seq == last_seq => {
+                // Same observation as last iteration — TID didn't run
+                // in Ring 3 during this tick (kernel-bound, off-CPU,
+                // or terminated).  Don't double-count.
+                errors_no_sample += 1;
+            }
+            Some((rip, rbp, seq)) => {
+                if rip == 0 {
+                    // Slot owned by `tid` but the sampler has never
+                    // observed a non-zero Ring-3 RIP — treat as a
+                    // no-sample tick.
+                    errors_no_sample += 1;
+                    last_seq = seq;
+                    continue;
+                }
+                last_seq = seq;
+                samples += 1;
+                *rip_hist.entry(rip).or_insert(0) += 1;
+
+                // Walk the user RBP chain via the foreign CR3.  All
+                // reads are software page-table walks under
+                // `proc::sample::read_user_u64_at` — they cannot
+                // fault.  Stop on the first unmapped slot, on a non-
+                // ascending RBP (cycle / descent guard), on kernel-
+                // half pointers, or on the depth cap.  Record at
+                // least the head RIP even if the chain immediately
+                // terminates so the caller can still see the
+                // sampling distribution.
+                let mut chain: alloc::vec::Vec<u64> =
+                    alloc::vec::Vec::with_capacity(RIP_TRACE_RBP_MAX_FRAMES);
+                chain.push(rip);
+                let mut cur = rbp;
+                let mut chain_faulted = false;
+                for _ in 1..RIP_TRACE_RBP_MAX_FRAMES {
+                    if cur == 0 || cur < 0x1000 { break; }
+                    if cur >= astryx_shared::KERNEL_VIRT_BASE { break; }
+                    if cur & 0x7 != 0 { break; }
+                    let saved_rbp = match
+                        crate::proc::sample::read_user_u64_at(cr3, cur)
+                    {
+                        Some(v) => v,
+                        None => { chain_faulted = true; break; }
+                    };
+                    let saved_rip = match
+                        crate::proc::sample::read_user_u64_at(cr3, cur.wrapping_add(8))
+                    {
+                        Some(v) => v,
+                        None => { chain_faulted = true; break; }
+                    };
+                    chain.push(saved_rip);
+                    if saved_rbp <= cur { break; }
+                    cur = saved_rbp;
+                }
+                if chain_faulted { errors_rbp_fault += 1; }
+                *chain_hist.entry(chain).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // ── Rank top-N RIPs and chains ───────────────────────────────────
+    let mut rip_vec: alloc::vec::Vec<(u64, u64)> =
+        rip_hist.into_iter().map(|(k, v)| (k, v)).collect();
+    rip_vec.sort_by(|a, b| b.1.cmp(&a.1));
+    rip_vec.truncate(RIP_TRACE_TOP_N);
+
+    let mut chain_vec: alloc::vec::Vec<(alloc::vec::Vec<u64>, u64)> =
+        chain_hist.into_iter().collect();
+    chain_vec.sort_by(|a, b| b.1.cmp(&a.1));
+    chain_vec.truncate(RIP_TRACE_TOP_N);
+
+    // ── Emit response JSON ───────────────────────────────────────────
+    out.push('{');
+    let _ = write!(out, r#""tid":{},"pid":{},"ms_requested":{},"#, tid, pid, ms);
+    let _ = write!(out, r#""ticks_polled":{},"samples":{},"#, ticks_to_run, samples);
+    out.push_str(r#""errors":{"#);
+    let _ = write!(out, r#""rbp_fault":{},"no_sample":{},"torn_read":{}"#,
+                   errors_rbp_fault, errors_no_sample, errors_torn_read);
+    out.push_str("},");
+    out.push_str(r#""top_rips":["#);
+    for (i, (rip, count)) in rip_vec.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        out.push('{');
+        j_str(out, "rip"); out.push(':'); j_hex(out, *rip); out.push(',');
+        let _ = write!(out, r#""count":{},"#, count);
+        j_str(out, "page"); out.push(':'); j_hex(out, *rip & !0xFFFu64);
+        out.push('}');
+    }
+    out.push_str("],");
+    out.push_str(r#""top_rbp_chains":["#);
+    for (i, (chain, count)) in chain_vec.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        out.push('{');
+        out.push_str(r#""chain":["#);
+        for (j, addr) in chain.iter().enumerate() {
+            if j > 0 { out.push(','); }
+            j_hex(out, *addr);
+        }
+        out.push_str("],");
+        let _ = write!(out, r#""count":{}"#, count);
+        out.push('}');
+    }
+    out.push_str("]}");
+
+    // Mirror a one-line summary to serial so the harness has a
+    // fallback path even if the JSON arm is truncated.
+    crate::serial_println!(
+        "[RIP-TRACE] tid={} pid={} cr3={:#x} ms={} samples={} no_sample={} \
+         rbp_fault={} top_rip={:#x} top_rip_count={}",
+        tid, pid, cr3, ms, samples,
+        errors_no_sample, errors_rbp_fault,
+        rip_vec.first().map(|(r, _)| *r).unwrap_or(0),
+        rip_vec.first().map(|(_, c)| *c).unwrap_or(0),
+    );
 }
 
 // ── futex-ghost-hist ─────────────────────────────────────────────────────────
