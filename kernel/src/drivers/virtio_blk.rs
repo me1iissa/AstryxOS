@@ -85,8 +85,48 @@ const VRING_DESC_F_WRITE: u16 = 2;
 
 // ── Virtio Block Request Types ──────────────────────────────────────────────
 
-const VIRTIO_BLK_T_IN:  u32 = 0; // Read
-const VIRTIO_BLK_T_OUT: u32 = 1; // Write
+const VIRTIO_BLK_T_IN:    u32 = 0; // Read
+const VIRTIO_BLK_T_OUT:   u32 = 1; // Write
+/// Cache flush command (legacy feature bit `VIRTIO_BLK_F_FLUSH` = 9).
+/// A flush request has no data descriptor — just the request header and
+/// the status byte.  See virtio 1.2 §5.2.6 (Device Operation).
+const VIRTIO_BLK_T_FLUSH: u32 = 4;
+
+// ── Virtio Block Feature Bits ───────────────────────────────────────────────
+//
+// Bit numbers per virtio 1.2 §5.2.3 (Feature bits).  Only the legacy
+// transport bits relevant to this driver are listed; modern-only bits
+// (VIRTIO_F_VERSION_1 etc.) are out of scope for the legacy I/O register
+// interface.
+
+/// Disk is read-only.  Writes will fail with status VIRTIO_BLK_S_IOERR;
+/// we reject them locally with `BlockError::IoError` before submitting.
+const VIRTIO_BLK_F_RO:       u32 = 5;
+/// Block size of disk is available in `virtio_blk_config.blk_size`
+/// (offset 0x20 from the device-specific config base).
+const VIRTIO_BLK_F_BLK_SIZE: u32 = 6;
+/// FLUSH command is supported; the device honours `VIRTIO_BLK_T_FLUSH`.
+/// Without this bit the device does not buffer writes and a flush is a
+/// no-op at the virtio layer.
+const VIRTIO_BLK_F_FLUSH:    u32 = 9;
+
+// ── Virtio Block Status Codes ───────────────────────────────────────────────
+// Returned in the status byte at the end of each request chain.  Defined
+// in virtio 1.2 §5.2.6.
+
+#[allow(dead_code)] const VIRTIO_BLK_S_OK:     u8 = 0;
+#[allow(dead_code)] const VIRTIO_BLK_S_IOERR:  u8 = 1;
+#[allow(dead_code)] const VIRTIO_BLK_S_UNSUPP: u8 = 2;
+
+// ── Block Device Config Offsets (Legacy) ────────────────────────────────────
+//
+// Device-specific config starts at +0x14 for legacy virtio-blk.  Offsets
+// here are relative to the start of the device-specific config block
+// (`io_base + 0x14`).  See virtio 1.2 §5.2.4 (Device configuration layout).
+
+/// `virtio_blk_config.blk_size` (u32) — logical block size in bytes.
+/// Valid only when `VIRTIO_BLK_F_BLK_SIZE` was negotiated.
+const VIRTIO_REG_BLK_BLK_SIZE: u16 = 0x14 + 0x14;
 
 // ── Higher-Half Mapping ─────────────────────────────────────────────────────
 
@@ -180,12 +220,35 @@ struct VirtioBlkDevice {
     /// config offset 0x3C).  Used as the IO-APIC GSI for level-triggered
     /// PCI INTx routing.
     pci_irq_line: u8,
+    /// Subset of device features we acknowledged at init time.  Reading
+    /// this back lets the I/O paths check whether `VIRTIO_BLK_T_FLUSH` is
+    /// usable (FLUSH bit set) or whether to short-circuit writes (RO bit
+    /// set).  See virtio 1.2 §5.2.3.
+    negotiated_features: u32,
+    /// Logical block size in bytes — `virtio_blk_config.blk_size` when
+    /// `VIRTIO_BLK_F_BLK_SIZE` was negotiated, otherwise 512 (the legacy
+    /// default per virtio 1.2 §5.2.6, "every request is a multiple of 512
+    /// bytes").
+    blk_size: u32,
 }
 
 /// Global virtio-blk device (if found).
 static VIRTIO_BLK: Mutex<Option<VirtioBlkDevice>> = Mutex::new(None);
 /// Fast check without acquiring the mutex on every block I/O call.
 static VIRTIO_BLK_AVAILABLE: AtomicBool = AtomicBool::new(false);
+/// Lock-free `VIRTIO_BLK_F_FLUSH` flag.  Set at init time if the device
+/// advertised the FLUSH feature bit AND we acknowledged it.  Consulted by
+/// the `flush()` path so a no-flush device returns Ok without entering
+/// the submit machinery (the host backend is effectively write-through).
+static VIRTIO_BLK_FLUSH_SUPPORTED: AtomicBool = AtomicBool::new(false);
+/// Lock-free `VIRTIO_BLK_F_RO` flag.  Set at init time if the device
+/// advertised the RO feature bit.  Reads are still allowed; writes are
+/// rejected with `BlockError::IoError` before any device submission.
+static VIRTIO_BLK_READONLY: AtomicBool = AtomicBool::new(false);
+/// Lock-free cached logical-block size (bytes).  Initialised to 512 and
+/// updated to `blk_size` if `VIRTIO_BLK_F_BLK_SIZE` was negotiated.
+static VIRTIO_BLK_LOGICAL_BLOCK_SIZE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(SECTOR_SIZE as u32);
 
 // ── IRQ-Driven Completion State ─────────────────────────────────────────────
 //
@@ -271,6 +334,10 @@ static TOTAL_IRQS: AtomicU64 = AtomicU64::new(0);
 /// ISR did.  Zero in steady state means IRQ delivery is working as
 /// designed and the schedule() yield happens once per request.
 static POLLED_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Total `VIRTIO_BLK_T_FLUSH` requests submitted (diagnostic).  Bumped
+/// once per `do_flush` call, regardless of completion path.
+static FLUSH_SUBMITTED: AtomicU64 = AtomicU64::new(0);
 
 /// Acquire a free slot via CAS scan; returns `Some(slot_idx)` on success.
 /// Caller must hold the device mutex while submitting against this slot
@@ -379,15 +446,64 @@ pub fn init() -> bool {
             VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER,
         );
 
-        // 4. Read device features, write guest features (accept none for basic I/O).
-        let _features = hal::inl(io_base + VIRTIO_REG_DEVICE_FEATURES);
-        hal::outl(io_base + VIRTIO_REG_GUEST_FEATURES, 0);
+        // 4. Negotiate features.  Virtio 1.2 §3.1.1 spells out the legacy
+        //    handshake: read DEVICE_FEATURES, write back the subset we
+        //    understand into GUEST_FEATURES.  We accept three bits today:
+        //
+        //      VIRTIO_BLK_F_FLUSH    — VIRTIO_BLK_T_FLUSH command is honoured
+        //                              (virtio 1.2 §5.2.3, legacy bit 9).
+        //      VIRTIO_BLK_F_RO       — disk is read-only (bit 5); writes will
+        //                              never succeed regardless of permission.
+        //      VIRTIO_BLK_F_BLK_SIZE — `virtio_blk_config.blk_size` is valid
+        //                              (bit 6); used as the logical block
+        //                              size hint for filesystems.
+        //
+        //    Other useful bits (SIZE_MAX, SEG_MAX, GEOMETRY, TOPOLOGY, MQ,
+        //    DISCARD, WRITE_ZEROES, CONFIG_WCE) are deferred — they are
+        //    optional and not load-bearing for the current single-queue,
+        //    fixed-segment-size pipeline.
+        let device_features = hal::inl(io_base + VIRTIO_REG_DEVICE_FEATURES);
+        let want: u32 = (1u32 << VIRTIO_BLK_F_FLUSH)
+            | (1u32 << VIRTIO_BLK_F_RO)
+            | (1u32 << VIRTIO_BLK_F_BLK_SIZE);
+        let negotiated = device_features & want;
+        hal::outl(io_base + VIRTIO_REG_GUEST_FEATURES, negotiated);
+
+        let flush_ok    = (negotiated & (1u32 << VIRTIO_BLK_F_FLUSH))    != 0;
+        let readonly    = (negotiated & (1u32 << VIRTIO_BLK_F_RO))       != 0;
+        let blk_size_ok = (negotiated & (1u32 << VIRTIO_BLK_F_BLK_SIZE)) != 0;
+        crate::serial_println!(
+            "[VIRTIO-BLK] Features: dev={:#010x} want={:#010x} got={:#010x} (flush={} ro={} blk_size={})",
+            device_features, want, negotiated, flush_ok, readonly, blk_size_ok
+        );
 
         // 5. Read device capacity (sectors).
         let cap_lo = hal::inl(io_base + VIRTIO_REG_BLK_CAPACITY_LO) as u64;
         let cap_hi = hal::inl(io_base + VIRTIO_REG_BLK_CAPACITY_HI) as u64;
         let capacity = (cap_hi << 32) | cap_lo;
         crate::serial_println!("[VIRTIO-BLK] Capacity: {} sectors ({} MiB)", capacity, capacity * 512 / (1024 * 1024));
+
+        // 5b. Read the device's logical block size when supported.  Falls
+        //     back to 512 (the implicit legacy default — every request is a
+        //     multiple of 512 bytes per virtio 1.2 §5.2.6) so the rest of
+        //     the driver and partition-table code keeps working unchanged.
+        let blk_size = if blk_size_ok {
+            let raw = hal::inl(io_base + VIRTIO_REG_BLK_BLK_SIZE);
+            // Sanity-check: must be a power of two, multiple of 512, and
+            // <= 4096 (page-aligned device buffers).  An obviously bogus
+            // value falls back to 512 with a WARN.
+            if raw != 0 && raw <= 4096 && (raw & (raw - 1)) == 0 && (raw % (SECTOR_SIZE as u32)) == 0 {
+                raw
+            } else {
+                crate::serial_println!(
+                    "[VIRTIO-BLK] Ignoring out-of-range blk_size={}; falling back to {}",
+                    raw, SECTOR_SIZE
+                );
+                SECTOR_SIZE as u32
+            }
+        } else {
+            SECTOR_SIZE as u32
+        };
 
         // 6. Set up virtqueue 0.
         hal::outw(io_base + VIRTIO_REG_QUEUE_SELECT, 0);
@@ -453,8 +569,13 @@ pub fn init() -> bool {
             pci_dev: pci_dev.device,
             pci_func: pci_dev.function,
             pci_irq_line: pci_dev.interrupt_line,
+            negotiated_features: negotiated,
+            blk_size,
         });
         publish_irq_snapshot(io_base, queue_size, vq_phys);
+        VIRTIO_BLK_FLUSH_SUPPORTED.store(flush_ok, Ordering::Release);
+        VIRTIO_BLK_READONLY.store(readonly, Ordering::Release);
+        VIRTIO_BLK_LOGICAL_BLOCK_SIZE.store(blk_size, Ordering::Release);
         VIRTIO_BLK_AVAILABLE.store(true, Ordering::Release);
     }
 
@@ -1010,6 +1131,147 @@ fn submit_request(
     }
 }
 
+/// Submit a `VIRTIO_BLK_T_FLUSH` request and ring the device doorbell.
+///
+/// FLUSH has a degenerate two-descriptor chain — header → status, no data
+/// buffer — per virtio 1.2 §5.2.6.2.  We still own three descriptors per
+/// slot, but the middle one (`3*slot + 1`) is unused for flush; we link
+/// the header (`3*slot`) directly to the status (`3*slot + 2`).
+///
+/// The completion path is identical to a read/write: the ISR demuxes by
+/// head descriptor index (`head_id / 3`), the status byte lands in the
+/// same per-slot scratch, and `wait_completion` (or the poll fallback)
+/// observes `status != 0xFF` to detect retirement.
+///
+/// Caller must hold `VIRTIO_BLK.lock()` and have already acquired `slot`.
+fn submit_flush_request(
+    dev: &mut VirtioBlkDevice,
+    slot: usize,
+) -> Result<SubmitOutcome, BlockError> {
+    debug_assert!(slot < MAX_INFLIGHT);
+    let io_base = dev.io_base;
+    let qs = dev.queue_size;
+    let vq_base = phys_to_virt::<u8>(dev.vq_phys);
+
+    // Slot N owns descriptors 3N (header), 3N+1 (unused for flush), 3N+2 (status).
+    let desc0_idx: u16 = (slot as u16) * 3;
+    let desc2_idx: u16 = desc0_idx + 2;
+    let desc_base = vq_base; // descriptor table at offset 0
+    let avail_base = unsafe { vq_base.add(avail_ring_offset(qs)) };
+
+    let header_offset = header_array_offset(qs) + slot * 16;
+    let status_offset = status_array_offset(qs) + slot;
+    let header_virt = unsafe { vq_base.add(header_offset) } as *mut VirtioBlkReqHeader;
+    let status_virt = unsafe { vq_base.add(status_offset) } as *mut u8;
+    let header_phys = dev.vq_phys + header_offset as u64;
+    let status_phys = dev.vq_phys + status_offset as u64;
+
+    // SAFETY: slot allocation gives us exclusive access; the device mutex
+    // serialises descriptor table writes for the duration of submit.
+    unsafe {
+        // VIRTIO_BLK_T_FLUSH request: sector field is reserved (and was
+        // historically the LBA before which to flush; modern devices
+        // ignore it and flush everything).  We zero it both for spec
+        // hygiene and to avoid leaking previous-request data.
+        (*header_virt).type_ = VIRTIO_BLK_T_FLUSH;
+        (*header_virt).reserved = 0;
+        (*header_virt).sector = 0;
+        core::ptr::write_volatile(status_virt, 0xFFu8); // sentinel
+    }
+
+    // Descriptor 3*slot (head): request header (device reads).  Chain
+    // straight to the status descriptor; no intermediate data buffer.
+    let desc0 = unsafe { desc_base.add((desc0_idx as usize) * 16) };
+    // SAFETY: writing within our owned virtqueue page.
+    unsafe {
+        let d0_addr = desc0 as *mut u64;
+        d0_addr.write_volatile(header_phys);
+        let d0_len = desc0.add(8) as *mut u32;
+        d0_len.write_volatile(16); // sizeof(virtio_blk_outhdr) per §5.2.6
+        let d0_flags = desc0.add(12) as *mut u16;
+        d0_flags.write_volatile(VRING_DESC_F_NEXT);
+        let d0_next = desc0.add(14) as *mut u16;
+        d0_next.write_volatile(desc2_idx); // skip 3N+1
+    }
+
+    // Descriptor 3*slot + 2: status byte (device writes).
+    let desc2 = unsafe { desc_base.add((desc2_idx as usize) * 16) };
+    // SAFETY: writing within our owned virtqueue page.
+    unsafe {
+        let d2_addr = desc2 as *mut u64;
+        d2_addr.write_volatile(status_phys);
+        let d2_len = desc2.add(8) as *mut u32;
+        d2_len.write_volatile(1);
+        let d2_flags = desc2.add(12) as *mut u16;
+        d2_flags.write_volatile(VRING_DESC_F_WRITE);
+        let d2_next = desc2.add(14) as *mut u16;
+        d2_next.write_volatile(0);
+    }
+
+    // Pre-arm slot completion state (matches submit_request).
+    let irq_path = IRQS_ARMED.load(Ordering::Acquire) && crate::sched::is_active();
+    COMPLETIONS[slot].done.store(false, Ordering::Release);
+    COMPLETIONS[slot].status.store(0xFF, Ordering::Relaxed);
+    if irq_path {
+        COMPLETIONS[slot]
+            .waiter_tid
+            .store(crate::proc::current_tid(), Ordering::Release);
+    }
+
+    // Publish into the available ring.
+    // SAFETY: writing within our owned virtqueue page.
+    unsafe {
+        let avail_idx_ptr = avail_base.add(2) as *mut u16;
+        let idx = avail_idx_ptr.read_volatile();
+        let ring_entry = avail_base.add(4 + ((idx % qs) as usize) * 2) as *mut u16;
+        ring_entry.write_volatile(desc0_idx);
+        // Make descriptor + ring writes visible before the avail.idx bump.
+        core::sync::atomic::fence(Ordering::SeqCst);
+        avail_idx_ptr.write_volatile(idx.wrapping_add(1));
+    }
+
+    dev.last_used_idx = dev.last_used_idx.wrapping_add(1);
+
+    // Ring the doorbell.
+    // SAFETY: writing the notify register of the discovered virtio-blk PCI
+    // device — same handling as the read/write submit path.
+    unsafe {
+        hal::outw(io_base + VIRTIO_REG_QUEUE_NOTIFY, 0);
+    }
+
+    if irq_path {
+        return Ok(SubmitOutcome::IrqWait { slot });
+    }
+
+    // Poll fallback — same shape as submit_request's poll loop.  Flushes
+    // can take longer than reads (the host must commit cached writes), so
+    // we use a wider budget than the data-path's 10M-iter loop.
+    let mut timeout = 50_000_000u32;
+    let used_idx_ptr = unsafe {
+        (vq_base as *const u8).add(used_ring_offset(qs) + 2) as *const u16
+    };
+    loop {
+        // SAFETY: reading the per-slot status byte in owned VQ memory.
+        let s = unsafe { status_virt.read_volatile() };
+        if s != 0xFF {
+            // SAFETY: reading the device's used.idx in owned VQ memory.
+            let cur_used = unsafe { used_idx_ptr.read_volatile() };
+            IRQ_LAST_USED_IDX.store(cur_used, Ordering::Release);
+            release_slot(slot);
+            if s != 0 {
+                crate::serial_println!("[VIRTIO-BLK] Flush failed: status={}", s);
+                return Err(BlockError::IoError);
+            }
+            return Ok(SubmitOutcome::PollDone);
+        }
+        timeout = timeout.checked_sub(1).ok_or_else(|| {
+            release_slot(slot);
+            BlockError::IoError
+        })?;
+        core::hint::spin_loop();
+    }
+}
+
 /// Diagnostic: number of times we entered wait_completion (one per IRQ-path
 /// request).  Cheap counter for figuring out which step in the IRQ pipeline
 /// is silent during early bring-up.
@@ -1138,9 +1400,29 @@ impl BlockDevice for VirtioBlkBlockDevice {
         if count == 0 {
             return Ok(());
         }
+        // Fail fast on a read-only device.  Per virtio 1.2 §5.2.3 the
+        // device WILL reject the request, but checking locally avoids the
+        // virtqueue round-trip and surfaces the policy uniformly to
+        // every caller — `mkfs` / log writers / FAT32 dirty-flush all see
+        // `IoError` instead of a transport-level success-then-failure.
+        if VIRTIO_BLK_READONLY.load(Ordering::Acquire) {
+            return Err(BlockError::IoError);
+        }
         // SAFETY: We pass a *mut for the submit_request interface but the
         // device only reads from this buffer for T_OUT.
         do_io(VIRTIO_BLK_T_OUT, lba, count, data.as_ptr() as *mut u8)
+    }
+
+    fn flush(&self) -> Result<(), BlockError> {
+        do_flush()
+    }
+
+    fn is_readonly(&self) -> bool {
+        VIRTIO_BLK_READONLY.load(Ordering::Acquire)
+    }
+
+    fn logical_block_size(&self) -> u32 {
+        VIRTIO_BLK_LOGICAL_BLOCK_SIZE.load(Ordering::Acquire)
     }
 }
 
@@ -1268,6 +1550,69 @@ fn do_io(req_type: u32, lba: u64, count: u32, buf: *mut u8) -> Result<(), BlockE
     Ok(())
 }
 
+/// Issue a single `VIRTIO_BLK_T_FLUSH` request and await its completion.
+///
+/// Mirrors the structure of [`do_io`]: acquire a slot, build descriptors
+/// under the device mutex, drop the mutex before waiting.  If the device
+/// did not negotiate `VIRTIO_BLK_F_FLUSH`, returns `Ok(())` immediately —
+/// the host backend is write-through and there is nothing to flush.
+///
+/// Per virtio 1.2 §5.2.6.4: the device may complete the FLUSH request
+/// before all in-flight writes have been retired; durable ordering is
+/// guaranteed only with respect to writes the driver has already received
+/// successful completions for.  Callers should therefore drain their own
+/// outstanding writes before invoking flush(), which is the contract the
+/// BlockDevice trait implies (writes are acknowledged before this method
+/// is called).
+fn do_flush() -> Result<(), BlockError> {
+    if !VIRTIO_BLK_AVAILABLE.load(Ordering::Acquire) {
+        return Err(BlockError::IoError);
+    }
+    if !VIRTIO_BLK_FLUSH_SUPPORTED.load(Ordering::Acquire) {
+        // No-op: device has no write-back cache to drain.  Returning Ok
+        // matches POSIX `fsync` on a tmpfs / write-through volume.
+        return Ok(());
+    }
+    FLUSH_SUBMITTED.fetch_add(1, Ordering::Relaxed);
+
+    // Slot acquisition mirrors do_io — yield to the scheduler if every
+    // slot is currently in flight rather than busy-spinning the CPU.
+    let slot = loop {
+        if let Some(s) = acquire_slot() {
+            break s;
+        }
+        if crate::sched::is_active() {
+            crate::sched::schedule();
+        } else {
+            core::hint::spin_loop();
+        }
+    };
+
+    let outcome = {
+        let mut guard = VIRTIO_BLK.lock();
+        let dev = match guard.as_mut() {
+            Some(d) => d,
+            None => {
+                release_slot(slot);
+                return Err(BlockError::IoError);
+            }
+        };
+        match submit_flush_request(dev, slot) {
+            Ok(o) => o,
+            Err(e) => {
+                drop(guard);
+                release_slot(slot);
+                return Err(e);
+            }
+        }
+    };
+
+    match outcome {
+        SubmitOutcome::IrqWait { slot } => wait_completion(slot),
+        SubmitOutcome::PollDone => Ok(()),
+    }
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /// Quiesce the virtio-blk device on shutdown.
@@ -1291,6 +1636,11 @@ pub fn stop() {
         }
     }
     VIRTIO_BLK_AVAILABLE.store(false, Ordering::Release);
+    // Per virtio 1.2 §4.1.4.1 a reset clears the device's negotiated
+    // feature set.  Mirror that locally so a caller racing in between
+    // `stop()` and `restart_device()` doesn't see stale FLUSH/RO bits.
+    // `restart_device` republishes the cached values from `dev`.
+    VIRTIO_BLK_FLUSH_SUPPORTED.store(false, Ordering::Release);
     crate::serial_println!("[VIRTIO-BLK] stop: done");
 }
 
@@ -1339,8 +1689,13 @@ pub fn restart_device() -> bool {
             dev.io_base + VIRTIO_REG_DEVICE_STATUS,
             VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER,
         );
+        // Re-acknowledge the same feature subset we negotiated at init.
+        // A reset clears the device's negotiated state, but per virtio
+        // 1.2 §3.1.1 the driver must re-write GUEST_FEATURES before
+        // DRIVER_OK; using the cached value keeps `VIRTIO_BLK_T_FLUSH`
+        // available across the Po dry-run shutdown sweep.
         let _features = hal::inl(dev.io_base + VIRTIO_REG_DEVICE_FEATURES);
-        hal::outl(dev.io_base + VIRTIO_REG_GUEST_FEATURES, 0);
+        hal::outl(dev.io_base + VIRTIO_REG_GUEST_FEATURES, dev.negotiated_features);
 
         // Select queue 0 and reconfirm queue size matches.
         hal::outw(dev.io_base + VIRTIO_REG_QUEUE_SELECT, 0);
@@ -1372,11 +1727,20 @@ pub fn restart_device() -> bool {
     let qs_snap = dev.queue_size;
     let vq_phys_snap = dev.vq_phys;
 
+    let flush_supported_snap =
+        (dev.negotiated_features & (1u32 << VIRTIO_BLK_F_FLUSH)) != 0;
+    let readonly_snap =
+        (dev.negotiated_features & (1u32 << VIRTIO_BLK_F_RO)) != 0;
+    let blk_size_snap = dev.blk_size;
+
     drop(guard);
     // Refresh the lock-free ISR snapshot — the device fields have not
     // changed but `IRQ_LAST_USED_IDX` must be reset to 0 to match the
     // post-reset device state.
     publish_irq_snapshot(io_base_snap, qs_snap, vq_phys_snap);
+    VIRTIO_BLK_FLUSH_SUPPORTED.store(flush_supported_snap, Ordering::Release);
+    VIRTIO_BLK_READONLY.store(readonly_snap, Ordering::Release);
+    VIRTIO_BLK_LOGICAL_BLOCK_SIZE.store(blk_size_snap, Ordering::Release);
     VIRTIO_BLK_AVAILABLE.store(true, Ordering::Release);
     crate::serial_println!("[VIRTIO-BLK] restart_device: device re-initialized");
     true
@@ -1390,4 +1754,38 @@ pub fn is_available() -> bool {
 /// Get the disk capacity in sectors (0 if no device).
 pub fn capacity() -> u64 {
     VIRTIO_BLK.lock().as_ref().map_or(0, |d| d.capacity)
+}
+
+/// Returns `true` if `VIRTIO_BLK_F_FLUSH` was negotiated and the device
+/// honours `VIRTIO_BLK_T_FLUSH`.  When `false`, [`do_flush`] returns
+/// `Ok(())` without entering the submit machinery.
+pub fn flush_supported() -> bool {
+    VIRTIO_BLK_FLUSH_SUPPORTED.load(Ordering::Acquire)
+}
+
+/// Returns `true` if the device advertised `VIRTIO_BLK_F_RO`.  The
+/// `BlockDevice::write_sectors` impl rejects writes locally when this
+/// is set, before ringing the doorbell.
+pub fn is_readonly() -> bool {
+    VIRTIO_BLK_READONLY.load(Ordering::Acquire)
+}
+
+/// Logical block size in bytes — `virtio_blk_config.blk_size` if the
+/// `VIRTIO_BLK_F_BLK_SIZE` feature was negotiated, otherwise 512.
+pub fn logical_block_size() -> u32 {
+    VIRTIO_BLK_LOGICAL_BLOCK_SIZE.load(Ordering::Acquire)
+}
+
+/// Diagnostic: total number of `VIRTIO_BLK_T_FLUSH` requests submitted
+/// since boot.  Useful for confirming an `fsync(2)` or `FlushFileBuffers`
+/// call actually reached the device.
+pub fn flush_submitted() -> u64 {
+    FLUSH_SUBMITTED.load(Ordering::Relaxed)
+}
+
+/// Trigger a device flush from outside the BlockDevice trait — used by
+/// the test harness and the kernel-side `sync()` path.  Wraps [`do_flush`]
+/// so callers do not need a `VirtioBlkBlockDevice` handle.
+pub fn flush() -> Result<(), BlockError> {
+    do_flush()
 }
