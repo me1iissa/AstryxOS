@@ -877,12 +877,18 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         "MOZ_ACCELERATED=0",
         "LIBGL_ALWAYS_SOFTWARE=1",
         // The path list covers both Firefox variants:
-        //   glibc: /lib/x86_64-linux-gnu (multiarch glibc tree)
-        //   musl : /usr/lib (Alpine's flat support-lib tree, plus /opt/firefox
-        //          for libxul.so + Mozilla's own .so files)
+        //   glibc: /lib/x86_64-linux-gnu (multiarch glibc tree), /opt/firefox
+        //          for libxul.so + Mozilla's own .so files (in-tree convention)
+        //   musl : /usr/lib (Alpine's flat support-lib tree) + /usr/lib/firefox-esr
+        //          (Alpine canonical Mozilla tree — DT_RUNPATH target baked
+        //          into every Mozilla DSO per readelf -d; see ELF gABI §5.4
+        //          "Shared Object Dependencies" and ld-musl(8) search order)
         // /disk/lib/firefox is a legacy build-firefox.sh path retained for
         // any caller using the in-tree built variant.
-        "LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/usr/lib:/opt/firefox:/disk/lib/firefox",
+        // LD_LIBRARY_PATH precedes DT_RUNPATH in the search order, so listing
+        // /usr/lib/firefox-esr here is a belt-and-braces guard for any
+        // dlopen("libfoo.so") call that lacks RUNPATH propagation.
+        "LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/usr/lib:/usr/lib/firefox-esr:/opt/firefox:/disk/lib/firefox",
         // libfontconfig-interposer.so — defensive FcPatternGetString *out
         // wrapper.  Real libfontconfig (PR #179) leaves *out untouched on
         // FcResultNoMatch per spec; Mozilla's gfxFcPlatformFontList caller
