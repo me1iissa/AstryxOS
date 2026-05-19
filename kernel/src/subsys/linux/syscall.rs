@@ -2361,10 +2361,21 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             vfork_canary_snapshot("pre_block.clone", pid as u32, parent_tid);
                             // Three-channel snapshot + open the sibling-syscall
                             // window.  Diagnostic-only; see `vfork_diag.rs`.
+                            // Axis-N+1 widened diagnostic: SSP-epilogue scan
+                            // (Method 1) + full-stack-VMA per-page CRC
+                            // (Method 2) + canary-slot DR arm (Method 3).
+                            // System V x86_64 psABI §6.4, Intel SDM Vol. 3B
+                            // §17.2.4 / §17.2.5.
                             #[cfg(feature = "vfork-canary-diag")]
                             {
                                 crate::subsys::linux::vfork_diag::snapshot_canaries(
                                     "PRE", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::ssp_epilogue_scan(
+                                    "PRE", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::full_stack_vma_provenance(
+                                    "PRE", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::arm_canary_watch_if_located(
+                                    pid, parent_tid);
                                 crate::subsys::linux::vfork_diag::enter_vfork_window(
                                     pid, parent_tid);
                             }
@@ -2390,12 +2401,17 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                 crate::subsys::linux::elf_write_trace::exit_window(
                                     pid, parent_tid, parent_cr3);
                             }
-                            // VFORK/CANARY post-wake snapshot.
+                            // VFORK/CANARY post-wake snapshot + Method 1/2 POST.
                             #[cfg(feature = "vfork-canary-diag")]
                             {
                                 crate::subsys::linux::vfork_diag::exit_vfork_window();
                                 crate::subsys::linux::vfork_diag::snapshot_canaries(
                                     "POST", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::ssp_epilogue_scan(
+                                    "POST", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::full_stack_vma_provenance(
+                                    "POST", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::reset_canary_target();
                             }
                             vfork_canary_snapshot("post_wake.clone", pid as u32, parent_tid);
                         }
@@ -3248,10 +3264,18 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             vfork_canary_snapshot("pre_block.clone3", pid as u32, parent_tid);
                             // Three-channel snapshot + open the sibling-syscall
                             // window.  Diagnostic-only; see `vfork_diag.rs`.
+                            // Axis-N+1 widened diagnostic — see clone (56) for
+                            // the rationale; clone3(2) sibling.
                             #[cfg(feature = "vfork-canary-diag")]
                             {
                                 crate::subsys::linux::vfork_diag::snapshot_canaries(
                                     "PRE", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::ssp_epilogue_scan(
+                                    "PRE", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::full_stack_vma_provenance(
+                                    "PRE", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::arm_canary_watch_if_located(
+                                    pid, parent_tid);
                                 crate::subsys::linux::vfork_diag::enter_vfork_window(
                                     pid, parent_tid);
                             }
@@ -3270,12 +3294,17 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                 crate::subsys::linux::elf_write_trace::exit_window(
                                     pid, parent_tid, parent_cr3);
                             }
-                            // VFORK/CANARY post-wake snapshot.
+                            // VFORK/CANARY post-wake snapshot + Method 1/2 POST.
                             #[cfg(feature = "vfork-canary-diag")]
                             {
                                 crate::subsys::linux::vfork_diag::exit_vfork_window();
                                 crate::subsys::linux::vfork_diag::snapshot_canaries(
                                     "POST", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::ssp_epilogue_scan(
+                                    "POST", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::full_stack_vma_provenance(
+                                    "POST", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::reset_canary_target();
                             }
                             vfork_canary_snapshot("post_wake.clone3", pid as u32, parent_tid);
                         }
