@@ -75,6 +75,17 @@ CI / multi-trial aggregation:
                                                     [--tracking T] [--regex]
     python3 scripts/qemu-harness.py allowlist remove --name N
     python3 scripts/qemu-harness.py allowlist check --serial-log PATH
+
+ABI-conformance reference (delegates to scripts/strace-ref.py):
+    python3 scripts/qemu-harness.py strace-ref setup [--bootstrap]
+    python3 scripts/qemu-harness.py strace-ref capture [--label N]
+                                                       [--binary-args ARGS]
+                                                       [--syscall-filter F]
+                                                       [--timeout SEC]
+    python3 scripts/qemu-harness.py strace-ref diff --linux-trace P
+                                                    --astryx-log P [--verbose]
+    python3 scripts/qemu-harness.py strace-ref list
+    python3 scripts/qemu-harness.py strace-ref clean [--label STR]
 """
 
 import argparse
@@ -1225,6 +1236,44 @@ def _regen_data_img(root_dir: Path) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+
+def cmd_strace_ref(args):
+    """
+    Front-end for scripts/strace-ref.py — Linux reference strace captures.
+
+    Runs the AstryxOS-shipped musl firefox-esr binary under a real Linux
+    kernel (the host) inside a bubblewrap sandbox, captures strace output,
+    and compares against AstryxOS serial logs.  Use for ABI-conformance
+    diffing when an AstryxOS wedge could be either a kernel ABI bug or a
+    quirk of Mozilla's userspace.
+
+    Subcommands (forwarded to strace-ref.py):
+      setup [--bootstrap]
+        Verify (or bootstrap) the Alpine reference rootfs.
+
+      capture [--label NAME] [--binary-args ARGS] [--syscall-filter FILT]
+              [--timeout SEC] [--output PATH]
+        Run firefox-esr under strace; trace saved to
+        ~/.astryx-harness/strace-ref/captures/<label>.trace.
+
+      diff --linux-trace PATH --astryx-log PATH [--verbose]
+        Compare a captured Linux trace against an AstryxOS serial log;
+        JSON summary with by-op histogram and wedge-class notes.
+
+      list                 Show captured traces.
+      clean [--label STR]  Remove captures.
+
+    See the strace-ref.py docstring for full details.
+    """
+    import subprocess as _sp
+    helper = Path(__file__).parent / "strace-ref.py"
+    if not helper.exists():
+        _out({"ok": False, "error": f"strace-ref.py not found at {helper}"})
+        return 1
+    cmd = [sys.executable, str(helper)] + (args.strace_ref_args or [])
+    result = _sp.run(cmd)
+    return result.returncode
+
 
 def cmd_context(args):
     """
@@ -8377,6 +8426,20 @@ def main():
         help="Subcommand + arguments forwarded to agent-context.py",
     )
 
+    # strace-ref — Linux reference strace captures (delegates to strace-ref.py)
+    p_sref = sub.add_parser(
+        "strace-ref",
+        help="Linux reference strace captures for ABI conformance.  Runs the "
+             "same musl firefox-esr binary under the host Linux kernel inside "
+             "bwrap; captures strace, diffs against AstryxOS serial logs.  "
+             "Subcommands: setup | capture | diff | list | clean.  All "
+             "arguments are forwarded verbatim to scripts/strace-ref.py.",
+    )
+    p_sref.add_argument(
+        "strace_ref_args", nargs=argparse.REMAINDER,
+        help="Subcommand + arguments forwarded to strace-ref.py",
+    )
+
     # _watch: private subcommand used internally by `start` to run the
     # background watcher in a detached process. Not shown in help.
     p_watch = sub.add_parser("_watch")
@@ -8444,6 +8507,8 @@ def main():
         "read-png": cmd_read_png,
         # Shared session context
         "context": cmd_context,
+        # Linux reference strace (ABI conformance)
+        "strace-ref": cmd_strace_ref,
         "_watch":  cmd_run_watcher,
     }
     rc = dispatch[args.cmd](args)
