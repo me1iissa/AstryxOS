@@ -196,16 +196,25 @@ pub fn snapshot_canaries(label: &str, parent_pid: u64, parent_tid: u64) {
 
     // ── Channel 1: parent saved-canary [rbp-8] ────────────────────────────────
     //
-    // `get_user_rsp_rbp` returns the (user_rsp, user_rbp) pair saved on this
-    // CPU's syscall frame at entry.  user_rbp at this point is the libc
-    // syscall wrapper's frame pointer; the wrapper's prologue did `push rbp;
-    // mov rbp, rsp`, so `*(user_rbp) = saved_RBP_of_caller`.  The caller is
-    // typically the libxul function that issued the spawn — and ITS `[rbp-8]`
-    // slot (= `*(user_rbp) - 8`) is the SSP slot the epilogue will compare
-    // against `fs:0x28`.  We dump BOTH the wrapper-frame `[rbp-8]` and the
-    // caller-frame `[rbp-8]` so the post-processor can pick whichever frame
-    // the SSP-instrumented function actually owns.
-    let (user_rsp, user_rbp) = crate::syscall::get_user_rsp_rbp();
+    // Resolve (user_rsp, user_rbp) from the parent thread's saved syscall
+    // frame at the top of its kernel stack — NOT from the per-CPU
+    // `frame_rsp` slot, which is overwritten by every subsequent syscall
+    // on that CPU (so by the time the POST snapshot runs after
+    // `schedule()` the slot may belong to an unrelated sibling syscall).
+    // Per `syscall_entry`'s save layout, the user_rsp slot is at
+    // `kstack_top - 8` and user_rbp is at `kstack_top - 32`; both are
+    // stable across pre-block and post-wake because the scheduler does
+    // not modify the saved syscall frame.
+    //
+    // user_rbp at this point is the libc syscall wrapper's frame
+    // pointer; the wrapper's prologue did `push rbp; mov rbp, rsp`, so
+    // `*(user_rbp) = saved_RBP_of_caller`.  The caller is typically the
+    // libxul function that issued the spawn — and ITS `[rbp-8]` slot
+    // (= `*(user_rbp) - 8`) is the SSP slot the epilogue will compare
+    // against `fs:0x28`.  We dump BOTH the wrapper-frame `[rbp-8]` and
+    // the caller-frame `[rbp-8]` so the post-processor can pick whichever
+    // frame the SSP-instrumented function actually owns.
+    let (user_rsp, user_rbp) = get_parent_user_rsp_rbp(parent_tid);
     if user_rbp == 0 {
         crate::serial_println!(
             "[VFORK-CANARY-{}] pid={} tid={} state=no_user_frame rsp={:#x}",
@@ -219,7 +228,7 @@ pub fn snapshot_canaries(label: &str, parent_pid: u64, parent_tid: u64) {
     let (wrap_val_str, wrap_phys_str) = read_userland_qword(wrap_canary_addr);
 
     // Walk one frame up: saved_caller_rbp = *(user_rbp).
-    let caller_rbp_opt = read_userland_qword_raw(user_rbp);
+    let caller_rbp_opt = read_userland_qword_raw(user_rbp).map(|(v, _phys)| v);
     let (caller_rbp_str, caller_canary_addr_str,
          caller_val_str, caller_phys_str) = match caller_rbp_opt {
         Some(0) | None => (
@@ -254,8 +263,24 @@ pub fn snapshot_canaries(label: &str, parent_pid: u64, parent_tid: u64) {
 /// Read a userland u64 + resolve its physical address.  Returns
 /// `("?", "?")` if the address is unmapped / non-canonical.
 ///
-/// Both halves go through `validate_user_ptr` and `virt_to_phys_in` so that
-/// a corrupt RBP chain cannot fault the snapshot helper.
+/// **Fault-immune**: the actual read goes through the kernel direct
+/// physical map (`PHYS_OFF + phys`), NOT through the user virtual
+/// address.  This eliminates the failure mode where a corrupt RBP chain
+/// points at a user VA that passes `validate_user_ptr` (in-range,
+/// aligned) but whose page is not present — a STAC-bracketed user-VA
+/// deref in that case faults inside the kernel with no `__ex_table`
+/// recovery and panics the box with KERNEL_PAGE_FAULT (CR2 = the bad
+/// user VA), defeating the diagnostic.
+///
+/// Mirrors the `fletcher32_user_page` pattern already in this module:
+/// resolve `va -> phys` under the caller's CR3, then read the value at
+/// `PHYS_OFF + phys + (va & 0xFFF)` — a kernel-VA read that never
+/// faults on a not-present user PTE.  Per Intel SDM Vol. 3A §4.6
+/// (paging) the virt→phys walker checks the present bit at every
+/// level, so a not-present leaf simply returns `None`.
+///
+/// No SMAP bracket needed: the load is through the kernel direct map,
+/// not a user VA, so `AC=0` is the correct EFLAGS state.
 fn read_userland_qword(addr: u64) -> (alloc::string::String, alloc::string::String) {
     if !crate::syscall::validate_user_ptr(addr, 8) {
         return (
@@ -263,25 +288,48 @@ fn read_userland_qword(addr: u64) -> (alloc::string::String, alloc::string::Stri
             alloc::string::String::from("?"),
         );
     }
-    let cr3 = crate::mm::vmm::get_cr3();
-    let phys_str = match crate::mm::vmm::virt_to_phys_in(cr3, addr) {
-        Some(p) => alloc::format!("{:#x}", p),
-        None => alloc::string::String::from("?"),
-    };
-    let val_str = match unsafe { crate::syscall::user_read_u64(addr) } {
-        Some(v) => alloc::format!("{:#x}", v),
-        None => alloc::string::String::from("?"),
-    };
-    (val_str, phys_str)
+    match read_userland_qword_raw(addr) {
+        Some((val, phys)) => (
+            alloc::format!("{:#x}", val),
+            alloc::format!("{:#x}", phys),
+        ),
+        None => (
+            alloc::string::String::from("?"),
+            alloc::string::String::from("?"),
+        ),
+    }
 }
 
-/// Same as `read_userland_qword` but returns the raw value if successful, so
-/// the caller can do arithmetic on it (used for the saved-RBP chain walk).
-fn read_userland_qword_raw(addr: u64) -> Option<u64> {
+/// Fault-immune raw read.  Returns `Some((value, phys))` if the user
+/// page is present under the current CR3, `None` otherwise.  Read goes
+/// through the kernel direct physical map — see `read_userland_qword`
+/// for the rationale.
+///
+/// 8-byte qword reads only — splitting across a page boundary returns
+/// `None`.  Per Intel SDM Vol. 3A §4.6: a single-byte access can never
+/// span a page boundary, and an 8-byte access spans only when the low
+/// 12 bits of the base address exceed `0x1000 - 8`.  The vfork-canary
+/// slots in libxul prologues are 8-byte-aligned (System V AMD64 ABI
+/// §3.4.5.2), so the cross-page case here is a corruption signal worth
+/// reporting as "?" rather than silently stitching two phys reads.
+fn read_userland_qword_raw(addr: u64) -> Option<(u64, u64)> {
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
     if !crate::syscall::validate_user_ptr(addr, 8) {
         return None;
     }
-    unsafe { crate::syscall::user_read_u64(addr) }
+    // Reject reads that straddle a 4 KiB boundary — see docstring.
+    if (addr & 0xFFF) > 0x1000 - 8 {
+        return None;
+    }
+    let cr3 = crate::mm::vmm::get_cr3();
+    let phys = crate::mm::vmm::virt_to_phys_in(cr3, addr)?;
+    // Read from the kernel direct map — never faults on a not-present
+    // *user* PTE, because the read VA itself is a kernel VA whose phys
+    // backing we just confirmed.
+    let val = unsafe {
+        core::ptr::read_volatile((PHYS_OFF + phys) as *const u64)
+    };
+    Some((val, phys))
 }
 
 // ─── Helper: per-thread (user_rsp, user_rbp) from saved syscall frame ────────
@@ -402,7 +450,7 @@ pub fn snapshot_stack_canary_walk(label: &str, parent_pid: u64, parent_tid: u64)
         }
 
         let saved_rbp = match read_userland_qword_raw(rbp) {
-            Some(v) => v,
+            Some((v, _phys)) => v,
             None => {
                 crate::serial_println!(
                     "[STACK-CANARY-WALK] {} pid={} tid={} frame_idx={} \
@@ -412,8 +460,11 @@ pub fn snapshot_stack_canary_walk(label: &str, parent_pid: u64, parent_tid: u64)
                 return;
             }
         };
-        let saved_rip = read_userland_qword_raw(rbp.wrapping_add(8)).unwrap_or(0);
-        let canary = read_userland_qword_raw(rbp.wrapping_sub(8));
+        let saved_rip = read_userland_qword_raw(rbp.wrapping_add(8))
+            .map(|(v, _phys)| v)
+            .unwrap_or(0);
+        let canary = read_userland_qword_raw(rbp.wrapping_sub(8))
+            .map(|(v, _phys)| v);
 
         let canary_str = canary
             .map(|v| alloc::format!("{:#x}", v))
@@ -613,6 +664,17 @@ fn infer_writable(cr3: u64, va: u64) -> bool {
 ///  - Intel SDM Vol. 3A §4.6 (paging, virt→phys translation)
 pub fn fletcher32_user_page(cr3: u64, va: u64) -> Option<(u64, u32)> {
     const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    // Diagnostic helper is documented as USER-half only; callers in this
+    // module always pass a user VA.  Refuse a kernel-half VA defensively
+    // — `virt_to_phys_in` resolves kernel VAs against the same PML4 and
+    // would happily return a phys, but the CRC then describes a kernel
+    // page rather than a user page, which is meaningless for the
+    // SSP-canary diagnostic.  Per `crate::syscall::USER_VA_LIMIT` and
+    // System V AMD64 ABI §3.5.7 (process layout).
+    debug_assert!(
+        va < crate::syscall::USER_VA_LIMIT,
+        "fletcher32_user_page called with non-user VA {:#x}", va,
+    );
     let page_va = va & !0xFFFu64;
     let phys = crate::mm::vmm::virt_to_phys_in(cr3, page_va)?;
     let mut s1: u32 = 0;
