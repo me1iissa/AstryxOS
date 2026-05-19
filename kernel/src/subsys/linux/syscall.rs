@@ -2368,8 +2368,28 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                 crate::subsys::linux::vfork_diag::enter_vfork_window(
                                     pid, parent_tid);
                             }
+                            // W215-aliasing axis-N: arm a hardware write-only
+                            // watchpoint on the ld-musl `.data.rel.ro` slot
+                            // for the duration of the vfork window.  See
+                            // `elf_write_trace` module docs; Intel SDM Vol. 3B
+                            // §17.2.4 / §17.2.5.  Investigative; the [W215/
+                            // DR-WATCH-FIRE] line from the `#DB` handler is
+                            // the primary output if a kernel-mode store hits
+                            // the watched range.
+                            #[cfg(feature = "elf-write-trace")]
+                            {
+                                let parent_cr3 = crate::mm::vmm::get_cr3();
+                                crate::subsys::linux::elf_write_trace::enter_window(
+                                    pid, parent_tid, parent_cr3);
+                            }
                             crate::sched::schedule();
                             // Resumed: child called exec/exit, or timeout expired.
+                            #[cfg(feature = "elf-write-trace")]
+                            {
+                                let parent_cr3 = crate::mm::vmm::get_cr3();
+                                crate::subsys::linux::elf_write_trace::exit_window(
+                                    pid, parent_tid, parent_cr3);
+                            }
                             // VFORK/CANARY post-wake snapshot.
                             #[cfg(feature = "vfork-canary-diag")]
                             {
@@ -3235,7 +3255,21 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                 crate::subsys::linux::vfork_diag::enter_vfork_window(
                                     pid, parent_tid);
                             }
+                            // W215-aliasing axis-N — see clone (56) path above
+                            // for rationale; this is the clone3(2) sibling.
+                            #[cfg(feature = "elf-write-trace")]
+                            {
+                                let parent_cr3 = crate::mm::vmm::get_cr3();
+                                crate::subsys::linux::elf_write_trace::enter_window(
+                                    pid, parent_tid, parent_cr3);
+                            }
                             crate::sched::schedule();
+                            #[cfg(feature = "elf-write-trace")]
+                            {
+                                let parent_cr3 = crate::mm::vmm::get_cr3();
+                                crate::subsys::linux::elf_write_trace::exit_window(
+                                    pid, parent_tid, parent_cr3);
+                            }
                             // VFORK/CANARY post-wake snapshot.
                             #[cfg(feature = "vfork-canary-diag")]
                             {
