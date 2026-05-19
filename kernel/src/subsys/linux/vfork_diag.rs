@@ -594,6 +594,39 @@ fn infer_writable(cr3: u64, va: u64) -> bool {
     }
 }
 
+/// Compute Fletcher-32 (RFC 1146, modulus 65535) over the 4-KiB user page
+/// containing `va` under the given `cr3`.  Returns `(phys, crc)` on a present
+/// page, or `None` if the page is unmapped.
+///
+/// Reads through the kernel direct physical map (no SMAP bracket required)
+/// so the helper is safe to call from a fault-immune ISR context.  The CRC
+/// formula matches the per-256 B `[STACK-CANARY-FINEGRAIN]` chunks and the
+/// 8 KiB-window `vfork_canary_snapshot` so the `#GP`-time value is
+/// directly comparable with the pre/post snapshot pair without
+/// re-implementing the hash.
+///
+/// Diagnostic-only.  Callers may pass an unaligned `va`; the helper masks
+/// to a page boundary internally.
+///
+/// Refs:
+///  - RFC 1146 §1 (Fletcher-32, mod 65535)
+///  - Intel SDM Vol. 3A §4.6 (paging, virt→phys translation)
+pub fn fletcher32_user_page(cr3: u64, va: u64) -> Option<(u64, u32)> {
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    let page_va = va & !0xFFFu64;
+    let phys = crate::mm::vmm::virt_to_phys_in(cr3, page_va)?;
+    let mut s1: u32 = 0;
+    let mut s2: u32 = 0;
+    for i in 0..4096u64 {
+        let b = unsafe {
+            core::ptr::read_volatile((PHYS_OFF + phys + i) as *const u8)
+        };
+        s1 = s1.wrapping_add(b as u32) % 65535;
+        s2 = s2.wrapping_add(s1) % 65535;
+    }
+    Some((phys, (s2 << 16) | s1))
+}
+
 /// Re-arm a hardware write-only watchpoint (8 bytes) on `fs:0x28`
 /// (the master canary slot, `__stack_chk_guard` per System V x86_64
 /// psABI §6.4) for the duration of the vfork window.  Any kernel-mode
