@@ -255,3 +255,177 @@ fn read_userland_qword_raw(addr: u64) -> Option<u64> {
     }
     unsafe { crate::syscall::user_read_u64(addr) }
 }
+
+// ─── Full parent-stack-VMA page-provenance dump (W215 axis-N+1) ───────────
+//
+// Tech-lead cross-walk on the post-#328 10-trial soak (0/10 page_pa swaps
+// in the narrow RSP+8 KiB window, 0/10 refcount mismatches) identified
+// that the SSP-failing parent frame sits *upstream* of the narrow window:
+// musl's `__clone` syscall stub strips the frame pointer at syscall-entry,
+// so an RBP-chain walk from the syscall-handler view terminates at depth
+// 1, and the doomed frame's page is outside the 8 KiB capture range.
+//
+// This dispatch extends provenance capture to **every present page in the
+// parent's `[stack]` VMA(s)** at the same two snapshot points
+// (`pre_block.clone` and `post_wake.clone`).  Three discriminators:
+//
+//   (α)  Same `page_va` pre vs post, different `page_pa`     → W215-class
+//        aliasing on a stack page outside the narrow window.
+//   (β)  Same `(page_va, page_pa)` pre vs post, different `refcount`
+//        without an explicit map/unmap                       → race in
+//        page-table refcount accounting on the stack VMA.
+//   (γ)  `present=true` → `present=false` → `present=true`   → cache
+//        eviction inside the window.
+//   (δ)  `writable=true` → `writable=false` → `writable=true` → PR #270
+//        `pte_share_count` race signature.
+//
+// Per Intel SDM Vol. 3A §4.10.4–§4.10.5 (paging and TLB invariants) and
+// POSIX `mmap(2)` semantics for `MAP_STACK`.
+
+/// Hard cap on per-snapshot page-provenance rows.  USER_STACK_MAX = 1 MiB
+/// = 256 pages, so 512 covers both the lazy and eager `[stack]` VMAs and
+/// leaves headroom if a process has unusual stack VMA shapes.  Each row is
+/// ~180 bytes serialised → ≤92 KiB per snapshot, ≤184 KiB per trial — well
+/// within the soak-runner's serial-log budget.
+const MAX_STACK_PROV_ROWS: usize = 512;
+
+/// Page-provenance snapshot row.  Held in a fixed-size on-stack buffer so
+/// that the entire VMA-iteration phase runs without allocator traffic, then
+/// emitted in a single batch under PROCESS_TABLE-unlocked serial I/O.
+#[derive(Copy, Clone)]
+struct StackPageProv {
+    page_va: u64,
+    page_pa: u64,
+    pte:     u64,
+    refcount: u16,
+}
+
+/// Walk every present page in the parent process's stack VMA(s) and emit
+/// one `[STACK-PAGE-PROV-FULL]` row per page, plus a summary line.
+///
+/// `label` is `"PRE"` or `"POST"` and tags the snapshot pair.
+///
+/// Per Intel SDM Vol. 3A §4.5 (paging structures, PTE layout) the PTE
+/// returned by `lookup_pte_in` carries the physical frame in
+/// `bits[51:12]` and access/protection flags in `bits[11:0]`.
+pub fn snapshot_stack_page_provenance(label: &str, parent_pid: u64, parent_tid: u64) {
+    // Step 1 — under PROCESS_TABLE lock, collect (cr3, [(base,end,name); N])
+    // for the parent's `[stack]` VMAs.  Copy into a fixed-size stack array
+    // so PROCESS_TABLE can be released before any serial-print, avoiding
+    // both lock-order issues and serial-log interleaving inside the lock.
+    let (parent_cr3, vmas, vma_count) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        let parent = match procs.iter().find(|p| p.pid == parent_pid) {
+            Some(p) => p,
+            None => {
+                drop(procs);
+                crate::serial_println!(
+                    "[STACK-PAGE-PROV-FULL] when={} pid={} tid={} state=no_parent",
+                    label, parent_pid, parent_tid);
+                return;
+            }
+        };
+        let space = match parent.vm_space.as_ref() {
+            Some(s) => s,
+            None => {
+                let cr3 = parent.cr3;
+                drop(procs);
+                crate::serial_println!(
+                    "[STACK-PAGE-PROV-FULL] when={} pid={} tid={} state=no_vmspace cr3={:#x}",
+                    label, parent_pid, parent_tid, cr3);
+                return;
+            }
+        };
+        // Up to 4 stack VMAs (lazy [stack] + eager [stack] + optional
+        // [vfork-stack] + headroom).  Any more is anomalous — emit a
+        // diagnostic but bound the iteration.
+        let mut vmas: [(u64, u64, &'static str); 4] =
+            [(0, 0, ""); 4];
+        let mut n = 0usize;
+        for area in space.areas.iter() {
+            if area.name == "[stack]" || area.name == "[vfork-stack]" {
+                if n < vmas.len() {
+                    vmas[n] = (area.base, area.end(), area.name);
+                    n += 1;
+                }
+            }
+        }
+        (parent.cr3, vmas, n)
+    };
+
+    if vma_count == 0 {
+        crate::serial_println!(
+            "[STACK-PAGE-PROV-FULL] when={} pid={} tid={} state=no_stack_vma cr3={:#x}",
+            label, parent_pid, parent_tid, parent_cr3);
+        return;
+    }
+
+    // Step 2 — for each [stack] VMA, iterate every 4 KiB page, query the
+    // PTE in the parent's PML4, and (when PRESENT) capture phys + flags +
+    // refcount into the row buffer.  Skip absent pages — only present
+    // pages carry useful provenance.
+    let mut rows: [StackPageProv; MAX_STACK_PROV_ROWS] =
+        [StackPageProv { page_va: 0, page_pa: 0, pte: 0, refcount: 0 };
+         MAX_STACK_PROV_ROWS];
+    let mut row_idx = 0usize;
+    let mut total_present = 0u64;
+    let mut total_writable = 0u64;
+    let mut total_refcount_sum: u64 = 0;
+    let mut overflowed = false;
+
+    for vi in 0..vma_count {
+        let (base, end, _name) = vmas[vi];
+        let mut va = base;
+        while va < end {
+            if let Some(pte) = crate::mm::vmm::lookup_pte_in(parent_cr3, va) {
+                // PAGE_PRESENT guaranteed by lookup_pte_in success.
+                let phys = pte & crate::mm::vmm::ADDR_MASK;
+                let rc = crate::mm::refcount::pte_share_count(phys);
+                total_present += 1;
+                if pte & crate::mm::vmm::PAGE_WRITABLE != 0 {
+                    total_writable += 1;
+                }
+                total_refcount_sum = total_refcount_sum.saturating_add(rc as u64);
+                if row_idx < MAX_STACK_PROV_ROWS {
+                    rows[row_idx] = StackPageProv {
+                        page_va: va,
+                        page_pa: phys,
+                        pte,
+                        refcount: rc,
+                    };
+                    row_idx += 1;
+                } else {
+                    overflowed = true;
+                }
+            }
+            va = va.wrapping_add(crate::mm::pmm::PAGE_SIZE as u64);
+        }
+    }
+
+    // Step 3 — emit captured rows.  One line per present page so the
+    // post-processor can `grep '\[STACK-PAGE-PROV-FULL\] when=PRE'` then
+    // diff against the POST set in a single awk pass.
+    for i in 0..row_idx {
+        let r = &rows[i];
+        let present = r.pte & crate::mm::vmm::PAGE_PRESENT != 0;
+        let writable = r.pte & crate::mm::vmm::PAGE_WRITABLE != 0;
+        crate::serial_println!(
+            "[STACK-PAGE-PROV-FULL] when={} pid={} tid={} \
+             page_va={:#x} page_pa={:#x} refcount={} pte={:#x} \
+             present={} writable={}",
+            label, parent_pid, parent_tid,
+            r.page_va, r.page_pa, r.refcount, r.pte,
+            present, writable);
+    }
+
+    // Step 4 — summary line.  Carries vma_count so the post-processor can
+    // verify both lazy and eager [stack] VMAs were covered, and the
+    // overflowed flag so a cap-truncated capture is loud.
+    crate::serial_println!(
+        "[STACK-PAGE-PROV-FULL] when={} pid={} tid={} \
+         summary=true vma_count={} total_present={} total_writable={} \
+         total_refcount_sum={} emitted_rows={} cap={} overflowed={}",
+        label, parent_pid, parent_tid,
+        vma_count, total_present, total_writable,
+        total_refcount_sum, row_idx, MAX_STACK_PROV_ROWS, overflowed);
+}
