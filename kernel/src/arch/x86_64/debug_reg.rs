@@ -633,6 +633,84 @@ pub enum ArmPhysResult {
     PoolExhausted,
 }
 
+/// Manually arm a write-only watchpoint on `PHYS_OFF + phys + off` where
+/// `phys` is the base of the containing 4 KiB physical frame and `off`
+/// is a byte offset in `[0, 4096)`.  `len` must be 1, 2, 4, or 8 per
+/// Intel SDM Vol. 3B §17.2.4 Table 17-2.  Used by the ELF write-trace
+/// diagnostic (`subsys/linux/elf_write_trace.rs`) to watch a specific
+/// 8-byte slot within an ld-musl `.data.rel.ro` page.
+///
+/// Slot selection: prefer DR1/DR2/DR3 (the pre-insert pool) so a manual
+/// arm doesn't clobber the CRC walker's post-hoc slot (DR0).  Fall back
+/// to DR0 only if all three pre-insert slots are busy.
+///
+/// Cross-CPU sync is the same lazy-gen protocol used by
+/// `arm_write_watchpoint` / `arm_preinsert_watchpoint`: bump
+/// `SYNC_GENERATION` and program our own DRs; peer CPUs pick up the
+/// change in their next `apply_pending_if_stale()` (≤ one timer tick).
+pub fn arm_phys_slot_watchpoint(phys: u64, off: u64, len: u8) -> ArmPhysResult {
+    // Validate page alignment of the frame base.
+    if phys & 0xFFF != 0 {
+        return ArmPhysResult::NotAligned;
+    }
+    // Validate offset + length stays inside the 4 KiB frame.  Per Intel
+    // SDM Vol. 3B §17.2.4 Table 17-2 the DR address may be any byte; we
+    // restrict to one-frame windows so the diagnostic doesn't mis-report
+    // when a write to the adjacent frame's leading bytes fires.
+    if off >= 4096 || off + (len as u64) > 4096 {
+        return ArmPhysResult::NotAligned;
+    }
+    // Width must be one of {1, 2, 4, 8}.
+    match len {
+        1 | 2 | 4 | 8 => {}
+        _ => return ArmPhysResult::NotAligned,
+    }
+    // The watch address must be naturally aligned to `len` per the same
+    // table; reject otherwise (a misaligned arm silently widens via the
+    // Intel-defined LEN encoding and would catch unrelated writes).
+    if off & (len as u64 - 1) != 0 {
+        return ArmPhysResult::NotAligned;
+    }
+    // Validate that the frame falls inside installed RAM.
+    let (total_pages, _) = crate::mm::pmm::stats();
+    let ram_top = total_pages.saturating_mul(crate::mm::pmm::PAGE_SIZE as u64);
+    if phys >= ram_top {
+        return ArmPhysResult::OutOfRange;
+    }
+
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    let linear = PHYS_OFF.wrapping_add(phys).wrapping_add(off);
+    let inode: u64 = 0;
+    let file_offset: u64 = off;
+
+    let mut armed_slot: Option<u8> = None;
+    for slot in [1usize, 2, 3, 0] {
+        if try_arm_slot(slot, linear, len, phys.wrapping_add(off), inode, file_offset) {
+            armed_slot = Some(slot as u8);
+            break;
+        }
+    }
+    let Some(slot) = armed_slot else {
+        return ArmPhysResult::PoolExhausted;
+    };
+
+    ARM_COUNT.fetch_add(1, Ordering::Relaxed);
+    crate::serial_println!(
+        "[W215/DR-ARM] slot={} linear={:#x} phys={:#x} inode={} offset={:#x} kind=slot len={}",
+        slot, linear, phys.wrapping_add(off), inode, file_offset, len,
+    );
+    SYNC_GENERATION.fetch_add(1, Ordering::Release);
+    program_local_drs();
+    let cpu = super::apic::cpu_index();
+    if cpu < super::apic::MAX_CPUS {
+        LOCAL_SYNC_GENERATION[cpu].store(
+            SYNC_GENERATION.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+    }
+    ArmPhysResult::Armed(slot)
+}
+
 /// Manually arm a write-only watchpoint on `PHYS_OFF + phys` from a kdb
 /// command, bypassing the `cache::insert` pre-arm key filter.  Useful when
 /// a corrupted phys has already been observed by the CRC walker but the

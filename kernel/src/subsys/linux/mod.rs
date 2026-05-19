@@ -42,6 +42,16 @@ pub mod syscall;
 #[cfg(feature = "vfork-canary-diag")]
 pub mod vfork_diag;
 
+/// ELF write-trace diagnostic for the W215-aliasing axis-N investigation:
+/// arms a hardware write-only watchpoint on the ld-musl `.data.rel.ro`
+/// slot at `0x7F00_0003_7e18` for the duration of the `CLONE_VM|CLONE_VFORK`
+/// parent-block window and snapshots the page content before/after.
+/// Per Intel SDM Vol. 3B §17.2.4 / §17.2.5.  Gated behind `elf-write-trace`
+/// (which also pulls in `w215-diag` for the DR0–DR3 plumbing) so master
+/// builds are byte-identical without it.
+#[cfg(feature = "elf-write-trace")]
+pub mod elf_write_trace;
+
 /// Bounded broadcast-within-cluster compensation for FUTEX_WAKE.  Mitigates
 /// the older-glibc `pthread_cond_signal` race
 /// (<https://sourceware.org/bugzilla/show_bug.cgi?id=25847>) by
