@@ -22030,7 +22030,9 @@ fn test_x11_hello_runs() -> bool {
 // ── Test 139: Firefox ESR launch oracle ───────────────────────────────────────
 //
 // Infrastructure probe, NOT a feature gate.  This test:
-//   1. Verifies /disk/opt/firefox/firefox exists — skips (pass) if absent.
+//   1. Selects a Firefox binary, preferring the Alpine musl build at
+//      /disk/usr/lib/firefox-esr/ over the Mozilla-official glibc build at
+//      /disk/opt/firefox/.  Skips (pass) if neither is present.
 //   2. Writes /tmp/hello.html to the VFS ramdisk.
 //   3. Spawns Firefox with --headless --screenshot /tmp/fx.png file:///tmp/hello.html
 //   4. Schedules it for up to ~60 s (6000 yields) counting Linux syscalls.
@@ -22044,29 +22046,62 @@ fn test_x11_hello_runs() -> bool {
 // Firefox is expected to crash.  The goal is to measure progress and report
 // the exact crash context for the next agent.
 //
+// Why prefer the musl build?  The glibc Firefox demo path has been observed
+// to plateau in TimeStamp::Now / pthread_mutex_lock loops with no forward
+// progress.  The Alpine musl Firefox uses a different libc + linker (ld-musl
+// vs glibc ld-linux) and exercises a substantially different syscall and
+// futex trace, which is the intended demo target.  See:
+//   - musl libc reference:        https://musl.libc.org/
+//   - ld-musl(8) interpreter:     PT_INTERP=/lib/ld-musl-x86_64.so.1
+//   - ELF DT_RUNPATH (System V gABI §5.4): /usr/lib/firefox-esr
+//
 fn test_firefox_launch_progress() -> bool {
     test_header!("Firefox ESR launch oracle (progress probe)");
 
-    // ── 1. Check /disk/opt/firefox/firefox exists ─────────────────────────────
-    let ff_bin = match crate::vfs::read_file("/disk/opt/firefox/firefox") {
-        Ok(data) => {
-            test_println!("  /disk/opt/firefox/firefox: {} bytes", data.len());
-            data
+    // ── 1. Pick Firefox binary: prefer musl, fall back to glibc ──────────────
+    //
+    // The musl wrapper at /disk/usr/lib/firefox-esr/firefox is Alpine's
+    // firefox-esr ELF (interpreter /lib/ld-musl-x86_64.so.1).  The glibc
+    // fallback at /disk/opt/firefox/firefox is the Mozilla official build
+    // (interpreter /lib64/ld-linux-x86-64.so.2).  exe_path is set to whichever
+    // path actually loaded, so readlink("/proc/self/exe") + append "-bin"
+    // resolves to the matching firefox-bin sibling.
+    const FF_CANDIDATES: &[&str] = &[
+        "/disk/usr/lib/firefox-esr/firefox",   // Alpine musl build (preferred)
+        "/disk/opt/firefox/firefox",           // Mozilla glibc build (fallback)
+    ];
+
+    let mut chosen_path: &str = "";
+    let mut ff_bin: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    for cand in FF_CANDIDATES {
+        match crate::vfs::read_file(cand) {
+            Ok(data) => {
+                test_println!("  {}: {} bytes ✓", cand, data.len());
+                chosen_path = cand;
+                ff_bin = data;
+                break;
+            }
+            Err(e) => {
+                test_println!("  {} not found ({:?})", cand, e);
+            }
         }
-        Err(e) => {
-            test_println!("  SKIP: /disk/opt/firefox/firefox not found ({:?})", e);
-            test_println!("        Run scripts/create-data-disk.sh --force to rebuild data disk.");
-            test_pass!("Firefox ESR oracle (skipped — binary absent)");
-            return true;
-        }
-    };
+    }
+    if chosen_path.is_empty() {
+        test_println!("  SKIP: no Firefox binary present at any known location");
+        test_println!("        Tried: {:?}", FF_CANDIDATES);
+        test_println!("        Run scripts/install-firefox-musl.sh (or scripts/create-data-disk.sh) to stage.");
+        test_pass!("Firefox ESR oracle (skipped — binary absent)");
+        return true;
+    }
+
+    let is_musl = chosen_path.starts_with("/disk/usr/lib/firefox-esr/");
 
     // ── Basic ELF sanity ──────────────────────────────────────────────────────
     if !crate::proc::elf::is_elf(&ff_bin) {
-        test_fail!("firefox_oracle", "/disk/opt/firefox/firefox is not an ELF binary");
+        test_fail!("firefox_oracle", "{} is not an ELF binary", chosen_path);
         return false;
     }
-    test_println!("  ELF magic OK");
+    test_println!("  ELF magic OK ({})", if is_musl { "musl" } else { "glibc" });
 
     match crate::proc::elf::validate_elf(&ff_bin) {
         Ok(hdr) => {
@@ -22104,30 +22139,59 @@ fn test_firefox_launch_progress() -> bool {
         "/tmp/fx.png",
         "file:///tmp/hello.html",
     ];
-    let envp = &[
-        "HOME=/tmp",
-        "PATH=/opt/firefox:/bin:/disk/bin",
-        "LD_LIBRARY_PATH=/opt/firefox:/lib64:/lib/x86_64-linux-gnu",
-        "MOZ_HEADLESS=1",
-        "MOZ_LOG=all:5",
-        "MOZ_LOG_FILE=/tmp/firefox.log",
-        "DISPLAY=:0",
-        "XAUTHORITY=/tmp/.Xauthority",
-        "XDG_RUNTIME_DIR=/tmp",
-        "XDG_DATA_DIRS=/tmp",
-        "XDG_CONFIG_HOME=/tmp",
-        "XDG_CACHE_HOME=/tmp/cache",
-        "DBUS_SESSION_BUS_ADDRESS=",
-        "FONTCONFIG_FILE=/tmp",
-    ];
+    //
+    // PATH / LD_LIBRARY_PATH tuned to whichever build we picked.  For musl,
+    // ld-musl reads DT_RUNPATH=/usr/lib/firefox-esr (per System V gABI §5.4)
+    // so transitive deps (libxul.so, libmozsandbox.so, ...) resolve from the
+    // canonical tree without any extra LD_LIBRARY_PATH hint, but we still
+    // include it for fallback search order (per ld-musl(8) and ld.so(8)).
+    //
+    let envp: alloc::vec::Vec<&str> = if is_musl {
+        alloc::vec![
+            "HOME=/tmp",
+            "PATH=/usr/lib/firefox-esr:/bin:/disk/bin",
+            "LD_LIBRARY_PATH=/usr/lib/firefox-esr:/lib:/usr/lib",
+            "MOZ_HEADLESS=1",
+            "MOZ_LOG=all:5",
+            "MOZ_LOG_FILE=/tmp/firefox.log",
+            "DISPLAY=:0",
+            "XAUTHORITY=/tmp/.Xauthority",
+            "XDG_RUNTIME_DIR=/tmp",
+            "XDG_DATA_DIRS=/tmp",
+            "XDG_CONFIG_HOME=/tmp",
+            "XDG_CACHE_HOME=/tmp/cache",
+            "DBUS_SESSION_BUS_ADDRESS=",
+            "FONTCONFIG_FILE=/tmp",
+        ]
+    } else {
+        alloc::vec![
+            "HOME=/tmp",
+            "PATH=/opt/firefox:/bin:/disk/bin",
+            "LD_LIBRARY_PATH=/opt/firefox:/lib64:/lib/x86_64-linux-gnu",
+            "MOZ_HEADLESS=1",
+            "MOZ_LOG=all:5",
+            "MOZ_LOG_FILE=/tmp/firefox.log",
+            "DISPLAY=:0",
+            "XAUTHORITY=/tmp/.Xauthority",
+            "XDG_RUNTIME_DIR=/tmp",
+            "XDG_DATA_DIRS=/tmp",
+            "XDG_CONFIG_HOME=/tmp",
+            "XDG_CACHE_HOME=/tmp/cache",
+            "DBUS_SESSION_BUS_ADDRESS=",
+            "FONTCONFIG_FILE=/tmp",
+        ]
+    };
+    let envp: &[&str] = &envp;
 
     // Use the *blocked* variant so we can set exe_path BEFORE the thread
     // is scheduled.  The Firefox launcher calls readlink("/proc/self/exe"),
     // appends "-bin", and execv's the result.  If exe_path is just "firefox"
     // (the default process name), readlink returns "firefox" and execv tries
     // the relative path "firefox-bin" which is not found.  Setting the full
-    // disk path first means readlink returns "/disk/opt/firefox/firefox" and
-    // execv gets "/disk/opt/firefox/firefox-bin" which is on the data disk.
+    // disk path here means readlink returns `chosen_path` and execv gets
+    // `<chosen_path>-bin` which is on the data disk for both musl
+    // (/disk/usr/lib/firefox-esr/firefox{,-bin}) and glibc
+    // (/disk/opt/firefox/firefox{,-bin}) layouts.
     let ff_pid = match crate::proc::usermode::create_user_process_with_args_blocked(
         "firefox", &ff_bin, argv, envp
     ) {
@@ -22147,7 +22211,7 @@ fn test_firefox_launch_progress() -> bool {
         if let Some(p) = procs.iter_mut().find(|p| p.pid == ff_pid) {
             p.linux_abi = true;
             p.subsystem = crate::win32::SubsystemType::Linux;
-            p.exe_path = Some(alloc::string::String::from("/disk/opt/firefox/firefox"));
+            p.exe_path = Some(alloc::string::String::from(chosen_path));
         }
     }
 
