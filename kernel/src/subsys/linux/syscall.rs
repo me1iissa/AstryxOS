@@ -7590,6 +7590,28 @@ pub fn sys_futex_linux(
                 crate::proc::current_tid(), pid, uaddr, woken, val, futex_op
             );
 
+            // Futex-key resolution diagnostic: when this WAKE found zero
+            // waiters at the exact key, emit the bucket landscape so the
+            // harness can distinguish "kernel key correct, no waiter on
+            // this logical futex" from "waiter and waker computed different
+            // keys for what should be the same slot".  Observe-only.
+            //
+            // Per `futex(2)` (<https://man7.org/linux/man-pages/man2/futex.2.html>):
+            // private-flag futexes are keyed `(mm, uaddr)`; AstryxOS uses
+            // `(pid, uaddr)` (one mm per pid in this kernel), so a waiter
+            // and waker on the same `pid` with identical `uaddr` MUST
+            // hit the same bucket.  A populated `nearest=[…]` with the
+            // waiter just a few bytes away from `uaddr` would indicate
+            // the userspace producer signalled the wrong field of a
+            // composite cond-var (musl `pthread_cond_t._c_seq` vs
+            // `_c_waiters`, public layout in the musl source).
+            #[cfg(feature = "firefox-test")]
+            if woken == 0 {
+                crate::subsys::linux::futex_key_diag::emit_wake_empty(
+                    pid, crate::proc::current_tid(), uaddr, futex_op,
+                );
+            }
+
             // Record this WAKE in the per-CPU history ring (regardless of
             // `woken`) so the cluster-wake compensation can use "this TID
             // recently issued a wake at this uaddr" as a safety-harness

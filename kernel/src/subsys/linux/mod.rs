@@ -61,6 +61,19 @@ pub mod elf_write_trace;
 #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
 pub mod futex_cluster;
 
+/// Futex-key resolution diagnostic for `FUTEX_WAKE woken=0`.
+///
+/// Emits `[FUTEX-WAKE-EMPTY]` lines describing the bucket landscape when
+/// a wake returns zero, so the harness can decide whether the kernel
+/// key-resolution is correct (waiter on different uaddr → userspace
+/// POSIX defence) or wrong (waiter and waker hash to different keys for
+/// the same logical futex).  Per `futex(2)`
+/// (<https://man7.org/linux/man-pages/man2/futex.2.html>) the
+/// `FUTEX_PRIVATE_FLAG` key is `(mm, uaddr)`; AstryxOS uses `(pid, uaddr)`
+/// equivalent.  See `futex_key_diag.rs` for the audit framing.
+#[cfg(feature = "firefox-test")]
+pub mod futex_key_diag;
+
 /// Firefox-test diagnostic ring helpers — tiny shim that holds the "current
 /// syscall's ring-entry index" so sys_read_linux / sys_open_linux can attach
 /// path / read-content context without threading it through every signature.
