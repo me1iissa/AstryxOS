@@ -288,6 +288,46 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
                     crate::serial_println!("[GPF-DBG]   [RSP+{:#03x}]={:#018x}", i*8, val);
                 }
             }
+
+            // Fletcher-32 CRC over the user-stack page containing fault RSP.
+            // Pairs with the `[STACK-CANARY-FINEGRAIN]` and `[STACK-PAGE-PROV]`
+            // snapshots emitted PRE/POST the vfork window by
+            // `subsys::linux::vfork_diag`.  A post-processor compares the
+            // `#GP`-time CRC against the POST snapshot at the same VA to
+            // discriminate:
+            //
+            //   * `crc == POST && phys == POST` → page contents stable from
+            //     POST through `#GP`; the faulting write came from userspace
+            //     after the vfork window closed (userspace memory-safety
+            //     bug — e.g. STL write past end overwriting saved SSP slot).
+            //   * `crc != POST && phys == POST` → kernel mutated the page
+            //     between POST snapshot and `#GP` (axis-O kernel-side
+            //     post-vfork stack-page corruption).
+            //   * `phys != POST`               → page aliasing (axis-N+1
+            //     class — VA stable but a different physical frame is now
+            //     mapped).
+            //
+            // Diagnostic-only; gated behind `vfork-canary-diag` so master
+            // builds remain byte-identical and the trap path retains its
+            // existing fault-immune shape.
+            //
+            // Refs: Intel SDM Vol. 3A §6.15 (#GP), RFC 1146 (Fletcher-32).
+            #[cfg(feature = "vfork-canary-diag")]
+            {
+                let stack_page = rsp & !0xFFFu64;
+                match crate::subsys::linux::vfork_diag::fletcher32_user_page(
+                    cr3, stack_page,
+                ) {
+                    Some((phys, crc)) => crate::serial_println!(
+                        "[GPF-STACK-CRC] tid={} stack_page={:#x} phys={:#x} crc={:#010x}",
+                        tid, stack_page, phys, crc,
+                    ),
+                    None => crate::serial_println!(
+                        "[GPF-STACK-CRC] tid={} stack_page={:#x} state=unmapped",
+                        tid, stack_page,
+                    ),
+                }
+            }
         }
     }
 
