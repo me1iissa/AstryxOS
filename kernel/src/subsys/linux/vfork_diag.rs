@@ -284,6 +284,47 @@ fn read_userland_qword_raw(addr: u64) -> Option<u64> {
     unsafe { crate::syscall::user_read_u64(addr) }
 }
 
+// ─── Helper: per-thread (user_rsp, user_rbp) from saved syscall frame ────────
+//
+// `crate::syscall::get_user_rsp_rbp()` reads the *current* CPU's per-CPU
+// `frame_rsp` slot, which is overwritten by every subsequent syscall on
+// that CPU.  By the time `snapshot_..._post` runs (after `schedule()`
+// returns), the per-CPU slot may belong to any sibling syscall that ran
+// during the wait, so the lookup returns `(0, 0)` and the snapshot
+// reports `state=no_rsp` even though the parent's saved frame is still
+// intact on its kernel stack.
+//
+// This helper resolves (user_rsp, user_rbp) by walking THREAD_TABLE for
+// the requested `parent_tid` and reading from the saved syscall frame at
+// the top of that thread's kernel stack:
+//
+//   kstack_top - 1*8  = saved user_rsp   (frame slot 14)
+//   kstack_top - 4*8  = saved user_rbp   (frame slot 11)
+//
+// Per the `syscall_entry` save layout in `kernel/src/syscall/mod.rs`
+// (frame slots [rdi, rsi, rdx, r8, r9, r10, r15, r14, r13, r12, rbx,
+// rbp, r11, rcx, user_rsp]).  Stable across pre-block and post-wake
+// because `schedule()` does not modify the saved syscall frame.
+fn get_parent_user_rsp_rbp(parent_tid: u64) -> (u64, u64) {
+    let kstack_top = {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        threads.iter().find(|t| t.tid == parent_tid)
+            .map(|t| t.kernel_stack_base + t.kernel_stack_size)
+            .unwrap_or(0)
+    };
+    if kstack_top == 0 {
+        return (0, 0);
+    }
+    // SAFETY: the kernel stack is in the kernel's virtual address space
+    // (always present, always writable from CPL 0).  The two reads are
+    // from `kstack_top - 8` and `kstack_top - 32` which are both within
+    // the bottom 15 qwords pushed by `syscall_entry` — i.e. within the
+    // thread's own kernel stack span.  No user-memory access.
+    let user_rsp = unsafe { *((kstack_top - 8) as *const u64) };
+    let user_rbp = unsafe { *((kstack_top - 32) as *const u64) };
+    (user_rsp, user_rbp)
+}
+
 // ─── Axis-N+1: three additional stack-provenance channels ────────────────────
 //
 // Tech-lead cross-walk verdict (W215 axis-N+1): the SSP-canary mismatch on
@@ -329,7 +370,7 @@ const PAGE_PROV_PAGES: usize = FINEGRAIN_WIN_SIZE / 4096; // 2 pages
 /// (`mov rax, fs:0x28 ; mov [rbp-8], rax`) and the epilogue re-reads it
 /// before the function returns.
 pub fn snapshot_stack_canary_walk(label: &str, parent_pid: u64, parent_tid: u64) {
-    let (user_rsp, user_rbp) = crate::syscall::get_user_rsp_rbp();
+    let (user_rsp, user_rbp) = get_parent_user_rsp_rbp(parent_tid);
     if user_rbp == 0 {
         crate::serial_println!(
             "[STACK-CANARY-WALK] {} pid={} tid={} state=no_user_frame rsp={:#x}",
@@ -413,7 +454,7 @@ pub fn snapshot_stack_canary_walk(label: &str, parent_pid: u64, parent_tid: u64)
 /// `vfork_canary_snapshot` window CRC — keeps the two channels
 /// numerically comparable.
 pub fn snapshot_stack_finegrain(label: &str, parent_pid: u64, parent_tid: u64) {
-    let (user_rsp, _user_rbp) = crate::syscall::get_user_rsp_rbp();
+    let (user_rsp, _user_rbp) = get_parent_user_rsp_rbp(parent_tid);
     if user_rsp == 0 {
         crate::serial_println!(
             "[STACK-CANARY-FINEGRAIN] {} pid={} tid={} state=no_rsp",
@@ -477,7 +518,7 @@ pub fn snapshot_stack_finegrain(label: &str, parent_pid: u64, parent_tid: u64) {
 /// path needn't pass it.  All reads go through `virt_to_phys_in` so an
 /// unmapped slot reports `phys=?` instead of faulting.
 pub fn snapshot_stack_page_prov(label: &str, parent_pid: u64, parent_tid: u64) {
-    let (user_rsp, _user_rbp) = crate::syscall::get_user_rsp_rbp();
+    let (user_rsp, _user_rbp) = get_parent_user_rsp_rbp(parent_tid);
     if user_rsp == 0 {
         crate::serial_println!(
             "[STACK-PAGE-PROV] when={} pid={} tid={} state=no_rsp",
@@ -553,17 +594,27 @@ fn infer_writable(cr3: u64, va: u64) -> bool {
     }
 }
 
-/// Re-arm DR0 (write-only, 8 bytes) on `fs:0x28` (the master canary slot,
-/// `__stack_chk_guard` per System V x86_64 psABI §6.4) for the duration
-/// of the vfork window.  Any kernel-mode store to that slot fires a `#DB`
-/// and emits `[W215/DR-WATCH-FIRE]` naming the writer.
+/// Re-arm a hardware write-only watchpoint (8 bytes) on `fs:0x28`
+/// (the master canary slot, `__stack_chk_guard` per System V x86_64
+/// psABI §6.4) for the duration of the vfork window.  Any kernel-mode
+/// store to that slot fires a `#DB` and emits `[W215/DR-WATCH-FIRE]`
+/// naming the writer.
 ///
-/// No-op if the master canary's physical frame cannot be resolved (the
-/// thread hasn't faulted in its TCB yet, or `fs_base` is zero).
+/// Uses `arm_phys_slot_watchpoint` which prefers DR1/DR2/DR3 (the
+/// pre-insert pool); falls back to DR0 only when all three are busy.
+/// This avoids clobbering the W215 cache walker's DR0 in the common
+/// case where the walker has already armed (the CRC walker arms DR0
+/// during cache::insert hotpaths very early in boot).
 ///
 /// Belt-and-braces channel — the master canary slot should NEVER be
-/// written outside `__init_ssp`.  Any fire here is a separate corruption
-/// channel worth knowing about, orthogonal to the saved-`[rbp-8]` story.
+/// written outside `__init_ssp`.  Any fire here is a separate
+/// corruption channel worth knowing about, orthogonal to the
+/// saved-`[rbp-8]` story.  Tracks the armed slot in
+/// `FS28_WATCH_SLOT` so `disarm_master_canary_watch` can release the
+/// correct DR.
+static FS28_WATCH_SLOT: core::sync::atomic::AtomicI8 =
+    core::sync::atomic::AtomicI8::new(-1);
+
 pub fn arm_master_canary_watch() {
     let fs_base = unsafe { crate::hal::rdmsr(0xC000_0100) };
     if fs_base == 0 {
@@ -584,28 +635,31 @@ pub fn arm_master_canary_watch() {
             return;
         }
     };
-    // `arm_write_watchpoint` programs DR0 with `PHYS_OFF + phys` (per the
-    // module-level docs).  The watch fires on any write to that linear
-    // address — the kernel's direct physical map covers all installed RAM
-    // so any aliased VA mapping the same frame will also trip the watch.
-    // Returns false if DR0 is already armed (CRC walker's slot); in that
-    // case we just emit a state line and continue.  The vfork window
-    // remains useful without this belt-and-braces channel.
-    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
-    let linear = PHYS_OFF + phys + (fs28_addr & 0xFFF);
-    let armed = crate::arch::x86_64::debug_reg::arm_write_watchpoint(
-        linear, 8, phys, 0xFFFF_FFFF_FFFF_FFFE /* inode sentinel: fs28 */, 0x28,
-    );
+    let frame_phys = phys & !0xFFF;
+    let off_in_frame = fs28_addr & 0xFFF;
+    use crate::arch::x86_64::debug_reg::{arm_phys_slot_watchpoint, ArmPhysResult};
+    let result = arm_phys_slot_watchpoint(frame_phys, off_in_frame, 8);
+    let (state, slot_val) = match result {
+        ArmPhysResult::Armed(s) => ("armed", s as i8),
+        ArmPhysResult::PoolExhausted => ("pool_exhausted", -1),
+        ArmPhysResult::NotAligned    => ("not_aligned", -1),
+        ArmPhysResult::OutOfRange    => ("out_of_range", -1),
+    };
+    FS28_WATCH_SLOT.store(slot_val, core::sync::atomic::Ordering::Release);
     crate::serial_println!(
-        "[VFORK-FS28-WATCH] state={} fs_base={:#x} fs28_addr={:#x} phys={:#x} linear={:#x}",
-        if armed { "armed" } else { "dr0_busy" },
-        fs_base, fs28_addr, phys, linear,
+        "[VFORK-FS28-WATCH] state={} fs_base={:#x} fs28_addr={:#x} phys={:#x} \
+         frame_phys={:#x} off={:#x} slot={}",
+        state, fs_base, fs28_addr, phys, frame_phys, off_in_frame, slot_val,
     );
 }
 
-/// Disarm the DR0 master-canary watch if the vfork window closes without
-/// the watch firing.  Idempotent — safe to call when DR0 is unowned or
-/// when the watch was a one-shot consumed by `#DB`.
+/// Disarm the master-canary watch if the vfork window closes without
+/// the watch firing.  Idempotent — safe to call when the slot is
+/// unowned or when the watch was a one-shot consumed by `#DB`.
 pub fn disarm_master_canary_watch() {
-    crate::arch::x86_64::debug_reg::release_slot(0);
+    let slot = FS28_WATCH_SLOT.swap(-1, core::sync::atomic::Ordering::AcqRel);
+    if slot < 0 {
+        return;
+    }
+    crate::arch::x86_64::debug_reg::release_slot(slot as usize);
 }
