@@ -117,102 +117,70 @@ fn read_user_u64_safe(cr3: u64, va: u64) -> Result<u64, ()> {
     Ok(u64::from_le_bytes(buf))
 }
 
-/// Compact VMA data for a single `rip`, extracted under `PROCESS_TABLE` lock
-/// and used for the `[STACK/VMA]` line after the lock is dropped.
-#[derive(Copy, Clone)]
-struct StackVmaInfo {
-    vma_base:       u64,
-    vma_end:        u64,
-    offset_in_vma:  u64,
-    /// Non-zero only for file-backed VMAs.
-    offset_in_file: u64,
-    /// Non-zero only for ELF PT_LOAD segments.
-    vaddr_in_elf:   u64,
-    /// `&'static str` from `VmArea::name` — valid for the kernel's lifetime.
-    name:           &'static str,
-    is_file:        bool,
-}
-
 /// Emit a `[STACK/VMA]` line for the given `rip` at the specified `depth`.
 ///
-/// Acquires `PROCESS_TABLE` briefly to snapshot the VMA covering `rip`, then
-/// drops the lock before calling `serial_println!` (COM1 is slow and must not
-/// be held across the spinlock; identical discipline to `emit_signal_vma_banner`).
+/// Acquires `PROCESS_TABLE` briefly via `find_vma_with_parent_fallback`,
+/// which transparently consults the parent's VmSpace for a CLONE_VM child
+/// (whose own bookkeeping is intentionally empty — see `clone(2)` /
+/// `vfork(2)` "CLONE_VM").  The lock is dropped before calling
+/// `serial_println!` (COM1 is slow and must not be held across the
+/// spinlock; identical discipline to `emit_signal_vma_banner`).
 fn emit_stack_vma_line(pid: u64, tid: u64, depth: usize, rip: u64) {
-    use crate::mm::vma::VmBacking;
-
     // ── Phase 1: snapshot VMA data under the lock ────────────────────────────
-    let info: Option<StackVmaInfo> = {
-        let procs = crate::proc::PROCESS_TABLE.lock();
-        procs
-            .iter()
-            .find(|p| p.pid == pid)
-            .and_then(|proc_entry| proc_entry.vm_space.as_ref())
-            .and_then(|vs| vs.find_vma(rip))
-            .map(|vma| {
-                let offset_in_vma = rip - vma.base;
-                let (is_file, offset_in_file, vaddr_in_elf) = match &vma.backing {
-                    VmBacking::File { offset, elf_load_delta, .. } => {
-                        let off_file = offset + offset_in_vma;
-                        let vaddr    = if *elf_load_delta != 0 {
-                            off_file.wrapping_add(*elf_load_delta)
-                        } else {
-                            0
-                        };
-                        (true, off_file, vaddr)
-                    }
-                    _ => (false, 0, 0),
-                };
-                StackVmaInfo {
-                    vma_base:      vma.base,
-                    vma_end:       vma.end(),
-                    name:          vma.name,
-                    offset_in_vma,
-                    offset_in_file,
-                    vaddr_in_elf,
-                    is_file,
-                }
-            })
-        // lock dropped here
-    };
+    let hit = crate::proc::find_vma_with_parent_fallback(pid, rip);
 
     // ── Phase 2: emit after the lock is released ─────────────────────────────
-    match info {
+    let v = match hit {
         None => {
             crate::serial_println!(
                 "[STACK/VMA] pid={} tid={} depth={} rip={:#x} no_vma=1",
                 pid, tid, depth, rip,
             );
+            return;
         }
-        Some(v) if v.is_file && v.vaddr_in_elf != 0 => {
-            crate::serial_println!(
-                "[STACK/VMA] pid={} tid={} depth={} rip={:#x} \
-                 vma_base={:#x} vma_end={:#x} file={} \
-                 offset_in_vma={:#x} offset_in_file={:#x} vaddr_in_elf={:#x}",
-                pid, tid, depth, rip,
-                v.vma_base, v.vma_end, v.name,
-                v.offset_in_vma, v.offset_in_file, v.vaddr_in_elf,
-            );
-        }
-        Some(v) if v.is_file => {
-            crate::serial_println!(
-                "[STACK/VMA] pid={} tid={} depth={} rip={:#x} \
-                 vma_base={:#x} vma_end={:#x} file={} \
-                 offset_in_vma={:#x} offset_in_file={:#x}",
-                pid, tid, depth, rip,
-                v.vma_base, v.vma_end, v.name,
-                v.offset_in_vma, v.offset_in_file,
-            );
-        }
-        Some(v) => {
-            // Anonymous or device mapping.
-            crate::serial_println!(
-                "[STACK/VMA] pid={} tid={} depth={} rip={:#x} \
-                 vma_base={:#x} vma_end={:#x} file=<anon> offset_in_vma={:#x}",
-                pid, tid, depth, rip,
-                v.vma_base, v.vma_end, v.offset_in_vma,
-            );
-        }
+        Some(v) => v,
+    };
+    let offset_in_vma = rip - v.vma_base;
+    let offset_in_file = if v.file_backed {
+        v.file_offset + offset_in_vma
+    } else {
+        0
+    };
+    let vaddr_in_elf = if v.file_backed && v.elf_load_delta != 0 {
+        offset_in_file.wrapping_add(v.elf_load_delta)
+    } else {
+        0
+    };
+    // Suffix marks a parent-inherited (CLONE_VM child) resolution so a
+    // reader can tell at a glance that the diagnostic walked the parent's
+    // bookkeeping rather than the child's own.
+    let suffix = if v.inherited { " inherited_from_parent=1" } else { "" };
+    if v.file_backed && vaddr_in_elf != 0 {
+        crate::serial_println!(
+            "[STACK/VMA] pid={} tid={} depth={} rip={:#x} \
+             vma_base={:#x} vma_end={:#x} file={} \
+             offset_in_vma={:#x} offset_in_file={:#x} vaddr_in_elf={:#x}{}",
+            pid, tid, depth, rip,
+            v.vma_base, v.vma_end, v.name,
+            offset_in_vma, offset_in_file, vaddr_in_elf, suffix,
+        );
+    } else if v.file_backed {
+        crate::serial_println!(
+            "[STACK/VMA] pid={} tid={} depth={} rip={:#x} \
+             vma_base={:#x} vma_end={:#x} file={} \
+             offset_in_vma={:#x} offset_in_file={:#x}{}",
+            pid, tid, depth, rip,
+            v.vma_base, v.vma_end, v.name,
+            offset_in_vma, offset_in_file, suffix,
+        );
+    } else {
+        // Anonymous or device mapping.
+        crate::serial_println!(
+            "[STACK/VMA] pid={} tid={} depth={} rip={:#x} \
+             vma_base={:#x} vma_end={:#x} file=<anon> offset_in_vma={:#x}{}",
+            pid, tid, depth, rip,
+            v.vma_base, v.vma_end, offset_in_vma, suffix,
+        );
     }
 }
 

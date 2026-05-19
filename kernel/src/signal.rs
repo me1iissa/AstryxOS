@@ -1353,10 +1353,31 @@ fn vma_file_key(vma: &VmaSnap, fault_va: u64) -> Option<(usize, u64, u64)> {
 /// here without re-acquiring locks already dropped).
 pub fn emit_fault_phys_for_fatal(pid: u64, user_rip: u64, cr2: u64, cr3: u64) {
     // Snapshot under the PROCESS_TABLE lock, then release before printing.
+    //
+    // For a CLONE_VM child (`vm_space == None`, shared CR3 with parent —
+    // see `clone(2)` "CLONE_VM" + `vfork(2)`) the child's own VMA list is
+    // empty by design.  Fall back to the parent's VmSpace so the
+    // `[FAULT/PHYS]` diagnostic reports `vma_offset=<off>` instead of
+    // `vma_offset=NO_VMA` when the fault lies inside a parent-mapped
+    // segment (library text, anon code page, etc.).  The PFH itself
+    // already does this fallback for the actual fault path — see
+    // `arch/x86_64/idt.rs::handle_page_fault` (the target_pid switch).
     let snap = {
         let procs = crate::proc::PROCESS_TABLE.lock();
-        let space = procs.iter().find(|p| p.pid == pid).and_then(|p| p.vm_space.as_ref());
-        signal_vma_snapshot(space, user_rip, cr2)
+        let child = procs.iter().find(|p| p.pid == pid);
+        let direct_space = child.and_then(|p| p.vm_space.as_ref());
+        if let Some(space) = direct_space {
+            signal_vma_snapshot(Some(space), user_rip, cr2)
+        } else if let Some(c) = child {
+            let parent_pid = c.parent_pid;
+            let cr3_child = c.cr3;
+            let parent_space = procs.iter()
+                .find(|p| p.pid == parent_pid && p.cr3 == cr3_child && cr3_child != 0)
+                .and_then(|p| p.vm_space.as_ref());
+            signal_vma_snapshot(parent_space, user_rip, cr2)
+        } else {
+            signal_vma_snapshot(None, user_rip, cr2)
+        }
     };
     emit_fault_phys_diagnostic(pid, user_rip, cr3, &snap);
 }
