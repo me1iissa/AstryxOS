@@ -52,6 +52,19 @@ pub mod vfork_diag;
 #[cfg(feature = "elf-write-trace")]
 pub mod elf_write_trace;
 
+/// SSP-canary divergence diagnostic.  Fires once per `#GP` taken from CPL 3
+/// at the publicly-exported musl `__stack_chk_fail` two-byte `hlt;ret` stub
+/// (ld-musl-x86_64.so.1 + 0x1c7f9, per the musl ldso `.dynsym`).  The hook
+/// emits the live `IA32_FS_BASE` MSR, the master canary at `*(fs_base+0x28)`,
+/// and the saved-canary qword the SSP epilogue was about to read.  Mode A
+/// (saved-canary mutated) and Mode B (FS_BASE shifted mid-function) are
+/// distinguishable from the emitted lines.  Bounded to a small number of
+/// events per boot.  See POSIX sigaction(2), Intel SDM Vol. 3A §3.4.4.1
+/// (IA32_FS_BASE), §6.15 (#GP), System V AMD64 ABI §6.4.  Gated behind
+/// `ssp-canary-diag` so master builds remain byte-identical.
+#[cfg(feature = "ssp-canary-diag")]
+pub mod ssp_diag;
+
 /// Bounded broadcast-within-cluster compensation for FUTEX_WAKE.  Mitigates
 /// the older-glibc `pthread_cond_signal` race
 /// (<https://sourceware.org/bugzilla/show_bug.cgi?id=25847>) by
