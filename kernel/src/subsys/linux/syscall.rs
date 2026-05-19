@@ -2473,8 +2473,25 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 PR_SET_PDEATHSIG         => 0,
                 PR_SET_CHILD_SUBREAPER   => 0, // stub: accept but no real subreaper support
                 PR_GET_CHILD_SUBREAPER   => {
-                    // Report "not a subreaper"
+                    // Report "not a subreaper".  Range-check the user
+                    // pointer before the write: SMAP's AC=1 only blocks
+                    // CPL-0 access to PTE.U=1 user pages — it does NOT
+                    // gate kernel-VA writes (those pages have PTE.U=0
+                    // and SMAP is inactive on them), so a sandboxed
+                    // process passing `arg2 = KERNEL_VIRT_BASE + offset`
+                    // would obtain a 4-byte arbitrary-write primitive
+                    // mediated by this stub.  Per prctl(2) ERRORS,
+                    // EFAULT is the conformant response for a pointer
+                    // outside the caller's address space.
+                    //
+                    // CWE-822 (Untrusted Pointer Dereference) /
+                    // CWE-823 (Use of Out-of-range Pointer Offset).
                     if arg2 != 0 {
+                        if !crate::syscall::user_ptr_check_bypassed()
+                            && !crate::syscall::validate_user_ptr(arg2, 4)
+                        {
+                            return -14; // EFAULT
+                        }
                         unsafe {
                             let _g = crate::arch::x86_64::smap::UserGuard::new();
                             core::ptr::write_unaligned(arg2 as *mut u32, 0);
@@ -2600,7 +2617,29 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 let len  = t.robust_list_len;
                 drop(threads);
                 // Write head pointer into *head_ptr (arg2 is **robust_list_head)
-                // and length into *len_ptr — both user pointers.
+                // and length into *len_ptr — both user pointers.  Each
+                // is range-checked before the write so a sandboxed
+                // process cannot supply `arg2 = KERNEL_VIRT_BASE + off`
+                // to obtain an 8-byte arbitrary-write primitive (SMAP
+                // only blocks CPL-0 writes to PTE.U=1 user pages;
+                // kernel-VA pages are PTE.U=0 and SMAP is inactive on
+                // them).  Per get_robust_list(2) ERRORS, EFAULT is the
+                // conformant response for an inaccessible pointer.
+                //
+                // CWE-822 / CWE-823.  Same threat class as the audit's
+                // C2 finding (iovec kernel-VA, closed in PR #242).
+                if arg2 != 0
+                    && !crate::syscall::user_ptr_check_bypassed()
+                    && !crate::syscall::validate_user_ptr(arg2, 8)
+                {
+                    return -14; // EFAULT
+                }
+                if arg3 != 0
+                    && !crate::syscall::user_ptr_check_bypassed()
+                    && !crate::syscall::validate_user_ptr(arg3, 8)
+                {
+                    return -14; // EFAULT
+                }
                 unsafe {
                     let _g = crate::arch::x86_64::smap::UserGuard::new();
                     if arg2 != 0 { core::ptr::write(arg2 as *mut u64, head); }
@@ -2617,8 +2656,34 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         281 => sys_epoll_wait(arg1 as usize, arg2, arg3 as usize, arg4 as i32),
         // 291: epoll_create1(flags)
         291 => sys_epoll_create1(arg1 as u32),
-        // 309: getcpu(cpu, node, cache) — stub
+        // 309: getcpu(cpu, node, cache) — stub.  Both `cpu` and `node`
+        // are user pointers that we range-check before writing; the
+        // third arg (`cache`) is deprecated and ignored per getcpu(2)
+        // NOTES (it has had no effect since Linux 2.6.24).
+        //
+        // Without the range check, a sandboxed process passing
+        // `arg1 = KERNEL_VIRT_BASE + off` obtains a 4-byte
+        // arbitrary-write primitive of the value 0 — SMAP's AC=1 only
+        // blocks CPL-0 writes to PTE.U=1 user pages and is inactive on
+        // kernel-VA pages (PTE.U=0).  Even a constant-zero write is a
+        // weaponisable primitive (clear an `enabled` flag, NULL a
+        // function pointer, blank an audit-record field).  CWE-822 /
+        // CWE-823; same threat class as the audit's C2 finding.
+        //
+        // Per getcpu(2) ERRORS, EFAULT is the conformant response.
         309 => {
+            if arg1 != 0
+                && !crate::syscall::user_ptr_check_bypassed()
+                && !crate::syscall::validate_user_ptr(arg1, 4)
+            {
+                return -14; // EFAULT
+            }
+            if arg2 != 0
+                && !crate::syscall::user_ptr_check_bypassed()
+                && !crate::syscall::validate_user_ptr(arg2, 4)
+            {
+                return -14; // EFAULT
+            }
             unsafe {
                 let _g = crate::arch::x86_64::smap::UserGuard::new();
                 if arg1 != 0 { core::ptr::write(arg1 as *mut u32, 0); }
