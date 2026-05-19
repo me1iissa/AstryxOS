@@ -711,6 +711,72 @@ pub fn arm_phys_slot_watchpoint(phys: u64, off: u64, len: u8) -> ArmPhysResult {
     ArmPhysResult::Armed(slot)
 }
 
+/// Arm a write-only watchpoint on a USER linear address (low-canonical half).
+///
+/// Per Intel SDM Vol. 3B §17.2.4 (DR0–DR3) the linear-address compare runs
+/// on every memory access regardless of CPL, so a user-VA arm catches both
+/// kernel-mode stores via `PHYS_OFF + phys` AND user-mode stores via the
+/// same user VA from any thread whose CR3 has that VA mapped (e.g. the
+/// parent's sibling threads during a `CLONE_VFORK` window).
+///
+/// Used by the SSP-epilogue scan (axis-N+1 diagnostic in
+/// `subsys/linux/vfork_diag.rs`) to watch a specific user-space canary
+/// slot located by byte-pattern scan.
+///
+/// Slot selection mirrors `arm_phys_slot_watchpoint`: prefer DR1/DR2/DR3
+/// so the CRC walker's DR0 is not stolen; fall back to DR0 only if all
+/// three pre-insert slots are busy.
+///
+/// `len` is restricted to {1, 2, 4, 8} per Intel SDM Vol. 3B §17.2.4
+/// Table 17-2 and must be naturally-aligned to `len`.  `linear` must lie
+/// in the low canonical user half (below `USER_VA_LIMIT = 0x8000_0000_0000`).
+///
+/// Returns the slot index (0..=3) on success or `None` if the parameters
+/// were invalid or all four slots are busy.
+pub fn arm_user_va_watchpoint(linear: u64, len: u8) -> Option<u8> {
+    // Reject lengths the DR LEN field cannot encode.
+    match len {
+        1 | 2 | 4 | 8 => {}
+        _ => return None,
+    }
+    // Reject misaligned watch address per Intel SDM §17.2.4 Table 17-2.
+    if linear & (len as u64 - 1) != 0 {
+        return None;
+    }
+    // Refuse non-canonical / kernel-half addresses — the parent's stack
+    // canary always lives in the low canonical half.
+    const USER_VA_LIMIT: u64 = 0x0000_8000_0000_0000;
+    if linear == 0 || linear >= USER_VA_LIMIT {
+        return None;
+    }
+    let phys: u64 = 0;          // unknown / unused for the [W215/DR-ARM] line
+    let inode: u64 = 0;
+    let file_offset: u64 = 0;
+    let mut armed_slot: Option<u8> = None;
+    for slot in [1usize, 2, 3, 0] {
+        if try_arm_slot(slot, linear, len, phys, inode, file_offset) {
+            armed_slot = Some(slot as u8);
+            break;
+        }
+    }
+    let slot = armed_slot?;
+    ARM_COUNT.fetch_add(1, Ordering::Relaxed);
+    crate::serial_println!(
+        "[W215/DR-ARM] slot={} linear={:#x} phys=0 inode=0 offset=0 kind=user_va len={}",
+        slot, linear, len,
+    );
+    SYNC_GENERATION.fetch_add(1, Ordering::Release);
+    program_local_drs();
+    let cpu = super::apic::cpu_index();
+    if cpu < super::apic::MAX_CPUS {
+        LOCAL_SYNC_GENERATION[cpu].store(
+            SYNC_GENERATION.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+    }
+    Some(slot)
+}
+
 /// Manually arm a write-only watchpoint on `PHYS_OFF + phys` from a kdb
 /// command, bypassing the `cache::insert` pre-arm key filter.  Useful when
 /// a corrupted phys has already been observed by the CRC walker but the
