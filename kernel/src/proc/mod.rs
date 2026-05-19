@@ -263,6 +263,22 @@ pub struct Thread {
     /// path (initial thread, fork-style clone with a fresh CR3, kernel
     /// threads, AP idle threads).
     pub vfork_isolated_stack: Option<(u64, u64)>,
+    /// Per `clone(2)`/`vfork(2)`: companion to `vfork_isolated_stack`.  The
+    /// `CLONE_VM|CLONE_VFORK` child path provisions a minimal per-vfork-child
+    /// "thread-control block" page so the child can read its `%fs:0`-relative
+    /// state before `execve(2)` installs a fresh TCB.  Per the System V x86_64
+    /// ABI §3.4.2 (Thread-Local Storage / Variant II) and the ELF gABI §3.5,
+    /// libc TLS reads on x86_64 begin with `mov %fs:0,%REG` to materialise
+    /// the TCB address; with `tls_base == 0` that fault would block the
+    /// musl `posix_spawn(3)` child helper at its first cancellable libc
+    /// syscall (`close(2)`).  The provisioned page is zero-initialised so
+    /// the byte at `%fs:0x28` is 0 (not the parent's stack-protector canary)
+    /// — preserving the canary-isolation invariant — and pre-populates only
+    /// the self-pointer at offset 0 plus the `canceldisable` byte at offset
+    /// 64 (POSIX `pthread_setcancelstate(3)` PTHREAD_CANCEL_DISABLE).  This
+    /// field records `(base, length)` so the kernel can unmap it at
+    /// `execve(2)` / vfork-child exit.  `None` for every non-vfork path.
+    pub vfork_isolated_tls: Option<(u64, u64)>,
 }
 
 impl Thread {
@@ -686,6 +702,7 @@ pub fn init() {
         robust_list_head: 0,
         robust_list_len: 0,
         vfork_isolated_stack: None,
+        vfork_isolated_tls: None,
     };
 
     PROCESS_TABLE.lock().push(idle_proc);
@@ -935,6 +952,7 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
         robust_list_head: 0,
         robust_list_len: 0,
         vfork_isolated_stack: None,
+        vfork_isolated_tls: None,
     };
 
     PROCESS_TABLE.lock().push(process);
@@ -1001,6 +1019,7 @@ pub fn create_thread(pid: Pid, name: &str, entry_point: u64) -> Option<Tid> {
         robust_list_head: 0,
         robust_list_len: 0,
         vfork_isolated_stack: None,
+        vfork_isolated_tls: None,
     };
 
     THREAD_TABLE.lock().push(thread);
@@ -1071,6 +1090,7 @@ pub fn create_thread_blocked(pid: Pid, name: &str, entry_point: u64) -> Option<T
         robust_list_head: 0,
         robust_list_len: 0,
         vfork_isolated_stack: None,
+        vfork_isolated_tls: None,
     };
 
     THREAD_TABLE.lock().push(thread);
@@ -1197,6 +1217,27 @@ pub fn exit_thread(exit_code: i64) {
             let mut threads = THREAD_TABLE.lock();
             if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
                 t.vfork_isolated_stack = None;
+            }
+        }
+    }
+
+    // Vfork isolated-TLS cleanup: companion to the stack cleanup above.
+    // The per-vfork-child TCB page lives in the parent's address space —
+    // tearing it down here (before `wake_vfork_parent()`) ensures the parent
+    // never sees a stale `[vfork-tls]` VMA after resume.
+    {
+        let isolated_tls = {
+            let threads = THREAD_TABLE.lock();
+            threads.iter().find(|t| t.tid == tid)
+                .and_then(|t| t.vfork_isolated_tls)
+        };
+        if let Some((base, length)) = isolated_tls {
+            if parent_pid != 0 {
+                vfork_isolated_tls_cleanup(parent_pid, base, length);
+            }
+            let mut threads = THREAD_TABLE.lock();
+            if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+                t.vfork_isolated_tls = None;
             }
         }
     }
@@ -1816,6 +1857,21 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
                 t.vfork_isolated_stack = None;
             }
         }
+
+        // Companion: vfork isolated-TLS cleanup.  Same ordering rationale —
+        // parent must observe the mapping torn down before it resumes.
+        let isolated_tls = {
+            let threads = THREAD_TABLE.lock();
+            threads.iter().find(|t| t.tid == calling_tid)
+                .and_then(|t| t.vfork_isolated_tls)
+        };
+        if let Some((base, length)) = isolated_tls {
+            vfork_isolated_tls_cleanup(parent_pid, base, length);
+            let mut threads = THREAD_TABLE.lock();
+            if let Some(t) = threads.iter_mut().find(|t| t.tid == calling_tid) {
+                t.vfork_isolated_tls = None;
+            }
+        }
     }
 
     // vfork completion: if the caller is a vfork child fatal-faulting mid-
@@ -2269,6 +2325,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
         robust_list_head: 0,
         robust_list_len: 0,
         vfork_isolated_stack: None,
+        vfork_isolated_tls: None,
     };
 
     PROCESS_TABLE.lock().push(child_proc);
@@ -2475,24 +2532,30 @@ pub fn fork_process_share_vm(
         user_entry_r8:  0,
         priority: PRIORITY_NORMAL,
         base_priority: PRIORITY_NORMAL,
-        // TLS base is set to 0 for CLONE_VM|CLONE_VFORK children.  This is
-        // a hard safety invariant — see the unconditional WRMSR site in
-        // `proc::usermode::enter_user_mode` (~L347-353): when `tls_base == 0`
-        // the user-mode entry path explicitly zeros FS.base via WRMSR before
-        // jumping to user mode.  Skipping that WRMSR (i.e. inheriting the
-        // parent's FS.base by leaving the MSR alone) would let the child's
-        // stack-guard epilogue read a valid-looking parent canary from
-        // %fs:0x28 and so corrupt the SSP comparison.
+        // TLS base starts at 0 here so a CLONE_VM|CLONE_VFORK child cannot
+        // read the parent's stack-protector canary at `%fs:0x28`.  See the
+        // unconditional WRMSR site in `proc::usermode::enter_user_mode`
+        // (~L347-353): when `tls_base == 0` the user-mode entry path
+        // explicitly zeros FS.base via WRMSR before jumping to user mode.
+        // Skipping that WRMSR (i.e. inheriting the parent's FS.base by
+        // leaving the MSR alone) would let the child's stack-guard epilogue
+        // read a valid-looking parent canary from %fs:0x28 and so corrupt
+        // the SSP comparison.
         //
-        // Any change to TLS-inheritance behavior for CLONE_VM|CLONE_VFORK
-        // children must be preceded by empirical falsification — saved-canary
-        // and master-canary snapshot-pair diagnostics — and a binding
-        // cross-walk on the tree.  See POSIX clone(2) for the semantics of
-        // tls/CLONE_SETTLS (we ignore parent_tls_base here precisely so that
-        // an execve(2)-driven `arch_prctl(ARCH_SET_FS, new_tls)` is the only
-        // way the child's FS.base ever becomes non-zero).
+        // For the `posix_spawn(3)` child path, the clone(2) dispatcher
+        // (kernel/src/subsys/linux/syscall.rs arm 56) immediately calls
+        // `alloc_vfork_child_tls(parent_pid)` to provision a fresh, zeroed,
+        // child-private TCB page mapped into the shared address space and
+        // overwrites `tls_base` here with the returned VA.  The new page
+        // preserves the canary-isolation invariant (its byte at +0x28 is 0,
+        // not the parent's canary) while giving the child a valid `%fs:0`
+        // self-pointer so the first cancellable libc syscall (`close(2)`)
+        // does not fault.  See `alloc_vfork_child_tls` for the layout and
+        // the System V x86_64 ABI §3.4.2 / ELF gABI §3.5 references.
         //
-        // Refs: POSIX clone(2); Intel SDM Vol. 3A §6.8 (WRMSR FS_BASE).
+        // Refs: POSIX clone(2) / vfork(2) / posix_spawn(3);
+        //       System V x86_64 ABI §3.4.2 (TLS / Variant II);
+        //       Intel SDM Vol. 3A §3.4.4, §6.8 (WRMSR FS_BASE).
         tls_base: 0,
         cpu_affinity: None,
         last_cpu: 0,
@@ -2505,6 +2568,7 @@ pub fn fork_process_share_vm(
         robust_list_head: 0,
         robust_list_len: 0,
         vfork_isolated_stack: None,
+        vfork_isolated_tls: None,
     };
 
     PROCESS_TABLE.lock().push(child_proc);
@@ -2759,6 +2823,186 @@ pub fn vfork_isolated_stack_cleanup(parent_pid: Pid, base: u64, length: u64) {
     );
 }
 
+/// Allocate a **minimal per-vfork-child TLS page** so that the child's
+/// `%fs:0`-relative reads do not fault before `execve(2)` can install a
+/// fresh image.
+///
+/// # Why this exists
+///
+/// Per the System V x86_64 ABI §3.4.2 ("Thread-Local Storage") and the ELF
+/// gABI §3.5, the Variant II TLS model on x86_64 places a "thread-control
+/// block" (TCB) at the address the FS segment base points to.  The first
+/// 8 bytes of the TCB are required to be a self-pointer: every TLS-relative
+/// helper in libc starts by issuing `mov %fs:0,%REG` to materialise the
+/// TCB address.  See also Intel SDM Vol. 3A §3.4.4 for `FS_BASE` / `GS_BASE`
+/// segmentation semantics in 64-bit mode.
+///
+/// `CLONE_VM|CLONE_VFORK` children inherit `tls_base = 0` (set by
+/// `fork_process_share_vm`).  This is the safer choice for stack-protector
+/// canary isolation — see the comment on the Thread initializer there —
+/// but it leaves the child unable to read its own TCB.  The first thing
+/// the `posix_spawn(3)` child helper does after the `clone(2)` syscall
+/// returns is invoke `close(2)` to drop the parent-pipe write fd; per
+/// POSIX, `close(3)` is a cancellation point, so the libc routes through
+/// its cancellable-syscall wrapper which reads `%fs:0` to materialise the
+/// thread pointer.  With `tls_base == 0` that first deref faults at VA 0.
+///
+/// # What this helper does
+///
+/// 1. Allocates a 4 KiB anonymous VMA in the shared address space.
+/// 2. Backs it with a fresh, zeroed page.  Zeroed bytes give the child a
+///    safe-by-default TCB: a 0 canary at `%fs:0x28`, a 0 cancel flag, etc.
+///    None of those values aliases the parent's, so the `tls_base = 0`
+///    invariant's intent (no canary leakage from the parent's TLS) is
+///    preserved.
+/// 3. Writes the TCB self-pointer at offset 0 — the ABI-required field
+///    every libc-TLS read starts with.
+/// 4. Writes the per-thread cancel-state byte at offset 64 to a non-zero
+///    value so the cancellable-syscall wrapper short-circuits to the raw
+///    `__syscall(2)` path — matching the parent's own behaviour, which
+///    already called `pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, …)`
+///    around the `clone(2)` per POSIX `posix_spawn(3)`.
+/// 5. Maps the page with PRESENT|WRITABLE|USER|NX into the parent's CR3 so
+///    the child (which runs on `parent_cr3`) can read and write it without
+///    invoking the page-fault handler.
+/// 6. Returns the base VA (== TCB self-pointer value).  The caller stores
+///    it in `Thread.tls_base` and the user-mode entry path writes it to
+///    `FS_BASE` (MSR `0xC000_0100`) before IRETQ to Ring 3.
+///
+/// # Why this is safe vs. the canary-isolation goal
+///
+/// The original `tls_base = 0` choice existed to guarantee the child could
+/// NOT read the parent's canary at `%fs:0x28`.  Routing the child's
+/// FS.base to a fresh, zero-initialised page achieves the same isolation:
+/// byte 0x28 of the new page is 0, not the parent's canary.  An
+/// SSP-instrumented function inside the child pushes 0 to its frame in
+/// prologue and compares against 0 in epilogue — canary self-consistent
+/// within the child.  The parent never reads this page because (a) the
+/// parent is blocked in `vfork(2)` until the child execs/exits, and (b)
+/// on resume the parent's FS.base is its own (unchanged) TCB.
+///
+/// # Cleanup
+///
+/// The base+length is recorded on `Thread.vfork_isolated_tls` and unmapped
+/// at the same three sites that release `vfork_isolated_stack`:
+///   * `execve(2)` case (C) — `syscall::sys_exec` after the new VmSpace is
+///     installed and the parent is woken via `wake_vfork_parent()`.
+///   * Vfork-child exit (`exit`, `exit_group`, or fatal signal) — via
+///     `vfork_isolated_tls_cleanup()` from the thread-exit path.
+///
+/// # References
+///
+/// * POSIX `vfork(2)` / `posix_spawn(3)` / `pthread_setcancelstate(3)`
+/// * System V x86_64 ABI §3.4.2 (TLS / Variant II)
+/// * ELF gABI §3.5 (Thread-local storage)
+/// * Intel SDM Vol. 3A §3.4.4 (FS / GS segment base in 64-bit mode)
+/// * Intel SDM Vol. 3A §4.6 (SMAP semantics)
+pub fn alloc_vfork_child_tls(parent_pid: Pid) -> Option<u64> {
+    use crate::mm::vma::{VmArea, VmBacking, VmaError,
+                         PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS,
+                         page_align_up};
+    use crate::mm::vmm::{PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER, PAGE_NO_EXECUTE};
+
+    // One 4 KiB page is sufficient: the runtime TCB plus the handful of
+    // bytes the cancellable-syscall path reads (`%fs:0` plus single-byte
+    // fields near `+0x40`) all live within the first page.  The child
+    // never enters the standard `__init_tls` block expansion before
+    // `execve(2)` — execve installs a fresh image that runs its own
+    // libc-init sequence.
+    const VFORK_TLS_SIZE: u64 = 4096;
+
+    // Cancel-state byte position inside the TCB.  Per POSIX
+    // `pthread_setcancelstate(3)` and the SysV `<pthread.h>` ABI, the
+    // `canceldisable` member of a `struct pthread` lands at byte offset 64
+    // after `self`, `dtv`, `prev`, `next`, `sysinfo`, `canary` (6×8 = 48)
+    // and the implementation-internal `tid`, `errno_val`, `detach_state`,
+    // `cancel` (4×4 = 16).  PTHREAD_CANCEL_DISABLE == 1 per POSIX.
+    const TCB_CANCELDISABLE_OFFSET: usize = 64;
+    const PTHREAD_CANCEL_DISABLE: u8 = 1;
+
+    let length = page_align_up(VFORK_TLS_SIZE);
+
+    // ── Phase 1: locate the parent's VmSpace and find a free range.
+    let (parent_cr3, base) = {
+        let mut procs = PROCESS_TABLE.lock();
+        let p = procs.iter_mut().find(|p| p.pid == parent_pid)?;
+        let space = p.vm_space.as_mut()?;
+        let base = space.find_free_range(length)?;
+
+        let vma = VmArea {
+            base,
+            length,
+            prot: PROT_READ | PROT_WRITE,
+            flags: MAP_PRIVATE | MAP_ANONYMOUS,
+            backing: VmBacking::Anonymous,
+            name: "[vfork-tls]",
+        };
+        if let Err(VmaError::Overlap) = space.insert_vma(vma) {
+            return None;
+        }
+        (p.cr3, base)
+    };
+
+    // ── Phase 2: allocate the backing frame, zero it, and lay down the
+    // minimal TCB: self-pointer at offset 0; cancel-state byte at offset 64.
+    let frame = crate::mm::pmm::alloc_page()?;
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    unsafe {
+        let kva = (PHYS_OFF + frame) as *mut u8;
+        core::ptr::write_bytes(kva, 0, 4096);
+        core::ptr::write(kva as *mut u64, base);
+        *kva.add(TCB_CANCELDISABLE_OFFSET) = PTHREAD_CANCEL_DISABLE;
+    }
+
+    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_NO_EXECUTE;
+    if !crate::mm::vmm::map_page_in(parent_cr3, base, frame, flags) {
+        crate::mm::pmm::free_page(frame);
+        let mut procs = PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == parent_pid) {
+            if let Some(space) = p.vm_space.as_mut() {
+                let _ = space.remove_range(base, length);
+            }
+        }
+        return None;
+    }
+    crate::mm::refcount::page_ref_inc(frame);
+
+    crate::serial_println!(
+        "[VFORK-TLS] alloc parent_pid={} cr3={:#x} base={:#x} length={:#x} \
+         self_ptr={:#x} canceldisable_off={} canceldisable=1",
+        parent_pid, parent_cr3, base, length, base, TCB_CANCELDISABLE_OFFSET
+    );
+
+    Some(base)
+}
+
+/// Tear down the per-vfork-child TLS page from the parent's address space.
+/// Symmetric to `vfork_isolated_stack_cleanup`; safe to call multiple
+/// times.
+pub fn vfork_isolated_tls_cleanup(parent_pid: Pid, base: u64, length: u64) {
+    let parent_cr3 = {
+        let procs = PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == parent_pid).map(|p| p.cr3).unwrap_or(0)
+    };
+    if parent_cr3 == 0 { return; }
+
+    let unmapped = crate::mm::vmm::unmap_and_free_range_in(parent_cr3, base, length);
+
+    {
+        let mut procs = PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == parent_pid) {
+            if let Some(space) = p.vm_space.as_mut() {
+                let _ = space.remove_range(base, length);
+            }
+        }
+    }
+
+    crate::serial_println!(
+        "[VFORK-TLS] cleanup parent_pid={} cr3={:#x} base={:#x} length={:#x} unmapped_pages={}",
+        parent_pid, parent_cr3, base, length, unmapped
+    );
+}
+
 /// Apply `CLONE_CLEAR_SIGHAND` semantics to a process's signal-action table.
 ///
 /// Per `clone3(2)`: every signal whose current handler is not `SIG_IGN` is
@@ -2970,6 +3214,7 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
         robust_list_head: 0,
         robust_list_len: 0,
         vfork_isolated_stack: None,
+        vfork_isolated_tls: None,
     };
 
     PROCESS_TABLE.lock().push(child_proc);

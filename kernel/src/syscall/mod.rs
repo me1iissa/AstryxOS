@@ -1373,7 +1373,7 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
     //     blocked in `schedule()` with its own RSP elsewhere — so the
     //     unmap is race-free with respect to the parent thread.
     if is_shared_vm_child {
-        let (parent_pid, isolated_stack) = {
+        let (parent_pid, isolated_stack, isolated_tls) = {
             let tid = crate::proc::current_tid();
             let procs = crate::proc::PROCESS_TABLE.lock();
             let threads = crate::proc::THREAD_TABLE.lock();
@@ -1382,11 +1382,10 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
                 .find(|p| p.pid == pid)
                 .map(|p| p.parent_pid)
                 .unwrap_or(0);
-            let isolated = threads
-                .iter()
-                .find(|t| t.tid == tid)
-                .and_then(|t| t.vfork_isolated_stack);
-            (parent_pid, isolated)
+            let t = threads.iter().find(|t| t.tid == tid);
+            let isolated_stack = t.and_then(|t| t.vfork_isolated_stack);
+            let isolated_tls = t.and_then(|t| t.vfork_isolated_tls);
+            (parent_pid, isolated_stack, isolated_tls)
         };
         if let Some((base, length)) = isolated_stack {
             if parent_pid != 0 {
@@ -1398,6 +1397,23 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
             let mut threads = crate::proc::THREAD_TABLE.lock();
             if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
                 t.vfork_isolated_stack = None;
+            }
+        }
+
+        // Companion: drop the per-vfork-child TLS page.  execve(2) is about
+        // to install a fresh VmSpace via the standard ELF load path, which
+        // includes a real `__init_tls` allocating a new TCB; the bridge
+        // page provisioned at clone time has done its job and must not
+        // survive into the new image as a stray `[vfork-tls]` mapping in
+        // the parent's address space.
+        if let Some((base, length)) = isolated_tls {
+            if parent_pid != 0 {
+                crate::proc::vfork_isolated_tls_cleanup(parent_pid, base, length);
+            }
+            let tid = crate::proc::current_tid();
+            let mut threads = crate::proc::THREAD_TABLE.lock();
+            if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+                t.vfork_isolated_tls = None;
             }
         }
     }
