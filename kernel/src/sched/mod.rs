@@ -25,6 +25,134 @@ static TICKS_REMAINING: [AtomicU64; MAX_CPUS] =
 static NEED_RESCHEDULE: [AtomicBool; MAX_CPUS] =
     [const { AtomicBool::new(false) }; MAX_CPUS];
 
+/// Cumulative count of `'pick:` retry iterations that wrapped through
+/// the `sti; hlt; cli; continue 'pick` wait path because no Ready peer
+/// was selectable for the current thread.
+///
+/// One increment per HLT wakeup: in a healthy system this counts the
+/// idle-cycle taken when the CPU literally has no work and is waiting on
+/// the next timer ISR or other wake source.  In a wedge — e.g. every
+/// runnable thread is sleeping on the same condition that nobody is
+/// firing — this counter advances rapidly and unbounded.  Together with
+/// `STARVATION_BURST` it lets diagnostics report "the picker has been
+/// in a sti/hlt/cli loop for N consecutive iterations on CPU X for thread
+/// T".  The counter never resets except on boot, so its rate-of-change
+/// is what diagnostics watch.
+pub static SCHED_PICK_HLT_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Diagnostic threshold above which `schedule()` emits a `[SCHED/STARVE]`
+/// line.  At TICK_HZ=100 a single `sti; hlt; cli` runs until the next
+/// timer ISR (~10 ms), so 200 consecutive HLTs on one thread without a
+/// successful pick corresponds to ~2 s of inability to make forward
+/// progress.  The threshold is intentionally generous: short HLT runs
+/// during legitimate idle (every other tick under low load) must not
+/// trigger the diagnostic.
+///
+/// NOTE: this threshold is tuned for KVM (the default in
+/// `scripts/qemu-harness.py` when `/dev/kvm` is available).  TCG runs
+/// have a syscall throughput roughly an order of magnitude lower and
+/// will spend proportionally more time in HLT during quiet phases —
+/// expect occasional extra `[SCHED/STARVE]` lines on TCG-only hosts and
+/// CI lanes that opt out of KVM with `--no-kvm`.  The line itself is
+/// diagnostic only; it does not change scheduler behaviour.
+const STARVATION_BURST_THRESHOLD: u32 = 200;
+
+/// Re-emit factor for sustained-wedge heartbeats.  After the first
+/// threshold crossing, [`note_picker_hlt`] returns `true` again every
+/// `RESTARVE_PERIOD * STARVATION_BURST_THRESHOLD` HLT cycles so a
+/// multi-minute wedge leaves a trail in the serial log rather than a
+/// single line followed by silence.  At TICK_HZ=100 the default
+/// (10×200 = 2000 HLTs) corresponds to a heartbeat every ~20 s of
+/// sustained wedge time.
+const RESTARVE_PERIOD: u64 = 10;
+
+/// Per-CPU counter of consecutive `sti; hlt; cli; continue 'pick` cycles
+/// on the same `current_tid` without a Ready peer being found.  Reset to
+/// zero whenever the picker succeeds (peer found and context-switch happens)
+/// or `current_tid` changes between iterations.
+static STARVATION_BURST: [AtomicU64; MAX_CPUS] =
+    [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Per-CPU `current_tid` snapshot at the most recent HLT decision.  Used to
+/// detect "the burst is for THIS thread" — if the picker context-switches
+/// away, the burst counter is naturally reset because subsequent waits are
+/// for a different thread.
+static STARVATION_LAST_TID: [AtomicU64; MAX_CPUS] =
+    [const { AtomicU64::new(u64::MAX) }; MAX_CPUS];
+
+/// Total number of times the starvation threshold has been crossed since
+/// boot.  Each increment names one diagnostic emission; the counter is
+/// monotone so downstream tooling can compute "did the scheduler starve
+/// during the last test run?" by snapshotting before/after.
+pub static SCHED_STARVATION_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the cumulative HLT count.  Useful for test-side checks that
+/// the scheduler did not enter an HLT storm during a workload.
+pub fn pick_hlt_count() -> u64 {
+    SCHED_PICK_HLT_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Snapshot of the cumulative starvation events.  An increment indicates
+/// the picker held the same thread for `STARVATION_BURST_THRESHOLD`
+/// consecutive HLT cycles without a successful pick.
+pub fn starvation_count() -> u64 {
+    SCHED_STARVATION_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Internal: record one HLT decision for the given `current_tid` on this
+/// CPU.  Returns `true` if the per-thread burst has just crossed the
+/// starvation threshold (or a subsequent re-emit boundary — see
+/// [`RESTARVE_PERIOD`]) so the caller should emit the diagnostic;
+/// `false` otherwise.  Always bumps the cumulative `SCHED_PICK_HLT_TOTAL`.
+///
+/// A sustained wedge produces a heartbeat trail: the first crossing at
+/// `STARVATION_BURST_THRESHOLD`, then one re-emit every
+/// `RESTARVE_PERIOD * STARVATION_BURST_THRESHOLD` HLT cycles thereafter.
+/// `SCHED_STARVATION_TOTAL` is bumped on every emit, so downstream
+/// tooling can compute "the scheduler was wedged for N×period HLT cycles"
+/// from the delta alone.
+#[inline]
+fn note_picker_hlt(current_tid: u64) -> bool {
+    SCHED_PICK_HLT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let cpu = cpu_index();
+    if cpu >= MAX_CPUS {
+        return false;
+    }
+    let prev_tid = STARVATION_LAST_TID[cpu].load(Ordering::Relaxed);
+    if prev_tid != current_tid {
+        STARVATION_LAST_TID[cpu].store(current_tid, Ordering::Relaxed);
+        STARVATION_BURST[cpu].store(1, Ordering::Relaxed);
+        return false;
+    }
+    let new_burst = STARVATION_BURST[cpu].fetch_add(1, Ordering::Relaxed) + 1;
+    let threshold = STARVATION_BURST_THRESHOLD as u64;
+    // Initial crossing: new_burst == threshold.
+    // Subsequent heartbeats: new_burst == threshold * (1 + k*RESTARVE_PERIOD)
+    //                       for k = 1, 2, 3, ...
+    //   ↳ equivalent to:  new_burst > threshold
+    //                  && (new_burst - threshold) % (threshold * RESTARVE_PERIOD) == 0
+    let crossed_initial = new_burst == threshold;
+    let crossed_heartbeat = new_burst > threshold
+        && (new_burst - threshold) % (threshold * RESTARVE_PERIOD) == 0;
+    if crossed_initial || crossed_heartbeat {
+        SCHED_STARVATION_TOTAL.fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
+/// Internal: clear the per-CPU starvation burst (called when the picker
+/// succeeds, so legitimate idle on a quiet system does not leave stale
+/// burst state that conflates with a later wedge).
+#[inline]
+fn clear_picker_burst() {
+    let cpu = cpu_index();
+    if cpu < MAX_CPUS {
+        STARVATION_BURST[cpu].store(0, Ordering::Relaxed);
+        STARVATION_LAST_TID[cpu].store(u64::MAX, Ordering::Relaxed);
+    }
+}
+
 use crate::arch::x86_64::apic::cpu_index;
 
 /// Initialize CoreSched.
@@ -368,6 +496,13 @@ pub fn schedule() {
                 Some(ThreadState::Sleeping) | Some(ThreadState::Blocked) => {
                     crate::arch::x86_64::irq::reset_watchdog_counter();
                     crate::perf::record_idle_tick();
+                    if note_picker_hlt(current_tid) {
+                        crate::serial_println!(
+                            "[SCHED/STARVE] tid={} state=Sleeping/Blocked (len=1) burst={} \
+                             (>2 s without ready peer; check waitlist / futex bookkeeping)",
+                            current_tid, STARVATION_BURST_THRESHOLD,
+                        );
+                    }
                     // sti; hlt; cli — the STI shadow guarantees the next
                     // instruction (hlt) is executed before any pending
                     // interrupt fires, so this sequence is race-free.
@@ -402,6 +537,13 @@ pub fn schedule() {
                     // stranded and deadlocks the test_runner.
                     crate::arch::x86_64::irq::reset_watchdog_counter();
                     crate::perf::record_idle_tick();
+                    if note_picker_hlt(current_tid) {
+                        crate::serial_println!(
+                            "[SCHED/STARVE] tid={} state=Dead/reaped (len=1) burst={} \
+                             (terminal wedge — no other thread can ever become ready)",
+                            current_tid, STARVATION_BURST_THRESHOLD,
+                        );
+                    }
                     unsafe {
                         core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
                     }
@@ -605,6 +747,13 @@ pub fn schedule() {
                     Some(ThreadState::Sleeping) | Some(ThreadState::Blocked) => {
                         crate::arch::x86_64::irq::reset_watchdog_counter();
                         crate::perf::record_idle_tick();
+                        if note_picker_hlt(current_tid) {
+                            crate::serial_println!(
+                                "[SCHED/STARVE] tid={} state=Sleeping/Blocked (peers exist but none ready) \
+                                 burst={} — runqueue stuck for >2 s; check peer wake hooks",
+                                current_tid, STARVATION_BURST_THRESHOLD,
+                            );
+                        }
                         unsafe {
                             core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
                         }
@@ -623,6 +772,13 @@ pub fn schedule() {
                         // becomes Ready.
                         crate::arch::x86_64::irq::reset_watchdog_counter();
                         crate::perf::record_idle_tick();
+                        if note_picker_hlt(current_tid) {
+                            crate::serial_println!(
+                                "[SCHED/STARVE] tid={} state=Dead/reaped (peers exist but none ready) \
+                                 burst={} — runqueue wedged; no peer wake source firing",
+                                current_tid, STARVATION_BURST_THRESHOLD,
+                            );
+                        }
                         unsafe {
                             core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
                         }
@@ -637,6 +793,12 @@ pub fn schedule() {
             }
         }
     };
+
+    // ── Picker succeeded: reset the per-CPU starvation burst ─────────────
+    // Reaching here means a Ready peer was selected; clear the per-CPU
+    // burst counter so subsequent legitimate idle on a quiet system does
+    // not inherit a stale burst from an earlier transient wedge.
+    clear_picker_burst();
 
     if next_tid == current_tid {
         crate::arch::x86_64::irq::reset_watchdog_counter();

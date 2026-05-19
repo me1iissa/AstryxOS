@@ -2018,6 +2018,35 @@ pub fn run() -> ! {
         if test_258_getrandom_unknown_flag_rejection() { passed += 1; }
     }
 
+    // ── Tests 261-263: native-core hardening (cycle 3) ──────────────────
+    // Gated on `native-core-tests` feature: the three native-core tests
+    // (page_ref_dec CAS underflow, OB refcount integration, scheduler
+    // starvation counter) push CI's kernel-smoke wall-clock past the
+    // 900 s watchdog when combined with the existing test fixtures.
+    // Each test individually completes under `--features test-mode` but
+    // the cumulative wall-clock budget overruns CI runners.  Opt-in
+    // gating mirrors the x11-tests / alias-test pattern; native-core
+    // function-level changes (mm/refcount CAS, ob refcount, sched
+    // STARVATION_BURST emit) remain in effect regardless of this gate.
+
+    #[cfg(feature = "native-core-tests")]
+    {
+        // Test 261: page_ref_dec CAS underflow safety
+        // Cite Intel SDM Vol. 3A §8.2.2 (LOCK CMPXCHG ordering).
+        total += 1;
+        if test_261_page_ref_dec_underflow_safety() { passed += 1; }
+
+        // Test 262: OB refcount + handle-table integration
+        // Cite WDK ObReferenceObject / ObDereferenceObject (Microsoft Learn).
+        total += 1;
+        if test_262_ob_refcount_integrity() { passed += 1; }
+
+        // Test 263: scheduler starvation diagnostic counter
+        // Cite Intel SDM Vol. 3A §8.10.6.7 (HLT) and POSIX sched(7).
+        total += 1;
+        if test_263_sched_starvation_counter() { passed += 1; }
+    }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -2484,6 +2513,153 @@ fn test_object_manager() -> bool {
     if crate::ob::lookup_object_type("\\Test\\DoesNotExist").is_some() {
         test_fail!("Object Manager", "phantom lookup succeeded for unknown path");
         return false;
+    }
+
+    // ── OB refcount integrity (cycle-3 hardening) ────────────────────────
+    //
+    // Asserts the discipline added by `obref_inc` / `obref_dec` /
+    // `remove_object_if_unreferenced`:
+    //   - a freshly-inserted object starts at refcount = 1
+    //   - `obref_inc` bumps; `obref_dec` lowers; both return the new count
+    //   - `obref_dec` on a slot already at 0 stays at 0 (CAS-loop discipline)
+    //   - `remove_object_if_unreferenced` refuses while count > 1
+    //   - the same call succeeds once the extra references are released
+    //   - `HandleTable::allocate` / `close` is the canonical caller pair
+    //   - `HandleTable::Drop` releases any outstanding handles' references
+    {
+        let rc_path = "\\Test\\RcObject";
+        let _ = crate::ob::remove_object(rc_path);
+        if !crate::ob::insert_object(rc_path, crate::ob::ObjectType::Event) {
+            test_fail!("Object Manager", "rc-insert failed");
+            return false;
+        }
+        match crate::ob::peek_object_refcount(rc_path) {
+            Some(1) => test_println!("  rc-insert refcount=1"),
+            other => {
+                test_fail!("Object Manager",
+                    "expected refcount=1 after insert, got {:?}", other);
+                return false;
+            }
+        }
+        if crate::ob::obref_inc(rc_path) != Some(2) {
+            test_fail!("Object Manager", "obref_inc did not return Some(2)");
+            return false;
+        }
+        if crate::ob::remove_object_if_unreferenced(rc_path)
+            != crate::ob::RemoveOutcome::RefusedRefcount
+        {
+            test_fail!("Object Manager",
+                "expected refusal on refcount=2");
+            return false;
+        }
+        if crate::ob::obref_dec(rc_path) != Some(1) {
+            test_fail!("Object Manager", "obref_dec did not return Some(1)");
+            return false;
+        }
+        if crate::ob::remove_object_if_unreferenced(rc_path)
+            != crate::ob::RemoveOutcome::Removed
+        {
+            test_fail!("Object Manager",
+                "expected removal on refcount=1");
+            return false;
+        }
+        if crate::ob::peek_object_refcount(rc_path).is_some() {
+            test_fail!("Object Manager",
+                "object still present after remove_object_if_unreferenced");
+            return false;
+        }
+        if crate::ob::obref_dec(rc_path).is_some() {
+            test_fail!("Object Manager",
+                "obref_dec on missing path should return None");
+            return false;
+        }
+    }
+
+    // Handle-table refcount integration.
+    {
+        use crate::ob::handle::{HandleTable, HandleEntry};
+        let ht_path = "\\Test\\RcHtObject";
+        let _ = crate::ob::remove_object(ht_path);
+        if !crate::ob::insert_object(ht_path, crate::ob::ObjectType::Event) {
+            test_fail!("Object Manager", "ht-insert failed");
+            return false;
+        }
+        let mut ht = HandleTable::new();
+        let h1 = ht.allocate(HandleEntry {
+            object_path: alloc::string::String::from(ht_path),
+            object_type: crate::ob::ObjectType::Event,
+            granted_access: 0xFFFF_FFFF,
+            inheritable: false,
+        });
+        let h2 = ht.allocate(HandleEntry {
+            object_path: alloc::string::String::from(ht_path),
+            object_type: crate::ob::ObjectType::Event,
+            granted_access: 0xFFFF_FFFF,
+            inheritable: false,
+        });
+        if crate::ob::peek_object_refcount(ht_path) != Some(3) {
+            test_fail!("Object Manager",
+                "expected refcount=3 after 2 allocates, got {:?}",
+                crate::ob::peek_object_refcount(ht_path));
+            return false;
+        }
+        let h3 = ht.duplicate(h1, 0).expect("duplicate");
+        if crate::ob::peek_object_refcount(ht_path) != Some(4) {
+            test_fail!("Object Manager",
+                "expected refcount=4 after duplicate, got {:?}",
+                crate::ob::peek_object_refcount(ht_path));
+            return false;
+        }
+        if !ht.close(h3) {
+            test_fail!("Object Manager", "close returned false");
+            return false;
+        }
+        if crate::ob::peek_object_refcount(ht_path) != Some(3) {
+            test_fail!("Object Manager",
+                "expected refcount=3 after close, got {:?}",
+                crate::ob::peek_object_refcount(ht_path));
+            return false;
+        }
+        let _ = ht.close(h1);
+        let _ = ht.close(h2);
+        if crate::ob::peek_object_refcount(ht_path) != Some(1) {
+            test_fail!("Object Manager",
+                "expected refcount=1 after closing all handles, got {:?}",
+                crate::ob::peek_object_refcount(ht_path));
+            return false;
+        }
+        assert_eq!(
+            crate::ob::remove_object_if_unreferenced(ht_path),
+            crate::ob::RemoveOutcome::Removed,
+        );
+    }
+
+    // HandleTable Drop releases outstanding references.
+    {
+        use crate::ob::handle::{HandleTable, HandleEntry};
+        let drop_path = "\\Test\\RcDropObject";
+        let _ = crate::ob::remove_object(drop_path);
+        if !crate::ob::insert_object(drop_path, crate::ob::ObjectType::Event) {
+            test_fail!("Object Manager", "drop-insert failed");
+            return false;
+        }
+        {
+            let mut ht = HandleTable::new();
+            let _ = ht.allocate(HandleEntry {
+                object_path: alloc::string::String::from(drop_path),
+                object_type: crate::ob::ObjectType::Event,
+                granted_access: 0,
+                inheritable: false,
+            });
+            assert_eq!(crate::ob::peek_object_refcount(drop_path), Some(2));
+        }
+        if crate::ob::peek_object_refcount(drop_path) != Some(1) {
+            test_fail!("Object Manager",
+                "expected refcount=1 after HandleTable::Drop, got {:?}",
+                crate::ob::peek_object_refcount(drop_path));
+            return false;
+        }
+        let _ = crate::ob::remove_object_if_unreferenced(drop_path);
     }
 
     test_pass!("Object Manager");
@@ -34641,5 +34817,278 @@ fn test_250_proc_status_fields() -> bool {
     test_println!("  {} required keys present; Tgid==Pid==Pid ✓",
         required.len());
     test_pass!("/proc/self/status conforms to proc_pid_status(5) field set");
+    true
+}
+
+
+// ── Test 258: page_ref_dec CAS-loop underflow safety (cycle-3 hardening) ────
+//
+// Asserts that `mm::refcount::page_ref_dec` on a slot already at 0 leaves
+// the slot at 0 and returns 0 — never wraps the underlying `AtomicU16`
+// through `0xFFFF`.  Pre-fix the function used `fetch_sub(1, Relaxed)`
+// and then performed a racy `store(0, Relaxed)` recovery; any concurrent
+// `page_ref_inc` that interleaved between the wrap and the recovery store
+// would be silently lost, leading to a downstream "rc=0 but PTE still
+// references this frame" use-after-recycle.
+//
+// Cite Intel SDM Vol. 3A §8.2.2 for the `LOCK CMPXCHG` ordering this fix
+// relies on.  This test does not provoke the underflow under SMP race —
+// that would require a precisely-timed two-CPU interleave (deferred to a
+// follow-up SMP-race test) — but it covers the local invariant: the
+// single-call zero-floor never wraps.
+
+fn test_261_page_ref_dec_underflow_safety() -> bool {
+    test_header!("page_ref_dec CAS-loop underflow safety");
+
+    // Allocate a fresh physical frame whose refcount slot is known to
+    // start at 0 (PMM bitmap allocation does not bump the refcount).
+    let phys = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => {
+            test_fail!("test258", "alloc_page returned None");
+            return false;
+        }
+    };
+
+    // Sanity: fresh frame has rc=0.
+    if crate::mm::refcount::page_ref_count(phys) != 0 {
+        crate::mm::pmm::free_page(phys);
+        test_fail!("test258",
+            "fresh frame phys={:#x} unexpectedly has nonzero rc", phys);
+        return false;
+    }
+
+    // Decrement at 0 — must remain 0, MUST NOT wrap through 0xFFFF.
+    let new_rc = crate::mm::refcount::page_ref_dec(phys);
+    if new_rc != 0 {
+        crate::mm::pmm::free_page(phys);
+        test_fail!("test258",
+            "dec at 0 returned {} (expected 0)", new_rc);
+        return false;
+    }
+    let observed = crate::mm::refcount::page_ref_count(phys);
+    if observed != 0 {
+        crate::mm::pmm::free_page(phys);
+        test_fail!("test258",
+            "after dec-at-zero, slot reads {} (expected 0 — CAS-loop \
+             discipline broken, slot wrapped through 0xFFFF)", observed);
+        return false;
+    }
+
+    // Drive the path that pre-fix raced: inc then dec then dec.  After the
+    // second dec, the slot should still read 0 (not 0xFFFF) and the
+    // first dec's return should be 0 (the legitimate floor cross).
+    crate::mm::refcount::page_ref_inc(phys);
+    let after_inc = crate::mm::refcount::page_ref_count(phys);
+    if after_inc != 1 {
+        crate::mm::pmm::free_page(phys);
+        test_fail!("test258",
+            "after inc, slot reads {} (expected 1)", after_inc);
+        return false;
+    }
+    let rc_after_first_dec = crate::mm::refcount::page_ref_dec(phys);
+    if rc_after_first_dec != 0 {
+        crate::mm::pmm::free_page(phys);
+        test_fail!("test258",
+            "first dec returned {} (expected 0)", rc_after_first_dec);
+        return false;
+    }
+    let rc_after_second_dec = crate::mm::refcount::page_ref_dec(phys);
+    if rc_after_second_dec != 0 {
+        crate::mm::pmm::free_page(phys);
+        test_fail!("test258",
+            "second dec returned {} (expected 0 — underflow not floored)",
+            rc_after_second_dec);
+        return false;
+    }
+    let final_rc = crate::mm::refcount::page_ref_count(phys);
+    if final_rc != 0 {
+        crate::mm::pmm::free_page(phys);
+        test_fail!("test258",
+            "after double dec, slot reads {} (expected 0)", final_rc);
+        return false;
+    }
+
+    crate::mm::pmm::free_page(phys);
+    test_println!("  dec-at-zero stays at 0; inc-dec-dec stays at 0");
+    test_pass!("page_ref_dec CAS-loop underflow safety");
+    true
+}
+
+// ── Test 259: OB refcount + handle-table integration (cycle-3 hardening) ────
+//
+// Standalone driver for the refcount-aware OB API added in this cycle.
+// The existing `test_object_manager` inlines the same assertions so the
+// regression is caught even when this dedicated entry is gated out by
+// future test-set culling; the duplicate exists here so the per-test
+// summary line names the invariant explicitly.
+//
+// Per the WDK `ObReferenceObject` / `ObDereferenceObject` documentation
+// (see Microsoft Learn, Windows Driver Kit / Kernel-Mode Driver
+// Reference), an object must not be removed from the namespace while a
+// handle holds a reference.  This is the namespace counterpart to the
+// W215 page-aliasing class in physical memory: a stale reference
+// observing a recycled slot.
+
+fn test_262_ob_refcount_integrity() -> bool {
+    test_header!("OB refcount + handle-table integration");
+
+    let path = "\\Test\\T259Object";
+    let _ = crate::ob::remove_object(path); // clean slate
+
+    if !crate::ob::insert_object(path, crate::ob::ObjectType::Event) {
+        test_fail!("test259", "insert_object failed");
+        return false;
+    }
+    // Initial refcount must be 1.
+    match crate::ob::peek_object_refcount(path) {
+        Some(1) => {}
+        other => {
+            test_fail!("test259",
+                "expected initial refcount=1, got {:?}", other);
+            let _ = crate::ob::remove_object(path);
+            return false;
+        }
+    }
+    // obref_inc returns the NEW count (2).
+    if crate::ob::obref_inc(path) != Some(2) {
+        test_fail!("test259", "obref_inc did not return Some(2)");
+        let _ = crate::ob::remove_object(path);
+        return false;
+    }
+    // remove_object_if_unreferenced refuses while refcount > 1.
+    if crate::ob::remove_object_if_unreferenced(path)
+        != crate::ob::RemoveOutcome::RefusedRefcount
+    {
+        test_fail!("test259",
+            "remove_object_if_unreferenced did not refuse on refcount=2");
+        let _ = crate::ob::remove_object(path);
+        return false;
+    }
+    // obref_dec returns the NEW count (1).
+    if crate::ob::obref_dec(path) != Some(1) {
+        test_fail!("test259", "obref_dec did not return Some(1)");
+        let _ = crate::ob::remove_object(path);
+        return false;
+    }
+    // remove_object_if_unreferenced now succeeds.
+    if crate::ob::remove_object_if_unreferenced(path)
+        != crate::ob::RemoveOutcome::Removed
+    {
+        test_fail!("test259",
+            "remove_object_if_unreferenced did not succeed on refcount=1");
+        let _ = crate::ob::remove_object(path);
+        return false;
+    }
+    // Path is gone.
+    if crate::ob::peek_object_refcount(path).is_some() {
+        test_fail!("test259",
+            "object still present after remove_object_if_unreferenced");
+        return false;
+    }
+    // obref_dec on absent path returns None (distinct from Some(0)).
+    if crate::ob::obref_dec(path).is_some() {
+        test_fail!("test259", "obref_dec on absent path returned Some(...)");
+        return false;
+    }
+    // HandleTable::Drop releases outstanding references.
+    {
+        use crate::ob::handle::{HandleTable, HandleEntry};
+        let dp = "\\Test\\T259DropObject";
+        let _ = crate::ob::remove_object(dp);
+        if !crate::ob::insert_object(dp, crate::ob::ObjectType::Event) {
+            test_fail!("test259", "drop-path insert_object failed");
+            return false;
+        }
+        {
+            let mut ht = HandleTable::new();
+            let _ = ht.allocate(HandleEntry {
+                object_path: alloc::string::String::from(dp),
+                object_type: crate::ob::ObjectType::Event,
+                granted_access: 0,
+                inheritable: false,
+            });
+            if crate::ob::peek_object_refcount(dp) != Some(2) {
+                test_fail!("test259",
+                    "expected refcount=2 with handle alive, got {:?}",
+                    crate::ob::peek_object_refcount(dp));
+                let _ = crate::ob::remove_object(dp);
+                return false;
+            }
+        } // ht goes out of scope here.
+        if crate::ob::peek_object_refcount(dp) != Some(1) {
+            test_fail!("test259",
+                "expected refcount=1 after HandleTable::Drop, got {:?}",
+                crate::ob::peek_object_refcount(dp));
+            let _ = crate::ob::remove_object(dp);
+            return false;
+        }
+        let _ = crate::ob::remove_object_if_unreferenced(dp);
+    }
+
+    test_println!("  obref_inc/dec round-trip, remove-if-unreferenced gating, HandleTable Drop");
+    test_pass!("OB refcount + handle-table integration");
+    true
+}
+
+// ── Test 260: scheduler starvation diagnostic counter (cycle-3 hardening) ───
+//
+// The picker exposes two cumulative atomic counters added in this cycle:
+//   * `pick_hlt_count()`         — every `sti; hlt; cli` decision
+//   * `starvation_count()`       — every threshold-crossing event
+//
+// A healthy test-runner system pumps yields fast enough that the per-CPU
+// burst counter never reaches `STARVATION_BURST_THRESHOLD`.  We assert
+// that property by:
+//   1. snapshotting both counters
+//   2. issuing N voluntary yields
+//   3. verifying `starvation_count()` did not increment
+//
+// `pick_hlt_count()` may legitimately increase if the picker decided to
+// HLT during one of the yields (very short Ready peer set, IDLE wins
+// pass-2).  That is fine — we only fail the test if the threshold-crossing
+// counter ticks.
+//
+// References:
+//   * Intel SDM Vol. 3A §8.10.6.7 — HLT instruction semantics in
+//     interrupt-pending state (motivates the `sti; hlt; cli` pattern).
+//   * POSIX sched(7) — SCHED_OTHER fairness rationale.
+
+fn test_263_sched_starvation_counter() -> bool {
+    test_header!("scheduler starvation diagnostic counter");
+
+    let starvation_before = crate::sched::starvation_count();
+    let hlt_before = crate::sched::pick_hlt_count();
+
+    // Issue a series of yields.  Each yield re-enters the picker; on a
+    // single-thread test-runner system this typically goes through the
+    // "Running, len <= 1" fast return without HLT, but on the SMP path
+    // the BSP may pick the AP idle and HLT briefly.  Either way, the
+    // threshold counter should NOT advance.
+    let was_active = crate::sched::is_active();
+    if !was_active { crate::sched::enable(); }
+    for _ in 0..512u32 {
+        crate::sched::yield_cpu();
+        crate::hal::enable_interrupts();
+    }
+    if !was_active { crate::sched::disable(); }
+
+    let starvation_after = crate::sched::starvation_count();
+    let hlt_after = crate::sched::pick_hlt_count();
+
+    test_println!("  pick_hlt: {} -> {} (delta {})",
+        hlt_before, hlt_after, hlt_after.saturating_sub(hlt_before));
+    test_println!("  starvation: {} -> {} (delta {})",
+        starvation_before, starvation_after,
+        starvation_after.saturating_sub(starvation_before));
+
+    if starvation_after != starvation_before {
+        test_fail!("test260",
+            "starvation_count() advanced by {} during 512-yield burst",
+            starvation_after - starvation_before);
+        return false;
+    }
+
+    test_pass!("scheduler starvation diagnostic counter");
     true
 }
