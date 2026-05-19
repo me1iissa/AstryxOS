@@ -734,6 +734,15 @@ pub fn test_write_sockaddr_in(addr_ptr: u64, addrlen_ptr: *mut u32,
 /// Maps Linux syscall numbers to AstryxOS handlers, handling differences
 /// in argument encoding (e.g., C strings vs ptr+len for paths).
 pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, arg6: u64) -> i64 {
+    // ── Vfork sibling-syscall tagger (diagnostic-only) ──────────────────────
+    // Fires exactly once per syscall entry.  Off-path cost is a single
+    // relaxed atomic load + branch (no VFORK window active → returns
+    // immediately).  When a window IS active, any thread that shares the
+    // parent's PID but is not the parent itself logs one bounded
+    // `[VFORK-SIB]` line.  See `vfork_diag.rs` for the full rationale.
+    #[cfg(feature = "vfork-canary-diag")]
+    crate::subsys::linux::vfork_diag::maybe_log_sibling_syscall(num);
+
     // ── Tier-0 trace: one self-contained line per syscall entry ──────────────
     // Grepped by qemu-harness.py via `^\[SC\] `.  User RIP comes from the
     // per-CPU syscall_entry stash (set by the naked-asm stub before dispatch).
@@ -2321,9 +2330,24 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             drop(threads);
                             // VFORK/CANARY pre-block snapshot — see helper.
                             vfork_canary_snapshot("pre_block.clone", pid as u32, parent_tid);
+                            // Three-channel snapshot + open the sibling-syscall
+                            // window.  Diagnostic-only; see `vfork_diag.rs`.
+                            #[cfg(feature = "vfork-canary-diag")]
+                            {
+                                crate::subsys::linux::vfork_diag::snapshot_canaries(
+                                    "PRE", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::enter_vfork_window(
+                                    pid, parent_tid);
+                            }
                             crate::sched::schedule();
                             // Resumed: child called exec/exit, or timeout expired.
                             // VFORK/CANARY post-wake snapshot.
+                            #[cfg(feature = "vfork-canary-diag")]
+                            {
+                                crate::subsys::linux::vfork_diag::exit_vfork_window();
+                                crate::subsys::linux::vfork_diag::snapshot_canaries(
+                                    "POST", pid, parent_tid);
+                            }
                             vfork_canary_snapshot("post_wake.clone", pid as u32, parent_tid);
                         }
                         child_pid as i64
@@ -3173,8 +3197,23 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             drop(threads);
                             // VFORK/CANARY pre-block snapshot — see helper.
                             vfork_canary_snapshot("pre_block.clone3", pid as u32, parent_tid);
+                            // Three-channel snapshot + open the sibling-syscall
+                            // window.  Diagnostic-only; see `vfork_diag.rs`.
+                            #[cfg(feature = "vfork-canary-diag")]
+                            {
+                                crate::subsys::linux::vfork_diag::snapshot_canaries(
+                                    "PRE", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::enter_vfork_window(
+                                    pid, parent_tid);
+                            }
                             crate::sched::schedule();
                             // VFORK/CANARY post-wake snapshot.
+                            #[cfg(feature = "vfork-canary-diag")]
+                            {
+                                crate::subsys::linux::vfork_diag::exit_vfork_window();
+                                crate::subsys::linux::vfork_diag::snapshot_canaries(
+                                    "POST", pid, parent_tid);
+                            }
                             vfork_canary_snapshot("post_wake.clone3", pid as u32, parent_tid);
                         }
                         child_pid as i64
