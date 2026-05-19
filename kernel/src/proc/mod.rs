@@ -2681,25 +2681,29 @@ pub fn fork_process_share_vm(
         child_pid, child_tid, parent_pid, parent_cr3
     );
 
-    // VFORK/CHILD-STACK diagnostic — record the child's initial user RSP and
-    // whether the child will run on the parent's user stack (clone3's
-    // `new_stack` == 0 case).  Per POSIX vfork(2) and clone(2) Linux man-pages
-    // §"CLONE_VM" the child shares the parent's address space; the kernel
-    // does NOT carve out a private stack region for the child, so any
-    // RSP-relative store the child makes before execve(2) lands on the
-    // parent's user stack.  When `user_entry_rsp` equals the parent's RSP at
-    // the syscall instruction site the child's local-variable spills are
-    // inside the parent's frame chain — the precondition for SSP-canary
-    // aliasing per ELF gABI §6 stack-protector.
-    let child_uses_parent_stack = user_rsp != 0;
+    // VFORK/CHILD-STACK diagnostic — record the child's initial user RSP at
+    // *clone-time*.  The value here is the parent-frame RSP as captured by
+    // `fork_process_share_vm`; the caller (`syscall.rs` arm 56) substitutes
+    // a kernel-allocated isolated stack via `alloc_vfork_child_stack` before
+    // the child is unblocked, so the runtime `user_entry_rsp` the child
+    // actually starts on is NOT the value shown here (see the subsequent
+    // `[VFORK-STACK] alloc base=… top=… new_rsp=…` line for the substituted
+    // RSP).  This print is therefore captured *before* the RSP swap and is
+    // cosmetic only — included for the historical record of which parent
+    // frame the caller passed.  Per POSIX vfork(2) and clone(2) "CLONE_VM"
+    // the child shares the parent's address space; the kernel does not
+    // carve out a private stack on its own, but the syscall.rs arm 56 path
+    // does it for vfork-shaped clones so the child cannot overflow into
+    // an SSP-instrumented parent frame (ELF gABI §6 stack-protector).
+    let parent_frame_rsp_at_clone = user_rsp;
+    let child_uses_parent_frame_at_clone = user_rsp != 0;
     crate::serial_println!(
-        "[VFORK/CHILD-STACK] pid={} parent_pid={} child_rsp_at_entry={:#x} \
-         child_uses_parent_stack={} parent_user_rsp={:#x} \
+        "[VFORK/CHILD-STACK] pid={} parent_pid={} parent_frame_rsp_at_clone={:#x} \
+         child_uses_parent_frame_at_clone={} note=runtime_rsp_substituted_by_caller \
          parent_tls_base={:#x} child_tls_base=0",
         child_pid, parent_pid,
-        user_rsp,
-        child_uses_parent_stack,
-        user_rsp,
+        parent_frame_rsp_at_clone,
+        child_uses_parent_frame_at_clone,
         parent_tls_base,
     );
 
