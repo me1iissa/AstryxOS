@@ -327,6 +327,33 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
                         tid, stack_page,
                     ),
                 }
+
+                // Axis-O `#GP`-entry stack snapshot (tech-lead 2026-05-19):
+                // capture two 4 KiB windows around the launcher frame — one
+                // upward from user RSP, one downward from user RBP — and
+                // emit per-qword (VA, value, PRE/POST writer-history)
+                // rows.  Identifies the failing SSP-canary slot at
+                // `[rbp_at_GP - 8]` plus its writer history.
+                //
+                // Saved user RBP lives at `frame[-12]`, saved user RAX at
+                // `frame[-2]` per the `isr_with_error!` macro stack layout
+                // documented above.  Both reads target the ISR's own
+                // kernel-stack frame slots (always present, always mapped)
+                // so they cannot fault.
+                //
+                // Ref: Intel SDM Vol. 3A §6.15 (#GP), System V AMD64 ABI §6.4
+                // (SSP / `__stack_chk_guard` at `fs:0x28`).
+                let frame_ptr = frame as *const InterruptFrame as *const u64;
+                // SAFETY: `frame` is a valid `&mut InterruptFrame` pushed
+                // by the ISR stub.  The slots at `frame_ptr.sub(12)` and
+                // `frame_ptr.sub(2)` are within the ISR's saved-GPR
+                // window per the layout documented above the
+                // `isr_with_error!` macro.  Reading them is a
+                // kernel-internal load; no user-memory access.
+                let user_rbp = unsafe { *frame_ptr.sub(12) };
+                let user_rax = unsafe { *frame_ptr.sub(2) };
+                crate::subsys::linux::vfork_diag::gpf_entry_snapshot(
+                    tid, frame.rip, rsp, user_rbp, user_rax);
             }
         }
     }
