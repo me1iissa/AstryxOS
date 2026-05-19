@@ -743,6 +743,16 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     #[cfg(feature = "vfork-canary-diag")]
     crate::subsys::linux::vfork_diag::maybe_log_sibling_syscall(num);
 
+    // ── Axis-O bisect: post-vfork parent-stack CRC check (entry) ────────────
+    // Off-path cost identical to the sibling-syscall tagger above.  When
+    // armed (after `arm_post_vfork_stack_watch` fired in the parent's
+    // clone / clone3 path), re-CRC every armed page and emit one
+    // `[POST-VFORK-CRC-DELTA]` line per state change so the post-processor
+    // can bisect the writer to a specific syscall.  Bounded at MAX_DELTAS.
+    // POSIX vfork(2); Intel SDM Vol. 3A §4.10.
+    #[cfg(feature = "vfork-canary-diag")]
+    crate::subsys::linux::vfork_diag::check_post_vfork_stack("SC-ENTER", num);
+
     // ── Tier-0 trace: one self-contained line per syscall entry ──────────────
     // Grepped by qemu-harness.py via `^\[SC\] `.  User RIP comes from the
     // per-CPU syscall_entry stash (set by the naked-asm stub before dispatch).
@@ -977,6 +987,14 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         num,
         ret as u64,
     );
+
+    // ── Axis-O bisect: post-vfork parent-stack CRC check (return) ───────────
+    // Pairs with the SC-ENTER check at the top of `dispatch()` so the
+    // post-processor can bracket each syscall's kernel-side window with a
+    // pre-call and post-call CRC.  A delta that appears only on `SC-RET`
+    // localises the writer to inside that specific syscall handler.
+    #[cfg(feature = "vfork-canary-diag")]
+    crate::subsys::linux::vfork_diag::check_post_vfork_stack("SC-RET", num);
 
     ret
 }
@@ -2396,6 +2414,18 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                     "post", pid, parent_tid);
                                 crate::subsys::linux::vfork_diag::snapshot_stack_page_prov(
                                     "post", pid, parent_tid);
+                                // Axis-O bisect — emit the EXIT-FINAL stack snapshot
+                                // (the LAST kernel point before SYSRET back to userspace)
+                                // and arm the per-page CRC watch on the parent's stack
+                                // VMA.  Subsequent syscall entries / returns plus the
+                                // `#GP` handler will fire `check_post_vfork_stack` to
+                                // bisect any in-window page mutation.  POSIX vfork(2);
+                                // Intel SDM Vol. 3A §4.10.
+                                crate::subsys::linux::vfork_diag::snapshot_stack_page_prov(
+                                    crate::subsys::linux::vfork_diag::EXIT_FINAL_LABEL,
+                                    pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::arm_post_vfork_stack_watch(
+                                    pid, parent_tid);
                             }
                             vfork_canary_snapshot("post_wake.clone", pid as u32, parent_tid);
                         }
@@ -3276,6 +3306,12 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                     "post", pid, parent_tid);
                                 crate::subsys::linux::vfork_diag::snapshot_stack_page_prov(
                                     "post", pid, parent_tid);
+                                // Axis-O bisect — see clone (56) for rationale.
+                                crate::subsys::linux::vfork_diag::snapshot_stack_page_prov(
+                                    crate::subsys::linux::vfork_diag::EXIT_FINAL_LABEL,
+                                    pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::arm_post_vfork_stack_watch(
+                                    pid, parent_tid);
                             }
                             vfork_canary_snapshot("post_wake.clone3", pid as u32, parent_tid);
                         }

@@ -55,6 +55,16 @@
 //!     Any `#DB` from this region during vfork names the kernel-mode
 //!     writer corrupting the master canary.  Intel SDM Vol. 3B §17.2.4.
 //!
+//!  8. **`[POST-VFORK-CRC-DELTA]` (axis-O)** — after the POST snapshots
+//!     close the vfork window, arm a per-page Fletcher-32 watch on the
+//!     parent's stack VMA (16 pages = 64 KiB upward from RSP).  Hook
+//!     points (Linux syscall entry / return, `#GP` handler) re-CRC every
+//!     watched page on each fire and emit one `[POST-VFORK-CRC-DELTA]`
+//!     line per state change, bracketing the writer to a specific
+//!     `(SC-ENTER nr=N) ↔ (SC-RET nr=N)` or `#GP` span.  See
+//!     `arm_post_vfork_stack_watch` / `check_post_vfork_stack` below.
+//!     RFC 1146 (Fletcher-32); Intel SDM Vol. 3A §4.6 (paging).
+//!
 //! # Why a separate module
 //!
 //! This file owns all of the vfork-window state so the snapshot helper can
@@ -695,4 +705,273 @@ pub fn disarm_master_canary_watch() {
         return;
     }
     crate::arch::x86_64::debug_reg::release_slot(slot as usize);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Axis-O bisect: post-vfork parent-stack page watch
+// ───────────────────────────────────────────────────────────────────────────
+//
+// The PR #331 3-trial dispositive established that the parent's user-stack
+// page `0x7ffffffee000` changes contents between the `STACK-PAGE-PROV` /
+// `STACK-PAGE-CRC` snapshot taken at vfork-window-close and the
+// `GPF-STACK-CRC` snapshot taken at the eventual `#GP` arrival — with
+// identical `phys` (no aliasing).  The mutation therefore happens somewhere
+// in the kernel-and-user execution slice between those two points.
+//
+// `arm_post_vfork_stack_watch` snapshots up to `WATCH_SLOTS` pages of the
+// parent's stack VMA (starting at the RSP-aligned page from the POST
+// sample) and stores per-slot `(va, phys, crc)`.  `check_post_vfork_stack`
+// is invoked from the candidate writer-paths (syscall entry / return /
+// `#GP` handler) and emits one `[POST-VFORK-CRC-DELTA]` line per slot per
+// state change — bounded at `MAX_DELTAS` lines total so a wild post-vfork
+// loop cannot run away with the serial log.
+//
+// Refs: POSIX vfork(2); Intel SDM Vol. 3A §4.10 / §4.6 (TLB / SMAP);
+//       RFC 1146 (Fletcher-32).
+
+/// Maximum number of stack pages tracked per vfork window.  16 pages =
+/// 64 KiB — covers the libxul deep-frame range observed in the dispositive
+/// trials (POST-time RSP at `0x...ec708`, eventual `#GP` RSP at
+/// `0x...ee468`, span ≈ 8 KiB; 64 KiB gives 8× headroom).
+const WATCH_SLOTS: usize = 16;
+
+/// Hard cap on `[POST-VFORK-CRC-DELTA]` lines across all hook points
+/// within a single vfork window.  Keeps serial bounded if a tight
+/// user-mode loop keeps rewriting the same page.
+const MAX_DELTAS: usize = 32;
+
+/// Bisect snapshot label suffix used by the LAST kernel snapshot before
+/// SYSRET back to userspace.  Distinguishing label so the post-processor
+/// can identify the "kernel post-vfork final state".
+pub const EXIT_FINAL_LABEL: &str = "EXIT-FINAL";
+
+/// Active post-vfork watch identity, packed as `(pid << 32) | (tid & 0xFFFF_FFFF)`.
+/// Zero = no watch active.  Single `AtomicU64` so the per-syscall fast
+/// path is a single relaxed load + branch (matches the sibling-syscall
+/// tagger).
+static WATCH_ACTIVE_PACKED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Per-slot watched VA.  `0` = unused slot.
+static WATCH_VA: [core::sync::atomic::AtomicU64; WATCH_SLOTS] = [
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Per-slot watched physical address at arm time.  Used to discriminate
+/// "phys changed = aliasing" from "phys same, crc changed = in-place
+/// kernel/user write".
+static WATCH_PHYS: [core::sync::atomic::AtomicU64; WATCH_SLOTS] = [
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Per-slot Fletcher-32 CRC at arm time.  Stored in the low 32 bits of a
+/// `u64` for atomic-load uniformity with the other watch arrays.
+static WATCH_CRC: [core::sync::atomic::AtomicU64; WATCH_SLOTS] = [
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Global delta counter — drives the `MAX_DELTAS` cap and gives every
+/// emitted line a monotonic index for log post-processing.
+static WATCH_DELTA_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Arm the post-vfork parent-stack page watch.
+///
+/// Walks the parent's stack VMA (located via `get_parent_user_rsp_rbp`
+/// and the parent's CR3) and stores up to `WATCH_SLOTS` per-page
+/// `(va, phys, crc)` records.  After this call, `check_post_vfork_stack`
+/// is live for the parent tid until `disarm_post_vfork_stack_watch` or a
+/// new arm replaces the state.
+///
+/// One-line summary emitted via `[POST-VFORK-WATCH-ARM] …` regardless of
+/// outcome so the post-processor can correlate hook fires with the arm.
+///
+/// Diagnostic-only.  All reads route through `fletcher32_user_page` which
+/// uses `virt_to_phys_in` + the kernel direct map so a corrupt page-table
+/// entry cannot fault the arm path.  POSIX vfork(2); Intel SDM Vol. 3A
+/// §4.6.
+pub fn arm_post_vfork_stack_watch(parent_pid: u64, parent_tid: u64) {
+    use core::sync::atomic::Ordering;
+
+    // Reset any prior-window state first so a missed disarm cannot leak
+    // stale slots into this window.
+    for s in 0..WATCH_SLOTS {
+        WATCH_VA[s].store(0,   Ordering::Relaxed);
+        WATCH_PHYS[s].store(0, Ordering::Relaxed);
+        WATCH_CRC[s].store(0,  Ordering::Relaxed);
+    }
+    WATCH_DELTA_COUNT.store(0, Ordering::Relaxed);
+
+    let (rsp, _rbp) = get_parent_user_rsp_rbp(parent_tid);
+    // `USER_ADDR_END` matches the kernel-wide constant.
+    const USER_ADDR_END: u64 = 0x0000_8000_0000_0000;
+    const USER_ADDR_MIN: u64 = 0x1000;
+    const PAGE_SIZE_U64: u64 = 4096;
+    if rsp == 0 || rsp < USER_ADDR_MIN || rsp >= USER_ADDR_END {
+        crate::serial_println!(
+            "[POST-VFORK-WATCH-ARM] pid={} tid={} state=bad_rsp rsp={:#x}",
+            parent_pid, parent_tid, rsp,
+        );
+        return;
+    }
+
+    let cr3 = crate::mm::vmm::get_cr3();
+    let walk_low  = rsp & !(PAGE_SIZE_U64 - 1);
+    // 64-KiB window upward from the RSP-aligned page.  The dispositive
+    // trials show the eventual `#GP` RSP is ~8 KiB above the POST-time
+    // RSP, so 64 KiB covers any plausible later frame without depending
+    // on the parent's stack VMA bounds (which would require a
+    // `find_vma` snapshot under PROCESS_TABLE lock).
+    let walk_high = walk_low.saturating_add(WATCH_SLOTS as u64 * PAGE_SIZE_U64);
+
+    let mut armed: usize = 0;
+    let mut page_va = walk_low;
+    while page_va + PAGE_SIZE_U64 <= walk_high && armed < WATCH_SLOTS {
+        if let Some((phys, crc)) = fletcher32_user_page(cr3, page_va) {
+            WATCH_VA[armed].store(page_va, Ordering::Relaxed);
+            WATCH_PHYS[armed].store(phys, Ordering::Relaxed);
+            WATCH_CRC[armed].store(crc as u64, Ordering::Relaxed);
+            armed += 1;
+        }
+        // Unmapped page → skip; the walk continues so a mid-VMA hole
+        // doesn't truncate coverage.
+        page_va += PAGE_SIZE_U64;
+    }
+
+    // Publish the (pid, tid) atomic LAST, so `check_post_vfork_stack`
+    // never sees a half-initialised slot array (Release pairs with the
+    // Acquire load in the check path; Intel SDM Vol. 3A §8.2 — TSO
+    // makes this a compiler-fence in practice but the explicit
+    // ordering documents the intent).
+    let packed = (parent_pid << 32) | (parent_tid & 0xFFFF_FFFF);
+    WATCH_ACTIVE_PACKED.store(packed, Ordering::Release);
+
+    crate::serial_println!(
+        "[POST-VFORK-WATCH-ARM] pid={} tid={} rsp={:#x} walk=[{:#x},{:#x}) armed_slots={}",
+        parent_pid, parent_tid, rsp, walk_low, walk_high, armed,
+    );
+}
+
+/// Disarm the watch and emit a one-line summary.  Safe to call multiple
+/// times; the second call is a no-op.
+pub fn disarm_post_vfork_stack_watch() {
+    use core::sync::atomic::Ordering;
+    let prev = WATCH_ACTIVE_PACKED.swap(0, Ordering::AcqRel);
+    if prev == 0 {
+        return;
+    }
+    let pid = prev >> 32;
+    let tid = prev & 0xFFFF_FFFF;
+    let deltas = WATCH_DELTA_COUNT.load(Ordering::Acquire);
+    crate::serial_println!(
+        "[POST-VFORK-WATCH-DISARM] pid={} tid={} total_deltas={}",
+        pid, tid, deltas,
+    );
+}
+
+/// Bisect hook.  Called from chosen kernel points (syscall entry/return,
+/// `#GP` handler) — must be cheap on the off-path (no watch active or
+/// wrong tid → single relaxed load + branch + return).
+///
+/// `tag` is a short literal naming the call site (`"SC-ENTER"`,
+/// `"SC-RET"`, `"#GP"`).  `tag_val` is an optional integer (typically the
+/// syscall number) baked into the delta line.  Passing the value as a
+/// `u64` avoids any allocation on the fast path — `crate::serial_println!`
+/// only fires once a delta is actually detected.
+///
+/// On the on-path, walks each armed slot and re-reads `(phys, crc)`.  If
+/// either differs from the stored arm-time value AND we have not yet hit
+/// `MAX_DELTAS`, emits one `[POST-VFORK-CRC-DELTA]` line and updates the
+/// stored state so subsequent hooks emit the NEXT delta (rather than
+/// re-flagging the same one).  This bisects sequential writers along the
+/// kernel-to-user return path.
+#[inline]
+pub fn check_post_vfork_stack(tag: &str, tag_val: u64) {
+    use core::sync::atomic::Ordering;
+
+    let packed = WATCH_ACTIVE_PACKED.load(Ordering::Acquire);
+    if packed == 0 {
+        return; // No window active — fast path.
+    }
+    let watch_pid = packed >> 32;
+    let watch_tid = packed & 0xFFFF_FFFF;
+
+    // Tid filter: only the parent thread's path mutates a frame the
+    // parent will later read.  Sibling threads share CR3 but their
+    // writes are already named by the `[VFORK-SIB]` tagger.
+    let my_tid = crate::proc::current_tid();
+    if my_tid != watch_tid {
+        return;
+    }
+
+    // Capped total delta emissions per window.
+    let deltas_so_far = WATCH_DELTA_COUNT.load(Ordering::Relaxed);
+    if deltas_so_far >= MAX_DELTAS {
+        return;
+    }
+
+    let cr3 = crate::mm::vmm::get_cr3();
+    for s in 0..WATCH_SLOTS {
+        let va = WATCH_VA[s].load(Ordering::Relaxed);
+        if va == 0 {
+            continue;
+        }
+        let stored_phys = WATCH_PHYS[s].load(Ordering::Relaxed);
+        let stored_crc  = WATCH_CRC[s].load(Ordering::Relaxed) as u32;
+
+        let (phys_now, crc_now) = match fletcher32_user_page(cr3, va) {
+            Some(p) => p,
+            None => {
+                // Slot unmapped — emit one delta and clear so we don't
+                // re-flag.  An unmapped-after-arm slot is itself the
+                // bisect signal (e.g. a kernel path tore down the
+                // mapping).
+                if WATCH_DELTA_COUNT.fetch_add(1, Ordering::Relaxed) < MAX_DELTAS {
+                    crate::serial_println!(
+                        "[POST-VFORK-CRC-DELTA] tag={} val={} pid={} tid={} slot={} va={:#x} \
+                         phys_pre={:#x} phys_now=unmapped crc_pre={:#010x} crc_now=unmapped",
+                        tag, tag_val, watch_pid, watch_tid, s, va, stored_phys, stored_crc,
+                    );
+                }
+                WATCH_VA[s].store(0, Ordering::Relaxed);
+                continue;
+            }
+        };
+
+        if phys_now != stored_phys || crc_now != stored_crc {
+            if WATCH_DELTA_COUNT.fetch_add(1, Ordering::Relaxed) < MAX_DELTAS {
+                crate::serial_println!(
+                    "[POST-VFORK-CRC-DELTA] tag={} val={} pid={} tid={} slot={} va={:#x} \
+                     phys_pre={:#x} phys_now={:#x} crc_pre={:#010x} crc_now={:#010x}",
+                    tag, tag_val, watch_pid, watch_tid, s, va,
+                    stored_phys, phys_now, stored_crc, crc_now,
+                );
+            }
+            // Update stored state so the NEXT delta is reported by the
+            // NEXT hook, not the same write.
+            WATCH_PHYS[s].store(phys_now, Ordering::Relaxed);
+            WATCH_CRC[s].store(crc_now as u64, Ordering::Relaxed);
+        }
+    }
 }

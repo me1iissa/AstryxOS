@@ -327,6 +327,20 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
                         tid, stack_page,
                     ),
                 }
+                // Axis-O bisect: fire the post-vfork stack-watch check at
+                // `#GP` arrival so the final state of every armed slot is
+                // emitted alongside the per-syscall checks.  If the page
+                // first diverges HERE (and not on any prior `SC-ENTER` /
+                // `SC-RET` hook) the writer is in the `#GP` handler / IDT
+                // entry stub itself.  POSIX vfork(2); Intel SDM Vol. 3A §6.15.
+                crate::subsys::linux::vfork_diag::check_post_vfork_stack(
+                    "#GP", vector as u64);
+                // Best-effort disarm.  The `#GP` is the terminating event
+                // for the parent's vfork lifecycle in the dispositive
+                // trials; clearing the watch here prevents a stale arm
+                // from leaking into any subsequent vfork window if the
+                // process somehow continues.  No-op if already disarmed.
+                crate::subsys::linux::vfork_diag::disarm_post_vfork_stack_watch();
             }
         }
     }
