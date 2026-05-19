@@ -1932,6 +1932,107 @@ pub fn get_process_cr3(pid: Pid) -> Option<u64> {
     procs.iter().find(|p| p.pid == pid).map(|p| p.cr3)
 }
 
+/// Result of a VMA lookup that transparently falls back to the parent's
+/// bookkeeping for a CLONE_VM child.
+///
+/// Per `clone(2)` "CLONE_VM" + `vfork(2)`, the child runs with the parent's
+/// page tables (same CR3) but the kernel records its `Process.vm_space` as
+/// `None` so the parent retains exclusive ownership of the VMA list and the
+/// child's exit path is a no-op for the parent's address space.  That works
+/// for fault handling (the PFH already has the parent-CR3 fallback path,
+/// see `arch/x86_64/idt.rs::handle_page_fault`), but it misleads the
+/// **diagnostic** printers: a fault inside the parent's text segment in a
+/// shared-VM child reports `no_vma=1` / `vma_offset=NO_VMA` even though the
+/// physical mapping is valid — because the lookup short-circuits on the
+/// child's empty VMA list before consulting the parent's.
+///
+/// This helper does the obvious thing: try the child's VmSpace first, then
+/// — if the child is in the `CLONE_VM` shared-VM state (no VmSpace + same
+/// CR3 as the parent) — re-try against the parent's.  The `inherited` flag
+/// lets the caller annotate the diagnostic line so a reader can tell at a
+/// glance which address space the VMA came from.
+#[derive(Copy, Clone, Default)]
+pub struct VmaLookupHit {
+    pub vma_base: u64,
+    pub vma_end:  u64,
+    pub prot:     u32,
+    pub name:     &'static str,
+    pub file_backed: bool,
+    pub file_offset: u64,
+    pub elf_load_delta: u64,
+    pub mount_idx: usize,
+    pub inode: u64,
+    /// True when the VMA was resolved via the parent's VmSpace (the calling
+    /// process is a CLONE_VM child whose own bookkeeping is empty).
+    pub inherited: bool,
+}
+
+/// Look up `addr` in `pid`'s VmSpace, transparently falling back to the
+/// parent's when `pid` is a CLONE_VM child (no own VmSpace, same CR3 as
+/// parent).
+///
+/// `None` means neither child nor parent has a VMA covering `addr`.
+///
+/// Acquires `PROCESS_TABLE` briefly; the returned value owns no borrows so
+/// the caller can use it after the lock is dropped.  Diagnostic-only — the
+/// PFH at `arch/x86_64/idt.rs::handle_page_fault` performs its own
+/// parent-VmSpace fallback for the actual fault path and does not call
+/// this helper.
+pub fn find_vma_with_parent_fallback(pid: Pid, addr: u64) -> Option<VmaLookupHit> {
+    use crate::mm::vma::VmBacking;
+
+    fn extract(vma: &crate::mm::vma::VmArea, inherited: bool) -> VmaLookupHit {
+        let (file_backed, file_offset, elf_load_delta, mount_idx, inode) = match vma.backing {
+            VmBacking::File { offset, elf_load_delta, mount_idx, inode } => {
+                (true, offset, elf_load_delta, mount_idx, inode)
+            }
+            _ => (false, 0u64, 0u64, 0usize, 0u64),
+        };
+        VmaLookupHit {
+            vma_base: vma.base,
+            vma_end:  vma.end(),
+            prot:     vma.prot,
+            name:     vma.name,
+            file_backed,
+            file_offset,
+            elf_load_delta,
+            mount_idx,
+            inode,
+            inherited,
+        }
+    }
+
+    let procs = PROCESS_TABLE.lock();
+    let child = procs.iter().find(|p| p.pid == pid)?;
+
+    // Direct hit on the child's own VmSpace.
+    if let Some(space) = child.vm_space.as_ref() {
+        if let Some(vma) = space.find_vma(addr) {
+            return Some(extract(vma, false));
+        }
+        // Child has its own VmSpace but it doesn't cover `addr`.  Do NOT
+        // fall back to the parent: that child has diverged (post-execve or
+        // fork-with-CoW) and its VMA list is authoritative.
+        return None;
+    }
+
+    // Child has no VmSpace (CLONE_VM shared-VM state).  Try the parent if
+    // the CR3 matches — otherwise the relationship is something else
+    // (kernel thread, idle, AP) and we have no VMA list to consult.
+    let child_cr3 = child.cr3;
+    let parent_pid = child.parent_pid;
+    if child_cr3 == 0 || parent_pid == 0 {
+        return None;
+    }
+    let parent = procs.iter().find(|p| p.pid == parent_pid)?;
+    if parent.cr3 != child_cr3 {
+        return None;
+    }
+    let parent_space = parent.vm_space.as_ref()?;
+    let vma = parent_space.find_vma(addr)?;
+    Some(extract(vma, true))
+}
+
 /// Store the clear_child_tid address in a thread for CLONE_CHILD_CLEARTID.
 /// When that thread exits, the kernel will write 0 to that address and wake futex.
 pub fn set_clear_child_tid(pid: Pid, tid: Tid, tidptr: u64) {

@@ -34,6 +34,14 @@ pub mod errno;
 /// Extracted from `kernel/src/syscall/mod.rs` in Phase 0.2.
 pub mod syscall;
 
+/// Vfork canary snapshot-pair + sibling-syscall tagger diagnostic.  See
+/// the module docstring (`vfork_diag.rs`) for the three channels and the
+/// reference set (POSIX vfork(2) / clone(2), Intel SDM Vol. 3A §6.8,
+/// System V AMD64 ABI §3.4.5.2).  Gated entirely behind `vfork-canary-diag`
+/// so master builds are byte-identical.
+#[cfg(feature = "vfork-canary-diag")]
+pub mod vfork_diag;
+
 /// Bounded broadcast-within-cluster compensation for FUTEX_WAKE.  Mitigates
 /// the older-glibc `pthread_cond_signal` race
 /// (<https://sourceware.org/bugzilla/show_bug.cgi?id=25847>) by

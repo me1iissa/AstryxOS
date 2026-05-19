@@ -140,6 +140,17 @@ vfs-trace = []
 # bugcheck (sc=1161 under firefox-test).  Off by default — the runtime
 # cost is one extra `try_lock` per device call.
 vfs-debug = []
+# Vfork canary snapshot-pair + sibling-syscall tagger diagnostic
+# (kernel/src/subsys/linux/vfork_diag.rs).  Emits `[VFORK-CANARY-PRE/POST]`,
+# `[VFORK-FSCANARY-PRE/POST]`, and `[VFORK-SIB]` lines around the
+# `CLONE_VM|CLONE_VFORK` parent-block window so a post-processor can
+# attribute any SSP-canary divergence to a specific writer thread.
+# Diagnostic-only — no functional behaviour change.  Implies `firefox-test`
+# (the snapshot helper rides the same gated emit path) and `syscall-trace`
+# (the SIB tagger leans on `get_user_rip` / `get_user_rsp_rbp`, both
+# unconditional pubs but heavily exercised under syscall-trace).
+# See docs/HARNESS.md and POSIX vfork(2) / clone(2) / Intel SDM Vol. 3A §6.8.
+vfork-canary-diag = ["firefox-test", "syscall-trace"]
 # LLVM source-based code-coverage instrumentation (test-coverage audit
 # session 5 / docs/TEST_COVERAGE_AUDIT_2026-05-16.md).  When enabled, the
 # kernel must additionally be built with `-C instrument-coverage` (see

@@ -773,52 +773,54 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
             let rip = frame.rip;
             let pid = crate::proc::current_pid_lockless();
             let tid = crate::proc::current_tid();
-            let procs = crate::proc::PROCESS_TABLE.lock();
-            if let Some(proc_entry) = procs.iter().find(|p| p.pid == pid) {
-                if let Some(vm_space) = proc_entry.vm_space.as_ref() {
-                    if let Some(vma) = vm_space.find_vma(rip) {
-                        use crate::mm::vma::VmBacking;
-                        let (file_name, file_offset, elf_load_delta) = match &vma.backing {
-                            VmBacking::File { offset, elf_load_delta, .. } => {
-                                (vma.name, *offset, *elf_load_delta)
-                            }
-                            _ => ("<anon>", 0u64, 0u64),
-                        };
-                        let offset_in_vma  = rip - vma.base;
-                        let offset_in_file = file_offset + offset_in_vma;
-                        // vaddr_in_elf: the link-time ELF virtual address, i.e. the
-                        // value addr2line expects.  Defined by ELF-64 §3 (Program
-                        // Loading): for each PT_LOAD segment, runtime_va - bias =
-                        // p_vaddr, and file_offset = p_offset + (runtime_va - bias -
-                        // p_vaddr + p_offset_page).  The delta encodes
-                        // (p_vaddr_page - p_offset_page) which is constant for the
-                        // segment.
-                        if elf_load_delta != 0 {
-                            let vaddr_in_elf = offset_in_file.wrapping_add(elf_load_delta);
-                            crate::serial_println!(
-                                "[UD/VMA] pid={} tid={} rip={:#x} vma_base={:#x} vma_end={:#x} \
-                                 file={} offset_in_file={:#x} offset_in_vma={:#x} vaddr_in_elf={:#x}",
-                                pid, tid, rip, vma.base, vma.end(),
-                                file_name, offset_in_file, offset_in_vma, vaddr_in_elf,
-                            );
-                        } else {
-                            crate::serial_println!(
-                                "[UD/VMA] pid={} tid={} rip={:#x} vma_base={:#x} vma_end={:#x} \
-                                 file={} offset_in_file={:#x} offset_in_vma={:#x}",
-                                pid, tid, rip, vma.base, vma.end(),
-                                file_name, offset_in_file, offset_in_vma,
-                            );
-                        }
+            // CLONE_VM-aware lookup: falls through to the parent's VmSpace
+            // for a vfork / posix_spawn child whose own bookkeeping is None
+            // by design (see `clone(2)` "CLONE_VM").  Returns owned data so
+            // PROCESS_TABLE is released before the prints.
+            let hit = crate::proc::find_vma_with_parent_fallback(pid, rip);
+            match hit {
+                Some(v) => {
+                    let file_name = if v.file_backed { v.name } else { "<anon>" };
+                    let offset_in_vma  = rip - v.vma_base;
+                    let offset_in_file = if v.file_backed {
+                        v.file_offset + offset_in_vma
+                    } else {
+                        0
+                    };
+                    // vaddr_in_elf: the link-time ELF virtual address, i.e. the
+                    // value addr2line expects.  Defined by ELF-64 §3 (Program
+                    // Loading): for each PT_LOAD segment, runtime_va - bias =
+                    // p_vaddr, and file_offset = p_offset + (runtime_va - bias -
+                    // p_vaddr + p_offset_page).  The delta encodes
+                    // (p_vaddr_page - p_offset_page) which is constant for the
+                    // segment.
+                    let suffix = if v.inherited { " inherited_from_parent=1" } else { "" };
+                    if v.file_backed && v.elf_load_delta != 0 {
+                        let vaddr_in_elf = offset_in_file.wrapping_add(v.elf_load_delta);
+                        crate::serial_println!(
+                            "[UD/VMA] pid={} tid={} rip={:#x} vma_base={:#x} vma_end={:#x} \
+                             file={} offset_in_file={:#x} offset_in_vma={:#x} vaddr_in_elf={:#x}{}",
+                            pid, tid, rip, v.vma_base, v.vma_end,
+                            file_name, offset_in_file, offset_in_vma, vaddr_in_elf, suffix,
+                        );
                     } else {
                         crate::serial_println!(
-                            "[UD/VMA] pid={} tid={} rip={:#x} no_vma_match=1",
-                            pid, tid, rip,
+                            "[UD/VMA] pid={} tid={} rip={:#x} vma_base={:#x} vma_end={:#x} \
+                             file={} offset_in_file={:#x} offset_in_vma={:#x}{}",
+                            pid, tid, rip, v.vma_base, v.vma_end,
+                            file_name, offset_in_file, offset_in_vma, suffix,
                         );
                     }
                 }
+                None => {
+                    crate::serial_println!(
+                        "[UD/VMA] pid={} tid={} rip={:#x} no_vma_match=1",
+                        pid, tid, rip,
+                    );
+                }
             }
-            // Drop PROCESS_TABLE — all subsequent work uses ud_cr3 directly.
-            drop(procs);
+            // PROCESS_TABLE was released by find_vma_with_parent_fallback
+            // before it returned; subsequent work uses ud_cr3 directly.
 
             // ── [UD/RIP-BYTES]: 16 bytes at RIP ────────────────────────────────
             // Allows instant classification:
