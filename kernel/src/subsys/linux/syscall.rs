@@ -2359,43 +2359,43 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             drop(threads);
                             // VFORK/CANARY pre-block snapshot — see helper.
                             vfork_canary_snapshot("pre_block.clone", pid as u32, parent_tid);
-                            // Three-channel snapshot + open the sibling-syscall
-                            // window.  Diagnostic-only; see `vfork_diag.rs`.
+                            // Axis-N+1 three-channel stack-provenance snapshot
+                            // + sibling-syscall window + master-canary DR0
+                            // watch.  Diagnostic-only; see `vfork_diag.rs`.
                             #[cfg(feature = "vfork-canary-diag")]
                             {
                                 crate::subsys::linux::vfork_diag::snapshot_canaries(
                                     "PRE", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::snapshot_stack_canary_walk(
+                                    "PRE", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::snapshot_stack_finegrain(
+                                    "pre", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::snapshot_stack_page_prov(
+                                    "pre", pid, parent_tid);
                                 crate::subsys::linux::vfork_diag::enter_vfork_window(
                                     pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::arm_master_canary_watch();
                             }
-                            // W215-aliasing axis-N: arm a hardware write-only
-                            // watchpoint on the ld-musl `.data.rel.ro` slot
-                            // for the duration of the vfork window.  See
-                            // `elf_write_trace` module docs; Intel SDM Vol. 3B
-                            // §17.2.4 / §17.2.5.  Investigative; the [W215/
-                            // DR-WATCH-FIRE] line from the `#DB` handler is
-                            // the primary output if a kernel-mode store hits
-                            // the watched range.
-                            #[cfg(feature = "elf-write-trace")]
-                            {
-                                let parent_cr3 = crate::mm::vmm::get_cr3();
-                                crate::subsys::linux::elf_write_trace::enter_window(
-                                    pid, parent_tid, parent_cr3);
-                            }
+                            // ELF-WRITE-TRACE on 0x37e18 dropped here — qa
+                            // verdict: structurally meaningless on musl
+                            // (musl's ld doesn't use a `.data.rel.ro`
+                            // function-pointer slot at that offset; only
+                            // glibc's `_rtld_global_ro+0x378` does).  TODO:
+                            // re-gate to glibc-only when we re-enable the
+                            // glibc personality track.
                             crate::sched::schedule();
                             // Resumed: child called exec/exit, or timeout expired.
-                            #[cfg(feature = "elf-write-trace")]
-                            {
-                                let parent_cr3 = crate::mm::vmm::get_cr3();
-                                crate::subsys::linux::elf_write_trace::exit_window(
-                                    pid, parent_tid, parent_cr3);
-                            }
                             // VFORK/CANARY post-wake snapshot.
                             #[cfg(feature = "vfork-canary-diag")]
                             {
+                                crate::subsys::linux::vfork_diag::disarm_master_canary_watch();
                                 crate::subsys::linux::vfork_diag::exit_vfork_window();
                                 crate::subsys::linux::vfork_diag::snapshot_canaries(
                                     "POST", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::snapshot_stack_finegrain(
+                                    "post", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::snapshot_stack_page_prov(
+                                    "post", pid, parent_tid);
                             }
                             vfork_canary_snapshot("post_wake.clone", pid as u32, parent_tid);
                         }
@@ -3246,36 +3246,36 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             drop(threads);
                             // VFORK/CANARY pre-block snapshot — see helper.
                             vfork_canary_snapshot("pre_block.clone3", pid as u32, parent_tid);
-                            // Three-channel snapshot + open the sibling-syscall
-                            // window.  Diagnostic-only; see `vfork_diag.rs`.
+                            // Axis-N+1 three-channel stack-provenance snapshot
+                            // — see clone (56) path above for the rationale.
                             #[cfg(feature = "vfork-canary-diag")]
                             {
                                 crate::subsys::linux::vfork_diag::snapshot_canaries(
                                     "PRE", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::snapshot_stack_canary_walk(
+                                    "PRE", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::snapshot_stack_finegrain(
+                                    "pre", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::snapshot_stack_page_prov(
+                                    "pre", pid, parent_tid);
                                 crate::subsys::linux::vfork_diag::enter_vfork_window(
                                     pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::arm_master_canary_watch();
                             }
-                            // W215-aliasing axis-N — see clone (56) path above
-                            // for rationale; this is the clone3(2) sibling.
-                            #[cfg(feature = "elf-write-trace")]
-                            {
-                                let parent_cr3 = crate::mm::vmm::get_cr3();
-                                crate::subsys::linux::elf_write_trace::enter_window(
-                                    pid, parent_tid, parent_cr3);
-                            }
+                            // ELF-WRITE-TRACE on 0x37e18 dropped — see
+                            // clone(56) path above for the qa-verdict TODO.
                             crate::sched::schedule();
-                            #[cfg(feature = "elf-write-trace")]
-                            {
-                                let parent_cr3 = crate::mm::vmm::get_cr3();
-                                crate::subsys::linux::elf_write_trace::exit_window(
-                                    pid, parent_tid, parent_cr3);
-                            }
                             // VFORK/CANARY post-wake snapshot.
                             #[cfg(feature = "vfork-canary-diag")]
                             {
+                                crate::subsys::linux::vfork_diag::disarm_master_canary_watch();
                                 crate::subsys::linux::vfork_diag::exit_vfork_window();
                                 crate::subsys::linux::vfork_diag::snapshot_canaries(
                                     "POST", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::snapshot_stack_finegrain(
+                                    "post", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::snapshot_stack_page_prov(
+                                    "post", pid, parent_tid);
                             }
                             vfork_canary_snapshot("post_wake.clone3", pid as u32, parent_tid);
                         }

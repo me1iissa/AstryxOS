@@ -615,6 +615,44 @@ pub fn is_armed() -> bool {
     ARMED[0].load(Ordering::Acquire)
 }
 
+/// Manually release `slot` if it is armed.  Idempotent — returns `true`
+/// iff the slot transitioned from armed to disarmed.
+///
+/// Used by short-lived diagnostic windows that arm a watchpoint at the
+/// start of the window and want to release it at the end if it did not
+/// fire (the on-fire path is one-shot and self-releasing, see
+/// `handle_db_exception`).  Mirrors that path's local-DR reprogramming
+/// + lazy-gen propagation so peer CPUs notice the disarm at their next
+/// `apply_pending_if_stale`.
+///
+/// Safe to call outside ISR context (the disarm itself is just a few
+/// atomic stores + a `program_local_drs`).  Per Intel SDM Vol. 3B
+/// §17.2.4, clearing L{slot}/G{slot} in DR7 suffices to silence the
+/// breakpoint regardless of DR{slot} contents.
+pub fn release_slot(slot: usize) -> bool {
+    if slot >= N_DR_SLOTS {
+        return false;
+    }
+    if ARMED[slot]
+        .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false; // already disarmed
+    }
+    ARMED_ADDR[slot].store(0, Ordering::Relaxed);
+    ARMED_CTRL[slot].store(0, Ordering::Relaxed);
+    SYNC_GENERATION.fetch_add(1, Ordering::Release);
+    program_local_drs();
+    let cpu = super::apic::cpu_index();
+    if cpu < super::apic::MAX_CPUS {
+        LOCAL_SYNC_GENERATION[cpu].store(
+            SYNC_GENERATION.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+    }
+    true
+}
+
 /// Outcome of a `kdb arm-phys` request.  Reported back to the kdb caller
 /// verbatim as a small JSON object.
 #[derive(Copy, Clone, Debug)]

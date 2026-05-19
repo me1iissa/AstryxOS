@@ -140,17 +140,22 @@ vfs-trace = []
 # bugcheck (sc=1161 under firefox-test).  Off by default — the runtime
 # cost is one extra `try_lock` per device call.
 vfs-debug = []
-# Vfork canary snapshot-pair + sibling-syscall tagger diagnostic
-# (kernel/src/subsys/linux/vfork_diag.rs).  Emits `[VFORK-CANARY-PRE/POST]`,
-# `[VFORK-FSCANARY-PRE/POST]`, and `[VFORK-SIB]` lines around the
+# Vfork canary snapshot-pair + sibling-syscall tagger + axis-N+1
+# stack-provenance diagnostic (kernel/src/subsys/linux/vfork_diag.rs).
+# Emits `[VFORK-CANARY-PRE/POST]`, `[VFORK-FSCANARY-PRE/POST]`,
+# `[VFORK-SIB]`, `[STACK-CANARY-WALK]`, `[STACK-CANARY-FINEGRAIN]`,
+# `[STACK-PAGE-PROV]`, and `[VFORK-FS28-WATCH]` lines around the
 # `CLONE_VM|CLONE_VFORK` parent-block window so a post-processor can
-# attribute any SSP-canary divergence to a specific writer thread.
-# Diagnostic-only — no functional behaviour change.  Implies `firefox-test`
-# (the snapshot helper rides the same gated emit path) and `syscall-trace`
-# (the SIB tagger leans on `get_user_rip` / `get_user_rsp_rbp`, both
-# unconditional pubs but heavily exercised under syscall-trace).
-# See docs/HARNESS.md and POSIX vfork(2) / clone(2) / Intel SDM Vol. 3A §6.8.
-vfork-canary-diag = ["firefox-test", "syscall-trace"]
+# discriminate between (a) pre-existing zero canary, (b) in-window
+# kernel write, and (c) W215-class page-aliasing on the user-stack
+# VMA.  Diagnostic-only — no functional behaviour change.  Implies
+# `firefox-test` (the snapshot helper rides the same gated emit path),
+# `syscall-trace` (the SIB tagger leans on `get_user_rip` /
+# `get_user_rsp_rbp`), and `w215-diag` (the master-canary DR0 watch
+# uses the same DR0–DR3 plumbing as the W215 cache walker).
+# See POSIX vfork(2) / clone(2), Intel SDM Vol. 3A §6.8 + Vol. 3B
+# §17.2.4 / §17.2.5, System V x86_64 ABI §6.4.
+vfork-canary-diag = ["firefox-test", "syscall-trace", "w215-diag"]
 # ELF write-trace diagnostic (kernel/src/subsys/linux/elf_write_trace.rs).
 # Arms a hardware write-only watchpoint on the ld-musl `.data.rel.ro`
 # slot at user VA `0x7F00_0003_7e18` for the duration of the
