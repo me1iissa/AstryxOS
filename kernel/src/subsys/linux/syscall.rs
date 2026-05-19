@@ -2365,6 +2365,15 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             {
                                 crate::subsys::linux::vfork_diag::snapshot_canaries(
                                     "PRE", pid, parent_tid);
+                                // W215 axis-N+1 — full parent-stack-VMA
+                                // page provenance dump.  Discriminates the
+                                // doomed frame's page from cache-eviction
+                                // and refcount-race signatures upstream of
+                                // the narrow RSP+8 KiB window.  See
+                                // `vfork_diag::snapshot_stack_page_provenance`.
+                                crate::subsys::linux::vfork_diag::
+                                    snapshot_stack_page_provenance(
+                                        "PRE", pid, parent_tid);
                                 crate::subsys::linux::vfork_diag::enter_vfork_window(
                                     pid, parent_tid);
                             }
@@ -2396,6 +2405,9 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                 crate::subsys::linux::vfork_diag::exit_vfork_window();
                                 crate::subsys::linux::vfork_diag::snapshot_canaries(
                                     "POST", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::
+                                    snapshot_stack_page_provenance(
+                                        "POST", pid, parent_tid);
                             }
                             vfork_canary_snapshot("post_wake.clone", pid as u32, parent_tid);
                         }
@@ -3252,6 +3264,9 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             {
                                 crate::subsys::linux::vfork_diag::snapshot_canaries(
                                     "PRE", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::
+                                    snapshot_stack_page_provenance(
+                                        "PRE", pid, parent_tid);
                                 crate::subsys::linux::vfork_diag::enter_vfork_window(
                                     pid, parent_tid);
                             }
@@ -3276,6 +3291,9 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                 crate::subsys::linux::vfork_diag::exit_vfork_window();
                                 crate::subsys::linux::vfork_diag::snapshot_canaries(
                                     "POST", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::
+                                    snapshot_stack_page_provenance(
+                                        "POST", pid, parent_tid);
                             }
                             vfork_canary_snapshot("post_wake.clone3", pid as u32, parent_tid);
                         }
