@@ -2309,6 +2309,35 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             }
                         }
 
+                        // Provision a minimal per-vfork-child TLS page so the
+                        // child's first cancellable libc syscall (e.g.
+                        // `close(2)` from the `posix_spawn(3)` child helper)
+                        // can read `%fs:0` without faulting.  See
+                        // `proc::alloc_vfork_child_tls` for the layout
+                        // rationale and the canary-isolation argument.  The
+                        // page is unmapped on `execve(2)` / vfork-child exit
+                        // via `vfork_isolated_tls_cleanup`.  Best-effort: if
+                        // allocation fails we leave `tls_base = 0` and the
+                        // child will fault on its first TLS-relative read —
+                        // matching the pre-fix behaviour rather than masking
+                        // an OOM as a different error.
+                        match crate::proc::alloc_vfork_child_tls(pid) {
+                            Some(tls_base) => {
+                                const VFORK_TLS_SIZE: u64 = 4096;
+                                let mut threads = crate::proc::THREAD_TABLE.lock();
+                                if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
+                                    t.tls_base = tls_base;
+                                    t.vfork_isolated_tls = Some((tls_base, VFORK_TLS_SIZE));
+                                }
+                            }
+                            None => {
+                                crate::serial_println!(
+                                    "[VFORK] WARN: failed to allocate isolated TLS page; \
+                                     child_tls_base=0 (first cancellable libc syscall will fault)"
+                                );
+                            }
+                        }
+
                         // Unblock the child so the scheduler can run it.
                         crate::proc::unblock_process(child_pid);
 

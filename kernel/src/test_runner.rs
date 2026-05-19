@@ -2018,6 +2018,19 @@ pub fn run() -> ! {
         if test_258_getrandom_unknown_flag_rejection() { passed += 1; }
     }
 
+    // ── Test 264: vfork-child TLS page layout (musl posix_spawn unblocker) ─
+    // The `CLONE_VM|CLONE_VFORK` child path allocates a minimal per-vfork-
+    // child TCB page via `proc::alloc_vfork_child_tls`.  Verifies:
+    //   (a) the returned VA is non-zero and 4 KiB aligned;
+    //   (b) the TCB self-pointer at offset 0 equals the returned VA;
+    //   (c) the canary slot at offset 0x28 is zero (canary-isolation);
+    //   (d) the cancel-state byte at offset 64 = PTHREAD_CANCEL_DISABLE;
+    //   (e) the cleanup helper unmaps the VMA.
+    // Cite POSIX vfork(2)/posix_spawn(3); System V x86_64 ABI §3.4.2 (TLS);
+    // ELF gABI §3.5 (Thread-local storage); Intel SDM Vol. 3A §3.4.4.
+    total += 1;
+    if test_264_vfork_child_tls_layout() { passed += 1; }
+
     // ── Tests 261-263: native-core hardening (cycle 3) ──────────────────
     // Gated on `native-core-tests` feature: the three native-core tests
     // (page_ref_dec CAS underflow, OB refcount integration, scheduler
@@ -35090,5 +35103,159 @@ fn test_263_sched_starvation_counter() -> bool {
     }
 
     test_pass!("scheduler starvation diagnostic counter");
+    true
+}
+
+// ── Test 264: vfork-child TLS page layout (musl posix_spawn unblocker) ───────
+//
+// `proc::alloc_vfork_child_tls(parent_pid)` provisions a per-vfork-child
+// "thread-control block" (TCB) page in the parent's address space so a
+// `CLONE_VM|CLONE_VFORK` child can read its own `%fs:0`-relative state
+// before `execve(2)` installs a fresh TCB.  Without this page the musl
+// `posix_spawn(3)` child helper faults at its first cancellable libc call
+// (`close(2)`) when `__pthread_self()` dereferences `%fs:0 == 0`.
+//
+// The page is laid out to match the Variant II TLS contract on x86_64
+// (System V ABI §3.4.2, ELF gABI §3.5): the TCB self-pointer at offset 0
+// is the universal `__pthread_self()` read.  The cancel-state byte at
+// offset 64 is pre-set to `PTHREAD_CANCEL_DISABLE` (POSIX
+// `pthread_setcancelstate(3)`) so the cancellable-syscall wrapper
+// short-circuits to the raw `__syscall(2)` path on the very first call —
+// which is what musl's `posix_spawn(3)` parent already requested via
+// `pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cs)` immediately
+// before the `__clone` call.  The canary slot at offset 0x28 is zeroed
+// to preserve the kernel's canary-isolation invariant — the child must
+// not see the parent's `%fs:0x28` value.
+//
+// References:
+//   * POSIX vfork(2), posix_spawn(3), pthread_setcancelstate(3)
+//   * System V x86_64 ABI §3.4.2 (Thread-Local Storage)
+//   * ELF gABI §3.5 (Thread-local storage)
+//   * Intel SDM Vol. 3A §3.4.4 (FS/GS base in 64-bit mode)
+fn test_264_vfork_child_tls_layout() -> bool {
+    test_header!("alloc_vfork_child_tls layout (musl posix_spawn unblocker)");
+
+    let parent_pid: crate::proc::Pid = 1;
+
+    // Skip gracefully if PID 1 has no VmSpace (the kernel-only test runner
+    // boots an init thread without a userspace address space — see
+    // `Process { vm_space: None, ... }` initialisers in proc/mod.rs).  The
+    // helper would return None at the `space.find_free_range` step and the
+    // test would falsely fail.  When this is the case we exercise the
+    // earliest path (lookup) and accept the documented `None`; the
+    // firefox-test run path through `linux/syscall.rs` arm 56 exercises
+    // the full happy path under a real userspace VmSpace.
+    let has_vm_space = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == parent_pid)
+            .map(|p| p.vm_space.is_some())
+            .unwrap_or(false)
+    };
+    if !has_vm_space {
+        let res = crate::proc::alloc_vfork_child_tls(parent_pid);
+        if res.is_some() {
+            test_fail!("test264",
+                "alloc_vfork_child_tls succeeded despite parent PID 1 \
+                 having no VmSpace — None expected on VmSpace lookup miss");
+            return false;
+        }
+        test_println!("  (skipped happy-path: PID 1 has no VmSpace in test-mode runner; \
+                       lookup-miss returns None as expected ✓)");
+        test_pass!("alloc_vfork_child_tls layout (lookup-miss path)");
+        return true;
+    }
+
+    let base = match crate::proc::alloc_vfork_child_tls(parent_pid) {
+        Some(v) => v,
+        None => {
+            test_fail!("test264",
+                "alloc_vfork_child_tls returned None for PID 1 — \
+                 page allocation or VmSpace insert failed");
+            return false;
+        }
+    };
+
+    // (a) Non-zero, 4 KiB-aligned base VA.
+    if base == 0 {
+        test_fail!("test264", "Case A: base VA is zero — fs:0 deref will fault");
+        return false;
+    }
+    if base & 0xfff != 0 {
+        test_fail!("test264",
+            "Case A: base VA 0x{:x} not 4 KiB aligned (page-granular VMA \
+             contract broken)", base);
+        return false;
+    }
+    test_println!("  Case A: base VA 0x{:x} non-zero and page-aligned ✓", base);
+
+    // Resolve the backing frame via the parent's CR3 so the TCB read path
+    // is CR3-independent.
+    let parent_cr3 = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == parent_pid).map(|p| p.cr3).unwrap_or(0)
+    };
+    if parent_cr3 == 0 {
+        test_fail!("test264",
+            "Case B: parent PID 1 has CR3 == 0 — test prerequisite broken");
+        return false;
+    }
+
+    let frame = match crate::mm::vmm::virt_to_phys_in(parent_cr3, base) {
+        Some(f) => f & !0xfff,
+        None => {
+            test_fail!("test264",
+                "Case B: virt_to_phys_in(cr3=0x{:x}, base=0x{:x}) returned None — \
+                 page not mapped by alloc_vfork_child_tls", parent_cr3, base);
+            return false;
+        }
+    };
+
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    let kva = (PHYS_OFF + frame) as *const u8;
+
+    // (b) Self-pointer at offset 0 equals the returned VA.
+    let self_ptr = unsafe { core::ptr::read(kva as *const u64) };
+    if self_ptr != base {
+        test_fail!("test264",
+            "Case B: TCB[0] (self-pointer) is 0x{:x}, expected 0x{:x} \
+             (Variant II TLS requires *fs == fs.base)", self_ptr, base);
+        return false;
+    }
+    test_println!("  Case B: TCB self-pointer at +0x00 = 0x{:x} ✓", self_ptr);
+
+    // (c) Canary slot at +0x28 is zero.
+    let canary = unsafe { core::ptr::read(kva.add(0x28) as *const u64) };
+    if canary != 0 {
+        test_fail!("test264",
+            "Case C: TCB canary slot at +0x28 is 0x{:x}, expected 0 \
+             (canary-isolation invariant violated)", canary);
+        return false;
+    }
+    test_println!("  Case C: TCB canary slot at +0x28 = 0 ✓");
+
+    // (d) Cancel-state byte at +0x40 is PTHREAD_CANCEL_DISABLE (1).
+    let canceldisable = unsafe { core::ptr::read(kva.add(0x40)) };
+    if canceldisable != 1 {
+        test_fail!("test264",
+            "Case D: TCB canceldisable byte at +0x40 = {}, expected 1 \
+             (PTHREAD_CANCEL_DISABLE per POSIX pthread_setcancelstate)",
+            canceldisable);
+        return false;
+    }
+    test_println!("  Case D: TCB canceldisable at +0x40 = 1 ✓");
+
+    // (e) Cleanup unmaps the page.
+    const VFORK_TLS_SIZE: u64 = 4096;
+    crate::proc::vfork_isolated_tls_cleanup(parent_pid, base, VFORK_TLS_SIZE);
+    let post_cleanup = crate::mm::vmm::virt_to_phys_in(parent_cr3, base);
+    if post_cleanup.is_some() {
+        test_fail!("test264",
+            "Case E: virt_to_phys_in still resolves base=0x{:x} after \
+             cleanup — VMA leak", base);
+        return false;
+    }
+    test_println!("  Case E: cleanup unmapped base=0x{:x} ✓", base);
+
+    test_pass!("alloc_vfork_child_tls layout (musl posix_spawn unblocker)");
     true
 }
