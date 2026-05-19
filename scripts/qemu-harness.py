@@ -5886,6 +5886,236 @@ def cmd_sc_histogram(args):
     })
 
 
+# ─── W215 axis-N+1 stack-provenance verdict bucket parser ─────────────────────
+#
+# Inputs (per session serial log):
+#   [STACK-CANARY-WALK]    {PRE|POST} pid=… tid=… frame_idx=N rbp=… \
+#                          saved_rbp_at_rbp=… saved_rip_at_rbp+8=… canary_at_rbp-8=…
+#   [STACK-CANARY-FINEGRAIN] {pre|post} pid=… tid=… chunk_idx=N crc=… range=…
+#   [STACK-PAGE-PROV]      when={pre|post} pid=… tid=… page_va=… page_pa=… \
+#                          refcount=N present=B writable=B
+#   [VFORK-FS28-WATCH]     state=… fs_base=… fs28_addr=… phys=… linear=…
+#   [W215/DR-WATCH-FIRE]   slot=… cpu=… rip=… …  (from the master-canary DR0
+#                          watch — names the kernel writer if `fs:0x28` is
+#                          stored to during the vfork window).
+#
+# Verdict buckets (per dispatch's three branches):
+#   (a) "pre_existing_zero"      — all chunks identical AND canary_at_rbp-8 == 0
+#                                  in BOTH PRE and POST snapshots.  Corruption
+#                                  is pre-vfork.  Next dispatch: trace SSP
+#                                  prologue writes (DR watchpoint on the slot
+#                                  at the moment the prologue stores it).
+#   (b) "during_vfork_chunk_delta" — some FINEGRAIN chunk CRC differs pre/post.
+#                                  Corruption is during-vfork.  Localised to
+#                                  the changed chunk's 256 B band.
+#   (c) "page_aliasing"           — for some page_va, page_pa changed across
+#                                  the wait (same VA → different physical
+#                                  frame) or refcount mismatched.  W215-class
+#                                  aliasing on the user-stack VMA.  Dispatch
+#                                  aether-kernel-engineer with the failing
+#                                  (page_va, refcount-history) tuple.
+#   "no_signal"                  — none of the above; the snapshot pair is
+#                                  perfectly identical AND no SSP-instrumented
+#                                  frame had a zero canary.  Likely the run
+#                                  didn't reach the vfork window.
+#
+# Plus per-trial fields:
+#   pre_snapshot_seen / post_snapshot_seen / chunks_pre / chunks_post …
+
+_SPP_WALK_RE = re.compile(
+    r"\[STACK-CANARY-WALK\]\s+(?P<label>\S+)\s+pid=(?P<pid>\d+)\s+tid=(?P<tid>\d+)\s+"
+    r"frame_idx=(?P<idx>\d+)\s+rbp=(?P<rbp>0x[0-9a-fA-F]+)\s+"
+    r"saved_rbp_at_rbp=(?P<srbp>0x[0-9a-fA-F]+)\s+"
+    r"saved_rip_at_rbp\+8=(?P<srip>0x[0-9a-fA-F]+)\s+"
+    r"canary_at_rbp-8=(?P<canary>\S+)"
+)
+_SPP_FINE_RE = re.compile(
+    r"\[STACK-CANARY-FINEGRAIN\]\s+(?P<label>\S+)\s+pid=(?P<pid>\d+)\s+tid=(?P<tid>\d+)\s+"
+    r"chunk_idx=(?P<idx>\d+)\s+crc=(?P<crc>0x[0-9a-fA-F]+)\s+"
+    r"range=(?P<lo>0x[0-9a-fA-F]+)\.\.(?P<hi>0x[0-9a-fA-F]+)"
+)
+_SPP_PAGE_RE = re.compile(
+    r"\[STACK-PAGE-PROV\]\s+when=(?P<when>\S+)\s+pid=(?P<pid>\d+)\s+tid=(?P<tid>\d+)\s+"
+    r"page_va=(?P<va>0x[0-9a-fA-F]+)\s+page_pa=(?P<pa>\S+)\s+"
+    r"refcount=(?P<rc>\d+)\s+present=(?P<pres>\S+)\s+writable=(?P<wr>\S+)"
+)
+_SPP_WATCH_RE = re.compile(
+    r"\[VFORK-FS28-WATCH\]\s+state=(?P<state>\S+)"
+)
+_SPP_FIRE_RE = re.compile(
+    r"\[W215/DR-WATCH-FIRE\]\s+slot=(?P<slot>\d+)\s+fire_idx=\d+\s+cpu=\d+\s+"
+    r"rip=(?P<rip>0x[0-9a-fA-F]+)"
+)
+
+
+def _parse_canary_str(s: str):
+    """Decode the canary_at_rbp-8 field, which is either a hex literal
+    (`0x…`) or a `?` sentinel for unmapped/unreadable slots.  Returns
+    `int | None`.  Used to detect zero canaries (verdict bucket (a))."""
+    if s == "?" or s.startswith("?"):
+        return None
+    try:
+        return int(s, 0)
+    except ValueError:
+        return None
+
+
+def cmd_stack_prov_summary(args):
+    """Parse W215 axis-N+1 stack-provenance lines from the serial log and
+    emit a verdict bucket per the tech-lead cross-walk:
+
+      a) "pre_existing_zero"  — saved-`[rbp-8]` was already 0 BEFORE vfork
+                                AND no kernel write hit the window;
+      b) "during_vfork_chunk_delta" — some 256 B FINEGRAIN chunk CRC
+                                differs across the vfork window;
+      c) "page_aliasing"      — some user-stack page's `page_pa` changed
+                                (or refcount mismatched) across the wait.
+
+    Output (one JSON object):
+      {
+        "verdict": "a"|"b"|"c"|"no_signal",
+        "pre_walk_frames": [{frame_idx, rbp, saved_rbp, saved_rip, canary}, …],
+        "post_walk_frames": [...],
+        "zero_canary_frames_pre":  [<frame_idx>, …],
+        "zero_canary_frames_post": [<frame_idx>, …],
+        "finegrain_pre":  {<chunk_idx>: crc, …},
+        "finegrain_post": {<chunk_idx>: crc, …},
+        "finegrain_changed_chunks": [<chunk_idx>, …],
+        "page_prov_pre":  [{page_va, page_pa, refcount, present, writable}, …],
+        "page_prov_post": [...],
+        "page_prov_pa_swaps":    [{page_va, pa_pre, pa_post}, …],
+        "page_prov_rc_mismatch": [{page_va, rc_pre, rc_post}, …],
+        "fs28_watch_state":      "armed"|"dr0_busy"|"fs28_unmapped"|null,
+        "fs28_watch_fires":      [{slot, rip}, …],
+      }
+    """
+    sess = _load_session(args.sid)
+    serial_log = sess["serial_log"]
+
+    pre_walk = []
+    post_walk = []
+    fine_pre: dict[int, str] = {}
+    fine_post: dict[int, str] = {}
+    page_pre = []
+    page_post = []
+    fs28_state = None
+    watch_fires = []
+
+    try:
+        with Path(serial_log).open("r", errors="replace") as fh:
+            for ln in fh:
+                m = _SPP_WALK_RE.search(ln)
+                if m:
+                    rec = {
+                        "frame_idx": int(m.group("idx")),
+                        "rbp":       m.group("rbp"),
+                        "saved_rbp": m.group("srbp"),
+                        "saved_rip": m.group("srip"),
+                        "canary":    m.group("canary"),
+                    }
+                    if m.group("label") == "PRE":
+                        pre_walk.append(rec)
+                    else:
+                        post_walk.append(rec)
+                    continue
+                m = _SPP_FINE_RE.search(ln)
+                if m:
+                    if m.group("label") == "pre":
+                        fine_pre[int(m.group("idx"))] = m.group("crc")
+                    else:
+                        fine_post[int(m.group("idx"))] = m.group("crc")
+                    continue
+                m = _SPP_PAGE_RE.search(ln)
+                if m:
+                    rec = {
+                        "page_va":   m.group("va"),
+                        "page_pa":   m.group("pa"),
+                        "refcount":  int(m.group("rc")),
+                        "present":   m.group("pres"),
+                        "writable":  m.group("wr"),
+                    }
+                    if m.group("when") == "pre":
+                        page_pre.append(rec)
+                    else:
+                        page_post.append(rec)
+                    continue
+                m = _SPP_WATCH_RE.search(ln)
+                if m:
+                    fs28_state = m.group("state")
+                    continue
+                m = _SPP_FIRE_RE.search(ln)
+                if m:
+                    watch_fires.append({
+                        "slot": int(m.group("slot")),
+                        "rip":  m.group("rip"),
+                    })
+    except OSError as e:
+        _err(f"Cannot read serial log: {e}")
+
+    # FINEGRAIN delta detection.
+    changed_chunks = sorted(
+        idx for idx in set(fine_pre) | set(fine_post)
+        if fine_pre.get(idx) != fine_post.get(idx)
+    )
+
+    # PAGE-PROV pa-swap + refcount-mismatch detection (match by page_va).
+    pre_by_va  = {p["page_va"]: p for p in page_pre}
+    post_by_va = {p["page_va"]: p for p in page_post}
+    pa_swaps = []
+    rc_mismatches = []
+    for va in sorted(set(pre_by_va) & set(post_by_va)):
+        a, b = pre_by_va[va], post_by_va[va]
+        if a["page_pa"] != b["page_pa"]:
+            pa_swaps.append({
+                "page_va": va, "pa_pre": a["page_pa"], "pa_post": b["page_pa"],
+            })
+        if a["refcount"] != b["refcount"]:
+            rc_mismatches.append({
+                "page_va": va, "rc_pre": a["refcount"], "rc_post": b["refcount"],
+            })
+
+    # Zero-canary frame detection (per-pre / per-post).
+    def _zero_idxs(frames):
+        out = []
+        for f in frames:
+            v = _parse_canary_str(f["canary"])
+            if v == 0:
+                out.append(f["frame_idx"])
+        return out
+    zero_pre  = _zero_idxs(pre_walk)
+    zero_post = _zero_idxs(post_walk)
+
+    # Verdict bucket.  Branch (c) takes precedence over (b) which takes
+    # precedence over (a) — a pa-swap is the most actionable signal
+    # (W215-class kernel bug), a finegrain delta is next (in-window
+    # write), pre-existing-zero is last (corruption pre-vfork).
+    if pa_swaps or rc_mismatches:
+        verdict = "c"
+    elif changed_chunks:
+        verdict = "b"
+    elif (zero_pre and zero_post) or (zero_pre == zero_post and zero_pre):
+        verdict = "a"
+    else:
+        verdict = "no_signal"
+
+    _out({
+        "verdict": verdict,
+        "pre_walk_frames":  pre_walk,
+        "post_walk_frames": post_walk,
+        "zero_canary_frames_pre":  zero_pre,
+        "zero_canary_frames_post": zero_post,
+        "finegrain_pre":  {str(k): v for k, v in sorted(fine_pre.items())},
+        "finegrain_post": {str(k): v for k, v in sorted(fine_post.items())},
+        "finegrain_changed_chunks": changed_chunks,
+        "page_prov_pre":  page_pre,
+        "page_prov_post": page_post,
+        "page_prov_pa_swaps":    pa_swaps,
+        "page_prov_rc_mismatch": rc_mismatches,
+        "fs28_watch_state":      fs28_state,
+        "fs28_watch_fires":      watch_fires,
+    })
+
+
 def cmd_results(args):
     """
     Scan the session's serial log and summarise test-runner + Firefox state.
@@ -8010,6 +8240,20 @@ def main():
                           help="Skip serial log lines before this line number "
                                "(useful to restrict to post-plateau window)")
 
+    # stack-prov-summary — parse W215 axis-N+1 stack-provenance lines
+    # and emit a verdict bucket (a/b/c/no_signal).  Pairs with the
+    # `vfork-canary-diag` kernel build (vfork_diag.rs).
+    p_spp = sub.add_parser(
+        "stack-prov-summary",
+        help="Parse [STACK-CANARY-WALK], [STACK-CANARY-FINEGRAIN], "
+             "[STACK-PAGE-PROV], [VFORK-FS28-WATCH], and "
+             "[W215/DR-WATCH-FIRE] lines from the serial log; emit "
+             "a per-trial verdict bucket (a=pre_existing_zero, "
+             "b=during_vfork_chunk_delta, c=page_aliasing).  "
+             "Requires --features vfork-canary-diag at start."
+    )
+    p_spp.add_argument("sid")
+
     # read-png — extract the guest PNG screenshot to a host-side file
     p_read_png = sub.add_parser(
         "read-png",
@@ -8189,6 +8433,7 @@ def main():
         "parked-stacks": cmd_parked_stacks,
         "wake-attempts": cmd_wake_attempts,
         "sc-histogram": cmd_sc_histogram,
+        "stack-prov-summary": cmd_stack_prov_summary,
         "rip-sample": cmd_rip_sample,
         "rip-trace-sym": cmd_rip_trace_sym,
         "qmp-regs": cmd_qmp_regs,

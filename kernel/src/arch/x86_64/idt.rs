@@ -259,10 +259,15 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
             "[EXC] vec={} err={:#x} RIP={:#x} CS={:#x} RSP={:#x}",
             vector, error_code, frame.rip, frame.cs, frame.rsp
         );
-        // For GP fault from dlerror (known crash site): dump GOT and ld-linux state.
-        // RIP=0x7effffae4c7c is libc dlerror "call *0x378(%r13)" where r13 = _rtld_global_ro ptr.
-        // Dump the libc GOT slot (at libc_base + 0x202eb0) and the ld-linux .data.rel.ro page
-        // at the function pointer slot (ld_base + 0x37e18) to diagnose relocation failures.
+        // For #GP from user mode: dump the qword window around RSP so the
+        // post-processor can see the return-address chain on the stack
+        // (the SSP failing-frame's `__stack_chk_fail` call leaves the
+        // SSP-instrumented caller's return-addr at the top of stack even
+        // though `__stack_chk_fail` itself sets up no RBP).  This is the
+        // axis-N+1 successor to the prior `0x37e18` ldlinux dump (musl
+        // doesn't use that `_rtld_global_ro+0x378` slot — qa-engineer
+        // verdict 2026-05-19).  TODO: re-gate to glibc-only when the
+        // glibc personality track returns.
         if vector == 13 {
             // SAFETY: current_tid() is a lock-free atomic read — safe in ISR context.
             // Do NOT call current_pid() here: it acquires THREAD_TABLE lock which can
@@ -270,7 +275,6 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
             let tid = crate::proc::current_tid();
             let cr3: u64;
             unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
-            // Dump 16 qwords around the RSP to see the call stack.
             let rsp = frame.rsp;
             crate::serial_println!("[GPF-DBG] tid={} RSP={:#x} CR3={:#x}", tid, rsp, cr3);
             for i in 0..8usize {
@@ -282,35 +286,6 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
                         )
                     };
                     crate::serial_println!("[GPF-DBG]   [RSP+{:#03x}]={:#018x}", i*8, val);
-                }
-            }
-            // Dump relevant addresses: libc base detection via known RIP offset
-            // and ld-linux base at INTERP_BASE=0x7F00_0000_0000.
-            let ldlinux_relro_slot: u64 = 0x7F00_0003_7e18; // _rtld_global_ro+0x378
-            if let Some(phys) = crate::mm::vmm::virt_to_phys_in(cr3, ldlinux_relro_slot) {
-                let val = unsafe {
-                    core::ptr::read_volatile(
-                        (0xFFFF_8000_0000_0000u64 + phys) as *const u64
-                    )
-                };
-                crate::serial_println!("[GPF-DBG] ldlinux[0x37e18]={:#018x} (should=0x7F00_0000_1640)", val);
-            } else {
-                crate::serial_println!("[GPF-DBG] ldlinux[0x37e18]=UNMAPPED");
-            }
-            // Libc GOT slot: libc_base = RIP - 0x97c7c, GOT_slot = libc_base + 0x202eb0
-            if frame.rip >= 0x97c7c {
-                let libc_base = frame.rip - 0x97c7c;
-                let got_slot = libc_base + 0x202eb0;
-                crate::serial_println!("[GPF-DBG] libc_base={:#x} got_slot={:#x}", libc_base, got_slot);
-                if let Some(phys) = crate::mm::vmm::virt_to_phys_in(cr3, got_slot) {
-                    let val = unsafe {
-                        core::ptr::read_volatile(
-                            (0xFFFF_8000_0000_0000u64 + phys) as *const u64
-                        )
-                    };
-                    crate::serial_println!("[GPF-DBG] libc.GOT[_rtld_global_ro]={:#018x} (should=0x7F00_0003_7aa0)", val);
-                } else {
-                    crate::serial_println!("[GPF-DBG] libc.GOT[_rtld_global_ro]=UNMAPPED");
                 }
             }
         }
