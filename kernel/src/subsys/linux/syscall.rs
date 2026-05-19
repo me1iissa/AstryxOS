@@ -2372,6 +2372,11 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                     "pre", pid, parent_tid);
                                 crate::subsys::linux::vfork_diag::snapshot_stack_page_prov(
                                     "pre", pid, parent_tid);
+                                // Axis-O: stash PRE 8 KiB window for the
+                                // `#GP`-entry per-qword writer-history
+                                // diff.  Tech-lead 2026-05-19 brief.
+                                crate::subsys::linux::vfork_diag::store_pre_snapshot(
+                                    pid, parent_tid);
                                 crate::subsys::linux::vfork_diag::enter_vfork_window(
                                     pid, parent_tid);
                                 crate::subsys::linux::vfork_diag::arm_master_canary_watch();
@@ -2396,6 +2401,15 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                     "post", pid, parent_tid);
                                 crate::subsys::linux::vfork_diag::snapshot_stack_page_prov(
                                     "post", pid, parent_tid);
+                                // Axis-O: stash POST 8 KiB window and arm
+                                // DR write-watchpoints on changed slots so
+                                // any post-wake writer is named by the
+                                // existing `[W215/DR-WATCH-FIRE]` line in
+                                // `arch::x86_64::debug_reg::handle_db_exception`.
+                                crate::subsys::linux::vfork_diag::store_post_snapshot(
+                                    pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::arm_launcher_canary_watches(
+                                    pid, parent_tid);
                             }
                             vfork_canary_snapshot("post_wake.clone", pid as u32, parent_tid);
                         }
@@ -3258,6 +3272,8 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                     "pre", pid, parent_tid);
                                 crate::subsys::linux::vfork_diag::snapshot_stack_page_prov(
                                     "pre", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::store_pre_snapshot(
+                                    pid, parent_tid);
                                 crate::subsys::linux::vfork_diag::enter_vfork_window(
                                     pid, parent_tid);
                                 crate::subsys::linux::vfork_diag::arm_master_canary_watch();
@@ -3276,6 +3292,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                     "post", pid, parent_tid);
                                 crate::subsys::linux::vfork_diag::snapshot_stack_page_prov(
                                     "post", pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::store_post_snapshot(
+                                    pid, parent_tid);
+                                crate::subsys::linux::vfork_diag::arm_launcher_canary_watches(
+                                    pid, parent_tid);
                             }
                             vfork_canary_snapshot("post_wake.clone3", pid as u32, parent_tid);
                         }

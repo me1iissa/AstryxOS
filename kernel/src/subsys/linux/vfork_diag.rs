@@ -74,6 +74,7 @@
 extern crate alloc;
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use spin::Mutex;
 
 /// Active vfork-window parent identity, packed as `(pid << 32) | (tid & 0xFFFF_FFFF)`.
 /// Zero = no vfork in flight.  Single AtomicU64 instead of two atomics so that
@@ -757,4 +758,445 @@ pub fn disarm_master_canary_watch() {
         return;
     }
     crate::arch::x86_64::debug_reg::release_slot(slot as usize);
+}
+
+// ─── Axis-O: #GP-entry stack snapshot + launcher-frame canary identification ─
+//
+// Tech-lead cross-walk verdict 2026-05-19 (post-PR-#336): the existing 8 KiB
+// `[vfork_canary_snapshot]` window starts at the parent's RSP **at vfork
+// entry** and runs upward by 8 KiB.  Empirically the launcher frame whose
+// SSP canary is failing sits ABOVE that window — the parent unwinds many
+// frames between vfork-return and the `__stack_chk_fail` call, so the
+// failing `[rbp-8]` slot is in a frame the PRE/POST window does not cover.
+//
+// This channel takes a SECOND snapshot at `#GP`-entry from user mode, with
+// two windows sized to bracket the launcher frame regardless of where it
+// landed:
+//
+//   * `[RSP_at_GP, RSP_at_GP + 4096)` — 4 KiB upward from the current
+//     user RSP.  Captures the SSP frame's return-address chain + locals.
+//   * `[RBP_at_GP - 4096, RBP_at_GP)` — 4 KiB downward from the current
+//     user RBP.  Captures the launcher caller's frame including the
+//     `[rbp-8]` canary slot that the failing epilogue re-read.
+//
+// For each 8-aligned qword in the window we emit the VA, the value at
+// `#GP`-time, and (if the slot also lies inside the stored PRE/POST 8 KiB
+// snapshot range) the PRE_VAL and POST_VAL captured by
+// `store_pre_snapshot` / `store_post_snapshot`.  A post-processor then
+// classifies each qword's writer history:
+//
+//   PRE == POST == GPF  → never written across the timeline (prologue value)
+//   PRE != POST == GPF  → written inside the vfork window, stable since wake
+//   PRE == POST != GPF  → written AFTER the wake but BEFORE the #GP
+//                         (i.e. by the launcher's continued userspace work)
+//   PRE != POST != GPF  → written in window AND post-wake (two writers)
+//
+// The "writer identity" rows (kernel RIP per write) are then provided by
+// the DR watchpoint pool: candidate canary slots (any qword that differs
+// from PRE within the window) are armed with `arm_phys_slot_watchpoint`
+// at POST_WAKE; the existing `[W215/DR-WATCH-FIRE]` line names the
+// writer RIP when a hit fires.  This is a strictly additive use of the
+// existing DR-fire path — no new exception handler code is needed.
+//
+// Bucket disambiguation (per tech-lead brief):
+//   α — slot only ever written by launcher prologue → TLS-base / arch_prctl
+//       audit (launcher's `[rbp-8]` and `fs:0x28` reading different memory)
+//   β — slot written by a kernel RIP in a CLONE_VFORK wake / sibling TID
+//       mutation path → kernel fix
+//   γ — slot written by another user thread (not the launcher) → CLONE_VM
+//       shared-AS userspace mutation, possibly TID 4 sibling write
+//   δ — slot never explicitly written → master canary `fs:0x28` is what
+//       changed; TLS-base swap mid-flight
+//
+// Refs:
+//  - Intel SDM Vol. 3A §6.15 (#GP exception)
+//  - System V AMD64 ABI §6.4 (SSP / `__stack_chk_guard` at `fs:0x28`)
+//  - System V AMD64 ABI §3.4.1 (frame-pointer chain)
+//  - POSIX clone(2) / vfork(2) man pages (CLONE_VM / CLONE_VFORK semantics)
+
+const GPF_WIN_PAGES: usize = 1;
+const GPF_WIN_SIZE: usize  = GPF_WIN_PAGES * 4096;
+const SNAP_BYTES:    usize = 0x2000; // 8 KiB — matches `vfork_canary_snapshot`.
+
+/// Hard cap on `[GPF-WIN-Q]` dump invocations.  Without this guard, a tight
+/// `#GP`-handler-IRET-#GP loop (which can happen if the user mode RIP stays
+/// at the faulting instruction across retry) would emit ~1024 lines per
+/// iteration and drown the serial log.  Per Intel SDM Vol. 3A §6.15: #GP
+/// is a fault, so the saved RIP is the faulting instruction — without a
+/// kernel-side fix the trap re-fires on every iret.
+const GPF_DUMP_MAX: u64 = 3;
+static GPF_DUMP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Stored PRE/POST 8 KiB snapshot for the active vfork parent.  Used by the
+/// `#GP`-entry handler to compute per-qword writer history.
+struct StashedSnapshot {
+    parent_tid: u64,
+    parent_pid: u64,
+    win_base: u64,
+    pre:  Option<alloc::vec::Vec<u8>>,
+    post: Option<alloc::vec::Vec<u8>>,
+}
+
+/// At-most-one stashed snapshot at a time (vforks are serialised inside a
+/// single posix_spawn caller frame).  Replaced on each `store_pre_snapshot`
+/// call.  A Mutex<Option<…>> rather than a per-tid map keeps the lookup
+/// O(1) and the static footprint bounded.
+static STASHED: Mutex<Option<StashedSnapshot>> =
+    Mutex::new(None);
+
+/// Snapshot the parent's 8 KiB stack window at vfork pre-block and stash
+/// the bytes for the #GP-entry handler to diff against.  Called from
+/// `syscall.rs` next to the existing `snapshot_stack_finegrain("pre", ...)`
+/// call.  No new userland reads — uses the same `user_slice_snapshot`
+/// SMAP-bracketed helper that `vfork_canary_snapshot` uses.
+pub fn store_pre_snapshot(parent_pid: u64, parent_tid: u64) {
+    let (user_rsp, _user_rbp) = get_parent_user_rsp_rbp(parent_tid);
+    if user_rsp == 0 {
+        crate::serial_println!(
+            "[GPF-STASH-PRE] pid={} tid={} state=no_rsp", parent_pid, parent_tid);
+        return;
+    }
+    if !crate::syscall::validate_user_ptr(user_rsp, SNAP_BYTES) {
+        crate::serial_println!(
+            "[GPF-STASH-PRE] pid={} tid={} state=win_unmapped base={:#x}",
+            parent_pid, parent_tid, user_rsp);
+        return;
+    }
+    let buf = unsafe { crate::syscall::user_slice_snapshot(user_rsp, SNAP_BYTES) };
+    let mut guard = STASHED.lock();
+    *guard = Some(StashedSnapshot {
+        parent_tid,
+        parent_pid,
+        win_base: user_rsp,
+        pre:  buf,
+        post: None,
+    });
+    crate::serial_println!(
+        "[GPF-STASH-PRE] pid={} tid={} win_base={:#x} bytes={}",
+        parent_pid, parent_tid, user_rsp,
+        guard.as_ref().and_then(|s| s.pre.as_ref()).map(|b| b.len()).unwrap_or(0));
+}
+
+/// Snapshot the parent's 8 KiB stack window at vfork post-wake.  Called
+/// from `syscall.rs` next to the existing `snapshot_stack_finegrain
+/// ("post", ...)` call.  Updates the stash in-place; preserves the PRE
+/// buffer so the `#GP` handler can three-way diff PRE / POST / GPF.
+pub fn store_post_snapshot(parent_pid: u64, parent_tid: u64) {
+    let (user_rsp, _user_rbp) = get_parent_user_rsp_rbp(parent_tid);
+    if user_rsp == 0 {
+        crate::serial_println!(
+            "[GPF-STASH-POST] pid={} tid={} state=no_rsp", parent_pid, parent_tid);
+        return;
+    }
+    let buf = if crate::syscall::validate_user_ptr(user_rsp, SNAP_BYTES) {
+        unsafe { crate::syscall::user_slice_snapshot(user_rsp, SNAP_BYTES) }
+    } else {
+        None
+    };
+    let mut guard = STASHED.lock();
+    if let Some(stash) = guard.as_mut() {
+        if stash.parent_tid == parent_tid && stash.win_base == user_rsp {
+            stash.post = buf;
+            crate::serial_println!(
+                "[GPF-STASH-POST] pid={} tid={} win_base={:#x} bytes={}",
+                parent_pid, parent_tid, user_rsp,
+                stash.post.as_ref().map(|b| b.len()).unwrap_or(0));
+            return;
+        }
+    }
+    // PRE was never captured or win_base shifted (RSP unwound).  Stash POST
+    // alone — the `#GP` handler will still emit GPF values, just without
+    // PRE/POST history.
+    *guard = Some(StashedSnapshot {
+        parent_tid, parent_pid, win_base: user_rsp,
+        pre: None, post: buf,
+    });
+    crate::serial_println!(
+        "[GPF-STASH-POST] pid={} tid={} win_base={:#x} state=replaced_pre",
+        parent_pid, parent_tid, user_rsp);
+}
+
+/// Look up the stashed PRE/POST qword values at VA `addr`, if `addr` lies
+/// inside the stashed `[win_base, win_base + SNAP_BYTES)` range.  Returns
+/// `(pre_val, post_val)` as `Option<u64>` pairs; either side may be `None`
+/// if that snapshot wasn't captured (e.g. fault occurred between PRE and
+/// POST sites, or VA is outside the stashed range).
+fn stashed_pre_post_at(addr: u64) -> (Option<u64>, Option<u64>) {
+    let guard = STASHED.lock();
+    let stash = match guard.as_ref() { Some(s) => s, None => return (None, None) };
+    if addr < stash.win_base || addr + 8 > stash.win_base + SNAP_BYTES as u64 {
+        return (None, None);
+    }
+    let off = (addr - stash.win_base) as usize;
+    let read = |bytes: &alloc::vec::Vec<u8>| -> u64 {
+        u64::from_le_bytes([
+            bytes[off],     bytes[off + 1], bytes[off + 2], bytes[off + 3],
+            bytes[off + 4], bytes[off + 5], bytes[off + 6], bytes[off + 7],
+        ])
+    };
+    let pre  = stash.pre.as_ref().map(read);
+    let post = stash.post.as_ref().map(read);
+    (pre, post)
+}
+
+/// Classify a single qword's writer history into one of the
+/// (α/β/γ/δ) buckets per tech-lead brief.  Returns a 4-char tag so the
+/// post-processor can grep `bucket=α` (utf-8 `\xCE\xB1`) cheaply; for
+/// readability the kernel emits the ASCII-safe codes `prol|inwin|postwk|both|stable|gpf_only|nodata`.
+fn classify_qword(pre: Option<u64>, post: Option<u64>, gpf: u64) -> &'static str {
+    match (pre, post) {
+        (None,     None)             => "nodata",        // No snapshot history.
+        (Some(p),  None)     if p == gpf => "stable_pre", // PRE matches GPF; no POST.
+        (Some(_p), None)              => "post_unk",      // PRE != GPF, POST missing.
+        (None,     Some(q))  if q == gpf => "stable_post",
+        (None,     Some(_q))          => "post_gpf_diff", // POST != GPF.
+        (Some(p),  Some(q))  => match (p == q, q == gpf, p == gpf) {
+            (true,  true,  _)     => "prol",     // PRE==POST==GPF: prologue value, never written.
+            (false, true,  _)     => "inwin",    // PRE!=POST==GPF: written in vfork window only.
+            (true,  false, _)     => "postwk",   // PRE==POST!=GPF: written post-wake.
+            (false, false, false) => "both",     // All three differ.
+            (false, false, true)  => "gpf_back", // GPF matches PRE but not POST — write+revert.
+        },
+    }
+}
+
+/// Snapshot two 4 KiB windows at `#GP`-entry from user mode and emit
+/// per-qword (VA, value, writer-history) rows.  Called from the user-mode
+/// `#GP` arm in `exception_handler` (vec=13, CPL=3).  Fault-immune: all
+/// reads go through `read_userland_qword_raw` (kernel direct-map deref of
+/// the resolved phys; never faults on a not-present user PTE).
+///
+/// Also performs **launcher-frame canary identification**: at `#GP`-entry
+/// the SSP-instrumented function that called `__stack_chk_fail` has its
+/// canary slot at `[rbp_at_GP - 8]` (per System V AMD64 ABI §6.4 SSP).
+/// We compare that slot's value with `rax_at_gp` (which holds the master
+/// canary `fs:0x28` value at the point of the failing `cmp` per GCC's
+/// SSP-epilogue convention — see GCC `-fstack-protector` codegen docs).
+/// The mismatch identifies the doomed slot.
+///
+/// Per tech-lead 2026-05-19 brief.
+///
+/// # Parameters
+/// * `tid`         — current TID (from `current_tid()`, atomic read).
+/// * `rip_at_gp`   — faulting RIP (frame.rip).
+/// * `rsp_at_gp`   — user RSP at trap (frame.rsp).
+/// * `rbp_at_gp`   — user RBP at trap (from saved-RBP in ISR frame).
+/// * `rax_at_gp`   — user RAX at trap (from saved-RAX in ISR frame).
+///
+/// # Refs
+///  - Intel SDM Vol. 3A §6.15 (#GP exception, error code semantics)
+///  - System V AMD64 ABI §6.4 (TLS Variant II, `__stack_chk_guard`)
+///  - System V AMD64 ABI §3.4.1 (frame-pointer chain)
+pub fn gpf_entry_snapshot(
+    tid: u64,
+    rip_at_gp: u64,
+    rsp_at_gp: u64,
+    rbp_at_gp: u64,
+    rax_at_gp: u64,
+) {
+    // One-shot guard: cap total dump invocations.  An IRET-storm of #GPs
+    // would otherwise emit ~1024 lines × N iterations.
+    let prev = GPF_DUMP_COUNT.fetch_add(1, Ordering::Relaxed);
+    if prev >= GPF_DUMP_MAX {
+        if prev == GPF_DUMP_MAX {
+            crate::serial_println!(
+                "[GPF-WIN] state=cap_reached cap={} (further #GP dumps suppressed)",
+                GPF_DUMP_MAX);
+        }
+        return;
+    }
+    const USER_ADDR_END: u64 = 0x0000_8000_0000_0000;
+    let cr3 = crate::mm::vmm::get_cr3();
+
+    crate::serial_println!(
+        "[GPF-CANARY-FRAME] tid={} rip={:#x} rsp_at_gp={:#x} rbp_at_gp={:#x} \
+         rax_at_gp={:#x} cr3={:#x}",
+        tid, rip_at_gp, rsp_at_gp, rbp_at_gp, rax_at_gp, cr3);
+
+    // ── Launcher-frame canary identification ──────────────────────────────
+    //
+    // Per System V AMD64 ABI §6.4: SSP-instrumented function prologue does
+    // `mov rax, fs:0x28; mov [rbp-8], rax`.  Epilogue does
+    // `mov rax, fs:0x28; xor rax, [rbp-8]; jne __stack_chk_fail`.
+    // On reaching `__stack_chk_fail`, RAX = `fs:0x28 XOR canary_at_rbp-8`
+    // (or, on some codegen variants, RAX = the canary slot value itself —
+    // depends on compiler version).  We dump both `[rbp_at_gp - 8]` and
+    // current `fs:0x28`, and emit `diff_bits` so the post-processor can
+    // decide which variant codegen was used and whether the diff is
+    // structural (e.g. single bit flipped, upper 32 bits zeroed).
+    if rbp_at_gp != 0 && rbp_at_gp < USER_ADDR_END && rbp_at_gp & 0x7 == 0 {
+        let canary_va = rbp_at_gp.wrapping_sub(8);
+        let canary = read_userland_qword_raw(canary_va);
+        let fs_base = unsafe { crate::hal::rdmsr(0xC000_0100) };
+        let fs28_va = fs_base.wrapping_add(0x28);
+        let fs28 = read_userland_qword_raw(fs28_va);
+
+        let (canary_str, canary_phys_str) = match canary {
+            Some((v, p)) => (alloc::format!("{:#x}", v), alloc::format!("{:#x}", p)),
+            None         => (alloc::string::String::from("?"),
+                             alloc::string::String::from("?")),
+        };
+        let (fs28_str, fs28_phys_str) = match fs28 {
+            Some((v, p)) => (alloc::format!("{:#x}", v), alloc::format!("{:#x}", p)),
+            None         => (alloc::string::String::from("?"),
+                             alloc::string::String::from("?")),
+        };
+        let diff_bits_str = match (canary, fs28) {
+            (Some((c, _)), Some((f, _))) => alloc::format!("{:#x}", c ^ f),
+            _ => alloc::string::String::from("?"),
+        };
+        crate::serial_println!(
+            "[GPF-CANARY-FRAME] tid={} rip={:#x} canary_va={:#x} \
+             canary_val={} canary_phys={} fs28_va={:#x} fs28_val={} \
+             fs28_phys={} diff_bits={}",
+            tid, rip_at_gp, canary_va, canary_str, canary_phys_str,
+            fs28_va, fs28_str, fs28_phys_str, diff_bits_str);
+    } else {
+        crate::serial_println!(
+            "[GPF-CANARY-FRAME] tid={} rip={:#x} state=bad_rbp rbp={:#x}",
+            tid, rip_at_gp, rbp_at_gp);
+    }
+
+    // ── Window A: [RSP, RSP+4096) ─────────────────────────────────────────
+    emit_window("RSP", tid, rip_at_gp, cr3, rsp_at_gp, GPF_WIN_SIZE as u64);
+
+    // ── Window B: [RBP-4096, RBP) ─────────────────────────────────────────
+    if rbp_at_gp != 0 && rbp_at_gp >= GPF_WIN_SIZE as u64 && rbp_at_gp < USER_ADDR_END {
+        emit_window("RBP", tid, rip_at_gp, cr3,
+                    rbp_at_gp - GPF_WIN_SIZE as u64, GPF_WIN_SIZE as u64);
+    } else {
+        crate::serial_println!(
+            "[GPF-WIN] tag=RBP tid={} state=skipped rbp={:#x}", tid, rbp_at_gp);
+    }
+}
+
+/// Emit a 4 KiB window of (VA, val, history) rows.  Per-qword the helper
+/// reads the GPF value via `read_userland_qword_raw` (fault-immune), looks
+/// up PRE/POST values from `STASHED`, and classifies each slot's bucket.
+///
+/// Output volume: 4096 / 8 = 512 lines per window.  At ~80 bytes/line that's
+/// ~40 KiB serial per window — large but bounded, fires only at `#GP`-entry
+/// (i.e. once per wedge).  Cheap relative to the existing 8 KiB
+/// `[STACK-CANARY-FINEGRAIN]` × 32 chunks per snapshot pair (~64 lines × 2).
+fn emit_window(tag: &str, tid: u64, rip: u64, cr3: u64, base: u64, len: u64) {
+    if !crate::syscall::validate_user_ptr(base, len as usize) {
+        crate::serial_println!(
+            "[GPF-WIN] tag={} tid={} state=unmapped base={:#x} len={}",
+            tag, tid, base, len);
+        return;
+    }
+    crate::serial_println!(
+        "[GPF-WIN] tag={} tid={} rip={:#x} base={:#x} len={} cr3={:#x}",
+        tag, tid, rip, base, len, cr3);
+    let mut off: u64 = 0;
+    while off + 8 <= len {
+        let va = base + off;
+        match crate::mm::vmm::virt_to_phys_in(cr3, va) {
+            Some(phys) => {
+                let val = unsafe {
+                    core::ptr::read_volatile(
+                        (0xFFFF_8000_0000_0000u64 + phys) as *const u64)
+                };
+                let (pre, post) = stashed_pre_post_at(va);
+                let bucket = classify_qword(pre, post, val);
+                let pre_s  = pre .map(|v| alloc::format!("{:#x}", v))
+                    .unwrap_or_else(|| alloc::string::String::from("?"));
+                let post_s = post.map(|v| alloc::format!("{:#x}", v))
+                    .unwrap_or_else(|| alloc::string::String::from("?"));
+                crate::serial_println!(
+                    "[GPF-WIN-Q] tag={} tid={} va={:#x} val={:#x} pre={} \
+                     post={} bucket={}",
+                    tag, tid, va, val, pre_s, post_s, bucket);
+            }
+            None => {
+                crate::serial_println!(
+                    "[GPF-WIN-Q] tag={} tid={} va={:#x} state=unmapped", tag, tid, va);
+            }
+        }
+        off += 8;
+    }
+}
+
+/// Arm hardware write-watchpoints on the candidate canary slots identified
+/// at vfork POST_WAKE.  Called from `syscall.rs` immediately after
+/// `store_post_snapshot` returns.  Uses up to 3 DR slots (DR0 is held by
+/// `arm_master_canary_watch` for `fs:0x28`; remaining DR1/DR2/DR3 are
+/// available via the existing `arm_phys_slot_watchpoint` pool).
+///
+/// **Candidate-slot policy**: scan the 8 KiB stashed PRE/POST snapshots
+/// for qwords that changed (PRE != POST) — these are the slots written
+/// during the vfork window AND ALSO are the slots most likely to be
+/// re-written post-wake (cache-aliased pages, sibling-thread mutation).
+/// Cap at 3 candidates (DR slot budget).  If fewer than 3 changed, arm
+/// the first non-zero PRE slot below the launcher's expected `[rbp-8]`
+/// area as a control.
+///
+/// When a hit fires, the existing `[W215/DR-WATCH-FIRE]` line in
+/// `arch/x86_64/debug_reg.rs::handle_db_exception` names the writer RIP
+/// and the CR3, identifying whether the writer is kernel-mode (vfork wake
+/// path, sibling syscall) or user-mode (TID 4 worker, or the launcher
+/// itself).  No new exception handler code — strict reuse.
+///
+/// Diagnostic-only, bounded LOC; gated on `vfork-canary-diag`.
+pub fn arm_launcher_canary_watches(parent_pid: u64, parent_tid: u64) {
+    use crate::arch::x86_64::debug_reg::{arm_phys_slot_watchpoint, ArmPhysResult};
+    let guard = STASHED.lock();
+    let stash = match guard.as_ref() {
+        Some(s) if s.parent_tid == parent_tid => s,
+        _ => {
+            crate::serial_println!(
+                "[GPF-LAUNCHER-WATCH] pid={} tid={} state=no_stash",
+                parent_pid, parent_tid);
+            return;
+        }
+    };
+    let (pre, post) = match (stash.pre.as_ref(), stash.post.as_ref()) {
+        (Some(p), Some(q)) => (p, q),
+        _ => {
+            crate::serial_println!(
+                "[GPF-LAUNCHER-WATCH] pid={} tid={} state=incomplete_stash",
+                parent_pid, parent_tid);
+            return;
+        }
+    };
+    let cr3 = crate::mm::vmm::get_cr3();
+    let mut armed = 0;
+    let mut off = 0usize;
+    let win_base = stash.win_base;
+    while off + 8 <= SNAP_BYTES && armed < 3 {
+        let pv = u64::from_le_bytes([
+            pre[off],     pre[off + 1], pre[off + 2], pre[off + 3],
+            pre[off + 4], pre[off + 5], pre[off + 6], pre[off + 7],
+        ]);
+        let qv = u64::from_le_bytes([
+            post[off],     post[off + 1], post[off + 2], post[off + 3],
+            post[off + 4], post[off + 5], post[off + 6], post[off + 7],
+        ]);
+        if pv != qv {
+            let va = win_base + off as u64;
+            if let Some(phys) = crate::mm::vmm::virt_to_phys_in(cr3, va) {
+                let frame_phys = phys & !0xFFFu64;
+                let off_in_frame = va & 0xFFFu64;
+                let result = arm_phys_slot_watchpoint(frame_phys, off_in_frame, 8);
+                let (state, slot_val) = match result {
+                    ArmPhysResult::Armed(s)       => ("armed", s as i32),
+                    ArmPhysResult::PoolExhausted  => ("pool_exhausted", -1),
+                    ArmPhysResult::NotAligned     => ("not_aligned", -1),
+                    ArmPhysResult::OutOfRange     => ("out_of_range", -1),
+                };
+                crate::serial_println!(
+                    "[GPF-LAUNCHER-WATCH] pid={} tid={} candidate_idx={} \
+                     va={:#x} pre={:#x} post={:#x} phys={:#x} slot={} state={}",
+                    parent_pid, parent_tid, armed, va, pv, qv, phys, slot_val, state);
+                if matches!(result, ArmPhysResult::Armed(_)) {
+                    armed += 1;
+                } else if matches!(result, ArmPhysResult::PoolExhausted) {
+                    break;
+                }
+            }
+        }
+        off += 8;
+    }
+    crate::serial_println!(
+        "[GPF-LAUNCHER-WATCH] pid={} tid={} armed_total={}", parent_pid, parent_tid, armed);
 }
