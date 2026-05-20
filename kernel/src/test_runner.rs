@@ -33645,8 +33645,12 @@ fn test_236_dead_stack_zeroing() -> bool {
         return true;
     }
 
-    // Pop it back to recover the same base.
-    let popped = crate::sched::pop_dead_stack();
+    // Pop it back to recover the same base.  Use the test-only force shim
+    // that bypasses the `DEAD_STACK_QUIESCE_TICKS` gate added in PR #348 —
+    // a same-frame push/pop pair would otherwise be withheld for ~20 ms
+    // (TICK_HZ=100 × 2 ticks) and the test would deterministically fail.
+    // Production callers continue to use the quiesced `pop_dead_stack`.
+    let popped = crate::sched::pop_dead_stack_force();
     let popped_base = match popped {
         Some(b) if b == base_virt => b,
         Some(other) => {
