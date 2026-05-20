@@ -355,6 +355,32 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
                 crate::subsys::linux::vfork_diag::gpf_entry_snapshot(
                     tid, frame.rip, rsp, user_rbp, user_rax);
             }
+
+            // ── SSP-canary divergence diagnostic (Mode A vs Mode B) ─────
+            // When the trap is at ld-musl + 0x1c7f9 (the publicly-exported
+            // `__stack_chk_fail` 2-byte hlt;ret stub — musl-1.2.x ldso
+            // `.dynsym`), capture the live FS_BASE + canary master + saved
+            // canary so we can tell whether the cookie at `[rsp+0x50]` was
+            // mutated externally (A) or `%fs:0x28` itself shifted between
+            // prologue and epilogue (B).  RAX at trap time = the live
+            // re-read the epilogue loaded for the `cmp 0x50(%rsp), %rax`.
+            // Recovery via the ISR-saved frame: `isr_with_error` pushes in
+            // order rax, rcx, rdx, ..., r15; RAX is at frame[-2].  See the
+            // [SMAP/FAULT/regs] block below for the matching layout.
+            //
+            // Bounded to 8 events per boot (see ssp_diag::SSP_DIAG_MAX),
+            // attribution-clean, gated behind `ssp-canary-diag` so master
+            // builds are byte-identical.
+            //
+            // Refs: Intel SDM Vol. 3A §3.4.4.1 (IA32_FS_BASE), §6.15 (#GP).
+            #[cfg(feature = "ssp-canary-diag")]
+            {
+                let base = frame as *const InterruptFrame as *const u64;
+                let rax_at_gp = unsafe { *base.sub(2) };
+                crate::subsys::linux::ssp_diag::probe_gp_at_ssp_fail(
+                    frame.rip, frame.rsp, rax_at_gp,
+                );
+            }
         }
     }
 

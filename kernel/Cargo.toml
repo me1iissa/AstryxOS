@@ -169,6 +169,21 @@ vfork-canary-diag = ["firefox-test", "syscall-trace", "w215-diag"]
 # Vol. 3B §17.2.4 / §17.2.5, System V AMD64 ABI §6.4.  Implies
 # `w215-diag` (DR0–DR3 infra) and `firefox-test` (trace formatters).
 elf-write-trace = ["w215-diag", "firefox-test"]
+# SSP-canary divergence diagnostic (kernel/src/subsys/linux/ssp_diag.rs).
+# When a #GP from CPL 3 fires at a user-VA whose containing VMA is the
+# musl dynamic linker (`/lib/ld-musl-x86_64.so.1`) at offset `0x1c7f9`
+# (the publicly-exported `__stack_chk_fail` two-byte `hlt;ret` stub —
+# musl-libc-1.2.x ld-musl `.dynsym`), capture the live `IA32_FS_BASE`
+# MSR, the qword at `*(fs_base + 0x28)` (the master SSP guard slot per
+# x86_64 psABI §6.4 TLS variant II), and the saved-canary slot in the
+# SSP-instrumented caller's frame.  The pair of values discriminates
+# whether the canary divergence is caused by the saved cookie being
+# mutated externally (Mode A) or by the FS_BASE MSR itself shifting
+# mid-function (Mode B).  Default builds are byte-identical when this
+# feature is off.  Bounded emission (capped per boot) makes the hook
+# safe in a soak loop.  See POSIX sigaction(2), Intel SDM Vol. 3A §6.15
+# (#GP) + §3.4.4.1 (IA32_FS_BASE), System V AMD64 ABI §6.4.
+ssp-canary-diag = ["firefox-test"]
 # LLVM source-based code-coverage instrumentation (test-coverage audit
 # session 5 / docs/TEST_COVERAGE_AUDIT_2026-05-16.md).  When enabled, the
 # kernel must additionally be built with `-C instrument-coverage` (see
