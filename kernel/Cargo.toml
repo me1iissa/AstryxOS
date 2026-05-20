@@ -245,6 +245,19 @@ kernel-gp-trap-diag = ["firefox-test"]
 # ABI §3.3.3 (`_init` semantics), and glibc `_dl_init` (publicly documented
 # at <https://www.gnu.org/software/libc/manual/html_node/Dynamic-Linker-Hooks.html>).
 elf-init-array-diag = ["firefox-test"]
+# File-struct buf/buf_size corruption witness for the B-1 gate
+# (ld-musl+0x44aeb NULL-deref in `memchr` called from `fgets`).
+# Snapshots `[page_base+0x68, +0x78)` (the page offsets at which musl
+# 1.2.5's FILE struct places `f->buf` and `f->buf_size` when the
+# FILE lives at page-offset 0x10) on every `sys_read_linux` entry and
+# exit, comparing the pair and emitting `[F_BUF_DELTA]` /
+# `[F_BUF_ZERO]` lines when the field state matches the empirical
+# fault pattern documented by the prior gate-ownership verdicts (K1+
+# K2+K3 PASS but f->buf=NULL at memchr).  Default / firefox-test /
+# test-mode builds remain byte-identical when this feature is OFF.
+# Cite: musl public FILE layout (1.2.5), POSIX read(2), Intel SDM
+# Vol. 3A §4.10.5 (TLB invariants).
+file-buf-witness = ["firefox-test"]
 # LLVM source-based code-coverage instrumentation (test-coverage audit
 # session 5 / docs/TEST_COVERAGE_AUDIT_2026-05-16.md).  When enabled, the
 # kernel must additionally be built with `-C instrument-coverage` (see
