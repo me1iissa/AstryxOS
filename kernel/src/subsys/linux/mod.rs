@@ -52,6 +52,21 @@ pub mod vfork_diag;
 #[cfg(feature = "elf-write-trace")]
 pub mod elf_write_trace;
 
+/// Live `__clone` pthread-args smoking-gun diagnostic — W215 axis-N
+/// continuation per tech-lead cross-walk verdict 2026-05-20.  Captures the
+/// pthread-args struct's `start_routine` and `arg` fields at successful
+/// clone(2)/clone3(2) syscall exit into a 16-entry ring keyed by (pid,
+/// tid); on a later CPL-3 `#GP` looks up the trapping child and emits
+/// `[CLONE-CHECK]` (framing-falsifier, fires for every matched trap) and
+/// `[CLONE-SMOKING-GUN]` (fires when captured `start_routine == rip`).
+/// Disambiguates F1 (pre-clone corruption) from F2 (mid-flight kernel
+/// aliasing — W215 axis-N) via phys-frame variance.  See POSIX
+/// pthread_create(3) / clone(2) / clone3(2), AMD64 SysV ABI §3.4, Intel
+/// SDM Vol. 3A §6.15 (`#GP`).  Gated behind `clone-args-diag` so master
+/// builds remain byte-identical.
+#[cfg(feature = "clone-args-diag")]
+pub mod clone_args_diag;
+
 /// SSP-canary divergence diagnostic.  Fires once per `#GP` taken from CPL 3
 /// at the publicly-exported musl `__stack_chk_fail` two-byte `hlt;ret` stub
 /// (ld-musl-x86_64.so.1 + 0x1c7f9, per the musl ldso `.dynsym`).  The hook

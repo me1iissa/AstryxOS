@@ -2203,6 +2203,27 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 match crate::proc::usermode::create_user_thread(pid, user_rip, new_stack, tls_val, 0, 0) {
                     Some(tid) => {
                         crate::serial_println!("[CLONE] Thread TID {} spawned in PID {}", tid, pid);
+                        // CLONE-ARGS-DIAG: snapshot pthread args at clone time.
+                        // For musl __clone (clone.s in upstream musl), the
+                        // pthread-args struct pointer the trampoline will load
+                        // into %rbx via `pop %rbx ; call *(%rbx)` lives at
+                        // `*(new_stack - 8)`.  This is the smoking-gun input
+                        // for the W215 axis-N continuation per tech-lead
+                        // verdict 2026-05-20.  See AMD64 SysV ABI §3.4 +
+                        // POSIX pthread_create(3).
+                        #[cfg(feature = "clone-args-diag")]
+                        if new_stack != 0 {
+                            let args_slot = new_stack.wrapping_sub(8);
+                            let args_va = match unsafe {
+                                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                                if crate::syscall::validate_user_ptr(args_slot, 8) {
+                                    Some(core::ptr::read_unaligned(args_slot as *const u64))
+                                } else { None }
+                            } { Some(v) => v, None => 0 };
+                            crate::subsys::linux::clone_args_diag::record_clone_args(
+                                pid as u32, tid as u32, flags, args_va, 0, 0,
+                            );
+                        }
 
                         // CLONE_CHILD_SETTID: write TID into child's TCB tid field.
                         const CLONE_CHILD_SETTID: u64 = 0x01000000;
@@ -3155,6 +3176,17 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 match crate::proc::usermode::create_user_thread(pid, user_rip, sp, tls_val, func, thread_arg) {
                     Some(tid) => {
                         crate::serial_println!("[CLONE3] Thread TID {} spawned in PID {}", tid, pid);
+                        // CLONE-ARGS-DIAG: clone3 passes func/arg in registers
+                        // (RDX/R8 per glibc 2.34+ __clone3_wrapper convention;
+                        // see syscall.rs::dispatch::435 docstring).  No args
+                        // struct to dereference — record the inline values
+                        // directly with args_va=0 as the "in-register form"
+                        // marker.  Per POSIX pthread_create(3), clone3(2),
+                        // AMD64 SysV ABI §3.4.
+                        #[cfg(feature = "clone-args-diag")]
+                        crate::subsys::linux::clone_args_diag::record_clone_args(
+                            pid as u32, tid as u32, clone_flags, 0, func, thread_arg,
+                        );
 
                         // CLONE_CHILD_SETTID: write the child TID into the child's TLS/TCB.
                         // glibc's pthread_create sets this so that the TCB's `tid` field is
