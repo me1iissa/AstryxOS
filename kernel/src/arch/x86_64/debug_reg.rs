@@ -118,11 +118,33 @@ static ARMED_KEY_INODE: [AtomicU64; N_DR_SLOTS] = [
 static ARMED_KEY_OFFSET: [AtomicU64; N_DR_SLOTS] = [
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
 ];
+/// Per-slot watch-kind tag.  Encodes the policy/owner that armed the slot
+/// so the `#DB` fire-line can route the diagnostic to the right consumer.
+/// Values:
+///   0 — unset / legacy (cache CRC walker / pre-insert pool / kdb manual)
+///   1 — F3 user-VA stack-canary watch (see `subsys/linux/f3_watch.rs`)
+///   2 — F3 PHYS_OFF stack-canary mirror (same)
+/// Future axes may take additional tags without disturbing existing arms.
+pub const WATCH_KIND_LEGACY:  u32 = 0;
+pub const WATCH_KIND_F3_USER: u32 = 1;
+pub const WATCH_KIND_F3_PHYS: u32 = 2;
+static ARMED_KIND: [AtomicU32; N_DR_SLOTS] = [
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+];
 
 /// Per-slot fire count.  Final report sums to the legacy single counter.
 static DR_FIRE_COUNT: [AtomicU32; N_DR_SLOTS] = [
     AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
 ];
+
+/// Per-slot fire CAP for `WATCH_KIND_F3_*` arms.  After this many
+/// `#DB` events the slot self-disarms and the post-processor sees a
+/// final `[W215/DR-WATCH-FIRE] one_shot=1 …` line for the cap-th hit.
+/// Bounded to keep the serial log readable when the user-VA slot
+/// catches a hot write loop (e.g. a memset across the saved-canary
+/// slot); above the cap the writer identity is already known from
+/// the first ~N fires.
+const F3_FIRE_CAP: u32 = 32;
 
 /// Number of arm broadcasts issued since boot (sum across slots).
 static ARM_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -330,6 +352,11 @@ fn try_arm_slot(
     ARMED_PHYS[slot].store(phys, Ordering::Relaxed);
     ARMED_KEY_INODE[slot].store(inode, Ordering::Relaxed);
     ARMED_KEY_OFFSET[slot].store(file_offset, Ordering::Relaxed);
+    // Default to LEGACY; callers that need a different tag
+    // (`arm_linear_watchpoint`) overwrite this after a successful arm.
+    // Per-slot reset ensures a slot that was previously F3 and got
+    // re-armed by the legacy walker does not carry stale routing.
+    ARMED_KIND[slot].store(WATCH_KIND_LEGACY, Ordering::Relaxed);
     true
 }
 
@@ -525,16 +552,43 @@ pub fn handle_db_exception(
         let inode = ARMED_KEY_INODE[slot].load(Ordering::Relaxed);
         let offset = ARMED_KEY_OFFSET[slot].load(Ordering::Relaxed);
         let addr = ARMED_ADDR[slot].load(Ordering::Relaxed);
-        // One-shot disarm of this slot.
-        ARMED[slot].store(false, Ordering::Release);
-        ARMED_ADDR[slot].store(0, Ordering::Relaxed);
-        ARMED_CTRL[slot].store(0, Ordering::Relaxed);
-
+        let kind_tag = ARMED_KIND[slot].load(Ordering::Relaxed);
+        // For F3-routed slots we want to keep the slot armed across fires
+        // — the prologue write is just one of N writes we expect, and the
+        // smoking-gun foreign write may come later.  The legacy one-shot
+        // disarm is preserved only for `WATCH_KIND_LEGACY` slots.  Per
+        // Intel SDM Vol. 3B §17.2.5, leaving DR{slot} and DR7 enable bits
+        // armed across an EOI'd `#DB` is supported behaviour — the next
+        // matching write on any CPU re-triggers `#DB` on that CPU.
+        //
+        // Diagnostic emission is still bounded (per-slot via
+        // `DR_FIRE_COUNT`'s saturating increment) so an F3 slot cannot
+        // flood the serial log; the post-processor reads at most
+        // `u32::MAX` fires per slot per boot — far above any plausible
+        // write rate for a single stack qword.
         let fire_idx = DR_FIRE_COUNT[slot].fetch_add(1, Ordering::Relaxed);
+        // F3 slots persist across fires up to F3_FIRE_CAP; legacy slots
+        // disarm one-shot.  When an F3 slot reaches its cap, treat the
+        // capping fire as one_shot=1 so the post-processor sees the
+        // closing marker; subsequent writes will not re-trigger because
+        // the slot is now disarmed.
+        let one_shot = match kind_tag {
+            WATCH_KIND_LEGACY => true,
+            _ => fire_idx + 1 >= F3_FIRE_CAP,
+        };
+        if one_shot {
+            ARMED[slot].store(false, Ordering::Release);
+            ARMED_ADDR[slot].store(0, Ordering::Relaxed);
+            ARMED_CTRL[slot].store(0, Ordering::Relaxed);
+            ARMED_KIND[slot].store(WATCH_KIND_LEGACY, Ordering::Relaxed);
+        }
+
         crate::serial_println!(
             "[W215/DR-WATCH-FIRE] slot={} fire_idx={} cpu={} rip={:#x} cs={:#x} \
-             rflags={:#x} cr3={:#x} phys={:#x} linear={:#x} key=(_,{},{:#x}) dr6={:#x}",
-            slot, fire_idx, cpu, rip, cs, rflags, cr3, phys, addr, inode, offset, dr6,
+             rflags={:#x} cr3={:#x} phys={:#x} linear={:#x} key=(_,{},{:#x}) \
+             dr6={:#x} kind_tag={} one_shot={}",
+            slot, fire_idx, cpu, rip, cs, rflags, cr3, phys, addr, inode, offset,
+            dr6, kind_tag, one_shot as u8,
         );
         crate::serial_println!(
             "[W215/DR-WATCH-FIRE/STACK] slot={} cpu={} rip={:#x} rsp={:#x}",
@@ -823,4 +877,117 @@ pub fn arm_phys_watchpoint(phys: u64) -> ArmPhysResult {
         );
     }
     ArmPhysResult::Armed(slot)
+}
+
+/// Arm a write-only watchpoint on an arbitrary linear address — the kind
+/// of arm the K2b F3 diagnostic needs.  Unlike `arm_phys_watchpoint` /
+/// `arm_phys_slot_watchpoint`, this does NOT translate through `PHYS_OFF`:
+/// the supplied `linear_addr` is programmed directly into DR{slot}, so the
+/// watchpoint fires on writes that the CPU's translation resolves to that
+/// linear address regardless of which physical frame backs it at write
+/// time (Intel SDM Vol. 3B §17.2.4 — DR0–DR3 store linear, not physical,
+/// addresses; the breakpoint match is checked on the post-segment / pre-
+/// paging linear stream).
+///
+/// This is the right shape for catching foreign-frame writers on a fixed
+/// user VA whose backing phys may change between prologue and epilogue
+/// (the F3 hypothesis): a DR armed on the user VA fires on every write
+/// the CPU performs to that linear address while the owning process's
+/// CR3 is loaded, including kernel-mode writes through the user-VA mapping
+/// (CoW path) — but it will MISS kernel writes that bypass the user
+/// mapping and hit `PHYS_OFF + phys` instead (typical direct-map
+/// `write_bytes` shape).  The complementary `arm_phys_slot_watchpoint`
+/// call on the current backing frame catches that channel.
+///
+/// `kind_tag` is propagated to the `#DB` fire-line so the post-processor
+/// can route the event to the F3 consumer rather than the legacy W215
+/// cache-walker path.  Use one of the `WATCH_KIND_*` constants.
+///
+/// Slot selection: try DR1/DR2/DR3 first (the pre-insert pool) so the
+/// F3 arm does not clobber the CRC walker's post-hoc slot (DR0).  Fall
+/// back to DR0 only if all three pre-insert slots are busy.
+///
+/// `len` must be one of {1, 2, 4, 8} and `linear_addr` must be naturally
+/// aligned to `len` per Intel SDM Vol. 3B §17.2.4 Table 17-2 (the LEN
+/// encoding silently widens misaligned addresses, which would catch
+/// unrelated nearby writes).
+///
+/// Cross-CPU sync is the same lazy-gen protocol used by all other arm
+/// paths: bump `SYNC_GENERATION` and program our own DRs; peer CPUs
+/// pick up the change in their next `apply_pending_if_stale()` call
+/// (≤ one timer tick, ≤ 10 ms at TICK_HZ=100).
+pub fn arm_linear_watchpoint(
+    linear_addr: u64,
+    len: u8,
+    kind_tag: u32,
+) -> ArmPhysResult {
+    match len {
+        1 | 2 | 4 | 8 => {}
+        _ => return ArmPhysResult::NotAligned,
+    }
+    if linear_addr & (len as u64 - 1) != 0 {
+        return ArmPhysResult::NotAligned;
+    }
+
+    let mut armed_slot: Option<u8> = None;
+    for slot in [1usize, 2, 3, 0] {
+        // `phys`, `inode`, `file_offset` carried through as zero — the
+        // linear-arm path does not have those keys (the watch is on a
+        // virtual address, not a cache entry).  The `#DB` fire-line
+        // includes `linear` regardless so the post-processor has the
+        // address it actually needs.
+        if try_arm_slot(slot, linear_addr, len, 0, 0, 0) {
+            ARMED_KIND[slot].store(kind_tag, Ordering::Relaxed);
+            armed_slot = Some(slot as u8);
+            break;
+        }
+    }
+    let Some(slot) = armed_slot else {
+        return ArmPhysResult::PoolExhausted;
+    };
+
+    ARM_COUNT.fetch_add(1, Ordering::Relaxed);
+    crate::serial_println!(
+        "[W215/DR-ARM] slot={} linear={:#x} phys=0 inode=0 offset=0 \
+         kind=linear kind_tag={} len={}",
+        slot, linear_addr, kind_tag, len,
+    );
+    SYNC_GENERATION.fetch_add(1, Ordering::Release);
+    program_local_drs();
+    let cpu = super::apic::cpu_index();
+    if cpu < super::apic::MAX_CPUS {
+        LOCAL_SYNC_GENERATION[cpu].store(
+            SYNC_GENERATION.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+    }
+    ArmPhysResult::Armed(slot)
+}
+
+/// Read the kind-tag for a slot (0..3).  Out-of-range → `WATCH_KIND_LEGACY`.
+/// Used by `handle_db_exception` to tag the fire-line, and by external
+/// diagnostic consumers (`subsys/linux/f3_watch.rs`) to decide whether to
+/// emit follow-on lines.
+pub fn slot_kind_tag(slot: usize) -> u32 {
+    if slot >= N_DR_SLOTS {
+        return WATCH_KIND_LEGACY;
+    }
+    ARMED_KIND[slot].load(Ordering::Relaxed)
+}
+
+/// Promote / demote a slot's kind tag *after* it has already been armed
+/// by one of the legacy paths (`arm_phys_slot_watchpoint` etc.).  Used by
+/// `subsys/linux/f3_watch.rs` to re-tag a slot it just armed via the
+/// PHYS_OFF helper — without retagging, the slot would be treated as
+/// `WATCH_KIND_LEGACY` and disarm one-shot on the first fire, defeating
+/// the persistent-arm policy the F3 diagnostic needs.
+///
+/// Out-of-range slot index → no-op.  Does not change `ARMED[slot]` or
+/// any address/control register state; only updates the routing tag for
+/// the next `#DB` to read.
+pub fn retag_slot(slot: usize, kind_tag: u32) {
+    if slot >= N_DR_SLOTS {
+        return;
+    }
+    ARMED_KIND[slot].store(kind_tag, Ordering::Relaxed);
 }

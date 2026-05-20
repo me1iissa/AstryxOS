@@ -1337,6 +1337,23 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
     //    references the old page tables when we free their backing frames.
     unsafe { crate::mm::vmm::switch_cr3(new_cr3); }
 
+    // 4a. K2b F3 foreign-frame writer trap arm — gated on `f3-watch` and
+    //     additionally guarded by the F3 module's own path-substring check
+    //     against `"firefox-bin"` plus a per-boot `F3_ARM_MAX` cap.  Posts
+    //     two `[F3-WATCH]` lines (one per channel: user-VA and PHYS_OFF)
+    //     and arms persistent DR write-only watchpoints on the canary
+    //     slot at `0x7ffffffee4c0`.  Subsequent writes from any CPU emit
+    //     `[W215/DR-WATCH-FIRE] kind_tag=1|2 …` naming the writer RIP +
+    //     CR3 — see `subsys/linux/f3_watch.rs` for the F3-mode → RIP map.
+    //
+    //     Diagnostic-only; no behavioural change to the execve path.
+    //     Refs: Intel SDM Vol. 3B §17.2.4 (DR0–DR3, DR7); System V AMD64
+    //     ABI §6.4 (SSP / `__stack_chk_guard`); POSIX execve(2).
+    #[cfg(feature = "f3-watch")]
+    crate::subsys::linux::f3_watch::arm_after_execve(
+        final_path.as_str(), new_cr3, entry_rip, entry_rsp,
+    );
+
     // 4b. Reclaim the old address space now that the hardware no longer uses it.
     //     free_vm_space() walks old VMAs, decrements CoW refcounts, frees any
     //     anonymous pages whose refcount reaches zero, and releases the old PT
