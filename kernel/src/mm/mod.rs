@@ -11,6 +11,13 @@ pub mod refcount;
 pub mod tlb;
 pub mod vma;
 pub mod vmm;
+// File-struct buffer corruption witness for the B-1 gate (musl
+// `memchr+0x31` NULL-deref).  Always-built (no feature gate on the
+// module declaration) so call sites compile in both configurations;
+// the witness body is feature-gated to `file-buf-witness` and emits
+// nothing in default builds.  Cite: musl 1.2.5 public FILE layout,
+// Intel SDM Vol. 3A §4.10.5 (TLB invariants).  See module-level doc.
+pub mod file_buf_witness;
 // W215 Arm-1 diagnostic (CRC walker + DR plumbing).  Gated behind
 // `w215-diag` (a strict superset of `firefox-test`) so the 2 MiB
 // shadow-table BSS is only present when the diagnostic is requested.
