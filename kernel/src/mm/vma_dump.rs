@@ -17,16 +17,16 @@
 //!     and the in-VMA offset — useful for the aliasing-class hypotheses
 //!     (W190/W196/W215) but does not enumerate the address space.
 //!
-//! `[VMA-DUMP]` emits every VMA up to a 256-line paranoia cap, including
+//! `[VMA-DUMP]` emits every VMA up to a 1024-line paranoia cap, including
 //! anonymous mappings, stacks, and heap, with the physical frame backing
-//! the first page of each VMA.  The cap is well above the upper bound
-//! observed for libxul-loading processes (~120 VMAs at content-process
-//! steady state).
+//! the first page of each VMA.  Cap raised from 256 → 1024 per empirical
+//! measurement 2026-05-20 (sid=059b127fb103): firefox-bin clone-VM child
+//! exceeds 256 VMAs at trap time.
 //!
 //! ## Emission cap
 //!
 //! Capped at **4 dumps per boot** via `VMA_DUMP_EMISSIONS`.  Each dump
-//! emits one `[VMA-DUMP-BEGIN]` banner, up to 256 `[VMA-DUMP]` rows, and
+//! emits one `[VMA-DUMP-BEGIN]` banner, up to 1024 `[VMA-DUMP]` rows, and
 //! one `[VMA-DUMP-END]` banner.  After the 4th dump the helper becomes a
 //! no-op.  This bounds the serial volume even under a fault storm.
 //!
@@ -67,10 +67,14 @@ use core::sync::atomic::{AtomicU32, Ordering};
 const MAX_VMA_DUMPS_PER_BOOT: u32 = 4;
 
 /// Max VMA rows per dump.  Bounded so a runaway VmSpace with thousands
-/// of micro-VMAs cannot flood the serial port.  Observed upper bound for
-/// firefox-test content-process steady state is ~120 VMAs; 256 gives
-/// 2× headroom.
-const MAX_VMAS_PER_DUMP: usize = 256;
+/// of micro-VMAs cannot flood the serial port.  Empirical measurement
+/// 2026-05-20 (sid=059b127fb103) shows the firefox-bin clone-VM child's
+/// VmSpace contains >256 VMAs at trap time and a 256-cap truncates
+/// before the RIP-covering VMA, defeating the diagnostic's purpose.
+/// Raised to 1024 to cover the observed worst case plus headroom.  At
+/// ~256 chars/line × 4 dumps/boot the absolute serial-volume cap is
+/// ~1 MiB — well within the harness's serial-log capacity.
+const MAX_VMAS_PER_DUMP: usize = 1024;
 
 /// Per-boot emission counter.  Each fatal user-mode exception with the
 /// `vma-dump-on-gp` feature live consumes one slot.  `Relaxed` ordering
