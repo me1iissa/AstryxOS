@@ -69,6 +69,14 @@ pub const KIND_REFINC: u8                      = 4;
 pub const KIND_REFDEC: u8                      = 5;
 pub const KIND_PHYS_OFF_WRITE_PRE_INSERT: u8   = 6;
 pub const KIND_PFH_INSTALL: u8                 = 7;
+/// Phase D (2026-05-20): the moment `pmm::free_page` returns a frame to the
+/// allocator pool.  Carries the caller-RIP (low 48 bits) in `key_packed_48`
+/// so a post-mortem dump can name the upstream unmap path that released
+/// the frame.  Distinct from `KIND_REFDEC` (which records every refcount
+/// decrement, including those that do not reach zero).  Used by the
+/// `[FAULT/PHYS/PROV]` unconditional dump in the user-mode fatal-fault
+/// path to localise W215-class anonymous-VMA recurrences.
+pub const KIND_FREE: u8                        = 8;
 
 // ── Writer site IDs for Arm-2 PREINS witness map ────────────────────────────
 
@@ -205,8 +213,27 @@ fn kind_str(k: u8) -> &'static str {
         KIND_REFDEC => "REFDEC",
         KIND_PHYS_OFF_WRITE_PRE_INSERT => "PREINS_W",
         KIND_PFH_INSTALL => "PFH_INSTALL",
+        KIND_FREE => "FREE",
         _ => "UNKNOWN",
     }
+}
+
+/// Convenience wrapper: record a `KIND_FREE` event for `phys` with the
+/// caller's return address packed into the 48-bit key payload.  Used by
+/// `pmm::free_page` after the residual-`pte_share_count` invariant check
+/// passes — i.e. for every frame that actually returns to the allocator
+/// pool.  Per Intel SDM Vol. 3A §4.10.5, the most-recent free of a frame
+/// is the most-likely upstream of a W215-class use-after-recycle, so
+/// recording it in the per-phys event ring lets the fault-site dump name
+/// the unmap caller.  `caller_rip` is truncated to its low 48 bits when
+/// packed; in practice the kernel image lives at `0xFFFF_8000_0010_0000`
+/// (see arch::x86_64::layout), so the low 48 bits suffice to identify
+/// the call-site within `addr2line`.
+#[inline]
+pub fn prov_record_free(phys: u64, caller_rip: u64) {
+    if phys == 0 { return; }
+    let key_low48 = caller_rip & 0x0000_FFFF_FFFF_FFFF;
+    prov_record(phys, KIND_FREE, key_low48);
 }
 
 /// Emit the most-recent provenance entries for `phys` as a single
@@ -668,4 +695,152 @@ pub fn counts() -> [(&'static str, u64); 10] {
         ("clear-tid", CLEARTID_OVER_CACHE.load(Ordering::Relaxed)),
         ("sigframe",  SIGFRAME_OVER_CACHE.load(Ordering::Relaxed)),
     ]
+}
+
+// ── Phase D 2026-05-20: dedicated phys-FREE shadow ──────────────────────────
+//
+// The primary `PROV_TABLE` (above) hashes phys into 256 buckets of 16 slots
+// each — adequate for the file-backed bucket-A workload that prior W215
+// iterations targeted, but **too small** for the
+// post-vfork-cleanup workload at sc≈1233 (Phase C trial set).  The Phase D
+// first trial confirmed: the prov ring is EMPTY for the fault's `rip_phys`
+// because every prior FREE / REFDEC / REFINC event for that bucket has been
+// rotated out by ~16 other phys frames flowing through the same hash bucket.
+//
+// To capture the FREE→ALLOC→fault chain at the **specific frame** that
+// faults, this shadow tracks ONLY `KIND_FREE` events, keyed directly by
+// `pfn` (no hash collisions across phys → no eviction by unrelated frames).
+// Sized at 64 Ki entries × 24 bytes = 1.5 MiB BSS — material only in
+// `firefox-test` builds because the entire `w215_diag` module is gated.
+//
+// Direct addressing: `pfn % FREE_SHADOW_SIZE`.  On collision, the newer
+// entry overwrites the older.  `FREE_SHADOW_DISPLACED` counts overwrites so
+// a downstream operator can verify whether the shadow's verdict is reliable
+// (zero displacements ⇒ exact per-pfn record).
+//
+// Per Intel SDM Vol. 3A §4.10.5, the most-recent free of a frame is the
+// upstream of a use-after-recycle when the freed frame is then drawn by
+// `alloc_page_locked` and re-installed in a PTE via a path that lacks the
+// `page_ref_inc` discipline.  Naming the free's caller-RIP is the
+// dispositive evidence.
+
+/// Direct-mapped free-shadow size.  64 Ki entries covers `64 Ki × 4 KiB =
+/// 256 MiB` of physical address space without hash collisions; with the
+/// `pfn % FREE_SHADOW_SIZE` direct addressing, frames spaced by a multiple
+/// of 256 MiB will alias.  In a 4 GiB physical RAM configuration the
+/// collision rate is ≤ 16-to-1 — adequate for a diagnostic.
+const FREE_SHADOW_SIZE: usize = 65536;
+
+#[repr(C)]
+struct FreeShadowEntry {
+    /// Physical address of the most-recent free into this slot.  `0` means
+    /// the slot has never been written.
+    phys: AtomicU64,
+    /// Tick at which the free fired.
+    tick: AtomicU64,
+    /// Caller-RIP of the `pmm::free_page` invocation that freed the frame.
+    caller_rip: AtomicU64,
+}
+
+impl FreeShadowEntry {
+    const fn new() -> Self {
+        Self {
+            phys: AtomicU64::new(0),
+            tick: AtomicU64::new(0),
+            caller_rip: AtomicU64::new(0),
+        }
+    }
+}
+
+struct FreeShadow {
+    slots: [FreeShadowEntry; FREE_SHADOW_SIZE],
+}
+
+impl FreeShadow {
+    const fn new() -> Self {
+        const E: FreeShadowEntry = FreeShadowEntry::new();
+        Self { slots: [E; FREE_SHADOW_SIZE] }
+    }
+}
+
+static FREE_SHADOW: FreeShadow = FreeShadow::new();
+
+/// Number of free events that displaced an unrelated previous entry in the
+/// free-shadow (i.e. `slot.phys != 0 && slot.phys != new_phys`).  Zero means
+/// every recorded FREE for the current run is observable by phys; non-zero
+/// means at least one phys's free was overwritten by an aliasing pfn.
+static FREE_SHADOW_DISPLACED: AtomicU64 = AtomicU64::new(0);
+
+/// Total number of free events recorded into the shadow.
+static FREE_SHADOW_RECORDED: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn free_shadow_slot(phys: u64) -> &'static FreeShadowEntry {
+    let pfn = (phys >> 12) as usize;
+    &FREE_SHADOW.slots[pfn & (FREE_SHADOW_SIZE - 1)]
+}
+
+/// Record a free event in the direct-addressed shadow.  Called by
+/// `pmm::free_page` immediately after the residual-`pte_share_count`
+/// invariant check passes.
+#[inline]
+pub fn free_shadow_record(phys: u64, caller_rip: u64) {
+    if phys == 0 { return; }
+    let slot = free_shadow_slot(phys);
+    let prev_phys = slot.phys.load(Ordering::Relaxed);
+    if prev_phys != 0 && prev_phys != phys {
+        FREE_SHADOW_DISPLACED.fetch_add(1, Ordering::Relaxed);
+    }
+    let tick = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+    slot.phys.store(phys, Ordering::Relaxed);
+    slot.tick.store(tick, Ordering::Relaxed);
+    slot.caller_rip.store(caller_rip, Ordering::Relaxed);
+    FREE_SHADOW_RECORDED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Look up the most-recent free recorded for `phys` in the shadow.  Returns
+/// `(tick, caller_rip)` if an entry is present with matching phys, else
+/// `None`.  Called from the fault-site dump to localise the unmap caller.
+#[inline]
+pub fn free_shadow_lookup(phys: u64) -> Option<(u64, u64)> {
+    if phys == 0 { return None; }
+    let slot = free_shadow_slot(phys);
+    let p = slot.phys.load(Ordering::Relaxed);
+    if p != phys { return None; }
+    let tick = slot.tick.load(Ordering::Relaxed);
+    let rip  = slot.caller_rip.load(Ordering::Relaxed);
+    Some((tick, rip))
+}
+
+/// Diagnostic dump: emit the free-shadow entry for `phys` as a single
+/// `[FAULT/PHYS/FREESHADOW]` serial line.  Format chosen for grep parsing
+/// by the harness without requiring a JSON decoder.
+pub fn dump_free_shadow_for_phys(phys: u64) {
+    let now_tick = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+    let recorded = FREE_SHADOW_RECORDED.load(Ordering::Relaxed);
+    let displaced = FREE_SHADOW_DISPLACED.load(Ordering::Relaxed);
+    match free_shadow_lookup(phys) {
+        Some((tick, rip)) => {
+            let age_ticks = now_tick.saturating_sub(tick);
+            crate::serial_println!(
+                "[FAULT/PHYS/FREESHADOW] phys={:#x} hit=1 free_tick={} \
+                 age_ticks={} caller_rip={:#x} totals=(recorded={},displaced={})",
+                phys, tick, age_ticks, rip, recorded, displaced,
+            );
+        }
+        None => {
+            crate::serial_println!(
+                "[FAULT/PHYS/FREESHADOW] phys={:#x} hit=0 totals=(recorded={},displaced={})",
+                phys, recorded, displaced,
+            );
+        }
+    }
+}
+
+/// Read free-shadow counters for kdb introspection.
+pub fn free_shadow_recorded_count() -> u64 {
+    FREE_SHADOW_RECORDED.load(Ordering::Relaxed)
+}
+pub fn free_shadow_displaced_count() -> u64 {
+    FREE_SHADOW_DISPLACED.load(Ordering::Relaxed)
 }
