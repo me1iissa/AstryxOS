@@ -456,6 +456,42 @@ python3 scripts/qemu-harness.py resume abc123def456
 
 ---
 
+## Data image — Firefox variant selection
+
+The test data disk (`build/data.img`, 2 GiB FAT32) is built by
+`scripts/create-data-disk.sh`. The script's `FIREFOX_VARIANT` env var
+controls which Firefox build is staged:
+
+- `glibc` (default) — populates `/disk/opt/firefox/firefox-bin` from a glibc-linked
+  Firefox. The kernel test runner falls back here when the musl variant is
+  absent.
+- `musl` — additionally populates `/disk/usr/lib/firefox-esr/firefox-bin` from an
+  Alpine musl-linked Firefox. The kernel test runner *prefers* this path
+  when present (selection via `vfs::stat` in `kernel/src/main.rs`).
+
+```bash
+# Glibc variant (default)
+bash scripts/create-data-disk.sh --force
+
+# Musl variant — required for the F3/SSP demo gate investigation track
+ASTRYXOS_FIREFOX_VARIANT=musl bash scripts/create-data-disk.sh --force
+```
+
+Verify staging by inspecting the FAT image:
+
+```bash
+mdir -i build/data.img '::/usr/lib/firefox-esr/firefox-bin'  # musl
+mdir -i build/data.img '::/opt/firefox/firefox-bin'          # glibc
+```
+
+The musl path is required for any investigation that exercises the musl
+dynamic linker (`ld-musl-x86_64.so.1`) or musl libc paths. A run with only the
+glibc variant staged will silently boot the glibc binary, which has a different
+crash signature class (W215 page-aliasing residual on libxul cold-start dlopen,
+not the F3 stack-frame-identity gate).
+
+---
+
 ## Use cases
 
 ### Debugging a kernel hang
