@@ -525,6 +525,35 @@ pub fn free_page(phys_addr: u64) {
         return;
     }
 
+    // Phase D (2026-05-20) — record the upstream unmap path in the per-phys
+    // event ring AND the dedicated direct-addressed free-shadow BEFORE the
+    // bitmap clear so that a concurrent fault-site dump always observes the
+    // FREE event before the frame is reachable from the next
+    // `alloc_page_locked` cursor advance.  Reading RBP via `caller_rip()` is
+    // safe outside any lock — it touches only the current kernel stack,
+    // which is the calling thread's own.  Per Intel SDM Vol. 3A §4.10.5,
+    // the most-recent free of a physical frame is the most-likely upstream
+    // of a W215-class use-after-recycle, so this record is the key evidence
+    // for localising anonymous-VMA recurrences (where the cache-key
+    // bucket-A path cannot fire because the VMA has `VmBacking::Anonymous`).
+    //
+    // The 256-bucket × 16-slot `PROV_TABLE` ring is too small to retain a
+    // FREE event for the duration of a typical Firefox-musl boot's
+    // ~1000-syscall window: Phase D's first trial confirmed an EMPTY ring
+    // for the fault's `rip_phys` (the original FREE / REFINC / ALLOC
+    // events had been rotated out by ~16 unrelated phys in the same hash
+    // bucket).  The dedicated `FREE_SHADOW` (`free_shadow_record`) uses
+    // direct `pfn % 64K` addressing — no hash-bucket eviction — so any
+    // per-pfn collision is recorded as a displacement counter increment
+    // rather than silent data loss.  At 64 Ki slots × 24 bytes = 1.5 MiB
+    // BSS, the cost is material only in `firefox-test` builds.
+    #[cfg(feature = "firefox-test")]
+    {
+        let rip = caller_rip();
+        crate::mm::w215_diag::prov_record_free(phys_addr, rip);
+        crate::mm::w215_diag::free_shadow_record(phys_addr, rip);
+    }
+
     let _lock = PMM_LOCK.lock();
     // SAFETY: We hold the PMM lock and page is in bounds.
     unsafe {

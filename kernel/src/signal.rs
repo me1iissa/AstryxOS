@@ -1530,6 +1530,54 @@ pub(crate) fn emit_fault_phys_diagnostic(
         }
     }
 
+    // ── [FAULT/PHYS/FREESHADOW] direct-addressed free-shadow lookup (Phase D) ─
+    // The 256×16 hashed `PROV_TABLE` ring rotates out entries every ~16
+    // unrelated phys in the same hash bucket — by the time a deeper boot
+    // (e.g. sc≈1233 musl Firefox) faults, the original FREE event for the
+    // faulting frame has typically been displaced.  Phase D's dedicated
+    // `FREE_SHADOW` table is direct-mapped by `pfn % 64K` so per-pfn
+    // collisions are observable (via a global displacement counter) instead
+    // of silent.  Emit one line per fault so the operator can correlate the
+    // fault's `rip_phys` with the unmap caller-RIP that released the frame.
+    #[cfg(feature = "firefox-test")]
+    if let Some(rp) = rip_phys {
+        crate::mm::w215_diag::dump_free_shadow_for_phys(rp);
+    }
+
+    // ── [FAULT/PHYS/PROV] unconditional dump (Phase D 2026-05-20) ──────────
+    // The bucket-A cache-key classifier below only fires for file-backed
+    // VMAs.  W215-class recurrences on `VmBacking::Anonymous` VMAs (e.g.
+    // musl's `mmap(MAP_ANONYMOUS) + read()` ld-musl bootstrap, the
+    // `[elf]` PT_LOAD VMAs from `proc::elf::load_elf`, and posix_spawn
+    // helper stacks) bypass the cache lookup entirely — yet exhibit the
+    // exact same fingerprint of "same VMA + same offset + DIFFERENT
+    // rip_phys per boot + wrong content" that the original W215 saga
+    // produced for file-backed faults.  Phase C revalidation (2026-05-20)
+    // documented one such recurrence at `ld-musl+0x1c7f9` with HLT;RET
+    // bytes on a `<anon>` VMA.
+    //
+    // To name the writer for those classes, dump the per-phys provenance
+    // ring unconditionally whenever `rip_phys` is known on a user-mode
+    // fault.  The ring records ALLOC / REFINC / REFDEC / FREE
+    // (Phase D addition — `KIND_FREE` carries the upstream caller-RIP),
+    // INSERT / EVICT / PFH_INSTALL events.  Per Intel SDM Vol. 3A §4.10.5,
+    // the most-recent FREE before the fault is the most-likely upstream
+    // of a use-after-recycle, so its caller-RIP is the locus of the bug.
+    //
+    // The bucket-A path below ALSO calls `dump_prov_for_phys` (kept for
+    // backward compatibility with PR #255's W215 H2 verifier).  Double-dumps
+    // for file-backed faults are bounded by the ring's 16 entries per
+    // bucket, so the cost is at most two ~16-line bursts on a fatal fault
+    // — negligible relative to the existing FAULT/PHYS noise.
+    #[cfg(feature = "firefox-test")]
+    if let Some(rp) = rip_phys {
+        crate::serial_println!(
+            "[FAULT/PHYS/PROV] kind=unconditional pid={} tid={} rip={:#x} rip_phys={:#x}",
+            pid, tid, user_rip, rp,
+        );
+        crate::mm::w215_diag::dump_prov_for_phys(rp);
+    }
+
     // ── [FAULT/CACHE-KEY] (W215 action-(C) diagnostic) ──────────────────────
     // Classify the corrupted physical frame into one of three exhaustive buckets
     // based on its current presence in the page cache.  Only emitted for
@@ -1588,6 +1636,47 @@ pub(crate) fn emit_fault_phys_diagnostic(
                     }
                 }
             }
+        }
+    }
+
+    // ── [FAULT/PHYS/RAW16] kernel-side PHYS_OFF sniff (Phase D) ────────────
+    // Reads the same 16 bytes as [FAULT/RIP-CONTENT] below, but through the
+    // higher-half identity-map at `PHYS_OFF + rip_phys + (user_rip & 0xFFF)`
+    // — bypassing the user-mode page tables entirely.  If [FAULT/RIP-CONTENT]
+    // and [FAULT/PHYS/RAW16] agree byte-for-byte, the wrong content is
+    // physically present in the frame (writer is in a kernel path that
+    // touched the frame after the original load — pmm::free + re-alloc, or
+    // a kernel-side PHYS_OFF write).  If they disagree, the user-mode PTE
+    // points at a different frame than the one we resolved through
+    // `virt_to_phys_in` (a stale TLB or a torn PT walk).  Per Intel SDM
+    // Vol. 3A §4.10.5 the two views must agree under normal conditions.
+    if let Some(rp) = rip_phys {
+        const N: usize = 16;
+        let mut buf = [0u8; N];
+        let mut got = 0usize;
+        let page_off = (user_rip & 0xFFF) as usize;
+        for i in 0..N {
+            if page_off + i >= 0x1000 { break; } // stay inside the same phys page
+            let kva = (PHYS_OFF + rp) as *const u8;
+            buf[i] = unsafe { core::ptr::read_volatile(kva.add(page_off + i)) };
+            got += 1;
+        }
+        if got > 0 {
+            const HEX: &[u8] = b"0123456789abcdef";
+            let mut hex = [0u8; N * 3];
+            for i in 0..got {
+                hex[i * 3]     = HEX[(buf[i] >> 4) as usize];
+                hex[i * 3 + 1] = HEX[(buf[i] & 0xF) as usize];
+                hex[i * 3 + 2] = b' ';
+            }
+            // SAFETY: HEX bytes are ASCII; got >= 1 by the early-break check.
+            let hex_str = unsafe {
+                core::str::from_utf8_unchecked(&hex[..got * 3 - 1])
+            };
+            crate::serial_println!(
+                "[FAULT/PHYS/RAW16] rip={:#x} phys={:#x} bytes={}",
+                user_rip, rp, hex_str,
+            );
         }
     }
 
