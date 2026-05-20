@@ -22071,14 +22071,18 @@ fn test_firefox_launch_progress() -> bool {
         "/disk/opt/firefox/firefox",           // Mozilla glibc build (fallback)
     ];
 
+    // Pick via stat() (POSIX stat(2) semantics — success iff the named file is
+    // reachable; no content read).  read_file() on the multi-MB firefox binary
+    // can fail transiently for reasons unrelated to existence (allocator
+    // pressure, short read, cache lock contention), which would silently
+    // demote musl→glibc in earlier runs.  Stat-first decouples selection from
+    // read latency, then we read_file() the single chosen candidate.
     let mut chosen_path: &str = "";
-    let mut ff_bin: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     for cand in FF_CANDIDATES {
-        match crate::vfs::read_file(cand) {
-            Ok(data) => {
-                test_println!("  {}: {} bytes ✓", cand, data.len());
+        match crate::vfs::stat(cand) {
+            Ok(st) => {
+                test_println!("  {}: stat OK ({} bytes) ✓", cand, st.size);
                 chosen_path = cand;
-                ff_bin = data;
                 break;
             }
             Err(e) => {
@@ -22086,6 +22090,17 @@ fn test_firefox_launch_progress() -> bool {
             }
         }
     }
+    let ff_bin: alloc::vec::Vec<u8> = if chosen_path.is_empty() {
+        alloc::vec::Vec::new()
+    } else {
+        match crate::vfs::read_file(chosen_path) {
+            Ok(data) => { test_println!("  {} read {} bytes", chosen_path, data.len()); data }
+            Err(e)   => {
+                test_fail!("firefox_oracle", "stat OK but read_file({}) failed: {:?}", chosen_path, e);
+                return false;
+            }
+        }
+    };
     if chosen_path.is_empty() {
         test_println!("  SKIP: no Firefox binary present at any known location");
         test_println!("        Tried: {:?}", FF_CANDIDATES);
