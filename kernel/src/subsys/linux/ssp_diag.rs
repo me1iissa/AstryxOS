@@ -202,23 +202,36 @@ fn reserve_reject_slot() -> bool {
     n < SSP_REJECT_MAX
 }
 
-/// Resolve the base VA of the `ld-musl-x86_64.so.1` text mapping that
-/// covers `rip`.  Looks up the per-process VMA list under a
-/// `try_lock()` so the hook never blocks the trap path.  Accepts any
-/// VMA whose `name` field contains the substring `"ld-musl"` and whose
-/// `base` is a sane user VA.
+/// Resolve the load-relative base VA of whatever user mapping covers
+/// `rip`.  Looks up the per-process VMA list under a `try_lock()` so
+/// the hook never blocks the trap path.
 ///
-/// Returns `Some(base)` only when the VMA is valid and `rip - base` is
-/// a small offset consistent with a `.text` mapping (`< 0x80_0000`,
-/// i.e. within the first 8 MiB of the library — ld-musl is ~650 KiB so
-/// this is generous).
+/// Per saga discipline (prefer content gates over symbolic ones), this
+/// function deliberately does NOT filter by VMA name: the AstryxOS ELF
+/// loader names PT_LOAD segments `"[elf]"` and PT_INTERP segments
+/// `"[interp]"` (see `proc/elf.rs`), neither of which contains the
+/// substring `"ld-musl"`.  A name-based gate is therefore brittle by
+/// construction.  The upstream gates that protect this hook are:
+///   * `idt.rs` only calls the hook on `vector == 13 && CS&3 == 3`
+///     (user-mode `#GP`, Intel SDM Vol. 3A §6.15).
+///   * The caller-side content gate then requires the 2 bytes at `rip`
+///     to be `HLT; RET` (`0xF4 0xC3`).  Per Intel SDM Vol. 2A `HLT`
+///     is a privileged instruction; executing it at CPL 3 raises `#GP`.
+/// Combined, those two conditions uniquely identify a musl
+/// `__stack_chk_fail`-shaped stub regardless of which mapping it lives
+/// in, so the VMA name is irrelevant.
+///
+/// Returns `Some(base)` when a VMA covers `rip`, its `base` is a sane
+/// user VA, and `rip - base < 0x80_0000` (8 MiB — generous bound for
+/// any reasonable shared library `.text` segment).  Emits a bounded
+/// `reject` line when the lock is contended or no VMA covers `rip`,
+/// so a verifier can distinguish "hook never reached the precondition"
+/// from "hook reached but content gate said no".
 fn resolve_ld_musl_base(rip: u64) -> Option<u64> {
     let pid = crate::proc::current_pid_lockless();
     let procs = match crate::proc::PROCESS_TABLE.try_lock() {
         Some(g) => g,
         None => {
-            // PR #338 N1 MED: emit a one-shot marker so a verifier can
-            // distinguish "VMA lookup deadlock-averted" from "no match".
             if reserve_reject_slot() {
                 crate::serial_println!(
                     "[SSP-DIAG] reject reason=lock_busy rip={:#x}",
@@ -230,12 +243,18 @@ fn resolve_ld_musl_base(rip: u64) -> Option<u64> {
     };
     let proc_entry = procs.iter().find(|p| p.pid == pid)?;
     let vm_space = proc_entry.vm_space.as_ref()?;
-    let vma = vm_space.find_vma(rip)?;
-    // Name match is conservative: accept either "ld-musl" or "libc.musl"
-    // (the symlink target some processes mmap by canonical-path).
-    if !(vma.name.contains("ld-musl") || vma.name.contains("libc.musl")) {
-        return None;
-    }
+    let vma = match vm_space.find_vma(rip) {
+        Some(v) => v,
+        None => {
+            if reserve_reject_slot() {
+                crate::serial_println!(
+                    "[SSP-DIAG] reject reason=no_vma rip={:#x}",
+                    rip,
+                );
+            }
+            return None;
+        }
+    };
     let base = vma.base;
     if base < USER_VA_MIN || base >= USER_VA_LIMIT {
         return None;
