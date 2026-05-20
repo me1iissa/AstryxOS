@@ -2333,34 +2333,45 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             }
                         }
 
-                        // Provision a minimal per-vfork-child TLS page so the
-                        // child's first cancellable libc syscall (e.g.
-                        // `close(2)` from the `posix_spawn(3)` child helper)
-                        // can read `%fs:0` without faulting.  See
-                        // `proc::alloc_vfork_child_tls` for the layout
-                        // rationale and the canary-isolation argument.  The
-                        // page is unmapped on `execve(2)` / vfork-child exit
-                        // via `vfork_isolated_tls_cleanup`.  Best-effort: if
-                        // allocation fails we leave `tls_base = 0` and the
-                        // child will fault on its first TLS-relative read —
-                        // matching the pre-fix behaviour rather than masking
-                        // an OOM as a different error.
-                        match crate::proc::alloc_vfork_child_tls(pid) {
-                            Some(tls_base) => {
-                                const VFORK_TLS_SIZE: u64 = 4096;
-                                let mut threads = crate::proc::THREAD_TABLE.lock();
-                                if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
-                                    t.tls_base = tls_base;
-                                    t.vfork_isolated_tls = Some((tls_base, VFORK_TLS_SIZE));
-                                }
-                            }
-                            None => {
-                                crate::serial_println!(
-                                    "[VFORK] WARN: failed to allocate isolated TLS page; \
-                                     child_tls_base=0 (first cancellable libc syscall will fault)"
-                                );
+                        // Per POSIX vfork(2) and clone(2) `CLONE_VM`, the
+                        // child shares the parent's address space — including
+                        // the parent's TLS region.  Inherit the parent's
+                        // FS_BASE so the child's first TLS-relative read
+                        // (e.g. `%fs:0x28` SSP-canary load, `%fs:0` TCB
+                        // self-pointer in the cancellable-syscall wrapper)
+                        // resolves against the parent's TCB, which is mapped
+                        // and live throughout the vfork window.  The earlier
+                        // `alloc_vfork_child_tls` approach (private TCB page
+                        // with zero canary) is no longer used: the SSP
+                        // contract requires the value at `%fs:0x28` to match
+                        // what the function's prologue pushed, and within a
+                        // shared address space that value is the parent's
+                        // process-wide canary by construction.  If the
+                        // caller supplied `CLONE_SETTLS`, the explicit value
+                        // wins.  Refs: AMD64 SysV ABI §3.4.6 (Thread Local
+                        // Storage / Variant II); POSIX vfork(2), clone(2);
+                        // Intel SDM Vol. 3A §3.4.4.1 (IA32_FS_BASE MSR
+                        // 0xC000_0100).
+                        let child_tls_base = if flags & CLONE_SETTLS != 0 {
+                            tls
+                        } else {
+                            let threads = crate::proc::THREAD_TABLE.lock();
+                            threads.iter().find(|t| t.tid == parent_tid)
+                                .map(|t| t.tls_base).unwrap_or(0)
+                        };
+                        {
+                            let mut threads = crate::proc::THREAD_TABLE.lock();
+                            if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
+                                t.tls_base = child_tls_base;
                             }
                         }
+                        crate::serial_println!(
+                            "[VFORK/TLS] pid={} child_tid={} child_tls_base={:#x} \
+                             via={} (inherited from parent_tid={} unless CLONE_SETTLS)",
+                            pid, child_tid, child_tls_base,
+                            if flags & CLONE_SETTLS != 0 { "CLONE_SETTLS" } else { "parent" },
+                            parent_tid,
+                        );
 
                         // Unblock the child so the scheduler can run it.
                         crate::proc::unblock_process(child_pid);
@@ -3262,6 +3273,25 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             crate::proc::clear_sighand(child_pid);
                         }
 
+                        // Inherit parent's FS_BASE for the vfork child (or
+                        // honour CLONE_SETTLS when supplied).  Mirrors the
+                        // legacy clone(56) path's TLS-inheritance block: per
+                        // POSIX vfork(2)/clone(2) `CLONE_VM` the child shares
+                        // the parent's address space, so the parent's TLS
+                        // region is the correct backing for the child's
+                        // `%fs:0`-relative reads (TCB self-pointer, SSP
+                        // canary at `%fs:0x28`, cancellable-syscall state).
+                        // Refs: AMD64 SysV ABI §3.4.6; POSIX vfork(2),
+                        // clone(2), clone3(2); Intel SDM Vol. 3A §3.4.4.1
+                        // (IA32_FS_BASE MSR 0xC000_0100).
+                        let child_tls_base = if clone_flags & CLONE_SETTLS != 0 {
+                            tls
+                        } else {
+                            let threads = crate::proc::THREAD_TABLE.lock();
+                            threads.iter().find(|t| t.tid == parent_tid)
+                                .map(|t| t.tls_base).unwrap_or(0)
+                        };
+
                         // Set func/arg and original RIP BEFORE unblocking
                         {
                             let mut threads = crate::proc::THREAD_TABLE.lock();
@@ -3272,11 +3302,14 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                 if sp != 0 {
                                     t.user_entry_rsp = sp; // use the new_stack from clone3
                                 }
+                                t.tls_base = child_tls_base;
                             }
                         }
                         crate::serial_println!(
-                            "[CLONE3-VM] child PID {} TID {} rdx={:#x} r8={:#x} rip={:#x} rsp={:#x}",
-                            child_pid, child_tid, func, thread_arg, original_rip, sp);
+                            "[CLONE3-VM] child PID {} TID {} rdx={:#x} r8={:#x} rip={:#x} rsp={:#x} tls_base={:#x} via={}",
+                            child_pid, child_tid, func, thread_arg, original_rip, sp,
+                            child_tls_base,
+                            if clone_flags & CLONE_SETTLS != 0 { "CLONE_SETTLS" } else { "parent" });
 
                         // NOW unblock the child
                         crate::proc::unblock_process(child_pid);
