@@ -54,6 +54,48 @@ static TRAMPOLINE_PHYS: AtomicU64 = AtomicU64::new(0);
 /// (no pending signals, no PROCESS_TABLE lock acquired).  Used by Test 201.
 pub static SIGNAL_FAST_PATH_COUNT: AtomicU64 = AtomicU64::new(0);
 
+// ── Per-tid signal-delivered counter (diagnostic only) ─────────────────────
+//
+// Direct-mapped, lock-free, lossy cache from `tid` to delivery count.
+// Used by `subsys::linux::ssp_diag` to discriminate sigreturn-mid-frame
+// from normal canary-fail flow at a CPL-3 `#GP` (POSIX.1-2017
+// sigaction(2) / sigreturn(2)).  On TID collision the slot is overwritten
+// and the count restarts at 1; a reader hitting a non-matching slot
+// returns `None` (surfaced as "unknown" — not "zero" — to the caller).
+const SIGNAL_DELIVERED_SLOTS: usize = 64;
+static SIGNAL_DELIVERED_TID: [AtomicU64; SIGNAL_DELIVERED_SLOTS] =
+    [const { AtomicU64::new(0) }; SIGNAL_DELIVERED_SLOTS];
+static SIGNAL_DELIVERED_COUNT: [AtomicU64; SIGNAL_DELIVERED_SLOTS] =
+    [const { AtomicU64::new(0) }; SIGNAL_DELIVERED_SLOTS];
+
+/// Record that one signal has been delivered to user space for thread
+/// `tid`.  Called at the success-edge of both
+/// [`signal_check_on_syscall_return`] and [`deliver_sigsegv_from_isr`].
+pub fn record_signal_delivered(tid: u64) {
+    let i = (tid as usize) & (SIGNAL_DELIVERED_SLOTS - 1);
+    let owner = SIGNAL_DELIVERED_TID[i].load(Ordering::Relaxed);
+    if owner == tid {
+        SIGNAL_DELIVERED_COUNT[i].fetch_add(1, Ordering::Relaxed);
+    } else {
+        SIGNAL_DELIVERED_TID[i].store(tid, Ordering::Relaxed);
+        SIGNAL_DELIVERED_COUNT[i].store(1, Ordering::Relaxed);
+    }
+}
+
+/// Read the current delivery count for `tid`.  `Some(n)` when the cache
+/// slot is still owned by `tid` (n includes the deliveries since the
+/// last eviction); `None` when the slot has been evicted (surface as
+/// "unknown" — neither confirms nor refutes any prior delivery).
+pub fn signal_delivered_count(tid: u64) -> Option<u64> {
+    let i = (tid as usize) & (SIGNAL_DELIVERED_SLOTS - 1);
+    let owner = SIGNAL_DELIVERED_TID[i].load(Ordering::Relaxed);
+    if owner == tid {
+        Some(SIGNAL_DELIVERED_COUNT[i].load(Ordering::Relaxed))
+    } else {
+        None
+    }
+}
+
 /// Signal frame pushed onto the user stack when delivering a signal to a
 /// user-mode handler.  The handler sees RSP pointing at `restorer` (which
 /// acts as its return address).  On `ret`, execution jumps to the trampoline
@@ -757,6 +799,12 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
                 if want_siginfo { "SA_SIGINFO" } else { "classic" }
             );
 
+            // Bump the per-tid delivery counter so the SSP-diag
+            // RIP-disambiguator can tell sigreturn-mid-frame from
+            // normal canary-fail flow.  Best-effort lossy cache; see
+            // [`record_signal_delivered`] for semantics.
+            record_signal_delivered(crate::proc::current_tid());
+
             sig as u64
         }
     }
@@ -1037,6 +1085,10 @@ pub unsafe fn deliver_sigsegv_from_isr(
         core::arch::asm!("mov {}, cr3", out(reg) cr3_now, options(nomem, nostack, preserves_flags));
         emit_fault_phys_diagnostic(pid, user_rip, cr3_now, &vma_snapshot);
     }
+
+    // Bump the per-tid delivery counter (SSP-diag discriminator).  See
+    // [`record_signal_delivered`].
+    record_signal_delivered(crate::proc::current_tid());
 
     true
 }
