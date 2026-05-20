@@ -771,7 +771,13 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
             return;
         }
 
-        // Kernel-mode page fault → bugcheck (structured crash report)
+        // Kernel-mode page fault → bugcheck (structured crash report).
+        // See companion `dump_for_kernel_trap` call near the #GP/UNEXPECTED
+        // bugcheck below for the W215 axis-N producer/consumer probe.
+        #[cfg(feature = "kernel-gp-trap-diag")]
+        crate::ke::gp_trap_diag::dump_for_kernel_trap(
+            14, frame.rip, frame.rsp, error_code,
+        );
         crate::ke::bugcheck::ke_bugcheck(
             crate::ke::bugcheck::BUGCHECK_KERNEL_PAGE_FAULT,
             cr2,             // P1: fault address
@@ -1107,6 +1113,15 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
     } else {
         crate::ke::bugcheck::BUGCHECK_UNEXPECTED_TRAP
     };
+    // Producer/consumer probe for the W215 axis-N continuation:
+    // kernel-mode #GP/#PF with a low (< 0x10000) RIP shortly after a sibling
+    // thread's CLEARTID/FUTEX_WAKE_EXIT.  See `ke::gp_trap_diag` for the
+    // gate semantics and the framing-falsifier observable.  Diagnostic-only,
+    // bounded emission, feature-gated.
+    #[cfg(feature = "kernel-gp-trap-diag")]
+    crate::ke::gp_trap_diag::dump_for_kernel_trap(
+        vector, frame.rip, frame.rsp, error_code,
+    );
     crate::ke::bugcheck::ke_bugcheck(
         bugcode,
         vector as u64,      // P1: exception vector
