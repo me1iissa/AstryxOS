@@ -194,9 +194,11 @@ ssp-canary-diag = ["firefox-test"]
 #     distinguishes F2 mid-flight aliasing — W215 axis-N per PR #270 —
 #     from F1 pre-clone userspace corruption).
 #   * `[CLONE-SMOKING-GUN]` fires when start_routine == trap RIP, the
-#     dispositive observable for the musl `__pthread_start` trampoline
-#     `call *(%rbx)` corrupted-fptr framing per tech-lead cross-walk
-#     verdict 2026-05-20.
+#     dispositive observable for the inner musl thread-start trampoline's
+#     indirect-call corrupted-fptr framing per tech-lead cross-walk
+#     verdict 2026-05-20.  (Per upstream musl libc x86_64 __clone, the
+#     args struct VA the kernel captures lives at `*new_stack` — rsi was
+#     biased by `sub $8` before the syscall.)
 # Bounded to 4 emissions per category per boot.  Default builds are
 # byte-identical when this feature is off.  See POSIX pthread_create(3),
 # clone(2), clone3(2); AMD64 SysV ABI §3.4 calling convention; Intel SDM

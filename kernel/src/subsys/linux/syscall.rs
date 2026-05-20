@@ -2204,22 +2204,25 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     Some(tid) => {
                         crate::serial_println!("[CLONE] Thread TID {} spawned in PID {}", tid, pid);
                         // CLONE-ARGS-DIAG: snapshot pthread args at clone time.
-                        // For musl __clone (clone.s in upstream musl), the
-                        // pthread-args struct pointer the trampoline will load
-                        // into %rbx via `pop %rbx ; call *(%rbx)` lives at
-                        // `*(new_stack - 8)`.  This is the smoking-gun input
-                        // for the W215 axis-N continuation per tech-lead
-                        // verdict 2026-05-20.  See AMD64 SysV ABI §3.4 +
-                        // POSIX pthread_create(3).
+                        // Per upstream musl libc x86_64 __clone, before the
+                        // syscall the wrapper does `and $-16,%rsi ; sub $8,%rsi ;
+                        // mov %rcx,(%rsi)`, so the kernel-visible `new_stack`
+                        // (= the rsi value at syscall entry) already points AT
+                        // the slot containing the args-struct pointer.  The
+                        // child then does `pop %rdi ; call *%r9` — popping the
+                        // args pointer into %rdi (SysV arg0) and calling the
+                        // static start helper that was placed in %r9 before
+                        // the syscall.  Therefore the args-struct VA is read
+                        // at `*new_stack`, not `*(new_stack - 8)`.  See AMD64
+                        // SysV ABI §3.4 + POSIX pthread_create(3) + clone(2).
                         #[cfg(feature = "clone-args-diag")]
                         if new_stack != 0 {
-                            let args_slot = new_stack.wrapping_sub(8);
-                            let args_va = match unsafe {
+                            let args_va = unsafe {
                                 let _g = crate::arch::x86_64::smap::UserGuard::new();
-                                if crate::syscall::validate_user_ptr(args_slot, 8) {
-                                    Some(core::ptr::read_unaligned(args_slot as *const u64))
-                                } else { None }
-                            } { Some(v) => v, None => 0 };
+                                if crate::syscall::validate_user_ptr(new_stack, 8) {
+                                    core::ptr::read_unaligned(new_stack as *const u64)
+                                } else { 0 }
+                            };
                             crate::subsys::linux::clone_args_diag::record_clone_args(
                                 pid as u32, tid as u32, flags, args_va, 0, 0,
                             );

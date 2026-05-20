@@ -14,7 +14,7 @@
 //!
 //!   * `[CLONE-SMOKING-GUN]` — fires when the captured `start_routine`
 //!     equals the trap RIP.  This is the dispositive observable for the
-//!     "musl `__pthread_start` trampoline executes `call *(%rbx)` where
+//!     "inner musl thread-start helper executes its indirect call where
 //!     the `start_routine` slot was already poisoned" framing per
 //!     tech-lead cross-walk verdict 2026-05-20.
 //!
@@ -54,13 +54,27 @@
 //!
 //! ## Capture ABI
 //!
-//! For `clone(2)` (syscall 56) in the `CLONE_THREAD|CLONE_VM` shape,
-//! musl's `__clone` (per `src/thread/x86_64/clone.s` upstream) reaches
-//! the kernel with `%rsi = child stack top` and the pthread-args struct
-//! pointer pushed onto the child stack.  In `__pthread_start` the
-//! trampoline `pop %rbx ; call *(%rbx)` consumes that pushed pointer
-//! into `%rbx`.  The args struct layout (musl `src/internal/pthread_impl.h`)
-//! starts with `void *(*start_routine)(void *)` followed by `void *arg`.
+//! For `clone(2)` (syscall 56) in the `CLONE_THREAD|CLONE_VM` shape, per
+//! upstream musl libc x86_64 `__clone` the wrapper aligns the caller's
+//! `child_stack` to 16 and then subtracts 8 (`and $-16,%rsi ; sub $8,%rsi`)
+//! before storing the args-struct pointer at `(%rsi)` and issuing the
+//! syscall.  Consequently the kernel-visible `new_stack` argument (= the
+//! `%rsi` value at syscall entry) already points AT the args slot, and
+//! the args-struct VA is recovered with a single qword read at
+//! `*new_stack` (NOT `*(new_stack - 8)`).
+//!
+//! On child return the wrapper executes `pop %rdi ; call *%r9` —
+//! popping the args pointer into `%rdi` (SysV arg 0, per AMD64 SysV ABI
+//! §3.2 register classes) and calling the static helper whose address was
+//! placed in `%r9` BEFORE the syscall.  That static helper is the inner
+//! musl thread-start trampoline: it stashes the args pointer (commonly
+//! in a callee-saved register such as `%rbx`) and later performs the
+//! indirect call to the user's `start_routine`.  The first qword of the
+//! args struct (offset 0) is `void *(*start_routine)(void *)`, the second
+//! qword (offset 8) is `void *arg`.  When the trampoline's indirect call
+//! traps with `#GP` because that first qword was poisoned, the trapping
+//! `%rip` equals the value the kernel captured at `*args_va` — that is
+//! the `[CLONE-SMOKING-GUN]` predicate.
 //!
 //! For `clone3(2)` (syscall 435) the kernel-side dispatch (see
 //! `subsys/linux/syscall.rs::dispatch::435`) already extracts `func` from
@@ -105,11 +119,14 @@ struct CloneRingEntry {
     pid: u32,
     tid: u32,
     clone_flags: u64,
-    /// Pointer the trampoline will load into `%rbx` then dereference via
-    /// `call *(%rbx)`.  For clone(56) this is `*(new_stack - 8)` (musl
-    /// pushed it).  For clone3(435) this is the synthesized
-    /// `(func, arg)` pair carried via `t.user_entry_rdx` / `r8` — there
-    /// is no in-memory args struct; we record `args_va = 0` to flag that.
+    /// Pointer the inner musl thread-start trampoline will dereference
+    /// to fetch `start_routine`.  For clone(56) this is `*new_stack`
+    /// (the slot at `aligned_stack - 8` that musl `__clone` wrote with
+    /// `mov %rcx,(%rsi)` before the syscall — `%rsi` was already biased
+    /// by `sub $8`, so the kernel's view of `new_stack` IS the slot).
+    /// For clone3(435) this is the synthesized `(func, arg)` pair carried
+    /// via `t.user_entry_rdx` / `r8` — there is no in-memory args struct;
+    /// we record `args_va = 0` to flag that.
     args_va: u64,
     /// Resolved physical frame backing `args_va` under the calling CR3.
     /// Compared at #GP time against the live phys to detect axis-N
@@ -182,10 +199,12 @@ fn resolve_phys(addr: u64) -> Option<u64> {
 /// Record a successful clone-thread spawn.  Called from
 /// `subsys/linux/syscall.rs` after the child TID has been registered.
 ///
-/// `args_va` is the pthread-args struct pointer that will be loaded into
-/// `%rbx` by the trampoline.  For the clone(56) ABI this is `*(new_stack
-/// - 8)` (musl `__clone` push).  Pass 0 to skip the dereference and
-/// record the in-register `start_routine` / `arg` from clone3 instead.
+/// `args_va` is the pthread-args struct pointer the child will pop off
+/// its stack into `%rdi` and pass to the static start helper.  For the
+/// clone(56) ABI this qword is read at `*new_stack` (per upstream musl
+/// libc x86_64 `__clone`, which biases `%rsi` by `sub $8` before writing
+/// it).  Pass 0 to skip the dereference and record the in-register
+/// `start_routine` / `arg` from clone3 instead.
 pub fn record_clone_args(
     pid: u32,
     tid: u32,
@@ -196,8 +215,10 @@ pub fn record_clone_args(
 ) {
     let ts = crate::arch::x86_64::irq::get_ticks();
     let (resolved_args_va, args_phys, start_routine, arg) = if args_va != 0 {
-        // clone(56) shape: dereference the args slot the trampoline will
-        // load into %rbx.  Per musl __clone.s, this is `*(new_stack-8)`.
+        // clone(56) shape: dereference the args struct the child will
+        // pop into %rdi.  Per upstream musl libc x86_64 __clone the args
+        // VA is read by the caller at `*new_stack` (rsi was already biased
+        // by `sub $8` before the syscall).
         match read_user_qword(args_va) {
             Some((sr, phys)) => {
                 let arg = read_user_qword(args_va.wrapping_add(8))
