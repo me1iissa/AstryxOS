@@ -19,6 +19,11 @@ pub mod vmm;
 pub mod w215_crc;
 #[cfg(feature = "firefox-test")]
 pub mod w215_diag;
+// PSE 2026-05-20: `[VMA-DUMP]` on fatal user-mode exceptions.  Used by
+// `vma-dump-on-gp` to anchor PIE-ASLR bases at the moment a process is
+// torn down.  See `vma_dump.rs` for line format and emission cap.
+#[cfg(feature = "vma-dump-on-gp")]
+pub mod vma_dump;
 
 use astryx_shared::BootInfo;
 
