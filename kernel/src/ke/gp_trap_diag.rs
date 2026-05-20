@@ -148,6 +148,14 @@ pub fn record_exit(
     let slot = ((seq - 1) as usize) % RING_LEN;
     let mut ring = RING.lock();
     ring[slot] = snap;
+    drop(ring);
+    // Producer-side wiring trace: lets the operator confirm `record_exit`
+    // fires per `proc::exit_thread`.  Cheap (one serial line per exit) and
+    // confined to the feature-gated build.
+    crate::serial_println!(
+        "[KGP-DIAG] exit_snapshot: seq={} pid={} tid={} cpu={} clear_addr={:#x} ctx_rsp={:#x}",
+        seq, pid, tid, cpu, clear_addr, saved_context_rsp
+    );
 }
 
 /// Outcome of a consumer-side ring lookup.  `Contended` discriminates the
@@ -284,8 +292,15 @@ pub fn dump_for_kernel_trap(vector: u64, rip: u64, rsp: u64, error_code: u64) {
                 let near_top = t.kernel_stack_base + t.kernel_stack_size - 64;
                 drop(threads); // release lock before second emission
                 dump_stack_window("trap_thread_kstack_top-64", near_top);
-                return;
+                // INTENTIONAL FALL-THROUGH: producer-side lookup +
+                // framing-falsifier line MUST follow.  Earlier revision
+                // returned here, suppressing the line the dispatch exists
+                // to emit.
+            } else {
+                drop(threads);
             }
+        } else {
+            drop(threads);
         }
     } else {
         crate::serial_println!(
