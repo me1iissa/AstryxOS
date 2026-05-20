@@ -4949,8 +4949,20 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
 
     // ── VFS file descriptors (covers ALL fds including 0/1/2) ──────────────
     // Try VFS first; if fd 0 has no VFS file open (BadFd), fall through to TTY.
+    //
+    // B-1 file-buf witness: snapshot the FILE struct's `buf`/`buf_size`
+    // doublet (musl 1.2.5 layout, FILE at page-offset 0x10 → fields at
+    // page-offset 0x68/0x70) before and after the VFS read so any
+    // kernel-side write that lands on the FILE struct during the
+    // syscall is named in the serial log.  Diagnostic-only; the
+    // module compiles to empty no-op stubs in default builds.  See
+    // `mm::file_buf_witness` and the B-1 gate-ownership verdict
+    // (`memchr(rcx=NULL, '\n', 89)` from `fgets`).
+    let __fbw_snap = crate::mm::file_buf_witness::pre_read(
+        pid as u64, fd, buf as u64);
     match crate::vfs::fd_read(pid, fd as usize, buf_ptr, count) {
         Ok(n) => {
+            crate::mm::file_buf_witness::post_read(__fbw_snap, n as i64);
             #[cfg(feature = "firefox-test")]
             {
                 // Look up the fd's open_path to decide whether to peek.  We
