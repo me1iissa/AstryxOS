@@ -330,7 +330,101 @@ fn reap_dead_threads_sched() {
 /// Maximum cached dead stacks. Increased for Firefox (many threads + PMM fragmentation).
 const MAX_DEAD_STACKS: usize = 64;
 
-static DEAD_STACK_CACHE: spin::Mutex<alloc::vec::Vec<u64>> = spin::Mutex::new(alloc::vec::Vec::new());
+/// Quiescence margin: a cached kstack is eligible for re-issue only after
+/// every CPU that was actively counting timer ticks at push time has
+/// advanced its per-CPU timer-ISR counter by at least this many ticks since
+/// the push.  N=2 gives one full timer period of slack beyond the minimum
+/// "the CPU has fired its ISR once since push", protecting against the
+/// degenerate case where a CPU was already inside the timer ISR (between
+/// the `TIMER_ISR_PER_CPU.fetch_add` and the eventual `iretq`) at the
+/// instant push() snapshotted its counter — that single increment is then
+/// not in fact a quiescent state for the rest of the ISR body.
+///
+/// At TICK_HZ=100 (see `arch::x86_64::irq::TICK_HZ`) this is a worst-case
+/// 20 ms reuse delay per cached kstack — negligible against the multi-
+/// millisecond cost of falling back to `pmm::alloc_pages(KERNEL_STACK_PAGES)`
+/// under PMM fragmentation, and orders of magnitude smaller than thread
+/// creation latency.
+const DEAD_STACK_QUIESCE_TICKS: u64 = 2;
+
+/// One cached dead stack: the higher-half kernel-stack base plus the
+/// per-CPU timer-ISR tick counter snapshot taken at push time.
+///
+/// Generation snapshot: `push_gen[i]` is the value of
+/// `arch::x86_64::irq::TIMER_ISR_PER_CPU[i]` observed by the pushing CPU
+/// at push time.  At pop time we require, for every CPU `i` where
+/// `push_gen[i] != 0` (i.e. CPU i was actively counting ticks at push),
+/// that `TIMER_ISR_PER_CPU[i] >= push_gen[i] + DEAD_STACK_QUIESCE_TICKS`.
+/// Only when every such CPU has independently advanced through that many
+/// timer interrupts since the push do we hand the stack back out.
+///
+/// Why this matters: when a thread exits, its saved context (the
+/// `switch_context_asm` frame stored in `Thread::context.rsp`) still
+/// points into the kstack VA range we're caching.  Another CPU mid-way
+/// through `schedule()` may have already loaded that thread's `rsp` into
+/// a register and be about to execute the post-`ret` epilogue.  If we
+/// re-issue the kstack to a new thread before the other CPU completes
+/// at least one full quiescent state (Intel SDM Vol. 3A §11.10 cache-
+/// coherence implies the CPU has retired the in-flight stack reads/writes
+/// only after it has serialised against the timer ISR returning), the
+/// new thread's first `ret` from `switch_context_asm` pops zero bytes
+/// (we bulk-zeroed at push) and lands at RIP=0 — the deterministic
+/// low-RIP kernel #GP cluster.
+///
+/// POSIX clone(2) thread lifecycle: a thread is reaped only after the
+/// scheduler has fully removed it from THREAD_TABLE and no CPU
+/// references it.  This gen-tick gate is the kernel-side mechanism that
+/// guarantees the "no CPU references it" half of that contract under SMP.
+#[derive(Clone, Copy)]
+struct CachedDeadStack {
+    /// Higher-half kernel-stack base virtual address.
+    base: u64,
+    /// Per-CPU timer-ISR tick counter snapshot at push time.
+    /// `push_gen[i] == 0` means CPU i was not counting ticks at push
+    /// (offline / never ticked) — that CPU does not gate quiescence.
+    push_gen: [u64; MAX_CPUS],
+}
+
+static DEAD_STACK_CACHE: spin::Mutex<alloc::vec::Vec<CachedDeadStack>> =
+    spin::Mutex::new(alloc::vec::Vec::new());
+
+/// Snapshot the per-CPU timer-ISR tick counters into a `push_gen` array.
+///
+/// Reads `arch::x86_64::irq::TIMER_ISR_PER_CPU` with `Relaxed` ordering;
+/// these counters are monotone-increasing and any race producing a stale
+/// (lower) read only delays quiescence by at most one tick — the
+/// `DEAD_STACK_QUIESCE_TICKS` margin absorbs that without changing the
+/// safety property.
+#[inline]
+fn snapshot_per_cpu_ticks() -> [u64; MAX_CPUS] {
+    let mut out = [0u64; MAX_CPUS];
+    for i in 0..MAX_CPUS {
+        out[i] = crate::arch::x86_64::irq::TIMER_ISR_PER_CPU[i]
+            .load(Ordering::Relaxed);
+    }
+    out
+}
+
+/// Decide whether a cached entry has quiesced — every CPU that was
+/// counting ticks at push time must have advanced its per-CPU counter by
+/// at least `DEAD_STACK_QUIESCE_TICKS` since.  CPUs whose `push_gen[i]`
+/// is zero (offline at push) are not required to advance.
+#[inline]
+fn entry_is_quiesced(entry: &CachedDeadStack) -> bool {
+    for i in 0..MAX_CPUS {
+        let pg = entry.push_gen[i];
+        if pg == 0 {
+            // CPU i was not ticking at push time → not a quiescence gate.
+            continue;
+        }
+        let now = crate::arch::x86_64::irq::TIMER_ISR_PER_CPU[i]
+            .load(Ordering::Relaxed);
+        if now < pg.saturating_add(DEAD_STACK_QUIESCE_TICKS) {
+            return false;
+        }
+    }
+    true
+}
 
 /// Try to push a dead stack to the cache. Returns true if cached, false if full.
 ///
@@ -350,6 +444,12 @@ static DEAD_STACK_CACHE: spin::Mutex<alloc::vec::Vec<u64>> = spin::Mutex::new(al
 /// non-cached path (`pmm::free_page` → `pmm::alloc_page` zero on the
 /// allocation side).  The cache exists to skip TLB shootdowns and the
 /// PMM round-trip, not to skip zeroing.
+///
+/// Quiescence gate: a per-CPU tick snapshot is recorded alongside the
+/// kstack base so `pop_dead_stack` can withhold the entry from re-issue
+/// until every CPU that was ticking at push time has advanced through
+/// `DEAD_STACK_QUIESCE_TICKS` timer interrupts (one full ISR round-trip
+/// plus margin).  See `CachedDeadStack` for the rationale.
 fn push_dead_stack(stack_base_virt: u64) -> bool {
     // Bulk-zero the kernel stack via the higher-half virtual base BEFORE
     // taking the cache lock — keeps the lock window tight (a few CPU
@@ -375,17 +475,51 @@ fn push_dead_stack(stack_base_virt: u64) -> bool {
         core::ptr::write_bytes(stack_base_virt as *mut u8, 0u8, stack_size);
     }
 
+    let push_gen = snapshot_per_cpu_ticks();
+
     let mut cache = DEAD_STACK_CACHE.lock();
     if cache.len() >= MAX_DEAD_STACKS {
         return false;
     }
-    cache.push(stack_base_virt);
+    cache.push(CachedDeadStack { base: stack_base_virt, push_gen });
     true
 }
 
-/// Try to pop a cached stack for reuse. Returns Some(higher-half base) or None.
+/// Try to pop a cached stack for reuse.
+///
+/// Returns the higher-half base of the oldest cached entry that has
+/// quiesced — i.e. every CPU active at push time has advanced its per-CPU
+/// timer-ISR counter by at least `DEAD_STACK_QUIESCE_TICKS` since.
+/// Non-quiesced entries are left in place; the next pop attempt re-checks
+/// them.
+///
+/// PMM allocator fallback: returning `None` here is the normal path that
+/// causes `proc::alloc_kernel_stack` to fall through to
+/// `pmm::alloc_pages(KERNEL_STACK_PAGES)` — see `proc/mod.rs`.  No caller
+/// of `pop_dead_stack` treats `None` as fatal, so withholding a
+/// non-quiesced entry is always safe; it costs a fresh PMM allocation in
+/// exchange for closing the kstack-reuse-while-RSP-still-live race
+/// (Intel SDM Vol. 3A §6.14 "Interrupt and Exception Handling" — a CPU's
+/// in-flight stack access against a saved kernel RSP is only retired
+/// once that CPU has executed at least one further `iretq` cycle, which
+/// the per-CPU timer ISR counter directly measures).
 pub fn pop_dead_stack() -> Option<u64> {
-    DEAD_STACK_CACHE.lock().pop()
+    let mut cache = DEAD_STACK_CACHE.lock();
+    // Scan from the oldest end (index 0) — older entries have had more
+    // time to quiesce, so this preserves rough-FIFO recycle order even
+    // though pushes append to the end.
+    let mut idx_found: Option<usize> = None;
+    for (i, entry) in cache.iter().enumerate() {
+        if entry_is_quiesced(entry) {
+            idx_found = Some(i);
+            break;
+        }
+    }
+    let i = idx_found?;
+    // `remove` is O(n) but n ≤ MAX_DEAD_STACKS = 64 and the call site
+    // (alloc_kernel_stack) is off the hot scheduler path — already
+    // amortised against PMM allocation cost.
+    Some(cache.remove(i).base)
 }
 
 /// Public interface to pre-populate the dead stack cache (called from main.rs).
