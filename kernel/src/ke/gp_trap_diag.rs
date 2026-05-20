@@ -150,10 +150,29 @@ pub fn record_exit(
     ring[slot] = snap;
 }
 
+/// Outcome of a consumer-side ring lookup.  `Contended` discriminates the
+/// case where `try_lock` failed (so we know nothing) from `Empty` (no
+/// snapshot exists for this pid).
+enum LookupResult {
+    Found(ExitSnap),
+    Empty,
+    Contended,
+}
+
 /// Look up the most-recent exit snapshot in the same process as the
-/// trapping thread.  Returns a copy or `None`.
-fn find_most_recent_in_pid(pid: u64) -> Option<ExitSnap> {
-    let ring = RING.lock();
+/// trapping thread.
+///
+/// Consumer-side: uses `try_lock` because this is invoked from the
+/// kernel-mode fatal-trap path, which can fire while another CPU (or this
+/// CPU, mid-`record_exit`) holds RING.  Blocking on a non-reentrant
+/// `spin::Mutex` would hang the kernel before `ke_bugcheck` runs.  On
+/// contention we return `Contended`; producer-side `RING.lock()` in
+/// `record_exit` is UNCHANGED.
+fn find_most_recent_in_pid(pid: u64) -> LookupResult {
+    let ring = match RING.try_lock() {
+        Some(g) => g,
+        None => return LookupResult::Contended,
+    };
     let mut best: Option<ExitSnap> = None;
     for slot in ring.iter() {
         if slot.seq == 0 || slot.pid != pid {
@@ -163,7 +182,10 @@ fn find_most_recent_in_pid(pid: u64) -> Option<ExitSnap> {
             best = Some(*slot);
         }
     }
-    best
+    match best {
+        Some(s) => LookupResult::Found(s),
+        None => LookupResult::Empty,
+    }
 }
 
 /// Print up to 64 bytes around `addr` as eight `u64` words, lossy-ly via
@@ -237,11 +259,15 @@ pub fn dump_for_kernel_trap(vector: u64, rip: u64, rsp: u64, error_code: u64) {
     dump_stack_window("trap_rsp_window", rsp);
 
     // Print the trapping thread's kernel-stack bookkeeping so the operator
-    // can decide whether `rsp` is in the expected range.  This takes a
-    // THREAD_TABLE lock; safe because we are in the pre-bugcheck path
-    // (interrupts still enabled until ke_bugcheck does `cli`).
-    {
-        let threads = crate::proc::THREAD_TABLE.lock();
+    // can decide whether `rsp` is in the expected range.  Use `try_lock`:
+    // acquiring THREAD_TABLE from a kernel-mode fatal-trap handler is
+    // unsafe (per `proc/mod.rs` THREAD_TABLE doc): a syscall on this CPU
+    // may already hold THREAD_TABLE, producing a non-recoverable same-CPU
+    // re-entrant deadlock on the non-reentrant `spin::Mutex` and hanging
+    // the kernel before `ke_bugcheck` runs.  On contention we skip the
+    // trap-thread bookkeeping line — the producer-side snapshot below is
+    // sufficient to discriminate the framing-falsifier.
+    if let Some(threads) = crate::proc::THREAD_TABLE.try_lock() {
         if let Some(t) = threads.iter().find(|t| t.tid == trap_tid) {
             crate::serial_println!(
                 "[KGP-DIAG] trap_thread: kstack=[{:#x}..{:#x}] size={:#x} state={:?} ctx_rsp={:#x}",
@@ -261,11 +287,15 @@ pub fn dump_for_kernel_trap(vector: u64, rip: u64, rsp: u64, error_code: u64) {
                 return;
             }
         }
+    } else {
+        crate::serial_println!(
+            "[KGP-DIAG] trap_thread: <THREAD_TABLE held on this CPU; skipping>"
+        );
     }
 
     // ── Producer-side lookup: most-recent exit in the same process ──
     match find_most_recent_in_pid(trap_pid) {
-        Some(snap) => {
+        LookupResult::Found(snap) => {
             crate::serial_println!(
                 "[KGP-DIAG] recent_exit: seq={} pid={} tid={} cpu={} cr3={:#x} clear_addr={:#x} \
                  saved_context_rsp={:#x} kstack=[{:#x}..{:#x}]",
@@ -289,10 +319,15 @@ pub fn dump_for_kernel_trap(vector: u64, rip: u64, rsp: u64, error_code: u64) {
                 stack_overlap
             );
         }
-        None => {
+        LookupResult::Empty => {
             crate::serial_println!(
                 "[KGP-DIAG] recent_exit: <no producer-side snapshot for pid={}>",
                 trap_pid
+            );
+        }
+        LookupResult::Contended => {
+            crate::serial_println!(
+                "[KGP-DIAG] recent_exit: <RING contended>"
             );
         }
     }
