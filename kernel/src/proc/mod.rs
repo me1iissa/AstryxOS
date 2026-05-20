@@ -401,6 +401,12 @@ pub struct Process {
     /// ITIMER_REAL interval in ticks (0 = one-shot).  Non-zero means the alarm
     /// is automatically re-armed after each expiry.
     pub alarm_interval_ticks: u64,
+    /// Parent-death signal — `prctl(PR_SET_PDEATHSIG, sig)` per `prctl(2)`.
+    /// When the parent of this process exits (or its parent thread dies, in
+    /// the Linux semantics), this signal is delivered to the child.  0 = no
+    /// signal (the default, and the post-exec reset value per the man page).
+    /// Stored as a byte so it fits the signal number range 1..=64.
+    pub pdeath_signal: u8,
 }
 
 /// Next PID counter.
@@ -660,6 +666,7 @@ pub fn init() {
         envp: Vec::new(),
         alarm_deadline_ticks: 0,
         alarm_interval_ticks: 0,
+        pdeath_signal: 0,
     };
 
     let idle_thread = Thread {
@@ -921,6 +928,7 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
         envp: Vec::new(),
         alarm_deadline_ticks: 0,
         alarm_interval_ticks: 0,
+        pdeath_signal: 0,
     };
 
     let thread = Thread {
@@ -1792,7 +1800,11 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
     // the init process shall inherit the child."  Without a userspace init,
     // we play that role here for any zombie whose adoptive parent (PID 1) is
     // itself exiting or already a zombie.
-    let (parent_pid, orphan_zombie_pids): (Pid, alloc::vec::Vec<(Pid, alloc::vec::Vec<Tid>)>) = {
+    let (parent_pid, orphan_zombie_pids, pdeath_deliveries): (
+        Pid,
+        alloc::vec::Vec<(Pid, alloc::vec::Vec<Tid>)>,
+        alloc::vec::Vec<(Pid, u8)>,
+    ) = {
         let mut procs = PROCESS_TABLE.lock();
         let pp = procs.iter().find(|p| p.pid == pid).map(|p| p.parent_pid).unwrap_or(0);
         if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
@@ -1807,8 +1819,20 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
             p.pid == 1 && p.state != ProcessState::Zombie);
         // Re-parent surviving (non-Zombie) children to PID 1.  Their lifecycle
         // continues normally; PID 1's exit will sweep them via the same path.
+        //
+        // Collect children whose `pdeath_signal` is non-zero so we can deliver
+        // the parent-death signal after releasing PROCESS_TABLE.  Per
+        // `prctl(2)` PR_SET_PDEATHSIG: "Set the parent-death signal of the
+        // calling process to arg2 (either a signal value in the range 1..maxsig,
+        // or 0 to clear).  This is the signal that the calling process will get
+        // when its parent dies."  Signal delivery cannot happen under the
+        // PROCESS_TABLE lock — crate::signal::kill() re-enters it.
+        let mut pdeath_deliveries: alloc::vec::Vec<(Pid, u8)> = alloc::vec::Vec::new();
         for p in procs.iter_mut() {
             if p.parent_pid == pid && p.state != ProcessState::Zombie {
+                if p.pdeath_signal != 0 {
+                    pdeath_deliveries.push((p.pid, p.pdeath_signal));
+                }
                 p.parent_pid = 1;
             }
         }
@@ -1836,8 +1860,16 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
             }
             i += 1;
         }
-        (pp, orphans)
+        (pp, orphans, pdeath_deliveries)
     };
+    // Deliver PR_SET_PDEATHSIG signals to children that requested them.
+    // signal::kill() acquires PROCESS_TABLE, so this must run after the lock
+    // is dropped.  Per prctl(2): "The setting is not inherited by children
+    // created by fork(2)/clone(2) and is cleared when [...] the credentials
+    // change."  Storage of the value is per-process; reset on exec().
+    for (cpid, sig) in &pdeath_deliveries {
+        let _ = crate::signal::kill(*cpid, *sig as u8);
+    }
     // Drop reaped orphans' threads + metrics outside the PROCESS_TABLE lock
     // (lock order: PROCESS_TABLE then THREAD_TABLE — see waitpid()).
     if !orphan_zombie_pids.is_empty() {
@@ -2424,6 +2456,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
         // POSIX: alarm state is NOT inherited across fork (POSIX.1-2008 §2.4)
         alarm_deadline_ticks: 0,
         alarm_interval_ticks: 0,
+        pdeath_signal: 0,
     };
 
     let child_thread = Thread {
@@ -2649,6 +2682,7 @@ pub fn fork_process_share_vm(
         envp: Vec::new(),
         alarm_deadline_ticks: 0,
         alarm_interval_ticks: 0,
+        pdeath_signal: 0,
     };
 
     let child_thread = Thread {
@@ -3322,6 +3356,7 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
         envp: Vec::new(),
         alarm_deadline_ticks: 0,
         alarm_interval_ticks: 0,
+        pdeath_signal: 0,
     };
 
     let child_thread = Thread {
