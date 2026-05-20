@@ -246,7 +246,7 @@ Ranked by frequency in real program traces. Syscalls that would most unblock rea
 | 318 | `getrandom` | Full |
 | 319 | `memfd_create` | Full; creates tmpfs-backed anonymous file |
 | 322 | `execveat` | Partial; ignores dirfd, rejects empty path |
-| 324 | `membarrier` | Full; QUERY, GLOBAL, PRIVATE_EXPEDITED |
+| 324 | `membarrier` | Full; QUERY (advertises 0x7f), GLOBAL, PRIVATE_EXPEDITED, REGISTER_* arms (accept), SYNC_CORE variants |
 | 326 | `copy_file_range` | Delegates to sendfile |
 | 332 | `statx` | Full; fills STATX_BASIC_STATS fields |
 | 435 | `clone3` | Full; CLONE_THREAD, CLONE_VM/VFORK, fork fallback |
@@ -274,7 +274,7 @@ These arms exist but return incomplete or hardcoded results that may cause subtl
 | 130 | `rt_sigsuspend` | yield + EINTR | Does not actually atomically unmask+wait |
 | 137 | `statfs` | Fixed EXT2_SUPER_MAGIC, fake block counts | df/stat will show wrong FS type/usage |
 | 138 | `fstatfs` | Same as statfs | Same risk |
-| 157 | `prctl` | PR_SET_NAME/PR_SET_PDEATHSIG/PR_SET_DUMPABLE silently accepted | Process name not stored; death signal not honored |
+| 157 | `prctl` | PR_SET_PDEATHSIG/PR_GET_PDEATHSIG now stored + delivered on parent exit; PR_CAPBSET_DROP/PR_CAPBSET_READ implemented (cap-model is no-op); PR_SET_NAME still ignored | Process name not stored |
 | 185 | `rt_sigaction` | Aliases to sigaction (185 is `security` in UAPI) | **Number collision: 185=security in UAPI, not rt_sigaction** |
 | 187 | `readahead` | Returns 0 (no page cache) | Not fatal; programs expect no-op is OK |
 | 203 | `sched_setaffinity` | Silent stub | Affinity not enforced |
