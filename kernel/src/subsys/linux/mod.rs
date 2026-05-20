@@ -80,6 +80,21 @@ pub mod clone_args_diag;
 #[cfg(feature = "ssp-canary-diag")]
 pub mod ssp_diag;
 
+/// K2b F3 foreign-frame writer trap — hardware-watchpoint-based diagnostic
+/// for the canary slot at the libxul `FireGLXTestProcess` `[rbp-8]` VA.
+/// Arms write-only DR slots on BOTH the user-VA and `PHYS_OFF + backing
+/// phys` channels at firefox-bin execve completion; the existing
+/// `[W215/DR-WATCH-FIRE]` line names the writer RIP on every hit.  The
+/// F3 hypothesis space (kernel `clone_for_fork` direct PTE writes vs
+/// stack-VMA grow path replacing PTEs without `map_page_in` vs sibling-
+/// CPU TLB-stale read) is distinguished by the writer RIP — see the
+/// module docstring for the per-mode signature.  See Intel SDM Vol. 3B
+/// §17.2 (DR0–DR3, DR7), Intel SDM Vol. 3A §4.10 (TLB management),
+/// System V AMD64 ABI §6.4 (SSP / `__stack_chk_guard`).  Diagnostic-only;
+/// gated behind `f3-watch` so master builds remain byte-identical.
+#[cfg(feature = "f3-watch")]
+pub mod f3_watch;
+
 /// Bounded broadcast-within-cluster compensation for FUTEX_WAKE.  Mitigates
 /// the older-glibc `pthread_cond_signal` race
 /// (<https://sourceware.org/bugzilla/show_bug.cgi?id=25847>) by

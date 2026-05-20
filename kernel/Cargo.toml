@@ -204,6 +204,26 @@ ssp-canary-diag = ["firefox-test"]
 # clone(2), clone3(2); AMD64 SysV ABI §3.4 calling convention; Intel SDM
 # Vol. 3A §6.15 (`#GP`), Vol. 2A (HLT/RET).
 clone-args-diag = ["firefox-test"]
+# K2b F3 foreign-frame writer trap (kernel/src/subsys/linux/f3_watch.rs).
+# Arms persistent hardware write-only watchpoints on the libxul
+# `FireGLXTestProcess` `[rbp - 8]` canary slot (deterministic user VA
+# `0x7ffffffee4c0`) at firefox-bin execve completion.  Two channels:
+#   * user-VA — catches writes via TID 1's user mapping (including the
+#     libxul prologue's `MOV [RSP+0x50], RAX` and any kernel-mode write
+#     that explicitly uses the user mapping).
+#   * `PHYS_OFF + backing_phys` — catches direct-map writes from any CPU
+#     to the specific frame backing the VA at arm time.
+# Each fire emits `[W215/DR-WATCH-FIRE] … kind_tag=1|2 …` naming the
+# writer RIP + CR3.  Bounded to `F3_FIRE_CAP=32` fires per slot per
+# boot.  Distinguishes K-CLONE-FORK (writer RIP in `clone_for_fork`)
+# from K-VMA-GROW (writer RIP in stack-VMA grow) from K-TLB-STALE
+# (zero fires + foreign data still visible at SSP-DIAG trap).
+# Diagnostic-only; default builds remain byte-identical when off.
+# Depends on `ssp-canary-diag` (for the SSP-DIAG correlation) and on
+# `w215-diag` (for the DR0–DR3 plumbing in `arch/x86_64/debug_reg.rs`).
+# See Intel SDM Vol. 3B §17.2.4 / §17.2.5 (DR0–DR3, DR7, DR6); Intel
+# SDM Vol. 3A §4.10 (TLB management); System V AMD64 ABI §6.4.
+f3-watch = ["firefox-test", "ssp-canary-diag", "w215-diag"]
 # `[VMA-DUMP]` on fatal user-mode exceptions.  At each fatal user-mode
 # #PF / #UD / #GP / #AC that terminates the process (no installed
 # handler) the kernel emits a full enumeration of the trapping
