@@ -792,6 +792,9 @@ pub fn free_shadow_record(phys: u64, caller_rip: u64) {
         FREE_SHADOW_DISPLACED.fetch_add(1, Ordering::Relaxed);
     }
     let tick = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+    // Note: relaxed writes — diagnostic readers may observe a torn
+    // (phys, tick, rip) tuple. Acceptable for a best-effort tracer; do
+    // not promote to load-bearing.
     slot.phys.store(phys, Ordering::Relaxed);
     slot.tick.store(tick, Ordering::Relaxed);
     slot.caller_rip.store(caller_rip, Ordering::Relaxed);
@@ -984,6 +987,9 @@ pub fn pte_change_record(
     let cpu = crate::arch::x86_64::apic::cpu_index() as u64;
     let tid = crate::proc::current_tid();
     let prev_va = slot.va.load(Ordering::Relaxed);
+    // Note: displacement counter uses relaxed-order writes; concurrent
+    // same-slot frees from different phys may undercount. Informational
+    // only.
     if prev_va != 0 && prev_va != va_page {
         PTE_CHANGE_DISPLACED.fetch_add(1, Ordering::Relaxed);
     }
