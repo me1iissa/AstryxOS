@@ -8,6 +8,8 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::arch::x86_64::smap::UserGuard;
+
 // Signal numbers (Linux x86_64 compatible)
 pub const SIGHUP: u8 = 1;
 pub const SIGINT: u8 = 2;
@@ -704,6 +706,13 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
             );
 
             // Write the signal frame to user memory.
+            // Per Intel SDM Vol. 3A §4.6.1: with CR4.SMAP=1 a supervisor
+            // store to a user-mapped page raises #PF unless EFLAGS.AC=1.
+            // The syscall-entry path runs with AC=0, so this bracket is
+            // required for every store via `sig_frame_ptr` / `ucontext_ptr`
+            // / `siginfo_ptr` below.  Pointer math is bounded by `total`
+            // (≤ 664) starting at the user-supplied `saved_rsp`.
+            let _smap_g = unsafe { UserGuard::new() };
             unsafe {
                 (*sig_frame_ptr).restorer   = restorer_addr;
                 (*sig_frame_ptr).sig_num    = sig as u64;
@@ -973,6 +982,12 @@ pub unsafe fn deliver_sigsegv_from_isr(
     );
 
     // ── Write SignalFrame ─────────────────────────────────────────────────────
+    // Per Intel SDM Vol. 3A §4.6.1: CR4.SMAP=1 raises #PF on any supervisor
+    // access to a user-mapped page unless EFLAGS.AC=1.  This ISR path runs
+    // with AC=0 (interrupts/exceptions clear AC per §6.8.3), so the user-VA
+    // stores below would fault without the bracket.  Pointer was already
+    // range-validated via `virt_to_phys_in(cr3, new_rsp)` above.
+    let _smap_g = UserGuard::new();
     (*sig_frame_ptr).restorer    = restorer_addr;
     (*sig_frame_ptr).sig_num     = SIGSEGV as u64;
     (*sig_frame_ptr).saved_mask  = saved_mask;
