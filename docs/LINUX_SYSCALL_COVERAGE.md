@@ -246,7 +246,7 @@ Ranked by frequency in real program traces. Syscalls that would most unblock rea
 | 318 | `getrandom` | Full |
 | 319 | `memfd_create` | Full; creates tmpfs-backed anonymous file |
 | 322 | `execveat` | Partial; ignores dirfd, rejects empty path |
-| 324 | `membarrier` | Full; QUERY, GLOBAL, PRIVATE_EXPEDITED |
+| 324 | `membarrier` | Full; QUERY (advertises 0x7f), GLOBAL, PRIVATE_EXPEDITED, REGISTER_* arms (accept), SYNC_CORE variants |
 | 326 | `copy_file_range` | Delegates to sendfile |
 | 332 | `statx` | Full; fills STATX_BASIC_STATS fields |
 | 435 | `clone3` | Full; CLONE_THREAD, CLONE_VM/VFORK, fork fallback |

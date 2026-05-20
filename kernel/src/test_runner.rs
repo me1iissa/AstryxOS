@@ -21088,7 +21088,7 @@ fn test_set_robust_list_roundtrip() -> bool {
 // ── Test 124: membarrier QUERY returns non-zero mask with GLOBAL bit ──────────
 
 fn test_membarrier_query() -> bool {
-    test_header!("membarrier(324): QUERY returns mask including GLOBAL (bit 0x1)");
+    test_header!("membarrier(324): QUERY mask + REGISTER_PRIVATE_EXPEDITED + GLOBAL");
 
     // membarrier(MEMBARRIER_CMD_QUERY=0, flags=0, cpu_id=0)
     let r = crate::syscall::dispatch_linux_kernel(324, 0, 0, 0, 0, 0, 0);
@@ -21098,13 +21098,20 @@ fn test_membarrier_query() -> bool {
         test_fail!("membarrier_query", "returned {} (expected positive bitmask)", r);
         return false;
     }
-    // MEMBARRIER_CMD_GLOBAL is bit 0x1
-    if r & 0x1 == 0 {
-        test_fail!("membarrier_query", "GLOBAL bit (0x1) not set in mask {:#x}", r as u64);
-        return false;
+    // MEMBARRIER_CMD_GLOBAL                       = 0x01
+    // MEMBARRIER_CMD_PRIVATE_EXPEDITED            = 0x08
+    // MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED   = 0x10 (musl uses this at startup)
+    for (bit, name) in &[(0x01i64, "GLOBAL"),
+                          (0x08i64, "PRIVATE_EXPEDITED"),
+                          (0x10i64, "REGISTER_PRIVATE_EXPEDITED")] {
+        if r & *bit == 0 {
+            test_fail!("membarrier_query",
+                "{} bit ({:#x}) not set in mask {:#x}", name, bit, r as u64);
+            return false;
+        }
     }
 
-    // Also verify GLOBAL command executes without error
+    // Verify GLOBAL command executes without error
     let r2 = crate::syscall::dispatch_linux_kernel(324, 1, 0, 0, 0, 0, 0);
     test_println!("  membarrier(GLOBAL) = {}", r2);
     if r2 != 0 {
@@ -21112,7 +21119,24 @@ fn test_membarrier_query() -> bool {
         return false;
     }
 
-    test_pass!("membarrier: QUERY mask non-zero with GLOBAL bit, GLOBAL cmd=0");
+    // Verify REGISTER_PRIVATE_EXPEDITED (cmd=0x10) returns 0 (the musl-FF gate).
+    let r3 = crate::syscall::dispatch_linux_kernel(324, 0x10, 0, 0, 0, 0, 0);
+    test_println!("  membarrier(REGISTER_PRIVATE_EXPEDITED) = {}", r3);
+    if r3 != 0 {
+        test_fail!("membarrier_query",
+            "REGISTER_PRIVATE_EXPEDITED returned {} (expected 0)", r3);
+        return false;
+    }
+
+    // Unknown command must still return -EINVAL.
+    let r4 = crate::syscall::dispatch_linux_kernel(324, 0x7FFF, 0, 0, 0, 0, 0);
+    if r4 != -22 {
+        test_fail!("membarrier_query",
+            "unknown cmd returned {} (expected -22/EINVAL)", r4);
+        return false;
+    }
+
+    test_pass!("membarrier: QUERY mask + GLOBAL + REGISTER_PRIVATE_EXPEDITED + EINVAL");
     true
 }
 
