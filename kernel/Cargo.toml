@@ -231,6 +231,20 @@ vma-dump-on-gp = ["firefox-test"]
 # AMD64 ABI §3.4 (kernel-mode trap frame layout); POSIX clone(2)
 # CLONE_CHILD_CLEARTID semantics.
 kernel-gp-trap-diag = ["firefox-test"]
+# Per-binary `[ELF/INIT-ARRAY]` emission at every kernel-side ELF load (main
+# executable + ELF interpreter).  Records DT_INIT / DT_INIT_ARRAY /
+# DT_PREINIT_ARRAY virtual addresses and reads the first four DT_INIT_ARRAY
+# function pointers (with their backing physical frame + W215
+# pte_share_count from PR #270) while the image is still hot.  Used as a
+# framing-falsifier for the W215 saga: if fn_ptrs are NULL / non-text the
+# constructor table was never relocated; if they look sane the bug is post-
+# init (signal-frame corruption, aliasing-after-launch, etc.).  Bounded to
+# the first 8 images per boot, then emits a single OVERFLOW marker.
+# Default builds remain byte-identical when this feature is OFF.  See
+# ELF gABI §5.7 (Initialization and Termination Functions), System V AMD64
+# ABI §3.3.3 (`_init` semantics), and glibc `_dl_init` (publicly documented
+# at <https://www.gnu.org/software/libc/manual/html_node/Dynamic-Linker-Hooks.html>).
+elf-init-array-diag = ["firefox-test"]
 # LLVM source-based code-coverage instrumentation (test-coverage audit
 # session 5 / docs/TEST_COVERAGE_AUDIT_2026-05-16.md).  When enabled, the
 # kernel must additionally be built with `-C instrument-coverage` (see
