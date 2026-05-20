@@ -662,6 +662,72 @@ pub fn probe_gp_at_ssp_fail(
         window_lines[3], window_lines[4],
     );
 
+    // ── [SSP-DIAG-PROV] — Track K phys-provenance for the canary slot ─────
+    //
+    // F3 hypothesis (per [[track-k-f3-provenance-2026-05-20]]): the libxul
+    // function's prologue stored a real canary at VA `saved_slot`, but
+    // between prologue and epilogue the page-table mapping for that VA was
+    // either replaced (a different phys is now backing the same VA — PTE-
+    // replace mechanism) OR the underlying frame was freed+realloced and
+    // a sibling thread's content is now visible at the same VA.
+    //
+    // The diagnostic prints four lines:
+    //
+    // 1. `[FAULT/PHYS/FREESHADOW]` for the canary slot's current phys —
+    //    if hit, the printed caller-RIP names the kernel `pmm::free_page`
+    //    call site (addr2line against the kernel ELF) for the frame that
+    //    is currently backing the slot.  A FREE hit AFTER the libxul
+    //    prologue is the smoking-gun signature of free-then-realloc.
+    // 2. `[FAULT/PHYS/ALLOCSHADOW]` for the same phys — names the
+    //    `pmm::alloc_page_locked` caller-RIP that handed the frame out;
+    //    when paired with FREESHADOW, gives the full FREE→ALLOC pair.
+    // 3. `[FAULT/STACK-PTE]` for the canary slot VA — names the most-
+    //    recent `map_page_in` / `unmap_page_in` / `write_pte` operator
+    //    for that VA in the current address space.  An entry with a
+    //    `kind=MAP` and `tick > prologue_tick` is the smoking-gun
+    //    signature of PTE-replace.
+    // 4. `[FAULT/PHYS/ALLOCSHADOW]` + `[FAULT/PHYS/FREESHADOW]` for the
+    //    PTE-ring's recorded `old_phys` — names the prior frame that
+    //    backed the slot before the most-recent PTE-change.  Lets the
+    //    operator distinguish "the prologue saw frame X, then frame X was
+    //    freed and replaced by Y" from "the slot was first mapped at PTE
+    //    install time".
+    //
+    // Per Intel SDM Vol. 3A §4.10.5, paging-structure changes must be
+    // globally visible before any frame they reference is repurposed.
+    // The diagnostic above lets a reviewer reconstruct the operator-of-
+    // record chain that violates the invariant when F3 fires.
+    let saved_slot_phys = match read_user_qword(saved_slot) {
+        Some((_v, p)) => p & !0xFFFu64,
+        None => 0,
+    };
+    if saved_slot_phys != 0 {
+        crate::serial_println!(
+            "[SSP-DIAG-PROV] pid={} tid={} saved_slot={:#x} saved_slot_phys={:#x}",
+            pid, tid, saved_slot, saved_slot_phys,
+        );
+        crate::mm::w215_diag::dump_free_shadow_for_phys(saved_slot_phys);
+        crate::mm::w215_diag::dump_alloc_shadow_for_phys(saved_slot_phys);
+    } else {
+        crate::serial_println!(
+            "[SSP-DIAG-PROV] pid={} tid={} saved_slot={:#x} saved_slot_phys=UNMAPPED",
+            pid, tid, saved_slot,
+        );
+    }
+    let prior_phys = crate::mm::w215_diag::dump_pte_change_for_va(saved_slot);
+    if prior_phys != 0 && prior_phys != saved_slot_phys {
+        // The PTE-ring recorded a `old_phys` distinct from the slot's
+        // current `saved_slot_phys` — confirming a PTE-replace operation
+        // happened on this VA.  Dump the FREE/ALLOC shadows for the prior
+        // frame so the operator can see whether it has been recycled.
+        crate::serial_println!(
+            "[SSP-DIAG-PROV-PRIOR] pid={} tid={} prior_phys={:#x}",
+            pid, tid, prior_phys,
+        );
+        crate::mm::w215_diag::dump_free_shadow_for_phys(prior_phys);
+        crate::mm::w215_diag::dump_alloc_shadow_for_phys(prior_phys);
+    }
+
     // ── RIP-disambiguator block — see module header for the truth table.
 
     // ── Line 4: [SSP-DIAG-RA] — caller's return-address slot one qword

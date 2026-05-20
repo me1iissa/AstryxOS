@@ -44,6 +44,44 @@ unsafe fn p2v(phys: u64) -> *mut u64 {
 /// VMM lock.
 static VMM_LOCK: Mutex<()> = Mutex::new(());
 
+/// Best-effort caller-RIP capture for the Track K PTE-change ring (Phase D
+/// follow-up, 2026-05-20).  Walks one frame up via RBP — if the upstream
+/// caller was built with `-fomit-frame-pointer` this returns 0 and the
+/// ring entry simply lacks a usable caller-RIP.  Direct-map range guard
+/// matches `mm/pmm.rs::caller_rip` (KERNEL_VIRT_OFFSET .. +4 GiB).  Diag-
+/// nostic only, gated on the `firefox-test` feature so default builds are
+/// byte-identical.
+#[cfg(feature = "firefox-test")]
+#[inline(never)]
+fn ring_caller_rip() -> u64 {
+    let rbp: u64;
+    // SAFETY: reading the frame pointer is always safe; the subsequent
+    // dereference is guarded by the alignment + range checks below.
+    unsafe {
+        core::arch::asm!(
+            "mov {}, rbp",
+            out(reg) rbp,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    const DIRECT_MAP_BASE: u64 = crate::proc::KERNEL_VIRT_OFFSET;
+    // 4 GiB direct map (matches `pmm::MAX_PAGES * PAGE_SIZE = 1Mi × 4 KiB`).
+    // Hard-coded here to keep this helper visible without needing `pub`
+    // exposure on PMM internals.
+    const DIRECT_MAP_END:  u64 = DIRECT_MAP_BASE + (1u64 << 32);
+    if rbp == 0
+        || (rbp & 7) != 0
+        || rbp < DIRECT_MAP_BASE
+        || rbp.saturating_add(8) >= DIRECT_MAP_END
+    {
+        return 0;
+    }
+    // [rbp+8] = saved return address into the caller's caller (one
+    // frame above `map_page_in` / `unmap_page_in` / `write_pte`).
+    // SAFETY: rbp+8 is within the higher-half direct map.
+    unsafe { core::ptr::read_volatile((rbp + 8) as *const u64) }
+}
+
 /// The kernel's primary page table CR3, captured during VMM init.
 /// Used to restore the CR3 on CPUs that were using a user process's page
 /// table when that process exits (e.g. AP idle after a user thread dies).
@@ -501,6 +539,12 @@ pub fn map_page_in(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -
     let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
     let pt_idx = ((virt_addr >> 12) & 0x1FF) as usize;
 
+    // Track K diagnostic: capture old phys (pre-change) for the user-stack
+    // PTE-change ring.  Cheap branchless walk — short-circuited inside
+    // `pte_change_record` when the VA is outside the user-stack window.
+    #[cfg(feature = "firefox-test")]
+    let old_phys_for_ring = read_pte(pml4_phys, virt_addr) & ADDR_MASK;
+
     unsafe {
         let pdpt_phys = match get_or_create_entry(pml4_phys, pml4_idx, flags) {
             Some(addr) => addr,
@@ -519,6 +563,21 @@ pub fn map_page_in(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -
         *pt_ptr.add(pt_idx) = (phys_addr & ADDR_MASK) | flags | PAGE_PRESENT;
     }
 
+    // Track K (2026-05-20): record PTE-change events for user-stack VAs
+    // (no-op outside the window).  `caller_rip` via the same frame-pointer
+    // trick used by `pmm::caller_rip()` — see Intel SDM Vol. 3A §4.10.5 for
+    // the underlying TLB-coherence invariant whose violation produces the
+    // F3 fingerprint.
+    #[cfg(feature = "firefox-test")]
+    crate::mm::w215_diag::pte_change_record(
+        virt_addr,
+        phys_addr & ADDR_MASK,
+        old_phys_for_ring,
+        crate::mm::w215_diag::PTE_KIND_MAP,
+        ring_caller_rip(),
+        pml4_phys,
+    );
+
     true
 }
 
@@ -535,6 +594,13 @@ pub fn unmap_page_in(pml4_phys: u64, virt_addr: u64) {
     let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
     let pt_idx = ((virt_addr >> 12) & 0x1FF) as usize;
 
+    // Track K diagnostic: capture old phys (pre-unmap) for the user-stack
+    // PTE-change ring.  Lookup is short-circuited by the ring-window guard
+    // inside `pte_change_record`; the `read_pte` walk runs only when the
+    // diagnostic feature is on.
+    #[cfg(feature = "firefox-test")]
+    let old_phys_for_ring = read_pte(pml4_phys, virt_addr) & ADDR_MASK;
+
     unsafe {
         let pml4_entry = *p2v(pml4_phys).add(pml4_idx);
         if pml4_entry & PAGE_PRESENT == 0 { return; }
@@ -547,6 +613,16 @@ pub fn unmap_page_in(pml4_phys: u64, virt_addr: u64) {
 
         *p2v(pd_entry & ADDR_MASK).add(pt_idx) = 0;
     }
+
+    #[cfg(feature = "firefox-test")]
+    crate::mm::w215_diag::pte_change_record(
+        virt_addr,
+        0,
+        old_phys_for_ring,
+        crate::mm::w215_diag::PTE_KIND_UNMAP,
+        ring_caller_rip(),
+        pml4_phys,
+    );
 }
 
 /// Unmap every present page in `[base, base+length)` from an arbitrary page
@@ -708,6 +784,11 @@ pub fn write_pte(pml4_phys: u64, virt_addr: u64, pte: u64) {
     let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
     let pt_idx = ((virt_addr >> 12) & 0x1FF) as usize;
 
+    // Track K: capture old PTE (pre-write) for the user-stack PTE-change
+    // ring.  Mirrors the pattern in `map_page_in` / `unmap_page_in`.
+    #[cfg(feature = "firefox-test")]
+    let old_phys_for_ring = read_pte(pml4_phys, virt_addr) & ADDR_MASK;
+
     unsafe {
         let pml4_entry = *p2v(pml4_phys).add(pml4_idx);
         if pml4_entry & PAGE_PRESENT == 0 { return; }
@@ -720,6 +801,16 @@ pub fn write_pte(pml4_phys: u64, virt_addr: u64, pte: u64) {
 
         *p2v(pd_entry & ADDR_MASK).add(pt_idx) = pte;
     }
+
+    #[cfg(feature = "firefox-test")]
+    crate::mm::w215_diag::pte_change_record(
+        virt_addr,
+        pte & ADDR_MASK,
+        old_phys_for_ring,
+        crate::mm::w215_diag::PTE_KIND_WRITE,
+        ring_caller_rip(),
+        pml4_phys,
+    );
 }
 
 /// Switch the active page table (CR3).
