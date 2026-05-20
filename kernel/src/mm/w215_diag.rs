@@ -69,6 +69,11 @@ pub const KIND_REFINC: u8                      = 4;
 pub const KIND_REFDEC: u8                      = 5;
 pub const KIND_PHYS_OFF_WRITE_PRE_INSERT: u8   = 6;
 pub const KIND_PFH_INSTALL: u8                 = 7;
+/// Axis-B-CoW cross-check (Arm-2 cross-check arm).  Recorded when a
+/// PHYS_OFF write is *about* to land on a physical frame that the page
+/// cache STILL holds under some key — the cache-aliasing precondition
+/// for the FAULT/PHYS bucket-A cluster.
+pub const KIND_WRITE_DETECTED: u8              = 8;
 
 // ── Writer site IDs for Arm-2 PREINS witness map ────────────────────────────
 
@@ -205,7 +210,103 @@ fn kind_str(k: u8) -> &'static str {
         KIND_REFDEC => "REFDEC",
         KIND_PHYS_OFF_WRITE_PRE_INSERT => "PREINS_W",
         KIND_PFH_INSTALL => "PFH_INSTALL",
+        KIND_WRITE_DETECTED => "WRITE_DETECT",
         _ => "UNKNOWN",
+    }
+}
+
+// ── Arm-2 cross-check (WRITE_DETECT probes at PHYS_OFF write sites) ─────────
+//
+// Each probe is a thin wrapper around `cache::is_phys_in_cache` evaluated
+// BEFORE the imminent PHYS_OFF write.  On `Some(key)` the wrapper:
+//   1. increments the per-site `*_OVER_CACHE` counter,
+//   2. emits one structured `[W215/WRITE-DETECT/<site>]` serial line
+//      (rate-limited via `sample_emit`), and
+//   3. records a `KIND_WRITE_DETECTED` entry in the provenance ring so the
+//      `[FAULT/PHYS/PROV]` dump shows the writer's footprint after the fact.
+//
+// The probe never short-circuits or alters control flow — diagnostic only.
+
+/// Writer site IDs (used in both serial line tags and packed key payloads).
+pub const WSITE_COW_CACHE_HIT: u8     = 1; // idt.rs cache-hit MAP_PRIVATE writable copy
+pub const WSITE_COW_READAHEAD: u8     = 2; // idt.rs readahead MAP_PRIVATE writable copy
+pub const WSITE_COW_SINGLEPAGE: u8    = 3; // idt.rs single-page fallback MAP_PRIVATE writable copy
+pub const WSITE_ANON_ZEROFILL: u8     = 4; // idt.rs anonymous fault zero-fill (TOP CANDIDATE)
+
+static COW_CACHE_HIT_OVER_CACHE:   AtomicU64 = AtomicU64::new(0);
+static COW_READAHEAD_OVER_CACHE:   AtomicU64 = AtomicU64::new(0);
+static COW_SINGLEPAGE_OVER_CACHE:  AtomicU64 = AtomicU64::new(0);
+static ANON_ZEROFILL_OVER_CACHE:   AtomicU64 = AtomicU64::new(0);
+
+pub fn cow_cache_hit_over_cache_count()   -> u64 { COW_CACHE_HIT_OVER_CACHE.load(Ordering::Relaxed) }
+pub fn cow_readahead_over_cache_count()   -> u64 { COW_READAHEAD_OVER_CACHE.load(Ordering::Relaxed) }
+pub fn cow_singlepage_over_cache_count()  -> u64 { COW_SINGLEPAGE_OVER_CACHE.load(Ordering::Relaxed) }
+pub fn anon_zerofill_over_cache_count()   -> u64 { ANON_ZEROFILL_OVER_CACHE.load(Ordering::Relaxed) }
+
+#[inline]
+fn wsite_str(s: u8) -> &'static str {
+    match s {
+        WSITE_COW_CACHE_HIT   => "COW_CACHE_HIT",
+        WSITE_COW_READAHEAD   => "COW_READAHEAD",
+        WSITE_COW_SINGLEPAGE  => "COW_SINGLEPAGE",
+        WSITE_ANON_ZEROFILL   => "ANON_ZEROFILL",
+        _ => "UNKNOWN",
+    }
+}
+
+#[inline]
+fn bump_wsite(site: u8) {
+    match site {
+        WSITE_COW_CACHE_HIT  => { COW_CACHE_HIT_OVER_CACHE.fetch_add(1, Ordering::Relaxed);  }
+        WSITE_COW_READAHEAD  => { COW_READAHEAD_OVER_CACHE.fetch_add(1, Ordering::Relaxed);  }
+        WSITE_COW_SINGLEPAGE => { COW_SINGLEPAGE_OVER_CACHE.fetch_add(1, Ordering::Relaxed); }
+        WSITE_ANON_ZEROFILL  => { ANON_ZEROFILL_OVER_CACHE.fetch_add(1, Ordering::Relaxed);  }
+        _ => {}
+    }
+}
+
+/// Cross-check probe.  Call IMMEDIATELY BEFORE a PHYS_OFF-mapped write
+/// (zero-fill or CoW copy) onto `phys`.
+///
+/// Behaviour:
+/// - If `phys` is currently held by the page cache under some key, increments
+///   the per-site counter, emits one rate-limited serial line, and pushes a
+///   `KIND_WRITE_DETECTED` entry into the provenance ring (so the
+///   `[FAULT/PHYS/PROV]` dump shows the writer's footprint).
+/// - Otherwise: zero work; returns without touching any counter.
+///
+/// ISR-safe.  `cache::is_phys_in_cache` takes a short spin lock; that lock is
+/// not held across any sleeping path here.  Per Intel SDM Vol. 3A §4.10.5,
+/// a PHYS_OFF write to a frame the cache holds aliases the cache page (the
+/// PHYS_OFF mapping is in PML4[256-511] kernel half) — exactly the structural
+/// precondition for the FAULT/PHYS bucket-A cluster.
+#[inline]
+pub fn write_detect(phys: u64, site: u8, rip: u64) {
+    if phys == 0 { return; }
+    let key = match crate::mm::cache::is_phys_in_cache(phys) {
+        Some(k) => k,
+        None => return,
+    };
+    bump_wsite(site);
+    // Provenance entry: pack the matched cache key into the 48-bit payload so
+    // the FAULT/PHYS/PROV dump can correlate (mount,inode,off) with the
+    // writer site that touched the frame.
+    let packed = pack_cache_key(key.1, key.2);
+    prov_record(phys, KIND_WRITE_DETECTED, packed);
+
+    // Rate-limit the serial line: first 16 detections per site verbatim,
+    // then 1 in 4096.  Counter is shared across sites — fine for the
+    // diagnostic; the per-site counters above are exact.
+    static WRITE_DETECT_N: AtomicU64 = AtomicU64::new(0);
+    let n = WRITE_DETECT_N.fetch_add(1, Ordering::Relaxed);
+    if n < 16 || n % 4096 == 0 {
+        crate::serial_println!(
+            "[W215/WRITE-DETECT/{}] phys={:#x} key=(mount={},inode={:#x},off={:#x}) \
+             rip={:#x} n={}",
+            wsite_str(site),
+            phys, key.0, key.1, key.2,
+            rip, n,
+        );
     }
 }
 
