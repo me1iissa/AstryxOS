@@ -844,3 +844,371 @@ pub fn free_shadow_recorded_count() -> u64 {
 pub fn free_shadow_displaced_count() -> u64 {
     FREE_SHADOW_DISPLACED.load(Ordering::Relaxed)
 }
+
+// ── Track K (2026-05-20): ALLOC_SHADOW + USER-STACK PTE_CHANGE_RING ─────────
+//
+// Phase D landed `FREE_SHADOW` to name the upstream `pmm::free_page` caller
+// for a given phys frame.  The symmetric ALLOC side lets a downstream
+// diagnostic answer "was this phys allocated to *someone* between the
+// libxul prologue and the SSP epilogue?" — the foundation for naming the
+// page-table operation that aliased a stack-page VA to a different phys.
+//
+// `PTE_CHANGE_RING` is the per-VA companion: a direct-addressed ring keyed
+// by `(va >> 12) % USER_STACK_PTE_RING_SIZE` that records every
+// `map_page_in` / `unmap_page_in` / `write_pte` operation whose VA falls in
+// the userspace high-stack window `[USER_STACK_RING_LO, USER_STACK_RING_HI)`.
+// The window is chosen to cover the main-thread initial stack
+// (`0x7fff_ffe0_0000 .. 0x8000_0000_0000`) PLUS any clone-spawned thread
+// stacks placed by the kernel's `clone(CLONE_VM)` path in the same region.
+//
+// Per Intel SDM Vol. 3A §4.10.5 — a PTE change must be propagated to all
+// processors before the underlying physical frame is returned to the
+// allocator.  Naming the operator-of-record for each PTE change on the
+// canary slot's VA is the dispositive evidence for Track K's F3
+// hypothesis space (PTE-replace vs TLB-stale).
+//
+// All counters / rings are `firefox-test`-gated; default builds remain
+// byte-identical.
+
+/// Lower bound of the user-stack PTE-change ring window.  Covers the entire
+/// upper 2 MiB of canonical user space — generous enough to capture every
+/// known stack VMA the AstryxOS Linux personality produces (main thread
+/// initial stack, vfork helper stacks at `0x7fff_ffef_…`, clone-child
+/// thread stacks the syscalls assign in the same region).  See
+/// `proc/usermode.rs::map_initial_stack` for the main-thread VA.
+pub const USER_STACK_RING_LO: u64 = 0x0000_7fff_ffe0_0000;
+
+/// Upper (exclusive) bound — top of canonical lower-half user address space.
+pub const USER_STACK_RING_HI: u64 = 0x0000_8000_0000_0000;
+
+/// Number of entries in the user-stack PTE-change ring.  Direct addressing
+/// over `(va >> 12)` means the window holds at most
+/// `(HI - LO) / 4 KiB = 0x200 == 512` distinct 4 KiB-aligned VAs; 1024
+/// gives 2× headroom for hash collisions to be effectively impossible
+/// without bloating BSS (1024 × 48 B = 48 KiB).
+const USER_STACK_PTE_RING_SIZE: usize = 1024;
+
+/// PTE-change kind codes.
+pub const PTE_KIND_MAP: u8       = 1; // map_page_in installed a fresh PTE
+pub const PTE_KIND_UNMAP: u8     = 2; // unmap_page_in cleared the PTE
+pub const PTE_KIND_WRITE: u8     = 3; // write_pte rewrote PTE flags (CoW etc.)
+pub const PTE_KIND_BULK_UNMAP: u8 = 4; // unmap_and_free_range_in cleared the PTE
+pub const PTE_KIND_FORK_CLONE: u8 = 5; // clone_for_fork installed a CoW PTE
+
+#[repr(C)]
+struct PteChangeEntry {
+    /// Virtual address (`va` masked to a 4 KiB-aligned page) of the changed
+    /// PTE.  `0` means the slot has never been written.
+    va: AtomicU64,
+    /// Tick at which the change fired.
+    tick: AtomicU64,
+    /// New phys (post-change).  `0` for an unmap.
+    new_phys: AtomicU64,
+    /// Old phys (pre-change).  `0` if the slot was empty.
+    old_phys: AtomicU64,
+    /// Packed: [63:32] caller_rip_low32 (truncated; kernel low 32 bits suffice
+    /// for `addr2line` against the kernel ELF), [31:16] cr3_low16,
+    /// [15:8] cpu, [7:0] kind.  `tid` carried in a separate field below.
+    packed: AtomicU64,
+    /// Recording TID (mostly useful for cross-correlation with `[HB]` log).
+    tid: AtomicU64,
+}
+
+impl PteChangeEntry {
+    const fn new() -> Self {
+        Self {
+            va: AtomicU64::new(0),
+            tick: AtomicU64::new(0),
+            new_phys: AtomicU64::new(0),
+            old_phys: AtomicU64::new(0),
+            packed: AtomicU64::new(0),
+            tid: AtomicU64::new(0),
+        }
+    }
+}
+
+struct PteChangeRing {
+    slots: [PteChangeEntry; USER_STACK_PTE_RING_SIZE],
+}
+
+impl PteChangeRing {
+    const fn new() -> Self {
+        const E: PteChangeEntry = PteChangeEntry::new();
+        Self { slots: [E; USER_STACK_PTE_RING_SIZE] }
+    }
+}
+
+static PTE_CHANGE_RING: PteChangeRing = PteChangeRing::new();
+
+/// Total PTE-change events recorded (every successful map / unmap / write
+/// in-window).
+static PTE_CHANGE_RECORDED: AtomicU64 = AtomicU64::new(0);
+
+/// Number of events whose slot already held a different VA (slot collision —
+/// the previous entry was overwritten).  Hash size is 8× the window so this
+/// should remain ~0 in normal operation; non-zero is a yellow flag for the
+/// dump's reliability.
+static PTE_CHANGE_DISPLACED: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn pte_ring_slot(va: u64) -> Option<&'static PteChangeEntry> {
+    if va < USER_STACK_RING_LO || va >= USER_STACK_RING_HI {
+        return None;
+    }
+    let pfn = (va >> 12) as usize;
+    Some(&PTE_CHANGE_RING.slots[pfn & (USER_STACK_PTE_RING_SIZE - 1)])
+}
+
+/// Record a PTE-change event.  No-op outside the user-stack window.
+///
+/// `va` is the changed user VA (will be page-aligned for storage).
+/// `old_phys`/`new_phys` are the pre/post mappings (`0` for unmapped).
+/// `kind` is one of `PTE_KIND_*`.  `caller_rip` is the kernel return
+/// address into the caller of the page-table primitive — used to name
+/// the upstream syscall handler (`addr2line` against the kernel ELF).
+#[inline]
+pub fn pte_change_record(
+    va: u64,
+    new_phys: u64,
+    old_phys: u64,
+    kind: u8,
+    caller_rip: u64,
+    cr3: u64,
+) {
+    let slot = match pte_ring_slot(va) {
+        Some(s) => s,
+        None => return,
+    };
+    let va_page = va & !0xFFFu64;
+    let tick = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+    let cpu = crate::arch::x86_64::apic::cpu_index() as u64;
+    let tid = crate::proc::current_tid();
+    let prev_va = slot.va.load(Ordering::Relaxed);
+    if prev_va != 0 && prev_va != va_page {
+        PTE_CHANGE_DISPLACED.fetch_add(1, Ordering::Relaxed);
+    }
+    let rip_low32 = caller_rip & 0xFFFF_FFFF;
+    let cr3_low16 = (cr3 >> 12) & 0xFFFF;
+    let packed = (rip_low32 << 32) | (cr3_low16 << 16) | (cpu << 8) | (kind as u64);
+    slot.va.store(va_page, Ordering::Relaxed);
+    slot.tick.store(tick, Ordering::Relaxed);
+    slot.new_phys.store(new_phys & !0xFFFu64, Ordering::Relaxed);
+    slot.old_phys.store(old_phys & !0xFFFu64, Ordering::Relaxed);
+    slot.packed.store(packed, Ordering::Relaxed);
+    slot.tid.store(tid as u64, Ordering::Relaxed);
+    PTE_CHANGE_RECORDED.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+fn pte_kind_str(k: u8) -> &'static str {
+    match k {
+        PTE_KIND_MAP => "MAP",
+        PTE_KIND_UNMAP => "UNMAP",
+        PTE_KIND_WRITE => "WRITE",
+        PTE_KIND_BULK_UNMAP => "BULK_UNMAP",
+        PTE_KIND_FORK_CLONE => "FORK_CLONE",
+        _ => "?",
+    }
+}
+
+/// Emit the most-recent PTE-change entry for the (4 KiB-aligned) `va` as a
+/// single `[FAULT/STACK-PTE]` serial line.  Used by the SSP-DIAG-PROV
+/// extension and (later, optionally) by the FAULT/PHYS dump.  Returns the
+/// recorded `old_phys` (pre-change PTE phys) so the caller can dump the
+/// FREE_SHADOW / ALLOC_SHADOW entries for that prior frame.  Returns `0`
+/// when the slot is empty or the lookup fell outside the user-stack window.
+pub fn dump_pte_change_for_va(va: u64) -> u64 {
+    let slot = match pte_ring_slot(va) {
+        Some(s) => s,
+        None => {
+            crate::serial_println!(
+                "[FAULT/STACK-PTE] va={:#x} hit=0 reason=out_of_window",
+                va,
+            );
+            return 0;
+        }
+    };
+    let va_page = va & !0xFFFu64;
+    let stored_va = slot.va.load(Ordering::Relaxed);
+    let recorded = PTE_CHANGE_RECORDED.load(Ordering::Relaxed);
+    let displaced = PTE_CHANGE_DISPLACED.load(Ordering::Relaxed);
+    if stored_va != va_page {
+        crate::serial_println!(
+            "[FAULT/STACK-PTE] va={:#x} hit=0 stored_va={:#x} \
+             totals=(recorded={},displaced={})",
+            va_page, stored_va, recorded, displaced,
+        );
+        return 0;
+    }
+    let tick = slot.tick.load(Ordering::Relaxed);
+    let new_phys = slot.new_phys.load(Ordering::Relaxed);
+    let old_phys = slot.old_phys.load(Ordering::Relaxed);
+    let packed = slot.packed.load(Ordering::Relaxed);
+    let tid = slot.tid.load(Ordering::Relaxed);
+    let kind = (packed & 0xFF) as u8;
+    let cpu = ((packed >> 8) & 0xFF) as u8;
+    let cr3_low16 = (packed >> 16) & 0xFFFF;
+    let rip_low32 = (packed >> 32) & 0xFFFF_FFFF;
+    let now_tick = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+    let age_ticks = now_tick.saturating_sub(tick);
+    crate::serial_println!(
+        "[FAULT/STACK-PTE] va={:#x} hit=1 kind={} tick={} age_ticks={} \
+         new_phys={:#x} old_phys={:#x} tid={} cpu={} \
+         caller_rip_low32={:#x} cr3_low16={:#x} \
+         totals=(recorded={},displaced={})",
+        va_page, pte_kind_str(kind), tick, age_ticks,
+        new_phys, old_phys, tid, cpu,
+        rip_low32, cr3_low16,
+        recorded, displaced,
+    );
+    old_phys
+}
+
+/// Read PTE-change-ring counters for kdb introspection.
+pub fn pte_change_recorded_count() -> u64 {
+    PTE_CHANGE_RECORDED.load(Ordering::Relaxed)
+}
+pub fn pte_change_displaced_count() -> u64 {
+    PTE_CHANGE_DISPLACED.load(Ordering::Relaxed)
+}
+
+// ── ALLOC_SHADOW (symmetric to FREE_SHADOW) ─────────────────────────────────
+//
+// Direct-addressed by `pfn % ALLOC_SHADOW_SIZE`; records the most recent
+// `pmm::alloc_page_locked` event for that pfn (caller-RIP, tick).  Combined
+// with FREE_SHADOW (Phase D) this lets Track K reconstruct the "was this
+// phys handed out between prologue and epilogue?" timeline for the foreign
+// frame backing the canary slot at fault time.
+//
+// 4 Ki entries × 24 B = 96 KiB BSS, gated on `firefox-test` (the module).
+// The kernel-image bss_end must stay below the heap start at
+// `phys 0x80_0000` (8 MiB) — see `mm/heap.rs::HEAP_START` and the
+// `pmm::reserve_range` call in `mm/vmm.rs::init`.  Phase D's FREE_SHADOW
+// (1.5 MiB) consumed most of the headroom that remained after the kernel
+// .text/.data sections, so ALLOC_SHADOW is intentionally sized at 1/16th
+// of FREE_SHADOW.  A 4 Ki direct-mapped table hashes 64 frames per slot
+// in a 1 GiB QEMU configuration; the typical *most-recent* alloc working
+// set in the firefox-test sc≈1233 window is well under 4 Ki frames, so
+// per-slot collisions are exceptional.  When a collision occurs,
+// `ALLOC_SHADOW_DISPLACED` ticks, and a downstream operator can fall
+// back to the hashed `PROV_TABLE` ring for residual alloc history.
+//
+// Per Intel SDM Vol. 3A §4.6 (paging-structure cache hierarchy), the
+// direct-map at `PHYS_OFF + 0x80_0000` backs the linked-list allocator's
+// arena — any BSS overlap would corrupt the very first 224-byte heap
+// allocation (the boot-time ATA driver init), which is precisely what
+// happens when Track K's BSS pushes total BSS past 8 MiB.  Keep this
+// constant small.
+
+const ALLOC_SHADOW_SIZE: usize = 4096;
+
+#[repr(C)]
+struct AllocShadowEntry {
+    phys: AtomicU64,
+    tick: AtomicU64,
+    caller_rip: AtomicU64,
+}
+
+impl AllocShadowEntry {
+    const fn new() -> Self {
+        Self {
+            phys: AtomicU64::new(0),
+            tick: AtomicU64::new(0),
+            caller_rip: AtomicU64::new(0),
+        }
+    }
+}
+
+struct AllocShadow {
+    slots: [AllocShadowEntry; ALLOC_SHADOW_SIZE],
+}
+
+impl AllocShadow {
+    const fn new() -> Self {
+        const E: AllocShadowEntry = AllocShadowEntry::new();
+        Self { slots: [E; ALLOC_SHADOW_SIZE] }
+    }
+}
+
+static ALLOC_SHADOW: AllocShadow = AllocShadow::new();
+
+static ALLOC_SHADOW_RECORDED: AtomicU64 = AtomicU64::new(0);
+static ALLOC_SHADOW_DISPLACED: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn alloc_shadow_slot(phys: u64) -> &'static AllocShadowEntry {
+    let pfn = (phys >> 12) as usize;
+    &ALLOC_SHADOW.slots[pfn & (ALLOC_SHADOW_SIZE - 1)]
+}
+
+/// Record an alloc event in the direct-addressed shadow.  Called by
+/// `pmm::alloc_page_locked` immediately after `mark_page_used` succeeds.
+///
+/// To keep per-entry storage at 24 B (matching FREE_SHADOW) and BSS within
+/// the heap-overlap budget (see comment block above), this function does
+/// NOT record per-event TID or CPU.  The recording tick lets a downstream
+/// operator cross-reference the `[HB]` heartbeat lines (which carry CPU
+/// affinity) when needed.
+#[inline]
+pub fn alloc_shadow_record(phys: u64, caller_rip: u64) {
+    if phys == 0 { return; }
+    let slot = alloc_shadow_slot(phys);
+    let prev_phys = slot.phys.load(Ordering::Relaxed);
+    if prev_phys != 0 && prev_phys != phys {
+        ALLOC_SHADOW_DISPLACED.fetch_add(1, Ordering::Relaxed);
+    }
+    let tick = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+    slot.phys.store(phys, Ordering::Relaxed);
+    slot.tick.store(tick, Ordering::Relaxed);
+    slot.caller_rip.store(caller_rip, Ordering::Relaxed);
+    ALLOC_SHADOW_RECORDED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Look up the most-recent alloc recorded for `phys`.  Returns
+/// `(tick, caller_rip)` if the entry's phys still matches.
+#[inline]
+pub fn alloc_shadow_lookup(phys: u64) -> Option<(u64, u64)> {
+    if phys == 0 { return None; }
+    let slot = alloc_shadow_slot(phys);
+    let p = slot.phys.load(Ordering::Relaxed);
+    if p != phys { return None; }
+    let tick = slot.tick.load(Ordering::Relaxed);
+    let rip = slot.caller_rip.load(Ordering::Relaxed);
+    Some((tick, rip))
+}
+
+/// Diagnostic dump: emit the alloc-shadow entry for `phys` as a single
+/// `[FAULT/PHYS/ALLOCSHADOW]` serial line.  Format mirrors FREESHADOW for
+/// grep-symmetry.
+pub fn dump_alloc_shadow_for_phys(phys: u64) {
+    let now_tick = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+    let recorded = ALLOC_SHADOW_RECORDED.load(Ordering::Relaxed);
+    let displaced = ALLOC_SHADOW_DISPLACED.load(Ordering::Relaxed);
+    match alloc_shadow_lookup(phys) {
+        Some((tick, rip)) => {
+            let age_ticks = now_tick.saturating_sub(tick);
+            crate::serial_println!(
+                "[FAULT/PHYS/ALLOCSHADOW] phys={:#x} hit=1 alloc_tick={} \
+                 age_ticks={} caller_rip={:#x} \
+                 totals=(recorded={},displaced={})",
+                phys, tick, age_ticks, rip,
+                recorded, displaced,
+            );
+        }
+        None => {
+            crate::serial_println!(
+                "[FAULT/PHYS/ALLOCSHADOW] phys={:#x} hit=0 \
+                 totals=(recorded={},displaced={})",
+                phys, recorded, displaced,
+            );
+        }
+    }
+}
+
+/// Read alloc-shadow counters for kdb introspection.
+pub fn alloc_shadow_recorded_count() -> u64 {
+    ALLOC_SHADOW_RECORDED.load(Ordering::Relaxed)
+}
+pub fn alloc_shadow_displaced_count() -> u64 {
+    ALLOC_SHADOW_DISPLACED.load(Ordering::Relaxed)
+}

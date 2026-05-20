@@ -317,6 +317,19 @@ unsafe fn alloc_page_locked() -> Option<u64> {
                         crate::mm::w215_diag::prov_record(
                             phys, crate::mm::w215_diag::KIND_ALLOC, 0,
                         );
+                        // Track K (2026-05-20): record the alloc in the
+                        // direct-addressed ALLOC_SHADOW alongside the hashed
+                        // ring above.  Symmetric to `free_shadow_record`
+                        // (Phase D); together they reconstruct the
+                        // FREE→ALLOC chain for a specific phys (per Intel
+                        // SDM Vol. 3A §4.10.5 the most-recent alloc is the
+                        // upstream of any use-after-recycle observable at
+                        // the current rip_phys).
+                        #[cfg(feature = "firefox-test")]
+                        {
+                            let rip = caller_rip();
+                            crate::mm::w215_diag::alloc_shadow_record(phys, rip);
+                        }
                         // H1 diagnostic: check whether this frame still
                         // carries a live refcount — a mismatch between the
                         // PMM bitmap (free) and the refcount table (in-use).
