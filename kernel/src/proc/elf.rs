@@ -93,6 +93,20 @@ const DT_RELRENT: u64 = 37;
 const DT_GNU_HASH: u64 = 0x6ffffef5;
 /// Dynamic section tag: end of dynamic array
 const DT_NULL: u64 = 0;
+/// Dynamic section tag: address of the legacy single initialiser function
+/// (ELF gABI §5.7 / System V AMD64 ABI §3.3.3 — `_init`).
+const DT_INIT: u64 = 12;
+/// Dynamic section tag: virtual address of the function-pointer array of
+/// constructor entries that the dynamic linker invokes after relocations
+/// (ELF gABI §5.7 / glibc `_dl_init`).
+const DT_INIT_ARRAY: u64 = 25;
+/// Dynamic section tag: total byte size of DT_INIT_ARRAY.
+const DT_INIT_ARRAYSZ: u64 = 27;
+/// Dynamic section tag: virtual address of the preinit function-pointer array
+/// (executable image only — runs before any constructor in DT_INIT_ARRAY).
+const DT_PREINIT_ARRAY: u64 = 32;
+/// Dynamic section tag: total byte size of DT_PREINIT_ARRAY.
+const DT_PREINIT_ARRAYSZ: u64 = 33;
 
 /// ELF type: dynamically-linked shared object / PIE
 const ET_DYN: u16 = 3;
@@ -503,6 +517,168 @@ fn parse_dynamic_for_relr(
     (relr_file_off, relr_sz as usize, has_gnu_hash)
 }
 
+/// ── [ELF/INIT-ARRAY] diagnostic helper (feature-gated, byte-identical off) ──
+///
+/// Per ELF gABI §5.7 and System V AMD64 ABI §3.3.3, the dynamic linker invokes
+/// DT_PREINIT_ARRAY → DT_INIT → DT_INIT_ARRAY after relocations.  We emit one
+/// `[ELF/INIT-ARRAY]` line per kernel-side ELF load with those addresses plus
+/// the first four DT_INIT_ARRAY fn_ptr CONTENTS (read through `mapped_pages`),
+/// each fn_ptr's backing physical frame and W215 `pte_share_count` (PR #270).
+/// NULL / non-text fn_ptrs → constructor table never relocated; plausible
+/// text-range values → fault is post-init.  Diagnostic only.
+#[cfg(feature = "elf-init-array-diag")]
+const ELF_INIT_ARRAY_DIAG_MAX: u32 = 8;
+
+#[cfg(feature = "elf-init-array-diag")]
+static ELF_INIT_ARRAY_DIAG_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Read the u64 at runtime VA `va` via `mapped_pages` (page_va → phys lookup
+/// + direct-map deref).  DT_INIT_ARRAY entries are 8-byte aligned per System
+/// V AMD64 ABI §3.4 so cross-page reads are guarded only defensively.
+#[cfg(feature = "elf-init-array-diag")]
+fn read_u64_from_mapped(mapped_pages: &[(u64, u64)], va: u64) -> Option<u64> {
+    let page_va = va & !0xFFF;
+    let off = (va & 0xFFF) as usize;
+    if off + 8 > 0x1000 { return None; }
+    for &(pv, phys) in mapped_pages {
+        if pv == page_va {
+            // SAFETY: `phys` is a PMM-backed page mapped into the direct map;
+            // `off + 8 <= PAGE_SIZE` by the boundary check above.
+            let v = unsafe {
+                core::ptr::read(phys_to_virt(phys).add(off) as *const u64)
+            };
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Emit `[ELF/INIT-ARRAY] binary=<tag> ...` for a freshly-loaded ELF.  Bounded
+/// to `ELF_INIT_ARRAY_DIAG_MAX` images per boot (then a single OVERFLOW line).
+#[cfg(feature = "elf-init-array-diag")]
+fn emit_init_array_diag(
+    data: &[u8],
+    header: &Elf64Header,
+    load_bias: u64,
+    mapped_pages: &[(u64, u64)],
+    tag: &str,
+) {
+    use core::sync::atomic::Ordering;
+    let prev = ELF_INIT_ARRAY_DIAG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if prev >= ELF_INIT_ARRAY_DIAG_MAX {
+        if prev == ELF_INIT_ARRAY_DIAG_MAX {
+            crate::serial_println!("[ELF/INIT-ARRAY] OVERFLOW cap={}", ELF_INIT_ARRAY_DIAG_MAX);
+        }
+        return;
+    }
+
+    let ph_off  = header.e_phoff as usize;
+    let ph_sz   = header.e_phentsize as usize;
+    let ph_cnt  = header.e_phnum as usize;
+    let mut dyn_off: usize = 0;
+    let mut dyn_sz:  usize = 0;
+    for i in 0..ph_cnt {
+        let base = ph_off + i * ph_sz;
+        if base + ph_sz > data.len() { continue; }
+        let phdr = unsafe { &*(data.as_ptr().add(base) as *const Elf64Phdr) };
+        if phdr.p_type == PT_DYNAMIC {
+            dyn_off = phdr.p_offset as usize;
+            dyn_sz  = phdr.p_filesz as usize;
+            break;
+        }
+    }
+    if dyn_sz == 0 || dyn_off + dyn_sz > data.len() {
+        crate::serial_println!(
+            "[ELF/INIT-ARRAY] binary={} no_pt_dynamic bias={:#x}", tag, load_bias
+        );
+        return;
+    }
+
+    // Walk DT_ entries.  Stored values for DT_INIT / DT_INIT_ARRAY /
+    // DT_PREINIT_ARRAY are link-time VAs; runtime VA = link-time VA + bias.
+    let n = dyn_sz / 16;
+    let mut dt_init_lva:       u64 = 0;
+    let mut init_array_lva:    u64 = 0;
+    let mut init_array_sz:     u64 = 0;
+    let mut preinit_lva:       u64 = 0;
+    let mut preinit_sz:        u64 = 0;
+    for i in 0..n {
+        let base = dyn_off + i * 16;
+        if base + 16 > data.len() { break; }
+        let e = unsafe { &*(data.as_ptr().add(base) as *const Elf64Dyn) };
+        match e.d_tag {
+            DT_NULL            => break,
+            DT_INIT            => dt_init_lva       = e.d_val,
+            DT_INIT_ARRAY      => init_array_lva    = e.d_val,
+            DT_INIT_ARRAYSZ    => init_array_sz     = e.d_val,
+            DT_PREINIT_ARRAY   => preinit_lva       = e.d_val,
+            DT_PREINIT_ARRAYSZ => preinit_sz        = e.d_val,
+            _ => {}
+        }
+    }
+
+    let init_array_va    = if init_array_lva != 0 { init_array_lva.wrapping_add(load_bias) } else { 0 };
+    let preinit_array_va = if preinit_lva    != 0 { preinit_lva.wrapping_add(load_bias) }    else { 0 };
+    let dt_init_va       = if dt_init_lva    != 0 { dt_init_lva.wrapping_add(load_bias) }    else { 0 };
+
+    // Read up to four fn_ptrs from DT_INIT_ARRAY, resolve each VA's backing
+    // physical frame, sample the W215 pte_share_count invariant from PR #270.
+    let mut fns: [u64; 4] = [0; 4];
+    let mut fn_phys: [u64; 4] = [0; 4];
+    let mut fn_share: [u16; 4] = [0; 4];
+    let mut fn_count: usize = 0;
+    if init_array_va != 0 && init_array_sz >= 8 {
+        let max = core::cmp::min(4, (init_array_sz / 8) as usize);
+        for j in 0..max {
+            let slot_va = init_array_va.wrapping_add((j as u64) * 8);
+            match read_u64_from_mapped(mapped_pages, slot_va) {
+                Some(v) => {
+                    fns[j] = v;
+                    if v != 0 {
+                        let page_va = v & !0xFFF;
+                        for &(pv, phys) in mapped_pages {
+                            if pv == page_va {
+                                fn_phys[j]  = phys;
+                                fn_share[j] = crate::mm::refcount::pte_share_count(phys);
+                                break;
+                            }
+                        }
+                    }
+                    fn_count = j + 1;
+                }
+                None => break,
+            }
+        }
+    }
+
+    // Emit on one serial line.  Use a single println! to avoid interleaving
+    // across CPUs (the SMP-safe `serial_println!` already serialises one call).
+    crate::serial_println!(
+        "[ELF/INIT-ARRAY] binary={} bias={:#x} init_array_va={:#x} sz={} \
+         fn_ptr[0]={:#x} phys[0]={:#x} sc[0]={} \
+         fn_ptr[1]={:#x} phys[1]={:#x} sc[1]={} \
+         fn_ptr[2]={:#x} phys[2]={:#x} sc[2]={} \
+         fn_ptr[3]={:#x} phys[3]={:#x} sc[3]={} \
+         n_read={} preinit_array_va={:#x} preinit_sz={} dt_init_va={:#x}",
+        tag, load_bias, init_array_va, init_array_sz,
+        fns[0], fn_phys[0], fn_share[0],
+        fns[1], fn_phys[1], fn_share[1],
+        fns[2], fn_phys[2], fn_share[2],
+        fns[3], fn_phys[3], fn_share[3],
+        fn_count, preinit_array_va, preinit_sz, dt_init_va,
+    );
+}
+
+/// Build-time no-op when feature is disabled — keeps default builds byte-
+/// identical to master.
+#[cfg(not(feature = "elf-init-array-diag"))]
+#[inline(always)]
+fn emit_init_array_diag(
+    _data: &[u8], _header: &Elf64Header, _load_bias: u64,
+    _mapped_pages: &[(u64, u64)], _tag: &str,
+) {}
+
 /// Validate and parse an ELF64 header.
 ///
 /// Accepts both ET_EXEC (non-PIE) and ET_DYN (PIE) executables.
@@ -794,6 +970,16 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
     if !has_load {
         return Err(ElfError::NoLoadSegments);
     }
+
+    // ── [ELF/INIT-ARRAY] diagnostic (D1 framing-falsifier) ──────────────
+    // ELF gABI §5.7: dynamic linker invokes DT_PREINIT_ARRAY → DT_INIT →
+    // DT_INIT_ARRAY after relocations.  Emit the constructor-table VAs +
+    // first four fn_ptrs (resolved through `mapped_pages` while the image
+    // is hot) so post-mortem diagnostics can distinguish "constructor
+    // table never relocated" from "constructors ran, fault is elsewhere".
+    // Feature-gated; default builds remain byte-identical.
+    let _diag_tag = if interp_path.is_some() { "main" } else { "main-static" };
+    emit_init_array_diag(data, header, pie_bias, &mapped_pages, _diag_tag);
 
     // ── Apply DT_RELR packed relative relocations (PIE + ASLR) ─────────
     //
@@ -1493,6 +1679,13 @@ fn load_elf_dyn(
             }
         }
     }
+
+    // ── [ELF/INIT-ARRAY] diagnostic for the interpreter image ───────────
+    // ld-musl / ld-linux is itself an ET_DYN with its own DT_INIT_ARRAY
+    // (`_dl_init` family); record the constructor-table addresses + first
+    // four fn_ptrs as loaded.  Per ELF gABI §5.7 the interpreter's own
+    // bootstrap (`_dl_start`) drives these — the kernel never invokes them.
+    emit_init_array_diag(data, header, bias, &mapped_pages, "interp");
 
     // ── DT_RELR for the interpreter: DO NOT apply from the kernel ───────
     //
