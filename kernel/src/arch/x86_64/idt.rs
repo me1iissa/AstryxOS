@@ -746,6 +746,11 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
                 unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3_now, options(nomem, nostack, preserves_flags)); }
                 let pid = crate::proc::current_pid_lockless();
                 crate::signal::emit_fault_phys_for_fatal(pid, frame.rip, cr2, cr3_now);
+                // PSE 2026-05-20: full VMA enumeration to anchor PIE-ASLR
+                // bases (libxul, ld-musl, anonymous JIT) at fatal-user-#PF
+                // time.  Bounded 4 dumps/boot; see `mm::vma_dump`.
+                #[cfg(feature = "vma-dump-on-gp")]
+                crate::mm::vma_dump::dump_for_fault(pid, cr3_now);
             }
             // POSIX signal(7): the default action for SIGSEGV is "terminate
             // the process (core dump)" — the entire thread group, not just
@@ -1070,6 +1075,11 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
             unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3_now, options(nomem, nostack, preserves_flags)); }
             let pid = crate::proc::current_pid_lockless();
             crate::signal::emit_fault_phys_for_fatal(pid, frame.rip, 0, cr3_now);
+            // PSE 2026-05-20: full VMA enumeration to anchor PIE-ASLR
+            // bases (libxul, ld-musl, anonymous JIT) at fatal-user-#UD /
+            // #GP / #AC time.  Bounded 4 dumps/boot; see `mm::vma_dump`.
+            #[cfg(feature = "vma-dump-on-gp")]
+            crate::mm::vma_dump::dump_for_fault(pid, cr3_now);
         }
         // POSIX signal(7): synchronous fatal CPU exceptions in user mode
         // (#DE → SIGFPE, #UD → SIGILL, #DF / #SS / #GP / #AC / #MC → SIGBUS|SIGSEGV)
