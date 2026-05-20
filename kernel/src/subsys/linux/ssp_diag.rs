@@ -1,14 +1,21 @@
 //! SSP-canary divergence diagnostic.
 //!
-//! Fires once per `#GP` taken from CPL 3 at the publicly-exported musl
-//! `__stack_chk_fail` two-byte `hlt;ret` stub (ld-musl-x86_64.so.1 +
-//! `0x1c7f9`, per the musl ldso `.dynsym`).  When the trap matches, the
-//! hook emits three diagnostic lines:
+//! Fires once per `#GP` taken from CPL 3 at a two-byte `hlt; ret` stub
+//! inside the user-mode `ld-musl-x86_64.so.1` mapping.  This is the
+//! shape of musl's publicly-exported `__stack_chk_fail` symbol (2-byte
+//! body — opcode `0xF4 0xC3`).  When the trap matches, the hook emits
+//! three diagnostic lines:
 //!
 //!   1. `[SSP-DIAG] match=1 pid=… tid=… cpu=… rip=… ld_musl_base=…
-//!      vma_offset=0x1c7f9 fs_base=… fs28_addr=… fs28_val=… fs28_phys=…`
+//!      vma_offset=… fs_base=… fs28_addr=… fs28_val=… fs28_phys=…`
 //!      — IA32_FS_BASE MSR (Intel SDM Vol. 3A §3.4.4.1) and the master
 //!      canary at `*(fs_base + 0x28)` per x86_64 psABI §6.4 TLS variant II.
+//!      `vma_offset` is the *load-relative* offset (`rip - vma.base`),
+//!      which is NOT the same as the symbol's file offset in the ELF
+//!      image because `PT_LOAD` entries can place `.text` at a non-zero
+//!      `p_offset` with `p_vaddr = 0` (per SysV gABI / `elf(5)`).  This
+//!      is precisely why this diagnostic gates on instruction-byte
+//!      content rather than a hard-coded offset.
 //!
 //!   2. `[SSP-DIAG-CANARY] caller_rsp=… saved_canary=…  saved_canary_phys=…
 //!      ax_at_gp=…  ax_eq_fs28={0|1}`
@@ -85,12 +92,22 @@ extern crate alloc;
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-/// Publicly-exported musl `__stack_chk_fail` offset in
-/// `ld-musl-x86_64.so.1`.  Per the musl ldso `.dynsym` for musl-1.2.x:
-/// the symbol is a two-byte stub `hlt; ret` placed between
-/// `__libc_start_main` and `clearenv`.  The `hlt` from CPL 3 raises
-/// `#GP` (Intel SDM Vol. 3A §6.15) with `RIP = ld_musl_base + 0x1c7f9`.
-const SSP_FAIL_VMA_OFFSET: u64 = 0x1c7f9;
+/// musl `__stack_chk_fail` body — `hlt; ret` = 2 bytes / opcodes
+/// `0xF4 0xC3` (Intel SDM Vol. 2A — `HLT` / `RET`).  Executing `HLT`
+/// from CPL 3 raises `#GP` (Intel SDM Vol. 3A §6.15).  This diagnostic
+/// classifies a `#GP` as "SSP fail" by READING the two bytes at
+/// `rip` (load-relative; safe through the kernel direct map) and
+/// requiring `[0xF4, 0xC3]`.
+///
+/// Note on what we deliberately do NOT use: the symbol's *file offset*
+/// inside `ld-musl-x86_64.so.1` (currently `0x1c7f9`).  A `PT_LOAD`
+/// segment may map a file offset `p_offset` at a load-relative VA of
+/// `p_vaddr` (SysV gABI / `elf(5)`); for ld-musl the text segment is
+/// loaded with `p_offset = 0x14000, p_vaddr = 0x0`, so the load-relative
+/// VMA offset of `__stack_chk_fail` is `0x1c7f9 - 0x14000 = 0x87f9` —
+/// NOT `0x1c7f9`.  A future musl rebuild can shift either side.  The
+/// `HLT; RET` byte sequence is far more robust.
+const SSP_FAIL_OPCODES: [u8; 2] = [0xF4, 0xC3];
 
 /// Size of musl `__stack_chk_fail` — `hlt; ret` = 2 bytes.
 const SSP_FAIL_STUB_SIZE: u64 = 2;
@@ -114,6 +131,13 @@ const SSP_DIAG_MAX: u32 = 8;
 
 /// Per-boot emission counter.
 static SSP_DIAG_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Independent per-boot cap on `[SSP-DIAG] reject` lines so a verifier
+/// can distinguish "hook never reached the precondition" from "hook
+/// reached but content gate said no".  Bounded so a bad-RIP storm
+/// cannot flood the serial log.
+const SSP_REJECT_MAX: u32 = 4;
+static SSP_REJECT_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Lowest valid user-VA for ld-musl base sanity (matches the
 /// kernel-wide convention; rejects 0 / kernel half).  See
@@ -143,6 +167,41 @@ fn read_user_qword(addr: u64) -> Option<(u64, u64)> {
     Some((val, phys))
 }
 
+/// Read N bytes (N ≤ 8) from a user VA through the kernel direct map,
+/// rejecting cross-page straddles.  Returns `Err(CrossPage)` so the
+/// caller can emit a specific rejection reason.  Same fault-immune
+/// path as [`read_user_qword`].
+#[derive(Copy, Clone)]
+enum SspReadErr {
+    Invalid,
+    CrossPage,
+}
+
+fn read_user_bytes2(addr: u64) -> Result<[u8; 2], SspReadErr> {
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    if !crate::syscall::validate_user_ptr(addr, 2) {
+        return Err(SspReadErr::Invalid);
+    }
+    // 2-byte read straddles only when `addr & 0xFFF == 0xFFF`.
+    if (addr & 0xFFF) > 0x1000 - 2 {
+        return Err(SspReadErr::CrossPage);
+    }
+    let cr3 = crate::mm::vmm::get_cr3();
+    let phys = crate::mm::vmm::virt_to_phys_in(cr3, addr)
+        .ok_or(SspReadErr::Invalid)?;
+    let p = (PHYS_OFF + phys) as *const u8;
+    let b0 = unsafe { core::ptr::read_volatile(p) };
+    let b1 = unsafe { core::ptr::read_volatile(p.add(1)) };
+    Ok([b0, b1])
+}
+
+/// Reserve a rejection-log slot.  Same shape as [`reserve_slot`] but
+/// against the independent `SSP_REJECT_COUNT` budget.
+fn reserve_reject_slot() -> bool {
+    let n = SSP_REJECT_COUNT.fetch_add(1, Ordering::Relaxed);
+    n < SSP_REJECT_MAX
+}
+
 /// Resolve the base VA of the `ld-musl-x86_64.so.1` text mapping that
 /// covers `rip`.  Looks up the per-process VMA list under a
 /// `try_lock()` so the hook never blocks the trap path.  Accepts any
@@ -155,7 +214,20 @@ fn read_user_qword(addr: u64) -> Option<(u64, u64)> {
 /// this is generous).
 fn resolve_ld_musl_base(rip: u64) -> Option<u64> {
     let pid = crate::proc::current_pid_lockless();
-    let procs = crate::proc::PROCESS_TABLE.try_lock()?;
+    let procs = match crate::proc::PROCESS_TABLE.try_lock() {
+        Some(g) => g,
+        None => {
+            // PR #338 N1 MED: emit a one-shot marker so a verifier can
+            // distinguish "VMA lookup deadlock-averted" from "no match".
+            if reserve_reject_slot() {
+                crate::serial_println!(
+                    "[SSP-DIAG] reject reason=lock_busy rip={:#x}",
+                    rip,
+                );
+            }
+            return None;
+        }
+    };
     let proc_entry = procs.iter().find(|p| p.pid == pid)?;
     let vm_space = proc_entry.vm_space.as_ref()?;
     let vma = vm_space.find_vma(rip)?;
@@ -226,8 +298,47 @@ pub fn probe_gp_at_ssp_fail(
         None => return, // not an ld-musl trap; quiet
     };
     let vma_offset = rip.wrapping_sub(ld_musl_base);
-    if vma_offset != SSP_FAIL_VMA_OFFSET {
-        return;
+
+    // Content gate: require the 2 bytes at RIP to be `HLT; RET`
+    // (`0xF4 0xC3`) — the musl `__stack_chk_fail` body.  This is
+    // robust to PT_LOAD-driven offset shifts (SysV gABI / `elf(5)`)
+    // and to future musl rebuilds that move the symbol.  Reads go
+    // through the same fault-immune direct-map path used elsewhere
+    // in this file (PR #333).
+    let cs_user = 1u8; // hook is only called from CPL 3 #GP; recorded for logs.
+    match read_user_bytes2(rip) {
+        Ok(bytes) => {
+            if bytes != SSP_FAIL_OPCODES {
+                if reserve_reject_slot() {
+                    crate::serial_println!(
+                        "[SSP-DIAG] reject reason=bytes \
+                         rip={:#x} bytes={:02x} {:02x} cs={} vma_offset={:#x}",
+                        rip, bytes[0], bytes[1], cs_user, vma_offset,
+                    );
+                }
+                return;
+            }
+        }
+        Err(SspReadErr::CrossPage) => {
+            if reserve_reject_slot() {
+                crate::serial_println!(
+                    "[SSP-DIAG] reject reason=cross_page \
+                     rip={:#x} cs={} vma_offset={:#x}",
+                    rip, cs_user, vma_offset,
+                );
+            }
+            return;
+        }
+        Err(SspReadErr::Invalid) => {
+            if reserve_reject_slot() {
+                crate::serial_println!(
+                    "[SSP-DIAG] reject reason=read_invalid \
+                     rip={:#x} cs={} vma_offset={:#x}",
+                    rip, cs_user, vma_offset,
+                );
+            }
+            return;
+        }
     }
 
     if !reserve_slot() {
