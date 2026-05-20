@@ -184,6 +184,26 @@ elf-write-trace = ["w215-diag", "firefox-test"]
 # safe in a soak loop.  See POSIX sigaction(2), Intel SDM Vol. 3A §6.15
 # (#GP) + §3.4.4.1 (IA32_FS_BASE), System V AMD64 ABI §6.4.
 ssp-canary-diag = ["firefox-test"]
+# Live `__clone` pthread-args smoking-gun diagnostic.  At each successful
+# pthread-create-shape clone(2)/clone3(2) the kernel records the args
+# struct VA, its backing physical frame, and the pre-call values of
+# start_routine + arg into a 16-entry ring keyed by (pid, tid).  On a
+# later CPL-3 #GP the trap is looked up against the ring and:
+#   * `[CLONE-CHECK]` fires for every matched trap regardless of
+#     start_routine value (framing-falsifier; phys-frame variance
+#     distinguishes F2 mid-flight aliasing — W215 axis-N per PR #270 —
+#     from F1 pre-clone userspace corruption).
+#   * `[CLONE-SMOKING-GUN]` fires when start_routine == trap RIP, the
+#     dispositive observable for the inner musl thread-start trampoline's
+#     indirect-call corrupted-fptr framing per tech-lead cross-walk
+#     verdict 2026-05-20.  (Per upstream musl libc x86_64 __clone, the
+#     args struct VA the kernel captures lives at `*new_stack` — rsi was
+#     biased by `sub $8` before the syscall.)
+# Bounded to 4 emissions per category per boot.  Default builds are
+# byte-identical when this feature is off.  See POSIX pthread_create(3),
+# clone(2), clone3(2); AMD64 SysV ABI §3.4 calling convention; Intel SDM
+# Vol. 3A §6.15 (`#GP`), Vol. 2A (HLT/RET).
+clone-args-diag = ["firefox-test"]
 # LLVM source-based code-coverage instrumentation (test-coverage audit
 # session 5 / docs/TEST_COVERAGE_AUDIT_2026-05-16.md).  When enabled, the
 # kernel must additionally be built with `-C instrument-coverage` (see

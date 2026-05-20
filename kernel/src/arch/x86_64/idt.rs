@@ -396,6 +396,27 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
                     frame.rip, frame.rsp, rax_at_gp, user_rbp_at_gp,
                 );
             }
+
+            // ── CLONE-ARGS smoking-gun diagnostic ────────────────────────
+            // Looks up the trapping (pid, tid) against the per-boot
+            // clone-args ring populated at successful clone(2) /
+            // clone3(2) syscall exit.  Emits framing-falsifier observables
+            // distinguishing F1 (pre-clone userspace corruption — value
+            // was already `0x1c7f9`) from F2 (mid-flight kernel page
+            // aliasing — W215 axis-N continuation per PR #270 / PR #327)
+            // from F3 (no ring match — trap arrived by a different
+            // control-flow mechanism).  See clone_args_diag.rs module
+            // docstring + tech-lead cross-walk verdict 2026-05-20.
+            //
+            // Bounded (4 [CLONE-CHECK] + 4 [CLONE-SMOKING-GUN] per boot)
+            // and feature-gated so master builds are byte-identical.
+            //
+            // Refs: POSIX pthread_create(3), clone(2), clone3(2);
+            //       AMD64 SysV ABI §3.4; Intel SDM Vol. 3A §6.15.
+            #[cfg(feature = "clone-args-diag")]
+            crate::subsys::linux::clone_args_diag::probe_gp_clone_args(
+                frame.rip, frame.rsp,
+            );
         }
     }
 
