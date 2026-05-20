@@ -515,7 +515,23 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // to firefox-test's --headless --screenshot pipeline.
             const CMDLINE_MUSL:  &str = "/disk/usr/lib/firefox-esr/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png file:///tmp/hello.html";
             const CMDLINE_GLIBC: &str = "/disk/opt/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png file:///tmp/hello.html";
-            let cmdline = if crate::vfs::read_file("/disk/usr/lib/firefox-esr/firefox-bin").is_ok() {
+            // Use stat() (resolve_path + FileSystemOps::stat) for the existence
+            // probe instead of read_file().  read_file() allocates a Vec sized
+            // to the full file (~795 KB for firefox-bin), reads every byte, and
+            // inserts into FILE_READ_CACHE; any transient failure in that
+            // pipeline (short read, allocator pressure, cache lock contention)
+            // reports Err here even though the file is reachable.  POSIX
+            // stat(2) semantics: success iff the named file is reachable; no
+            // content is read.  Emit both probe results so future qa runs can
+            // see at a glance which build was chosen.
+            let musl_stat  = crate::vfs::stat("/disk/usr/lib/firefox-esr/firefox-bin");
+            let glibc_stat = crate::vfs::stat("/disk/opt/firefox/firefox-bin");
+            serial_println!(
+                "[FFTEST] FF binary probe: musl={:?} glibc={:?}",
+                musl_stat.as_ref().map(|s| s.size).map_err(|e| *e),
+                glibc_stat.as_ref().map(|s| s.size).map_err(|e| *e),
+            );
+            let cmdline = if musl_stat.is_ok() {
                 CMDLINE_MUSL
             } else {
                 CMDLINE_GLIBC
