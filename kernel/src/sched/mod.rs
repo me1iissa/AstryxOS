@@ -527,6 +527,24 @@ pub fn push_dead_stack_pub(stack_base_virt: u64) -> bool {
     push_dead_stack(stack_base_virt)
 }
 
+/// Test-only pop that bypasses the `DEAD_STACK_QUIESCE_TICKS` gate so a
+/// freshly-pushed entry can be popped in the same tick.  Behaves like
+/// `pop_dead_stack` but disregards `entry_is_quiesced`.
+///
+/// This exists for `test_runner::test_236_dead_stack_zeroing`, which pushes
+/// and pops in the same call frame to verify the zeroing contract — the
+/// quiescence gate would otherwise withhold the entry for ~20 ms and the
+/// test would deterministically fail under `--features test-mode`.
+///
+/// Production callers MUST use `pop_dead_stack`; the gate is load-bearing
+/// for closing the kstack-reuse-while-RSP-still-live race (PR #348).
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+pub fn pop_dead_stack_force() -> Option<u64> {
+    let mut cache = DEAD_STACK_CACHE.lock();
+    if cache.is_empty() { return None; }
+    Some(cache.remove(0).base)
+}
+
 /// Schedule the next thread to run.
 ///
 /// This is the core scheduling function. It:
