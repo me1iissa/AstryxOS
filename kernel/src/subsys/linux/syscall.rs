@@ -2563,22 +2563,33 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             }
             len as i64
         }
-        // 157: prctl(option, arg2, arg3, arg4, arg5)
+        // 157: prctl(option, arg2, arg3, arg4, arg5) — per `man 2 prctl`.
+        //
+        // Op numbers are stable Linux-UAPI constants from `<sys/prctl.h>` /
+        // `<linux/prctl.h>`; see prctl(2) for semantics.
         157 => {
+            const PR_SET_PDEATHSIG: u64         = 1;
+            const PR_GET_PDEATHSIG: u64         = 2;
+            const PR_GET_DUMPABLE: u64          = 3;
+            const PR_SET_DUMPABLE: u64          = 4;
+            const PR_GET_KEEPCAPS: u64          = 7;
+            const PR_SET_KEEPCAPS: u64          = 8;
             const PR_SET_NAME: u64              = 15;
             const PR_GET_NAME: u64              = 16;
-            const PR_SET_DUMPABLE: u64          = 4;
-            const PR_GET_DUMPABLE: u64          = 3;
-            const PR_SET_PDEATHSIG: u64         = 1;
+            const PR_GET_SECCOMP: u64           = 21;
+            const PR_SET_SECCOMP: u64           = 22;
+            const PR_CAPBSET_READ: u64          = 23;
+            const PR_CAPBSET_DROP: u64          = 24;
             const PR_SET_CHILD_SUBREAPER: u64   = 36;
             const PR_GET_CHILD_SUBREAPER: u64   = 37;
             const PR_SET_NO_NEW_PRIVS: u64      = 38;
             const PR_GET_NO_NEW_PRIVS: u64      = 39;
-            const PR_SET_SECCOMP: u64           = 22;
-            const PR_GET_SECCOMP: u64           = 21;
-            const PR_SET_KEEPCAPS: u64          = 8;
-            const PR_GET_KEEPCAPS: u64          = 7;
             const PR_CAP_AMBIENT: u64           = 47;
+            // Last capability number defined in Linux uapi/linux/capability.h
+            // 5.13 (CAP_CHECKPOINT_RESTORE = 40).  Per `capabilities(7)` and
+            // `prctl(2)` PR_CAPBSET_*: arguments outside 0..=CAP_LAST_CAP
+            // must return EINVAL.
+            const CAP_LAST_CAP: u64             = 40;
             match arg1 {
                 PR_SET_NAME => 0,   // ignore thread name
                 PR_GET_NAME => {
@@ -2592,7 +2603,70 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 }
                 PR_SET_DUMPABLE          => 0,
                 PR_GET_DUMPABLE          => 0,
-                PR_SET_PDEATHSIG         => 0,
+                // PR_SET_PDEATHSIG(sig): "Set the parent-death signal of the
+                // calling process to arg2 (either a signal value in the range
+                // 1..maxsig, or 0 to clear)."  Store on the per-process
+                // record; delivered by exit_group_inner() when the parent
+                // exits.  Cite: prctl(2) "PR_SET_PDEATHSIG (since Linux 2.1.57)".
+                PR_SET_PDEATHSIG         => {
+                    // Reject out-of-range signal numbers.
+                    if arg2 > crate::signal::MAX_SIGNAL as u64 {
+                        -22 // EINVAL
+                    } else {
+                        let pid = crate::proc::current_pid_lockless();
+                        let mut procs = crate::proc::PROCESS_TABLE.lock();
+                        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                            p.pdeath_signal = arg2 as u8;
+                        }
+                        0
+                    }
+                }
+                // PR_GET_PDEATHSIG(*intp): write the current pdeath signal into
+                // user-space.  We range-check the user pointer for the same
+                // reason as PR_GET_CHILD_SUBREAPER (SMAP AC=1 does not gate
+                // kernel-VA writes — see CWE-822 commentary on that arm).
+                PR_GET_PDEATHSIG         => {
+                    if arg2 != 0 {
+                        if !crate::syscall::user_ptr_check_bypassed()
+                            && !crate::syscall::validate_user_ptr(arg2, 4)
+                        {
+                            return -14; // EFAULT
+                        }
+                        let pid = crate::proc::current_pid_lockless();
+                        let procs = crate::proc::PROCESS_TABLE.lock();
+                        let sig = procs.iter()
+                            .find(|p| p.pid == pid)
+                            .map(|p| p.pdeath_signal as u32)
+                            .unwrap_or(0);
+                        unsafe {
+                            let _g = crate::arch::x86_64::smap::UserGuard::new();
+                            core::ptr::write_unaligned(arg2 as *mut u32, sig);
+                        }
+                    }
+                    0
+                }
+                // PR_CAPBSET_READ(cap): per capabilities(7), return 1 if the
+                // capability is in the calling thread's bounding set, 0 if
+                // not, -EINVAL if `cap` is invalid.  AstryxOS has no
+                // capability model — every process is effectively root —
+                // so we report all valid caps as present (1).  This makes
+                // the bwrap-style "while CAPBSET_READ(i); CAPBSET_DROP(i)"
+                // loop terminate cleanly after dropping all 41 caps.
+                PR_CAPBSET_READ          => {
+                    if arg2 > CAP_LAST_CAP { -22 } else { 1 }
+                }
+                // PR_CAPBSET_DROP(cap): per capabilities(7) and prctl(2),
+                // remove the capability from the bounding set.  AstryxOS
+                // has no capability bounding-set storage, so this is
+                // accept-and-return-0; validation matches Linux's
+                // input range check.
+                //
+                // Note: real Linux returns -EPERM if CAP_SETPCAP is not
+                // in the effective set, but bwrap and similar tools issue
+                // this as root and expect 0 — which we always return.
+                PR_CAPBSET_DROP          => {
+                    if arg2 > CAP_LAST_CAP { -22 } else { 0 }
+                }
                 PR_SET_CHILD_SUBREAPER   => 0, // stub: accept but no real subreaper support
                 PR_GET_CHILD_SUBREAPER   => {
                     // Report "not a subreaper".  Range-check the user

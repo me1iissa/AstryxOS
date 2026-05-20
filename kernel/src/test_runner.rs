@@ -12250,6 +12250,84 @@ fn test_bash_compat() -> bool {
         }
     }
 
+    // ─── 7a. prctl(PR_SET_SECCOMP=22, 2) — SECCOMP_MODE_FILTER ──────────────
+    // Per `man 2 prctl` (and seccomp(2)), MODE_FILTER expects a sock_fprog
+    // pointer in arg3.  AstryxOS does not interpret the BPF; FF's content
+    // process only needs the call to return 0 so its sandbox-init proceeds.
+    {
+        let r = dispatch(157, 22, 2, 0, 0, 0, 0);
+        if r == 0 {
+            test_println!("  prctl(PR_SET_SECCOMP, MODE_FILTER) → ok");
+        } else {
+            test_fail!("prctl PR_SET_SECCOMP MODE_FILTER", "r={}", r);
+            ok = false;
+        }
+    }
+
+    // ─── 7b. prctl(PR_CAPBSET_DROP=24, CAP_SYS_ADMIN=21) ────────────────────
+    // bwrap-style sandbox drops 41 caps in a loop; each call must succeed.
+    {
+        let r = dispatch(157, 24, 21, 0, 0, 0, 0);
+        if r == 0 {
+            test_println!("  prctl(PR_CAPBSET_DROP, CAP_SYS_ADMIN) → ok");
+        } else {
+            test_fail!("prctl PR_CAPBSET_DROP", "r={}", r);
+            ok = false;
+        }
+        // Out-of-range cap → -EINVAL per prctl(2).
+        let r_inv = dispatch(157, 24, 200, 0, 0, 0, 0);
+        if r_inv != -22 {
+            test_fail!("prctl PR_CAPBSET_DROP invalid",
+                "cap=200 returned {} (expected -22)", r_inv);
+            ok = false;
+        }
+    }
+
+    // ─── 7c. prctl(PR_CAPBSET_READ=23, cap) — every valid cap reports present
+    {
+        let r = dispatch(157, 23, 0, 0, 0, 0, 0); // CAP_CHOWN = 0
+        if r != 1 {
+            test_fail!("prctl PR_CAPBSET_READ",
+                "cap=0 returned {} (expected 1 — present)", r);
+            ok = false;
+        } else {
+            test_println!("  prctl(PR_CAPBSET_READ, CAP_CHOWN) → 1 (present)");
+        }
+        let r_inv = dispatch(157, 23, 200, 0, 0, 0, 0);
+        if r_inv != -22 {
+            test_fail!("prctl PR_CAPBSET_READ invalid",
+                "cap=200 returned {} (expected -22)", r_inv);
+            ok = false;
+        }
+    }
+
+    // ─── 7d. prctl(PR_SET_PDEATHSIG=1, SIGTERM=15) round-trip via PR_GET_PDEATHSIG=2
+    {
+        let r_set = dispatch(157, 1, 15, 0, 0, 0, 0);
+        if r_set != 0 {
+            test_fail!("prctl PR_SET_PDEATHSIG", "r={}", r_set);
+            ok = false;
+        }
+        let mut out: u32 = 0xDEADBEEF;
+        let r_get = dispatch(157, 2, &mut out as *mut u32 as u64, 0, 0, 0, 0);
+        if r_get != 0 || out != 15 {
+            test_fail!("prctl PR_GET_PDEATHSIG",
+                "r={} out={:#x} (expected r=0 out=15)", r_get, out);
+            ok = false;
+        } else {
+            test_println!("  prctl(PR_SET_PDEATHSIG=15) / PR_GET_PDEATHSIG → 15 ✓");
+        }
+        // Out-of-range signal → -EINVAL.
+        let r_inv = dispatch(157, 1, 1000, 0, 0, 0, 0);
+        if r_inv != -22 {
+            test_fail!("prctl PR_SET_PDEATHSIG invalid",
+                "sig=1000 returned {} (expected -22)", r_inv);
+            ok = false;
+        }
+        // Reset.
+        let _ = dispatch(157, 1, 0, 0, 0, 0, 0);
+    }
+
     // ─── 8. /etc/passwd exists and contains "root:" ───────────────────────────
     {
         let path = b"/etc/passwd\0";
@@ -22817,6 +22895,7 @@ fn test_syscall_alarm_delivers_sigalrm() -> bool {
             envp: alloc::vec::Vec::new(),
             alarm_deadline_ticks: now.saturating_sub(1), // already expired
             alarm_interval_ticks: 0,
+            pdeath_signal: 0,
         };
         procs.push(proc);
     }
@@ -22891,6 +22970,7 @@ fn test_syscall_setitimer_itimer_real() -> bool {
             envp: alloc::vec::Vec::new(),
             alarm_deadline_ticks: 0,
             alarm_interval_ticks: 0,
+            pdeath_signal: 0,
         };
         procs.push(proc);
     }
