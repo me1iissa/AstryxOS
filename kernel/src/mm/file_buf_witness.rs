@@ -29,7 +29,7 @@
 //!
 //!   [F_BUF_DELTA] pid=<n> fd=<n> page=<#x> pre_buf=<#x> pre_size=<#x>
 //!                 post_buf=<#x> post_size=<#x> n_read=<n>
-//!   [F_BUF_ZERO]  pid=<n> fd=<n> page=<#x> when=<pre|post> n_read=<n>
+//!   [F_BUF_ZERO_TRANSITION] pid=<n> fd=<n> page=<#x> ... n_read=<n>
 //!
 //! All emissions are bounded by a per-witness fire cap (16 first hits,
 //! then every 1024th) so the serial log cannot be flooded by a tight
@@ -57,7 +57,6 @@ const SAMPLED_FIRE_MOD: u64 = 1024;
 // ── Counters ──────────────────────────────────────────────────────────────
 
 static F_BUF_DELTA_FIRES: AtomicU64 = AtomicU64::new(0);
-static F_BUF_ZERO_PRE_FIRES: AtomicU64 = AtomicU64::new(0);
 static F_BUF_ZERO_POST_FIRES: AtomicU64 = AtomicU64::new(0);
 static F_BUF_SNAPSHOT_FAILS: AtomicU64 = AtomicU64::new(0);
 
@@ -205,12 +204,11 @@ pub fn post_read(snap: Snapshot, n_read: i64) {
 }
 
 /// Counters dump for the `kdb` introspection layer.  Returns
-/// `(delta, zero_pre, zero_post, snap_fails)`.
+/// `(delta, zero_post, snap_fails)`.
 #[cfg(feature = "file-buf-witness")]
-pub fn counters() -> (u64, u64, u64, u64) {
+pub fn counters() -> (u64, u64, u64) {
     (
         F_BUF_DELTA_FIRES.load(Ordering::Relaxed),
-        F_BUF_ZERO_PRE_FIRES.load(Ordering::Relaxed),
         F_BUF_ZERO_POST_FIRES.load(Ordering::Relaxed),
         F_BUF_SNAPSHOT_FAILS.load(Ordering::Relaxed),
     )
@@ -235,4 +233,4 @@ pub fn post_read(_snap: Snapshot, _n_read: i64) {}
 
 #[cfg(not(feature = "file-buf-witness"))]
 #[inline(always)]
-pub fn counters() -> (u64, u64, u64, u64) { (0, 0, 0, 0) }
+pub fn counters() -> (u64, u64, u64) { (0, 0, 0) }
