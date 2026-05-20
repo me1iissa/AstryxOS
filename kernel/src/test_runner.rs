@@ -11374,23 +11374,25 @@ fn test_phase1_linux_syscalls() -> bool {
         let machine_end = buf[260..325].iter().position(|&b| b == 0).unwrap_or(65);
         let machine = core::str::from_utf8(&buf[260..260 + machine_end]).unwrap_or("");
 
-        // Parse "<major>.<minor>...." — major must be ≥ 3 for Mozilla etc.
-        let major: u32 = release
-            .split('.')
-            .next()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        // Parse "<major>.<minor>...." — must be ≥ 3.2.0 for glibc 2.17+ to
+        // select modern code paths (e.g. the FUTEX_PRIVATE_FLAG fast path
+        // and the rt_sigreturn restorer convention).  Per the AstryxOS ABI
+        // version contract documented in subsys/linux/syscall.rs uname arm.
+        let mut parts = release.split(|c: char| c == '.' || c == '-');
+        let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
 
-        if r == 0 && sysname == "Linux" && major >= 3 && machine == "x86_64" {
+        let ver_ok = major > 3 || (major == 3 && minor >= 2);
+        if r == 0 && sysname == "Linux" && ver_ok && machine == "x86_64" {
             test_println!(
-                "  uname: sysname=\"{}\" release=\"{}\" machine=\"{}\" ✓",
-                sysname, release, machine,
+                "  uname: sysname=\"{}\" release=\"{}\" ({}.{}) machine=\"{}\" ✓",
+                sysname, release, major, minor, machine,
             );
         } else {
             test_fail!(
                 "uname",
-                "r={} sysname=\"{}\" release=\"{}\" major={} machine=\"{}\"",
-                r, sysname, release, major, machine,
+                "r={} sysname=\"{}\" release=\"{}\" major={} minor={} machine=\"{}\" (need ≥3.2.0)",
+                r, sysname, release, major, minor, machine,
             );
             ok = false;
         }
@@ -18757,7 +18759,43 @@ fn test_procfs_cpuinfo() -> bool {
     }
     test_println!("  content contains 'processor' ok");
 
-    test_pass!("/proc/cpuinfo dynamic content");
+    // Locate the `flags` line and check that the JIT-critical flags Mozilla
+    // probes via /proc/cpuinfo are present.  These are emitted unconditionally
+    // by every x86_64 host that AstryxOS supports — Intel SDM Vol. 2A
+    // (CPUID leaf 1 EDX bits 15/19/25/26 + leaf 1 ECX bit 19) guarantees
+    // they are reported by any post-Nehalem CPU.
+    //
+    // The check is conservative: we only fail if the literal token is
+    // missing on a word boundary (preceded and followed by space or newline).
+    // QEMU's default `-cpu qemu64` model exposes cmov/clflush/sse2/sse4_1.
+    let s = core::str::from_utf8(content).unwrap_or("");
+    let flags_line = s.lines().find(|l| l.starts_with("flags"));
+    let flags_line = match flags_line {
+        Some(l) => l,
+        None => {
+            test_fail!("procfs_cpuinfo", "no 'flags' line in /proc/cpuinfo");
+            return false;
+        }
+    };
+    test_println!("  flags line: {}", flags_line);
+    let token_present = |needle: &str| -> bool {
+        flags_line.split(|c: char| c.is_ascii_whitespace())
+            .any(|tok| tok == needle)
+    };
+    // Required Mozilla / FF tier-1 baseline: sse2, sse4_1, cmov, clflush.
+    // Cite: Intel SDM Vol. 2A "CPUID — EAX=1: Processor Info and Feature Bits"
+    // (EDX bit 15 = CMOV, EDX bit 19 = CLFSH, EDX bit 26 = SSE2,
+    //  ECX bit 19 = SSE4.1).
+    for required in &["sse2", "sse4_1", "cmov", "clflush"] {
+        if !token_present(required) {
+            test_fail!("procfs_cpuinfo",
+                "required flag '{}' missing from flags line", required);
+            return false;
+        }
+    }
+    test_println!("  flags include sse2 sse4_1 cmov clflush ✓");
+
+    test_pass!("/proc/cpuinfo dynamic content + Mozilla-required flags");
     true
 }
 

@@ -586,7 +586,13 @@ pub fn generate_cpuinfo() -> Vec<u8> {
     // Query CPUID leaf 0x80000002..0x80000004 for brand string.
     let brand = get_cpu_brand_string();
 
-    // Build feature flag list from EDX leaf 1.
+    // Build feature flag list from CPUID leaf 1 (EDX + ECX).
+    //
+    // Names follow Intel SDM Vol. 2A Table 3-8 (CPUID leaf 1 feature flag
+    // mnemonics) and the lowercase strings Linux exports in /proc/cpuinfo.
+    // Mozilla / FF probes this string for `sse2`, `sse4_1`, `clflush`,
+    // `cmov`, `aes`, `avx2`, `bmi1`, `bmi2`, `rdrand` (see media/libcubeb,
+    // js/src/jit/x86-shared/AssemblerBuffer-x86-shared.cpp).
     let mut flags = alloc::vec::Vec::<&str>::new();
     if features_edx & (1 <<  0) != 0 { flags.push("fpu"); }
     if features_edx & (1 <<  4) != 0 { flags.push("tsc"); }
@@ -594,18 +600,59 @@ pub fn generate_cpuinfo() -> Vec<u8> {
     if features_edx & (1 <<  6) != 0 { flags.push("pae"); }
     if features_edx & (1 <<  9) != 0 { flags.push("apic"); }
     if features_edx & (1 << 15) != 0 { flags.push("cmov"); }
+    if features_edx & (1 << 19) != 0 { flags.push("clflush"); } // CLFSH: cache-line flush
     if features_edx & (1 << 23) != 0 { flags.push("mmx"); }
     if features_edx & (1 << 24) != 0 { flags.push("fxsr"); }
     if features_edx & (1 << 25) != 0 { flags.push("sse"); }
     if features_edx & (1 << 26) != 0 { flags.push("sse2"); }
-    if features_ecx & (1 <<  0) != 0 { flags.push("sse3"); }
+    if features_ecx & (1 <<  0) != 0 { flags.push("pni"); } // SSE3 (Linux name)
     if features_ecx & (1 <<  1) != 0 { flags.push("pclmulqdq"); }
     if features_ecx & (1 <<  9) != 0 { flags.push("ssse3"); }
+    if features_ecx & (1 << 12) != 0 { flags.push("fma"); }
+    if features_ecx & (1 << 13) != 0 { flags.push("cx16"); } // CMPXCHG16B
     if features_ecx & (1 << 19) != 0 { flags.push("sse4_1"); }
     if features_ecx & (1 << 20) != 0 { flags.push("sse4_2"); }
+    if features_ecx & (1 << 22) != 0 { flags.push("movbe"); }
     if features_ecx & (1 << 23) != 0 { flags.push("popcnt"); }
+    if features_ecx & (1 << 25) != 0 { flags.push("aes"); }
+    if features_ecx & (1 << 26) != 0 { flags.push("xsave"); }
+    if features_ecx & (1 << 27) != 0 { flags.push("osxsave"); }
     if features_ecx & (1 << 28) != 0 { flags.push("avx"); }
+    if features_ecx & (1 << 29) != 0 { flags.push("f16c"); }
     if features_ecx & (1 << 30) != 0 { flags.push("rdrand"); }
+
+    // CPUID leaf 7 sub-leaf 0 — structured extended feature flags
+    // (per Intel SDM Vol. 2A: CPUID — Returns Structured Extended Feature
+    // Enumeration Information).  Mozilla's JIT and crypto code paths
+    // probe `avx2`, `bmi1`, `bmi2` here.
+    if max_leaf >= 7 {
+        let (leaf7_ebx, leaf7_ecx) = {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                let ebx: u32; let ecx: u32;
+                core::arch::asm!(
+                    "push rbx",
+                    "cpuid",
+                    "mov {ebx_out:e}, ebx",
+                    "pop rbx",
+                    inout("eax") 7u32 => _,
+                    inout("ecx") 0u32 => ecx,
+                    out("edx") _,
+                    ebx_out = out(reg) ebx,
+                );
+                (ebx, ecx)
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            { (0u32, 0u32) }
+        };
+        if leaf7_ebx & (1 <<  3) != 0 { flags.push("bmi1"); }
+        if leaf7_ebx & (1 <<  5) != 0 { flags.push("avx2"); }
+        if leaf7_ebx & (1 <<  8) != 0 { flags.push("bmi2"); }
+        if leaf7_ebx & (1 << 19) != 0 { flags.push("adx"); }
+        if leaf7_ebx & (1 << 29) != 0 { flags.push("sha_ni"); }
+        let _ = leaf7_ecx;
+    }
+
     // Always include x86_64 baseline flags.
     flags.push("lm"); // long mode
     flags.push("nx"); // no-execute
