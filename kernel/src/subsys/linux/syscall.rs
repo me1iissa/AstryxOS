@@ -3079,25 +3079,43 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         }
         // 318: getrandom(buf, buflen, flags)
         318 => crate::syscall::sys_getrandom(arg1 as *mut u8, arg2 as usize, arg3 as u32),
-        // 324: membarrier(cmd, flags, cpu_id)
-        // Used by glibc's rseq fallback path and by jemalloc.
-        // MEMBARRIER_CMD_QUERY (0)             — return supported command bitmask
-        // MEMBARRIER_CMD_GLOBAL (1)            — full system-wide memory barrier
-        // MEMBARRIER_CMD_PRIVATE_EXPEDITED (8) — barrier on current process's threads
+        // 324: membarrier(cmd, flags, cpu_id) — per `man 2 membarrier` (Linux 4.3+).
+        //
+        // Command set per `<linux/membarrier.h>` (kernel UAPI):
+        //   MEMBARRIER_CMD_QUERY                                  = 0
+        //   MEMBARRIER_CMD_GLOBAL                                 = (1<<0) = 0x01
+        //   MEMBARRIER_CMD_GLOBAL_EXPEDITED                       = (1<<1) = 0x02
+        //   MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED              = (1<<2) = 0x04
+        //   MEMBARRIER_CMD_PRIVATE_EXPEDITED                      = (1<<3) = 0x08
+        //   MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED             = (1<<4) = 0x10
+        //   MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE            = (1<<5) = 0x20
+        //   MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE   = (1<<6) = 0x40
+        //
+        // musl-FF observed at sc=39 issuing cmd=0x10 (REGISTER_PRIVATE_EXPEDITED)
+        // once per process; returning EINVAL previously caused content-process
+        // bringup to take the synchronous-barrier fallback path.
+        //
+        // AstryxOS issues a global mfence+lfence on every barrier command —
+        // conservative but correct: on x86_64 stores are TSO-ordered, so the
+        // resulting barrier exceeds the membarrier(2) spec ("ordering of memory
+        // accesses by user-space threads") in both required directions.  The
+        // REGISTER_* arms are accept-and-return-0: they exist so the kernel can
+        // pre-allocate per-task state, which AstryxOS does not need.
         324 => {
-            // Supported command bitmask reported by QUERY.
-            // Bit 0 = MEMBARRIER_CMD_GLOBAL, bit 3 = MEMBARRIER_CMD_PRIVATE_EXPEDITED.
-            const MEMBARRIER_SUPPORTED: i64 = 0x1 | 0x8;
+            // Bits per command index, matching the cmd numeric value when
+            // used as an OR-able bitmask.  We advertise everything we accept.
+            const MEMBARRIER_SUPPORTED: i64 =
+                0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40;
             match arg1 as i64 {
-                0 => MEMBARRIER_SUPPORTED, // MEMBARRIER_CMD_QUERY
-                1 | 8 => {
-                    // MEMBARRIER_CMD_GLOBAL or MEMBARRIER_CMD_PRIVATE_EXPEDITED.
-                    // Issue a full memory barrier.  On x86_64 all stores are
-                    // ordered, but mfence + lfence ensures prior stores are visible
-                    // to all CPUs before any subsequent loads.
+                0 => MEMBARRIER_SUPPORTED,
+                // Barrier-issuing commands — emit a real fence.
+                0x01 | 0x02 | 0x08 | 0x20 => {
                     unsafe { core::arch::asm!("mfence", "lfence", options(nostack, preserves_flags)); }
                     0
                 }
+                // Registration commands — accept as a no-op; AstryxOS does not
+                // require per-task opt-in for any barrier variant.
+                0x04 | 0x10 | 0x40 => 0,
                 _ => -22, // EINVAL — unknown command
             }
         }
