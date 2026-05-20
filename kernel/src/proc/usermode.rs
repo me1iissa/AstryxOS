@@ -237,6 +237,28 @@ fn create_user_process_impl(
         user_cr3, result.allocated_pages.len()
     );
 
+    // K2b F3 foreign-frame writer trap arm — gated on `f3-watch` and on a
+    // path-substring match against `"firefox-bin"`.  This is the
+    // kernel-spawned launch path (case-A in `crate::syscall::sys_exec`'s
+    // taxonomy); the user-mode `execve(2)` replace path (cases B/C) has
+    // its own equivalent arm in `sys_exec` post-`switch_cr3`.  Arming at
+    // process-create time runs strictly before any Ring 3 instruction in
+    // the new image, so the first `[W215/DR-WATCH-FIRE] kind_tag=1 …`
+    // captures the libxul prologue's canary store.
+    //
+    // Note: at this site the *current* CR3 is still the caller's
+    // (BSP/init thread's), not `user_cr3` — that switch only happens when
+    // the new thread first runs in `user_mode_bootstrap`.  The DR arm is
+    // a linear-address watch (not address-space-scoped), and the per-CPU
+    // lazy-gen sync propagates the new DR{slot}/DR7 to every CPU within
+    // one timer tick — so by the time the new thread's CR3 is loaded on
+    // any CPU, the watchpoint is live.  See `arch/x86_64/debug_reg.rs`
+    // module docs and Intel SDM Vol. 3B §17.2.4.
+    #[cfg(feature = "f3-watch")]
+    crate::subsys::linux::f3_watch::arm_after_execve(
+        name, user_cr3, entry_rip, entry_rsp,
+    );
+
     Ok(pid)
 }
 
