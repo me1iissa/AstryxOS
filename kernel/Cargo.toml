@@ -204,6 +204,19 @@ ssp-canary-diag = ["firefox-test"]
 # clone(2), clone3(2); AMD64 SysV ABI §3.4 calling convention; Intel SDM
 # Vol. 3A §6.15 (`#GP`), Vol. 2A (HLT/RET).
 clone-args-diag = ["firefox-test"]
+# `[VMA-DUMP]` on fatal user-mode exceptions.  At each fatal user-mode
+# #PF / #UD / #GP / #AC that terminates the process (no installed
+# handler) the kernel emits a full enumeration of the trapping
+# process's VMAs: base, end, size, prot, file/anon flags, name, and the
+# physical frame backing the first page of each VMA.  This anchors PIE
+# ASLR bases — with 28-bit per-exec entropy (1 TiB window) the libxul
+# and ld-musl bases vary across boots, so an interpreter looking at a
+# trapping RIP value cannot resolve "0x7f000001c7f9 is in ld-musl
+# `__stack_chk_fail`" without the same-trial VMA layout.  Bounded to
+# 4 dumps per boot × 256 VMAs/dump.  Default builds are byte-identical
+# when this feature is off.  See Intel SDM Vol. 3A §6.15 (#GP), §4.5
+# (4-Level Paging); POSIX mmap(2); ELF-64 gABI §3 (Program Loading).
+vma-dump-on-gp = ["firefox-test"]
 # LLVM source-based code-coverage instrumentation (test-coverage audit
 # session 5 / docs/TEST_COVERAGE_AUDIT_2026-05-16.md).  When enabled, the
 # kernel must additionally be built with `-C instrument-coverage` (see
