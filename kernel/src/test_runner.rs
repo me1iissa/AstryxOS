@@ -11374,23 +11374,25 @@ fn test_phase1_linux_syscalls() -> bool {
         let machine_end = buf[260..325].iter().position(|&b| b == 0).unwrap_or(65);
         let machine = core::str::from_utf8(&buf[260..260 + machine_end]).unwrap_or("");
 
-        // Parse "<major>.<minor>...." — major must be ≥ 3 for Mozilla etc.
-        let major: u32 = release
-            .split('.')
-            .next()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        // Parse "<major>.<minor>...." — must be ≥ 3.2.0 for glibc 2.17+ to
+        // select modern code paths (e.g. the FUTEX_PRIVATE_FLAG fast path
+        // and the rt_sigreturn restorer convention).  Per the AstryxOS ABI
+        // version contract documented in subsys/linux/syscall.rs uname arm.
+        let mut parts = release.split(|c: char| c == '.' || c == '-');
+        let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
 
-        if r == 0 && sysname == "Linux" && major >= 3 && machine == "x86_64" {
+        let ver_ok = major > 3 || (major == 3 && minor >= 2);
+        if r == 0 && sysname == "Linux" && ver_ok && machine == "x86_64" {
             test_println!(
-                "  uname: sysname=\"{}\" release=\"{}\" machine=\"{}\" ✓",
-                sysname, release, machine,
+                "  uname: sysname=\"{}\" release=\"{}\" ({}.{}) machine=\"{}\" ✓",
+                sysname, release, major, minor, machine,
             );
         } else {
             test_fail!(
                 "uname",
-                "r={} sysname=\"{}\" release=\"{}\" major={} machine=\"{}\"",
-                r, sysname, release, major, machine,
+                "r={} sysname=\"{}\" release=\"{}\" major={} minor={} machine=\"{}\" (need ≥3.2.0)",
+                r, sysname, release, major, minor, machine,
             );
             ok = false;
         }
@@ -12248,6 +12250,84 @@ fn test_bash_compat() -> bool {
             test_fail!("prctl PR_SET_SECCOMP", "r={}", r);
             ok = false;
         }
+    }
+
+    // ─── 7a. prctl(PR_SET_SECCOMP=22, 2) — SECCOMP_MODE_FILTER ──────────────
+    // Per `man 2 prctl` (and seccomp(2)), MODE_FILTER expects a sock_fprog
+    // pointer in arg3.  AstryxOS does not interpret the BPF; FF's content
+    // process only needs the call to return 0 so its sandbox-init proceeds.
+    {
+        let r = dispatch(157, 22, 2, 0, 0, 0, 0);
+        if r == 0 {
+            test_println!("  prctl(PR_SET_SECCOMP, MODE_FILTER) → ok");
+        } else {
+            test_fail!("prctl PR_SET_SECCOMP MODE_FILTER", "r={}", r);
+            ok = false;
+        }
+    }
+
+    // ─── 7b. prctl(PR_CAPBSET_DROP=24, CAP_SYS_ADMIN=21) ────────────────────
+    // bwrap-style sandbox drops 41 caps in a loop; each call must succeed.
+    {
+        let r = dispatch(157, 24, 21, 0, 0, 0, 0);
+        if r == 0 {
+            test_println!("  prctl(PR_CAPBSET_DROP, CAP_SYS_ADMIN) → ok");
+        } else {
+            test_fail!("prctl PR_CAPBSET_DROP", "r={}", r);
+            ok = false;
+        }
+        // Out-of-range cap → -EINVAL per prctl(2).
+        let r_inv = dispatch(157, 24, 200, 0, 0, 0, 0);
+        if r_inv != -22 {
+            test_fail!("prctl PR_CAPBSET_DROP invalid",
+                "cap=200 returned {} (expected -22)", r_inv);
+            ok = false;
+        }
+    }
+
+    // ─── 7c. prctl(PR_CAPBSET_READ=23, cap) — every valid cap reports present
+    {
+        let r = dispatch(157, 23, 0, 0, 0, 0, 0); // CAP_CHOWN = 0
+        if r != 1 {
+            test_fail!("prctl PR_CAPBSET_READ",
+                "cap=0 returned {} (expected 1 — present)", r);
+            ok = false;
+        } else {
+            test_println!("  prctl(PR_CAPBSET_READ, CAP_CHOWN) → 1 (present)");
+        }
+        let r_inv = dispatch(157, 23, 200, 0, 0, 0, 0);
+        if r_inv != -22 {
+            test_fail!("prctl PR_CAPBSET_READ invalid",
+                "cap=200 returned {} (expected -22)", r_inv);
+            ok = false;
+        }
+    }
+
+    // ─── 7d. prctl(PR_SET_PDEATHSIG=1, SIGTERM=15) round-trip via PR_GET_PDEATHSIG=2
+    {
+        let r_set = dispatch(157, 1, 15, 0, 0, 0, 0);
+        if r_set != 0 {
+            test_fail!("prctl PR_SET_PDEATHSIG", "r={}", r_set);
+            ok = false;
+        }
+        let mut out: u32 = 0xDEADBEEF;
+        let r_get = dispatch(157, 2, &mut out as *mut u32 as u64, 0, 0, 0, 0);
+        if r_get != 0 || out != 15 {
+            test_fail!("prctl PR_GET_PDEATHSIG",
+                "r={} out={:#x} (expected r=0 out=15)", r_get, out);
+            ok = false;
+        } else {
+            test_println!("  prctl(PR_SET_PDEATHSIG=15) / PR_GET_PDEATHSIG → 15 ✓");
+        }
+        // Out-of-range signal → -EINVAL.
+        let r_inv = dispatch(157, 1, 1000, 0, 0, 0, 0);
+        if r_inv != -22 {
+            test_fail!("prctl PR_SET_PDEATHSIG invalid",
+                "sig=1000 returned {} (expected -22)", r_inv);
+            ok = false;
+        }
+        // Reset.
+        let _ = dispatch(157, 1, 0, 0, 0, 0, 0);
     }
 
     // ─── 8. /etc/passwd exists and contains "root:" ───────────────────────────
@@ -18679,7 +18759,43 @@ fn test_procfs_cpuinfo() -> bool {
     }
     test_println!("  content contains 'processor' ok");
 
-    test_pass!("/proc/cpuinfo dynamic content");
+    // Locate the `flags` line and check that the JIT-critical flags Mozilla
+    // probes via /proc/cpuinfo are present.  These are emitted unconditionally
+    // by every x86_64 host that AstryxOS supports — Intel SDM Vol. 2A
+    // (CPUID leaf 1 EDX bits 15/19/25/26 + leaf 1 ECX bit 19) guarantees
+    // they are reported by any post-Nehalem CPU.
+    //
+    // The check is conservative: we only fail if the literal token is
+    // missing on a word boundary (preceded and followed by space or newline).
+    // QEMU's default `-cpu qemu64` model exposes cmov/clflush/sse2/sse4_1.
+    let s = core::str::from_utf8(content).unwrap_or("");
+    let flags_line = s.lines().find(|l| l.starts_with("flags"));
+    let flags_line = match flags_line {
+        Some(l) => l,
+        None => {
+            test_fail!("procfs_cpuinfo", "no 'flags' line in /proc/cpuinfo");
+            return false;
+        }
+    };
+    test_println!("  flags line: {}", flags_line);
+    let token_present = |needle: &str| -> bool {
+        flags_line.split(|c: char| c.is_ascii_whitespace())
+            .any(|tok| tok == needle)
+    };
+    // Required Mozilla / FF tier-1 baseline: sse2, sse4_1, cmov, clflush.
+    // Cite: Intel SDM Vol. 2A "CPUID — EAX=1: Processor Info and Feature Bits"
+    // (EDX bit 15 = CMOV, EDX bit 19 = CLFSH, EDX bit 26 = SSE2,
+    //  ECX bit 19 = SSE4.1).
+    for required in &["sse2", "sse4_1", "cmov", "clflush"] {
+        if !token_present(required) {
+            test_fail!("procfs_cpuinfo",
+                "required flag '{}' missing from flags line", required);
+            return false;
+        }
+    }
+    test_println!("  flags include sse2 sse4_1 cmov clflush ✓");
+
+    test_pass!("/proc/cpuinfo dynamic content + Mozilla-required flags");
     true
 }
 
@@ -21088,7 +21204,7 @@ fn test_set_robust_list_roundtrip() -> bool {
 // ── Test 124: membarrier QUERY returns non-zero mask with GLOBAL bit ──────────
 
 fn test_membarrier_query() -> bool {
-    test_header!("membarrier(324): QUERY returns mask including GLOBAL (bit 0x1)");
+    test_header!("membarrier(324): QUERY mask + REGISTER_PRIVATE_EXPEDITED + GLOBAL");
 
     // membarrier(MEMBARRIER_CMD_QUERY=0, flags=0, cpu_id=0)
     let r = crate::syscall::dispatch_linux_kernel(324, 0, 0, 0, 0, 0, 0);
@@ -21098,13 +21214,20 @@ fn test_membarrier_query() -> bool {
         test_fail!("membarrier_query", "returned {} (expected positive bitmask)", r);
         return false;
     }
-    // MEMBARRIER_CMD_GLOBAL is bit 0x1
-    if r & 0x1 == 0 {
-        test_fail!("membarrier_query", "GLOBAL bit (0x1) not set in mask {:#x}", r as u64);
-        return false;
+    // MEMBARRIER_CMD_GLOBAL                       = 0x01
+    // MEMBARRIER_CMD_PRIVATE_EXPEDITED            = 0x08
+    // MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED   = 0x10 (musl uses this at startup)
+    for (bit, name) in &[(0x01i64, "GLOBAL"),
+                          (0x08i64, "PRIVATE_EXPEDITED"),
+                          (0x10i64, "REGISTER_PRIVATE_EXPEDITED")] {
+        if r & *bit == 0 {
+            test_fail!("membarrier_query",
+                "{} bit ({:#x}) not set in mask {:#x}", name, bit, r as u64);
+            return false;
+        }
     }
 
-    // Also verify GLOBAL command executes without error
+    // Verify GLOBAL command executes without error
     let r2 = crate::syscall::dispatch_linux_kernel(324, 1, 0, 0, 0, 0, 0);
     test_println!("  membarrier(GLOBAL) = {}", r2);
     if r2 != 0 {
@@ -21112,7 +21235,24 @@ fn test_membarrier_query() -> bool {
         return false;
     }
 
-    test_pass!("membarrier: QUERY mask non-zero with GLOBAL bit, GLOBAL cmd=0");
+    // Verify REGISTER_PRIVATE_EXPEDITED (cmd=0x10) returns 0 (the musl-FF gate).
+    let r3 = crate::syscall::dispatch_linux_kernel(324, 0x10, 0, 0, 0, 0, 0);
+    test_println!("  membarrier(REGISTER_PRIVATE_EXPEDITED) = {}", r3);
+    if r3 != 0 {
+        test_fail!("membarrier_query",
+            "REGISTER_PRIVATE_EXPEDITED returned {} (expected 0)", r3);
+        return false;
+    }
+
+    // Unknown command must still return -EINVAL.
+    let r4 = crate::syscall::dispatch_linux_kernel(324, 0x7FFF, 0, 0, 0, 0, 0);
+    if r4 != -22 {
+        test_fail!("membarrier_query",
+            "unknown cmd returned {} (expected -22/EINVAL)", r4);
+        return false;
+    }
+
+    test_pass!("membarrier: QUERY mask + GLOBAL + REGISTER_PRIVATE_EXPEDITED + EINVAL");
     true
 }
 
@@ -22793,6 +22933,7 @@ fn test_syscall_alarm_delivers_sigalrm() -> bool {
             envp: alloc::vec::Vec::new(),
             alarm_deadline_ticks: now.saturating_sub(1), // already expired
             alarm_interval_ticks: 0,
+            pdeath_signal: 0,
         };
         procs.push(proc);
     }
@@ -22867,6 +23008,7 @@ fn test_syscall_setitimer_itimer_real() -> bool {
             envp: alloc::vec::Vec::new(),
             alarm_deadline_ticks: 0,
             alarm_interval_ticks: 0,
+            pdeath_signal: 0,
         };
         procs.push(proc);
     }
