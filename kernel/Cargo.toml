@@ -217,6 +217,20 @@ clone-args-diag = ["firefox-test"]
 # when this feature is off.  See Intel SDM Vol. 3A §6.15 (#GP), §4.5
 # (4-Level Paging); POSIX mmap(2); ELF-64 gABI §3 (Program Loading).
 vma-dump-on-gp = ["firefox-test"]
+# Producer-side snapshot of every exiting thread keyed by (pid, tid), with a
+# lookup at the kernel-mode fatal-trap site for cases where a sibling thread
+# trapped in kernel mode at a very low RIP (< 0x10000) shortly after a
+# sibling's CLEARTID + FUTEX_WAKE_EXIT.  The observable framing-falsifier is
+# whether the most-recently-exited sibling's recorded clear-cr3 / clear-addr /
+# saved-context-rsp aliases the trapping thread's kernel-stack VA range — only
+# obtainable producer-side (at exit time, before reap) because the
+# scheduler/reaper will have removed the dying thread's table entry by the
+# time the trap fires.  Lossy ring of 16 entries per CPU; emission gated to
+# the first 4 traps per boot.  Default builds remain byte-identical when this
+# feature is OFF.  See Intel SDM Vol. 3A §6.15 (#GP), §4.5 (Paging); System V
+# AMD64 ABI §3.4 (kernel-mode trap frame layout); POSIX clone(2)
+# CLONE_CHILD_CLEARTID semantics.
+kernel-gp-trap-diag = ["firefox-test"]
 # LLVM source-based code-coverage instrumentation (test-coverage audit
 # session 5 / docs/TEST_COVERAGE_AUDIT_2026-05-16.md).  When enabled, the
 # kernel must additionally be built with `-C instrument-coverage` (see

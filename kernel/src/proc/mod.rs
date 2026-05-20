@@ -1281,6 +1281,16 @@ pub fn exit_thread(exit_code: i64) {
     // Wake parent threads waiting in waitpid, and mark current thread Dead.
     // Both ops are THREAD_TABLE-only with no PROCESS_TABLE access between them,
     // so one lock acquisition covers both.
+    //
+    // Producer-side snapshot for `ke::gp_trap_diag` is collected inside the
+    // same lock so it captures the exit-time state atomically — see
+    // `kernel/src/ke/gp_trap_diag.rs`.  Feature-gated; default builds are
+    // byte-identical.  Cite: Intel SDM Vol. 3A §6.15 (#GP / kernel-mode trap
+    // framing); POSIX clone(2) `CLONE_CHILD_CLEARTID`.
+    #[cfg(feature = "kernel-gp-trap-diag")]
+    let exit_snap: Option<(u64, u64, u64, u64)>;
+    #[cfg(not(feature = "kernel-gp-trap-diag"))]
+    let exit_snap: Option<()> = None;
     {
         let mut threads = THREAD_TABLE.lock();
         for t in threads.iter_mut() {
@@ -1297,7 +1307,34 @@ pub fn exit_thread(exit_code: i64) {
             // which is the AP's cue that the stack is safe to free.  Without
             // this, the AP can race to free the stack while BSP is still on it.
             t.ctx_rsp_valid.store(false, core::sync::atomic::Ordering::Release);
+
+            #[cfg(feature = "kernel-gp-trap-diag")]
+            {
+                exit_snap = Some((
+                    t.context.rsp,
+                    t.kernel_stack_base,
+                    t.kernel_stack_size,
+                    t.clear_child_tid,
+                ));
+            }
+        } else {
+            #[cfg(feature = "kernel-gp-trap-diag")]
+            { exit_snap = None; }
         }
+    }
+    // Commit the producer-side snapshot now that the lock is released.  The
+    // `cr3` we captured earlier in the CLEARTID block was the snapshot at
+    // CLEARTID time and is the value `write_u32_to_user_pub` dereferenced
+    // against — re-derive it here from PROCESS_TABLE to be sure.
+    #[cfg(feature = "kernel-gp-trap-diag")]
+    if let Some((ctx_rsp, kstack_base, kstack_size, clear_addr)) = exit_snap {
+        let cr3 = {
+            let procs = PROCESS_TABLE.lock();
+            procs.iter().find(|p| p.pid == pid).map(|p| p.cr3).unwrap_or(0)
+        };
+        crate::ke::gp_trap_diag::record_exit(
+            pid, tid, cr3, clear_addr, ctx_rsp, kstack_base, kstack_size,
+        );
     }
 
     // Deliver SIGCHLD to parent (no locks held).
