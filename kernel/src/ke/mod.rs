@@ -3,6 +3,8 @@
 //! NT-inspired kernel services: IRQL, DPC, APC, Dispatcher Objects, Wait.
 
 pub mod bugcheck;
+#[cfg(feature = "kernel-gp-trap-diag")]
+pub mod gp_trap_diag;
 pub mod irql;
 pub mod dpc;
 pub mod apc;
