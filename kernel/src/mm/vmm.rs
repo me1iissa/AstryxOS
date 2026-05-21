@@ -106,11 +106,19 @@ pub fn get_kernel_cr3() -> u64 {
 ///    heap mapping.
 pub fn init() {
     // Reserve physical pages that back the higher-half kernel heap.
-    // HEAP_START 0xFFFF_8000_0080_0000 → physical 0x0080_0000 (8 MiB).
-    // Starting at 8 MiB avoids overlap with the kernel image (ends < 6 MiB).
-    // Heap size is 128 MiB.
-    let heap_phys_start = 0x0080_0000u64;
-    let heap_phys_end = heap_phys_start + (128 * 1024 * 1024) as u64;
+    //
+    // The heap layout (virtual base + phys range) is computed from the
+    // linker's `__kernel_end` symbol so it always sits above BSS — see
+    // `mm/heap.rs::compute_heap_layout()` for the alignment rules.  Default
+    // builds (BSS < 8 MiB) get phys_start = 0x80_0000 / VA 0xFFFF_8000_0080_0000
+    // for byte-identical behaviour; heavy-diagnostic builds (e.g.
+    // `firefox-test,w215-diag,f3-watch`) push the heap above the inflated
+    // BSS, preventing the silent free-list overlap surfaced by Phase 2 QA
+    // on 2026-05-21.
+    //
+    // This reservation MUST run before any `pmm::alloc_page()` below so
+    // PD copies and the 1..4 GiB extension cannot land in the heap region.
+    let (_heap_va, heap_phys_start, heap_phys_end) = super::heap::compute_heap_layout();
     pmm::reserve_range(heap_phys_start, heap_phys_end);
 
     // Separate the PD pages between the identity map (PML4[0]) and the
