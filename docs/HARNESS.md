@@ -492,6 +492,70 @@ not the F3 stack-frame-identity gate).
 
 ---
 
+## Data image — debug-symbol companions (musl variant)
+
+When attributing captured RIPs to named functions (`addr2line`,
+`rip-trace-resolve`, ad-hoc `nm` lookups, K-class hardware-watchpoint fires)
+the stripped Alpine binaries in `/disk/lib/` and `/disk/usr/lib/` carry only
+`.dynsym` — which names exported symbols but not internal functions and
+provides no line-number information. Setting `ASTRYXOS_FIREFOX_DEBUG` opts the
+build into staging Alpine's `-dbg` companion packages alongside the stripped
+binaries in the standard `/usr/lib/debug/<absolute-path>/<basename>.debug`
+layout, so binutils tools find them automatically via the binaries'
+`.gnu_debuglink` sections.
+
+```bash
+# musl-only (default opt-in; ~2.8 MiB on data.img)
+ASTRYXOS_FIREFOX_VARIANT=musl ASTRYXOS_FIREFOX_DEBUG=musl \
+    bash scripts/create-data-disk.sh --force
+
+# full GTK stack (~54 MiB on data.img)
+ASTRYXOS_FIREFOX_VARIANT=musl ASTRYXOS_FIREFOX_DEBUG=1 \
+    bash scripts/create-data-disk.sh --force
+
+# explicit off (default, unchanged from prior behaviour)
+ASTRYXOS_FIREFOX_VARIANT=musl bash scripts/create-data-disk.sh --force
+```
+
+Coverage matrix (Alpine v3.20, x86_64):
+
+| `ASTRYXOS_FIREFOX_DEBUG` | data.img Δ | Covers |
+|---|---|---|
+| unset / `0` (off, default) | 0 | — |
+| `musl` | ~2.8 MiB | `ld-musl-x86_64.so.1`, `libc.musl-x86_64.so.1` (musl-dbg) |
+| `1` / `full` | ~54 MiB | + libglib/gobject/gio, libgdk_pixbuf, libcairo, libgtk-3/libgdk-3 |
+
+`libxul.so` is **not** covered — Alpine's `firefox-esr` package does not ship a
+`-dbg` subpackage (verified against Alpine v3.20 community APKBUILD). For
+coarse function-level libxul attribution under the musl variant, run
+`scripts/inject-libxul-symbols.sh` against the musl libxul path
+(`build/disk/usr/lib/firefox-esr/libxul.so`); note that VMAs drift a few bytes
+per function vs Mozilla's reference build due to Alpine's rebuild — function
+*names* are usually correct but per-line attribution is not byte-precise.
+
+The companion files land at `/usr/lib/debug/<path>` on the guest filesystem.
+For host-side resolution use a temporary verification root (the install
+script does this internally for its own end-to-end check):
+
+```bash
+# Host-side: addr2line a RIP in the staged musl ld-musl
+VERIFY="$(mktemp -d)"
+ln -sf "$(pwd)/build/disk/lib/ld-musl-x86_64.so.1"                "${VERIFY}/ld-musl-x86_64.so.1"
+ln -sf "$(pwd)/build/disk/usr/lib/debug/lib/ld-musl-x86_64.so.1.debug" \
+       "${VERIFY}/ld-musl-x86_64.so.1.debug"
+addr2line --inlines --functions --demangle \
+    -e "${VERIFY}/ld-musl-x86_64.so.1" 0x5e880
+# → __unmapself
+rm -rf "${VERIFY}"
+```
+
+The opt-in is silently ignored under `ASTRYXOS_FIREFOX_VARIANT=glibc` — Alpine
+-dbg packages are companions to Alpine binaries; the glibc Firefox debug-symbol
+track is owned by `scripts/inject-libxul-symbols.sh` (Mozilla Breakpad `.sym`
+injection into `libxul.so` as a `.symtab`).
+
+---
+
 ## Use cases
 
 ### Debugging a kernel hang

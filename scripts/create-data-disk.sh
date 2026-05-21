@@ -40,12 +40,38 @@ FIREFOX=false
 # Selectable via CLI arg or env var; env var loses to explicit CLI arg.
 FIREFOX_VARIANT="${ASTRYXOS_FIREFOX_VARIANT:-glibc}"
 
+# Firefox debug-symbols opt-in.  When set, stages Alpine -dbg debug companion
+# files (musl-dbg + optionally glib/gdk-pixbuf/cairo/gtk+3.0-dbg) into
+# build/disk/usr/lib/debug/ and into data.img so that addr2line / objdump
+# (and equivalent guest-side tooling) can attribute captured RIPs to function
+# names and source lines.  Targets the K-class watchpoint attribution flow.
+#
+#   unset / 0   — no debug companions staged (default; data.img footprint
+#                  unchanged from the variant baseline)
+#   musl        — stage musl-dbg only (~2.8 MiB).  Covers ld-musl-x86_64.so.1
+#                  + libc.musl-x86_64.so.1 (libc is a symlink to ld-musl).
+#   1 / full    — stage musl-dbg + glib-dbg + gdk-pixbuf-dbg + cairo-dbg +
+#                  gtk+3.0-dbg (~54 MiB).  Covers ld-musl + libc + the GTK3
+#                  stack libxul transitively depends on.
+#
+# Constraints:
+#   - Only meaningful when FIREFOX_VARIANT=musl (Alpine -dbg packages are
+#     companions to Alpine binaries).  Setting under glibc is silently
+#     ignored; the glibc Firefox debug-symbol track is owned by the
+#     inject-libxul-symbols.sh / Mozilla Breakpad .sym path instead.
+#   - Alpine does NOT ship a firefox-esr-dbg subpackage; libxul.so debug
+#     attribution under the musl variant is on a separate path
+#     (see scripts/install-firefox-musl-debug.sh for the documented gap).
+FIREFOX_DEBUG="${ASTRYXOS_FIREFOX_DEBUG:-}"
+
 for arg in "$@"; do
     case "$arg" in
         --force) FORCE=true ;;
         --firefox) FIREFOX=true; FORCE=true ;;
         --firefox-variant=*) FIREFOX_VARIANT="${arg#--firefox-variant=}" ;;
         --firefox-variant) :;;   # next arg consumed by trailing path
+        --firefox-debug=*) FIREFOX_DEBUG="${arg#--firefox-debug=}" ;;
+        --firefox-debug)   FIREFOX_DEBUG=1 ;;
         [0-9]*) SIZE_MB="$arg" ;;
     esac
 done
@@ -58,6 +84,21 @@ case "${FIREFOX_VARIANT}" in
         ;;
 esac
 echo "[DATA-DISK] Firefox variant: ${FIREFOX_VARIANT}"
+
+case "${FIREFOX_DEBUG}" in
+    ''|0)        FIREFOX_DEBUG_MODE=off ;;
+    musl)        FIREFOX_DEBUG_MODE=musl ;;
+    1|full|yes)  FIREFOX_DEBUG_MODE=full ;;
+    *)
+        echo "[DATA-DISK] ERROR: unknown FIREFOX_DEBUG='${FIREFOX_DEBUG}' (expected unset|0|musl|1|full)"
+        exit 1
+        ;;
+esac
+if [ "${FIREFOX_DEBUG_MODE}" != off ] && [ "${FIREFOX_VARIANT}" != musl ]; then
+    echo "[DATA-DISK] NOTE: ASTRYXOS_FIREFOX_DEBUG=${FIREFOX_DEBUG} ignored — only applies to FIREFOX_VARIANT=musl"
+    FIREFOX_DEBUG_MODE=off
+fi
+echo "[DATA-DISK] Firefox debug-symbols: ${FIREFOX_DEBUG_MODE}"
 
 # ── Stage at least one TTF font for Mozilla's font-list init ─────────────────
 # Mozilla's gfxFcPlatformFontList walks the FcFontSet returned by
@@ -240,6 +281,23 @@ if [ -f "${ROOT_DIR}/scripts/install-firefox-musl.sh" ]; then
     [ "${FORCE}" = true ] && MUSL_FLAGS="--force"
     bash "${ROOT_DIR}/scripts/install-firefox-musl.sh" ${MUSL_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
         { echo "[DATA-DISK] FATAL: install-firefox-musl.sh failed"; exit 1; }
+fi
+
+# ── Optional: stage Alpine -dbg debug companions ─────────────────────────────
+# When ASTRYXOS_FIREFOX_DEBUG is set, run install-firefox-musl-debug.sh to
+# pull the per-library debug-info companion files into
+# build/disk/usr/lib/debug/.  The script reuses install-firefox-musl.sh's
+# shared apk rootfs (~/.cache/astryxos-firefox-musl/rootfs) so debug-info
+# package versions match the binary versions exactly.
+if [ "${FIREFOX_DEBUG_MODE}" != off ] && \
+   [ -f "${ROOT_DIR}/scripts/install-firefox-musl-debug.sh" ]; then
+    DBG_FLAGS=""
+    [ "${FORCE}" = true ] && DBG_FLAGS="--force"
+    if [ "${FIREFOX_DEBUG_MODE}" = musl ]; then
+        DBG_FLAGS="${DBG_FLAGS} --musl-only"
+    fi
+    bash "${ROOT_DIR}/scripts/install-firefox-musl-debug.sh" ${DBG_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
+        echo "[DATA-DISK] WARNING: install-firefox-musl-debug.sh failed — /usr/lib/debug not staged"
 fi
 
 # Stage a /tmp/hello.html for the headless oracle test — install-firefox.sh
@@ -498,6 +556,25 @@ EOF
             echo "[DATA-DISK] Copied /usr/lib/firefox-esr/ to data image (DT_RUNPATH target)"
         else
             echo "[DATA-DISK] WARNING: ${MUSL_FF_ESR} missing — musl FF DT_RUNPATH lookup will fail"
+        fi
+
+        # ── Optional: /usr/lib/debug/ debug-info companion tree ─────────────
+        # Staged by install-firefox-musl-debug.sh when ASTRYXOS_FIREFOX_DEBUG
+        # is set.  Layout per binutils convention: /usr/lib/debug/<abs-binary-
+        # path>/<basename>.debug.  Mirrors into the data image so addr2line /
+        # objdump (or equivalent guest-side tooling) can resolve captured
+        # RIPs to function + source-line via the binaries' .gnu_debuglink
+        # sections without further host coupling.
+        MUSL_DEBUG="${BUILD_DIR}/disk/usr/lib/debug"
+        if [ "${FIREFOX_DEBUG_MODE}" != off ] && [ -d "${MUSL_DEBUG}" ]; then
+            DBG_SIZE="$(du -sh "${MUSL_DEBUG}" | cut -f1)"
+            DBG_FILES="$(find "${MUSL_DEBUG}" -type f -name '*.debug' | wc -l)"
+            echo "[DATA-DISK] Copying /usr/lib/debug (${DBG_SIZE}, ${DBG_FILES} files) to data image..."
+            mmd -i "${DATA_IMG}" "::usr/lib/debug" 2>/dev/null || true
+            mcopy -s -o -i "${DATA_IMG}" "${MUSL_DEBUG}/." \
+                "::usr/lib/debug/" 2>&1 | \
+                grep -v "^$" | grep -iv "^skipping" | head -20 || true
+            echo "[DATA-DISK] Copied /usr/lib/debug/ to data image (${FIREFOX_DEBUG_MODE} coverage)"
         fi
     fi
     HOST_FONTS="${BUILD_DIR}/disk/usr/share/fonts"
