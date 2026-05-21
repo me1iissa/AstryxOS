@@ -143,10 +143,31 @@ static F3_ARM_COUNT: AtomicU32 = AtomicU32::new(0);
 /// the worst case.
 const FIREFOX_BIN_SUBSTRING: &str = "firefox-bin";
 
-/// Path-substring gate.  Lowercase compare against the supplied final-path
-/// argument.  Returns `true` if the substring is present.
+/// Path-substring gate.  Case-sensitive path match — the firefox-bin path
+/// is canonical lowercase, so this is intentional.
 fn path_matches(path: &str) -> bool {
     path.contains(FIREFOX_BIN_SUBSTRING)
+}
+
+/// Atomically claim an arm-cycle index in the range `[0, F3_ARM_MAX)`.
+/// Returns `Ok(arm_idx)` if a slot was claimed, or `Err(())` if the cap is
+/// already reached.  Uses `compare_exchange` (not `fetch_add`) so a
+/// refused-arm path never grows the counter past `F3_ARM_MAX` — the
+/// boot-bound on log emissions is then exactly `F3_ARM_MAX` accepted arms
+/// plus one `cap_reached` line.
+fn claim_arm_idx() -> Result<u32, ()> {
+    loop {
+        let cur = F3_ARM_COUNT.load(Ordering::Relaxed);
+        if cur >= F3_ARM_MAX {
+            return Err(());
+        }
+        if F3_ARM_COUNT
+            .compare_exchange(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Ok(cur);
+        }
+    }
 }
 
 /// Resolve the current backing phys for the canary slot VA under the
@@ -174,16 +195,26 @@ pub fn arm_after_execve(final_path: &str, cr3: u64, entry_rip: u64, entry_rsp: u
         return;
     }
 
-    let arm_idx = F3_ARM_COUNT.fetch_add(1, Ordering::Relaxed);
-    if arm_idx >= F3_ARM_MAX {
-        if arm_idx == F3_ARM_MAX {
-            crate::serial_println!(
-                "[F3-WATCH] state=cap_reached arm_idx={} cap={}",
-                arm_idx, F3_ARM_MAX,
-            );
+    let arm_idx = match claim_arm_idx() {
+        Ok(idx) => idx,
+        Err(()) => {
+            // First refused arm only: claim the one-shot transition
+            // emission via a separate AtomicBool so the cap_reached line
+            // fires exactly once even under concurrent execve races.
+            use core::sync::atomic::AtomicBool;
+            static CAP_REPORTED: AtomicBool = AtomicBool::new(false);
+            if CAP_REPORTED
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                crate::serial_println!(
+                    "[F3-WATCH] state=cap_reached arm_idx={} cap={}",
+                    F3_ARM_MAX, F3_ARM_MAX,
+                );
+            }
+            return;
         }
-        return;
-    }
+    };
 
     let pid = crate::proc::current_pid_lockless();
     let tid = crate::proc::current_tid();
@@ -258,21 +289,3 @@ pub fn arm_after_execve(final_path: &str, cr3: u64, entry_rip: u64, entry_rsp: u
     }
 }
 
-/// Final-report emission.  Called once at shutdown / harness-stop so the
-/// post-processor sees a closing summary regardless of how many arms /
-/// fires happened.
-///
-/// Currently a thin wrapper around `arch/x86_64/debug_reg.rs::stats()`
-/// because the per-slot fire counts are kept there; the F3 module's only
-/// owned state is `F3_ARM_COUNT`.
-pub fn final_report() {
-    let arms = F3_ARM_COUNT.load(Ordering::Relaxed);
-    let (dr_arms, dr_fires) = crate::arch::x86_64::debug_reg::stats();
-    let per_slot = crate::arch::x86_64::debug_reg::per_slot_fires();
-    crate::serial_println!(
-        "[F3-WATCH] kind=final f3_arms={} dr_arms={} dr_fires_total={} \
-         per_slot=[{},{},{},{}]",
-        arms, dr_arms, dr_fires,
-        per_slot[0], per_slot[1], per_slot[2], per_slot[3],
-    );
-}

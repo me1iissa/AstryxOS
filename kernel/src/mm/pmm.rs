@@ -67,6 +67,8 @@ impl RecentFreeRing {
 }
 
 #[cfg(feature = "firefox-test")]
+// See FREE_SHADOW in mm/w215_diag.rs for a parallel direct-addressed
+// tracer; future consolidation opportunity.
 static RECENT_FREE_RING: Mutex<RecentFreeRing> = Mutex::new(RecentFreeRing::new());
 
 /// H2 diagnostic counter: physical frames re-allocated within

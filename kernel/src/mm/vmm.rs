@@ -76,8 +76,9 @@ fn ring_caller_rip() -> u64 {
     {
         return 0;
     }
-    // [rbp+8] = saved return address into the caller's caller (one
-    // frame above `map_page_in` / `unmap_page_in` / `write_pte`).
+    // [rbp+8] is the return address INTO map_page_in/unmap_page_in/
+    // write_pte itself. addr2line + #[inline(never)] on these wrappers
+    // ensures the symbol resolves cleanly.
     // SAFETY: rbp+8 is within the higher-half direct map.
     unsafe { core::ptr::read_volatile((rbp + 8) as *const u64) }
 }
@@ -542,6 +543,9 @@ pub fn map_page_in(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -
     // Track K diagnostic: capture old phys (pre-change) for the user-stack
     // PTE-change ring.  Cheap branchless walk — short-circuited inside
     // `pte_change_record` when the VA is outside the user-stack window.
+    // Best-effort pre-mutation snapshot: a concurrent CPU may race between
+    // snapshot and the write below, so old_phys_for_ring can be stale.
+    // Diagnostic-only.
     #[cfg(feature = "firefox-test")]
     let old_phys_for_ring = read_pte(pml4_phys, virt_addr) & ADDR_MASK;
 
@@ -598,6 +602,9 @@ pub fn unmap_page_in(pml4_phys: u64, virt_addr: u64) {
     // PTE-change ring.  Lookup is short-circuited by the ring-window guard
     // inside `pte_change_record`; the `read_pte` walk runs only when the
     // diagnostic feature is on.
+    // Best-effort pre-mutation snapshot: a concurrent CPU may race between
+    // snapshot and the write below, so old_phys_for_ring can be stale.
+    // Diagnostic-only.
     #[cfg(feature = "firefox-test")]
     let old_phys_for_ring = read_pte(pml4_phys, virt_addr) & ADDR_MASK;
 
@@ -786,6 +793,9 @@ pub fn write_pte(pml4_phys: u64, virt_addr: u64, pte: u64) {
 
     // Track K: capture old PTE (pre-write) for the user-stack PTE-change
     // ring.  Mirrors the pattern in `map_page_in` / `unmap_page_in`.
+    // Best-effort pre-mutation snapshot: a concurrent CPU may race between
+    // snapshot and the write below, so old_phys_for_ring can be stale.
+    // Diagnostic-only.
     #[cfg(feature = "firefox-test")]
     let old_phys_for_ring = read_pte(pml4_phys, virt_addr) & ADDR_MASK;
 
