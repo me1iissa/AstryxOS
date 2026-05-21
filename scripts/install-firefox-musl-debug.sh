@@ -36,30 +36,42 @@
 #                                          subpackages="$pkgname-intl" only.
 #                                          (Compare community/firefox/ which DOES
 #                                          ship firefox-dbg.)
+#   firefox  (132.x)        YES          /usr/lib/debug/usr/lib/firefox/libxul.so.debug
+#                                          (~46 MiB libxul.so.debug carrying full
+#                                          .symtab ~420k symbols incl. FUNC plus
+#                                          minimal DWARF; addr2line / nm / gdb
+#                                          resolve C++ names automatically via
+#                                          the binary's .gnu_debuglink section).
+#                                          Pulled iff ASTRYXOS_FIREFOX_PACKAGE=firefox.
 #
 # Implication for libxul.so attribution
 # -------------------------------------
 #
-# Because Alpine does not ship debug symbols for firefox-esr, addr2line cannot
-# resolve RIPs inside libxul.so by .gnu_debuglink alone.  Three options exist:
+# Two attribution flows are wired, selected by ASTRYXOS_FIREFOX_PACKAGE:
 #
-#   1. Coarse function-level names via Mozilla's tecken symbol server.  Alpine
-#      uploads to tecken keyed by its exact ELF BuildID, so the .sym matches
-#      the Alpine libxul byte-for-byte (no VMA drift).  The .sym contains
-#      PUBLIC-only records (Alpine builds without DWARF), so coverage is
-#      .dynsym names plus their entry-point VMAs — ~8,600 symbols, enough to
-#      attribute K-class RIP fires to within a function (file/line not
-#      recoverable).  scripts/inject-libxul-symbols.sh --musl handles this
-#      automatically; create-data-disk.sh wires it whenever
-#      ASTRYXOS_FIREFOX_DEBUG is set with FIREFOX_VARIANT=musl.
+#   firefox-esr — Alpine does not ship debug symbols for firefox-esr, so the
+#                 attribution flow uses Mozilla's tecken symbol server.  Alpine
+#                 uploads to tecken keyed by its exact ELF BuildID, so the .sym
+#                 matches the Alpine libxul byte-for-byte (no VMA drift).  The
+#                 .sym contains PUBLIC-only records (Alpine builds firefox-esr
+#                 without DWARF), so coverage is .dynsym names plus their
+#                 entry-point VMAs — ~8,600 symbols, enough to attribute
+#                 K-class RIP fires to within a function (file/line not
+#                 recoverable).  scripts/inject-libxul-symbols.sh --musl handles
+#                 this automatically; create-data-disk.sh wires it whenever
+#                 ASTRYXOS_FIREFOX_DEBUG is set with FIREFOX_VARIANT=musl and
+#                 ASTRYXOS_FIREFOX_PACKAGE=firefox-esr.
 #
-#   2. Build firefox-esr from source inside an Alpine builder with
-#      --disable-strip and --disable-install-strip.  Multi-hour, multi-GiB.
-#      Out of scope for this script.
+#   firefox     — Alpine ships firefox-dbg with a full /usr/lib/debug/usr/lib/
+#                 firefox/libxul.so.debug, so this script stages it alongside
+#                 the GTK-stack -dbg files.  No Mozilla tecken indirection is
+#                 needed — addr2line resolves C++ names (e.g. mozilla::widget::
+#                 GfxInfo::FireGLXTestProcess()) automatically.  create-data-disk.sh
+#                 SKIPS the tecken injection in this mode.
 #
-#   3. Switch the data-disk from firefox-esr-115.x to firefox-132.x and use
-#      Alpine's firefox-dbg (47.9 MiB installed).  Changes the reproducer.
-#      Coordinator-level decision; not done by this script.
+# Escalation if Alpine ever stops shipping firefox-dbg: build firefox from
+# source inside an Alpine builder with --disable-strip and --disable-install-
+# strip.  Multi-hour, multi-GiB.  Out of scope for this script.
 #
 # Layout written to build/disk/
 # -----------------------------
@@ -133,8 +145,17 @@ ROOTFS="${CACHE_DIR}/rootfs"
 # Pinned set of -dbg packages we know Alpine v3.20 ships for the FF stack.
 # Adding a package here is a deliberate act; the script verifies each one
 # landed under ${ROOTFS}/usr/lib/debug/ after `apk add`.
+#
+# firefox-dbg is conditionally appended below for ASTRYXOS_FIREFOX_PACKAGE=
+# firefox (it has no analogue when the staged binary is firefox-esr).
 ALL_DBG_PKGS=(musl-dbg glib-dbg gdk-pixbuf-dbg cairo-dbg gtk+3.0-dbg)
 MUSL_ONLY_DBG_PKGS=(musl-dbg)
+
+# Package selection mirrors install-firefox-musl.sh.  Default firefox-esr to
+# preserve existing caller behaviour.  When firefox is selected and the user
+# does NOT also pass --musl-only, we stage firefox-dbg so libxul.so attribution
+# works via .gnu_debuglink (no Mozilla tecken indirection needed).
+FIREFOX_PKG="${ASTRYXOS_FIREFOX_PACKAGE:-firefox-esr}"
 
 FORCE=false
 MUSL_ONLY=false
@@ -142,8 +163,9 @@ for arg in "$@"; do
     case "${arg}" in
         --force) FORCE=true ;;
         --musl-only) MUSL_ONLY=true ;;
+        --package=*) FIREFOX_PKG="${arg#--package=}" ;;
         -h|--help)
-            sed -n '2,90p' "$0"
+            sed -n '2,100p' "$0"
             exit 0
             ;;
         *)
@@ -153,9 +175,24 @@ for arg in "$@"; do
     esac
 done
 
+case "${FIREFOX_PKG}" in
+    firefox-esr|firefox) ;;
+    *)
+        echo "[FF-MUSL-DBG] ERROR: unknown FIREFOX_PKG='${FIREFOX_PKG}' (expected firefox-esr|firefox)" >&2
+        exit 2
+        ;;
+esac
+
 DBG_PKGS=("${ALL_DBG_PKGS[@]}")
 if [ "${MUSL_ONLY}" = true ]; then
     DBG_PKGS=("${MUSL_ONLY_DBG_PKGS[@]}")
+fi
+
+# Append firefox-dbg when staging the firefox-132 package; --musl-only callers
+# intentionally skip it (they only want musl-dbg for ld-musl SSP attribution
+# and don't care about libxul symbol resolution).
+if [ "${FIREFOX_PKG}" = "firefox" ] && [ "${MUSL_ONLY}" = false ]; then
+    DBG_PKGS+=(firefox-dbg)
 fi
 
 # ── Preconditions ────────────────────────────────────────────────────────────
