@@ -300,6 +300,28 @@ if [ "${FIREFOX_DEBUG_MODE}" != off ] && \
         echo "[DATA-DISK] WARNING: install-firefox-musl-debug.sh failed — /usr/lib/debug not staged"
 fi
 
+# ── Optional: inject .symtab into the musl libxul.so ─────────────────────────
+# Alpine's firefox-esr does NOT ship a -dbg subpackage (verified vs
+# community/firefox 132.x which DOES; see scripts/install-firefox-musl-debug.sh
+# "Implication for libxul.so attribution").  Instead, Mozilla's symbol server
+# (tecken) indexes the exact Alpine BuildID and serves a gzipped Breakpad
+# .sym (~9 MiB compressed) that lists every .dynsym entry as a PUBLIC record.
+# scripts/inject-libxul-symbols.sh --musl downloads the .sym, derives the
+# Breakpad GUID from the libxul BuildID, and splices an Elf64_Sym .symtab
+# into libxul.so.  The .text section is byte-identical pre/post (verified
+# by SHA256 inside the script) — no upstream-binary edit.
+#
+# Triggered together with the -dbg companion stage so a single
+# ASTRYXOS_FIREFOX_DEBUG=musl|1|full request gets all attribution avenues.
+if [ "${FIREFOX_DEBUG_MODE}" != off ] && \
+   [ -f "${ROOT_DIR}/scripts/inject-libxul-symbols.sh" ] && \
+   [ -f "${BUILD_DIR}/disk/usr/lib/firefox-esr/libxul.so" ]; then
+    MUSL_SYM_FLAGS="--musl"
+    [ "${FORCE}" = true ] && MUSL_SYM_FLAGS="${MUSL_SYM_FLAGS} --force"
+    bash "${ROOT_DIR}/scripts/inject-libxul-symbols.sh" ${MUSL_SYM_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
+        echo "[DATA-DISK] WARNING: inject-libxul-symbols.sh --musl failed — libxul.so will lack .symtab"
+fi
+
 # Stage a /tmp/hello.html for the headless oracle test — install-firefox.sh
 # does this in the glibc path, but we skipped that script.
 mkdir -p "${BUILD_DIR}/disk/tmp"
