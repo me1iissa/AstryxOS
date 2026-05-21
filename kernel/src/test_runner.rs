@@ -984,6 +984,11 @@ pub fn run() -> ! {
     total += 1;
     if test_aslr_shared_lib() { passed += 1; }
 
+    // ── Test 107c: mmap_hint not dragged downward by MAP_FIXED placements ─
+
+    total += 1;
+    if test_mmap_hint_not_dragged_by_fixed() { passed += 1; }
+
     // ── Test 108: ASLR — ET_EXEC load base is stable (never randomised) ───
 
     total += 1;
@@ -20467,6 +20472,70 @@ fn test_aslr_shared_lib() -> bool {
     drop(vm_stack);
 
     test_pass!("ASLR — shared-library VA jitter (interpreter + mmap hint)");
+    true
+}
+
+// ── Test 107c: mmap_hint not dragged downward by MAP_FIXED placements ────────
+//
+// PR #365 seeds each VmSpace with a randomised `mmap_hint` so NULL-hint mmaps
+// (per POSIX mmap(2) when `addr == NULL`) land at a per-process randomised
+// upper bound.  A dynamic linker that MAP_FIXED-loads shared libraries at a
+// PIE-biased load base must NOT drag this hint down, because doing so
+// destroys the per-process entropy before any later NULL-hint allocation
+// (notably pthread_create(3)'s stack fallback path) is ever issued.
+//
+// References: POSIX mmap(2), pthread_create(3), CWE-330.
+
+fn test_mmap_hint_not_dragged_by_fixed() -> bool {
+    test_header!("mmap_hint not dragged downward by MAP_FIXED placements");
+
+    let mut vm = match crate::mm::vma::VmSpace::new_user() {
+        Some(v) => v,
+        None => { test_fail!("mmap_hint_fixed", "VmSpace::new_user() failed"); return false; }
+    };
+    let hint_initial = vm.mmap_hint;
+    test_println!("  hint_initial: {:#x}", hint_initial);
+
+    // Step 1: NULL-hint anonymous mmap lowers the hint (downward walk).
+    const ALLOC_LEN: u64 = 0x10_0000; // 1 MiB
+    let va_a = hint_initial - ALLOC_LEN;
+    vm.note_mmap_placement(va_a, /*is_fixed=*/false, /*is_stack_alloc=*/false);
+    test_println!("  after NULL-hint base={:#x}: hint={:#x}", va_a, vm.mmap_hint);
+    if vm.mmap_hint != va_a {
+        test_fail!("mmap_hint_fixed",
+                   "NULL-hint should lower hint to {:#x}, got {:#x}", va_a, vm.mmap_hint);
+        return false;
+    }
+
+    // Step 2: MAP_FIXED at PIE-biased base must NOT drag the hint
+    // (the libxul-via-ld-musl pattern at ~0x3F_xxxx_xxxx).
+    const FIXED_VA: u64 = 0x0000_003F_5E7C_0000;
+    let hint_before_fixed = vm.mmap_hint;
+    vm.note_mmap_placement(FIXED_VA, /*is_fixed=*/true, /*is_stack_alloc=*/false);
+    test_println!("  after MAP_FIXED base={:#x}: hint={:#x} (must equal {:#x})",
+                  FIXED_VA, vm.mmap_hint, hint_before_fixed);
+    if vm.mmap_hint != hint_before_fixed {
+        test_fail!("mmap_hint_fixed",
+                   "MAP_FIXED at {:#x} dragged hint {:#x} -> {:#x} (PR #365 entropy lost)",
+                   FIXED_VA, hint_before_fixed, vm.mmap_hint);
+        return false;
+    }
+
+    // Step 3: a follow-up NULL-hint allocation still walks downward from the
+    // high jittered region, not from FIXED_VA.  Exit criterion: the next
+    // placement lies well above FIXED_VA.
+    let va_b_predicted = vm.mmap_hint - ALLOC_LEN;
+    test_println!("  next NULL-hint would land at {:#x} (must be > {:#x})",
+                  va_b_predicted, FIXED_VA + ALLOC_LEN);
+    if va_b_predicted <= FIXED_VA + ALLOC_LEN {
+        test_fail!("mmap_hint_fixed",
+                   "next NULL-hint {:#x} too close to FIXED base {:#x} — hint dragged",
+                   va_b_predicted, FIXED_VA);
+        return false;
+    }
+
+    drop(vm);
+    test_pass!("mmap_hint not dragged downward by MAP_FIXED placements");
     true
 }
 
