@@ -361,6 +361,49 @@ cp -aL "${ROOTFS}/usr/lib/." "${DISK_USR_LIB}/" 2>/dev/null || true
 # Drop apk's bookkeeping; not useful at runtime.
 rm -rf "${DISK_USR_LIB}/apk" 2>/dev/null || true
 
+# (c2) Auxiliary data trees under /usr/share/.  Several Alpine packages
+# split runtime data from the .so files: the dynamic loader resolves the
+# stub library by SONAME, but the library reads its real payload from a
+# fixed path under /usr/share/<pkg>/ at runtime.  Notable examples:
+#
+#   /usr/share/icu/<ver>/icudt<ver>l.dat     ← libicudata.so.<ver> is a
+#                                              9 KiB stub; the 2.7 MiB
+#                                              data file is here.  ICU
+#                                              u_init() returns
+#                                              U_FILE_ACCESS_ERROR
+#                                              without it, and SpiderMonkey
+#                                              JS_Init aborts inside
+#                                              NS_InitXPCOM.
+#   /usr/share/mime/                         ← shared-mime-info DB used
+#                                              by GIO/GTK file-type queries.
+#   /usr/share/X11/xkb/                      ← libxkbcommon keymap rules.
+#   /usr/share/glib-2.0/schemas/             ← compiled GSettings schemas
+#                                              looked up by GIO at startup.
+#   /usr/share/icons/, /usr/share/themes/    ← GTK icon/theme resolution.
+#   /usr/share/dbus-1/, applications/, etc.  ← misc runtime metadata.
+#
+# Total ~15 MiB across all subdirs — comfortably within the data.img
+# budget.  Skip Alpine build-time helpers (aclocal/, pkgconfig/, gettext/)
+# and human-only content (doc/, man/, info/, locale/) which contribute no
+# runtime behaviour.
+DISK_USR_SHARE="${DISK_DIR}/usr/share"
+if [ -d "${ROOTFS}/usr/share" ]; then
+    mkdir -p "${DISK_USR_SHARE}"
+    # Allow-list of runtime-relevant subdirs.  Anything not in this list is
+    # build-time helpers or human-readable docs; we drop it to keep the
+    # data image lean and to avoid surprising side-effects from copying
+    # everything Alpine happens to ship.
+    for share_subdir in icu mime X11 glib-2.0 icons themes dbus-1 applications \
+                        gtk-3.0 fontconfig drirc.d alsa libdrm hwdata defaults \
+                        metainfo thumbnailers xml; do
+        if [ -d "${ROOTFS}/usr/share/${share_subdir}" ]; then
+            mkdir -p "${DISK_USR_SHARE}/${share_subdir}"
+            cp -aL "${ROOTFS}/usr/share/${share_subdir}/." \
+                "${DISK_USR_SHARE}/${share_subdir}/" 2>/dev/null || true
+        fi
+    done
+fi
+
 # Within ${DISK_FF_TREE}: ensure both "firefox-bin" and "firefox" sentinel
 # names exist so callers that follow the launcher's readlink("/proc/self/exe")
 # + "-bin" convention (or its plain-name fallback) resolve there.
