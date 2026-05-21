@@ -3566,6 +3566,31 @@ pub fn alloc_tls(tid: Tid) -> Option<u64> {
 /// # Safety
 /// Must only be called with a valid virtual address.
 pub unsafe fn write_fs_base(base: u64) {
+    // FS_BASE-trace probe: record (old_fs, new_fs, caller_rip) into the
+    // per-boot ring BEFORE the WRMSR so a later SSP-canary `#GP` can dump
+    // the trapping TID's FS.base history.  Captures every write that
+    // routes through this canonical kernel API: `restore_tls_for_current`
+    // (scheduler context-switch, sched/mod.rs) and `enter_user_mode`
+    // (boot, exec, fork-child bootstrap via `user_mode_bootstrap`).
+    // Diagnostic-only; gated behind `fs-base-trace`.  Intel SDM Vol. 3A
+    // §3.4.4.1 (`IA32_FS_BASE` MSR).
+    #[cfg(feature = "fs-base-trace")]
+    {
+        let old_fs = crate::hal::rdmsr(IA32_FS_BASE);
+        // Best-effort caller RIP: use the current `RIP` indirectly via
+        // a return-address read.  The kernel-mode return address sits
+        // at `[rsp + 0]` for an inlined frame, but `write_fs_base` is
+        // marked `#[inline(never)]`-implicit via `pub unsafe fn`; just
+        // pass 0 as the site marker — the kind+old/new pair already
+        // names the path well enough.
+        crate::subsys::linux::fs_base_trace::record_event(
+            crate::subsys::linux::fs_base_trace::KIND_WRITE_FS_BASE,
+            old_fs,
+            base,
+            0,
+        );
+    }
+
     let lo = base as u32;
     let hi = (base >> 32) as u32;
     core::arch::asm!(
