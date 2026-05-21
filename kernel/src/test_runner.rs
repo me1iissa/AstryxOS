@@ -2041,6 +2041,16 @@ pub fn run() -> ! {
     total += 1;
     if test_264_vfork_child_tls_layout() { passed += 1; }
 
+    // ── Test 265: execve(2) resets clear_child_tid + robust_list ────────
+    // Verifies the `exec_reset_thread_exit_slots` helper that `sys_exec`
+    // calls between new-image install and SYSRET-frame rewrite zeroes
+    // `clear_child_tid`, `robust_list_head`, `robust_list_len` on the
+    // surviving thread per `execve(2)`/`clone(2)` (CLONE_CHILD_CLEARTID)
+    // and `set_robust_list(2)`/`get_robust_list(2)` ABI.  Threat-model:
+    // CWE-672 (Operation on Resource After Expiration or Release).
+    total += 1;
+    if test_265_exec_resets_cleartid_and_robust_list() { passed += 1; }
+
     // ── Tests 261-263: native-core hardening (cycle 3) ──────────────────
     // Gated on `native-core-tests` feature: the three native-core tests
     // (page_ref_dec CAS underflow, OB refcount integration, scheduler
@@ -35914,4 +35924,138 @@ fn test_264_vfork_child_tls_layout() -> bool {
 
     test_pass!("alloc_vfork_child_tls layout (musl posix_spawn unblocker)");
     true
+}
+
+// ── Test 265: execve(2) resets clear_child_tid + robust_list ─────────────────
+//
+// Per `execve(2)` and `clone(2)`, the new image starts with a fresh
+// thread-exit-protocol slate: the `CLONE_CHILD_CLEARTID` user-VA
+// registered by `set_tid_address(2)` and the robust-futex list head/length
+// registered by `set_robust_list(2)` are dropped on exec.  If the new
+// image cares about either, it re-registers from its own startup.
+// Carrying the old image's values across exec would let a later
+// `exit_thread` zero-store + `FUTEX_WAKE` (the `CLONE_CHILD_CLEARTID`
+// protocol) land on whatever VA the new image happens to have at that
+// offset, and would let the kernel walk a stale robust-list head into
+// unrelated memory at the next exit.
+//
+// This test exercises the `exec_reset_thread_exit_slots` helper that
+// `sys_exec` calls between the new-image install and the SYSRET-frame
+// rewrite.  The helper is testable in isolation; the full `sys_exec`
+// path requires a userspace VmSpace which the kernel-only test runner
+// doesn't have.
+//
+// References:
+//   * Linux `clone(2)` (CLONE_CHILD_CLEARTID semantics, set_child_tid)
+//   * Linux `execve(2)` (thread-state reset on image replacement)
+//   * Linux `set_tid_address(2)`
+//   * Linux `set_robust_list(2)` / `get_robust_list(2)`
+//   * Linux `futex(2)` (FUTEX_WAKE on task exit)
+//   * POSIX-1.2017 `execve(2)`
+fn test_265_exec_resets_cleartid_and_robust_list() -> bool {
+    test_header!("execve(2) resets clear_child_tid + robust_list");
+
+    let tid = crate::proc::current_tid();
+
+    // Stash whatever the kernel-test-runner thread already has registered
+    // so the assertion below is exclusively about the reset semantics,
+    // and so the test leaves THREAD_TABLE indistinguishable from how it
+    // found it (no leakage into subsequent tests).
+    let (saved_cct, saved_rlh, saved_rll) = {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        match threads.iter().find(|t| t.tid == tid) {
+            Some(t) => (t.clear_child_tid, t.robust_list_head, t.robust_list_len),
+            None => {
+                test_fail!("test265",
+                    "current_tid={} not present in THREAD_TABLE — test \
+                     prerequisite broken", tid);
+                return false;
+            }
+        }
+    };
+
+    // Plant sentinel values that are obviously not zero, obviously not a
+    // plausible default, and obviously not derived from any current
+    // pointer the kernel might hand out.
+    const SENTINEL_CCT: u64    = 0x0123_4567_89ab_cdef;
+    const SENTINEL_RLH: u64    = 0xfedc_ba98_7654_3210;
+    const SENTINEL_RLL: usize  = 0xa5a5_a5a5;
+
+    {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+            t.clear_child_tid  = SENTINEL_CCT;
+            t.robust_list_head = SENTINEL_RLH;
+            t.robust_list_len  = SENTINEL_RLL;
+        }
+    }
+
+    // Readback sanity — the plant landed.
+    {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        let t = threads.iter().find(|t| t.tid == tid).unwrap();
+        if t.clear_child_tid  != SENTINEL_CCT
+        || t.robust_list_head != SENTINEL_RLH
+        || t.robust_list_len  != SENTINEL_RLL
+        {
+            test_fail!("test265",
+                "Pre-reset plant did not land: cct={:#x} rlh={:#x} rll={:#x}",
+                t.clear_child_tid, t.robust_list_head, t.robust_list_len);
+            return false;
+        }
+    }
+    test_println!("  Pre-reset plant: cct={:#x} rlh={:#x} rll={:#x} ✓",
+        SENTINEL_CCT, SENTINEL_RLH, SENTINEL_RLL);
+
+    // Exercise the helper that `sys_exec` calls.
+    crate::syscall::exec_reset_thread_exit_slots(tid);
+
+    // All three slots must now be zero.
+    let (post_cct, post_rlh, post_rll) = {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        let t = threads.iter().find(|t| t.tid == tid).unwrap();
+        (t.clear_child_tid, t.robust_list_head, t.robust_list_len)
+    };
+
+    let mut ok = true;
+    if post_cct != 0 {
+        test_fail!("test265",
+            "clear_child_tid not reset: got {:#x}, expected 0 \
+             (execve(2)/clone(2) CLONE_CHILD_CLEARTID slate)", post_cct);
+        ok = false;
+    } else {
+        test_println!("  clear_child_tid reset to 0 ✓");
+    }
+    if post_rlh != 0 {
+        test_fail!("test265",
+            "robust_list_head not reset: got {:#x}, expected 0 \
+             (set_robust_list(2) slate)", post_rlh);
+        ok = false;
+    } else {
+        test_println!("  robust_list_head reset to 0 ✓");
+    }
+    if post_rll != 0 {
+        test_fail!("test265",
+            "robust_list_len not reset: got {:#x}, expected 0 \
+             (set_robust_list(2) slate)", post_rll);
+        ok = false;
+    } else {
+        test_println!("  robust_list_len reset to 0 ✓");
+    }
+
+    // Restore whatever was there before the test so the runner thread
+    // leaves the table in the state it found it.
+    {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+            t.clear_child_tid  = saved_cct;
+            t.robust_list_head = saved_rlh;
+            t.robust_list_len  = saved_rll;
+        }
+    }
+
+    if ok {
+        test_pass!("execve(2) resets clear_child_tid + robust_list");
+    }
+    ok
 }
