@@ -2477,17 +2477,23 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
 
     match space.insert_vma(vma) {
         Ok(()) => {
-            // MAP_STACK allocations live in the stack-ASLR window (above
-            // `MMAP_BASE`); they must NOT lower `mmap_hint` because doing so
-            // would have no effect on the general allocator's downward walk
-            // (which is already below `MMAP_BASE`) and would needlessly
-            // perturb invariants tested by mm::vma::find_free_range callers
-            // that assume `mmap_hint <= MMAP_BASE`.  Likewise MAP_FIXED
-            // allocations at user-chosen addresses inside the stack window
-            // should not perturb the hint.
-            if !is_stack_alloc && base < space.mmap_hint {
-                space.mmap_hint = base;
-            }
+            // Lower `mmap_hint` only when this allocation participates in the
+            // NULL-hint downward-walk regime — i.e. neither MAP_FIXED nor a
+            // MAP_STACK kernel-chosen allocation.  See
+            // `VmSpace::note_mmap_placement` for the full rationale; the
+            // critical case is MAP_FIXED at a PIE-biased shared-library load
+            // base, which would otherwise destroy the per-process entropy
+            // seeded by `randomised_mmap_hint()` before any NULL-hint
+            // allocation is ever issued (POSIX mmap(2), CWE-330).
+            let hint_before = space.mmap_hint;
+            space.note_mmap_placement(base, is_fixed, is_stack_alloc);
+            let hint_after = space.mmap_hint;
+            #[cfg(all(feature = "firefox-test", feature = "firefox-trace-verbose"))]
+            crate::serial_println!(
+                "[MMAP-HINT] pid={} base={:#x} hint_before={:#x} hint_after={:#x} is_fixed={} is_stack_alloc={}",
+                pid, base, hint_before, hint_after, is_fixed as u8, is_stack_alloc as u8
+            );
+            let _ = (hint_before, hint_after);
             base as i64
         }
         Err(_) => {
