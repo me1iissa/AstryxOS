@@ -673,6 +673,35 @@ EOF
                 grep -v "^$" | grep -iv "^skipping" | head -20 || true
             echo "[DATA-DISK] Copied /usr/lib/debug/ to data image (${FIREFOX_DEBUG_MODE} coverage)"
         fi
+
+        # ── Runtime data trees under /usr/share/ ────────────────────────────
+        # Several Alpine packages split their runtime payload from the .so:
+        # libicudata.so is a 9 KiB stub, the real 2.7 MiB tables live at
+        # /usr/share/icu/<ver>/icudt<ver>l.dat.  Without these files the
+        # libraries fail at first use (ICU u_init -> U_FILE_ACCESS_ERROR,
+        # which aborts SpiderMonkey JS_Init inside NS_InitXPCOM).  Staged
+        # into build/disk/usr/share/ by install-firefox-musl.sh (allow-list
+        # of runtime-relevant subdirs); copied into the FAT32 image here.
+        MUSL_USR_SHARE="${BUILD_DIR}/disk/usr/share"
+        if [ -d "${MUSL_USR_SHARE}" ]; then
+            mmd -i "${DATA_IMG}" "::usr"       2>/dev/null || true
+            mmd -i "${DATA_IMG}" "::usr/share" 2>/dev/null || true
+            # Each subdir is copied independently so a single oversized or
+            # symlink-pathological subtree can't take down the whole step.
+            # Skip the "fonts" subdir — it is staged by the HOST_FONTS block
+            # below from the host DejaVu install, not from the Alpine rootfs.
+            for share_subdir in "${MUSL_USR_SHARE}"/*; do
+                [ -d "${share_subdir}" ] || continue
+                share_name="$(basename "${share_subdir}")"
+                [ "${share_name}" = "fonts" ] && continue
+                share_size="$(du -sh "${share_subdir}" | cut -f1)"
+                echo "[DATA-DISK] Copying /usr/share/${share_name} (${share_size}) to data image..."
+                mmd -i "${DATA_IMG}" "::usr/share/${share_name}" 2>/dev/null || true
+                mcopy -s -o -i "${DATA_IMG}" "${share_subdir}/." \
+                    "::usr/share/${share_name}/" 2>&1 | \
+                    grep -v "^$" | grep -iv "^skipping" | head -10 || true
+            done
+        fi
     fi
     HOST_FONTS="${BUILD_DIR}/disk/usr/share/fonts"
     if [ -d "${HOST_FONTS}/truetype/dejavu" ]; then
