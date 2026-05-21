@@ -11,15 +11,27 @@ Usage:
         --output <path/to/libxul.sym.so>
 
 The Breakpad .sym format (see https://chromium.googlesource.com/breakpad/) has
-FUNC records of the form:
+two relevant per-symbol record types:
 
-    FUNC <hex_offset> <size_hex> <param_size_hex> <demangled_name>
+    FUNC   <hex_offset> <size_hex> <param_size_hex> <demangled_name>
+    PUBLIC [m] <hex_offset> <param_size_hex> <demangled_name>
 
-where <hex_offset> is the ELF VMA (load-time address for a PIE/shared object,
+`FUNC` records carry an explicit byte size and are produced when the upstream
+build was compiled with DWARF debug info (Mozilla's release builds for the
+official Firefox channels).  `PUBLIC` records are derived from the dynamic
+symbol table (.dynsym) plus per-platform demanglers and are emitted by
+dump_syms when no DWARF is available — for example, third-party rebuilds
+(Alpine's community/firefox-esr, Debian's firefox-esr, distro packages
+generally).  PUBLIC carries no size; we set st_size = 0 and let nm / addr2line
+treat the entry as a function-entry-point address.  The optional "m" token
+flags a multiple-definition symbol; we ignore it (objcopy/nm handle dupes
+correctly because we use STB_LOCAL).
+
+`<hex_offset>` is the ELF VMA (load-time address for a PIE/shared object,
 i.e. the same value you'd find in .symtab st_value for a shared library).
 
 This script:
-  1. Parses FUNC records from the .sym file.
+  1. Parses FUNC and PUBLIC records from the .sym file.
   2. Builds an Elf64_Sym array (.symtab) and a null-terminated string table
      (.strtab).
   3. Appends both sections to the ELF using objcopy --add-section.
@@ -78,30 +90,83 @@ SHN_ABS = 0xfff1
 
 def parse_sym(sym_path: Path) -> list[tuple[int, int, str]]:
     """
-    Parse FUNC records from a Mozilla Breakpad .sym file.
+    Parse FUNC and PUBLIC records from a Mozilla Breakpad .sym file.
 
-    Returns a list of (vma, size, name) tuples, one per FUNC record.
+    Returns a list of (vma, size, name) tuples, one per FUNC or PUBLIC record.
     Names are already demangled in the .sym file.
+
+    PUBLIC records carry no explicit size (Breakpad spec: size field absent —
+    PUBLIC tokens are entry-point pointers, not extents).  We set size=0 for
+    those entries.  nm and addr2line treat STT_FUNC symbols with st_size=0 as
+    entry-point markers and still resolve names via the nearest-below lookup
+    that binutils performs internally, which is sufficient for kdb
+    rip-trace-resolve attribution.
+
+    FUNC and PUBLIC are not mutually exclusive in a well-formed .sym; in
+    practice Mozilla's release builds emit FUNC only, and dump_syms builds
+    against stripped third-party binaries (Alpine, Debian) emit PUBLIC only.
+    We accept both so a single injection pass handles either source.
     """
     funcs: list[tuple[int, int, str]] = []
-    # The .sym file may be large (690 MiB) — read line-by-line to avoid
-    # loading the whole thing into memory at once.
+    # The .sym file may be large (690 MiB for Mozilla release builds, ~90 MiB
+    # for Alpine PUBLIC-only) — read line-by-line to avoid loading it whole.
+    n_func = 0
+    n_public = 0
     with open(sym_path, "r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
-            if not line.startswith("FUNC "):
-                continue
-            # FUNC <addr_hex> <size_hex> <param_size_hex> <name>
-            parts = line.split(None, 4)
-            if len(parts) < 5:
-                continue
-            try:
-                vma = int(parts[1], 16)
-                size = int(parts[2], 16)
-            except ValueError:
-                continue
-            name = parts[4].rstrip("\n")
-            if name:
-                funcs.append((vma, size, name))
+            if line.startswith("FUNC "):
+                # FUNC [m] <addr_hex> <size_hex> <param_size_hex> <name>
+                # The "m" multiple-definition flag is optional (sits at
+                # parts[1]); when absent the address is at parts[1] and the
+                # name at parts[4].  Mozilla release builds emit FUNC without
+                # the m flag; we accept both to be tolerant of future format
+                # variants.
+                parts = line.split(None, 5)
+                if len(parts) < 5:
+                    continue
+                if parts[1] == "m":
+                    if len(parts) < 6:
+                        continue
+                    addr_field, size_field = parts[2], parts[3]
+                    name = parts[5].rstrip("\n")
+                else:
+                    addr_field, size_field = parts[1], parts[2]
+                    name = parts[4].rstrip("\n")
+                try:
+                    vma = int(addr_field, 16)
+                    size = int(size_field, 16)
+                except ValueError:
+                    continue
+                if name:
+                    funcs.append((vma, size, name))
+                    n_func += 1
+            elif line.startswith("PUBLIC "):
+                # PUBLIC [m] <addr_hex> <param_size_hex> <name>
+                # The optional "m" multiple-definition flag sits at parts[1];
+                # the address is then at parts[2] and the name at parts[4].
+                # Without "m" the address is at parts[1] and the name at
+                # parts[3].
+                parts = line.split(None, 4)
+                if len(parts) < 4:
+                    continue
+                if parts[1] == "m":
+                    if len(parts) < 5:
+                        continue
+                    addr_field = parts[2]
+                    name = parts[4].rstrip("\n")
+                else:
+                    addr_field = parts[1]
+                    name = parts[3].rstrip("\n")
+                try:
+                    vma = int(addr_field, 16)
+                except ValueError:
+                    continue
+                if name and vma != 0:
+                    # st_size = 0 — PUBLIC has no size; nm / addr2line tolerate
+                    # this and treat the symbol as an entry-point marker.
+                    funcs.append((vma, 0, name))
+                    n_public += 1
+    print(f"      Parsed FUNC={n_func:,}  PUBLIC={n_public:,}")
     return funcs
 
 
