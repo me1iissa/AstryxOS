@@ -81,9 +81,13 @@ static VDSO_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vdso.so"));
 
 /// Virtual base of the vDSO + vvar window in every user process.
 ///
-/// Located 16 MiB below the interpreter base (`INTERP_BASE = 0x7F00_0000_0000`)
-/// so neither the interpreter's BSS expansion nor any stack growth can
-/// collide with it.
+/// Located 16 MiB below the legacy fixed-interpreter base
+/// (`0x7F00_0000_0000`).  The interpreter now uses per-`exec()` ASLR
+/// (`proc::elf::interp_aslr_base()`) inside `[0x7F40_0000_0000,
+/// 0x7FC0_0000_0000)`, which is well above this vDSO window — so the
+/// previous "16 MiB below ld-musl" non-collision invariant is preserved
+/// (any randomised interpreter placement is at least 256 GiB above the
+/// vDSO).  See vdso(7).
 pub const VDSO_WINDOW_BASE: u64 = 0x7EFF_F000_0000;
 
 /// Fixed sub-offset within the window: vvar page first, vDSO ELF second.

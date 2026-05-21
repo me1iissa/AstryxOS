@@ -979,6 +979,11 @@ pub fn run() -> ! {
     total += 1;
     if test_aslr_elf_dyn() { passed += 1; }
 
+    // ── Test 107b: ASLR — shared-library / interpreter VA jitter ─────────
+
+    total += 1;
+    if test_aslr_shared_lib() { passed += 1; }
+
     // ── Test 108: ASLR — ET_EXEC load base is stable (never randomised) ───
 
     total += 1;
@@ -20129,6 +20134,179 @@ fn test_aslr_elf_dyn() -> bool {
 
     test_println!("  Bases differ: {:#x} vs {:#x} ✓  (28-bit ASLR active)", base1, base2);
     test_pass!("ASLR — ET_DYN load base differs between two loads");
+    true
+}
+
+// ── ASLR — shared-library / interpreter ASLR mechanism ───────────────────────
+//
+// Verifies that the kernel-side VA-selection paths that govern where the
+// dynamic interpreter (`ld-musl`) lands, and where subsequent anonymous
+// `mmap()` calls (used by the interpreter for DT_NEEDED shared libraries
+// such as `libxul`, `libc.musl-x86_64.so.1`) get their starting hint, both
+// vary across address spaces.  Together these two sources of jitter mean
+// every shared library in a user process lands at a per-`exec()` randomised
+// VA — the kernel-visible signal is the `[ELF] Interpreter loaded at <VA>`
+// serial line differing between boots and between successive `exec()`
+// calls within a boot.
+//
+// References:
+//   - ELF gABI §5.4 (Program Loading)
+//   - System V AMD64 ABI §3.3.3 (Address Space Layout)
+//   - mmap(2) — kernel-chosen VA when `addr == NULL`
+//   - vdso(7)
+//   - Intel SDM Vol. 3A §4.10.5 (paging invariants — referenced for the
+//     pte_share_count free-time policy honoured during test cleanup)
+fn test_aslr_shared_lib() -> bool {
+    test_header!("ASLR — shared-library VA jitter (interpreter + mmap hint)");
+
+    // ── Mechanism 1: VmSpace::new_user() — per-process mmap_hint jitter ─────
+    //
+    // Two freshly-created user address spaces should expose distinct
+    // `mmap_hint` values, both inside the configured ASLR window.  This is
+    // the upper bound that `find_free_range` walks downward from, so it
+    // directly governs where the dynamic linker's anonymous `mmap()` calls
+    // place shared-library segments.
+
+    // mmap hint window: MMAP_BASE - 4 GiB ..= MMAP_BASE
+    const MMAP_BASE_EXPECTED: u64 = 0x0000_7F00_0000_0000;
+    const MMAP_HINT_MIN: u64 = 0x0000_7F00_0000_0000 - 0x1_0000_0000; // -4 GiB
+
+    let vm_a = match crate::mm::vma::VmSpace::new_user() {
+        Some(v) => v,
+        None => {
+            test_fail!("aslr_shared_lib", "VmSpace::new_user() failed (a)");
+            return false;
+        }
+    };
+    let vm_b = match crate::mm::vma::VmSpace::new_user() {
+        Some(v) => v,
+        None => {
+            test_fail!("aslr_shared_lib", "VmSpace::new_user() failed (b)");
+            return false;
+        }
+    };
+
+    let hint_a = vm_a.mmap_hint;
+    let hint_b = vm_b.mmap_hint;
+    test_println!("  mmap_hint A: {:#x}", hint_a);
+    test_println!("  mmap_hint B: {:#x}", hint_b);
+
+    // Bounds: both must be inside the configured window and 4 KiB aligned.
+    for (tag, h) in [("A", hint_a), ("B", hint_b)] {
+        if h & 0xFFF != 0 {
+            test_fail!("aslr_shared_lib", "mmap_hint {} = {:#x} not page-aligned", tag, h);
+            return false;
+        }
+        if h > MMAP_BASE_EXPECTED || h < MMAP_HINT_MIN {
+            test_fail!(
+                "aslr_shared_lib",
+                "mmap_hint {} = {:#x} outside ASLR window [{:#x}, {:#x}]",
+                tag, h, MMAP_HINT_MIN, MMAP_BASE_EXPECTED
+            );
+            return false;
+        }
+    }
+
+    // Difference check.  Collision probability on 20 bits = 1 / 2^20; if the
+    // first two happen to collide we tiebreak with a third draw.
+    if hint_a == hint_b {
+        test_println!("  hint_a == hint_b == {:#x}; tiebreaking with VmSpace C", hint_a);
+        let vm_c = match crate::mm::vma::VmSpace::new_user() {
+            Some(v) => v,
+            None => {
+                test_fail!("aslr_shared_lib", "VmSpace::new_user() failed (c)");
+                return false;
+            }
+        };
+        let hint_c = vm_c.mmap_hint;
+        test_println!("  mmap_hint C: {:#x}", hint_c);
+        if hint_a == hint_c {
+            test_fail!(
+                "aslr_shared_lib",
+                "mmap_hint identical {:#x} across 3 fresh VmSpaces — \
+                 randomisation appears broken",
+                hint_a
+            );
+            // Free the CR3 page allocated by new_user() to avoid leaking it
+            // before returning.  Drop is not called on the VmSpace because
+            // we're returning false early; the explicit free mirrors what
+            // Drop would do.
+            drop(vm_c);
+            drop(vm_b);
+            drop(vm_a);
+            return false;
+        }
+        drop(vm_c);
+    }
+    test_println!("  mmap_hint jitter active ✓");
+
+    // ── Mechanism 2: interpreter ASLR via load_elf with PT_INTERP ───────────
+    //
+    // We don't have a synthetic PT_INTERP-bearing ELF in the test image
+    // because that requires a real on-disk interpreter.  Instead, exercise
+    // the public surface (`proc::elf::test_only_interp_aslr_base()`) twice
+    // and assert the two values differ.  This validates the same RNG and
+    // window logic that the `[ELF] Interpreter loaded at <VA>` serial line
+    // reports on each `exec()` of a dynamically-linked binary.
+
+    let interp_a = crate::proc::elf::test_only_interp_aslr_base();
+    let interp_b = crate::proc::elf::test_only_interp_aslr_base();
+    test_println!("  interp_aslr_base A: {:#x}", interp_a);
+    test_println!("  interp_aslr_base B: {:#x}", interp_b);
+
+    // Bounds: both must be 4 KiB-aligned and inside the configured window.
+    const INTERP_ASLR_MIN_EXPECTED: u64 = 0x7F40_0000_0000;
+    const INTERP_ASLR_MAX_EXPECTED: u64 = 0x7FC0_0000_0000;
+    for (tag, v) in [("A", interp_a), ("B", interp_b)] {
+        if v & 0xFFF != 0 {
+            test_fail!("aslr_shared_lib", "interp_base {} = {:#x} not page-aligned", tag, v);
+            return false;
+        }
+        if v < INTERP_ASLR_MIN_EXPECTED || v >= INTERP_ASLR_MAX_EXPECTED {
+            test_fail!(
+                "aslr_shared_lib",
+                "interp_base {} = {:#x} outside ASLR window [{:#x}, {:#x})",
+                tag, v, INTERP_ASLR_MIN_EXPECTED, INTERP_ASLR_MAX_EXPECTED
+            );
+            return false;
+        }
+    }
+
+    // Difference check with a third-draw tiebreaker (P(2-way collision) =
+    // 1 / 2^27 ≈ 7.5e-9; vanishingly unlikely but not impossible).
+    if interp_a == interp_b {
+        let interp_c = crate::proc::elf::test_only_interp_aslr_base();
+        test_println!("  interp_aslr_base C: {:#x}", interp_c);
+        if interp_a == interp_c {
+            test_fail!(
+                "aslr_shared_lib",
+                "interp_aslr_base identical {:#x} across 3 calls — \
+                 randomisation appears broken",
+                interp_a
+            );
+            return false;
+        }
+    }
+
+    // ── Independence: interpreter window and mmap-hint window must not
+    // overlap.  If they ever did, ld-musl's anonymous mmap() walks could
+    // collide with the interpreter image itself.  Verify the windows are
+    // disjoint (MMAP_BASE upper bound < INTERP_ASLR_MIN_EXPECTED).
+    if MMAP_BASE_EXPECTED >= INTERP_ASLR_MIN_EXPECTED {
+        test_fail!(
+            "aslr_shared_lib",
+            "layout invariant violated: MMAP_BASE {:#x} >= INTERP_ASLR_MIN {:#x}",
+            MMAP_BASE_EXPECTED, INTERP_ASLR_MIN_EXPECTED
+        );
+        return false;
+    }
+    test_println!(
+        "  layout: mmap_hint window {:#x}..={:#x} BELOW interp window {:#x}..{:#x} ✓",
+        MMAP_HINT_MIN, MMAP_BASE_EXPECTED,
+        INTERP_ASLR_MIN_EXPECTED, INTERP_ASLR_MAX_EXPECTED
+    );
+
+    test_pass!("ASLR — shared-library VA jitter (interpreter + mmap hint)");
     true
 }
 

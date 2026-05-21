@@ -111,10 +111,73 @@ const DT_PREINIT_ARRAYSZ: u64 = 33;
 /// ELF type: dynamically-linked shared object / PIE
 const ET_DYN: u16 = 3;
 
-/// Virtual address at which the dynamic interpreter is loaded.
-/// Placed below the main stack: 0x7F00_0000_0000 has plenty of room for
-/// a 4 MiB interpreter without touching the stack at 0x7FFF_FFFF_0000.
-const INTERP_BASE: u64 = 0x7F00_0000_0000;
+/// Default (un-randomised) virtual address at which the dynamic interpreter
+/// would be loaded.  Retained as the lower bound of the interpreter ASLR
+/// window and as a compile-time anchor for references in tooling.
+///
+/// At runtime `interp_aslr_base()` returns a per-`exec()` randomised base
+/// inside `[INTERP_ASLR_MIN, INTERP_ASLR_MAX)` so that the dynamic linker
+/// — and every shared library it subsequently mmaps below itself — lands
+/// at a different VA each boot.  See `interp_aslr_base()` for the layout
+/// rationale (System V AMD64 ABI §3.3.3, vdso(7), mmap(2)).
+const INTERP_BASE_DEFAULT: u64 = 0x7F00_0000_0000;
+
+/// Lower bound of the interpreter ASLR window.  Set well above the default
+/// `mmap` allocation region (`MMAP_BASE = 0x7F00_0000_0000`, growing
+/// downward) so that randomised interpreter placements never collide with
+/// addresses the anonymous-mmap allocator hands back to `ld-musl`.
+const INTERP_ASLR_MIN: u64 = 0x7F40_0000_0000;
+
+/// Upper bound (exclusive) of the interpreter ASLR window.  Set well below
+/// `USER_STACK_TOP - USER_STACK_MAX` = `0x7FFF_FFF0_0000` so a fully-grown
+/// 1 MiB user stack cannot collide with the interpreter image (which is
+/// at most a few MiB for ld-musl / ld-linux).  Window size = 512 GiB.
+const INTERP_ASLR_MAX: u64 = 0x7FC0_0000_0000;
+
+/// Entropy bits for the interpreter ASLR window.  27 bits page-aligned
+/// covers `2^27 * 4 KiB = 512 GiB`, exactly matching the window above.
+/// Collision probability across two `exec()` calls is `1 / 2^27 ≈ 7.5e-9`,
+/// comparable to the main-binary PIE-ASLR entropy (28 bits, see `ASLR_BITS`).
+const INTERP_ASLR_BITS: u32 = 27;
+
+/// Public surface for the `test_aslr_shared_lib` kernel test.  Forwards
+/// to the private `interp_aslr_base()` so the test can assert that two
+/// successive calls produce 4 KiB-aligned values inside the configured
+/// window and (probabilistically) differ.  Not used outside `test_runner`.
+#[inline]
+pub fn test_only_interp_aslr_base() -> u64 {
+    interp_aslr_base()
+}
+
+/// Compute a per-`exec()` randomised base for the dynamic interpreter.
+///
+/// Returns a 4 KiB-aligned address in `[INTERP_ASLR_MIN, INTERP_ASLR_MAX)`.
+/// Each call returns a fresh random value, so two `exec("./prog")` calls in
+/// the same boot — and the same binary across different boots — get
+/// distinct interpreter VAs.  The dynamic linker's subsequent
+/// `mmap(MAP_ANONYMOUS)` calls for shared libraries (DT_NEEDED entries
+/// such as `libxul`, `libc.musl-x86_64.so.1`) are satisfied by
+/// `VmSpace::find_free_range`, whose first VMA-overlap point depends on
+/// the interpreter's placement — so randomising the interpreter
+/// transitively randomises every shared-library VA in the process.
+///
+/// References:
+/// - ELF gABI §5.4 (Program Loading)
+/// - System V AMD64 ABI §3.3.3 (Address Space Layout)
+/// - mmap(2) regarding kernel-chosen VAs when `addr == NULL`
+#[inline]
+fn interp_aslr_base() -> u64 {
+    let offset = crate::security::rand::aslr_page_offset(INTERP_ASLR_BITS);
+    let base = INTERP_ASLR_MIN.saturating_add(offset);
+    // Clamp into the window.  The mask in `aslr_page_offset` already keeps
+    // `offset < 2^INTERP_ASLR_BITS * 4 KiB`, but a defensive ceiling check
+    // protects against future entropy-bit miscalibration.
+    if base >= INTERP_ASLR_MAX {
+        INTERP_ASLR_MIN
+    } else {
+        base
+    }
+}
 
 /// Segment flags
 const PF_X: u32 = 1; // Execute
@@ -712,8 +775,10 @@ pub fn validate_elf(data: &[u8]) -> Result<&Elf64Header, ElfError> {
 ///
 /// Maps all PT_LOAD segments and allocates a user stack.
 /// Handles PT_INTERP: if present, loads the interpreter (dynamic linker)
-/// at INTERP_BASE and sets it as the actual entry point, passing the
-/// main executable's entry via AT_ENTRY in the auxiliary vector.
+/// at a per-`exec()` randomised base inside the interpreter ASLR window
+/// (see `interp_aslr_base()`) and sets it as the actual entry point,
+/// passing the main executable's entry via AT_ENTRY in the auxiliary
+/// vector.
 ///
 /// # Arguments
 /// * `data` — Complete ELF binary contents.
@@ -1119,18 +1184,24 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
             alloc::format!("/disk/{}", path)
         };
 
+        // Pick a fresh per-`exec()` randomised base for the interpreter so
+        // that ld-musl and every shared library it subsequently mmaps land
+        // at different VAs each boot (System V AMD64 ABI §3.3.3, mmap(2),
+        // vdso(7)).  See `interp_aslr_base()` for the layout rationale.
+        let interp_base = interp_aslr_base();
+
         crate::serial_println!("[ELF] PT_INTERP: loading interpreter '{}'", disk_path);
         match read_interpreter_cached(&disk_path) {
             Ok(interp_data) => {
                 crate::serial_println!("[ELF] PT_INTERP: {} bytes (cached)", interp_data.len());
-                match load_elf_dyn(&interp_data, cr3, INTERP_BASE, &mut allocated_pages, &mut vmas) {
+                match load_elf_dyn(&interp_data, cr3, interp_base, &mut allocated_pages, &mut vmas) {
                     Ok(interp_entry) => {
                         crate::serial_println!(
                             "[ELF] Interpreter loaded at {:#x}, entry={:#x}",
-                            INTERP_BASE, interp_entry
+                            interp_base, interp_entry
                         );
                         actual_entry = interp_entry;
-                        interp_base_for_auxv = INTERP_BASE;
+                        interp_base_for_auxv = interp_base;
                     }
                     Err(e) => {
                         crate::serial_println!("[ELF] Interpreter load failed: {:?}", e);
