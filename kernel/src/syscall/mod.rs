@@ -1446,6 +1446,39 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
     //     new image — reaching this point in execve(2) is that moment.
     wake_vfork_parent();
 
+    // 5c. Reset the per-thread thread-exit protocol slots on the surviving
+    //     thread per `execve(2)` ABI.  The new image must start with a
+    //     clean `clear_child_tid` and `robust_list` slate — if it cares
+    //     about either, it will re-register via `set_tid_address(2)` and
+    //     `set_robust_list(2)` from its own startup code (glibc/musl
+    //     `__libc_setup_tls` and the pthread bootstrap).
+    //
+    //     Why this matters: the calling thread's `clear_child_tid` was
+    //     registered by the *previous* image against a user VA that is
+    //     about to be unmapped and replaced.  If the slot survives the
+    //     exec, the kernel's eventual `exit_thread` zero-store +
+    //     `FUTEX_WAKE` (the CLONE_CHILD_CLEARTID protocol per
+    //     `clone(2)`) would land on whatever VA the new image happens to
+    //     have at that offset — under firefox-bin the worst case is
+    //     BaseProfiler's `RegisteredThread::mThreadInfo` storage, where
+    //     a stale zero-store produces an unrelated NULL deref far away
+    //     from any exit path.  The same shape applies to
+    //     `robust_list_head` / `robust_list_len` per `set_robust_list(2)`
+    //     /`get_robust_list(2)`: the kernel would walk a head pointer
+    //     into the new image's memory at the next exit.
+    //
+    //     Threat-model: CWE-672 (Operation on Resource After Expiration
+    //     or Release).  Stale per-thread state surviving exec violates
+    //     the `execve(2)` process-image cleanslate guarantee.
+    //
+    //     `tls_base` (FS.MSR) is intentionally retained — the new ELF's
+    //     `_start` will issue `arch_prctl(ARCH_SET_FS, ...)` (or the
+    //     dynamic linker will, before any TLS access).  Resetting it
+    //     here would either be a no-op (overwritten before first use)
+    //     or actively wrong (some code paths observe FS.base in the
+    //     window between exec and `_start`).
+    exec_reset_thread_exit_slots(crate::proc::current_tid());
+
     // 6. Modify the syscall return frame on the kernel stack so that when
     //    we return through syscall_entry's epilogue, SYSRETQ jumps to the
     //    new entry point with the new stack.
@@ -1502,6 +1535,37 @@ pub fn wake_vfork_parent() {
                 p.state = crate::proc::ThreadState::Ready;
             }
         }
+    }
+}
+
+/// Reset the per-thread thread-exit protocol slots on `execve(2)`.
+///
+/// Per `execve(2)`, the new image starts with no `CLONE_CHILD_CLEARTID`
+/// address registered and no robust-futex list; if the new image cares
+/// about either it will re-register via `set_tid_address(2)` and
+/// `set_robust_list(2)` from its own startup code (glibc/musl pthread
+/// bootstrap).  Carrying the old image's values across exec would let a
+/// later `exit_thread` zero-store + `FUTEX_WAKE` (the
+/// `CLONE_CHILD_CLEARTID` protocol per `clone(2)`) land on whatever VA
+/// the new image happens to have at that offset — under firefox-bin the
+/// worst case is BaseProfiler's `RegisteredThread::mThreadInfo` storage,
+/// where a stale zero-store produces an unrelated NULL deref far away
+/// from any exit path.  The robust-list head/len fields have the same
+/// shape per `set_robust_list(2)`/`get_robust_list(2)`: the kernel would
+/// walk a stale head pointer at the next exit.
+///
+/// Threat-model: CWE-672 (Operation on Resource After Expiration or
+/// Release).  Stale per-thread state surviving exec violates the
+/// `execve(2)` process-image cleanslate guarantee.
+///
+/// Called by `sys_exec` (post-image-install, pre-SYSRET-frame-rewrite)
+/// and by the `execve(2)` ABI test in `test_runner.rs`.
+pub(crate) fn exec_reset_thread_exit_slots(tid: crate::proc::Tid) {
+    let mut threads = crate::proc::THREAD_TABLE.lock();
+    if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+        t.clear_child_tid  = 0;
+        t.robust_list_head = 0;
+        t.robust_list_len  = 0;
     }
 }
 
