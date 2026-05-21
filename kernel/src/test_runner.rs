@@ -22198,16 +22198,22 @@ fn test_x11_hello_runs() -> bool {
 fn test_firefox_launch_progress() -> bool {
     test_header!("Firefox ESR launch oracle (progress probe)");
 
-    // ── 1. Pick Firefox binary: prefer musl, fall back to glibc ──────────────
+    // ── 1. Pick Firefox binary: prefer musl-132 → musl-esr → glibc ───────────
     //
-    // The musl wrapper at /disk/usr/lib/firefox-esr/firefox is Alpine's
-    // firefox-esr ELF (interpreter /lib/ld-musl-x86_64.so.1).  The glibc
-    // fallback at /disk/opt/firefox/firefox is the Mozilla official build
-    // (interpreter /lib64/ld-linux-x86-64.so.2).  exe_path is set to whichever
-    // path actually loaded, so readlink("/proc/self/exe") + append "-bin"
-    // resolves to the matching firefox-bin sibling.
+    // Three candidate paths are probed in order:
+    //   /disk/usr/lib/firefox/firefox      — Alpine musl firefox 132.x (preferred
+    //                                         when present; bundled firefox-dbg
+    //                                         enables native addr2line / gdb).
+    //   /disk/usr/lib/firefox-esr/firefox  — Alpine musl firefox-esr 115.x
+    //                                         (historical reproducer; no -dbg).
+    //   /disk/opt/firefox/firefox          — Mozilla official glibc build
+    //                                         (fallback).
+    //
+    // exe_path is set to whichever path actually loaded, so readlink("/proc/
+    // self/exe") + append "-bin" resolves to the matching firefox-bin sibling.
     const FF_CANDIDATES: &[&str] = &[
-        "/disk/usr/lib/firefox-esr/firefox",   // Alpine musl build (preferred)
+        "/disk/usr/lib/firefox/firefox",       // Alpine musl 132.x (preferred)
+        "/disk/usr/lib/firefox-esr/firefox",   // Alpine musl 115.x ESR
         "/disk/opt/firefox/firefox",           // Mozilla glibc build (fallback)
     ];
 
@@ -22249,7 +22255,17 @@ fn test_firefox_launch_progress() -> bool {
         return true;
     }
 
-    let is_musl = chosen_path.starts_with("/disk/usr/lib/firefox-esr/");
+    let is_musl = chosen_path.starts_with("/disk/usr/lib/firefox-esr/")
+        || chosen_path.starts_with("/disk/usr/lib/firefox/");
+    // Per-package install dir for PATH / LD_LIBRARY_PATH; both Alpine packages
+    // bake DT_RUNPATH=/usr/lib/<pkg> so we mirror that here.
+    let ff_install_dir: &str = if chosen_path.starts_with("/disk/usr/lib/firefox/") {
+        "/usr/lib/firefox"
+    } else if chosen_path.starts_with("/disk/usr/lib/firefox-esr/") {
+        "/usr/lib/firefox-esr"
+    } else {
+        "/opt/firefox"   // unused for is_musl == false but keeps the let well-typed
+    };
 
     // ── Basic ELF sanity ──────────────────────────────────────────────────────
     if !crate::proc::elf::is_elf(&ff_bin) {
@@ -22296,47 +22312,51 @@ fn test_firefox_launch_progress() -> bool {
     ];
     //
     // PATH / LD_LIBRARY_PATH tuned to whichever build we picked.  For musl,
-    // ld-musl reads DT_RUNPATH=/usr/lib/firefox-esr (per System V gABI §5.4)
-    // so transitive deps (libxul.so, libmozsandbox.so, ...) resolve from the
+    // ld-musl reads DT_RUNPATH=/usr/lib/<package> (per System V gABI §5.4) so
+    // transitive deps (libxul.so, libmozsandbox.so, ...) resolve from the
     // canonical tree without any extra LD_LIBRARY_PATH hint, but we still
     // include it for fallback search order (per ld-musl(8) and ld.so(8)).
-    //
-    let envp: alloc::vec::Vec<&str> = if is_musl {
+    // ff_install_dir was set above based on chosen_path so a 132 install
+    // picks /usr/lib/firefox, an ESR install picks /usr/lib/firefox-esr.
+    let path_env  = alloc::format!("PATH={}:/bin:/disk/bin", ff_install_dir);
+    let ld_env    = alloc::format!("LD_LIBRARY_PATH={}:/lib:/usr/lib", ff_install_dir);
+    let envp_owned: alloc::vec::Vec<alloc::string::String> = if is_musl {
         alloc::vec![
-            "HOME=/tmp",
-            "PATH=/usr/lib/firefox-esr:/bin:/disk/bin",
-            "LD_LIBRARY_PATH=/usr/lib/firefox-esr:/lib:/usr/lib",
-            "MOZ_HEADLESS=1",
-            "MOZ_LOG=all:5",
-            "MOZ_LOG_FILE=/tmp/firefox.log",
-            "DISPLAY=:0",
-            "XAUTHORITY=/tmp/.Xauthority",
-            "XDG_RUNTIME_DIR=/tmp",
-            "XDG_DATA_DIRS=/tmp",
-            "XDG_CONFIG_HOME=/tmp",
-            "XDG_CACHE_HOME=/tmp/cache",
-            "DBUS_SESSION_BUS_ADDRESS=",
-            "FONTCONFIG_FILE=/tmp",
+            alloc::string::String::from("HOME=/tmp"),
+            path_env,
+            ld_env,
+            alloc::string::String::from("MOZ_HEADLESS=1"),
+            alloc::string::String::from("MOZ_LOG=all:5"),
+            alloc::string::String::from("MOZ_LOG_FILE=/tmp/firefox.log"),
+            alloc::string::String::from("DISPLAY=:0"),
+            alloc::string::String::from("XAUTHORITY=/tmp/.Xauthority"),
+            alloc::string::String::from("XDG_RUNTIME_DIR=/tmp"),
+            alloc::string::String::from("XDG_DATA_DIRS=/tmp"),
+            alloc::string::String::from("XDG_CONFIG_HOME=/tmp"),
+            alloc::string::String::from("XDG_CACHE_HOME=/tmp/cache"),
+            alloc::string::String::from("DBUS_SESSION_BUS_ADDRESS="),
+            alloc::string::String::from("FONTCONFIG_FILE=/tmp"),
         ]
     } else {
         alloc::vec![
-            "HOME=/tmp",
-            "PATH=/opt/firefox:/bin:/disk/bin",
-            "LD_LIBRARY_PATH=/opt/firefox:/lib64:/lib/x86_64-linux-gnu",
-            "MOZ_HEADLESS=1",
-            "MOZ_LOG=all:5",
-            "MOZ_LOG_FILE=/tmp/firefox.log",
-            "DISPLAY=:0",
-            "XAUTHORITY=/tmp/.Xauthority",
-            "XDG_RUNTIME_DIR=/tmp",
-            "XDG_DATA_DIRS=/tmp",
-            "XDG_CONFIG_HOME=/tmp",
-            "XDG_CACHE_HOME=/tmp/cache",
-            "DBUS_SESSION_BUS_ADDRESS=",
-            "FONTCONFIG_FILE=/tmp",
+            alloc::string::String::from("HOME=/tmp"),
+            alloc::string::String::from("PATH=/opt/firefox:/bin:/disk/bin"),
+            alloc::string::String::from("LD_LIBRARY_PATH=/opt/firefox:/lib64:/lib/x86_64-linux-gnu"),
+            alloc::string::String::from("MOZ_HEADLESS=1"),
+            alloc::string::String::from("MOZ_LOG=all:5"),
+            alloc::string::String::from("MOZ_LOG_FILE=/tmp/firefox.log"),
+            alloc::string::String::from("DISPLAY=:0"),
+            alloc::string::String::from("XAUTHORITY=/tmp/.Xauthority"),
+            alloc::string::String::from("XDG_RUNTIME_DIR=/tmp"),
+            alloc::string::String::from("XDG_DATA_DIRS=/tmp"),
+            alloc::string::String::from("XDG_CONFIG_HOME=/tmp"),
+            alloc::string::String::from("XDG_CACHE_HOME=/tmp/cache"),
+            alloc::string::String::from("DBUS_SESSION_BUS_ADDRESS="),
+            alloc::string::String::from("FONTCONFIG_FILE=/tmp"),
         ]
     };
-    let envp: &[&str] = &envp;
+    let envp_refs: alloc::vec::Vec<&str> = envp_owned.iter().map(|s| s.as_str()).collect();
+    let envp: &[&str] = &envp_refs;
 
     // Use the *blocked* variant so we can set exe_path BEFORE the thread
     // is scheduled.  The Firefox launcher calls readlink("/proc/self/exe"),

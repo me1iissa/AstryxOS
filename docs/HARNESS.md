@@ -459,29 +459,71 @@ python3 scripts/qemu-harness.py resume abc123def456
 ## Data image — Firefox variant selection
 
 The test data disk (`build/data.img`, 2 GiB FAT32) is built by
-`scripts/create-data-disk.sh`. The script's `FIREFOX_VARIANT` env var
-controls which Firefox build is staged:
+`scripts/create-data-disk.sh`. Two orthogonal env vars control which Firefox
+build is staged:
 
-- `glibc` (default) — populates `/disk/opt/firefox/firefox-bin` from a glibc-linked
-  Firefox. The kernel test runner falls back here when the musl variant is
-  absent.
-- `musl` — additionally populates `/disk/usr/lib/firefox-esr/firefox-bin` from an
-  Alpine musl-linked Firefox. The kernel test runner *prefers* this path
-  when present (selection via `vfs::stat` in `kernel/src/main.rs`).
+| Env var | Values | Purpose |
+|---|---|---|
+| `ASTRYXOS_FIREFOX_VARIANT` | `glibc` (default), `musl` | C library + binary source |
+| `ASTRYXOS_FIREFOX_PACKAGE` | `firefox-esr` (default), `firefox` | Alpine package, musl variant only |
+
+`ASTRYXOS_FIREFOX_PACKAGE` is silently ignored under
+`ASTRYXOS_FIREFOX_VARIANT=glibc` — the glibc track always uses the
+Mozilla-official ESR 115 tarball staged at `/disk/opt/firefox/firefox-bin`.
+
+### Variants
+
+- `glibc` (default) — populates `/disk/opt/firefox/firefox-bin` from a
+  glibc-linked Firefox. The kernel test runner falls back here when no
+  musl variant is staged.
+- `musl` — populates `/disk/usr/lib/<install-dir>/firefox-bin` from an
+  Alpine musl-linked Firefox. `<install-dir>` is `firefox-esr` for the ESR
+  package and `firefox` for the current package; both directories match
+  the DT_RUNPATH baked into the corresponding Mozilla DSOs per ELF gABI
+  §5.4. The kernel test runner *prefers* the musl path when present
+  (selection via `vfs::stat` in `kernel/src/main.rs`).
+
+### Packages (musl variant)
+
+- `firefox-esr` (default) — Alpine community/firefox-esr 115.x. Mature ESR
+  binary; the historical reproducer for the F3-saga gate at sc=1233. Alpine
+  does **not** ship a `-dbg` subpackage for ESR; libxul attribution flows
+  through Mozilla tecken's PUBLIC-symbol corpus (~8,600 entries, no FUNC).
+- `firefox` — Alpine community/firefox 132.x. Current stable release;
+  carries the `firefox-dbg` companion with a real `.debug` file
+  (~46 MiB `libxul.so.debug`, ~420k symbols including FUNC + minimal
+  DWARF). `addr2line`, `nm`, and `gdb` resolve C++ function names natively
+  via the binary's `.gnu_debuglink` section — no Mozilla tecken
+  indirection. Use when an investigation needs to *name* the libxul
+  function at a captured RIP.
+
+> Switching `ASTRYXOS_FIREFOX_PACKAGE` changes the reproducer identity:
+> firefox-132 metrics will NOT match the firefox-esr sc=1233 plateau. The
+> staging pipeline detects package-switch automatically via the
+> `/disk/opt/firefox/.variant` sentinel and re-stages cleanly without
+> requiring `--force`.
+
+### Examples
 
 ```bash
-# Glibc variant (default)
+# Glibc variant (default — Mozilla-official ESR 115)
 bash scripts/create-data-disk.sh --force
 
-# Musl variant — required for the F3/SSP demo gate investigation track
+# Musl variant, firefox-esr 115.x (historical F3-saga reproducer)
 ASTRYXOS_FIREFOX_VARIANT=musl bash scripts/create-data-disk.sh --force
+
+# Musl variant, firefox 132.x — required for libxul C++ name attribution
+ASTRYXOS_FIREFOX_VARIANT=musl \
+  ASTRYXOS_FIREFOX_PACKAGE=firefox \
+    bash scripts/create-data-disk.sh --force
 ```
 
 Verify staging by inspecting the FAT image:
 
 ```bash
-mdir -i build/data.img '::/usr/lib/firefox-esr/firefox-bin'  # musl
-mdir -i build/data.img '::/opt/firefox/firefox-bin'          # glibc
+mdir -i build/data.img '::/usr/lib/firefox-esr/firefox-bin'  # musl + firefox-esr
+mdir -i build/data.img '::/usr/lib/firefox/firefox-bin'      # musl + firefox-132
+mdir -i build/data.img '::/opt/firefox/firefox-bin'          # glibc, OR musl mirror
 ```
 
 The musl path is required for any investigation that exercises the musl
@@ -519,25 +561,37 @@ ASTRYXOS_FIREFOX_VARIANT=musl bash scripts/create-data-disk.sh --force
 
 Coverage matrix (Alpine v3.20, x86_64):
 
-| `ASTRYXOS_FIREFOX_DEBUG` | data.img Δ | Covers |
-|---|---|---|
-| unset / `0` (off, default) | 0 | — |
-| `musl` | ~2.8 MiB | `ld-musl-x86_64.so.1`, `libc.musl-x86_64.so.1` (musl-dbg) |
-| `1` / `full` | ~54 MiB | + libglib/gobject/gio, libgdk_pixbuf, libcairo, libgtk-3/libgdk-3 |
+| `ASTRYXOS_FIREFOX_DEBUG` | `ASTRYXOS_FIREFOX_PACKAGE` | data.img Δ | Covers |
+|---|---|---|---|
+| unset / `0` (off, default) | (any) | 0 | — |
+| `musl` | `firefox-esr` (default) | ~2.8 MiB | `ld-musl-x86_64.so.1`, `libc.musl-x86_64.so.1` (musl-dbg) |
+| `1` / `full` | `firefox-esr` (default) | ~54 MiB | + libglib/gobject/gio, libgdk_pixbuf, libcairo, libgtk-3/libgdk-3 |
+| `1` / `full` | `firefox` | ~100 MiB | as above, + `libxul.so.debug` (~46 MiB, real FUNC + minimal DWARF) |
 
-`libxul.so` is **not** covered by Alpine's `-dbg` packages — Alpine's
-`firefox-esr` does not ship a `-dbg` subpackage (verified against Alpine v3.20
-community APKBUILD). It is instead handled by
-`scripts/inject-libxul-symbols.sh --musl`, which `create-data-disk.sh` invokes
-automatically whenever `ASTRYXOS_FIREFOX_DEBUG` is set in the musl variant.
-The script derives a Breakpad GUID from the libxul `NT_GNU_BUILD_ID` note and
-fetches the matching `.sym.gz` from Mozilla's tecken symbol server (Alpine
-uploads symbols there), so VMAs match the staged Alpine libxul byte-for-byte.
-Coverage is PUBLIC-only (Alpine builds without DWARF): ~8,600 entry-point
-names with the same VMAs `nm`/`addr2line` would read from a hypothetical
-`.dynsym` lookup, sufficient to attribute a sampled RIP to the nearest
-exported function. File and line numbers are **not** recoverable — that
-requires option 2 (Alpine source build with `--disable-strip`).
+### libxul attribution paths
+
+`libxul.so` is the load-bearing Mozilla DSO; attributing a captured RIP back
+to a function name requires per-package handling:
+
+- **firefox-esr (default)** — Alpine does not ship a `-dbg` subpackage for
+  firefox-esr. Coverage is provided by
+  `scripts/inject-libxul-symbols.sh --musl`, which `create-data-disk.sh`
+  invokes automatically when `ASTRYXOS_FIREFOX_DEBUG` is set in this mode.
+  The script derives a Breakpad GUID from the libxul `NT_GNU_BUILD_ID` note
+  and fetches the matching `.sym.gz` from Mozilla's tecken symbol server
+  (Alpine uploads symbols there), so VMAs match the staged Alpine libxul
+  byte-for-byte. Coverage is PUBLIC-only (Alpine builds without DWARF):
+  ~8,600 entry-point names sufficient to attribute a sampled RIP to the
+  nearest exported function. File and line numbers are NOT recoverable.
+
+- **firefox (132.x)** — Alpine *does* ship `firefox-dbg`, so
+  `install-firefox-musl-debug.sh` stages the real `.debug` companion at
+  `/disk/usr/lib/debug/usr/lib/firefox/libxul.so.debug` (~46 MiB,
+  containing full `.symtab` with FUNC records and minimal DWARF, ~420k
+  symbols). `addr2line` / `nm` / `gdb` resolve C++ names natively via the
+  binary's `.gnu_debuglink` section — no Mozilla tecken indirection.
+  `create-data-disk.sh` SKIPS the tecken injection in this mode (it would
+  be a no-op anyway; the firefox-dbg `.symtab` is strictly superior).
 
 The companion files land at `/usr/lib/debug/<path>` on the guest filesystem.
 For host-side resolution use a temporary verification root (the install
