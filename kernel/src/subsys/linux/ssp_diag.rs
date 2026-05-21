@@ -858,4 +858,18 @@ pub fn probe_gp_at_ssp_fail(
         "[SSP-DIAG-SIGNALS] pid={} tid={} signals_delivered={}",
         pid, tid, sig_str,
     );
+
+    // ── FS-base-trace dump (feature `fs-base-trace`) ────────────────
+    // Co-emitted with `[SSP-DIAG]` so the reviewer sees the trapping
+    // TID's FS.base event history alongside the trap-time `fs_base`
+    // and `fs28_val`.  Distinguishes the kernel-side
+    // "FS.base shifted between prologue and epilogue" hypothesis
+    // (`new_fs != old_fs` event in the window, kind=write_fs_base or
+    // arch_prctl_set_fs) from the userspace foreign-frame hypothesis
+    // (no FS.base change events since the initial `arch_prctl_set_fs`).
+    // Intel SDM Vol. 3A §3.4.4.1; saga rule: this dump is bounded by
+    // `FS_BASE_DUMP_MAX` so adding it to the SSP-DIAG emission preserves
+    // bounded-output invariants.
+    #[cfg(feature = "fs-base-trace")]
+    crate::subsys::linux::fs_base_trace::dump_for_tid(tid as u64);
 }

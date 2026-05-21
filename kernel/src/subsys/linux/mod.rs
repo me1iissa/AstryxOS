@@ -95,6 +95,18 @@ pub mod ssp_diag;
 #[cfg(feature = "f3-watch")]
 pub mod f3_watch;
 
+/// FS_BASE preserve-across-execution probe.  Records every kernel-side
+/// `WRMSR(IA32_FS_BASE)` into a per-boot ring; on a CPL-3 SSP-canary `#GP`
+/// the trapping TID's recent event history is dumped alongside the
+/// `[SSP-DIAG]` block.  Distinguishes the "FS.base shifted between
+/// prologue and epilogue" hypothesis from the "FS.base preserved; canary
+/// fail is on the stack slot" hypothesis — neither of which is falsified
+/// by `ax_eq_fs28=1` alone.  See module docstring for sites instrumented
+/// and Intel SDM Vol. 3A §3.4.4.1 (`IA32_FS_BASE`).  Gated behind
+/// `fs-base-trace` so master builds remain byte-identical.
+#[cfg(feature = "fs-base-trace")]
+pub mod fs_base_trace;
+
 /// Bounded broadcast-within-cluster compensation for FUTEX_WAKE.  Mitigates
 /// the older-glibc `pthread_cond_signal` race
 /// (<https://sourceware.org/bugzilla/show_bug.cgi?id=25847>) by
