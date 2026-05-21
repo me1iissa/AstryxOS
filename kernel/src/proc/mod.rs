@@ -2943,6 +2943,20 @@ pub fn alloc_vfork_child_stack(parent_pid: Pid, parent_new_stack: u64) -> Option
         core::ptr::write_bytes(kva, 0, 4096);
         core::ptr::write((kva.add(0x1000 - 8)) as *mut u64, arg_word);
     }
+    // Track B (Phase 5, 2026-05-21) — record this kernel-direct-map write
+    // into the stack-page provenance ring.  The write is invisible to
+    // `f3-watch`'s DR0–DR3 channel because it goes through `PHYS_OFF +
+    // frame`, not through the user-VA mapping.  Per Intel SDM Vol. 3B
+    // §17.2.4 data-breakpoint watchpoints trap on linear-VA only.  The
+    // VA we report (`top - 8`) is what the helper-arg word will appear
+    // at once the PTE below is installed — the same VA the child's
+    // `pop %rdi` will read it from.
+    #[cfg(feature = "stack-prov")]
+    crate::mm::stack_prov::record_write(
+        top - 8,
+        arg_word,
+        crate::mm::stack_prov::SITE_VFORK_STACK_SEED,
+    );
     let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_NO_EXECUTE;
     if !crate::mm::vmm::map_page_in(parent_cr3, top_page_va, frame, flags) {
         // Map failed — free the frame and bail.  The VMA stays in the parent's
@@ -3128,6 +3142,23 @@ pub fn alloc_vfork_child_tls(parent_pid: Pid) -> Option<u64> {
         core::ptr::write_bytes(kva, 0, 4096);
         core::ptr::write(kva as *mut u64, base);
         *kva.add(TCB_CANCELDISABLE_OFFSET) = PTHREAD_CANCEL_DISABLE;
+    }
+    // Track B (Phase 5, 2026-05-21) — record the TCB self-pointer write
+    // and the cancel-disable byte write into the stack-prov ring.  The
+    // VA reported for the self-pointer is `base` (where the TLS page is
+    // about to be mapped); for the byte write we report
+    // `base + TCB_CANCELDISABLE_OFFSET`.  See `mm/stack_prov.rs` for the
+    // direct-map blind-spot rationale.
+    #[cfg(feature = "stack-prov")]
+    {
+        crate::mm::stack_prov::record_write(
+            base, base, crate::mm::stack_prov::SITE_VFORK_TLS_INIT,
+        );
+        crate::mm::stack_prov::record_write(
+            base + TCB_CANCELDISABLE_OFFSET as u64,
+            PTHREAD_CANCEL_DISABLE as u64,
+            crate::mm::stack_prov::SITE_VFORK_TLS_INIT,
+        );
     }
 
     let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_NO_EXECUTE;

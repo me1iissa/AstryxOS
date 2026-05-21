@@ -252,6 +252,21 @@ f3-watch = ["firefox-test", "ssp-canary-diag", "w215-diag"]
 # (`SYSRETQ` — does NOT auto-reload MSRs); Intel SDM Vol. 3A §6.15
 # (`#GP`); System V AMD64 ABI §6.4 (TLS variant II).
 fs-base-trace = ["firefox-test", "ssp-canary-diag"]
+# Track B (Phase 5, 2026-05-21) — stack-page write provenance ring.
+# Records kernel-mode writes whose target user VA falls into the
+# `[0x3f00_0000_0000, 0x4000_0000_0000)` thread-stack range (per Phase 4
+# `phase_4_post_aslr_fs_base_trace_2026_05_21`, TID 7's `saved_slot` at
+# `0x3f5e7c5850`).  Instrumented call sites: `alloc_vfork_child_stack`
+# (vfork helper-stack seed), `alloc_vfork_child_tls` (vfork TLS init),
+# `setup_user_stack` (initial-stack auxv/argv writes — out-of-window for
+# the main-thread `USER_STACK_TOP=0x7fff_…`, but still recorded
+# defensively).  Dumped at `[SSP-DIAG-STACK-PROV]` time keyed on
+# `saved_slot_phys`.  Closes the kernel-direct-map blind spot of the
+# `f3-watch` linear-VA DR0–DR3 channel (Intel SDM Vol. 3B §17.2.4 —
+# hardware watchpoints trap on linear-VA only).  Two 256-entry rings
+# (by-phys + sequential) × ~64 B/entry = ~32 KiB BSS.  Default builds
+# remain byte-identical when this feature is OFF.
+stack-prov = ["firefox-test", "ssp-canary-diag"]
 # `[VMA-DUMP]` on fatal user-mode exceptions.  At each fatal user-mode
 # #PF / #UD / #GP / #AC that terminates the process (no installed
 # handler) the kernel emits a full enumeration of the trapping
