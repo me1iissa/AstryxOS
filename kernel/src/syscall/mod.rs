@@ -2140,6 +2140,12 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
     const MAP_FIXED_NOREPLACE: u32 = 0x0010_0000;
     let is_fixed = flags & (MAP_FIXED as u32 | MAP_FIXED_NOREPLACE) != 0;
     let is_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
+    // MAP_STACK | MAP_ANONYMOUS non-FIXED: route through the dedicated
+    // stack-ASLR window with per-call fresh entropy (see
+    // `mm::vma::STACK_ASLR_MIN` / `find_free_stack_range`).
+    let is_stack_alloc = !is_fixed
+        && (flags & MAP_STACK as u32 != 0)
+        && (flags & MAP_ANONYMOUS as u32 != 0);
 
     // ── Phase 1 — choose base address, resolve fd, build the VMA. ────────────
     //
@@ -2195,6 +2201,15 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
         let space = proc.vm_space.as_mut().unwrap();
 
         // Choose base address.
+        //
+        // For non-FIXED `MAP_STACK | MAP_ANONYMOUS` allocations route through
+        // `find_free_stack_range`, which places the VMA inside the dedicated
+        // stack-ASLR window with per-call fresh entropy rather than the
+        // deterministic-after-libxul `find_free_range` downward walk.  See
+        // `mm::vma::STACK_ASLR_MIN` for the layout rationale.  POSIX mmap(2)
+        // gives the kernel full latitude over the chosen VA when
+        // `addr == NULL` and `MAP_FIXED` is unset, so this routing is
+        // ABI-conformant.
         let chosen_base = if is_fixed {
             let b = page_align_down(addr_hint);
             if b == 0 {
@@ -2207,6 +2222,11 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
                 }
             }
             b
+        } else if is_stack_alloc {
+            match space.find_free_stack_range(length) {
+                Some(b) => b,
+                None => return -12, // ENOMEM
+            }
         } else {
             match space.find_free_range(length) {
                 Some(b) => b,
@@ -2457,7 +2477,15 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
 
     match space.insert_vma(vma) {
         Ok(()) => {
-            if base < space.mmap_hint {
+            // MAP_STACK allocations live in the stack-ASLR window (above
+            // `MMAP_BASE`); they must NOT lower `mmap_hint` because doing so
+            // would have no effect on the general allocator's downward walk
+            // (which is already below `MMAP_BASE`) and would needlessly
+            // perturb invariants tested by mm::vma::find_free_range callers
+            // that assume `mmap_hint <= MMAP_BASE`.  Likewise MAP_FIXED
+            // allocations at user-chosen addresses inside the stack window
+            // should not perturb the hint.
+            if !is_stack_alloc && base < space.mmap_hint {
                 space.mmap_hint = base;
             }
             base as i64
