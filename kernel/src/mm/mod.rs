@@ -32,6 +32,17 @@ pub mod w215_diag;
 #[cfg(feature = "vma-dump-on-gp")]
 pub mod vma_dump;
 
+// Stack-page write provenance ring — F3 BUCKET writer attribution.
+// Records kernel-mode writes to user VAs in the 0x3f thread-stack range
+// (`[0x3f00_0000_0000, 0x4000_0000_0000)` per Phase 4 `phase_4_post_aslr…`
+// memory).  Dumped at `[SSP-DIAG-STACK-PROV]` time keyed on
+// `saved_slot_phys`.  Closes the kernel-direct-map blind spot of the
+// `f3-watch` linear-VA DR0–DR3 channel (Intel SDM Vol. 3B §17.2.4).
+// Diagnostic-only; gated behind `stack-prov` so default builds are
+// byte-identical to master.
+#[cfg(feature = "stack-prov")]
+pub mod stack_prov;
+
 use astryx_shared::BootInfo;
 
 /// Initialize the memory management subsystem.
