@@ -5731,6 +5731,23 @@ pub fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
 
     match code {
         ARCH_SET_FS => {
+            // FS_BASE-trace probe — record the explicit user-mode WRMSR
+            // path BEFORE the actual write.  This is the canonical TCB
+            // setup path used by musl on x86_64 (per the musl libc
+            // public docs: `arch_prctl(ARCH_SET_FS, tcb)`); without
+            // this hook the very first FS.base write per thread would
+            // be invisible to the diagnostic.  Diagnostic-only; gated
+            // behind `fs-base-trace`.  Intel SDM Vol. 3A §3.4.4.1.
+            #[cfg(feature = "fs-base-trace")]
+            {
+                let old_fs = unsafe { crate::hal::rdmsr(0xC000_0100) };
+                crate::subsys::linux::fs_base_trace::record_event(
+                    crate::subsys::linux::fs_base_trace::KIND_ARCH_PRCTL,
+                    old_fs,
+                    addr,
+                    0,
+                );
+            }
             // Write to FS.base via MSR 0xC0000100 and persist in thread struct
             unsafe { crate::hal::wrmsr(0xC000_0100, addr); }
             // Update the thread's tls_base so scheduler restores it on re-schedule
