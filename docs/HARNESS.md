@@ -525,13 +525,19 @@ Coverage matrix (Alpine v3.20, x86_64):
 | `musl` | ~2.8 MiB | `ld-musl-x86_64.so.1`, `libc.musl-x86_64.so.1` (musl-dbg) |
 | `1` / `full` | ~54 MiB | + libglib/gobject/gio, libgdk_pixbuf, libcairo, libgtk-3/libgdk-3 |
 
-`libxul.so` is **not** covered — Alpine's `firefox-esr` package does not ship a
-`-dbg` subpackage (verified against Alpine v3.20 community APKBUILD). For
-coarse function-level libxul attribution under the musl variant, run
-`scripts/inject-libxul-symbols.sh` against the musl libxul path
-(`build/disk/usr/lib/firefox-esr/libxul.so`); note that VMAs drift a few bytes
-per function vs Mozilla's reference build due to Alpine's rebuild — function
-*names* are usually correct but per-line attribution is not byte-precise.
+`libxul.so` is **not** covered by Alpine's `-dbg` packages — Alpine's
+`firefox-esr` does not ship a `-dbg` subpackage (verified against Alpine v3.20
+community APKBUILD). It is instead handled by
+`scripts/inject-libxul-symbols.sh --musl`, which `create-data-disk.sh` invokes
+automatically whenever `ASTRYXOS_FIREFOX_DEBUG` is set in the musl variant.
+The script derives a Breakpad GUID from the libxul `NT_GNU_BUILD_ID` note and
+fetches the matching `.sym.gz` from Mozilla's tecken symbol server (Alpine
+uploads symbols there), so VMAs match the staged Alpine libxul byte-for-byte.
+Coverage is PUBLIC-only (Alpine builds without DWARF): ~8,600 entry-point
+names with the same VMAs `nm`/`addr2line` would read from a hypothetical
+`.dynsym` lookup, sufficient to attribute a sampled RIP to the nearest
+exported function. File and line numbers are **not** recoverable — that
+requires option 2 (Alpine source build with `--disable-strip`).
 
 The companion files land at `/usr/lib/debug/<path>` on the guest filesystem.
 For host-side resolution use a temporary verification root (the install

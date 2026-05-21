@@ -11,15 +11,27 @@ Usage:
         --output <path/to/libxul.sym.so>
 
 The Breakpad .sym format (see https://chromium.googlesource.com/breakpad/) has
-FUNC records of the form:
+two relevant per-symbol record types:
 
-    FUNC <hex_offset> <size_hex> <param_size_hex> <demangled_name>
+    FUNC   <hex_offset> <size_hex> <param_size_hex> <demangled_name>
+    PUBLIC [m] <hex_offset> <param_size_hex> <demangled_name>
 
-where <hex_offset> is the ELF VMA (load-time address for a PIE/shared object,
+`FUNC` records carry an explicit byte size and are produced when the upstream
+build was compiled with DWARF debug info (Mozilla's release builds for the
+official Firefox channels).  `PUBLIC` records are derived from the dynamic
+symbol table (.dynsym) plus per-platform demanglers and are emitted by
+dump_syms when no DWARF is available — for example, third-party rebuilds
+(Alpine's community/firefox-esr, Debian's firefox-esr, distro packages
+generally).  PUBLIC carries no size; we set st_size = 0 and let nm / addr2line
+treat the entry as a function-entry-point address.  The optional "m" token
+flags a multiple-definition symbol; we ignore it (objcopy/nm handle dupes
+correctly because we use STB_LOCAL).
+
+`<hex_offset>` is the ELF VMA (load-time address for a PIE/shared object,
 i.e. the same value you'd find in .symtab st_value for a shared library).
 
 This script:
-  1. Parses FUNC records from the .sym file.
+  1. Parses FUNC and PUBLIC records from the .sym file.
   2. Builds an Elf64_Sym array (.symtab) and a null-terminated string table
      (.strtab).
   3. Appends both sections to the ELF using objcopy --add-section.
@@ -78,30 +90,101 @@ SHN_ABS = 0xfff1
 
 def parse_sym(sym_path: Path) -> list[tuple[int, int, str]]:
     """
-    Parse FUNC records from a Mozilla Breakpad .sym file.
+    Parse FUNC and PUBLIC records from a Mozilla Breakpad .sym file.
 
-    Returns a list of (vma, size, name) tuples, one per FUNC record.
+    Returns a list of (vma, size, name) tuples, one per FUNC or PUBLIC record.
     Names are already demangled in the .sym file.
+
+    PUBLIC records carry no explicit size (Breakpad spec: size field absent —
+    PUBLIC tokens are entry-point pointers, not extents).  We set size=0 for
+    those entries.  nm and addr2line treat STT_FUNC symbols with st_size=0 as
+    entry-point markers and still resolve names via the nearest-below lookup
+    that binutils performs internally, which is sufficient for kdb
+    rip-trace-resolve attribution.
+
+    FUNC and PUBLIC are not mutually exclusive in a well-formed .sym; in
+    practice Mozilla's release builds emit FUNC only, and dump_syms builds
+    against stripped third-party binaries (Alpine, Debian) emit PUBLIC only.
+    We accept both so a single injection pass handles either source.
     """
     funcs: list[tuple[int, int, str]] = []
-    # The .sym file may be large (690 MiB) — read line-by-line to avoid
-    # loading the whole thing into memory at once.
+    # The .sym file may be large (690 MiB for Mozilla release builds, ~90 MiB
+    # for Alpine PUBLIC-only) — read line-by-line to avoid loading it whole.
+    n_func = 0
+    n_public = 0
     with open(sym_path, "r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
-            if not line.startswith("FUNC "):
-                continue
-            # FUNC <addr_hex> <size_hex> <param_size_hex> <name>
-            parts = line.split(None, 4)
-            if len(parts) < 5:
-                continue
-            try:
-                vma = int(parts[1], 16)
-                size = int(parts[2], 16)
-            except ValueError:
-                continue
-            name = parts[4].rstrip("\n")
-            if name:
-                funcs.append((vma, size, name))
+            if line.startswith("FUNC "):
+                # FUNC [m] <addr_hex> <size_hex> <param_size_hex> <name>
+                # The "m" multiple-definition flag is optional (sits at
+                # parts[1]).  We must redo the split with the correct maxsplit
+                # depending on whether "m" is present, so that the demangled
+                # C++ name (which contains spaces from templates, `const`,
+                # multi-arg lists, etc.) is captured as one final token rather
+                # than truncated at its first whitespace.
+                #
+                #   With m:    FUNC m <addr> <size> <psize> <name...>
+                #              → split(None, 5), name = parts[5]
+                #   Without:   FUNC   <addr> <size> <psize> <name...>
+                #              → split(None, 4), name = parts[4]
+                first_split = line.split(None, 2)
+                if len(first_split) < 2:
+                    continue
+                if first_split[1] == "m":
+                    parts = line.split(None, 5)
+                    if len(parts) < 6:
+                        continue
+                    addr_field, size_field = parts[2], parts[3]
+                    name = parts[5].rstrip("\n")
+                else:
+                    parts = line.split(None, 4)
+                    if len(parts) < 5:
+                        continue
+                    addr_field, size_field = parts[1], parts[2]
+                    name = parts[4].rstrip("\n")
+                try:
+                    vma = int(addr_field, 16)
+                    size = int(size_field, 16)
+                except ValueError:
+                    continue
+                if name:
+                    funcs.append((vma, size, name))
+                    n_func += 1
+            elif line.startswith("PUBLIC "):
+                # PUBLIC [m] <addr_hex> <param_size_hex> <name>
+                # Same demangled-name-with-spaces concern as FUNC: redo the
+                # split with the correct maxsplit so the full name lands in
+                # the final token.
+                #
+                #   With m:    PUBLIC m <addr> <psize> <name...>
+                #              → split(None, 4), name = parts[4]
+                #   Without:   PUBLIC   <addr> <psize> <name...>
+                #              → split(None, 3), name = parts[3]
+                first_split = line.split(None, 2)
+                if len(first_split) < 2:
+                    continue
+                if first_split[1] == "m":
+                    parts = line.split(None, 4)
+                    if len(parts) < 5:
+                        continue
+                    addr_field = parts[2]
+                    name = parts[4].rstrip("\n")
+                else:
+                    parts = line.split(None, 3)
+                    if len(parts) < 4:
+                        continue
+                    addr_field = parts[1]
+                    name = parts[3].rstrip("\n")
+                try:
+                    vma = int(addr_field, 16)
+                except ValueError:
+                    continue
+                if name and vma != 0:
+                    # st_size = 0 — PUBLIC has no size; nm / addr2line tolerate
+                    # this and treat the symbol as an entry-point marker.
+                    funcs.append((vma, 0, name))
+                    n_public += 1
+    print(f"      Parsed FUNC={n_func:,}  PUBLIC={n_public:,}")
     return funcs
 
 
@@ -331,7 +414,69 @@ def verify_output(output_path: Path) -> None:
         print("[WARN] nm returned no symbols!", file=sys.stderr)
 
 
+def _selftest() -> int:
+    """
+    Round-trip parse_sym() against representative FUNC/PUBLIC records that
+    exercise the demangled-name-with-spaces edge cases (templates, references,
+    `const`, multi-arg).  Catches the regression where the optional `m` flag
+    branch truncates names at the first whitespace.
+    """
+    cases = [
+        # (line, expected_vma, expected_size, expected_name)
+        ("FUNC 1500 80 0 mozilla::dom::Document::GetElementById(nsAString const&)\n",
+         0x1500, 0x80,
+         "mozilla::dom::Document::GetElementById(nsAString const&)"),
+        ("FUNC m 1500 80 0 mozilla::Foo::Bar(int const&)\n",
+         0x1500, 0x80,
+         "mozilla::Foo::Bar(int const&)"),
+        ("PUBLIC 1430 0 std::vector<int, std::allocator<int> >::push_back(int const&)\n",
+         0x1430, 0,
+         "std::vector<int, std::allocator<int> >::push_back(int const&)"),
+        ("PUBLIC m 1430 0 std::vector<int>::clear()\n",
+         0x1430, 0,
+         "std::vector<int>::clear()"),
+        # No-flag simple case (no internal spaces) — sanity check that the
+        # common path still works.
+        ("FUNC 2000 10 0 _start\n",
+         0x2000, 0x10, "_start"),
+        ("PUBLIC 3000 0 main\n",
+         0x3000, 0, "main"),
+    ]
+    failures = 0
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sym_path = Path(tmpdir) / "selftest.sym"
+        with open(sym_path, "w", encoding="utf-8") as f:
+            f.write("MODULE Linux x86_64 0000 libxul.so\n")
+            for line, _, _, _ in cases:
+                f.write(line)
+        # Suppress the "Parsed FUNC=... PUBLIC=..." print during self-test.
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            parsed = parse_sym(sym_path)
+    if len(parsed) != len(cases):
+        print(f"[SELFTEST] FAIL: expected {len(cases)} records, got {len(parsed)}")
+        return 1
+    for (line, exp_vma, exp_size, exp_name), got in zip(cases, parsed):
+        got_vma, got_size, got_name = got
+        if (got_vma, got_size, got_name) != (exp_vma, exp_size, exp_name):
+            print(f"[SELFTEST] FAIL: {line.rstrip()}")
+            print(f"           expected (vma={exp_vma:#x}, size={exp_size:#x}, name={exp_name!r})")
+            print(f"           got      (vma={got_vma:#x}, size={got_size:#x}, name={got_name!r})")
+            failures += 1
+    if failures == 0:
+        print(f"[SELFTEST] OK: {len(cases)} round-trip cases passed")
+        return 0
+    return 1
+
+
 def main() -> None:
+    # Hidden --self-test entry point for round-tripping parse_sym() against
+    # representative demangled-name shapes.  Used in CI and by reviewers; does
+    # not require any external .sym or libxul.so input.
+    if len(sys.argv) == 2 and sys.argv[1] == "--self-test":
+        sys.exit(_selftest())
+
     parser = argparse.ArgumentParser(
         description="Splice Breakpad FUNC symbols into a stripped libxul.so as .symtab"
     )

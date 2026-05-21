@@ -43,13 +43,15 @@
 # Because Alpine does not ship debug symbols for firefox-esr, addr2line cannot
 # resolve RIPs inside libxul.so by .gnu_debuglink alone.  Three options exist:
 #
-#   1. Coarse function-level names via Mozilla's official Breakpad .sym file
-#      (Firefox 115.24.0esr) injected as a .symtab.  This is what
-#      scripts/inject-libxul-symbols.sh does — but note that Alpine rebuilds
-#      libxul from source with its own toolchain, so VMAs in Mozilla's .sym
-#      will drift from Alpine's libxul by a few bytes per function; the
-#      resolved function NAME is usually correct, but the line/file mapping
-#      is not.  Pragmatic for K-class watchpoint attribution; not byte-precise.
+#   1. Coarse function-level names via Mozilla's tecken symbol server.  Alpine
+#      uploads to tecken keyed by its exact ELF BuildID, so the .sym matches
+#      the Alpine libxul byte-for-byte (no VMA drift).  The .sym contains
+#      PUBLIC-only records (Alpine builds without DWARF), so coverage is
+#      .dynsym names plus their entry-point VMAs — ~8,600 symbols, enough to
+#      attribute K-class RIP fires to within a function (file/line not
+#      recoverable).  scripts/inject-libxul-symbols.sh --musl handles this
+#      automatically; create-data-disk.sh wires it whenever
+#      ASTRYXOS_FIREFOX_DEBUG is set with FIREFOX_VARIANT=musl.
 #
 #   2. Build firefox-esr from source inside an Alpine builder with
 #      --disable-strip and --disable-install-strip.  Multi-hour, multi-GiB.
@@ -316,7 +318,6 @@ echo "[FF-MUSL-DBG] Done."
 echo "[FF-MUSL-DBG]   Layout: ${DISK_DEBUG_DIR}/<abs-binary-path>/<basename>.debug"
 echo "[FF-MUSL-DBG]   Total:  ${DBG_TREE_SIZE} across ${DBG_FILE_COUNT} files"
 echo "[FF-MUSL-DBG]   Coverage: musl libc + ld-musl; +GTK/glib/cairo/pixbuf when not --musl-only"
-echo "[FF-MUSL-DBG]   Gap:    firefox-esr — Alpine does not ship firefox-esr-dbg;"
-echo "[FF-MUSL-DBG]           run scripts/inject-libxul-symbols.sh against the musl libxul"
-echo "[FF-MUSL-DBG]           for coarse function-level names via Mozilla's Breakpad .sym"
-echo "[FF-MUSL-DBG]           (function names usually correct, VMAs drift vs Mozilla build)."
+echo "[FF-MUSL-DBG]   libxul: handled by scripts/inject-libxul-symbols.sh --musl"
+echo "[FF-MUSL-DBG]           (Mozilla tecken keyed by Alpine ELF BuildID; PUBLIC-only,"
+echo "[FF-MUSL-DBG]            ~8,600 entries; VMAs byte-exact vs Alpine libxul)."
