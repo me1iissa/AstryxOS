@@ -40,6 +40,33 @@ FIREFOX=false
 # Selectable via CLI arg or env var; env var loses to explicit CLI arg.
 FIREFOX_VARIANT="${ASTRYXOS_FIREFOX_VARIANT:-glibc}"
 
+# Firefox package selector (musl variant only).  Picks which Alpine package
+# install-firefox-musl.sh + install-firefox-musl-debug.sh pull:
+#
+#   firefox-esr (default) — Alpine community/firefox-esr 115.x.  Mature ESR
+#                           binary; no -dbg subpackage in Alpine v3.20.
+#                           libxul attribution falls back to Mozilla tecken
+#                           (PUBLIC-only; ~8,600 symbols, no FUNC).  This is
+#                           the historical reproducer for the F3-saga gate at
+#                           sc=1233.
+#
+#   firefox               — Alpine community/firefox 132.x.  Current stable
+#                           release; carries firefox-dbg with a real .debug
+#                           companion (~46 MiB libxul.so.debug containing
+#                           ~420k symbols incl. FUNC + minimal DWARF — full
+#                           C++ name attribution via .gnu_debuglink without
+#                           Mozilla tecken).  Use when you need to NAME the
+#                           libxul function at a captured RIP.  Note that
+#                           switching the binary changes the reproducer
+#                           identity — new firefox-132 plateau metrics will
+#                           NOT match the firefox-esr sc=1233 plateau.
+#
+# Constraints:
+#   - Only meaningful when FIREFOX_VARIANT=musl.  Setting under glibc is
+#     silently ignored; glibc uses the Mozilla-official ESR 115 tarball
+#     unconditionally (install-firefox.sh path).
+FIREFOX_PACKAGE="${ASTRYXOS_FIREFOX_PACKAGE:-firefox-esr}"
+
 # Firefox debug-symbols opt-in.  When set, stages Alpine -dbg debug companion
 # files (musl-dbg + optionally glib/gdk-pixbuf/cairo/gtk+3.0-dbg) into
 # build/disk/usr/lib/debug/ and into data.img so that addr2line / objdump
@@ -72,6 +99,7 @@ for arg in "$@"; do
         --firefox-variant) :;;   # next arg consumed by trailing path
         --firefox-debug=*) FIREFOX_DEBUG="${arg#--firefox-debug=}" ;;
         --firefox-debug)   FIREFOX_DEBUG=1 ;;
+        --firefox-package=*) FIREFOX_PACKAGE="${arg#--firefox-package=}" ;;
         [0-9]*) SIZE_MB="$arg" ;;
     esac
 done
@@ -84,6 +112,27 @@ case "${FIREFOX_VARIANT}" in
         ;;
 esac
 echo "[DATA-DISK] Firefox variant: ${FIREFOX_VARIANT}"
+
+case "${FIREFOX_PACKAGE}" in
+    firefox-esr|firefox) ;;
+    *)
+        echo "[DATA-DISK] ERROR: unknown FIREFOX_PACKAGE='${FIREFOX_PACKAGE}' (expected firefox-esr|firefox)"
+        exit 1
+        ;;
+esac
+if [ "${FIREFOX_PACKAGE}" != "firefox-esr" ] && [ "${FIREFOX_VARIANT}" != "musl" ]; then
+    echo "[DATA-DISK] NOTE: ASTRYXOS_FIREFOX_PACKAGE=${FIREFOX_PACKAGE} ignored — only applies to FIREFOX_VARIANT=musl"
+    FIREFOX_PACKAGE=firefox-esr
+fi
+echo "[DATA-DISK] Firefox package: ${FIREFOX_PACKAGE}"
+
+# Compute the on-disk install-dir for the musl variant.  Mirrors
+# install-firefox-musl.sh's FF_INSTALL_DIR_NAME logic.  Used by the
+# /usr/lib/<pkg>/ copy below and the inject-libxul-symbols.sh trigger guard.
+case "${FIREFOX_PACKAGE}" in
+    firefox-esr) FIREFOX_INSTALL_DIRNAME=firefox-esr ;;
+    firefox)     FIREFOX_INSTALL_DIRNAME=firefox     ;;
+esac
 
 case "${FIREFOX_DEBUG}" in
     ''|0)        FIREFOX_DEBUG_MODE=off ;;
@@ -279,7 +328,10 @@ fi
 if [ -f "${ROOT_DIR}/scripts/install-firefox-musl.sh" ]; then
     MUSL_FLAGS=""
     [ "${FORCE}" = true ] && MUSL_FLAGS="--force"
-    bash "${ROOT_DIR}/scripts/install-firefox-musl.sh" ${MUSL_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
+    # ASTRYXOS_FIREFOX_PACKAGE forwarded via env so install-firefox-musl.sh
+    # picks firefox-esr vs firefox-132 layout uniformly across the pipeline.
+    ASTRYXOS_FIREFOX_PACKAGE="${FIREFOX_PACKAGE}" \
+        bash "${ROOT_DIR}/scripts/install-firefox-musl.sh" ${MUSL_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
         { echo "[DATA-DISK] FATAL: install-firefox-musl.sh failed"; exit 1; }
 fi
 
@@ -296,30 +348,51 @@ if [ "${FIREFOX_DEBUG_MODE}" != off ] && \
     if [ "${FIREFOX_DEBUG_MODE}" = musl ]; then
         DBG_FLAGS="${DBG_FLAGS} --musl-only"
     fi
-    bash "${ROOT_DIR}/scripts/install-firefox-musl-debug.sh" ${DBG_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
+    # Forward ASTRYXOS_FIREFOX_PACKAGE so the dbg installer adds firefox-dbg
+    # (only meaningful when FIREFOX_PACKAGE=firefox; firefox-esr has no -dbg).
+    ASTRYXOS_FIREFOX_PACKAGE="${FIREFOX_PACKAGE}" \
+        bash "${ROOT_DIR}/scripts/install-firefox-musl-debug.sh" ${DBG_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
         echo "[DATA-DISK] WARNING: install-firefox-musl-debug.sh failed — /usr/lib/debug not staged"
 fi
 
 # ── Optional: inject .symtab into the musl libxul.so ─────────────────────────
-# Alpine's firefox-esr does NOT ship a -dbg subpackage (verified vs
-# community/firefox 132.x which DOES; see scripts/install-firefox-musl-debug.sh
-# "Implication for libxul.so attribution").  Instead, Mozilla's symbol server
-# (tecken) indexes the exact Alpine BuildID and serves a gzipped Breakpad
-# .sym (~9 MiB compressed) that lists every .dynsym entry as a PUBLIC record.
-# scripts/inject-libxul-symbols.sh --musl downloads the .sym, derives the
-# Breakpad GUID from the libxul BuildID, and splices an Elf64_Sym .symtab
-# into libxul.so.  The .text section is byte-identical pre/post (verified
-# by SHA256 inside the script) — no upstream-binary edit.
+# Two cases, selected by ASTRYXOS_FIREFOX_PACKAGE:
+#
+#   firefox-esr (115.x) — Alpine does NOT ship a -dbg subpackage.  Mozilla's
+#       symbol server (tecken) indexes the exact Alpine BuildID and serves a
+#       gzipped Breakpad .sym (~9 MiB compressed) that lists every .dynsym
+#       entry as a PUBLIC record.  scripts/inject-libxul-symbols.sh --musl
+#       downloads the .sym, derives the Breakpad GUID from the libxul BuildID,
+#       and splices an Elf64_Sym .symtab into libxul.so.  The .text section
+#       is byte-identical pre/post (verified by SHA256 inside the script) —
+#       no upstream-binary edit.
+#
+#   firefox (132.x)     — Alpine DOES ship firefox-dbg with a real .debug
+#       companion at /usr/lib/debug/usr/lib/firefox/libxul.so.debug carrying
+#       full .symtab (~420k entries with FUNC records and minimal DWARF).
+#       install-firefox-musl-debug.sh stages it; the binary's .gnu_debuglink
+#       section already points there.  addr2line / nm / gdb resolve C++ names
+#       natively — no Mozilla tecken indirection required.  We SKIP the inject
+#       step in this mode (it would be a no-op anyway: tecken's libxul-132 GUID
+#       coverage is incomplete and the .symtab would be inferior to the
+#       firefox-dbg one).
 #
 # Triggered together with the -dbg companion stage so a single
 # ASTRYXOS_FIREFOX_DEBUG=musl|1|full request gets all attribution avenues.
+LIBXUL_STAGED="${BUILD_DIR}/disk/usr/lib/${FIREFOX_INSTALL_DIRNAME}/libxul.so"
 if [ "${FIREFOX_DEBUG_MODE}" != off ] && \
+   [ "${FIREFOX_PACKAGE}" = "firefox-esr" ] && \
    [ -f "${ROOT_DIR}/scripts/inject-libxul-symbols.sh" ] && \
-   [ -f "${BUILD_DIR}/disk/usr/lib/firefox-esr/libxul.so" ]; then
+   [ -f "${LIBXUL_STAGED}" ]; then
     MUSL_SYM_FLAGS="--musl"
     [ "${FORCE}" = true ] && MUSL_SYM_FLAGS="${MUSL_SYM_FLAGS} --force"
-    bash "${ROOT_DIR}/scripts/inject-libxul-symbols.sh" ${MUSL_SYM_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
+    if bash "${ROOT_DIR}/scripts/inject-libxul-symbols.sh" ${MUSL_SYM_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' ; then
+        :
+    else
         echo "[DATA-DISK] WARNING: inject-libxul-symbols.sh --musl failed — libxul.so will lack .symtab"
+    fi
+elif [ "${FIREFOX_DEBUG_MODE}" != off ] && [ "${FIREFOX_PACKAGE}" = "firefox" ]; then
+    echo "[DATA-DISK] Skipping Mozilla tecken libxul .symtab injection — firefox-dbg companion covers libxul attribution natively via .gnu_debuglink."
 fi
 
 # Stage a /tmp/hello.html for the headless oracle test — install-firefox.sh
@@ -556,28 +629,30 @@ EOF
         done
         echo "[DATA-DISK] Copied ${local_count} musl support libs to /usr/lib/ (Alpine deps)"
 
-        # The canonical Mozilla tree must land at /usr/lib/firefox-esr/ on the
+        # The canonical Mozilla tree must land at /usr/lib/${dirname}/ on the
         # FAT32 image — that is the DT_RUNPATH baked into firefox-bin,
         # libxul.so, libmozsandbox.so, etc. (readelf -d shows
-        # RUNPATH=[/usr/lib/firefox-esr]).  Per the ELF gABI (System V ABI
-        # §5.4) and ld-musl(8), DT_RUNPATH is the third entry in the dynamic
-        # linker search order; without the tree at this path, libxul's
-        # transitive dlopen calls (e.g. libmozsandbox.so) fail with ENOENT
-        # and ld-musl exit_group()s at startup.
-        MUSL_FF_ESR="${BUILD_DIR}/disk/usr/lib/firefox-esr"
-        if [ -d "${MUSL_FF_ESR}" ]; then
-            echo "[DATA-DISK] Copying /usr/lib/firefox-esr (~206 MiB) to data image — this takes a moment..."
-            mmd -i "${DATA_IMG}" "::usr/lib/firefox-esr" 2>/dev/null || true
+        # RUNPATH=[/usr/lib/firefox-esr] for the 115.x package or
+        # RUNPATH=[/usr/lib/firefox] for the 132.x package).  Per the ELF gABI
+        # (System V ABI §5.4) and ld-musl(8), DT_RUNPATH is the third entry
+        # in the dynamic linker search order; without the tree at this path,
+        # libxul's transitive dlopen calls (e.g. libmozsandbox.so) fail with
+        # ENOENT and ld-musl exit_group()s at startup.
+        MUSL_FF_TREE="${BUILD_DIR}/disk/usr/lib/${FIREFOX_INSTALL_DIRNAME}"
+        if [ -d "${MUSL_FF_TREE}" ]; then
+            FF_TREE_SIZE="$(du -sh "${MUSL_FF_TREE}" | cut -f1)"
+            echo "[DATA-DISK] Copying /usr/lib/${FIREFOX_INSTALL_DIRNAME} (${FF_TREE_SIZE}) to data image — this takes a moment..."
+            mmd -i "${DATA_IMG}" "::usr/lib/${FIREFOX_INSTALL_DIRNAME}" 2>/dev/null || true
             # mcopy -s walks the full tree (omni.ja, browser/, defaults/,
             # fonts/, gmp-clearkey/, every .so file).  Tolerate failures for
             # any deep symlink chains (none expected — install-firefox-musl.sh
             # dereferences with cp -L during staging).
-            mcopy -s -o -i "${DATA_IMG}" "${MUSL_FF_ESR}/." \
-                "::usr/lib/firefox-esr/" 2>&1 | \
+            mcopy -s -o -i "${DATA_IMG}" "${MUSL_FF_TREE}/." \
+                "::usr/lib/${FIREFOX_INSTALL_DIRNAME}/" 2>&1 | \
                 grep -v "^$" | grep -iv "^skipping" | head -20 || true
-            echo "[DATA-DISK] Copied /usr/lib/firefox-esr/ to data image (DT_RUNPATH target)"
+            echo "[DATA-DISK] Copied /usr/lib/${FIREFOX_INSTALL_DIRNAME}/ to data image (DT_RUNPATH target)"
         else
-            echo "[DATA-DISK] WARNING: ${MUSL_FF_ESR} missing — musl FF DT_RUNPATH lookup will fail"
+            echo "[DATA-DISK] WARNING: ${MUSL_FF_TREE} missing — musl FF DT_RUNPATH lookup will fail"
         fi
 
         # ── Optional: /usr/lib/debug/ debug-info companion tree ─────────────
