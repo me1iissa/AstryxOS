@@ -1817,6 +1817,16 @@ fn stack_write_u64(
                 let dst = phys_to_virt(phys).add(offset) as *mut u64;
                 core::ptr::write(dst, value);
             }
+            // Track B (Phase 5, 2026-05-21) — record the kernel-direct-map
+            // write into the stack-page provenance ring.  The window gate
+            // inside `record_write` drops VAs outside the 0x3f thread-stack
+            // range, so the main-thread initial-stack writes
+            // (USER_STACK_TOP=0x7fff_…) are dropped harmlessly while the
+            // 0x3f-range writes are captured.
+            #[cfg(feature = "stack-prov")]
+            crate::mm::stack_prov::record_write(
+                vaddr, value, crate::mm::stack_prov::SITE_ELF_AUXV,
+            );
             return;
         }
     }
@@ -1847,6 +1857,22 @@ fn stack_write_bytes(
                 break;
             }
         }
+    }
+    // Track B (Phase 5, 2026-05-21) — record ONE stack-prov entry per
+    // byte-slice write, packing the first up-to-8 bytes as the `value`
+    // (little-endian).  Per-byte recording would flood the small ring;
+    // the first-byte packing is enough to disambiguate string writes
+    // from u64 writes in the post-mortem.
+    #[cfg(feature = "stack-prov")]
+    if !data.is_empty() {
+        let mut val: u64 = 0;
+        let n = core::cmp::min(8, data.len());
+        for j in 0..n {
+            val |= (data[j] as u64) << (j * 8);
+        }
+        crate::mm::stack_prov::record_write(
+            vaddr, val, crate::mm::stack_prov::SITE_ELF_AUXV_BYTES,
+        );
     }
 }
 

@@ -728,6 +728,27 @@ pub fn probe_gp_at_ssp_fail(
         crate::mm::w215_diag::dump_alloc_shadow_for_phys(prior_phys);
     }
 
+    // ── [SSP-DIAG-STACK-PROV] — Track B stack-page write provenance ──────
+    //
+    // The `f3-watch` DR0–DR3 channel (per [[k2b-f3-user-writer-2026-05-20]])
+    // only catches writes whose access goes through the **linear** address
+    // (Intel SDM Vol. 3B §17.2.4: data-breakpoint watchpoints trap on
+    // linear-VA only).  But every kernel→user-page write today goes
+    // through the kernel direct map (`PHYS_OFF + phys`) — signal-frame
+    // builders, vfork helper-stack seeds, the auxv/argv setup path in
+    // `proc::elf::setup_user_stack`, etc.  Those writes are invisible to
+    // DR-watchpoints.
+    //
+    // This block names any kernel-mode writer that landed on the same
+    // physical frame as `saved_slot` while the VA was inside the 0x3f
+    // thread-stack window.  Output cap is bounded by the surrounding
+    // `SSP_DIAG_MAX` budget; the ring itself is statically-allocated and
+    // cannot leak.  See `mm/stack_prov.rs` for the on-record contract.
+    #[cfg(feature = "stack-prov")]
+    if saved_slot_phys != 0 {
+        crate::mm::stack_prov::dump_for_phys(saved_slot_phys);
+    }
+
     // ── RIP-disambiguator block — see module header for the truth table.
 
     // ── Line 4: [SSP-DIAG-RA] — caller's return-address slot one qword
