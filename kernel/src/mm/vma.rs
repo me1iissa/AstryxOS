@@ -298,8 +298,41 @@ pub struct VmSpace {
     pub generation: Arc<AtomicU64>,
 }
 
-/// Default user-space mmap starting address.
+/// Default user-space mmap starting address.  `find_free_range` walks
+/// downward from `mmap_hint`, so this is the *upper* bound from which
+/// the first anonymous mmap is allocated.
 const MMAP_BASE: u64 = 0x0000_7F00_0000_0000;
+
+/// Entropy bits applied to each `VmSpace`'s starting `mmap_hint` so that
+/// the first anonymous-mmap address — and every subsequent allocation
+/// that derives from it via the top-down walk — varies per process and
+/// per boot.  20 bits of page-granular entropy gives a `2^20 * 4 KiB =
+/// 4 GiB` jitter window which is large enough to defeat fixed-VA
+/// exploits while leaving the bulk of the mmap region (`MMAP_BASE`
+/// downward) intact for normal allocation.
+///
+/// References:
+/// - mmap(2) — kernel-chosen VA when `addr == NULL`
+/// - System V AMD64 ABI §3.3.3 (Address Space Layout)
+const MMAP_ASLR_BITS: u32 = 20;
+
+/// Return a per-process randomised `mmap_hint` starting value.
+///
+/// The hint is `MMAP_BASE - random_4 KiB_offset`, so subsequent
+/// `find_free_range` calls walk downward from a slightly different
+/// upper bound each time a new address space is created.  Combined
+/// with interpreter ASLR (`proc::elf::interp_aslr_base()`), this means
+/// every shared library that the dynamic linker maps via `mmap()`
+/// lands at a different VA per `exec()`.
+#[inline]
+fn randomised_mmap_hint() -> u64 {
+    let offset = crate::security::rand::aslr_page_offset(MMAP_ASLR_BITS);
+    // Subtract so the hint stays at or below `MMAP_BASE`; the allocator
+    // walks downward from this hint, never upward, so a subtractive
+    // jitter is the correct direction.  Saturating sub is paranoia —
+    // `MMAP_BASE - 4 GiB` is still well inside user space.
+    MMAP_BASE.saturating_sub(offset)
+}
 
 /// Default user-space heap start.
 const HEAP_BASE: u64 = 0x0000_0040_0000_0000;
@@ -542,7 +575,12 @@ impl VmSpace {
         Some(Self {
             cr3: new_pml4,
             areas: Vec::new(),
-            mmap_hint: MMAP_BASE,
+            // Per-process mmap-hint ASLR: subsequent anonymous mmaps via
+            // `find_free_range` walk downward from this hint, so jittering
+            // the starting value forces every shared-library VA chosen by
+            // ld-musl to differ between processes and between boots.  See
+            // `randomised_mmap_hint()` for the entropy rationale.
+            mmap_hint: randomised_mmap_hint(),
             brk: HEAP_BASE,
             brk_start: HEAP_BASE,
             mm_sem,
