@@ -2897,12 +2897,22 @@ pub fn alloc_vfork_child_stack(parent_pid: Pid, parent_new_stack: u64) -> Option
     };
 
     // ── Phase 2: locate the parent's VmSpace and pick a free address range.
+    //
+    // Route through `find_free_stack_range` (dedicated stack-ASLR window,
+    // per-process base + per-call jitter, disjoint from the general
+    // mmap downward walk) rather than the bare `find_free_range`.  This
+    // matches the routing in `syscall::sys_mmap` for `MAP_STACK |
+    // MAP_ANONYMOUS` non-FIXED allocations and gives the vfork child's
+    // isolated stack the same per-spawn entropy.  See `mm::vma::STACK_ASLR_MIN`
+    // for the layout rationale.  Falls through to `find_free_range`
+    // internally when the window is full, so behaviour is at least as
+    // permissive as before.
     let length = page_align_up(VFORK_STACK_SIZE);
     let (parent_cr3, base) = {
         let mut procs = PROCESS_TABLE.lock();
         let p = procs.iter_mut().find(|p| p.pid == parent_pid)?;
         let space = p.vm_space.as_mut()?;
-        let base = space.find_free_range(length)?;
+        let base = space.find_free_stack_range(length)?;
 
         // Insert the VMA so subsequent page-faults inside the range are
         // demand-paged by the standard handler.  We also pre-map the top
