@@ -117,19 +117,29 @@ def parse_sym(sym_path: Path) -> list[tuple[int, int, str]]:
             if line.startswith("FUNC "):
                 # FUNC [m] <addr_hex> <size_hex> <param_size_hex> <name>
                 # The "m" multiple-definition flag is optional (sits at
-                # parts[1]); when absent the address is at parts[1] and the
-                # name at parts[4].  Mozilla release builds emit FUNC without
-                # the m flag; we accept both to be tolerant of future format
-                # variants.
-                parts = line.split(None, 5)
-                if len(parts) < 5:
+                # parts[1]).  We must redo the split with the correct maxsplit
+                # depending on whether "m" is present, so that the demangled
+                # C++ name (which contains spaces from templates, `const`,
+                # multi-arg lists, etc.) is captured as one final token rather
+                # than truncated at its first whitespace.
+                #
+                #   With m:    FUNC m <addr> <size> <psize> <name...>
+                #              → split(None, 5), name = parts[5]
+                #   Without:   FUNC   <addr> <size> <psize> <name...>
+                #              → split(None, 4), name = parts[4]
+                first_split = line.split(None, 2)
+                if len(first_split) < 2:
                     continue
-                if parts[1] == "m":
+                if first_split[1] == "m":
+                    parts = line.split(None, 5)
                     if len(parts) < 6:
                         continue
                     addr_field, size_field = parts[2], parts[3]
                     name = parts[5].rstrip("\n")
                 else:
+                    parts = line.split(None, 4)
+                    if len(parts) < 5:
+                        continue
                     addr_field, size_field = parts[1], parts[2]
                     name = parts[4].rstrip("\n")
                 try:
@@ -142,19 +152,27 @@ def parse_sym(sym_path: Path) -> list[tuple[int, int, str]]:
                     n_func += 1
             elif line.startswith("PUBLIC "):
                 # PUBLIC [m] <addr_hex> <param_size_hex> <name>
-                # The optional "m" multiple-definition flag sits at parts[1];
-                # the address is then at parts[2] and the name at parts[4].
-                # Without "m" the address is at parts[1] and the name at
-                # parts[3].
-                parts = line.split(None, 4)
-                if len(parts) < 4:
+                # Same demangled-name-with-spaces concern as FUNC: redo the
+                # split with the correct maxsplit so the full name lands in
+                # the final token.
+                #
+                #   With m:    PUBLIC m <addr> <psize> <name...>
+                #              → split(None, 4), name = parts[4]
+                #   Without:   PUBLIC   <addr> <psize> <name...>
+                #              → split(None, 3), name = parts[3]
+                first_split = line.split(None, 2)
+                if len(first_split) < 2:
                     continue
-                if parts[1] == "m":
+                if first_split[1] == "m":
+                    parts = line.split(None, 4)
                     if len(parts) < 5:
                         continue
                     addr_field = parts[2]
                     name = parts[4].rstrip("\n")
                 else:
+                    parts = line.split(None, 3)
+                    if len(parts) < 4:
+                        continue
                     addr_field = parts[1]
                     name = parts[3].rstrip("\n")
                 try:
@@ -396,7 +414,69 @@ def verify_output(output_path: Path) -> None:
         print("[WARN] nm returned no symbols!", file=sys.stderr)
 
 
+def _selftest() -> int:
+    """
+    Round-trip parse_sym() against representative FUNC/PUBLIC records that
+    exercise the demangled-name-with-spaces edge cases (templates, references,
+    `const`, multi-arg).  Catches the regression where the optional `m` flag
+    branch truncates names at the first whitespace.
+    """
+    cases = [
+        # (line, expected_vma, expected_size, expected_name)
+        ("FUNC 1500 80 0 mozilla::dom::Document::GetElementById(nsAString const&)\n",
+         0x1500, 0x80,
+         "mozilla::dom::Document::GetElementById(nsAString const&)"),
+        ("FUNC m 1500 80 0 mozilla::Foo::Bar(int const&)\n",
+         0x1500, 0x80,
+         "mozilla::Foo::Bar(int const&)"),
+        ("PUBLIC 1430 0 std::vector<int, std::allocator<int> >::push_back(int const&)\n",
+         0x1430, 0,
+         "std::vector<int, std::allocator<int> >::push_back(int const&)"),
+        ("PUBLIC m 1430 0 std::vector<int>::clear()\n",
+         0x1430, 0,
+         "std::vector<int>::clear()"),
+        # No-flag simple case (no internal spaces) — sanity check that the
+        # common path still works.
+        ("FUNC 2000 10 0 _start\n",
+         0x2000, 0x10, "_start"),
+        ("PUBLIC 3000 0 main\n",
+         0x3000, 0, "main"),
+    ]
+    failures = 0
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sym_path = Path(tmpdir) / "selftest.sym"
+        with open(sym_path, "w", encoding="utf-8") as f:
+            f.write("MODULE Linux x86_64 0000 libxul.so\n")
+            for line, _, _, _ in cases:
+                f.write(line)
+        # Suppress the "Parsed FUNC=... PUBLIC=..." print during self-test.
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            parsed = parse_sym(sym_path)
+    if len(parsed) != len(cases):
+        print(f"[SELFTEST] FAIL: expected {len(cases)} records, got {len(parsed)}")
+        return 1
+    for (line, exp_vma, exp_size, exp_name), got in zip(cases, parsed):
+        got_vma, got_size, got_name = got
+        if (got_vma, got_size, got_name) != (exp_vma, exp_size, exp_name):
+            print(f"[SELFTEST] FAIL: {line.rstrip()}")
+            print(f"           expected (vma={exp_vma:#x}, size={exp_size:#x}, name={exp_name!r})")
+            print(f"           got      (vma={got_vma:#x}, size={got_size:#x}, name={got_name!r})")
+            failures += 1
+    if failures == 0:
+        print(f"[SELFTEST] OK: {len(cases)} round-trip cases passed")
+        return 0
+    return 1
+
+
 def main() -> None:
+    # Hidden --self-test entry point for round-tripping parse_sym() against
+    # representative demangled-name shapes.  Used in CI and by reviewers; does
+    # not require any external .sym or libxul.so input.
+    if len(sys.argv) == 2 and sys.argv[1] == "--self-test":
+        sys.exit(_selftest())
+
     parser = argparse.ArgumentParser(
         description="Splice Breakpad FUNC symbols into a stripped libxul.so as .symtab"
     )

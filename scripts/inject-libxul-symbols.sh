@@ -104,6 +104,19 @@ else
     SYM_GZ="${SYM_DIR}/libxul.so.sym.gz"
 fi
 
+# ── Required-tools check (defensive: keep .text-SHA invariant probe intact) ──
+# The architectural invariant (no upstream-binary edits) is enforced by the
+# pre/post .text SHA256 comparison below; that comparison silently no-ops if
+# objcopy or sha256sum is missing, which would let a regression slip through
+# unnoticed.  Require both upfront so the invariant probe is always exercised.
+for tool in objcopy sha256sum readelf; do
+    if ! command -v "${tool}" >/dev/null 2>&1; then
+        echo "[INJECT-SYMS] ERROR: required tool '${tool}' not found in PATH" >&2
+        echo "[INJECT-SYMS]        Install binutils + coreutils (Debian: 'apt install binutils coreutils')" >&2
+        exit 1
+    fi
+done
+
 # ── Sanity: target libxul must exist ─────────────────────────────────────────
 if [ ! -f "${LIBXUL}" ]; then
     echo "[INJECT-SYMS] ERROR: target libxul.so not found: ${LIBXUL}"
@@ -136,14 +149,16 @@ mkdir -p "${SYM_DIR}"
 # adding metadata sections, which does NOT touch .text — verify byte-identical
 # .text content after injection.
 PRE_TEXT_SHA=""
-if command -v objcopy >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1; then
-    PRE_TEXT_TMP="$(mktemp -t libxul_pre_text.XXXXXX)"
-    if objcopy --dump-section .text="${PRE_TEXT_TMP}" "${LIBXUL}" 2>/dev/null; then
-        PRE_TEXT_SHA="$(sha256sum "${PRE_TEXT_TMP}" | cut -d' ' -f1)"
-        echo "[INJECT-SYMS]   Pre  .text SHA256: ${PRE_TEXT_SHA}"
-    fi
+PRE_TEXT_TMP="$(mktemp -t libxul_pre_text.XXXXXX)"
+if objcopy --dump-section .text="${PRE_TEXT_TMP}" "${LIBXUL}" 2>/dev/null; then
+    PRE_TEXT_SHA="$(sha256sum "${PRE_TEXT_TMP}" | cut -d' ' -f1)"
+    echo "[INJECT-SYMS]   Pre  .text SHA256: ${PRE_TEXT_SHA}"
+else
+    echo "[INJECT-SYMS] ERROR: failed to dump .text from ${LIBXUL}" >&2
     rm -f "${PRE_TEXT_TMP}"
+    exit 1
 fi
+rm -f "${PRE_TEXT_TMP}"
 
 if [ "${MODE}" = "glibc" ]; then
     # ── glibc mode: HTTP-range-slice the crashreporter ZIP ───────────────────
@@ -268,12 +283,18 @@ print(g.hex().upper() + '0')
         echo "[INJECT-SYMS] Using cached ${SYM_FILE} ($(wc -l < "${SYM_FILE}") lines)"
     fi
 
-    # Sanity: the .sym file should carry the same Build ID we read from libxul.
+    # Sanity: the .sym file MUST carry the same Build ID we read from libxul.
+    # A mismatch means tecken returned the wrong .sym (GUID derivation bug,
+    # index inconsistency, or the .sym was rebuilt against a different binary).
+    # Splicing a mismatched .symtab produces nonsense rip-trace attributions —
+    # hard-fail rather than warn.
     SYM_MODULE_LINE="$(head -2 "${SYM_FILE}")"
     SYM_CODE_ID="$(echo "${SYM_MODULE_LINE}" | awk '/^INFO CODE_ID/ {print tolower($3)}')"
     if [ -n "${SYM_CODE_ID}" ] && [ "${SYM_CODE_ID}" != "${BUILD_ID}" ]; then
-        echo "[INJECT-SYMS] WARNING: .sym CODE_ID=${SYM_CODE_ID} does not match libxul BuildID=${BUILD_ID}" >&2
-        echo "[INJECT-SYMS]          GUID derivation or Mozilla index lookup is inconsistent." >&2
+        echo "[INJECT-SYMS] ERROR: .sym CODE_ID=${SYM_CODE_ID} does not match libxul BuildID=${BUILD_ID}" >&2
+        echo "[INJECT-SYMS]        GUID derivation or Mozilla index lookup is inconsistent." >&2
+        echo "[INJECT-SYMS]        Refusing to inject — would produce wrong rip-trace attributions." >&2
+        exit 1
     fi
 fi
 
