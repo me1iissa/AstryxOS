@@ -5135,7 +5135,7 @@ fn test_signal_vma_snapshot() -> bool {
                 name: "[heap]",
             },
         ],
-        mmap_hint: 0, brk: 0, brk_start: 0,
+        mmap_hint: 0, stack_aslr_base: 0, brk: 0, brk_start: 0,
     };
     // user_rip lands inside the libxul .text VMA at offset 0x1234, cr2 lands
     // inside the anonymous heap (typical post-#176 RIP-far-from-CR2 cluster).
@@ -5243,7 +5243,7 @@ fn test_signal_vma_snapshot() -> bool {
                     name: "[mmap-file]",
                 },
             ],
-            mmap_hint: 0, brk: 0, brk_start: 0,
+            mmap_hint: 0, stack_aslr_base: 0, brk: 0, brk_start: 0,
         };
         let rip_in_seg = delta_vma_base + 0x1234;
         let snap2 = crate::signal::signal_vma_snapshot(Some(&delta_space), rip_in_seg, 0);
@@ -20305,6 +20305,166 @@ fn test_aslr_shared_lib() -> bool {
         MMAP_HINT_MIN, MMAP_BASE_EXPECTED,
         INTERP_ASLR_MIN_EXPECTED, INTERP_ASLR_MAX_EXPECTED
     );
+
+    // ── Mechanism 3: MAP_STACK ASLR — find_free_stack_range ─────────────────
+    //
+    // A non-FIXED `MAP_STACK | MAP_ANONYMOUS` mmap should land inside the
+    // dedicated stack-ASLR window `[STACK_ASLR_MIN, STACK_ASLR_MAX) =
+    // [MMAP_BASE, INTERP_ASLR_MIN)`, ABOVE `mmap_hint` so the general
+    // downward-walk allocator never competes with it.  Both the per-process
+    // `stack_aslr_base` AND the per-call jitter contribute; assert that two
+    // sequential calls on the same VmSpace return distinct bases (per-call
+    // jitter active) and that two fresh VmSpaces produce distinct
+    // `stack_aslr_base` (per-process jitter active).
+    //
+    // Window constants here mirror the kernel-side `mm::vma::STACK_ASLR_MIN`
+    // and `STACK_ASLR_MAX`.  If either constant moves, this test's bounds
+    // check fails until they are updated — preventing silent ASLR-coverage
+    // regressions.
+    //
+    // References: mmap(2) MAP_STACK; pthread_create(3); System V AMD64
+    // ABI §3.3.3; CWE-330.
+    const STACK_ASLR_MIN_EXPECTED: u64 = 0x0000_7F00_0000_0000;
+    const STACK_ASLR_MAX_EXPECTED: u64 = 0x0000_7F40_0000_0000;
+
+    let mut vm_stack = match crate::mm::vma::VmSpace::new_user() {
+        Some(v) => v,
+        None => { test_fail!("aslr_shared_lib", "new_user() failed (stack-test)"); return false; }
+    };
+
+    let stack_base_a = vm_stack.stack_aslr_base;
+    test_println!("  stack_aslr_base (vm A): {:#x}", stack_base_a);
+    if stack_base_a & 0xFFF != 0 {
+        test_fail!("aslr_shared_lib", "stack_aslr_base {:#x} not page-aligned", stack_base_a);
+        return false;
+    }
+    if stack_base_a < STACK_ASLR_MIN_EXPECTED || stack_base_a >= STACK_ASLR_MAX_EXPECTED {
+        test_fail!(
+            "aslr_shared_lib",
+            "stack_aslr_base {:#x} outside window [{:#x}, {:#x})",
+            stack_base_a, STACK_ASLR_MIN_EXPECTED, STACK_ASLR_MAX_EXPECTED
+        );
+        return false;
+    }
+
+    // Per-call jitter: two sequential `find_free_stack_range` results on the
+    // SAME VmSpace must differ (no committed VMAs in between, so neither
+    // call sees an overlap and both pick fresh per-call jitter).
+    const STACK_VMA_SIZE: u64 = 8 * 1024 * 1024; // 8 MiB — typical pthread default
+    let s1 = match vm_stack.find_free_stack_range(STACK_VMA_SIZE) {
+        Some(b) => b,
+        None => { test_fail!("aslr_shared_lib", "find_free_stack_range returned None (1)"); return false; }
+    };
+    let s2 = match vm_stack.find_free_stack_range(STACK_VMA_SIZE) {
+        Some(b) => b,
+        None => { test_fail!("aslr_shared_lib", "find_free_stack_range returned None (2)"); return false; }
+    };
+    test_println!("  find_free_stack_range #1: {:#x}", s1);
+    test_println!("  find_free_stack_range #2: {:#x}", s2);
+    for (tag, v) in [("#1", s1), ("#2", s2)] {
+        if v & 0xFFF != 0 {
+            test_fail!("aslr_shared_lib", "stack alloc {} VA {:#x} not page-aligned", tag, v);
+            return false;
+        }
+        // The chosen base must fit `[base, base+size)` entirely inside
+        // the window per the find_free_stack_range contract.
+        if v < STACK_ASLR_MIN_EXPECTED || v.saturating_add(STACK_VMA_SIZE) > STACK_ASLR_MAX_EXPECTED {
+            test_fail!(
+                "aslr_shared_lib",
+                "stack alloc {} VA {:#x} + size {:#x} outside window [{:#x}, {:#x})",
+                tag, v, STACK_VMA_SIZE, STACK_ASLR_MIN_EXPECTED, STACK_ASLR_MAX_EXPECTED
+            );
+            return false;
+        }
+    }
+    if s1 == s2 {
+        // Per-call collision possible at 2^-16; tiebreak with a 3rd draw
+        // before failing.
+        let s3 = vm_stack.find_free_stack_range(STACK_VMA_SIZE).unwrap_or(0);
+        test_println!("  find_free_stack_range #3 (tiebreak): {:#x}", s3);
+        if s1 == s3 {
+            test_fail!(
+                "aslr_shared_lib",
+                "find_free_stack_range identical {:#x} across 3 calls — \
+                 per-call jitter appears broken",
+                s1
+            );
+            return false;
+        }
+    }
+    test_println!("  per-call MAP_STACK jitter active ✓");
+
+    // Per-process jitter: a fresh VmSpace must yield a distinct
+    // `stack_aslr_base`.
+    let vm_stack_b = match crate::mm::vma::VmSpace::new_user() {
+        Some(v) => v,
+        None => { test_fail!("aslr_shared_lib", "new_user() failed (vm B)"); return false; }
+    };
+    let stack_base_b = vm_stack_b.stack_aslr_base;
+    test_println!("  stack_aslr_base (vm B): {:#x}", stack_base_b);
+    if stack_base_b < STACK_ASLR_MIN_EXPECTED || stack_base_b >= STACK_ASLR_MAX_EXPECTED {
+        test_fail!(
+            "aslr_shared_lib",
+            "stack_aslr_base B {:#x} outside window [{:#x}, {:#x})",
+            stack_base_b, STACK_ASLR_MIN_EXPECTED, STACK_ASLR_MAX_EXPECTED
+        );
+        drop(vm_stack_b);
+        drop(vm_stack);
+        return false;
+    }
+    if stack_base_a == stack_base_b {
+        let vm_stack_c = match crate::mm::vma::VmSpace::new_user() {
+            Some(v) => v,
+            None => { test_fail!("aslr_shared_lib", "new_user() failed (vm C)"); return false; }
+        };
+        let stack_base_c = vm_stack_c.stack_aslr_base;
+        test_println!("  stack_aslr_base (vm C tiebreak): {:#x}", stack_base_c);
+        if stack_base_a == stack_base_c {
+            test_fail!(
+                "aslr_shared_lib",
+                "stack_aslr_base identical {:#x} across 3 fresh VmSpaces — \
+                 per-process jitter appears broken",
+                stack_base_a
+            );
+            drop(vm_stack_c);
+            drop(vm_stack_b);
+            drop(vm_stack);
+            return false;
+        }
+        drop(vm_stack_c);
+    }
+    test_println!("  per-process MAP_STACK base jitter active ✓");
+
+    // Disjointness invariant: stack window must lie ENTIRELY above the
+    // mmap-hint upper bound and ENTIRELY below the interpreter window.
+    if STACK_ASLR_MIN_EXPECTED < MMAP_BASE_EXPECTED {
+        test_fail!(
+            "aslr_shared_lib",
+            "layout invariant: STACK_ASLR_MIN {:#x} < MMAP_BASE {:#x}",
+            STACK_ASLR_MIN_EXPECTED, MMAP_BASE_EXPECTED
+        );
+        drop(vm_stack_b);
+        drop(vm_stack);
+        return false;
+    }
+    if STACK_ASLR_MAX_EXPECTED > INTERP_ASLR_MIN_EXPECTED {
+        test_fail!(
+            "aslr_shared_lib",
+            "layout invariant: STACK_ASLR_MAX {:#x} > INTERP_ASLR_MIN {:#x}",
+            STACK_ASLR_MAX_EXPECTED, INTERP_ASLR_MIN_EXPECTED
+        );
+        drop(vm_stack_b);
+        drop(vm_stack);
+        return false;
+    }
+    test_println!(
+        "  layout: stack window {:#x}..{:#x} between mmap {:#x} and interp {:#x} ✓",
+        STACK_ASLR_MIN_EXPECTED, STACK_ASLR_MAX_EXPECTED,
+        MMAP_BASE_EXPECTED, INTERP_ASLR_MIN_EXPECTED
+    );
+
+    drop(vm_stack_b);
+    drop(vm_stack);
 
     test_pass!("ASLR — shared-library VA jitter (interpreter + mmap hint)");
     true
