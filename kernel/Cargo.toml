@@ -224,6 +224,34 @@ clone-args-diag = ["firefox-test"]
 # See Intel SDM Vol. 3B §17.2.4 / §17.2.5 (DR0–DR3, DR7, DR6); Intel
 # SDM Vol. 3A §4.10 (TLB management); System V AMD64 ABI §6.4.
 f3-watch = ["firefox-test", "ssp-canary-diag", "w215-diag"]
+# FS_BASE preserve-across-execution probe
+# (kernel/src/subsys/linux/fs_base_trace.rs).
+# Records every kernel-side `WRMSR(IA32_FS_BASE)` (Intel SDM Vol. 3A
+# §3.4.4.1, MSR `0xC000_0100`) into a per-boot ring keyed by
+# `(cpu, pid, tid, old_fs, new_fs, caller_rip, sc_count, seq)`.  On a
+# CPL-3 SSP-canary `#GP` (per Intel SDM Vol. 2A `HLT`/`RET` + Vol. 3A
+# §6.15) the trapping TID's last ≤32 events are dumped immediately after
+# the existing `[SSP-DIAG]` block — distinguishing the F3-Mode-B-1
+# kernel-side FS.base-shift hypothesis (some scheduler / fork / signal
+# return path changed FS.base between the libxul function's prologue
+# `mov %fs:0x28, %rax` store and its epilogue re-read) from the
+# `ax_eq_fs28 = 1` already-known "live FS.base agrees with itself at
+# trap time" property — these are NOT the same question.
+# Sites instrumented: `proc::write_fs_base()` (the canonical kernel
+# API — covers context-switch via `restore_tls_for_current()` AND
+# `enter_user_mode()` for boot/exec/fork bootstrap) and
+# `subsys/linux/syscall::sys_arch_prctl(ARCH_SET_FS)` (the explicit
+# user-mode write).  `proc/thread.rs::ret_from_fork_asm` is a
+# naked_asm WRMSR that is not currently on the firefox-test fork path
+# (see `proc/mod.rs::create_fork_process_impl`: uses `user_mode_bootstrap`
+# instead) and is intentionally not instrumented in this revision.
+# Ring sized at 1024 × ~40 B = 40 KiB BSS; per-trap dump capped at
+# `FS_BASE_DUMP_MAX = 8` events per boot.  Default builds remain
+# byte-identical when this feature is off.
+# Refs: Intel SDM Vol. 3A §3.4.4.1 (`IA32_FS_BASE`); Intel SDM Vol. 2B
+# (`SYSRETQ` — does NOT auto-reload MSRs); Intel SDM Vol. 3A §6.15
+# (`#GP`); System V AMD64 ABI §6.4 (TLS variant II).
+fs-base-trace = ["firefox-test", "ssp-canary-diag"]
 # `[VMA-DUMP]` on fatal user-mode exceptions.  At each fatal user-mode
 # #PF / #UD / #GP / #AC that terminates the process (no installed
 # handler) the kernel emits a full enumeration of the trapping
