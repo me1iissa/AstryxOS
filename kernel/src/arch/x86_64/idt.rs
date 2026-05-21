@@ -1168,19 +1168,25 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
     // CPU's ring-level check (GP fault) before reaching here; guard detection
     // is purely a defence-in-depth for buggy kernel allocations.
     {
-        use crate::mm::heap::{HEAP_GUARD_BELOW_VA, HEAP_GUARD_ABOVE_VA, HEAP_START, HEAP_SIZE};
-        let is_below_guard = faulting_addr >= HEAP_GUARD_BELOW_VA
-                          && faulting_addr <  HEAP_GUARD_BELOW_VA + 0x1000;
-        let is_above_guard = faulting_addr >= HEAP_GUARD_ABOVE_VA
-                          && faulting_addr <  HEAP_GUARD_ABOVE_VA + 0x1000;
-        if is_below_guard || is_above_guard {
-            // Do not hold any lock — panic is unrecoverable.
-            panic!(
-                "[KERNEL HEAP GUARD] overflow at {:#x} (heap range: {:#x}..{:#x})",
-                faulting_addr,
-                HEAP_START as u64,
-                (HEAP_START + HEAP_SIZE) as u64,
-            );
+        use crate::mm::heap::{heap_guard_below_va, heap_guard_above_va, heap_start, HEAP_SIZE};
+        let below = heap_guard_below_va();
+        let above = heap_guard_above_va();
+        // `heap_start() == 0` means `heap::init()` has not run yet — no
+        // guard is installed, so skip the check entirely (the early-boot
+        // page-fault path can still fire for legitimate PT-building work).
+        let base = heap_start();
+        if base != 0 {
+            let is_below_guard = faulting_addr >= below && faulting_addr < below + 0x1000;
+            let is_above_guard = faulting_addr >= above && faulting_addr < above + 0x1000;
+            if is_below_guard || is_above_guard {
+                // Do not hold any lock — panic is unrecoverable.
+                panic!(
+                    "[KERNEL HEAP GUARD] overflow at {:#x} (heap range: {:#x}..{:#x})",
+                    faulting_addr,
+                    base as u64,
+                    (base + HEAP_SIZE) as u64,
+                );
+            }
         }
     }
 
