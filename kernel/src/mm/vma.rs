@@ -915,6 +915,23 @@ impl VmSpace {
         self.areas.iter_mut().find(|vma| vma.contains(addr))
     }
 
+    /// Lower `mmap_hint` to `base` only when this placement participates in
+    /// the NULL-hint downward-walk regime — i.e. neither MAP_FIXED nor a
+    /// MAP_STACK kernel-chosen allocation.  Skipping MAP_FIXED preserves the
+    /// per-process entropy seeded by `randomised_mmap_hint()`: a dynamic
+    /// linker that MAP_FIXED-loads shared libraries at a PIE-biased base
+    /// would otherwise drag the hint down to that base, destroying entropy
+    /// before any later NULL-hint allocation (notably `pthread_create`'s
+    /// stack fallback path) is ever issued.
+    ///
+    /// References: POSIX mmap(2), pthread_create(3), CWE-330.
+    #[inline]
+    pub fn note_mmap_placement(&mut self, base: u64, is_fixed: bool, is_stack_alloc: bool) {
+        if !is_fixed && !is_stack_alloc && base < self.mmap_hint {
+            self.mmap_hint = base;
+        }
+    }
+
     /// Insert a new VMA, maintaining sorted order by base address.
     /// Returns an error if the new VMA overlaps with any existing one.
     pub fn insert_vma(&mut self, vma: VmArea) -> Result<(), VmaError> {
