@@ -1087,12 +1087,13 @@ pub fn pte_change_displaced_count() -> u64 {
 // frame backing the canary slot at fault time.
 //
 // 4 Ki entries × 24 B = 96 KiB BSS, gated on `firefox-test` (the module).
-// The kernel-image bss_end must stay below the heap start at
-// `phys 0x80_0000` (8 MiB) — see `mm/heap.rs::HEAP_START` and the
-// `pmm::reserve_range` call in `mm/vmm.rs::init`.  Phase D's FREE_SHADOW
-// (1.5 MiB) consumed most of the headroom that remained after the kernel
-// .text/.data sections, so ALLOC_SHADOW is intentionally sized at 1/16th
-// of FREE_SHADOW.  A 4 Ki direct-mapped table hashes 64 frames per slot
+// Before the 2026-05-21 dynamic-heap fix the kernel-image bss_end had to
+// stay below the heap base at `phys 0x80_0000` (8 MiB) or the heap would
+// silently overlap BSS; the heap base is now computed past `__kernel_end`
+// in `mm/heap.rs::compute_heap_layout()` so heavy diagnostic feature
+// combinations no longer corrupt the free list.  Phase D's FREE_SHADOW
+// (1.5 MiB) is the largest contributor to BSS in this module; ALLOC_SHADOW
+// is intentionally sized at 1/16th of FREE_SHADOW.  A 4 Ki direct-mapped table hashes 64 frames per slot
 // in a 1 GiB QEMU configuration; the typical *most-recent* alloc working
 // set in the firefox-test sc≈1233 window is well under 4 Ki frames, so
 // per-slot collisions are exceptional.  When a collision occurs,

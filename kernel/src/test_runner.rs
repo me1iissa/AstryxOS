@@ -19783,10 +19783,7 @@ fn test_execve_no_pmm_leak() -> bool {
 fn test_heap_guard_pte() -> bool {
     test_header!("Heap guard pages — PTE present-bit verification");
 
-    use crate::mm::heap::{
-        HEAP_GUARD_BELOW_VA, HEAP_GUARD_ABOVE_VA,
-        HEAP_START, HEAP_SIZE,
-    };
+    use crate::mm::heap::{heap_guard_below_va, heap_guard_above_va, heap_start, HEAP_SIZE};
     use crate::mm::vmm;
 
     let kernel_cr3 = vmm::get_kernel_cr3();
@@ -19796,24 +19793,32 @@ fn test_heap_guard_pte() -> bool {
     }
     test_println!("  kernel CR3 = {:#x} ✓", kernel_cr3);
 
+    let below_va = heap_guard_below_va();
+    let above_va = heap_guard_above_va();
+    let heap_va  = heap_start() as u64;
+    if heap_va == 0 {
+        test_fail!("heap_guard", "heap_start() == 0 — heap::init not run");
+        return false;
+    }
+
     // 1. Guard below: PTE must NOT be present (bit 0 = 0).
-    let pte_below = vmm::read_pte(kernel_cr3, HEAP_GUARD_BELOW_VA);
-    test_println!("  Below-guard VA={:#x}  PTE={:#x}", HEAP_GUARD_BELOW_VA, pte_below);
+    let pte_below = vmm::read_pte(kernel_cr3, below_va);
+    test_println!("  Below-guard VA={:#x}  PTE={:#x}", below_va, pte_below);
     if pte_below & 1 != 0 {
         test_fail!("heap_guard",
             "Below-guard PTE at {:#x} has PRESENT set (PTE={:#x}) — guard not installed",
-            HEAP_GUARD_BELOW_VA, pte_below);
+            below_va, pte_below);
         return false;
     }
     test_println!("  Below-guard PTE present=0 (not-present) ✓");
 
     // 2. Guard above: PTE must NOT be present (bit 0 = 0).
-    let pte_above = vmm::read_pte(kernel_cr3, HEAP_GUARD_ABOVE_VA);
-    test_println!("  Above-guard VA={:#x}  PTE={:#x}", HEAP_GUARD_ABOVE_VA, pte_above);
+    let pte_above = vmm::read_pte(kernel_cr3, above_va);
+    test_println!("  Above-guard VA={:#x}  PTE={:#x}", above_va, pte_above);
     if pte_above & 1 != 0 {
         test_fail!("heap_guard",
             "Above-guard PTE at {:#x} has PRESENT set (PTE={:#x}) — guard not installed",
-            HEAP_GUARD_ABOVE_VA, pte_above);
+            above_va, pte_above);
         return false;
     }
     test_println!("  Above-guard PTE present=0 (not-present) ✓");
@@ -19823,19 +19828,18 @@ fn test_heap_guard_pte() -> bool {
     //    The heap is backed by 2 MiB huge pages from the bootloader so the
     //    higher-half PD entry will be a huge-page entry (bit 7 = 1, bit 0 = 1).
     //    read_pte returns the huge-page PD entry in that case; present=1 is enough.
-    let heap_first_page = HEAP_START as u64;
-    let pte_heap = vmm::read_pte(kernel_cr3, heap_first_page);
-    test_println!("  Heap first page VA={:#x}  PTE={:#x}", heap_first_page, pte_heap);
+    let pte_heap = vmm::read_pte(kernel_cr3, heap_va);
+    test_println!("  Heap first page VA={:#x}  PTE={:#x}", heap_va, pte_heap);
     if pte_heap & 1 == 0 {
         test_fail!("heap_guard",
             "Heap first page PTE at {:#x} is not present (PTE={:#x}) — unexpected",
-            heap_first_page, pte_heap);
+            heap_va, pte_heap);
         return false;
     }
     test_println!("  Heap first page PTE present=1 ✓");
 
-    // 4. Last heap page (HEAP_START + HEAP_SIZE - 4096): also present.
-    let heap_last_page = (HEAP_START + HEAP_SIZE) as u64 - 0x1000;
+    // 4. Last heap page (heap_va + HEAP_SIZE - 4096): also present.
+    let heap_last_page = heap_va + HEAP_SIZE as u64 - 0x1000;
     let pte_heap_last = vmm::read_pte(kernel_cr3, heap_last_page);
     test_println!("  Heap last page  VA={:#x}  PTE={:#x}", heap_last_page, pte_heap_last);
     if pte_heap_last & 1 == 0 {
@@ -19847,8 +19851,8 @@ fn test_heap_guard_pte() -> bool {
     test_println!("  Heap last page PTE present=1 ✓");
 
     test_println!("  Guard below={:#x} above={:#x} heap={:#x}..{:#x}",
-        HEAP_GUARD_BELOW_VA, HEAP_GUARD_ABOVE_VA,
-        HEAP_START as u64, (HEAP_START + HEAP_SIZE) as u64);
+        below_va, above_va,
+        heap_va, heap_va + HEAP_SIZE as u64);
     test_pass!("Heap guard pages — PTE present-bit verification");
     true
 }

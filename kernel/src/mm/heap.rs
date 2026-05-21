@@ -2,37 +2,133 @@
 //!
 //! Linked-list free-list allocator for the kernel heap.
 //! Supports proper allocation and deallocation with coalescing of adjacent free blocks.
+//!
+//! ## Heap base placement
+//!
+//! The heap virtual base is computed at runtime in `init()` from the
+//! `__kernel_end` linker symbol so the heap always sits above whatever the
+//! linker actually placed BSS at.  Default builds (where BSS fits under
+//! 8 MiB) keep the historical layout — `HEAP_START_MIN_VA = 0xFFFF_8000_0080_0000`
+//! — for byte-identical behaviour.  Heavy diagnostic feature combinations
+//! (`firefox-test,w215-diag,f3-watch,file-buf-witness`) grow BSS past
+//! 8 MiB; in those builds the heap follows BSS rather than overlapping it,
+//! avoiding the silent free-list corruption that first surfaced in Phase 2
+//! QA on 2026-05-21.
+//!
+//! `vmm::init()` calls `compute_heap_layout()` to reserve the backing
+//! frames in the PMM before any `pmm::alloc_page()` runs; `init()` here
+//! latches the same layout and wires the global allocator.  Both call
+//! sites get identical answers because `__kernel_end` is a link-time
+//! constant.  See Intel SDM Vol. 3A §4.3 (IA-32e 2 MiB paging) for the
+//! 2 MiB-aligned base rationale.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
-/// Kernel heap start address.
-///
-/// Placed in the higher-half mapping (PML4 entry 256) at the virtual address
-/// corresponding to physical 8 MiB.  Starting above 8 MiB ensures no overlap
-/// with the kernel image (text + data + bss < 6 MiB) while leaving the 0–8 MiB
-/// identity-mapped range free for user ELF segment mappings and the kernel image
-/// itself.  This keeps the heap accessible even when CR3 points to a user-process
-/// page table (which clones PML4 entries 256-511 from the kernel).
-pub const HEAP_START: usize = 0xFFFF_8000_0080_0000;
 /// Kernel heap size: 128 MiB (sufficient for 1920×1080 GUI with multiple window surfaces).
 pub const HEAP_SIZE: usize = 128 * 1024 * 1024;
 
-/// Guard page immediately below the heap (one 4 KiB page, not-present).
+/// Minimum heap base virtual address — phys 8 MiB in the higher-half map.
 ///
-/// Virtual address `HEAP_START - 4096`.  Faults into the kernel guard handler.
-/// Physical frame `HEAP_GUARD_BELOW_PHYS` is reserved in the PMM so the
-/// allocator never hands it out — preventing a direct-map alias via
-/// `PHYS_OFF + phys` from silently corrupting the guard.
-pub const HEAP_GUARD_BELOW_VA: u64   = HEAP_START as u64 - 0x1000;
-pub const HEAP_GUARD_BELOW_PHYS: u64 = HEAP_GUARD_BELOW_VA - 0xFFFF_8000_0000_0000;
+/// Preserves the historical layout for small kernel builds.  When BSS fits
+/// below 8 MiB (default `firefox-test`) the computed layout pins the heap
+/// here and the build is byte-identical to pre-dynamic-heap kernels.
+const HEAP_START_MIN_VA: usize = 0xFFFF_8000_0080_0000;
 
-/// Guard page immediately above the heap (one 4 KiB page, not-present).
+/// One 2 MiB huge page.  Heap base is rounded up to this alignment so it
+/// always falls on a 2 MiB boundary matching the bootloader's higher-half
+/// huge-page map.  See Intel SDM Vol. 3A §4.3.
+const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
+
+/// Physical-to-virtual offset for the kernel's higher-half map (PML4[256-511]).
+/// Matches `shared::KERNEL_VIRT_BASE` and `vmm::PHYS_OFF`.
+const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+
+extern "C" {
+    /// 4 KiB-aligned symbol emitted by `kernel/linker.ld` immediately after
+    /// `.bss` (see `__kernel_end = .;`).  Used to position the heap above
+    /// whatever the linker actually placed BSS at, so feature-gated
+    /// diagnostic statics that inflate BSS (e.g. `w215_diag` shadow tables
+    /// at ~1.65 MiB) do not silently overlap the heap.
+    static __kernel_end: u8;
+}
+
+/// Runtime-latched heap virtual base, computed in `heap::init()` from the
+/// `__kernel_end` linker symbol.  `0` until `heap::init()` runs.  All
+/// external callers (idt page-fault guard, test_runner) must read through
+/// `heap_start()` / `heap_guard_*_va()` so the "not yet initialised"
+/// sentinel is honoured.
+static HEAP_START_VA: AtomicUsize = AtomicUsize::new(0);
+
+/// Returns the kernel heap base virtual address, or `0` if `heap::init()`
+/// has not yet executed.
+#[inline]
+pub fn heap_start() -> usize {
+    HEAP_START_VA.load(Ordering::Relaxed)
+}
+
+/// Returns the not-present guard page VA immediately below the heap base,
+/// or `0` if `heap::init()` has not yet executed.
+#[inline]
+pub fn heap_guard_below_va() -> u64 {
+    let base = HEAP_START_VA.load(Ordering::Relaxed);
+    if base == 0 { 0 } else { base as u64 - 0x1000 }
+}
+
+/// Returns the not-present guard page VA immediately above the heap, or
+/// `0` if `heap::init()` has not yet executed.
+#[inline]
+pub fn heap_guard_above_va() -> u64 {
+    let base = HEAP_START_VA.load(Ordering::Relaxed);
+    if base == 0 { 0 } else { (base + HEAP_SIZE) as u64 }
+}
+
+/// Compute the kernel heap layout — virtual base, physical base, physical
+/// end-exclusive — by aligning past the linker's `__kernel_end` symbol.
 ///
-/// Virtual address `HEAP_START + HEAP_SIZE`.  Same PMM reservation rationale.
-pub const HEAP_GUARD_ABOVE_VA: u64   = (HEAP_START + HEAP_SIZE) as u64;
-pub const HEAP_GUARD_ABOVE_PHYS: u64 = HEAP_GUARD_ABOVE_VA - 0xFFFF_8000_0000_0000;
+/// Called twice during early boot: once from `vmm::init()` to reserve the
+/// backing frames in the PMM before any `pmm::alloc_page()` can hand them
+/// out, and once from `heap::init()` to wire the allocator.  Both calls
+/// agree because `__kernel_end` is a link-time constant.
+///
+/// Returns `(va_start, phys_start, phys_end_exclusive)`.
+pub fn compute_heap_layout() -> (usize, u64, u64) {
+    // SAFETY: `__kernel_end` is a linker-defined symbol; taking its
+    // address is always safe.  Its higher-half VA translates back to a
+    // physical address via `va - PHYS_OFF`.
+    let kernel_end_va: u64 = unsafe { &__kernel_end as *const u8 as u64 };
+    let kernel_end_phys: u64 = kernel_end_va.saturating_sub(PHYS_OFF);
+
+    // Round up past kernel_end by ≥1 page (so there is always a strictly
+    // non-present byte between BSS and the below-guard PTE), then to the
+    // next 2 MiB huge-page boundary so the heap base aligns with the
+    // bootloader's higher-half huge-page map.
+    let candidate_phys = (kernel_end_phys + 0x1000 + HUGE_PAGE_SIZE as u64 - 1)
+        & !(HUGE_PAGE_SIZE as u64 - 1);
+
+    // Honour the historical lower bound (HEAP_START_MIN_VA, phys 0x80_0000)
+    // so default builds with BSS < 8 MiB get byte-identical layout.
+    let min_phys = (HEAP_START_MIN_VA as u64).saturating_sub(PHYS_OFF);
+    let phys_start = core::cmp::max(candidate_phys, min_phys);
+    let phys_end = phys_start + HEAP_SIZE as u64;
+    let va_start = (phys_start + PHYS_OFF) as usize;
+
+    (va_start, phys_start, phys_end)
+}
+
+/// Physical frame backing the below-guard VA, for PMM reservation.
+#[inline]
+fn heap_guard_below_phys() -> u64 {
+    heap_guard_below_va().saturating_sub(PHYS_OFF)
+}
+
+/// Physical frame backing the above-guard VA, for PMM reservation.
+#[inline]
+fn heap_guard_above_phys() -> u64 {
+    heap_guard_above_va().saturating_sub(PHYS_OFF)
+}
 
 /// Minimum block size — must be large enough to hold a FreeBlock header.
 const MIN_BLOCK_SIZE: usize = core::mem::size_of::<FreeBlock>();
@@ -257,12 +353,35 @@ pub fn stats() -> (usize, usize, usize) {
 }
 
 /// Initialize the kernel heap.
+///
+/// Computes the heap base from the linker's `__kernel_end` symbol so the
+/// heap follows BSS dynamically (see module docs).  Panics if the heap
+/// would extend past 1 GiB phys (outside the bootloader's huge-page map)
+/// — this is a build-misconfiguration assertion that catches kernels
+/// grown so large they would extend the heap into MMIO territory.
 pub fn init() {
-    ALLOCATOR.0.lock().init(HEAP_START, HEAP_SIZE);
+    let (va_start, phys_start, phys_end) = compute_heap_layout();
+
+    // Sanity: the bootloader maps phys 0..1 GiB into PML4[256] via 2 MiB
+    // huge pages; `vmm::extend_higher_half_to_4gib` later covers 1..4 GiB
+    // but that path is for MMIO, not RAM-backed heap.  A heap extending
+    // past 1 GiB phys means the kernel image+BSS is multiple-hundred-MiB
+    // — investigate before papering over.
+    assert!(
+        phys_end <= 0x4000_0000,
+        "[HEAP] heap layout phys_end={:#x} exceeds 1 GiB — kernel image too large?",
+        phys_end,
+    );
+
+    HEAP_START_VA.store(va_start, Ordering::Relaxed);
+    ALLOCATOR.0.lock().init(va_start, HEAP_SIZE);
+
     crate::serial_println!(
-        "[HEAP] Initialized at 0x{:x}-0x{:x} ({} KiB) — linked-list allocator",
-        HEAP_START,
-        HEAP_START + HEAP_SIZE,
+        "[HEAP] Initialized at {:#x}-{:#x} (phys {:#x}-{:#x}, {} KiB) — linked-list allocator",
+        va_start,
+        va_start + HEAP_SIZE,
+        phys_start,
+        phys_end,
         HEAP_SIZE / 1024
     );
 }
@@ -271,9 +390,9 @@ pub fn init() {
 ///
 /// # Guard layout
 /// ```
-/// HEAP_GUARD_BELOW_VA  (not-present PTE)  ← underflow trap
-/// HEAP_START           (heap, 128 MiB)
-/// HEAP_START + HEAP_SIZE (= HEAP_GUARD_ABOVE_VA, not-present PTE) ← overflow trap
+/// heap_guard_below_va()         (not-present PTE)  ← underflow trap
+/// heap_start()                  (heap, 128 MiB)
+/// heap_start() + HEAP_SIZE  (= heap_guard_above_va(), not-present PTE) ← overflow trap
 /// ```
 ///
 /// # Physical-alias prevention
@@ -291,26 +410,34 @@ pub fn init() {
 pub fn init_guard_pages() {
     use crate::mm::{pmm, vmm};
 
+    let below_va    = heap_guard_below_va();
+    let above_va    = heap_guard_above_va();
+    let below_phys  = heap_guard_below_phys();
+    let above_phys  = heap_guard_above_phys();
+    let base        = heap_start() as u64;
+
+    debug_assert!(base != 0, "init_guard_pages called before heap::init");
+
     // Reserve the physical frames for both guard pages.
     // This must happen before installing PTEs so that no racing allocation can
     // grab those frames in the window between the PMM free-mark and the PTE write.
-    pmm::reserve_range(HEAP_GUARD_BELOW_PHYS, HEAP_GUARD_BELOW_PHYS + 0x1000);
-    pmm::reserve_range(HEAP_GUARD_ABOVE_PHYS, HEAP_GUARD_ABOVE_PHYS + 0x1000);
+    pmm::reserve_range(below_phys, below_phys + 0x1000);
+    pmm::reserve_range(above_phys, above_phys + 0x1000);
 
     // Install not-present PTEs (creates PT hierarchy, writes PTE = 0).
-    if !vmm::install_not_present_guard(HEAP_GUARD_BELOW_VA) {
-        crate::serial_println!("[HEAP GUARD] WARN: failed to install below-guard at {:#x}", HEAP_GUARD_BELOW_VA);
+    if !vmm::install_not_present_guard(below_va) {
+        crate::serial_println!("[HEAP GUARD] WARN: failed to install below-guard at {:#x}", below_va);
     }
-    if !vmm::install_not_present_guard(HEAP_GUARD_ABOVE_VA) {
-        crate::serial_println!("[HEAP GUARD] WARN: failed to install above-guard at {:#x}", HEAP_GUARD_ABOVE_VA);
+    if !vmm::install_not_present_guard(above_va) {
+        crate::serial_println!("[HEAP GUARD] WARN: failed to install above-guard at {:#x}", above_va);
     }
 
     crate::serial_println!(
         "[HEAP GUARD] Guard pages installed: below={:#x} above={:#x} (heap {:#x}..{:#x})",
-        HEAP_GUARD_BELOW_VA,
-        HEAP_GUARD_ABOVE_VA,
-        HEAP_START as u64,
-        (HEAP_START + HEAP_SIZE) as u64,
+        below_va,
+        above_va,
+        base,
+        base + HEAP_SIZE as u64,
     );
 }
 
