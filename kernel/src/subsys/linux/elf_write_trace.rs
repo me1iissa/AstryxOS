@@ -47,10 +47,14 @@
 //! # Why this VA
 //!
 //! The ELF dynamic linker (`/lib/ld-musl-x86_64.so.1`) maps its
-//! `.data.rel.ro` segment at the fixed interpreter base
-//! `INTERP_BASE = 0x7F00_0000_0000`.  The slot at offset `0x37e18` is the
-//! function-pointer the parent dereferences shortly after returning from
-//! the vfork-wake.  Per System V AMD64 ABI §6.4 (stack protector) a fault
+//! `.data.rel.ro` segment at the interpreter load base.  Historically the
+//! kernel pinned that base at `0x7F00_0000_0000`, so the slot at offset
+//! `0x37e18` was the function-pointer the parent dereferences shortly
+//! after returning from the vfork-wake.  With per-`exec()` interpreter
+//! ASLR (`proc::elf::interp_aslr_base()`) the absolute slot VA varies
+//! each boot; `WATCH_LINEAR_BASE` below remains a legacy anchor that
+//! must be re-pointed (via `[ELF] Interpreter loaded at <VA>` serial
+//! output for the trial in question) before re-enabling this feature.  Per System V AMD64 ABI §6.4 (stack protector) a fault
 //! in this slot manifests as a `#GP` at `a_crash` because the indirect
 //! call enters the `hlt;ret` epilogue.  See `arch::x86_64::idt.rs`
 //! `[GPF-DBG] ldlinux[0x37e18]=…` for the existing on-fault snapshot.
