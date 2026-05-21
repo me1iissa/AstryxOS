@@ -266,6 +266,12 @@ pub struct VmSpace {
     pub areas: Vec<VmArea>,
     /// Next hint address for mmap auto-placement.
     pub mmap_hint: u64,
+    /// Per-process upper bound for `MAP_STACK` allocations.  Drawn fresh from
+    /// `[STACK_ASLR_MIN, STACK_ASLR_MAX)` in `new_user()`; remains constant
+    /// for the life of the address space.  Consumed by `find_free_stack_range`
+    /// as the seed for per-call jitter — see the `STACK_ASLR_MIN` docs for
+    /// the layout rationale and `find_free_stack_range` for the search.
+    pub stack_aslr_base: u64,
     /// Program break (end of the heap segment).
     pub brk: u64,
     /// Start of the heap segment.
@@ -334,8 +340,73 @@ fn randomised_mmap_hint() -> u64 {
     MMAP_BASE.saturating_sub(offset)
 }
 
+/// Pick a fresh per-process upper bound for `MAP_STACK` allocations.  Uniform
+/// over `[STACK_ASLR_MIN, STACK_ASLR_MAX)`, 4 KiB-aligned.  Each VmSpace
+/// constructed by `new_user()` calls this once at construction time; the
+/// per-call jitter is applied separately by `find_free_stack_range`.
+///
+/// Refs: mmap(2), System V AMD64 ABI §3.3.3, CWE-330.
+#[inline]
+fn randomised_stack_aslr_base() -> u64 {
+    const WINDOW: u64 = STACK_ASLR_MAX - STACK_ASLR_MIN;
+    debug_assert!(WINDOW >= (1u64 << 30), "stack ASLR window too small for useful entropy");
+    // The window is `2^38` bytes (256 GiB), i.e. `2^26` 4 KiB pages — pick a
+    // 26-bit page-aligned offset.  `aslr_page_offset` rejects entropy > 40
+    // bits via its `debug_assert!`, so 26 is well within bounds.
+    let page_offset = crate::security::rand::aslr_page_offset(26);
+    // Saturating add: even at the maximum 26-bit offset of `2^26 * 4 KiB =
+    // 256 GiB - 4 KiB`, `STACK_ASLR_MIN + 256 GiB = STACK_ASLR_MAX`, so the
+    // result fits in `[STACK_ASLR_MIN, STACK_ASLR_MAX]`.  The saturating
+    // form is defence-in-depth against future window-resize edits.
+    STACK_ASLR_MIN.saturating_add(page_offset).min(STACK_ASLR_MAX - 0x1000)
+}
+
 /// Default user-space heap start.
 const HEAP_BASE: u64 = 0x0000_0040_0000_0000;
+
+/// Dedicated VA window for `MAP_STACK | MAP_ANONYMOUS` thread-stack allocations
+/// chosen by the kernel (i.e. when the caller passes no fixed address).  The
+/// window sits ABOVE the general `mmap_hint` ceiling so that `find_free_range`
+/// — which only walks downward from `mmap_hint ≤ MMAP_BASE` — never touches it,
+/// and BELOW the interpreter PIE ASLR window (`INTERP_ASLR_MIN = 0x7F40...`),
+/// so the interpreter loader and stack allocator do not compete for the same
+/// VAs.  256 GiB is far more than any pthread implementation will ever need:
+/// `__SC_THREAD_STACK_MIN` ≥ 16 KiB and a generous default of 8 MiB per stack
+/// gives `2^15` simultaneous threads worth of room.
+///
+/// # Why this exists (independent of `mmap_hint` jitter)
+///
+/// PR #365's `randomised_mmap_hint()` jitters the *starting* `mmap_hint` by 20
+/// bits but every successful `mmap` lowers `mmap_hint` toward the chosen base
+/// (`syscall::sys_mmap` end-of-function).  After the dynamic linker has
+/// finished mapping libxul + ld-musl + dependent libraries the hint has
+/// marched many GiB downward through a sequence whose total span is
+/// dominated by deterministic library sizes; the 4 GiB of starting jitter is
+/// drowned out and a pthread `MAP_STACK` allocation that follows lands at a
+/// nearly byte-identical VA across boots.  Routing `MAP_STACK` through a
+/// dedicated window with per-call fresh entropy decouples thread-stack VAs
+/// from prior mmap state.
+///
+/// Refs: mmap(2) (MAP_STACK semantics + kernel-chosen address when
+/// `addr == NULL`), pthread_create(3), System V AMD64 ABI §3.3.3 (Address
+/// Space Layout), CWE-330 (use of insufficiently random values).
+const STACK_ASLR_MIN: u64 = MMAP_BASE;                        // 0x0000_7F00_0000_0000
+const STACK_ASLR_MAX: u64 = 0x0000_7F40_0000_0000;             // == INTERP_ASLR_MIN
+
+/// Entropy bits applied to each `MAP_STACK` allocation's chosen base.  16 bits
+/// at 4 KiB granularity covers a 256 MiB span — well within the 256 GiB
+/// window and far more positions than any realistic exploit could enumerate
+/// against a non-fixed thread-stack allocation.  We compose this with the
+/// per-VmSpace `stack_aslr_base` jitter so the per-process *and* per-call
+/// entropy combine: per-process gives ~22 bits inside the window (window /
+/// max-stack-size), per-call gives 16 more bits of small jitter on top.
+///
+/// Combined effective entropy for the chosen base across boots:
+///   `min(22 + 16, log2(WINDOW / 4 KiB)) = min(38, 26) = 26 bits`
+/// (since the window is `2^26` pages wide).  That is far above the 20-bit
+/// threshold the kernel uses elsewhere for ASLR (`MMAP_ASLR_BITS`,
+/// `aslr_page_offset` callers) and 2^26 ≈ 6.7e7 distinct VAs.
+const STACK_ASLR_BITS: u32 = 16;
 
 // ============================================================================
 // MM registry — maps cr3 → VmSpace::mm_sem so PTE-mutating helpers in
@@ -462,6 +533,10 @@ impl VmSpace {
             cr3,
             areas: Vec::new(),
             mmap_hint: MMAP_BASE,
+            // Kernel processes never allocate user stacks; pick a neutral
+            // default inside the configured window so any accidental call
+            // from a kernel-mode context still produces a well-formed VA.
+            stack_aslr_base: STACK_ASLR_MIN,
             brk: HEAP_BASE,
             brk_start: HEAP_BASE,
             mm_sem,
@@ -511,6 +586,10 @@ impl VmSpace {
             cr3,
             areas: Vec::new(),
             mmap_hint: MMAP_BASE,
+            // vfork children share the parent's address space until execve(2);
+            // their MAP_STACK allocations (if any) should not collide with the
+            // parent's pthread stacks, so seed with a fresh per-vfork base.
+            stack_aslr_base: randomised_stack_aslr_base(),
             brk: HEAP_BASE,
             brk_start: HEAP_BASE,
             mm_sem: parent_mm_sem,
@@ -581,6 +660,13 @@ impl VmSpace {
             // ld-musl to differ between processes and between boots.  See
             // `randomised_mmap_hint()` for the entropy rationale.
             mmap_hint: randomised_mmap_hint(),
+            // Per-process MAP_STACK ASLR: `MAP_STACK` mmap allocations use a
+            // dedicated window (above `MMAP_BASE`, below `INTERP_ASLR_MIN`)
+            // with per-call jitter on top of this per-process base.  This
+            // decouples thread-stack VAs from the deterministic-after-libxul
+            // `mmap_hint` walk.  See `STACK_ASLR_MIN` docs and
+            // `find_free_stack_range` for the layout rationale.
+            stack_aslr_base: randomised_stack_aslr_base(),
             brk: HEAP_BASE,
             brk_start: HEAP_BASE,
             mm_sem,
@@ -802,6 +888,14 @@ impl VmSpace {
             cr3: child_pml4_phys,
             areas: child_areas,
             mmap_hint: self.mmap_hint,
+            // Inherit the parent's stack ASLR base.  The child gets its own
+            // PML4 (fresh VMA list) but inheriting the base keeps existing
+            // thread-stack VMAs that were copied above pointing at the same
+            // VAs in the child — required for thread-aware libc state (e.g.
+            // `pthread_attr_getstack(3)`) to remain consistent across fork.
+            // Per-call jitter on subsequent MAP_STACK allocations still
+            // diverges parent and child paths.
+            stack_aslr_base: self.stack_aslr_base,
             brk: self.brk,
             brk_start: self.brk_start,
             mm_sem: child_mm_sem,
@@ -941,6 +1035,69 @@ impl VmSpace {
         }
 
         Ok(())
+    }
+
+    /// Find a free virtual address range for a `MAP_STACK` allocation inside
+    /// the dedicated stack-ASLR window `[STACK_ASLR_MIN, STACK_ASLR_MAX)`.
+    ///
+    /// The base is chosen by combining the per-process `stack_aslr_base`
+    /// (sampled once at `new_user()` time) with `STACK_ASLR_BITS` of fresh
+    /// per-call entropy.  This decouples thread-stack VAs from the
+    /// deterministic-after-libxul downward walk of `find_free_range` /
+    /// `mmap_hint`: each pthread_create's MAP_STACK lands at a different VA
+    /// across boots and across threads, independent of the order in which
+    /// the dynamic linker has mapped shared libraries beforehand.
+    ///
+    /// On overlap (rare — the window is 256 GiB and stacks are at most a few
+    /// MiB), retries with fresh entropy up to a small bounded number of
+    /// times.  If every attempt overlaps (which would require the window to
+    /// be substantially full), falls back to `find_free_range` for the
+    /// general mmap region so the caller still receives a valid VA — albeit
+    /// without the dedicated entropy.  This fallback preserves correctness
+    /// when the window is unavailable (e.g. exhausted by a pathological
+    /// caller); the deterministic-VA risk is the same as the legacy path.
+    ///
+    /// # References
+    /// - mmap(2) — MAP_STACK and kernel-chosen VA semantics
+    /// - pthread_create(3) — typical caller of MAP_STACK
+    /// - System V AMD64 ABI §3.3.3 — Address Space Layout
+    /// - Intel SDM Vol. 3A §4.6 — User/Supervisor address-space boundaries
+    pub fn find_free_stack_range(&self, size: u64) -> Option<u64> {
+        let size = page_align_up(size);
+        if size == 0 || size > (STACK_ASLR_MAX - STACK_ASLR_MIN) {
+            return None;
+        }
+
+        // Number of retries before falling through.  16 attempts at 16-bit
+        // jitter over a 256 GiB window with a few MiB stack-per-slot keeps
+        // the failure probability negligible (collision per attempt ≪ 1%
+        // until the window is dense).
+        const STACK_PLACE_RETRIES: u32 = 16;
+
+        for _ in 0..STACK_PLACE_RETRIES {
+            // Per-call jitter, page-aligned, within `2^STACK_ASLR_BITS` pages.
+            let jitter = crate::security::rand::aslr_page_offset(STACK_ASLR_BITS);
+            // Candidate base: anchor on `stack_aslr_base`, then nudge by
+            // `jitter` while keeping the whole `[base, base+size)` inside
+            // `[STACK_ASLR_MIN, STACK_ASLR_MAX)`.
+            let raw = self.stack_aslr_base.saturating_add(jitter);
+            // Clamp so `base + size <= STACK_ASLR_MAX`.  If clamping pushes
+            // us below `STACK_ASLR_MIN`, the window is smaller than `size`
+            // and we already returned `None` above; otherwise the clamp
+            // keeps the candidate within the window.
+            let max_base = STACK_ASLR_MAX.saturating_sub(size);
+            let candidate = raw.min(max_base).max(STACK_ASLR_MIN);
+
+            let overlaps = self.areas.iter().any(|vma| vma.overlaps(candidate, size));
+            if !overlaps {
+                return Some(candidate);
+            }
+        }
+
+        // Window full or otherwise unwilling — fall through so the caller
+        // still gets a VA from the general allocator.  Callers may treat
+        // this as a "best-effort, weaker entropy" outcome and proceed.
+        self.find_free_range(size)
     }
 
     /// Find a free virtual address range of the given size.
