@@ -445,17 +445,21 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // later mmap()s these files, demand-paging hits the cache
             // (instant) instead of reading from disk (5+ minutes on WSL2/KVM).
             serial_println!("[FFTEST] Pre-populating page cache from disk (slow ATA PIO)...");
-            // We list both glibc and musl interpreter / libc paths plus both
+            // We list both glibc and musl interpreter / libc paths plus all
             // possible libxul.so locations.  Whichever variant is staged on
-            // the data disk resolves; the other returns 0 pages benignly
+            // the data disk resolves; the others return 0 pages benignly
             // (prepopulate_file → resolve_path Err → 0).
             //
-            // libxul.so location by variant:
-            //   - glibc: /opt/firefox/libxul.so (kernel-internal staging path)
-            //   - musl : /usr/lib/firefox-esr/libxul.so (the DT_RUNPATH baked
-            //            into firefox-bin per readelf -d; ELF gABI §5.4)
-            // /opt/firefox/firefox-bin is mirrored for both variants so the
-            // kernel launch path stays stable.
+            // libxul.so location by variant + package:
+            //   - glibc:                /opt/firefox/libxul.so
+            //                             (kernel-internal staging path)
+            //   - musl + firefox-esr:   /usr/lib/firefox-esr/libxul.so
+            //                             (DT_RUNPATH for Alpine 115.x ESR;
+            //                              ELF gABI §5.4)
+            //   - musl + firefox-132:   /usr/lib/firefox/libxul.so
+            //                             (DT_RUNPATH for Alpine 132.x current)
+            // /opt/firefox/firefox-bin is mirrored for both musl variants so
+            // the kernel launch path stays stable; only the runpath tree changes.
             for path in &[
                 "/disk/lib64/ld-linux-x86-64.so.2",         // glibc — 236 KB
                 "/disk/lib/ld-musl-x86_64.so.1",            // musl  — 650 KB
@@ -463,7 +467,8 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 "/disk/lib/x86_64-linux-gnu/libc.so.6",     // glibc — 2.0 MB
                 "/disk/lib/libc.musl-x86_64.so.1",          // musl  — symlink to ld-musl
                 "/disk/opt/firefox/libxul.so",              // 157 MB — glibc variant
-                "/disk/usr/lib/firefox-esr/libxul.so",      // 130 MB — musl variant (DT_RUNPATH)
+                "/disk/usr/lib/firefox-esr/libxul.so",      // 130 MB — musl variant (firefox-esr 115.x)
+                "/disk/usr/lib/firefox/libxul.so",          // 130 MB — musl variant (firefox 132.x)
             ] {
                 let t0 = arch::x86_64::irq::get_ticks();
                 let pages = mm::cache::prepopulate_file(path);
@@ -501,20 +506,23 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // relative to that resolved directory.  We therefore launch from
             // wherever the FULL Mozilla tree is staged.
             //
-            //   musl variant:  /disk/usr/lib/firefox-esr/firefox-bin
-            //                  (Alpine's package layout; DT_RUNPATH target;
-            //                   contains dependentlibs.list, application.ini,
-            //                   omni.ja, every Mozilla .so file)
-            //   glibc variant: /disk/opt/firefox/firefox-bin
-            //                  (in-tree convention; install-firefox.sh stages
-            //                   the tarball there directly)
+            //   musl + firefox-esr (115.x):  /disk/usr/lib/firefox-esr/firefox-bin
+            //                                  (Alpine package layout for ESR;
+            //                                   DT_RUNPATH target)
+            //   musl + firefox     (132.x):  /disk/usr/lib/firefox/firefox-bin
+            //                                  (Alpine package layout for current)
+            //   glibc:                       /disk/opt/firefox/firefox-bin
+            //                                  (in-tree convention; install-firefox.sh
+            //                                   stages the Mozilla tarball there)
             //
-            // Prefer the musl path when present so readlink-relative file
-            // opens (notably dependentlibs.list — ENOENT here aborts the
-            // process at sc≈73) land in the right tree.  Both fall through
-            // to firefox-test's --headless --screenshot pipeline.
-            const CMDLINE_MUSL:  &str = "/disk/usr/lib/firefox-esr/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png file:///tmp/hello.html";
-            const CMDLINE_GLIBC: &str = "/disk/opt/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png file:///tmp/hello.html";
+            // Prefer firefox-132 → firefox-esr → glibc.  firefox-132 is
+            // preferred when present because its bundled firefox-dbg lets
+            // addr2line / gdb resolve C++ names natively (no Mozilla tecken
+            // dependency).  All three fall through to the same --headless
+            // --screenshot pipeline.
+            const CMDLINE_MUSL_132: &str = "/disk/usr/lib/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png file:///tmp/hello.html";
+            const CMDLINE_MUSL_ESR: &str = "/disk/usr/lib/firefox-esr/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png file:///tmp/hello.html";
+            const CMDLINE_GLIBC:    &str = "/disk/opt/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png file:///tmp/hello.html";
             // Use stat() (resolve_path + FileSystemOps::stat) for the existence
             // probe instead of read_file().  read_file() allocates a Vec sized
             // to the full file (~795 KB for firefox-bin), reads every byte, and
@@ -522,17 +530,21 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // pipeline (short read, allocator pressure, cache lock contention)
             // reports Err here even though the file is reachable.  POSIX
             // stat(2) semantics: success iff the named file is reachable; no
-            // content is read.  Emit both probe results so future qa runs can
-            // see at a glance which build was chosen.
-            let musl_stat  = crate::vfs::stat("/disk/usr/lib/firefox-esr/firefox-bin");
-            let glibc_stat = crate::vfs::stat("/disk/opt/firefox/firefox-bin");
+            // content is read.  Emit all three probe results so future qa
+            // runs can see at a glance which build was chosen.
+            let musl_132_stat = crate::vfs::stat("/disk/usr/lib/firefox/firefox-bin");
+            let musl_esr_stat = crate::vfs::stat("/disk/usr/lib/firefox-esr/firefox-bin");
+            let glibc_stat    = crate::vfs::stat("/disk/opt/firefox/firefox-bin");
             serial_println!(
-                "[FFTEST] FF binary probe: musl={:?} glibc={:?}",
-                musl_stat.as_ref().map(|s| s.size).map_err(|e| *e),
+                "[FFTEST] FF binary probe: musl-132={:?} musl-esr={:?} glibc={:?}",
+                musl_132_stat.as_ref().map(|s| s.size).map_err(|e| *e),
+                musl_esr_stat.as_ref().map(|s| s.size).map_err(|e| *e),
                 glibc_stat.as_ref().map(|s| s.size).map_err(|e| *e),
             );
-            let cmdline = if musl_stat.is_ok() {
-                CMDLINE_MUSL
+            let cmdline = if musl_132_stat.is_ok() {
+                CMDLINE_MUSL_132
+            } else if musl_esr_stat.is_ok() {
+                CMDLINE_MUSL_ESR
             } else {
                 CMDLINE_GLIBC
             };
