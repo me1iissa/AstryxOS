@@ -422,6 +422,17 @@ pub fn check_signals() -> bool {
         proc.exit_code = -(sig as i32);
         crate::serial_println!("[SIGNAL] Process {} killed by SIGKILL", pid);
         drop(procs);
+        // Per `signal(7)` ("Standard signals"): a lethal signal terminates
+        // every thread in the target process, not just the thread that
+        // observes it.  Conceptually equivalent to `exit_group(2)`, so
+        // every sibling owes a CLEARTID write + FUTEX_WAKE per `clone(2)`
+        // ("C library/kernel ABI differences", CLONE_CHILD_CLEARTID) and
+        // `futex(2)` (NOTES on task-exit semantics) — otherwise a cross-
+        // thread joiner parked in `FUTEX_WAIT` on a sibling's joinstate
+        // never wakes (CWE-833 Deadlock).  Helper from PR #375 already
+        // covers `exit_group(2)`; this is the K1 audit's lethal-signal
+        // companion (F1b).
+        crate::proc::fire_cleartid_for_group(pid);
         crate::proc::exit_thread(-(sig as i64));
         return true;
     }
@@ -438,6 +449,11 @@ pub fn check_signals() -> bool {
                     proc.exit_code = -(sig as i32);
                     crate::serial_println!("[SIGNAL] Process {} terminated by signal {}", pid, sig);
                     drop(procs);
+                    // See SIGKILL branch above: a default-action terminate
+                    // (`signal(7)` "Term"/"Core") is also a group exit per
+                    // POSIX-1.2017 `_exit(2)` / `kill(2)` and Linux
+                    // `clone(2)`; CLEARTID for every sibling is required.
+                    crate::proc::fire_cleartid_for_group(pid);
                     crate::proc::exit_thread(-(sig as i64));
                     true
                 }
@@ -598,6 +614,13 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
         proc_entry.exit_code = -(sig as i32);
         crate::serial_println!("[SIGNAL] Process {} killed by SIGKILL (syscall return)", pid);
         drop(procs);
+        // Mirror of the `check_signals()` SIGKILL branch.  Per `signal(7)`
+        // a lethal signal kills the whole thread group; CLEARTID must
+        // fire for every sibling before any of them is reaped, otherwise
+        // `pthread_join(3)` waiters on this group block indefinitely
+        // (CWE-833).  See `clone(2)` CLONE_CHILD_CLEARTID and `futex(2)`
+        // NOTES on task-exit semantics.
+        crate::proc::fire_cleartid_for_group(pid);
         crate::proc::exit_thread(-(sig as i64));
         return 0; // unreachable
     }
@@ -616,6 +639,9 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
                         pid, sig
                     );
                     drop(procs);
+                    // Default-action terminate is also a group exit; see
+                    // the SIGKILL branch above for the full citation.
+                    crate::proc::fire_cleartid_for_group(pid);
                     crate::proc::exit_thread(-(sig as i64));
                     0
                 }
