@@ -127,11 +127,17 @@ static ARMED_KEY_OFFSET: [AtomicU64; N_DR_SLOTS] = [
 ///   3 — D7 PT_TLS BSS-slot watch (see `subsys/linux/d7_bss_watch.rs`).
 ///       Same persistent-arm policy as the F3 tags (capped at
 ///       `F3_FIRE_CAP` fires per slot per boot, see `handle_db_exception`).
+///   4 — D15 `RegisteredThread::mThreadInfo` slot watch (see
+///       `subsys/linux/d15_mthread_watch.rs`).  Catches writes (or absence
+///       of writes) to the heap-object qword at `[*(fs:-0x18) + 0x38]`
+///       for firefox-bin pid=1.  Same persistent-arm + `F3_FIRE_CAP`
+///       policy as D7.
 /// Future axes may take additional tags without disturbing existing arms.
-pub const WATCH_KIND_LEGACY:  u32 = 0;
-pub const WATCH_KIND_F3_USER: u32 = 1;
-pub const WATCH_KIND_F3_PHYS: u32 = 2;
-pub const WATCH_KIND_D7_BSS:  u32 = 3;
+pub const WATCH_KIND_LEGACY:    u32 = 0;
+pub const WATCH_KIND_F3_USER:   u32 = 1;
+pub const WATCH_KIND_F3_PHYS:   u32 = 2;
+pub const WATCH_KIND_D7_BSS:    u32 = 3;
+pub const WATCH_KIND_D15_MTHRD: u32 = 4;
 static ARMED_KIND: [AtomicU32; N_DR_SLOTS] = [
     AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
 ];
