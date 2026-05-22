@@ -28097,6 +28097,47 @@ fn test_ahci_per_port_mutex() -> bool {
         }
     }
 
+    // (3) PR #386 N1 regression — registry-side lookup must not be coupled to
+    //     per-port locks.  Holding a port's mutex must NOT prevent the
+    //     production `port_handle()` lookup path from finding any port (the
+    //     held port itself OR any sibling).  Under the original PR #386
+    //     shape, `port_handle()` called `p.lock()` on each candidate inside
+    //     the linear search; with the held port's mutex taken, lookups
+    //     either deadlocked (own port) or serialised behind the held mutex
+    //     until released (siblings).  The fixed shape keeps `port_num` on
+    //     `PortEntry` outside the per-port mutex, so lookups are bounded by
+    //     the registry mutex only.  See AHCI 1.3.1 §4.2 and POSIX-1.2017
+    //     `pthread_mutex(7)` (per-resource locking).
+    match crate::drivers::ahci::probe_lookup_independent_of_port_lock(probe_port) {
+        Some((held, all_ok)) => {
+            if !held {
+                test_fail!("ahci_per_port_mutex",
+                    "could not acquire port {} mutex under try_lock \
+                     (lookup-decouple probe)", probe_port);
+                return false;
+            }
+            if !all_ok {
+                test_fail!("ahci_per_port_mutex",
+                    "port_handle() failed for some active port while \
+                     port {} mutex was held — lookup is still coupled \
+                     to per-port locks (PR #386 N1 regression)",
+                    probe_port);
+                return false;
+            }
+            test_println!(
+                "  port_handle() lookups succeed while port {} mutex \
+                 held — registry decoupled from per-port locks ✓",
+                probe_port
+            );
+        }
+        None => {
+            test_fail!("ahci_per_port_mutex",
+                "probe_lookup_independent_of_port_lock({}) returned None",
+                probe_port);
+            return false;
+        }
+    }
+
     test_pass!("AHCI per-port mutex topology (Test 0f)");
     true
 }
