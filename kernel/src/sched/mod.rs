@@ -589,6 +589,13 @@ pub fn schedule() {
     // fault inside the formatter just leads to the bugcheck banner,
     // which is the same outcome we get today.
     {
+        // The `(pid, kernel_stack_base, kernel_stack_size)` tuple is read
+        // out of the THREAD_TABLE here, BEFORE we drop the lock — and the
+        // `stack_size` captured into the diagnostic emit below reflects the
+        // value at canary-fail observation time.  This is intentional: the
+        // diagnostic must describe what was true when the overflow
+        // happened, not whatever the Thread record may be patched to look
+        // like by the time the bugcheck banner prints.
         let canary_info = {
             let threads = THREAD_TABLE.lock();
             threads.iter().find(|t| t.tid == current_tid)
