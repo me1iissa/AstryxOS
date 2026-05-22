@@ -326,6 +326,33 @@ d8-tls-fault-dump = ["firefox-test", "w215-diag"]
 # Mozilla searchfox `mozglue/baseprofiler/core/RegisteredThread.cpp`;
 # POSIX mmap(2).
 d15-mthread-watch = ["firefox-test", "w215-diag"]
+# D16 SSP-canary saved-slot writer trap
+# (kernel/src/subsys/linux/d16_canary_watch.rs).  Post-F3-closure (PR
+# #368) the sc plateau moved to musl `__stack_chk_fail` at
+# ld-musl-x86_64.so.1+0x87f9 (sc=1230-1232 deterministic, byte-identical
+# 3/3 trials).  The saved canary qword on stack reads `0x30` in the
+# low byte, mismatching the master canary at `fs:0x28` — the F3 SSP
+# fingerprint returning at a different RIP.  Critical observation: the
+# canary slot's backing physical frame `0x127114c0` is **deterministic
+# across all 3 trials**.  D16 arms write-only hardware watchpoints
+# (Intel SDM Vol. 3B §17.2.4) on BOTH the kernel-direct-map mirror
+# (`PHYS_OFF + 0x127114c0`, deterministic-phys channel — fires on
+# kernel-mode writers to the backing frame regardless of CR3) and the
+# user-VA `0x7ffffffee4c0` (late-armed from the syscall-entry hook the
+# first time the page is mapped under firefox-bin pid=1 tid=1 CR3).
+# Each `#DB` fire emits `[W215/DR-WATCH-FIRE] kind_tag=5 …` naming the
+# writer RIP, CS, CR3.  Mirrors the D15 dispatch shape (syscall-entry
+# hook + arm-once latch) but anchors on the deterministic phys so the
+# arm can happen at execve time without waiting for demand-paging.
+# Diagnostic-only; default builds remain byte-identical when off.
+# Depends on `firefox-test` (trace formatters) and `w215-diag` (DR
+# plumbing).
+# Refs: Intel SDM Vol. 3B §17.2.4 (DR0–DR3, DR7), §17.3.1.1 (data-
+# breakpoint trap timing); Intel SDM Vol. 3A §3.4.4.1 (`IA32_FS_BASE`);
+# System V AMD64 ABI §3.4.1 (SSP / `__stack_chk_guard`); CWE-121
+# (stack-based buffer overflow), CWE-587 (assignment of fixed address
+# to pointer); musl libc `src/env/__stack_chk_fail.c`.
+d16-canary-watch = ["firefox-test", "w215-diag"]
 # Track B (Phase 5, 2026-05-21) — stack-page write provenance ring.
 # Records kernel-mode writes whose target user VA falls into the
 # `[0x3f00_0000_0000, 0x4000_0000_0000)` thread-stack range (per Phase 4

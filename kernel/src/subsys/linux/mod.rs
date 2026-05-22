@@ -162,6 +162,25 @@ pub mod d8_fault_tls_dump;
 #[cfg(feature = "d15-mthread-watch")]
 pub mod d15_mthread_watch;
 
+/// D16 SSP-canary saved-slot writer trap.  Post-F3-saga-closure (PR
+/// #368) the sc plateau moved to musl `__stack_chk_fail` at
+/// ld-musl+0x87f9 (sc=1230-1232 deterministic, byte-identical 3/3).
+/// The saved canary qword reads `0x30` in the low byte — the F3 SSP
+/// fingerprint returning at a different RIP.  Critical anchor: the
+/// canary slot backing phys `0x127114c0` is **deterministic across
+/// all 3 trials**, letting D16 arm a PHYS_OFF-channel DR at execve
+/// time without waiting for the user stack page to be demand-paged.
+/// A complementary user-VA DR is late-armed from the syscall-entry
+/// hook (same shape as D15).  Each fire emits `[W215/DR-WATCH-FIRE]
+/// kind_tag=5 …` naming the writer RIP / CS / CR3.  Diagnostic-only;
+/// gated behind `d16-canary-watch` so master builds remain byte-
+/// identical.  Refs: Intel SDM Vol. 3B §17.2.4 (DR0–DR3, DR7),
+/// §17.3.1.1 (data-breakpoint trap timing); Intel SDM Vol. 3A
+/// §3.4.4.1 (`IA32_FS_BASE`); System V AMD64 ABI §3.4.1 (SSP);
+/// POSIX execve(2); CWE-121, CWE-587.
+#[cfg(feature = "d16-canary-watch")]
+pub mod d16_canary_watch;
+
 /// Bounded broadcast-within-cluster compensation for FUTEX_WAKE.  Mitigates
 /// the older-glibc `pthread_cond_signal` race
 /// (<https://sourceware.org/bugzilla/show_bug.cgi?id=25847>) by
