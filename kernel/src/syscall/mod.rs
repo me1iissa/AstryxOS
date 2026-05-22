@@ -234,10 +234,48 @@ pub(crate) unsafe fn user_read_timespec(addr: u64) -> Option<(u64, u64)> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Futex wait queue — keyed by virtual address
+// Futex wait queue — keyed by (pid, uaddr)
 // ═══════════════════════════════════════════════════════════════════════════════
-
-/// Futex wait queue: maps (pid, uaddr) -> list of waiting TIDs.
+//
+// Key shape: `(pid, uaddr)` — the FUTEX_PRIVATE key per `futex(2)`.
+//
+// Per `futex(2)` (Linux man-pages, "FUTEX_PRIVATE_FLAG" and "Priority-inheritance
+// futexes"):
+//
+//   * FUTEX_PRIVATE futexes are scoped to a single process and identified by
+//     the tuple `(mm_struct, virtual address)`.  We approximate `mm_struct`
+//     with `pid` — correct because every process has its own page tables and
+//     no two processes share the `mm` of a Linux task on AstryxOS.
+//
+//   * FUTEX_SHARED futexes are scoped to a backing object and identified by
+//     the tuple `(inode, page offset within file)` for file-backed mappings
+//     or by an anonymous-mapping anchor for `MAP_SHARED|MAP_ANONYMOUS`.
+//     Two processes that map the same shared region at different virtual
+//     addresses must still hash to the same key, otherwise a
+//     `pthread_mutex_lock` in process A and the matching wake in process B
+//     will miss.
+//
+// This implementation uses the FUTEX_PRIVATE key shape for ALL futex
+// operations, including those with the FUTEX_PRIVATE_FLAG clear.  This is
+// correct in practice when:
+//
+//   (a) The futex is FUTEX_PRIVATE (FUTEX_PRIVATE_FLAG set, or implied by
+//       the caller's intent — `pthread_mutexattr_setpshared(_, PROCESS_PRIVATE)`
+//       and similar default to FUTEX_PRIVATE).
+//   (b) The futex is FUTEX_SHARED AND both processes have mapped the shared
+//       region at the same `uaddr` (common when a parent forks and the child
+//       inherits identical mappings, or when both ends explicitly request
+//       MAP_FIXED at the same VA).
+//
+// Cross-process FUTEX_SHARED synchronisation across DIFFERENT virtual
+// addresses is NOT supported.  No upstream binary on the current demo path
+// (musl-FF strace differential 2026-05-20) uses it.  When a use case
+// emerges, change `(u64, u64)` to a `FutexKey` enum with `Private(pid, va)`
+// and `Shared(mount_idx, inode, page_off)` variants, derive the shared
+// variant from `vma::lookup(pid, uaddr)` on every WAIT/WAKE/REQUEUE entry,
+// and back-fill tests with a two-process MAP_SHARED+pthread_mutex case.
+//
+// Refs: `futex(2)` Linux man-pages; POSIX.1-2017 §pthread_mutexattr_getpshared.
 pub(crate) static FUTEX_WAITERS: Mutex<BTreeMap<(u64, u64), Vec<u64>>> = Mutex::new(BTreeMap::new());
 
 /// Outcome of `futex_wait_check_and_enqueue`.
