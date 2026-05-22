@@ -382,6 +382,26 @@ d16-canary-watch = ["firefox-test", "w215-diag"]
 # §3.4.1 (SSP / `__stack_chk_guard`); POSIX `execve(2)`; CWE-787
 # (out-of-bounds write via PT aliasing).
 d17-aliasing-test = ["firefox-test", "w215-diag", "d16-canary-watch", "ssp-canary-diag"]
+# D18 — extension of D16's SSP-canary capture to (a) raise the per-slot
+# fire cap from 32 to 256 specifically for `WATCH_KIND_D16_CANARY`
+# (other watchpoint kinds keep their 32-fire cap to avoid log flood)
+# and (b) runtime-detect the canary slot's backing phys.  PR #383 (D17)
+# showed the boot-time phys was `0x129d94c0`, not the hard-coded
+# `0x127114c0`; the execve-time PHYS_OFF arm was watching a stale
+# frame.  D18 captures the live backing phys at user-VA arm time
+# (`virt_to_phys_in(cr3, CANARY_SLOT_VA)`) and, if it differs, re-arms
+# a fresh PHYS_OFF slot on the observed frame.  Goal: directly capture
+# the 33rd+ writer (the `0x30`-byte corrupting store) which D16's
+# 32-fire cap missed, and conclusively settle whether it is CPL=3
+# user-mode (upstream-confirmed) or CPL=0 kernel-mode (kernel issue).
+# Diagnostic-only.  Default builds remain byte-identical when off.
+# Depends on `d16-canary-watch` (transitive `firefox-test` + `w215-diag`).
+# Refs: Intel SDM Vol. 3A §4.6 (page-table walk, linear → phys);
+# Intel SDM Vol. 3B §17.2.4 (DR0–DR3, DR7), §17.3.1.1 (trap-after-
+# retire); System V AMD64 ABI §3.4.1 (SSP / `__stack_chk_guard`);
+# POSIX `execve(2)`; CWE-121 (stack-based buffer overflow); musl
+# libc `src/env/__stack_chk_fail.c`.
+d18-extended-d16 = ["d16-canary-watch"]
 # Track B (Phase 5, 2026-05-21) — stack-page write provenance ring.
 # Records kernel-mode writes whose target user VA falls into the
 # `[0x3f00_0000_0000, 0x4000_0000_0000)` thread-stack range (per Phase 4
