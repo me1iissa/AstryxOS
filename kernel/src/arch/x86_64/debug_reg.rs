@@ -132,12 +132,20 @@ static ARMED_KEY_OFFSET: [AtomicU64; N_DR_SLOTS] = [
 ///       of writes) to the heap-object qword at `[*(fs:-0x18) + 0x38]`
 ///       for firefox-bin pid=1.  Same persistent-arm + `F3_FIRE_CAP`
 ///       policy as D7.
+///   5 — D16 SSP-canary saved-slot watch (see
+///       `subsys/linux/d16_canary_watch.rs`).  Catches writes to the
+///       saved-canary stack qword at user VA `0x7ffffffee4c0` (and its
+///       deterministic backing phys `0x127114c0` via `PHYS_OFF`) on the
+///       firefox-bin pid=1 init thread.  Used to name the writer of the
+///       observed `0x30`-byte mismatch in musl `__stack_chk_fail`.
+///       Same persistent-arm + `F3_FIRE_CAP` policy as D7/D15.
 /// Future axes may take additional tags without disturbing existing arms.
-pub const WATCH_KIND_LEGACY:    u32 = 0;
-pub const WATCH_KIND_F3_USER:   u32 = 1;
-pub const WATCH_KIND_F3_PHYS:   u32 = 2;
-pub const WATCH_KIND_D7_BSS:    u32 = 3;
-pub const WATCH_KIND_D15_MTHRD: u32 = 4;
+pub const WATCH_KIND_LEGACY:     u32 = 0;
+pub const WATCH_KIND_F3_USER:    u32 = 1;
+pub const WATCH_KIND_F3_PHYS:    u32 = 2;
+pub const WATCH_KIND_D7_BSS:     u32 = 3;
+pub const WATCH_KIND_D15_MTHRD:  u32 = 4;
+pub const WATCH_KIND_D16_CANARY: u32 = 5;
 static ARMED_KIND: [AtomicU32; N_DR_SLOTS] = [
     AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
 ];
