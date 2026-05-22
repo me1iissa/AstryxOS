@@ -631,8 +631,16 @@ pub fn read_stack_canary(stack_base: u64) -> u64 {
 
 /// Read another u64 from the canary region (offset in bytes from base).
 /// Returns 0 if the address would be outside the higher-half kernel map.
+///
+/// `byte_offset` is asserted to be strictly less than one page (0x1000),
+/// so the helper can never read more than 4 KiB above `stack_base`.  The
+/// current call sites pass 8 / 16 / 24, which satisfy this trivially; the
+/// assert guards against future misuse (e.g. someone passing an arbitrary
+/// frame-pointer delta and accidentally walking off the canary region).
 #[inline]
 pub fn read_stack_word_at(stack_base: u64, byte_offset: u64) -> u64 {
+    debug_assert!(byte_offset < 0x1000,
+        "read_stack_word_at: byte_offset {:#x} exceeds one page", byte_offset);
     let addr = stack_base.wrapping_add(byte_offset);
     if addr < KERNEL_VIRT_OFFSET { return 0; }
     unsafe { core::ptr::read_volatile(addr as *const u64) }
@@ -651,13 +659,16 @@ pub fn current_kernel_rsp_live() -> u64 {
 // ── Emergency-stack-fallback recorder ────────────────────────────────────
 //
 // When `alloc_kernel_stack` falls back to a single 4 KiB page (PMM
-// fragmentation, line ~568 below), the caller still stamps
-// `kernel_stack_size = KERNEL_STACK_SIZE` on the resulting Thread — there
-// is no in-Thread record of the actual span.  Without that record, a
-// later canary-corruption (STACK_CANARY_CORRUPT bugcheck) cannot be
-// attributed to "took the emergency 4 KiB path".  This diagnostic-only
-// ring of recently-emitted emergency-stack bases lets the canary check
-// in `sched::schedule` answer "was this thread on a 4 KiB stack?".
+// fragmentation, line ~568 below), callers now stamp the honest 4 KiB
+// span into `Thread.kernel_stack_size` (PR #392, kstack-size honesty).
+// That span alone, however, doesn't say *why* a thread is on a short
+// stack — a future allocator might return 4 KiB for reasons other than
+// emergency fallback.  This diagnostic-only ring complements the now-
+// honest in-Thread span by attributing the emergency origin even after a
+// stack base is later reused: if the same base reappears within the
+// ring's 16-entry window, the canary-corruption diagnostic in
+// `sched::schedule` can still answer "was this thread on a 4 KiB
+// emergency stack?" rather than "merely on a 4 KiB stack".
 //
 // Lock-free SPSC-ish ring; the writer is the alloc path (one writer at a
 // time under PMM_LOCK), the readers are diagnostic emitters that tolerate
@@ -669,7 +680,13 @@ static EMERGENCY_KSTACK_HEAD: AtomicU64 = AtomicU64::new(0);
 
 /// Record that `stack_base` was just handed out from the 4 KiB
 /// emergency-fallback path.  Called from `alloc_kernel_stack`.
-pub fn record_emergency_kstack(stack_base: u64) {
+///
+/// Visibility is `pub(crate)` — the single legitimate caller is the
+/// fallback arm of `alloc_kernel_stack` within this module; the
+/// readers (`was_emergency_kstack`) are also crate-local.  External
+/// callers have no legitimate need to mark arbitrary bases as
+/// "emergency-fallback origins".
+pub(crate) fn record_emergency_kstack(stack_base: u64) {
     let slot = (EMERGENCY_KSTACK_HEAD.fetch_add(1, Ordering::Relaxed)
         as usize) % EMERGENCY_KSTACK_RING_LEN;
     EMERGENCY_KSTACK_RING[slot].store(stack_base, Ordering::Relaxed);
