@@ -107,6 +107,24 @@ pub mod f3_watch;
 #[cfg(feature = "fs-base-trace")]
 pub mod fs_base_trace;
 
+/// D7 PT_TLS BSS-slot writer trap.  Arms a write-only hardware
+/// watchpoint on the linear address `fs_base - 0x18` of the firefox-bin
+/// init thread (pid=1, tid=1) at the first `proc::write_fs_base()`
+/// transition from zero to non-zero.  The watched qword is part of the
+/// firefox-bin PT_TLS BSS tail (`memsz=0x20, filesz=0`), which ELF
+/// gABI §5.2 requires to be zero on first access; Mozilla's
+/// `GetThreadRegistrationTime` reads it and on zero takes an
+/// early-return path (Linux behaviour), on non-zero takes a slow path
+/// to a NULL deref (the deterministic AstryxOS fault at
+/// `firefox-bin + 0x207dc`).  Each `#DB` fire emits a
+/// `[W215/DR-WATCH-FIRE] kind_tag=3 …` line naming the writer RIP, CS
+/// and CR3 — `CS=0x23` (CPL-3) implicates upstream, `CS=0x08` (CPL-0)
+/// implicates the kernel.  See Intel SDM Vol. 3B §17.2.4 (DR0–DR3,
+/// DR7); ELF gABI §5.2.  Diagnostic-only; gated behind `d7-bss-watch`
+/// so master builds remain byte-identical.
+#[cfg(feature = "d7-bss-watch")]
+pub mod d7_bss_watch;
+
 /// Bounded broadcast-within-cluster compensation for FUTEX_WAKE.  Mitigates
 /// the older-glibc `pthread_cond_signal` race
 /// (<https://sourceware.org/bugzilla/show_bug.cgi?id=25847>) by

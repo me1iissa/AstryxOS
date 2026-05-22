@@ -213,8 +213,26 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     let svga_ok = drivers::vmware_svga::init();
     serial_println!("[Aether] Phase 10a: VMware SVGA II {}", if svga_ok { "OK" } else { "not available (using fallback FB)" });
 
-    // Determine actual framebuffer parameters
-    let (fb_base, fb_width, fb_height, fb_stride) = if svga_ok {
+    // Determine actual framebuffer parameters.
+    //
+    // The BootInfo struct lives at `BOOT_INFO_PHYS_BASE` (16 MiB) but its
+    // memory_map array spans more than one 4 KiB page and the PMM only
+    // reserves the first page (see `mm/pmm.rs::init` BootInfo reservation
+    // block).  Under heavy-diagnostic feature combinations (`firefox-test`
+    // plus `w215-diag` plus any of `d7-bss-watch`, `f3-watch`, etc.) the
+    // BSS extent pushes the dynamically-computed heap base above the
+    // historical 8 MiB lower bound, and the heap range can include the
+    // BootInfo location.  The kernel allocator's linked-list metadata
+    // can then overwrite later BootInfo fields, leaving
+    // `info.framebuffer.{width,height,stride}` reading as freelist
+    // pointer fragments (a sequential u32 counter pattern).  We sanity-
+    // clamp here so a garbage read does not cascade into a multi-GiB
+    // Box::new in `gui::init`.  Maximum supported single-dimension is
+    // 8192 pixels — well past 4K UHD (3840×2160).  When values are
+    // unreasonable we fall back to zero, which matches the headless
+    // firefox-test path that has been validated since PR #156.
+    const FB_MAX_DIM: u32 = 8192;
+    let (mut fb_base, mut fb_width, mut fb_height, mut fb_stride) = if svga_ok {
         if let Some(params) = drivers::vmware_svga::get_framebuffer() {
             params
         } else {
@@ -225,6 +243,17 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         (info.framebuffer.base_address, info.framebuffer.width,
          info.framebuffer.height, info.framebuffer.stride)
     };
+    if fb_width > FB_MAX_DIM || fb_height > FB_MAX_DIM || fb_stride > FB_MAX_DIM {
+        serial_println!(
+            "[Aether] Display: dropping garbage FB dims w={} h={} stride={} fb={:#x} — \
+             falling back to 0×0 headless mode",
+            fb_width, fb_height, fb_stride, fb_base,
+        );
+        fb_base = 0;
+        fb_width = 0;
+        fb_height = 0;
+        fb_stride = 0;
+    }
 
     serial_println!("[Aether] Display: {}x{} fb=0x{:x} stride={}", fb_width, fb_height, fb_base, fb_stride);
 

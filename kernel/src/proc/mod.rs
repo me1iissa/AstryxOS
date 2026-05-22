@@ -3632,6 +3632,25 @@ pub unsafe fn write_fs_base(base: u64) {
         );
     }
 
+    // D7 PT_TLS BSS-slot watcher arm.  Triggered exactly once per boot
+    // on the first qualifying `write_fs_base()` (pid=1, tid=1, zero →
+    // non-zero transition), i.e. immediately before the firefox-bin
+    // init thread first enters Ring 3.  All gating lives inside
+    // `try_arm_after_fs_base_write`; the call site is unconditional
+    // when the feature is enabled so a single read of FS.base feeds
+    // both probes.  Diagnostic-only; gated behind `d7-bss-watch`.
+    // Refs: Intel SDM Vol. 3B §17.2.4; ELF gABI §5.2; PSE Phase 4
+    // dispatch in `docs/SC1171_PSE_END_TO_END_2026-05-22.md`.
+    #[cfg(feature = "d7-bss-watch")]
+    {
+        let old_fs = crate::hal::rdmsr(IA32_FS_BASE);
+        let pid = current_pid_lockless();
+        let tid = current_tid();
+        crate::subsys::linux::d7_bss_watch::try_arm_after_fs_base_write(
+            pid as u64, tid as u64, old_fs, base,
+        );
+    }
+
     let lo = base as u32;
     let hi = (base >> 32) as u32;
     core::arch::asm!(
