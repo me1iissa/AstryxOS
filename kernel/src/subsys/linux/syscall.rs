@@ -755,6 +755,19 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         crate::proc::current_tid(),
     );
 
+    // ── D16 SSP-canary saved-slot watcher (diagnostic-only) ────────────────
+    // Late-arm of the user-VA DR channel.  Same fast-path cost as D15:
+    // one pid+tid compare and one relaxed atomic load on each Linux
+    // syscall when D16 is built; bails immediately once the arm has
+    // been claimed.  The complementary PHYS_OFF channel is armed eagerly
+    // at execve completion against the deterministic backing phys
+    // `0x127114c0`.  See `d16_canary_watch.rs` for the full strategy.
+    #[cfg(feature = "d16-canary-watch")]
+    crate::subsys::linux::d16_canary_watch::try_arm_at_syscall(
+        crate::proc::current_pid_lockless(),
+        crate::proc::current_tid(),
+    );
+
     // ── Tier-0 trace: one self-contained line per syscall entry ──────────────
     // Grepped by qemu-harness.py via `^\[SC\] `.  User RIP comes from the
     // per-CPU syscall_entry stash (set by the naked-asm stub before dispatch).

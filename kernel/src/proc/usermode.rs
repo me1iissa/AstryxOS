@@ -259,6 +259,17 @@ fn create_user_process_impl(
         name, user_cr3, entry_rip, entry_rsp,
     );
 
+    // D16 SSP-canary PHYS_OFF channel arm at process-create time.
+    // Mirrors the F3 hook above — the eager phys-anchored DR catches
+    // the libxul/musl SSP prologue store on the deterministic backing
+    // frame `0x127114c0` without depending on the user stack page
+    // being mapped yet.  See `subsys/linux/d16_canary_watch.rs` and
+    // Intel SDM Vol. 3B §17.2.4 for the DR-arm contract.
+    #[cfg(feature = "d16-canary-watch")]
+    crate::subsys::linux::d16_canary_watch::arm_after_execve(
+        name, user_cr3, entry_rip, entry_rsp,
+    );
+
     Ok(pid)
 }
 
