@@ -2069,6 +2069,18 @@ pub fn run() -> ! {
     total += 1;
     if test_266_exec_sets_fs_base_to_new_tls() { passed += 1; }
 
+    // ── Test 267: PMM reserves every page that backs BootInfo (CWE-787) ─
+    // Verifies the fix in `mm::pmm::init` that reserves the full span of
+    // pages backing the BootInfo struct (not just the first page).
+    // BootInfo embeds a [MemoryMapEntry; 256] array; total size exceeds
+    // 4 KiB.  Pre-fix the tail page(s) remained Available and could be
+    // clobbered by the heap allocator's freelist metadata, corrupting
+    // `framebuffer` fields and the tail of `memory_map.entries[]`
+    // (CWE-787 Out-of-bounds Write).  Refs: UEFI §7.2 (GetMemoryMap);
+    // CWE-787; Intel SDM Vol. 3A §4.10.5.
+    total += 1;
+    if test_267_pmm_reserves_full_bootinfo_span() { passed += 1; }
+
     // ── Tests 261-263: native-core hardening (cycle 3) ──────────────────
     // Gated on `native-core-tests` feature: the three native-core tests
     // (page_ref_dec CAS underflow, OB refcount integration, scheduler
@@ -36210,6 +36222,132 @@ fn test_266_exec_sets_fs_base_to_new_tls() -> bool {
 
     if ok {
         test_pass!("execve(2) sets tls_base to new image PT_TLS TCB");
+    }
+    ok
+}
+
+// ── Test 267: PMM reserves every page that backs BootInfo (CWE-787 fix) ──────
+//
+// `BootInfo` (in `astryx_shared`) embeds a `MemoryMapInfo` whose
+// `entries: [MemoryMapEntry; MAX_MEMORY_MAP_ENTRIES]` array is statically
+// sized at 256 entries.  The total `size_of::<BootInfo>()` is several KiB
+// and straddles two or more 4 KiB physical pages at the fixed handoff
+// address `BOOT_INFO_PHYS_BASE`.
+//
+// Prior to this fix `pmm::init` reserved only the *first* page of the
+// span.  The tail page(s) remained eligible for the heap allocator's
+// intrusive freelist metadata, which under heavy-diagnostic feature
+// builds (where the BSS extent advances the heap base into the BootInfo
+// vicinity) could be written into the un-reserved tail page — clobbering
+// `framebuffer.{width,height,stride}` and the back end of
+// `memory_map.entries[]`.  Classified CWE-787 (Out-of-bounds Write).
+//
+// This test verifies the structural condition and the reservation
+// outcome without booting a second time:
+//
+//   (a) `BootInfo` is large enough to straddle ≥2 pages — i.e. the bug
+//       is real, not a "could be" hypothetical.  If a future refactor
+//       shrinks BootInfo below 4 KiB this assertion deliberately fails,
+//       prompting a re-audit of the reservation logic.
+//
+//   (b) Every page in the span returned by `boot_info_phys_page_span`
+//       is currently marked used in the PMM bitmap — including the tail
+//       page(s) that previously could have been clobbered.
+//
+//   (c) The first page of the span is correctly anchored at
+//       `BOOT_INFO_PHYS_BASE / PAGE_SIZE`.
+//
+// Refs: UEFI Specification §7.2 (GetMemoryMap, EfiBootServicesData);
+//       CWE-787 (Out-of-bounds Write);
+//       Intel SDM Vol. 3A §4.10.5 (paging-structure coherence).
+fn test_267_pmm_reserves_full_bootinfo_span() -> bool {
+    test_header!("PMM reserves every page that backs BootInfo (CWE-787)");
+
+    use astryx_shared::{BootInfo, BOOT_INFO_PHYS_BASE};
+
+    let size = core::mem::size_of::<BootInfo>();
+    let (first, last) = crate::mm::pmm::boot_info_phys_page_span();
+    let page_size = crate::mm::pmm::PAGE_SIZE;
+
+    test_println!(
+        "  size_of::<BootInfo>() = {} B ({:.2} KiB)",
+        size,
+        size as f64 / 1024.0,
+    );
+    test_println!(
+        "  BOOT_INFO_PHYS_BASE = {:#x}  span = pages {}..={}  ({} page{})",
+        BOOT_INFO_PHYS_BASE,
+        first, last,
+        last - first + 1,
+        if last == first { "" } else { "s" },
+    );
+
+    let mut ok = true;
+
+    // (a) Structural: size must exceed one 4 KiB page, otherwise the
+    //     "reserve only one page" code path that the fix replaces would
+    //     have been correct and this test is not exercising the bug.
+    if size <= page_size {
+        test_fail!("test267",
+            "BootInfo size {} ≤ PAGE_SIZE {} — fix is unnecessary or \
+             struct has shrunk; re-audit BootInfo layout before \
+             relaxing the reservation.",
+            size, page_size);
+        ok = false;
+    } else {
+        test_println!(
+            "  ✓ BootInfo straddles {} pages (>{} B)",
+            last - first + 1, page_size,
+        );
+    }
+
+    // (b) First page anchored at BOOT_INFO_PHYS_BASE.
+    let expected_first = (BOOT_INFO_PHYS_BASE / page_size as u64) as usize;
+    if first != expected_first {
+        test_fail!("test267",
+            "first page {} != expected {} (BOOT_INFO_PHYS_BASE / PAGE_SIZE)",
+            first, expected_first);
+        ok = false;
+    } else {
+        test_println!("  ✓ first page anchored at {:#x} / PAGE_SIZE = {}",
+            BOOT_INFO_PHYS_BASE, expected_first);
+    }
+
+    // (c) Every page in the span is marked used in the PMM bitmap.
+    //     This is the post-fix invariant: the CWE-787 window is closed
+    //     iff the entire span (incl. tail) is reserved.
+    let mut used_count = 0usize;
+    let mut free_pages: [usize; 8] = [0; 8];
+    let mut free_n = 0usize;
+    for page in first..=last {
+        if crate::mm::pmm::is_page_used_for_test(page) {
+            used_count += 1;
+        } else if free_n < free_pages.len() {
+            free_pages[free_n] = page;
+            free_n += 1;
+        }
+    }
+    let span_pages = last - first + 1;
+    if used_count != span_pages {
+        test_fail!("test267",
+            "{}/{} pages in BootInfo span reserved; {} unreserved \
+             (CWE-787 window OPEN — heap can clobber BootInfo tail)",
+            used_count, span_pages, span_pages - used_count);
+        // Print up to 8 offending page indices so the failure is
+        // actionable from the serial log alone.
+        for i in 0..free_n {
+            test_println!("    UNRESERVED page index {}", free_pages[i]);
+        }
+        ok = false;
+    } else {
+        test_println!(
+            "  ✓ all {} pages of BootInfo span reserved in PMM bitmap",
+            span_pages,
+        );
+    }
+
+    if ok {
+        test_pass!("PMM reserves every page that backs BootInfo (CWE-787)");
     }
     ok
 }

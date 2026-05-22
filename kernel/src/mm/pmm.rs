@@ -182,6 +182,37 @@ pub fn is_kernel_static_phys(phys: u64) -> bool {
     base != 0 && end != 0 && phys >= base && phys < end
 }
 
+/// Compute the inclusive [first_page, last_page] PMM page indices that
+/// back the BootInfo struct at `BOOT_INFO_PHYS_BASE`, given the compile-
+/// time `size_of::<BootInfo>()`.
+///
+/// Exposed for tests verifying the CWE-787 fix (Test 267): the helper
+/// returns the same span used by `init` to reserve BootInfo pages.  A
+/// caller may check `last >= first + 1` to assert that BootInfo spans
+/// more than one page (the structural condition that motivated the
+/// fix).
+pub fn boot_info_phys_page_span() -> (usize, usize) {
+    let bytes = core::mem::size_of::<BootInfo>() as u64;
+    let first = (astryx_shared::BOOT_INFO_PHYS_BASE / PAGE_SIZE as u64) as usize;
+    let last = ((astryx_shared::BOOT_INFO_PHYS_BASE + bytes - 1)
+        / PAGE_SIZE as u64) as usize;
+    (first, last)
+}
+
+/// True if the page index is currently marked used in the PMM bitmap.
+///
+/// Intended for test assertions only.  Production code should not rely
+/// on the bitmap state directly; allocate via `alloc_page` and inspect
+/// the returned phys.  Takes the PMM lock internally.
+pub fn is_page_used_for_test(page: usize) -> bool {
+    if page >= MAX_PAGES {
+        return false;
+    }
+    let _lock = PMM_LOCK.lock();
+    // SAFETY: lock held, page index just bounds-checked.
+    unsafe { is_page_used_locked(page) }
+}
+
 /// Initialize the PMM from the UEFI memory map.
 pub fn init(boot_info: &BootInfo) {
     let _lock = PMM_LOCK.lock();
@@ -253,23 +284,91 @@ pub fn init(boot_info: &BootInfo) {
         }
     }
 
-    // Reserve the BootInfo page explicitly.  The bootloader writes BootInfo
-    // at `BOOT_INFO_PHYS_BASE` (a fixed offset past the kernel image) but
-    // UEFI's exit_boot_services memory map reports the underlying region as
-    // BOOT_SERVICES_DATA, which our converter maps to `Available` — so
-    // without an explicit reservation the very page holding BootInfo can be
-    // handed out to later allocators.  One 4 KiB page is sufficient for the
-    // BootInfo struct (single-digit KiB, repr(C), pinned at this address).
-    let boot_info_page = (astryx_shared::BOOT_INFO_PHYS_BASE / PAGE_SIZE as u64) as usize;
-    if boot_info_page < MAX_PAGES {
-        // SAFETY: We hold the PMM lock and page is in bounds.
-        unsafe {
-            mark_page_used(boot_info_page);
-        }
-        if total_available > 0 {
-            total_available -= 1;
+    // Reserve every page that backs the BootInfo struct (CWE-787 fix).
+    //
+    // The bootloader writes BootInfo at `BOOT_INFO_PHYS_BASE` (a fixed offset
+    // past the kernel image).  UEFI's `ExitBootServices` memory map (UEFI
+    // §7.2, `GetMemoryMap`) reports the underlying region as
+    // `EfiBootServicesData`, which our converter maps to `Available` — so
+    // without an explicit reservation the pages backing BootInfo can be
+    // handed out to later allocators (heap, page-table walker, COW pool).
+    //
+    // BootInfo is *not* a single page.  Per `astryx_shared::BootInfo`, the
+    // struct embeds `MemoryMapInfo { entries: [MemoryMapEntry; 256], .. }`.
+    // With the current type layout (`MemoryMapEntry` = 24 B; 256 entries =
+    // 6144 B; plus framebuffer + magic + entry_count + auxiliary u64s) the
+    // total `size_of::<BootInfo>()` is ~6.2 KiB — straddling two 4 KiB
+    // pages.  Reserving only the first page leaves the tail page eligible
+    // for the heap allocator's linked-list metadata, which then clobbers
+    // `framebuffer.{width,height,stride}` and the back end of
+    // `memory_map.entries[]` (CWE-787, Out-of-Bounds Write of allocator
+    // metadata into a structurally live but un-reserved region).
+    //
+    // Compute the inclusive page span: every page from
+    // `BOOT_INFO_PHYS_BASE / PAGE_SIZE` through
+    // `(BOOT_INFO_PHYS_BASE + size_of::<BootInfo>() - 1) / PAGE_SIZE`
+    // inclusive, and mark them all used.  The size is known at compile
+    // time, so no dependence on `boot_info.memory_map.entry_count` (the
+    // entries array is statically sized at `MAX_MEMORY_MAP_ENTRIES = 256`
+    // regardless of how many entries the bootloader populated).
+    //
+    // Threat model:
+    //   - CWE-787 (Out-of-bounds Write) — heap allocator's intrusive
+    //     freelist metadata is written into the un-reserved tail page of
+    //     BootInfo, corrupting `framebuffer` and `memory_map` fields.
+    //   - Manifests under heavy-diagnostic feature combinations
+    //     (`firefox-test` + `w215-diag` + `d7-bss-watch` / `f3-watch`)
+    //     where BSS extent pushes the dynamically-computed heap base into
+    //     a range that intersects the un-reserved tail page.
+    //
+    // Refs: UEFI Specification §7.2 (GetMemoryMap / EfiBootServicesData);
+    //       Intel SDM Vol. 3A §4.10.5 (paging-structure coherence — frames
+    //       backing live kernel structures must remain reserved against
+    //       PMM recycling).  See also defensive framebuffer-dimension
+    //       clamp in `kernel/src/main.rs` (PR #371), retained as defence
+    //       in depth: after this fix it is a no-op in practice but stays
+    //       to bound the blast radius of any future similar oversight.
+    const BOOT_INFO_BYTES: u64 = core::mem::size_of::<BootInfo>() as u64;
+    let boot_info_first_page =
+        (astryx_shared::BOOT_INFO_PHYS_BASE / PAGE_SIZE as u64) as usize;
+    let boot_info_last_page = ((astryx_shared::BOOT_INFO_PHYS_BASE
+        + BOOT_INFO_BYTES
+        - 1)
+        / PAGE_SIZE as u64) as usize;
+    let mut boot_info_reserved_pages = 0u64;
+    for page in boot_info_first_page..=boot_info_last_page {
+        if page < MAX_PAGES {
+            // SAFETY: We hold the PMM lock and page is in bounds.
+            //
+            // `mark_page_used` is idempotent against an already-used bit
+            // (it ORs the bit in), so any page already covered by the
+            // kernel-image reservation above is harmless to re-mark.  We
+            // still decrement `total_available` only for pages that were
+            // previously free.
+            unsafe {
+                if !is_page_used_locked(page) {
+                    mark_page_used(page);
+                    if total_available > 0 {
+                        total_available -= 1;
+                    }
+                    boot_info_reserved_pages += 1;
+                } else {
+                    // Already reserved by an earlier block (e.g. kernel
+                    // image + 256-page slack); nothing to do.
+                }
+            }
         }
     }
+    crate::serial_println!(
+        "[PMM] BootInfo reservation: phys=[{:#x}..{:#x}) size={} B \
+         pages={}..={} newly_reserved={} (CWE-787 fix)",
+        astryx_shared::BOOT_INFO_PHYS_BASE,
+        astryx_shared::BOOT_INFO_PHYS_BASE + BOOT_INFO_BYTES,
+        BOOT_INFO_BYTES,
+        boot_info_first_page,
+        boot_info_last_page,
+        boot_info_reserved_pages,
+    );
 
     // Mark first 1 MiB as reserved (BIOS, VGA, etc.)
     for page in 0..256 {
@@ -706,4 +805,17 @@ unsafe fn mark_page_used(page: usize) {
 /// Caller must hold PMM_LOCK and ensure page is in bounds.
 unsafe fn mark_page_free(page: usize) {
     BITMAP[page / 8] &= !(1 << (page % 8));
+}
+
+/// Check whether a page is currently marked used in the bitmap.
+///
+/// Used by `init` to avoid double-counting `total_available` when an
+/// adjacent reservation block (kernel image + slack, first-MiB BIOS
+/// reserve, BootInfo span) overlaps a page that another block already
+/// claimed.
+///
+/// # Safety
+/// Caller must hold PMM_LOCK and ensure page is in bounds.
+unsafe fn is_page_used_locked(page: usize) -> bool {
+    BITMAP[page / 8] & (1 << (page % 8)) != 0
 }
