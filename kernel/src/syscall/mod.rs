@@ -1360,6 +1360,23 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
         final_path.as_str(), new_cr3, entry_rip, entry_rsp,
     );
 
+    // 4a.bis. D16 SSP-canary PHYS_OFF channel arm.  Anchors on the
+    //     deterministic backing phys `0x127114c0` observed byte-identical
+    //     across 3 KVM trials post-PR #368.  Eager arm at execve time
+    //     means the prologue's first store will fire on the PHYS_OFF
+    //     channel without needing the user stack page to be demand-paged
+    //     first.  The complementary user-VA channel is late-armed from
+    //     the Linux syscall-entry hook (`subsys/linux/syscall::dispatch`).
+    //
+    //     Diagnostic-only; no behavioural change to the execve path.
+    //     Refs: Intel SDM Vol. 3B §17.2.4 (DR0–DR3, DR7); Intel SDM
+    //     Vol. 3A §4.10 (TLB / PHYS_OFF coherence); System V AMD64 ABI
+    //     §3.4.1 (SSP / `__stack_chk_guard`); POSIX execve(2).
+    #[cfg(feature = "d16-canary-watch")]
+    crate::subsys::linux::d16_canary_watch::arm_after_execve(
+        final_path.as_str(), new_cr3, entry_rip, entry_rsp,
+    );
+
     // 4b. Reclaim the old address space now that the hardware no longer uses it.
     //     free_vm_space() walks old VMAs, decrements CoW refcounts, frees any
     //     anonymous pages whose refcount reaches zero, and releases the old PT
