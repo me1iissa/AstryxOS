@@ -782,14 +782,32 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     {
         let user_rip = unsafe { crate::syscall::get_user_rip() };
         let caller_rip = crate::syscall::get_user_caller_rip();
+        // Stack-depth-from-base augments the standard [SC] line for the
+        // STACK_CANARY_CORRUPT (post-task #229) investigation.  `ksp` is
+        // the live kernel RSP at dispatch time; `kdepth` is
+        // `(kstack_top - ksp)`.  Both default to 0 when the thread's
+        // kstack span is not recorded (e.g. idle paths).
+        let tid_now = crate::proc::current_tid();
+        let pid_now = crate::proc::current_pid_lockless();
+        let rsp_live = crate::proc::current_kernel_rsp_live();
+        let (kstack_base, kstack_size) = {
+            let threads = crate::proc::THREAD_TABLE.lock();
+            threads.iter().find(|t| t.tid == tid_now)
+                .map(|t| (t.kernel_stack_base, t.kernel_stack_size))
+                .unwrap_or((0, 0))
+        };
+        let kdepth = if kstack_base > 0 {
+            kstack_base.wrapping_add(kstack_size).wrapping_sub(rsp_live)
+        } else { 0 };
         crate::serial_println!(
-            "[SC] pid={} tid={} nr={} rip={:#x} cr={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x} a6={:#x}",
-            crate::proc::current_pid_lockless(),
-            crate::proc::current_tid(),
+            "[SC] pid={} tid={} nr={} rip={:#x} cr={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x} a6={:#x} ksp={:#x} kdepth={:#x}",
+            pid_now,
+            tid_now,
             num,
             user_rip,
             caller_rip,
             arg1, arg2, arg3, arg4, arg5, arg6,
+            rsp_live, kdepth,
         );
     }
 

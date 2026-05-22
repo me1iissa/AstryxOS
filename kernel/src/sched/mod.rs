@@ -576,15 +576,44 @@ pub fn schedule() {
 
     // ── Stack canary check for the outgoing thread ───────────────────
     // Detect kernel stack overflow before it causes silent corruption.
+    //
+    // When the canary is corrupt we emit a structured diagnostic line
+    // BEFORE entering `ke_bugcheck`.  The bugcheck path is fault-immune
+    // but extremely terse; the diagnostic carries the context the
+    // STACK_CANARY_CORRUPT investigation actually needs:
+    //   - live RSP and depth from the recorded top
+    //   - observed bytes at the canary slot (canary, +8, +16, +24)
+    //   - flag for "ran on the 4 KiB emergency fallback" (see
+    //     `proc::record_emergency_kstack` / `was_emergency_kstack`).
+    // The pre-bugcheck print uses ordinary serial_println so any side
+    // fault inside the formatter just leads to the bugcheck banner,
+    // which is the same outcome we get today.
     {
         let canary_info = {
             let threads = THREAD_TABLE.lock();
             threads.iter().find(|t| t.tid == current_tid)
                 .filter(|t| t.kernel_stack_base > 0)
-                .map(|t| (t.pid, t.kernel_stack_base))
+                .map(|t| (t.pid, t.kernel_stack_base, t.kernel_stack_size))
         };
-        if let Some((pid, stack_base)) = canary_info {
+        if let Some((pid, stack_base, stack_size)) = canary_info {
             if !proc::check_stack_canary(stack_base) {
+                let rsp_live = proc::current_kernel_rsp_live();
+                let kstack_top = stack_base.wrapping_add(stack_size);
+                let depth_used = kstack_top.wrapping_sub(rsp_live);
+                let observed_canary = proc::read_stack_canary(stack_base);
+                let observed_p8     = proc::read_stack_word_at(stack_base, 8);
+                let observed_p16    = proc::read_stack_word_at(stack_base, 16);
+                let observed_p24    = proc::read_stack_word_at(stack_base, 24);
+                let was_emergency   = proc::was_emergency_kstack(stack_base);
+                crate::serial_println!(
+                    "[KSTACK/CANARY-FAIL] tid={} pid={} base={:#x} size={:#x} top={:#x} \
+rsp_live={:#x} depth={:#x} expect_magic={:#x} got={:#x} +8={:#x} +16={:#x} +24={:#x} \
+was_emergency_4k={}",
+                    current_tid, pid, stack_base, stack_size, kstack_top,
+                    rsp_live, depth_used, proc::STACK_END_MAGIC,
+                    observed_canary, observed_p8, observed_p16, observed_p24,
+                    was_emergency,
+                );
                 crate::ke::bugcheck::ke_bugcheck(
                     crate::ke::bugcheck::BUGCHECK_CANARY_CORRUPT,
                     current_tid,   // P1: thread ID

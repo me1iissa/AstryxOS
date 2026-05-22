@@ -2776,6 +2776,34 @@ pub(crate) fn sys_munmap(addr: u64, length: u64) -> i64 {
 pub(crate) fn sys_brk(new_brk: u64) -> i64 {
     let pid = crate::proc::current_pid_lockless();
 
+    // ── kstack-depth probe at brk entry ──────────────────────────────
+    // The STACK_CANARY_CORRUPT investigation (post-task #229) needs to
+    // know how deep the kernel stack is when `sys_brk` runs, so the
+    // brk path can be correlated with later canary-fail events.  We
+    // capture the live RSP and emit a single structured line under
+    // `syscall-trace`.  The probe is `#[inline(never)]` indirectly via
+    // the function boundary so the captured RSP includes this frame.
+    #[cfg(feature = "syscall-trace")]
+    {
+        let tid = crate::proc::current_tid();
+        let rsp_live = crate::proc::current_kernel_rsp_live();
+        let (kstack_base, kstack_size) = {
+            let threads = crate::proc::THREAD_TABLE.lock();
+            threads.iter().find(|t| t.tid == tid)
+                .map(|t| (t.kernel_stack_base, t.kernel_stack_size))
+                .unwrap_or((0, 0))
+        };
+        let kstack_top = kstack_base.wrapping_add(kstack_size);
+        let depth_used = if kstack_base > 0 {
+            kstack_top.wrapping_sub(rsp_live)
+        } else { 0 };
+        let was_emergency = crate::proc::was_emergency_kstack(kstack_base);
+        crate::serial_println!(
+            "[BRK/ENTRY] tid={} pid={} new_brk={:#x} rsp={:#x} base={:#x} size={:#x} top={:#x} depth={:#x} was_emergency_4k={}",
+            tid, pid, new_brk, rsp_live, kstack_base, kstack_size, kstack_top, depth_used, was_emergency,
+        );
+    }
+
     let mut procs = crate::proc::PROCESS_TABLE.lock();
     let proc = match procs.iter_mut().find(|p| p.pid == pid) {
         Some(p) => p,
