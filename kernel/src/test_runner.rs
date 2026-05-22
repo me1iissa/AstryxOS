@@ -2099,6 +2099,29 @@ pub fn run() -> ! {
     total += 1;
     if test_268_exit_group_clears_sibling_cleartid() { passed += 1; }
 
+    // ── Test 269: lethal-signal sibling teardown fires CLEARTID (F1b) ───
+    // Companion to Test 268 — verifies the same `fire_cleartid_for_group`
+    // helper is wired into the lethal-signal paths in `signal.rs` (the
+    // SIGKILL branch and the default-action Terminate/CoreDump branch of
+    // both `check_signals()` and `signal_check_on_syscall_return()`).
+    //
+    // Per `signal(7)` ("Standard signals"): "If a signal whose default
+    // action is Term, Core, or Stop is delivered to a process which has
+    // installed no handler for it, the kernel terminates (or stops) the
+    // ENTIRE process (all threads)."  That makes lethal-signal delivery a
+    // process-group exit per POSIX-1.2017 `_exit(2)`, so the same
+    // CLONE_CHILD_CLEARTID + FUTEX_WAKE obligation `exit_group_inner`
+    // honours (Test 268) must also fire on the lethal-signal route —
+    // otherwise a `pthread_join(3)` waiter parked on a sibling's join-
+    // state during a SIGKILL/SIGSEGV/SIGTERM teardown blocks forever
+    // (CWE-833 Deadlock).
+    //
+    // Refs: signal(7), kill(2), clone(2) CLONE_CHILD_CLEARTID, futex(2)
+    // task-exit semantics, set_tid_address(2), set_robust_list(2),
+    // POSIX-1.2017 `_exit(2)`/`pthread_join(3)`; CWE-833, CWE-672.
+    total += 1;
+    if test_269_sigkill_clears_sibling_cleartid() { passed += 1; }
+
     // ── Tests 261-263: native-core hardening (cycle 3) ──────────────────
     // Gated on `native-core-tests` feature: the three native-core tests
     // (page_ref_dec CAS underflow, OB refcount integration, scheduler
@@ -36710,6 +36733,265 @@ fn test_268_exit_group_clears_sibling_cleartid() -> bool {
 
     if ok {
         test_pass!("exit_group(2) fires CLEARTID + FUTEX_WAKE for siblings");
+    }
+    ok
+}
+
+/// Test 269 — lethal-signal sibling teardown fires CLEARTID (F1b).
+///
+/// PR #375 (Test 268) closed the `exit_group(2)` side of the K1 audit's
+/// exec/exit CLEARTID family.  This test closes the lethal-signal side:
+/// the SIGKILL branch and the default-action Terminate/CoreDump branch
+/// of both `signal::check_signals()` and
+/// `signal::signal_check_on_syscall_return()` must call
+/// `proc::fire_cleartid_for_group(pid)` before the calling thread enters
+/// `exit_thread`, so every sibling of the dying process gets its
+/// CLEARTID write + FUTEX_WAKE per `clone(2)`.
+///
+/// Without it, a cross-thread `pthread_join(3)` waiter parked in
+/// `FUTEX_WAIT` on a sibling's joinstate is silently dropped by
+/// `futex_drain_pid` (run later in `exit_thread`) and never wakes —
+/// CWE-833 (Deadlock).
+///
+/// Strategy: install the same synthetic-group fixture as Test 268 (two
+/// CLEARTID-bearing siblings + one parked waiter), then invoke the
+/// helper directly — exactly as `signal.rs` invokes it from the lethal-
+/// signal site.  Driving `check_signals()` end-to-end would require a
+/// real PROCESS_TABLE entry and tear down the test runner; the helper-
+/// level invocation here is the same code path the lethal route now
+/// takes, with a distinct synthetic PID/TID/uaddr set so the test runs
+/// independently of Test 268.
+///
+/// Refs: signal(7), kill(2), clone(2) CLONE_CHILD_CLEARTID, futex(2),
+/// set_tid_address(2), set_robust_list(2), POSIX-1.2017 `_exit(2)` /
+/// `pthread_join(3)`; CWE-833 (Deadlock), CWE-672 (Resource After
+/// Expiration).
+fn test_269_sigkill_clears_sibling_cleartid() -> bool {
+    test_header!("lethal-signal sibling teardown fires CLEARTID + FUTEX_WAKE (F1b)");
+
+    // Distinct synthetic PID/TID/uaddr from Test 268 so the two tests
+    // can never interfere; the constants are far above any plausible
+    // allocation (PIDs/TIDs come from a small monotonic counter).
+    const SYNTH_PID:    crate::proc::Pid = 0xDEAD_0269;
+    const SYNTH_SIB_A:  crate::proc::Tid = 0xDEAD_0269_0A;
+    const SYNTH_SIB_B:  crate::proc::Tid = 0xDEAD_0269_0B;
+    const SYNTH_WAITER: crate::proc::Tid = 0xDEAD_0269_DE;
+    const UADDR_A:      u64               = 0xDEAD_0269_AAAA_0000;
+    const UADDR_B:      u64               = 0xDEAD_0269_BBBB_0000;
+
+    // Defence-in-depth pre-condition.
+    {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        if threads.iter().any(|t|
+            t.pid == SYNTH_PID
+            || t.tid == SYNTH_SIB_A
+            || t.tid == SYNTH_SIB_B
+            || t.tid == SYNTH_WAITER)
+        {
+            test_fail!("test269",
+                "synthetic PID/TID constants collide with live \
+                 THREAD_TABLE rows — test prerequisite broken");
+            return false;
+        }
+    }
+    {
+        let waiters = crate::syscall::FUTEX_WAITERS.lock();
+        if waiters.contains_key(&(SYNTH_PID, UADDR_A))
+        || waiters.contains_key(&(SYNTH_PID, UADDR_B))
+        {
+            test_fail!("test269",
+                "synthetic FUTEX_WAITERS keys already present — test \
+                 prerequisite broken");
+            return false;
+        }
+    }
+
+    // Synthetic Thread row builder (matches Test 268 contract).
+    let make_thread = |tid: crate::proc::Tid, cct: u64, rlh: u64, rll: usize|
+        crate::proc::Thread {
+            tid,
+            pid: SYNTH_PID,
+            state: crate::proc::ThreadState::Blocked,
+            context: alloc::boxed::Box::new(crate::proc::CpuContext::default()),
+            kernel_stack_base: 0,
+            kernel_stack_size: 0,
+            wake_tick: u64::MAX - 2,
+            name: [0u8; 32],
+            exit_code: 0,
+            fpu_state: None,
+            user_entry_rip: 0,
+            user_entry_rsp: 0,
+            user_entry_rdx: 0,
+            user_entry_r8:  0,
+            priority: 0,
+            base_priority: 0,
+            tls_base: 0,
+            gs_base: 0,
+            cpu_affinity: Some(0xFE),
+            last_cpu: 0,
+            first_run: false,
+            ctx_rsp_valid: alloc::boxed::Box::new(
+                core::sync::atomic::AtomicBool::new(true)),
+            clear_child_tid: cct,
+            fork_user_regs: crate::proc::ForkUserRegs::default(),
+            vfork_parent_tid: None,
+            robust_list_head: rlh,
+            robust_list_len: rll,
+            vfork_isolated_stack: None,
+            vfork_isolated_tls: None,
+        };
+
+    const SENT_RLH: u64    = 0x1357_9bdf_2468_ace0;
+    const SENT_RLL: usize  = 0x5a5a_5a5a;
+
+    crate::hal::disable_interrupts();
+    let sched_was_active = crate::sched::is_active();
+    if sched_was_active { crate::sched::disable(); }
+
+    {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        threads.push(make_thread(SYNTH_SIB_A, UADDR_A, SENT_RLH, SENT_RLL));
+        threads.push(make_thread(SYNTH_SIB_B, UADDR_B, SENT_RLH, SENT_RLL));
+        threads.push(make_thread(SYNTH_WAITER, 0, 0, 0));
+    }
+
+    {
+        let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
+        let mut v = alloc::vec::Vec::new();
+        v.push(SYNTH_WAITER);
+        waiters.insert((SYNTH_PID, UADDR_A), v);
+        // Empty-list key: proves the no-op wake path also removes the
+        // key (mirrors Test 268; redundant validation that the helper
+        // contract holds across two synthetic groups).
+        waiters.insert((SYNTH_PID, UADDR_B), alloc::vec::Vec::new());
+    }
+
+    // Exercise: this is the EXACT call the lethal-signal path now makes
+    // (signal.rs SIGKILL branch + default-Terminate/CoreDump branch in
+    // both `check_signals` and `signal_check_on_syscall_return`).
+    crate::proc::fire_cleartid_for_group(SYNTH_PID);
+
+    // Snapshot post-helper state, then uninstall the synthetic group so
+    // the picker never sees a Ready waiter once IRQs return.
+    let (post_a, post_b, post_w, waiters_a_present, waiters_b_present, waiter_state) = {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        let waiters = crate::syscall::FUTEX_WAITERS.lock();
+        let find = |tid| threads.iter().find(|t| t.tid == tid)
+            .map(|t| (t.clear_child_tid, t.robust_list_head, t.robust_list_len, t.state));
+        let pa = find(SYNTH_SIB_A);
+        let pb = find(SYNTH_SIB_B);
+        let pw = find(SYNTH_WAITER);
+        let wa = waiters.contains_key(&(SYNTH_PID, UADDR_A));
+        let wb = waiters.contains_key(&(SYNTH_PID, UADDR_B));
+        let ws = pw.map(|(_, _, _, s)| s);
+        (pa, pb, pw, wa, wb, ws)
+    };
+
+    {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        for t in threads.iter_mut().filter(|t| t.pid == SYNTH_PID) {
+            t.state = crate::proc::ThreadState::Dead;
+        }
+        threads.retain(|t| t.pid != SYNTH_PID);
+    }
+    {
+        let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
+        waiters.remove(&(SYNTH_PID, UADDR_A));
+        waiters.remove(&(SYNTH_PID, UADDR_B));
+    }
+
+    if sched_was_active { crate::sched::enable(); }
+    crate::hal::enable_interrupts();
+
+    // Verify.
+    let mut ok = true;
+    macro_rules! expect_zero_slots_269 {
+        ($label:expr, $snap:expr) => {{
+            match $snap {
+                Some((cct, rlh, rll, _)) => {
+                    if cct != 0 {
+                        test_fail!("test269",
+                            "{} clear_child_tid not zeroed: got {:#x}, \
+                             expected 0 (lethal-signal CLONE_CHILD_CLEARTID \
+                             post-exit slate per clone(2))", $label, cct);
+                        ok = false;
+                    }
+                    if rlh != 0 {
+                        test_fail!("test269",
+                            "{} robust_list_head not zeroed: got {:#x}, \
+                             expected 0 (set_robust_list(2) post-exit \
+                             slate, CWE-672)", $label, rlh);
+                        ok = false;
+                    }
+                    if rll != 0 {
+                        test_fail!("test269",
+                            "{} robust_list_len not zeroed: got {:#x}, \
+                             expected 0 (set_robust_list(2) post-exit \
+                             slate, CWE-672)", $label, rll);
+                        ok = false;
+                    }
+                    if cct == 0 && rlh == 0 && rll == 0 {
+                        test_println!("  ✓ {} exit slots zeroed", $label);
+                    }
+                }
+                None => {
+                    test_fail!("test269",
+                        "{} disappeared from THREAD_TABLE before snapshot \
+                         — test invariant broken", $label);
+                    ok = false;
+                }
+            }
+        }};
+    }
+
+    expect_zero_slots_269!("SIB_A", post_a);
+    expect_zero_slots_269!("SIB_B", post_b);
+    expect_zero_slots_269!("WAITER", post_w);
+
+    if waiters_a_present {
+        test_fail!("test269",
+            "FUTEX_WAITERS still contains (SYNTH_PID, UADDR_A) after \
+             helper — lethal-signal wake not delivered, joiner would \
+             block forever (CWE-833)");
+        ok = false;
+    } else {
+        test_println!(
+            "  ✓ FUTEX_WAITERS[(pid, UADDR_A)] drained by lethal-signal wake");
+    }
+    if waiters_b_present {
+        test_fail!("test269",
+            "FUTEX_WAITERS still contains (SYNTH_PID, UADDR_B) — \
+             empty-list key not removed by no-op wake path");
+        ok = false;
+    } else {
+        test_println!(
+            "  ✓ FUTEX_WAITERS[(pid, UADDR_B)] absent (no leak on \
+             empty-list path)");
+    }
+
+    match waiter_state {
+        Some(crate::proc::ThreadState::Ready) => {
+            test_println!(
+                "  ✓ waiter thread Blocked → Ready under lethal-signal \
+                 teardown (futex_wake_for_exit reached parked thread)");
+        }
+        Some(other) => {
+            test_fail!("test269",
+                "waiter thread state = {:?}, expected Ready \
+                 (futex_wake_for_exit did not flip the parked thread)",
+                other);
+            ok = false;
+        }
+        None => {
+            test_fail!("test269",
+                "waiter thread missing from THREAD_TABLE before \
+                 snapshot — test invariant broken");
+            ok = false;
+        }
+    }
+
+    if ok {
+        test_pass!("lethal-signal sibling teardown fires CLEARTID + FUTEX_WAKE (F1b)");
     }
     ok
 }
