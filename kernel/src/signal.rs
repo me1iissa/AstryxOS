@@ -1098,7 +1098,7 @@ pub unsafe fn deliver_sigsegv_from_isr(
     {
         let cr3_now: u64;
         core::arch::asm!("mov {}, cr3", out(reg) cr3_now, options(nomem, nostack, preserves_flags));
-        emit_fault_phys_diagnostic(pid, user_rip, cr3_now, &vma_snapshot);
+        emit_fault_phys_diagnostic(pid, user_rip, Some(cr2), cr3_now, &vma_snapshot);
     }
 
     // Bump the per-tid delivery counter (SSP-diag discriminator).  See
@@ -1418,7 +1418,73 @@ fn vma_file_key(vma: &VmaSnap, fault_va: u64) -> Option<(usize, u64, u64)> {
 /// `cr3` is the live CR3 read by the caller in ISR context (always equal
 /// to the faulting process's PML4 phys; we cannot derive it from the VmSpace
 /// here without re-acquiring locks already dropped).
+/// D13 (2026-05-22): dump per-phys provenance for likely user-pointer GPRs
+/// at fatal-#PF time.  Complements `[D13/CR2-PROV]` (which queries only the
+/// fault address `cr2`); a NULL-deref of `[rdi+8]` shows `cr2=8` but the
+/// real pointer of interest is in `rdi`.  Useful when the faulting
+/// instruction is a load through a register that should have held a heap
+/// pointer (e.g. `mov r8, [rdi+0x8]` with `rdi=0` after `rdi = *(fp+0x88)`,
+/// the D11/D12 `_IO_link_in` pattern).
+///
+/// Bounded: up to 6 candidate GPRs (rdi, rsi, rdx, rcx, r8, r9 — the SysV
+/// AMD64 ABI argument registers per §3.2.3) are queried.  Each emits at
+/// most one `[D13/GPR-PROV]` line plus shadow lookups; ring lookups are
+/// O(1).  Skips: kernel VAs, sub-page pointers, the nullptr page.
+///
+/// Cite: Intel SDM Vol. 3A §4.6 (paging walk); System V AMD64 ABI §3.2.3
+/// (argument-register conventions).
+pub fn emit_fault_gpr_phys_for_fatal(
+    pid: u64,
+    cr3: u64,
+    candidates: &[(&'static str, u64)],
+) {
+    #[cfg(feature = "firefox-test")]
+    {
+        const KERNEL_BASE: u64 = 0x0000_8000_0000_0000;
+        let tid = crate::proc::current_tid();
+        for (name, val) in candidates.iter() {
+            let v = *val;
+            // Skip kernel pointers and the nullptr page; we only care
+            // about pointers into the user heap / stack / code arenas.
+            if v < 0x1000 || v >= KERNEL_BASE {
+                continue;
+            }
+            let page = v & !0xFFFu64;
+            match crate::mm::vmm::virt_to_phys_in(cr3, page) {
+                Some(phys) => {
+                    crate::serial_println!(
+                        "[D13/GPR-PROV] pid={} tid={} reg={} val={:#x} \
+                         page={:#x} phys={:#x}",
+                        pid, tid, name, v, page, phys,
+                    );
+                    crate::mm::w215_diag::dump_free_shadow_for_phys(phys);
+                    crate::mm::w215_diag::dump_alloc_shadow_for_phys(phys);
+                }
+                None => {
+                    // Unmapped GPR pointer is itself informative — likely
+                    // the upstream that produced the NULL/garbage that
+                    // triggered the fault.
+                    crate::serial_println!(
+                        "[D13/GPR-PROV] pid={} tid={} reg={} val={:#x} \
+                         page={:#x} phys=UNMAPPED",
+                        pid, tid, name, v, page,
+                    );
+                }
+            }
+        }
+        // Silence unused-variable warning when no candidates pass the
+        // filter.
+        let _ = (pid, cr3, tid);
+    }
+    #[cfg(not(feature = "firefox-test"))]
+    let _ = (pid, cr3, candidates);
+}
+
 pub fn emit_fault_phys_for_fatal(pid: u64, user_rip: u64, cr2: u64, cr3: u64) {
+    // D13 (2026-05-22): cr2 was previously dropped at the call boundary;
+    // forward it through so `emit_fault_phys_diagnostic` can query
+    // phys-shadows on the DATA fault address (not just the instruction
+    // page).  See D12 sc=201 verdict and the [D13/CR2-PROV] line below.
     // Snapshot under the PROCESS_TABLE lock, then release before printing.
     //
     // For a CLONE_VM child (`vm_space == None`, shared CR3 with parent —
@@ -1446,7 +1512,7 @@ pub fn emit_fault_phys_for_fatal(pid: u64, user_rip: u64, cr2: u64, cr3: u64) {
             signal_vma_snapshot(None, user_rip, cr2)
         }
     };
-    emit_fault_phys_diagnostic(pid, user_rip, cr3, &snap);
+    emit_fault_phys_diagnostic(pid, user_rip, Some(cr2), cr3, &snap);
 }
 
 /// Emit `[FAULT/PHYS]` and `[FAULT/RIP-CONTENT]` diagnostic lines.
@@ -1476,9 +1542,15 @@ pub fn emit_fault_phys_for_fatal(pid: u64, user_rip: u64, cr2: u64, cr3: u64) {
 pub(crate) fn emit_fault_phys_diagnostic(
     pid: u64,
     user_rip: u64,
+    cr2: Option<u64>,
     cr3: u64,
     vma_snapshot: &[VmaSnap],
 ) {
+    // D13: `cr2` is consumed only by the firefox-test gated block below
+    // (see [D13/CR2-PROV]).  Silence the unused-variable warning when the
+    // feature is off — default builds stay byte-identical.
+    #[cfg(not(feature = "firefox-test"))]
+    let _ = cr2;
     const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
     const KERNEL_BASE: u64 = 0x0000_8000_0000_0000;
     let tid = crate::proc::current_tid();
@@ -1542,6 +1614,53 @@ pub(crate) fn emit_fault_phys_diagnostic(
     #[cfg(feature = "firefox-test")]
     if let Some(rp) = rip_phys {
         crate::mm::w215_diag::dump_free_shadow_for_phys(rp);
+    }
+
+    // ── [D13/CR2-PROV] phys-shadow lookup on the DATA fault address ─────────
+    // D12 (sc=201 glibc `_IO_link_in` NULL-deref of `fp->_lock`, 2026-05-22)
+    // identified that the existing `[FAULT/PHYS/FREESHADOW]` /
+    // `[FAULT/PHYS/ALLOCSHADOW]` / `[FAULT/PHYS/PROV]` dumps query only
+    // `rip_phys` (the instruction-page phys), never the data-page phys.
+    // For heap-class faults the corrupted byte lives in the data page, not
+    // the code page, so the only diagnostic available was a single
+    // `caller_rip=glibc.text` line — uselessly redundant with the RIP itself.
+    //
+    // D13 closes that gap: when `cr2` is known (always true for a #PF; see
+    // `emit_fault_phys_for_fatal` + `deliver_sigsegv_from_isr`), translate
+    // `cr2 & ~0xFFF` through the faulting CR3 and dump per-phys
+    // FREE/ALLOC/PROV provenance.  Per Intel SDM Vol. 3A §4.6 (paging walk)
+    // a successful `virt_to_phys_in` resolves the same physical frame the
+    // CPU's translation produced; per §4.10.5 the most-recent free + most-
+    // recent alloc together name the upstream of any use-after-recycle.
+    //
+    // Output format mirrors the existing `[FAULT/PHYS/…]` family so the
+    // qemu-harness grep pattern is invariant.  `cr2 < KERNEL_BASE` guards
+    // against kernel-mode CR2 (which would not have a user CR3 mapping
+    // anyway, but cheap to be explicit).
+    #[cfg(feature = "firefox-test")]
+    if let Some(cr2_va) = cr2 {
+        if cr2_va < KERNEL_BASE && cr2_va >= 0x1000 {
+            let cr2_page = cr2_va & !0xFFFu64;
+            match crate::mm::vmm::virt_to_phys_in(cr3, cr2_page) {
+                Some(data_phys) => {
+                    crate::serial_println!(
+                        "[D13/CR2-PROV] pid={} tid={} cr2={:#x} cr2_page={:#x} \
+                         data_phys={:#x}",
+                        pid, tid, cr2_va, cr2_page, data_phys,
+                    );
+                    crate::mm::w215_diag::dump_free_shadow_for_phys(data_phys);
+                    crate::mm::w215_diag::dump_alloc_shadow_for_phys(data_phys);
+                    crate::mm::w215_diag::dump_prov_for_phys(data_phys);
+                }
+                None => {
+                    crate::serial_println!(
+                        "[D13/CR2-PROV] pid={} tid={} cr2={:#x} cr2_page={:#x} \
+                         data_phys=UNMAPPED",
+                        pid, tid, cr2_va, cr2_page,
+                    );
+                }
+            }
+        }
     }
 
     // ── [FAULT/PHYS/PROV] unconditional dump (Phase D 2026-05-20) ──────────
