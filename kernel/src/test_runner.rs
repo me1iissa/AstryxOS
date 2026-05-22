@@ -2081,6 +2081,24 @@ pub fn run() -> ! {
     total += 1;
     if test_267_pmm_reserves_full_bootinfo_span() { passed += 1; }
 
+    // ── Test 268: exit_group(2) fires CLEARTID + FUTEX_WAKE for siblings ─
+    // Verifies the `fire_cleartid_for_group(pid)` helper that
+    // `exit_group_inner` calls at the top of the teardown path.  Per
+    // `clone(2)` (CLONE_CHILD_CLEARTID): "When the thread terminates, the
+    // kernel writes a 0 to that location, and any thread waiting on a
+    // futex at that address will be woken."  Linux runs this for every
+    // task that traverses `do_exit()`, including the caller of
+    // `exit_group(2)` and each sibling reaped during group termination.
+    // Without it, a cross-thread joiner parked in `FUTEX_WAIT` on a
+    // sibling's joinstate is never woken when the group exits — CWE-833
+    // (Deadlock) for `pthread_join(3)`.  The post-helper zeroing of
+    // `clear_child_tid` / `robust_list_head` / `robust_list_len` on every
+    // thread of the group also closes CWE-672 against `Thread`-slot reuse.
+    // Refs: clone(2), futex(2), pthread_join(3), set_tid_address(2),
+    // set_robust_list(2), POSIX-1.2017; CWE-833, CWE-672.
+    total += 1;
+    if test_268_exit_group_clears_sibling_cleartid() { passed += 1; }
+
     // ── Tests 261-263: native-core hardening (cycle 3) ──────────────────
     // Gated on `native-core-tests` feature: the three native-core tests
     // (page_ref_dec CAS underflow, OB refcount integration, scheduler
@@ -36350,6 +36368,348 @@ fn test_267_pmm_reserves_full_bootinfo_span() -> bool {
 
     if ok {
         test_pass!("PMM reserves every page that backs BootInfo (CWE-787)");
+    }
+    ok
+}
+
+// ── Test 268: exit_group(2) fires CLEARTID + FUTEX_WAKE for siblings ────────
+//
+// Per Linux `clone(2)` (section "C library/kernel ABI differences", on
+// CLONE_CHILD_CLEARTID): "When the thread terminates, the kernel writes
+// a 0 to that location, and any thread waiting on a futex at that
+// address will be woken."  Linux runs this protocol on every task that
+// traverses `do_exit()`, including the caller of `exit_group(2)` and
+// each sibling reaped during the group termination — not just the
+// thread that issued `sys_exit(2)`.
+//
+// AstryxOS's `exit_thread` (per-thread exit) already honoured the
+// protocol.  `exit_group_inner` previously marked siblings (and on the
+// `yield_self == true` path the caller too) `Dead` directly, without
+// firing the wake.  The downstream `futex_drain_pid` then silently
+// evicted any parked `FUTEX_WAIT` waiter without delivering a wake —
+// stranding glibc / musl `pthread_join(3)` joiners (which park in
+// FUTEX_WAIT on the joinstate registered via CLONE_CHILD_CLEARTID)
+// indefinitely.  CWE-833 (Deadlock).
+//
+// `proc::fire_cleartid_for_group(pid)` is the helper that
+// `exit_group_inner` now calls at the top of the teardown path.  It
+// snapshots `(tid, uaddr)` for every non-Dead thread of `pid` with a
+// registered CLEARTID slot under `THREAD_TABLE.lock()`, drops the lock,
+// then for each entry calls `write_u32_to_user_pub(cr3, uaddr, 0)` and
+// `futex_wake_for_exit(pid, uaddr, 1)` (the same lock-free pattern
+// `exit_thread` uses).  Finally it re-acquires `THREAD_TABLE` to zero
+// `clear_child_tid` / `robust_list_head` / `robust_list_len` on every
+// thread of the group — closing CWE-672 (Operation on Resource After
+// Expiration or Release) against any future `Thread`-slot reuse that
+// would otherwise replay the stale write at unrelated user-VA.
+//
+// This test exercises the helper in isolation.  The full
+// `exit_group_inner` path would tear down the test runner thread; the
+// helper is testable on its own (mirroring the test-265 / test-266
+// pattern that does the same for the `sys_exec` post-image-install
+// slate).  The synthetic group is a unique PID that is intentionally
+// NOT registered in `PROCESS_TABLE`, so the helper's CR3 lookup returns
+// 0 and the user-VA `write_u32_to_user_pub` is short-circuited (the
+// existing `if cr3 != 0` guard) — we are exercising the FUTEX_WAKE +
+// per-thread zero-out behaviour, not re-testing `write_u32_to_user_pub`
+// (covered by the test-200-series mm fixtures).
+//
+// Lock-order discipline: the test takes `THREAD_TABLE.lock()` and
+// `FUTEX_WAITERS.lock()` separately; `fire_cleartid_for_group` itself
+// runs no lock-held callouts (the helper drops `THREAD_TABLE` before
+// invoking `futex_wake_for_exit`, which is the canonical lock order
+// across the kernel: FUTEX_WAITERS THEN THREAD_TABLE, with neither
+// held across the other's transitions).
+//
+// Scheduler discipline: the test inserts a synthetic Thread row in
+// state `Blocked` (so the picker skips it) with an impossibly-high
+// `wake_tick` (so the wake-sleeping pass skips it too).  The helper's
+// `futex_wake_for_exit` flips that Thread `Blocked → Ready` to prove
+// the wake fired; the test then immediately re-marks it `Dead` and
+// removes it from `THREAD_TABLE` while interrupts are disabled, so the
+// picker never observes a synthetic Ready thread with no real context.
+//
+// References:
+//   * Linux `clone(2)` — CLONE_CHILD_CLEARTID, set_child_tid,
+//     FUTEX_WAKE on task exit
+//   * Linux `futex(2)` — NOTES on task-exit semantics
+//   * Linux `set_tid_address(2)`
+//   * Linux `set_robust_list(2)` / `get_robust_list(2)`
+//   * POSIX-1.2017 `pthread_join(3)`, `pthread_exit(3)`
+//   * CWE-833 (Deadlock); CWE-672 (Operation on Resource After
+//     Expiration or Release)
+fn test_268_exit_group_clears_sibling_cleartid() -> bool {
+    test_header!("exit_group(2) fires CLEARTID + FUTEX_WAKE for siblings");
+
+    // Synthetic group: a PID guaranteed not to collide with any live
+    // process (PIDs are 64-bit but allocated from a small monotonic
+    // counter — `0xDEAD_0268` is far above any plausible allocation).
+    // Because this PID is not in PROCESS_TABLE, `fire_cleartid_for_group`
+    // resolves cr3=0 and skips `write_u32_to_user_pub` (the existing
+    // guard); we are validating the FUTEX_WAKE + per-thread zero-out
+    // semantics.  The user-VA write itself is covered by the existing
+    // mm test fixtures.
+    const SYNTH_PID:    crate::proc::Pid = 0xDEAD_0268;
+    const SYNTH_SIB_A:  crate::proc::Tid = 0xDEAD_0268_0A;
+    const SYNTH_SIB_B:  crate::proc::Tid = 0xDEAD_0268_0B;
+    const SYNTH_WAITER: crate::proc::Tid = 0xDEAD_0268_DE;
+    const UADDR_A:      u64               = 0xDEAD_0268_AAAA_0000;
+    const UADDR_B:      u64               = 0xDEAD_0268_BBBB_0000;
+
+    // Defence-in-depth pre-condition: bail out cleanly if the synthetic
+    // PID or TIDs already exist (e.g. an earlier test crashed and left
+    // residue, or the constants collide with a future allocation).
+    {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        if threads.iter().any(|t|
+            t.pid == SYNTH_PID
+            || t.tid == SYNTH_SIB_A
+            || t.tid == SYNTH_SIB_B
+            || t.tid == SYNTH_WAITER)
+        {
+            test_fail!("test268",
+                "synthetic PID/TID constants collide with live \
+                 THREAD_TABLE rows — test prerequisite broken");
+            return false;
+        }
+    }
+    {
+        let waiters = crate::syscall::FUTEX_WAITERS.lock();
+        if waiters.contains_key(&(SYNTH_PID, UADDR_A))
+        || waiters.contains_key(&(SYNTH_PID, UADDR_B))
+        {
+            test_fail!("test268",
+                "synthetic FUTEX_WAITERS keys already present — test \
+                 prerequisite broken");
+            return false;
+        }
+    }
+
+    // Build a synthetic Thread row.  Heap-allocate the `ctx_rsp_valid`
+    // AtomicBool because that is the contract documented at the field
+    // declaration site (`proc/mod.rs:228` — "Heap-allocated via `Box` so
+    // the address is stable across `Vec` growth of `THREAD_TABLE`").
+    let make_thread = |tid: crate::proc::Tid, cct: u64, rlh: u64, rll: usize|
+        crate::proc::Thread {
+            tid,
+            pid: SYNTH_PID,
+            // `Blocked` so the picker / wake-sleeping passes skip the row.
+            state: crate::proc::ThreadState::Blocked,
+            context: alloc::boxed::Box::new(crate::proc::CpuContext::default()),
+            kernel_stack_base: 0,
+            kernel_stack_size: 0,
+            // `u64::MAX - 2`: a sentinel that is neither the waitpid
+            // sentinel (`MAX-1`) nor a plausible tick deadline.
+            wake_tick: u64::MAX - 2,
+            name: [0u8; 32],
+            exit_code: 0,
+            fpu_state: None,
+            user_entry_rip: 0,
+            user_entry_rsp: 0,
+            user_entry_rdx: 0,
+            user_entry_r8:  0,
+            priority: 0,
+            base_priority: 0,
+            tls_base: 0,
+            gs_base: 0,
+            // Pin to an impossible CPU index as a second-line guard
+            // against the picker ever attempting to dispatch this row
+            // (defence-in-depth: state=Blocked is the primary guard).
+            cpu_affinity: Some(0xFE),
+            last_cpu: 0,
+            first_run: false,
+            ctx_rsp_valid: alloc::boxed::Box::new(
+                core::sync::atomic::AtomicBool::new(true)),
+            clear_child_tid: cct,
+            fork_user_regs: crate::proc::ForkUserRegs::default(),
+            vfork_parent_tid: None,
+            robust_list_head: rlh,
+            robust_list_len: rll,
+            vfork_isolated_stack: None,
+            vfork_isolated_tls: None,
+        };
+
+    // Sentinel values for the non-CLEARTID exit slots — the helper must
+    // zero these too, so that a future `Thread`-slot reuse cannot
+    // replay an inherited `robust_list_head` walk at the next exit
+    // (CWE-672).
+    const SENT_RLH: u64    = 0xfedc_ba98_7654_3210;
+    const SENT_RLL: usize  = 0xa5a5_a5a5;
+
+    // Phase 1: install synthetic state.  Take both locks in canonical
+    // order (THREAD_TABLE outside FUTEX_WAITERS is the dominant kernel
+    // order; we hold each separately).  Disable interrupts across the
+    // install + helper + verify + uninstall window so the timer-tick
+    // scheduler does not observe a half-installed group.  The test
+    // runner is invoked from `kernel_main` which leaves IRQs enabled,
+    // so we re-enable unconditionally at the end of the test (the
+    // alternative — reading RFLAGS.IF via PUSHFQ — is not worth the
+    // extra mile for the single fixed call site here).
+    crate::hal::disable_interrupts();
+    let sched_was_active = crate::sched::is_active();
+    if sched_was_active { crate::sched::disable(); }
+
+    {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        threads.push(make_thread(SYNTH_SIB_A, UADDR_A, SENT_RLH, SENT_RLL));
+        threads.push(make_thread(SYNTH_SIB_B, UADDR_B, SENT_RLH, SENT_RLL));
+        // Waiter thread: state=Blocked, no CLEARTID of its own.  This
+        // is the row that `futex_wake_for_exit` will flip Blocked→Ready
+        // to prove the wake reached the queue.
+        threads.push(make_thread(SYNTH_WAITER, 0, 0, 0));
+    }
+
+    // Park the waiter on UADDR_A.  Either sibling's exit must wake it,
+    // but only ONE waiter is woken per `futex_wake_for_exit` call (the
+    // helper passes `max_wake = 1`, matching the per-thread exit-path
+    // convention in `exit_thread`).
+    {
+        let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
+        let mut v = alloc::vec::Vec::new();
+        v.push(SYNTH_WAITER);
+        waiters.insert((SYNTH_PID, UADDR_A), v);
+        // A second key with NO waiters parked — proves the helper does
+        // not leak per-(pid,uaddr) entries when the wake list is empty
+        // (the `futex_wake_for_exit` no-op branch).
+        waiters.insert((SYNTH_PID, UADDR_B), alloc::vec::Vec::new());
+    }
+
+    // Phase 2: exercise the helper.
+    crate::proc::fire_cleartid_for_group(SYNTH_PID);
+
+    // Phase 3: snapshot post-helper state under lock, then immediately
+    // re-mark synthetic threads Dead + remove from THREAD_TABLE so the
+    // picker never sees the Ready waiter once we re-enable interrupts.
+    let (post_a, post_b, post_w, waiters_a_present, waiters_b_present, waiter_state) = {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        let waiters = crate::syscall::FUTEX_WAITERS.lock();
+        let find = |tid| threads.iter().find(|t| t.tid == tid)
+            .map(|t| (t.clear_child_tid, t.robust_list_head, t.robust_list_len, t.state));
+        let pa = find(SYNTH_SIB_A);
+        let pb = find(SYNTH_SIB_B);
+        let pw = find(SYNTH_WAITER);
+        let wa = waiters.contains_key(&(SYNTH_PID, UADDR_A));
+        let wb = waiters.contains_key(&(SYNTH_PID, UADDR_B));
+        let ws = pw.map(|(_, _, _, s)| s);
+        (pa, pb, pw, wa, wb, ws)
+    };
+
+    {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        for t in threads.iter_mut().filter(|t| t.pid == SYNTH_PID) {
+            t.state = crate::proc::ThreadState::Dead;
+        }
+        threads.retain(|t| t.pid != SYNTH_PID);
+    }
+    {
+        let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
+        waiters.remove(&(SYNTH_PID, UADDR_A));
+        waiters.remove(&(SYNTH_PID, UADDR_B));
+    }
+
+    if sched_was_active { crate::sched::enable(); }
+    crate::hal::enable_interrupts();
+
+    // Phase 4: verify.
+    let mut ok = true;
+    macro_rules! expect_zero_slots {
+        ($label:expr, $snap:expr) => {{
+            match $snap {
+                Some((cct, rlh, rll, _)) => {
+                    if cct != 0 {
+                        test_fail!("test268",
+                            "{} clear_child_tid not zeroed: got {:#x}, \
+                             expected 0 (clone(2) CLONE_CHILD_CLEARTID \
+                             post-exit slate)", $label, cct);
+                        ok = false;
+                    }
+                    if rlh != 0 {
+                        test_fail!("test268",
+                            "{} robust_list_head not zeroed: got {:#x}, \
+                             expected 0 (set_robust_list(2) post-exit \
+                             slate, CWE-672)", $label, rlh);
+                        ok = false;
+                    }
+                    if rll != 0 {
+                        test_fail!("test268",
+                            "{} robust_list_len not zeroed: got {:#x}, \
+                             expected 0 (set_robust_list(2) post-exit \
+                             slate, CWE-672)", $label, rll);
+                        ok = false;
+                    }
+                    if cct == 0 && rlh == 0 && rll == 0 {
+                        test_println!("  ✓ {} exit slots zeroed", $label);
+                    }
+                }
+                None => {
+                    test_fail!("test268",
+                        "{} disappeared from THREAD_TABLE before snapshot \
+                         — test invariant broken", $label);
+                    ok = false;
+                }
+            }
+        }};
+    }
+
+    expect_zero_slots!("SIB_A", post_a);
+    expect_zero_slots!("SIB_B", post_b);
+    // Waiter has no CLEARTID of its own, but its slots must still read
+    // zero post-helper (the helper zeros every thread in the group).
+    expect_zero_slots!("WAITER", post_w);
+
+    // FUTEX_WAITERS: UADDR_A must be drained (one waiter woken, list
+    // emptied, key removed by `futex_wake_for_exit`).  UADDR_B had no
+    // parked waiters but the helper still called `futex_wake_for_exit`
+    // — the no-op path must not leave the key behind either.
+    if waiters_a_present {
+        test_fail!("test268",
+            "FUTEX_WAITERS still contains (SYNTH_PID, UADDR_A) after \
+             helper — wake not delivered or list not drained \
+             (CWE-833: joiner would block forever)");
+        ok = false;
+    } else {
+        test_println!(
+            "  ✓ FUTEX_WAITERS[(pid, UADDR_A)] drained after wake");
+    }
+    if waiters_b_present {
+        test_fail!("test268",
+            "FUTEX_WAITERS still contains (SYNTH_PID, UADDR_B) — \
+             empty-list key not removed by no-op wake path");
+        ok = false;
+    } else {
+        test_println!(
+            "  ✓ FUTEX_WAITERS[(pid, UADDR_B)] absent (no leak on \
+             empty-list path)");
+    }
+
+    // Waiter Thread must have transitioned Blocked → Ready, proving the
+    // wake actually reached the parked thread (not just drained the
+    // queue).  `futex_wake_for_exit` is the only code that can perform
+    // this transition for this synthetic TID, so the verification is
+    // dispositive.
+    match waiter_state {
+        Some(crate::proc::ThreadState::Ready) => {
+            test_println!(
+                "  ✓ waiter thread transitioned Blocked → Ready by \
+                 futex_wake_for_exit");
+        }
+        Some(other) => {
+            test_fail!("test268",
+                "waiter thread state = {:?}, expected Ready \
+                 (futex_wake_for_exit did not run, or did not flip \
+                 the parked thread)", other);
+            ok = false;
+        }
+        None => {
+            test_fail!("test268",
+                "waiter thread missing from THREAD_TABLE before \
+                 snapshot — test invariant broken");
+            ok = false;
+        }
+    }
+
+    if ok {
+        test_pass!("exit_group(2) fires CLEARTID + FUTEX_WAKE for siblings");
     }
     ok
 }
