@@ -181,6 +181,28 @@ pub mod d15_mthread_watch;
 #[cfg(feature = "d16-canary-watch")]
 pub mod d16_canary_watch;
 
+/// D17 read-side aliasing test for the SSP-canary slot.  D16
+/// established that all 32 fires on the canary slot were CPL-3 user
+/// writers (no kernel direct-map writer), superficially falsifying
+/// "kernel writer corrupts the slot".  D17 closes the remaining
+/// hypothesis: the writer wrote correct data to the correct phys,
+/// but a residual page-table or TLB aliasing (W215-class on the stack
+/// canary VA) means the epilogue's read resolves the same VA to a
+/// *different* phys at fault time.  D17 records (rip, va, phys, value)
+/// at each D16 fire, re-resolves the canary VA at SSP-fail `#GP` time,
+/// and emits a verdict line: `D17-PHYS-DIFFER` (read-side aliasing
+/// confirmed), `D17-PHYS-MATCH-VALUE-DIVERGED` (D16 missed a writer),
+/// `D17-PHYS-MATCH-VALUE-MATCH` (no kernel-side anomaly — points to
+/// the read instruction itself), or `D17-NO-WRITE-CAPTURED` (D16 did
+/// not fire — inconclusive).  Diagnostic-only; gated behind
+/// `d17-aliasing-test` so master builds remain byte-identical.  Refs:
+/// Intel SDM Vol. 3A §4.6 (page-table walk), §4.10 (TLB management,
+/// PHYS_OFF coherence), §11.4 (cache coherence on aliased VAs);
+/// Intel SDM Vol. 3B §17.2.4 (DR0–DR3), §17.3.1.1 (trap-after-retire);
+/// System V AMD64 ABI §3.4.1 (SSP); POSIX `execve(2)`; CWE-787.
+#[cfg(feature = "d17-aliasing-test")]
+pub mod d17_aliasing_test;
+
 /// Bounded broadcast-within-cluster compensation for FUTEX_WAKE.  Mitigates
 /// the older-glibc `pthread_cond_signal` race
 /// (<https://sourceware.org/bugzilla/show_bug.cgi?id=25847>) by

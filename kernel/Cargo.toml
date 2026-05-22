@@ -353,6 +353,35 @@ d15-mthread-watch = ["firefox-test", "w215-diag"]
 # (stack-based buffer overflow), CWE-587 (assignment of fixed address
 # to pointer); musl libc `src/env/__stack_chk_fail.c`.
 d16-canary-watch = ["firefox-test", "w215-diag"]
+# D17 read-side aliasing test for the SSP-canary slot
+# (kernel/src/subsys/linux/d17_aliasing_test.rs).  D16's two-channel
+# coverage saw 32 fires on the canary slot, all CPL=3 user writers
+# (the libxul / musl SSP prologue) — no CPL=0 kernel-mode writer on
+# the PHYS_OFF channel.  That falsifies "kernel direct-map writer
+# corrupts the slot between prologue and epilogue" but leaves one
+# hypothesis open: the prologue write retired against phys `X` (the
+# correct canary) and the epilogue's read resolves the same VA to
+# phys `Y != X` (a residual page-table or TLB aliasing on the canary
+# VA, W215-class but on a different VA).  D17 records (rip, va,
+# phys, value) on every D16 fire (hooked from `handle_db_exception`
+# on `kind_tag == WATCH_KIND_D16_CANARY`) and re-resolves the canary
+# VA at SSP-fail `#GP` time from `ssp_diag::probe_gp_at_ssp_fail`.
+# Four verdict shapes: D17-PHYS-DIFFER (read-side aliasing
+# CONFIRMED — kernel PT/TLB bug, named target for fix);
+# D17-PHYS-MATCH-VALUE-DIVERGED (D16 missed a writer); D17-PHYS-
+# MATCH-VALUE-MATCH (no kernel-side anomaly — points to read
+# instruction); D17-NO-WRITE-CAPTURED (D16 did not fire,
+# inconclusive).  Diagnostic-only; default builds remain byte-
+# identical when off.  Depends on `firefox-test` (trace formatters),
+# `w215-diag` (DR plumbing), `d16-canary-watch` (D16 fire path),
+# `ssp-canary-diag` (SSP-fail `#GP` hook site).
+# Refs: Intel SDM Vol. 3A §4.6 (page-table walk, linear → phys),
+# §4.10 (TLB management, PHYS_OFF coherence), §11.4 (cache coherence
+# on aliased VAs); Intel SDM Vol. 3B §17.2.4 (DR0–DR3, DR7),
+# §17.3.1.1 (data-breakpoint trap-after-retire); System V AMD64 ABI
+# §3.4.1 (SSP / `__stack_chk_guard`); POSIX `execve(2)`; CWE-787
+# (out-of-bounds write via PT aliasing).
+d17-aliasing-test = ["firefox-test", "w215-diag", "d16-canary-watch", "ssp-canary-diag"]
 # Track B (Phase 5, 2026-05-21) — stack-page write provenance ring.
 # Records kernel-mode writes whose target user VA falls into the
 # `[0x3f00_0000_0000, 0x4000_0000_0000)` thread-stack range (per Phase 4
