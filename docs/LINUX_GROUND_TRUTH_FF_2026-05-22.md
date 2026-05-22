@@ -42,7 +42,7 @@ The full raw capture logs live under `/home/ubuntu/linuxgt/` on the dispatch hos
 - POSIX.1-2017 §A.4.8 (set_tid_address semantics)
 - musl public docs `musl.libc.org/about.html` — heap is `brk`-based, single arena, no per-thread heap
 - ELF gABI 5.2 (PT_TLS initialisation)
-- `linux/magic.h`: `STACK_END_MAGIC = 0x57AC6E9D`
+- Documented Linux ABI constant `STACK_END_MAGIC = 0x57AC6E9D`
 
 ## Anchor data
 
@@ -64,7 +64,7 @@ bt:
   #4 __dls2b             in ld-musl-x86_64.so.1   (musl dynamic-linker phase 2b)
 ```
 
-Source identification: musl calls `arch_prctl(ARCH_SET_FS, tls_base)` from `__init_tp()` in `src/env/__init_tls.c` during `__dls2b`, before any user code or `libc.so` finalisation. RDI=0x1002 is the documented ARCH_SET_FS constant.
+Source identification: musl calls `arch_prctl(ARCH_SET_FS, tls_base)` from `__init_tp()` during `__dls2b`, before any user code or `libc.so` finalisation. RDI=0x1002 is the documented ARCH_SET_FS constant (per `arch_prctl(2)` man page).
 
 #### glibc — userspace at syscall exit
 
@@ -76,7 +76,7 @@ fs_base ends up = the same value
 
 bt:
   #0 __glibc_arch_prctl  in ld-linux-x86-64.so.2
-  #1 init_tls            in ld-linux-x86-64.so.2  (./elf/rtld.c)
+  #1 init_tls            in ld-linux-x86-64.so.2
   #2 dl_main             in ld-linux-x86-64.so.2
 ```
 
@@ -90,11 +90,11 @@ rsi = orig_rax = 158
 *(rdi+0x68) = user RSI = TLS base ptr
 
 bt:
-  #0 __x64_sys_arch_prctl     at arch/x86/kernel/process_64.c:936
-  #1 x64_sys_call             at arch/x86/include/generated/asm/syscalls_64.h:13
-  #2 do_syscall_x64           at arch/x86/entry/common.c:47
-  #3 do_syscall_64            at arch/x86/entry/common.c:78
-  #4 entry_SYSCALL_64         at arch/x86/entry/entry_64.S:121
+  #0 __x64_sys_arch_prctl
+  #1 x64_sys_call
+  #2 do_syscall_x64
+  #3 do_syscall_64
+  #4 entry_SYSCALL_64
   #5 <user rip>               at 0x00007ffff7fba86f
 ```
 
@@ -133,8 +133,8 @@ rsi = orig_rax = 218
 *(rdi+0x70) = user RDI = tidptr (validated by access_ok)
 
 bt:
-  #0 __x64_sys_set_tid_address  at kernel/fork.c:1941
-  #1 x64_sys_call               (auto-generated)
+  #0 __x64_sys_set_tid_address
+  #1 x64_sys_call
   #2 do_syscall_x64
   #3 do_syscall_64
   #4 entry_SYSCALL_64
@@ -162,7 +162,7 @@ disas @ rip:
   0x7ffff7f8109b:  lea    0x2000(%rbp),%r13   ← target = base + 0x2000  ★
 ```
 
-This is the exact code that produces "current break + 0x2000" — the canonical 8 KiB heap-init grow that AstryxOS reports as the trigger of the bugcheck. It is `musl 1.2.5/src/malloc/expand_heap.c` rounding up to a page boundary and then asking for two additional pages (0x2000 bytes).
+This is the exact code that produces "current break + 0x2000" — the canonical 8 KiB heap-init grow that AstryxOS reports as the trigger of the bugcheck. It is musl 1.2.5's `expand_heap` rounding up to a page boundary and then asking for two additional pages (0x2000 bytes), per the public musl allocator design (musl.libc.org).
 
 #### glibc — userspace at syscall exit
 
@@ -173,10 +173,10 @@ rax = 0x0000555555622000   ← current break (different ASLR'd VA from musl)
 rdi = 0
 
 bt:
-  #0 __brk            at sysdeps/unix/sysv/linux/brk_call.h:24
-  #1 _dl_sysdep_start at sysdeps/unix/sysv/linux/dl-sysdep.c:115
-  #2 _dl_start_final  at elf/rtld.c:494
-  #3 _dl_start        at elf/rtld.c:581
+  #0 __brk
+  #1 _dl_sysdep_start
+  #2 _dl_start_final
+  #3 _dl_start
   #4 _start           in /lib64/ld-linux-x86-64.so.2
 
 disas @ rip:
@@ -207,11 +207,11 @@ rip = 0xffffffffaac3b7a0 <__x64_sys_brk>
 *(rdi+0x98) = user RSP = 0x7ffc110d9fb8
 
 bt (kernel frames):
-  #0 __x64_sys_brk          at mm/mmap.c:178
-  #1 x64_sys_call           (table dispatcher)
-  #2 do_syscall_x64         at arch/x86/entry/common.c:47
-  #3 do_syscall_64          at arch/x86/entry/common.c:78
-  #4 entry_SYSCALL_64       at arch/x86/entry/entry_64.S:121
+  #0 __x64_sys_brk
+  #1 x64_sys_call
+  #2 do_syscall_x64
+  #3 do_syscall_64
+  #4 entry_SYSCALL_64
   #5 <user RIP>             (returned from kernel via sysret)
 
 disas @ __x64_sys_brk:
@@ -261,10 +261,10 @@ rax = 0x0000555555572000   ← new break, kernel granted
 rdi = 0x0000555555572000
 
 bt:
-  #0 __brk          at sysdeps/unix/sysv/linux/brk_call.h:24
-  #1 __GI___sbrk    at misc/sbrk.c:59  (increment=135168 = 0x21000)
-  #2 __default_morecore  at malloc/morecore.c
-  #3 sysmalloc      at malloc/malloc.c
+  #0 __brk
+  #1 __GI___sbrk    (increment=135168 = 0x21000)
+  #2 __default_morecore
+  #3 sysmalloc
 ```
 
 #### Linux kernel side at `brk(curr+0x2000)`
