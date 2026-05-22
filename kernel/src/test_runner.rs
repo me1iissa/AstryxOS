@@ -15502,7 +15502,8 @@ fn test_sigsegv_handler() -> bool {
 // SIGSEGV therefore induced a kernel-mode #PF (error code = P|W = 0x3)
 // during signal-frame construction, which the IDT routed to
 // `BUGCHECK_KERNEL_PAGE_FAULT` — i.e. userspace could oops the kernel
-// (CWE-1037-class).
+// (CWE-754 Improper Check, CWE-20 Improper Input Validation on RSP,
+// CWE-617 Reachable Assertion).
 //
 // This test exercises `signal::is_user_writable_range` against the three
 // PTE states that arise in practice:
