@@ -1103,28 +1103,40 @@ pub fn pte_change_displaced_count() -> u64 {
 // phys handed out between prologue and epilogue?" timeline for the foreign
 // frame backing the canary slot at fault time.
 //
-// 4 Ki entries × 24 B = 96 KiB BSS, gated on `firefox-test` (the module).
-// Before the 2026-05-21 dynamic-heap fix the kernel-image bss_end had to
-// stay below the heap base at `phys 0x80_0000` (8 MiB) or the heap would
-// silently overlap BSS; the heap base is now computed past `__kernel_end`
-// in `mm/heap.rs::compute_heap_layout()` so heavy diagnostic feature
-// combinations no longer corrupt the free list.  Phase D's FREE_SHADOW
-// (1.5 MiB) is the largest contributor to BSS in this module; ALLOC_SHADOW
-// is intentionally sized at 1/16th of FREE_SHADOW.  A 4 Ki direct-mapped table hashes 64 frames per slot
-// in a 1 GiB QEMU configuration; the typical *most-recent* alloc working
-// set in the firefox-test sc≈1233 window is well under 4 Ki frames, so
-// per-slot collisions are exceptional.  When a collision occurs,
-// `ALLOC_SHADOW_DISPLACED` ticks, and a downstream operator can fall
-// back to the hashed `PROV_TABLE` ring for residual alloc history.
+// ## Sizing (Phase 10, 2026-05-22 widening)
 //
-// Per Intel SDM Vol. 3A §4.6 (paging-structure cache hierarchy), the
-// direct-map at `PHYS_OFF + 0x80_0000` backs the linked-list allocator's
-// arena — any BSS overlap would corrupt the very first 224-byte heap
-// allocation (the boot-time ATA driver init), which is precisely what
-// happens when Track K's BSS pushes total BSS past 8 MiB.  Keep this
-// constant small.
+// Pre-widening sizing was 4 Ki entries × 24 B = 96 KiB BSS.  Phase 10 of
+// the F3 diagnostic (long demo trial, sc ≈ 1233) measured 97 % displacement
+// saturation: `recorded = 38 394, displaced = 37 363`.  At that saturation
+// the ring's attribution power for any specific phys is essentially zero —
+// nearly every phys's `(caller_rip, tick)` has been overwritten by some
+// later allocation that aliased the same slot.
+//
+// Widening to 64 Ki entries (× 24 B = 1.5 MiB BSS) brings ALLOC_SHADOW into
+// symmetry with FREE_SHADOW (Phase D) and gives the same aliasing budget:
+// `64 Ki × 4 KiB = 256 MiB` of physical address space hashed collision-free,
+// degrading to ≤ 16-to-1 in a 4 GiB QEMU configuration.  This is the same
+// rationale captured in the FREE_SHADOW banner above — direct addressing
+// `pfn % SHADOW_SIZE` aliases pfn-multiples of 256 MiB, but the *most-recent*
+// alloc working set on the firefox-test demo path is dominated by churn in
+// the lower few hundred MiB (heap, anonymous mmap, kstacks), so aliasing
+// frames are rare and `ALLOC_SHADOW_DISPLACED` should stay near zero.
+//
+// BSS impact: +1 440 KiB (gated on `firefox-test`).  Default builds remain
+// byte-identical.  The 2026-05-21 dynamic-heap fix in
+// `mm/heap.rs::compute_heap_layout()` (computes the heap base past
+// `__kernel_end`) means BSS growth in diagnostic features no longer collides
+// with the allocator arena — the earlier 96 KiB cap was a band-aid for the
+// static-base heap, which has since been retired.
+//
+// Per Intel SDM Vol. 3A §4.10.5 (paging-structure cache coherence) and
+// CWE-908 (Use of Uninitialized Resource), naming the upstream allocator
+// of a frame that turns out to be use-after-recycle is the dispositive
+// evidence for the W215 class of bug; the ring is the substrate for that
+// attribution and must therefore have enough capacity to survive a multi-
+// second demo trial without being overwritten end-to-end.
 
-const ALLOC_SHADOW_SIZE: usize = 4096;
+const ALLOC_SHADOW_SIZE: usize = 65536;
 
 #[repr(C)]
 struct AllocShadowEntry {
