@@ -1303,6 +1303,89 @@ def _detect_staged_ff_variant(disk_dir: Path) -> dict:
     return out
 
 
+# Canonical (main-checkout) build/disk/ — used as a fallback for variant
+# detection when an agent worktree has no local build/disk/ but its
+# build/data.img is a symlink to the canonical build/data.img.  Mirrors
+# the same path used by the data.img auto-symlink in cmd_start.
+_CANONICAL_DISK_DIR = Path("/home/ubuntu/AstryxOS/build/disk")
+
+
+def _data_img_symlink_info(data_img: Path, wt_root: Path) -> dict:
+    """
+    Classify how `build/data.img` is materialised in this worktree.
+
+    Returns:
+      is_symlink: bool — os.path.islink(data_img)
+      target:    str|None — symlink target as written (may be relative)
+      resolved:  str|None — fully resolved real path (after symlinks)
+      target_outside_wt: bool — True when the resolved target lives outside
+        `wt_root` (i.e. mutating it would clobber a different worktree's or
+        the main checkout's data.img).  Conservative default False when we
+        cannot resolve.
+
+    Per POSIX symlink(7), st_mode on the link itself reports S_IFLNK; we
+    use os.path.islink for that classification and os.path.realpath to
+    follow the chain.  Symlink-to-symlink chains resolve to the terminal
+    target.  Hardlinks are not detected here because there is no portable
+    way to enumerate "files outside this worktree that share the same
+    inode" — agents that hardlink data.img into a worktree are on their
+    own; the symlink path is the documented one (see cmd_start banner).
+    """
+    out = {"is_symlink": False, "target": None, "resolved": None,
+           "target_outside_wt": False}
+    try:
+        out["is_symlink"] = os.path.islink(str(data_img))
+    except OSError:
+        return out
+    if out["is_symlink"]:
+        try:
+            out["target"] = os.readlink(str(data_img))
+        except OSError:
+            out["target"] = None
+    try:
+        out["resolved"] = os.path.realpath(str(data_img))
+    except OSError:
+        out["resolved"] = None
+    if out["resolved"]:
+        try:
+            wt_real = os.path.realpath(str(wt_root))
+            # commonpath raises ValueError on cross-drive paths (Windows);
+            # on Linux that path never trips for our absolute paths.
+            common = os.path.commonpath([out["resolved"], wt_real])
+            out["target_outside_wt"] = (common != wt_real)
+        except (ValueError, OSError):
+            out["target_outside_wt"] = False
+    return out
+
+
+def _resolve_effective_disk_dir(wt_root: Path, data_img: Path) -> Path:
+    """
+    Return the disk_dir that should be inspected for the FF-variant probe.
+
+    Prefer the worktree's own `build/disk/` when it exists.  When it does
+    not (typical for agent worktrees, which are .gitignored for the whole
+    `build/` tree) and `build/data.img` is a symlink to the canonical
+    image, fall back to the canonical `build/disk/` so the variant pin
+    can still observe the staged layout.  Otherwise return the worktree
+    path unchanged so callers' `.exists()` check fails the soft way.
+    """
+    local = wt_root / "build" / "disk"
+    if local.exists():
+        return local
+    sym = _data_img_symlink_info(data_img, wt_root)
+    if sym["is_symlink"] and sym["resolved"]:
+        # If the symlink target is inside the canonical AstryxOS build/, use
+        # the canonical disk_dir for probe inspection.  We never mutate it —
+        # the variant-pin regen path refuses to clobber shared targets.
+        canonical_data_img = "/home/ubuntu/AstryxOS/build/data.img"
+        try:
+            if os.path.realpath(canonical_data_img) == sym["resolved"]:
+                return _CANONICAL_DISK_DIR
+        except OSError:
+            pass
+    return local
+
+
 # Regex for the kernel's post-boot variant probe line.  Each "Ok(<size>)" /
 # "Err(<errcode>)" group reflects whether vfs::stat() succeeded for that path.
 # Example: "[FFTEST] FF binary probe: musl-132=Ok(795616) musl-esr=Err(NotFound) glibc=Err(NotFound)"
@@ -2318,10 +2401,24 @@ def cmd_start(args):
         "regen_triggered": False,
         "regen_ok": None,
         "regen_reason": None,
+        # D10 fix-it (PR #378 follow-up): when build/data.img is a symlink to
+        # a path outside this worktree, an in-place create-data-disk.sh --force
+        # would clobber the shared target (mkfs.fat overwrites the inode the
+        # symlink points to).  We refuse that and record the reason here so
+        # `events <sid>` / `status <sid>` make the inaction visible.  None
+        # when no refusal happened.
+        "regen_refused_reason": None,
+        "data_img_symlink": None,   # populated below when relevant
         "kernel_chosen": None,      # filled in by post-boot probe verifier
         "match": None,              # final verdict, when known
     }
-    _disk_dir = Path(wt.ROOT) / "build" / "disk"
+    # D10 fix-it: in worktrees the local build/disk/ is typically absent;
+    # if build/data.img is a symlink into the canonical tree, inspect that
+    # tree instead so the variant probe still resolves a family.  Read-only
+    # inspection — the regen path below has its own anti-clobber guard.
+    _disk_dir = _resolve_effective_disk_dir(Path(wt.ROOT), _data_img_path)
+    _data_img_symlink = _data_img_symlink_info(_data_img_path, Path(wt.ROOT))
+    _ff_variant_info["data_img_symlink"] = _data_img_symlink
     if not _data_img_missing:
         # Extra source directories whose compiled outputs land in build/disk/.
         # A source file newer than its compiled artifact inside build/disk/ will
@@ -2423,12 +2520,56 @@ def cmd_start(args):
         _ff_variant_info["regen_reason"] = (
             f"staged-family={_staged_family} != requested={_requested_variant}"
         )
-        if _no_regen:
+        # D10 fix-it: detect the "shared symlink" scenario before doing
+        # anything destructive.  scripts/create-data-disk.sh resolves
+        # ${BUILD_DIR}/data.img relative to ROOT_DIR=<script>/..; in an
+        # agent worktree that is <worktree>/build/data.img.  When that path
+        # is a symlink to /home/ubuntu/AstryxOS/build/data.img (or any
+        # target outside the worktree), `mkfs.fat -F 32 "${DATA_IMG}"`
+        # writes through the link and clobbers the shared image — taking
+        # every sibling agent's session down with it.  Refuse politely
+        # and tell the caller exactly what to do.
+        _shared_symlink = (
+            _data_img_symlink.get("is_symlink")
+            and _data_img_symlink.get("target_outside_wt")
+        )
+        if _shared_symlink and not _no_regen:
+            _target_disp = (_data_img_symlink.get("resolved")
+                            or _data_img_symlink.get("target") or "<unknown>")
+            _ff_variant_info["regen_refused_reason"] = (
+                f"data.img is a symlink to a shared target ({_target_disp}); "
+                "refusing to clobber via create-data-disk.sh --force. "
+                "Pass --no-regen-data-img to boot the staged variant as-is, "
+                "or run scripts/create-data-disk.sh in the canonical tree."
+            )
+            print(
+                "╔══════════════════════════════════════════════════════════════╗\n"
+                "║  Firefox variant mismatch — REFUSING auto re-stage           ║\n"
+                f"║  staged: {_staged_family:<10} requested: {_requested_variant:<28}║\n"
+                "║  build/data.img is a symlink to a shared target; an          ║\n"
+                "║  in-place re-stage would clobber sibling worktrees.          ║\n"
+                f"║  target: {_target_disp[:50]:<50}    ║\n"
+                "║  Either --no-regen-data-img (boot mismatched), or            ║\n"
+                "║  re-stage in the canonical tree before retrying.             ║\n"
+                "╚══════════════════════════════════════════════════════════════╝",
+                file=sys.stderr,
+            )
+            print(
+                f"[VARIANT-PIN] requested={_requested_variant} "
+                f"staged={_staged_family} action=refused-shared-symlink",
+                file=sys.stderr,
+            )
+        elif _no_regen:
             print(
                 "╔══════════════════════════════════════════════════════════════╗\n"
                 f"║  WARNING: staged FF variant ({_staged_family}) != requested ({_requested_variant})  ║\n"
                 "║  --no-regen-data-img set; booting mismatched image as-is.    ║\n"
                 "╚══════════════════════════════════════════════════════════════╝",
+                file=sys.stderr,
+            )
+            print(
+                f"[VARIANT-PIN] requested={_requested_variant} "
+                f"staged={_staged_family} action=no-regen-warned",
                 file=sys.stderr,
             )
         else:
@@ -2460,6 +2601,11 @@ def cmd_start(args):
                     f"(now {_ff_variant_info['staged_predicted']}).",
                     file=sys.stderr,
                 )
+                print(
+                    f"[VARIANT-PIN] requested={_requested_variant} "
+                    f"staged={_staged_family} action=restaged-ok",
+                    file=sys.stderr,
+                )
             else:
                 _tail = (_variant_regen.get("tail") or "")[-400:]
                 print(
@@ -2467,6 +2613,24 @@ def cmd_start(args):
                     f"║  rc={_variant_regen.get('rc')}, tail: {_tail!r:<48}",
                     file=sys.stderr,
                 )
+                print(
+                    f"[VARIANT-PIN] requested={_requested_variant} "
+                    f"staged={_staged_family} action=restage-failed",
+                    file=sys.stderr,
+                )
+    else:
+        # Match case: no mismatch detected.  Still emit one line so agents
+        # parsing the harness output always see the pin's decision (matches
+        # cleanly to grep '\[VARIANT-PIN\]').  Skipped when the staged
+        # family couldn't be determined (worktree without build/disk/ and
+        # no usable symlink fallback) to avoid asserting a match we can't
+        # justify — `staged_predicted: null` in the JSON tells that story.
+        if _staged_family is not None:
+            print(
+                f"[VARIANT-PIN] requested={_requested_variant} "
+                f"staged={_staged_family} action=match-no-op",
+                file=sys.stderr,
+            )
 
     kvm_arg: Optional[bool]
     no_kvm_flag = bool(getattr(args, "no_kvm", False))
@@ -2614,6 +2778,9 @@ def cmd_start(args):
         "regen_triggered": _ff_variant_info.get("regen_triggered", False),
         "regen_ok": _ff_variant_info.get("regen_ok"),
         "regen_reason": _ff_variant_info.get("regen_reason"),
+        # D10 fix-it (additive): None on the success path, populated when
+        # variant-pin refused to clobber a shared data.img symlink target.
+        "regen_refused_reason": _ff_variant_info.get("regen_refused_reason"),
     })
     # Spawn a detached verifier that tails the serial log for the kernel's
     # "[FFTEST] FF binary probe:" line, parses the chosen variant, updates
