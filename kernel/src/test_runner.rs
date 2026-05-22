@@ -2051,6 +2051,24 @@ pub fn run() -> ! {
     total += 1;
     if test_265_exec_resets_cleartid_and_robust_list() { passed += 1; }
 
+    // ── Test 266: execve(2) sets tls_base to new image PT_TLS TCB ───────
+    // Verifies the `exec_set_thread_tls_base` helper that `sys_exec`
+    // calls from step 5d to point the surviving thread's `tls_base`
+    // (and, via the companion `proc::write_fs_base` call at the
+    // `sys_exec` site, the CPU's `IA32_FS_BASE` MSR) at the new image's
+    // PT_TLS TCB virtual address.  Without this step the SYSRETQ into
+    // the new image would carry the previous image's FS.base into user
+    // mode, but the previous image's TLS pages have already been freed
+    // at the `free_vm_space(old)` step — opening a CWE-908
+    // Use-of-Uninitialised-Resource window for any TLS-relative access
+    // in the new image's `_start` / dynamic-linker startup / early
+    // `__thread` constructors / stack-protector epilogues at
+    // `%fs:0x28`.  Refs: Intel SDM Vol. 3A §3.4.4.1 (IA32_FS_BASE);
+    // Vol. 2B (SYSCALL/SYSRETQ); execve(2); arch_prctl(2); clone(2);
+    // System V AMD64 ABI §3.4.2/§6.4; ELF gABI §3.5.
+    total += 1;
+    if test_266_exec_sets_fs_base_to_new_tls() { passed += 1; }
+
     // ── Tests 261-263: native-core hardening (cycle 3) ──────────────────
     // Gated on `native-core-tests` feature: the three native-core tests
     // (page_ref_dec CAS underflow, OB refcount integration, scheduler
@@ -36056,6 +36074,142 @@ fn test_265_exec_resets_cleartid_and_robust_list() -> bool {
 
     if ok {
         test_pass!("execve(2) resets clear_child_tid + robust_list");
+    }
+    ok
+}
+
+// ── Test 266: execve(2) sets tls_base to the new image's PT_TLS TCB ─────────
+//
+// Per `execve(2)` the new image's per-thread state — including the TLS
+// pointer (`%fs:` segment base, `IA32_FS_BASE` MSR on x86-64) — must be
+// established before the kernel returns to user mode at the new entry
+// point.  SYSCALL on x86-64 does NOT modify FS.base (Intel SDM Vol. 2B
+// `SYSCALL`/`SYSRETQ`), so the kernel must explicitly point FS.base at
+// the new image's PT_TLS TCB.  Otherwise the launcher's stale TCB VA
+// would survive into the new image; that VA's backing pages have
+// already been freed at the `free_vm_space(old)` step, and any
+// TLS-relative access by the new `_start` (or by an early constructor
+// using `__thread`) — including stack-protector epilogues at
+// `%fs:0x28` — would read uninitialised or reused physical memory.
+//
+// This test exercises the `exec_set_thread_tls_base` helper that
+// `sys_exec` calls from step 5d (between `exec_reset_thread_exit_slots`
+// and the SYSRET-frame rewrite).  The full `sys_exec` path needs a
+// userspace VmSpace which the kernel-only test runner does not have;
+// the helper is testable in isolation, mirroring the test-265 sibling.
+//
+// References:
+//   * Intel SDM Vol. 3A §3.4.4 / §3.4.4.1 — IA32_FS_BASE MSR
+//   * Intel SDM Vol. 2B — SYSCALL / SYSRETQ (no MSR side effects)
+//   * `execve(2)` — process-image replacement
+//   * `arch_prctl(2)` — ARCH_SET_FS / ARCH_GET_FS
+//   * `clone(2)` — CLONE_SETTLS interaction
+//   * System V AMD64 ABI §3.4.2 — Thread-Local Storage variant II
+//   * System V AMD64 ABI §6.4 — stack protector at `%fs:0x28`
+//   * ELF gABI §3.5 — Thread-local storage
+//   * CWE-908 (Use of Uninitialized Resource)
+fn test_266_exec_sets_fs_base_to_new_tls() -> bool {
+    test_header!("execve(2) sets tls_base to new image PT_TLS TCB");
+
+    let tid = crate::proc::current_tid();
+
+    // Stash whatever the kernel-test-runner thread already has in
+    // `tls_base` so the assertion below is purely about the helper's
+    // behaviour, and so we leave THREAD_TABLE indistinguishable from
+    // how we found it (no leakage into subsequent tests).
+    let saved_tls_base = {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        match threads.iter().find(|t| t.tid == tid) {
+            Some(t) => t.tls_base,
+            None => {
+                test_fail!("test266",
+                    "current_tid={} not present in THREAD_TABLE — test \
+                     prerequisite broken", tid);
+                return false;
+            }
+        }
+    };
+
+    // Plant a sentinel "stale launcher TCB" value that is obviously not
+    // a plausible default and not zero, to simulate the launcher's
+    // `tls_base` surviving into the new image's thread slot pre-fix.
+    const SENTINEL_OLD_TCB: u64 = 0xdead_beef_0000_d100;
+    // The "new image TCB VA" used by `exec_set_thread_tls_base` in
+    // the real exec path is `result.tls_base` from `load_elf_with_args`
+    // (see `proc/elf.rs` PT_TLS layout).  Use a distinct sentinel here.
+    const SENTINEL_NEW_TCB: u64 = 0x0000_7fff_ffe0_0c00;
+
+    // Plant the "stale" value.
+    {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+            t.tls_base = SENTINEL_OLD_TCB;
+        }
+    }
+    {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        let t = threads.iter().find(|t| t.tid == tid).unwrap();
+        if t.tls_base != SENTINEL_OLD_TCB {
+            test_fail!("test266",
+                "Pre-call plant did not land: tls_base={:#x}", t.tls_base);
+            return false;
+        }
+    }
+    test_println!("  Pre-call plant: tls_base={:#x} ✓", SENTINEL_OLD_TCB);
+
+    // Exercise the helper that `sys_exec` calls.
+    crate::syscall::exec_set_thread_tls_base(tid, SENTINEL_NEW_TCB);
+
+    // The helper must have replaced the planted stale value.
+    let post_tls_base = {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        let t = threads.iter().find(|t| t.tid == tid).unwrap();
+        t.tls_base
+    };
+
+    let mut ok = true;
+    if post_tls_base != SENTINEL_NEW_TCB {
+        test_fail!("test266",
+            "tls_base not set to new TCB: got {:#x}, expected {:#x} \
+             (execve(2) cleanslate: FS.base must point at new image PT_TLS)",
+            post_tls_base, SENTINEL_NEW_TCB);
+        ok = false;
+    } else {
+        test_println!("  tls_base set to new TCB {:#x} ✓", SENTINEL_NEW_TCB);
+    }
+
+    // Edge case: a static binary with no PT_TLS segment loads with
+    // `result.tls_base == 0`.  The helper must accept and persist that
+    // zero (mirroring the unconditional WRMSR on the initial
+    // `enter_user_mode` path; without it, a CLONE_VM child with no TLS
+    // would inherit a stale ancestor FS.base).
+    crate::syscall::exec_set_thread_tls_base(tid, 0);
+    let post_zero = {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        let t = threads.iter().find(|t| t.tid == tid).unwrap();
+        t.tls_base
+    };
+    if post_zero != 0 {
+        test_fail!("test266",
+            "tls_base not set to 0 for static-binary case: got {:#x} \
+             (helper must accept 0 — see proc/usermode.rs unconditional \
+             WRMSR rationale)", post_zero);
+        ok = false;
+    } else {
+        test_println!("  tls_base set to 0 (static binary, no PT_TLS) ✓");
+    }
+
+    // Restore the prior value so the runner thread leaves the table in
+    // the state it found it.
+    {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+            t.tls_base = saved_tls_base;
+        }
+    }
+
+    if ok {
+        test_pass!("execve(2) sets tls_base to new image PT_TLS TCB");
     }
     ok
 }
