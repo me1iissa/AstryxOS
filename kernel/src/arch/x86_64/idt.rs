@@ -687,6 +687,37 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
 
         // If the fault came from Ring 3, try to deliver SIGSEGV first.
         if error_code & 4 != 0 {
+            // D8 fault-time TLS-slot dump (sc=1171 Z1 disposition).
+            // Content-gated on (cr2=0x20, opcode `49 8b 5e 20`, pid=1)
+            // per docs/SC1171_PSE_END_TO_END_2026-05-22.md.  Runs BEFORE
+            // SIGSEGV delivery so the dump captures every matching
+            // fault regardless of whether the process has a SEGV handler
+            // installed.  Single-shot (`D8_FIRE_MAX = 1`), no PT mutation.
+            // See `kernel/src/subsys/linux/d8_fault_tls_dump.rs` and
+            // Intel SDM Vol. 3A 3.4.4 (IA32_FS_BASE).
+            #[cfg(feature = "d8-tls-fault-dump")]
+            {
+                let base = frame as *const InterruptFrame as *const u64;
+                let (rax_, rcx_, rdx_, rsi_, rdi_, r8_, r9_, r10_, r11_,
+                     rbx_, rbp_, r12_, r13_, r14_, r15_) = unsafe {(
+                    *base.sub(2),  *base.sub(3),  *base.sub(4),
+                    *base.sub(5),  *base.sub(6),  *base.sub(7),
+                    *base.sub(8),  *base.sub(9),  *base.sub(10),
+                    *base.sub(11), *base.sub(12), *base.sub(13),
+                    *base.sub(14), *base.sub(15), *base.sub(16),
+                )};
+                let pid_ = crate::proc::current_pid_lockless();
+                let tid_ = crate::proc::current_tid();
+                crate::subsys::linux::d8_fault_tls_dump::try_dump_at_fault(
+                    cr2, frame.rip,
+                    rax_, rbx_, rcx_, rdx_,
+                    rsi_, rdi_, rbp_, frame.rsp,
+                    r8_, r9_, r10_, r11_,
+                    r12_, r13_, r14_, r15_,
+                    pid_, tid_,
+                );
+            }
+
             let delivered = unsafe {
                 crate::signal::deliver_sigsegv_from_isr(
                     cr2,
