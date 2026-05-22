@@ -342,5 +342,54 @@ pub fn try_dump_at_fault(
         );
     }
 
+    // ── D10: HEAP-OBJECT phys-provenance (Phase-2-E closer) ──
+    //
+    // The TLS slot at `[fs:-0x18]` holds a pointer to a heap-resident
+    // `RegisteredThread` object; Mozilla's `GetThreadRegistrationTime`
+    // loads that pointer into `r14` and then derefs `0x20(%r14)` (the
+    // `mThreadInfo` field).  Phase 2-A/B/C/D cleanly excluded heap-alloc
+    // zero-fill, ctor codegen elision, signal preemption, and
+    // unregistered-caller framings.  The one residual is whether the
+    // heap *page* itself (not the TLS slot's page) was the target of a
+    // recent `pmm::free_page` / `pmm::alloc_page` recycle that left the
+    // outer object with a partial-zero `+0x38` field.
+    //
+    // Block above dumped `FREE_SHADOW` / `ALLOC_SHADOW` on `tls_phys`
+    // — the page backing the TLS slot itself.  Block below resolves the
+    // *value* of the TLS slot as a user VA (the heap-object pointer) and
+    // dumps the same shadows on that page's phys, naming the most recent
+    // free/alloc caller RIPs for the heap frame.  Per saga-discipline
+    // Rule 1 (phys-provenance first), this completes the W215/W216
+    // aliasing-class falsification surface for the sc=1171 fingerprint.
+    //
+    // Refs: Intel SDM Vol. 3A §4.6 (paging address translation);
+    // POSIX `mmap(2)` (anonymous-mapping zero-fill); CWE-908
+    // (Use of Uninitialized Resource).
+    if let Some(v) = tls_val {
+        if v != 0 {
+            if let Some(heap_phys) = crate::mm::vmm::virt_to_phys_in(cr3, v) {
+                crate::serial_println!(
+                    "[D10/HEAP-OBJ-PROV] tls_val={:#018x} heap_phys={:#x}",
+                    v, heap_phys,
+                );
+                crate::mm::w215_diag::dump_free_shadow_for_phys(heap_phys);
+                crate::mm::w215_diag::dump_alloc_shadow_for_phys(heap_phys);
+            } else {
+                crate::serial_println!(
+                    "[D10/HEAP-OBJ-PROV] tls_val={:#018x} heap_phys=? (unmapped under cr3={:#x})",
+                    v, cr3,
+                );
+            }
+        } else {
+            crate::serial_println!(
+                "[D10/HEAP-OBJ-PROV] tls_val=0 — no heap pointer to resolve",
+            );
+        }
+    } else {
+        crate::serial_println!(
+            "[D10/HEAP-OBJ-PROV] tls_val=? (slot unreadable, see earlier dump)",
+        );
+    }
+
     crate::serial_println!("[D8/FAULT-DUMP] end pid={} tid={}", pid, tid);
 }
