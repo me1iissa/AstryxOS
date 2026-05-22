@@ -533,9 +533,19 @@ const KERNEL_STACK_SIZE: u64 = (KERNEL_STACK_PAGES * 4096) as u64;
 pub const KERNEL_STACK_PAGES_PUB: usize = KERNEL_STACK_PAGES;
 
 /// Allocate a kernel stack, checking the dead-stack cache first (NT pattern).
-/// Returns (stack_base_virt, stack_top_virt).
+/// Returns `(stack_base_virt, stack_top_virt)`.
+///
+/// The actual span is always `stack_top - stack_base`.  Callers MUST stamp
+/// `Thread.kernel_stack_size` with that computed span (NOT the compile-time
+/// `KERNEL_STACK_SIZE` constant) so that bound checks and stack-depth
+/// accounting in `sched::schedule` and the syscall-trace path stay honest
+/// when the PMM-fragmented emergency-fallback path returns a 4 KiB region.
+/// Stamping the constant unconditionally produced STACK_CANARY_CORRUPT on
+/// emergency threads — see PR #391 diagnostic and the kstack-honesty fix.
 fn alloc_kernel_stack() -> Option<(u64, u64)> {
     // Try the dead-stack cache first — avoids PMM allocator overhead.
+    // Cached stacks always carry the full KERNEL_STACK_SIZE span; the cache
+    // never holds emergency 4 KiB fallbacks (see `sched::push_dead_stack`).
     if let Some(cached_base) = crate::sched::pop_dead_stack() {
         write_stack_canary(cached_base);
         return Some((cached_base, cached_base + KERNEL_STACK_SIZE));
@@ -548,33 +558,20 @@ fn alloc_kernel_stack() -> Option<(u64, u64)> {
         return Some((stack_base, stack_top));
     }
     // Contiguous allocation failed (PMM fragmented by page cache).
-    // Fall back to allocating individual pages. Each page is at a different
-    // physical address but accessed via KERNEL_VIRT_OFFSET + phys (which is
-    // always mapped via the higher-half PML4 entries).
-    // For the kernel stack, we need the pages to be VIRTUALLY contiguous.
-    // Since each `KERNEL_VIRT_OFFSET + phys_page` maps independently and
-    // the kernel uses the higher-half mapping, individual pages work IF they
-    // happen to be placed at contiguous physical addresses (unlikely after
-    // fragmentation). Instead, use a single page as a minimal stack.
+    // Fall back to a single 4 KiB page.  Kernel paths running on this stack
+    // MUST keep depth ≤ 4 KiB — that is enforced by callers stamping the
+    // returned span (4 KiB) into `Thread.kernel_stack_size`, which the
+    // syscall-trace and canary-check paths consult before any depth math.
     //
-    // Contiguous allocation failed. Allocate 4 individual pages (16KB) and
-    // use the FIRST page as stack base. Each page is independently mapped via
-    // KERNEL_VIRT_OFFSET but NOT virtually contiguous. We use only the first
-    // page (4KB) as the actual stack, which is enough for user_mode_bootstrap.
-    // The other 3 pages are "guard" space — wasted but prevents the stack from
-    // growing into unrelated memory.
-    //
-    // A proper fix would be vmalloc-style virtual mapping, but this unblocks Firefox.
+    // A proper fix would be vmalloc-style virtual mapping; that is tracked
+    // separately and intentionally out of scope for the size-honesty fix.
     if let Some(phys) = crate::mm::pmm::alloc_page() {
         let stack_base = KERNEL_VIRT_OFFSET + phys;
-        let stack_top = stack_base + 0x1000; // 4KB usable
+        let stack_top = stack_base + 0x1000; // 4 KiB usable
         write_stack_canary(stack_base);
         // Record in the emergency-stack ring so the canary-corruption
-        // diagnostic in `sched::schedule` can attribute a later overflow
-        // to "ran on the 4 KiB emergency fallback".  The caller stamps
-        // `kernel_stack_size = KERNEL_STACK_SIZE` (256 KiB) regardless,
-        // so the Thread itself does NOT carry the real span — the ring
-        // is the only attribution channel.
+        // diagnostic in `sched::schedule` retains its attribution channel
+        // even after callers stamp the real (4 KiB) span on the Thread.
         record_emergency_kstack(stack_base);
         crate::serial_println!(
             "[KSTACK/EMERGENCY] base={:#x} size=4K (PMM fragmented)",
@@ -583,6 +580,24 @@ fn alloc_kernel_stack() -> Option<(u64, u64)> {
         return Some((stack_base, stack_top));
     }
     None
+}
+
+/// Emit a one-shot diagnostic line if `stack_base` was just handed out from
+/// the 4 KiB emergency-fallback path.  Called by every `alloc_kernel_stack`
+/// consumer immediately after stamping the Thread, so the operator can see
+/// which (pid, tid) is running on the constrained stack.  Per Intel SDM
+/// Vol 3A §6.2 (stack-fault exceptions) and the x86_64 SysV ABI §3.4.1
+/// (stack growth direction), kernel paths on a 4 KiB stack must keep total
+/// frame depth ≤ 4 KiB or risk overwriting the bottom-of-stack canary.
+#[inline]
+fn note_if_emergency_kstack(pid: Pid, tid: Tid, stack_base: u64, span: u64) {
+    if span < KERNEL_STACK_SIZE && was_emergency_kstack(stack_base) {
+        crate::serial_println!(
+            "[KSTACK/EMERGENCY-THREAD] tid={} pid={} base={:#x} size={}K \
+             — kernel paths must keep depth <= {}K",
+            tid, pid, stack_base, span / 1024, span / 1024,
+        );
+    }
 }
 
 /// Magic value written at the bottom of every kernel stack for overflow
@@ -939,6 +954,10 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
     // Allocate kernel stack (tries dead-stack cache first, then PMM).
     let (stack_base, stack_top) = alloc_kernel_stack()
         .expect("Failed to allocate kernel stack");
+    // Stamp the REAL span on the Thread — not KERNEL_STACK_SIZE — so the
+    // 4 KiB emergency-fallback case can't trick depth/bound math into
+    // reading past the canary.  See `alloc_kernel_stack` doc-comment.
+    let kstack_span = stack_top - stack_base;
 
     let cr3 = crate::mm::vmm::get_cr3();
 
@@ -1014,7 +1033,7 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
         state: initial_state,
         context: alloc::boxed::Box::new(context),
         kernel_stack_base: stack_base,
-        kernel_stack_size: KERNEL_STACK_SIZE,
+        kernel_stack_size: kstack_span,
         wake_tick: u64::MAX,
         name: thread_name,
         exit_code: 0,
@@ -1045,6 +1064,7 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
     proc_metrics::register(pid);
 
     crate::serial_println!("[PROC] Created kernel process '{}' PID {} TID {}", name, pid, tid);
+    note_if_emergency_kstack(pid, tid, stack_base, kstack_span);
     pid
 }
 
@@ -1053,6 +1073,7 @@ pub fn create_thread(pid: Pid, name: &str, entry_point: u64) -> Option<Tid> {
     let tid = NEXT_TID.fetch_add(1, Ordering::Relaxed);
 
     let (stack_base, stack_top) = alloc_kernel_stack()?;
+    let kstack_span = stack_top - stack_base; // honest span (may be 4 KiB)
 
     let cr3 = {
         let procs = PROCESS_TABLE.lock();
@@ -1081,7 +1102,7 @@ pub fn create_thread(pid: Pid, name: &str, entry_point: u64) -> Option<Tid> {
         state: ThreadState::Ready,
         context: alloc::boxed::Box::new(context),
         kernel_stack_base: stack_base,
-        kernel_stack_size: KERNEL_STACK_SIZE,
+        kernel_stack_size: kstack_span,
         wake_tick: u64::MAX,
         name: thread_name,
         exit_code: 0,
@@ -1113,6 +1134,7 @@ pub fn create_thread(pid: Pid, name: &str, entry_point: u64) -> Option<Tid> {
         .map(|p| p.threads.push(tid));
 
     crate::serial_println!("[PROC] Created thread '{}' TID {} in PID {}", name, tid, pid);
+    note_if_emergency_kstack(pid, tid, stack_base, kstack_span);
     Some(tid)
 }
 
@@ -1124,6 +1146,7 @@ pub fn create_thread_blocked(pid: Pid, name: &str, entry_point: u64) -> Option<T
     let tid = NEXT_TID.fetch_add(1, Ordering::Relaxed);
 
     let (stack_base, stack_top) = alloc_kernel_stack()?;
+    let kstack_span = stack_top - stack_base; // honest span (may be 4 KiB)
 
     let cr3 = {
         let procs = PROCESS_TABLE.lock();
@@ -1152,7 +1175,7 @@ pub fn create_thread_blocked(pid: Pid, name: &str, entry_point: u64) -> Option<T
         state: ThreadState::Blocked, // caller must mark Ready when prepared
         context: alloc::boxed::Box::new(context),
         kernel_stack_base: stack_base,
-        kernel_stack_size: KERNEL_STACK_SIZE,
+        kernel_stack_size: kstack_span,
         wake_tick: u64::MAX, // indefinite — caller marks Ready explicitly
         name: thread_name,
         exit_code: 0,
@@ -1184,6 +1207,7 @@ pub fn create_thread_blocked(pid: Pid, name: &str, entry_point: u64) -> Option<T
         .map(|p| p.threads.push(tid));
 
     crate::serial_println!("[PROC] Created thread (blocked) '{}' TID {} in PID {}", name, tid, pid);
+    note_if_emergency_kstack(pid, tid, stack_base, kstack_span);
     Some(tid)
 }
 pub fn exit_thread(exit_code: i64) {
@@ -2495,6 +2519,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
 
     // Allocate kernel stack for the child (higher-half virtual address).
     let (stack_base, stack_top) = alloc_kernel_stack()?;
+    let kstack_span = stack_top - stack_base; // honest span (may be 4 KiB)
 
     // Copy parent's file descriptors, CWD, and security credentials.
     let (fds, cwd, parent_name, parent_uid, parent_gid, parent_euid, parent_egid,
@@ -2682,7 +2707,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
         state: ThreadState::Blocked,
         context: alloc::boxed::Box::new(context),
         kernel_stack_base: stack_base,
-        kernel_stack_size: KERNEL_STACK_SIZE,
+        kernel_stack_size: kstack_span,
         wake_tick: u64::MAX,
         name: thread_name,
         exit_code: 0,
@@ -2722,6 +2747,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
         "[PROC] fork: child PID {} TID {} (parent PID {}, CoW={})",
         child_pid, child_tid, parent_pid, user_rip != 0
     );
+    note_if_emergency_kstack(child_pid, child_tid, stack_base, kstack_span);
 
     Some((child_pid, child_tid))
 }
@@ -2758,6 +2784,7 @@ pub fn fork_process_share_vm(
     // Allocate a fresh kernel stack for the child.  Kernel stacks are never
     // shared — only user-mode memory follows `CLONE_VM`.
     let (stack_base, stack_top) = alloc_kernel_stack()?;
+    let kstack_span = stack_top - stack_base; // honest span (may be 4 KiB)
 
     // Copy parent's file descriptors, CWD, and security credentials.
     // Per clone(2)/clone3(2):
@@ -2908,7 +2935,7 @@ pub fn fork_process_share_vm(
         state: ThreadState::Blocked,
         context: alloc::boxed::Box::new(context),
         kernel_stack_base: stack_base,
-        kernel_stack_size: KERNEL_STACK_SIZE,
+        kernel_stack_size: kstack_span,
         wake_tick: u64::MAX,
         name: thread_name,
         exit_code: 0,
@@ -2966,6 +2993,7 @@ pub fn fork_process_share_vm(
         "[PROC] fork_share_vm: child PID {} TID {} (parent PID {} CR3={:#x}, shared)",
         child_pid, child_tid, parent_pid, parent_cr3
     );
+    note_if_emergency_kstack(child_pid, child_tid, stack_base, kstack_span);
 
     // VFORK/CHILD-STACK diagnostic — record the child's initial user RSP at
     // *clone-time*.  The value here is the parent-frame RSP as captured by
@@ -3481,6 +3509,7 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
     let child_tid = NEXT_TID.fetch_add(1, Ordering::Relaxed);
 
     let (stack_base, stack_top) = alloc_kernel_stack()?;
+    let kstack_span = stack_top - stack_base; // honest span (may be 4 KiB)
 
     // Copy parent's file descriptors and credentials.
     let (fds, cwd, parent_name, parent_cr3, parent_tls_base,
@@ -3621,7 +3650,7 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
         state: ThreadState::Ready, // Ready immediately (parent blocks itself)
         context: alloc::boxed::Box::new(context),
         kernel_stack_base: stack_base,
-        kernel_stack_size: KERNEL_STACK_SIZE,
+        kernel_stack_size: kstack_span,
         wake_tick: u64::MAX,
         name: thread_name,
         exit_code: 0,
@@ -3653,6 +3682,7 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
     PROCESS_TABLE.lock().push(child_proc);
     THREAD_TABLE.lock().push(child_thread);
     proc_metrics::register(child_pid);
+    note_if_emergency_kstack(child_pid, child_tid, stack_base, kstack_span);
 
     Some((child_pid, child_tid))
 }
