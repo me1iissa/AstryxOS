@@ -119,13 +119,12 @@ const D8_TLS_SLOT_OFFSET: u64 = 0x18;
 /// Vol. 3A §4.6, an 8-byte access straddles only when
 /// `(addr & 0xFFF) > 0x1000 - 8`; in that case `None` is returned.
 fn read_user_qword(addr: u64) -> Option<(u64, u64)> {
-    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
     if !crate::syscall::validate_user_ptr(addr, 8) { return None; }
     if (addr & 0xFFF) > 0x1000 - 8 { return None; }
     let cr3 = crate::mm::vmm::get_cr3();
     let phys = crate::mm::vmm::virt_to_phys_in(cr3, addr)?;
     let val = unsafe {
-        core::ptr::read_volatile((PHYS_OFF + phys) as *const u64)
+        core::ptr::read_volatile((crate::mm::vmm::PHYS_OFF + phys) as *const u64)
     };
     Some((val, phys))
 }
@@ -223,9 +222,16 @@ pub fn try_dump_at_fault(
     // this is the value that turned the early-return into the slow
     // path.  Zero ⇒ Z1 falsified.  Non-zero ⇒ Z1 candidate.
     if fs_base < D8_TLS_SLOT_OFFSET {
+        // Emit shadow totals before bailing so a post-processor sees how
+        // many free/alloc events were recorded prior to the fault; helps
+        // disambiguate "no provenance because rings were empty" from
+        // "no provenance because we returned early before lookup".
+        let fr = crate::mm::w215_diag::free_shadow_recorded_count();
+        let ar = crate::mm::w215_diag::alloc_shadow_recorded_count();
         crate::serial_println!(
-            "[D8/FAULT-DUMP] tls_slot fs_base_too_small fs_base={:#x}",
-            fs_base,
+            "[D8/FAULT-DUMP] tls_slot fs_base_too_small fs_base={:#x} \
+             free_recorded={} alloc_recorded={}",
+            fs_base, fr, ar,
         );
         return;
     }
@@ -253,19 +259,63 @@ pub fn try_dump_at_fault(
     // recycled heap arena (non-zero pointer-shaped values) vs a
     // freshly-zeroed page (all zeros).  Per ELF gABI §5.2 the entire
     // PT_TLS BSS tail should read zero on first access.
-    for q in (-8i64)..8i64 {
+    //
+    // Emitted as a single multi-line `serial_println!` so the 16 rows
+    // cannot be interleaved with output from a concurrent CPU's serial
+    // writer (the underlying serial layer serialises per-call but does
+    // not lock across separate `serial_println!` invocations).
+    //
+    // `Some(0)` is encoded as `0x0000000000000000`; `None` (read failed
+    // — page not mapped under the current CR3) is encoded as `?` so the
+    // post-processor can distinguish "zero value" from "unreadable".
+    let mut vals: [Option<u64>; 16] = [None; 16];
+    for (idx, q) in (-8i64..8i64).enumerate() {
         let va = (fs_base as i64 + q * 8) as u64;
-        match read_user_qword(va) {
-            Some((v, _)) => crate::serial_println!(
-                "[D8/FAULT-DUMP] tls_dump fs_base{}{:#x}: {:#018x}",
-                if q < 0 { "-" } else { "+" }, (q * 8).unsigned_abs(), v,
-            ),
-            None => crate::serial_println!(
-                "[D8/FAULT-DUMP] tls_dump fs_base{}{:#x}: ?",
-                if q < 0 { "-" } else { "+" }, (q * 8).unsigned_abs(),
-            ),
-        }
+        vals[idx] = read_user_qword(va).map(|(v, _)| v);
     }
+    let fmt = |o: Option<u64>| -> [u8; 18] {
+        // 18 chars: "0x" + 16 hex digits, or "?" right-padded.  Returned
+        // as a stack array so the closure has no allocation footprint.
+        let mut buf = [b' '; 18];
+        match o {
+            Some(v) => {
+                buf[0] = b'0'; buf[1] = b'x';
+                for i in 0..16 {
+                    let nyb = ((v >> (60 - i * 4)) & 0xf) as u8;
+                    buf[2 + i] = if nyb < 10 { b'0' + nyb } else { b'a' + nyb - 10 };
+                }
+            }
+            None => { buf[0] = b'?'; }
+        }
+        buf
+    };
+    // Convert to &str via from_utf8_unchecked: all bytes above are ASCII
+    // hex / space / '?' / 'x' so UTF-8-validity holds by construction.
+    let s: [[u8; 18]; 16] = core::array::from_fn(|i| fmt(vals[i]));
+    let r: [&str; 16] = core::array::from_fn(|i| {
+        // SAFETY: `fmt` only writes ASCII bytes.
+        unsafe { core::str::from_utf8_unchecked(&s[i]) }
+    });
+    crate::serial_println!(
+        "[D8/FAULT-DUMP] tls_dump fs_base-0x40: {}\n\
+         [D8/FAULT-DUMP] tls_dump fs_base-0x38: {}\n\
+         [D8/FAULT-DUMP] tls_dump fs_base-0x30: {}\n\
+         [D8/FAULT-DUMP] tls_dump fs_base-0x28: {}\n\
+         [D8/FAULT-DUMP] tls_dump fs_base-0x20: {}\n\
+         [D8/FAULT-DUMP] tls_dump fs_base-0x18: {}\n\
+         [D8/FAULT-DUMP] tls_dump fs_base-0x10: {}\n\
+         [D8/FAULT-DUMP] tls_dump fs_base-0x8:  {}\n\
+         [D8/FAULT-DUMP] tls_dump fs_base+0x0:  {}\n\
+         [D8/FAULT-DUMP] tls_dump fs_base+0x8:  {}\n\
+         [D8/FAULT-DUMP] tls_dump fs_base+0x10: {}\n\
+         [D8/FAULT-DUMP] tls_dump fs_base+0x18: {}\n\
+         [D8/FAULT-DUMP] tls_dump fs_base+0x20: {}\n\
+         [D8/FAULT-DUMP] tls_dump fs_base+0x28: {}\n\
+         [D8/FAULT-DUMP] tls_dump fs_base+0x30: {}\n\
+         [D8/FAULT-DUMP] tls_dump fs_base+0x38: {}",
+        r[0], r[1], r[2],  r[3],  r[4],  r[5],  r[6],  r[7],
+        r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15],
+    );
 
     // ── Phys-frame provenance: FREE_SHADOW + ALLOC_SHADOW ──
     // Both rings are direct-addressed by `pfn & (SIZE-1)`, so a hit
