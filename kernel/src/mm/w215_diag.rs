@@ -873,22 +873,39 @@ pub fn free_shadow_displaced_count() -> u64 {
 // All counters / rings are `firefox-test`-gated; default builds remain
 // byte-identical.
 
-/// Lower bound of the user-stack PTE-change ring window.  Covers the entire
-/// upper 2 MiB of canonical user space — generous enough to capture every
-/// known stack VMA the AstryxOS Linux personality produces (main thread
-/// initial stack, vfork helper stacks at `0x7fff_ffef_…`, clone-child
-/// thread stacks the syscalls assign in the same region).  See
-/// `proc/usermode.rs::map_initial_stack` for the main-thread VA.
-pub const USER_STACK_RING_LO: u64 = 0x0000_7fff_ffe0_0000;
+/// Lower bound of the PTE-change ring window (D13 widening, 2026-05-22).
+///
+/// Originally `0x0000_7fff_ffe0_0000` — the top 2 MiB of canonical user space,
+/// chosen to cover the main-thread initial stack + vfork helper stacks.  D12
+/// (sc=201 glibc FILE._lock NULL-deref, 2026-05-22) demonstrated the
+/// restriction was diagnostically fatal: the corrupted frame lived at
+/// `0x7effd9a21020` (a glibc malloc-arena heap page well below the stack
+/// window), so `pte_change_record` was a no-op for every PTE event on the
+/// faulting page and the ring could not name the writer.
+///
+/// D13 widens the filter to the full canonical user VA range (skipping the
+/// nullptr page at 0).  Per Intel SDM Vol. 3A §4.6 user VA covers
+/// `[0, 0x0000_8000_0000_0000)`; we admit any user-VA PTE change.  The ring
+/// SIZE is unchanged (1024 slots — see [`USER_STACK_PTE_RING_SIZE`] below)
+/// to keep BSS bounded, so collisions are now expected and observable via
+/// [`PTE_CHANGE_DISPLACED`].  Most-recent-write-wins per slot; for a saga
+/// in flight the dispatcher cross-checks the ring's `tick` field against
+/// the fault tick to confirm freshness.  This is a *diagnostic-only* tradeoff
+/// gated under `firefox-test`; default builds remain byte-identical.
+pub const USER_STACK_RING_LO: u64 = 0x0000_0000_0000_1000;
 
 /// Upper (exclusive) bound — top of canonical lower-half user address space.
 pub const USER_STACK_RING_HI: u64 = 0x0000_8000_0000_0000;
 
-/// Number of entries in the user-stack PTE-change ring.  Direct addressing
-/// over `(va >> 12)` means the window holds at most
-/// `(HI - LO) / 4 KiB = 0x200 == 512` distinct 4 KiB-aligned VAs; 1024
-/// gives 2× headroom for hash collisions to be effectively impossible
-/// without bloating BSS (1024 × 48 B = 48 KiB).
+/// Number of entries in the PTE-change ring.  Direct addressing over
+/// `(va >> 12)` mod the size.  Pre-D13 the window covered only 2 MiB (512
+/// 4 KiB pages, so 1024 slots gave 2× headroom and effectively zero
+/// collisions); post-D13 the window covers the full 128 TiB canonical user
+/// VA, so collisions are unavoidable at this size — the ring is a
+/// most-recent-write-wins cache rather than a complete record.  Bumping to
+/// e.g. 64 Ki slots (3 MiB BSS) would not eliminate aliasing either
+/// (`2^35 PFNs >> 2^16`), so we keep the small footprint and rely on the
+/// `tick` freshness cross-check at dump time.  See module banner.
 const USER_STACK_PTE_RING_SIZE: usize = 1024;
 
 /// PTE-change kind codes.
