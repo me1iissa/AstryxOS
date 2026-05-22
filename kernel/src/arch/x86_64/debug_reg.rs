@@ -608,6 +608,16 @@ pub fn handle_db_exception(
             slot, fire_idx, cpu, rip, cs, rflags, cr3, phys, addr, inode, offset,
             dr6, kind_tag, one_shot as u8,
         );
+        // D17 hook — record the (rip, canary-VA, current-phys, current-value)
+        // for D16-tagged fires so the SSP-fail `#GP` post-processor can
+        // compare against the read-time phys.  Intel SDM Vol. 3B §17.3.1.1
+        // says the `#DB` is taken after the writer's store retires, so the
+        // qword we read through the direct map now reflects what the
+        // writer just stored.  Gated on `d17-aliasing-test`.
+        #[cfg(feature = "d17-aliasing-test")]
+        if kind_tag == WATCH_KIND_D16_CANARY {
+            crate::subsys::linux::d17_aliasing_test::record_d16_fire(rip, cs, cr3);
+        }
         crate::serial_println!(
             "[W215/DR-WATCH-FIRE/STACK] slot={} cpu={} rip={:#x} rsp={:#x}",
             slot, cpu, rip, rsp,
