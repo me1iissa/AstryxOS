@@ -893,4 +893,16 @@ pub fn probe_gp_at_ssp_fail(
     // bounded-output invariants.
     #[cfg(feature = "fs-base-trace")]
     crate::subsys::linux::fs_base_trace::dump_for_tid(tid as u64);
+
+    // ── D17 read-side aliasing verdict (feature `d17-aliasing-test`) ─
+    // Re-resolves `CANARY_SLOT_VA` → phys at fault time and scans
+    // D17's ring for the most-recent D16 fire on the same VA, emitting
+    // `[D17/READ-PHYS]` and `[D17/VERDICT]` lines.  If write-phys ≠
+    // read-phys, this names a residual page-table / TLB aliasing on
+    // the stack canary VA (W215-class, but on a different VA than
+    // PR #270 / `pte_share_count`).  Bounded: one verdict emission
+    // per boot via `D17_VERDICT_EMITTED`.  Intel SDM Vol. 3A §4.6,
+    // §4.10; CWE-787.
+    #[cfg(feature = "d17-aliasing-test")]
+    crate::subsys::linux::d17_aliasing_test::emit_fault_verdict(rip);
 }
