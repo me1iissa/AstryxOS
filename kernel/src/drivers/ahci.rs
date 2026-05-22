@@ -110,16 +110,20 @@ const FALLBACK_SECTOR_COUNT: u64 = 131072;
 
 /// Tracks the physical memory allocations for one AHCI port.
 ///
-/// One instance per active SATA port.  All fields except `port_num` describe
-/// resources (command list, command table, DMA staging buffer) that the AHCI
-/// HBA accesses concurrently with the CPU during an outstanding command; an
-/// in-flight transaction therefore must hold this port's mutex from FIS build
-/// through completion polling.  Per-port serialisation matches the AHCI 1.3.1
-/// command engine model — each port has an independent command list register
-/// (PxCLB) and command-issue register (PxCI), so distinct ports proceed in
-/// parallel without coordination (§4.2).
+/// One instance per active SATA port.  All fields describe resources (command
+/// list, command table, DMA staging buffer) that the AHCI HBA accesses
+/// concurrently with the CPU during an outstanding command; an in-flight
+/// transaction therefore must hold this port's mutex from FIS build through
+/// completion polling.  Per-port serialisation matches the AHCI 1.3.1 command
+/// engine model — each port has an independent command list register (PxCLB)
+/// and command-issue register (PxCI), so distinct ports proceed in parallel
+/// without coordination (§4.2).
+///
+/// `port_num` is intentionally NOT a field here: it is immutable for the
+/// lifetime of the registry entry and is held lock-free on the enclosing
+/// `PortEntry` so registry lookup never needs to take this mutex.  See
+/// [`PortEntry`] and [`port_handle`].
 struct AhciPort {
-    port_num: u8,
     clb_phys: u64,      // Command List Base physical address
     fb_phys: u64,       // FIS Base physical address
     ctbl_phys: u64,     // Command Table physical address (slot 0)
@@ -127,6 +131,26 @@ struct AhciPort {
     /// Total addressable LBA sectors discovered via IDENTIFY DEVICE (ACS-3 §7.12).
     /// Set to FALLBACK_SECTOR_COUNT if IDENTIFY failed; a WARN line is logged.
     sector_count: u64,
+}
+
+/// Registry entry pairing an immutable port number with its per-port lock.
+///
+/// `port_num` is set once during init and never mutated, so the lookup path
+/// reads it directly out of the registry vector without acquiring the per-port
+/// mutex.  This is what makes `port_handle()` lock-the-registry-only: under
+/// the previous shape, the registry held `Arc<Mutex<AhciPort>>` only, so the
+/// linear search had to `p.lock()` each entry just to read `port_num` —
+/// re-introducing the very serialisation the per-port mutex was meant to
+/// eliminate (AHCI 1.3.1 §4.2 per-port command-engine model).
+///
+/// Compare POSIX-1.2017 / `pthread_mutex(7)`: a registry of independent
+/// resources must not require holding the resource lock to *find* the
+/// resource, otherwise all lookups serialise behind any one in-flight user.
+struct PortEntry {
+    /// Immutable after construction.  Safe to read without locking `state`.
+    port_num: u8,
+    /// Per-port lock guarding the DMA structures.  Independent across ports.
+    state: Arc<Mutex<AhciPort>>,
 }
 
 // ── Global State ────────────────────────────────────────────────────────────
@@ -138,22 +162,37 @@ static AHCI_PORTS: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 /// Per-port DMA structures (populated during init).
 ///
 /// The outer `Mutex` only guards the registry vector itself (membership /
-/// lookup) and is held briefly.  Each `Arc<Mutex<AhciPort>>` owns the
-/// per-port lock; concurrent I/O on distinct ports never blocks on the
-/// registry, satisfying the AHCI 1.3.1 §4.2 per-port command-engine model.
-static AHCI_PORT_STATE: Mutex<Vec<Arc<Mutex<AhciPort>>>> = Mutex::new(Vec::new());
+/// lookup) and is held briefly.  Each `Arc<Mutex<AhciPort>>` inside a
+/// [`PortEntry`] owns the per-port lock; concurrent I/O on distinct ports
+/// never blocks on the registry, satisfying the AHCI 1.3.1 §4.2 per-port
+/// command-engine model.
+///
+/// The `port_num` discriminator lives on `PortEntry` outside the per-port
+/// mutex so the lookup path is purely registry-mutex bounded: a concurrent
+/// long-running I/O on port N never delays `port_handle(M != N)` lookups,
+/// which would have been the case if the discriminator lived inside the
+/// `Mutex<AhciPort>` (the original PR #386 shape, flagged as N1 in security
+/// review).
+static AHCI_PORT_STATE: Mutex<Vec<PortEntry>> = Mutex::new(Vec::new());
 
 /// Look up a port's `Arc<Mutex<AhciPort>>` by port number.
 ///
 /// The registry mutex is held only for the duration of the linear search and
-/// `Arc::clone()`; the returned handle can be locked independently of the
+/// the `Arc::clone()`.  Crucially, the per-port mutex on each candidate is
+/// *never* acquired during lookup — `port_num` is read out of `PortEntry`
+/// directly.  The returned handle can be locked independently of the
 /// registry, so I/O on one port never blocks lookup or I/O on another.
+///
+/// This decoupling is the fix for the N1 finding on PR #386 (the original
+/// shape held the registry mutex while calling `p.lock()` on every candidate
+/// during the linear search, which serialised all lookups behind any single
+/// in-flight I/O — defeating the per-port mutex's purpose).
 fn port_handle(port: u8) -> Option<Arc<Mutex<AhciPort>>> {
     AHCI_PORT_STATE
         .lock()
         .iter()
-        .find(|p| p.lock().port_num == port)
-        .cloned()
+        .find(|e| e.port_num == port)
+        .map(|e| Arc::clone(&e.state))
 }
 
 /// Test-only: snapshot of the per-port lock topology.
@@ -163,16 +202,16 @@ fn port_handle(port: u8) -> Option<Arc<Mutex<AhciPort>>> {
 /// ports prove the registry stores per-port mutexes rather than one shared
 /// mutex.  Used by the test runner to assert the AHCI 1.3.1 §4.2 per-port
 /// command-engine model is reflected in driver locking.
+///
+/// This implementation does NOT acquire any per-port mutex: `port_num` is
+/// read straight out of `PortEntry`, so the snapshot is unaffected by an
+/// in-flight I/O holding a port lock elsewhere.
 #[doc(hidden)]
 pub fn port_lock_topology() -> Vec<(u8, usize)> {
-    let handles: Vec<_> = AHCI_PORT_STATE.lock().iter().cloned().collect();
-    handles
-        .into_iter()
-        .map(|h| {
-            let addr = Arc::as_ptr(&h) as usize;
-            let port = h.lock().port_num;
-            (port, addr)
-        })
+    AHCI_PORT_STATE
+        .lock()
+        .iter()
+        .map(|e| (e.port_num, Arc::as_ptr(&e.state) as usize))
         .collect()
 }
 
@@ -183,26 +222,69 @@ pub fn port_lock_topology() -> Vec<(u8, usize)> {
 /// `held_acquired` confirms we held the port's lock and `other_try_ok`
 /// reports whether every other active port could be `try_lock`-ed while
 /// `held_port` was locked.  Returns `None` if `held_port` is not active.
+///
+/// Lookup of `held_port` and of the "other ports" both go through the
+/// `port_num`-on-`PortEntry` path, so even though we hold `held_port`'s
+/// mutex across the `try_lock` sweep, the registry-side lookup itself never
+/// needs to acquire any per-port mutex.
 #[doc(hidden)]
 pub fn probe_port_lock_independence(held_port: u8) -> Option<(bool, bool)> {
-    let handles: Vec<_> = AHCI_PORT_STATE.lock().iter().cloned().collect();
-    let held = handles
+    // Snapshot of (port_num, Arc<Mutex<AhciPort>>) — no per-port lock taken.
+    let entries: Vec<(u8, Arc<Mutex<AhciPort>>)> = AHCI_PORT_STATE
+        .lock()
         .iter()
-        .find(|h| h.lock().port_num == held_port)?
-        .clone();
+        .map(|e| (e.port_num, Arc::clone(&e.state)))
+        .collect();
+    let held = entries.iter().find(|(n, _)| *n == held_port)?.1.clone();
     let held_guard = held.try_lock();
     let held_acquired = held_guard.is_some();
 
     let mut other_try_ok = true;
-    for h in handles.iter() {
-        if Arc::ptr_eq(h, &held) {
+    for (_, s) in entries.iter() {
+        if Arc::ptr_eq(s, &held) {
             continue;
         }
-        if h.try_lock().is_none() {
+        if s.try_lock().is_none() {
             other_try_ok = false;
         }
     }
     Some((held_acquired, other_try_ok))
+}
+
+/// Test-only: probe registry-side lookup independence from per-port locks.
+///
+/// Holds `held_port`'s mutex, then attempts a registry lookup of every
+/// active port via the production [`port_handle`] path.  Returns
+/// `Some((held_acquired, all_lookups_ok))` if `held_port` is active, where
+/// `all_lookups_ok` is `true` iff every active port (including `held_port`
+/// itself) was found by `port_handle` while `held_port`'s mutex was held.
+///
+/// This is the direct N1-regression test: if `port_handle` were to acquire
+/// per-port mutexes during the linear search (the original PR #386 shape),
+/// holding `held_port`'s mutex would either deadlock or block all other
+/// lookups depending on whether `held_port` was the matched entry.  With
+/// the decoupled `PortEntry { port_num, state }` shape, the lookup reads
+/// `port_num` directly and never touches the per-port mutex, so all
+/// lookups succeed in bounded time.
+///
+/// Returns `None` if `held_port` is not active or if no ports are registered.
+#[doc(hidden)]
+pub fn probe_lookup_independent_of_port_lock(held_port: u8) -> Option<(bool, bool)> {
+    let port_nums: Vec<u8> = AHCI_PORT_STATE.lock().iter().map(|e| e.port_num).collect();
+    if port_nums.is_empty() || !port_nums.contains(&held_port) {
+        return None;
+    }
+    let held = port_handle(held_port)?;
+    let held_guard = held.try_lock();
+    let held_acquired = held_guard.is_some();
+
+    let mut all_lookups_ok = true;
+    for n in port_nums.iter() {
+        if port_handle(*n).is_none() {
+            all_lookups_ok = false;
+        }
+    }
+    Some((held_acquired, all_lookups_ok))
 }
 
 // ── MMIO Helpers ────────────────────────────────────────────────────────────
@@ -359,8 +441,8 @@ fn init_port(abar: u64, port: u8) -> Option<AhciPort> {
         }
     };
 
+    let _ = port; // discriminator now lives on PortEntry, not AhciPort
     Some(AhciPort {
-        port_num: port,
         clb_phys,
         fb_phys,
         ctbl_phys,
@@ -677,10 +759,15 @@ pub fn init() -> bool {
             // Initialize port DMA structures.  Each port gets its own
             // `Mutex<AhciPort>`; concurrent I/O on different ports proceeds
             // in parallel through their independent command engines
-            // (AHCI 1.3.1 §4.2).
+            // (AHCI 1.3.1 §4.2).  The `port_num` discriminator lives on the
+            // enclosing `PortEntry` outside the mutex so registry lookup
+            // never has to acquire any per-port lock.
             match init_port(abar, port) {
                 Some(ps) => {
-                    port_states.push(Arc::new(Mutex::new(ps)));
+                    port_states.push(PortEntry {
+                        port_num: port,
+                        state: Arc::new(Mutex::new(ps)),
+                    });
                     active_ports.push(port);
                 }
                 None => {
