@@ -36265,8 +36265,10 @@ fn test_267_pmm_reserves_full_bootinfo_span() -> bool {
 
     use astryx_shared::{BootInfo, BOOT_INFO_PHYS_BASE};
 
-    let size = core::mem::size_of::<BootInfo>();
-    let (first, last) = crate::mm::pmm::boot_info_phys_page_span();
+    let (first, last, bytes) = crate::mm::pmm::boot_info_phys_page_span();
+    let size = bytes as usize;
+    debug_assert_eq!(size, core::mem::size_of::<BootInfo>(),
+        "boot_info_phys_page_span bytes must equal size_of::<BootInfo>()");
     let page_size = crate::mm::pmm::PAGE_SIZE;
 
     test_println!(

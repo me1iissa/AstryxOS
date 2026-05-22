@@ -33,7 +33,7 @@ pub const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 /// (e.g. 0x400000).  Any physical address that falls within a region the ELF
 /// occupies can no longer be reached via `phys as *mut u64` while the user
 /// CR3 is active.  Using `PHYS_OFF + phys` avoids this problem entirely.
-const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+pub(crate) const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
 
 /// Convert a physical page-table address to a kernel-accessible virtual pointer.
 #[inline(always)]

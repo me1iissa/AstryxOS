@@ -182,21 +182,27 @@ pub fn is_kernel_static_phys(phys: u64) -> bool {
     base != 0 && end != 0 && phys >= base && phys < end
 }
 
-/// Compute the inclusive [first_page, last_page] PMM page indices that
-/// back the BootInfo struct at `BOOT_INFO_PHYS_BASE`, given the compile-
-/// time `size_of::<BootInfo>()`.
+/// Compute the inclusive `[first_page, last_page]` PMM page indices and
+/// total byte size of the BootInfo struct at `BOOT_INFO_PHYS_BASE`, given
+/// the compile-time `size_of::<BootInfo>()`.
 ///
-/// Exposed for tests verifying the CWE-787 fix (Test 267): the helper
-/// returns the same span used by `init` to reserve BootInfo pages.  A
-/// caller may check `last >= first + 1` to assert that BootInfo spans
-/// more than one page (the structural condition that motivated the
-/// fix).
-pub fn boot_info_phys_page_span() -> (usize, usize) {
+/// Returns `(first_page, last_page, bytes)`.  Exposed for tests verifying
+/// the CWE-787 fix (Test 267): the helper returns the same span used by
+/// `init` to reserve BootInfo pages, plus the byte count so callers do not
+/// duplicate the `size_of::<BootInfo>()` call site.  A caller may check
+/// `last >= first + 1` to assert that BootInfo spans more than one page
+/// (the structural condition that motivated the fix).
+///
+/// Uses `saturating_sub(1)` defensively: a zero-byte BootInfo is
+/// structurally impossible (the struct has named fields), but the
+/// arithmetic is hardened so a compiler bug or `#[repr(packed)]`
+/// regression cannot produce a wrap to `u64::MAX` here.
+pub fn boot_info_phys_page_span() -> (usize, usize, u64) {
     let bytes = core::mem::size_of::<BootInfo>() as u64;
     let first = (astryx_shared::BOOT_INFO_PHYS_BASE / PAGE_SIZE as u64) as usize;
-    let last = ((astryx_shared::BOOT_INFO_PHYS_BASE + bytes - 1)
+    let last = ((astryx_shared::BOOT_INFO_PHYS_BASE + bytes.saturating_sub(1))
         / PAGE_SIZE as u64) as usize;
-    (first, last)
+    (first, last, bytes)
 }
 
 /// True if the page index is currently marked used in the PMM bitmap.
@@ -328,13 +334,11 @@ pub fn init(boot_info: &BootInfo) {
     //       clamp in `kernel/src/main.rs` (PR #371), retained as defence
     //       in depth: after this fix it is a no-op in practice but stays
     //       to bound the blast radius of any future similar oversight.
-    const BOOT_INFO_BYTES: u64 = core::mem::size_of::<BootInfo>() as u64;
-    let boot_info_first_page =
-        (astryx_shared::BOOT_INFO_PHYS_BASE / PAGE_SIZE as u64) as usize;
-    let boot_info_last_page = ((astryx_shared::BOOT_INFO_PHYS_BASE
-        + BOOT_INFO_BYTES
-        - 1)
-        / PAGE_SIZE as u64) as usize;
+    // Single source-of-truth for the BootInfo phys span — `boot_info_phys_page_span`
+    // owns the `size_of::<BootInfo>()` computation so call sites cannot
+    // drift out of sync.
+    let (boot_info_first_page, boot_info_last_page, boot_info_bytes) =
+        boot_info_phys_page_span();
     let mut boot_info_reserved_pages = 0u64;
     for page in boot_info_first_page..=boot_info_last_page {
         if page < MAX_PAGES {
@@ -345,6 +349,11 @@ pub fn init(boot_info: &BootInfo) {
             // kernel-image reservation above is harmless to re-mark.  We
             // still decrement `total_available` only for pages that were
             // previously free.
+            //
+            // The `is_page_used_locked == true` branch is silently no-op
+            // (the bit is already set, idempotent OR); we just don't bump
+            // `boot_info_reserved_pages` because that counter is "newly
+            // reserved by this block" for the diagnostic line below.
             unsafe {
                 if !is_page_used_locked(page) {
                     mark_page_used(page);
@@ -352,9 +361,6 @@ pub fn init(boot_info: &BootInfo) {
                         total_available -= 1;
                     }
                     boot_info_reserved_pages += 1;
-                } else {
-                    // Already reserved by an earlier block (e.g. kernel
-                    // image + 256-page slack); nothing to do.
                 }
             }
         }
@@ -363,8 +369,8 @@ pub fn init(boot_info: &BootInfo) {
         "[PMM] BootInfo reservation: phys=[{:#x}..{:#x}) size={} B \
          pages={}..={} newly_reserved={} (CWE-787 fix)",
         astryx_shared::BOOT_INFO_PHYS_BASE,
-        astryx_shared::BOOT_INFO_PHYS_BASE + BOOT_INFO_BYTES,
-        BOOT_INFO_BYTES,
+        astryx_shared::BOOT_INFO_PHYS_BASE + boot_info_bytes,
+        boot_info_bytes,
         boot_info_first_page,
         boot_info_last_page,
         boot_info_reserved_pages,
