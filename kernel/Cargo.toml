@@ -252,6 +252,32 @@ f3-watch = ["firefox-test", "ssp-canary-diag", "w215-diag"]
 # (`SYSRETQ` — does NOT auto-reload MSRs); Intel SDM Vol. 3A §6.15
 # (`#GP`); System V AMD64 ABI §6.4 (TLS variant II).
 fs-base-trace = ["firefox-test", "ssp-canary-diag"]
+# D7 PT_TLS BSS-slot writer trap (kernel/src/subsys/linux/d7_bss_watch.rs).
+# Arms a write-only hardware watchpoint on the linear address
+# `fs_base - 0x18` of the firefox-bin init thread (pid=1, tid=1)
+# immediately after the first `proc::write_fs_base()` WRMSR transitions
+# the MSR from zero to a non-zero TLS base.  The slot covers the 8-byte
+# qword that the ELF gABI §5.2 PT_TLS zero-extension rule (the
+# `memsz > filesz` BSS tail required to read as zero on first access)
+# governs — for firefox-bin this is part of a `MemSiz=0x20, FileSiz=0`
+# PT_TLS segment, so the slot MUST read as zero at the first user-mode
+# instruction.  Every write hits `[W215/DR-WATCH-FIRE] kind_tag=3 …`,
+# naming the writer RIP + CR3 + CS.  CS=0x23 means a CPL-3 (upstream)
+# writer; CS=0x08 means a CPL-0 (kernel) writer — which would be
+# dispositive of an AstryxOS kernel-side write to the user-VA after
+# zero-init.  Bounded to the existing `F3_FIRE_CAP=32` per slot per
+# boot.  Single arm per boot (`D7_ARM_MAX = 1`).
+# Distinguishes Phase 4 hypothesis Z1 (anon-PF returned a non-zero
+# frame, no runtime write) — falsified by zero captures — from
+# Z2/Z3 (some writer reaches the slot post-init) — proved by
+# captures naming the writer.
+# Diagnostic-only; default builds remain byte-identical when off.
+# Depends on `firefox-test` (the trace formatters share infra) and
+# `w215-diag` (DR0–DR3 plumbing).
+# Refs: Intel SDM Vol. 3B §17.2.4 (DR0–DR3, DR7), §17.3.1.1 (data-
+# breakpoint trap timing); Intel SDM Vol. 3A §3.4.4.1 (`IA32_FS_BASE`);
+# ELF gABI §5.2 (PT_LOAD / PT_TLS `memsz > filesz` zero-fill).
+d7-bss-watch = ["firefox-test", "w215-diag"]
 # Track B (Phase 5, 2026-05-21) — stack-page write provenance ring.
 # Records kernel-mode writes whose target user VA falls into the
 # `[0x3f00_0000_0000, 0x4000_0000_0000)` thread-stack range (per Phase 4

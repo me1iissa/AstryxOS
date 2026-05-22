@@ -124,10 +124,14 @@ static ARMED_KEY_OFFSET: [AtomicU64; N_DR_SLOTS] = [
 ///   0 — unset / legacy (cache CRC walker / pre-insert pool / kdb manual)
 ///   1 — F3 user-VA stack-canary watch (see `subsys/linux/f3_watch.rs`)
 ///   2 — F3 PHYS_OFF stack-canary mirror (same)
+///   3 — D7 PT_TLS BSS-slot watch (see `subsys/linux/d7_bss_watch.rs`).
+///       Same persistent-arm policy as the F3 tags (capped at
+///       `F3_FIRE_CAP` fires per slot per boot, see `handle_db_exception`).
 /// Future axes may take additional tags without disturbing existing arms.
 pub const WATCH_KIND_LEGACY:  u32 = 0;
 pub const WATCH_KIND_F3_USER: u32 = 1;
 pub const WATCH_KIND_F3_PHYS: u32 = 2;
+pub const WATCH_KIND_D7_BSS:  u32 = 3;
 static ARMED_KIND: [AtomicU32; N_DR_SLOTS] = [
     AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
 ];
