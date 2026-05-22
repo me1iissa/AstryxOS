@@ -164,6 +164,30 @@ static DR_FIRE_COUNT: [AtomicU32; N_DR_SLOTS] = [
 /// the first ~N fires.
 const F3_FIRE_CAP: u32 = 32;
 
+/// Per-slot fire CAP for `WATCH_KIND_D16_CANARY` arms when the D18
+/// extension is enabled.  D17 (PR #383) found 32 fires exhausted the
+/// cap before the 0x30-byte writer was captured — the 32nd entry was
+/// a libxul write of part of the "screenshot" string, meaning the
+/// real corrupting writer was the 33rd+ store to the slot.  Raising
+/// the cap lets D18 attribute the actual corrupting write at the
+/// price of a larger log window; the writer-naming budget (CPL=3 vs
+/// CPL=0) is unchanged.  Bounded to avoid unbounded fire loops on a
+/// hot prologue path.
+///
+/// At `F3_FIRE_CAP` × 8-line emission (fire line + 7 stack qwords +
+/// per-fire D17 records) ≈ 250 lines, vs `D16_FIRE_CAP` × 8 ≈ 2 KiB
+/// lines per boot — well inside the serial-log retention window
+/// (per `~/.astryx-harness/<sid>.serial.log` rotation).
+///
+/// Cited under POSIX `__stack_chk_fail(3)` semantics and Intel SDM
+/// Vol. 3B §17.3.1.1 (trap-after-retire — each fire names one
+/// retired writer; raising the cap names more writers without
+/// changing fire-time semantics).
+#[cfg(feature = "d18-extended-d16")]
+const D16_FIRE_CAP: u32 = 256;
+#[cfg(not(feature = "d18-extended-d16"))]
+const D16_FIRE_CAP: u32 = F3_FIRE_CAP;
+
 /// Number of arm broadcasts issued since boot (sum across slots).
 static ARM_COUNT: AtomicU32 = AtomicU32::new(0);
 
@@ -590,9 +614,17 @@ pub fn handle_db_exception(
         // capping fire as one_shot=1 so the post-processor sees the
         // closing marker; subsequent writes will not re-trigger because
         // the slot is now disarmed.
+        //
+        // D16 (`WATCH_KIND_D16_CANARY`) uses its own cap (`D16_FIRE_CAP`)
+        // so the D18 extension can raise the per-boot fire budget for
+        // the SSP-canary slot without affecting D7/D15/F3 caps.  Per
+        // Intel SDM Vol. 3B §17.3.1.1 each fire still names one
+        // retired writer; the cap controls how many writers we log,
+        // not the timing of the trap.
+        let cap = if kind_tag == WATCH_KIND_D16_CANARY { D16_FIRE_CAP } else { F3_FIRE_CAP };
         let one_shot = match kind_tag {
             WATCH_KIND_LEGACY => true,
-            _ => fire_idx + 1 >= F3_FIRE_CAP,
+            _ => fire_idx + 1 >= cap,
         };
         if one_shot {
             ARMED[slot].store(false, Ordering::Release);
