@@ -125,6 +125,24 @@ pub mod fs_base_trace;
 #[cfg(feature = "d7-bss-watch")]
 pub mod d7_bss_watch;
 
+/// D8 fault-time TLS-slot dump + phys-frame provenance.  Distinguishes
+/// the surviving PSE Z1 hypothesis (anon-mmap returned a recycled
+/// physical frame without ELF gABI 5.2 zero-fill) from a re-framing
+/// (slot is zero at fault time; `r14` came from elsewhere) by
+/// inspecting `[fs:-0x18]` at the very instant of the deterministic
+/// pid=1 firefox-bin NULL-deref fault.  Content-gated on
+/// `cr2 == 0x20`, the `49 8b 5e 20` opcode prefix of
+/// `mov 0x20(%r14), %rbx`, and `pid == 1`.  Re-uses the existing
+/// FREE_SHADOW / ALLOC_SHADOW phys-provenance rings (PR #354 / Track K)
+/// to name the most recent `pmm::free_page` / `pmm::alloc_page` caller
+/// RIPs for the backing frame.  See Intel SDM Vol. 3A 3.4.4 (TLS via
+/// `IA32_FS_BASE`); ELF gABI 5.2 (PT_TLS BSS zero-fill); POSIX
+/// `mmap(2)` (anonymous-mapping zero contract); CWE-908 (Use of
+/// Uninitialized Resource).  Diagnostic-only; gated behind
+/// `d8-tls-fault-dump` so master builds remain byte-identical.
+#[cfg(feature = "d8-tls-fault-dump")]
+pub mod d8_fault_tls_dump;
+
 /// Bounded broadcast-within-cluster compensation for FUTEX_WAKE.  Mitigates
 /// the older-glibc `pthread_cond_signal` race
 /// (<https://sourceware.org/bugzilla/show_bug.cgi?id=25847>) by
