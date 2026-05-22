@@ -1246,6 +1246,12 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
     let new_cr3 = new_vm_space.cr3;
     let entry_rip = result.entry_point;
     let entry_rsp = result.user_stack_ptr;
+    // Capture the new image's TCB VA before the SYSRET-frame rewrite at
+    // step 6 — step 5d below WRMSRs this into `IA32_FS_BASE` so the new
+    // image's `_start` enters user mode with FS.base pointing at PT_TLS
+    // (not the launcher's freed TCB).  Per ELF gABI §3.5 / System V
+    // AMD64 ABI §3.4.2; `0` for static binaries with no PT_TLS segment.
+    let entry_tls_base = result.tls_base;
 
     crate::serial_println!(
         "[SYSCALL] exec: replacing PID {} image → entry={:#x} stack={:#x} cr3={:#x}",
@@ -1471,13 +1477,60 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
     //     or Release).  Stale per-thread state surviving exec violates
     //     the `execve(2)` process-image cleanslate guarantee.
     //
-    //     `tls_base` (FS.MSR) is intentionally retained — the new ELF's
-    //     `_start` will issue `arch_prctl(ARCH_SET_FS, ...)` (or the
-    //     dynamic linker will, before any TLS access).  Resetting it
-    //     here would either be a no-op (overwritten before first use)
-    //     or actively wrong (some code paths observe FS.base in the
-    //     window between exec and `_start`).
+    //     Note: `tls_base` / FS.base is handled separately in step 5d
+    //     below; see the rationale there.  (An earlier rev of this code
+    //     deferred FS.base entirely to the new image's
+    //     `arch_prctl(ARCH_SET_FS, ...)`; that window proved to be a
+    //     CWE-908 use-of-uninitialised-resource hazard because the old
+    //     image's TCB VA had already been unmapped at step 4b.)
     exec_reset_thread_exit_slots(crate::proc::current_tid());
+
+    // 5d. Point FS.base at the NEW image's PT_TLS TCB before SYSRETQ.
+    //
+    //     The previous image's FS.base still lives in the CPU's
+    //     `IA32_FS_BASE` MSR (`0xC000_0100`) at this point — SYSCALL
+    //     does NOT touch it (Intel SDM Vol. 2B `SYSCALL`/`SYSRETQ`).
+    //     But the previous image's TLS pages are gone: step 4 swapped
+    //     CR3 to the new VmSpace and step 4b called `free_vm_space()`,
+    //     which decremented refcounts on the old VMAs, freed any
+    //     anonymous pages whose refcount reached zero, and released
+    //     the old PT structures back to the PMM (see
+    //     `proc::free_vm_space`).  Leaving FS.base pointing into the
+    //     freed TCB VA opens a window between the SYSRETQ into the
+    //     new `_start` and the new image's first
+    //     `arch_prctl(ARCH_SET_FS, ...)` (or musl's `__init_tls`)
+    //     during which any TLS-relative read or write — including
+    //     dynamic linker code paths, early constructors with
+    //     `__thread` storage, and stack-protector epilogue checks at
+    //     `%fs:0x28` (System V AMD64 ABI §6.4) — lands in
+    //     uninitialised or reused physical memory at the new VA's
+    //     PT_TLS template.  Empirically (sc=1171 firefox-bin gate)
+    //     the read returns plausible-looking-but-residual data and
+    //     the offending function (`GetThreadRegistrationTime`,
+    //     mozglue BaseProfiler) faults later at
+    //     `mov rbx,[r14+0x20]` with `r14 == NULL`.
+    //
+    //     The fix mirrors the existing FS.base setup on the initial
+    //     `enter_user_mode` path (`proc/usermode.rs` — the WRMSR at
+    //     the bootstrap site).  After this point FS.base names the
+    //     new image's TCB; once the new image runs and issues its own
+    //     `arch_prctl(ARCH_SET_FS, ...)` (or musl `__set_thread_area`
+    //     under glibc-compat) the MSR is overwritten with the
+    //     userspace-chosen TCB — there is no conflict.
+    //
+    //     Threat-model: CWE-908 (Use of Uninitialized Resource).
+    //
+    //     Refs:
+    //       * Intel SDM Vol. 3A §3.4.4 / §3.4.4.1 (`IA32_FS_BASE` MSR,
+    //         FS segment loading; SYSCALL/SYSRETQ do not modify it)
+    //       * Intel SDM Vol. 2B (`SYSCALL`, `SYSRETQ`)
+    //       * `execve(2)` — process-image replacement (new image's
+    //         TLS template comes from PT_TLS per the ELF gABI §3.5)
+    //       * `arch_prctl(2)` (ARCH_SET_FS / ARCH_GET_FS)
+    //       * `clone(2)` (CLONE_SETTLS interaction)
+    //       * System V AMD64 ABI §3.4.2 (Thread-Local Storage variant II)
+    exec_set_thread_tls_base(crate::proc::current_tid(), entry_tls_base);
+    unsafe { crate::proc::write_fs_base(entry_tls_base); }
 
     // 6. Modify the syscall return frame on the kernel stack so that when
     //    we return through syscall_entry's epilogue, SYSRETQ jumps to the
@@ -1566,6 +1619,48 @@ pub(crate) fn exec_reset_thread_exit_slots(tid: crate::proc::Tid) {
         t.clear_child_tid  = 0;
         t.robust_list_head = 0;
         t.robust_list_len  = 0;
+    }
+}
+
+/// Point the surviving thread's `tls_base` (and, via the companion
+/// `proc::write_fs_base` call at the `sys_exec` site, the CPU's
+/// `IA32_FS_BASE` MSR) at the new image's PT_TLS TCB virtual address.
+///
+/// Required to satisfy the `execve(2)` cleanslate contract: SYSCALL on
+/// x86-64 does not touch FS.base (Intel SDM Vol. 2B `SYSCALL` /
+/// `SYSRETQ`), so without this, SYSRETQ would return into the new
+/// image's `_start` with the **previous** image's FS.base loaded — and
+/// that VA's backing pages were freed at the prior `free_vm_space`
+/// step.  The first TLS-relative load (`%fs:0x28` stack-protector
+/// canary, ELF `.tdata` access, dynamic linker `_dl_*` thread-local,
+/// or musl `__init_tls` self-check) would read uninitialised or
+/// reused physical memory.
+///
+/// `new_tls_base` is `result.tls_base` from `proc::elf::load_elf_*`:
+/// the TCB self-pointer VA computed during PT_TLS layout, or `0` for
+/// a static binary with no PT_TLS.  When `0`, the helper still stores
+/// the value and the caller still WRMSRs `0` — mirroring the
+/// unconditional write at the initial `enter_user_mode` site so
+/// CLONE_VM children with no TLS explicitly zero the CPU MSR rather
+/// than inheriting a stale ancestor value.
+///
+/// Threat-model: CWE-908 (Use of Uninitialized Resource) — without
+/// this, the kernel returns to user mode with FS.base pointing into
+/// memory that was just freed.
+///
+/// Refs:
+///   * Intel SDM Vol. 3A §3.4.4 / §3.4.4.1 — IA32_FS_BASE MSR
+///   * Intel SDM Vol. 2B — SYSCALL/SYSRETQ (no MSR side effects)
+///   * `execve(2)` — process-image replacement
+///   * `arch_prctl(2)` — ARCH_SET_FS / ARCH_GET_FS
+///   * `clone(2)` — CLONE_SETTLS
+///   * System V AMD64 ABI §3.4.2 / §6.4 — TLS variant II, stack
+///     protector at `%fs:0x28`
+///   * ELF gABI §3.5 — Thread-local storage
+pub(crate) fn exec_set_thread_tls_base(tid: crate::proc::Tid, new_tls_base: u64) {
+    let mut threads = crate::proc::THREAD_TABLE.lock();
+    if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+        t.tls_base = new_tls_base;
     }
 }
 
