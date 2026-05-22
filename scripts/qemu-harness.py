@@ -29,6 +29,7 @@ WARNING to stderr when --no-kvm is used and /dev/kvm is available.
 Tier 1 — session management:
     python3 scripts/qemu-harness.py start [--features FLAGS] [--no-build]
                                           [--gdb-port PORT] [--gdb-wait]
+                                          [--firefox-variant musl|glibc]
     python3 scripts/qemu-harness.py stop <sid>
     python3 scripts/qemu-harness.py list
     python3 scripts/qemu-harness.py wait <sid> <regex> [--ms MS]
@@ -1194,7 +1195,8 @@ def _data_img_staleness(data_img: Path, disk_dir: Path,
         return out
 
 
-def _regen_data_img(root_dir: Path) -> dict:
+def _regen_data_img(root_dir: Path,
+                    firefox_variant: "str | None" = None) -> dict:
     """
     Invoke `scripts/create-data-disk.sh --force` and capture its outcome.
 
@@ -1204,14 +1206,24 @@ def _regen_data_img(root_dir: Path) -> dict:
       duration_s: float
       tail: str       — last ~1500 chars of stderr (so a failure surfaces)
 
+    `firefox_variant`, when set, is exported to the child shell as
+    ASTRYXOS_FIREFOX_VARIANT so the data-disk builder stages the requested
+    libc/Firefox combination (see create-data-disk.sh: glibc | musl).  When
+    None, the script's default applies (currently glibc; controlled by the
+    script, not the harness).
+
     The script logs to stdout (mixed with stderr by some sub-scripts); we
     fold both streams together and keep the tail for diagnostics.
     """
     script = root_dir / "scripts" / "create-data-disk.sh"
-    out = {"ok": False, "rc": -1, "duration_s": 0.0, "tail": ""}
+    out = {"ok": False, "rc": -1, "duration_s": 0.0, "tail": "",
+           "firefox_variant": firefox_variant}
     if not script.exists():
         out["tail"] = f"create-data-disk.sh not found at {script}"
         return out
+    env = os.environ.copy()
+    if firefox_variant:
+        env["ASTRYXOS_FIREFOX_VARIANT"] = firefox_variant
     t0 = time.monotonic()
     try:
         proc = subprocess.run(
@@ -1220,6 +1232,7 @@ def _regen_data_img(root_dir: Path) -> dict:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=900,  # 15 min — generous; full Firefox copy is ~3 min
+            env=env,
         )
         out["rc"] = proc.returncode
         out["ok"] = proc.returncode == 0
@@ -1233,6 +1246,141 @@ def _regen_data_img(root_dir: Path) -> dict:
         out["tail"] = f"{type(e).__name__}: {e}"
     out["duration_s"] = time.monotonic() - t0
     return out
+
+
+# ── Firefox variant pin (D10 staging-gap guard) ───────────────────────────────
+#
+# Two userspace Firefox layouts can be staged into build/disk/ + build/data.img:
+#
+#   musl   — Alpine packages installed into  /usr/lib/firefox/firefox-bin
+#                                            /usr/lib/firefox-esr/firefox-bin
+#   glibc  — Mozilla-official tarball at     /opt/firefox/firefox-bin
+#
+# The kernel's main.rs probe selects, in order: musl-132 → musl-esr → glibc
+# (first existing wins).  If the user is mid-investigation on musl but
+# build/data.img was last staged for glibc, the kernel silently picks glibc
+# and the run diverges from the saga.  We catch this BEFORE QEMU boots.
+#
+# We inspect the staged tree (build/disk/) — not the packed image — because:
+#   * inspecting the FAT32 image needs mtools/mcopy, more brittle
+#   * the data-disk builder always writes build/disk/ before mcopy'ing
+#   * staleness logic already trips a regen if disk/ is newer than data.img
+# Per-binary "firefox-bin" presence under each prefix is a sufficient signal.
+
+# Canonical install prefixes (mirror create-data-disk.sh + kernel/main.rs probe).
+# Each entry: (variant-tag, on-disk relative path of firefox-bin).
+_FF_VARIANT_PROBE_PATHS = [
+    ("musl-132", "usr/lib/firefox/firefox-bin"),
+    ("musl-esr", "usr/lib/firefox-esr/firefox-bin"),
+    ("glibc",    "opt/firefox/firefox-bin"),
+]
+
+
+def _detect_staged_ff_variant(disk_dir: Path) -> dict:
+    """
+    Inspect build/disk/ for which Firefox layouts are present and predict
+    which one the kernel's [FFTEST] probe will select on boot.
+
+    Returns:
+      present: dict[tag, bool]  — one entry per (musl-132, musl-esr, glibc)
+      predicted_kernel_choice: "musl-132" | "musl-esr" | "glibc" | None
+      family: "musl" | "glibc" | None — coarse grouping of the predicted choice
+
+    No I/O failure modes; missing entries surface as `present[tag] = False`.
+    The kernel rule (musl-132 → musl-esr → glibc) is mirrored exactly here.
+    """
+    out = {"present": {}, "predicted_kernel_choice": None, "family": None}
+    for tag, rel in _FF_VARIANT_PROBE_PATHS:
+        try:
+            out["present"][tag] = (disk_dir / rel).is_file()
+        except OSError:
+            out["present"][tag] = False
+    for tag, _rel in _FF_VARIANT_PROBE_PATHS:
+        if out["present"].get(tag):
+            out["predicted_kernel_choice"] = tag
+            out["family"] = "musl" if tag.startswith("musl") else "glibc"
+            break
+    return out
+
+
+# Regex for the kernel's post-boot variant probe line.  Each "Ok(<size>)" /
+# "Err(<errcode>)" group reflects whether vfs::stat() succeeded for that path.
+# Example: "[FFTEST] FF binary probe: musl-132=Ok(795616) musl-esr=Err(NotFound) glibc=Err(NotFound)"
+_FF_PROBE_RE = re.compile(
+    r"\[FFTEST\] FF binary probe: "
+    r"musl-132=(?P<m132>Ok\([^)]*\)|Err\([^)]*\))\s+"
+    r"musl-esr=(?P<mesr>Ok\([^)]*\)|Err\([^)]*\))\s+"
+    r"glibc=(?P<g>Ok\([^)]*\)|Err\([^)]*\))"
+)
+
+
+def _parse_kernel_ff_probe(line: str) -> "dict | None":
+    """
+    Parse a serial-log line emitted by kernel main.rs and report which
+    Firefox binary the kernel actually selected.  Mirrors the rule in
+    main.rs: musl-132 wins, else musl-esr, else glibc.
+
+    Returns None if the line does not match the [FFTEST] FF binary probe
+    format; otherwise a dict with `chosen` ∈ {"musl-132", "musl-esr",
+    "glibc", None} and `family` ∈ {"musl", "glibc", None}.
+    """
+    m = _FF_PROBE_RE.search(line)
+    if not m:
+        return None
+    def _ok(s: str) -> bool:
+        return s.startswith("Ok(")
+    m132_ok = _ok(m.group("m132"))
+    mesr_ok = _ok(m.group("mesr"))
+    g_ok    = _ok(m.group("g"))
+    if m132_ok:
+        chosen = "musl-132"
+    elif mesr_ok:
+        chosen = "musl-esr"
+    elif g_ok:
+        chosen = "glibc"
+    else:
+        chosen = None
+    family = ("musl" if chosen and chosen.startswith("musl")
+              else ("glibc" if chosen == "glibc" else None))
+    return {
+        "chosen": chosen,
+        "family": family,
+        "musl_132_present": m132_ok,
+        "musl_esr_present": mesr_ok,
+        "glibc_present":    g_ok,
+    }
+
+
+def _scan_serial_for_ff_probe(serial_log: str,
+                              deadline_s: float) -> "dict | None":
+    """
+    Tail the serial log until either the [FFTEST] FF binary probe line is
+    seen or `deadline_s` (wall-clock seconds) is reached.  Returns the
+    parsed probe dict on hit; None on timeout.
+
+    Best-effort: returns None on any I/O error.  Caller decides what to do
+    with a timeout (typically: log a warning and move on).
+    """
+    p = Path(serial_log)
+    end = time.monotonic() + deadline_s
+    last_pos = 0
+    while time.monotonic() < end:
+        try:
+            if not p.exists():
+                time.sleep(0.1)
+                continue
+            with p.open("rb") as fh:
+                fh.seek(last_pos)
+                chunk = fh.read()
+                last_pos += len(chunk)
+            for line in chunk.decode("utf-8", errors="replace").splitlines():
+                parsed = _parse_kernel_ff_probe(line)
+                if parsed is not None:
+                    return parsed
+        except OSError:
+            return None
+        time.sleep(0.1)
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2156,8 +2304,25 @@ def cmd_start(args):
     _data_img_staleness_info: dict = {}
     _data_img_regen_info: dict = {}
     _no_regen = bool(getattr(args, "no_regen_data_img", False))
+    # ── Firefox variant pin (D10 staging-gap guard) ──────────────────────────
+    # `--firefox-variant` requests a specific libc + Firefox layout.  Default
+    # is "musl" because that is the primary demo target as of 2026-05; agents
+    # explicitly investigating the glibc plateau must pass `--firefox-variant
+    # glibc`.  When the requested variant does not match what is currently
+    # staged in build/disk/ we trigger an `ASTRYXOS_FIREFOX_VARIANT=<v>
+    # scripts/create-data-disk.sh --force` to re-stage the disk before boot.
+    _requested_variant = getattr(args, "firefox_variant", None) or "musl"
+    _ff_variant_info: dict = {
+        "requested": _requested_variant,
+        "staged_predicted": None,   # filled in after probe
+        "regen_triggered": False,
+        "regen_ok": None,
+        "regen_reason": None,
+        "kernel_chosen": None,      # filled in by post-boot probe verifier
+        "match": None,              # final verdict, when known
+    }
+    _disk_dir = Path(wt.ROOT) / "build" / "disk"
     if not _data_img_missing:
-        _disk_dir = Path(wt.ROOT) / "build" / "disk"
         # Extra source directories whose compiled outputs land in build/disk/.
         # A source file newer than its compiled artifact inside build/disk/ will
         # make the artifact appear older than data.img — the normal disk_dir scan
@@ -2206,7 +2371,8 @@ def cmd_start(args):
                 "║  Auto-regenerating via scripts/create-data-disk.sh --force … ║",
                 file=sys.stderr,
             )
-            _data_img_regen_info = _regen_data_img(Path(wt.ROOT))
+            _data_img_regen_info = _regen_data_img(
+                Path(wt.ROOT), firefox_variant=_requested_variant)
             _data_img_regenerated = bool(_data_img_regen_info.get("ok"))
             if _data_img_regenerated:
                 # Re-scan; the regen should have updated data.img mtime so the
@@ -2228,6 +2394,77 @@ def cmd_start(args):
                 print(
                     "║  REGEN FAILED — booting stale image; check stderr above.    ║\n"
                     f"║  rc={_data_img_regen_info.get('rc')}, tail: {_tail!r:<48}",
+                    file=sys.stderr,
+                )
+
+    # ── Firefox variant-mismatch guard (D10) ────────────────────────────────
+    # Even when data.img is fresh, the *layout* staged on it may not match
+    # the variant the agent requested.  Compare the kernel's predicted
+    # selection (mirrors main.rs probe rule) against `_requested_variant`;
+    # re-stage with ASTRYXOS_FIREFOX_VARIANT exported when they disagree.
+    # Soft-fail: if the inspection or regen can't run, we still launch — the
+    # post-boot kernel-probe verifier (below) emits the final verdict either
+    # way.  Re-using the staleness regen is intentional: if staleness already
+    # ran the script for the right variant, the staged tree now matches and
+    # we don't loop.
+    _variant_info = {}
+    if _disk_dir.exists():
+        _variant_info = _detect_staged_ff_variant(_disk_dir)
+    _ff_variant_info["staged_predicted"] = _variant_info.get(
+        "predicted_kernel_choice")
+    _staged_family = _variant_info.get("family")
+    _need_variant_regen = (
+        not _data_img_missing
+        and not _data_img_regenerated  # avoid back-to-back regens
+        and _staged_family is not None
+        and _staged_family != _requested_variant
+    )
+    if _need_variant_regen:
+        _ff_variant_info["regen_reason"] = (
+            f"staged-family={_staged_family} != requested={_requested_variant}"
+        )
+        if _no_regen:
+            print(
+                "╔══════════════════════════════════════════════════════════════╗\n"
+                f"║  WARNING: staged FF variant ({_staged_family}) != requested ({_requested_variant})  ║\n"
+                "║  --no-regen-data-img set; booting mismatched image as-is.    ║\n"
+                "╚══════════════════════════════════════════════════════════════╝",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "╔══════════════════════════════════════════════════════════════╗\n"
+                "║  Firefox variant mismatch — re-staging data.img              ║\n"
+                f"║  staged: {_staged_family:<10} requested: {_requested_variant:<28}║\n"
+                "║  Running scripts/create-data-disk.sh --force with            ║\n"
+                f"║  ASTRYXOS_FIREFOX_VARIANT={_requested_variant:<35} ║\n"
+                "╚══════════════════════════════════════════════════════════════╝",
+                file=sys.stderr,
+            )
+            _variant_regen = _regen_data_img(
+                Path(wt.ROOT), firefox_variant=_requested_variant)
+            _ff_variant_info["regen_triggered"] = True
+            _ff_variant_info["regen_ok"] = bool(_variant_regen.get("ok"))
+            # Fold into the existing regen-info slot so a single field carries
+            # the latest invocation outcome; the older staleness regen (if any)
+            # already set _data_img_regenerated above.
+            _data_img_regen_info = _variant_regen
+            if _variant_regen.get("ok"):
+                _data_img_regenerated = True
+                _variant_info = _detect_staged_ff_variant(_disk_dir)
+                _ff_variant_info["staged_predicted"] = _variant_info.get(
+                    "predicted_kernel_choice")
+                _dur = _variant_regen.get("duration_s", 0.0)
+                print(
+                    f"║  variant re-stage OK in {_dur:.1f}s "
+                    f"(now {_ff_variant_info['staged_predicted']}).",
+                    file=sys.stderr,
+                )
+            else:
+                _tail = (_variant_regen.get("tail") or "")[-400:]
+                print(
+                    "║  variant re-stage FAILED — booting with wrong variant.   ║\n"
+                    f"║  rc={_variant_regen.get('rc')}, tail: {_tail!r:<48}",
                     file=sys.stderr,
                 )
 
@@ -2323,6 +2560,12 @@ def cmd_start(args):
         "data_img_regenerated": _data_img_regenerated,
         "data_img_staleness_info": _data_img_staleness_info,
         "data_img_regen_info": _data_img_regen_info,
+        # Firefox variant pin (D10 staging-gap guard).  `requested` is what
+        # the caller asked for; `staged_predicted` is what kernel main.rs's
+        # selection rule will pick from the current build/disk/ tree.  The
+        # `kernel_chosen` field is updated by the post-boot verifier after
+        # the kernel's "[FFTEST] FF binary probe" line is observed.
+        "firefox_variant_info": _ff_variant_info,
         # Session-scoped kernel binary (concurrent-rebuild clobber fix).
         # NOTE: snapshot files saved via `qemu-harness.py snap save` are tied
         # to the kernel binary loaded at the time. Loading a snapshot in a
@@ -2360,6 +2603,31 @@ def cmd_start(args):
         "cpu_override": cpu_model,
     })
 
+    # D10: record the requested Firefox variant + staged-predicted choice up
+    # front so a single `events <sid>` shows whether the pre-boot guard caught
+    # a mismatch.  A follow-up `firefox_variant_probe` event is emitted by the
+    # detached verifier when the kernel's [FFTEST] probe line is parsed.
+    _emit_event(sid, {
+        "kind": "firefox_variant_requested",
+        "requested": _requested_variant,
+        "staged_predicted": _ff_variant_info.get("staged_predicted"),
+        "regen_triggered": _ff_variant_info.get("regen_triggered", False),
+        "regen_ok": _ff_variant_info.get("regen_ok"),
+        "regen_reason": _ff_variant_info.get("regen_reason"),
+    })
+    # Spawn a detached verifier that tails the serial log for the kernel's
+    # "[FFTEST] FF binary probe:" line, parses the chosen variant, updates
+    # the session JSON, and emits a `firefox_variant_probe` event.  Detached
+    # so `start` exits promptly; the verifier's 120 s deadline is generous
+    # for normal boots (kernel emits the probe within ~5–15 s).
+    subprocess.Popen(
+        [sys.executable, __file__, "_ff_variant_verify", sid],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
     _out({"sid": sid, "pid": proc.pid, "serial_log": serial_log,
           "gdb_port": gdb_port, "kdb_host_port": kdb_host_port,
           # W106: structured CPU-model fields. `cpu_model_resolved` is
@@ -2380,6 +2648,13 @@ def cmd_start(args):
           # session. False when not needed, when --no-regen-data-img was set,
           # or when the regen script failed (check `data_img_regen_info`).
           "data_img_regenerated": _data_img_regenerated,
+          # D10: Firefox variant pin.  `firefox_variant_info` reflects the
+          # state at session-start time: `requested` (caller's pin), and
+          # `staged_predicted` (which binary the kernel's probe rule will
+          # select from the current build/disk/ tree).  The `kernel_chosen`
+          # field is populated asynchronously by the post-boot verifier;
+          # read it from `events <sid>` or `status <sid>` after wait().
+          "firefox_variant_info": _ff_variant_info,
           # Per-session QGA UNIX chardev socket path. Empty string when the
           # session was started without --features qga; non-empty paths may
           # not yet exist on disk if QEMU hasn't bound the socket yet
@@ -2748,6 +3023,11 @@ def cmd_status(args):
         "uptime_s":        round(uptime, 1),
         "features":        sess.get("features"),
         "exit_cause":      exit_cause,
+        # D10: Firefox variant pin.  Additive — never present on sessions
+        # started before this field landed.  `kernel_chosen`/`match` are
+        # filled in by the post-boot verifier once the [FFTEST] probe line
+        # is parsed; until then they remain None.
+        "firefox_variant_info": sess.get("firefox_variant_info"),
     })
 
 
@@ -2884,6 +3164,72 @@ def cmd_run_watcher(args):
         qmp_sock   = sess["qmp_sock"],
         pid        = sess["pid"],
     )
+    sys.exit(0)
+
+
+def cmd_ff_variant_verify(args):
+    """
+    Private subcommand: tail the serial log for the kernel's "[FFTEST] FF
+    binary probe:" line, parse the selected variant, and (a) emit a
+    `firefox_variant_probe` event, (b) update `firefox_variant_info` in the
+    session JSON.  Detached process spawned by `start`.  Best-effort: any
+    error path exits 0 silently — the agent can fall back to `grep <sid>
+    '\\[FFTEST\\] FF binary probe'`.
+
+    Deadline is 120 s wall-clock — kernel emits the probe within the first
+    few seconds of test_runner.  We loop until either the probe line is
+    parsed or the deadline is reached.
+    """
+    sid = args.sid
+    try:
+        sess = _load_session(sid)
+    except SystemExit:
+        sys.exit(0)
+    serial_log = sess.get("serial_log")
+    if not serial_log:
+        sys.exit(0)
+    parsed = _scan_serial_for_ff_probe(serial_log, deadline_s=120.0)
+    # Refresh session under the assumption it may have been updated by other
+    # callers (e.g. snapshot save); merge our verdict in.
+    try:
+        sess = _load_session(sid)
+    except SystemExit:
+        sys.exit(0)
+    fvi = dict(sess.get("firefox_variant_info") or {})
+    if parsed is None:
+        fvi["kernel_chosen"] = None
+        fvi["match"] = None
+        fvi["probe_timeout"] = True
+        sess["firefox_variant_info"] = fvi
+        _save_session(sess)
+        _emit_event(sid, {
+            "kind": "firefox_variant_probe",
+            "ok": False,
+            "reason": "timeout-waiting-for-[FFTEST]-probe-line",
+            "requested": fvi.get("requested"),
+        })
+        sys.exit(0)
+    chosen = parsed.get("chosen")
+    family = parsed.get("family")
+    requested = fvi.get("requested")
+    match = (family == requested) if (family and requested) else None
+    fvi["kernel_chosen"] = chosen
+    fvi["kernel_chosen_family"] = family
+    fvi["match"] = match
+    fvi["probe_timeout"] = False
+    sess["firefox_variant_info"] = fvi
+    _save_session(sess)
+    _emit_event(sid, {
+        "kind": "firefox_variant_probe",
+        "ok": True,
+        "requested": requested,
+        "kernel_chosen": chosen,
+        "kernel_chosen_family": family,
+        "match": match,
+        "musl_132_present": parsed.get("musl_132_present"),
+        "musl_esr_present": parsed.get("musl_esr_present"),
+        "glibc_present":    parsed.get("glibc_present"),
+    })
     sys.exit(0)
 
 
@@ -7769,6 +8115,24 @@ def main():
                                "still prints to stderr so the situation is "
                                "never hidden. Use when reproducing a bug that "
                                "depends on the existing data.img contents.")
+    p_start.add_argument("--firefox-variant", dest="firefox_variant",
+                          choices=("musl", "glibc"), default="musl",
+                          help="Pin which Firefox userspace layout the data "
+                               "disk must carry: 'musl' (Alpine packages at "
+                               "/usr/lib/firefox*) or 'glibc' (Mozilla tarball "
+                               "at /opt/firefox).  Default 'musl' — the "
+                               "primary demo target.  When the staged tree "
+                               "doesn't match, the harness re-runs "
+                               "scripts/create-data-disk.sh with "
+                               "ASTRYXOS_FIREFOX_VARIANT exported so the boot "
+                               "image carries the requested binaries.  After "
+                               "boot the kernel's [FFTEST] FF binary probe "
+                               "line is parsed and a `firefox_variant_probe` "
+                               "event records the actual selection (read it "
+                               "via `events <sid>` or `status <sid>`). "
+                               "Suppress the auto-restage with "
+                               "--no-regen-data-img — the mismatch is still "
+                               "warned about on stderr.")
 
     # stop
     p_stop = sub.add_parser("stop", help="Kill a QEMU session")
@@ -8445,6 +8809,12 @@ def main():
     p_watch = sub.add_parser("_watch")
     p_watch.add_argument("sid")
 
+    # _ff_variant_verify: private subcommand used internally by `start` to
+    # tail the serial log for the kernel's [FFTEST] FF binary probe line
+    # and record the actual variant selection.  Not shown in help.
+    p_ffv = sub.add_parser("_ff_variant_verify")
+    p_ffv.add_argument("sid")
+
     args = parser.parse_args()
 
     dispatch = {
@@ -8510,6 +8880,7 @@ def main():
         # Linux reference strace (ABI conformance)
         "strace-ref": cmd_strace_ref,
         "_watch":  cmd_run_watcher,
+        "_ff_variant_verify": cmd_ff_variant_verify,
     }
     rc = dispatch[args.cmd](args)
     if isinstance(rc, int) and rc != 0:
