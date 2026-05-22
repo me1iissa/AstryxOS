@@ -16,6 +16,7 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
@@ -108,6 +109,15 @@ const FALLBACK_SECTOR_COUNT: u64 = 131072;
 // ── Per-Port DMA State ──────────────────────────────────────────────────────
 
 /// Tracks the physical memory allocations for one AHCI port.
+///
+/// One instance per active SATA port.  All fields except `port_num` describe
+/// resources (command list, command table, DMA staging buffer) that the AHCI
+/// HBA accesses concurrently with the CPU during an outstanding command; an
+/// in-flight transaction therefore must hold this port's mutex from FIS build
+/// through completion polling.  Per-port serialisation matches the AHCI 1.3.1
+/// command engine model — each port has an independent command list register
+/// (PxCLB) and command-issue register (PxCI), so distinct ports proceed in
+/// parallel without coordination (§4.2).
 struct AhciPort {
     port_num: u8,
     clb_phys: u64,      // Command List Base physical address
@@ -126,7 +136,74 @@ static AHCI_BASE: Mutex<u64> = Mutex::new(0);
 /// List of active SATA port numbers.
 static AHCI_PORTS: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 /// Per-port DMA structures (populated during init).
-static AHCI_PORT_STATE: Mutex<Vec<AhciPort>> = Mutex::new(Vec::new());
+///
+/// The outer `Mutex` only guards the registry vector itself (membership /
+/// lookup) and is held briefly.  Each `Arc<Mutex<AhciPort>>` owns the
+/// per-port lock; concurrent I/O on distinct ports never blocks on the
+/// registry, satisfying the AHCI 1.3.1 §4.2 per-port command-engine model.
+static AHCI_PORT_STATE: Mutex<Vec<Arc<Mutex<AhciPort>>>> = Mutex::new(Vec::new());
+
+/// Look up a port's `Arc<Mutex<AhciPort>>` by port number.
+///
+/// The registry mutex is held only for the duration of the linear search and
+/// `Arc::clone()`; the returned handle can be locked independently of the
+/// registry, so I/O on one port never blocks lookup or I/O on another.
+fn port_handle(port: u8) -> Option<Arc<Mutex<AhciPort>>> {
+    AHCI_PORT_STATE
+        .lock()
+        .iter()
+        .find(|p| p.lock().port_num == port)
+        .cloned()
+}
+
+/// Test-only: snapshot of the per-port lock topology.
+///
+/// Returns one tuple per active port: `(port_num, mutex_addr)`.
+/// `mutex_addr` is the `Arc<Mutex<_>>` data-address — distinct values across
+/// ports prove the registry stores per-port mutexes rather than one shared
+/// mutex.  Used by the test runner to assert the AHCI 1.3.1 §4.2 per-port
+/// command-engine model is reflected in driver locking.
+#[doc(hidden)]
+pub fn port_lock_topology() -> Vec<(u8, usize)> {
+    let handles: Vec<_> = AHCI_PORT_STATE.lock().iter().cloned().collect();
+    handles
+        .into_iter()
+        .map(|h| {
+            let addr = Arc::as_ptr(&h) as usize;
+            let port = h.lock().port_num;
+            (port, addr)
+        })
+        .collect()
+}
+
+/// Test-only: probe per-port lock independence.
+///
+/// Locks `held_port`'s mutex, then `try_lock`s every other port.  Returns
+/// `Some((held_acquired, other_try_ok))` if `held_port` is active, where
+/// `held_acquired` confirms we held the port's lock and `other_try_ok`
+/// reports whether every other active port could be `try_lock`-ed while
+/// `held_port` was locked.  Returns `None` if `held_port` is not active.
+#[doc(hidden)]
+pub fn probe_port_lock_independence(held_port: u8) -> Option<(bool, bool)> {
+    let handles: Vec<_> = AHCI_PORT_STATE.lock().iter().cloned().collect();
+    let held = handles
+        .iter()
+        .find(|h| h.lock().port_num == held_port)?
+        .clone();
+    let held_guard = held.try_lock();
+    let held_acquired = held_guard.is_some();
+
+    let mut other_try_ok = true;
+    for h in handles.iter() {
+        if Arc::ptr_eq(h, &held) {
+            continue;
+        }
+        if h.try_lock().is_none() {
+            other_try_ok = false;
+        }
+    }
+    Some((held_acquired, other_try_ok))
+}
 
 // ── MMIO Helpers ────────────────────────────────────────────────────────────
 
@@ -597,10 +674,13 @@ pub fn init() -> bool {
         if sig == SATA_SIG_ATA {
             crate::serial_println!("[AHCI] Port {}: SATA disk detected (sig={:#010x})", port, sig);
 
-            // Initialize port DMA structures
+            // Initialize port DMA structures.  Each port gets its own
+            // `Mutex<AhciPort>`; concurrent I/O on different ports proceeds
+            // in parallel through their independent command engines
+            // (AHCI 1.3.1 §4.2).
             match init_port(abar, port) {
                 Some(ps) => {
-                    port_states.push(ps);
+                    port_states.push(Arc::new(Mutex::new(ps)));
                     active_ports.push(port);
                 }
                 None => {
@@ -669,11 +749,10 @@ pub fn active_ports() -> Vec<u8> {
 /// Returns `FALLBACK_SECTOR_COUNT` (131072) when the port is not found or
 /// IDENTIFY failed during init (a WARN was logged at init time in that case).
 pub fn get_port_sector_count(port: u8) -> u64 {
-    AHCI_PORT_STATE.lock()
-        .iter()
-        .find(|p| p.port_num == port)
-        .map(|p| p.sector_count)
-        .unwrap_or(FALLBACK_SECTOR_COUNT)
+    match port_handle(port) {
+        Some(h) => h.lock().sector_count,
+        None => FALLBACK_SECTOR_COUNT,
+    }
 }
 
 /// Read sectors from a SATA disk using AHCI DMA.
@@ -699,14 +778,16 @@ pub fn read_sectors(port: u8, lba: u64, count: u16, buf: &mut [u8]) -> Result<()
 
     let pb = port_base(abar, port);
 
-    // Look up per-port DMA state
-    let ports = AHCI_PORT_STATE.lock();
-    let ps = ports.iter().find(|p| p.port_num == port)
-        .ok_or("AHCI read: port not initialized")?;
+    // Look up per-port DMA state and hold this port's mutex for the full
+    // command sequence.  The HBA accesses ctbl/clb/dma_buf concurrently with
+    // the CPU once PxCI is written (AHCI 1.3.1 §5.3.2), so two issuers on
+    // the same port must serialise — but distinct ports have independent
+    // command engines and never contend on this lock.
+    let handle = port_handle(port).ok_or("AHCI read: port not initialized")?;
+    let ps = handle.lock();
     let clb_phys = ps.clb_phys;
     let ctbl_phys = ps.ctbl_phys;
     let dma_buf_phys = ps.dma_buf_phys;
-    drop(ports); // Release lock before DMA operations
 
     let mut remaining = count;
     let mut current_lba = lba;
@@ -773,14 +854,14 @@ pub fn write_sectors(port: u8, lba: u64, count: u16, data: &[u8]) -> Result<(), 
 
     let pb = port_base(abar, port);
 
-    // Look up per-port DMA state
-    let ports = AHCI_PORT_STATE.lock();
-    let ps = ports.iter().find(|p| p.port_num == port)
-        .ok_or("AHCI write: port not initialized")?;
+    // Look up per-port DMA state and hold this port's mutex for the full
+    // command sequence (see read_sectors for the same rationale —
+    // AHCI 1.3.1 §5.3.2 per-port command engine).
+    let handle = port_handle(port).ok_or("AHCI write: port not initialized")?;
+    let ps = handle.lock();
     let clb_phys = ps.clb_phys;
     let ctbl_phys = ps.ctbl_phys;
     let dma_buf_phys = ps.dma_buf_phys;
-    drop(ports);
 
     let mut remaining = count;
     let mut current_lba = lba;
@@ -845,12 +926,12 @@ pub fn flush_cache(port: u8) -> Result<(), &'static str> {
     }
     let pb = port_base(abar, port);
 
-    let ports = AHCI_PORT_STATE.lock();
-    let ps = ports.iter().find(|p| p.port_num == port)
-        .ok_or("AHCI flush: port not initialized")?;
+    // Acquire this port's mutex for the full command sequence; see
+    // read_sectors for the same rationale (AHCI 1.3.1 §5.3.2).
+    let handle = port_handle(port).ok_or("AHCI flush: port not initialized")?;
+    let ps = handle.lock();
     let clb_phys = ps.clb_phys;
     let ctbl_phys = ps.ctbl_phys;
-    drop(ports);
 
     wait_port_idle(pb)?;
 

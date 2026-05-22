@@ -222,6 +222,10 @@ pub fn run() -> ! {
     total += 1;
     if test_virtio_blk_features_and_flush() { passed += 1; }
 
+    // ── Test 0f: AHCI per-port mutex topology ───────────────────────────
+    total += 1;
+    if test_ahci_per_port_mutex() { passed += 1; }
+
     // ── Test 1: Network Configuration ───────────────────────────────────
 
     total += 1;
@@ -27895,6 +27899,83 @@ fn test_virtio_blk_features_and_flush() -> bool {
     test_println!("  BlockDevice trait surface consistent with module API ✓");
 
     test_pass!("virtio-blk features + flush (Test 0e)");
+    true
+}
+
+// ── Test 0f: AHCI per-port mutex topology ───────────────────────────────────
+//
+// Regression coverage for PR #313 M2: the AHCI driver previously held a
+// single `Mutex<Vec<AhciPort>>` for all port state, which serialised
+// concurrent I/O across distinct ports.  AHCI 1.3.1 §4.2 specifies an
+// independent command engine per port (PxCLB, PxCI, PxIS all per-port);
+// the driver locking topology must reflect that.
+//
+// This test verifies:
+//   1. Every active port has a distinct mutex (Arc data-address differs).
+//   2. Holding port N's mutex via `try_lock` does not block `try_lock` on
+//      any other active port — i.e. ports are truly independent.
+//
+// Skipped if no AHCI controller is present (typical CI configuration runs
+// only virtio-blk; the AHCI path is exercised under QEMU `-device ahci`).
+fn test_ahci_per_port_mutex() -> bool {
+    test_header!("AHCI per-port mutex topology (Test 0f)");
+
+    if !crate::drivers::ahci::is_available() {
+        test_println!("  SKIP: no AHCI controller present");
+        test_pass!("AHCI per-port mutex (skipped — no controller)");
+        return true;
+    }
+
+    let topo = crate::drivers::ahci::port_lock_topology();
+    if topo.is_empty() {
+        test_println!("  SKIP: AHCI present but no active ports");
+        test_pass!("AHCI per-port mutex (skipped — no ports)");
+        return true;
+    }
+    test_println!("  active ports: {}", topo.len());
+
+    // (1) All per-port mutex addresses must be distinct.
+    for i in 0..topo.len() {
+        for j in (i + 1)..topo.len() {
+            if topo[i].1 == topo[j].1 {
+                test_fail!("ahci_per_port_mutex",
+                    "ports {} and {} share mutex address {:#x} — \
+                     locks are not per-port",
+                    topo[i].0, topo[j].0, topo[i].1);
+                return false;
+            }
+        }
+        test_println!("  port {} mutex addr = {:#x}", topo[i].0, topo[i].1);
+    }
+
+    // (2) Holding port[0]'s lock must not block try_lock on any other port.
+    let probe_port = topo[0].0;
+    match crate::drivers::ahci::probe_port_lock_independence(probe_port) {
+        Some((held, others_ok)) => {
+            if !held {
+                test_fail!("ahci_per_port_mutex",
+                    "could not acquire port {} mutex under try_lock", probe_port);
+                return false;
+            }
+            if topo.len() > 1 && !others_ok {
+                test_fail!("ahci_per_port_mutex",
+                    "holding port {} mutex blocked try_lock on another \
+                     port — locks are not independent", probe_port);
+                return false;
+            }
+            test_println!(
+                "  port {} held under try_lock; other ports independent ✓",
+                probe_port
+            );
+        }
+        None => {
+            test_fail!("ahci_per_port_mutex",
+                "probe_port_lock_independence({}) returned None", probe_port);
+            return false;
+        }
+    }
+
+    test_pass!("AHCI per-port mutex topology (Test 0f)");
     true
 }
 
