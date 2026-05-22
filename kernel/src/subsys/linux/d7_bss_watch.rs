@@ -74,7 +74,6 @@
 //!   * transitions FS.base from zero to a non-zero value, AND
 //!   * is performed for `pid == 1` `tid == 1` (firefox-bin init thread —
 //!     pid=1 is firefox-bin under the Linux personality, per
-//!     `[[project_sc1171_litmus_test_worked_2026_05_21]]` and
 //!     [PSE Phase 1](docs/SC1171_PSE_END_TO_END_2026-05-22.md)), AND
 //!   * the new fs_base value is at least `0x18` (so `fs_base - 0x18`
 //!     does not underflow).
@@ -86,11 +85,10 @@
 //!
 //! ## No-fix discipline
 //!
-//! Per the saga-discipline rules ([[feedback_saga_diagnostic_discipline_2026_05_20]],
-//! Rule 1 phys-provenance FIRST), this module emits diagnostic data
-//! only.  It does NOT mutate page tables, allocate frames, change any
-//! lock order, or run any logic outside the WRMSR-precondition path
-//! when `D7_ARM_COUNT == 0`.  Captured fires identify the writer; a
+//! Per saga-discipline Rule 1 (phys-provenance FIRST), this module emits
+//! diagnostic data only.  It does NOT mutate page tables, allocate frames,
+//! change any lock order, or run any logic outside the WRMSR-precondition
+//! path when `D7_ARM_COUNT == 0`.  Captured fires identify the writer; a
 //! *separate* coordinator-dispatched fix uses that identification to
 //! target the exact path.
 //!
