@@ -1701,6 +1701,27 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
         pid, exit_code, calling_tid
     );
 
+    // Honour CLONE_CHILD_CLEARTID for every live thread in the dying
+    // group BEFORE any sibling is marked Dead and BEFORE
+    // `futex_drain_pid` evicts the wait queue.  Per `clone(2)`
+    // ("C library/kernel ABI differences"): "When the thread terminates,
+    // the kernel writes a 0 to that location, and any thread waiting on
+    // a futex at that address will be woken."  Linux runs this for every
+    // task that traverses `do_exit()`, including the caller of
+    // `exit_group(2)` and each sibling reaped during group termination.
+    //
+    // Without this step, a cross-thread joiner parked in `FUTEX_WAIT` on
+    // a sibling's joinstate is never woken when the group exits —
+    // `futex_drain_pid` (a few lines below) silently drops the waiter
+    // without delivering a wake, so `pthread_join(3)` blocks until a
+    // non-existent event.  CWE-833 (Deadlock).
+    //
+    // Lock discipline: the helper snapshots under THREAD_TABLE.lock(),
+    // drops, then performs the write + wake (which themselves acquire
+    // FUTEX_WAITERS and THREAD_TABLE).  Must run with no kernel locks
+    // held, which is the state at function entry.
+    fire_cleartid_for_group(pid);
+
     // Kill every OTHER thread in the process immediately, but NOT the caller
     // (if the caller is itself a thread of this process).
     //
@@ -2164,6 +2185,123 @@ pub fn set_clear_child_tid(pid: Pid, tid: Tid, tidptr: u64) {
     let mut threads = THREAD_TABLE.lock();
     if let Some(t) = threads.iter_mut().find(|t| t.pid == pid && t.tid == tid) {
         t.clear_child_tid = tidptr;
+    }
+}
+
+/// Fire the `CLONE_CHILD_CLEARTID` protocol on every non-Dead thread of
+/// `pid` whose `clear_child_tid` is non-zero, then zero the per-thread
+/// thread-exit ABI slots (`clear_child_tid`, `robust_list_head`,
+/// `robust_list_len`) so the same write cannot be re-played by a later
+/// reaper or by re-use of the `Thread` slot.
+///
+/// Per Linux `clone(2)` (CLONE_CHILD_CLEARTID): "When the thread
+/// terminates, the kernel writes a 0 to that location, and any thread
+/// waiting on a futex at that address will be woken."  Linux runs this
+/// protocol on **every** task that traverses `do_exit()`, including the
+/// thread that calls `exit_group(2)` and every sibling reaped during the
+/// group termination.  A glibc / musl joiner parked in `FUTEX_WAIT` on a
+/// sibling's joinstate (the address registered via `CLONE_CHILD_CLEARTID`)
+/// is otherwise never woken when the group exits — `futex_drain_pid`
+/// silently removes the waiter without delivering a wake, so the joiner's
+/// `pthread_join(3)` blocks until a non-existent event.
+///
+/// AstryxOS's `exit_thread` already honours this protocol for the calling
+/// thread on the per-thread exit path.  `exit_group_inner`, by contrast,
+/// previously marked siblings (and on `yield_self == true`, the caller)
+/// `Dead` without firing the wake — leaving any cross-thread joiner
+/// parked indefinitely.
+///
+/// Lock discipline: the function snapshots `(tid, uaddr)` tuples under
+/// `THREAD_TABLE.lock()`, drops the lock, performs the `write_u32_to_user`
+/// + `futex_wake_for_exit` for each, then re-acquires the lock to zero
+/// the slots.  `futex_wake_for_exit` itself takes `FUTEX_WAITERS.lock()`
+/// then `THREAD_TABLE.lock()` to mark woken waiters `Ready`; calling it
+/// while holding `THREAD_TABLE` would deadlock.  This mirrors the
+/// snapshot-drop-write-wake pattern in `exit_thread` (lines 1258-1287).
+///
+/// Robust-list teardown is intentionally **not** performed here: AstryxOS
+/// stores `robust_list_head` as an opaque user pointer and never walks it
+/// (no userspace currently registers robust mutexes against the kernel —
+/// the slot is round-tripped for `get_robust_list(2)` only).  We simply
+/// zero the field so a future `Thread`-slot reuse cannot re-fire stale
+/// values.
+///
+/// Caller contract: must hold no kernel-level locks (PROCESS_TABLE,
+/// THREAD_TABLE, FUTEX_WAITERS, FILE_LOCKS, …).  Call once at the top of
+/// the group-exit path, before any sibling is marked `Dead`.
+///
+/// Threat-model:
+///   * CWE-833 (Deadlock) — without the wake, `pthread_join(3)` on a
+///     sibling that died via `exit_group(2)` blocks forever.
+///   * CWE-672 (Operation on Resource After Expiration or Release) — the
+///     zeroing of the per-thread slots ensures a recycled `Thread` value
+///     cannot replay an inherited `clear_child_tid` against unrelated
+///     user-VA.
+///
+/// Refs:
+///   * Linux `clone(2)` — CLONE_CHILD_CLEARTID, set_child_tid, FUTEX_WAKE
+///     on task exit ("C library / kernel ABI differences").
+///   * Linux `futex(2)` — NOTES on task-exit semantics.
+///   * Linux `set_tid_address(2)`.
+///   * POSIX-1.2017 `pthread_join(3)`, `pthread_exit(3)`.
+///
+/// Visibility: `pub(crate)` so the `exit_group(2)` ABI test in
+/// `kernel/src/test_runner.rs` can exercise the helper without driving
+/// the full `exit_group_inner` (which would tear down the test runner).
+pub(crate) fn fire_cleartid_for_group(pid: Pid) {
+    // (1) Snapshot user-VA writers under THREAD_TABLE.lock(): every
+    //     non-Dead thread in this process with a registered CLEARTID slot.
+    //     A tuple list is used (not a map) to keep ordering deterministic
+    //     and to bound allocation to the live thread count.
+    let writers: alloc::vec::Vec<(Tid, u64)> = {
+        let threads = THREAD_TABLE.lock();
+        threads
+            .iter()
+            .filter(|t| t.pid == pid
+                     && t.state != ThreadState::Dead
+                     && t.clear_child_tid != 0)
+            .map(|t| (t.tid, t.clear_child_tid))
+            .collect()
+    };
+    if writers.is_empty() {
+        return;
+    }
+    // (2) Resolve the process's CR3 once.  All threads in the same
+    //     process share the same VmSpace by construction (clone(2) without
+    //     CLONE_VM produces a separate Pid), so a single CR3 covers every
+    //     `clear_child_tid` user-VA in the snapshot.
+    let cr3 = {
+        let procs = PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid).map(|p| p.cr3).unwrap_or(0)
+    };
+    // (3) For each writer: zero the user-VA and FUTEX_WAKE one waiter.
+    //     `write_u32_to_user` is fault-immune (it returns early if the
+    //     PTE is not Present), matching the "best effort" semantics
+    //     `exit_thread` already provides for a torn-down VmSpace.
+    //     `futex_wake_for_exit` is a no-op if no waiter is parked on the
+    //     uaddr.
+    for (tid, uaddr) in &writers {
+        #[cfg(feature = "firefox-test")]
+        crate::serial_println!(
+            "[CLEARTID/group] pid={} tid={} clear_addr={:#x} cr3={:#x}",
+            pid, tid, uaddr, cr3
+        );
+        let _ = tid; // silence unused-binding warning when feature off
+        if cr3 != 0 {
+            crate::syscall::write_u32_to_user_pub(cr3, *uaddr, 0);
+        }
+        crate::syscall::futex_wake_for_exit(pid, *uaddr, 1);
+    }
+    // (4) Re-acquire THREAD_TABLE briefly and zero the per-thread slots
+    //     so a recycled `Thread` value cannot replay these writes against
+    //     unrelated user-VA in a future image.  Mirrors the
+    //     `exec_reset_thread_exit_slots` slate that `sys_exec` applies
+    //     across `execve(2)`.
+    let mut threads = THREAD_TABLE.lock();
+    for t in threads.iter_mut().filter(|t| t.pid == pid) {
+        t.clear_child_tid = 0;
+        t.robust_list_head = 0;
+        t.robust_list_len = 0;
     }
 }
 
