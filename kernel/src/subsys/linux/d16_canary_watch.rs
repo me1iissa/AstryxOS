@@ -131,7 +131,7 @@
 
 #![cfg(feature = "d16-canary-watch")]
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Saved-canary slot user VA.  Per the dispositive F3-saga SSP-DIAG
 /// captures the libxul SSP-instrumented function places `[rbp - 8]` /
@@ -151,8 +151,24 @@ const CANARY_SLOT_VA: u64 = 0x0000_7fff_fffe_e4c0;
 /// If a future PMM allocation policy change shifts this, the `[D16/ARM]`
 /// log line records the captured phys at arm time so a post-processor
 /// can detect drift and the next dispatch can update the constant.
+///
+/// PR #383 (D17) observed phys drift: the boot-time backing phys was
+/// `0x129d94c0`, not `0x127114c0`.  Under the D18 extension
+/// (`d18-extended-d16`) the user-VA arm path detects drift and re-arms
+/// the PHYS_OFF channel on the observed phys (see
+/// `OBSERVED_CANARY_PHYS` / `rearm_phys_channel_on_observed`).
 const CANARY_SLOT_PHYS: u64 = 0x1271_1000;
 const CANARY_SLOT_PHYS_OFF: u64 = 0x4c0;
+
+/// Observed canary-slot backing phys (page-aligned), captured at the
+/// first qualifying user-VA arm where `virt_to_phys_in(cr3,
+/// CANARY_SLOT_VA)` returns `Some(p)`.  Initially `0`; set once per
+/// boot (CAS).  Under the D18 extension this is used to re-arm the
+/// PHYS_OFF channel on the observed phys when it differs from the
+/// hard-coded `CANARY_SLOT_PHYS`.  Per Intel SDM Vol. 3A §4.6 the
+/// page-table walk result is authoritative for the current CR3; D18's
+/// re-arm uses this observed value rather than the stale constant.
+static OBSERVED_CANARY_PHYS: AtomicU64 = AtomicU64::new(0);
 
 /// Length of the watched access in bytes — the canary is a single qword.
 /// DR LEN field encoding for 8 bytes is `0b10` (Intel SDM Vol. 3B
@@ -391,4 +407,93 @@ pub fn try_arm_at_syscall(pid: u64, tid: u64) {
             slot, WATCH_LEN, WATCH_KIND_D16_CANARY,
         ),
     }
+
+    // D18 extension — runtime phys detection.  Now that we have the
+    // authoritative backing phys for `CANARY_SLOT_VA` under firefox-bin
+    // CR3, latch it into `OBSERVED_CANARY_PHYS` and (if it differs from
+    // the hard-coded `CANARY_SLOT_PHYS + CANARY_SLOT_PHYS_OFF`) re-arm
+    // the PHYS_OFF channel on the observed phys.  PR #383 (D17) showed
+    // the boot-time backing phys had drifted from `0x127114c0` to
+    // `0x129d94c0`; the original execve-time PHYS_OFF arm was therefore
+    // watching a stale frame.  Per Intel SDM Vol. 3B §17.2.4 the DR
+    // comparison is on linear addresses; the kernel direct map gives
+    // linear = `PHYS_OFF + phys`, so a stale phys = a dead arm.
+    #[cfg(feature = "d18-extended-d16")]
+    if let Some(p) = backing_phys {
+        rearm_phys_channel_on_observed(p, pid, tid, cpu as u64, cr3);
+    }
+}
+
+/// D18 — observe the live backing phys and re-arm the PHYS_OFF channel
+/// if it differs from the constant the execve hook used.
+///
+/// Called from `try_arm_at_syscall` immediately after a successful
+/// user-VA arm.  At that point `walked_phys` is the live page-table-
+/// walk result for `CANARY_SLOT_VA` under the firefox-bin pid=1 tid=1
+/// CR3 (Intel SDM Vol. 3A §4.6).  We:
+///
+///   1. Latch the page-aligned base into `OBSERVED_CANARY_PHYS` via CAS
+///      (one-shot per boot).  Idempotent — a second caller sees a
+///      non-zero value and bails.
+///   2. If `walked_phys` matches the hard-coded
+///      `CANARY_SLOT_PHYS + CANARY_SLOT_PHYS_OFF` exactly, the
+///      execve-time arm was correct; nothing to do.
+///   3. Otherwise, attempt to arm a fresh PHYS_OFF slot on the observed
+///      phys.  We do NOT disarm the original execve-time slot — if the
+///      hard-coded constant happens to be live in this boot (rare
+///      future PMM-policy intersection), keeping both arms is harmless
+///      (they'd both fire on a write to either frame).  The DR pool has
+///      4 slots; this consumes at most one more.  If the pool is
+///      exhausted (e.g. F3 / D15 / pre-insert pool already claimed all
+///      slots), the re-arm logs the failure and proceeds — the user-VA
+///      slot still gives D16 single-channel coverage.
+///
+/// Cited under Intel SDM Vol. 3B §17.2.4 (DR layout), §17.3.1.1 (trap
+/// timing); Intel SDM Vol. 3A §4.6 (page-table walk semantics); CWE-
+/// 121 (the canary corruption taxonomy).
+#[cfg(feature = "d18-extended-d16")]
+fn rearm_phys_channel_on_observed(walked_phys: u64, pid: u64, tid: u64, cpu: u64, cr3: u64) {
+    let frame = walked_phys & !0xFFFu64;
+    let off = walked_phys & 0xFFFu64;
+
+    // Latch — one shot per boot.  CAS from 0 to the observed value;
+    // subsequent callers see non-zero and bail.
+    if OBSERVED_CANARY_PHYS
+        .compare_exchange(0, walked_phys, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    let hardcoded = CANARY_SLOT_PHYS.wrapping_add(CANARY_SLOT_PHYS_OFF);
+    if walked_phys == hardcoded {
+        crate::serial_println!(
+            "[D18/PHYS-OBSERVED] action=no_rearm pid={} tid={} cpu={} cr3={:#x} \
+             observed_phys={:#x} hardcoded_phys={:#x}",
+            pid, tid, cpu, cr3, walked_phys, hardcoded,
+        );
+        return;
+    }
+
+    use crate::arch::x86_64::debug_reg::{
+        arm_phys_slot_watchpoint, retag_slot,
+        ArmPhysResult, WATCH_KIND_D16_CANARY,
+    };
+
+    let result = arm_phys_slot_watchpoint(frame, off, WATCH_LEN);
+    let (state, slot) = match result {
+        ArmPhysResult::Armed(s)      => ("armed", s as i32),
+        ArmPhysResult::PoolExhausted => ("pool_exhausted", -1),
+        ArmPhysResult::NotAligned    => ("not_aligned", -1),
+        ArmPhysResult::OutOfRange    => ("out_of_range", -1),
+    };
+    if let ArmPhysResult::Armed(s) = result {
+        retag_slot(s as usize, WATCH_KIND_D16_CANARY);
+    }
+    crate::serial_println!(
+        "[D18/PHYS-OBSERVED] action=rearm channel=phys_off state={} pid={} tid={} cpu={} \
+         cr3={:#x} observed_phys={:#x} hardcoded_phys={:#x} slot={} len={} kind_tag={}",
+        state, pid, tid, cpu, cr3, walked_phys, hardcoded,
+        slot, WATCH_LEN, WATCH_KIND_D16_CANARY,
+    );
 }
