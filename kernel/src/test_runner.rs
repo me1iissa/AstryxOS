@@ -733,6 +733,11 @@ pub fn run() -> ! {
     total += 1;
     if test_sigsegv_handler() { passed += 1; }
 
+    // ── Test 76b: signal-frame user-stack writability pre-flight (task #229) ─
+
+    total += 1;
+    if test_signal_user_writable_range() { passed += 1; }
+
     // ── Test 77: PTY /dev/ptmx — alloc, TIOCGPTN, read/write, slave ──────────
 
     total += 1;
@@ -15485,6 +15490,122 @@ fn test_sigsegv_handler() -> bool {
     }
 
     if ok { test_pass!("SIGSEGV signal handler infrastructure"); }
+    ok
+}
+
+// ── Test 76b: signal-frame user-stack writability pre-flight ─────────────────
+//
+// Regression test for task #229 / sc=4576: `deliver_sigsegv_from_isr` (and
+// the syscall-return signal delivery path) used to verify only that the
+// user-stack page was present, not that it was writable.  A user thread
+// whose RSP pointed into a PROT_READ mapping at the moment of a synchronous
+// SIGSEGV therefore induced a kernel-mode #PF (error code = P|W = 0x3)
+// during signal-frame construction, which the IDT routed to
+// `BUGCHECK_KERNEL_PAGE_FAULT` — i.e. userspace could oops the kernel
+// (CWE-1037-class).
+//
+// This test exercises `signal::is_user_writable_range` against the three
+// PTE states that arise in practice:
+//   1. PRESENT + USER + WRITABLE  → true   (the normal case)
+//   2. PRESENT + USER, no WRITABLE → false (the bug-triggering case)
+//   3. not present                → false  (already handled by old code)
+//
+// Cited specs: Intel SDM Vol. 3A §4.6 (page-fault error code encoding);
+// POSIX.1-2017 sigaction(2) (default-action fallback when delivery fails).
+fn test_signal_user_writable_range() -> bool {
+    test_header!("signal-frame user-stack writability pre-flight (task #229)");
+
+    use crate::mm::vmm::{
+        map_page_in, unmap_page_in, write_pte, invlpg,
+        PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER,
+    };
+
+    let cr3: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) cr3,
+                         options(nomem, nostack, preserves_flags));
+    }
+
+    // Pick a user-VA window that the live kernel/init process does not use.
+    // 0x0000_0000_2000_0000 sits well below libxul / glibc / vDSO ranges
+    // and well above the NULL guard page.  Two pages so we exercise the
+    // multi-page loop in `is_user_writable_range`.
+    let va: u64 = 0x0000_0000_2000_0000;
+    let len: u64 = 0x2000; // 2 × 4 KiB
+
+    // Allocate two physical frames; remember to free on every exit path.
+    let p0 = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => { test_fail!("sigwritable", "alloc_page #0 failed"); return false; }
+    };
+    let p1 = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => {
+            crate::mm::pmm::free_page(p0);
+            test_fail!("sigwritable", "alloc_page #1 failed"); return false;
+        }
+    };
+
+    let mut ok = true;
+
+    // ── Case 1: both pages PRESENT + USER + WRITABLE → true ──────────────────
+    if !map_page_in(cr3, va,          p0, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+        || !map_page_in(cr3, va+0x1000, p1, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) {
+        test_fail!("sigwritable", "map_page_in failed for RW setup");
+        ok = false;
+    } else if !crate::signal::is_user_writable_range(cr3, va + 0x100, len - 0x200) {
+        test_fail!("sigwritable", "case 1: RW range reported NOT writable");
+        ok = false;
+    } else {
+        test_println!("  case 1 (RW+USER, 2 pages, straddling): writable ✓");
+    }
+
+    // ── Case 2: first page RO, second page RW → false (the bug) ──────────────
+    if ok {
+        // Clear PAGE_WRITABLE on first leaf.
+        write_pte(cr3, va, p0 | PAGE_PRESENT | PAGE_USER);
+        invlpg(va);
+        if crate::signal::is_user_writable_range(cr3, va + 0x100, len - 0x200) {
+            test_fail!("sigwritable", "case 2: RO-then-RW range reported writable");
+            ok = false;
+        } else {
+            test_println!("  case 2 (RO+RW straddle, would oops pre-fix): NOT writable ✓");
+        }
+    }
+
+    // ── Case 3: first page UNMAPPED, second page RW → false ──────────────────
+    if ok {
+        unmap_page_in(cr3, va);
+        if crate::signal::is_user_writable_range(cr3, va + 0x100, len - 0x200) {
+            test_fail!("sigwritable", "case 3: unmapped range reported writable");
+            ok = false;
+        } else {
+            test_println!("  case 3 (unmapped+RW straddle): NOT writable ✓");
+        }
+    }
+
+    // ── Case 4: PRESENT + WRITABLE but missing PAGE_USER (kernel page) ──────
+    // Models a kernel page that somehow ended up at a user VA; must reject.
+    if ok {
+        write_pte(cr3, va, p0 | PAGE_PRESENT | PAGE_WRITABLE);
+        invlpg(va);
+        if crate::signal::is_user_writable_range(cr3, va + 0x100, 0x10) {
+            test_fail!("sigwritable", "case 4: non-USER page reported writable");
+            ok = false;
+        } else {
+            test_println!("  case 4 (PRESENT+W, no USER bit): NOT writable ✓");
+        }
+    }
+
+    // ── Cleanup ──────────────────────────────────────────────────────────────
+    unmap_page_in(cr3, va);
+    unmap_page_in(cr3, va + 0x1000);
+    crate::mm::pmm::free_page(p0);
+    crate::mm::pmm::free_page(p1);
+
+    if ok {
+        test_pass!("signal-frame user-stack writability pre-flight (task #229)");
+    }
     ok
 }
 

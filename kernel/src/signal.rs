@@ -124,6 +124,82 @@ const _SIGNAL_FRAME_SIZE_CHECK: () = {
     assert!(core::mem::size_of::<SignalFrame>() == 112);
 };
 
+/// Verify every 4 KiB page in `[base, base+len)` is mapped as a
+/// **user, writable, present** leaf in the address space identified by
+/// `cr3`.  This is the pre-flight check that signal-frame delivery uses
+/// before issuing supervisor stores to the user stack.
+///
+/// Returning `false` means at least one page in the range is unmapped,
+/// non-user, or read-only.  Returning `true` is a single-point-in-time
+/// snapshot; once SMAP is lifted (`stac`) and the writes begin, another
+/// CPU can still flip the PTE (e.g. mprotect, ptrace, ksm).  That race
+/// is small (the entire frame is ≤ 664 bytes / one page touched) and
+/// the worst case is the same kernel-mode #PF this function was added
+/// to prevent — so the caller MUST still treat a faulting store as
+/// fatal-to-the-process (not fatal-to-the-kernel).  Achieving the
+/// stronger guarantee (no oops even under concurrent mprotect) is the
+/// `extable`/`fixup` mechanism, which is out of scope for this patch.
+///
+/// Huge-page (2 MiB / 1 GiB) leafs are treated as **acceptable** when
+/// the corresponding `virt_to_phys_in` resolves: `lookup_pte_in`
+/// returns `None` for huge mappings, so we fall back to the presence
+/// check.  User stacks are conventionally 4 KiB-paged so this fallback
+/// is essentially never taken in practice (glibc / musl pthread stacks
+/// use anonymous 4 KiB pages per the NPTL design).
+///
+/// Per Intel SDM Vol. 3A §4.6: a supervisor write to a present,
+/// not-writable page raises #PF with error code `P | W` (bits 0+1 set),
+/// regardless of `CR0.WP` for ring 0 — but `CR0.WP = 1` (set in
+/// `arch/x86_64/init`) makes the fault unconditional, which is the
+/// expected hardening posture for a kernel that maps user pages
+/// read-only on CoW and ELF-RO segments.
+///
+/// CWE-1037-class: without this guard, malicious userspace can
+/// induce a kernel oops by arranging RSP to point into a PROT_READ
+/// mapping immediately before raising a synchronous SIGSEGV (e.g.
+/// dereferencing a NULL pointer), since the kernel's signal-frame
+/// delivery would then write to a read-only page in supervisor mode.
+pub(crate) fn is_user_writable_range(cr3: u64, base: u64, len: u64) -> bool {
+    use crate::mm::vmm::{lookup_pte_in, virt_to_phys_in,
+                          PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER};
+    // Iterate every page covered by [base, base+len).  Loop bound is
+    // ceil((base & 0xfff) + len, 4096) — at most 2 pages for the 664-
+    // byte SA_SIGINFO frame, but we keep the loop general so the same
+    // helper can be reused (e.g. by sigaltstack-aware paths later).
+    let end = match base.checked_add(len) {
+        Some(e) => e,
+        None => return false, // u64 wrap is never legitimate user VA
+    };
+    let mut va = base & !0xFFFu64;
+    while va < end {
+        match lookup_pte_in(cr3, va) {
+            Some(pte) => {
+                let want = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+                if pte & want != want {
+                    return false;
+                }
+            }
+            None => {
+                // Either non-present at some level, or terminated in a
+                // huge-page leaf.  Distinguish via virt_to_phys_in:
+                // a translation exists iff the leaf is huge+present.
+                // For huge pages we cannot inspect the W/U bits via
+                // this helper; accept the page rather than spuriously
+                // SIGKILL'ing processes with huge-page stacks.  See the
+                // doc comment for rationale.
+                if virt_to_phys_in(cr3, va).is_none() {
+                    return false;
+                }
+            }
+        }
+        va = match va.checked_add(0x1000) {
+            Some(n) => n,
+            None => return false,
+        };
+    }
+    true
+}
+
 /// Default action for a signal.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SigDefault {
@@ -731,6 +807,32 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
                 total as usize,
             );
 
+            // Pre-flight: every page in [new_rsp, new_rsp+total) must be
+            // present + user + writable.  See `is_user_writable_range` and
+            // the matching guard in `deliver_sigsegv_from_isr` for the full
+            // rationale (Intel SDM Vol. 3A §4.6.1, CWE-1037).  When the
+            // user stack is read-only / unmapped we fall through to
+            // default-action terminate so the kernel does not oops.
+            let cr3: u64;
+            unsafe {
+                core::arch::asm!("mov {}, cr3", out(reg) cr3,
+                                 options(nomem, nostack, preserves_flags));
+            }
+            if !is_user_writable_range(cr3, new_rsp, total) {
+                proc_entry.state = crate::proc::ProcessState::Zombie;
+                proc_entry.exit_code = -(sig as i32);
+                crate::serial_println!(
+                    "[SIGNAL] Process {} signal {} delivery aborted: user stack \
+                     {:#x}+{} not writable; terminating (POSIX.1-2017 sigaction(2) \
+                     default-action fallback)",
+                    pid, sig, new_rsp, total
+                );
+                drop(procs);
+                crate::proc::fire_cleartid_for_group(pid);
+                crate::proc::exit_thread(-(sig as i64));
+                return 0; // unreachable
+            }
+
             // Write the signal frame to user memory.
             // Per Intel SDM Vol. 3A §4.6.1: with CR4.SMAP=1 a supervisor
             // store to a user-mapped page raises #PF unless EFLAGS.AC=1.
@@ -958,15 +1060,28 @@ pub unsafe fn deliver_sigsegv_from_isr(
         (new_rsp + sigframe_size) as *mut u8
     };
 
-    // ── Guard: verify user stack is mapped before writing ────────────────────
-    // If the user stack is unmapped, writing the signal frame would fault in
-    // kernel mode (nested #PF → double fault on SMP where the ISR stack is the
-    // only valid kernel memory).  Return false so the caller kills the process
-    // via exit_thread instead.
+    // ── Guard: verify user stack is mapped USER+WRITABLE before storing ─────
+    // If the user stack is unmapped, OR present-but-read-only, OR present-but-
+    // not-USER, writing the signal frame would fault in kernel mode (nested
+    // #PF → BUGCHECK_KERNEL_PAGE_FAULT, on SMP a double fault is also possible
+    // since the ISR stack is the only guaranteed valid kernel memory).  Per
+    // Intel SDM Vol. 3A §4.6.1 a supervisor store to a present, not-writable
+    // page raises #PF with error_code `P|W` (= 0x3) — exactly the kernel oops
+    // class this guard exists to prevent.  Return false so the caller kills
+    // the process via exit_thread instead.
+    //
+    // We walk every page in [new_rsp, new_rsp + total) (≤ 2 pages for the
+    // 664-byte SA_SIGINFO frame), not just `new_rsp`, because the frame can
+    // straddle a page boundary when the user stack ends near one and the
+    // tail page is mapped but read-only / non-user.
+    //
+    // CWE-1037-class hardening: malicious userspace can otherwise arrange
+    // RSP into a PROT_READ mapping immediately before raising a synchronous
+    // SIGSEGV to oops the kernel.
     {
         let cr3: u64;
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
-        if crate::mm::vmm::virt_to_phys_in(cr3, new_rsp).is_none() {
+        if !is_user_writable_range(cr3, new_rsp, total) {
             drop(procs); // release PROCESS_TABLE lock before returning
             return false;
         }
