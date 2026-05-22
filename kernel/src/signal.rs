@@ -163,6 +163,20 @@ const _SIGNAL_FRAME_SIZE_CHECK: () = {
 /// synchronous SIGSEGV (e.g. dereferencing a NULL pointer), since the
 /// kernel's signal-frame delivery would then write to a read-only page
 /// in supervisor mode.
+///
+/// TOCTOU note: this is a check-then-store helper.  Between the page-table
+/// walk here and the kernel's subsequent supervisor write in the caller, a
+/// concurrent thread sharing the same address space could in principle
+/// remap the range non-writable.  In practice the window is mitigated two
+/// ways: (1) the supervisor write is bracketed by the existing
+/// `extable`/fault-fixup machinery, so a racing remap downgrades from a
+/// fail-stop kernel oops to a SIGSEGV the user already expected; and (2)
+/// per-page atomic guard primitives (e.g. PTE-locked "begin-store" tokens)
+/// are deferred to a future hardening pass rather than added here, since
+/// they require touching every user-VA store path, not just signal
+/// delivery.  Threat model is "unprivileged userspace cannot induce a
+/// kernel oops on the synchronous SIGSEGV path", which the check-then-
+/// store shape already satisfies in conjunction with the fault fixup.
 pub(crate) fn is_user_writable_range(cr3: u64, base: u64, len: u64) -> bool {
     use crate::mm::vmm::{lookup_pte_in, virt_to_phys_in,
                           PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER};

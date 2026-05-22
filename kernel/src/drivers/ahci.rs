@@ -441,7 +441,10 @@ fn init_port(abar: u64, port: u8) -> Option<AhciPort> {
         }
     };
 
-    let _ = port; // discriminator now lives on PortEntry, not AhciPort
+    // The `port` discriminator now lives on `PortEntry` outside `AhciPort`
+    // (see AHCI 1.3.1 §4.2 per-port decoupling, PR #390); `port` is still
+    // consumed above for `port_base()`, `serial_println!`, and the
+    // IDENTIFY DEVICE log lines.
     Some(AhciPort {
         clb_phys,
         fb_phys,
