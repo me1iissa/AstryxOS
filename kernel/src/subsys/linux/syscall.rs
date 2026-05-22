@@ -743,6 +743,18 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     #[cfg(feature = "vfork-canary-diag")]
     crate::subsys::linux::vfork_diag::maybe_log_sibling_syscall(num);
 
+    // ── D15 `RegisteredThread::mThreadInfo` watcher (diagnostic-only) ──────
+    // Off-path cost on every Linux syscall when D15 is built: a single
+    // pid+tid compare and one relaxed atomic load.  Once the arm has
+    // been claimed (within the first ~few syscalls of firefox-bin
+    // pid=1) the fast-path guard bails immediately.  See
+    // `d15_mthread_watch.rs` for the full strategy + signature classes.
+    #[cfg(feature = "d15-mthread-watch")]
+    crate::subsys::linux::d15_mthread_watch::try_arm_at_syscall(
+        crate::proc::current_pid_lockless(),
+        crate::proc::current_tid(),
+    );
+
     // ── Tier-0 trace: one self-contained line per syscall entry ──────────────
     // Grepped by qemu-harness.py via `^\[SC\] `.  User RIP comes from the
     // per-CPU syscall_entry stash (set by the naked-asm stub before dispatch).

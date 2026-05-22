@@ -280,29 +280,52 @@ fs-base-trace = ["firefox-test", "ssp-canary-diag"]
 d7-bss-watch = ["firefox-test", "w215-diag"]
 # D8 fault-time TLS-slot dump + phys-frame provenance
 # (kernel/src/subsys/linux/d8_fault_tls_dump.rs).  Hooks the user-mode
-# fatal-#PF path (idt.rs handle_exception vector 14) and on a
-# fingerprint match (cr2=0x20, opcode prefix 49 8b 5e 20
-# = mov 0x20(%r14), %rbx per Intel SDM Vol. 2A 2.1, pid=1) emits a
-# multi-line [D8/FAULT-DUMP] block containing the user-GPR state,
-# the value of [fs:-0x18] AT FAULT TIME, the physical frame backing
+# fatal-#PF path (idt.rs `handle_exception` vector 14) and on a
+# fingerprint match (cr2=0x20, opcode prefix `49 8b 5e 20`
+# = `mov 0x20(%r14), %rbx` per Intel SDM Vol. 2A §2.1, pid=1) emits a
+# multi-line `[D8/FAULT-DUMP]` block containing the user-GPR state,
+# the value of `[fs:-0x18]` AT FAULT TIME, the physical frame backing
 # that VA, and FREE_SHADOW + ALLOC_SHADOW lookups on that phys frame
-# (w215_diag PR #354 / Track K rings, reused by reference).
-# Single-shot per boot (D8_FIRE_MAX = 1) — the sc=1171 fingerprint
-# is deterministic, one capture dispositive.  D7 (d7-bss-watch,
-# PR #371) catches writes to the slot; D8 is the orthogonal angle
-# for the Z1 — anon-mmap returned a non-zero frame on first read
+# (`w215_diag` PR #354 / Track K rings, reused by reference).
+# Single-shot per boot (`D8_FIRE_MAX = 1`) — the sc=1171 fingerprint
+# is deterministic, one capture dispositive.  D7 (`d7-bss-watch`,
+# PR #371) catches *writes* to the slot; D8 is the orthogonal angle
+# for the **Z1 — anon-mmap returned a non-zero frame on first read**
 # survivor case where D7 records zero captures.  If the value at
-# [fs:-0x18] at fault time is zero, Z1 is falsified.  If non-zero
-# AND FREE_SHADOW hits, anon-PF returned a recycled frame without
-# honouring the ELF gABI 5.2 PT_TLS BSS zero-fill contract
+# `[fs:-0x18]` at fault time is **zero**, Z1 is falsified.  If it is
+# non-zero AND FREE_SHADOW hits, anon-PF returned a recycled frame
+# without honouring the ELF gABI §5.2 PT_TLS BSS zero-fill contract
 # (CWE-908).  If non-zero AND FREE_SHADOW empty, the slot was
 # mutated by a path the W215 rings do not cover.  Diagnostic-only;
 # default builds remain byte-identical when off.  Depends on
-# firefox-test (trace formatters) and w215-diag (shadow rings).
-# Refs: Intel SDM Vol. 3A 3.4.4 (IA32_FS_BASE), 4.10.5 (TLB);
-# Intel SDM Vol. 2A 2.1 (Instruction Format); ELF gABI 5.2;
+# `firefox-test` (trace formatters) and `w215-diag` (shadow rings).
+# Refs: Intel SDM Vol. 3A §3.4.4 (`IA32_FS_BASE`), §4.10.5 (TLB);
+# Intel SDM Vol. 2A §2.1 (Instruction Format); ELF gABI §5.2;
 # POSIX mmap(2); CWE-908, CWE-401.
 d8-tls-fault-dump = ["firefox-test", "w215-diag"]
+# D15 `RegisteredThread::mThreadInfo` slot writer trap
+# (kernel/src/subsys/linux/d15_mthread_watch.rs).  Hooks
+# `subsys::linux::syscall::dispatch` and arms a write-only hardware
+# watchpoint (Intel SDM Vol. 3B §17.2.4) on the heap qword at
+# `*(fs:-0x18) + 0x38` — Mozilla's `RegisteredThread::mThreadInfo`
+# field — the first time the TLS-published `sRegisteredThread` pointer
+# becomes non-zero on firefox-bin pid=1 tid=1.  Each `#DB` fire emits
+# `[W215/DR-WATCH-FIRE] kind_tag=4 …` naming the writer RIP, CS, CR3.
+# Designed to disposition Phase 2-E (heap +0x38 reads zero at sc=1171
+# despite the outer object being allocator-clean).  Two-pass workflow:
+# observe ARM line to confirm the captured `tls_val` matches D8's
+# `tls_at_fs_minus_0x18`, then read fire lines (or zero-captures, which
+# is dispositive of "no writer between TLS publish and read").  Single
+# arm per boot (`D15_ARM_MAX = 1`); persistent fires bounded by the
+# existing `F3_FIRE_CAP = 32`.  Diagnostic-only; default builds remain
+# byte-identical when off.  Depends on `firefox-test` (trace formatters)
+# and `w215-diag` (DR plumbing).
+# Refs: Intel SDM Vol. 3B §17.2.4 (DR0–DR3, DR7), §17.3.1.1 (data-
+# breakpoint trap timing); Intel SDM Vol. 3A §3.4.4.1 (`IA32_FS_BASE`),
+# §4.6 (page boundary); System V AMD64 ABI §3.4.4 (TLS variant II);
+# Mozilla searchfox `mozglue/baseprofiler/core/RegisteredThread.cpp`;
+# POSIX mmap(2).
+d15-mthread-watch = ["firefox-test", "w215-diag"]
 # Track B (Phase 5, 2026-05-21) — stack-page write provenance ring.
 # Records kernel-mode writes whose target user VA falls into the
 # `[0x3f00_0000_0000, 0x4000_0000_0000)` thread-stack range (per Phase 4
