@@ -207,7 +207,7 @@ Ranked by frequency in real program traces. Syscalls that would most unblock rea
 | 166 | `umount` | Full; delegates to vfs::sys_umount (flags=0) |
 | 169 | `umount2` | Full; delegates to vfs::sys_umount with flags |
 | 186 | `gettid` | Full |
-| 202 | `futex` | Full; WAIT, WAKE, REQUEUE, CMP_REQUEUE, WAIT_BITSET, WAKE_BITSET; under `firefox-test` / `test-mode` features a bounded broadcast-within-cluster wake compensation runs when `FUTEX_WAKE` finds 0 waiters (glibc BZ 25847 mitigation, runtime-gated via `kdb futex-set-cluster-wake`) |
+| 202 | `futex` | WAIT, WAKE, REQUEUE, CMP_REQUEUE, WAIT_BITSET, WAKE_BITSET, FUTEX_CLOCK_REALTIME (absolute deadline). WAKE_OP returns ENOSYS — glibc/musl fall back. Key shape is `(pid, uaddr)` — FUTEX_PRIVATE per `futex(2)`; FUTEX_PRIVATE_FLAG is treated as a hint (no separate key space). FUTEX_SHARED (`pthread_mutexattr_setpshared`, `pshared` semaphores, MAP_SHARED condvars) is NOT distinguished — same `(pid, uaddr)` key applies, which is correct only when both processes happen to map the shared region at the same VA. Cross-process MAP_SHARED futex synchronisation at differing VAs would miss; no upstream binary on the current demo path uses it (strace differential 2026-05-20: musl-FF uses FUTEX_PRIVATE only). Under `firefox-test` / `test-mode` a bounded broadcast-within-cluster wake compensation runs when `FUTEX_WAKE` finds 0 waiters (glibc BZ 25847 mitigation, runtime-gated via `kdb futex-set-cluster-wake`). |
 | 204 | `sched_getaffinity` | Full; writes per-CPU bitmask |
 | 213 | `epoll_create` | Full |
 | 217 | `getdents64` | Full |
