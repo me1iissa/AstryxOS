@@ -569,7 +569,17 @@ fn alloc_kernel_stack() -> Option<(u64, u64)> {
         let stack_base = KERNEL_VIRT_OFFSET + phys;
         let stack_top = stack_base + 0x1000; // 4KB usable
         write_stack_canary(stack_base);
-        crate::serial_println!("[PROC] WARN: 4KB emergency kernel stack (PMM fragmented)");
+        // Record in the emergency-stack ring so the canary-corruption
+        // diagnostic in `sched::schedule` can attribute a later overflow
+        // to "ran on the 4 KiB emergency fallback".  The caller stamps
+        // `kernel_stack_size = KERNEL_STACK_SIZE` (256 KiB) regardless,
+        // so the Thread itself does NOT carry the real span — the ring
+        // is the only attribution channel.
+        record_emergency_kstack(stack_base);
+        crate::serial_println!(
+            "[KSTACK/EMERGENCY] base={:#x} size=4K (PMM fragmented)",
+            stack_base,
+        );
         return Some((stack_base, stack_top));
     }
     None
@@ -593,6 +603,73 @@ pub fn write_stack_canary(stack_base: u64) {
 pub fn check_stack_canary(stack_base: u64) -> bool {
     if stack_base < KERNEL_VIRT_OFFSET || stack_base == 0 { return true; } // skip for idle/untracked stacks
     unsafe { core::ptr::read_volatile(stack_base as *const u64) == STACK_END_MAGIC }
+}
+
+/// Read the live u64 stored at the kernel-stack canary slot.  Used by the
+/// canary-corruption diagnostic in `sched::schedule` to emit the observed
+/// bytes when the check fails — no panic path, so we can format/print.
+#[inline]
+pub fn read_stack_canary(stack_base: u64) -> u64 {
+    if stack_base < KERNEL_VIRT_OFFSET || stack_base == 0 { return 0; }
+    unsafe { core::ptr::read_volatile(stack_base as *const u64) }
+}
+
+/// Read another u64 from the canary region (offset in bytes from base).
+/// Returns 0 if the address would be outside the higher-half kernel map.
+#[inline]
+pub fn read_stack_word_at(stack_base: u64, byte_offset: u64) -> u64 {
+    let addr = stack_base.wrapping_add(byte_offset);
+    if addr < KERNEL_VIRT_OFFSET { return 0; }
+    unsafe { core::ptr::read_volatile(addr as *const u64) }
+}
+
+/// Read the current CPU's RSP via inline assembly.  Safe to call from any
+/// kernel context; observes only the live register.  Used by syscall-trace
+/// and the canary diagnostic to compute stack depth (top - rsp).
+#[inline(always)]
+pub fn current_kernel_rsp_live() -> u64 {
+    let rsp: u64;
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)) };
+    rsp
+}
+
+// ── Emergency-stack-fallback recorder ────────────────────────────────────
+//
+// When `alloc_kernel_stack` falls back to a single 4 KiB page (PMM
+// fragmentation, line ~568 below), the caller still stamps
+// `kernel_stack_size = KERNEL_STACK_SIZE` on the resulting Thread — there
+// is no in-Thread record of the actual span.  Without that record, a
+// later canary-corruption (STACK_CANARY_CORRUPT bugcheck) cannot be
+// attributed to "took the emergency 4 KiB path".  This diagnostic-only
+// ring of recently-emitted emergency-stack bases lets the canary check
+// in `sched::schedule` answer "was this thread on a 4 KiB stack?".
+//
+// Lock-free SPSC-ish ring; the writer is the alloc path (one writer at a
+// time under PMM_LOCK), the readers are diagnostic emitters that tolerate
+// torn reads (worst-case: false negative).
+const EMERGENCY_KSTACK_RING_LEN: usize = 16;
+static EMERGENCY_KSTACK_RING: [AtomicU64; EMERGENCY_KSTACK_RING_LEN] =
+    [const { AtomicU64::new(0) }; EMERGENCY_KSTACK_RING_LEN];
+static EMERGENCY_KSTACK_HEAD: AtomicU64 = AtomicU64::new(0);
+
+/// Record that `stack_base` was just handed out from the 4 KiB
+/// emergency-fallback path.  Called from `alloc_kernel_stack`.
+pub fn record_emergency_kstack(stack_base: u64) {
+    let slot = (EMERGENCY_KSTACK_HEAD.fetch_add(1, Ordering::Relaxed)
+        as usize) % EMERGENCY_KSTACK_RING_LEN;
+    EMERGENCY_KSTACK_RING[slot].store(stack_base, Ordering::Relaxed);
+}
+
+/// Return true iff `stack_base` matches a recently-recorded emergency
+/// 4 KiB fallback base.  Best-effort: the ring holds the last 16 entries.
+pub fn was_emergency_kstack(stack_base: u64) -> bool {
+    if stack_base == 0 { return false; }
+    for i in 0..EMERGENCY_KSTACK_RING_LEN {
+        if EMERGENCY_KSTACK_RING[i].load(Ordering::Relaxed) == stack_base {
+            return true;
+        }
+    }
+    false
 }
 
 /// Higher-half virtual offset.  The bootloader identity-maps the first 4 GiB
