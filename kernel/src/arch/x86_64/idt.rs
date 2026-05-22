@@ -777,6 +777,34 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
                 unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3_now, options(nomem, nostack, preserves_flags)); }
                 let pid = crate::proc::current_pid_lockless();
                 crate::signal::emit_fault_phys_for_fatal(pid, frame.rip, cr2, cr3_now);
+                // D13 (2026-05-22): also dump per-phys provenance for the
+                // SysV AMD64 argument registers — the GPRs most likely to
+                // hold a user pointer at the moment of fault.  Reads from
+                // the ISR push frame (see push order in `isr_with_error!`
+                // — frame layout: rsp+128 = InterruptFrame, descending
+                // pushes below it).  Offsets below mirror the existing
+                // `rbp_at_fault` deref above (frame.sub(12)).
+                //
+                // SAFETY: the ISR stub guarantees the GPR pushes occupy
+                // the 16 u64 slots immediately below `frame` (see the
+                // `isr_with_error!` macro definition lower in this file).
+                // Reads are 8-byte aligned and within the kernel stack
+                // page we are executing on.
+                #[cfg(feature = "firefox-test")]
+                {
+                    let base = frame as *const InterruptFrame as *const u64;
+                    let rdx = unsafe { *base.sub(4) };
+                    let rsi = unsafe { *base.sub(5) };
+                    let rdi = unsafe { *base.sub(6) };
+                    let r8  = unsafe { *base.sub(7) };
+                    let r9  = unsafe { *base.sub(8) };
+                    let rcx = unsafe { *base.sub(3) };
+                    crate::signal::emit_fault_gpr_phys_for_fatal(
+                        pid, cr3_now,
+                        &[("rdi", rdi), ("rsi", rsi), ("rdx", rdx),
+                          ("rcx", rcx), ("r8", r8), ("r9", r9)],
+                    );
+                }
                 // PSE 2026-05-20: full VMA enumeration to anchor PIE-ASLR
                 // bases (libxul, ld-musl, anonymous JIT) at fatal-user-#PF
                 // time.  Bounded 4 dumps/boot; see `mm::vma_dump`.
@@ -1112,6 +1140,26 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
             unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3_now, options(nomem, nostack, preserves_flags)); }
             let pid = crate::proc::current_pid_lockless();
             crate::signal::emit_fault_phys_for_fatal(pid, frame.rip, 0, cr3_now);
+            // D13 (2026-05-22): mirror the user-#PF site — dump per-phys
+            // provenance for the SysV AMD64 argument registers.  A #UD on
+            // a `call [rdi]` through a freed vtable is named by the
+            // FREE-shadow on `rdi`'s page just as well here as it would be
+            // at the corresponding #PF.  See SysV AMD64 ABI §3.2.3.
+            #[cfg(feature = "firefox-test")]
+            {
+                let base = frame as *const InterruptFrame as *const u64;
+                let rdx = unsafe { *base.sub(4) };
+                let rsi = unsafe { *base.sub(5) };
+                let rdi = unsafe { *base.sub(6) };
+                let r8  = unsafe { *base.sub(7) };
+                let r9  = unsafe { *base.sub(8) };
+                let rcx = unsafe { *base.sub(3) };
+                crate::signal::emit_fault_gpr_phys_for_fatal(
+                    pid, cr3_now,
+                    &[("rdi", rdi), ("rsi", rsi), ("rdx", rdx),
+                      ("rcx", rcx), ("r8", r8), ("r9", r9)],
+                );
+            }
             // PSE 2026-05-20: full VMA enumeration to anchor PIE-ASLR
             // bases (libxul, ld-musl, anonymous JIT) at fatal-user-#UD /
             // #GP / #AC time.  Bounded 4 dumps/boot; see `mm::vma_dump`.
