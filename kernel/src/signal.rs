@@ -154,11 +154,15 @@ const _SIGNAL_FRAME_SIZE_CHECK: () = {
 /// expected hardening posture for a kernel that maps user pages
 /// read-only on CoW and ELF-RO segments.
 ///
-/// CWE-1037-class: without this guard, malicious userspace can
-/// induce a kernel oops by arranging RSP to point into a PROT_READ
-/// mapping immediately before raising a synchronous SIGSEGV (e.g.
-/// dereferencing a NULL pointer), since the kernel's signal-frame
-/// delivery would then write to a read-only page in supervisor mode.
+/// Threat model — CWE-754 (Improper Check for Unusual or Exceptional
+/// Conditions), cross-referenced with CWE-20 (Improper Input Validation
+/// on user-controlled RSP) and CWE-617 (Reachable Assertion: the kernel
+/// bugcheck is reachable from unprivileged userspace).  Without this
+/// guard, malicious userspace can induce a kernel oops by arranging RSP
+/// to point into a PROT_READ mapping immediately before raising a
+/// synchronous SIGSEGV (e.g. dereferencing a NULL pointer), since the
+/// kernel's signal-frame delivery would then write to a read-only page
+/// in supervisor mode.
 pub(crate) fn is_user_writable_range(cr3: u64, base: u64, len: u64) -> bool {
     use crate::mm::vmm::{lookup_pte_in, virt_to_phys_in,
                           PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER};
@@ -810,9 +814,10 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
             // Pre-flight: every page in [new_rsp, new_rsp+total) must be
             // present + user + writable.  See `is_user_writable_range` and
             // the matching guard in `deliver_sigsegv_from_isr` for the full
-            // rationale (Intel SDM Vol. 3A §4.6.1, CWE-1037).  When the
-            // user stack is read-only / unmapped we fall through to
-            // default-action terminate so the kernel does not oops.
+            // rationale (Intel SDM Vol. 3A §4.6.1; CWE-754 / CWE-20 /
+            // CWE-617).  When the user stack is read-only / unmapped we
+            // fall through to default-action terminate so the kernel does
+            // not oops.
             let cr3: u64;
             unsafe {
                 core::arch::asm!("mov {}, cr3", out(reg) cr3,
@@ -1075,9 +1080,9 @@ pub unsafe fn deliver_sigsegv_from_isr(
     // straddle a page boundary when the user stack ends near one and the
     // tail page is mapped but read-only / non-user.
     //
-    // CWE-1037-class hardening: malicious userspace can otherwise arrange
-    // RSP into a PROT_READ mapping immediately before raising a synchronous
-    // SIGSEGV to oops the kernel.
+    // CWE-754 / CWE-20 / CWE-617 hardening: malicious userspace can
+    // otherwise arrange RSP into a PROT_READ mapping immediately before
+    // raising a synchronous SIGSEGV to oops the kernel.
     {
         let cr3: u64;
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
