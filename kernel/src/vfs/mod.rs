@@ -489,6 +489,21 @@ pub fn init() {
               HOME_URL=\"https://example.org/astryxos\"\n");
     }
 
+    // /srv/index.html — document served by the httpd-test in-kernel
+    // HTTP responder (PIVOT-C, 2026-05-23).  Gated to httpd-test so the
+    // default kernel build doesn't carry the ~700-byte tmpfs entry.
+    // The responder also has a compiled-in fallback in httpd_demo.rs,
+    // so a tmpfs miss is benign; we still seed here so the served bytes
+    // demonstrably came from "kernel-managed VFS" rather than a const.
+    #[cfg(feature = "httpd-test")]
+    {
+        let _ = mkdir("/srv");
+        if let Ok(()) = create_file("/srv/index.html") {
+            let _ = write_file("/srv/index.html",
+                crate::httpd_demo::INDEX_HTML);
+        }
+    }
+
     // /etc/machine-id — required by GLib, systemd, D-Bus, and many userspace tools.
     // Must be a 32-character lowercase hex string.
     if let Ok(()) = create_file("/etc/machine-id") {

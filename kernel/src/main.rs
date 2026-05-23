@@ -60,6 +60,8 @@ mod util;
 mod record_replay;
 #[cfg(any(feature = "busybox-test", feature = "wget-test"))]
 mod busybox_demo;
+#[cfg(feature = "httpd-test")]
+mod httpd_demo;
 
 use astryx_shared::{BootInfo, BOOT_INFO_MAGIC};
 
@@ -385,6 +387,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "firefox-test"),
                   not(feature = "busybox-test"),
                   not(feature = "wget-test"),
+                  not(feature = "httpd-test"),
                   feature = "xeyes-test"))]
         {
             serial_println!("[XEYES] xeyes-test mode starting...");
@@ -588,6 +591,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         #[cfg(all(not(feature = "gui-test"),
                   not(feature = "xeyes-test"),
                   not(feature = "firefox-test"),
+                  not(feature = "httpd-test"),
                   any(feature = "busybox-test", feature = "wget-test")))]
         {
             hal::enable_interrupts();
@@ -627,12 +631,62 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             loop { unsafe { core::arch::asm!("hlt"); } }
         }
 
+        // ── httpd-test: kernel-as-HTTP-server demo (PIVOT-C, 2026-05-23) ──
+        // Headless: no X11, no compositor, no userspace processes — just
+        // bind a TCP listener on port 8080 and answer inbound HTTP/1.1
+        // GETs with a static HTML body served from the kernel-managed
+        // in-RAM tmpfs.  See kernel/src/httpd_demo.rs for the responder.
+        //
+        // Mutually exclusive with the other *-test cargo features at the
+        // cfg-gate level (all share the BSP idle slot).  Networking
+        // (net::init) and TCP (tcp::tcp_timer_tick via net::poll()) are
+        // already initialised by the earlier `net::init()` call in this
+        // function; we just open a listener here and run the demo loop.
+        #[cfg(all(not(feature = "gui-test"),
+                  not(feature = "xeyes-test"),
+                  not(feature = "firefox-test"),
+                  not(feature = "busybox-test"),
+                  not(feature = "wget-test"),
+                  feature = "httpd-test"))]
+        {
+            hal::enable_interrupts();
+            if !sched::is_active() {
+                sched::enable();
+            }
+            // Brief scheduler settle (matches busybox-test / xeyes-test
+            // patterns above).
+            let t0 = arch::x86_64::irq::get_ticks();
+            while arch::x86_64::irq::get_ticks().wrapping_sub(t0) < 30 {
+                core::hint::spin_loop();
+            }
+
+            httpd_demo::run_httpd_demo();
+
+            serial_println!("[HTTPD] DONE");
+
+            // Brief pause then exit QEMU via the isa-debug-exit port.
+            let t_done = arch::x86_64::irq::get_ticks();
+            while arch::x86_64::irq::get_ticks().wrapping_sub(t_done) < 100 {
+                core::hint::spin_loop();
+            }
+            unsafe {
+                core::arch::asm!(
+                    "out dx, eax",
+                    in("dx")  0xf4_u16,
+                    in("eax") 0_u32,
+                    options(nomem, nostack)
+                );
+            }
+            loop { unsafe { core::arch::asm!("hlt"); } }
+        }
+
         // ── X11 visual test: create a colored window and hold it on screen ──
         // Activated by firefox-test mode — shows an X11 window before Firefox.
         #[cfg(all(not(feature = "gui-test"),
                   not(feature = "xeyes-test"),
                   not(feature = "busybox-test"),
                   not(feature = "wget-test"),
+                  not(feature = "httpd-test"),
                   feature = "firefox-test"))]
         {
             serial_println!("[FFTEST] Firefox-test mode starting...");
@@ -993,7 +1047,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         }
 
         // ── Normal boot: launch userspace + interactive shell ──────────────
-        #[cfg(not(any(feature = "gui-test", feature = "firefox-test", feature = "xeyes-test", feature = "busybox-test", feature = "wget-test")))]
+        #[cfg(not(any(feature = "gui-test", feature = "firefox-test", feature = "xeyes-test", feature = "busybox-test", feature = "wget-test", feature = "httpd-test")))]
         {
         // Phase 13: Launch Ascension (init) and Orbit (shell) as Ring 3 processes
         serial_println!("[Aether] Phase 13: Launching userspace processes...");
@@ -1053,7 +1107,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         // Drop to the kernel shell for interactive debugging/management.
         // Ascension will eventually replace this with a full user-mode init.
         shell::launch()
-        } // end #[cfg(not(any(feature = "gui-test", feature = "firefox-test", feature = "xeyes-test", feature = "busybox-test", feature = "wget-test")))]
+        } // end #[cfg(not(any(feature = "gui-test", feature = "firefox-test", feature = "xeyes-test", feature = "busybox-test", feature = "wget-test", feature = "httpd-test")))]
     }
 }
 

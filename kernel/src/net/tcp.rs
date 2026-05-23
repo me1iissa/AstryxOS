@@ -737,10 +737,12 @@ pub fn tcp_timer_tick() {
 // ── Public query API ──────────────────────────────────────────────────────────
 
 /// Snapshot of a connection's 4-tuple + state.  Used by kdb for child-of-
-/// listener discovery without exposing the full TCB struct.  Gated to
-/// preserve byte-identical default builds — the struct would otherwise
-/// alter LLVM's symbol mangling hashes of neighbouring statics.
-#[cfg(feature = "kdb")]
+/// listener discovery and by the PIVOT-C httpd_demo for accept-equivalent
+/// session admission, without either consumer holding the TCB lock or
+/// touching the full TCB struct.  Gated to preserve byte-identical
+/// default builds — the struct would otherwise alter LLVM's symbol
+/// mangling hashes of neighbouring statics.
+#[cfg(any(feature = "kdb", feature = "httpd-test"))]
 #[derive(Clone, Copy)]
 pub struct ConnSnap {
     pub local_port:  u16,
@@ -751,7 +753,7 @@ pub struct ConnSnap {
 
 /// Return a snapshot of every connection in the TCP table.  Caller-owned
 /// copy — safe to use after the lock is dropped.
-#[cfg(feature = "kdb")]
+#[cfg(any(feature = "kdb", feature = "httpd-test"))]
 pub fn snapshot_connections() -> alloc::vec::Vec<ConnSnap> {
     TCP_CONNECTIONS.lock().iter().map(|c| ConnSnap {
         local_port:  c.local_port,
@@ -770,7 +772,7 @@ pub fn snapshot_connections() -> alloc::vec::Vec<ConnSnap> {
 /// received their entire response.  Closing while either count is non-
 /// zero discards the buffered tail because the FIN advances `send_next`
 /// past data that has not yet been transmitted.
-#[cfg(feature = "kdb")]
+#[cfg(any(feature = "kdb", feature = "httpd-test"))]
 pub fn outbound_pending(local_port: u16, remote_ip: Ipv4Address, remote_port: u16) -> usize {
     TCP_CONNECTIONS.lock().iter()
         .find(|c| c.local_port == local_port

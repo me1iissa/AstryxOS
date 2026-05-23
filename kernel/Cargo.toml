@@ -34,6 +34,24 @@ xeyes-test = []
 # Public refs: BusyBox <https://busybox.net/>, POSIX exec / write / read,
 # os-release(5).
 busybox-test = []
+# httpd-test — kernel-as-HTTP-server demo (PIVOT-C, 2026-05-23).  Opens a
+# TCP listener on port 8080 from a dedicated PRIORITY_HIGH kernel pump
+# thread (same shape as the existing kdb pump on 9999) and answers
+# inbound HTTP/1.1 GET requests with a static HTML body read from the
+# kernel-managed in-RAM tmpfs at /srv/index.html.  Exercises the kernel
+# net stack on the SERVER side: tcp::listen, SYN-handling, RX-to-kernel
+# (the inverse of the wget-test RX-to-userspace gate), HTTP/1.1
+# response framing, and orderly TCP close.  No userspace binary, no
+# AF_INET accept(2) syscall — the responder lives entirely inside the
+# kernel and the strategic claim "kernel can answer external HTTP
+# clients" is proven byte-for-byte at the host curl boundary.  The
+# harness adds a `--http-host-port N` option that injects a SLIRP
+# hostfwd rule forwarding host-port N to guest 10.0.2.15:8080.
+# Mutually exclusive with the other *-test cargo features at the
+# main.rs cfg-gate level (all share the BSP idle slot).  Public refs:
+# RFC 7230 (HTTP/1.1) <https://datatracker.ietf.org/doc/html/rfc7230>,
+# RFC 793 (TCP), POSIX socket(2)/listen(2).
+httpd-test = []
 # wget-test — network-stack CLI probe (PIVOT-B Phase 2, 2026-05-23).  Same
 # Alpine busybox-static binary as busybox-test, but launched as
 # `busybox wget -q -O - http://<host>:<port>/` to fetch a small HTTP
