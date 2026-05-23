@@ -315,6 +315,53 @@ fn read_user_qword(addr: u64) -> Option<(u64, u64)> {
 /// `saved_RBP - 8` per System V AMD64 ABI §3.2.2.
 const SAVED_RBP_OFFSET_FROM_RSP: u64 = 0x1d58;
 
+/// True SSP canary slot offset from `parent_user_rsp`, corrected from
+/// the previous `SAVED_RBP_OFFSET_FROM_RSP - 8` (= 0x1d50) raw-offset
+/// arm site per the PR #425 verdict.
+///
+/// ## EVIDENCE (PR #425 dispositive arithmetic)
+///
+/// Let `fail_rsp` be RSP at entry to musl `__stack_chk_fail` from the
+/// libxul SSP-failing function `f` (libxul+0x4670270).  The autopsy in
+/// PR #424/425 captured `fail_rsp = 0x7ffffffee468`.  Per Intel SDM
+/// Vol. 2A §3.3 (CALL semantics) the call pushed a return RIP, so RSP
+/// at the `call __stack_chk_fail` instruction is `fail_rsp + 8`.  Per
+/// the PR #417 disassembly of `f`'s prologue (`push rbp; push r15;
+/// push r14; push r13; push r12; push rbx` then `sub rsp, 0x1e8`),
+/// the prologue consumed `6 * 8 + 0x1e8 = 0x220` bytes.  Thus
+/// `entry_rsp = fail_rsp + 0x220 = 0x7ffffffee688`.
+///
+/// The compiler places the SSP canary at `[rbp - 8]` per the GCC SSP
+/// convention.  In `f`, `rbp = entry_rsp - 8` (set by `push rbp; mov
+/// rbp, rsp`), so the canary slot is at `entry_rsp - 0x10`... but the
+/// PR #417 disassembly shows the canary is actually stored at
+/// `[function-local rsp + 0x1e0]` — relative to RSP AFTER the `sub
+/// rsp, 0x1e8`.  That same slot, expressed relative to `entry_rsp`,
+/// is `entry_rsp - (0x1e8 - 0x1e0) - 6*8 = entry_rsp - 0x8 - 0x30 =
+/// entry_rsp - 0x38`.  Concretely: `canary_va = 0x7ffffffee688 - 0x38
+/// = 0x7ffffffee650`.
+///
+/// Expressed relative to `parent_user_rsp` (= the value of RSP saved
+/// in the parent thread's syscall frame on its kernel stack, which
+/// the vfork-PRE-block snapshot probes), the offset is `0x1f48`:
+/// `parent_user_rsp + 0x1f48 = 0x7ffffffee650`.  Equivalently,
+/// `fail_rsp + 0x1e8 = 0x7ffffffee650`.
+///
+/// ## SAFETY (why the prior raw-offset arm was wrong)
+///
+/// The previous raw-offset arm computed `user_rsp + 0x1d58 - 8 =
+/// user_rsp + 0x1d50 = 0x7ffffffee4c0`.  That VA sits **400 bytes
+/// (0x190) below** the true canary slot, INSIDE `f`'s WebRender
+/// diagnostic string-builder buffer at `[rsp+0x40..0xd0]` (PR #417
+/// disassembly).  The `0x30` byte observed there was ASCII `'0'`
+/// from the inner decimal-formatting loop — NOT a canary write.
+///
+/// References: System V AMD64 ABI §3.2.2 (stack frame layout) +
+/// §3.4.5 (TLS variant II for `IA32_FS_BASE + 0x28` master canary);
+/// Intel SDM Vol. 2A §3.3 (CALL push); GCC `-fstack-protector` SSP
+/// convention.
+const SSP_CANARY_OFFSET_FROM_RSP: u64 = 0x1f48;
+
 /// Hook called from the Linux clone(2) / clone3(2) PRE-block site
 /// (`kernel/src/subsys/linux/syscall.rs`) immediately before the
 /// parent enters `schedule()` for the vfork wait.  Off-path cost on
@@ -454,13 +501,17 @@ pub fn try_arm_at_vfork_preblock(parent_pid: u64, parent_tid: u64) {
     // Candidate 2 — raw-offset fallback.  Always attempt (subject to
     // D21_ARM_MAX) so we have a cross-check even when the RBP-derived
     // channel succeeds; both can fire under the cap.  The slot at
-    // `[user_rsp + 0x1d58 - 8]` is the 8-byte qword immediately
-    // adjacent to the existing `s_1d58` probe and is the next-most
-    // likely SSP slot per the post-PR-#398 stack window analysis.
+    // `[user_rsp + SSP_CANARY_OFFSET_FROM_RSP]` (= `user_rsp +
+    // 0x1f48`) is the true SSP-canary slot of the libxul SSP-failing
+    // function `f` (libxul+0x4670270) per the PR #425 verdict — see
+    // the SSP_CANARY_OFFSET_FROM_RSP doc-comment for the dispositive
+    // arithmetic.  The previous arm site `user_rsp + 0x1d58 - 8`
+    // (= `user_rsp + 0x1d50`) was 0x190 bytes (400 bytes) below the
+    // true slot and landed inside `f`'s WebRender diagnostic
+    // string-builder buffer.
     if D21_ARM_COUNT.load(Ordering::Relaxed) < D21_ARM_MAX {
         let raw_canary_va = user_rsp
-            .wrapping_add(SAVED_RBP_OFFSET_FROM_RSP)
-            .wrapping_sub(8);
+            .wrapping_add(SSP_CANARY_OFFSET_FROM_RSP);
         if raw_canary_va & 0x7 == 0
             && raw_canary_va >= USER_ADDR_MIN
             && raw_canary_va < USER_ADDR_END

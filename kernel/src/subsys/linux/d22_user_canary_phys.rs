@@ -188,6 +188,45 @@ const CHANNEL_PHYS: u32 = 2;
 /// PR #404's doc + the existing `[VFORK/CANARY]` `s_1d58` probe.
 const SAVED_RBP_OFFSET_FROM_RSP: u64 = 0x1d58;
 
+/// True SSP canary slot offset from `parent_user_rsp`, corrected from
+/// the previous `SAVED_RBP_OFFSET_FROM_RSP - 8` (= 0x1d50) arm site
+/// per the PR #425 verdict.
+///
+/// ## EVIDENCE (PR #425 dispositive arithmetic)
+///
+/// Let `fail_rsp` = RSP at entry to musl `__stack_chk_fail` from the
+/// libxul SSP-failing function `f` (libxul+0x4670270).  PR #424/425
+/// autopsy captured `fail_rsp = 0x7ffffffee468`.  Per the PR #417
+/// disassembly of `f`'s prologue (`push rbp; push r15; push r14;
+/// push r13; push r12; push rbx; sub rsp, 0x1e8`), the prologue
+/// consumed `6 * 8 + 0x1e8 = 0x220` bytes, so `entry_rsp = fail_rsp +
+/// 0x220 = 0x7ffffffee688`.  The canary is stored at `[function-
+/// local rsp + 0x1e0]` per PR #417, which expressed relative to
+/// `entry_rsp` is `entry_rsp - 0x38` = `0x7ffffffee650`.
+///
+/// Expressed relative to `parent_user_rsp` (the value of RSP saved
+/// in the parent thread's syscall frame on its kernel stack, which
+/// the vfork-PRE-block snapshot probes), the offset is `0x1f48`:
+/// `parent_user_rsp + 0x1f48 = 0x7ffffffee650`.  Equivalently
+/// `fail_rsp + 0x1e8 = 0x7ffffffee650`.
+///
+/// ## SAFETY (why the prior arm site was wrong)
+///
+/// The previous arm computed `user_rsp + 0x1d58 - 8 = user_rsp +
+/// 0x1d50 = 0x7ffffffee4c0`, **400 bytes (0x190) below** the true
+/// canary slot.  That VA sat INSIDE `f`'s WebRender diagnostic
+/// string-builder buffer at `[rsp+0x40..0xd0]` (PR #417); the `0x30`
+/// byte observed there was ASCII `'0'` from the inner decimal-
+/// formatting loop, NOT a canary write.  Both D22 channels (linear
+/// and phys mirror) accordingly watched the wrong VA — re-armed at
+/// the corrected slot per this constant.
+///
+/// References: System V AMD64 ABI §3.2.2 (stack frame layout) +
+/// §3.4.5 (TLS variant II for `IA32_FS_BASE + 0x28` master canary);
+/// Intel SDM Vol. 2A §3.3 (CALL push); GCC `-fstack-protector` SSP
+/// convention.
+const SSP_CANARY_OFFSET_FROM_RSP: u64 = 0x1f48;
+
 /// User-VA range bounds (canonical lower half).
 const USER_ADDR_MIN: u64 = 0x1000;
 const USER_ADDR_END: u64 = 0x0000_8000_0000_0000;
@@ -407,20 +446,19 @@ pub fn try_arm_at_vfork_preblock(parent_pid: u64, parent_tid: u64) {
         return;
     }
 
-    // Watch the **raw-offset** candidate VA: `[user_rsp + 0x1d58] - 8`
-    // (the qword adjacent to the existing `s_1d58` probe).  Per the
-    // D21 evidence trail (PR #404 + Trial 1 [W215/DR-WATCH-FIRE]
-    // kind_tag=7 lines), this is the VA where the user-mode SSP
-    // prologue actually writes — the RBP-derived candidate
-    // (`*(probe_va) - 8`) lands on a different slot that the writer
-    // does not touch.  D22 focuses both channels on the proven hot
-    // VA so the dispositive phys-aliasing comparison is on the right
-    // slot.  System V AMD64 ABI §3.2.2 SSP convention applies to the
-    // resulting linear address regardless of which candidate was
-    // chosen.
+    // Watch the **true SSP-canary slot**: `[user_rsp +
+    // SSP_CANARY_OFFSET_FROM_RSP]` (= `[user_rsp + 0x1f48]`) per the
+    // PR #425 verdict — see the SSP_CANARY_OFFSET_FROM_RSP doc-
+    // comment above for the dispositive arithmetic.  Both channels A
+    // (linear) and B (phys mirror) target this corrected slot.
+    //
+    // The previous arm at `user_rsp + 0x1d58 - 8` (= `user_rsp +
+    // 0x1d50`) was 0x190 bytes (400 bytes) below the true slot and
+    // landed inside `f`'s WebRender diagnostic string-builder
+    // buffer (PR #417 disassembly).  System V AMD64 ABI §3.2.2 SSP
+    // convention applies to the resulting linear address.
     let canary_va = user_rsp
-        .wrapping_add(SAVED_RBP_OFFSET_FROM_RSP)
-        .wrapping_sub(8);
+        .wrapping_add(SSP_CANARY_OFFSET_FROM_RSP);
 
     // Validate canary VA — must be 8-byte aligned and in user range.
     // If not, neither channel can arm safely (per Intel SDM Vol. 3B
