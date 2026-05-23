@@ -112,6 +112,30 @@ static MMIO_BASE: Mutex<u64> = Mutex::new(0);
 /// Whether the e1000 NIC has been initialized.
 static AVAILABLE: AtomicBool = AtomicBool::new(false);
 
+/// Kernel direct-map base for raw physical addresses.  AstryxOS maps the
+/// full physical address space at `KERNEL_VIRT_BASE` (higher-half), so a
+/// physical frame at `phys` is accessible by the kernel as the virtual
+/// address `PHYS_OFFSET + phys`.  Matches the convention used by
+/// `net/virtio_net.rs::phys_to_virt`, `drivers/virtio_blk.rs::PHYS_OFFSET`,
+/// and `mm/cache.rs::PHYS_OFFSET`.
+///
+/// The e1000 driver historically stored values returned from
+/// `pmm::alloc_pages()` (raw physical frames) into `RX_DESCS` / `TX_DESCS`
+/// / `RX_BUFS` / `TX_BUFS` and dereferenced them directly as virtual
+/// pointers.  That worked when the kernel happened to identity-map low
+/// memory; under the current higher-half layout (PML4[256..511] for
+/// kernel, PML4[0] per-process) physical addresses below `KERNEL_VIRT_BASE`
+/// resolve to user-only PTEs and raise `#PF (not-present)` when accessed
+/// in supervisor mode.  Helper added 2026-05-23 (PIVOT-B wget-test
+/// dispatch) — see Intel SDM Vol. 3A §4.5 (4-level paging),
+/// `astryx_shared::KERNEL_VIRT_BASE`.
+const PHYS_OFFSET: u64 = astryx_shared::KERNEL_VIRT_BASE;
+
+#[inline(always)]
+fn phys_to_virt(phys: u64) -> u64 {
+    PHYS_OFFSET + phys
+}
+
 /// RX descriptor ring (page-aligned via alloc)
 static RX_DESCS: Mutex<u64> = Mutex::new(0); // phys addr of desc ring
 /// TX descriptor ring
@@ -167,19 +191,28 @@ fn rx_flush_nudge() {
 // ── MMIO helpers ────────────────────────────────────────────────────────────
 
 /// Read a 32-bit register from MMIO space.
+///
+/// The PCI BAR-derived `MMIO_BASE` is a PHYSICAL address (typically in the
+/// QEMU PCI hole around 0xfeb80000); MMIO pages live in the kernel
+/// direct-map at `PHYS_OFFSET + base`.  Without `phys_to_virt` the access
+/// only works while CR3 is the kernel CR3 (PML4[0] = identity map) and
+/// faults the instant a user process's CR3 is active because that PML4[0]
+/// is the user's VMA mapping.  See the per-process page-table layout note
+/// at `mm/vmm.rs:31-35` for the deeper rationale.
 fn mmio_read(reg: u32) -> u32 {
     let base = *MMIO_BASE.lock();
     unsafe {
-        let ptr = (base + reg as u64) as *const u32;
+        let ptr = phys_to_virt(base + reg as u64) as *const u32;
         core::ptr::read_volatile(ptr)
     }
 }
 
-/// Write a 32-bit register in MMIO space.
+/// Write a 32-bit register in MMIO space.  See `mmio_read` for the
+/// physical-vs-virtual rationale.
 fn mmio_write(reg: u32, val: u32) {
     let base = *MMIO_BASE.lock();
     unsafe {
-        let ptr = (base + reg as u64) as *mut u32;
+        let ptr = phys_to_virt(base + reg as u64) as *mut u32;
         core::ptr::write_volatile(ptr, val);
     }
 }
@@ -402,19 +435,22 @@ fn init_rx() -> bool {
         None => return false,
     };
 
-    // Zero out the descriptor ring
+    // Zero out the descriptor ring via the kernel direct-map (PHYS_OFFSET
+    // + desc_phys) — see `phys_to_virt` above for rationale.  The
+    // descriptor's `.addr` field below carries the BUFFER's PHYSICAL
+    // address because the hardware DMAs against it.
     unsafe {
-        core::ptr::write_bytes(desc_phys as *mut u8, 0, 4096);
+        core::ptr::write_bytes(phys_to_virt(desc_phys) as *mut u8, 0, 4096);
     }
 
     // Initialize each RX descriptor with a buffer address.
     // Use volatile writes — the hardware reads these via DMA and the compiler
     // must not reorder or elide them.
     for i in 0..NUM_RX_DESC {
-        let desc_ptr = (desc_phys + (i as u64) * 16) as *mut RxDesc;
-        let buf_addr = bufs_phys + (i as u64) * RX_BUF_SIZE as u64;
+        let desc_ptr = (phys_to_virt(desc_phys) + (i as u64) * 16) as *mut RxDesc;
+        let buf_phys = bufs_phys + (i as u64) * RX_BUF_SIZE as u64;
         unsafe {
-            core::ptr::write_volatile(&mut (*desc_ptr).addr, buf_addr);
+            core::ptr::write_volatile(&mut (*desc_ptr).addr, buf_phys);
             core::ptr::write_volatile(&mut (*desc_ptr).status, 0);
         }
     }
@@ -474,18 +510,20 @@ fn init_tx() -> bool {
         None => return false,
     };
 
-    // Zero out the descriptor ring
+    // Zero out the descriptor ring via the kernel direct-map.  The
+    // `.addr` field below carries the BUFFER's PHYSICAL address — that
+    // is what the e1000 hardware DMAs against; do not phys_to_virt it.
     unsafe {
-        core::ptr::write_bytes(desc_phys as *mut u8, 0, 4096);
+        core::ptr::write_bytes(phys_to_virt(desc_phys) as *mut u8, 0, 4096);
     }
 
     // Init TX descriptors — mark all as done so first use works.
     // Volatile writes so the compiler cannot elide or reorder these DMA-visible stores.
     for i in 0..NUM_TX_DESC {
-        let desc_ptr = (desc_phys + (i as u64) * 16) as *mut TxDesc;
-        let buf_addr = bufs_phys + (i as u64) * 2048;
+        let desc_ptr = (phys_to_virt(desc_phys) + (i as u64) * 16) as *mut TxDesc;
+        let buf_phys = bufs_phys + (i as u64) * 2048;
         unsafe {
-            core::ptr::write_volatile(&mut (*desc_ptr).addr, buf_addr);
+            core::ptr::write_volatile(&mut (*desc_ptr).addr, buf_phys);
             core::ptr::write_volatile(&mut (*desc_ptr).status, TDESC_STA_DD);
             core::ptr::write_volatile(&mut (*desc_ptr).cmd, 0);
         }
@@ -526,10 +564,15 @@ pub fn send_packet(data: &[u8]) {
     if data.is_empty() || data.len() > 1518 { return; }
 
     let mut tail = TX_TAIL.lock();
-    let desc_base = *TX_DESCS.lock();
+    let desc_base_phys = *TX_DESCS.lock();
     let idx = *tail as usize;
 
-    let desc_ptr = (desc_base + (idx as u64) * 16) as *mut TxDesc;
+    // Kernel-side descriptor pointer = direct-map virtual (PHYS_OFFSET +
+    // desc_phys + idx*sizeof(TxDesc)).  Without phys_to_virt this
+    // dereferenced a raw physical frame as a virtual address — under
+    // higher-half mapping the access faults with #PF (not-present)
+    // because low-physical VAs are user-only mappings.
+    let desc_ptr = (phys_to_virt(desc_base_phys) + (idx as u64) * 16) as *mut TxDesc;
 
     // Wait for this descriptor to be free (DD bit set by hardware)
     unsafe {
@@ -541,15 +584,19 @@ pub fn send_packet(data: &[u8]) {
         }
     }
 
-    // Copy data to the descriptor's buffer
-    let buf_addr = *TX_BUFS.lock() + (idx as u64) * 2048;
+    // Copy data into the descriptor's buffer.  The TX-buffer table holds
+    // physical addresses (hardware DMAs against them); we kernel-write
+    // through the direct map.
+    let buf_phys = *TX_BUFS.lock() + (idx as u64) * 2048;
+    let buf_virt = phys_to_virt(buf_phys);
     unsafe {
-        core::ptr::copy_nonoverlapping(data.as_ptr(), buf_addr as *mut u8, data.len());
+        core::ptr::copy_nonoverlapping(data.as_ptr(), buf_virt as *mut u8, data.len());
     }
 
-    // Fill in the descriptor (volatile — DMA-visible to hardware)
+    // Fill in the descriptor (volatile — DMA-visible to hardware).
+    // `.addr` MUST carry the PHYSICAL buffer address (hardware DMA target).
     unsafe {
-        core::ptr::write_volatile(&mut (*desc_ptr).addr, buf_addr);
+        core::ptr::write_volatile(&mut (*desc_ptr).addr, buf_phys);
         core::ptr::write_volatile(&mut (*desc_ptr).length, data.len() as u16);
         core::ptr::write_volatile(&mut (*desc_ptr).cmd,
             TDESC_CMD_EOP | TDESC_CMD_IFCS | TDESC_CMD_RS);
@@ -611,14 +658,15 @@ pub fn send_packet(data: &[u8]) {
 pub fn poll_rx() {
     if !AVAILABLE.load(Ordering::Acquire) { return; }
 
-    let desc_base = *RX_DESCS.lock();
-    let bufs_base = *RX_BUFS.lock();
+    let desc_base_phys = *RX_DESCS.lock();
+    let bufs_base_phys = *RX_BUFS.lock();
     let mut cur = RX_CUR.lock();
 
     let mut drained_any = false;
     loop {
         let idx = *cur as usize;
-        let desc_ptr = (desc_base + (idx as u64) * 16) as *const RxDesc;
+        // Kernel-side descriptor pointer = direct-map virtual.
+        let desc_ptr = (phys_to_virt(desc_base_phys) + (idx as u64) * 16) as *const RxDesc;
 
         // Volatile reads — hardware writes these fields via DMA.
         let status = unsafe { core::ptr::read_volatile(&(*desc_ptr).status) };
@@ -631,12 +679,13 @@ pub fn poll_rx() {
         drained_any = true;
 
         if status & RDESC_STA_EOP != 0 && length > 0 {
-            let buf_addr = bufs_base + (idx as u64) * RX_BUF_SIZE as u64;
+            let buf_phys = bufs_base_phys + (idx as u64) * RX_BUF_SIZE as u64;
             let len = length as usize;
 
-            // Safety: reading from the RX buffer that hardware wrote into
+            // Safety: reading from the RX buffer that hardware wrote into,
+            // via the kernel direct-map (PHYS_OFFSET + buf_phys).
             let packet = unsafe {
-                core::slice::from_raw_parts(buf_addr as *const u8, len)
+                core::slice::from_raw_parts(phys_to_virt(buf_phys) as *const u8, len)
             };
 
             // Hand to the network stack
@@ -711,8 +760,9 @@ pub fn restart_device() -> bool {
 
     // Clear any pending DD bits left in the RX ring from before stop(),
     // otherwise poll_rx would walk stale descriptors and replay packets.
+    // Descriptors live in pmm-allocated frames — access via direct map.
     for i in 0..NUM_RX_DESC {
-        let desc_ptr = (rx_desc_phys + (i as u64) * 16) as *mut RxDesc;
+        let desc_ptr = (phys_to_virt(rx_desc_phys) + (i as u64) * 16) as *mut RxDesc;
         unsafe {
             core::ptr::write_volatile(&mut (*desc_ptr).status, 0);
         }
@@ -720,7 +770,7 @@ pub fn restart_device() -> bool {
     // Mark all TX descriptors as done so send_packet's first use after
     // restart doesn't spin waiting for a completion that will never come.
     for i in 0..NUM_TX_DESC {
-        let desc_ptr = (tx_desc_phys + (i as u64) * 16) as *mut TxDesc;
+        let desc_ptr = (phys_to_virt(tx_desc_phys) + (i as u64) * 16) as *mut TxDesc;
         unsafe {
             core::ptr::write_volatile(&mut (*desc_ptr).status, TDESC_STA_DD);
             core::ptr::write_volatile(&mut (*desc_ptr).cmd, 0);

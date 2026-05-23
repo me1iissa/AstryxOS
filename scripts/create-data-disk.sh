@@ -47,6 +47,13 @@ FIREFOX_VARIANT="${ASTRYXOS_FIREFOX_VARIANT:-glibc}"
 # of the kernel personality stack outside the libxul SSP saga).
 XEYES="${ASTRYXOS_XEYES:-0}"
 
+# When set (env or --busybox flag), also stage Alpine's busybox-static binary
+# at /bin/busybox and seed /etc/os-release.  Used by the busybox-test /
+# wget-test cargo features (kernel/src/main.rs) for the CLI-tool demo soaks.
+# Independent of Firefox staging; opt-in to keep default builds lean.
+# See scripts/install-busybox-cli.sh.
+BUSYBOX_CLI="${ASTRYXOS_BUSYBOX:-0}"
+
 # Firefox package selector (musl variant only).  Picks which Alpine package
 # install-firefox-musl.sh + install-firefox-musl-debug.sh pull:
 #
@@ -108,6 +115,7 @@ for arg in "$@"; do
         --firefox-debug)   FIREFOX_DEBUG=1 ;;
         --firefox-package=*) FIREFOX_PACKAGE="${arg#--firefox-package=}" ;;
         --xeyes) XEYES=1; FORCE=true ;;
+        --busybox) BUSYBOX_CLI=1; FORCE=true ;;
         [0-9]*) SIZE_MB="$arg" ;;
     esac
 done
@@ -451,6 +459,20 @@ if [ "${XEYES}" = "1" ] || [ "${XEYES}" = "true" ]; then
     fi
 fi
 
+# ── Optional: stage Alpine busybox-static (CLI tools probe) ─────────────────
+# Triggered by ASTRYXOS_BUSYBOX=1 or --busybox.  Stages a 1 MiB statically-
+# linked binary at /bin/busybox plus seeds /etc/os-release.  The kernel-side
+# busybox-test / wget-test cargo features (kernel/src/main.rs) drive applet
+# runs against it.  See scripts/install-busybox-cli.sh.
+if [ "${BUSYBOX_CLI}" = "1" ] || [ "${BUSYBOX_CLI}" = "true" ]; then
+    if [ -f "${ROOT_DIR}/scripts/install-busybox-cli.sh" ]; then
+        BB_FLAGS=""
+        [ "${FORCE}" = true ] && BB_FLAGS="--force"
+        bash "${ROOT_DIR}/scripts/install-busybox-cli.sh" ${BB_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
+            { echo "[DATA-DISK] FATAL: install-busybox-cli.sh failed"; exit 1; }
+    fi
+fi
+
 # ── Compile glibc_hello oracle binary if source present ──────────────────────
 GLIBC_HELLO_SRC="${ROOT_DIR}/userspace/glibc_hello.c"
 GLIBC_HELLO_BIN="${BUILD_DIR}/glibc_hello"
@@ -516,6 +538,14 @@ if command -v mcopy &>/dev/null; then
         mcopy -o -i "${DATA_IMG}" - "::etc/ld.so.conf"
     # ld.so.cache: empty placeholder — linker falls back to ld.so.conf on miss
     printf '' | mcopy -o -i "${DATA_IMG}" - "::etc/ld.so.cache"
+    # /etc/os-release: optional, copied from staging if install-busybox-cli.sh
+    # (or any other staging script) wrote one.  Used by `busybox cat
+    # /etc/os-release` in the busybox-test soak.  Format per
+    # https://www.freedesktop.org/software/systemd/man/os-release.html
+    if [ -f "${BUILD_DIR}/disk/etc/os-release" ]; then
+        mcopy -o -i "${DATA_IMG}" "${BUILD_DIR}/disk/etc/os-release" "::etc/os-release"
+        echo "[DATA-DISK] Copied /etc/os-release"
+    fi
     echo "[DATA-DISK] Seeded /etc/ (hostname, hosts, resolv.conf, nsswitch.conf, passwd, group, ld.so.conf)"
 
     # Create a welcome file

@@ -19,6 +19,36 @@ firefox-test = []
 # Mutually exclusive with firefox-test at the main.rs cfg-gate level —
 # both enabled would race for Xastryx + the visible-window slot.
 xeyes-test = []
+# busybox-test — CLI-tool probe pivot (PIVOT-B, 2026-05-23).  Launches the
+# Alpine busybox-static binary (~1 MB stripped, statically-linked) and runs
+# a short battery of standard applets sequentially (`echo`, `uname -a`,
+# `ls -la /`, `cat /etc/os-release`, `sh -c '...'`, `du -sh /bin`), capturing
+# each child's stdout to the serial log.  Validates the kernel personality
+# stack for upstream Linux CLI binaries outside the X11 / libxul paths:
+# static ELF loader, brk(2), mmap(2) for argv/env, write(2) to pipe,
+# readdir/getdents(2), exit_group(2).  No dynamic linker, no PLT/GOT, no TLS
+# surprises.  Mutually exclusive with the other *-test cargo features at
+# the main.rs cfg-gate level (all share the BSP idle slot).  Requires the
+# data.img to contain /bin/busybox; run `scripts/create-data-disk.sh
+# --busybox --force` (or pass ASTRYXOS_BUSYBOX=1) before booting.
+# Public refs: BusyBox <https://busybox.net/>, POSIX exec / write / read,
+# os-release(5).
+busybox-test = []
+# wget-test — network-stack CLI probe (PIVOT-B Phase 2, 2026-05-23).  Same
+# Alpine busybox-static binary as busybox-test, but launched as
+# `busybox wget -q -O - http://<host>:<port>/` to fetch a small HTTP
+# response.  Exercises socket(2) AF_INET / connect(2) / sendto(2) +
+# recvfrom(2) on TCP, the kernel TCP retransmit / ACK path, and write(2)
+# of the response body to a parent-visible pipe.  The default fetch
+# target is `http://10.0.2.2:8888/` (QEMU SLIRP gateway) — a tiny
+# `python3 -m http.server` instance on the host is the canonical
+# responder; if no responder is running the test still validates the
+# socket / DNS path up to the connect-refused boundary and reports the
+# named gate.  See QEMU SLIRP docs
+# <https://www.qemu.org/docs/master/system/devices/net.html#network-options>
+# and RFC 7230 (HTTP/1.1).  Mutually exclusive with the other *-test
+# cargo features.  Requires data.img to contain /bin/busybox.
+wget-test = []
 # Opt-in for the userspace alias_test page-aliasing reproducer (Test 44b).
 # Spawns 8 worker threads via raw clone(CLONE_VM|CLONE_THREAD|CLONE_SIGHAND)
 # doing MAP_PRIVATE mmap churn; runs >100k page faults; sometimes wedges

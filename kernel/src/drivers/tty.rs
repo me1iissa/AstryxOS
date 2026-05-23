@@ -622,6 +622,20 @@ pub fn pump_keyboard(tty: &mut Tty) {
 // ── ioctl dispatch ──────────────────────────────────────────────────────────
 
 /// Handle TTY ioctl requests. Returns 0 on success, negative errno on error.
+///
+/// SMAP discipline (Intel SDM Vol. 3A §4.6 — "Supervisor Mode Access
+/// Prevention"): every `arg_ptr` deref in this function targets a
+/// user-mapped page (PTE.U=1) because the caller is the Linux ioctl(2)
+/// syscall handler passing through the user's raw argument.  When SMAP
+/// is enabled (CR4.SMAP=1) a supervisor read or write to a user page
+/// without EFLAGS.AC=1 raises #PF with the SMAP error-code bit set,
+/// which our handler converts to a `KERNEL_PAGE_FAULT` bugcheck (see
+/// `idt.rs` SMAP FAULT path).  Each branch below that touches
+/// `arg_ptr` brackets the access with a `UserGuard` RAII that sets AC
+/// on construction and clears it on drop — including on panic-unwind
+/// exits — matching the established convention at lines 398/415/439.
+/// See also POSIX `termios(3)`, `ioctl_tty(2)`, and CWE-754 (improper
+/// check of unusual conditions, applied to missing SMAP gate).
 pub fn tty_ioctl(request: u64, arg_ptr: *mut u8) -> i64 {
     match request {
         TCGETS => {
@@ -633,6 +647,7 @@ pub fn tty_ioctl(request: u64, arg_ptr: *mut u8) -> i64 {
             let src = &termios as *const Termios as *const u8;
             let size = core::mem::size_of::<Termios>();
             unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
                 core::ptr::copy_nonoverlapping(src, arg_ptr, size);
             }
             0
@@ -645,6 +660,7 @@ pub fn tty_ioctl(request: u64, arg_ptr: *mut u8) -> i64 {
             let dst = &mut termios as *mut Termios as *mut u8;
             let size = core::mem::size_of::<Termios>();
             unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
                 core::ptr::copy_nonoverlapping(arg_ptr as *const u8, dst, size);
             }
             let mut tty = TTY0.lock();
@@ -661,6 +677,7 @@ pub fn tty_ioctl(request: u64, arg_ptr: *mut u8) -> i64 {
             let dst = &mut termios as *mut Termios as *mut u8;
             let size = core::mem::size_of::<Termios>();
             unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
                 core::ptr::copy_nonoverlapping(arg_ptr as *const u8, dst, size);
             }
             let mut tty = TTY0.lock();
@@ -676,6 +693,7 @@ pub fn tty_ioctl(request: u64, arg_ptr: *mut u8) -> i64 {
             let dst = &mut termios as *mut Termios as *mut u8;
             let size = core::mem::size_of::<Termios>();
             unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
                 core::ptr::copy_nonoverlapping(arg_ptr as *const u8, dst, size);
             }
             let mut tty = TTY0.lock();
@@ -691,6 +709,7 @@ pub fn tty_ioctl(request: u64, arg_ptr: *mut u8) -> i64 {
             let src = &ws as *const Winsize as *const u8;
             let size = core::mem::size_of::<Winsize>();
             unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
                 core::ptr::copy_nonoverlapping(src, arg_ptr, size);
             }
             0
@@ -704,7 +723,10 @@ pub fn tty_ioctl(request: u64, arg_ptr: *mut u8) -> i64 {
             // A real kernel tracks per-tty foreground pgrp; we approximate.
             if !arg_ptr.is_null() {
                 let pid = crate::proc::current_pid() as i32;
-                unsafe { core::ptr::write_unaligned(arg_ptr as *mut i32, pid); }
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    core::ptr::write_unaligned(arg_ptr as *mut i32, pid);
+                }
             }
             0
         }
@@ -724,7 +746,10 @@ pub fn tty_ioctl(request: u64, arg_ptr: *mut u8) -> i64 {
             // Return current process PID as session leader PID.
             if !arg_ptr.is_null() {
                 let pid = crate::proc::current_pid() as i32;
-                unsafe { core::ptr::write_unaligned(arg_ptr as *mut i32, pid); }
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    core::ptr::write_unaligned(arg_ptr as *mut i32, pid);
+                }
             }
             0
         }
