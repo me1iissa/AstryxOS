@@ -2633,18 +2633,20 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                 pid, parent_tid);
                             // D22 — PHYS_OFF channel companion to D21 for
                             // phys-aliasing detection (Wave 13).  Arms a
-                            // linear watchpoint on the same canary VA AND
-                            // a PHYS_OFF mirror on the observed backing
-                            // physical frame, so a write that lands on
-                            // either side of the user-VA / direct-map
-                            // boundary is named.  Per PR #356 K2b two-
-                            // channel pattern + PR #407 Wave 12 verdict
-                            // (Mechanism D — phys-aliasing on user stack).
-                            // Diagnostic-only; gated behind
+                            // PHYS_OFF write-watchpoint on the SSP-fail
+                            // slot at `parent_user_rsp + 0x1db8` (the
+                            // empirical post-wake offset per PR #423
+                            // evidence — distinct from the D21 / pre-block
+                            // 0x1d50 anchor, which is the saved-RBP slot
+                            // rather than the SSP slot).  Per PR #356 K2b
+                            // two-channel pattern + PR #407 Wave 12
+                            // verdict (Mechanism D — phys-aliasing on
+                            // user stack) + PR #423 0/3-fires-on-linear
+                            // evidence.  Diagnostic-only; gated behind
                             // `d22-user-canary-phys`.
                             #[cfg(feature = "d22-user-canary-phys")]
-                            crate::subsys::linux::d22_user_canary_phys::try_arm_at_vfork_preblock(
-                                pid, parent_tid);
+                            crate::subsys::linux::d22_user_canary_phys::try_arm_ssp_slot_phys(
+                                pid, parent_tid, "pre_block");
                             // ELF-WRITE-TRACE on 0x37e18 dropped here — qa
                             // verdict: structurally meaningless on musl
                             // (musl's ld doesn't use a `.data.rel.ro`
@@ -2676,6 +2678,20 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                     pid, parent_tid);
                             }
                             vfork_canary_snapshot("post_wake.clone", pid as u32, parent_tid);
+                            // D22 POST-WAKE PHYS_OFF fallback arm — the
+                            // PRE-block arm above is the primary catcher
+                            // (set BEFORE the vfork wait opens the
+                            // corruption window).  This second arm covers
+                            // the (Mechanism-D-shaped) case where the
+                            // slot's backing frame CHANGES between
+                            // pre-block and post-wake; the pre-block arm
+                            // watches the old phys and is silent in that
+                            // case, while this post-wake arm catches the
+                            // next write to the new phys.  Diagnostic-only;
+                            // gated behind `d22-user-canary-phys`.
+                            #[cfg(feature = "d22-user-canary-phys")]
+                            crate::subsys::linux::d22_user_canary_phys::try_arm_ssp_slot_phys(
+                                pid, parent_tid, "post_wake");
                         }
                         child_pid as i64
                     }
@@ -3676,15 +3692,16 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             #[cfg(feature = "d21-user-canary-watch")]
                             crate::subsys::linux::d21_user_canary_watch::try_arm_at_vfork_preblock(
                                 pid, parent_tid);
-                            // D22 — PHYS_OFF channel companion to D21 for
-                            // phys-aliasing detection (Wave 13).  See the
+                            // D22 — PHYS_OFF channel arm on the SSP-fail
+                            // slot at the 0x1db8 offset.  See the
                             // clone(56) site above for rationale and PR
-                            // #407 for the convergent Mechanism D verdict.
+                            // #423 for the convergent
+                            // 0/3-fires-on-linear evidence.
                             // Diagnostic-only; gated behind
                             // `d22-user-canary-phys`.
                             #[cfg(feature = "d22-user-canary-phys")]
-                            crate::subsys::linux::d22_user_canary_phys::try_arm_at_vfork_preblock(
-                                pid, parent_tid);
+                            crate::subsys::linux::d22_user_canary_phys::try_arm_ssp_slot_phys(
+                                pid, parent_tid, "pre_block");
                             // ELF-WRITE-TRACE on 0x37e18 dropped — see
                             // clone(56) path above for the qa-verdict TODO.
                             crate::sched::schedule();
@@ -3705,6 +3722,13 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                     pid, parent_tid);
                             }
                             vfork_canary_snapshot("post_wake.clone3", pid as u32, parent_tid);
+                            // D22 POST-WAKE PHYS_OFF fallback arm — see
+                            // the clone(56) post-wake site above for
+                            // rationale.  Diagnostic-only; gated behind
+                            // `d22-user-canary-phys`.
+                            #[cfg(feature = "d22-user-canary-phys")]
+                            crate::subsys::linux::d22_user_canary_phys::try_arm_ssp_slot_phys(
+                                pid, parent_tid, "post_wake");
                         }
                         child_pid as i64
                     }
