@@ -3963,6 +3963,27 @@ pub(crate) fn sys_getrandom(buf: *mut u8, count: usize, flags: u32) -> i64 {
     #[cfg(feature = "firefox-test")]
     crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Getrandom, buf, count);
 
+    // Record/replay: fill from the deterministic kernel PRNG instead of
+    // RDRAND / TSC-seeded xorshift.  This is the same chokepoint that
+    // ASLR and AT_RANDOM funnel through via `security::rand::rand_u64`,
+    // so the bytes returned here are byte-stable across runs with the
+    // same `astryx.rng_seed=` cmdline value.  See
+    // `crate::record_replay` for the protocol.
+    #[cfg(feature = "record-replay")]
+    {
+        let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+        let out = unsafe { core::slice::from_raw_parts_mut(buf, count) };
+        let mut i = 0;
+        while i < count {
+            let val = crate::security::rand::rand_u64();
+            let bytes = val.to_le_bytes();
+            let n = (count - i).min(8);
+            out[i..i + n].copy_from_slice(&bytes[..n]);
+            i += n;
+        }
+        return count as i64;
+    }
+
     // SMAP bracket — every iteration below writes through `out` which
     // backs the user buffer.  Held for the full fill so RDRAND and the
     // xorshift fallback both run with AC=1.  CPUID / RDRAND themselves

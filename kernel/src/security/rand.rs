@@ -12,8 +12,30 @@
 /// Panics only if inline-asm constraints fail — which is impossible on x86_64.
 /// Caller must be prepared for identical values on successive calls with
 /// probability 1/2^64 (or 1/2^28 after masking for ASLR).
+///
+/// When the kernel is built with `--features record-replay`, every call
+/// is served from the deterministic per-boot PRNG seeded from
+/// `astryx.rng_seed=<u64>` on the QEMU `opt/astryx/cmdline` fw_cfg blob
+/// (see `crate::record_replay`).  This is the single chokepoint that
+/// turns ASLR, AT_RANDOM, and `getrandom(2)` into deterministic
+/// reproducers; default (non-record-replay) builds remain
+/// byte-identical to the pre-PR artefact.
 #[inline]
 pub fn rand_u64() -> u64 {
+    #[cfg(feature = "record-replay")]
+    {
+        return crate::record_replay::rr_rand_u64();
+    }
+    #[cfg(not(feature = "record-replay"))]
+    rand_u64_nondeterministic()
+}
+
+/// Non-deterministic implementation extracted so the record-replay
+/// gate above stays small and so this body remains exercisable by
+/// in-tree unit tests under non-RR builds.
+#[cfg(not(feature = "record-replay"))]
+#[inline]
+fn rand_u64_nondeterministic() -> u64 {
     // Try RDRAND (Intel Ivy Bridge+, AMD Ryzen+).  CPUID.01H:ECX[30] = RDRAND.
     let has_rdrand: bool = unsafe {
         let ecx: u32;
