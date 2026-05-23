@@ -134,6 +134,17 @@ pub struct TcpConnection {
     /// long soaks where short-lived control flows would otherwise
     /// pile up indefinitely on the heap.
     closed_tick: u64,
+
+    /// True once `accept(2)` has handed this child TCB out to user
+    /// space via a freshly-allocated socket fd.  Set by
+    /// [`take_pending_accept`] and never cleared.  Prevents two
+    /// successive `accept(2)` calls from returning the same 4-tuple
+    /// twice — IEEE Std 1003.1-2017 §accept requires each call to
+    /// dequeue exactly one connection from the listener's pending
+    /// queue.  Listener entries (`state == Listen`) keep the default
+    /// `false`; only child TCBs created by the inbound SYN path are
+    /// ever toggled.
+    accepted: bool,
 }
 
 // ── ISN generation ─────────────────────────────────────────────────────────────
@@ -437,6 +448,7 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
                 sndbuf:      131072,
                 timewait_start: 0,
                 closed_tick: 0,
+                accepted:    false,
             });
             drop(conns);
             send_flags(lip, lport, src_ip, hdr.src_port, isn, rcv_nxt, SYN | ACK);
@@ -860,6 +872,22 @@ pub fn has_data(port: u16) -> bool {
                  && !c.recv_buffer.is_empty())
 }
 
+/// Per-connection readability gate.  Matches the same 4-tuple as
+/// [`read_from`] / [`send_data_to`] so an accept-side socket's
+/// `poll(POLLIN)` only fires for bytes destined to its own peer —
+/// not for another sibling session that happens to share the local
+/// listening port (RFC 793 §3.8 demultiplexing).
+pub fn has_data_for(local_port: u16,
+                    remote_ip:  Ipv4Address,
+                    remote_port: u16) -> bool {
+    TCP_CONNECTIONS.lock().iter()
+        .any(|c| c.local_port  == local_port
+                 && c.remote_ip   == remote_ip
+                 && c.remote_port == remote_port
+                 && c.state       == TcpState::Established
+                 && !c.recv_buffer.is_empty())
+}
+
 pub fn read(port: u16) -> Vec<u8> {
     let mut conns = TCP_CONNECTIONS.lock();
     if let Some(conn) = conns.iter_mut()
@@ -931,6 +959,7 @@ pub fn test_inject_established(local_port: u16, remote_ip: Ipv4Address,
         sndbuf:      131072,
         timewait_start: 0,
         closed_tick: 0,
+        accepted:    false,
     });
     Ok(())
 }
@@ -959,6 +988,63 @@ pub fn read_from(local_port: u16, remote_ip: Ipv4Address, remote_port: u16) -> V
     } else {
         Vec::new()
     }
+}
+
+/// Dequeue one accept-pending child TCB on `local_port`.
+///
+/// Per IEEE Std 1003.1-2017 §accept: each `accept(2)` call extracts the
+/// first connection from the listener's pending queue.  A "pending"
+/// child TCB is one that
+///
+///   * was created by the inbound SYN path (so `state != Listen` and
+///     `remote_port != 0`),
+///   * has progressed past the 3-way handshake into
+///     [`TcpState::Established`] (RFC 793 §3.4), and
+///   * has not yet been handed out by an earlier `accept(2)` call
+///     (i.e. `accepted == false`).
+///
+/// Returns `Some((remote_ip, remote_port))` for the matched TCB and
+/// marks it `accepted = true` so the same 4-tuple is never returned
+/// twice.  Returns `None` when no eligible child exists — the caller
+/// then either blocks (BLOCKing socket) or returns `EAGAIN`
+/// (`SOCK_NONBLOCK`).
+///
+/// Connections still in `SynReceived` are skipped: handing them to
+/// user space before the final ACK lands would let `read(2)` /
+/// `write(2)` race the handshake.  Children in `CloseWait` or later
+/// are also skipped — they have already FIN'd and there is no useful
+/// session to expose.
+///
+/// The check on `state == Established` (not `>= Established`)
+/// matches Linux behaviour and avoids exposing a child that has
+/// already torn down before the server could accept it.
+pub fn take_pending_accept(local_port: u16) -> Option<(Ipv4Address, u16)> {
+    let mut conns = TCP_CONNECTIONS.lock();
+    let conn = conns.iter_mut().find(|c|
+        c.local_port  == local_port
+            && c.state       == TcpState::Established
+            && c.remote_port != 0
+            && !c.accepted
+    )?;
+    conn.accepted = true;
+    Some((conn.remote_ip, conn.remote_port))
+}
+
+/// True if there is at least one accept-pending child TCB on
+/// `local_port` — i.e. a subsequent [`take_pending_accept`] would
+/// succeed without blocking.  Side-effect free.
+///
+/// Used by `poll(2)` / `select(2)` to report `POLLIN` readiness on
+/// listening AF_INET sockets per IEEE Std 1003.1-2017 §poll: a
+/// listening socket is "readable" exactly when `accept(2)` would not
+/// block.
+pub fn has_pending_accept(local_port: u16) -> bool {
+    TCP_CONNECTIONS.lock().iter().any(|c|
+        c.local_port  == local_port
+            && c.state       == TcpState::Established
+            && c.remote_port != 0
+            && !c.accepted
+    )
 }
 
 // ── Control operations ────────────────────────────────────────────────────────
@@ -1001,6 +1087,7 @@ pub fn listen(port: u16) -> Result<(), &'static str> {
         sndbuf:      131072,
         timewait_start: 0,
         closed_tick: 0,
+        accepted:    false,
     });
     Ok(())
 }
@@ -1045,6 +1132,7 @@ pub fn connect(remote_ip: Ipv4Address, remote_port: u16) -> Result<u16, &'static
             sndbuf:      131072,
             timewait_start: 0,
             closed_tick: 0,
+            accepted:    false,
         });
     }
     send_flags(local_ip, local_port, remote_ip, remote_port, isn, 0, SYN);
@@ -1096,6 +1184,21 @@ pub fn abort(port: u16) -> Result<(), &'static str> {
         send_flags(i.lip, i.lp, i.rip, i.rp, i.sn, i.rn, RST | ACK);
     }
     Ok(())
+}
+
+/// Drop the listener TCB on `port` (state == Listen) from the
+/// connection table.  Accepted child TCBs sharing the same local
+/// port are preserved — they own their own 4-tuples and their own
+/// lifecycle (FIN/RST per connection).  Returns Ok even when no
+/// listener entry is found (idempotent).
+///
+/// Cited: IEEE Std 1003.1-2017 §close — closing a listening socket
+/// "shall cause any reservation of resources made by the
+/// implementation on behalf of the socket to be released" but does
+/// not require already-accepted connections to be torn down.
+pub fn close_listener(port: u16) {
+    let mut conns = TCP_CONNECTIONS.lock();
+    conns.retain(|c| !(c.local_port == port && c.state == TcpState::Listen));
 }
 
 pub fn close(port: u16) -> Result<(), &'static str> {
