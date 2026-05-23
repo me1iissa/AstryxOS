@@ -1,0 +1,463 @@
+[2J[001;001H[=3h[2J[001;001H[2J[001;001H[8;056;240t[2J[001;001H[2J[001;001H[=3h[2J[001;001H[2J[001;001H[8;042;160t[2J[001;001HBdsDxe: loading Boot0002 "UEFI QEMU HARDDISK QM00001 " from PciRoot(0x0)/Pci(0x1,0x1)/Ata(Primary,Master,0x0)
+BdsDxe: starting Boot0002 "UEFI QEMU HARDDISK QM00001 " from PciRoot(0x0)/Pci(0x1,0x1)/Ata(Primary,Master,0x0)
+[2J[001;001H
+    ___         __                  ____  _____
+   /   |  _____/ /________  ___  __/ __ \/ ___/
+  / /| | / ___/ __/ ___/ / / / |/_/ / / /\__ \
+ / ___ |(__  ) /_/ /  / /_/ />  </ /_/ /___/ /
+/_/  |_/____/\__/_/   \__, /_/|_|\____//____/
+                      /____/
+
+        Aether Kernel v0.1 - Booting...
+
+[AstryxBoot] Initializing UEFI bootloader...
+[AstryxBoot] Framebuffer acquired via GOP
+[AstryxBoot] Kernel loaded from ESP
+[AstryxBoot] Kernel copied to 0x100000 (entry at 0xFFFF800000100000)
+[AstryxBoot] Exiting boot services...
+[SERIAL] COM1 initialized at 115200 baud (16550A FIFO enabled)
+[Aether] Serial port initialized
+[Aether] Validating BootInfo at 0x1000000
+[Aether] BootInfo magic validated OK
+[Aether] Phase 1: HAL init...
+[Aether] Phase 1: HAL OK
+[Aether] Phase 2: x86_64 arch init...
+[GDT] Initialized: per-CPU TSSes for BSP + 15 APs
+[IDT] PF=0xffff80000018e5e8 Timer=0xffff80000018ec04 INT80=0xffff80000018e8c0 (should be 0xFFFF8000...)
+[IDT] Initialized with 256 vectors
+[IRQ] PIC remapped to vectors 32-47, timer at ~100 Hz
+[x86_64] SMAP enabled (CR4.SMAP=1, EFLAGS.AC gated by STAC/CLAC)
+[x86_64] UMIP enabled (CR4.UMIP=1, SGDT/SIDT/SLDT/STR/SMSW #GP at CPL>0)
+[x86_64] Architecture initialized (GDT, IDT, IRQ, SSE, SMEP, SMAP)
+[Aether] Phase 2: x86_64 arch OK
+[Aether] Phase 3: Memory management init...
+[MM] Starting PMM init...
+[PMM] Kernel image: phys_base=0x100000 bin_end=0x44d518 bss_end=0x516000 reserved_end=0x516000 (4184 KiB)
+[PMM] BootInfo reservation: phys=[0x1000000..0x1001848) size=6216 B pages=4096..=4097 newly_reserved=2 (CWE-787 fix)
+[PMM] Initialized: 1009 MiB available (258374 pages)
+[MM] PMM done, starting VMM init...
+[VMM] Higher-half extended to cover physical 0..4 GiB
+[VMM] Virtual memory manager initialized
+[MM] VMM done, starting heap init...
+[HEAP] Initialized at 0xffff800000800000-0xffff800008800000 (phys 0x800000-0x8800000, 131072 KiB) — linked-list allocator
+[MM] Heap done, installing heap guard pages...
+[HEAP GUARD] Guard pages installed: below=0xffff8000007ff000 above=0xffff800008800000 (heap 0xffff800000800000..0xffff800008800000)
+[MM] Heap guard pages installed, starting refcount init...
+[MM] Memory management subsystem initialized
+[Aether] Phase 3: Memory management OK
+[Aether] Phase 4: Driver init...
+[SERIAL] COM1 initialized at 115200 baud (16550A FIFO enabled)
+[CONSOLE] Framebuffer console initialized
+[KEYBOARD] PS/2 keyboard driver initialized (extended)
+[KEYBOARD] i8042 CCB: 0x77 → 0x67 (IRQ1=on, translate=on)
+[MOUSE] PS/2 mouse initialized (1024x768)
+[TTY] Initialized TTY0 (128x48, cooked mode, echo on)
+[ATA] Probing Primary Master...
+[ATA] Found Primary Master: 1032192 sectors (504 MiB), model: QEMU HARDDISK
+[ATA] Probing Primary Slave...
+[ATA] Probing Secondary Master...
+[ATA] Probing Secondary Slave...
+[ATA] Found 1 ATA drive(s)
+[PCI] 00:00.0 8086:1237 class=06.00
+[PCI] 00:01.0 8086:7000 class=06.01
+[PCI] 00:01.1 8086:7010 class=01.01
+[PCI] 00:01.3 8086:7113 class=06.80
+[PCI] 00:02.0 15ad:0405 class=03.00
+[PCI] 00:03.0 1af4:1001 class=01.00
+[PCI] 00:04.0 8086:100e class=02.00
+[PCI] Enumeration complete: 7 devices found
+[AHCI] No AHCI controller found on PCI bus
+[AC97] No AC97 device found on PCI bus
+[USB] Scanning for USB controllers...
+[USB] Found 0 USB controller(s)
+[VIRTIO-BLK] Found device at PCI 00:03.0 (vendor=1af4 device=1001)
+[VIRTIO-BLK] I/O base = 0xc000
+[VIRTIO-BLK] Features: dev=0x79007e54 want=0x00000260 got=0x00000240 (flush=true ro=false blk_size=true)
+[VIRTIO-BLK] Capacity: 4194304 sectors (2048 MiB)
+[VIRTIO-BLK] Queue 0 size: 256
+[VIRTIO-BLK] Initialized: io=0xc000, capacity=4194304 sectors, queue_size=256, vq_phys=0x619000
+[DRIVERS] Virtio-blk initialized
+[DRIVERS] All drivers initialized
+[Aether] Phase 4: Drivers OK
+[Aether] Phase 4b: Kernel Executive init...
+[Ke/IRQL] Initialized — current IRQL = Passive
+[Ke/DPC] Initialized
+[Ke/APC] Initialized
+[Ke/Dispatcher] Initialized
+[Ke/Timer] Initialized
+[Ke] Kernel executive initialized (IRQL+DPC+APC+Dispatcher+Timer)
+[Aether] Phase 4b: Kernel Executive OK
+[Aether] Phase 4c: Executive Services init...
+[Ex/WorkQueue] Work queues initialized (Delayed+Critical+HyperCritical)
+[Ex] Executive services initialized (EResource+FastMutex+PushLock+WorkQueues)
+[Aether] Phase 4c: Executive Services OK
+[Aether] Phase 5: Process & scheduler init...
+[PROC] Process manager initialized (idle PID 0, TID 0, kstack=0xffff800000639000–0xffff800000679000)
+[vDSO] init: vvar_phys=0x679000 vdso_phys=0x61c000 elf=7064 bytes wall_secs=1779545371
+[CoreSched] Scheduler initialized (per-CPU round-robin, quantum=5 ticks)
+[Aether] Phase 5: Process & scheduler OK
+[Aether] Phase 5b: APIC init...
+[APIC] Legacy 8259 PIC disabled
+[vDSO] tsc-calibration published: tsc_at_boot=0x4ea5a58fa tsc_per_tick=20384228 tsc_freq_hz=2038422800 ns_mult=2107005129 ns_shift=32
+[APIC] Local APIC initialized: BSP ID=0, base=0xfee00000, timer count=640820
+[APIC] I/O APIC version=0x11, max_entries=24
+[APIC] I/O APIC: IRQ1 (keyboard) → vector 33, APIC ID 0
+[APIC] I/O APIC: IRQ12 (mouse) → vector 44, APIC ID 0
+[APIC] APIC subsystem fully initialized
+[SMP] Trampoline pages marked executable
+[SMP] Starting AP scan (BSP=0, vector=8)
+[SMP] Trying AP 1...
+[x86_64] SMAP enabled (CR4.SMAP=1, EFLAGS.AC gated by STAC/CLAC)
+[x86_64] UMIP enabled (CR4.UMIP=1, SGDT/SIDT/SLDT/STR/SMSW #GP a[t SCPML>P0)]
+ AP[G DTb] oAPo t1s ltoardead pTR =c0xo3m8p (lpeer-tAPe T:SS )1
+ C[PSMUP]( AsP )1  oonnlilnei, nLAePI C (eBnaSblPed=, 0id)le T
+ID=4097, entering scheduler
+[VIRTIO-BLK] IRQ armed: PCI 00:03.0 line=11 -> vector 45 (BSP APIC 0)
+[Aether] Phase 5b: APIC OK
+[Aether] Phase 6: Syscall init...
+[SYSCALL] Initialized (int 0x80 + syscall/sysret)
+[Aether] Phase 6: Syscall OK
+[Aether] Phase 7: VFS, IPC & I/O subsystem init...
+[VFS] ProcFs mounted at /proc (dynamic, live kernel state)
+[VFS] SysFs mounted at /sys
+[VFS] Initialized with root ramfs, standard directories created
+[Aether] Phase 7a: VFS OK
+[FAT32] BPB: 512 bytes/sector, 1 sectors/cluster, 2 reserved, 2 FATs, fat_size=2, root_cluster=2, total_sectors=32
+[FAT32] Read 256 FAT entries, cached 5 sectors
+[FAT32] Mounted: 3 nodes discovered in root
+[VFS] FAT32 test image mounted at /mnt
+[VFS] Probing virtio-blk device (4194304 sectors) for partitions...
+[VFS] No partitions on virtio-blk, trying whole disk FAT32...
+[FAT32] BPB: 512 bytes/sector, 8 sectors/cluster, 32 reserved, 2 FATs, fat_size=4088, root_cluster=2, total_sectors=4194288
+[FAT32] Read 523264 FAT entries, cached 8177 sectors
+[FAT32] Mounted: 10 nodes discovered in root
+[VFS] FAT32 whole-disk mounted at /disk (virtio-blk)
+[Aether] Phase 7a: FAT32 OK
+[EXT2] Invalid magic: 0x0000 (expected 0xef53)
+[EXT2] No ext2 filesystem found on disk 0
+[Aether] Phase 7a: ext2 OK
+[IPC] IPC subsystem initialized (pipes + eventfd + epoll + timerfd + signalfd + inotify + sysv_shm)
+[Aether] Phase 7b: IPC OK
+[DEVMGR] Device tree populated
+[IO] I/O Manager initialized (5 drivers, 5 devices)
+[IO/IOCP] Completion port subsystem initialized
+[IO/Async] Async I/O subsystem initialized
+[IO] I/O subsystem initialized
+[Aether] Phase 7: I/O subsystem OK
+[Aether] Phase 8: Network init...
+[E1000] Found device at PCI 0:4.0
+[E1000] MMIO base: 0x81080000
+[E1000] PCI bus mastering enabled
+[E1000] PCI command after reset: 0x7 -> 0x7
+[E1000] Status: 0x80080783 (link UP)
+[E1000] MAC: 52:54:00:12:34:56
+[E1000] RX ring at 0x690000, 32 descriptors, buffers at 0x691000
+[E1000] TX ring at 0x6A1000, 32 descriptors, buffers at 0x6A2000
+[E1000] Driver initialized, ready for packets
+[NET] e1000 initialized, MAC=52:54:00:12:34:56
+[NET] IPv4=10.0.2.15
+[NET] IPv6=fec0::15
+[Aether] Phase 8: Network OK
+[Aether] Phase 9: NT Executive subsystems init...
+[OB] Object Manager initialized — namespace created
+[Aether] Phase 9a: Object Manager OK
+[SEC] Security subsystem initialized (NT-style ACLs + POSIX mode + Tokens/SIDs)
+[Aether] Phase 9b: Security subsystem OK
+[SIGNAL] Trampoline page allocated at phys 0x6b2000, vaddr 0x7ffffffff000
+[SIGNAL] Signal subsystem initialized
+[Aether] Phase 9b: Signal subsystem OK
+[CONFIG] Registry initialized — 4 hives loaded
+[Aether] Phase 9c: Registry OK
+[LPC] Advanced Local Procedure Call (ALPC) subsystem initialized
+[Aether] Phase 9c: LPC OK
+[Aether] Phase 9c: NT subsystem (KUSER_SHARED_DATA) OK
+[WIN32] Created window station 'WinSta0' (handle=1)
+[WIN32] Created desktop 'WinSta0\Default' (handle=1)
+[WIN32] Win32 environment subsystem initialized (CSRSS, WinSta0, Default desktop)
+[Aether] Phase 9d: Win32 subsystem OK
+[Aether] Phase 9: NT Executive OK
+[Aether] Phase 9e: Power management init...
+[Po] Power management initialized
+[Aether] Phase 9e: Power management OK
+[Aether] Phase 10a: VMware SVGA II init...
+[SVGA] Found VMware SVGA II at PCI 00:02.0
+[SVGA] I/O base = 0xc0c0, FIFO BAR = 0x810a0000
+[SVGA] Negotiated version ID: 0x90000002
+[SVGA] Capabilities=0x000000e3 max=2368x1770 VRAM=16384K
+[SVGA] Mode set: 1920x1080x32 pitch=7680 fb=0x80000000 fb_size=0x1000000
+[SVGA] FIFO initialized: base=0x810a0000 size=0x10000
+[SVGA] VMware SVGA II driver initialized
+[Aether] Phase 10a: VMware SVGA II OK
+[Aether] Display: 1920x1080 fb=0x80000000 stride=1920
+[CONSOLE] Reconfigured framebuffer: 1920x1080 @ 0x80000000 stride=1920
+[MOUSE] Bounds updated to 1920x1080
+[Aether] Phase 10b: GUI init...
+[GUI] Compositor initialized (1920x1080, stride=1920, fb=0x80000000)
+[GUI] VMware SVGA hardware cursor disabled — using software cursor
+[Aether] Phase 10b: GUI OK
+[Aether] Phase 10c: GDI init...
+[GDI] Graphics Device Interface initialized
+[Aether] Phase 10c: GDI OK
+[Aether] Phase 10d: Window Manager init...
+[WM] Registered 4 default window classes
+[WM] Created WinSta0/Default desktop (1920x1080)
+[WM] Window Manager initialized (1920x1080)
+[Aether] Phase 10d: Window Manager OK
+[Aether] Phase 10e: Message System init...
+[MSG/QUEUE] Queue subsystem initialized
+[MSG/DISPATCH] Dispatch subsystem initialized
+[MSG] Window message system initialized
+[Aether] Phase 10e: Message System OK
+[Aether] Phase 10f: GUI input init...
+[Aether] Phase 10f: GUI input OK
+========================================
+  AstryxOS - Aether Kernel v0.1
+  Architecture: x86_64 (UEFI)
+  Framebuffer: 0x0
+  Memory regions: 0
+========================================
+
+[Aether] Kernel initialization complete.
+[Aether] Dropping to kernel shell...
+
+[XEYES] xeyes-test mode starting...
+[X11] Xastryx ready on /tmp/.X11-unix/X0 (fd=0)
+[XEYES] X11 server ready
+[WM] Created window #1 "Taskbar" class="Static" (1920x40 at 0,1040)
+[WM] Created window #2 "File Explorer" class="Static" (600x400 at 20,20)
+[WM] Created window #3 "Terminal" class="Edit" (500x350 at 20,500)
+[WM] Created window #4 "Settings" class="Static" (450x300 at 1240,20)
+[WM] Created window #5 "Text Editor" class="Edit" (520x380 at 640,20)
+[WM] Created window #6 "Calculator" class="Static" (272x310 at 560,500)
+[GUI/Desktop] Demo desktop created (1920x1080) — taskbar=1, explorer=2, terminal=3, settings=4, editor=5, calculator=6
+[XEYES] Pre-allocated 8 kernel stacks (512 KiB)
+[XEYES] Pre-populating page cache for xeyes + deps...
+[XEYES] Cached /disk/lib/ld-musl-x86_64.so.1 (159 pages, 1 ticks)
+[XEYES] Cached /disk/lib/libc.musl-x86_64.so.1 (159 pages, 1 ticks)
+[XEYES] Cached /disk/usr/bin/xeyes (7 pages, 0 ticks)
+[XEYES] Cached /disk/usr/lib/libX11.so.6 (284 pages, 1 ticks)
+[XEYES] Cached /disk/usr/lib/libXt.so.6 (87 pages, 0 ticks)
+[XEYES] Cached /disk/usr/lib/libXmu.so.6 (22 pages, 0 ticks)
+[XEYES] Cached /disk/usr/lib/libXi.so.6 (16 pages, 0 ticks)
+[XEYES] Cached /disk/usr/lib/libXext.so.6 (17 pages, 0 ticks)
+[XEYES] Cached /disk/usr/lib/libXrender.so.1 (11 pages, 0 ticks)
+[XEYES] Cached /disk/usr/lib/libX11-xcb.so.1 (4 pages, 0 ticks)
+[XEYES] Cached /disk/usr/lib/libxcb.so.1 (38 pages, 0 ticks)
+[XEYES] Cached /disk/usr/lib/libxcb-damage.so.0 (4 pages, 0 ticks)
+[XEYES] Cached /disk/usr/lib/libxcb-present.so.0 (4 pages, 0 ticks)
+[XEYES] Cached /disk/usr/lib/libxcb-xfixes.so.0 (9 pages, 0 ticks)
+[XEYES] Cached /disk/usr/lib/libSM.so.6 (9 pages, 0 ticks)
+[XEYES] Cached /disk/usr/lib/libICE.so.6 (22 pages, 0 ticks)
+[XEYES] Cached /disk/usr/lib/libuuid.so.1 (8 pages, 0 ticks)
+[XEYES] Page cache: 860 pages total
+[XEYES] Pre-load complete — launching xeyes
+[XEYES] Binary probe: /disk/usr/bin/xeyes -> Ok(28336)
+[XEYES] Launching /disk/usr/bin/xeyes ...
+[CoreSched] Scheduler enabled
+[USER] Loading ELF binary '/disk/usr/bin/xeyes' (28336 bytes)
+[ELF] DT_RELR: deferring 56 bytes to dynamic linker (PT_INTERP present)
+[ELF] PT_INTERP: loading interpreter '/disk/lib/ld-musl-x86_64.so.1'
+[ELF] INTERP cache miss for '/disk/lib/ld-musl-x86_64.so.1' — reading from disk (slow)...
+[ELF] INTERP loaded 649832 bytes, caching
+[ELF] PT_INTERP: 649832 bytes (cached)
+[ELF] Interpreter loaded at 0x7f611f68e000, entry=0x7f611f6f0a62
+[USER] ELF loaded: entry=0x7f611f6f0a62, stack=0x7ffffffefb10, range=0x28c8bc9000-0x28c8bd07c0, 187 pages, 12 VMAs
+[PROC] Created kernel process '/disk/usr/bin/xeyes' PID 1 TID 1
+[USER] Process '/disk/usr/bin/xeyes' PID 1 suspended (blocked) (cr3=0xa390000, 187 physical pages)
+[BOOT] tid=1 entering bootstrap
+[USER] Bootstrap tid=1: Ring 3 at RIP=0x7f611f6f0a62 RSP=0x7ffffffefb10 CR3=0xa390000 RDX=0x0 R8=0x0
+[BOOT] jump_to_user_mode: rip=0x7f611f6f0a62 rsp=0x7ffffffefb10 rdx=0x0 r8=0x0 fork_regs=[rbp=0x0 rbx=0x0 r12=0x0]
+[X11] client fd=2
+[X11POLL] svc_fd=2 has_data=true avail=12
+[X11SVC] fd=2 read 12 bytes
+[X11] setup: byte_order=0x6c maj=11 min=0 n_auth=0 d_auth=0 total_client=12
+[X11] setup_ok len=128 hdr=01000b0000001e00 additional_units=30 n_screens=1 n_formats=1
+[X11] setup_ok res_base=0x400000 res_mask=0x1fffff vendor_len=7 max_req=32767
+[X11] setup_ok written=128
+[X11] fd=2 setup ok
+[X11POLL] svc_fd=2 has_data=true avail=20
+[X11SVC] fd=2 read 20 bytes
+[X11] req#0 op=98 minor=0 len=20
+[X11REPLY] fd=2 seq=1 reply_len=0 total=32
+[X11POLL] svc_fd=2 has_data=true avail=4
+[X11SVC] fd=2 read 4 bytes
+[X11] req#1 op=133 minor=0 len=4
+[X11REPLY] fd=2 seq=2 reply_len=0 total=32
+[X11POLL] svc_fd=2 has_data=true avail=44
+[X11SVC] fd=2 read 44 bytes
+[X11] req#2 op=55 minor=0 len=20
+[X11] req#3 op=20 minor=0 len=24
+[X11GP] fd=2 wid=1 atom=23 seq=4
+[X11POLL] svc_fd=2 has_data=true avail=20
+[X11SVC] fd=2 read 20 bytes
+[X11] req#4 op=98 minor=0 len=20
+[X11REPLY] fd=2 seq=5 reply_len=0 total=32
+[X11POLL] svc_fd=2 has_data=true avail=8
+[X11SVC] fd=2 read 8 bytes
+[X11] req#5 op=135 minor=0 len=8
+[X11XKB] minor=0 seq=6 len=8
+[X11REPLY] fd=2 seq=6 reply_len=0 total=32
+[X11POLL] svc_fd=2 has_data=true avail=20
+[X11SVC] fd=2 read 20 bytes
+[X11] req#6 op=16 minor=0 len=20
+[X11REPLY] fd=2 seq=7 reply_len=0 total=32
+[X11] InternAtom("Custom Init") -> 83
+[X11POLL] svc_fd=2 has_data=true avail=20
+[X11SVC] fd=2 read 20 bytes
+[X11] req#7 op=16 minor=0 len=20
+[X11REPLY] fd=2 seq=8 reply_len=0 total=32
+[X11] InternAtom("Custom Data") -> 84
+[PROC-METRICS] tick=500 pid=1 name=/disk/usr/bin/xeyes sc=304 (vm=108 file=151 net=26 sync=16 proc=0 sig=0 other=3) pf=236 disk=R712704/W0 net=R276/W500 cur_nr=0@2t
+[X11POLL] svc_fd=2 has_data=true avail=24
+[X11SVC] fd=2 read 24 bytes
+[X11] req#8 op=16 minor=1 len=24
+[X11REPLY] fd=2 seq=9 reply_len=0 total=32
+[X11] InternAtom("SCREEN_RESOURCES") -> 0
+[X11POLL] svc_fd=2 has_data=true avail=24
+[X11SVC] fd=2 read 24 bytes
+[X11] req#9 op=16 minor=0 len=24
+[X11REPLY] fd=2 seq=10 reply_len=0 total=32
+[X11] InternAtom("WM_DELETE_WINDOW") -> 70
+[X11POLL] svc_fd=2 has_data=true avail=92
+[X11SVC] fd=2 read 92 bytes
+[X11] req#10 op=53 minor=1 len=16
+[X11] req#11 op=53 minor=4 len=16
+[X11] req#12 op=54 minor=0 len=8
+[X11] req#13 op=53 minor=8 len=16
+[X11] req#14 op=54 minor=0 len=8
+[X11] req#15 op=53 minor=32 len=16
+[X11] req#16 op=54 minor=0 len=8
+[X11] req#17 op=43 minor=0 len=4
+[X11REPLY] fd=2 seq=18 reply_len=0 total=32
+[X11POLL] svc_fd=2 has_data=true avail=16
+[X11SVC] fd=2 read 16 bytes
+[X11] req#18 op=98 minor=1 len=16
+[X11REPLY] fd=2 seq=19 reply_len=0 total=32
+[X11POLL] svc_fd=2 has_data=true avail=16
+[X11SVC] fd=2 read 16 bytes
+[X11] req#19 op=139 minor=0 len=12
+[X11REPLY] fd=2 seq=20 reply_len=0 total=32
+[X11] req#20 op=139 minor=1 len=4
+[X11REPLY] fd=2 seq=21 reply_len=33 total=164
+[X11POLL] svc_fd=2 has_data=true avail=684
+[X11SVC] fd=2 read 684 bytes
+[X11] req#21 op=55 minor=0 len=16
+[X11] req#22 op=72 minor=1 len=280
+[X11] req#23 op=60 minor=0 len=8
+[X11] req#24 op=53 minor=1 len=16
+[X11] req#25 op=55 minor=0 len=16
+[X11] req#26 op=72 minor=1 len=280
+[X11] req#27 op=60 minor=0 len=8
+[X11] req#28 op=55 minor=0 len=20
+[X11] req#29 op=55 minor=0 len=24
+[X11] req#30 op=98 minor=0 len=16
+[X11REPLY] fd=2 seq=31 reply_len=0 total=32
+[X11POLL] svc_fd=2 has_data=true avail=32
+[X11SVC] fd=2 read 32 bytes
+[X11] req#31 op=98 minor=0 len=32
+[X11REPLY] fd=2 seq=32 reply_len=0 total=32
+[X11POLL] svc_fd=2 has_data=true avail=24
+[X11SVC] fd=2 read 24 bytes
+[X11] req#32 op=98 minor=0 len=24
+[X11REPLY] fd=2 seq=33 reply_len=0 total=32
+[X11POLL] svc_fd=2 has_data=true avail=24
+[X11SVC] fd=2 read 24 bytes
+[X11] req#33 op=131 minor=1 len=24
+[X11/XI] minor=1 len=24
+[X11REPLY] fd=2 seq=34 reply_len=0 total=32
+[X11POLL] svc_fd=2 has_data=true avail=24
+[X11SVC] fd=2 read 24 bytes
+[X11] req#34 op=98 minor=1 len=24
+[X11REPLY] fd=2 seq=35 reply_len=0 total=32
+[X11POLL] svc_fd=2 has_data=true avail=24
+[X11SVC] fd=2 read 24 bytes
+[X11] req#35 op=131 minor=1 len=24
+[X11/XI] minor=1 len=24
+[X11REPLY] fd=2 seq=36 reply_len=0 total=32
+[X11POLL] svc_fd=2 has_data=true avail=8
+[X11SVC] fd=2 read 8 bytes
+[X11] req#36 op=131 minor=47 len=8
+[X11/XI] minor=47 len=8
+[X11REPLY] fd=2 seq=37 reply_len=0 total=32
+[X11POLL] svc_fd=2 has_data=true avail=12
+[X11SVC] fd=2 read 12 bytes
+[X11] req#37 op=91 minor=47 len=12
+[X11REPLY] fd=2 seq=38 reply_len=2 total=40
+[X11POLL] svc_fd=2 has_data=true avail=28
+[X11SVC] fd=2 read 28 bytes
+[X11] req#38 op=139 minor=33 len=16
+[X11] req#39 op=91 minor=1 len=12
+[X11REPLY] fd=2 seq=40 reply_len=2 total=40
+[X11POLL] svc_fd=2 has_data=true avail=28
+[X11SVC] fd=2 read 28 bytes
+[X11] req#40 op=139 minor=33 len=16
+[X11] req#41 op=91 minor=1 len=12
+[X11REPLY] fd=2 seq=42 reply_len=2 total=40
+[X11POLL] svc_fd=2 has_data=true avail=64
+[X11SVC] fd=2 read 64 bytes
+[X11] req#42 op=139 minor=33 len=16
+[X11] req#43 op=98 minor=0 len=16
+[X11REPLY] fd=2 seq=44 reply_len=0 total=32
+[X11] req#44 op=98 minor=0 len=16
+[X11REPLY] fd=2 seq=45 reply_len=0 total=32
+[X11] req#45 op=98 minor=0 len=16
+[X11REPLY] fd=2 seq=46 reply_len=0 total=32
+[X11POLL] svc_fd=2 has_data=true avail=408
+[X11SVC] fd=2 read 408 bytes
+[X11] req#46 op=1 minor=24 len=52
+[X11] req#47 op=18 minor=0 len=32
+[X11] req#48 op=18 minor=0 len=32
+[X11] req#49 op=18 minor=0 len=44
+[X11] req#50 op=18 minor=0 len=32
+[X11] req#51 op=18 minor=0 len=96
+[X11] req#52 op=18 minor=0 len=60
+[X11] req#53 op=18 minor=0 len=36
+[X11] req#54 op=16 minor=0 len=24
+[X11REPLY] fd=2 seq=55 reply_len=0 total=32
+[X11] InternAtom("WM_LOCALE_NAME") -> 85
+[X11POLL] svc_fd=2 has_data=true avail=88
+[X11SVC] fd=2 read 88 bytes
+[X11] req#55 op=18 minor=0 len=32
+[X11] req#56 op=18 minor=0 len=32
+[X11] req#57 op=16 minor=0 len=24
+[X11REPLY] fd=2 seq=58 reply_len=0 total=32
+[X11] InternAtom("WM_CLIENT_LEADER") -> 86
+[X11POLL] svc_fd=2 has_data=true avail=240
+[X11SVC] fd=2 read 240 bytes
+[X11] req#58 op=18 minor=0 len=28
+[X11] req#59 op=1 minor=24 len=48
+[X11] req#60 op=61 minor=0 len=16
+[X11] req#61 op=53 minor=1 len=16
+[X11] req#62 op=55 minor=101 len=16
+[X11] req#63 op=70 minor=0 len=20
+[X11] req#64 op=56 minor=47 len=16
+[X11] req#65 op=71 minor=0 len=36
+[X11] req#66 op=128 minor=2 len=20
+[X11] req#67 op=54 minor=2 len=8
+[X11] req#68 op=139 minor=0 len=12
+[X11REPLY] fd=2 seq=69 reply_len=0 total=32
+[X11] req#69 op=139 minor=1 len=4
+[X11REPLY] fd=2 seq=70 reply_len=33 total=164
+[X11POLL] svc_fd=2 has_data=true avail=56
+[X11SVC] fd=2 read 56 bytes
+[X11] req#70 op=131 minor=46 len=20
+[X11/XI] minor=46 len=20
+[X11] req#71 op=9 minor=0 len=8
+[X11] req#72 op=8 minor=24 len=8
+[X11] MapWindow 0x40000d 150x100+0,0
+[X11] req#73 op=16 minor=0 len=20
+[X11REPLY] fd=2 seq=74 reply_len=0 total=32
+[X11] InternAtom("WM_PROTOCOLS") -> 69
+[X11POLL] svc_fd=2 has_data=true avail=28
+[X11SVC] fd=2 read 28 bytes
+[X11] req#74 op=18 minor=0 len=28
+[PROC-METRICS] tick=1000 pid=1 name=/disk/usr/bin/xeyes sc=581 (vm=124 file=265 net=114 sync=73 proc=0 sig=0 other=5) pf=311 disk=R1277952/W0 net=R2220/W3884 cur_nr=7@98t
+[PROC-METRICS] tick=1500 pid=1 name=/disk/usr/bin/xeyes sc=581 (vm=124 file=265 net=114 sync=73 proc=0 sig=0 other=5) pf=311 disk=R1277952/W0 net=R2220/W3884 STUCK_IN_NR=7@598t
+[PROC-METRICS] tick=2000 pid=1 name=/disk/usr/bin/xeyes sc=581 (vm=124 file=265 net=114 sync=73 proc=0 sig=0 other=5) pf=311 disk=R1277952/W0 net=R2220/W3884 STUCK_IN_NR=7@1098t
+[PROC-METRICS] tick=2500 pid=1 name=/disk/usr/bin/xeyes sc=581 (vm=124 file=265 net=114 sync=73 proc=0 sig=0 other=5) pf=311 disk=R1277952/W0 net=R2220/W3884 STUCK_IN_NR=7@1598t
+[PROC-METRICS] tick=3000 pid=1 name=/disk/usr/bin/xeyes sc=581 (vm=124 file=265 net=114 sync=73 proc=0 sig=0 other=5) pf=311 disk=R1277952/W0 net=R2220/W3884 STUCK_IN_NR=7@2098t
+[PROC-METRICS] tick=3500 pid=1 name=/disk/usr/bin/xeyes sc=581 (vm=124 file=265 net=114 sync=73 proc=0 sig=0 other=5) pf=311 disk=R1277952/W0 net=R2220/W3884 STUCK_IN_NR=7@2598t
+[PROC-METRICS] tick=4000 pid=1 name=/disk/usr/bin/xeyes sc=581 (vm=124 file=265 net=114 sync=73 proc=0 sig=0 other=5) pf=311 disk=R1277952/W0 net=R2220/W3884 STUCK_IN_NR=7@3098t
+[PROC-METRICS] tick=4500 pid=1 name=/disk/usr/bin/xeyes sc=581 (vm=124 file=265 net=114 sync=73 proc=0 sig=0 other=5) pf=311 disk=R1277952/W0 net=R2220/W3884 STUCK_IN_NR=7@3598t
+[PROC-METRICS] tick=5000 pid=1 name=/disk/usr/bin/xeyes sc=581 (vm=124 file=265 net=114 sync=73 proc=0 sig=0 other=5) pf=311 disk=R1277952/W0 net=R2220/W3884 STUCK_IN_NR=7@4098t
+[PROC-METRICS] tick=5500 pid=1 name=/disk/usr/bin/xeyes sc=581 (vm=124 file=265 net=114 sync=73 proc=0 sig=0 other=5) pf=311 disk=R1277952/W0 net=R2220/W3884 STUCK_IN_NR=7@4598t
