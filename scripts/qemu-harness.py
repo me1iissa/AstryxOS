@@ -57,6 +57,20 @@ Tier 2 — GDB stub integration (requires --gdb-port on start):
     python3 scripts/qemu-harness.py cont <sid>
     python3 scripts/qemu-harness.py pause <sid>
     python3 scripts/qemu-harness.py resume <sid>
+    python3 scripts/qemu-harness.py autopsy <sid> --break <sym|addr> \\
+                                            --capture <preset> \\
+                                            [--once N] [--continue-after] \\
+                                            [--timeout-ms MS] \\
+                                            [--leave-paused] \\
+                                            [--output PATH]
+
+Autopsy is the MANDATORY FIRST PROBE for any fault investigation.
+Presets live at scripts/autopsy/presets.yaml; current set includes
+full-register-dump, stack-walk-bt-full, ssp-fail-snapshot, vfork-window,
+gp-fault-context, bugcheck-entry.  Adding a new printk-style ring buffer
+without first running an autopsy is dispatch-counted-against-you — the
+GDB stub already produces structured machine-readable output that
+beats every ad-hoc serial-log probe.
 
 QGA bridge (requires --features qga on start):
     python3 scripts/qemu-harness.py qga-ping <sid> [--timeout S]
@@ -373,6 +387,93 @@ class GdbClient:
             return resp == "OK"
         except Exception:
             return False
+
+    # ── continue + wait-for-stop (used by `autopsy`) ──────────────────────────
+
+    def cont_no_wait(self) -> None:
+        """
+        Send `vCont;c` (or `c` if vCont unsupported) WITHOUT consuming the
+        eventual stop-reply.  The caller is responsible for invoking
+        `wait_for_stop()` later to drain the stop packet.
+
+        This split exists so `cmd_autopsy` can arm a breakpoint, resume the
+        guest, poll with a timeout, and time-bound the wait — the
+        `vcont_cont` convenience helper drops the stop-reply on the floor
+        which we cannot tolerate when we need it.
+        """
+        support = ""
+        try:
+            support = self.send("vCont?")
+        except Exception:
+            pass
+        pkt = "vCont;c" if "c" in support else "c"
+        # Hand-build the frame so we don't recurse into _send_pkt's ack loop.
+        raw = pkt.encode("ascii")
+        cs  = self._checksum(raw)
+        frame = f"${pkt}#{cs:02x}".encode("ascii")
+        self._s.sendall(frame)
+        if self._ack_mode:
+            # Drain the immediate '+' ack to the continue packet.
+            self._s.settimeout(1.0)
+            try:
+                self._recv_bytes(1)  # consume '+'
+            except (socket.timeout, ConnectionError):
+                pass
+            finally:
+                self._s.settimeout(self.timeout)
+
+    def wait_for_stop(self, timeout_s: float) -> Optional[str]:
+        """
+        Block up to `timeout_s` seconds for the next stop-reply packet
+        ($T..#cs or $S..#cs).  Returns the payload (e.g. "T05swbreak:;...")
+        on success, or None on timeout.
+
+        We use select() on the underlying socket so we can honour a
+        deadline without holding the connection timeout permanently low
+        (which would break subsequent packet exchanges).
+        """
+        import select
+        deadline = time.monotonic() + timeout_s
+        # Skip leading +/- ack bytes (response to our previous send) and
+        # wait for the '$' that begins a stop packet.
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            ready, _, _ = select.select([self._s], [], [], remaining)
+            if not ready:
+                return None
+            try:
+                b = self._s.recv(1)
+            except (socket.timeout, ConnectionError):
+                return None
+            if not b:
+                return None
+            if b == b"$":
+                break
+            # else: stray + or - or noise — keep going.
+
+        # Read until '#'; the body of the stop packet is small (< 64 bytes
+        # in practice) so we don't need an inner select loop.
+        old_to = self._s.gettimeout()
+        try:
+            self._s.settimeout(max(1.0, deadline - time.monotonic()))
+            payload = b""
+            while True:
+                c = self._s.recv(1)
+                if not c:
+                    return None
+                if c == b"#":
+                    break
+                payload += c
+            _cs_bytes = self._s.recv(2)
+            if self._ack_mode:
+                self._s.sendall(b"+")
+            return payload.decode("ascii", errors="replace")
+        except (socket.timeout, ConnectionError):
+            return None
+        finally:
+            self._s.settimeout(old_to)
 
 
 # ── Tier 2: ELF symbol resolver ──────────────────────────────────────────────
@@ -3574,6 +3675,588 @@ def cmd_resume(args):
         _out({"ok": False, "qmp_error": result["error"]})
     else:
         _out({"ok": True, "note": "QEMU resumed"})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tier 2: GDB-autopsy wrapper (cmd_autopsy)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Replaces the "add another printk" debugging anti-pattern with a one-shot
+# argv invocation that arms one or more breakpoints on the live GDB stub,
+# waits for them to hit, and captures a STRUCTURED snapshot per hit
+# (registers, named memory windows, FSBASE-relative reads) driven by a
+# YAML-defined preset library at scripts/autopsy/presets.yaml.
+#
+# Contract:
+#   - The session MUST have been started with --gdb-port PORT.  Without it
+#     we exit with a JSON error pointing at the correct start command.
+#   - Output is a single JSON document on stdout.  Optionally also written
+#     to --output PATH for archival.
+#   - Hits are returned as an ordered array; agents iterate with no further
+#     parsing required.
+#   - All memory reads are capped per-step (default 4 KiB per window).
+#   - If a breakpoint never hits within --timeout-ms we return what we
+#     captured plus `{"timed_out": true}` — silent timeouts are forbidden.
+#
+# Public spec references:
+#   - GDB Remote Serial Protocol (Z0/z0 packets, vCont, stop replies)
+#   - Intel SDM Vol. 1 §3.4 (GPR set)
+#   - Intel SDM Vol. 3A §3.4.4 (FSBASE/GSBASE MSRs, segment base)
+#   - sysV AMD64 ABI §3.2 (stack frame layout)
+
+_AUTOPSY_PRESETS_PATH = _SCRIPTS_DIR / "autopsy" / "presets.yaml"
+
+_KERNEL_NM_CACHE: list[tuple[int, str]] = []
+
+
+def _kernel_nm_suffix_lookup(suffix: str) -> list[tuple[int, str]]:
+    """Use `nm --defined-only -C` against the kernel ELF to find symbols
+    whose demangled name equals `suffix` OR ends in `::<suffix>`.
+
+    Used by autopsy's --break resolution as a fallback when pyelftools
+    isn't installed (and `_build_kernel_symtab` therefore returns []).
+    Caches the parsed nm output for the lifetime of the process.
+
+    Returns a list of (addr, fullname) tuples.  Empty if nm can't run.
+    """
+    global _KERNEL_NM_CACHE
+    if not _KERNEL_NM_CACHE:
+        elf = _get_kernel_elf()
+        if not elf.exists():
+            return []
+        try:
+            out = subprocess.check_output(
+                ["nm", "--defined-only", "-C", str(elf)],
+                stderr=subprocess.DEVNULL, timeout=20,
+            ).decode("utf-8", errors="replace")
+        except (FileNotFoundError, subprocess.CalledProcessError,
+                subprocess.TimeoutExpired):
+            return []
+        parsed: list[tuple[int, str]] = []
+        for line in out.splitlines():
+            parts = line.split(maxsplit=2)
+            if len(parts) < 3:
+                continue
+            try:
+                addr = int(parts[0], 16)
+            except ValueError:
+                continue
+            if addr == 0:
+                continue
+            parsed.append((addr, parts[2]))
+        _KERNEL_NM_CACHE = parsed
+    suffix_qualified = f"::{suffix}"
+    return [(a, n) for (a, n) in _KERNEL_NM_CACHE
+            if n == suffix or n.endswith(suffix_qualified)]
+
+
+def _load_autopsy_presets() -> dict:
+    """Read scripts/autopsy/presets.yaml; return the parsed dict.
+
+    Falls back to an empty preset bank if PyYAML is missing or the file
+    doesn't exist — the autopsy command can still run with ad-hoc captures
+    via --capture-step (future extension) but the canonical path uses
+    the preset library.
+    """
+    if not _AUTOPSY_PRESETS_PATH.exists():
+        return {"presets": {}}
+    try:
+        import yaml
+    except ImportError:
+        return {"presets": {}, "_warning": "PyYAML missing; presets unavailable"}
+    try:
+        with _AUTOPSY_PRESETS_PATH.open() as f:
+            data = yaml.safe_load(f) or {}
+    except Exception as e:
+        return {"presets": {}, "_warning": f"presets.yaml parse error: {e}"}
+    if "presets" not in data:
+        return {"presets": {}}
+    return data
+
+
+_AUTOPSY_RE_FS_LINE = re.compile(
+    r"^FS\s*=([0-9a-fA-F]+)\s+([0-9a-fA-F]+)\s+", re.MULTILINE
+)
+_AUTOPSY_RE_GS_LINE = re.compile(
+    r"^GS\s*=([0-9a-fA-F]+)\s+([0-9a-fA-F]+)\s+", re.MULTILINE
+)
+
+
+def _autopsy_query_seg_base(qmp_sock: str, seg: str) -> Optional[int]:
+    """Return the segment base (FS/GS) of CPU 0 via QMP info registers.
+
+    On x86_64, FSBASE is stored in the FS_BASE MSR (IA32_FS_BASE) and is
+    independent of the FS segment selector; QEMU's `info registers` text
+    surfaces it as the 64-bit field immediately after the segment
+    selector on the corresponding line.  We don't pause/resume QEMU here
+    — caller is responsible for state since autopsy runs while paused at
+    a breakpoint.
+    """
+    resp = _qmp_command(qmp_sock, "human-monitor-command",
+                         {"command-line": "info registers"},
+                         connect_timeout=2.0)
+    text = resp.get("return", "") if isinstance(resp, dict) else ""
+    if not text:
+        return None
+    rx = _AUTOPSY_RE_FS_LINE if seg == "fs" else _AUTOPSY_RE_GS_LINE
+    m = rx.search(text)
+    if not m:
+        return None
+    try:
+        return int(m.group(2), 16)
+    except ValueError:
+        return None
+
+
+def _autopsy_resolve_kernel_rip(rip: int) -> Optional[str]:
+    """Best-effort symbol resolution for a kernel-space RIP.  Returns
+    'symbol+offset' string or None.
+
+    Tries pyelftools-backed symtab first (fast, demangled).  Falls back
+    to the cached nm output when pyelftools is missing so the autopsy
+    still names the RIP on minimal Python installs.
+    """
+    if rip < _KERNEL_VMA_BASE:
+        return None
+    try:
+        elf = _get_kernel_elf()
+        if not elf.exists():
+            return None
+        syms = _build_kernel_symtab(elf)
+        if syms:
+            named = _resolve_kernel_rip(rip, syms)
+            if named:
+                return named
+    except Exception:
+        pass
+
+    # nm fallback: prime the cache via a no-op lookup, then bisect.
+    _kernel_nm_suffix_lookup("__AUTOPSY_PRIME_NM_CACHE__")
+    if not _KERNEL_NM_CACHE:
+        return None
+    import bisect
+    sorted_pairs = sorted(_KERNEL_NM_CACHE, key=lambda t: t[0])
+    addrs = [a for (a, _n) in sorted_pairs]
+    idx = bisect.bisect_right(addrs, rip) - 1
+    if idx < 0:
+        return None
+    base, name = sorted_pairs[idx]
+    delta = rip - base
+    if delta > 0x10000:  # too far from any known symbol — likely junk
+        return None
+    return f"{name}+{delta:#x}"
+
+
+def _autopsy_run_step(gdb: GdbClient, regs: dict, step: dict,
+                       qmp_sock: str, seg_base_cache: dict,
+                       per_step_cap: int) -> dict:
+    """Execute one capture step; return its JSON record.
+
+    Errors are FOLDED INTO the record (`"error": "..."`) rather than
+    raised — a single failing step must not invalidate the whole hit.
+    """
+    kind = step.get("kind", "")
+    name = step.get("name", "")
+    try:
+        if kind == "regs":
+            return {"kind": "regs", "regs": regs}
+
+        if kind == "mem":
+            addr = int(step["addr"]) if not isinstance(step["addr"], str) \
+                   else int(step["addr"], 0)
+            length = min(int(step["len"]), per_step_cap)
+            data = gdb.read_mem(addr, length)
+            return {
+                "kind": "mem", "addr": hex(addr), "len": len(data),
+                "bytes": data.hex(),
+            }
+
+        if kind in ("mem_at", "mem_via_reg"):
+            reg = step["reg"].lower()
+            if reg not in regs:
+                return {"kind": kind, "error": f"unknown register {reg!r}"}
+            base = int(regs[reg], 16) if isinstance(regs[reg], str) \
+                   else int(regs[reg])
+            offset = int(step.get("offset", 0))
+            length = min(int(step["len"]), per_step_cap)
+            addr = (base + offset) & 0xFFFF_FFFF_FFFF_FFFF
+            try:
+                data = gdb.read_mem(addr, length)
+                return {
+                    "kind": kind, "reg": reg, "offset": offset,
+                    "addr": hex(addr), "len": len(data), "bytes": data.hex(),
+                }
+            except Exception as e:
+                return {
+                    "kind": kind, "reg": reg, "offset": offset,
+                    "addr": hex(addr), "error": str(e),
+                }
+
+        if kind == "mem_via_seg":
+            seg = step["seg"].lower()
+            if seg not in ("fs", "gs"):
+                return {"kind": kind, "error": f"unsupported seg {seg!r}"}
+            base = seg_base_cache.get(seg)
+            if base is None:
+                base = _autopsy_query_seg_base(qmp_sock, seg)
+                seg_base_cache[seg] = base
+            if base is None:
+                return {"kind": kind, "seg": seg,
+                        "error": "segment base unavailable from QMP"}
+            offset = int(step.get("offset", 0))
+            length = min(int(step["len"]), per_step_cap)
+            addr = (base + offset) & 0xFFFF_FFFF_FFFF_FFFF
+            try:
+                data = gdb.read_mem(addr, length)
+                return {
+                    "kind": kind, "seg": seg, "seg_base": hex(base),
+                    "offset": offset, "addr": hex(addr), "len": len(data),
+                    "bytes": data.hex(),
+                }
+            except Exception as e:
+                return {
+                    "kind": kind, "seg": seg, "seg_base": hex(base),
+                    "offset": offset, "addr": hex(addr), "error": str(e),
+                }
+
+        if kind == "sym_window":
+            sym_name = step["sym"]
+            elf = _get_kernel_elf()
+            info = _resolve_symbol(elf, sym_name)
+            if info is None:
+                return {"kind": kind, "sym": sym_name,
+                        "error": "symbol not found in kernel ELF"}
+            base = int(info["addr"], 16)
+            offset = int(step.get("offset", 0))
+            length = min(int(step["len"]), per_step_cap)
+            addr = (base + offset) & 0xFFFF_FFFF_FFFF_FFFF
+            try:
+                data = gdb.read_mem(addr, length)
+                return {
+                    "kind": kind, "sym": sym_name, "sym_addr": info["addr"],
+                    "offset": offset, "addr": hex(addr), "len": len(data),
+                    "bytes": data.hex(),
+                }
+            except Exception as e:
+                return {"kind": kind, "sym": sym_name, "addr": hex(addr),
+                        "error": str(e)}
+
+        if kind == "note":
+            return {"kind": "note", "text": str(step.get("text", ""))}
+
+        return {"kind": kind, "error": f"unknown step kind {kind!r}"}
+    except KeyError as e:
+        return {"kind": kind, "name": name, "error": f"missing field {e}"}
+    except Exception as e:
+        return {"kind": kind, "name": name, "error": str(e)}
+
+
+def _autopsy_resolve_break_target(target: str) -> tuple[Optional[int], Optional[str]]:
+    """Resolve a --break argument into (address, label).
+
+    Accepts:
+      - "0xffff..."   raw hex address
+      - "12345"       decimal address
+      - "ke_bugcheck" symbol name (looked up in kernel ELF)
+      - "ke_bugcheck+0x10" symbol with offset
+
+    Returns (None, "<error msg>") on failure.
+    """
+    if target.startswith("0x") or target.startswith("0X"):
+        try:
+            return (int(target, 16), target)
+        except ValueError:
+            return (None, f"invalid hex address {target!r}")
+    if target[:1].isdigit() and "+" not in target:
+        try:
+            return (int(target, 0), target)
+        except ValueError:
+            pass
+
+    # Symbol or symbol+offset
+    sym = target
+    delta = 0
+    if "+" in target:
+        sym, off_s = target.split("+", 1)
+        try:
+            delta = int(off_s, 0)
+        except ValueError:
+            return (None, f"invalid offset {off_s!r} in {target!r}")
+
+    elf = _get_kernel_elf()
+    if not elf.exists():
+        return (None, f"kernel ELF not found at {elf}")
+    info = _resolve_symbol(elf, sym)
+    if info is None:
+        # Rust mangles kernel symbols (e.g. ke_bugcheck →
+        # astryx_kernel::ke::bugcheck::ke_bugcheck), so fall back to a
+        # suffix-match across the kernel symtab.  The user-friendly
+        # "break ke_bugcheck" then resolves the canonical mangled name.
+        # Try pyelftools first (covers both global and local symbols);
+        # if pyelftools is missing the symtab is empty and we fall through
+        # to an `nm -C` based lookup.
+        candidates: list[tuple[int, str]] = []
+        try:
+            syms = _build_kernel_symtab(elf)
+        except Exception:
+            syms = []
+        suffix = f"::{sym}"
+        candidates = [(a, n) for (a, _sz, n) in syms
+                      if n == sym or n.endswith(suffix)]
+        if not candidates:
+            candidates = _kernel_nm_suffix_lookup(sym)
+        if len(candidates) == 1:
+            addr, fullname = candidates[0]
+            return (addr + delta,
+                    f"{target} ({fullname})")
+        if len(candidates) > 1:
+            sample = [c[1] for c in candidates[:5]]
+            return (None, f"symbol {sym!r} ambiguous "
+                          f"({len(candidates)} matches, e.g. {sample}); "
+                          f"pass the fully-qualified name or a hex address")
+        return (None, f"symbol {sym!r} not found in {elf.name}")
+    try:
+        addr = int(info["addr"], 16) + delta
+    except (TypeError, ValueError) as e:
+        return (None, f"symbol resolution returned non-hex: {e}")
+    return (addr, target)
+
+
+def cmd_autopsy(args):
+    """
+    GDB-autopsy wrapper.
+
+    Arms one or more breakpoints on the live GDB stub, resumes the
+    guest, and on each hit runs a YAML-defined capture preset that
+    produces STRUCTURED JSON (registers, named memory windows,
+    FSBASE-relative reads) instead of forcing the agent to grep raw
+    GDB output.
+
+    Usage (canonical):
+      qemu-harness.py autopsy <sid> \\
+          --break ke_bugcheck \\
+          --capture ssp-fail-snapshot \\
+          --once \\
+          --timeout-ms 60000 \\
+          --output /tmp/ssp.json
+
+    Mandatory first probe before ANY new printk-style ring buffer.
+    """
+    sess = _load_session(args.sid)
+    port = _get_gdb_port(sess)
+    qmp_sock = sess["qmp_sock"]
+
+    # ── Preset resolution ────────────────────────────────────────────────────
+    bank = _load_autopsy_presets()
+    preset_name = args.capture
+    presets = bank.get("presets") or {}
+    if preset_name not in presets:
+        _err(f"Unknown preset {preset_name!r}. "
+             f"Available: {sorted(presets.keys())}. "
+             f"Edit {_AUTOPSY_PRESETS_PATH} to add a new one.")
+    preset = presets[preset_name]
+    steps = preset.get("steps") or []
+    if not steps:
+        _err(f"Preset {preset_name!r} has no steps")
+
+    # ── Breakpoint resolution ────────────────────────────────────────────────
+    breaks: list[dict] = []
+    for tgt in args.brk:
+        addr, label = _autopsy_resolve_break_target(tgt)
+        if addr is None:
+            _err(f"Could not resolve --break {tgt!r}: {label}")
+        breaks.append({"addr": addr, "label": tgt})
+
+    # ── Stub lock (one autopsy at a time) ────────────────────────────────────
+    import fcntl
+    lock_path = HARNESS_DIR / f"{args.sid}.gdb.lock"
+    lock_fd = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_fd.close()
+        _err(f"GDB stub for sid {args.sid} is busy (another autopsy / "
+             f"rip-sample / kdb invocation holds the lock). Retry once it "
+             f"exits.")
+
+    # ── Pause guest, connect, arm breakpoints, capture ───────────────────────
+    # We pause via QMP first so the breakpoints land on a frozen guest;
+    # this avoids a race where the guest runs past the desired symbol
+    # between the connect and the Z0 packet.
+    was_paused = False
+    paused_resp = _qmp_command(qmp_sock, "stop", connect_timeout=3.0)
+    if "error" in paused_resp:
+        # QMP stop on an already-stopped guest can return runstate-mismatch;
+        # treat it as a benign "already stopped" condition.
+        was_paused = True
+
+    hits: list[dict] = []
+    timed_out = False
+    captured_error: Optional[str] = None
+    started_at = time.time()
+
+    gdb = GdbClient("127.0.0.1", port)
+    if not gdb.connect():
+        # Make sure we don't leave the guest paused on connect failure.
+        if not was_paused:
+            _qmp_command(qmp_sock, "cont", connect_timeout=3.0)
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_fd.close()
+        _err(f"Cannot connect to GDB stub on port {port} (tried "
+             f"{port}..{port+4}). Was the session started with --gdb-port?")
+
+    armed_addrs: list[int] = []
+    try:
+        # Arm all requested breakpoints.
+        for b in breaks:
+            ok = gdb.set_bp(b["addr"])
+            b["armed"] = bool(ok)
+            if ok:
+                armed_addrs.append(b["addr"])
+        if not armed_addrs:
+            captured_error = "no breakpoints could be armed (check addresses)"
+        else:
+            per_step_cap = max(64, min(int(args.max_bytes_per_step), 4096))
+            once_n = max(1, int(args.once_n))
+            timeout_ms = max(100, int(args.timeout_ms))
+            wait_budget = timeout_ms / 1000.0
+
+            # The breakpoint loop: resume → wait → snapshot → repeat.
+            for hit_index in range(once_n):
+                # Resume.  QMP cont is the canonical "let it run" command;
+                # we then poll the GDB stub's stop-reply channel.
+                cont_resp = _qmp_command(qmp_sock, "cont",
+                                          connect_timeout=2.0)
+                if "error" in cont_resp:
+                    # Already running is benign.
+                    pass
+
+                # Tell the GDB stub to continue too (so vCont state is
+                # cleared) — QMP cont already resumes the vCPUs but
+                # without a matching vCont;c the next stop-reply may
+                # have stale state.  We still need to drain via
+                # wait_for_stop.
+                try:
+                    gdb.cont_no_wait()
+                except Exception as e:
+                    captured_error = f"gdb continue failed: {e}"
+                    break
+
+                stop_reply = gdb.wait_for_stop(wait_budget)
+                if stop_reply is None:
+                    timed_out = True
+                    # Pause back so the cleanup path can disarm cleanly.
+                    _qmp_command(qmp_sock, "stop", connect_timeout=2.0)
+                    break
+
+                # The guest is now halted at the breakpoint; snapshot it.
+                try:
+                    regs = gdb.read_regs()
+                except Exception as e:
+                    regs = {}
+                    captured_error = f"read_regs failed: {e}"
+
+                rip = 0
+                try:
+                    rip = int(regs.get("rip", "0x0"), 16)
+                except Exception:
+                    pass
+
+                # Match this hit to one of our armed breakpoints (by RIP).
+                matched = None
+                for b in breaks:
+                    if b.get("armed") and b["addr"] == rip:
+                        matched = b
+                        break
+                bp_record = {
+                    "addr": hex(rip),
+                    "label": matched["label"] if matched else None,
+                    "symbol": _autopsy_resolve_kernel_rip(rip),
+                }
+
+                # Run the preset's capture steps.
+                seg_base_cache: dict = {}
+                captures: dict = {}
+                for step in steps:
+                    step_name = step.get("name") or step.get("kind", "?")
+                    captures[step_name] = _autopsy_run_step(
+                        gdb, regs, step, qmp_sock,
+                        seg_base_cache, per_step_cap,
+                    )
+
+                hits.append({
+                    "hit_index": hit_index,
+                    "breakpoint": bp_record,
+                    "stop_reply": stop_reply,
+                    "captures": captures,
+                })
+
+                # Budget renewal for the next hit (subtract elapsed).
+                wait_budget = max(
+                    0.1,
+                    timeout_ms / 1000.0 - (time.time() - started_at),
+                )
+                if wait_budget <= 0:
+                    timed_out = True
+                    break
+
+                # If continue-after is OFF (single shot per arm), break.
+                if not args.continue_after:
+                    break
+    finally:
+        # Always disarm the breakpoints we set; leaving them armed would
+        # surprise the next agent who attaches via `step`/`cont`.
+        for addr in armed_addrs:
+            try:
+                gdb.del_bp(addr)
+            except Exception:
+                pass
+        try:
+            gdb.close()
+        except Exception:
+            pass
+
+        # Resume the guest UNLESS the caller asked to leave it paused.
+        if not args.leave_paused:
+            _qmp_command(qmp_sock, "cont", connect_timeout=3.0)
+
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_fd.close()
+
+    # ── Emit ─────────────────────────────────────────────────────────────────
+    result = {
+        "ok":          len(hits) > 0 or not timed_out,
+        "sid":         args.sid,
+        "preset":      preset_name,
+        "preset_desc": preset.get("description", "").strip(),
+        "breakpoints": [
+            {"label": b["label"], "addr": hex(b["addr"]),
+             "armed": b.get("armed", False)}
+            for b in breaks
+        ],
+        "hit_count":   len(hits),
+        "timed_out":   timed_out,
+        "elapsed_s":   round(time.time() - started_at, 3),
+        "hits":        hits,
+    }
+    if captured_error:
+        result["error"] = captured_error
+    if "_warning" in bank:
+        result["preset_warning"] = bank["_warning"]
+
+    if args.output:
+        try:
+            with open(args.output, "w") as f:
+                json.dump(result, f, indent=2, default=str)
+            result["output_path"] = args.output
+        except OSError as e:
+            result["output_error"] = str(e)
+
+    _out(result)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -8395,6 +9078,61 @@ def main():
     p_resume = sub.add_parser("resume", help="[Tier2] Resume QEMU via QMP cont")
     p_resume.add_argument("sid")
 
+    # autopsy — GDB breakpoint + structured capture wrapper
+    p_autopsy = sub.add_parser(
+        "autopsy",
+        help="[Tier2] GDB-autopsy: arm breakpoint(s), wait for hit, "
+             "capture structured snapshot driven by a preset. "
+             "Required first probe before any new printk-style ring buffer.",
+    )
+    p_autopsy.add_argument("sid")
+    p_autopsy.add_argument(
+        "--break", dest="brk", action="append", required=True, metavar="TARGET",
+        help="Breakpoint target. Accepts hex address (0xffff...), "
+             "decimal address, kernel symbol name (e.g. ke_bugcheck), "
+             "or symbol+offset (e.g. ke_bugcheck+0x10). May be "
+             "repeated to arm multiple sites simultaneously.",
+    )
+    p_autopsy.add_argument(
+        "--capture", required=True, metavar="PRESET",
+        help="Preset name from scripts/autopsy/presets.yaml. Examples: "
+             "full-register-dump, stack-walk-bt-full, ssp-fail-snapshot, "
+             "vfork-window, gp-fault-context, bugcheck-entry. Run with "
+             "an unknown preset to see the available list.",
+    )
+    p_autopsy.add_argument(
+        "--once", dest="once_n", type=int, default=1, metavar="N",
+        help="Cap the number of hits captured (default 1). Use higher "
+             "values together with --continue-after to record repeated "
+             "fires of the same breakpoint.",
+    )
+    p_autopsy.add_argument(
+        "--continue-after", action="store_true", dest="continue_after",
+        help="After capturing a hit, resume the guest and wait for the "
+             "next one (up to --once N). Default: stop after the first hit.",
+    )
+    p_autopsy.add_argument(
+        "--timeout-ms", type=int, default=60000, metavar="MS",
+        help="Total wall-clock budget across all hits (default 60000 ms). "
+             "On timeout the captured hits so far are returned with "
+             "timed_out=true — never silent.",
+    )
+    p_autopsy.add_argument(
+        "--max-bytes-per-step", type=int, default=512, metavar="N",
+        help="Cap per-memory-window read size (default 512, max 4096) to "
+             "protect agent context length.",
+    )
+    p_autopsy.add_argument(
+        "--leave-paused", action="store_true",
+        help="On exit, leave the guest paused (so a follow-up `step`/`mem` "
+             "session can pick up state). Default: resume the guest.",
+    )
+    p_autopsy.add_argument(
+        "--output", default=None, metavar="PATH",
+        help="Optional: also write the structured JSON to PATH "
+             "(in addition to stdout) for archival in a doc / commit message.",
+    )
+
     # kdb — Tier 1 kernel debugger JSON socket
     p_kdb = sub.add_parser(
         "kdb",
@@ -9008,6 +9746,7 @@ def main():
         "cont":   cmd_cont,
         "pause":  cmd_pause,
         "resume": cmd_resume,
+        "autopsy": cmd_autopsy,
         # Tier 1
         "kdb":         cmd_kdb,
         "tlb-stats":   cmd_tlb_stats,
