@@ -114,6 +114,28 @@ wget-test = []
 # <https://datatracker.ietf.org/doc/html/rfc5246>, OpenSSL s_client(1)
 # <https://www.openssl.org/docs/man3.0/man1/openssl-s_client.html>.
 tls-test = []
+# oracle-test — Oracle endpoint agent first-boot demo (PIVOT-I2, 2026-05-23).
+# Launches the production GLIBC-linked `oracle` binary from the user's
+# infrastructure-services/infrasvc release (~5 MiB) with
+# `--mode console --once` so it runs a single observation cycle and exits.
+# Validates the AstryxOS kernel's ability to host a real glibc+tokio
+# Linux server-agent: dynamic linker + glibc + libssl3/libcrypto3 +
+# tokio runtime + signalfd + epoll + clone3 + /proc + /sys reads.  This
+# is a first-boot VALIDATION pass — the goal is to reach the first
+# non-recoverable failure and name it, not to make oracle fully
+# functional.  Subsequent fixes (sysfs network shim, sd_notify, etc.)
+# are tracked in docs/INFRASVC_ORACLE_AUDIT_2026-05-23.md.
+#
+# Mutually exclusive with the other *-test cargo features at the
+# main.rs cfg-gate level.  Requires the data.img to contain
+# /usr/bin/oracle plus the glibc + host libssl3 stage; run
+# `scripts/create-data-disk.sh --oracle --force` (or
+# `ASTRYXOS_ORACLE=1`) before booting.  Public refs:
+# tokio <https://tokio.rs/>, sd_notify(3)
+# <https://www.freedesktop.org/software/systemd/man/sd_notify.html>,
+# systemd.service(5)
+# <https://www.freedesktop.org/software/systemd/man/systemd.service.html>.
+oracle-test = []
 # Opt-in for the userspace alias_test page-aliasing reproducer (Test 44b).
 # Spawns 8 worker threads via raw clone(CLONE_VM|CLONE_THREAD|CLONE_SIGHAND)
 # doing MAP_PRIVATE mmap churn; runs >100k page faults; sometimes wedges

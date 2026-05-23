@@ -66,6 +66,8 @@ mod httpd_demo;
 mod sshd_demo;
 #[cfg(feature = "tls-test")]
 mod tls_demo;
+#[cfg(feature = "oracle-test")]
+mod oracle_demo;
 
 use astryx_shared::{BootInfo, BOOT_INFO_MAGIC};
 
@@ -394,6 +396,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "httpd-test"),
                   not(feature = "sshd-test"),
                   not(feature = "tls-test"),
+                  not(feature = "oracle-test"),
                   feature = "xeyes-test"))]
         {
             serial_println!("[XEYES] xeyes-test mode starting...");
@@ -600,6 +603,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "httpd-test"),
                   not(feature = "sshd-test"),
                   not(feature = "tls-test"),
+                  not(feature = "oracle-test"),
                   any(feature = "busybox-test", feature = "wget-test")))]
         {
             hal::enable_interrupts();
@@ -657,6 +661,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "wget-test"),
                   not(feature = "sshd-test"),
                   not(feature = "tls-test"),
+                  not(feature = "oracle-test"),
                   feature = "httpd-test"))]
         {
             hal::enable_interrupts();
@@ -698,6 +703,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "wget-test"),
                   not(feature = "httpd-test"),
                   not(feature = "tls-test"),
+                  not(feature = "oracle-test"),
                   feature = "sshd-test"))]
         {
             hal::enable_interrupts();
@@ -736,6 +742,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "wget-test"),
                   not(feature = "httpd-test"),
                   not(feature = "sshd-test"),
+                  not(feature = "oracle-test"),
                   feature = "tls-test"))]
         {
             hal::enable_interrupts();
@@ -766,6 +773,45 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             loop { unsafe { core::arch::asm!("hlt"); } }
         }
 
+        // ── oracle-test: oracle endpoint agent first-boot demo (PIVOT-I2, 2026-05-23) ──
+        #[cfg(all(not(feature = "gui-test"),
+                  not(feature = "xeyes-test"),
+                  not(feature = "firefox-test"),
+                  not(feature = "busybox-test"),
+                  not(feature = "wget-test"),
+                  not(feature = "httpd-test"),
+                  not(feature = "sshd-test"),
+                  not(feature = "tls-test"),
+                  feature = "oracle-test"))]
+        {
+            hal::enable_interrupts();
+            if !sched::is_active() {
+                sched::enable();
+            }
+            let t0 = arch::x86_64::irq::get_ticks();
+            while arch::x86_64::irq::get_ticks().wrapping_sub(t0) < 30 {
+                core::hint::spin_loop();
+            }
+
+            oracle_demo::run_oracle_demo();
+
+            serial_println!("[ORACLE] DONE");
+
+            let t_done = arch::x86_64::irq::get_ticks();
+            while arch::x86_64::irq::get_ticks().wrapping_sub(t_done) < 100 {
+                core::hint::spin_loop();
+            }
+            unsafe {
+                core::arch::asm!(
+                    "out dx, eax",
+                    in("dx")  0xf4_u16,
+                    in("eax") 0_u32,
+                    options(nomem, nostack)
+                );
+            }
+            loop { unsafe { core::arch::asm!("hlt"); } }
+        }
+
         // ── X11 visual test: create a colored window and hold it on screen ──
         // Activated by firefox-test mode — shows an X11 window before Firefox.
         #[cfg(all(not(feature = "gui-test"),
@@ -775,6 +821,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "httpd-test"),
                   not(feature = "sshd-test"),
                   not(feature = "tls-test"),
+                  not(feature = "oracle-test"),
                   feature = "firefox-test"))]
         {
             serial_println!("[FFTEST] Firefox-test mode starting...");
@@ -1135,7 +1182,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         }
 
         // ── Normal boot: launch userspace + interactive shell ──────────────
-        #[cfg(not(any(feature = "gui-test", feature = "firefox-test", feature = "xeyes-test", feature = "busybox-test", feature = "wget-test", feature = "httpd-test", feature = "sshd-test", feature = "tls-test")))]
+        #[cfg(not(any(feature = "gui-test", feature = "firefox-test", feature = "xeyes-test", feature = "busybox-test", feature = "wget-test", feature = "httpd-test", feature = "sshd-test", feature = "tls-test", feature = "oracle-test")))]
         {
         // Phase 13: Launch Ascension (init) and Orbit (shell) as Ring 3 processes
         serial_println!("[Aether] Phase 13: Launching userspace processes...");
