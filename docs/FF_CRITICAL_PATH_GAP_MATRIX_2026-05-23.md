@@ -151,8 +151,8 @@ authoritative source location; **Spec** = public spec citation.
 | `clone(2)` CLONE_VFORK semantics (parent blocks until execve/exit) | mandatory | P | `subsys/linux/syscall.rs:2404+` | clone(2) man page |
 | `clone3(2)` (nr=435) | soft (glibc 2.34+ prefers, falls back to clone) | P | `subsys/linux/syscall.rs:3265-3360` | clone3(2) man page |
 | `set_tid_address(2)` (nr=218) | mandatory | P | `subsys/linux/syscall.rs:5829` | set_tid_address(2) man page |
-| `set_robust_list(2)` (nr=273) + robust-futex wake-on-death | mandatory (NPTL) | — | nr=273 not in dispatch table → ENOSYS via default arm | set_robust_list(2); kernel.org `robust-futexes.txt` |
-| `get_robust_list(2)` (nr=274) | optional (debugger only) | — | ENOSYS | get_robust_list(2) man page |
+| `set_robust_list(2)` (nr=273) + robust-futex wake-on-death | mandatory (NPTL) | p | nr=273 dispatch PRESENT (`syscall.rs:2815`), stores `(head, len)`; **wake-on-death walker MISSING** (`proc/mod.rs:2420-2425` self-documents the omission) | set_robust_list(2); kernel.org `robust-futexes.txt` |
+| `get_robust_list(2)` (nr=274) | optional (debugger only) | y | nr=274 dispatch PRESENT (`syscall.rs:2837`) — round-trips stored head/len | get_robust_list(2) man page |
 | `futex(2)` FUTEX_WAIT / FUTEX_WAKE / FUTEX_PRIVATE_FLAG | mandatory | P | `subsys/linux/syscall.rs:7486+` | futex(2) man page |
 | `futex(2)` FUTEX_REQUEUE / FUTEX_CMP_REQUEUE | mandatory (pthread_cond) | P | `subsys/linux/syscall.rs:7466-7468` | futex(2) man page |
 | `futex(2)` FUTEX_WAIT_BITSET / FUTEX_WAKE_BITSET | mandatory (priority-inherit) | p (bitset accepted but treated as MATCH_ANY) | `subsys/linux/syscall.rs:7470-7471` | futex(2) man page |
@@ -209,7 +209,7 @@ authoritative source location; **Spec** = public spec citation.
 | `/proc/self/exe` (symlink) | mandatory | P | `vfs/procfs.rs:486` | proc(5) man page |
 | `/proc/self/fd/<N>` (symlinks) | mandatory (Mojo handle passing) | P | `vfs/procfs.rs:155,295,486` | proc(5) man page |
 | `/proc/self/status` | mandatory (Mozilla sandbox parsers) | P | `vfs/procfs.rs` (46-key per 2026-05-18 expansion) | proc(5) man page |
-| `/proc/self/mountinfo` | mandatory (sandbox policy enumerates fs) | p (stub) | `vfs/procfs.rs:194,269` | proc(5) man page |
+| `/proc/self/mountinfo` | mandatory (sandbox policy enumerates fs) | y | `vfs/procfs.rs:876-950` (`generate_mountinfo`) — residual gaps: bind-mounts, optional_fields, octal-escape | proc(5) man page |
 | `/proc/self/cgroup` | mandatory (cgroup-aware code reads `0::/\n`) | P | `vfs/procfs.rs:273` | cgroup-v2 docs |
 | `/proc/self/oom_score_adj` | soft (Mozilla writes here, see source comment) | P | `vfs/procfs.rs:197,276` | proc(5) man page |
 | `/proc/self/loginuid` | soft (audit) | P (returns -1) | `vfs/procfs.rs:200,279` | audit(7) |
@@ -275,27 +275,36 @@ Headless screenshot does not require any of these.
 
 ## Top-5 gaps — fix shape and recommended investigation
 
-### Gap 1 — `set_robust_list(2)` ENOSYS
+### Gap 1 — Robust-futex wake-on-thread-death walker MISSING (set_robust_list dispatch is PRESENT)
 
-**FF behaviour if absent:** NPTL silently tolerates ENOSYS (glibc 2.34+
-attempts the call once per thread and stores robust list head only on success).
-The kernel-side wake-on-thread-death path is what matters for *correctness* —
-without it, when a thread holding a robust mutex is killed (SIGKILL, SIGSEGV,
-exit_group), waiters block forever instead of receiving `EOWNERDEAD`.
+**Current state on master (corrected after /review):** `set_robust_list` (nr=273)
+and `get_robust_list` (nr=274) dispatch arms are present at
+`kernel/src/subsys/linux/syscall.rs:2810-2845`; `(head, len)` is stored in
+`Thread.robust_list_head/_len` (`kernel/src/proc/mod.rs:244-247`) with
+CWE-822 user-pointer validation. The wake-on-thread-death walker is
+intentionally absent — `kernel/src/proc/mod.rs:2420-2425` explicitly
+documents: "Robust-list teardown is intentionally **not** performed here …
+the slot is round-tripped for `get_robust_list(2)` only."
 
-**AstryxOS fix shape:** ~60 LOC.
+**FF behaviour:** NPTL is happy — its `set_robust_list` succeeds and the
+head is stored. But when a thread holding a robust mutex is killed
+(SIGKILL, SIGSEGV, exit_group), waiters **never receive `EOWNERDEAD`** —
+they block forever instead of taking the lock with the owner-died bit
+set. Mozilla IPC and mozjemalloc use robust mutexes in several paths.
 
-1. Add nr=273 (`set_robust_list`) and nr=274 (`get_robust_list`) dispatch arms
-   storing `(head_ptr, len)` in the per-task struct.
-2. On task exit (`subsys/linux/syscall.rs` `sys_exit` / clone path teardown),
-   walk the robust list head; for each user-space lock node, atomically set
-   the `FUTEX_OWNER_DIED` bit and wake one waiter on that uaddr. Per
-   `robust-futexes.txt`.
-3. Add `kernel/src/test_runner.rs` test: spawn a thread holding robust mutex,
+**AstryxOS fix shape:** ~60 LOC (walker + test only — dispatch arms already
+exist).
+
+1. On task exit (`subsys/linux/syscall.rs` `sys_exit` / clone-path teardown /
+   `proc/mod.rs:2420-2425` exit path), walk the stored `robust_list_head`;
+   for each user-space lock node, atomically set the `FUTEX_OWNER_DIED` bit
+   (`0x40000000`) and wake one waiter on that `uaddr`. Enforce the 1M-entry
+   silent-stop cap per `Documentation/robust-futex-ABI.txt`.
+2. Add `kernel/src/test_runner.rs` test: spawn a thread holding robust mutex,
    kill it, observe `EOWNERDEAD` returned to the waiter.
 
-**Recommended dispatch:** `aether-kernel-engineer` for the dispatch arm + exit
-walker; `qa-engineer` for the test case.
+**Recommended dispatch:** `aether-kernel-engineer` for the exit walker;
+`qa-engineer` for the test case.
 
 ### Gap 2 — `futex_waitv(2)` ENOSYS (nr=449)
 
@@ -309,7 +318,10 @@ the vectored form would have collapsed to one syscall.
 **AstryxOS fix shape:** ~120 LOC.
 
 1. Add nr=449 dispatch reading the `struct futex_waitv[]` (count up to 128 per
-   `futex_waitv(2)`).
+   `futex_waitv(2)`). Current state on master: nr=449 appears only as
+   metadata in `kernel/src/subsys/linux/syscall.rs:811,838` ("202 | 449 |
+   ... // futex, futex_waitv") with no executable arm — falls through to
+   the default ENOSYS arm.
 2. For each element, validate (uaddr aligned, val matches, flags valid).
 3. Park the calling thread on multiple uaddrs in
    `FUTEX_WAITERS` (single-blocker semantics — first wake returns the index).
@@ -344,25 +356,42 @@ extra_auxv.push((AT_SECURE, 0));
 
 **Recommended dispatch:** any kernel engineer; trivially small.
 
-### Gap 4 — `/proc/self/mountinfo` real content
+### Gap 4 — `/proc/self/mountinfo` residual deficiencies (canonical emitter is PRESENT)
 
-**FF behaviour:** Firefox content sandbox enumerates mountpoints to compute
-its broker policy (which paths are read-only, which are writable). Stub returns
-empty → sandbox sees no mountpoints and defaults to refuse-all, which means
-Mesa swrast / NSS / fontconfig probes get EACCES instead of EROFS / OK.
+**Current state on master (corrected after /review):** `generate_mountinfo()`
+exists at `kernel/src/vfs/procfs.rs:876-950`, walks `MOUNTS`, and emits
+the canonical 11-column `proc(5)` mountinfo format with synthetic
+major:minor, mount opts, and fstype-derived source names. The "empty stub"
+characterisation in earlier drafts of this doc was wrong — the comment at
+line 897-899 explicitly notes the past-tense "ENOENT used to make it fall
+back to a refuse-all policy". The primary refuse-all-cascade risk is
+already mitigated.
 
-**AstryxOS fix shape:** ~80 LOC.
+**Residual deficiencies (still real, smaller scope):**
 
-1. In `vfs/procfs.rs`, when `/proc/self/mountinfo` is read, walk
-   `vfs::mount_table` and emit lines in proc(5) `mountinfo` format:
-   `<id> <parent_id> <major:minor> <root> <mount_pt> <opts> ...`
-2. Each `Filesystem` impl already has a `name()` so we have a major:minor
-   shim (e.g. ramfs=`0:1`, tmpfs=`0:2`, fat32=`8:1`, ext2=`8:2`).
+1. **Bind-mount support** — no current mount-table primitive for bind mounts;
+   Firefox sandbox bind-mounts `/proc/self/cwd` and similar. Per
+   `mount(2)` `MS_BIND`.
+2. **`optional_fields` column** — column 7 in `proc(5)` mountinfo is
+   `optional_fields` (e.g. `shared:N`, `master:N`); currently emitted
+   empty (`-`). Some sandbox enumerators parse it; verify Mozilla's
+   broker tolerates an empty value.
+3. **Octal escape of mount-point spaces / control bytes** — `proc(5)`
+   requires `\040` etc. for any whitespace in the path. Verify
+   our emitter handles this (currently the bringup paths are all
+   plain-ASCII so this hasn't been exercised).
 
-Cite: proc(5) man page, Mozilla bz #1198550, #1948331.
+**AstryxOS fix shape:** ~30-50 LOC of incremental hardening, not the
+80 LOC of a fresh emitter.
 
-**Recommended dispatch:** `filesystem-engineer`. Add tests verifying mountinfo
-lines exist for the bringup-mounted filesystems (procfs, sysfs, ramfs, fat32).
+Cite: `proc(5)` man page, Mozilla bz #1198550 (sandbox reads
+`/proc/self/maps`; the broker-policy / mountinfo enumeration is implied
+but the bz primarily covers `/proc/self/maps`).
+
+**Recommended dispatch:** `filesystem-engineer` for bind-mount support
+*only if* a downstream investigation surfaces a bind-mount-dependent
+Mozilla path. Bumped down priority versus initial draft because the
+"empty stub" framing was wrong.
 
 ### Gap 5 — `MAP_HUGETLB` / 2 MiB mapping
 
