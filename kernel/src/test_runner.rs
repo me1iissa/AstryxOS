@@ -2186,6 +2186,21 @@ pub fn run() -> ! {
         if test_271_tokio_syscall_backfills() { passed += 1; }
     }
 
+    // ── Test 272: /sys/class/net native sysfs surface ───────────────────
+    // Validates the per-interface attribute directory tree at
+    // `/sys/class/net/<iface>/` for the Linux server binaries that
+    // discover network interfaces by `glob("/sys/class/net/*")` and read
+    // per-iface `address`/`operstate`/`mtu`/`carrier`/`speed`/`flags`/
+    // `ifindex`/`type` files.  oracle endpoint agent's network collector
+    // and cloud-init's NoCloud datasource both follow this discovery
+    // pattern.  Refs: kernel.org/Documentation/ABI/testing/sysfs-class-net,
+    // Documentation/networking/operstates.rst, man 7 netdevice, man 5 sysfs.
+    #[cfg(any(feature = "test-mode", feature = "firefox-test", feature = "oracle-test"))]
+    {
+        total += 1;
+        if test_272_sys_class_net() { passed += 1; }
+    }
+
     // ── Tests 261-263: native-core hardening (cycle 3) ──────────────────
     // Gated on `native-core-tests` feature: the three native-core tests
     // (page_ref_dec CAS underflow, OB refcount integration, scheduler
@@ -37709,6 +37724,223 @@ fn test_271_tokio_syscall_backfills() -> bool {
 
     if ok {
         test_pass!("tokio I1b backfills: signalfd / epoll_pwait2 / pidfd_open");
+    }
+    ok
+}
+
+// ── Test 272: /sys/class/net native sysfs surface ───────────────────────────
+//
+// Asserts that the `/sys/class/net/` subtree exposed by sysfs.rs satisfies
+// the consumer contract that production Linux server binaries rely on:
+//
+//   272-A  readdir(`/sys/class/net`) returns at minimum `lo`
+//   272-B  stat(`/sys/class/net/lo`) reports a directory
+//   272-C  read(`/sys/class/net/lo/address`) returns "00:00:00:00:00:00\n"
+//          (loopback hardware address, Linux convention — kernel.org
+//          Documentation/ABI/testing/sysfs-class-net §address)
+//   272-D  read(`/sys/class/net/lo/mtu`) parses as a positive integer
+//   272-E  read(`/sys/class/net/lo/operstate`) is a known operstate token
+//          (per Documentation/networking/operstates.rst)
+//   272-F  read(`/sys/class/net/lo/ifindex`) is a positive integer
+//   272-G  read(`/sys/class/net/lo/type`) is the loopback ARPHRD code (772)
+//   272-H  read(`/sys/class/net/lo/speed`) is "-1\n" (no link speed concept)
+//
+// All reads bypass the userspace syscall path and call the FS directly
+// because the test runner is kernel-mode; that's sufficient to validate
+// the FS-layer content + path resolution.  The oracle-test soak in the
+// dispatch hand-back validates the userspace `glob` + `open` + `read`
+// chain end-to-end.
+//
+// Refs: kernel.org/Documentation/ABI/testing/sysfs-class-net,
+//       kernel.org/Documentation/networking/operstates.rst,
+//       man 7 netdevice, man 5 sysfs, RFC 1042 (ARP types).
+#[cfg(any(feature = "test-mode", feature = "firefox-test", feature = "oracle-test"))]
+fn test_272_sys_class_net() -> bool {
+    test_header!("/sys/class/net native sysfs surface");
+
+    let mut ok = true;
+
+    // Read up to 256 bytes from a sysfs file via the FS directly.  Returns
+    // the trimmed-to-actual-length byte vector or `None` on lookup error.
+    fn read_sysfs(path: &str) -> Option<alloc::vec::Vec<u8>> {
+        use crate::vfs::{MOUNTS};
+        // Resolve path to (mount_idx, inode) by walking the path components.
+        // We bypass `vfs::read_file` because it uses stat().size to size the
+        // buffer, and sysfs reports size=0 per the ABI doc.
+        let (mount_idx, inode) = crate::vfs::resolve_path(path).ok()?;
+        let fs = {
+            let mounts = MOUNTS.lock();
+            mounts.get(mount_idx).map(|m| m.fs.clone())?
+        };
+        let mut buf = [0u8; 256];
+        let n = fs.read(inode, 0, &mut buf).ok()?;
+        Some(buf[..n].to_vec())
+    }
+
+    // ── 272-A: readdir(/sys/class/net) contains "lo" ───────────────────────
+    match crate::vfs::readdir("/sys/class/net") {
+        Ok(entries) => {
+            let names: alloc::vec::Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+            if !names.contains(&"lo") {
+                test_fail!("272-A readdir",
+                    "/sys/class/net entries = {:?}; expected 'lo' present", names);
+                ok = false;
+            } else {
+                test_println!("  272-A readdir /sys/class/net → {:?} (contains lo) ✓", names);
+            }
+        }
+        Err(e) => {
+            test_fail!("272-A readdir", "readdir(/sys/class/net) failed: {:?}", e);
+            ok = false;
+        }
+    }
+
+    // ── 272-B: stat(/sys/class/net/lo) is a directory ──────────────────────
+    match crate::vfs::stat("/sys/class/net/lo") {
+        Ok(st) => {
+            if st.file_type != crate::vfs::FileType::Directory {
+                test_fail!("272-B stat",
+                    "/sys/class/net/lo file_type={:?}; expected Directory", st.file_type);
+                ok = false;
+            } else {
+                test_println!("  272-B stat /sys/class/net/lo → Directory ✓");
+            }
+        }
+        Err(e) => {
+            test_fail!("272-B stat", "stat(/sys/class/net/lo) failed: {:?}", e);
+            ok = false;
+        }
+    }
+
+    // ── 272-C: read(/sys/class/net/lo/address) = "00:00:00:00:00:00\n" ─────
+    match read_sysfs("/sys/class/net/lo/address") {
+        Some(bytes) => {
+            const EXPECTED: &[u8] = b"00:00:00:00:00:00\n";
+            if bytes != EXPECTED {
+                test_fail!("272-C address",
+                    "/sys/class/net/lo/address = {:?}; expected {:?}",
+                    core::str::from_utf8(&bytes).unwrap_or("<non-utf8>"),
+                    core::str::from_utf8(EXPECTED).unwrap_or("<non-utf8>"));
+                ok = false;
+            } else {
+                test_println!("  272-C address = \"00:00:00:00:00:00\\n\" ✓");
+            }
+        }
+        None => {
+            test_fail!("272-C address", "read(/sys/class/net/lo/address) failed");
+            ok = false;
+        }
+    }
+
+    // ── 272-D: read(/sys/class/net/lo/mtu) parses as positive integer ─────
+    match read_sysfs("/sys/class/net/lo/mtu") {
+        Some(bytes) => {
+            let s = core::str::from_utf8(&bytes).unwrap_or("");
+            let trimmed = s.trim();
+            match trimmed.parse::<u32>() {
+                Ok(mtu) if mtu > 0 => {
+                    test_println!("  272-D mtu = {} ✓", mtu);
+                }
+                _ => {
+                    test_fail!("272-D mtu",
+                        "/sys/class/net/lo/mtu = {:?}; expected positive integer", s);
+                    ok = false;
+                }
+            }
+        }
+        None => {
+            test_fail!("272-D mtu", "read(/sys/class/net/lo/mtu) failed");
+            ok = false;
+        }
+    }
+
+    // ── 272-E: read(/sys/class/net/lo/operstate) is a known token ─────────
+    // Valid tokens per operstates.rst: up, down, unknown, lowerlayerdown,
+    // dormant, notpresent, testing.
+    match read_sysfs("/sys/class/net/lo/operstate") {
+        Some(bytes) => {
+            let s = core::str::from_utf8(&bytes).unwrap_or("");
+            let trimmed = s.trim();
+            const VALID: &[&str] = &[
+                "up", "down", "unknown",
+                "lowerlayerdown", "dormant", "notpresent", "testing",
+            ];
+            if !VALID.contains(&trimmed) {
+                test_fail!("272-E operstate",
+                    "/sys/class/net/lo/operstate = {:?}; not a known token", s);
+                ok = false;
+            } else {
+                test_println!("  272-E operstate = {:?} ✓", trimmed);
+            }
+        }
+        None => {
+            test_fail!("272-E operstate", "read(/sys/class/net/lo/operstate) failed");
+            ok = false;
+        }
+    }
+
+    // ── 272-F: read(/sys/class/net/lo/ifindex) is positive integer ────────
+    match read_sysfs("/sys/class/net/lo/ifindex") {
+        Some(bytes) => {
+            let s = core::str::from_utf8(&bytes).unwrap_or("");
+            let trimmed = s.trim();
+            match trimmed.parse::<u32>() {
+                Ok(idx) if idx > 0 => {
+                    test_println!("  272-F ifindex = {} ✓", idx);
+                }
+                _ => {
+                    test_fail!("272-F ifindex",
+                        "/sys/class/net/lo/ifindex = {:?}; expected positive integer", s);
+                    ok = false;
+                }
+            }
+        }
+        None => {
+            test_fail!("272-F ifindex", "read(/sys/class/net/lo/ifindex) failed");
+            ok = false;
+        }
+    }
+
+    // ── 272-G: read(/sys/class/net/lo/type) = "772\n" (ARPHRD_LOOPBACK) ───
+    match read_sysfs("/sys/class/net/lo/type") {
+        Some(bytes) => {
+            const EXPECTED: &[u8] = b"772\n";
+            if bytes != EXPECTED {
+                test_fail!("272-G type",
+                    "/sys/class/net/lo/type = {:?}; expected \"772\\n\" (ARPHRD_LOOPBACK)",
+                    core::str::from_utf8(&bytes).unwrap_or("<non-utf8>"));
+                ok = false;
+            } else {
+                test_println!("  272-G type = \"772\\n\" (ARPHRD_LOOPBACK) ✓");
+            }
+        }
+        None => {
+            test_fail!("272-G type", "read(/sys/class/net/lo/type) failed");
+            ok = false;
+        }
+    }
+
+    // ── 272-H: read(/sys/class/net/lo/speed) = "-1\n" (no link speed) ─────
+    match read_sysfs("/sys/class/net/lo/speed") {
+        Some(bytes) => {
+            const EXPECTED: &[u8] = b"-1\n";
+            if bytes != EXPECTED {
+                test_fail!("272-H speed",
+                    "/sys/class/net/lo/speed = {:?}; expected \"-1\\n\" (loopback)",
+                    core::str::from_utf8(&bytes).unwrap_or("<non-utf8>"));
+                ok = false;
+            } else {
+                test_println!("  272-H speed = \"-1\\n\" (loopback) ✓");
+            }
+        }
+        None => {
+            test_fail!("272-H speed", "read(/sys/class/net/lo/speed) failed");
+            ok = false;
+        }
+    }
+
+    if ok {
+        test_pass!("/sys/class/net native sysfs surface");
     }
     ok
 }
