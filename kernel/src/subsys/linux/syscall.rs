@@ -2949,12 +2949,34 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             const CAP_LAST_CAP: u64             = 40;
             match arg1 {
                 PR_SET_NAME => 0,   // ignore thread name
+                // PR_GET_NAME(*buf): per prctl(2), "the buffer should allow
+                // space for up to 16 bytes; the returned string will be
+                // null-terminated."  We range-check the user pointer for the
+                // same CWE-822/CWE-823 reason called out on the
+                // PR_GET_CHILD_SUBREAPER arm — SMAP AC=1 does not gate
+                // kernel-VA writes, so a sandboxed caller passing
+                // `arg2 = KERNEL_VIRT_BASE + off` would obtain a 16-byte
+                // arbitrary-write primitive.  Write the kernel name padded
+                // with NULs to fill the 16-byte buffer that callers
+                // (including tokio's worker-thread naming probe) allocate.
                 PR_GET_NAME => {
-                    let buf = arg2 as *mut u8;
-                    let name = b"astryx\0";
+                    if arg2 == 0 { return -14; } // EFAULT
+                    if !crate::syscall::user_ptr_check_bypassed()
+                        && !crate::syscall::validate_user_ptr(arg2, 16)
+                    {
+                        return -14; // EFAULT
+                    }
+                    let mut name = [0u8; 16];
+                    let src = b"astryx";
+                    name[..src.len()].copy_from_slice(src);
+                    // name[6..16] stays zero — NUL terminator + padding
                     unsafe {
                         let _g = crate::arch::x86_64::smap::UserGuard::new();
-                        core::ptr::copy_nonoverlapping(name.as_ptr(), buf, name.len());
+                        core::ptr::copy_nonoverlapping(
+                            name.as_ptr(),
+                            arg2 as *mut u8,
+                            16,
+                        );
                     }
                     0
                 }
@@ -4678,8 +4700,60 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // 326: copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)
         // Delegate to sendfile (40); arg1=fd_in, arg3=fd_out, arg2=off_in, arg5=len
         326 => sys_sendfile(arg3 as usize, arg1 as usize, arg2, arg5 as usize),
-        // 424: pidfd_send_signal — ENOSYS
+        // 282: signalfd(fd, *mask, sizemask) — legacy form, no flags argument.
+        // Per signalfd(2): "signalfd() was added to Linux in kernel 2.6.22;
+        // [signalfd4] supports a flags argument."  Functionally equivalent to
+        // signalfd4(fd, mask, sizemask, 0); musl posix_spawn's cancellation
+        // path and older glibc binaries still issue 282 directly.
+        282 => sys_signalfd4(arg1, arg2, arg3, 0),
+        // 424: pidfd_send_signal(pidfd, sig, *info, flags) — ENOSYS until
+        // pidfd objects exist.  Returning -38 here forces tokio's
+        // `tokio::process::Child::kill` fallback path (kill(2) via the
+        // child's recorded PID), which is the canonical behaviour on
+        // pre-5.1 Linux per pidfd_send_signal(2) NOTES.
         424 => -38,
+        // 434: pidfd_open(pid, flags) — ENOSYS until pidfd objects exist.
+        // Per pidfd_open(2): "Returns a file descriptor that refers to the
+        // process whose PID is specified in pid."  Tokio's `signal::ctrl_c`
+        // and `process::Child::wait` reactor paths fall back to signalfd +
+        // waitpid when this returns ENOSYS, both of which are plumbed.
+        434 => {
+            crate::serial_println!("[SYSCALL/Linux] pidfd_open(pid={}, flags={:#x}) — ENOSYS", arg1, arg2);
+            -38 // ENOSYS
+        }
+        // 441: epoll_pwait2(epfd, events, maxevents, *timespec, *sigmask, sigsetsize)
+        // Per epoll_pwait2(2) (Linux 5.11+): "epoll_pwait2() … takes a
+        // pointer to a timespec structure instead of milliseconds, allowing
+        // sub-millisecond precision."  Internally bounds-checks the
+        // user-supplied timespec, converts to whole milliseconds (matching
+        // our 100 Hz timer resolution), and delegates to sys_epoll_wait.
+        // The sigmask arg (arg5/arg6) is accepted-and-ignored as on
+        // epoll_pwait (sc 281) — see that arm's comment.
+        441 => {
+            let timeout_ms: i32 = if arg4 == 0 {
+                -1 // NULL timespec → block indefinitely per spec
+            } else {
+                if !crate::syscall::validate_user_ptr(arg4, 16) {
+                    return -14; // EFAULT
+                }
+                let (tv_sec, tv_nsec) = unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    let p = arg4 as *const i64;
+                    (core::ptr::read_unaligned(p), core::ptr::read_unaligned(p.add(1)))
+                };
+                if tv_sec < 0 || tv_nsec < 0 || tv_nsec >= 1_000_000_000 {
+                    return -22; // EINVAL
+                }
+                // Convert to whole ms, saturating to i32::MAX (~24.8 days).
+                // Round up to ensure caller's deadline isn't crossed before
+                // we even attempt the first poll on sub-tick timeouts.
+                let ms = (tv_sec as u64)
+                    .saturating_mul(1000)
+                    .saturating_add(((tv_nsec as u64) + 999_999) / 1_000_000);
+                ms.min(i32::MAX as u64) as i32
+            };
+            sys_epoll_wait(arg1 as usize, arg2, arg3 as usize, timeout_ms)
+        }
         // 443-445: landlock_* — ENOSYS
         443 | 444 | 445 => -38,
 

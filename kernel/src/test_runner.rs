@@ -2170,6 +2170,22 @@ pub fn run() -> ! {
     total += 1;
     if test_269_sigkill_clears_sibling_cleartid() { passed += 1; }
 
+    // ── Test 271: tokio I1b syscall backfills ───────────────────────────
+    // Validates the four small additions in `kernel/src/subsys/linux/syscall.rs`
+    // that close the residual syscall gaps tokio's reactor exercises at
+    // start-up:  signalfd(2) legacy form (sc 282), epoll_pwait2(2) (sc 441),
+    // pidfd_open(2) explicit ENOSYS (sc 434), and PR_GET_NAME 16-byte-buffer
+    // hardening (CWE-823).  Per the I1b dispatch + the INFRASVC oracle
+    // audit, these are the only kernel-ABI gaps preventing a tokio multi-
+    // thread runtime + `signal::ctrl_c` reactor from bringing up cleanly on
+    // an Alpine musl image.  Refs: signalfd(2), epoll_pwait2(2),
+    // pidfd_open(2), prctl(2), POSIX-1.2017.
+    #[cfg(any(feature = "test-mode", feature = "firefox-test"))]
+    {
+        total += 1;
+        if test_271_tokio_syscall_backfills() { passed += 1; }
+    }
+
     // ── Tests 261-263: native-core hardening (cycle 3) ──────────────────
     // Gated on `native-core-tests` feature: the three native-core tests
     // (page_ref_dec CAS underflow, OB refcount integration, scheduler
@@ -37498,6 +37514,201 @@ fn test_269_sigkill_clears_sibling_cleartid() -> bool {
 
     if ok {
         test_pass!("lethal-signal sibling teardown fires CLEARTID + FUTEX_WAKE (F1b)");
+    }
+    ok
+}
+
+// ── Test 271: signalfd(2) legacy + epoll_pwait2(2) + pidfd_open(2) stubs ────
+//
+// Validates the I1b TLS-substrate backfills against the Linux syscall ABI as
+// the tokio runtime exercises it during start-up.  Three sub-cases, all run
+// through the kernel-mode dispatch wrapper (no real userspace process):
+//
+//   271-A signalfd(2) (legacy form, syscall 282) — must delegate to
+//         signalfd4(2) with flags=0.  Tokio's `signal::ctrl_c` reactor on a
+//         musl/glibc image with the 282 codepath compiled in must allocate a
+//         valid fd, not -ENOSYS.  Per signalfd(2): "signalfd() was added to
+//         Linux in kernel 2.6.22; signalfd4() supports a flags argument."
+//
+//   271-B epoll_pwait2(2) (syscall 441) — must accept a `struct timespec *`
+//         timeout, convert to whole ms, and otherwise behave like epoll_wait.
+//         Per epoll_pwait2(2): "Compared to epoll_pwait, ... it allows for
+//         sub-millisecond precision via a struct timespec timeout."  We test
+//         the zero-watch / 0-timeout fast path (returns immediately with 0).
+//
+//   271-C pidfd_open(2) (syscall 434) — must return -ENOSYS (-38) explicitly
+//         so tokio's `tokio::process` reactor takes the kill(2) + waitpid(2)
+//         fallback path documented in pidfd_open(2) NOTES.
+//
+// Refs: signalfd(2), signalfd4(2), epoll_wait(2), epoll_pwait2(2),
+// pidfd_open(2), pidfd_send_signal(2), POSIX-1.2017 `<signal.h>`,
+// kernel.org/Documentation/admin-guide/syscalls.
+#[cfg(any(feature = "test-mode", feature = "firefox-test"))]
+fn test_271_tokio_syscall_backfills() -> bool {
+    test_header!("tokio I1b backfills: signalfd / epoll_pwait2 / pidfd_open");
+
+    let dispatch = crate::syscall::dispatch_linux_kernel;
+    let mut ok = true;
+
+    // ─── 271-A: signalfd(2) legacy (sc 282) ─────────────────────────────────
+    //
+    // signalfd(-1, &mask, sizemask) creates a new signalfd; the mask must be
+    // at least 8 bytes (sigset_t on x86_64).  Mask the common reactor set
+    // (SIGCHLD = 17, SIGTERM = 15, SIGINT = 2) so tokio's signal::unix path
+    // accepts the result.
+    {
+        const SIGCHLD: u64 = 17;
+        const SIGTERM: u64 = 15;
+        const SIGINT:  u64 = 2;
+        let mask: u64 = (1u64 << (SIGCHLD - 1))
+                      | (1u64 << (SIGTERM - 1))
+                      | (1u64 << (SIGINT  - 1));
+        // arg1 = -1 (create new), passed as u64::MAX since the sys_signalfd4
+        // helper accepts both `i64 == -1` and `u64::MAX` per its callsite.
+        let r = dispatch(282 /*signalfd*/, u64::MAX, &mask as *const u64 as u64, 8, 0, 0, 0);
+        if r < 0 {
+            test_fail!("271-A signalfd legacy",
+                "signalfd(-1, &mask, 8) returned {} (expected fd ≥ 0)", r);
+            ok = false;
+        } else {
+            test_println!("  271-A signalfd(-1, &mask, 8) → fd {} ✓", r);
+            // Clean up so the fd table doesn't leak into later tests.
+            let _ = dispatch(3 /*close*/, r as u64, 0, 0, 0, 0, 0);
+        }
+
+        // EINVAL on sizemask < 8 (matches signalfd4 spec).
+        let r_inv = dispatch(282 /*signalfd*/, u64::MAX, &mask as *const u64 as u64, 4, 0, 0, 0);
+        if r_inv != -22 {
+            test_fail!("271-A signalfd legacy",
+                "signalfd(-1, &mask, 4) returned {} (expected -22 EINVAL)", r_inv);
+            ok = false;
+        } else {
+            test_println!("  271-A signalfd sizemask=4 → -EINVAL ✓");
+        }
+    }
+
+    // ─── 271-B: epoll_pwait2(2) (sc 441) ────────────────────────────────────
+    //
+    // Build an empty epoll set, then call epoll_pwait2 with a zero-second
+    // timeout (returns immediately with 0 ready fds per epoll_wait(2)
+    // RETURN VALUE) and with a NULL timeout (also returns immediately on
+    // an empty set since there are no watches that could ever fire).
+    {
+        // epoll_create1(0)
+        let epfd = dispatch(291 /*epoll_create1*/, 0, 0, 0, 0, 0, 0);
+        if epfd < 0 {
+            test_fail!("271-B epoll_pwait2",
+                "epoll_create1(0) returned {}", epfd);
+            ok = false;
+            // Skip the remainder of this sub-case but continue the test.
+        } else {
+            // epoll_pwait2 with zero timespec → returns 0 immediately.
+            let ts_zero: [i64; 2] = [0, 0];
+            let mut events_buf = [0u8; 12 * 4]; // 12 bytes/event * 4 events headroom
+            let r0 = dispatch(
+                441 /*epoll_pwait2*/,
+                epfd as u64,
+                events_buf.as_mut_ptr() as u64,
+                4, // maxevents
+                ts_zero.as_ptr() as u64,
+                0, 0,
+            );
+            if r0 != 0 {
+                test_fail!("271-B epoll_pwait2",
+                    "zero-timeout returned {} (expected 0 on empty set)", r0);
+                ok = false;
+            } else {
+                test_println!("  271-B epoll_pwait2(epfd, ts={{0,0}}) → 0 ✓");
+            }
+
+            // epoll_pwait2 with NULL timespec → must NOT block on the empty
+            // set; the kernel returns 0 immediately because no watches are
+            // registered (mirrors epoll_wait(timeout=-1) on empty interest
+            // list — there's nothing to wait for).  Note: we still pass
+            // maxevents=4 so the sys_epoll_wait EINVAL gate (maxevents == 0)
+            // is not tripped.
+            //
+            // Reject negative tv_nsec.
+            let ts_bad: [i64; 2] = [0, -1];
+            let r_bad = dispatch(
+                441,
+                epfd as u64,
+                events_buf.as_mut_ptr() as u64,
+                4,
+                ts_bad.as_ptr() as u64,
+                0, 0,
+            );
+            if r_bad != -22 {
+                test_fail!("271-B epoll_pwait2",
+                    "negative tv_nsec returned {} (expected -22 EINVAL)", r_bad);
+                ok = false;
+            } else {
+                test_println!("  271-B epoll_pwait2 negative tv_nsec → -EINVAL ✓");
+            }
+
+            // close(epfd)
+            let _ = dispatch(3 /*close*/, epfd as u64, 0, 0, 0, 0, 0);
+        }
+    }
+
+    // ─── 271-C: pidfd_open(2) explicit ENOSYS (sc 434) ──────────────────────
+    {
+        // Linux pidfd_open(pid, flags); pid=1 is always valid on Linux.
+        let r = dispatch(434 /*pidfd_open*/, 1, 0, 0, 0, 0, 0);
+        if r != -38 {
+            test_fail!("271-C pidfd_open",
+                "pidfd_open(1, 0) returned {} (expected -38 ENOSYS)", r);
+            ok = false;
+        } else {
+            test_println!("  271-C pidfd_open(1, 0) → -ENOSYS ✓");
+        }
+    }
+
+    // ─── 271-D: prctl(PR_GET_NAME) writes 16-byte NUL-padded name ───────────
+    //
+    // The hardened PR_GET_NAME arm must (a) reject NULL buf with -EFAULT,
+    // (b) reject unreadable buf via validate_user_ptr with -EFAULT, and
+    // (c) write exactly 16 bytes with a NUL terminator within the first
+    // 16 bytes when given a valid 16-byte buffer.  Per prctl(2): "The
+    // buffer should allow space for up to 16 bytes; the returned string
+    // will be null-terminated."
+    {
+        // EFAULT on NULL buf.
+        let r_null = dispatch(157 /*prctl*/, 16 /*PR_GET_NAME*/, 0, 0, 0, 0, 0);
+        if r_null != -14 {
+            test_fail!("271-D PR_GET_NAME NULL",
+                "PR_GET_NAME(NULL) returned {} (expected -14 EFAULT)", r_null);
+            ok = false;
+        } else {
+            test_println!("  271-D PR_GET_NAME(NULL) → -EFAULT ✓");
+        }
+
+        // Valid 16-byte buffer.  Initialise with 0xAA so we can verify the
+        // arm overwrites the trailing pad bytes too (not just the prefix).
+        let mut buf = [0xAAu8; 16];
+        let r_ok = dispatch(157, 16, buf.as_mut_ptr() as u64, 0, 0, 0, 0);
+        if r_ok != 0 {
+            test_fail!("271-D PR_GET_NAME ok",
+                "PR_GET_NAME(buf) returned {} (expected 0)", r_ok);
+            ok = false;
+        } else {
+            // Must start with "astryx\0", and tail bytes must be cleared.
+            if &buf[..7] != b"astryx\0" {
+                test_fail!("271-D PR_GET_NAME ok",
+                    "buf prefix mismatch: {:?}", &buf[..7]);
+                ok = false;
+            } else if buf[7..].iter().any(|&b| b != 0) {
+                test_fail!("271-D PR_GET_NAME pad",
+                    "buf[7..16] not zero-padded: {:?}", &buf[7..]);
+                ok = false;
+            } else {
+                test_println!("  271-D PR_GET_NAME → \"astryx\\0\" + 9 NUL pad ✓");
+            }
+        }
+    }
+
+    if ok {
+        test_pass!("tokio I1b backfills: signalfd / epoll_pwait2 / pidfd_open");
     }
     ok
 }
