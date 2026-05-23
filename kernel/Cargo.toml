@@ -402,6 +402,27 @@ d17-aliasing-test = ["firefox-test", "w215-diag", "d16-canary-watch", "ssp-canar
 # POSIX `execve(2)`; CWE-121 (stack-based buffer overflow); musl
 # libc `src/env/__stack_chk_fail.c`.
 d18-extended-d16 = ["d16-canary-watch"]
+# D20 — write-only DR watchpoint on the kernel-stack canary slot.  After
+# PR #396 (multi-tier emergency kstack fallback) and PR #397 (`mm/vmm.rs`
+# `BATCH` 1024→128) landed, 3/3 deterministic trials still BUGCHECK at
+# `STACK_CANARY_CORRUPT (0xDEAD_0001)` on PID 2 TID 5 at sc=1230..1232,
+# with ZERO `[KSTACK/TIER]` and ZERO `[KSTACK/CANARY-FAIL]` records — i.e.
+# the multi-tier fallback never engaged and the writer is NOT in the
+# brk(2) / munmap(2) paths PR #395 named.  D20 hooks every thread-creation
+# site in `proc/mod.rs` (`create_thread`, `create_thread_blocked`,
+# `clone_for_fork`, `clone_for_thread`) via `note_kstack_alloc(pid, tid,
+# base, span)` and, for the first 6 PID-2 thread creations, arms a
+# write-only DR on `[kernel_stack_base, +8)` via the K2b primitive
+# `arm_linear_watchpoint` (PR #356).  The existing `handle_db_exception`
+# path emits `[W215/DR-WATCH-FIRE] kind_tag=6 …` with the writer's RIP /
+# CS / RFLAGS / CR3 + 8 qwords of stack context — per Intel SDM Vol. 3B
+# §17.3.1.1 each fire names one retired writer.  Diagnostic-only; default
+# builds remain byte-identical when off.  Depends on `firefox-test`
+# (trace formatters) and `w215-diag` (DR plumbing).
+# Refs: Intel SDM Vol. 3B §17.2.4 (DR0–DR3, DR7), §17.3.1.1 (data-
+# breakpoint trap timing); x86_64 SysV ABI §3.4.1 (stack-frame budgeting);
+# CWE-121 (stack-based buffer overflow).
+d20-kstack-canary-watch = ["firefox-test", "w215-diag"]
 # Track B (Phase 5, 2026-05-21) — stack-page write provenance ring.
 # Records kernel-mode writes whose target user VA falls into the
 # `[0x3f00_0000_0000, 0x4000_0000_0000)` thread-stack range (per Phase 4
