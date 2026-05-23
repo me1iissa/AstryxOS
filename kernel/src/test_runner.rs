@@ -34563,10 +34563,28 @@ fn test_236_dead_stack_zeroing() -> bool {
     // a same-frame push/pop pair would otherwise be withheld for ~20 ms
     // (TICK_HZ=100 × 2 ticks) and the test would deterministically fail.
     // Production callers continue to use the quiesced `pop_dead_stack`.
+    //
+    // The pop returns `(base, size)`; size is verified below to match
+    // the honest extent we pushed, closing the
+    // `push_dead_stack`/`CachedDeadStack` bounded-zero-fill contract
+    // (PR #399 STACK_CANARY_CORRUPT closure).
     let popped = crate::sched::pop_dead_stack_force();
     let popped_base = match popped {
-        Some(b) if b == base_virt => b,
-        Some(other) => {
+        Some((b, sz)) if b == base_virt => {
+            if sz != STACK_BYTES as u64 {
+                test_fail!(
+                    "test236",
+                    "pop returned size {} != pushed {} for base {:#x}",
+                    sz, STACK_BYTES, b,
+                );
+                for p in 0..STACK_PAGES {
+                    crate::mm::pmm::free_page(phys + (p as u64) * 0x1000);
+                }
+                return false;
+            }
+            b
+        }
+        Some((other, _)) => {
             // Another reaped stack was on top of the cache.  Push our
             // base back first so we don't lose it, then re-pop until we
             // hit our base.  In practice the test runs early and the

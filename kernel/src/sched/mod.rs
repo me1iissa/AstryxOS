@@ -301,11 +301,24 @@ fn reap_dead_threads_sched() {
     }; // THREAD_TABLE released before any PMM operations
 
     // Return kernel stacks to the dead-stack cache for reuse (NT pattern:
-    // MmDeadStackSListHead).  Only cache stacks of the standard size.
-    // Overflow goes to PMM free as before.
+    // MmDeadStackSListHead).  Only cache stacks of the standard size —
+    // shorter emergency-tier fallbacks (16 KiB / 8 KiB / 4 KiB; see
+    // `proc::alloc_kernel_stack::SMALL_KSTACK_TIERS`) go straight back
+    // to PMM so the cache never has to bound a partial zero-fill into
+    // unrelated higher-half mappings.
+    //
+    // The push carries the honest byte-extent of the dead Thread's
+    // kernel stack (`stack_pages * 0x1000`) so that
+    // `push_dead_stack`'s bulk zero-fill is strictly bounded to the
+    // entry's allocation — see `CachedDeadStack` and
+    // `push_dead_stack`'s doc-comments for the PR #399
+    // STACK_CANARY_CORRUPT closure rationale.  Overflow (cache full,
+    // or push rejected by the defensive size check) falls through to
+    // per-page PMM free as before.
     for (stack_base, stack_pages) in stacks {
         if stack_pages == crate::proc::KERNEL_STACK_PAGES_PUB {
-            if push_dead_stack(stack_base) {
+            let stack_size_bytes = (stack_pages as u64) * 0x1000;
+            if push_dead_stack(stack_base, stack_size_bytes) {
                 continue; // cached for reuse
             }
         }
@@ -347,8 +360,22 @@ const MAX_DEAD_STACKS: usize = 64;
 /// creation latency.
 const DEAD_STACK_QUIESCE_TICKS: u64 = 2;
 
-/// One cached dead stack: the higher-half kernel-stack base plus the
-/// per-CPU timer-ISR tick counter snapshot taken at push time.
+/// One cached dead stack: the higher-half kernel-stack base, the honest
+/// byte-extent of the underlying kernel-stack allocation, plus the per-CPU
+/// timer-ISR tick counter snapshot taken at push time.
+///
+/// `size` is the honest byte-extent reported by the reaper from
+/// `Thread::kernel_stack_size` (see `proc::alloc_kernel_stack` for why
+/// callers stamp the real span, not the compile-time
+/// `KERNEL_STACK_SIZE`).  It is load-bearing: `push_dead_stack`
+/// zero-fills exactly `size` bytes starting at `base`, never more.
+/// Without this, a buggy or future loosened call site that admits a
+/// shorter stack to the cache would scribble through the cached
+/// entry's true extent and into whichever physical pages happen to lie
+/// at the higher-half VAs immediately above it — corrupting an
+/// unrelated thread's kernel stack and tripping the STACK_CANARY_CORRUPT
+/// bugcheck (PR #399 D20 DR-watchpoint dispositive evidence).  See the
+/// `push_dead_stack` doc-comment for the closure narrative.
 ///
 /// Generation snapshot: `push_gen[i]` is the value of
 /// `arch::x86_64::irq::TIMER_ISR_PER_CPU[i]` observed by the pushing CPU
@@ -379,6 +406,13 @@ const DEAD_STACK_QUIESCE_TICKS: u64 = 2;
 struct CachedDeadStack {
     /// Higher-half kernel-stack base virtual address.
     base: u64,
+    /// Honest byte-extent of this cached stack — exactly the same value
+    /// the reaper read from `Thread::kernel_stack_size` (which itself is
+    /// `stack_top - stack_base`, set at allocation time in
+    /// `proc::alloc_kernel_stack`).  Used to bound the bulk zero-fill in
+    /// `push_dead_stack` and to compute `stack_top` at
+    /// `pop_dead_stack` time.
+    size: u64,
     /// Per-CPU timer-ISR tick counter snapshot at push time.
     /// `push_gen[i] == 0` means CPU i was not counting ticks at push
     /// (offline / never ticked) — that CPU does not gate quiescence.
@@ -428,19 +462,43 @@ fn entry_is_quiesced(entry: &CachedDeadStack) -> bool {
 
 /// Try to push a dead stack to the cache. Returns true if cached, false if full.
 ///
-/// Zeroes the full stack region before caching so a recycled stack does not
-/// carry the previous thread's saved register state, syscall arguments, or
-/// kernel pointers across the lifetime boundary into the new thread that
-/// pops it.  Without this, `pop_dead_stack` returns a base whose top frame
-/// still contains the prior occupant's RIP / RBP / scratch values; any
-/// kernel code that subsequently reads from the stack — speculatively or
-/// architecturally — observes another thread's secret state.  CWE-244
-/// (Improper Clean Up on Thrown Exception in the broader "improper resource
-/// shutdown" class — recycled-resource leak of residual data).
+/// `stack_size_bytes` is the honest byte-extent of the kernel-stack
+/// allocation backing `stack_base_virt` — i.e. the same
+/// `kernel_stack_size` the reaper read from the dead Thread, which itself
+/// is `stack_top - stack_base` at allocation time.  The zero-fill below
+/// is strictly bounded to `stack_size_bytes`; it MUST NOT write past the
+/// end of the cached allocation.
 ///
-/// Cost: one `write_bytes(..,0,KERNEL_STACK_SIZE)` per reaped thread.  At
-/// 64 pages = 256 KiB this is ~12 µs on a modern core, paid once per
-/// thread death — comparable to the page-zeroing cost paid on the
+/// Why this bound matters (closure of STACK_CANARY_CORRUPT, PR #399
+/// D20 DR-watchpoint disposition): the prior implementation zeroed a
+/// fixed `KERNEL_STACK_PAGES_PUB * 0x1000` = 256 KiB irrespective of
+/// the cached entry's true extent.  In the saga's bugcheck signature,
+/// the writer RIP captured by the D20 hardware watchpoint resolved to
+/// `compiler_builtins::memset` called from this site, with the
+/// destination range extending past the cached allocation's true
+/// end and into the higher-half mapping of an adjacent thread's
+/// kernel stack canary.  Bounding the zero-fill to the cached entry's
+/// honest size eliminates that out-of-bounds write at its source.
+/// The call site in `reap_dead_threads_sched` separately refuses to
+/// push entries whose `kernel_stack_size` is not the full
+/// `KERNEL_STACK_SIZE`, so today `stack_size_bytes` is always
+/// `KERNEL_STACK_PAGES_PUB * 0x1000`; the bound is the defence-in-depth
+/// invariant that survives future gate changes.
+///
+/// Zeroing rationale: a recycled stack must not carry the previous
+/// thread's saved register state, syscall arguments, or kernel
+/// pointers across the lifetime boundary into the new thread that
+/// pops it.  Without zeroing, `pop_dead_stack` returns a base whose
+/// top frame still contains the prior occupant's RIP / RBP / scratch
+/// values; any kernel code that subsequently reads from the stack —
+/// speculatively or architecturally — observes another thread's
+/// secret state.  CWE-244 (Improper Clean Up on Thrown Exception in
+/// the broader "improper resource shutdown" class — recycled-resource
+/// leak of residual data).
+///
+/// Cost: one `write_bytes(.., 0, stack_size_bytes)` per reaped thread.
+/// At 64 pages = 256 KiB this is ~12 µs on a modern core, paid once
+/// per thread death — comparable to the page-zeroing cost paid on the
 /// non-cached path (`pmm::free_page` → `pmm::alloc_page` zero on the
 /// allocation side).  The cache exists to skip TLB shootdowns and the
 /// PMM round-trip, not to skip zeroing.
@@ -450,7 +508,18 @@ fn entry_is_quiesced(entry: &CachedDeadStack) -> bool {
 /// until every CPU that was ticking at push time has advanced through
 /// `DEAD_STACK_QUIESCE_TICKS` timer interrupts (one full ISR round-trip
 /// plus margin).  See `CachedDeadStack` for the rationale.
-fn push_dead_stack(stack_base_virt: u64) -> bool {
+fn push_dead_stack(stack_base_virt: u64, stack_size_bytes: u64) -> bool {
+    // Defensive: refuse zero-sized or absurdly-large entries.  Both shapes
+    // are programmer errors at the call site — the cache must never
+    // hand back a base whose true extent we cannot honour.  Treat as
+    // "cache full" so the caller falls through to `pmm::free_page` for
+    // each of the kstack's pages (see `reap_dead_threads_sched`).
+    if stack_size_bytes == 0
+        || stack_size_bytes > (crate::proc::KERNEL_STACK_PAGES_PUB as u64) * 0x1000
+    {
+        return false;
+    }
+
     // Bulk-zero the kernel stack via the higher-half virtual base BEFORE
     // taking the cache lock — keeps the lock window tight (a few CPU
     // cycles to push the entry; the ~12 µs zero runs outside the lock).
@@ -458,10 +527,10 @@ fn push_dead_stack(stack_base_virt: u64) -> bool {
     // the lock below, so the zero is guaranteed to be visible to the
     // first `pop_dead_stack` caller that recycles this base.
     //
-    // The caller (sched reaper) only caches stacks of
-    // `KERNEL_STACK_PAGES_PUB` pages (verified at the call site in
-    // `reap_dead_threads_sched`), so the zero length is fixed and known.
-    let stack_size = crate::proc::KERNEL_STACK_PAGES_PUB * 0x1000;
+    // The zero length is `stack_size_bytes`, which is the honest extent
+    // of this entry's underlying allocation (see doc-comment).  Writing
+    // past that would step into another allocation's higher-half
+    // mapping and corrupt unrelated kernel state.
     // SAFETY: `stack_base_virt` is a kernel higher-half virtual address
     // that was previously allocated as a kernel stack for a thread that
     // is now Dead and removed from THREAD_TABLE (see
@@ -470,9 +539,16 @@ fn push_dead_stack(stack_base_virt: u64) -> bool {
     // state is set by the thread's last `schedule()` call, after which
     // the per-CPU `current_tid` moves away from this thread.  The
     // mapping is in the kernel half (above KERNEL_VIRT_BASE) so a
-    // user-mode access cannot reach it.
+    // user-mode access cannot reach it.  The length `stack_size_bytes`
+    // is bounded above by `KERNEL_STACK_PAGES_PUB * 0x1000` (checked
+    // immediately above), so the write stays within the kstack
+    // allocation's physical extent.
     unsafe {
-        core::ptr::write_bytes(stack_base_virt as *mut u8, 0u8, stack_size);
+        core::ptr::write_bytes(
+            stack_base_virt as *mut u8,
+            0u8,
+            stack_size_bytes as usize,
+        );
     }
 
     let push_gen = snapshot_per_cpu_ticks();
@@ -481,17 +557,31 @@ fn push_dead_stack(stack_base_virt: u64) -> bool {
     if cache.len() >= MAX_DEAD_STACKS {
         return false;
     }
-    cache.push(CachedDeadStack { base: stack_base_virt, push_gen });
+    cache.push(CachedDeadStack {
+        base: stack_base_virt,
+        size: stack_size_bytes,
+        push_gen,
+    });
     true
 }
 
 /// Try to pop a cached stack for reuse.
 ///
-/// Returns the higher-half base of the oldest cached entry that has
-/// quiesced — i.e. every CPU active at push time has advanced its per-CPU
-/// timer-ISR counter by at least `DEAD_STACK_QUIESCE_TICKS` since.
-/// Non-quiesced entries are left in place; the next pop attempt re-checks
-/// them.
+/// Returns `(stack_base_virt, stack_size_bytes)` of the oldest cached
+/// entry that has quiesced — i.e. every CPU active at push time has
+/// advanced its per-CPU timer-ISR counter by at least
+/// `DEAD_STACK_QUIESCE_TICKS` since.  Non-quiesced entries are left in
+/// place; the next pop attempt re-checks them.
+///
+/// `stack_size_bytes` is the honest extent stamped at push time (the
+/// reaper's view of `Thread::kernel_stack_size`).  Callers use it to
+/// build a `stack_top` without falling back to the compile-time
+/// `KERNEL_STACK_SIZE` constant — see `proc::alloc_kernel_stack`.
+/// Today every cached entry is `KERNEL_STACK_PAGES_PUB * 0x1000`
+/// (the call-site gate in `reap_dead_threads_sched` refuses anything
+/// shorter), so this is effectively a constant in production; we still
+/// return it explicitly to keep the cache's external contract honest
+/// against future gate changes.
 ///
 /// PMM allocator fallback: returning `None` here is the normal path that
 /// causes `proc::alloc_kernel_stack` to fall through to
@@ -503,7 +593,7 @@ fn push_dead_stack(stack_base_virt: u64) -> bool {
 /// in-flight stack access against a saved kernel RSP is only retired
 /// once that CPU has executed at least one further `iretq` cycle, which
 /// the per-CPU timer ISR counter directly measures).
-pub fn pop_dead_stack() -> Option<u64> {
+pub fn pop_dead_stack() -> Option<(u64, u64)> {
     let mut cache = DEAD_STACK_CACHE.lock();
     // Scan from the oldest end (index 0) — older entries have had more
     // time to quiesce, so this preserves rough-FIFO recycle order even
@@ -519,12 +609,20 @@ pub fn pop_dead_stack() -> Option<u64> {
     // `remove` is O(n) but n ≤ MAX_DEAD_STACKS = 64 and the call site
     // (alloc_kernel_stack) is off the hot scheduler path — already
     // amortised against PMM allocation cost.
-    Some(cache.remove(i).base)
+    let entry = cache.remove(i);
+    Some((entry.base, entry.size))
 }
 
 /// Public interface to pre-populate the dead stack cache (called from main.rs).
+///
+/// Pre-allocated stacks are always full-sized (`KERNEL_STACK_PAGES_PUB *
+/// 0x1000`) — see `main.rs::pre_alloc_stacks` — so this shim stamps
+/// that size unconditionally.  No other production call site uses the
+/// `_pub` shim; all reaper-driven pushes go through the internal
+/// `push_dead_stack` with the honest `kernel_stack_size`.
 pub fn push_dead_stack_pub(stack_base_virt: u64) -> bool {
-    push_dead_stack(stack_base_virt)
+    let stack_size = (crate::proc::KERNEL_STACK_PAGES_PUB as u64) * 0x1000;
+    push_dead_stack(stack_base_virt, stack_size)
 }
 
 /// Test-only pop that bypasses the `DEAD_STACK_QUIESCE_TICKS` gate so a
@@ -539,10 +637,11 @@ pub fn push_dead_stack_pub(stack_base_virt: u64) -> bool {
 /// Production callers MUST use `pop_dead_stack`; the gate is load-bearing
 /// for closing the kstack-reuse-while-RSP-still-live race (PR #348).
 #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
-pub fn pop_dead_stack_force() -> Option<u64> {
+pub fn pop_dead_stack_force() -> Option<(u64, u64)> {
     let mut cache = DEAD_STACK_CACHE.lock();
     if cache.is_empty() { return None; }
-    Some(cache.remove(0).base)
+    let entry = cache.remove(0);
+    Some((entry.base, entry.size))
 }
 
 /// Schedule the next thread to run.
