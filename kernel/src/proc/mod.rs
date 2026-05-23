@@ -549,11 +549,17 @@ pub const KERNEL_STACK_PAGES_PUB: usize = KERNEL_STACK_PAGES;
 /// the kstack-honesty fix in PR #392.
 fn alloc_kernel_stack() -> Option<(u64, u64)> {
     // Try the dead-stack cache first — avoids PMM allocator overhead.
-    // Cached stacks always carry the full KERNEL_STACK_SIZE span; the cache
-    // never holds emergency 4 KiB fallbacks (see `sched::push_dead_stack`).
-    if let Some(cached_base) = crate::sched::pop_dead_stack() {
+    // The cache returns the honest byte-extent stamped at push time
+    // (see `sched::pop_dead_stack`).  The call-site gate in
+    // `reap_dead_threads_sched` refuses any non-`KERNEL_STACK_SIZE`
+    // entry, so `cached_size` is `KERNEL_STACK_SIZE` in production —
+    // but using the returned size (rather than the constant) keeps the
+    // pair `(base, top)` exactly bracketing the cached allocation, so
+    // future loosening of the cache gate cannot silently extend
+    // `stack_top` past the real allocation boundary.
+    if let Some((cached_base, cached_size)) = crate::sched::pop_dead_stack() {
         write_stack_canary(cached_base);
-        return Some((cached_base, cached_base + KERNEL_STACK_SIZE));
+        return Some((cached_base, cached_base + cached_size));
     }
     // Try contiguous allocation first (fast path).
     if let Some(phys_stack) = crate::mm::pmm::alloc_pages(KERNEL_STACK_PAGES) {
