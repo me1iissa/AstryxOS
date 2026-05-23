@@ -451,6 +451,38 @@ d20-kstack-canary-watch = ["firefox-test", "w215-diag"]
 # frame layout), §3.4.5.2 (SSP); POSIX `vfork(3p)`; CWE-121.  Prior
 # art: PR #399 (D20 kernel-stack canary), PR #382 (D16 user-VA SSP).
 d21-user-canary-watch = ["firefox-test", "w215-diag"]
+# D22 — PHYS_OFF channel companion to D21 for user-canary phys-aliasing
+# detection (Wave 13).  After PR #404 (D21 linear-VA arm) captured user-
+# canary writers as legitimate musl prologue pushes, and PR #406 / PR #407
+# rejected mechanisms A (alignment), B (signal-frame), B1/B2 (substitution
+# gate sub-shapes), and C (kstack drift), the convergent verdict is
+# Mechanism D — phys-aliasing on the user stack (same class as PR #248
+# H3a/H3b on file-backed shared cache).  D22 mirrors PR #356's K2b two-
+# channel pattern: at the same vfork-PRE-block hook D21 uses, arms a
+# linear watchpoint on the canary VA AND a PHYS_OFF mirror on the
+# observed backing physical frame.  The new `record_d22_fire` hook in
+# `handle_db_exception` re-walks the user VA under the firing CR3 (Intel
+# SDM Vol. 3A §4.6) to capture `phys_at_write`; the read-side
+# `record_ssp_check` hook in `ssp_diag::probe_gp_at_ssp_fail` emits
+# `phys_at_read` at the moment of the SSP `#GP` trap.  The dispositive
+# comparison is `phys_at_write != phys_at_read` for the same `tid:pid`
+# pair — Mechanism D confirmed if differ, rejected if equal.  Bounded
+# by `D22_ARM_MAX = 4` total arms per boot plus the `F3_FIRE_CAP` per-
+# slot fire bound.  Diagnostic-only; default builds remain byte-
+# identical when off.  Depends on `firefox-test` (path gating + thread
+# table), `w215-diag` (DR plumbing + handle_db_exception), and
+# `ssp-canary-diag` (the `probe_gp_at_ssp_fail` hook site where the
+# `[D22/SSP-CHECK]` read-time emission lives).  Refs:
+# Intel SDM Vol. 3B §17.2.4 (DR0–DR3, DR7); §17.3.1.1 (data-breakpoint
+# trap-after-retire); Intel SDM Vol. 3A §4.6 (page-table walk),
+# §4.10.5 (TLB-coherency invariant); System V AMD64 ABI §3.2.2 (frame
+# layout), §3.4.5.2 / §6.4 (SSP / `__stack_chk_guard` at fs:0x28);
+# POSIX `vfork(3p)`; CWE-121.  Prior art: PR #248 (W215 H3a/H3b file-
+# backed phys-alias), PR #356 (K2b two-channel `linear_watchpoint` +
+# `phys_watchpoint` pattern), PR #404 (D21 linear-VA channel — same
+# arm site), PR #407 (Wave 12 aether audit — convergent Mechanism D
+# verdict).
+d22-user-canary-phys = ["firefox-test", "w215-diag", "ssp-canary-diag"]
 # Track B (Phase 5, 2026-05-21) — stack-page write provenance ring.
 # Records kernel-mode writes whose target user VA falls into the
 # `[0x3f00_0000_0000, 0x4000_0000_0000)` thread-stack range (per Phase 4

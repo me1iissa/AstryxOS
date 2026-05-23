@@ -153,6 +153,17 @@ static ARMED_KEY_OFFSET: [AtomicU64; N_DR_SLOTS] = [
 ///       Names the user-mode SSP-canary writer for the post-PR-#400
 ///       `__stack_chk_fail` at ld-musl+0x1c7f9 (PR #398 evidence).
 ///       Same persistent-arm + `F3_FIRE_CAP` policy.
+///   8 — D22 PID-1 user-canary PHYS_OFF channel (see
+///       `subsys/linux/d22_user_canary_phys.rs`).  Pairs with the D21
+///       linear-VA arm to catch the **phys-aliasing** mechanism (D
+///       per PR #407 Wave 12 verdict): user-stack canary VA whose
+///       backing physical frame differs between prologue store and
+///       epilogue load.  Same two-channel pattern PR #356 established
+///       for K2b.  Same persistent-arm + `F3_FIRE_CAP` policy.  The
+///       `record_d22_fire` hook re-walks the user VA under the
+///       firing CR3 to name `phys_at_write`; `record_ssp_check` in
+///       the CPL-3 `#GP` path names `phys_at_read` for the
+///       dispositive comparison.
 /// Future axes may take additional tags without disturbing existing arms.
 pub const WATCH_KIND_LEGACY:        u32 = 0;
 pub const WATCH_KIND_F3_USER:       u32 = 1;
@@ -162,6 +173,7 @@ pub const WATCH_KIND_D15_MTHRD:     u32 = 4;
 pub const WATCH_KIND_D16_CANARY:    u32 = 5;
 pub const WATCH_KIND_D20_KSTACK:    u32 = 6;
 pub const WATCH_KIND_D21_USER_CANARY: u32 = 7;
+pub const WATCH_KIND_D22_USER_CANARY_PHYS: u32 = 8;
 static ARMED_KIND: [AtomicU32; N_DR_SLOTS] = [
     AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
 ];
@@ -665,6 +677,20 @@ pub fn handle_db_exception(
         #[cfg(feature = "d17-aliasing-test")]
         if kind_tag == WATCH_KIND_D16_CANARY {
             crate::subsys::linux::d17_aliasing_test::record_d16_fire(rip, cs, cr3);
+        }
+        // D22 hook — emit the per-fire `[D22/USER-CANARY-PHYS]` line
+        // for D22-tagged slots.  Captures `phys_at_write` (re-walked
+        // under the firing CR3) for the dispositive comparison
+        // against the read-time `phys_at_read` emitted by the SSP
+        // `#GP` path's `record_ssp_check`.  Per Intel SDM Vol. 3B
+        // §17.3.1.1 the writer's store has already retired by the
+        // time `#DB` is taken, so the walk is authoritative for the
+        // writer's address space.  Gated on `d22-user-canary-phys`.
+        #[cfg(feature = "d22-user-canary-phys")]
+        if kind_tag == WATCH_KIND_D22_USER_CANARY_PHYS {
+            crate::subsys::linux::d22_user_canary_phys::record_d22_fire(
+                slot as u8, rip, cs, cr3,
+            );
         }
         crate::serial_println!(
             "[W215/DR-WATCH-FIRE/STACK] slot={} cpu={} rip={:#x} rsp={:#x}",

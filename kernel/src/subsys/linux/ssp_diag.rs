@@ -714,6 +714,36 @@ pub fn probe_gp_at_ssp_fail(
             pid, tid, saved_slot,
         );
     }
+
+    // ── [D22/SSP-CHECK] — read-side half of the D22 dispositive comparison ──
+    //
+    // D22 records `phys_at_write` at the moment any DR slot tagged
+    // `WATCH_KIND_D22_USER_CANARY_PHYS` fires; here we name
+    // `phys_at_read` at the SSP `#GP` site so a post-processor can
+    // compare the two for the same `(tid, pid)` pair.  Per Intel SDM
+    // Vol. 3A §4.6 the page-table walk under the trapping CR3 gives
+    // the authoritative current backing phys for `saved_slot`; per
+    // System V AMD64 ABI §3.4.5.2 / §6.4 the master canary lives at
+    // `IA32_FS_BASE + 0x28` (already resolved above as `fs_base + 0x28`).
+    //
+    // Mechanism D (PR #407 Wave 12 verdict): `phys_at_write !=
+    // phys_at_read` for the same VA proves the user-stack frame
+    // backing changed between prologue and epilogue.  Bounded by the
+    // surrounding `SSP_DIAG_MAX` budget; diagnostic-only.
+    #[cfg(feature = "d22-user-canary-phys")]
+    {
+        let expected = match read_user_qword(fs28_addr) {
+            Some((v, _)) => v,
+            None         => 0,
+        };
+        let observed = match read_user_qword(saved_slot) {
+            Some((v, _)) => v,
+            None         => 0,
+        };
+        crate::subsys::linux::d22_user_canary_phys::record_ssp_check(
+            saved_slot, expected, observed,
+        );
+    }
     let prior_phys = crate::mm::w215_diag::dump_pte_change_for_va(saved_slot);
     if prior_phys != 0 && prior_phys != saved_slot_phys {
         // The PTE-ring recorded a `old_phys` distinct from the slot's

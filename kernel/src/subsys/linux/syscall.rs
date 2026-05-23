@@ -2475,6 +2475,20 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             #[cfg(feature = "d21-user-canary-watch")]
                             crate::subsys::linux::d21_user_canary_watch::try_arm_at_vfork_preblock(
                                 pid, parent_tid);
+                            // D22 — PHYS_OFF channel companion to D21 for
+                            // phys-aliasing detection (Wave 13).  Arms a
+                            // linear watchpoint on the same canary VA AND
+                            // a PHYS_OFF mirror on the observed backing
+                            // physical frame, so a write that lands on
+                            // either side of the user-VA / direct-map
+                            // boundary is named.  Per PR #356 K2b two-
+                            // channel pattern + PR #407 Wave 12 verdict
+                            // (Mechanism D — phys-aliasing on user stack).
+                            // Diagnostic-only; gated behind
+                            // `d22-user-canary-phys`.
+                            #[cfg(feature = "d22-user-canary-phys")]
+                            crate::subsys::linux::d22_user_canary_phys::try_arm_at_vfork_preblock(
+                                pid, parent_tid);
                             // ELF-WRITE-TRACE on 0x37e18 dropped here — qa
                             // verdict: structurally meaningless on musl
                             // (musl's ld doesn't use a `.data.rel.ro`
@@ -3505,6 +3519,15 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             // behind `d21-user-canary-watch`.
                             #[cfg(feature = "d21-user-canary-watch")]
                             crate::subsys::linux::d21_user_canary_watch::try_arm_at_vfork_preblock(
+                                pid, parent_tid);
+                            // D22 — PHYS_OFF channel companion to D21 for
+                            // phys-aliasing detection (Wave 13).  See the
+                            // clone(56) site above for rationale and PR
+                            // #407 for the convergent Mechanism D verdict.
+                            // Diagnostic-only; gated behind
+                            // `d22-user-canary-phys`.
+                            #[cfg(feature = "d22-user-canary-phys")]
+                            crate::subsys::linux::d22_user_canary_phys::try_arm_at_vfork_preblock(
                                 pid, parent_tid);
                             // ELF-WRITE-TRACE on 0x37e18 dropped — see
                             // clone(56) path above for the qa-verdict TODO.
