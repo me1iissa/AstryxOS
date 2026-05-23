@@ -71,6 +71,14 @@ bitmap-title-fallback = []
 # alongside `firefox-test` when debugging user-mode regressions via
 # `qemu-harness.py grep <sid> '^\[SC\] '`. See docs/HARNESS.md.
 syscall-trace = []
+# Meta-feature for the differential bytestream harness (INFRA-1, 2026-05-23).
+# Pulls in firefox-test (which auto-tracks user-process PIDs into the
+# syscall ring) and syscall-trace (which emits the [SC]/[SC-RET] pair
+# consumed by `scripts/qemu-harness.py differential-soak`).  No additional
+# kernel code is enabled — this exists purely so agents can pass a single
+# canonical feature string instead of remembering the exact combination.
+# See docs/DIFFERENTIAL_HARNESS_2026-05-23.md.
+differential-trace = ["firefox-test", "syscall-trace"]
 # Verbose firefox-test tracing.  By default `firefox-test` keeps only the
 # essential per-syscall pair (`[SC]` / `[SC-RET]` under `syscall-trace`) plus
 # boot banners and the periodic `tick=...` heartbeat — the minimum signal
