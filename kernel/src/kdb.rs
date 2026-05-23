@@ -368,6 +368,12 @@ pub fn dispatch(req: &str, out: &mut String) {
         #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
         "futex-set-cluster-wake" => op_futex_set_cluster_wake(req, out),
         "futex-ghost-hist" => op_futex_ghost_hist(req, out),
+        // INFRA-3 record/replay introspection.  Off-path when the
+        // `record-replay` feature is OFF — the ops return a fixed
+        // "feature off" JSON object so the KDB protocol surface is
+        // stable across builds.
+        "record-status" => op_record_status(out),
+        "replay-dump"   => op_replay_dump(req, out),
         _ => {
             out.push_str(r#"{"error":"unknown op: "#);
             for c in op.chars().take(64) {
@@ -3029,4 +3035,71 @@ fn op_procmaps(req: &str, out: &mut String) {
         out.push('}');
     }
     out.push_str("]}");
+}
+
+// ── record-status ────────────────────────────────────────────────────────────
+//
+// Returns the current INFRA-3 record/replay state: PRNG seed loaded at
+// boot, current virtual-tick value, and current syscall-record
+// ordinal.  When the `record-replay` feature is OFF, returns a stable
+// "feature off" JSON so the KDB protocol surface does not change
+// across builds.
+
+#[cfg(feature = "record-replay")]
+fn op_record_status(out: &mut String) {
+    use core::fmt::Write;
+    let seed = crate::record_replay::seed_at_boot();
+    let vt   = crate::record_replay::current_virtual_ticks();
+    let ord  = crate::record_replay::current_ordinal();
+    let _ = write!(
+        out,
+        r#"{{"enabled":true,"seed":"{:#018x}","virtual_ticks":{},"ordinal":{}}}"#,
+        seed, vt, ord,
+    );
+}
+
+#[cfg(not(feature = "record-replay"))]
+fn op_record_status(out: &mut String) {
+    out.push_str(r#"{"enabled":false}"#);
+}
+
+// ── replay-dump ──────────────────────────────────────────────────────────────
+//
+// Writes the in-RAM `[SC-REC]` record log to a VFS path.  Request
+// field: `"path":"<absolute path>"`.  Response: `{"ok":true,"records":N,"path":"..."}`
+// on success, `{"ok":false,"error":"..."}` on failure.
+//
+// When the `record-replay` feature is OFF, returns a stable
+// "feature off" JSON so the protocol surface is stable.
+
+#[cfg(feature = "record-replay")]
+fn op_replay_dump(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    let path = match extract_field(req, "path") {
+        Some(p) => p,
+        None    => { out.push_str(r#"{"ok":false,"error":"missing 'path' field"}"#); return; }
+    };
+    match crate::record_replay::dump_records_to(&path) {
+        Ok(n) => {
+            let _ = write!(out, r#"{{"ok":true,"records":{},"path":""#, n);
+            for c in path.chars().take(256) {
+                if c == '"' || c == '\\' { out.push('\\'); }
+                out.push(c);
+            }
+            out.push_str(r#""}"#);
+        }
+        Err(e) => {
+            let _ = write!(out, r#"{{"ok":false,"error":""#);
+            for c in e.chars().take(128) {
+                if c == '"' || c == '\\' { out.push('\\'); }
+                out.push(c);
+            }
+            out.push_str(r#""}"#);
+        }
+    }
+}
+
+#[cfg(not(feature = "record-replay"))]
+fn op_replay_dump(_req: &str, out: &mut String) {
+    out.push_str(r#"{"ok":false,"error":"record-replay feature off"}"#);
 }
