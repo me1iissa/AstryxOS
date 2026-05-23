@@ -28,8 +28,16 @@ pub const OP_CREATE_WINDOW:          u8 = 1;
 pub const OP_CHANGE_WINDOW_ATTRS:    u8 = 2;
 pub const OP_GET_WINDOW_ATTRS:       u8 = 3;
 pub const OP_DESTROY_WINDOW:         u8 = 4;
+pub const OP_DESTROY_SUBWINDOWS:     u8 = 5;
+pub const OP_CHANGE_SAVE_SET:        u8 = 6;
+pub const OP_REPARENT_WINDOW:        u8 = 7;
 pub const OP_MAP_WINDOW:             u8 = 8;
+pub const OP_MAP_SUBWINDOWS:         u8 = 9;
 pub const OP_UNMAP_WINDOW:           u8 = 10;
+pub const OP_UNMAP_SUBWINDOWS:       u8 = 11;
+pub const OP_CIRCULATE_WINDOW:       u8 = 13;
+pub const OP_TRANSLATE_COORDINATES:  u8 = 40;
+pub const OP_ROTATE_PROPERTIES:      u8 = 114;
 pub const OP_CONFIGURE_WINDOW:       u8 = 12;
 pub const OP_GET_GEOMETRY:           u8 = 14;
 pub const OP_QUERY_TREE:             u8 = 15;
@@ -69,7 +77,14 @@ pub const OP_COPY_GC:                u8 = 57;
 pub const OP_FREE_GC:                u8 = 60;
 pub const OP_CLEAR_AREA:             u8 = 61;
 pub const OP_COPY_AREA:              u8 = 62;
+pub const OP_POLY_POINT:             u8 = 64;
+pub const OP_POLY_LINE:              u8 = 65;
+pub const OP_POLY_SEGMENT:           u8 = 66;
+pub const OP_POLY_RECTANGLE:         u8 = 67;
+pub const OP_POLY_ARC:               u8 = 68;
+pub const OP_FILL_POLY:              u8 = 69;
 pub const OP_POLY_FILL_RECTANGLE:    u8 = 70;
+pub const OP_POLY_FILL_ARC:          u8 = 71;
 pub const OP_PUT_IMAGE:              u8 = 72;
 pub const OP_IMAGE_TEXT8:            u8 = 76;
 pub const OP_IMAGE_TEXT16:           u8 = 77;
@@ -297,10 +312,31 @@ pub const DAMAGE_DESTROY:        u8 = 2;
 pub const DAMAGE_SUBTRACT:       u8 = 3;
 pub const DAMAGE_ADD:            u8 = 4;
 
-// ── XInputExtension (XI2) minor opcodes ───────────────────────────────────────
-pub const XI_QUERY_VERSION:    u8 = 47;
-pub const XI_GET_CLIENT_POINTER: u8 = 18;
-pub const XI_SELECT_EVENTS:    u8 = 46;
+// ── XInputExtension minor opcodes ─────────────────────────────────────────────
+// XI v1 (minors 1-39) and XI2 (minors 40-61) share the same XInputExtension
+// major opcode (per X Input Extension Protocol §3).  libXi multiplexes
+// based on the minor.  Public reference: X Input Extension Protocol
+// Specification, XInput2 protocol XML.
+//
+// XI v1 — the subset commonly issued by toolkits during XOpenDevice / initial
+// device discovery.  Each carries a reply.
+pub const XI_V1_GET_EXTENSION_VERSION: u8 = 1;  // GetExtensionVersion
+pub const XI_V1_LIST_INPUT_DEVICES:    u8 = 2;  // ListInputDevices
+pub const XI_V1_OPEN_DEVICE:           u8 = 3;  // OpenDevice
+pub const XI_V1_CLOSE_DEVICE:          u8 = 4;  // CloseDevice (no reply)
+pub const XI_V1_GET_DEVICE_FOCUS:      u8 = 20; // GetDeviceFocus
+pub const XI_V1_QUERY_DEVICE_STATE:    u8 = 30; // QueryDeviceState
+//
+// XI2.
+pub const XI_QUERY_POINTER:        u8 = 40; // XIQueryPointer (reply)
+pub const XI_GET_CLIENT_POINTER:   u8 = 45; // XIGetClientPointer (reply)
+pub const XI_SELECT_EVENTS:        u8 = 46; // XISelectEvents (no reply)
+pub const XI_QUERY_VERSION:        u8 = 47; // XIQueryVersion (reply)
+pub const XI_QUERY_DEVICE:         u8 = 48; // XIQueryDevice (reply)
+pub const XI_GET_FOCUS:            u8 = 50; // XIGetFocus (reply)
+pub const XI_LIST_PROPERTIES:      u8 = 56; // XIListProperties (reply)
+pub const XI_GET_PROPERTY:         u8 = 59; // XIGetProperty (reply)
+pub const XI_GET_SELECTED_EVENTS:  u8 = 60; // XIGetSelectedEvents (reply)
 
 // ── BIG-REQUESTS major opcode ─────────────────────────────────────────────────
 // BIG-REQUESTS is a tiny protocol-negotiation extension: the client sends
