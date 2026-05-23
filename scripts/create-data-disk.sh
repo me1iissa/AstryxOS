@@ -1092,6 +1092,15 @@ EOF
         echo "[DATA-DISK] Copied /etc/pki/tls/certs/ca-bundle.crt (RHEL)"
     fi
     if [ -f "${BUILD_DIR}/disk/etc/ssl/openssl.cnf" ]; then
+        # mtools(1) mcopy does NOT create parent directories implicitly; when
+        # neither cert.pem nor ca-certificates.crt was staged (--tls without
+        # the bundle present, or a freshly created data.img reached this
+        # block before the cert-bundle block), ::etc/ssl does not yet exist
+        # and `mcopy ::etc/ssl/openssl.cnf` fails with "no match for target".
+        # `mmd -p`-style chained parents are not portable across mtools
+        # versions, so create both levels idempotently.
+        mmd -i "${DATA_IMG}" "::etc"     2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::etc/ssl" 2>/dev/null || true
         mcopy -o -i "${DATA_IMG}" \
             "${BUILD_DIR}/disk/etc/ssl/openssl.cnf" "::etc/ssl/openssl.cnf"
         echo "[DATA-DISK] Copied /etc/ssl/openssl.cnf"
