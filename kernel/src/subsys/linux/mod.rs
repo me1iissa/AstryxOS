@@ -203,6 +203,23 @@ pub mod d16_canary_watch;
 #[cfg(feature = "d17-aliasing-test")]
 pub mod d17_aliasing_test;
 
+/// D20 — write-only DR watchpoint on the kernel-stack canary slot of the
+/// post-#396/#397 STACK_CANARY_CORRUPT bugcheck victim (PID 2 TID 5).  PRs
+/// #396 (multi-tier emergency kstack fallback) and #397 (`mm/vmm.rs`
+/// `BATCH` 1024→128) merged with the demo gate UNMOVED (3/3 trials still
+/// bugcheck at sc=1230..1232).  ZERO `[KSTACK/TIER]` and ZERO
+/// `[KSTACK/CANARY-FAIL]` records in the same trials prove the writer is
+/// not in either of the brk(2) / munmap(2) paths PR #395's stack-pressure
+/// analysis named.  D20 arms a DR write-only watchpoint on
+/// `[kernel_stack_base, kernel_stack_base + 8)` for the first N PID-2
+/// thread creations and lets `handle_db_exception` emit a
+/// `[W215/DR-WATCH-FIRE] kind_tag=6 …` line on the writing CPU — the RIP
+/// in that line directly names the writer (Intel SDM Vol. 3B §17.3.1.1).
+/// Gated behind `d20-kstack-canary-watch` so master builds remain
+/// byte-identical.
+#[cfg(feature = "d20-kstack-canary-watch")]
+pub mod d20_kstack_canary_watch;
+
 /// Bounded broadcast-within-cluster compensation for FUTEX_WAKE.  Mitigates
 /// the older-glibc `pthread_cond_signal` race
 /// (<https://sourceware.org/bugzilla/show_bug.cgi?id=25847>) by
