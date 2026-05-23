@@ -217,7 +217,11 @@ _RE_STRACE_LINE = re.compile(
     (?:(?P<ts>\d+\.\d+)\s+)?            # optional epoch timestamp
     (?P<name>[a-z_][a-z0-9_]*)          # syscall name
     \((?P<args>.*)\)\s*=\s*             # arg list + " = "
-    (?P<ret>-?\d+|0x[0-9a-fA-F]+|\?)    # return value
+    (?P<ret>0x[0-9a-fA-F]+|-?\d+|\?)    # return value (hex first — `0x...`
+                                        #   would otherwise match only the
+                                        #   leading `0` via `-?\d+` and
+                                        #   silently truncate every pointer
+                                        #   retval to 0).
     (?:\s+(?P<errno>[A-Z_][A-Z0-9_]+))? # optional errno
     """,
     re.VERBOSE,
@@ -477,6 +481,63 @@ def _arg_match_strace(args: list[str], wanted: str) -> bool:
     return any(wanted in a for a in args)
 
 
+_RUNTIME_DEP_RETVAL = {
+    "set_tid_address", "gettid", "getpid", "getppid", "getuid", "geteuid",
+    "getgid", "getegid", "getpgid", "getsid",
+    # Address-returning calls: the absolute value depends on ASLR / mm
+    # layout and is not a kernel-correctness signal.
+    "brk", "mmap", "mmap2", "mremap",
+    "getrandom",  # buffer content is random by design
+    "clock_gettime", "clock_getres", "gettimeofday", "time",
+    # Random pointer returns from helper utilities.
+    "getcwd", "readlink", "readlinkat",
+}
+
+# strace renders syscall errors as `ret=-1` plus a symbolic `errno`
+# token (e.g. `ENOENT`).  AstryxOS [SC-RET] reports the raw kernel
+# return value (e.g. `0xfffffffffffffffe` → sign-extended to -2 for
+# ENOENT).  This map normalises strace's (-1, "ENOENT") to the kernel
+# convention -<errno> for the diff comparison.  Source: Linux
+# include/uapi/asm-generic/errno-base.h + errno.h (public ABI).
+_ERRNO_VALUES = {
+    "EPERM": 1, "ENOENT": 2, "ESRCH": 3, "EINTR": 4, "EIO": 5,
+    "ENXIO": 6, "E2BIG": 7, "ENOEXEC": 8, "EBADF": 9, "ECHILD": 10,
+    "EAGAIN": 11, "EWOULDBLOCK": 11, "ENOMEM": 12, "EACCES": 13,
+    "EFAULT": 14, "ENOTBLK": 15, "EBUSY": 16, "EEXIST": 17, "EXDEV": 18,
+    "ENODEV": 19, "ENOTDIR": 20, "EISDIR": 21, "EINVAL": 22, "ENFILE": 23,
+    "EMFILE": 24, "ENOTTY": 25, "ETXTBSY": 26, "EFBIG": 27, "ENOSPC": 28,
+    "ESPIPE": 29, "EROFS": 30, "EMLINK": 31, "EPIPE": 32, "EDOM": 33,
+    "ERANGE": 34, "EDEADLK": 35, "ENAMETOOLONG": 36, "ENOLCK": 37,
+    "ENOSYS": 38, "ENOTEMPTY": 39, "ELOOP": 40,
+    "ENOMSG": 42, "EIDRM": 43,
+    "ENOTSOCK": 88, "EDESTADDRREQ": 89, "EMSGSIZE": 90,
+    "EPROTOTYPE": 91, "ENOPROTOOPT": 92, "EPROTONOSUPPORT": 93,
+    "ESOCKTNOSUPPORT": 94, "EOPNOTSUPP": 95, "EPFNOSUPPORT": 96,
+    "EAFNOSUPPORT": 97, "EADDRINUSE": 98, "EADDRNOTAVAIL": 99,
+    "ENETDOWN": 100, "ENETUNREACH": 101, "ENETRESET": 102,
+    "ECONNABORTED": 103, "ECONNRESET": 104, "ENOBUFS": 105,
+    "EISCONN": 106, "ENOTCONN": 107, "ESHUTDOWN": 108,
+    "ETIMEDOUT": 110, "ECONNREFUSED": 111, "EHOSTDOWN": 112,
+    "EHOSTUNREACH": 113, "EALREADY": 114, "EINPROGRESS": 115,
+}
+
+
+def _normalise_linux_ret(rec: dict[str, Any]) -> int | None:
+    """If strace reported `ret=-1` + a known errno, return -errno.
+    Otherwise return the raw parsed ret unchanged.  This collapses the
+    strace convention onto the AstryxOS [SC-RET] convention so the diff
+    compares like for like.
+    """
+    ret = rec.get("ret")
+    if ret is None:
+        return None
+    if ret == -1 and rec.get("errno"):
+        ev = _ERRNO_VALUES.get(rec["errno"])
+        if ev is not None:
+            return -ev
+    return ret
+
+
 def _classify(linux_rec: dict[str, Any] | None,
               astryx_rec: dict[str, Any] | None) -> str:
     if linux_rec is None:
@@ -488,6 +549,13 @@ def _classify(linux_rec: dict[str, Any] | None,
     # Same syscall.  Check retval shape (only if Linux has one).
     lret = linux_rec.get("ret")
     aret = astryx_rec.get("ret")
+    # Skip retval comparison for syscalls whose return value is runtime-
+    # dependent (TID, PID, address-returning, time, random).  A
+    # divergence on these is not, by itself, a kernel-ABI bug — the
+    # downstream syscalls will surface real semantic divergence if any.
+    if linux_rec["name"] in _RUNTIME_DEP_RETVAL:
+        return "args_or_seq"
+    lret = _normalise_linux_ret(linux_rec)
     if lret is not None and aret is not None:
         if (lret < 0) != (aret < 0):
             return "retval_sign"
@@ -557,10 +625,15 @@ def diff_streams(linux: list[dict[str, Any]],
             first_idx = i
             break
         # Same nr — check retval divergence (both sides known).
-        lret, aret = L.get("ret"), A.get("ret")
-        if lret is not None and aret is not None and lret != aret:
-            first_idx = i
-            break
+        # Skip runtime-dependent return values (TID/PID, addresses, time,
+        # random) — they vary by ASLR / mm layout / process identity and
+        # are not by themselves kernel-correctness bugs.
+        if L["name"] not in _RUNTIME_DEP_RETVAL:
+            lret = _normalise_linux_ret(L)
+            aret = A.get("ret")
+            if lret is not None and aret is not None and lret != aret:
+                first_idx = i
+                break
         aligned += 1
 
     summary: dict[str, Any] = {
@@ -815,10 +888,28 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         linux_trace_path = Path(linux_step["trace_path"])
         linux_dir = _linux_trace_dir(linux_trace_path)
-        linux_calls = parse_linux_trace_dir(
-            linux_dir, name_to_nr,
-            max_per_tid=args.max_syscalls // 4 if args.max_syscalls else 0,
-        )
+        # NOTE: don't apply max_per_tid here — when the trace is a
+        # single-file shim (no -ff), every record collapses onto
+        # tid_from_name=0 and the per-tid cap silently truncates the
+        # whole stream.  The post-parse `[:max_syscalls]` slice handles
+        # truncation correctly across both shim and per-tid layouts.
+        linux_calls = parse_linux_trace_dir(linux_dir, name_to_nr, max_per_tid=0)
+
+        # Optional PID filter (single-file shim only — when -f produced
+        # an interleaved trace, parse_linux_trace_dir records every
+        # syscall with its true pid in `rec["pid"]`).
+        linux_pid_filter = args.linux_pid_filter
+        if args.linux_pid_auto_firefox:
+            # Scan for the firefox-esr execve and use its pid.
+            for rec in linux_calls:
+                if rec["name"] == "execve":
+                    first_arg = rec["args"][0] if rec["args"] else ""
+                    if "firefox-esr" in first_arg and "bwrap" not in first_arg:
+                        linux_pid_filter = rec["pid"]
+                        break
+        if linux_pid_filter is not None:
+            linux_calls = [c for c in linux_calls if c["pid"] == linux_pid_filter]
+
         if args.max_syscalls:
             linux_calls = linux_calls[:args.max_syscalls]
 
@@ -834,6 +925,59 @@ def cmd_run(args: argparse.Namespace) -> int:
             linux_calls, dropped = _strip_linux_prefix_noise(linux_calls)
         else:
             dropped = 0
+
+        # ── Step 3b: optional anchor alignment ────────────────────────
+        # Drop leading records on BOTH sides up to (and including the
+        # leading slice before) the first record whose syscall name
+        # matches --align-anchor.  AstryxOS [SC] does not emit
+        # kernel-side init (the firefox-test loader does brk/mmap/openat
+        # before user code runs), so without an anchor the two streams
+        # diverge at index 0.  Aligning on a common landmark (e.g. first
+        # futex(), first arch_prctl(ARCH_SET_FS)) gives a deterministic
+        # join point on both sides.
+        anchor_dropped = 0
+        anchor_dropped_astryx = 0
+        anchor_used = None
+
+        def _find_anchor(stream: list[dict[str, Any]],
+                         target: str,
+                         arg_prefix: str | None) -> int | None:
+            for i, rec in enumerate(stream):
+                if rec["name"] != target:
+                    continue
+                if arg_prefix:
+                    first_arg = rec["args"][0] if rec["args"] else ""
+                    if not first_arg.startswith(arg_prefix):
+                        continue
+                return i
+            return None
+
+        if args.align_anchor:
+            target = args.align_anchor
+            arg_prefix = args.align_anchor_arg_prefix
+            l_idx = _find_anchor(linux_calls, target, arg_prefix)
+            a_idx = _find_anchor(astryx_calls, target, arg_prefix)
+            anchor_used = {
+                "syscall": target,
+                "arg_prefix": arg_prefix,
+                "linux_idx_before_drop": l_idx,
+                "astryx_idx_before_drop": a_idx,
+                "linux_matched":  _summarise_record(linux_calls[l_idx])
+                                  if l_idx is not None else None,
+                "astryx_matched": _summarise_record(astryx_calls[a_idx])
+                                  if a_idx is not None else None,
+            }
+            if l_idx is not None:
+                anchor_dropped = l_idx
+                linux_calls = linux_calls[l_idx:]
+            else:
+                anchor_used["warning_linux"] = "anchor syscall not found in Linux stream"
+            if a_idx is not None:
+                anchor_dropped_astryx = a_idx
+                astryx_calls = astryx_calls[a_idx:]
+            else:
+                anchor_used.setdefault("warning_astryx",
+                                       "anchor syscall not found in AstryxOS stream")
 
         # ── Step 4: diff ──────────────────────────────────────────────
         diff = diff_streams(linux_calls, astryx_calls,
@@ -861,6 +1005,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             "reused":          linux_step.get("reused"),
             "calls_parsed":    len(linux_calls),
             "prefix_dropped":  dropped,
+            "anchor_dropped":  anchor_dropped,
+            "anchor":          anchor_used,
+            "pid_filter":      linux_pid_filter,
         },
         "astryx": {
             "sid":             astryx_step.get("sid"),
@@ -868,6 +1015,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             "reused":          astryx_step.get("reused"),
             "wait":            astryx_step.get("wait"),
             "calls_parsed":    len(astryx_calls),
+            "anchor_dropped":  anchor_dropped_astryx,
         },
         "first_divergence": diff["first_divergence"],
         "summary":          diff["summary"],
@@ -944,6 +1092,17 @@ def make_parser() -> argparse.ArgumentParser:
                        help="If set, restrict AstryxOS [SC] parsing to "
                             "this PID.  Default: no filter (every "
                             "Linux-personality pid).")
+    p_run.add_argument("--linux-pid-filter", type=int, default=None,
+                       help="If set, restrict Linux strace parsing to "
+                            "this PID.  Use to exclude bwrap / launcher "
+                            "wrappers and focus on the firefox-bin pid "
+                            "(typically the second pid in the trace).  "
+                            "Default: no filter.")
+    p_run.add_argument("--linux-pid-auto-firefox", action="store_true",
+                       help="Auto-detect the firefox-bin PID by scanning "
+                            "the Linux trace for execve(\"firefox-esr\") "
+                            "and using the calling PID's children.  "
+                            "Overrides --linux-pid-filter if both set.")
     p_run.add_argument("--reuse-linux-capture", default=None,
                        help="Reuse an existing Linux strace capture by "
                             "label or absolute path.  Skips the strace step.")
@@ -967,6 +1126,21 @@ def make_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--context", type=int, default=5,
                        help="Records of context on each side around the "
                             "first-divergence row (default 5).")
+    p_run.add_argument("--align-anchor", default=None,
+                       help="Drop Linux records from the start until the "
+                            "first call whose name matches the given "
+                            "syscall name (e.g. 'arch_prctl').  Use to "
+                            "anchor the two streams at a known common "
+                            "point, since AstryxOS [SC] does not emit "
+                            "the kernel-side init that strace captures.  "
+                            "If the syscall is repeated (e.g. across "
+                            "threads), the FIRST occurrence is the anchor.")
+    p_run.add_argument("--align-anchor-arg-prefix", default=None,
+                       help="When --align-anchor is set, additionally "
+                            "require that the matching record's first "
+                            "positional arg starts with this prefix "
+                            "(useful to disambiguate arch_prctl SET_FS "
+                            "vs SET_GS by matching e.g. 'ARCH_SET_FS').")
     p_run.add_argument("--output", default=None,
                        help="Write full JSON diff to this path (in "
                             "addition to stdout).")
