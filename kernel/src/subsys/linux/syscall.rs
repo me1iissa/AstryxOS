@@ -104,6 +104,89 @@ fn memfd_seals_add(inode: u64, new_seals: u32) -> i64 {
 // location).  The pre-block and post-wake snapshots together let downstream
 // analysis decide whether the child overwrote parent state during the
 // vfork window — without applying any fix.
+//
+// ─── Wave 14 (R-A): user-RBP snapshot ────────────────────────────────────
+//
+// PR #407 (Wave 12) verified slot-14 (saved user_rsp at `kstack_top - 8`) is
+// bit-stable across `schedule()` on the vfork-wake path.  PR #408 (Wave 13)
+// falsified Mechanism D phys-aliasing on the user-canary VA.  The next
+// hypothesis (R-A per PR #409 tech-lead cross-walk) is that the parent's
+// user-mode RBP (saved at `kstack_top - 32`, frame slot 11 per
+// `syscall_entry` save layout in `kernel/src/syscall/mod.rs`) drifts across
+// the vfork-wake `schedule()`.  Per SysV AMD64 ABI §3.4.5.2 (frame-pointer
+// convention) RBP must be preserved across calls; per Intel SDM Vol. 3A §6
+// (interrupt/syscall return) IRETQ/SYSRET restore the saved frame verbatim,
+// so any drift across the syscall window is a kernel-side bug.
+//
+// If the parent's user-RBP differs between `pre_block` and `post_wake`, the
+// SSP epilogue's `XOR [rbp-8], rax` reads a different VA than the prologue's
+// store and produces the observed canary mismatch — and R-A becomes the
+// dispositive lead.  If RBP is stable, R-A is falsified and the next
+// dispatch (R-B per PR #409) examines FPO calling-convention skew.
+// ─── Wave 14 R-A: tiny pre-cache for RBP-drift diff ───────────────────────
+//
+// `vfork_canary_snapshot` is stateless, so to emit a derived `rbp_diff`
+// field at the post-wake call we cache the pre-block RBP value here.  Keyed
+// on `parent_tid` (unique per in-flight vfork; bounded by `MAX_INFLIGHT`).
+// Lockless reads/writes via `AtomicU64`; sized for ≤16 concurrent vfork
+// parents which is well above any observed live count.  No allocation, no
+// teardown — entries are overwritten in place.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+const MAX_INFLIGHT: usize = 16;
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+static RBP_PRE_CACHE: [(core::sync::atomic::AtomicU64, core::sync::atomic::AtomicU64); MAX_INFLIGHT] = [
+    (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)),
+    (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)),
+    (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)),
+    (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)),
+    (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)),
+    (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)),
+    (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)),
+    (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)),
+    (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)),
+    (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)),
+    (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)),
+    (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)),
+    (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)),
+    (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)),
+    (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)),
+    (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)),
+];
+
+/// Stash the pre-block RBP for a vfork parent.  Overwrites the slot keyed
+/// on `parent_tid` if present, else claims an empty slot (key==0).  Falls
+/// back to slot 0 on full ring — only loses precision for unrealistic
+/// concurrent-vfork counts.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn rbp_pre_cache_store(parent_tid: u64, rbp: u64) {
+    use core::sync::atomic::Ordering;
+    for (k, v) in RBP_PRE_CACHE.iter() {
+        let cur = k.load(Ordering::Relaxed);
+        if cur == parent_tid || cur == 0 {
+            k.store(parent_tid, Ordering::Relaxed);
+            v.store(rbp, Ordering::Relaxed);
+            return;
+        }
+    }
+    RBP_PRE_CACHE[0].0.store(parent_tid, Ordering::Relaxed);
+    RBP_PRE_CACHE[0].1.store(rbp, Ordering::Relaxed);
+}
+
+/// Look up the pre-block RBP for `parent_tid`.  Returns `None` if no pre
+/// snapshot has been stored (e.g. on a post-wake call without a matching
+/// pre-block).  Does NOT clear the slot — re-vfork by the same TID
+/// overwrites in-place.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn rbp_pre_cache_load(parent_tid: u64) -> Option<u64> {
+    use core::sync::atomic::Ordering;
+    for (k, v) in RBP_PRE_CACHE.iter() {
+        if k.load(Ordering::Relaxed) == parent_tid {
+            return Some(v.load(Ordering::Relaxed));
+        }
+    }
+    None
+}
+
 #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
 fn vfork_canary_snapshot(label: &str, pid: u32, parent_tid: u64) {
     use core::fmt::Write;
@@ -125,6 +208,12 @@ fn vfork_canary_snapshot(label: &str, pid: u32, parent_tid: u64) {
         return;
     }
     let parent_user_rsp = unsafe { *((kstack_top - 8) as *const u64) };
+    // Wave 14 R-A: saved user_rbp lives at `kstack_top - 32` (frame slot
+    // 11 per `syscall_entry` layout: rdi, rsi, rdx, r8, r9, r10, r15, r14,
+    // r13, r12, rbx, rbp, r11, rcx, user_rsp — RBP is the 12th save, four
+    // qwords from the top).  Read from the same kernel-stack frame as the
+    // user_rsp read above; same SAFETY justification.
+    let parent_user_rbp = unsafe { *((kstack_top - 32) as *const u64) };
 
     // FS_BASE MSR (Intel SDM Vol. 3A §3.4.4.1, IA32_FS_BASE = 0xC000_0100).
     // Captures the live FS_BASE for the currently-running thread, which —
@@ -192,18 +281,43 @@ fn vfork_canary_snapshot(label: &str, pid: u32, parent_tid: u64) {
         None
     };
 
-    let mut line = alloc::string::String::with_capacity(384);
+    // Wave 14 R-A: compute rbp_diff for post-wake calls.  On a pre_block
+    // label the diff is reported as "pre" (the field is informational only
+    // at pre); on a post_wake label, look up the matching pre-block RBP
+    // and report `same` / `drift=<delta>` / `nopre` (if cache miss).
+    let rbp_diff_str: alloc::string::String = if label.starts_with("pre_block") {
+        rbp_pre_cache_store(parent_tid, parent_user_rbp);
+        alloc::string::String::from("pre")
+    } else if label.starts_with("post_wake") {
+        match rbp_pre_cache_load(parent_tid) {
+            None => alloc::string::String::from("nopre"),
+            Some(rbp_pre) if rbp_pre == parent_user_rbp => alloc::string::String::from("same"),
+            Some(rbp_pre) => {
+                // Signed delta = post - pre, formatted as hex with sign.
+                let delta = (parent_user_rbp as i64).wrapping_sub(rbp_pre as i64);
+                if delta >= 0 {
+                    alloc::format!("drift=+{:#x}_pre={:#x}", delta as u64, rbp_pre)
+                } else {
+                    alloc::format!("drift=-{:#x}_pre={:#x}", (-delta) as u64, rbp_pre)
+                }
+            }
+        }
+    } else {
+        alloc::string::String::from("n/a")
+    };
+
+    let mut line = alloc::string::String::with_capacity(448);
     let _ = write!(&mut line,
         "[VFORK/CANARY] {} pid={} parent_tid={} \
          fs_base={:#x} fs_28={} tcb_self={} \
-         user_rsp={:#x} \
+         user_rsp={:#x} rsp_slot14={:#x} rbp_slot11={:#x} rbp_diff={} \
          s_1d8={:#x} s_1e0={:#x} s_d58={:#x} s_1d58={:#x} s_1d60={:#x} \
          win_bytes={} win_crc={:#x}",
         label, pid, parent_tid,
         fs_base,
         fs28.map(|v| alloc::format!("{:#x}", v)).unwrap_or_else(|| alloc::string::String::from("?")),
         tcb_self.map(|v| alloc::format!("{:#x}", v)).unwrap_or_else(|| alloc::string::String::from("?")),
-        parent_user_rsp,
+        parent_user_rsp, parent_user_rsp, parent_user_rbp, rbp_diff_str,
         slot_1d8, slot_1e0, slot_d58, slot_1d58, slot_1d60,
         stack_bytes.len(), win_crc);
     crate::serial_println!("{}", line);
