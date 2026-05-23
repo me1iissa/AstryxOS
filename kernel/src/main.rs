@@ -64,6 +64,8 @@ mod busybox_demo;
 mod httpd_demo;
 #[cfg(feature = "sshd-test")]
 mod sshd_demo;
+#[cfg(feature = "tls-test")]
+mod tls_demo;
 
 use astryx_shared::{BootInfo, BOOT_INFO_MAGIC};
 
@@ -391,6 +393,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "wget-test"),
                   not(feature = "httpd-test"),
                   not(feature = "sshd-test"),
+                  not(feature = "tls-test"),
                   feature = "xeyes-test"))]
         {
             serial_println!("[XEYES] xeyes-test mode starting...");
@@ -596,6 +599,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "firefox-test"),
                   not(feature = "httpd-test"),
                   not(feature = "sshd-test"),
+                  not(feature = "tls-test"),
                   any(feature = "busybox-test", feature = "wget-test")))]
         {
             hal::enable_interrupts();
@@ -652,6 +656,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "busybox-test"),
                   not(feature = "wget-test"),
                   not(feature = "sshd-test"),
+                  not(feature = "tls-test"),
                   feature = "httpd-test"))]
         {
             hal::enable_interrupts();
@@ -686,31 +691,19 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         }
 
         // ── sshd-test: dropbear SSH-service userspace demo (PIVOT-D, 2026-05-23) ──
-        // Headless: no X11, no compositor — just spawn /disk/usr/sbin/dropbear
-        // with our staged host keys + authorized_keys and let it enter its
-        // accept(2) loop on TCP :22.  The harness adds --ssh-host-port N to
-        // bridge guest :22 to host port N.  See kernel/src/sshd_demo.rs for
-        // the launcher.
-        //
-        // Networking (net::init) is already initialised by the earlier
-        // net::init() call in this function; the userspace dropbear consumes
-        // it via socket(2)/bind(2)/listen(2)/accept(2).
-        //
-        // Mutually exclusive with the other *-test cargo features at the
-        // cfg-gate level (all share the BSP idle slot).
         #[cfg(all(not(feature = "gui-test"),
                   not(feature = "xeyes-test"),
                   not(feature = "firefox-test"),
                   not(feature = "busybox-test"),
                   not(feature = "wget-test"),
                   not(feature = "httpd-test"),
+                  not(feature = "tls-test"),
                   feature = "sshd-test"))]
         {
             hal::enable_interrupts();
             if !sched::is_active() {
                 sched::enable();
             }
-            // Brief scheduler settle (matches httpd-test / busybox-test).
             let t0 = arch::x86_64::irq::get_ticks();
             while arch::x86_64::irq::get_ticks().wrapping_sub(t0) < 30 {
                 core::hint::spin_loop();
@@ -720,7 +713,44 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
             serial_println!("[SSHD] DONE");
 
-            // Brief pause then exit QEMU via the isa-debug-exit port.
+            let t_done = arch::x86_64::irq::get_ticks();
+            while arch::x86_64::irq::get_ticks().wrapping_sub(t_done) < 100 {
+                core::hint::spin_loop();
+            }
+            unsafe {
+                core::arch::asm!(
+                    "out dx, eax",
+                    in("dx")  0xf4_u16,
+                    in("eax") 0_u32,
+                    options(nomem, nostack)
+                );
+            }
+            loop { unsafe { core::arch::asm!("hlt"); } }
+        }
+
+        // ── tls-test: TLS userspace handshake demo (PIVOT-I1a, 2026-05-23) ──
+        #[cfg(all(not(feature = "gui-test"),
+                  not(feature = "xeyes-test"),
+                  not(feature = "firefox-test"),
+                  not(feature = "busybox-test"),
+                  not(feature = "wget-test"),
+                  not(feature = "httpd-test"),
+                  not(feature = "sshd-test"),
+                  feature = "tls-test"))]
+        {
+            hal::enable_interrupts();
+            if !sched::is_active() {
+                sched::enable();
+            }
+            let t0 = arch::x86_64::irq::get_ticks();
+            while arch::x86_64::irq::get_ticks().wrapping_sub(t0) < 30 {
+                core::hint::spin_loop();
+            }
+
+            tls_demo::run_tls_demo();
+
+            serial_println!("[TLSDEMO] DONE");
+
             let t_done = arch::x86_64::irq::get_ticks();
             while arch::x86_64::irq::get_ticks().wrapping_sub(t_done) < 100 {
                 core::hint::spin_loop();
@@ -744,6 +774,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "wget-test"),
                   not(feature = "httpd-test"),
                   not(feature = "sshd-test"),
+                  not(feature = "tls-test"),
                   feature = "firefox-test"))]
         {
             serial_println!("[FFTEST] Firefox-test mode starting...");
@@ -1104,7 +1135,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         }
 
         // ── Normal boot: launch userspace + interactive shell ──────────────
-        #[cfg(not(any(feature = "gui-test", feature = "firefox-test", feature = "xeyes-test", feature = "busybox-test", feature = "wget-test", feature = "httpd-test", feature = "sshd-test")))]
+        #[cfg(not(any(feature = "gui-test", feature = "firefox-test", feature = "xeyes-test", feature = "busybox-test", feature = "wget-test", feature = "httpd-test", feature = "sshd-test", feature = "tls-test")))]
         {
         // Phase 13: Launch Ascension (init) and Orbit (shell) as Ring 3 processes
         serial_println!("[Aether] Phase 13: Launching userspace processes...");
