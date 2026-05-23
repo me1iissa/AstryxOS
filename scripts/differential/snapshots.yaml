@@ -1,0 +1,118 @@
+# scripts/differential/snapshots.yaml
+#
+# Memory-snapshot trigger points for `qemu-harness.py differential-soak`.
+#
+# Each entry names a SYSCALL BOUNDARY at which the differential harness
+# captures a small set of memory regions on both the Linux reference run
+# and the AstryxOS run, so the diff engine can flag a divergence not just
+# in the syscall stream but also in the ABI-visible state the kernel
+# hands back to userspace (TLS canary, stack frames, FS_BASE, etc.).
+#
+# Schema (per entry):
+#   name:         short identifier, used as the JSON key in the diff output
+#   when:         "before" | "after" | "both" — relative to the named sc
+#   syscall:      Linux syscall name (must match strace + AstryxOS [SC]).
+#                 Optional sub-filter via `arg_match:` (substring match
+#                 on the strace arg list; use to disambiguate variants).
+#   regions:      list of regions to snapshot.  Each region:
+#                 - kind:  "fs_base"        — read FS_BASE register
+#                          "stack_near_rbp" — N bytes around current RBP
+#                          "tls_canary"     — fs:[0x28] (POSIX TLS canary)
+#                          "fixed_va"       — explicit virtual addr range
+#                          "elf_aux"        — auxv contents (one-shot)
+#                 - bytes: how many bytes (default 64)
+#                 - va:    only for kind=fixed_va — virtual address
+#                 - note:  human-readable rationale (for diff output)
+#
+# Future agents extend this file by adding new entries.  No code change
+# needed — the diff engine reads this file at every run.
+#
+# Public references:
+#   - System V AMD64 ABI:  https://gitlab.com/x86-psABIs/x86-64-ABI
+#     (§3.4.3 stack canary, §3.4.4 thread-local storage)
+#   - ptrace(2):           https://man7.org/linux/man-pages/man2/ptrace.2.html
+#   - arch_prctl(2):       https://man7.org/linux/man-pages/man2/arch_prctl.2.html
+#   - strace(1):           https://man7.org/linux/man-pages/man1/strace.1.html
+
+version: 1
+
+snapshots:
+  # ── execve boundary ─────────────────────────────────────────────────────
+  # After execve the new ELF entry point has been jumped to; FS_BASE
+  # is still zero, RSP is the kernel-supplied initial-stack pointer.
+  # First place the diff can see "ABI shape" before any user code runs.
+  - name: post_execve
+    when: after
+    syscall: execve
+    regions:
+      - kind: fs_base
+        note: "FS_BASE must be 0 immediately after execve per AMD64 ABI"
+      - kind: stack_near_rbp
+        bytes: 128
+        note: "auxv tail + envp tail (initial-stack layout)"
+
+  # ── arch_prctl(ARCH_SET_FS) boundary ───────────────────────────────────
+  # libc sets FS_BASE to the TLS block here.  We snapshot AFTER to
+  # confirm both kernels return success and FS_BASE actually changed.
+  - name: post_arch_prctl_set_fs
+    when: after
+    syscall: arch_prctl
+    arg_match: ARCH_SET_FS
+    regions:
+      - kind: fs_base
+        note: "FS_BASE must equal a1 of ARCH_SET_FS call"
+      - kind: tls_canary
+        note: "TLS canary slot at fs:0x28 — pre-populated by libc"
+
+  # ── vfork parent-return boundary ───────────────────────────────────────
+  # The F3 / D22 saga focal point.  Parent resumes here after the child
+  # execve; SSP and RBP must be byte-identical to pre-vfork.
+  - name: post_vfork_parent_return
+    when: after
+    syscall: vfork
+    regions:
+      - kind: tls_canary
+        note: "MSR_FS_BASE + 0x28 canary slot — F3/D22 axis"
+      - kind: stack_near_rbp
+        bytes: 96
+        note: "RBP/saved_canary frame (slot-11 + slot-14 per Wave 12/14)"
+      - kind: fs_base
+        note: "FS_BASE preservation across vfork"
+
+  # ── clone() child-side boundary ────────────────────────────────────────
+  # First syscall the cloned thread makes; we snapshot its FS_BASE to
+  # confirm CLONE_SETTLS landed correctly (PR #298 R9 clone clobber).
+  - name: post_clone_child
+    when: after
+    syscall: clone
+    regions:
+      - kind: fs_base
+        note: "Per CLONE_SETTLS: new FS_BASE must equal a4 of clone"
+      - kind: tls_canary
+        note: "TLS canary must be inherited from the parent's TLS block"
+
+  # ── futex wake/wait boundary ───────────────────────────────────────────
+  # The W101 / FUTEX_WAKE_GHOST axis: when a wake happens, the matching
+  # uaddr must hold the value the waker stored.  Snapshot 16 bytes at
+  # the uaddr address so the diff catches "waker stored X, kernel saw Y".
+  - name: post_futex_wake
+    when: after
+    syscall: futex
+    arg_match: FUTEX_WAKE
+    regions:
+      - kind: stack_near_rbp
+        bytes: 32
+        note: "Caller frame at WAKE-return — for FUTEX_WAKE_GHOST audit"
+
+  # ── fatal signal boundary ──────────────────────────────────────────────
+  # Captured when AstryxOS emits [BUGCHECK] or [PF].  No Linux analogue
+  # (Linux runs the SIGSEGV handler directly) — the diff engine marks
+  # this entry as "astryx_only".  Still useful for post-mortem.
+  - name: pre_fatal_pf
+    when: before
+    syscall: rt_sigaction
+    arg_match: SIGSEGV
+    regions:
+      - kind: stack_near_rbp
+        bytes: 256
+        note: "Stack frame at SIGSEGV handler install"

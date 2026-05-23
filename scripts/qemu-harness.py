@@ -1506,6 +1506,59 @@ def cmd_strace_ref(args):
     return result.returncode
 
 
+def cmd_differential_soak(args):
+    """
+    Front-end for scripts/differential-soak.py — INFRA-1 differential
+    bytestream harness.
+
+    Runs the AstryxOS-shipped musl firefox-bin under BOTH the host Linux
+    kernel (via strace-ref.py + bwrap) and the AstryxOS QEMU kernel, then
+    diffs the two syscall bytestreams and reports the FIRST divergence
+    in a structured JSON object.
+
+    Replaces the "guess-a-hypothesis-then-soak" saga loop with continuous
+    differential observation.  Every divergence is a named ABI gap that
+    an engineering agent can pick up directly.
+
+    Subcommand arguments (forwarded to differential-soak.py):
+      --baseline-lxc NAME              [accepted for forward compat; ignored]
+      --astryx-features FLAGS          (default: firefox-test,differential-trace)
+      --max-syscalls N                 truncate each stream to N records
+      --boot-timeout-ms MS             ms to wait for boot banner (180000)
+      --linux-timeout-s SEC            strace wall-clock budget (30)
+      --linux-binary-args ARGS         firefox-bin argv tail
+      --snapshots PATH                 override snapshot config
+                                       (default: scripts/differential/snapshots.yaml)
+      --reuse-linux-capture LABEL      reuse prior strace trace
+      --reuse-astryx-log PATH          reuse prior serial log
+      --output PATH                    also write full JSON to PATH
+      --no-build                       skip cargo rebuild
+      --no-kvm                         debug-only TCG run
+      --keep-session                   leave AstryxOS QEMU running
+
+    Output (stdout, one JSON object):
+      {
+        "ok": true,
+        "subcommand": "differential-soak",
+        "linux":  {...},
+        "astryx": {...},
+        "first_divergence": {"sc_index": N, "kind": ..., "linux": ..., "astryx": ...},
+        "summary": {...},
+        "snapshot_hits": [...]
+      }
+
+    See scripts/differential-soak.py docstring for full details.
+    """
+    import subprocess as _sp
+    helper = Path(__file__).parent / "differential-soak.py"
+    if not helper.exists():
+        _out({"ok": False,
+              "error": f"differential-soak.py not found at {helper}"})
+        return 1
+    cmd = [sys.executable, str(helper)] + (args.differential_args or [])
+    return _sp.run(cmd).returncode
+
+
 def cmd_context(args):
     """
     Front-end for scripts/agent-context.py — shared session-context management.
@@ -8217,6 +8270,33 @@ def cmd_read_png(args):
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 def main():
+    # ── Early-exit forwarding for delegate subcommands ───────────────────────
+    # `argparse.REMAINDER` is famously broken when the first remaining token
+    # starts with `-` — it tries to interpret it as an unknown parent-parser
+    # flag.  For pure-forwarding subcommands (strace-ref, differential-soak,
+    # context) the cleanest workaround is to detect them at argv[1] and
+    # shell out directly, before argparse even runs.
+    _DELEGATE_SCRIPTS = {
+        "differential-soak": "differential-soak.py",
+        # Note: strace-ref and context still flow through argparse because
+        # they're always invoked with a positional subcommand first, which
+        # REMAINDER handles correctly.
+    }
+    if len(sys.argv) >= 2 and sys.argv[1] in _DELEGATE_SCRIPTS:
+        if "--help" in sys.argv[2:3] or "-h" in sys.argv[2:3]:
+            # Let argparse render `qemu-harness differential-soak --help`
+            # for discoverability — only intercept real invocations.
+            pass
+        else:
+            import subprocess as _sp
+            helper = Path(__file__).parent / _DELEGATE_SCRIPTS[sys.argv[1]]
+            if not helper.exists():
+                _out({"ok": False,
+                      "error": f"delegate script missing: {helper}"})
+                sys.exit(1)
+            cmd = [sys.executable, str(helper)] + list(sys.argv[2:])
+            sys.exit(_sp.run(cmd).returncode)
+
     parser = argparse.ArgumentParser(
         prog="qemu-harness.py",
         description="Agentic QEMU session manager for AstryxOS (JSON protocol)",
@@ -8957,6 +9037,22 @@ def main():
         help="Subcommand + arguments forwarded to agent-context.py",
     )
 
+    # differential-soak — end-to-end Linux↔AstryxOS bytestream diff (INFRA-1)
+    p_diff = sub.add_parser(
+        "differential-soak",
+        help="End-to-end differential bytestream harness: run firefox-bin "
+             "under both the host Linux kernel (bwrap + strace) and "
+             "AstryxOS QEMU; align the two syscall streams; report the "
+             "FIRST divergence with structured JSON.  Snapshot trigger "
+             "points configurable via scripts/differential/snapshots.yaml.  "
+             "All arguments forwarded to scripts/differential-soak.py.",
+    )
+    p_diff.add_argument(
+        "differential_args", nargs=argparse.REMAINDER,
+        help="Arguments forwarded to differential-soak.py "
+             "(see --help on that script for the full list)",
+    )
+
     # strace-ref — Linux reference strace captures (delegates to strace-ref.py)
     p_sref = sub.add_parser(
         "strace-ref",
@@ -9046,6 +9142,8 @@ def main():
         "context": cmd_context,
         # Linux reference strace (ABI conformance)
         "strace-ref": cmd_strace_ref,
+        # INFRA-1 differential bytestream harness (end-to-end)
+        "differential-soak": cmd_differential_soak,
         "_watch":  cmd_run_watcher,
         "_ff_variant_verify": cmd_ff_variant_verify,
     }
