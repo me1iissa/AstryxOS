@@ -2648,6 +2648,22 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             #[cfg(feature = "f3-codeDR-watch")]
                             crate::subsys::linux::f3_code_dr_watch::try_arm_after_post_wake(
                                 pid, parent_tid);
+                            // F3 write-DR watch — companion to the
+                            // code-DR above.  Arms an 8-byte data-write
+                            // DR on `parent_user_rsp + 0x58` (the
+                            // SSP-canary slot whose contents PR #420
+                            // named as `0x30` byte-invariant).  Fires
+                            // as a trap AFTER the writer instruction
+                            // retires (Intel SDM Vol. 3B §17.3.1.1),
+                            // emitting the writer's RIP + GPRs + a
+                            // 16-byte backward-disassembly window for
+                            // post-processor reconstruction (Intel SDM
+                            // Vol. 2A §2.1).  Same PID-1 + one-shot
+                            // gating.  Diagnostic-only; gated behind
+                            // `f3-codeDR-write-watch`.
+                            #[cfg(feature = "f3-codeDR-write-watch")]
+                            crate::subsys::linux::f3_code_dr_write_watch::try_arm_after_post_wake(
+                                pid, parent_tid);
                         }
                         child_pid as i64
                     }
@@ -3683,6 +3699,14 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             // gated behind `f3-codeDR-watch`.
                             #[cfg(feature = "f3-codeDR-watch")]
                             crate::subsys::linux::f3_code_dr_watch::try_arm_after_post_wake(
+                                pid, parent_tid);
+                            // F3 write-DR watch — see clone(56) above
+                            // for the rationale.  Names the *writer*
+                            // of the SSP-canary slot via a data-write
+                            // DR; one-shot per boot.  Diagnostic-only;
+                            // gated behind `f3-codeDR-write-watch`.
+                            #[cfg(feature = "f3-codeDR-write-watch")]
+                            crate::subsys::linux::f3_code_dr_write_watch::try_arm_after_post_wake(
                                 pid, parent_tid);
                         }
                         child_pid as i64

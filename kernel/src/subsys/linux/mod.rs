@@ -292,6 +292,27 @@ pub mod d22_user_canary_phys;
 #[cfg(feature = "f3-codeDR-watch")]
 pub mod f3_code_dr_watch;
 
+/// F3 data-write DR watchpoint on the per-trial
+/// `parent_user_rsp + 0x58` SSP-canary slot.  Companion to
+/// `f3_code_dr_watch` (PR #421): the code-DR named the slot, this
+/// names the *writer* by trapping after the instruction that stores
+/// the corrupting value retires.  Per Intel SDM Vol. 3B §17.3.1.1
+/// data-breakpoint traps fire AFTER the writing instruction, so the
+/// fire emits a 16-byte instruction-stream window below
+/// `rip_after_trap` for backward disassembly per Intel SDM Vol. 2A §2.1
+/// (AMD64 instruction length 1..15 bytes).  Arm is one-shot per boot
+/// at the first PID 1 post-wake; disarms on first fire.  Diagnostic-
+/// only; gated behind `f3-codeDR-write-watch` so master builds remain
+/// byte-identical.  Refs: Intel SDM Vol. 3B §17.2.4 (DR0–DR3, DR7 —
+/// RW=01b / LEN=10b encoding), §17.2.5 (8-byte LEN form), §17.3.1.1
+/// (#DB data-breakpoint trap timing); Intel SDM Vol. 3A §6.15 (#DB);
+/// Intel SDM Vol. 2A §2.1 (instruction length); System V AMD64 ABI
+/// §3.4.1 (SSP), §3.4.5.2 (frame-pointer convention); GCC manual
+/// §3.20 (-fstack-protector); PR #421 (slot-naming code-fetch DR),
+/// PR #420 (autopsy verdict), PR #417 (libxul SSP-shape audit).
+#[cfg(feature = "f3-codeDR-write-watch")]
+pub mod f3_code_dr_write_watch;
+
 /// Bounded broadcast-within-cluster compensation for FUTEX_WAKE.  Mitigates
 /// the older-glibc `pthread_cond_signal` race
 /// (<https://sourceware.org/bugzilla/show_bug.cgi?id=25847>) by
