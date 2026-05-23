@@ -423,6 +423,34 @@ d18-extended-d16 = ["d16-canary-watch"]
 # breakpoint trap timing); x86_64 SysV ABI §3.4.1 (stack-frame budgeting);
 # CWE-121 (stack-based buffer overflow).
 d20-kstack-canary-watch = ["firefox-test", "w215-diag"]
+# D21 — write-only DR watchpoint on PID 1's user-mode saved-canary stack
+# slot at the moment of the `CLONE_VM|CLONE_VFORK` PRE-block.  After PRs
+# #388 → #400 closed the kernel-mode `STACK_CANARY_CORRUPT` class, 2/2
+# fresh-master trials reproduce a user-mode SSP failure on PID 1: #GP at
+# RIP `ld-musl-x86_64.so.1 + 0x1c7f9`, which `objdump -d` identifies as
+# musl's `__stack_chk_fail` two-byte stub (`f4 c3` = HLT;RET; HLT from
+# CPL=3 raises #GP per Intel SDM Vol. 2A).  AstryxOS encodes that as
+# `exit_group(-13)`.  The TCB master canary at `FS:0x28` is stable
+# across the vfork window per the existing `[VFORK/CANARY]` snapshots,
+# so the corruption is on a stack-frame saved-canary slot.  D21 walks
+# the parent's user RBP chain from the saved syscall frame, finds the
+# libxul SSP-instrumented caller's `[rbp-8]` slot (System V AMD64 ABI
+# §3.2.2 + GCC SSP convention), and arms a write-only DR on it via
+# `arm_linear_watchpoint(va, 8, WATCH_KIND_D21_USER_CANARY)`.  The
+# existing `handle_db_exception` path emits `[W215/DR-WATCH-FIRE]
+# kind_tag=7 …` naming the writer's RIP / CS / CR3 (Intel SDM Vol. 3B
+# §17.3.1.1 — each fire names one retired writer).  Hook site:
+# `subsys/linux/syscall.rs` PRE-block tails for clone(2)/clone3(2)
+# alongside `vfork_diag::snapshot_canaries` / `arm_master_canary_watch`.
+# Diagnostic-only; default builds remain byte-identical when off.
+# Depends on `firefox-test` (path gating + thread table) and `w215-diag`
+# (DR plumbing + handle_db_exception).
+# Refs: Intel SDM Vol. 3B §17.2.4 (DR0–DR3, DR7), §17.3.1.1 (data-
+# breakpoint trap-after-retire); Intel SDM Vol. 2A (`HLT`); Intel SDM
+# Vol. 3A §4.10 (TLB management); System V AMD64 ABI §3.2.2 (stack
+# frame layout), §3.4.5.2 (SSP); POSIX `vfork(3p)`; CWE-121.  Prior
+# art: PR #399 (D20 kernel-stack canary), PR #382 (D16 user-VA SSP).
+d21-user-canary-watch = ["firefox-test", "w215-diag"]
 # Track B (Phase 5, 2026-05-21) — stack-page write provenance ring.
 # Records kernel-mode writes whose target user VA falls into the
 # `[0x3f00_0000_0000, 0x4000_0000_0000)` thread-stack range (per Phase 4
