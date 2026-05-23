@@ -69,7 +69,7 @@ impl Client {
     }
     fn next_seq(&mut self) -> u16 { self.seq = self.seq.wrapping_add(1); self.seq }
     fn send(&self, data: &[u8])   {
-        #[cfg(feature = "firefox-test")]
+        #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
         if data.len() >= 4 && data[0] == 1 {
             // Reply: log fd, seq, reply_length, total_bytes
             let seq = u16::from_le_bytes([data[2], data[3]]);
@@ -438,7 +438,7 @@ pub fn poll() {
       for (i, sl) in s.clients.iter().enumerate() {
           if let Some(c) = sl {
               let hd = unix::has_data(c.fd);
-              #[cfg(feature = "firefox-test")]
+              #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
               if hd { crate::serial_println!("[X11POLL] svc_fd={} has_data=true avail={}", c.fd, unix::bytes_available(c.fd)); }
               if hd { pending[i] = c.fd; }
           }
@@ -454,7 +454,7 @@ fn service_fd(fd: u64) {
     let n = unix::read(fd, &mut buf);
     if n <= 0 { return; }
     let data = &buf[..n as usize];
-    #[cfg(feature = "firefox-test")]
+    #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
     crate::serial_println!("[X11SVC] fd={} read {} bytes", fd, n);
     let setup = {
         let s = SERVER.lock();
@@ -479,7 +479,7 @@ fn handle_setup(fd: u64, data: &[u8]) {
     if data.len() < 12       { send_fail(fd, b"truncated"); return; }
     if data[0] != 0x6C       { send_fail(fd, b"big-endian not supported"); return; }
     if r16(data,2) != 11     { send_fail(fd, b"unsupported protocol"); return; }
-    #[cfg(feature = "firefox-test")]
+    #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
     {
         let n_auth = r16(data, 6) as usize;
         let d_auth = r16(data, 8) as usize;
@@ -487,7 +487,7 @@ fn handle_setup(fd: u64, data: &[u8]) {
             data[0], r16(data,2), r16(data,4), n_auth, d_auth, data.len());
     }
     let reply = build_setup_ok();
-    #[cfg(feature = "firefox-test")]
+    #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
     {
         crate::serial_println!("[X11] setup_ok len={} hdr={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} additional_units={} n_screens={} n_formats={}",
             reply.len(), reply[0], reply[1], reply[2], reply[3], reply[4], reply[5], reply[6], reply[7],
@@ -496,7 +496,7 @@ fn handle_setup(fd: u64, data: &[u8]) {
             r32(&reply,12), r32(&reply,16), r16(&reply,24), r16(&reply,26));
     }
     let n_written = unix::write(fd, &reply);
-    #[cfg(feature = "firefox-test")]
+    #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
     crate::serial_println!("[X11] setup_ok written={}", n_written);
     let mut srv = SERVER.lock();
     for sl in srv.clients.iter_mut() {
@@ -539,12 +539,17 @@ fn build_setup_ok() -> [u8; 128] {
 fn handle_request(fd: u64, data: &[u8]) {
     if data.len() < 4 { return; }
     let opcode = data[0];
-    #[cfg(feature = "firefox-test")]
+    #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
     {
         static X11_REQ_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
         let n = X11_REQ_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         if n < 200 {
-            crate::serial_println!("[X11] req#{} op={} len={}", n, opcode, data.len());
+            // For core ops (opcode 1-127) data[1] is op-specific (CW depth, etc.).
+            // For extension major opcodes (128-255) it is the minor opcode per X11
+            // protocol §10.  Logging both unifies the trace for downstream parsing.
+            let minor = data[1];
+            crate::serial_println!("[X11] req#{} op={} minor={} len={}",
+                                   n, opcode, minor, data.len());
         }
     }
     let seq = { let mut srv = SERVER.lock();
@@ -555,8 +560,14 @@ fn handle_request(fd: u64, data: &[u8]) {
         proto::OP_CHANGE_WINDOW_ATTRS   => op_change_win_attrs(fd, data),
         proto::OP_GET_WINDOW_ATTRS      => op_get_win_attrs(fd, data, seq),
         proto::OP_DESTROY_WINDOW        => op_destroy_window(fd, data, seq),
+        proto::OP_DESTROY_SUBWINDOWS    => {} // best-effort no-op (no children tracked)
+        proto::OP_CHANGE_SAVE_SET       => {} // ICCCM bookkeeping; ignored
+        proto::OP_REPARENT_WINDOW       => {} // no WM hierarchy beyond root
         proto::OP_MAP_WINDOW            => op_map_window(fd, data, seq),
+        proto::OP_MAP_SUBWINDOWS        => {} // children unmapped; no-op
         proto::OP_UNMAP_WINDOW          => op_unmap_window(fd, data, seq),
+        proto::OP_UNMAP_SUBWINDOWS      => {} // no-op
+        proto::OP_CIRCULATE_WINDOW      => {} // no Z-order beyond top window
         proto::OP_CONFIGURE_WINDOW      => op_configure_window(fd, data, seq),
         proto::OP_GET_GEOMETRY          => op_get_geometry(fd, data, seq),
         proto::OP_QUERY_TREE            => op_query_tree(fd, data, seq),
@@ -609,7 +620,20 @@ fn handle_request(fd: u64, data: &[u8]) {
         proto::XKEYBOARD_MAJOR_OPCODE  => op_xkeyboard(fd, data, seq),
         proto::DPMS_MAJOR_OPCODE       => op_dpms(fd, data, seq),
         proto::RANDR_MAJOR_OPCODE      => op_randr(fd, data, seq),
+        // Polygon / arc drawing ops.  Per X11 protocol §PolyArc /
+        // §PolyFillArc / §FillPoly / §PolyLine / §PolySegment / §PolyPoint
+        // / §PolyRectangle — no reply, request data is (drawable, gc,
+        // [coords...]).  Minimal stub: accept and discard.  A future
+        // revision can rasterise into the drawable's pixel buffer for
+        // full visual fidelity.
+        proto::OP_POLY_POINT            => {}
+        proto::OP_POLY_LINE             => {}
+        proto::OP_POLY_SEGMENT          => {}
+        proto::OP_POLY_RECTANGLE        => {}
+        proto::OP_POLY_ARC              => {}
+        proto::OP_FILL_POLY             => {}
         proto::OP_POLY_FILL_RECTANGLE   => op_poly_fill_rect(fd, data),
+        proto::OP_POLY_FILL_ARC         => {}
         proto::OP_PUT_IMAGE             => op_put_image(fd, data),
         proto::OP_IMAGE_TEXT8           => op_image_text8(fd, data),
         proto::OP_IMAGE_TEXT16          => {}
@@ -629,7 +653,7 @@ fn handle_request(fd: u64, data: &[u8]) {
         proto::OP_GET_MODIFIER_MAPPING  => op_get_modifier_mapping(fd, seq),
         proto::OP_NO_OPERATION          => {}
         _ => {
-            #[cfg(feature = "firefox-test")]
+            #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
             crate::serial_println!("[X11] unknown opcode={} len={}", opcode, data.len());
             with_client(fd, |c| c.send_error(proto::ERR_REQUEST, 0, opcode));
         }
@@ -974,9 +998,13 @@ fn deliver_property_notify(window: u32, atom: u32, deleted: bool) {
                     .unwrap_or(false)
             };
             if has_mask {
-                let seq = c.seq.wrapping_add(1);
-                c.seq = seq;
-                let ev = event::encode_property_notify(seq, window, atom, tick, deleted);
+                // Per X11 protocol §11.1, every event carries the sequence
+                // number of the last REQUEST received from that client — it
+                // does NOT advance the request counter.  Advancing c.seq here
+                // would desynchronise subsequent reply sequence numbers from
+                // what the client's Xlib expects, manifesting as silent client
+                // exit on the next reply.
+                let ev = event::encode_property_notify(c.seq, window, atom, tick, deleted);
                 unix::write(c.fd, &ev);
             }
         }
@@ -1045,7 +1073,7 @@ fn op_get_property(fd: u64, data: &[u8], seq: u16) {
     let rtype   = r32(data, 12);
     let offset  = r32(data, 16) as usize * 4;
     let req_len = r32(data, 20) as usize * 4;
-    #[cfg(feature = "firefox-test")]
+    #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
     crate::serial_println!("[X11GP] fd={} wid={} atom={} seq={}", fd, wid, atom, seq);
 
     // Root-window properties are stored in SERVER.root_properties, not per-client.
@@ -1069,7 +1097,7 @@ fn op_get_property(fd: u64, data: &[u8], seq: u16) {
         if atom == 0 {
             let mut b = [0u8;32]; b[0]=1; w16(&mut b,2,seq);
             let wr = unix::write(c.fd, &b);
-            #[cfg(feature = "firefox-test")]
+            #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
             crate::serial_println!("[X11GP] atom=0 empty reply fd={} wr={}", c.fd, wr);
             return;
         }
@@ -1080,13 +1108,13 @@ fn op_get_property(fd: u64, data: &[u8], seq: u16) {
                 (p.type_, p.format, p.len, arr)
             })
         });
-        #[cfg(feature = "firefox-test")]
+        #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
         crate::serial_println!("[X11GP] result={} wid={} atom={}", result.is_some(), wid, atom);
         match result {
             None => {
                 let mut b=[0u8;32]; b[0]=1; w16(&mut b,2,seq);
                 let wr = unix::write(c.fd, &b);
-                #[cfg(feature = "firefox-test")]
+                #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
                 crate::serial_println!("[X11GP] none-reply fd={} seq={} wr={}", c.fd, seq, wr);
             }
             Some((type_,fmt,total,raw)) => {
@@ -1341,11 +1369,12 @@ fn op_send_event(fd: u64, data: &[u8], _seq: u16) {
                     .unwrap_or(false)
             };
             if matches {
-                // ev[2..4] is overwritten per-client (per-client sequence number).
-                let seq = c.seq.wrapping_add(1);
-                c.seq = seq;
-                ev[2] = (seq & 0xFF) as u8;
-                ev[3] = (seq >> 8) as u8;
+                // Per X11 protocol §11.1, events carry the sequence number
+                // of the last REQUEST from the receiving client — they do
+                // NOT advance the request counter.  Stamping a fresh seq
+                // here would desync subsequent reply sequence numbers.
+                ev[2] = (c.seq & 0xFF) as u8;
+                ev[3] = (c.seq >> 8) as u8;
                 unix::write(c.fd, &ev);
             }
         }
@@ -1424,12 +1453,11 @@ fn deliver_focus_event(window: u32, focus_in: bool) {
                 })
                 .unwrap_or(false);
             if has_mask {
-                let seq = c.seq.wrapping_add(1);
-                c.seq = seq;
+                // Per X11 protocol §11.1, events carry the last-request seq.
                 let ev = if focus_in {
-                    event::encode_focus_in(seq, window)
+                    event::encode_focus_in(c.seq, window)
                 } else {
-                    event::encode_focus_out(seq, window)
+                    event::encode_focus_out(c.seq, window)
                 };
                 unix::write(c.fd, &ev);
             }
@@ -2457,7 +2485,64 @@ fn op_damage(fd: u64, data: &[u8], seq: u16) {
 fn op_xinput(fd: u64, data: &[u8], seq: u16) {
     if data.len() < 4 { return; }
     let minor = data[1];
+    #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
+    crate::serial_println!("[X11/XI] minor={} len={}", minor, data.len());
     match minor {
+        // ── XI v1 (subset commonly issued by libXi during device discovery) ───
+        proto::XI_V1_GET_EXTENSION_VERSION => {
+            // XGetExtensionVersionReply: present=1, server_major=2, server_minor=3
+            // Reply layout per X Input Extension Protocol §3.1
+            // (32-byte fixed reply, no trailing data).
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            w16(&mut b, 8,  2);   // server_major
+            w16(&mut b, 10, 3);   // server_minor
+            b[12] = 1;            // present
+            with_client(fd, |c| c.send(&b));
+        }
+        proto::XI_V1_LIST_INPUT_DEVICES => {
+            // Minimal: report 2 devices (virtual core pointer + virtual core
+            // keyboard) with NO input classes attached.  Reply shape per
+            // X Input Extension §3.2: 32-byte header (ndevices, then variable
+            // device array, then variable classes, then variable names).
+            //
+            // Reply byte 1 = ndevices.
+            // Reply qword 8.. = (variable) — empty in our minimal impl since
+            // ndevices=0 means many clients short-circuit without inspecting
+            // the variable part.  This is sufficient for xeyes which only
+            // cares about XI2 device list (via XIQueryDevice) when XI2 is
+            // available — and we advertise XI2 via XIQueryVersion above.
+            let mut b = [0u8; 32];
+            b[0] = 1; b[1] = 0;   // ndevices = 0
+            w16(&mut b, 2, seq);
+            with_client(fd, |c| c.send(&b));
+        }
+        proto::XI_V1_OPEN_DEVICE => {
+            // OpenDeviceReply: ndevices_classes=0 (32-byte fixed).
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            with_client(fd, |c| c.send(&b));
+        }
+        proto::XI_V1_GET_DEVICE_FOCUS => {
+            // GetDeviceFocusReply: focus=PointerRoot, time=0, revert_to=None
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            w32(&mut b, 8,  1); // focus = PointerRoot (id 1)
+            w32(&mut b, 12, 0); // time
+            with_client(fd, |c| c.send(&b));
+        }
+        proto::XI_V1_QUERY_DEVICE_STATE => {
+            // QueryDeviceStateReply: num_classes=0.  Per X Input Extension
+            // §3.30 the variable trailer carries InputClass records; an empty
+            // list means "device exists but reports no axes/keys at this
+            // moment" — acceptable for a tracking client.
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            with_client(fd, |c| c.send(&b));
+        }
+        proto::XI_V1_CLOSE_DEVICE => {} // no reply
+
+        // ── XI2 ────────────────────────────────────────────────────────────────
         proto::XI_QUERY_VERSION => {
             // XIQueryVersionReply: major=2, minor=3 (CARD16 each)
             let mut b = [0u8; 32];
@@ -2466,16 +2551,73 @@ fn op_xinput(fd: u64, data: &[u8], seq: u16) {
             w16(&mut b, 10, 3); // minor_version
             with_client(fd, |c| c.send(&b));
         }
-        proto::XI_GET_CLIENT_POINTER => {
-            // XIGetClientPointerReply: device_id = 2 (default pointer)
-            let mut b = [0u8; 32];
+        proto::XI_QUERY_POINTER => {
+            // XIQueryPointerReply: 56-byte fixed header.
+            // Per XInput2 protocol §3.1: root, child, root_x/y, win_x/y (all
+            // FP1616), mods, group, buttons_len.  Report pointer at (0,0)
+            // on the root window with no buttons pressed.
+            let mut b = [0u8; 56];
             b[0] = 1; w16(&mut b, 2, seq);
-            w16(&mut b, 8, 2); // device_id
+            w32(&mut b, 4, 6);  // reply_length = 6 four-byte units (56-32=24)
+            w32(&mut b, 8,  proto::ROOT_WINDOW_ID); // root
+            w32(&mut b, 12, 0);                     // child = None
+            // root_x = root_y = win_x = win_y = 0 (FP1616 zero)
+            // mods (16) + group (4) + buttons_len (4) = remaining zeroes.
             with_client(fd, |c| c.send(&b));
         }
-        // XI_SELECT_EVENTS: side-effect only
-        proto::XI_SELECT_EVENTS => {}
-        _ => {}
+        proto::XI_GET_CLIENT_POINTER => {
+            // XIGetClientPointerReply: set=true, device_id = 2 (virtual core ptr)
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            b[8] = 1;          // set
+            w16(&mut b, 10, 2); // device_id (per XI2 reply layout)
+            with_client(fd, |c| c.send(&b));
+        }
+        proto::XI_SELECT_EVENTS => {} // no reply
+        proto::XI_QUERY_DEVICE => {
+            // XIQueryDeviceReply: num_devices=0 trailing data.
+            // Per XInput2 protocol §4.4: 32-byte header followed by
+            // num_devices XIDeviceInfo records.  Reporting zero devices is
+            // a legal reply; clients fall back to assuming the core
+            // pointer/keyboard are present (which our XI v1 ListInputDevices
+            // and core protocol QueryPointer also imply).
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            // reply_length=0 (32-byte fixed), num_devices=0.
+            with_client(fd, |c| c.send(&b));
+        }
+        proto::XI_GET_FOCUS => {
+            // XIGetFocusReply: focus=PointerRoot.
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            w32(&mut b, 8, 1); // focus = PointerRoot
+            with_client(fd, |c| c.send(&b));
+        }
+        proto::XI_LIST_PROPERTIES => {
+            // XIListPropertiesReply: num_properties=0 (32-byte fixed).
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            with_client(fd, |c| c.send(&b));
+        }
+        proto::XI_GET_PROPERTY => {
+            // XIGetPropertyReply: type=0 (None), bytes_after=0, num_items=0.
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            with_client(fd, |c| c.send(&b));
+        }
+        proto::XI_GET_SELECTED_EVENTS => {
+            // XIGetSelectedEventsReply: num_masks=0 (32-byte fixed).
+            let mut b = [0u8; 32];
+            b[0] = 1; w16(&mut b, 2, seq);
+            with_client(fd, |c| c.send(&b));
+        }
+        _ => {
+            // Unknown XInputExtension minor.  Treat as a no-reply request
+            // (best-effort; the alternative is a BadRequest error which
+            // many toolkits handle worse than silence).
+            #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
+            crate::serial_println!("[X11/XI] unhandled minor={} (no reply)", minor);
+        }
     }
 }
 
@@ -2562,7 +2704,7 @@ fn op_sync_ext(fd: u64, data: &[u8], seq: u16) {
 fn op_xkeyboard(fd: u64, data: &[u8], seq: u16) {
     if data.len() < 4 { return; }
     let minor = data[1];
-    #[cfg(feature = "firefox-test")]
+    #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
     crate::serial_println!("[X11XKB] minor={} seq={} len={}", minor, seq, data.len());
     // XKB minor opcodes that need replies:
     // 0=UseExtension, 4=GetState, 6=GetControls, 9=ListComponents,
