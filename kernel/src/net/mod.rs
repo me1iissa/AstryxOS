@@ -230,3 +230,112 @@ pub fn format_ipv6(addr: Ipv6Address) -> alloc::string::String {
 
     s
 }
+
+// ── Interface table — /sys/class/net surface ─────────────────────────────────
+//
+// A pull-on-read snapshot of the network interfaces visible to userspace.
+// The list is computed each time `list_ifaces()` is called from anything
+// reading `/sys/class/net`; this keeps the kernel-side state minimal and
+// avoids inotify-style change notifications, which production binaries
+// (oracle network collector, cloud-init NoCloud) do not require.
+//
+// `lo` is always present (per RFC 1122 §3.2.1.3 — the loopback pseudo-
+// device is implicit on every host).  `eth0` is exposed iff a hardware NIC
+// (e1000 or virtio-net) has finished `init()` successfully.  Naming is the
+// minimal subset of `man 7 netdevice`: lowercase, ≤15 bytes, no "/", no
+// whitespace — sufficient for `glob("/sys/class/net/*")` consumers.
+
+// ARP hardware type codes (RFC 1700 / Linux <if_arp.h>):
+//   ARPHRD_ETHER    = 1     — IEEE 802.3 Ethernet
+//   ARPHRD_LOOPBACK = 772   — local loopback device
+pub const ARPHRD_ETHER:    u16 = 1;
+pub const ARPHRD_LOOPBACK: u16 = 772;
+
+// Interface flag bits from `man 7 netdevice` (`SIOCGIFFLAGS`); we only
+// surface the subset the oracle/cloud-init collectors inspect via the
+// `/sys/class/net/<iface>/flags` hex string.
+pub const IFF_UP:        u32 = 0x0001;
+pub const IFF_BROADCAST: u32 = 0x0002;
+pub const IFF_LOOPBACK:  u32 = 0x0008;
+pub const IFF_RUNNING:   u32 = 0x0040;
+pub const IFF_MULTICAST: u32 = 0x1000;
+
+/// Snapshot of a single network interface as visible through
+/// `/sys/class/net/<name>/`.  All fields are formatted in
+/// `vfs/sysfs.rs::iface_attr_content` exactly as the Linux ABI doc
+/// (kernel.org/Documentation/ABI/testing/sysfs-class-net) specifies.
+#[derive(Clone)]
+pub struct IfaceInfo {
+    pub name: alloc::string::String,
+    pub ifindex: u32,
+    /// ARPHRD_* hardware type code.
+    pub iftype: u16,
+    /// Interface flags (IFF_* bit mask).
+    pub flags: u32,
+    pub mtu: u32,
+    /// Hardware address.  Loopback uses all-zero (Linux convention).
+    pub mac: MacAddress,
+    /// One of: "up", "down", "unknown", "lowerlayerdown", "dormant",
+    /// "notpresent", "testing" — per RFC 2863 / operstates.rst.
+    pub operstate: &'static str,
+    /// Carrier state, when defined.  `None` means the device has no
+    /// carrier concept (e.g. loopback); the sysfs file then reports
+    /// `EINVAL` on read per the ABI doc.
+    pub carrier: Option<bool>,
+    /// Link speed in megabits/sec, when defined.  `None` means the
+    /// device has no concept of a link speed (loopback) — sysfs then
+    /// emits the `-1` sentinel per the ABI doc.
+    pub speed_mbps: Option<u32>,
+}
+
+/// Snapshot the current network interface set.  Pull-on-read; no caching.
+///
+/// Returns at minimum the loopback interface `lo`.  `eth0` is appended
+/// when an Ethernet NIC has been initialised.  The interface naming is
+/// stable across boots for a given device topology (loopback first,
+/// hardware NIC second), matching the predictable-naming convention
+/// userspace tools rely on.
+pub fn list_ifaces() -> alloc::vec::Vec<IfaceInfo> {
+    let mut v = alloc::vec::Vec::new();
+
+    // ── lo ──────────────────────────────────────────────────────────────
+    // Loopback is always up + running per RFC 1122 §3.2.1.3.  MTU 65536
+    // matches Linux's default for the loopback pseudo-device (chosen so
+    // that IP fragmentation never fires on local-only traffic).  Carrier
+    // and speed have no meaning on a non-physical device — surfaced as
+    // None and rendered per the ABI doc.
+    v.push(IfaceInfo {
+        name:       alloc::string::String::from("lo"),
+        ifindex:    1,
+        iftype:     ARPHRD_LOOPBACK,
+        flags:      IFF_UP | IFF_LOOPBACK | IFF_RUNNING,
+        mtu:        65_536,
+        mac:        [0u8; 6],
+        operstate:  "unknown",  // loopback has no link layer; reports "unknown"
+        carrier:    None,       // /sys/class/net/lo/carrier → EINVAL
+        speed_mbps: None,       // /sys/class/net/lo/speed   → "-1\n"
+    });
+
+    // ── eth0 ────────────────────────────────────────────────────────────
+    // Surfaced when either e1000 or virtio-net has come up successfully.
+    // The hardware MAC is the same one announced through `our_mac()`
+    // (already filled in by the NIC `init()`).  We pick "up" + carrier
+    // true unconditionally since the kernel has no per-driver link-state
+    // polling today; a follow-up patch can wire e1000 STATUS.LU and the
+    // virtio-net link-status feature into these fields.
+    if e1000::is_available() || virtio_net::is_available() {
+        v.push(IfaceInfo {
+            name:       alloc::string::String::from("eth0"),
+            ifindex:    2,
+            iftype:     ARPHRD_ETHER,
+            flags:      IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST,
+            mtu:        1_500,
+            mac:        our_mac(),
+            operstate:  "up",
+            carrier:    Some(true),
+            speed_mbps: Some(1_000), // QEMU e1000 advertises 1 Gb/s
+        });
+    }
+
+    v
+}
