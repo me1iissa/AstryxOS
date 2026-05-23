@@ -220,6 +220,31 @@ pub mod d17_aliasing_test;
 #[cfg(feature = "d20-kstack-canary-watch")]
 pub mod d20_kstack_canary_watch;
 
+/// D21 — write-only DR watchpoint on PID 1's user-mode stack-frame
+/// saved-canary slot at the moment the `CLONE_VM|CLONE_VFORK` parent
+/// blocks.  After the kernel-mode `STACK_CANARY_CORRUPT` class was
+/// closed by PRs #388 → #400, the demo gate moved to a user-mode SSP
+/// failure: byte-identical 2/2 reproductions at ld-musl-x86_64.so.1
+/// `+0x1c7f9` (= musl `__stack_chk_fail`, `f4 c3` = HLT;RET).  Per
+/// Intel SDM Vol. 2A `HLT` from CPL=3 raises `#GP(0)`; AstryxOS
+/// encodes that as `exit_group(-13)`.  The TCB-side `FS:0x28` master
+/// canary is stable per the `[VFORK/CANARY]` snapshots, so the
+/// corruption is on a stack-frame saved-canary slot.  D21 walks one
+/// frame up from the libc syscall wrapper's RBP to reach the libxul
+/// SSP-instrumented caller's `[rbp-8]` slot and arms a write-only DR
+/// on it via `arm_linear_watchpoint(va, 8, WATCH_KIND_D21_USER_CANARY)`.
+/// The existing `[W215/DR-WATCH-FIRE]` line then names the writer's
+/// RIP / CS / CR3 (Intel SDM Vol. 3B §17.3.1.1 trap-after-retire).
+/// Diagnostic-only; gated behind `d21-user-canary-watch` so master
+/// builds remain byte-identical.  Refs: Intel SDM Vol. 3B §17.2.4
+/// (DR0–DR3, DR7), §17.3.1.1 (data-breakpoint trap timing); Intel
+/// SDM Vol. 2A (`HLT`); Intel SDM Vol. 3A §4.10 (TLB management);
+/// System V AMD64 ABI §3.2.2 (stack frame layout), §3.4.5.2 (SSP);
+/// POSIX `vfork(3p)`; CWE-121; PR #398 (PID 1 `exit_group(-13)`
+/// investigation); PR #399 (D20 precedent).
+#[cfg(feature = "d21-user-canary-watch")]
+pub mod d21_user_canary_watch;
+
 /// Bounded broadcast-within-cluster compensation for FUTEX_WAKE.  Mitigates
 /// the older-glibc `pthread_cond_signal` race
 /// (<https://sourceware.org/bugzilla/show_bug.cgi?id=25847>) by

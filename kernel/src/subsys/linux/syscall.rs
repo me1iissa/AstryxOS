@@ -2459,6 +2459,22 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                     pid, parent_tid);
                                 crate::subsys::linux::vfork_diag::arm_master_canary_watch();
                             }
+                            // D21 — arm a write-only DR on the libxul caller-
+                            // frame `[rbp-8]` saved-canary slot for PID 1
+                            // TID 1.  Catches any writer (kernel or user, any
+                            // CR3 that resolves to the watched user VA) to
+                            // the SSP slot that the doomed function's
+                            // epilogue will compare against `fs:0x28` —
+                            // names the user-mode `__stack_chk_fail` writer
+                            // post-PR-#400.  Bounded by `D21_ARM_MAX = 4`
+                            // and the `F3_FIRE_CAP` per-slot fire bound.
+                            // Diagnostic-only; gated behind
+                            // `d21-user-canary-watch`.  See PR #398 for the
+                            // dispositive evidence trail and PR #399 for
+                            // the D20 precedent.
+                            #[cfg(feature = "d21-user-canary-watch")]
+                            crate::subsys::linux::d21_user_canary_watch::try_arm_at_vfork_preblock(
+                                pid, parent_tid);
                             // ELF-WRITE-TRACE on 0x37e18 dropped here — qa
                             // verdict: structurally meaningless on musl
                             // (musl's ld doesn't use a `.data.rel.ro`
@@ -3481,6 +3497,15 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                     pid, parent_tid);
                                 crate::subsys::linux::vfork_diag::arm_master_canary_watch();
                             }
+                            // D21 — arm a write-only DR on the libxul caller-
+                            // frame `[rbp-8]` saved-canary slot for PID 1
+                            // TID 1.  See the clone(56) site above for the
+                            // rationale and PR #398 for the dispositive
+                            // evidence trail.  Diagnostic-only; gated
+                            // behind `d21-user-canary-watch`.
+                            #[cfg(feature = "d21-user-canary-watch")]
+                            crate::subsys::linux::d21_user_canary_watch::try_arm_at_vfork_preblock(
+                                pid, parent_tid);
                             // ELF-WRITE-TRACE on 0x37e18 dropped — see
                             // clone(56) path above for the qa-verdict TODO.
                             crate::sched::schedule();

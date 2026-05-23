@@ -146,14 +146,22 @@ static ARMED_KEY_OFFSET: [AtomicU64; N_DR_SLOTS] = [
 ///       STACK_CANARY_CORRUPT bugcheck victim (PID 2 TID 5).  Same
 ///       persistent-arm + `F3_FIRE_CAP` policy.  Per Intel SDM Vol. 3B
 ///       §17.3.1.1 each fire names one retired writer.
+///   7 — D21 PID-1 user stack-frame saved-canary watch (see
+///       `subsys/linux/d21_user_canary_watch.rs`).  Catches writes to
+///       the libxul-caller-frame `[rbp-8]` SSP slot for the PID 1 init
+///       thread at the moment of the `CLONE_VM|CLONE_VFORK` PRE-block.
+///       Names the user-mode SSP-canary writer for the post-PR-#400
+///       `__stack_chk_fail` at ld-musl+0x1c7f9 (PR #398 evidence).
+///       Same persistent-arm + `F3_FIRE_CAP` policy.
 /// Future axes may take additional tags without disturbing existing arms.
-pub const WATCH_KIND_LEGACY:     u32 = 0;
-pub const WATCH_KIND_F3_USER:    u32 = 1;
-pub const WATCH_KIND_F3_PHYS:    u32 = 2;
-pub const WATCH_KIND_D7_BSS:     u32 = 3;
-pub const WATCH_KIND_D15_MTHRD:  u32 = 4;
-pub const WATCH_KIND_D16_CANARY: u32 = 5;
-pub const WATCH_KIND_D20_KSTACK: u32 = 6;
+pub const WATCH_KIND_LEGACY:        u32 = 0;
+pub const WATCH_KIND_F3_USER:       u32 = 1;
+pub const WATCH_KIND_F3_PHYS:       u32 = 2;
+pub const WATCH_KIND_D7_BSS:        u32 = 3;
+pub const WATCH_KIND_D15_MTHRD:     u32 = 4;
+pub const WATCH_KIND_D16_CANARY:    u32 = 5;
+pub const WATCH_KIND_D20_KSTACK:    u32 = 6;
+pub const WATCH_KIND_D21_USER_CANARY: u32 = 7;
 static ARMED_KIND: [AtomicU32; N_DR_SLOTS] = [
     AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
 ];
