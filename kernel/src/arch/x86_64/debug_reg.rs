@@ -174,6 +174,19 @@ pub const WATCH_KIND_D16_CANARY:    u32 = 5;
 pub const WATCH_KIND_D20_KSTACK:    u32 = 6;
 pub const WATCH_KIND_D21_USER_CANARY: u32 = 7;
 pub const WATCH_KIND_D22_USER_CANARY_PHYS: u32 = 8;
+///   9 — F3 code-fetch (instruction-execute) watch on the user-VA of
+///       musl `__stack_chk_fail+0x0` (see
+///       `subsys/linux/f3_code_dr_watch.rs`).  Differs from kinds 1–8
+///       in DR7 encoding: RW=00b (instruction execute) + LEN=00b
+///       (must be 1-byte per Intel SDM Vol. 3B §17.2.4 Table 17-2).
+///       Per §17.3.1.1, instruction-fetch breakpoints are *faults*
+///       (taken before the instruction retires), so the `#DB` frame's
+///       `rip` is the watched address itself — convenient for naming
+///       the SSP-fail entry as the dispositive caller-frame snapshot
+///       point.  One-shot disarm policy (`one_shot=true` for this
+///       kind), matching legacy slots — a single fire produces the
+///       full dump and the slot releases for any later diagnostic.
+pub const WATCH_KIND_F3_CODE_DR:     u32 = 9;
 static ARMED_KIND: [AtomicU32; N_DR_SLOTS] = [
     AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
 ];
@@ -593,11 +606,26 @@ fn read_cr3() -> u64 {
 /// and disarmed.
 ///
 /// Returns `false` if the trap is not a W215 watchpoint.
+/// GPR snapshot passed through from the IDT ISR stub.  Index layout matches
+/// the saved-frame walk in `arch/x86_64/idt.rs` (the `isr_no_error!`
+/// macro pushes r15 first / rax last; the slice index reflects the same
+/// order so a consumer can address registers by name without arithmetic):
+///
+///   `[0] = r15, [1] = r14, [2] = r13, [3] = r12, [4] = rbp, [5] = rbx,
+///    [6] = r11, [7] = r10, [8] = r9,  [9] = r8,  [10] = rdi, [11] = rsi,
+///    [12] = rdx, [13] = rcx, [14] = rax`
+///
+/// Passed as `Option<&Gprs>` so callers that don't have the saved frame
+/// available (none currently; reserved for future ISR shapes) can still
+/// invoke the dispatcher.
+pub type Gprs = [u64; 15];
+
 pub fn handle_db_exception(
     rip: u64,
     rsp: u64,
     rflags: u64,
     cs: u64,
+    gprs: Option<&Gprs>,
 ) -> bool {
     let dr6 = read_dr6();
     let hit_mask = dr6 & 0xF;
@@ -690,6 +718,22 @@ pub fn handle_db_exception(
         if kind_tag == WATCH_KIND_D22_USER_CANARY_PHYS {
             crate::subsys::linux::d22_user_canary_phys::record_d22_fire(
                 slot as u8, rip, cs, cr3,
+            );
+        }
+        // F3 code-DR hook — emit the `[F3/CODE-DR-FIRE]` dump for
+        // instruction-fetch fires on the musl `__stack_chk_fail+0x0`
+        // user VA (PR #420 autopsy verdict).  Per Intel SDM Vol. 3B
+        // §17.3.1.1 instruction breakpoints are faults taken before
+        // the watched instruction retires, so `rip == watched VA` and
+        // the GPRs / RSP / RBP reflect the SSP-instrumented caller's
+        // frame at the moment of `__stack_chk_fail`'s call.  The
+        // dump is the dispositive saga-closing evidence (names the
+        // caller frame, lets a post-processor diff saved-canary vs
+        // fs:0x28).  Gated on `f3-codeDR-watch`.
+        #[cfg(feature = "f3-codeDR-watch")]
+        if kind_tag == WATCH_KIND_F3_CODE_DR {
+            crate::subsys::linux::f3_code_dr_watch::record_fire(
+                slot as u8, rip, rsp, rflags, cs, cr3, gprs,
             );
         }
         crate::serial_println!(
@@ -1053,6 +1097,79 @@ pub fn arm_linear_watchpoint(
         "[W215/DR-ARM] slot={} linear={:#x} phys=0 inode=0 offset=0 \
          kind=linear kind_tag={} len={}",
         slot, linear_addr, kind_tag, len,
+    );
+    SYNC_GENERATION.fetch_add(1, Ordering::Release);
+    program_local_drs();
+    let cpu = super::apic::cpu_index();
+    if cpu < super::apic::MAX_CPUS {
+        LOCAL_SYNC_GENERATION[cpu].store(
+            SYNC_GENERATION.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+    }
+    ArmPhysResult::Armed(slot)
+}
+
+/// Build DR7 control bits for an instruction-execute breakpoint on `slot`.
+///
+/// Per Intel SDM Vol. 3B §17.2.4 Table 17-2 instruction breakpoints
+/// REQUIRE `R/W = 00b` (execute) and `LEN = 00b` (1-byte) — the LEN
+/// field is the only encoding ignored for execute breakpoints but the
+/// processor still requires it to be `00b` for compatibility.  Sets
+/// L{slot} + G{slot} like the data-watch path.
+fn dr7_bits_for_code_slot(slot: usize) -> u64 {
+    debug_assert!(slot < N_DR_SLOTS);
+    let li = 2 * slot as u64;
+    let gi = li + 1;
+    // R/W field = 00b (instruction execute), LEN field = 00b (1-byte).
+    // Both default to 0 in the bit positions, so the per-slot ctrl word
+    // is simply the L/G enables.
+    (1u64 << li) | (1u64 << gi)
+}
+
+/// Arm an instruction-execute (code-fetch) watchpoint on `linear_addr`.
+/// Unlike `arm_linear_watchpoint` (which arms a write-only data watch),
+/// this fires when the CPU's instruction stream retires a fetch from
+/// the watched linear address — i.e. when execution reaches the
+/// `linear_addr`'th byte under the current CR3.
+///
+/// `linear_addr` should be the first byte of the target instruction
+/// (Intel SDM Vol. 3B §17.2.4 — code breakpoints match the linear
+/// address of the first opcode byte).  `kind_tag` is propagated to the
+/// `#DB` fire-line for post-processor routing.
+///
+/// Slot selection: try DR1/DR2/DR3 first (the pre-insert pool) to
+/// avoid clobbering the CRC walker's post-hoc slot (DR0); fall back to
+/// DR0 only if all three are busy.  Cross-CPU sync uses the same
+/// lazy-gen protocol as every other arm path.
+///
+/// Per Intel SDM Vol. 3A §6.15 the `#DB` raised by an instruction
+/// breakpoint is a **fault** (taken before the watched instruction
+/// retires), so the interrupt-frame `rip` equals `linear_addr`; the
+/// fire handler can use that as the dispositive marker.
+pub fn arm_code_watchpoint(linear_addr: u64, kind_tag: u32) -> ArmPhysResult {
+    let mut armed_slot: Option<u8> = None;
+    for slot in [1usize, 2, 3, 0] {
+        // Use the data-watch try_arm_slot to claim the slot atomics,
+        // then overwrite the control word with the code-fetch encoding
+        // (RW=00, LEN=00) before the SYNC_GENERATION bump publishes
+        // the slot to peer CPUs.
+        if try_arm_slot(slot, linear_addr, 1, 0, 0, 0) {
+            ARMED_CTRL[slot].store(dr7_bits_for_code_slot(slot), Ordering::Relaxed);
+            ARMED_KIND[slot].store(kind_tag, Ordering::Relaxed);
+            armed_slot = Some(slot as u8);
+            break;
+        }
+    }
+    let Some(slot) = armed_slot else {
+        return ArmPhysResult::PoolExhausted;
+    };
+
+    ARM_COUNT.fetch_add(1, Ordering::Relaxed);
+    crate::serial_println!(
+        "[W215/DR-ARM] slot={} linear={:#x} phys=0 inode=0 offset=0 \
+         kind=code kind_tag={} len=1",
+        slot, linear_addr, kind_tag,
     );
     SYNC_GENERATION.fetch_add(1, Ordering::Release);
     program_local_drs();
