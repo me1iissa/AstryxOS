@@ -9375,12 +9375,21 @@ fn sys_setitimer(which: u64, new_val_ptr: u64, old_val_ptr: u64) -> i64 {
     let now = crate::arch::x86_64::irq::get_ticks();
 
     // Read the new itimerval before acquiring the process lock.
+    // SMAP discipline (Intel SDM Vol. 3A §4.6): the four `*(new_val_ptr + N)`
+    // dereferences below target a user-mapped page (PTE.U=1); without
+    // EFLAGS.AC=1 they fault and our handler escalates to KERNEL_PAGE_FAULT.
+    // UserGuard sets AC on construction and clears on drop / panic-unwind.
     let (new_interval_ticks, new_value_ticks) = if new_val_ptr != 0 {
         if !crate::syscall::validate_user_ptr(new_val_ptr, 32) { return -14; } // EFAULT
-        let it_interval_sec  = unsafe { *( new_val_ptr       as *const i64) } as u64;
-        let it_interval_usec = unsafe { *((new_val_ptr + 8)  as *const i64) } as u64;
-        let it_value_sec     = unsafe { *((new_val_ptr + 16) as *const i64) } as u64;
-        let it_value_usec    = unsafe { *((new_val_ptr + 24) as *const i64) } as u64;
+        let (it_interval_sec, it_interval_usec, it_value_sec, it_value_usec) = unsafe {
+            let _g = crate::arch::x86_64::smap::UserGuard::new();
+            (
+                *( new_val_ptr       as *const i64) as u64,
+                *((new_val_ptr + 8)  as *const i64) as u64,
+                *((new_val_ptr + 16) as *const i64) as u64,
+                *((new_val_ptr + 24) as *const i64) as u64,
+            )
+        };
         // Convert microseconds → ticks (round up, minimum 1 if non-zero).
         let interval_us = it_interval_sec * 1_000_000 + it_interval_usec;
         let value_us    = it_value_sec    * 1_000_000 + it_value_usec;
@@ -9406,7 +9415,9 @@ fn sys_setitimer(which: u64, new_val_ptr: u64, old_val_ptr: u64) -> i64 {
         };
         let old_value_us    = old_remaining_ticks * 1_000_000 / TICKS_PER_SEC;
         let old_interval_us = proc.alarm_interval_ticks * 1_000_000 / TICKS_PER_SEC;
+        // SMAP guard — kernel→user writes to itimerval-out struct.
         unsafe {
+            let _g = crate::arch::x86_64::smap::UserGuard::new();
             // it_interval
             *( old_val_ptr       as *mut i64) = (old_interval_us / 1_000_000) as i64;
             *((old_val_ptr +  8) as *mut i64) = (old_interval_us % 1_000_000) as i64;
@@ -9450,7 +9461,10 @@ fn sys_getitimer(which: u64, val_ptr: u64) -> i64 {
     };
     let value_us    = remaining_ticks * 1_000_000 / TICKS_PER_SEC;
     let interval_us = proc.alarm_interval_ticks * 1_000_000 / TICKS_PER_SEC;
+    // SMAP guard — kernel→user write to itimerval-out struct
+    // (Intel SDM Vol. 3A §4.6; getitimer(2)).
     unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
         *( val_ptr       as *mut i64) = (interval_us / 1_000_000) as i64;
         *((val_ptr +  8) as *mut i64) = (interval_us % 1_000_000) as i64;
         *((val_ptr + 16) as *mut i64) = (value_us / 1_000_000) as i64;

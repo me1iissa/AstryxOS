@@ -58,6 +58,8 @@ mod init;
 mod util;
 #[cfg(feature = "record-replay")]
 mod record_replay;
+#[cfg(any(feature = "busybox-test", feature = "wget-test"))]
+mod busybox_demo;
 
 use astryx_shared::{BootInfo, BOOT_INFO_MAGIC};
 
@@ -381,6 +383,8 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         // Xastryx + the visible-window slot.
         #[cfg(all(not(feature = "gui-test"),
                   not(feature = "firefox-test"),
+                  not(feature = "busybox-test"),
+                  not(feature = "wget-test"),
                   feature = "xeyes-test"))]
         {
             serial_println!("[XEYES] xeyes-test mode starting...");
@@ -473,24 +477,51 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             const CMDLINE: &str = "/disk/usr/bin/xeyes";
             serial_println!("[XEYES] Launching {} ...", CMDLINE);
             gui::terminal::launch_process(CMDLINE);
+            serial_println!("[XEYES] launch_process returned");
 
             // Soak loop: same shape as FFTEST but shorter budget (xeyes is
             // tiny — if it isn't drawing within ~30 s something is wrong).
             let t_launch = arch::x86_64::irq::get_ticks();
+            serial_println!("[XEYES] t_launch={}", t_launch);
             let mut last_log_tick: u64 = 0;
             let mut xeyes_exited = false;
+            // Synthetic mouse-motion injection state.  xeyes enters poll(2)
+            // after processing the initial Expose — it redraws only on
+            // MotionNotify.  We inject a synthetic MotionNotify at the
+            // centre of the xeyes window (75, 50) once the process has had
+            // time to settle (~200 ticks ≈ 2 s), and then repeat every
+            // 500 ticks to keep the pupils moving.  Per X11 protocol §5,
+            // PointerMotion events carry root-space coordinates; xeyes
+            // translates them via the window origin reported in ConfigureNotify.
+            let mut next_motion_inject: u64 = 200;
             loop {
+                // Service all kernel subsystems that xeyes depends on.
+                // Without these calls the BSP sits in hlt while xeyes's X11
+                // requests queue up unserviced in the kernel FD buffer, and
+                // the compositor never fires.  Mirrors the FFTEST soak loop
+                // (main.rs line ~815); must be present in every kernel-BSP
+                // idle loop that runs concurrent with a GUI workload.
                 gui::input::pump_input();
                 crate::net::poll();
                 crate::x11::poll();
                 crate::gui::terminal::poll_output();
-                let now_t = arch::x86_64::irq::get_ticks();
-                if now_t % 3 == 0 {
-                    gui::compositor::compose();
-                }
+                // Drive the compositor at ~50 Hz via the ISR-set tick flag.
+                // timer ISR sets COMPOSITOR_TICK_DUE every 2 ticks;
+                // tick_and_compose() atomically drains it and renders a frame.
+                gui::compositor::tick_and_compose();
 
                 let now = arch::x86_64::irq::get_ticks();
                 let elapsed = now.wrapping_sub(t_launch);
+
+                // Inject a synthetic MotionNotify to wake xeyes from poll(2)
+                // and trigger pupil redraw.  The pointer is placed at the
+                // centre of the default xeyes window (75, 50 in root space).
+                // inject_mouse_event() delivers the event to the focused window
+                // if it has PointerMotionMask in its event_mask.
+                if elapsed >= next_motion_inject {
+                    next_motion_inject = elapsed + 500;
+                    crate::x11::inject_mouse_event(75, 50, 0, 0);
+                }
 
                 if elapsed / 1000 != last_log_tick / 1000 {
                     last_log_tick = elapsed;
@@ -546,10 +577,62 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             loop { unsafe { core::arch::asm!("hlt"); } }
         }
 
+        // ── busybox-test / wget-test CLI demo runner (PIVOT-B, 2026-05-23) ──
+        // Headless: no X11, no compositor, no Xastryx — just spawn
+        // /disk/bin/busybox under various applets and capture stdout.
+        // See kernel/src/busybox_demo.rs for the applet battery.
+        //
+        // Mutually exclusive with the other *-test cargo features (all
+        // share the BSP idle slot).  Cargo feature combinations are
+        // enforced at compile time via the cfg gates above.
+        #[cfg(all(not(feature = "gui-test"),
+                  not(feature = "xeyes-test"),
+                  not(feature = "firefox-test"),
+                  any(feature = "busybox-test", feature = "wget-test")))]
+        {
+            hal::enable_interrupts();
+            if !sched::is_active() {
+                sched::enable();
+            }
+
+            // Let the scheduler stabilise — same brief settle the xeyes /
+            // firefox-test paths use before the first launch_process call.
+            let t0 = arch::x86_64::irq::get_ticks();
+            while arch::x86_64::irq::get_ticks().wrapping_sub(t0) < 30 {
+                core::hint::spin_loop();
+            }
+
+            #[cfg(feature = "busybox-test")]
+            busybox_demo::run_busybox_demo();
+
+            #[cfg(feature = "wget-test")]
+            busybox_demo::run_wget_demo();
+
+            serial_println!("[BBDEMO] DONE");
+
+            // Brief pause then exit QEMU via the isa-debug-exit port,
+            // mirroring the xeyes-test / firefox-test exit shape.
+            let t_done = arch::x86_64::irq::get_ticks();
+            while arch::x86_64::irq::get_ticks().wrapping_sub(t_done) < 100 {
+                core::hint::spin_loop();
+            }
+            unsafe {
+                core::arch::asm!(
+                    "out dx, eax",
+                    in("dx")  0xf4_u16,
+                    in("eax") 0_u32,
+                    options(nomem, nostack)
+                );
+            }
+            loop { unsafe { core::arch::asm!("hlt"); } }
+        }
+
         // ── X11 visual test: create a colored window and hold it on screen ──
         // Activated by firefox-test mode — shows an X11 window before Firefox.
         #[cfg(all(not(feature = "gui-test"),
                   not(feature = "xeyes-test"),
+                  not(feature = "busybox-test"),
+                  not(feature = "wget-test"),
                   feature = "firefox-test"))]
         {
             serial_println!("[FFTEST] Firefox-test mode starting...");
@@ -803,12 +886,12 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 crate::net::poll();
                 crate::x11::poll();
                 crate::gui::terminal::poll_output();
-                // Only compose every 3rd tick to reduce MMIO overhead.
-                // Input pump runs every tick for responsiveness.
-                let now_t = arch::x86_64::irq::get_ticks();
-                if now_t % 3 == 0 {
-                    gui::compositor::compose();
-                }
+                // Drive the compositor via the ISR-set tick flag (≈50 Hz).
+                // The timer ISR sets COMPOSITOR_TICK_DUE every 2 published
+                // ticks; tick_and_compose() atomically drains it and renders
+                // a frame.  Replaces the unreliable `ticks % 3` check (see
+                // gui/compositor.rs for rationale).
+                gui::compositor::tick_and_compose();
 
                 let now = arch::x86_64::irq::get_ticks();
                 let elapsed = now.wrapping_sub(t_launch);
@@ -910,7 +993,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         }
 
         // ── Normal boot: launch userspace + interactive shell ──────────────
-        #[cfg(not(any(feature = "gui-test", feature = "firefox-test", feature = "xeyes-test")))]
+        #[cfg(not(any(feature = "gui-test", feature = "firefox-test", feature = "xeyes-test", feature = "busybox-test", feature = "wget-test")))]
         {
         // Phase 13: Launch Ascension (init) and Orbit (shell) as Ring 3 processes
         serial_println!("[Aether] Phase 13: Launching userspace processes...");
@@ -970,7 +1053,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         // Drop to the kernel shell for interactive debugging/management.
         // Ascension will eventually replace this with a full user-mode init.
         shell::launch()
-        } // end #[cfg(not(any(feature = "gui-test", feature = "firefox-test", feature = "xeyes-test")))]
+        } // end #[cfg(not(any(feature = "gui-test", feature = "firefox-test", feature = "xeyes-test", feature = "busybox-test", feature = "wget-test")))]
     }
 }
 
