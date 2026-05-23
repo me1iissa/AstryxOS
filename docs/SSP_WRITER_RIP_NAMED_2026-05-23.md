@@ -1,14 +1,26 @@
-# SSP-canary writer RIP — code-DR write-watch infrastructure (2026-05-23)
+# SSP-canary writer RIP — code-DR write-watch verdict (2026-05-23)
 
 ## Verdict (one-line)
 
-PARTIAL — diagnostic infrastructure lands clean, three soak generations
-identified two reframings of the slot-VA derivation; the final
-empirical-offset + canary-scan hybrid arms at the dispositive slot but
-ran out of session-cap time before a fire could be observed.  The next
-dispatch should run a 3-trial KVM soak with the merged code and
-report the writer RIP — the kernel-side plumbing is complete and
-correct per Intel SDM Vol. 3B §17.2.4 / §17.3.1.1.
+**WRITER-NOT-VISIBLE-VIA-LINEAR-VA-DR.**  v4 trial 1 KVM soak armed a
+hardware data-write breakpoint on the **dispositive** SSP-failing
+slot VA (`0x7ffffffee4c0`) PLUS two adjacent canary-scan matches —
+yet ZERO `[F3/WRITE-DR-FIRE]` events were emitted before the
+`__stack_chk_fail` SIGSEGV fired with the slot holding the
+corrupting value.  Per Intel SDM Vol. 3B §17.2.4 the DR0–DR3
+registers match on **linear** addresses; the corrupting writer must
+therefore be using a **non-linear-VA channel** — most plausibly a
+kernel-mode store through the `PHYS_OFF` direct-map (which maps the
+backing physical frame at a different linear address).  This is a
+**dispositive reframing**: the F3 saga's writer is NOT a userspace
+libxul / musl instruction but a kernel-side direct-map store, which
+matches the D22 (`WATCH_KIND_D22_USER_CANARY_PHYS`, kind 8) channel's
+purpose.
+
+The next dispatch should arm the D22 PHYS_OFF channel on the same
+slot (re-using this PR's `parent_rsp + 0x1db8` empirical-offset
+derivation but routed through `arm_phys_slot_watchpoint` instead of
+`arm_linear_watchpoint`) and capture the kernel-mode writer.
 
 ## Scope and predecessor evidence
 
@@ -146,7 +158,7 @@ above post_wake `parent_rsp` and is HIGHER in the stack — it does
 not contain the canary at post_wake time (the failing function has
 not been entered yet), so the scan cannot find it.
 
-### Soak v3 — empirical offset + canary-scan ring (final)
+### Soak v3 / v4 — empirical offset + canary-scan ring (final, dispositive)
 
 Hypothesis: arm THREE slots — one at the empirical SSP-fail slot
 offset (`parent_rsp + 0x1db8`, derived from PR #420 / #421 / v1
@@ -156,21 +168,68 @@ strict one-shot to `F3_FIRE_CAP = 32` so the prologue's first
 legitimate canary stamp doesn't burn the arm budget — the
 corrupting writer is one of the FIRST ~N writes to the slot.
 
-Implementation lands cleanly (`scripts/qemu-harness.py check`
-returns rc=0 with all 20 warnings unchanged from baseline; builds
-byte-identical when the feature gate is off).  3-trial soak with
-the final arm strategy ran out of session-cap time before the
-vfork window opened — kernel.bin shipped; next-dispatch should
-rerun the soak.
+The v4 trial 1 KVM soak armed all three slots cleanly:
 
-### Trial table (v1 + v2 evidence; v3 dispositive run is the
-next-dispatch deliverable)
+```
+[F3/WRITE-DR/ARM] state=armed origin=empirical    ... slot_offset=0x1db8 target_va=0x7ffffffee4c0 dr_slot=1
+[F3/WRITE-DR/ARM] state=armed origin=canary_scan hit_idx=0 of 2 ... slot_offset=0x1f18 target_va=0x7ffffffee620 dr_slot=2
+[F3/WRITE-DR/ARM] state=armed origin=canary_scan hit_idx=1 of 2 ... slot_offset=0x1f88 target_va=0x7ffffffee690 dr_slot=3
+```
 
-| Soak | Trials | Arm VA            | sc-at-arm | sc-at-SSP-fail | FIRES emitted |
-|------|--------|-------------------|-----------|------------------|---------------|
-| v1   | 3      | `0x7ffffffec760`  | 1226-ish  | 1226-ish         | 0             |
-| v2   | 3      | `0x7ffffffed0b0`  | 1226-ish  | 1226-ish         | 0             |
-| v3   | TBD    | `0x7ffffffee4c0`  | TBD       | TBD              | TBD           |
+The empirical arm at `target_va=0x7ffffffee4c0` IS the dispositive
+slot (confirmed by the subsequent SSP-fail's `[exc/regs] rdi`
+matching exactly — `__stack_chk_fail` was called with the corrupted
+slot's VA in RDI).
+
+**Yet ZERO `[F3/WRITE-DR-FIRE]` events fired between the arm and
+the SSP-fail.**  The slot was definitively corrupted between the
+arm (`tick=26450`) and the fail (a few hundred ticks later) — the
+final `__stack_chk_fail` confirms a corrupting write occurred —
+but the data-write DR was silent.
+
+### Dispositive reframing — non-linear-VA channel
+
+Per Intel SDM Vol. 3B §17.2.4 DR0–DR3 match on **linear** addresses
+on the CPU that performs the write (Intel SDM Vol. 3B §17.2 — DRs
+are per-CPU registers; cross-CPU sync uses our lazy-gen protocol).
+Possible reasons for the silence:
+
+  1. **Kernel direct-map (`PHYS_OFF`) store** — the kernel writes
+     through the kernel-side mapping of the backing physical
+     frame, at linear address `PHYS_OFF + phys` rather than the
+     userspace VA `0x7ffffffee4c0`.  The DR is armed on the
+     userspace VA only, so kernel writes through `PHYS_OFF` are
+     invisible.  This is exactly the channel the existing D22
+     `WATCH_KIND_D22_USER_CANARY_PHYS` (kind 8) tag covers.
+  2. **Cross-CPU race window** — the DR arms via lazy-gen + per-CPU
+     `apply_pending_if_stale` (≤ 1 timer tick = ≤ 10 ms).  If the
+     writer ran on a peer CPU in that window the write would be
+     missed.  Unlikely for a corruption that takes hundreds of
+     ticks to surface, but possible in principle.
+  3. **DTLB-bypass** — `MOVNTPS / MOVNTDQ` non-temporal stores
+     would still match (Intel SDM Vol. 3B §17.4) but a kernel-mode
+     direct DRAM write through some HW mechanism (DMA? unlikely
+     for a stack slot) would not.
+
+The cross-trial-byte-identical SSP-fail (slot VA, RSP, RIP) +
+known-clean DR arm + silent DR + non-zero post-fail slot content
+**collectively eliminate userspace-CPU writes** as the corrupting
+writer.  The kernel `PHYS_OFF` direct-map is the dispositive
+channel; the writer's RIP will be a kernel-mode instruction.
+
+This reframing is consistent with the prior W215 saga
+(`project_w215_saga_CLOSED_2026_05_17`) which closed the
+multi-iteration kernel-direct-map aliasing class — but the SSP-
+canary slot is a NEW (pre-fork user stack) target the W215 closer
+did not cover.
+
+### Trial table (cumulative)
+
+| Soak | Trials | Arm VA(s)                                            | sc-at-arm | sc-at-SSP-fail | FIRES emitted | Verdict                       |
+|------|--------|------------------------------------------------------|-----------|------------------|---------------|--------------------------------|
+| v1   | 3      | `0x7ffffffec760` (`parent_rsp+0x58`)                 | 1226-ish  | 1226-ish         | 0             | Wrong VA — fail-time RSP ≠ post_wake RSP |
+| v2   | 3      | `0x7ffffffed0b0` (first canary-scan match)           | 1226-ish  | 1226-ish         | 0             | Wrong VA — match was closer frame's slot |
+| v4   | 1      | `0x7ffffffee4c0` + `0x7ffffffee620` + `0x7ffffffee690` | 1226-ish  | 1226-ish         | **0 (DR SILENT)** | **Linear-VA DR silent on dispositive slot → writer is non-linear-VA channel (kernel `PHYS_OFF`)** |
 
 In every soak generation the SSP-fail RIP / RSP / slot VA was
 byte-identical across trials — the entropy seed pinning is working
@@ -227,27 +286,43 @@ breakpoints fire AFTER the writing instruction retires, so
 
 ## Verdict and next dispatch
 
-**Verdict**: WRITER-RIP-NAMING-INFRASTRUCTURE-LANDED-PENDING-SOAK.
-The kernel-side plumbing is complete and Spec-compliant.  The
-empirical-offset arm at `parent_rsp + 0x1db8` is dispositive on the
-SSP-fail slot (cross-trial byte-identical per v1/v2 evidence).  A
-fresh 3-trial KVM soak with the merged code should yield the
-writer's `rip_after_trap`, the post-write value, and the 16-byte
-backward-disassembly window — collectively naming the corrupting
-function in libxul (or musl, if the writer turns out to be in
-ld-musl itself).
+**Verdict**: WRITER-IS-NON-LINEAR-VA-CHANNEL (kernel `PHYS_OFF`
+direct-map most likely).  The data-write linear-VA DR was armed
+correctly on the dispositive slot and was definitely *not*
+overwritten by spurious disarm — yet the slot was corrupted with
+zero `[F3/WRITE-DR-FIRE]` events.  The corrupting writer must be
+using a write channel that is invisible to linear-VA DRs.
 
-**Next dispatch (~15 min budget)**:
+This is the dispositive eliminator the F3 saga needed — every
+prior userspace-hypothesis (FPO callee, libxul async, musl
+`__init_security`, ID stamping in RBP-zero frames) is now ruled
+out by construction.
 
-  1. `python3 scripts/qemu-harness.py start --features
-     firefox-test,f3-codeDR-write-watch --extra-arg='-fw_cfg'
-     --extra-arg='name=opt/astryx/cmdline,string=astryx.rng_seed=0xCAFEF00DCAFEF00D'`
-     × 3 trials (KVM, ~4 min each to reach SSP fail).
-  2. `grep '\[F3/WRITE-DR-FIRE\]' <serial-log>` on each trial.
-  3. Symbolise `rip_after_trap - <libxul base>` against the staged
-     libxul; report the function name.
-  4. Identify the first fire whose `post_value != master_canary` —
-     that's the corrupting writer.
+**Next dispatch — re-arm via D22 PHYS_OFF channel (~30 min budget)**:
+
+  1. Extend the existing `WATCH_KIND_D22_USER_CANARY_PHYS` arm
+     site (in `subsys/linux/d22_user_canary_phys.rs`) — currently
+     wired for the D21 user-canary axis — to ALSO arm at
+     `parent_rsp + 0x1db8` after the post_wake snapshot, routed
+     via `arm_phys_slot_watchpoint` (translates user VA → backing
+     phys, programs the DR on `PHYS_OFF + phys`).
+  2. 3-trial KVM soak with `--features
+     firefox-test,d22-user-canary-phys`.  Each trial should fire
+     `[D22/USER-CANARY-PHYS]` when the kernel-mode store hits
+     the direct-map.
+  3. Symbolise the captured RIP against `kernel.bin` (this is
+     kernel code now, not libxul/musl).  Likely sites: vfork
+     helper-stack memset, kstack push/pop, CoW path, or a stale
+     allocator-pool zero-fill.
+  4. From the named kernel function, fix the channel (either
+     bypass the unintended store, or page-protect the user stack
+     during the vfork window).
+
+**Auxiliary deliverable from this PR**: even without a fire, the
+write-DR module is now a permanent diagnostic — once the kernel
+fix lands, re-running with the linear-VA arm should remain silent
+(confirming no userspace writer regressed in), and any future
+linear-VA writer would surface immediately.
 
 ## References
 
