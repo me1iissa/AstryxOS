@@ -54,6 +54,15 @@ XEYES="${ASTRYXOS_XEYES:-0}"
 # See scripts/install-busybox-cli.sh.
 BUSYBOX_CLI="${ASTRYXOS_BUSYBOX:-0}"
 
+# When set (env or --sshd flag), also stage Alpine's dropbear SSH daemon
+# + host keys + /etc/passwd / /etc/shadow / /etc/group / /etc/shells +
+# /root/.ssh/authorized_keys into build/disk/.  Used by the sshd-test
+# cargo feature (kernel/src/main.rs) and validated end-to-end once
+# AF_INET accept(2) lands (currently stubbed; tracked separately).
+# Independent of Firefox staging; opt-in to keep default builds lean.
+# See scripts/install-sshd.sh.
+SSHD="${ASTRYXOS_SSHD:-0}"
+
 # Firefox package selector (musl variant only).  Picks which Alpine package
 # install-firefox-musl.sh + install-firefox-musl-debug.sh pull:
 #
@@ -116,6 +125,7 @@ for arg in "$@"; do
         --firefox-package=*) FIREFOX_PACKAGE="${arg#--firefox-package=}" ;;
         --xeyes) XEYES=1; FORCE=true ;;
         --busybox) BUSYBOX_CLI=1; FORCE=true ;;
+        --sshd) SSHD=1; FORCE=true ;;
         [0-9]*) SIZE_MB="$arg" ;;
     esac
 done
@@ -473,6 +483,36 @@ if [ "${BUSYBOX_CLI}" = "1" ] || [ "${BUSYBOX_CLI}" = "true" ]; then
     fi
 fi
 
+# ── Optional: stage dropbear SSH daemon + host keys + accounts ──────────────
+# Triggered by ASTRYXOS_SSHD=1 or --sshd.  Stages /usr/sbin/dropbear (~260 KB),
+# /etc/dropbear/ host keys (Ed25519 + RSA), /etc/passwd / /etc/shadow /
+# /etc/group / /etc/shells with a root account locked to public-key auth,
+# and /root/.ssh/authorized_keys with the host-side test client key.  See
+# scripts/install-sshd.sh.  Implies --busybox (dropbear's login shell is
+# /bin/sh, provided by busybox).
+if [ "${SSHD}" = "1" ] || [ "${SSHD}" = "true" ]; then
+    if [ "${BUSYBOX_CLI}" != "1" ] && [ "${BUSYBOX_CLI}" != "true" ]; then
+        # Auto-enable busybox staging when --sshd was the only flag.  We do
+        # NOT propagate --force here: dropbear's login shell only needs
+        # /bin/busybox to exist; refreshing busybox-static is tangential
+        # and would re-trigger apk's "1 errors updating directory
+        # permissions" warning (apk exit=7 on rootfs that lacks /var/cache
+        # writability), which would mask the sshd staging that succeeded.
+        echo "[DATA-DISK] NOTE: --sshd implies --busybox (login shell /bin/sh) — auto-enabling (no --force)."
+        BUSYBOX_CLI=1
+        if [ -f "${ROOT_DIR}/scripts/install-busybox-cli.sh" ]; then
+            bash "${ROOT_DIR}/scripts/install-busybox-cli.sh" 2>&1 | sed 's/^/[DATA-DISK] /' || \
+                { echo "[DATA-DISK] FATAL: install-busybox-cli.sh failed (see lines above)"; exit 1; }
+        fi
+    fi
+    if [ -f "${ROOT_DIR}/scripts/install-sshd.sh" ]; then
+        SSHD_FLAGS=""
+        [ "${FORCE}" = true ] && SSHD_FLAGS="--force"
+        bash "${ROOT_DIR}/scripts/install-sshd.sh" ${SSHD_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
+            { echo "[DATA-DISK] FATAL: install-sshd.sh failed"; exit 1; }
+    fi
+fi
+
 # ── Compile glibc_hello oracle binary if source present ──────────────────────
 GLIBC_HELLO_SRC="${ROOT_DIR}/userspace/glibc_hello.c"
 GLIBC_HELLO_BIN="${BUILD_DIR}/glibc_hello"
@@ -817,6 +857,92 @@ EOF
         mmd -i "${DATA_IMG}" "::usr/bin"  2>/dev/null || true
         mcopy -o -i "${DATA_IMG}" "${XEYES_STAGED}" "::usr/bin/xeyes"
         echo "[DATA-DISK] Copied /usr/bin/xeyes ($(stat -c%s "${XEYES_STAGED}") bytes)"
+    fi
+
+    # ── dropbear SSH daemon + config + host keys (opt-in via --sshd) ────────
+    # Per scripts/install-sshd.sh: dropbear lives at /usr/sbin/dropbear,
+    # host keys at /etc/dropbear/, authorized_keys at /root/.ssh/.  The
+    # /etc/passwd, /etc/shadow, /etc/group, /etc/shells seed files written
+    # by install-sshd.sh OVERWRITE the minimum-NSS seeds written earlier
+    # in this script (root + demo accounts with /bin/sh login shell).
+    #
+    # NOTE on musl runtime libs: dropbear is musl-linked and needs
+    # /lib/ld-musl-x86_64.so.1, /lib/libc.musl-x86_64.so.1, and
+    # /lib/libz.so.1 at runtime.  When FIREFOX_VARIANT=musl the
+    # earlier ::lib/ copy block already packs these.  Under the
+    # default FIREFOX_VARIANT=glibc, that block is skipped, so we
+    # explicitly pack the three SSH-runtime libs here.  See
+    # install-sshd.sh which double-stages NEEDED entries to BOTH
+    # /disk/lib/ and /disk/usr/lib/ to make this copy unconditional.
+    DROPBEAR_STAGED="${BUILD_DIR}/disk/usr/sbin/dropbear"
+    if [ -f "${DROPBEAR_STAGED}" ]; then
+        # Independent musl runtime lib pack (idempotent — no-op if FF musl
+        # variant already packed them via the FIREFOX_VARIANT=musl branch).
+        mmd -i "${DATA_IMG}" "::lib"     2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/lib" 2>/dev/null || true
+        for lib in ld-musl-x86_64.so.1 libc.musl-x86_64.so.1 libz.so.1; do
+            src_lib="${BUILD_DIR}/disk/lib/${lib}"
+            if [ -f "${src_lib}" ]; then
+                # Pack to both /lib (musl native path) and /usr/lib (fallback).
+                mcopy -o -i "${DATA_IMG}" "${src_lib}" "::lib/${lib}" 2>/dev/null || true
+                mcopy -o -i "${DATA_IMG}" "${src_lib}" "::usr/lib/${lib}" 2>/dev/null || true
+                echo "[DATA-DISK] Copied ${lib} ($(stat -c%s "${src_lib}") bytes) for sshd runtime"
+            fi
+        done
+        mmd -i "${DATA_IMG}" "::usr"      2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/sbin" 2>/dev/null || true
+        mcopy -o -i "${DATA_IMG}" "${DROPBEAR_STAGED}" "::usr/sbin/dropbear"
+        echo "[DATA-DISK] Copied /usr/sbin/dropbear ($(stat -c%s "${DROPBEAR_STAGED}") bytes)"
+
+        # dropbearkey utility (small; useful for guest-side key regen).
+        DROPBEARKEY_STAGED="${BUILD_DIR}/disk/usr/bin/dropbearkey"
+        if [ -f "${DROPBEARKEY_STAGED}" ]; then
+            mmd -i "${DATA_IMG}" "::usr/bin" 2>/dev/null || true
+            mcopy -o -i "${DATA_IMG}" "${DROPBEARKEY_STAGED}" "::usr/bin/dropbearkey"
+            echo "[DATA-DISK] Copied /usr/bin/dropbearkey ($(stat -c%s "${DROPBEARKEY_STAGED}") bytes)"
+        fi
+
+        # /etc/dropbear/ host keys + config.
+        DROPBEAR_ETC="${BUILD_DIR}/disk/etc/dropbear"
+        if [ -d "${DROPBEAR_ETC}" ]; then
+            mmd -i "${DATA_IMG}" "::etc"          2>/dev/null || true
+            mmd -i "${DATA_IMG}" "::etc/dropbear" 2>/dev/null || true
+            for f in "${DROPBEAR_ETC}/"*; do
+                [ -f "${f}" ] || continue
+                mcopy -o -i "${DATA_IMG}" "${f}" "::etc/dropbear/$(basename "${f}")"
+            done
+            echo "[DATA-DISK] Copied /etc/dropbear/ (host keys + dropbear.conf)"
+        fi
+
+        # /root/.ssh/authorized_keys.  FAT32 has no directory permissions
+        # so the 0600 we set on the host side is informational only; the
+        # guest's VFS layer enforces no perms either.  Dropbear's
+        # publickey auth path does not require mode-checking on FAT32
+        # backing (the StrictModes default applies to POSIX hosts).
+        ROOT_SSH="${BUILD_DIR}/disk/root/.ssh"
+        if [ -f "${ROOT_SSH}/authorized_keys" ]; then
+            mmd -i "${DATA_IMG}" "::root"     2>/dev/null || true
+            mmd -i "${DATA_IMG}" "::root/.ssh" 2>/dev/null || true
+            mcopy -o -i "${DATA_IMG}" "${ROOT_SSH}/authorized_keys" "::root/.ssh/authorized_keys"
+            echo "[DATA-DISK] Copied /root/.ssh/authorized_keys"
+        fi
+
+        # Refresh /etc/passwd, /etc/shadow, /etc/group, /etc/shells from
+        # install-sshd.sh's writes (these supersede the minimal NSS seeds
+        # written earlier in this script).  Dropbear's getpwnam_r("root")
+        # path reads /etc/passwd for the home dir + login shell; locked
+        # /etc/shadow ensures password-auth is impossible by construction.
+        for f in passwd shadow group shells; do
+            src="${BUILD_DIR}/disk/etc/${f}"
+            if [ -f "${src}" ]; then
+                mcopy -o -i "${DATA_IMG}" "${src}" "::etc/${f}"
+                echo "[DATA-DISK] Copied /etc/${f} ($(stat -c%s "${src}") bytes)"
+            fi
+        done
+
+        # Pre-create /home/demo so getpwnam-derived chdir doesn't fail.
+        mmd -i "${DATA_IMG}" "::home"      2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::home/demo" 2>/dev/null || true
     fi
 
     # ── /tmp staging: hello.html for Firefox oracle test ─────────────────────

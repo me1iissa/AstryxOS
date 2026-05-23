@@ -1076,6 +1076,7 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
                           gdb_wait: bool = False,
                           kdb_host_port: int = 0,
                           http_host_port: int = 0,
+                          ssh_host_port: int = 0,
                           kvm: Optional[bool] = None,
                           smp: int = 2,
                           cpu_model: Optional[str] = None,
@@ -1094,6 +1095,10 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
         guest 10.0.2.15:8080 for the httpd-test in-kernel HTTP responder.
         Used by --features httpd-test (PIVOT-C, 2026-05-23) so a host
         `curl http://127.0.0.1:<port>/` reaches the kernel HTTP server.
+    ssh_host_port: if > 0, adds a hostfwd rule forwarding host-port to
+        guest 10.0.2.15:22 for the sshd-test userspace dropbear daemon.
+        Used by --features sshd-test (PIVOT-D, 2026-05-23) so a host
+        `ssh -p <port> root@127.0.0.1` reaches the guest dropbear.
     kvm: tri-state. None = autodetect; True = force-enable; False = force-disable
         (matches CI which has no /dev/kvm — useful for reproducing CI hangs locally).
     esp_dir_override: if set, use this ESP directory instead of the in-tree
@@ -1165,6 +1170,11 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
         for i, arg in enumerate(cmd):
             if arg == "-netdev" and i + 1 < len(cmd) and cmd[i + 1].startswith("user,id=net0"):
                 cmd[i + 1] = cmd[i + 1] + f",hostfwd=tcp:127.0.0.1:{http_host_port}-:8080"
+                break
+    if ssh_host_port and ssh_host_port > 0:
+        for i, arg in enumerate(cmd):
+            if arg == "-netdev" and i + 1 < len(cmd) and cmd[i + 1].startswith("user,id=net0"):
+                cmd[i + 1] = cmd[i + 1] + f",hostfwd=tcp:127.0.0.1:{ssh_host_port}-:22"
                 break
 
     proc = subprocess.Popen(
@@ -2472,6 +2482,16 @@ def cmd_start(args):
     if http_host_port == 0 and "httpd-test" in feats:
         http_host_port = 8800 + (int(sid, 16) % 1000)
 
+    # PIVOT-D (2026-05-23): when `sshd-test` is in the feature set the
+    # guest runs dropbear listening on TCP/22; expose a host port via SLIRP
+    # hostfwd so a host-side `ssh -p <port> root@127.0.0.1` reaches it.
+    # Derived deterministically from the sid (range 2200..2299) so reruns
+    # are stable and concurrent sessions almost certainly land on distinct
+    # ports.  Override with --ssh-host-port N.
+    ssh_host_port = int(getattr(args, "ssh_host_port", 0) or 0)
+    if ssh_host_port == 0 and "sshd-test" in feats:
+        ssh_host_port = 2200 + (int(sid, 16) % 100)
+
     # QGA transport (Phase QGA-1): when the kernel was built with the `qga`
     # feature, expose a virtio-serial port + matching host Unix socket so
     # the future userspace daemon (Phase QGA-2) has a path out to the host.
@@ -2867,6 +2887,7 @@ def cmd_start(args):
                                  gdb_port=gdb_port, gdb_wait=gdb_wait,
                                  kdb_host_port=kdb_host_port,
                                  http_host_port=http_host_port,
+                                 ssh_host_port=ssh_host_port,
                                  kvm=kvm_arg,
                                  smp=smp,
                                  cpu_model=cpu_model,
@@ -2887,6 +2908,7 @@ def cmd_start(args):
         "gdb_wait":   gdb_wait,
         "kdb_host_port": kdb_host_port,
         "http_host_port": http_host_port,
+        "ssh_host_port": ssh_host_port,
         "smp":         smp,
         "cpu_model":   cpu_model or "default",
         # W106: capture the resolved CPU model + reason so post-hoc
@@ -2988,6 +3010,7 @@ def cmd_start(args):
     _out({"sid": sid, "pid": proc.pid, "serial_log": serial_log,
           "gdb_port": gdb_port, "kdb_host_port": kdb_host_port,
           "http_host_port": http_host_port,
+          "ssh_host_port": ssh_host_port,
           # W106: structured CPU-model fields. `cpu_model_resolved` is
           # the literal string passed to QEMU `-cpu`; `cpu_model_reason`
           # is one of "override" | "kvm-host" | "tcg-safe".
@@ -9201,6 +9224,14 @@ def main():
                                "`curl http://127.0.0.1:PORT/` reaches the "
                                "in-kernel HTTP responder. 0 = derive "
                                "deterministically from sid in 8800..9799.")
+    p_start.add_argument("--ssh-host-port", dest="ssh_host_port", type=int,
+                          default=0, metavar="PORT",
+                          help="When --features includes 'sshd-test' (PIVOT-D, "
+                               "2026-05-23), forward host TCP PORT to guest "
+                               "10.0.2.15:22 via SLIRP hostfwd so a host "
+                               "`ssh -p PORT root@127.0.0.1` reaches the "
+                               "guest dropbear daemon.  0 = derive "
+                               "deterministically from sid in 2200..2299.")
     p_start.add_argument("--gdb-wait", action="store_true",
                           help="Start QEMU frozen (-S); debugger must 'cont' to unfreeze")
     p_start.add_argument("--no-kvm", dest="no_kvm", action="store_true",
