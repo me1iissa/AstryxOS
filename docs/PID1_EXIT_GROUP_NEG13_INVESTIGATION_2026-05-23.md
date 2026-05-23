@@ -165,17 +165,26 @@ Suspected perturbation candidates (each falsifiable with a small probe):
    slot could be clobbered.  Falsifier: DR-watchpoint on the canary slot
    for PID 1 TID 2 from the moment of vfork wake through the next 32
    syscalls.
-3. **Stack-frame identity loss across vfork's `clone` codegen.**  In the
-   musl source the `clone` wrapper saves a frame pointer; if our `clone`
-   syscall return path skips restoring an alignment-sensitive register,
-   the saved canary may be read from one slot and written to another.
-   Falsifier: dump the user RSP+0..0x80 bytewise at `pre_block.clone` and
-   at the syscall-return that immediately precedes `__stack_chk_fail`,
-   diff.
+3. **Stack-frame identity loss across vfork's `clone` codegen.**  Per the
+   System V AMD64 ABI §3.2.1 frame-pointer convention and the documented
+   `clone(2)` semantics (`man7.org/linux/man-pages/man2/clone.2.html`),
+   the wrapper saves a frame pointer; if our `clone` syscall return path
+   skips restoring an alignment-sensitive register, the saved canary may
+   be read from one slot and written to another.  Falsifier: dump the
+   user RSP+0..0x80 bytewise at `pre_block.clone` and at the syscall-
+   return that immediately precedes `__stack_chk_fail`, diff.
 
 This is the **same shape** as the in-flight `sc=1171` family; the only
 difference is the surface — PID 1 here, PID 2 in the previously-observed
 saga.
+
+**Note on layer disambiguation:** this is a *user-mode* SSP failure
+(CPL=3, `ld-musl __stack_chk_fail`); it is a different layer from the
+PID-2 TID-5 kernel-side `STACK_CANARY_CORRUPT` bugcheck observed in the
+same trace, which fires at CPL=0 inside the kernel-stack canary periodic
+audit.  Two distinct corruption sites, possibly related kernel-side
+cause; investigated independently by the parallel Wave 9 DR-watchpoint
+dispatch on the kernel canary.
 
 ## Recommendation
 
