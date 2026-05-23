@@ -57,11 +57,20 @@ BUSYBOX_CLI="${ASTRYXOS_BUSYBOX:-0}"
 # When set (env or --sshd flag), also stage Alpine's dropbear SSH daemon
 # + host keys + /etc/passwd / /etc/shadow / /etc/group / /etc/shells +
 # /root/.ssh/authorized_keys into build/disk/.  Used by the sshd-test
-# cargo feature (kernel/src/main.rs) and validated end-to-end once
-# AF_INET accept(2) lands (currently stubbed; tracked separately).
-# Independent of Firefox staging; opt-in to keep default builds lean.
+# cargo feature (kernel/src/main.rs).  Independent of Firefox staging;
+# opt-in to keep default builds lean.
 # See scripts/install-sshd.sh.
 SSHD="${ASTRYXOS_SSHD:-0}"
+
+# When set (env or --tls flag), also stage Alpine's OpenSSL 3.x userspace
+# (libssl, libcrypto, /usr/bin/openssl, ossl-modules/legacy.so) plus the
+# Mozilla CA bundle at every conventional path (/etc/ssl/cert.pem,
+# /etc/ssl/certs/ca-certificates.crt, /etc/pki/tls/certs/ca-bundle.crt).
+# Used by the tls-test cargo feature (kernel/src/main.rs) and by any
+# guest-side binary that DT_NEEDED libssl/libcrypto.  Independent of the
+# other -test variants; opt-in to keep default builds lean.
+# See scripts/install-tls-stack.sh.
+TLS_STACK="${ASTRYXOS_TLS:-0}"
 
 # Firefox package selector (musl variant only).  Picks which Alpine package
 # install-firefox-musl.sh + install-firefox-musl-debug.sh pull:
@@ -126,6 +135,7 @@ for arg in "$@"; do
         --xeyes) XEYES=1; FORCE=true ;;
         --busybox) BUSYBOX_CLI=1; FORCE=true ;;
         --sshd) SSHD=1; FORCE=true ;;
+        --tls) TLS_STACK=1; FORCE=true ;;
         [0-9]*) SIZE_MB="$arg" ;;
     esac
 done
@@ -484,20 +494,8 @@ if [ "${BUSYBOX_CLI}" = "1" ] || [ "${BUSYBOX_CLI}" = "true" ]; then
 fi
 
 # ── Optional: stage dropbear SSH daemon + host keys + accounts ──────────────
-# Triggered by ASTRYXOS_SSHD=1 or --sshd.  Stages /usr/sbin/dropbear (~260 KB),
-# /etc/dropbear/ host keys (Ed25519 + RSA), /etc/passwd / /etc/shadow /
-# /etc/group / /etc/shells with a root account locked to public-key auth,
-# and /root/.ssh/authorized_keys with the host-side test client key.  See
-# scripts/install-sshd.sh.  Implies --busybox (dropbear's login shell is
-# /bin/sh, provided by busybox).
 if [ "${SSHD}" = "1" ] || [ "${SSHD}" = "true" ]; then
     if [ "${BUSYBOX_CLI}" != "1" ] && [ "${BUSYBOX_CLI}" != "true" ]; then
-        # Auto-enable busybox staging when --sshd was the only flag.  We do
-        # NOT propagate --force here: dropbear's login shell only needs
-        # /bin/busybox to exist; refreshing busybox-static is tangential
-        # and would re-trigger apk's "1 errors updating directory
-        # permissions" warning (apk exit=7 on rootfs that lacks /var/cache
-        # writability), which would mask the sshd staging that succeeded.
         echo "[DATA-DISK] NOTE: --sshd implies --busybox (login shell /bin/sh) — auto-enabling (no --force)."
         BUSYBOX_CLI=1
         if [ -f "${ROOT_DIR}/scripts/install-busybox-cli.sh" ]; then
@@ -510,6 +508,16 @@ if [ "${SSHD}" = "1" ] || [ "${SSHD}" = "true" ]; then
         [ "${FORCE}" = true ] && SSHD_FLAGS="--force"
         bash "${ROOT_DIR}/scripts/install-sshd.sh" ${SSHD_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
             { echo "[DATA-DISK] FATAL: install-sshd.sh failed"; exit 1; }
+    fi
+fi
+
+# ── Optional: stage Alpine OpenSSL 3.x + Mozilla CA bundle (TLS userspace) ─
+if [ "${TLS_STACK}" = "1" ] || [ "${TLS_STACK}" = "true" ]; then
+    if [ -f "${ROOT_DIR}/scripts/install-tls-stack.sh" ]; then
+        TLS_FLAGS=""
+        [ "${FORCE}" = true ] && TLS_FLAGS="--force"
+        bash "${ROOT_DIR}/scripts/install-tls-stack.sh" ${TLS_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
+            { echo "[DATA-DISK] FATAL: install-tls-stack.sh failed"; exit 1; }
     fi
 fi
 
@@ -987,6 +995,90 @@ EOF
         done
         echo "[DATA-DISK] Copied TCC headers to /lib/tcc/include/"
     fi
+
+    # ── TLS userspace: OpenSSL + ca-certificates (--tls / ASTRYXOS_TLS=1) ───
+    # install-tls-stack.sh has already populated:
+    #   build/disk/usr/lib/libssl.so.3
+    #   build/disk/usr/lib/libcrypto.so.3
+    #   build/disk/usr/lib/ossl-modules/legacy.so
+    #   build/disk/usr/bin/openssl
+    #   build/disk/usr/bin/ssl_client
+    #   build/disk/etc/ssl/cert.pem
+    #   build/disk/etc/ssl/certs/ca-certificates.crt
+    #   build/disk/etc/ssl/openssl.cnf
+    #   build/disk/etc/pki/tls/certs/ca-bundle.crt
+    # The libs are already swept by the generic /usr/lib/ copy above (musl
+    # variant) or by the host-GTK loop; here we mirror the binaries + cert
+    # bundle into the FAT32 image at their canonical paths so any guest TLS
+    # client (busybox wget https://, openssl s_client) resolves correctly.
+    if [ -f "${BUILD_DIR}/disk/usr/bin/openssl" ]; then
+        mmd -i "${DATA_IMG}" "::usr"     2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/bin" 2>/dev/null || true
+        mcopy -o -i "${DATA_IMG}" "${BUILD_DIR}/disk/usr/bin/openssl" \
+            "::usr/bin/openssl"
+        echo "[DATA-DISK] Copied /usr/bin/openssl ($(stat -c%s "${BUILD_DIR}/disk/usr/bin/openssl") bytes)"
+    fi
+    if [ -f "${BUILD_DIR}/disk/usr/bin/ssl_client" ]; then
+        mmd -i "${DATA_IMG}" "::usr"     2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/bin" 2>/dev/null || true
+        mcopy -o -i "${DATA_IMG}" "${BUILD_DIR}/disk/usr/bin/ssl_client" \
+            "::usr/bin/ssl_client"
+        echo "[DATA-DISK] Copied /usr/bin/ssl_client ($(stat -c%s "${BUILD_DIR}/disk/usr/bin/ssl_client") bytes)"
+    fi
+    # ossl-modules/legacy.so — OpenSSL 3 provider for legacy ciphers.
+    if [ -f "${BUILD_DIR}/disk/usr/lib/ossl-modules/legacy.so" ]; then
+        mmd -i "${DATA_IMG}" "::usr"                  2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/lib"              2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/lib/ossl-modules" 2>/dev/null || true
+        mcopy -o -i "${DATA_IMG}" \
+            "${BUILD_DIR}/disk/usr/lib/ossl-modules/legacy.so" \
+            "::usr/lib/ossl-modules/legacy.so"
+        echo "[DATA-DISK] Copied /usr/lib/ossl-modules/legacy.so"
+    fi
+    # CA bundle materialised at all three conventional paths (Alpine,
+    # Debian/Ubuntu, RHEL).  FAT32 lacks symlinks; cp -L in
+    # install-tls-stack.sh dereferenced the Alpine /etc/ssl/cert.pem ->
+    # certs/ca-certificates.crt link into a real file at each target.
+    if [ -f "${BUILD_DIR}/disk/etc/ssl/cert.pem" ]; then
+        mmd -i "${DATA_IMG}" "::etc/ssl"       2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::etc/ssl/certs" 2>/dev/null || true
+        mcopy -o -i "${DATA_IMG}" \
+            "${BUILD_DIR}/disk/etc/ssl/cert.pem" "::etc/ssl/cert.pem"
+        echo "[DATA-DISK] Copied /etc/ssl/cert.pem (Alpine/LibreSSL CA bundle)"
+    fi
+    if [ -f "${BUILD_DIR}/disk/etc/ssl/certs/ca-certificates.crt" ]; then
+        mmd -i "${DATA_IMG}" "::etc/ssl/certs" 2>/dev/null || true
+        mcopy -o -i "${DATA_IMG}" \
+            "${BUILD_DIR}/disk/etc/ssl/certs/ca-certificates.crt" \
+            "::etc/ssl/certs/ca-certificates.crt"
+        echo "[DATA-DISK] Copied /etc/ssl/certs/ca-certificates.crt (Debian/Ubuntu)"
+    fi
+    if [ -f "${BUILD_DIR}/disk/etc/pki/tls/certs/ca-bundle.crt" ]; then
+        mmd -i "${DATA_IMG}" "::etc/pki"            2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::etc/pki/tls"        2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::etc/pki/tls/certs"  2>/dev/null || true
+        mcopy -o -i "${DATA_IMG}" \
+            "${BUILD_DIR}/disk/etc/pki/tls/certs/ca-bundle.crt" \
+            "::etc/pki/tls/certs/ca-bundle.crt"
+        echo "[DATA-DISK] Copied /etc/pki/tls/certs/ca-bundle.crt (RHEL)"
+    fi
+    if [ -f "${BUILD_DIR}/disk/etc/ssl/openssl.cnf" ]; then
+        mcopy -o -i "${DATA_IMG}" \
+            "${BUILD_DIR}/disk/etc/ssl/openssl.cnf" "::etc/ssl/openssl.cnf"
+        echo "[DATA-DISK] Copied /etc/ssl/openssl.cnf"
+    fi
+    # libssl/libcrypto themselves: copied above by the /usr/lib sweep for
+    # the musl variant; for non-musl test runs (e.g. tls-test without
+    # firefox), copy them explicitly here.
+    for sslib in libssl.so.3 libcrypto.so.3; do
+        if [ -f "${BUILD_DIR}/disk/usr/lib/${sslib}" ]; then
+            mmd -i "${DATA_IMG}" "::usr"     2>/dev/null || true
+            mmd -i "${DATA_IMG}" "::usr/lib" 2>/dev/null || true
+            mcopy -o -i "${DATA_IMG}" \
+                "${BUILD_DIR}/disk/usr/lib/${sslib}" "::usr/lib/${sslib}"
+            echo "[DATA-DISK] Copied /usr/lib/${sslib} ($(stat -c%s "${BUILD_DIR}/disk/usr/lib/${sslib}") bytes)"
+        fi
+    done
 
     # ── BusyBox binary + applet wrapper scripts (built by build-busybox.sh) ─
     # Ships a single static musl binary at /bin/busybox plus a curated set of

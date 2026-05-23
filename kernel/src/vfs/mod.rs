@@ -379,6 +379,31 @@ pub fn init() {
     // (hostname, motd, nsswitch.conf, hosts, resolv.conf, etc.) below.
     let _ = symlink("/bin",   "/disk/bin");
 
+    // /etc/ssl and /etc/pki/tls/certs — symlinked into the data disk so
+    // upstream TLS clients (openssl, ssl_client, busybox wget --https,
+    // anything DT_NEEDED libssl) find the Mozilla CA bundle at every
+    // conventional path without the kernel having to embed ~220 KiB of
+    // PEM into tmpfs.  Staged by scripts/install-tls-stack.sh +
+    // create-data-disk.sh --tls.  The targets may be absent on builds
+    // that did not stage the TLS pack; symlink creation is best-effort.
+    //
+    // Paths covered:
+    //   /etc/ssl/cert.pem                    (Alpine / LibreSSL default)
+    //   /etc/ssl/certs/ca-certificates.crt   (Debian / Ubuntu)
+    //   /etc/ssl/openssl.cnf                 (OpenSSL CLI config)
+    //   /etc/pki/tls/certs/ca-bundle.crt     (RHEL / Fedora)
+    //
+    // Per FHS 3.0 (https://refspecs.linuxfoundation.org/FHS_3.0/) and
+    // ca-certificates(7), these are the documented locations userland
+    // expects.  We make /etc/ssl and /etc/pki point at /disk/ subtrees;
+    // the parent /etc tmpfs entries above (hostname, hosts, ...) are
+    // unaffected because the kernel symlink walker matches the longest
+    // mount-point prefix.
+    let _ = mkdir("/etc/pki");
+    let _ = mkdir("/etc/pki/tls");
+    let _ = symlink("/etc/ssl",            "/disk/etc/ssl");
+    let _ = symlink("/etc/pki/tls/certs",  "/disk/etc/pki/tls/certs");
+
     // Create /dev/null and /dev/console.
     let _ = create_file("/dev/null");
     let _ = create_file("/dev/zero");
@@ -458,8 +483,20 @@ pub fn init() {
 
     // /etc/hosts — minimal hostname map (required by musl resolver)
     if let Ok(()) = create_file("/etc/hosts") {
+        // Local + SLIRP gateway aliases.  10.0.2.2 is the conventional
+        // QEMU SLIRP host loopback alias
+        // (https://www.qemu.org/docs/master/system/devices/net.html);
+        // `gateway` lets tls-test / wget-test / busybox-test refer to
+        // the host responder by name and avoids the musl getaddrinfo
+        // DNS-fallthrough path that some libc versions take even for
+        // literal IPv4 strings.
+        //
+        // NB: bytes literal must NOT use \\ line continuations — those
+        // would preserve the leading indentation as part of the line
+        // body and musl's /etc/hosts parser silently rejects lines with
+        // leading whitespace.
         let _ = write_file("/etc/hosts",
-            b"127.0.0.1 localhost\n::1 localhost\n127.0.0.1 astryx\n");
+            b"127.0.0.1 localhost\n::1 localhost\n127.0.0.1 astryx\n10.0.2.2 gateway host\n");
     }
 
     // /etc/host.conf — resolver order configuration
@@ -467,9 +504,19 @@ pub fn init() {
         let _ = write_file("/etc/host.conf", b"order files,bind\n");
     }
 
-    // /etc/resolv.conf — no nameservers; hosts: files means DNS is not used
+    // /etc/resolv.conf — point at the QEMU SLIRP DNS gateway (10.0.2.3)
+    // by default.  This is the conventional SLIRP-internal DNS proxy
+    // (https://www.qemu.org/docs/master/system/devices/net.html) and is
+    // reachable from any guest on the default user-mode network.  When
+    // SLIRP is not in use the address is unreachable; clients fall back
+    // to the `hosts: files` rule above, which suffices for /etc/hosts
+    // mappings and literal-IP connect attempts.  Without a nameserver
+    // entry, some userspace getaddrinfo implementations (musl's
+    // included) refuse to look up even literal IPs, returning
+    // EAI_AGAIN — see the I1a tls-test investigation 2026-05-23.
     if let Ok(()) = create_file("/etc/resolv.conf") {
-        let _ = write_file("/etc/resolv.conf", b"# no nameservers\n");
+        let _ = write_file("/etc/resolv.conf",
+            b"nameserver 10.0.2.3\n");
     }
 
     // /etc/os-release — systemd-style distro identifier
