@@ -459,6 +459,19 @@ extern "C" fn timer_tick() {
     };
     crate::perf::record_interrupt(32); // IRQ0 = vector 32
 
+    // ── Record/replay: virtual tick advance on the publishing CPU ───
+    // Only the CPU that actually CAS'd a new TICK_COUNT advances the
+    // virtual counter — under SMP every other CPU's LAPIC ISR fires
+    // too but loses the race, so this stays one increment per real
+    // wall-clock tick rather than (cpus * ticks).  See
+    // `crate::record_replay` for the deterministic-time contract.
+    #[cfg(feature = "record-replay")]
+    {
+        if we_published {
+            crate::record_replay::advance_virtual_ticks();
+        }
+    }
+
     // ── Heartbeat: emit every 500 ticks (~5s at 100 Hz) ─────────────
     // Gives the external watchdog (tools/qemu-watchdog.py) a signal that
     // the timer ISR is still firing.  Zero cost in production builds.

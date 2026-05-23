@@ -4287,8 +4287,19 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
               "fault-cache-keys", "w215-cache-residency",
               "tlb-stats", "heap-stats", "w215-diag",
               "coverage-flush", "proc-metrics",
-              "futex-stats"):
+              "futex-stats",
+              # INFRA-3 record/replay: zero-arg introspection.
+              "record-status"):
         return {"op": op}
+    if op == "replay-dump":
+        # INFRA-3: dump the in-RAM record log to a VFS file.  Single
+        # required positional `path=<abs>` arg (or just `<abs>`).
+        if not rest:
+            raise ValueError("replay-dump requires <path> (absolute VFS path)")
+        # Accept either `path=/foo` or bare `/foo`.
+        tok = rest[0]
+        path = tok.split("=", 1)[1] if tok.startswith("path=") else tok
+        return {"op": "replay-dump", "path": path}
     if op == "futex-set-cluster-wake":
         # Accepts:
         #   futex-set-cluster-wake on
@@ -9154,6 +9165,13 @@ def main():
         # FUTEX_WAKE cluster-wake compensation (firefox-test/test-mode only).
         # See subsys/linux/futex_cluster.rs.
         "futex-stats", "futex-set-cluster-wake",
+        # INFRA-3 record/replay introspection (record-replay feature).
+        # `record-status` returns seed + virtual ticks + ordinal; safe to
+        # query under any build (returns enabled:false when the feature
+        # is off).  `replay-dump path=<abs>` writes the in-RAM record
+        # log to a VFS file; takes one `path=...` arg.  See
+        # docs/RECORD_REPLAY_2026-05-23.md.
+        "record-status", "replay-dump",
     ])
     p_kdb.add_argument("args", nargs="*",
                         help="Op-specific positional args: "
