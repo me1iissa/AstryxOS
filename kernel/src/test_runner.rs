@@ -170,6 +170,23 @@ pub fn run() -> ! {
     let mut total = 0u32;
     let mut passed = 0u32;
 
+    // ── Test R0: record/replay self-tests (cmdline parser + PRNG) ────────
+    // Pure-Rust unit tests for the INFRA-3 cmdline parser and the
+    // deterministic xorshift PRNG.  Only compiled in when the
+    // `record-replay` feature is on.  No serial I/O cost when the
+    // feature is off.
+    #[cfg(feature = "record-replay")]
+    {
+        total += 1;
+        let n = crate::record_replay::self_tests();
+        if n >= 20 {
+            passed += 1;
+            test_println!("  Test R0: record-replay self-tests passed ({} asserts)", n);
+        } else {
+            test_println!("  Test R0: record-replay self-tests FAILED ({} asserts ran)", n);
+        }
+    }
+
     // ── Test 0a: pipe wake hook (Stream A) ───────────────────────────────
     // Run before any network/disk tests so a regression here surfaces
     // immediately rather than after the long pre-amble.

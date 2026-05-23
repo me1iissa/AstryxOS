@@ -56,6 +56,8 @@ mod subsys;
 mod x11;
 mod init;
 mod util;
+#[cfg(feature = "record-replay")]
+mod record_replay;
 
 use astryx_shared::{BootInfo, BOOT_INFO_MAGIC};
 
@@ -87,6 +89,16 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // Initialize serial first for debug output
     drivers::serial::init();
     serial_println!("[Aether] Serial port initialized");
+
+    // Phase 0a: Record/replay infrastructure (INFRA-3).  Must run before
+    // any RNG consumer (ASLR, AT_RANDOM, getrandom, kernel heap layout)
+    // and before any time consumer.  Reads the QEMU fw_cfg
+    // `opt/astryx/cmdline` blob if present, parses `astryx.rng_seed=<u64>`,
+    // and publishes the PRNG seed + virtual-tick counter.  No-op when the
+    // `record-replay` feature is OFF (the function does not exist).  Refs:
+    // QEMU `docs/specs/fw_cfg.txt`.
+    #[cfg(feature = "record-replay")]
+    record_replay::init_early();
 
     // Validate boot info
     serial_println!("[Aether] Validating BootInfo at {:p}", boot_info);

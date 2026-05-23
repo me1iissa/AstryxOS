@@ -882,6 +882,42 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         crate::proc::current_tid(),
     );
 
+    // ── Record/replay: virtual tick advance + structured per-syscall record ──
+    // Off-path cost when `--features record-replay` is OFF is zero (the
+    // entire block is `cfg`-elided).  When ON, we advance the kernel's
+    // frozen virtual tick counter (one relaxed atomic increment) and
+    // emit one self-describing `[SC-REC] {...}` JSON-shaped serial line
+    // carrying pid, tid, sc#, all six args, user RIP at entry, live
+    // IA32_FS_BASE, the per-process vfork-generation id, and the
+    // strictly increasing `ord` sequence ordinal.  Same workload + same
+    // seed → byte-identical `[SC-REC]` streams across runs (validation
+    // target: first ~500 records; see
+    // `docs/RECORD_REPLAY_2026-05-23.md`).  Refs: Intel SDM Vol. 3A
+    // §3.4.4.1 (IA32_FS_BASE); POSIX `clock_gettime(3)`.
+    #[cfg(feature = "record-replay")]
+    {
+        crate::record_replay::advance_virtual_ticks();
+        let user_rip = unsafe { crate::syscall::get_user_rip() };
+        let fs_base = unsafe { crate::hal::rdmsr(0xC000_0100) };
+        let pid_now = crate::proc::current_pid_lockless();
+        let tid_now = crate::proc::current_tid();
+        // Best-effort: read the per-process VmSpace generation if we can
+        // get a non-blocking handle on the process table.  Skip silently
+        // (gen=0) on contention — the ordinal already gives total order.
+        let gen_id = {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            procs.iter()
+                .find(|p| p.pid == pid_now)
+                .and_then(|p| p.vm_space.as_ref())
+                .map(|s| s.generation.load(core::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(0)
+        };
+        crate::record_replay::record_syscall_entry(
+            num, arg1, arg2, arg3, arg4, arg5, arg6,
+            pid_now, tid_now, user_rip, fs_base, gen_id,
+        );
+    }
+
     // ── Tier-0 trace: one self-contained line per syscall entry ──────────────
     // Grepped by qemu-harness.py via `^\[SC\] `.  User RIP comes from the
     // per-CPU syscall_entry stash (set by the naked-asm stub before dispatch).
@@ -1119,6 +1155,12 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     if _metrics_pid >= 1 {
         crate::proc::proc_metrics::leave_syscall(_metrics_pid);
     }
+
+    // ── Record/replay: advance virtual ticks on syscall exit ───────────
+    // Paired with the entry-side bump so every syscall contributes
+    // exactly two virtual ticks.  See `crate::record_replay`.
+    #[cfg(feature = "record-replay")]
+    crate::record_replay::advance_virtual_ticks();
 
     // ── Tier-0 trace: paired return value line ────────────────────────────
     // Hex formatting keeps negative errno values grep-friendly
@@ -6064,7 +6106,19 @@ pub fn sys_clock_gettime(clk_id: u64, tp: u64) -> i64 {
     // HRES paths use TSC-derived ns — identical to the vDSO fast path so
     // futex absolute deadlines stay coherent.  COARSE paths use the 10 ms
     // tick counter per clock_gettime(2) "coarse resolution" semantics.
+    //
+    // Record/replay override: when `--features record-replay` is on, all
+    // clocks (HRES and COARSE) are derived from the frozen virtual tick
+    // counter `crate::record_replay::KERNEL_VIRTUAL_TICKS`.  This makes
+    // `pthread_cond_timedwait` deadlines reproducible across runs at the
+    // cost of breaking real wall-time accuracy; the trade is correct for
+    // a diagnostic feature gated off by default.  Refs: POSIX
+    // `clock_gettime(3)` and kernel.org
+    // `Documentation/timers/timekeeping.rst`.
     let is_coarse = clk_id == CLOCK_REALTIME_COARSE || clk_id == CLOCK_MONOTONIC_COARSE;
+    #[cfg(feature = "record-replay")]
+    let (secs, nsecs) = { let _ = is_coarse; crate::record_replay::virtual_clock() };
+    #[cfg(not(feature = "record-replay"))]
     let (secs, nsecs) = if is_coarse {
         let ticks = crate::arch::x86_64::irq::get_ticks();
         let mono_secs = ticks / 100;
@@ -6083,8 +6137,19 @@ pub fn sys_clock_gettime(clk_id: u64, tp: u64) -> i64 {
 
     let is_realtime = clk_id == CLOCK_REALTIME || clk_id == CLOCK_REALTIME_COARSE;
     let _ = CLOCK_MONOTONIC_RAW;
+    // Record/replay: pin the wall-clock epoch to a constant (the unix
+    // timestamp 1_700_000_000 → 2023-11-14T22:13:20Z) instead of reading
+    // the CMOS RTC, which is the only remaining non-deterministic input
+    // into CLOCK_REALTIME.  Picked as a recognisable round number that
+    // also sits inside the post-Y2038 safe window for future-dated
+    // certificate validation paths.
+    #[cfg(feature = "record-replay")]
+    const RR_WALL_EPOCH: u64 = 1_700_000_000;
     let secs = if is_realtime {
-        crate::proc::vdso::wall_secs_at_boot().saturating_add(secs)
+        #[cfg(feature = "record-replay")]
+        { RR_WALL_EPOCH.saturating_add(secs) }
+        #[cfg(not(feature = "record-replay"))]
+        { crate::proc::vdso::wall_secs_at_boot().saturating_add(secs) }
     } else {
         secs
     };
@@ -6742,14 +6807,28 @@ fn sys_gettimeofday(tv: u64, _tz: u64) -> i64 {
     // possible) bypass — see sys_open_linux for the rationale.
     // TSC-derived ns for vDSO/syscall parity; falls back to tick
     // granularity before TSC calibration is published (pre-apic::init).
-    let mono_ns = crate::proc::vdso::monotonic_ns();
-    let (mono_secs, sub_usecs) = if mono_ns != 0 {
-        (mono_ns / 1_000_000_000, (mono_ns % 1_000_000_000) / 1000)
-    } else {
-        let ticks = crate::arch::x86_64::irq::get_ticks();
-        (ticks / 100, (ticks % 100) * 10_000)
+    //
+    // Record/replay: derive from the frozen virtual tick counter and a
+    // pinned wall-clock epoch (1_700_000_000) so the (sec, usec) pair is
+    // identical across runs of the same workload.  See
+    // `clock_gettime(2)` (POSIX) and `crate::record_replay`.
+    #[cfg(feature = "record-replay")]
+    let (secs, sub_usecs) = {
+        let (vsecs, vns) = crate::record_replay::virtual_clock();
+        (1_700_000_000u64.saturating_add(vsecs), vns / 1000)
     };
-    let secs = crate::proc::vdso::wall_secs_at_boot().saturating_add(mono_secs);
+    #[cfg(not(feature = "record-replay"))]
+    let (secs, sub_usecs) = {
+        let mono_ns = crate::proc::vdso::monotonic_ns();
+        let (mono_secs, sub_usecs) = if mono_ns != 0 {
+            (mono_ns / 1_000_000_000, (mono_ns % 1_000_000_000) / 1000)
+        } else {
+            let ticks = crate::arch::x86_64::irq::get_ticks();
+            (ticks / 100, (ticks % 100) * 10_000)
+        };
+        let secs = crate::proc::vdso::wall_secs_at_boot().saturating_add(mono_secs);
+        (secs, sub_usecs)
+    };
     // SMAP bracket — `tv` is a user-VA timeval pointer.
     let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
     let buf = unsafe { core::slice::from_raw_parts_mut(tv as *mut u8, 16) };
