@@ -72,6 +72,13 @@ SSHD="${ASTRYXOS_SSHD:-0}"
 # See scripts/install-tls-stack.sh.
 TLS_STACK="${ASTRYXOS_TLS:-0}"
 
+# When set (env or --oracle flag), also stage the Oracle endpoint agent
+# (infrasvc) binary + /etc/oracle/config.toml + host glibc-linked libssl3/
+# libcrypto3.  Used by the oracle-test cargo feature (kernel/src/main.rs
+# + kernel/src/oracle_demo.rs) for first-boot validation of glibc+tokio
+# Linux server-agent hosting on AstryxOS.  See scripts/install-oracle.sh.
+ORACLE="${ASTRYXOS_ORACLE:-0}"
+
 # Firefox package selector (musl variant only).  Picks which Alpine package
 # install-firefox-musl.sh + install-firefox-musl-debug.sh pull:
 #
@@ -136,6 +143,7 @@ for arg in "$@"; do
         --busybox) BUSYBOX_CLI=1; FORCE=true ;;
         --sshd) SSHD=1; FORCE=true ;;
         --tls) TLS_STACK=1; FORCE=true ;;
+        --oracle) ORACLE=1; FORCE=true ;;
         [0-9]*) SIZE_MB="$arg" ;;
     esac
 done
@@ -518,6 +526,27 @@ if [ "${TLS_STACK}" = "1" ] || [ "${TLS_STACK}" = "true" ]; then
         [ "${FORCE}" = true ] && TLS_FLAGS="--force"
         bash "${ROOT_DIR}/scripts/install-tls-stack.sh" ${TLS_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
             { echo "[DATA-DISK] FATAL: install-tls-stack.sh failed"; exit 1; }
+    fi
+fi
+
+# ── Optional: stage Oracle endpoint agent (infrasvc) binary + config ────────
+# Oracle is GLIBC-linked (DT_NEEDED libc.so.6, libssl.so.3, libcrypto.so.3,
+# interp = /lib64/ld-linux-x86-64.so.2; max GLIBC_2.39).  install-oracle.sh
+# stages /usr/bin/oracle + /etc/oracle/config.toml + host glibc-linked
+# libssl3/libcrypto3 into build/disk/lib/x86_64-linux-gnu/.  It relies on
+# install-glibc.sh's output for libc.so.6 + ld-linux — when the default
+# FIREFOX_VARIANT=glibc is active, install-glibc.sh has already run.  The
+# install-tls-stack.sh musl libssl is INCOMPATIBLE for a glibc binary so
+# install-oracle.sh stages its own glibc-linked copies separately.
+if [ "${ORACLE}" = "1" ] || [ "${ORACLE}" = "true" ]; then
+    if [ "${FIREFOX_VARIANT}" != "glibc" ]; then
+        echo "[DATA-DISK] WARNING: --oracle expects FIREFOX_VARIANT=glibc (current: ${FIREFOX_VARIANT}); oracle is a glibc binary and won't load against the musl track."
+    fi
+    if [ -f "${ROOT_DIR}/scripts/install-oracle.sh" ]; then
+        ORACLE_FLAGS=""
+        [ "${FORCE}" = true ] && ORACLE_FLAGS="--force"
+        bash "${ROOT_DIR}/scripts/install-oracle.sh" ${ORACLE_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
+            { echo "[DATA-DISK] FATAL: install-oracle.sh failed"; exit 1; }
     fi
 fi
 
@@ -1079,6 +1108,39 @@ EOF
             echo "[DATA-DISK] Copied /usr/lib/${sslib} ($(stat -c%s "${BUILD_DIR}/disk/usr/lib/${sslib}") bytes)"
         fi
     done
+
+    # ── Oracle endpoint agent (--oracle / ASTRYXOS_ORACLE=1) ────────────────
+    # install-oracle.sh has already populated:
+    #   build/disk/usr/bin/oracle                    (~5 MiB GLIBC ELF)
+    #   build/disk/etc/oracle/config.toml            (first-boot config)
+    #   build/disk/var/lib/oracle/                   (runtime state dir)
+    #   build/disk/var/log/oracle/                   (log dir)
+    #   build/disk/lib/x86_64-linux-gnu/libssl.so.3  (host glibc-linked, ~1 MiB)
+    #   build/disk/lib/x86_64-linux-gnu/libcrypto.so.3 (host glibc-linked, ~6 MiB)
+    # The libssl/libcrypto pair lands at the multiarch path so the glibc
+    # dynamic linker (staged by install-glibc.sh) finds them; the install-
+    # tls-stack.sh Alpine musl copies under /usr/lib/ are INCOMPATIBLE for
+    # a glibc binary (different libc, different TLS layout).
+    if [ -f "${BUILD_DIR}/disk/usr/bin/oracle" ]; then
+        mmd -i "${DATA_IMG}" "::usr"     2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/bin" 2>/dev/null || true
+        mcopy -o -i "${DATA_IMG}" \
+            "${BUILD_DIR}/disk/usr/bin/oracle" "::usr/bin/oracle"
+        echo "[DATA-DISK] Copied /usr/bin/oracle ($(stat -c%s "${BUILD_DIR}/disk/usr/bin/oracle") bytes)"
+    fi
+    if [ -f "${BUILD_DIR}/disk/etc/oracle/config.toml" ]; then
+        mmd -i "${DATA_IMG}" "::etc"        2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::etc/oracle" 2>/dev/null || true
+        mcopy -o -i "${DATA_IMG}" \
+            "${BUILD_DIR}/disk/etc/oracle/config.toml" "::etc/oracle/config.toml"
+        echo "[DATA-DISK] Copied /etc/oracle/config.toml"
+    fi
+    # Runtime dirs.  FAT32 has no separate dir-vs-file modes; create empty.
+    mmd -i "${DATA_IMG}" "::var"            2>/dev/null || true
+    mmd -i "${DATA_IMG}" "::var/lib"        2>/dev/null || true
+    mmd -i "${DATA_IMG}" "::var/lib/oracle" 2>/dev/null || true
+    mmd -i "${DATA_IMG}" "::var/log"        2>/dev/null || true
+    mmd -i "${DATA_IMG}" "::var/log/oracle" 2>/dev/null || true
 
     # ── BusyBox binary + applet wrapper scripts (built by build-busybox.sh) ─
     # Ships a single static musl binary at /bin/busybox plus a curated set of
