@@ -1,0 +1,245 @@
+# GDB-autopsy preset library
+# =============================================================================
+# Each preset is a list of named CAPTURE STEPS that the autopsy wrapper
+# executes after a breakpoint hits.  The output of every step is folded
+# into a single structured JSON document, so agents never have to grep
+# raw GDB scrollback again.
+#
+# Step schema:
+#
+#   - name: <unique key under "captures">     # required
+#     kind: regs | mem | mem_at | mem_via_reg | mem_via_seg | sym_window | note
+#     ... kind-specific fields ...
+#
+# Kinds:
+#   - regs         : full GPR + segment + RFLAGS snapshot.
+#                    No extra fields.
+#   - mem          : read N bytes at a fixed absolute address.
+#                    addr: <hex int>, len: <int>
+#   - mem_at       : read N bytes at (reg + offset).
+#                    reg: rsp|rbp|rip|rax|... , offset: <signed int>, len: <int>
+#   - mem_via_reg  : same as mem_at but groups the result as "stack window",
+#                    "frame window", etc.  Identical wire format.
+#   - mem_via_seg  : read N bytes at (segment_base + offset).  Currently
+#                    'fs' uses GDB's `info reg fs_base` equivalent — we
+#                    query the FSBASE MSR via the stub's 'g' register
+#                    expansion (long-target xml).  If the stub doesn't
+#                    expose fs_base we record fs_base=null and skip.
+#                    seg: fs|gs , offset: <int>, len: <int>
+#   - sym_window   : resolve <symbol> in the kernel ELF, read len bytes
+#                    starting at (sym + offset).  Useful for inspecting a
+#                    statically-allocated debug ring buffer.
+#                    sym: <name>, offset: <int>, len: <int>
+#   - note         : free-form note string emitted into the output for
+#                    operator context.  text: <str>
+#
+# Output shape (per breakpoint hit):
+#
+#   {
+#     "hit_index": <int>,
+#     "breakpoint": {"addr": "0x...", "symbol": "<name>+0xN" | null},
+#     "captures": {
+#       "<step.name>": { ... step-specific fields ... },
+#       ...
+#     }
+#   }
+#
+# The wrapper appends the breakpoint, hit-index, and (when resolvable)
+# the resolved RIP symbol automatically — presets only need to declare
+# the per-hit observation set.
+#
+# References (public specs only):
+#   - GDB Remote Serial Protocol — gnu.org/software/gdb/documentation/
+#   - Intel SDM Vol. 1 §3.4 (general-purpose registers)
+#   - Intel SDM Vol. 3A §3.4.4 (FSBASE/GSBASE MSRs)
+#   - sysV AMD64 ABI §3.2 (stack frame layout)
+# =============================================================================
+
+presets:
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # full-register-dump
+  # ───────────────────────────────────────────────────────────────────────────
+  # Mandatory first probe.  Captures all GPRs + segment registers + RFLAGS.
+  # This is the autopsy-first replacement for "let me add a printk that
+  # dumps the registers".  Agents should run THIS before anything else.
+  full-register-dump:
+    description: |
+      Full x86_64 register snapshot at breakpoint.  Drop-in replacement
+      for an ad-hoc kprintf("rip=%lx rax=%lx ...") probe.
+    steps:
+      - name: regs
+        kind: regs
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # stack-walk-bt-full
+  # ───────────────────────────────────────────────────────────────────────────
+  # Snapshot top-of-stack memory windows so a follow-up walker can do
+  # frame-by-frame unwinding without needing live access to the stub.
+  stack-walk-bt-full:
+    description: |
+      Registers + top 512B of stack + top 256B around RBP frame.
+      Sufficient for a saved-RIP/saved-RBP walk on a sysV AMD64 frame.
+    steps:
+      - name: regs
+        kind: regs
+      - name: stack_top
+        kind: mem_via_reg
+        reg: rsp
+        offset: 0
+        len: 512
+      - name: stack_below_rsp
+        kind: mem_via_reg
+        reg: rsp
+        offset: -128
+        len: 128
+      - name: frame_around_rbp
+        kind: mem_via_reg
+        reg: rbp
+        offset: -64
+        len: 256
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # ssp-fail-snapshot
+  # ───────────────────────────────────────────────────────────────────────────
+  # Stack-Smashing-Protector failure window.  When __stack_chk_fail (musl
+  # userspace) or BUGCHECK_CANARY_CORRUPT (kernel ke_bugcheck) fires, we
+  # need ALL of:
+  #   - registers (so we know which frame owned the canary)
+  #   - stack window straddling the canary slot ([rbp-8] for sysV frames)
+  #   - fs_base + 16 bytes (musl's per-thread guard at fs:0x28)
+  #   - frame backtrace for blame
+  # so the autopsy tells us whether the canary at [rbp-8] != *fs:0x28
+  # because the canary was overwritten in place (stack overflow) OR
+  # because the guard at fs:0x28 was rotated under us (FS_BASE
+  # contamination across a context switch — the W215/F3 axis).
+  ssp-fail-snapshot:
+    description: |
+      SSP failure / STACK_CANARY_CORRUPT.  Captures the canary slot at
+      [rbp-8], 16 bytes at fs:0x28 (musl's per-thread guard), and a
+      stack window so the caller can decide overflow vs. FSBASE drift.
+    steps:
+      - name: regs
+        kind: regs
+      # The canary slot lives at [rbp-8] in sysV AMD64 prologues that
+      # use -fstack-protector{,-strong,-all}.  Pull a wider window
+      # around it so callers see neighbouring locals too.
+      - name: canary_slot
+        kind: mem_via_reg
+        reg: rbp
+        offset: -16
+        len: 32
+      - name: frame_window
+        kind: mem_via_reg
+        reg: rbp
+        offset: -128
+        len: 256
+      - name: stack_top
+        kind: mem_via_reg
+        reg: rsp
+        offset: 0
+        len: 256
+      # musl's __stack_chk_guard is loaded from fs:0x28 (per glibc /
+      # musl convention — sysV AMD64 ABI §11.4 "TLS Variant II").
+      - name: tls_guard
+        kind: mem_via_seg
+        seg: fs
+        offset: 0x28
+        len: 16
+      # ke_bugcheck's parameters (p1..p4) sit in RDX, RCX, R8, R9
+      # at the call boundary; we capture them via the regs snapshot
+      # but also dump the call-site rsp window in case the call was
+      # made from a stack-tail-call site.
+      - name: arg_window
+        kind: mem_via_reg
+        reg: rsp
+        offset: -64
+        len: 128
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # vfork-window
+  # ───────────────────────────────────────────────────────────────────────────
+  # Capture pre-clone state at a vfork(2) gate, so a follow-up trace at
+  # the parent-resumes-after-child-exec point can compare frame identity.
+  # See sysV AMD64 ABI §3.2.4 for the caller-saved register set we keep.
+  vfork-window:
+    description: |
+      vfork(2) gate snapshot.  Registers + caller frame + arg window;
+      useful for the user-RBP-identity / kstack-drift axis where the
+      same VA returns a different qword after the child exits.
+    steps:
+      - name: regs
+        kind: regs
+      - name: frame_caller
+        kind: mem_via_reg
+        reg: rbp
+        offset: 0
+        len: 64
+      - name: frame_local
+        kind: mem_via_reg
+        reg: rbp
+        offset: -128
+        len: 256
+      - name: stack_args
+        kind: mem_via_reg
+        reg: rsp
+        offset: 0
+        len: 256
+      - name: tls_anchor
+        kind: mem_via_seg
+        seg: fs
+        offset: 0
+        len: 64
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # gp-fault-context
+  # ───────────────────────────────────────────────────────────────────────────
+  # #GP at user IRET / SYSRET path.  Captures CS/SS/RFLAGS and a wide
+  # stack window so the IRET frame can be decoded.
+  gp-fault-context:
+    description: |
+      #GP fault context.  Registers + 128 bytes around RSP for IRET
+      frame decoding + CS/SS/RFLAGS.
+    steps:
+      - name: regs
+        kind: regs
+      - name: iret_frame
+        kind: mem_via_reg
+        reg: rsp
+        offset: -16
+        len: 128
+      - name: code_around_rip
+        kind: mem_via_reg
+        reg: rip
+        offset: -16
+        len: 64
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # bugcheck-entry
+  # ───────────────────────────────────────────────────────────────────────────
+  # Symmetric to ssp-fail-snapshot but tuned for ke_bugcheck() entry.
+  # ke_bugcheck signature: ke_bugcheck(code: u32, p1: u64, p2: u64, p3: u64, p4: u64).
+  # By sysV AMD64 ABI §3.2.3 these are passed in EDI, RSI, RDX, RCX, R8.
+  bugcheck-entry:
+    description: |
+      Snapshot at ke_bugcheck() entry.  EDI=code, RSI..R8=p1..p4 by
+      sysV AMD64 ABI §3.2.3; plus the return-address slot at [rsp] so
+      the calling site can be symbolised.
+    steps:
+      - name: regs
+        kind: regs
+      - name: return_address
+        kind: mem_via_reg
+        reg: rsp
+        offset: 0
+        len: 8
+      - name: stack_args
+        kind: mem_via_reg
+        reg: rsp
+        offset: 0
+        len: 128
+      - name: frame_window
+        kind: mem_via_reg
+        reg: rbp
+        offset: -64
+        len: 128
