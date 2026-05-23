@@ -146,6 +146,69 @@ def main() -> int:
                   f"dropped={dropped} remaining={[s['name'] for s in stripped]}"):
         failures.append("prefix strip behaviour")
 
+    # ── strace ret regex: hex ret must not truncate to leading "0" ─────
+    # Regression guard for INFRA-1 bug #1 from SSP_DIFFERENTIAL_AT_ANCHOR_
+    # 2026-05-23: the alternation `-?\d+|0x[0-9a-fA-F]+` greedy-matched
+    # the leading `0` of `0x614ff1726000` and silently dropped 12 hex
+    # digits, making every pointer-returning syscall report ret=0.
+    m = ds._RE_STRACE_LINE.match("1101 1.0 brk(NULL) = 0x614ff1726000")
+    if not _check("strace hex ret parses fully (regex order)",
+                  bool(m) and m.group("ret") == "0x614ff1726000",
+                  f"got={m.group('ret') if m else None}"):
+        failures.append("strace hex ret regex order")
+
+    # ── retval normalisation: strace `-1 errno=ENOENT` → -2 ────────────
+    # Regression guard for INFRA-1 bug #5: strace's symbolic-errno
+    # convention vs AstryxOS's raw-kernel-ret convention caused every
+    # ENOENT to flag as a retval mismatch.
+    rec_strace = {"name": "open", "nr": 2, "args": ["..."], "ret": -1,
+                  "errno": "ENOENT"}
+    if not _check("strace `-1 + ENOENT` normalises to -2",
+                  ds._normalise_linux_ret(rec_strace) == -2,
+                  f"got={ds._normalise_linux_ret(rec_strace)}"):
+        failures.append("errno normalise ENOENT")
+    rec_no_errno = {"name": "read", "nr": 0, "args": [], "ret": 42,
+                    "errno": None}
+    if not _check("retval normalise leaves non-error rets unchanged",
+                  ds._normalise_linux_ret(rec_no_errno) == 42):
+        failures.append("errno normalise passthrough")
+
+    # ── runtime-dep retval skip: TID/PID mismatch is benign ────────────
+    # Regression guard: set_tid_address returning different absolute TIDs
+    # on Linux (host pid namespace) vs AstryxOS (guest pid namespace) is
+    # not a divergence; both correctly return caller's TID.
+    linux_tid = [{"name": "set_tid_address", "nr": 218, "args": ["..."],
+                  "ret": 1101255, "errno": None}]
+    astryx_tid = [{"name": "set_tid_address", "nr": 218, "args": ["0x0"],
+                   "ret": 1}]
+    diff = ds.diff_streams(linux_tid, astryx_tid, {"snapshots": []})
+    if not _check("TID-value mismatch is benign (no_divergence)",
+                  diff["summary"]["divergence_class"] == "no_divergence",
+                  f"got={diff['summary']['divergence_class']}"):
+        failures.append("runtime-dep retval skip")
+
+    # ── anchor logic: find_anchor by name + arg_prefix ────────────────
+    # Regression guard for INFRA-1 bug #4 (anchor alignment).
+    stream = [
+        {"name": "brk",         "args": ["NULL"]},
+        {"name": "arch_prctl",  "args": ["ARCH_SET_GS", "0x1234"]},
+        {"name": "arch_prctl",  "args": ["ARCH_SET_FS", "0x5678"]},
+        {"name": "set_tid_address", "args": ["0x9abc"]},
+    ]
+    # find_anchor is defined inside cmd_run; re-expressing it inline.
+    def _find_anchor(s, name, prefix):
+        for i, r in enumerate(s):
+            if r["name"] != name:
+                continue
+            if prefix and not (r["args"] and r["args"][0].startswith(prefix)):
+                continue
+            return i
+        return None
+    idx = _find_anchor(stream, "arch_prctl", "ARCH_SET_FS")
+    if not _check("anchor finds arch_prctl with prefix ARCH_SET_FS",
+                  idx == 2, f"got={idx}"):
+        failures.append("anchor arg_prefix match")
+
     print()
     if failures:
         print(f"FAILED ({len(failures)}): {', '.join(failures)}")
