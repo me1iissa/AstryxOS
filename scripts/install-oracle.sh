@@ -226,30 +226,123 @@ refresh_interval_hours = 24
 EOF
 echo "[ORACLE] Wrote /etc/oracle/config.toml (sync disabled, process+security collectors off)"
 
-# ── Step 4b: stage glibc-linked libssl3 + libcrypto3 from the host ───────────
-# Oracle's DT_NEEDED list includes libssl.so.3 and libcrypto.so.3.  The Alpine
-# musl track that install-tls-stack.sh stages will NOT load into a glibc
-# binary (different libc, different TLS layout, different relocation
-# semantics).  We therefore mirror the host's glibc-linked copies into the
-# canonical glibc-track lib dir.  This is harmless when install-glibc.sh has
-# also run — the .so files are owned by separate base names and the loader
-# walks DT_NEEDED in order.
-mkdir -p "${DISK_GLIBC_LIB}"
-ssl_count=0
-for lib in libssl.so.3 libcrypto.so.3; do
-    for src_dir in /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64; do
-        if [ -f "${src_dir}/${lib}" ]; then
-            cp -fL "${src_dir}/${lib}" "${DISK_GLIBC_LIB}/${lib}"
-            echo "[ORACLE] Staged /lib/x86_64-linux-gnu/${lib} (host glibc-link, $(stat -c%s "${DISK_GLIBC_LIB}/${lib}") bytes)"
-            ssl_count=$((ssl_count + 1))
-            break
+# ── Step 4b: walk oracle's DT_NEEDED transitive closure ──────────────────────
+# Oracle's *direct* DT_NEEDED is just libssl.so.3, libcrypto.so.3, libgcc_s.so.1,
+# libm.so.6, libc.so.6 — but libcrypto.so.3 itself pulls in libz.so.1 and
+# libzstd.so.1, neither of which are staged by install-glibc.sh (which only
+# stages base glibc) or by install-tls-stack.sh (Alpine-musl — incompatible
+# with a glibc binary).  Without those transitive libs, ld-linux exits with
+# "libzstd.so.1: cannot open shared object file" before any oracle code runs.
+#
+# We therefore walk the closure with a BFS over `readelf -d ... | grep NEEDED`,
+# resolving each library via `ldconfig -p` or a fixed search-dir list, and
+# staging every reachable .so into ${DISK_GLIBC_LIB} (the canonical Debian
+# multiarch path, which `create-data-disk.sh` mcopies into data.img at
+# /lib/x86_64-linux-gnu/).  Per the ELF gABI (System V ABI §5.4) and ld.so(8)
+# the dynamic linker searches DT_RPATH/DT_RUNPATH then LD_LIBRARY_PATH then
+# /etc/ld.so.cache then default paths (/lib, /usr/lib); our staging covers the
+# default-path branch which is what oracle and its DT_NEEDED chain rely on
+# (oracle has no DT_RPATH/DT_RUNPATH per readelf -d).
+#
+# FAT32 has no symlinks, so we stage every reachable name as a *real file*
+# (cp -L dereferences host symlinks).  When a host symlink resolves to a
+# differently-named file (libzstd.so.1 -> libzstd.so.1.5.7), we stage BOTH
+# names so DT_NEEDED resolution (which looks for libzstd.so.1) AND any
+# runtime dlopen of the versioned name both succeed.
+#
+# Skip-list: base glibc libs (libc, libm, libpthread, libdl, librt, libresolv,
+# ld-linux) are already staged by install-glibc.sh under their host-versioned
+# real names (e.g. libc.so.6 -> libc.so.6).  We re-check via the staged tree;
+# if install-glibc.sh has run, we let those win.  Otherwise we stage them too,
+# which is harmless.
+declare -A STAGED_SOS
+SKIP_BASE_SET="libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2 librt.so.1 libresolv.so.2 ld-linux-x86-64.so.2 ld-linux.so.2"
+
+# Resolve a SONAME (e.g. libzstd.so.1) to an absolute host path.  Prefer
+# ldconfig -p (authoritative on the host) then fall back to a fixed search
+# list for environments where ldconfig is unavailable or stale.
+resolve_soname() {
+    local soname="$1"
+    local p
+    if command -v ldconfig >/dev/null 2>&1; then
+        p="$(ldconfig -p 2>/dev/null | awk -v n="${soname}" '$1==n {print $NF; exit}')"
+        [ -n "${p}" ] && [ -e "${p}" ] && { echo "${p}"; return 0; }
+    fi
+    for src_dir in /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64 /lib /usr/lib; do
+        if [ -e "${src_dir}/${soname}" ]; then
+            echo "${src_dir}/${soname}"; return 0
         fi
     done
+    return 1
+}
+
+# Stage one resolved .so under both its SONAME and its real (versioned) name.
+# Marks both names in STAGED_SOS so subsequent BFS iterations don't redo work.
+stage_one_so() {
+    local soname="$1"
+    local src_path="$2"
+    local real_path real_name
+    real_path="$(readlink -f "${src_path}")"
+    real_name="$(basename "${real_path}")"
+    cp -fL "${real_path}" "${DISK_GLIBC_LIB}/${soname}"
+    if [ "${soname}" != "${real_name}" ]; then
+        cp -fL "${real_path}" "${DISK_GLIBC_LIB}/${real_name}"
+    fi
+    STAGED_SOS["${soname}"]=1
+    STAGED_SOS["${real_name}"]=1
+    echo "[ORACLE]   staged ${soname}$([ "${soname}" != "${real_name}" ] && echo " (+${real_name})") ($(stat -c%s "${DISK_GLIBC_LIB}/${soname}") bytes, src=${src_path})"
+}
+
+# BFS over DT_NEEDED, rooted at the oracle ELF.  Queue holds absolute paths;
+# we extract DT_NEEDED of each, resolve to host paths, enqueue + stage.
+walk_dt_needed_closure() {
+    local root="$1"
+    local -a queue=("${root}")
+    local -A visited
+    visited["$(readlink -f "${root}")"]=1
+    local total=0 skipped=0 missing=0
+    while [ ${#queue[@]} -gt 0 ]; do
+        local cur="${queue[0]}"
+        queue=("${queue[@]:1}")
+        while IFS= read -r dep; do
+            [ -z "${dep}" ] && continue
+            # Skip base glibc — owned by install-glibc.sh
+            if printf '%s' "${SKIP_BASE_SET}" | tr ' ' '\n' | grep -qFx "${dep}"; then
+                skipped=$((skipped + 1)); continue
+            fi
+            [ -n "${STAGED_SOS[${dep}]:-}" ] && continue
+            local resolved
+            if ! resolved="$(resolve_soname "${dep}")"; then
+                echo "[ORACLE]   MISSING dep: ${dep} (no host copy located)"
+                missing=$((missing + 1))
+                STAGED_SOS["${dep}"]=1   # don't re-warn
+                continue
+            fi
+            local real_resolved
+            real_resolved="$(readlink -f "${resolved}")"
+            if [ -n "${visited[${real_resolved}]:-}" ]; then continue; fi
+            visited["${real_resolved}"]=1
+            stage_one_so "${dep}" "${resolved}"
+            queue+=("${real_resolved}")
+            total=$((total + 1))
+        done < <(readelf -d "${cur}" 2>/dev/null \
+                 | awk -F'[][]' '/NEEDED/ {print $2}')
+    done
+    echo "[ORACLE] DT_NEEDED closure: ${total} staged, ${skipped} skipped (base glibc), ${missing} missing"
+}
+
+mkdir -p "${DISK_GLIBC_LIB}"
+echo "[ORACLE] Walking DT_NEEDED transitive closure rooted at ${ORACLE_BIN_CACHED}"
+walk_dt_needed_closure "${ORACLE_BIN_CACHED}"
+
+# Sanity: libssl/libcrypto + libzstd (the known transitive that wedged
+# oracle pre-walker) must be present after the walk.
+for required in libssl.so.3 libcrypto.so.3 libzstd.so.1 libz.so.1; do
+    if [ ! -f "${DISK_GLIBC_LIB}/${required}" ]; then
+        echo "[ORACLE] WARNING: closure walk did not stage ${required} —"
+        echo "[ORACLE]          install with 'sudo apt install libssl3 libzstd1 zlib1g' before re-running."
+    fi
 done
-if [ "${ssl_count}" -lt 2 ]; then
-    echo "[ORACLE] WARNING: host libssl.so.3/libcrypto.so.3 not located —"
-    echo "[ORACLE]          install with 'sudo apt install libssl3' before re-running."
-fi
 
 # ── Step 5: create runtime dirs ──────────────────────────────────────────────
 # systemd's oracle.service uses ExecStartPre=install -d /var/lib/oracle
