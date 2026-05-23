@@ -139,6 +139,13 @@ static ARMED_KEY_OFFSET: [AtomicU64; N_DR_SLOTS] = [
 ///       firefox-bin pid=1 init thread.  Used to name the writer of the
 ///       observed `0x30`-byte mismatch in musl `__stack_chk_fail`.
 ///       Same persistent-arm + `F3_FIRE_CAP` policy as D7/D15.
+///   6 — D20 kernel-stack canary watch (see
+///       `subsys/linux/d20_kstack_canary_watch.rs`).  Catches writes to
+///       the kernel-stack canary qword at `[kernel_stack_base, +8)` for
+///       the first N PID-2 thread creations — the post-#396/#397
+///       STACK_CANARY_CORRUPT bugcheck victim (PID 2 TID 5).  Same
+///       persistent-arm + `F3_FIRE_CAP` policy.  Per Intel SDM Vol. 3B
+///       §17.3.1.1 each fire names one retired writer.
 /// Future axes may take additional tags without disturbing existing arms.
 pub const WATCH_KIND_LEGACY:     u32 = 0;
 pub const WATCH_KIND_F3_USER:    u32 = 1;
@@ -146,6 +153,7 @@ pub const WATCH_KIND_F3_PHYS:    u32 = 2;
 pub const WATCH_KIND_D7_BSS:     u32 = 3;
 pub const WATCH_KIND_D15_MTHRD:  u32 = 4;
 pub const WATCH_KIND_D16_CANARY: u32 = 5;
+pub const WATCH_KIND_D20_KSTACK: u32 = 6;
 static ARMED_KIND: [AtomicU32; N_DR_SLOTS] = [
     AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
 ];

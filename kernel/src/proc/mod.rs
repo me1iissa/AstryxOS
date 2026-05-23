@@ -747,6 +747,34 @@ pub fn was_emergency_kstack(stack_base: u64) -> bool {
     false
 }
 
+/// Notification hook called by every thread-creation site immediately
+/// after the new `Thread` is published to `THREAD_TABLE`, carrying the
+/// just-allocated kernel stack base, total span, owning pid, and tid.
+/// Currently used only by the D20 kernel-stack canary watchpoint
+/// diagnostic (`subsys/linux/d20_kstack_canary_watch.rs`) to arm a DR
+/// write-only breakpoint on `[stack_base, stack_base + 8)` for the
+/// post-#396/#397 STACK_CANARY_CORRUPT bugcheck victim profile.
+///
+/// Off-feature builds compile this to a no-op — zero overhead and
+/// byte-identical artefact.  Default builds (no `d20-kstack-canary-watch`)
+/// elide the call entirely.
+///
+/// Safe to call with `stack_base == 0` / non-higher-half (the D20
+/// implementation gates on the target pid before doing anything).  Per
+/// Intel SDM Vol. 3B §17.2.4 the watch is on the kernel direct-map
+/// linear address; `stack_base = KERNEL_VIRT_OFFSET + phys` already
+/// satisfies the natural-alignment requirement (LEN=8 wants 8-byte
+/// alignment, and `phys` is page-aligned from PMM).
+#[inline]
+pub fn note_kstack_alloc(pid: Pid, tid: Tid, stack_base: u64, span: u64) {
+    #[cfg(feature = "d20-kstack-canary-watch")]
+    crate::subsys::linux::d20_kstack_canary_watch::note_kstack_alloc(
+        pid as u64, tid as u64, stack_base, span,
+    );
+    // Off-feature: zero-cost no-op.
+    let _ = (pid, tid, stack_base, span);
+}
+
 /// Higher-half virtual offset.  The bootloader identity-maps the first 4 GiB
 /// of RAM at both virtual 0x0 and 0xFFFF_8000_0000_0000.  Kernel stacks are
 /// allocated from PMM (physical addresses) but accessed via the higher-half
@@ -1125,6 +1153,7 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
 
     crate::serial_println!("[PROC] Created kernel process '{}' PID {} TID {}", name, pid, tid);
     note_if_emergency_kstack(pid, tid, stack_base, kstack_span);
+    note_kstack_alloc(pid, tid, stack_base, kstack_span);
     pid
 }
 
@@ -1195,6 +1224,7 @@ pub fn create_thread(pid: Pid, name: &str, entry_point: u64) -> Option<Tid> {
 
     crate::serial_println!("[PROC] Created thread '{}' TID {} in PID {}", name, tid, pid);
     note_if_emergency_kstack(pid, tid, stack_base, kstack_span);
+    note_kstack_alloc(pid, tid, stack_base, kstack_span);
     Some(tid)
 }
 
@@ -1268,6 +1298,7 @@ pub fn create_thread_blocked(pid: Pid, name: &str, entry_point: u64) -> Option<T
 
     crate::serial_println!("[PROC] Created thread (blocked) '{}' TID {} in PID {}", name, tid, pid);
     note_if_emergency_kstack(pid, tid, stack_base, kstack_span);
+    note_kstack_alloc(pid, tid, stack_base, kstack_span);
     Some(tid)
 }
 pub fn exit_thread(exit_code: i64) {
@@ -2808,6 +2839,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
         child_pid, child_tid, parent_pid, user_rip != 0
     );
     note_if_emergency_kstack(child_pid, child_tid, stack_base, kstack_span);
+    note_kstack_alloc(child_pid, child_tid, stack_base, kstack_span);
 
     Some((child_pid, child_tid))
 }
@@ -3054,6 +3086,7 @@ pub fn fork_process_share_vm(
         child_pid, child_tid, parent_pid, parent_cr3
     );
     note_if_emergency_kstack(child_pid, child_tid, stack_base, kstack_span);
+    note_kstack_alloc(child_pid, child_tid, stack_base, kstack_span);
 
     // VFORK/CHILD-STACK diagnostic — record the child's initial user RSP at
     // *clone-time*.  The value here is the parent-frame RSP as captured by
@@ -3743,6 +3776,7 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
     THREAD_TABLE.lock().push(child_thread);
     proc_metrics::register(child_pid);
     note_if_emergency_kstack(child_pid, child_tid, stack_base, kstack_span);
+    note_kstack_alloc(child_pid, child_tid, stack_base, kstack_span);
 
     Some((child_pid, child_tid))
 }
