@@ -573,6 +573,55 @@ file-buf-witness = ["firefox-test"]
 # / firefox-test / test-mode builds remain byte-identical when this
 # feature is OFF.  See docs/HARNESS.md.
 coverage = []
+# INFRA-3 record/replay primitives (kernel/src/record_replay/).  Three
+# coordinated mechanisms that make repeated runs of the same
+# user-mode workload byte-deterministic enough to bisect a single
+# failure offline:
+#
+#   1. Deterministic PRNG seed.  When this feature is on AND the QEMU
+#      cmdline (passed via the `opt/astryx/cmdline` fw_cfg blob — see
+#      QEMU `docs/specs/fw_cfg.txt`) contains an `astryx.rng_seed=<u64>`
+#      token, every call to `crate::security::rand::rand_u64()` is
+#      served from a per-boot xorshift64* PRNG seeded from that value.
+#      ASLR offsets, AT_RANDOM aux-vector entry, getrandom(2) and any
+#      other kernel RNG consumer therefore observe identical byte
+#      sequences across runs with the same seed.  Default seed when the
+#      cmdline is absent: 0xA577_E470_57ED_7E57.
+#
+#   2. Frozen virtual tick source.  A new `KERNEL_VIRTUAL_TICKS`
+#      AtomicU64 advances exclusively on (a) syscall entry, (b) syscall
+#      exit, (c) timer interrupt, (d) explicit `record-replay/advance`
+#      KDB operations.  When this feature is on, `clock_gettime(2)`,
+#      `gettimeofday(2)`, and the vDSO `monotonic_ns()` fallback path
+#      all derive their result from `KERNEL_VIRTUAL_TICKS`, not from
+#      TSC.  Same syscall sequence → same returned times.
+#
+#   3. Structured per-syscall record log.  Every Linux dispatch entry
+#      emits a single self-describing `[SC-REC] {...}` JSON-shaped
+#      serial line carrying pid, tid, sc#, all six args, user RIP at
+#      entry, IA32_FS_BASE, vfork-generation id, and a strictly
+#      increasing `ord` sequence ordinal tied to `KERNEL_VIRTUAL_TICKS`.
+#      Two runs of the same workload with the same seed should produce
+#      byte-identical `[SC-REC]` streams for the first ~500 records
+#      (the validation target — see docs/RECORD_REPLAY_2026-05-23.md
+#      for the full coverage list and known non-deterministic sources).
+#
+# Off by default and feature-gated end-to-end: when this flag is OFF
+# the kernel binary is byte-identical to the pre-PR artefact (zero
+# cmdline parse, zero virtual-tick counter, zero per-syscall record
+# overhead).  When ON, the additional cost is one atomic increment per
+# syscall + one ~150-byte serial line per syscall.
+#
+# Adds two KDB ops (read-only JSON, gated through the existing `kdb`
+# feature when `record-replay` is also on):
+#   - `record-status`  — current seed, virtual ticks, current ordinal
+#   - `replay-dump`    — write the in-RAM record log to a VFS path
+#
+# Refs: QEMU `docs/specs/fw_cfg.txt` (firmware config selector at I/O
+# ports 0x510/0x511); Intel SDM Vol. 1 §17.17 (Time-Stamp Counter);
+# kernel.org `Documentation/timers/timekeeping.rst`; POSIX
+# `clock_gettime(3)` and `getrandom(3)` (man-pages section 3).
+record-replay = []
 
 [dependencies]
 astryx-shared = { path = "../shared" }
