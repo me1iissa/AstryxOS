@@ -535,13 +535,18 @@ pub const KERNEL_STACK_PAGES_PUB: usize = KERNEL_STACK_PAGES;
 /// Allocate a kernel stack, checking the dead-stack cache first (NT pattern).
 /// Returns `(stack_base_virt, stack_top_virt)`.
 ///
+/// Allocation order under PMM fragmentation:
+///   1. dead-stack cache hit (always 256 KiB)
+///   2. contiguous `pmm::alloc_pages(64)` — 256 KiB normal path
+///   3. tiered emergency fallback: 16 KiB → 8 KiB → 4 KiB (each contiguous)
+///
 /// The actual span is always `stack_top - stack_base`.  Callers MUST stamp
 /// `Thread.kernel_stack_size` with that computed span (NOT the compile-time
 /// `KERNEL_STACK_SIZE` constant) so that bound checks and stack-depth
 /// accounting in `sched::schedule` and the syscall-trace path stay honest
-/// when the PMM-fragmented emergency-fallback path returns a 4 KiB region.
-/// Stamping the constant unconditionally produced STACK_CANARY_CORRUPT on
-/// emergency threads — see PR #391 diagnostic and the kstack-honesty fix.
+/// for every tier.  Stamping the constant unconditionally produced
+/// STACK_CANARY_CORRUPT on emergency threads — see PR #391 diagnostic and
+/// the kstack-honesty fix in PR #392.
 fn alloc_kernel_stack() -> Option<(u64, u64)> {
     // Try the dead-stack cache first — avoids PMM allocator overhead.
     // Cached stacks always carry the full KERNEL_STACK_SIZE span; the cache
@@ -557,38 +562,72 @@ fn alloc_kernel_stack() -> Option<(u64, u64)> {
         write_stack_canary(stack_base);
         return Some((stack_base, stack_top));
     }
-    // Contiguous allocation failed (PMM fragmented by page cache).
-    // Fall back to a single 4 KiB page.  Kernel paths running on this stack
-    // MUST keep depth ≤ 4 KiB — that is enforced by callers stamping the
-    // returned span (4 KiB) into `Thread.kernel_stack_size`, which the
-    // syscall-trace and canary-check paths consult before any depth math.
+    // Contiguous 256 KiB allocation failed (PMM fragmented by page cache).
+    // Walk down progressively smaller contiguous tiers before giving up:
+    // 16 KiB (4 pages) → 8 KiB (2 pages) → 4 KiB (1 page).  16 KiB matches
+    // x86_64 SysV ABI §3.4.1 minimum stack frame budgets observed in practice
+    // for short syscall paths and pthread_create(3) rationale (16 KiB is the
+    // smallest size POSIX requires implementations to honour when the caller
+    // does not specify PTHREAD_STACK_MIN explicitly), giving comfortable
+    // headroom over the 4 KiB single-page fallback that PR #392 made honest.
     //
-    // A proper fix would be vmalloc-style virtual mapping; that is tracked
-    // separately and intentionally out of scope for the size-honesty fix.
-    if let Some(phys) = crate::mm::pmm::alloc_page() {
+    // Empirical motivation: the H1 STACK_CANARY_CORRUPT trial in PR #394 showed
+    // brk() peak push-depth on 4 KiB stacks reaching RSP = (base + small),
+    // where a subsequent `push %reg` writes (RSP - 8) = stack_base and zeroes
+    // the canary.  Widening to 16 KiB / 8 KiB makes that overflow materially
+    // less likely without requiring a full vmalloc-style remap (still tracked
+    // separately).  The bugcheck still fires if any tier overflows; the larger
+    // tier is the mitigation, not the cure.
+    //
+    // Behavioural contract: if every wider tier fails, fall through to the
+    // 4 KiB tier and keep it.  Refusing to spawn a thread is worse than the
+    // residual canary risk (the diagnostic still attributes the failure).
+    const SMALL_KSTACK_TIERS: &[(usize, u64)] = &[
+        (4, 16 * 1024), // tier 4: 4 pages × 4 KiB = 16 KiB
+        (2,  8 * 1024), // tier 2: 2 pages × 4 KiB =  8 KiB
+        (1,  4 * 1024), // tier 1: 1 page  × 4 KiB =  4 KiB (legacy emergency)
+    ];
+    for &(pages, span_bytes) in SMALL_KSTACK_TIERS {
+        let phys_opt = if pages == 1 {
+            crate::mm::pmm::alloc_page()
+        } else {
+            crate::mm::pmm::alloc_pages(pages)
+        };
+        let Some(phys) = phys_opt else { continue };
         let stack_base = KERNEL_VIRT_OFFSET + phys;
-        let stack_top = stack_base + 0x1000; // 4 KiB usable
+        let stack_top = stack_base + span_bytes;
         write_stack_canary(stack_base);
         // Record in the emergency-stack ring so the canary-corruption
-        // diagnostic in `sched::schedule` retains its attribution channel
-        // even after callers stamp the real (4 KiB) span on the Thread.
+        // diagnostic in `sched::schedule` retains attribution for every
+        // sub-256-KiB tier (not just 4 KiB).  `was_emergency_kstack` is the
+        // single channel readers use; one ring covers every short tier.
         record_emergency_kstack(stack_base);
         crate::serial_println!(
-            "[KSTACK/EMERGENCY] base={:#x} size=4K (PMM fragmented)",
-            stack_base,
+            "[KSTACK/TIER] base={:#x} size={}K tier={} (PMM fragmented)",
+            stack_base, span_bytes / 1024, pages,
         );
+        if pages == 1 {
+            // Preserve the legacy attribution line for the 4 KiB tier so
+            // existing log-grep tooling and the PR #391 diagnostic chain
+            // keep firing on the narrowest fallback specifically.
+            crate::serial_println!(
+                "[KSTACK/EMERGENCY] base={:#x} size=4K (PMM fragmented)",
+                stack_base,
+            );
+        }
         return Some((stack_base, stack_top));
     }
     None
 }
 
 /// Emit a one-shot diagnostic line if `stack_base` was just handed out from
-/// the 4 KiB emergency-fallback path.  Called by every `alloc_kernel_stack`
-/// consumer immediately after stamping the Thread, so the operator can see
-/// which (pid, tid) is running on the constrained stack.  Per Intel SDM
-/// Vol 3A §6.2 (stack-fault exceptions) and the x86_64 SysV ABI §3.4.1
-/// (stack growth direction), kernel paths on a 4 KiB stack must keep total
-/// frame depth ≤ 4 KiB or risk overwriting the bottom-of-stack canary.
+/// any of the small-stack emergency-fallback tiers (16 KiB / 8 KiB / 4 KiB).
+/// Called by every `alloc_kernel_stack` consumer immediately after stamping
+/// the Thread, so the operator can see which (pid, tid) is running on a
+/// constrained stack and at which tier.  Per Intel SDM Vol 3A §6.2 (stack-
+/// fault exceptions) and the x86_64 SysV ABI §3.4.1 (stack growth
+/// direction), kernel paths on any short stack must keep total frame depth
+/// ≤ `span` or risk overwriting the bottom-of-stack canary.
 #[inline]
 fn note_if_emergency_kstack(pid: Pid, tid: Tid, stack_base: u64, span: u64) {
     if span < KERNEL_STACK_SIZE && was_emergency_kstack(stack_base) {
@@ -658,17 +697,21 @@ pub fn current_kernel_rsp_live() -> u64 {
 
 // ── Emergency-stack-fallback recorder ────────────────────────────────────
 //
-// When `alloc_kernel_stack` falls back to a single 4 KiB page (PMM
-// fragmentation, line ~568 below), callers now stamp the honest 4 KiB
-// span into `Thread.kernel_stack_size` (PR #392, kstack-size honesty).
-// That span alone, however, doesn't say *why* a thread is on a short
-// stack — a future allocator might return 4 KiB for reasons other than
-// emergency fallback.  This diagnostic-only ring complements the now-
-// honest in-Thread span by attributing the emergency origin even after a
-// stack base is later reused: if the same base reappears within the
-// ring's 16-entry window, the canary-corruption diagnostic in
-// `sched::schedule` can still answer "was this thread on a 4 KiB
-// emergency stack?" rather than "merely on a 4 KiB stack".
+// When `alloc_kernel_stack` falls back from the normal 256 KiB path to any
+// of the smaller emergency tiers (16 KiB / 8 KiB / 4 KiB — see
+// `SMALL_KSTACK_TIERS`), callers stamp the honest span into
+// `Thread.kernel_stack_size` (PR #392, kstack-size honesty).  That span
+// alone, however, doesn't say *why* a thread is on a short stack — a
+// future allocator might return 16 KiB for reasons other than emergency
+// fallback.  This diagnostic-only ring complements the now-honest in-
+// Thread span by attributing the emergency origin even after a stack base
+// is later reused: if the same base reappears within the ring's 16-entry
+// window, the canary-corruption diagnostic in `sched::schedule` can still
+// answer "was this thread on an emergency-tier stack?" rather than
+// "merely on a short stack".  All sub-256-KiB tiers are recorded; the
+// `was_emergency_4k` label on the `[KSTACK/CANARY-FAIL]` line is retained
+// for backward-compat but now means "any emergency-tier base", with the
+// observed `size` field disambiguating which tier.
 //
 // Lock-free SPSC-ish ring; the writer is the alloc path (one writer at a
 // time under PMM_LOCK), the readers are diagnostic emitters that tolerate
