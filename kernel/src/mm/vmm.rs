@@ -678,10 +678,25 @@ pub fn unmap_page_in(pml4_phys: u64, virt_addr: u64) {
 /// Returns the number of frames actually freed (rc reached zero).  Pages
 /// that were never demand-paged are skipped.
 pub fn unmap_and_free_range_in(pml4_phys: u64, base: u64, length: u64) -> usize {
-    // Maximum physical addresses to defer per shootdown round.  1024 pages =
-    // 4 MiB.  Keeping the batch finite bounds stack-pressure (this runs on
-    // the kernel stack, not a heap-allocated buffer).
-    const BATCH: usize = 1024;
+    // Maximum physical addresses to defer per shootdown round.
+    //
+    // Sized to bound on-stack pressure on the brk-shrink / munmap path, which
+    // can be entered on the 4 KiB emergency-fallback kernel stack.  At
+    // `BATCH = 128`, `to_free = [0u64; BATCH]` consumes 1024 bytes — leaving
+    // headroom for the surrounding call chain (PTE walk, refcount dec, TLB
+    // shootdown, PMM free).  An earlier value of 1024 (8192 bytes) was the
+    // dominant source of STACK_CANARY_CORRUPT bugchecks under brk(2) shrink
+    // by glibc/musl when the emergency-fallback kstack was in use.
+    //
+    // Trade-off: shrinking the batch increases TLB-shootdown IPI rounds for
+    // very large `munmap` ranges (8× more IPIs per 1024 pages).  Typical
+    // brk-shrink and process-teardown ranges are small (≤16 pages), so the
+    // practical IPI cost is unchanged; only multi-MiB munmap calls see the
+    // extra rounds, and per Intel SDM Vol. 3A §4.10.4-5 each round is
+    // bounded by the per-CPU acknowledgement latency.
+    //
+    // Cite: brk(2) (POSIX 2017); Intel SDM Vol. 3A §4.10.4-5.
+    const BATCH: usize = 128;
 
     // W216 mm_sem read-lock: held across PTE clear → shootdown → free so a
     // sibling CPU executing `clone_for_fork` on the same address space (which
