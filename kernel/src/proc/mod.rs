@@ -602,6 +602,21 @@ fn alloc_kernel_stack() -> Option<(u64, u64)> {
         let Some(phys) = phys_opt else { continue };
         let stack_base = KERNEL_VIRT_OFFSET + phys;
         let stack_top = stack_base + span_bytes;
+        // Defence-in-depth: `pmm::alloc_page`/`alloc_pages` do not zero the
+        // returned frame, so a frame previously occupied by the page cache
+        // (e.g. an evicted libxul `.text` page) can land here with residual
+        // bytes that decode as valid x86-64 instructions occupying the
+        // canary slot at `stack_base`.  PR #418's GDB autopsy reproduced this
+        // across two KVM trials with STABLE residue at +8/+24 (deterministic
+        // page-cache provenance, not stack overflow).  Zero the entire span
+        // before stamping the canary so `write_stack_canary` sees a clean
+        // bottom-of-stack and so any subsequent push reads back zero, not a
+        // stale instruction byte.  Per x86_64 SysV ABI §3.4.1 the kernel
+        // stack must be initialised before first use; this provides that
+        // initialisation at the consumer until `pmm` grows a zeroing variant.
+        // SAFETY: `stack_base` is a freshly allocated, exclusively-owned
+        // higher-half mapping of `span_bytes` contiguous physical bytes.
+        unsafe { core::ptr::write_bytes(stack_base as *mut u8, 0, span_bytes as usize); }
         write_stack_canary(stack_base);
         // Record in the emergency-stack ring so the canary-corruption
         // diagnostic in `sched::schedule` retains attribution for every
