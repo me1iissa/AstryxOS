@@ -155,8 +155,56 @@ const D22_TARGET_PID: u64 = 1;
 /// budget is honest.
 const D22_ARM_MAX: u32 = 4;
 
+/// Maximum post-wake arm cycles per boot for the PR #423 follow-up
+/// PHYS_OFF channel below.  Tracked separately from `D22_ARM_MAX` so
+/// the pre-block arm budget (above) cannot starve the post-wake arm
+/// path that PR #423 evidence proved is the dispositive site.  Each
+/// arm consumes one DR slot until the per-slot `F3_FIRE_CAP = 32`
+/// fires self-disarm it.
+const D22_POSTWAKE_ARM_MAX: u32 = 2;
+
 /// Per-boot accepted-arm counter.  Mirrors D21's CAS-claim discipline.
 static D22_ARM_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Per-boot post-wake arm counter, paired with `D22_POSTWAKE_ARM_MAX`.
+static D22_POSTWAKE_ARM_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Empirical offset above the parent's post-wake `parent_user_rsp`
+/// where the libxul SSP-instrumented caller-frame's `[rbp-8]` canary
+/// slot lives in the FF + musl reproducer.
+///
+/// Derived from PR #420 / #421 / #423 cross-boot evidence (every soak
+/// observed the same byte-identical relationship):
+///
+///   * Post_wake `parent_rsp = 0x7ffffffec708` (deterministic — the
+///     kernel `USER_STACK_TOP` is set by the loader, not ASLR).
+///   * SSP-fail captured `rsp = 0x7ffffffee468` (deterministic — set
+///     by the libxul `posix_spawn` caller's frame layout, which is
+///     fixed at link time).
+///   * SSP-fail slot per PR #421 caller-frame snapshot is
+///     `[rsp+0x58] = 0x7ffffffee4c0`.
+///   * Delta: `0x7ffffffee4c0 - 0x7ffffffec708 = 0x1db8`.
+///
+/// This offset is the **post-wake** anchor — distinct from the
+/// `SAVED_RBP_OFFSET_FROM_RSP = 0x1d58` that the pre-block path uses,
+/// because pre-block and post-wake see different RSP contexts even
+/// though both observe the parent thread (vfork semantics: parent
+/// blocks on the kernel-side semaphore, then resumes on the SAME
+/// syscall frame, but the user-stack region above that RSP has been
+/// observed to differ in the SSP-canary slot's backing phys — the
+/// hypothesis this PHYS_OFF arm is built to falsify or confirm).
+///
+/// Per PR #423's 3-trial KVM soak the linear-VA write watchpoint on
+/// this slot returned **0/3 fires**, yet PR #421 proved the slot's
+/// stored qword IS overwritten with `0x30` byte-for-byte across all
+/// trials.  Per Intel SDM Vol. 3B §17.2.4, DR0–DR3 compare on linear
+/// addresses; a write that targets the slot via the kernel direct
+/// map (`PHYS_OFF + phys`) rather than via the user VA mapping is
+/// therefore invisible to a user-VA arm — but visible to a PHYS_OFF
+/// arm.  This module's post-wake PHYS_OFF arm is the dispositive
+/// channel for that hypothesis (the same two-channel pattern PR #356
+/// K2b established for the F3 saga).
+const POSTWAKE_FAIL_SLOT_OFFSET: u64 = 0x1db8;
 
 /// Per-DR-slot recorded arm-time `(write_va, phys_at_write, channel)`
 /// for D22 entries.  Indexed by DR slot 0..3 (mirrors
@@ -378,6 +426,15 @@ pub fn record_ssp_check(read_va: u64, expected: u64, observed: u64) {
 /// translation resolves to `PHYS_OFF + phys`.  Together they cover
 /// the user-VA path AND the kernel-direct-map path for the same
 /// underlying frame — the two-channel pattern PR #356 established.
+///
+/// **STATUS — superseded but retained (2026-05-23).** This hook
+/// arms the 0x1d50 saved-RBP slot, not the actual SSP-fail slot at
+/// 0x1db8 (see PR #421 / PR #423 evidence in
+/// `docs/SSP_KERNEL_WRITER_NAMED_2026-05-23.md`).  The replacement
+/// `try_arm_ssp_slot_phys` below is what `syscall.rs` calls; this
+/// function is preserved for callers from external crates / tests
+/// that may have referenced it under the PR #408 API.
+#[allow(dead_code)]
 pub fn try_arm_at_vfork_preblock(parent_pid: u64, parent_tid: u64) {
     // Fast precondition checks — keep the hot path cheap.  Same shape
     // as D21's gate.
@@ -534,4 +591,210 @@ pub fn try_arm_at_vfork_preblock(parent_pid: u64, parent_tid: u64) {
             slot, WATCH_KIND_D22_USER_CANARY_PHYS,
         );
     }
+}
+
+/// Atomically claim a post-wake arm slot via CAS.  Same shape as
+/// `claim_arm` above but on the post-wake counter.
+fn claim_postwake_arm() -> Result<(), ()> {
+    loop {
+        let cur = D22_POSTWAKE_ARM_COUNT.load(Ordering::Relaxed);
+        if cur >= D22_POSTWAKE_ARM_MAX {
+            return Err(());
+        }
+        if D22_POSTWAKE_ARM_COUNT
+            .compare_exchange(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+}
+
+/// Hook called from the clone(56) / clone3(435) PRE-block tail in
+/// `kernel/src/subsys/linux/syscall.rs`, immediately after the
+/// existing `vfork_canary_snapshot("pre_block.cloneX", …)` and the
+/// pre-block `try_arm_at_vfork_preblock` arms, **and** again at the
+/// matching post-wake tail as a fallback (in case the slot's phys
+/// changes between pre-block and post-wake — Mechanism D's
+/// signature).  Off-path cost on non-target callers: one integer
+/// compare + one relaxed atomic load.
+///
+/// ## Why arm at the SSP-fail slot offset and via PHYS_OFF
+///
+/// PR #423's 3-trial KVM soak armed a **linear-VA** write DR on the
+/// SSP-fail slot at `parent_rsp + 0x1db8` (= `0x7ffffffee4c0`,
+/// byte-identical across boots) at the post-wake site and observed
+/// **0/3 fires**, while PR #421 proved the slot's stored qword IS
+/// overwritten with `0x30` byte-for-byte across all three trials.
+///
+/// Per Intel SDM Vol. 3B §17.2.4, DR0–DR3 compare on linear
+/// addresses; the user-VA arm therefore covers only writes whose
+/// translation resolves to the watched linear address.  A write that
+/// targets the slot's backing physical frame via the kernel direct
+/// map (`PHYS_OFF + phys`) is invisible to the user-VA arm — its
+/// linear address is in the higher half, not the user range.
+///
+/// This hook arms exactly that complementary channel: a write-only
+/// 8-byte DR on `PHYS_OFF + virt_to_phys(parent_rsp + 0x1db8)`.
+/// If the corrupting writer is kernel-mode (CS = 0x08 / 0x10) and
+/// uses a direct-map mapping rather than the user VA, the next
+/// retired store to that frame fires `#DB` and `record_d22_fire`
+/// emits the writer's RIP + GPRs + CR3 + CS.  Per Intel SDM Vol. 3B
+/// §17.3.1.1 data-breakpoint exceptions are traps taken AFTER the
+/// writing instruction retires, so the `#DB` RIP points one
+/// instruction past the store — sufficient for post-processing to
+/// disassemble backward and name the kernel function.
+///
+/// ## Why both pre-block and post-wake call sites
+///
+/// First-deployment evidence (trial 1, 2026-05-23) showed the slot
+/// at `0x7ffffffee4c0` already contains `0x30` AT POST-WAKE ARM TIME
+/// (`canary_val=0x0000000000000030`), meaning the corrupting write
+/// happened during the vfork-wait window.  A post-wake arm therefore
+/// cannot catch it (the writing instruction has already retired).
+/// Arming at PRE-block — before `schedule()` suspends the parent —
+/// places the watchpoint BEFORE the writing window opens.
+///
+/// The post-wake call site is preserved as a fallback for the
+/// (Mechanism-D-shaped) case where the slot's backing frame
+/// CHANGES between pre-block and post-wake; if that happens, the
+/// pre-block arm watches the old phys and is silent, while the
+/// post-wake arm catches the next write to the new phys.  Bounded
+/// arm budget (`D22_POSTWAKE_ARM_MAX = 2`) covers both call sites
+/// per vfork without unbounded growth.
+///
+/// ## Why not also re-arm the linear channel here
+///
+/// PR #423 already established that the linear-VA channel is silent
+/// on this slot at this site.  Re-arming it would burn a DR slot
+/// without adding information.  The existing pre-block
+/// `try_arm_at_vfork_preblock` keeps the linear channel for its
+/// (separate) 0x1d50 anchor.
+///
+/// ## Bounding
+///
+/// At most `D22_POSTWAKE_ARM_MAX = 2` arms per boot, separate from
+/// the pre-block budget so the two channels do not compete.  Each
+/// successful arm consumes one DR slot until `F3_FIRE_CAP = 32`
+/// fires self-disarm it.  Refused arms (cap reached, pool exhausted,
+/// VA unmapped, walk failed) do NOT consume a count.
+///
+/// ## Diagnostic-only
+///
+/// Per the saga-discipline rules
+/// ([[feedback_saga_diagnostic_discipline_2026_05_20]]) this hook
+/// mutates no page tables, allocates no frames, changes no lock
+/// order, and performs no syscall-altering side effects.
+pub fn try_arm_ssp_slot_phys(parent_pid: u64, parent_tid: u64, site: &'static str) {
+    // Fast precondition checks — keep the hot path cheap.  Same
+    // shape as the pre-block gate above.
+    if parent_pid != D22_TARGET_PID {
+        return;
+    }
+    if D22_POSTWAKE_ARM_COUNT.load(Ordering::Relaxed) >= D22_POSTWAKE_ARM_MAX {
+        return;
+    }
+
+    // Resolve the parent's user RSP from the saved syscall frame.
+    // After `schedule()` returns from the vfork-wait, the parent
+    // thread is once again the running context and its kstack-top
+    // word still holds the saved user RSP from syscall entry.
+    let (user_rsp, _ignored_rbp) = get_parent_user_rsp_rbp(parent_tid);
+    if user_rsp == 0 {
+        crate::serial_println!(
+            "[D22/SSP-PHYS-ARM] site={} pid={} tid={} state=no_user_frame",
+            site, parent_pid, parent_tid,
+        );
+        return;
+    }
+
+    // Compute the candidate canary VA at the **post-wake** anchor
+    // offset (0x1db8, per PR #423 evidence — distinct from the
+    // pre-block 0x1d58 anchor).  Per System V AMD64 ABI §3.2.2 SSP
+    // convention applies to the resulting linear address regardless
+    // of which anchor was chosen; the offset only selects which
+    // call-chain frame's `[rbp-8]` slot is observed.
+    let canary_va = user_rsp.wrapping_add(POSTWAKE_FAIL_SLOT_OFFSET);
+
+    // Validate VA — must be 8-byte aligned and in user range.
+    // Per Intel SDM Vol. 3B §17.2.4 Table 17-2 LEN=8 requires
+    // natural alignment; misalignment would silently widen the
+    // breakpoint via the Intel-defined LEN encoding and catch
+    // unrelated writes.
+    if canary_va & 0x7 != 0
+        || canary_va < USER_ADDR_MIN
+        || canary_va >= USER_ADDR_END
+    {
+        crate::serial_println!(
+            "[D22/SSP-PHYS-ARM] site={} pid={} tid={} state=canary_va_invalid \
+             user_rsp={:#x} canary_va={:#x}",
+            site, parent_pid, parent_tid, user_rsp, canary_va,
+        );
+        return;
+    }
+
+    // Walk the user VA → phys under the parent's CR3 (which is the
+    // currently-loaded CR3 because we are running in the parent's
+    // syscall body post-`schedule()`).  Per Intel SDM Vol. 3A §4.6
+    // the walker returns `None` if any level is not-present; in that
+    // case there is nothing to mirror and we emit a state line.
+    let cpu = crate::arch::x86_64::apic::cpu_index();
+    let cr3 = crate::mm::vmm::get_cr3();
+    let (canary_val_opt, canary_phys_opt) = match read_user_qword(canary_va) {
+        Some((v, p)) => (Some(v), Some(p)),
+        None         => (None, None),
+    };
+    let walked_phys = match canary_phys_opt {
+        Some(p) => p,
+        None => {
+            crate::serial_println!(
+                "[D22/SSP-PHYS-ARM] site={} state=phys_unmapped pid={} tid={} cpu={} \
+                 cr3={:#x} user_rsp={:#x} canary_va={:#x}",
+                site, parent_pid, parent_tid, cpu, cr3, user_rsp, canary_va,
+            );
+            return;
+        }
+    };
+
+    use crate::arch::x86_64::debug_reg::{
+        arm_phys_slot_watchpoint, retag_slot,
+        ArmPhysResult, WATCH_KIND_D22_USER_CANARY_PHYS,
+    };
+
+    if claim_postwake_arm().is_err() {
+        return;
+    }
+
+    let frame_base = walked_phys & !0xFFFu64;
+    let off_in_frame = walked_phys & 0xFFFu64;
+    let result = arm_phys_slot_watchpoint(frame_base, off_in_frame, 8);
+    let (state, slot) = match result {
+        ArmPhysResult::Armed(s)      => ("armed", s as i32),
+        ArmPhysResult::PoolExhausted => ("pool_exhausted", -1),
+        ArmPhysResult::NotAligned    => ("not_aligned", -1),
+        ArmPhysResult::OutOfRange    => ("out_of_range", -1),
+    };
+    // Promote the legacy tag set by `arm_phys_slot_watchpoint` to
+    // `WATCH_KIND_D22_USER_CANARY_PHYS` so the persistent-arm /
+    // `F3_FIRE_CAP` policy applies and `record_d22_fire` routes the
+    // diagnostic — same retag pattern as the pre-block path above
+    // and PR #382's D16 precedent.
+    if let ArmPhysResult::Armed(s) = result {
+        retag_slot(s as usize, WATCH_KIND_D22_USER_CANARY_PHYS);
+        note_arm(s, canary_va, walked_phys, CHANNEL_PHYS);
+    }
+    let linear = PHYS_OFF.wrapping_add(walked_phys);
+    let canary_val_str = match canary_val_opt {
+        Some(v) => alloc::format!("{:#018x}", v),
+        None    => alloc::string::String::from("unmapped"),
+    };
+    crate::serial_println!(
+        "[D22/SSP-PHYS-ARM] site={} channel=phys state={} pid={} tid={} cpu={} cr3={:#x} \
+         user_rsp={:#x} canary_va={:#x} canary_val={} canary_phys={:#x} \
+         mirror_linear={:#x} slot={} len=8 kind_tag={} offset={:#x}",
+        site, state, parent_pid, parent_tid, cpu, cr3,
+        user_rsp, canary_va, canary_val_str, walked_phys,
+        linear, slot, WATCH_KIND_D22_USER_CANARY_PHYS,
+        POSTWAKE_FAIL_SLOT_OFFSET,
+    );
 }
