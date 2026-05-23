@@ -245,6 +245,31 @@ pub mod d20_kstack_canary_watch;
 #[cfg(feature = "d21-user-canary-watch")]
 pub mod d21_user_canary_watch;
 
+/// D22 — PHYS_OFF channel companion to D21 for user-canary phys-aliasing
+/// detection (Wave 13).  After PR #404 (D21 linear-VA arm) named the
+/// user-canary writers as legitimate musl prologue pushes, and PR #406
+/// / PR #407 rejected every alternative mechanism (alignment, signal-
+/// frame, kstack drift, substitution-gate sub-shapes), the convergent
+/// verdict is **Mechanism D — phys-aliasing on the user stack**.  The
+/// libxul SSP prologue stores the canary at user VA `0x7ffffffee458`;
+/// the epilogue's `XOR [rbp-8], rax` loads from the same linear VA;
+/// but the **physical frame backing that VA differs** between store
+/// and load (same class as PR #248 H3a/H3b on file-backed shared
+/// cache; PR #356 K2b user-stack canary).  D22 arms a two-channel
+/// watchpoint pair (linear user-VA + PHYS_OFF mirror on the observed
+/// backing frame) at the vfork-PRE-block hook, captures
+/// `phys_at_write` at fire time via the firing CR3, and emits a
+/// read-time `[D22/SSP-CHECK]` line at the CPL-3 `#GP` for
+/// `phys_at_read` — the dispositive comparison.  Diagnostic-only;
+/// gated behind `d22-user-canary-phys` so master builds remain
+/// byte-identical.  Refs: Intel SDM Vol. 3B §17.2.4 (DR0–DR3, DR7),
+/// §17.3.1.1 (data-breakpoint trap-after-retire); Intel SDM Vol. 3A
+/// §4.6 (page-table walk), §4.10.5 (TLB-coherency invariant); System
+/// V AMD64 ABI §3.2.2 (frame layout), §3.4.5.2 / §6.4 (SSP); POSIX
+/// `vfork(3p)`; CWE-121; PR #248, PR #356, PR #404, PR #407.
+#[cfg(feature = "d22-user-canary-phys")]
+pub mod d22_user_canary_phys;
+
 /// Bounded broadcast-within-cluster compensation for FUTEX_WAKE.  Mitigates
 /// the older-glibc `pthread_cond_signal` race
 /// (<https://sourceware.org/bugzilla/show_bug.cgi?id=25847>) by
