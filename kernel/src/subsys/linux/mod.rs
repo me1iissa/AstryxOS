@@ -270,6 +270,28 @@ pub mod d21_user_canary_watch;
 #[cfg(feature = "d22-user-canary-phys")]
 pub mod d22_user_canary_phys;
 
+/// F3 code-fetch (instruction-execute) DR0 watchpoint on the
+/// deterministic musl `__stack_chk_fail+0x0` user VA — the saga
+/// closer for the user-mode SSP-fail trap reproduced byte-identically
+/// by PR #420.  Arms a single instruction breakpoint (Intel SDM
+/// Vol. 3B §17.2.4 RW=00b / LEN=00b) after the `[VFORK/CANARY]
+/// post_wake.*` snapshot for PID 1; emits a one-shot
+/// `[F3/CODE-DR-FIRE]` dump with all 15 saved GPRs + RFLAGS + RIP +
+/// CS, 16 qwords above RSP, and 4 qwords around RBP at the precise
+/// moment the SSP epilogue invokes `__stack_chk_fail`.  Unlike the
+/// D21/D22 data-watch channels (which name the canary slot's
+/// writer), this names the *reader-side* caller-frame snapshot so a
+/// post-processor can diff the saved-canary slot against the
+/// `fs:0x28` master canary.  Diagnostic-only; gated behind
+/// `f3-codeDR-watch` so master builds remain byte-identical.  Refs:
+/// Intel SDM Vol. 3B §17.2.4 (DR0–DR3, DR7), §17.3.1.1 (instruction-
+/// breakpoint fault timing); Intel SDM Vol. 3A §6.15 (#DB);
+/// System V AMD64 ABI §3.4.1 (SSP); GCC manual §3.20
+/// (-fstack-protector); PR #420 (autopsy verdict), PR #417 (libxul
+/// SSP-shape audit).
+#[cfg(feature = "f3-codeDR-watch")]
+pub mod f3_code_dr_watch;
+
 /// Bounded broadcast-within-cluster compensation for FUTEX_WAKE.  Mitigates
 /// the older-glibc `pthread_cond_signal` race
 /// (<https://sourceware.org/bugzilla/show_bug.cgi?id=25847>) by
