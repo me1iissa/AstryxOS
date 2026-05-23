@@ -369,6 +369,15 @@ pub fn init() {
     let _ = symlink("/lib64", "/disk/lib64");
     let _ = symlink("/usr",   "/disk/usr");
     let _ = symlink("/opt",   "/disk/opt");
+    // /bin → /disk/bin so /bin/busybox and the applet wrappers
+    // staged by create-data-disk.sh are reachable at their FHS path
+    // (per https://refspecs.linuxfoundation.org/FHS_3.0/).  Upstream
+    // binaries hard-code `/bin/foo` for many tools; without this the
+    // PATH search in busybox sh would only find files staged at
+    // `/disk/bin/foo`.  /etc/ is NOT symlinked because the kernel
+    // populates it in-RAM with locally-customised tmpfs entries
+    // (hostname, motd, nsswitch.conf, hosts, resolv.conf, etc.) below.
+    let _ = symlink("/bin",   "/disk/bin");
 
     // Create /dev/null and /dev/console.
     let _ = create_file("/dev/null");
@@ -461,6 +470,23 @@ pub fn init() {
     // /etc/resolv.conf — no nameservers; hosts: files means DNS is not used
     if let Ok(()) = create_file("/etc/resolv.conf") {
         let _ = write_file("/etc/resolv.conf", b"# no nameservers\n");
+    }
+
+    // /etc/os-release — systemd-style distro identifier
+    // (https://www.freedesktop.org/software/systemd/man/os-release.html).
+    // Many CLI tools (lsb_release, neofetch, busybox uname -a fallback,
+    // various Mozilla telemetry sniffers) read this file to identify
+    // the host distro.  We provide a static AstryxOS-flavoured entry
+    // here as the in-RAM authoritative copy; the data.img build also
+    // stages a copy at /disk/etc/os-release for tools that hard-code
+    // the `/disk/` prefix.
+    if let Ok(()) = create_file("/etc/os-release") {
+        let _ = write_file("/etc/os-release",
+            b"NAME=\"AstryxOS\"\n\
+              ID=astryxos\n\
+              VERSION_ID=demo\n\
+              PRETTY_NAME=\"AstryxOS (Aether kernel demo)\"\n\
+              HOME_URL=\"https://example.org/astryxos\"\n");
     }
 
     // /etc/machine-id — required by GLib, systemd, D-Bus, and many userspace tools.
