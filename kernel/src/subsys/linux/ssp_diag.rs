@@ -416,6 +416,28 @@ fn lookup_vma_perms(addr: u64) -> Option<(u64, u64, &'static str)> {
     Some((vma.base, vma.base + vma.length, perms_str(vma.prot)))
 }
 
+/// Resolve `addr` into `(vma.name, vma.base, vma.end, file_offset,
+/// elf_load_delta, mount_idx, inode)` when the covering VMA is file-backed.
+/// `vaddr_in_elf = (addr - vma.base) + file_offset + elf_load_delta` is the
+/// link-time VA an `addr2line`/`nm` invocation expects (ELF-64 Object File
+/// Format §3 — Program Loading).  `mount_idx` + `inode` uniquely name the
+/// on-disk object.
+fn lookup_vma_file_info(addr: u64)
+    -> Option<(&'static str, u64, u64, u64, u64, usize, u64)>
+{
+    use crate::mm::vma::VmBacking;
+    let pid = crate::proc::current_pid_lockless();
+    let procs = crate::proc::PROCESS_TABLE.try_lock()?;
+    let pe = procs.iter().find(|p| p.pid == pid)?;
+    let vma = pe.vm_space.as_ref()?.find_vma(addr)?;
+    match vma.backing {
+        VmBacking::File { mount_idx, inode, offset, elf_load_delta } =>
+            Some((vma.name, vma.base, vma.base + vma.length,
+                  offset, elf_load_delta, mount_idx, inode)),
+        _ => None,
+    }
+}
+
 /// Walk backward up to `PROLOGUE_SCAN_BACK` bytes from `trap_ra` for
 /// the 4-byte `SUB RSP, 0x58` leader, then scan the next 32 bytes for
 /// the `MOV %fs:0x28, %rax` and `MOV %rax, 0x50(%rsp)` pair.  Byte-wise
@@ -896,6 +918,48 @@ pub fn probe_gp_at_ssp_fail(
     crate::serial_println!(
         "[SSP-DIAG-RBP] pid={} tid={} rbp0={:#x} {} {}",
         pid, tid, user_rbp_at_gp, joined, break_str,
+    );
+
+    // ── Line 7a: [SSP-DIAG-CALLER-WALK] — deciding probe for the PR #421
+    //   vs PR #425 slot contradiction (post-INFRA-4 cycle).  Reads the
+    //   return address pushed by `call __stack_chk_fail` (Intel SDM Vol.
+    //   2A §3.3 — `CALL rel32` = `E8 cd`, 5 bytes), resolves the covering
+    //   file-backed VMA so a post-hoc `addr2line -e libxul.so
+    //   <return_rip_vaddr_in_elf>` (or, for stripped libxul,
+    //   `objdump -d --start-address=<offset_in_file>`) names the SSP-
+    //   instrumented caller, and dumps PR #425's "Reframe B" canary slot
+    //   at `caller_rsp + 0x1e0` (= `frame_rsp + 0x1e8`) alongside the
+    //   existing PR #421 slot already shown by [SSP-DIAG-CANARY].
+    //
+    //   ELF-64 Object File Format §3 (Program Loading): `vaddr_in_elf =
+    //   (addr - vma.base) + file_offset + elf_load_delta`.  Refs: Intel
+    //   SDM Vol. 2A §3.3; System V AMD64 ABI §3.4.5; GCC manual §3.20
+    //   (-fstack-protector-strong).
+    const CALL_REL32_LEN: u64 = 5;
+    let (return_rip, _) = read_user_qword(frame_rsp).unwrap_or((0, 0));
+    let (vname, vbase, vend, voff, vdelta, vmnt, vino, voff_file, velf) =
+        match lookup_vma_file_info(return_rip) {
+            Some((n, b, e, o, d, m, i)) => {
+                let off_f = return_rip.wrapping_sub(b).wrapping_add(o);
+                (n, b, e, o, d, m as i64, i as i64,
+                 off_f, off_f.wrapping_add(d))
+            }
+            None => ("?", 0, 0, 0, 0, -1, -1, 0, 0),
+        };
+    let _ = (voff, vdelta); // referenced via voff_file/velf already
+    let slot_pr425 = caller_rsp.wrapping_add(0x1e0);
+    let pr425_val = read_user_qword(slot_pr425).map(|(v,_)| v);
+    crate::serial_println!(
+        "[SSP-DIAG-CALLER-WALK] pid={} tid={} return_rip={:#x} pre_call_rip={:#x} \
+         caller_vma_name={} caller_vma_base={:#x} caller_vma_end={:#x} \
+         return_rip_offset_in_file={:#x} return_rip_vaddr_in_elf={:#x} \
+         caller_vma_mount={} caller_vma_inode={} \
+         slot_pr425={:#x} slot_pr425_val={}",
+        pid, tid, return_rip, return_rip.saturating_sub(CALL_REL32_LEN),
+        vname, vbase, vend, voff_file, velf, vmnt, vino,
+        slot_pr425,
+        match pr425_val { Some(v) => alloc::format!("{:#018x}", v),
+                          None    => alloc::string::String::from("?") },
     );
 
     // ── Line 7: [SSP-DIAG-SIGNALS] — per-thread signal-delivered count
