@@ -506,6 +506,37 @@ d22-user-canary-phys = ["firefox-test", "w215-diag", "ssp-canary-diag"]
 # §3.20 (-fstack-protector); PR #420 (autopsy verdict, byte-
 # identical 2/2 reproduction), PR #417 (libxul SSP-shape audit).
 f3-codeDR-watch = ["firefox-test", "w215-diag"]
+# F3 saga companion to `f3-codeDR-watch` — adds a one-shot 8-byte
+# DATA-WRITE hardware breakpoint on the per-trial `parent_user_rsp +
+# 0x58` SSP-canary slot (the user VA whose contents PR #420/#421
+# named as `0x30` byte-invariant across trials).  Where the code-DR
+# (kind 9) names the slot from the SSP epilogue's read-side caller-
+# frame, the write-DR (kind 10) names the *writer* — the instruction
+# that stores the corrupting value into the slot between the
+# prologue's canary stamp and the epilogue's check.  On fire the
+# kernel emits one `[F3/WRITE-DR-FIRE]` block: all 15 GPRs + RFLAGS +
+# CS + DR6, the post-write qword at the slot (confirming the
+# corrupting value), 9 qwords of the writer's local frame at
+# `[rsp..rsp+0x40]`, and a 16-byte instruction-stream window below
+# `rip_after_trap` so a post-processor can disassemble backward to
+# the writing instruction (Intel SDM Vol. 2A §2.1 — AMD64
+# instructions are 1..15 bytes, so 16 bytes always brackets the
+# prior instruction).  Per Intel SDM Vol. 3B §17.3.1.1 data
+# breakpoints are TRAPS (taken after retire), so the captured RIP is
+# the next instruction; the writer's RIP is recovered by the
+# backward-disassembly window.  Arm is one-shot at the first PID 1
+# post_wake; disarms on first fire.  Diagnostic-only; default builds
+# remain byte-identical when off.  Depends on `firefox-test` (path /
+# pid gating) and `w215-diag` (DR0–DR3 + #DB plumbing).  Refs: Intel
+# SDM Vol. 3B §17.2.4 Table 17-2 (DR0–DR3, DR7 — RW=01b / LEN=10b
+# 8-byte write encoding), §17.2.5 (8-byte LEN form valid on x86_64),
+# §17.3.1.1 (#DB data-breakpoint trap timing); Intel SDM Vol. 3A
+# §6.15 (#DB vector 1); Intel SDM Vol. 2A §2.1 (instruction length);
+# System V AMD64 ABI §3.4.1 (SSP), §3.4.5.2 (frame-pointer
+# convention); GCC manual §3.20 (-fstack-protector); PR #421
+# (slot-naming code-fetch DR), PR #420 (autopsy verdict, byte-
+# invariant `0x30` in the slot).
+f3-codeDR-write-watch = ["firefox-test", "w215-diag"]
 # Track B (Phase 5, 2026-05-21) — stack-page write provenance ring.
 # Records kernel-mode writes whose target user VA falls into the
 # `[0x3f00_0000_0000, 0x4000_0000_0000)` thread-stack range (per Phase 4

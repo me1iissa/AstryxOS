@@ -187,6 +187,20 @@ pub const WATCH_KIND_D22_USER_CANARY_PHYS: u32 = 8;
 ///       kind), matching legacy slots — a single fire produces the
 ///       full dump and the slot releases for any later diagnostic.
 pub const WATCH_KIND_F3_CODE_DR:     u32 = 9;
+///  10 — F3 data-write (1..8-byte qword) watch on the per-trial
+///       `parent_user_rsp + 0x58` SSP-canary slot (see
+///       `subsys/linux/f3_code_dr_write_watch.rs`).  Companion to kind
+///       9 (PR #421): the code-DR named the slot, the write-DR names
+///       the writer.  Differs from kind 9 in DR7 encoding: RW=01b
+///       (write only) + LEN=10b (8 bytes — qword form, valid on
+///       x86_64 per Intel SDM Vol. 3B §17.2.4 Table 17-2 / §17.2.5).
+///       Per §17.3.1.1 the data-breakpoint trap is taken AFTER the
+///       writer's store retires, so the `#DB` frame's `rip` points to
+///       the next instruction; the writer's RIP is recovered by the
+///       module's backward-disassembly window.  One-shot disarm
+///       policy — a single fire produces the full dump and the slot
+///       releases for any later diagnostic.
+pub const WATCH_KIND_F3_WRITE_DR:    u32 = 10;
 static ARMED_KIND: [AtomicU32; N_DR_SLOTS] = [
     AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
 ];
@@ -678,6 +692,14 @@ pub fn handle_db_exception(
         // retired writer; the cap controls how many writers we log,
         // not the timing of the trap.
         let cap = if kind_tag == WATCH_KIND_D16_CANARY { D16_FIRE_CAP } else { F3_FIRE_CAP };
+        // `WATCH_KIND_F3_WRITE_DR` (kind 10) shares the F3-cap policy:
+        // a single fire often catches only the SSP prologue's
+        // legitimate canary stamp; the corrupting write is one of
+        // several subsequent stores.  The cap (`F3_FIRE_CAP = 32`)
+        // bounds log volume while letting the post-processor see the
+        // first ~N writers to the watched slot in order — sufficient
+        // to identify the corrupting writer (Intel SDM Vol. 3B
+        // §17.3.1.1 — each `#DB` names one retired writer).
         let one_shot = match kind_tag {
             WATCH_KIND_LEGACY => true,
             _ => fire_idx + 1 >= cap,
@@ -733,6 +755,20 @@ pub fn handle_db_exception(
         #[cfg(feature = "f3-codeDR-watch")]
         if kind_tag == WATCH_KIND_F3_CODE_DR {
             crate::subsys::linux::f3_code_dr_watch::record_fire(
+                slot as u8, rip, rsp, rflags, cs, cr3, gprs,
+            );
+        }
+        // F3 write-DR hook — emit the `[F3/WRITE-DR-FIRE]` dump for
+        // data-write fires on the `parent_user_rsp + 0x58` SSP-canary
+        // slot (PR #421 saga-closer companion).  Per Intel SDM
+        // Vol. 3B §17.3.1.1 data-breakpoint traps fire AFTER the
+        // writer's store retires, so `rip` here is the
+        // instruction-following-the-write; the writer's RIP is
+        // reconstructed by the module's backward-disassembly window.
+        // Gated on `f3-codeDR-write-watch`.
+        #[cfg(feature = "f3-codeDR-write-watch")]
+        if kind_tag == WATCH_KIND_F3_WRITE_DR {
+            crate::subsys::linux::f3_code_dr_write_watch::record_fire(
                 slot as u8, rip, rsp, rflags, cs, cr3, gprs,
             );
         }
