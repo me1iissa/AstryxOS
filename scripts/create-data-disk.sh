@@ -40,6 +40,13 @@ FIREFOX=false
 # Selectable via CLI arg or env var; env var loses to explicit CLI arg.
 FIREFOX_VARIANT="${ASTRYXOS_FIREFOX_VARIANT:-glibc}"
 
+# When set (env or --xeyes flag), also stage the Alpine xeyes binary + its
+# missing deps into build/disk/, and copy /usr/bin/xeyes into data.img.
+# Independent of Firefox staging; opt-in to keep default builds lean.
+# See scripts/install-xeyes.sh for the rationale (X11 "hello world" probe
+# of the kernel personality stack outside the libxul SSP saga).
+XEYES="${ASTRYXOS_XEYES:-0}"
+
 # Firefox package selector (musl variant only).  Picks which Alpine package
 # install-firefox-musl.sh + install-firefox-musl-debug.sh pull:
 #
@@ -100,6 +107,7 @@ for arg in "$@"; do
         --firefox-debug=*) FIREFOX_DEBUG="${arg#--firefox-debug=}" ;;
         --firefox-debug)   FIREFOX_DEBUG=1 ;;
         --firefox-package=*) FIREFOX_PACKAGE="${arg#--firefox-package=}" ;;
+        --xeyes) XEYES=1; FORCE=true ;;
         [0-9]*) SIZE_MB="$arg" ;;
     esac
 done
@@ -429,6 +437,20 @@ PREFS
 
 fi  # end FIREFOX_VARIANT branch
 
+# ── Optional: stage Alpine xeyes (X11 "hello world" outside libxul) ──────────
+# Independent of FIREFOX_VARIANT — xeyes only requires the musl libc + a small
+# X11 client stack, all of which we already stage for the musl Firefox path.
+# Triggered by ASTRYXOS_XEYES=1 or --xeyes.  The kernel side wires this up
+# under cargo feature `xeyes-test` (see kernel/src/main.rs).
+if [ "${XEYES}" = "1" ] || [ "${XEYES}" = "true" ]; then
+    if [ -f "${ROOT_DIR}/scripts/install-xeyes.sh" ]; then
+        XEYES_FLAGS=""
+        [ "${FORCE}" = true ] && XEYES_FLAGS="--force"
+        bash "${ROOT_DIR}/scripts/install-xeyes.sh" ${XEYES_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
+            { echo "[DATA-DISK] FATAL: install-xeyes.sh failed"; exit 1; }
+    fi
+fi
+
 # ── Compile glibc_hello oracle binary if source present ──────────────────────
 GLIBC_HELLO_SRC="${ROOT_DIR}/userspace/glibc_hello.c"
 GLIBC_HELLO_BIN="${BUILD_DIR}/glibc_hello"
@@ -753,6 +775,18 @@ EOF
         echo "[DATA-DISK] Copied /opt/firefox to data image"
     else
         echo "[DATA-DISK] WARNING: ${FF_OPT}/firefox not found — Firefox not on data disk"
+    fi
+
+    # ── xeyes binary at /usr/bin/xeyes (opt-in via ASTRYXOS_XEYES/--xeyes) ──
+    # Per scripts/install-xeyes.sh: the X11 client lives in /usr/bin (the
+    # canonical Alpine install path) so PATH-less absolute invocation from
+    # the kernel xeyes-test launch path resolves the binary correctly.
+    XEYES_STAGED="${BUILD_DIR}/disk/usr/bin/xeyes"
+    if [ -f "${XEYES_STAGED}" ]; then
+        mmd -i "${DATA_IMG}" "::usr"      2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/bin"  2>/dev/null || true
+        mcopy -o -i "${DATA_IMG}" "${XEYES_STAGED}" "::usr/bin/xeyes"
+        echo "[DATA-DISK] Copied /usr/bin/xeyes ($(stat -c%s "${XEYES_STAGED}") bytes)"
     fi
 
     # ── /tmp staging: hello.html for Firefox oracle test ─────────────────────

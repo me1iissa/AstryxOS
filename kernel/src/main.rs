@@ -363,9 +363,194 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             loop { unsafe { core::arch::asm!("hlt"); } }
         }
 
+        // ── X11 pivot: xeyes (Linux app outside libxul SSP saga) ───────────
+        // Activated by `--features xeyes-test`.  Launches the Alpine musl-linked
+        // xeyes binary (~28 KB) as the sole user workload, after bringing up
+        // Xastryx.  Proves the kernel personality stack runs unmodified Alpine
+        // Linux X11 binaries end-to-end without the libxul indirect-call
+        // complexity (no vfork/posix_spawn, no JIT, no SSP-canary stamping in
+        // xeyes itself; libX11/libXt may have SSP callsites that reach a real
+        // musl __stack_chk_guard via static-TLS).
+        //
+        // The block layout deliberately mirrors firefox-test below so the
+        // boot-time scaffolding (kernel-stack pre-alloc, page-cache
+        // pre-population, X11 desktop) is identical and any divergence in
+        // outcomes is attributable to the workload binary, not the harness.
+        //
+        // Mutually exclusive with firefox-test: both set would race for
+        // Xastryx + the visible-window slot.
+        #[cfg(all(not(feature = "gui-test"),
+                  not(feature = "firefox-test"),
+                  feature = "xeyes-test"))]
+        {
+            serial_println!("[XEYES] xeyes-test mode starting...");
+            x11::init();
+            serial_println!("[XEYES] X11 server ready");
+
+            gui::desktop::launch_desktop();
+            hal::enable_interrupts();
+
+            // Let the desktop settle (mirrors FFTEST wait).
+            let t0 = arch::x86_64::irq::get_ticks();
+            while arch::x86_64::irq::get_ticks().wrapping_sub(t0) < 30 {
+                gui::compositor::compose();
+                core::hint::spin_loop();
+            }
+
+            // Pre-allocate kernel stacks for the xeyes worker thread(s).
+            // xeyes itself is single-threaded but ld-musl + libX11 may
+            // spawn helpers; PMM fragmentation under page-cache pre-load
+            // can otherwise starve the dead-stack cache (see PR #156
+            // rationale for the firefox-test pre-alloc burst).
+            {
+                const PRE_ALLOC_STACKS: usize = 8;
+                let mut prealloc_count = 0;
+                for _ in 0..PRE_ALLOC_STACKS {
+                    if let Some(phys) = mm::pmm::alloc_pages(proc::KERNEL_STACK_PAGES_PUB) {
+                        let base = proc::KERNEL_VIRT_OFFSET + phys;
+                        proc::write_stack_canary(base);
+                        sched::push_dead_stack_pub(base);
+                        prealloc_count += 1;
+                    }
+                }
+                serial_println!("[XEYES] Pre-allocated {} kernel stacks ({} KiB)",
+                    prealloc_count, prealloc_count * 64);
+            }
+
+            // Pre-populate page cache for xeyes + its 5 unique deps + musl
+            // libc + the X11 libs shared with the Firefox path.  Cold ATA
+            // PIO is ~100 µs/sector on WSL2/KVM; even a 28 KB binary takes
+            // ~7 sectors → ~1 ms, but ld-musl + libX11 (~650 KB + ~1.4 MB)
+            // dominate the start-up latency.  Pre-loading here lets the
+            // desktop compositor spin while disk I/O is in flight.
+            serial_println!("[XEYES] Pre-populating page cache for xeyes + deps...");
+            for path in &[
+                "/disk/lib/ld-musl-x86_64.so.1",            // 650 KB — interpreter
+                "/disk/lib/libc.musl-x86_64.so.1",          // symlink to ld-musl
+                "/disk/usr/bin/xeyes",                      // 28 KB — workload
+                "/disk/usr/lib/libX11.so.6",                // ~1.4 MB — X11 client
+                "/disk/usr/lib/libXt.so.6",                 // ~340 KB — Xt toolkit
+                "/disk/usr/lib/libXmu.so.6",                // ~ 60 KB — Xmu shape
+                "/disk/usr/lib/libXi.so.6",                 // ~ 50 KB — Xi events
+                "/disk/usr/lib/libXext.so.6",               // ~ 70 KB — Xext
+                "/disk/usr/lib/libXrender.so.1",            // ~ 30 KB — Xrender
+                "/disk/usr/lib/libX11-xcb.so.1",            // ~  5 KB — X11-xcb glue
+                "/disk/usr/lib/libxcb.so.1",                // ~140 KB — xcb core
+                "/disk/usr/lib/libxcb-damage.so.0",         // stub
+                "/disk/usr/lib/libxcb-present.so.0",        // stub
+                "/disk/usr/lib/libxcb-xfixes.so.0",         // stub
+                "/disk/usr/lib/libSM.so.6",                 // ~ 40 KB — session mgmt
+                "/disk/usr/lib/libICE.so.6",                // ~110 KB — ICE transport
+                "/disk/usr/lib/libuuid.so.1",               // ~ 20 KB — uuidgen (libSM dep)
+            ] {
+                let t0 = arch::x86_64::irq::get_ticks();
+                let pages = mm::cache::prepopulate_file(path);
+                let dt = arch::x86_64::irq::get_ticks().wrapping_sub(t0);
+                serial_println!("[XEYES] Cached {} ({} pages, {} ticks)",
+                    path, pages, dt);
+                gui::compositor::compose();
+            }
+            let (total, _dirty) = mm::cache::stats();
+            serial_println!("[XEYES] Page cache: {} pages total", total);
+            serial_println!("[XEYES] Pre-load complete — launching xeyes");
+
+            // Existence probe: stat the binary before launch_process attempts
+            // exec.  Avoids the launch_process error path masking a missing-
+            // staging gate as a kernel ABI fault.  POSIX stat(2): success iff
+            // the file is reachable — no content read, no allocator pressure.
+            let stat_res = crate::vfs::stat("/disk/usr/bin/xeyes");
+            serial_println!("[XEYES] Binary probe: /disk/usr/bin/xeyes -> {:?}",
+                stat_res.as_ref().map(|s| s.size).map_err(|e| *e));
+
+            // DISPLAY=:0 wires xeyes to the kernel Xastryx instance bound at
+            // /tmp/.X11-unix/X0 (see kernel/src/x11/mod.rs init()).  No
+            // XAUTHORITY: Xastryx accepts kernel-pid (PID 0) and any peer
+            // without auth (a non-issue for the demo soak).
+            //
+            // We don't pass any --display argument: libXt's XtAppInitialize
+            // falls back to the DISPLAY env var, which the kernel launch
+            // path's terminal::launch_process plumbs through.
+            const CMDLINE: &str = "/disk/usr/bin/xeyes";
+            serial_println!("[XEYES] Launching {} ...", CMDLINE);
+            gui::terminal::launch_process(CMDLINE);
+
+            // Soak loop: same shape as FFTEST but shorter budget (xeyes is
+            // tiny — if it isn't drawing within ~30 s something is wrong).
+            let t_launch = arch::x86_64::irq::get_ticks();
+            let mut last_log_tick: u64 = 0;
+            let mut xeyes_exited = false;
+            loop {
+                gui::input::pump_input();
+                crate::net::poll();
+                crate::x11::poll();
+                crate::gui::terminal::poll_output();
+                let now_t = arch::x86_64::irq::get_ticks();
+                if now_t % 3 == 0 {
+                    gui::compositor::compose();
+                }
+
+                let now = arch::x86_64::irq::get_ticks();
+                let elapsed = now.wrapping_sub(t_launch);
+
+                if elapsed / 1000 != last_log_tick / 1000 {
+                    last_log_tick = elapsed;
+                    let sc = crate::syscall::syscall_count();
+                    let pf = crate::perf::page_faults();
+                    match crate::proc::THREAD_TABLE.try_lock() {
+                        Some(threads) => {
+                            let total = threads.len();
+                            serial_println!("[XEYES] tick={} sc={} pf={} total_th={}",
+                                elapsed, sc, pf, total);
+                        }
+                        None => {
+                            serial_println!("[XEYES] tick={} sc={} pf={} THREAD_TABLE busy",
+                                elapsed, sc, pf);
+                        }
+                    }
+                }
+
+                // xeyes is a draw-and-poll event loop — under the demo soak we
+                // exit when the workload itself exits, OR after 18000 ticks
+                // (~180 s) so a wedged process can't pin the CI watchdog.
+                if elapsed > 60 && !crate::gui::terminal::is_firefox_running() {
+                    serial_println!("[XEYES] xeyes exited after {} ticks", elapsed);
+                    xeyes_exited = true;
+                    break;
+                }
+
+                if elapsed >= 18000 {
+                    serial_println!("[XEYES] Soak budget reached at {} ticks", elapsed);
+                    break;
+                }
+
+                crate::sched::yield_cpu();
+                unsafe { core::arch::asm!("hlt"); }
+            }
+
+            serial_println!("[XEYES] xeyes_exited={}", xeyes_exited);
+            serial_println!("[XEYES] DONE");
+
+            // Pause briefly for QMP screendump, then exit (mirrors FFTEST).
+            let t_done = arch::x86_64::irq::get_ticks();
+            while arch::x86_64::irq::get_ticks().wrapping_sub(t_done) < 100 {
+                core::hint::spin_loop();
+            }
+            unsafe {
+                core::arch::asm!(
+                    "out dx, eax",
+                    in("dx")  0xf4_u16,
+                    in("eax") 0_u32,
+                    options(nomem, nostack)
+                );
+            }
+            loop { unsafe { core::arch::asm!("hlt"); } }
+        }
+
         // ── X11 visual test: create a colored window and hold it on screen ──
         // Activated by firefox-test mode — shows an X11 window before Firefox.
-        #[cfg(all(not(feature = "gui-test"), feature = "firefox-test"))]
+        #[cfg(all(not(feature = "gui-test"),
+                  not(feature = "xeyes-test"),
+                  feature = "firefox-test"))]
         {
             serial_println!("[FFTEST] Firefox-test mode starting...");
             x11::init();
@@ -725,7 +910,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         }
 
         // ── Normal boot: launch userspace + interactive shell ──────────────
-        #[cfg(not(any(feature = "gui-test", feature = "firefox-test")))]
+        #[cfg(not(any(feature = "gui-test", feature = "firefox-test", feature = "xeyes-test")))]
         {
         // Phase 13: Launch Ascension (init) and Orbit (shell) as Ring 3 processes
         serial_println!("[Aether] Phase 13: Launching userspace processes...");
@@ -785,7 +970,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         // Drop to the kernel shell for interactive debugging/management.
         // Ascension will eventually replace this with a full user-mode init.
         shell::launch()
-        } // end #[cfg(not(any(feature = "gui-test", feature = "firefox-test")))]
+        } // end #[cfg(not(any(feature = "gui-test", feature = "firefox-test", feature = "xeyes-test")))]
     }
 }
 

@@ -8,6 +8,17 @@ default = []
 test-mode = []
 gui-test = []
 firefox-test = []
+# X11 "hello world" pivot — launches Alpine's xeyes binary (~28 KB musl PIE,
+# linked against libX11/libXt/libXmu/libxcb) as the test workload instead of
+# Firefox.  Shares the in-kernel Xastryx server (kernel/src/x11/) with
+# firefox-test, but skips the libxul SSP-canary saga path entirely:
+# xeyes does no vfork/posix_spawn, no JIT, no Rust panic strings, no
+# multi-process IPC.  Used as an orthogonal probe: if xeyes runs to its
+# event loop the kernel personality stack is functional for real Linux
+# X11 binaries; if it crashes, the failure is isolated from libxul.
+# Mutually exclusive with firefox-test at the main.rs cfg-gate level —
+# both enabled would race for Xastryx + the visible-window slot.
+xeyes-test = []
 # Opt-in for the userspace alias_test page-aliasing reproducer (Test 44b).
 # Spawns 8 worker threads via raw clone(CLONE_VM|CLONE_THREAD|CLONE_SIGHAND)
 # doing MAP_PRIVATE mmap churn; runs >100k page faults; sometimes wedges
