@@ -1,0 +1,18 @@
+{
+  "ok": true,
+  "sid": "1f8d37bc3b36",
+  "preset": "ssp-fail-snapshot",
+  "preset_desc": "SSP failure / STACK_CANARY_CORRUPT.  Captures the canary slot at\n[rbp-8], 16 bytes at fs:0x28 (musl's per-thread guard), and a\nstack window so the caller can decide overflow vs. FSBASE drift.",
+  "breakpoints": [
+    {
+      "label": "0x7f41a4b567f9",
+      "addr": "0x7f41a4b567f9",
+      "armed": false
+    }
+  ],
+  "hit_count": 0,
+  "timed_out": false,
+  "elapsed_s": 0.002,
+  "hits": [],
+  "error": "no breakpoints could be armed (check addresses)"
+}
