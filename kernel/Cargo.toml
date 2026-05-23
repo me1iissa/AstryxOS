@@ -94,6 +94,26 @@ sshd-test = []
 # and RFC 7230 (HTTP/1.1).  Mutually exclusive with the other *-test
 # cargo features.  Requires data.img to contain /bin/busybox.
 wget-test = []
+# tls-test — TLS userspace probe (PIVOT-I1a, 2026-05-23).  Drives the
+# Alpine OpenSSL 3.x CLI (/usr/bin/openssl) through `openssl s_client
+# -connect <host>:<port>` against a host-side openssl s_server (default
+# 10.0.2.2:8443, conventional QEMU SLIRP gateway alias) to validate
+# end-to-end TLS 1.2 / 1.3 handshake from inside an AstryxOS-hosted
+# Linux personality binary.  Also runs `busybox wget` against an
+# https:// URL to exercise the libssl + ssl_client helper path that
+# real-world HTTPS clients use.  Proves the userspace TLS substrate
+# (libssl.so.3, libcrypto.so.3, /etc/ssl/cert.pem, ossl-modules/legacy.so)
+# is correctly staged and that no kernel-side bug intercepts the cipher
+# negotiation, certificate verification, or symmetric encryption paths.
+# Mutually exclusive with the other *-test cargo features at the
+# main.rs cfg-gate level.  Requires data.img to contain /usr/bin/openssl,
+# /bin/busybox, /usr/bin/ssl_client, libssl/libcrypto, and the CA bundle
+# (run `scripts/create-data-disk.sh --tls --busybox --force` or
+# `ASTRYXOS_TLS=1 ASTRYXOS_BUSYBOX=1`).  Public refs: RFC 8446 (TLS 1.3)
+# <https://datatracker.ietf.org/doc/html/rfc8446>, RFC 5246 (TLS 1.2)
+# <https://datatracker.ietf.org/doc/html/rfc5246>, OpenSSL s_client(1)
+# <https://www.openssl.org/docs/man3.0/man1/openssl-s_client.html>.
+tls-test = []
 # Opt-in for the userspace alias_test page-aliasing reproducer (Test 44b).
 # Spawns 8 worker threads via raw clone(CLONE_VM|CLONE_THREAD|CLONE_SIGHAND)
 # doing MAP_PRIVATE mmap churn; runs >100k page faults; sometimes wedges
