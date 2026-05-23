@@ -2676,6 +2676,20 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                     pid, parent_tid);
                             }
                             vfork_canary_snapshot("post_wake.clone", pid as u32, parent_tid);
+                            // F3 code-DR watch — arm a one-shot
+                            // instruction-breakpoint DR on the
+                            // deterministic musl `__stack_chk_fail+0x0`
+                            // user VA (PR #420 autopsy verdict).  Fires
+                            // as a fault before the abort instruction
+                            // retires (Intel SDM Vol. 3B §17.3.1.1),
+                            // giving a dispositive caller-frame
+                            // snapshot for diffing the saved-canary
+                            // slot against fs:0x28.  Path-gated to
+                            // PID 1 + one-shot per boot.  Diagnostic-
+                            // only; gated behind `f3-codeDR-watch`.
+                            #[cfg(feature = "f3-codeDR-watch")]
+                            crate::subsys::linux::f3_code_dr_watch::try_arm_after_post_wake(
+                                pid, parent_tid);
                         }
                         child_pid as i64
                     }
@@ -3705,6 +3719,13 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                     pid, parent_tid);
                             }
                             vfork_canary_snapshot("post_wake.clone3", pid as u32, parent_tid);
+                            // F3 code-DR watch — see clone(56) above
+                            // for the rationale.  Same one-shot,
+                            // PID-1-only arm site.  Diagnostic-only;
+                            // gated behind `f3-codeDR-watch`.
+                            #[cfg(feature = "f3-codeDR-watch")]
+                            crate::subsys::linux::f3_code_dr_watch::try_arm_after_post_wake(
+                                pid, parent_tid);
                         }
                         child_pid as i64
                     }
