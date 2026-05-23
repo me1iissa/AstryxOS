@@ -291,6 +291,48 @@ def run_tier2(gdb_port: int = 1234, no_build: bool = False):
     check("T2 cont returns JSON",     obj9 is not None, raw9[:120])
     print()
 
+    # ── T2-9b: autopsy — arm bp on _start (already past it) with timeout ────
+    # Cannot guarantee a fresh hit of _start (kernel already booted), but the
+    # wrapper's plumbing — preset load, breakpoint arm, timeout-then-clean —
+    # is testable: we expect a clean "timed_out: true" with no exceptions.
+    print("T2-9b: autopsy --capture full-register-dump (expect timeout)")
+    if sym_ok and sym_addr and sym_addr != "0x0":
+        obj9b, raw9b, _ = _h(
+            "autopsy", sid,
+            "--break", sym_addr,
+            "--capture", "full-register-dump",
+            "--timeout-ms", "2000",
+        )
+        check("T2 autopsy returns JSON",  obj9b is not None, raw9b[:160])
+        if obj9b is not None:
+            # Either we hit (rare, would need to rewind) or we timed out —
+            # both are valid; failure mode is an exception / missing key.
+            check("T2 autopsy preset echoed",
+                  obj9b.get("preset") == "full-register-dump", str(obj9b)[:200])
+            check("T2 autopsy breakpoint armed",
+                  bool(obj9b.get("breakpoints") and
+                       obj9b["breakpoints"][0].get("armed")),
+                  str(obj9b.get("breakpoints")))
+            check("T2 autopsy clean completion (timed_out or hit)",
+                  obj9b.get("timed_out") is True or obj9b.get("hit_count", 0) > 0,
+                  f"timed_out={obj9b.get('timed_out')} "
+                  f"hits={obj9b.get('hit_count')}")
+    else:
+        print("  [INFO] Skipping autopsy sub-test (_start symbol not resolved)")
+    print()
+
+    # ── T2-9c: autopsy with unknown preset → clean JSON error ────────────────
+    print("T2-9c: autopsy --capture nonexistent-preset (expect JSON error)")
+    obj9c, raw9c, _ = _h(
+        "autopsy", sid,
+        "--break", sym_addr if sym_ok and sym_addr else "0xffff800000000000",
+        "--capture", "this-preset-does-not-exist",
+        "--timeout-ms", "1000",
+    )
+    check("T2 autopsy bad-preset returns JSON", obj9c is not None, raw9c[:160])
+    check("T2 autopsy bad-preset surfaces error",
+          bool(obj9c and obj9c.get("error")), str(obj9c)[:200])
+
     # ── T2-10: stop ──────────────────────────────────────────────────────────
     print("T2-10: stop")
     obj10, raw10, rc10 = _h("stop", sid)
