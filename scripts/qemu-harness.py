@@ -2829,6 +2829,16 @@ def cmd_start(args):
     )
 
     extra_qemu_args = list(getattr(args, "extra_qemu_args", None) or [])
+    # When `xeyes-test` is in the feature set, the kernel boots an Alpine
+    # X11 binary that needs a real framebuffer for any visible window to
+    # show up.  `_launch_qemu_harness` is hard-wired to mode="test", which
+    # emits `-display none` without a VGA card, so QMP `screendump` returns
+    # an empty frame.  Inject `-vga vmware` (matches gui-test/firefox-test
+    # via astryx_qemu._display_args) so the kernel framebuffer compositor
+    # has somewhere to write and QMP can pull the image.  Idempotent guard
+    # so an explicit caller-supplied `-vga` is not duplicated.
+    if "xeyes-test" in feats and not any(a == "-vga" for a in extra_qemu_args):
+        extra_qemu_args += ["-vga", "vmware"]
     proc = _launch_qemu_harness(sid, serial_log, qmp_sock, ovmf_vars,
                                  gdb_port=gdb_port, gdb_wait=gdb_wait,
                                  kdb_host_port=kdb_host_port,
@@ -8961,6 +8971,147 @@ def cmd_read_png(args):
     })
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# screendump — capture the QEMU framebuffer via QMP and write a PNG
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Uses QEMU's `screendump` QMP command (returns PPM at a server-side path).
+# Convert PPM (P6, ASCII header + binary RGB) to PNG using only the Python
+# stdlib (struct + zlib) — no PIL/netpbm dependency.
+#
+# QMP screendump payload (see qemu/docs/interop/qmp-spec.txt and the
+# `screendump` command at https://www.qemu.org/docs/master/interop/qemu-qmp-
+# ref.html):
+#
+#   { "execute": "screendump", "arguments": { "filename": "<host-path>" } }
+#
+# The resulting PPM is a P6 file: ASCII header `P6\n<W> <H>\n<MAXVAL>\n`,
+# then W*H pixels of 3 bytes each (R, G, B). PNG output follows W3C PNG §5.
+
+def _ppm_to_png_bytes(ppm: bytes) -> bytes:
+    """
+    Convert a P6 PPM image to PNG bytes.  Pure stdlib; uses zlib for IDAT
+    deflate (W3C PNG §11.2.4) and struct for chunk framing (§5).
+    """
+    import struct
+    import zlib
+
+    if not ppm.startswith(b"P6"):
+        raise ValueError(f"not a P6 PPM (got magic {ppm[:2]!r})")
+
+    # Parse ASCII header: P6\n<W> <H>\n<MAXVAL>\n  (comments with # allowed)
+    pos = 2
+    tokens: list[bytes] = []
+    while len(tokens) < 3:
+        # skip whitespace + comments
+        while pos < len(ppm) and ppm[pos:pos+1] in (b" ", b"\t", b"\n", b"\r"):
+            pos += 1
+        if pos < len(ppm) and ppm[pos:pos+1] == b"#":
+            while pos < len(ppm) and ppm[pos:pos+1] != b"\n":
+                pos += 1
+            continue
+        start = pos
+        while pos < len(ppm) and ppm[pos:pos+1] not in (b" ", b"\t", b"\n", b"\r"):
+            pos += 1
+        if start == pos:
+            raise ValueError("PPM header truncated")
+        tokens.append(ppm[start:pos])
+    # one whitespace byte after MAXVAL per PPM spec
+    if pos < len(ppm) and ppm[pos:pos+1] in (b" ", b"\t", b"\n", b"\r"):
+        pos += 1
+    w = int(tokens[0]); h = int(tokens[1]); maxval = int(tokens[2])
+    if maxval != 255:
+        raise ValueError(f"PPM maxval={maxval} unsupported (only 255)")
+    pixels = ppm[pos:pos + w * h * 3]
+    if len(pixels) != w * h * 3:
+        raise ValueError(
+            f"PPM pixel count mismatch: header says {w}x{h}*3={w*h*3}, "
+            f"got {len(pixels)} bytes")
+
+    # Build PNG: signature + IHDR + IDAT + IEND (W3C PNG §11.2).
+    sig = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+
+    def _chunk(tag: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(tag + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
+
+    # IHDR: width(4), height(4), bitdepth(1), colortype(1=2 RGB),
+    # compression(1=0), filter(1=0), interlace(1=0)
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+
+    # Raw image data: each scanline prefixed with filter type 0 (None).
+    raw = bytearray()
+    stride = w * 3
+    for y in range(h):
+        raw.append(0)
+        raw.extend(pixels[y*stride:(y+1)*stride])
+    idat = zlib.compress(bytes(raw), level=6)
+
+    return sig + _chunk(b"IHDR", ihdr) + _chunk(b"IDAT", idat) + _chunk(b"IEND", b"")
+
+
+def cmd_screendump(args):
+    """
+    Capture the QEMU framebuffer via QMP `screendump` and write a PNG to <dst>.
+
+    Requires the session to have been started with a VGA card (xeyes-test
+    feature auto-injects `-vga vmware`; gui-test / firefox-test enable it
+    via astryx_qemu._display_args).  Returns JSON describing the capture.
+    """
+    import tempfile
+
+    sess     = _load_session(args.sid)
+    qmp_sock = sess["qmp_sock"]
+    dst      = args.dst
+
+    # QMP writes the PPM at a server-visible path.  Use a host temp file —
+    # QEMU shares the host's filesystem (no isolation).
+    with tempfile.NamedTemporaryFile(suffix=".ppm", delete=False) as tmp:
+        ppm_path = tmp.name
+    try:
+        resp = _qmp_command(qmp_sock, "screendump", {"filename": ppm_path})
+        if "error" in resp:
+            _out({"ok": False, "error": "qmp_error",
+                  "qmp_response": resp})
+            sys.exit(1)
+        # screendump may return before the file is fully flushed on some QEMU
+        # builds; poll briefly for non-zero size to avoid a torn read.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                if Path(ppm_path).stat().st_size > 0:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.05)
+        ppm_bytes = Path(ppm_path).read_bytes()
+        if not ppm_bytes:
+            _out({"ok": False, "error": "ppm_empty",
+                  "hint": "VGA card not attached?  xeyes-test injects "
+                          "-vga vmware; check the session's -vga args."})
+            sys.exit(1)
+        try:
+            png_bytes = _ppm_to_png_bytes(ppm_bytes)
+        except Exception as exc:
+            _out({"ok": False, "error": f"ppm_to_png_failed: {exc}",
+                  "ppm_bytes": len(ppm_bytes)})
+            sys.exit(1)
+        dst_path = Path(dst)
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        dst_path.write_bytes(png_bytes)
+        _out({
+            "ok":         True,
+            "path":       str(dst_path.resolve()),
+            "png_bytes":  len(png_bytes),
+            "ppm_bytes":  len(ppm_bytes),
+        })
+    finally:
+        try:
+            Path(ppm_path).unlink()
+        except OSError:
+            pass
+
+
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 def main():
@@ -9686,6 +9837,17 @@ def main():
              "(default 120000 = 2 min, covers build + boot + test run)"
     )
 
+    # screendump — capture the framebuffer via QMP screendump + PPM->PNG
+    p_screendump = sub.add_parser(
+        "screendump",
+        help="Capture the QEMU framebuffer via QMP `screendump` and convert "
+             "the resulting PPM to PNG.  Requires the session to have a VGA "
+             "card (xeyes-test auto-injects -vga vmware; gui-test/firefox-test "
+             "always do).  Example: screendump <sid> /tmp/xeyes.png"
+    )
+    p_screendump.add_argument("sid")
+    p_screendump.add_argument("dst", help="Host-side destination path for the PNG")
+
     # ci-run: one-shot build+boot+test+report for CI.  Replaces the banned
     # watch-test.py wrapper.  All filtering (--allow-fail) is applied here
     # rather than at the CI YAML level, keeping the logic in one place.
@@ -9895,6 +10057,7 @@ def main():
         "rip-walk": cmd_rip_walk,
         "rip-trace-resolve": cmd_rip_trace_resolve,
         "read-png": cmd_read_png,
+        "screendump": cmd_screendump,
         # Shared session context
         "context": cmd_context,
         # Linux reference strace (ABI conformance)
