@@ -84,10 +84,12 @@ gate Firefox:
    `argv[0]` when absent (correct per `getauxval(3)`), so binaries run; but
    sandbox probes (and `/proc/self/exe` consistency checks) may diverge from
    reality. Cheap to add (~3 lines in `proc/elf.rs` auxv build).
-4. **`/proc/self/mountinfo` real content** — Currently a stub. Firefox content
-   sandbox enumerates mountpoints to compute its broker policy
-   (Mozilla bz #1198550 / #1948331 family). Stub returns empty → sandbox
-   defaults to refuse-all which fights jemalloc + Mesa swrast probes.
+4. **`/proc/self/mountinfo` residual deficiencies** — Canonical 11-column
+   emitter is PRESENT (`vfs/procfs.rs:876-950`); the refuse-all-cascade risk
+   from an earlier-draft "empty stub" characterisation is already mitigated.
+   Residual: bind-mount support, optional_fields column, octal-escape of
+   path control bytes. Smaller scope (~30-50 LOC) than initially framed.
+   Cite: Mozilla bz #1198550.
 5. **MAP_HUGETLB / 2 MiB huge mapping support** — Absent. jemalloc tries
    `mmap(... MAP_HUGETLB)` opportunistically; we silently return EINVAL via
    the default-flag check. jemalloc handles this gracefully (falls back to 4 K)
