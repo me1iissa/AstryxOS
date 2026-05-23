@@ -1629,27 +1629,141 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 }
             }
         }
-        // 43: accept(sockfd, addr, addrlen) — AF_UNIX real; AF_INET stub.
+        // 43: accept(sockfd, addr, addrlen) — AF_UNIX + AF_INET both real.
         // arg4 carries `flags` for accept4(2): SOCK_CLOEXEC | SOCK_NONBLOCK.
         // Plain accept(2) (#43) leaves arg4 = 0; accept4(2) (#288) forwards it.
+        //
+        // POSIX.1-2017 §accept: extracts the first connection from the
+        // listening socket's pending-connection queue, creates a new
+        // socket of the same type and protocol, and returns a new fd
+        // referring to that socket.  The original listening socket is
+        // unaffected.
         43 => {
             let pid = crate::proc::current_pid_lockless();
             let fd = arg1 as usize;
+            let addr_ptr = arg2;
+            let addrlen_ptr = arg3;
             // accept4 flag bits: SOCK_CLOEXEC = 0x80000, SOCK_NONBLOCK = 0x800.
             let cloexec  = (arg4 & 0x80000) != 0;
             let nonblock = (arg4 & 0x00800) != 0;
+
             if crate::syscall::is_unix_socket_fd(pid, fd) {
                 let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
-                match crate::net::unix::accept(unix_id) {
+                return match crate::net::unix::accept(unix_id) {
                     peer_id if peer_id >= 0 => {
                         // Allocate an fd for the accepted connected socket.
                         crate::syscall::alloc_unix_socket_fd(pid, peer_id as u64, cloexec, nonblock)
                     }
                     e => e, // EAGAIN or error
-                }
-            } else {
-                -11 // EAGAIN (AF_INET accept stub: no real listener)
+                };
             }
+            if !crate::syscall::is_socket_fd(pid, fd) { return -9; } // EBADF
+
+            // Snapshot the listener socket's local port + the
+            // per-fd non-blocking flag.  The listener socket itself
+            // must be Bound and TCP (POSIX returns EINVAL on accept
+            // for non-listening or non-stream sockets).
+            let listener_id = crate::syscall::get_socket_id(pid, fd);
+            let (listener_port, fd_nonblock) = {
+                let sockets = crate::net::socket::SOCKETS.lock();
+                let sock = match sockets.iter().find(|s| s.id == listener_id) {
+                    Some(s) => s,
+                    None => return -22, // EINVAL — socket vanished
+                };
+                if !sock.bound || sock.socket_type != crate::net::socket::SocketType::Tcp {
+                    return -22; // EINVAL — listen() requires a bound stream socket
+                }
+                let fd_nb = {
+                    let procs = crate::proc::PROCESS_TABLE.lock();
+                    procs.iter().find(|p| p.pid == pid)
+                        .and_then(|p| p.file_descriptors.get(fd).and_then(|f| f.as_ref()))
+                        .map(|f| (f.flags & 0x0800) != 0)
+                        .unwrap_or(false)
+                };
+                (sock.local_port, fd_nb)
+            };
+
+            // Dequeue one accept-pending child TCB on this listener's
+            // local port.  When the pending queue is empty either
+            // block (BLOCKing socket) by yielding until the NIC RX
+            // path drives a fresh child past 3WHS (RFC 793 §3.4), or
+            // return EAGAIN under SOCK_NONBLOCK / O_NONBLOCK.
+            //
+            // The TCP RX advances connection state directly from the
+            // NIC IRQ, so a simple yield+poll loop is sufficient.
+            // `net::poll()` also drains other pending events so we
+            // don't starve sibling sockets.
+            let blocking = !(nonblock || fd_nonblock);
+            let (peer_ip, peer_port) = loop {
+                if let Some(p) = crate::net::tcp::take_pending_accept(listener_port) {
+                    break p;
+                }
+                if !blocking { return -11; } // EAGAIN
+                if signal_pending(pid)       { return -4;  } // EINTR
+                crate::net::poll();
+                crate::sched::yield_cpu();
+            };
+
+            // Materialise the accept-side socket bound to this 4-tuple.
+            let child_id = crate::net::socket::socket_create_accepted(
+                listener_port, peer_ip, peer_port);
+
+            // Write the peer address back to user space if requested.
+            // POSIX permits both `addr` and `addrlen` to be NULL when
+            // the caller does not care about the peer name.  When
+            // `addrlen` is non-NULL, treat it as input capacity (max
+            // bytes to write into `addr`) and overwrite it with the
+            // actual sockaddr size produced.
+            //
+            // SMAP (Intel SDM Vol 3A §4.6): all user-page accesses
+            // performed under AC=1 via UserGuard.  Range-validate
+            // first so a kernel-VA addr_ptr cannot direct supervisor
+            // writes at arbitrary kernel memory (CWE-823) — SMAP's
+            // AC=1 guard catches user-page misses but does not catch
+            // kernel-VA dereferences.
+            if addr_ptr != 0 {
+                if addrlen_ptr == 0
+                    || !crate::syscall::validate_user_ptr(addrlen_ptr, 4)
+                {
+                    crate::net::socket::socket_close(child_id);
+                    return -14; // EFAULT
+                }
+                let cap = unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    core::ptr::read_unaligned(addrlen_ptr as *const u32) as usize
+                };
+                // sockaddr_in: u16 sin_family + u16 sin_port (be) + 4-byte sin_addr + 8 pad = 16.
+                const SOCKADDR_IN_LEN: usize = 16;
+                let write_bytes = cap.min(SOCKADDR_IN_LEN);
+                if write_bytes > 0
+                    && !crate::syscall::validate_user_ptr(addr_ptr, write_bytes)
+                {
+                    crate::net::socket::socket_close(child_id);
+                    return -14; // EFAULT
+                }
+                // Build the sockaddr_in locally then copy.  AF_INET = 2,
+                // sin_port network-byte-order, sin_addr is the raw 4-byte
+                // big-endian IPv4 address per RFC 791 §3.1.
+                let mut buf = [0u8; SOCKADDR_IN_LEN];
+                buf[0] = 2;  buf[1] = 0;
+                buf[2] = (peer_port >> 8) as u8;
+                buf[3] = (peer_port & 0xff) as u8;
+                buf[4..8].copy_from_slice(&peer_ip);
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    if write_bytes > 0 {
+                        core::ptr::copy_nonoverlapping(
+                            buf.as_ptr(), addr_ptr as *mut u8, write_bytes);
+                    }
+                    // POSIX: addrlen out = actual sockaddr length
+                    // (always 16 for AF_INET), even when truncated.
+                    core::ptr::write_unaligned(
+                        addrlen_ptr as *mut u32, SOCKADDR_IN_LEN as u32);
+                }
+            }
+
+            // Allocate the new fd.  SOCK_STREAM type code = 1.
+            crate::syscall::alloc_socket_fd(pid, child_id, 1, cloexec, nonblock)
         }
         // 44: sendto(sockfd, buf, len, flags, addr, addrlen)
         44 => {

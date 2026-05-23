@@ -69,6 +69,48 @@ pub fn socket_create(socket_type: SocketType) -> u64 {
     id
 }
 
+/// Create an accept-side TCP socket entry bound to an existing child
+/// TCB identified by `(local_port, peer_ip, peer_port)`.
+///
+/// Used by `accept(2)` to materialise a user-visible socket fd over a
+/// child TCB that was already brought up to `Established` by the
+/// inbound SYN path in [`super::tcp::handle_tcp`].  The returned
+/// socket id carries the full 4-tuple so subsequent `send`/`recv`
+/// route via the per-connection [`super::tcp::send_data_to`] /
+/// [`super::tcp::read_from`] primitives rather than the listener-port
+/// fallback — required when several concurrent client sessions share
+/// one listening port (RFC 793 §3.8 demultiplexing).
+///
+/// The new socket is marked `bound = true` (the underlying TCB is
+/// already on the wire) and `connected = true` (the peer 4-tuple is
+/// known), matching the state a `connect(2)`ed socket would be in
+/// after its 3-way handshake completed.
+pub fn socket_create_accepted(local_port: u16,
+                              peer_ip:    Ipv4Address,
+                              peer_port:  u16) -> u64 {
+    let id = NEXT_SOCKET_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let mut sockets = SOCKETS.lock();
+    sockets.push(Socket {
+        id,
+        socket_type: SocketType::Tcp,
+        local_port,
+        remote_ip:   peer_ip,
+        remote_port: peer_port,
+        bound:       true,
+        connected:   true,
+        reuseaddr:   false,
+        keepalive:   false,
+        nodelay:     false,
+        rcvbuf:      87380,
+        sndbuf:      131072,
+        linger:      false,
+        so_error:    0,
+        shut_rd:     false,
+        shut_wr:     false,
+    });
+    id
+}
+
 // ── Socket option constants ───────────────────────────────────────────────────
 
 const SOL_SOCKET:  u64 = 1;
@@ -245,6 +287,7 @@ pub fn socket_send(id: u64, data: &[u8]) -> Result<usize, &'static str> {
     let local_port = sock.local_port;
     let remote_port = sock.remote_port;
     let bound = sock.bound;
+    let connected = sock.connected;
     drop(sockets);
 
     let r = match socket_type {
@@ -259,7 +302,18 @@ pub fn socket_send(id: u64, data: &[u8]) -> Result<usize, &'static str> {
             if !bound {
                 return Err("not bound");
             }
-            super::tcp::send_data(local_port, data)
+            // When the socket carries a known peer 4-tuple (set by
+            // `connect(2)` or `accept(2)` via socket_create_accepted),
+            // route the segment to the matching TCB strictly by tuple
+            // — otherwise `send_data(port)` would match the first
+            // Established TCB on the listener's local port and mis-
+            // address the bytes when multiple peers share that port
+            // (RFC 793 §3.8 demultiplexing).
+            if connected && remote_port != 0 {
+                super::tcp::send_data_to(local_port, remote_ip, remote_port, data)
+            } else {
+                super::tcp::send_data(local_port, data)
+            }
         }
     };
     // Attribute outbound bytes to the caller.  Counted on success only.
@@ -322,7 +376,17 @@ pub fn socket_recv(id: u64) -> Result<Vec<u8>, &'static str> {
             if !sock.bound {
                 return Err("not bound");
             }
-            Ok(super::tcp::read(sock.local_port))
+            // Per-connection drain when a peer 4-tuple is known
+            // (accept(2)-side child or connect(2)ed client) — matches
+            // RFC 793 §3.8 demultiplexing.  Falls back to the
+            // port-only drain only for the legacy single-peer case.
+            if sock.connected && sock.remote_port != 0 {
+                Ok(super::tcp::read_from(sock.local_port,
+                                         sock.remote_ip,
+                                         sock.remote_port))
+            } else {
+                Ok(super::tcp::read(sock.local_port))
+            }
         }
     };
     if let Ok(d) = r.as_ref() {
@@ -398,6 +462,13 @@ pub fn socket_recvfrom(id: u64) -> Result<(Vec<u8>, Ipv4Address, u16), &'static 
 }
 
 /// Check if a socket has incoming data available (used by poll).
+///
+/// For a TCP listener (bound but unconnected) the readability gate is
+/// "accept(2) would not block" per IEEE Std 1003.1-2017 §poll, which
+/// translates to "at least one pending child TCB on this local port".
+/// For a connected TCP socket (accept-side child or connect(2)ed
+/// client) the gate is per-connection: only this 4-tuple's recv
+/// buffer must be non-empty.
 pub fn socket_has_data(id: u64) -> bool {
     let sockets = SOCKETS.lock();
     let sock = match sockets.iter().find(|s| s.id == id) {
@@ -407,24 +478,64 @@ pub fn socket_has_data(id: u64) -> bool {
     if !sock.bound { return false; }
     match sock.socket_type {
         SocketType::Udp => super::udp::has_data(sock.local_port),
-        SocketType::Tcp => super::tcp::has_data(sock.local_port),
+        SocketType::Tcp => {
+            if sock.connected && sock.remote_port != 0 {
+                // Per-connection: only count bytes routed to this 4-tuple.
+                super::tcp::has_data_for(sock.local_port,
+                                         sock.remote_ip,
+                                         sock.remote_port)
+            } else {
+                // Listener: poll readable iff a child is accept-pending.
+                super::tcp::has_data(sock.local_port)
+                    || super::tcp::has_pending_accept(sock.local_port)
+            }
+        }
     }
 }
 
 /// Close a socket.
+///
+/// For TCP, the underlying close path depends on whether this socket
+/// fd represents a listener or an accepted/connected child:
+///
+///   * A connected socket (peer 4-tuple set, accept-side child or
+///     `connect(2)`ed client) calls [`super::tcp::close_connection`]
+///     so the FIN targets exactly its own TCB and cannot trip a
+///     sibling session sharing the listener's local port.
+///   * A bound-but-unconnected listener has no peer; the listener
+///     TCB is dropped quietly.  Children accepted from it carry
+///     their own TCBs and are unaffected.
+///   * A bound TCB with no peer in `Established`/`CloseWait` (a
+///     dangling pre-handshake or already-closed socket) drops to the
+///     legacy port-only `close()` which is a no-op in that state.
 pub fn socket_close(id: u64) {
     let mut sockets = SOCKETS.lock();
     if let Some(idx) = sockets.iter().position(|s| s.id == id) {
         let sock = &sockets[idx];
         let socket_type = sock.socket_type;
         let local_port = sock.local_port;
+        let remote_ip = sock.remote_ip;
+        let remote_port = sock.remote_port;
+        let connected = sock.connected;
         let bound = sock.bound;
         if bound {
             match socket_type {
                 SocketType::Udp => super::udp::unbind(local_port),
                 SocketType::Tcp => {
                     drop(sockets);
-                    let _ = super::tcp::close(local_port);
+                    if connected && remote_port != 0 {
+                        let _ = super::tcp::close_connection(
+                            local_port, remote_ip, remote_port);
+                    } else {
+                        // Listener socket: release the Listen-state
+                        // TCB.  Children already accepted from this
+                        // listener carry their own TCBs (independent
+                        // 4-tuples) and survive — IEEE Std 1003.1-2017
+                        // §close doesn't require accepted descendants
+                        // to be torn down when their parent listener
+                        // closes.
+                        super::tcp::close_listener(local_port);
+                    }
                     // Re-lock to remove entry
                     let mut sockets = SOCKETS.lock();
                     if let Some(idx) = sockets.iter().position(|s| s.id == id) {
