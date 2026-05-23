@@ -246,8 +246,25 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
     // `w215-diag` so non-diagnostic builds carry no DR0 dispatch.
     #[cfg(feature = "w215-diag")]
     if vector == 1 {
+        // Reconstruct the saved-GPR slice from the ISR-stub stack frame.
+        // Per the layout documented above `isr_no_error!`:
+        //   `frame[-16]` = r15, `frame[-15]` = r14, …, `frame[-2]` = rax.
+        // Index into the slice using the same r15-first / rax-last
+        // ordering exposed via `debug_reg::Gprs`.
+        //
+        // SAFETY: the ISR macro guarantees 15 GPR qwords are stored
+        // immediately below the InterruptFrame (between `frame[-16]`
+        // and `frame[-2]`); reading them through a `*const u64`
+        // formed from `frame as *const _ as *const u64` is in-bounds
+        // for the ISR-stub stack region.  Slice lifetime is bound
+        // to the borrow of `frame`.
+        let gprs: &crate::arch::x86_64::debug_reg::Gprs = unsafe {
+            let frame_ptr = frame as *const InterruptFrame as *const u64;
+            let gpr_base = frame_ptr.offset(-16);
+            &*(gpr_base as *const crate::arch::x86_64::debug_reg::Gprs)
+        };
         if crate::arch::x86_64::debug_reg::handle_db_exception(
-            frame.rip, frame.rsp, frame.rflags, frame.cs,
+            frame.rip, frame.rsp, frame.rflags, frame.cs, Some(gprs),
         ) {
             return;
         }

@@ -491,6 +491,29 @@ d21-user-canary-watch = ["firefox-test", "w215-diag"]
 # arm site), PR #407 (Wave 12 aether audit — convergent Mechanism D
 # verdict).
 d22-user-canary-phys = ["firefox-test", "w215-diag", "ssp-canary-diag"]
+# F3 code-fetch (instruction-execute) DR0 watchpoint on the deterministic
+# musl `__stack_chk_fail+0x0` user VA (PR #420 autopsy verdict).  When
+# the parent PID 1 TID 2 thread retires the first instruction of the
+# musl SSP-fail stub, the existing `[W215/DR-WATCH-FIRE]` line is
+# joined by an `[F3/CODE-DR-FIRE]` block that dumps the full GPR
+# snapshot, the 16 qwords above RSP, and the 4 qwords around RBP —
+# pinpointing the caller-frame state at the moment SSP-fail is about
+# to abort.  Compared to the D21/D22 data-watch channels (which name
+# the *writer* of a corrupted canary slot), the code-DR fire names
+# the *reader* and gives an authoritative caller-frame snapshot from
+# which the saved-canary mismatch can be diffed against the parent's
+# fs:0x28 master canary.  Arm is one-shot at the first PID 1 TID 2
+# syscall after the `[VFORK/CANARY] post_wake.clone*` snapshot
+# completes; disarms on first fire.  Diagnostic-only; default builds
+# remain byte-identical when off.  Depends on `firefox-test` (path /
+# pid gating) and `w215-diag` (DR0–DR3 + #DB plumbing).  Refs: Intel
+# SDM Vol. 3B §17.2.4 (DR0–DR3, DR7 — RW=00 / LEN=00 instruction-
+# breakpoint encoding), §17.3.1.1 (#DB on instruction fetch is a
+# fault, taken before the instruction retires); Intel SDM Vol. 3A
+# §6.15 (#DB vector 1); System V AMD64 ABI §3.4.1 (SSP); GCC manual
+# §3.20 (-fstack-protector); PR #420 (autopsy verdict, byte-
+# identical 2/2 reproduction), PR #417 (libxul SSP-shape audit).
+f3-codeDR-watch = ["firefox-test", "w215-diag"]
 # Track B (Phase 5, 2026-05-21) — stack-page write provenance ring.
 # Records kernel-mode writes whose target user VA falls into the
 # `[0x3f00_0000_0000, 0x4000_0000_0000)` thread-stack range (per Phase 4
