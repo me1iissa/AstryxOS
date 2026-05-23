@@ -10,7 +10,7 @@ per-connection rather than per-port. This unblocks every userspace
 Linux network server that calls `accept(2)`: sshd, busybox httpd,
 python `-m http.server`, nginx, redis-server, and so on.
 
-Test coverage: a new gated test (`test265`) drives the full
+Test coverage: a new gated test (`test270`) drives the full
 plumbing end-to-end against the in-kernel TCP table using
 synthetic Established child TCBs, exercising every observable
 behaviour without paying for SLIRP RTT.
@@ -161,7 +161,7 @@ the two helpers. Lock order unchanged.
 
 ## Validation
 
-### Test 265 (`test_af_inet_accept_end_to_end`, kdb feature)
+### Test 270 (`test_af_inet_accept_end_to_end`, kdb feature)
 
 End-to-end exercise of the new primitives against the in-kernel
 TCP table. Uses `tcp::test_inject_established` (the same helper
@@ -182,7 +182,7 @@ Stages:
 | E | `tcp::close_connection` on A removes A from Established; B remains Established. |
 | F | `tcp::close_listener` drops the Listen TCB and leaves B's Established TCB alive. |
 
-Test 265 result (KVM, `--features kdb,test-mode`):
+Test 270 result (KVM, `--features kdb,test-mode`):
 
 ```
 TEST: AF_INET accept(2) — take_pending + per-4-tuple routing
@@ -206,7 +206,7 @@ infrastructure and were proven by the same 4-tuple tests.
 | `kernel/src/net/tcp.rs` | +69 (one struct field; 5 struct literals; `take_pending_accept`, `has_pending_accept`, `has_data_for`, `close_listener`) |
 | `kernel/src/net/socket.rs` | +95 (`socket_create_accepted`; per-4-tuple routing in `socket_send`/`socket_recv`/`socket_has_data`/`socket_close`) |
 | `kernel/src/subsys/linux/syscall.rs` | +106 / -8 (accept(2) replaces stub) |
-| `kernel/src/test_runner.rs` | +186 (Test 265 + dispatch wiring) |
+| `kernel/src/test_runner.rs` | +186 (Test 270 + dispatch wiring) |
 
 All changes are additive at the byte level for non-AF_INET
 paths: AF_UNIX `accept(2)`, every existing UDP path, and every

@@ -1391,7 +1391,7 @@ pub fn run() -> ! {
         if test_tcp_read_from_isolation() { passed += 1; }
     }
 
-    // ── Test 265: AF_INET accept(2) — end-to-end against in-kernel TCP ────
+    // ── Test 270: AF_INET accept(2) — end-to-end against in-kernel TCP ────
     //
     // Synthesises two Established child TCBs on a single listening port
     // (mirrors the wire post-3WHS state without paying for SLIRP) and
@@ -25525,7 +25525,7 @@ fn test_tcp_read_from_isolation() -> bool {
     true
 }
 
-// ── Test 265: AF_INET accept(2) end-to-end ───────────────────────────────────
+// ── Test 270: AF_INET accept(2) end-to-end ───────────────────────────────────
 //
 // Drives the accept(2) plumbing end-to-end without touching the wire:
 //
@@ -25563,17 +25563,17 @@ fn test_af_inet_accept_end_to_end() -> bool {
     let b_port: u16     = 51112;
 
     if let Err(e) = tcp::listen(LOCAL_PORT) {
-        test_fail!("test265", "listen({}) failed: {}", LOCAL_PORT, e);
+        test_fail!("test270", "listen({}) failed: {}", LOCAL_PORT, e);
         return false;
     }
 
     // Stage A — no pending children yet, accept must return None.
     if tcp::take_pending_accept(LOCAL_PORT).is_some() {
-        test_fail!("test265", "take_pending_accept saw a phantom child before SYN");
+        test_fail!("test270", "take_pending_accept saw a phantom child before SYN");
         return false;
     }
     if tcp::has_pending_accept(LOCAL_PORT) {
-        test_fail!("test265", "has_pending_accept true before any child");
+        test_fail!("test270", "has_pending_accept true before any child");
         return false;
     }
     test_println!("  empty listener: take_pending_accept=None ✓");
@@ -25582,15 +25582,15 @@ fn test_af_inet_accept_end_to_end() -> bool {
     const RX_A: &[u8] = b"GET /a HTTP/1.0\r\n\r\n";
     const RX_B: &[u8] = b"GET /b HTTP/1.0\r\n\r\n";
     if let Err(e) = tcp::test_inject_established(LOCAL_PORT, a_ip, a_port, RX_A) {
-        test_fail!("test265", "inject A failed: {}", e);
+        test_fail!("test270", "inject A failed: {}", e);
         return false;
     }
     if let Err(e) = tcp::test_inject_established(LOCAL_PORT, b_ip, b_port, RX_B) {
-        test_fail!("test265", "inject B failed: {}", e);
+        test_fail!("test270", "inject B failed: {}", e);
         return false;
     }
     if !tcp::has_pending_accept(LOCAL_PORT) {
-        test_fail!("test265", "has_pending_accept false after two children");
+        test_fail!("test270", "has_pending_accept false after two children");
         return false;
     }
 
@@ -25601,17 +25601,17 @@ fn test_af_inet_accept_end_to_end() -> bool {
     let (p1, p2) = match (take1, take2) {
         (Some(p1), Some(p2)) => (p1, p2),
         _ => {
-            test_fail!("test265",
+            test_fail!("test270",
                 "expected two pending children, got {:?} {:?}", take1, take2);
             return false;
         }
     };
     if p1 == p2 {
-        test_fail!("test265", "same 4-tuple returned twice: {:?}", p1);
+        test_fail!("test270", "same 4-tuple returned twice: {:?}", p1);
         return false;
     }
     if take3.is_some() {
-        test_fail!("test265", "third take returned {:?}, expected None", take3);
+        test_fail!("test270", "third take returned {:?}, expected None", take3);
         return false;
     }
     test_println!("  two takes returned distinct peers; third = None ✓");
@@ -25624,13 +25624,13 @@ fn test_af_inet_accept_end_to_end() -> bool {
     let sid_a = socket::socket_create_accepted(LOCAL_PORT, peer_a.0, peer_a.1);
     let sid_b = socket::socket_create_accepted(LOCAL_PORT, peer_b.0, peer_b.1);
     if sid_a == sid_b {
-        test_fail!("test265", "duplicate socket ids");
+        test_fail!("test270", "duplicate socket ids");
         return false;
     }
 
     // socket_has_data must be true for both before any drain.
     if !socket::socket_has_data(sid_a) || !socket::socket_has_data(sid_b) {
-        test_fail!("test265", "socket_has_data false on freshly-accepted children");
+        test_fail!("test270", "socket_has_data false on freshly-accepted children");
         return false;
     }
 
@@ -25638,29 +25638,29 @@ fn test_af_inet_accept_end_to_end() -> bool {
     let got_a = match socket::socket_recv(sid_a) {
         Ok(d) => d,
         Err(e) => {
-            test_fail!("test265", "socket_recv A failed: {}", e);
+            test_fail!("test270", "socket_recv A failed: {}", e);
             return false;
         }
     };
     if got_a != RX_A {
-        test_fail!("test265",
+        test_fail!("test270",
             "A: got {} bytes (expected {})", got_a.len(), RX_A.len());
         return false;
     }
     // After draining A, B's recv buffer must still be populated.
     if !socket::socket_has_data(sid_b) {
-        test_fail!("test265", "B's recv buffer drained when only A was read");
+        test_fail!("test270", "B's recv buffer drained when only A was read");
         return false;
     }
     let got_b = match socket::socket_recv(sid_b) {
         Ok(d) => d,
         Err(e) => {
-            test_fail!("test265", "socket_recv B failed: {}", e);
+            test_fail!("test270", "socket_recv B failed: {}", e);
             return false;
         }
     };
     if got_b != RX_B {
-        test_fail!("test265",
+        test_fail!("test270",
             "B: got {} bytes (expected {})", got_b.len(), RX_B.len());
         return false;
     }
@@ -25686,11 +25686,11 @@ fn test_af_inet_accept_end_to_end() -> bool {
         && c.remote_ip == b_ip && c.remote_port == b_port
         && c.state == tcp::TcpState::Established);
     if a_still_est {
-        test_fail!("test265", "A child still Established after close_connection");
+        test_fail!("test270", "A child still Established after close_connection");
         return false;
     }
     if !b_alive_est {
-        test_fail!("test265", "B child no longer Established after closing A");
+        test_fail!("test270", "B child no longer Established after closing A");
         return false;
     }
     test_println!("  close_connection on A left B Established ✓");
@@ -25706,11 +25706,11 @@ fn test_af_inet_accept_end_to_end() -> bool {
         && c.remote_ip == b_ip && c.remote_port == b_port
         && c.state == tcp::TcpState::Established);
     if listener_alive {
-        test_fail!("test265", "Listen-state TCB still present after close_listener");
+        test_fail!("test270", "Listen-state TCB still present after close_listener");
         return false;
     }
     if !b_still_est {
-        test_fail!("test265", "B Established child died with the listener");
+        test_fail!("test270", "B Established child died with the listener");
         return false;
     }
     test_println!("  close_listener preserves accepted children ✓");
