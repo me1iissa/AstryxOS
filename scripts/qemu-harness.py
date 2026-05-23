@@ -1321,7 +1321,9 @@ def _data_img_staleness(data_img: Path, disk_dir: Path,
 
 
 def _regen_data_img(root_dir: Path,
-                    firefox_variant: "str | None" = None) -> dict:
+                    firefox_variant: "str | None" = None,
+                    extra_flags: "list[str] | None" = None,
+                    extra_env: "dict[str, str] | None" = None) -> dict:
     """
     Invoke `scripts/create-data-disk.sh --force` and capture its outcome.
 
@@ -1330,6 +1332,8 @@ def _regen_data_img(root_dir: Path,
       rc: int
       duration_s: float
       tail: str       — last ~1500 chars of stderr (so a failure surfaces)
+      argv: list[str] — full argv handed to the child (for debuggability)
+      env_overrides: dict[str, str] — env vars layered on top of os.environ
 
     `firefox_variant`, when set, is exported to the child shell as
     ASTRYXOS_FIREFOX_VARIANT so the data-disk builder stages the requested
@@ -1337,22 +1341,40 @@ def _regen_data_img(root_dir: Path,
     None, the script's default applies (currently glibc; controlled by the
     script, not the harness).
 
+    `extra_flags` are appended verbatim to the create-data-disk.sh argv
+    after `--force`.  Used to forward demo-binary opt-ins
+    (e.g. `--oracle`, `--sshd`, `--tls`) so an auto-restage triggered by
+    the variant-pin guard does not silently drop staging the user
+    previously opted into.
+
+    `extra_env` is layered on top of os.environ (and after the
+    ASTRYXOS_FIREFOX_VARIANT injection).  Mirrors the env-var equivalents
+    of the demo-binary flags (ASTRYXOS_ORACLE, ASTRYXOS_SSHD, ASTRYXOS_TLS)
+    for callers that prefer env to argv.
+
     The script logs to stdout (mixed with stderr by some sub-scripts); we
     fold both streams together and keep the tail for diagnostics.
     """
     script = root_dir / "scripts" / "create-data-disk.sh"
+    flags = list(extra_flags or [])
+    env_overrides = dict(extra_env or {})
+    argv = ["bash", str(script), "--force", *flags]
     out = {"ok": False, "rc": -1, "duration_s": 0.0, "tail": "",
-           "firefox_variant": firefox_variant}
+           "firefox_variant": firefox_variant,
+           "argv": argv,
+           "env_overrides": env_overrides}
     if not script.exists():
         out["tail"] = f"create-data-disk.sh not found at {script}"
         return out
     env = os.environ.copy()
     if firefox_variant:
         env["ASTRYXOS_FIREFOX_VARIANT"] = firefox_variant
+    for k, v in env_overrides.items():
+        env[k] = v
     t0 = time.monotonic()
     try:
         proc = subprocess.run(
-            ["bash", str(script), "--force"],
+            argv,
             cwd=str(root_dir),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -1371,6 +1393,83 @@ def _regen_data_img(root_dir: Path,
         out["tail"] = f"{type(e).__name__}: {e}"
     out["duration_s"] = time.monotonic() - t0
     return out
+
+
+# ── Demo-binary flag preservation (auto-restage path) ─────────────────────────
+#
+# When the variant-pin guard re-invokes scripts/create-data-disk.sh to swap
+# between the musl and glibc Firefox layouts, the auto-restage runs with a
+# bare `--force` — none of the user's prior demo-binary opt-ins (--oracle,
+# --sshd, --tls / ASTRYXOS_ORACLE=1, ASTRYXOS_SSHD=1, ASTRYXOS_TLS=1) carry
+# across.  Result: the previously-staged demo binaries vanish from data.img
+# and the kernel fails at first-boot probe with `[ORACLE] FATAL: cannot
+# read /disk/usr/bin/oracle: NotFound` (or the SSHD / TLS equivalents).
+#
+# `_resolve_demo_binary_flags` reconstructs the user's intent from two
+# additive sources and folds them into one (flags, env) pair that the
+# restage call can replay verbatim:
+#
+#   1. Explicit env vars in os.environ (ASTRYXOS_ORACLE / _SSHD / _TLS) —
+#      the canonical way users opt in to demo binaries from the shell.
+#      Truthy when the value is one of "1" / "true" / "yes" / "on" (case
+#      insensitive).  These take precedence: if the env says ORACLE=1 we
+#      stage oracle even when the cargo feature list does not include
+#      oracle-test (e.g. an investigation where oracle is staged on disk
+#      but the kernel is built without the runtime-launch hook).
+#
+#   2. Cargo feature names in the harness's `--features` comma list:
+#      `oracle-test` → ORACLE=1, `sshd-test` → SSHD=1, `tls-test` → TLS=1.
+#      This catches the common case where the user passed
+#      `--features oracle-test` and expects the staging to follow without
+#      having to also export ASTRYXOS_ORACLE=1.
+#
+# Both flag and env forms are emitted: create-data-disk.sh accepts either,
+# but emitting both is harmless (the script ORs them) and means a future
+# refactor in either layer keeps working.  Additive output — agents
+# parsing `firefox_variant_info.restage_extra_flags` see the resolved
+# argv tail and can audit it.
+_DEMO_BIN_SPEC = [
+    # (cargo-feature, create-data-disk-flag, env-var-name)
+    ("oracle-test", "--oracle", "ASTRYXOS_ORACLE"),
+    ("sshd-test",   "--sshd",   "ASTRYXOS_SSHD"),
+    ("tls-test",    "--tls",    "ASTRYXOS_TLS"),
+]
+
+
+def _resolve_demo_binary_flags(features: "list[str]",
+                                env: "dict[str, str] | None" = None
+                                ) -> dict:
+    """
+    Compute the (--flag, ENV=1) set to forward into an auto-restage call.
+
+    `features` — comma-split harness `--features` list (already trimmed).
+    `env`      — env mapping to inspect (defaults to os.environ).
+
+    Returns a dict:
+      flags:        list[str]  — argv-tail e.g. ["--oracle", "--tls"]
+      env:          dict[str,str]  — env additions e.g. {"ASTRYXOS_ORACLE":"1"}
+      sources:      dict[str,str]  — per-flag, "env" | "feature" | None,
+                                     for debuggability
+    """
+    if env is None:
+        env = os.environ
+    truthy = {"1", "true", "yes", "on"}
+    flags: list = []
+    env_out: dict = {}
+    sources: dict = {}
+    for feat_name, flag, env_var in _DEMO_BIN_SPEC:
+        env_val = (env.get(env_var) or "").strip().lower()
+        if env_val in truthy:
+            flags.append(flag)
+            env_out[env_var] = "1"
+            sources[flag] = "env"
+        elif feat_name in features:
+            flags.append(flag)
+            env_out[env_var] = "1"
+            sources[flag] = "feature"
+        else:
+            sources[flag] = None
+    return {"flags": flags, "env": env_out, "sources": sources}
 
 
 # ── Firefox variant pin (D10 staging-gap guard) ───────────────────────────────
@@ -2593,6 +2692,14 @@ def cmd_start(args):
     # staged in build/disk/ we trigger an `ASTRYXOS_FIREFOX_VARIANT=<v>
     # scripts/create-data-disk.sh --force` to re-stage the disk before boot.
     _requested_variant = getattr(args, "firefox_variant", None) or "musl"
+    # Resolve the demo-binary flag set ONCE so both regen sites (staleness
+    # and variant mismatch) forward the same staging intent.  Without this,
+    # an auto-restage runs `create-data-disk.sh --force` bare and silently
+    # drops the user's prior `--oracle` / `--sshd` / `--tls` opt-ins,
+    # producing `[ORACLE] FATAL: cannot read /disk/usr/bin/oracle: NotFound`
+    # (or the SSHD/TLS analogue) on the next boot.  See
+    # `_resolve_demo_binary_flags` for the env-vs-feature precedence rule.
+    _demo_bin = _resolve_demo_binary_flags(feats)
     _ff_variant_info: dict = {
         "requested": _requested_variant,
         "staged_predicted": None,   # filled in after probe
@@ -2609,6 +2716,14 @@ def cmd_start(args):
         "data_img_symlink": None,   # populated below when relevant
         "kernel_chosen": None,      # filled in by post-boot probe verifier
         "match": None,              # final verdict, when known
+        # Demo-binary flag preservation (2026-05-23): the resolved
+        # (--oracle / --sshd / --tls) tail that the auto-restage path will
+        # forward into create-data-disk.sh, plus the per-flag source
+        # ("env" | "feature" | None) for debuggability.  Additive — never
+        # rename without updating downstream agents.
+        "restage_extra_flags": list(_demo_bin["flags"]),
+        "restage_extra_env":   dict(_demo_bin["env"]),
+        "restage_flag_sources": dict(_demo_bin["sources"]),
     }
     # D10 fix-it: in worktrees the local build/disk/ is typically absent;
     # if build/data.img is a symlink into the canonical tree, inspect that
@@ -2667,7 +2782,9 @@ def cmd_start(args):
                 file=sys.stderr,
             )
             _data_img_regen_info = _regen_data_img(
-                Path(wt.ROOT), firefox_variant=_requested_variant)
+                Path(wt.ROOT), firefox_variant=_requested_variant,
+                extra_flags=_demo_bin["flags"],
+                extra_env=_demo_bin["env"])
             _data_img_regenerated = bool(_data_img_regen_info.get("ok"))
             if _data_img_regenerated:
                 # Re-scan; the regen should have updated data.img mtime so the
@@ -2771,17 +2888,28 @@ def cmd_start(args):
                 file=sys.stderr,
             )
         else:
+            # 2026-05-23: surface the demo-binary flag preservation in the
+            # re-stage banner so it is obvious in stderr that the auto-
+            # restage is honouring the user's prior `--oracle` / `--sshd` /
+            # `--tls` opt-ins (the missing-flag bug that produced
+            # "[ORACLE] FATAL: cannot read /disk/usr/bin/oracle: NotFound"
+            # on first-boot verification of the oracle-test track).
+            _df_disp = (" ".join(_demo_bin["flags"])
+                        if _demo_bin["flags"] else "<none>")
             print(
                 "╔══════════════════════════════════════════════════════════════╗\n"
                 "║  Firefox variant mismatch — re-staging data.img              ║\n"
                 f"║  staged: {_staged_family:<10} requested: {_requested_variant:<28}║\n"
                 "║  Running scripts/create-data-disk.sh --force with            ║\n"
                 f"║  ASTRYXOS_FIREFOX_VARIANT={_requested_variant:<35} ║\n"
+                f"║  preserved demo flags:    {_df_disp:<35} ║\n"
                 "╚══════════════════════════════════════════════════════════════╝",
                 file=sys.stderr,
             )
             _variant_regen = _regen_data_img(
-                Path(wt.ROOT), firefox_variant=_requested_variant)
+                Path(wt.ROOT), firefox_variant=_requested_variant,
+                extra_flags=_demo_bin["flags"],
+                extra_env=_demo_bin["env"])
             _ff_variant_info["regen_triggered"] = True
             _ff_variant_info["regen_ok"] = bool(_variant_regen.get("ok"))
             # Fold into the existing regen-info slot so a single field carries
@@ -2993,6 +3121,13 @@ def cmd_start(args):
         # D10 fix-it (additive): None on the success path, populated when
         # variant-pin refused to clobber a shared data.img symlink target.
         "regen_refused_reason": _ff_variant_info.get("regen_refused_reason"),
+        # 2026-05-23 demo-binary flag preservation: the (--oracle / --sshd /
+        # --tls) tail the auto-restage forwarded into create-data-disk.sh
+        # plus the per-flag source so a single `events <sid>` answers
+        # "why did oracle disappear after my variant swap?".
+        "restage_extra_flags":  _ff_variant_info.get("restage_extra_flags"),
+        "restage_extra_env":    _ff_variant_info.get("restage_extra_env"),
+        "restage_flag_sources": _ff_variant_info.get("restage_flag_sources"),
     })
     # Spawn a detached verifier that tails the serial log for the kernel's
     # "[FFTEST] FF binary probe:" line, parses the chosen variant, updates
