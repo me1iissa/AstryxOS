@@ -366,6 +366,22 @@ pub fn run() -> ! {
     total += 1;
     if test_ext2_symlink_decoding() { passed += 1; }
 
+    // ── EXT2-WRITE-1..2, EXT2-WRITE-INDIRECT, EXT2-TRUNC-1..2, EXT2-ALLOC-1
+    // (PR-B: write substrate). All run against an in-memory ext2 image
+    // built at test-fixture-load time via `build_ext2_test_image`.
+    total += 1;
+    if test_ext2_write_subblock() { passed += 1; }
+    total += 1;
+    if test_ext2_write_cross_block() { passed += 1; }
+    total += 1;
+    if test_ext2_write_indirect() { passed += 1; }
+    total += 1;
+    if test_ext2_trunc_shrink() { passed += 1; }
+    total += 1;
+    if test_ext2_trunc_grow_sparse() { passed += 1; }
+    total += 1;
+    if test_ext2_alloc_group_walk() { passed += 1; }
+
     // ── Test 18: Signal Delivery Trampoline ─────────────────────────────
 
     total += 1;
@@ -5316,6 +5332,471 @@ fn test_ext2_symlink_decoding() -> bool {
         test_pass!("EXT2-LINK-1");
     }
     ok
+}
+
+// ============================================================================
+// EXT2-WRITE-*, EXT2-TRUNC-*, EXT2-ALLOC-1 (PR-B substrate)
+//
+// These tests exercise the block + inode bitmap allocators, the indirect-
+// tree-aware write path, in-place / growing truncate, and the cross-group
+// allocator fallback against an in-memory ext2 image built at test-load
+// time.  The image is tiny — a single root directory with two pre-staged
+// regular-file inodes, chosen so that the EXT2-ALLOC-1 test can exhaust a
+// group's data-bitmap and verify that allocation transparently rolls over
+// into the next group.
+//
+// Spec references:
+//   * ext2 filesystem documentation, <https://www.nongnu.org/ext2-doc/ext2.html>
+//   * Stephen Tweedie, "Design and Implementation of the Second Extended
+//     Filesystem", Annual Linux Expo 1998 (sections 2-5: superblock, block
+//     group, inode table, bitmaps)
+//   * POSIX.1-2017 §write(2), §ftruncate(2)
+// ============================================================================
+
+/// Layout constants for the in-memory test image.
+mod ext2_test_image {
+    pub const BLOCK_SIZE: usize = 1024;
+    /// `log_block_size = 0` ⇒ 1 024 bytes per block.
+    pub const LOG_BLOCK_SIZE: u32 = 0;
+    pub const BLOCKS_PER_GROUP: u32 = 32;
+    pub const INODES_PER_GROUP: u32 = 16;
+    pub const NUM_GROUPS: u32 = 3;
+    pub const TOTAL_BLOCKS: u32 = BLOCKS_PER_GROUP * NUM_GROUPS; // 96
+    pub const TOTAL_INODES: u32 = INODES_PER_GROUP * NUM_GROUPS; // 48
+    pub const INODE_SIZE: u16 = 128;
+
+    /// Per-group layout (in absolute block numbers within the image):
+    /// group 0:
+    ///   block 0      : padding (first 1 KiB)
+    ///   block 1      : superblock (1 024 bytes at offset 1 024)
+    ///   block 2      : BGDT (one sector covers 3 × 32-byte descriptors)
+    ///   block 3      : (reserved for backups in real images; unused here)
+    ///   block 4      : block bitmap (group 0)
+    ///   block 5      : inode bitmap (group 0)
+    ///   block 6..7   : inode table (16 inodes × 128 B = 2 048 B = 2 blocks)
+    ///   block 8..31  : data blocks (24 blocks usable)
+    /// group N (N>0):
+    ///   block 0      : block bitmap (group N)
+    ///   block 1      : inode bitmap (group N)
+    ///   block 2..3   : inode table
+    ///   block 4..31  : data blocks (28 blocks usable)
+    pub const G0_BLOCK_BITMAP: u32 = 4;
+    pub const G0_INODE_BITMAP: u32 = 5;
+    pub const G0_INODE_TABLE: u32 = 6;
+    pub const G0_FIRST_DATA: u32 = 8;
+    pub const G0_USABLE_DATA: u32 = BLOCKS_PER_GROUP - G0_FIRST_DATA; // 24
+
+    pub const GN_BLOCK_BITMAP_OFF: u32 = 0;
+    pub const GN_INODE_BITMAP_OFF: u32 = 1;
+    pub const GN_INODE_TABLE_OFF: u32 = 2;
+    pub const GN_FIRST_DATA_OFF: u32 = 4;
+    pub const GN_USABLE_DATA: u32 = BLOCKS_PER_GROUP - GN_FIRST_DATA_OFF; // 28
+}
+
+/// Build a minimal but spec-compliant ext2 image in a heap-allocated Vec.
+///
+/// The image has 3 block groups, with reserved metadata (bitmaps, inode
+/// tables) in each.  Inode 2 is the root directory (with one fast-symlink
+/// dummy entry to satisfy lookup); inodes 11 and 12 are pre-staged
+/// regular-file inodes that the tests write into.  Bitmaps mark all
+/// reserved (metadata + the first few used data) blocks as in-use.
+fn build_ext2_test_image() -> alloc::vec::Vec<u8> {
+    use crate::vfs::ext2::{Superblock, BlockGroupDesc, Ext2Inode};
+    use ext2_test_image::*;
+
+    let mut img = alloc::vec![0u8; (TOTAL_BLOCKS as usize) * BLOCK_SIZE];
+
+    // ── Superblock (block 1, offset 1024) ─────────────────────────────────
+    let sb = Superblock {
+        inodes_count: TOTAL_INODES,
+        blocks_count: TOTAL_BLOCKS,
+        r_blocks_count: 0,
+        free_blocks_count: 0, // filled below after we mark used metadata
+        free_inodes_count: 0,
+        first_data_block: 1, // 1 KiB block FS: data starts at block 1
+        log_block_size: LOG_BLOCK_SIZE,
+        log_frag_size: LOG_BLOCK_SIZE,
+        blocks_per_group: BLOCKS_PER_GROUP,
+        frags_per_group: BLOCKS_PER_GROUP,
+        inodes_per_group: INODES_PER_GROUP,
+        mtime: 0, wtime: 0, mnt_count: 0, max_mnt_count: 0,
+        magic: 0xEF53,
+        state: 1, errors: 0, minor_rev_level: 0,
+        lastcheck: 0, checkinterval: 0, creator_os: 0,
+        rev_level: 1,
+        def_resuid: 0, def_resgid: 0,
+        first_ino: 11,
+        inode_size: INODE_SIZE,
+    };
+    unsafe {
+        core::ptr::write_unaligned(
+            img[1024..].as_mut_ptr() as *mut Superblock, sb);
+    }
+
+    // ── BGDT (block 2 in a 1 KiB-block FS) ────────────────────────────────
+    // Per the spec the BGDT begins on the block IMMEDIATELY following the
+    // superblock block.  With 1 KiB blocks the superblock is block 1, so
+    // the BGDT is block 2.
+    for g in 0..NUM_GROUPS {
+        let (bb, ib, it, free_b, free_i, used_d);
+        if g == 0 {
+            bb = G0_BLOCK_BITMAP;
+            ib = G0_INODE_BITMAP;
+            it = G0_INODE_TABLE;
+            free_b = G0_USABLE_DATA as u16;
+            // Inodes used in group 0: inode 1 (bad-blocks reserved), 2 (root),
+            // 11, 12 (test files).  Remaining 12 are free.
+            free_i = INODES_PER_GROUP as u16 - 4;
+            used_d = 1;
+        } else {
+            bb = g * BLOCKS_PER_GROUP + GN_BLOCK_BITMAP_OFF;
+            ib = g * BLOCKS_PER_GROUP + GN_INODE_BITMAP_OFF;
+            it = g * BLOCKS_PER_GROUP + GN_INODE_TABLE_OFF;
+            free_b = GN_USABLE_DATA as u16;
+            free_i = INODES_PER_GROUP as u16;
+            used_d = 0;
+        }
+        let bgd = BlockGroupDesc {
+            block_bitmap: bb,
+            inode_bitmap: ib,
+            inode_table: it,
+            free_blocks_count: free_b,
+            free_inodes_count: free_i,
+            used_dirs_count: used_d,
+            pad: 0, reserved: [0; 3],
+        };
+        let bgdt_byte = (2 * BLOCK_SIZE) + (g as usize) * 32;
+        unsafe {
+            core::ptr::write_unaligned(
+                img[bgdt_byte..].as_mut_ptr() as *mut BlockGroupDesc, bgd);
+        }
+    }
+
+    // ── Block bitmaps ─────────────────────────────────────────────────────
+    // Each group's bitmap covers exactly BLOCKS_PER_GROUP bits.  The
+    // bits-set discipline matches the layout above: bit N corresponds to
+    // logical block N within the group.  All bits past BLOCKS_PER_GROUP
+    // are required by the spec to be 1 (we leave them 0 here because the
+    // allocator's scan-cap is `blocks_per_group`).
+    for g in 0..NUM_GROUPS {
+        let bitmap_block = if g == 0 { G0_BLOCK_BITMAP }
+            else { g * BLOCKS_PER_GROUP + GN_BLOCK_BITMAP_OFF };
+        let bitmap_off = (bitmap_block as usize) * BLOCK_SIZE;
+        // Within-group "reserved" bits.  Group 0 has 8 reserved blocks
+        // (boot/SB/BGDT/backup/2 bitmaps/2 inode-table); groups N>0 have
+        // 4 reserved (bitmaps + inode-table).
+        let reserved_in_group: u32 = if g == 0 {
+            G0_FIRST_DATA  // blocks 0..7 are metadata/reserved
+        } else {
+            GN_FIRST_DATA_OFF  // 0..3 are metadata
+        };
+        for bit in 0..reserved_in_group {
+            let byte_idx = (bit / 8) as usize;
+            let bit_off = bit % 8;
+            img[bitmap_off + byte_idx] |= 1 << bit_off;
+        }
+    }
+
+    // ── Inode bitmaps ─────────────────────────────────────────────────────
+    // Inode 1 (bad blocks reserved), inode 2 (root), inodes 11 + 12 are
+    // marked used in group 0.  All other inodes are free.
+    let g0_ibm_off = (G0_INODE_BITMAP as usize) * BLOCK_SIZE;
+    let mark = |off: usize, bit: u32, img: &mut [u8]| {
+        let byte_idx = (bit / 8) as usize;
+        let bit_off = bit % 8;
+        img[off + byte_idx] |= 1 << bit_off;
+    };
+    mark(g0_ibm_off, 0, &mut img); // inode 1
+    mark(g0_ibm_off, 1, &mut img); // inode 2 (root)
+    mark(g0_ibm_off, 10, &mut img); // inode 11
+    mark(g0_ibm_off, 11, &mut img); // inode 12
+
+    // ── Inode table — root inode (inode 2) ────────────────────────────────
+    // Root is a directory of size 0 (empty — lookup tests are out of PR-B
+    // scope).  The driver tolerates an empty directory via the size<HDR
+    // early-return in `read_dir_entries`.
+    let it_block = G0_INODE_TABLE;
+    let it_byte = (it_block as usize) * BLOCK_SIZE;
+    let root_ino = Ext2Inode {
+        mode: 0x4000 | 0o755, // S_IFDIR | 0755
+        uid: 0, size: 0,
+        atime: 0, ctime: 0, mtime: 0, dtime: 0,
+        gid: 0, links_count: 2, // self + . entry (none here, but conventional)
+        blocks: 0, flags: 0, osd1: 0,
+        block: [0; 15],
+        generation: 0, file_acl: 0, dir_acl: 0, faddr: 0,
+        osd2: [0; 12],
+    };
+    unsafe {
+        core::ptr::write_unaligned(
+            img[it_byte + 1 * 128..].as_mut_ptr() as *mut Ext2Inode, root_ino);
+    }
+
+    // Inodes 11 + 12: empty regular files.
+    let blank_reg = Ext2Inode {
+        mode: 0x8000 | 0o644, // S_IFREG | 0644
+        uid: 0, size: 0,
+        atime: 0, ctime: 0, mtime: 0, dtime: 0,
+        gid: 0, links_count: 1,
+        blocks: 0, flags: 0, osd1: 0,
+        block: [0; 15],
+        generation: 0, file_acl: 0, dir_acl: 0, faddr: 0,
+        osd2: [0; 12],
+    };
+    unsafe {
+        core::ptr::write_unaligned(
+            img[it_byte + 10 * 128..].as_mut_ptr() as *mut Ext2Inode, blank_reg);
+        core::ptr::write_unaligned(
+            img[it_byte + 11 * 128..].as_mut_ptr() as *mut Ext2Inode, blank_reg);
+    }
+
+    // ── Final: patch superblock free counters now that bitmaps are set ────
+    // Group 0 has 24 free data blocks, groups 1+ have 28 each.
+    let total_free_blocks: u32 = G0_USABLE_DATA + (NUM_GROUPS - 1) * GN_USABLE_DATA;
+    let total_free_inodes: u32 = INODES_PER_GROUP * NUM_GROUPS - 4;
+    let mut sb_patch: Superblock = unsafe {
+        core::ptr::read_unaligned(img[1024..].as_ptr() as *const Superblock)
+    };
+    sb_patch.free_blocks_count = total_free_blocks;
+    sb_patch.free_inodes_count = total_free_inodes;
+    unsafe {
+        core::ptr::write_unaligned(
+            img[1024..].as_mut_ptr() as *mut Superblock, sb_patch);
+    }
+
+    img
+}
+
+/// Mount the in-memory test image through the production
+/// `Ext2Fs::new(Box<dyn BlockDevice>)` path so write tests exercise the
+/// real dispatch.  Returns the mounted FS instance.
+fn mount_ext2_test_image() -> alloc::sync::Arc<crate::vfs::ext2::Ext2Fs> {
+    use crate::drivers::block::MutableMemoryBlockDevice;
+    use crate::vfs::ext2::Ext2Fs;
+    let img = build_ext2_test_image();
+    let dev = alloc::boxed::Box::new(MutableMemoryBlockDevice::new(img));
+    let fs = Ext2Fs::new(dev).expect("test image must mount");
+    alloc::sync::Arc::new(fs)
+}
+
+// ── EXT2-WRITE-1: sub-block write + read-back ────────────────────────────
+fn test_ext2_write_subblock() -> bool {
+    test_header!("EXT2-WRITE-1: sub-block write, read back, verify i_size");
+    use crate::vfs::FileSystemOps;
+    let fs = mount_ext2_test_image();
+    let payload = b"hello ext2 world";
+    let n = match fs.write(11, 0, payload) {
+        Ok(n) => n,
+        Err(e) => { test_fail!("EXT2-WRITE-1", "write returned {:?}", e); return false; }
+    };
+    if n != payload.len() {
+        test_fail!("EXT2-WRITE-1", "short write {}/{}", n, payload.len());
+        return false;
+    }
+    let stat = fs.stat(11).expect("stat after write");
+    if stat.size != payload.len() as u64 {
+        test_fail!("EXT2-WRITE-1", "i_size={} want={}", stat.size, payload.len());
+        return false;
+    }
+    let mut buf = alloc::vec![0u8; payload.len()];
+    let r = fs.read(11, 0, &mut buf).expect("read after write");
+    if r != payload.len() || &buf[..] != payload {
+        test_fail!("EXT2-WRITE-1", "round-trip mismatch (read {}, got {:?})", r, &buf[..r.min(32)]);
+        return false;
+    }
+    test_pass!("EXT2-WRITE-1");
+    true
+}
+
+// ── EXT2-WRITE-2: cross-block write spanning two direct blocks ───────────
+fn test_ext2_write_cross_block() -> bool {
+    test_header!("EXT2-WRITE-2: write across block boundary, multi-block readback");
+    use crate::vfs::FileSystemOps;
+    let fs = mount_ext2_test_image();
+    // 1.5 KiB write at offset 768 → spans blocks 0+1+2 (1 KiB blocks).
+    let payload: alloc::vec::Vec<u8> = (0..1536u32).map(|i| (i & 0xFF) as u8).collect();
+    let n = fs.write(11, 768, &payload).expect("write");
+    if n != payload.len() {
+        test_fail!("EXT2-WRITE-2", "short write {}/{}", n, payload.len());
+        return false;
+    }
+    let stat = fs.stat(11).expect("stat");
+    let want_size = (768 + payload.len()) as u64;
+    if stat.size != want_size {
+        test_fail!("EXT2-WRITE-2", "i_size={} want={}", stat.size, want_size);
+        return false;
+    }
+    let mut buf = alloc::vec![0u8; payload.len()];
+    let r = fs.read(11, 768, &mut buf).expect("read");
+    if r != payload.len() || &buf[..] != &payload[..] {
+        test_fail!("EXT2-WRITE-2", "readback mismatch (read {})", r);
+        return false;
+    }
+    // Leading [0..768) must read as zero (sparse hole from offset 0).
+    let mut leading = alloc::vec![0xFFu8; 768];
+    let _ = fs.read(11, 0, &mut leading).expect("read leading");
+    if !leading.iter().all(|&b| b == 0) {
+        test_fail!("EXT2-WRITE-2", "leading bytes not zero: first nonzero {:?}",
+            leading.iter().position(|&b| b != 0));
+        return false;
+    }
+    test_pass!("EXT2-WRITE-2");
+    true
+}
+
+// ── EXT2-WRITE-INDIRECT: write past 12 direct blocks ─────────────────────
+fn test_ext2_write_indirect() -> bool {
+    test_header!("EXT2-WRITE-INDIRECT: > 12 KiB write forces single-indirect allocation");
+    use crate::vfs::FileSystemOps;
+    let fs = mount_ext2_test_image();
+    // Block size is 1 KiB; 13 KiB forces one indirect-block allocation.
+    let payload: alloc::vec::Vec<u8> = (0..13 * 1024u32).map(|i| (i & 0xFF) as u8).collect();
+    let n = match fs.write(12, 0, &payload) {
+        Ok(n) => n,
+        Err(e) => { test_fail!("EXT2-WRITE-INDIRECT", "write {:?}", e); return false; }
+    };
+    if n != payload.len() {
+        test_fail!("EXT2-WRITE-INDIRECT", "short write {}/{}", n, payload.len());
+        return false;
+    }
+    let mut buf = alloc::vec![0u8; payload.len()];
+    let r = fs.read(12, 0, &mut buf).expect("read");
+    if r != payload.len() || buf != payload {
+        // Diff-locate for easier triage.
+        let first_bad = buf.iter().zip(&payload).position(|(a, b)| a != b);
+        test_fail!("EXT2-WRITE-INDIRECT", "mismatch at byte {:?} (read {})",
+            first_bad, r);
+        return false;
+    }
+    test_pass!("EXT2-WRITE-INDIRECT");
+    true
+}
+
+// ── EXT2-TRUNC-1: shrink frees blocks back into the bitmap ───────────────
+fn test_ext2_trunc_shrink() -> bool {
+    test_header!("EXT2-TRUNC-1: shrink frees data blocks (free count restored)");
+    use crate::vfs::FileSystemOps;
+    let fs = mount_ext2_test_image();
+    // Snapshot free count.
+    let free_before = fs.stat_free_blocks_count_for_test();
+    // Write 6 KiB → 6 direct blocks consumed.
+    let payload: alloc::vec::Vec<u8> = alloc::vec![0xAB; 6 * 1024];
+    fs.write(11, 0, &payload).expect("write");
+    let free_after_write = fs.stat_free_blocks_count_for_test();
+    if free_after_write + 6 != free_before {
+        test_fail!("EXT2-TRUNC-1", "post-write free={} want={} (allocated 6 blocks)",
+            free_after_write, free_before - 6);
+        return false;
+    }
+    // Truncate to 0 → all 6 must come back.
+    fs.truncate(11, 0).expect("truncate(0)");
+    let free_after_trunc = fs.stat_free_blocks_count_for_test();
+    if free_after_trunc != free_before {
+        test_fail!("EXT2-TRUNC-1", "post-trunc free={} want={} (leak of {} blocks)",
+            free_after_trunc, free_before, free_before - free_after_trunc);
+        return false;
+    }
+    let stat = fs.stat(11).expect("stat");
+    if stat.size != 0 {
+        test_fail!("EXT2-TRUNC-1", "i_size={} after truncate(0)", stat.size);
+        return false;
+    }
+    test_pass!("EXT2-TRUNC-1");
+    true
+}
+
+// ── EXT2-TRUNC-2: grow leaves sparse zeros + subsequent write works ──────
+fn test_ext2_trunc_grow_sparse() -> bool {
+    test_header!("EXT2-TRUNC-2: grow → sparse hole reads as zero, then write");
+    use crate::vfs::FileSystemOps;
+    let fs = mount_ext2_test_image();
+    fs.truncate(11, 4096).expect("truncate grow");
+    let stat = fs.stat(11).expect("stat");
+    if stat.size != 4096 {
+        test_fail!("EXT2-TRUNC-2", "post-grow i_size={} want=4096", stat.size);
+        return false;
+    }
+    // The grow path is sparse — no blocks allocated.  Reading must
+    // return zeros.
+    let mut buf = alloc::vec![0xFFu8; 4096];
+    let r = fs.read(11, 0, &mut buf).expect("read");
+    if r != 4096 || !buf.iter().all(|&b| b == 0) {
+        let nz = buf.iter().position(|&b| b != 0);
+        test_fail!("EXT2-TRUNC-2", "hole not zero: first nonzero {:?} read {}", nz, r);
+        return false;
+    }
+    // Now write into the middle of the hole — must succeed.
+    let payload = b"middle";
+    fs.write(11, 2000, payload).expect("write into hole");
+    let stat = fs.stat(11).expect("stat after fill");
+    if stat.size != 4096 {
+        test_fail!("EXT2-TRUNC-2", "i_size={} want=4096 (write within hole)", stat.size);
+        return false;
+    }
+    let mut buf2 = alloc::vec![0u8; payload.len()];
+    fs.read(11, 2000, &mut buf2).expect("read fill");
+    if &buf2[..] != payload {
+        test_fail!("EXT2-TRUNC-2", "fill readback mismatch {:?}", &buf2[..]);
+        return false;
+    }
+    test_pass!("EXT2-TRUNC-2");
+    true
+}
+
+// ── EXT2-ALLOC-1: exhausting group 0 forces walk into group 1 ────────────
+//
+// Strategy: write 12 KiB to inode 11 + 12 KiB to inode 12 → exactly 24
+// blocks from group 0 (all direct, no indirect-tree allocations because
+// 12 logical blocks of 1 KiB each fit the inode's 12 direct slots).
+// That saturates G0's free-data-block count to 0.  A subsequent write to
+// a third location must then allocate from G1 — proving the allocator
+// walks the BGDT past a fully-consumed group.  We extend inode 11 by
+// writing past 12 KiB (logical block 12), which forces the allocator to
+// (a) consume one indirect index block and (b) one data leaf block, both
+// from G1, leaving G1 with `GN_USABLE_DATA - 2` blocks free.
+fn test_ext2_alloc_group_walk() -> bool {
+    test_header!("EXT2-ALLOC-1: exhaust group 0 → allocator rolls over to group 1");
+    use crate::vfs::FileSystemOps;
+    use ext2_test_image::*;
+    let fs = mount_ext2_test_image();
+    // 12 KiB into inode 11 — fills all 12 direct slots, no indirect.
+    let payload_a: alloc::vec::Vec<u8> = alloc::vec![0xCD; 12 * BLOCK_SIZE];
+    fs.write(11, 0, &payload_a).expect("fill inode 11");
+    // 12 KiB into inode 12 — same.
+    let payload_b: alloc::vec::Vec<u8> = alloc::vec![0xCE; 12 * BLOCK_SIZE];
+    fs.write(12, 0, &payload_b).expect("fill inode 12");
+    let free_g0 = fs.stat_free_blocks_count_for_group_for_test(0);
+    if free_g0 != 0 {
+        test_fail!("EXT2-ALLOC-1", "post-fill group 0 free={} want=0", free_g0);
+        return false;
+    }
+    // Group 1 should still be at its initial usable count.
+    let free_g1_initial = fs.stat_free_blocks_count_for_group_for_test(1);
+    if free_g1_initial != GN_USABLE_DATA as u16 {
+        test_fail!("EXT2-ALLOC-1", "pre-overflow group 1 free={} want={}",
+            free_g1_initial, GN_USABLE_DATA);
+        return false;
+    }
+    // Now extend inode 11 past the direct extent — writing one byte at
+    // logical block 12 forces (a) one indirect index block + (b) one
+    // data leaf block from G1 (G0 is exhausted).
+    fs.write(11, (12 * BLOCK_SIZE) as u64, b"x").expect("indirect-extend");
+    let free_g1_after = fs.stat_free_blocks_count_for_group_for_test(1);
+    let expected = (GN_USABLE_DATA as u16).saturating_sub(2);
+    if free_g1_after != expected {
+        test_fail!("EXT2-ALLOC-1", "post-overflow group 1 free={} want={} (delta {})",
+            free_g1_after, expected, free_g1_initial as i32 - free_g1_after as i32);
+        return false;
+    }
+    // Read-back at the extended offset must return our byte.
+    let mut buf = [0u8; 1];
+    fs.read(11, (12 * BLOCK_SIZE) as u64, &mut buf).expect("readback");
+    if buf[0] != b'x' {
+        test_fail!("EXT2-ALLOC-1", "indirect-leaf readback got {:?}", buf[0]);
+        return false;
+    }
+    test_pass!("EXT2-ALLOC-1");
+    true
 }
 
 // ============================================================================
