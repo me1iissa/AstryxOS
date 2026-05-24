@@ -933,6 +933,61 @@ EOF
         echo "[DATA-DISK] Copied var/cache/fontconfig/ (fc-cache output)"
     fi
 
+    # ── ncurses terminfo database (PTY substrate — Test 275 / TUI tools) ────
+    # Stage the host's /usr/share/terminfo/ tree so any ncurses-linked
+    # binary (busybox vi, busybox top, less, more, mc, htop, tmux, nano,
+    # etc.) can resolve its TERM= entry and render correctly through a
+    # PTY slave.  Without this, ncurses calls setupterm("xterm", ...)
+    # → OK file lookup, gets E_DATABASE_NOT_FOUND, and aborts with
+    # "Error opening terminal: xterm."
+    #
+    # We copy only the high-impact terminfo entries (xterm, xterm-256color,
+    # vt100, vt220, linux, screen, dumb, ansi, tmux, tmux-256color) rather
+    # than the full ~12 MiB tree — these cover ~99% of TERM= values
+    # busybox/dropbear/sshd/Alpine clients ever set.  Falls back to copying
+    # the whole tree if specific entries can't be found (e.g. ncurses-base
+    # not installed on the build host).
+    #
+    # FAT32 has no symlinks, so where a terminfo file is a symlink on the
+    # host (very common: e.g. xterm-color -> xterm) the `[ -f "$f" ]`
+    # test dereferences and `mcopy` writes the resolved file contents under
+    # the link name — functionally equivalent for the lookup path.
+    #
+    # Refs: terminfo(5), term(7), ncurses(3).
+    HOST_TERMINFO="/usr/share/terminfo"
+    if [ -d "${HOST_TERMINFO}" ]; then
+        echo "[DATA-DISK] Staging /usr/share/terminfo/ (ncurses TUI substrate)"
+        mmd -i "${DATA_IMG}" "::usr"          2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/share"    2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/share/terminfo" 2>/dev/null || true
+        # Per terminfo(5): entries are looked up at
+        # $TERMINFO/<x>/<name> or /usr/share/terminfo/<x>/<name>, where
+        # <x> is the first character of <name>.  Pre-create the subdirs
+        # we plan to populate.
+        for sub in a d l s t v x; do
+            mmd -i "${DATA_IMG}" "::usr/share/terminfo/${sub}" 2>/dev/null || true
+        done
+        TI_COUNT=0
+        for entry in \
+            ansi dumb \
+            linux \
+            screen screen-256color \
+            tmux tmux-256color \
+            vt52 vt100 vt102 vt220 vt320 \
+            xterm xterm-color xterm-16color xterm-256color xterm-mono ; do
+            sub="${entry:0:1}"
+            src="${HOST_TERMINFO}/${sub}/${entry}"
+            if [ -f "${src}" ]; then
+                mcopy -o -i "${DATA_IMG}" "${src}" \
+                    "::usr/share/terminfo/${sub}/${entry}" 2>/dev/null && \
+                    TI_COUNT=$((TI_COUNT + 1))
+            fi
+        done
+        echo "[DATA-DISK] Copied ${TI_COUNT} terminfo entries to /usr/share/terminfo/"
+    else
+        echo "[DATA-DISK] WARNING: ${HOST_TERMINFO} not present on host — ncurses TUIs will fail (apt install ncurses-base)"
+    fi
+
     # ── Firefox ESR at /opt/firefox/ (installed by install-firefox.sh) ──────
     # Firefox is large (~238 MB uncompressed).  We use mcopy -s (recursive)
     # to copy the full directory tree.  FAT32 directory depth limit is 8 on
