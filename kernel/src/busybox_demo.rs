@@ -257,6 +257,14 @@ pub fn run_busybox_demo() {
         ("sh-c-echo",    &["busybox", "sh", "-c", "echo SH_OK; exit 0"]),
         ("printenv",     &["busybox", "printenv", "HOME"]),
         ("du-disk-bin",  &["busybox", "du", "-sh", "/disk/bin"]),
+        // nslookup exercises the full userspace UDP DNS path: musl
+        // getaddrinfo(3) → /etc/resolv.conf → socket(AF_INET,SOCK_DGRAM)
+        // → sendto(2) → recvfrom(2).  Resolves a stable name via SLIRP's
+        // DNS forwarder at 10.0.2.3 (RFC 1035, RFC 768).  The applet
+        // ignores its own argv flags inside busybox so the trailing
+        // argument is the server override; we pass it explicitly so the
+        // test does not depend on /etc/resolv.conf order.
+        ("nslookup",     &["busybox", "nslookup", "example.com", "10.0.2.3"]),
     ];
 
     let mut passed = 0usize;
