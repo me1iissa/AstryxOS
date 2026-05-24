@@ -169,6 +169,22 @@ for helper in "${ROOTFS}/usr/libexec/git-core/"*; do
 done
 echo "[PIVOT-E-GIT] Staged ${helper_count} real helpers in /usr/libexec/git-core/ (${total_helper_bytes} bytes total)"
 
+# ── Step 3a: materialise FAT32-safe aliases of git-remote-http ────────────────
+# Alpine ships git-remote-{https,ftp,ftps} as symlinks to git-remote-http;
+# the loop above skips symlinks because FAT32 cannot represent them.  Git's
+# transport lookup is by helper basename (git-remote-<scheme>), so without
+# these aliases `git clone https://…` fails with "Unable to find remote
+# helper for 'https'".  Copy the one real binary to each alias name.
+if [ -f "${DISK_USR_LIBEXEC_GIT}/git-remote-http" ]; then
+    for alias in git-remote-https git-remote-ftp git-remote-ftps; do
+        cp -f "${DISK_USR_LIBEXEC_GIT}/git-remote-http" \
+              "${DISK_USR_LIBEXEC_GIT}/${alias}"
+        chmod +x "${DISK_USR_LIBEXEC_GIT}/${alias}" 2>/dev/null || true
+        helper_count=$((helper_count + 1))
+    done
+    echo "[PIVOT-E-GIT] Materialised git-remote-{https,ftp,ftps} aliases (FAT32 symlink workaround)"
+fi
+
 # ── Step 4: walk DT_NEEDED transitive closure for git + the helpers ──────────
 # Pattern mirrors install-pivot-e.sh / install-pivot-e-tui.sh.  We add the
 # real helpers to the queue too — git-remote-http needs libcurl + libexpat
