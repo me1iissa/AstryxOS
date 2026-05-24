@@ -28,6 +28,7 @@ use alloc::vec::Vec;
 use spin::Mutex;
 
 use crate::drivers::block::BlockDevice;
+use crate::vfs::VfsError;
 
 /// ext2 magic number.
 const EXT2_MAGIC: u16 = 0xEF53;
@@ -115,10 +116,67 @@ pub struct Ext2Inode {
 
 /// Inode type constants from mode field.
 const S_IFMT: u16 = 0xF000;
-#[allow(dead_code)]
 const S_IFREG: u16 = 0x8000;
 const S_IFDIR: u16 = 0x4000;
 const S_IFLNK: u16 = 0xA000;
+
+/// Directory entry `file_type` byte values for revision-1 ext2 images
+/// (`EXT2_FEATURE_INCOMPAT_FILETYPE`).  See the second-extended-filesystem
+/// specification §3 "Linked directory entries"
+/// (<https://www.nongnu.org/ext2-doc/ext2.html#linked-directory-entries>).
+/// Rev-0 images always set this byte to 0; that case is handled implicitly
+/// by [`Ext2Fs::readdir`] which already maps unknown values to
+/// `FileType::RegularFile`.
+const EXT2_FT_REG_FILE: u8 = 1;
+const EXT2_FT_DIR: u8 = 2;
+#[allow(dead_code)]
+const EXT2_FT_SYMLINK: u8 = 7;
+
+/// Directory-entry on-disk header size (`inode` + `rec_len` + `name_len`
+/// + `file_type` = 4+2+1+1 = 8 bytes), per the specification §3 "Linked
+/// directory entries".
+const EXT2_DIR_HDR: usize = 8;
+
+/// Compute the on-disk record length needed to store an entry with the
+/// given `name_len`, rounded up to a 4-byte boundary
+/// (`EXT2_DIR_REC_LEN(name_len) = ((name_len + 8 + 3) & ~3)`).  This is
+/// the canonical macro from the ext2 specification; every entry that
+/// goes on disk must be aligned to a 4-byte multiple so the next entry's
+/// `inode` field is naturally aligned.
+#[inline]
+const fn ext2_dir_rec_len(name_len: usize) -> usize {
+    (name_len + EXT2_DIR_HDR + 3) & !3
+}
+
+/// Map an inode `mode` to the dir-entry `file_type` byte.
+fn ext2_ft_from_mode(mode: u16) -> u8 {
+    match mode & S_IFMT {
+        S_IFDIR => EXT2_FT_DIR,
+        S_IFLNK => EXT2_FT_SYMLINK,
+        _ => EXT2_FT_REG_FILE,
+    }
+}
+
+/// Serialise a single directory-entry record at byte offset `off` in
+/// `buf`.  Writes the 8-byte header (`inode`, `rec_len`, `name_len`,
+/// `file_type`) followed by `name`, then zero-pads any trailing slack
+/// inside `rec_len` so a later read does not see stale bytes.  Caller
+/// guarantees `off + rec_len ≤ buf.len()`.
+fn write_dir_entry(buf: &mut [u8], off: usize, inode: u32,
+                   rec_len: usize, name: &[u8], file_type: u8) {
+    debug_assert!(rec_len >= ext2_dir_rec_len(name.len()));
+    debug_assert!(off + rec_len <= buf.len());
+    buf[off..off+4].copy_from_slice(&inode.to_le_bytes());
+    buf[off+4..off+6].copy_from_slice(&(rec_len as u16).to_le_bytes());
+    buf[off+6] = name.len() as u8;
+    buf[off+7] = file_type;
+    buf[off+EXT2_DIR_HDR..off+EXT2_DIR_HDR+name.len()].copy_from_slice(name);
+    // Zero the trailing slack so stale bytes from a previous entry don't
+    // leak (some tools sanity-check zero padding).
+    for byte in &mut buf[off+EXT2_DIR_HDR+name.len()..off+rec_len] {
+        *byte = 0;
+    }
+}
 
 /// Fast-symlink size threshold per ext2 spec §6 "Symbolic links":
 /// `i_size` ≤ 60 AND `i_blocks` == 0 ⇒ target stored inline in the
@@ -1311,6 +1369,350 @@ impl Ext2Fs {
         }
     }
 
+    // ────────────────────────────────────────────────────────────────────────
+    // Directory mutation (PR-C, 2026-05-24).
+    //
+    // Directory-block layout follows ext2 spec §3 "Linked directory entries".
+    // Each directory block is a logically independent linked list of
+    // variable-length entries.  The final entry's `rec_len` extends to the
+    // end of the block; insertion either splits the final entry's slack (if
+    // it can accommodate a new entry plus the existing entry's true size) or
+    // re-uses an existing inode==0 entry whose `rec_len` is large enough.
+    // Removal merges the dead entry's space into the preceding entry's
+    // `rec_len` (or, for the first entry in a block, marks `inode = 0` and
+    // keeps `rec_len` unchanged so the linked-list walk can step past it).
+    //
+    // All routines below mutate the parent directory's data blocks via the
+    // existing `ensure_block` / `read_block` / `write_block` substrate from
+    // PR-B and keep `i_size` aligned with the directory's allocated block
+    // count (each directory block is fully owned by the directory; spec §3).
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// Initialise a fresh directory block containing `.` and `..` entries.
+    ///
+    /// Per the spec a newly-empty directory has exactly two records:
+    /// `(inode=self_ino, name=".", rec_len = REC_LEN(1))` followed by
+    /// `(inode=parent_ino, name="..", rec_len = block_size - REC_LEN(1))`.
+    /// The second entry's `rec_len` extends to the end of the block so the
+    /// linked-list walk reaches block-end correctly.
+    fn init_dir_block(&self, buf: &mut [u8], self_ino: u32, parent_ino: u32) {
+        debug_assert_eq!(buf.len(), self.block_size);
+        for byte in buf.iter_mut() { *byte = 0; }
+        let dot_reclen = ext2_dir_rec_len(1);
+        let dotdot_reclen = self.block_size - dot_reclen;
+
+        // `.` entry
+        buf[0..4].copy_from_slice(&self_ino.to_le_bytes());
+        buf[4..6].copy_from_slice(&(dot_reclen as u16).to_le_bytes());
+        buf[6] = 1; // name_len
+        buf[7] = EXT2_FT_DIR;
+        buf[8] = b'.';
+        // bytes 9..dot_reclen are zero-padded (already memset above).
+
+        // `..` entry
+        let off = dot_reclen;
+        buf[off..off + 4].copy_from_slice(&parent_ino.to_le_bytes());
+        buf[off + 4..off + 6].copy_from_slice(&(dotdot_reclen as u16).to_le_bytes());
+        buf[off + 6] = 2; // name_len
+        buf[off + 7] = EXT2_FT_DIR;
+        buf[off + 8] = b'.';
+        buf[off + 9] = b'.';
+        // bytes [off+10..] zero-padded.
+    }
+
+    /// Insert a new entry `(child_ino, name, file_type)` into the parent
+    /// directory.  Walks the parent's data blocks looking for a slot:
+    ///
+    /// 1. **Empty slot reuse** — an existing `inode == 0` entry whose
+    ///    `rec_len ≥ needed` is repurposed wholesale.
+    /// 2. **Slack split** — an entry whose `rec_len - REC_LEN(name_len)`
+    ///    is at least `needed` gives up its trailing slack to the new
+    ///    entry.  The old entry's `rec_len` shrinks to its minimum
+    ///    (`REC_LEN(name_len)`); the new entry's `rec_len` consumes the
+    ///    rest of what the old entry held.
+    /// 3. **New block** — if no slot in any existing block fits, allocate
+    ///    a fresh data block via [`Self::ensure_block`], place the new
+    ///    entry at offset 0 with `rec_len = block_size`, and grow
+    ///    `i_size` by `block_size`.
+    ///
+    /// Mutates `parent_inode` in place (the caller observes any `i_size`
+    /// or `i_block[]` changes from path 3).  Persistence of `parent_inode`
+    /// is the caller's responsibility (call [`Self::write_inode`]).
+    ///
+    /// Returns `Err` on I/O failure or duplicate-name (`EEXIST`).
+    fn insert_dir_entry(&self, parent_inode: &mut Ext2Inode, parent_ino_num: u64,
+                        name: &str, child_ino: u32, child_file_type: u8)
+        -> Result<(), VfsError>
+    {
+        if name.is_empty() || name.len() > 255 || name.contains('/') || name == "." || name == ".." {
+            return Err(VfsError::InvalidArg);
+        }
+        let name_bytes = name.as_bytes();
+        let needed = ext2_dir_rec_len(name_bytes.len());
+        if needed > self.block_size {
+            return Err(VfsError::InvalidArg);
+        }
+
+        let bs = self.block_size;
+        let dir_size = parent_inode.size as usize;
+        let num_blocks = dir_size / bs; // directory blocks are full-block records
+        let mut block_buf = alloc::vec![0u8; bs];
+
+        // Pass 1 — walk existing blocks for a slot, and check for duplicate.
+        for blk_idx in 0..num_blocks {
+            let phys = self.resolve_block(parent_inode, blk_idx);
+            if phys == 0 { continue; } // sparse — skip for insertion search
+            if self.read_block(phys, &mut block_buf).is_err() {
+                return Err(VfsError::Io);
+            }
+
+            // Walk entries in this block. We need both "is duplicate" and
+            // "where to insert" knowledge, so collect candidate slot info
+            // as we go.  Slot priority is: dead entry first, then a split.
+            let mut offset = 0usize;
+            let mut slot: Option<(usize, bool, usize)> = None; // (offset, is_dead, fitted_split_size)
+            while offset + EXT2_DIR_HDR <= bs {
+                let entry_inode = u32::from_le_bytes([
+                    block_buf[offset], block_buf[offset+1],
+                    block_buf[offset+2], block_buf[offset+3]]);
+                let rec_len = u16::from_le_bytes(
+                    [block_buf[offset+4], block_buf[offset+5]]) as usize;
+                let nm_len = block_buf[offset+6] as usize;
+                if rec_len < EXT2_DIR_HDR || rec_len & 3 != 0
+                    || offset + rec_len > bs
+                {
+                    // Treat malformed dir as fatal — corruption.
+                    crate::serial_println!(
+                        "[EXT2] insert_dir_entry: malformed entry blk_idx={} off={} rec_len={}",
+                        blk_idx, offset, rec_len);
+                    return Err(VfsError::Io);
+                }
+                // Duplicate-name check (POSIX EEXIST).
+                if entry_inode != 0 && nm_len == name_bytes.len() {
+                    let on_disk = &block_buf[offset + EXT2_DIR_HDR
+                        ..offset + EXT2_DIR_HDR + nm_len];
+                    if on_disk == name_bytes {
+                        return Err(VfsError::FileExists);
+                    }
+                }
+                // Slot candidates.
+                if slot.is_none() {
+                    if entry_inode == 0 && rec_len >= needed {
+                        slot = Some((offset, true, rec_len));
+                    } else if entry_inode != 0 {
+                        let used = ext2_dir_rec_len(nm_len);
+                        if rec_len >= used + needed {
+                            slot = Some((offset, false, used));
+                        }
+                    }
+                }
+                offset += rec_len;
+            }
+
+            if let Some((slot_off, is_dead, fitted)) = slot {
+                // Apply placement.
+                if is_dead {
+                    // Reuse: keep rec_len, overwrite header + name.
+                    let kept_reclen = u16::from_le_bytes(
+                        [block_buf[slot_off+4], block_buf[slot_off+5]]) as usize;
+                    write_dir_entry(&mut block_buf, slot_off,
+                        child_ino, kept_reclen,
+                        name_bytes, child_file_type);
+                } else {
+                    // Split: shrink existing entry's rec_len to its minimum,
+                    // place new entry in the released tail.
+                    let old_reclen = u16::from_le_bytes(
+                        [block_buf[slot_off+4], block_buf[slot_off+5]]) as usize;
+                    let new_off = slot_off + fitted;
+                    let new_reclen = old_reclen - fitted;
+                    // Patch the predecessor's rec_len.
+                    block_buf[slot_off+4..slot_off+6]
+                        .copy_from_slice(&(fitted as u16).to_le_bytes());
+                    write_dir_entry(&mut block_buf, new_off,
+                        child_ino, new_reclen,
+                        name_bytes, child_file_type);
+                }
+                if self.write_block(phys, &block_buf).is_err() {
+                    return Err(VfsError::Io);
+                }
+                return Ok(());
+            }
+        }
+
+        // Pass 2 — no existing block had room.  Allocate one new block,
+        // initialise it with a single entry spanning the whole block, and
+        // extend `i_size` accordingly.
+        let new_block_idx = num_blocks;
+        let phys = self.ensure_block(parent_inode, new_block_idx)
+            .ok_or(VfsError::Io)?;
+        for byte in block_buf.iter_mut() { *byte = 0; }
+        write_dir_entry(&mut block_buf, 0, child_ino, bs,
+            name_bytes, child_file_type);
+        if self.write_block(phys, &block_buf).is_err() {
+            return Err(VfsError::Io);
+        }
+        // Grow i_size by one block.  Directory size is always a multiple
+        // of the FS block size (spec §3.1).
+        let new_size = (dir_size + bs) as u64;
+        if new_size > u32::MAX as u64 {
+            return Err(VfsError::Io);
+        }
+        parent_inode.size = new_size as u32;
+        parent_inode.mtime = current_unix_time();
+        // Persist parent inode now — the cooperating caller's write_inode
+        // is also safe but doing it here keeps `i_blocks` / `i_size` in
+        // sync after the ensure_block above.
+        self.write_inode(parent_ino_num, parent_inode)
+            .map_err(|_| VfsError::Io)?;
+        Ok(())
+    }
+
+    /// Remove the directory entry named `name` from the parent directory.
+    /// Returns the inode number that the dead entry pointed at, so the
+    /// caller can decrement that inode's `i_links_count`.
+    ///
+    /// Coalescing strategy per ext2 spec §3 "Linked directory entries":
+    ///
+    /// * If the entry is preceded by another entry in the same block, the
+    ///   predecessor's `rec_len` absorbs the removed entry's `rec_len`
+    ///   (the linked-list walk skips over the gap).
+    /// * If the entry is the FIRST entry in its block (no predecessor in
+    ///   the same block), the entry's `inode` field is set to 0 and its
+    ///   `rec_len` is left unchanged — the walk steps past the dead slot.
+    ///
+    /// Directories never shrink (we do not free the trailing block even
+    /// if every entry in it has been removed) — matches Linux's ext2
+    /// implementation and keeps the indirect tree stable.
+    fn remove_dir_entry(&self, parent_inode: &Ext2Inode, name: &str)
+        -> Result<u32, VfsError>
+    {
+        if name.is_empty() || name == "." || name == ".." {
+            return Err(VfsError::InvalidArg);
+        }
+        let name_bytes = name.as_bytes();
+        let bs = self.block_size;
+        let dir_size = parent_inode.size as usize;
+        let num_blocks = dir_size / bs;
+        let mut block_buf = alloc::vec![0u8; bs];
+
+        for blk_idx in 0..num_blocks {
+            let phys = self.resolve_block(parent_inode, blk_idx);
+            if phys == 0 { continue; }
+            if self.read_block(phys, &mut block_buf).is_err() {
+                return Err(VfsError::Io);
+            }
+            let mut offset = 0usize;
+            let mut prev_offset: Option<usize> = None;
+            while offset + EXT2_DIR_HDR <= bs {
+                let entry_inode = u32::from_le_bytes([
+                    block_buf[offset], block_buf[offset+1],
+                    block_buf[offset+2], block_buf[offset+3]]);
+                let rec_len = u16::from_le_bytes(
+                    [block_buf[offset+4], block_buf[offset+5]]) as usize;
+                let nm_len = block_buf[offset+6] as usize;
+                if rec_len < EXT2_DIR_HDR || rec_len & 3 != 0
+                    || offset + rec_len > bs
+                {
+                    return Err(VfsError::Io);
+                }
+                if entry_inode != 0 && nm_len == name_bytes.len() {
+                    let on_disk = &block_buf[offset + EXT2_DIR_HDR
+                        ..offset + EXT2_DIR_HDR + nm_len];
+                    if on_disk == name_bytes {
+                        // Found.
+                        let dead_ino = entry_inode;
+                        if let Some(po) = prev_offset {
+                            // Coalesce into predecessor.
+                            let prev_reclen = u16::from_le_bytes(
+                                [block_buf[po+4], block_buf[po+5]]) as usize;
+                            let new_prev = prev_reclen + rec_len;
+                            block_buf[po+4..po+6]
+                                .copy_from_slice(&(new_prev as u16).to_le_bytes());
+                        } else {
+                            // First entry: mark inode=0, keep rec_len.
+                            block_buf[offset..offset+4].fill(0);
+                            // Clear name_len so a stale-name scan can't match.
+                            block_buf[offset+6] = 0;
+                            block_buf[offset+7] = 0;
+                        }
+                        if self.write_block(phys, &block_buf).is_err() {
+                            return Err(VfsError::Io);
+                        }
+                        return Ok(dead_ino);
+                    }
+                }
+                prev_offset = Some(offset);
+                offset += rec_len;
+            }
+        }
+        Err(VfsError::NotFound)
+    }
+
+    /// Check whether the directory inode has any entries other than `.`
+    /// and `..`.  Used to enforce POSIX `rmdir(2)` ENOTEMPTY.
+    fn dir_is_empty(&self, inode: &Ext2Inode) -> bool {
+        let entries = self.read_dir_entries(inode);
+        for (_, name, _) in entries {
+            if name != "." && name != ".." {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Tear down an inode after its last directory link is gone.  Frees
+    /// all allocated data + indirect blocks, sets `i_dtime`, and clears
+    /// the inode bitmap bit (releasing the inode number for reuse).
+    ///
+    /// Used by [`FileSystemOps::remove_inode`] when `i_links_count` drops
+    /// to 0 and no fds reference the inode.
+    fn destroy_inode(&self, inode_num: u64, mut inode: Ext2Inode)
+        -> Result<(), &'static str>
+    {
+        let was_dir = (inode.mode & S_IFMT) == S_IFDIR;
+        // Free all data blocks first.  For regular files this walks the
+        // direct + indirect tree; for symlinks we may have a slow-link
+        // tail (fast symlinks have inode.blocks == 0 and the loop is a
+        // no-op).  For directories we free every block they own.
+        self.free_blocks_from(&mut inode, 0);
+        // Mark dtime + clear mode so e2fsck recognises the slot as free.
+        inode.dtime = current_unix_time();
+        inode.size = 0;
+        inode.links_count = 0;
+        self.write_inode(inode_num, &inode)?;
+        // Finally release the inode-bitmap bit.
+        self.free_inode(inode_num as u32, was_dir);
+        Ok(())
+    }
+
+    /// Internal helper for create_file / create_dir: build a freshly-
+    /// initialised inode with the given mode bits.  Timestamps are set
+    /// from the live RTC; uid / gid default to 0 (root) — PR-C does not
+    /// thread per-process credentials through the create path.
+    fn make_new_inode(&self, mode: u16, links_count: u16) -> Ext2Inode {
+        let t = current_unix_time();
+        Ext2Inode {
+            mode,
+            uid: 0,
+            size: 0,
+            atime: t,
+            ctime: t,
+            mtime: t,
+            dtime: 0,
+            gid: 0,
+            links_count,
+            blocks: 0,
+            flags: 0,
+            osd1: 0,
+            block: [0; 15],
+            generation: 0,
+            file_acl: 0,
+            dir_acl: 0,
+            faddr: 0,
+            osd2: [0; 12],
+        }
+    }
+
     /// Read directory entries from an inode.
     ///
     /// Parses on-disk `ext2_dir_entry_2` records and enforces the integrity
@@ -1565,7 +1967,7 @@ impl Ext2Fs {
 }
 
 // Implement FileSystemOps trait
-use crate::vfs::{FileSystemOps, FileStat, FileType, VfsResult, VfsError};
+use crate::vfs::{FileSystemOps, FileStat, FileType, VfsResult};
 
 // Need Send + Sync. read_fn is a function pointer (Send+Sync), rest is plain data.
 unsafe impl Send for Ext2Fs {}
@@ -1640,16 +2042,133 @@ impl FileSystemOps for Ext2Fs {
         Ok(result)
     }
 
-    fn create_file(&self, _parent_inode: u64, _name: &str) -> VfsResult<u64> {
-        Err(VfsError::PermissionDenied) // Read-only
+    fn create_file(&self, parent_inode: u64, name: &str) -> VfsResult<u64> {
+        // POSIX open(2) O_CREAT semantics: parent must be a directory; the
+        // resulting inode is a regular file with i_mode = S_IFREG | 0o644
+        // (the kernel applies umask at the syscall layer — we hand back
+        // raw 0644 here and let the personality layer mask later).
+        let mut parent = self.read_inode(parent_inode).ok_or(VfsError::NotFound)?;
+        if (parent.mode & S_IFMT) != S_IFDIR {
+            return Err(VfsError::NotADirectory);
+        }
+        let new_ino = self.alloc_inode(false).ok_or(VfsError::NoSpace)?;
+        let inode = self.make_new_inode(S_IFREG | 0o644, 1);
+        self.write_inode(new_ino as u64, &inode)
+            .map_err(|_| VfsError::Io)?;
+        // Insert the dir-entry.  On failure we must roll back the inode
+        // allocation so we don't leak the bitmap bit.
+        match self.insert_dir_entry(&mut parent, parent_inode, name,
+            new_ino, EXT2_FT_REG_FILE)
+        {
+            Ok(()) => {
+                // insert_dir_entry persists `parent` only when it had to
+                // grow into a new block; for the in-place split / reuse
+                // paths we still need to bump parent's mtime/ctime.  Do
+                // a single defensive write — duplicate writes are
+                // idempotent (RMW touches the same 512-byte sector).
+                let t = current_unix_time();
+                parent.mtime = t;
+                parent.ctime = t;
+                let _ = self.write_inode(parent_inode, &parent);
+                Ok(new_ino as u64)
+            }
+            Err(e) => {
+                self.free_inode(new_ino, false);
+                Err(e)
+            }
+        }
     }
 
-    fn create_dir(&self, _parent_inode: u64, _name: &str) -> VfsResult<u64> {
-        Err(VfsError::PermissionDenied) // Read-only
+    fn create_dir(&self, parent_inode: u64, name: &str) -> VfsResult<u64> {
+        // POSIX mkdir(2): allocate inode, allocate one data block for the
+        // initial `.`/`..` entries, link into parent.  i_links_count starts
+        // at 2 (the `.` self-link plus the parent's name→inode link) per
+        // spec §3.1 "Linked directory entries".
+        let mut parent = self.read_inode(parent_inode).ok_or(VfsError::NotFound)?;
+        if (parent.mode & S_IFMT) != S_IFDIR {
+            return Err(VfsError::NotADirectory);
+        }
+        let new_ino = self.alloc_inode(true).ok_or(VfsError::NoSpace)?;
+        let mut inode = self.make_new_inode(S_IFDIR | 0o755, 2);
+        // Allocate the directory's first data block via ensure_block.
+        // This populates inode.block[0] and i_blocks; size is updated by
+        // hand to one full block.
+        let bs = self.block_size;
+        let first_block = match self.ensure_block(&mut inode, 0) {
+            Some(b) => b,
+            None => {
+                self.free_inode(new_ino, true);
+                return Err(VfsError::NoSpace);
+            }
+        };
+        inode.size = bs as u32;
+        // Write `.`/`..` into the new block.
+        let mut block_buf = alloc::vec![0u8; bs];
+        self.init_dir_block(&mut block_buf, new_ino, parent_inode as u32);
+        if self.write_block(first_block, &block_buf).is_err() {
+            // Best-effort rollback: free the block and the inode.
+            self.free_block(first_block);
+            self.free_inode(new_ino, true);
+            return Err(VfsError::Io);
+        }
+        if self.write_inode(new_ino as u64, &inode).is_err() {
+            self.free_block(first_block);
+            self.free_inode(new_ino, true);
+            return Err(VfsError::Io);
+        }
+        // Link into parent.
+        match self.insert_dir_entry(&mut parent, parent_inode, name,
+            new_ino, EXT2_FT_DIR)
+        {
+            Ok(()) => {
+                // Bump parent's links_count by 1 for the new child's `..`
+                // back-reference, plus mtime/ctime.
+                let t = current_unix_time();
+                parent.links_count = parent.links_count.saturating_add(1);
+                parent.mtime = t;
+                parent.ctime = t;
+                let _ = self.write_inode(parent_inode, &parent);
+                Ok(new_ino as u64)
+            }
+            Err(e) => {
+                // Roll back the child inode + block.
+                let inode_copy = inode;
+                let _ = self.destroy_inode(new_ino as u64, inode_copy);
+                Err(e)
+            }
+        }
     }
 
-    fn remove(&self, _parent_inode: u64, _name: &str) -> VfsResult<()> {
-        Err(VfsError::PermissionDenied) // Read-only
+    fn remove(&self, parent_inode: u64, name: &str) -> VfsResult<()> {
+        // POSIX-style combined unlink: look up the target so we can decide
+        // between rmdir(2) (ENOTEMPTY check + parent links_count decrement)
+        // and unlink(2) (regular-file or symlink path).  Then run the
+        // unlink_entry / remove_inode pair atomically.
+        let parent = self.read_inode(parent_inode).ok_or(VfsError::NotFound)?;
+        if (parent.mode & S_IFMT) != S_IFDIR {
+            return Err(VfsError::NotADirectory);
+        }
+        // Find target.
+        let target_ino = {
+            let entries = self.read_dir_entries(&parent);
+            entries.into_iter()
+                .find(|(_, n, _)| n == name)
+                .map(|(i, _, _)| i as u64)
+                .ok_or(VfsError::NotFound)?
+        };
+        let target = self.read_inode(target_ino).ok_or(VfsError::NotFound)?;
+        let is_dir = (target.mode & S_IFMT) == S_IFDIR;
+        if is_dir && !self.dir_is_empty(&target) {
+            return Err(VfsError::NotEmpty);
+        }
+        // 1) Remove dir-entry.
+        self.unlink_entry(parent_inode, name)?;
+        // 2) Free inode if no more refs (PR-C does not maintain an
+        // in-memory open-fd ref-count; we conservatively free immediately,
+        // matching the inline-unlink behaviour POSIX requires when no fd
+        // is open on the target.  Open-fd retention is a VFS-layer concern
+        // outside this FS driver.)
+        self.remove_inode(target_ino)
     }
 
     fn truncate(&self, inode: u64, size: u64) -> VfsResult<()> {
@@ -1677,6 +2196,57 @@ impl FileSystemOps for Ext2Fs {
             return Err(VfsError::InvalidArg); // POSIX readlink(2): EINVAL on non-symlink
         }
         self.read_symlink_target(&ino).ok_or(VfsError::Io)
+    }
+
+    fn unlink_entry(&self, parent_inode: u64, name: &str) -> VfsResult<()> {
+        // POSIX unlink(2) split form: remove the name→inode binding from
+        // the parent directory but leave the target inode in place; the
+        // VFS layer calls `remove_inode` once all open fds are closed.
+        // Decrements the target's `i_links_count`.  For directories the
+        // parent's `i_links_count` is also decremented (the child's `..`
+        // back-link is going away).
+        let parent = self.read_inode(parent_inode).ok_or(VfsError::NotFound)?;
+        if (parent.mode & S_IFMT) != S_IFDIR {
+            return Err(VfsError::NotADirectory);
+        }
+        let dead_ino = self.remove_dir_entry(&parent, name)?;
+        // Decrement target's links_count.
+        if let Some(mut target) = self.read_inode(dead_ino as u64) {
+            target.links_count = target.links_count.saturating_sub(1);
+            target.ctime = current_unix_time();
+            let _ = self.write_inode(dead_ino as u64, &target);
+            // Directory case: parent loses one ref from the child's `..`.
+            if (target.mode & S_IFMT) == S_IFDIR {
+                if let Some(mut p) = self.read_inode(parent_inode) {
+                    p.links_count = p.links_count.saturating_sub(1);
+                    p.mtime = current_unix_time();
+                    p.ctime = p.mtime;
+                    let _ = self.write_inode(parent_inode, &p);
+                }
+            } else {
+                if let Some(mut p) = self.read_inode(parent_inode) {
+                    p.mtime = current_unix_time();
+                    p.ctime = p.mtime;
+                    let _ = self.write_inode(parent_inode, &p);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_inode(&self, inode: u64) -> VfsResult<()> {
+        // Final teardown — called after the last open fd is closed.  If
+        // `i_links_count` is still > 0 the inode is reachable from some
+        // surviving directory entry and we must NOT free it (e.g. a hard-
+        // linked file unlinked from one path but still bound to another).
+        let ino = self.read_inode(inode).ok_or(VfsError::NotFound)?;
+        if ino.links_count > 0 {
+            return Ok(());
+        }
+        self.destroy_inode(inode, ino).map_err(|e| {
+            crate::serial_println!("[EXT2] remove_inode({}) failed: {}", inode, e);
+            VfsError::Io
+        })
     }
 }
 
