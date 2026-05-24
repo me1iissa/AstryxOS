@@ -364,12 +364,28 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
     let payload = &data[hlen..];
 
     // RST: immediately close matching connection.
+    //
+    // We MUST match against the connection's lifecycle state too — once a
+    // TCB is already in `Closed`, a second RST arriving for the same
+    // 4-tuple (a normal occurrence when the peer issues an abortive close
+    // by sending FIN immediately followed by RST, both buffered in SLIRP's
+    // outbound queue and delivered as separate frames on the next RX
+    // drain) re-matched the now-Closed TCB and emitted a stale log line.
+    // The duplicate log was harmless to the wire — `mark_closed` /
+    // `retransmit_queue.clear` are idempotent — but pollutes the serial
+    // diagnostic so per-connection RST counting overcounts.
+    //
+    // The same caveat applies if the connection has already transitioned
+    // to TimeWait via a graceful close: a late RST for that 4-tuple
+    // should be silently dropped per RFC 9293 §3.10.7.4 (TIME-WAIT state
+    // ignores anything that does not advance recv_next).
     if hdr.flags & RST != 0 {
         let mut conns = TCP_CONNECTIONS.lock();
         if let Some(c) = conns.iter_mut().find(|c|
             c.local_port == hdr.dst_port &&
             c.remote_ip  == src_ip &&
             c.remote_port == hdr.src_port
+            && !matches!(c.state, TcpState::Closed | TcpState::TimeWait)
         ) {
             crate::serial_println!("[TCP] RST: closing port {}", c.local_port);
             mark_closed(c);
@@ -754,7 +770,8 @@ pub fn tcp_timer_tick() {
 /// touching the full TCB struct.  Gated to preserve byte-identical
 /// default builds — the struct would otherwise alter LLVM's symbol
 /// mangling hashes of neighbouring statics.
-#[cfg(any(feature = "kdb", feature = "httpd-test"))]
+#[cfg(any(feature = "kdb", feature = "httpd-test", feature = "test-mode",
+          feature = "firefox-test", feature = "oracle-test"))]
 #[derive(Clone, Copy)]
 pub struct ConnSnap {
     pub local_port:  u16,
@@ -765,7 +782,8 @@ pub struct ConnSnap {
 
 /// Return a snapshot of every connection in the TCP table.  Caller-owned
 /// copy — safe to use after the lock is dropped.
-#[cfg(any(feature = "kdb", feature = "httpd-test"))]
+#[cfg(any(feature = "kdb", feature = "httpd-test", feature = "test-mode",
+          feature = "firefox-test", feature = "oracle-test"))]
 pub fn snapshot_connections() -> alloc::vec::Vec<ConnSnap> {
     TCP_CONNECTIONS.lock().iter().map(|c| ConnSnap {
         local_port:  c.local_port,
@@ -784,7 +802,8 @@ pub fn snapshot_connections() -> alloc::vec::Vec<ConnSnap> {
 /// received their entire response.  Closing while either count is non-
 /// zero discards the buffered tail because the FIN advances `send_next`
 /// past data that has not yet been transmitted.
-#[cfg(any(feature = "kdb", feature = "httpd-test"))]
+#[cfg(any(feature = "kdb", feature = "httpd-test", feature = "test-mode",
+          feature = "firefox-test", feature = "oracle-test"))]
 pub fn outbound_pending(local_port: u16, remote_ip: Ipv4Address, remote_port: u16) -> usize {
     TCP_CONNECTIONS.lock().iter()
         .find(|c| c.local_port == local_port

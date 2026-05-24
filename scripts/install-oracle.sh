@@ -286,8 +286,15 @@ enable_platform_log = false
 # Enabled for the daemon-mode demo.  Target is the QEMU SLIRP gateway
 # alias 10.0.2.2 where `scripts/oracle-stub-conflux.py` listens on port
 # 8088 (plain HTTP, no TLS — defers I1 ca-certificates work).
+#
+# server_url is the BASE URL — oracle's infrasvc::sync::HttpSync appends
+# the canonical Conflux v1 path `/v1/hosts/<hostname>/heartbeat` itself,
+# so this URL must NOT carry a `/heartbeat` (or any other) trailing path.
+# The stub `scripts/oracle-stub-conflux.py` accepts both the canonical
+# `/v1/hosts/<hostname>/heartbeat` shape and the legacy `/heartbeat`
+# fallback — see its do_POST router for the full match.
 enabled = true
-server_url = "http://10.0.2.2:8088/heartbeat"
+server_url = "http://10.0.2.2:8088"
 interval_secs = 10
 
 [patching]
