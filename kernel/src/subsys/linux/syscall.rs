@@ -1236,20 +1236,50 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             if crate::syscall::is_inotify_fd(pid, fd) {
                 crate::ipc::inotify::close(crate::syscall::get_inotify_id(pid, fd));
             }
-            // If it's an epoll fd, remove the EpollInstance.
+            // If it's an epoll fd, remove the EpollInstance — but ONLY
+            // when this close is dropping the LAST FileDescriptor that
+            // references the underlying epoll object.  Symmetric with
+            // the by-id lookup in sys_epoll_ctl/wait: epoll instances
+            // are now keyed by `inode` (the epoll id stamped at
+            // create time), and dup(2)/fcntl(F_DUPFD) clones the
+            // FileDescriptor including its inode — so multiple fds
+            // can point at the same instance.  Retiring the instance
+            // on first close would orphan watches the dup'd fds still
+            // care about.
+            //
+            // POSIX dup(2): "after a successful return from one of
+            // these functions, the old and new file descriptors may be
+            // used interchangeably. ... When one of the descriptors is
+            // closed, the file is not closed if the other descriptor
+            // is still open."  Epoll-on-Linux extends this to the
+            // watch list (epoll(7): the interest list is associated
+            // with the open file description, not the fd).
             {
-                let is_epoll = {
+                let close_epoll_id: Option<u64> = {
                     let procs = crate::proc::PROCESS_TABLE.lock();
                     procs.iter().find(|p| p.pid == pid)
                         .and_then(|p| p.file_descriptors.get(fd))
                         .and_then(|f| f.as_ref())
-                        .map(|f| f.open_path == "[epoll]")
-                        .unwrap_or(false)
+                        .and_then(|f| if f.open_path == "[epoll]" {
+                            Some(f.inode)
+                        } else {
+                            None
+                        })
                 };
-                if is_epoll {
+                if let Some(eid) = close_epoll_id {
                     let mut procs = crate::proc::PROCESS_TABLE.lock();
                     if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-                        p.epoll_sets.retain(|e| e.epfd != fd);
+                        // Count surviving FileDescriptors that point at
+                        // this epoll id, EXCLUDING the one we're about
+                        // to close (fd == this slot).
+                        let other_refs = p.file_descriptors.iter().enumerate()
+                            .filter(|(i, _)| *i != fd)
+                            .filter_map(|(_, f)| f.as_ref())
+                            .filter(|f| f.open_path == "[epoll]" && f.inode == eid)
+                            .count();
+                        if other_refs == 0 {
+                            p.epoll_sets.retain(|e| e.id != eid);
+                        }
                     }
                 }
             }
@@ -9099,8 +9129,21 @@ fn sys_epoll_create1(_flags: u32) -> i64 {
     while proc.file_descriptors.len() <= slot {
         proc.file_descriptors.push(None);
     }
+    // Allocate a fresh epoll id and stamp it into BOTH the FileDescriptor
+    // (so dup(2) / fcntl(F_DUPFD) carries it forward in the cloned fd) and
+    // the EpollInstance (so the by-id lookup in sys_epoll_ctl/wait finds
+    // the same instance through any dup of the original epfd).  Without
+    // this, dup'ing an epoll fd creates a second FileDescriptor whose
+    // `open_path == "[epoll]"` check passes but whose post-check
+    // `epoll_sets.iter().find(|e| e.epfd == NEW_FD)` returns None — and
+    // the caller sees a spurious -EBADF on the dup'd epfd.  tokio's signal
+    // driver hits exactly this pattern: it F_DUPFDs the runtime epoll
+    // (mio internal fd=4) into a signal-driver-local epfd (typically 6),
+    // then epoll_ctl's a signal pipe through the dup.  Verified failing
+    // pre-fix; verified working post-fix.  See PIVOT-I2 Phase D, 2026-05-23.
+    let (epoll_instance, epoll_id) = crate::ipc::epoll::EpollInstance::new_with_id(slot);
     proc.file_descriptors[slot] = Some(crate::vfs::FileDescriptor {
-        inode:     0,
+        inode:     epoll_id,
         mount_idx: 0,
         offset:    0,
         flags:     0,
@@ -9109,7 +9152,7 @@ fn sys_epoll_create1(_flags: u32) -> i64 {
         cloexec:   false,
         open_path: alloc::string::String::from("[epoll]"),
     });
-    proc.epoll_sets.push(crate::ipc::epoll::EpollInstance::new(slot));
+    proc.epoll_sets.push(epoll_instance);
     slot as i64
 }
 
@@ -9135,14 +9178,23 @@ fn sys_epoll_ctl(epfd: usize, op: u64, fd: usize, event_ptr: u64) -> i64 {
         None    => return -9, // EBADF
     };
 
-    // Verify epfd refers to an epoll object.
-    let is_epoll = proc.file_descriptors.get(epfd)
-        .and_then(|f| f.as_ref())
-        .map(|f| f.open_path == "[epoll]")
-        .unwrap_or(false);
-    if !is_epoll { return -9; } // EBADF
+    // Verify epfd refers to an epoll object AND capture the epoll id
+    // (stored in FileDescriptor.inode at create-time).  We use the id —
+    // not the epfd value — to look up the shared EpollInstance, so dup'd
+    // epoll fds (signal-hook-registry / tokio signal driver pattern) all
+    // resolve to the same instance.  See `EpollInstance::new_with_id`
+    // and `sys_epoll_create1` for the by-id design rationale.
+    //
+    // Per POSIX dup(2) and Linux epoll(7): registrations made through one
+    // fd of a dup'd pair are visible through the other.  Without by-id
+    // lookup we incorrectly return -EBADF on dup'd epfds, breaking any
+    // runtime that opaquely dup's its epoll handle (tokio + signal-hook).
+    let epoll_id = match proc.file_descriptors.get(epfd).and_then(|f| f.as_ref()) {
+        Some(f) if f.open_path == "[epoll]" => f.inode,
+        _                                   => return -9, // EBADF
+    };
 
-    let inst = match proc.epoll_sets.iter_mut().find(|e| e.epfd == epfd) {
+    let inst = match proc.epoll_sets.iter_mut().find(|e| e.id == epoll_id) {
         Some(i) => i,
         None    => return -9, // EBADF
     };
@@ -9168,18 +9220,22 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
     let pid = crate::proc::current_pid_lockless();
 
     // ── Step 1: snapshot the watch list while briefly holding the lock ────────
+    // Look up the EpollInstance by its per-process id (stamped into
+    // FileDescriptor.inode at epoll_create1 time) NOT by the epfd —
+    // dup'd epoll fds share the inode and thus the same instance.
+    // Symmetric with sys_epoll_ctl above; see that block for the full
+    // by-id rationale (PIVOT-I2 Phase D, 2026-05-23).
     let watches_snap: alloc::vec::Vec<(usize, u32, u64)> = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         let proc = match procs.iter().find(|p| p.pid == pid) {
             Some(p) => p,
             None    => return -9, // EBADF
         };
-        let is_epoll = proc.file_descriptors.get(epfd)
-            .and_then(|f| f.as_ref())
-            .map(|f| f.open_path == "[epoll]")
-            .unwrap_or(false);
-        if !is_epoll { return -9; }
-        let inst = match proc.epoll_sets.iter().find(|e| e.epfd == epfd) {
+        let epoll_id = match proc.file_descriptors.get(epfd).and_then(|f| f.as_ref()) {
+            Some(f) if f.open_path == "[epoll]" => f.inode,
+            _                                   => return -9, // EBADF
+        };
+        let inst = match proc.epoll_sets.iter().find(|e| e.id == epoll_id) {
             Some(i) => i,
             None    => return -9,
         };

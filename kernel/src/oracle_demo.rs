@@ -61,7 +61,7 @@
 //!   - POSIX execve(2), exit_group(2)
 //!   - clap CLI parser:      https://docs.rs/clap/
 
-#![cfg(feature = "oracle-test")]
+#![cfg(any(feature = "oracle-test", feature = "oracle-daemon-test"))]
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -114,6 +114,7 @@ fn default_envp() -> &'static [&'static str] {
 /// Public entry point for `--features oracle-test`.  Loads
 /// /disk/usr/bin/oracle, launches it with `--mode console --once`, captures
 /// stdout, and reports the first-boot verdict.
+#[cfg(feature = "oracle-test")]
 pub fn run_oracle_demo() {
     serial_println!("[ORACLE] oracle-test starting (PIVOT-I2, 2026-05-23)");
 
@@ -328,6 +329,400 @@ pub fn run_oracle_demo() {
     } else {
         serial_println!(
             "[ORACLE] === ORACLE-TEST: PARTIAL (some stdout but no banner; exit={}; first bytes may name the loader gate) ===",
+            exit_code
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Daemon-mode bring-up (PIVOT-I2 Phase D, 2026-05-23)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `--features oracle-daemon-test` stretches the first-boot --once flow into a
+// real long-running agent against a host-side stub Conflux endpoint.  Reaches
+// (and exercises) the parts of the agent the --once path does NOT:
+//
+//   - tokio multi-thread runtime worker bring-up (clone3 + tokio's
+//     blocking-pool ramp).
+//   - infrasvc::polling::poll_loop's heartbeat task — the timer-driven
+//     periodic publish path.
+//   - infrasvc::sync::HttpSync — reqwest + hyper + tokio-net TCP outbound
+//     against `http://10.0.2.2:<port>/heartbeat` (the QEMU SLIRP gateway
+//     alias for the host stub).
+//
+// Sync is enabled via *env-vars*, NOT by mutating /etc/oracle/config.toml.
+// Oracle reads INFRASVC_SYNC_ENABLED and INFRASVC_SYNC_URL (per its
+// CONFIG_ENV mapping; the env-var names are statically interned in the
+// shipped binary — confirmed by `strings(1)`).  This keeps the existing
+// first-boot config staged by `install-oracle.sh` (which sets
+// `sync.enabled=false`) intact: the daemon demo overrides at run-time,
+// the first-boot --once flow keeps its sync-disabled posture.
+//
+// Soak budget is configurable but defaults to 90 s wall-clock.  At
+// `INFRASVC_POLL_INTERVAL=10` (we override the default 60 s to keep test
+// turnaround tight) the heartbeat emitter publishes roughly every 10 s,
+// so 90 s gives 5–8 heartbeats — comfortably above the "at least one
+// reached the host" success threshold while leaving slack for tokio's
+// own bring-up latency (worker-thread spawn + dynamic-linker walk).
+//
+// Why plain HTTP, not HTTPS?
+// --------------------------
+// Per audit §7, this defers the I1 (ca-certificates + libssl soak) work.
+// The reqwest client this oracle release was built with accepts both
+// `http://` and `https://`; we just point at the plain-HTTP URL and the
+// hyper-tls layer no-ops out of the connect path (per the strings dump
+// `hyper-util/.../connect/http.rs:481` plain-HTTP path is the
+// non-conditional branch when scheme==http).  No upstream-side code
+// change required.
+
+/// Soak budget for the daemon mode.  TICK_HZ=100, so 18_000 = 180 s
+/// (3 minutes).  Initially 90 s; bumped to 180 s after empirical
+/// observation that the first heartbeat send routinely arrives in the
+/// ~80-100 s window once the host-side stub Conflux is reachable, but
+/// the heartbeat-send log line + post-send pipe drain can lag by an
+/// extra ~30 s on a heavily-spinning tokio worker (verified
+/// PIVOT-I2 Phase D, 2026-05-23).  180 s comfortably brackets that
+/// without making CI runs balloon.
+#[cfg(feature = "oracle-daemon-test")]
+const ORACLE_DAEMON_SOAK_TICKS: u64 = 18_000;
+
+/// Heartbeat cadence we coerce oracle into via env-var override
+/// (INFRASVC_POLL_INTERVAL).  10 s gives 5–8 heartbeats in a 90 s soak
+/// — fast enough to demo, slow enough to not look like a flood.
+#[cfg(feature = "oracle-daemon-test")]
+const ORACLE_DAEMON_INTERVAL_SECS: &str = "10";
+
+/// Default Conflux stub endpoint URL.  Matches what
+/// `scripts/oracle-stub-conflux.py --port 8088` listens on, viewed
+/// through the QEMU SLIRP NAT gateway alias 10.0.2.2 (host loopback
+/// as seen from the guest — same alias used by busybox-test and
+/// tls-test).
+#[cfg(feature = "oracle-daemon-test")]
+const ORACLE_DAEMON_SYNC_URL: &str = "http://10.0.2.2:8088/heartbeat";
+
+/// Envp for daemon-mode oracle.  Extends `default_envp()` with the
+/// sync-override entries.  We hand-roll the slice rather than calling
+/// `default_envp()` + push because the kernel-side process spawner takes
+/// `&[&str]` and we want to avoid heap allocation for the envp before
+/// the address space is built.
+#[cfg(feature = "oracle-daemon-test")]
+fn daemon_envp() -> &'static [&'static str] {
+    &[
+        "HOME=/root",
+        "PATH=/bin:/usr/bin:/usr/sbin",
+        "TMPDIR=/tmp",
+        "TERM=dumb",
+        "LANG=C",
+        "LC_ALL=C",
+        "INFRASVC_LOG_LEVEL=info",
+        "RUST_BACKTRACE=1",
+        "SSL_CERT_FILE=/etc/ssl/cert.pem",
+        "SSL_CERT_DIR=/etc/ssl/certs",
+        "LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/lib64:/usr/lib/x86_64-linux-gnu",
+        // ── PIVOT-I2 Phase D overrides ──────────────────────────────────
+        // These three env-vars steer the agent into "sync enabled, plain
+        // HTTP, fast heartbeat" without touching /etc/oracle/config.toml.
+        // The shipped binary reads them at startup (confirmed via
+        // strings dump: INFRASVC_SYNC_ENABLED, INFRASVC_SYNC_URL,
+        // INFRASVC_POLL_INTERVAL).
+        "INFRASVC_SYNC_ENABLED=true",
+        "INFRASVC_SYNC_URL=http://10.0.2.2:8088/heartbeat",
+        "INFRASVC_POLL_INTERVAL=10",
+    ]
+}
+
+/// Public entry point for `--features oracle-daemon-test`.  Loads
+/// /disk/usr/bin/oracle, launches it with `--mode console` (no --once),
+/// captures stdout, and looks for the "Heartbeat sent for" /
+/// "Conflux rejected heartbeat" log lines that mark a successful
+/// reqwest POST to the host stub.  Reports a daemon-specific verdict
+/// surface (HEARTBEAT-OK / HEARTBEAT-FAIL / NO-HEARTBEAT / PRE-MAIN).
+#[cfg(feature = "oracle-daemon-test")]
+pub fn run_oracle_daemon() {
+    serial_println!("[ORACLED] oracle-daemon-test starting (PIVOT-I2 Phase D, 2026-05-23)");
+    serial_println!(
+        "[ORACLED] target sync URL: {} (host stub: scripts/oracle-stub-conflux.py --port 8088)",
+        ORACLE_DAEMON_SYNC_URL
+    );
+
+    let elf = match crate::vfs::read_file(ORACLE_PATH) {
+        Ok(d) => d,
+        Err(e) => {
+            serial_println!(
+                "[ORACLED] FATAL: cannot read {}: {:?} (run scripts/create-data-disk.sh --oracle --force)",
+                ORACLE_PATH, e
+            );
+            serial_println!("[ORACLED] === ORACLE-DAEMON: FAIL (staging) ===");
+            return;
+        }
+    };
+    serial_println!("[ORACLED] Loaded {} ({} bytes)", ORACLE_PATH, elf.len());
+
+    if !crate::proc::elf::is_elf(&elf) {
+        serial_println!("[ORACLED] FATAL: {} is not an ELF binary", ORACLE_PATH);
+        serial_println!("[ORACLED] === ORACLE-DAEMON: FAIL (staging) ===");
+        return;
+    }
+
+    // Daemon-mode CLI: drop --once and point at the daemon-specific
+    // /etc/oracle/daemon.toml (staged by install-oracle.sh — has
+    // `[sync] enabled = true` + `server_url = "http://10.0.2.2:8088/heartbeat"`
+    // + `interval_secs = 10`).  Using a separate config file keeps the
+    // first-boot --once flow's offline-only config.toml untouched, which
+    // matters because PR #439 PINS sync.enabled=false there as the
+    // first-boot contract.
+    //
+    // Why not env-vars?  The shipped oracle release (infrasvc 7b03aa65)
+    // interns INFRASVC_SYNC_ENABLED / INFRASVC_SYNC_URL in the binary
+    // strings table but empirically does NOT honour them once a
+    // config-file is supplied (verified 2026-05-23: even with sync env
+    // vars set, no "failed to build HttpSync" or heartbeat lines fire).
+    // The two-config-file approach is robust to that env-var-precedence
+    // ambiguity.
+    let argv: &[&str] = &[
+        "oracle",
+        "--mode", "console",
+        "--log-level", "info",
+        "--interval", ORACLE_DAEMON_INTERVAL_SECS,
+        "--config", "/etc/oracle/daemon.toml",
+    ];
+    let envp = daemon_envp();
+
+    serial_println!("[ORACLED] Spawning oracle (daemon) with argv={:?}", argv);
+
+    let pid = match crate::proc::usermode::create_user_process_with_args_blocked(
+        "oracle-daemon",
+        &elf,
+        argv,
+        envp,
+    ) {
+        Ok(pid) => pid,
+        Err(e) => {
+            serial_println!(
+                "[ORACLED] FATAL: spawn failed: create_user_process_with_args_blocked={:?}",
+                e
+            );
+            serial_println!("[ORACLED] === ORACLE-DAEMON: FAIL (spawn) ===");
+            return;
+        }
+    };
+    serial_println!("[ORACLED] oracle (daemon) spawned: pid={}", pid);
+
+    let pipe_id = crate::ipc::pipe::create_pipe();
+    crate::proc::attach_stdout_pipe(pid, pipe_id);
+    crate::proc::unblock_process(pid);
+
+    if !crate::sched::is_active() {
+        crate::sched::enable();
+    }
+    crate::hal::enable_interrupts();
+
+    let t_start = crate::arch::x86_64::irq::get_ticks();
+    // Daemon mode is verbose — bump capture cap to 64 KiB (vs 32 KiB for
+    // the --once path) so a chatty tokio runtime + multiple heartbeats
+    // worth of poll-cycle log don't truncate.
+    let cap = 65_536usize;
+    let mut captured: Vec<u8> = Vec::with_capacity(8_192);
+    let mut buf = [0u8; 512];
+    let mut last_marker_tick: u64 = 0;
+    let mut heartbeats_emitted: u32 = 0;
+    let mut heartbeats_rejected: u32 = 0;
+    let mut last_heartbeat_text_len: usize = 0;
+    let mut connect_errors: u32 = 0;
+
+    loop {
+        crate::sched::yield_cpu();
+
+        if let Some(n) = crate::ipc::pipe::pipe_read(pipe_id, &mut buf) {
+            if n > 0 && captured.len() < cap {
+                let take = core::cmp::min(n, cap - captured.len());
+                captured.extend_from_slice(&buf[..take]);
+
+                // Echo each line so the harness wait/grep can correlate
+                // collector events with kernel-side syscall markers.
+                let text = core::str::from_utf8(&buf[..take]).unwrap_or("<non-utf8>");
+                for line in text.lines() {
+                    serial_println!("[ORACLED] oracle | {}", line);
+                }
+            }
+        }
+
+        // Incremental marker accounting — scan only the new portion of
+        // captured since the last marker tick, so we count each heartbeat
+        // exactly once regardless of how the pipe chunks the bytes.
+        if captured.len() > last_heartbeat_text_len {
+            let slice = &captured[last_heartbeat_text_len..];
+            let text = core::str::from_utf8(slice).unwrap_or("");
+            // Count occurrences of each marker substring.  Each
+            // `windows(n).filter(...)` walk is O(N*M) but N is small here
+            // (one tick's worth of fresh bytes).
+            for line in text.lines() {
+                if line.contains("Heartbeat sent for") {
+                    heartbeats_emitted += 1;
+                }
+                if line.contains("Conflux rejected heartbeat") {
+                    heartbeats_rejected += 1;
+                }
+                if line.contains("error sending request")
+                    || line.contains("Connection refused")
+                    || line.contains("tcp connect error")
+                {
+                    connect_errors += 1;
+                }
+            }
+            last_heartbeat_text_len = captured.len();
+        }
+
+        let done = {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            match procs.iter().find(|p| p.pid == pid) {
+                Some(p) => p.state == crate::proc::ProcessState::Zombie,
+                None => true,
+            }
+        };
+        if done {
+            serial_println!("[ORACLED] oracle exited unexpectedly during soak");
+            break;
+        }
+
+        let elapsed = crate::arch::x86_64::irq::get_ticks().wrapping_sub(t_start);
+        if elapsed >= ORACLE_DAEMON_SOAK_TICKS {
+            serial_println!(
+                "[ORACLED] soak budget reached ({} ticks ~= {} s); winding down",
+                ORACLE_DAEMON_SOAK_TICKS, ORACLE_DAEMON_SOAK_TICKS / 100
+            );
+            // Best-effort kill: SIGKILL via the existing signal::kill
+            // path.  SIGKILL (vs SIGTERM) so we don't depend on oracle
+            // installing a graceful-shutdown signal handler — the soak
+            // is done either way and we just want to release the pipe
+            // reader and reap the zombie.
+            //
+            // POSIX kill(2): https://pubs.opengroup.org/onlinepubs/9699919799/functions/kill.html
+            let _ = crate::signal::kill(pid as u64, crate::signal::SIGKILL);
+            break;
+        }
+
+        // Periodic liveness marker every ~10 s.  Differs from --once mode:
+        // we surface the in-flight heartbeat count so a stalled oracle
+        // (TCP timeout, tokio worker wedge) is visible before the soak
+        // budget expires.
+        if elapsed.wrapping_sub(last_marker_tick) >= 1_000 {
+            last_marker_tick = elapsed;
+            serial_println!(
+                "[ORACLED] LIVENESS pid={} elapsed_s={} heartbeats_ok={} heartbeats_rej={} conn_err={} captured_bytes={}",
+                pid,
+                elapsed / 100,
+                heartbeats_emitted,
+                heartbeats_rejected,
+                connect_errors,
+                captured.len()
+            );
+        }
+
+        for _ in 0..1_000u32 {
+            core::hint::spin_loop();
+        }
+    }
+
+    // Drain any tail bytes the child wrote after the soak deadline.
+    {
+        let mut tail = [0u8; 4096];
+        while let Some(n) = crate::ipc::pipe::pipe_read(pipe_id, &mut tail) {
+            if n == 0 {
+                break;
+            }
+            if captured.len() < cap {
+                let take = core::cmp::min(n, cap - captured.len());
+                captured.extend_from_slice(&tail[..take]);
+            }
+        }
+    }
+
+    // One more marker sweep over the drained tail for accuracy.
+    if captured.len() > last_heartbeat_text_len {
+        let slice = &captured[last_heartbeat_text_len..];
+        let text = core::str::from_utf8(slice).unwrap_or("");
+        for line in text.lines() {
+            if line.contains("Heartbeat sent for") {
+                heartbeats_emitted += 1;
+            }
+            if line.contains("Conflux rejected heartbeat") {
+                heartbeats_rejected += 1;
+            }
+            if line.contains("error sending request")
+                || line.contains("Connection refused")
+                || line.contains("tcp connect error")
+            {
+                connect_errors += 1;
+            }
+        }
+    }
+
+    let (final_state, exit_code) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == pid) {
+            Some(p) => (p.state, p.exit_code),
+            None => (crate::proc::ProcessState::Zombie, 0),
+        }
+    };
+
+    crate::ipc::pipe::pipe_close_reader(pipe_id);
+    let _ = crate::proc::waitpid(0, pid as i64);
+
+    let text = core::str::from_utf8(&captured).unwrap_or("<non-utf8>");
+    let saw_banner          = text.contains("Oracle endpoint agent") ||
+                              text.contains("Oracle agent starting");
+    let saw_runtime_ready   = text.contains("tokio") ||
+                              text.contains("worker") ||
+                              text.contains("Polling");
+    let saw_panic           = text.contains("panic") || text.contains("PANIC");
+
+    serial_println!(
+        "[ORACLED] === SUMMARY === banner={} runtime_ready={} heartbeats_ok={} heartbeats_rej={} conn_err={} panic={} exit={} state={:?} captured_bytes={}",
+        saw_banner as u8,
+        saw_runtime_ready as u8,
+        heartbeats_emitted,
+        heartbeats_rejected,
+        connect_errors,
+        saw_panic as u8,
+        exit_code,
+        final_state,
+        captured.len(),
+    );
+
+    // Verdict tree — pick the most informative bucket the data supports.
+    // The major-win threshold per dispatch is "1+ heartbeat received"; the
+    // stub Conflux logs the host-side view independently in /tmp/oracle-stub.jsonl.
+    if heartbeats_emitted > 0 {
+        serial_println!(
+            "[ORACLED] === ORACLE-DAEMON: HEARTBEAT-OK ({} heartbeats emitted to host stub; substrate proven end-to-end) ===",
+            heartbeats_emitted
+        );
+    } else if heartbeats_rejected > 0 {
+        serial_println!(
+            "[ORACLED] === ORACLE-DAEMON: HEARTBEAT-REJECTED (reqwest reached host but Conflux rejected; check stub status code) ==="
+        );
+    } else if connect_errors > 0 {
+        serial_println!(
+            "[ORACLED] === ORACLE-DAEMON: CONNECT-FAIL ({} TCP-connect failures; host stub probably not listening on 10.0.2.2:8088 — start with `python3 scripts/oracle-stub-conflux.py --port 8088`) ===",
+            connect_errors
+        );
+    } else if saw_runtime_ready {
+        serial_println!(
+            "[ORACLED] === ORACLE-DAEMON: RUNTIME-OK-NO-EMIT (tokio runtime up, collectors polling, but no heartbeat publish line in stdout — check INFRASVC_SYNC_ENABLED honoring) ==="
+        );
+    } else if saw_banner {
+        serial_println!(
+            "[ORACLED] === ORACLE-DAEMON: BANNER-ONLY (oracle banner printed but no runtime line; tokio bring-up wedge — check syscall trace for clone3/eventfd/epoll faults) ==="
+        );
+    } else if captured.is_empty() {
+        serial_println!(
+            "[ORACLED] === ORACLE-DAEMON: PRE-MAIN (no stdout; dynamic linker / glibc / static-init failure; exit={}) ===",
+            exit_code
+        );
+    } else {
+        serial_println!(
+            "[ORACLED] === ORACLE-DAEMON: PARTIAL (some stdout but no banner; exit={}) ===",
             exit_code
         );
     }
