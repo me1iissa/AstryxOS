@@ -2022,7 +2022,7 @@ pub(crate) fn sys_ioctl(fd_num: usize, request: u64, arg_ptr: *mut u8) -> i64 {
     // `open(2)` guarantees the lowest free descriptor.  Routing by
     // file_type instead of by fd number keeps the per-pair termios
     // contract intact for those callers.
-    let (open_path, file_type, inode, is_console) = {
+    let (open_path, file_type, inode, is_console, fd_present) = {
         let pid = crate::proc::current_pid_lockless();
         let procs = crate::proc::PROCESS_TABLE.lock();
         let fd_opt = procs.iter()
@@ -2030,15 +2030,24 @@ pub(crate) fn sys_ioctl(fd_num: usize, request: u64, arg_ptr: *mut u8) -> i64 {
             .and_then(|p| p.file_descriptors.get(fd_num))
             .and_then(|f| f.as_ref());
         match fd_opt {
-            Some(f) => (f.open_path.clone(), f.file_type, f.inode, f.is_console),
-            None    => (alloc::string::String::new(), crate::vfs::FileType::RegularFile, 0, false),
+            Some(f) => (f.open_path.clone(), f.file_type, f.inode, f.is_console, true),
+            None    => (alloc::string::String::new(), crate::vfs::FileType::RegularFile, 0, false, false),
         }
     };
 
     // Console fds (is_console=true) → TTY0.  This is set by the kernel
     // init path on the initial stdio fds for processes inheriting the
     // physical console, and stays distinct from /dev/ptmx PTY masters.
-    if is_console {
+    //
+    // Legacy stdio fall-back: if the caller targets fd 0/1/2 but the
+    // process has no fd table populated (kernel test threads, very early
+    // boot, or callers that never inherited stdio), route to `TTY0`
+    // anyway.  This preserves POSIX `tty(4)` semantics for TIOCGPGRP /
+    // TIOCGETSID / TIOCGWINSZ on stdio in environments where the kernel
+    // is the sole driver of the physical console.  A real fd with
+    // `is_console=false` (e.g. an `open("/dev/ptmx")` that happens to
+    // land on fd 0 after `close(0)`) still routes by file_type below.
+    if is_console || (!fd_present && fd_num <= 2) {
         return crate::drivers::tty::tty_ioctl(request, arg_ptr);
     }
 
