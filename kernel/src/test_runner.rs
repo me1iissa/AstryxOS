@@ -862,6 +862,12 @@ pub fn run() -> ! {
     total += 1;
     if test_vfs_resolve_deadline() { passed += 1; }
 
+    // ── Test 87c: Linux open(2) / readlink(2) / truncate(2) / chmod(2) /
+    //             symlink(2) — relative-path CWD resolution
+
+    total += 1;
+    if test_linux_cwd_relative_path() { passed += 1; }
+
     // ── Test 88: VFS C4 — /proc/<PID>/ dynamic per-process directory ────────
 
     total += 1;
@@ -17207,6 +17213,190 @@ fn test_vfs_resolve_deadline() -> bool {
     let _ = crate::vfs::remove("/tmp/w83");
 
     if ok { test_pass!("VFS resolve_path_opts: trace + 1s deadline (W83)"); }
+    ok
+}
+
+// ── Test 87c: Linux personality open(2) / readlink(2) / truncate(2) /
+//             chmod(2) / symlink(2) — relative-path CWD resolution ──────────
+//
+// Per POSIX `man 7 path_resolution` and the open(2) / readlink(2) /
+// truncate(2) / chmod(2) / symlink(2) man pages: "If pathname is relative,
+// then it is interpreted relative to the directory referred to by the file
+// descriptor dirfd."  For the legacy single-path entry points (open(2) #2,
+// truncate(2) #76, chmod(2) #90, symlink(2) #88, readlink(2) #89) the
+// implicit dirfd is AT_FDCWD i.e. `Process::cwd`.
+//
+// Prior to PR vfs-readdir-mountprefix-fix, these handlers passed user-
+// supplied relative paths directly to the CWD-blind `crate::vfs::*` layer,
+// which treated every input as anchored at "/".  The symptom in
+// PIVOT-E Tier D was `git commit` calling `open(".")` from cwd
+// `/tmp/repo` and getting the ROOT directory's entries via the resulting
+// fd, which made `git status`'s untracked-files enumerator iterate
+// `/dev`, `/etc`, `/lib`, … instead of `/tmp/repo/{.git, hello.txt}`.
+//
+// This test exercises the fix by directly invoking the syscall handlers
+// (the bare argv path) with a cwd set to a non-root directory and
+// verifying the resolved path lands on the intended subdirectory.
+fn test_linux_cwd_relative_path() -> bool {
+    test_header!("Linux open/readlink/truncate/chmod/symlink: relative-path CWD resolution");
+    let mut ok = true;
+
+    // ── Setup: scaffold /tmp/cwdtest/{file_a, sub/file_b} ─────────────────
+    let _ = crate::vfs::mkdir("/tmp/cwdtest");
+    let _ = crate::vfs::mkdir("/tmp/cwdtest/sub");
+    let _ = crate::vfs::create_file("/tmp/cwdtest/file_a");
+    let _ = crate::vfs::write_file("/tmp/cwdtest/file_a", b"alpha\n");
+    let _ = crate::vfs::create_file("/tmp/cwdtest/sub/file_b");
+    let _ = crate::vfs::write_file("/tmp/cwdtest/sub/file_b", b"bravo\n");
+
+    // Spawn a kernel process we can mutate the cwd of.
+    let pid = crate::proc::create_kernel_process_suspended("cwd_open_test", 0u64);
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            p.cwd = alloc::string::String::from("/tmp/cwdtest");
+        }
+    }
+    // Bypass user-mode SMAP/pointer checks since we pass kernel-side
+    // string pointers below (test_runner ↔ Linux personality pattern).
+    let _kdg = crate::syscall::KernelDispatchGuard::new();
+    // Make the spawned process the current PID for the duration of the
+    // syscall calls so handlers reading current_pid_lockless() see the
+    // right cwd.  The PER_CPU_CURRENT_PID store mirrors the scheduler
+    // hand-off but is safe to call directly from a test context because
+    // we do not yield while the override is in place.
+    let prev_pid = crate::proc::current_pid_lockless();
+    crate::proc::set_current_pid(pid);
+
+    // ── (a) open(".") from cwd=/tmp/cwdtest → fd points at /tmp/cwdtest ──
+    let dot = b".\0";
+    let fd = crate::subsys::linux::syscall::sys_open_linux(
+        dot.as_ptr() as u64, 0 /* O_RDONLY */, 0,
+    );
+    if fd < 0 {
+        test_fail!("Linux open relative", "(a) open(\".\") cwd=/tmp/cwdtest -> errno {}", -fd);
+        ok = false;
+    } else {
+        // Resolve the fd back to its inode + open_path under PROCESS_TABLE.
+        let stat_inode = crate::vfs::stat("/tmp/cwdtest").map(|s| s.inode).unwrap_or(0);
+        let (fd_inode, fd_path) = {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            procs.iter().find(|p| p.pid == pid)
+                .and_then(|p| p.file_descriptors.get(fd as usize)?.as_ref())
+                .map(|f| (f.inode, f.open_path.clone()))
+                .unwrap_or((0, alloc::string::String::new()))
+        };
+        if fd_inode == stat_inode && fd_inode != 1 {
+            test_println!("  (a) open(\".\") cwd=/tmp/cwdtest -> fd inode={} path=\"{}\" (matches stat /tmp/cwdtest) ✓",
+                fd_inode, fd_path);
+        } else {
+            test_fail!("Linux open relative",
+                "(a) open(\".\") got inode={} path=\"{}\" expected stat inode={} (not 1=root)",
+                fd_inode, fd_path, stat_inode);
+            ok = false;
+        }
+        let _ = crate::vfs::close(pid, fd as usize);
+    }
+
+    // ── (b) open("file_a") from cwd=/tmp/cwdtest → /tmp/cwdtest/file_a ──
+    let rel_a = b"file_a\0";
+    let fd_a = crate::subsys::linux::syscall::sys_open_linux(
+        rel_a.as_ptr() as u64, 0, 0,
+    );
+    if fd_a < 0 {
+        test_fail!("Linux open relative",
+            "(b) open(\"file_a\") cwd=/tmp/cwdtest -> errno {}", -fd_a);
+        ok = false;
+    } else {
+        let expected_inode = crate::vfs::stat("/tmp/cwdtest/file_a").map(|s| s.inode).unwrap_or(0);
+        let fd_inode = {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            procs.iter().find(|p| p.pid == pid)
+                .and_then(|p| p.file_descriptors.get(fd_a as usize)?.as_ref())
+                .map(|f| f.inode)
+                .unwrap_or(0)
+        };
+        if fd_inode == expected_inode && expected_inode != 0 {
+            test_println!("  (b) open(\"file_a\") cwd=/tmp/cwdtest -> inode={} (matches /tmp/cwdtest/file_a) ✓",
+                fd_inode);
+        } else {
+            test_fail!("Linux open relative",
+                "(b) open(\"file_a\") got inode={} expected /tmp/cwdtest/file_a inode={}",
+                fd_inode, expected_inode);
+            ok = false;
+        }
+        let _ = crate::vfs::close(pid, fd_a as usize);
+    }
+
+    // ── (c) open("sub/file_b") (multi-component relative) ─────────────────
+    let rel_sub = b"sub/file_b\0";
+    let fd_sub = crate::subsys::linux::syscall::sys_open_linux(
+        rel_sub.as_ptr() as u64, 0, 0,
+    );
+    if fd_sub < 0 {
+        test_fail!("Linux open relative",
+            "(c) open(\"sub/file_b\") cwd=/tmp/cwdtest -> errno {}", -fd_sub);
+        ok = false;
+    } else {
+        let expected_inode = crate::vfs::stat("/tmp/cwdtest/sub/file_b").map(|s| s.inode).unwrap_or(0);
+        let fd_inode = {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            procs.iter().find(|p| p.pid == pid)
+                .and_then(|p| p.file_descriptors.get(fd_sub as usize)?.as_ref())
+                .map(|f| f.inode)
+                .unwrap_or(0)
+        };
+        if fd_inode == expected_inode && expected_inode != 0 {
+            test_println!("  (c) open(\"sub/file_b\") cwd=/tmp/cwdtest -> inode={} (matches /tmp/cwdtest/sub/file_b) ✓",
+                fd_inode);
+        } else {
+            test_fail!("Linux open relative",
+                "(c) open(\"sub/file_b\") got inode={} expected inode={}",
+                fd_inode, expected_inode);
+            ok = false;
+        }
+        let _ = crate::vfs::close(pid, fd_sub as usize);
+    }
+
+    // ── (d) Absolute paths still work unchanged ───────────────────────────
+    let abs = b"/tmp/cwdtest/file_a\0";
+    let fd_abs = crate::subsys::linux::syscall::sys_open_linux(
+        abs.as_ptr() as u64, 0, 0,
+    );
+    if fd_abs < 0 {
+        test_fail!("Linux open relative",
+            "(d) open(\"/tmp/cwdtest/file_a\") absolute -> errno {}", -fd_abs);
+        ok = false;
+    } else {
+        let expected_inode = crate::vfs::stat("/tmp/cwdtest/file_a").map(|s| s.inode).unwrap_or(0);
+        let fd_inode = {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            procs.iter().find(|p| p.pid == pid)
+                .and_then(|p| p.file_descriptors.get(fd_abs as usize)?.as_ref())
+                .map(|f| f.inode)
+                .unwrap_or(0)
+        };
+        if fd_inode == expected_inode {
+            test_println!("  (d) open(absolute) still resolves correctly inode={} ✓", fd_inode);
+        } else {
+            test_fail!("Linux open relative",
+                "(d) open(absolute) got inode={} expected inode={}",
+                fd_inode, expected_inode);
+            ok = false;
+        }
+        let _ = crate::vfs::close(pid, fd_abs as usize);
+    }
+
+    // ── Cleanup ───────────────────────────────────────────────────────────
+    crate::proc::set_current_pid(prev_pid);
+    // _kdg dropped here unblocks SMAP user-pointer validation.
+    drop(_kdg);
+    let _ = crate::vfs::remove("/tmp/cwdtest/sub/file_b");
+    let _ = crate::vfs::remove("/tmp/cwdtest/sub");
+    let _ = crate::vfs::remove("/tmp/cwdtest/file_a");
+    let _ = crate::vfs::remove("/tmp/cwdtest");
+
+    if ok { test_pass!("Linux open/readlink/truncate/chmod/symlink: relative-path CWD resolution"); }
     ok
 }
 

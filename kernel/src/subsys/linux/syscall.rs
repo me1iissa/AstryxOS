@@ -3005,7 +3005,22 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         alloc::format!("/dev/fd/{}", fd_num)
                     })
             } else {
-                match crate::vfs::readlink(path_str) {
+                // POSIX readlink(2): "If the pathname given in path is
+                // relative, it shall be interpreted relative to the calling
+                // process's current working directory."  vfs::readlink is
+                // CWD-blind, so resolve here.
+                let resolved_owned: alloc::string::String = if path_str.starts_with('/')
+                    || path_str.is_empty()
+                {
+                    alloc::string::String::from(path_str)
+                } else {
+                    const AT_FDCWD: i64 = -100;
+                    match resolve_at_path(AT_FDCWD as u64, arg1) {
+                        Ok(p) => p,
+                        Err(_) => return -22,
+                    }
+                };
+                match crate::vfs::readlink(resolved_owned.as_str()) {
                     Ok(t) => t,
                     Err(_) => return -22, // EINVAL
                 }
@@ -3403,12 +3418,23 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         84 => sys_rmdir_linux(arg1),
         // 87: unlink(pathname) — C string
         87 => sys_unlink_linux(arg1),
-        // 88: symlink(oldpath, newpath) — C strings
+        // 88: symlink(oldpath, newpath) — POSIX symlink(2): the contents
+        // of the symlink (oldpath/target) are stored verbatim and MAY be
+        // relative (resolved at lookup time, not creation).  newpath is
+        // the location where the symlink is created and follows normal
+        // pathname resolution (relative paths anchored at CWD).
         88 => {
             let old_raw = read_cstring_from_user(arg1);
-            let new_raw = read_cstring_from_user(arg2);
             let old_str = core::str::from_utf8(&old_raw).unwrap_or("");
-            let new_str = core::str::from_utf8(&new_raw).unwrap_or("");
+            let new_bytes = match resolve_user_path_to_owned(arg2) {
+                Ok(b) => b,
+                Err(e) => return e,
+            };
+            let new_len = new_bytes.iter().position(|&b| b == 0).unwrap_or(new_bytes.len());
+            let new_str = match core::str::from_utf8(&new_bytes[..new_len]) {
+                Ok(s) => s,
+                Err(_) => return -22,
+            };
             match crate::vfs::symlink(old_str, new_str) {
                 Ok(()) => 0,
                 Err(e) => -(e as usize as i64),
@@ -4368,19 +4394,37 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             }
             crate::syscall::sys_uname(arg1 as *mut u8)
         }
-        // 76: truncate(path, length)
+        // 76: truncate(path, length) — POSIX truncate(2): pathname is
+        // interpreted relative to the calling process's working directory
+        // when it is relative.  resolve_user_path_to_owned() applies the
+        // AT_FDCWD prefix in that case.
         76 => {
-            let path_bytes = read_cstring_from_user(arg1);
-            let path_str = core::str::from_utf8(&path_bytes).unwrap_or("");
+            let path_bytes = match resolve_user_path_to_owned(arg1) {
+                Ok(b) => b,
+                Err(e) => return e,
+            };
+            let len = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
+            let path_str = match core::str::from_utf8(&path_bytes[..len]) {
+                Ok(s) => s,
+                Err(_) => return -22,
+            };
             match crate::vfs::truncate_path(path_str, arg2) {
                 Ok(()) => 0,
                 Err(e) => crate::subsys::linux::errno::vfs_err(e),
             }
         }
-        // 90: chmod(pathname, mode)
+        // 90: chmod(pathname, mode) — POSIX chmod(2) §pathname resolution:
+        // relative paths anchored at the working directory.
         90 => {
-            let path_bytes = read_cstring_from_user(arg1);
-            let path_str = core::str::from_utf8(&path_bytes).unwrap_or("");
+            let path_bytes = match resolve_user_path_to_owned(arg1) {
+                Ok(b) => b,
+                Err(e) => return e,
+            };
+            let len = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
+            let path_str = match core::str::from_utf8(&path_bytes[..len]) {
+                Ok(s) => s,
+                Err(_) => return -22,
+            };
             match crate::vfs::chmod(path_str, arg2 as u32) {
                 Ok(()) => 0,
                 Err(e) => crate::subsys::linux::errno::vfs_err(e),
@@ -5929,11 +5973,40 @@ fn sys_open_linux_inner(pathname: u64, flags: u64, _mode: u64) -> i64 {
     }
 
     let path_bytes = read_cstring_from_user(pathname);
-    let path = match core::str::from_utf8(&path_bytes) {
+    let path_raw = match core::str::from_utf8(&path_bytes) {
         Ok(s) => s,
         Err(_) => return -22,
     };
     let pid = crate::proc::current_pid_lockless();
+    // Per open(2) (IEEE Std 1003.1-2017) and `man 7 path_resolution`:
+    // "If the pathname given in pathname is relative, then it is interpreted
+    //  relative to the directory referred to by the file descriptor dirfd."
+    // For the legacy open(2) entry, the implicit dirfd is AT_FDCWD, i.e. the
+    // process working directory.  `crate::vfs::resolve_path` is CWD-blind
+    // (it treats every input as anchored at "/"), so resolve relative paths
+    // here against `Process::cwd` BEFORE handing off to the special-path
+    // matchers and the VFS open.  This matches the openat(AT_FDCWD, …)
+    // handler below and the sys_stat_linux / sys_access pattern.
+    //
+    // Empty paths fall through unchanged so the downstream layers produce a
+    // POSIX-compliant ENOENT (per open(2): "If pathname is an empty string,
+    // open() shall return -1 with errno set to ENOENT.").
+    let path_owned: alloc::string::String = if path_raw.is_empty() || path_raw.starts_with('/') {
+        alloc::string::String::from(path_raw)
+    } else {
+        let cwd = {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            procs.iter().find(|p| p.pid == pid)
+                .map(|p| p.cwd.clone())
+                .unwrap_or_else(|| alloc::string::String::from("/"))
+        };
+        if cwd.ends_with('/') {
+            alloc::format!("{}{}", cwd, path_raw)
+        } else {
+            alloc::format!("{}/{}", cwd, path_raw)
+        }
+    };
+    let path: &str = path_owned.as_str();
     #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
     if pid == 1 || crate::syscall::ring::is_tracked(pid) {
         crate::serial_println!("[FF/open] pid={} path={}", pid, path);
