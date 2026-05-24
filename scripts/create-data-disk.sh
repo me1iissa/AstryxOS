@@ -702,7 +702,7 @@ if ! command -v mke2fs &>/dev/null; then
     echo "  sudo apt install e2fsprogs"
     exit 1
 fi
-MKE2FS_VER="$(mke2fs --version 2>&1 | head -1)"
+MKE2FS_VER="$(mke2fs -V 2>&1 | head -1)"
 echo "[DATA-DISK] Using: ${MKE2FS_VER}"
 
 STAGING_TREE="${BUILD_DIR}/disk"
