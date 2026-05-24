@@ -136,6 +136,24 @@ tls-test = []
 # systemd.service(5)
 # <https://www.freedesktop.org/software/systemd/man/systemd.service.html>.
 oracle-test = []
+# oracle-daemon-test — Oracle endpoint agent daemon-mode bring-up
+# (PIVOT-I2 Phase D, 2026-05-23).  Same staging requirements as
+# oracle-test (the staged glibc + libssl3 substrate, /usr/bin/oracle on
+# the data disk) but launches oracle WITHOUT --once and overrides
+# INFRASVC_SYNC_ENABLED=true + INFRASVC_SYNC_URL=http://10.0.2.2:8088/heartbeat
+# (the conventional QEMU SLIRP gateway alias for the host-side
+# `scripts/oracle-stub-conflux.py` Python responder).  Captures heartbeats
+# end-to-end and validates the *full* AstryxOS server-agent substrate:
+# tokio multi-thread runtime + reqwest+hyper TCP outbound + heartbeat
+# emission timer.  Per audit §7 ("Minimum viable demo — defer I1 path")
+# this swaps plain-HTTP for the eventual WSS/TLS substrate so end-to-end
+# can be proven before the TLS soak completes.  Mutually exclusive with
+# the other *-test cargo features at the main.rs cfg-gate level.  Run
+# `python3 scripts/oracle-stub-conflux.py --port 8088 --log /tmp/stub.jsonl &`
+# on the host before booting.  Public refs: RFC 9110 (HTTP semantics)
+# <https://www.rfc-editor.org/rfc/rfc9110.html>, QEMU SLIRP
+# <https://www.qemu.org/docs/master/system/devices/net.html#network-options>.
+oracle-daemon-test = []
 # Opt-in for the userspace alias_test page-aliasing reproducer (Test 44b).
 # Spawns 8 worker threads via raw clone(CLONE_VM|CLONE_THREAD|CLONE_SIGHAND)
 # doing MAP_PRIVATE mmap churn; runs >100k page faults; sometimes wedges

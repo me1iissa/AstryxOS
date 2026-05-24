@@ -1144,6 +1144,19 @@ EOF
             "${BUILD_DIR}/disk/etc/oracle/config.toml" "::etc/oracle/config.toml"
         echo "[DATA-DISK] Copied /etc/oracle/config.toml"
     fi
+    # PIVOT-I2 Phase D (2026-05-23): companion daemon-mode config.
+    # Written by install-oracle.sh alongside config.toml; selected by the
+    # kernel-side oracle_demo::run_oracle_daemon launcher via
+    # `--config /etc/oracle/daemon.toml` (sync enabled → 10.0.2.2:8088).
+    # Independent of config.toml so the first-boot --once flow stays
+    # offline-only as designed.
+    if [ -f "${BUILD_DIR}/disk/etc/oracle/daemon.toml" ]; then
+        mmd -i "${DATA_IMG}" "::etc"        2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::etc/oracle" 2>/dev/null || true
+        mcopy -o -i "${DATA_IMG}" \
+            "${BUILD_DIR}/disk/etc/oracle/daemon.toml" "::etc/oracle/daemon.toml"
+        echo "[DATA-DISK] Copied /etc/oracle/daemon.toml"
+    fi
     # Runtime dirs.  FAT32 has no separate dir-vs-file modes; create empty.
     mmd -i "${DATA_IMG}" "::var"            2>/dev/null || true
     mmd -i "${DATA_IMG}" "::var/lib"        2>/dev/null || true
