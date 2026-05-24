@@ -205,6 +205,31 @@ pub trait FileSystemOps: Send + Sync {
     fn remove_inode(&self, _inode: u64) -> VfsResult<()> {
         Err(VfsError::Unsupported)
     }
+
+    /// Create a hard link: insert `name` in `parent_inode` pointing at
+    /// `target_inode`, incrementing `i_links_count`.  Per POSIX `link(2)`,
+    /// linking a directory is not permitted (`EPERM`); that check is the
+    /// caller's responsibility.  Returns `Err(Unsupported)` on filesystems
+    /// (FAT32, procfs, …) that do not support hard links.
+    fn link(&self, _target_inode: u64, _parent_inode: u64, _name: &str) -> VfsResult<()> {
+        Err(VfsError::Unsupported)
+    }
+
+    /// Update access and modification timestamps.  `atime` / `mtime` are
+    /// Unix-epoch seconds; pass `None` to leave the field unchanged.
+    /// Per POSIX `utimes(2)` / `utimensat(2)`, also updates `i_ctime` to
+    /// the current wall-clock time whenever either timestamp is changed.
+    fn utimes(&self, _inode: u64, _atime: Option<u64>, _mtime: Option<u64>) -> VfsResult<()> {
+        Err(VfsError::Unsupported)
+    }
+
+    /// Change owner and group.  Per POSIX `chown(2)`, also clears the
+    /// set-user-ID and set-group-ID bits unless the caller is privileged
+    /// (the kernel personality layer enforces privilege; here we simply
+    /// update `i_uid` / `i_gid` and write the inode back).
+    fn chown(&self, _inode: u64, _uid: u32, _gid: u32) -> VfsResult<()> {
+        Err(VfsError::Unsupported)
+    }
 }
 
 /// A mounted filesystem.
