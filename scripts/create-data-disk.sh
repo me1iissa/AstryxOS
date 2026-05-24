@@ -660,7 +660,16 @@ if command -v mcopy &>/dev/null; then
     printf 'astryx\n' | mcopy -o -i "${DATA_IMG}" - "::etc/hostname"
     printf '127.0.0.1 localhost\n::1 localhost\n10.0.2.2 gateway\n' | \
         mcopy -o -i "${DATA_IMG}" - "::etc/hosts"
-    printf 'nameserver 10.0.2.3\n' | mcopy -o -i "${DATA_IMG}" - "::etc/resolv.conf"
+    # Default resolver: QEMU SLIRP's built-in DNS at 10.0.2.3 (proxies host's
+    # resolver via NAT — fine for general guest DNS).  Override at staging
+    # time via ASTRYXOS_NAMESERVER for workloads that need a specific
+    # upstream resolver (e.g. internal-only zone).  The override IP is never
+    # baked into source; users supply it from their own environment.
+    # Reference: resolv.conf(5), RFC 1035 §6.1.
+    DNS_NAMESERVER="${ASTRYXOS_NAMESERVER:-10.0.2.3}"
+    printf 'nameserver %s\n' "${DNS_NAMESERVER}" | \
+        mcopy -o -i "${DATA_IMG}" - "::etc/resolv.conf"
+    echo "[DATA-DISK] /etc/resolv.conf nameserver=${DNS_NAMESERVER}"
     printf 'hosts: files dns\npasswd: files\ngroup: files\n' | \
         mcopy -o -i "${DATA_IMG}" - "::etc/nsswitch.conf"
     printf 'root:x:0:0:root:/:/bin/sh\nuser:x:1000:1000:user:/home/user:/bin/sh\n' | \
