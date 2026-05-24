@@ -98,12 +98,28 @@ pub fn handle_udp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
 
     // Deliver to bound port.
     let mut bindings = UDP_BINDINGS.lock();
-    if let Some(binding) = bindings.iter_mut().find(|b| b.port == header.dst_port) {
+    let delivered = if let Some(binding) = bindings.iter_mut().find(|b| b.port == header.dst_port) {
         binding.queue.push(UdpDatagram {
             src_ip,
             src_port: header.src_port,
             data: Vec::from(payload),
         });
+        true
+    } else {
+        false
+    };
+    drop(bindings);
+
+    // Wake any thread parked in `poll(2)` / `epoll_wait(2)` /
+    // `select(2)` on a fd backed by this UDP socket.  Without this
+    // ring, userspace pollers observe the new datagram only on the
+    // 1 s resync floor in `wait_poll_event` — RFC 1035 §4.2.1 DNS
+    // resolvers expect sub-second wake latency and otherwise report
+    // ";; connection timed out; no servers could be reached" even
+    // when the reply has already landed in the binding queue.
+    if delivered {
+        crate::ipc::waitlist::ring_poll_bell_for(
+            crate::ipc::waitlist::PollBellSource::InetRx);
     }
 }
 

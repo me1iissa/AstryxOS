@@ -1403,6 +1403,14 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 // socket buffer.  Then check AGAIN before the first yield — if X11
                 // already wrote a reply, we can return without yielding at all.
                 crate::x11::poll();
+                // Pump the network stack so any e1000 RX descriptors filled
+                // by the NIC since the last tick get drained into per-socket
+                // queues before we re-evaluate readiness.  Without this, a
+                // userspace DNS resolver that polls within a 5 ms window of
+                // its `write()` sees the binding queue empty even though the
+                // reply was DMA'd into the RX ring (RFC 1035 §4.2.1 retry
+                // budget is too tight for the 1 s resync floor to cover).
+                crate::net::poll();
                 let r = do_check(true, true);
                 if r > 0 {
                     #[cfg(feature = "firefox-test")]
@@ -1433,6 +1441,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     crate::ipc::waitlist::wait_poll_event(deadline_tick);
                     // Pump X11 so replies appear in socket buffers.
                     crate::x11::poll();
+                    // Pump the NIC RX ring + UDP/TCP demux so wire-side
+                    // events become poll-visible.  See the matching
+                    // pre-wait pump above for the rationale.
+                    crate::net::poll();
                     let r = do_check(true, true);
                     if r > 0 {
                         #[cfg(feature = "firefox-test")]
@@ -1627,12 +1639,25 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     let ip = [bytes[4], bytes[5], bytes[6], bytes[7]];
                     match crate::net::socket::socket_connect(socket_id, ip, port) {
                         Ok(()) => {
-                            // For TCP: wait up to 3s for connection to become Established.
-                            let local_port = {
+                            // Per IEEE 1003.1 §connect: only connection-mode
+                            // transports (TCP) perform a handshake and may
+                            // block.  UDP / SOCK_DGRAM connect(2) is a pure
+                            // local-state update — return immediately so
+                            // the userspace resolver (musl getaddrinfo etc.)
+                            // can move on to sendto.  Sampling the socket
+                            // type here avoids waiting on tcp::get_state for
+                            // a UDP socket that will never produce one — the
+                            // pre-fix path returned -110 ETIMEDOUT after 3 s
+                            // for every UDP connect, breaking DNS.
+                            let (sock_type, lport) = {
                                 let socks = crate::net::socket::SOCKETS.lock();
-                                socks.iter().find(|s| s.id == socket_id).map(|s| s.local_port)
+                                let sock = socks.iter().find(|s| s.id == socket_id);
+                                (sock.map(|s| s.socket_type), sock.map(|s| s.local_port))
                             };
-                            if let Some(lport) = local_port {
+                            if sock_type == Some(crate::net::socket::SocketType::Udp) {
+                                return 0;
+                            }
+                            if let Some(lport) = lport {
                                 let deadline = crate::arch::x86_64::irq::get_ticks() + 300;
                                 loop {
                                     crate::net::poll();
@@ -1862,6 +1887,12 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let fd = arg1 as usize;
             let buf_ptr = arg2 as *mut u8;
             let len = arg3 as usize;
+            // flags (arg4): MSG_DONTWAIT = 0x40 (per <sys/socket.h>).
+            // MSG_PEEK / MSG_WAITALL not yet wired (out of scope here);
+            // userspace DNS resolvers (musl getaddrinfo, busybox nslookup)
+            // do not pass them on the UDP receive path.
+            let flags = arg4;
+            let msg_dontwait = (flags & 0x40) != 0;
             let addr_ptr     = arg5;
             let addrlen_ptr  = arg6 as *mut u32;
             if crate::syscall::is_unix_socket_fd(pid, fd) {
@@ -1875,8 +1906,48 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             } else {
                 if !crate::syscall::is_socket_fd(pid, fd) { return -9; }
                 let socket_id = crate::syscall::get_socket_id(pid, fd);
+                // O_NONBLOCK on the fd makes the call non-blocking even
+                // without MSG_DONTWAIT.  Per IEEE 1003.1 §recvfrom the
+                // two flag sources are independent and either disables
+                // blocking.  Without this gate every DNS resolver call
+                // returns 0 immediately (no datagram queued at entry)
+                // and userspace mis-reads it as a zero-length datagram,
+                // bailing out before the reply ever arrives.
+                let fd_nonblock = {
+                    let procs = crate::proc::PROCESS_TABLE.lock();
+                    procs.iter().find(|p| p.pid == pid)
+                        .and_then(|p| p.file_descriptors.get(fd).and_then(|f| f.as_ref()))
+                        .map(|f| (f.flags & 0x0800) != 0)
+                        .unwrap_or(false)
+                };
+                let blocking = !(msg_dontwait || fd_nonblock);
+                // For blocking sockets, yield until the socket has data
+                // or the receive deadline fires.  3000 ticks (≈30 s) is
+                // the upper bound — matches SO_RCVTIMEO's POSIX default
+                // (zero = no timeout) cap of "very long" without leaving
+                // a zombie syscall pinning the runner forever.  Most
+                // DNS resolvers retry within 5 s anyway (RFC 1035 §4.2.1).
+                if blocking {
+                    let deadline = crate::arch::x86_64::irq::get_ticks() + 3000;
+                    while !crate::net::socket::socket_has_data(socket_id) {
+                        if signal_pending(pid) { return -4; } // EINTR
+                        crate::net::poll();
+                        if crate::arch::x86_64::irq::get_ticks() >= deadline {
+                            return -11; // EAGAIN — surfaces as "timed out"
+                        }
+                        crate::sched::yield_cpu();
+                    }
+                }
                 match crate::net::socket::socket_recvfrom(socket_id) {
                     Ok((data, src_ip, src_port)) => {
+                        // Empty result on a non-blocking socket = EAGAIN
+                        // per IEEE 1003.1 §recvfrom.  We can only hit
+                        // this branch when blocking==false (the wait
+                        // loop above guarantees data on the blocking
+                        // path) so the userspace contract holds.
+                        if data.is_empty() {
+                            return -11; // EAGAIN
+                        }
                         let n = data.len().min(len);
                         if n > 0 {
                             unsafe {

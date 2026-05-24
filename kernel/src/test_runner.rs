@@ -2220,6 +2220,33 @@ pub fn run() -> ! {
         if test_273_tcp_medium_payload_loopback() { passed += 1; }
     }
 
+    // ── Test 274: UDP connect/sendto auto-bind (DNS unblocker) ──────────
+    // Exercises the three socket-layer fixes that unblock outbound DNS
+    // for any glibc/musl-linked Linux client:
+    //
+    //   274-A  socket(AF_INET,SOCK_DGRAM) + connect() must auto-bind a
+    //          local ephemeral port so the eventual reply has somewhere
+    //          to land (RFC 6335 §6).  Pre-fix `socket_connect` left
+    //          `local_port = 0` for UDP and the DNS response from
+    //          10.0.2.3:53 matched no per-port UDP binding.
+    //   274-B  socket() + sendto() (no prior bind, no prior connect)
+    //          also auto-binds.  POSIX `man 2 sendto`: "the socket need
+    //          not be bound; the protocol will assign a port".
+    //   274-C  An echoed datagram lands on the auto-bound port and
+    //          socket_recvfrom returns it with the source 4-tuple set
+    //          to the peer that emitted it (`recv` filter semantics
+    //          align with IEEE 1003.1 §recvfrom).
+    //
+    // Uses the loopback short-circuit (127.0.0.1) so the test runs
+    // self-contained on the BSP without needing a NIC or SLIRP.
+    // Public-spec refs: RFC 768 (UDP), RFC 6335 §6 (ephemeral ports),
+    // IEEE 1003.1 §connect / §sendto / §recvfrom.
+    #[cfg(any(feature = "test-mode", feature = "firefox-test", feature = "oracle-test", feature = "busybox-test"))]
+    {
+        total += 1;
+        if test_274_udp_connect_auto_bind() { passed += 1; }
+    }
+
     // ── Tests 261-263: native-core hardening (cycle 3) ──────────────────
     // Gated on `native-core-tests` feature: the three native-core tests
     // (page_ref_dec CAS underflow, OB refcount integration, scheduler
@@ -28759,8 +28786,11 @@ fn test_poll_bell_source_attribution() -> bool {
         before[i] = BELL_RINGS_BY_SOURCE[i].load(Ordering::Relaxed);
     }
 
-    // Ring one of each tagged source.
-    let sources_to_ring: [PollBellSource; 8] = [
+    // Ring one of each tagged source.  Update the array length any time
+    // a new source variant lands in `PollBellSource` (currently 9 tagged
+    // variants — `Other` stays untagged by design so it can absorb
+    // ad-hoc callers without skewing the per-source attribution).
+    let sources_to_ring: [PollBellSource; 9] = [
         PollBellSource::Pipe,
         PollBellSource::Eventfd,
         PollBellSource::UnixWrite,
@@ -28769,6 +28799,7 @@ fn test_poll_bell_source_attribution() -> bool {
         PollBellSource::Signalfd,
         PollBellSource::Inotify,
         PollBellSource::SignalInject,
+        PollBellSource::InetRx,
     ];
     for s in &sources_to_ring {
         ring_poll_bell_for(*s);
@@ -28788,7 +28819,8 @@ fn test_poll_bell_source_attribution() -> bool {
             return false;
         }
     }
-    test_println!("  all 8 tagged sources bumped their own slot; `other` unchanged ✓");
+    test_println!("  all {} tagged sources bumped their own slot; `other` unchanged ✓",
+        sources_to_ring.len());
     test_pass!("poll-bell per-source attribution counters");
     true
 }
@@ -38127,6 +38159,173 @@ fn test_272_sys_class_net() -> bool {
 
     if ok {
         test_pass!("/sys/class/net native sysfs surface");
+    }
+    ok
+}
+
+// ── Test 274: UDP connect/sendto auto-bind (DNS unblocker) ───────────────────
+//
+// Validates the three socket-layer fixes that unblock userspace UDP DNS
+// resolution for any glibc/musl-linked client:
+//
+//   274-A  socket(AF_INET,SOCK_DGRAM) + socket_connect() must auto-bind
+//          a local ephemeral port — without it, the wire packet's source
+//          port is zero, the DNS reply's destination port is zero, and
+//          udp::handle_udp matches no per-port binding (the reply is
+//          dropped before recvfrom ever sees it).
+//   274-B  socket() + socket_sendto() (no prior bind or connect) also
+//          auto-binds.  Mirrors `man 2 sendto`: "the socket need not be
+//          bound; the protocol will assign a port automatically".
+//   274-C  Loopback echo: an inbound datagram destined for the
+//          auto-bound port reaches socket_recvfrom with the source
+//          4-tuple set correctly (IEEE 1003.1 §recvfrom).
+//
+// Uses the loopback short-circuit (RFC 1122 §3.2.1.3) so the test runs
+// self-contained on the BSP without any NIC or SLIRP dependency.  The
+// helper port (47353) is in the IANA registered range to avoid colliding
+// with another test's ephemeral allocation, which is bounded to
+// 49152–65535 by `alloc_ephemeral_port`.
+//
+// Public-spec refs: RFC 768 (UDP), RFC 6335 §6 (ephemeral port range),
+// IEEE 1003.1 §connect, §sendto, §recvfrom.
+#[cfg(any(feature = "test-mode", feature = "firefox-test", feature = "oracle-test", feature = "busybox-test"))]
+fn test_274_udp_connect_auto_bind() -> bool {
+    test_header!("UDP connect()/sendto() auto-bind (DNS unblocker)");
+
+    use crate::net::{socket, udp};
+
+    // ── Helper: peer port that echoes one datagram per send.  We don't
+    // actually run an echoer — we drive the receive side by hand-crafting
+    // a reply via `udp::send` from the peer's port back to the auto-bound
+    // local port.  The peer never has to exist as a real binding because
+    // the loopback path delivers the bytes directly into the bound queue.
+    const PEER_PORT: u16 = 47353;
+    const PEER_IP: [u8; 4] = [127, 0, 0, 9];
+
+    // Bind the peer port so the loopback reply from socket-side sendto
+    // (274-B) lands somewhere we can inspect.  Without this bind the
+    // datagram is dropped by udp::handle_udp's per-port match.
+    let peer_bind_ok = udp::bind(PEER_PORT).is_ok();
+    if !peer_bind_ok {
+        test_fail!("273-setup", "could not bind peer-side port {}", PEER_PORT);
+        return false;
+    }
+
+    let mut ok = true;
+
+    // ── 274-A: socket_connect on UDP auto-binds local port ─────────────────
+    let sid_a = socket::socket_create(socket::SocketType::Udp);
+    match socket::socket_connect(sid_a, PEER_IP, PEER_PORT) {
+        Ok(()) => {
+            let (lip, lport) = socket::socket_local_addr(sid_a);
+            if lport == 0 {
+                test_fail!("274-A connect-auto-bind",
+                    "socket_connect left local_port=0 (no ephemeral allocated)");
+                ok = false;
+            } else if lport < 49152 {
+                test_fail!("274-A connect-auto-bind",
+                    "ephemeral port {} outside RFC 6335 dynamic range 49152–65535",
+                    lport);
+                ok = false;
+            } else {
+                test_println!("  274-A connect -> auto-bound {}.{}.{}.{}:{} ✓",
+                    lip[0], lip[1], lip[2], lip[3], lport);
+            }
+        }
+        Err(e) => {
+            test_fail!("274-A connect-auto-bind", "socket_connect failed: {}", e);
+            ok = false;
+        }
+    }
+    socket::socket_close(sid_a);
+
+    // ── 274-B: sendto on an un-bound UDP socket auto-binds + 274-C echo ────
+    let sid_b = socket::socket_create(socket::SocketType::Udp);
+    // Send a probe payload to ourselves on PEER_PORT.  The auto-bind in
+    // socket_sendto should pick a fresh ephemeral; we record it via
+    // socket_local_addr after the send returns.
+    const PROBE: &[u8] = b"AstryxOS-UDP-auto-bind probe";
+    let send_n = match socket::socket_sendto(sid_b, [127, 0, 0, 1], PEER_PORT, PROBE) {
+        Ok(n) => n,
+        Err(e) => {
+            test_fail!("274-B sendto-auto-bind", "socket_sendto failed: {}", e);
+            ok = false;
+            socket::socket_close(sid_b);
+            udp::unbind(PEER_PORT);
+            return false;
+        }
+    };
+    if send_n != PROBE.len() {
+        test_fail!("274-B sendto-auto-bind",
+            "sendto returned {} bytes, expected {}", send_n, PROBE.len());
+        ok = false;
+    }
+    let (_lip_b, lport_b) = socket::socket_local_addr(sid_b);
+    if lport_b == 0 || lport_b < 49152 {
+        test_fail!("274-B sendto-auto-bind",
+            "auto-bound to port {} (expected ephemeral)", lport_b);
+        ok = false;
+    } else {
+        test_println!("  274-B sendto -> auto-bound port {} ✓", lport_b);
+    }
+
+    // Drain the loopback queue so udp::handle_udp delivers our probe to
+    // PEER_PORT's binding.
+    crate::net::poll();
+    let probe_arrived = udp::recv(PEER_PORT)
+        .map(|d| d.data == PROBE && d.src_port == lport_b)
+        .unwrap_or(false);
+    if !probe_arrived {
+        test_fail!("274-B sendto-auto-bind",
+            "probe didn't arrive at PEER_PORT with expected src_port={}",
+            lport_b);
+        ok = false;
+    } else {
+        test_println!("  274-B probe landed at {} from src_port={} ✓",
+            PEER_PORT, lport_b);
+    }
+
+    // ── 274-C: reply lands on socket_recvfrom with correct 4-tuple ─────────
+    // Hand-craft a "reply" datagram from PEER_PORT to the auto-bound port.
+    // This is exactly what a real DNS server would do: its reply's
+    // source port is its listening port (PEER_PORT), destination port is
+    // the client's ephemeral port (lport_b).
+    const REPLY: &[u8] = b"AstryxOS-UDP-reply payload";
+    udp::send([127, 0, 0, 1], PEER_PORT, lport_b, REPLY);
+    crate::net::poll();
+    match socket::socket_recvfrom(sid_b) {
+        Ok((data, src_ip, src_port)) => {
+            if data != REPLY {
+                test_fail!("274-C recvfrom",
+                    "payload mismatch: got {} bytes, expected {}",
+                    data.len(), REPLY.len());
+                ok = false;
+            } else if src_port != PEER_PORT {
+                test_fail!("274-C recvfrom",
+                    "src_port = {} (expected {})", src_port, PEER_PORT);
+                ok = false;
+            } else if src_ip[0] != 127 {
+                test_fail!("274-C recvfrom",
+                    "src_ip = {}.{}.{}.{} (expected 127/8)",
+                    src_ip[0], src_ip[1], src_ip[2], src_ip[3]);
+                ok = false;
+            } else {
+                test_println!("  274-C recvfrom: {} bytes from {}.{}.{}.{}:{} ✓",
+                    data.len(), src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port);
+            }
+        }
+        Err(e) => {
+            test_fail!("274-C recvfrom", "socket_recvfrom failed: {}", e);
+            ok = false;
+        }
+    }
+
+    // Cleanup
+    socket::socket_close(sid_b);
+    udp::unbind(PEER_PORT);
+
+    if ok {
+        test_pass!("UDP connect()/sendto() auto-bind (DNS unblocker)");
     }
     ok
 }
