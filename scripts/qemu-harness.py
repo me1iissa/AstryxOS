@@ -1446,6 +1446,12 @@ _DEMO_BIN_SPEC = [
     # --busybox and --tls (declared at the script level as implicit
     # prerequisites), so a single feature flag triggers the full stage.
     ("pivot-e-test",       "--pivot-e","ASTRYXOS_PIVOT_E"),
+    # pivot-e-tui-test (PIVOT-E Tier C, 2026-05-24) — TUI utilities
+    # (nano/vim/htop/tmux) on top of the PR #450 per-pair PTY substrate.
+    # --pivot-e-tui in create-data-disk.sh auto-enables --pivot-e (which
+    # in turn auto-enables --busybox and --tls), so a single feature flag
+    # triggers the full Tier A + B + C staging closure.
+    ("pivot-e-tui-test",   "--pivot-e-tui","ASTRYXOS_PIVOT_E_TUI"),
 ]
 
 
