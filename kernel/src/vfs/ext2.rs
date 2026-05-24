@@ -23,12 +23,21 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
 use crate::drivers::block::BlockDevice;
 use crate::vfs::VfsError;
+
+/// Maximum number of entries kept in the per-directory dentry cache.
+///
+/// When this limit is reached the oldest entry (FIFO order) is evicted.
+/// 1024 entries cover the entire `/usr/lib` directory of a typical Alpine
+/// Linux installation (≈600–900 shared libraries) with some headroom.
+const DENTRY_CACHE_CAP: usize = 1024;
 
 /// ext2 magic number.
 const EXT2_MAGIC: u16 = 0xEF53;
@@ -213,6 +222,19 @@ enum BlockReader {
 /// updating bitmap → BGDT → superblock in that order; a crash between
 /// any two steps leaves the filesystem internally consistent under
 /// `e2fsck -fy`.
+///
+/// Also holds the two hot-path caches added in PR-E:
+///
+/// * **Dentry cache** — a bounded `BTreeMap` mapping
+///   `(parent_inode, name)` to the child inode number.  Populated on
+///   every successful `lookup`, evicted on `unlink`, `rename`,
+///   `create_file`, `create_dir`, and `symlink`.  FIFO eviction via a
+///   companion `VecDeque` of keys.  Cap: [`DENTRY_CACHE_CAP`] entries.
+///
+/// * **Indirect-block cache** — a single-entry cache holding the most
+///   recently read indirect block.  Avoids re-reading the same indirect
+///   block on every pointer lookup when reading a large file
+///   sequentially (e.g. libxul.so mmap demand-fault storms).
 struct Ext2State {
     /// Mutable superblock counters.  Other fields of the superblock
     /// (block_size, inode_size, …) are duplicated as immutable plain
@@ -222,6 +244,18 @@ struct Ext2State {
     /// block-group number.  Mutated by the block / inode allocators
     /// and the free paths.
     bgdt: Vec<BlockGroupDesc>,
+    /// Per-directory dentry cache: (parent_inode, name) → child_inode.
+    /// Protected by this mutex because dentry inserts/evictions race
+    /// with concurrent lookups in the same mutex epoch.
+    dentry_map: BTreeMap<(u64, String), u64>,
+    /// FIFO eviction queue — keys are (parent_inode, name) in insertion
+    /// order.  When `dentry_map.len() == DENTRY_CACHE_CAP` we pop the
+    /// front and remove the corresponding entry from `dentry_map`.
+    dentry_fifo: VecDeque<(u64, String)>,
+    /// Single-entry indirect-block cache.  `None` if empty.
+    /// Tuple is `(block_num, block_data)`.  Invalidated whenever
+    /// [`Ext2Fs::write_indirect_slot`] modifies an indirect block.
+    indirect_cache: Option<(u32, Vec<u8>)>,
 }
 
 /// ext2 filesystem instance.
@@ -243,6 +277,24 @@ pub struct Ext2Fs {
     bgdt_block: u32,
     /// Mutable state — see [`Ext2State`].
     state: Mutex<Ext2State>,
+    /// Per-group allocation lock (PR-E SMP fix).
+    ///
+    /// Serialises concurrent block/inode allocations within the same
+    /// block group.  A CPU that wins the per-group lock reads the bitmap,
+    /// finds a free bit, sets it, and writes the bitmap back — all while
+    /// holding this lock.  A racing CPU queues behind the lock and then
+    /// re-reads the bitmap after acquiring it, so it sees the updated
+    /// state and cannot pick the same bit.
+    ///
+    /// Different block groups can allocate in parallel (different indices
+    /// in this vec), eliminating the bottleneck of a single global lock.
+    ///
+    /// Allocated lazily (empty `Vec` when num_groups is not yet known)
+    /// and then populated in [`Ext2Fs::new_with_reader`].
+    per_group_alloc: Vec<Mutex<()>>,
+    /// Count of dentry-cache hits since mount.  Incremented atomically
+    /// so it is visible to test assertions without taking the state lock.
+    pub dentry_cache_hits: AtomicUsize,
 }
 
 impl Ext2Fs {
@@ -381,6 +433,12 @@ impl Ext2Fs {
             }
         };
 
+        // Build per-group alloc locks.
+        let mut per_group_alloc = Vec::with_capacity(num_groups as usize);
+        for _ in 0..num_groups {
+            per_group_alloc.push(Mutex::new(()));
+        }
+
         Some(Ext2Fs {
             reader,
             superblock: sb,
@@ -388,7 +446,15 @@ impl Ext2Fs {
             inode_size,
             num_groups,
             bgdt_block,
-            state: Mutex::new(Ext2State { superblock: sb, bgdt }),
+            state: Mutex::new(Ext2State {
+                superblock: sb,
+                bgdt,
+                dentry_map: BTreeMap::new(),
+                dentry_fifo: VecDeque::new(),
+                indirect_cache: None,
+            }),
+            per_group_alloc,
+            dentry_cache_hits: AtomicUsize::new(0),
         })
     }
 
@@ -444,6 +510,11 @@ impl Ext2Fs {
         if sb.blocks_per_group > (block_size as u32) * 8 { return None; }
         let num_groups = (sb.blocks_count + sb.blocks_per_group - 1) / sb.blocks_per_group;
         let bgdt_block = if block_size == 1024 { 2 } else { 1 };
+        // Build per-group alloc locks (test path — same as production).
+        let mut per_group_alloc = Vec::with_capacity(num_groups as usize);
+        for _ in 0..num_groups {
+            per_group_alloc.push(Mutex::new(()));
+        }
         // The Fn-reader test path never exercises the allocator (the existing
         // EXT2-DIR-1 / EXT2-SB-1 / EXT2-LINK-1 tests are read-only validators)
         // so a dummy single-group BGDT is sufficient.  Real BGDT contents are
@@ -461,7 +532,15 @@ impl Ext2Fs {
             inode_size,
             num_groups,
             bgdt_block,
-            state: Mutex::new(Ext2State { superblock: sb, bgdt }),
+            state: Mutex::new(Ext2State {
+                superblock: sb,
+                bgdt,
+                dentry_map: BTreeMap::new(),
+                dentry_fifo: VecDeque::new(),
+                indirect_cache: None,
+            }),
+            per_group_alloc,
+            dentry_cache_hits: AtomicUsize::new(0),
         })
     }
 
@@ -639,14 +718,44 @@ impl Ext2Fs {
     }
 
     /// Read one pointer from an indirect block.
+    ///
+    /// Uses the single-entry indirect-block cache in `Ext2State` (PR-E).
+    /// When the same indirect block is read repeatedly — the common case for
+    /// a sequential read of a file > 48 KiB — each pointer lookup hits the
+    /// cache rather than issuing a fresh disk read, eliminating the ~256×
+    /// redundant I/O noted in the audit §6 "Indirect block re-reading".
     fn read_indirect(&self, block_num: u32, index: usize) -> u32 {
         if block_num == 0 { return 0; }
+        // Fast path: hit the per-FS indirect-block cache.
+        {
+            let state = self.state.lock();
+            if let Some((cached_block, ref cached_data)) = state.indirect_cache {
+                if cached_block == block_num {
+                    let off = index * 4;
+                    if off + 4 <= cached_data.len() {
+                        return u32::from_le_bytes([
+                            cached_data[off], cached_data[off+1],
+                            cached_data[off+2], cached_data[off+3],
+                        ]);
+                    }
+                }
+            }
+        }
+        // Miss: read the block and populate the cache.
         let mut buf = alloc::vec![0u8; self.block_size];
         if self.read_block(block_num, &mut buf).is_err() { return 0; }
-        let ptrs = unsafe {
-            core::slice::from_raw_parts(buf.as_ptr() as *const u32, self.block_size / 4)
+        let result = {
+            let off = index * 4;
+            if off + 4 <= buf.len() {
+                u32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]])
+            } else { 0 }
         };
-        if index < ptrs.len() { u32::from_le(ptrs[index]) } else { 0 }
+        // Store in cache.
+        {
+            let mut state = self.state.lock();
+            state.indirect_cache = Some((block_num, buf));
+        }
+        result
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -766,29 +875,59 @@ impl Ext2Fs {
     /// groups round-robin starting at group 0, and within a group scan the
     /// bitmap bits low-to-high (LSB of byte 0 is data block
     /// `first_data_block + group * blocks_per_group`).
+    ///
+    /// # SMP correctness (PR-E)
+    ///
+    /// PR-B allocated with a drop-lock-across-I/O pattern that left a
+    /// window where two CPUs could independently read the same bitmap byte,
+    /// find the same free bit, and allocate the same block number.
+    ///
+    /// PR-E fixes this by holding the per-group lock (`self.per_group_alloc[group]`)
+    /// across the entire read–set–write sequence for the bitmap.  The global
+    /// state lock is still used for the BGDT free-count checks and updates;
+    /// it is dropped across the I/O to avoid holding it during disk access.
+    /// The protocol is:
+    ///
+    /// 1. Hold state lock: check global + group free count.  Release.
+    /// 2. Acquire per-group alloc lock.
+    /// 3. (Re)read the bitmap while holding the per-group lock.
+    /// 4. Find and set a free bit while holding the per-group lock.
+    /// 5. Write the bitmap back while holding the per-group lock.
+    /// 6. Release per-group lock.
+    /// 7. Acquire state lock: update BGDT + superblock counters.  Release.
+    /// 8. Flush BGDT + superblock to disk.
+    ///
+    /// Steps 3–5 are serialised per-group; different groups can run in
+    /// parallel.  The re-read in step 3 means a CPU that queued behind
+    /// another on the same group always sees the post-commit bitmap.
     fn alloc_block(&self) -> Option<u32> {
-        let mut state = self.state.lock();
-        if state.superblock.free_blocks_count == 0 { return None; }
+        // Quick global check before taking any per-group lock.
+        {
+            let state = self.state.lock();
+            if state.superblock.free_blocks_count == 0 { return None; }
+        }
         let num_groups = self.num_groups as usize;
         for group in 0..num_groups {
-            if state.bgdt[group].free_blocks_count == 0 { continue; }
-            // Read the group's block bitmap.
-            let bitmap_block = state.bgdt[group].block_bitmap;
-            // Drop the state lock across the I/O — we re-acquire to commit
-            // the bit and counters.  Other allocators racing on the same
-            // group are coordinated by the bitmap-scan retry below
-            // (re-read after re-locking).
-            drop(state);
+            // Fast per-group free-count check (no I/O yet).
+            let bitmap_block = {
+                let state = self.state.lock();
+                if state.bgdt[group].free_blocks_count == 0 { continue; }
+                state.bgdt[group].block_bitmap
+            };
+
+            // Acquire the per-group alloc lock.  This serialises the
+            // read-find-set-write bitmap sequence within this group.
+            let _group_guard = self.per_group_alloc[group].lock();
+
+            // Re-read the bitmap under the per-group lock so we see any
+            // writes committed by a racing allocator that held this lock
+            // before us.
             let mut bitmap = alloc::vec![0u8; self.block_size];
             if self.read_block(bitmap_block, &mut bitmap).is_err() {
-                state = self.state.lock();
                 continue;
             }
-            // Find a clear bit within `blocks_per_group` of the group's
-            // bitmap.  Limit the scan: the bitmap byte count is
-            // `block_size`, but `blocks_per_group` may be smaller — beyond
-            // that the bits MUST be set to 1 by mkfs (spec §4) and we
-            // honour that here defensively.
+
+            // Scan for a free bit within blocks_per_group.
             let bits_in_group = self.superblock.blocks_per_group as usize;
             let mut chosen: Option<usize> = None;
             for byte_idx in 0..(bits_in_group + 7) / 8 {
@@ -803,44 +942,41 @@ impl Ext2Fs {
                 }
                 if chosen.is_some() { break; }
             }
-            state = self.state.lock();
-            let Some(bit_idx) = chosen else {
-                // Re-acquired and found no free bit — counter was stale or
-                // raced; skip group.
-                continue;
-            };
-            // Re-check after re-acquiring (free count could have dropped to 0).
-            if state.bgdt[group].free_blocks_count == 0 { continue; }
-            // Commit the bit.  Note bitmap was read without the lock; under
-            // single-threaded test runs this is exact, under SMP a future
-            // PR-E should add a per-group lock + atomic CAS retry on the
-            // bit.  For PR-B we accept the wider critical section by
-            // re-reading the byte and OR-ing the bit.
+            let Some(bit_idx) = chosen else { continue; };
+
+            // Set the bit and write the bitmap back — still under the
+            // per-group lock, so no other CPU can pick this bit.
             let byte_idx = bit_idx / 8;
             let bit_off = bit_idx % 8;
-            // Re-read the host byte (single sector containing it) to apply
-            // the bit OR.  Doing a full block re-read would be safer; this
-            // narrow RMW is what the spec describes.
             bitmap[byte_idx] |= 1 << bit_off;
             if self.write_block(bitmap_block, &bitmap).is_err() {
                 continue;
             }
+            // Per-group lock can be released here; the bit is on disk.
+            drop(_group_guard);
+
             // Compute the absolute block number.
             let block_num = self.superblock.first_data_block
                 + (group as u32) * self.superblock.blocks_per_group
                 + bit_idx as u32;
-            // Zero the new block — ext2 spec does not strictly require this
-            // but most callers expect zeroed indirect/data blocks (POSIX
-            // `lseek(SEEK_END) + write` semantics for tail extension, and
-            // indirect-block initialisation).
+
+            // Zero the new block — POSIX ftruncate / lseek+write semantics
+            // require that newly-allocated tail bytes read as zero.
             let zero = alloc::vec![0u8; self.block_size];
             let _ = self.write_block(block_num, &zero);
-            // Update BGDT + superblock counters.
-            state.bgdt[group].free_blocks_count -= 1;
-            state.superblock.free_blocks_count -= 1;
-            let bgd_snap = state.bgdt[group];
-            let sb_snap = state.superblock;
-            drop(state);
+
+            // Update BGDT + superblock counters (state lock).
+            let (bgd_snap, sb_snap) = {
+                let mut state = self.state.lock();
+                // Re-check after the I/O: another CPU may have exhausted
+                // this group while we were writing.  Accept if it was > 0
+                // when we committed the bitmap.
+                state.bgdt[group].free_blocks_count =
+                    state.bgdt[group].free_blocks_count.saturating_sub(1);
+                state.superblock.free_blocks_count =
+                    state.superblock.free_blocks_count.saturating_sub(1);
+                (state.bgdt[group], state.superblock)
+            };
             let _ = self.flush_bgd(group as u32, &bgd_snap);
             let _ = self.flush_superblock(&sb_snap);
             return Some(block_num);
@@ -889,6 +1025,11 @@ impl Ext2Fs {
     /// per-group `used_dirs_count` for the Orlov allocator's directory
     /// spreading heuristic).  Reserved inodes (1..`first_ino` exclusive for
     /// rev ≥ 1) are never returned.
+    ///
+    /// Uses the same per-group lock protocol as [`Self::alloc_block`]
+    /// (PR-E SMP fix): reads, finds, and sets the bitmap bit while holding
+    /// the per-group alloc lock, eliminating the concurrent-allocation race
+    /// window that existed in PR-B.
     #[allow(dead_code)]
     pub(crate) fn alloc_inode(&self, is_dir: bool) -> Option<u32> {
         let first_ino = if self.superblock.rev_level >= 1 {
@@ -898,17 +1039,23 @@ impl Ext2Fs {
         };
         let inodes_per_group = self.superblock.inodes_per_group as usize;
         let num_groups = self.num_groups as usize;
-        let mut state = self.state.lock();
-        if state.superblock.free_inodes_count == 0 { return None; }
+        {
+            let state = self.state.lock();
+            if state.superblock.free_inodes_count == 0 { return None; }
+        }
         for group in 0..num_groups {
-            if state.bgdt[group].free_inodes_count == 0 { continue; }
-            let bitmap_block = state.bgdt[group].inode_bitmap;
-            drop(state);
+            let bitmap_block = {
+                let state = self.state.lock();
+                if state.bgdt[group].free_inodes_count == 0 { continue; }
+                state.bgdt[group].inode_bitmap
+            };
+
+            // Per-group lock: serialises inode bitmap R-M-W within this group.
+            let _group_guard = self.per_group_alloc[group].lock();
+
             let mut bitmap = alloc::vec![0u8; self.block_size];
-            if self.read_block(bitmap_block, &mut bitmap).is_err() {
-                state = self.state.lock();
-                continue;
-            }
+            if self.read_block(bitmap_block, &mut bitmap).is_err() { continue; }
+
             let mut chosen: Option<usize> = None;
             for bit_idx in 0..inodes_per_group {
                 let absolute = (group as u32 * self.superblock.inodes_per_group)
@@ -921,21 +1068,25 @@ impl Ext2Fs {
                     break;
                 }
             }
-            state = self.state.lock();
             let Some(bit_idx) = chosen else { continue; };
-            if state.bgdt[group].free_inodes_count == 0 { continue; }
+
             let byte_idx = bit_idx / 8;
             let bit_off = bit_idx % 8;
             bitmap[byte_idx] |= 1 << bit_off;
             if self.write_block(bitmap_block, &bitmap).is_err() { continue; }
             let inum = (group as u32 * self.superblock.inodes_per_group)
                 + bit_idx as u32 + 1;
-            state.bgdt[group].free_inodes_count -= 1;
-            if is_dir { state.bgdt[group].used_dirs_count += 1; }
-            state.superblock.free_inodes_count -= 1;
-            let bgd_snap = state.bgdt[group];
-            let sb_snap = state.superblock;
-            drop(state);
+            drop(_group_guard);
+
+            let (bgd_snap, sb_snap) = {
+                let mut state = self.state.lock();
+                state.bgdt[group].free_inodes_count =
+                    state.bgdt[group].free_inodes_count.saturating_sub(1);
+                if is_dir { state.bgdt[group].used_dirs_count += 1; }
+                state.superblock.free_inodes_count =
+                    state.superblock.free_inodes_count.saturating_sub(1);
+                (state.bgdt[group], state.superblock)
+            };
             let _ = self.flush_bgd(group as u32, &bgd_snap);
             let _ = self.flush_superblock(&sb_snap);
             return Some(inum);
@@ -976,6 +1127,10 @@ impl Ext2Fs {
     /// Write a single 32-bit little-endian pointer into an indirect block
     /// at slot `index`.  Reads, modifies, writes the block.  Used by the
     /// indirect-tree growth path.
+    ///
+    /// Also invalidates the single-entry indirect-block cache (PR-E) so a
+    /// subsequent `read_indirect` on the same block sees the updated value
+    /// rather than a stale cache entry.
     fn write_indirect_slot(&self, block_num: u32, index: usize, value: u32)
         -> Result<(), &'static str>
     {
@@ -986,7 +1141,18 @@ impl Ext2Fs {
             return Err("ext2: indirect slot out of range");
         }
         buf[byte_off..byte_off + 4].copy_from_slice(&value.to_le_bytes());
-        self.write_block(block_num, &buf)
+        self.write_block(block_num, &buf)?;
+        // Invalidate: either evict or update the cache entry for this block.
+        {
+            let mut state = self.state.lock();
+            match &mut state.indirect_cache {
+                Some((cached_block, _)) if *cached_block == block_num => {
+                    state.indirect_cache = None;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Resolve a logical block index to a physical block number,
@@ -1902,6 +2068,88 @@ impl Ext2Fs {
         self.read_symlink_target(inode)
     }
 
+    // ────────────────────────────────────────────────────────────────────────
+    // Per-directory dentry cache (PR-E).
+    //
+    // The hot path in Firefox boot is a dlopen cascade: the dynamic linker
+    // calls lookup() once per entry in the DT_NEEDED closure (~100 names)
+    // against the same parent directory (/usr/lib or /usr/lib/firefox).
+    // Without a cache, each call runs read_dir_entries() from scratch —
+    // allocating a full-directory Vec<u8> and scanning every dir-entry.
+    //
+    // The cache maps (parent_inode, name) → child_inode and is bounded at
+    // DENTRY_CACHE_CAP entries with FIFO eviction.  The cache is stored in
+    // Ext2State (protected by the state mutex) to avoid a second lock and
+    // the associated deadlock risk; the mutex is held for the duration of
+    // the cache lookup, which is just a BTreeMap::get — a few hundred
+    // nanoseconds, well below any preemption threshold.
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// Insert a (parent, name) → child mapping into the dentry cache.
+    /// If the cache is at capacity, the oldest entry is evicted (FIFO).
+    fn dentry_cache_insert(&self, parent: u64, name: &str, child: u64) {
+        let mut state = self.state.lock();
+        // Evict if at capacity.
+        if state.dentry_map.len() >= DENTRY_CACHE_CAP {
+            if let Some(oldest) = state.dentry_fifo.pop_front() {
+                state.dentry_map.remove(&oldest);
+            }
+        }
+        let key = (parent, name.to_string());
+        // Only insert if not already present (avoid duplicate FIFO entries).
+        if state.dentry_map.insert(key.clone(), child).is_none() {
+            state.dentry_fifo.push_back(key);
+        }
+    }
+
+    /// Look up a name in the dentry cache.  Returns `Some(inode)` on hit.
+    fn dentry_cache_lookup(&self, parent: u64, name: &str) -> Option<u64> {
+        let state = self.state.lock();
+        let result = state.dentry_map.get(&(parent, name.to_string())).copied();
+        drop(state);
+        if result.is_some() {
+            self.dentry_cache_hits.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// Evict all dentry-cache entries whose parent inode matches `parent`.
+    /// Called after any mutation to the directory (create, unlink, rename)
+    /// so the cache cannot serve stale positive entries.
+    fn dentry_cache_evict_parent(&self, parent: u64) {
+        let mut state = self.state.lock();
+        let old_len = state.dentry_map.len();
+        if old_len == 0 { return; }
+        // Collect keys to remove (can't mutate while iterating).
+        let to_remove: Vec<_> = state.dentry_map.keys()
+            .filter(|(p, _)| *p == parent)
+            .cloned()
+            .collect();
+        for k in &to_remove {
+            state.dentry_map.remove(k);
+        }
+        // Rebuild FIFO to remove the evicted entries.  This is O(n) where
+        // n = FIFO length (bounded by DENTRY_CACHE_CAP = 1024), so it is
+        // fine on the infrequent mutation path.
+        if !to_remove.is_empty() {
+            let remove_set: BTreeMap<_, ()> =
+                to_remove.iter().map(|k| (k.clone(), ())).collect();
+            state.dentry_fifo.retain(|k| !remove_set.contains_key(k));
+        }
+    }
+
+    /// Test-only accessor: current dentry-cache hit counter.
+    #[doc(hidden)]
+    pub fn dentry_cache_hits_for_test(&self) -> usize {
+        self.dentry_cache_hits.load(Ordering::Relaxed)
+    }
+
+    /// Test-only accessor: current dentry-cache size.
+    #[doc(hidden)]
+    pub fn dentry_cache_size_for_test(&self) -> usize {
+        self.state.lock().dentry_map.len()
+    }
+
     /// Test-only accessor for the live `s_free_blocks_count` counter.
     /// Used by EXT2-TRUNC-1 / EXT2-ALLOC-1 to assert that allocation +
     /// free balance.  Reads through the mutex so the test sees the
@@ -2016,11 +2264,19 @@ impl FileSystemOps for Ext2Fs {
     }
 
     fn lookup(&self, parent_inode: u64, name: &str) -> VfsResult<u64> {
+        // Hot path: dentry cache hit avoids a full directory scan (PR-E).
+        if let Some(child) = self.dentry_cache_lookup(parent_inode, name) {
+            return Ok(child);
+        }
+        // Cache miss: fall through to linear scan.
         let ino = self.read_inode(parent_inode).ok_or(VfsError::NotFound)?;
         let entries = self.read_dir_entries(&ino);
         for (entry_ino, entry_name, _) in entries {
             if entry_name == name {
-                return Ok(entry_ino as u64);
+                let child = entry_ino as u64;
+                // Populate cache on successful lookup.
+                self.dentry_cache_insert(parent_inode, name, child);
+                return Ok(child);
             }
         }
         Err(VfsError::NotFound)
@@ -2070,6 +2326,8 @@ impl FileSystemOps for Ext2Fs {
                 parent.mtime = t;
                 parent.ctime = t;
                 let _ = self.write_inode(parent_inode, &parent);
+                // Evict stale dentry-cache entries for this parent (PR-E).
+                self.dentry_cache_evict_parent(parent_inode);
                 Ok(new_ino as u64)
             }
             Err(e) => {
@@ -2128,6 +2386,8 @@ impl FileSystemOps for Ext2Fs {
                 parent.mtime = t;
                 parent.ctime = t;
                 let _ = self.write_inode(parent_inode, &parent);
+                // Evict stale dentry-cache entries for this parent (PR-E).
+                self.dentry_cache_evict_parent(parent_inode);
                 Ok(new_ino as u64)
             }
             Err(e) => {
@@ -2210,6 +2470,8 @@ impl FileSystemOps for Ext2Fs {
             return Err(VfsError::NotADirectory);
         }
         let dead_ino = self.remove_dir_entry(&parent, name)?;
+        // Evict dentry-cache entries for this parent (PR-E).
+        self.dentry_cache_evict_parent(parent_inode);
         // Decrement target's links_count.
         if let Some(mut target) = self.read_inode(dead_ino as u64) {
             target.links_count = target.links_count.saturating_sub(1);
@@ -2312,6 +2574,8 @@ impl FileSystemOps for Ext2Fs {
                 parent.mtime = t;
                 parent.ctime = t;
                 let _ = self.write_inode(parent_inode, &parent);
+                // Evict stale dentry-cache entries for this parent (PR-E).
+                self.dentry_cache_evict_parent(parent_inode);
                 Ok(new_ino as u64)
             }
             Err(e) => {
@@ -2356,6 +2620,8 @@ impl FileSystemOps for Ext2Fs {
                 parent.mtime = t;
                 parent.ctime = t;
                 let _ = self.write_inode(parent_inode, &parent);
+                // Evict stale dentry-cache entries for this parent (PR-E).
+                self.dentry_cache_evict_parent(parent_inode);
                 Ok(())
             }
             Err(e) => {
@@ -2494,6 +2760,14 @@ impl FileSystemOps for Ext2Fs {
                     let _ = self.write_inode(new_parent, &np);
                 }
             }
+        }
+
+        // Evict dentry-cache entries for both parents (PR-E): the old
+        // name is gone from old_parent; new_parent may have a new entry
+        // (or a replaced one) under new_name.
+        self.dentry_cache_evict_parent(old_parent);
+        if new_parent != old_parent {
+            self.dentry_cache_evict_parent(new_parent);
         }
 
         Ok(())
