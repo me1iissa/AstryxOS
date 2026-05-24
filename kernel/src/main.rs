@@ -58,7 +58,7 @@ mod init;
 mod util;
 #[cfg(feature = "record-replay")]
 mod record_replay;
-#[cfg(any(feature = "busybox-test", feature = "wget-test", feature = "pivot-e-test"))]
+#[cfg(any(feature = "busybox-test", feature = "wget-test", feature = "pivot-e-test", feature = "pivot-e-tui-test"))]
 mod busybox_demo;
 #[cfg(feature = "httpd-test")]
 mod httpd_demo;
@@ -70,6 +70,8 @@ mod tls_demo;
 mod oracle_demo;
 #[cfg(feature = "pivot-e-test")]
 mod pivot_e_demo;
+#[cfg(feature = "pivot-e-tui-test")]
+mod pivot_e_tui_demo;
 
 use astryx_shared::{BootInfo, BOOT_INFO_MAGIC};
 
@@ -401,6 +403,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "oracle-test"),
                   not(feature = "oracle-daemon-test"),
                   not(feature = "pivot-e-test"),
+                  not(feature = "pivot-e-tui-test"),
                   feature = "xeyes-test"))]
         {
             serial_println!("[XEYES] xeyes-test mode starting...");
@@ -610,6 +613,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "oracle-test"),
                   not(feature = "oracle-daemon-test"),
                   not(feature = "pivot-e-test"),
+                  not(feature = "pivot-e-tui-test"),
                   any(feature = "busybox-test", feature = "wget-test")))]
         {
             hal::enable_interrupts();
@@ -670,6 +674,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "oracle-test"),
                   not(feature = "oracle-daemon-test"),
                   not(feature = "pivot-e-test"),
+                  not(feature = "pivot-e-tui-test"),
                   feature = "httpd-test"))]
         {
             hal::enable_interrupts();
@@ -714,6 +719,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "oracle-test"),
                   not(feature = "oracle-daemon-test"),
                   not(feature = "pivot-e-test"),
+                  not(feature = "pivot-e-tui-test"),
                   feature = "sshd-test"))]
         {
             hal::enable_interrupts();
@@ -755,6 +761,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "oracle-test"),
                   not(feature = "oracle-daemon-test"),
                   not(feature = "pivot-e-test"),
+                  not(feature = "pivot-e-tui-test"),
                   feature = "tls-test"))]
         {
             hal::enable_interrupts();
@@ -796,6 +803,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "tls-test"),
                   not(feature = "oracle-daemon-test"),
                   not(feature = "pivot-e-test"),
+                  not(feature = "pivot-e-tui-test"),
                   feature = "oracle-test"))]
         {
             hal::enable_interrupts();
@@ -842,6 +850,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "tls-test"),
                   not(feature = "oracle-test"),
                   not(feature = "pivot-e-test"),
+                  not(feature = "pivot-e-tui-test"),
                   feature = "oracle-daemon-test"))]
         {
             hal::enable_interrupts();
@@ -924,6 +933,57 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             loop { unsafe { core::arch::asm!("hlt"); } }
         }
 
+        // ── pivot-e-tui-test: Tier C TUI utilities (PIVOT-E, 2026-05-24) ─────
+        // Headless: no X11, no Xastryx, no compositor.  Loads each of
+        // nano/vim/htop/tmux through the PR #450 per-pair PTY substrate +
+        // libncursesw DT_NEEDED closure and verifies a clean version-banner
+        // exit.  See kernel/src/pivot_e_tui_demo.rs for the battery and
+        // docs/PIVOT_E_TIER_C_2026-05-24.md for the strategic context.
+        //
+        // Mutually exclusive with the other *-test cargo features at the
+        // cfg-gate level (all share the BSP idle slot).
+        #[cfg(all(not(feature = "gui-test"),
+                  not(feature = "xeyes-test"),
+                  not(feature = "firefox-test"),
+                  not(feature = "busybox-test"),
+                  not(feature = "wget-test"),
+                  not(feature = "httpd-test"),
+                  not(feature = "sshd-test"),
+                  not(feature = "tls-test"),
+                  not(feature = "oracle-test"),
+                  not(feature = "oracle-daemon-test"),
+                  not(feature = "pivot-e-test"),
+                  feature = "pivot-e-tui-test"))]
+        {
+            hal::enable_interrupts();
+            if !sched::is_active() {
+                sched::enable();
+            }
+            // Scheduler settle — same pattern as pivot-e-test.
+            let t0 = arch::x86_64::irq::get_ticks();
+            while arch::x86_64::irq::get_ticks().wrapping_sub(t0) < 30 {
+                core::hint::spin_loop();
+            }
+
+            pivot_e_tui_demo::run_pivot_e_tui_demo();
+
+            serial_println!("[PIVOT-E-TUI] DONE");
+
+            let t_done = arch::x86_64::irq::get_ticks();
+            while arch::x86_64::irq::get_ticks().wrapping_sub(t_done) < 100 {
+                core::hint::spin_loop();
+            }
+            unsafe {
+                core::arch::asm!(
+                    "out dx, eax",
+                    in("dx")  0xf4_u16,
+                    in("eax") 0_u32,
+                    options(nomem, nostack)
+                );
+            }
+            loop { unsafe { core::arch::asm!("hlt"); } }
+        }
+
         // ── X11 visual test: create a colored window and hold it on screen ──
         // Activated by firefox-test mode — shows an X11 window before Firefox.
         #[cfg(all(not(feature = "gui-test"),
@@ -936,6 +996,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "oracle-test"),
                   not(feature = "oracle-daemon-test"),
                   not(feature = "pivot-e-test"),
+                  not(feature = "pivot-e-tui-test"),
                   feature = "firefox-test"))]
         {
             serial_println!("[FFTEST] Firefox-test mode starting...");

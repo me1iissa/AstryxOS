@@ -20,7 +20,7 @@
 //!     https://www.qemu.org/docs/master/system/devices/net.html#network-options
 //!   - RFC 7230 (HTTP/1.1) — for the wget-test fetch path
 
-#![cfg(any(feature = "busybox-test", feature = "wget-test", feature = "pivot-e-test"))]
+#![cfg(any(feature = "busybox-test", feature = "wget-test", feature = "pivot-e-test", feature = "pivot-e-tui-test"))]
 
 extern crate alloc;
 use alloc::vec::Vec;

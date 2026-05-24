@@ -177,6 +177,24 @@ oracle-daemon-test = []
 # <https://www.gnu.org/software/tar/manual/tar.html>, POSIX exec(2)
 # / read(2) / write(2).
 pivot-e-test = []
+# pivot-e-tui-test — PIVOT-E Tier C TUI utilities demo (2026-05-24).
+# Verifies the four interactive ncurses utilities staged by
+# install-pivot-e-tui.sh: nano, vim, htop, tmux.  Each binary is loaded
+# via the PR #450 per-pair PTY substrate (/dev/ptmx, /dev/pts/N, TCGETS,
+# TCSETS, TIOCGWINSZ, TIOCSPGRP) and the libncursesw DT_NEEDED closure
+# resolved by ld-musl.  The runner invokes a non-interactive smoke for
+# each utility (--version / -V / -h / ls) that exercises the full ELF +
+# linker + ncurses-init path without requiring an attached PTY stdin.
+# Major-win threshold: 2-of-4 utilities exit cleanly (PASS); 3-of-4
+# means the substrate is robust enough for richer interactive demos.
+# Mutually exclusive with other *-test features at the main.rs gate.
+# Requires data.img staged by `scripts/create-data-disk.sh --pivot-e-tui`.
+# Public refs: GNU nano <https://www.nano-editor.org/>, Vim
+# <https://vimhelp.org/>, htop <https://htop.dev/>, tmux
+# <https://github.com/tmux/tmux/wiki>, ncurses(3X)
+# <https://invisible-island.net/ncurses/man/ncurses.3x.html>,
+# terminfo(5) <https://invisible-island.net/ncurses/man/terminfo.5.html>.
+pivot-e-tui-test = []
 # Opt-in for the userspace alias_test page-aliasing reproducer (Test 44b).
 # Spawns 8 worker threads via raw clone(CLONE_VM|CLONE_THREAD|CLONE_SIGHAND)
 # doing MAP_PRIVATE mmap churn; runs >100k page faults; sometimes wedges
