@@ -660,7 +660,23 @@ if command -v mcopy &>/dev/null; then
     printf 'astryx\n' | mcopy -o -i "${DATA_IMG}" - "::etc/hostname"
     printf '127.0.0.1 localhost\n::1 localhost\n10.0.2.2 gateway\n' | \
         mcopy -o -i "${DATA_IMG}" - "::etc/hosts"
-    printf 'nameserver 10.0.2.3\n' | mcopy -o -i "${DATA_IMG}" - "::etc/resolv.conf"
+    # Default resolver is QEMU SLIRP's built-in DNS at 10.0.2.3, which proxies
+    # to the host's resolver — fine for general guest DNS via NAT.  Override
+    # via env when targeting a specific upstream resolver: e.g. ASTRYXOS_ORACLE=1
+    # selects the user's LAN DNS at 192.168.3.23 so oracle's HttpSync resolves
+    # the internal Conflux endpoint reachable on that LAN.  SLIRP NAT routes
+    # guest egress to 192.168.3.x via the host's default gateway, so the host
+    # machine must itself be on / reachable to 192.168.3.0/24.
+    if [ -n "${ASTRYXOS_NAMESERVER}" ]; then
+        DNS_NAMESERVER="${ASTRYXOS_NAMESERVER}"
+    elif [ "${ORACLE}" = "1" ] || [ "${ORACLE}" = "true" ]; then
+        DNS_NAMESERVER="192.168.3.23"
+    else
+        DNS_NAMESERVER="10.0.2.3"
+    fi
+    printf 'nameserver %s\n' "${DNS_NAMESERVER}" | \
+        mcopy -o -i "${DATA_IMG}" - "::etc/resolv.conf"
+    echo "[DATA-DISK] /etc/resolv.conf nameserver=${DNS_NAMESERVER}"
     printf 'hosts: files dns\npasswd: files\ngroup: files\n' | \
         mcopy -o -i "${DATA_IMG}" - "::etc/nsswitch.conf"
     printf 'root:x:0:0:root:/:/bin/sh\nuser:x:1000:1000:user:/home/user:/bin/sh\n' | \
