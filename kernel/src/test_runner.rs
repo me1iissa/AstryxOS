@@ -760,6 +760,24 @@ pub fn run() -> ! {
     total += 1;
     if test_pty() { passed += 1; }
 
+    // ── Test 275: PTY substrate end-to-end via syscall dispatch ──────────────
+    // Drives the full /dev/ptmx → TIOCGPTN → /dev/pts/N → read/write +
+    // TCGETS/TCSETS round-trip via the Linux syscall numbers used by real
+    // ELFs.  Complements Test 77, which exercises only the in-kernel
+    // helper API.  Validates per-pair termios (TUIs flipping their slave
+    // into raw mode do not perturb TTY0) and per-pair winsize.  Refs:
+    // POSIX termios(3), pty(7), pts(4), tty_ioctl(4); Linux ioctl
+    // numbers per Documentation/admin-guide/devices.txt.
+    //
+    // Sequenced immediately after Test 77 so a regression in the syscall
+    // surface fires early in the suite (rather than after ~28 000 lines
+    // of unrelated tests).
+    #[cfg(any(feature = "test-mode", feature = "pivot-e-test"))]
+    {
+        total += 1;
+        if test_275_pty_syscall_smoke() { passed += 1; }
+    }
+
     // ── Test 78: SysV SHM — shmget / shmat / shmdt / shmctl ─────────────────
 
     total += 1;
@@ -38327,5 +38345,302 @@ fn test_274_udp_connect_auto_bind() -> bool {
     if ok {
         test_pass!("UDP connect()/sendto() auto-bind (DNS unblocker)");
     }
+    ok
+}
+
+// ── Test 275: PTY substrate end-to-end via syscall dispatch ────────────────
+//
+// Exercises the full kernel syscall surface a real TUI program (busybox vi,
+// nano, htop, tmux, ...) drives at startup:
+//
+//   1. open("/dev/ptmx", O_RDWR)        → master fd
+//   2. ioctl(master, TIOCGPTN, &n)      → slave number N
+//   3. ioctl(master, TIOCSPTLCK, &zero) → unlock the slave
+//   4. open("/dev/pts/N", O_RDWR)       → slave fd
+//   5. write(slave, "hello\n", 6)       → master sees "hello\n"
+//   6. write(master, "world\n", 6)      → slave sees "world\n"
+//   7. ioctl(slave,  TCGETS, &t)        → struct termios populated
+//   8. ioctl(slave,  TCSETS, &raw)      → flip slave to raw mode
+//   9. ioctl(master, TCGETS, &t2)       → master sees the raw config too
+//                                          (per POSIX pty(7): both ends share
+//                                          the line-discipline state)
+//  10. ioctl(slave,  TIOCGWINSZ, &ws)   → returns 80x24 (per-pair default,
+//                                          not TTY0's dimensions)
+//  11. ioctl(slave,  TIOCSWINSZ, &big)  → resize to 132x50
+//  12. ioctl(master, TIOCGWINSZ, &ws2)  → master sees the resize
+//  13. close(slave), close(master)
+//
+// Test 77 covers the in-kernel helper API (drivers::pty::master_write etc.);
+// this test goes through `crate::syscall::dispatch_linux_kernel` so we
+// exercise the same code path real ELFs hit through `syscall` instruction →
+// IDT vector 0x80 → linux syscall table.
+//
+// Refs:
+//   - POSIX termios(3), pty(7), pts(4), tty_ioctl(4)
+//   - Documentation/admin-guide/devices.txt (PTY major/minor allocation)
+//   - https://man7.org/linux/man-pages/man3/openpty.3.html
+#[cfg(any(feature = "test-mode", feature = "pivot-e-test"))]
+fn test_275_pty_syscall_smoke() -> bool {
+    test_header!("PTY syscall smoke — open/ioctl/read/write end-to-end (Test 275)");
+
+    let dispatch = crate::syscall::dispatch_linux_kernel;
+    let mut ok = true;
+
+    // Linux syscall numbers (asm-generic/unistd.h, x86_64 variant).
+    const SYS_READ:  u64 = 0;
+    const SYS_WRITE: u64 = 1;
+    const SYS_OPEN:  u64 = 2;
+    const SYS_CLOSE: u64 = 3;
+    const SYS_IOCTL: u64 = 16;
+
+    // Linux PTY/TTY ioctl numbers (Documentation/admin-guide/devices.txt
+    // and asm-generic/ioctls.h).
+    const TIOCGPTN:   u64 = 0x8004_5430;
+    const TIOCSPTLCK: u64 = 0x4004_5431;
+    const TCGETS:     u64 = 0x5401;
+    const TCSETS:     u64 = 0x5402;
+    const TIOCGWINSZ: u64 = 0x5413;
+    const TIOCSWINSZ: u64 = 0x5414;
+
+    // open(2) flags — O_RDWR (2) per asm-generic/fcntl.h.
+    const O_RDWR: u64 = 2;
+
+    // Path strings need a stable address; null-terminate explicitly because
+    // sys_open_linux's read_cstring_from_user reads until a NUL byte.
+    let ptmx_path = b"/dev/ptmx\0";
+
+    // ── Step 1: open /dev/ptmx → master fd ───────────────────────────────
+    let master = dispatch(SYS_OPEN, ptmx_path.as_ptr() as u64, O_RDWR, 0, 0, 0, 0);
+    if master < 0 {
+        test_fail!("275/open ptmx", "open(/dev/ptmx) → {}", master);
+        return false;
+    }
+    test_println!("  275-1 open(/dev/ptmx) → fd {} ✓", master);
+
+    // ── Step 2: ioctl(master, TIOCGPTN, &n) ──────────────────────────────
+    let mut pty_n: u32 = 0xFFFF_FFFF;
+    let r = dispatch(SYS_IOCTL, master as u64, TIOCGPTN,
+                     &mut pty_n as *mut u32 as u64, 0, 0, 0);
+    if r != 0 {
+        test_fail!("275/TIOCGPTN", "ioctl(TIOCGPTN) → {}", r);
+        ok = false;
+    } else if pty_n > 15 {
+        test_fail!("275/TIOCGPTN", "ioctl(TIOCGPTN) → pty_n={} (expected 0..16)", pty_n);
+        ok = false;
+    } else {
+        test_println!("  275-2 ioctl(master, TIOCGPTN) → N={} ✓", pty_n);
+    }
+
+    // ── Step 3: ioctl(master, TIOCSPTLCK, &0) — unlockpt ─────────────────
+    let unlock: i32 = 0;
+    let r = dispatch(SYS_IOCTL, master as u64, TIOCSPTLCK,
+                     &unlock as *const i32 as u64, 0, 0, 0);
+    if r != 0 {
+        test_fail!("275/TIOCSPTLCK", "ioctl(TIOCSPTLCK) → {}", r);
+        ok = false;
+    } else {
+        test_println!("  275-3 ioctl(master, TIOCSPTLCK, 0) → 0 ✓");
+    }
+
+    // ── Step 4: open /dev/pts/<N> → slave fd ─────────────────────────────
+    // Build the slave path on the kernel stack.  Max N is 15 so a 16-byte
+    // buffer is more than enough.
+    let mut slave_path = [0u8; 16];
+    let prefix = b"/dev/pts/";
+    slave_path[..prefix.len()].copy_from_slice(prefix);
+    if pty_n < 10 {
+        slave_path[prefix.len()]     = b'0' + (pty_n as u8);
+        slave_path[prefix.len() + 1] = 0;
+    } else {
+        slave_path[prefix.len()]     = b'1';
+        slave_path[prefix.len() + 1] = b'0' + ((pty_n - 10) as u8);
+        slave_path[prefix.len() + 2] = 0;
+    }
+    let slave = dispatch(SYS_OPEN, slave_path.as_ptr() as u64, O_RDWR, 0, 0, 0, 0);
+    if slave < 0 {
+        test_fail!("275/open pts",
+            "open(/dev/pts/{}) → {}", pty_n, slave);
+        // Close master and bail — without a slave fd the remaining checks
+        // are meaningless and would compound the failure noise.
+        let _ = dispatch(SYS_CLOSE, master as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+    test_println!("  275-4 open(/dev/pts/{}) → fd {} ✓", pty_n, slave);
+
+    // ── Step 5: write(slave, "hello\n") → read(master, ...) ──────────────
+    let s2m_msg = b"hello\n";
+    let w = dispatch(SYS_WRITE, slave as u64, s2m_msg.as_ptr() as u64,
+                     s2m_msg.len() as u64, 0, 0, 0);
+    if w != s2m_msg.len() as i64 {
+        test_fail!("275/slave-write", "write({} bytes) → {}", s2m_msg.len(), w);
+        ok = false;
+    }
+    let mut rx = [0u8; 32];
+    let r = dispatch(SYS_READ, master as u64, rx.as_mut_ptr() as u64,
+                     rx.len() as u64, 0, 0, 0);
+    if r != s2m_msg.len() as i64 || &rx[..r.max(0) as usize] != s2m_msg {
+        test_fail!("275/master-read",
+            "master read returned {} bytes (data {:?})", r, &rx[..r.max(0) as usize]);
+        ok = false;
+    } else {
+        test_println!("  275-5 slave→master {:?} → {} bytes ✓",
+            core::str::from_utf8(s2m_msg).unwrap_or("?"), r);
+    }
+
+    // ── Step 6: write(master, "world\n") → read(slave, ...) ──────────────
+    let m2s_msg = b"world\n";
+    let w = dispatch(SYS_WRITE, master as u64, m2s_msg.as_ptr() as u64,
+                     m2s_msg.len() as u64, 0, 0, 0);
+    if w != m2s_msg.len() as i64 {
+        test_fail!("275/master-write", "write({} bytes) → {}", m2s_msg.len(), w);
+        ok = false;
+    }
+    let mut rx = [0u8; 32];
+    let r = dispatch(SYS_READ, slave as u64, rx.as_mut_ptr() as u64,
+                     rx.len() as u64, 0, 0, 0);
+    if r != m2s_msg.len() as i64 || &rx[..r.max(0) as usize] != m2s_msg {
+        test_fail!("275/slave-read",
+            "slave read returned {} bytes (data {:?})", r, &rx[..r.max(0) as usize]);
+        ok = false;
+    } else {
+        test_println!("  275-6 master→slave {:?} → {} bytes ✓",
+            core::str::from_utf8(m2s_msg).unwrap_or("?"), r);
+    }
+
+    // ── Step 7: ioctl(slave, TCGETS, &t) ─────────────────────────────────
+    // Bring in the Termios layout from the driver; the userland-visible
+    // shape matches the Linux x86_64 ABI (36 bytes per asm-generic/
+    // termbits.h NCCS=19).
+    let mut t = crate::drivers::tty::Termios {
+        c_iflag: 0, c_oflag: 0, c_cflag: 0, c_lflag: 0,
+        c_line: 0, c_cc: [0u8; crate::drivers::tty::NCCS],
+    };
+    let r = dispatch(SYS_IOCTL, slave as u64, TCGETS,
+                     &mut t as *mut _ as u64, 0, 0, 0);
+    if r != 0 {
+        test_fail!("275/TCGETS slave", "ioctl(TCGETS) → {}", r);
+        ok = false;
+    } else if t.c_lflag & crate::drivers::tty::ICANON == 0 {
+        test_fail!("275/TCGETS slave",
+            "fresh slave should default to ICANON=on, lflag={:#x}", t.c_lflag);
+        ok = false;
+    } else {
+        test_println!("  275-7 ioctl(slave, TCGETS) → lflag={:#x} (ICANON|ECHO) ✓",
+            t.c_lflag);
+    }
+
+    // ── Step 8: ioctl(slave, TCSETS, &raw) — flip to raw mode ────────────
+    // Clear ICANON | ECHO | ISIG so the PTY behaves like a tmux/vim raw
+    // terminal.  Also save TTY0's lflag before the flip so the next
+    // assertion can verify TTY0 is untouched (the per-pair termios
+    // invariant — TUIs setting raw mode on their slave must NOT clobber
+    // the kernel console).
+    let tty0_lflag_before = {
+        let tty = crate::drivers::tty::TTY0.lock();
+        tty.termios.c_lflag
+    };
+    let mut raw = t;
+    raw.c_lflag &= !(crate::drivers::tty::ICANON
+                   | crate::drivers::tty::ECHO
+                   | crate::drivers::tty::ISIG);
+    let r = dispatch(SYS_IOCTL, slave as u64, TCSETS,
+                     &raw as *const _ as u64, 0, 0, 0);
+    if r != 0 {
+        test_fail!("275/TCSETS slave", "ioctl(TCSETS raw) → {}", r);
+        ok = false;
+    } else {
+        test_println!("  275-8 ioctl(slave, TCSETS, raw) → 0 ✓");
+    }
+
+    // The kernel-console termios MUST be untouched.
+    let tty0_lflag_after = {
+        let tty = crate::drivers::tty::TTY0.lock();
+        tty.termios.c_lflag
+    };
+    if tty0_lflag_before != tty0_lflag_after {
+        test_fail!("275/tty0 isolation",
+            "TTY0 lflag changed by slave TCSETS: {:#x} → {:#x}",
+            tty0_lflag_before, tty0_lflag_after);
+        ok = false;
+    } else {
+        test_println!(
+            "  275-8b TTY0 lflag unchanged ({:#x}) — per-pair termios isolation ✓",
+            tty0_lflag_after);
+    }
+
+    // ── Step 9: ioctl(master, TCGETS) sees the same raw config ───────────
+    let mut t2 = t;
+    let r = dispatch(SYS_IOCTL, master as u64, TCGETS,
+                     &mut t2 as *mut _ as u64, 0, 0, 0);
+    if r != 0 {
+        test_fail!("275/TCGETS master", "ioctl(TCGETS master) → {}", r);
+        ok = false;
+    } else if t2.c_lflag != raw.c_lflag {
+        test_fail!("275/TCGETS master shared",
+            "master sees lflag={:#x}, expected raw {:#x} (per-pair shared)",
+            t2.c_lflag, raw.c_lflag);
+        ok = false;
+    } else {
+        test_println!(
+            "  275-9 master TCGETS sees raw lflag={:#x} (per pty(7) shared state) ✓",
+            t2.c_lflag);
+    }
+
+    // ── Step 10: ioctl(slave, TIOCGWINSZ) → 80x24 default ────────────────
+    let mut ws = crate::drivers::tty::Winsize {
+        ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0,
+    };
+    let r = dispatch(SYS_IOCTL, slave as u64, TIOCGWINSZ,
+                     &mut ws as *mut _ as u64, 0, 0, 0);
+    if r != 0 {
+        test_fail!("275/TIOCGWINSZ", "ioctl(TIOCGWINSZ) → {}", r);
+        ok = false;
+    } else if ws.ws_row != 24 || ws.ws_col != 80 {
+        test_fail!("275/TIOCGWINSZ",
+            "default winsize {}x{} (expected 80x24)", ws.ws_col, ws.ws_row);
+        ok = false;
+    } else {
+        test_println!("  275-10 slave TIOCGWINSZ → {}x{} (default) ✓",
+            ws.ws_col, ws.ws_row);
+    }
+
+    // ── Step 11: ioctl(slave, TIOCSWINSZ) → 132x50 ───────────────────────
+    let big = crate::drivers::tty::Winsize {
+        ws_row: 50, ws_col: 132, ws_xpixel: 0, ws_ypixel: 0,
+    };
+    let r = dispatch(SYS_IOCTL, slave as u64, TIOCSWINSZ,
+                     &big as *const _ as u64, 0, 0, 0);
+    if r != 0 {
+        test_fail!("275/TIOCSWINSZ", "ioctl(TIOCSWINSZ 132x50) → {}", r);
+        ok = false;
+    } else {
+        test_println!("  275-11 slave TIOCSWINSZ 132x50 → 0 ✓");
+    }
+
+    // ── Step 12: master TIOCGWINSZ sees the resize ───────────────────────
+    let mut ws2 = crate::drivers::tty::Winsize {
+        ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0,
+    };
+    let r = dispatch(SYS_IOCTL, master as u64, TIOCGWINSZ,
+                     &mut ws2 as *mut _ as u64, 0, 0, 0);
+    if r != 0 {
+        test_fail!("275/TIOCGWINSZ master", "ioctl → {}", r);
+        ok = false;
+    } else if ws2.ws_row != 50 || ws2.ws_col != 132 {
+        test_fail!("275/TIOCGWINSZ master shared",
+            "master saw {}x{} after slave resize 132x50",
+            ws2.ws_col, ws2.ws_row);
+        ok = false;
+    } else {
+        test_println!("  275-12 master TIOCGWINSZ → {}x{} (shared per pair) ✓",
+            ws2.ws_col, ws2.ws_row);
+    }
+
+    // ── Step 13: cleanup ─────────────────────────────────────────────────
+    let _ = dispatch(SYS_CLOSE, slave as u64, 0, 0, 0, 0, 0);
+    let _ = dispatch(SYS_CLOSE, master as u64, 0, 0, 0, 0, 0);
+    test_println!("  275-13 close(master), close(slave) ✓");
+
+    if ok { test_pass!("PTY syscall smoke — open/ioctl/read/write end-to-end (Test 275)"); }
     ok
 }

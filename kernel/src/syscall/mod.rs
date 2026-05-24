@@ -2014,13 +2014,15 @@ pub(crate) fn sys_waitpid(pid: i64, options: u32) -> i64 {
 
 /// ioctl — dispatch based on which device the fd refers to.
 pub(crate) fn sys_ioctl(fd_num: usize, request: u64, arg_ptr: *mut u8) -> i64 {
-    // TTY / console fds (0-2) always go to tty_ioctl.
-    if fd_num <= 2 {
-        return crate::drivers::tty::tty_ioctl(request, arg_ptr);
-    }
-
-    // Look up the fd's open_path and file_type.
-    let (open_path, file_type, inode) = {
+    // Look up the fd's open_path and file_type FIRST.  Historically fds
+    // 0..=2 were short-circuited to `tty_ioctl` on the assumption they
+    // were always the kernel console, but a process that closes its
+    // stdio and then opens `/dev/ptmx` (or any other char device) can
+    // legitimately receive fd 0/1/2 back from the open path — POSIX
+    // `open(2)` guarantees the lowest free descriptor.  Routing by
+    // file_type instead of by fd number keeps the per-pair termios
+    // contract intact for those callers.
+    let (open_path, file_type, inode, is_console, fd_present) = {
         let pid = crate::proc::current_pid_lockless();
         let procs = crate::proc::PROCESS_TABLE.lock();
         let fd_opt = procs.iter()
@@ -2028,18 +2030,38 @@ pub(crate) fn sys_ioctl(fd_num: usize, request: u64, arg_ptr: *mut u8) -> i64 {
             .and_then(|p| p.file_descriptors.get(fd_num))
             .and_then(|f| f.as_ref());
         match fd_opt {
-            Some(f) => (f.open_path.clone(), f.file_type, f.inode),
-            None    => (alloc::string::String::new(), crate::vfs::FileType::RegularFile, 0),
+            Some(f) => (f.open_path.clone(), f.file_type, f.inode, f.is_console, true),
+            None    => (alloc::string::String::new(), crate::vfs::FileType::RegularFile, 0, false, false),
         }
     };
 
-    // PTY ioctls
+    // Console fds (is_console=true) → TTY0.  This is set by the kernel
+    // init path on the initial stdio fds for processes inheriting the
+    // physical console, and stays distinct from /dev/ptmx PTY masters.
+    //
+    // Legacy stdio fall-back: if the caller targets fd 0/1/2 but the
+    // process has no fd table populated (kernel test threads, very early
+    // boot, or callers that never inherited stdio), route to `TTY0`
+    // anyway.  This preserves POSIX `tty(4)` semantics for TIOCGPGRP /
+    // TIOCGETSID / TIOCGWINSZ on stdio in environments where the kernel
+    // is the sole driver of the physical console.  A real fd with
+    // `is_console=false` (e.g. an `open("/dev/ptmx")` that happens to
+    // land on fd 0 after `close(0)`) still routes by file_type below.
+    if is_console || (!fd_present && fd_num <= 2) {
+        return crate::drivers::tty::tty_ioctl(request, arg_ptr);
+    }
+
+    // PTY ioctls.  Both ends route through per-pair handlers so a TUI
+    // setting raw mode on its slave does not perturb the kernel-console
+    // `TTY0` (which `drivers::tty::tty_ioctl` mutates).  See POSIX
+    // `termios(3)` for the per-fd attribute model and `pty(7)` for the
+    // master/slave distinction.
     match file_type {
         crate::vfs::FileType::PtyMaster => {
             return sys_pty_master_ioctl(inode as u8, request, arg_ptr);
         }
         crate::vfs::FileType::PtySlave => {
-            return crate::drivers::tty::tty_ioctl(request, arg_ptr);
+            return sys_pty_slave_ioctl(inode as u8, request, arg_ptr);
         }
         _ => {}
     }
@@ -2058,6 +2080,13 @@ pub(crate) fn sys_ioctl(fd_num: usize, request: u64, arg_ptr: *mut u8) -> i64 {
 }
 
 /// Ioctls for the PTY master side (/dev/ptmx).
+///
+/// The master handles PTY-management ioctls (`TIOCGPTN`, `TIOCSPTLCK`,
+/// `TIOCGPTLCK`) and the winsize accessors (`TIOCGWINSZ`, `TIOCSWINSZ`).
+/// `TCGETS` / `TCSETS` on the master end are routed to the same per-pair
+/// `Termios` the slave sees, which is the documented Linux semantics for
+/// PTY pairs — `man pty(7)` and `Documentation/admin-guide/devices.txt`
+/// section "PTY major/minor allocation".
 pub(crate) fn sys_pty_master_ioctl(pty_n: u8, request: u64, arg_ptr: *mut u8) -> i64 {
     // TIOCGPTN (0x80045430) — get slave number
     const TIOCGPTN:   u64 = 0x8004_5430;
@@ -2065,9 +2094,13 @@ pub(crate) fn sys_pty_master_ioctl(pty_n: u8, request: u64, arg_ptr: *mut u8) ->
     const TIOCSPTLCK: u64 = 0x4004_5431;
     // TIOCGPTLCK (0x80045439) — get lock state
     const TIOCGPTLCK: u64 = 0x8004_5439;
-    // TIOCGWINSZ (0x5413) / TIOCSWINSZ (0x5414)
-    const TIOCGWINSZ: u64 = 0x5413;
-    const TIOCSWINSZ: u64 = 0x5414;
+    // Per-pair termios + winsize accessors shared with the slave path.
+    use crate::drivers::tty::{
+        TCGETS, TCSETS, TCSETSW, TCSETSF,
+        TIOCGWINSZ, TIOCSWINSZ, TIOCGPGRP, TIOCSPGRP,
+        TIOCSCTTY, TIOCNOTTY, TIOCGETSID,
+        Winsize,
+    };
 
     // SMAP bracket — arg_ptr is a user-VA from the syscall arg.
     // Bracketing once at the top covers all match arms.
@@ -2096,26 +2129,133 @@ pub(crate) fn sys_pty_master_ioctl(pty_n: u8, request: u64, arg_ptr: *mut u8) ->
         }
         TIOCGWINSZ => {
             if !arg_ptr.is_null() {
-                let (cols, rows) = crate::drivers::pty::get_winsz(pty_n);
-                unsafe {
-                    core::ptr::write(arg_ptr as *mut u16, rows);
-                    core::ptr::write((arg_ptr as *mut u16).add(1), cols);
-                    core::ptr::write((arg_ptr as *mut u16).add(2), 0u16); // xpixel
-                    core::ptr::write((arg_ptr as *mut u16).add(3), 0u16); // ypixel
-                }
+                let ws = crate::drivers::pty::get_winsize_full(pty_n);
+                unsafe { core::ptr::write_unaligned(arg_ptr as *mut Winsize, ws); }
             }
             0
         }
         TIOCSWINSZ => {
             if !arg_ptr.is_null() {
-                let rows = unsafe { core::ptr::read(arg_ptr as *const u16) };
-                let cols = unsafe { core::ptr::read((arg_ptr as *const u16).add(1)) };
-                crate::drivers::pty::set_winsz(pty_n, cols, rows);
+                let ws = unsafe { core::ptr::read_unaligned(arg_ptr as *const Winsize) };
+                crate::drivers::pty::set_winsize_full(pty_n, ws);
+            }
+            0
+        }
+        TCGETS => pty_tcgets(pty_n, arg_ptr),
+        TCSETS  => pty_tcsets(pty_n, arg_ptr, /*flush=*/false),
+        TCSETSW => pty_tcsets(pty_n, arg_ptr, /*flush=*/false),
+        TCSETSF => pty_tcsets(pty_n, arg_ptr, /*flush=*/true),
+        TIOCGPGRP => {
+            if !arg_ptr.is_null() {
+                let pgid = crate::drivers::pty::get_fg_pgid(pty_n) as i32;
+                unsafe { core::ptr::write_unaligned(arg_ptr as *mut i32, pgid); }
+            }
+            0
+        }
+        TIOCSPGRP => {
+            if !arg_ptr.is_null() {
+                let pgid = unsafe { core::ptr::read_unaligned(arg_ptr as *const i32) };
+                crate::drivers::pty::set_fg_pgid(pty_n, pgid as u32);
+            }
+            0
+        }
+        TIOCSCTTY | TIOCNOTTY => 0,  // controlling-tty stubs
+        TIOCGETSID => {
+            if !arg_ptr.is_null() {
+                let pid = crate::proc::current_pid() as i32;
+                unsafe { core::ptr::write_unaligned(arg_ptr as *mut i32, pid); }
             }
             0
         }
         _ => 0, // Accept all other ioctls silently
     }
+}
+
+/// Ioctls for the PTY slave side (/dev/pts/N).
+///
+/// Mirror image of `sys_pty_master_ioctl` minus the PTMX-specific
+/// requests (`TIOCGPTN`, `TIOCSPTLCK`).  Per POSIX `termios(3)` and
+/// `pty(7)`, `tcgetattr`/`tcsetattr` on a slave fd MUST operate on the
+/// same `Termios` the master sees — both ends share the line-discipline
+/// configuration.
+pub(crate) fn sys_pty_slave_ioctl(pty_n: u8, request: u64, arg_ptr: *mut u8) -> i64 {
+    use crate::drivers::tty::{
+        TCGETS, TCSETS, TCSETSW, TCSETSF,
+        TIOCGWINSZ, TIOCSWINSZ, TIOCGPGRP, TIOCSPGRP,
+        TIOCSCTTY, TIOCNOTTY, TIOCGETSID,
+        Winsize,
+    };
+
+    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+    match request {
+        TCGETS => pty_tcgets(pty_n, arg_ptr),
+        TCSETS  => pty_tcsets(pty_n, arg_ptr, /*flush=*/false),
+        TCSETSW => pty_tcsets(pty_n, arg_ptr, /*flush=*/false),
+        TCSETSF => pty_tcsets(pty_n, arg_ptr, /*flush=*/true),
+        TIOCGWINSZ => {
+            if !arg_ptr.is_null() {
+                let ws = crate::drivers::pty::get_winsize_full(pty_n);
+                unsafe { core::ptr::write_unaligned(arg_ptr as *mut Winsize, ws); }
+            }
+            0
+        }
+        TIOCSWINSZ => {
+            if !arg_ptr.is_null() {
+                let ws = unsafe { core::ptr::read_unaligned(arg_ptr as *const Winsize) };
+                crate::drivers::pty::set_winsize_full(pty_n, ws);
+            }
+            0
+        }
+        TIOCGPGRP => {
+            if !arg_ptr.is_null() {
+                let pgid = crate::drivers::pty::get_fg_pgid(pty_n) as i32;
+                unsafe { core::ptr::write_unaligned(arg_ptr as *mut i32, pgid); }
+            }
+            0
+        }
+        TIOCSPGRP => {
+            if !arg_ptr.is_null() {
+                let pgid = unsafe { core::ptr::read_unaligned(arg_ptr as *const i32) };
+                crate::drivers::pty::set_fg_pgid(pty_n, pgid as u32);
+            }
+            0
+        }
+        TIOCSCTTY | TIOCNOTTY => 0,
+        TIOCGETSID => {
+            if !arg_ptr.is_null() {
+                let pid = crate::proc::current_pid() as i32;
+                unsafe { core::ptr::write_unaligned(arg_ptr as *mut i32, pid); }
+            }
+            0
+        }
+        _ => 0,  // Accept all other ioctls silently (e.g. TIOCMGET, FIONREAD)
+    }
+}
+
+/// Shared TCGETS handler — copies the pair's `Termios` into `arg_ptr`.
+/// Must be called inside an enclosing `UserGuard` bracket (the caller
+/// `sys_pty_*_ioctl` brackets the whole match).
+fn pty_tcgets(pty_n: u8, arg_ptr: *mut u8) -> i64 {
+    use crate::drivers::tty::Termios;
+    if arg_ptr.is_null() { return -14; } // EFAULT
+    let t = crate::drivers::pty::get_termios(pty_n);
+    unsafe { core::ptr::write_unaligned(arg_ptr as *mut Termios, t); }
+    0
+}
+
+/// Shared TCSETS / TCSETSW / TCSETSF handler.  `flush=true` selects the
+/// TCSETSF (TCSAFLUSH) variant which also discards both ring buffers
+/// before applying the new attributes — POSIX `termios(3)`.
+fn pty_tcsets(pty_n: u8, arg_ptr: *const u8, flush: bool) -> i64 {
+    use crate::drivers::tty::Termios;
+    if arg_ptr.is_null() { return -14; } // EFAULT
+    let t = unsafe { core::ptr::read_unaligned(arg_ptr as *const Termios) };
+    if flush {
+        crate::drivers::pty::set_termios_flush(pty_n, t);
+    } else {
+        crate::drivers::pty::set_termios(pty_n, t);
+    }
+    0
 }
 
 // ===== fbdev ioctls =========================================================
