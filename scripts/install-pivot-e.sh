@@ -25,8 +25,8 @@
 #   /bin/tar         — GNU tar 1.35 (libacl + libc.musl).  Provides the
 #                      extended-attribute / sparse-file / long-name shapes
 #                      busybox tar cannot do.  Symlinked at /usr/bin/tar
-#                      conventionally — FAT32 has no symlinks so we stage
-#                      it under both names as real files.
+#                      conventionally; we stage it under both names so
+#                      PATH-less hard-coded paths (/bin/tar) still resolve.
 #
 # Tier A (the 305 busybox-static applets including grep, sed, awk, find,
 # head, tail, wc, cat, sort, uniq, md5sum, sha256sum, du, df, vi, tar)
@@ -148,8 +148,7 @@ done
 mkdir -p "${DISK_BIN}" "${DISK_USR_BIN}" "${DISK_USR_LIB}" "${DISK_LIB}"
 
 # curl + jq under /usr/bin (canonical Alpine paths).  GNU tar lives at
-# /bin/tar with a /usr/bin/tar duplicate (Alpine ships a symlink; FAT32
-# has no symlinks so we materialise as a real file).
+# /bin/tar with a /usr/bin/tar duplicate so both canonical paths resolve.
 cp -fL "${ROOTFS}/usr/bin/curl" "${DISK_USR_BIN}/curl"
 chmod +x "${DISK_USR_BIN}/curl"
 echo "[PIVOT-E] Staged /usr/bin/curl ($(stat -c%s "${DISK_USR_BIN}/curl") bytes)"

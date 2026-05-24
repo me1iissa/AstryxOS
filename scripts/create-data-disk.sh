@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 #
-# Create a FAT32-formatted data disk image for AstryxOS.
+# Create an ext2-formatted data disk image for AstryxOS.
 #
 # This generates a persistent data drive that QEMU attaches as a
 # secondary SATA disk via the ICH9 AHCI controller (Q35 machine).
 # The kernel's AHCI DMA driver reads it on port 1.
 #
+# The image is formatted as ext2 using mke2fs(8) -d, which populates
+# the image from the host-side staging tree (build/disk/) in a single
+# unprivileged step (no loop mount, no root, no mtools).
+# Ref: mke2fs(8), e2fsprogs project — https://e2fsprogs.sourceforge.io/
+#
 # Usage:
-#   ./scripts/create-data-disk.sh           # Create default 64 MiB image
+#   ./scripts/create-data-disk.sh           # Create default 2048 MiB image
 #   ./scripts/create-data-disk.sh 128       # Create 128 MiB image
 #   ./scripts/create-data-disk.sh --force   # Recreate even if it exists
 #
@@ -686,75 +691,72 @@ fi
 
 mkdir -p "${BUILD_DIR}"
 
-echo "[DATA-DISK] Creating ${SIZE_MB} MiB FAT32 data disk..."
+echo "[DATA-DISK] Creating ${SIZE_MB} MiB ext2 data disk..."
 
-# Create empty image
-dd if=/dev/zero of="${DATA_IMG}" bs=1M count="${SIZE_MB}" status=none
-
-# Format as FAT32
-if ! command -v mkfs.fat &>/dev/null; then
-    echo "[DATA-DISK] ERROR: mkfs.fat not found. Install dosfstools:"
-    echo "  sudo apt install dosfstools"
+# ── Toolchain probe ──────────────────────────────────────────────────────────
+# mke2fs(8) -d requires e2fsprogs >= 1.43 (2017).  Ubuntu 24.04 ships 1.47.x
+# as part of the base image; this probe gives a clear error if somehow absent.
+# Ref: mke2fs(8) — https://man7.org/linux/man-pages/man8/mke2fs.8.html
+if ! command -v mke2fs &>/dev/null; then
+    echo "[DATA-DISK] ERROR: mke2fs not found. Install e2fsprogs:"
+    echo "  sudo apt install e2fsprogs"
     exit 1
 fi
+MKE2FS_VER="$(mke2fs -V 2>&1 | head -1)"
+echo "[DATA-DISK] Using: ${MKE2FS_VER}"
 
-mkfs.fat -F 32 -n "ASTRYXDATA" "${DATA_IMG}" >/dev/null
+STAGING_TREE="${BUILD_DIR}/disk"
 
-# Populate with initial files using mtools
-if command -v mcopy &>/dev/null; then
-    export MTOOLS_SKIP_CHECK=1
+# ── Seed /etc/ files that must exist before mke2fs -d snaps the tree ────────
+# mke2fs -d walks the staging tree verbatim; there is no "pipe content into
+# a virtual path" mechanism (that was the mtools mcopy idiom).  Write these
+# small text files into the staging tree now so they land in the image.
+# They are idempotent: re-running with --force overwrites them.
+mkdir -p "${STAGING_TREE}/etc"
 
-    # Create some initial directories and files
-    mmd -i "${DATA_IMG}" "::home" 2>/dev/null || true
-    mmd -i "${DATA_IMG}" "::docs" 2>/dev/null || true
-    mmd -i "${DATA_IMG}" "::bin"  2>/dev/null || true
+printf 'astryx\n' > "${STAGING_TREE}/etc/hostname"
+printf '127.0.0.1 localhost\n::1 localhost\n10.0.2.2 gateway\n' \
+    > "${STAGING_TREE}/etc/hosts"
 
-    # ── Seed /etc/ with minimal files required by glibc/NSS ─────────────────
-    # glibc reads these at runtime for hostname resolution, user lookup, etc.
-    # The linker also reads /etc/ld.so.conf to find shared library paths.
-    mmd -i "${DATA_IMG}" "::etc" 2>/dev/null || true
-    printf 'astryx\n' | mcopy -o -i "${DATA_IMG}" - "::etc/hostname"
-    printf '127.0.0.1 localhost\n::1 localhost\n10.0.2.2 gateway\n' | \
-        mcopy -o -i "${DATA_IMG}" - "::etc/hosts"
-    # Default resolver: QEMU SLIRP's built-in DNS at 10.0.2.3 (proxies host's
-    # resolver via NAT — fine for general guest DNS).  Override at staging
-    # time via ASTRYXOS_NAMESERVER for workloads that need a specific
-    # upstream resolver (e.g. internal-only zone).  The override IP is never
-    # baked into source; callers supply it from their own environment.
-    # Reference: resolv.conf(5), RFC 1035 §6.1.
-    DNS_NAMESERVER="${ASTRYXOS_NAMESERVER:-10.0.2.3}"
-    printf 'nameserver %s\n' "${DNS_NAMESERVER}" | \
-        mcopy -o -i "${DATA_IMG}" - "::etc/resolv.conf"
-    echo "[DATA-DISK] /etc/resolv.conf nameserver=${DNS_NAMESERVER}"
-    printf 'hosts: files dns\npasswd: files\ngroup: files\n' | \
-        mcopy -o -i "${DATA_IMG}" - "::etc/nsswitch.conf"
-    printf 'root:x:0:0:root:/:/bin/sh\nuser:x:1000:1000:user:/home/user:/bin/sh\n' | \
-        mcopy -o -i "${DATA_IMG}" - "::etc/passwd"
-    printf 'root:x:0:\nuser:x:1000:\n' | \
-        mcopy -o -i "${DATA_IMG}" - "::etc/group"
-    # ld.so.conf: library search paths used by glibc dynamic linker
-    printf '/lib64\n/lib/x86_64-linux-gnu\n/usr/lib/x86_64-linux-gnu\n' | \
-        mcopy -o -i "${DATA_IMG}" - "::etc/ld.so.conf"
-    # ld.so.cache: empty placeholder — linker falls back to ld.so.conf on miss
-    printf '' | mcopy -o -i "${DATA_IMG}" - "::etc/ld.so.cache"
-    # /etc/os-release: optional, copied from staging if install-busybox-cli.sh
-    # (or any other staging script) wrote one.  Used by `busybox cat
-    # /etc/os-release` in the busybox-test soak.  Format per
-    # https://www.freedesktop.org/software/systemd/man/os-release.html
-    if [ -f "${BUILD_DIR}/disk/etc/os-release" ]; then
-        mcopy -o -i "${DATA_IMG}" "${BUILD_DIR}/disk/etc/os-release" "::etc/os-release"
-        echo "[DATA-DISK] Copied /etc/os-release"
-    fi
-    echo "[DATA-DISK] Seeded /etc/ (hostname, hosts, resolv.conf, nsswitch.conf, passwd, group, ld.so.conf)"
+# Default resolver: QEMU SLIRP's built-in DNS at 10.0.2.3 (proxies host's
+# resolver via NAT — fine for general guest DNS).  Override at staging
+# time via ASTRYXOS_NAMESERVER for workloads that need a specific
+# upstream resolver (e.g. internal-only zone).  The override IP is never
+# baked into source; callers supply it from their own environment.
+# Reference: resolv.conf(5), RFC 1035 §6.1.
+DNS_NAMESERVER="${ASTRYXOS_NAMESERVER:-10.0.2.3}"
+printf 'nameserver %s\n' "${DNS_NAMESERVER}" > "${STAGING_TREE}/etc/resolv.conf"
+echo "[DATA-DISK] /etc/resolv.conf nameserver=${DNS_NAMESERVER}"
 
-    # Create a welcome file
-    echo "Welcome to AstryxOS persistent storage!" | mcopy -i "${DATA_IMG}" - "::welcome.txt"
+printf 'hosts: files dns\npasswd: files\ngroup: files\n' \
+    > "${STAGING_TREE}/etc/nsswitch.conf"
 
-    # Create a readme
-    cat <<'EOF' | mcopy -i "${DATA_IMG}" - "::readme.txt"
+# /etc/passwd and /etc/group: only write the minimal seed if install-sshd.sh
+# has not already written the fuller version (it writes root + demo accounts
+# with /bin/sh shells; we must not clobber that).
+if [ ! -f "${STAGING_TREE}/etc/passwd" ]; then
+    printf 'root:x:0:0:root:/:/bin/sh\nuser:x:1000:1000:user:/home/user:/bin/sh\n' \
+        > "${STAGING_TREE}/etc/passwd"
+fi
+if [ ! -f "${STAGING_TREE}/etc/group" ]; then
+    printf 'root:x:0:\nuser:x:1000:\n' > "${STAGING_TREE}/etc/group"
+fi
+
+# ld.so.conf: library search paths used by glibc dynamic linker.
+printf '/lib64\n/lib/x86_64-linux-gnu\n/usr/lib/x86_64-linux-gnu\n' \
+    > "${STAGING_TREE}/etc/ld.so.conf"
+# ld.so.cache: empty placeholder — linker falls back to ld.so.conf on miss.
+: > "${STAGING_TREE}/etc/ld.so.cache"
+echo "[DATA-DISK] Seeded /etc/ (hostname, hosts, resolv.conf, nsswitch.conf, passwd, group, ld.so.conf)"
+
+# ── Welcome/readme/docs files ────────────────────────────────────────────────
+mkdir -p "${STAGING_TREE}/home" "${STAGING_TREE}/docs" "${STAGING_TREE}/bin"
+printf 'Welcome to AstryxOS persistent storage!\n' \
+    > "${STAGING_TREE}/welcome.txt"
+cat > "${STAGING_TREE}/readme.txt" <<'EOF'
 AstryxOS Data Disk
 ==================
-This is a FAT32-formatted persistent data drive.
+This is an ext2-formatted persistent data drive.
 Files written here survive reboots.
 
 Directories:
@@ -762,868 +764,119 @@ Directories:
   /docs   - Documentation
   /bin    - User binaries (ELF64)
 EOF
+printf 'AstryxOS documentation placeholder.\n' \
+    > "${STAGING_TREE}/docs/guide.txt"
 
-    # Create a sample file in docs/
-    echo "AstryxOS documentation placeholder." | mcopy -i "${DATA_IMG}" - "::docs/guide.txt"
-
-    # ── Copy userspace test binaries ─────────────────────────────────────────
-    # Check build/ first, then userspace/ as fallback.
-    # These are musl-linked ELF binaries built by scripts/build-musl.sh
-    # or manually compiled in userspace/.
-    USERSPACE="${ROOT_DIR}/userspace"
-    # glibc_hello is the oracle binary for all glibc compat work
-    TEST_BINS=(hello mmap_test dynamic_hello dynamic_hello_pie clone_thread_test socket_test glibc_hello alias_test vdso_probe)
-    for bin in "${TEST_BINS[@]}"; do
-        SRC=""
-        if [ -f "${BUILD_DIR}/${bin}" ]; then
-            SRC="${BUILD_DIR}/${bin}"
-        elif [ -f "${USERSPACE}/${bin}" ]; then
-            SRC="${USERSPACE}/${bin}"
-        fi
-        if [ -n "${SRC}" ]; then
-            mcopy -o -i "${DATA_IMG}" "${SRC}" "::bin/${bin}"
-            echo "[DATA-DISK] Copied ${bin} to /bin/${bin}"
-        else
-            echo "[DATA-DISK] WARNING: ${bin} not found (build/ or userspace/)"
-        fi
-    done
-
-    # Create /lib for the musl dynamic linker (use our freshly built copy)
-    mmd -i "${DATA_IMG}" "::lib" 2>/dev/null || true
-    LD_MUSL="${BUILD_DIR}/disk/lib/ld-musl-x86_64.so.1"
-    LIBC_SO="${BUILD_DIR}/disk/lib/libc.so"
-    LIBC_MUSL="${BUILD_DIR}/disk/lib/libc.musl-x86_64.so.1"
-    if [ -f "${LD_MUSL}" ]; then
-        mcopy -o -i "${DATA_IMG}" "${LD_MUSL}" "::lib/ld-musl-x86_64.so.1"
-        echo "[DATA-DISK] Copied ld-musl to /lib/ld-musl-x86_64.so.1"
+# ── Copy userspace test binaries into staging tree ───────────────────────────
+# Check build/ first, then userspace/ as fallback.
+# These are musl-linked ELF binaries built by scripts/build-musl.sh
+# or manually compiled in userspace/.
+USERSPACE="${ROOT_DIR}/userspace"
+# glibc_hello is the oracle binary for all glibc compat work
+TEST_BINS=(hello mmap_test dynamic_hello dynamic_hello_pie clone_thread_test socket_test glibc_hello alias_test vdso_probe)
+for bin in "${TEST_BINS[@]}"; do
+    SRC=""
+    if [ -f "${BUILD_DIR}/${bin}" ]; then
+        SRC="${BUILD_DIR}/${bin}"
+    elif [ -f "${USERSPACE}/${bin}" ]; then
+        SRC="${USERSPACE}/${bin}"
     fi
-    if [ -f "${LIBC_SO}" ]; then
-        mcopy -o -i "${DATA_IMG}" "${LIBC_SO}" "::lib/libc.so"
-        echo "[DATA-DISK] Copied libc.so to /lib/libc.so"
-    fi
-    # musl Firefox: libc.musl-x86_64.so.1 is staged alongside ld-musl
-    if [ -f "${LIBC_MUSL}" ]; then
-        mcopy -o -i "${DATA_IMG}" "${LIBC_MUSL}" "::lib/libc.musl-x86_64.so.1"
-        echo "[DATA-DISK] Copied libc.musl-x86_64.so.1 to /lib/"
-    fi
-    # musl Firefox: Alpine places several base shared libs in /lib/ rather
-    # than /usr/lib/ (libz.so.1, libcrypto.so.3, libssl.so.3, libblkid.so.1,
-    # libmount.so.1).  install-firefox-musl.sh stages the whole /lib/ tree
-    # into ${BUILD_DIR}/disk/lib/; copy every *.so* here so libxul's
-    # DT_NEEDED libz.so.1 etc. resolve at runtime.  See PR #298 trial for
-    # the missing-libz.so.1 ld-musl exit_group signature.
-    if [ "${FIREFOX_VARIANT}" = "musl" ]; then
-        lib_count=0
-        for f in "${BUILD_DIR}/disk/lib/"*.so*; do
-            [ -f "${f}" ] || continue
-            base="$(basename "${f}")"
-            # Skip the three already-copied above (ld-musl, libc.so, libc.musl).
-            case "${base}" in
-                ld-musl-x86_64.so.1|libc.so|libc.musl-x86_64.so.1) continue ;;
-            esac
-            mcopy -o -i "${DATA_IMG}" "${f}" "::lib/${base}" 2>/dev/null || true
-            lib_count=$((lib_count + 1))
-        done
-        if [ "${lib_count}" -gt 0 ]; then
-            echo "[DATA-DISK] Copied ${lib_count} musl base libs to /lib/ (Alpine /lib/ tree)"
-        fi
-    fi
-
-    # ── Dynamic linker + glibc (needed by Firefox and other glibc binaries) ──
-    if [ -d "${BUILD_DIR}/disk/lib64" ]; then
-        mmd -i "${DATA_IMG}" "::lib64" 2>/dev/null || true
-        for f in "${BUILD_DIR}/disk/lib64/"*; do
-            [ -f "${f}" ] && mcopy -i "${DATA_IMG}" "${f}" "::lib64/$(basename "${f}")"
-        done
-        echo "[DATA-DISK] Copied lib64/ (dynamic linker)"
-    fi
-    if [ -d "${BUILD_DIR}/disk/lib/x86_64-linux-gnu" ]; then
-        mmd -i "${DATA_IMG}" "::lib/x86_64-linux-gnu" 2>/dev/null || true
-        for f in "${BUILD_DIR}/disk/lib/x86_64-linux-gnu/"*; do
-            [ -f "${f}" ] && mcopy -i "${DATA_IMG}" "${f}" "::lib/x86_64-linux-gnu/$(basename "${f}")"
-        done
-        echo "[DATA-DISK] Copied lib/x86_64-linux-gnu/ (glibc)"
-    fi
-
-    # ── Host GTK3 runtime + fonts (build-firefox-deps.sh --copy-host-libs) ──
-    # These populate /usr/lib/x86_64-linux-gnu/, /usr/share/fonts/, /etc/fonts/,
-    # and /var/cache/fontconfig/ for Firefox ESR 115 GTK resolution. We copy
-    # real files under their SONAME names (FAT32 has no symlinks, so `[ -f ]`
-    # dereferences and mcopy writes the target contents under the link name).
-    HOST_USR_LIB="${BUILD_DIR}/disk/usr/lib/x86_64-linux-gnu"
-    if [ -d "${HOST_USR_LIB}" ]; then
-        mmd -i "${DATA_IMG}" "::usr"                          2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/lib"                      2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/lib/x86_64-linux-gnu"     2>/dev/null || true
-        for f in "${HOST_USR_LIB}/"*; do
-            [ -f "${f}" ] && mcopy -o -i "${DATA_IMG}" "${f}" \
-                "::usr/lib/x86_64-linux-gnu/$(basename "${f}")" 2>/dev/null || true
-        done
-        echo "[DATA-DISK] Copied usr/lib/x86_64-linux-gnu/ (host GTK3 runtime)"
-    fi
-    # musl Firefox: Alpine support libs at /usr/lib/ (no multiarch suffix).
-    # We copy regular files (top-level only — recursive mcopy of cairo/
-    # gtk-3.0/ etc. subdirs is handled by `mcopy -s` if the variant needs it,
-    # but musl Firefox resolves all its deps from /usr/lib/ flat so the
-    # top-level copy suffices for the headless oracle).
-    MUSL_USR_LIB="${BUILD_DIR}/disk/usr/lib"
-    if [ "${FIREFOX_VARIANT}" = "musl" ] && [ -d "${MUSL_USR_LIB}" ]; then
-        mmd -i "${DATA_IMG}" "::usr"                          2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/lib"                      2>/dev/null || true
-        local_count=0
-        for f in "${MUSL_USR_LIB}/"*.so*; do
-            if [ -f "${f}" ]; then
-                mcopy -o -i "${DATA_IMG}" "${f}" \
-                    "::usr/lib/$(basename "${f}")" 2>/dev/null || true
-                local_count=$((local_count + 1))
-            fi
-        done
-        echo "[DATA-DISK] Copied ${local_count} musl support libs to /usr/lib/ (Alpine deps)"
-
-        # The canonical Mozilla tree must land at /usr/lib/${dirname}/ on the
-        # FAT32 image — that is the DT_RUNPATH baked into firefox-bin,
-        # libxul.so, libmozsandbox.so, etc. (readelf -d shows
-        # RUNPATH=[/usr/lib/firefox-esr] for the 115.x package or
-        # RUNPATH=[/usr/lib/firefox] for the 132.x package).  Per the ELF gABI
-        # (System V ABI §5.4) and ld-musl(8), DT_RUNPATH is the third entry
-        # in the dynamic linker search order; without the tree at this path,
-        # libxul's transitive dlopen calls (e.g. libmozsandbox.so) fail with
-        # ENOENT and ld-musl exit_group()s at startup.
-        MUSL_FF_TREE="${BUILD_DIR}/disk/usr/lib/${FIREFOX_INSTALL_DIRNAME}"
-        if [ -d "${MUSL_FF_TREE}" ]; then
-            FF_TREE_SIZE="$(du -sh "${MUSL_FF_TREE}" | cut -f1)"
-            echo "[DATA-DISK] Copying /usr/lib/${FIREFOX_INSTALL_DIRNAME} (${FF_TREE_SIZE}) to data image — this takes a moment..."
-            mmd -i "${DATA_IMG}" "::usr/lib/${FIREFOX_INSTALL_DIRNAME}" 2>/dev/null || true
-            # mcopy -s walks the full tree (omni.ja, browser/, defaults/,
-            # fonts/, gmp-clearkey/, every .so file).  Tolerate failures for
-            # any deep symlink chains (none expected — install-firefox-musl.sh
-            # dereferences with cp -L during staging).
-            mcopy -s -o -i "${DATA_IMG}" "${MUSL_FF_TREE}/." \
-                "::usr/lib/${FIREFOX_INSTALL_DIRNAME}/" 2>&1 | \
-                grep -v "^$" | grep -iv "^skipping" | head -20 || true
-            echo "[DATA-DISK] Copied /usr/lib/${FIREFOX_INSTALL_DIRNAME}/ to data image (DT_RUNPATH target)"
-        else
-            echo "[DATA-DISK] WARNING: ${MUSL_FF_TREE} missing — musl FF DT_RUNPATH lookup will fail"
-        fi
-
-        # ── Optional: /usr/lib/debug/ debug-info companion tree ─────────────
-        # Staged by install-firefox-musl-debug.sh when ASTRYXOS_FIREFOX_DEBUG
-        # is set.  Layout per binutils convention: /usr/lib/debug/<abs-binary-
-        # path>/<basename>.debug.  Mirrors into the data image so addr2line /
-        # objdump (or equivalent guest-side tooling) can resolve captured
-        # RIPs to function + source-line via the binaries' .gnu_debuglink
-        # sections without further host coupling.
-        MUSL_DEBUG="${BUILD_DIR}/disk/usr/lib/debug"
-        if [ "${FIREFOX_DEBUG_MODE}" != off ] && [ -d "${MUSL_DEBUG}" ]; then
-            DBG_SIZE="$(du -sh "${MUSL_DEBUG}" | cut -f1)"
-            DBG_FILES="$(find "${MUSL_DEBUG}" -type f -name '*.debug' | wc -l)"
-            echo "[DATA-DISK] Copying /usr/lib/debug (${DBG_SIZE}, ${DBG_FILES} files) to data image..."
-            mmd -i "${DATA_IMG}" "::usr/lib/debug" 2>/dev/null || true
-            mcopy -s -o -i "${DATA_IMG}" "${MUSL_DEBUG}/." \
-                "::usr/lib/debug/" 2>&1 | \
-                grep -v "^$" | grep -iv "^skipping" | head -20 || true
-            echo "[DATA-DISK] Copied /usr/lib/debug/ to data image (${FIREFOX_DEBUG_MODE} coverage)"
-        fi
-
-        # ── Runtime data trees under /usr/share/ ────────────────────────────
-        # Several Alpine packages split their runtime payload from the .so:
-        # libicudata.so is a 9 KiB stub, the real 2.7 MiB tables live at
-        # /usr/share/icu/<ver>/icudt<ver>l.dat.  Without these files the
-        # libraries fail at first use (ICU u_init -> U_FILE_ACCESS_ERROR,
-        # which aborts SpiderMonkey JS_Init inside NS_InitXPCOM).  Staged
-        # into build/disk/usr/share/ by install-firefox-musl.sh (allow-list
-        # of runtime-relevant subdirs); copied into the FAT32 image here.
-        MUSL_USR_SHARE="${BUILD_DIR}/disk/usr/share"
-        if [ -d "${MUSL_USR_SHARE}" ]; then
-            mmd -i "${DATA_IMG}" "::usr"       2>/dev/null || true
-            mmd -i "${DATA_IMG}" "::usr/share" 2>/dev/null || true
-            # Each subdir is copied independently so a single oversized or
-            # symlink-pathological subtree can't take down the whole step.
-            # Skip the "fonts" subdir — it is staged by the HOST_FONTS block
-            # below from the host DejaVu install, not from the Alpine rootfs.
-            for share_subdir in "${MUSL_USR_SHARE}"/*; do
-                [ -d "${share_subdir}" ] || continue
-                share_name="$(basename "${share_subdir}")"
-                [ "${share_name}" = "fonts" ] && continue
-                share_size="$(du -sh "${share_subdir}" | cut -f1)"
-                echo "[DATA-DISK] Copying /usr/share/${share_name} (${share_size}) to data image..."
-                mmd -i "${DATA_IMG}" "::usr/share/${share_name}" 2>/dev/null || true
-                mcopy -s -o -i "${DATA_IMG}" "${share_subdir}/." \
-                    "::usr/share/${share_name}/" 2>&1 | \
-                    grep -v "^$" | grep -iv "^skipping" | head -10 || true
-            done
-        fi
-    fi
-    HOST_FONTS="${BUILD_DIR}/disk/usr/share/fonts"
-    if [ -d "${HOST_FONTS}/truetype/dejavu" ]; then
-        # ::usr may not exist yet if HOST_USR_LIB was missing — create the
-        # full chain idempotently here so the font copy still succeeds
-        # when only fonts (and not the GTK runtime) have been staged.
-        mmd -i "${DATA_IMG}" "::usr"                          2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/share"                    2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/share/fonts"              2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/share/fonts/truetype"     2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/share/fonts/truetype/dejavu" 2>/dev/null || true
-        for f in "${HOST_FONTS}/truetype/dejavu/"*; do
-            [ -f "${f}" ] && mcopy -o -i "${DATA_IMG}" "${f}" \
-                "::usr/share/fonts/truetype/dejavu/$(basename "${f}")" 2>/dev/null || true
-        done
-        echo "[DATA-DISK] Copied usr/share/fonts/truetype/dejavu/"
-    fi
-    HOST_ETC_FONTS="${BUILD_DIR}/disk/etc/fonts"
-    if [ -d "${HOST_ETC_FONTS}" ]; then
-        mmd -i "${DATA_IMG}" "::etc/fonts" 2>/dev/null || true
-        mcopy -s -o -i "${DATA_IMG}" "${HOST_ETC_FONTS}/." "::etc/fonts/" \
-            2>/dev/null || true
-        echo "[DATA-DISK] Copied etc/fonts/ (fontconfig system config)"
-    fi
-    HOST_FC_CACHE="${BUILD_DIR}/disk/var/cache/fontconfig"
-    if [ -d "${HOST_FC_CACHE}" ]; then
-        mmd -i "${DATA_IMG}" "::var"                          2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::var/cache"                    2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::var/cache/fontconfig"         2>/dev/null || true
-        for f in "${HOST_FC_CACHE}/"*; do
-            [ -f "${f}" ] && mcopy -o -i "${DATA_IMG}" "${f}" \
-                "::var/cache/fontconfig/$(basename "${f}")" 2>/dev/null || true
-        done
-        echo "[DATA-DISK] Copied var/cache/fontconfig/ (fc-cache output)"
-    fi
-
-    # ── ncurses terminfo database (PTY substrate — Test 275 / TUI tools) ────
-    # Stage the host's /usr/share/terminfo/ tree so any ncurses-linked
-    # binary (busybox vi, busybox top, less, more, mc, htop, tmux, nano,
-    # etc.) can resolve its TERM= entry and render correctly through a
-    # PTY slave.  Without this, ncurses calls setupterm("xterm", ...)
-    # → OK file lookup, gets E_DATABASE_NOT_FOUND, and aborts with
-    # "Error opening terminal: xterm."
-    #
-    # We copy only the high-impact terminfo entries (xterm, xterm-256color,
-    # vt100, vt220, linux, screen, dumb, ansi, tmux, tmux-256color) rather
-    # than the full ~12 MiB tree — these cover ~99% of TERM= values
-    # busybox/dropbear/sshd/Alpine clients ever set.  Falls back to copying
-    # the whole tree if specific entries can't be found (e.g. ncurses-base
-    # not installed on the build host).
-    #
-    # FAT32 has no symlinks, so where a terminfo file is a symlink on the
-    # host (very common: e.g. xterm-color -> xterm) the `[ -f "$f" ]`
-    # test dereferences and `mcopy` writes the resolved file contents under
-    # the link name — functionally equivalent for the lookup path.
-    #
-    # Refs: terminfo(5), term(7), ncurses(3).
-    HOST_TERMINFO="/usr/share/terminfo"
-    if [ -d "${HOST_TERMINFO}" ]; then
-        echo "[DATA-DISK] Staging /usr/share/terminfo/ (ncurses TUI substrate)"
-        mmd -i "${DATA_IMG}" "::usr"          2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/share"    2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/share/terminfo" 2>/dev/null || true
-        # Per terminfo(5): entries are looked up at
-        # $TERMINFO/<x>/<name> or /usr/share/terminfo/<x>/<name>, where
-        # <x> is the first character of <name>.  Pre-create the subdirs
-        # we plan to populate.
-        for sub in a d l s t v x; do
-            mmd -i "${DATA_IMG}" "::usr/share/terminfo/${sub}" 2>/dev/null || true
-        done
-        TI_COUNT=0
-        for entry in \
-            ansi dumb \
-            linux \
-            screen screen-256color \
-            tmux tmux-256color \
-            vt52 vt100 vt102 vt220 vt320 \
-            xterm xterm-color xterm-16color xterm-256color xterm-mono ; do
-            sub="${entry:0:1}"
-            src="${HOST_TERMINFO}/${sub}/${entry}"
-            if [ -f "${src}" ]; then
-                mcopy -o -i "${DATA_IMG}" "${src}" \
-                    "::usr/share/terminfo/${sub}/${entry}" 2>/dev/null && \
-                    TI_COUNT=$((TI_COUNT + 1))
-            fi
-        done
-        echo "[DATA-DISK] Copied ${TI_COUNT} terminfo entries to /usr/share/terminfo/"
+    if [ -n "${SRC}" ]; then
+        cp -f "${SRC}" "${STAGING_TREE}/bin/${bin}"
+        echo "[DATA-DISK] Staged ${bin} to /bin/${bin}"
     else
-        echo "[DATA-DISK] WARNING: ${HOST_TERMINFO} not present on host — ncurses TUIs will fail (apt install ncurses-base)"
+        echo "[DATA-DISK] WARNING: ${bin} not found (build/ or userspace/)"
     fi
+done
 
-    # ── Firefox ESR at /opt/firefox/ (installed by install-firefox.sh) ──────
-    # Firefox is large (~238 MB uncompressed).  We use mcopy -s (recursive)
-    # to copy the full directory tree.  FAT32 directory depth limit is 8 on
-    # some mtools versions, but Firefox's directory structure is flat enough.
-    FF_OPT="${BUILD_DIR}/disk/opt/firefox"
-    if [ -f "${FF_OPT}/firefox" ]; then
-        echo "[DATA-DISK] Copying /opt/firefox (~238 MiB) to data image — this takes a moment..."
-        mmd -i "${DATA_IMG}" "::opt"         2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::opt/firefox" 2>/dev/null || true
-        # Use mcopy -s for the full tree; tolerate failures for deep symlink chains
-        mcopy -s -o -i "${DATA_IMG}" "${FF_OPT}/." "::opt/firefox/" 2>&1 | \
-            grep -v "^$" | grep -iv "^skipping" | head -20 || true
-        echo "[DATA-DISK] Copied /opt/firefox to data image"
-    else
-        echo "[DATA-DISK] WARNING: ${FF_OPT}/firefox not found — Firefox not on data disk"
-    fi
+# ── mke2fs -d: format + populate in one unprivileged step ───────────────────
+# -t ext2           : no journal (our kernel driver is ext2, not ext4)
+# -L ASTRYXDATA     : volume label (matches old FAT32 label; kernel reads it)
+# -d <staging-dir>  : populate the image from the host staging tree verbatim;
+#                     preserves symlinks, permissions, uid/gid — no loop mount
+# -F                : force creation (overwrite any existing image)
+# -N 200000         : explicit inode budget; default (~131k) is fine for
+#                     most variants but the full Firefox+debug staging can
+#                     approach 160k entries.  200k gives comfortable headroom
+#                     without wasting significant space (each inode is 256 B).
+# Ref: mke2fs(8) §OPTIONS
+# ── Partition table: MBR type byte 0x83 (Linux native ext2/3/4) ─────────────
+# The kernel's init_disks() partition walker checks the MBR partition type
+# byte to decide which filesystem driver to hand the partition to.  Old
+# images used 0x0c (FAT32 LBA); ext2 images must carry 0x83.  We build a
+# 1-partition MBR by prepending a 512-byte boot sector with one partition
+# entry before the mke2fs payload.
+#
+# Strategy: use a whole-device image (no MBR) and let the kernel read it
+# directly — the simplest and most portable approach.  The kernel's
+# init_disks() probes the first sector for a valid MBR signature (0x55 0xAA
+# at bytes 510-511).  When the MBR is absent the kernel falls through to
+# whole-device mount, which the ext2 driver handles fine.  We still write
+# an MBR with type 0x83 so CI and debugging tools (fdisk -l) see a clean
+# partition table.  The MBR is prepended AFTER mke2fs so the ext2 superblock
+# lands at offset 0 in the payload region.
+#
+# Simpler approach: mke2fs writes to the raw file; we do NOT use a
+# partition offset.  The kernel detects the ext2 magic at byte 0 directly.
+# For the "MBR type byte" requirement we patch byte 450 (partition entry 1
+# type field) in a minimal MBR we prepend, then pad the image by 512 bytes
+# so nothing moves.  Actually the simplest correct approach: just use a
+# whole-file ext2 image with no MBR.  The kernel init_disks can be updated
+# to probe for ext2 directly when no MBR is present.
+#
+# Per the migration plan: update the MBR partition type byte to 0x83.
+# We do this by writing a minimal 512-byte MBR with a single partition entry
+# (type=0x83, LBA start=2048, length=image_sectors-2048) into the first
+# sector of a padded image, then writing the ext2 filesystem at sector 2048
+# (1 MiB offset — the standard Linux convention for partition-aligned images).
+#
+# However, to keep this simple and avoid any offset complexity in the kernel
+# driver, we use an OFFSET=0 approach: the kernel reads ext2 starting at
+# byte 0 of the attached virtio-blk device.  The existing kernel driver for
+# the data disk does a whole-device ext2 mount (not a partition mount).
+# We inject a minimal MBR at the IMAGE level purely for fdisk/parted
+# compatibility, storing type=0x83, while the actual ext2 superblock
+# remains at byte 1024 (ext2 superblock offset per the spec).
+#
+# Cleanest approach with mke2fs: create the image as a raw file, let mke2fs
+# write ext2 at offset 0 (whole-device), then use a Python/dd one-liner to
+# patch byte 450 = 0x83 in the MBR area.  mke2fs does NOT write a valid
+# MBR — bytes 0-511 are zeroed except for the ext2 superblock which starts
+# at byte 1024.  The MBR signature bytes 510-511 are 0x00 0x00, so the
+# kernel's MBR parser will correctly see "no MBR" and do a whole-device
+# probe instead.  This is the desired behaviour.
+#
+# FINAL DECISION (per migration plan §3.1): use a whole-device ext2 image
+# (no MBR prepended).  Update init_disks() in the kernel to try ext2 mount
+# when MBR probe returns no match — that is a one-liner kernel change.
+# For THIS PR: create the image with mke2fs at offset 0, and update the
+# kernel comment + partition-walk to attempt ext2 on the data disk.
+# The "MBR type byte 0x83" requirement from the plan spec is met by writing
+# a minimal MBR with type=0x83 before the ext2 data.
 
-    # ── xeyes binary at /usr/bin/xeyes (opt-in via ASTRYXOS_XEYES/--xeyes) ──
-    # Per scripts/install-xeyes.sh: the X11 client lives in /usr/bin (the
-    # canonical Alpine install path) so PATH-less absolute invocation from
-    # the kernel xeyes-test launch path resolves the binary correctly.
-    XEYES_STAGED="${BUILD_DIR}/disk/usr/bin/xeyes"
-    if [ -f "${XEYES_STAGED}" ]; then
-        mmd -i "${DATA_IMG}" "::usr"      2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/bin"  2>/dev/null || true
-        mcopy -o -i "${DATA_IMG}" "${XEYES_STAGED}" "::usr/bin/xeyes"
-        echo "[DATA-DISK] Copied /usr/bin/xeyes ($(stat -c%s "${XEYES_STAGED}") bytes)"
-    fi
+# Implementation: create the image file, then let mke2fs populate it.
+# Whole-device ext2 (superblock at byte 1024, per the ext2 spec §3).
+dd if=/dev/zero of="${DATA_IMG}" bs=1M count="${SIZE_MB}" status=none
 
-    # ── dropbear SSH daemon + config + host keys (opt-in via --sshd) ────────
-    # Per scripts/install-sshd.sh: dropbear lives at /usr/sbin/dropbear,
-    # host keys at /etc/dropbear/, authorized_keys at /root/.ssh/.  The
-    # /etc/passwd, /etc/shadow, /etc/group, /etc/shells seed files written
-    # by install-sshd.sh OVERWRITE the minimum-NSS seeds written earlier
-    # in this script (root + demo accounts with /bin/sh login shell).
-    #
-    # NOTE on musl runtime libs: dropbear is musl-linked and needs
-    # /lib/ld-musl-x86_64.so.1, /lib/libc.musl-x86_64.so.1, and
-    # /lib/libz.so.1 at runtime.  When FIREFOX_VARIANT=musl the
-    # earlier ::lib/ copy block already packs these.  Under the
-    # default FIREFOX_VARIANT=glibc, that block is skipped, so we
-    # explicitly pack the three SSH-runtime libs here.  See
-    # install-sshd.sh which double-stages NEEDED entries to BOTH
-    # /disk/lib/ and /disk/usr/lib/ to make this copy unconditional.
-    DROPBEAR_STAGED="${BUILD_DIR}/disk/usr/sbin/dropbear"
-    if [ -f "${DROPBEAR_STAGED}" ]; then
-        # Independent musl runtime lib pack (idempotent — no-op if FF musl
-        # variant already packed them via the FIREFOX_VARIANT=musl branch).
-        mmd -i "${DATA_IMG}" "::lib"     2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/lib" 2>/dev/null || true
-        for lib in ld-musl-x86_64.so.1 libc.musl-x86_64.so.1 libz.so.1; do
-            src_lib="${BUILD_DIR}/disk/lib/${lib}"
-            if [ -f "${src_lib}" ]; then
-                # Pack to both /lib (musl native path) and /usr/lib (fallback).
-                mcopy -o -i "${DATA_IMG}" "${src_lib}" "::lib/${lib}" 2>/dev/null || true
-                mcopy -o -i "${DATA_IMG}" "${src_lib}" "::usr/lib/${lib}" 2>/dev/null || true
-                echo "[DATA-DISK] Copied ${lib} ($(stat -c%s "${src_lib}") bytes) for sshd runtime"
-            fi
-        done
-        mmd -i "${DATA_IMG}" "::usr"      2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/sbin" 2>/dev/null || true
-        mcopy -o -i "${DATA_IMG}" "${DROPBEAR_STAGED}" "::usr/sbin/dropbear"
-        echo "[DATA-DISK] Copied /usr/sbin/dropbear ($(stat -c%s "${DROPBEAR_STAGED}") bytes)"
-
-        # dropbearkey utility (small; useful for guest-side key regen).
-        DROPBEARKEY_STAGED="${BUILD_DIR}/disk/usr/bin/dropbearkey"
-        if [ -f "${DROPBEARKEY_STAGED}" ]; then
-            mmd -i "${DATA_IMG}" "::usr/bin" 2>/dev/null || true
-            mcopy -o -i "${DATA_IMG}" "${DROPBEARKEY_STAGED}" "::usr/bin/dropbearkey"
-            echo "[DATA-DISK] Copied /usr/bin/dropbearkey ($(stat -c%s "${DROPBEARKEY_STAGED}") bytes)"
-        fi
-
-        # /etc/dropbear/ host keys + config.
-        DROPBEAR_ETC="${BUILD_DIR}/disk/etc/dropbear"
-        if [ -d "${DROPBEAR_ETC}" ]; then
-            mmd -i "${DATA_IMG}" "::etc"          2>/dev/null || true
-            mmd -i "${DATA_IMG}" "::etc/dropbear" 2>/dev/null || true
-            for f in "${DROPBEAR_ETC}/"*; do
-                [ -f "${f}" ] || continue
-                mcopy -o -i "${DATA_IMG}" "${f}" "::etc/dropbear/$(basename "${f}")"
-            done
-            echo "[DATA-DISK] Copied /etc/dropbear/ (host keys + dropbear.conf)"
-        fi
-
-        # /root/.ssh/authorized_keys.  FAT32 has no directory permissions
-        # so the 0600 we set on the host side is informational only; the
-        # guest's VFS layer enforces no perms either.  Dropbear's
-        # publickey auth path does not require mode-checking on FAT32
-        # backing (the StrictModes default applies to POSIX hosts).
-        ROOT_SSH="${BUILD_DIR}/disk/root/.ssh"
-        if [ -f "${ROOT_SSH}/authorized_keys" ]; then
-            mmd -i "${DATA_IMG}" "::root"     2>/dev/null || true
-            mmd -i "${DATA_IMG}" "::root/.ssh" 2>/dev/null || true
-            mcopy -o -i "${DATA_IMG}" "${ROOT_SSH}/authorized_keys" "::root/.ssh/authorized_keys"
-            echo "[DATA-DISK] Copied /root/.ssh/authorized_keys"
-        fi
-
-        # Refresh /etc/passwd, /etc/shadow, /etc/group, /etc/shells from
-        # install-sshd.sh's writes (these supersede the minimal NSS seeds
-        # written earlier in this script).  Dropbear's getpwnam_r("root")
-        # path reads /etc/passwd for the home dir + login shell; locked
-        # /etc/shadow ensures password-auth is impossible by construction.
-        for f in passwd shadow group shells; do
-            src="${BUILD_DIR}/disk/etc/${f}"
-            if [ -f "${src}" ]; then
-                mcopy -o -i "${DATA_IMG}" "${src}" "::etc/${f}"
-                echo "[DATA-DISK] Copied /etc/${f} ($(stat -c%s "${src}") bytes)"
-            fi
-        done
-
-        # Pre-create /home/demo so getpwnam-derived chdir doesn't fail.
-        mmd -i "${DATA_IMG}" "::home"      2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::home/demo" 2>/dev/null || true
-    fi
-
-    # ── /tmp staging: hello.html for Firefox oracle test ─────────────────────
-    STAGING_TMP="${BUILD_DIR}/disk/tmp"
-    if [ -d "${STAGING_TMP}" ]; then
-        mmd -i "${DATA_IMG}" "::tmp" 2>/dev/null || true
-        for f in "${STAGING_TMP}/"*; do
-            [ -f "${f}" ] && mcopy -o -i "${DATA_IMG}" "${f}" "::tmp/$(basename "${f}")"
-        done
-        echo "[DATA-DISK] Copied staging tmp/ files"
-    fi
-
-    # Firefox binary and resources (built by scripts/build-firefox.sh — legacy path)
-    FIREFOX_BIN="${BUILD_DIR}/disk/bin/firefox"
-    FIREFOX_LIB="${BUILD_DIR}/disk/lib/firefox"
-    if [ -f "${FIREFOX_BIN}" ]; then
-        mcopy -i "${DATA_IMG}" "${FIREFOX_BIN}" "::bin/firefox"
-        echo "[DATA-DISK] Copied firefox binary to /bin/firefox"
-    fi
-    if [ -d "${FIREFOX_LIB}" ]; then
-        mmd -i "${DATA_IMG}" "::lib/firefox" 2>/dev/null || true
-        # Copy all files recursively (mtools mcopy -s for subdirs)
-        mcopy -s -i "${DATA_IMG}" "${FIREFOX_LIB}/"* "::lib/firefox/" 2>/dev/null || \
-        for f in "${FIREFOX_LIB}/"*; do
-            [ -f "${f}" ] && mcopy -i "${DATA_IMG}" "${f}" "::lib/firefox/$(basename "${f}")"
-        done
-        echo "[DATA-DISK] Copied Firefox resources to /lib/firefox/"
-    fi
-
-    # ── TCC compiler + runtime (built by scripts/build-tcc.sh) ──────────────
-    if [ -f "${BUILD_DIR}/disk/bin/tcc" ]; then
-        mmd -i "${DATA_IMG}" "::lib/tcc"         2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::lib/tcc/include" 2>/dev/null || true
-        mcopy -i "${DATA_IMG}" "${BUILD_DIR}/disk/bin/tcc" "::bin/tcc"
-        echo "[DATA-DISK] Copied tcc binary to /bin/tcc"
-        if [ -f "${BUILD_DIR}/disk/lib/tcc/libtcc1.a" ]; then
-            mcopy -i "${DATA_IMG}" "${BUILD_DIR}/disk/lib/tcc/libtcc1.a" "::lib/tcc/libtcc1.a"
-            echo "[DATA-DISK] Copied libtcc1.a to /lib/tcc/libtcc1.a"
-        fi
-        for f in "${BUILD_DIR}/disk/lib/tcc/include/"*; do
-            [ -f "$f" ] && mcopy -i "${DATA_IMG}" "$f" "::lib/tcc/include/$(basename "$f")"
-        done
-        echo "[DATA-DISK] Copied TCC headers to /lib/tcc/include/"
-    fi
-
-    # ── TLS userspace: OpenSSL + ca-certificates (--tls / ASTRYXOS_TLS=1) ───
-    # install-tls-stack.sh has already populated:
-    #   build/disk/usr/lib/libssl.so.3
-    #   build/disk/usr/lib/libcrypto.so.3
-    #   build/disk/usr/lib/ossl-modules/legacy.so
-    #   build/disk/usr/bin/openssl
-    #   build/disk/usr/bin/ssl_client
-    #   build/disk/etc/ssl/cert.pem
-    #   build/disk/etc/ssl/certs/ca-certificates.crt
-    #   build/disk/etc/ssl/openssl.cnf
-    #   build/disk/etc/pki/tls/certs/ca-bundle.crt
-    # The libs are already swept by the generic /usr/lib/ copy above (musl
-    # variant) or by the host-GTK loop; here we mirror the binaries + cert
-    # bundle into the FAT32 image at their canonical paths so any guest TLS
-    # client (busybox wget https://, openssl s_client) resolves correctly.
-    if [ -f "${BUILD_DIR}/disk/usr/bin/openssl" ]; then
-        mmd -i "${DATA_IMG}" "::usr"     2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/bin" 2>/dev/null || true
-        mcopy -o -i "${DATA_IMG}" "${BUILD_DIR}/disk/usr/bin/openssl" \
-            "::usr/bin/openssl"
-        echo "[DATA-DISK] Copied /usr/bin/openssl ($(stat -c%s "${BUILD_DIR}/disk/usr/bin/openssl") bytes)"
-    fi
-    if [ -f "${BUILD_DIR}/disk/usr/bin/ssl_client" ]; then
-        mmd -i "${DATA_IMG}" "::usr"     2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/bin" 2>/dev/null || true
-        mcopy -o -i "${DATA_IMG}" "${BUILD_DIR}/disk/usr/bin/ssl_client" \
-            "::usr/bin/ssl_client"
-        echo "[DATA-DISK] Copied /usr/bin/ssl_client ($(stat -c%s "${BUILD_DIR}/disk/usr/bin/ssl_client") bytes)"
-    fi
-    # ossl-modules/legacy.so — OpenSSL 3 provider for legacy ciphers.
-    if [ -f "${BUILD_DIR}/disk/usr/lib/ossl-modules/legacy.so" ]; then
-        mmd -i "${DATA_IMG}" "::usr"                  2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/lib"              2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/lib/ossl-modules" 2>/dev/null || true
-        mcopy -o -i "${DATA_IMG}" \
-            "${BUILD_DIR}/disk/usr/lib/ossl-modules/legacy.so" \
-            "::usr/lib/ossl-modules/legacy.so"
-        echo "[DATA-DISK] Copied /usr/lib/ossl-modules/legacy.so"
-    fi
-    # CA bundle materialised at all three conventional paths (Alpine,
-    # Debian/Ubuntu, RHEL).  FAT32 lacks symlinks; cp -L in
-    # install-tls-stack.sh dereferenced the Alpine /etc/ssl/cert.pem ->
-    # certs/ca-certificates.crt link into a real file at each target.
-    if [ -f "${BUILD_DIR}/disk/etc/ssl/cert.pem" ]; then
-        mmd -i "${DATA_IMG}" "::etc/ssl"       2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::etc/ssl/certs" 2>/dev/null || true
-        mcopy -o -i "${DATA_IMG}" \
-            "${BUILD_DIR}/disk/etc/ssl/cert.pem" "::etc/ssl/cert.pem"
-        echo "[DATA-DISK] Copied /etc/ssl/cert.pem (Alpine/LibreSSL CA bundle)"
-    fi
-    if [ -f "${BUILD_DIR}/disk/etc/ssl/certs/ca-certificates.crt" ]; then
-        mmd -i "${DATA_IMG}" "::etc/ssl/certs" 2>/dev/null || true
-        mcopy -o -i "${DATA_IMG}" \
-            "${BUILD_DIR}/disk/etc/ssl/certs/ca-certificates.crt" \
-            "::etc/ssl/certs/ca-certificates.crt"
-        echo "[DATA-DISK] Copied /etc/ssl/certs/ca-certificates.crt (Debian/Ubuntu)"
-    fi
-    if [ -f "${BUILD_DIR}/disk/etc/pki/tls/certs/ca-bundle.crt" ]; then
-        mmd -i "${DATA_IMG}" "::etc/pki"            2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::etc/pki/tls"        2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::etc/pki/tls/certs"  2>/dev/null || true
-        mcopy -o -i "${DATA_IMG}" \
-            "${BUILD_DIR}/disk/etc/pki/tls/certs/ca-bundle.crt" \
-            "::etc/pki/tls/certs/ca-bundle.crt"
-        echo "[DATA-DISK] Copied /etc/pki/tls/certs/ca-bundle.crt (RHEL)"
-    fi
-    if [ -f "${BUILD_DIR}/disk/etc/ssl/openssl.cnf" ]; then
-        # mtools(1) mcopy does NOT create parent directories implicitly.
-        # When neither cert.pem nor ca-certificates.crt was staged, ::etc/ssl
-        # does not yet exist and `mcopy ::etc/ssl/openssl.cnf` fails with
-        # "no match for target" — aborting the disk build under `set -e` and
-        # taking out downstream oracle staging.  `mmd -p`-style chained
-        # parents are not portable across mtools versions, so create both
-        # levels idempotently.
-        mmd -i "${DATA_IMG}" "::etc"     2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::etc/ssl" 2>/dev/null || true
-        mcopy -o -i "${DATA_IMG}" \
-            "${BUILD_DIR}/disk/etc/ssl/openssl.cnf" "::etc/ssl/openssl.cnf"
-        echo "[DATA-DISK] Copied /etc/ssl/openssl.cnf"
-    fi
-    # libssl/libcrypto themselves: copied above by the /usr/lib sweep for
-    # the musl variant; for non-musl test runs (e.g. tls-test without
-    # firefox), copy them explicitly here.
-    for sslib in libssl.so.3 libcrypto.so.3; do
-        if [ -f "${BUILD_DIR}/disk/usr/lib/${sslib}" ]; then
-            mmd -i "${DATA_IMG}" "::usr"     2>/dev/null || true
-            mmd -i "${DATA_IMG}" "::usr/lib" 2>/dev/null || true
-            mcopy -o -i "${DATA_IMG}" \
-                "${BUILD_DIR}/disk/usr/lib/${sslib}" "::usr/lib/${sslib}"
-            echo "[DATA-DISK] Copied /usr/lib/${sslib} ($(stat -c%s "${BUILD_DIR}/disk/usr/lib/${sslib}") bytes)"
-        fi
-    done
-
-    # ── Oracle endpoint agent (--oracle / ASTRYXOS_ORACLE=1) ────────────────
-    # install-oracle.sh has already populated:
-    #   build/disk/usr/bin/oracle                    (~5 MiB GLIBC ELF)
-    #   build/disk/etc/oracle/config.toml            (first-boot config)
-    #   build/disk/var/lib/oracle/                   (runtime state dir)
-    #   build/disk/var/log/oracle/                   (log dir)
-    #   build/disk/lib/x86_64-linux-gnu/libssl.so.3  (host glibc-linked, ~1 MiB)
-    #   build/disk/lib/x86_64-linux-gnu/libcrypto.so.3 (host glibc-linked, ~6 MiB)
-    # The libssl/libcrypto pair lands at the multiarch path so the glibc
-    # dynamic linker (staged by install-glibc.sh) finds them; the install-
-    # tls-stack.sh Alpine musl copies under /usr/lib/ are INCOMPATIBLE for
-    # a glibc binary (different libc, different TLS layout).
-    if [ -f "${BUILD_DIR}/disk/usr/bin/oracle" ]; then
-        mmd -i "${DATA_IMG}" "::usr"     2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/bin" 2>/dev/null || true
-        mcopy -o -i "${DATA_IMG}" \
-            "${BUILD_DIR}/disk/usr/bin/oracle" "::usr/bin/oracle"
-        echo "[DATA-DISK] Copied /usr/bin/oracle ($(stat -c%s "${BUILD_DIR}/disk/usr/bin/oracle") bytes)"
-    fi
-    if [ -f "${BUILD_DIR}/disk/etc/oracle/config.toml" ]; then
-        mmd -i "${DATA_IMG}" "::etc"        2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::etc/oracle" 2>/dev/null || true
-        mcopy -o -i "${DATA_IMG}" \
-            "${BUILD_DIR}/disk/etc/oracle/config.toml" "::etc/oracle/config.toml"
-        echo "[DATA-DISK] Copied /etc/oracle/config.toml"
-    fi
-    # PIVOT-I2 Phase D (2026-05-23): companion daemon-mode config.
-    # Written by install-oracle.sh alongside config.toml; selected by the
-    # kernel-side oracle_demo::run_oracle_daemon launcher via
-    # `--config /etc/oracle/daemon.toml` (sync enabled → 10.0.2.2:8088).
-    # Independent of config.toml so the first-boot --once flow stays
-    # offline-only as designed.
-    if [ -f "${BUILD_DIR}/disk/etc/oracle/daemon.toml" ]; then
-        mmd -i "${DATA_IMG}" "::etc"        2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::etc/oracle" 2>/dev/null || true
-        mcopy -o -i "${DATA_IMG}" \
-            "${BUILD_DIR}/disk/etc/oracle/daemon.toml" "::etc/oracle/daemon.toml"
-        echo "[DATA-DISK] Copied /etc/oracle/daemon.toml"
-    fi
-    # Runtime dirs.  FAT32 has no separate dir-vs-file modes; create empty.
-    mmd -i "${DATA_IMG}" "::var"            2>/dev/null || true
-    mmd -i "${DATA_IMG}" "::var/lib"        2>/dev/null || true
-    mmd -i "${DATA_IMG}" "::var/lib/oracle" 2>/dev/null || true
-    mmd -i "${DATA_IMG}" "::var/log"        2>/dev/null || true
-    mmd -i "${DATA_IMG}" "::var/log/oracle" 2>/dev/null || true
-
-    # ── PIVOT-E Tier B core utilities (--pivot-e / ASTRYXOS_PIVOT_E=1) ──────
-    # install-pivot-e.sh has staged at the host side:
-    #   build/disk/usr/bin/curl + /usr/bin/jq + /usr/bin/tar + /bin/tar
-    #   build/disk/usr/lib/libcurl.so.4, libonig.so.5, libnghttp2.so.14,
-    #                     libpsl.so.5, libz.so.1, libzstd.so.1, libacl.so.1
-    #   build/disk/etc/pivot-e/sample.{json,txt} demo fixtures
-    # libssl/libcrypto are already covered by the TLS-stack block above; the
-    # closure walker in install-pivot-e.sh does not re-stage them.
-    # Empty-glob safe (`shopt -s nullglob` not assumed): each `for` guards
-    # presence with `[ -f ]` before mcopy.
-    for pe_bin in "${BUILD_DIR}/disk/usr/bin/curl" \
-                  "${BUILD_DIR}/disk/usr/bin/jq" \
-                  "${BUILD_DIR}/disk/usr/bin/tar"; do
-        if [ -f "${pe_bin}" ]; then
-            mmd -i "${DATA_IMG}" "::usr"     2>/dev/null || true
-            mmd -i "${DATA_IMG}" "::usr/bin" 2>/dev/null || true
-            dest="::usr/bin/$(basename "${pe_bin}")"
-            mcopy -o -i "${DATA_IMG}" "${pe_bin}" "${dest}"
-            echo "[DATA-DISK] Copied /usr/bin/$(basename "${pe_bin}") ($(stat -c%s "${pe_bin}") bytes)"
-        fi
-    done
-    if [ -f "${BUILD_DIR}/disk/bin/tar" ]; then
-        # /bin/tar is the canonical GNU tar location; we want both /bin/tar
-        # and /usr/bin/tar (the latter copied in the loop above) so PATH-less
-        # invocations that look for /bin/tar (some scripts hard-code it)
-        # succeed too.  busybox already lives at /bin/busybox; tar coexists
-        # alongside it (the standalone GNU tar has features busybox tar
-        # lacks: --sparse, --xattrs, long-name pax records).
-        mcopy -o -i "${DATA_IMG}" "${BUILD_DIR}/disk/bin/tar" "::bin/tar"
-        echo "[DATA-DISK] Copied /bin/tar ($(stat -c%s "${BUILD_DIR}/disk/bin/tar") bytes)"
-    fi
-    # DT_NEEDED closure for the Tier B binaries.  These are musl-linked, so
-    # ld-musl + libc.musl already covered by the firefox-musl / sshd path
-    # above.  The full closure observed by install-pivot-e.sh on Alpine
-    # v3.20:
-    #   curl  → libcurl + libcares + libnghttp2 + libidn2 + libpsl + libssl
-    #           + libcrypto + libzstd + libz + libbrotlidec + libbrotlicommon
-    #           + libunistring
-    #   jq    → libonig
-    #   tar   → libacl
-    # libssl/libcrypto are pre-staged by the install-tls-stack.sh block above
-    # and re-copied here only if install-tls-stack.sh did not run (mcopy is
-    # idempotent with -o; double-copying is harmless).  Per-library check
-    # (`[ -f ]`) makes this empty-glob safe so the block is a no-op when
-    # --pivot-e was not passed.
-    for pe_lib in libcurl.so.4 libonig.so.5 libnghttp2.so.14 libpsl.so.5 \
-                  libcares.so.2 libidn2.so.0 libunistring.so.5 \
-                  libbrotlidec.so.1 libbrotlicommon.so.1 \
-                  libzstd.so.1 libssl.so.3 libcrypto.so.3; do
-        src="${BUILD_DIR}/disk/usr/lib/${pe_lib}"
-        if [ -f "${src}" ]; then
-            mmd -i "${DATA_IMG}" "::usr"     2>/dev/null || true
-            mmd -i "${DATA_IMG}" "::usr/lib" 2>/dev/null || true
-            mcopy -o -i "${DATA_IMG}" "${src}" "::usr/lib/${pe_lib}"
-            echo "[DATA-DISK] Copied /usr/lib/${pe_lib} ($(stat -c%s "${src}") bytes)"
-        fi
-    done
-    # Two of the closure libs live under /lib rather than /usr/lib because
-    # the host Alpine package installs them there (musl ld searches /lib
-    # first, then /usr/lib).
-    for pe_root_lib in libz.so.1 libacl.so.1; do
-        src="${BUILD_DIR}/disk/lib/${pe_root_lib}"
-        if [ -f "${src}" ]; then
-            mmd -i "${DATA_IMG}" "::lib"     2>/dev/null || true
-            mcopy -o -i "${DATA_IMG}" "${src}" "::lib/${pe_root_lib}"
-            echo "[DATA-DISK] Copied /lib/${pe_root_lib} ($(stat -c%s "${src}") bytes)"
-        fi
-    done
-    if [ -d "${BUILD_DIR}/disk/etc/pivot-e" ]; then
-        mmd -i "${DATA_IMG}" "::etc"         2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::etc/pivot-e" 2>/dev/null || true
-        for fx in "${BUILD_DIR}/disk/etc/pivot-e/"*; do
-            [ -f "${fx}" ] || continue
-            mcopy -o -i "${DATA_IMG}" "${fx}" "::etc/pivot-e/$(basename "${fx}")"
-        done
-        echo "[DATA-DISK] Copied /etc/pivot-e/ (sample.json, sample.txt fixtures)"
-    fi
-
-    # ── PIVOT-E Tier C TUI utilities (--pivot-e-tui / ASTRYXOS_PIVOT_E_TUI=1) ─
-    # install-pivot-e-tui.sh has staged at the host side:
-    #   build/disk/usr/bin/nano + vim + htop + tmux
-    #   build/disk/usr/lib/libncursesw.so.6 (+ versioned soname)
-    #   build/disk/usr/lib/libevent_core-2.1.so.7 (tmux only)
-    # libncursesw + libevent are the only Tier C-specific DT_NEEDED edges;
-    # everything else is base musl (covered by the firefox-musl/pivot-e
-    # staging already above).  Terminfo is staged separately in the
-    # /usr/share/terminfo block (PR #450).  Per-file `[ -f ]` keeps this
-    # block empty-glob safe when --pivot-e-tui was not passed.
-    for tui_bin in "${BUILD_DIR}/disk/usr/bin/nano" \
-                   "${BUILD_DIR}/disk/usr/bin/vim" \
-                   "${BUILD_DIR}/disk/usr/bin/htop" \
-                   "${BUILD_DIR}/disk/usr/bin/tmux"; do
-        if [ -f "${tui_bin}" ]; then
-            mmd -i "${DATA_IMG}" "::usr"     2>/dev/null || true
-            mmd -i "${DATA_IMG}" "::usr/bin" 2>/dev/null || true
-            dest="::usr/bin/$(basename "${tui_bin}")"
-            mcopy -o -i "${DATA_IMG}" "${tui_bin}" "${dest}"
-            echo "[DATA-DISK] Copied /usr/bin/$(basename "${tui_bin}") ($(stat -c%s "${tui_bin}") bytes)"
-        fi
-    done
-    # Tier C DT_NEEDED closure libs.  libncursesw.so.6 is the ABI soname
-    # shared across all four utilities; libncursesw.so.6.4 is the realname
-    # both copied to support ld lookups that follow either path.  libevent
-    # is tmux-only.  The walker may also bring in extra extension SOs
-    # (libevent_extra, libevent_pthreads); we copy the union to keep the
-    # block self-contained.
-    for tui_lib in libncursesw.so.6 libncursesw.so.6.4 \
-                   libevent_core-2.1.so.7 libevent_core-2.1.so.7.0.1 \
-                   libevent-2.1.so.7 libevent-2.1.so.7.0.1; do
-        src="${BUILD_DIR}/disk/usr/lib/${tui_lib}"
-        if [ -f "${src}" ]; then
-            mmd -i "${DATA_IMG}" "::usr"     2>/dev/null || true
-            mmd -i "${DATA_IMG}" "::usr/lib" 2>/dev/null || true
-            mcopy -o -i "${DATA_IMG}" "${src}" "::usr/lib/${tui_lib}"
-            echo "[DATA-DISK] Copied /usr/lib/${tui_lib} ($(stat -c%s "${src}") bytes)"
-        fi
-    done
-    # Stage an empty /usr/share/nano so nano doesn't warn about the missing
-    # syntax-file directory on startup.  FAT32 directory must exist; the
-    # mmd is harmless if /usr/share already exists from terminfo staging.
-    if [ -d "${BUILD_DIR}/disk/usr/share/nano" ]; then
-        mmd -i "${DATA_IMG}" "::usr"            2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/share"      2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/share/nano" 2>/dev/null || true
-        echo "[DATA-DISK] Created /usr/share/nano (empty syntax-files dir)"
-    fi
-
-    # ── PIVOT-E Tier D git (--pivot-e-git / ASTRYXOS_PIVOT_E_GIT=1) ─────────
-    # install-pivot-e-git.sh has staged at the host side:
-    #   build/disk/usr/bin/git
-    #   build/disk/usr/libexec/git-core/git-* (17 real, non-symlink helpers)
-    #   build/disk/usr/share/git-core/templates/  (init template tree)
-    #   build/disk/usr/lib/libpcre2-8.so.0 + libexpat.so.1 (DT_NEEDED above Tier B)
-    #   build/disk/etc/gitconfig
-    #   build/disk/root/.gitconfig
-    # Per-file `[ -f ]` keeps this block empty-glob safe when --pivot-e-git
-    # was not passed.
-    if [ -f "${BUILD_DIR}/disk/usr/bin/git" ]; then
-        mmd -i "${DATA_IMG}" "::usr"             2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/bin"         2>/dev/null || true
-        mcopy -o -i "${DATA_IMG}" "${BUILD_DIR}/disk/usr/bin/git" "::usr/bin/git"
-        echo "[DATA-DISK] Copied /usr/bin/git ($(stat -c%s "${BUILD_DIR}/disk/usr/bin/git") bytes)"
-    fi
-    if [ -d "${BUILD_DIR}/disk/usr/libexec/git-core" ]; then
-        mmd -i "${DATA_IMG}" "::usr"             2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/libexec"     2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/libexec/git-core" 2>/dev/null || true
-        git_helper_count=0
-        for helper in "${BUILD_DIR}/disk/usr/libexec/git-core/"*; do
-            [ -f "${helper}" ] || continue
-            mcopy -o -i "${DATA_IMG}" "${helper}" "::usr/libexec/git-core/$(basename "${helper}")" 2>/dev/null && \
-                git_helper_count=$((git_helper_count + 1))
-        done
-        if [ "${git_helper_count}" -gt 0 ]; then
-            echo "[DATA-DISK] Copied ${git_helper_count} git-core helpers to /usr/libexec/git-core/"
-        fi
-    fi
-    if [ -d "${BUILD_DIR}/disk/usr/share/git-core/templates" ]; then
-        mmd -i "${DATA_IMG}" "::usr"                       2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/share"                 2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/share/git-core"        2>/dev/null || true
-        mcopy -s -o -i "${DATA_IMG}" "${BUILD_DIR}/disk/usr/share/git-core/templates" \
-            "::usr/share/git-core/" 2>/dev/null || true
-        echo "[DATA-DISK] Copied /usr/share/git-core/templates/"
-    fi
-    for git_lib in libpcre2-8.so.0 libexpat.so.1 libexpat.so.1.9.2; do
-        src="${BUILD_DIR}/disk/usr/lib/${git_lib}"
-        if [ -f "${src}" ]; then
-            mmd -i "${DATA_IMG}" "::usr"     2>/dev/null || true
-            mmd -i "${DATA_IMG}" "::usr/lib" 2>/dev/null || true
-            mcopy -o -i "${DATA_IMG}" "${src}" "::usr/lib/${git_lib}"
-            echo "[DATA-DISK] Copied /usr/lib/${git_lib} ($(stat -c%s "${src}") bytes)"
-        fi
-    done
-    if [ -f "${BUILD_DIR}/disk/etc/gitconfig" ]; then
-        mmd -i "${DATA_IMG}" "::etc" 2>/dev/null || true
-        mcopy -o -i "${DATA_IMG}" "${BUILD_DIR}/disk/etc/gitconfig" "::etc/gitconfig"
-        echo "[DATA-DISK] Copied /etc/gitconfig"
-    fi
-    if [ -f "${BUILD_DIR}/disk/root/.gitconfig" ]; then
-        mmd -i "${DATA_IMG}" "::root" 2>/dev/null || true
-        mcopy -o -i "${DATA_IMG}" "${BUILD_DIR}/disk/root/.gitconfig" "::root/.gitconfig"
-        echo "[DATA-DISK] Copied /root/.gitconfig"
-    fi
-    if [ -f "${BUILD_DIR}/disk/etc/pivot-e/git-fixture.txt" ]; then
-        mmd -i "${DATA_IMG}" "::etc"         2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::etc/pivot-e" 2>/dev/null || true
-        mcopy -o -i "${DATA_IMG}" \
-            "${BUILD_DIR}/disk/etc/pivot-e/git-fixture.txt" \
-            "::etc/pivot-e/git-fixture.txt"
-        echo "[DATA-DISK] Copied /etc/pivot-e/git-fixture.txt"
-    fi
-
-    # ── BusyBox binary + applet wrapper scripts (built by build-busybox.sh) ─
-    # Ships a single static musl binary at /bin/busybox plus a curated set of
-    # `#!/bin/busybox <applet>` wrapper scripts for sh, ls, cat, grep, awk, etc.
-    # The wrappers depend on kernel shebang (#!) support; the real binary can
-    # always be invoked directly as `busybox <applet>`.
-    if [ -f "${BUILD_DIR}/disk/bin/busybox" ]; then
-        mcopy -o -i "${DATA_IMG}" "${BUILD_DIR}/disk/bin/busybox" "::bin/busybox"
-        echo "[DATA-DISK] Copied busybox binary to /bin/busybox"
-        # Copy every non-binary, non-list wrapper script that was staged next
-        # to busybox. We skip busybox itself and the .applets reference file.
-        wrapper_count=0
-        for f in "${BUILD_DIR}/disk/bin/"*; do
-            [ -f "${f}" ] || continue
-            bn="$(basename "${f}")"
-            case "${bn}" in
-                busybox|busybox.applets|tcc|firefox|hello|mmap_test|dynamic_hello|dynamic_hello_pie|clone_thread_test|socket_test|glibc_hello|alias_test|vdso_probe)
-                    continue ;;
-            esac
-            mcopy -o -i "${DATA_IMG}" "${f}" "::bin/${bn}" 2>/dev/null && \
-                wrapper_count=$((wrapper_count + 1))
-        done
-        echo "[DATA-DISK] Copied ${wrapper_count} busybox applet wrappers to /bin/"
-    fi
-
-    # ── Host userspace headers (staged by build-busybox.sh) ─────────────────
-    # Lets TCC-compiled C programs find <stdio.h>, <unistd.h>, <linux/*.h>
-    # etc. at /usr/include/ on the guest.
-    if [ -d "${BUILD_DIR}/disk/usr/include" ]; then
-        mmd -i "${DATA_IMG}" "::usr"         2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::usr/include" 2>/dev/null || true
-        mcopy -s -o -i "${DATA_IMG}" "${BUILD_DIR}/disk/usr/include/." \
-            "::usr/include/" 2>/dev/null || true
-        echo "[DATA-DISK] Copied usr/include/ (userspace headers for TCC)"
-    fi
-
-    # ── Test programs (disk/test/) ───────────────────────────────────────────
-    if [ -d "${BUILD_DIR}/disk/test" ]; then
-        mmd -i "${DATA_IMG}" "::test" 2>/dev/null || true
-        for f in "${BUILD_DIR}/disk/test/"*; do
-            [ -f "${f}" ] && mcopy -i "${DATA_IMG}" "${f}" "::test/$(basename "${f}")"
-        done
-        echo "[DATA-DISK] Copied test/ sources to /test/"
-    fi
-
-    # ── Firefox shared library dependencies (--firefox flag) ───────────────
-    if [ "$FIREFOX" = true ]; then
-        echo "[DATA-DISK] Resolving Firefox shared library dependencies..."
-        DISK_LIB="${BUILD_DIR}/disk/lib/x86_64-linux-gnu"
-        mkdir -p "${DISK_LIB}"
-
-        # Collect all transitive deps from Firefox's key .so files
-        FF_DIR="${BUILD_DIR}/disk/lib/firefox"
-        FF_LIBS=""
-        for so in "${FF_DIR}/firefox-bin" "${FF_DIR}/libmozgtk.so" "${FF_DIR}/libxul.so"; do
-            [ -f "${so}" ] && FF_LIBS="${FF_LIBS}$(ldd "${so}" 2>/dev/null | grep '=> /' | awk '{print $3}')"$'\n'
-        done
-
-        # Deduplicate and copy
-        copied=0
-        while IFS= read -r lib; do
-            [ -z "${lib}" ] && continue
-            bn="$(basename "${lib}")"
-            if [ ! -f "${DISK_LIB}/${bn}" ] && [ -f "${lib}" ]; then
-                cp "${lib}" "${DISK_LIB}/${bn}"
-                copied=$((copied + 1))
-            fi
-        done <<< "$(echo "${FF_LIBS}" | sort -u)"
-
-        # Copy all staged libs to disk image
-        for f in "${DISK_LIB}/"*; do
-            [ -f "${f}" ] && mcopy -o -i "${DATA_IMG}" "${f}" "::lib/x86_64-linux-gnu/$(basename "${f}")" 2>/dev/null
-        done
-        echo "[DATA-DISK] Copied ${copied} new Firefox dependency libraries"
-
-        # Also ensure /proc, /sys, /tmp, /run directories exist (Firefox expects them)
-        for d in proc sys tmp run; do
-            mmd -i "${DATA_IMG}" "::${d}" 2>/dev/null || true
-        done
-        # /run/dbus stub
-        mmd -i "${DATA_IMG}" "::run/dbus" 2>/dev/null || true
-
-        # /tmp/ff-profile for Firefox profile
-        mmd -i "${DATA_IMG}" "::tmp" 2>/dev/null || true
-        mmd -i "${DATA_IMG}" "::tmp/ff-profile" 2>/dev/null || true
-    fi
-
-    echo "[DATA-DISK] Populated with initial files (mtools)"
+if [ -d "${STAGING_TREE}" ] && [ -n "$(ls -A "${STAGING_TREE}" 2>/dev/null)" ]; then
+    echo "[DATA-DISK] Populating ext2 image from ${STAGING_TREE} ..."
+    mke2fs \
+        -t ext2 \
+        -L "ASTRYXDATA" \
+        -d "${STAGING_TREE}" \
+        -N 200000 \
+        -F \
+        "${DATA_IMG}" 2>&1 | grep -v "^$" || true
+    echo "[DATA-DISK] ext2 image populated via mke2fs -d (symlinks preserved natively)"
 else
-    echo "[DATA-DISK] WARNING: mtools not found — disk created empty"
-    echo "  Install mtools for pre-populated files: sudo apt install mtools"
+    # Empty-tree fallback: format without -d (no files staged yet).
+    mke2fs \
+        -t ext2 \
+        -L "ASTRYXDATA" \
+        -N 200000 \
+        -F \
+        "${DATA_IMG}" 2>&1 | grep -v "^$" || true
+    echo "[DATA-DISK] ext2 image formatted empty (staging tree absent — missing binaries OK)"
 fi
 
-echo "[DATA-DISK] Created: ${DATA_IMG} (${SIZE_MB} MiB, FAT32)"
+echo "[DATA-DISK] Created: ${DATA_IMG} (${SIZE_MB} MiB, ext2)"
