@@ -195,6 +195,22 @@ pivot-e-test = []
 # <https://invisible-island.net/ncurses/man/ncurses.3x.html>,
 # terminfo(5) <https://invisible-island.net/ncurses/man/terminfo.5.html>.
 pivot-e-tui-test = []
+# pivot-e-git-test — PIVOT-E Tier D git demo (2026-05-24).  Verifies the
+# Alpine `git` binary staged by install-pivot-e-git.sh on top of the
+# Tier B substrate.  Runs a local-only "init / add / commit / log /
+# cat-file" smoke against /tmp/repo, with the kernel runner setting
+# GIT_EXEC_PATH=/disk/usr/bin so git's helper-exec lookup resolves to
+# the real binary (Alpine ships /usr/libexec/git-core/git as a symlink;
+# FAT32 has no symlinks).  Mutually exclusive with the other *-test cargo
+# features at the main.rs cfg-gate level (all share the BSP idle slot).
+# Requires data.img staged by `scripts/create-data-disk.sh --pivot-e-git`.
+# Public refs: git(1) <https://git-scm.com/docs/git>,
+# git-config(7) <https://git-scm.com/docs/git-config>,
+# gitrepository-layout(5)
+# <https://git-scm.com/docs/gitrepository-layout>,
+# libpcre2 <https://www.pcre.org/current/doc/html/pcre2.html>,
+# libexpat <https://libexpat.github.io/>.
+pivot-e-git-test = []
 # Opt-in for the userspace alias_test page-aliasing reproducer (Test 44b).
 # Spawns 8 worker threads via raw clone(CLONE_VM|CLONE_THREAD|CLONE_SIGHAND)
 # doing MAP_PRIVATE mmap churn; runs >100k page faults; sometimes wedges

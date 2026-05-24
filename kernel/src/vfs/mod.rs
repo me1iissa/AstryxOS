@@ -1113,7 +1113,22 @@ fn resolve_path_opts(
         return Err(VfsError::NotFound); // symlink loop
     }
 
-    let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    // Per POSIX pathname resolution (IEEE Std 1003.1 §4.13), "." (the
+    // current-directory entry) is consumed by the resolver as a no-op
+    // (it refers to the directory itself), and ".." steps one level
+    // toward the root.  Filter out "." components here so callers that
+    // pass paths like "/." (= "/"), "/tmp/repo/./hello.txt", etc. do not
+    // try to look up "." as a literal directory entry against an inode's
+    // child list — which would NotFound because POSIX dirent enumeration
+    // does not always materialise "." and ".." as user-visible names.
+    // ".." is left for explicit handling further down (or absorbed by the
+    // mount-walker which can pop the resolved_so_far stack); on AstryxOS
+    // tmpfs no callers currently rely on ".." resolution outside of
+    // openat/realpath which canonicalise client-side.
+    let components: Vec<&str> = path
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
 
     // Start from root mount and walk component by component.
     // After each lookup, check if the result is a symlink and follow it.
@@ -1149,7 +1164,10 @@ fn resolve_path_opts(
 
     // Determine which components are already consumed by the mount path.
     let mount_path = resolved_so_far.clone();
-    let mount_components: Vec<&str> = mount_path.split('/').filter(|s| !s.is_empty()).collect();
+    let mount_components: Vec<&str> = mount_path
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
     let remaining = &components[mount_components.len()..];
 
     for (i, component) in remaining.iter().enumerate() {
