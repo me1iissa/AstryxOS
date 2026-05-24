@@ -2248,6 +2248,306 @@ impl FileSystemOps for Ext2Fs {
             VfsError::Io
         })
     }
+
+    /// Create a symbolic link in `parent_inode` with name `name` pointing to
+    /// `target`.
+    ///
+    /// The ext2 specification (Stephen Tweedie, *Design and Implementation of
+    /// the Second Extended Filesystem*, Annual Linux Expo 1998 — see
+    /// <https://www.nongnu.org/ext2-doc/ext2.html#symbolic-links>) defines two
+    /// storage encodings:
+    ///
+    /// * **Fast symlink** (`target.len() ≤ 60`): the target string is stored
+    ///   inline in the 15 × 4 = 60-byte `i_block[]` array.  `i_blocks` remains
+    ///   0 (no data block allocated); `i_size` is the byte length of the target.
+    /// * **Slow symlink** (`target.len() > 60`): a single data block is
+    ///   allocated and the target is written there, exactly as a regular file.
+    ///
+    /// Per POSIX `symlink(2)`, the parent must be a directory and the name
+    /// must not already exist.
+    fn symlink(&self, parent_inode: u64, name: &str, target: &str) -> VfsResult<u64> {
+        let mut parent = self.read_inode(parent_inode).ok_or(VfsError::NotFound)?;
+        if (parent.mode & S_IFMT) != S_IFDIR {
+            return Err(VfsError::NotADirectory);
+        }
+        let target_bytes = target.as_bytes();
+        if target_bytes.is_empty() || target_bytes.len() > 4095 {
+            return Err(VfsError::InvalidArg);
+        }
+        let new_ino = self.alloc_inode(false).ok_or(VfsError::NoSpace)?;
+        let mut inode = self.make_new_inode(S_IFLNK | 0o777, 1);
+        inode.size = target_bytes.len() as u32;
+
+        if target_bytes.len() as u64 <= EXT2_FAST_SYMLINK_MAX {
+            // Fast symlink: store target inline in i_block[], i_blocks stays 0.
+            // i_block[] is treated as a 60-byte raw byte array (not as block
+            // pointers) for fast symlinks — see spec §6 "Symbolic links".
+            let mut inline_buf = [0u8; 60];
+            inline_buf[..target_bytes.len()].copy_from_slice(target_bytes);
+            for (i, word) in inode.block.iter_mut().enumerate() {
+                let off = i * 4;
+                *word = u32::from_le_bytes([
+                    inline_buf[off],
+                    inline_buf[off + 1],
+                    inline_buf[off + 2],
+                    inline_buf[off + 3],
+                ]);
+            }
+            // i_blocks is already 0 from make_new_inode.
+        } else {
+            // Slow symlink: allocate a data block and write the target there.
+            let phys = self.ensure_block(&mut inode, 0).ok_or(VfsError::NoSpace)?;
+            let mut block_buf = alloc::vec![0u8; self.block_size];
+            block_buf[..target_bytes.len()].copy_from_slice(target_bytes);
+            self.write_block(phys, &block_buf).map_err(|_| VfsError::Io)?;
+        }
+
+        self.write_inode(new_ino as u64, &inode).map_err(|_| VfsError::Io)?;
+
+        match self.insert_dir_entry(&mut parent, parent_inode, name,
+            new_ino, EXT2_FT_SYMLINK)
+        {
+            Ok(()) => {
+                let t = current_unix_time();
+                parent.mtime = t;
+                parent.ctime = t;
+                let _ = self.write_inode(parent_inode, &parent);
+                Ok(new_ino as u64)
+            }
+            Err(e) => {
+                self.free_inode(new_ino, false);
+                Err(e)
+            }
+        }
+    }
+
+    /// Create a hard link.  Inserts `name` in `parent_inode` pointing at the
+    /// same inode as `target_inode`, then increments `i_links_count` on that
+    /// inode and updates `i_ctime`.
+    ///
+    /// Per POSIX `link(2)`: the target must not be a directory (EPERM), and
+    /// `name` must not already exist in `parent_inode` (EEXIST from
+    /// `insert_dir_entry`).  Incrementing `i_links_count` before inserting
+    /// the dir-entry ensures the inode is not freed if a concurrent unlink on
+    /// the old name fires between the two steps.
+    fn link(&self, target_inode: u64, parent_inode: u64, name: &str) -> VfsResult<()> {
+        let mut target = self.read_inode(target_inode).ok_or(VfsError::NotFound)?;
+        // POSIX link(2): hard-linking a directory returns EPERM (privilege
+        // required, not granted at the FS layer).
+        if (target.mode & S_IFMT) == S_IFDIR {
+            return Err(VfsError::PermissionDenied);
+        }
+        let mut parent = self.read_inode(parent_inode).ok_or(VfsError::NotFound)?;
+        if (parent.mode & S_IFMT) != S_IFDIR {
+            return Err(VfsError::NotADirectory);
+        }
+        // Bump links_count before inserting the dir-entry so the inode is
+        // kept alive even if a concurrent remove fires between the two steps.
+        target.links_count = target.links_count.saturating_add(1);
+        target.ctime = current_unix_time();
+        self.write_inode(target_inode, &target).map_err(|_| VfsError::Io)?;
+
+        let ft = ext2_ft_from_mode(target.mode);
+        match self.insert_dir_entry(&mut parent, parent_inode, name,
+            target_inode as u32, ft)
+        {
+            Ok(()) => {
+                let t = current_unix_time();
+                parent.mtime = t;
+                parent.ctime = t;
+                let _ = self.write_inode(parent_inode, &parent);
+                Ok(())
+            }
+            Err(e) => {
+                // Roll back the links_count increment.
+                if let Some(mut t2) = self.read_inode(target_inode) {
+                    t2.links_count = t2.links_count.saturating_sub(1);
+                    t2.ctime = current_unix_time();
+                    let _ = self.write_inode(target_inode, &t2);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Rename / move a directory entry.
+    ///
+    /// The POSIX `rename(2)` contract (POSIX.1-2017 §3 "The rename function"):
+    ///
+    /// * If `new_name` already exists in `new_parent`, unlink it first
+    ///   (for regular files / symlinks: decrement `i_links_count`; for dirs:
+    ///   only if empty — ENOTEMPTY otherwise).
+    /// * Insert a new dir-entry `new_name → old_inode` in `new_parent`.
+    /// * Remove the old dir-entry `old_name` from `old_parent`.
+    ///
+    /// Cross-directory rename: both parent inodes are mutated.  If the
+    /// renamed entry is a directory, its `..` entry's inode number is updated
+    /// to reflect the new parent, `old_parent.i_links_count` is decremented,
+    /// and `new_parent.i_links_count` is incremented.
+    ///
+    /// This implementation is not atomic across a power failure (ext2 has no
+    /// journal), but the sequence — unlink new, insert new, remove old — is
+    /// crash-consistent under `e2fsck -fy` because each step is a single
+    /// idempotent directory block write.
+    fn rename(&self, old_parent: u64, old_name: &str,
+              new_parent: u64, new_name: &str) -> VfsResult<()> {
+        // Locate the inode being moved.
+        let old_p_inode = self.read_inode(old_parent).ok_or(VfsError::NotFound)?;
+        if (old_p_inode.mode & S_IFMT) != S_IFDIR {
+            return Err(VfsError::NotADirectory);
+        }
+        let victim_ino = {
+            let entries = self.read_dir_entries(&old_p_inode);
+            entries.into_iter()
+                .find(|(_, n, _)| n == old_name)
+                .map(|(i, _, _)| i as u64)
+                .ok_or(VfsError::NotFound)?
+        };
+        let victim = self.read_inode(victim_ino).ok_or(VfsError::NotFound)?;
+        let victim_is_dir = (victim.mode & S_IFMT) == S_IFDIR;
+
+        // Validate new_parent is a directory.
+        let mut new_p_inode = self.read_inode(new_parent).ok_or(VfsError::NotFound)?;
+        if (new_p_inode.mode & S_IFMT) != S_IFDIR {
+            return Err(VfsError::NotADirectory);
+        }
+
+        // If new_name already exists, unlink it (POSIX rename(2) §ERRORS).
+        // For a directory target, require it to be empty (ENOTEMPTY).
+        {
+            let entries = self.read_dir_entries(&new_p_inode);
+            if let Some((existing_ino, _, _)) = entries.into_iter()
+                .find(|(_, n, _)| n == new_name)
+            {
+                let existing = self.read_inode(existing_ino as u64)
+                    .ok_or(VfsError::NotFound)?;
+                if (existing.mode & S_IFMT) == S_IFDIR
+                    && !self.dir_is_empty(&existing)
+                {
+                    return Err(VfsError::NotEmpty);
+                }
+                // Unlink the existing entry; if it was a dir, remove_inode
+                // will free it once links_count drops to 0.
+                self.unlink_entry(new_parent, new_name)?;
+                self.remove_inode(existing_ino as u64)?;
+            }
+        }
+
+        // Re-read new_parent (unlink_entry may have mutated it).
+        new_p_inode = self.read_inode(new_parent).ok_or(VfsError::NotFound)?;
+
+        // Insert the new dir-entry in new_parent.
+        let ft = ext2_ft_from_mode(victim.mode);
+        self.insert_dir_entry(&mut new_p_inode, new_parent, new_name,
+            victim_ino as u32, ft)?;
+
+        // Remove the old dir-entry.  We call remove_dir_entry directly to
+        // avoid decrementing links_count a second time (the entry is being
+        // moved, not removed).
+        let old_p_inode2 = self.read_inode(old_parent).ok_or(VfsError::NotFound)?;
+        self.remove_dir_entry(&old_p_inode2, old_name)
+            .map_err(|_| VfsError::Io)?;
+
+        // Cross-directory: fix the `..` back-pointer in the moved subtree
+        // and adjust parent link-counts.
+        if victim_is_dir && old_parent != new_parent {
+            // Update `..` entry inside the moved directory to point at
+            // new_parent.  The `..` entry is always the second record in
+            // block 0 (immediately after `.`), per the ext2 spec §3
+            // "Linked directory entries".
+            let mut dir_block = alloc::vec![0u8; self.block_size];
+            let phys = self.resolve_block(&victim, 0);
+            if phys != 0 && self.read_block(phys, &mut dir_block).is_ok() {
+                // Walk past the `.` entry to reach `..`.
+                let dot_rec_len = u16::from_le_bytes(
+                    [dir_block[4], dir_block[5]]) as usize;
+                if dot_rec_len + 4 <= self.block_size {
+                    dir_block[dot_rec_len..dot_rec_len + 4]
+                        .copy_from_slice(&(new_parent as u32).to_le_bytes());
+                    let _ = self.write_block(phys, &dir_block);
+                }
+            }
+            // old_parent loses one i_links_count (the `..` back-ref leaving).
+            if let Some(mut op) = self.read_inode(old_parent) {
+                op.links_count = op.links_count.saturating_sub(1);
+                op.mtime = current_unix_time();
+                op.ctime = op.mtime;
+                let _ = self.write_inode(old_parent, &op);
+            }
+            // new_parent gains one i_links_count (the `..` back-ref arriving).
+            if let Some(mut np) = self.read_inode(new_parent) {
+                np.links_count = np.links_count.saturating_add(1);
+                np.mtime = current_unix_time();
+                np.ctime = np.mtime;
+                let _ = self.write_inode(new_parent, &np);
+            }
+        } else {
+            // Intra-directory rename or non-dir: just bump mtimes.
+            let t = current_unix_time();
+            if let Some(mut op) = self.read_inode(old_parent) {
+                op.mtime = t; op.ctime = t;
+                let _ = self.write_inode(old_parent, &op);
+            }
+            if old_parent != new_parent {
+                if let Some(mut np) = self.read_inode(new_parent) {
+                    np.mtime = t; np.ctime = t;
+                    let _ = self.write_inode(new_parent, &np);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Change permission bits.
+    ///
+    /// Updates `i_mode` preserving the file-type high bits (S_IFMT mask),
+    /// updates `i_ctime` to the current wall-clock time, and writes the
+    /// inode back.  Per POSIX `chmod(2)`, only the low 12 bits of `mode`
+    /// (permissions + setuid/setgid/sticky) are stored; the file-type bits
+    /// are always preserved from the existing inode.
+    fn chmod(&self, inode: u64, mode: u32) -> VfsResult<()> {
+        let mut ino = self.read_inode(inode).ok_or(VfsError::NotFound)?;
+        // Preserve file-type bits; replace permission bits only.
+        ino.mode = (ino.mode & S_IFMT) | ((mode as u16) & 0o7777);
+        ino.ctime = current_unix_time();
+        self.write_inode(inode, &ino).map_err(|_| VfsError::Io)
+    }
+
+    /// Update access and modification timestamps.
+    ///
+    /// Per POSIX `utimes(2)`: if `atime` or `mtime` is `Some`, the
+    /// corresponding field is updated; `None` leaves the field unchanged.
+    /// `i_ctime` is always updated to the current wall-clock time when any
+    /// timestamp changes, per POSIX.1-2017 §2 "file times update rules".
+    fn utimes(&self, inode: u64, atime: Option<u64>, mtime: Option<u64>) -> VfsResult<()> {
+        let mut ino = self.read_inode(inode).ok_or(VfsError::NotFound)?;
+        if atime.is_none() && mtime.is_none() {
+            return Ok(());
+        }
+        if let Some(a) = atime {
+            ino.atime = a.min(u32::MAX as u64) as u32;
+        }
+        if let Some(m) = mtime {
+            ino.mtime = m.min(u32::MAX as u64) as u32;
+        }
+        ino.ctime = current_unix_time();
+        self.write_inode(inode, &ino).map_err(|_| VfsError::Io)
+    }
+
+    /// Change owner and group.
+    ///
+    /// Updates `i_uid` / `i_gid` and `i_ctime`, then writes the inode back.
+    /// Per POSIX `chown(2)`, privilege enforcement (only root may change uid
+    /// to an arbitrary value) is the personality layer's responsibility; the
+    /// FS driver simply applies the values it is given.
+    fn chown(&self, inode: u64, uid: u32, gid: u32) -> VfsResult<()> {
+        let mut ino = self.read_inode(inode).ok_or(VfsError::NotFound)?;
+        ino.uid = (uid & 0xFFFF) as u16;
+        ino.gid = (gid & 0xFFFF) as u16;
+        ino.ctime = current_unix_time();
+        self.write_inode(inode, &ino).map_err(|_| VfsError::Io)
+    }
 }
 
 /// Try to construct an `Ext2Fs` over the given block device.
