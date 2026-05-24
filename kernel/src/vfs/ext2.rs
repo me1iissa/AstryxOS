@@ -2,12 +2,25 @@
 //!
 //! Provides read-only access to ext2-formatted disk partitions.
 //! Supports reading the superblock, block group descriptors, inodes,
-//! directory entries, and file data.
+//! directory entries, file data, and symbolic-link targets (both
+//! "fast" inline and "slow" block-backed forms).
+//!
+//! # Block-device binding
+//!
+//! `Ext2Fs` can be constructed against either a [`BlockDevice`] trait
+//! object (the production path used by [`init_disks`]) or against a
+//! caller-supplied `fn(sector, count, &mut [u8]) -> Result<(), _>`
+//! reader (the test path used by `test_runner`).  Both shapes funnel
+//! through the same in-driver `read_sectors_inner` helper, so on-disk
+//! parsing logic only needs to be written once.
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+
+use crate::drivers::block::BlockDevice;
 
 /// ext2 magic number.
 const EXT2_MAGIC: u16 = 0xEF53;
@@ -86,15 +99,32 @@ pub struct Ext2Inode {
 
 /// Inode type constants from mode field.
 const S_IFMT: u16 = 0xF000;
+#[allow(dead_code)]
 const S_IFREG: u16 = 0x8000;
 const S_IFDIR: u16 = 0x4000;
 const S_IFLNK: u16 = 0xA000;
 
+/// Fast-symlink size threshold per ext2 spec §6 "Symbolic links":
+/// `i_size` ≤ 60 AND `i_blocks` == 0 ⇒ target stored inline in the
+/// 15-entry `i_block[]` array (60 bytes total).  Slow symlinks use
+/// the regular file-data path.
+const EXT2_FAST_SYMLINK_MAX: u64 = 60;
+
+/// Underlying reader for sector I/O.  Production callers pass a
+/// `Box<dyn BlockDevice>`; tests pass a plain function pointer to
+/// avoid having to mock the BlockDevice trait surface.  Both shapes
+/// are reachable through [`Ext2Fs::read_sectors_inner`].
+enum BlockReader {
+    /// Production path — a real or partition-wrapped block device.
+    Device(Box<dyn BlockDevice>),
+    /// Test path — a fn pointer used by `test_runner`.
+    Fn(fn(u64, u16, &mut [u8]) -> Result<(), &'static str>),
+}
+
 /// ext2 filesystem instance.
 pub struct Ext2Fs {
-    /// Function to read raw sectors from the underlying block device.
-    /// (sector: u64, count: u16, buf: &mut [u8])
-    read_fn: fn(u64, u16, &mut [u8]) -> Result<(), &'static str>,
+    /// Underlying reader (block-device trait object or test fn pointer).
+    reader: BlockReader,
     /// Cached superblock.
     superblock: Superblock,
     /// Block size in bytes.
@@ -104,7 +134,7 @@ pub struct Ext2Fs {
 }
 
 impl Ext2Fs {
-    /// Try to mount an ext2 filesystem from the given block device reader.
+    /// Try to mount an ext2 filesystem from the given block device.
     ///
     /// Validates the superblock against the constraints in the
     /// second-extended-filesystem specification
@@ -114,10 +144,26 @@ impl Ext2Fs {
     /// two, etc. — must be rejected up front: every other method on
     /// `Ext2Fs` trusts these fields and would otherwise panic in debug or
     /// produce arbitrary memory reads in release.
-    pub fn new(read_fn: fn(u64, u16, &mut [u8]) -> Result<(), &'static str>) -> Option<Self> {
+    pub fn new(device: Box<dyn BlockDevice>) -> Option<Self> {
+        Self::new_with_reader(BlockReader::Device(device))
+    }
+
+    /// Test-only constructor accepting a function-pointer reader.
+    ///
+    /// Lets `test_runner` exercise the validation rules without having to
+    /// implement the [`BlockDevice`] trait.  Production callers must use
+    /// [`Ext2Fs::new`].
+    #[doc(hidden)]
+    pub fn new_with_fn(
+        read_fn: fn(u64, u16, &mut [u8]) -> Result<(), &'static str>,
+    ) -> Option<Self> {
+        Self::new_with_reader(BlockReader::Fn(read_fn))
+    }
+
+    fn new_with_reader(reader: BlockReader) -> Option<Self> {
         // Read superblock (at byte offset 1024, sector 2)
         let mut sb_buf = [0u8; 512];
-        if read_fn(2, 1, &mut sb_buf).is_err() {
+        if Self::read_sectors_via(&reader, 2, 1, &mut sb_buf).is_err() {
             crate::serial_println!("[EXT2] Failed to read superblock");
             return None;
         }
@@ -125,7 +171,9 @@ impl Ext2Fs {
         let sb: Superblock = unsafe { core::ptr::read_unaligned(sb_buf.as_ptr() as *const Superblock) };
 
         if sb.magic != EXT2_MAGIC {
-            crate::serial_println!("[EXT2] Invalid magic: {:#06x} (expected {:#06x})", sb.magic, EXT2_MAGIC);
+            // Magic mismatch is the common case for "this partition is not ext2".
+            // Demote to a single debug-level line to keep the boot log readable
+            // when the probe also tries FAT32 and NTFS on the same partition.
             return None;
         }
 
@@ -199,7 +247,7 @@ impl Ext2Fs {
             sb.inodes_count, sb.blocks_count, block_size);
 
         Some(Ext2Fs {
-            read_fn,
+            reader,
             superblock: sb,
             block_size,
             inode_size,
@@ -228,14 +276,38 @@ impl Ext2Fs {
             isz
         } else { 128 };
         if sb.blocks_per_group > (block_size as u32) * 8 { return None; }
-        Some(Ext2Fs { read_fn, superblock: sb, block_size, inode_size })
+        Some(Ext2Fs {
+            reader: BlockReader::Fn(read_fn),
+            superblock: sb,
+            block_size,
+            inode_size,
+        })
+    }
+
+    /// Dispatch a sector-level read through whichever reader the FS holds.
+    fn read_sectors_inner(&self, sector: u64, count: u16, buf: &mut [u8])
+        -> Result<(), &'static str>
+    {
+        Self::read_sectors_via(&self.reader, sector, count, buf)
+    }
+
+    fn read_sectors_via(reader: &BlockReader, sector: u64, count: u16, buf: &mut [u8])
+        -> Result<(), &'static str>
+    {
+        match reader {
+            BlockReader::Device(dev) => {
+                dev.read_sectors(sector, count as u32, buf)
+                    .map_err(|_| "ext2: block device read error")
+            }
+            BlockReader::Fn(f) => f(sector, count, buf),
+        }
     }
 
     /// Read a block from the filesystem.
     fn read_block(&self, block_num: u32, buf: &mut [u8]) -> Result<(), &'static str> {
         let sectors_per_block = (self.block_size / 512) as u16;
         let start_sector = block_num as u64 * sectors_per_block as u64;
-        (self.read_fn)(start_sector, sectors_per_block, buf)
+        self.read_sectors_inner(start_sector, sectors_per_block, buf)
     }
 
     /// Read an inode by number (1-based).
@@ -251,7 +323,7 @@ impl Ext2Fs {
         let bgd_sector = bgd_block as u64 * (self.block_size as u64 / 512) + (bgd_offset as u64 / 512);
 
         let mut sector_buf = [0u8; 512];
-        if (self.read_fn)(bgd_sector, 1, &mut sector_buf).is_err() {
+        if self.read_sectors_inner(bgd_sector, 1, &mut sector_buf).is_err() {
             return None;
         }
 
@@ -267,7 +339,7 @@ impl Ext2Fs {
         let inode_off = (inode_byte % 512) as usize;
 
         let mut buf = [0u8; 512];
-        if (self.read_fn)(inode_sector, 1, &mut buf).is_err() {
+        if self.read_sectors_inner(inode_sector, 1, &mut buf).is_err() {
             return None;
         }
 
@@ -276,7 +348,7 @@ impl Ext2Fs {
         } else {
             // Inode spans sector boundary — read two sectors
             let mut buf2 = [0u8; 1024];
-            if (self.read_fn)(inode_sector, 2, &mut buf2).is_err() {
+            if self.read_sectors_inner(inode_sector, 2, &mut buf2).is_err() {
                 return None;
             }
             Some(unsafe { core::ptr::read_unaligned(buf2[inode_off..].as_ptr() as *const Ext2Inode) })
@@ -481,6 +553,82 @@ impl Ext2Fs {
         entries
     }
 
+    /// Decode the target of a symbolic-link inode.
+    ///
+    /// The ext2 specification (Stephen Tweedie, *Design and Implementation
+    /// of the Second Extended Filesystem*, Annual Linux Expo 1998 — see
+    /// <https://www.nongnu.org/ext2-doc/ext2.html#symbolic-links>) defines
+    /// two on-disk encodings for a symlink target:
+    ///
+    /// * **Fast symlink** — `i_size ≤ 60` AND `i_blocks == 0`.  The target
+    ///   string is stored inline in the 15-entry `i_block[]` array (60
+    ///   bytes total).  No block I/O is required.
+    /// * **Slow symlink** — target stored in regular file data blocks.
+    ///   Read via the same path as a regular file's contents.
+    ///
+    /// Returns the decoded target as a `String`, with any trailing NUL
+    /// bytes stripped (mkfs.ext2 and Linux do not require a terminator,
+    /// but some implementations zero-pad to a 4-byte boundary).
+    ///
+    /// Returns `None` if the inode is not a symlink, if the inline bytes
+    /// are not valid UTF-8, or if a slow-symlink read fails.
+    fn read_symlink_target(&self, inode: &Ext2Inode) -> Option<String> {
+        if (inode.mode & S_IFMT) != S_IFLNK {
+            return None;
+        }
+        let size = inode.size as u64;
+        if size == 0 {
+            return Some(String::new());
+        }
+        // Fast-symlink discriminator (ext2 spec §6 "Symbolic links"):
+        // i_blocks reports allocated 512-byte sectors; a value of zero
+        // signals that no data block was allocated, in which case the
+        // target lives inside i_block[].  The 60-byte cap is a hard
+        // ceiling — i_block[] is exactly 15 × 4 = 60 bytes.
+        if inode.blocks == 0 && size <= EXT2_FAST_SYMLINK_MAX {
+            // Reinterpret i_block[] as a 60-byte little-endian-agnostic
+            // byte array — the values stored here are raw bytes, not
+            // u32 pointers, when the inode is a fast symlink.
+            let mut buf = [0u8; 60];
+            for (i, word) in inode.block.iter().enumerate() {
+                let bytes = word.to_le_bytes();
+                buf[i * 4..i * 4 + 4].copy_from_slice(&bytes);
+            }
+            let len = (size as usize).min(60);
+            // Strip any trailing NULs from the declared length.
+            let mut effective = len;
+            while effective > 0 && buf[effective - 1] == 0 {
+                effective -= 1;
+            }
+            return core::str::from_utf8(&buf[..effective])
+                .ok()
+                .map(|s| s.to_string());
+        }
+        // Slow symlink — read the target out of file-data blocks.
+        let mut data = alloc::vec![0u8; size as usize];
+        let got = self.read_inode_data(inode, 0, &mut data);
+        if got == 0 {
+            return None;
+        }
+        // Trim trailing NULs and decode.
+        let mut effective = got;
+        while effective > 0 && data[effective - 1] == 0 {
+            effective -= 1;
+        }
+        core::str::from_utf8(&data[..effective])
+            .ok()
+            .map(|s| s.to_string())
+    }
+
+    /// Test-only wrapper exposing the symlink-target decoder against a
+    /// caller-supplied `Ext2Inode`.  Lets `test_runner` validate the fast
+    /// / slow discrimination logic without instantiating a full mock
+    /// block device.
+    #[doc(hidden)]
+    pub fn decode_symlink_for_test(&self, inode: &Ext2Inode) -> Option<String> {
+        self.read_symlink_target(inode)
+    }
+
     /// Test-only helper exercising the directory-entry validator against a
     /// caller-supplied buffer.  Used by the corruption-resilience tests in
     /// `test_runner.rs`.  Returns the parsed `(inode, name, file_type)`
@@ -606,21 +754,27 @@ impl FileSystemOps for Ext2Fs {
     fn truncate(&self, _inode: u64, _size: u64) -> VfsResult<()> {
         Err(VfsError::PermissionDenied) // Read-only
     }
-}
 
-/// Try to mount an ext2 filesystem from ATA disk 0.
-pub fn try_mount() {
-    fn ata_read(sector: u64, count: u16, buf: &mut [u8]) -> Result<(), &'static str> {
-        crate::drivers::ata::read_sectors(0, sector as u32, count as u8, buf)
-    }
-
-    match Ext2Fs::new(ata_read) {
-        Some(fs) => {
-            crate::serial_println!("[EXT2] Mounting ext2 filesystem at /ext2");
-            crate::vfs::mount("/ext2", alloc::boxed::Box::new(fs), 2); // ext2 root inode = 2
+    fn readlink(&self, inode: u64) -> VfsResult<String> {
+        let ino = self.read_inode(inode).ok_or(VfsError::NotFound)?;
+        if (ino.mode & S_IFMT) != S_IFLNK {
+            return Err(VfsError::InvalidArg); // POSIX readlink(2): EINVAL on non-symlink
         }
-        None => {
-            crate::serial_println!("[EXT2] No ext2 filesystem found on disk 0");
-        }
+        self.read_symlink_target(&ino).ok_or(VfsError::Io)
     }
 }
+
+/// Try to construct an `Ext2Fs` over the given block device.
+///
+/// Returns `Some(fs)` if the device's superblock parses cleanly, `None`
+/// otherwise (wrong filesystem, corrupt superblock, I/O error).  This is
+/// the production entry point used by [`crate::vfs::init_disks`] when a
+/// partition probe wants to try ext2 alongside (or in fallback from)
+/// FAT32 / NTFS.
+pub fn try_mount_ext2(device: Box<dyn BlockDevice>) -> Option<Ext2Fs> {
+    Ext2Fs::new(device)
+}
+
+/// ext2 root inode number per the spec (always 2; inode 1 reserves the
+/// "bad blocks" list, inode 0 is invalid).
+pub const EXT2_ROOT_INODE: u64 = 2;
