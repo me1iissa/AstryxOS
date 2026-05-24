@@ -85,7 +85,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y mtools
+          sudo apt-get install -y e2fsprogs
 
       - name: Cache cargo + target
         uses: actions/cache@v5
@@ -122,10 +122,12 @@ jobs:
           components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-uefi, x86_64-unknown-none
 
-      - name: Install QEMU + OVMF + mtools
+      - name: Install QEMU + OVMF + e2fsprogs
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 ovmf mtools
+          sudo apt-get install -y qemu-system-x86 ovmf e2fsprogs
+          # Fail fast if mke2fs -d is not supported (requires e2fsprogs >= 1.43).
+          mke2fs -V
           # Fix up OVMF paths — Ubuntu ships 4M variants under /usr/share/OVMF/
           # but some base images only install /usr/share/ovmf/OVMF.fd.  Both
           # watch-test.py and qemu-harness.py expect OVMF_CODE_4M.fd.
@@ -191,7 +193,7 @@ jobs:
           "$OBJCOPY" -O binary target/x86_64-astryx/release/astryx-kernel build/esp/EFI/astryx/kernel.bin
           ls -lh build/esp/EFI/astryx/kernel.bin
 
-      - name: Create data disk (FAT32 — missing binaries OK)
+      - name: Create data disk (ext2 — missing binaries OK)
         run: ./scripts/create-data-disk.sh --force
 
       # Headless kernel boot + full test suite.  Exit code 0 means all
@@ -291,10 +293,11 @@ jobs:
           components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-uefi, x86_64-unknown-none
 
-      - name: Install QEMU + OVMF + mtools
+      - name: Install QEMU + OVMF + e2fsprogs
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 ovmf mtools
+          sudo apt-get install -y qemu-system-x86 ovmf e2fsprogs
+          mke2fs -V
           if [ ! -e /usr/share/OVMF/OVMF_CODE_4M.fd ]; then
             sudo install -d /usr/share/OVMF
             for f in /usr/share/OVMF/OVMF_CODE.fd /usr/share/ovmf/OVMF.fd; do
