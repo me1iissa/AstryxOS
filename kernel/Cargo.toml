@@ -115,8 +115,8 @@ wget-test = []
 # <https://www.openssl.org/docs/man3.0/man1/openssl-s_client.html>.
 tls-test = []
 # oracle-test — Oracle endpoint agent first-boot demo (PIVOT-I2, 2026-05-23).
-# Launches the production GLIBC-linked `oracle` binary from the user's
-# infrastructure-services/infrasvc release (~5 MiB) with
+# Launches a production GLIBC-linked endpoint-agent binary (caller-supplied
+# at staging time, ~5 MiB) with
 # `--mode console --once` so it runs a single observation cycle and exits.
 # Validates the AstryxOS kernel's ability to host a real glibc+tokio
 # Linux server-agent: dynamic linker + glibc + libssl3/libcrypto3 +
