@@ -1440,6 +1440,12 @@ _DEMO_BIN_SPEC = [
     ("oracle-daemon-test", "--oracle", "ASTRYXOS_ORACLE"),
     ("sshd-test",          "--sshd",   "ASTRYXOS_SSHD"),
     ("tls-test",           "--tls",    "ASTRYXOS_TLS"),
+    # pivot-e-test (PIVOT-E, 2026-05-24) — Tier B core utilities
+    # (curl/jq/tar) plus DT_NEEDED closure walker, on top of the Tier A
+    # busybox surface.  --pivot-e in create-data-disk.sh auto-enables
+    # --busybox and --tls (declared at the script level as implicit
+    # prerequisites), so a single feature flag triggers the full stage.
+    ("pivot-e-test",       "--pivot-e","ASTRYXOS_PIVOT_E"),
 ]
 
 

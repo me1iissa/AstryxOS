@@ -58,7 +58,7 @@ mod init;
 mod util;
 #[cfg(feature = "record-replay")]
 mod record_replay;
-#[cfg(any(feature = "busybox-test", feature = "wget-test"))]
+#[cfg(any(feature = "busybox-test", feature = "wget-test", feature = "pivot-e-test"))]
 mod busybox_demo;
 #[cfg(feature = "httpd-test")]
 mod httpd_demo;
@@ -68,6 +68,8 @@ mod sshd_demo;
 mod tls_demo;
 #[cfg(any(feature = "oracle-test", feature = "oracle-daemon-test"))]
 mod oracle_demo;
+#[cfg(feature = "pivot-e-test")]
+mod pivot_e_demo;
 
 use astryx_shared::{BootInfo, BOOT_INFO_MAGIC};
 
@@ -398,6 +400,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "tls-test"),
                   not(feature = "oracle-test"),
                   not(feature = "oracle-daemon-test"),
+                  not(feature = "pivot-e-test"),
                   feature = "xeyes-test"))]
         {
             serial_println!("[XEYES] xeyes-test mode starting...");
@@ -606,6 +609,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "tls-test"),
                   not(feature = "oracle-test"),
                   not(feature = "oracle-daemon-test"),
+                  not(feature = "pivot-e-test"),
                   any(feature = "busybox-test", feature = "wget-test")))]
         {
             hal::enable_interrupts();
@@ -665,6 +669,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "tls-test"),
                   not(feature = "oracle-test"),
                   not(feature = "oracle-daemon-test"),
+                  not(feature = "pivot-e-test"),
                   feature = "httpd-test"))]
         {
             hal::enable_interrupts();
@@ -708,6 +713,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "tls-test"),
                   not(feature = "oracle-test"),
                   not(feature = "oracle-daemon-test"),
+                  not(feature = "pivot-e-test"),
                   feature = "sshd-test"))]
         {
             hal::enable_interrupts();
@@ -748,6 +754,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "sshd-test"),
                   not(feature = "oracle-test"),
                   not(feature = "oracle-daemon-test"),
+                  not(feature = "pivot-e-test"),
                   feature = "tls-test"))]
         {
             hal::enable_interrupts();
@@ -788,6 +795,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "sshd-test"),
                   not(feature = "tls-test"),
                   not(feature = "oracle-daemon-test"),
+                  not(feature = "pivot-e-test"),
                   feature = "oracle-test"))]
         {
             hal::enable_interrupts();
@@ -833,6 +841,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "sshd-test"),
                   not(feature = "tls-test"),
                   not(feature = "oracle-test"),
+                  not(feature = "pivot-e-test"),
                   feature = "oracle-daemon-test"))]
         {
             hal::enable_interrupts();
@@ -863,6 +872,58 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             loop { unsafe { core::arch::asm!("hlt"); } }
         }
 
+        // ── pivot-e-test: Tier A + Tier B core utilities (PIVOT-E, 2026-05-24) ──
+        // Headless: no X11, no Xastryx, no compositor.  Runs the Tier A
+        // busybox-static applet battery (grep/sed/awk/find/etc.) followed
+        // by Tier B standalone musl-PIE binaries (curl/jq/tar) — each is
+        // its own ELF load with the kernel resolving PT_INTERP -> ld-musl
+        // and the full DT_NEEDED closure.  See kernel/src/pivot_e_demo.rs
+        // for the applet/binary batteries and docs/PIVOT_E_2026-05-24.md
+        // for the strategic context.
+        //
+        // Mutually exclusive with the other *-test cargo features at the
+        // cfg-gate level (all share the BSP idle slot).
+        #[cfg(all(not(feature = "gui-test"),
+                  not(feature = "xeyes-test"),
+                  not(feature = "firefox-test"),
+                  not(feature = "busybox-test"),
+                  not(feature = "wget-test"),
+                  not(feature = "httpd-test"),
+                  not(feature = "sshd-test"),
+                  not(feature = "tls-test"),
+                  not(feature = "oracle-test"),
+                  not(feature = "oracle-daemon-test"),
+                  feature = "pivot-e-test"))]
+        {
+            hal::enable_interrupts();
+            if !sched::is_active() {
+                sched::enable();
+            }
+            // Scheduler settle — same pattern as busybox-test/oracle-test.
+            let t0 = arch::x86_64::irq::get_ticks();
+            while arch::x86_64::irq::get_ticks().wrapping_sub(t0) < 30 {
+                core::hint::spin_loop();
+            }
+
+            pivot_e_demo::run_pivot_e_demo();
+
+            serial_println!("[PIVOT-E] DONE");
+
+            let t_done = arch::x86_64::irq::get_ticks();
+            while arch::x86_64::irq::get_ticks().wrapping_sub(t_done) < 100 {
+                core::hint::spin_loop();
+            }
+            unsafe {
+                core::arch::asm!(
+                    "out dx, eax",
+                    in("dx")  0xf4_u16,
+                    in("eax") 0_u32,
+                    options(nomem, nostack)
+                );
+            }
+            loop { unsafe { core::arch::asm!("hlt"); } }
+        }
+
         // ── X11 visual test: create a colored window and hold it on screen ──
         // Activated by firefox-test mode — shows an X11 window before Firefox.
         #[cfg(all(not(feature = "gui-test"),
@@ -874,6 +935,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "tls-test"),
                   not(feature = "oracle-test"),
                   not(feature = "oracle-daemon-test"),
+                  not(feature = "pivot-e-test"),
                   feature = "firefox-test"))]
         {
             serial_println!("[FFTEST] Firefox-test mode starting...");

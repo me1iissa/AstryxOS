@@ -154,6 +154,29 @@ oracle-test = []
 # <https://www.rfc-editor.org/rfc/rfc9110.html>, QEMU SLIRP
 # <https://www.qemu.org/docs/master/system/devices/net.html#network-options>.
 oracle-daemon-test = []
+# pivot-e-test — PIVOT-E core-utilities demo (2026-05-24).  Verifies the
+# Tier A busybox-static surface (305 applets, statically-linked,
+# previously staged by install-busybox-cli.sh) by enumerating
+# `busybox --list` and running a curated battery (grep, sed, awk, find,
+# head, tail, wc, cat, sort, uniq, md5sum, sha256sum, du, df, vi as
+# `vi -v`).  Then launches each Tier B standalone binary staged by
+# install-pivot-e.sh — `/usr/bin/curl --version`, `/usr/bin/jq '.'`,
+# `/bin/tar --version`, `/usr/bin/curl http://10.0.2.2:8888/` — to
+# confirm the AstryxOS kernel can host non-busybox musl-PIE Linux
+# binaries with non-trivial DT_NEEDED closures (libcurl + zlib +
+# nghttp2 + libpsl + zstd + libssl + libcrypto for curl).  Each
+# child runs as its own process with stdout captured to the serial
+# log via the same pipe-attach pattern as busybox_demo.  Mutually
+# exclusive with the other *-test cargo features at the main.rs
+# cfg-gate level (all share the BSP idle slot).  Requires the
+# data.img to contain /bin/busybox + /usr/bin/curl + /usr/bin/jq +
+# /bin/tar (run `scripts/create-data-disk.sh --pivot-e --force`).
+# Public refs: BusyBox <https://busybox.net/>, curl
+# <https://curl.se/docs/manpage.html>, jq
+# <https://stedolan.github.io/jq/manual/>, GNU tar
+# <https://www.gnu.org/software/tar/manual/tar.html>, POSIX exec(2)
+# / read(2) / write(2).
+pivot-e-test = []
 # Opt-in for the userspace alias_test page-aliasing reproducer (Test 44b).
 # Spawns 8 worker threads via raw clone(CLONE_VM|CLONE_THREAD|CLONE_SIGHAND)
 # doing MAP_PRIVATE mmap churn; runs >100k page faults; sometimes wedges

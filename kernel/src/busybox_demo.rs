@@ -20,30 +20,30 @@
 //!     https://www.qemu.org/docs/master/system/devices/net.html#network-options
 //!   - RFC 7230 (HTTP/1.1) — for the wget-test fetch path
 
-#![cfg(any(feature = "busybox-test", feature = "wget-test"))]
+#![cfg(any(feature = "busybox-test", feature = "wget-test", feature = "pivot-e-test"))]
 
 extern crate alloc;
 use alloc::vec::Vec;
 
 use crate::serial_println;
 
-const BUSYBOX_PATH: &str = "/disk/bin/busybox";
+pub(crate) const BUSYBOX_PATH: &str = "/disk/bin/busybox";
 
 /// Per-applet wall-clock budget, in 100 Hz ticks (TICK_HZ=100 ⇒ 1 tick ≈ 10 ms).
 /// 10 s should be ample for any of the demo applets — the existing
 /// `test_busybox_basic` (Test 63b) measures `busybox echo` at < 1 s on the same
 /// kernel.  wget HTTP fetches need a larger budget; see WGET_APPLET_TICKS.
-const APPLET_TICKS: u64 = 1_000;
+pub(crate) const APPLET_TICKS: u64 = 1_000;
 
 /// Wget-specific timeout — the connect / DNS / response cycle on a SLIRP
 /// gateway round-trip can take several seconds.  Bump to ~30 s.
-const WGET_APPLET_TICKS: u64 = 3_000;
+pub(crate) const WGET_APPLET_TICKS: u64 = 3_000;
 
 /// Standard envp passed to every applet.  Kept small and deterministic —
 /// no MOZ_*, no LD_PRELOAD, no LD_DEBUG.  PATH points at /bin (where the
 /// busybox multi-call binary lives) and /disk/bin (where the data-disk
 /// stages additional binaries).
-fn default_envp() -> &'static [&'static str] {
+pub(crate) fn default_envp() -> &'static [&'static str] {
     &[
         "HOME=/",
         "PATH=/bin:/disk/bin",
@@ -68,14 +68,18 @@ fn default_envp() -> &'static [&'static str] {
 ///
 /// Captured stdout is bounded to 4 KiB per applet to keep the BSS / heap
 /// footprint deterministic; the busybox demo applets all fit in <1 KiB.
-fn run_applet(label: &str, argv: &[&str], elf_bytes: &[u8], deadline_ticks: u64) -> (i32, Vec<u8>) {
+pub(crate) fn run_applet(label: &str, argv: &[&str], elf_bytes: &[u8], deadline_ticks: u64) -> (i32, Vec<u8>) {
     serial_println!("[BBDEMO] ── {}: {:?} ──", label, argv);
 
     let envp = default_envp();
 
     // Spawn blocked so we can attach the pipe to fd 1 / fd 2 before the
     // child can call write(2).  Pattern is identical to the existing
-    // test_runner::test_busybox_basic (Test 63b).
+    // test_runner::test_busybox_basic (Test 63b).  argv[0] is also used
+    // as the process display name for ps / kdb proc-list.  For Tier B
+    // binaries (curl/jq/tar) the same loader path applies — the
+    // `"busybox"` name string is just a display label and is not
+    // interpreted by the loader.
     let pid = match crate::proc::usermode::create_user_process_with_args_blocked(
         "busybox",
         elf_bytes,

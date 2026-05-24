@@ -79,6 +79,17 @@ TLS_STACK="${ASTRYXOS_TLS:-0}"
 # Linux server-agent hosting on AstryxOS.  See scripts/install-oracle.sh.
 ORACLE="${ASTRYXOS_ORACLE:-0}"
 
+# When set (env or --pivot-e flag), also stage PIVOT-E Tier B core
+# utilities: /usr/bin/curl, /usr/bin/jq, /bin/tar (and /usr/bin/tar
+# duplicate) plus their DT_NEEDED transitive closures (libcurl, libonig,
+# libacl, nghttp2, libpsl, zlib, zstd).  Used by the pivot-e-test cargo
+# feature (kernel/src/main.rs + kernel/src/pivot_e_demo.rs) which
+# verifies the Tier A busybox surface AND launches each Tier B binary.
+# Auto-enables --busybox (Tier A substrate) and --tls (libssl/libcrypto
+# needed by curl HTTPS) per the install-pivot-e.sh pre-flight checks.
+# See scripts/install-pivot-e.sh and docs/PIVOT_E_2026-05-24.md.
+PIVOT_E="${ASTRYXOS_PIVOT_E:-0}"
+
 # Firefox package selector (musl variant only).  Picks which Alpine package
 # install-firefox-musl.sh + install-firefox-musl-debug.sh pull:
 #
@@ -144,6 +155,7 @@ for arg in "$@"; do
         --sshd) SSHD=1; FORCE=true ;;
         --tls) TLS_STACK=1; FORCE=true ;;
         --oracle) ORACLE=1; FORCE=true ;;
+        --pivot-e) PIVOT_E=1; FORCE=true ;;
         [0-9]*) SIZE_MB="$arg" ;;
     esac
 done
@@ -547,6 +559,51 @@ if [ "${ORACLE}" = "1" ] || [ "${ORACLE}" = "true" ]; then
         [ "${FORCE}" = true ] && ORACLE_FLAGS="--force"
         bash "${ROOT_DIR}/scripts/install-oracle.sh" ${ORACLE_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
             { echo "[DATA-DISK] FATAL: install-oracle.sh failed"; exit 1; }
+    fi
+fi
+
+# ── PIVOT-E Tier B core utilities (--pivot-e / ASTRYXOS_PIVOT_E=1) ───────────
+# Tier A substrate (busybox) and TLS substrate (libssl/libcrypto, needed by
+# curl HTTPS) are pre-requisites for install-pivot-e.sh.  Auto-enable them
+# here rather than asking the user to remember three flags.  Per the
+# install-pivot-e.sh pre-flight checks, both will be hard-failed if missing.
+if [ "${PIVOT_E}" = "1" ] || [ "${PIVOT_E}" = "true" ]; then
+    # Tier A substrate.  Only call install-busybox-cli.sh if /bin/busybox
+    # is not already staged — apk-static's `add` returns rc=7 on a repeat
+    # install due to chroot-restricted trigger scripts, which would
+    # spuriously kill the whole create-data-disk.sh run.  We skip the
+    # re-stage when the artefact is already present (install-pivot-e.sh
+    # has its own pre-flight that confirms the file exists).
+    if [ "${BUSYBOX_CLI}" != "1" ] && [ "${BUSYBOX_CLI}" != "true" ]; then
+        BUSYBOX_CLI=1
+        if [ -f "${BUILD_DIR}/disk/bin/busybox" ]; then
+            echo "[DATA-DISK] NOTE: --pivot-e implies --busybox; /bin/busybox already staged — skipping re-stage."
+        elif [ -f "${ROOT_DIR}/scripts/install-busybox-cli.sh" ]; then
+            echo "[DATA-DISK] NOTE: --pivot-e implies --busybox (Tier A surface) — auto-enabling."
+            bash "${ROOT_DIR}/scripts/install-busybox-cli.sh" 2>&1 | sed 's/^/[DATA-DISK] /' || \
+                { echo "[DATA-DISK] FATAL: install-busybox-cli.sh failed"; exit 1; }
+        fi
+    fi
+    # Tier B substrate (libssl/libcrypto).  Same pattern.
+    if [ "${TLS_STACK}" != "1" ] && [ "${TLS_STACK}" != "true" ]; then
+        TLS_STACK=1
+        if [ -f "${BUILD_DIR}/disk/usr/lib/libssl.so.3" ]; then
+            echo "[DATA-DISK] NOTE: --pivot-e implies --tls; libssl.so.3 already staged — skipping re-stage."
+        elif [ -f "${ROOT_DIR}/scripts/install-tls-stack.sh" ]; then
+            echo "[DATA-DISK] NOTE: --pivot-e implies --tls (libssl/libcrypto for curl HTTPS) — auto-enabling."
+            bash "${ROOT_DIR}/scripts/install-tls-stack.sh" 2>&1 | sed 's/^/[DATA-DISK] /' || \
+                { echo "[DATA-DISK] FATAL: install-tls-stack.sh failed"; exit 1; }
+        fi
+    fi
+    if [ -f "${ROOT_DIR}/scripts/install-pivot-e.sh" ]; then
+        # install-pivot-e.sh's apk-add path is idempotent and tolerates
+        # repeat installs (uses `|| true` after apk on the apk path).
+        # Pass --force only when the data.img is being regenerated to
+        # ensure fresh closure-walker output.
+        PE_FLAGS=""
+        [ "${FORCE}" = true ] && PE_FLAGS="--force"
+        bash "${ROOT_DIR}/scripts/install-pivot-e.sh" ${PE_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
+            { echo "[DATA-DISK] FATAL: install-pivot-e.sh failed"; exit 1; }
     fi
 fi
 
@@ -1163,6 +1220,84 @@ EOF
     mmd -i "${DATA_IMG}" "::var/lib/oracle" 2>/dev/null || true
     mmd -i "${DATA_IMG}" "::var/log"        2>/dev/null || true
     mmd -i "${DATA_IMG}" "::var/log/oracle" 2>/dev/null || true
+
+    # ── PIVOT-E Tier B core utilities (--pivot-e / ASTRYXOS_PIVOT_E=1) ──────
+    # install-pivot-e.sh has staged at the host side:
+    #   build/disk/usr/bin/curl + /usr/bin/jq + /usr/bin/tar + /bin/tar
+    #   build/disk/usr/lib/libcurl.so.4, libonig.so.5, libnghttp2.so.14,
+    #                     libpsl.so.5, libz.so.1, libzstd.so.1, libacl.so.1
+    #   build/disk/etc/pivot-e/sample.{json,txt} demo fixtures
+    # libssl/libcrypto are already covered by the TLS-stack block above; the
+    # closure walker in install-pivot-e.sh does not re-stage them.
+    # Empty-glob safe (`shopt -s nullglob` not assumed): each `for` guards
+    # presence with `[ -f ]` before mcopy.
+    for pe_bin in "${BUILD_DIR}/disk/usr/bin/curl" \
+                  "${BUILD_DIR}/disk/usr/bin/jq" \
+                  "${BUILD_DIR}/disk/usr/bin/tar"; do
+        if [ -f "${pe_bin}" ]; then
+            mmd -i "${DATA_IMG}" "::usr"     2>/dev/null || true
+            mmd -i "${DATA_IMG}" "::usr/bin" 2>/dev/null || true
+            dest="::usr/bin/$(basename "${pe_bin}")"
+            mcopy -o -i "${DATA_IMG}" "${pe_bin}" "${dest}"
+            echo "[DATA-DISK] Copied /usr/bin/$(basename "${pe_bin}") ($(stat -c%s "${pe_bin}") bytes)"
+        fi
+    done
+    if [ -f "${BUILD_DIR}/disk/bin/tar" ]; then
+        # /bin/tar is the canonical GNU tar location; we want both /bin/tar
+        # and /usr/bin/tar (the latter copied in the loop above) so PATH-less
+        # invocations that look for /bin/tar (some scripts hard-code it)
+        # succeed too.  busybox already lives at /bin/busybox; tar coexists
+        # alongside it (the standalone GNU tar has features busybox tar
+        # lacks: --sparse, --xattrs, long-name pax records).
+        mcopy -o -i "${DATA_IMG}" "${BUILD_DIR}/disk/bin/tar" "::bin/tar"
+        echo "[DATA-DISK] Copied /bin/tar ($(stat -c%s "${BUILD_DIR}/disk/bin/tar") bytes)"
+    fi
+    # DT_NEEDED closure for the Tier B binaries.  These are musl-linked, so
+    # ld-musl + libc.musl already covered by the firefox-musl / sshd path
+    # above.  The full closure observed by install-pivot-e.sh on Alpine
+    # v3.20:
+    #   curl  → libcurl + libcares + libnghttp2 + libidn2 + libpsl + libssl
+    #           + libcrypto + libzstd + libz + libbrotlidec + libbrotlicommon
+    #           + libunistring
+    #   jq    → libonig
+    #   tar   → libacl
+    # libssl/libcrypto are pre-staged by the install-tls-stack.sh block above
+    # and re-copied here only if install-tls-stack.sh did not run (mcopy is
+    # idempotent with -o; double-copying is harmless).  Per-library check
+    # (`[ -f ]`) makes this empty-glob safe so the block is a no-op when
+    # --pivot-e was not passed.
+    for pe_lib in libcurl.so.4 libonig.so.5 libnghttp2.so.14 libpsl.so.5 \
+                  libcares.so.2 libidn2.so.0 libunistring.so.5 \
+                  libbrotlidec.so.1 libbrotlicommon.so.1 \
+                  libzstd.so.1 libssl.so.3 libcrypto.so.3; do
+        src="${BUILD_DIR}/disk/usr/lib/${pe_lib}"
+        if [ -f "${src}" ]; then
+            mmd -i "${DATA_IMG}" "::usr"     2>/dev/null || true
+            mmd -i "${DATA_IMG}" "::usr/lib" 2>/dev/null || true
+            mcopy -o -i "${DATA_IMG}" "${src}" "::usr/lib/${pe_lib}"
+            echo "[DATA-DISK] Copied /usr/lib/${pe_lib} ($(stat -c%s "${src}") bytes)"
+        fi
+    done
+    # Two of the closure libs live under /lib rather than /usr/lib because
+    # the host Alpine package installs them there (musl ld searches /lib
+    # first, then /usr/lib).
+    for pe_root_lib in libz.so.1 libacl.so.1; do
+        src="${BUILD_DIR}/disk/lib/${pe_root_lib}"
+        if [ -f "${src}" ]; then
+            mmd -i "${DATA_IMG}" "::lib"     2>/dev/null || true
+            mcopy -o -i "${DATA_IMG}" "${src}" "::lib/${pe_root_lib}"
+            echo "[DATA-DISK] Copied /lib/${pe_root_lib} ($(stat -c%s "${src}") bytes)"
+        fi
+    done
+    if [ -d "${BUILD_DIR}/disk/etc/pivot-e" ]; then
+        mmd -i "${DATA_IMG}" "::etc"         2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::etc/pivot-e" 2>/dev/null || true
+        for fx in "${BUILD_DIR}/disk/etc/pivot-e/"*; do
+            [ -f "${fx}" ] || continue
+            mcopy -o -i "${DATA_IMG}" "${fx}" "::etc/pivot-e/$(basename "${fx}")"
+        done
+        echo "[DATA-DISK] Copied /etc/pivot-e/ (sample.json, sample.txt fixtures)"
+    fi
 
     # ── BusyBox binary + applet wrapper scripts (built by build-busybox.sh) ─
     # Ships a single static musl binary at /bin/busybox plus a curated set of
