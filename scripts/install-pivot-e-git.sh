@@ -19,27 +19,22 @@
 # and 17 are real helper binaries (git-http-fetch, git-http-push,
 # git-remote-http, git-merge-{octopus,one-file,resolve}, etc.).
 #
-# AstryxOS uses FAT32 for the data disk and FAT32 has no symlinks.  Two
-# implications:
+# The data disk is now ext2, which preserves POSIX symlinks natively.
+# This means:
 #
-#   1. The git binary is staged ONCE at /usr/bin/git.  At runtime the
-#      kernel demo runner sets GIT_EXEC_PATH=/disk/usr/bin so the git
-#      sub-process spawned by `git commit` (e.g. "git maintenance run")
-#      resolves to /disk/usr/bin/git rather than the canonical
-#      /usr/libexec/git-core/git symlink.
+#   1. The full Alpine git-core tree (158 entries, ~141 symlinks + 17 real
+#      helpers) is staged verbatim.  mke2fs -d carries the symlinks into
+#      the image without dereferencing them.  At runtime git's helper lookup
+#      resolves /usr/libexec/git-core/git-<subcmd> → /usr/bin/git correctly.
 #
-#   2. The non-symlink helpers (the 17 real ELF binaries needed for the
-#      HTTPS-clone protocol path: git-http-fetch, git-remote-http, etc.)
-#      ARE staged as real files under /usr/libexec/git-core/ — they are
-#      not symlinks and they fit the FAT32 file model.  Their footprint
-#      is small (~80 KiB each) and copying the union avoids per-feature
-#      gates.
+#   2. git-remote-{https,ftp,ftps} are true symlinks to git-remote-http in
+#      the Alpine package — no duplication workaround needed.
 #
 # What this stages
 # ----------------
 #
 #   1. /usr/bin/git                     (~2.9 MiB, musl-PIE)
-#   2. /usr/libexec/git-core/git-*      (17 real helpers; symlinks omitted)
+#   2. /usr/libexec/git-core/git-*      (full Alpine set: 17 real + 141 symlinks)
 #   3. /usr/lib/libpcre2-8.so.0         (regex engine for git pattern matches)
 #   4. /usr/lib/libexpat.so.1           (HTTPS dumb-client XML for git-http)
 #   5. /usr/share/git-core/templates/   (init template tree — copied verbatim)
@@ -149,41 +144,29 @@ cp -fL "${ROOTFS}/usr/bin/git" "${DISK_USR_BIN}/git"
 chmod +x "${DISK_USR_BIN}/git"
 echo "[PIVOT-E-GIT] Staged /usr/bin/git ($(stat -c%s "${DISK_USR_BIN}/git") bytes)"
 
-# ── Step 3: stage the 17 REAL (non-symlink) git-core helpers ─────────────────
-# Symlinks back to /usr/bin/git are NOT staged (FAT32 has no symlinks; at
-# runtime GIT_EXEC_PATH=/disk/usr/bin overrides the default helper-exec
-# directory).  Real binaries ARE staged: they implement the HTTPS-clone
-# protocol path (git-http-fetch, git-http-push, git-remote-http) and the
-# helper-script set (git-mergetool, git-submodule, git-filter-branch, ...).
+# ── Step 3: stage the full git-core helper set (real files + symlinks) ───────
+# The data disk is ext2; symlinks are preserved natively by mke2fs -d.
+# We stage the complete Alpine git-core tree: 17 real helper binaries and
+# ~141 symlinks back to /usr/bin/git.  Alpine's git-remote-{https,ftp,ftps}
+# are symlinks to git-remote-http — no duplication needed.
+# Ref: git(1) §GIT_EXEC_PATH, gitrepository-layout(5)
 helper_count=0
 total_helper_bytes=0
 for helper in "${ROOTFS}/usr/libexec/git-core/"*; do
-    [ -f "${helper}" ] || continue           # skip dirs
-    [ ! -L "${helper}" ] || continue          # skip symlinks (handled via GIT_EXEC_PATH)
     name="$(basename "${helper}")"
-    cp -fL "${helper}" "${DISK_USR_LIBEXEC_GIT}/${name}"
-    chmod +x "${DISK_USR_LIBEXEC_GIT}/${name}" 2>/dev/null || true
-    sz="$(stat -c%s "${DISK_USR_LIBEXEC_GIT}/${name}")"
-    helper_count=$((helper_count + 1))
-    total_helper_bytes=$((total_helper_bytes + sz))
-done
-echo "[PIVOT-E-GIT] Staged ${helper_count} real helpers in /usr/libexec/git-core/ (${total_helper_bytes} bytes total)"
-
-# ── Step 3a: materialise FAT32-safe aliases of git-remote-http ────────────────
-# Alpine ships git-remote-{https,ftp,ftps} as symlinks to git-remote-http;
-# the loop above skips symlinks because FAT32 cannot represent them.  Git's
-# transport lookup is by helper basename (git-remote-<scheme>), so without
-# these aliases `git clone https://…` fails with "Unable to find remote
-# helper for 'https'".  Copy the one real binary to each alias name.
-if [ -f "${DISK_USR_LIBEXEC_GIT}/git-remote-http" ]; then
-    for alias in git-remote-https git-remote-ftp git-remote-ftps; do
-        cp -f "${DISK_USR_LIBEXEC_GIT}/git-remote-http" \
-              "${DISK_USR_LIBEXEC_GIT}/${alias}"
-        chmod +x "${DISK_USR_LIBEXEC_GIT}/${alias}" 2>/dev/null || true
+    if [ -L "${helper}" ]; then
+        # Preserve the symlink as-is (cp -aP copies symlinks without resolving).
+        cp -aP "${helper}" "${DISK_USR_LIBEXEC_GIT}/${name}"
         helper_count=$((helper_count + 1))
-    done
-    echo "[PIVOT-E-GIT] Materialised git-remote-{https,ftp,ftps} aliases (FAT32 symlink workaround)"
-fi
+    elif [ -f "${helper}" ]; then
+        cp -fL "${helper}" "${DISK_USR_LIBEXEC_GIT}/${name}"
+        chmod +x "${DISK_USR_LIBEXEC_GIT}/${name}" 2>/dev/null || true
+        sz="$(stat -c%s "${DISK_USR_LIBEXEC_GIT}/${name}")"
+        helper_count=$((helper_count + 1))
+        total_helper_bytes=$((total_helper_bytes + sz))
+    fi
+done
+echo "[PIVOT-E-GIT] Staged ${helper_count} git-core entries in /usr/libexec/git-core/ (${total_helper_bytes} bytes for real files; symlinks carry no extra bytes)"
 
 # ── Step 4: walk DT_NEEDED transitive closure for git + the helpers ──────────
 # Pattern mirrors install-pivot-e.sh / install-pivot-e-tui.sh.  We add the
@@ -275,18 +258,11 @@ fi
 # fine for a smoke test but the apk package ships a stock hooks/ + info/ +
 # description.  We mirror exactly what's in the rootfs.
 if [ -d "${ROOTFS}/usr/share/git-core/templates" ]; then
-    # cp -aL would dereference symlinks AND preserve attrs; we want plain
-    # recursive copy (FAT32 ignores perms beyond x bit).  Use a per-file
-    # loop so symlinks inside templates become real files.
-    find "${ROOTFS}/usr/share/git-core/templates" -type f -print0 |
-        while IFS= read -r -d '' src; do
-            rel="${src#${ROOTFS}/usr/share/git-core/templates/}"
-            dest="${DISK_USR_SHARE_GIT_TEMPLATES}/${rel}"
-            mkdir -p "$(dirname "${dest}")"
-            cp -fL "${src}" "${dest}"
-        done
-    template_count="$(find "${DISK_USR_SHARE_GIT_TEMPLATES}" -type f | wc -l)"
-    echo "[PIVOT-E-GIT] Staged ${template_count} template files in /usr/share/git-core/templates/"
+    # cp -aP preserves symlinks, permissions, and timestamps; ext2 carries all of
+    # them natively.  Ref: cp(1) §-a (archive), §-P (no symlink deref).
+    cp -aP "${ROOTFS}/usr/share/git-core/templates/." "${DISK_USR_SHARE_GIT_TEMPLATES}/"
+    template_count="$(find "${DISK_USR_SHARE_GIT_TEMPLATES}" | wc -l)"
+    echo "[PIVOT-E-GIT] Staged ${template_count} template entries in /usr/share/git-core/templates/"
 fi
 
 # ── Step 6: write /etc/gitconfig + /root/.gitconfig defaults ─────────────────
@@ -336,7 +312,7 @@ echo "[PIVOT-E-GIT] Wrote fixture /etc/pivot-e/git-fixture.txt ($(stat -c%s "${D
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo "[PIVOT-E-GIT] Done.  Summary:"
 echo "[PIVOT-E-GIT]   - /usr/bin/git                ($(stat -c%s "${DISK_USR_BIN}/git") bytes)"
-echo "[PIVOT-E-GIT]   - /usr/libexec/git-core/      (${helper_count} real helpers)"
+echo "[PIVOT-E-GIT]   - /usr/libexec/git-core/      (${helper_count} entries: real helpers + symlinks)"
 echo "[PIVOT-E-GIT]   - /usr/share/git-core/templates/"
 echo "[PIVOT-E-GIT]   - /etc/gitconfig + /root/.gitconfig"
 echo "[PIVOT-E-GIT]   - /usr/lib/* — DT_NEEDED closure (libpcre2 + libexpat above the Tier B set)"
