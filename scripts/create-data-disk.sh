@@ -90,6 +90,16 @@ ORACLE="${ASTRYXOS_ORACLE:-0}"
 # See scripts/install-pivot-e.sh and docs/PIVOT_E_2026-05-24.md.
 PIVOT_E="${ASTRYXOS_PIVOT_E:-0}"
 
+# When set (env or --pivot-e-tui flag), also stage PIVOT-E Tier C TUI
+# utilities (nano, vim, htop, tmux) plus their DT_NEEDED transitive closure
+# (libncursesw, libevent_core).  Used by the pivot-e-tui-test cargo feature
+# (kernel/src/main.rs + kernel/src/pivot_e_tui_demo.rs) which verifies each
+# TUI binary loads via the PR #450 PTY substrate, prints its version banner,
+# and exits cleanly.  Auto-enables --pivot-e (Tier B substrate, which in
+# turn auto-enables --busybox + --tls).  See scripts/install-pivot-e-tui.sh
+# and docs/PIVOT_E_TIER_C_2026-05-24.md.
+PIVOT_E_TUI="${ASTRYXOS_PIVOT_E_TUI:-0}"
+
 # Firefox package selector (musl variant only).  Picks which Alpine package
 # install-firefox-musl.sh + install-firefox-musl-debug.sh pull:
 #
@@ -156,6 +166,7 @@ for arg in "$@"; do
         --tls) TLS_STACK=1; FORCE=true ;;
         --oracle) ORACLE=1; FORCE=true ;;
         --pivot-e) PIVOT_E=1; FORCE=true ;;
+        --pivot-e-tui) PIVOT_E_TUI=1; PIVOT_E=1; FORCE=true ;;
         [0-9]*) SIZE_MB="$arg" ;;
     esac
 done
@@ -604,6 +615,21 @@ if [ "${PIVOT_E}" = "1" ] || [ "${PIVOT_E}" = "true" ]; then
         [ "${FORCE}" = true ] && PE_FLAGS="--force"
         bash "${ROOT_DIR}/scripts/install-pivot-e.sh" ${PE_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
             { echo "[DATA-DISK] FATAL: install-pivot-e.sh failed"; exit 1; }
+    fi
+fi
+
+# ── PIVOT-E Tier C TUI utilities (--pivot-e-tui / ASTRYXOS_PIVOT_E_TUI=1) ────
+# Tier C requires Tier B substrate (libssl/libcrypto + busybox already
+# auto-enabled by --pivot-e above) AND the per-pair PTY surface landed by
+# PR #450 (kernel side, no extra staging).  --pivot-e-tui auto-enables
+# --pivot-e via the arg-parse line above, so by the time we reach this block
+# the Tier B install has already run.
+if [ "${PIVOT_E_TUI}" = "1" ] || [ "${PIVOT_E_TUI}" = "true" ]; then
+    if [ -f "${ROOT_DIR}/scripts/install-pivot-e-tui.sh" ]; then
+        PET_FLAGS=""
+        [ "${FORCE}" = true ] && PET_FLAGS="--force"
+        bash "${ROOT_DIR}/scripts/install-pivot-e-tui.sh" ${PET_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
+            { echo "[DATA-DISK] FATAL: install-pivot-e-tui.sh failed"; exit 1; }
     fi
 fi
 
@@ -1361,6 +1387,55 @@ EOF
             mcopy -o -i "${DATA_IMG}" "${fx}" "::etc/pivot-e/$(basename "${fx}")"
         done
         echo "[DATA-DISK] Copied /etc/pivot-e/ (sample.json, sample.txt fixtures)"
+    fi
+
+    # ── PIVOT-E Tier C TUI utilities (--pivot-e-tui / ASTRYXOS_PIVOT_E_TUI=1) ─
+    # install-pivot-e-tui.sh has staged at the host side:
+    #   build/disk/usr/bin/nano + vim + htop + tmux
+    #   build/disk/usr/lib/libncursesw.so.6 (+ versioned soname)
+    #   build/disk/usr/lib/libevent_core-2.1.so.7 (tmux only)
+    # libncursesw + libevent are the only Tier C-specific DT_NEEDED edges;
+    # everything else is base musl (covered by the firefox-musl/pivot-e
+    # staging already above).  Terminfo is staged separately in the
+    # /usr/share/terminfo block (PR #450).  Per-file `[ -f ]` keeps this
+    # block empty-glob safe when --pivot-e-tui was not passed.
+    for tui_bin in "${BUILD_DIR}/disk/usr/bin/nano" \
+                   "${BUILD_DIR}/disk/usr/bin/vim" \
+                   "${BUILD_DIR}/disk/usr/bin/htop" \
+                   "${BUILD_DIR}/disk/usr/bin/tmux"; do
+        if [ -f "${tui_bin}" ]; then
+            mmd -i "${DATA_IMG}" "::usr"     2>/dev/null || true
+            mmd -i "${DATA_IMG}" "::usr/bin" 2>/dev/null || true
+            dest="::usr/bin/$(basename "${tui_bin}")"
+            mcopy -o -i "${DATA_IMG}" "${tui_bin}" "${dest}"
+            echo "[DATA-DISK] Copied /usr/bin/$(basename "${tui_bin}") ($(stat -c%s "${tui_bin}") bytes)"
+        fi
+    done
+    # Tier C DT_NEEDED closure libs.  libncursesw.so.6 is the ABI soname
+    # shared across all four utilities; libncursesw.so.6.4 is the realname
+    # both copied to support ld lookups that follow either path.  libevent
+    # is tmux-only.  The walker may also bring in extra extension SOs
+    # (libevent_extra, libevent_pthreads); we copy the union to keep the
+    # block self-contained.
+    for tui_lib in libncursesw.so.6 libncursesw.so.6.4 \
+                   libevent_core-2.1.so.7 libevent_core-2.1.so.7.0.1 \
+                   libevent-2.1.so.7 libevent-2.1.so.7.0.1; do
+        src="${BUILD_DIR}/disk/usr/lib/${tui_lib}"
+        if [ -f "${src}" ]; then
+            mmd -i "${DATA_IMG}" "::usr"     2>/dev/null || true
+            mmd -i "${DATA_IMG}" "::usr/lib" 2>/dev/null || true
+            mcopy -o -i "${DATA_IMG}" "${src}" "::usr/lib/${tui_lib}"
+            echo "[DATA-DISK] Copied /usr/lib/${tui_lib} ($(stat -c%s "${src}") bytes)"
+        fi
+    done
+    # Stage an empty /usr/share/nano so nano doesn't warn about the missing
+    # syntax-file directory on startup.  FAT32 directory must exist; the
+    # mmd is harmless if /usr/share already exists from terminfo staging.
+    if [ -d "${BUILD_DIR}/disk/usr/share/nano" ]; then
+        mmd -i "${DATA_IMG}" "::usr"            2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/share"      2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/share/nano" 2>/dev/null || true
+        echo "[DATA-DISK] Created /usr/share/nano (empty syntax-files dir)"
     fi
 
     # ── BusyBox binary + applet wrapper scripts (built by build-busybox.sh) ─
