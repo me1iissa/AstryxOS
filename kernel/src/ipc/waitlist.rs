@@ -194,19 +194,25 @@ pub enum PollBellSource {
     /// pending signal, and any signalfd/self-pipe loop the process
     /// uses for signal-driven IPC.
     SignalInject = 7,
+    /// `crate::net::udp::handle_udp` / `crate::net::tcp::handle_tcp` —
+    /// AF_INET datagram or stream segment arrival on a bound port.
+    /// Without this, a userspace `poll()` parked on a UDP/TCP socket
+    /// would only re-evaluate on the 1 s resync floor, defeating the
+    /// short timeouts DNS resolvers expect (RFC 1035 §4.2.1).
+    InetRx       = 8,
     /// Catch-all for ad-hoc readiness sources that have not yet been
     /// given their own variant (kept last for ABI tail-stability).
-    Other        = 8,
+    Other        = 9,
 }
 
 /// Number of `PollBellSource` variants — keep in sync with the enum.
-pub const N_BELL_SOURCES: usize = 9;
+pub const N_BELL_SOURCES: usize = 10;
 
 /// Stable string label for each `PollBellSource`, used by kdb to
 /// render the per-source counters.  Indexed by the enum's discriminant.
 pub const BELL_SOURCE_NAMES: [&str; N_BELL_SOURCES] = [
     "pipe", "eventfd", "unix_write", "unix_shutdown",
-    "timerfd", "signalfd", "inotify", "signal_inject", "other",
+    "timerfd", "signalfd", "inotify", "signal_inject", "inet_rx", "other",
 ];
 
 /// Per-source ring counters.  Bumped (Relaxed) at every successful
@@ -217,6 +223,7 @@ pub static BELL_RINGS_BY_SOURCE: [AtomicU64; N_BELL_SOURCES] = [
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0),
 ];
 
 /// Cumulative number of `wait_poll_event` calls that woke via a bell

@@ -178,28 +178,8 @@ pub fn socket_bind(id: u64, port: u16) -> Result<(), &'static str> {
     }
 
     let actual_port = if port == 0 {
-        // Allocate an ephemeral port.  Try up to MAX_TRIES candidates
-        // before giving up — covers the case where the dynamic range is
-        // densely populated with bound sockets.
-        const MAX_TRIES: u16 = 1024;
-        let mut found: Option<u16> = None;
-        for _ in 0..MAX_TRIES {
-            let candidate = NEXT_EPHEMERAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            // Wrap from 65535 back to 49152.
-            let candidate = if candidate < 49152 {
-                NEXT_EPHEMERAL.store(49153, core::sync::atomic::Ordering::Relaxed);
-                49152
-            } else {
-                candidate
-            };
-            // Probe: is this port already bound on this socket type?
-            let collision = match sock.socket_type {
-                SocketType::Udp => super::udp::is_bound(candidate),
-                SocketType::Tcp => super::tcp::is_listening(candidate),
-            };
-            if !collision { found = Some(candidate); break; }
-        }
-        found.ok_or("no ephemeral port available")?
+        alloc_ephemeral_port(sock.socket_type)
+            .ok_or("no ephemeral port available")?
     } else {
         port
     };
@@ -217,6 +197,38 @@ pub fn socket_bind(id: u64, port: u16) -> Result<(), &'static str> {
     sock.local_port = actual_port;
     sock.bound = true;
     Ok(())
+}
+
+/// Allocate an ephemeral local port from the IANA dynamic range
+/// (49152–65535, RFC 6335 §6).  Probes for collisions against the
+/// per-protocol binding table so a freshly-allocated port is not
+/// already in use by another socket.  Returns `None` only when the
+/// entire dynamic range is contested by sockets the caller has not
+/// torn down — `MAX_TRIES` (1024) is well above any realistic guest
+/// workload.
+///
+/// Public-spec ref: RFC 6335 §6 (Service Name and Transport Protocol
+/// Port Number Registry) — ephemeral allocations MUST come from the
+/// 49152–65535 range and MUST avoid clashing with an in-use port.
+fn alloc_ephemeral_port(socket_type: SocketType) -> Option<u16> {
+    const MAX_TRIES: u16 = 1024;
+    for _ in 0..MAX_TRIES {
+        let candidate = NEXT_EPHEMERAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // Wrap from 65535 back to 49152.
+        let candidate = if candidate < 49152 {
+            NEXT_EPHEMERAL.store(49153, core::sync::atomic::Ordering::Relaxed);
+            49152
+        } else {
+            candidate
+        };
+        // Probe: is this port already bound on this socket type?
+        let collision = match socket_type {
+            SocketType::Udp => super::udp::is_bound(candidate),
+            SocketType::Tcp => super::tcp::is_listening(candidate),
+        };
+        if !collision { return Some(candidate); }
+    }
+    None
 }
 
 /// Ephemeral-port allocator for bind(port=0) — IANA dynamic range
@@ -284,7 +296,7 @@ pub fn socket_send(id: u64, data: &[u8]) -> Result<usize, &'static str> {
 
     let socket_type = sock.socket_type;
     let remote_ip = sock.remote_ip;
-    let local_port = sock.local_port;
+    let mut local_port = sock.local_port;
     let remote_port = sock.remote_port;
     let bound = sock.bound;
     let connected = sock.connected;
@@ -294,6 +306,14 @@ pub fn socket_send(id: u64, data: &[u8]) -> Result<usize, &'static str> {
         SocketType::Udp => {
             if remote_ip == [0; 4] {
                 return Err("no destination");
+            }
+            // Auto-bind to an ephemeral port if the caller never called
+            // bind(2) — required so the reply has somewhere to land.
+            // Mirrors `man 2 send`/`man 2 sendto`: "If the socket is a
+            // SOCK_DGRAM socket [...] the socket need not be bound; the
+            // protocol will assign a port automatically." (RFC 6335 §6.)
+            if !bound {
+                local_port = ensure_udp_local_port(id)?;
             }
             super::udp::send(remote_ip, local_port, remote_port, data);
             Ok(data.len())
@@ -325,28 +345,73 @@ pub fn socket_send(id: u64, data: &[u8]) -> Result<usize, &'static str> {
 }
 
 /// Send data to a specific destination (UDP).
+///
+/// Per `man 2 sendto` / IEEE 1003.1 §sendto: a SOCK_DGRAM socket need not
+/// be bound before the first send.  When the caller has not bound a local
+/// port, lazily allocate an ephemeral one from the IANA dynamic range so
+/// the eventual reply can be demultiplexed back to this socket.  Without
+/// this lazy bind, the wire packet's source port is zero and the reply
+/// from the peer matches no per-port UDP binding — the textbook DNS
+/// "Operation timed out" symptom that triggered this fix.
 pub fn socket_sendto(
     id: u64,
     dst_ip: Ipv4Address,
     dst_port: u16,
     data: &[u8],
 ) -> Result<usize, &'static str> {
-    let sockets = SOCKETS.lock();
-    let sock = sockets.iter().find(|s| s.id == id)
-        .ok_or("socket not found")?;
+    let (already_bound, mut local_port) = {
+        let sockets = SOCKETS.lock();
+        let sock = sockets.iter().find(|s| s.id == id)
+            .ok_or("socket not found")?;
 
-    if sock.shut_wr {
-        return Err("EPIPE");
+        if sock.shut_wr {
+            return Err("EPIPE");
+        }
+        if sock.socket_type != SocketType::Udp {
+            return Err("sendto only for UDP");
+        }
+        (sock.bound, sock.local_port)
+    };
+
+    if !already_bound {
+        local_port = ensure_udp_local_port(id)?;
     }
 
-    if sock.socket_type != SocketType::Udp {
-        return Err("sendto only for UDP");
-    }
-
-    super::udp::send(dst_ip, sock.local_port, dst_port, data);
+    super::udp::send(dst_ip, local_port, dst_port, data);
     crate::proc::proc_metrics::bump_net_write(
         crate::proc::current_pid_lockless(), data.len() as u64);
     Ok(data.len())
+}
+
+/// Ensure a UDP socket has a bound local port; allocate an ephemeral one
+/// from the IANA dynamic range (RFC 6335 §6) if not.  Returns the local
+/// port the caller should stamp into the outgoing datagram's source-port
+/// field so the reply demultiplexes back to this socket.
+///
+/// Racing callers (two concurrent sends on the same unbound socket) are
+/// resolved by the SOCKETS-lock check: only the first observer of
+/// `!sock.bound` performs the bind, the second sees `bound==true` and
+/// reuses the already-allocated port.
+fn ensure_udp_local_port(id: u64) -> Result<u16, &'static str> {
+    // Allocate before re-acquiring the per-socket lock so the alloc
+    // (which probes the udp::is_bound table) doesn't compose two locks.
+    let port = alloc_ephemeral_port(SocketType::Udp)
+        .ok_or("no ephemeral port available")?;
+    super::udp::bind(port)?;
+
+    let mut sockets = SOCKETS.lock();
+    let sock = sockets.iter_mut().find(|s| s.id == id)
+        .ok_or("socket not found")?;
+    if sock.bound {
+        // Lost the race; release the port we just reserved and use the
+        // winner's port.  Without this branch we'd leak `port` in
+        // UDP_BINDINGS until the socket closed.
+        super::udp::unbind(port);
+        return Ok(sock.local_port);
+    }
+    sock.local_port = port;
+    sock.bound = true;
+    Ok(port)
 }
 
 /// Receive data from a socket (non-blocking).
@@ -626,6 +691,20 @@ pub fn socket_shutdown(id: u64, how: i32) -> i32 {
 }
 
 /// Set the remote endpoint for a socket and initiate TCP connection if applicable.
+///
+/// For UDP (SOCK_DGRAM), `connect(2)` does not generate any wire traffic —
+/// IEEE 1003.1 §connect specifies that a connectionless socket merely records
+/// the peer 4-tuple so subsequent `send(2)` calls implicitly target it and
+/// `recv(2)` filters inbound datagrams against it.  The kernel still has to
+/// allocate a local port for the reply demultiplexing path: without an
+/// ephemeral bind, the source port on the wire is zero and the DNS server's
+/// response would not match any port-keyed UDP binding (RFC 768 §"Source
+/// Port", RFC 6335 §6).  We therefore lazily bind a 49152–65535 ephemeral
+/// when the caller has not already called `bind(2)`.
+///
+/// For TCP, the existing connect path opens a TCB and drives the SYN; the
+/// 3-way-handshake state-machine wait happens in the syscall stub (so we
+/// can yield without holding the SOCKETS mutex), per RFC 793 §3.4.
 pub fn socket_connect(id: u64, remote_ip: Ipv4Address, remote_port: u16) -> Result<(), &'static str> {
     let mut sockets = SOCKETS.lock();
     let sock = sockets.iter_mut().find(|s| s.id == id)
@@ -635,10 +714,25 @@ pub fn socket_connect(id: u64, remote_ip: Ipv4Address, remote_port: u16) -> Resu
     sock.remote_port = remote_port;
     sock.connected = true;
 
-    if sock.socket_type == SocketType::Tcp {
-        let local_port = super::tcp::connect(remote_ip, remote_port)?;
-        sock.local_port = local_port;
-        sock.bound = true;
+    match sock.socket_type {
+        SocketType::Tcp => {
+            let local_port = super::tcp::connect(remote_ip, remote_port)?;
+            sock.local_port = local_port;
+            sock.bound = true;
+        }
+        SocketType::Udp => {
+            // POSIX: connect(2) on a SOCK_DGRAM socket sets the peer but
+            // sends nothing.  We still need a bound local port so the
+            // reply lands somewhere — auto-bind when the caller has not.
+            if !sock.bound {
+                let socket_type = sock.socket_type;
+                let port = alloc_ephemeral_port(socket_type)
+                    .ok_or("no ephemeral port available")?;
+                super::udp::bind(port)?;
+                sock.local_port = port;
+                sock.bound = true;
+            }
+        }
     }
     Ok(())
 }
