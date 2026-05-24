@@ -20,9 +20,9 @@ the substrate end-to-end, defer the full TLS substrate to I1.
 
 Wire shape
 ----------
-This release of oracle (infrasvc git 7b03aa65, the pinned tag in
-`scripts/install-oracle.sh`) uses `infrasvc::sync::HttpSync` — NOT
-WebSocket-over-TLS as the legacy audit described.  HttpSync sends:
+The endpoint-agent build staged via `scripts/install-oracle.sh` uses an
+HTTP sync protocol — NOT WebSocket-over-TLS as some earlier scratch
+notes described.  It sends:
 
     POST /v1/hosts/<hostname>/heartbeat HTTP/1.1
     Host: <server-from-INFRASVC_SYNC_URL>
@@ -38,7 +38,7 @@ on top, producing `/heartbeat/v1/hosts/<hostname>/heartbeat`.
 
 Either way the stub expects 2xx for "accepted" / 4xx/5xx for "rejected".
 See the symbols
-`<infrasvc::sync::HttpSync as infrasvc::sync::SyncBackend>::send_heartbeat`
+`<HttpSync as SyncBackend>::send_heartbeat`
 and the "Conflux rejected heartbeat: " / "Heartbeat sent for" log strings
 shipping in the oracle binary.  We therefore accept all three observed
 request shapes (per `do_POST` route below):
@@ -160,7 +160,7 @@ class ConfluxStubHandler(BaseHTTPRequestHandler):
         # Accept both the legacy `/heartbeat` shorthand AND the Conflux v1
         # canonical path `/v1/hosts/<hostname>/heartbeat` that the shipped
         # oracle binary constructs as `<INFRASVC_SYNC_URL>/v1/hosts/<host>/heartbeat`.
-        # Per oracle's `infrasvc::sync::HttpSync::send_heartbeat`, when
+        # Per oracle's `the HTTP sync send_heartbeat path`, when
         # `INFRASVC_SYNC_URL` is set to a bare base URL (no path), the client
         # appends `/v1/hosts/<host>/heartbeat`; when set to a URL that already
         # has `/heartbeat` as its path, the appended suffix is grafted on so
@@ -244,7 +244,7 @@ class ConfluxStubHandler(BaseHTTPRequestHandler):
         )
 
         # Reply shape mirrors what reqwest's send_heartbeat happy-path
-        # logic in `infrasvc::sync::HttpSync` accepts: 2xx + non-empty body
+        # logic in the HTTP sync backend accepts: 2xx + non-empty body
         # is enough to log "Heartbeat sent for <hostname>" on the guest.
         self._ok_json({"accepted": True, "protocol_version": 2, "seq": seq})
 
