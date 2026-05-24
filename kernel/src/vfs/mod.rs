@@ -705,14 +705,15 @@ fn init_virtio_disks() -> bool {
                 "[VFS]   Partition {}: type={:?}, start={}, size={} sectors",
                 part.index, part.partition_type, part.start_lba, part.sector_count
             );
-            let pdev = partition::create_partition_device(
+            // Each Fs::new consumes the BlockDevice; build a fresh one per try.
+            let new_pdev = || partition::create_partition_device(
                 Box::new(virtio_blk::VirtioBlkBlockDevice),
                 part.start_lba,
                 part.sector_count,
             );
             match part.partition_type {
                 partition::PartitionType::Fat32 => {
-                    match fat32::Fat32Fs::new(Box::new(pdev)) {
+                    match fat32::Fat32Fs::new(Box::new(new_pdev())) {
                         Ok(fs) => {
                             let root_inode = fs.root_inode();
                             mount("/disk", Box::new(fs), root_inode);
@@ -730,7 +731,7 @@ fn init_virtio_disks() -> bool {
                     }
                 }
                 partition::PartitionType::Ntfs => {
-                    if let Some(fs) = ntfs::try_mount_ntfs(Box::new(pdev)) {
+                    if let Some(fs) = ntfs::try_mount_ntfs(Box::new(new_pdev())) {
                         let root_inode = fs.root_inode();
                         mount("/ntfs", Box::new(fs), root_inode);
                         crate::serial_println!(
@@ -738,6 +739,18 @@ fn init_virtio_disks() -> bool {
                         );
                         return true;
                     }
+                }
+                partition::PartitionType::LinuxExt => {
+                    if let Some(fs) = ext2::try_mount_ext2(Box::new(new_pdev())) {
+                        mount("/disk", Box::new(fs), ext2::EXT2_ROOT_INODE);
+                        crate::serial_println!(
+                            "[VFS] ext2 partition mounted at /disk (virtio-blk)"
+                        );
+                        return true;
+                    }
+                    crate::serial_println!(
+                        "[VFS] ext2 mount failed on virtio-blk LinuxExt partition"
+                    );
                 }
                 _ => {
                     crate::serial_println!(
@@ -749,7 +762,8 @@ fn init_virtio_disks() -> bool {
         }
     }
 
-    // Fallback: try whole-disk FAT32.
+    // Fallback: try whole-disk FAT32, then ext2.  ext2 added per the
+    // 2026-05-24 FAT32 → ext2 data-disk migration plan.
     crate::serial_println!(
         "[VFS] No partitions on virtio-blk, trying whole disk FAT32..."
     );
@@ -758,13 +772,19 @@ fn init_virtio_disks() -> bool {
             let root_inode = fs.root_inode();
             mount("/disk", Box::new(fs), root_inode);
             crate::serial_println!("[VFS] FAT32 whole-disk mounted at /disk (virtio-blk)");
-            true
+            return true;
         }
         Err(_) => {
-            crate::serial_println!("[VFS] Virtio-blk disk is not FAT32");
-            false
+            crate::serial_println!("[VFS] Virtio-blk disk is not FAT32, trying ext2...");
         }
     }
+    if let Some(fs) = ext2::try_mount_ext2(Box::new(virtio_blk::VirtioBlkBlockDevice)) {
+        mount("/disk", Box::new(fs), ext2::EXT2_ROOT_INODE);
+        crate::serial_println!("[VFS] ext2 whole-disk mounted at /disk (virtio-blk)");
+        return true;
+    }
+    crate::serial_println!("[VFS] Virtio-blk disk is neither FAT32 nor ext2");
+    false
 }
 
 /// Probe AHCI ports for partitions and mount FAT32/NTFS volumes.
@@ -799,15 +819,15 @@ fn init_ahci_disks() -> bool {
                 crate::serial_println!("[VFS]   Partition {}: type={:?}, start={}, size={} sectors",
                     part.index, part.partition_type, part.start_lba, part.sector_count);
 
+                let new_pdev = || partition::create_partition_device(
+                    Box::new(AhciBlockDevice::new(port)),
+                    part.start_lba,
+                    part.sector_count,
+                );
                 match part.partition_type {
                     partition::PartitionType::Fat32 => {
                         // Try FAT32 first
-                        let pdev = partition::create_partition_device(
-                            Box::new(AhciBlockDevice::new(port)),
-                            part.start_lba,
-                            part.sector_count,
-                        );
-                        match fat32::Fat32Fs::new(Box::new(pdev)) {
+                        match fat32::Fat32Fs::new(Box::new(new_pdev())) {
                             Ok(fs) => {
                                 let root_inode = fs.root_inode();
                                 mount("/disk", Box::new(fs), root_inode);
@@ -818,12 +838,7 @@ fn init_ahci_disks() -> bool {
                             Err(_) => {}
                         }
                         // Try NTFS
-                        let pdev = partition::create_partition_device(
-                            Box::new(AhciBlockDevice::new(port)),
-                            part.start_lba,
-                            part.sector_count,
-                        );
-                        if let Some(fs) = ntfs::try_mount_ntfs(Box::new(pdev)) {
+                        if let Some(fs) = ntfs::try_mount_ntfs(Box::new(new_pdev())) {
                             let root_inode = fs.root_inode();
                             mount("/ntfs", Box::new(fs), root_inode);
                             crate::serial_println!("[VFS] NTFS partition mounted at /ntfs (AHCI port {})", port);
@@ -831,16 +846,20 @@ fn init_ahci_disks() -> bool {
                         }
                     }
                     partition::PartitionType::Ntfs => {
-                        let pdev = partition::create_partition_device(
-                            Box::new(AhciBlockDevice::new(port)),
-                            part.start_lba,
-                            part.sector_count,
-                        );
-                        if let Some(fs) = ntfs::try_mount_ntfs(Box::new(pdev)) {
+                        if let Some(fs) = ntfs::try_mount_ntfs(Box::new(new_pdev())) {
                             let root_inode = fs.root_inode();
                             mount("/ntfs", Box::new(fs), root_inode);
                             crate::serial_println!("[VFS] NTFS partition mounted at /ntfs (AHCI port {})", port);
                             mounted_any = true;
+                        }
+                    }
+                    partition::PartitionType::LinuxExt => {
+                        if let Some(fs) = ext2::try_mount_ext2(Box::new(new_pdev())) {
+                            mount("/disk", Box::new(fs), ext2::EXT2_ROOT_INODE);
+                            crate::serial_println!("[VFS] ext2 partition mounted at /disk (AHCI port {})", port);
+                            mounted_any = true;
+                        } else {
+                            crate::serial_println!("[VFS] ext2 mount failed on AHCI port {} LinuxExt partition", port);
                         }
                     }
                     _ => {
@@ -849,20 +868,26 @@ fn init_ahci_disks() -> bool {
                 }
             }
         } else {
-            // No partition table — try whole disk as FAT32 (legacy behavior)
+            // No partition table — try whole disk as FAT32 (legacy), then ext2.
             crate::serial_println!("[VFS] No partitions found on AHCI port {}, trying whole disk as FAT32...", port);
-            let device = Box::new(AhciBlockDevice::new(port));
-
-            match fat32::Fat32Fs::new(device) {
+            match fat32::Fat32Fs::new(Box::new(AhciBlockDevice::new(port))) {
                 Ok(fs) => {
                     let root_inode = fs.root_inode();
                     mount("/disk", Box::new(fs), root_inode);
                     crate::serial_println!("[VFS] FAT32 whole-disk mounted at /disk (AHCI port {})", port);
                     mounted_any = true;
+                    continue;
                 }
                 Err(e) => {
-                    crate::serial_println!("[VFS] AHCI port {} is not FAT32: {:?}", port, e);
+                    crate::serial_println!("[VFS] AHCI port {} is not FAT32: {:?}, trying ext2...", port, e);
                 }
+            }
+            if let Some(fs) = ext2::try_mount_ext2(Box::new(AhciBlockDevice::new(port))) {
+                mount("/disk", Box::new(fs), ext2::EXT2_ROOT_INODE);
+                crate::serial_println!("[VFS] ext2 whole-disk mounted at /disk (AHCI port {})", port);
+                mounted_any = true;
+            } else {
+                crate::serial_println!("[VFS] AHCI port {} is neither FAT32 nor ext2", port);
             }
         }
     }
@@ -892,16 +917,20 @@ fn init_ata_disks() {
                 crate::serial_println!("[VFS]   Partition {}: type={:?}, start={}, size={} sectors",
                     part.index, part.partition_type, part.start_lba, part.sector_count);
 
-                // Re-probe to get a fresh device for this partition
-                let fresh_devs = crate::drivers::ata::probe_all();
-                if let Some(fresh_dev) = fresh_devs.into_iter().nth(dev_idx) {
-                    let pdev = partition::create_partition_device(
-                        Box::new(fresh_dev),
-                        part.start_lba,
-                        part.sector_count,
-                    );
-                    match part.partition_type {
-                        partition::PartitionType::Fat32 => {
+                // Helper: re-probe ATA and build a fresh partition device
+                // for `dev_idx` — needed because each Fs::new consumes its
+                // BlockDevice, and ATA devices are not Clone.
+                let new_pdev = || -> Option<crate::drivers::partition::PartitionBlockDevice> {
+                    let fresh = crate::drivers::ata::probe_all();
+                    fresh.into_iter().nth(dev_idx).map(|d| {
+                        partition::create_partition_device(
+                            Box::new(d), part.start_lba, part.sector_count,
+                        )
+                    })
+                };
+                match part.partition_type {
+                    partition::PartitionType::Fat32 => {
+                        if let Some(pdev) = new_pdev() {
                             match fat32::Fat32Fs::new(Box::new(pdev)) {
                                 Ok(fs) => {
                                     let root_inode = fs.root_inode();
@@ -910,12 +939,7 @@ fn init_ata_disks() {
                                     return;
                                 }
                                 Err(_) => {
-                                    // Try NTFS on this partition instead
-                                    let fresh_devs2 = crate::drivers::ata::probe_all();
-                                    if let Some(fd) = fresh_devs2.into_iter().nth(dev_idx) {
-                                        let pd = partition::create_partition_device(
-                                            Box::new(fd), part.start_lba, part.sector_count,
-                                        );
+                                    if let Some(pd) = new_pdev() {
                                         if let Some(fs) = ntfs::try_mount_ntfs(Box::new(pd)) {
                                             let root_inode = fs.root_inode();
                                             mount("/ntfs", Box::new(fs), root_inode);
@@ -925,16 +949,28 @@ fn init_ata_disks() {
                                 }
                             }
                         }
-                        partition::PartitionType::Ntfs => {
+                    }
+                    partition::PartitionType::Ntfs => {
+                        if let Some(pdev) = new_pdev() {
                             if let Some(fs) = ntfs::try_mount_ntfs(Box::new(pdev)) {
                                 let root_inode = fs.root_inode();
                                 mount("/ntfs", Box::new(fs), root_inode);
                                 crate::serial_println!("[VFS] NTFS partition mounted at /ntfs (ATA dev {})", dev_idx);
                             }
                         }
-                        _ => {
-                            crate::serial_println!("[VFS]   Skipping unsupported partition type: {:?}", part.partition_type);
+                    }
+                    partition::PartitionType::LinuxExt => {
+                        if let Some(pdev) = new_pdev() {
+                            if let Some(fs) = ext2::try_mount_ext2(Box::new(pdev)) {
+                                mount("/disk", Box::new(fs), ext2::EXT2_ROOT_INODE);
+                                crate::serial_println!("[VFS] ext2 partition mounted at /disk (ATA dev {})", dev_idx);
+                                return;
+                            }
+                            crate::serial_println!("[VFS] ext2 mount failed on ATA dev {} LinuxExt partition", dev_idx);
                         }
+                    }
+                    _ => {
+                        crate::serial_println!("[VFS]   Skipping unsupported partition type: {:?}", part.partition_type);
                     }
                 }
             }
@@ -943,7 +979,7 @@ fn init_ata_disks() {
         }
     }
 
-    // Fallback: try each ATA device as whole-disk FAT32.
+    // Fallback: try each ATA device as whole-disk FAT32, then ext2.
     // Mount the LARGEST valid FAT32 device at /disk (this skips the small
     // boot ESP and picks the data disk).  Other valid devices get skipped
     // for now — in the future they could be mounted at /disk2 etc.
@@ -976,7 +1012,16 @@ fn init_ata_disks() {
                     return;
                 }
                 Err(e) => {
-                    crate::serial_println!("[VFS] ATA dev {} FAT32 mount failed: {:?}", best_idx, e);
+                    crate::serial_println!("[VFS] ATA dev {} FAT32 mount failed: {:?}, trying ext2...", best_idx, e);
+                    let fresh2 = crate::drivers::ata::probe_all();
+                    if let Some(dev2) = fresh2.into_iter().nth(best_idx) {
+                        if let Some(fs) = ext2::try_mount_ext2(Box::new(dev2)) {
+                            mount("/disk", Box::new(fs), ext2::EXT2_ROOT_INODE);
+                            crate::serial_println!("[VFS] ext2 whole-disk mounted at /disk (ATA dev {}, largest)", best_idx);
+                            return;
+                        }
+                        crate::serial_println!("[VFS] ATA dev {} is neither FAT32 nor ext2", best_idx);
+                    }
                 }
             }
         }

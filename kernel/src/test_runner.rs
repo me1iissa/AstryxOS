@@ -361,6 +361,11 @@ pub fn run() -> ! {
     total += 1;
     if test_ext2_superblock_validation() { passed += 1; }
 
+    // ── EXT2-LINK-1: symlink target decoding (fast + slow forms) ────────────
+
+    total += 1;
+    if test_ext2_symlink_decoding() { passed += 1; }
+
     // ── Test 18: Signal Delivery Trampoline ─────────────────────────────
 
     total += 1;
@@ -5111,6 +5116,204 @@ fn test_ext2_superblock_validation() -> bool {
 
     if ok {
         test_pass!("EXT2-SB-1");
+    }
+    ok
+}
+
+// ============================================================================
+// EXT2-LINK-1: symbolic-link target decoding (fast + slow forms)
+// ============================================================================
+//
+// Per the second-extended-filesystem specification
+// (<https://www.nongnu.org/ext2-doc/ext2.html#symbolic-links>), a symlink
+// inode encodes its target in one of two forms:
+//
+//   * **Fast symlink** — target stored inline in the 15-entry `i_block[]`
+//     array (60 bytes total) when `i_size <= 60` AND `i_blocks == 0`.
+//     Saves a data-block allocation for short targets like `../bin/sh`.
+//   * **Slow symlink** — target stored in regular file-data blocks,
+//     read via the normal file-data path.  Used when `i_size > 60` or
+//     `i_blocks != 0`.
+//
+// PR-A makes `Ext2Fs::readlink` honour both forms.  This test exercises
+// the fast-symlink decoder directly via `decode_symlink_for_test`,
+// covering: (1) a typical short target, (2) the 60-byte maximum, (3) a
+// target shorter than 60 bytes with trailing zero-padding in the
+// `i_block[]` array, (4) an empty (`i_size = 0`) symlink, and (5) the
+// non-symlink rejection path (mode is regular file).
+//
+// The slow-symlink read path is exercised end-to-end at boot whenever
+// the data disk is ext2 — there is no in-RAM ext2 image small enough
+// to fixture here without duplicating a full mkfs.ext2 pass, so the
+// fast-symlink unit test plus the boot-time integration coverage are
+// the right split.
+//
+// POSIX `readlink(2)` reference: returns the byte count placed in the
+// caller's buffer (without a NUL terminator); we return a `String` to
+// the VFS, which formats the userland-visible buffer at the syscall
+// boundary.
+
+fn test_ext2_symlink_decoding() -> bool {
+    test_header!("EXT2-LINK-1: symlink target decoding (fast + slow forms)");
+    use crate::vfs::ext2::{Ext2Fs, Ext2Inode, Superblock};
+
+    let sb = Superblock {
+        inodes_count: 100,
+        blocks_count: 1024,
+        r_blocks_count: 0,
+        free_blocks_count: 1000,
+        free_inodes_count: 90,
+        first_data_block: 1,
+        log_block_size: 0,
+        log_frag_size: 0,
+        blocks_per_group: 8192,
+        frags_per_group: 8192,
+        inodes_per_group: 100,
+        mtime: 0,
+        wtime: 0,
+        mnt_count: 0,
+        max_mnt_count: 0,
+        magic: 0xEF53,
+        state: 1,
+        errors: 0,
+        minor_rev_level: 0,
+        lastcheck: 0,
+        checkinterval: 0,
+        creator_os: 0,
+        rev_level: 0,
+        def_resuid: 0,
+        def_resgid: 0,
+        first_ino: 11,
+        inode_size: 128,
+    };
+    fn dummy_read(_sector: u64, _count: u16, _buf: &mut [u8]) -> Result<(), &'static str> {
+        Err("unused in test")
+    }
+    let fs = Ext2Fs::try_from_superblock_for_test(sb, dummy_read)
+        .expect("test superblock must validate");
+
+    // Helper: pack a target string into the i_block[] array as a fast
+    // symlink would on-disk.  Each u32 entry stores 4 raw little-endian
+    // bytes of the target.
+    fn make_fast_symlink(target: &[u8]) -> Ext2Inode {
+        let mut block = [0u32; 15];
+        for i in 0..15 {
+            let base = i * 4;
+            let mut bytes = [0u8; 4];
+            for j in 0..4 {
+                if base + j < target.len() {
+                    bytes[j] = target[base + j];
+                }
+            }
+            block[i] = u32::from_le_bytes(bytes);
+        }
+        Ext2Inode {
+            mode: 0xA000 | 0o777, // S_IFLNK | 0777
+            uid: 0,
+            size: target.len() as u32,
+            atime: 0, ctime: 0, mtime: 0, dtime: 0,
+            gid: 0,
+            links_count: 1,
+            blocks: 0, // fast symlink discriminator
+            flags: 0,
+            osd1: 0,
+            block,
+            generation: 0,
+            file_acl: 0,
+            dir_acl: 0,
+            faddr: 0,
+            osd2: [0u8; 12],
+        }
+    }
+
+    let mut ok = true;
+
+    // [1] Short fast symlink — typical case.
+    {
+        let ino = make_fast_symlink(b"../bin/sh");
+        match fs.decode_symlink_for_test(&ino) {
+            Some(s) if s == "../bin/sh" => {
+                test_println!("  [1] short fast symlink decodes to '../bin/sh'");
+            }
+            other => {
+                test_fail!("EXT2-LINK-1", "short fast symlink: got {:?}", other);
+                ok = false;
+            }
+        }
+    }
+
+    // [2] 60-byte (maximum) fast symlink.
+    {
+        let target = b"012345678901234567890123456789012345678901234567890123456789";
+        assert_eq!(target.len(), 60);
+        let ino = make_fast_symlink(target);
+        match fs.decode_symlink_for_test(&ino) {
+            Some(s) if s.as_bytes() == target => {
+                test_println!("  [2] 60-byte (max) fast symlink round-trips");
+            }
+            other => {
+                test_fail!("EXT2-LINK-1", "60-byte fast symlink: got {:?}", other);
+                ok = false;
+            }
+        }
+    }
+
+    // [3] Short target with trailing zero-padding in i_block[] — common on
+    // disk because mke2fs zeros the unused tail.  Decoder must honour
+    // i_size, not scan for NUL.
+    {
+        let mut ino = make_fast_symlink(b"abc");
+        // i_size says 3; the i_block[] tail is already zero from the helper.
+        // Sanity: i_block[0] low 3 bytes are 'a','b','c'.
+        assert_eq!(ino.size, 3);
+        // Also verify the decoder strips any NULs inside the declared
+        // length range — set the target to "ab\0" (length 3) to confirm
+        // the trailing NUL is dropped per the implementation's policy.
+        ino = make_fast_symlink(b"ab\0");
+        ino.size = 3;
+        match fs.decode_symlink_for_test(&ino) {
+            Some(s) if s == "ab" => {
+                test_println!("  [3] short fast symlink with trailing NUL → trimmed");
+            }
+            other => {
+                test_fail!("EXT2-LINK-1", "NUL-trimmed fast symlink: got {:?}", other);
+                ok = false;
+            }
+        }
+    }
+
+    // [4] Empty symlink (i_size == 0) — degenerate but legal.
+    {
+        let ino = make_fast_symlink(b"");
+        match fs.decode_symlink_for_test(&ino) {
+            Some(s) if s.is_empty() => {
+                test_println!("  [4] empty fast symlink → empty string");
+            }
+            other => {
+                test_fail!("EXT2-LINK-1", "empty fast symlink: got {:?}", other);
+                ok = false;
+            }
+        }
+    }
+
+    // [5] Non-symlink (regular file) must be rejected — readlink(2) returns
+    // EINVAL on a non-symbolic-link inode per POSIX.1-2017 §readlink(2).
+    {
+        let mut ino = make_fast_symlink(b"target");
+        ino.mode = 0o100644; // S_IFREG | 0644
+        match fs.decode_symlink_for_test(&ino) {
+            None => {
+                test_println!("  [5] regular-file inode rejected by symlink decoder");
+            }
+            other => {
+                test_fail!("EXT2-LINK-1", "non-symlink decoded: got {:?}", other);
+                ok = false;
+            }
+        }
+    }
+
+    if ok {
+        test_pass!("EXT2-LINK-1");
     }
     ok
 }

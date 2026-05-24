@@ -189,10 +189,12 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     serial_println!("[Aether] Phase 7: VFS, IPC & I/O subsystem init...");
     vfs::init();
     serial_println!("[Aether] Phase 7a: VFS OK");
+    // init_fat32() probes the disk for FAT32 *and* ext2 (added 2026-05-24
+    // per the FAT32 → ext2 data-disk migration plan).  The historical
+    // ext2::try_mount() hardcoded ATA disk 0 (the boot ESP, never ext2)
+    // and is gone; ext2 is now reached through init_disks().
     vfs::init_fat32();
-    serial_println!("[Aether] Phase 7a: FAT32 OK");
-    vfs::ext2::try_mount();
-    serial_println!("[Aether] Phase 7a: ext2 OK");
+    serial_println!("[Aether] Phase 7a: FAT32/ext2 OK");
     ipc::init();
     serial_println!("[Aether] Phase 7b: IPC OK");
     io::init();
