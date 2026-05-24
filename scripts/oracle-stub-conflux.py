@@ -24,20 +24,29 @@ This release of oracle (infrasvc git 7b03aa65, the pinned tag in
 `scripts/install-oracle.sh`) uses `infrasvc::sync::HttpSync` — NOT
 WebSocket-over-TLS as the legacy audit described.  HttpSync sends:
 
-    POST /heartbeat HTTP/1.1
+    POST /v1/hosts/<hostname>/heartbeat HTTP/1.1
     Host: <server-from-INFRASVC_SYNC_URL>
     Content-Type: application/json
     Content-Length: N
 
     {"hostname": ..., "agent_version": ..., "timestamp": ..., ...}
 
-and expects 2xx for "accepted" or 4xx/5xx for "rejected".  See the symbols
+The route suffix `/v1/hosts/<hostname>/heartbeat` is appended to whatever
+URL is configured in `INFRASVC_SYNC_URL` / `[sync] server_url`.  If the
+configured URL already includes `/heartbeat`, oracle grafts the v1 path
+on top, producing `/heartbeat/v1/hosts/<hostname>/heartbeat`.
+
+Either way the stub expects 2xx for "accepted" / 4xx/5xx for "rejected".
+See the symbols
 `<infrasvc::sync::HttpSync as infrasvc::sync::SyncBackend>::send_heartbeat`
 and the "Conflux rejected heartbeat: " / "Heartbeat sent for" log strings
-shipping in the oracle binary.  We therefore implement the *minimum subset*:
+shipping in the oracle binary.  We therefore accept all three observed
+request shapes (per `do_POST` route below):
 
   - `GET /healthz` → 200 OK `{"ok":true}` (smoke ping, optional)
   - `POST /heartbeat` → 200 OK `{"accepted":true,"protocol_version":2}`
+  - `POST /v1/hosts/<hostname>/heartbeat` → same (canonical Conflux v1 form)
+  - `POST /heartbeat/v1/hosts/<hostname>/heartbeat` → same (when SYNC_URL had `/heartbeat`)
   - Anything else → 404 Not Found
 
 This is intentionally TLS-free (defers the I1 ca-certificates / OpenSSL soak)
@@ -148,7 +157,25 @@ class ConfluxStubHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         global HEARTBEATS_TOTAL  # noqa: PLW0603
 
-        if self.path != "/heartbeat":
+        # Accept both the legacy `/heartbeat` shorthand AND the Conflux v1
+        # canonical path `/v1/hosts/<hostname>/heartbeat` that the shipped
+        # oracle binary constructs as `<INFRASVC_SYNC_URL>/v1/hosts/<host>/heartbeat`.
+        # Per oracle's `infrasvc::sync::HttpSync::send_heartbeat`, when
+        # `INFRASVC_SYNC_URL` is set to a bare base URL (no path), the client
+        # appends `/v1/hosts/<host>/heartbeat`; when set to a URL that already
+        # has `/heartbeat` as its path, the appended suffix is grafted on so
+        # the resulting URL is `/heartbeat/v1/hosts/<host>/heartbeat`.  Both
+        # request shapes carry the same heartbeat body — accept them both so
+        # the stub is robust to either INFRASVC_SYNC_URL convention.
+        # RFC 9110 §3.4 (Request-URI) does not require a literal match of
+        # the configured route; a server may serve multiple URIs.
+        p = self.path
+        is_heartbeat = (
+            p == "/heartbeat"
+            or p.endswith("/heartbeat")
+            and (p.startswith("/v1/hosts/") or p.startswith("/heartbeat/v1/hosts/"))
+        )
+        if not is_heartbeat:
             self._not_found()
             return
 
