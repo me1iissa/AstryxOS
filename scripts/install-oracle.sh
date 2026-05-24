@@ -226,6 +226,76 @@ refresh_interval_hours = 24
 EOF
 echo "[ORACLE] Wrote /etc/oracle/config.toml (sync disabled, process+security collectors off)"
 
+# ── Step 4a: write /etc/oracle/daemon.toml (PIVOT-I2 Phase D, 2026-05-23) ────
+# Companion config used by --features oracle-daemon-test (kernel-side launcher
+# is `oracle_demo::run_oracle_daemon`).  Differs from the first-boot config
+# in three places:
+#
+#   - [sync] enabled = true + server_url points at the QEMU SLIRP host
+#     alias 10.0.2.2:8088 where `scripts/oracle-stub-conflux.py` listens
+#     (plain HTTP, no TLS — defers I1 work per audit §7).
+#   - [polling] interval_secs = 10 so heartbeats fire ~every 10 s instead
+#     of every 60 s, keeping the demo soak short.
+#   - [polling] changes_only = false so every poll iteration triggers a
+#     heartbeat, even when nothing on the host changed.  The first-boot
+#     config uses changes_only=false too; explicit here for emphasis.
+#
+# This config exists IN PARALLEL with config.toml; the kernel-side launcher
+# selects which file to use via the `--config /etc/oracle/<file>` CLI flag,
+# so the existing --once first-boot flow remains untouched.
+cat > "${DISK_ETC_ORACLE}/daemon.toml" <<'EOF'
+# Oracle Endpoint Agent — AstryxOS daemon-mode config (PIVOT-I2 Phase D, 2026-05-23).
+# Companion to /etc/oracle/config.toml; selected by the kernel-side
+# oracle_demo::run_oracle_daemon launcher via `--config /etc/oracle/daemon.toml`.
+# Enables sync to the host-side stub Conflux on 10.0.2.2:8088 (the QEMU SLIRP
+# gateway alias).  Per audit §7 ("Minimum viable demo — defer I1 path"):
+# plain HTTP, no TLS substrate dependency.
+[service]
+name = "oracle"
+display_name = "Oracle Endpoint Agent"
+description = "Oracle endpoint agent (AstryxOS daemon-mode demo)"
+
+[host_metadata]
+
+[polling]
+interval_secs = 10
+include_loopback = false
+changes_only = false
+
+[polling.collectors.network]
+enabled = true
+
+[polling.collectors.system]
+enabled = true
+
+[polling.collectors.hardware]
+enabled = true
+
+[polling.collectors.process]
+enabled = false
+
+[polling.collectors.security]
+enabled = false
+
+[logging]
+level = "info"
+enable_file = false
+enable_platform_log = false
+
+[sync]
+# Enabled for the daemon-mode demo.  Target is the QEMU SLIRP gateway
+# alias 10.0.2.2 where `scripts/oracle-stub-conflux.py` listens on port
+# 8088 (plain HTTP, no TLS — defers I1 ca-certificates work).
+enabled = true
+server_url = "http://10.0.2.2:8088/heartbeat"
+interval_secs = 10
+
+[patching]
+enforcement_enabled = false
+refresh_interval_hours = 24
+EOF
+echo "[ORACLE] Wrote /etc/oracle/daemon.toml (sync enabled → 10.0.2.2:8088, 10s heartbeat)"
+
 # ── Step 4b: walk oracle's DT_NEEDED transitive closure ──────────────────────
 # Oracle's *direct* DT_NEEDED is just libssl.so.3, libcrypto.so.3, libgcc_s.so.1,
 # libm.so.6, libc.so.6 — but libcrypto.so.3 itself pulls in libz.so.1 and

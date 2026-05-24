@@ -1430,9 +1430,16 @@ def _regen_data_img(root_dir: Path,
 # argv tail and can audit it.
 _DEMO_BIN_SPEC = [
     # (cargo-feature, create-data-disk-flag, env-var-name)
-    ("oracle-test", "--oracle", "ASTRYXOS_ORACLE"),
-    ("sshd-test",   "--sshd",   "ASTRYXOS_SSHD"),
-    ("tls-test",    "--tls",    "ASTRYXOS_TLS"),
+    ("oracle-test",        "--oracle", "ASTRYXOS_ORACLE"),
+    # oracle-daemon-test reuses the same staged binary as oracle-test
+    # (same /usr/bin/oracle + glibc + libssl3 DT_NEEDED closure); the
+    # only divergence is the kernel-side launcher (--once vs daemon-mode
+    # + INFRASVC_SYNC_URL override).  Mapping both features to the same
+    # staging flag keeps the data.img stage cost amortised — agents that
+    # toggle between the two feature builds don't re-stage.
+    ("oracle-daemon-test", "--oracle", "ASTRYXOS_ORACLE"),
+    ("sshd-test",          "--sshd",   "ASTRYXOS_SSHD"),
+    ("tls-test",           "--tls",    "ASTRYXOS_TLS"),
 ]
 
 
@@ -2598,6 +2605,91 @@ def cmd_start(args):
     if "qga" in feats:
         qga_sock = str(HARNESS_DIR / f"{sid}.qga.sock")
 
+    # PIVOT-I2 Phase D (2026-05-23): when --oracle-stub-conflux is passed
+    # AND the feature set includes oracle-daemon-test, launch the host-side
+    # Python stub Conflux responder on 127.0.0.1:<port>.  Records its pid
+    # in the session state so cmd_stop can SIGTERM it on session teardown.
+    # Heartbeats land in `<sid>.oracle-stub.jsonl` (one JSON per line).
+    #
+    # Defensive: if --oracle-stub-conflux is set WITHOUT oracle-daemon-test
+    # in the feature list we still launch — operator may be doing a manual
+    # workflow.  Print a warning to stderr so the unusual case is visible.
+    oracle_stub_port = int(getattr(args, "oracle_stub_conflux", 0) or 0)
+    oracle_stub_pid  = 0
+    oracle_stub_log  = ""
+    oracle_stub_ready_file = ""
+    if oracle_stub_port > 0:
+        if "oracle-daemon-test" not in feats:
+            print(
+                f"[harness] WARNING: --oracle-stub-conflux={oracle_stub_port} "
+                f"set but oracle-daemon-test not in --features; launching "
+                f"stub anyway (manual / advanced workflow).",
+                file=sys.stderr,
+            )
+        oracle_stub_log = str(HARNESS_DIR / f"{sid}.oracle-stub.jsonl")
+        oracle_stub_ready_file = str(HARNESS_DIR / f"{sid}.oracle-stub.ready")
+        # Truncate any prior ready file so the post-launch wait loop
+        # doesn't false-positive on a previous session's leftover.
+        try:
+            Path(oracle_stub_ready_file).unlink(missing_ok=True)
+        except OSError:
+            pass
+        # Stub lives alongside this script (scripts/).  Use __file__-relative
+        # path so it works whether the harness was launched via a wrapper,
+        # an agent worktree, or directly.
+        stub_script = Path(__file__).resolve().parent / "oracle-stub-conflux.py"
+        stub_stderr_path = HARNESS_DIR / f"{sid}.oracle-stub.stderr.log"
+        # Run unbuffered so stderr lines appear in the log immediately —
+        # the agent tails this file looking for "[STUB-CONFLUX] heartbeat"
+        # lines and we don't want python's default block-buffering hiding them.
+        try:
+            stub_stderr_fh = open(stub_stderr_path, "w")
+            stub_proc = subprocess.Popen(
+                [
+                    sys.executable, "-u", str(stub_script),
+                    "--port", str(oracle_stub_port),
+                    "--bind", "127.0.0.1",
+                    "--log", oracle_stub_log,
+                    "--ready-file", oracle_stub_ready_file,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=stub_stderr_fh,
+                stderr=stub_stderr_fh,
+                start_new_session=True,
+            )
+            oracle_stub_pid = stub_proc.pid
+            # Wait up to 5 s for the stub to bind + write its ready file.
+            # If it never appears we leave the stub running (cmd_stop will
+            # still SIGTERM it via the pid) but warn loudly — most likely
+            # cause is EADDRINUSE which is operator-fixable.
+            ready_seen = False
+            for _ in range(50):
+                if Path(oracle_stub_ready_file).exists():
+                    ready_seen = True
+                    break
+                time.sleep(0.1)
+            if ready_seen:
+                print(
+                    f"[harness] oracle-stub-conflux listening on "
+                    f"127.0.0.1:{oracle_stub_port} (pid={oracle_stub_pid}, "
+                    f"log={oracle_stub_log})",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"[harness] WARNING: oracle-stub-conflux did not signal "
+                    f"ready within 5 s; check {stub_stderr_path} for bind "
+                    f"errors (EADDRINUSE most likely).  Continuing anyway.",
+                    file=sys.stderr,
+                )
+        except OSError as e:
+            print(
+                f"[harness] WARNING: failed to spawn oracle-stub-conflux: {e}",
+                file=sys.stderr,
+            )
+            oracle_stub_pid = 0
+            oracle_stub_log = ""
+
     # Build unless --no-build.
     # Redirect all build output to stderr so stdout stays JSON-only.
     if not args.no_build:
@@ -3037,6 +3129,11 @@ def cmd_start(args):
         "kdb_host_port": kdb_host_port,
         "http_host_port": http_host_port,
         "ssh_host_port": ssh_host_port,
+        # PIVOT-I2 Phase D — host stub Conflux for oracle-daemon-test.
+        # If oracle_stub_pid is 0 the stub wasn't launched (default).
+        "oracle_stub_port": oracle_stub_port,
+        "oracle_stub_pid":  oracle_stub_pid,
+        "oracle_stub_log":  oracle_stub_log,
         "smp":         smp,
         "cpu_model":   cpu_model or "default",
         # W106: capture the resolved CPU model + reason so post-hoc
@@ -3202,6 +3299,23 @@ def cmd_stop(args):
                 time.sleep(0.1)
             if _pid_alive(pid):
                 os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    # PIVOT-I2 Phase D (2026-05-23): tear down the host-side stub Conflux
+    # responder if cmd_start launched one.  SIGTERM gets the stub's clean
+    # SUMMARY line into the stderr log; if it doesn't exit in 2 s we
+    # SIGKILL so we don't leak the python process across runs.
+    oracle_stub_pid = sess.get("oracle_stub_pid", 0)
+    if oracle_stub_pid and _pid_alive(oracle_stub_pid):
+        try:
+            os.kill(oracle_stub_pid, signal.SIGTERM)
+            for _ in range(20):
+                if not _pid_alive(oracle_stub_pid):
+                    break
+                time.sleep(0.1)
+            if _pid_alive(oracle_stub_pid):
+                os.kill(oracle_stub_pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
 
@@ -9367,6 +9481,21 @@ def main():
                                "`ssh -p PORT root@127.0.0.1` reaches the "
                                "guest dropbear daemon.  0 = derive "
                                "deterministically from sid in 2200..2299.")
+    p_start.add_argument("--oracle-stub-conflux", dest="oracle_stub_conflux",
+                          type=int, default=0, metavar="PORT",
+                          help="When --features includes 'oracle-daemon-test' "
+                               "(PIVOT-I2 Phase D, 2026-05-23), launch the "
+                               "host-side `scripts/oracle-stub-conflux.py` "
+                               "responder on 127.0.0.1:PORT before QEMU boots "
+                               "and tear it down on `stop`. Guest oracle "
+                               "reaches it via the QEMU SLIRP gateway alias at "
+                               "http://10.0.2.2:PORT/heartbeat (matches the "
+                               "kernel-side run_oracle_daemon() default URL). "
+                               "Heartbeat JSON is appended to "
+                               "~/.astryx-harness/<sid>.oracle-stub.jsonl. "
+                               "0 = do not auto-launch (operator can run the "
+                               "stub by hand at any port).  Pass 8088 to match "
+                               "the kernel-side default URL.")
     p_start.add_argument("--gdb-wait", action="store_true",
                           help="Start QEMU frozen (-S); debugger must 'cont' to unfreeze")
     p_start.add_argument("--no-kvm", dest="no_kvm", action="store_true",
