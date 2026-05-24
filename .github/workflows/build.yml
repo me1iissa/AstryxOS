@@ -127,7 +127,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 ovmf e2fsprogs
           # Fail fast if mke2fs -d is not supported (requires e2fsprogs >= 1.43).
-          mke2fs --version
+          mke2fs -V
           # Fix up OVMF paths — Ubuntu ships 4M variants under /usr/share/OVMF/
           # but some base images only install /usr/share/ovmf/OVMF.fd.  Both
           # watch-test.py and qemu-harness.py expect OVMF_CODE_4M.fd.
@@ -297,7 +297,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 ovmf e2fsprogs
-          mke2fs --version
+          mke2fs -V
           if [ ! -e /usr/share/OVMF/OVMF_CODE_4M.fd ]; then
             sudo install -d /usr/share/OVMF
             for f in /usr/share/OVMF/OVMF_CODE.fd /usr/share/ovmf/OVMF.fd; do
