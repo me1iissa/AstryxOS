@@ -1452,6 +1452,13 @@ _DEMO_BIN_SPEC = [
     # in turn auto-enables --busybox and --tls), so a single feature flag
     # triggers the full Tier A + B + C staging closure.
     ("pivot-e-tui-test",   "--pivot-e-tui","ASTRYXOS_PIVOT_E_TUI"),
+    # pivot-e-git-test (PIVOT-E Tier D, 2026-05-24) — git on top of the
+    # Tier B DT_NEEDED substrate (libcurl/libssl/libz/libcrypto) plus
+    # libpcre2 + libexpat staged by install-pivot-e-git.sh.  --pivot-e-git
+    # in create-data-disk.sh auto-enables --pivot-e (which in turn
+    # auto-enables --busybox and --tls), so a single feature flag triggers
+    # the full Tier A + B + D staging closure.
+    ("pivot-e-git-test",   "--pivot-e-git","ASTRYXOS_PIVOT_E_GIT"),
 ]
 
 
