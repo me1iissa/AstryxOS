@@ -1,7 +1,7 @@
 //! oracle-test — Oracle endpoint agent first-boot demo (PIVOT-I2, 2026-05-23).
 //!
-//! Launches the production GLIBC-linked `oracle` binary from the user's
-//! infrastructure-services/infrasvc project (release 7b03aa65, ~5 MiB) with
+//! Launches a production GLIBC-linked endpoint-agent binary (caller-supplied
+//! at staging time via `scripts/install-oracle.sh`, ~5 MiB) with
 //! `--mode console --once` so it runs a single observation cycle and exits.
 //! Captures stdout to serial and characterises whichever syscall/file gate
 //! fires first.  This is a first-boot VALIDATION pass — the goal is to
@@ -19,7 +19,7 @@
 //! incompatible).  No new kernel-side surface — the existing glibc-track
 //! firefox-test pipeline already proves the dynamic linker.
 //!
-//! Predicted first-gate candidates (from the infrasvc audit)
+//! Predicted first-gate candidates ((internal scratch audit))
 //! ---------------------------------------------------------
 //!   - `/sys/class/net/` ENOENT — oracle's NetworkCollector walks this dir
 //!     looking for interfaces.  AstryxOS exposes only `/sys/devices/system/cpu/`
@@ -344,9 +344,9 @@ pub fn run_oracle_demo() {
 //
 //   - tokio multi-thread runtime worker bring-up (clone3 + tokio's
 //     blocking-pool ramp).
-//   - infrasvc::polling::poll_loop's heartbeat task — the timer-driven
+//   - the polling loop's heartbeat task — the timer-driven
 //     periodic publish path.
-//   - infrasvc::sync::HttpSync — reqwest + hyper + tokio-net TCP outbound
+//   - HTTP sync backend — reqwest + hyper + tokio-net TCP outbound
 //     against `http://10.0.2.2:<port>/heartbeat` (the QEMU SLIRP gateway
 //     alias for the host stub).
 //
@@ -393,7 +393,7 @@ const ORACLE_DAEMON_SOAK_TICKS: u64 = 18_000;
 const ORACLE_DAEMON_INTERVAL_SECS: &str = "10";
 
 /// Default Conflux stub endpoint URL — BASE only.  Oracle's
-/// `infrasvc::sync::HttpSync::send_heartbeat` appends the canonical
+/// `the HTTP sync send_heartbeat path` appends the canonical
 /// Conflux v1 path `/v1/hosts/<hostname>/heartbeat` itself, so this
 /// constant must NOT carry a trailing `/heartbeat` (or any path) — see
 /// `scripts/oracle-stub-conflux.py::do_POST` for the matching server
@@ -477,13 +477,12 @@ pub fn run_oracle_daemon() {
     // matters because PR #439 PINS sync.enabled=false there as the
     // first-boot contract.
     //
-    // Why not env-vars?  The shipped oracle release (infrasvc 7b03aa65)
-    // interns INFRASVC_SYNC_ENABLED / INFRASVC_SYNC_URL in the binary
-    // strings table but empirically does NOT honour them once a
-    // config-file is supplied (verified 2026-05-23: even with sync env
-    // vars set, no "failed to build HttpSync" or heartbeat lines fire).
-    // The two-config-file approach is robust to that env-var-precedence
-    // ambiguity.
+    // Why not env-vars?  The shipped oracle binary interns
+    // INFRASVC_SYNC_ENABLED / INFRASVC_SYNC_URL in the strings table but
+    // empirically does NOT honour them once a config-file is supplied
+    // (verified 2026-05-23: even with sync env vars set, no "failed to
+    // build HttpSync" or heartbeat lines fire).  The two-config-file
+    // approach is robust to that env-var-precedence ambiguity.
     let argv: &[&str] = &[
         "oracle",
         "--mode", "console",
