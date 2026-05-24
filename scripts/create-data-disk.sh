@@ -100,6 +100,19 @@ PIVOT_E="${ASTRYXOS_PIVOT_E:-0}"
 # and docs/PIVOT_E_TIER_C_2026-05-24.md.
 PIVOT_E_TUI="${ASTRYXOS_PIVOT_E_TUI:-0}"
 
+# When set (env or --pivot-e-git flag), also stage PIVOT-E Tier D git
+# (the final canonical Linux CLI utility on the PIVOT-E queue).  Stages
+# /usr/bin/git, the 17 real (non-symlink) helpers under
+# /usr/libexec/git-core/, /usr/share/git-core/templates/, /etc/gitconfig,
+# /root/.gitconfig, plus DT_NEEDED closure (libpcre2 + libexpat above
+# the Tier B set; libcurl/libssl/libcrypto/libz already covered by Tier B).
+# Used by the pivot-e-git-test cargo feature (kernel/src/main.rs +
+# kernel/src/pivot_e_git_demo.rs) which verifies local-only git
+# init/add/commit/log/cat-file end-to-end.  Auto-enables --pivot-e
+# (Tier B substrate, which auto-enables --busybox + --tls).  See
+# scripts/install-pivot-e-git.sh and docs/PIVOT_E_TIER_D_2026-05-24.md.
+PIVOT_E_GIT="${ASTRYXOS_PIVOT_E_GIT:-0}"
+
 # Firefox package selector (musl variant only).  Picks which Alpine package
 # install-firefox-musl.sh + install-firefox-musl-debug.sh pull:
 #
@@ -167,6 +180,7 @@ for arg in "$@"; do
         --oracle) ORACLE=1; FORCE=true ;;
         --pivot-e) PIVOT_E=1; FORCE=true ;;
         --pivot-e-tui) PIVOT_E_TUI=1; PIVOT_E=1; FORCE=true ;;
+        --pivot-e-git) PIVOT_E_GIT=1; PIVOT_E=1; FORCE=true ;;
         [0-9]*) SIZE_MB="$arg" ;;
     esac
 done
@@ -630,6 +644,22 @@ if [ "${PIVOT_E_TUI}" = "1" ] || [ "${PIVOT_E_TUI}" = "true" ]; then
         [ "${FORCE}" = true ] && PET_FLAGS="--force"
         bash "${ROOT_DIR}/scripts/install-pivot-e-tui.sh" ${PET_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
             { echo "[DATA-DISK] FATAL: install-pivot-e-tui.sh failed"; exit 1; }
+    fi
+fi
+
+# ── PIVOT-E Tier D git (--pivot-e-git / ASTRYXOS_PIVOT_E_GIT=1) ──────────────
+# Tier D requires Tier B substrate (libcurl/libssl/libcrypto/libz auto-enabled
+# by --pivot-e above).  install-pivot-e-git.sh stages git binary + the 17
+# real (non-symlink) helpers + libpcre2 + libexpat + templates + system
+# config + per-user config.  The kernel runner uses GIT_EXEC_PATH=/disk/usr/bin
+# to redirect child git invocations away from the (non-existent on FAT32)
+# /usr/libexec/git-core/git symlink.
+if [ "${PIVOT_E_GIT}" = "1" ] || [ "${PIVOT_E_GIT}" = "true" ]; then
+    if [ -f "${ROOT_DIR}/scripts/install-pivot-e-git.sh" ]; then
+        PEG_FLAGS=""
+        [ "${FORCE}" = true ] && PEG_FLAGS="--force"
+        bash "${ROOT_DIR}/scripts/install-pivot-e-git.sh" ${PEG_FLAGS} 2>&1 | sed 's/^/[DATA-DISK] /' || \
+            { echo "[DATA-DISK] FATAL: install-pivot-e-git.sh failed"; exit 1; }
     fi
 fi
 
@@ -1436,6 +1466,72 @@ EOF
         mmd -i "${DATA_IMG}" "::usr/share"      2>/dev/null || true
         mmd -i "${DATA_IMG}" "::usr/share/nano" 2>/dev/null || true
         echo "[DATA-DISK] Created /usr/share/nano (empty syntax-files dir)"
+    fi
+
+    # ── PIVOT-E Tier D git (--pivot-e-git / ASTRYXOS_PIVOT_E_GIT=1) ─────────
+    # install-pivot-e-git.sh has staged at the host side:
+    #   build/disk/usr/bin/git
+    #   build/disk/usr/libexec/git-core/git-* (17 real, non-symlink helpers)
+    #   build/disk/usr/share/git-core/templates/  (init template tree)
+    #   build/disk/usr/lib/libpcre2-8.so.0 + libexpat.so.1 (DT_NEEDED above Tier B)
+    #   build/disk/etc/gitconfig
+    #   build/disk/root/.gitconfig
+    # Per-file `[ -f ]` keeps this block empty-glob safe when --pivot-e-git
+    # was not passed.
+    if [ -f "${BUILD_DIR}/disk/usr/bin/git" ]; then
+        mmd -i "${DATA_IMG}" "::usr"             2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/bin"         2>/dev/null || true
+        mcopy -o -i "${DATA_IMG}" "${BUILD_DIR}/disk/usr/bin/git" "::usr/bin/git"
+        echo "[DATA-DISK] Copied /usr/bin/git ($(stat -c%s "${BUILD_DIR}/disk/usr/bin/git") bytes)"
+    fi
+    if [ -d "${BUILD_DIR}/disk/usr/libexec/git-core" ]; then
+        mmd -i "${DATA_IMG}" "::usr"             2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/libexec"     2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/libexec/git-core" 2>/dev/null || true
+        git_helper_count=0
+        for helper in "${BUILD_DIR}/disk/usr/libexec/git-core/"*; do
+            [ -f "${helper}" ] || continue
+            mcopy -o -i "${DATA_IMG}" "${helper}" "::usr/libexec/git-core/$(basename "${helper}")" 2>/dev/null && \
+                git_helper_count=$((git_helper_count + 1))
+        done
+        if [ "${git_helper_count}" -gt 0 ]; then
+            echo "[DATA-DISK] Copied ${git_helper_count} git-core helpers to /usr/libexec/git-core/"
+        fi
+    fi
+    if [ -d "${BUILD_DIR}/disk/usr/share/git-core/templates" ]; then
+        mmd -i "${DATA_IMG}" "::usr"                       2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/share"                 2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::usr/share/git-core"        2>/dev/null || true
+        mcopy -s -o -i "${DATA_IMG}" "${BUILD_DIR}/disk/usr/share/git-core/templates" \
+            "::usr/share/git-core/" 2>/dev/null || true
+        echo "[DATA-DISK] Copied /usr/share/git-core/templates/"
+    fi
+    for git_lib in libpcre2-8.so.0 libexpat.so.1 libexpat.so.1.9.2; do
+        src="${BUILD_DIR}/disk/usr/lib/${git_lib}"
+        if [ -f "${src}" ]; then
+            mmd -i "${DATA_IMG}" "::usr"     2>/dev/null || true
+            mmd -i "${DATA_IMG}" "::usr/lib" 2>/dev/null || true
+            mcopy -o -i "${DATA_IMG}" "${src}" "::usr/lib/${git_lib}"
+            echo "[DATA-DISK] Copied /usr/lib/${git_lib} ($(stat -c%s "${src}") bytes)"
+        fi
+    done
+    if [ -f "${BUILD_DIR}/disk/etc/gitconfig" ]; then
+        mmd -i "${DATA_IMG}" "::etc" 2>/dev/null || true
+        mcopy -o -i "${DATA_IMG}" "${BUILD_DIR}/disk/etc/gitconfig" "::etc/gitconfig"
+        echo "[DATA-DISK] Copied /etc/gitconfig"
+    fi
+    if [ -f "${BUILD_DIR}/disk/root/.gitconfig" ]; then
+        mmd -i "${DATA_IMG}" "::root" 2>/dev/null || true
+        mcopy -o -i "${DATA_IMG}" "${BUILD_DIR}/disk/root/.gitconfig" "::root/.gitconfig"
+        echo "[DATA-DISK] Copied /root/.gitconfig"
+    fi
+    if [ -f "${BUILD_DIR}/disk/etc/pivot-e/git-fixture.txt" ]; then
+        mmd -i "${DATA_IMG}" "::etc"         2>/dev/null || true
+        mmd -i "${DATA_IMG}" "::etc/pivot-e" 2>/dev/null || true
+        mcopy -o -i "${DATA_IMG}" \
+            "${BUILD_DIR}/disk/etc/pivot-e/git-fixture.txt" \
+            "::etc/pivot-e/git-fixture.txt"
+        echo "[DATA-DISK] Copied /etc/pivot-e/git-fixture.txt"
     fi
 
     # ── BusyBox binary + applet wrapper scripts (built by build-busybox.sh) ─

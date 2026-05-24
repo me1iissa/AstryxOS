@@ -6078,7 +6078,19 @@ fn sys_stat_linux(pathname: u64, stat_buf: u64) -> i64 {
         Ok(s) => s,
         Err(_) => return -22,
     };
-    match crate::vfs::stat(path) {
+    // Per stat(2): "If pathname is relative, then it is interpreted
+    // relative to the current working directory of the calling process."
+    // crate::vfs::stat is CWD-blind so we resolve here.
+    let resolved: alloc::string::String = if path.starts_with('/') {
+        alloc::string::String::from(path)
+    } else {
+        const AT_FDCWD: i64 = -100;
+        match resolve_at_path(AT_FDCWD as u64, pathname) {
+            Ok(p) => p,
+            Err(e) => return e,
+        }
+    };
+    match crate::vfs::stat(resolved.as_str()) {
         Ok(st) => {
             fill_linux_stat(stat_buf as *mut u8, &st);
             0
@@ -6200,22 +6212,72 @@ fn sys_faccessat_linux(dirfd: u64, pathname: u64, mode: u64) -> i64 {
     }
 }
 
+/// Resolve a user-supplied pathname against the process CWD if it is
+/// relative.  Used by the bare-path Linux personality syscall wrappers
+/// (mkdir/rmdir/unlink/chmod/chown/etc.) whose underlying
+/// `crate::syscall::sys_*` helpers are CWD-blind by design.  Returns
+/// the original byte buffer for absolute paths (avoids a clone) and a
+/// freshly-allocated buffer for relative paths (cwd-prefixed +
+/// NUL-terminated).
+///
+/// Per POSIX (IEEE Std 1003.1 §4.13 — Pathname resolution): "If a
+/// pathname begins with the slash character ('/'), the predecessor of
+/// the first filename in the pathname shall be taken to be the root
+/// directory of the process [...]. If a pathname does not begin with a
+/// slash, the predecessor of the first filename in the pathname shall
+/// be taken to be the current working directory of the process."
+fn resolve_user_path_to_owned(pathname: u64) -> Result<alloc::vec::Vec<u8>, i64> {
+    let raw = read_cstring_from_user(pathname);
+    let s = match core::str::from_utf8(&raw) {
+        Ok(s) => s,
+        Err(_) => return Err(-22),
+    };
+    if s.starts_with('/') || s.is_empty() {
+        // Absolute or empty — clone into an owned buffer so downstream
+        // (which expects a contiguous ptr + len) can consume uniformly.
+        let mut out = alloc::vec::Vec::with_capacity(raw.len());
+        out.extend_from_slice(raw);
+        return Ok(out);
+    }
+    // Relative — prefix CWD.
+    const AT_FDCWD: i64 = -100;
+    let full = resolve_at_path(AT_FDCWD as u64, pathname)?;
+    let mut out = alloc::vec::Vec::with_capacity(full.len() + 1);
+    out.extend_from_slice(full.as_bytes());
+    out.push(0);
+    Ok(out)
+}
+
 /// Linux mkdir(pathname, mode) — pathname is a C string.
 fn sys_mkdir_linux(pathname: u64, _mode: u64) -> i64 {
-    let path_bytes = read_cstring_from_user(pathname);
-    crate::syscall::sys_mkdir(path_bytes.as_ptr(), path_bytes.len())
+    let path_bytes = match resolve_user_path_to_owned(pathname) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    // sys_mkdir reads path_len bytes (no NUL); we passed a NUL terminator
+    // for absolute paths only in the relative branch — strip it.
+    let len = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
+    crate::syscall::sys_mkdir(path_bytes.as_ptr(), len)
 }
 
 /// Linux rmdir(pathname) — pathname is a C string.
 fn sys_rmdir_linux(pathname: u64) -> i64 {
-    let path_bytes = read_cstring_from_user(pathname);
-    crate::syscall::sys_rmdir(path_bytes.as_ptr(), path_bytes.len())
+    let path_bytes = match resolve_user_path_to_owned(pathname) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let len = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
+    crate::syscall::sys_rmdir(path_bytes.as_ptr(), len)
 }
 
 /// Linux unlink(pathname) — pathname is a C string.
 fn sys_unlink_linux(pathname: u64) -> i64 {
-    let path_bytes = read_cstring_from_user(pathname);
-    crate::syscall::sys_unlink(path_bytes.as_ptr(), path_bytes.len())
+    let path_bytes = match resolve_user_path_to_owned(pathname) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let len = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
+    crate::syscall::sys_unlink(path_bytes.as_ptr(), len)
 }
 
 /// Fill a Linux x86_64 `struct stat` buffer (144 bytes).
@@ -7029,10 +7091,22 @@ fn sys_access(pathname: u64, mode: u64) -> i64 {
     // (dispatch_body arm 21) — see sys_open_linux for the rationale.
 
     let path_bytes = read_cstring_from_user(pathname);
-    let path = match core::str::from_utf8(&path_bytes) {
+    let path_raw = match core::str::from_utf8(&path_bytes) {
         Ok(s) => s,
         Err(_) => return -22, // EINVAL
     };
+    // Per access(2): "If pathname is relative, then it is interpreted
+    // relative to the current working directory of the calling process."
+    let resolved_owned: alloc::string::String = if path_raw.starts_with('/') {
+        alloc::string::String::from(path_raw)
+    } else {
+        const AT_FDCWD: i64 = -100;
+        match resolve_at_path(AT_FDCWD as u64, pathname) {
+            Ok(p) => p,
+            Err(e) => return e,
+        }
+    };
+    let path: &str = resolved_owned.as_str();
 
     // Resolve to (mount_idx, inode).  Existence failure → -ENOENT.
     let (mount_idx, inode) = match crate::vfs::resolve_path(path) {
@@ -7331,7 +7405,39 @@ fn sys_openat(dirfd: u64, pathname: u64, flags: u64, mode: u64) -> i64 {
     // Pointer validation is done at the user/kernel boundary (dispatch_body
     // arm 257) — see sys_open_linux for the rationale.
     if dirfd as i64 == AT_FDCWD {
-        return sys_open_linux(pathname, flags, mode);
+        // Per openat(2) §AT_FDCWD: "If pathname is relative and dirfd is
+        // the special value AT_FDCWD, pathname is interpreted relative to
+        // the current working directory of the calling process."  The
+        // downstream sys_open_linux → crate::vfs::open chain calls
+        // resolve_path which is CWD-blind, so we need to resolve relative
+        // paths HERE against the process CWD before handing off.
+        let raw = read_cstring_from_user(pathname);
+        let rel_str = match core::str::from_utf8(&raw) {
+            Ok(s) => s,
+            Err(_) => return -22, // EINVAL
+        };
+        if rel_str.starts_with('/') || rel_str.is_empty() {
+            // Absolute path or empty (later rejected) — sys_open_linux is
+            // the right entry; it handles SMAP, ring tracking, /proc/self
+            // refresh, /dev/dsp routing, etc.
+            return sys_open_linux(pathname, flags, mode);
+        }
+        // Relative path with AT_FDCWD — resolve against cwd, then call
+        // straight into vfs::open with the absolute path.  We bypass
+        // sys_open_linux's mainline because it re-reads pathname from
+        // user memory and we have only a kernel-side string now.  The
+        // /proc/self/* refresh and ring tracking are not needed for
+        // CWD-relative cases (they fire only on absolute paths like
+        // "/proc/self/maps").
+        let full_path = match resolve_at_path(AT_FDCWD as u64, pathname) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let pid = crate::proc::current_pid_lockless();
+        return match crate::vfs::open(pid, full_path.as_str(), flags as u32) {
+            Ok(fd_num) => fd_num as i64,
+            Err(e) => crate::subsys::linux::errno::vfs_err(e),
+        };
     }
 
     // Real directory fd — resolve pathname relative to it.

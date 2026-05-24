@@ -20,7 +20,7 @@
 //!     https://www.qemu.org/docs/master/system/devices/net.html#network-options
 //!   - RFC 7230 (HTTP/1.1) — for the wget-test fetch path
 
-#![cfg(any(feature = "busybox-test", feature = "wget-test", feature = "pivot-e-test", feature = "pivot-e-tui-test"))]
+#![cfg(any(feature = "busybox-test", feature = "wget-test", feature = "pivot-e-test", feature = "pivot-e-tui-test", feature = "pivot-e-git-test"))]
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -69,9 +69,61 @@ pub(crate) fn default_envp() -> &'static [&'static str] {
 /// Captured stdout is bounded to 4 KiB per applet to keep the BSS / heap
 /// footprint deterministic; the busybox demo applets all fit in <1 KiB.
 pub(crate) fn run_applet(label: &str, argv: &[&str], elf_bytes: &[u8], deadline_ticks: u64) -> (i32, Vec<u8>) {
-    serial_println!("[BBDEMO] ── {}: {:?} ──", label, argv);
+    // Thin wrapper — delegates to run_applet_with_env with no env extras.
+    // Existing callers see no signature change.
+    run_applet_with_env(label, argv, &[], elf_bytes, deadline_ticks)
+}
 
-    let envp = default_envp();
+/// Run a single applet with caller-supplied env extras APPENDED to the
+/// default envp.  Used by callers that need binary-specific environment
+/// (e.g. PIVOT-E Tier D git needs GIT_EXEC_PATH / GIT_CONFIG_NOSYSTEM /
+/// GIT_TEMPLATE_DIR to redirect the helper-exec lookup onto the FAT32
+/// data disk).  Pass `&[]` for the extras when no overrides are needed —
+/// the plain `run_applet` is the equivalent shortcut.
+///
+/// Environment-precedence note: musl libc's getenv(3) returns the FIRST
+/// matching entry, so extras MUST be passed FIRST in the final envp.  We
+/// build the merged envp as `[extras..., default_envp()...]` so a caller
+/// override of e.g. HOME beats the default `HOME=/`.
+pub(crate) fn run_applet_with_env(
+    label: &str,
+    argv: &[&str],
+    env_extras: &[&str],
+    elf_bytes: &[u8],
+    deadline_ticks: u64,
+) -> (i32, Vec<u8>) {
+    run_applet_with_env_and_cwd(label, argv, env_extras, None, elf_bytes, deadline_ticks)
+}
+
+/// Run a single applet with both caller-supplied env extras AND a
+/// caller-specified working directory.  The cwd is installed into the
+/// child's PROCESS_TABLE entry BEFORE unblocking — this matches the
+/// effect of `chdir(2)` at process startup but does not require the
+/// caller to invoke a shell.  Pass `None` for the cwd to keep the
+/// kernel default ("/").
+///
+/// Use case: PIVOT-E Tier D git steps need to run with cwd inside the
+/// working tree so git's `setup_git_directory_gently()` and friends see
+/// the right cwd from getcwd(2) — without this, git computes a "prefix"
+/// based on cwd vs work-tree mismatch and confuses subsequent path
+/// lookups.
+pub(crate) fn run_applet_with_env_and_cwd(
+    label: &str,
+    argv: &[&str],
+    env_extras: &[&str],
+    cwd_override: Option<&str>,
+    elf_bytes: &[u8],
+    deadline_ticks: u64,
+) -> (i32, Vec<u8>) {
+    serial_println!("[BBDEMO] ── {}: {:?} (cwd={:?}) ──", label, argv, cwd_override);
+
+    // Merge: extras first (override), then defaults (fallback).  Per POSIX
+    // env(7) and musl libc's getenv() this gives "extras win".
+    let defaults = default_envp();
+    let mut envp_vec: Vec<&str> = Vec::with_capacity(env_extras.len() + defaults.len());
+    envp_vec.extend_from_slice(env_extras);
+    envp_vec.extend_from_slice(defaults);
+    let envp: &[&str] = &envp_vec;
 
     // Spawn blocked so we can attach the pipe to fd 1 / fd 2 before the
     // child can call write(2).  Pattern is identical to the existing
@@ -95,6 +147,18 @@ pub(crate) fn run_applet(label: &str, argv: &[&str], elf_bytes: &[u8], deadline_
             return (-1, Vec::new());
         }
     };
+
+    // If caller requested a non-default cwd, install it BEFORE unblock so
+    // the child sees the requested working directory from its first
+    // getcwd(2) call.  This matches the effect of an in-shell `cd` but
+    // does not require spawning sh as an intermediate.  See PIVOT-E Tier
+    // D's git runner for the use case.
+    if let Some(cwd_str) = cwd_override {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            p.cwd = alloc::string::String::from(cwd_str);
+        }
+    }
 
     let pipe_id = crate::ipc::pipe::create_pipe();
     crate::proc::attach_stdout_pipe(pid, pipe_id);
