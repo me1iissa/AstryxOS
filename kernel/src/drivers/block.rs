@@ -148,6 +148,66 @@ impl BlockDevice for MemoryBlockDevice {
     }
 }
 
+/// A writable in-memory block device backed by a heap-allocated byte vector.
+///
+/// Intended for tests that need a real `BlockDevice` whose write path actually
+/// persists (so a freshly-constructed filesystem image can be exercised via
+/// the production mount + RW dispatch path).  The interior `Mutex<Vec<u8>>`
+/// makes the device `Send + Sync` per [`BlockDevice`] without any external
+/// coordination.
+pub struct MutableMemoryBlockDevice {
+    data: spin::Mutex<alloc::vec::Vec<u8>>,
+}
+
+impl MutableMemoryBlockDevice {
+    /// Create a new writable in-memory block device with the given byte
+    /// contents.  The length should be a multiple of `SECTOR_SIZE`; any
+    /// remainder is treated as inaccessible past-EOF.
+    pub fn new(data: alloc::vec::Vec<u8>) -> Self {
+        Self { data: spin::Mutex::new(data) }
+    }
+
+    /// Snapshot the current contents (clones the underlying vector — intended
+    /// for test assertions, not production hot paths).
+    pub fn snapshot(&self) -> alloc::vec::Vec<u8> {
+        self.data.lock().clone()
+    }
+}
+
+impl BlockDevice for MutableMemoryBlockDevice {
+    fn sector_count(&self) -> u64 {
+        (self.data.lock().len() / SECTOR_SIZE) as u64
+    }
+
+    fn read_sectors(&self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), BlockError> {
+        let start = (lba as usize) * SECTOR_SIZE;
+        let len = (count as usize) * SECTOR_SIZE;
+        if buf.len() < len {
+            return Err(BlockError::BufferTooSmall);
+        }
+        let data = self.data.lock();
+        if start.checked_add(len).map_or(true, |end| end > data.len()) {
+            return Err(BlockError::OutOfRange);
+        }
+        buf[..len].copy_from_slice(&data[start..start + len]);
+        Ok(())
+    }
+
+    fn write_sectors(&self, lba: u64, count: u32, src: &[u8]) -> Result<(), BlockError> {
+        let start = (lba as usize) * SECTOR_SIZE;
+        let len = (count as usize) * SECTOR_SIZE;
+        if src.len() < len {
+            return Err(BlockError::BufferTooSmall);
+        }
+        let mut data = self.data.lock();
+        if start.checked_add(len).map_or(true, |end| end > data.len()) {
+            return Err(BlockError::OutOfRange);
+        }
+        data[start..start + len].copy_from_slice(&src[..len]);
+        Ok(())
+    }
+}
+
 // ── AHCI Block Device ──────────────────────────────────────────────────────
 
 /// A block device backed by an AHCI SATA port.
