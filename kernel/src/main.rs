@@ -531,8 +531,8 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 crate::gui::terminal::poll_output();
                 // Drive the compositor at ~50 Hz via the ISR-set tick flag.
                 // timer ISR sets COMPOSITOR_TICK_DUE every 2 ticks;
-                // tick_and_compose() atomically drains it and renders a frame.
-                gui::compositor::tick_and_compose();
+                // compose() drains the tick flag and renders a frame.
+                gui::compositor::compose();
 
                 let now = arch::x86_64::irq::get_ticks();
                 let elapsed = now.wrapping_sub(t_launch);
@@ -1318,10 +1318,9 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 crate::gui::terminal::poll_output();
                 // Drive the compositor via the ISR-set tick flag (≈50 Hz).
                 // The timer ISR sets COMPOSITOR_TICK_DUE every 2 published
-                // ticks; tick_and_compose() atomically drains it and renders
-                // a frame.  Replaces the unreliable `ticks % 3` check (see
-                // gui/compositor.rs for rationale).
-                gui::compositor::tick_and_compose();
+                // ticks; compose() drains it and renders a frame.  Replaces
+                // the unreliable `ticks % 3` check (see gui/compositor.rs).
+                gui::compositor::compose();
 
                 let now = arch::x86_64::irq::get_ticks();
                 let elapsed = now.wrapping_sub(t_launch);
