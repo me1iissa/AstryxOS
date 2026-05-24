@@ -392,13 +392,16 @@ const ORACLE_DAEMON_SOAK_TICKS: u64 = 18_000;
 #[cfg(feature = "oracle-daemon-test")]
 const ORACLE_DAEMON_INTERVAL_SECS: &str = "10";
 
-/// Default Conflux stub endpoint URL.  Matches what
-/// `scripts/oracle-stub-conflux.py --port 8088` listens on, viewed
-/// through the QEMU SLIRP NAT gateway alias 10.0.2.2 (host loopback
-/// as seen from the guest — same alias used by busybox-test and
-/// tls-test).
+/// Default Conflux stub endpoint URL — BASE only.  Oracle's
+/// `infrasvc::sync::HttpSync::send_heartbeat` appends the canonical
+/// Conflux v1 path `/v1/hosts/<hostname>/heartbeat` itself, so this
+/// constant must NOT carry a trailing `/heartbeat` (or any path) — see
+/// `scripts/oracle-stub-conflux.py::do_POST` for the matching server
+/// routes.  Viewed through the QEMU SLIRP NAT gateway alias 10.0.2.2
+/// (host loopback as seen from the guest — same alias used by
+/// busybox-test and tls-test).
 #[cfg(feature = "oracle-daemon-test")]
-const ORACLE_DAEMON_SYNC_URL: &str = "http://10.0.2.2:8088/heartbeat";
+const ORACLE_DAEMON_SYNC_URL: &str = "http://10.0.2.2:8088";
 
 /// Envp for daemon-mode oracle.  Extends `default_envp()` with the
 /// sync-override entries.  We hand-roll the slice rather than calling
@@ -426,7 +429,9 @@ fn daemon_envp() -> &'static [&'static str] {
         // strings dump: INFRASVC_SYNC_ENABLED, INFRASVC_SYNC_URL,
         // INFRASVC_POLL_INTERVAL).
         "INFRASVC_SYNC_ENABLED=true",
-        "INFRASVC_SYNC_URL=http://10.0.2.2:8088/heartbeat",
+        // BASE URL only — oracle appends `/v1/hosts/<hostname>/heartbeat`.
+        // See ORACLE_DAEMON_SYNC_URL above for rationale.
+        "INFRASVC_SYNC_URL=http://10.0.2.2:8088",
         "INFRASVC_POLL_INTERVAL=10",
     ]
 }

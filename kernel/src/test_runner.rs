@@ -2201,6 +2201,25 @@ pub fn run() -> ! {
         if test_272_sys_class_net() { passed += 1; }
     }
 
+    // ── Test 273: TCP medium-payload send delivers full payload ─────────
+    // Validates the outbound TCP TX path end-to-end through the loopback
+    // pseudo-device (RFC 1122 §3.2.1.3) with a ≥256-byte payload — the
+    // size range a typical HTTP/1.1 POST falls into and the gate that the
+    // oracle endpoint agent's 465-byte heartbeat POST exercises against
+    // the host stub Conflux.  Without this, a regression in `send_data_to`
+    // chunking, `send_buffer` drain, or the loopback short-circuit would
+    // not be caught by either the 3WHS-only `test_loopback_tcp_handshake`
+    // test or any of the existing read/write isolation tests (all of
+    // which exercise zero- to short-byte payloads).
+    //
+    // Refs: RFC 9293 §3.4 (TCP connection establishment), RFC 9293 §3.7
+    // (data exchange), IEEE Std 1003.1-2017 §send.
+    #[cfg(any(feature = "test-mode", feature = "firefox-test", feature = "oracle-test"))]
+    {
+        total += 1;
+        if test_273_tcp_medium_payload_loopback() { passed += 1; }
+    }
+
     // ── Tests 261-263: native-core hardening (cycle 3) ──────────────────
     // Gated on `native-core-tests` feature: the three native-core tests
     // (page_ref_dec CAS underflow, OB refcount integration, scheduler
@@ -25977,6 +25996,173 @@ fn test_loopback_tcp_handshake() -> bool {
         pkts_out_after - pkts_out_before);
 
     test_pass!("Loopback (lo) — TCP 3WHS via 127.0.0.1");
+    true
+}
+
+// ── Test 273: TCP medium-payload send delivers full payload (loopback) ────────
+//
+// Confirms an outbound TCP write of a ≥256-byte payload — sized to mimic the
+// real-world HTTP/1.1 POST that oracle's heartbeat sender issues against the
+// host stub Conflux — is in fact received in full by the peer TCB.  Drives
+// the full TX path:
+//
+//   * tcp::connect → SYN, peer (listener) → SYN-ACK, client ACK (3WHS)
+//   * tcp::send_data_to with a 384-byte deterministic payload
+//   * net::poll drains the loopback queue + handles per-segment ACKs
+//   * tcp::read_from on the listener's child TCB returns the full payload
+//
+// The 384-byte size is chosen specifically:
+//   * > 256 B    (per dispatch requirement — medium, not short)
+//   * < MSS=1460 (fits a single TCP segment — exercises the single-PSH+ACK
+//                 fast path that an HTTP POST under one MSS typically hits)
+//   * non-MSS-aligned + not a power-of-2 (catches off-by-one chunking bugs)
+//
+// Uses the loopback pseudo-device so the test is self-contained:  no SLIRP
+// dependency, no e1000 ring state to thread, no host stub to coordinate.
+// The IPv4 / TCP framing exercised is identical to the wire-side path
+// (build_segment is the same code) — only the link-layer hop is
+// short-circuited.
+//
+// Failure modes this test catches:
+//   * `send_data_inner`'s chunk-loop drops bytes at MSS-aligned offsets
+//   * `process_segment` ACK-processing fails to drain retransmit-queue
+//     entries past a multi-byte payload, leaving send_buffer unwound
+//   * loopback enqueue truncates packets above some buffer size
+//   * payload bytes get reordered (deterministic content makes that
+//     visible as a content mismatch rather than just a length mismatch)
+//
+// Refs: RFC 9293 §3.4 / §3.7 (TCP setup + data exchange), RFC 1122
+// §3.2.1.3 (loopback prefix 127.0.0.0/8), IEEE Std 1003.1-2017 §send.
+
+fn test_273_tcp_medium_payload_loopback() -> bool {
+    test_header!("TCP medium-payload send → full payload delivered (loopback)");
+
+    use crate::net::tcp;
+
+    const SERVER_PORT: u16 = 17373;
+    const LB_IP: [u8; 4] = [127, 0, 0, 1];
+    const PAYLOAD_LEN: usize = 384;
+
+    // Deterministic payload — every byte uniquely identifies its offset
+    // modulo 251 (a prime, so the byte pattern doesn't accidentally line
+    // up with any power-of-2 boundary the TCP/IP layer might split on).
+    let mut payload = [0u8; PAYLOAD_LEN];
+    for i in 0..PAYLOAD_LEN {
+        payload[i] = (i % 251) as u8;
+    }
+
+    if let Err(e) = tcp::listen(SERVER_PORT) {
+        test_fail!("tcp_medium_payload",
+            "listen({}) failed: {}", SERVER_PORT, e);
+        return false;
+    }
+
+    let client_port = match tcp::connect(LB_IP, SERVER_PORT) {
+        Ok(p) => p,
+        Err(e) => {
+            test_fail!("tcp_medium_payload", "connect failed: {}", e);
+            return false;
+        }
+    };
+
+    // Drive the 3WHS to Established on both sides.  Loopback packets are
+    // queued by ipv4::send_ipv4 and drained on net::poll(); SYN → SYN-ACK
+    // → ACK takes 3 ticks but we give 6 for slack.
+    for _ in 0..6 {
+        crate::net::poll();
+    }
+
+    // Locate both TCBs and verify Established.
+    let snap = tcp::snapshot_connections();
+    let client_state = snap.iter()
+        .find(|c| c.local_port == client_port
+                  && c.remote_ip == LB_IP
+                  && c.remote_port == SERVER_PORT)
+        .map(|c| c.state);
+    let server_child = snap.iter()
+        .find(|c| c.local_port == SERVER_PORT
+                  && c.remote_ip[0] == 127
+                  && c.remote_port == client_port);
+
+    if client_state != Some(tcp::TcpState::Established) {
+        test_fail!("tcp_medium_payload",
+            "client TCB not Established (got {:?})", client_state);
+        return false;
+    }
+    let server_child = match server_child {
+        Some(c) if c.state == tcp::TcpState::Established => c,
+        Some(c) => {
+            test_fail!("tcp_medium_payload",
+                "server child TCB not Established (got {:?})", c.state);
+            return false;
+        }
+        None => {
+            test_fail!("tcp_medium_payload",
+                "no server child TCB for client_port={}", client_port);
+            return false;
+        }
+    };
+
+    // Send the medium-sized payload from the CLIENT side, addressed to
+    // the SERVER TCB (4-tuple form to disambiguate from any concurrent
+    // siblings on the listener port — matches the path oracle's
+    // send_heartbeat → socket_send takes when a peer 4-tuple is known,
+    // per net/socket.rs::socket_send).
+    let sent = match tcp::send_data_to(
+        client_port, LB_IP, SERVER_PORT, &payload,
+    ) {
+        Ok(n) => n,
+        Err(e) => {
+            test_fail!("tcp_medium_payload", "send_data_to: {}", e);
+            return false;
+        }
+    };
+    if sent != PAYLOAD_LEN {
+        test_fail!("tcp_medium_payload",
+            "send_data_to returned {} bytes (expected {})", sent, PAYLOAD_LEN);
+        return false;
+    }
+
+    // Drive the segment + ACK round-trip.  Loopback round-trip is one
+    // tick out + one tick back; 6 ticks is generous so a future ACK
+    // deferral or coalesce doesn't make this test flake.
+    for _ in 0..6 {
+        crate::net::poll();
+    }
+
+    // Drain the server child's receive buffer.  Match on the same 4-tuple
+    // that send_data_to addressed, so a sibling Established TCB (e.g. one
+    // left over from a previous test on the same listener port) cannot
+    // steal the read.  127.x address is reflected by the loopback path:
+    // the server child's remote_ip carries the client's reflected
+    // loopback addr.
+    let server_remote_ip = server_child.remote_ip;
+    let received = tcp::read_from(SERVER_PORT, server_remote_ip, client_port);
+
+    if received.len() != PAYLOAD_LEN {
+        test_fail!("tcp_medium_payload",
+            "received {} bytes (expected {} — TX-path truncation)",
+            received.len(), PAYLOAD_LEN);
+        // Surface a few sample byte windows for triage.
+        let head_n = received.len().min(8);
+        if head_n > 0 {
+            test_println!("  received head:   {:02x?}", &received[..head_n]);
+            test_println!("  expected head:   {:02x?}", &payload[..head_n]);
+        }
+        return false;
+    }
+    for i in 0..PAYLOAD_LEN {
+        if received[i] != payload[i] {
+            test_fail!("tcp_medium_payload",
+                "byte mismatch at offset {} — got {:#04x}, expected {:#04x}",
+                i, received[i], payload[i]);
+            return false;
+        }
+    }
+
+    test_println!("  delivered {} bytes intact, content match end-to-end ✓",
+        PAYLOAD_LEN);
+    test_pass!("TCP medium-payload send → full payload delivered (loopback)");
     true
 }
 
