@@ -9518,25 +9518,54 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
     // instances directly when a watched fd transitions to ready) is a
     // correctness-preserving optimisation tracked as follow-up work.
     if fired.is_empty() && timeout_ms != 0 {
+        // Pre-wait network pump: drain any RX frames that arrived between the
+        // initial do_poll above and now, and run tcp_timer_tick() to drain any
+        // queued send_buffer entries.  Mirrors the identical pre-wait pump in
+        // poll(2) (syscall nr 7).  Without this first pump, a fresh
+        // epoll_wait call immediately after connect(2) may miss a SYN-ACK or
+        // ACK that was already DMA'd into the NIC RX ring.
+        crate::net::poll();
+        do_poll(&mut fired);
         let deadline_tick = if timeout_ms < 0 {
             u64::MAX // infinite — block until ready or signal
         } else {
             let now = crate::arch::x86_64::irq::get_ticks();
             now.saturating_add(((timeout_ms as u64) / 10).max(1))
         };
-        loop {
-            // Park on the global poll bell.  Pipe/eventfd writes ring it
-            // (see `crate::ipc::waitlist::ring_poll_bell`); the scheduler
-            // tick wakes us at the deadline.  Replaces the prior
-            // 10 ms-tick sleep loop and is the change responsible for
-            // closing the post-PR-#119 epoll-spin plateau.
-            crate::ipc::waitlist::wait_poll_event(deadline_tick);
-            do_poll(&mut fired);
-            if !fired.is_empty() { break; }
-            // Signal pending → return -EINTR per spec.
-            if signal_pending(pid) { return -4; } // EINTR
-            let now = crate::arch::x86_64::irq::get_ticks();
-            if now >= deadline_tick { break; }
+        if fired.is_empty() {
+            loop {
+                // Park on the global poll bell.  Pipe/eventfd writes ring it
+                // (see `crate::ipc::waitlist::ring_poll_bell`); the scheduler
+                // tick wakes us at the deadline.  Replaces the prior
+                // 10 ms-tick sleep loop and is the change responsible for
+                // closing the post-PR-#119 epoll-spin plateau.
+                crate::ipc::waitlist::wait_poll_event(deadline_tick);
+                // Pump the NIC RX ring and TCP timers on every wakeup.
+                // This is the symmetric partner to the identical call in
+                // poll(2) (~line 1447).  Without it, a tokio/reqwest runtime
+                // that blocks in epoll_wait never processes incoming TCP ACKs:
+                //
+                //   1. The NIC DMA ring fills with ACK frames from the peer.
+                //   2. tcp_timer_tick() never fires → send_buffer never drains.
+                //   3. send_data_inner() accumulates data in send_buffer once
+                //      the initial congestion window (1 MSS = 1 460 B) is
+                //      exhausted.
+                //   4. write(2) returns Ok(n) while data silently queues,
+                //      never reaching the wire — producing the W=465 / R=0
+                //      asymmetry observed in the Oracle daemon-mode 180 s soak
+                //      (PIVOT-I2 Phase D, 2026-05-23, NDE-5).
+                //
+                // Per RFC 9293 §3.8.1, the sender MUST keep the pipe full
+                // while SND.WND and cwnd permit; that is only possible when
+                // ACKs are delivered and SND.UNA advances.
+                crate::net::poll();
+                do_poll(&mut fired);
+                if !fired.is_empty() { break; }
+                // Signal pending → return -EINTR per spec.
+                if signal_pending(pid) { return -4; } // EINTR
+                let now = crate::arch::x86_64::irq::get_ticks();
+                if now >= deadline_tick { break; }
+            }
         }
     }
 
