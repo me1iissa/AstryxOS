@@ -558,8 +558,15 @@ fn alloc_kernel_stack() -> Option<(u64, u64)> {
     // future loosening of the cache gate cannot silently extend
     // `stack_top` past the real allocation boundary.
     if let Some((cached_base, cached_size)) = crate::sched::pop_dead_stack() {
+        #[cfg(feature = "test-mode")]
+        crate::serial_println!("[KSTACK/ALLOC] cache hit base={:#x}", cached_base);
         write_stack_canary(cached_base);
         return Some((cached_base, cached_base + cached_size));
+    }
+    #[cfg(feature = "test-mode")]
+    {
+        let cache_len = crate::sched::dead_stack_cache_len();
+        crate::serial_println!("[KSTACK/ALLOC] cache miss (len={}) — PMM fallback", cache_len);
     }
     // Try contiguous allocation first (fast path).
     if let Some(phys_stack) = crate::mm::pmm::alloc_pages(KERNEL_STACK_PAGES) {
@@ -2136,7 +2143,32 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
         }
     }
     // Free user memory (no locks held).
-    free_process_memory(pid);
+    //
+    // SMP coherence guard: sibling threads marked Dead at the top of this
+    // function may still be mid-syscall on another CPU.  Freeing the user
+    // page tables before those threads leave Running state causes a
+    // use-after-free when they execute SYSRETQ back to a now-unmapped
+    // user VA.  Per Intel SDM Vol. 3A §4.10, CR3-referenced PML4 entries
+    // must remain valid while any logical processor has the CR3 loaded.
+    //
+    // Guard: if any sibling is still Running, defer the PMM teardown.
+    // The sibling's own syscall dispatch tail (dispatch() in
+    // subsys/linux/syscall.rs) checks for Dead state on return and calls
+    // exit_thread(), which checks all_dead and performs the PMM teardown
+    // as the final owner.  This keeps the common single-thread path fast
+    // (no sibling → free immediately) while making the multi-thread path
+    // safe (CLONE_THREAD: wait for Running siblings to drain off-CPU).
+    let any_sibling_running = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().any(|t| {
+            t.pid == pid
+            && (calling_tid == 0 || t.tid != calling_tid)
+            && t.state == ThreadState::Running
+        })
+    };
+    if !any_sibling_running {
+        free_process_memory(pid);
+    }
 
     // Vfork isolated-stack cleanup: same rationale as exit_thread (see
     // there for the longer comment).  We harvest the field from the
