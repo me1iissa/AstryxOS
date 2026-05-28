@@ -127,9 +127,10 @@ jobs:
           sudo apt-get update
           # musl-tools provides musl-gcc for compiling the hello + mmap_test
           # static ELF fixtures that test_musl_hello / test_sigchld / test_ascension
-          # read from /disk/bin/.  busybox-static provides a fallback static
-          # busybox when the Alpine-rootfs busybox isn't pre-staged.
-          sudo apt-get install -y qemu-system-x86 ovmf e2fsprogs musl-tools busybox-static
+          # read from /disk/bin/.  busybox-static is NOT installed: the Ubuntu
+          # package may ship a PT_INTERP-bearing binary that fails in-kernel;
+          # the Alpine-rootfs path (install-busybox-cli.sh) is authoritative.
+          sudo apt-get install -y qemu-system-x86 ovmf e2fsprogs musl-tools
           # Fail fast if mke2fs -d is not supported (requires e2fsprogs >= 1.43).
           mke2fs -V
           # Fix up OVMF paths — Ubuntu ships 4M variants under /usr/share/OVMF/
@@ -308,7 +309,7 @@ jobs:
       - name: Install QEMU + OVMF + e2fsprogs + musl-tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 ovmf e2fsprogs musl-tools busybox-static
+          sudo apt-get install -y qemu-system-x86 ovmf e2fsprogs musl-tools
           mke2fs -V
           if [ ! -e /usr/share/OVMF/OVMF_CODE_4M.fd ]; then
             sudo install -d /usr/share/OVMF

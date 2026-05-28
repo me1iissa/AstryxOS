@@ -519,10 +519,15 @@ def run_allowlist_check():
           not r.stdout.endswith("\n"), repr(r.stdout[-10:]))
 
     # ── check against a synthetic serial log ──────────────────────────────────
+    # Use 'dynamic_elf' as the allowed failure — it is a stable env-gap entry
+    # that will remain in ci/allow-fail.json until the musl dynamic linker is
+    # always present in CI.  'Musl hello' was removed from the allowlist when
+    # staging was fixed in PR #467; keep this fixture in sync with the live
+    # allowlist rather than reverting that staging improvement.
     with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as fh:
         fh.write("[OK] something\n")
         fh.write("[PASS] another\n")
-        fh.write("[FAIL] Musl hello: errno 2\n")
+        fh.write("[FAIL] dynamic_elf: interpreter not found\n")
         fh.write("[FAIL] WriteConsoleA: stub not registered\n")
         synthetic = fh.name
     try:
