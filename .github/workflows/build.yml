@@ -202,7 +202,8 @@ jobs:
       # required; the build is fast (~15 s).  Failure is non-fatal: the test
       # is in the allow-fail list and the kernel smoke can still pass without it.
       - name: Build TCC fixture (non-fatal)
-        run: bash scripts/build-tcc.sh || echo "[ci] NOTE: build-tcc.sh failed — tcc fixture absent, test_tcc_compile allow-failed"
+        run: |
+          bash scripts/build-tcc.sh || echo "[ci] build-tcc.sh failed; tcc fixture absent (test_tcc_compile allow-failed)"
 
       - name: Create data disk (ext2)
         run: ./scripts/create-data-disk.sh --force
