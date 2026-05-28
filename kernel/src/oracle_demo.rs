@@ -537,6 +537,17 @@ pub fn run_oracle_daemon() {
     loop {
         crate::sched::yield_cpu();
 
+        // Drive the NIC RX ring and TCP timers from the BSP main loop.
+        // The Oracle daemon is a tokio binary that calls epoll_wait(2) on
+        // its worker threads; those calls pump net::poll() on each wakeup
+        // (NDE-5 fix).  This additional call from the BSP loop ensures that
+        // net::poll() advances even when ALL tokio workers happen to be
+        // running (not blocked in epoll_wait) — e.g. during the HTTP POST
+        // body serialisation phase.  Without it, the BSP spins in yield_cpu
+        // + pipe_read while the NIC ring accumulates unprocessed ACKs, and
+        // tcp_timer_tick() has no caller to drain the send_buffer.
+        crate::net::poll();
+
         if let Some(n) = crate::ipc::pipe::pipe_read(pipe_id, &mut buf) {
             if n > 0 && captured.len() < cap {
                 let take = core::cmp::min(n, cap - captured.len());
