@@ -1177,6 +1177,47 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         ret as u64,
     );
 
+    // ── Dead-thread drain (exit_group SMP coherence) ──────────────────────
+    //
+    // A concurrent exit_group(2) from another thread in this process may
+    // have marked the current thread Dead while it was mid-syscall on a
+    // separate CPU.  Per POSIX exit_group(2), all threads in the process
+    // must terminate; returning to userspace with freed page tables would
+    // be a use-after-free (Intel SDM Vol. 3A §4.10 — CR3 loaded after PML4
+    // is freed causes unpredictable TLB behaviour).
+    //
+    // Check here, after all syscall-exit hooks have run and before the asm
+    // stub executes SYSRETQ.  If Dead, call exit_thread() which switches to
+    // the kernel CR3, marks this thread Zombie, and calls schedule() — so
+    // control never returns to userspace.  The check is a single lock +
+    // state comparison; on the common path (not Dead) it adds one
+    // THREAD_TABLE lock round-trip, which is negligible vs. the syscall cost.
+    {
+        let tid = crate::proc::current_tid();
+        let is_dead = {
+            let threads = crate::proc::THREAD_TABLE.lock();
+            threads.iter()
+                .find(|t| t.tid == tid)
+                .map(|t| t.state == crate::proc::ThreadState::Dead)
+                .unwrap_or(false)
+        };
+        if is_dead {
+            // Switch to kernel CR3 before any teardown.
+            let kc3 = crate::mm::vmm::get_kernel_cr3();
+            if kc3 != 0 {
+                let cur = crate::mm::vmm::get_cr3();
+                if cur != kc3 {
+                    crate::mm::tlb::note_cr3_load(kc3);
+                    unsafe { crate::mm::vmm::switch_cr3(kc3); }
+                    crate::mm::tlb::note_cr3_unload(cur);
+                }
+            }
+            crate::proc::exit_thread(0);
+            // exit_thread() calls schedule() which never returns to this thread.
+            unreachable!();
+        }
+    }
+
     ret
 }
 

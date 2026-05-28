@@ -13906,7 +13906,13 @@ fn test_epoll_and_proc_fd() -> bool {
         {
             let epfd4 = dispatch(291, 0, 0, 0, 0, 0, 0);
             if epfd4 >= 0 {
-                let mut sp: [u64; 2] = [u64::MAX; 2];
+                // socketpair(2) fills sv[2] as int[2] (32-bit per-fd).
+                // Use [u32; 2] so fd extraction is unambiguous regardless
+                // of host endianness; [u64; 2] would pack both fds into
+                // sp[0] on little-endian x86_64, corrupting a and b.
+                // POSIX socketpair(2) §DESCRIPTION: "sv shall point to an
+                // array of 2 integers."  Linux ABI: int sv[2].
+                let mut sp: [u32; 2] = [u32::MAX; 2];
                 // socketpair(AF_UNIX=1, SOCK_STREAM=1, 0, sp)
                 let spr = dispatch(53, 1, 1, 0, sp.as_mut_ptr() as u64, 0, 0);
                 if spr == 0 {
@@ -21987,7 +21993,40 @@ fn test_execve_no_pmm_leak() -> bool {
             for _ in 0..1000 { core::hint::spin_loop(); }
         }
 
-        test_println!("  iter {}/{}: child PID {} exited ✓", iter + 1, ITERS, child_pid);
+        // 3b. Wait for kstack quiescence before the next iteration.
+        //
+        // When a thread exits, its kernel stack is pushed to the dead-stack
+        // cache by `reap_dead_threads_sched`.  The cache withholds the entry
+        // from re-issue until every CPU has advanced its per-CPU timer-ISR
+        // counter by at least DEAD_STACK_QUIESCE_TICKS (= 2) beyond the push
+        // snapshot (Intel SDM Vol. 3A §11.10 coherence: a CPU's in-flight
+        // stack reads are only retired after a full timer-ISR round-trip).
+        //
+        // Without this wait: the next iteration's `alloc_kernel_stack` finds
+        // the cache entry non-quiesced and falls back to `pmm::alloc_pages`,
+        // consuming a fresh 64-page frame.  The old cached frame is never
+        // returned to PMM (it stays allocated until recycled), so each
+        // iteration adds exactly KERNEL_STACK_PAGES (64) to the PMM leak.
+        //
+        // Fix: call `sched::wait_dead_stacks_quiesced()`, which spins with
+        // interrupts enabled until every per-CPU timer-ISR counter (the
+        // same counters checked by `entry_is_quiesced`) has advanced by
+        // DEAD_STACK_QUIESCE_TICKS + 1 beyond a fresh baseline.  Unlike
+        // waiting on the global TICK_COUNT (which is TSC-derived and can be
+        // advanced by CPU 1 only), this directly unblocks the
+        // quiescence gate for ALL CPUs.
+        //
+        // Yield twice first to ensure reap_dead_threads_sched() has run and
+        // pushed the child's kstack to the cache before we wait for quiescence.
+        crate::sched::yield_cpu();
+        crate::sched::yield_cpu();
+        crate::sched::wait_dead_stacks_quiesced();
+
+        let pages_mid = crate::mm::pmm::free_page_count();
+        test_println!("  iter {}/{}: child PID {} exited ✓  PMM={} (delta={})",
+            iter + 1, ITERS, child_pid,
+            pages_mid,
+            pages_before.saturating_sub(pages_mid));
     }
 
     if !was_active { crate::sched::disable(); }
