@@ -5322,11 +5322,18 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
     //   Pass 2 — synchronous shootdown (IPI + ack) across all CPUs.
     //   Pass 3 — return frames to the PMM (safe after pass 2 completes).
     //
-    // The batch buffer uses the same BATCH constant as unmap_and_free_range_in.
-    // For MADV_DONTNEED the typical range is a handful of pages (stack trim,
-    // arena shrink), so a single pass of 1024 is more than sufficient.
+    // The batch buffer mirrors the BATCH constant in unmap_and_free_range_in
+    // (mm/vmm.rs, PR #397).  At BATCH = 128, `to_free = [0u64; BATCH]`
+    // consumes 1024 bytes of kernel stack.  The previous value of 1024 (8192
+    // bytes) could overflow the 4 KiB emergency-fallback kstack when layered
+    // on top of the madvise(2) entry path plus PTE walk, refcount decrement,
+    // TLB shootdown, and PMM free.  The outer while-loop already handles
+    // continuation across multiple batches, so this is a tuning change only:
+    // no caller observes the batch boundary.
+    //
+    // Cite: madvise(2) (POSIX.1-2017); Intel SDM Vol. 3A §4.10.4-5.
     const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
-    const BATCH: usize = 1024;
+    const BATCH: usize = 128;
 
     let mut page = start;
     let mut any_unmap = false;
