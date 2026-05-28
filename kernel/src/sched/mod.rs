@@ -319,10 +319,21 @@ fn reap_dead_threads_sched() {
         if stack_pages == crate::proc::KERNEL_STACK_PAGES_PUB {
             let stack_size_bytes = (stack_pages as u64) * 0x1000;
             if push_dead_stack(stack_base, stack_size_bytes) {
+                #[cfg(feature = "test-mode")]
+                {
+                    let len = DEAD_STACK_CACHE.lock().len();
+                    crate::serial_println!(
+                        "[KSTACK/REAP] pushed base={:#x} to cache (len={})",
+                        stack_base, len);
+                }
                 continue; // cached for reuse
             }
         }
         // Cache full or non-standard size — free to PMM.
+        #[cfg(feature = "test-mode")]
+        crate::serial_println!(
+            "[KSTACK/REAP] cache full or non-std size={} — freed to PMM base={:#x}",
+            stack_pages, stack_base);
         let phys_base = if stack_base >= KERNEL_VIRT_OFFSET {
             stack_base - KERNEL_VIRT_OFFSET
         } else {
@@ -344,20 +355,18 @@ fn reap_dead_threads_sched() {
 const MAX_DEAD_STACKS: usize = 64;
 
 /// Quiescence margin: a cached kstack is eligible for re-issue only after
-/// every CPU that was actively counting timer ticks at push time has
-/// advanced its per-CPU timer-ISR counter by at least this many ticks since
-/// the push.  N=2 gives one full timer period of slack beyond the minimum
-/// "the CPU has fired its ISR once since push", protecting against the
-/// degenerate case where a CPU was already inside the timer ISR (between
-/// the `TIMER_ISR_PER_CPU.fetch_add` and the eventual `iretq`) at the
-/// instant push() snapshotted its counter — that single increment is then
-/// not in fact a quiescent state for the rest of the ISR body.
+/// the global `TICK_COUNT` has advanced by at least this many ticks since
+/// the push.  N=2 gives a 20 ms wall-clock window at TICK_HZ=100 — longer
+/// than any in-flight `switch_context_asm` call (x86-64 context switches
+/// take microseconds, not milliseconds) but negligible against thread-
+/// creation cost.
 ///
-/// At TICK_HZ=100 (see `arch::x86_64::irq::TICK_HZ`) this is a worst-case
-/// 20 ms reuse delay per cached kstack — negligible against the multi-
-/// millisecond cost of falling back to `pmm::alloc_pages(KERNEL_STACK_PAGES)`
-/// under PMM fragmentation, and orders of magnitude smaller than thread
-/// creation latency.
+/// `TICK_COUNT` is TSC-derived and advances at wall-clock rate regardless
+/// of which CPU fires the timer ISR (any CPU that wins the CAS publishes
+/// the new value).  This replaces a previous per-CPU
+/// `TIMER_ISR_PER_CPU[i]` scheme that could deadlock if a single CPU's
+/// LAPIC timer stopped delivering interrupts — causing its per-CPU counter
+/// to freeze and all cache entries to remain permanently unquiesced.
 const DEAD_STACK_QUIESCE_TICKS: u64 = 2;
 
 /// One cached dead stack: the higher-half kernel-stack base, the honest
@@ -377,13 +386,25 @@ const DEAD_STACK_QUIESCE_TICKS: u64 = 2;
 /// bugcheck (PR #399 D20 DR-watchpoint dispositive evidence).  See the
 /// `push_dead_stack` doc-comment for the closure narrative.
 ///
-/// Generation snapshot: `push_gen[i]` is the value of
-/// `arch::x86_64::irq::TIMER_ISR_PER_CPU[i]` observed by the pushing CPU
-/// at push time.  At pop time we require, for every CPU `i` where
-/// `push_gen[i] != 0` (i.e. CPU i was actively counting ticks at push),
-/// that `TIMER_ISR_PER_CPU[i] >= push_gen[i] + DEAD_STACK_QUIESCE_TICKS`.
-/// Only when every such CPU has independently advanced through that many
-/// timer interrupts since the push do we hand the stack back out.
+/// Generation snapshot: `push_tick` is the value of the global
+/// `TICK_COUNT` (TSC-derived wall-clock, see `arch::x86_64::irq`) at
+/// push time.  At pop time we require `TICK_COUNT >= push_tick +
+/// DEAD_STACK_QUIESCE_TICKS`.
+///
+/// Why this works: `TICK_COUNT` is monotone and advances at the real
+/// wall-clock rate regardless of which CPU fires the timer ISR (any CPU
+/// that wins the CAS publishes the new value).  Waiting two ticks (20 ms
+/// at TICK_HZ=100) is sufficient for any in-flight `switch_context_asm`
+/// to complete — x86-64 context switches take microseconds, never
+/// tens of milliseconds.
+///
+/// Previous design used per-CPU `TIMER_ISR_PER_CPU[i]` counters.  That
+/// scheme fails when a CPU's LAPIC timer delivers interrupts to a
+/// different MSR slot (e.g. if `IA32_TSC_AUX` is transiently wrong),
+/// causing one CPU's counter to freeze while the others advance.
+/// `TICK_COUNT` sidesteps this: it is a single global value advanced by
+/// the first CPU to win the CAS each tick period — immune to per-CPU
+/// timer delivery skew.
 ///
 /// Why this matters: when a thread exits, its saved context (the
 /// `switch_context_asm` frame stored in `Thread::context.rsp`) still
@@ -413,51 +434,35 @@ struct CachedDeadStack {
     /// `push_dead_stack` and to compute `stack_top` at
     /// `pop_dead_stack` time.
     size: u64,
-    /// Per-CPU timer-ISR tick counter snapshot at push time.
-    /// `push_gen[i] == 0` means CPU i was not counting ticks at push
-    /// (offline / never ticked) — that CPU does not gate quiescence.
-    push_gen: [u64; MAX_CPUS],
+    /// Global `TICK_COUNT` snapshot at push time.  `entry_is_quiesced`
+    /// requires `TICK_COUNT >= push_tick + DEAD_STACK_QUIESCE_TICKS`
+    /// before re-issuing this entry.  Replaces the previous per-CPU
+    /// `TIMER_ISR_PER_CPU` snapshot — see the struct-level doc comment
+    /// for the rationale.
+    push_tick: u64,
 }
 
 static DEAD_STACK_CACHE: spin::Mutex<alloc::vec::Vec<CachedDeadStack>> =
     spin::Mutex::new(alloc::vec::Vec::new());
 
-/// Snapshot the per-CPU timer-ISR tick counters into a `push_gen` array.
+/// Read the current global tick count for use as a quiescence snapshot.
 ///
-/// Reads `arch::x86_64::irq::TIMER_ISR_PER_CPU` with `Relaxed` ordering;
-/// these counters are monotone-increasing and any race producing a stale
-/// (lower) read only delays quiescence by at most one tick — the
-/// `DEAD_STACK_QUIESCE_TICKS` margin absorbs that without changing the
-/// safety property.
+/// Uses `TICK_COUNT` rather than per-CPU `TIMER_ISR_PER_CPU` — see the
+/// `CachedDeadStack` struct doc for the rationale.
 #[inline]
-fn snapshot_per_cpu_ticks() -> [u64; MAX_CPUS] {
-    let mut out = [0u64; MAX_CPUS];
-    for i in 0..MAX_CPUS {
-        out[i] = crate::arch::x86_64::irq::TIMER_ISR_PER_CPU[i]
-            .load(Ordering::Relaxed);
-    }
-    out
+fn current_tick_for_quiesce() -> u64 {
+    crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed)
 }
 
-/// Decide whether a cached entry has quiesced — every CPU that was
-/// counting ticks at push time must have advanced its per-CPU counter by
-/// at least `DEAD_STACK_QUIESCE_TICKS` since.  CPUs whose `push_gen[i]`
-/// is zero (offline at push) are not required to advance.
+/// Decide whether a cached entry has quiesced — the global `TICK_COUNT`
+/// must have advanced by at least `DEAD_STACK_QUIESCE_TICKS` since push.
+///
+/// This replaces the previous per-CPU `TIMER_ISR_PER_CPU` check.  See
+/// `CachedDeadStack` struct doc for the full rationale.
 #[inline]
 fn entry_is_quiesced(entry: &CachedDeadStack) -> bool {
-    for i in 0..MAX_CPUS {
-        let pg = entry.push_gen[i];
-        if pg == 0 {
-            // CPU i was not ticking at push time → not a quiescence gate.
-            continue;
-        }
-        let now = crate::arch::x86_64::irq::TIMER_ISR_PER_CPU[i]
-            .load(Ordering::Relaxed);
-        if now < pg.saturating_add(DEAD_STACK_QUIESCE_TICKS) {
-            return false;
-        }
-    }
-    true
+    let now = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+    now >= entry.push_tick.saturating_add(DEAD_STACK_QUIESCE_TICKS)
 }
 
 /// Try to push a dead stack to the cache. Returns true if cached, false if full.
@@ -503,11 +508,11 @@ fn entry_is_quiesced(entry: &CachedDeadStack) -> bool {
 /// allocation side).  The cache exists to skip TLB shootdowns and the
 /// PMM round-trip, not to skip zeroing.
 ///
-/// Quiescence gate: a per-CPU tick snapshot is recorded alongside the
+/// Quiescence gate: the global `TICK_COUNT` is recorded alongside the
 /// kstack base so `pop_dead_stack` can withhold the entry from re-issue
-/// until every CPU that was ticking at push time has advanced through
-/// `DEAD_STACK_QUIESCE_TICKS` timer interrupts (one full ISR round-trip
-/// plus margin).  See `CachedDeadStack` for the rationale.
+/// until `TICK_COUNT` has advanced by at least `DEAD_STACK_QUIESCE_TICKS`
+/// (wall-clock: 20 ms at TICK_HZ=100).  See `CachedDeadStack` for the
+/// rationale.
 fn push_dead_stack(stack_base_virt: u64, stack_size_bytes: u64) -> bool {
     // Defensive: refuse zero-sized or absurdly-large entries.  Both shapes
     // are programmer errors at the call site — the cache must never
@@ -551,7 +556,7 @@ fn push_dead_stack(stack_base_virt: u64, stack_size_bytes: u64) -> bool {
         );
     }
 
-    let push_gen = snapshot_per_cpu_ticks();
+    let push_tick = current_tick_for_quiesce();
 
     let mut cache = DEAD_STACK_CACHE.lock();
     if cache.len() >= MAX_DEAD_STACKS {
@@ -560,7 +565,7 @@ fn push_dead_stack(stack_base_virt: u64, stack_size_bytes: u64) -> bool {
     cache.push(CachedDeadStack {
         base: stack_base_virt,
         size: stack_size_bytes,
-        push_gen,
+        push_tick,
     });
     true
 }
@@ -568,10 +573,9 @@ fn push_dead_stack(stack_base_virt: u64, stack_size_bytes: u64) -> bool {
 /// Try to pop a cached stack for reuse.
 ///
 /// Returns `(stack_base_virt, stack_size_bytes)` of the oldest cached
-/// entry that has quiesced — i.e. every CPU active at push time has
-/// advanced its per-CPU timer-ISR counter by at least
-/// `DEAD_STACK_QUIESCE_TICKS` since.  Non-quiesced entries are left in
-/// place; the next pop attempt re-checks them.
+/// entry that has quiesced — i.e. the global `TICK_COUNT` has advanced
+/// by at least `DEAD_STACK_QUIESCE_TICKS` since push.  Non-quiesced
+/// entries are left in place; the next pop attempt re-checks them.
 ///
 /// `stack_size_bytes` is the honest extent stamped at push time (the
 /// reaper's view of `Thread::kernel_stack_size`).  Callers use it to
@@ -589,10 +593,8 @@ fn push_dead_stack(stack_base_virt: u64, stack_size_bytes: u64) -> bool {
 /// of `pop_dead_stack` treats `None` as fatal, so withholding a
 /// non-quiesced entry is always safe; it costs a fresh PMM allocation in
 /// exchange for closing the kstack-reuse-while-RSP-still-live race
-/// (Intel SDM Vol. 3A §6.14 "Interrupt and Exception Handling" — a CPU's
-/// in-flight stack access against a saved kernel RSP is only retired
-/// once that CPU has executed at least one further `iretq` cycle, which
-/// the per-CPU timer ISR counter directly measures).
+/// (Intel SDM Vol. 3A §6.14 "Interrupt and Exception Handling").  See
+/// `CachedDeadStack` for the full quiescence rationale.
 pub fn pop_dead_stack() -> Option<(u64, u64)> {
     let mut cache = DEAD_STACK_CACHE.lock();
     // Scan from the oldest end (index 0) — older entries have had more
@@ -604,6 +606,15 @@ pub fn pop_dead_stack() -> Option<(u64, u64)> {
             idx_found = Some(i);
             break;
         }
+    }
+    #[cfg(feature = "test-mode")]
+    if idx_found.is_none() && !cache.is_empty() {
+        let e = &cache[0];
+        let now = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+        crate::serial_println!(
+            "[KSTACK/QUIESCE] push_tick={} now={} need={} quiesced={}",
+            e.push_tick, now, e.push_tick.saturating_add(DEAD_STACK_QUIESCE_TICKS),
+            now >= e.push_tick.saturating_add(DEAD_STACK_QUIESCE_TICKS));
     }
     let i = idx_found?;
     // `remove` is O(n) but n ≤ MAX_DEAD_STACKS = 64 and the call site
@@ -634,6 +645,37 @@ pub fn push_dead_stack_pub(stack_base_virt: u64) -> bool {
 /// quiescence gate would otherwise withhold the entry for ~20 ms and the
 /// test would deterministically fail under `--features test-mode`.
 ///
+/// Return the number of entries currently in the dead-stack cache.
+///
+/// Diagnostic helper: only compiled for test-mode to avoid polluting the
+/// production binary.  Use to verify kstack recycling in PMM-leak tests.
+#[cfg(feature = "test-mode")]
+pub fn dead_stack_cache_len() -> usize {
+    DEAD_STACK_CACHE.lock().len()
+}
+
+/// Wait (yield-based) until the global `TICK_COUNT` has advanced by
+/// `DEAD_STACK_QUIESCE_TICKS + 1` ticks from the current instant.
+///
+/// After this returns, any dead-stack cache entry pushed BEFORE the call
+/// will satisfy `entry_is_quiesced` — `TICK_COUNT` is the same counter
+/// that `entry_is_quiesced` now reads (see `CachedDeadStack.push_tick`).
+///
+/// Test-mode only: used by the PMM-leak test to ensure the child's kstack
+/// is recycled on the next iteration rather than forcing a fresh PMM alloc.
+#[cfg(feature = "test-mode")]
+pub fn wait_dead_stacks_quiesced() {
+    const NEEDED: u64 = DEAD_STACK_QUIESCE_TICKS + 1;
+    let baseline = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+    loop {
+        crate::hal::enable_interrupts();
+        yield_cpu();
+        let now = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+        if now >= baseline.saturating_add(NEEDED) { break; }
+        for _ in 0..200 { core::hint::spin_loop(); }
+    }
+}
+
 /// Production callers MUST use `pop_dead_stack`; the gate is load-bearing
 /// for closing the kstack-reuse-while-RSP-still-live race (PR #348).
 #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
