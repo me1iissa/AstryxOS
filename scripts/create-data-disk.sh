@@ -668,6 +668,45 @@ if [ "${PIVOT_E_GIT}" = "1" ] || [ "${PIVOT_E_GIT}" = "true" ]; then
     fi
 fi
 
+# ── Compile hello oracle binary (musl static ELF) ────────────────────────────
+# hello is the primary musl-linked test fixture used by test_musl_hello,
+# test_sigchld_delivery, and test_ascension_init (all read /disk/bin/hello).
+# Compiled from userspace/hello.c with musl-gcc -static so the binary has no
+# dynamic-linker dependency — the kernel's static ELF loader handles it
+# directly without PT_INTERP dispatch.
+# Ref: musl libc — https://musl.libc.org/, ELF-64 spec §2 Program Header.
+HELLO_SRC="${ROOT_DIR}/userspace/hello.c"
+HELLO_BIN="${BUILD_DIR}/hello"
+if [ -f "${HELLO_SRC}" ]; then
+    if [ ! -f "${HELLO_BIN}" ] || [ "${FORCE}" = true ] || \
+       [ "${HELLO_SRC}" -nt "${HELLO_BIN}" ]; then
+        # Prefer x86_64-linux-musl-gcc (cross-musl); fall back to musl-gcc
+        # (musl-tools apt package).  Both produce a static x86_64 ELF.
+        MUSL_CC=""
+        if command -v x86_64-linux-musl-gcc &>/dev/null; then
+            MUSL_CC="x86_64-linux-musl-gcc"
+        elif command -v musl-gcc &>/dev/null; then
+            MUSL_CC="musl-gcc"
+        fi
+        if [ -n "${MUSL_CC}" ]; then
+            "${MUSL_CC}" -static -no-pie -O2 -o "${HELLO_BIN}" "${HELLO_SRC}"
+            echo "[DATA-DISK] Compiled hello (musl static ELF, $(stat -c%s "${HELLO_BIN}") bytes)"
+        else
+            echo "[DATA-DISK] WARNING: no musl compiler found (install musl-tools) — /disk/bin/hello will be absent"
+        fi
+    fi
+fi
+
+# NOTE: host busybox-static fallback removed (PR #467 follow-up).
+# The Ubuntu 24.04 busybox-static package may ship a PT_INTERP-bearing binary
+# that the DT_NEEDED readelf check cannot detect; staging it causes a glibc
+# dynamic-linker abort inside the kernel's ELF loader.  The authoritative
+# source is the Alpine-rootfs path (build/disk/bin/busybox from
+# install-busybox-cli.sh / build-busybox.sh).  If no busybox is pre-staged,
+# test_busybox_basic prints a clear "regenerate data.img" message and the
+# test is gated by the allow-fail list.  Add build-busybox.sh to CI when a
+# bare-CI busybox fixture is required.
+
 # ── Compile glibc_hello oracle binary if source present ──────────────────────
 GLIBC_HELLO_SRC="${ROOT_DIR}/userspace/glibc_hello.c"
 GLIBC_HELLO_BIN="${BUILD_DIR}/glibc_hello"
@@ -768,24 +807,35 @@ printf 'AstryxOS documentation placeholder.\n' \
     > "${STAGING_TREE}/docs/guide.txt"
 
 # ── Copy userspace test binaries into staging tree ───────────────────────────
-# Check build/ first, then userspace/ as fallback.
-# These are musl-linked ELF binaries built by scripts/build-musl.sh
-# or manually compiled in userspace/.
+# Search order for each binary:
+#   1. build/<name>          — compiled inline above (hello, glibc_hello) or by
+#                              a standalone build script (build-busybox.sh places
+#                              busybox at build/disk/bin/busybox, not build/busybox)
+#   2. userspace/<name>      — pre-built ELF checked into the repo tree
+#   3. build/disk/bin/<name> — already staged by an install-*.sh or build-*.sh
+#                              script earlier in this run (busybox via
+#                              install-busybox-cli.sh / build-busybox.sh; tcc via
+#                              build-tcc.sh).  If the file is already at the
+#                              destination we skip the copy (same inode is fine).
 USERSPACE="${ROOT_DIR}/userspace"
 # glibc_hello is the oracle binary for all glibc compat work
-TEST_BINS=(hello mmap_test dynamic_hello dynamic_hello_pie clone_thread_test socket_test glibc_hello alias_test vdso_probe)
+TEST_BINS=(hello mmap_test dynamic_hello dynamic_hello_pie clone_thread_test socket_test glibc_hello alias_test vdso_probe busybox tcc)
 for bin in "${TEST_BINS[@]}"; do
     SRC=""
     if [ -f "${BUILD_DIR}/${bin}" ]; then
         SRC="${BUILD_DIR}/${bin}"
     elif [ -f "${USERSPACE}/${bin}" ]; then
         SRC="${USERSPACE}/${bin}"
+    elif [ -f "${STAGING_TREE}/bin/${bin}" ]; then
+        # Already staged by a prior script — nothing to copy, just log it.
+        echo "[DATA-DISK] ${bin} already in staging tree (/bin/${bin}) ✓"
+        continue
     fi
     if [ -n "${SRC}" ]; then
         cp -f "${SRC}" "${STAGING_TREE}/bin/${bin}"
         echo "[DATA-DISK] Staged ${bin} to /bin/${bin}"
     else
-        echo "[DATA-DISK] WARNING: ${bin} not found (build/ or userspace/)"
+        echo "[DATA-DISK] WARNING: ${bin} not found (build/, userspace/, or staging tree)"
     fi
 done
 
