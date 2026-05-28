@@ -32,6 +32,11 @@
       "tracking": "#41"
     },
     {
+      "name": "busybox basic",
+      "reason": "env-gap: /disk/bin/busybox requires Alpine-rootfs (install-busybox-cli.sh), absent in bare CI — host busybox-static fallback removed (unreliable PT_INTERP)",
+      "tracking": "#41"
+    },
+    {
       "name": "TCC compile",
       "reason": "env-gap: /disk/bin/tcc from build-tcc.sh; CI builds it non-fatally — kept as safety net if that step fails",
       "tracking": "#41"

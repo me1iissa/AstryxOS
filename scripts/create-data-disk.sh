@@ -697,31 +697,15 @@ if [ -f "${HELLO_SRC}" ]; then
     fi
 fi
 
-# ── Busybox-static fallback: host package ────────────────────────────────────
-# When neither install-busybox-cli.sh (Alpine cache) nor build-busybox.sh
-# (musl cross-compile from source) has pre-staged build/disk/bin/busybox,
-# fall back to the host-installed busybox-static package
-# (apt: busybox-static — statically-linked, no ld-linux dependency).
-# This ensures test_busybox_basic has a binary to load in CI environments
-# where the Alpine rootfs cache and cross-compiler are absent.
-# The test validates the kernel ELF loader and syscall layer, not musl
-# linkage — a glibc-static busybox exercises the same code paths.
-# Install with: sudo apt install busybox-static
-BUSYBOX_STAGING="${BUILD_DIR}/disk/bin/busybox"
-if [ ! -f "${BUSYBOX_STAGING}" ]; then
-    if command -v busybox &>/dev/null; then
-        HOST_BB="$(command -v busybox)"
-        # Only use if statically linked (no DT_NEEDED entries) — a dynamic
-        # busybox depends on host glibc paths that won't exist in the guest.
-        if ! readelf -d "${HOST_BB}" 2>/dev/null | grep -q NEEDED; then
-            mkdir -p "${BUILD_DIR}/disk/bin"
-            cp "${HOST_BB}" "${BUSYBOX_STAGING}"
-            echo "[DATA-DISK] busybox fallback: staged host $(${HOST_BB} --version 2>&1 | head -1) from ${HOST_BB}"
-        else
-            echo "[DATA-DISK] NOTE: host busybox is dynamically linked — cannot use as fallback"
-        fi
-    fi
-fi
+# NOTE: host busybox-static fallback removed (PR #467 follow-up).
+# The Ubuntu 24.04 busybox-static package may ship a PT_INTERP-bearing binary
+# that the DT_NEEDED readelf check cannot detect; staging it causes a glibc
+# dynamic-linker abort inside the kernel's ELF loader.  The authoritative
+# source is the Alpine-rootfs path (build/disk/bin/busybox from
+# install-busybox-cli.sh / build-busybox.sh).  If no busybox is pre-staged,
+# test_busybox_basic prints a clear "regenerate data.img" message and the
+# test is gated by the allow-fail list.  Add build-busybox.sh to CI when a
+# bare-CI busybox fixture is required.
 
 # ── Compile glibc_hello oracle binary if source present ──────────────────────
 GLIBC_HELLO_SRC="${ROOT_DIR}/userspace/glibc_hello.c"
