@@ -2303,6 +2303,24 @@ pub fn run() -> ! {
         if test_273_tcp_medium_payload_loopback() { passed += 1; }
     }
 
+    // ── Test 276: TCP send_buffer drain — multi-MSS payload via loopback ─
+    // Validates that a payload exceeding one congestion window (> 1 MSS =
+    // 1 460 B) is fully delivered after ACKs open the window and
+    // tcp_timer_tick() drains send_buffer.  This is the kernel-side
+    // regression gate for the W=465/R=0 Oracle daemon asymmetry (NDE-5,
+    // 2026-05-28): without net::poll() in sys_epoll_wait's wait loop, ACKs
+    // were never processed, send_buffer never drained, and every byte
+    // beyond the first MSS was silently discarded.
+    //
+    // Refs: RFC 9293 §3.7 (data transfer), RFC 9293 §3.8.1 (send buffer),
+    // RFC 5681 §3.1 (slow start / cwnd), IEEE Std 1003.1-2017 §write.
+    #[cfg(any(feature = "test-mode", feature = "firefox-test",
+              feature = "oracle-test", feature = "oracle-daemon-test"))]
+    {
+        total += 1;
+        if test_276_tcp_send_buffer_drain() { passed += 1; }
+    }
+
     // ── Test 274: UDP connect/sendto auto-bind (DNS unblocker) ──────────
     // Exercises the three socket-layer fixes that unblock outbound DNS
     // for any glibc/musl-linked Linux client:
@@ -28091,6 +28109,165 @@ fn test_273_tcp_medium_payload_loopback() -> bool {
     test_println!("  delivered {} bytes intact, content match end-to-end ✓",
         PAYLOAD_LEN);
     test_pass!("TCP medium-payload send → full payload delivered (loopback)");
+    true
+}
+
+// ── Test 276: TCP send_buffer drain — multi-MSS payload ───────────────────────
+//
+// Validates that a payload larger than one congestion window (2 × MSS) is
+// fully delivered after ACKs advance SND.UNA and tcp_timer_tick() drains the
+// send_buffer.
+//
+// This is the regression gate for the W=465/R=0 Oracle daemon-mode asymmetry
+// (NDE-5, 2026-05-28): without net::poll() being called in the sys_epoll_wait
+// wait loop, ACKs from the peer were never delivered into the protocol stack,
+// send_buffer never drained, and every byte beyond the first MSS was silently
+// buffered and never sent.
+//
+// The test exercises the path:
+//   send_data_to() — sends first MSS immediately, queues remainder in
+//                    send_buffer (can_send = cwnd - in_flight)
+//   net::poll()    — drives tcp_timer_tick() → drains send_buffer as
+//                    peer ACKs open the window
+//
+// Refs: RFC 9293 §3.7.4 (sender flow control / send window), RFC 5681 §3.1
+// (congestion window), IEEE Std 1003.1-2017 §write.
+#[cfg(any(feature = "test-mode", feature = "firefox-test",
+          feature = "oracle-test", feature = "oracle-daemon-test"))]
+fn test_276_tcp_send_buffer_drain() -> bool {
+    test_header!("TCP send_buffer drain — multi-MSS payload fully delivered (loopback)");
+
+    use crate::net::tcp;
+
+    const SERVER_PORT: u16 = 17376;
+    const LB_IP: [u8; 4] = [127, 0, 0, 1];
+    // Two full MSS-sized segments worth of data — enough to overflow the
+    // initial 1-MSS congestion window and exercise the send_buffer drain.
+    const PAYLOAD_LEN: usize = (tcp::MSS as usize) * 2 + 100;
+
+    // Deterministic payload.
+    let mut payload = alloc::vec![0u8; PAYLOAD_LEN];
+    for i in 0..PAYLOAD_LEN {
+        payload[i] = ((i * 7 + 13) % 256) as u8;
+    }
+
+    if let Err(e) = tcp::listen(SERVER_PORT) {
+        test_fail!("tcp_send_buf_drain",
+            "listen({}) failed: {}", SERVER_PORT, e);
+        return false;
+    }
+
+    let client_port = match tcp::connect(LB_IP, SERVER_PORT) {
+        Ok(p) => p,
+        Err(e) => {
+            test_fail!("tcp_send_buf_drain", "connect failed: {}", e);
+            let _ = tcp::abort(SERVER_PORT);
+            return false;
+        }
+    };
+
+    // Drive the 3-way handshake to Established.
+    for _ in 0..8 {
+        crate::net::poll();
+    }
+
+    // Verify Established on both sides.
+    let snap = tcp::snapshot_connections();
+    let client_ok = snap.iter().any(|c|
+        c.local_port == client_port
+        && c.remote_ip == LB_IP
+        && c.remote_port == SERVER_PORT
+        && c.state == tcp::TcpState::Established);
+    let server_child = snap.iter().find(|c|
+        c.local_port == SERVER_PORT
+        && c.remote_ip[0] == 127
+        && c.remote_port == client_port
+        && c.state == tcp::TcpState::Established);
+
+    if !client_ok {
+        test_fail!("tcp_send_buf_drain", "client TCB not Established after 3WHS");
+        let _ = tcp::abort(client_port);
+        let _ = tcp::abort(SERVER_PORT);
+        return false;
+    }
+    let server_child = match server_child {
+        Some(c) => *c,
+        None => {
+            test_fail!("tcp_send_buf_drain",
+                "no server child TCB for port {}", client_port);
+            let _ = tcp::abort(client_port);
+            let _ = tcp::abort(SERVER_PORT);
+            return false;
+        }
+    };
+    test_println!("  3WHS complete: client_port={} server_port={} ✓",
+        client_port, SERVER_PORT);
+
+    // Send the multi-MSS payload.  The first MSS goes on the wire immediately;
+    // the remaining ~1560 B are queued in send_buffer because cwnd = 1 MSS.
+    let sent = match tcp::send_data_to(client_port, LB_IP, SERVER_PORT, &payload) {
+        Ok(n) => n,
+        Err(e) => {
+            test_fail!("tcp_send_buf_drain", "send_data_to failed: {}", e);
+            let _ = tcp::abort(client_port);
+            let _ = tcp::abort(SERVER_PORT);
+            return false;
+        }
+    };
+    if sent != PAYLOAD_LEN {
+        test_fail!("tcp_send_buf_drain",
+            "send_data_to claimed {} (expected {})", sent, PAYLOAD_LEN);
+        let _ = tcp::abort(client_port);
+        let _ = tcp::abort(SERVER_PORT);
+        return false;
+    }
+    test_println!("  send_data_to queued {} B ✓", PAYLOAD_LEN);
+
+    // Drive ACK round-trips so the loopback path delivers the first segment to
+    // the server side (which auto-ACKs), that ACK comes back to the client
+    // (advancing SND.UNA + opening cwnd), and tcp_timer_tick() drains
+    // send_buffer.  This is the path that was BROKEN in NDE-5: without
+    // net::poll() in sys_epoll_wait, ACKs never arrived and send_buffer never
+    // drained.  We use 16 poll ticks — generous enough for two round-trips
+    // even under heavy kernel load (each loopback tick = 1 poll call).
+    for _ in 0..16 {
+        crate::net::poll();
+    }
+
+    // Drain the server child's receive buffer.
+    let server_remote_ip = server_child.remote_ip;
+    let received = tcp::read_from(SERVER_PORT, server_remote_ip, client_port);
+
+    if received.len() != PAYLOAD_LEN {
+        test_fail!("tcp_send_buf_drain",
+            "received {} B (expected {} — send_buffer drain broken)",
+            received.len(), PAYLOAD_LEN);
+        let head_n = received.len().min(8);
+        if head_n > 0 {
+            test_println!("  first {} recv bytes: {:02x?}", head_n, &received[..head_n]);
+            test_println!("  first {} payload:    {:02x?}", head_n, &payload[..head_n]);
+        }
+        let _ = tcp::abort(client_port);
+        let _ = tcp::abort(SERVER_PORT);
+        return false;
+    }
+
+    for i in 0..PAYLOAD_LEN {
+        if received[i] != payload[i] {
+            test_fail!("tcp_send_buf_drain",
+                "byte mismatch at offset {} — got {:#04x} expected {:#04x}",
+                i, received[i], payload[i]);
+            let _ = tcp::abort(client_port);
+            let _ = tcp::abort(SERVER_PORT);
+            return false;
+        }
+    }
+
+    test_println!("  {} B delivered intact (send_buffer drain confirmed) ✓",
+        PAYLOAD_LEN);
+    let _ = tcp::abort(client_port);
+    let _ = tcp::abort(SERVER_PORT);
+    test_pass!("TCP send_buffer drain — multi-MSS payload fully delivered (loopback)");
     true
 }
 
