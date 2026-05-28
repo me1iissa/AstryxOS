@@ -22,38 +22,23 @@
   ],
   "entries": [
     {
-      "name": "Musl hello",
-      "reason": "env-gap: CI does not build /disk/bin/* fixtures (issue #41)",
-      "tracking": "#41"
-    },
-    {
       "name": "dynamic_elf",
-      "reason": "env-gap: requires ld-musl-x86_64.so.1 fixture (issue #41)",
+      "reason": "env-gap: requires ld-musl-x86_64.so.1 (Alpine musl dynamic linker — staged by install-firefox-musl.sh, absent in bare CI)",
       "tracking": "#41"
     },
     {
       "name": "pie_elf",
-      "reason": "env-gap: requires PIE musl binary fixture (issue #41)",
-      "tracking": "#41"
-    },
-    {
-      "name": "TCC compile",
-      "reason": "env-gap: requires /disk/bin/tcc fixture (issue #41)",
+      "reason": "env-gap: requires PIE musl binary + ld-musl-x86_64.so.1 dynamic linker (same as dynamic_elf)",
       "tracking": "#41"
     },
     {
       "name": "busybox basic",
-      "reason": "env-gap: requires busybox fixture (issue #41)",
+      "reason": "env-gap: /disk/bin/busybox requires Alpine-rootfs (install-busybox-cli.sh), absent in bare CI — host busybox-static fallback removed (unreliable PT_INTERP)",
       "tracking": "#41"
     },
     {
-      "name": "sigchld",
-      "reason": "env-gap: SIGSEGV on missing userspace fixture (issue #41)",
-      "tracking": "#41"
-    },
-    {
-      "name": "ascension",
-      "reason": "env-gap: requires hello fixture (issue #41)",
+      "name": "TCC compile",
+      "reason": "env-gap: /disk/bin/tcc from build-tcc.sh; CI builds it non-fatally — kept as safety net if that step fails",
       "tracking": "#41"
     },
     {
