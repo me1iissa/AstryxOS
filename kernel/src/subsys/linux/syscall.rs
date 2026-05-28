@@ -1192,7 +1192,17 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     // control never returns to userspace.  The check is a single lock +
     // state comparison; on the common path (not Dead) it adds one
     // THREAD_TABLE lock round-trip, which is negligible vs. the syscall cost.
-    {
+    //
+    // EXCLUDED: sys_exit (60) and sys_exit_group (231).  Those syscalls call
+    // free_process_memory() and exit_thread() directly as part of their own
+    // execution path (POSIX exit(2) / exit_group(2)).  Reaching this drain
+    // after either of them returns would invoke exit_thread() a second time,
+    // double-decrementing thread-resource refcounts on the kstack and signal
+    // stack before vm_space.take() can short-circuit — producing the
+    // REFCOUNT/DEC-UNDERFLOW seen on the Firefox demo path.  The drain is
+    // for SMP sibling cleanup only; the exit syscalls handle their own thread
+    // on the caller's path.
+    if num != 60 && num != 231 {
         let tid = crate::proc::current_tid();
         let is_dead = {
             let threads = crate::proc::THREAD_TABLE.lock();
