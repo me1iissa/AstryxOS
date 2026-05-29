@@ -1229,6 +1229,11 @@ pub fn run() -> ! {
     total += 1;
     if test_elf_dt_gnu_hash_accepted() { passed += 1; }
 
+    // ── Test 132b: ELF PT_INTERP libc-flavour classifier (variant signal) ─
+
+    total += 1;
+    if test_elf_libc_flavor() { passed += 1; }
+
     // ── Test 133: X11 BIG-REQUESTS — QueryExtension present + BigReqEnable ─
 
     total += 1;
@@ -3152,6 +3157,102 @@ fn test_perf_metrics() -> bool {
 
     let ok = timer_ok && heap_ok && uptime_ok;
     if ok { test_pass!("Performance metrics"); }
+    ok
+}
+
+/// Test PT_INTERP-based libc-flavour classification.
+///
+/// This is the variant signal that the GUI exec env builder uses to pick a
+/// libc-appropriate LD_LIBRARY_PATH (musl tree first for musl binaries, glibc
+/// multiarch tree for glibc binaries).  We verify both the pure string
+/// classifier and the end-to-end PT_INTERP extractor on a synthetic ELF.
+fn test_elf_libc_flavor() -> bool {
+    use crate::proc::elf::{libc_flavor, libc_flavor_from_interp, pt_interp_path, LibcFlavor};
+    test_header!("ELF libc-flavour (PT_INTERP) classifier");
+
+    let mut ok = true;
+
+    // ── 1. Pure string classifier ────────────────────────────────────────
+    let cases: &[(&str, LibcFlavor)] = &[
+        ("/lib/ld-musl-x86_64.so.1", LibcFlavor::Musl),
+        ("/usr/lib/ld-musl-x86_64.so.1", LibcFlavor::Musl),
+        ("/lib64/ld-linux-x86-64.so.2", LibcFlavor::Glibc),
+        ("/lib/ld-linux-x86-64.so.2", LibcFlavor::Glibc),
+        ("/lib/ld-linux.so.2", LibcFlavor::Glibc),
+        ("/some/other/interp", LibcFlavor::Unknown),
+        ("", LibcFlavor::Unknown),
+    ];
+    for (interp, want) in cases {
+        let got = libc_flavor_from_interp(interp);
+        if got != *want {
+            test_fail!("ELF libc-flavour", "{:?} → {:?}, want {:?}", interp, got, want);
+            ok = false;
+        } else {
+            test_println!("  {:<32} → {:?}", interp, got);
+        }
+    }
+
+    // ── 2. Static binary (HELLO_ELF) has no PT_INTERP → None / Unknown ────
+    let hello = &crate::proc::hello_elf::HELLO_ELF;
+    if pt_interp_path(hello).is_some() {
+        test_fail!("ELF libc-flavour", "static HELLO_ELF reported a PT_INTERP");
+        ok = false;
+    }
+    if libc_flavor(hello) != LibcFlavor::Unknown {
+        test_fail!("ELF libc-flavour", "static HELLO_ELF not classified Unknown");
+        ok = false;
+    } else {
+        test_println!("  static HELLO_ELF → no PT_INTERP, Unknown ✓");
+    }
+
+    // ── 3. Synthetic dynamic ELF with a PT_INTERP pointing at ld-musl ─────
+    // Build a minimal but spec-valid ELF64 image: a header that points at a
+    // single program header of type PT_INTERP, whose p_offset/p_filesz name a
+    // NUL-terminated interpreter string laid out right after the phdr.
+    const EHDR_SZ: usize = core::mem::size_of::<crate::proc::elf::Elf64Header>();
+    const PHDR_SZ: usize = core::mem::size_of::<crate::proc::elf::Elf64Phdr>();
+    let interp = b"/lib/ld-musl-x86_64.so.1\0";
+    let ph_off = EHDR_SZ;
+    let interp_off = EHDR_SZ + PHDR_SZ;
+
+    let mut img = alloc::vec![0u8; interp_off + interp.len()];
+    // e_ident: magic + class64 + LE + version
+    img[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+    img[4] = 2; // ELFCLASS64
+    img[5] = 1; // ELFDATA2LSB
+    img[6] = 1; // EV_CURRENT
+    // e_type = ET_DYN (3), e_machine = EM_X86_64 (62), e_version = 1
+    img[16..18].copy_from_slice(&3u16.to_le_bytes());
+    img[18..20].copy_from_slice(&62u16.to_le_bytes());
+    img[20..24].copy_from_slice(&1u32.to_le_bytes());
+    // e_phoff @ offset 32
+    img[32..40].copy_from_slice(&(ph_off as u64).to_le_bytes());
+    // e_phentsize @ 54, e_phnum @ 56
+    img[54..56].copy_from_slice(&(PHDR_SZ as u16).to_le_bytes());
+    img[56..58].copy_from_slice(&1u16.to_le_bytes());
+    // Program header: p_type = PT_INTERP (3) @ ph_off
+    img[ph_off..ph_off + 4].copy_from_slice(&3u32.to_le_bytes());
+    // p_offset @ ph_off+8, p_filesz @ ph_off+32
+    img[ph_off + 8..ph_off + 16].copy_from_slice(&(interp_off as u64).to_le_bytes());
+    img[ph_off + 32..ph_off + 40].copy_from_slice(&(interp.len() as u64).to_le_bytes());
+    // The interpreter string itself.
+    img[interp_off..interp_off + interp.len()].copy_from_slice(interp);
+
+    match pt_interp_path(&img) {
+        Some(p) if p == "/lib/ld-musl-x86_64.so.1" => {
+            test_println!("  synthetic ELF → PT_INTERP '{}' ✓", p);
+        }
+        other => {
+            test_fail!("ELF libc-flavour", "synthetic PT_INTERP = {:?}", other);
+            ok = false;
+        }
+    }
+    if libc_flavor(&img) != LibcFlavor::Musl {
+        test_fail!("ELF libc-flavour", "synthetic musl ELF not classified Musl");
+        ok = false;
+    }
+
+    if ok { test_pass!("ELF libc-flavour (PT_INTERP) classifier"); }
     ok
 }
 

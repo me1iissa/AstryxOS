@@ -1378,6 +1378,100 @@ pub fn is_elf(data: &[u8]) -> bool {
     data.len() >= 4 && data[0..4] == ELF_MAGIC
 }
 
+/// C-library flavour implied by an executable's `PT_INTERP` (program
+/// interpreter), used to pick a libc-appropriate runtime search scope before
+/// `exec()` lays out `envp`.
+///
+/// The dynamic linker named in `PT_INTERP` is the authoritative signal for
+/// which libc an executable was linked against:
+///   * `/lib/ld-musl-*`            ⇒ musl libc
+///   * `/lib64/ld-linux-*` / `/lib/ld-linux-*` ⇒ glibc
+/// (ELF gABI §5.4 "Program Interpreter"; `ld-musl(8)`, `ld.so(8)`.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibcFlavor {
+    /// `PT_INTERP` names an `ld-musl-*` interpreter.
+    Musl,
+    /// `PT_INTERP` names an `ld-linux*` interpreter.
+    Glibc,
+    /// No `PT_INTERP` (static binary) or an unrecognised interpreter path.
+    Unknown,
+}
+
+/// Extract the `PT_INTERP` (program interpreter) path from an ELF image
+/// without loading it.  Returns `None` for static binaries (no `PT_INTERP`)
+/// or malformed images.
+///
+/// This is the same lookup the loader performs in `load_elf_with_args`, but
+/// split out so callers (e.g. the exec env builder) can learn the interpreter
+/// before the address space is created.  Per the ELF gABI, `PT_INTERP`
+/// (`p_type == 3`) points at a NUL-terminated path in the file at `p_offset`.
+pub fn pt_interp_path(data: &[u8]) -> Option<alloc::string::String> {
+    let header = validate_elf(data).ok()?;
+
+    let ph_offset = header.e_phoff as usize;
+    let ph_size = header.e_phentsize as usize;
+    let ph_count = header.e_phnum as usize;
+
+    // Same CWE-119 phdr-count cap as the loader, plus a minimum entry size so
+    // the in-bounds proof below holds.
+    if ph_count > MAX_PHDRS || ph_size < core::mem::size_of::<Elf64Phdr>() {
+        return None;
+    }
+
+    for i in 0..ph_count {
+        let offset = ph_offset.checked_add(i.checked_mul(ph_size)?)?;
+        if offset.checked_add(ph_size)? > data.len() {
+            continue;
+        }
+        // SAFETY: `offset + ph_size <= data.len()` and `ph_size >=
+        // size_of::<Elf64Phdr>()` were both checked above, so the read stays
+        // in-bounds.  Elf64Phdr is `repr(C)`; the file buffer is a heap Vec
+        // (8-byte aligned), matching the struct's alignment.
+        let phdr = unsafe { &*(data.as_ptr().add(offset) as *const Elf64Phdr) };
+        if phdr.p_type == PT_INTERP {
+            let path_start = phdr.p_offset as usize;
+            let path_end = path_start.checked_add(phdr.p_filesz as usize)?;
+            if path_end <= data.len() {
+                let raw = &data[path_start..path_end];
+                // Strip the NUL terminator.
+                let raw = raw.split(|&b| b == 0).next().unwrap_or(raw);
+                return Some(alloc::string::String::from_utf8_lossy(raw).into_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Classify the C-library flavour of an ELF image from its `PT_INTERP`.
+///
+/// Returns [`LibcFlavor::Unknown`] for static binaries and any interpreter
+/// path that matches neither the musl nor glibc dynamic-linker naming
+/// convention, leaving the caller free to fall back to a conservative default.
+pub fn libc_flavor(data: &[u8]) -> LibcFlavor {
+    match pt_interp_path(data) {
+        Some(interp) => libc_flavor_from_interp(&interp),
+        None => LibcFlavor::Unknown,
+    }
+}
+
+/// Classify a `PT_INTERP` path string into a [`LibcFlavor`].
+///
+/// Matching is on the interpreter *basename* convention so it is robust to
+/// the directory the linker lives in (`/lib`, `/lib64`, a sysroot prefix):
+///   * basename starts with `ld-musl-` ⇒ musl
+///   * basename starts with `ld-linux` ⇒ glibc
+/// Anything else is [`LibcFlavor::Unknown`].
+pub fn libc_flavor_from_interp(interp: &str) -> LibcFlavor {
+    let basename = interp.rsplit('/').next().unwrap_or(interp);
+    if basename.starts_with("ld-musl-") {
+        LibcFlavor::Musl
+    } else if basename.starts_with("ld-linux") {
+        LibcFlavor::Glibc
+    } else {
+        LibcFlavor::Unknown
+    }
+}
+
 /// Quick check: is this data a `#!` shebang script?
 pub fn is_shebang(data: &[u8]) -> bool {
     data.len() >= 2 && data[0] == b'#' && data[1] == b'!'
