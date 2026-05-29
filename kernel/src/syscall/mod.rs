@@ -3401,14 +3401,21 @@ pub(crate) fn sys_dup2(old_fd: usize, new_fd: usize) -> i64 {
     new_fd as i64
 }
 
-pub(crate) fn sys_pipe(fds_out: *mut u64) -> i64 {
+/// pipe(pipefd[2]) — create a pipe.
+///
+/// Writes exactly 8 bytes: `int pipefd[2]` = two 4-byte signed integers,
+/// as specified by pipe(2) — https://man7.org/linux/man-pages/man2/pipe.2.html
+/// and POSIX.1-2017.  The previous `*mut u64` signature wrote 16 bytes
+/// (2 × u64), which overran the caller's 8-byte buffer (CWE-787).
+///
+/// `fds_out` must point to a buffer of at least 8 bytes (2 × sizeof(int)).
+/// Pointer validation is performed at the user/kernel boundary
+/// (Linux dispatch arm 22; Aether dispatch); kernel-internal callers
+/// bypass — see sys_open_linux for the rationale.
+pub(crate) fn sys_pipe(fds_out: *mut u32) -> i64 {
     if fds_out.is_null() {
         return -22; // EINVAL
     }
-
-    // Pointer validation is done at the user/kernel boundary (Linux
-    // dispatch_body arm 22; Aether dispatch).  Kernel-internal callers
-    // bypass — see sys_open_linux for the rationale.
 
     let pipe_id = crate::ipc::pipe::create_pipe();
     let pid = crate::proc::current_pid_lockless();
@@ -3481,11 +3488,14 @@ pub(crate) fn sys_pipe(fds_out: *mut u64) -> i64 {
     proc.file_descriptors[ri] = Some(read_fd);
     proc.file_descriptors[wi] = Some(write_fd);
 
-    // Write [read_fd, write_fd] to user buffer
+    // Write exactly 8 bytes: int pipefd[2] per pipe(2) ABI.
+    // write_unaligned is used defensively; the caller's pipefd[] may not be
+    // 4-byte aligned (musl/glibc do not guarantee stack-frame alignment of
+    // individual locals beyond their declared type).
     unsafe {
         let _g = crate::arch::x86_64::smap::UserGuard::new();
-        *fds_out = ri as u64;
-        *fds_out.add(1) = wi as u64;
+        core::ptr::write_unaligned(fds_out,        ri as u32);
+        core::ptr::write_unaligned(fds_out.add(1), wi as u32);
     }
 
     crate::serial_println!("[SYSCALL] pipe() -> [{}, {}] (pipe_id={})", ri, wi, pipe_id);
