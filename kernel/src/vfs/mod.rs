@@ -257,10 +257,22 @@ pub struct Mount {
 /// Mount table.
 pub static MOUNTS: Mutex<Vec<Mount>> = Mutex::new(Vec::new());
 
-/// Snapshot the (Arc<FS>, root_inode) for `mount_idx` without retaining the
-/// `MOUNTS` lock across the FS dispatch that follows.  Returns `None` if the
-/// index is out of bounds.
-fn fs_at(idx: usize) -> Option<(Arc<dyn FileSystemOps>, u64)> {
+/// Snapshot `(Arc<dyn FileSystemOps>, root_inode)` for `mount_idx` and
+/// immediately drop the `MOUNTS` lock.  The returned `Arc` keeps the
+/// filesystem alive independent of the mount table: a concurrent unmount
+/// cannot free the backing FS while the caller holds the Arc.
+///
+/// All callers that dispatch a `FileSystemOps` method which may block on I/O
+/// (e.g. `stat`, `read`, `write`, `lookup`) MUST use this helper rather than
+/// holding `MOUNTS.lock()` across the dispatch.  The `MOUNTS` spinlock is
+/// non-yielding; holding it across a `schedule()` point (which virtio block
+/// I/O reaches via `wait_completion`) causes a cross-thread spinlock deadlock
+/// on SMP — the holder yields at the I/O wait, another thread spins forever
+/// on `MOUNTS`, monopolising its CPU, and the holder is never rescheduled.
+/// (POSIX fstat(2) / vfork(2) interaction; confirmed via GDB autopsy.)
+///
+/// Returns `None` when `idx` is out of bounds.
+pub fn fs_at(idx: usize) -> Option<(Arc<dyn FileSystemOps>, u64)> {
     let mounts = MOUNTS.lock();
     mounts.get(idx).map(|m| (m.fs.clone(), m.root_inode))
 }
