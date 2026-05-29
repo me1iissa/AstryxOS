@@ -41266,6 +41266,144 @@ fn test_278_mounts_lock_not_held_across_fs_dispatch() -> bool {
         }
     }
 
+    // ── Step 6: sys_fstat handler — MOUNTS must be free during dispatch ──
+    // Create a real file on the tmpfs, open it, call the native sys_fstat
+    // (Aether personality path, PR #476 fix 2), verify the handler returns
+    // success AND that MOUNTS is free immediately after the call.  This
+    // directly exercises the converted handler, not just fs_at().
+    const FILE_PATH: &str = "/test-278/probe.txt";
+    const FILE_CONTENT: &[u8] = b"deadlock-probe";
+    let file_content_len = FILE_CONTENT.len();
+
+    // Create the file and write known content.
+    let wfd = crate::syscall::sys_open_test(
+        FILE_PATH,
+        (crate::vfs::flags::O_WRONLY | crate::vfs::flags::O_CREAT) as u32,
+    );
+    if wfd < 0 {
+        test_fail!("VFS MOUNTS-lock deadlock regression",
+            "open({}, O_WRONLY|O_CREAT) failed: {}", FILE_PATH, wfd);
+        let mut mounts = crate::vfs::MOUNTS.lock();
+        mounts.retain(|m| m.path != MOUNT_PATH);
+        return false;
+    }
+    let n = crate::syscall::sys_write_test(
+        wfd as usize, FILE_CONTENT.as_ptr(), file_content_len,
+    );
+    let _ = crate::syscall::sys_close_test(wfd as usize);
+    if n != file_content_len as i64 {
+        test_fail!("VFS MOUNTS-lock deadlock regression",
+            "write returned {}, expected {}", n, file_content_len);
+        let mut mounts = crate::vfs::MOUNTS.lock();
+        mounts.retain(|m| m.path != MOUNT_PATH);
+        return false;
+    }
+
+    // Open for read/write — gives us an fd to pass to sys_fstat / sys_lseek.
+    let rfd = crate::syscall::sys_open_test(FILE_PATH, crate::vfs::flags::O_RDWR as u32);
+    if rfd < 0 {
+        test_fail!("VFS MOUNTS-lock deadlock regression",
+            "open({}, O_RDWR) failed: {}", FILE_PATH, rfd);
+        let mut mounts = crate::vfs::MOUNTS.lock();
+        mounts.retain(|m| m.path != MOUNT_PATH);
+        return false;
+    }
+    test_println!("  opened {} as fd={}", FILE_PATH, rfd);
+
+    // Call sys_fstat (Aether path, crate::syscall::sys_fstat).
+    // This is the handler PR #476 amend converts from MOUNTS.lock() to fs_at().
+    let mut stat_buf = [0u8; 64];
+    let fstat_ret = crate::syscall::sys_fstat(rfd as usize, stat_buf.as_mut_ptr());
+    if fstat_ret != 0 {
+        test_fail!("VFS MOUNTS-lock deadlock regression",
+            "sys_fstat(fd={}) returned {} (expected 0)", rfd, fstat_ret);
+        let _ = crate::syscall::sys_close_test(rfd as usize);
+        let mut mounts = crate::vfs::MOUNTS.lock();
+        mounts.retain(|m| m.path != MOUNT_PATH);
+        return false;
+    }
+
+    // MOUNTS must be free immediately after sys_fstat returns — the converted
+    // handler acquires MOUNTS only inside fs_at() which drops it before
+    // returning the Arc.  If MOUNTS is still held the lock is leaked.
+    let mounts_free_after_fstat = crate::vfs::MOUNTS.try_lock().is_some();
+    if !mounts_free_after_fstat {
+        test_fail!("VFS MOUNTS-lock deadlock regression",
+            "MOUNTS was still held after sys_fstat() returned — \
+             PR #476 amend (sys_fstat conversion) is broken");
+        let _ = crate::syscall::sys_close_test(rfd as usize);
+        return false;
+    }
+
+    // Verify stat reports the correct file size.
+    let reported_size = u64::from_le_bytes(stat_buf[16..24].try_into().unwrap_or([0u8; 8]));
+    if reported_size != file_content_len as u64 {
+        test_fail!("VFS MOUNTS-lock deadlock regression",
+            "sys_fstat reported size={}, expected {}", reported_size, file_content_len);
+        let _ = crate::syscall::sys_close_test(rfd as usize);
+        let mut mounts = crate::vfs::MOUNTS.lock();
+        mounts.retain(|m| m.path != MOUNT_PATH);
+        return false;
+    }
+    test_println!("  sys_fstat: size={} correct, MOUNTS free after dispatch ✓", reported_size);
+
+    // ── Step 7: sys_lseek SEEK_END — MOUNTS AND PROCESS_TABLE must be free ─
+    // This exercises the double-lock drop/reacquire path in PR #476 amend
+    // (Fix 1).  SEEK_END must drop PROCESS_TABLE, call fs_at + stat (no
+    // locks held), then re-acquire PROCESS_TABLE to set fd.offset.
+    // Per POSIX lseek(2): SEEK_END + 0 positions the offset at the end of
+    // the file (equal to the file size for a regular file).
+    const SEEK_END: u32 = 2;
+    let seek_ret = crate::syscall::sys_lseek(rfd as usize, 0, SEEK_END);
+    if seek_ret < 0 {
+        test_fail!("VFS MOUNTS-lock deadlock regression",
+            "sys_lseek(fd={}, 0, SEEK_END) returned {} (expected {})",
+            rfd, seek_ret, file_content_len);
+        let _ = crate::syscall::sys_close_test(rfd as usize);
+        let mut mounts = crate::vfs::MOUNTS.lock();
+        mounts.retain(|m| m.path != MOUNT_PATH);
+        return false;
+    }
+
+    // MOUNTS must be free after sys_lseek SEEK_END returns.
+    let mounts_free_after_lseek = crate::vfs::MOUNTS.try_lock().is_some();
+    if !mounts_free_after_lseek {
+        test_fail!("VFS MOUNTS-lock deadlock regression",
+            "MOUNTS was still held after sys_lseek(SEEK_END) returned — \
+             PR #476 amend (sys_lseek SEEK_END conversion) is broken");
+        let _ = crate::syscall::sys_close_test(rfd as usize);
+        return false;
+    }
+
+    // SEEK_END + 0 must position at file size (per POSIX lseek(2) §DESCRIPTION).
+    if seek_ret as u64 != file_content_len as u64 {
+        test_fail!("VFS MOUNTS-lock deadlock regression",
+            "sys_lseek(SEEK_END+0) returned {}, expected {} (file size)",
+            seek_ret, file_content_len);
+        let _ = crate::syscall::sys_close_test(rfd as usize);
+        let mut mounts = crate::vfs::MOUNTS.lock();
+        mounts.retain(|m| m.path != MOUNT_PATH);
+        return false;
+    }
+    test_println!("  sys_lseek SEEK_END: offset={} = file_size, MOUNTS free after dispatch ✓",
+        seek_ret);
+
+    // Verify the offset was actually stored by doing SEEK_CUR+0 (no FS I/O).
+    const SEEK_CUR: u32 = 1;
+    let cur_ret = crate::syscall::sys_lseek(rfd as usize, 0, SEEK_CUR);
+    if cur_ret as u64 != file_content_len as u64 {
+        test_fail!("VFS MOUNTS-lock deadlock regression",
+            "SEEK_CUR after SEEK_END returned {}, expected {} — offset not persisted",
+            cur_ret, file_content_len);
+        let _ = crate::syscall::sys_close_test(rfd as usize);
+        let mut mounts = crate::vfs::MOUNTS.lock();
+        mounts.retain(|m| m.path != MOUNT_PATH);
+        return false;
+    }
+    test_println!("  SEEK_CUR after SEEK_END: offset={} persisted ✓", cur_ret);
+
+    let _ = crate::syscall::sys_close_test(rfd as usize);
+
     // ── Cleanup: remove the test mount ───────────────────────────────────
     {
         let mut mounts = crate::vfs::MOUNTS.lock();

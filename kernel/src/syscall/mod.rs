@@ -3215,9 +3215,14 @@ pub(crate) fn sys_fstat(fd_num: usize, stat_buf: *mut u8) -> i64 {
     let inode = fd.inode;
     drop(procs);
 
-    let mounts = crate::vfs::MOUNTS.lock();
-    match mounts.get(mount_idx) {
-        Some(m) => match m.fs.stat(inode) {
+    // Snapshot the Arc<FS> under MOUNTS and drop the lock before dispatching
+    // stat().  Block-backed FS stat() reaches virtio I/O which calls
+    // schedule(); holding the non-yielding MOUNTS spinlock across that point
+    // produces a cross-thread spinlock deadlock on SMP (confirmed GDB autopsy
+    // — see PR #476).  Per POSIX fstat(2): the implementation must not hold a
+    // non-reentrant kernel lock across a potentially blocking I/O operation.
+    match crate::vfs::fs_at(mount_idx) {
+        Some((fs, _)) => match fs.stat(inode) {
             Ok(st) => {
                 fill_stat_buf(&st, stat_buf);
                 0
@@ -3229,49 +3234,118 @@ pub(crate) fn sys_fstat(fd_num: usize, stat_buf: *mut u8) -> i64 {
 }
 
 pub(crate) fn sys_lseek(fd_num: usize, offset: i64, whence: u32) -> i64 {
-    let pid = crate::proc::current_pid_lockless();
-    let mut procs = crate::proc::PROCESS_TABLE.lock();
-    let proc = match procs.iter_mut().find(|p| p.pid == pid) {
-        Some(p) => p,
-        None => return -3,
-    };
-
-    let fd = match proc.file_descriptors.get_mut(fd_num).and_then(|f| f.as_mut()) {
-        Some(fd) => fd,
-        None => return -9,
-    };
-
-    if fd.is_console {
-        return -29; // ESPIPE
-    }
-
     const SEEK_SET: u32 = 0;
     const SEEK_CUR: u32 = 1;
     const SEEK_END: u32 = 2;
 
-    let mount_idx = fd.mount_idx;
-    let inode = fd.inode;
+    let pid = crate::proc::current_pid_lockless();
 
-    let new_offset = match whence {
-        SEEK_SET => offset,
-        SEEK_CUR => fd.offset as i64 + offset,
-        SEEK_END => {
-            // Need to look up file size
-            let mounts = crate::vfs::MOUNTS.lock();
-            match mounts.get(mount_idx).and_then(|m| m.fs.stat(inode).ok()) {
-                Some(st) => st.size as i64 + offset,
-                None => return -9,
-            }
+    // ── SEEK_SET / SEEK_CUR: no FS I/O needed ─────────────────────────────
+    // Handle these entirely under PROCESS_TABLE and return early.  All
+    // borrows from `procs` end when the enclosing block closes, which lets us
+    // take the lock again below for SEEK_END without confusing the borrow
+    // checker.
+    if whence == SEEK_SET || whence == SEEK_CUR {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        let proc = match procs.iter_mut().find(|p| p.pid == pid) {
+            Some(p) => p,
+            None => return -3,
+        };
+        let fd = match proc.file_descriptors.get_mut(fd_num).and_then(|f| f.as_mut()) {
+            Some(fd) => fd,
+            None => return -9,
+        };
+        if fd.is_console {
+            return -29; // ESPIPE
         }
-        _ => return -22,
-    };
-
-    if new_offset < 0 {
-        return -22;
+        if whence == SEEK_SET {
+            if offset < 0 {
+                return -22; // EINVAL
+            }
+            fd.offset = offset as u64;
+            return offset;
+        } else {
+            // SEEK_CUR
+            let new_off = fd.offset as i64 + offset;
+            if new_off < 0 {
+                return -22;
+            }
+            fd.offset = new_off as u64;
+            return new_off;
+        }
     }
 
-    fd.offset = new_offset as u64;
-    new_offset
+    if whence != SEEK_END {
+        return -22; // EINVAL — unknown whence
+    }
+
+    // ── SEEK_END: must query file size via FS stat() ──────────────────────
+    // Block-backed filesystems (ext2, fat32, ntfs) reach virtio block I/O
+    // which calls schedule(); holding the non-yielding PROCESS_TABLE or
+    // MOUNTS spinlock across that yields a cross-thread SMP deadlock
+    // (GDB-confirmed: PR #476).
+    //
+    // Per POSIX lseek(2) §DESCRIPTION: the new offset for SEEK_END is
+    // the file size plus the signed adjustment `offset`.
+    //
+    // Protocol:
+    //   Step A — acquire PROCESS_TABLE; validate fd; snapshot mount_idx +
+    //             inode (Copy types — no borrows escape the block); drop.
+    //   Step B — call fs_at() + stat() with NO spinlocks held.
+    //   Step C — reacquire PROCESS_TABLE; re-validate fd identity (the fd
+    //             may have been closed or recycled while we were in stat());
+    //             store the new offset.
+
+    // Step A: snapshot under PROCESS_TABLE (all borrows end at block close).
+    let (mount_idx, inode) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        let proc = match procs.iter().find(|p| p.pid == pid) {
+            Some(p) => p,
+            None => return -9,
+        };
+        let fd = match proc.file_descriptors.get(fd_num).and_then(|f| f.as_ref()) {
+            Some(fd) => fd,
+            None => return -9, // EBADF
+        };
+        if fd.is_console {
+            return -29; // ESPIPE
+        }
+        (fd.mount_idx, fd.inode)
+    }; // PROCESS_TABLE released here
+
+    // Step B: stat() with no kernel spinlocks held.
+    // fs_at() acquires MOUNTS, clones the Arc<FS>, drops MOUNTS, returns.
+    let file_size = match crate::vfs::fs_at(mount_idx) {
+        Some((fs, _)) => match fs.stat(inode) {
+            Ok(st) => st.size,
+            Err(_) => return -9, // EIO / stat failed
+        },
+        None => return -9, // mount entry disappeared
+    };
+
+    let new_off = file_size as i64 + offset;
+    if new_off < 0 {
+        return -22; // EINVAL — per POSIX lseek(2)
+    }
+
+    // Step C: reacquire and re-validate.  close(2) on another thread while
+    // lseek(2) is in-flight is valid per POSIX; return EBADF for stale fds.
+    let mut procs = crate::proc::PROCESS_TABLE.lock();
+    let proc = match procs.iter_mut().find(|p| p.pid == pid) {
+        Some(p) => p,
+        None => return -9, // process exited between steps A and C
+    };
+    let fd = match proc.file_descriptors.get_mut(fd_num).and_then(|f| f.as_mut()) {
+        Some(f) => f,
+        None => return -9, // fd closed while stat was in-flight (EBADF)
+    };
+    // Identity guard: if the slot was recycled to a different file the
+    // computed offset is stale — treat as EBADF.
+    if fd.mount_idx != mount_idx || fd.inode != inode {
+        return -9;
+    }
+    fd.offset = new_off as u64;
+    new_off
 }
 
 pub(crate) fn sys_dup(old_fd: usize) -> i64 {
