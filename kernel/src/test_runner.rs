@@ -13935,7 +13935,7 @@ fn test_epoll_and_proc_fd() -> bool {
 
         // ─── 7. Pipe + epoll EPOLLIN test ───────────────────────────────────
         {
-            let mut pipe_fds: [u64; 2] = [u64::MAX; 2];
+            let mut pipe_fds: [u32; 2] = [u32::MAX; 2]; // pipe(2) writes int[2] (u32); see PR #473
             let pr = dispatch(22, pipe_fds.as_mut_ptr() as u64, 0, 0, 0, 0, 0);
             if pr == 0 {
                 let rfd = pipe_fds[0] as usize;
@@ -14007,7 +14007,7 @@ fn test_epoll_and_proc_fd() -> bool {
         {
             let epfd3 = dispatch(291, 0, 0, 0, 0, 0, 0);
             if epfd3 >= 0 {
-                let mut pipe_fds: [u64; 2] = [u64::MAX; 2];
+                let mut pipe_fds: [u32; 2] = [u32::MAX; 2]; // pipe(2) writes int[2] (u32); see PR #473
                 if dispatch(22, pipe_fds.as_mut_ptr() as u64, 0, 0, 0, 0, 0) == 0 {
                     let rfd = pipe_fds[0] as usize;
                     let wfd = pipe_fds[1] as usize;
