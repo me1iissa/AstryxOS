@@ -13612,28 +13612,56 @@ fn test_phase1_batch2_syscalls() -> bool {
     let mut ok = true;
 
     // ─── pipe (22): create a pipe pair ──────────────────────────────────────
+    // pipe(2) ABI: int pipefd[2] = 8 bytes.  The kernel writes two u32 values.
+    // See: https://man7.org/linux/man-pages/man2/pipe.2.html
     {
-        // sys_pipe writes two u64 fd values into the buffer
-        let mut fds: [u64; 2] = [u64::MAX; 2];
-        let r = dispatch(22, fds.as_mut_ptr() as u64, 0, 0, 0, 0, 0);
-        let valid = r == 0 && fds[0] < 1024 && fds[1] < 1024 && fds[0] != fds[1];
+        // Layout: [read_fd(u32), write_fd(u32), sentinel(u32)]
+        // sentinel at byte offset 8 must not be touched — it guards the
+        // boundary that the old 16-byte (2×u64) write would have overrun,
+        // which previously clobbered the SSP stack canary in caller frames
+        // (CWE-787).
+        let mut buf: [u32; 3] = [0xFFFF_FFFF; 3];
+        let r = dispatch(22, buf.as_mut_ptr() as u64, 0, 0, 0, 0, 0);
+        let read_fd  = buf[0];
+        let write_fd = buf[1];
+        let sentinel = buf[2];
+
+        // Sentinel must be intact — the write must not have overrun 8 bytes.
+        if sentinel != 0xFFFF_FFFF {
+            test_fail!("pipe() sentinel", "OOB write detected: sentinel={:#010x}", sentinel);
+            ok = false;
+        }
+
+        let valid = r == 0
+            && (read_fd  as u64) < 1024
+            && (write_fd as u64) < 1024
+            && read_fd != write_fd;
         if valid {
-            test_println!("  pipe() -> read_fd={} write_fd={} ok", fds[0], fds[1]);
-            // Write then read back
+            test_println!(
+                "  pipe() -> read_fd={} write_fd={} sentinel=intact ok",
+                read_fd, write_fd
+            );
+            // Write then read back to confirm the FDs are functional.
             let msg: &[u8] = b"AstryxOS";
-            let w = dispatch(1, fds[1], msg.as_ptr() as u64, msg.len() as u64, 0, 0, 0);
+            let w = dispatch(
+                1, write_fd as u64, msg.as_ptr() as u64, msg.len() as u64, 0, 0, 0,
+            );
             let mut rbuf = [0u8; 8];
-            let rd = dispatch(0, fds[0], rbuf.as_mut_ptr() as u64, 8, 0, 0, 0);
+            let rd = dispatch(0, read_fd as u64, rbuf.as_mut_ptr() as u64, 8, 0, 0, 0);
             if w == msg.len() as i64 && rd == msg.len() as i64 && &rbuf == msg {
                 test_println!("  pipe write+read ok");
             } else {
                 test_fail!("pipe write/read", "w={} rd={}", w, rd);
                 ok = false;
             }
-            let _ = crate::vfs::close(pid, fds[0] as usize);
-            let _ = crate::vfs::close(pid, fds[1] as usize);
+            let _ = crate::vfs::close(pid, read_fd  as usize);
+            let _ = crate::vfs::close(pid, write_fd as usize);
+        } else if r == 0 {
+            // FDs out of range or equal — ABI failure.
+            test_fail!("pipe()", "bad fds: read={} write={}", read_fd, write_fd);
+            ok = false;
         } else {
-            test_fail!("pipe()", "r={} fds=[{},{}]", r, fds[0], fds[1]);
+            test_fail!("pipe()", "r={}", r);
             ok = false;
         }
     }
@@ -35547,8 +35575,9 @@ fn test_222_syscall_arg_validation_matrix() -> bool {
     );
 
     // ── Aether SYS_PIPE pointer-validation smoke test ────────────────────
-    // The Aether dispatch arm for SYS_PIPE (nr=24) now calls
-    // validate_user_ptr(fds_out, 16) before delegating to sys_pipe().
+    // The Aether dispatch arm for SYS_PIPE (nr=24) calls
+    // validate_user_ptr(fds_out, 8) before delegating to sys_pipe().
+    // pipe(2) ABI: int pipefd[2] = 8 bytes total.
     // Verify that a kernel-VA pointer returns EFAULT (-14).
     // Uses dispatch_aether (NOT dispatch_linux) to exercise the Aether path.
     // Per CWE-119 (memory bounds violation), defence-in-depth at the
