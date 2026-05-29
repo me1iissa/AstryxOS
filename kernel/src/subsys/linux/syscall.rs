@@ -4624,16 +4624,16 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
 
         // ─── Phase 1 batch 2: small stubs / wrappers for bash + coreutils ─────
 
-        // 22: pipe(pipefd[2]) — same as pipe2 with no flags
-        // 22: pipe(pipefd) — user-mode entry gate.  Writes 2 × u64 = 16
-        // bytes via *pipefd and *pipefd.add(1).  CWE-823.
+        // 22: pipe(pipefd[2]) — create a pipe, writing int pipefd[2] (8 bytes)
+        // to the user buffer.  pipe(2): https://man7.org/linux/man-pages/man2/pipe.2.html
+        // The ABI is `int pipefd[2]` = 2 × 4-byte ints = 8 bytes total.
         22 => {
             if !crate::syscall::user_ptr_check_bypassed()
-                && !crate::syscall::validate_user_ptr(arg1, 16)
+                && !crate::syscall::validate_user_ptr(arg1, 8)
             {
                 return -14;
             }
-            crate::syscall::sys_pipe(arg1 as *mut u64)
+            crate::syscall::sys_pipe(arg1 as *mut u32)
         }
         // 26: msync(addr, length, flags) — writeback not yet implemented.
         // Returning 0 silently is dangerous (caller believes data is durable).
