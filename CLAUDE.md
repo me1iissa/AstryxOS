@@ -133,6 +133,55 @@ Every step goes through `scripts/qemu-harness.py`. If a subcommand is missing,
 
 ---
 
+## Dynamic Workflows — binding rules for workflow-spawned agents
+
+The `Workflow` primitive can fan out tens-to-hundreds of parallel agents and
+runs adversarial verification (sibling agents refute each finding until answers
+converge). **Workflow-spawned agents do NOT receive the verbatim dispatch
+blocks the coordinator normally pastes** — they inherit context through this
+file. Every agent running inside a workflow on this repo is therefore bound by
+the rules below exactly as a manually-dispatched specialist would be:
+
+- **GDB-autopsy first** — before any new printk/ring-buffer/counter probe for a
+  fault, run `scripts/qemu-harness.py autopsy` and report the structured
+  output. (Same exceptions as the autopsy section above.)
+- **Harness-only testing** — every build/boot/serial/kdb/wait step goes through
+  `scripts/qemu-harness.py`. The hard-banned shell wrappers and manual
+  `cargo +nightly build` are banned inside workflows too. Extend the harness if
+  a subcommand is missing.
+- **Never edit upstream binaries** — fix the kernel/ABI side instead.
+- **PR flow** — kernel changes land via GitHub PR with green CI, never
+  direct-to-master.
+- **Diff-size budgets are soft** — 1.5× without asking, 2× with a one-sentence
+  justification, >2× stop and report. Don't split logical changes or skip
+  tests to hit a number.
+- **Cite public specifications only** — in all committed prose (commits,
+  comments, PRs, docs) cite POSIX, RFCs, man pages, Intel SDM / AMD APM, the
+  ELF/psABI standards, or published upstream APIs. Do not attribute design
+  choices to any other project's source tree.
+
+Two meta-rules that govern workflow behaviour specifically:
+
+- **Saga-exhaustion overrides "iterate until convergence."** A workflow's
+  refutation loop must not re-open a parked saga (≥4 hypothesis flips in 24h).
+  If the work touches a parked investigation, bound the iteration explicitly —
+  convergence is not closure, and the saga-exhaustion rule wins.
+- **Token economics** — workflows can consume far more tokens than a normal
+  session and this project hits weekly quota regularly. Scope every workflow
+  invocation tightly. Workflows are opt-in (an explicit "workflow" request, the
+  `ultracode`/xhigh setting, or a saved/named workflow); do not invoke the
+  `Workflow` tool speculatively.
+
+**Findings discipline inside a workflow:** make every finding citable
+(`file:line` + evidence quote + metric) so refuters have surface area, and
+report hypothesis → evidence → confidence like a `/review` verdict.
+
+Coordination layers that stay **manual** (never handed to a workflow):
+strategic verdicts (PM Plan A/B/C/D), tech-lead cross-walks, the Discord
+side-channel, claudemon CSV, and CURRENT.md maintenance.
+
+---
+
 ## Session files
 
 | File | Purpose |
