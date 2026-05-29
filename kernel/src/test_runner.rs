@@ -1009,6 +1009,10 @@ pub fn run() -> ! {
     total += 1;
     if test_cleartid_futex_wake() { passed += 1; }
 
+    // ── Test 98f: CLONE_CHILD_CLEARTID write lands on a non-present page ──
+    total += 1;
+    if test_cleartid_write_demand_faults() { passed += 1; }
+
     // ── Test 99: procfs self/maps — per-process VMA listing ──────────────
 
     total += 1;
@@ -27266,6 +27270,210 @@ fn test_cleartid_futex_wake() -> bool {
     }
 
     test_pass!("CLONE_CHILD_CLEARTID exit-time futex wake (key match + dequeue)");
+    true
+}
+
+/// Regression test for the CLONE_CHILD_CLEARTID exit-time write being dropped
+/// when the target page's PTE is non-present (lazily demand-paged) or
+/// present-but-read-only (copy-on-write).
+///
+/// This guards the musl `__thread_list_lock` contract: musl sets the exiting
+/// thread's `clear_child_tid` to `&__thread_list_lock`, so the kernel's
+/// write-of-zero on thread exit IS the userspace `__tl_unlock` that a surviving
+/// thread parked on via `while (*addr == val) futex(FUTEX_WAIT, …)`.  Before
+/// the fix, `write_u32_to_user` no-op'd on a non-present PTE; the woken waiter
+/// re-read the OLD value and re-parked forever.  Refs: clone(2)
+/// CLONE_CHILD_CLEARTID, set_tid_address(2), futex(2), POSIX.
+///
+/// The test exercises both resolvable arms plus the futex-wake ordering:
+///   Part A — target word on a NOT-PRESENT page of a writable anon VMA: the
+///            write must demand-fault the page in and land zero.
+///   Part B — a parked FUTEX waiter on that word is released by the same
+///            exit-path wake that follows the write.
+///   Part C — target word on a PRESENT, read-only (sole-owner COW) page: the
+///            write must break COW and land zero.
+fn test_cleartid_write_demand_faults() -> bool {
+    test_header!("CLONE_CHILD_CLEARTID write lands on non-present / COW page");
+
+    use crate::mm::vmm::{read_pte, map_page_in, PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER};
+    use crate::syscall::{write_u32_to_user_pub, futex_wake_for_exit, FUTEX_WAITERS};
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+
+    let test_pid: u64 = 9971;
+
+    // 1. Build a fresh user address space.
+    let mut vm = match crate::mm::vma::VmSpace::new_user() {
+        Some(vs) => vs,
+        None => { test_fail!("cleartid_demand", "VmSpace::new_user() OOM"); return false; }
+    };
+    let cr3 = vm.cr3;
+
+    // 2. Insert a writable anonymous VMA — the shape of a libc .bss global like
+    //    musl's __thread_list_lock.  Two pages: page 0 stays untouched (Part A),
+    //    page 1 we pre-populate read-only to exercise the COW arm (Part C).
+    let vma_base: u64 = 0x4000_0000;
+    let vma_len: u64 = 0x2000;
+    {
+        use crate::mm::vma::*;
+        let vma = VmArea {
+            base: vma_base,
+            length: vma_len,
+            prot: PROT_READ | PROT_WRITE,
+            flags: MAP_PRIVATE | MAP_ANONYMOUS,
+            backing: VmBacking::Anonymous,
+            name: "[test-tllock]",
+        };
+        if vm.insert_vma(vma).is_err() {
+            test_fail!("cleartid_demand", "insert_vma failed");
+            return false;
+        }
+    }
+
+    // 3. Register a synthetic process holding this VmSpace so the resolver's
+    //    `find(|p| p.cr3 == cr3)` VMA lookup succeeds.
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        let proc = crate::proc::Process {
+            pid: test_pid,
+            parent_pid: 0,
+            name: { let mut n = [0u8;64]; n[..7].copy_from_slice(b"tllock!"); n },
+            state: crate::proc::ProcessState::Active,
+            cr3,
+            threads: alloc::vec::Vec::new(),
+            exit_code: 0,
+            file_descriptors: alloc::vec::Vec::new(),
+            cwd: alloc::string::String::from("/"),
+            uid: 0, gid: 0, euid: 0, egid: 0,
+            pgid: test_pid as u32, sid: test_pid as u32,
+            no_new_privs: false,
+            cap_permitted: !0u64, cap_effective: !0u64,
+            rlimits_soft: [u64::MAX; 16],
+            supplementary_groups: alloc::vec::Vec::new(),
+            umask: 0o022,
+            vm_space: Some(vm),
+            signal_state: Some(crate::signal::SignalState::new()),
+            linux_abi: true,
+            handle_table: None,
+            subsystem: crate::win32::SubsystemType::Linux,
+            token_id: None,
+            exe_path: None,
+            epoll_sets: alloc::vec::Vec::new(),
+            auxv: alloc::vec::Vec::new(),
+            envp: alloc::vec::Vec::new(),
+            alarm_deadline_ticks: 0,
+            alarm_interval_ticks: 0,
+            pdeath_signal: 0,
+        };
+        procs.push(proc);
+    }
+
+    // Helper to remove the synthetic process and reclaim its VmSpace on any exit.
+    let teardown = || {
+        let old = {
+            let mut procs = crate::proc::PROCESS_TABLE.lock();
+            let old = procs.iter_mut().find(|p| p.pid == test_pid)
+                .and_then(|p| p.vm_space.take());
+            procs.retain(|p| p.pid != test_pid);
+            old
+        };
+        if let Some(space) = old { crate::proc::free_vm_space(space); }
+        FUTEX_WAITERS.lock().remove(&(test_pid, 0)); // belt-and-braces
+    };
+
+    // ── Part A: write to a word on a NOT-PRESENT page ───────────────────────
+    let addr_a: u64 = vma_base + 0x40; // page 0, never touched
+    if read_pte(cr3, addr_a) & PAGE_PRESENT != 0 {
+        teardown();
+        test_fail!("cleartid_demand", "precondition: addr_a PTE already present");
+        return false;
+    }
+    test_println!("  Part A: addr_a={:#x} PTE non-present (precondition) ✓", addr_a);
+
+    // The exit path writes 0; emulate a surviving waiter that parked while the
+    // word held a non-zero lock value.  Register the waiter first, then perform
+    // the write+wake in the same order exit_thread does.
+    let waiter_tid: u64 = 0x5151;
+    {
+        let mut waiters = FUTEX_WAITERS.lock();
+        waiters.entry((test_pid, addr_a)).or_insert_with(alloc::vec::Vec::new).push(waiter_tid);
+    }
+
+    write_u32_to_user_pub(cr3, addr_a, 0);
+
+    // (a) PTE must now be present + writable + user.
+    let pte_a = read_pte(cr3, addr_a);
+    if pte_a & PAGE_PRESENT == 0 || pte_a & PAGE_WRITABLE == 0 || pte_a & PAGE_USER == 0 {
+        FUTEX_WAITERS.lock().remove(&(test_pid, addr_a));
+        teardown();
+        test_fail!("cleartid_demand", "addr_a PTE not present/writable/user after write: {:#x}", pte_a);
+        return false;
+    }
+    // (b) The word must read 0 through the resolved frame.
+    let phys_a = (pte_a & crate::mm::vmm::ADDR_MASK) + (addr_a & 0xFFF);
+    let read_back_a = unsafe { core::ptr::read_volatile((PHYS_OFF + phys_a) as *const u32) };
+    if read_back_a != 0 {
+        FUTEX_WAITERS.lock().remove(&(test_pid, addr_a));
+        teardown();
+        test_fail!("cleartid_demand", "addr_a read-back {:#x}, expected 0", read_back_a);
+        return false;
+    }
+    test_println!("  Part A: write landed on demand-faulted page, reads 0 ✓");
+
+    // ── Part B: the parked waiter is released by the exit-path wake ─────────
+    futex_wake_for_exit(test_pid, addr_a, 1);
+    let still_parked = {
+        let waiters = FUTEX_WAITERS.lock();
+        waiters.get(&(test_pid, addr_a)).map(|v| v.contains(&waiter_tid)).unwrap_or(false)
+    };
+    if still_parked {
+        FUTEX_WAITERS.lock().remove(&(test_pid, addr_a));
+        teardown();
+        test_fail!("cleartid_demand", "waiter still parked after write+wake (lost wakeup)");
+        return false;
+    }
+    test_println!("  Part B: parked waiter released after write+wake (sees 0) ✓");
+
+    // ── Part C: write to a PRESENT, read-only sole-owner page (break COW) ───
+    let addr_c: u64 = vma_base + 0x1000 + 0x80; // page 1
+    let phys_c = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => { teardown(); test_fail!("cleartid_demand", "OOM for COW page"); return false; }
+    };
+    unsafe {
+        // Seed a non-zero pattern so we can prove the write actually happened.
+        core::ptr::write_bytes((PHYS_OFF + phys_c) as *mut u8, 0xAB, crate::mm::pmm::PAGE_SIZE);
+    }
+    crate::mm::refcount::page_ref_set(phys_c, 1); // sole owner
+    // Install read-only (no PAGE_WRITABLE) to force the COW arm.
+    let page_c = crate::mm::vma::page_align_down(addr_c);
+    map_page_in(cr3, page_c, phys_c, PAGE_PRESENT | PAGE_USER);
+    let pre_c = read_pte(cr3, addr_c);
+    if pre_c & PAGE_PRESENT == 0 || pre_c & PAGE_WRITABLE != 0 {
+        teardown();
+        test_fail!("cleartid_demand", "precondition: addr_c not present-RO: {:#x}", pre_c);
+        return false;
+    }
+    test_println!("  Part C: addr_c={:#x} PTE present read-only (precondition) ✓", addr_c);
+
+    write_u32_to_user_pub(cr3, addr_c, 0);
+
+    let post_c = read_pte(cr3, addr_c);
+    if post_c & PAGE_PRESENT == 0 || post_c & PAGE_WRITABLE == 0 {
+        teardown();
+        test_fail!("cleartid_demand", "addr_c not writable after COW-break: {:#x}", post_c);
+        return false;
+    }
+    let phys_c2 = (post_c & crate::mm::vmm::ADDR_MASK) + (addr_c & 0xFFF);
+    let read_back_c = unsafe { core::ptr::read_volatile((PHYS_OFF + phys_c2) as *const u32) };
+    if read_back_c != 0 {
+        teardown();
+        test_fail!("cleartid_demand", "addr_c read-back {:#x}, expected 0", read_back_c);
+        return false;
+    }
+    test_println!("  Part C: write broke COW and landed 0 ✓");
+
+    teardown();
+    test_pass!("CLONE_CHILD_CLEARTID write lands on non-present / COW page");
     true
 }
 
