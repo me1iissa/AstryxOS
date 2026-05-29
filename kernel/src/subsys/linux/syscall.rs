@@ -3439,9 +3439,13 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             crate::syscall::sys_exec(arg1, path_bytes.len() as u64, arg2, arg3)
         }
         // 60: exit(status)
+        // exit_thread() loops on schedule() until this thread is switched
+        // away permanently; it never returns.  The trailing `0` satisfies
+        // the type-checker (dispatch_body returns i64) but is dead code —
+        // POSIX exit(2): "The exit() function shall not return."
         60 => {
             crate::proc::exit_thread(arg1 as i64);
-            0
+            0 // dead — exit_thread diverges
         }
         // 61: wait4(pid, wstatus, options, rusage)
         61 => crate::syscall::sys_waitpid(arg1 as i64, arg3 as u32),
@@ -3635,10 +3639,14 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             sys_clock_gettime(arg1, arg2)
         }
         // 231: exit_group(status) — terminate all threads in the process
+        // exit_group() marks all sibling threads Dead, frees process memory,
+        // and loops on schedule() until this thread is switched away; it
+        // never returns.  The trailing `0` is dead code — POSIX exit(2):
+        // "The exit() function shall not return."
         231 => {
             crate::serial_println!("[SYSCALL/Linux] exit_group({})", arg1 as i32);
             crate::proc::exit_group(arg1 as i64);
-            0
+            0 // dead — exit_group diverges
         }
         // 234: tgkill(tgid, tid, sig)
         // Sends signal `sig` to thread `tid` in thread group `tgid`.
