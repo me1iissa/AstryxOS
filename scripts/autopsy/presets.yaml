@@ -215,6 +215,38 @@ presets:
         len: 64
 
   # ───────────────────────────────────────────────────────────────────────────
+  # sigsegv-user-gprs
+  # ───────────────────────────────────────────────────────────────────────────
+  # Capture the FAULTING USER register set at deliver_sigsegv_from_isr() entry.
+  # The kernel ISR stub pushes the 15 user GPRs immediately BELOW the
+  # InterruptFrame (lower VAs).  deliver_sigsegv_from_isr(cr2, error_code, frame)
+  # receives `frame` in RDX (sysV AMD64 ABI §3.2.3: arg0=RDI=cr2,
+  # arg1=RSI=error_code, arg2=RDX=frame).  Per the documented layout the GPR
+  # qwords sit at frame[-2]=rax … frame[-16]=r15 (frame[-5]=rsi, frame[-11]=rbx,
+  # frame[-12]=rbp, frame[-15]=r14).  Reading 144 bytes at (frame-128) captures
+  # all 16 pushed qwords plus the InterruptFrame's saved RIP/CS so the user
+  # fault context (which argv slot, which array base) is fully reconstructable.
+  sigsegv-user-gprs:
+    description: |
+      Faulting user GPRs at deliver_sigsegv_from_isr() entry.  frame is in RDX;
+      pushed user GPRs live at frame-128..frame.  Captures that window + the
+      InterruptFrame so rsi/r14/rbp/rbx (the option-array parse state) are
+      recoverable without a printk.
+    steps:
+      - name: regs
+        kind: regs
+      - name: pushed_gprs
+        kind: mem_via_reg
+        reg: rdx
+        offset: -128
+        len: 144
+      - name: interrupt_frame
+        kind: mem_via_reg
+        reg: rdx
+        offset: 0
+        len: 48
+
+  # ───────────────────────────────────────────────────────────────────────────
   # bugcheck-entry
   # ───────────────────────────────────────────────────────────────────────────
   # Symmetric to ssp-fail-snapshot but tuned for ke_bugcheck() entry.

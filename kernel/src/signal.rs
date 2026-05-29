@@ -1244,9 +1244,10 @@ pub unsafe fn deliver_sigsegv_from_isr(
     // never block other CPUs from looking up their own process entry.
     drop(procs);
     crate::serial_println!(
-        "[SIGNAL] SIGSEGV ISR delivery: PID={} CR2={:#x} user_rip={:#x} handler={:#x} new_rsp={:#x} siginfo={}",
+        "[SIGNAL] SIGSEGV ISR delivery: PID={} CR2={:#x} user_rip={:#x} handler={:#x} new_rsp={:#x} siginfo={} r14={:#x} rbp={:#x} rbx={:#x} rsi={:#x}",
         pid, cr2, user_rip, handler_addr, new_rsp,
-        if want_siginfo { "SA_SIGINFO" } else { "classic" }
+        if want_siginfo { "SA_SIGINFO" } else { "classic" },
+        isr_r14, isr_rbp, isr_rbx, isr_rsi
     );
     emit_signal_vma_banner(pid, user_rip, cr2, &vma_snapshot);
 
