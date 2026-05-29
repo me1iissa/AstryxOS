@@ -22098,10 +22098,11 @@ fn test_execve_no_pmm_leak() -> bool {
         //
         // When a thread exits, its kernel stack is pushed to the dead-stack
         // cache by `reap_dead_threads_sched`.  The cache withholds the entry
-        // from re-issue until every CPU has advanced its per-CPU timer-ISR
-        // counter by at least DEAD_STACK_QUIESCE_TICKS (= 2) beyond the push
-        // snapshot (Intel SDM Vol. 3A §11.10 coherence: a CPU's in-flight
-        // stack reads are only retired after a full timer-ISR round-trip).
+        // from re-issue until the global `TICK_COUNT` has advanced by at least
+        // DEAD_STACK_QUIESCE_TICKS (= 2) ticks beyond the push snapshot
+        // (20 ms wall-clock at TICK_HZ=100).  This ensures any in-flight
+        // `switch_context_asm` on another CPU has retired before the kstack
+        // frame is handed out for reuse (Intel SDM Vol. 3A §6.14).
         //
         // Without this wait: the next iteration's `alloc_kernel_stack` finds
         // the cache entry non-quiesced and falls back to `pmm::alloc_pages`,
@@ -22110,12 +22111,9 @@ fn test_execve_no_pmm_leak() -> bool {
         // iteration adds exactly KERNEL_STACK_PAGES (64) to the PMM leak.
         //
         // Fix: call `sched::wait_dead_stacks_quiesced()`, which spins with
-        // interrupts enabled until every per-CPU timer-ISR counter (the
-        // same counters checked by `entry_is_quiesced`) has advanced by
-        // DEAD_STACK_QUIESCE_TICKS + 1 beyond a fresh baseline.  Unlike
-        // waiting on the global TICK_COUNT (which is TSC-derived and can be
-        // advanced by CPU 1 only), this directly unblocks the
-        // quiescence gate for ALL CPUs.
+        // interrupts enabled until `TICK_COUNT` (the same counter checked by
+        // `entry_is_quiesced`) has advanced by DEAD_STACK_QUIESCE_TICKS + 1
+        // beyond a fresh baseline.
         //
         // Yield twice first to ensure reap_dead_threads_sched() has run and
         // pushed the child's kstack to the cache before we wait for quiescence.
