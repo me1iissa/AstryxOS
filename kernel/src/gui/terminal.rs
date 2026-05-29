@@ -897,12 +897,23 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         // Reports/ creation and the subsequent fatal-on-error writes that
         // bubble up through CrashReporter::SetupExtraData().
         "MOZ_CRASHREPORTER_DISABLE=1",
-        // E10S (multi-process) is left enabled so libxul attempts to launch
-        // plugin-container.  This drives the parent through
-        // GeckoChildProcessHost::PerformAsyncLaunch (chromium IPC LaunchProcess
-        // path), which exercises clone(), execve(), socketpair(AF_UNIX,
-        // SOCK_SEQPACKET), and SCM_RIGHTS cmsg delivery — all needed for
-        // issue #88.  See https://wiki.mozilla.org/Electrolysis.
+        // Force single-process (no content-child) mode so the headless
+        // --screenshot path uses the in-process paint branch of
+        // CrossProcessPaint::Start.  When e10s is disabled,
+        // WindowGlobalParent::IsInProcess() returns true and
+        // drawSnapshot() records the page directly in the parent process
+        // without spawning a content child, without AF_UNIX SCM_RIGHTS
+        // fd-passing, and without memfd/shm round-trips — dropping the
+        // entire content-process cluster off the critical path.
+        //
+        // MOZ_DISABLE_NONLOCAL_CONNECTIONS=1 (set above) satisfies the
+        // AreNonLocalConnectionsDisabled() gate in MOZILLA_OFFICIAL
+        // release builds, after which MOZ_FORCE_DISABLE_E10S=1 is
+        // honoured.
+        //
+        // See: https://wiki.mozilla.org/Electrolysis
+        //      https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html
+        "MOZ_FORCE_DISABLE_E10S=1",
         // Skip GPU/glxtest process — software rendering only.
         "MOZ_GFX_TESTING_NO_CHILD_PROCESS=1",
         "MOZ_X11_EGL=0",
