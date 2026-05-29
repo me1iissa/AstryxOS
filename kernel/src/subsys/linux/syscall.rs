@@ -6270,9 +6270,16 @@ fn sys_fstat_linux(fd_num: usize, stat_buf: *mut u8) -> i64 {
     let inode = fd.inode;
     drop(procs);
 
-    let mounts = crate::vfs::MOUNTS.lock();
-    match mounts.get(mount_idx) {
-        Some(m) => match m.fs.stat(inode) {
+    // Snapshot the Arc<FS> under the MOUNTS lock and drop the lock before
+    // dispatching stat().  The ext2/fat32/ntfs stat paths reach virtio block
+    // I/O which calls schedule(); holding the non-yielding MOUNTS spinlock
+    // across that yields a cross-thread deadlock on SMP (confirmed GDB
+    // autopsy: vfork parent spins on MOUNTS at resolve_path while the holder
+    // is blocked in virtio wait_completion with MOUNTS still held).
+    // Per POSIX fstat(2): the call must not hold any non-reentrant kernel
+    // lock across a potential blocking I/O operation.
+    match crate::vfs::fs_at(mount_idx) {
+        Some((fs, _)) => match fs.stat(inode) {
             Ok(st) => {
                 fill_linux_stat(stat_buf, &st);
                 0
@@ -7124,16 +7131,18 @@ fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: u64, count: usize) -> i
     };
 
     // Read data from in_fd into a heap buffer.
+    // Snapshot the Arc<FS> under MOUNTS and drop the lock before dispatching
+    // read() — the block I/O path may call schedule() (virtio wait_completion),
+    // and holding the non-yielding MOUNTS spinlock across that yields an SMP
+    // deadlock.  Per sendfile(2) / POSIX read(2): no kernel-internal lock may
+    // be held across blocking I/O.
     let mut buf: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
-    let n = {
-        let mounts = crate::vfs::MOUNTS.lock();
-        match mounts.get(in_mount) {
-            Some(m) => match m.fs.read(in_inode, read_offset, &mut buf) {
-                Ok(n) => n,
-                Err(_) => return -5,
-            },
-            None => return -9,
-        }
+    let n = match crate::vfs::fs_at(in_mount) {
+        Some((fs, _)) => match fs.read(in_inode, read_offset, &mut buf) {
+            Ok(n) => n,
+            Err(_) => return -5,
+        },
+        None => return -9,
     };
     if n == 0 { return 0; }
     buf.truncate(n);
@@ -7161,11 +7170,11 @@ fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: u64, count: usize) -> i
             return -9;
         }
     } else {
-        let mounts = crate::vfs::MOUNTS.lock();
-        match mounts.get(out_mount) {
-            Some(m) => {
-                let n_w = m.fs.write(out_inode, out_offset, &buf).unwrap_or(0);
-                drop(mounts);
+        // Same snapshot-Arc-then-drop convention as the read path above:
+        // drop MOUNTS before dispatching write() which may block on I/O.
+        match crate::vfs::fs_at(out_mount) {
+            Some((fs, _)) => {
+                let n_w = fs.write(out_inode, out_offset, &buf).unwrap_or(0);
                 // Page-cache coherency: same contract as `vfs::fd_write`
                 // (POSIX mmap(2) MAP_SHARED + write(2) visibility).
                 if n_w > 0 {
@@ -7258,20 +7267,22 @@ fn sys_access(pathname: u64, mode: u64) -> i64 {
         return 0;
     }
 
-    // Read inode mode bits and the mount's (path, fstype) under the lock,
-    // then drop it before consulting procfs::mount_opts_for to keep the
-    // critical section tight.
-    let (st, mount_path, fstype) = {
+    // Snapshot the Arc<FS>, mount path, and fstype under the MOUNTS lock,
+    // then drop the lock before dispatching stat() which may block on I/O.
+    // Holding the non-yielding MOUNTS spinlock across a schedule() point
+    // (reached via virtio block I/O) causes an SMP deadlock — same class as
+    // the fstat/sendfile fix.  Per POSIX access(2): no reentrant lock may
+    // be held across a blocking file-system call.
+    let (mount_path, fstype, fs) = {
         let mounts = crate::vfs::MOUNTS.lock();
-        let m = match mounts.get(mount_idx) {
-            Some(m) => m,
+        match mounts.get(mount_idx) {
+            Some(m) => (m.path.clone(), alloc::string::String::from(m.fs.name()), m.fs.clone()),
             None => return -2,
-        };
-        let st = match m.fs.stat(inode) {
-            Ok(s) => s,
-            Err(_) => return -2,
-        };
-        (st, m.path.clone(), alloc::string::String::from(m.fs.name()))
+        }
+    };
+    let st = match fs.stat(inode) {
+        Ok(s) => s,
+        Err(_) => return -2,
     };
 
     let opts = crate::vfs::procfs::mount_opts_for(mount_path.as_str(), fstype.as_str());
@@ -7383,16 +7394,17 @@ fn sys_getdents64(fd: u64, buf: u64, count: u64) -> i64 {
         return getdents64_proc_fd(pid, fd as usize, buf, count, offset);
     }
 
-    // Read directory entries from VFS
-    let entries = {
-        let mounts = crate::vfs::MOUNTS.lock();
-        match mounts.get(mount_idx) {
-            Some(m) => match m.fs.readdir(inode) {
-                Ok(e) => e,
-                Err(e) => return crate::subsys::linux::errno::vfs_err(e),
-            },
-            None => return -9,
-        }
+    // Snapshot Arc<FS> under MOUNTS, drop the lock, then dispatch readdir().
+    // ext2::readdir issues block I/O (read_block → virtio wait_completion →
+    // schedule()); holding the non-yielding MOUNTS spinlock across that point
+    // causes the same SMP deadlock as fstat/sendfile.  Per POSIX getdents(3):
+    // no non-reentrant lock may span a blocking directory-read operation.
+    let entries = match crate::vfs::fs_at(mount_idx) {
+        Some((fs, _)) => match fs.readdir(inode) {
+            Ok(e) => e,
+            Err(e) => return crate::subsys::linux::errno::vfs_err(e),
+        },
+        None => return -9,
     };
 
     // SMAP bracket — `buf` is a user-VA pointer the dirent records are
@@ -10178,16 +10190,15 @@ fn sys_getdents(fd: u64, buf: u64, count: u64) -> i64 {
         (fd_entry.mount_idx, fd_entry.inode, fd_entry.offset)
     };
 
-    // Read directory entries from VFS.
-    let entries = {
-        let mounts = crate::vfs::MOUNTS.lock();
-        match mounts.get(mount_idx) {
-            Some(m) => match m.fs.readdir(inode) {
-                Ok(e) => e,
-                Err(e) => return crate::subsys::linux::errno::vfs_err(e),
-            },
-            None => return -9,
-        }
+    // Snapshot Arc<FS> under MOUNTS, drop the lock, then dispatch readdir().
+    // Same reasoning as the getdents64 path above: block I/O in readdir may
+    // call schedule(), so MOUNTS must not be held across the dispatch.
+    let entries = match crate::vfs::fs_at(mount_idx) {
+        Some((fs, _)) => match fs.readdir(inode) {
+            Ok(e) => e,
+            Err(e) => return crate::subsys::linux::errno::vfs_err(e),
+        },
+        None => return -9,
     };
 
     if buf == 0 || !crate::syscall::validate_user_ptr(buf, count as usize) {
