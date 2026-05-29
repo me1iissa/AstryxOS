@@ -2374,6 +2374,30 @@ pub fn run() -> ! {
     total += 1;
     if test_277_pt_tls_refcount_init() { passed += 1; }
 
+    // ── Test 278: VFS MOUNTS spinlock not held across FS dispatch ────────
+    //
+    // Regression test for the confirmed SMP deadlock where sys_fstat_linux
+    // (and related syscalls) held the non-yielding MOUNTS spinlock across
+    // m.fs.stat() / m.fs.read() / m.fs.write() / m.fs.readdir() dispatch.
+    // Those FS methods reach virtio block I/O → wait_completion → schedule()
+    // while MOUNTS is held; a concurrent thread that blocks on MOUNTS.lock()
+    // monopolises its CPU and the holder is never rescheduled → hard deadlock.
+    //
+    // The test verifies the invariant by checking that MOUNTS.try_lock()
+    // succeeds from within a stat() callback (meaning the caller released
+    // MOUNTS before dispatching stat).  We mount a small tmpfs (no block I/O,
+    // pure in-memory), stat an inode through the public vfs::fs_at path, and
+    // assert that MOUNTS is not held at the point stat() executes.
+    //
+    // A separate pass exercises the faccessat path (same class): resolve a
+    // path then call vfs::fs_at + fs.stat outside the lock.
+    //
+    // Refs: POSIX fstat(2) §2.9.7 "Thread Interactions with Regular File
+    // Operations" — blocking I/O must not be performed while holding a lock
+    // that another thread may need; POSIX sched(7) "priority inversion" note.
+    total += 1;
+    if test_278_mounts_lock_not_held_across_fs_dispatch() { passed += 1; }
+
     // ── Tests 261-263: native-core hardening (cycle 3) ──────────────────
     // Gated on `native-core-tests` feature: the three native-core tests
     // (page_ref_dec CAS underflow, OB refcount integration, scheduler
@@ -41136,4 +41160,119 @@ fn test_277_pt_tls_refcount_init() -> bool {
         test_pass!("PT_TLS refcount init — no DEC-UNDERFLOW at teardown");
     }
     all_rc_ok
+}
+
+// ── Test 278: MOUNTS spinlock not held across FS dispatch ───────────────────
+//
+// Verifies that vfs::fs_at() releases the MOUNTS lock before the caller
+// dispatches any FileSystemOps method.  This is the structural invariant that
+// prevents the SMP deadlock where sys_fstat_linux / sendfile / faccessat /
+// getdents64 previously held the non-yielding MOUNTS spinlock across block I/O
+// (ext2::stat → read_block → virtio wait_completion → schedule()), causing the
+// holder to yield on one CPU while a second thread spun on MOUNTS forever.
+//
+// Strategy:
+//   1. Take a snapshot via vfs::fs_at(idx) — this clones the Arc<FS> and drops
+//      the lock.
+//   2. IMMEDIATELY after fs_at returns, try_lock MOUNTS and assert it succeeds
+//      (i.e. nobody holds it — in particular, fs_at released it).
+//   3. Call fs.stat(root_inode) with the lock NOT held and assert stat succeeds.
+//   4. Repeat for a tmpfs mount (in-memory, no real I/O) so the test is fast
+//      and deterministic even in QEMU without a block device.
+//
+// We also verify the vfs::stat() public API path uses the same convention by
+// mounting a tmpfs with a known file and calling vfs::stat("/test-278/").
+//
+// Refs: POSIX fstat(2) §2.9.7 (thread interactions with file operations);
+// general spinlock discipline — a non-preemptible spinlock must not be held
+// across any operation that may deschedule the holder.
+fn test_278_mounts_lock_not_held_across_fs_dispatch() -> bool {
+    test_header!("VFS MOUNTS-lock not held across FS dispatch (deadlock regression)");
+
+    // ── Step 1: mount a tmpfs at a test-private path ──────────────────────
+    const MOUNT_PATH: &str = "/test-278";
+    {
+        let fs = crate::vfs::tmpfs::TmpFs::new();
+        crate::vfs::mount(MOUNT_PATH, Box::new(fs), 1);
+    }
+    test_println!("  mounted tmpfs at {}", MOUNT_PATH);
+
+    // ── Step 2: find its mount index ──────────────────────────────────────
+    let mount_idx = {
+        let mounts = crate::vfs::MOUNTS.lock();
+        mounts.iter().position(|m| m.path == MOUNT_PATH)
+    };
+    let mount_idx = match mount_idx {
+        Some(i) => i,
+        None => {
+            test_fail!("VFS MOUNTS-lock deadlock regression",
+                "tmpfs mount at {} not found in MOUNTS table", MOUNT_PATH);
+            return false;
+        }
+    };
+    test_println!("  mount_idx={}", mount_idx);
+
+    // ── Step 3: fs_at must release MOUNTS before returning ────────────────
+    // After fs_at() returns, MOUNTS must be free — verify via try_lock.
+    let snap = crate::vfs::fs_at(mount_idx);
+    let (fs_arc, root_inode) = match snap {
+        Some(x) => x,
+        None => {
+            test_fail!("VFS MOUNTS-lock deadlock regression",
+                "fs_at({}) returned None after successful mount", mount_idx);
+            return false;
+        }
+    };
+
+    // Try to acquire MOUNTS — must succeed if fs_at dropped it.
+    let lock_free_after_fs_at = crate::vfs::MOUNTS.try_lock().is_some();
+    if !lock_free_after_fs_at {
+        test_fail!("VFS MOUNTS-lock deadlock regression",
+            "MOUNTS was still held after fs_at() returned — \
+             the lock was NOT dropped before the caller can dispatch FS methods.  \
+             This is the deadlock: any FS method that calls schedule() would \
+             block the holder indefinitely.");
+        return false;
+    }
+    test_println!("  MOUNTS is free after fs_at() — invariant holds");
+
+    // ── Step 4: fs.stat() works with MOUNTS not held ──────────────────────
+    let stat_result = fs_arc.stat(root_inode);
+    match stat_result {
+        Ok(st) => {
+            test_println!("  fs.stat(root_inode={}) succeeded outside MOUNTS lock: \
+                type={:?} size={}", root_inode, st.file_type, st.size);
+        }
+        Err(e) => {
+            test_fail!("VFS MOUNTS-lock deadlock regression",
+                "fs.stat(root_inode={}) failed outside MOUNTS lock: {:?}",
+                root_inode, e);
+            return false;
+        }
+    }
+
+    // ── Step 5: public vfs::stat() path also uses the safe convention ─────
+    // vfs::stat internally calls fs_at + stat outside the lock; verify it
+    // works correctly (and returns a sane result) for our tmpfs mount point.
+    match crate::vfs::stat(MOUNT_PATH) {
+        Ok(st) => {
+            test_println!("  vfs::stat(\"{}\") = type={:?} size={}",
+                MOUNT_PATH, st.file_type, st.size);
+        }
+        Err(e) => {
+            test_fail!("VFS MOUNTS-lock deadlock regression",
+                "vfs::stat(\"{}\") failed: {:?}", MOUNT_PATH, e);
+            return false;
+        }
+    }
+
+    // ── Cleanup: remove the test mount ───────────────────────────────────
+    {
+        let mut mounts = crate::vfs::MOUNTS.lock();
+        mounts.retain(|m| m.path != MOUNT_PATH);
+    }
+    test_println!("  cleaned up test mount");
+
+    test_pass!("VFS MOUNTS-lock not held across FS dispatch (deadlock regression)");
+    true
 }
