@@ -2158,6 +2158,15 @@ fn exit_group_inner(pid: Pid, calling_tid: Tid, exit_code: i64, yield_self: bool
     // as the final owner.  This keeps the common single-thread path fast
     // (no sibling → free immediately) while making the multi-thread path
     // safe (CLONE_THREAD: wait for Running siblings to drain off-CPU).
+    //
+    // Contention note: THREAD_TABLE is a spin::Mutex.  This lock
+    // acquisition is on the exit path — interrupts are enabled and the
+    // calling CPU is about to schedule away, so contention with a
+    // concurrent timer ISR or AP scheduler is bounded to a short
+    // critical section (one iter + state compare).  If SMP thread counts
+    // grow large enough that the linear scan becomes a latency concern,
+    // consider an atomic per-process Running-thread counter as a fast
+    // pre-check before taking the lock.
     let any_sibling_running = {
         let threads = THREAD_TABLE.lock();
         threads.iter().any(|t| {
