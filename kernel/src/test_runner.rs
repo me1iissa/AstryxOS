@@ -2353,6 +2353,27 @@ pub fn run() -> ! {
         if test_274_udp_connect_auto_bind() { passed += 1; }
     }
 
+    // ── Test 277: PT_TLS page refcount initialisation (process-teardown) ──
+    // Verifies that each physical frame backing a PT_TLS segment receives
+    // refcount = 1 immediately after map_page_in, mirroring the PT_LOAD
+    // path.  Pre-fix: the PT_TLS mapping loop in proc/elf.rs called
+    // vmm::map_page_in for each TLS page but never called page_ref_set,
+    // leaving the frames at refcount 0.  At process exit, free_process_memory
+    // walked the surviving VMA, found the present TLS PTEs, and issued
+    // page_ref_dec on frames already at 0, firing [REFCOUNT/DEC-UNDERFLOW].
+    //
+    // The test synthesises a minimal ELF64 with one PT_LOAD + one PT_TLS,
+    // loads it into a fresh VmSpace, walks the TLS virtual range, resolves
+    // each frame via virt_to_phys_in, and asserts page_ref_count == 1.  It
+    // also checks that the PAGE_REF_DEC_UNDERFLOW global counter does not
+    // increment during a synthetic teardown dec sequence.
+    //
+    // Refs: ELF gABI §3.4.1 (PT_TLS); System V AMD64 ABI §3.4.6 (TLS
+    // allocation); Intel SDM Vol. 3A §4.10.5 (page-table reference
+    // discipline); CWE-911 (improper update of reference count).
+    total += 1;
+    if test_277_pt_tls_refcount_init() { passed += 1; }
+
     // ── Tests 261-263: native-core hardening (cycle 3) ──────────────────
     // Gated on `native-core-tests` feature: the three native-core tests
     // (page_ref_dec CAS underflow, OB refcount integration, scheduler
@@ -40841,4 +40862,249 @@ fn test_275_pty_syscall_smoke() -> bool {
 
     if ok { test_pass!("PTY syscall smoke — open/ioctl/read/write end-to-end (Test 275)"); }
     ok
+}
+
+// ── Test 277: PT_TLS page refcount initialisation ───────────────────────────
+//
+// Regression test for the [REFCOUNT/DEC-UNDERFLOW] bug where PT_TLS frames
+// were mapped present+user+writable but never had page_ref_set(phys, 1)
+// called, leaving them at refcount 0.  At process exit, free_process_memory
+// calls page_ref_dec on those frames and fires the underflow guard.
+//
+// Strategy: synthesise a minimal ELF64 with one PT_LOAD segment (so the
+// loader accepts it) and one PT_TLS segment (memsz=8, filesz=0, align=8).
+// Load it into a fresh VmSpace.  Walk the TLS virtual range, resolve each
+// backing frame via virt_to_phys_in, and assert page_ref_count(frame) == 1.
+// Then simulate one teardown dec per frame and assert the counter reaches 0
+// without triggering PAGE_REF_DEC_UNDERFLOW.
+//
+// The ELF image is built entirely from raw bytes so there is no dependency
+// on an external binary.  ELF64 header layout: ELF gABI §4 Table 4-3
+// (Elf64_Ehdr); program header: ELF gABI §5 Table 5-2 (Elf64_Phdr).
+// PT_TLS type code = 7 per ELF gABI §5 Table 5-3.
+fn test_277_pt_tls_refcount_init() -> bool {
+    test_header!("PT_TLS refcount init — no DEC-UNDERFLOW at teardown");
+
+    use crate::mm::vma::VmSpace;
+    use crate::mm::refcount;
+    use crate::mm::vmm;
+    use crate::mm::pmm;
+
+    // ── Build a minimal ELF64 with PT_LOAD + PT_TLS ──────────────────────
+    // Layout:
+    //   offset 0x00 .. 0x3F  ELF64 header (e_phnum=2)
+    //   offset 0x40 .. 0x77  Phdr[0]: PT_LOAD, vaddr=0, filesz=memsz=0xB5, PF_R|PF_X
+    //   offset 0x78 .. 0xAF  Phdr[1]: PT_TLS,  vaddr=0, filesz=0, memsz=8, align=8
+    //   offset 0xB0 .. 0xB4  padding to reach 0xB5 total file bytes
+    //
+    // The PT_LOAD covers the entire file (filesz = file size = 0xB5) so the
+    // loader copies the image from file into a zeroed page — the PT_TLS
+    // parsing then consumes its segment independently.
+    const FILE_SIZE: usize = 0xB5;
+    let mut elf = alloc::vec![0u8; FILE_SIZE];
+
+    // ── ELF64 header (64 bytes, offset 0x00) ─────────────────────────────
+    // Magic
+    elf[0] = 0x7F; elf[1] = b'E'; elf[2] = b'L'; elf[3] = b'F';
+    elf[4] = 2;    // ELFCLASS64
+    elf[5] = 1;    // ELFDATA2LSB
+    elf[6] = 1;    // EI_VERSION
+    // elf[7..15] = 0 (EI_OSABI, EI_ABIVERSION, EI_PAD)
+    // e_type = ET_DYN (3) — use PIE so the PT_LOAD maps at an ASLR base
+    // rather than VA 0, which the loader refuses (null-pointer page guard).
+    elf[16] = 3; elf[17] = 0;
+    // e_machine = EM_X86_64 (62)
+    elf[18] = 62; elf[19] = 0;
+    // e_version = 1
+    elf[20] = 1;
+    // e_entry = 0 (bias added at runtime; only the load-and-map path matters)
+    // e_phoff = 64 (0x40)
+    elf[32] = 64;
+    // e_shoff = 0 (no section headers)
+    // e_flags = 0
+    // e_ehsize = 64
+    elf[52] = 64;
+    // e_phentsize = 56
+    elf[54] = 56;
+    // e_phnum = 2
+    elf[56] = 2;
+    // e_shentsize, e_shnum, e_shstrndx = 0
+
+    // ── Phdr[0]: PT_LOAD (offset 0x40, 56 bytes) ─────────────────────────
+    let ph0 = 0x40_usize;
+    // p_type = PT_LOAD (1)
+    elf[ph0]     = 1;
+    // p_flags = PF_R | PF_X = 5
+    elf[ph0 + 4] = 5;
+    // p_offset = 0
+    // p_vaddr  = 0
+    // p_paddr  = 0
+    // p_filesz = FILE_SIZE as u64 (little-endian)
+    let fsz = (FILE_SIZE as u64).to_le_bytes();
+    elf[ph0 + 32..ph0 + 40].copy_from_slice(&fsz);
+    // p_memsz  = FILE_SIZE
+    elf[ph0 + 40..ph0 + 48].copy_from_slice(&fsz);
+    // p_align  = 0x1000
+    elf[ph0 + 48] = 0x00; elf[ph0 + 49] = 0x10; // 0x1000 LE
+
+    // ── Phdr[1]: PT_TLS (offset 0x78, 56 bytes) ──────────────────────────
+    // PT_TLS type = 7 per ELF gABI §5 Table 5-3.
+    let ph1 = 0x78_usize;
+    // p_type = PT_TLS (7)
+    elf[ph1] = 7;
+    // p_flags = PF_R = 4
+    elf[ph1 + 4] = 4;
+    // p_offset = 0   (no file content; filesz = 0)
+    // p_vaddr  = 0   (kernel assigns tls_virt internally; p_vaddr ignored)
+    // p_paddr  = 0
+    // p_filesz = 0   (no initialised template data)
+    // p_memsz  = 8   (minimum non-zero TLS block)
+    elf[ph1 + 40] = 8;
+    // p_align  = 8
+    elf[ph1 + 48] = 8;
+
+    // ── Load into a fresh VmSpace ─────────────────────────────────────────
+    let vm = match VmSpace::new_user() {
+        Some(v) => v,
+        None => {
+            test_fail!("test277", "VmSpace::new_user() returned None");
+            return false;
+        }
+    };
+    let cr3 = vm.cr3;
+
+    let result = match crate::proc::elf::load_elf(&elf, cr3) {
+        Ok(r) => r,
+        Err(e) => {
+            test_fail!("test277",
+                "load_elf returned {:?} — ELF synthesis or loader broken", e);
+            return false;
+        }
+    };
+
+    // ── Verify TLS base is non-zero ───────────────────────────────────────
+    // result.tls_base == 0 means no PT_TLS was found.  That would confirm
+    // the ELF image was malformed rather than prove the fix.
+    if result.tls_base == 0 {
+        test_fail!("test277",
+            "result.tls_base == 0 — PT_TLS not parsed; ELF image or loader \
+             path broken; cannot verify refcount fix");
+        // Cleanup best-effort.
+        for &p in &result.allocated_pages {
+            refcount::page_ref_set(p, 0);
+            pmm::free_page(p);
+        }
+        return false;
+    }
+    test_println!("  tls_base = {:#x} (non-zero, PT_TLS parsed) ✓", result.tls_base);
+
+    // ── Walk TLS virtual range and check refcount == 1 per frame ─────────
+    // The TLS region starts at tls_virt (a fixed VA in the upper user area,
+    // see proc/elf.rs) and covers npages = ceil((memsz + 8) / PAGE_SIZE)
+    // pages (+ 8 bytes for the TCB self-pointer per AMD64 ABI §3.4.6).
+    // We do not hard-code tls_virt; instead we walk from tls_base (= TCB VA)
+    // down to tls_base - 1 page, then check all frames in that page.  For
+    // a memsz=8 TLS, everything fits in 1 page.  We scan up to 4 pages
+    // (generous upper bound for memsz up to ~16 KiB) starting one page
+    // below the TCB page.
+    //
+    // Simpler: the loader always allocates npages = ceil((memsz+8)/PAGE_SIZE)
+    // starting at tls_virt.  For memsz=8, total=16, npages=1.  tls_virt is
+    // the page aligned address equal to tls_base & !0xFFF for single-page
+    // case (TCB = tls_virt + memsz = tls_virt + 8, so tls_base = tls_virt+8).
+    let page_size: u64 = pmm::PAGE_SIZE as u64;
+    let tls_virt = result.tls_base & !0xFFF; // page-align the TCB address
+    // For memsz=8: 1 page total.  Scan up to 4 pages to be robust.
+    let max_tls_pages: u64 = 4;
+
+    let mut tls_frames_found = 0u64;
+    let mut all_rc_ok = true;
+
+    for pi in 0..max_tls_pages {
+        let va = tls_virt + pi * page_size;
+        // Stop at the first unmapped page — that marks the end of the TLS
+        // allocation.
+        let phys = match vmm::virt_to_phys_in(cr3, va) {
+            Some(p) => p & !0xFFF,
+            None => break,
+        };
+        tls_frames_found += 1;
+        let rc = refcount::page_ref_count(phys);
+        if rc != 1 {
+            test_fail!("test277",
+                "TLS frame #{}: phys={:#x} has rc={} (expected 1) — \
+                 page_ref_set missing after map_page_in; \
+                 free_process_memory would fire DEC-UNDERFLOW",
+                pi, phys, rc);
+            all_rc_ok = false;
+        } else {
+            test_println!("  TLS frame #{}: phys={:#x} rc=1 ✓", pi, phys);
+        }
+    }
+
+    if tls_frames_found == 0 {
+        test_fail!("test277",
+            "no mapped TLS pages found starting at tls_virt={:#x} — \
+             tls_base computation or TLS mapping broken", tls_virt);
+        for &p in &result.allocated_pages {
+            refcount::page_ref_set(p, 0);
+            pmm::free_page(p);
+        }
+        return false;
+    }
+    test_println!("  {} TLS frame(s) found, all rc=1 ✓", tls_frames_found);
+
+    // ── Simulate teardown: one dec per TLS frame, assert no underflow ─────
+    // Capture the pre-dec underflow counter so the assertion is relative
+    // (other tests may have incremented it earlier in the suite).
+    let underflow_before = refcount::page_ref_dec_underflow_count();
+
+    for pi in 0..tls_frames_found {
+        let va = tls_virt + pi * page_size;
+        if let Some(phys) = vmm::virt_to_phys_in(cr3, va) {
+            let phys = phys & !0xFFF;
+            let new_rc = refcount::page_ref_dec(phys);
+            if new_rc != 0 {
+                test_fail!("test277",
+                    "TLS frame #{}: page_ref_dec → {} (expected 0 — \
+                     dec from 1 must floor at 0)", pi, new_rc);
+                all_rc_ok = false;
+            }
+        }
+    }
+
+    let underflow_after = refcount::page_ref_dec_underflow_count();
+    if underflow_after != underflow_before {
+        test_fail!("test277",
+            "PAGE_REF_DEC_UNDERFLOW incremented during TLS teardown: \
+             before={} after={} delta={} — refcount still not initialised \
+             correctly or double-dec present",
+            underflow_before, underflow_after,
+            underflow_after - underflow_before);
+        all_rc_ok = false;
+    } else {
+        test_println!("  Teardown dec: underflow_counter unchanged ({}) ✓",
+            underflow_before);
+    }
+
+    // ── Cleanup: free all allocated pages ────────────────────────────────
+    // TLS frames were taken to rc=0 by the teardown simulation above;
+    // PT_LOAD frames (from result.allocated_pages) still have rc=1 and
+    // must be cleared before handing back to the PMM, matching the
+    // test_elf_loader cleanup pattern.
+    //
+    // Distinguish TLS frames (already at 0) from PT_LOAD frames (still
+    // at 1) by resolving through the page table vs scanning allocated_pages.
+    // Simplest safe approach: set all to 0 then free.
+    for &p in &result.allocated_pages {
+        refcount::page_ref_set(p, 0);
+        pmm::free_page(p);
+    }
+    // TLS frames were pushed into allocated_pages by the loader (elf.rs
+    // ~1259), so the loop above covers them too.  No extra free needed.
+
+    if all_rc_ok {
+        test_pass!("PT_TLS refcount init — no DEC-UNDERFLOW at teardown");
+    }
+    all_rc_ok
 }

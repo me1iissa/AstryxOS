@@ -1270,6 +1270,29 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
             });
 
             // Map TLS pages into the process page tables (one page at a time).
+            // Each successfully mapped frame receives refcount = 1, mirroring
+            // the PT_LOAD path (elf.rs ~1029 / ~1170).  Without this init,
+            // free_process_memory's VMA walk calls page_ref_dec on frames still
+            // at count 0, triggering [REFCOUNT/DEC-UNDERFLOW] and leaving the
+            // frames in a permanently quarantined / never-freed state.
+            //
+            // Ownership model (ELF gABI §3.4.1 / System V AMD64 ABI §3.4.6):
+            // PT_TLS pages are private to the process and must be released at
+            // exit.  The [tls] VMA registered above ensures the teardown VMA
+            // walk reaches these PTEs and issues exactly one page_ref_dec per
+            // frame, taking each refcount cleanly 1 → 0 → free.
+            //
+            // Known follow-ups (out of scope for this PR):
+            // (a) The [tls] VMA at tls_virt=0x7FFF_FFF0_0000 currently falls
+            //     inside the [stack grow] VMA range and is silently dropped by
+            //     insert_vma (Overlap error).  /proc/self/maps and CoW-fork
+            //     lose the [tls] region as a result.  Fix: choose a non-
+            //     colliding TLS VA (e.g. below INTERP_ASLR_MIN) and widen the
+            //     tls_base_for_thread plumbing accordingly.
+            // (b) The `let _ = insert_vma(...)` at usermode.rs:163 and
+            //     syscall/mod.rs:1281 swallows ALL insert errors silently.
+            //     A future hardening pass should log Overlap errors so VA-
+            //     layout regressions are visible in the serial log.
             let flags = vmm::PAGE_PRESENT | vmm::PAGE_USER | vmm::PAGE_WRITABLE;
             for pi in 0..npages {
                 vmm::map_page_in(
@@ -1277,6 +1300,12 @@ pub fn load_elf_with_args(data: &[u8], cr3: u64, argv: &[&str], envp: &[&str]) -
                     tls_virt + (pi * pmm::PAGE_SIZE) as u64,
                     tls_phys + (pi * pmm::PAGE_SIZE) as u64,
                     flags,
+                );
+                // Initialise the live-PTE reference count.  Mirrors PT_LOAD
+                // page_ref_set(phys, 1) at elf.rs:~1029 and ~1170.
+                crate::mm::refcount::page_ref_set(
+                    tls_phys + (pi * pmm::PAGE_SIZE) as u64,
+                    1,
                 );
             }
 
