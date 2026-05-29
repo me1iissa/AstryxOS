@@ -9331,7 +9331,7 @@ fn write_hex64(out: &mut Vec<u8>, mut v: u64) {
 /// Poll the readiness events for `fd` in process `pid`.
 /// Returns a bitmask of EPOLL* flags that are currently set.
 fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
-    use crate::ipc::epoll::{EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP};
+    use crate::ipc::epoll::{EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP, EPOLLRDHUP};
 
     // Snapshot fd metadata with a brief lock hold.  `mount_idx == usize::MAX`
     // together with the SOCKET_FD bit (`0x4000_0000`) in `flags` identifies a
@@ -9407,11 +9407,18 @@ fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
                         ev |= EPOLLIN;
                     }
                     if crate::net::unix::peer_closed(inode) {
-                        // Buffered bytes win over EOF for the EPOLLIN
-                        // signal but coexist with EPOLLHUP so a draining
-                        // reader can finish before observing the
-                        // half-close — per `poll(2)`/`epoll_wait(2)`.
-                        ev |= EPOLLHUP;
+                        // Read side is at EOF (peer did `shutdown(SHUT_WR)`
+                        // or `close()`, or we did `shutdown(SHUT_RD)`).  Per
+                        // `epoll(7)`, a read-direction hang-up sets both
+                        // EPOLLRDHUP and EPOLLHUP, and the read end becomes
+                        // readable (read() returns 0) so EPOLLIN is raised
+                        // even with the buffer empty — a draining reader is
+                        // woken to observe the EOF.  Buffered bytes (EPOLLIN
+                        // above) coexist with the hang-up bits, matching the
+                        // `poll(2)`/`epoll_wait(2)` rule that POLLHUP/RDHUP
+                        // are reported regardless of whether they were
+                        // requested in the interest mask.
+                        ev |= EPOLLIN | EPOLLRDHUP | EPOLLHUP;
                     }
                     ev
                 } else {
@@ -9543,7 +9550,7 @@ fn sys_epoll_ctl(epfd: usize, op: u64, fd: usize, event_ptr: u64) -> i64 {
 
 /// epoll_wait — collect ready events into caller's buffer.
 fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i32) -> i64 {
-    use crate::ipc::epoll::{EpollEvent, EPOLLERR};
+    use crate::ipc::epoll::{EpollEvent, EPOLLERR, EPOLLHUP};
     if maxevents == 0 { return -22; } // EINVAL
     let pid = crate::proc::current_pid_lockless();
 
@@ -9575,7 +9582,26 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
         for &(fd, subscribed, data) in &watches_snap {
             if fired.len() >= maxevents { break; }
             let ready_ev = epoll_poll_events(pid, fd);
-            let interest = subscribed & (ready_ev | EPOLLERR);
+            // Per `epoll(7)`: "EPOLLERR and EPOLLHUP ... it is not necessary
+            // to set [them] in events"; the kernel reports them whenever they
+            // occur, independent of the caller's interest set.  Build the
+            // delivered mask as two disjoint parts:
+            //   * the caller-subscribed bits that are currently ready
+            //     (`subscribed & ready_ev`), and
+            //   * any EPOLLERR / EPOLLHUP that is ready, delivered even when
+            //     unsubscribed (`ready_ev & (EPOLLERR | EPOLLHUP)`).
+            // EPOLLRDHUP is NOT in the always-on set — Linux only reports it
+            // when subscribed — so it flows through the first term only.
+            //
+            // The stored `subscribed` mask is the caller's raw interest and is
+            // never mutated; ERR/HUP are force-added to the *ready* side here
+            // at the single delivery site.  This keeps the readiness/wake
+            // matching wake-safe: a healthy fd reporting only EPOLLOUT against
+            // an EPOLLIN-only watch yields `(EPOLLIN & EPOLLOUT) | (EPOLLOUT &
+            // (ERR|HUP)) = 0`, so no spurious-ready perturbs the parking
+            // decision — exactly as before this ABI fix.
+            let interest =
+                (subscribed & ready_ev) | (ready_ev & (EPOLLERR | EPOLLHUP));
             if interest != 0 {
                 fired.push(EpollEvent { events: interest, data });
             }

@@ -3754,9 +3754,19 @@ pub(crate) fn poll_revents(pid: u64, fd: usize, events: u16) -> u16 {
     const POLLIN:  u16 = 0x0001;
     const POLLOUT: u16 = 0x0004;
     const POLLHUP: u16 = 0x0010;
-    if fd <= 2 {
-        if fd == 0 { events & POLLIN } else { events & POLLOUT }
-    } else if is_eventfd_fd(pid, fd) {
+    // Treat fd 0/1/2 as the console stdin/stdout/stderr ONLY when they are
+    // genuinely a console fd or are not open at all.  A process may
+    // `close()` a standard descriptor and `socketpair()` / `pipe()` / `dup()`
+    // a typed fd back into slot 0, 1, or 2 (POSIX guarantees the lowest free
+    // descriptor is reused — IEEE 1003.1-2017 §2.14).  Special-casing by fd
+    // *number* alone would shadow that real fd and report it as a plain
+    // console stream, dropping POLLHUP/POLLIN/POLLRDHUP — the very edge
+    // `poll(2)` must surface.  This mirrors the `is_console || (!fd_present
+    // && fd_num <= 2)` test used by the TTY/ioctl path.
+    if fd <= 2 && fd_is_console_or_absent(pid, fd) {
+        return if fd == 0 { events & POLLIN } else { events & POLLOUT };
+    }
+    if is_eventfd_fd(pid, fd) {
         if crate::ipc::eventfd::is_readable(get_eventfd_id(pid, fd)) { events & POLLIN } else { 0 }
     } else if is_unix_socket_fd(pid, fd) {
         let uid = get_unix_socket_id(pid, fd);
@@ -3771,6 +3781,17 @@ pub(crate) fn poll_revents(pid: u64, fd: usize, events: u16) -> u16 {
         let mut rev = 0u16;
         if readable { rev |= events & POLLIN; }
         rev |= events & POLLOUT; // connected sockets always writable
+        if crate::net::unix::peer_closed(uid) {
+            // The peer shut down its write direction (or closed), so our
+            // read side is at EOF.  Per POSIX `poll(2)`, `POLLHUP` is
+            // reported unconditionally (independent of the requested
+            // `events`), and the read end becomes readable — `read()`
+            // returns 0 — so `POLLIN` is also raised even with an empty
+            // buffer, mirroring the pipe read-end branch below and the
+            // unconditional-hang-up contract.
+            rev |= POLLHUP;
+            rev |= events & POLLIN;
+        }
         rev
     } else if is_socket_fd(pid, fd) {
         let sid = get_socket_id(pid, fd);
@@ -3815,6 +3836,27 @@ pub(crate) fn poll_revents(pid: u64, fd: usize, events: u16) -> u16 {
         if crate::ipc::inotify::is_readable(get_inotify_id(pid, fd)) { events & POLLIN } else { 0 }
     } else {
         events & (POLLIN | POLLOUT) // regular file always ready
+    }
+}
+
+/// Returns true if `fd` is a console fd or is not currently open in `pid`.
+///
+/// Used by `poll_revents` to decide whether fds 0/1/2 should be treated as
+/// the default console stdin/stdout/stderr.  A descriptor that has been
+/// re-bound to a socket/pipe/eventfd (after `close()` + reuse of the low
+/// slot) is `is_console == false` *and* present, so this returns false and
+/// the typed-fd readiness logic runs instead.  Mirrors the
+/// `is_console || (!fd_present && fd_num <= 2)` predicate in the TTY/ioctl
+/// path (IEEE 1003.1-2017 §2.14, lowest-free-descriptor reuse).
+fn fd_is_console_or_absent(pid: u64, fd: usize) -> bool {
+    let procs = crate::proc::PROCESS_TABLE.lock();
+    match procs.iter().find(|p| p.pid == pid)
+        .and_then(|p| p.file_descriptors.get(fd))
+    {
+        // Slot present and occupied: console only if explicitly flagged.
+        Some(Some(f)) => f.is_console,
+        // Slot absent or closed: fall back to the default-console assumption.
+        _ => true,
     }
 }
 
