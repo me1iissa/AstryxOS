@@ -113,6 +113,16 @@ impl EpollInstance {
     }
 
     /// EPOLL_CTL_ADD — returns `false` (caller should return -EEXIST) if already registered.
+    ///
+    /// The stored mask is the caller's *raw* interest set, unmodified.  Per
+    /// `epoll(7)`, `EPOLLERR` and `EPOLLHUP` are always reported and "it is
+    /// not necessary to set [them] in `events`" — but rather than mutate the
+    /// stored mask here (which would perturb the readiness/wake matching that
+    /// every `sys_epoll_wait` re-check depends on), the always-on hang-up /
+    /// error edge is force-added at the single `sys_epoll_wait` return site
+    /// (`subscribed & (ready | EPOLLERR | EPOLLHUP)`).  Keeping the stored
+    /// mask raw guarantees the wake path sees exactly the caller's interest
+    /// and no spurious HUP/ERR readiness leaks into the parking decision.
     pub fn add(&mut self, fd: usize, events: u32, data: u64) -> bool {
         if self.watches.iter().any(|w| w.fd == fd) { return false; }
         self.watches.push(EpollWatch { fd, events, data });
@@ -127,6 +137,13 @@ impl EpollInstance {
     }
 
     /// EPOLL_CTL_MOD — returns `false` (ENOENT) if fd not registered.
+    ///
+    /// As in `add()`, the stored mask is the caller's raw interest set; the
+    /// always-on `EPOLLERR | EPOLLHUP` edge is force-added at the
+    /// `sys_epoll_wait` return site, not mutated into the stored mask.  A
+    /// `MOD` that narrows the caller's interest therefore still surfaces
+    /// ERR/HUP (added at delivery) without the stored mask diverging from
+    /// what the caller requested.
     pub fn modify(&mut self, fd: usize, events: u32, data: u64) -> bool {
         if let Some(w) = self.watches.iter_mut().find(|w| w.fd == fd) {
             w.events = events;

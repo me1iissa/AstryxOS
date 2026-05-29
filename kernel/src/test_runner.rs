@@ -14160,6 +14160,132 @@ fn test_epoll_and_proc_fd() -> bool {
             }
         }
 
+        // ─── 7e. epoll EPOLLIN-only watch on a pipe whose writer closes ────
+        //
+        // Per `epoll(7)`: "EPOLLHUP ... it is not necessary to set it in
+        // events" — the kernel always reports the hang-up edge.  A watch
+        // registered with EPOLLIN only must therefore still see EPOLLHUP
+        // when the writer closes a pipe at EOF.  libevent's epoll_dispatch
+        // maps EPOLLHUP → EV_READ|EV_WRITE; without it the peer-close edge
+        // never reaches the event loop and it spins.
+        {
+            const EPOLLHUP: u32 = 0x0010;
+            let epfd5 = dispatch(291, 0, 0, 0, 0, 0, 0);
+            if epfd5 >= 0 {
+                let mut pipe_fds: [u32; 2] = [u32::MAX; 2]; // pipe(2) writes int[2]; see PR #473
+                if dispatch(22, pipe_fds.as_mut_ptr() as u64, 0, 0, 0, 0, 0) == 0 {
+                    let rfd = pipe_fds[0] as usize;
+                    let wfd = pipe_fds[1] as usize;
+                    // Subscribe to EPOLLIN ONLY — deliberately NOT EPOLLHUP.
+                    let ev = make_ev(EPOLLIN, rfd as u64);
+                    let _ = dispatch(233, epfd5 as u64, CTL_ADD, rfd as u64,
+                                     ev.as_ptr() as u64, 0, 0);
+                    // Close the writer with no data buffered → pure EOF.
+                    let _ = dispatch(3, wfd as u64, 0, 0, 0, 0, 0);
+
+                    let mut buf = [[0u8; 12]; 4];
+                    let r = dispatch(232, epfd5 as u64, buf[0].as_mut_ptr() as u64,
+                                     4, 0, 0, 0); // non-blocking
+                    let evb = if r >= 1 { ev_events(&buf[0]) } else { 0 };
+                    if r >= 1 && (evb & EPOLLHUP) != 0 {
+                        test_println!(
+                            "  pipe EPOLLIN-only watch: EPOLLHUP delivered on writer-close ok (ev={:#x})",
+                            evb);
+                    } else {
+                        test_fail!("pipe EPOLLHUP on EOF",
+                            "r={} ev={:#x} (expected fd ready with EPOLLHUP set)", r, evb);
+                        ok = false;
+                    }
+                    let _ = crate::vfs::close(pid, rfd);
+                }
+                let _ = dispatch(3, epfd5 as u64, 0, 0, 0, 0, 0);
+            }
+        }
+
+        // ─── 7f. epoll watch on AF_UNIX socket whose peer write-shuts-down ─
+        //
+        // Per `epoll(7)`, a read-direction hang-up reports EPOLLRDHUP (when
+        // subscribed) together with the always-on EPOLLHUP.  We watch fd `a`
+        // and call shutdown(b, SHUT_WR) on its peer, which surfaces on `a`
+        // as read-side EOF.  libevent's EV_CLOSED path needs EPOLLRDHUP.
+        {
+            const EPOLLHUP:   u32 = 0x0010;
+            const EPOLLRDHUP: u32 = 0x2000;
+            const SHUT_WR: u64 = 1;
+            let epfd6 = dispatch(291, 0, 0, 0, 0, 0, 0);
+            if epfd6 >= 0 {
+                let mut sp: [u32; 2] = [u32::MAX; 2]; // socketpair(2): int sv[2]
+                // socketpair(AF_UNIX=1, SOCK_STREAM=1, 0, sp)
+                if dispatch(53, 1, 1, 0, sp.as_mut_ptr() as u64, 0, 0) == 0 {
+                    let a = sp[0] as usize;
+                    let b = sp[1] as usize;
+                    // Subscribe to EPOLLIN | EPOLLRDHUP on `a`.
+                    let ev = make_ev(EPOLLIN | EPOLLRDHUP, a as u64);
+                    let _ = dispatch(233, epfd6 as u64, CTL_ADD, a as u64,
+                                     ev.as_ptr() as u64, 0, 0);
+                    // Peer shuts down its write direction → `a` read side EOF.
+                    let _ = dispatch(48, b as u64, SHUT_WR, 0, 0, 0, 0);
+
+                    let mut buf = [[0u8; 12]; 4];
+                    let r = dispatch(232, epfd6 as u64, buf[0].as_mut_ptr() as u64,
+                                     4, 0, 0, 0); // non-blocking
+                    let evb = if r >= 1 { ev_events(&buf[0]) } else { 0 };
+                    // Both RDHUP (subscribed) and HUP (always-on) must appear.
+                    if r >= 1 && (evb & EPOLLRDHUP) != 0 && (evb & EPOLLHUP) != 0 {
+                        test_println!(
+                            "  AF_UNIX peer SHUT_WR: EPOLLRDHUP|EPOLLHUP delivered ok (ev={:#x})",
+                            evb);
+                    } else {
+                        test_fail!("unix EPOLLRDHUP on peer SHUT_WR",
+                            "r={} ev={:#x} (expected EPOLLRDHUP and EPOLLHUP set)", r, evb);
+                        ok = false;
+                    }
+                    let _ = crate::vfs::close(pid, a);
+                    let _ = crate::vfs::close(pid, b);
+                }
+                let _ = dispatch(3, epfd6 as u64, 0, 0, 0, 0, 0);
+            }
+        }
+
+        // ─── 7g. poll(2) on an AF_UNIX fd after peer-close → POLLHUP ───────
+        //
+        // Per POSIX `poll(2)`, POLLHUP is reported in revents regardless of
+        // whether the caller requested it.  NSPR PR_Poll (gecko) lowers to
+        // poll(2); a peer write-shutdown that Linux surfaces as POLLHUP must
+        // not be invisible.  Watch fd `a` for POLLIN, shut down peer `b`'s
+        // write side, then poll — POLLHUP (0x10) must be set in revents.
+        {
+            const POLLIN:  u16 = 0x0001;
+            const POLLHUP: u16 = 0x0010;
+            const SHUT_WR: u64 = 1;
+            let mut sp: [u32; 2] = [u32::MAX; 2];
+            if dispatch(53, 1, 1, 0, sp.as_mut_ptr() as u64, 0, 0) == 0 {
+                let a = sp[0] as usize;
+                let b = sp[1] as usize;
+                // Peer shuts down write direction → `a` read side EOF.
+                let _ = dispatch(48, b as u64, SHUT_WR, 0, 0, 0, 0);
+
+                // struct pollfd { i32 fd; u16 events; u16 revents } = 8 bytes.
+                let mut pfd = [0u8; 8];
+                pfd[0..4].copy_from_slice(&(a as i32).to_le_bytes());
+                pfd[4..6].copy_from_slice(&POLLIN.to_le_bytes());
+                // syscall 7: poll(fds, nfds=1, timeout_ms=0)
+                let r = dispatch(7, pfd.as_ptr() as u64, 1, 0, 0, 0, 0);
+                let revents = u16::from_le_bytes([pfd[6], pfd[7]]);
+                if r >= 1 && (revents & POLLHUP) != 0 {
+                    test_println!(
+                        "  poll(AF_UNIX) after peer SHUT_WR: POLLHUP set ok (revents={:#x})",
+                        revents);
+                } else {
+                    test_fail!("poll POLLHUP on unix peer-close",
+                        "r={} revents={:#x} (expected POLLHUP set)", r, revents);
+                    ok = false;
+                }
+                let _ = crate::vfs::close(pid, a);
+                let _ = crate::vfs::close(pid, b);
+            }
+        }
+
         // ─── 8. close(epfd) cleans up ────────────────────────────────────────
         {
             let r = dispatch(3, epfd as u64, 0, 0, 0, 0, 0);
