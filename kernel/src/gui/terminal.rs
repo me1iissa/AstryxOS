@@ -838,6 +838,38 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         crate::sched::enable();
     }
 
+    // Variant-aware library search scope.  The disk image is intentionally
+    // mixed-ABI: a glibc tree under /lib/x86_64-linux-gnu + /lib64, and a
+    // musl (Alpine) tree under /usr/lib — and each tree ships its OWN
+    // libstdc++.so.6 / libgcc_s.so.1.  A dynamic linker resolves a soname by
+    // scanning LD_LIBRARY_PATH left-to-right (ELF gABI §5.4; ld.so(8) /
+    // ld-musl(8)), binding the FIRST match.  So the path order must keep each
+    // libc's C++ runtime within that libc's tree:
+    //   * musl  binaries (PT_INTERP /lib/ld-musl-*) must reach /usr/lib BEFORE
+    //     the glibc multiarch dir — otherwise ld-musl binds the glibc-built
+    //     libstdc++ whose glibc-versioned imports (__cxa_thread_atexit_impl,
+    //     __libc_single_threaded, _dl_find_object, the fortify *_chk family,
+    //     ...) musl libc does not export → "Error relocating … symbol not
+    //     found" → exit(127).  We omit the glibc multiarch dir entirely so
+    //     nothing in the musl process resolves against the glibc tree.
+    //   * glibc binaries (PT_INTERP /lib64/ld-linux-*) keep the original
+    //     glibc-first order so their libs in /lib/x86_64-linux-gnu + /lib64
+    //     still resolve.
+    // The PT_INTERP of the binary we are about to exec is the authoritative,
+    // build-staging-independent signal for which libc it was linked against,
+    // and `data` already holds the full ELF image here.
+    const LD_PATH_MUSL: &str =
+        "LD_LIBRARY_PATH=/usr/lib:/usr/lib/firefox-esr:/opt/firefox:/disk/lib/firefox";
+    const LD_PATH_GLIBC: &str =
+        "LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/usr/lib:/usr/lib/firefox-esr:/opt/firefox:/disk/lib/firefox";
+    let ld_library_path: &str = match crate::proc::elf::libc_flavor(&data) {
+        crate::proc::elf::LibcFlavor::Musl => LD_PATH_MUSL,
+        // Glibc and Unknown (static / unrecognised) both keep the historical
+        // glibc-first order — it is the long-standing default and a static
+        // binary does not consult LD_LIBRARY_PATH anyway.
+        _ => LD_PATH_GLIBC,
+    };
+
     let envp: &[&str] = &[
         "HOME=/home/user",
         "PATH=/bin:/disk/bin",
@@ -876,19 +908,17 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         "MOZ_X11_EGL=0",
         "MOZ_ACCELERATED=0",
         "LIBGL_ALWAYS_SOFTWARE=1",
-        // The path list covers both Firefox variants:
-        //   glibc: /lib/x86_64-linux-gnu (multiarch glibc tree), /opt/firefox
-        //          for libxul.so + Mozilla's own .so files (in-tree convention)
-        //   musl : /usr/lib (Alpine's flat support-lib tree) + /usr/lib/firefox-esr
-        //          (Alpine canonical Mozilla tree — DT_RUNPATH target baked
-        //          into every Mozilla DSO per readelf -d; see ELF gABI §5.4
-        //          "Shared Object Dependencies" and ld-musl(8) search order)
-        // /disk/lib/firefox is a legacy build-firefox.sh path retained for
-        // any caller using the in-tree built variant.
-        // LD_LIBRARY_PATH precedes DT_RUNPATH in the search order, so listing
-        // /usr/lib/firefox-esr here is a belt-and-braces guard for any
-        // dlopen("libfoo.so") call that lacks RUNPATH propagation.
-        "LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/usr/lib:/usr/lib/firefox-esr:/opt/firefox:/disk/lib/firefox",
+        // Variant-aware library search scope, selected above from the binary's
+        // PT_INTERP (LD_PATH_MUSL vs LD_PATH_GLIBC).  Common tail in both:
+        //   /usr/lib/firefox-esr — Alpine canonical Mozilla tree (DT_RUNPATH
+        //     target baked into every Mozilla DSO per readelf -d).
+        //   /opt/firefox         — Mozilla-official tarball tree.
+        //   /disk/lib/firefox    — legacy build-firefox.sh in-tree path.
+        // LD_LIBRARY_PATH precedes DT_RUNPATH in the search order (ELF gABI
+        // §5.4; ld.so(8) / ld-musl(8)), so listing /usr/lib/firefox-esr here is
+        // a belt-and-braces guard for any dlopen("libfoo.so") call lacking
+        // RUNPATH propagation.
+        ld_library_path,
         // libfontconfig-interposer.so — defensive FcPatternGetString *out
         // wrapper.  Real libfontconfig (PR #179) leaves *out untouched on
         // FcResultNoMatch per spec; Mozilla's gfxFcPlatformFontList caller
