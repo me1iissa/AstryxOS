@@ -10,6 +10,17 @@ No GPL-contaminated derivation: all descriptions sourced from `man 2` pages and 
 
 ## Recent conformance fixes
 
+- **2026-05-30** — **musl / Linux-ABI completeness audit** added at
+  `docs/MUSL_ABI_COMPLETENESS_AUDIT_2026-05-30.md`, scoped to the syscall
+  surface musl libc (Alpine/libxul) actually issues.  Verdict: the surface is
+  substantially code-complete for the musl workload.  One **HIGH** gap found —
+  `clock_nanosleep(2)` (230) discards `clockid` and `flags`, so
+  `TIMER_ABSTIME` absolute deadlines are mishandled as relative intervals
+  (`syscall.rs` dispatch `230 => sys_nanosleep_linux(arg3, arg4)`).  A new
+  `musl-abi` test tier in `test_runner.rs` pins futex WAIT/WAKE errno, the
+  clock surface, and `set_tid_address`; it carries a soft regression pin for
+  the `clock_nanosleep(TIMER_ABSTIME)` gap.  Per `clock_nanosleep(2)`,
+  `futex(2)`, `clock_gettime(2)`, `set_tid_address(2)`.
 - **2026-05-18** — `sysinfo(2)` rewritten to the 112-byte x86\_64 struct layout
   per `<sys/sysinfo.h>` (Linux 2.3.23+ format).  The legacy 64-byte write
   was clobbering `freeswap` with `1` and leaving `mem_unit` at zero; both
