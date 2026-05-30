@@ -9447,7 +9447,14 @@ fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
                 // AF_INET goes through the protocol's `socket_has_data`
                 // — same shape, distinct backend.
                 if flags & UNIX_SOCK_BIT != 0 {
-                    let mut ev = EPOLLOUT;
+                    // EPOLLOUT only when a `write()` would make progress — the
+                    // peer's recv ring has room, or the write side can no
+                    // longer block (SHUT_WR / peer-gone / not-connected, where
+                    // `write()` returns -EPIPE without blocking).  Advertising
+                    // writable unconditionally makes a producer blocked on a
+                    // full socket busy-spin epoll_wait→write→EAGAIN, the
+                    // stuck-producer pattern `epoll(7)` / `poll(2)` avoid.
+                    let mut ev = if crate::net::unix::writable(inode) { EPOLLOUT } else { 0 };
                     let has_d = crate::net::unix::has_data(inode);
                     if has_d {
                         ev |= EPOLLIN;

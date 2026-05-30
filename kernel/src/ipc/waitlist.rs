@@ -200,19 +200,28 @@ pub enum PollBellSource {
     /// would only re-evaluate on the 1 s resync floor, defeating the
     /// short timeouts DNS resolvers expect (RFC 1035 §4.2.1).
     InetRx       = 8,
+    /// `crate::net::unix::read_msg` recv-drain — a reader consuming bytes
+    /// frees room in the recv ring, which makes the *peer's* write side
+    /// newly `POLLOUT`-ready.  Rung so a peer parked in `poll`/`epoll_wait`
+    /// waiting for the socket to become writable re-checks immediately,
+    /// rather than only on the resync floor (`man 7 unix`, the recv-side
+    /// write-space wake).  Distinct from `UnixWrite` (data-arrival, which
+    /// makes the reader `POLLIN`-ready) so kdb attribution stays honest.
+    UnixRead     = 9,
     /// Catch-all for ad-hoc readiness sources that have not yet been
     /// given their own variant (kept last for ABI tail-stability).
-    Other        = 9,
+    Other        = 10,
 }
 
 /// Number of `PollBellSource` variants — keep in sync with the enum.
-pub const N_BELL_SOURCES: usize = 10;
+pub const N_BELL_SOURCES: usize = 11;
 
 /// Stable string label for each `PollBellSource`, used by kdb to
 /// render the per-source counters.  Indexed by the enum's discriminant.
 pub const BELL_SOURCE_NAMES: [&str; N_BELL_SOURCES] = [
     "pipe", "eventfd", "unix_write", "unix_shutdown",
-    "timerfd", "signalfd", "inotify", "signal_inject", "inet_rx", "other",
+    "timerfd", "signalfd", "inotify", "signal_inject", "inet_rx",
+    "unix_read", "other",
 ];
 
 /// Per-source ring counters.  Bumped (Relaxed) at every successful
@@ -223,7 +232,7 @@ pub static BELL_RINGS_BY_SOURCE: [AtomicU64; N_BELL_SOURCES] = [
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0),
 ];
 
 /// Cumulative number of `wait_poll_event` calls that woke via a bell

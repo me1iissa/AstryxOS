@@ -500,6 +500,14 @@ pub fn read_msg(id: u64, buf: &mut [u8]) -> Result<(usize, usize), i64> {
     // still queued in our recv_buf.  Matches Linux AF_UNIX behaviour.
     if s.shut_rd { return Ok((0, 0)); }
 
+    // Number of bytes the drain frees from *our* recv ring.  Draining recv
+    // space makes the *peer's* write side newly POLLOUT-ready, so once we
+    // have dropped the TABLE lock we ring the write-side poll bell for any
+    // peer parked in poll/epoll_wait waiting to become writable (`man 7
+    // unix` recv-side write-space wake).  0 ⇒ nothing drained ⇒ no edge.
+    let drained: usize;
+    let result: Result<(usize, usize), i64>;
+
     if s.kind == SockKind::SeqPacket {
         // SEQPACKET: dequeue exactly one message, truncating any tail that
         // does not fit per `man 7 unix` §SOCK_SEQPACKET.
@@ -515,12 +523,26 @@ pub fn read_msg(id: u64, buf: &mut [u8]) -> Result<(usize, usize), i64> {
         for _ in 0..discard {
             s.recv_head = (s.recv_head + 1) % RECV_BUF_CAP;
         }
-        return Ok((copied, discard));
+        // The whole message (copied + discarded tail) leaves the recv ring.
+        drained = copied + discard;
+        result  = Ok((copied, discard));
+    } else {
+        // STREAM: byte-stream — copy as many bytes as fit, no boundaries.
+        if s.recv_available() == 0 { return Err(-11); }
+        let copied = s.pop(buf);
+        drained = copied;
+        result  = Ok((copied, 0));
     }
 
-    // STREAM: byte-stream — copy as many bytes as fit, no boundaries.
-    if s.recv_available() == 0 { return Err(-11); }
-    Ok((s.pop(buf), 0))
+    // Drop the TABLE lock before ringing so a peer waking on the bell does
+    // not contend on TABLE during its re-evaluation pass (same discipline
+    // as `write()` / `shutdown()`).
+    drop(t);
+    if drained > 0 {
+        crate::ipc::waitlist::ring_poll_bell_for(
+            crate::ipc::waitlist::PollBellSource::UnixRead);
+    }
+    result
 }
 
 /// Half-close per IEEE 1003.1 §shutdown.  `shut_rd_flag` / `shut_wr_flag`
@@ -688,6 +710,44 @@ pub fn fully_hung_up(id: u64) -> bool {
     if peer == u64::MAX { return false; }
     if (peer as usize) >= MAX_UNIX_SOCKETS { return false; }
     t.0[peer as usize].state == UnixState::Free
+}
+
+/// Returns true if a `write(2)` on socket `id` would make progress right now —
+/// the AF_UNIX equivalent of the `POLLOUT` / `EPOLLOUT` writable predicate.
+///
+/// For our in-memory backend a STREAM `write()` pushes bytes directly into the
+/// *peer's* `recv_buf`; the call returns `-EAGAIN` exactly when that ring has no
+/// free space (`recv_space() == 0`).  A faithful `poll(2)` / `epoll_wait(2)`
+/// must therefore gate `POLLOUT` / `EPOLLOUT` on the peer having recv-buffer
+/// room, rather than advertising the socket writable unconditionally — an
+/// always-writable report makes a producer blocked on a full socket busy-spin
+/// `poll → write → EAGAIN`, the stuck-producer pattern `poll(2)` exists to
+/// avoid (`man 7 unix`, `man 2 poll`).
+///
+/// Per the long-standing AF_UNIX rule — writable is also reported once the
+/// write side can no longer block, so a blocked writer is released to observe
+/// the terminal `-EPIPE` instead of hanging forever:
+///   * not in `Connected` state (unbound / listening / disconnected) — a
+///     `write()` returns immediately (`-ENOTCONN` / `-EPIPE`), never blocks;
+///   * locally `shut_wr` — `write()` returns `-EPIPE` immediately;
+///   * peer slot gone — `write()` returns `-EPIPE` immediately.
+/// In all of those cases the call completes without blocking, so `POLLOUT`
+/// is the correct, stuck-socket-avoiding answer.
+pub fn writable(id: u64) -> bool {
+    if id as usize >= MAX_UNIX_SOCKETS { return false; }
+    let t = TABLE.lock();
+    let s = &t.0[id as usize];
+    if s.state == UnixState::Free { return true; }     // closed: write → EPIPE, no block
+    if s.state != UnixState::Connected { return true; } // not connected: never blocks
+    if s.shut_wr { return true; }                       // SHUT_WR: write → EPIPE, no block
+    let peer = s.peer_id;
+    if peer == u64::MAX || (peer as usize) >= MAX_UNIX_SOCKETS { return true; }
+    let peer = &t.0[peer as usize];
+    if peer.state == UnixState::Free { return true; }   // peer gone: write → EPIPE, no block
+    // Genuinely connected, write side open, peer alive: writable iff the peer's
+    // recv ring has room for at least one byte — the exact condition under
+    // which our STREAM/SEQPACKET `write()` returns >0 rather than -EAGAIN.
+    peer.recv_space() > 0
 }
 
 pub fn bytes_available(id: u64) -> usize {
