@@ -14202,16 +14202,26 @@ fn test_epoll_and_proc_fd() -> bool {
             }
         }
 
-        // ─── 7f. epoll watch on AF_UNIX socket whose peer write-shuts-down ─
+        // ─── 7f. epoll AF_UNIX: peer SHUT_WR (read half-close) vs full close ─
         //
-        // Per `epoll(7)`, a read-direction hang-up reports EPOLLRDHUP (when
-        // subscribed) together with the always-on EPOLLHUP.  We watch fd `a`
-        // and call shutdown(b, SHUT_WR) on its peer, which surfaces on `a`
-        // as read-side EOF.  libevent's EV_CLOSED path needs EPOLLRDHUP.
+        // Per `epoll(7)`, EPOLLRDHUP means "stream socket peer closed
+        // connection, or shut down writing half" — read EOF with the write
+        // direction still valid — whereas EPOLLHUP means "hang up ...
+        // connection fully dead".  The two are distinct and must NOT be
+        // conflated: a read-side half-close that still permits writes must
+        // report EPOLLRDHUP (when subscribed) and keep EPOLLOUT, but must
+        // NOT report EPOLLHUP — otherwise an event loop tears down a
+        // still-writable connection.
+        //
+        //   7f.1: peer shutdown(SHUT_WR) only → EPOLLRDHUP set, EPOLLOUT
+        //         set, EPOLLHUP NOT set.
+        //   7f.2: peer fully closed (both directions) → EPOLLHUP set.
         {
             const EPOLLHUP:   u32 = 0x0010;
             const EPOLLRDHUP: u32 = 0x2000;
             const SHUT_WR: u64 = 1;
+
+            // 7f.1 — read-side half-close (peer SHUT_WR), connection writable.
             let epfd6 = dispatch(291, 0, 0, 0, 0, 0, 0);
             if epfd6 >= 0 {
                 let mut sp: [u32; 2] = [u32::MAX; 2]; // socketpair(2): int sv[2]
@@ -14219,70 +14229,149 @@ fn test_epoll_and_proc_fd() -> bool {
                 if dispatch(53, 1, 1, 0, sp.as_mut_ptr() as u64, 0, 0) == 0 {
                     let a = sp[0] as usize;
                     let b = sp[1] as usize;
-                    // Subscribe to EPOLLIN | EPOLLRDHUP on `a`.
-                    let ev = make_ev(EPOLLIN | EPOLLRDHUP, a as u64);
+                    // Subscribe to EPOLLIN | EPOLLRDHUP | EPOLLOUT on `a`.
+                    let ev = make_ev(EPOLLIN | EPOLLRDHUP | EPOLLOUT, a as u64);
                     let _ = dispatch(233, epfd6 as u64, CTL_ADD, a as u64,
                                      ev.as_ptr() as u64, 0, 0);
-                    // Peer shuts down its write direction → `a` read side EOF.
+                    // Peer shuts down its write direction → `a` read side EOF
+                    // but `a` is still Connected and still writable.
                     let _ = dispatch(48, b as u64, SHUT_WR, 0, 0, 0, 0);
 
                     let mut buf = [[0u8; 12]; 4];
                     let r = dispatch(232, epfd6 as u64, buf[0].as_mut_ptr() as u64,
                                      4, 0, 0, 0); // non-blocking
                     let evb = if r >= 1 { ev_events(&buf[0]) } else { 0 };
-                    // Both RDHUP (subscribed) and HUP (always-on) must appear.
-                    if r >= 1 && (evb & EPOLLRDHUP) != 0 && (evb & EPOLLHUP) != 0 {
+                    // RDHUP (subscribed) and OUT (still writable) must be set;
+                    // HUP must NOT be set — the connection is not fully dead.
+                    if r >= 1 && (evb & EPOLLRDHUP) != 0
+                        && (evb & EPOLLOUT) != 0 && (evb & EPOLLHUP) == 0 {
                         test_println!(
-                            "  AF_UNIX peer SHUT_WR: EPOLLRDHUP|EPOLLHUP delivered ok (ev={:#x})",
+                            "  AF_UNIX peer SHUT_WR (half-close): EPOLLRDHUP|EPOLLOUT set, EPOLLHUP NOT set ok (ev={:#x})",
                             evb);
                     } else {
-                        test_fail!("unix EPOLLRDHUP on peer SHUT_WR",
-                            "r={} ev={:#x} (expected EPOLLRDHUP and EPOLLHUP set)", r, evb);
+                        test_fail!("unix half-close EPOLLRDHUP-not-HUP",
+                            "r={} ev={:#x} (expected EPOLLRDHUP|EPOLLOUT set, EPOLLHUP clear)", r, evb);
                         ok = false;
                     }
-                    let _ = crate::vfs::close(pid, a);
-                    let _ = crate::vfs::close(pid, b);
+                    // close(2) (nr 3) so the AF_UNIX backend slots are freed.
+                    let _ = dispatch(3, a as u64, 0, 0, 0, 0, 0);
+                    let _ = dispatch(3, b as u64, 0, 0, 0, 0, 0);
                 }
                 let _ = dispatch(3, epfd6 as u64, 0, 0, 0, 0, 0);
             }
+
+            // 7f.2 — full close: close the peer fd entirely → EPOLLHUP.
+            let epfd7 = dispatch(291, 0, 0, 0, 0, 0, 0);
+            if epfd7 >= 0 {
+                let mut sp: [u32; 2] = [u32::MAX; 2];
+                if dispatch(53, 1, 1, 0, sp.as_mut_ptr() as u64, 0, 0) == 0 {
+                    let a = sp[0] as usize;
+                    let b = sp[1] as usize;
+                    let ev = make_ev(EPOLLIN | EPOLLRDHUP, a as u64);
+                    let _ = dispatch(233, epfd7 as u64, CTL_ADD, a as u64,
+                                     ev.as_ptr() as u64, 0, 0);
+                    // Peer fully closes → `a` sees a full hang-up.  Use the
+                    // close(2) syscall (nr 3), not the raw fd-table close, so
+                    // the AF_UNIX backend teardown runs and flips `a`'s
+                    // shutdown/peer state (mirrors a real userspace close).
+                    let _ = dispatch(3, b as u64, 0, 0, 0, 0, 0);
+
+                    let mut buf = [[0u8; 12]; 4];
+                    let r = dispatch(232, epfd7 as u64, buf[0].as_mut_ptr() as u64,
+                                     4, 0, 0, 0);
+                    let evb = if r >= 1 { ev_events(&buf[0]) } else { 0 };
+                    // EPOLLHUP is always reported on a full hang-up,
+                    // independent of the interest mask.
+                    if r >= 1 && (evb & EPOLLHUP) != 0 {
+                        test_println!(
+                            "  AF_UNIX peer full close: EPOLLHUP delivered ok (ev={:#x})",
+                            evb);
+                    } else {
+                        test_fail!("unix full-close EPOLLHUP",
+                            "r={} ev={:#x} (expected EPOLLHUP set)", r, evb);
+                        ok = false;
+                    }
+                    let _ = dispatch(3, a as u64, 0, 0, 0, 0, 0); // b already closed above
+                }
+                let _ = dispatch(3, epfd7 as u64, 0, 0, 0, 0, 0);
+            }
         }
 
-        // ─── 7g. poll(2) on an AF_UNIX fd after peer-close → POLLHUP ───────
+        // ─── 7g. poll(2) AF_UNIX: peer SHUT_WR (half-close) vs full close ──
         //
-        // Per POSIX `poll(2)`, POLLHUP is reported in revents regardless of
-        // whether the caller requested it.  NSPR PR_Poll (gecko) lowers to
-        // poll(2); a peer write-shutdown that Linux surfaces as POLLHUP must
-        // not be invisible.  Watch fd `a` for POLLIN, shut down peer `b`'s
-        // write side, then poll — POLLHUP (0x10) must be set in revents.
+        // Per POSIX `poll(2)`, POLLHUP means "device has been disconnected"
+        // (a full hang-up) and is mutually distinct from a read-side EOF.
+        // A read-side half-close must surface as POLLIN-readiness (read()
+        // returns 0) and POLLRDHUP when requested — but NOT POLLHUP, since
+        // the write direction is still valid.  NSPR PR_Poll (gecko) lowers
+        // to poll(2) and keys its readiness on POLLIN; over-reporting
+        // POLLHUP on a still-writable connection makes the loop tear it
+        // down.  POLLHUP appears only on a full hang-up, where (per POSIX)
+        // it is reported regardless of the requested `events`.
+        //
+        //   7g.1: peer shutdown(SHUT_WR) only → POLLIN set, POLLHUP NOT set.
+        //   7g.2: peer fully closed → POLLHUP set.
         {
-            const POLLIN:  u16 = 0x0001;
-            const POLLHUP: u16 = 0x0010;
+            const POLLIN:    u16 = 0x0001;
+            const POLLHUP:   u16 = 0x0010;
+            const POLLRDHUP: u16 = 0x2000;
             const SHUT_WR: u64 = 1;
+
+            // 7g.1 — read-side half-close (peer SHUT_WR), still writable.
             let mut sp: [u32; 2] = [u32::MAX; 2];
             if dispatch(53, 1, 1, 0, sp.as_mut_ptr() as u64, 0, 0) == 0 {
                 let a = sp[0] as usize;
                 let b = sp[1] as usize;
-                // Peer shuts down write direction → `a` read side EOF.
+                // Peer shuts down write direction → `a` read side EOF, but
+                // `a` stays Connected and writable.
                 let _ = dispatch(48, b as u64, SHUT_WR, 0, 0, 0, 0);
 
                 // struct pollfd { i32 fd; u16 events; u16 revents } = 8 bytes.
                 let mut pfd = [0u8; 8];
                 pfd[0..4].copy_from_slice(&(a as i32).to_le_bytes());
-                pfd[4..6].copy_from_slice(&POLLIN.to_le_bytes());
+                pfd[4..6].copy_from_slice(&(POLLIN | POLLRDHUP).to_le_bytes());
                 // syscall 7: poll(fds, nfds=1, timeout_ms=0)
                 let r = dispatch(7, pfd.as_ptr() as u64, 1, 0, 0, 0, 0);
                 let revents = u16::from_le_bytes([pfd[6], pfd[7]]);
-                if r >= 1 && (revents & POLLHUP) != 0 {
+                // POLLIN (read-ready, EOF) must be set; POLLHUP must NOT be.
+                if r >= 1 && (revents & POLLIN) != 0 && (revents & POLLHUP) == 0 {
                     test_println!(
-                        "  poll(AF_UNIX) after peer SHUT_WR: POLLHUP set ok (revents={:#x})",
+                        "  poll(AF_UNIX) peer SHUT_WR (half-close): POLLIN set, POLLHUP NOT set ok (revents={:#x})",
                         revents);
                 } else {
-                    test_fail!("poll POLLHUP on unix peer-close",
+                    test_fail!("poll half-close POLLIN-not-HUP",
+                        "r={} revents={:#x} (expected POLLIN set, POLLHUP clear)", r, revents);
+                    ok = false;
+                }
+                let _ = dispatch(3, a as u64, 0, 0, 0, 0, 0);
+                let _ = dispatch(3, b as u64, 0, 0, 0, 0, 0);
+            }
+
+            // 7g.2 — full close: close peer `b` entirely → POLLHUP.
+            let mut sp2: [u32; 2] = [u32::MAX; 2];
+            if dispatch(53, 1, 1, 0, sp2.as_mut_ptr() as u64, 0, 0) == 0 {
+                let a = sp2[0] as usize;
+                let b = sp2[1] as usize;
+                // Peer fully closes → `a` sees a full hang-up.  Use close(2)
+                // (nr 3) so the AF_UNIX backend teardown runs.
+                let _ = dispatch(3, b as u64, 0, 0, 0, 0, 0);
+
+                let mut pfd = [0u8; 8];
+                pfd[0..4].copy_from_slice(&(a as i32).to_le_bytes());
+                pfd[4..6].copy_from_slice(&POLLIN.to_le_bytes());
+                let r = dispatch(7, pfd.as_ptr() as u64, 1, 0, 0, 0, 0);
+                let revents = u16::from_le_bytes([pfd[6], pfd[7]]);
+                // POLLHUP reported on a full hang-up, independent of `events`.
+                if r >= 1 && (revents & POLLHUP) != 0 {
+                    test_println!(
+                        "  poll(AF_UNIX) peer full close: POLLHUP set ok (revents={:#x})",
+                        revents);
+                } else {
+                    test_fail!("poll full-close POLLHUP",
                         "r={} revents={:#x} (expected POLLHUP set)", r, revents);
                     ok = false;
                 }
-                let _ = crate::vfs::close(pid, a);
-                let _ = crate::vfs::close(pid, b);
+                let _ = dispatch(3, a as u64, 0, 0, 0, 0, 0); // b already closed above
             }
         }
 
@@ -34929,7 +35018,9 @@ fn test_mm_sem_registry_w216() -> bool {
 //      ref_count drops to 1.  The slot must NOT be freed yet.
 //   4. Assert state(id_b) == Connected.  Without PR #233 the slot is
 //      already Free here, and the write below would return -EPIPE.
-//   5. Assert peer_closed(id_a) == false (peer not yet notified of close).
+//   5. Assert fully_hung_up(id_a) == false (peer not yet hung up — the
+//      child's partial close only decremented the refcount, id_b is still
+//      Connected, so id_a sees no full hang-up).
 //   6. Write "ping" through id_a (delivered into id_b's recv buffer).
 //   7. Read from id_b, assert payload == "ping".
 //   8. Final close(id_b) + close(id_a) — tears both slots down.
@@ -34966,13 +35057,14 @@ fn test_socketpair_survives_child_close_w216() -> bool {
     }
     test_println!("  state(id_b) == Connected ✓");
 
-    // Step 5: id_a must not observe a peer-close notification yet.
-    if unix::peer_closed(id_a) {
+    // Step 5: id_a must not observe a full hang-up yet — the child's
+    // partial close only dropped the refcount, id_b is still Connected.
+    if unix::fully_hung_up(id_a) {
         test_fail!("socketpair_survives_child_close_w216",
-            "peer_closed(id_a) = true after child close (want false)");
+            "fully_hung_up(id_a) = true after child close (want false)");
         return false;
     }
-    test_println!("  peer_closed(id_a) == false ✓");
+    test_println!("  fully_hung_up(id_a) == false ✓");
 
     // Step 6: write "ping" through id_a — delivers into id_b's recv buffer.
     let msg = b"ping";

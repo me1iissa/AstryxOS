@@ -3751,9 +3751,10 @@ pub(crate) fn get_inotify_id(pid: u64, fd_num: usize) -> u64 {
 /// `POLLHUP`; if data is still buffered it must coexist with `POLLIN`
 /// so userspace can drain the remainder before observing EOF.
 pub(crate) fn poll_revents(pid: u64, fd: usize, events: u16) -> u16 {
-    const POLLIN:  u16 = 0x0001;
-    const POLLOUT: u16 = 0x0004;
-    const POLLHUP: u16 = 0x0010;
+    const POLLIN:    u16 = 0x0001;
+    const POLLOUT:   u16 = 0x0004;
+    const POLLHUP:   u16 = 0x0010;
+    const POLLRDHUP: u16 = 0x2000;
     // Treat fd 0/1/2 as the console stdin/stdout/stderr ONLY when they are
     // genuinely a console fd or are not open at all.  A process may
     // `close()` a standard descriptor and `socketpair()` / `pipe()` / `dup()`
@@ -3762,7 +3763,8 @@ pub(crate) fn poll_revents(pid: u64, fd: usize, events: u16) -> u16 {
     // *number* alone would shadow that real fd and report it as a plain
     // console stream, dropping POLLHUP/POLLIN/POLLRDHUP — the very edge
     // `poll(2)` must surface.  This mirrors the `is_console || (!fd_present
-    // && fd_num <= 2)` test used by the TTY/ioctl path.
+    // && fd_num <= 2)` test used by the TTY/ioctl path, and the `is_console`
+    // dispatch in `epoll_poll_events`.
     if fd <= 2 && fd_is_console_or_absent(pid, fd) {
         return if fd == 0 { events & POLLIN } else { events & POLLOUT };
     }
@@ -3781,14 +3783,27 @@ pub(crate) fn poll_revents(pid: u64, fd: usize, events: u16) -> u16 {
         let mut rev = 0u16;
         if readable { rev |= events & POLLIN; }
         rev |= events & POLLOUT; // connected sockets always writable
-        if crate::net::unix::peer_closed(uid) {
-            // The peer shut down its write direction (or closed), so our
-            // read side is at EOF.  Per POSIX `poll(2)`, `POLLHUP` is
-            // reported unconditionally (independent of the requested
-            // `events`), and the read end becomes readable — `read()`
-            // returns 0 — so `POLLIN` is also raised even with an empty
-            // buffer, mirroring the pipe read-end branch below and the
-            // unconditional-hang-up contract.
+        // `poll(2)` distinguishes a read-side half-close from a full
+        // hang-up, so we report them separately (matching the `epoll(7)`
+        // EPOLLRDHUP / EPOLLHUP split):
+        if crate::net::unix::read_shutdown(uid) {
+            // Read-side half-close (peer `shutdown(SHUT_WR)`, or we did
+            // `shutdown(SHUT_RD)`; the connection is still up and still
+            // writable).  The read end becomes readable — `read()` returns
+            // 0 (EOF) — so `POLLIN` is raised even with an empty buffer, and
+            // `POLLRDHUP` ("read EOF, write still valid") is reported when
+            // the caller asked for it.  POLLOUT (above) stays set.  No
+            // POLLHUP: the connection is not fully dead.  POLLIN is the bit
+            // NSPR's wait loop keys on.
+            rev |= events & POLLIN;
+            rev |= events & POLLRDHUP;
+        }
+        if crate::net::unix::fully_hung_up(uid) {
+            // Full hang-up (SHUT_RDWR both directions, or either endpoint
+            // fully closed).  Per POSIX `poll(2)`, `POLLHUP` is reported
+            // unconditionally (independent of the requested `events`), and
+            // coexists with `POLLIN` while a draining reader observes EOF —
+            // mirroring the pipe read-end branch below.
             rev |= POLLHUP;
             rev |= events & POLLIN;
         }
