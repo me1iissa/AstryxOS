@@ -194,6 +194,27 @@ pub(crate) unsafe fn user_read_u32(addr: u64) -> Option<u32> {
     Some(core::ptr::read_volatile(addr as *const u32))
 }
 
+/// Write a u32 to a validated user address in the CURRENT address space.
+/// Returns `true` on success, `false` on a bad / non-canonical / kernel-half
+/// or misaligned address (caller should surface EFAULT).
+///
+/// Symmetric with [`user_read_u32`]: a direct volatile store under an SMAP
+/// bracket, used where the target word lives in the *caller's own* address
+/// space (same CR3) — e.g. `FUTEX_WAKE_OP`'s modify of `*uaddr2`.  This is
+/// distinct from [`write_u32_to_user`], which walks an arbitrary CR3 and
+/// resolves through the owning `VmSpace` for the cross-address-space
+/// CLONE_CHILD_CLEARTID exit path; that machinery is unnecessary (and, for a
+/// page that is present+writable but not VMA-tracked, can refuse the write)
+/// when the writer is the page's own process.
+#[inline]
+pub(crate) unsafe fn user_write_u32(addr: u64, val: u32) -> bool {
+    if !validate_user_ptr(addr, 4) { return false; }
+    if addr % 4 != 0 { return false; } // alignment check
+    let _g = crate::arch::x86_64::smap::UserGuard::new();
+    core::ptr::write_volatile(addr as *mut u32, val);
+    true
+}
+
 /// Read a u64 from a validated user address. Returns None on bad address.
 ///
 /// SMAP-bracketed — see [`user_read_u32`].
@@ -277,6 +298,34 @@ pub(crate) unsafe fn user_read_timespec(addr: u64) -> Option<(u64, u64)> {
 //
 // Refs: `futex(2)` Linux man-pages; POSIX.1-2017 §pthread_mutexattr_getpshared.
 pub(crate) static FUTEX_WAITERS: Mutex<BTreeMap<(u64, u64), Vec<u64>>> = Mutex::new(BTreeMap::new());
+
+/// Destination key for waiters that a `FUTEX_REQUEUE` / `FUTEX_CMP_REQUEUE`
+/// moved off their original WAIT queue.
+///
+/// A thread parked in the `FUTEX_WAIT` branch records its *original* `uaddr`
+/// in its on-stack frame and, after `schedule()` returns, removes itself from
+/// the `(pid, uaddr)` bucket.  But a `FUTEX_REQUEUE` may have meanwhile moved
+/// that TID into the `(pid, uaddr2)` bucket — per `futex(2)`, requeue updates
+/// the waiter's queue key to `uaddr2` (the kernel-internal "`q->key = key2`"
+/// invariant).  Without tracking that move, a timeout-after-requeue would scan
+/// the wrong bucket and (a) leave a stale waiter orphaned in `(pid, uaddr2)`
+/// for a later wake to spuriously pop, and (b) misclassify the timeout as a
+/// successful wake (returning 0 instead of ETIMEDOUT).
+///
+/// This map records `(pid, tid) → dest_uaddr` for exactly the window between a
+/// requeue moving the TID and that TID's WAIT branch running its post-wake
+/// cleanup.  The cleanup consults it to scan the bucket the waiter actually
+/// sits in, then removes the entry.  Keyed by `(pid, tid)`: a TID is unique
+/// within a process and at most one requeue destination is live per parked
+/// waiter.  Lock order: acquired only while NOT holding `FUTEX_WAITERS` for
+/// the requeue insert (insert happens after the `FUTEX_WAITERS` critical
+/// section in the REQUEUE branch) and acquired *inside* the `FUTEX_WAITERS`
+/// critical section in the WAIT cleanup — to keep a single, consistent order
+/// (`FUTEX_WAITERS` → `FUTEX_REQUEUE_DEST`), the requeue insert takes
+/// `FUTEX_REQUEUE_DEST` while still holding `FUTEX_WAITERS`.
+///
+/// Ref: `futex(2)` Linux man-pages (FUTEX_REQUEUE / FUTEX_CMP_REQUEUE).
+pub(crate) static FUTEX_REQUEUE_DEST: Mutex<BTreeMap<(u64, u64), u64>> = Mutex::new(BTreeMap::new());
 
 /// Outcome of `futex_wait_check_and_enqueue`.
 #[derive(Debug)]
@@ -1864,6 +1913,18 @@ pub fn futex_drain_pid(pid: u64) {
         .collect();
     for key in dead_keys {
         waiters.remove(&key);
+    }
+    // Drain any lingering requeue-destination records for this pid so a
+    // PID-reuse cannot inherit a stale `(pid, tid) → uaddr2` mapping.  Same
+    // FUTEX_WAITERS → FUTEX_REQUEUE_DEST lock order as the requeue/WAIT paths.
+    let mut dest = FUTEX_REQUEUE_DEST.lock();
+    let dead_dest: alloc::vec::Vec<(u64, u64)> = dest
+        .keys()
+        .filter(|&&(p, _)| p == pid)
+        .copied()
+        .collect();
+    for key in dead_dest {
+        dest.remove(&key);
     }
 }
 
