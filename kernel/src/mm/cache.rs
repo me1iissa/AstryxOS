@@ -735,23 +735,41 @@ pub fn prepopulate_file(path: &str) -> usize {
         // one virtio request per up-to-1 MiB-aligned segment of the burst.
         // (`fs` was snapshotted above; MOUNTS is not held during the read.)
         //
-        // Per POSIX read(2), a successful read may return fewer bytes than
-        // requested (short read).  We MUST honour the returned length —
-        // bytes beyond it in chunk_buf are stale heap content from prior
-        // iterations and must not be installed into the page cache.
+        // A DEVICE READ ERROR is NOT end-of-file.  The FS `read` contract is
+        // that an I/O failure during a covering read returns Err (per POSIX
+        // read(2): an I/O error returns -1, not a short count).  We MUST NOT
+        // zero-fill and install the unread tail on such a failure — that would
+        // poison the page cache with all-zero pages over real file contents
+        // (e.g. a shared library's tail code pages), corrupting it for every
+        // subsequent mapper.  The correct recovery is to leave the failed
+        // chunk's pages ABSENT: do not install anything, abandon the rest of
+        // the prepopulate for this file, and let the later demand-fault path
+        // re-read (and, on a persistent failure, deliver SIGBUS/SIGSEGV
+        // instead of executing zeroed code).  Genuine sparse holes still read
+        // as zero in-band (the FS returns Ok with the hole zero-filled), so a
+        // legitimate short read is an `Ok(n)` we honour below.
         let read_buf = &mut chunk_buf[..this_chunk];
         let bytes_read = match fs.read(inode, chunk_start, read_buf) {
             Ok(n) => n,
-            Err(_) => break,
+            Err(_) => {
+                crate::serial_println!(
+                    "[CACHE] prepopulate {}: device read error at off={:#x} \
+                     (inode={:#x}) — leaving pages absent for demand-fault retry",
+                    path, chunk_start, inode,
+                );
+                break;
+            }
         };
         if bytes_read == 0 {
-            // EOF or transient zero-return: skip this chunk and advance so
-            // the outer loop does not spin forever.
+            // EOF: skip this chunk and advance so the outer loop does not spin.
             offset = chunk_start + this_chunk as u64;
             continue;
         }
-        // Zero-fill the unread tail of chunk_buf so subsequent page-slicing
-        // below never copies stale heap bytes into the page cache.
+        // A genuine short read (`bytes_read < this_chunk`) now only happens at
+        // EOF or a trailing sparse hole — both of which read as zero by
+        // definition.  Zero-fill the unread tail of chunk_buf so page-slicing
+        // below never copies stale heap bytes into the page cache.  (A device
+        // error cannot reach here: it returned Err above.)
         if bytes_read < this_chunk {
             // SAFETY: read_buf covers [0..this_chunk]; bytes_read <= this_chunk.
             unsafe {

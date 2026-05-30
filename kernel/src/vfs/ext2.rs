@@ -544,6 +544,29 @@ impl Ext2Fs {
         })
     }
 
+    /// Test-only: resolve a file's logical block index to its on-disk
+    /// `(start_sector, sector_count)` range.
+    ///
+    /// Lets a fault-injection harness arm a device error on the exact sectors
+    /// that back a chosen block of a file (e.g. the tail block of a multi-block
+    /// library) without baking in any allocator-placement assumption. Returns
+    /// `None` if the inode does not exist or the logical block is a hole.
+    #[doc(hidden)]
+    pub fn resolve_block_sectors_for_test(
+        &self,
+        inode_num: u64,
+        block_idx: usize,
+    ) -> Option<(u64, u16)> {
+        let ino = self.read_inode(inode_num)?;
+        let block_num = self.resolve_block(&ino, block_idx);
+        if block_num == 0 {
+            return None; // hole — no backing sectors
+        }
+        let sectors_per_block = (self.block_size / 512) as u16;
+        let start_sector = block_num as u64 * sectors_per_block as u64;
+        Some((start_sector, sectors_per_block))
+    }
+
     /// Dispatch a sector-level read through whichever reader the FS holds.
     fn read_sectors_inner(&self, sector: u64, count: u16, buf: &mut [u8])
         -> Result<(), &'static str>
@@ -561,6 +584,34 @@ impl Ext2Fs {
             }
             BlockReader::Fn(f) => f(sector, count, buf),
         }
+    }
+
+    /// Sector read with a bounded retry for transient device errors.
+    ///
+    /// A block device may report a *retryable* condition (a queue-full / busy
+    /// timeout that resolves once the device drains) as an error.  Treating
+    /// such a transient failure as a hard error — and worse, as end-of-file —
+    /// would poison the page cache with zeros (see `read_inode_data`).  We
+    /// therefore retry a small, bounded number of times before surfacing the
+    /// error to the caller.  This is NOT a substitute for genuine error
+    /// handling: after the retry budget is exhausted the error propagates so
+    /// the read path can fail the covering read rather than silently truncate
+    /// it.  POSIX read(2): a read interrupted by an error returns -1, not a
+    /// short count that masquerades as EOF.
+    fn read_sectors_retry(&self, sector: u64, count: u16, buf: &mut [u8])
+        -> Result<(), &'static str>
+    {
+        // 3 attempts total (1 + 2 retries): enough to ride out a momentary
+        // queue-full / yield window without unbounded spinning on a hard fault.
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last = Ok(());
+        for _ in 0..MAX_ATTEMPTS {
+            last = self.read_sectors_inner(sector, count, buf);
+            if last.is_ok() {
+                return Ok(());
+            }
+        }
+        last
     }
 
     /// Write `count` sectors starting at `sector` from `data`.
@@ -586,6 +637,16 @@ impl Ext2Fs {
         let sectors_per_block = (self.block_size / 512) as u16;
         let start_sector = block_num as u64 * sectors_per_block as u64;
         self.read_sectors_inner(start_sector, sectors_per_block, buf)
+    }
+
+    /// Read a block with the bounded transient-error retry (see
+    /// [`Ext2Fs::read_sectors_retry`]).  Used on the file-data read path so a
+    /// momentary device hiccup does not surface as a (corrupting) silent short
+    /// read.
+    fn read_block_retry(&self, block_num: u32, buf: &mut [u8]) -> Result<(), &'static str> {
+        let sectors_per_block = (self.block_size / 512) as u16;
+        let start_sector = block_num as u64 * sectors_per_block as u64;
+        self.read_sectors_retry(start_sector, sectors_per_block, buf)
     }
 
     /// Write a whole block to the filesystem.
@@ -656,12 +717,23 @@ impl Ext2Fs {
     /// madvise(2) MADV_SEQUENTIAL for the conceptual access pattern this
     /// optimises.
     ///
-    /// Behaviour is byte-for-byte identical to the per-block loop it replaces:
-    /// sparse blocks still read as zero, the result is still clamped to EOF
-    /// (`i_size`), and a block-device error still yields a short read.
-    fn read_inode_data(&self, inode: &Ext2Inode, offset: u64, buf: &mut [u8]) -> usize {
+    /// On success returns the number of bytes read: a value < `buf.len()` is a
+    /// genuine short read because the request ran past `i_size` (EOF).  A block
+    /// **device error** during the covering read is NOT EOF — it returns
+    /// `Err(..)` so the caller can fail the read rather than mistake the unread
+    /// tail for end-of-file.  This is the load-bearing distinction: the page
+    /// cache treats whatever it gets as authoritative file contents, so a
+    /// device error silently collapsed into a short count would let the
+    /// prepopulate / demand-fault path install ZERO pages over real file data
+    /// (e.g. a shared library's tail code pages), corrupting it permanently.
+    /// POSIX read(2): a read interrupted by an error returns -1, not a short
+    /// count indistinguishable from EOF.  Genuine sparse blocks
+    /// (`resolve_block == 0`) are the only legitimate in-band zero-fill.
+    fn read_inode_data(&self, inode: &Ext2Inode, offset: u64, buf: &mut [u8])
+        -> Result<usize, &'static str>
+    {
         let file_size = inode.size as u64;
-        if offset >= file_size { return 0; }
+        if offset >= file_size { return Ok(0); }
 
         let bs = self.block_size as u64;
         let to_read = buf.len().min((file_size - offset) as usize);
@@ -677,7 +749,10 @@ impl Ext2Fs {
 
             let block_num = self.resolve_block(inode, block_idx);
 
-            // Sparse block (hole) — fill with zeros, no device I/O.
+            // Sparse block (hole) — fill with zeros, no device I/O.  This is
+            // the ONLY legitimate in-band zero-fill: the block genuinely has no
+            // backing storage, so reading it as zero is correct per the ext2
+            // sparse-file semantics (a hole reads as zero).
             if block_num == 0 {
                 let n = (self.block_size - off_in_block).min(to_read - read_total);
                 buf[read_total..read_total + n].fill(0);
@@ -715,24 +790,23 @@ impl Ext2Fs {
                 let start_sector = block_num as u64 * sectors_per_block;
                 let sector_count = (run_blocks as u64 * sectors_per_block) as u16;
                 let dst = &mut buf[read_total..read_total + run_bytes];
-                if self.read_sectors_inner(start_sector, sector_count, dst).is_err() {
-                    break;
-                }
+                // A device error here is NOT EOF: fail the read so the caller
+                // never installs a zero-filled tail as if it were file data.
+                self.read_sectors_retry(start_sector, sector_count, dst)?;
                 read_total += run_bytes;
                 continue;
             }
 
             // Slow path: unaligned head/tail — read one block through the
-            // bounce buffer and copy the overlapping window.
-            if self.read_block(block_num, &mut block_buf).is_err() {
-                break;
-            }
+            // bounce buffer and copy the overlapping window.  Same rule: a
+            // device error is propagated, not swallowed as a short read.
+            self.read_block_retry(block_num, &mut block_buf)?;
             let n = (self.block_size - off_in_block).min(to_read - read_total);
             buf[read_total..read_total + n].copy_from_slice(&block_buf[off_in_block..off_in_block + n]);
             read_total += n;
         }
 
-        read_total
+        Ok(read_total)
     }
 
     /// Resolve a logical block index to a physical block number.
@@ -1966,7 +2040,19 @@ impl Ext2Fs {
             return entries;
         }
         let mut data = alloc::vec![0u8; size];
-        self.read_inode_data(inode, 0, &mut data);
+        // A device error while reading the directory blocks must not be
+        // mistaken for a valid (empty/short) directory.  We parse only the
+        // bytes successfully read; on a hard device error we return the
+        // entries parsed so far (none, since the buffer is still zeroed),
+        // matching the conservative readdir(3) behaviour used by the
+        // corruption guards below — never fabricate entries from zeroed bytes.
+        let valid_len = self
+            .read_inode_data(inode, 0, &mut data)
+            .unwrap_or(0);
+        let size = valid_len.min(size);
+        if size < EXT2_DIR_HDR {
+            return entries;
+        }
 
         let max_inumber = self.superblock.inodes_count;
         // Defensive iteration bound: each iteration must consume at least
@@ -2100,9 +2186,14 @@ impl Ext2Fs {
                 .ok()
                 .map(|s| s.to_string());
         }
-        // Slow symlink — read the target out of file-data blocks.
+        // Slow symlink — read the target out of file-data blocks.  A device
+        // error reading the target is a failure to resolve the link, not an
+        // empty target: return None rather than decode a zeroed buffer.
         let mut data = alloc::vec![0u8; size as usize];
-        let got = self.read_inode_data(inode, 0, &mut data);
+        let got = match self.read_inode_data(inode, 0, &mut data) {
+            Ok(n) => n,
+            Err(_) => return None,
+        };
         if got == 0 {
             return None;
         }
@@ -2303,7 +2394,11 @@ impl FileSystemOps for Ext2Fs {
 
     fn read(&self, inode: u64, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
         let ino = self.read_inode(inode).ok_or(VfsError::NotFound)?;
-        Ok(self.read_inode_data(&ino, offset, buf))
+        // A device read error during a covering read maps to VfsError::Io
+        // (EIO) — NOT a silent short read.  Callers (page-cache prepopulate,
+        // demand-fault) rely on this to avoid installing zero pages over real
+        // file data; per POSIX read(2) an I/O error is distinct from EOF.
+        self.read_inode_data(&ino, offset, buf).map_err(|_| VfsError::Io)
     }
 
     fn write(&self, inode: u64, offset: u64, data: &[u8]) -> VfsResult<usize> {
