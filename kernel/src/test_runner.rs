@@ -380,6 +380,8 @@ pub fn run() -> ! {
     total += 1;
     if test_ext2_write_indirect() { passed += 1; }
     total += 1;
+    if test_ext2_read_coalesce() { passed += 1; }
+    total += 1;
     if test_ext2_trunc_shrink() { passed += 1; }
     total += 1;
     if test_ext2_trunc_grow_sparse() { passed += 1; }
@@ -5890,6 +5892,76 @@ fn test_ext2_write_indirect() -> bool {
         return false;
     }
     test_pass!("EXT2-WRITE-INDIRECT");
+    true
+}
+
+// ── EXT2-READ-COALESCE: contiguous-block read coalescing ─────────────────
+// Validates that ext2::read_inode_data produces byte-identical results when
+// the contiguous-extent fast path (one multi-sector device read) and the
+// unaligned/sparse slow paths interleave.  Guards the demand-fault bulk
+// readahead optimisation: same bytes, fewer device requests.
+fn test_ext2_read_coalesce() -> bool {
+    test_header!("EXT2-READ-COALESCE: contiguous run + unaligned + sparse-hole readback");
+    use crate::vfs::FileSystemOps;
+    let fs = mount_ext2_test_image();
+
+    // (1) Multi-block contiguous file: 8 KiB (8 blocks at 1 KiB).  mke2fs-style
+    // sequential allocation makes these blocks physically contiguous, so the
+    // read exercises the coalescing fast path across the whole span.
+    let payload: alloc::vec::Vec<u8> =
+        (0..8 * 1024u32).map(|i| ((i * 31 + 7) & 0xFF) as u8).collect();
+    if fs.write(11, 0, &payload).expect("write 8K") != payload.len() {
+        test_fail!("EXT2-READ-COALESCE", "short write");
+        return false;
+    }
+    // Whole-file read: block-aligned, ≥1 block → fast path, one coalesced run.
+    let mut full = alloc::vec![0u8; payload.len()];
+    let r = fs.read(11, 0, &mut full).expect("read full");
+    if r != payload.len() || full != payload {
+        let first = full.iter().zip(&payload).position(|(a, b)| a != b);
+        test_fail!("EXT2-READ-COALESCE", "full-read mismatch at {:?} (r={})", first, r);
+        return false;
+    }
+
+    // (2) Unaligned head + tail: start 300 B into block 0, end mid-block.
+    // Exercises slow(head) → fast(coalesced middle) → slow(tail).
+    let start = 300usize;
+    let len = 5 * 1024 + 100; // spans into the 6th block, ending unaligned
+    let mut win = alloc::vec![0u8; len];
+    let r2 = fs.read(11, start as u64, &mut win).expect("read unaligned");
+    if r2 != len || win[..] != payload[start..start + len] {
+        let first = win.iter().zip(&payload[start..]).position(|(a, b)| a != b);
+        test_fail!("EXT2-READ-COALESCE", "unaligned mismatch at {:?} (r={})", first, r2);
+        return false;
+    }
+
+    // (3) Sparse hole: write block 0 and block 3 of inode 12, leaving blocks
+    // 1+2 as holes.  A read across [0, 4 KiB) must coalesce-break at the hole,
+    // return zeros for the hole, and real data on both sides.
+    let blk0: alloc::vec::Vec<u8> = (0..1024u32).map(|i| (i & 0xFF) as u8).collect();
+    fs.write(12, 0, &blk0).expect("write blk0");
+    let blk3: alloc::vec::Vec<u8> = (0..1024u32).map(|i| ((i ^ 0xAA) & 0xFF) as u8).collect();
+    fs.write(12, 3 * 1024, &blk3).expect("write blk3");
+    let mut sp = alloc::vec![0xFFu8; 4 * 1024];
+    let r3 = fs.read(12, 0, &mut sp).expect("read sparse");
+    if r3 != 4 * 1024 {
+        test_fail!("EXT2-READ-COALESCE", "sparse short read r={}", r3);
+        return false;
+    }
+    if sp[0..1024] != blk0[..] {
+        test_fail!("EXT2-READ-COALESCE", "sparse blk0 mismatch");
+        return false;
+    }
+    if !sp[1024..3 * 1024].iter().all(|&b| b == 0) {
+        test_fail!("EXT2-READ-COALESCE", "sparse hole not zero-filled");
+        return false;
+    }
+    if sp[3 * 1024..4 * 1024] != blk3[..] {
+        test_fail!("EXT2-READ-COALESCE", "sparse blk3 mismatch");
+        return false;
+    }
+
+    test_pass!("EXT2-READ-COALESCE");
     true
 }
 
