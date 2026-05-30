@@ -1902,6 +1902,53 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
             if let Some(fs) = fs_opt {
                 let file_size = fs.stat(inode).map(|s| s.size).unwrap_or(0);
 
+                // BULK READAHEAD READ
+                // --------------------
+                // The readahead window is one contiguous file extent from
+                // `file_page_offset`.  Issuing the FS read once for the whole
+                // span — instead of once per 4 KiB page — lets the ext2 layer
+                // coalesce the physically-contiguous blocks into a single
+                // multi-sector block-device request (see
+                // ext2::read_inode_data).  For a 32-page (128 KiB) window over
+                // a well-laid-out shared object this collapses 32 device
+                // round-trips into one, which is the dominant latency on the
+                // dynamic-loader relocation sweep.  This is a pure batching of
+                // the *read*; per-page frame allocation, cache install, and the
+                // already-present skip below are unchanged, so semantics
+                // (sparse→zero, EOF clamp, per-page SIGSEGV on I/O failure) are
+                // preserved.  Conceptually mmap(2) + madvise(2) MADV_SEQUENTIAL.
+                //
+                // Clamp the bulk span to the VMA end and to EOF, and to the
+                // window.  If `file_page_offset` itself is at/after EOF there is
+                // nothing to read.
+                let window_end_va = (page_addr + READAHEAD_PAGES * 0x1000).min(vma_end);
+                let window_pages = window_end_va.saturating_sub(page_addr) / 0x1000;
+                let span_by_file = file_size.saturating_sub(file_page_offset);
+                let span_bytes =
+                    (window_pages * 0x1000).min(span_by_file) as usize;
+                // Scratch holding the contiguous extent.  Heap-backed (the
+                // kernel heap is physically contiguous and 128 MiB); the
+                // 128 KiB worst case is negligible.  `None` means the bulk read
+                // was skipped or failed → the per-page loop falls back to an
+                // individual `fs.read` for every page, preserving old behaviour.
+                let mut bulk: Option<alloc::vec::Vec<u8>> = None;
+                if span_bytes > 0 {
+                    let mut scratch = alloc::vec![0u8; span_bytes];
+                    match fs.read(inode, file_page_offset, &mut scratch) {
+                        Ok(got) if got == span_bytes => bulk = Some(scratch),
+                        // Short read: the tail past `got` (e.g. an EOF partial
+                        // page or a mid-file hole the FS short-returned on) is
+                        // not covered.  Keep what we have; pages beyond `got`
+                        // fall back to the per-page path which re-reads them
+                        // (and zero-fills holes / clamps EOF correctly).
+                        Ok(got) => {
+                            scratch.truncate(got);
+                            bulk = Some(scratch);
+                        }
+                        Err(_) => { /* fall back to per-page reads */ }
+                    }
+                }
+
                 for pg_idx in 0..READAHEAD_PAGES {
                     let vaddr = page_addr + pg_idx * 0x1000;
                     let foff = file_page_offset + pg_idx * 0x1000;
@@ -1953,7 +2000,24 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         // pg_idx == 0 (the faulting page) the user-mode
                         // signal handler observes the failure rather than
                         // executing against zeroed-out code/data.
-                        if fs.read(inode, foff, buf).is_err() {
+                        // Prefer the bulk-read scratch when it covers this
+                        // page; otherwise read the page individually (bulk read
+                        // was skipped, failed, or short-returned before this
+                        // page).  Either way `buf` ends up holding the exact
+                        // file bytes for `foff`, identical to the old per-page
+                        // path — only the number of device requests changes.
+                        let span_off = (foff - file_page_offset) as usize;
+                        let covered = bulk.as_ref()
+                            .map(|b| span_off + 0x1000 <= b.len())
+                            .unwrap_or(false);
+                        if covered {
+                            // SAFETY-equivalent to a slice copy; lengths checked
+                            // by `covered`.  The page was already zeroed above,
+                            // so a partial tail (never hit here since covered
+                            // requires a full page) would remain zero-padded.
+                            let src = &bulk.as_ref().unwrap()[span_off..span_off + 0x1000];
+                            buf.copy_from_slice(src);
+                        } else if fs.read(inode, foff, buf).is_err() {
                             crate::mm::pmm::free_page(phys);
                             #[cfg(feature = "firefox-test")]
                             crate::serial_println!(
