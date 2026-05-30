@@ -9406,19 +9406,32 @@ fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
                     if has_d {
                         ev |= EPOLLIN;
                     }
-                    if crate::net::unix::peer_closed(inode) {
-                        // Read side is at EOF (peer did `shutdown(SHUT_WR)`
-                        // or `close()`, or we did `shutdown(SHUT_RD)`).  Per
-                        // `epoll(7)`, a read-direction hang-up sets both
-                        // EPOLLRDHUP and EPOLLHUP, and the read end becomes
-                        // readable (read() returns 0) so EPOLLIN is raised
-                        // even with the buffer empty — a draining reader is
-                        // woken to observe the EOF.  Buffered bytes (EPOLLIN
-                        // above) coexist with the hang-up bits, matching the
-                        // `poll(2)`/`epoll_wait(2)` rule that POLLHUP/RDHUP
-                        // are reported regardless of whether they were
-                        // requested in the interest mask.
-                        ev |= EPOLLIN | EPOLLRDHUP | EPOLLHUP;
+                    // `epoll(7)` distinguishes a read-side half-close from a
+                    // full hang-up, so we report them separately:
+                    //
+                    //   * read-side half-close (peer `shutdown(SHUT_WR)`, or
+                    //     we did `shutdown(SHUT_RD)`; the connection is still
+                    //     up and still writable) → EPOLLRDHUP, plus the read
+                    //     end becomes readable (read() returns 0) so EPOLLIN.
+                    //     EPOLLOUT stays set — the write direction is valid.
+                    //     EPOLLRDHUP means "read EOF, write still valid"; it
+                    //     is NOT EPOLLHUP.
+                    //
+                    //   * full hang-up (SHUT_RDWR both directions, or either
+                    //     endpoint fully closed) → additionally EPOLLHUP,
+                    //     which `epoll(7)` defines as "connection fully dead".
+                    //
+                    // EPOLLHUP is always reported regardless of the interest
+                    // mask; EPOLLRDHUP is only *delivered* when the caller
+                    // subscribed it, via the `subscribed & ready_ev`
+                    // intersection in `do_poll`.  Raising EPOLLRDHUP
+                    // unconditionally here is correct — the intersection
+                    // gates its delivery, per `epoll(7)`.
+                    if crate::net::unix::read_shutdown(inode) {
+                        ev |= EPOLLIN | EPOLLRDHUP;
+                    }
+                    if crate::net::unix::fully_hung_up(inode) {
+                        ev |= EPOLLHUP;
                     }
                     ev
                 } else {

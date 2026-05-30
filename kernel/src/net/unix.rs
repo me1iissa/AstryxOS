@@ -642,20 +642,48 @@ pub fn has_data(id: u64) -> bool {
     }
 }
 
-/// Returns true if the local side has been half-closed for reading
-/// (either by a local `shutdown(SHUT_RD)` or by the peer's `shutdown(SHUT_WR)`
-/// / `close()` propagation per `shutdown()` / `close()` below) and is
-/// therefore at EOF for subsequent reads.  Epoll callers use this to
-/// raise `EPOLLHUP` once any buffered data has been drained — POSIX
-/// `poll(2)` / IEEE 1003.1 §poll require `POLLHUP` to coexist with
-/// `POLLIN` while bytes remain, and to be reported regardless of
-/// whether the caller asked for it.
-pub fn peer_closed(id: u64) -> bool {
+/// Returns true if the local read direction is at EOF — the RCV_SHUTDOWN
+/// equivalent.  This is set when the local side did `shutdown(SHUT_RD)`,
+/// the peer did `shutdown(SHUT_WR)`, or the peer `close()`d (all of which
+/// flip our `shut_rd`; see `shutdown()` / `close()` above).
+///
+/// This is a *read-direction half-close*: subsequent local `read()`s return
+/// 0 (orderly EOF) but the connection is NOT torn down and the local write
+/// direction stays valid.  Per `epoll(7)`, a read-side hang-up maps to
+/// `EPOLLRDHUP` (and the read end becomes readable, so `EPOLLIN` too); per
+/// `poll(2)` it maps to `POLLIN` / `POLLRDHUP`.  It does *not* by itself
+/// imply `EPOLLHUP` / `POLLHUP`, which mean a *full* hang-up — see
+/// [`fully_hung_up`].
+pub fn read_shutdown(id: u64) -> bool {
     if id as usize >= MAX_UNIX_SOCKETS { return false; }
     let t = TABLE.lock();
     let s = &t.0[id as usize];
     if s.state == UnixState::Free { return true; }
-    if s.shut_rd { return true; }
+    s.shut_rd
+}
+
+/// Returns true on a *full* hang-up — the SHUTDOWN_MASK / TCP_CLOSE
+/// equivalent — where the connection is dead in both directions.  This is
+/// the only condition under which `epoll(7)` reports `EPOLLHUP` and
+/// `poll(2)` reports `POLLHUP` (both meaning "connection fully dead", as
+/// opposed to `EPOLLRDHUP`'s "read EOF, write still valid").
+///
+/// It is true when:
+///   * our slot is `Free` (fully closed locally — TCP_CLOSE), or
+///   * the peer's slot is `Free` (peer fully closed — TCP_CLOSE), or
+///   * both directions have been shut down locally
+///     (`shut_rd && shut_wr`, i.e. `SHUT_RDWR` — SHUTDOWN_MASK).
+///
+/// A read-side-only half-close (peer `shutdown(SHUT_WR)`: our `shut_rd`
+/// set but `shut_wr` clear, both slots still `Connected`) is deliberately
+/// NOT a full hang-up — the write direction stays usable and only
+/// [`read_shutdown`] fires.
+pub fn fully_hung_up(id: u64) -> bool {
+    if id as usize >= MAX_UNIX_SOCKETS { return false; }
+    let t = TABLE.lock();
+    let s = &t.0[id as usize];
+    if s.state == UnixState::Free { return true; }
+    if s.shut_rd && s.shut_wr { return true; }
     let peer = s.peer_id;
     if peer == u64::MAX { return false; }
     if (peer as usize) >= MAX_UNIX_SOCKETS { return false; }
