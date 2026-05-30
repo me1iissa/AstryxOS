@@ -1489,13 +1489,28 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     // `u64::MAX` for infinite waits, the bell is the only
                     // wake mechanism — its single firing point is every
                     // pipe/eventfd write).
-                    crate::ipc::waitlist::wait_poll_event(deadline_tick);
-                    // Pump X11 so replies appear in socket buffers.
-                    crate::x11::poll();
-                    // Pump the NIC RX ring + UDP/TCP demux so wire-side
-                    // events become poll-visible.  See the matching
-                    // pre-wait pump above for the rationale.
-                    crate::net::poll();
+                    //
+                    // The readiness closure passed here is re-run by
+                    // `wait_poll_event` *under the POLL_BELL lock* before it
+                    // commits to parking, closing the check-and-park
+                    // lost-wakeup window: a writer that rings the bell
+                    // between our last `do_check` and the park is serialized
+                    // on POLL_BELL, so it either makes us observe ready in
+                    // the recheck (we skip parking) or finds us already
+                    // enqueued (it drains us).  `do_check(false, false)` is a
+                    // side-effect-light readiness probe (it only writes the
+                    // idempotent revents bits, recomputed after the wake).
+                    let ready_in_window =
+                        crate::ipc::waitlist::wait_poll_event(
+                            deadline_tick, || do_check(false, false) > 0);
+                    if !ready_in_window {
+                        // We actually parked and woke — pump X11 so replies
+                        // appear in socket buffers, and pump the NIC RX ring +
+                        // UDP/TCP demux so wire-side events become poll-
+                        // visible.  See the matching pre-wait pump above.
+                        crate::x11::poll();
+                        crate::net::poll();
+                    }
                     let r = do_check(true, true);
                     if r > 0 {
                         #[cfg(feature = "firefox-test")]
@@ -5209,6 +5224,27 @@ fn sys_select_linux(
         }
     }
 
+    // Read-only readiness probe: returns true if any still-requested fd is
+    // currently ready, WITHOUT clearing any fd_set bits.  Used as the
+    // recheck-under-lock predicate for `wait_poll_event` so the
+    // check-and-park lost-wakeup window is closed without destructively
+    // mutating the caller's fd_set during the recheck (the authoritative
+    // bit-clearing `do_rescan` runs only after we decide to return).
+    let probe_ready = || -> bool {
+        for fd in 0..nfds {
+            let byte_off = (fd / 8) as u64;
+            let bit      = 1u8 << (fd % 8);
+            let r_req = readfds  != 0 && fdset_read_bit(readfds,  byte_off, bit, kernel_dispatch);
+            let w_req = writefds != 0 && fdset_read_bit(writefds, byte_off, bit, kernel_dispatch);
+            if !r_req && !w_req { continue; }
+            let revents = crate::syscall::poll_revents(pid, fd, if r_req { 0x0001 } else { 0x0004 });
+            const READABLE_MASK: u16 = 0x0001 | 0x0010;
+            if r_req && revents & READABLE_MASK != 0 { return true; }
+            if w_req && revents & 0x0004 != 0 { return true; }
+        }
+        false
+    };
+
     let do_rescan = |ready: &mut i64| {
         *ready = 0;
         for fd in 0..nfds {
@@ -5274,8 +5310,18 @@ fn sys_select_linux(
                 // sleep.  The bell wakes us when any pipe/eventfd state
                 // change occurs; the scheduler tick wakes us at the
                 // deadline.  Either path drops back into the rescan.
-                crate::ipc::waitlist::wait_poll_event(deadline_tick);
-                crate::x11::poll();
+                //
+                // `probe_ready` is re-run under the POLL_BELL lock before
+                // committing to park (prepare-to-wait), closing the
+                // check-and-park lost-wakeup window; it is read-only so the
+                // authoritative bit-clearing `do_rescan` below stays the
+                // single fd_set mutator.
+                let ready_in_window =
+                    crate::ipc::waitlist::wait_poll_event(
+                        deadline_tick, &probe_ready);
+                if !ready_in_window {
+                    crate::x11::poll();
+                }
                 do_rescan(&mut ready);
                 if ready > 0 { break; }
                 if signal_pending(pid) { return -4; } // EINTR
@@ -9621,6 +9667,21 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
         }
     };
 
+    // Read-only readiness probe over the watch snapshot — true if any
+    // watched fd currently has a deliverable event.  Mirrors `do_poll`'s
+    // interest/ERR/HUP masking but allocates nothing and pushes nothing;
+    // used as the recheck-under-lock predicate for `wait_poll_event` so
+    // the check-and-park lost-wakeup window is closed (prepare-to-wait).
+    let probe_ready = || -> bool {
+        for &(fd, subscribed, _data) in &watches_snap {
+            let ready_ev = epoll_poll_events(pid, fd);
+            let interest =
+                (subscribed & ready_ev) | (ready_ev & (EPOLLERR | EPOLLHUP));
+            if interest != 0 { return true; }
+        }
+        false
+    };
+
     let mut fired: alloc::vec::Vec<EpollEvent> = alloc::vec::Vec::new();
     do_poll(&mut fired);
 
@@ -9656,7 +9717,22 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
                 // tick wakes us at the deadline.  Replaces the prior
                 // 10 ms-tick sleep loop and is the change responsible for
                 // closing the post-PR-#119 epoll-spin plateau.
-                crate::ipc::waitlist::wait_poll_event(deadline_tick);
+                //
+                // `probe_ready` is re-run under the POLL_BELL lock before
+                // the park commits (prepare-to-wait), so a writer that makes
+                // a watched fd ready in the window between our last `do_poll`
+                // and the park cannot lose the readiness edge: it is
+                // serialized on POLL_BELL and either makes the recheck
+                // observe ready (we skip parking) or finds us enqueued (it
+                // drains us).  The wake-side net/x11 pumps run only when we
+                // actually parked.
+                let ready_in_window =
+                    crate::ipc::waitlist::wait_poll_event(
+                        deadline_tick, &probe_ready);
+                if ready_in_window {
+                    do_poll(&mut fired);
+                    if !fired.is_empty() { break; }
+                }
                 // Pump the NIC RX ring and TCP timers on every wakeup.
                 // This is the symmetric partner to the identical call in
                 // poll(2) (~line 1447).  Without it, a tokio/reqwest runtime

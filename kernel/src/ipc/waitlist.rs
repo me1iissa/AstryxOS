@@ -254,14 +254,55 @@ pub static POLL_BELL_RESYNC_WAKES: AtomicU64 = AtomicU64::new(0);
 /// `ring_poll_bell_for`, the resync floor is purely a safety net for
 /// future sources (or third-party fds) that have not yet been added
 /// to the bell — it is sized accordingly (1 s, was 100 ms pre-wiring).
-pub fn wait_poll_event(caller_deadline: u64) {
+///
+/// ## Lost-wakeup correctness (prepare-to-wait / recheck-under-lock)
+///
+/// The caller's fd-readiness scan (`poll_revents` / `epoll_poll_events`)
+/// runs in a *different* lock domain (`PROCESS_TABLE` + the per-fd
+/// pipe/socket/eventfd state locks) from the bell.  A naive
+/// `scan → if not-ready park` has a lost-wakeup window: between the
+/// scan reading "not ready" and this function taking `POLL_BELL`, a
+/// writer can run `ring_poll_bell_for → drain_all()`, find the waiter
+/// list empty, and consume the readiness edge — the parker then sleeps
+/// with the wakeup already gone, only recovering at the
+/// `RESYNC_INTERVAL_TICKS` (≈1 s) floor.  This is the classic
+/// prepare-to-wait / lost-wakeup hazard (cf. `poll(2)`, `epoll(7)`,
+/// `man 7 futex` "futex word recheck"): the condition must be
+/// re-tested *after* committing to the wait queue but *before*
+/// sleeping, atomically with respect to the waker.
+///
+/// `ready_now` is the caller's readiness re-scan.  This function holds
+/// `POLL_BELL` and calls `ready_now()`; if it reports readiness, the
+/// caller is NOT enqueued and NOT scheduled away — `true` is returned
+/// so the caller drops straight back into its evaluate-and-return path.
+/// Otherwise the caller is enqueued *under the same `POLL_BELL` hold*
+/// that gated the recheck, so any `ring_poll_bell_for` that races
+/// between the recheck and `schedule()` is serialized behind the bell
+/// lock and therefore observes the now-enqueued waiter — no edge can
+/// be lost.  Returns `false` if it actually parked.
+///
+/// ### Lock order (no inversion)
+///
+/// While holding `POLL_BELL` this function acquires, *sequentially and
+/// non-nested*, first whatever locks `ready_now()` needs
+/// (`PROCESS_TABLE` + per-fd state, all released before it returns),
+/// then `THREAD_TABLE` via `enqueue_self_blocked`.  The new edge is
+/// `POLL_BELL → PROCESS_TABLE`.  No bell *writer* ever rings the bell
+/// while holding `PROCESS_TABLE` (every `ring_poll_bell_for` site drops
+/// the process/state lock first — see `signal::kill`, the alarm
+/// dispatcher, and the pipe/eventfd/unix wake paths), so the reverse
+/// edge `PROCESS_TABLE → POLL_BELL` does not exist and the addition is
+/// inversion-free.  `POLL_BELL` is never held across `schedule()`.
+pub fn wait_poll_event(caller_deadline: u64, mut ready_now: impl FnMut() -> bool) -> bool {
     /// Maximum ticks to park before the outer loop rescans.  100 ticks
     /// = 1 s at `TICK_HZ=100`.  Pre-wiring this was 100 ms because the
     /// bell missed timerfd / signalfd / inotify / unix-shutdown /
     /// signal-injection readiness; with those sources now wired, the
     /// floor exists only as a backstop for future readiness sources
     /// that have not yet been ring-bell-wired, and a 1 s rescan keeps
-    /// CPU overhead in the long-quiet case ~10× lower.
+    /// CPU overhead in the long-quiet case ~10× lower.  It is retained
+    /// as belt-and-braces even though the recheck-under-lock above
+    /// closes the structural lost-wakeup window for every wired source.
     const RESYNC_INTERVAL_TICKS: u64 = 100;
     let tid = crate::proc::current_tid();
     let now = crate::arch::x86_64::irq::get_ticks();
@@ -273,7 +314,22 @@ pub fn wait_poll_event(caller_deadline: u64) {
     let wake_tick = caller_deadline.min(resync_tick);
 
     let mut bell = POLL_BELL.lock();
+    // Recheck readiness WHILE HOLDING the bell lock.  If a watched fd
+    // became ready in the window between the caller's last scan and
+    // now, bail without parking: returning `true` tells the caller to
+    // re-evaluate and return ready, and because we never enqueued there
+    // is nothing to clean up.  A writer racing here is serialized on
+    // `POLL_BELL` — it either ran before us (we observe ready) or after
+    // us (we are enqueued and it drains us).
+    if ready_now() {
+        drop(bell);
+        return true;
+    }
     bell.enqueue_self_blocked(tid, wake_tick);
+    // Drop the bell AFTER enqueue but BEFORE schedule(): a wake that
+    // arrives between here and schedule() finds us already on the list
+    // and flips us Blocked→Ready, so the schedule() (or the scheduler
+    // tick) returns us promptly rather than losing the wake.
     drop(bell);
     crate::sched::schedule();
     // Classify the wake: if we are still on the bell list, the
@@ -286,6 +342,7 @@ pub fn wait_poll_event(caller_deadline: u64) {
     } else {
         POLL_BELL_BELL_WAKES.fetch_add(1, Ordering::Relaxed);
     }
+    false
 }
 
 /// Ring the poll bell — wake every thread parked in `wait_poll_event`.
