@@ -670,6 +670,10 @@ pub fn run() -> ! {
     total += 1;
     if test_unix_socketpair() { passed += 1; }
 
+    // ── AF_UNIX POLLOUT writable-gate + recv-drain write-space wake ────────
+    total += 1;
+    if test_unix_pollout_writable_gate() { passed += 1; }
+
     // ── Test 54: AF_UNIX bind/listen/connect/accept ───────────────────────
 
     total += 1;
@@ -13136,6 +13140,114 @@ fn test_unix_socketpair() -> bool {
     crate::syscall::dispatch_linux_kernel(3, fds[1] as u64, 0, 0, 0, 0, 0);
 
     test_pass!("AF_UNIX socketpair round-trip");
+    true
+}
+
+// ── AF_UNIX POLLOUT writable-gate + recv-drain write-space wake ────────────────
+//
+// Proves the two AF_UNIX readiness ABI fixes against `man 7 unix` / `man 2
+// poll`:
+//   (1) POLLOUT/EPOLLOUT is reported only when a `write()` would make progress
+//       — i.e. the peer's recv ring has room.  A socket whose peer recv ring is
+//       full must NOT advertise writable (else a blocked producer busy-spins
+//       poll→write→EAGAIN).
+//   (2) A reader draining recv space rings the write-side poll bell, so a peer
+//       parked in poll-for-writable re-checks immediately rather than only on
+//       the resync floor (the recv-side write-space wake).
+fn test_unix_pollout_writable_gate() -> bool {
+    use crate::net::unix;
+    use crate::ipc::waitlist::{BELL_RINGS_BY_SOURCE, PollBellSource};
+    test_header!("AF_UNIX POLLOUT writable-gate + recv-drain write-space wake");
+
+    // socketpair: a write on `a` lands in `b`'s recv ring and vice-versa, so
+    // `writable(a)` is gated on `b`'s recv_space().
+    let (a, b) = unix::socketpair(unix::SockKind::Stream,
+        unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if a == u64::MAX || b == u64::MAX {
+        test_fail!("unix_pollout_gate", "socketpair returned MAX");
+        return false;
+    }
+
+    // Fresh, empty pair → both ends writable (peer recv ring empty).
+    if !unix::writable(a) {
+        test_fail!("unix_pollout_gate", "fresh socket a not writable");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    test_println!("  fresh pair: writable(a)=true ✓");
+
+    // Fill `b`'s recv ring by writing to `a` until a write returns -EAGAIN
+    // (-11): the ring is then full and `a` must report NOT writable.  Use a
+    // 4 KiB chunk; recv ring is 32 KiB so this terminates after ~8 writes.
+    let chunk = [0xa5u8; 4096];
+    let mut total: i64 = 0;
+    loop {
+        let n = unix::write(a, &chunk);
+        if n == -11 { break; }            // EAGAIN — peer ring full
+        if n <= 0 {
+            test_fail!("unix_pollout_gate", "unexpected write ret {}", n);
+            unix::close(a); unix::close(b);
+            return false;
+        }
+        total += n;
+        if total > 1 << 20 {              // safety: ring is only 32 KiB
+            test_fail!("unix_pollout_gate", "ring never filled (wrote {})", total);
+            unix::close(a); unix::close(b);
+            return false;
+        }
+    }
+    test_println!("  filled peer recv ring with {} bytes (write→EAGAIN) ✓", total);
+
+    // Peer ring full → `a` must NOT be writable (gap #1).  Before the fix this
+    // returned true unconditionally and a producer would busy-spin.
+    if unix::writable(a) {
+        test_fail!("unix_pollout_gate",
+            "socket a still writable with full peer recv ring (POLLOUT gate)");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    test_println!("  peer ring full: writable(a)=false ✓ (gap #1)");
+
+    // Snapshot the UnixRead (recv-drain) bell counter; draining `b` must ring
+    // it so a peer parked in poll-for-writable re-checks (gap #2).
+    let before = BELL_RINGS_BY_SOURCE[PollBellSource::UnixRead as usize]
+        .load(core::sync::atomic::Ordering::Relaxed);
+
+    // Drain `b` fully — read everything that was written.
+    let mut sink = [0u8; 4096];
+    let mut drained: i64 = 0;
+    loop {
+        let n = unix::read(b, &mut sink);
+        if n <= 0 { break; }              // EAGAIN/EOF — nothing left
+        drained += n;
+    }
+    test_println!("  drained {} bytes from b", drained);
+
+    let after = BELL_RINGS_BY_SOURCE[PollBellSource::UnixRead as usize]
+        .load(core::sync::atomic::Ordering::Relaxed);
+    if after <= before {
+        test_fail!("unix_pollout_gate",
+            "recv drain did not ring UnixRead bell (before={} after={}) — \
+             a peer parked in poll-for-writable would never re-check (gap #2)",
+            before, after);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    test_println!("  recv drain rang UnixRead poll bell ({}→{}) ✓ (gap #2)",
+        before, after);
+
+    // After draining, `a` is writable again (peer ring has room) — POLLOUT
+    // re-asserts.
+    if !unix::writable(a) {
+        test_fail!("unix_pollout_gate", "socket a not writable after drain");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    test_println!("  after drain: writable(a)=true ✓ (POLLOUT re-asserts)");
+
+    unix::close(a);
+    unix::close(b);
+    test_pass!("AF_UNIX POLLOUT writable-gate + recv-drain wake");
     true
 }
 
@@ -31586,10 +31698,10 @@ fn test_poll_bell_source_attribution() -> bool {
     }
 
     // Ring one of each tagged source.  Update the array length any time
-    // a new source variant lands in `PollBellSource` (currently 9 tagged
+    // a new source variant lands in `PollBellSource` (currently 10 tagged
     // variants — `Other` stays untagged by design so it can absorb
     // ad-hoc callers without skewing the per-source attribution).
-    let sources_to_ring: [PollBellSource; 9] = [
+    let sources_to_ring: [PollBellSource; 10] = [
         PollBellSource::Pipe,
         PollBellSource::Eventfd,
         PollBellSource::UnixWrite,
@@ -31599,6 +31711,7 @@ fn test_poll_bell_source_attribution() -> bool {
         PollBellSource::Inotify,
         PollBellSource::SignalInject,
         PollBellSource::InetRx,
+        PollBellSource::UnixRead,
     ];
     for s in &sources_to_ring {
         ring_poll_bell_for(*s);

@@ -3960,7 +3960,14 @@ pub(crate) fn poll_revents(pid: u64, fd: usize, events: u16) -> u16 {
         }
         let mut rev = 0u16;
         if readable { rev |= events & POLLIN; }
-        rev |= events & POLLOUT; // connected sockets always writable
+        // POLLOUT only when a `write()` would make progress — i.e. the peer's
+        // recv ring has room (or the write side can no longer block, e.g.
+        // SHUT_WR / peer-gone / not-connected, where `write()` returns -EPIPE
+        // / -ENOTCONN without blocking).  Advertising writable unconditionally
+        // makes a producer blocked on a full socket busy-spin poll→write→EAGAIN
+        // — the stuck-producer pattern `poll(2)` exists to avoid (`man 2 poll`,
+        // `man 7 unix`).
+        if crate::net::unix::writable(uid) { rev |= events & POLLOUT; }
         // `poll(2)` distinguishes a read-side half-close from a full
         // hang-up, so we report them separately (matching the `epoll(7)`
         // EPOLLRDHUP / EPOLLHUP split):
