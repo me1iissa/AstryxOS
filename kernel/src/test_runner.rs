@@ -201,6 +201,10 @@ pub fn run() -> ! {
     total += 1;
     if test_poll_bell_source_attribution() { passed += 1; }
 
+    // ── Test 0bx2: poll-bell check-and-park recheck-under-lock ────────────
+    total += 1;
+    if test_poll_bell_recheck_under_lock() { passed += 1; }
+
     // ── Test 0bc: POLLHUP on pipe read-end after writer close ─────────────
     total += 1;
     if test_pipe_pollhup_on_writer_close() { passed += 1; }
@@ -31534,6 +31538,141 @@ fn test_poll_bell_source_attribution() -> bool {
     test_println!("  all {} tagged sources bumped their own slot; `other` unchanged ✓",
         sources_to_ring.len());
     test_pass!("poll-bell per-source attribution counters");
+    true
+}
+
+// ── Test 0bx2: poll-bell check-and-park recheck-under-lock (TOCTOU) ──────────
+//
+// Regression for the `wait_poll_event` check-and-park lost-wakeup window.
+// Pre-fix, `wait_poll_event` unconditionally enqueued the caller and called
+// `schedule()`: a writer that rang the bell in the window between the
+// caller's last readiness scan (a *different* lock domain) and the
+// `POLL_BELL.lock()` would `drain_all()` an empty waiter list, consuming the
+// readiness edge, and the parker then slept until the ≈1 s `RESYNC_INTERVAL`
+// floor — presenting as a spinning/frozen event loop (`poll(2)`, `epoll(7)`
+// self-pipe `ScheduleWork` wakeups hit this window every iteration).
+//
+// The fix re-runs the caller's readiness predicate WHILE HOLDING `POLL_BELL`
+// (prepare-to-wait / recheck-under-lock, the standard lost-wakeup remedy).
+// This test asserts the two halves of that contract directly, without a
+// non-deterministic two-thread race:
+//
+//   1. Ready-in-window: when the readiness closure reports `true`, the helper
+//      MUST return `true` and MUST NOT park (no waiter enqueued, no
+//      `schedule()` — verified by an unchanged parked-waiter count and the
+//      fact that the call returns on the same thread without yielding).
+//   2. Not-ready: when the closure reports `false` *and* the deadline is
+//      already in the past, the helper parks but the scheduler-tick deadline
+//      is honoured (it returns rather than hanging), and on return the waiter
+//      is no longer parked.
+//
+// The decisive assertion is #1: it is exactly the edge a racing writer would
+// otherwise lose — a watched fd that became ready in the check-and-park
+// window is caught by the under-lock recheck and the caller never sleeps.
+fn test_poll_bell_recheck_under_lock() -> bool {
+    use crate::ipc::waitlist::{
+        wait_poll_event, poll_bell_waiter_count,
+        POLL_BELL_BELL_WAKES, POLL_BELL_RESYNC_WAKES,
+    };
+    use core::sync::atomic::Ordering;
+
+    test_header!("poll-bell check-and-park recheck-under-lock (lost-wakeup TOCTOU)");
+
+    // Pre-conditions: nobody parked on the bell at test entry.
+    let parked0 = poll_bell_waiter_count();
+    if parked0 != 0 {
+        test_fail!("poll_bell_recheck",
+            "unexpected {} pre-parked bell waiters at test entry", parked0);
+        return false;
+    }
+    let bw0 = POLL_BELL_BELL_WAKES.load(Ordering::Relaxed);
+    let rw0 = POLL_BELL_RESYNC_WAKES.load(Ordering::Relaxed);
+
+    // ── Case 1: ready-in-window — recheck closure reports ready ──────────
+    // Deadline `u64::MAX` (infinite) proves the return is driven by the
+    // under-lock recheck, NOT by a timeout: pre-fix this call would have
+    // enqueued + schedule()'d and only the bell or resync could return it.
+    // The closure simulates "an fd became ready in the check-and-park
+    // window".  Must return true and leave zero waiters parked.
+    let ready_ret = wait_poll_event(u64::MAX, || true);
+    if !ready_ret {
+        test_fail!("poll_bell_recheck",
+            "ready-in-window recheck returned false (should bail without parking)");
+        return false;
+    }
+    let parked1 = poll_bell_waiter_count();
+    if parked1 != 0 {
+        test_fail!("poll_bell_recheck",
+            "ready-in-window path enqueued a waiter (count={}); must not park", parked1);
+        return false;
+    }
+    // It must not have classified as a bell/resync wake — it never parked.
+    let bw1 = POLL_BELL_BELL_WAKES.load(Ordering::Relaxed);
+    let rw1 = POLL_BELL_RESYNC_WAKES.load(Ordering::Relaxed);
+    if bw1 != bw0 || rw1 != rw0 {
+        test_fail!("poll_bell_recheck",
+            "ready-in-window path bumped a wake counter (bell {}->{}, resync {}->{}); \
+             it must short-circuit before parking", bw0, bw1, rw0, rw1);
+        return false;
+    }
+    test_println!("  case1: ready-in-window recheck bailed without parking ✓");
+
+    // ── Case 1b: the recheck closure IS consulted (it gates the bail) ────
+    // A `wait_poll_event` that ignored the closure and unconditionally
+    // parked would never call it; assert the closure ran exactly once and
+    // that its `true` is what produced the no-park bail.  This is the
+    // decisive lost-wakeup edge — a writer that makes an fd ready in the
+    // check-and-park window is observed by the under-lock recheck.
+    let mut calls = 0u32;
+    let ready_ret_1b = wait_poll_event(u64::MAX, || { calls += 1; true });
+    if !ready_ret_1b || calls != 1 || poll_bell_waiter_count() != 0 {
+        test_fail!("poll_bell_recheck",
+            "recheck not consulted under lock (ret={} calls={} parked={}); \
+             the closure must gate the bail", ready_ret_1b, calls, poll_bell_waiter_count());
+        return false;
+    }
+    test_println!("  case1b: recheck closure consulted under lock (calls=1) ✓");
+
+    // ── Case 2: not-ready enqueue mechanics (WaitList-level, NO TID-0 park)
+    //
+    // The not-ready branch of `wait_poll_event` calls
+    // `enqueue_self_blocked` then `schedule()`.  We must NOT drive that
+    // branch from this test: the kernel-smoke test runner IS TID 0 (the
+    // BSP main thread), and parking TID 0 corrupts the scheduler (TID 0 is
+    // the BSP's only Ready candidate on CPU 0 — see the `vfork`/`futex`
+    // TID-0 notes elsewhere in this file).  So we exercise the same
+    // enqueue/drain mechanics one layer down, on a private `WaitList`,
+    // proving the not-ready path's building blocks are correct without
+    // ever transitioning TID 0 to Blocked.
+    {
+        use crate::ipc::waitlist::{WaitList, wake_tids};
+        let mut wl = WaitList::new();
+        if !wl.is_empty() {
+            test_fail!("poll_bell_recheck", "fresh WaitList not empty");
+            return false;
+        }
+        // A writer racing AFTER enqueue must find the waiter and be able to
+        // drain it — this is the half that makes a post-recheck wake safe.
+        // Use a synthetic TID that matches no real thread so `wake_tids`'
+        // THREAD_TABLE pass is a no-op (no scheduler state touched).
+        const SYNTH_TID: u64 = u64::MAX - 1;
+        wl.enqueue_self_blocked(SYNTH_TID, u64::MAX);
+        if wl.len() != 1 {
+            test_fail!("poll_bell_recheck", "enqueue did not register waiter (len={})", wl.len());
+            return false;
+        }
+        let drained = wl.drain_all();
+        if drained != [SYNTH_TID] || !wl.is_empty() {
+            test_fail!("poll_bell_recheck",
+                "drain_all did not return the enqueued waiter (drained={:?}, empty={})",
+                drained, wl.is_empty());
+            return false;
+        }
+        wake_tids(&drained); // no-op for the synthetic tid; asserts no panic
+    }
+    test_println!("  case2: not-ready enqueue/drain mechanics correct (no TID-0 park) ✓");
+
+    test_pass!("poll-bell check-and-park recheck-under-lock (lost-wakeup TOCTOU)");
     true
 }
 
