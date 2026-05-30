@@ -1941,14 +1941,24 @@ fn stack_write_u64(
                 core::ptr::write(dst, value);
             }
             // Track B (Phase 5, 2026-05-21) — record the kernel-direct-map
-            // write into the stack-page provenance ring.  The window gate
-            // inside `record_write` drops VAs outside the 0x3f thread-stack
-            // range, so the main-thread initial-stack writes
-            // (USER_STACK_TOP=0x7fff_…) are dropped harmlessly while the
-            // 0x3f-range writes are captured.
+            // write into the stack-page provenance ring.  The 0x3f-window
+            // `record_write` covers thread stacks (e.g. clone-child argv on
+            // the 0x3f mmap allocator).
             #[cfg(feature = "stack-prov")]
             crate::mm::stack_prov::record_write(
                 vaddr, value, crate::mm::stack_prov::SITE_ELF_AUXV,
+            );
+            // GATE-A (2026-05-30) — also seed a BASELINE record for the
+            // main-stack TOP window (`USER_STACK_TOP - 64*4KiB ..`), where the
+            // argc/argv/envp/auxv block lives.  This is a non-zeroing build
+            // write (it stores the legitimate pointer/value), so it does NOT
+            // flag a zeroing store; it phys-anchors the slot so a later
+            // out-of-band ZEROING store on the same frame is attributable to
+            // the same `phys`.  We pass `phys` explicitly because this runs in
+            // the creating context's CR3, not the target process's.
+            #[cfg(feature = "stack-prov")]
+            crate::mm::stack_prov::record_top_window_write_phys(
+                vaddr, value, phys, crate::mm::stack_prov::SITE_ARGV_BUILD,
             );
             return;
         }

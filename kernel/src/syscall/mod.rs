@@ -1987,6 +1987,18 @@ pub(crate) fn write_u32_to_user(cr3: u64, vaddr: u64, val: u32) {
             }
         }
     }
+    // GATE-A (2026-05-30) — observability-only: if this u32 store lands in the
+    // main-stack TOP window (where the argc/argv/envp/auxv block lives), record
+    // the kernel-direct-map write with its writer-RIP BEFORE the store mutates
+    // the slot.  CLONE_CHILD_CLEARTID writes `0`; if `clear_child_tid` ever
+    // points at (or aliases) a non-zero argv pointer slot, this names the
+    // out-of-band argv-zeroing writer.  No-op (≤1 cmp+branch) for the
+    // overwhelming common case where `vaddr` is a libc `.bss`/`.data` word
+    // outside the TOP window — the hot CLEARTID path is untouched.
+    #[cfg(feature = "stack-prov")]
+    crate::mm::stack_prov::record_top_window_write_cr3(
+        vaddr, val as u64, cr3, crate::mm::stack_prov::SITE_CLEARTID,
+    );
     unsafe {
         core::ptr::write_volatile((PHYS_OFF + phys) as *mut u32, val);
     }
