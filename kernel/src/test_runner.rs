@@ -2406,6 +2406,17 @@ pub fn run() -> ! {
     total += 1;
     if test_278_mounts_lock_not_held_across_fs_dispatch() { passed += 1; }
 
+    // ── Test 283: stack-prov main-stack TOP-window argv-writer capture ──
+    // GATE-A blind-spot closure (2026-05-30).  Only built when the
+    // `stack-prov` diagnostic feature is on (CI smoke does not enable it);
+    // verifies that a value-zeroing store into the simulated argv block is
+    // captured with its writer-RIP, retrievable by VA.
+    #[cfg(feature = "stack-prov")]
+    {
+        total += 1;
+        if test_283_stack_prov_argv_writer_capture() { passed += 1; }
+    }
+
     // ── Tests 261-263: native-core hardening (cycle 3) ──────────────────
     // Gated on `native-core-tests` feature: the three native-core tests
     // (page_ref_dec CAS underflow, OB refcount integration, scheduler
@@ -31873,6 +31884,136 @@ fn test_pipe_refcount_fork_exec_close_chain() -> bool {
     crate::ipc::pipe::pipe_close_reader(pipe_id);
 
     test_pass!("pipe refcount — fork+exec+close chain (musl posix_spawn cancel-pipe)");
+    true
+}
+
+// ── Test 283: stack-prov main-stack TOP-window argv-writer capture ──────────
+//
+// GATE-A blind-spot closure (2026-05-30).  The libxul `nsCommandLine::Init`
+// SIGSEGV (CR2=0, `argv[1]==NULL` at `0x7fff_fffe_fa38`) is unconstructable at
+// build time, so some out-of-band kernel store must zero `argv[1]`'s slot AFTER
+// `setup_user_stack`.  The stack-prov ring previously only covered the 0x3f
+// thread-stack window and DROPPED writes to the `0x7fff_…` main stack — the
+// blind spot.  This test confirms the new main-stack TOP window
+// (`[USER_STACK_TOP - 64*4KiB, USER_STACK_TOP)`) now captures a value-zeroing
+// store into a simulated argv slot, with the writer-RIP retrievable by VA.
+//
+// It drives `test_inject_top_window_record` (the production capture body's
+// ring-store, minus the page-table walk) so the test needs no mapped user
+// frame, then reads the writer back via `test_lookup_writer_for_va` and asserts
+// the zeroing-store counter advanced.  Also asserts a non-zeroing build write
+// in the same window does NOT bump the zeroing counter, and that a write
+// OUTSIDE the window is rejected by the gate.
+//
+// Refs: System V AMD64 psABI §3.4.1 (initial process stack: argc/argv/envp/
+// auxv layout); POSIX `exec(3p)` (argv contents passed to the new image).
+#[cfg(feature = "stack-prov")]
+fn test_283_stack_prov_argv_writer_capture() -> bool {
+    test_header!("stack-prov main-stack TOP-window argv-writer capture (GATE-A)");
+    use crate::mm::stack_prov;
+
+    // Simulated argv[1] pointer slot, matching the GATE-A fault VA class:
+    // just below USER_STACK_TOP=0x7fff_ffff_0000.
+    let argv1_va: u64 = 0x0000_7FFF_FFFE_FA38;
+    // A plausible argv-page phys frame (page-aligned, non-zero).
+    let argv_phys: u64 = 0x0000_0000_0123_4000;
+
+    // ── Gate sanity: the TOP window must include argv1_va and exclude a
+    //    deep-stack VA far below it. ───────────────────────────────────────
+    if !stack_prov::in_top_window(argv1_va) {
+        test_fail!("stack_prov_argv_writer_capture",
+            "argv1_va {:#x} not classified inside the TOP window", argv1_va);
+        return false;
+    }
+    let deep_va: u64 = 0x0000_7FFF_FFF0_0000; // ~1 MiB below top: outside window
+    if stack_prov::in_top_window(deep_va) {
+        test_fail!("stack_prov_argv_writer_capture",
+            "deep_va {:#x} wrongly classified inside the TOP window", deep_va);
+        return false;
+    }
+
+    let zeroing_before = stack_prov::argv_zeroing_count();
+    let top_before = stack_prov::top_window_count();
+
+    // ── Step 1: legitimate build write (non-zero pointer, old=0). ─────────
+    // Must record a TOP-window entry but NOT a zeroing store.
+    let build_rip: u64 = 0xFFFF_8000_0011_1111;
+    let argv1_ptr: u64 = 0x0000_7FFF_FFFE_FFC0; // points at the argv[1] string
+    stack_prov::test_inject_top_window_record(
+        argv1_va, /*old*/ 0, /*new*/ argv1_ptr, build_rip, argv_phys,
+        stack_prov::SITE_ARGV_BUILD,
+    );
+
+    if stack_prov::argv_zeroing_count() != zeroing_before {
+        test_fail!("stack_prov_argv_writer_capture",
+            "build write (old=0,new!=0) wrongly counted as a zeroing store");
+        return false;
+    }
+    if stack_prov::top_window_count() != top_before + 1 {
+        test_fail!("stack_prov_argv_writer_capture",
+            "build write did not advance the TOP-window record counter");
+        return false;
+    }
+
+    // Build write must be retrievable, naming its RIP and the value written.
+    match stack_prov::test_lookup_writer_for_va(argv1_va) {
+        Some((rip, old, new)) => {
+            if rip != build_rip || old != 0 || new != argv1_ptr {
+                test_fail!("stack_prov_argv_writer_capture",
+                    "build-write readback mismatch: rip={:#x} old={:#x} new={:#x}",
+                    rip, old, new);
+                return false;
+            }
+        }
+        None => {
+            test_fail!("stack_prov_argv_writer_capture",
+                "build write not retrievable by VA {:#x}", argv1_va);
+            return false;
+        }
+    }
+
+    // ── Step 2: the out-of-band ZEROING store (the writer we hunt). ───────
+    // old = the build pointer (non-zero), new = 0 → must flag zeroing and
+    // record the writer-RIP retrievable by VA.
+    let writer_rip: u64 = 0xFFFF_8000_00AB_CDEF;
+    stack_prov::test_inject_top_window_record(
+        argv1_va, /*old*/ argv1_ptr, /*new*/ 0, writer_rip, argv_phys,
+        stack_prov::SITE_CLEARTID,
+    );
+
+    if stack_prov::argv_zeroing_count() != zeroing_before + 1 {
+        test_fail!("stack_prov_argv_writer_capture",
+            "zeroing store not counted: before={} after={}",
+            zeroing_before, stack_prov::argv_zeroing_count());
+        return false;
+    }
+
+    // The captured writer-RIP for the argv slot must now be the zeroing
+    // store's RIP (most-recent seq wins) — the blind spot is closed.
+    match stack_prov::test_lookup_writer_for_va(argv1_va) {
+        Some((rip, old, new)) => {
+            if rip != writer_rip {
+                test_fail!("stack_prov_argv_writer_capture",
+                    "captured writer-RIP {:#x} != expected zeroing-store RIP {:#x}",
+                    rip, writer_rip);
+                return false;
+            }
+            if old != argv1_ptr || new != 0 {
+                test_fail!("stack_prov_argv_writer_capture",
+                    "zeroing-store record wrong: old={:#x} (want {:#x}) new={:#x} (want 0)",
+                    old, argv1_ptr, new);
+                return false;
+            }
+        }
+        None => {
+            test_fail!("stack_prov_argv_writer_capture",
+                "zeroing store not retrievable by VA {:#x} — blind spot NOT closed",
+                argv1_va);
+            return false;
+        }
+    }
+
+    test_pass!("stack_prov_argv_writer_capture");
     true
 }
 
