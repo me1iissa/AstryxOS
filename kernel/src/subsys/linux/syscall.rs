@@ -9331,7 +9331,7 @@ fn write_hex64(out: &mut Vec<u8>, mut v: u64) {
 /// Poll the readiness events for `fd` in process `pid`.
 /// Returns a bitmask of EPOLL* flags that are currently set.
 fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
-    use crate::ipc::epoll::{EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP};
+    use crate::ipc::epoll::{EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP, EPOLLRDHUP};
 
     // Snapshot fd metadata with a brief lock hold.  `mount_idx == usize::MAX`
     // together with the SOCKET_FD bit (`0x4000_0000`) in `flags` identifies a
@@ -9406,11 +9406,31 @@ fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
                     if has_d {
                         ev |= EPOLLIN;
                     }
-                    if crate::net::unix::peer_closed(inode) {
-                        // Buffered bytes win over EOF for the EPOLLIN
-                        // signal but coexist with EPOLLHUP so a draining
-                        // reader can finish before observing the
-                        // half-close — per `poll(2)`/`epoll_wait(2)`.
+                    // `epoll(7)` distinguishes a read-side half-close from a
+                    // full hang-up, so we report them separately:
+                    //
+                    //   * read-side half-close (peer `shutdown(SHUT_WR)`, or
+                    //     we did `shutdown(SHUT_RD)`; the connection is still
+                    //     up and still writable) → EPOLLRDHUP, plus the read
+                    //     end becomes readable (read() returns 0) so EPOLLIN.
+                    //     EPOLLOUT stays set — the write direction is valid.
+                    //     EPOLLRDHUP means "read EOF, write still valid"; it
+                    //     is NOT EPOLLHUP.
+                    //
+                    //   * full hang-up (SHUT_RDWR both directions, or either
+                    //     endpoint fully closed) → additionally EPOLLHUP,
+                    //     which `epoll(7)` defines as "connection fully dead".
+                    //
+                    // EPOLLHUP is always reported regardless of the interest
+                    // mask; EPOLLRDHUP is only *delivered* when the caller
+                    // subscribed it, via the `subscribed & ready_ev`
+                    // intersection in `do_poll`.  Raising EPOLLRDHUP
+                    // unconditionally here is correct — the intersection
+                    // gates its delivery, per `epoll(7)`.
+                    if crate::net::unix::read_shutdown(inode) {
+                        ev |= EPOLLIN | EPOLLRDHUP;
+                    }
+                    if crate::net::unix::fully_hung_up(inode) {
                         ev |= EPOLLHUP;
                     }
                     ev
@@ -9543,7 +9563,7 @@ fn sys_epoll_ctl(epfd: usize, op: u64, fd: usize, event_ptr: u64) -> i64 {
 
 /// epoll_wait — collect ready events into caller's buffer.
 fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i32) -> i64 {
-    use crate::ipc::epoll::{EpollEvent, EPOLLERR};
+    use crate::ipc::epoll::{EpollEvent, EPOLLERR, EPOLLHUP};
     if maxevents == 0 { return -22; } // EINVAL
     let pid = crate::proc::current_pid_lockless();
 
@@ -9575,7 +9595,26 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
         for &(fd, subscribed, data) in &watches_snap {
             if fired.len() >= maxevents { break; }
             let ready_ev = epoll_poll_events(pid, fd);
-            let interest = subscribed & (ready_ev | EPOLLERR);
+            // Per `epoll(7)`: "EPOLLERR and EPOLLHUP ... it is not necessary
+            // to set [them] in events"; the kernel reports them whenever they
+            // occur, independent of the caller's interest set.  Build the
+            // delivered mask as two disjoint parts:
+            //   * the caller-subscribed bits that are currently ready
+            //     (`subscribed & ready_ev`), and
+            //   * any EPOLLERR / EPOLLHUP that is ready, delivered even when
+            //     unsubscribed (`ready_ev & (EPOLLERR | EPOLLHUP)`).
+            // EPOLLRDHUP is NOT in the always-on set — Linux only reports it
+            // when subscribed — so it flows through the first term only.
+            //
+            // The stored `subscribed` mask is the caller's raw interest and is
+            // never mutated; ERR/HUP are force-added to the *ready* side here
+            // at the single delivery site.  This keeps the readiness/wake
+            // matching wake-safe: a healthy fd reporting only EPOLLOUT against
+            // an EPOLLIN-only watch yields `(EPOLLIN & EPOLLOUT) | (EPOLLOUT &
+            // (ERR|HUP)) = 0`, so no spurious-ready perturbs the parking
+            // decision — exactly as before this ABI fix.
+            let interest =
+                (subscribed & ready_ev) | (ready_ev & (EPOLLERR | EPOLLHUP));
             if interest != 0 {
                 fired.push(EpollEvent { events: interest, data });
             }
