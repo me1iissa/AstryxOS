@@ -1919,12 +1919,50 @@ pub fn futex_wake_for_exit(pid: u64, uaddr: u64, max_wake: u64) {
 }
 
 /// Write a 32-bit value to a virtual address through the given CR3's page tables.
-/// Used for CLONE_CHILD_SETTID.
+///
+/// Used for CLONE_CHILD_SETTID and — critically — for CLONE_CHILD_CLEARTID on
+/// the thread-exit path (`proc::exit_thread`).  Per clone(2)
+/// `CLONE_CHILD_CLEARTID` and `set_tid_address(2)`, the kernel must zero the
+/// `clear_child_tid` word in the *dying thread's* address space and then
+/// futex-wake any waiter — this is how a surviving thread that parked on that
+/// word (e.g. via a `while (*addr == val) futex(FUTEX_WAIT, …)` loop) learns the
+/// thread has gone.  If the write is dropped, the woken waiter re-reads the old
+/// value and re-parks forever (POSIX futex(2) semantics: a wake without the
+/// guarded value actually changing is a spurious wake the waiter ignores).
+///
+/// The target word is not guaranteed to be backed by a present, writable PTE at
+/// exit time: the page may be lazily demand-paged (never touched in this CR3),
+/// or present-but-read-only after a copy-on-write fork.  Silently skipping the
+/// write in those cases is the bug this function guards against.  We therefore
+/// resolve the page the same way a hardware write fault would — demand-fault an
+/// anonymous page in, or break COW — before performing the store, mirroring the
+/// page-fault handler's anonymous/COW install logic (Intel SDM Vol. 3A §4.10.5,
+/// §8.2.3 for the ordering used around the install).
 pub(crate) fn write_u32_to_user(cr3: u64, vaddr: u64, val: u32) {
     const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
-    use crate::mm::vmm::{read_pte, ADDR_MASK, PAGE_PRESENT};
-    let pte = read_pte(cr3, vaddr);
-    if pte & PAGE_PRESENT == 0 { return; }
+    use crate::mm::vmm::{read_pte, ADDR_MASK, PAGE_PRESENT, PAGE_WRITABLE};
+
+    let mut pte = read_pte(cr3, vaddr);
+
+    // Slow path: the PTE is non-present (lazily demand-paged) or present but
+    // not writable (copy-on-write).  Resolve it through the owning VmSpace so
+    // the store below always lands on the exact frame the surviving thread
+    // reads.  On any unrecoverable condition (no VMA, non-writable VMA, OOM)
+    // `resolve_user_write_page` returns false and we fall through without
+    // writing — the same observable outcome as the historical no-op, but only
+    // for genuinely-unmapped targets rather than every lazily-paged one.
+    if pte & PAGE_PRESENT == 0 || pte & PAGE_WRITABLE == 0 {
+        if !resolve_user_write_page(cr3, vaddr) {
+            return;
+        }
+        pte = read_pte(cr3, vaddr);
+        // If resolution still did not leave us a present, writable PTE, abort
+        // rather than write through a stale/RO translation.
+        if pte & PAGE_PRESENT == 0 || pte & PAGE_WRITABLE == 0 {
+            return;
+        }
+    }
+
     let phys = (pte & ADDR_MASK) + (vaddr & 0xFFF);
     // W215 axis-B probe: check if the resolved phys page is cache-resident.
     // This writer hits via PHYS_OFF direct map, bypassing user-PTE permission
@@ -1952,6 +1990,134 @@ pub(crate) fn write_u32_to_user(cr3: u64, vaddr: u64, val: u32) {
     unsafe {
         core::ptr::write_volatile((PHYS_OFF + phys) as *mut u32, val);
     }
+    // Publish the store before any subsequent futex wake.  The dying thread's
+    // CLEARTID write is the userspace unlock the surviving waiter is parked on
+    // (clone(2) CLONE_CHILD_CLEARTID); the waiter re-checks `*addr == val`
+    // after being woken (POSIX futex(2)), so the zero must be globally visible
+    // before `futex_wake_for_exit` runs or the waiter re-parks.  A release
+    // fence orders this store ahead of the wake's queue mutation (Intel SDM
+    // Vol. 3A §8.2.2 — stores are not reordered with older stores, but the
+    // fence also forbids the compiler from sinking the write past the wake).
+    core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+}
+
+/// Demand-fault (or COW-break) the user page containing `vaddr` in the address
+/// space identified by `cr3`, so a subsequent direct write through the PHYS_OFF
+/// direct map lands on a present, writable, process-private frame.
+///
+/// This is the non-interrupt-context analogue of the write-fault arms of
+/// `arch::x86_64::idt::handle_page_fault`: it is invoked from the thread-exit
+/// path (`write_u32_to_user` → CLONE_CHILD_CLEARTID) where no real `#PF` will
+/// be taken because the write goes through the kernel direct map rather than
+/// the user PTE.  It reproduces only the two arms reachable for a
+/// `clear_child_tid` target — which musl/glibc guarantee is a writable libc
+/// global (anonymous `.bss`/`.data`) or a COW page after fork:
+///
+///   * **not-present + writable anonymous VMA** → allocate a zeroed frame and
+///     install it RW|User (clone(2) guarantees the word is mapped; an unwritten
+///     `.bss`/lock word reads as zero, which is the correct content).
+///   * **present + read-only COW** → if the frame is shared (`refcount > 1`)
+///     copy it to a private frame, else flip the existing frame writable;
+///     shoot down stale read-only TLB entries on sibling CPUs.
+///
+/// Returns `true` if the page is now present and writable, `false` for any
+/// unrecoverable case (no covering VMA, a non-writable VMA, OOM) — in which
+/// case the caller declines the write, preserving the historical no-op outcome
+/// but only for genuinely-unresolvable targets.
+///
+/// Locking: takes `PROCESS_TABLE` only in short snapshot critical sections and
+/// drops it before `map_page_in` / `write_pte` (which take the per-CR3 `mm_sem`
+/// in read mode).  It is called from `exit_thread` with no table lock held, so
+/// no lock-order inversion is introduced.  Cite Intel SDM Vol. 3A §4.10.5
+/// (TLB/paging-structure caches) and §8.2.3 (memory-ordering of stores).
+fn resolve_user_write_page(cr3: u64, vaddr: u64) -> bool {
+    use crate::mm::vmm::{
+        read_pte, map_page_in, write_pte, ADDR_MASK,
+        PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER,
+    };
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    let page_addr = crate::mm::vma::page_align_down(vaddr);
+
+    let pte = read_pte(cr3, page_addr);
+
+    // ── Arm A: present-but-read-only — break copy-on-write ──────────────────
+    if pte & PAGE_PRESENT != 0 {
+        if pte & PAGE_WRITABLE != 0 {
+            return true; // already writable; nothing to do
+        }
+        // Confirm the VMA actually permits writes before breaking COW; a
+        // genuinely read-only mapping (e.g. a const .rodata word) must not be
+        // promoted — that would be a real protection error.
+        let writable_vma = {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            procs.iter()
+                .find(|p| p.cr3 == cr3)
+                .and_then(|p| p.vm_space.as_ref())
+                .and_then(|vs| vs.find_vma(page_addr))
+                .map(|vma| vma.prot & crate::mm::vma::PROT_WRITE != 0)
+                .unwrap_or(false)
+        };
+        if !writable_vma {
+            return false;
+        }
+        let old_phys = pte & ADDR_MASK;
+        let flags = (pte & !ADDR_MASK) | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+        if crate::mm::refcount::page_ref_count(old_phys) > 1 {
+            // Shared frame — copy to a private one.
+            let new_phys = match crate::mm::pmm::alloc_page() {
+                Some(p) => p,
+                None => return false,
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (PHYS_OFF + old_phys) as *const u8,
+                    (PHYS_OFF + new_phys) as *mut u8,
+                    crate::mm::pmm::PAGE_SIZE,
+                );
+            }
+            let _ = crate::mm::refcount::page_ref_dec(old_phys);
+            crate::mm::refcount::page_ref_set(new_phys, 1);
+            map_page_in(cr3, page_addr, new_phys, flags);
+        } else {
+            // Sole owner — just flip the writable bit in place.
+            write_pte(cr3, page_addr, old_phys | flags);
+        }
+        crate::mm::tlb::shootdown_page(cr3, page_addr);
+        return true;
+    }
+
+    // ── Arm B: not present — demand-fault an anonymous frame ────────────────
+    // Look up the covering VMA and require it to be writable (a clear_child_tid
+    // target is always a writable libc global per clone(2)).  We install a
+    // zeroed RW|User frame; for an untouched .bss/lock word zero IS the correct
+    // file/anon content, and the caller immediately overwrites it with the
+    // CLEARTID value anyway.
+    let install_flags = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter()
+            .find(|p| p.cr3 == cr3)
+            .and_then(|p| p.vm_space.as_ref())
+            .and_then(|vs| vs.find_vma(page_addr))
+        {
+            Some(vma) if vma.prot & crate::mm::vma::PROT_WRITE != 0 => {
+                // Build flags from the VMA but force writable+user+present; the
+                // VMA's own to_page_flags already encodes NX correctly.
+                vma.to_page_flags() | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
+            }
+            _ => return false, // no VMA, or non-writable VMA → real error
+        }
+    };
+    let phys = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => return false,
+    };
+    unsafe {
+        core::ptr::write_bytes((PHYS_OFF + phys) as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
+    }
+    crate::mm::refcount::page_ref_set(phys, 1);
+    map_page_in(cr3, page_addr, phys, install_flags);
+    crate::mm::vmm::invlpg(page_addr);
+    true
 }
 
 // ===== waitpid() Implementation =============================================
