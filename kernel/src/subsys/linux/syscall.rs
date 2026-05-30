@@ -8606,15 +8606,30 @@ pub fn sys_futex_linux(
             crate::sched::schedule();
 
             // Woken (or timed out). Clean up from wait queue.
+            //
+            // A FUTEX_REQUEUE may have moved this TID off its original
+            // `(pid, uaddr)` bucket into `(pid, uaddr2)` while it slept (per
+            // `futex(2)`, requeue updates the waiter's queue key).  Scan the
+            // bucket the waiter ACTUALLY sits in — the requeue destination if
+            // one was recorded, else the original `uaddr` — so a
+            // timeout-after-requeue removes the real orphan rather than
+            // leaving a stale waiter in the uaddr2 bucket and misreporting the
+            // timeout as a wake.
             let mut timed_out = false;
             {
                 let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
-                if let Some(list) = waiters.get_mut(&(pid, uaddr)) {
+                // Consume any requeue destination recorded for this TID
+                // (FUTEX_WAITERS → FUTEX_REQUEUE_DEST lock order, matching the
+                // requeue insert).  `take`-style: remove it so the map does
+                // not leak across this waiter's lifetime.
+                let dest = crate::syscall::FUTEX_REQUEUE_DEST.lock().remove(&(pid, tid));
+                let key = (pid, dest.unwrap_or(uaddr));
+                if let Some(list) = waiters.get_mut(&key) {
                     let before = list.len();
                     list.retain(|&t| t != tid);
-                    if list.len() < before { timed_out = true; } // still in list → woken; removed → timed out
+                    if list.len() < before { timed_out = true; } // still in list → timed out; already gone → woken
                     if list.is_empty() {
-                        waiters.remove(&(pid, uaddr));
+                        waiters.remove(&key);
                     }
                 }
             }
@@ -8892,6 +8907,19 @@ pub fn sys_futex_linux(
                 // Requeue surviving waiters to uaddr2.
                 if !requeue_list.is_empty() {
                     waiters.entry((pid, uaddr2)).or_insert_with(Vec::new).extend(requeue_list.iter());
+                    // Record each requeued TID's new destination key so its
+                    // own FUTEX_WAIT post-`schedule()` cleanup scans the
+                    // bucket it now sits in `(pid, uaddr2)` rather than its
+                    // original `(pid, uaddr)`.  Per `futex(2)`, requeue
+                    // updates the waiter's queue key to uaddr2; without this a
+                    // timeout-after-requeue would leave an orphan in the
+                    // uaddr2 bucket and misreport ETIMEDOUT as success.  Taken
+                    // while still holding FUTEX_WAITERS to keep the single
+                    // FUTEX_WAITERS → FUTEX_REQUEUE_DEST lock order.
+                    let mut dest = crate::syscall::FUTEX_REQUEUE_DEST.lock();
+                    for &tid in &requeue_list {
+                        dest.insert((pid, tid), uaddr2);
+                    }
                 }
                 tids_to_wake = wake_list;
                 tids_to_requeue = requeue_list;
@@ -8913,11 +8941,126 @@ pub fn sys_futex_linux(
             // Return woken count only — not woken+requeued.  Per futex(2).
             woken as i64
         }
-        // FUTEX_WAKE_OP (5) — compound wake + modify-second-futex operation.
-        // Not yet implemented; the operation is rarely needed by glibc/musl in
-        // the AstryxOS Firefox demo path.  Return ENOSYS so callers fall back
-        // to their non-WAKE_OP path.  Per futex(2).
-        5 => -38, // ENOSYS
+        // FUTEX_WAKE_OP (5) — compound atomic-modify-then-conditional-wake.
+        // Per futex(2):
+        //   1. Atomically apply OP(oparg) to *uaddr2, capturing the OLD value.
+        //   2. Wake up to `val` (nr_wake) waiters on uaddr.
+        //   3. If CMP(oldval, cmparg) is true, additionally wake up to `val2`
+        //      (nr_wake2) waiters on uaddr2.
+        //   Return total number of waiters woken (uaddr + uaddr2).
+        //
+        // The 32-bit `val3` (arg6) encodes the operation:
+        //   bits 28..30  OP        (SET=0, ADD=1, OR=2, ANDN=3, XOR=4)
+        //   bit  31      OPARG_SHIFT — interpret oparg as `1 << oparg`
+        //   bits 24..27  CMP       (EQ=0, NE=1, LT=2, LE=3, GT=4, GE=5)
+        //   bits 12..23  oparg     (signed 12-bit)
+        //   bits  0..11  cmparg    (signed 12-bit)
+        // glibc/musl use this for pthread_cond / barrier fast paths.
+        5 => {
+            let encoded_op = (_val3 & 0xFFFF_FFFF) as u32;
+            let val2 = timeout_ptr; // nr_wake2 (positional arg4 per futex(2))
+
+            // ── Decode the encoded operation ──────────────────────────────
+            let op_field   = (encoded_op >> 28) & 0x7;
+            let oparg_shift = (encoded_op & (0x8 << 28)) != 0;
+            let cmp_field  = (encoded_op >> 24) & 0xF;
+            // Sign-extend the two 12-bit fields to i32.
+            let sext12 = |v: u32| -> i32 {
+                let v = (v & 0xFFF) as i32;
+                if v & 0x800 != 0 { v - 0x1000 } else { v }
+            };
+            let mut oparg = sext12((encoded_op >> 12) & 0xFFF);
+            let cmparg    = sext12(encoded_op & 0xFFF);
+
+            if oparg_shift {
+                // `1 << oparg`; per futex(2) an oparg outside 0..=31 is a
+                // program bug.  Linux masks it to 31 and continues rather than
+                // erroring; we mirror that (mask, no fault) so a buggy caller
+                // does not wedge.
+                if !(0..=31).contains(&oparg) {
+                    oparg &= 31;
+                }
+                oparg = 1i32 << (oparg & 31);
+            }
+
+            // ── Atomic modify of *uaddr2, capturing the old value ─────────
+            // Read-modify-write is serialised by the FUTEX_WAITERS lock held
+            // across the whole op: every wake-class futex op takes it, so no
+            // concurrent futex modify of this word interleaves.  (A racing
+            // *non-futex* userspace store can still interleave — but that is
+            // true on real hardware too; futex(2) only guarantees atomicity
+            // against other futex operations.)
+            let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
+
+            let oldval = match unsafe { crate::syscall::user_read_u32(uaddr2) } {
+                Some(v) => v as i32,
+                None => return -14, // EFAULT — *uaddr2 unreadable
+            };
+            let newval: i32 = match op_field {
+                0 => oparg,             // FUTEX_OP_SET
+                1 => oldval.wrapping_add(oparg), // FUTEX_OP_ADD
+                2 => oldval | oparg,    // FUTEX_OP_OR
+                3 => oldval & !oparg,   // FUTEX_OP_ANDN
+                4 => oldval ^ oparg,    // FUTEX_OP_XOR
+                _ => return -22,        // EINVAL — unknown OP
+            };
+            // Store the new value into *uaddr2 in the caller's own address
+            // space (symmetric with the user_read_u32 above).
+            if !unsafe { crate::syscall::user_write_u32(uaddr2, newval as u32) } {
+                return -14; // EFAULT — *uaddr2 unwritable
+            }
+
+            // ── Wake up to `val` waiters on uaddr ─────────────────────────
+            let max_wake1 = if val == 0 { u64::MAX } else { val };
+            let mut tids_to_wake: Vec<u64> = Vec::new();
+            if let Some(list) = waiters.get_mut(&(pid, uaddr)) {
+                let mut n = 0u64;
+                while !list.is_empty() && n < max_wake1 {
+                    tids_to_wake.push(list.remove(0));
+                    n += 1;
+                }
+                if list.is_empty() { waiters.remove(&(pid, uaddr)); }
+            }
+
+            // ── Evaluate CMP(oldval, cmparg); if true wake uaddr2 too ─────
+            let cmp_true = match cmp_field {
+                0 => oldval == cmparg, // FUTEX_OP_CMP_EQ
+                1 => oldval != cmparg, // FUTEX_OP_CMP_NE
+                2 => oldval <  cmparg, // FUTEX_OP_CMP_LT
+                3 => oldval <= cmparg, // FUTEX_OP_CMP_LE
+                4 => oldval >  cmparg, // FUTEX_OP_CMP_GT
+                5 => oldval >= cmparg, // FUTEX_OP_CMP_GE
+                _ => return -22,       // EINVAL — unknown CMP
+            };
+            if cmp_true {
+                let max_wake2 = if val2 == 0 { u64::MAX } else { val2 };
+                if let Some(list) = waiters.get_mut(&(pid, uaddr2)) {
+                    let mut n = 0u64;
+                    while !list.is_empty() && n < max_wake2 {
+                        tids_to_wake.push(list.remove(0));
+                        n += 1;
+                    }
+                    if list.is_empty() { waiters.remove(&(pid, uaddr2)); }
+                }
+            }
+            drop(waiters);
+
+            // Flip every drained TID Blocked → Ready under one THREAD_TABLE
+            // acquisition (same post-drain pattern as FUTEX_WAKE).
+            {
+                let mut threads = crate::proc::THREAD_TABLE.lock();
+                for &t in &tids_to_wake {
+                    if let Some(th) = threads.iter_mut().find(|th| th.tid == t) {
+                        if th.state == crate::proc::ThreadState::Blocked {
+                            th.state = crate::proc::ThreadState::Ready;
+                            th.wake_tick = 0;
+                        }
+                    }
+                }
+            }
+
+            tids_to_wake.len() as i64
+        }
         _ => -38, // ENOSYS
     }
 }
