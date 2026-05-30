@@ -665,6 +665,10 @@ pub fn run() -> ! {
     total += 1;
     if test_futex_requeue() { passed += 1; }
 
+    // ── futex REQUEUE destination tracking (orphan-free timeout) ──────────
+    total += 1;
+    if test_futex_requeue_dest_tracking() { passed += 1; }
+
     // ── Test 53: AF_UNIX socketpair + write/read ──────────────────────────
 
     total += 1;
@@ -12903,12 +12907,12 @@ fn test_pipe2_statfs() -> bool {
 // Covers futex(2) ABI hygiene fixes from the post-H1-SMAP follow-up bundle:
 //   * FUTEX_REQUEUE  op=3 (was incorrectly dispatched as op=4 before the fix)
 //   * FUTEX_CMP_REQUEUE op=4 with correct val3 comparison via arg6
-//   * FUTEX_WAKE_OP op=5 returns ENOSYS (stub, not implemented)
+//   * FUTEX_WAKE_OP op=5 atomic modify-*uaddr2 + conditional wake (SET/ADD/ANDN)
 //
 // References: futex(2) Linux man-page; Linux UAPI <linux/futex.h>.
 
 fn test_futex_requeue() -> bool {
-    test_header!("futex — REQUEUE + CMP_REQUEUE + WAKE_OP stub + WAIT_BITSET");
+    test_header!("futex — REQUEUE + CMP_REQUEUE + WAKE_OP + WAIT_BITSET");
 
     // ── FUTEX_REQUEUE (op=3): wake 0 waiters, requeue 0 to uaddr2 ──────────
     // With no waiters, woken count = 0; return value must be 0 (not negative).
@@ -12974,17 +12978,69 @@ fn test_futex_requeue() -> bool {
     }
     test_println!("  FUTEX_CMP_REQUEUE op=4 (*uaddr≠val3) → {} (EAGAIN) ✓", r);
 
-    // ── FUTEX_WAKE_OP (op=5): stub must return ENOSYS (-38) ────────────────
+    // ── FUTEX_WAKE_OP (op=5): atomic modify *uaddr2 + conditional wake ─────
+    // Per futex(2): apply OP(oparg) to *uaddr2 (capturing old value), wake up
+    // to `val` waiters on uaddr, then if CMP(oldval,cmparg) wake up to `val2`
+    // waiters on uaddr2.  With no waiters the return value is 0 and the only
+    // observable effect is the modify of *uaddr2.
+    //
+    // Encoded op (val3) layout: OP<<28 | OPARG_SHIFT<<31 | CMP<<24 |
+    //                           (oparg&0xfff)<<12 | (cmparg&0xfff).
+    //
+    // Sub-case A: FUTEX_OP_SET, oparg=5; CMP_EQ cmparg=0.
+    //   *uaddr2 starts 0 → becomes 5; oldval(0)==cmparg(0) → CMP true.
+    //   No waiters → woken=0.
+    let mut wop2: u32 = 0;
+    // OP=SET(0)<<28 | CMP=EQ(0)<<24 | oparg(5)<<12 | cmparg(0)
+    let enc_set: u64 = (5u64 << 12) | 0;
     let r = unsafe {
         crate::syscall::dispatch_linux_kernel(202, &uaddr as *const u32 as u64,
-            5, 0, 0, &uaddr2 as *const u32 as u64, 0)
+            5, 0, 0, &mut wop2 as *mut u32 as u64, enc_set)
     };
-    if r != -38 {
-        test_fail!("futex_wake_op_stub",
-            "FUTEX_WAKE_OP op=5 returned {} (expected -38 ENOSYS)", r);
+    if r != 0 {
+        test_fail!("futex_wake_op_set",
+            "FUTEX_WAKE_OP SET returned {} (expected 0 woken)", r);
         return false;
     }
-    test_println!("  FUTEX_WAKE_OP op=5 → {} (ENOSYS stub) ✓", r);
+    if wop2 != 5 {
+        test_fail!("futex_wake_op_set",
+            "FUTEX_WAKE_OP SET left *uaddr2={} (expected 5)", wop2);
+        return false;
+    }
+    test_println!("  FUTEX_WAKE_OP SET oparg=5 → *uaddr2={} woken={} ✓", wop2, r);
+
+    // Sub-case B: FUTEX_OP_ADD, oparg=3 on *uaddr2 (now 5) → 8; oldval(5)
+    // captured BEFORE the add; CMP_GT cmparg=4 → 5>4 true.  Still 0 woken.
+    // OP=ADD(1)<<28 | CMP=GT(4)<<24 | oparg(3)<<12 | cmparg(4)
+    let enc_add: u64 = (1u64 << 28) | (4u64 << 24) | (3u64 << 12) | 4;
+    let r = unsafe {
+        crate::syscall::dispatch_linux_kernel(202, &uaddr as *const u32 as u64,
+            5, 0, 0, &mut wop2 as *mut u32 as u64, enc_add)
+    };
+    if r != 0 {
+        test_fail!("futex_wake_op_add", "FUTEX_WAKE_OP ADD returned {}", r);
+        return false;
+    }
+    if wop2 != 8 {
+        test_fail!("futex_wake_op_add",
+            "FUTEX_WAKE_OP ADD left *uaddr2={} (expected 8)", wop2);
+        return false;
+    }
+    test_println!("  FUTEX_WAKE_OP ADD oparg=3 → *uaddr2={} woken={} ✓", wop2, r);
+
+    // Sub-case C: FUTEX_OP_ANDN, oparg=0xF on *uaddr2 (now 8) → 8 & ~0xF = 0.
+    // OP=ANDN(3)<<28 | CMP=EQ(0)<<24 | oparg(0xF)<<12 | cmparg(0)
+    let enc_andn: u64 = (3u64 << 28) | (0xFu64 << 12) | 0;
+    let r = unsafe {
+        crate::syscall::dispatch_linux_kernel(202, &uaddr as *const u32 as u64,
+            5, 0, 0, &mut wop2 as *mut u32 as u64, enc_andn)
+    };
+    if r != 0 || wop2 != 0 {
+        test_fail!("futex_wake_op_andn",
+            "FUTEX_WAKE_OP ANDN ret={} *uaddr2={} (expected 0/0)", r, wop2);
+        return false;
+    }
+    test_println!("  FUTEX_WAKE_OP ANDN oparg=0xF → *uaddr2={} woken={} ✓", wop2, r);
 
     // Verify FUTEX_WAIT_BITSET (9) with a timeout of 1ns returns ETIMEDOUT (-110).
     // We use a stack value == 0 and check val == *uaddr (0 == 0) so it waits.
@@ -13072,7 +13128,132 @@ fn test_futex_requeue() -> bool {
     }
     test_println!("  FUTEX_WAIT_BITSET|CLOCK_REALTIME future deadline → {} ✓", r);
 
-    test_pass!("futex REQUEUE + WAIT_BITSET");
+    test_pass!("futex REQUEUE + WAKE_OP + WAIT_BITSET");
+    true
+}
+
+// ── futex REQUEUE destination tracking — orphan-free timeout-after-requeue ─────
+//
+// Proves the requeue-cleanup ABI fix (gap #3): a `FUTEX_REQUEUE` /
+// `FUTEX_CMP_REQUEUE` that moves a waiter to `(pid, uaddr2)` records the
+// destination so the waiter's own post-`schedule()` cleanup scans the bucket
+// it ACTUALLY sits in.  Before the fix, the cleanup scanned the original
+// `(pid, uaddr)`: a timeout-after-requeue would (a) orphan the waiter in the
+// uaddr2 bucket for a later wake to spuriously pop, and (b) misreport the
+// timeout as a successful wake.
+//
+// Driven at the data-structure level with a synthetic (pid, tid): we cannot
+// park a real thread mid-WAIT in a single-threaded test, so we (1) register a
+// fake waiter, (2) drive the real `FUTEX_REQUEUE` syscall to move it, (3)
+// assert the move + the recorded destination, then (4) replay the cleanup's
+// key-selection (`FUTEX_REQUEUE_DEST.remove((pid,tid)).unwrap_or(uaddr)`) and
+// assert it removes the orphan from the uaddr2 bucket and leaves no leak.
+//
+// Ref: futex(2) FUTEX_REQUEUE / FUTEX_CMP_REQUEUE (q->key = key2 invariant).
+fn test_futex_requeue_dest_tracking() -> bool {
+    use crate::syscall::{FUTEX_WAITERS, FUTEX_REQUEUE_DEST};
+    test_header!("futex REQUEUE destination tracking (orphan-free timeout)");
+
+    // Use the CURRENT pid (the requeue syscall keys on current_pid_lockless).
+    let pid = crate::proc::current_pid_lockless();
+    // Two distinct user words; values 0 so FUTEX_CMP_REQUEUE val3=0 passes.
+    let uaddr1: u32 = 0;
+    let uaddr2: u32 = 0;
+    let a1 = &uaddr1 as *const u32 as u64;
+    let a2 = &uaddr2 as *const u32 as u64;
+    // Synthetic waiter TID that collides with no live thread.
+    let fake_tid: u64 = 0xF00D_5678;
+
+    // Clean slate for these keys (a prior failed run could leak).
+    {
+        let mut w = FUTEX_WAITERS.lock();
+        w.remove(&(pid, a1));
+        w.remove(&(pid, a2));
+        FUTEX_REQUEUE_DEST.lock().remove(&(pid, fake_tid));
+    }
+
+    // Step 1: register a fake waiter on uaddr1.
+    FUTEX_WAITERS.lock().entry((pid, a1))
+        .or_insert_with(alloc::vec::Vec::new).push(fake_tid);
+    test_println!("  registered fake waiter tid={:#x} on uaddr1", fake_tid);
+
+    // Step 2: FUTEX_REQUEUE (op=3): wake 0, requeue up to 1 to uaddr2.
+    let r = unsafe {
+        crate::syscall::dispatch_linux_kernel(
+            202, a1, 3, /*val=wake*/0, /*val2=requeue*/1, a2, 0)
+    };
+    if r != 0 {
+        FUTEX_WAITERS.lock().remove(&(pid, a1));
+        FUTEX_WAITERS.lock().remove(&(pid, a2));
+        FUTEX_REQUEUE_DEST.lock().remove(&(pid, fake_tid));
+        test_fail!("futex_requeue_dest", "REQUEUE returned {} (expected 0 woken)", r);
+        return false;
+    }
+
+    // Step 3a: the waiter must have MOVED — gone from uaddr1, present at uaddr2.
+    let in_a1 = FUTEX_WAITERS.lock().get(&(pid, a1)).map(|v| v.contains(&fake_tid)).unwrap_or(false);
+    let in_a2 = FUTEX_WAITERS.lock().get(&(pid, a2)).map(|v| v.contains(&fake_tid)).unwrap_or(false);
+    if in_a1 || !in_a2 {
+        FUTEX_WAITERS.lock().remove(&(pid, a1));
+        FUTEX_WAITERS.lock().remove(&(pid, a2));
+        FUTEX_REQUEUE_DEST.lock().remove(&(pid, fake_tid));
+        test_fail!("futex_requeue_dest",
+            "after requeue: in_uaddr1={} in_uaddr2={} (expected false/true)", in_a1, in_a2);
+        return false;
+    }
+    test_println!("  waiter moved uaddr1→uaddr2 ✓");
+
+    // Step 3b: the destination must be recorded so the WAIT cleanup scans uaddr2.
+    let recorded = FUTEX_REQUEUE_DEST.lock().get(&(pid, fake_tid)).copied();
+    if recorded != Some(a2) {
+        FUTEX_WAITERS.lock().remove(&(pid, a2));
+        FUTEX_REQUEUE_DEST.lock().remove(&(pid, fake_tid));
+        test_fail!("futex_requeue_dest",
+            "FUTEX_REQUEUE_DEST[(pid,tid)]={:#x?} (expected {:#x})", recorded, a2);
+        return false;
+    }
+    test_println!("  destination recorded: (pid,tid)→uaddr2 ✓ (gap #3)");
+
+    // Step 4: replay the WAIT-branch timeout cleanup's bucket selection EXACTLY:
+    //   dest = FUTEX_REQUEUE_DEST.remove((pid,tid)); key = dest.unwrap_or(uaddr1)
+    // and remove the TID from that bucket.  Pre-fix this used uaddr1 and would
+    // leave the orphan in uaddr2 + misreport timeout as a wake.
+    let timed_out;
+    {
+        let mut waiters = FUTEX_WAITERS.lock();
+        let dest = FUTEX_REQUEUE_DEST.lock().remove(&(pid, fake_tid));
+        let key = (pid, dest.unwrap_or(a1));
+        if let Some(list) = waiters.get_mut(&key) {
+            let before = list.len();
+            list.retain(|&t| t != fake_tid);
+            timed_out = list.len() < before;
+            if list.is_empty() { waiters.remove(&key); }
+        } else {
+            timed_out = false;
+        }
+    }
+    if !timed_out {
+        FUTEX_WAITERS.lock().remove(&(pid, a2));
+        test_fail!("futex_requeue_dest",
+            "cleanup scanned the wrong bucket — orphan would survive (timed_out=false)");
+        return false;
+    }
+
+    // Step 5: no orphan left anywhere, dest map cleaned.
+    let leak_a1 = FUTEX_WAITERS.lock().contains_key(&(pid, a1));
+    let leak_a2 = FUTEX_WAITERS.lock().contains_key(&(pid, a2));
+    let leak_dest = FUTEX_REQUEUE_DEST.lock().contains_key(&(pid, fake_tid));
+    if leak_a1 || leak_a2 || leak_dest {
+        FUTEX_WAITERS.lock().remove(&(pid, a1));
+        FUTEX_WAITERS.lock().remove(&(pid, a2));
+        FUTEX_REQUEUE_DEST.lock().remove(&(pid, fake_tid));
+        test_fail!("futex_requeue_dest",
+            "leak after cleanup: a1={} a2={} dest={}", leak_a1, leak_a2, leak_dest);
+        return false;
+    }
+    test_println!("  timeout cleanup removed the orphan from uaddr2, no leak ✓");
+
+    test_pass!("futex REQUEUE destination tracking");
     true
 }
 
