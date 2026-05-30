@@ -382,6 +382,8 @@ pub fn run() -> ! {
     total += 1;
     if test_ext2_read_coalesce() { passed += 1; }
     total += 1;
+    if test_ext2_read_device_error_not_eof() { passed += 1; }
+    total += 1;
     if test_ext2_readdir_noncontig() { passed += 1; }
     total += 1;
     if test_ext2_trunc_shrink() { passed += 1; }
@@ -5985,6 +5987,245 @@ fn test_ext2_read_coalesce() -> bool {
     }
 
     test_pass!("EXT2-READ-COALESCE");
+    true
+}
+
+// ── EXT2-READERR: a device read error during a covering read is NOT EOF ──
+//
+// Regression guard for the page-cache corruption class where a transient
+// block-device read error in the MIDDLE of a multi-block file read was
+// silently collapsed into a short return indistinguishable from a genuine
+// end-of-file / sparse-hole short read.  The bulk prepopulate path
+// (`mm::cache::prepopulate_file`) then zero-filled the unread tail and
+// installed all-zero pages into the page cache as authoritative file
+// contents — corrupting (for example) the tail code pages of a shared
+// library so the dynamic loader executed against a zeroed instruction page.
+//
+// The POSIX invariant (read(2): a read interrupted by an error "shall
+// return -1") and the page-cache filler contract (an I/O error must NOT
+// produce an up-to-date zero page; the page is left absent so a later
+// access re-reads) require that a device error during a covering read be
+// DISTINGUISHABLE from EOF.  Concretely for our VFS `read`:
+//
+//   * a read that ends because it reached i_size (EOF) or filled the buffer
+//     returns `Ok(n)` (a genuine short read is permitted);
+//   * a read whose underlying device I/O FAILS before the covering range is
+//     satisfied returns `Err(..)` — it MUST NOT return `Ok(partial)`.
+//
+// A genuine sparse hole (resolve_block == 0) is the ONLY legitimate
+// zero-fill and is exercised by EXT2-READ-COALESCE.
+
+/// Arc-sharing block-device shim: lets a test retain a handle to the in-memory
+/// image while also handing a `Box<dyn BlockDevice>` to `Ext2Fs::new`.
+struct ArcDevShim(alloc::sync::Arc<crate::drivers::block::MutableMemoryBlockDevice>);
+impl crate::drivers::block::BlockDevice for ArcDevShim {
+    fn sector_count(&self) -> u64 {
+        self.0.sector_count()
+    }
+    fn read_sectors(
+        &self,
+        lba: u64,
+        count: u32,
+        buf: &mut [u8],
+    ) -> Result<(), crate::drivers::block::BlockError> {
+        self.0.read_sectors(lba, count, buf)
+    }
+    fn write_sectors(
+        &self,
+        lba: u64,
+        count: u32,
+        data: &[u8],
+    ) -> Result<(), crate::drivers::block::BlockError> {
+        self.0.write_sectors(lba, count, data)
+    }
+}
+
+/// A block device that returns `IoError` for any read overlapping an armed
+/// sector window.  Arming modes:
+///   * `u32::MAX` remaining — the window always errors (hard device fault);
+///   * `n` remaining — the window errors for the first `n` reads that touch it,
+///     then succeeds (models a retryable queue-full / timeout that the FS read
+///     path must NOT mistake for EOF).
+struct FaultInjectBlockDevice {
+    inner: alloc::sync::Arc<crate::drivers::block::MutableMemoryBlockDevice>,
+    fault_lo: u64,
+    fault_hi: u64,
+    remaining: core::sync::atomic::AtomicU32,
+}
+
+impl FaultInjectBlockDevice {
+    fn overlaps(&self, lba: u64, count: u32) -> bool {
+        lba < self.fault_hi && lba + count as u64 > self.fault_lo
+    }
+}
+
+impl crate::drivers::block::BlockDevice for FaultInjectBlockDevice {
+    fn sector_count(&self) -> u64 {
+        self.inner.sector_count()
+    }
+    fn read_sectors(
+        &self,
+        lba: u64,
+        count: u32,
+        buf: &mut [u8],
+    ) -> Result<(), crate::drivers::block::BlockError> {
+        use core::sync::atomic::Ordering;
+        if self.overlaps(lba, count) {
+            loop {
+                let cur = self.remaining.load(Ordering::Acquire);
+                if cur == 0 {
+                    break; // exhausted: fall through to a real read
+                }
+                let next = if cur == u32::MAX { u32::MAX } else { cur - 1 };
+                if self
+                    .remaining
+                    .compare_exchange(cur, next, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return Err(crate::drivers::block::BlockError::IoError);
+                }
+            }
+        }
+        self.inner.read_sectors(lba, count, buf)
+    }
+    fn write_sectors(
+        &self,
+        lba: u64,
+        count: u32,
+        data: &[u8],
+    ) -> Result<(), crate::drivers::block::BlockError> {
+        self.inner.write_sectors(lba, count, data)
+    }
+}
+
+fn test_ext2_read_device_error_not_eof() -> bool {
+    test_header!("EXT2-READERR: device read error mid-file returns Err, never silent zero-EOF");
+    use crate::drivers::block::MutableMemoryBlockDevice;
+    use crate::vfs::ext2::Ext2Fs;
+    use crate::vfs::FileSystemOps;
+
+    // An 8 KiB (8 × 1 KiB blocks) contiguous file on inode 11.  mke2fs-style
+    // sequential allocation makes the 8 blocks physically contiguous, so a
+    // whole-file read takes the coalescing fast path — exactly the
+    // shared-library load shape.
+    let payload: alloc::vec::Vec<u8> =
+        (0..8 * 1024u32).map(|i| ((i * 31 + 7) & 0xFF) as u8).collect();
+
+    // Build the fixture once: write the file through a shared-Arc device, then
+    // snapshot the resulting on-disk image so every sub-case re-mounts the same
+    // bytes (behind a clean device or a fault injector).
+    let backing = alloc::sync::Arc::new(MutableMemoryBlockDevice::new(build_ext2_test_image()));
+    {
+        let fs = Ext2Fs::new(alloc::boxed::Box::new(ArcDevShim(backing.clone())))
+            .expect("clean mount for fixture");
+        if fs.write(11, 0, &payload).expect("write 8K") != payload.len() {
+            test_fail!("EXT2-READERR", "short write building fixture");
+            return false;
+        }
+    }
+    let clean_img = backing.snapshot();
+
+    // Resolve the file's TAIL block (logical block 7) to its physical sectors.
+    let (tail_lba, tail_sectors) = {
+        let dev = alloc::boxed::Box::new(MutableMemoryBlockDevice::new(clean_img.clone()));
+        let fs = Ext2Fs::new(dev).expect("remount clean for probe");
+        match fs.resolve_block_sectors_for_test(11, 7) {
+            Some(v) => v,
+            None => {
+                test_fail!("EXT2-READERR", "could not resolve tail block sectors");
+                return false;
+            }
+        }
+    };
+
+    // ── Case 1: persistent device fault on the tail block ────────────────────
+    // A whole-file read covers [0, 8 KiB).  The first 7 blocks read cleanly;
+    // the device errors on the 8th.  The covering read CANNOT be satisfied —
+    // `read` must return Err, NOT Ok(7168) (which the caller would treat as a
+    // benign EOF short read and zero-fill the tail into the page cache).
+    {
+        let dev = alloc::boxed::Box::new(FaultInjectBlockDevice {
+            inner: alloc::sync::Arc::new(MutableMemoryBlockDevice::new(clean_img.clone())),
+            fault_lo: tail_lba,
+            fault_hi: tail_lba + tail_sectors as u64,
+            remaining: core::sync::atomic::AtomicU32::new(u32::MAX),
+        });
+        let fs = Ext2Fs::new(dev).expect("mount behind fault injector");
+        let mut full = alloc::vec![0xEEu8; payload.len()];
+        match fs.read(11, 0, &mut full) {
+            Ok(n) => {
+                test_fail!(
+                    "EXT2-READERR",
+                    "covering read over a device error returned Ok({}) — a \
+                     silent partial indistinguishable from EOF; the tail would \
+                     be zero-installed into the page cache",
+                    n
+                );
+                return false;
+            }
+            Err(_) => { /* correct: a device error is not EOF */ }
+        }
+    }
+
+    // ── Case 2: transient fault that clears on retry ─────────────────────────
+    // A single-shot device error: the read path either surfaces Err (caller
+    // re-faults and retries) OR transparently retries to success.  Either way
+    // the bytes returned on a SUCCESSFUL read must be the real file bytes —
+    // never a zero tail.
+    {
+        let dev = alloc::boxed::Box::new(FaultInjectBlockDevice {
+            inner: alloc::sync::Arc::new(MutableMemoryBlockDevice::new(clean_img.clone())),
+            fault_lo: tail_lba,
+            fault_hi: tail_lba + tail_sectors as u64,
+            remaining: core::sync::atomic::AtomicU32::new(1),
+        });
+        let fs = Ext2Fs::new(dev).expect("mount behind transient fault injector");
+        let mut full = alloc::vec![0xEEu8; payload.len()];
+        match fs.read(11, 0, &mut full) {
+            Ok(n) => {
+                if n != payload.len() || full != payload {
+                    test_fail!(
+                        "EXT2-READERR",
+                        "transient fault: Ok({}) but contents diverge — a retry \
+                         path must yield the true bytes, never a zero tail",
+                        n
+                    );
+                    return false;
+                }
+            }
+            Err(_) => {
+                // The 1-shot fault is now spent; re-read must succeed with the
+                // true bytes (the caller's correct recovery is to re-fault).
+                let mut again = alloc::vec![0xEEu8; payload.len()];
+                let r = fs.read(11, 0, &mut again).expect("re-read after spent fault");
+                if r != payload.len() || again != payload {
+                    test_fail!("EXT2-READERR", "post-fault re-read mismatch (r={})", r);
+                    return false;
+                }
+            }
+        }
+    }
+
+    // ── Case 3: a genuine EOF short read still returns Ok ─────────────────────
+    // Reading past i_size must NOT regress to Err — only a DEVICE error does.
+    {
+        let dev = alloc::boxed::Box::new(MutableMemoryBlockDevice::new(clean_img.clone()));
+        let fs = Ext2Fs::new(dev).expect("mount clean for EOF case");
+        let mut over = alloc::vec![0u8; 16 * 1024];
+        let n = match fs.read(11, 0, &mut over) {
+            Ok(n) => n,
+            Err(_) => {
+                test_fail!("EXT2-READERR", "genuine EOF short read regressed to Err");
+                return false;
+            }
+        };
+        if n != payload.len() || over[..payload.len()] != payload[..] {
+            test_fail!("EXT2-READERR", "EOF short read wrong length/contents (n={})", n);
+            return false;
+        }
+    }
+
+    test_pass!("EXT2-READERR");
     true
 }
 
