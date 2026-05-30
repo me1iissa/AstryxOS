@@ -644,32 +644,89 @@ impl Ext2Fs {
     }
 
     /// Read file data from an inode.
+    ///
+    /// Physically-contiguous logical blocks are coalesced into a single
+    /// multi-sector block-device transfer.  This is the dominant latency cost
+    /// on the demand-fault / shared-library load path: a sequential read of an
+    /// N-page run (e.g. the dynamic loader walking a shared object's
+    /// PROT_READ|PROT_EXEC segment during relocation) that previously issued
+    /// one block-device request per filesystem block now issues one request per
+    /// physically-contiguous extent.  For a well-laid-out file the whole run is
+    /// a single extent, collapsing N round-trips into one — see mmap(2) /
+    /// madvise(2) MADV_SEQUENTIAL for the conceptual access pattern this
+    /// optimises.
+    ///
+    /// Behaviour is byte-for-byte identical to the per-block loop it replaces:
+    /// sparse blocks still read as zero, the result is still clamped to EOF
+    /// (`i_size`), and a block-device error still yields a short read.
     fn read_inode_data(&self, inode: &Ext2Inode, offset: u64, buf: &mut [u8]) -> usize {
         let file_size = inode.size as u64;
         if offset >= file_size { return 0; }
 
+        let bs = self.block_size as u64;
         let to_read = buf.len().min((file_size - offset) as usize);
-        let mut read_total = 0;
+        let mut read_total = 0usize;
+        // Bounce buffer for the unaligned head/tail of a transfer (a partial
+        // block at either edge that cannot be read straight into `buf`).
         let mut block_buf = alloc::vec![0u8; self.block_size];
 
         while read_total < to_read {
             let pos = offset + read_total as u64;
-            let block_idx = (pos / self.block_size as u64) as usize;
-            let off_in_block = (pos % self.block_size as u64) as usize;
+            let block_idx = (pos / bs) as usize;
+            let off_in_block = (pos % bs) as usize;
 
             let block_num = self.resolve_block(inode, block_idx);
+
+            // Sparse block (hole) — fill with zeros, no device I/O.
             if block_num == 0 {
-                // Sparse block — fill with zeros
                 let n = (self.block_size - off_in_block).min(to_read - read_total);
                 buf[read_total..read_total + n].fill(0);
                 read_total += n;
                 continue;
             }
 
+            // Fast path: a block-aligned position with at least one whole block
+            // left to read.  Greedily extend the run across physically
+            // contiguous blocks and issue ONE multi-sector device read straight
+            // into the caller's buffer (no bounce copy).  The run breaks at the
+            // first hole, the first non-contiguous block, or end-of-request.
+            if off_in_block == 0 && (to_read - read_total) >= self.block_size {
+                // Cap the coalesced run so the sector count fits the device
+                // request ABI (u16 sectors) with margin: 512 sectors = 256 KiB
+                // at 1 KiB blocks, comfortably larger than the 128 KiB
+                // demand-fault readahead window while staying well inside u16.
+                const MAX_RUN_SECTORS: usize = 512;
+                let sectors_per_block_usz = (self.block_size / 512).max(1);
+                let max_run_by_sectors = MAX_RUN_SECTORS / sectors_per_block_usz;
+                let max_whole_blocks =
+                    ((to_read - read_total) / self.block_size).min(max_run_by_sectors.max(1));
+                let mut run_blocks = 1usize;
+                while run_blocks < max_whole_blocks {
+                    let next = self.resolve_block(inode, block_idx + run_blocks);
+                    // Stop at a hole or a discontinuity; both are serviced by a
+                    // fresh iteration of the outer loop.
+                    if next == 0 || next != block_num + run_blocks as u32 {
+                        break;
+                    }
+                    run_blocks += 1;
+                }
+                let run_bytes = run_blocks * self.block_size;
+                let sectors_per_block = (self.block_size / 512) as u64;
+                let start_sector = block_num as u64 * sectors_per_block;
+                let sector_count = (run_blocks as u64 * sectors_per_block) as u16;
+                let dst = &mut buf[read_total..read_total + run_bytes];
+                if self.read_sectors_inner(start_sector, sector_count, dst).is_err() {
+                    break;
+                }
+                read_total += run_bytes;
+                continue;
+            }
+
+            // Slow path: unaligned head/tail — read one block through the
+            // bounce buffer and copy the overlapping window.
             if self.read_block(block_num, &mut block_buf).is_err() {
                 break;
             }
-
             let n = (self.block_size - off_in_block).min(to_read - read_total);
             buf[read_total..read_total + n].copy_from_slice(&block_buf[off_in_block..off_in_block + n]);
             read_total += n;

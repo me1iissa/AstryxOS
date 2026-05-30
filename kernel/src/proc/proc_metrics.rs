@@ -70,6 +70,13 @@ pub struct ProcessMetrics {
     pub disk_r_bytes: AtomicU64,
     pub disk_w_bytes: AtomicU64,
 
+    /// Count of distinct block-device read *requests* (one per `do_io` call).
+    /// Together with `disk_r_bytes` this exposes the read-batching efficiency:
+    /// for a fixed byte total, fewer requests means larger coalesced transfers
+    /// and fewer device round-trips — the metric that moves when the
+    /// demand-fault readahead coalesces contiguous blocks.
+    pub disk_r_reqs: AtomicU64,
+
     pub net_r_bytes: AtomicU64,
     pub net_w_bytes: AtomicU64,
 
@@ -97,6 +104,7 @@ impl ProcessMetrics {
             pf_count:     AtomicU64::new(0),
             disk_r_bytes: AtomicU64::new(0),
             disk_w_bytes: AtomicU64::new(0),
+            disk_r_reqs:  AtomicU64::new(0),
             net_r_bytes:  AtomicU64::new(0),
             net_w_bytes:  AtomicU64::new(0),
             last_sc_nr:   AtomicI32::new(-1),
@@ -115,6 +123,7 @@ impl ProcessMetrics {
         self.pf_count.store(0, Ordering::Relaxed);
         self.disk_r_bytes.store(0, Ordering::Relaxed);
         self.disk_w_bytes.store(0, Ordering::Relaxed);
+        self.disk_r_reqs.store(0, Ordering::Relaxed);
         self.net_r_bytes.store(0, Ordering::Relaxed);
         self.net_w_bytes.store(0, Ordering::Relaxed);
         self.last_sc_nr.store(-1, Ordering::Relaxed);
@@ -256,11 +265,13 @@ pub fn bump_page_fault(pid: Pid) {
     }
 }
 
-/// Bump disk-read byte counter.
+/// Bump disk-read byte counter and the per-request counter (one call per
+/// logical block-device read request, i.e. one `do_io`).
 #[inline]
 pub fn bump_disk_read(pid: Pid, bytes: u64) {
     if let Some(m) = lookup(pid) {
         m.disk_r_bytes.fetch_add(bytes, Ordering::Relaxed);
+        m.disk_r_reqs.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -308,6 +319,7 @@ pub struct MetricsSnap {
     pub pf_count: u64,
     pub disk_r_bytes: u64,
     pub disk_w_bytes: u64,
+    pub disk_r_reqs:  u64,
     pub net_r_bytes:  u64,
     pub net_w_bytes:  u64,
     pub last_sc_nr:   i32,
@@ -331,6 +343,7 @@ pub fn snapshot(pid: Pid) -> Option<MetricsSnap> {
         pf_count: m.pf_count.load(Ordering::Relaxed),
         disk_r_bytes: m.disk_r_bytes.load(Ordering::Relaxed),
         disk_w_bytes: m.disk_w_bytes.load(Ordering::Relaxed),
+        disk_r_reqs:  m.disk_r_reqs.load(Ordering::Relaxed),
         net_r_bytes:  m.net_r_bytes.load(Ordering::Relaxed),
         net_w_bytes:  m.net_w_bytes.load(Ordering::Relaxed),
         last_sc_nr:   m.last_sc_nr.load(Ordering::Relaxed),
@@ -430,12 +443,13 @@ fn emit_periodic(tick: u64) {
         };
 
         crate::serial_println!(
-            "[PROC-METRICS] tick={} pid={} name={} sc={} (vm={} file={} net={} sync={} proc={} sig={} other={}) pf={} disk=R{}/W{} net=R{}/W{}{}",
+            "[PROC-METRICS] tick={} pid={} name={} sc={} (vm={} file={} net={} sync={} proc={} sig={} other={}) pf={} disk=R{}/W{} rreq={} net=R{}/W{}{}",
             tick, pid, name, s.sc_total,
             s.sc_vm, s.sc_file, s.sc_net, s.sc_sync, s.sc_proc,
             s.sc_signal, s.sc_other,
             s.pf_count,
             s.disk_r_bytes, s.disk_w_bytes,
+            s.disk_r_reqs,
             s.net_r_bytes, s.net_w_bytes,
             stuck
         );
