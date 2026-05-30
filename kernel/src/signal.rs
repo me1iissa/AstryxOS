@@ -1812,6 +1812,19 @@ pub(crate) fn emit_fault_phys_diagnostic(
                     crate::mm::w215_diag::dump_free_shadow_for_phys(data_phys);
                     crate::mm::w215_diag::dump_alloc_shadow_for_phys(data_phys);
                     crate::mm::w215_diag::dump_prov_for_phys(data_phys);
+                    // GATE-A (2026-05-30) — if the faulting data address is in
+                    // the main-stack TOP window (the argv/envp/auxv block,
+                    // e.g. `cr2=0x7fff_fffe_fa38` for a zeroed `argv[1]`
+                    // pointer slot), scan the stack-prov rings for the writer
+                    // that stored into that frame and name its RIP.  This is
+                    // the trap-time mirror of the synchronous capture-time
+                    // `[STACK-PROV/ARGV-WRITER]` emit; together they
+                    // deterministically link the SIGSEGV to its out-of-band
+                    // writer.
+                    #[cfg(feature = "stack-prov")]
+                    if crate::mm::stack_prov::in_top_window(cr2_va) {
+                        crate::mm::stack_prov::dump_argv_writer_for_phys(data_phys);
+                    }
                 }
                 None => {
                     crate::serial_println!(
