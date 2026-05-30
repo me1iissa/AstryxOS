@@ -382,6 +382,8 @@ pub fn run() -> ! {
     total += 1;
     if test_ext2_read_coalesce() { passed += 1; }
     total += 1;
+    if test_ext2_readdir_noncontig() { passed += 1; }
+    total += 1;
     if test_ext2_trunc_shrink() { passed += 1; }
     total += 1;
     if test_ext2_trunc_grow_sparse() { passed += 1; }
@@ -5962,6 +5964,191 @@ fn test_ext2_read_coalesce() -> bool {
     }
 
     test_pass!("EXT2-READ-COALESCE");
+    true
+}
+
+// ── EXT2-READDIR-NONCONTIG: multi-block directory with NON-CONTIGUOUS blocks ──
+//
+// Regression test for the dropped-directory-entry class of bug.  A real-world
+// directory such as `/usr/lib` is large enough to span several data blocks,
+// and on a fragmented filesystem those blocks are NOT physically contiguous
+// (e.g. observed block numbers 3317, 71444, 82699 for one inode).  The
+// `read_inode_data` coalescing path must break the run at every discontinuity
+// and scatter each block into the correct buffer offset; a mis-detected run
+// boundary, a wrong scatter offset, or a short/stale read of any block would
+// silently drop the directory entries that live in the affected block, so a
+// linear `lookup` for a file in that block would return ENOENT even though the
+// on-disk entry is well-formed.
+//
+// The fixture pins inode 13 to three DELIBERATELY non-contiguous data blocks
+// (8, 20, 31 — group-0 usable data range is 8..31) each fully populated with
+// well-formed ext2 directory entries (ext2 spec §3, linked dir entries).  The
+// test asserts that:
+//   * `readdir(13)` returns EVERY entry from all three blocks,
+//   * `lookup(13, name)` succeeds for a name living in the LAST (third,
+//     highest-numbered, most-fragmented) block,
+//   * the result is stable across many repeated reads — the original bug was
+//     FLAKY (a transient short/stale read), so a single read could pass by
+//     luck; repeating it raises the odds of catching a non-deterministic drop.
+fn test_ext2_readdir_noncontig() -> bool {
+    test_header!("EXT2-READDIR-NONCONTIG: 3 non-contiguous dir blocks, every entry returned");
+    use crate::vfs::FileSystemOps;
+    use ext2_test_image::*;
+
+    // 6 entries per block keeps each entry well under 1 KiB and lets the last
+    // entry's rec_len pad out to the block boundary, exactly like mke2fs.
+    const ENTRIES_PER_BLOCK: usize = 6;
+    // Non-contiguous physical blocks within group 0's usable data range.
+    const DIR_BLOCKS: [u32; 3] = [8, 20, 31];
+
+    // Build a base image and graft a 3-block directory (inode 13) onto it
+    // with manually-fragmented block pointers.
+    let mut img = build_ext2_test_image();
+
+    // Encode one directory block: ENTRIES_PER_BLOCK entries, the last padded
+    // to the block boundary. Entry inode is `base_ino + i` (any in-range,
+    // non-zero inode number is fine for lookup/readdir).
+    let encode_block = |buf: &mut [u8], names: &[&str], base_ino: u32| {
+        // Fixed rec_len for all but the last entry; the last absorbs the slack.
+        let slot = (BLOCK_SIZE / ENTRIES_PER_BLOCK) & !3usize; // 4-byte aligned
+        let mut off = 0usize;
+        for (i, name) in names.iter().enumerate() {
+            let is_last = i == names.len() - 1;
+            let rec_len = if is_last { BLOCK_SIZE - off } else { slot };
+            let ino = base_ino + i as u32;
+            buf[off..off + 4].copy_from_slice(&ino.to_le_bytes());
+            buf[off + 4..off + 6].copy_from_slice(&(rec_len as u16).to_le_bytes());
+            buf[off + 6] = name.len() as u8;
+            buf[off + 7] = 1; // file_type = regular file
+            buf[off + 8..off + 8 + name.len()].copy_from_slice(name.as_bytes());
+            off += rec_len;
+        }
+    };
+
+    // The 18 entry names, grouped per block.  The target lookup name lives in
+    // the third (most-fragmented) block.
+    let block_names: [[&str; ENTRIES_PER_BLOCK]; 3] = [
+        ["libc.so.6", "libm.so.6", "libdl.so.2", "librt.so.1", "libpthread.so", "libz.so.1"],
+        ["libstdc++.so", "libgcc_s.so.1", "libffi.so.8", "libpcre.so.3", "libexpat.so", "libpng16.so"],
+        ["libfreetype.so", "libfontconfig.so", "libbsd.so.0", "libGL.so.1", "libX11.so.6", "libxcb.so.1"],
+    ];
+
+    // Entry inode numbers must stay within the image's inode count
+    // (TOTAL_INODES = 48) — the parser's corruption guard rejects any entry
+    // whose inode exceeds `inodes_count`.  Base each block at 14 / 26 / 38 so
+    // the 6 entries per block (e.g. 38..43) never exceed 48.
+    for (bi, &phys) in DIR_BLOCKS.iter().enumerate() {
+        let blk_off = (phys as usize) * BLOCK_SIZE;
+        let names: alloc::vec::Vec<&str> = block_names[bi].iter().copied().collect();
+        encode_block(&mut img[blk_off..blk_off + BLOCK_SIZE], &names, 14 + (bi as u32) * 12);
+        // Mark the data block used in group 0's block bitmap.
+        let bm_off = (G0_BLOCK_BITMAP as usize) * BLOCK_SIZE;
+        img[bm_off + (phys / 8) as usize] |= 1 << (phys % 8);
+    }
+
+    // Inode 13: a directory of size 3 blocks pointing at the fragmented blocks.
+    {
+        use crate::vfs::ext2::Ext2Inode;
+        let it_byte = (G0_INODE_TABLE as usize) * BLOCK_SIZE;
+        let mut block = [0u32; 15];
+        block[0] = DIR_BLOCKS[0];
+        block[1] = DIR_BLOCKS[1];
+        block[2] = DIR_BLOCKS[2];
+        let dir = Ext2Inode {
+            mode: 0x4000 | 0o755, // S_IFDIR | 0755
+            uid: 0, size: (3 * BLOCK_SIZE) as u32,
+            atime: 0, ctime: 0, mtime: 0, dtime: 0,
+            gid: 0, links_count: 2,
+            blocks: (3 * BLOCK_SIZE / 512) as u32,
+            flags: 0, osd1: 0,
+            block,
+            generation: 0, file_acl: 0, dir_acl: 0, faddr: 0,
+            osd2: [0; 12],
+        };
+        unsafe {
+            core::ptr::write_unaligned(
+                img[it_byte + 12 * 128..].as_mut_ptr() as *mut Ext2Inode, dir);
+        }
+        // Mark inode 13 used (bit 12 in group 0's inode bitmap).
+        let ibm_off = (G0_INODE_BITMAP as usize) * BLOCK_SIZE;
+        img[ibm_off + (12 / 8)] |= 1 << (12 % 8);
+    }
+
+    // Mount the grafted image through the production dispatch path.
+    let fs = {
+        use crate::drivers::block::MutableMemoryBlockDevice;
+        use crate::vfs::ext2::Ext2Fs;
+        let dev = alloc::boxed::Box::new(MutableMemoryBlockDevice::new(img));
+        match Ext2Fs::new(dev) {
+            Some(fs) => alloc::sync::Arc::new(fs),
+            None => { test_fail!("EXT2-READDIR-NONCONTIG", "mount failed"); return false; }
+        }
+    };
+
+    // Collect the full set of expected names.
+    let mut expected: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+    for row in block_names.iter() { for n in row.iter() { expected.push(n); } }
+
+    // Repeat the readdir + lookup many times — the original fault was a
+    // transient (flaky) dropped entry, so a single pass could pass by luck.
+    const REPEATS: usize = 64;
+    for pass in 0..REPEATS {
+        // (1) readdir must return ALL 18 entries every time.
+        let listing = match fs.readdir(13) {
+            Ok(v) => v,
+            Err(e) => { test_fail!("EXT2-READDIR-NONCONTIG", "readdir err {:?} (pass {})", e, pass); return false; }
+        };
+        if listing.len() != expected.len() {
+            test_fail!("EXT2-READDIR-NONCONTIG",
+                "readdir returned {} entries, want {} (pass {}) — a block was dropped",
+                listing.len(), expected.len(), pass);
+            return false;
+        }
+        for want in expected.iter() {
+            if !listing.iter().any(|(name, _, _)| name == want) {
+                test_fail!("EXT2-READDIR-NONCONTIG",
+                    "readdir missing '{}' (pass {}) — entry dropped from a block", want, pass);
+                return false;
+            }
+        }
+        // (2) lookup must resolve a name living in the LAST (most-fragmented,
+        // highest-numbered) block — this is the entry the dropped-block bug
+        // would lose.  `libGL.so.1` is in DIR_BLOCKS[2] (block 31).  The first
+        // pass populates the dentry cache; later passes hit it, but the
+        // 64 `readdir` re-scans above keep the linear read path exercised.
+        match fs.lookup(13, "libGL.so.1") {
+            Ok(ino) if ino != 0 => {}
+            Ok(_) => { test_fail!("EXT2-READDIR-NONCONTIG", "lookup libGL.so.1 -> inode 0 (pass {})", pass); return false; }
+            Err(e) => { test_fail!("EXT2-READDIR-NONCONTIG", "lookup libGL.so.1 ENOENT {:?} (pass {}) — third-block entry dropped", e, pass); return false; }
+        }
+    }
+
+    // Cross-check the parsed entry list against a raw whole-directory read so a
+    // future short/stale multi-block read is caught even if the parser were to
+    // mask it: `read` must return the full 3 blocks and every block header must
+    // be intact (the bug under test manifested as a silently-truncated read).
+    let mut raw = alloc::vec![0u8; 3 * BLOCK_SIZE];
+    let got = fs.read(13, 0, &mut raw).unwrap_or(0);
+    if got != 3 * BLOCK_SIZE {
+        test_fail!("EXT2-READDIR-NONCONTIG",
+            "raw read(13) returned {} bytes, want {} — multi-block read short", got, 3 * BLOCK_SIZE);
+        return false;
+    }
+    // Each of the 3 blocks must begin with its first entry's header intact
+    // (non-zero inode, valid rec_len) — a stale/zeroed block would fail here.
+    for (bi, base_ino) in [14u32, 26, 38].iter().enumerate() {
+        let b = bi * BLOCK_SIZE;
+        let ino = u32::from_le_bytes([raw[b], raw[b+1], raw[b+2], raw[b+3]]);
+        let rec = u16::from_le_bytes([raw[b+4], raw[b+5]]);
+        if ino != *base_ino || rec < 12 {
+            test_fail!("EXT2-READDIR-NONCONTIG",
+                "block {} header corrupt: ino={} (want {}) rec_len={} — block read stale/short",
+                bi, ino, base_ino, rec);
+            return false;
+        }
+    }
+
+    test_pass!("EXT2-READDIR-NONCONTIG");
     true
 }
 
