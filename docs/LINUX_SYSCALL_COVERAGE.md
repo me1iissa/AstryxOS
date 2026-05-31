@@ -147,7 +147,7 @@ Ranked by frequency in real program traces. Syscalls that would most unblock rea
 | 22 | `pipe` | Full |
 | 23 | `select` | Implemented; fd_set bitmask, X11 pump, yielding |
 | 24 | `sched_yield` | Full |
-| 25 | `mremap` | Full; shrink, grow in-place, MREMAP_MAYMOVE |
+| 25 | `mremap` | Full; shrink, non-destructive in-place grow (MAP_FIXED_NOREPLACE), MREMAP_MAYMOVE relocate |
 | 28 | `madvise` | Partial; MADV_DONTNEED/FREE frees pages; others no-op |
 | 29 | `shmget` | Full; SysV SHM |
 | 30 | `shmat` | Full |

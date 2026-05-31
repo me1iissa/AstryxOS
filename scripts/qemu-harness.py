@@ -312,6 +312,27 @@ class GdbClient:
         resp = self.send(f"z0,{addr:x},1")
         return resp == "OK"
 
+    # ── hardware watchpoints (Z2/Z3/Z4 packets) ──────────────────────────────
+    #
+    # GDB remote-protocol watchpoint kinds (see the GDB Remote Serial Protocol
+    # "Z/z packets" spec): Z2 = write watchpoint, Z3 = read watchpoint,
+    # Z4 = access (read|write) watchpoint.  QEMU's gdbstub maps these onto the
+    # x86 debug registers (DR0..DR3 + DR7) so they fire on the EXACT store that
+    # touches the watched bytes — this is what lets us name an out-of-band
+    # writer without polluting the kernel with a probe.
+
+    def set_watch(self, addr: int, length: int = 8, kind: str = "write") -> bool:
+        """Arm a hardware watchpoint via Z2/Z3/Z4.  Returns True on stub ack."""
+        z = {"write": "Z2", "read": "Z3", "access": "Z4"}.get(kind, "Z2")
+        resp = self.send(f"{z},{addr:x},{length:x}")
+        return resp == "OK"
+
+    def del_watch(self, addr: int, length: int = 8, kind: str = "write") -> bool:
+        """Remove a hardware watchpoint via z2/z3/z4."""
+        z = {"write": "z2", "read": "z3", "access": "z4"}.get(kind, "z2")
+        resp = self.send(f"{z},{addr:x},{length:x}")
+        return resp == "OK"
+
     def vcont_step(self) -> str:
         """Single-step via vCont;s. Returns stop-reply payload."""
         # First check vCont is supported
@@ -4032,6 +4053,122 @@ def cmd_cont(args):
         gdb.close()
 
     _out({"ok": True, "note": "kernel running", "reply": resp})
+
+
+def cmd_watch(args):
+    """
+    Arm a HARDWARE write watchpoint on a guest VA, resume, and capture the
+    EXACT store that writes to it — naming the writer RIP + register context
+    and classifying it kernel-mode vs user-mode.
+
+    This is the "name the out-of-band writer" tool: the legitimate kernel
+    argv-build store happens before the watch is armed (we arm at a chosen
+    break-point, after the stack is built), so the FIRST fire after arming is
+    the offending later store.  Use --skip N to let the first N fires pass
+    (e.g. if a legitimate write to the slot precedes the corrupting one).
+
+    Contract: session started with --gdb-port.  One-shot JSON on stdout.
+    """
+    sess = _load_session(args.sid)
+    port = _get_gdb_port(sess)
+
+    try:
+        addr = int(args.addr, 0)
+    except ValueError:
+        _err(f"Invalid watch address: {args.addr}")
+
+    length = args.length
+    kind   = args.kind
+    skip   = max(0, args.skip)
+    timeout_s = args.timeout_ms / 1000.0
+
+    gdb = GdbClient("127.0.0.1", port)
+    if not gdb.connect():
+        _err(f"Cannot connect to GDB stub on port {port} (tried {port}..{port+4})")
+
+    fires = []
+    armed = False
+    try:
+        # If the caller wants us to break at a symbol/addr first (so the watch
+        # is armed only after the stack region is mapped), honour --break.
+        if getattr(args, "brk", None):
+            try:
+                brk_addr = int(args.brk, 0)
+            except ValueError:
+                # Try resolving as a kernel symbol.
+                r = _resolve_symbol(_get_kernel_elf(), args.brk)
+                brk_addr = int(r["address"], 0) if r and r.get("address") else None
+            if brk_addr is not None:
+                gdb.set_bp(brk_addr)
+                gdb.cont_no_wait()
+                gdb.wait_for_stop(timeout_s)
+                gdb.del_bp(brk_addr)
+
+        armed = gdb.set_watch(addr, length, kind)
+        if not armed:
+            _out({"ok": False, "error": f"stub rejected watchpoint Z@{hex(addr)} "
+                                        f"(len={length},kind={kind}) — DRs exhausted?"})
+            return
+
+        hit_count = 0
+        # We allow (skip + 1) fires total; the (skip+1)-th is the one we report.
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            gdb.cont_no_wait()
+            stop = gdb.wait_for_stop(max(1.0, deadline - time.monotonic()))
+            if stop is None:
+                break  # timed out with no fire
+            hit_count += 1
+            try:
+                regs = gdb.read_regs()
+            except Exception:
+                regs = {}
+            rip = int(regs.get("rip", "0x0"), 0)
+            # x86-64 canonical kernel half-space: high bit set (0xffff8.. and up).
+            is_kernel = rip >= 0xFFFF_8000_0000_0000
+            # Read the watched slot's current value + the instruction bytes at RIP.
+            try:
+                slot_val = gdb.read_mem(addr, length).hex()
+            except Exception:
+                slot_val = None
+            try:
+                code = gdb.read_mem(rip, 16).hex()
+            except Exception:
+                code = None
+            fire = {
+                "fire_index": hit_count,
+                "rip":        hex(rip),
+                "mode":       "kernel" if is_kernel else "user",
+                "slot_now":   slot_val,
+                "code_at_rip": code,
+                "regs":       regs,
+            }
+            fires.append(fire)
+            if hit_count > skip:
+                break  # this is the fire we care about
+
+        # Disarm before returning so we don't leave a DR busy for the next run.
+        try:
+            gdb.del_watch(addr, length, kind)
+        except Exception:
+            pass
+    except Exception as e:
+        _err(f"GDB watch error: {e}")
+    finally:
+        gdb.close()
+
+    reported = fires[skip] if len(fires) > skip else (fires[-1] if fires else None)
+    _out({
+        "ok":        True,
+        "watch_addr": hex(addr),
+        "length":    length,
+        "kind":      kind,
+        "skip":      skip,
+        "armed":     armed,
+        "fire_count": len(fires),
+        "writer":    reported,
+        "all_fires": fires,
+    })
 
 
 def cmd_pause(args):
@@ -9661,6 +9798,27 @@ def main():
     p_cont = sub.add_parser("cont", help="[Tier2] Continue execution via GDB vCont;c")
     p_cont.add_argument("sid")
 
+    # watch — hardware write watchpoint; names the out-of-band writer
+    p_watch = sub.add_parser(
+        "watch",
+        help="[Tier2] Arm a HW write watchpoint on a VA, resume, and capture "
+             "the exact store that writes it (writer RIP + kernel/user mode "
+             "+ register context). Names out-of-band stack-slot writers.")
+    p_watch.add_argument("sid")
+    p_watch.add_argument("addr", help="Guest VA to watch (hex or decimal)")
+    p_watch.add_argument("--length", type=int, default=8,
+                          help="Watch width in bytes (default 8)")
+    p_watch.add_argument("--kind", choices=["write", "read", "access"],
+                          default="write", help="Watchpoint kind (default write)")
+    p_watch.add_argument("--skip", type=int, default=0,
+                          help="Let the first N fires pass before reporting "
+                               "(e.g. skip the legitimate argv-build store)")
+    p_watch.add_argument("--break", dest="brk", default=None,
+                          help="Break at this symbol/addr FIRST (so the watch "
+                               "is armed only after the stack is mapped)")
+    p_watch.add_argument("--timeout-ms", type=int, default=120000,
+                          help="Overall budget for catching the writer")
+
     # pause
     p_pause = sub.add_parser("pause", help="[Tier2] Pause QEMU via QMP stop")
     p_pause.add_argument("sid")
@@ -10369,6 +10527,7 @@ def main():
         "bp":     cmd_bp,
         "step":   cmd_step,
         "cont":   cmd_cont,
+        "watch":  cmd_watch,
         "pause":  cmd_pause,
         "resume": cmd_resume,
         "autopsy": cmd_autopsy,

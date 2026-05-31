@@ -5553,6 +5553,17 @@ fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64, new_addr:
     if new_size == 0 { return -22; } // EINVAL
     const MREMAP_MAYMOVE: u64 = 1;
     const MREMAP_FIXED:   u64 = 2;
+    // MAP_FIXED_NOREPLACE (Linux 4.17+) — non-destructive fixed placement:
+    // sys_mmap returns EEXIST (-17) instead of clobbering an existing VMA.
+    // The in-place mremap grow MUST be non-destructive: per mremap(2), if the
+    // region just past the old mapping is not free the in-place expansion
+    // fails (and MREMAP_MAYMOVE then relocates) — it must NEVER overwrite an
+    // adjacent mapping.  Using plain MAP_FIXED here corrupted whatever sat at
+    // `old_addr+old_size`; when that was the top initial-stack page (argc/argv
+    // per System V x86-64 psABI §3.4.1) it erased the command line, surfacing
+    // as the upstream `argv[1]==NULL` crash.  Ref: man7 mremap(2), mmap(2)
+    // (MAP_FIXED_NOREPLACE).
+    const MAP_FIXED_NOREPLACE: u32 = 0x0010_0000;
 
     // Shrink: munmap the tail and return the same address.
     if new_size <= old_size {
@@ -5567,13 +5578,18 @@ fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64, new_addr:
     let ext_addr = old_addr + old_size;
 
     if flags & MREMAP_FIXED == 0 {
-        // Attempt in-place: MAP_FIXED at the adjacent address.
+        // Attempt in-place: NON-DESTRUCTIVE fixed placement at the adjacent
+        // address.  MAP_FIXED_NOREPLACE returns EEXIST (-17) if that range is
+        // already mapped, so an occupied neighbour (e.g. the initial stack)
+        // is left intact and we fall through to the move path below — exactly
+        // the mremap(2) contract.  (Previously this used plain MAP_FIXED,
+        // which clobbered the neighbour.)
         let r = crate::syscall::sys_mmap(ext_addr, ext_size, 0x3 /*PROT_READ|PROT_WRITE*/,
-            MAP_ANONYMOUS | MAP_FIXED, u64::MAX, 0);
+            MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, u64::MAX, 0);
         if r == ext_addr as i64 {
-            return old_addr as i64; // grown in place
+            return old_addr as i64; // grown in place (range was free)
         }
-        // In-place failed; move if allowed.
+        // In-place failed (range occupied → EEXIST, or other error); move if allowed.
         if flags & MREMAP_MAYMOVE != 0 {
             let dest = crate::syscall::sys_mmap(0, new_size, 0x3, MAP_ANONYMOUS, u64::MAX, 0);
             if dest < 0 { return -12; } // ENOMEM
