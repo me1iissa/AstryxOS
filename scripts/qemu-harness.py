@@ -30,6 +30,7 @@ Tier 1 — session management:
     python3 scripts/qemu-harness.py start [--features FLAGS] [--no-build]
                                           [--gdb-port PORT] [--gdb-wait]
                                           [--firefox-variant musl|glibc]
+                                          [--snapshottable]
     python3 scripts/qemu-harness.py stop <sid>
     python3 scripts/qemu-harness.py list
     python3 scripts/qemu-harness.py wait <sid> <regex> [--ms MS]
@@ -39,6 +40,23 @@ Tier 1 — session management:
     python3 scripts/qemu-harness.py status <sid>
     python3 scripts/qemu-harness.py events <sid> [--tail N] [--follow]
     python3 scripts/qemu-harness.py snap <sid> save|load <name>
+    python3 scripts/qemu-harness.py snap-gate <sid> save <name>
+    python3 scripts/qemu-harness.py snap-gate load <name>
+    python3 scripts/qemu-harness.py snap-gate list
+        Live VM snapshot/restore that PRESERVES a running guest (e.g. a deep
+        Firefox boot) across save/load — collapses a 30-50min FF-boot-to-gate
+        into a sub-second loadvm. Requires `start --snapshottable` (the
+        savevm-compatible device topology: read-only fat:ro vvfat boot disk on
+        a virtio-blk-pci frontend, qcow2 OVMF_VARS pflash, an orphan qcow2
+        vmstate device + a persistent qcow2 data overlay backed read-only by
+        the shared data.img). `save` does QMP stop->savevm->cont and records a
+        manifest entry (name -> {sid, gate, max_sc, features, ts, qcow2 paths})
+        under ~/.astryx-harness/snapshots/. `load` spawns a NEW session with
+        the same topology + loadvm and prints its sid, so grep/wait/kdb/
+        ff-progress work against the restored VM. Stop the origin session
+        before `load` (load reuses the saved qcow2 files in place). The default
+        `snap` subcommand (above) cannot preserve FF state — the writable
+        vvfat boot disk blocks savevm; snap-gate is the FF-capable replacement.
     python3 scripts/qemu-harness.py prune [--ttl DAYS]
     python3 scripts/qemu-harness.py results <sid>
     python3 scripts/qemu-harness.py ff-progress <sid>
@@ -118,6 +136,7 @@ ABI-conformance reference (delegates to scripts/strace-ref.py):
 """
 
 import argparse
+import datetime
 import json
 import os
 import re
@@ -687,6 +706,13 @@ def _get_watch_test():
 HARNESS_DIR = Path.home() / ".astryx-harness"
 HARNESS_DIR.mkdir(parents=True, exist_ok=True)
 
+# snap-gate: dedicated qcow2 vmstate / data-overlay files + the named-snapshot
+# manifest live here.  Separate from per-session files so they survive `stop`
+# (a snapshot must outlive the session that created it).
+SNAP_DIR = HARNESS_DIR / "snapshots"
+SNAP_DIR.mkdir(parents=True, exist_ok=True)
+SNAP_MANIFEST = SNAP_DIR / "manifest.json"
+
 # ── ANSI (TTY only) ───────────────────────────────────────────────────────────
 
 _TTY = sys.stdout.isatty()
@@ -1125,6 +1151,9 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
                           esp_dir_override: Optional[str] = None,
                           qga_sock: str = "",
                           extra_qemu_args: Optional[list[str]] = None,
+                          snapshottable: bool = False,
+                          data_overlay: Optional[str] = None,
+                          vmstate_qcow2: Optional[str] = None,
                           ) -> subprocess.Popen:
     """
     Launch QEMU with a per-session serial log and QMP socket.
@@ -1157,7 +1186,21 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
 
     if not OVMF_CODE.exists():
         raise FileNotFoundError(f"OVMF not found at {OVMF_CODE}")
-    shutil.copy(OVMF_VARS_SRC, ovmf_vars_dst)
+    # OVMF_VARS varstore. Under --snapshottable it must be a writable qcow2
+    # (writable so EDK2 boots, qcow2 so it participates in savevm) — convert
+    # the raw template to qcow2. Otherwise a plain raw copy (unchanged).
+    if snapshottable:
+        qi = shutil.which("qemu-img") or "qemu-img"
+        # If a qcow2 varstore already exists at this path (snap-gate load
+        # relaunch reuses the path), keep it so firmware vars persist; else
+        # convert the raw template.
+        if not Path(ovmf_vars_dst).exists():
+            subprocess.run([qi, "convert", "-f", "raw", "-O", "qcow2",
+                            str(OVMF_VARS_SRC), str(ovmf_vars_dst)],
+                           check=True, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE)
+    else:
+        shutil.copy(OVMF_VARS_SRC, ovmf_vars_dst)
 
     # Truncate per-session serial log
     Path(serial_log).parent.mkdir(parents=True, exist_ok=True)
@@ -1184,6 +1227,9 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
         cpu_override=cpu_model,
         extra_args=list(extra_qemu_args) if extra_qemu_args else None,
         warn_on_missing_data_img=True,
+        snapshottable=snapshottable,
+        data_overlay=data_overlay,
+        vmstate_qcow2=vmstate_qcow2,
     )
 
     # Override -smp count if caller asked for non-default. astryx_qemu.py
@@ -2618,6 +2664,39 @@ def cmd_check(args):
     return rc
 
 
+def _qemu_img() -> str:
+    """Resolve the qemu-img binary (snap-gate creates qcow2 overlays)."""
+    return shutil.which("qemu-img") or "qemu-img"
+
+
+def _make_snap_topology(sid: str, data_img: str) -> dict:
+    """Create the per-session snap-gate qcow2 files (vmstate + data overlay).
+
+    Returns a dict with `vmstate_qcow2`, `data_overlay`, and `data_img`
+    (the raw backing path).  Files live under SNAP_DIR keyed by sid so they
+    survive `stop` — a saved snapshot must outlive its originating session.
+
+      * vmstate qcow2  — orphan device that holds the savevm RAM/CPU blob.
+        Sized generously (4 GiB virtual; qcow2 is sparse so on-disk cost is
+        only the RAM actually written, ~1 GiB guest RAM + overhead).
+      * data overlay   — qcow2 backed read-only by the shared raw data.img,
+        so guest writes never mutate the shared image and the per-device
+        data snapshot persists across stop.
+    """
+    vmstate = str(SNAP_DIR / f"{sid}.vmstate.qcow2")
+    overlay = str(SNAP_DIR / f"{sid}.data-overlay.qcow2")
+    qi = _qemu_img()
+    # Orphan vmstate device. 4G virtual is ample headroom for the RAM blob.
+    subprocess.run([qi, "create", "-f", "qcow2", vmstate, "4G"],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    # Data overlay backed by the raw data.img (backing format must be raw).
+    subprocess.run([qi, "create", "-f", "qcow2",
+                    "-b", str(data_img), "-F", "raw", overlay],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    return {"vmstate_qcow2": vmstate, "data_overlay": overlay,
+            "data_img": str(data_img)}
+
+
 def cmd_start(args):
     sid = uuid.uuid4().hex[:12]
     serial_log  = str(HARNESS_DIR / f"{sid}.serial.log")
@@ -3164,6 +3243,21 @@ def cmd_start(args):
     # so an explicit caller-supplied `-vga` is not duplicated.
     if "xeyes-test" in feats and not any(a == "-vga" for a in extra_qemu_args):
         extra_qemu_args += ["-vga", "vmware"]
+
+    # snap-gate (--snapshottable): build the savevm/loadvm-compatible device
+    # topology so the running guest can be snapshotted live.  The default
+    # firefox-test boot disk (writable vvfat) + writable OVMF_VARS pflash
+    # both abort `savevm` with "Device '...' is writable but does not support
+    # snapshots"; --snapshottable makes them read-only and adds a dedicated
+    # orphan qcow2 vmstate device + a persistent qcow2 data overlay.  Gated
+    # behind the flag so all existing (non-snapshottable) harness usage is
+    # byte-for-byte unaffected.
+    snapshottable = bool(getattr(args, "snapshottable", False))
+    snap_topology = None
+    if snapshottable:
+        wt_for_di = _get_watch_test()
+        snap_topology = _make_snap_topology(sid, str(wt_for_di.DATA_IMG))
+
     proc = _launch_qemu_harness(sid, serial_log, qmp_sock, ovmf_vars,
                                  gdb_port=gdb_port, gdb_wait=gdb_wait,
                                  kdb_host_port=kdb_host_port,
@@ -3174,7 +3268,10 @@ def cmd_start(args):
                                  cpu_model=cpu_model,
                                  esp_dir_override=esp_paths["session_esp_dir"],
                                  qga_sock=qga_sock,
-                                 extra_qemu_args=extra_qemu_args)
+                                 extra_qemu_args=extra_qemu_args,
+                                 snapshottable=snapshottable,
+                                 data_overlay=(snap_topology or {}).get("data_overlay"),
+                                 vmstate_qcow2=(snap_topology or {}).get("vmstate_qcow2"))
 
     session = {
         "sid":        sid,
@@ -3228,6 +3325,27 @@ def cmd_start(args):
         # `kernel_chosen` field is updated by the post-boot verifier after
         # the kernel's "[FFTEST] FF binary probe" line is observed.
         "firefox_variant_info": _ff_variant_info,
+        # snap-gate topology.  `snapshottable` records whether this session
+        # was launched with the savevm/loadvm-compatible device layout;
+        # `snap_vmstate_qcow2` / `snap_data_overlay` / `snap_data_img` are
+        # the qcow2 files that hold the VM state + data overlay (None on
+        # non-snapshottable sessions).  Additive — never present on sessions
+        # started before snap-gate landed; `snap-gate load` reads these back
+        # to relaunch QEMU with an identical topology.
+        "snapshottable":       snapshottable,
+        "snap_vmstate_qcow2":  (snap_topology or {}).get("vmstate_qcow2"),
+        "snap_data_overlay":   (snap_topology or {}).get("data_overlay"),
+        "snap_data_img":       (snap_topology or {}).get("data_img"),
+        # Re-launch parameters captured so `snap-gate load` can spawn a fresh
+        # QEMU with the same accel/cpu/smp as the saved session.
+        "snap_launch": {
+            "features":   args.features or "",
+            "smp":        smp,
+            "cpu_model":  cpu_model,
+            "kvm_arg":    kvm_arg,
+            "gdb_port":   gdb_port,
+            "kdb_host_port": kdb_host_port,
+        } if snapshottable else None,
         # Session-scoped kernel binary (concurrent-rebuild clobber fix).
         # NOTE: snapshot files saved via `qemu-harness.py snap save` are tied
         # to the kernel binary loaded at the time. Loading a snapshot in a
@@ -4029,6 +4147,323 @@ def cmd_snap(args):
     else:
         _out({"ok": True, "name": name, "op": op,
               "hmp_return": result.get("return", "") if isinstance(result, dict) else ""})
+
+
+# ── snap-gate: live VM snapshot/restore over the savevm/loadvm topology ───────
+
+def _snap_manifest_load() -> dict:
+    """Load the snapshot manifest ({name: {meta...}}). Empty dict if absent."""
+    if not SNAP_MANIFEST.exists():
+        return {}
+    try:
+        with SNAP_MANIFEST.open() as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _snap_manifest_save(manifest: dict):
+    tmp = SNAP_MANIFEST.with_suffix(".json.tmp")
+    with tmp.open("w") as f:
+        json.dump(manifest, f, indent=2)
+    tmp.replace(SNAP_MANIFEST)
+
+
+def _hmp(qmp_sock: str, hmp_cmd: str, connect_timeout: float = 5.0) -> dict:
+    """Run one HMP command via QMP human-monitor-command. Returns the reply."""
+    return _qmp_command(qmp_sock, "human-monitor-command",
+                        {"command-line": hmp_cmd}, connect_timeout=connect_timeout)
+
+
+def _ff_gate_label(sid: str) -> dict:
+    """Best-effort gate/sc summary for the manifest. Tolerant of any failure."""
+    info = {"gate": None, "max_sc": None}
+    try:
+        sess = _load_session(sid)
+        serial = sess.get("serial_log", "")
+        if serial and Path(serial).exists():
+            txt = Path(serial).read_text(errors="replace")
+            # Highest "sc=<N>" seen — cheap progress proxy used elsewhere.
+            scs = [int(m) for m in re.findall(r"\bsc=(\d+)", txt)]
+            if scs:
+                info["max_sc"] = max(scs)
+            # Cheap gate hints (matches ff-progress vocabulary, additive).
+            for label, pat in (
+                ("png-write",      r"Screenshot saved|out\.png"),
+                ("draw-snapshot",  r"drawSnapshot|DrawSnapshot"),
+                ("content-proc",   r"content process|contentproc|HeadlessShell"),
+                ("compositor",     r"Compositor"),
+                ("lib-load",       r"libxul"),
+            ):
+                if re.search(pat, txt):
+                    info["gate"] = label
+                    break
+    except Exception:
+        pass
+    return info
+
+
+def cmd_snap_gate(args):
+    """snap-gate: save/load/list live VM snapshots of a --snapshottable session.
+
+    save: QMP `stop` -> HMP `savevm <name>` -> `cont`, then record a manifest
+          entry (name -> {sid, gate, max_sc, features, ts, qcow2 paths, esp}).
+          A copy of the session ESP is frozen under SNAP_DIR so a later `load`
+          can relaunch QEMU with the matching kernel even after the originating
+          session is stopped and its session-ESP is reaped.
+    load: spawn a fresh QEMU with the SAME snapshottable topology pointing at
+          the saved vmstate/overlay qcow2 files, issue HMP `loadvm <name>`, and
+          write a NEW session JSON so subsequent grep/wait/kdb/ff-progress run
+          against the restored VM. Prints the new sid.
+    list: print the manifest.
+
+    argv forms (resolved from the free-form positionals):
+      snap-gate <sid> save <name>
+      snap-gate load <name>
+      snap-gate list
+    """
+    rest = list(getattr(args, "rest", []) or [])
+    # Resolve op + sid + name from the positionals.
+    sid = None
+    name = None
+    if rest and rest[0] == "list":
+        op = "list"
+    elif rest and rest[0] == "load":
+        op = "load"
+        name = rest[1] if len(rest) > 1 else None
+    elif len(rest) >= 2 and rest[1] == "save":
+        op = "save"
+        sid = rest[0]
+        name = rest[2] if len(rest) > 2 else None
+    else:
+        _err("usage: snap-gate <sid> save <name> | snap-gate load <name> | "
+             "snap-gate list")
+        return
+
+    if op == "list":
+        manifest = _snap_manifest_load()
+        _out({"ok": True, "snapshots": manifest})
+        return
+
+    if not name:
+        _err("snap-gate save/load requires a <name>")
+
+    # ── save ──────────────────────────────────────────────────────────────
+    if op == "save":
+        sess = _load_session(sid)
+        if not sess.get("snapshottable"):
+            _out({
+                "ok": False,
+                "error": "session is not snapshottable",
+                "remediation": (
+                    "Start the session with `--snapshottable` so savevm has a "
+                    "qcow2 vmstate device and read-only vvfat/pflash. The "
+                    "default firefox-test topology cannot store a live "
+                    "snapshot (writable vvfat boot disk blocks savevm)."
+                ),
+            })
+            return
+
+        qmp_sock = sess["qmp_sock"]
+        # stop -> savevm -> cont. `stop` quiesces the vCPUs so the RAM blob is
+        # consistent; savevm writes the named snapshot into the vmstate orphan
+        # qcow2 + the data overlay; cont resumes.
+        _hmp(qmp_sock, "stop")
+        save_res = _hmp(qmp_sock, f"savevm {name}")
+        _hmp(qmp_sock, "cont")
+        err = _hmp_error(save_res)
+        if err is not None:
+            _out({"ok": False, "op": "save", "name": name, "hmp_error": err})
+            return
+
+        # Freeze a copy of the session ESP so `load` can relaunch with the same
+        # kernel even after the originating session is stopped.
+        snap_esp = SNAP_DIR / f"snap-{name}.esp"
+        src_esp = sess.get("session_esp_dir", "")
+        if src_esp and Path(src_esp).exists():
+            if snap_esp.exists():
+                shutil.rmtree(snap_esp, ignore_errors=True)
+            shutil.copytree(src_esp, snap_esp)
+
+        # Freeze the OVMF_VARS qcow2 too.  Under --snapshottable it is a
+        # writable snapshottable pflash, so `savevm` wrote the named snapshot
+        # INTO it; `loadvm` requires that snapshot present.  A fresh `load`
+        # session uses a new ovmf_vars path, so we must hand it this exact
+        # post-save varstore (the raw template lacks the snapshot).
+        snap_vars = str(SNAP_DIR / f"snap-{name}.OVMF_VARS.qcow2")
+        src_vars = sess.get("ovmf_vars", "")
+        if src_vars and Path(src_vars).exists():
+            shutil.copy2(src_vars, snap_vars)
+        else:
+            snap_vars = None
+
+        gate = _ff_gate_label(sid)
+        manifest = _snap_manifest_load()
+        manifest[name] = {
+            "name":            name,
+            "origin_sid":      sid,
+            "features":        sess.get("features", ""),
+            "gate":            gate.get("gate"),
+            "max_sc":          gate.get("max_sc"),
+            "saved_at":        time.time(),
+            "saved_at_iso":    datetime.datetime.now().isoformat(timespec="seconds"),
+            "vmstate_qcow2":   sess.get("snap_vmstate_qcow2"),
+            "data_overlay":    sess.get("snap_data_overlay"),
+            "data_img":        sess.get("snap_data_img"),
+            "snap_esp_dir":    str(snap_esp) if snap_esp.exists() else None,
+            "snap_ovmf_vars":  snap_vars,
+            "snap_launch":     sess.get("snap_launch") or {},
+        }
+        _snap_manifest_save(manifest)
+        _out({
+            "ok": True, "op": "save", "name": name,
+            "gate": gate.get("gate"), "max_sc": gate.get("max_sc"),
+            "vmstate_qcow2": sess.get("snap_vmstate_qcow2"),
+            "data_overlay": sess.get("snap_data_overlay"),
+        })
+        return
+
+    # ── load ──────────────────────────────────────────────────────────────
+    if op == "load":
+        manifest = _snap_manifest_load()
+        entry = manifest.get(name)
+        if entry is None:
+            _out({"ok": False, "op": "load", "name": name,
+                  "error": f"no snapshot named {name!r}",
+                  "available": sorted(manifest.keys())})
+            return
+
+        vmstate = entry.get("vmstate_qcow2")
+        overlay = entry.get("data_overlay")
+        snap_esp = entry.get("snap_esp_dir")
+        snap_vars = entry.get("snap_ovmf_vars")
+        for label, p in (("vmstate", vmstate), ("data_overlay", overlay),
+                         ("snap_esp_dir", snap_esp), ("snap_ovmf_vars", snap_vars)):
+            if not p or not Path(p).exists():
+                _out({"ok": False, "op": "load", "name": name,
+                      "error": f"snapshot {label} missing on disk: {p}"})
+                return
+
+        launch = entry.get("snap_launch") or {}
+        # New session: fresh sid, fresh serial/qmp, but the SAME vmstate +
+        # data overlay so `loadvm` finds the named snapshot in both devices.
+        # NOTE: this reuses the saved overlay/vmstate qcow2 files in place, so
+        # the ORIGIN session must be `stop`ped before loading (a still-running
+        # origin would race on the same qcow2 files). The named snapshot is
+        # preserved by loadvm, so the same snapshot can be loaded repeatedly.
+        new_sid = uuid.uuid4().hex[:12]
+        serial_log = str(HARNESS_DIR / f"{new_sid}.serial.log")
+        qmp_sock = str(HARNESS_DIR / f"{new_sid}.qmp.sock")
+        ovmf_vars = str(HARNESS_DIR / f"{new_sid}.OVMF_VARS.fd")
+        # Hand the new session the saved post-save varstore qcow2 (it carries
+        # the named snapshot that loadvm requires in the pflash device).
+        shutil.copy2(snap_vars, ovmf_vars)
+        # Give the restored session its OWN copy of the frozen ESP so that
+        # `stop`ping it (cmd_stop reaps session_esp_dir) does not delete the
+        # snapshot's master ESP — the snapshot stays loadable repeatedly.
+        sess_esp = _session_esp_dir(new_sid)
+        if sess_esp.exists():
+            shutil.rmtree(sess_esp, ignore_errors=True)
+        shutil.copytree(snap_esp, sess_esp)
+
+        feats = [f.strip() for f in (launch.get("features") or "").split(",")]
+        kdb_host_port = launch.get("kdb_host_port") or 0
+        if "kdb" in feats and not kdb_host_port:
+            kdb_host_port = 9990 + (int(new_sid, 16) % 1000)
+
+        proc = _launch_qemu_harness(
+            new_sid, serial_log, qmp_sock, ovmf_vars,
+            gdb_port=launch.get("gdb_port") or 0,
+            kdb_host_port=kdb_host_port,
+            kvm=launch.get("kvm_arg"),
+            smp=launch.get("smp") or 2,
+            cpu_model=launch.get("cpu_model"),
+            esp_dir_override=str(sess_esp),
+            snapshottable=True,
+            data_overlay=overlay,
+            vmstate_qcow2=vmstate,
+        )
+
+        # Wait for QMP to actually ACCEPT a connection (the socket file can
+        # appear before QEMU is listening, and under host load QEMU can take
+        # tens of seconds to reach the monitor). Probe with a real `query-status`
+        # until it answers, up to a generous deadline. Then loadvm: QEMU starts
+        # the (orphan) VM running from firmware; `loadvm` discards that and
+        # restores the saved RAM/CPU/disk state. `stop` first for determinism,
+        # `cont` to resume the restored VM.
+        load_err = None
+        load_ret = ""
+        ok = False
+        qmp_ready = False
+        deadline = time.monotonic() + 90.0
+        while time.monotonic() < deadline:
+            if Path(qmp_sock).exists():
+                probe = _qmp_command(qmp_sock, "query-status", connect_timeout=2.0)
+                if isinstance(probe, dict) and "return" in probe:
+                    qmp_ready = True
+                    break
+            time.sleep(0.3)
+        if not qmp_ready:
+            load_err = "qmp: monitor never became ready within 90s"
+        else:
+            _hmp(qmp_sock, "stop", connect_timeout=15.0)
+            load_res = _hmp(qmp_sock, f"loadvm {name}", connect_timeout=15.0)
+            _hmp(qmp_sock, "cont", connect_timeout=15.0)
+            load_err = _hmp_error(load_res)
+            ok = load_err is None
+            load_ret = load_res.get("return", "") if isinstance(load_res, dict) else ""
+
+        # Write the restored session JSON so grep/wait/kdb/ff-progress work.
+        session = {
+            "sid":            new_sid,
+            "pid":            proc.pid,
+            "serial_log":     serial_log,
+            "qmp_sock":       qmp_sock,
+            "qga_sock":       "",
+            "ovmf_vars":      ovmf_vars,
+            "started_at":     time.time(),
+            "features":       launch.get("features") or "",
+            "gdb_port":       launch.get("gdb_port") or 0,
+            "gdb_wait":       False,
+            "kdb_host_port":  kdb_host_port,
+            "http_host_port": 0,
+            "ssh_host_port":  0,
+            "oracle_stub_port": 0, "oracle_stub_pid": 0, "oracle_stub_log": "",
+            "smp":            launch.get("smp") or 2,
+            "cpu_model":      launch.get("cpu_model") or "default",
+            "breakpoints":    [],
+            "snapshottable":  True,
+            "snap_vmstate_qcow2": vmstate,
+            "snap_data_overlay":  overlay,
+            "snap_data_img":      entry.get("data_img"),
+            "snap_launch":        launch,
+            # Provenance: this session was hydrated from a snapshot.
+            "restored_from_snapshot": name,
+            "session_esp_dir":       str(sess_esp),
+        }
+        _save_session(session)
+
+        # Background watcher so panics/idles still get recorded post-restore.
+        try:
+            subprocess.Popen(
+                [sys.executable, __file__, "_watch", new_sid],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True)
+        except Exception:
+            pass
+
+        _out({
+            "ok": ok, "op": "load", "name": name, "sid": new_sid,
+            "pid": proc.pid, "serial_log": serial_log, "qmp_sock": qmp_sock,
+            "restored_gate": entry.get("gate"), "restored_max_sc": entry.get("max_sc"),
+            "hmp_error": load_err, "hmp_return": load_ret,
+            "hint": (f"use `grep {new_sid} ...`, `wait {new_sid} ...`, "
+                     f"`ff-progress {new_sid}`, `kdb {new_sid} ...` against the "
+                     f"restored VM" if ok else None),
+        })
+        return
+
+    _err(f"Unknown snap-gate op: {op}")
 
 
 def cmd_run_watcher(args):
@@ -9896,6 +10331,20 @@ def main():
                                "serial lines for `coverage --collect`.")
     p_start.add_argument("--no-build", action="store_true",
                           help="Skip cargo build; use existing kernel.bin")
+    p_start.add_argument("--snapshottable", action="store_true",
+                          dest="snapshottable",
+                          help="snap-gate: launch with the QEMU savevm/loadvm-"
+                               "compatible device topology so the live guest "
+                               "can be snapshotted. Makes the vvfat boot disk "
+                               "read-only (fat:ro:) and the OVMF_VARS pflash "
+                               "read-only (both block savevm otherwise), and "
+                               "attaches a dedicated orphan qcow2 vmstate "
+                               "device + a persistent qcow2 data overlay (under "
+                               "~/.astryx-harness/snapshots/) backed read-only "
+                               "by the shared data.img. Required for the "
+                               "`snap-gate save/load` subcommands. Default OFF "
+                               "— existing harness usage is byte-for-byte "
+                               "unaffected.")
     p_start.add_argument("--gdb-port", type=int, default=0, metavar="PORT",
                           help="Enable GDB stub on TCP PORT (0=off). "
                                "GdbClient will back off to PORT+1..PORT+4 on conflict.")
@@ -10041,6 +10490,22 @@ def main():
     p_snap.add_argument("sid")
     p_snap.add_argument("op", choices=["save", "load"])
     p_snap.add_argument("name")
+
+    # snap-gate: live VM snapshot/restore that actually preserves a running
+    # Firefox process across save/load (requires `start --snapshottable`).
+    p_snapgate = sub.add_parser(
+        "snap-gate",
+        help="Live VM snapshot/restore preserving the running guest. "
+             "Forms: `snap-gate <sid> save <name>`, `snap-gate load <name>`, "
+             "`snap-gate list`. Requires `start --snapshottable`. Collapses a "
+             "30-50min FF-boot-to-gate into a sub-second loadvm.")
+    # Free-form positionals resolved in cmd_snap_gate so the three argv forms
+    # above all parse without ambiguity:
+    #   save: <sid> save <name>   (3 tokens)
+    #   load: load <name>         (2 tokens; no sid — a NEW session is spawned)
+    #   list: list                (1 token)
+    p_snapgate.add_argument("rest", nargs="*",
+                            help="See the forms in --help.")
 
     # ── Tier 2: GDB stub subcommands ──────────────────────────────────────────
     # All require that `start` was called with --gdb-port PORT.
@@ -10814,6 +11279,7 @@ def main():
         "status": cmd_status,
         "events": cmd_events,
         "snap":   cmd_snap,
+        "snap-gate": cmd_snap_gate,
         # Tier 2
         "regs":   cmd_regs,
         "mem":    cmd_mem,
