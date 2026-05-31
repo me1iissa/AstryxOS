@@ -1655,6 +1655,10 @@ pub fn run() -> ! {
     total += 1;
     if test_futex_wait_atomic_check_then_queue() { passed += 1; }
 
+    // ── Test 195b: FUTEX_WAIT value compare is 32-bit (int sign-extension) ──
+    total += 1;
+    if test_futex_wait_val_is_32bit() { passed += 1; }
+
     // ── Test 196: memfd_create MFD_CLOEXEC + MFD_ALLOW_SEALING + seals ──
     total += 1;
     if test_memfd_cloexec_sealing() { passed += 1; }
@@ -31830,6 +31834,117 @@ fn test_futex_wait_atomic_check_then_queue() -> bool {
 
     test_println!("  all {} waiters drained, no leaked queue entries ✓", N_WAITERS);
     test_pass!("FUTEX_WAIT atomic check-then-queue (lost-wakeup race)");
+    true
+}
+
+// ── Test: FUTEX_WAIT value comparison is 32-bit (sign-extension safe) ────
+//
+// Per futex(2), "the futex word is a 32-bit field"; the FUTEX_WAIT
+// comparison `*uaddr == val` is over those 32 bits only.  The futex `val`
+// argument is typed `int` in the C-library wrappers
+// (pthread_mutex_timedlock → __timedwait(addr, val, …)).  When a mutex word
+// with bit 31 set — the musl contended-waiters bit 0x8000_0000 — is passed
+// as that `int`, widening to the 64-bit syscall register sign-extends it:
+// the kernel receives 0xFFFF_FFFF_8000_0010 for a futex word of 0x8000_0010.
+//
+// A full-width compare against the zero-extended 32-bit `*uaddr` would
+// mismatch in the high half on EVERY call and return EAGAIN, so a waiter on
+// a contended mutex spins instead of parking — the observed 1.6-billion-call
+// FUTEX_WAIT storm with a frozen futex word.  This test pins the contract:
+// when the low 32 bits agree, the helper must Enqueue regardless of the high
+// 32 bits of `val`; when the low 32 bits differ it must report ValueMismatch.
+fn test_futex_wait_val_is_32bit() -> bool {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use crate::syscall::{FUTEX_WAITERS, FutexWaitOutcome, futex_wait_check_and_enqueue};
+
+    test_header!("FUTEX_WAIT 32-bit value compare (int sign-extension safe)");
+
+    // Synthetic key, well clear of any live mapping.
+    const SYNTH_PID:   u64 = 0xF00D_F00D_0000_0001;
+    const SYNTH_UADDR: u64 = 0x7EFF_F222_0000_0000;
+    // Futex word with bit 31 (musl waiters bit) set — exactly the value
+    // captured live at the Firefox main-thread mutex storm (_m_lock = waiters
+    // | EBUSY).
+    const WORD: u32 = 0x8000_0010;
+    // The sign-extended 64-bit `val` a musl `int` carrying WORD produces in
+    // the syscall register.
+    const VAL_SIGN_EXTENDED: u64 = 0xFFFF_FFFF_8000_0010;
+
+    static FUTEX_WORD: AtomicU32 = AtomicU32::new(WORD);
+    FUTEX_WORD.store(WORD, Ordering::SeqCst);
+
+    // Clean any stale queue entry from a prior run.
+    FUTEX_WAITERS.lock().remove(&(SYNTH_PID, SYNTH_UADDR));
+
+    let tid = crate::proc::current_tid();
+
+    // Case 1: low-32 bits agree, high bits all-ones (sign-extended int).
+    // MUST Enqueue (pre-fix this returned ValueMismatch → the storm).
+    let outcome = futex_wait_check_and_enqueue(
+        SYNTH_PID, SYNTH_UADDR, VAL_SIGN_EXTENDED, tid,
+        u64::MAX,
+        || Some(FUTEX_WORD.load(Ordering::SeqCst)),
+    );
+    let enqueued = matches!(outcome, FutexWaitOutcome::Enqueued);
+    // Immediately dequeue + un-block ourselves: we are the calling (test
+    // runner) thread, the helper marked us Blocked under THREAD_TABLE.  Undo
+    // that so the scheduler keeps running us, and clear the queue entry.
+    {
+        let mut waiters = FUTEX_WAITERS.lock();
+        if let Some(list) = waiters.get_mut(&(SYNTH_PID, SYNTH_UADDR)) {
+            list.retain(|&t| t != tid);
+            if list.is_empty() { waiters.remove(&(SYNTH_PID, SYNTH_UADDR)); }
+        }
+    }
+    {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+            t.state = crate::proc::ThreadState::Ready;
+            t.wake_tick = 0;
+        }
+    }
+    if !enqueued {
+        test_fail!("futex_wait_val_is_32bit",
+            "sign-extended val {:#x} vs word {:#x} reported ValueMismatch — \
+             the FUTEX_WAIT compare is not 32-bit (would EAGAIN-storm)",
+            VAL_SIGN_EXTENDED, WORD);
+        return false;
+    }
+    test_println!("  case1: word={:#x} val={:#x} (low32 agree) → Enqueued ✓",
+        WORD, VAL_SIGN_EXTENDED);
+
+    // Case 2: low-32 bits genuinely differ → MUST ValueMismatch (the EAGAIN
+    // the comparison legitimately exists to produce; the fix must not mask it).
+    let bad_val: u64 = 0xFFFF_FFFF_8000_0011; // low32 = 0x8000_0011 != WORD
+    let outcome2 = futex_wait_check_and_enqueue(
+        SYNTH_PID, SYNTH_UADDR, bad_val, tid,
+        u64::MAX,
+        || Some(FUTEX_WORD.load(Ordering::SeqCst)),
+    );
+    // Defensive cleanup if it somehow enqueued.
+    {
+        let mut waiters = FUTEX_WAITERS.lock();
+        if let Some(list) = waiters.get_mut(&(SYNTH_PID, SYNTH_UADDR)) {
+            list.retain(|&t| t != tid);
+            if list.is_empty() { waiters.remove(&(SYNTH_PID, SYNTH_UADDR)); }
+        }
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+            t.state = crate::proc::ThreadState::Ready;
+            t.wake_tick = 0;
+        }
+    }
+    if !matches!(outcome2, FutexWaitOutcome::ValueMismatch) {
+        test_fail!("futex_wait_val_is_32bit",
+            "low-32 mismatch (word {:#x} vs val-low32 {:#x}) did NOT report \
+             ValueMismatch — comparison too lax",
+            WORD, bad_val as u32);
+        return false;
+    }
+    test_println!("  case2: word={:#x} val-low32={:#x} (differ) → ValueMismatch ✓",
+        WORD, bad_val as u32);
+
+    test_pass!("FUTEX_WAIT 32-bit value compare (int sign-extension safe)");
     true
 }
 
