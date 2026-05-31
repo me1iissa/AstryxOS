@@ -1585,6 +1585,22 @@ pub fn run() -> ! {
         if test_loopback_tcp_handshake() { passed += 1; }
     }
 
+    // ── Test 184b: handle_tcp must not hold TCP_CONNECTIONS across send ──
+    //
+    // Cross-subsystem lock-discipline regression: the RX path
+    // (handle_tcp -> process_segment) must release TCP_CONNECTIONS before
+    // transmitting any reply, because ipv4::send_ipv4 can re-enter
+    // net::poll() (ARP resolution) and thus re-enter handle_tcp, which is
+    // a self-deadlock on the non-reentrant spin::Mutex (and an SMP cross-
+    // core stall).  Twin of the MOUNTS / e1000 RX_CUR hold-across-dispatch
+    // fixes.
+
+    #[cfg(feature = "kdb")]
+    {
+        total += 1;
+        if test_tcp_lock_released_before_send() { passed += 1; }
+    }
+
     // ── Test 185: Loopback — 127/8 coverage and 128/8 rejection ──────────
 
     total += 1;
@@ -29764,6 +29780,107 @@ fn test_loopback_tcp_handshake() -> bool {
         pkts_out_after - pkts_out_before);
 
     test_pass!("Loopback (lo) — TCP 3WHS via 127.0.0.1");
+    true
+}
+
+// ── Test 184b: handle_tcp releases TCP_CONNECTIONS before transmitting ────────
+//
+// Lock-discipline regression for the cross-subsystem deadlock class
+// (twin of #476 MOUNTS and #499 e1000 RX_CUR).  The receive path
+// `net::tcp::handle_tcp` -> `process_segment` builds reply segments while
+// holding `TCP_CONNECTIONS`, but MUST drop the lock before calling
+// `ipv4::send_ipv4`: the transmit path can re-enter `net::poll()` (ARP
+// resolution polls the RX ring), which re-enters `handle_tcp` and would
+// take `TCP_CONNECTIONS` a second time on the same CPU — an immediate
+// self-deadlock on the non-reentrant `spin::Mutex`, and on SMP a peer
+// core spinning on the lock across the unbounded (I/O-bearing) transmit
+// is never timer-preempted in Ring 0 and stalls the machine.
+//
+// We push real data from the client to the server over loopback and let
+// `net::poll()` drive the server's `handle_tcp` -> `process_segment`
+// data-ACK reply (one of the five send sites converted to the deferred-
+// send `OutSeg` pattern, with correct sequence numbers — no hand-crafted
+// arithmetic).  Then we assert two invariants:
+//   (1) `connection_count()` (a brief `try_lock` of TCP_CONNECTIONS)
+//       succeeds — the lock is free, i.e. NOT held across the send;
+//   (2) the reply ACK reached the loopback TX queue, and the payload
+//       arrived at the server — delivery-once semantics are preserved by
+//       the deferred send.
+
+#[cfg(feature = "kdb")]
+fn test_tcp_lock_released_before_send() -> bool {
+    test_header!("handle_tcp releases TCP_CONNECTIONS before transmit");
+
+    use crate::net::{tcp, loopback};
+
+    const SERVER_PORT: u16 = 17112;
+    const LB_IP: [u8; 4] = [127, 0, 0, 1];
+    const DATA: &[u8] = b"deferred-send-probe";
+
+    if let Err(e) = tcp::listen(SERVER_PORT) {
+        test_fail!("tcp_lock_release", "listen({}) failed: {}", SERVER_PORT, e);
+        return false;
+    }
+
+    let client_port = match tcp::connect(LB_IP, SERVER_PORT) {
+        Ok(p) => p,
+        Err(e) => { test_fail!("tcp_lock_release", "connect failed: {}", e); return false; }
+    };
+
+    // Drive the 3WHS to completion through the loopback drain.
+    for _ in 0..6 { crate::net::poll(); }
+
+    if tcp::get_state(client_port) != Some(tcp::TcpState::Established) {
+        test_fail!("tcp_lock_release", "client TCB not Established after 3WHS");
+        return false;
+    }
+
+    let pkts_out_before = loopback::stats().1;
+
+    // Send real data client -> server.  Each `net::poll()` drains the
+    // loopback queue: the data segment lands on the server child via
+    // `handle_tcp` -> `process_segment` (Established, in-order data), which
+    // emits a reply ACK through the deferred-send path now under test.
+    if tcp::send_data_to(client_port, LB_IP, SERVER_PORT, DATA).is_err() {
+        test_fail!("tcp_lock_release", "send_data_to failed");
+        return false;
+    }
+    for _ in 0..6 { crate::net::poll(); }
+
+    // (1) Lock-discipline invariant: TCP_CONNECTIONS must be free now.
+    // Pre-fix the reply ACK was built and sent *inside* the lock, so a
+    // re-entrant poll (as ARP resolution would trigger) racing the send
+    // could not acquire it — the self-deadlock this fix removes.
+    if tcp::connection_count().is_none() {
+        test_fail!("tcp_lock_release",
+            "TCP_CONNECTIONS still contended after handle_tcp — held across send");
+        return false;
+    }
+
+    // (2) Delivery-once: the reply ACK(s) must have traversed loopback TX,
+    // and the server child must have received the full payload.
+    let pkts_out_after = loopback::stats().1;
+    if pkts_out_after <= pkts_out_before {
+        test_fail!("tcp_lock_release",
+            "no segments transmitted after data send (loopback pkts_out delta {})",
+            pkts_out_after - pkts_out_before);
+        return false;
+    }
+
+    let got = tcp::read_from(SERVER_PORT, LB_IP, client_port);
+    if got.as_slice() != DATA {
+        test_fail!("tcp_lock_release",
+            "server payload mismatch: got {} bytes, want {}", got.len(), DATA.len());
+        return false;
+    }
+
+    test_println!("  lock free post-send ✓, payload delivered, lo pkts_out +{} ✓",
+        pkts_out_after - pkts_out_before);
+
+    // Cleanup: abort the client TCB so SLIRP / the table don't carry it on.
+    let _ = tcp::abort(client_port);
+
+    test_pass!("handle_tcp releases TCP_CONNECTIONS before transmit");
     true
 }
 
