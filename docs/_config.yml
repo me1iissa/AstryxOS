@@ -11,11 +11,15 @@ description: >-
   upstream unmodified binaries from other operating systems.
 remote_theme: just-the-docs/just-the-docs
 
-# Site URL config is set by GitHub Pages at build time; baseurl is left blank so
-# the site works for both a user/repo page and a custom domain. If this deploys
-# to https://<user>.github.io/AstryxOS/, set baseurl to "/AstryxOS".
-url: ""
-baseurl: ""
+# This is a GitHub Pages *project* site served from a subpath
+# (https://<user>.github.io/AstryxOS/). Jekyll resolves every theme asset
+# (CSS/JS) through the `relative_url` filter, which prepends `site.baseurl`;
+# with an empty baseurl those links resolve to the domain root (/assets/...)
+# and 404. `actions/configure-pages` only auto-injects a baseurl for the JS
+# generators it supports (Next/Nuxt/Gatsby/SvelteKit), NOT for Jekyll, so the
+# baseurl must be set here explicitly to the repository subpath.
+url: "https://me1iissa.github.io"
+baseurl: "/AstryxOS"
 
 # --- just-the-docs options ---------------------------------------------------
 
