@@ -211,6 +211,18 @@ def _firmware_args(ovmf_code: str, ovmf_vars: str,
     ]
 
 
+# Pinned PCI slots on the i440fx (`-machine pc`) root bus for the two
+# virtio-blk-pci devices that only the --snapshottable topology presents
+# (the default path has a single virtio-blk data disk and pins nothing).
+# The kernel's virtio-blk driver is a singleton that binds the FIRST
+# virtio-blk device in ascending-slot order, so the DATA overlay MUST sit at
+# a lower slot than the boot ESP.  Slots 0x00..0x02 are the i440fx host
+# bridge / PIIX3 / VGA and the e1000 NIC auto-assigns above them; 0x04/0x05
+# are clear of those defaults.  Lower number = enumerated first by the guest.
+_DATA_DISK_PCI_ADDR = 0x04   # ext2 data overlay — bound by the kernel
+_BOOT_DISK_PCI_ADDR = 0x05   # read-only vvfat boot ESP — must NOT be bound
+
+
 def _boot_disk_args(esp_dir: str, snapshottable: bool = False) -> list[str]:
     """Boot disk: FAT-formatted ESP directory exposed as a raw image.
 
@@ -228,12 +240,26 @@ def _boot_disk_args(esp_dir: str, snapshottable: bool = False) -> list[str]:
     read-only").  So under --snapshottable we attach it via `if=none` + a
     `virtio-blk-pci,read-only=on` frontend, which OVMF enumerates and boots
     from exactly like the IDE path.
+
+    DATA-DISK BINDING (snap-gate data-overlay fix): the snapshottable boot
+    disk is itself a virtio-blk-pci device, so the topology now presents TWO
+    virtio-blk devices (this boot ESP + the data overlay).  The kernel's
+    virtio-blk driver is a singleton that binds the FIRST virtio-blk device in
+    PCI bus-scan (ascending slot) order.  If the boot ESP enumerates first the
+    kernel binds the ~504 MiB read-only vvfat ESP instead of the ext2 data
+    overlay and the data mount fails ("neither FAT32 nor ext2").  We therefore
+    PIN explicit PCI slots so the data overlay always lands at a LOWER slot
+    than this boot disk — see `_BOOT_DISK_PCI_ADDR` / `_DATA_DISK_PCI_ADDR`.
+    The default (non-snapshottable) path keeps a single virtio-blk data disk
+    and is left byte-for-byte unchanged.  QEMU `-device ...,addr=N` fixes the
+    device's slot on the i440fx root bus (QEMU `-device` PCI addressing).
     """
     if not snapshottable:
         return ["-drive", f"format=raw,file=fat:rw:{esp_dir}"]
     return [
         "-drive", f"format=raw,file=fat:ro:{esp_dir},if=none,id=boot0,readonly=on",
-        "-device", "virtio-blk-pci,drive=boot0,bootindex=0",
+        "-device",
+        f"virtio-blk-pci,drive=boot0,bootindex=0,addr={_BOOT_DISK_PCI_ADDR:#x}",
     ]
 
 
@@ -277,10 +303,15 @@ def _data_disk_args(data_img: str, warn_on_missing: bool = False,
         # `snapshot=on` temp-overlay used by the default path is deleted on
         # QEMU exit and would lose that snapshot.  The overlay file itself
         # is created by the caller via `qemu-img create -b <data_img>`.
+        # Pin the data overlay to a LOWER PCI slot than the snapshottable boot
+        # disk so the kernel's singleton virtio-blk driver (binds the first
+        # virtio-blk device in ascending-slot order) selects the ext2 data
+        # overlay, not the read-only vvfat boot ESP.  See `_boot_disk_args`.
         return [
             "-drive",
             f"file={data_overlay},format=qcow2,if=none,id=data0",
-            "-device", "virtio-blk-pci,drive=data0",
+            "-device",
+            f"virtio-blk-pci,drive=data0,addr={_DATA_DISK_PCI_ADDR:#x}",
         ]
     return [
         "-drive", f"file={data_img},format=raw,if=none,id=data0,snapshot=on",
