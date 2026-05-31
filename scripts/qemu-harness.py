@@ -41,6 +41,20 @@ Tier 1 — session management:
     python3 scripts/qemu-harness.py snap <sid> save|load <name>
     python3 scripts/qemu-harness.py prune [--ttl DAYS]
     python3 scripts/qemu-harness.py results <sid>
+    python3 scripts/qemu-harness.py ff-progress <sid>
+        FF headless-screenshot gate ladder + DEEPEST gate reached (pure
+        serial-log scan; no kdb). Ladder in scripts/ff_gates.yaml (additive).
+        Reports lib-load -> x11-ready -> compositor-init -> ff-launch ->
+        content-proc -> screenshot-actors -> draw-snapshot -> png-write,
+        plus max_sc, reached_png, and terminal_cause. The authoritative
+        "how deep did this boot get + is it the screenshot wedge?" oracle.
+    python3 scripts/qemu-harness.py kdb <sid> cond-autopsy <pid> <cond_va> [<half>]
+        One-shot musl pthread_cond/mutex wake-target-vs-wait-addr report:
+        live struct dump + parked waiters in [va-half,va+half] (with delta to
+        the query) + recent FUTEX_WAKE targets + inferred lock holder +
+        verdict_hint (wake-address-mismatch | held-lock-deadlock |
+        owner-starved | true-lost-wakeup | benign-empty) + a one-line summary.
+        The decisive condvar-livelock probe in one argv call (half def 128).
     python3 scripts/qemu-harness.py read-png <sid> <dst.png> [--timeout-ms MS]
     python3 scripts/qemu-harness.py futex-wake-drill <sid> [--tid N]
                                             [--bucket-count K] [--window-lines L]
@@ -845,12 +859,18 @@ def _watcher_thread(sid: str, serial_log: str, qmp_sock: str, pid: int):
                     if m:
                         snap_name = f"{sid}-panic"
                         snap_ok = False
+                        snap_err = None
                         try:
                             resp = _qmp_command(qmp_sock,
                                                 "human-monitor-command",
                                                 {"command-line": f"savevm {snap_name}"},
                                                 connect_timeout=2.0)
-                            snap_ok = "error" not in resp
+                            # An HMP savevm failure rides in the `return`
+                            # string, not an `error` key — parse it so the
+                            # panic event reports a TRUE snapshot, not a
+                            # phantom one (same bug class as cmd_snap).
+                            snap_err = _hmp_error(resp)
+                            snap_ok = snap_err is None
                         except Exception:
                             pass
                         _emit_event(sid, {
@@ -858,6 +878,7 @@ def _watcher_thread(sid: str, serial_log: str, qmp_sock: str, pid: int):
                             "pattern": m.group(0),
                             "line": line,
                             "snapshot": snap_name if snap_ok else None,
+                            "snapshot_error": snap_err,
                         })
                 last_size = size
                 last_activity = time.monotonic()
@@ -3663,6 +3684,154 @@ def _classify_exit_cause(serial_log: str, running: bool) -> str:
     return "unknown_exit"
 
 
+_FF_GATES_PATH = _SCRIPTS_DIR / "ff_gates.yaml"
+
+# sc= appears on most [SC]/trace lines; capture the running counter so we can
+# tag each gate with the syscall count at which it was first reached and
+# report the deepest live sc.
+_FF_SC_RE = re.compile(rb"sc=(\d+)")
+# An [FF/write] IPC line carries its payload in body="...".  The screenshot
+# actor names live INSIDE that escaped payload, so ipc-body gates substring-
+# scan the whole line rather than anchoring.
+_FF_IPC_WRITE_RE = re.compile(rb"\[FF/write\]")
+
+
+def _load_ff_gates() -> list[dict]:
+    """Load the ordered FF gate ladder from scripts/ff_gates.yaml.
+
+    Returns a list of {id, marker_regex (compiled bytes), kind, desc} in
+    ladder order.  Falls back to a built-in minimal ladder if PyYAML is
+    missing or the file is absent so ff-progress always produces output.
+    """
+    fallback = [
+        {"id": "lib-load",          "marker_regex": rb"\[FFTEST\]\s+Cached\s+\S*libxul\.so\s+\((?!0 pages)", "kind": "line"},
+        {"id": "x11-ready",         "marker_regex": rb"\[FFTEST\]\s+X11 server ready", "kind": "line"},
+        {"id": "compositor-init",   "marker_regex": rb"\[GUI\]\s+Compositor initialized", "kind": "line"},
+        {"id": "ff-launch",         "marker_regex": rb"\[FFTEST\]\s+Launching\s+\S*firefox", "kind": "line"},
+        {"id": "content-proc",      "marker_regex": rb"\[FF/write\]\s+pid=2\b", "kind": "line"},
+        {"id": "screenshot-actors", "marker_regex": rb"ScreenshotParent|getDimensions|sendQuery", "kind": "ipc-body"},
+        {"id": "draw-snapshot",     "marker_regex": rb"drawSnapshot", "kind": "ipc-body"},
+        {"id": "png-write",         "marker_regex": rb"Screenshot saved|out\.png|\[SCREENSHOT-B64:", "kind": "line"},
+    ]
+    raw = None
+    if _FF_GATES_PATH.exists():
+        try:
+            import yaml
+            with _FF_GATES_PATH.open() as f:
+                doc = yaml.safe_load(f) or {}
+            raw = doc.get("gates")
+        except Exception:
+            raw = None
+    src = raw if raw else fallback
+    out: list[dict] = []
+    for g in src:
+        try:
+            rx = g["marker_regex"]
+            if isinstance(rx, str):
+                rx = rx.encode("utf-8", errors="replace")
+            out.append({
+                "id":    g["id"],
+                "regex": re.compile(rx),
+                "kind":  g.get("kind", "line"),
+                "desc":  g.get("desc", ""),
+            })
+        except (KeyError, re.error):
+            continue
+    return out
+
+
+def cmd_ff_progress(args):
+    """One-shot FF gate-ladder + deepest-reached detector.
+
+    Pure read-only serial-log scan; no kernel/kdb interaction.  Reports which
+    canonical Firefox-headless-screenshot gates the session reached, the
+    deepest one, the live syscall count at each, and the terminal cause —
+    automating the recurring "how deep did this boot get + is it the
+    screenshot wedge?" question.  The ladder is read from
+    scripts/ff_gates.yaml (additive; extend it to add gates)."""
+    sess = _load_session(args.sid)
+    serial_log = sess.get("serial_log", "")
+    if not serial_log or not Path(serial_log).exists():
+        _out({"error": f"no serial log for session {args.sid}"})
+        sys.exit(1)
+
+    gates = _load_ff_gates()
+    # Per-gate first-seen state.
+    seen: dict[str, dict] = {}      # id -> {first_line_no, first_sc}
+    line_no = 0
+    cur_sc = 0
+    max_sc = 0
+
+    try:
+        with Path(serial_log).open("rb") as fh:
+            for raw_line in fh:
+                line_no += 1
+                # Track the running syscall counter so each gate gets the sc
+                # at which it was first reached, and we can report deepest sc.
+                m = _FF_SC_RE.search(raw_line)
+                if m:
+                    try:
+                        cur_sc = int(m.group(1))
+                        if cur_sc > max_sc:
+                            max_sc = cur_sc
+                    except ValueError:
+                        pass
+                is_ipc = bool(_FF_IPC_WRITE_RE.search(raw_line))
+                for g in gates:
+                    if g["id"] in seen:
+                        continue
+                    if g["kind"] == "ipc-body" and not is_ipc:
+                        # ipc-body gates only match inside an [FF/write] body,
+                        # but still allow a bare line match as a fallback (some
+                        # markers also appear in plain log lines).
+                        if not g["regex"].search(raw_line):
+                            continue
+                    if g["regex"].search(raw_line):
+                        seen[g["id"]] = {
+                            "first_line_no": line_no,
+                            "first_sc": max_sc,
+                        }
+    except OSError as e:
+        _out({"error": f"cannot read serial log: {e}"})
+        sys.exit(1)
+
+    # Build the ordered gate report; deepest = last gate in ladder order that
+    # was reached.
+    gate_rows = []
+    deepest_gate = None
+    deepest_index = -1
+    for i, g in enumerate(gates):
+        s = seen.get(g["id"])
+        reached = s is not None
+        gate_rows.append({
+            "id":            g["id"],
+            "reached":       reached,
+            "first_sc":      (s["first_sc"] if reached else None),
+            "first_line_no": (s["first_line_no"] if reached else None),
+            "desc":          g["desc"],
+        })
+        if reached:
+            deepest_gate = g["id"]
+            deepest_index = i
+
+    pid = sess.get("pid", 0)
+    alive = _pid_alive(pid) if pid else False
+    terminal_cause = _classify_exit_cause(serial_log, alive)
+    reached_png = "png-write" in seen
+
+    _out({
+        "sid":            args.sid,
+        "running":        alive,
+        "deepest_gate":   deepest_gate,
+        "deepest_index":  deepest_index,
+        "max_sc":         max_sc,
+        "reached_png":    reached_png,
+        "terminal_cause": terminal_cause,
+        "total_lines":    line_no,
+        "gates":          gate_rows,
+    })
+
+
 def cmd_status(args):
     sid = args.sid
     p   = _session_path(sid)
@@ -3790,6 +3959,37 @@ def _follow_events(ep: Path):
             pass
 
 
+def _hmp_error(result: dict) -> Optional[str]:
+    """Extract a failure string from a `human-monitor-command` reply.
+
+    QMP `human-monitor-command` succeeds at the QMP layer even when the HMP
+    command itself fails — the HMP error text is delivered in the `return`
+    STRING, not in a top-level `error` key.  `savevm`/`loadvm` failures (no
+    snapshottable device, snapshot not found, image read-only) therefore look
+    like success to a naive `"error" in result` check, which is how phantom
+    snapshots were silently reported `ok:true`.
+
+    Returns the error text if the command failed, else None.  Checks both the
+    QMP-transport `error` key AND the HMP `return` text for the leading
+    `Error:` / `Error ` marker QEMU's monitor prints on failure.
+    """
+    if not isinstance(result, dict):
+        return f"unexpected QMP reply type: {type(result).__name__}"
+    if "error" in result:
+        return f"qmp: {result['error']}"
+    ret = result.get("return", "")
+    if isinstance(ret, str):
+        text = ret.strip()
+        # HMP prints "Error: <msg>" (and historically "Error <msg>") to the
+        # monitor on savevm/loadvm failure.  An empty return is success.
+        low = text.lower()
+        if low.startswith("error:") or low.startswith("error ") or \
+           "device has no snapshot" in low or "no block device can store" in low or \
+           "is not found" in low:
+            return text
+    return None
+
+
 def cmd_snap(args):
     sess     = _load_session(args.sid)
     qmp_sock = sess["qmp_sock"]
@@ -3809,10 +4009,26 @@ def cmd_snap(args):
         {"command-line": hmp_cmd},
         connect_timeout=5.0,
     )
-    if "error" in result:
-        _out({"ok": False, "qmp_error": result["error"]})
+    err = _hmp_error(result)
+    if err is not None:
+        # Surface the HMP error AND a remediation hint — full VM-state
+        # savevm needs a writable qcow2 device to hold the RAM blob; the
+        # default firefox-test boot disk (vvfat/raw) cannot store one.
+        _out({
+            "ok": False,
+            "hmp_error": err,
+            "name": name,
+            "op": op,
+            "remediation": (
+                "savevm/loadvm requires a writable qcow2 device to hold the "
+                "VM state. The default firefox-test data/boot disks are "
+                "raw/vvfat and cannot store a snapshot. Attach a qcow2 "
+                "scratch device at start (see snap-gate spec) before saving."
+            ),
+        })
     else:
-        _out({"ok": True, "name": name, "op": op})
+        _out({"ok": True, "name": name, "op": op,
+              "hmp_return": result.get("return", "") if isinstance(result, dict) else ""})
 
 
 def cmd_run_watcher(args):
@@ -4923,6 +5139,23 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
                     "(expected on|off|reset or none)"
                 )
         return req
+    if op == "cond-autopsy":
+        # One-shot musl pthread_cond/mutex wake-target-vs-wait-addr report.
+        #   kdb <sid> cond-autopsy <pid> <cond_va> [<half>]   (half default 128)
+        # Composes the live struct dump + parked waiters (FUTEX_WAITERS in
+        # [va-half, va+half]) + recent FUTEX_WAKE targets + inferred lock
+        # holder into ONE JSON object with a verdict_hint.  The cond_va is
+        # canonicalised to 0x-prefixed hex so the kernel parse_u64 sees the
+        # prefix (matching the arm-phys branch).  Requires --features kdb;
+        # the recent_wakes section additionally needs firefox-test/test-mode.
+        if len(rest) < 2:
+            raise ValueError(
+                "cond-autopsy requires <pid> <cond_va> [<half>]")
+        half = int(rest[2], 0) if len(rest) >= 3 else 128
+        return {"op": "cond-autopsy",
+                "pid": int(rest[0], 0),
+                "addr": f"0x{int(rest[1], 0):x}",
+                "half": half}
     raise ValueError(f"unknown kdb op: {op}")
 
 
@@ -5030,10 +5263,55 @@ def cmd_kdb(args):
     state["last_ping_unix"] = int(time.time())
     state["operations_called"] = int(state.get("operations_called", 0)) + 1
     state.setdefault("last_response", {})[args.op] = resp
+
+    # cond-autopsy: derive a one-line human summary so the recurring manual
+    # interpretation ("waiter at +delta, holder runnable?") is a glance.
+    # Purely additive — the machine-readable verdict_hint stays the source of
+    # truth; `summary` is a derived convenience key.
+    if args.op == "cond-autopsy" and isinstance(resp, dict) and "verdict_hint" in resp:
+        try:
+            resp["summary"] = _cond_autopsy_summary(resp)
+        except Exception:
+            pass
+
     try: cache.write_text(json.dumps(state))
     except OSError: pass
 
     _out(resp)
+
+
+def _cond_autopsy_summary(resp: dict) -> str:
+    """One-line gloss of a cond-autopsy response.
+
+    e.g. `VERDICT=wake-address-mismatch waiters=3@{+0x50,+0x54} holder=tid14`
+    `(blocked,runs=false) recent_wakes=2@{+0x50}`.
+    """
+    verdict = resp.get("verdict_hint", "?")
+    waiters = resp.get("waiters", []) or []
+    wakes   = resp.get("recent_wakes", []) or []
+    holder  = resp.get("holder", {}) or {}
+
+    def _deltas(rows):
+        seen = []
+        for r in rows:
+            try:
+                d = int(r.get("delta", 0))
+            except (TypeError, ValueError):
+                continue
+            tag = f"+0x{d:x}" if d >= 0 else f"-0x{-d:x}"
+            if tag not in seen:
+                seen.append(tag)
+        return ("{" + ",".join(seen[:6]) + "}") if seen else "{}"
+
+    w_part = f"waiters={len(waiters)}@{_deltas(waiters)}"
+    k_part = f"recent_wakes={len(wakes)}@{_deltas(wakes)}"
+    ot = holder.get("owner_tid", 0)
+    if ot and str(ot) != "0":
+        h_part = (f"holder=tid{ot}({holder.get('owner_state','?')},"
+                  f"runs={str(holder.get('owner_runs', False)).lower()})")
+    else:
+        h_part = "holder=none"
+    return f"VERDICT={verdict} {w_part} {h_part} {k_part}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -9898,6 +10176,10 @@ def main():
         "coverage-flush", "proc-metrics", "thread-park-audit",
         "rip-trace",
         "futex-ghost-hist",
+        # One-shot musl pthread_cond/mutex wake-target-vs-wait-addr report:
+        # struct dump + parked waiters + recent wakes + holder + verdict.
+        # See subsys/linux/futex_cluster.rs::recent_wakes_near + op_cond_autopsy.
+        "cond-autopsy",
         # Terse file-backed VMA map; one entry per VMA with first_page_phys.
         "procmaps",
         # FUTEX_WAKE cluster-wake compensation (firefox-test/test-mode only).
@@ -9919,7 +10201,8 @@ def main():
                              "syscall-trend [<seconds> [<pid>]] (def 5 0), "
                              "dmesg [tail], syms <name|0xaddr>, "
                              "mem <addr> <len>, "
-                             "rip-trace <tid> [<ms>] (def ms=1000)")
+                             "rip-trace <tid> [<ms>] (def ms=1000), "
+                             "cond-autopsy <pid> <cond_va> [<half>] (def half=128)")
     p_kdb.add_argument("--timeout", type=float, default=30.0,
                         help="Overall deadline in seconds (default 30.0). "
                              "Wraps retry/backoff for BSP starvation tolerance.")
@@ -10103,6 +10386,17 @@ def main():
     p_results = sub.add_parser("results",
         help="Parse per-test JSONL results from the session's serial log")
     p_results.add_argument("sid")
+
+    # ff-progress — structured FF gate-ladder + deepest-reached detector.
+    p_ffprog = sub.add_parser(
+        "ff-progress",
+        help="[Tier0] FF headless-screenshot gate ladder + deepest gate "
+             "reached (pure serial-log scan; no kdb). Ladder is read from "
+             "scripts/ff_gates.yaml (additive). Reports lib-load -> x11-ready "
+             "-> compositor-init -> ff-launch -> content-proc -> "
+             "screenshot-actors -> draw-snapshot -> png-write, plus max_sc "
+             "and terminal_cause.")
+    p_ffprog.add_argument("sid")
 
     # scrings — parse firefox-test syscall ring-buffer dumps from serial log.
     p_scrings = sub.add_parser(
@@ -10549,6 +10843,7 @@ def main():
         # Housekeeping / reporting
         "prune":   cmd_prune,
         "results": cmd_results,
+        "ff-progress": cmd_ff_progress,
         "scrings": cmd_scrings,
         "stack":   cmd_stack,
         "ustack":  cmd_ustack,

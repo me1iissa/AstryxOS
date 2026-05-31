@@ -368,6 +368,10 @@ pub fn dispatch(req: &str, out: &mut String) {
         #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
         "futex-set-cluster-wake" => op_futex_set_cluster_wake(req, out),
         "futex-ghost-hist" => op_futex_ghost_hist(req, out),
+        // cond-autopsy: one-shot musl pthread_cond/mutex wake-target-vs-
+        // wait-addr report.  Composes the live struct dump + parked waiters +
+        // recent wake targets + inferred lock holder into a single verdict.
+        "cond-autopsy"   => op_cond_autopsy(req, out),
         // INFRA-3 record/replay introspection.  Off-path when the
         // `record-replay` feature is OFF — the ops return a fixed
         // "feature off" JSON object so the KDB protocol surface is
@@ -2873,6 +2877,302 @@ fn op_futex_ghost_hist(req: &str, out: &mut String) {
 #[cfg(not(any(feature = "firefox-test", feature = "test-mode")))]
 fn op_futex_ghost_hist(_req: &str, out: &mut String) {
     out.push_str(r#"{"error":"futex-ghost-hist requires firefox-test or test-mode feature"}"#);
+}
+
+// ── cond-autopsy ────────────────────────────────────────────────────────────
+//
+// One-shot wake-target-vs-wait-addr report for a musl pthread_cond_t / mutex.
+//
+// The decisive recurring question at a condvar/mutex livelock is: "the waiter
+// parks on uaddr X, but the wake targets uaddr Y — what is the delta, who
+// holds the lock, and does the holder ever run?".  This op composes the
+// already-tracked pieces into ONE structured object so the answer is a single
+// argv call rather than five.
+//
+// Request: {"op":"cond-autopsy","pid":N,"addr":"0x..","half":N}  (half def 128)
+//
+// Response fields:
+//   pid, addr, half
+//   cr3                  — guest CR3 the user reads were resolved under
+//   struct.hex           — `STRUCT_WORDS` u64 words read live from `addr`
+//                          (LE-byte hex string), unmapped slots filled "..".
+//   struct.mutex/.cond   — labelled musl field decode (both sets emitted;
+//                          the caller picks the one matching the object).
+//   waiters[]            — every FUTEX_WAITERS entry in [addr-half, addr+half]
+//                          for `pid`: {tid, uaddr, delta, state, nr, rip}
+//   recent_wakes[]       — recent FUTEX_WAKE targets in the same window
+//                          (firefox-test/test-mode only): {tid, uaddr, delta}
+//   holder               — inferred lock owner {owner_tid, owner_state,
+//                          owner_runs, source}
+//   verdict_hint         — wake-address-mismatch | held-lock-deadlock |
+//                          owner-starved | true-lost-wakeup | benign-empty
+//   summary              — one-line human gloss of the verdict
+//
+// Public references: pthread_cond_signal(3p), pthread_mutex_lock(3p),
+// futex(2).  The musl struct field offsets used below match the public
+// `pthread_cond_t` / `pthread_mutex_t` layout (musl exposes `__u.__vi[]` and
+// the `_c_*` / `_m_*` accessor macros in its public headers).
+//
+// Bounded: ≤ 64 waiters, ≤ 64 wakes, 12 struct words → response < 4 KB.
+
+/// Number of 64-bit words dumped from the cond/mutex object (96 bytes —
+/// covers a full musl pthread_cond_t plus the head of an adjacent object).
+const COND_STRUCT_WORDS: u64 = 12;
+
+/// Decode the low-30-bit owner-tid field from a musl mutex `_m_lock` word.
+/// musl stores the owning kernel TID in the low bits of `_m_lock`
+/// (`__u.__vi[1]`, offset +4); the high bits carry FUTEX_WAITERS (0x8000_0000)
+/// and the robust/owner-dead markers.
+#[inline]
+fn musl_mutex_owner_tid(m_lock_word: u32) -> u32 { m_lock_word & 0x3FFF_FFFF }
+
+fn op_cond_autopsy(req: &str, out: &mut String) {
+    use core::fmt::Write;
+
+    let pid = match extract_field(req, "pid").and_then(|s| parse_u64(&s)) {
+        Some(p) => p,
+        None => { out.push_str(r#"{"error":"missing or bad 'pid'"}"#); return; }
+    };
+    let addr = match extract_field(req, "addr").and_then(|s| parse_u64(&s)) {
+        Some(a) => a,
+        None => { out.push_str(r#"{"error":"missing or bad 'addr'"}"#); return; }
+    };
+    if addr >= astryx_shared::KERNEL_VIRT_BASE {
+        out.push_str(r#"{"error":"addr must be a user (canonical low-half) VA"}"#);
+        return;
+    }
+    // `half` window for waiter / wake scan.  Default 128 B (covers a full
+    // pthread_cond_t with margin); clamp to a sane bound so the scan stays
+    // cheap and the response stays < 4 KB.
+    let half = extract_field(req, "half")
+        .and_then(|s| parse_u64(&s))
+        .unwrap_or(128)
+        .clamp(4, 0x400);
+
+    let cr3 = match crate::proc::get_process_cr3(pid) {
+        Some(c) => c,
+        None => { let _ = write!(out, r#"{{"error":"pid {} has no cr3"}}"#, pid); return; }
+    };
+
+    // ── Stage 1: live struct dump ──────────────────────────────────────
+    // Read COND_STRUCT_WORDS u64s via the foreign-CR3 software walk (cannot
+    // fault).  None for an unmapped slot → "..".  We keep both the raw word
+    // array (for the decode below) and the hex string (for the caller).
+    let mut words: [Option<u64>; COND_STRUCT_WORDS as usize] =
+        [None; COND_STRUCT_WORDS as usize];
+    let mut struct_hex = String::with_capacity(COND_STRUCT_WORDS as usize * 16);
+    let mut any_mapped = false;
+    for i in 0..COND_STRUCT_WORDS {
+        let va = addr.wrapping_add(i * 8);
+        match crate::proc::sample::read_user_u64_at(cr3, va) {
+            Some(w) => {
+                words[i as usize] = Some(w);
+                any_mapped = true;
+                // Little-endian byte order so the hex reads as memory bytes.
+                for b in 0..8 { let _ = write!(struct_hex, "{:02x}", (w >> (b * 8)) & 0xff); }
+            }
+            None => { struct_hex.push_str(".."); for _ in 0..14 { struct_hex.push('.'); } }
+        }
+    }
+
+    // Helper: extract a 32-bit field at byte offset `off` from the dumped
+    // words (assumes `off` is 4-byte aligned and within the dump).
+    let u32_at = |off: u64| -> Option<u32> {
+        let wi = (off / 8) as usize;
+        if wi >= words.len() { return None; }
+        words[wi].map(|w| if off % 8 == 0 { w as u32 } else { (w >> 32) as u32 })
+    };
+
+    // ── Stage 2: parked waiters in the window ──────────────────────────
+    struct WaiterRow { tid: u64, uaddr: u64, delta: i64 }
+    let lo = addr.saturating_sub(half);
+    let hi = addr.saturating_add(half);
+    let mut waiters_busy = false;
+    let mut waiter_rows: Vec<WaiterRow> = Vec::new();
+    match try_lock_brief(&crate::syscall::FUTEX_WAITERS) {
+        Some(w) => {
+            for (&(wpid, wuaddr), tids) in w.range((pid, lo)..=(pid, hi)) {
+                if wpid != pid { continue; }
+                if tids.is_empty() { continue; }
+                for &tid in tids.iter() {
+                    waiter_rows.push(WaiterRow {
+                        tid, uaddr: wuaddr,
+                        delta: wuaddr as i64 - addr as i64,
+                    });
+                    if waiter_rows.len() >= 64 { break; }
+                }
+                if waiter_rows.len() >= 64 { break; }
+            }
+        }
+        None => waiters_busy = true,
+    }
+
+    // ── Stage 3: thread states (for waiter + holder state lookup) ──────
+    // Snapshot tid → (state, runnable) so the emit phase needs no lock.
+    let mut tid_state: alloc::collections::BTreeMap<u64, (&'static str, bool)> =
+        alloc::collections::BTreeMap::new();
+    if let Some(tt) = try_lock_brief(&THREAD_TABLE) {
+        for t in tt.iter() {
+            let runnable = matches!(t.state,
+                crate::proc::ThreadState::Ready | crate::proc::ThreadState::Running);
+            tid_state.insert(t.tid, (thread_state_str(t.state), runnable));
+        }
+    }
+
+    // ── Stage 4: recent wake targets in the window ─────────────────────
+    // firefox-test/test-mode only — the per-CPU wake rings live in the
+    // feature-gated futex_cluster module.  Empty otherwise.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    let recent_wakes: alloc::vec::Vec<(u64, u64, i64)> =
+        crate::subsys::linux::futex_cluster::recent_wakes_near(addr, half);
+    #[cfg(not(any(feature = "firefox-test", feature = "test-mode")))]
+    let recent_wakes: alloc::vec::Vec<(u64, u64, i64)> = alloc::vec::Vec::new();
+
+    // ── Stage 5: holder inference ──────────────────────────────────────
+    // For a mutex the owner is the low-30 bits of `_m_lock` (offset +4).
+    // For a cond the "holder" is whichever thread most recently woke a
+    // NON-zero-delta target (the signaller advancing a paired mutex); we
+    // surface the mutex decode as primary and the cond signaller as a hint.
+    let m_lock = u32_at(4);
+    let m_owner_tid = m_lock.map(musl_mutex_owner_tid).filter(|&t| t != 0);
+    // Cond signaller hint: nearest non-zero-delta recent wake.
+    let cond_signaller: Option<u64> = recent_wakes.iter()
+        .filter(|&&(_, _, d)| d != 0)
+        .min_by_key(|&&(_, _, d)| d.unsigned_abs())
+        .map(|&(tid, _, _)| tid);
+    let (owner_tid, owner_source): (Option<u64>, &'static str) = match m_owner_tid {
+        Some(t) => (Some(t as u64), "m_lock"),
+        None => (cond_signaller, if cond_signaller.is_some() { "cond_signaller" } else { "none" }),
+    };
+    let owner_state_run = owner_tid.and_then(|t| tid_state.get(&t).copied());
+
+    // ── Stage 6: verdict ───────────────────────────────────────────────
+    // Decision logic (matches the 4-case audit shape):
+    //   benign-empty        : no waiter anywhere in the window
+    //   true-lost-wakeup     : a waiter parks EXACTLY at `addr` (delta 0) but
+    //                          the object shows no live owner & a wake fired
+    //   wake-address-mismatch: a waiter parks at a NON-zero delta and a
+    //                          recent wake targets a DIFFERENT slot in-window
+    //   held-lock-deadlock   : an owner is named and is NOT runnable
+    //   owner-starved        : an owner is named, IS runnable, yet a waiter
+    //                          is still parked (owner hasn't been scheduled)
+    let waiter_at_exact = waiter_rows.iter().any(|w| w.delta == 0);
+    let waiter_at_offset = waiter_rows.iter().any(|w| w.delta != 0);
+    let wake_offset_mismatch = recent_wakes.iter().any(|&(_, _, d)| d != 0)
+        && waiter_rows.iter().any(|w| !recent_wakes.iter().any(|&(_, u, _)| u == w.uaddr));
+    let (verdict, reason): (&'static str, &'static str) = if waiter_rows.is_empty() {
+        ("benign-empty", "no parked waiter in the cluster window")
+    } else if let Some((_, runnable)) = owner_state_run {
+        if !runnable {
+            ("held-lock-deadlock", "named lock owner is not runnable")
+        } else if waiter_at_offset || waiter_at_exact {
+            ("owner-starved", "owner is runnable but a waiter is still parked")
+        } else {
+            ("benign-empty", "owner runnable, no blocked waiter")
+        }
+    } else if wake_offset_mismatch || (waiter_at_offset && !waiter_at_exact) {
+        ("wake-address-mismatch", "waiter parked at a delta the wake never targeted")
+    } else if waiter_at_exact {
+        ("true-lost-wakeup", "waiter parked exactly at addr; no owner, wake missed")
+    } else {
+        ("benign-empty", "waiters present but classification inconclusive")
+    };
+
+    // ── Stage 7: emit JSON ─────────────────────────────────────────────
+    out.push('{');
+    j_kv(out, "pid", &alloc::format!("{}", pid));
+    j_str(out, "addr"); out.push(':'); j_hex(out, addr); out.push(',');
+    j_str(out, "cr3");  out.push(':'); j_hex(out, cr3);  out.push(',');
+    j_kv(out, "half", &alloc::format!("{}", half));
+
+    // struct
+    out.push_str("\"struct\":{");
+    j_kv_str(out, "hex", &struct_hex);
+    j_kv(out, "any_mapped", if any_mapped { "true" } else { "false" });
+    // mutex decode
+    out.push_str("\"mutex\":{");
+    if let Some(l) = m_lock {
+        j_str(out, "m_lock"); out.push(':'); j_hex(out, l as u64); out.push(',');
+        j_kv(out, "owner_tid", &alloc::format!("{}", musl_mutex_owner_tid(l)));
+        j_kv(out, "waiters_bit", if l & 0x8000_0000 != 0 { "true" } else { "false" });
+    }
+    if let Some(w) = u32_at(8) { j_str(out, "m_waiters"); out.push(':'); j_hex(out, w as u64); out.push(','); }
+    j_trim_comma(out); out.push_str("},");
+    // cond decode
+    out.push_str("\"cond\":{");
+    if let Some(s) = u32_at(8)  { j_str(out, "c_seq");      out.push(':'); j_hex(out, s as u64); out.push(','); }
+    if let Some(s) = u32_at(12) { j_str(out, "c_waiters");  out.push(':'); j_hex(out, s as u64); out.push(','); }
+    if let Some(s) = u32_at(0)  { j_str(out, "c_lock");     out.push(':'); j_hex(out, s as u64); out.push(','); }
+    j_trim_comma(out); out.push('}');   // close "cond"
+    out.push('}');                       // close "struct"
+    out.push(',');
+
+    // waiters
+    if waiters_busy { out.push_str("\"waiters_busy\":true,"); }
+    out.push_str("\"waiters\":[");
+    for (i, w) in waiter_rows.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        let (st, _) = tid_state.get(&w.tid).copied().unwrap_or(("?", false));
+        let (nr, rip) = match crate::proc::sample::read_sample(w.tid) {
+            Some(s) => (s.last_syscall_nr, s.last_user_rip),
+            None => (u64::MAX, 0),
+        };
+        out.push('{');
+        j_kv(out, "tid", &alloc::format!("{}", w.tid));
+        j_str(out, "uaddr"); out.push(':'); j_hex(out, w.uaddr); out.push(',');
+        j_kv(out, "delta", &alloc::format!("{}", w.delta));
+        j_kv_str(out, "state", st);
+        if nr != u64::MAX { j_kv(out, "nr", &alloc::format!("{}", nr)); }
+        j_str(out, "rip"); out.push(':'); j_hex(out, rip); out.push(',');
+        j_trim_comma(out);
+        out.push('}');
+    }
+    out.push_str("],");
+
+    // recent_wakes
+    out.push_str("\"recent_wakes\":[");
+    for (i, &(tid, u, d)) in recent_wakes.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        out.push('{');
+        j_kv(out, "tid", &alloc::format!("{}", tid));
+        j_str(out, "uaddr"); out.push(':'); j_hex(out, u); out.push(',');
+        j_kv(out, "delta", &alloc::format!("{}", d));
+        j_trim_comma(out);
+        out.push('}');
+    }
+    out.push_str("],");
+
+    // holder
+    out.push_str("\"holder\":{");
+    match owner_tid {
+        Some(t) => {
+            j_kv(out, "owner_tid", &alloc::format!("{}", t));
+            let (st, runs) = owner_state_run.unwrap_or(("unknown", false));
+            j_kv_str(out, "owner_state", st);
+            j_kv(out, "owner_runs", if runs { "true" } else { "false" });
+        }
+        None => { j_kv(out, "owner_tid", "0"); j_kv_str(out, "owner_state", "none"); j_kv(out, "owner_runs", "false"); }
+    }
+    j_kv_str(out, "source", owner_source);
+    j_trim_comma(out); out.push_str("},");
+
+    j_kv_str(out, "verdict_hint", verdict);
+    j_kv_str(out, "reason", reason);
+    j_trim_comma(out);
+    out.push('}');
+
+    // Serial mirror for TCP-drain recovery (mirrors op_thread_park_audit's
+    // [THREAD-PARK] side channel).  One compact line; the harness can
+    // reconstruct the verdict from serial even if the JSON envelope is
+    // truncated mid-flight under load.
+    crate::serial_println!(
+        "[COND-AUTOPSY] pid={} addr={:#x} verdict={} waiters={} recent_wakes={} \
+         owner_tid={} owner_runs={} reason={}",
+        pid, addr, verdict, waiter_rows.len(), recent_wakes.len(),
+        owner_tid.unwrap_or(0),
+        owner_state_run.map(|(_, r)| r).unwrap_or(false),
+        reason
+    );
 }
 
 fn file_type_str(ft: crate::vfs::FileType) -> &'static str {

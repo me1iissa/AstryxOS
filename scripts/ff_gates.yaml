@@ -1,0 +1,69 @@
+# scripts/ff_gates.yaml
+#
+# Ordered Firefox-headless-screenshot gate ladder for
+# `qemu-harness.py ff-progress <sid>`.
+#
+# Each entry names a canonical progress marker in the session serial log.
+# `ff-progress` scans the log once, records the first line each gate is seen
+# at (plus the live syscall count at that point), and reports the DEEPEST gate
+# reached — replacing the recurring hand-grep "how far did this boot get?".
+#
+# Schema (per gate):
+#   id:           short stable identifier (used as the JSON key)
+#   marker_regex: Python regex matched against each serial line
+#   kind:         "line"     — anchored line scan (default), OR
+#                 "ipc-body" — substring scan: the marker lives INSIDE the
+#                              base64/escaped body="..." payload of an
+#                              `[FF/write]` IPC line, so it is NOT line-
+#                              anchored.  This is the one non-obvious gate.
+#   desc:         human-readable description (carried into the JSON output)
+#
+# The ladder is ORDER-SIGNIFICANT: gate N is "deeper" than gate N-1.  Future
+# agents extend the ladder by appending entries (additive — no code change;
+# ff-progress reads this file at runtime, mirroring the
+# scripts/differential/snapshots.yaml convention).
+#
+# Public references: the markers are AstryxOS test-runner / GUI / Linux-
+# personality serial output; the IPC bodies are Gecko PContent/PScreenshot
+# actor messages (Mozilla public IPDL protocol names).
+
+gates:
+  - id: lib-load
+    marker_regex: '\[FFTEST\]\s+Cached\s+\S*libxul\.so\s+\((?!0 pages)'
+    kind: line
+    desc: "libxul.so mapped/cached (real load, not the 0-page stub probe)"
+
+  - id: x11-ready
+    marker_regex: '\[FFTEST\]\s+X11 server ready'
+    kind: line
+    desc: "Xastryx server up; FF can connect to the display"
+
+  - id: compositor-init
+    marker_regex: '\[GUI\]\s+Compositor initialized'
+    kind: line
+    desc: "WebRender/compositor framebuffer initialized"
+
+  - id: ff-launch
+    marker_regex: '\[FFTEST\]\s+Launching\s+\S*firefox'
+    kind: line
+    desc: "firefox-bin exec'd"
+
+  - id: content-proc
+    marker_regex: '\[FF/write\]\s+pid=2\b'
+    kind: line
+    desc: "content process (pid 2) spawned and producing IPC"
+
+  - id: screenshot-actors
+    marker_regex: 'ScreenshotParent|getDimensions|sendQuery'
+    kind: ipc-body
+    desc: "HeadlessShell screenshot IPC actors loaded (ScreenshotParent/getDimensions/sendQuery) — the deep screenshot-IPC gate"
+
+  - id: draw-snapshot
+    marker_regex: 'drawSnapshot'
+    kind: ipc-body
+    desc: "drawSnapshot invoked — paint of the target page begins"
+
+  - id: png-write
+    marker_regex: 'Screenshot saved|out\.png|\[SCREENSHOT-B64:'
+    kind: line
+    desc: "PNG encoded / written — demo SUCCESS"
