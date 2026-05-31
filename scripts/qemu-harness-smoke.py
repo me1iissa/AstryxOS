@@ -483,6 +483,32 @@ def run_snapgate_argv_check():
     check("snap data disk is the qcow2 overlay",
           any("file=/x/ov.qcow2,format=qcow2,if=none,id=data0" in x for x in s),
           "data overlay missing")
+    # Data-overlay binding (snap-gate data-overlay fix): the snapshottable
+    # topology presents TWO virtio-blk devices (boot ESP + data overlay).  The
+    # kernel's singleton virtio-blk driver binds the FIRST device in
+    # ascending-PCI-slot order, so the ext2 data overlay MUST be pinned to a
+    # LOWER slot than the boot ESP — otherwise the guest binds the ~504 MiB
+    # vvfat boot disk and the data mount fails ("neither FAT32 nor ext2").
+    try:
+        boot_dev = next(x for x in s if "virtio-blk-pci,drive=boot0" in x)
+        data_dev = next(x for x in s if "virtio-blk-pci,drive=data0" in x)
+
+        def _addr(dev):
+            for tok in dev.split(","):
+                if tok.startswith("addr="):
+                    return int(tok.split("=", 1)[1], 0)
+            return None
+
+        a_boot, a_data = _addr(boot_dev), _addr(data_dev)
+        check("snap data overlay + boot ESP both have pinned PCI addr",
+              a_boot is not None and a_data is not None,
+              f"boot_addr={a_boot} data_addr={a_data}")
+        check("snap data overlay pinned to LOWER PCI slot than boot ESP",
+              a_data is not None and a_boot is not None and a_data < a_boot,
+              f"data@{a_data} boot@{a_boot} (data must be < boot)")
+    except StopIteration:
+        check("snap data overlay + boot ESP both have pinned PCI addr", False,
+              "could not locate both virtio-blk -device lines")
     # vmstate must precede the data overlay so bdrv_all_find_vmstate_bs picks it.
     try:
         i_vm = next(i for i, x in enumerate(s) if "id=vmstate0" in x)
