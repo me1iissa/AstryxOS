@@ -374,7 +374,21 @@ where
         Some(v) => v,
         None => return FutexWaitOutcome::Fault,
     };
-    if current as u64 != val {
+    // Per futex(2): "The futex word is a 32-bit field."  The FUTEX_WAIT
+    // comparison is `*uaddr == val` over those 32 bits only — the kernel
+    // must ignore any bits the caller placed above bit 31 of the `val`
+    // syscall argument.  This matters because the futex `val` argument is
+    // typed `int` in the C library wrappers (e.g. pthread_mutex_timedlock's
+    // `__timedwait(addr, val, …)` where `val` carries the mutex word with
+    // bit 31 — the contended-waiters bit — set).  Widening a negative `int`
+    // to the 64-bit syscall register sign-extends it: a futex word of
+    // 0x8000_0010 arrives as 0xFFFF_FFFF_8000_0010.  Comparing the
+    // zero-extended 32-bit `*uaddr` (0x0000_0000_8000_0010) against the full
+    // 64-bit `val` would then mismatch in the high half on every call,
+    // returning EAGAIN forever and never parking the waiter — a contended
+    // mutex's owner-handoff wait spins instead of sleeping.  Truncate `val`
+    // to 32 bits before the compare, matching the 32-bit futex-word contract.
+    if current != (val as u32) {
         return FutexWaitOutcome::ValueMismatch;
     }
 
