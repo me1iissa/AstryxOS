@@ -1,0 +1,22 @@
+# Gemfile for the AstryxOS documentation site (docs/).
+#
+# The site is built by GitHub Pages using the github-pages gem, which pins a
+# Jekyll + plugin set compatible with the Pages build environment. The
+# just-the-docs theme is pulled in via `remote_theme` in _config.yml, so it is
+# not listed as a hard dependency here; jekyll-remote-theme (bundled with
+# github-pages) fetches it at build time.
+#
+# To build locally:  bundle install && bundle exec jekyll build
+source "https://rubygems.org"
+
+gem "github-pages", group: :jekyll_plugins
+
+# Plugins referenced by _config.yml.
+group :jekyll_plugins do
+  gem "jekyll-remote-theme"
+  gem "jekyll-seo-tag"
+end
+
+# Windows / JRuby support and a faster file watcher (harmless elsewhere).
+gem "webrick", "~> 1.8"
+gem "wdm", "~> 0.1", platforms: [:mingw, :x64_mingw, :mswin]
