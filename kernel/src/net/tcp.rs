@@ -212,6 +212,26 @@ fn gc_closed_in(conns: &mut alloc::vec::Vec<TcpConnection>, now: u64) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// A fully-built outbound TCP segment captured while the `TCP_CONNECTIONS`
+/// lock is held, to be transmitted by the caller *after* the lock is
+/// dropped.
+///
+/// The receive path (`handle_tcp` → `process_segment`) must never call
+/// `ipv4::send_ipv4` while `TCP_CONNECTIONS` is held: the transmit path
+/// can re-enter `net::poll()` (ARP resolution polls the RX ring inside
+/// `ipv4::resolve_mac`), which re-enters `handle_tcp` and would take
+/// `TCP_CONNECTIONS` a second time on the same CPU.  A `spin::Mutex` is
+/// not reentrant, so that is an immediate self-deadlock; on SMP a second
+/// core spinning on `TCP_CONNECTIONS` during the (unbounded, I/O-bearing)
+/// transmit is never timer-preempted in Ring 0 and stalls the machine.
+/// Capturing the segment under the lock and sending it after the drop
+/// mirrors the established discipline already used by `send_data_inner`
+/// and `tcp_timer_tick`.
+struct OutSeg {
+    remote_ip: Ipv4Address,
+    seg:       Vec<u8>,
+}
+
 /// TCP pseudo-header checksum.
 fn tcp_checksum(src: Ipv4Address, dst: Ipv4Address, tcp: &[u8]) -> u16 {
     let mut buf = Vec::with_capacity(12 + tcp.len());
@@ -403,7 +423,18 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
         c.remote_port == hdr.src_port
     );
     if let Some(i) = idx {
-        process_segment(&mut conns[i], &hdr, payload);
+        // Capture any reply segments under the lock, then drop the lock
+        // BEFORE transmitting — `ipv4::send_ipv4` can re-enter `net::poll()`
+        // (ARP resolution) and thus re-enter `handle_tcp`, which would take
+        // `TCP_CONNECTIONS` a second time on this CPU (self-deadlock), and
+        // on SMP would stall a peer core spinning on the lock across the
+        // unbounded transmit.  See `OutSeg`.
+        let mut out: Vec<OutSeg> = Vec::new();
+        process_segment(&mut conns[i], &hdr, payload, &mut out);
+        drop(conns);
+        for o in out {
+            super::ipv4::send_ipv4(o.remote_ip, super::ipv4::PROTO_TCP, &o.seg);
+        }
         return;
     }
 
@@ -476,8 +507,11 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
     }
 }
 
-/// Process one segment on an existing connection (lock already held by caller).
-fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8]) {
+/// Process one segment on an existing connection (lock already held by
+/// caller).  Any reply segments are pushed into `out` for the caller to
+/// transmit *after* releasing the `TCP_CONNECTIONS` lock — see `OutSeg`.
+fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8],
+                   out: &mut Vec<OutSeg>) {
     conn.peer_window = hdr.window as u32;
 
     let lp = conn.local_port;
@@ -496,7 +530,7 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8]) {
                 let sn = conn.send_next;
                 let rn = conn.recv_next;
                 let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
-                super::ipv4::send_ipv4(rip, super::ipv4::PROTO_TCP, &s);
+                out.push(OutSeg { remote_ip: rip, seg: s });
             }
         }
 
@@ -520,7 +554,7 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8]) {
                 let sn = conn.send_next;
                 let rn = conn.recv_next;
                 let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
-                super::ipv4::send_ipv4(rip, super::ipv4::PROTO_TCP, &s);
+                out.push(OutSeg { remote_ip: rip, seg: s });
             }
             // FIN from peer.
             if hdr.flags & FIN != 0 {
@@ -529,7 +563,7 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8]) {
                 let sn = conn.send_next;
                 let rn = conn.recv_next;
                 let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
-                super::ipv4::send_ipv4(rip, super::ipv4::PROTO_TCP, &s);
+                out.push(OutSeg { remote_ip: rip, seg: s });
             }
         }
 
@@ -545,7 +579,7 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8]) {
                 let sn = conn.send_next;
                 let rn = conn.recv_next;
                 let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
-                super::ipv4::send_ipv4(rip, super::ipv4::PROTO_TCP, &s);
+                out.push(OutSeg { remote_ip: rip, seg: s });
             } else if hdr.flags & ACK != 0 {
                 // Pure ACK (no FIN): move to FinWait2.
                 conn.state = TcpState::FinWait2;
@@ -560,7 +594,7 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8]) {
                 let sn = conn.send_next;
                 let rn = conn.recv_next;
                 let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
-                super::ipv4::send_ipv4(rip, super::ipv4::PROTO_TCP, &s);
+                out.push(OutSeg { remote_ip: rip, seg: s });
             }
         }
 
