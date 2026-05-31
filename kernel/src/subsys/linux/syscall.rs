@@ -8877,7 +8877,14 @@ pub fn sys_futex_linux(
                     Some(v) => v,
                     None => return -14, // EFAULT
                 };
-                if current as u64 != _val3 {
+                // Per futex(2), the futex word is 32-bit; compare only the low
+                // 32 bits of `val3`.  The `val3` argument is typed `int` in the
+                // C-library wrappers, so a value with bit 31 set arrives in the
+                // 64-bit syscall register sign-extended (high half all-ones).
+                // A full-width compare against the zero-extended 32-bit `*uaddr`
+                // would mismatch in the high half and spuriously return EAGAIN,
+                // breaking the pthread_cond broadcast/requeue handshake.
+                if current != (_val3 as u32) {
                     return -11; // EAGAIN — *uaddr changed under us
                 }
             }
