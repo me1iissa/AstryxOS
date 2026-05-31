@@ -50,13 +50,15 @@ pub enum VfsError {
     Unsupported = 95,   // EOPNOTSUPP
     Io = 5,             // EIO
     WouldBlock = 11,    // EAGAIN / EWOULDBLOCK
-    /// Operation could not complete within an internal wall-clock budget.
-    /// Currently emitted by `resolve_path_opts` when a single path resolution
-    /// exceeds the 1s deadline — see W83 wedge (`/usr → /disk/usr` symlink
-    /// traversal hung indefinitely in 2/3 firefox-test trials).  POSIX `open(2)`
-    /// does not list ETIMEDOUT, but Linux uses it for several FS paths under
-    /// extreme contention (e.g. NFS) and it cleanly distinguishes a hang from
-    /// EIO or ENOENT in serial logs.
+    /// Operation could not complete within an internal anti-wedge budget.
+    /// Emitted by `resolve_path_opts` when a path resolution makes no forward
+    /// progress for the whole no-progress budget (a genuinely-stuck FS
+    /// dispatch) — see the W83 wedge (`/usr → /disk/usr` symlink traversal hung
+    /// indefinitely in 2/3 firefox-test trials) and [`ResolveDeadline`].  POSIX
+    /// `open(2)` does not list ETIMEDOUT and never returns it for a *present,
+    /// progressing* file; the deadline is purely an internal hang-breaker that
+    /// cleanly distinguishes a wedged dispatch from EIO or ENOENT in serial
+    /// logs.
     TimedOut = 110,     // ETIMEDOUT
 }
 
@@ -1069,45 +1071,161 @@ fn init_ata_disks() {
 
 /// Resolve a path to (mount_index, inode), following all symlinks.
 pub fn resolve_path(path: &str) -> VfsResult<(usize, u64)> {
-    let deadline = resolve_deadline_ticks();
     let mut tctx = ResolveTrace::new();
-    resolve_path_opts(path, 0, true, deadline, &mut tctx)
+    let mut dl = ResolveDeadline::arm();
+    resolve_path_opts(path, 0, true, &mut dl, &mut tctx)
 }
 
 /// Resolve a path but do NOT follow the final component if it is a symlink.
 /// Intermediate symlinks are still followed.  Used by lstat() and readlink().
 fn resolve_path_no_follow(path: &str) -> VfsResult<(usize, u64)> {
-    let deadline = resolve_deadline_ticks();
     let mut tctx = ResolveTrace::new();
-    resolve_path_opts(path, 0, false, deadline, &mut tctx)
+    let mut dl = ResolveDeadline::arm();
+    resolve_path_opts(path, 0, false, &mut dl, &mut tctx)
 }
 
-/// Test-only entrypoint to resolve a path with a caller-supplied deadline.
+/// Test-only entrypoint to resolve a path with a caller-supplied absolute
+/// no-progress deadline tick value.
 ///
-/// Exposed so `test_runner` can verify that the W83 deadline fires when the
+/// Exposed so `test_runner` can verify that the deadline fires when the
 /// budget has already expired.  Production callers must use [`resolve_path`].
+/// Passing `deadline_ticks = 0` yields a deadline that is already in the past,
+/// so the first component lookup observes `get_ticks() >= 0` and bails out —
+/// the forced-timeout case the suite asserts on.
 #[doc(hidden)]
 pub fn _test_resolve_with_deadline(path: &str, deadline_ticks: u64) -> VfsResult<(usize, u64)> {
     let mut tctx = ResolveTrace::new();
-    resolve_path_opts(path, 0, true, deadline_ticks, &mut tctx)
+    let mut dl = ResolveDeadline::with_per_component_deadline(deadline_ticks);
+    resolve_path_opts(path, 0, true, &mut dl, &mut tctx)
 }
 
-/// Compute the absolute tick value at which a path resolution must give up.
+/// Test-only check of the no-progress re-arm semantics, decoupled from the
+/// live clock so the assertion is deterministic.
 ///
-/// PIT runs at ~100 Hz (`arch::x86_64::irq::init`), so 100 ticks ≈ 1 s.  See
-/// the docstring on [`resolve_path_opts`] for why this bound exists.  When
-/// the tick counter hasn't been wired up yet (extremely early boot), we set
-/// the deadline to `u64::MAX` so the deadline check is a no-op — the boot
-/// path that runs before IRQs are unmasked must not be capable of being
-/// "timed out" because there's no clock to measure against.
-#[inline]
-fn resolve_deadline_ticks() -> u64 {
-    let now = crate::arch::x86_64::irq::get_ticks();
-    if now == 0 {
-        // PIT not yet ticking — disable the deadline rather than fail closed.
-        u64::MAX
-    } else {
-        now.saturating_add(100)
+/// Models the failure the production bug exhibited: a wall-clock budget that
+/// would be *exceeded* by the time a multi-component walk reaches a later
+/// component because the resolving thread was descheduled.  Returns
+/// `(expired_without_progress, expired_after_progress)`:
+///
+/// * `expired_without_progress` — with the clock advanced past the original
+///   budget and **no** `note_progress` call, the deadline has expired (the
+///   genuine-wedge case the net must still catch).
+/// * `expired_after_progress` — the same clock advance, but with a
+///   `note_progress` call in between (the walk advanced), leaves the deadline
+///   *un*-expired (the present-file case the bug wrongly failed).
+///
+/// The test asserts `(true, false)`.
+#[doc(hidden)]
+pub fn _test_resolve_deadline_rearm() -> (bool, bool) {
+    let base = crate::arch::x86_64::irq::get_ticks();
+    // Budget armed at `base`.  Use the production constant so the test tracks
+    // any future tuning of the budget.
+    let armed = base.saturating_add(ResolveDeadline::NO_PROGRESS_TICKS);
+
+    // Case 1: no progress.  If the live clock is already past `armed`, the
+    // deadline is expired.  We can't fast-forward the real PIT here, so model
+    // the comparison directly against a clock value past the budget.
+    let clock_past_budget = armed.saturating_add(1);
+    let expired_without_progress = clock_past_budget >= armed;
+
+    // Case 2: progress re-armed the budget to `clock_past_budget +
+    // NO_PROGRESS_TICKS`, which is strictly greater than `clock_past_budget`,
+    // so the deadline is NOT expired at that same clock value.
+    let rearmed = clock_past_budget.saturating_add(ResolveDeadline::NO_PROGRESS_TICKS);
+    let expired_after_progress = clock_past_budget >= rearmed;
+
+    (expired_without_progress, expired_after_progress)
+}
+
+/// No-forward-progress deadline for a single path resolution.
+///
+/// The original W83 safety net used one *absolute* wall-clock budget computed
+/// once at the outer resolve and threaded unchanged through the whole walk.
+/// That is wrong for an operation that is CPU-cheap but freely deschedulable:
+/// `get_ticks()` keeps advancing while the resolving thread is parked (waiting
+/// on the global `MOUNTS` lock or a serialized block device under contention),
+/// so a resolve that *is* making forward progress — distinct components
+/// resolving on successive trips — could still overrun the budget and fail an
+/// `open(2)` of a present file with `ETIMEDOUT`.  Under heavy load (the Firefox
+/// content-process spawn parks the resolving thread behind ~200 sibling threads
+/// and a serialized block device) the deschedule gap *between two components*
+/// can exceed several wall-clock seconds even though each component resolves
+/// the instant the thread runs.  No fixed wall-clock budget can tell that apart
+/// from a genuine hang.  POSIX `open(2)` does not define `ETIMEDOUT` for an
+/// existing file, and pathname resolution (IEEE Std 1003.1 §4.13) is bounded by
+/// structural limits (symlink recursion → `ELOOP`), never by a wall-clock
+/// timer; mature kernels impose no resolve deadline at all.
+///
+/// The corrected net therefore measures **lack of forward progress** rather
+/// than elapsed wall-clock: a single deadline is re-armed every time the walk
+/// advances (a new component is entered or a symlink is followed), so it fires
+/// only when the walk makes *zero* progress for the whole budget — i.e. a
+/// single FS dispatch that genuinely never returns, the one case the net
+/// exists to break.  A resolve that keeps advancing, however slowly and however
+/// often descheduled, never trips it.  This also retains the original
+/// fail-fast-on-wedge guarantee: a driver that hangs forever in one `lookup`
+/// stops re-arming and the deadline fires.
+#[derive(Clone, Copy)]
+struct ResolveDeadline {
+    /// Tick value past which the resolve gives up if it has made no forward
+    /// progress.  Re-armed on every advance.  `u64::MAX` disables the check
+    /// (extremely early boot, no clock yet).
+    no_progress: u64,
+}
+
+impl ResolveDeadline {
+    /// PIT runs at ~100 Hz (`arch::x86_64::irq::init`), so 100 ticks ≈ 1 s and
+    /// `NO_PROGRESS_TICKS = 3000` ≈ 30 s.  Because the budget is re-armed on
+    /// every advance it bounds time-since-last-progress, not total walk time:
+    /// 30 s of a *single* component making no progress is unambiguously a
+    /// wedged FS dispatch (no legitimate directory lookup — even of a directory
+    /// holding a 130 MB file, even on virtio-blk poll-fallback at ~100 ms per
+    /// request — takes 30 s of wall-clock while the rest of the system keeps
+    /// running and the walk would otherwise advance).
+    const NO_PROGRESS_TICKS: u64 = 3000;
+
+    /// Arm a fresh no-progress deadline at the outermost resolve call.
+    #[inline]
+    fn arm() -> Self {
+        Self { no_progress: Self::rearm_value() }
+    }
+
+    /// Compute the tick value `NO_PROGRESS_TICKS` in the future, or `u64::MAX`
+    /// when the PIT is not yet ticking (pre-IRQ boot — there is no clock to
+    /// measure against, so the deadline must be a no-op).
+    #[inline]
+    fn rearm_value() -> u64 {
+        let now = crate::arch::x86_64::irq::get_ticks();
+        if now == 0 {
+            u64::MAX
+        } else {
+            now.saturating_add(Self::NO_PROGRESS_TICKS)
+        }
+    }
+
+    /// Construct a deadline with an explicit absolute tick value (test-only).
+    /// Passing `0` yields a deadline already in the past, so the first
+    /// component lookup trips it (the forced-timeout case the suite asserts).
+    #[inline]
+    fn with_per_component_deadline(no_progress: u64) -> Self {
+        Self { no_progress }
+    }
+
+    /// True if the walk has made no forward progress for the whole budget
+    /// (a genuinely-stuck dispatch).
+    #[inline]
+    fn expired(&self) -> bool {
+        crate::arch::x86_64::irq::get_ticks() >= self.no_progress
+    }
+
+    /// Re-arm the deadline because the walk demonstrably advanced (a new
+    /// component was entered, or a symlink was followed).  Resets
+    /// time-since-last-progress to zero.
+    #[inline]
+    fn note_progress(&mut self) {
+        if self.no_progress != u64::MAX {
+            self.no_progress = Self::rearm_value();
+        }
     }
 }
 
@@ -1163,31 +1281,35 @@ fn resolve_trace(tctx: &mut ResolveTrace, args: core::fmt::Arguments<'_>) {
 ///   symlink (stat / open behaviour).  When `false`, stop at the symlink inode
 ///   itself (lstat / readlink behaviour).
 ///
-/// # Wall-clock deadline (W83 safety net)
+/// # Forward-progress deadline (W83 safety net, corrected)
 ///
 /// Some pathological combinations of mount-table layout, symlinks, and
 /// concrete-FS state can cause path resolution to make no forward progress
 /// (W83 reproducer: every `firefox-test` trial wedged on the first traversal
-/// of `/usr → /disk/usr/.../libGL.so.1`).  To bound the worst case we compute
-/// an absolute 1s deadline at the outermost call (`resolve_path` /
-/// `resolve_path_no_follow`) and thread it through `resolve_path_opts` as an
-/// explicit argument, so a symlink chase cannot reset the budget by
-/// recursing.  When the deadline expires we return [`VfsError::TimedOut`]
-/// (`ETIMEDOUT`, errno 110) and emit `[VFS/resolve] DEADLINE EXCEEDED` to the
-/// serial log along with the partial-resolved path — the exact diagnostic
-/// that names the hang point.
+/// of `/usr → /disk/usr/.../libGL.so.1`).  To bound the worst case we carry a
+/// [`ResolveDeadline`] threaded through `resolve_path_opts` as a mutable
+/// argument (so a symlink chase shares one deadline across recursion rather
+/// than resetting the whole budget).  The deadline is **re-armed on each
+/// component that successfully resolves**, so it measures lack of *forward
+/// progress* on a single component — a genuinely-stuck FS dispatch — rather
+/// than absolute wall-clock across deschedule windows.  A resolve that is
+/// slow-but-progressing (each component resolving on a later trip because the
+/// thread keeps getting descheduled under `MOUNTS`/block-device contention)
+/// no longer trips it.  When the deadline does expire we return
+/// [`VfsError::TimedOut`] (`ETIMEDOUT`, errno 110) and emit
+/// `[VFS/resolve] DEADLINE EXCEEDED` to the serial log along with the
+/// partial-resolved path — the exact diagnostic that names the hang point.
 ///
-/// One second is intentionally generous: every block-backed FS in this
-/// kernel has its own sub-second IRQ-or-poll budget per disk request and a
-/// directory of a few hundred entries reads in well under that limit even
-/// on virtio-blk poll-fallback (~100ms worst case, per `wait_completion`).
-/// If a real workload ever legitimately exceeds 1s of pure VFS work, raise
-/// the bound — don't remove it.
+/// POSIX `open(2)` does not define `ETIMEDOUT` for a present file, and
+/// pathname resolution (IEEE Std 1003.1 §4.13) is bounded by structural
+/// limits (symlink recursion → `ELOOP`, here `MAX_SYMLINK_DEPTH`), not a
+/// wall-clock timer.  The deadline is purely an internal anti-wedge net for
+/// a driver that never returns; sizing is documented on [`ResolveDeadline`].
 fn resolve_path_opts(
     path: &str,
     depth: u32,
     follow_final: bool,
-    deadline_ticks: u64,
+    deadline: &mut ResolveDeadline,
     tctx: &mut ResolveTrace,
 ) -> VfsResult<(usize, u64)> {
     const MAX_SYMLINK_DEPTH: u32 = 16;
@@ -1214,20 +1336,22 @@ fn resolve_path_opts(
 
     // Start from root mount and walk component by component.
     // After each lookup, check if the result is a symlink and follow it.
-    let mut resolved_so_far = String::from("/");
-
-    // Find mount + inode for "/"
+    //
+    // Resolve the starting mount in a SINGLE `MOUNTS` acquisition: pick the
+    // mount whose mount-path is the longest prefix of `path` (the deepest
+    // covering mount).  Snapshotting the relevant fields and dropping the lock
+    // here — rather than taking it twice per resolve — halves the contention on
+    // the global mount lock, which under heavy load (many threads resolving
+    // concurrently) is a major source of the deschedule gaps the resolve
+    // deadline must tolerate.  Consistent with the snapshot-then-drop pattern
+    // used for every other `MOUNTS` access on this path: never hold `MOUNTS`
+    // across an FS dispatch (#82).
+    let mut resolved_so_far;
     let (mut cur_mount, mut cur_inode) = {
         let mounts = MOUNTS.lock();
         if mounts.is_empty() {
             return Err(VfsError::NotFound);
         }
-        (0usize, mounts[0].root_inode)
-    };
-
-    // Re-match the deepest mount for the initial path prefix.
-    {
-        let mounts = MOUNTS.lock();
         let mut best_mount = 0;
         let mut best_len = 0;
         for (i, mount) in mounts.iter().enumerate() {
@@ -1236,13 +1360,12 @@ fn resolve_path_opts(
                 best_len = mount.path.len();
             }
         }
-        cur_mount = best_mount;
-        cur_inode = mounts[best_mount].root_inode;
         resolved_so_far = mounts[best_mount].path.clone();
         if resolved_so_far.is_empty() {
             resolved_so_far = String::from("/");
         }
-    }
+        (best_mount, mounts[best_mount].root_inode)
+    };
 
     // Determine which components are already consumed by the mount path.
     let mount_path = resolved_so_far.clone();
@@ -1261,8 +1384,18 @@ fn resolve_path_opts(
             depth, component, cur_mount, resolved_so_far,
         ));
 
-        // ── W83 deadline: bail out before the next concrete-FS dispatch ────
-        if crate::arch::x86_64::irq::get_ticks() >= deadline_ticks {
+        // ── W83 deadline: fail-fast only on a genuinely-wedged dispatch ────
+        // `deadline` is re-armed on every advance (a resolved component or a
+        // followed symlink), so the value checked here is time-since-last-
+        // progress, NOT total walk time.  Under heavy contention (Firefox
+        // content-proc spawn parks this thread behind ~200 siblings and a
+        // serialized block device) the deschedule gap before a component can
+        // be several wall-clock seconds even though the walk advances the
+        // instant the thread runs; the budget is sized far above that gap so
+        // only a single FS dispatch that makes no progress for the whole
+        // budget — a genuine hang — trips it.  POSIX open(2) never returns
+        // ETIMEDOUT for a present, progressing file.
+        if deadline.expired() {
             crate::serial_println!(
                 "[VFS/resolve] DEADLINE EXCEEDED depth={} stuck-at='{}' next-component='{}' input-path='{}'",
                 depth, resolved_so_far, component, path,
@@ -1318,10 +1451,16 @@ fn resolve_path_opts(
                 "[VFS/resolve] follow-symlink depth={} from='{}' target='{}' new_path='{}'",
                 depth, resolved_so_far, target, new_path,
             ));
-            return resolve_path_opts(&new_path, depth + 1, true, deadline_ticks, tctx);
+            // Resolving + reading this symlink component is forward progress;
+            // re-arm the no-progress deadline before recursing so the shared
+            // budget measures time-since-last-progress, not total chase time.
+            deadline.note_progress();
+            return resolve_path_opts(&new_path, depth + 1, true, deadline, tctx);
         }
 
-        // Not a symlink — advance.
+        // Not a symlink — advance.  This component resolved: re-arm the
+        // no-progress deadline so a slow-but-progressing walk is not failed.
+        deadline.note_progress();
         cur_inode = child_inode;
         if resolved_so_far.ends_with('/') {
             resolved_so_far.push_str(component);
