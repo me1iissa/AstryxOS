@@ -1,0 +1,102 @@
+# AstryxOS documentation site — Jekyll + just-the-docs (GitHub Pages remote theme)
+#
+# GitHub Pages builds Jekyll natively, so this site needs no custom build
+# pipeline beyond the remote_theme below. Page order is set per-page via the
+# `nav_order` front-matter key; client-side search, the nav sidebar, the
+# mobile-responsive layout, and code-block highlighting all ship with the theme.
+
+title: AstryxOS
+description: >-
+  A hybrid-kernel operating system, written from scratch in Rust, that runs
+  upstream unmodified binaries from other operating systems.
+remote_theme: just-the-docs/just-the-docs
+
+# Site URL config is set by GitHub Pages at build time; baseurl is left blank so
+# the site works for both a user/repo page and a custom domain. If this deploys
+# to https://<user>.github.io/AstryxOS/, set baseurl to "/AstryxOS".
+url: ""
+baseurl: ""
+
+# --- just-the-docs options ---------------------------------------------------
+
+# Client-side search (ships with the theme; no external service).
+search_enabled: true
+search:
+  heading_level: 2
+  previews: 3
+  preview_words_before: 5
+  preview_words_after: 10
+  tokenizer_separator: /[\s/]+/
+
+# Show a "table of contents" heading list on pages.
+heading_anchors: true
+
+# Collapse long auxiliary pages out of the top-level nav. The five authored
+# guides carry explicit nav_order; everything else in docs/ is reference
+# material reachable via in-page links and search rather than the sidebar.
+nav_external_links:
+  - title: AstryxOS on GitHub
+    url: https://github.com/me1iissa/AstryxOS
+
+# Footer / repo links.
+gh_edit_link: true
+gh_edit_link_text: Edit this page on GitHub
+gh_edit_repository: https://github.com/me1iissa/AstryxOS
+gh_edit_branch: master
+gh_edit_source: docs
+gh_edit_view_mode: tree
+
+color_scheme: dark
+
+# Callout styles used in the authored pages ({: .note }, {: .warning }).
+callouts:
+  note:
+    title: Note
+    color: blue
+  warning:
+    title: Warning
+    color: red
+
+# --- Jekyll build options ----------------------------------------------------
+
+# Exclude the large corpus of investigation/audit markdown from the built site
+# so only the curated guides are published. These remain in the repo and are
+# linked directly where referenced.
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - vendor
+  - .bundle
+  - "*_artifacts"
+
+# Keep dated investigation reports out of the auto-generated nav; they are still
+# served (linked from the guides) but should not clutter the sidebar.
+defaults:
+  - scope:
+      path: ""
+    values:
+      nav_exclude: true
+  - scope:
+      path: "index.md"
+    values:
+      nav_exclude: false
+  - scope:
+      path: "architecture.md"
+    values:
+      nav_exclude: false
+  - scope:
+      path: "getting-started.md"
+    values:
+      nav_exclude: false
+  - scope:
+      path: "running-upstream-binaries.md"
+    values:
+      nav_exclude: false
+  - scope:
+      path: "dev-tooling.md"
+    values:
+      nav_exclude: false
+
+plugins:
+  - jekyll-remote-theme
+  - jekyll-seo-tag
