@@ -2495,6 +2495,19 @@ pub fn run() -> ! {
         if test_284_due_wake_survives_contention() { passed += 1; }
     }
 
+    // ── Test 285: anti-starvation aging frees an out-scored Ready thread ────
+    // A `PRIORITY_NORMAL` Ready thread competing against peers that are
+    // continuously re-wake-boosted (priority NORMAL + PRIORITY_BOOST_WAIT) must
+    // still eventually be selected — the picker's wait-age term has to overcome
+    // the standing boost differential.  Deterministic and fast (pure scoring
+    // arithmetic + curve assertions).  Cite POSIX sched(7) (SCHED_OTHER: every
+    // runnable thread eventually runs).
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_285_anti_starvation_aging() { passed += 1; }
+    }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -41041,6 +41054,137 @@ fn test_284_due_wake_survives_contention() -> bool {
     true
 }
 
+// ── Test 285: anti-starvation aging frees an out-scored Ready thread ─────────
+//
+// Models the production wedge that starved the Firefox content-process child:
+// a `PRIORITY_NORMAL` Ready thread that is continuously out-scored by peers
+// which are re-wake-boosted (`PRIORITY_NORMAL + PRIORITY_BOOST_WAIT`) on every
+// event-loop wakeup, so a standing boosted peer always exists.  Without a
+// wait-age term the boosted peer wins every tick forever; with it, the starved
+// thread's escalating bonus must eventually overtake the boost differential.
+//
+// The test replicates the picker's score formula exactly —
+//   score = priority*4 + affinity_bonus(0..2) + wait_age_bonus(age)
+// (see `sched::schedule`) — using the public `sched::wait_age_bonus` and the
+// public `proc::PRIORITY_*` constants, and asserts the three contractual
+// properties: (1) the wait-age curve is zero below threshold then escalates and
+// caps; (2) a sufficiently-aged NORMAL thread out-scores a continuously-boosted
+// NORMAL peer; (3) with no wait (age 0) priority ordering is unchanged.  Pure
+// arithmetic — deterministic, no thread spawning, no scheduler races.  Cite
+// POSIX sched(7): under SCHED_OTHER every runnable thread eventually runs.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_285_anti_starvation_aging() -> bool {
+    use crate::proc::{PRIORITY_NORMAL, PRIORITY_BOOST_WAIT};
+    use crate::sched::wait_age_bonus;
+
+    test_header!("anti-starvation aging frees an out-scored Ready thread");
+
+    // The picker's exact score formula, mirrored here for the test.
+    // `affinity` is 0 (no match), 1 (cache-warm last_cpu), or 2 (pinned).
+    fn picker_score(priority: u8, affinity: u16, age: u64) -> u16 {
+        (priority as u16) * 4 + affinity + wait_age_bonus(age)
+    }
+
+    // ── Property 1: wait-age curve — zero below threshold, escalates, caps ──
+    // Below STARVE_AGE_TICKS (20) the bonus must be 0 so the common case is
+    // untouched; at/after threshold it must be strictly positive; far past
+    // threshold it must saturate (monotone non-decreasing, bounded).
+    if wait_age_bonus(0) != 0 || wait_age_bonus(19) != 0 {
+        test_fail!("test285", "wait_age_bonus nonzero below threshold (age<20)");
+        return false;
+    }
+    if wait_age_bonus(20) == 0 {
+        test_fail!("test285", "wait_age_bonus still zero AT threshold (age=20)");
+        return false;
+    }
+    // Monotone non-decreasing and bounded across a wide age sweep.
+    let mut prev = 0u16;
+    let mut saturated_at: Option<u64> = None;
+    for age in 0..=4000u64 {
+        let b = wait_age_bonus(age);
+        if b < prev {
+            test_fail!("test285", "wait_age_bonus decreased at age={} ({} < {})", age, b, prev);
+            return false;
+        }
+        if saturated_at.is_none() && b == wait_age_bonus(age + 1000) && b == prev && age > 30 {
+            saturated_at = Some(age);
+        }
+        prev = b;
+    }
+    // The capped value must dominate the largest wake-boost score differential:
+    // a peer boosted two priority levels gains PRIORITY_BOOST_WAIT*4 = 8 score,
+    // plus up to +2 affinity = 10.  The cap must exceed that so a fully-aged
+    // thread is guaranteed to overtake.
+    let boost_diff = (PRIORITY_BOOST_WAIT as u16) * 4 + 2;
+    let cap = wait_age_bonus(100_000);
+    if cap <= boost_diff {
+        test_fail!("test285",
+            "wait-age cap {} does not exceed max wake-boost differential {}", cap, boost_diff);
+        return false;
+    }
+    test_println!("  curve: 0 below age 20, escalates, caps at {} (> boost-diff {}) ✓",
+        cap, boost_diff);
+
+    // ── Property 2: aged NORMAL thread overtakes a continuously-boosted peer ─
+    // Boosted peer: NORMAL + BOOST_WAIT, +2 affinity (best case for the peer),
+    // age ~0 (it just woke, so it never accrues a wait-age bonus).
+    // Starved thread: NORMAL, +1 cache-warm affinity, increasing age.
+    let boosted_peer = picker_score(PRIORITY_NORMAL + PRIORITY_BOOST_WAIT, 2, 0);
+    // At age 0 the starved thread MUST lose (no false-positive pre-emption).
+    let starved_age0 = picker_score(PRIORITY_NORMAL, 1, 0);
+    if starved_age0 >= boosted_peer {
+        test_fail!("test285",
+            "NORMAL thread out-scores boosted peer with no wait (age 0): {} >= {}",
+            starved_age0, boosted_peer);
+        return false;
+    }
+    // Sweep increasing age; find the tick at which the starved thread wins.
+    let mut win_age: Option<u64> = None;
+    for age in 0..=4000u64 {
+        if picker_score(PRIORITY_NORMAL, 1, age) > boosted_peer {
+            win_age = Some(age);
+            break;
+        }
+    }
+    match win_age {
+        Some(age) => {
+            test_println!(
+                "  starved NORMAL(cache-warm) overtakes boosted peer (score {}) at age={} ticks ✓",
+                boosted_peer, age);
+        }
+        None => {
+            test_fail!("test285",
+                "starved NORMAL thread NEVER overtakes boosted peer (score {}) within 4000 ticks \
+                 — indefinite starvation not prevented", boosted_peer);
+            return false;
+        }
+    }
+
+    // ── Property 3: no contention → priority ordering unchanged ──────────────
+    // With age 0 for all, a higher base priority must still win; equal priority
+    // ties break on affinity exactly as before the aging change.
+    let hi = picker_score(PRIORITY_NORMAL + 2, 0, 0);
+    let lo = picker_score(PRIORITY_NORMAL, 2, 0);
+    if hi <= lo {
+        test_fail!("test285",
+            "without wait, higher base priority lost to affinity bonus: {} <= {}", hi, lo);
+        return false;
+    }
+    let pinned = picker_score(PRIORITY_NORMAL, 2, 0);
+    let warm   = picker_score(PRIORITY_NORMAL, 1, 0);
+    let cold   = picker_score(PRIORITY_NORMAL, 0, 0);
+    if !(pinned > warm && warm > cold) {
+        test_fail!("test285",
+            "affinity tie-break ordering broken at age 0: pinned={} warm={} cold={}",
+            pinned, warm, cold);
+        return false;
+    }
+    test_println!("  no-contention ordering preserved (priority > affinity, affinity tie-breaks) ✓");
+
+    test_pass!("anti-starvation aging frees an out-scored Ready thread");
+    true
+}
+
 // ── Test 264: vfork-child TLS page layout (musl posix_spawn unblocker) ───────
 //
 // `proc::alloc_vfork_child_tls(parent_pid)` provisions a per-vfork-child
@@ -41739,6 +41883,7 @@ fn test_268_exit_group_clears_sibling_cleartid() -> bool {
             cpu_affinity: Some(0xFE),
             last_cpu: 0,
             first_run: false,
+            ready_since_tick: 0,
             ctx_rsp_valid: alloc::boxed::Box::new(
                 core::sync::atomic::AtomicBool::new(true)),
             clear_child_tid: cct,
@@ -42028,6 +42173,7 @@ fn test_269_sigkill_clears_sibling_cleartid() -> bool {
             cpu_affinity: Some(0xFE),
             last_cpu: 0,
             first_run: false,
+            ready_since_tick: 0,
             ctx_rsp_valid: alloc::boxed::Box::new(
                 core::sync::atomic::AtomicBool::new(true)),
             clear_child_tid: cct,
