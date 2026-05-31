@@ -188,22 +188,63 @@ def _serial_args(serial_path: str) -> list[str]:
     ]
 
 
-def _firmware_args(ovmf_code: str, ovmf_vars: str) -> list[str]:
-    """UEFI firmware pflash pair."""
+def _firmware_args(ovmf_code: str, ovmf_vars: str,
+                   snapshottable: bool = False) -> list[str]:
+    """UEFI firmware pflash pair.
+
+    Default path: OVMF_VARS is a writable raw pflash.
+
+    Snapshottable path (snap-gate): a writable RAW pflash is not
+    snapshottable and aborts QEMU `savevm` with "Device '...' is writable
+    but does not support snapshots".  But making OVMF_VARS read-only is NOT
+    an option — EDK2 firmware needs a WRITABLE varstore at early init and
+    refuses to boot ("Block node is read-only") otherwise.  The resolution
+    is a writable *qcow2* pflash: qcow2 supports internal snapshots, so the
+    varstore stays writable for the firmware AND participates in savevm.
+    The caller (`qemu-harness.py`) materialises `ovmf_vars` as qcow2 under
+    --snapshottable; here we just declare the matching format.
+    """
+    vars_fmt = "qcow2" if snapshottable else "raw"
     return [
         "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf_code}",
-        "-drive", f"if=pflash,format=raw,file={ovmf_vars}",
+        "-drive", f"if=pflash,format={vars_fmt},file={ovmf_vars}",
     ]
 
 
-def _boot_disk_args(esp_dir: str) -> list[str]:
-    """Boot disk: FAT-formatted ESP directory exposed as a raw image."""
-    return ["-drive", f"format=raw,file=fat:rw:{esp_dir}"]
+def _boot_disk_args(esp_dir: str, snapshottable: bool = False) -> list[str]:
+    """Boot disk: FAT-formatted ESP directory exposed as a raw image.
+
+    Default path: writable vvfat on the implicit IDE bus (`fat:rw:`).
+
+    Snapshottable path (snap-gate): the vvfat ('fat:') driver has no
+    snapshot support, so a writable vvfat disk aborts QEMU `savevm` with
+    "Device '...' is writable but does not support snapshots".  We open it
+    read-only (`fat:ro:`) so it is excluded from the snapshot requirement —
+    the kernel ELF is loaded from the ESP at boot and the ESP is not written
+    at runtime, so read-only is safe.
+
+    A read-only vvfat backend CANNOT attach to QEMU's implicit IDE hard-disk
+    frontend (ide-hd rejects a read-only block node with "Block node is
+    read-only").  So under --snapshottable we attach it via `if=none` + a
+    `virtio-blk-pci,read-only=on` frontend, which OVMF enumerates and boots
+    from exactly like the IDE path.
+    """
+    if not snapshottable:
+        return ["-drive", f"format=raw,file=fat:rw:{esp_dir}"]
+    return [
+        "-drive", f"format=raw,file=fat:ro:{esp_dir},if=none,id=boot0,readonly=on",
+        "-device", "virtio-blk-pci,drive=boot0,bootindex=0",
+    ]
 
 
-def _data_disk_args(data_img: str, warn_on_missing: bool = False) -> list[str]:
+def _data_disk_args(data_img: str, warn_on_missing: bool = False,
+                    data_overlay: Optional[str] = None) -> list[str]:
     """
     Canonical data-disk attachment: virtio-blk-pci with snapshot=on.
+
+    When `data_overlay` is set (snapshottable topology), a persistent qcow2
+    overlay is attached instead of the `snapshot=on` temp overlay — see the
+    body for why the persistent overlay is required for cross-`stop` loadvm.
 
     Returns an empty list if `data_img` is missing — callers that
     require the data disk (e.g. firefox-test mode) must check for its
@@ -226,9 +267,42 @@ def _data_disk_args(data_img: str, warn_on_missing: bool = False) -> list[str]:
                 file=_sys.stderr,
             )
         return []
+    if data_overlay:
+        # Snapshottable topology (snap-gate / --snapshottable): attach a
+        # persistent qcow2 overlay backed read-only by the shared raw
+        # data.img.  Guest writes land in the overlay (never mutating the
+        # shared image), and — crucially — the overlay is a snapshottable
+        # qcow2 file that persists across `stop`, so the per-device data
+        # snapshot written by `savevm` survives a fresh `loadvm`.  The
+        # `snapshot=on` temp-overlay used by the default path is deleted on
+        # QEMU exit and would lose that snapshot.  The overlay file itself
+        # is created by the caller via `qemu-img create -b <data_img>`.
+        return [
+            "-drive",
+            f"file={data_overlay},format=qcow2,if=none,id=data0",
+            "-device", "virtio-blk-pci,drive=data0",
+        ]
     return [
         "-drive", f"file={data_img},format=raw,if=none,id=data0,snapshot=on",
         "-device", "virtio-blk-pci,drive=data0",
+    ]
+
+
+def _vmstate_disk_args(vmstate_qcow2: Optional[str]) -> list[str]:
+    """Orphan qcow2 device that holds the savevm RAM/CPU state blob.
+
+    Attached with `if=none` and NOT wired to any guest `-device`, so the
+    guest never sees it.  QEMU's `bdrv_all_find_vmstate_bs` picks the first
+    writable non-removable qcow2 device to store the VM-state blob; this
+    dedicated orphan device deterministically serves that role and persists
+    across `stop` (it is a real file, unlike a `snapshot=on` temp overlay).
+    QEMU prints an "orphaned" info note for it — expected and harmless.
+    Created by the caller via `qemu-img create -f qcow2 <path> <size>`.
+    """
+    if not vmstate_qcow2:
+        return []
+    return [
+        "-drive", f"file={vmstate_qcow2},format=qcow2,if=none,id=vmstate0",
     ]
 
 
@@ -321,6 +395,9 @@ def build_qemu_cmd(
     extra_args: Optional[list[str]] = None,
     cpu_override: Optional[str] = None,
     warn_on_missing_data_img: bool = False,
+    snapshottable: bool = False,
+    data_overlay: Optional[str] = None,
+    vmstate_qcow2: Optional[str] = None,
 ) -> list[str]:
     """
     Return the full argv for `qemu-system-x86_64` for an AstryxOS test run.
@@ -349,6 +426,16 @@ def build_qemu_cmd(
       warn_on_missing_data_img: If True, print a stderr warning when
         `data_img` does not exist. Set by `qemu-harness.py` which also
         emits a full banner and attempts an auto-symlink.
+      snapshottable: If True, build the QEMU `savevm`/`loadvm`-compatible
+        topology — read-only vvfat boot disk (`fat:ro:`) and read-only
+        OVMF_VARS pflash, so neither blocks internal snapshots.  Used by
+        `qemu-harness.py start --snapshottable` (snap-gate).
+      data_overlay: Path to a persistent qcow2 overlay backed by `data_img`.
+        When set, the data disk is attached from this overlay (qcow2,
+        snapshottable, persists across stop) instead of the default
+        `snapshot=on` temp overlay.  Required for cross-`stop` `loadvm`.
+      vmstate_qcow2: Path to an orphan qcow2 device that holds the savevm
+        RAM/CPU blob.  Attached with `if=none` and no `-device`.
 
     The returned list is safe to pass to `subprocess.Popen` without
     shell quoting.
@@ -375,9 +462,17 @@ def build_qemu_cmd(
     cmd += _qmp_args(qmp_sock)
     cmd += _qga_args(qga_sock)
     cmd += _display_args(mode, show_window)
-    cmd += _firmware_args(ovmf_code, ovmf_vars)
-    cmd += _boot_disk_args(esp_dir)
-    cmd += _data_disk_args(data_img, warn_on_missing=warn_on_missing_data_img)
+    cmd += _firmware_args(ovmf_code, ovmf_vars, snapshottable=snapshottable)
+    cmd += _boot_disk_args(esp_dir, snapshottable=snapshottable)
+    # Orphan qcow2 vmstate device FIRST among the qcow2 block devices.
+    # QEMU's bdrv_all_find_vmstate_bs picks the first writable non-removable
+    # qcow2 device to hold the RAM/CPU blob; emitting the dedicated orphan
+    # ahead of the qcow2 data overlay ensures the blob lands in the orphan
+    # (which persists across `stop`), not the data overlay.  No-op when
+    # vmstate_qcow2 is None (non-snapshottable path).
+    cmd += _vmstate_disk_args(vmstate_qcow2)
+    cmd += _data_disk_args(data_img, warn_on_missing=warn_on_missing_data_img,
+                           data_overlay=data_overlay)
     cmd += _net_args()
     cmd += _gdb_args(gdb_port, gdb_wait)
 
