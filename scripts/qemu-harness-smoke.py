@@ -413,6 +413,106 @@ def run_tier3(no_build: bool = False):
     print()
 
 
+def run_snapgate_argv_check():
+    """
+    Tier 1.5 host-only check: snap-gate device topology + CLI parsing.
+
+    No QEMU launched (runs in < 1s).  Locks down the snap-gate topology so a
+    future refactor cannot silently regress the savevm/loadvm compatibility:
+
+      * default (non-snapshottable) argv is UNCHANGED — fat:rw boot disk +
+        writable raw OVMF_VARS pflash (existing harness usage unaffected)
+      * --snapshottable argv has the savevm-compatible topology — fat:ro boot
+        disk via virtio-blk-pci read-only, qcow2 OVMF_VARS pflash, an orphan
+        qcow2 vmstate device emitted before the qcow2 data overlay
+      * snap-gate CLI parses the three argv forms: `list`, `load <name>`,
+        bad-usage -> error
+    """
+    print("=== Tier 1.5: snap-gate topology + CLI (host-only) ===")
+    print()
+
+    import importlib.util
+    aq_path = Path(__file__).resolve().parent / "astryx_qemu.py"
+    spec = importlib.util.spec_from_file_location("astryx_qemu_smoke", aq_path)
+    aq = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(aq)
+
+    kw = dict(mode="test", ovmf_code="/x/code.fd", ovmf_vars="/x/vars",
+              esp_dir="/x/esp", qmp_sock="/x/q.sock", kvm=False)
+
+    # The data-disk args are only emitted when the backing data_img exists on
+    # disk (a W13/W15 silent-wedge guard); use a real temp file so the overlay
+    # branch is exercised.
+    import tempfile, os as _os
+    _di = tempfile.NamedTemporaryFile(suffix=".img", delete=False)
+    _di.write(b"\0" * 4096)
+    _di.close()
+    data_img = _di.name
+
+    # ── default path unchanged ────────────────────────────────────────────────
+    d = aq.build_qemu_cmd("", data_img, "/x/s.log", **kw)
+    boot = [x for x in d if "fat:" in x]
+    pflash = [x for x in d if "pflash" in x]
+    check("default boot disk is fat:rw",
+          boot == ["format=raw,file=fat:rw:/x/esp"], str(boot))
+    check("default OVMF_VARS pflash is writable raw",
+          "if=pflash,format=raw,file=/x/vars" in pflash, str(pflash))
+    check("default has no orphan vmstate device",
+          not any("vmstate0" in x for x in d), "vmstate0 leaked into default")
+
+    # ── snapshottable path ────────────────────────────────────────────────────
+    s = aq.build_qemu_cmd("", data_img, "/x/s.log",
+                          snapshottable=True,
+                          data_overlay="/x/ov.qcow2",
+                          vmstate_qcow2="/x/vm.qcow2", **kw)
+    check("snap boot disk is fat:ro",
+          any(x.startswith("format=raw,file=fat:ro:/x/esp") for x in s),
+          "boot disk not fat:ro")
+    check("snap boot disk on virtio-blk-pci read-only frontend",
+          any("virtio-blk-pci,drive=boot0" in x for x in s)
+          and any("readonly=on,id=boot0" in x or "id=boot0,readonly=on" in x
+                  or "fat:ro:/x/esp,if=none,id=boot0,readonly=on" in x for x in s),
+          "boot0 frontend missing")
+    check("snap OVMF_VARS pflash is qcow2 (writable+snapshottable)",
+          any("if=pflash,format=qcow2,file=/x/vars" in x for x in s),
+          "vars pflash not qcow2")
+    check("snap has orphan vmstate qcow2 device (if=none, no -device)",
+          any("file=/x/vm.qcow2,format=qcow2,if=none,id=vmstate0" in x for x in s)
+          and not any("drive=vmstate0" in x for x in s),
+          "vmstate0 orphan missing or wired to a device")
+    check("snap data disk is the qcow2 overlay",
+          any("file=/x/ov.qcow2,format=qcow2,if=none,id=data0" in x for x in s),
+          "data overlay missing")
+    # vmstate must precede the data overlay so bdrv_all_find_vmstate_bs picks it.
+    try:
+        i_vm = next(i for i, x in enumerate(s) if "id=vmstate0" in x)
+        i_ov = next(i for i, x in enumerate(s) if "id=data0" in x)
+        check("orphan vmstate device emitted BEFORE data overlay",
+              i_vm < i_ov, f"vmstate@{i_vm} overlay@{i_ov}")
+    except StopIteration:
+        check("orphan vmstate device emitted BEFORE data overlay", False,
+              "could not locate both devices")
+
+    # ── snap-gate CLI parsing (no QEMU) ───────────────────────────────────────
+    obj, raw, rc = _h("snap-gate", "list")
+    check("snap-gate list returns JSON ok", obj is not None and obj.get("ok"),
+          raw[:120])
+    obj2, raw2, rc2 = _h("snap-gate", "load", "__no_such_snap__")
+    check("snap-gate load missing -> ok:false",
+          obj2 is not None and obj2.get("ok") is False, raw2[:120])
+    import subprocess as _sp
+    r3 = _sp.run([PYTHON, str(HARNESS), "snap-gate", "save"],
+                 capture_output=True, text=True)
+    check("snap-gate bad-usage -> error envelope",
+          '"error"' in r3.stdout, r3.stdout[:120])
+
+    try:
+        _os.unlink(data_img)
+    except OSError:
+        pass
+    print()
+
+
 def run_staleness_check():
     """
     Tier 1.5 host-only check: exercise `_data_img_staleness` directly to confirm
@@ -611,6 +711,7 @@ def main():
     # registry) against future refactors of qemu-harness.py.
     run_staleness_check()
     run_allowlist_check()
+    run_snapgate_argv_check()
 
     if args.staleness_only:
         # Early exit for CI cycles that just want the cheap host-only checks.
