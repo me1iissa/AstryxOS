@@ -660,52 +660,92 @@ pub fn poll_rx() {
 
     let desc_base_phys = *RX_DESCS.lock();
     let bufs_base_phys = *RX_BUFS.lock();
-    let mut cur = RX_CUR.lock();
 
     let mut drained_any = false;
+
+    // Drain the RX ring one descriptor at a time.  Each iteration holds
+    // RX_CUR only for the descriptor-ring mutation (read DD/length, copy
+    // out the frame, clear status, advance the cursor, write RDT) and
+    // DROPS it before delivering the frame to the network stack.  Holding
+    // RX_CUR across handle_rx_packet() is unsafe for two reasons:
+    //
+    //  1. Lock inversion / re-entry — the stack may reply (ARP, ICMP, TCP
+    //     send_frame -> send_packet), which re-enters the e1000 flush
+    //     nudge and try_lock()s RX_CUR; a blocking hold here would stall
+    //     that nudge needlessly.
+    //  2. SMP cross-core starvation — on smp>1 a second core entering
+    //     poll_rx() would block on RX_CUR's spin lock for the entire,
+    //     unbounded duration of handle_rx_packet() (which itself contends
+    //     downstream spin locks).  A Ring-0 spinner is not timer-preempted,
+    //     so that core can stall indefinitely.  Bounding the critical
+    //     section to the ring mutation keeps the cross-core wait short.
+    //
+    // This mirrors the virtio_net::poll_rx() pattern (copy-under-lock,
+    // deliver-after-drop) and the snapshot-then-drop discipline used on
+    // other held-across-dispatch locks in this tree.
     loop {
-        let idx = *cur as usize;
-        // Kernel-side descriptor pointer = direct-map virtual.
-        let desc_ptr = (phys_to_virt(desc_base_phys) + (idx as u64) * 16) as *const RxDesc;
+        // Stack buffer for the frame, captured while RX_CUR is held so the
+        // descriptor's RX buffer can be safely reused by hardware once we
+        // clear the status and release the lock.
+        let mut frame_buf = [0u8; RX_BUF_SIZE];
+        let mut frame_len = 0usize;
 
-        // Volatile reads — hardware writes these fields via DMA.
-        let status = unsafe { core::ptr::read_volatile(&(*desc_ptr).status) };
-        let length = unsafe { core::ptr::read_volatile(&(*desc_ptr).length) };
+        {
+            let mut cur = RX_CUR.lock();
+            let idx = *cur as usize;
+            // Kernel-side descriptor pointer = direct-map virtual.
+            let desc_ptr = (phys_to_virt(desc_base_phys) + (idx as u64) * 16) as *const RxDesc;
 
-        // Check if this descriptor has been filled by hardware
-        if status & RDESC_STA_DD == 0 {
-            break; // No more packets
+            // Volatile reads — hardware writes these fields via DMA.
+            let status = unsafe { core::ptr::read_volatile(&(*desc_ptr).status) };
+            let length = unsafe { core::ptr::read_volatile(&(*desc_ptr).length) };
+
+            // Check if this descriptor has been filled by hardware
+            if status & RDESC_STA_DD == 0 {
+                break; // No more packets — RX_CUR released by the block scope
+            }
+            drained_any = true;
+
+            if status & RDESC_STA_EOP != 0 && length > 0 {
+                let buf_phys = bufs_base_phys + (idx as u64) * RX_BUF_SIZE as u64;
+                // Bound the copy by the RX buffer size — hardware should
+                // never report a length larger than the buffer it DMA'd
+                // into, but clamp defensively.
+                let len = core::cmp::min(length as usize, RX_BUF_SIZE);
+
+                // Safety: copying from the RX buffer that hardware wrote
+                // into, via the kernel direct-map (PHYS_OFFSET + buf_phys).
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        phys_to_virt(buf_phys) as *const u8,
+                        frame_buf.as_mut_ptr(),
+                        len,
+                    );
+                }
+                frame_len = len;
+            }
+
+            // Volatile write: clear status so hardware can reuse this descriptor
+            let desc_ptr_mut = desc_ptr as *mut RxDesc;
+            unsafe {
+                core::ptr::write_volatile(&mut (*desc_ptr_mut).status, 0);
+            }
+
+            // Advance and update tail
+            let next = ((idx + 1) % NUM_RX_DESC) as u16;
+            *cur = next;
+
+            // Tell hardware it can use this descriptor again
+            mmio_write(REG_RDT, idx as u32);
+        } // RX_CUR released here — deliver the frame lock-free below.
+
+        // Hand the captured frame to the network stack with NO lock held,
+        // so a reply path (or a second core's poll_rx) can re-acquire
+        // RX_CUR without spinning behind us.
+        if frame_len > 0 {
+            super::handle_rx_packet(&frame_buf[..frame_len]);
         }
-        drained_any = true;
-
-        if status & RDESC_STA_EOP != 0 && length > 0 {
-            let buf_phys = bufs_base_phys + (idx as u64) * RX_BUF_SIZE as u64;
-            let len = length as usize;
-
-            // Safety: reading from the RX buffer that hardware wrote into,
-            // via the kernel direct-map (PHYS_OFFSET + buf_phys).
-            let packet = unsafe {
-                core::slice::from_raw_parts(phys_to_virt(buf_phys) as *const u8, len)
-            };
-
-            // Hand to the network stack
-            super::handle_rx_packet(packet);
-        }
-
-        // Volatile write: clear status so hardware can reuse this descriptor
-        let desc_ptr_mut = desc_ptr as *mut RxDesc;
-        unsafe {
-            core::ptr::write_volatile(&mut (*desc_ptr_mut).status, 0);
-        }
-
-        // Advance and update tail
-        let next = ((idx + 1) % NUM_RX_DESC) as u16;
-        *cur = next;
-
-        // Tell hardware it can use this descriptor again
-        mmio_write(REG_RDT, idx as u32);
     }
-    drop(cur);
 
     // If the ring was empty, nudge the emulator to flush any packets
     // its backend (SLIRP for user-mode netdev) is holding for us.
