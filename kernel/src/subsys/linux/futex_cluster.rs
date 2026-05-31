@@ -236,6 +236,41 @@ pub fn record_wait(pid: u64, uaddr: u64) {
     ring.push(WaitEntry { pid, uaddr });
 }
 
+/// Read-only accessor: every recent `FUTEX_WAKE` target within `half` bytes
+/// of `uaddr`, across all per-CPU wake-history rings.
+///
+/// Returns `(tid, entry_uaddr, signed_delta)` triples where
+/// `signed_delta = entry_uaddr − uaddr` (so a wake one cond-slot above the
+/// query reads `+0x04`).  De-duplicated by `(tid, entry_uaddr)` and capped at
+/// 64 entries so the response stays bounded.  Returns an empty vector when the
+/// cluster-wake feature is disabled on this build (mirroring `record_wake`'s
+/// `is_enabled()` gate), so a stock kernel produces nothing.
+///
+/// This is the one primitive the `cond-autopsy` kdb op needs that is not
+/// derivable host-side: the per-CPU wake rings are private to this module.
+/// No behaviour change — pure read of the existing rings.
+pub fn recent_wakes_near(uaddr: u64, half: u64) -> alloc::vec::Vec<(u64, u64, i64)> {
+    let mut out: alloc::vec::Vec<(u64, u64, i64)> = alloc::vec::Vec::new();
+    if !is_enabled() { return out; }
+    let lo = uaddr.saturating_sub(half);
+    let hi = uaddr.saturating_add(half);
+    for ring in WAKE_HISTORY.iter() {
+        // Brief try_lock: never block the kdb pump thread on a ring a
+        // concurrent FUTEX_WAKE happens to hold.  A missed ring is benign —
+        // the autopsy is a snapshot, not a ledger.
+        let Some(g) = ring.try_lock() else { continue };
+        for e in g.buf.iter() {
+            if e.tid == 0 && e.uaddr == 0 { continue; } // sentinel / unused
+            if e.uaddr < lo || e.uaddr > hi { continue; }
+            let delta = e.uaddr as i64 - uaddr as i64;
+            if out.iter().any(|&(t, u, _)| t == e.tid && u == e.uaddr) { continue; }
+            out.push((e.tid, e.uaddr, delta));
+            if out.len() >= 64 { return out; }
+        }
+    }
+    out
+}
+
 // ── Candidate selection ───────────────────────────────────────────────────
 
 /// Per-candidate annotation: why we admitted it through the safety harness.
