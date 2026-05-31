@@ -2477,6 +2477,19 @@ pub fn run() -> ! {
         if test_263_sched_starvation_counter() { passed += 1; }
     }
 
+    // ── Test 284: timer due-wake survives THREAD_TABLE contention ──────────
+    // Runs in the standard kernel-smoke (test-mode) lane — the lane where the
+    // production lost-wakeup manifested as a 900 s SCHEDULER_DEADLOCK timeout.
+    // It is deterministic and fast (bounded yields), so it pins the fix where
+    // the flake lived without the wall-clock cost that gates `native-core-tests`.
+    // Cite POSIX sched(7) / clock_nanosleep(2) and Intel SDM Vol. 3A §8.10.6.7
+    // (HLT) — deferred-drain shape.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_284_due_wake_survives_contention() { passed += 1; }
+    }
+
     // ── Summary ─────────────────────────────────────────────────────────
 
     test_println!();
@@ -40736,6 +40749,203 @@ fn test_263_sched_starvation_counter() -> bool {
     }
 
     test_pass!("scheduler starvation diagnostic counter");
+    true
+}
+
+// ── Test 284: timer due-wake survives THREAD_TABLE contention ───────────────
+//
+// Regression test for the timer-driven lost-wakeup that wedged the run queue.
+//
+// The 100 Hz timer ISR (`sched::wake_sleeping_threads`) is the driver that
+// re-Readies a `Sleeping`/`Blocked`-with-deadline thread once its `wake_tick`
+// has passed.  It must acquire `THREAD_TABLE` with `try_lock` because it runs
+// in interrupt context: blocking would be a same-CPU re-entrant deadlock
+// against an interrupted path that already holds the lock.  The pre-fix code
+// returned silently on a `try_lock` miss, PERMANENTLY DROPPING that tick's
+// due-wake.  Under sustained contention across a sleeper's deadline window the
+// sleeper was never re-Readied → `[SCHED/STARVE]` → `SCHEDULER_DEADLOCK`.
+//
+// The fix records a missed scan in `RESCAN_PENDING` and honours it from any
+// context that holds `THREAD_TABLE` unconditionally (the picker's lock-held
+// window, and the next uncontended tick), bounding wake latency rather than
+// losing it.  This test pins that contract deterministically:
+//
+//   1. Spawn a worker that parks (`Sleeping`, `wake_tick` far in the future)
+//      and increments a "resumed" flag after it wakes.
+//   2. Make the worker's deadline due NOW, then — while HOLDING
+//      `THREAD_TABLE` — spin past several real timer ticks so the ISR fires,
+//      misses its `try_lock`, and DEFERS the scan (RESCAN_DEFERRED advances).
+//      The worker MUST still be `Sleeping` here: the wake is deferred, not
+//      lost, and cannot be honoured while we hold the lock.
+//   3. Release the lock and drive the scheduler.  Assert the worker is
+//      re-Readied and runs within a bounded tick budget, and that the
+//      deferred scan was actually honoured (RESCAN_HONORED advances).
+//
+// Without the fix, step 2's dropped wake is never recovered and step 3 hangs
+// (the worker stays `Sleeping` forever) — the test FAILs deterministically
+// instead of the 900 s CI timeout the production wedge produced.
+//
+// References:
+//   * POSIX sched(7) / clock_nanosleep(2) — a sleep with an elapsed deadline
+//     must become runnable; the kernel may not drop the wake.
+//   * Intel SDM Vol. 3A §8.10.6.7 (HLT) — motivates the deferred-drain shape
+//     (the hard IRQ records pending work; a lock-safe context drains it).
+
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_284_due_wake_survives_contention() -> bool {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    test_header!("timer due-wake survives THREAD_TABLE contention");
+
+    // Set by the worker AFTER it wakes from its long sleep — proves it was
+    // actually re-Readied and ran, not merely flipped to Ready in the table.
+    static WORKER_RESUMED: AtomicBool = AtomicBool::new(false);
+    // The worker parks for this many ticks; we override its wake_tick below to
+    // make the deadline due immediately, so the natural timeout never fires
+    // within the test and only the contended-deferral path can wake it.
+    const PARK_TICKS: u64 = 1_000_000;
+
+    WORKER_RESUMED.store(false, Ordering::SeqCst);
+
+    fn worker_entry() {
+        crate::hal::enable_interrupts();
+        // Park.  Re-Ready can only come from the timer due-wake path (the
+        // table's wake_tick), which is exactly what we are testing.
+        crate::proc::sleep_ticks(PARK_TICKS);
+        // Reached only if the deferred due-wake re-Readied us.
+        WORKER_RESUMED.store(true, Ordering::SeqCst);
+        crate::proc::exit_thread(0);
+    }
+
+    let was_active = crate::sched::is_active();
+    if !was_active { crate::sched::enable(); }
+
+    let pid = crate::proc::create_kernel_process("due_wake_worker", worker_entry as u64);
+    let worker_tid = {
+        let pt = crate::proc::PROCESS_TABLE.lock();
+        pt.iter().find(|p| p.pid == pid)
+            .and_then(|p| p.threads.first().copied())
+            .unwrap_or(0)
+    };
+    test_println!("  spawned worker pid={} tid={}", pid, worker_tid);
+
+    // ── Phase 1: let the worker reach its parked Sleeping state ──────────────
+    // Drive the scheduler until the worker is observed Sleeping with a
+    // far-future wake_tick.  Bounded so a never-parking worker fails fast.
+    let mut parked = false;
+    for _ in 0..2000u32 {
+        crate::sched::yield_cpu();
+        crate::hal::enable_interrupts();
+        for _ in 0..200u32 { core::hint::spin_loop(); }
+        let st = {
+            let threads = crate::proc::THREAD_TABLE.lock();
+            threads.iter().find(|t| t.tid == worker_tid)
+                .map(|t| (t.state, t.wake_tick))
+        };
+        if let Some((crate::proc::ThreadState::Sleeping, _wt)) = st {
+            parked = true;
+            break;
+        }
+    }
+    if !parked {
+        if !was_active { crate::sched::disable(); }
+        test_fail!("test284", "worker never reached Sleeping state");
+        return false;
+    }
+    test_println!("  worker parked (Sleeping) ✓");
+
+    let deferred_before = crate::sched::rescan_deferred_count();
+    let honored_before = crate::sched::rescan_honored_count();
+
+    // ── Phase 2: force the ISR to DEFER a due-wake under contention ──────────
+    // Hold THREAD_TABLE, make the worker's deadline due NOW, then spin past
+    // several real timer ticks with interrupts enabled.  Each tick the ISR
+    // runs wake_sleeping_threads(), fails its try_lock (we hold the lock),
+    // and records the deferral instead of dropping it.  CRUCIAL: we never
+    // call anything that re-locks THREAD_TABLE while holding it here.
+    {
+        let mut threads = crate::proc::THREAD_TABLE.lock();
+        let now = crate::arch::x86_64::irq::get_ticks();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == worker_tid) {
+            // Deadline is now in the past → the next due-wake scan must re-Ready it.
+            t.wake_tick = now;
+        }
+        // Spin past several ticks while holding the lock so the ISR is forced
+        // onto the deferred path repeatedly.  ~8 ticks of headroom: at
+        // TICK_HZ=100 each tick is ~10 ms; the spin count is generous so even
+        // a fast KVM host crosses multiple tick boundaries.
+        let target = now.wrapping_add(6);
+        let mut spins = 0u64;
+        loop {
+            crate::hal::enable_interrupts(); // allow the timer ISR to fire
+            for _ in 0..2000u32 { core::hint::spin_loop(); }
+            let t = crate::arch::x86_64::irq::get_ticks();
+            spins += 1;
+            // Bound the spin so a stuck tick source can't hang the test.
+            if t >= target || spins > 200_000 { break; }
+        }
+        // Still holding the lock: the deferred scan CANNOT have run, so the
+        // worker must still be Sleeping.  This is the "wake not lost, not yet
+        // honoured" checkpoint.
+        let still_sleeping = threads.iter().find(|t| t.tid == worker_tid)
+            .map(|t| t.state == crate::proc::ThreadState::Sleeping)
+            .unwrap_or(false);
+        if !still_sleeping {
+            drop(threads);
+            if !was_active { crate::sched::disable(); }
+            test_fail!("test284",
+                "worker left Sleeping while THREAD_TABLE held — wake honoured impossibly early");
+            return false;
+        }
+        drop(threads);
+    }
+
+    let deferred_mid = crate::sched::rescan_deferred_count();
+    test_println!("  rescan_deferred: {} -> {} (delta {})",
+        deferred_before, deferred_mid, deferred_mid.saturating_sub(deferred_before));
+    if deferred_mid <= deferred_before {
+        if !was_active { crate::sched::disable(); }
+        test_fail!("test284",
+            "ISR did not record a deferred due-wake during the contention window \
+             (delta=0) — the contended-tick path was not exercised");
+        return false;
+    }
+
+    // ── Phase 3: release contention; the deferred wake must be honoured ──────
+    // Drive the scheduler.  The picker's lock-held drain (and/or the next
+    // uncontended tick) must honour the deferred scan, re-Ready the worker,
+    // and let it run to set WORKER_RESUMED — within a bounded tick budget.
+    let mut resumed = false;
+    for _ in 0..4000u32 {
+        crate::sched::yield_cpu();
+        crate::hal::enable_interrupts();
+        for _ in 0..200u32 { core::hint::spin_loop(); }
+        if WORKER_RESUMED.load(Ordering::SeqCst) {
+            resumed = true;
+            break;
+        }
+    }
+
+    let honored_after = crate::sched::rescan_honored_count();
+    test_println!("  rescan_honored: {} -> {} (delta {})",
+        honored_before, honored_after, honored_after.saturating_sub(honored_before));
+
+    if !was_active { crate::sched::disable(); }
+
+    if !resumed {
+        test_fail!("test284",
+            "worker was NOT re-Readied after a deferred due-wake — wake permanently lost \
+             (this is the SCHEDULER_DEADLOCK regression)");
+        return false;
+    }
+    if honored_after <= honored_before {
+        test_fail!("test284",
+            "worker resumed but RESCAN_HONORED did not advance — deferred-drain accounting broken");
+        return false;
+    }
+
+    test_println!("  worker re-Readied and ran after contended deferral ✓");
+    test_pass!("timer due-wake survives THREAD_TABLE contention");
     true
 }
 
