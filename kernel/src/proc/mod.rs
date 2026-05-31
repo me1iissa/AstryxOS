@@ -210,6 +210,22 @@ pub struct Thread {
     /// that user_mode_bootstrap() can correctly switch to the user CR3
     /// after the initial context-switch lands on the kernel stack.
     pub first_run: bool,
+    /// Global `TICK_COUNT` snapshot at which this thread entered (and has
+    /// continuously remained in) the `Ready` state without yet being
+    /// selected to run — i.e. the start of its current run-queue wait.
+    ///
+    /// `0` is the "not currently waiting / unstamped" sentinel.  The picker
+    /// stamps this lazily (it walks the whole table each iteration under
+    /// `THREAD_TABLE`, so a freshly-Readied thread is stamped within ~1 tick)
+    /// and clears it to `0` the moment the thread is selected to Run.  The
+    /// picker derives a wait-age from `now - ready_since_tick` and applies an
+    /// escalating anti-starvation score bonus (with a hard force-select
+    /// ceiling) so a runnable thread that is continuously out-scored by
+    /// wake-boosted peers cannot be starved indefinitely.  This is the
+    /// AstryxOS analogue of the POSIX/`sched(7)` SCHED_OTHER guarantee that a
+    /// runnable task accrues owed service the longer it is passed over and
+    /// eventually becomes the highest-priority choice (longest-waiting wins).
+    pub ready_since_tick: u64,
     /// True when context.rsp holds a valid saved kernel RSP.
     ///
     /// Set to `false` in schedule() just before marking the thread Ready,
@@ -909,6 +925,7 @@ pub fn init() {
         cpu_affinity: Some(0),
         last_cpu: 0,
         first_run: false,
+        ready_since_tick: 0,
         ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         fork_user_regs: ForkUserRegs::default(),
@@ -1164,6 +1181,7 @@ fn create_kernel_process_inner(name: &str, entry_point: u64, initial_state: Thre
         cpu_affinity: None,
         last_cpu: 0,
         first_run: false,
+        ready_since_tick: 0,
         ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         fork_user_regs: ForkUserRegs::default(),
@@ -1234,6 +1252,7 @@ pub fn create_thread(pid: Pid, name: &str, entry_point: u64) -> Option<Tid> {
         cpu_affinity: None,
         last_cpu: 0,
         first_run: false,
+        ready_since_tick: 0,
         ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         fork_user_regs: ForkUserRegs::default(),
@@ -1308,6 +1327,7 @@ pub fn create_thread_blocked(pid: Pid, name: &str, entry_point: u64) -> Option<T
         cpu_affinity: None,
         last_cpu: 0,
         first_run: false,
+        ready_since_tick: 0,
         ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         fork_user_regs: ForkUserRegs::default(),
@@ -2875,6 +2895,7 @@ pub fn fork_process(parent_pid: Pid, _parent_tid: Tid, parent_regs: &ForkUserReg
         cpu_affinity: None,
         last_cpu: 0,
         first_run: true, // goes through user_mode_bootstrap (CR3 switch, TSS, TLS)
+        ready_since_tick: 0,
         ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         // Propagate parent's callee-saved regs (RBP/RBX/R12-R15) into the child.
@@ -3128,6 +3149,7 @@ pub fn fork_process_share_vm(
         cpu_affinity: None,
         last_cpu: 0,
         first_run: true,
+        ready_since_tick: 0,
         ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         fork_user_regs: *parent_regs,
@@ -3820,6 +3842,7 @@ pub fn vfork_process(parent_pid: Pid, parent_tid: Tid, parent_regs: &ForkUserReg
         cpu_affinity: None,
         last_cpu: 0,
         first_run: true,  // Goes through user_mode_bootstrap (handles CR3, TSS, TLS)
+        ready_since_tick: 0,
         ctx_rsp_valid: alloc::boxed::Box::new(core::sync::atomic::AtomicBool::new(true)),
         clear_child_tid: 0,
         // Propagate parent callee-saved regs into the vfork child for the same
