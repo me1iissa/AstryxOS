@@ -25,6 +25,51 @@ static TICKS_REMAINING: [AtomicU64; MAX_CPUS] =
 static NEED_RESCHEDULE: [AtomicBool; MAX_CPUS] =
     [const { AtomicBool::new(false) }; MAX_CPUS];
 
+/// Global "a timer due-wake scan was deferred" flag.
+///
+/// The 100 Hz timer ISR (`wake_sleeping_threads`) is the driver that re-Readies
+/// a `Sleeping`/`Blocked`-with-deadline thread once its `wake_tick` has passed.
+/// It acquires `THREAD_TABLE` with `try_lock` to avoid a same-CPU re-entrant
+/// deadlock against an interrupted code path that already holds the lock.  When
+/// that `try_lock` fails the ISR CANNOT do the scan on this tick — but it MUST
+/// NOT silently lose the due-wake: if contention persists across a sleeper's
+/// deadline window, the sleeper would never be re-Readied and the run queue
+/// wedges (`[SCHED/STARVE]` → `SCHEDULER_DEADLOCK`).
+///
+/// Instead the ISR records the deferral here.  The scan is then honoured at the
+/// next opportunity by ANY context that holds `THREAD_TABLE` unconditionally —
+/// principally the picker's `'pick:` loop, which already walks the table every
+/// iteration and re-acquires the lock fresh after each `sti; hlt; cli`, and the
+/// next uncontended timer tick.  This mirrors the deferred-timer-softirq shape:
+/// the hard IRQ records that timer work is due and a context that can safely
+/// take the relevant lock drains it.  Wake latency is therefore bounded to "the
+/// next picker iteration or the next uncontended tick" — never "permanently
+/// lost".
+static RESCAN_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Diagnostic: cumulative count of timer due-wake scans that were deferred
+/// because the ISR could not acquire `THREAD_TABLE`.  Monotone; its delta over
+/// a workload tells tooling how often the contended-tick path was taken.  A
+/// non-zero delta is EXPECTED under contention and is NOT itself a bug — the
+/// deferred scan is honoured elsewhere — but a large delta with no matching
+/// `RESCAN_HONORED_TOTAL` progress would indicate the drain path is not running.
+pub static RESCAN_DEFERRED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Diagnostic: cumulative count of deferred due-wake scans actually drained
+/// (the flag was observed set and a scan ran).  Pairs with
+/// `RESCAN_DEFERRED_TOTAL` for test-side assertions that no deferral is lost.
+pub static RESCAN_HONORED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the cumulative deferred-scan count (see [`RESCAN_DEFERRED_TOTAL`]).
+pub fn rescan_deferred_count() -> u64 {
+    RESCAN_DEFERRED_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Snapshot of the cumulative honored-scan count (see [`RESCAN_HONORED_TOTAL`]).
+pub fn rescan_honored_count() -> u64 {
+    RESCAN_HONORED_TOTAL.load(Ordering::Relaxed)
+}
+
 /// Cumulative count of `'pick:` retry iterations that wrapped through
 /// the `sti; hlt; cli; continue 'pick` wait path because no Ready peer
 /// was selectable for the current thread.
@@ -211,27 +256,112 @@ pub fn timer_tick_schedule() {
     }
 }
 
-/// Wake any threads whose sleep time has elapsed.
-/// Also wakes blocked threads whose wait timeout has expired.
-/// Uses try_lock since this is called from interrupt context —
-/// if THREAD_TABLE is already held, skip this tick (wakeups will
-/// be caught on the next timer tick).
-fn wake_sleeping_threads() {
-    let now = crate::arch::x86_64::irq::get_ticks();
-    let mut threads = match THREAD_TABLE.try_lock() {
-        Some(guard) => guard,
-        None => return, // Lock held — skip this tick.
-    };
+/// Perform one due-wake pass over an already-locked thread table.
+///
+/// Re-Readies every `Sleeping` thread whose `wake_tick` deadline has passed and
+/// every `Blocked`-with-deadline thread whose timeout has expired.  This is the
+/// pure, lock-in-hand core shared by both the timer-ISR path
+/// (`wake_sleeping_threads`) and the deferred drain (`drain_due_wakes_if_pending`):
+/// keeping it in one place guarantees the two callers can never diverge on which
+/// states/deadlines count as "due".
+///
+/// The caller MUST already hold `THREAD_TABLE`.  `now` is the current
+/// `TICK_COUNT` (monotone); pass the value read by the caller so a single tick
+/// snapshot drives the whole pass.  Returns the number of threads flipped to
+/// `Ready` (diagnostic only).
+#[inline]
+fn due_wake_scan(threads: &mut alloc::vec::Vec<proc::Thread>, now: u64) -> u32 {
+    let mut woken = 0u32;
     for t in threads.iter_mut() {
         if t.state == ThreadState::Sleeping && now >= t.wake_tick {
             t.state = ThreadState::Ready;
+            woken += 1;
         }
         // Wake blocked threads whose timeout has expired.
         // The thread will resume in wait_for_single_object / wait_for_multiple_objects,
         // discover that its WaitBlock was NOT satisfied, and return Timeout.
         if t.state == ThreadState::Blocked && t.wake_tick != u64::MAX && now >= t.wake_tick {
             t.state = ThreadState::Ready;
+            woken += 1;
         }
+    }
+    woken
+}
+
+/// Wake any threads whose sleep time has elapsed (timer-ISR path).
+/// Also wakes blocked threads whose wait timeout has expired.
+///
+/// Uses `try_lock` because this runs in the timer ISR: if the interrupted code
+/// path on THIS CPU already holds `THREAD_TABLE`, blocking here would be a
+/// same-CPU re-entrant deadlock.  The original code returned silently on a
+/// `try_lock` miss — which PERMANENTLY DROPPED the due-wake for that tick.  If
+/// contention persisted across a sleeper's deadline window the sleeper was
+/// never re-Readied and the run queue wedged (`[SCHED/STARVE]` →
+/// `SCHEDULER_DEADLOCK`).
+///
+/// The fix: a `try_lock` miss now records the deferral in [`RESCAN_PENDING`]
+/// instead of dropping it.  The deferred scan is honoured at the next
+/// opportunity by [`drain_due_wakes_if_pending`] (called from the picker's
+/// lock-held window and from the next uncontended tick), so no due-wake is ever
+/// permanently lost — the bound is the next picker iteration or the next
+/// uncontended tick, not "never".  We never block in the ISR, preserving the
+/// original deadlock-avoidance property.
+fn wake_sleeping_threads() {
+    let now = crate::arch::x86_64::irq::get_ticks();
+    let mut threads = match THREAD_TABLE.try_lock() {
+        Some(guard) => guard,
+        None => {
+            // Lock held by interrupted code — cannot scan now.  Record the
+            // deferral so a context that CAN take the lock drains it; do NOT
+            // silently drop the due-wake.
+            RESCAN_PENDING.store(true, Ordering::SeqCst);
+            RESCAN_DEFERRED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+    // We hold the lock: this tick's scan is authoritative.  Clear any pending
+    // deferral first so a deferral set on a PRIOR contended tick is also
+    // satisfied by this pass (this scan sees the same or newer `now`, so it
+    // covers every deadline the deferred scan would have).
+    if RESCAN_PENDING.swap(false, Ordering::SeqCst) {
+        RESCAN_HONORED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    due_wake_scan(&mut threads, now);
+}
+
+/// Drain a deferred due-wake scan if one is pending, with the caller already
+/// holding `THREAD_TABLE`.
+///
+/// This is the deferred-softirq drain side of the [`RESCAN_PENDING`] protocol.
+/// It is called from contexts that hold `THREAD_TABLE` UNCONDITIONALLY (not via
+/// `try_lock`) and can therefore safely complete a scan the timer ISR had to
+/// defer — principally the picker's `'pick:` loop, which re-acquires the lock
+/// fresh on every iteration after each `sti; hlt; cli`.  Because the picker is
+/// exactly the code path that runs while a thread is wedged waiting to be
+/// re-Readied, folding the drain in here makes the wedged path SELF-HEAL: the
+/// sleeper whose deadline passed during the contention window is re-Readied by
+/// the very picker iteration that is looking for a Ready peer, even if the timer
+/// ISR keeps missing its `try_lock`.
+///
+/// Cheap fast path: a single relaxed load when no deferral is pending (the
+/// common case), so this adds negligible cost to the picker hot loop.  The
+/// `swap` only runs on the rare tick where a deferral was actually recorded.
+///
+/// SAFETY / SMP: the caller holds `THREAD_TABLE`, so the table mutation is
+/// serialised exactly as the ISR's own scan would be.  Clearing the flag with a
+/// `swap` is race-free against a concurrent ISR set on another CPU: if the ISR
+/// sets the flag AFTER our `swap` reads `true`, that set survives and the next
+/// drain (or uncontended tick) honours it — the worst case is one extra
+/// redundant scan, never a lost wake.
+#[inline]
+fn drain_due_wakes_if_pending(threads: &mut alloc::vec::Vec<proc::Thread>) {
+    if !RESCAN_PENDING.load(Ordering::Relaxed) {
+        return;
+    }
+    if RESCAN_PENDING.swap(false, Ordering::SeqCst) {
+        RESCAN_HONORED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        let now = crate::arch::x86_64::irq::get_ticks();
+        due_wake_scan(threads, now);
     }
 }
 
@@ -796,6 +926,19 @@ was_emergency_4k={}",
         // does not re-disable interrupts.
         crate::hal::disable_interrupts();
         let mut threads = THREAD_TABLE.lock();
+        // Deferred timer due-wake drain (lock-held window).
+        //
+        // The timer ISR re-Readies sleeping/blocked-with-deadline threads, but
+        // it uses `try_lock` and must defer the scan when the lock is contended
+        // (see `wake_sleeping_threads` / `RESCAN_PENDING`).  The picker is the
+        // code path that runs WHILE a thread is wedged waiting to be re-Readied,
+        // and it holds `THREAD_TABLE` unconditionally here — so it is the right
+        // place to honour any deferred scan.  Doing it before the Ready-peer
+        // search means a sleeper whose deadline passed during the ISR's
+        // contention window becomes selectable on THIS iteration, closing the
+        // lost-wakeup window deterministically (cheap relaxed probe in the
+        // common no-deferral case).
+        drain_due_wakes_if_pending(&mut threads);
         let len = threads.len();
         if len <= 1 {
             // Only this thread (idle) exists.  Decide based on its state.
@@ -817,7 +960,15 @@ was_emergency_4k={}",
                 .map(|t| t.state);
             drop(threads);
             match current_state {
-                Some(ThreadState::Running) => {
+                // Running, or freshly re-Readied (e.g. by the due-wake drain
+                // above): the single thread is runnable — return to the caller
+                // so it resumes rather than being mistaken for a terminal wedge.
+                // A `Ready` single thread reaching the picker means its wake
+                // deadline elapsed and the drain flipped it; sysret-ing back to
+                // it is exactly the intended self-resume.  Clear the burst so a
+                // brief wedge that just self-resolved does not leave stale state.
+                Some(ThreadState::Running) | Some(ThreadState::Ready) => {
+                    clear_picker_burst();
                     crate::arch::x86_64::irq::reset_watchdog_counter();
                     crate::hal::enable_interrupts();
                     return;
@@ -1067,7 +1218,18 @@ was_emergency_4k={}",
                     .map(|t| t.state);
                 drop(threads);
                 match current_state {
-                    Some(ThreadState::Running) => {
+                    // Running, or freshly re-Readied by the due-wake drain at
+                    // the top of this iteration: no OTHER peer is Ready, so the
+                    // current thread is the one to run — return to the caller
+                    // rather than HLT-ing it as a wedge.  This is the in-place
+                    // self-resume of a thread whose own sleep/timeout deadline
+                    // just elapsed.  A self-resume is a successful pick, so clear
+                    // the per-CPU starvation burst (matches the `break 'pick`
+                    // success path) — otherwise a thread that wedged briefly and
+                    // then self-resumed would carry a stale burst into the next
+                    // transient idle.
+                    Some(ThreadState::Running) | Some(ThreadState::Ready) => {
+                        clear_picker_burst();
                         crate::perf::record_idle_tick();
                         crate::arch::x86_64::irq::reset_watchdog_counter();
                         crate::hal::enable_interrupts();
