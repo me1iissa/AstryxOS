@@ -144,6 +144,106 @@ pub fn starvation_count() -> u64 {
     SCHED_STARVATION_TOTAL.load(Ordering::Relaxed)
 }
 
+// ── Anti-starvation aging (run-queue wait fairness) ─────────────────────────
+//
+// The base picker scores a Ready peer as `priority*4 + affinity_bonus(0..2)`
+// and selects the strict maximum.  With no wait-time term, a Ready thread that
+// is continuously out-scored — e.g. a `PRIORITY_NORMAL` peer competing against
+// a population that is repeatedly wake-boosted to `PRIORITY_NORMAL +
+// PRIORITY_BOOST_WAIT` on every event-loop wakeup — can be passed over on every
+// tick forever.  That is an indefinite run-queue starvation: it violates the
+// POSIX `sched(7)` SCHED_OTHER expectation that every runnable thread
+// eventually gets the CPU, and the practical "longest-waiting runnable task
+// eventually runs" guarantee that real general-purpose schedulers provide.
+//
+// The fix gives each Ready thread a wait-age that the picker folds into its
+// score, plus a hard force-select ceiling:
+//
+//   * `ready_since_tick` (per-thread) is stamped lazily by the picker the
+//     first time it observes a Ready thread without a stamp, and cleared the
+//     moment the thread is selected to Run.  The picker walks the whole table
+//     each iteration under `THREAD_TABLE`, so a freshly-Readied thread is
+//     stamped within ~1 tick of becoming runnable.
+//
+//   * Once a thread's wait-age reaches `STARVE_AGE_TICKS` it earns an
+//     escalating score bonus — one point per `STARVE_AGE_QUANTUM` ticks beyond
+//     the threshold, capped at `STARVE_AGE_BONUS_MAX`.  The cap is chosen to
+//     dominate the largest possible wake-boost differential (`PRIORITY_BOOST_WAIT
+//     * 4`), so a sufficiently-aged thread is guaranteed to out-score any
+//     wake-boosted peer at the same base priority.
+//
+//   * As an absolute backstop, a thread whose wait-age reaches
+//     `STARVE_FORCE_TICKS` is force-selected this tick regardless of score
+//     (the oldest such thread wins, mirroring an NT balance-set-manager
+//     force-boost / a CFS eligibility deadline).  This bounds worst-case
+//     run-queue latency to ~`STARVE_FORCE_TICKS` ticks even against a
+//     pathological mix of priorities.
+//
+// All three terms are inert in the common case: a thread that runs within
+// `STARVE_AGE_TICKS` of becoming Ready never accrues any bonus, so quiet or
+// lightly-loaded systems keep their existing priority ordering exactly.
+
+/// Run-queue wait-age (in 100 Hz ticks) at which a Ready thread begins to earn
+/// an anti-starvation score bonus.  20 ticks ≈ 200 ms — long enough that a
+/// thread scheduled in the normal course of events never accrues a bonus, short
+/// enough that a genuinely out-scored thread starts climbing well before a user
+/// would perceive a stall.
+const STARVE_AGE_TICKS: u64 = 20;
+
+/// Ticks of additional wait per +1 of escalating wait-age bonus once past
+/// `STARVE_AGE_TICKS`.  At 10 ticks (≈100 ms) per point the bonus climbs one
+/// step every ~100 ms of continued starvation.
+const STARVE_AGE_QUANTUM: u64 = 10;
+
+/// Maximum wait-age score bonus.  Must exceed the largest wake-boost score
+/// differential — `PRIORITY_BOOST_WAIT * 4 = 8` (a peer boosted two priority
+/// levels) plus the +2 affinity bonus — so a fully-aged thread is guaranteed
+/// to out-score any same-base-priority wake-boosted peer.  16 gives comfortable
+/// headroom (it also covers a +2 priority gap between distinct base
+/// priorities: `2 * 4 = 8`).
+const STARVE_AGE_BONUS_MAX: u16 = 16;
+
+/// Hard ceiling: a Ready thread that has waited this many ticks (≈1 s) is
+/// force-selected on the current CPU regardless of score, bypassing the normal
+/// strict-max comparison.  This is the absolute anti-starvation guarantee that
+/// bounds worst-case run-queue latency independent of any priority arithmetic.
+const STARVE_FORCE_TICKS: u64 = 100;
+
+/// Throttle factor for the `[SCHED/STARVE] force-select` diagnostic: the line
+/// is emitted on the first force and then once per this many force-selects.
+/// The monotone `SCHED_STARVE_FORCE_TOTAL` counter is unaffected and remains
+/// the authoritative rate source.  64 keeps a steady-but-quiet trail under a
+/// ~1 Hz re-starve without flooding a multi-minute soak log.
+const STARVE_FORCE_LOG_EVERY: u64 = 64;
+
+/// Cumulative count of force-selects performed by the anti-starvation backstop
+/// (`STARVE_FORCE_TICKS` reached).  A non-zero value means at least one Ready
+/// thread was rescued from indefinite starvation; the test suite snapshots this
+/// to assert the backstop fired.  Monotone since boot.
+pub static SCHED_STARVE_FORCE_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of [`SCHED_STARVE_FORCE_TOTAL`].
+pub fn starve_force_count() -> u64 {
+    SCHED_STARVE_FORCE_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Pure helper: the anti-starvation score bonus for a Ready thread that has
+/// been waiting `age` ticks (`age = now - ready_since_tick`, saturating).
+///
+/// Returns 0 below `STARVE_AGE_TICKS`; thereafter one point per
+/// `STARVE_AGE_QUANTUM` ticks of further wait, saturating at
+/// `STARVE_AGE_BONUS_MAX`.  Extracted as a free function so the scheduler
+/// regression test can assert the escalation/cap curve without spinning real
+/// threads.
+#[inline]
+pub fn wait_age_bonus(age: u64) -> u16 {
+    if age < STARVE_AGE_TICKS {
+        return 0;
+    }
+    let steps = (age - STARVE_AGE_TICKS) / STARVE_AGE_QUANTUM + 1;
+    (steps.min(STARVE_AGE_BONUS_MAX as u64)) as u16
+}
+
 /// Internal: record one HLT decision for the given `current_tid` on this
 /// CPU.  Returns `true` if the per-thread burst has just crossed the
 /// starvation threshold (or a subsequent re-emit boundary — see
@@ -1042,6 +1142,32 @@ was_emergency_4k={}",
             .position(|t| t.tid == current_tid)
             .unwrap_or(0);
 
+        // ── Anti-starvation: lazy run-queue wait stamping ───────────────────
+        // Stamp every Ready thread that is not yet stamped with `now` so its
+        // run-queue wait clock starts ticking.  This is the single place a
+        // thread's `ready_since_tick` is set: doing it here (rather than at the
+        // ~18 scattered Blocked→Ready / Running→Ready wake sites) keeps the
+        // bookkeeping in one auditable spot and cannot be forgotten by a new
+        // wake path.  The picker runs at least once per quantum and on every
+        // yield/wake, so a freshly-Readied thread is stamped within ~1 tick of
+        // becoming runnable — far finer than the ~200 ms `STARVE_AGE_TICKS`
+        // threshold.  `now.max(1)` keeps 0 reserved as the "unstamped"
+        // sentinel even on the (boot-only) tick 0.
+        let now = crate::arch::x86_64::irq::get_ticks();
+        let stamp = now.max(1);
+        for t in threads.iter_mut() {
+            if t.state == ThreadState::Ready {
+                if t.ready_since_tick == 0 {
+                    t.ready_since_tick = stamp;
+                }
+            } else if t.ready_since_tick != 0 {
+                // Left the Ready state by some other path (e.g. re-Blocked
+                // before ever running); drop the stale stamp so a future
+                // Ready episode starts its wait clock fresh.
+                t.ready_since_tick = 0;
+            }
+        }
+
         // Find the highest-priority Ready thread with affinity awareness.
         // Scoring: priority * 4 + affinity_bonus (0-2)
         //   - affinity match (pinned to this cpu): +2
@@ -1065,6 +1191,14 @@ was_emergency_4k={}",
         let mut best_score: u16 = 0;
         let mut idle_best_idx: Option<usize> = None;
         let mut idle_best_score: u16 = 0;
+        // Anti-starvation backstop: the schedulable-on-this-CPU Ready peer with
+        // the oldest run-queue wait, and that wait age in ticks.  If the oldest
+        // reaches `STARVE_FORCE_TICKS` it is force-selected below regardless of
+        // score.  Idle threads (TID >= 0x1000) are deliberately excluded — they
+        // are the schedule-of-last-resort and must never pre-empt real work via
+        // the backstop.
+        let mut force_idx: Option<usize> = None;
+        let mut force_age: u64 = 0;
 
         for i in 1..len {
             let idx = (current_idx + i) % len;
@@ -1085,11 +1219,32 @@ was_emergency_4k={}",
                 }
             }
 
+            // Run-queue wait age (ticks) for the anti-starvation terms.  The
+            // lazy-stamp pass above guarantees `ready_since_tick != 0` for any
+            // Ready thread by the time we get here; `saturating_sub` keeps the
+            // arithmetic safe against a non-monotone read in the unlikely event
+            // a stamp landed a tick ahead of `now`.
+            let wait_age = now.saturating_sub(t.ready_since_tick);
+            let is_idle_thread = t.tid >= 0x1000;
+
             let mut score = (t.priority as u16) * 4;
             if t.cpu_affinity == Some(cpu) {
                 score += 2; // Pinned to us — strong preference.
             } else if t.last_cpu == cpu {
                 score += 1; // Ran here last — cache-warm preference.
+            }
+            // Anti-starvation aging: a Ready thread that has been passed over
+            // long enough earns an escalating, capped score bonus so it cannot
+            // be out-competed forever by continuously wake-boosted peers.  Only
+            // real (non-idle) work ages — idle threads must stay the schedule
+            // of last resort.  See `wait_age_bonus` / `STARVE_*`.
+            if !is_idle_thread {
+                score += wait_age_bonus(wait_age);
+                // Track the oldest real Ready peer for the hard backstop.
+                if wait_age > force_age || force_idx.is_none() {
+                    force_age = wait_age;
+                    force_idx = Some(idx);
+                }
             }
 
             // AP idle threads (TID >= 0x1000 + apic_id, see
@@ -1109,8 +1264,8 @@ was_emergency_4k={}",
             // the framebuffer compositor.  Treat TID 0 as an ordinary
             // PRIORITY_IDLE peer that loses to higher-priority workers
             // on score alone but never falls into the schedule-of-last-
-            // resort bucket.
-            let is_idle_thread = t.tid >= 0x1000;
+            // resort bucket.  (`is_idle_thread` is computed once above, before
+            // the anti-starvation aging block.)
             if is_idle_thread {
                 if score > idle_best_score || idle_best_idx.is_none() {
                     idle_best_idx = Some(idx);
@@ -1129,6 +1284,42 @@ was_emergency_4k={}",
         if best_idx.is_none() {
             best_idx = idle_best_idx;
             best_score = idle_best_score;
+        }
+
+        // Anti-starvation backstop (hard guarantee): if the oldest real Ready
+        // peer on this CPU has been waiting at least `STARVE_FORCE_TICKS`
+        // (~1 s), force-select it this tick regardless of score.  The
+        // escalating `wait_age_bonus` already wins the score comparison long
+        // before this in almost all cases; the backstop bounds worst-case
+        // run-queue latency even against a pathological priority mix where the
+        // capped bonus cannot overcome a much-higher-base-priority storm.  This
+        // mirrors the balance-set-manager force-boost of starved Ready threads
+        // and the CFS/EEVDF guarantee that the longest-waiting runnable task
+        // eventually runs.  Only fires when the forced thread is not already the
+        // best pick (avoids a redundant override) and is non-idle (tracked that
+        // way in `force_idx`).
+        if force_age >= STARVE_FORCE_TICKS {
+            if let Some(fidx) = force_idx {
+                if best_idx != Some(fidx) {
+                    let n = SCHED_STARVE_FORCE_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    // Throttle the diagnostic: emit the first force-select and
+                    // then one per `STARVE_FORCE_LOG_EVERY` thereafter.  Under
+                    // sustained contention (e.g. a busy poll thread that
+                    // re-starves ~1 Hz) an unthrottled line per event would
+                    // flood the serial log; the monotone counter
+                    // (`starve_force_count()`) stays the authoritative rate
+                    // source for tooling.
+                    if n == 0 || n % STARVE_FORCE_LOG_EVERY == 0 {
+                        crate::serial_println!(
+                            "[SCHED/STARVE] force-select tid={} (waited {} ticks >= {}) on cpu={} \
+                             total={} — anti-starvation backstop",
+                            threads[fidx].tid, force_age, STARVE_FORCE_TICKS, cpu, n + 1,
+                        );
+                    }
+                    best_idx = Some(fidx);
+                    best_score = (threads[fidx].priority as u16) * 4;
+                }
+            }
         }
         let _ = best_score; // suppress "unused" if later edits drop the read
 
@@ -1154,6 +1345,10 @@ was_emergency_4k={}",
                 // Mark next thread as Running and record which CPU it's on.
                 threads[idx].state = ThreadState::Running;
                 threads[idx].last_cpu = cpu;
+                // This thread got the CPU — its run-queue wait is over.  Clear
+                // the stamp so any escalating anti-starvation bonus resets and
+                // its NEXT Ready episode times a fresh wait from zero.
+                threads[idx].ready_since_tick = 0;
                 let tid = threads[idx].tid;
                 let rsp = threads[idx].context.rsp;
                 let pid = threads[idx].pid;
