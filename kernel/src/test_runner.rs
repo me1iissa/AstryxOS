@@ -20337,21 +20337,23 @@ fn test_vfs_file_locking() -> bool {
     ok
 }
 
-// ── VFS resolve_path_opts — W83 trace + 1s deadline safety net ──────────────
+// ── VFS resolve_path_opts — W83 trace + forward-progress deadline ───────────
 //
-// Two sub-cases:
+// Three sub-cases:
 //   (a) Happy path: a deeply-nested directory chain plus a symlink resolves
-//       well within the 1s budget, returns Ok.
+//       well within the budget, returns Ok.
 //   (b) Forced-timeout: invoke the private `_test_resolve_with_deadline`
 //       entrypoint with `deadline_ticks = 0` (already in the past) and assert
-//       it returns `VfsError::TimedOut` — proving the deadline check on the
-//       hot path fires before the next concrete-FS dispatch.
+//       it returns `VfsError::TimedOut` — proving the no-progress deadline
+//       fires before the next concrete-FS dispatch.
+//   (c) Forward-progress re-arm: prove the deadline is re-armed on advance so
+//       a slow-but-progressing walk is NOT failed (the production bug).
 //
 // The happy-path leg is the regression guard: if a future change accidentally
 // makes deep-path resolution take seconds (e.g. by holding a global lock
 // across a slow disk read), this test will start failing.
 fn test_vfs_resolve_deadline() -> bool {
-    test_header!("VFS resolve_path_opts: trace + 1s deadline (W83)");
+    test_header!("VFS resolve_path_opts: forward-progress deadline (W83)");
     let mut ok = true;
 
     // ── (a) Deep nesting + symlink resolves quickly ─────────────────────
@@ -20392,6 +20394,26 @@ fn test_vfs_resolve_deadline() -> bool {
         }
     }
 
+    // ── (c) Forward-progress re-arm: a walk that advances does NOT time out ──
+    // Regression guard for the production bug where the deadline was an
+    // absolute single budget computed once and threaded unchanged, so a
+    // slow-but-progressing resolve (descheduled under MOUNTS / block-device
+    // contention) overran 1s of wall-clock and failed open(2) of a PRESENT
+    // file with ETIMEDOUT.  The corrected net re-arms per resolved component,
+    // so progress keeps the deadline alive; only a single stuck component (or
+    // the absolute backstop) trips it.  POSIX open(2) does not define
+    // ETIMEDOUT for an existing file.
+    let (expired_without_progress, expired_after_progress) =
+        crate::vfs::_test_resolve_deadline_rearm();
+    if expired_without_progress && !expired_after_progress {
+        test_println!("  (c) deadline re-arms on progress (wedge=expire, progress=alive) ✓");
+    } else {
+        test_fail!("VFS resolve deadline",
+            "(c) re-arm: expired_without_progress={} expired_after_progress={} (expected true,false)",
+            expired_without_progress, expired_after_progress);
+        ok = false;
+    }
+
     // ── Cleanup ─────────────────────────────────────────────────────────
     let _ = crate::vfs::remove("/tmp/w83/link");
     let _ = crate::vfs::remove("/tmp/w83/a/b/c/d/target.txt");
@@ -20401,7 +20423,7 @@ fn test_vfs_resolve_deadline() -> bool {
     let _ = crate::vfs::remove("/tmp/w83/a");
     let _ = crate::vfs::remove("/tmp/w83");
 
-    if ok { test_pass!("VFS resolve_path_opts: trace + 1s deadline (W83)"); }
+    if ok { test_pass!("VFS resolve_path_opts: forward-progress deadline (W83)"); }
     ok
 }
 
