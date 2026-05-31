@@ -1234,6 +1234,11 @@ pub fn run() -> ! {
     total += 1;
     if test_mremap_shrink() { passed += 1; }
 
+    // ── Test 126b: mremap grow must NOT clobber an adjacent mapping ───────────
+
+    total += 1;
+    if test_mremap_grow_preserves_neighbour() { passed += 1; }
+
     // ── Test 127: set_robust_list / get_robust_list roundtrip ────────────────
 
     total += 1;
@@ -25295,6 +25300,93 @@ fn test_mremap_shrink() -> bool {
     let _ = crate::syscall::dispatch_linux_kernel(11, addr as u64, 0x2000, 0, 0, 0, 0);
 
     test_pass!("mremap shrink: sentinel readable, addr unchanged ✓");
+    true
+}
+
+// ── Test 122b: mremap grow must relocate, never clobber a neighbour ───────────
+//
+// Per mremap(2): when the page(s) immediately after the old mapping are not
+// free, an in-place grow MUST fail; with MREMAP_MAYMOVE the kernel relocates
+// the mapping instead.  It must NEVER overwrite the adjacent mapping.  A prior
+// implementation used MAP_FIXED for the in-place attempt, which destructively
+// freed and re-zeroed whatever occupied `old_addr+old_size` — when that
+// happened to be the top initial-stack page (argc/argv, System V x86-64 psABI
+// §3.4.1) it surfaced as an upstream `argv[1]==NULL` crash.  This test pins the
+// neighbour-preservation invariant directly.
+
+fn test_mremap_grow_preserves_neighbour() -> bool {
+    test_header!("mremap(25): grow with MAYMOVE relocates, never clobbers neighbour");
+
+    // Reserve a 3-page region, then split it so we have a 1-page mapping A
+    // immediately followed by a 2-page neighbour B that is definitely occupied.
+    // mmap a single 3-page block first so the two sub-mappings are adjacent.
+    let block = crate::syscall::dispatch_linux_kernel(
+        9, 0, 0x3000, 3, 0x22 /*MAP_PRIVATE|MAP_ANONYMOUS*/, u64::MAX, 0,
+    );
+    if block <= 0 {
+        test_fail!("mremap_grow_neighbour", "mmap 3-page block failed: {}", block);
+        return false;
+    }
+    let a_addr = block as u64;           // 1-page mapping A
+    let b_addr = a_addr + 0x1000;        // 2-page neighbour B, immediately after A
+    test_println!("  A @ {:#x} (1 page), neighbour B @ {:#x} (2 pages) ✓", a_addr, b_addr);
+
+    // Plant a sentinel in B's first page.  UserGuard: user-VA, CR4.SMAP active.
+    const SENTINEL: u64 = 0x1357_9BDF_2468_ACE0u64;
+    unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
+        core::ptr::write(b_addr as *mut u64, SENTINEL);
+    }
+
+    // mremap(A, old=0x1000, new=0x2000, MREMAP_MAYMOVE=1).  The page just after
+    // A (== b_addr) is occupied by B, so the in-place grow must fail and the
+    // kernel must relocate A to a fresh address — leaving B untouched.
+    let new_addr = crate::syscall::dispatch_linux_kernel(
+        25,
+        a_addr,   // old_addr
+        0x1000,   // old_size
+        0x2000,   // new_size
+        1,        // flags = MREMAP_MAYMOVE
+        0, 0,
+    );
+    test_println!("  mremap(grow A, MAYMOVE) = {:#x}", new_addr as u64);
+    if new_addr <= 0 {
+        test_fail!("mremap_grow_neighbour", "mremap failed: {}", new_addr);
+        return false;
+    }
+
+    // The neighbour B's sentinel MUST survive — the bug freed+zeroed it.
+    let surv = unsafe {
+        let _g = crate::arch::x86_64::smap::UserGuard::new();
+        core::ptr::read(b_addr as *const u64)
+    };
+    if surv != SENTINEL {
+        test_fail!(
+            "mremap_grow_neighbour",
+            "neighbour clobbered: B[0]={:#x} expected {:#x} (mremap grew into occupied page)",
+            surv, SENTINEL
+        );
+        return false;
+    }
+
+    // A must have relocated (its old slot collided with B), so the returned
+    // address must differ from a_addr.  Being permissive: accept either a
+    // relocation OR an in-place that did not touch B (sentinel already checked).
+    if (new_addr as u64) == a_addr {
+        test_fail!(
+            "mremap_grow_neighbour",
+            "mremap returned the old base {:#x} despite occupied neighbour — \
+             in-place grow must have failed and relocated",
+            a_addr
+        );
+        return false;
+    }
+
+    // Cleanup: free the relocated mapping and the original block.
+    let _ = crate::syscall::dispatch_linux_kernel(11, new_addr as u64, 0x2000, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux_kernel(11, a_addr, 0x3000, 0, 0, 0, 0);
+
+    test_pass!("mremap grow relocated A, neighbour B sentinel intact ✓");
     true
 }
 
