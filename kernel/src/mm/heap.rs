@@ -670,11 +670,85 @@ impl LinkedListAllocator {
     }
 }
 
+/// RAII bracket that clears IF for the duration of a heap critical section,
+/// restoring the caller's prior interrupt state on drop.
+///
+/// ## Why the heap lock must run with interrupts masked
+///
+/// The kernel heap is guarded by a single non-reentrant `spin::Mutex`
+/// (`LockedHeapAllocator.0`).  A plain `spin::Mutex` does **not** mask
+/// interrupts while held: the free-list walk in `alloc`/`dealloc` runs with
+/// `IF` left at whatever the caller had.  Almost every allocation happens in
+/// ordinary kernel code with interrupts enabled, so the LAPIC timer ISR can
+/// fire *while this core holds the heap lock*.
+///
+/// The timer ISR's periodic metrics dump
+/// (`crate::proc::proc_metrics::maybe_emit_periodic`) itself allocates
+/// (`Vec`/`String`/`format!`).  When the ISR lands on a core that is mid-walk
+/// inside the heap lock, the ISR re-enters `alloc`, takes the same
+/// `spin::Mutex`, and busy-spins forever waiting for a lock the *interrupted*
+/// frame on the very same core can never release — a re-entrant self-deadlock
+/// that strands the core in a non-preemptible Ring-0 spin (the timer ISR
+/// skips kernel-mode preemption), freezing the whole machine.
+///
+/// Masking interrupts for the (tiny, bounded) free-list critical section
+/// makes a heap allocation atomic with respect to ISRs on the local core, so
+/// no interrupt handler can ever observe the lock held and re-enter the
+/// allocator.  This mirrors the same discipline `_serial_print` already uses
+/// around the `SERIAL` mutex, and follows the standard "spinlock that may be
+/// taken from interrupt context must be IRQ-safe" rule (an irqsave spinlock).
+/// Cross-core safety is unchanged: the `spin::Mutex` still serialises CPUs;
+/// masking only prevents *same-core* ISR re-entry.
+struct HeapIrqGuard {
+    /// True if IF was set on entry and must be restored to set on drop.
+    reenable: bool,
+}
+
+impl HeapIrqGuard {
+    #[inline(always)]
+    fn new() -> Self {
+        // Read RFLAGS, then mask interrupts.  `pushfq` reflects IF before the
+        // following `cli`, so we capture the caller's true prior state even
+        // when nested inside another IRQ-masked region (then `reenable` is
+        // false and drop is a no-op — correct).
+        let rflags: u64;
+        unsafe {
+            core::arch::asm!(
+                "pushfq",
+                "pop {rflags}",
+                "cli",
+                rflags = out(reg) rflags,
+                options(nomem, preserves_flags),
+            );
+        }
+        HeapIrqGuard { reenable: rflags & (1 << 9) != 0 }
+    }
+}
+
+impl Drop for HeapIrqGuard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if self.reenable {
+            // SAFETY: restoring IF to exactly the value the caller had on
+            // entry.  If the caller already had interrupts masked we leave
+            // them masked.
+            unsafe {
+                core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+            }
+        }
+    }
+}
+
 /// Thread-safe wrapper around the heap allocator.
 struct LockedHeapAllocator(Mutex<LinkedListAllocator>);
 
 unsafe impl GlobalAlloc for LockedHeapAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // Mask interrupts across the lock-held critical section so the timer
+        // ISR (which itself allocates via the periodic metrics dump) cannot
+        // fire on this core while the heap lock is held and re-enter the
+        // allocator into a same-core spin deadlock.  See `HeapIrqGuard`.
+        let _irq = HeapIrqGuard::new();
         let ptr = self.0.lock().alloc(layout);
         if !ptr.is_null() {
             crate::perf::record_heap_alloc(layout.size());
@@ -684,6 +758,7 @@ unsafe impl GlobalAlloc for LockedHeapAllocator {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         crate::perf::record_heap_free(layout.size());
+        let _irq = HeapIrqGuard::new();
         self.0.lock().dealloc(ptr, layout)
     }
 }

@@ -4576,6 +4576,56 @@ def cmd_regs(args):
     _out({"ok": True, "regs": regs})
 
 
+def cmd_dual_regs(args):
+    """Enumerate every QEMU vCPU thread, read RIP/CS/RSP/RBP for each, and
+    symbolize the kernel-space RIP.
+
+    Purpose: SMP spin-lock deadlock autopsy.  When the whole machine freezes
+    on a held-across-dispatch spin::Mutex, one core strands the lock while the
+    other busy-spins in a non-preemptible Ring-0 loop.  This command names the
+    RIP each vCPU is parked at so the busy-spinner core (the one looping in a
+    lock-acquire path) and the holder core can be identified in one shot.
+
+    Output per-cpu: thread id, RIP (hex), symbolized RIP, CS (ring via low 2
+    bits), RSP, RBP.  No guest mutation — pure read via the GDB stub.
+    """
+    sess = _load_session(args.sid)
+    port = _get_gdb_port(sess)
+
+    gdb = GdbClient("127.0.0.1", port)
+    if not gdb.connect():
+        _err(f"Cannot connect to GDB stub on port {port} (tried {port}..{port+4})")
+    cpus = []
+    try:
+        tids = gdb.list_threads()
+        if not tids:
+            tids = [1]  # single-vCPU stub that doesn't advertise threads
+        for tid in tids:
+            gdb.select_thread(tid)
+            regs = gdb.read_regs()
+            rip = int(regs.get("rip", "0x0"), 16)
+            cs = int(regs.get("cs", "0x0"), 16)
+            sym = _autopsy_resolve_kernel_rip(rip)
+            cpus.append({
+                "tid":  tid,
+                "rip":  hex(rip),
+                "sym":  sym,
+                "cs":   hex(cs),
+                "ring": cs & 0x3,
+                "rsp":  regs.get("rsp"),
+                "rbp":  regs.get("rbp"),
+                "rax":  regs.get("rax"),
+                "rdi":  regs.get("rdi"),
+                "rsi":  regs.get("rsi"),
+            })
+    except Exception as e:
+        _err(f"GDB dual-regs error: {e}")
+    finally:
+        gdb.close()
+
+    _out({"ok": True, "n_cpus": len(cpus), "cpus": cpus})
+
+
 def cmd_mem(args):
     """Read memory via GDB 'm addr,len' packet; cap at 4096 bytes."""
     sess = _load_session(args.sid)
@@ -10514,6 +10564,12 @@ def main():
     p_regs = sub.add_parser("regs", help="[Tier2] Read x86_64 registers via GDB stub")
     p_regs.add_argument("sid")
 
+    # dual-regs — read RIP/CS/RSP for EVERY vCPU + symbolize (SMP deadlock autopsy)
+    p_dual_regs = sub.add_parser(
+        "dual-regs",
+        help="[Tier2] Read RIP/CS/RSP/RBP for every vCPU and symbolize the kernel RIP")
+    p_dual_regs.add_argument("sid")
+
     # mem
     p_mem = sub.add_parser("mem", help="[Tier2] Read guest memory via GDB stub")
     p_mem.add_argument("sid")
@@ -11282,6 +11338,7 @@ def main():
         "snap-gate": cmd_snap_gate,
         # Tier 2
         "regs":   cmd_regs,
+        "dual-regs": cmd_dual_regs,
         "mem":    cmd_mem,
         "sym":    cmd_sym,
         "bp":     cmd_bp,
