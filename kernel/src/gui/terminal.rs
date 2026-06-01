@@ -897,23 +897,21 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         // Reports/ creation and the subsequent fatal-on-error writes that
         // bubble up through CrashReporter::SetupExtraData().
         "MOZ_CRASHREPORTER_DISABLE=1",
-        // Force single-process (no content-child) mode so the headless
-        // --screenshot path uses the in-process paint branch of
-        // CrossProcessPaint::Start.  When e10s is disabled,
-        // WindowGlobalParent::IsInProcess() returns true and
-        // drawSnapshot() records the page directly in the parent process
-        // without spawning a content child, without AF_UNIX SCM_RIGHTS
-        // fd-passing, and without memfd/shm round-trips — dropping the
-        // entire content-process cluster off the critical path.
-        //
-        // MOZ_DISABLE_NONLOCAL_CONNECTIONS=1 (set above) satisfies the
-        // AreNonLocalConnectionsDisabled() gate in MOZILLA_OFFICIAL
-        // release builds, after which MOZ_FORCE_DISABLE_E10S=1 is
-        // honoured.
-        //
-        // See: https://wiki.mozilla.org/Electrolysis
-        //      https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html
-        "MOZ_FORCE_DISABLE_E10S=1",
+        // NB: we intentionally do NOT force-disable e10s here.  The headless
+        // --screenshot path creates its capture <browser> with an explicit
+        // remote="true", and per the Firefox process model an explicit
+        // remoteness is authoritative — the global e10s-disable flag only
+        // changes the DEFAULT and cannot override it.  Forcing e10s off
+        // therefore leaves the screenshot actor cross-process while other
+        // routing treats it as in-process, so the GetDimensions JSWindowActor
+        // sendQuery is never dispatched over the content channel and the
+        // capture never completes (observed: zero AF_UNIX IPDL traffic on the
+        // content sockets across a multi-billion-syscall run).  Running the
+        // normal multi-process path — as an unmodified upstream Firefox does —
+        // keeps routing consistent: the query is sent over the content
+        // channel, the content actor renders the fragment, and its reply
+        // drives drawSnapshot to the PNG.
+        // See: https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html
         // Skip GPU/glxtest process — software rendering only.
         "MOZ_GFX_TESTING_NO_CHILD_PROCESS=1",
         "MOZ_X11_EGL=0",
