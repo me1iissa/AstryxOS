@@ -5,9 +5,21 @@ edition.workspace = true
 
 [features]
 default = []
-test-mode = []
+# `heap-canary` — fence every live kernel-heap allocation with front/rear
+# magic red-zone words (validated on free) so an out-of-bounds write that
+# clobbers free-list metadata is caught at free-time, naming the victim
+# block, instead of surfacing later as a silent free-list-walk freeze.  The
+# always-on free-list pointer validation (alignment/range/bounded walk) needs
+# no feature; this gates only the per-allocation canaries (a few words of
+# overhead per allocation).  Pulled in by `test-mode` and `firefox-test` so
+# both the kernel test suite and the Firefox debug path get the protection by
+# default.  Public refs: Rust `core::alloc::{GlobalAlloc, Layout}`; the
+# generic allocator red-zone / guard-byte technique; System V AMD64 ABI §3.1.2
+# (natural alignment of fundamental types).
+heap-canary = []
+test-mode = ["heap-canary"]
 gui-test = []
-firefox-test = []
+firefox-test = ["heap-canary"]
 # X11 "hello world" pivot — launches Alpine's xeyes binary (~28 KB musl PIE,
 # linked against libX11/libXt/libXmu/libxcb) as the test workload instead of
 # Firefox.  Shares the in-kernel Xastryx server (kernel/src/x11/) with
