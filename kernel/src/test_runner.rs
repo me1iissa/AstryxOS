@@ -187,6 +187,16 @@ pub fn run() -> ! {
         }
     }
 
+    // ── Test 0-heap: Heap free-list validation + canaries — healthy churn ─
+    // Runs FIRST (before any test that could itself perturb the heap) so it
+    // is a clean no-false-positive assertion for the hardened allocator: the
+    // always-on free-list pointer validation plus, under the `heap-canary`
+    // feature (enabled by `test-mode`), the per-allocation red-zone canaries.
+    // A correct allocator completes heavy alloc/free churn WITHOUT tripping
+    // any `[HEAP CORRUPT]` panic; reaching the end is the assertion.
+    total += 1;
+    if test_heap_corruption_detection_healthy() { passed += 1; }
+
     // ── Test 0a: pipe wake hook (Stream A) ───────────────────────────────
     // Run before any network/disk tests so a regression here surfaces
     // immediately rather than after the long pre-amble.
@@ -23653,6 +23663,76 @@ fn test_heap_guard_pte() -> bool {
         below_va, above_va,
         heap_va, heap_va + HEAP_SIZE as u64);
     test_pass!("Heap guard pages — PTE present-bit verification");
+    true
+}
+
+/// Test 105b: heap free-list validation + per-allocation canaries do not
+/// false-positive on a healthy heap under a heavy alloc/free workload.
+///
+/// The hardened allocator validates every free-list `next` pointer
+/// (alignment / heap-range / bounded walk) on every traversal and — under the
+/// `heap-canary` feature (enabled by `test-mode`) — fences each allocation
+/// with front/rear magic red-zone words checked on free.  A correct workload
+/// must therefore run to completion WITHOUT tripping any `[HEAP CORRUPT]`
+/// panic.  This exercises the split, full-block, and coalesce paths plus a
+/// spread of sizes and alignments; reaching the end is the assertion.
+fn test_heap_corruption_detection_healthy() -> bool {
+    use alloc::alloc::{alloc as raw_alloc, dealloc as raw_dealloc};
+    use core::alloc::Layout;
+
+    test_header!("Heap free-list validation + canaries — healthy-churn (no false positive)");
+
+    // 1. Vec/Box churn across the split + coalesce paths.
+    let mut vecs: Vec<Vec<u8>> = Vec::new();
+    for i in 0..64usize {
+        let mut v: Vec<u8> = Vec::with_capacity((i * 37) % 4096 + 1);
+        // Touch every byte so an off-by-one rear overrun (if any) would be
+        // exercised — a correct allocator leaves the rear canary intact.
+        for j in 0..v.capacity() {
+            v.push((j as u8) ^ 0x5a);
+        }
+        vecs.push(v);
+    }
+    // Drop in interleaved order to drive coalescing of non-adjacent frees.
+    let mut idx = 0usize;
+    while !vecs.is_empty() {
+        idx = (idx + 7) % vecs.len();
+        let _ = vecs.swap_remove(idx);
+        if vecs.is_empty() { break; }
+    }
+    test_println!("  64-vector interleaved alloc/free churn: OK (no [HEAP CORRUPT])");
+
+    // 2. Raw GlobalAlloc round-trips across a spread of sizes and alignments
+    //    so the front canary (header-adjacent) and rear canary are both
+    //    written and validated for over-aligned requests.
+    let sizes = [1usize, 7, 15, 16, 17, 64, 100, 4096, 9001];
+    let aligns = [1usize, 8, 16, 64];
+    let mut roundtrips = 0usize;
+    for &sz in sizes.iter() {
+        for &al in aligns.iter() {
+            let layout = match Layout::from_size_align(sz, al) {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            // SAFETY: matching alloc/dealloc with the identical layout; the
+            // pointer is never read as anything but raw bytes we wrote.
+            unsafe {
+                let p = raw_alloc(layout);
+                if p.is_null() {
+                    test_fail!("heap_corrupt_detect", "alloc returned null for {:?}", layout);
+                    return false;
+                }
+                // Write the full user region; the rear canary lives just past
+                // it and must survive an exact-size write.
+                core::ptr::write_bytes(p, 0xa5, sz);
+                raw_dealloc(p, layout);
+            }
+            roundtrips += 1;
+        }
+    }
+    test_println!("  {} raw alloc/dealloc round-trips (sizes×aligns): OK", roundtrips);
+
+    test_pass!("Heap free-list validation + canaries — healthy-churn (no false positive)");
     true
 }
 

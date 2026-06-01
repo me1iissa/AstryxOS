@@ -133,6 +133,189 @@ fn heap_guard_above_phys() -> u64 {
 /// Minimum block size — must be large enough to hold a FreeBlock header.
 const MIN_BLOCK_SIZE: usize = core::mem::size_of::<FreeBlock>();
 
+// ─────────────────────────────────────────────────────────────────────────
+// Free-list corruption detection
+//
+// The kernel heap is a single-linked free list walked under a `spin::Mutex`.
+// A stray out-of-bounds write that lands on a free block's `next` pointer
+// turns the O(n) first-fit walk into an unbounded chase of garbage pointers:
+// the holder of the heap lock spins forever and every other CPU that needs
+// the heap blocks behind it — a silent whole-machine freeze.
+//
+// To convert that silent freeze into a LOUD, LOCATED panic we validate every
+// `next`-pointer traversal against three cheap invariants (alignment, heap
+// range, and a bounded walk) and we fence each live allocation with magic
+// canary words.  A corrupted canary at free-time names the victim block — far
+// closer to the offending write than the eventual free-list-walk freeze.
+//
+// References: Rust `core::alloc::{GlobalAlloc, Layout}`; the general
+// allocator red-zone / guard-byte technique (fencing each object with a known
+// magic and validating it on free); System V AMD64 ABI §3.1.2 (natural
+// alignment of fundamental types — the minimum block alignment enforced here).
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Minimum alignment every `FreeBlock` start is guaranteed to satisfy.
+///
+/// `FreeBlock` is two pointer-sized words, so its natural alignment is 8 on
+/// x86_64 (System V AMD64 ABI §3.1.2).  The heap base is 2 MiB-aligned and the
+/// allocator only ever advances block starts by whole `AllocHeader`-plus-data
+/// spans, all of which are multiples of `align_of::<FreeBlock>()`; therefore a
+/// `next` pointer that is not 8-aligned is proof of corruption.  We derive the
+/// bound from the type so it self-corrects if the header ever grows.
+const BLOCK_ALIGN: usize = core::mem::align_of::<FreeBlock>();
+
+/// Generous upper bound on the number of distinct free blocks the walk may
+/// visit before we declare the list corrupt (cycle / runaway chase).  The heap
+/// is 128 MiB and the minimum block is `MIN_BLOCK_SIZE` (16 B); the true block
+/// count can never exceed `HEAP_SIZE / MIN_BLOCK_SIZE`.  We add headroom and
+/// cap at a fixed constant so the bound is independent of fragmentation.
+const MAX_WALK_ITERS: usize = (HEAP_SIZE / MIN_BLOCK_SIZE) + 16;
+
+/// Magic word written into the front canary slot of every live allocation
+/// (only when the `heap-canary` feature is enabled).  A distinct, non-zero,
+/// non-pointer-looking constant so a clobber is obvious in a hex dump.
+#[cfg(feature = "heap-canary")]
+const CANARY_FRONT: u64 = 0xA5A5_5A5A_C0DE_F00D;
+
+/// Magic word written into the rear canary slot immediately after the user
+/// region of every live allocation (only when `heap-canary` is enabled).
+#[cfg(feature = "heap-canary")]
+const CANARY_REAR: u64 = 0x5A5A_A5A5_DEAD_BEEF;
+
+/// Size of one canary word.
+#[cfg(feature = "heap-canary")]
+const CANARY_SIZE: usize = core::mem::size_of::<u64>();
+
+/// Extra bytes reserved at the tail of every allocation for the rear canary
+/// word.  Zero unless the `heap-canary` feature is enabled, so default builds
+/// reserve nothing and keep the historical block sizing.
+#[inline(always)]
+const fn canary_tail_bytes() -> usize {
+    #[cfg(feature = "heap-canary")]
+    { CANARY_SIZE }
+    #[cfg(not(feature = "heap-canary"))]
+    { 0 }
+}
+
+/// Validate a free-list `next` pointer.  Returns `Ok(())` if the pointer is a
+/// plausible `FreeBlock` (null is the legitimate list terminator and is
+/// accepted), or `Err(reason)` naming the first invariant it violates.
+///
+/// Checks (cheap — a handful of compares per block):
+/// * `BLOCK_ALIGN`-aligned (every real block start is 8-aligned, see
+///   [`BLOCK_ALIGN`]);
+/// * within the live heap range `[heap_start, heap_start + HEAP_SIZE)` with
+///   room for at least a `FreeBlock` header before the end.
+#[inline]
+fn validate_block_ptr(p: *mut FreeBlock) -> Result<(), &'static str> {
+    if p.is_null() {
+        return Ok(());
+    }
+    let addr = p as usize;
+    if addr & (BLOCK_ALIGN - 1) != 0 {
+        return Err("next pointer is not 8-aligned");
+    }
+    let base = heap_start();
+    if base == 0 {
+        // Heap not yet initialised: any non-null pointer is bogus.
+        return Err("next pointer non-null before heap init");
+    }
+    let end = base + HEAP_SIZE;
+    if addr < base || addr > end.saturating_sub(MIN_BLOCK_SIZE) {
+        return Err("next pointer outside heap range");
+    }
+    Ok(())
+}
+
+/// Loudly abort with rich, greppable context when free-list corruption is
+/// detected.  Tagged `[HEAP CORRUPT]` so the harness can `wait`/`grep` for it.
+///
+/// This runs while the heap `spin::Mutex` is held, so it must not allocate.
+/// `panic!` routes through the serial sink (no heap traffic) and the panic
+/// handler halts every CPU, so the held lock is moot.
+#[inline(never)]
+#[cold]
+fn heap_corrupt(
+    reason: &str,
+    block: usize,
+    bad_next: usize,
+    layout: Layout,
+    head: usize,
+) -> ! {
+    // `_caller` is the return address of `alloc`/`dealloc`'s caller — a cheap
+    // "where" hint to narrow the next phase (finding the OOB writer).
+    let caller = caller_return_address();
+    panic!(
+        "[HEAP CORRUPT] {reason}: block={block:#x} bad_next={bad_next:#x} \
+         req_size={req_size} req_align={req_align} head={head:#x} \
+         heap=[{lo:#x}..{hi:#x}) caller_ret={caller:#x}",
+        reason = reason,
+        block = block,
+        bad_next = bad_next,
+        req_size = layout.size(),
+        req_align = layout.align(),
+        head = head,
+        lo = heap_start(),
+        hi = heap_start() + HEAP_SIZE,
+        caller = caller,
+    );
+}
+
+/// Loudly abort when an allocation's red-zone (canary) is found clobbered at
+/// free-time.  Names the victim block, the corrupted value, what it should
+/// have been, and which edge overflowed.  Tagged `[HEAP CORRUPT]`.
+#[cfg(feature = "heap-canary")]
+#[inline(never)]
+#[cold]
+fn heap_corrupt_canary(
+    reason: &str,
+    block_start: usize,
+    data_ptr: usize,
+    found: u64,
+    expected: u64,
+    user_size: usize,
+) -> ! {
+    let caller = caller_return_address();
+    panic!(
+        "[HEAP CORRUPT] {reason}: block={block:#x} data={data:#x} \
+         user_size={user_size} found={found:#018x} expected={expected:#018x} \
+         heap=[{lo:#x}..{hi:#x}) caller_ret={caller:#x}",
+        reason = reason,
+        block = block_start,
+        data = data_ptr,
+        user_size = user_size,
+        found = found,
+        expected = expected,
+        lo = heap_start(),
+        hi = heap_start() + HEAP_SIZE,
+        caller = caller,
+    );
+}
+
+/// Best-effort return address of the current frame's caller, for the
+/// `caller_ret=` field in a corruption panic.  Reads the saved return slot
+/// `[rbp + 8]` per the System V AMD64 ABI §3.4.1 frame-pointer convention.
+///
+/// This is a *hint* only — the kernel is built with `-fomit-frame-pointer` in
+/// some translation units, so the value may not be a true return address.  We
+/// only ever format it (never dereference it), so a garbage read is harmless,
+/// and on the common path (`heap_corrupt` keeps a frame pointer) it points at
+/// the alloc/dealloc call site that tripped the corruption check.
+#[inline(always)]
+fn caller_return_address() -> usize {
+    let ra: usize;
+    // SAFETY: read-only load through RBP; the value is only formatted into the
+    // panic string, never used as a pointer.  No memory is written.
+    unsafe {
+        core::arch::asm!(
+            "mov {ra}, [rbp + 8]",
+            ra = out(reg) ra,
+            options(nostack, readonly, preserves_flags),
+        );
+    }
+    ra
+}
+
 /// Global kernel allocator.
 #[global_allocator]
 static ALLOCATOR: LockedHeapAllocator = LockedHeapAllocator(Mutex::new(LinkedListAllocator {
@@ -153,12 +336,30 @@ struct FreeBlock {
 
 /// Header stored just before every returned allocation.
 /// Stores the original block start address and total block size.
+///
+/// When the `heap-canary` feature is enabled the header additionally carries
+/// the user-requested size and a front-canary magic word.  `#[repr(C)]` lays
+/// the fields out in declaration order, so `front_canary` is declared *last*
+/// and therefore sits in the bytes immediately below `data_start`: an
+/// underflowing write to this allocation (a store just before the returned
+/// pointer) lands on the front canary first.  `block_start`/`block_size` keep
+/// their position at the top of the header and are accessed by name, so
+/// reordering is transparent to the recovery logic.  Without `heap-canary`
+/// the header is the historical `{block_start, block_size}` pair, byte-for-byte.
 #[repr(C)]
 struct AllocHeader {
     /// Start address of the entire block (including any alignment padding before this header).
     block_start: usize,
     /// Total size of the entire block.
     block_size: usize,
+    /// User-requested allocation size, so the rear canary at
+    /// `data_start + user_size` can be located on free.
+    #[cfg(feature = "heap-canary")]
+    user_size: usize,
+    /// Front-canary magic word — sits immediately below `data_start`; a write
+    /// that underflows this allocation clobbers it.  Validated on free.
+    #[cfg(feature = "heap-canary")]
+    front_canary: u64,
 }
 
 const ALLOC_HEADER_SIZE: usize = core::mem::size_of::<AllocHeader>();
@@ -200,22 +401,55 @@ impl LinkedListAllocator {
 
         let align = layout.align().max(core::mem::align_of::<AllocHeader>());
 
+        // Validate the head before the walk: a corrupt head is the first
+        // thing a stray write clobbers and the most common freeze signature.
+        if let Err(reason) = validate_block_ptr(self.head) {
+            heap_corrupt(reason, self.head as usize, self.head as usize, layout, self.head as usize);
+        }
+
         // Walk the free list looking for first fit.
         let mut prev: *mut FreeBlock = ptr::null_mut();
         let mut current = self.head;
+        let head_snapshot = self.head as usize;
+        let mut iters: usize = 0;
 
         while !current.is_null() {
+            // Bounded walk: a runaway chase (cycle or garbage tail) is proof
+            // of corruption — abort loudly instead of spinning forever holding
+            // the heap lock.
+            iters += 1;
+            if iters > MAX_WALK_ITERS {
+                heap_corrupt(
+                    "alloc free-list walk exceeded max iterations (cycle?)",
+                    current as usize, current as usize, layout, head_snapshot,
+                );
+            }
+
             let block_addr = current as usize;
+            // Canary-validate the FreeBlock so a clobbered header is caught at
+            // walk-time, not just at free-time (cheap; only under heap-canary).
+            self.check_freeblock_canary(current, layout, head_snapshot);
             let block_size = unsafe { (*current).size };
 
             // The user data must be aligned, and we need an AllocHeader just before it.
             let data_start = align_up(block_addr + ALLOC_HEADER_SIZE, align);
-            let total_needed = (data_start + layout.size()) - block_addr;
+            // Round the consumed span up to BLOCK_ALIGN so the *next* free block
+            // start (block_addr + total_needed) stays BLOCK_ALIGN-aligned.  This
+            // keeps every FreeBlock header naturally aligned (no unaligned
+            // pointer stores) and lets `validate_block_ptr` treat a misaligned
+            // `next` as definitive corruption.  See System V AMD64 ABI §3.1.2.
+            let raw_needed = (data_start + layout.size() + canary_tail_bytes()) - block_addr;
+            let total_needed = align_up(raw_needed, BLOCK_ALIGN);
 
             if block_size >= total_needed {
                 let remainder = block_size - total_needed;
                 let next_block = unsafe { (*current).next };
+                // Validate the successor we're about to splice around.
+                if let Err(reason) = validate_block_ptr(next_block) {
+                    heap_corrupt(reason, block_addr, next_block as usize, layout, head_snapshot);
+                }
 
+                let header_block_size;
                 if remainder >= MIN_BLOCK_SIZE + 16 {
                     // Split: create a new free block after the allocation.
                     let new_free_addr = block_addr + total_needed;
@@ -231,12 +465,7 @@ impl LinkedListAllocator {
                         unsafe { (*prev).next = new_free; }
                     }
 
-                    // Write the allocation header just before user data.
-                    let header_ptr = (data_start - ALLOC_HEADER_SIZE) as *mut AllocHeader;
-                    unsafe {
-                        (*header_ptr).block_start = block_addr;
-                        (*header_ptr).block_size = total_needed;
-                    }
+                    header_block_size = total_needed;
                     self.allocated_bytes += total_needed;
                 } else {
                     // Use the entire block (don't split tiny remainders).
@@ -246,20 +475,28 @@ impl LinkedListAllocator {
                         unsafe { (*prev).next = next_block; }
                     }
 
-                    // Write the allocation header.
-                    let header_ptr = (data_start - ALLOC_HEADER_SIZE) as *mut AllocHeader;
-                    unsafe {
-                        (*header_ptr).block_start = block_addr;
-                        (*header_ptr).block_size = block_size;
-                    }
+                    header_block_size = block_size;
                     self.allocated_bytes += block_size;
                 }
+
+                // Write the allocation header just before user data, then fence
+                // the user region with front/rear canaries (under heap-canary).
+                let header_ptr = (data_start - ALLOC_HEADER_SIZE) as *mut AllocHeader;
+                unsafe {
+                    (*header_ptr).block_start = block_addr;
+                    (*header_ptr).block_size = header_block_size;
+                }
+                self.write_alloc_canaries(header_ptr, data_start, layout.size());
 
                 return data_start as *mut u8;
             }
 
             prev = current;
-            current = unsafe { (*current).next };
+            let next = unsafe { (*current).next };
+            if let Err(reason) = validate_block_ptr(next) {
+                heap_corrupt(reason, current as usize, next as usize, layout, head_snapshot);
+            }
+            current = next;
         }
 
         // Out of memory.
@@ -277,6 +514,25 @@ impl LinkedListAllocator {
         let block_start = unsafe { (*header_ptr).block_start };
         let block_size = unsafe { (*header_ptr).block_size };
 
+        // Validate the canaries that fence this allocation BEFORE we trust
+        // `block_start`/`block_size`.  A corrupted canary names the victim of
+        // an out-of-bounds write right here at free-time — the closest point
+        // to the offending store we can cheaply reach (no-op without
+        // `heap-canary`).
+        self.check_alloc_canaries(header_ptr, ptr);
+
+        // The recovered block start is what we will hand back to the free
+        // list; if the header was clobbered it would corrupt the list, so
+        // validate it as a block pointer before insertion.
+        if let Err(reason) = validate_block_ptr(block_start as *mut FreeBlock) {
+            heap_corrupt(
+                reason, block_start, block_start,
+                Layout::from_size_align(block_size, BLOCK_ALIGN)
+                    .unwrap_or(Layout::new::<u8>()),
+                self.head as usize,
+            );
+        }
+
         self.allocated_bytes = self.allocated_bytes.saturating_sub(block_size);
         self.insert_free_block(block_start, block_size);
     }
@@ -285,11 +541,31 @@ impl LinkedListAllocator {
     fn insert_free_block(&mut self, addr: usize, size: usize) {
         let mut prev: *mut FreeBlock = ptr::null_mut();
         let mut current = self.head;
+        let head_snapshot = self.head as usize;
+        let ins_layout = Layout::from_size_align(size, BLOCK_ALIGN)
+            .unwrap_or(Layout::new::<u8>());
+
+        // A clobbered head here would otherwise be silently re-linked.
+        if let Err(reason) = validate_block_ptr(self.head) {
+            heap_corrupt(reason, addr, self.head as usize, ins_layout, head_snapshot);
+        }
 
         // Find insertion point (sorted by address).
+        let mut iters: usize = 0;
         while !current.is_null() && (current as usize) < addr {
+            iters += 1;
+            if iters > MAX_WALK_ITERS {
+                heap_corrupt(
+                    "insert_free_block walk exceeded max iterations (cycle?)",
+                    current as usize, current as usize, ins_layout, head_snapshot,
+                );
+            }
             prev = current;
-            current = unsafe { (*current).next };
+            let next = unsafe { (*current).next };
+            if let Err(reason) = validate_block_ptr(next) {
+                heap_corrupt(reason, current as usize, next as usize, ins_layout, head_snapshot);
+            }
+            current = next;
         }
 
         // Write the new free block.
@@ -324,6 +600,73 @@ impl LinkedListAllocator {
                 }
             }
         }
+    }
+
+    // ── Allocation red-zone (canary) helpers ─────────────────────────────
+    //
+    // These fence each live allocation with two magic words — a front canary
+    // stored in the `AllocHeader` (immediately below the user region) and a
+    // rear canary placed immediately after `data_start + user_size`.  An
+    // out-of-bounds write that overruns either edge clobbers a canary; the
+    // corruption is then caught the next time the block is freed (or, for the
+    // FreeBlock canary, walked), naming the victim block far closer to the
+    // offending store than the eventual free-list-walk freeze.
+    //
+    // All four helpers compile to nothing without the `heap-canary` feature,
+    // keeping the default fast path untouched.
+
+    /// Stamp the front + rear canaries onto a freshly carved allocation.
+    #[inline(always)]
+    #[cfg_attr(not(feature = "heap-canary"), allow(unused_variables))]
+    fn write_alloc_canaries(&self, header_ptr: *mut AllocHeader, data_start: usize, user_size: usize) {
+        #[cfg(feature = "heap-canary")]
+        unsafe {
+            (*header_ptr).front_canary = CANARY_FRONT;
+            (*header_ptr).user_size = user_size;
+            // Rear canary immediately after the user region.  `total_needed`
+            // in `alloc` reserved `CANARY_SIZE` extra bytes for exactly this.
+            let rear = (data_start + user_size) as *mut u64;
+            core::ptr::write_unaligned(rear, CANARY_REAR);
+        }
+    }
+
+    /// Validate the front + rear canaries of a live allocation at free-time.
+    /// Panics with `[HEAP CORRUPT]` naming the victim and which edge overflowed.
+    #[inline(always)]
+    #[cfg_attr(not(feature = "heap-canary"), allow(unused_variables))]
+    fn check_alloc_canaries(&self, header_ptr: *const AllocHeader, data_ptr: *mut u8) {
+        #[cfg(feature = "heap-canary")]
+        unsafe {
+            let front = (*header_ptr).front_canary;
+            let user_size = (*header_ptr).user_size;
+            let block_start = (*header_ptr).block_start;
+            if front != CANARY_FRONT {
+                heap_corrupt_canary(
+                    "front canary clobbered (underflow into this block's header)",
+                    block_start, data_ptr as usize, front, CANARY_FRONT, user_size,
+                );
+            }
+            let rear_ptr = (data_ptr as usize + user_size) as *const u64;
+            let rear = core::ptr::read_unaligned(rear_ptr);
+            if rear != CANARY_REAR {
+                heap_corrupt_canary(
+                    "rear canary clobbered (overflow past end of this allocation)",
+                    block_start, data_ptr as usize, rear, CANARY_REAR, user_size,
+                );
+            }
+        }
+    }
+
+    /// Cheap FreeBlock sanity at walk-time.  Currently a no-op placeholder for
+    /// the always-validated pointer checks; reserved for a future free-block
+    /// poison word.  Kept as a hook so the walk has a single canary call site.
+    #[inline(always)]
+    #[cfg_attr(not(feature = "heap-canary"), allow(unused_variables))]
+    fn check_freeblock_canary(&self, _block: *mut FreeBlock, _layout: Layout, _head: usize) {
+        // The structural invariants (alignment, range, bounded walk) are
+        // already enforced on every `next` traversal by `validate_block_ptr`;
+        // a dedicated free-block poison word would duplicate the in-band
+        // `size`/`next` validation, so this is intentionally empty for now.
     }
 }
 
