@@ -708,6 +708,216 @@ def run_allowlist_check():
     print()
 
 
+def run_read_ff_png_check():
+    """
+    Tier 1.5 host-only check: round-trip the read-ff-png decoder.
+
+    Synthesizes a minimal valid PNG, emits it in the exact [FF-OUT-PNG-B64:N/M]
+    serial wire format the firefox-test boot produces (kernel/src/ff_out_png.rs:
+    57 input bytes -> 76 base64 chars per line, standard alphabet, '=' padding),
+    writes a fake session + serial log, runs `read-ff-png`, and asserts the
+    decoded bytes are byte-identical to the source.
+
+    No QEMU launched.  This protects the two-sided contract — the kernel marker
+    format and the host decoder — against silent drift in either direction
+    (the marker stream is the only path that carries Firefox's rendered output
+    off the guest; a broken decode would silently strip the demo screenshot).
+    """
+    print("=== Tier 1.5: read-ff-png decoder round-trip (host-only) ===")
+    print()
+    import base64
+    import os
+    import struct
+    import tempfile
+    import zlib
+
+    # Build a tiny but real PNG: 2x2 RGBA, deterministic non-uniform pixels so
+    # the signature + IHDR are valid (W3C PNG §5.2/§11.2.2; ISO 15948).
+    def _png_2x2_rgba() -> bytes:
+        sig = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+
+        def _chunk(typ: bytes, data: bytes) -> bytes:
+            return (struct.pack(">I", len(data)) + typ + data +
+                    struct.pack(">I", zlib.crc32(typ + data) & 0xffffffff))
+
+        ihdr = struct.pack(">IIBBBBB", 2, 2, 8, 6, 0, 0, 0)  # 2x2, 8-bit, RGBA
+        # 2 rows, each: filter byte 0 + 2 px * 4 bytes
+        raw = (b"\x00" + bytes([255, 0, 0, 255, 0, 255, 0, 255]) +
+               b"\x00" + bytes([0, 0, 255, 255, 255, 255, 255, 255]))
+        idat = zlib.compress(raw, 9)
+        return sig + _chunk(b"IHDR", ihdr) + _chunk(b"IDAT", idat) + _chunk(b"IEND", b"")
+
+    png = _png_2x2_rgba()
+
+    # Emit in the firefox-test wire format: 57 input bytes per [FF-OUT-PNG-B64]
+    # line, standard base64 with '=' padding (RFC 4648 §4 / RFC 2045 §6.8).
+    CHUNK = 57
+    total = (len(png) + CHUNK - 1) // CHUNK
+    lines = [f"[FF-OUT-PNG:path=/tmp/out.png size={len(png)} sig_ok=true]"]
+    for i in range(total):
+        seg = png[i * CHUNK:(i + 1) * CHUNK]
+        b64 = base64.b64encode(seg).decode("ascii")
+        lines.append(f"[FF-OUT-PNG-B64:{i}/{total}] {b64}")
+    lines.append("[FF-OUT-PNG-END]")
+    serial_body = "\n".join(lines) + "\n"
+
+    harness_dir = Path.home() / ".astryx-harness"
+    harness_dir.mkdir(parents=True, exist_ok=True)
+    sid = "smoke-ffpng"
+    sess_path = harness_dir / f"{sid}.json"
+    serial_path = harness_dir / f"{sid}.serial.log"
+    out_path = None
+    try:
+        serial_path.write_text(serial_body)
+        # pid=0 → the decoder's `if pid and not _pid_alive(pid)` liveness guard
+        # is skipped, so it reads the static log without waiting for QEMU.
+        sess_path.write_text(json.dumps({
+            "sid": sid, "pid": 0, "serial_log": str(serial_path),
+        }))
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as fh:
+            out_path = fh.name
+
+        obj, raw, rc = _h("read-ff-png", sid, out_path, "--timeout-ms", "3000")
+        check("read-ff-png returns JSON",   obj is not None,                raw[:160])
+        check("read-ff-png ok=true",        bool(obj and obj.get("ok")),    str(obj))
+        check("read-ff-png rc=0",           rc == 0,                        f"rc={rc}")
+        check("read-ff-png size_match",     bool(obj and obj.get("size_match")), str(obj))
+        check("read-ff-png guest_sig_ok",   bool(obj and obj.get("guest_sig_ok")), str(obj))
+        check("read-ff-png chunk count",    bool(obj and obj.get("chunks") == total), str(obj))
+
+        if obj and obj.get("ok"):
+            decoded = Path(out_path).read_bytes()
+            check("read-ff-png byte-exact round-trip", decoded == png,
+                  f"len(decoded)={len(decoded)} len(png)={len(png)}")
+            check("read-ff-png valid PNG signature",
+                  decoded[:8] == png[:8], decoded[:8].hex())
+    finally:
+        sess_path.unlink(missing_ok=True)
+        serial_path.unlink(missing_ok=True)
+        if out_path:
+            Path(out_path).unlink(missing_ok=True)
+    print()
+
+
+def run_kdb_read_png_check():
+    """
+    Tier 1.5 host-only check: kdb-read-png chunked-assembly round-trip.
+
+    Loads cmd_kdb_read_png from the harness, monkeypatches _kdb_recv to serve a
+    synthetic PNG in 16 KiB chunks (mirroring the kernel read-file op's wire
+    contract: {file_size, offset, n, eof, sig_png, b64}), runs the command, and
+    asserts the reassembled file is byte-identical.  No QEMU / socket — protects
+    the offset-loop + base64 reassembly against drift in either the op contract
+    or the host wrapper.
+    """
+    print("=== Tier 1.5: kdb-read-png chunked assembly (host-only) ===")
+    print()
+    import base64
+    import importlib.util
+    import json as _json
+    import struct
+    import tempfile
+    import types
+    import zlib
+
+    spec = importlib.util.spec_from_file_location("qh_kdbpng_load", str(HARNESS))
+    mod = importlib.util.module_from_spec(spec)
+    _orig_argv = sys.argv
+    sys.argv = ["qemu-harness.py", "list"]
+    try:
+        spec.loader.exec_module(mod)
+    except SystemExit:
+        pass
+    finally:
+        sys.argv = _orig_argv
+
+    fn = getattr(mod, "cmd_kdb_read_png", None)
+    check("cmd_kdb_read_png importable", fn is not None)
+    if fn is None:
+        print()
+        return
+
+    # Synthetic PNG large enough to span >1 chunk (16384 raw/chunk).
+    def _png_blob(npix_rows: int) -> bytes:
+        sig = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+
+        def _chunk(typ, data):
+            return (struct.pack(">I", len(data)) + typ + data +
+                    struct.pack(">I", zlib.crc32(typ + data) & 0xffffffff))
+        w = 64
+        ihdr = struct.pack(">IIBBBBB", w, npix_rows, 8, 6, 0, 0, 0)
+        raw = bytearray()
+        for r in range(npix_rows):
+            raw.append(0)
+            for c in range(w):
+                raw += bytes([(r * 7) & 255, (c * 5) & 255, (r + c) & 255, 255])
+        idat = zlib.compress(bytes(raw), 6)
+        return sig + _chunk(b"IHDR", ihdr) + _chunk(b"IDAT", idat) + _chunk(b"IEND", b"")
+
+    png = _png_blob(300)  # ~ tens of KiB → multiple 16 KiB chunks
+    sig_ok = png[:8] == bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+    assert sig_ok and len(png) > 16384, f"need a multi-chunk PNG, got {len(png)}"
+
+    def _fake_kdb_recv(port, req, timeout=10.0):
+        # Mirror the kernel read-file op contract.
+        off = int(req.get("offset", 0))
+        ln = min(int(req.get("len", 16384)), 16384)
+        end = min(off + ln, len(png))
+        sl = png[off:end]
+        resp = {
+            "path": req.get("path"),
+            "file_size": len(png),
+            "offset": off,
+            "n": len(sl),
+            "eof": end >= len(png),
+            "sig_png": sig_ok,
+            "b64": base64.b64encode(sl).decode("ascii"),
+        }
+        return (_json.dumps(resp) + "\n").encode("utf-8")
+
+    harness_dir = Path.home() / ".astryx-harness"
+    harness_dir.mkdir(parents=True, exist_ok=True)
+    sid = "smoke-kdbpng"
+    sess_path = harness_dir / f"{sid}.json"
+    out_path = None
+    orig_recv = getattr(mod, "_kdb_recv", None)
+    try:
+        sess_path.write_text(_json.dumps({"sid": sid, "pid": 0, "kdb_host_port": 12345}))
+        mod._kdb_recv = _fake_kdb_recv
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as fh:
+            out_path = fh.name
+
+        # cmd_kdb_read_png calls _out (prints JSON) and may sys.exit on error.
+        captured = {}
+        orig_out = mod._out
+        mod._out = lambda obj: captured.update(obj if isinstance(obj, dict) else {})
+        args = types.SimpleNamespace(sid=sid, dst=out_path, path="/tmp/out.png", timeout=5.0)
+        try:
+            fn(args)
+        except SystemExit:
+            pass
+        finally:
+            mod._out = orig_out
+
+        check("kdb-read-png ok=true", bool(captured.get("ok")), str(captured))
+        check("kdb-read-png is_png", bool(captured.get("is_png")), str(captured))
+        check("kdb-read-png size_match", bool(captured.get("size_match")), str(captured))
+        check("kdb-read-png byte count", captured.get("bytes") == len(png), str(captured))
+        if captured.get("ok"):
+            decoded = Path(out_path).read_bytes()
+            check("kdb-read-png byte-exact round-trip", decoded == png,
+                  f"len(decoded)={len(decoded)} len(png)={len(png)}")
+    finally:
+        if orig_recv is not None:
+            mod._kdb_recv = orig_recv
+        sess_path.unlink(missing_ok=True)
+        if out_path:
+            Path(out_path).unlink(missing_ok=True)
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="AstryxOS qemu-harness smoke test")
@@ -738,6 +948,8 @@ def main():
     run_staleness_check()
     run_allowlist_check()
     run_snapgate_argv_check()
+    run_read_ff_png_check()
+    run_kdb_read_png_check()
 
     if args.staleness_only:
         # Early exit for CI cycles that just want the cheap host-only checks.

@@ -74,6 +74,8 @@ mod pivot_e_demo;
 mod pivot_e_tui_demo;
 #[cfg(feature = "pivot-e-git-test")]
 mod pivot_e_git_demo;
+#[cfg(feature = "firefox-test")]
+mod ff_out_png;
 
 use astryx_shared::{BootInfo, BOOT_INFO_MAGIC};
 
@@ -1311,6 +1313,16 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             let t_launch = arch::x86_64::irq::get_ticks();
             let mut last_log_tick: u64 = 0;
             let mut firefox_exited = false;
+            // Emit Firefox's rendered /tmp/out.png over serial as soon as it is
+            // written, INDEPENDENT of Firefox-exit detection.  The screenshot
+            // file is complete the moment Firefox closes it; waiting for full
+            // process teardown is fragile (a slow Dead-thread drain can hold
+            // THREAD_TABLE long enough that is_firefox_running() never reports
+            // exit, so the post-loop emit below would never run).  Probing the
+            // file directly decouples extraction from teardown.  Fires exactly
+            // once; emit_out_png() re-reads and streams the bytes (see below).
+            let mut out_png_emitted = false;
+            let mut last_png_probe_tick: u64 = 0;
             loop {
                 gui::input::pump_input();
                 crate::net::poll();
@@ -1358,6 +1370,28 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                         None => {
                             serial_println!("[FFTEST] tick={} sc={} pf={} THREAD_TABLE busy, skipping",
                                 elapsed, sc, pf);
+                        }
+                    }
+                }
+
+                // Stream the rendered screenshot the moment it lands, before
+                // (and independent of) Firefox-exit detection.  Probe at most
+                // every ~200 ticks via stat() (no content read) so this adds
+                // negligible cost to the hot poll loop; emit exactly once.
+                if !out_png_emitted && elapsed.wrapping_sub(last_png_probe_tick) >= 200 {
+                    last_png_probe_tick = elapsed;
+                    if let Ok(st) = crate::vfs::stat("/tmp/out.png") {
+                        if st.size > 0 {
+                            serial_println!(
+                                "[FFTEST] /tmp/out.png present ({} bytes) — streaming",
+                                st.size
+                            );
+                            // emit_out_png() returns false if the file is not yet
+                            // a COMPLETE PNG (still mid-write); in that case leave
+                            // out_png_emitted false so the next probe retries.
+                            if ff_out_png::emit_out_png() {
+                                out_png_emitted = true;
+                            }
                         }
                     }
                 }
@@ -1417,6 +1451,25 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // summary block at every kernel-test shutdown.
             #[cfg(feature = "firefox-test")]
             crate::subsys::linux::syscall::ghost_hist::dump_summary();
+
+            // Read Firefox's rendered screenshot (/tmp/out.png) back out of the
+            // VFS ramdisk and emit it over serial as the [FF-OUT-PNG-B64:…]
+            // marker stream for host extraction.  This is the REAL rendered
+            // page — distinct from the [SCREENSHOT-B64:…] stream, which carries
+            // the QEMU VGA framebuffer (the boot splash in headless mode), not
+            // Firefox's off-screen render.  The host decodes it with
+            // `qemu-harness.py read-ff-png`.  Best-effort: a missing or empty
+            // file is reported on the header line and never blocks shutdown.
+            //
+            // Skipped when the in-loop probe already streamed the file (the
+            // common, robust path) so we never double-emit.  This post-loop
+            // call is the fallback for the path where Firefox exited before the
+            // 200-tick probe fired (e.g. a very fast screenshot run).
+            #[cfg(feature = "firefox-test")]
+            if !out_png_emitted {
+                ff_out_png::emit_out_png();
+            }
+
             serial_println!("[FFTEST] DONE");
 
             // Brief pause for QMP screendump, then exit.
