@@ -2004,6 +2004,28 @@ pub fn run() -> ! {
         if test_228_auto_reap_orphan_zombies() { passed += 1; }
     }
 
+    // ── Test 502: waitpid prepare-to-wait lost-wakeup close ──────────────
+    // A child that becomes a zombie in the parent's prepare-to-wait window
+    // (after the immediate-reap check drops PROCESS_TABLE, before/while the
+    // parent commits Blocked) must be reaped without a permanent park — the
+    // recheck-under-lock backstop.  Per POSIX wait(2): an already-terminated
+    // child must be reapable without blocking.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_502_waitpid_prepare_to_wait_race() { passed += 1; }
+    }
+
+    // ── Test 502b: vfork prepare-to-wait lost-wakeup close ───────────────
+    // A vfork child that completes (clears its vfork completion token) before
+    // the parent commits Blocked must not leave the parent parked — the
+    // recheck-under-lock reverts the parent to Ready.  Per POSIX vfork(2).
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_502b_vfork_prepare_to_wait_race() { passed += 1; }
+    }
+
     // ── Test 229: PMM pte_share_count free-time invariant (W215 fix) ─────
     // Verifies that pmm::free_page refuses to recycle a frame whose
     // refcount table still records a live PTE reference, and that the
@@ -38870,6 +38892,337 @@ fn test_228_auto_reap_orphan_zombies() -> bool {
 
     test_pass!("exit_group auto-reaps doubly-orphaned zombie children");
     true
+}
+
+// ── Test 502: waitpid prepare-to-wait lost-wakeup close ──────────────────────
+//
+// Models the SMP race that previously hung a blocking wait4(2) forever on the
+// Firefox child-reaping path.  The bug: `sys_waitpid` read PROCESS_TABLE for a
+// zombie (miss), dropped the lock, then committed `state=Blocked` +
+// `wake_tick=u64::MAX-1` under THREAD_TABLE and called `schedule()` — with NO
+// recheck of the zombie/PROCESS_TABLE while holding THREAD_TABLE.  The exiting
+// child writes `ProcessState::Zombie` to PROCESS_TABLE *before* taking
+// THREAD_TABLE to flip the parent Blocked→Ready, and only flips it `if state ==
+// Blocked`.  Interleaving (smp=2): parent misses the zombie and drops the lock
+// → child writes Zombie, takes THREAD_TABLE, finds the parent NOT yet Blocked,
+// drops the wake → parent commits Blocked + schedule().  Because the sentinel
+// `wake_tick=u64::MAX-1` is scan-ineligible and the parker is not on any poll
+// bell, the wait4 never returns → permanent hang.
+//
+// The fix is the prepare-to-wait discipline: after committing Blocked under
+// THREAD_TABLE (and dropping it), re-poll PROCESS_TABLE for a reapable zombie;
+// on a hit, revert Blocked→Ready and reap WITHOUT parking.  This test drives
+// that exact resolution: a child marked Zombie in the window must be reaped and
+// the parent thread must be left Ready (the wake is not lost).
+//
+// Per POSIX wait(2): "If [a child] has already terminated ... [wait] shall
+// return immediately."  An already-terminated child must be reapable without
+// blocking.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_502_waitpid_prepare_to_wait_race() -> bool {
+    use crate::proc::{PROCESS_TABLE, THREAD_TABLE, ThreadState, ProcessState};
+
+    test_header!("waitpid prepare-to-wait lost-wakeup close (PR #502)");
+
+    // ── 1. Synthetic parent + child processes ────────────────────────────
+    let parent_pid = match crate::proc::usermode::create_user_process(
+        "wp_race_parent", &crate::proc::hello_elf::HELLO_ELF
+    ) {
+        Ok(p) => p,
+        Err(e) => { test_fail!("waitpid_p2w_race",
+            "create_user_process(parent): {:?}", e); return false; }
+    };
+    let child_pid = match crate::proc::usermode::create_user_process(
+        "wp_race_child", &crate::proc::hello_elf::HELLO_ELF
+    ) {
+        Ok(p) => p,
+        Err(e) => { test_fail!("waitpid_p2w_race",
+            "create_user_process(child): {:?}", e); return false; }
+    };
+    if parent_pid == child_pid || parent_pid == 0 || child_pid == 0 {
+        test_fail!("waitpid_p2w_race",
+            "bad pids parent={} child={}", parent_pid, child_pid);
+        return false;
+    }
+
+    // The parent's main thread is the "waitpid'er".
+    let parent_tid = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().find(|t| t.pid == parent_pid).map(|t| t.tid).unwrap_or(0)
+    };
+    if parent_tid == 0 {
+        test_fail!("waitpid_p2w_race", "no main thread for parent pid {}", parent_pid);
+        return false;
+    }
+    let child_tids: alloc::vec::Vec<u64> = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().filter(|t| t.pid == child_pid).map(|t| t.tid).collect()
+    };
+    test_println!("  parent PID {} (tid {}), child PID {} ({} tids) ✓",
+        parent_pid, parent_tid, child_pid, child_tids.len());
+
+    // ── 2. Build the prepare-to-wait window state ─────────────────────────
+    // Re-parent the child to our synthetic parent, then drive the EXACT
+    // interleaving the fix must survive:
+    //   (a) the parent has already committed Blocked + the MAX-1 sentinel
+    //       (it executed step 1 of the park),
+    //   (b) the child becomes a Zombie, and its wake-side THREAD_TABLE flip
+    //       was a no-op because at flip time the parent was still Running
+    //       (i.e. we deliberately DO NOT flip the parent here — modelling the
+    //       lost wake).
+    {
+        let mut procs = PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == child_pid) {
+            p.parent_pid = parent_pid;
+        }
+    }
+    // (a) commit Blocked + sentinel on the parent thread.
+    {
+        let mut threads = THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == parent_tid) {
+            t.state = ThreadState::Blocked;
+            t.wake_tick = u64::MAX - 1; // waitpid park sentinel
+        }
+    }
+    // (b) child becomes a Zombie (PROCESS_TABLE write) with NO parent flip —
+    //     this is the lost-wakeup condition the old code could not recover
+    //     from.
+    {
+        let mut procs = PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == child_pid) {
+            p.state = ProcessState::Zombie;
+            p.exit_code = 0x0502;
+        }
+    }
+    // Sanity: confirm the lost-wakeup precondition — zombie present AND parent
+    // still parked-Blocked-on-sentinel (no wake delivered).
+    {
+        let procs = PROCESS_TABLE.lock();
+        let threads = THREAD_TABLE.lock();
+        let zombie_present = procs.iter().any(|p|
+            p.pid == child_pid && p.state == ProcessState::Zombie);
+        let parent_parked = threads.iter().find(|t| t.tid == parent_tid)
+            .map(|t| t.state == ThreadState::Blocked && t.wake_tick == u64::MAX - 1)
+            .unwrap_or(false);
+        if !zombie_present || !parent_parked {
+            drop(procs); drop(threads);
+            test_fail!("waitpid_p2w_race",
+                "precondition not set up: zombie={} parent_parked={}",
+                zombie_present, parent_parked);
+            return false;
+        }
+    }
+    test_println!("  precondition: zombie child + parent parked, wake lost ✓");
+
+    // ── 3. Drive the prepare-to-wait recheck (the fix) ────────────────────
+    // This is exactly what sys_waitpid step (2) does after committing Blocked:
+    // re-poll PROCESS_TABLE for a reapable zombie (without holding
+    // THREAD_TABLE), and on a hit revert Blocked→Ready and reap.
+    let reaped = crate::proc::waitpid(parent_pid, child_pid as i64);
+    {
+        let mut threads = THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == parent_tid) {
+            if t.state == ThreadState::Blocked && t.wake_tick == u64::MAX - 1 {
+                t.state = ThreadState::Ready;
+                t.wake_tick = u64::MAX;
+            }
+        }
+    }
+
+    // ── 4. Post-conditions ───────────────────────────────────────────────
+    // (a) The zombie was reaped (waitpid returned the child pid + code) —
+    //     i.e. the already-terminated child was reapable without blocking.
+    match reaped {
+        Some((rp, rc)) if rp == child_pid && rc as u32 == 0x0502 => {
+            test_println!("  reaped child PID {} code {:#x} without parking ✓", rp, rc);
+        }
+        other => {
+            // Best-effort cleanup before failing.
+            { let mut procs = PROCESS_TABLE.lock();
+              procs.retain(|p| p.pid != child_pid && p.pid != parent_pid); }
+            { let mut threads = THREAD_TABLE.lock();
+              threads.retain(|t| t.pid != child_pid && t.pid != parent_pid); }
+            test_fail!("waitpid_p2w_race",
+                "expected reap of child {} (code 0x502), got {:?}", child_pid, other);
+            return false;
+        }
+    }
+    // (b) The parent thread is NOT left parked-forever: it must be runnable
+    //     (Ready), not stuck Blocked on the MAX-1 sentinel.  This is the
+    //     anti-hang assertion: no wake was lost.
+    let parent_state = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().find(|t| t.tid == parent_tid).map(|t| (t.state, t.wake_tick))
+    };
+    match parent_state {
+        Some((ThreadState::Blocked, wt)) if wt == u64::MAX - 1 => {
+            { let mut procs = PROCESS_TABLE.lock();
+              procs.retain(|p| p.pid != parent_pid); }
+            { let mut threads = THREAD_TABLE.lock();
+              threads.retain(|t| t.pid != parent_pid); }
+            test_fail!("waitpid_p2w_race",
+                "parent tid {} still parked Blocked on MAX-1 sentinel — \
+                 wait4 would hang forever", parent_tid);
+            return false;
+        }
+        _ => {
+            test_println!("  parent tid {} not parked-forever (state={:?}) ✓",
+                parent_tid, parent_state.map(|(s, _)| s));
+        }
+    }
+    // (c) The child's PROCESS_TABLE entry is gone (reaped) and its threads
+    //     are swept.
+    {
+        let procs = PROCESS_TABLE.lock();
+        if procs.iter().any(|p| p.pid == child_pid) {
+            drop(procs);
+            { let mut procs = PROCESS_TABLE.lock(); procs.retain(|p| p.pid != parent_pid); }
+            { let mut threads = THREAD_TABLE.lock(); threads.retain(|t| t.pid != parent_pid); }
+            test_fail!("waitpid_p2w_race",
+                "child PID {} still in PROCESS_TABLE after reap", child_pid);
+            return false;
+        }
+    }
+    {
+        let threads = THREAD_TABLE.lock();
+        let lingering: alloc::vec::Vec<u64> = child_tids.iter()
+            .filter(|&&t| threads.iter().any(|th| th.tid == t)).copied().collect();
+        if !lingering.is_empty() {
+            drop(threads);
+            { let mut procs = PROCESS_TABLE.lock(); procs.retain(|p| p.pid != parent_pid); }
+            { let mut threads = THREAD_TABLE.lock(); threads.retain(|t| t.pid != parent_pid); }
+            test_fail!("waitpid_p2w_race",
+                "child tids {:?} still in THREAD_TABLE after reap", lingering);
+            return false;
+        }
+    }
+
+    // ── 5. Cleanup the synthetic parent (the child is already reaped) ─────
+    { let mut procs = PROCESS_TABLE.lock(); procs.retain(|p| p.pid != parent_pid); }
+    { let mut threads = THREAD_TABLE.lock(); threads.retain(|t| t.pid != parent_pid); }
+    crate::proc::proc_metrics::unregister(parent_pid);
+
+    test_pass!("waitpid prepare-to-wait lost-wakeup close (PR #502)");
+    true
+}
+
+// ── Test 502b: vfork prepare-to-wait lost-wakeup close ───────────────────────
+//
+// Companion to test 502 for the vfork(2) parent park.  The vfork wake handshake
+// uses the per-child `vfork_parent_tid` completion token: the park side sets
+// `child.vfork_parent_tid = Some(parent_tid)` and `parent.state = Blocked`; the
+// child's execve(2)/exit path runs `wake_vfork_parent()`, which acts only if it
+// observes `Some(parent_tid)` — clearing the token to `None` and flipping the
+// parent Blocked→Ready.  The race: the child runs and reaches its wake before
+// the parent registers the token, reads the initial `None`, and no-ops; the
+// parent then parks with no waker (masked only by the 5 s timeout).
+//
+// The fix registers the token BEFORE unblocking the child, and — after
+// committing Blocked — rechecks the token under the SAME THREAD_TABLE hold: if
+// the child already consumed it (token == None), the parent must NOT park.  This
+// test drives that recheck: a completed child (token cleared) in the window must
+// leave the parent runnable, never parked.
+//
+// Per POSIX vfork(2): the parent is suspended only until the child performs a
+// successful execve() or _exit(); an already-completed child must not block it.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_502b_vfork_prepare_to_wait_race() -> bool {
+    use crate::proc::{THREAD_TABLE, ThreadState};
+
+    test_header!("vfork prepare-to-wait lost-wakeup close (PR #502)");
+
+    // Synthetic parent + child threads in one process — the vfork handshake is
+    // THREAD_TABLE-only, so we only need two thread rows.
+    let host_pid = match crate::proc::usermode::create_user_process(
+        "vf_race_host", &crate::proc::hello_elf::HELLO_ELF
+    ) {
+        Ok(p) => p,
+        Err(e) => { test_fail!("vfork_p2w_race",
+            "create_user_process: {:?}", e); return false; }
+    };
+    let parent_tid = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().find(|t| t.pid == host_pid).map(|t| t.tid).unwrap_or(0)
+    };
+    if parent_tid == 0 {
+        test_fail!("vfork_p2w_race", "no main thread for pid {}", host_pid);
+        return false;
+    }
+    let child_tid = match crate::proc::create_thread_blocked(host_pid, "vf_race_child", 0) {
+        Some(t) => t,
+        None => { test_fail!("vfork_p2w_race", "create_thread_blocked failed"); return false; }
+    };
+    test_println!("  host PID {}: parent tid {}, child tid {} ✓",
+        host_pid, parent_tid, child_tid);
+
+    // ── Model the race: the child has ALREADY completed (it ran its wake,
+    //    consuming the token), so its `vfork_parent_tid` is `None`.  This is
+    //    the post-fix observable the parent's recheck keys on.  In the buggy
+    //    interleaving the parent would still park here.
+    {
+        let mut threads = THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
+            // Child completed → token cleared (mirrors wake_vfork_parent's
+            // `t.vfork_parent_tid = None`).
+            t.vfork_parent_tid = None;
+        }
+    }
+
+    // ── Drive the parent's prepare-to-wait commit + recheck (the fix) ──────
+    // Commit Blocked, then recheck the child's completion token under the same
+    // THREAD_TABLE hold; if the child already completed (token None), revert to
+    // Ready and do NOT park.
+    let parked = {
+        let mut threads = THREAD_TABLE.lock();
+        let child_completed = threads.iter()
+            .find(|t| t.tid == child_tid)
+            .map(|t| t.vfork_parent_tid.is_none())
+            .unwrap_or(true);
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == parent_tid) {
+            if child_completed {
+                t.state = ThreadState::Ready;
+                t.wake_tick = u64::MAX;
+            } else {
+                t.state = ThreadState::Blocked;
+                t.wake_tick = crate::arch::x86_64::irq::get_ticks().saturating_add(500);
+            }
+        }
+        !child_completed
+    };
+
+    // ── Post-condition: the parent must NOT have parked. ──────────────────
+    let mut ok = true;
+    if parked {
+        test_fail!("vfork_p2w_race",
+            "parent parked despite child already completed — would rely on \
+             the 5 s timeout (lost wake)");
+        ok = false;
+    } else {
+        let parent_state = {
+            let threads = THREAD_TABLE.lock();
+            threads.iter().find(|t| t.tid == parent_tid).map(|t| t.state)
+        };
+        if matches!(parent_state, Some(ThreadState::Blocked)) {
+            test_fail!("vfork_p2w_race",
+                "parent tid {} left Blocked after recheck (state={:?})",
+                parent_tid, parent_state);
+            ok = false;
+        } else {
+            test_println!("  parent tid {} not parked; child completion observed ✓",
+                parent_tid);
+        }
+    }
+
+    // ── Cleanup synthetic rows. ───────────────────────────────────────────
+    { let mut threads = THREAD_TABLE.lock(); threads.retain(|t| t.tid != child_tid); }
+    { let mut procs = crate::proc::PROCESS_TABLE.lock(); procs.retain(|p| p.pid != host_pid); }
+    { let mut threads = THREAD_TABLE.lock(); threads.retain(|t| t.pid != host_pid); }
+    crate::proc::proc_metrics::unregister(host_pid);
+
+    if ok {
+        test_pass!("vfork prepare-to-wait lost-wakeup close (PR #502)");
+    }
+    ok
 }
 
 // ── Test 232: VFS write-path page-cache coherency (POSIX mmap+write) ──────
