@@ -2251,23 +2251,37 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         if !sender_fds.is_empty() {
                             let peer_id = scm_bind_peer_id;
                             if peer_id != u64::MAX {
-                                // Bind the fd batch to the FIRST byte of this
-                                // frame — the peer recv position captured BEFORE
-                                // the data-push loop above (scm_bind_offset).
-                                // This matches the kernel's first-byte-touch
-                                // delivery: the ancillary fds attach to the
-                                // stream position where the frame begins, so the
-                                // recvmsg that first returns this frame's bytes
-                                // also carries the cmsg (deliver predicate
-                                // recv_consumed >= byte_offset becomes true the
-                                // instant the reader pops the frame's first
-                                // byte).  For a control-only frame (iov_len==0)
-                                // nothing was pushed, so pre == post == the
-                                // current tail and the batch is immediately
-                                // deliverable — unchanged from the prior tail
-                                // bind.  Per recvmsg(2) / unix(7) /
-                                // POSIX.1-2017 SCM_RIGHTS.
-                                crate::syscall::scm_queue(peer_id, scm_bind_offset, sender_fds);
+                                // Bind the fd batch so it co-delivers with the
+                                // recvmsg that returns the FIRST byte of this
+                                // frame — the first-byte-touch delivery contract
+                                // (recvmsg(2) / unix(7) / POSIX.1-2017 §2.14:
+                                // ancillary data is delivered with the data it
+                                // accompanies).  `scm_bind_offset` was captured
+                                // BEFORE the data-push loop, so it is the stream
+                                // position T where the frame begins.
+                                //
+                                // The deliver predicate is `recv_consumed >=
+                                // byte_offset` (syscall/mod.rs scm_dequeue).
+                                // Popping the frame's first byte advances
+                                // recv_consumed from T to T+1, so to gate the
+                                // batch on "the reader has touched (begun
+                                // consuming) this frame" we bind a DATA-bearing
+                                // frame to T+1 — deliverable the instant the
+                                // first byte is popped, and NOT before any byte
+                                // of the frame is read.  A control-only frame
+                                // (no data pushed, `total == 0`) carries no
+                                // bytes to touch; it sits at the stream tail and
+                                // must be immediately readable as a 0-byte
+                                // ancillary message, so it binds to T (==tail)
+                                // and the predicate fires at once.  This keeps
+                                // the dequeue predicate uniform (`>=`) while
+                                // honouring both cases.
+                                let bind_offset = if total > 0 {
+                                    scm_bind_offset + 1
+                                } else {
+                                    scm_bind_offset
+                                };
+                                crate::syscall::scm_queue(peer_id, bind_offset, sender_fds);
                                 // Wake any poller/epoll_wait parked on the peer
                                 // fd so it re-evaluates and discovers the new
                                 // readable (ancillary) message immediately,

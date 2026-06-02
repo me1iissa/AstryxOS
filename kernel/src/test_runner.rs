@@ -2565,6 +2565,17 @@ pub fn run() -> ! {
     total += 1;
     if test_289_scm_first_byte_bind() { passed += 1; }
 
+    // ── Test 290: a multi-fd SCM_RIGHTS message delivers ALL its fds ───────
+    // A single sendmsg(2) that attaches N>1 file descriptors in one SCM_RIGHTS
+    // control message forms ONE batch carrying all N fds; the recvmsg(2) that
+    // first returns the frame's bytes must co-deliver EVERY one of those fds
+    // (not a partial subset).  A reader whose message header announces
+    // num_handles==N and receives fewer than N descriptors aborts with "needs
+    // unreceived descriptors".  Refs: recvmsg(2), unix(7) SCM_RIGHTS,
+    // POSIX.1-2017 §2.14.
+    total += 1;
+    if test_290_scm_multi_fd_delivery() { passed += 1; }
+
     // ── Test 283: stack-prov main-stack TOP-window argv-writer capture ──
     // GATE-A blind-spot closure (2026-05-30).  Only built when the
     // `stack-prov` diagnostic feature is on (CI smoke does not enable it);
@@ -45541,9 +45552,10 @@ fn test_289_scm_first_byte_bind() -> bool {
         open_path: alloc::string::String::new(),
     };
 
-    // Capture B's recv position BEFORE pushing this frame's data — exactly the
-    // pre-push offset the sendmsg path now binds to (scm_bind_offset).
-    let first_byte_off = unix::enqueue_offset_for(b);
+    // Capture B's recv position T BEFORE pushing this frame's data — the stream
+    // position where the frame begins (the sendmsg path captures this as
+    // scm_bind_offset, also before its data-push loop).
+    let frame_start = unix::enqueue_offset_for(b);
 
     // Push an 8-byte data frame into B's recv ring (the "message").
     let n = unix::write(a, b"HDRBODY!");
@@ -45553,19 +45565,27 @@ fn test_289_scm_first_byte_bind() -> bool {
         return false;
     }
 
-    // Bind the fd batch to the FIRST byte of the frame (the fix).  The pre-fix
-    // tail bind would have used enqueue_offset_for(b) AFTER the write (== 8).
+    // The DATA-bearing sendmsg binds its fd batch to the position the reader
+    // reaches after popping the frame's FIRST byte (frame_start + 1) — the
+    // first-byte-touch contract (recvmsg(2) / unix(7) / POSIX.1-2017 §2.14:
+    // ancillary data is delivered with the recvmsg that returns the data it
+    // accompanies, i.e. once the reader begins consuming the frame, and NOT
+    // before any of its bytes are read).  The pre-fix tail bind would have used
+    // enqueue_offset_for(b) AFTER the write (== frame_start + 8), withholding
+    // the fds until EVERY byte was drained.
     let tail_off = unix::enqueue_offset_for(b);
-    if tail_off != first_byte_off + 8 {
+    if tail_off != frame_start + 8 {
         test_fail!("scm_firstbyte",
-            "tail offset {} != first {} + 8", tail_off, first_byte_off);
+            "tail offset {} != first {} + 8", tail_off, frame_start);
         unix::close(a); unix::close(b);
         return false;
     }
-    crate::syscall::scm_queue(b, first_byte_off, alloc::vec![mk_fd()]);
+    let bind_off = frame_start + 1; // data frame → first-byte-touched position
+    crate::syscall::scm_queue(b, bind_off, alloc::vec![mk_fd()]);
 
-    // Reader has consumed nothing yet — batch must be WITHHELD (it binds to the
-    // first byte, which the reader has not reached).
+    // Reader has consumed nothing yet (recv_consumed == frame_start) — the batch
+    // must be WITHHELD: its bound position frame_start+1 has not been reached, so
+    // the reader has not yet touched (begun consuming) the frame.
     if crate::syscall::has_scm_deliverable(b, unix::recv_consumed(b)) {
         test_fail!("scm_firstbyte", "batch deliverable before any byte read");
         unix::close(a); unix::close(b);
@@ -45573,7 +45593,8 @@ fn test_289_scm_first_byte_bind() -> bool {
     }
 
     // Read ONLY the first byte of the 8-byte frame (a partial / header-first
-    // read).  recv_consumed advances by 1 — now >= first_byte_off.
+    // read).  recv_consumed advances from frame_start to frame_start+1 — exactly
+    // the bound position bind_off, so the batch now becomes deliverable.
     let mut one = [0u8; 1];
     let rn = unix::read_msg(b, &mut one).map(|(c, _)| c).unwrap_or(0xFFFF);
     if rn != 1 || one[0] != b'H' {
@@ -45614,5 +45635,122 @@ fn test_289_scm_first_byte_bind() -> bool {
     unix::close(a);
     unix::close(b);
     test_pass!("SCM_RIGHTS fds bound to the first byte of their frame (Test 289)");
+    true
+}
+
+// ── Test 290: a multi-fd SCM_RIGHTS message delivers ALL its fds ─────────────
+//
+// The sendmsg(2) SCM path collects every fd named in a single SCM_RIGHTS
+// control message into ONE batch and binds it to the frame's first-byte-touched
+// stream position; the recvmsg(2) that first returns the frame's bytes pops that
+// batch and installs ALL of its descriptors, writing one cmsg whose payload is
+// the full set of receiver-side fd numbers.  A 2-fd batch must therefore deliver
+// BOTH fds with the same recvmsg as a 1-fd batch delivers its one fd — a
+// short-delivery (fewer fds than the message header announced) makes a
+// length-prefixed IPC reader abort with "needs unreceived descriptors".  This
+// directly exercises the batch+dequeue layer with a 2-fd batch and an
+// interleaved 1-fd frame to confirm the multi-fd batch is neither split,
+// truncated, nor lost.  Refs: recvmsg(2)/sendmsg(2), unix(7) SCM_RIGHTS,
+// POSIX.1-2017 §2.14.
+fn test_290_scm_multi_fd_delivery() -> bool {
+    use crate::net::unix;
+    test_header!("multi-fd SCM_RIGHTS message delivers ALL its fds (Test 290)");
+
+    let (a, b) = unix::socketpair(unix::SockKind::Stream,
+        unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if a == u64::MAX || b == u64::MAX {
+        test_fail!("scm_multifd", "socketpair returned MAX");
+        return false;
+    }
+
+    // Distinguishable throw-away descriptors, tagged by `inode`.
+    let mk_fd = |ino: u64| crate::vfs::FileDescriptor {
+        inode: ino, mount_idx: 0, offset: 0, flags: 0,
+        file_type: crate::vfs::FileType::RegularFile,
+        is_console: false, cloexec: false,
+        open_path: alloc::string::String::new(),
+    };
+
+    // ── Part 1: a single 2-fd batch on a data frame delivers BOTH fds ────────
+    // Model the data-bearing 2-fd sendmsg: capture the frame start, push the
+    // data, then queue ONE batch of two fds bound to the first-byte-touched
+    // position (frame_start + 1), exactly as the sendmsg(2) SCM path does.
+    let frame_start = unix::enqueue_offset_for(b);
+    if unix::write(a, b"HDR") != 3 {
+        test_fail!("scm_multifd", "write(HDR) != 3");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    crate::syscall::scm_queue(b, frame_start + 1,
+        alloc::vec![mk_fd(0xF1), mk_fd(0xF2)]);
+
+    // Before any byte of the frame is read, the batch is withheld (first-byte
+    // bind): recv_consumed == frame_start < frame_start + 1.
+    if crate::syscall::has_scm_deliverable(b, unix::recv_consumed(b)) {
+        test_fail!("scm_multifd", "2-fd batch deliverable before any byte read");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // Pop the first byte → recv_consumed reaches frame_start + 1 → the WHOLE
+    // 2-fd batch becomes deliverable on this recvmsg.
+    let mut one = [0u8; 1];
+    if unix::read_msg(b, &mut one).map(|(c, _)| c).unwrap_or(0xFFFF) != 1 {
+        test_fail!("scm_multifd", "partial read of frame failed");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    let got = crate::syscall::scm_dequeue(b, unix::recv_consumed(b));
+    match got.as_deref() {
+        Some([f1, f2]) if (f1.inode, f2.inode) == (0xF1, 0xF2) => {
+            test_println!("  2-fd batch delivered BOTH fds in one dequeue ✓");
+        }
+        other => {
+            test_fail!("scm_multifd",
+                "2-fd dequeue returned {:?} (expected exactly [0xF1, 0xF2])",
+                other.map(|s| s.iter().map(|f| f.inode).collect::<alloc::vec::Vec<_>>()));
+            unix::close(a); unix::close(b);
+            return false;
+        }
+    }
+    // Drain the rest of the frame so the stream position is clean for Part 2.
+    let mut rest = [0u8; 2];
+    let _ = unix::read_msg(b, &mut rest);
+
+    // ── Part 2: a 1-fd frame after a 2-fd frame keeps its single fd ──────────
+    // Cross-check the N1 ordering interaction: when one message carries 2 fds
+    // and a following message carries 1 fd, each batch is bound to its own
+    // first-byte position and dequeued in byte order — the 2-fd batch is not
+    // merged into, nor does it steal a descriptor from, the 1-fd batch.
+    let f2_start = unix::enqueue_offset_for(b);
+    if unix::write(a, b"X") != 1 {
+        test_fail!("scm_multifd", "write(X) != 1");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    crate::syscall::scm_queue(b, f2_start + 1, alloc::vec![mk_fd(0xAB)]);
+    let _ = unix::read_msg(b, &mut one); // pop the single byte
+    match crate::syscall::scm_dequeue(b, unix::recv_consumed(b)).as_deref() {
+        Some([f]) if f.inode == 0xAB => {
+            test_println!("  following 1-fd frame delivered exactly its one fd ✓");
+        }
+        other => {
+            test_fail!("scm_multifd",
+                "1-fd frame dequeue returned {:?} (expected exactly [0xAB])",
+                other.map(|s| s.iter().map(|f| f.inode).collect::<alloc::vec::Vec<_>>()));
+            unix::close(a); unix::close(b);
+            return false;
+        }
+    }
+    // Nothing should remain queued.
+    if crate::syscall::scm_dequeue(b, unix::recv_consumed(b)).is_some() {
+        test_fail!("scm_multifd", "unexpected extra batch after both frames drained");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    unix::close(a);
+    unix::close(b);
+    test_pass!("multi-fd SCM_RIGHTS message delivers ALL its fds (Test 290)");
     true
 }
