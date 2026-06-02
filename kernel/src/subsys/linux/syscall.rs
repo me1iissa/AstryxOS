@@ -2382,18 +2382,25 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             } else {
                 if !crate::syscall::is_socket_fd(pid, fd) { return -9; }
                 let socket_id = crate::syscall::get_socket_id(pid, fd);
-                bytes_read = match crate::net::socket::socket_recv(socket_id) {
-                    Ok(data) => {
-                        if data.is_empty() { 0 }
-                        else {
-                            let n = data.len().min(cap);
-                            unsafe {
-                                let _g = crate::arch::x86_64::smap::UserGuard::new();
-                                core::ptr::copy_nonoverlapping(data.as_ptr(), dst, n);
-                            }
-                            n as i64
+                // Per recvmsg(2) / IEEE 1003.1 §recv: on a non-blocking
+                // socket an empty receive queue must return -1/EAGAIN, while
+                // an orderly peer shutdown (EOF) returns 0.  Collapsing both
+                // to 0 (the prior `Ok(empty) => 0`) lied to the caller: a
+                // polled IPC reactor read the 0 as a readable edge and
+                // re-issued recvmsg in a tight loop, never yielding.  Use the
+                // status-aware recv so the two cases get their correct
+                // returns (WouldBlock → -EAGAIN, Eof → 0).
+                bytes_read = match crate::net::socket::socket_recv_status(socket_id) {
+                    Ok(crate::net::socket::RecvOutcome::Data(data)) => {
+                        let n = data.len().min(cap);
+                        unsafe {
+                            let _g = crate::arch::x86_64::smap::UserGuard::new();
+                            core::ptr::copy_nonoverlapping(data.as_ptr(), dst, n);
                         }
+                        n as i64
                     }
+                    Ok(crate::net::socket::RecvOutcome::Eof) => 0,
+                    Ok(crate::net::socket::RecvOutcome::WouldBlock) => -11, // EAGAIN
                     Err(_) => -11,
                 };
             }
@@ -5770,8 +5777,14 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
         return ret;
     } else if crate::syscall::is_socket_fd(pid, fd as usize) {
         let socket_id = crate::syscall::get_socket_id(pid, fd as usize);
-        return match crate::net::socket::socket_recv(socket_id) {
-            Ok(data) => {
+        // Per read(2) / recv(2) / IEEE 1003.1: an empty receive on a
+        // non-blocking socket is -1/EAGAIN; an orderly peer shutdown is a
+        // 0-byte EOF.  The status-aware recv keeps the two apart so a polled
+        // reader does not mistake an empty queue for EOF and re-read in a
+        // busy loop (mirrors the pipe path above, which already separates
+        // EOF from would-block).
+        return match crate::net::socket::socket_recv_status(socket_id) {
+            Ok(crate::net::socket::RecvOutcome::Data(data)) => {
                 let n = data.len().min(count);
                 unsafe {
                     let _g = crate::arch::x86_64::smap::UserGuard::new();
@@ -5779,6 +5792,8 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
                 }
                 n as i64
             }
+            Ok(crate::net::socket::RecvOutcome::Eof) => 0,
+            Ok(crate::net::socket::RecvOutcome::WouldBlock) => -11, // EAGAIN
             Err(_) => -11, // EAGAIN
         };
     } else if crate::syscall::is_eventfd_fd(pid, fd as usize) {

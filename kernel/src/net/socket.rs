@@ -414,6 +414,106 @@ fn ensure_udp_local_port(id: u64) -> Result<u16, &'static str> {
     Ok(port)
 }
 
+/// Outcome of a non-blocking socket receive, with the three states the
+/// POSIX recv contract distinguishes:
+///
+///   * `Data(bytes)` — at least one byte (or one datagram) was dequeued.
+///   * `Eof`         — orderly end-of-stream: the read direction was shut
+///                     down (`shutdown(SHUT_RD)`) or, for a connection-mode
+///                     socket, the peer has sent FIN and no buffered data
+///                     remains.  `recv(2)` must report this as a 0-byte
+///                     return (IEEE 1003.1 §recv: "a return value of 0
+///                     indicates the peer has performed an orderly
+///                     shutdown").
+///   * `WouldBlock`  — no data is currently available but the endpoint is
+///                     still live (a connectionless datagram socket with an
+///                     empty queue, or a connection-mode socket whose peer
+///                     has NOT closed).  On an `O_NONBLOCK` fd `recv(2)`
+///                     must report this as `-1`/`EAGAIN`, NEVER as 0 — a 0
+///                     return would falsely signal EOF and send an event
+///                     loop into a busy re-read spin.
+///
+/// The distinction matters because [`socket_recv`] collapses `Eof` and
+/// `WouldBlock` into the same empty `Ok(Vec::new())`, which left the
+/// recvmsg/read syscall arms unable to choose between a 0 return (EOF) and
+/// `-EAGAIN` (would-block).  See `recvmsg(2)`, `recv(2)`, POSIX.1-2017
+/// §2.10.6 (Socket Receive Queue).
+pub enum RecvOutcome {
+    Data(Vec<u8>),
+    Eof,
+    WouldBlock,
+}
+
+/// Receive from a socket (non-blocking) with an explicit [`RecvOutcome`].
+///
+/// This is the EAGAIN-correct sibling of [`socket_recv`]: it tells the
+/// caller whether an empty result is end-of-stream (`Eof` → 0 return) or a
+/// transient empty queue (`WouldBlock` → `-EAGAIN`).  `recvmsg(2)` /
+/// `recv(2)` on a non-blocking socket with no data pending must return
+/// `EAGAIN` per IEEE 1003.1; returning 0 there is an EOF lie that drives a
+/// polled reactor into a tight re-read loop.
+pub fn socket_recv_status(id: u64) -> Result<RecvOutcome, &'static str> {
+    let sockets = SOCKETS.lock();
+    let sock = sockets.iter().find(|s| s.id == id)
+        .ok_or("socket not found")?;
+
+    // shutdown(SHUT_RD): orderly EOF regardless of socket type.
+    if sock.shut_rd {
+        return Ok(RecvOutcome::Eof);
+    }
+
+    match sock.socket_type {
+        SocketType::Udp => {
+            if !sock.bound {
+                return Err("not bound");
+            }
+            // UDP is connectionless: an empty receive queue is never EOF,
+            // it is always "no datagram yet" — i.e. would-block.
+            match super::udp::recv(sock.local_port) {
+                Some(datagram) => {
+                    crate::proc::proc_metrics::bump_net_read(
+                        crate::proc::current_pid_lockless(),
+                        datagram.data.len() as u64);
+                    Ok(RecvOutcome::Data(datagram.data))
+                }
+                None => Ok(RecvOutcome::WouldBlock),
+            }
+        }
+        SocketType::Tcp => {
+            if !sock.bound {
+                return Err("not bound");
+            }
+            let data = if sock.connected && sock.remote_port != 0 {
+                super::tcp::read_from(sock.local_port, sock.remote_ip, sock.remote_port)
+            } else {
+                super::tcp::read(sock.local_port)
+            };
+            if !data.is_empty() {
+                crate::proc::proc_metrics::bump_net_read(
+                    crate::proc::current_pid_lockless(), data.len() as u64);
+                return Ok(RecvOutcome::Data(data));
+            }
+            // Empty stream read: distinguish peer-FIN EOF from would-block.
+            // A connection that has received the peer's FIN sits in
+            // CloseWait (or has progressed to LastAck/Closed/TimeWait); with
+            // no buffered data that is an orderly EOF (RFC 793 §3.5).  An
+            // Established (or still-handshaking) connection with an empty
+            // buffer is would-block.
+            let peer_closed = match super::tcp::get_state(sock.local_port) {
+                Some(st) => matches!(st,
+                    super::tcp::TcpState::CloseWait
+                    | super::tcp::TcpState::LastAck
+                    | super::tcp::TcpState::TimeWait
+                    | super::tcp::TcpState::Closed),
+                // No TCB found for this port: the flow is gone — treat as EOF
+                // so a reader drains to completion rather than spinning.
+                None => true,
+            };
+            if peer_closed { Ok(RecvOutcome::Eof) } else { Ok(RecvOutcome::WouldBlock) }
+        }
+    }
+}
+
 /// Receive data from a socket (non-blocking).
 pub fn socket_recv(id: u64) -> Result<Vec<u8>, &'static str> {
     let sockets = SOCKETS.lock();
