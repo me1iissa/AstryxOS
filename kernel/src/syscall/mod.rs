@@ -495,6 +495,31 @@ pub fn has_scm_deliverable(receiver_id: u64, consumed: u64) -> bool {
     q.iter().any(|b| b.receiver_id == receiver_id && consumed >= b.byte_offset)
 }
 
+/// Lowest pending `SCM_RIGHTS` batch bound-offset for `receiver_id` that the
+/// reader has NOT yet reached (`byte_offset > consumed`).  Returns None when no
+/// pending batch sits ahead of the reader's current drained position.
+///
+/// This is the recv-side read CAP for AF_UNIX SOCK_STREAM: a `recvmsg(2)` must
+/// not drain bytes *past* the stream position at which the next queued fd batch
+/// becomes deliverable, because each `scm_dequeue` hands back exactly ONE batch.
+/// A byte-stream reader (e.g. a length-prefixed IPC channel) reads up to a large
+/// fixed buffer per `recvmsg`, so without a cap a single recvmsg can drain bytes
+/// that span MULTIPLE fd-bearing frames while only ONE batch is delivered — the
+/// reader then parses a later frame whose descriptors were silently withheld and
+/// aborts ("needs unreceived descriptors").  Capping the drain at the next
+/// batch's deliver-offset makes each recvmsg return the bytes up to exactly one
+/// fd batch and deliver that batch, then stop — mirroring the AF_UNIX stream
+/// recv that stops at each fd-bearing message boundary (recvmsg(2), unix(7)
+/// SCM_RIGHTS: ancillary data is delivered with the data it accompanies, one
+/// message's fds per recv).
+pub fn scm_next_batch_offset(receiver_id: u64, consumed: u64) -> Option<u64> {
+    let q = PENDING_SCM.lock();
+    q.iter()
+        .filter(|b| b.receiver_id == receiver_id && b.byte_offset > consumed)
+        .map(|b| b.byte_offset)
+        .min()
+}
+
 /// Pop the *earliest* deliverable `SCM_RIGHTS` batch for `receiver_id` — the
 /// deliverable batch with the LOWEST bound `byte_offset` (the stream-position
 /// nearest the reader), among those whose offset the reader has now reached
