@@ -2071,6 +2071,35 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 let _g = crate::arch::x86_64::smap::UserGuard::new();
                 core::slice::from_raw_parts(iov_ptr as *const [u64; 2], iov_len as usize).to_vec()
             };
+            // SCM_RIGHTS first-byte bind: capture the peer's recv-stream
+            // position BEFORE any data iovec of this frame is pushed, so a
+            // queued ancillary fd batch binds to the FIRST byte of the frame
+            // it accompanies — not its tail.  Per recvmsg(2) / unix(7) /
+            // POSIX.1-2017, the ancillary SCM_RIGHTS data is delivered with
+            // the message data it accompanies; the receiver's IPC reader
+            // parses a frame whose header announces N handles and requires
+            // those fds on the SAME recvmsg that first returns the frame's
+            // bytes.  Binding to the tail (post-push) withholds the fds until
+            // the reader has drained EVERY byte of the frame, which fails when
+            // the reader consumes the frame in pieces (e.g. reads the header,
+            // sees num_handles>=1, then expects the fds already present) —
+            // surfacing as a fatal "needs unreceived descriptors".  The
+            // deliver predicate is `recv_consumed >= byte_offset`
+            // (syscall/mod.rs scm_dequeue); with byte_offset = the frame's
+            // starting recv position, the batch becomes deliverable the
+            // instant the reader pops the frame's first byte.  Computed once
+            // here (under the unix TABLE lock, briefly) for unix sockets only.
+            let scm_bind_peer_id: u64 = if crate::syscall::is_unix_socket_fd(pid, fd) {
+                let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
+                crate::net::unix::get_peer(unix_id)
+            } else {
+                u64::MAX
+            };
+            let scm_bind_offset: u64 = if scm_bind_peer_id != u64::MAX {
+                crate::net::unix::enqueue_offset_for(scm_bind_peer_id)
+            } else {
+                0
+            };
             let mut total = 0usize;
             for iov in &iovecs_owned {
                 let base = iov[0] as *const u8;
@@ -2220,23 +2249,25 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             } else { Vec::new() }
                         };
                         if !sender_fds.is_empty() {
-                            let unix_id  = crate::syscall::get_unix_socket_id(pid, fd);
-                            let peer_id  = crate::net::unix::get_peer(unix_id);
+                            let peer_id = scm_bind_peer_id;
                             if peer_id != u64::MAX {
-                                // Bind the fd batch to the peer's current
-                                // recv-stream position.  Any data iovecs in
-                                // this same sendmsg were just pushed into the
-                                // peer's ring above, so capturing the offset
-                                // *after* those pushes attaches the fds at the
-                                // tail of this frame's bytes (offset == bytes
-                                // written so far).  For a control-only frame
-                                // (iov_len==0) nothing was pushed, so the
-                                // offset is the current tail and the batch is
-                                // immediately deliverable.  Per recvmsg(2) /
-                                // unix(7) / POSIX.1-2017 SCM_RIGHTS.
-                                let byte_offset =
-                                    crate::net::unix::enqueue_offset_for(peer_id);
-                                crate::syscall::scm_queue(peer_id, byte_offset, sender_fds);
+                                // Bind the fd batch to the FIRST byte of this
+                                // frame — the peer recv position captured BEFORE
+                                // the data-push loop above (scm_bind_offset).
+                                // This matches the kernel's first-byte-touch
+                                // delivery: the ancillary fds attach to the
+                                // stream position where the frame begins, so the
+                                // recvmsg that first returns this frame's bytes
+                                // also carries the cmsg (deliver predicate
+                                // recv_consumed >= byte_offset becomes true the
+                                // instant the reader pops the frame's first
+                                // byte).  For a control-only frame (iov_len==0)
+                                // nothing was pushed, so pre == post == the
+                                // current tail and the batch is immediately
+                                // deliverable — unchanged from the prior tail
+                                // bind.  Per recvmsg(2) / unix(7) /
+                                // POSIX.1-2017 SCM_RIGHTS.
+                                crate::syscall::scm_queue(peer_id, scm_bind_offset, sender_fds);
                                 // Wake any poller/epoll_wait parked on the peer
                                 // fd so it re-evaluates and discovers the new
                                 // readable (ancillary) message immediately,
@@ -4993,10 +5024,25 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // -1 with errno=ENODATA, and poisoned pthread's internal tkill() usage.
         // See arch-syscall.h: 192 lgetxattr .. 199 fremovexattr; 200 tkill; 201 time.
         192 | 193 | 194 | 195 | 196 | 197 | 198 | 199 => -61, // ENODATA
-        // 200: tkill(tid, sig) — minimal stub: forward to tgkill in the current pgrp.
-        // Most modern code uses tgkill (234); tkill exists for pre-2.5.75 compat.
-        // Returning ENOSYS is safe because glibc's pthread_kill fallback handles it.
-        200 => -38, // ENOSYS
+        // 200: tkill(tid, sig) — send signal `sig` to the single thread `tid`.
+        // tkill(2) addresses a thread directly by its kernel thread id (the
+        // obsolete-but-still-used predecessor of tgkill(2)).  musl's raise(3)
+        // and the abort(3) re-raise path issue tkill(self->tid, sig); returning
+        // ENOSYS here breaks that path (a crashing thread cannot re-raise to
+        // produce its default-action termination).  AstryxOS delivers signals
+        // at process granularity (one signal_state per process), so resolve the
+        // target thread's owning process and dispatch via the same path as
+        // tgkill(2) (signal::kill).  Per tkill(2): ESRCH if no such thread.
+        200 => {
+            let tid = arg1;
+            let sig = arg2 as u8;
+            let owner_pid = crate::proc::pid_for_tid(tid);
+            if owner_pid == 0 {
+                -3 // ESRCH — no thread carries this tid
+            } else {
+                crate::signal::kill(owner_pid, sig)
+            }
+        }
         // 201: time(tloc) — seconds since Epoch; optionally write to *tloc.
         // glibc calls this as a vDSO fallback; returning an error here makes
         // `time(NULL)` appear to fail with the kernel's errno, confusing callers.
