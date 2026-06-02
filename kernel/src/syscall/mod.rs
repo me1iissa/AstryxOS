@@ -460,10 +460,23 @@ struct ScmBatch {
 }
 static PENDING_SCM: Mutex<Vec<ScmBatch>> = Mutex::new(Vec::new());
 
-/// Queue an `SCM_RIGHTS` fd batch for delivery when `receiver_id` next
-/// drains its recv stream past `byte_offset` (see [`scm_dequeue`]).
-/// `byte_offset` is the receiver's absolute recv position at send time —
-/// for an ancillary-only frame this is the current stream tail.
+/// Queue an `SCM_RIGHTS` fd batch for delivery when `receiver_id`'s drained-byte
+/// count reaches `byte_offset` (see [`scm_dequeue`]: the deliver predicate is
+/// `consumed >= byte_offset`).  `byte_offset` is the stream position the reader
+/// must have reached to have *touched* (begun consuming) the frame the fds
+/// accompany — the first-byte-touch delivery contract (recvmsg(2) / unix(7) /
+/// POSIX.1-2017 §2.14: ancillary data is delivered with the recvmsg that returns
+/// the data it accompanies):
+///   * for a DATA-bearing frame starting at stream position T, the caller binds
+///     to `T + 1` — deliverable the instant the reader pops the frame's first
+///     byte (`consumed` advances T → T+1), and NOT before any byte of the frame
+///     is read;
+///   * for an ancillary-ONLY frame (no data bytes), the fds sit at the current
+///     stream tail T with nothing to touch, so the caller binds to `T` and the
+///     batch is immediately deliverable as a 0-byte readable message.
+///
+/// The single `>=` predicate covers both because the caller does the `+1`
+/// adjustment for data frames at enqueue time (see the sendmsg(2) SCM path).
 pub fn scm_queue(receiver_id: u64, byte_offset: u64, fds: Vec<crate::vfs::FileDescriptor>) {
     PENDING_SCM.lock().push(ScmBatch { receiver_id, byte_offset, fds });
 }
