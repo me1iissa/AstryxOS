@@ -365,6 +365,36 @@ pub fn lapic_eoi() {
     lapic_write(LAPIC_EOI, 0);
 }
 
+/// Re-arm the calling CPU's LAPIC periodic timer.
+///
+/// Rewrites the timer LVT (periodic | vector 32) and the initial-count
+/// register with the calibrated period. This is the standard recovery for a
+/// LAPIC periodic timer that has stopped delivering interrupts: under KVM a
+/// single vCPU subjected to a sustained framebuffer-MMIO VM-exit storm can
+/// have its LAPIC timer-interrupt delivery suppressed and **not** spontaneously
+/// resume once the storm ends (the periodic counter wedges). On a multi-core
+/// machine a sibling CPU keeps the global clock alive so this is invisible; on
+/// a single core there is no sibling, so the BSP idle path calls this to keep
+/// the timer — and therefore the scheduler tick and `TICK_COUNT` — alive.
+///
+/// Writing the initial-count register restarts the down-counter (Intel SDM
+/// Vol. 3A §11.5.4), so a wedged periodic timer begins firing again. The LVT
+/// rewrite is belt-and-suspenders in case the vector/mode bits were lost.
+/// Safe to call from any context: it touches only this CPU's LAPIC MMIO and
+/// the value written is the immutable boot-time calibration. No-op before
+/// calibration (period == 0) or if the APIC is disabled.
+pub fn rearm_timer() {
+    if !is_enabled() {
+        return;
+    }
+    let period = LAPIC_TIMER_PERIOD.load(Ordering::Acquire);
+    if period == 0 {
+        return;
+    }
+    lapic_write(LAPIC_TIMER_LVT, 0x20000 | 32); // periodic | vector 32
+    lapic_write(LAPIC_TIMER_INIT, period);
+}
+
 /// Check if APIC is enabled and active.
 pub fn is_enabled() -> bool {
     APIC_ENABLED.load(Ordering::Relaxed)

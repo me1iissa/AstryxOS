@@ -885,6 +885,12 @@ pub fn run() -> ! {
     total += 1;
     if test_clock_monotonic_rate_invariant() { passed += 1; }
 
+    // ── Test 80b2: get_ticks() advances on the TSC even if the LAPIC ISR
+    //              never fires (single-core LAPIC-suppression robustness) ──────
+
+    total += 1;
+    if test_get_ticks_tsc_floor_independent_of_isr() { passed += 1; }
+
     // ── Test 80c: vDSO / syscall CLOCK_REALTIME parity + futex deadline ───────
 
     total += 1;
@@ -19391,6 +19397,88 @@ fn test_clock_monotonic_rate_invariant() -> bool {
     }
 
     test_pass!("clock_gettime — monotonic-tick rate is wall-clock-locked");
+    true
+}
+
+// ── Test 80b2: get_ticks() is TSC-floored, independent of the LAPIC ISR ──────
+//
+// On a single core, a KVM framebuffer-MMIO VM-exit storm can suppress LAPIC
+// timer delivery indefinitely. If `get_ticks()` returned only the
+// ISR-published `TICK_COUNT`, every `while get_ticks() … { compose(); }` settle
+// loop would spin forever in Ring 0 (the init deadlock). The fix makes
+// `get_ticks()` return `max(TICK_COUNT, tsc_derived_floor)`, so it advances on
+// the invariant TSC (Intel SDM Vol. 3B §17.17) even when the ISR is starved.
+//
+// This test cannot un-wire the real LAPIC, so it asserts the two invariants the
+// fix guarantees regardless of ISR state:
+//   (1) get_ticks() is never below the TSC-derived floor (so it always makes
+//       progress as the TSC advances), and
+//   (2) get_ticks() advances by roughly the TSC delta across a pure busy-spin
+//       (no hlt, so even if the ISR were silent the value still moves).
+fn test_get_ticks_tsc_floor_independent_of_isr() -> bool {
+    test_header!("get_ticks — TSC-floored, advances without the timer ISR");
+
+    use core::sync::atomic::Ordering;
+    use crate::arch::x86_64::irq::{get_ticks, TSC_PER_TICK, TSC_AT_BOOT};
+
+    let rdtsc = || -> u64 {
+        let lo: u32; let hi: u32;
+        unsafe {
+            core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi,
+                             options(nomem, nostack));
+        }
+        ((hi as u64) << 32) | lo as u64
+    };
+
+    let tsc_per_tick = TSC_PER_TICK.load(Ordering::Acquire);
+    let tsc_at_boot  = TSC_AT_BOOT.load(Ordering::Acquire);
+    if tsc_per_tick == 0 {
+        test_fail!("get_ticks-tsc-floor",
+                   "TSC_PER_TICK not calibrated — apic::init must run first");
+        return false;
+    }
+
+    // Invariant (1): get_ticks() >= TSC floor at the same instant. Sample the
+    // TSC first; the floor computed from it can only be <= the value
+    // get_ticks() returns a moment later (time only moves forward).
+    let tsc_a   = rdtsc();
+    let floor_a = tsc_a.wrapping_sub(tsc_at_boot) / tsc_per_tick;
+    let ticks_a = get_ticks();
+    if ticks_a < floor_a {
+        test_fail!("get_ticks-tsc-floor",
+                   "get_ticks()={} below TSC floor={} — not TSC-floored",
+                   ticks_a, floor_a);
+        return false;
+    }
+
+    // Invariant (2): across a pure busy-spin (no hlt — the ISR may or may not
+    // fire, irrelevant), get_ticks() advances by ~the TSC delta. Spin a fixed
+    // number of TSC ticks and confirm the reported tick delta is in range.
+    const SPIN_TICKS: u64 = 20; // ~200 ms wall at TICK_HZ=100
+    let spin_tsc = tsc_per_tick.saturating_mul(SPIN_TICKS);
+    let tsc0   = rdtsc();
+    let ticks0 = get_ticks();
+    while rdtsc().wrapping_sub(tsc0) < spin_tsc {
+        core::hint::spin_loop();
+    }
+    let ticks1  = get_ticks();
+    let dticks  = ticks1.wrapping_sub(ticks0);
+
+    // Allow a generous band: the floor advances exactly SPIN_TICKS by
+    // construction, but the ISR (if alive) may push slightly further. Require
+    // at least SPIN_TICKS/2 (proves TSC-driven progress even with a silent
+    // ISR) and at most 4×SPIN_TICKS (catches a runaway clock).
+    if dticks < SPIN_TICKS / 2 || dticks > SPIN_TICKS * 4 {
+        test_fail!("get_ticks-tsc-floor",
+                   "get_ticks advanced {} over ~{} TSC-ticks of spin — \
+                    expected ~{} (TSC-driven progress check failed)",
+                   dticks, SPIN_TICKS, SPIN_TICKS);
+        return false;
+    }
+
+    test_println!("  floor_a={} ticks_a={} dticks={} (spin={})",
+                  floor_a, ticks_a, dticks, SPIN_TICKS);
+    test_pass!("get_ticks — TSC-floored, advances without the timer ISR");
     true
 }
 

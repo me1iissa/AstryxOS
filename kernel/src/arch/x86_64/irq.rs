@@ -213,8 +213,119 @@ pub fn read_scancode() -> Option<u8> {
 }
 
 /// Get the current tick count.
+///
+/// `TICK_COUNT` is normally advanced by the periodic LAPIC timer ISR
+/// (`timer_tick`). On a multi-core machine *any* online CPU's LAPIC ISR
+/// republishes the TSC-derived value, so the count stays wall-locked even
+/// if one CPU's LAPIC delivery is briefly suppressed. On a **single core**
+/// there is no second CPU to keep it fresh: under KVM a sustained burst of
+/// framebuffer MMIO VM-exits (the GUI compositor's `compose()` loop) can
+/// suppress LAPIC timer-interrupt delivery to the only CPU indefinitely.
+/// Any `while get_ticks() … { compose(); }` settle loop then spins forever
+/// in Ring 0 — and because the kernel is never preempted (the timer ISR
+/// deliberately never reschedules kernel-mode contexts, see
+/// `irq_timer_handler`), the lock-holder / kdb thread can never run. This
+/// is the single-core init deadlock.
+///
+/// Fix: derive a floor for the tick value directly from the TSC, using the
+/// same boot epoch and cycles-per-tick the ISR uses, and return the larger
+/// of the published count and that TSC-derived floor. The TSC is the
+/// invariant time source (Intel SDM Vol. 3B §17.17 — constant-rate TSC),
+/// so progress is guaranteed whenever the timer is delivered *or* the TSC
+/// advances, which is always. `max()` keeps the result monotone and never
+/// races the ISR backwards: when the ISR is firing it is already at or
+/// ahead of the floor, so SMP behaviour is unchanged.
 pub fn get_ticks() -> u64 {
-    TICK_COUNT.load(Ordering::Relaxed)
+    let published = TICK_COUNT.load(Ordering::Relaxed);
+
+    // Before calibration completes TSC_PER_TICK is 0; there is no usable
+    // TSC epoch yet, so fall back to the published count alone. (Boot code
+    // that runs before LAPIC calibration does not spin on get_ticks().)
+    let tsc_per_tick = TSC_PER_TICK.load(Ordering::Acquire);
+    if tsc_per_tick == 0 {
+        return published;
+    }
+
+    let tsc_at_boot = TSC_AT_BOOT.load(Ordering::Acquire);
+    let elapsed = rdtsc().wrapping_sub(tsc_at_boot);
+    let tsc_floor = elapsed / tsc_per_tick;
+
+    if tsc_floor > published { tsc_floor } else { published }
+}
+
+/// Number of times the BSP idle path detected a starved LAPIC timer and
+/// drove a scheduler tick from the TSC instead. Diagnostic-only; non-zero
+/// means the single-core LAPIC-suppression recovery path (see [`idle_tick`])
+/// fired.
+pub static TIMER_REARM_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Last TSC-floor tick at which the BSP idle path drove a software scheduler
+/// tick. Used to rate-limit the software tick to ~`TICK_HZ`.
+static LAST_SOFT_TICK: AtomicU64 = AtomicU64::new(0);
+
+/// Cooperative idle step for the BSP polling/soak loop.
+///
+/// Returns `true` if the LAPIC timer is healthy (the caller may safely `hlt`
+/// and rely on the next timer interrupt to wake it) and `false` if the timer
+/// is starved (the caller MUST NOT `hlt` — there is no wakeup source — and
+/// should spin-yield instead).
+///
+/// Background: under KVM a lone vCPU can have its LAPIC periodic timer
+/// suppressed by a sustained framebuffer-MMIO VM-exit storm (the GUI
+/// compositor) and **not** resume even after the storm ends. Rewriting the
+/// LAPIC initial-count does not reliably un-wedge KVM's injection, so a
+/// dead timer means: (a) `TICK_COUNT` would freeze — already handled by
+/// [`get_ticks`] reading a TSC floor; (b) the scheduler tick
+/// (`timer_tick_schedule`, which wakes timed-out sleepers and rotates the
+/// run queue) would never run; and (c) a blind `hlt` would sleep forever.
+///
+/// This routine makes the single core self-clocking. When the TSC shows the
+/// published `TICK_COUNT` has fallen `slack` ticks behind real time, it:
+///   1. attempts a LAPIC re-arm (cheap; helps if the timer is merely masked),
+///   2. drives `timer_tick_schedule()` directly from the idle thread once per
+///      elapsed tick (rate-limited via `LAST_SOFT_TICK`) so timed waits and
+///      run-queue rotation make progress on the live TSC clock, and
+///   3. reports the timer as unhealthy so the caller spin-yields instead of
+///      hlt-ing into a dead-timer sleep.
+///
+/// On a healthy timer — every SMP run, and single-core once the LAPIC is
+/// delivering — the published count tracks the TSC within ~1 tick, so this is
+/// a cheap comparison that returns `true` and the caller `hlt`s normally.
+/// `timer_tick_schedule()` is ISR-context-safe (it `try_lock`s `THREAD_TABLE`
+/// and only sets reschedule flags), so calling it from the idle thread is
+/// sound.
+///
+/// `slack` is in ticks (10 ms units at 100 Hz). ~5 (≈50 ms) tolerates the
+/// normal one-tick ISR publish lag without firing spuriously.
+pub fn idle_tick(slack: u64) -> bool {
+    let tsc_per_tick = TSC_PER_TICK.load(Ordering::Acquire);
+    if tsc_per_tick == 0 {
+        return true; // pre-calibration: nothing to drive yet, hlt is fine
+    }
+    let published = TICK_COUNT.load(Ordering::Relaxed);
+    let tsc_at_boot = TSC_AT_BOOT.load(Ordering::Acquire);
+    let elapsed = rdtsc().wrapping_sub(tsc_at_boot);
+    let tsc_floor = elapsed / tsc_per_tick;
+
+    // Timer healthy: the ISR is keeping TICK_COUNT within `slack` of the TSC.
+    if tsc_floor <= published.wrapping_add(slack) {
+        return true;
+    }
+
+    // Timer starved. Try to revive it (harmless if it's just masked), then
+    // drive a software scheduler tick from the TSC so the system keeps
+    // running on the single core regardless of LAPIC delivery.
+    super::apic::rearm_timer();
+
+    // Rate-limit the software tick to ~one per real elapsed tick so we don't
+    // burn the run queue's time-slice accounting faster than wall time.
+    let last = LAST_SOFT_TICK.load(Ordering::Relaxed);
+    if tsc_floor > last {
+        LAST_SOFT_TICK.store(tsc_floor, Ordering::Relaxed);
+        TIMER_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
+        crate::sched::timer_tick_schedule();
+    }
+    false
 }
 
 // ============================================================
