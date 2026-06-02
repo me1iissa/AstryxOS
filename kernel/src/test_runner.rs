@@ -45254,7 +45254,11 @@ fn test_288_scm_memfd_inode_lifecycle() -> bool {
                 }
                 slot
             }
-            None => { test_fail!("scm_memfd", "process gone"); return false; }
+            None => {
+                test_fail!("scm_memfd", "process gone");
+                crate::vfs::unpin_inode(mnt, ino); // balance the pin taken above
+                return false;
+            }
         }
     };
 
