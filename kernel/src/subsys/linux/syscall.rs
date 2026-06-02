@@ -2100,36 +2100,25 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             } else {
                 0
             };
+            // Whether this frame carries any data bytes — known from the iovec
+            // lengths BEFORE the push, so the SCM batch can be queued ahead of
+            // the data it accompanies (see the ordering note below).  A frame
+            // with at least one non-empty iovec is data-bearing.
+            let frame_has_data = iovecs_owned.iter().any(|iov| iov[1] != 0);
             let mut total = 0usize;
-            for iov in &iovecs_owned {
-                let base = iov[0] as *const u8;
-                let slen = iov[1] as usize;
-                if slen == 0 { continue; }
-                // SMAP bracket — slice materialises against the user iov
-                // buffer; copy into a kernel Vec immediately so the net
-                // layer's send (which may take locks / queue) runs
-                // outside AC=1.
-                let data_owned: alloc::vec::Vec<u8> = {
-                    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
-                    unsafe { core::slice::from_raw_parts(base, slen) }.to_vec()
-                };
-                let data: &[u8] = &data_owned;
-                if crate::syscall::is_unix_socket_fd(pid, fd) {
-                    let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
-                    match crate::net::unix::write(unix_id, data) {
-                        n if n >= 0 => total += n as usize,
-                        e => return e,
-                    }
-                } else {
-                    if !crate::syscall::is_socket_fd(pid, fd) { return -9; }
-                    let socket_id = crate::syscall::get_socket_id(pid, fd);
-                    match crate::net::socket::socket_send(socket_id, data) {
-                        Ok(n) => total += n,
-                        Err("EPIPE") => return -32,
-                        Err(_) => return -104,
-                    }
-                }
-            }
+            // ORDERING (race fix): the SCM_RIGHTS batch is queued BEFORE the data
+            // bytes are pushed into the peer's recv ring.  The data push and the
+            // batch enqueue are separate critical sections (net::unix TABLE lock
+            // vs PENDING_SCM lock); if the bytes became readable first, a peer
+            // recvmsg(2) could drain the frame's bytes and compute its read cap
+            // (scm_next_batch_offset) BEFORE the batch was visible, deliver no
+            // fds, and strand the batch past the reader's position — the
+            // intermittent "needs unreceived descriptors" on the cross-process
+            // channel.  Queuing the batch first (bound to the pre-push offset)
+            // guarantees the batch is in PENDING_SCM before any of its
+            // accompanying bytes can be read, so the reader's cap always stops at
+            // it.  Per recvmsg(2) / unix(7) / POSIX.1-2017 §2.14, the ancillary
+            // data is delivered with the data it accompanies.
             // Handle SCM_RIGHTS in msg_control (Unix sockets only).
             // msghdr layout (x86_64): msg_control at byte-offset 32 (u64 index 4),
             // msg_controllen at byte-offset 40 (u64 index 5).
@@ -2269,14 +2258,16 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                 // frame to T+1 — deliverable the instant the
                                 // first byte is popped, and NOT before any byte
                                 // of the frame is read.  A control-only frame
-                                // (no data pushed, `total == 0`) carries no
-                                // bytes to touch; it sits at the stream tail and
-                                // must be immediately readable as a 0-byte
-                                // ancillary message, so it binds to T (==tail)
-                                // and the predicate fires at once.  This keeps
-                                // the dequeue predicate uniform (`>=`) while
-                                // honouring both cases.
-                                let bind_offset = if total > 0 {
+                                // (no data bytes) carries no bytes to touch; it
+                                // sits at the stream tail and must be immediately
+                                // readable as a 0-byte ancillary message, so it
+                                // binds to T (==tail) and the predicate fires at
+                                // once.  This keeps the dequeue predicate uniform
+                                // (`>=`) while honouring both cases.  `frame_has_data`
+                                // is computed from the iovec lengths above (the
+                                // batch is queued before the push, so `total` is
+                                // not yet known here).
+                                let bind_offset = if frame_has_data {
                                     scm_bind_offset + 1
                                 } else {
                                     scm_bind_offset
@@ -2294,6 +2285,40 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                     crate::ipc::waitlist::PollBellSource::UnixWrite);
                             }
                         }
+                    }
+                }
+            }
+            // Push the frame's data bytes AFTER the SCM_RIGHTS batch is queued
+            // (see the ordering note above): the batch is now in PENDING_SCM, so
+            // the instant these bytes become readable a peer recvmsg(2) will cap
+            // its read at the batch and deliver it.  `total` accumulates the
+            // bytes accepted by the transport for the syscall return value.
+            for iov in &iovecs_owned {
+                let base = iov[0] as *const u8;
+                let slen = iov[1] as usize;
+                if slen == 0 { continue; }
+                // SMAP bracket — slice materialises against the user iov
+                // buffer; copy into a kernel Vec immediately so the net
+                // layer's send (which may take locks / queue) runs
+                // outside AC=1.
+                let data_owned: alloc::vec::Vec<u8> = {
+                    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+                    unsafe { core::slice::from_raw_parts(base, slen) }.to_vec()
+                };
+                let data: &[u8] = &data_owned;
+                if crate::syscall::is_unix_socket_fd(pid, fd) {
+                    let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
+                    match crate::net::unix::write(unix_id, data) {
+                        n if n >= 0 => total += n as usize,
+                        e => return e,
+                    }
+                } else {
+                    if !crate::syscall::is_socket_fd(pid, fd) { return -9; }
+                    let socket_id = crate::syscall::get_socket_id(pid, fd);
+                    match crate::net::socket::socket_send(socket_id, data) {
+                        Ok(n) => total += n,
+                        Err("EPIPE") => return -32,
+                        Err(_) => return -104,
                     }
                 }
             }
