@@ -1363,6 +1363,12 @@ pub fn run() -> ! {
     total += 1;
     if test_syscall_creat() { passed += 1; }
 
+    // ── Test 145b: out.png golden path — O_WRONLY|O_CREAT|O_TRUNC|O_LARGEFILE
+    //              create + 26870-byte write + read-back byte-exact ──────────
+
+    total += 1;
+    if test_out_png_create_write_readback() { passed += 1; }
+
     // ── Test 146: getdents(78) iterates directory entries ─────────────────
 
     total += 1;
@@ -27389,6 +27395,187 @@ fn test_syscall_creat() -> bool {
     // Clean up.
     let _ = crate::vfs::remove("/tmp/test_creat_file");
     test_pass!("syscall creat(85)");
+    true
+}
+
+/// Test the LITERAL last step of the headless-Firefox screenshot pipeline:
+/// the `out.png` create + write + read-back, on the filesystem that actually
+/// backs `/tmp/out.png`.
+///
+/// The headless `firefox --screenshot /tmp/out.png` driver finishes by emitting
+/// the encoded PNG with the golden sequence
+///
+///     open("/tmp/out.png", O_WRONLY|O_CREAT|O_TRUNC|O_LARGEFILE) = 82
+///     write(82, "\x89PNG\r\n\x1a\n...", 26870)                   = 26870
+///     close(82)
+///
+/// `/tmp` is a plain directory inside the root ramfs (`vfs::init` does
+/// `mkdir("/tmp")`; there is no separate `/tmp` mount at boot), so this is the
+/// VFS/ramfs write path — not ext2 and not a runtime tmpfs mount.
+///
+/// This test reproduces that exact sequence and locks three properties POSIX
+/// requires of it:
+///
+///  * `open(2)` (IEEE Std 1003.1-2017) — `O_LARGEFILE` is a no-op on a 64-bit
+///    kernel and MUST be accepted-and-ignored, not rejected with EINVAL.  We
+///    pass the full golden flag word `O_WRONLY|O_CREAT|O_TRUNC|O_LARGEFILE`
+///    (0x8241) and require a successful create.
+///  * `write(2)` — the single 26870-byte write MUST NOT short-write; the return
+///    value equals the byte count (matching the golden `= 26870`).
+///  * Persistence — a fresh `open(O_RDONLY)` + read loop MUST return the exact
+///    bytes written, and `stat(2)` MUST report `st_size == 26870`.
+///
+/// A regression on any of these (rejected O_LARGEFILE → no file; a short write;
+/// an i_size/data desync that yields an empty or truncated file on read-back)
+/// would leave Firefox unable to emit the screenshot even after a fully
+/// faithful render → libpng-encode chain.
+fn test_out_png_create_write_readback() -> bool {
+    test_header!("out.png golden create+write+readback");
+    let pid = crate::proc::current_pid();
+
+    // Use a dedicated path on the SAME filesystem that backs the real
+    // /tmp/out.png (root ramfs) so this exercises the production write path.
+    const PATH: &str = "/tmp/out_png_roundtrip_test.png";
+    const PATH_C: &[u8] = b"/tmp/out_png_roundtrip_test.png\0";
+    const LEN: usize = 26870; // 7 × 4 KiB blocks − 778; all-direct on a block FS.
+
+    // Golden open flags: O_WRONLY(0x1) | O_CREAT(0x40) | O_TRUNC(0x200)
+    // | O_LARGEFILE(0x8000) = 0x8241.  O_LARGEFILE must be ignored, not
+    // rejected, on a 64-bit kernel (open(2)).
+    const O_WRONLY: u32 = 0x1;
+    const O_CREAT: u32 = 0x40;
+    const O_TRUNC: u32 = 0x200;
+    const O_LARGEFILE: u32 = 0x8000;
+    const WR_FLAGS: u32 = O_WRONLY | O_CREAT | O_TRUNC | O_LARGEFILE;
+
+    // Remove any stale copy from a prior run so O_CREAT genuinely creates a
+    // fresh inode (the case the screenshot driver always hits).
+    let _ = crate::vfs::remove(PATH);
+
+    // Build a PNG-shaped 26870-byte buffer: the 8-byte PNG signature
+    // (\x89 P N G \r \n \x1a \n — per the PNG spec, ISO/IEC 15948) followed by
+    // a deterministic byte pattern so the read-back comparison is exact.
+    let mut src = alloc::vec::Vec::with_capacity(LEN);
+    const PNG_SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    src.extend_from_slice(&PNG_SIG);
+    for i in PNG_SIG.len()..LEN {
+        // Mix the index across the full byte range; avoids long zero runs so a
+        // partial / zero-filled write-back would diverge immediately.
+        src.push(((i.wrapping_mul(31)).wrapping_add(i >> 8) & 0xff) as u8);
+    }
+    if src.len() != LEN {
+        test_fail!("out.png", "source buffer len {} != {}", src.len(), LEN);
+        return false;
+    }
+
+    // ── open(O_WRONLY|O_CREAT|O_TRUNC|O_LARGEFILE) ────────────────────────
+    // Drive it through the real Linux open syscall (nr 2) so the full
+    // syscall-layer flag handling (including O_LARGEFILE) is exercised, exactly
+    // as Firefox reaches it.  dispatch(2, path, flags, mode, ...).
+    let wfd = {
+        let r = dispatch(2, PATH_C.as_ptr() as u64, WR_FLAGS as u64, 0o666, 0, 0, 0);
+        if r < 0 {
+            test_fail!(
+                "out.png",
+                "open(O_WRONLY|O_CREAT|O_TRUNC|O_LARGEFILE)=0x{:x} rejected: {} \
+                 (O_LARGEFILE must be ignored on a 64-bit kernel per open(2))",
+                WR_FLAGS, r);
+            return false;
+        }
+        r as usize
+    };
+    test_println!("  open(\"{}\", 0x{:x}) = fd {} ✓ (O_LARGEFILE accepted-and-ignored)",
+                  PATH, WR_FLAGS, wfd);
+
+    // ── write(fd, src, 26870) — must be a full, non-short write ───────────
+    let n = match crate::vfs::fd_write(pid, wfd, src.as_ptr(), src.len()) {
+        Ok(n) => n,
+        Err(e) => {
+            test_fail!("out.png", "write failed: {:?}", e);
+            let _ = crate::vfs::close(pid, wfd);
+            return false;
+        }
+    };
+    if n != LEN {
+        test_fail!("out.png", "short write: wrote {} of {} bytes", n, LEN);
+        let _ = crate::vfs::close(pid, wfd);
+        return false;
+    }
+    test_println!("  write(fd {}, .., {}) = {} ✓ (matches golden = 26870)", wfd, LEN, n);
+
+    let _ = crate::vfs::close(pid, wfd);
+
+    // ── stat — i_size must reflect the full 26870 bytes ───────────────────
+    match crate::vfs::stat(PATH) {
+        Ok(st) if st.size as usize == LEN => {
+            test_println!("  stat: size={} ✓ (i_size persisted)", st.size);
+        }
+        Ok(st) => {
+            test_fail!("out.png", "stat size {} != {} (i_size not persisted)", st.size, LEN);
+            let _ = crate::vfs::remove(PATH);
+            return false;
+        }
+        Err(e) => {
+            test_fail!("out.png", "stat after write failed: {:?}", e);
+            let _ = crate::vfs::remove(PATH);
+            return false;
+        }
+    }
+
+    // ── reopen O_RDONLY + read-back loop — bytes must be exact ────────────
+    let rfd = match crate::vfs::open(pid, PATH, 0 /* O_RDONLY */) {
+        Ok(fd) => fd,
+        Err(e) => {
+            test_fail!("out.png", "reopen O_RDONLY failed: {:?}", e);
+            let _ = crate::vfs::remove(PATH);
+            return false;
+        }
+    };
+
+    let mut got = alloc::vec::Vec::with_capacity(LEN);
+    let mut chunk = [0u8; 4096];
+    loop {
+        let r = match crate::vfs::fd_read(pid, rfd, chunk.as_mut_ptr(), chunk.len()) {
+            Ok(r) => r,
+            Err(e) => {
+                test_fail!("out.png", "read-back failed at offset {}: {:?}", got.len(), e);
+                let _ = crate::vfs::close(pid, rfd);
+                let _ = crate::vfs::remove(PATH);
+                return false;
+            }
+        };
+        if r == 0 {
+            break; // EOF
+        }
+        got.extend_from_slice(&chunk[..r]);
+        if got.len() > LEN {
+            test_fail!("out.png", "read-back returned more than {} bytes (got {})", LEN, got.len());
+            let _ = crate::vfs::close(pid, rfd);
+            let _ = crate::vfs::remove(PATH);
+            return false;
+        }
+    }
+    let _ = crate::vfs::close(pid, rfd);
+
+    // Length first, then byte-exact content.
+    if got.len() != LEN {
+        test_fail!("out.png", "read-back length {} != {} (truncated/empty file)", got.len(), LEN);
+        let _ = crate::vfs::remove(PATH);
+        return false;
+    }
+    if got != src {
+        // Find the first divergent offset for a useful failure message.
+        let mismatch = got.iter().zip(src.iter()).position(|(a, b)| a != b).unwrap_or(LEN);
+        test_fail!("out.png", "byte mismatch at offset {}: got 0x{:02x} want 0x{:02x}",
+                   mismatch, got.get(mismatch).copied().unwrap_or(0),
+                   src.get(mismatch).copied().unwrap_or(0));
+        let _ = crate::vfs::remove(PATH);
+        return false;
+    }
+    test_println!("  read-back {} bytes byte-exact (PNG sig + pattern) ✓", got.len());
+
+    let _ = crate::vfs::remove(PATH);
+    test_pass!("out.png golden create+write+readback");
     true
 }
 
