@@ -2492,6 +2492,17 @@ pub fn run() -> ! {
     total += 1;
     if test_280_scm_control_only_readiness() { passed += 1; }
 
+    // ── Test 281: non-blocking socket recv reports EAGAIN, not 0, on an
+    // empty queue (and 0 only on orderly EOF) ───────────────────────────
+    // recvmsg(2)/recv(2) on a non-blocking AF_INET socket with no datagram
+    // pending must surface "would block" as -EAGAIN, never as a 0-byte
+    // return: a 0 falsely signals EOF and drives a polled event loop into a
+    // busy re-read spin (the FF content-process screenshot-IPC gate).  An
+    // orderly read-shutdown must still return 0.  Refs: recvmsg(2), recv(2),
+    // IEEE 1003.1 §recv, POSIX.1-2017 §2.10.6.
+    total += 1;
+    if test_281_socket_recv_eagain_vs_eof() { passed += 1; }
+
     // ── Test 283: stack-prov main-stack TOP-window argv-writer capture ──
     // GATE-A blind-spot closure (2026-05-30).  Only built when the
     // `stack-prov` diagnostic feature is on (CI smoke does not enable it);
@@ -44473,5 +44484,129 @@ fn test_280_scm_control_only_readiness() -> bool {
     unix::close(a);
     unix::close(b);
     test_pass!("control-only SCM_RIGHTS readiness + byte-offset binding (Test 280)");
+    true
+}
+
+// ── Test 281: non-blocking socket recv — EAGAIN on empty queue, 0 only on EOF
+//
+// recvmsg(2)/recv(2) on a non-blocking AF_INET socket distinguishes three
+// outcomes that the syscall layer must translate correctly:
+//
+//   * data pending      → return the byte count
+//   * empty, peer live  → -1 / EAGAIN  (would-block)
+//   * orderly shutdown  →  0           (EOF)
+//
+// The bug this guards: the recvmsg/read arms previously collapsed "empty,
+// peer live" into a 0-byte return (the same value as EOF).  A polled IPC
+// reactor reads the spurious 0 as a readable edge and re-issues recvmsg in a
+// tight loop — the exact busy-spin observed on the Firefox content-process
+// screenshot-IPC channel, where one process pegged ~680k recvmsg/s while the
+// peer it should have serviced stayed frozen.
+//
+// This drives `socket_recv_status` (the EAGAIN-correct primitive the syscall
+// arms now call) directly, asserting the WouldBlock / Data / Eof mapping.
+//
+// Refs: recvmsg(2), recv(2), IEEE 1003.1 §recv ("a return value of 0
+// indicates the peer has performed an orderly shutdown"), POSIX.1-2017
+// §2.10.6 (Socket Receive Queue).
+fn test_281_socket_recv_eagain_vs_eof() -> bool {
+    use crate::net::socket::{self, RecvOutcome, SocketType};
+    test_header!("non-blocking socket recv: EAGAIN on empty, 0 only on EOF (Test 281)");
+
+    const PORT: u16 = 0xB281; // arbitrary unused test port
+
+    let sid = socket::socket_create(SocketType::Udp);
+    if sid == u64::MAX {
+        test_fail!("recv_eagain", "socket_create returned MAX");
+        return false;
+    }
+    if let Err(e) = socket::socket_bind(sid, PORT) {
+        test_fail!("recv_eagain", "socket_bind failed: {}", e);
+        return false;
+    }
+
+    // (1) Empty queue, socket live → MUST be WouldBlock (the storm-fix case).
+    match socket::socket_recv_status(sid) {
+        Ok(RecvOutcome::WouldBlock) => {
+            test_println!("  empty bound UDP socket → WouldBlock ✓");
+        }
+        other => {
+            let tag = match other {
+                Ok(RecvOutcome::Data(d)) => {
+                    test_fail!("recv_eagain",
+                        "empty socket returned Data({} bytes), expected WouldBlock",
+                        d.len());
+                    return false;
+                }
+                Ok(RecvOutcome::Eof) => "Eof",
+                Ok(RecvOutcome::WouldBlock) => unreachable!(),
+                Err(_) => "Err",
+            };
+            test_fail!("recv_eagain",
+                "empty socket returned {}, expected WouldBlock (EAGAIN)", tag);
+            return false;
+        }
+    }
+
+    // (2) Inject a datagram via the wire path → MUST be Data with the bytes.
+    //     checksum=0 skips verification (RFC 1071 identity), so the datagram
+    //     is delivered straight to the bound port's queue.
+    const PAYLOAD: &[u8] = b"px";
+    {
+        let mut pkt = alloc::vec::Vec::with_capacity(8 + PAYLOAD.len());
+        pkt.extend_from_slice(&0x1234u16.to_be_bytes());          // src_port
+        pkt.extend_from_slice(&PORT.to_be_bytes());               // dst_port
+        pkt.extend_from_slice(&((8 + PAYLOAD.len()) as u16).to_be_bytes()); // length
+        pkt.extend_from_slice(&0u16.to_be_bytes());               // checksum=0 → skip
+        pkt.extend_from_slice(PAYLOAD);
+        crate::net::udp::handle_udp([10, 0, 2, 2], [10, 0, 2, 15], &pkt);
+    }
+    match socket::socket_recv_status(sid) {
+        Ok(RecvOutcome::Data(d)) if d == PAYLOAD => {
+            test_println!("  injected datagram → Data({} bytes) ✓", d.len());
+        }
+        Ok(RecvOutcome::Data(d)) => {
+            test_fail!("recv_eagain",
+                "datagram recv returned {} bytes, expected {}", d.len(), PAYLOAD.len());
+            return false;
+        }
+        _ => {
+            test_fail!("recv_eagain", "datagram recv did not return Data");
+            return false;
+        }
+    }
+
+    // (3) After draining, the queue is empty again → WouldBlock, NOT Eof.
+    //     This is the regression's heart: an empty-but-live socket must never
+    //     read as EOF.
+    match socket::socket_recv_status(sid) {
+        Ok(RecvOutcome::WouldBlock) => {
+            test_println!("  drained socket → WouldBlock (not EOF) ✓");
+        }
+        _ => {
+            test_fail!("recv_eagain", "drained live socket did not return WouldBlock");
+            return false;
+        }
+    }
+
+    // (4) shutdown(SHUT_RD) → orderly EOF → MUST be Eof (0-byte return).
+    const SHUT_RD: i32 = 0;
+    if socket::socket_shutdown(sid, SHUT_RD) != 0 {
+        test_fail!("recv_eagain", "socket_shutdown(SHUT_RD) failed");
+        return false;
+    }
+    match socket::socket_recv_status(sid) {
+        Ok(RecvOutcome::Eof) => {
+            test_println!("  after SHUT_RD → Eof ✓");
+        }
+        _ => {
+            test_fail!("recv_eagain", "post-SHUT_RD recv did not return Eof");
+            return false;
+        }
+    }
+
+    // Cleanup: release the bound port so a re-run does not collide.
+    socket::socket_close(sid);
+    test_pass!("non-blocking socket recv: EAGAIN on empty, 0 only on EOF (Test 281)");
     true
 }

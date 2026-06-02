@@ -418,8 +418,12 @@ pub fn dispatch(
             let socket_id = arg1;
             let buf_ptr = arg2 as *mut u8;
             let buf_len = arg3 as usize;
-            match crate::net::socket::socket_recv(socket_id) {
-                Ok(data) => {
+            // Distinguish "would block" (-EAGAIN) from "orderly EOF" (0) the
+            // same way the Linux personality does — an empty receive on a
+            // live socket must not read as a 0-byte EOF, or a polled reader
+            // busy-loops.  See recv(2) / IEEE 1003.1 §recv.
+            match crate::net::socket::socket_recv_status(socket_id) {
+                Ok(crate::net::socket::RecvOutcome::Data(data)) => {
                     let copy_len = data.len().min(buf_len);
                     if copy_len > 0 {
                         unsafe {
@@ -428,6 +432,8 @@ pub fn dispatch(
                     }
                     copy_len as i64
                 }
+                Ok(crate::net::socket::RecvOutcome::Eof) => 0,
+                Ok(crate::net::socket::RecvOutcome::WouldBlock) => -11, // EAGAIN
                 Err(_) => -11, // EAGAIN
             }
         }
