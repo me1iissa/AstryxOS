@@ -1327,15 +1327,41 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 gui::input::pump_input();
                 crate::net::poll();
                 crate::x11::poll();
+
+                let now = arch::x86_64::irq::get_ticks();
+                let elapsed = now.wrapping_sub(t_launch);
+
+                // Stream the rendered screenshot the moment it lands — placed
+                // HERE, immediately after net/x11 poll and BEFORE poll_output()
+                // / compose(), because those later calls take the TERMINAL and
+                // THREAD_TABLE locks and can be starved during a large
+                // Dead-thread drain at Firefox exit (271 threads observed).
+                // net::poll() above keeps kdb alive even then, so probing here
+                // guarantees the emit fires before the loop body can block.
+                // stat() reads no content; emit_out_png() returns false until
+                // the file is a COMPLETE PNG (signature + IEND), so a probe
+                // that catches the write mid-flight retries next tick.
+                if !out_png_emitted && elapsed.wrapping_sub(last_png_probe_tick) >= 200 {
+                    last_png_probe_tick = elapsed;
+                    if let Ok(st) = crate::vfs::stat("/tmp/out.png") {
+                        if st.size > 0 {
+                            serial_println!(
+                                "[FFTEST] /tmp/out.png present ({} bytes) — streaming",
+                                st.size
+                            );
+                            if ff_out_png::emit_out_png() {
+                                out_png_emitted = true;
+                            }
+                        }
+                    }
+                }
+
                 crate::gui::terminal::poll_output();
                 // Drive the compositor via the ISR-set tick flag (≈50 Hz).
                 // The timer ISR sets COMPOSITOR_TICK_DUE every 2 published
                 // ticks; compose() drains it and renders a frame.  Replaces
                 // the unreliable `ticks % 3` check (see gui/compositor.rs).
                 gui::compositor::compose();
-
-                let now = arch::x86_64::irq::get_ticks();
-                let elapsed = now.wrapping_sub(t_launch);
 
                 // Log a heartbeat every 1000 ticks (~10s).  Use try_lock so a
                 // contended/leaked THREAD_TABLE never wedges CPU0; the BSP must
@@ -1370,28 +1396,6 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                         None => {
                             serial_println!("[FFTEST] tick={} sc={} pf={} THREAD_TABLE busy, skipping",
                                 elapsed, sc, pf);
-                        }
-                    }
-                }
-
-                // Stream the rendered screenshot the moment it lands, before
-                // (and independent of) Firefox-exit detection.  Probe at most
-                // every ~200 ticks via stat() (no content read) so this adds
-                // negligible cost to the hot poll loop; emit exactly once.
-                if !out_png_emitted && elapsed.wrapping_sub(last_png_probe_tick) >= 200 {
-                    last_png_probe_tick = elapsed;
-                    if let Ok(st) = crate::vfs::stat("/tmp/out.png") {
-                        if st.size > 0 {
-                            serial_println!(
-                                "[FFTEST] /tmp/out.png present ({} bytes) — streaming",
-                                st.size
-                            );
-                            // emit_out_png() returns false if the file is not yet
-                            // a COMPLETE PNG (still mid-write); in that case leave
-                            // out_png_emitted false so the next probe retries.
-                            if ff_out_png::emit_out_png() {
-                                out_png_emitted = true;
-                            }
                         }
                     }
                 }
