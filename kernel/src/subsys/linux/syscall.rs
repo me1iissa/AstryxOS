@@ -2158,7 +2158,42 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                         core::ptr::read_unaligned(fd_arr.add(i))
                                     } as usize;
                                     if fd_n < p.file_descriptors.len() {
-                                        p.file_descriptors[fd_n].clone()
+                                        let cloned = p.file_descriptors[fd_n].clone();
+                                        // SCM_RIGHTS duplicates the open file
+                                        // description into the receiver — the
+                                        // passed fd "refers to the same open
+                                        // file description as the corresponding
+                                        // descriptor in the sending process"
+                                        // (unix(7) SCM_RIGHTS, POSIX.1-2017
+                                        // §2.14).  Bump the underlying object's
+                                        // refcount so that when the sender later
+                                        // close(2)s its copy, the shared socket
+                                        // /pipe is NOT torn down and the peer is
+                                        // not spuriously hung up (CWE-416 — the
+                                        // close-resets-slot/shuts-peer path).
+                                        // Mirrors the dup(2)/fork(2) inc_ref.
+                                        if let Some(ref fdesc) = cloned {
+                                            if fdesc.file_type
+                                                == crate::vfs::FileType::Socket
+                                                && fdesc.flags
+                                                    & crate::syscall::UNIX_SOCKET_FLAG != 0
+                                            {
+                                                crate::net::unix::inc_ref(fdesc.inode);
+                                            } else if fdesc.file_type
+                                                == crate::vfs::FileType::Pipe
+                                                && fdesc.mount_idx == usize::MAX
+                                                && fdesc.flags & 0x8000_0000 != 0
+                                            {
+                                                if fdesc.flags & 1 == 1 {
+                                                    crate::ipc::pipe::pipe_add_writer(
+                                                        fdesc.inode);
+                                                } else {
+                                                    crate::ipc::pipe::pipe_add_reader(
+                                                        fdesc.inode);
+                                                }
+                                            }
+                                        }
+                                        cloned
                                     } else { None }
                                 }).collect()
                             } else { Vec::new() }
@@ -2167,7 +2202,30 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             let unix_id  = crate::syscall::get_unix_socket_id(pid, fd);
                             let peer_id  = crate::net::unix::get_peer(unix_id);
                             if peer_id != u64::MAX {
-                                crate::syscall::scm_queue(peer_id, sender_fds);
+                                // Bind the fd batch to the peer's current
+                                // recv-stream position.  Any data iovecs in
+                                // this same sendmsg were just pushed into the
+                                // peer's ring above, so capturing the offset
+                                // *after* those pushes attaches the fds at the
+                                // tail of this frame's bytes (offset == bytes
+                                // written so far).  For a control-only frame
+                                // (iov_len==0) nothing was pushed, so the
+                                // offset is the current tail and the batch is
+                                // immediately deliverable.  Per recvmsg(2) /
+                                // unix(7) / POSIX.1-2017 SCM_RIGHTS.
+                                let byte_offset =
+                                    crate::net::unix::enqueue_offset_for(peer_id);
+                                crate::syscall::scm_queue(peer_id, byte_offset, sender_fds);
+                                // Wake any poller/epoll_wait parked on the peer
+                                // fd so it re-evaluates and discovers the new
+                                // readable (ancillary) message immediately,
+                                // rather than waiting for the resync floor.
+                                // PENDING_SCM and the unix TABLE lock are both
+                                // already released here (scm_queue takes only
+                                // PENDING_SCM, briefly), so this honours the
+                                // drop-the-lock-before-ring discipline.
+                                crate::ipc::waitlist::ring_poll_bell_for(
+                                    crate::ipc::waitlist::PollBellSource::UnixWrite);
                             }
                         }
                     }
@@ -2224,12 +2282,33 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             }
                             n as i64
                         }
+                        // EAGAIN on an empty data ring is *not* the final
+                        // answer when a deliverable SCM_RIGHTS batch is
+                        // queued: a control-only ancillary frame (iov_len==0)
+                        // is a readable message that recvmsg(2) must return
+                        // with 0 data bytes and the cmsg attached (recvmsg(2),
+                        // unix(7), POSIX.1-2017 SCM_RIGHTS).  Promote to a
+                        // 0-byte success so the SCM-delivery block below runs;
+                        // msg_flags clears (no MSG_TRUNC for an empty read).
+                        Err(-11) if crate::syscall::has_scm_deliverable(
+                            unix_id, crate::net::unix::recv_consumed(unix_id)) =>
+                        {
+                            unsafe {
+                                let flags_ptr = (arg2 + 48) as *mut u32;
+                                core::ptr::write_unaligned(flags_ptr, 0u32);
+                            }
+                            0i64
+                        }
                         Err(e) => e,
                     }
                 };
                 // Deliver pending SCM_RIGHTS fds into receiver's fd table.
+                // Bound the batch to the reader's now-current stream position
+                // (recv_consumed) so an earlier data-only frame's reader does
+                // not pick up a later frame's fds.
                 if bytes_read >= 0 {
-                    if let Some(scm_fds) = crate::syscall::scm_dequeue(unix_id) {
+                    let consumed = crate::net::unix::recv_consumed(unix_id);
+                    if let Some(scm_fds) = crate::syscall::scm_dequeue(unix_id, consumed) {
                         // Allocate fds in the receiver's process.
                         let new_fd_nums: Vec<i32> = {
                             let mut procs = crate::proc::PROCESS_TABLE.lock();
@@ -5195,7 +5274,13 @@ fn sys_select_linux(
                 || crate::ipc::pipe::pipe_writer_closed(pid_id)
         } else if crate::syscall::is_unix_socket_fd(pid, fd) {
             let uid = crate::syscall::get_unix_socket_id(pid, fd);
-            crate::net::unix::has_data(uid) || crate::net::unix::has_pending(uid)
+            // A reached SCM_RIGHTS batch (control-only fd handoff, iov_len==0)
+            // is a readable message per recvmsg(2) / unix(7) / POSIX.1-2017,
+            // even with zero data bytes — surface it as select(2) readable.
+            crate::net::unix::has_data(uid)
+                || crate::net::unix::has_pending(uid)
+                || crate::syscall::has_scm_deliverable(
+                    uid, crate::net::unix::recv_consumed(uid))
         } else if crate::syscall::is_socket_fd(pid, fd) {
             crate::net::socket::socket_has_data(crate::syscall::get_socket_id(pid, fd))
         } else if crate::syscall::is_timerfd_fd(pid, fd) {
@@ -9622,7 +9707,15 @@ fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
                     // stuck-producer pattern `epoll(7)` / `poll(2)` avoid.
                     let mut ev = if crate::net::unix::writable(inode) { EPOLLOUT } else { 0 };
                     let has_d = crate::net::unix::has_data(inode);
-                    if has_d {
+                    // A reached SCM_RIGHTS batch confers EPOLLIN even with an
+                    // empty data ring: a control-only ancillary frame
+                    // (iov_len==0) IS a readable message per recvmsg(2) /
+                    // unix(7) / POSIX.1-2017 SCM_RIGHTS, and epoll_wait(2)
+                    // must report it so the receiver recvmsg's the fd instead
+                    // of parking forever on a pure fd handoff.
+                    let has_scm = crate::syscall::has_scm_deliverable(
+                        inode, crate::net::unix::recv_consumed(inode));
+                    if has_d || has_scm {
                         ev |= EPOLLIN;
                     }
                     // `epoll(7)` distinguishes a read-side half-close from a
