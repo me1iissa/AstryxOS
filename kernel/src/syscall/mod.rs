@@ -436,19 +436,66 @@ where
 }
 
 /// SCM_RIGHTS pending fd transfers.
-/// Key = receiving unix socket id.  Value = list of FileDescriptors to deliver.
-static PENDING_SCM: Mutex<Vec<(u64, Vec<crate::vfs::FileDescriptor>)>> = Mutex::new(Vec::new());
+///
+/// One entry = one ancillary-data batch sent by a `sendmsg(2)` carrying an
+/// `SCM_RIGHTS` control message.  Per `recvmsg(2)` / `unix(7)` /
+/// POSIX.1-2017, such a frame is a *readable message* in its own right — even
+/// when its data payload is empty (`iov_len == 0`, a control-only fd handoff)
+/// — and `recvmsg` must return it with the cmsg attached.
+///
+/// Each batch is bound to the receiving socket's absolute recv-stream
+/// position (`byte_offset`) captured at enqueue time, so that:
+///   * an ancillary-only frame still confers read-readiness (it sits at the
+///     stream tail with no preceding unread bytes, hence is immediately
+///     deliverable), and
+///   * a reader draining an earlier *data-only* frame does not prematurely
+///     receive a *later* frame's fds — the batch is withheld until the reader
+///     has consumed every byte that preceded it (`recv_consumed >=
+///     byte_offset`).  This keys delivery on a stream *position* rather than
+///     merely on the receiver uid.
+struct ScmBatch {
+    receiver_id: u64,
+    byte_offset: u64,
+    fds: Vec<crate::vfs::FileDescriptor>,
+}
+static PENDING_SCM: Mutex<Vec<ScmBatch>> = Mutex::new(Vec::new());
 
-/// Queue SCM_RIGHTS fds to be delivered when `receiver_id` calls recvmsg.
-pub fn scm_queue(receiver_id: u64, fds: Vec<crate::vfs::FileDescriptor>) {
-    PENDING_SCM.lock().push((receiver_id, fds));
+/// Queue an `SCM_RIGHTS` fd batch for delivery when `receiver_id` next
+/// drains its recv stream past `byte_offset` (see [`scm_dequeue`]).
+/// `byte_offset` is the receiver's absolute recv position at send time —
+/// for an ancillary-only frame this is the current stream tail.
+pub fn scm_queue(receiver_id: u64, byte_offset: u64, fds: Vec<crate::vfs::FileDescriptor>) {
+    PENDING_SCM.lock().push(ScmBatch { receiver_id, byte_offset, fds });
 }
 
-/// Pop SCM_RIGHTS fds for `receiver_id`.  Returns None if nothing pending.
-pub fn scm_dequeue(receiver_id: u64) -> Option<Vec<crate::vfs::FileDescriptor>> {
+/// Returns true if `receiver_id` has at least one `SCM_RIGHTS` batch that is
+/// already deliverable — its bound `byte_offset` has been reached by the
+/// reader (`consumed >= byte_offset`).  This is the readiness predicate that
+/// makes a control-only ancillary frame surface as `POLLIN`/`EPOLLIN`, since
+/// such a frame carries no recv-ring bytes for `has_data()` to see.
+///
+/// `consumed` is the receiver's absolute drained-byte count
+/// (`net::unix::recv_consumed`); passed in by the caller so this module does
+/// not have to reach back into the net layer while holding PENDING_SCM.
+pub fn has_scm_deliverable(receiver_id: u64, consumed: u64) -> bool {
+    let q = PENDING_SCM.lock();
+    q.iter().any(|b| b.receiver_id == receiver_id && consumed >= b.byte_offset)
+}
+
+/// Pop the *earliest* deliverable `SCM_RIGHTS` batch for `receiver_id` — the
+/// oldest batch whose bound `byte_offset` the reader has now reached
+/// (`consumed >= byte_offset`).  Returns None if nothing is pending or the
+/// pending batch(es) still sit beyond the reader's current position (the
+/// reader must drain the intervening data bytes first).  Delivering only the
+/// reached batch keeps fds attached to their originating stream frame.
+pub fn scm_dequeue(receiver_id: u64, consumed: u64) -> Option<Vec<crate::vfs::FileDescriptor>> {
     let mut q = PENDING_SCM.lock();
-    let pos = q.iter().position(|(id, _)| *id == receiver_id)?;
-    Some(q.remove(pos).1)
+    // Earliest in FIFO order: the first matching entry, since batches are
+    // pushed in send order and a later batch can never have a smaller
+    // byte_offset than an earlier one for the same receiver.
+    let pos = q.iter().position(
+        |b| b.receiver_id == receiver_id && consumed >= b.byte_offset)?;
+    Some(q.remove(pos).fds)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -4027,7 +4074,14 @@ pub(crate) fn poll_revents(pid: u64, fd: usize, events: u16) -> u16 {
         let uid = get_unix_socket_id(pid, fd);
         let has_d = crate::net::unix::has_data(uid);
         let has_p = crate::net::unix::has_pending(uid);
-        let readable = has_d || has_p;
+        // A queued SCM_RIGHTS batch whose bound stream offset the reader has
+        // reached makes the socket readable even with an empty data ring: a
+        // control-only ancillary frame (iov_len==0) IS a readable message per
+        // recvmsg(2) / unix(7) / POSIX.1-2017 SCM_RIGHTS, and recvmsg must
+        // return it.  Without this, the receiver parks in poll() forever on a
+        // pure fd handoff (e.g. an IPC channel/shared-memory fd pass).
+        let has_scm = has_scm_deliverable(uid, crate::net::unix::recv_consumed(uid));
+        let readable = has_d || has_p || has_scm;
         #[cfg(feature = "firefox-test")]
         if pid >= 1 && events & POLLIN != 0 {
             crate::serial_println!("[UNIXPOLL] pid={} fd={} uid={} has_data={} avail={} events={:#x}",

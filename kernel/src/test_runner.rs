@@ -2482,6 +2482,16 @@ pub fn run() -> ! {
     total += 1;
     if test_278_mounts_lock_not_held_across_fs_dispatch() { passed += 1; }
 
+    // ── Test 280: control-only SCM_RIGHTS confers read-readiness ─────────
+    // A sendmsg(2) carrying SCM_RIGHTS with an empty data payload
+    // (iov_len==0, a pure fd handoff) is still a readable message:
+    // poll/epoll must report POLLIN and recvmsg must return it with 0 data
+    // bytes + the cmsg.  Also verifies the byte-offset binding that keeps
+    // fds attached to their originating stream frame.
+    // Refs: recvmsg(2)/sendmsg(2), poll(2), epoll(7), unix(7) SCM_RIGHTS.
+    total += 1;
+    if test_280_scm_control_only_readiness() { passed += 1; }
+
     // ── Test 283: stack-prov main-stack TOP-window argv-writer capture ──
     // GATE-A blind-spot closure (2026-05-30).  Only built when the
     // `stack-prov` diagnostic feature is on (CI smoke does not enable it);
@@ -21183,11 +21193,20 @@ fn test_scm_rights() -> bool {
     };
     test_println!("  File inode={} prepared ✓", inode);
 
-    // Queue the fd from A→B: scm_queue(receiver=B, fds).
-    crate::syscall::scm_queue(id_b, alloc::vec![fd_to_pass]);
+    // Queue the fd from A→B at B's current recv-stream position.  B has read
+    // nothing, so this batch (offset 0) is immediately deliverable
+    // (consumed 0 >= offset 0).
+    let off_b = crate::net::unix::enqueue_offset_for(id_b);
+    crate::syscall::scm_queue(id_b, off_b, alloc::vec![fd_to_pass]);
 
-    // Dequeue from B.
-    let received = crate::syscall::scm_dequeue(id_b);
+    // The batch must register as deliverable — the POLLIN readiness predicate.
+    if !crate::syscall::has_scm_deliverable(id_b, crate::net::unix::recv_consumed(id_b)) {
+        test_fail!("scm_rights", "queued SCM batch not reported deliverable");
+        return false;
+    }
+
+    // Dequeue from B at B's current consumed position.
+    let received = crate::syscall::scm_dequeue(id_b, crate::net::unix::recv_consumed(id_b));
     if received.is_none() {
         test_fail!("scm_rights", "scm_dequeue(B) returned None");
         return false;
@@ -21216,7 +21235,7 @@ fn test_scm_rights() -> bool {
     test_println!("  File content via path: {:?} ✓", core::str::from_utf8(&content).unwrap_or("?"));
 
     // Second dequeue should return None (only one batch queued).
-    if crate::syscall::scm_dequeue(id_b).is_some() {
+    if crate::syscall::scm_dequeue(id_b, crate::net::unix::recv_consumed(id_b)).is_some() {
         test_fail!("scm_rights", "Second dequeue should return None");
         return false;
     }
@@ -44292,5 +44311,167 @@ fn test_278_mounts_lock_not_held_across_fs_dispatch() -> bool {
     test_println!("  cleaned up test mount");
 
     test_pass!("VFS MOUNTS-lock not held across FS dispatch (deadlock regression)");
+    true
+}
+
+// ── Test 280: control-only SCM_RIGHTS confers read-readiness + byte-offset bind
+//
+// A `sendmsg(2)` that carries an `SCM_RIGHTS` control message with an empty
+// data payload (`iov_len == 0`, a pure fd handoff) is still a *readable
+// message*: `poll(2)`/`epoll(7)` must report `POLLIN`/`EPOLLIN` and
+// `recvmsg(2)` must return it with 0 data bytes and the cmsg attached
+// (recvmsg(2), unix(7), POSIX.1-2017 SCM_RIGHTS).  Without this the receiver
+// parks in poll() forever on a control-only frame.
+//
+// This test drives the exact predicates the syscall layer uses:
+//   * `has_scm_deliverable(uid, consumed)` — the readiness predicate ORed
+//     into POLLIN/EPOLLIN in poll_revents / epoll_poll_events / select.
+//   * `scm_dequeue(uid, consumed)` — the byte-offset-gated delivery used by
+//     recvmsg after read_msg returns EAGAIN on an empty ring.
+//   * the byte-offset binding: a batch sent *after* a data frame is withheld
+//     until the reader drains past it, so an earlier reader does not pick up
+//     a later frame's fds.
+//
+// Refs: recvmsg(2)/sendmsg(2), poll(2), epoll(7), unix(7) SCM_RIGHTS,
+// POSIX.1-2017 §2.10.10 (Socket Receive Queue), §2.14 (File Descriptors).
+fn test_280_scm_control_only_readiness() -> bool {
+    use crate::net::unix;
+    use crate::ipc::waitlist::{BELL_RINGS_BY_SOURCE, PollBellSource};
+    test_header!("control-only SCM_RIGHTS readiness + byte-offset binding (Test 280)");
+
+    let (a, b) = unix::socketpair(unix::SockKind::Stream,
+        unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if a == u64::MAX || b == u64::MAX {
+        test_fail!("scm_ctrl_only", "socketpair returned MAX");
+        return false;
+    }
+
+    // A throw-away fd to pass.  Its identity is irrelevant — we assert on the
+    // readiness/binding, not the file behind it.
+    let mk_fd = || crate::vfs::FileDescriptor {
+        inode: 0xBEEF, mount_idx: 0, offset: 0, flags: 0,
+        file_type: crate::vfs::FileType::RegularFile,
+        is_console: false, cloexec: false,
+        open_path: alloc::string::String::new(),
+    };
+
+    // ── Part 1: a control-only batch (no data) on an empty stream is
+    // immediately readable — has_data() is false, has_scm_deliverable() true.
+    if unix::has_data(b) {
+        test_fail!("scm_ctrl_only", "fresh socket b unexpectedly has data");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    // Sender enqueues fds bound to B's current stream tail (offset 0, since B
+    // has received nothing) — exactly what sendmsg does for an iov_len==0 frame.
+    let off0 = unix::enqueue_offset_for(b);
+    if off0 != 0 {
+        test_fail!("scm_ctrl_only", "fresh enqueue_offset = {} (want 0)", off0);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    let bell_before = BELL_RINGS_BY_SOURCE[PollBellSource::UnixWrite as usize]
+        .load(core::sync::atomic::Ordering::Relaxed);
+    crate::syscall::scm_queue(b, off0, alloc::vec![mk_fd()]);
+    // The send-side bell ring is exercised by the sendmsg arm; emulate it so
+    // the test also covers the wake discipline (drop-lock-then-ring).
+    crate::ipc::waitlist::ring_poll_bell_for(PollBellSource::UnixWrite);
+    let bell_after = BELL_RINGS_BY_SOURCE[PollBellSource::UnixWrite as usize]
+        .load(core::sync::atomic::Ordering::Relaxed);
+    if bell_after <= bell_before {
+        test_fail!("scm_ctrl_only", "UnixWrite poll bell did not advance");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // Readiness predicate (the OR added to POLLIN) must now fire for B even
+    // though the data ring is empty.
+    let consumed_b = unix::recv_consumed(b);
+    if !crate::syscall::has_scm_deliverable(b, consumed_b) {
+        test_fail!("scm_ctrl_only", "control-only batch NOT reported readable");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    // read_msg on the empty ring returns EAGAIN — recvmsg promotes this to a
+    // 0-byte success because a deliverable batch is queued.  Verify the
+    // dequeue succeeds at B's current consumed position.
+    let mut scratch = [0u8; 8];
+    match unix::read_msg(b, &mut scratch) {
+        Err(-11) => { /* expected: empty ring, recvmsg would promote to 0 */ }
+        other => {
+            test_fail!("scm_ctrl_only", "read_msg on empty ring = {:?} (want EAGAIN)", other);
+            unix::close(a); unix::close(b);
+            return false;
+        }
+    }
+    let got = crate::syscall::scm_dequeue(b, unix::recv_consumed(b));
+    if got.map(|v| v.len()) != Some(1) {
+        test_fail!("scm_ctrl_only", "control-only scm_dequeue did not return the fd");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    // Batch consumed: no longer deliverable.
+    if crate::syscall::has_scm_deliverable(b, unix::recv_consumed(b)) {
+        test_fail!("scm_ctrl_only", "batch still deliverable after dequeue");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    test_println!("  control-only SCM batch: readable + delivered with 0 data bytes ✓");
+
+    // ── Part 2: byte-offset binding.  Send a 4-byte data frame, THEN an
+    // fd batch bound to the post-data offset.  A reader that has not yet
+    // drained the 4 bytes must NOT receive the later batch.
+    let n = unix::write(a, b"DATA");          // lands in B's recv ring
+    if n != 4 {
+        test_fail!("scm_ctrl_only", "write(DATA) = {} (want 4)", n);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    let off_after_data = unix::enqueue_offset_for(b);   // == 4
+    if off_after_data != 4 {
+        test_fail!("scm_ctrl_only", "offset after 4-byte write = {} (want 4)", off_after_data);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    crate::syscall::scm_queue(b, off_after_data, alloc::vec![mk_fd()]);
+
+    // Reader is still at consumed==0 (the 4 data bytes are undrained): the
+    // batch bound to offset 4 must be WITHHELD.
+    if crate::syscall::has_scm_deliverable(b, unix::recv_consumed(b)) {
+        test_fail!("scm_ctrl_only", "later batch deliverable before its data drained");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    if crate::syscall::scm_dequeue(b, unix::recv_consumed(b)).is_some() {
+        test_fail!("scm_ctrl_only", "dequeued a not-yet-reached batch (ordering bug)");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    test_println!("  fds bound to a later stream offset are withheld until drained ✓");
+
+    // Drain the 4 data bytes — now the batch's offset is reached.
+    let mut rbuf = [0u8; 4];
+    let rn = unix::read_msg(b, &mut rbuf).map(|(c, _)| c).unwrap_or(-1isize as usize);
+    if rn != 4 || &rbuf != b"DATA" {
+        test_fail!("scm_ctrl_only", "drain read = {} / {:?}", rn, rbuf);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    if !crate::syscall::has_scm_deliverable(b, unix::recv_consumed(b)) {
+        test_fail!("scm_ctrl_only", "batch not deliverable after its data drained");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    let got2 = crate::syscall::scm_dequeue(b, unix::recv_consumed(b));
+    if got2.map(|v| v.len()) != Some(1) {
+        test_fail!("scm_ctrl_only", "post-drain dequeue did not return the fd");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    test_println!("  fds delivered once the reader drains past their bound offset ✓");
+
+    unix::close(a);
+    unix::close(b);
+    test_pass!("control-only SCM_RIGHTS readiness + byte-offset binding (Test 280)");
     true
 }
