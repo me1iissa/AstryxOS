@@ -483,19 +483,106 @@ pub fn has_scm_deliverable(receiver_id: u64, consumed: u64) -> bool {
 }
 
 /// Pop the *earliest* deliverable `SCM_RIGHTS` batch for `receiver_id` — the
-/// oldest batch whose bound `byte_offset` the reader has now reached
-/// (`consumed >= byte_offset`).  Returns None if nothing is pending or the
-/// pending batch(es) still sit beyond the reader's current position (the
-/// reader must drain the intervening data bytes first).  Delivering only the
-/// reached batch keeps fds attached to their originating stream frame.
+/// deliverable batch with the LOWEST bound `byte_offset` (the stream-position
+/// nearest the reader), among those whose offset the reader has now reached
+/// (`consumed >= byte_offset`).  Returns None if nothing is pending or every
+/// pending batch still sits beyond the reader's current position (the reader
+/// must drain the intervening data bytes first).  Delivering the lowest-offset
+/// batch keeps fds attached to their originating stream frame.
+///
+/// Selecting by minimum `byte_offset` — rather than by Vec push order — is
+/// load-bearing for correctness under concurrent `sendmsg(2)` to the same
+/// peer.  The send path captures the bind offset (under the unix TABLE lock)
+/// and pushes the batch (under the PENDING_SCM lock) in two separate critical
+/// sections, so two interleaved senders can push their batches into the Vec in
+/// the opposite order to their byte offsets.  A naive "first matching Vec
+/// entry" pop would then hand the reader the LATER frame's fds first, attaching
+/// the wrong descriptors to a frame — a data-integrity bug.  Per `unix(7)` /
+/// `recvmsg(2)` SCM_RIGHTS, ancillary data attaches to a stream *position*; we
+/// therefore deliver strictly in byte-offset order regardless of push order.
 pub fn scm_dequeue(receiver_id: u64, consumed: u64) -> Option<Vec<crate::vfs::FileDescriptor>> {
     let mut q = PENDING_SCM.lock();
-    // Earliest in FIFO order: the first matching entry, since batches are
-    // pushed in send order and a later batch can never have a smaller
-    // byte_offset than an earlier one for the same receiver.
-    let pos = q.iter().position(
-        |b| b.receiver_id == receiver_id && consumed >= b.byte_offset)?;
+    // Pick the deliverable batch with the smallest byte_offset.  Ties (two
+    // batches bound to the exact same offset, e.g. two control-only frames
+    // racing at the same stream tail) fall back to Vec push order via the
+    // stable `min_by_key`, which is the best available approximation of send
+    // order when the offsets are indistinguishable.
+    let pos = q.iter().enumerate()
+        .filter(|(_, b)| b.receiver_id == receiver_id && consumed >= b.byte_offset)
+        .min_by_key(|(_, b)| b.byte_offset)
+        .map(|(i, _)| i)?;
     Some(q.remove(pos).fds)
+}
+
+/// Drain *all* pending `SCM_RIGHTS` batches destined for `receiver_id` and
+/// return their queued `FileDescriptor`s, removing the batches from the queue.
+///
+/// Called when a receiver socket is torn down (final `close(2)` / process
+/// exit) before it has `recvmsg`'d the queued ancillary data.  Per the AF_UNIX
+/// SCM_RIGHTS contract, fds that were placed in a receive queue but never
+/// delivered must be released when that queue is destroyed (each underlying
+/// open file description gets the matching reference drop, mirroring the
+/// `close(2)` of a delivered copy).  Without this drain the references that
+/// [`scm_queue`]'s callers took at enqueue time leak (CWE-772): the passed
+/// socket / pipe / file is never torn down and its peer never observes the
+/// hang-up.  The caller is responsible for balancing each returned descriptor's
+/// underlying-object reference via [`scm_drop_fds`].
+pub fn scm_drain_receiver(receiver_id: u64) -> Vec<crate::vfs::FileDescriptor> {
+    let mut q = PENDING_SCM.lock();
+    let mut out = Vec::new();
+    // Retain only the batches NOT destined for this receiver; collect the rest.
+    let mut i = 0;
+    while i < q.len() {
+        if q[i].receiver_id == receiver_id {
+            let batch = q.remove(i);
+            out.extend(batch.fds);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Release the underlying-object reference for each `FileDescriptor` that was
+/// queued for SCM_RIGHTS delivery but never received (see
+/// [`scm_drain_receiver`]).  This is the exact inverse of the reference bumped
+/// at enqueue time in the `sendmsg(2)` SCM path and must mirror that per-type
+/// dispatch so no socket / pipe reference leaks (CWE-772):
+///
+///   * AF_UNIX socket fd → `net::unix::close` drops one open-file-description
+///     reference; the last drop tears the slot down and hangs up the peer.
+///   * anonymous pipe end → drop the reader/writer count so the pipe's other
+///     end observes EOF / EPIPE per `read(2)` / `write(2)`.
+///   * regular file / memfd → drop the inode pin taken at enqueue time
+///     (`vfs::pin_inode`); when that was the last reference to a deferred-
+///     deleted (unlinked) memfd, the inode is freed by `unpin_inode`.  Without
+///     this the pin (and thus the inode) would leak forever.
+///   * eventfd / other sentinel fds → no per-object refcount to balance.
+///
+/// MUST be called with no unix `TABLE` / `PENDING_SCM` lock held — it re-enters
+/// `net::unix::close`, which takes the unix TABLE lock.
+pub fn scm_drop_fds(fds: Vec<crate::vfs::FileDescriptor>) {
+    for fd in fds {
+        if fd.file_type == crate::vfs::FileType::Socket
+            && fd.flags & UNIX_SOCKET_FLAG != 0
+        {
+            crate::net::unix::close(fd.inode);
+        } else if fd.file_type == crate::vfs::FileType::Pipe
+            && fd.mount_idx == usize::MAX
+            && fd.flags & 0x8000_0000 != 0
+        {
+            if fd.flags & 1 == 1 {
+                crate::ipc::pipe::pipe_close_writer(fd.inode);
+            } else {
+                crate::ipc::pipe::pipe_close_reader(fd.inode);
+            }
+        } else if fd.file_type == crate::vfs::FileType::RegularFile
+            && fd.mount_idx != usize::MAX
+        {
+            crate::vfs::unpin_inode(fd.mount_idx, fd.inode);
+        }
+        // eventfds / other sentinel fds: no per-object refcount to drop.
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

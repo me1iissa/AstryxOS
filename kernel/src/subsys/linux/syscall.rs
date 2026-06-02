@@ -2191,6 +2191,27 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                                     crate::ipc::pipe::pipe_add_reader(
                                                         fdesc.inode);
                                                 }
+                                            } else if fdesc.file_type
+                                                == crate::vfs::FileType::RegularFile
+                                                && fdesc.mount_idx != usize::MAX
+                                            {
+                                                // Regular file / memfd: VFS tracks
+                                                // inode lifetime by scanning open
+                                                // fd tables (unlink-on-last-close),
+                                                // but this passed copy is in flight
+                                                // in PENDING_SCM and NOT yet in any
+                                                // fd table, so the scan cannot see
+                                                // it.  Pin the inode so a sender's
+                                                // close(2) of its (possibly the
+                                                // last named) copy of an unlinked
+                                                // memfd cannot free the inode out
+                                                // from under the un-received
+                                                // descriptor — the Mozilla
+                                                // shared-surface fd handoff.
+                                                // Balanced by unpin on delivery or
+                                                // on drain (scm_drop_fds path).
+                                                crate::vfs::pin_inode(
+                                                    fdesc.mount_idx, fdesc.inode);
                                             }
                                         }
                                         cloned
@@ -2309,6 +2330,19 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 if bytes_read >= 0 {
                     let consumed = crate::net::unix::recv_consumed(unix_id);
                     if let Some(scm_fds) = crate::syscall::scm_dequeue(unix_id, consumed) {
+                        // Regular-file / memfd descriptors were pinned at enqueue
+                        // (PENDING_SCM holds an inode reference invisible to the
+                        // VFS fd-table scan).  Once installed in the receiver's
+                        // fd table below, the slot itself keeps the inode alive,
+                        // so the in-flight pin can be released.  Snapshot the
+                        // (mount_idx, inode) pairs BEFORE the descriptors are
+                        // moved into the table; unpin AFTER PROCESS_TABLE is
+                        // dropped (unpin_inode also takes PROCESS_TABLE).
+                        let to_unpin: Vec<(usize, u64)> = scm_fds.iter()
+                            .filter(|f| f.file_type == crate::vfs::FileType::RegularFile
+                                        && f.mount_idx != usize::MAX)
+                            .map(|f| (f.mount_idx, f.inode))
+                            .collect();
                         // Allocate fds in the receiver's process.
                         let new_fd_nums: Vec<i32> = {
                             let mut procs = crate::proc::PROCESS_TABLE.lock();
@@ -2327,6 +2361,11 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                 }).collect()
                             } else { Vec::new() }
                         };
+                        // Balance the enqueue-time pin now that the fd-table slot
+                        // holds the reference (PROCESS_TABLE lock released above).
+                        for (m, ino) in to_unpin {
+                            crate::vfs::unpin_inode(m, ino);
+                        }
                         // Write SCM_RIGHTS cmsghdr into msg_control.  All
                         // reads/writes here target user memory — single
                         // SMAP guard spanning the whole block.
@@ -9529,6 +9568,19 @@ fn sys_memfd_create(_name: u64, flags: u64) -> i64 {
             memfd_seals_register(inode);
         }
     }
+
+    // Per memfd_create(2): "The file is automatically removed (unlinked) ...
+    // The memory is freed when all references to the file are dropped."  Unlink
+    // the backing entry now so the memfd is a true anonymous inode with no
+    // visible name; the open fd (and any dup / fork / SCM_RIGHTS-passed copy)
+    // holds it alive via the kernel's unlink-on-last-close machinery, and it is
+    // freed once the last reference closes.  This makes a memfd handed between
+    // processes (the Mozilla shared-memory / CrossProcessPaint surface fd) safe
+    // *by construction* — the inode cannot outlive its last holder and leak,
+    // nor be freed while an SCM_RIGHTS-passed copy is in flight (PINNED_INODES).
+    // remove() on an open file performs a deferred delete, so the just-opened
+    // fd stays fully usable.
+    let _ = crate::vfs::remove(path_str);
 
     fd_num as i64
 }
