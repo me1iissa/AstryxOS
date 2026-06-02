@@ -2576,6 +2576,16 @@ pub fn run() -> ! {
     total += 1;
     if test_290_scm_multi_fd_delivery() { passed += 1; }
 
+    // ── Test 291: a coalesced stream read delivers one fd batch per recv ───
+    // Two fd-bearing frames queued back-to-back must NOT both drain in a single
+    // large recvmsg while only one batch is delivered; the recv-side cap
+    // (scm_next_batch_offset) returns the bytes up to exactly one fd batch per
+    // recv and delivers that batch, then stops — the byte-stream reader
+    // otherwise aborts "needs unreceived descriptors".  Refs: recvmsg(2),
+    // unix(7) SCM_RIGHTS.
+    total += 1;
+    if test_291_scm_coalesced_stream_read_cap() { passed += 1; }
+
     // ── Test 283: stack-prov main-stack TOP-window argv-writer capture ──
     // GATE-A blind-spot closure (2026-05-30).  Only built when the
     // `stack-prov` diagnostic feature is on (CI smoke does not enable it);
@@ -45752,5 +45762,112 @@ fn test_290_scm_multi_fd_delivery() -> bool {
     unix::close(a);
     unix::close(b);
     test_pass!("multi-fd SCM_RIGHTS message delivers ALL its fds (Test 290)");
+    true
+}
+
+// ── Test 291: a coalesced stream read delivers one fd batch per recv ─────────
+//
+// A byte-stream reader (e.g. a length-prefixed IPC channel) reads up to a large
+// fixed buffer per recvmsg(2).  When two fd-bearing frames are queued
+// back-to-back in the recv ring, an UNCAPPED read would drain the bytes of BOTH
+// frames in a single recvmsg while `scm_dequeue` only hands back ONE batch — the
+// reader then parses the second frame with its descriptors silently withheld and
+// aborts ("needs unreceived descriptors").  The recvmsg arm caps the drain at
+// the next pending batch's bound offset (`scm_next_batch_offset`), so each recv
+// returns the bytes up to exactly one fd batch and delivers that batch, then
+// stops — mirroring the AF_UNIX stream recv that stops at each fd-bearing message
+// boundary.  This drives that cap logic directly: two frames + two batches, then
+// read with a buffer large enough to span BOTH, and assert each batch is
+// delivered on its own capped read.  Refs: recvmsg(2), unix(7) SCM_RIGHTS.
+fn test_291_scm_coalesced_stream_read_cap() -> bool {
+    use crate::net::unix;
+    test_header!("coalesced stream read delivers one fd batch per recv (Test 291)");
+
+    let (a, b) = unix::socketpair(unix::SockKind::Stream,
+        unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if a == u64::MAX || b == u64::MAX {
+        test_fail!("scm_coalesce", "socketpair returned MAX");
+        return false;
+    }
+    let mk_fd = |ino: u64| crate::vfs::FileDescriptor {
+        inode: ino, mount_idx: 0, offset: 0, flags: 0,
+        file_type: crate::vfs::FileType::RegularFile,
+        is_console: false, cloexec: false,
+        open_path: alloc::string::String::new(),
+    };
+
+    // Frame 1: 4 data bytes at stream start T1, one fd bound to T1+1.
+    let t1 = unix::enqueue_offset_for(b);
+    if unix::write(a, b"AAAA") != 4 {
+        test_fail!("scm_coalesce", "write frame1 != 4"); unix::close(a); unix::close(b); return false;
+    }
+    crate::syscall::scm_queue(b, t1 + 1, alloc::vec![mk_fd(0x11)]);
+    // Frame 2: 4 more data bytes at stream pos T2, one fd bound to T2+1.
+    let t2 = unix::enqueue_offset_for(b);   // == t1 + 4
+    if unix::write(a, b"BBBB") != 4 {
+        test_fail!("scm_coalesce", "write frame2 != 4"); unix::close(a); unix::close(b); return false;
+    }
+    crate::syscall::scm_queue(b, t2 + 1, alloc::vec![mk_fd(0x22)]);
+
+    // The recv-side cap: with the reader at the stream start, the next pending
+    // batch is frame 1's (offset t1+1), so a stream recv must not drain past it.
+    let consumed0 = unix::recv_consumed(b);
+    match crate::syscall::scm_next_batch_offset(b, consumed0) {
+        Some(off) if off == t1 + 1 => {
+            test_println!("  next-batch cap = frame-1 offset (t1+1) ✓");
+        }
+        other => {
+            test_fail!("scm_coalesce", "next-batch offset = {:?} (want {})", other, t1 + 1);
+            unix::close(a); unix::close(b); return false;
+        }
+    }
+
+    // Simulate the capped recvmsg: a reader offers an 8-byte buffer (enough to
+    // span BOTH frames) but the cap limits the drain to (next - consumed) bytes.
+    // Read #1 must therefore stop at frame 1's first-byte position and deliver
+    // ONLY frame 1's batch.
+    let cap1 = ((t1 + 1) - consumed0) as usize;          // == 1 (read up to frame-1's first byte)
+    let mut buf = [0u8; 8];
+    let rn1 = unix::read_msg(b, &mut buf[..cap1.max(1)]).map(|(c, _)| c).unwrap_or(0xFFFF);
+    if rn1 == 0xFFFF {
+        test_fail!("scm_coalesce", "capped read #1 failed"); unix::close(a); unix::close(b); return false;
+    }
+    let got1 = crate::syscall::scm_dequeue(b, unix::recv_consumed(b));
+    if got1.as_deref().map(|s| s.iter().map(|f| f.inode).collect::<alloc::vec::Vec<_>>())
+        != Some(alloc::vec![0x11]) {
+        test_fail!("scm_coalesce", "read #1 did not deliver exactly frame-1's fd (0x11)");
+        unix::close(a); unix::close(b); return false;
+    }
+    // Frame 2's batch MUST still be withheld — its bytes are not yet drained.
+    if crate::syscall::scm_dequeue(b, unix::recv_consumed(b)).is_some() {
+        test_fail!("scm_coalesce", "frame-2 batch delivered on the same recv as frame-1");
+        unix::close(a); unix::close(b); return false;
+    }
+    test_println!("  read #1 delivered frame-1's fd only; frame-2 withheld ✓");
+
+    // Drain the rest of frame 1 + into frame 2 under the next cap, then deliver
+    // frame 2's batch.  Recompute the cap for the reader's new position.
+    let consumed1 = unix::recv_consumed(b);
+    let next2 = crate::syscall::scm_next_batch_offset(b, consumed1).unwrap_or(0);
+    if next2 != t2 + 1 {
+        test_fail!("scm_coalesce", "second next-batch offset = {} (want {})", next2, t2 + 1);
+        unix::close(a); unix::close(b); return false;
+    }
+    let cap2 = (next2 - consumed1) as usize;
+    let _ = unix::read_msg(b, &mut buf[..cap2.max(1)]);
+    match crate::syscall::scm_dequeue(b, unix::recv_consumed(b)).as_deref() {
+        Some([f]) if f.inode == 0x22 => {
+            test_println!("  read #2 delivered frame-2's fd (0x22) on its own recv ✓");
+        }
+        other => {
+            test_fail!("scm_coalesce", "read #2 delivered {:?} (want [0x22])",
+                other.map(|s| s.iter().map(|f| f.inode).collect::<alloc::vec::Vec<_>>()));
+            unix::close(a); unix::close(b); return false;
+        }
+    }
+
+    unix::close(a);
+    unix::close(b);
+    test_pass!("coalesced stream read delivers one fd batch per recv (Test 291)");
     true
 }

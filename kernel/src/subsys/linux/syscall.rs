@@ -2331,13 +2331,47 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let bytes_read: i64;
             if crate::syscall::is_unix_socket_fd(pid, fd) {
                 let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
+                // Cap the STREAM drain at the next pending SCM_RIGHTS batch
+                // boundary so this recvmsg does not consume bytes PAST the
+                // stream position where the next fd batch becomes deliverable.
+                // `scm_dequeue` (below) hands back exactly ONE batch per
+                // recvmsg; a byte-stream reader reads up to a large fixed buffer
+                // per call, so without this cap a single recvmsg can drain bytes
+                // spanning several fd-bearing frames while only one batch's fds
+                // are delivered — the reader then parses a later frame whose
+                // descriptors were silently withheld and aborts ("needs
+                // unreceived descriptors").  Capping at the next batch offset
+                // makes each recvmsg return the bytes up to exactly one fd batch
+                // and deliver that batch, then stop — the AF_UNIX stream recv
+                // stops at each fd-bearing message boundary (recvmsg(2), unix(7)
+                // SCM_RIGHTS: one message's ancillary fds per recv).  Datagram /
+                // SEQPACKET reads are message-framed already, so the cap only
+                // bites the byte-stream STREAM kind; it never shrinks the read
+                // below 1 byte (the next-batch offset is strictly > consumed).
+                let eff_cap = if crate::net::unix::kind(unix_id)
+                    == crate::net::unix::SockKind::Stream
+                {
+                    let consumed = crate::net::unix::recv_consumed(unix_id);
+                    match crate::syscall::scm_next_batch_offset(unix_id, consumed) {
+                        Some(next) => {
+                            // next > consumed (guaranteed by the helper); the
+                            // gap is the bytes the reader may drain before the
+                            // batch at `next` must be delivered on its own recv.
+                            let gap = (next - consumed) as usize;
+                            cap.min(gap)
+                        }
+                        None => cap,
+                    }
+                } else {
+                    cap
+                };
                 // SMAP bracket — read_msg writes through `buf` into user
                 // memory.  Held for the call duration; we drop it before
                 // the subsequent allocations / table walks below.
                 const MSG_TRUNC: u32 = 0x20;
                 bytes_read = {
                     let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
-                    let buf = unsafe { core::slice::from_raw_parts_mut(dst, cap) };
+                    let buf = unsafe { core::slice::from_raw_parts_mut(dst, eff_cap) };
                     match crate::net::unix::read_msg(unix_id, buf) {
                         Ok((n, discarded)) => {
                             // Overwrite (not OR) msg_flags — recvmsg(2) man page.
