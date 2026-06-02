@@ -19267,7 +19267,7 @@ fn test_clock_monotonic_rate_invariant() -> bool {
     use crate::arch::x86_64::apic::{cpu_count, MAX_CPUS};
     use crate::arch::x86_64::irq::{
         TICK_COUNT, TICK_COUNT_BUMPS, TIMER_ISR_PER_CPU, TSC_PER_TICK,
-        get_ticks, TICK_HZ,
+        TICK_HZ,
     };
 
     const TARGET_TICKS: u64 = 50; // ~500 ms wall at TICK_HZ=100
@@ -19301,9 +19301,17 @@ fn test_clock_monotonic_rate_invariant() -> bool {
 
     // Spin until TICK_COUNT advances by TARGET_TICKS, with a TSC fail-fast.
     // 50 ticks × 10 ms = 500 ms wall.  Budget 5 seconds via TSC.
+    //
+    // Drive on the RAW `TICK_COUNT`, not `get_ticks()`: `get_ticks()` returns
+    // `max(TICK_COUNT, tsc_floor)` and so can lead the ISR-published count by
+    // up to one tick (the TSC floor reflects real elapsed time; the ISR
+    // publishes just after the tick boundary). This test measures the
+    // ISR-published tick RATE, so the spin must break exactly when the raw
+    // counter reaches the target — otherwise the post-loop `dticks` re-check
+    // can observe TARGET-1.
     let tsc_budget = tsc_per_tick.saturating_mul(500); // ~5 s at 10 ms/tick
     loop {
-        let now = get_ticks();
+        let now = TICK_COUNT.load(Ordering::Relaxed);
         if now.wrapping_sub(ticks0) >= TARGET_TICKS { break; }
         if rdtsc().wrapping_sub(tsc0) > tsc_budget {
             test_fail!("monotonic-rate",
