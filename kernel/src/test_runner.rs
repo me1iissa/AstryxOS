@@ -1060,6 +1060,10 @@ pub fn run() -> ! {
     total += 1;
     if test_cleartid_write_demand_faults() { passed += 1; }
 
+    // ── Test 98g: shared-CR3 anonymous-fault anti-aliasing (vfork da4) ───
+    total += 1;
+    if test_map_page_in_if_absent_anti_alias() { passed += 1; }
+
     // ── Test 99: procfs self/maps — per-process VMA listing ──────────────
 
     total += 1;
@@ -29061,6 +29065,114 @@ fn test_cleartid_write_demand_faults() -> bool {
 
     teardown();
     test_pass!("CLONE_CHILD_CLEARTID write lands on non-present / COW page");
+    true
+}
+
+/// Regression test for the shared-CR3 anonymous demand-fault aliasing race.
+///
+/// On a CLONE_VM / vfork address space several threads run on ONE CR3 across
+/// multiple logical processors.  Two CPUs can take a not-present `#PF` on the
+/// same anonymous stack VA concurrently; each zero-fills its own frame.  The
+/// old anonymous install arm called `map_page_in` unconditionally, so the
+/// loser overwrote the winner's leaf PTE with a *different* physical frame.
+/// The winner's CPU kept reading the first frame through its already-cached
+/// TLB entry while the page table pointed at the second — one VA backed by two
+/// frames — so a release-store by one thread was never observed by the thread
+/// reading the other (the `da4` control-word store-visibility failure).
+///
+/// `map_page_in_if_absent` performs the present-check and the install as one
+/// indivisible operation under `VMM_LOCK`: the winner installs; the loser
+/// observes the winner's already-present PTE and backs out WITHOUT overwriting
+/// it, so the mapping is never aliased.  Refs: POSIX mmap(2), clone(2)
+/// CLONE_VM; Intel SDM Vol. 3A §4.10.4.3 (Optional Invalidation).
+fn test_map_page_in_if_absent_anti_alias() -> bool {
+    test_header!("map_page_in_if_absent: shared-CR3 anonymous-fault anti-aliasing");
+
+    use crate::mm::vmm::{read_pte, map_page_in_if_absent, PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER, ADDR_MASK};
+
+    // Fresh user address space (its own CR3 + page tables).
+    let vm = match crate::mm::vma::VmSpace::new_user() {
+        Some(vs) => vs,
+        None => { test_fail!("anti_alias", "VmSpace::new_user() OOM"); return false; }
+    };
+    let cr3 = vm.cr3;
+
+    // A stack-like anonymous VA in the canonical lower half.
+    let va: u64 = 0x7fff_fffe_c000;
+    let page = crate::mm::vma::page_align_down(va);
+
+    // Two distinct, separately-allocated frames standing in for the two CPUs'
+    // independently zero-filled demand-fault frames.
+    let frame_winner = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => { crate::proc::free_vm_space(vm); test_fail!("anti_alias", "OOM winner"); return false; }
+    };
+    let frame_loser = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => {
+            crate::mm::pmm::free_page(frame_winner);
+            crate::proc::free_vm_space(vm);
+            test_fail!("anti_alias", "OOM loser"); return false;
+        }
+    };
+    if frame_winner == frame_loser {
+        crate::mm::pmm::free_page(frame_winner);
+        crate::proc::free_vm_space(vm);
+        test_fail!("anti_alias", "allocator returned identical frames");
+        return false;
+    }
+
+    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+
+    // Precondition: VA not present.
+    if read_pte(cr3, va) & PAGE_PRESENT != 0 {
+        crate::mm::pmm::free_page(frame_winner);
+        crate::mm::pmm::free_page(frame_loser);
+        crate::proc::free_vm_space(vm);
+        test_fail!("anti_alias", "precondition: VA already present");
+        return false;
+    }
+
+    // (1) Winner installs over a not-present PTE → returns true, frame_winner mapped.
+    let won = map_page_in_if_absent(cr3, page, frame_winner, flags);
+    let pte1 = read_pte(cr3, va);
+    if !won || pte1 & PAGE_PRESENT == 0 || (pte1 & ADDR_MASK) != (frame_winner & ADDR_MASK) {
+        crate::mm::pmm::free_page(frame_winner);
+        crate::mm::pmm::free_page(frame_loser);
+        crate::proc::free_vm_space(vm);
+        test_fail!("anti_alias", "winner install failed: won={} pte={:#x} expect_phys={:#x}",
+            won, pte1, frame_winner);
+        return false;
+    }
+    test_println!("  (1) winner installed frame {:#x} over not-present PTE ✓", frame_winner);
+
+    // (2) Loser races the SAME VA with a DIFFERENT frame → must return false and
+    //     leave the winner's PTE untouched (no aliasing, no second frame).
+    let lost = map_page_in_if_absent(cr3, page, frame_loser, flags);
+    let pte2 = read_pte(cr3, va);
+    if lost {
+        crate::mm::pmm::free_page(frame_winner);
+        crate::mm::pmm::free_page(frame_loser);
+        crate::proc::free_vm_space(vm);
+        test_fail!("anti_alias", "loser install returned true — it overwrote the PTE (aliasing)");
+        return false;
+    }
+    if (pte2 & ADDR_MASK) != (frame_winner & ADDR_MASK) {
+        crate::mm::pmm::free_page(frame_winner);
+        crate::mm::pmm::free_page(frame_loser);
+        crate::proc::free_vm_space(vm);
+        test_fail!("anti_alias", "PTE no longer maps winner frame: pte={:#x} winner={:#x} loser={:#x}",
+            pte2, frame_winner, frame_loser);
+        return false;
+    }
+    test_println!("  (2) loser backed out; PTE still maps winner {:#x} — no aliasing ✓", frame_winner);
+
+    // Teardown: the VA still maps frame_winner; clearing the address space frees
+    // it via the page-table walk.  frame_loser was never mapped, so free it here.
+    crate::mm::pmm::free_page(frame_loser);
+    crate::proc::free_vm_space(vm);
+
+    test_pass!("map_page_in_if_absent anti-aliasing");
     true
 }
 
