@@ -593,6 +593,89 @@ pub fn map_page_in(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -
     true
 }
 
+/// Install `phys_addr` at `virt_addr` in `pml4_phys` **only if the leaf PTE is
+/// not already present**, performing the present-check and the install as one
+/// indivisible operation under `VMM_LOCK`.
+///
+/// Returns `true` if this call installed the mapping, `false` if a sibling CPU
+/// had already made the page present (in which case nothing is written and the
+/// caller's frame is redundant — it must be freed by the caller).
+///
+/// # Why this exists
+///
+/// `map_page_in` writes the leaf PTE unconditionally.  On a shared address
+/// space (CLONE_VM / vfork — several threads on one CR3, scheduled across
+/// logical processors), two CPUs can take a not-present `#PF` on the *same*
+/// anonymous virtual address concurrently.  Each allocates and zero-fills its
+/// own frame; whichever calls `map_page_in` second overwrites the leaf PTE
+/// with a *different* physical frame.  The first installer's CPU still caches
+/// the first frame in its TLB (its local `invlpg` only covered its own CPU and
+/// fired before the overwrite), so that CPU keeps reading the first frame while
+/// the page table — and every later faulting CPU — sees the second.  A store by
+/// one thread to a shared control word then lands on one frame and is never
+/// observed by the thread reading the other: a silent cross-CPU
+/// store-visibility failure on the shared stack page.
+///
+/// Doing the present-check atomically with the install closes the window: the
+/// loser observes the winner's already-present PTE under the same lock that
+/// serialises the install and backs out without aliasing the mapping.  This is
+/// the standard demand-paging re-validation (re-check the PTE under the
+/// page-table lock immediately before writing it).  Per Intel SDM Vol. 3A
+/// §4.10.4.3, no cross-CPU invalidation is required for the not-present →
+/// present transition itself; the hazard here is the second *frame*, which this
+/// guard prevents.
+pub fn map_page_in_if_absent(
+    pml4_phys: u64,
+    virt_addr: u64,
+    phys_addr: u64,
+    flags: u64,
+) -> bool {
+    let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
+    let _mm_read = _mm_guard.as_ref().map(|s| s.read());
+    let _lock = VMM_LOCK.lock();
+
+    let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
+    let pt_idx = ((virt_addr >> 12) & 0x1FF) as usize;
+
+    unsafe {
+        let pdpt_phys = match get_or_create_entry(pml4_phys, pml4_idx, flags) {
+            Some(addr) => addr,
+            None => return false,
+        };
+        let pd_phys = match get_or_create_entry(pdpt_phys, pdpt_idx, flags) {
+            Some(addr) => addr,
+            None => return false,
+        };
+        let pt_phys = match get_or_create_entry(pd_phys, pd_idx, flags) {
+            Some(addr) => addr,
+            None => return false,
+        };
+
+        let pt_ptr = p2v(pt_phys);
+        // Atomic-with-install present check: if a sibling won the race and
+        // already published a PTE for this VA, do NOT overwrite it.
+        let existing = *pt_ptr.add(pt_idx);
+        if existing & PAGE_PRESENT != 0 {
+            return false;
+        }
+        *pt_ptr.add(pt_idx) = (phys_addr & ADDR_MASK) | flags | PAGE_PRESENT;
+    }
+
+    #[cfg(feature = "firefox-test")]
+    crate::mm::w215_diag::pte_change_record(
+        virt_addr,
+        phys_addr & ADDR_MASK,
+        0,
+        crate::mm::w215_diag::PTE_KIND_MAP,
+        ring_caller_rip(),
+        pml4_phys,
+    );
+
+    true
+}
+
 /// Unmap a virtual page in an arbitrary page table.
 ///
 /// See `map_page_in` for the W216 `mm_sem` read-lock invariant.

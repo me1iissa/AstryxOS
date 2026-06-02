@@ -2730,8 +2730,66 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         crate::mm::pmm::free_page(phys);
                         return false;
                     }
-                    crate::mm::refcount::page_ref_set(phys, 1);
-                    crate::mm::vmm::map_page_in(cr3, page_addr, phys, page_flags);
+                    // Anti-aliasing re-check (POSIX mmap(2) demand paging;
+                    // Intel SDM Vol. 3A §4.10.4.3 "Optional Invalidation").
+                    //
+                    // On a shared address space (CLONE_VM / vfork — multiple
+                    // threads on one CR3, one per logical processor), two
+                    // CPUs can take a not-present #PF on the SAME anonymous VA
+                    // at the same time.  The hardware page-fault error code we
+                    // branched on (`!is_present`) was latched at fault time;
+                    // by the time we reach this install the *other* CPU may
+                    // already have allocated a frame and written the PTE.
+                    // Installing our own freshly-zeroed frame now would
+                    // overwrite the winner's PTE with a DIFFERENT physical
+                    // frame, leaving the winning CPU's TLB caching the first
+                    // frame while the page table points at the second — a
+                    // single VA backed by two frames.  A subsequent store by
+                    // the loser's thread (e.g. a release-store to a shared
+                    // control word) lands on the second frame, but the winner
+                    // keeps reading the first through its stale TLB entry, so
+                    // the store is never observed: a silent cross-CPU
+                    // store-visibility failure on the shared stack page.
+                    //
+                    // Install atomically-with-present-check under VMM_LOCK.
+                    // `map_page_in_if_absent` returns false (writing nothing) if
+                    // a sibling won the race and already published a PTE for
+                    // this VA, so we never overwrite the winner's mapping with a
+                    // second frame.  This is the standard demand-paging
+                    // re-validation: re-check the PTE under the page-table lock
+                    // immediately before writing it, and discard the loser's
+                    // frame rather than aliasing the mapping.  The file-backed
+                    // readahead arm above carries the same back-out
+                    // (`existing_pte & PAGE_PRESENT`); the anonymous arm needs
+                    // the identical guarantee for shared-CR3 stack pages.
+                    if crate::mm::vmm::map_page_in_if_absent(cr3, page_addr, phys, page_flags) {
+                        // We won the race and published the PTE — record the
+                        // single PTE reference and refresh our local TLB.  The
+                        // refcount is set AFTER a successful install so a lost
+                        // race leaves the frame at refcount 0 and frees cleanly
+                        // (pmm::free_page refuses to free a frame whose
+                        // pte_share_count is non-zero).
+                        crate::mm::refcount::page_ref_set(phys, 1);
+                        crate::mm::vmm::invlpg(page_addr);
+                        return true;
+                    }
+                    // Lost the race: a sibling CPU already mapped this VA.  Our
+                    // frame was never installed (refcount still 0), so it frees
+                    // cleanly.  Refresh THIS CPU's TLB so the faulting
+                    // instruction re-walks to the winner's authoritative PTE.
+                    #[cfg(feature = "firefox-test")]
+                    {
+                        static RACE: core::sync::atomic::AtomicU64 =
+                            core::sync::atomic::AtomicU64::new(0);
+                        let n = RACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        if n < 10 || n % 500 == 0 {
+                            crate::serial_println!(
+                                "[PF/anon-race] #{} addr={:#x} sibling already mapped — \
+                                 dropping our frame {:#x}",
+                                n, page_addr, phys);
+                        }
+                    }
+                    crate::mm::pmm::free_page(phys);
                     crate::mm::vmm::invlpg(page_addr);
                     return true;
                 }
