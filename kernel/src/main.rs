@@ -1389,7 +1389,21 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 // sched(7), a CPU must never be idle while a runnable peer
                 // exists.
                 crate::sched::yield_cpu();
-                unsafe { core::arch::asm!("hlt"); }
+                // Single-core robustness: under KVM a lone vCPU can have its
+                // LAPIC periodic timer suppressed by a framebuffer-MMIO exit
+                // storm and never resume, freezing the scheduler tick and
+                // TICK_COUNT (the dual-core path is immune — a sibling CPU
+                // keeps the global clock alive).  `idle_tick` reports whether
+                // the timer is healthy: if so we `hlt` and the next tick wakes
+                // us; if it is starved, `idle_tick` has already driven a
+                // software scheduler tick from the TSC and we MUST spin (not
+                // `hlt`) because a dead timer provides no wakeup.  A healthy
+                // timer — every SMP run — makes this a cheap `true` + `hlt`.
+                if crate::arch::x86_64::irq::idle_tick(5) {
+                    unsafe { core::arch::asm!("hlt"); }
+                } else {
+                    core::hint::spin_loop();
+                }
             }
 
             serial_println!("[FFTEST] firefox_exited={}", firefox_exited);
