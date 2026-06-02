@@ -2284,17 +2284,89 @@ pub(crate) fn sys_waitpid(pid: i64, options: u32) -> i64 {
 
     // Block the parent thread until a child exits.
     // We use wake_tick = u64::MAX-1 as a sentinel for "blocked in waitpid".
-    // exit_thread() wakes us when a child process becomes a zombie.
+    // exit_thread() / exit_group_inner() wake us when a child process becomes
+    // a zombie.
+    //
+    // ── Prepare-to-wait discipline (lost-wakeup close) ──────────────────────
+    //
+    // The wake side writes `ProcessState::Zombie` into PROCESS_TABLE first
+    // (lock dropped), THEN acquires THREAD_TABLE and flips this parent
+    // Blocked→Ready *only if* it observes `state == Blocked && wake_tick ==
+    // u64::MAX-1`.  The immediate-reap check above reads PROCESS_TABLE and
+    // drops it; if a child becomes a zombie in the window between that drop
+    // and this thread committing `Blocked`, the wake-side flip runs while we
+    // are still Running and is a no-op — the wake is lost.  Because the
+    // sentinel `wake_tick = u64::MAX-1` is scan-ineligible (the scheduler's
+    // due-wake scan requires `wake_tick != u64::MAX && now >= wake_tick`,
+    // never true for MAX-1) and this parker is not registered on any poll
+    // bell, the park would then never self-terminate → permanent hang of
+    // wait4(2).  POSIX wait(2): a child that has ALREADY terminated must be
+    // reapable without blocking.
+    //
+    // We close the window with the standard park-then-recheck handshake (the
+    // same shape as the poll/event waitlist in `ipc::waitlist`): commit
+    // `Blocked` under THREAD_TABLE, drop it, and THEN re-poll PROCESS_TABLE
+    // for a reapable zombie.  If a zombie is now visible we revert
+    // Blocked→Ready and reap without ever calling `schedule()`.
+    //
+    // Lock ordering / no-deadlock: this routine NEVER holds THREAD_TABLE and
+    // PROCESS_TABLE simultaneously — it takes THREAD_TABLE (commit Blocked),
+    // releases it, then takes PROCESS_TABLE (recheck via
+    // `crate::proc::waitpid`).  That matches the existing exit-path invariant
+    // ("Never hold THREAD_TABLE and PROCESS_TABLE simultaneously") and the
+    // wake side's own discipline (PROCESS_TABLE then THREAD_TABLE,
+    // sequentially, never nested), so no new lock-order edge is introduced.
+    //
+    // Why this is race-free against the concurrent child exit:
+    //   • If the child writes Zombie before we commit Blocked, our post-commit
+    //     recheck observes the zombie and reaps (no park).
+    //   • If the child writes Zombie after our recheck observed no zombie,
+    //     then our `Blocked` store happened-before that recheck, which
+    //     happened-before the child's Zombie write, which happens-before the
+    //     child's THREAD_TABLE flip — so the flip sees `Blocked` and wakes us.
+    //   • If the child writes Zombie strictly between our commit and recheck,
+    //     our recheck observes the zombie and reaps; we revert our own state
+    //     so we don't fall through still-Blocked.
     let max_attempts = 200; // Safety limit: ~200 wakeup cycles (~20 seconds at 100Hz)
+    let tid = crate::proc::current_tid();
     for _ in 0..max_attempts {
+        // (1) Commit Blocked under THREAD_TABLE, then drop the lock.
         {
-            let tid = crate::proc::current_tid();
             let mut threads = crate::proc::THREAD_TABLE.lock();
             if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
                 t.state = crate::proc::ThreadState::Blocked;
                 t.wake_tick = u64::MAX - 1; // sentinel: blocked in waitpid
             }
         }
+
+        // (2) Recheck PROCESS_TABLE for a reapable zombie WITHOUT holding
+        //     THREAD_TABLE.  A child that became a zombie in the
+        //     immediate-reap→commit window is caught here.  On a hit, revert
+        //     our own state to Ready (so a missed wake can't leave us Blocked)
+        //     and reap without parking.
+        if let Some((child_pid, exit_code)) = crate::proc::waitpid(parent_pid, pid) {
+            {
+                let mut threads = crate::proc::THREAD_TABLE.lock();
+                if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+                    if t.state == crate::proc::ThreadState::Blocked
+                        && t.wake_tick == u64::MAX - 1
+                    {
+                        t.state = crate::proc::ThreadState::Ready;
+                        t.wake_tick = u64::MAX;
+                    }
+                }
+            }
+            crate::serial_println!(
+                "[SYSCALL] waitpid: child PID {} exited with code {} (reaped without park)",
+                child_pid, exit_code
+            );
+            return child_pid as i64;
+        }
+
+        // (3) No zombie visible while we hold the Blocked commit → park.  A
+        //     wake that arrives after step (2) but before/at schedule() finds
+        //     us already Blocked and flips us Ready, so schedule() (or the
+        //     scheduler tick) returns us promptly.
         crate::sched::schedule();
 
         // We were woken up — try to reap.

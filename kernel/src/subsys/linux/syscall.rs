@@ -2939,6 +2939,24 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             parent_tid,
                         );
 
+                        // CLONE_VFORK prepare-to-wait: register the
+                        // child→parent wake mapping BEFORE unblocking the
+                        // child.  `wake_vfork_parent()` (called from the
+                        // child's execve(2)/exit path) acts only if it
+                        // observes `vfork_parent_tid == Some(parent_tid)`,
+                        // so the mapping must be visible before the child
+                        // can run — otherwise the child reads the initial
+                        // `None`, no-ops, and the parent parks with no waker
+                        // (lost wakeup, masked today only by the 500-tick
+                        // timeout below).  Per POSIX vfork(2): the parent
+                        // resumes only after the child execs or exits.
+                        if is_vfork {
+                            let mut threads = crate::proc::THREAD_TABLE.lock();
+                            if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
+                                t.vfork_parent_tid = Some(parent_tid);
+                            }
+                        }
+
                         // Unblock the child so the scheduler can run it.
                         crate::proc::unblock_process(child_pid);
 
@@ -2947,17 +2965,44 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         // needs the parent to block so the child can set up IPC first.
                         // Use a 500-tick timeout (~5 seconds) as a safety net.
                         if is_vfork {
+                            // Commit Blocked, then recheck the completion
+                            // token under the SAME THREAD_TABLE hold.  The
+                            // child's `wake_vfork_parent()` clears
+                            // `vfork_parent_tid` to `None` when it consumes
+                            // the token; if the child already ran (it execed
+                            // or exited in the unblock→here window), the
+                            // token is already `None` and its Blocked→Ready
+                            // flip raced ahead of our `Blocked` commit, so we
+                            // must NOT park — revert to Ready and fall
+                            // through.  Lock discipline: THREAD_TABLE only,
+                            // never nested with PROCESS_TABLE; same lock the
+                            // wake side takes, so the recheck is serialized
+                            // against the child's clear+flip.
                             let mut threads = crate::proc::THREAD_TABLE.lock();
-                            if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
-                                t.vfork_parent_tid = Some(parent_tid);
-                            }
+                            let child_completed = threads.iter()
+                                .find(|t| t.tid == child_tid)
+                                .map(|t| t.vfork_parent_tid.is_none())
+                                .unwrap_or(true); // child gone (exited+reaped) ⇒ completed
                             if let Some(t) = threads.iter_mut().find(|t| t.tid == parent_tid) {
-                                t.state = crate::proc::ThreadState::Blocked;
-                                // Timeout: wake after 500 ticks (~5s) even if child hasn't signaled
-                                let now = crate::arch::x86_64::irq::get_ticks();
-                                t.wake_tick = now.saturating_add(500);
+                                if child_completed {
+                                    // Race detected: wake already happened (or
+                                    // child is gone).  Do not park.
+                                    t.state = crate::proc::ThreadState::Ready;
+                                    t.wake_tick = u64::MAX;
+                                } else {
+                                    t.state = crate::proc::ThreadState::Blocked;
+                                    // Timeout backstop: wake after 500 ticks (~5s)
+                                    // even if the child never signals.
+                                    let now = crate::arch::x86_64::irq::get_ticks();
+                                    t.wake_tick = now.saturating_add(500);
+                                }
                             }
                             drop(threads);
+                            if child_completed {
+                                // Child already completed; skip the park
+                                // entirely and return as if resumed.
+                                return child_pid as i64;
+                            }
                             // VFORK/CANARY pre-block snapshot — see helper.
                             vfork_canary_snapshot("pre_block.clone", pid as u32, parent_tid);
                             // Axis-N+1 three-channel stack-provenance snapshot
@@ -4069,21 +4114,46 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             child_tls_base,
                             if clone_flags & CLONE_SETTLS != 0 { "CLONE_SETTLS" } else { "parent" });
 
-                        // NOW unblock the child
-                        crate::proc::unblock_process(child_pid);
-
-                        // Block parent for vfork
+                        // CLONE_VFORK prepare-to-wait: register the
+                        // child→parent wake mapping BEFORE unblocking the
+                        // child, for the same lost-wakeup reason documented
+                        // at the clone(56) site above (wake_vfork_parent acts
+                        // only on `Some(parent_tid)`).  Per POSIX vfork(2).
                         if is_vfork {
                             let mut threads = crate::proc::THREAD_TABLE.lock();
                             if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
                                 t.vfork_parent_tid = Some(parent_tid);
                             }
+                        }
+
+                        // NOW unblock the child
+                        crate::proc::unblock_process(child_pid);
+
+                        // Block parent for vfork
+                        if is_vfork {
+                            // Commit Blocked, then recheck the completion
+                            // token under the SAME THREAD_TABLE hold — see the
+                            // clone(56) site above for the full race analysis
+                            // and lock-ordering reasoning.
+                            let mut threads = crate::proc::THREAD_TABLE.lock();
+                            let child_completed = threads.iter()
+                                .find(|t| t.tid == child_tid)
+                                .map(|t| t.vfork_parent_tid.is_none())
+                                .unwrap_or(true); // child gone (exited+reaped) ⇒ completed
                             if let Some(t) = threads.iter_mut().find(|t| t.tid == parent_tid) {
-                                t.state = crate::proc::ThreadState::Blocked;
-                                let now = crate::arch::x86_64::irq::get_ticks();
-                                t.wake_tick = now.saturating_add(500);
+                                if child_completed {
+                                    t.state = crate::proc::ThreadState::Ready;
+                                    t.wake_tick = u64::MAX;
+                                } else {
+                                    t.state = crate::proc::ThreadState::Blocked;
+                                    let now = crate::arch::x86_64::irq::get_ticks();
+                                    t.wake_tick = now.saturating_add(500);
+                                }
                             }
                             drop(threads);
+                            if child_completed {
+                                return child_pid as i64;
+                            }
                             // VFORK/CANARY pre-block snapshot — see helper.
                             vfork_canary_snapshot("pre_block.clone3", pid as u32, parent_tid);
                             // Axis-N+1 three-channel stack-provenance snapshot
