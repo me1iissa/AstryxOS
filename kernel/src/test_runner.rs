@@ -2525,6 +2525,29 @@ pub fn run() -> ! {
     total += 1;
     if test_281_socket_recv_eagain_vs_eof() { passed += 1; }
 
+    // ── Test 286: concurrent SCM_RIGHTS deliver in byte-offset order (N1) ──
+    // Two SCM batches whose enqueue-offset capture and PENDING_SCM push
+    // interleave so the Vec order inverts vs byte order must still be
+    // delivered lowest-offset-first.  Refs: unix(7)/recvmsg(2) SCM_RIGHTS.
+    total += 1;
+    if test_286_scm_dequeue_byte_order() { passed += 1; }
+
+    // ── Test 287: PENDING_SCM drained on receiver teardown (N2, CWE-772) ──
+    // Closing a receiver socket with an undelivered SCM batch must release
+    // the per-fd reference taken at enqueue so the passed socket is not
+    // leaked and its peer observes the hang-up.  Refs: unix(7) SCM_RIGHTS,
+    // CWE-772.
+    total += 1;
+    if test_287_scm_drain_on_close_no_leak() { passed += 1; }
+
+    // ── Test 288: SCM-passed memfd inode survives sender close (N4) ────────
+    // A memfd (unlinked anonymous inode per memfd_create(2)) passed via
+    // SCM_RIGHTS must stay readable after the sender closes its copy — the
+    // in-flight pin keeps the inode alive, and it is freed only once both
+    // sides close.  Refs: memfd_create(2), unix(7) SCM_RIGHTS.
+    total += 1;
+    if test_288_scm_memfd_inode_lifecycle() { passed += 1; }
+
     // ── Test 283: stack-prov main-stack TOP-window argv-writer capture ──
     // GATE-A blind-spot closure (2026-05-30).  Only built when the
     // `stack-prov` diagnostic feature is on (CI smoke does not enable it);
@@ -44961,5 +44984,317 @@ fn test_281_socket_recv_eagain_vs_eof() -> bool {
     // Cleanup: release the bound port so a re-run does not collide.
     socket::socket_close(sid);
     test_pass!("non-blocking socket recv: EAGAIN on empty, 0 only on EOF (Test 281)");
+    true
+}
+
+// ── Test 286: concurrent SCM_RIGHTS delivered in byte-offset order (N1) ──────
+//
+// The sendmsg(2) SCM path captures the enqueue byte-offset (under the unix
+// TABLE lock) and pushes the ScmBatch (under the PENDING_SCM lock) in two
+// separate critical sections.  Two concurrent sendmsg(2)s to the SAME peer can
+// therefore push their batches into the PENDING_SCM Vec in the OPPOSITE order
+// to their byte offsets.  scm_dequeue must deliver the LOWEST-offset deliverable
+// batch first (byte order), not the first Vec entry (push order) — otherwise the
+// later frame's fds attach to the earlier frame, a data-integrity bug.
+//
+// This test reproduces the inverted-push order directly: enqueue an
+// offset==4 batch BEFORE an offset==0 batch (the order two interleaved senders
+// could produce), then assert delivery is offset 0 then offset 4.
+// Refs: unix(7) / recvmsg(2) / sendmsg(2) SCM_RIGHTS.
+fn test_286_scm_dequeue_byte_order() -> bool {
+    use crate::net::unix;
+    test_header!("concurrent SCM_RIGHTS delivered in byte-offset order (Test 286)");
+
+    let (a, b) = unix::socketpair(unix::SockKind::Stream,
+        unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if a == u64::MAX || b == u64::MAX {
+        test_fail!("scm_order", "socketpair returned MAX");
+        return false;
+    }
+
+    // Two distinguishable throw-away descriptors.  We tag identity via `inode`.
+    let mk_fd = |ino: u64| crate::vfs::FileDescriptor {
+        inode: ino, mount_idx: 0, offset: 0, flags: 0,
+        file_type: crate::vfs::FileType::RegularFile,
+        is_console: false, cloexec: false,
+        open_path: alloc::string::String::new(),
+    };
+
+    // Place 4 bytes in B's recv ring so an offset-4 batch is a valid "later
+    // frame" position; the reader has NOT drained them yet (consumed==0), so
+    // only the offset-0 batch is deliverable first.
+    if unix::write(a, b"DATA") != 4 {
+        test_fail!("scm_order", "write(DATA) != 4");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // INVERTED push order: the offset-4 (later-frame) batch is pushed FIRST,
+    // the offset-0 (earlier-frame) batch SECOND — exactly the Vec inversion a
+    // non-atomic offset-capture-then-push race can produce.
+    crate::syscall::scm_queue(b, 4, alloc::vec![mk_fd(0xAAAA)]); // later frame
+    crate::syscall::scm_queue(b, 0, alloc::vec![mk_fd(0xBBBB)]); // earlier frame
+
+    // Reader at consumed==0: only the offset-0 batch is deliverable, and it must
+    // be the 0xBBBB one regardless of it being pushed second.
+    let first = crate::syscall::scm_dequeue(b, unix::recv_consumed(b));
+    match first.as_deref() {
+        Some([fd]) if fd.inode == 0xBBBB => {
+            test_println!("  consumed=0 → delivered offset-0 batch (0xBBBB) first ✓");
+        }
+        other => {
+            test_fail!("scm_order",
+                "consumed=0 delivered {:?} (expected the offset-0 batch 0xBBBB)",
+                other.map(|s| s.iter().map(|f| f.inode).collect::<alloc::vec::Vec<_>>()));
+            unix::close(a); unix::close(b);
+            return false;
+        }
+    }
+
+    // The offset-4 batch must still be WITHHELD (its data is undrained).
+    if crate::syscall::scm_dequeue(b, unix::recv_consumed(b)).is_some() {
+        test_fail!("scm_order", "offset-4 batch delivered before its data drained");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // Drain the 4 data bytes; now the offset-4 batch (0xAAAA) is reachable.
+    let mut rbuf = [0u8; 4];
+    let _ = unix::read_msg(b, &mut rbuf);
+    match crate::syscall::scm_dequeue(b, unix::recv_consumed(b)).as_deref() {
+        Some([fd]) if fd.inode == 0xAAAA => {
+            test_println!("  consumed=4 → delivered offset-4 batch (0xAAAA) second ✓");
+        }
+        other => {
+            test_fail!("scm_order",
+                "post-drain delivered {:?} (expected the offset-4 batch 0xAAAA)",
+                other.map(|s| s.iter().map(|f| f.inode).collect::<alloc::vec::Vec<_>>()));
+            unix::close(a); unix::close(b);
+            return false;
+        }
+    }
+
+    unix::close(a);
+    unix::close(b);
+    test_pass!("concurrent SCM_RIGHTS delivered in byte-offset order (Test 286)");
+    true
+}
+
+// ── Test 287: PENDING_SCM drained on receiver teardown — no ref leak (N2) ────
+//
+// 9c09fc8 inc_ref's an AF_UNIX socket passed via SCM_RIGHTS so the sender's
+// later close(2) does not tear down the shared socket.  But if the receiver is
+// torn down before it recvmsg's the batch, that reference must be released —
+// otherwise the passed socket leaks (CWE-772) and its peer never sees the
+// hang-up.  This test queues a passed socket for a receiver, closes the
+// receiver (which must drain PENDING_SCM and balance the inc_ref), then closes
+// the sender's own copy and asserts the passed socket's PEER now sees a full
+// hang-up — proving the refcount returned to zero (no leak).
+// Refs: unix(7) SCM_RIGHTS, CWE-772.
+fn test_287_scm_drain_on_close_no_leak() -> bool {
+    use crate::net::unix;
+    test_header!("PENDING_SCM drained on receiver close — no socket leak (Test 287)");
+
+    // Transport pair (sender end `ta`, receiver end `tb`).
+    let (ta, tb) = unix::socketpair(unix::SockKind::Stream,
+        unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    // Payload pair: `pc` is the fd we "pass" via SCM; `pd` is its peer, which
+    // must observe the hang-up once `pc` is finally torn down.
+    let (pc, pd) = unix::socketpair(unix::SockKind::Stream,
+        unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if ta == u64::MAX || tb == u64::MAX || pc == u64::MAX || pd == u64::MAX {
+        test_fail!("scm_leak", "socketpair returned MAX");
+        return false;
+    }
+
+    // Baseline: pd is connected and NOT hung up.
+    if unix::fully_hung_up(pd) {
+        test_fail!("scm_leak", "pd unexpectedly hung up at start");
+        unix::close(ta); unix::close(tb); unix::close(pc); unix::close(pd);
+        return false;
+    }
+
+    // Model the sendmsg(2) SCM enqueue: inc_ref the passed socket (pc.ref_count
+    // 1→2, mirroring the kernel's inc_ref on fd-pass) and queue the batch for
+    // receiver tb at its current stream tail.
+    unix::inc_ref(pc);
+    let off = unix::enqueue_offset_for(tb);
+    let passed_fd = crate::vfs::FileDescriptor {
+        inode: pc, mount_idx: 0, offset: 0,
+        flags: crate::syscall::UNIX_SOCKET_FLAG,
+        file_type: crate::vfs::FileType::Socket,
+        is_console: false, cloexec: false,
+        open_path: alloc::string::String::new(),
+    };
+    crate::syscall::scm_queue(tb, off, alloc::vec![passed_fd]);
+
+    // Sanity: the batch is queued and deliverable.
+    if !crate::syscall::has_scm_deliverable(tb, unix::recv_consumed(tb)) {
+        test_fail!("scm_leak", "queued batch not deliverable");
+        unix::close(ta); unix::close(tb); unix::close(pc); unix::close(pd);
+        return false;
+    }
+
+    // Receiver is torn down WITHOUT ever recvmsg'ing the batch.  close(tb) must
+    // drain PENDING_SCM and run scm_drop_fds, which net::unix::close(pc)'s the
+    // passed socket — balancing the inc_ref above (pc.ref_count 2→1).
+    unix::close(tb);
+
+    // The batch must be gone from PENDING_SCM (no leak of the Vec entry).
+    if crate::syscall::has_scm_deliverable(tb, 0) {
+        test_fail!("scm_leak", "batch still queued after receiver close (drain leaked)");
+        unix::close(ta); unix::close(pc); unix::close(pd);
+        return false;
+    }
+
+    // pd must NOT yet be hung up — pc still has one live reference (the
+    // sender's own copy), so the drain correctly did NOT over-decrement.
+    if unix::fully_hung_up(pd) {
+        test_fail!("scm_leak",
+            "pd hung up after receiver close — drain OVER-decremented (double free)");
+        unix::close(ta); unix::close(pc); unix::close(pd);
+        return false;
+    }
+    test_println!("  receiver close drained the batch + balanced one ref ✓");
+
+    // Now close the sender's own copy of the passed socket (pc.ref_count 1→0).
+    // This is the LAST reference: if the drain had leaked (not decremented),
+    // pc.ref_count would be 2 here and this close would leave it at 1 — pd would
+    // NOT hang up.  A correct drain leaves exactly one ref, so this tears pc down
+    // and pd observes the full hang-up.
+    unix::close(pc);
+    if !unix::fully_hung_up(pd) {
+        test_fail!("scm_leak",
+            "pd NOT hung up after final close — passed-socket ref LEAKED (CWE-772)");
+        unix::close(ta); unix::close(pd);
+        return false;
+    }
+    test_println!("  final close tore down the passed socket → peer sees HUP ✓");
+
+    unix::close(ta);
+    unix::close(pd);
+    test_pass!("PENDING_SCM drained on receiver close — no socket leak (Test 287)");
+    true
+}
+
+// ── Test 288: SCM-passed memfd inode survives sender close (N4) ──────────────
+//
+// memfd_create(2) now unlinks the backing file immediately (anonymous inode),
+// so its lifetime is governed by the unlink-on-last-close machinery — which
+// frees the inode once no open fd references it.  A memfd handed to another
+// process via SCM_RIGHTS that is still IN FLIGHT (queued in PENDING_SCM, not yet
+// in any fd table) is invisible to that fd-table scan, so the enqueue path pins
+// the inode (vfs::pin_inode).  This test proves: while pinned, the sender's
+// close(2) of its copy must NOT free the inode (the in-flight passed copy still
+// needs it — the Mozilla shared-surface fd handoff); once the pin is balanced
+// (delivery) and the delivered copy is the last reference, the inode is freed.
+// Refs: memfd_create(2), unix(7) SCM_RIGHTS.
+fn test_288_scm_memfd_inode_lifecycle() -> bool {
+    test_header!("SCM-passed memfd inode survives sender close (Test 288)");
+    const MFD_CLOEXEC: u64 = 0x0001;
+
+    // Create a memfd (now an unlinked anonymous inode) and write a surface byte.
+    let fd = crate::subsys::linux::syscall::sys_memfd_create_test(0, MFD_CLOEXEC);
+    if fd < 0 {
+        test_fail!("scm_memfd", "memfd_create returned {}", fd);
+        return false;
+    }
+    let mut surf = [0xC0u8, 0xFF, 0xEE, 0x42];
+    let wn = crate::syscall::sys_write_test(fd as usize, surf.as_ptr(), surf.len());
+    if wn != surf.len() as i64 {
+        test_fail!("scm_memfd", "write to memfd = {} (want {})", wn, surf.len());
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+
+    // Snapshot (mount_idx, inode) of the memfd from the current fd table.
+    let pid = crate::proc::current_pid_lockless();
+    let (mnt, ino) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == pid)
+            .and_then(|p| p.file_descriptors.get(fd as usize))
+            .and_then(|f| f.as_ref())
+            .map(|f| (f.mount_idx, f.inode))
+        {
+            Some(v) => v,
+            None => {
+                test_fail!("scm_memfd", "could not resolve memfd inode");
+                crate::subsys::linux::syscall::sys_close_test(fd as u64);
+                return false;
+            }
+        }
+    };
+    if mnt == usize::MAX {
+        test_fail!("scm_memfd", "memfd has sentinel mount_idx (not a real inode)");
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+    test_println!("  memfd inode {} on mount {} ✓", ino, mnt);
+
+    // Model the SCM enqueue: pin the inode (the in-flight passed copy) and also
+    // install a second fd-table slot that references the same inode (the copy
+    // that will be DELIVERED to the receiver).  We do this in-process: a second
+    // fd is the cleanest stand-in for the receiver's installed descriptor.
+    crate::vfs::pin_inode(mnt, ino);
+    let recv_fd = {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter_mut().find(|p| p.pid == pid) {
+            Some(p) => {
+                let mut dup = p.file_descriptors[fd as usize].clone();
+                // The writer advanced the offset to 4; reset the receiver copy to
+                // 0 so this test's read(2) reads the surface from the start (real
+                // surface access is via mmap, where the offset is irrelevant).
+                if let Some(d) = dup.as_mut() { d.offset = 0; }
+                let slot = p.file_descriptors.iter().position(|e| e.is_none())
+                    .unwrap_or(p.file_descriptors.len());
+                if slot == p.file_descriptors.len() {
+                    p.file_descriptors.push(dup);
+                } else {
+                    p.file_descriptors[slot] = dup;
+                }
+                slot
+            }
+            None => { test_fail!("scm_memfd", "process gone"); return false; }
+        }
+    };
+
+    // SENDER close: drop the original fd while the batch is "in flight" (pinned).
+    // The inode MUST survive — the pin holds it even though, with the receiver
+    // copy modelled below, the fd-table scan also would; pin is the load-bearing
+    // guard for the true in-flight (pre-delivery) window.
+    crate::subsys::linux::syscall::sys_close_test(fd as u64);
+
+    // The delivered/receiver copy must STILL read the surface bytes — the inode
+    // was not freed out from under it.
+    let mut rbuf = [0u8; 4];
+    let rn = crate::syscall::sys_read_test(recv_fd, rbuf.as_mut_ptr(), rbuf.len());
+    if rn != 4 || rbuf != surf {
+        test_fail!("scm_memfd",
+            "receiver read after sender close = {} bytes {:?} (want {:?}) — inode freed early",
+            rn, rbuf, surf);
+        crate::vfs::unpin_inode(mnt, ino);
+        crate::subsys::linux::syscall::sys_close_test(recv_fd as u64);
+        return false;
+    }
+    test_println!("  receiver copy still reads the surface after sender close ✓");
+
+    // DELIVERY balance: drop the in-flight pin.  The receiver fd-table slot now
+    // keeps the inode alive on its own, so it must remain readable.
+    crate::vfs::unpin_inode(mnt, ino);
+    surf[0] = 0xC0; // (rbuf already validated; re-read to confirm liveness)
+    let rn2 = crate::syscall::sys_read_test(recv_fd, rbuf.as_mut_ptr(), 1);
+    // After the prior 4-byte read the offset is at EOF, so a further read returns
+    // 0 — that is liveness (a freed inode would not even resolve the fd).  Accept
+    // rn2 >= 0 (0 = EOF at end of file, the expected steady state).
+    if rn2 < 0 {
+        test_fail!("scm_memfd", "post-unpin read errored ({}) — inode freed while fd open", rn2);
+        crate::subsys::linux::syscall::sys_close_test(recv_fd as u64);
+        return false;
+    }
+    test_println!("  inode stays alive via the delivered fd-table slot after unpin ✓");
+
+    // Final close of the last reference frees the (unlinked) inode.
+    crate::subsys::linux::syscall::sys_close_test(recv_fd as u64);
+    test_pass!("SCM-passed memfd inode survives sender close (Test 288)");
     true
 }

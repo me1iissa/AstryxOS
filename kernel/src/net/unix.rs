@@ -674,6 +674,19 @@ pub fn close(id: u64) {
         }
     }
     drop(t);
+    // This socket is now fully torn down.  Any `SCM_RIGHTS` ancillary fds that
+    // were queued for it but never `recvmsg`'d are about to be lost — release
+    // the references that the sender took at enqueue time so the passed
+    // socket / pipe / file is not leaked and its peer observes the hang-up
+    // (CWE-772; unix(7) / recvmsg(2) SCM_RIGHTS: undelivered fds in a destroyed
+    // receive queue are dropped, mirroring close(2) of a delivered copy).
+    // The TABLE lock is released here, so draining (PENDING_SCM lock) and the
+    // per-fd drop (which may re-enter this function for a passed socket) cannot
+    // deadlock against the lock we just held.
+    let orphaned = crate::syscall::scm_drain_receiver(id);
+    if !orphaned.is_empty() {
+        crate::syscall::scm_drop_fds(orphaned);
+    }
     if ring {
         crate::ipc::waitlist::ring_poll_bell_for(
             crate::ipc::waitlist::PollBellSource::UnixShutdown);
