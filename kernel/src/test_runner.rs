@@ -2554,6 +2554,17 @@ pub fn run() -> ! {
     total += 1;
     if test_288_scm_memfd_inode_lifecycle() { passed += 1; }
 
+    // ── Test 289: SCM_RIGHTS fds bound to the FIRST byte of their frame ────
+    // A data-bearing sendmsg(2) that also carries SCM_RIGHTS must deliver the
+    // passed fds with the SAME recvmsg(2) that first returns the frame's
+    // bytes — even on a partial (header-first) read.  Binding the fd batch to
+    // the frame TAIL withholds the fds until every byte is drained, which
+    // breaks a reader that parses a message header announcing N handles and
+    // then expects those fds already present ("needs unreceived
+    // descriptors").  Refs: recvmsg(2), unix(7) SCM_RIGHTS, POSIX.1-2017.
+    total += 1;
+    if test_289_scm_first_byte_bind() { passed += 1; }
+
     // ── Test 283: stack-prov main-stack TOP-window argv-writer capture ──
     // GATE-A blind-spot closure (2026-05-30).  Only built when the
     // `stack-prov` diagnostic feature is on (CI smoke does not enable it);
@@ -45487,5 +45498,121 @@ fn test_288_scm_memfd_inode_lifecycle() -> bool {
     // Final close of the last reference frees the (unlinked) inode.
     crate::subsys::linux::syscall::sys_close_test(recv_fd as u64);
     test_pass!("SCM-passed memfd inode survives sender close (Test 288)");
+    true
+}
+
+// ── Test 289: SCM_RIGHTS fds bind to the FIRST byte of their frame ───────────
+//
+// sendmsg(2) on an AF_UNIX SOCK_STREAM that carries BOTH data and SCM_RIGHTS
+// must deliver the passed fds with the SAME recvmsg(2) that first returns that
+// frame's bytes — including the common case where the receiver reads the frame
+// in pieces (a length-prefixed IPC reader reads the small fixed header first,
+// sees that the message announces N handles, and expects those descriptors
+// already attached).  The kernel binds an SCM batch to a recv-stream byte
+// position and makes it deliverable once `recv_consumed >= byte_offset`
+// (scm_dequeue).  Binding to the frame TAIL (the position AFTER the data bytes
+// are pushed) withholds the fds until the reader drains EVERY byte of the
+// frame; a header-first reader then gets the bytes with NO cmsg and aborts with
+// the fatal "needs unreceived descriptors".  The fix binds to the FIRST byte
+// (the position captured BEFORE the data push), so the batch becomes
+// deliverable the instant the reader pops the frame's first byte.
+//
+// This test reproduces the partial-read scenario at the primitive layer: push
+// a multi-byte data frame, bind an fd batch to the frame's FIRST byte, then
+// read only the first byte and assert the batch is ALREADY deliverable (the
+// pre-fix tail bind would withhold it until all bytes were drained).
+//
+// Refs: recvmsg(2), sendmsg(2), unix(7) SCM_RIGHTS, POSIX.1-2017 §2.14.
+fn test_289_scm_first_byte_bind() -> bool {
+    use crate::net::unix;
+    test_header!("SCM_RIGHTS fds bound to the first byte of their frame (Test 289)");
+
+    let (a, b) = unix::socketpair(unix::SockKind::Stream,
+        unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if a == u64::MAX || b == u64::MAX {
+        test_fail!("scm_firstbyte", "socketpair returned MAX");
+        return false;
+    }
+
+    let mk_fd = || crate::vfs::FileDescriptor {
+        inode: 0xF00D, mount_idx: 0, offset: 0, flags: 0,
+        file_type: crate::vfs::FileType::RegularFile,
+        is_console: false, cloexec: false,
+        open_path: alloc::string::String::new(),
+    };
+
+    // Capture B's recv position BEFORE pushing this frame's data — exactly the
+    // pre-push offset the sendmsg path now binds to (scm_bind_offset).
+    let first_byte_off = unix::enqueue_offset_for(b);
+
+    // Push an 8-byte data frame into B's recv ring (the "message").
+    let n = unix::write(a, b"HDRBODY!");
+    if n != 8 {
+        test_fail!("scm_firstbyte", "write(8) = {} (want 8)", n);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // Bind the fd batch to the FIRST byte of the frame (the fix).  The pre-fix
+    // tail bind would have used enqueue_offset_for(b) AFTER the write (== 8).
+    let tail_off = unix::enqueue_offset_for(b);
+    if tail_off != first_byte_off + 8 {
+        test_fail!("scm_firstbyte",
+            "tail offset {} != first {} + 8", tail_off, first_byte_off);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    crate::syscall::scm_queue(b, first_byte_off, alloc::vec![mk_fd()]);
+
+    // Reader has consumed nothing yet — batch must be WITHHELD (it binds to the
+    // first byte, which the reader has not reached).
+    if crate::syscall::has_scm_deliverable(b, unix::recv_consumed(b)) {
+        test_fail!("scm_firstbyte", "batch deliverable before any byte read");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // Read ONLY the first byte of the 8-byte frame (a partial / header-first
+    // read).  recv_consumed advances by 1 — now >= first_byte_off.
+    let mut one = [0u8; 1];
+    let rn = unix::read_msg(b, &mut one).map(|(c, _)| c).unwrap_or(0xFFFF);
+    if rn != 1 || one[0] != b'H' {
+        test_fail!("scm_firstbyte", "partial read = {} / {:?} (want 1/'H')", rn, one);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // THE REGRESSION ASSERTION: with the first-byte bind, the fds are now
+    // deliverable even though 7 of the 8 frame bytes remain unread.  The pre-fix
+    // tail bind (offset 8) would still withhold them here → the recvmsg that
+    // first returned the frame's bytes would carry NO cmsg → fatal error.
+    if !crate::syscall::has_scm_deliverable(b, unix::recv_consumed(b)) {
+        test_fail!("scm_firstbyte",
+            "fds NOT deliverable after first byte (tail-bind regression)");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    let got = crate::syscall::scm_dequeue(b, unix::recv_consumed(b));
+    if got.map(|v| v.len()) != Some(1) {
+        test_fail!("scm_firstbyte", "first-byte dequeue did not return the fd");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    test_println!("  fds delivered on the first byte of their frame (partial read) ✓");
+
+    // The remaining 7 data bytes are still readable and intact (the fd batch
+    // delivery did not disturb the data stream).
+    let mut rest = [0u8; 7];
+    let rrn = unix::read_msg(b, &mut rest).map(|(c, _)| c).unwrap_or(0xFFFF);
+    if rrn != 7 || &rest != b"DRBODY!" {
+        test_fail!("scm_firstbyte", "remaining read = {} / {:?}", rrn, rest);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    test_println!("  remaining frame bytes intact after fd delivery ✓");
+
+    unix::close(a);
+    unix::close(b);
+    test_pass!("SCM_RIGHTS fds bound to the first byte of their frame (Test 289)");
     true
 }
