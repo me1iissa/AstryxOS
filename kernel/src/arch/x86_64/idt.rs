@@ -1715,14 +1715,62 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                             let _ = crate::mm::refcount::page_ref_dec(cached_phys);
                             return false;
                         }
-                        crate::mm::refcount::page_ref_set(private_phys, 1);
-                        crate::mm::vmm::map_page_in(cr3, page_addr, private_phys, page_flags);
+                        // Anti-aliasing install (POSIX mmap(2) MAP_PRIVATE;
+                        // Intel SDM Vol. 3A §4.10.4.3 "Optional Invalidation").
+                        // On a shared address space (CLONE_VM / vfork — several
+                        // threads on one CR3 across logical processors) two CPUs
+                        // can take a not-present #PF on the SAME private-writable
+                        // VA (a libxul GOT/PLT/.data/.bss page) concurrently;
+                        // each mints its own `private_phys`.  An unconditional
+                        // `map_page_in` here would let the loser overwrite the
+                        // winner's leaf PTE with a DIFFERENT frame: the winner
+                        // keeps reading its frame through its stale local TLB
+                        // entry while the loser's relocation store lands on the
+                        // other frame and is never observed — the same cross-CPU
+                        // store-visibility failure the anonymous arm carries.
+                        // Per MAP_PRIVATE a private VA in a shared address space
+                        // must resolve to exactly ONE backing frame.
+                        //
+                        // Install with a present-recheck atomic under VMM_LOCK.
+                        // The refcount on `private_phys` is set only AFTER a
+                        // successful install, so a lost race leaves it at 0 and
+                        // it frees cleanly.
+                        if crate::mm::vmm::map_page_in_if_absent(
+                            cr3, page_addr, private_phys, page_flags)
+                        {
+                            crate::mm::refcount::page_ref_set(private_phys, 1);
+                            crate::mm::vmm::invlpg(page_addr);
+                            // Release the guard ref acquired by
+                            // `lookup_and_acquire`.  The PTE now refers to
+                            // `private_phys`, not `cached_phys`; the cache still
+                            // holds its own independent reference to
+                            // `cached_phys`, so this dec will not free the frame.
+                            let _ = crate::mm::refcount::page_ref_dec(cached_phys);
+                            return true;
+                        }
+                        // Lost the race: a sibling CPU already published a PTE
+                        // for this VA.  `private_phys` was never mapped and its
+                        // refcount is still 0, so it frees cleanly.  Release the
+                        // guard ref exactly as the winner path does (the cache's
+                        // own ref keeps `cached_phys` alive), refresh THIS CPU's
+                        // TLB so the faulting instruction re-walks to the
+                        // winner's authoritative PTE, and report success.
+                        #[cfg(feature = "firefox-test")]
+                        {
+                            static RACE: core::sync::atomic::AtomicU64 =
+                                core::sync::atomic::AtomicU64::new(0);
+                            let n = RACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            if n < 10 || n % 500 == 0 {
+                                crate::serial_println!(
+                                    "[PF/cache-private-race] #{} addr={:#x} sibling \
+                                     already mapped — dropping private frame {:#x}",
+                                    n, page_addr, private_phys);
+                            }
+                        }
+                        crate::mm::pmm::free_page(private_phys);
                         crate::mm::vmm::invlpg(page_addr);
-                        // Release the guard ref acquired by `lookup_and_acquire`.
-                        // The PTE now refers to `private_phys`, not `cached_phys`;
-                        // the cache still holds its own independent reference to
-                        // `cached_phys`, so this dec will not free the frame.
                         let _ = crate::mm::refcount::page_ref_dec(cached_phys);
+                        return true;
                     } else {
                         // PMM exhausted: cannot allocate a private copy.
                         //
@@ -1809,10 +1857,50 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                             }
                         }
                     }
-                    crate::mm::vmm::map_page_in(cr3, page_addr, cached_phys, page_flags);
-                    crate::mm::vmm::invlpg(page_addr);
-                    // Guard ref is intentionally NOT released — it has been
-                    // promoted to the PTE reference.
+                    // Anti-aliasing install (POSIX mmap(2) MAP_SHARED / read-
+                    // only alias; Intel SDM Vol. 3A §4.10.4.3).  This arm
+                    // installs the SHARED cache frame directly.  Two CPUs on a
+                    // shared CR3 can reach this install for the same VA
+                    // concurrently; the unconditional `map_page_in` would let
+                    // the loser re-write a PTE the winner already published.
+                    // Because both would install the SAME `cached_phys` the
+                    // resulting PTE value is identical, so there is no two-frame
+                    // aliasing hazard here — but the refcount accounting double-
+                    // promotes the guard ref (one guard ref per CPU promoted to
+                    // "the" PTE ref for one PTE).  Use the present-recheck so
+                    // exactly one CPU promotes its guard ref to the PTE ref and
+                    // the loser releases its now-redundant guard ref, keeping the
+                    // cache-frame refcount at the cache(1)+PTE(1) steady state.
+                    if crate::mm::vmm::map_page_in_if_absent(
+                        cr3, page_addr, cached_phys, page_flags)
+                    {
+                        crate::mm::vmm::invlpg(page_addr);
+                        // Won: guard ref is intentionally NOT released — it has
+                        // been promoted to the PTE reference.
+                    } else {
+                        // Lost: a sibling CPU already published the PTE for this
+                        // VA (and, being the SAME cache frame, promoted its own
+                        // guard ref to the PTE ref).  Our guard ref is now
+                        // redundant: release it so the frame nets cache(1) +
+                        // sibling-PTE(1) = 2.  Do NOT free the cache frame — it
+                        // is shared and still referenced.  Refresh THIS CPU's
+                        // TLB and report success.
+                        #[cfg(feature = "firefox-test")]
+                        {
+                            static RACE: core::sync::atomic::AtomicU64 =
+                                core::sync::atomic::AtomicU64::new(0);
+                            let n = RACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            if n < 10 || n % 500 == 0 {
+                                crate::serial_println!(
+                                    "[PF/cache-alias-race] #{} addr={:#x} phys={:#x} \
+                                     sibling already mapped — releasing guard ref",
+                                    n, page_addr, cached_phys);
+                            }
+                        }
+                        let _ = crate::mm::refcount::page_ref_dec(cached_phys);
+                        crate::mm::vmm::invlpg(page_addr);
+                        return true;
+                    }
                 }
                 #[cfg(feature = "firefox-test")]
                 {
@@ -2298,11 +2386,49 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                                 crate::mm::pmm::PAGE_SIZE,
                             );
                         }
-                        crate::mm::refcount::page_ref_set(private_phys, 1);
-                        crate::mm::vmm::map_page_in(cr3, vaddr, private_phys, page_flags);
-                        // Cache keeps its ref to phys (the clean shared copy).
-                        // Drop guard ref — steady state: cache ref(phys) = 1.
-                        let _ = crate::mm::refcount::page_ref_dec(phys);
+                        // Anti-aliasing install (POSIX mmap(2) MAP_PRIVATE;
+                        // Intel SDM Vol. 3A §4.10.4.3).  The `existing_pte`
+                        // present-check above (the `continue` back-out) and
+                        // this install are not one atomic step, so a sibling
+                        // CPU on a shared CR3 can publish a PTE for `vaddr`
+                        // between them.  An unconditional `map_page_in` would
+                        // then overwrite the winner's leaf PTE with our DIFFERENT
+                        // `private_phys` frame — the cross-CPU store-visibility
+                        // failure on a libxul private-writable page.  Install
+                        // with a present-recheck atomic under VMM_LOCK; set the
+                        // refcount only AFTER a successful install so a lost race
+                        // frees `private_phys` cleanly.
+                        if crate::mm::vmm::map_page_in_if_absent(
+                            cr3, vaddr, private_phys, page_flags)
+                        {
+                            crate::mm::refcount::page_ref_set(private_phys, 1);
+                            // Cache keeps its ref to phys (the clean shared copy).
+                            // Drop guard ref — steady state: cache ref(phys) = 1.
+                            let _ = crate::mm::refcount::page_ref_dec(phys);
+                            crate::mm::vmm::invlpg(vaddr);
+                        } else {
+                            // Lost the race: a sibling already published this VA.
+                            // `private_phys` was never mapped (refcount still 0)
+                            // → frees cleanly; release the guard ref on the cache
+                            // frame exactly as the winner path does, refresh THIS
+                            // CPU's TLB, and move to the next readahead page.
+                            #[cfg(feature = "firefox-test")]
+                            {
+                                static RACE: core::sync::atomic::AtomicU64 =
+                                    core::sync::atomic::AtomicU64::new(0);
+                                let n = RACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                                if n < 10 || n % 500 == 0 {
+                                    crate::serial_println!(
+                                        "[PF/ra-private-race] #{} vaddr={:#x} sibling \
+                                         already mapped — dropping private frame {:#x}",
+                                        n, vaddr, private_phys);
+                                }
+                            }
+                            crate::mm::pmm::free_page(private_phys);
+                            let _ = crate::mm::refcount::page_ref_dec(phys);
+                            crate::mm::vmm::invlpg(vaddr);
+                            continue;
+                        }
                     } else {
                         // PMM exhausted: cannot allocate a private copy.
                         //
@@ -2354,12 +2480,50 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                             }
                         }
                     }
-                    crate::mm::refcount::page_ref_inc(phys);
-                    crate::mm::vmm::map_page_in(cr3, vaddr, phys, page_flags);
-                    // Drop guard ref — steady state: cache(1) + PTE(1) = 2.
-                    let _ = crate::mm::refcount::page_ref_dec(phys);
+                    // Anti-aliasing install (POSIX mmap(2) MAP_SHARED / read-
+                    // only alias; Intel SDM Vol. 3A §4.10.4.3).  The loop-top
+                    // `existing_pte` present-check and this install are not one
+                    // atomic step, so a sibling CPU on a shared CR3 can publish
+                    // a PTE for `vaddr` in between.  `phys` is THIS CPU's fresh
+                    // readahead frame; an unconditional `map_page_in` would
+                    // overwrite the sibling's already-published PTE (which may
+                    // reference a DIFFERENT frame) with ours — a two-frame alias.
+                    // Install with a present-recheck atomic under VMM_LOCK; the
+                    // PTE ref is taken (inc) only on a successful install.
+                    if crate::mm::vmm::map_page_in_if_absent(
+                        cr3, vaddr, phys, page_flags)
+                    {
+                        crate::mm::refcount::page_ref_inc(phys); // PTE reference
+                        // Drop guard ref — steady state: cache(1) + PTE(1) = 2.
+                        let _ = crate::mm::refcount::page_ref_dec(phys);
+                        crate::mm::vmm::invlpg(vaddr);
+                    } else {
+                        // Lost the race: a sibling already published this VA.
+                        // Our `phys` is the redundant frame — mirror the loop-top
+                        // back-out: conditionally evict our cache entry (only if
+                        // it still names our phys), drop the guard ref, free the
+                        // frame if it reached zero, refresh THIS CPU's TLB, and
+                        // move to the next readahead page.  No PTE ref is taken.
+                        #[cfg(feature = "firefox-test")]
+                        {
+                            static RACE: core::sync::atomic::AtomicU64 =
+                                core::sync::atomic::AtomicU64::new(0);
+                            let n = RACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            if n < 10 || n % 500 == 0 {
+                                crate::serial_println!(
+                                    "[PF/ra-alias-race] #{} vaddr={:#x} phys={:#x} \
+                                     sibling already mapped — discarding our frame",
+                                    n, vaddr, phys);
+                            }
+                        }
+                        crate::mm::cache::evict_if_phys(mount_idx, inode, foff, phys);
+                        if crate::mm::refcount::page_ref_dec(phys) == 0 {
+                            crate::mm::pmm::free_page(phys);
+                        }
+                        crate::mm::vmm::invlpg(vaddr);
+                        continue;
+                    }
                 }
-                crate::mm::vmm::invlpg(vaddr);
             }
 
             // Log progress periodically
@@ -2604,12 +2768,49 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                                 crate::mm::pmm::PAGE_SIZE,
                             );
                         }
-                        crate::mm::refcount::page_ref_set(private_phys, 1);
-                        crate::mm::vmm::map_page_in(cr3, page_addr, private_phys, page_flags);
+                        // Anti-aliasing install (POSIX mmap(2) MAP_PRIVATE;
+                        // Intel SDM Vol. 3A §4.10.4.3).  On a shared CR3 two CPUs
+                        // can take a not-present #PF on the SAME private-writable
+                        // VA (a libxul GOT/PLT/.data/.bss page) concurrently and
+                        // each reach this single-page fallback with its own
+                        // `private_phys`.  An unconditional `map_page_in` lets
+                        // the loser overwrite the winner's leaf PTE with a
+                        // DIFFERENT frame — the cross-CPU store-visibility
+                        // failure.  Install with a present-recheck atomic under
+                        // VMM_LOCK; set the refcount only AFTER a successful
+                        // install so a lost race frees `private_phys` cleanly.
+                        if crate::mm::vmm::map_page_in_if_absent(
+                            cr3, page_addr, private_phys, page_flags)
+                        {
+                            crate::mm::refcount::page_ref_set(private_phys, 1);
+                            crate::mm::vmm::invlpg(page_addr);
+                            // Cache keeps its own ref to phys (clean shared copy).
+                            // Release guard — steady state: cache ref(phys) = 1.
+                            let _ = crate::mm::refcount::page_ref_dec(phys);
+                            return true;
+                        }
+                        // Lost the race: a sibling already published this VA.
+                        // `private_phys` was never mapped (refcount still 0) →
+                        // frees cleanly; release the guard ref on the cache frame
+                        // exactly as the winner path does, refresh THIS CPU's TLB,
+                        // and report success so the faulting instruction re-walks
+                        // to the winner's authoritative PTE.
+                        #[cfg(feature = "firefox-test")]
+                        {
+                            static RACE: core::sync::atomic::AtomicU64 =
+                                core::sync::atomic::AtomicU64::new(0);
+                            let n = RACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            if n < 10 || n % 500 == 0 {
+                                crate::serial_println!(
+                                    "[PF/spf-private-race] #{} addr={:#x} sibling \
+                                     already mapped — dropping private frame {:#x}",
+                                    n, page_addr, private_phys);
+                            }
+                        }
+                        crate::mm::pmm::free_page(private_phys);
                         crate::mm::vmm::invlpg(page_addr);
-                        // Cache keeps its own ref to phys (clean shared copy).
-                        // Release guard — steady state: cache ref(phys) = 1.
                         let _ = crate::mm::refcount::page_ref_dec(phys);
+                        return true;
                     } else {
                         // PMM exhausted: cannot allocate a private copy.
                         //
@@ -2665,11 +2866,47 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         crate::mm::w215_diag::KIND_PFH_INSTALL,
                         crate::mm::w215_diag::pack_cache_key(inode, file_page_offset),
                     );
-                    crate::mm::refcount::page_ref_inc(phys); // PTE reference
-                    crate::mm::vmm::map_page_in(cr3, page_addr, phys, page_flags);
+                    // Anti-aliasing install (POSIX mmap(2) MAP_SHARED / read-
+                    // only alias; Intel SDM Vol. 3A §4.10.4.3).  `phys` is THIS
+                    // CPU's fresh single-page frame.  On a shared CR3 a sibling
+                    // can publish a PTE for `page_addr` (referencing a possibly-
+                    // DIFFERENT frame) between this CPU's fault and this install;
+                    // an unconditional `map_page_in` would overwrite it with our
+                    // frame — a two-frame alias.  Install with a present-recheck
+                    // atomic under VMM_LOCK; the PTE ref is taken only on a
+                    // successful install.
+                    if crate::mm::vmm::map_page_in_if_absent(
+                        cr3, page_addr, phys, page_flags)
+                    {
+                        crate::mm::refcount::page_ref_inc(phys); // PTE reference
+                        crate::mm::vmm::invlpg(page_addr);
+                        // Release guard — steady state: cache(1) + PTE(1) = 2.
+                        let _ = crate::mm::refcount::page_ref_dec(phys);
+                        return true;
+                    }
+                    // Lost the race: a sibling already published this VA.  Our
+                    // `phys` is the redundant frame — conditionally evict our
+                    // cache entry (only if it still names our phys), release the
+                    // guard ref, free the frame if it reached zero, refresh THIS
+                    // CPU's TLB, and report success.  No PTE ref is taken.
+                    #[cfg(feature = "firefox-test")]
+                    {
+                        static RACE: core::sync::atomic::AtomicU64 =
+                            core::sync::atomic::AtomicU64::new(0);
+                        let n = RACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        if n < 10 || n % 500 == 0 {
+                            crate::serial_println!(
+                                "[PF/spf-alias-race] #{} addr={:#x} phys={:#x} \
+                                 sibling already mapped — discarding our frame",
+                                n, page_addr, phys);
+                        }
+                    }
+                    crate::mm::cache::evict_if_phys(mount_idx, inode, file_page_offset, phys);
+                    if crate::mm::refcount::page_ref_dec(phys) == 0 {
+                        crate::mm::pmm::free_page(phys);
+                    }
                     crate::mm::vmm::invlpg(page_addr);
-                    // Release guard — steady state: cache(1) + PTE(1) = 2.
-                    let _ = crate::mm::refcount::page_ref_dec(phys);
+                    return true;
                 }
                 return true;
             }

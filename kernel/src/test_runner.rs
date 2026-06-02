@@ -1064,6 +1064,10 @@ pub fn run() -> ! {
     total += 1;
     if test_map_page_in_if_absent_anti_alias() { passed += 1; }
 
+    // ── Test 98h: file-backed install-arm anti-aliasing back-out ─────────
+    total += 1;
+    if test_pfh_install_arm_anti_alias_backout() { passed += 1; }
+
     // ── Test 99: procfs self/maps — per-process VMA listing ──────────────
 
     total += 1;
@@ -29173,6 +29177,164 @@ fn test_map_page_in_if_absent_anti_alias() -> bool {
     crate::proc::free_vm_space(vm);
 
     test_pass!("map_page_in_if_absent anti-aliasing");
+    true
+}
+
+/// Regression test for the file-backed page-fault install-arm anti-aliasing
+/// back-out (the libxul GOT/PLT/.data/.bss private-writable segment race).
+///
+/// The cache-hit / readahead / single-page install arms in `handle_page_fault`
+/// mint a backing frame and publish a leaf PTE for a file-backed
+/// MAP_PRIVATE-writable VA.  On a shared address space (CLONE_VM / vfork) two
+/// CPUs can reach the SAME VA's install concurrently.  The arms were converted
+/// from an unconditional `map_page_in` to `map_page_in_if_absent` so the loser
+/// backs out instead of overwriting the winner's PTE with a second frame (the
+/// cross-CPU store-visibility failure).  This test models the two back-out
+/// shapes used by those arms and proves the refcount accounting nets correctly:
+///
+///   (A) PRIVATE-COPY shape — the loser's freshly-allocated private frame was
+///       never mapped (refcount left at 0 until a successful install), so the
+///       arm must `free_page` it with NO leak and NO refcount drift, while the
+///       winner's private frame stays mapped at refcount 1.
+///   (B) ALIAS shape — the installed frame is the SHARED cache frame; the loser
+///       must NOT free it but must release its redundant guard ref so the frame
+///       nets cache(1) + winner-PTE(1) = 2 with no drift.
+///
+/// Refs: POSIX mmap(2) MAP_PRIVATE (a private VA in a shared address space must
+/// resolve to one backing frame); Intel SDM Vol. 3A §4.10.4.3 (present-recheck
+/// before leaf install; per-logical-processor invalidation).
+fn test_pfh_install_arm_anti_alias_backout() -> bool {
+    test_header!("PFH install-arm anti-aliasing back-out (private-copy + alias)");
+
+    use crate::mm::vmm::{read_pte, map_page_in_if_absent, PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER, ADDR_MASK};
+    use crate::mm::refcount::{page_ref_set, page_ref_inc, page_ref_dec, page_ref_count,
+        page_ref_dec_underflow_count};
+
+    let vm = match crate::mm::vma::VmSpace::new_user() {
+        Some(vs) => vs,
+        None => { test_fail!("backout", "VmSpace::new_user() OOM"); return false; }
+    };
+    let cr3 = vm.cr3;
+    let va: u64 = 0x5555_0001_0000;            // file-backed-style lower-half VA
+    let page = crate::mm::vma::page_align_down(va);
+    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+
+    let underflow_before = page_ref_dec_underflow_count();
+
+    // Helper: free up to three frames + the address space, then fail.
+    macro_rules! bail {
+        ($($f:expr),* ; $($arg:tt)*) => {{
+            $( crate::mm::pmm::free_page($f); )*
+            crate::proc::free_vm_space(vm);
+            test_fail!("backout", $($arg)*);
+            return false;
+        }};
+    }
+
+    // ── (A) PRIVATE-COPY shape ────────────────────────────────────────────
+    // Winner: alloc private frame, install, THEN set refcount 1 (mirrors the
+    // arm order: refcount is set only after a successful install).
+    let priv_winner = match crate::mm::pmm::alloc_page() {
+        Some(p) => p, None => bail!( ; "OOM priv_winner"),
+    };
+    if !map_page_in_if_absent(cr3, page, priv_winner, flags) {
+        bail!(priv_winner ; "priv winner install returned false on not-present PTE");
+    }
+    page_ref_set(priv_winner, 1);
+
+    // Loser: alloc a DIFFERENT private frame (refcount stays 0 — never set),
+    // race the SAME VA → must lose, and the arm frees it WITHOUT a refcount
+    // touch (frame at 0 frees cleanly; no underflow).
+    let priv_loser = match crate::mm::pmm::alloc_page() {
+        Some(p) => p, None => bail!(priv_winner ; "OOM priv_loser"),
+    };
+    if priv_loser == priv_winner {
+        bail!(priv_winner, priv_loser ; "allocator returned identical frames");
+    }
+    let lost_a = map_page_in_if_absent(cr3, page, priv_loser, flags);
+    if lost_a {
+        bail!(priv_winner, priv_loser ; "priv loser returned true — overwrote winner PTE (aliasing)");
+    }
+    // PTE must still map the winner's private frame.
+    let pte_a = read_pte(cr3, va);
+    if (pte_a & ADDR_MASK) != (priv_winner & ADDR_MASK) {
+        bail!(priv_winner, priv_loser ; "PTE no longer maps priv_winner: pte={:#x} winner={:#x}",
+            pte_a, priv_winner);
+    }
+    // The loser frame was never mapped and its refcount is 0 → the arm frees it.
+    // We model that free here and confirm no refcount drift / underflow.
+    if page_ref_count(priv_loser) != 0 {
+        bail!(priv_winner, priv_loser ; "priv_loser refcount drifted to {} (expected 0)",
+            page_ref_count(priv_loser));
+    }
+    crate::mm::pmm::free_page(priv_loser);   // loser-frees path — no leak
+    if page_ref_count(priv_winner) != 1 {
+        bail!(priv_winner ; "priv_winner refcount drifted to {} (expected 1)",
+            page_ref_count(priv_winner));
+    }
+    test_println!("  (A) private-copy loser freed its unmapped frame; winner intact (rc=1) ✓");
+
+    // ── (B) ALIAS shape ───────────────────────────────────────────────────
+    // A shared cache frame: cache holds one ref, plus a guard ref per faulting
+    // CPU.  Winner promotes its guard ref to the PTE ref (no dec); loser must
+    // release its redundant guard ref so the frame nets cache(1)+PTE(1)=2.
+    let va2: u64 = 0x5555_0002_0000;
+    let page2 = crate::mm::vma::page_align_down(va2);
+    let cache_phys = match crate::mm::pmm::alloc_page() {
+        Some(p) => p, None => bail!(priv_winner ; "OOM cache_phys"),
+    };
+    page_ref_set(cache_phys, 1);             // cache's own reference
+    page_ref_inc(cache_phys);                // winner's guard ref
+    page_ref_inc(cache_phys);                // loser's guard ref  → rc = 3
+
+    // Winner installs the SHARED frame, promoting its guard ref to the PTE ref
+    // (does NOT dec).  rc stays 3 (cache + winner-PTE + loser-guard).
+    if !map_page_in_if_absent(cr3, page2, cache_phys, flags) {
+        page_ref_set(cache_phys, 0);
+        bail!(priv_winner, cache_phys ; "alias winner install returned false on not-present PTE");
+    }
+    // Loser races the SAME VA → must lose and release ONLY its guard ref
+    // (do NOT free the shared frame).  Model that release: dec once.
+    let lost_b = map_page_in_if_absent(cr3, page2, cache_phys, flags);
+    if lost_b {
+        page_ref_set(cache_phys, 0);
+        bail!(priv_winner, cache_phys ; "alias loser returned true — re-published shared PTE");
+    }
+    let rc_after_loss = page_ref_dec(cache_phys);   // loser releases guard ref
+    if rc_after_loss != 2 {
+        page_ref_set(cache_phys, 0);
+        bail!(priv_winner, cache_phys ; "alias frame refcount after loser back-out = {} (expected 2: cache+PTE)",
+            rc_after_loss);
+    }
+    // PTE still maps the shared frame (winner's mapping survived).
+    let pte_b = read_pte(cr3, va2);
+    if (pte_b & ADDR_MASK) != (cache_phys & ADDR_MASK) {
+        page_ref_set(cache_phys, 0);
+        bail!(priv_winner, cache_phys ; "alias PTE no longer maps cache_phys: pte={:#x} phys={:#x}",
+            pte_b, cache_phys);
+    }
+    test_println!("  (B) alias loser released guard ref; frame intact (rc=2), not freed ✓");
+
+    // No refcount-dec underflow may have been triggered by either back-out.
+    let underflow_after = page_ref_dec_underflow_count();
+    if underflow_after != underflow_before {
+        page_ref_set(cache_phys, 0);
+        bail!(priv_winner, cache_phys ; "refcount-dec underflow fired {} time(s) during back-out",
+            underflow_after - underflow_before);
+    }
+
+    // Teardown.  `free_vm_space` frees backing frames only for VMAs in
+    // `vm_space.areas`; this test installs PTEs directly (no VMAs), so it
+    // explicitly releases the two mapped frames here, then frees the page-table
+    // structures via `free_vm_space`.  Reset both frames to refcount 0 and
+    // return them to the PMM with no leak.
+    page_ref_set(priv_winner, 0);
+    crate::mm::pmm::free_page(priv_winner);
+    page_ref_set(cache_phys, 0);
+    crate::mm::pmm::free_page(cache_phys);
+    crate::proc::free_vm_space(vm);
+
+    test_pass!("PFH install-arm anti-aliasing back-out");
     true
 }
 
