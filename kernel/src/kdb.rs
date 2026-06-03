@@ -1155,11 +1155,18 @@ fn op_w215_diag(out: &mut String) {
         let window_race = crate::mm::w215_diag::window_race_count();
         let install_race = crate::mm::w215_diag::install_race_count();
         let overflow = crate::mm::w215_diag::prov_ring_overflow_count();
+        // W215 clobber-writer capture counters (page-cache REFDEC shadow).
+        // `refdec_dec_to_zero` > 0 means at least one page-cache REFDEC drove
+        // a frame to zero (about to be quarantine-freed); cross-check the
+        // serial `[W215/CACHE-REFDEC-TO-ZERO]` lines for the caller-RIPs.
+        let refdec_recorded   = crate::mm::w215_diag::refdec_shadow_recorded_count();
+        let refdec_displaced  = crate::mm::w215_diag::refdec_shadow_displaced_count();
+        let refdec_dec_to_zero = crate::mm::w215_diag::refdec_shadow_dec_to_zero_count();
         let mut top: [(u64, u32); 5] = [(0, 0); 5];
         let n = crate::mm::w215_diag::top_traced_physes(&mut top);
         out.push('{');
         let _ = write!(out,
-            r#""window_race":{window_race},"install_race":{install_race},"prov_ring_overflow":{overflow}"#,
+            r#""window_race":{window_race},"install_race":{install_race},"prov_ring_overflow":{overflow},"refdec_recorded":{refdec_recorded},"refdec_displaced":{refdec_displaced},"refdec_dec_to_zero":{refdec_dec_to_zero}"#,
         );
         let _ = write!(out, r#","top_traced":["#);
         for i in 0..n {

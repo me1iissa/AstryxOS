@@ -1775,6 +1775,13 @@ pub(crate) fn emit_fault_phys_diagnostic(
     #[cfg(feature = "firefox-test")]
     if let Some(rp) = rip_phys {
         crate::mm::w215_diag::dump_free_shadow_for_phys(rp);
+        // W215 clobber-writer capture: emit the most-recent page-cache
+        // REFDEC recorded for the all-zero code-page frame.  A
+        // `new_refcount=0` hit names the cache site whose dec drove this
+        // still-mapped frame to free (the W215 SIGSEGV upstream).  This is
+        // the line that closes the documented `caller_rip=0x0` gap — the old
+        // hashed PROV ring discarded the REFDEC RIP.
+        crate::mm::w215_diag::dump_refdec_shadow_for_phys(rp);
     }
 
     // ── [D13/CR2-PROV] phys-shadow lookup on the DATA fault address ─────────
@@ -1810,6 +1817,7 @@ pub(crate) fn emit_fault_phys_diagnostic(
                         pid, tid, cr2_va, cr2_page, data_phys,
                     );
                     crate::mm::w215_diag::dump_free_shadow_for_phys(data_phys);
+                    crate::mm::w215_diag::dump_refdec_shadow_for_phys(data_phys);
                     crate::mm::w215_diag::dump_alloc_shadow_for_phys(data_phys);
                     crate::mm::w215_diag::dump_prov_for_phys(data_phys);
                     // GATE-A (2026-05-30) — if the faulting data address is in
