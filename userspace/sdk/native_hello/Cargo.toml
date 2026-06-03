@@ -1,0 +1,28 @@
+[package]
+name = "native-hello"
+version = "0.1.0"
+edition = "2021"
+description = "Astryx Native SDK — Phase 0 sample: a minimal native (Aether-ABI) hello-world"
+authors = ["AstryxOS"]
+
+# Standalone freestanding userspace binary, built for x86_64-unknown-none by
+# kernel/build.rs (mirrors userspace/qga).  Carries its own empty `[workspace]`
+# so it is not pulled into the kernel workspace.
+[workspace]
+
+[[bin]]
+name = "native_hello"
+path = "src/main.rs"
+
+[dependencies]
+aether-sys = { path = "../aether-sys" }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+panic = "abort"
