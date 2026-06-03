@@ -888,7 +888,14 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         // See: https://firefox-source-docs.mozilla.org/widget/headless.html
         "MOZ_HEADLESS=1",
         "MOZ_DISABLE_CONTENT_SANDBOX=1",
-        "MOZ_DISABLE_NONLOCAL_CONNECTIONS=1",
+        // NB: we intentionally do NOT set MOZ_DISABLE_NONLOCAL_CONNECTIONS.
+        // When set to any value other than "0", Firefox refuses every
+        // connect(2) to a non-loopback address in-process (the socket
+        // transport returns NS_ERROR_CONNECTION_REFUSED before any SYN is
+        // emitted), so a remote --screenshot URL never drives the network
+        // path.  Leaving it unset is the default automation behaviour and is
+        // required for fetching a real internet page.
+        // See: https://firefox-source-docs.mozilla.org/testing/marionette/Prefs.html
         "MOZ_DISABLE_AUTO_SAFE_MODE=1",
         // Short-circuit SetExceptionHandler() before it touches the
         // Crash Reports directory tree.  Release builds of Firefox check
