@@ -848,6 +848,226 @@ pub fn free_shadow_displaced_count() -> u64 {
     FREE_SHADOW_DISPLACED.load(Ordering::Relaxed)
 }
 
+// ── W215 clobber-writer capture (2026-06-03): page-cache REFDEC shadow ───────
+//
+// The months-long W215 saga never POSITIVELY named the page-cache clobber
+// writer by RIP.  The flaky-boot SIGSEGV is a page-cache bucket-A REFDEC of a
+// still-mapped frame: a library `.text` cache frame is `page_ref_dec`'d to
+// zero — and therefore quarantine-freed and recycled to all-zeros — while a
+// live process PTE still maps it, so the main thread later executes an
+// all-zero code page (#PF CR2=0 → SIGSEGV → exit_group(11)).
+//
+// The pre-existing `[FAULT/PHYS/PROV]` ring records `KIND_REFDEC` events but
+// packs `key=0` (the RIP is discarded), so the fault dump showed last-op
+// `REFDEC` with `caller_rip=0x0` — the documented gap.  The hashed PROV ring
+// is also too small: by the time the all-zero frame faults, the cache-REFDEC
+// entry for that pfn has been rotated out by ~16 unrelated frames in the same
+// hash bucket.
+//
+// This dedicated shadow closes both gaps.  It is direct-mapped by
+// `pfn % REFDEC_SHADOW_SIZE` (no hash collisions across unrelated phys — only
+// frames spaced by a multiple of 256 MiB alias, observable via the
+// displacement counter), and it records ONLY the page-cache REFDEC sites
+// (`cache::insert_with_expected` replace, `cache::evict`,
+// `cache::evict_if_phys`) — the sites that drop the *cache's own* reference.
+// PTE-unmap decrements (process exit, munmap, CoW) are excluded by
+// construction, so the shadow names the cache operation that drove a given
+// frame toward free without contamination from the (legitimate, far more
+// frequent) PTE-unmap decrements.
+//
+// For each REFDEC at a cache site, the shadow records `(caller_rip,
+// new_refcount, site_id, tick)`.  When the fault dump fires on the all-zero
+// `rip_phys`, `dump_refdec_shadow_for_phys` emits the captured caller-RIP +
+// the refcount the dec dropped to.  A `new_refcount == 0` entry is the
+// smoking gun: the cache dec reached zero (so the frame was freed and
+// recycled), yet the faulting PTE still mapped it — naming the exact cache
+// site whose dec failed to account for the live PTE mapping.
+//
+// Per Intel SDM Vol. 3A §4.10.5 (paging-structure changes must be propagated
+// to every processor before a physical frame is repurposed) and POSIX
+// mmap(2) (a mapping's contents are valid for the mapping's lifetime), the
+// REFDEC that drove the still-mapped frame to zero is the locus of the bug
+// (CWE-416 use-after-free / CWE-911 reference-count error).
+//
+// Sized at 64 Ki entries × 32 bytes = 2 MiB BSS — material only in
+// `firefox-test` builds (the entire module is gated).
+
+/// Direct-mapped REFDEC-shadow size (matches `FREE_SHADOW_SIZE`).
+const REFDEC_SHADOW_SIZE: usize = 65536;
+
+/// Cache REFDEC site identifiers — which `page_ref_dec` call drove the frame.
+pub const REFDEC_SITE_INSERT_REPLACE: u8 = 1; // cache::insert_with_expected old-entry replace
+pub const REFDEC_SITE_EVICT: u8          = 2; // cache::evict
+pub const REFDEC_SITE_EVICT_IF_PHYS: u8  = 3; // cache::evict_if_phys
+
+#[repr(C)]
+struct RefdecShadowEntry {
+    /// Physical address of the most-recent cache REFDEC into this slot.
+    /// `0` means the slot has never been written.
+    phys: AtomicU64,
+    /// Tick at which the REFDEC fired.
+    tick: AtomicU64,
+    /// Caller-RIP of the cache::* site that issued the `page_ref_dec`.
+    caller_rip: AtomicU64,
+    /// Packed: [63:8] new_refcount (the value the dec dropped to), [7:0] site.
+    packed: AtomicU64,
+}
+
+impl RefdecShadowEntry {
+    const fn new() -> Self {
+        Self {
+            phys: AtomicU64::new(0),
+            tick: AtomicU64::new(0),
+            caller_rip: AtomicU64::new(0),
+            packed: AtomicU64::new(0),
+        }
+    }
+}
+
+struct RefdecShadow {
+    slots: [RefdecShadowEntry; REFDEC_SHADOW_SIZE],
+}
+
+impl RefdecShadow {
+    const fn new() -> Self {
+        const E: RefdecShadowEntry = RefdecShadowEntry::new();
+        Self { slots: [E; REFDEC_SHADOW_SIZE] }
+    }
+}
+
+static REFDEC_SHADOW: RefdecShadow = RefdecShadow::new();
+
+/// Number of cache REFDEC events that displaced an unrelated previous entry
+/// in the shadow (`slot.phys != 0 && slot.phys != new_phys`).  Zero means
+/// every recorded cache-REFDEC for the run is observable by phys.
+static REFDEC_SHADOW_DISPLACED: AtomicU64 = AtomicU64::new(0);
+
+/// Total number of cache REFDEC events recorded into the shadow.
+static REFDEC_SHADOW_RECORDED: AtomicU64 = AtomicU64::new(0);
+
+/// Number of cache REFDEC events whose dec drove the refcount to ZERO — i.e.
+/// the cache dropped what it believed was the last reference and the frame
+/// was about to be quarantine-freed.  Each one is a candidate clobber: if a
+/// live process PTE still mapped the frame at that moment, this is the W215
+/// fault's upstream.
+static REFDEC_SHADOW_DEC_TO_ZERO: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn refdec_shadow_slot(phys: u64) -> &'static RefdecShadowEntry {
+    let pfn = (phys >> 12) as usize;
+    &REFDEC_SHADOW.slots[pfn & (REFDEC_SHADOW_SIZE - 1)]
+}
+
+/// Record a page-cache REFDEC event in the direct-addressed shadow.
+///
+/// Called ONLY from the three page-cache `page_ref_dec` sites
+/// (`cache::insert_with_expected` replace, `cache::evict`,
+/// `cache::evict_if_phys`), passing the caller-RIP, the new refcount the
+/// dec produced, and the site identifier.  PTE-unmap decrements do NOT call
+/// this — keeping the shadow contamination-free for naming the cache
+/// operation that drove a frame toward free.
+#[inline]
+pub fn refdec_shadow_record(phys: u64, caller_rip: u64, new_refcount: u16, site: u8) {
+    if phys == 0 { return; }
+    let slot = refdec_shadow_slot(phys);
+    let prev_phys = slot.phys.load(Ordering::Relaxed);
+    if prev_phys != 0 && prev_phys != phys {
+        REFDEC_SHADOW_DISPLACED.fetch_add(1, Ordering::Relaxed);
+    }
+    let tick = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+    let packed = ((new_refcount as u64) << 8) | (site as u64);
+    // Relaxed writes — diagnostic readers may observe a torn tuple; acceptable
+    // for a best-effort tracer (mirrors FREE_SHADOW).
+    slot.phys.store(phys, Ordering::Relaxed);
+    slot.tick.store(tick, Ordering::Relaxed);
+    slot.caller_rip.store(caller_rip, Ordering::Relaxed);
+    slot.packed.store(packed, Ordering::Relaxed);
+    REFDEC_SHADOW_RECORDED.fetch_add(1, Ordering::Relaxed);
+
+    if new_refcount == 0 {
+        let total = REFDEC_SHADOW_DEC_TO_ZERO.fetch_add(1, Ordering::Relaxed) + 1;
+        // A cache REFDEC drove the frame to zero → it will be quarantine-freed
+        // and recycled.  Emit a bounded smoking-gun line so the clobber is
+        // visible live (not only post-fault).  Bound the bandwidth: first 32
+        // fires, then every 4096th, under a sustained workload.
+        if total <= 32 || total % 4096 == 0 {
+            crate::serial_println!(
+                "[W215/CACHE-REFDEC-TO-ZERO] phys={:#x} caller_rip={:#x} site={} \
+                 tick={} dec_to_zero_total={}",
+                phys, caller_rip, refdec_site_str(site), tick, total,
+            );
+        }
+    }
+}
+
+#[inline]
+fn refdec_site_str(s: u8) -> &'static str {
+    match s {
+        REFDEC_SITE_INSERT_REPLACE => "INSERT_REPLACE",
+        REFDEC_SITE_EVICT          => "EVICT",
+        REFDEC_SITE_EVICT_IF_PHYS  => "EVICT_IF_PHYS",
+        _ => "UNKNOWN",
+    }
+}
+
+/// Look up the most-recent cache REFDEC recorded for `phys`.  Returns
+/// `(tick, caller_rip, new_refcount, site)` if present with matching phys.
+#[inline]
+pub fn refdec_shadow_lookup(phys: u64) -> Option<(u64, u64, u16, u8)> {
+    if phys == 0 { return None; }
+    let slot = refdec_shadow_slot(phys);
+    let p = slot.phys.load(Ordering::Relaxed);
+    if p != phys { return None; }
+    let tick   = slot.tick.load(Ordering::Relaxed);
+    let rip    = slot.caller_rip.load(Ordering::Relaxed);
+    let packed = slot.packed.load(Ordering::Relaxed);
+    let new_rc = ((packed >> 8) & 0xFFFF) as u16;
+    let site   = (packed & 0xFF) as u8;
+    Some((tick, rip, new_rc, site))
+}
+
+/// Diagnostic dump: emit the REFDEC-shadow entry for `phys` as a single
+/// `[FAULT/PHYS/REFDEC-SHADOW]` serial line.  Called from the fault-site dump
+/// for the all-zero code-page `rip_phys`.  A `new_refcount=0` hit names the
+/// cache site whose dec drove the still-mapped frame to free — the W215
+/// clobber writer.
+pub fn dump_refdec_shadow_for_phys(phys: u64) {
+    let now_tick  = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+    let recorded  = REFDEC_SHADOW_RECORDED.load(Ordering::Relaxed);
+    let displaced = REFDEC_SHADOW_DISPLACED.load(Ordering::Relaxed);
+    let to_zero   = REFDEC_SHADOW_DEC_TO_ZERO.load(Ordering::Relaxed);
+    match refdec_shadow_lookup(phys) {
+        Some((tick, rip, new_rc, site)) => {
+            let age_ticks = now_tick.saturating_sub(tick);
+            crate::serial_println!(
+                "[FAULT/PHYS/REFDEC-SHADOW] phys={:#x} hit=1 refdec_tick={} \
+                 age_ticks={} caller_rip={:#x} new_refcount={} site={} \
+                 totals=(recorded={},displaced={},dec_to_zero={})",
+                phys, tick, age_ticks, rip, new_rc, refdec_site_str(site),
+                recorded, displaced, to_zero,
+            );
+        }
+        None => {
+            crate::serial_println!(
+                "[FAULT/PHYS/REFDEC-SHADOW] phys={:#x} hit=0 \
+                 totals=(recorded={},displaced={},dec_to_zero={})",
+                phys, recorded, displaced, to_zero,
+            );
+        }
+    }
+}
+
+/// Read REFDEC-shadow counters for kdb introspection.
+pub fn refdec_shadow_recorded_count() -> u64 {
+    REFDEC_SHADOW_RECORDED.load(Ordering::Relaxed)
+}
+pub fn refdec_shadow_displaced_count() -> u64 {
+    REFDEC_SHADOW_DISPLACED.load(Ordering::Relaxed)
+}
+pub fn refdec_shadow_dec_to_zero_count() -> u64 {
+    REFDEC_SHADOW_DEC_TO_ZERO.load(Ordering::Relaxed)
+}
+
 // ── Track K (2026-05-20): ALLOC_SHADOW + USER-STACK PTE_CHANGE_RING ─────────
 //
 // Phase D landed `FREE_SHADOW` to name the upstream `pmm::free_page` caller

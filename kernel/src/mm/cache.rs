@@ -75,7 +75,12 @@ const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
 /// the prologue did not save RBP (LTO / `-fomit-frame-pointer`) this
 /// returns 0 — the line is still useful from the (mount, inode, phys)
 /// triple alone.  Diagnostic-only.
-#[cfg(feature = "w215-diag")]
+///
+/// Gated behind `firefox-test` (not the heavier `w215-diag`) so the
+/// page-cache REFDEC clobber-writer capture (`refdec_shadow_record`) works
+/// in the standard `firefox-test,kdb` demo boot.  Marked `#[inline(never)]`
+/// so the frame layout this walk assumes (saved RA at `[rbp+8]`) is stable.
+#[cfg(feature = "firefox-test")]
 #[inline(never)]
 fn caller_rip() -> u64 {
     let rbp: u64;
@@ -85,7 +90,7 @@ fn caller_rip() -> u64 {
     if rbp == 0 || (rbp & 7) != 0 || rbp < 0xFFFF_8000_0000_0000 {
         return 0;
     }
-    // [rbp+8] = saved return address into `cache::insert`'s caller.
+    // [rbp+8] = saved return address into this cache function's caller.
     let ret = unsafe { core::ptr::read_volatile((rbp + 8) as *const u64) };
     ret
 }
@@ -279,6 +284,18 @@ pub fn insert_with_expected(
             evicted_zero_rc = if new_rc == 0 { Some(old_entry.phys) } else { None };
             #[cfg(feature = "firefox-test")]
             {
+                // W215 clobber-writer capture: record this cache-REFDEC into
+                // the direct-mapped REFDEC shadow with the caller-RIP and the
+                // refcount the dec dropped to.  A `new_rc == 0` here means the
+                // cache dropped what it believed was the last reference and the
+                // frame is about to be quarantine-freed below — if a live
+                // process PTE still maps it, this is the W215 clobber.
+                crate::mm::w215_diag::refdec_shadow_record(
+                    old_entry.phys,
+                    caller_rip(),
+                    new_rc,
+                    crate::mm::w215_diag::REFDEC_SITE_INSERT_REPLACE,
+                );
                 crate::mm::w215_diag::prov_record(
                     old_entry.phys,
                     crate::mm::w215_diag::KIND_EVICT,
@@ -594,10 +611,17 @@ pub fn evict(mount_idx: usize, inode: u64, page_offset: u64) -> Option<u64> {
         // Caller takes ownership of the phys frame; freeing it (with proper
         // shootdown) is the caller's responsibility.  Here we only release
         // the cache's reference.
-        let _ = crate::mm::refcount::page_ref_dec(entry.phys);
+        let new_rc = crate::mm::refcount::page_ref_dec(entry.phys);
         // W215 diagnostic Arm-1 / Arm-2.
         #[cfg(feature = "firefox-test")]
         {
+            // W215 clobber-writer capture — see insert_with_expected site.
+            crate::mm::w215_diag::refdec_shadow_record(
+                entry.phys,
+                caller_rip(),
+                new_rc,
+                crate::mm::w215_diag::REFDEC_SITE_EVICT,
+            );
             crate::mm::w215_diag::prov_record(
                 entry.phys,
                 crate::mm::w215_diag::KIND_EVICT,
@@ -611,6 +635,8 @@ pub fn evict(mount_idx: usize, inode: u64, page_offset: u64) -> Option<u64> {
             #[cfg(feature = "w215-diag")]
             crate::mm::w215_crc::record_evict(entry.phys);
         }
+        #[cfg(not(feature = "firefox-test"))]
+        let _ = new_rc;
         Some(entry.phys)
     } else {
         None
@@ -886,9 +912,16 @@ pub fn evict_if_phys(
     if matches {
         cache.remove(&key);
         // Release the cache's reference to the evicted frame.
-        let _ = crate::mm::refcount::page_ref_dec(expected_phys);
+        let new_rc = crate::mm::refcount::page_ref_dec(expected_phys);
         #[cfg(feature = "firefox-test")]
         {
+            // W215 clobber-writer capture — see insert_with_expected site.
+            crate::mm::w215_diag::refdec_shadow_record(
+                expected_phys,
+                caller_rip(),
+                new_rc,
+                crate::mm::w215_diag::REFDEC_SITE_EVICT_IF_PHYS,
+            );
             crate::mm::w215_diag::prov_record(
                 expected_phys,
                 crate::mm::w215_diag::KIND_EVICT,
@@ -897,6 +930,8 @@ pub fn evict_if_phys(
             #[cfg(feature = "w215-diag")]
             crate::mm::w215_crc::record_evict(expected_phys);
         }
+        #[cfg(not(feature = "firefox-test"))]
+        let _ = new_rc;
         true
     } else {
         false
