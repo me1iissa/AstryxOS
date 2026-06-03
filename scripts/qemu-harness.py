@@ -1163,6 +1163,7 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
                           snapshottable: bool = False,
                           data_overlay: Optional[str] = None,
                           vmstate_qcow2: Optional[str] = None,
+                          mem_mib: int = 0,
                           ) -> subprocess.Popen:
     """
     Launch QEMU with a per-session serial log and QMP socket.
@@ -1249,6 +1250,19 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
         for i, arg in enumerate(cmd):
             if arg == "-smp" and i + 1 < len(cmd):
                 cmd[i + 1] = str(smp)
+                break
+
+    # Override -m guest RAM if the caller asked for more than the canonical
+    # `mode="test"` 1 GiB.  Firefox/libxul's working set exceeds 1 GiB, so a
+    # 1 GiB guest thrashes the demand-pager (code pages evicted under memory
+    # pressure re-fault from disk — measured tens of thousands of extra read
+    # requests to reach the render gate).  Patched in-place here, mirroring the
+    # -smp override above, so `build_qemu_cmd` (the canonical builder) stays
+    # unchanged.
+    if mem_mib and mem_mib > 0:
+        for i, arg in enumerate(cmd):
+            if arg == "-m" and i + 1 < len(cmd):
+                cmd[i + 1] = f"{mem_mib}M"
                 break
 
     # Inject the kdb hostfwd rule by patching the `-netdev user,id=net0`
@@ -3224,6 +3238,20 @@ def cmd_start(args):
     smp = int(getattr(args, "smp", 2) or 2)
     cpu_model = getattr(args, "cpu_model", None)
 
+    # Guest RAM: the canonical builder uses mode="test" = 1 GiB.  That is too
+    # small for the firefox-test browser bring-up (Firefox/libxul working set
+    # > 1 GiB → demand-page thrash).  Auto-bump to 2 GiB when the feature set
+    # includes firefox-test (unless the caller overrode it with --mem).  An
+    # explicit --mem always wins; a 0/absent flag keeps the auto behaviour.
+    mem_override = int(getattr(args, "mem", 0) or 0)
+    _feats = (getattr(args, "features", None) or "")
+    if mem_override > 0:
+        mem_mib = mem_override
+    elif "firefox-test" in _feats:
+        mem_mib = 2048
+    else:
+        mem_mib = 0  # keep the builder's mode="test" default
+
     # Resolve effective KVM state + CPU model up-front so we can log the
     # decision (W106: catches "TCG run with -cpu host advertising AVX-512
     # → glibc IFUNC trap → spurious #UD" misconfiguration before launch).
@@ -3280,7 +3308,8 @@ def cmd_start(args):
                                  extra_qemu_args=extra_qemu_args,
                                  snapshottable=snapshottable,
                                  data_overlay=(snap_topology or {}).get("data_overlay"),
-                                 vmstate_qcow2=(snap_topology or {}).get("vmstate_qcow2"))
+                                 vmstate_qcow2=(snap_topology or {}).get("vmstate_qcow2"),
+                                 mem_mib=mem_mib)
 
     session = {
         "sid":        sid,
@@ -10840,6 +10869,11 @@ def main():
                           help="Number of QEMU vCPUs (default 2). Plan-C "
                                "experiment uses 16 to test Mozilla "
                                "nsThreadPool sizing under wider _SC_NPROCESSORS_ONLN.")
+    p_start.add_argument("--mem", type=int, default=0, metavar="MIB",
+                          help="Guest RAM in MiB. Default: 2048 when the feature "
+                               "set includes firefox-test (Firefox/libxul needs "
+                               ">1 GiB to avoid demand-page thrash), else the "
+                               "canonical 1024. An explicit value always wins.")
     p_start.add_argument("--cpu", dest="cpu_model", default=None, metavar="MODEL",
                           help="Override QEMU -cpu model verbatim (e.g. 'host', "
                                "'max', 'Cascadelake-Server', 'EPYC-Genoa-v1', "
