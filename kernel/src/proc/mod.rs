@@ -3964,6 +3964,32 @@ pub fn waitpid(parent_pid: Pid, wait_pid: i64) -> Option<(Pid, i32)> {
     Some((child_pid, exit_code))
 }
 
+/// Count how many threads in `THREAD_TABLE` still belong to `pid`, and how
+/// many of those are not yet `Dead`.  Returns `(total, live)`.
+///
+/// A crash-recovery supervisor uses this to confirm a crashed process is fully
+/// torn down before relaunch: `(0, 0)` means the thread group has been reaped
+/// (every Dead thread freed by `sched::reap_dead_threads_sched`); a non-zero
+/// `total` with `live == 0` means teardown is complete and only stale Dead
+/// slots await the reaper; `live > 0` means siblings are still draining.
+///
+/// Uses `try_lock` so a momentarily-contended `THREAD_TABLE` (e.g. the AP is
+/// mid-`exit_group`) never stalls the caller — it returns `None` and the
+/// caller retries next tick.  This is the bounded, wedge-immune query the
+/// supervisor's pre-relaunch drain loop is built on.
+pub fn process_thread_counts(pid: Pid) -> Option<(usize, usize)> {
+    let threads = THREAD_TABLE.try_lock()?;
+    let mut total = 0usize;
+    let mut live = 0usize;
+    for t in threads.iter().filter(|t| t.pid == pid) {
+        total += 1;
+        if t.state != ThreadState::Dead {
+            live += 1;
+        }
+    }
+    Some((total, live))
+}
+
 /// Assign an access token to a process by PID.
 pub fn assign_token(pid: u64, token_id: u64) {
     let mut procs = PROCESS_TABLE.lock();
