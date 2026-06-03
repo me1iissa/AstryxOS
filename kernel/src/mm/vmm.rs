@@ -121,6 +121,23 @@ pub fn init() {
     let (_heap_va, heap_phys_start, heap_phys_end) = super::heap::compute_heap_layout();
     pmm::reserve_range(heap_phys_start, heap_phys_end);
 
+    // Reserve the two heap *guard* frames here as well, not just in
+    // `heap::init_guard_pages()` (which runs after this function).  The
+    // guard frames bracket the heap-backing range: the below-guard is the
+    // page under `heap_phys_start`, the above-guard is `heap_phys_end`
+    // itself.  Without reserving them up-front, the very next `alloc_page()`
+    // in `separate_higher_half_pds()` / `extend_higher_half_to_4gib()` can
+    // return the above-guard frame (it is the first free frame past the
+    // just-reserved heap) and use it as a page-table page; once
+    // `heap::init_guard_pages()` makes that frame's higher-half VA
+    // not-present, the next write to that page table — e.g. the LAPIC MMIO
+    // PD entry in `apic::init()` (Intel SDM Vol. 3A §10.4.4) — faults on the
+    // guard page during early boot.  Reserving them before any allocation
+    // closes that ordering window for every BSS size / feature combination.
+    let (below_guard_phys, above_guard_phys) = super::heap::compute_guard_phys();
+    pmm::reserve_range(below_guard_phys, below_guard_phys + 0x1000);
+    pmm::reserve_range(above_guard_phys, above_guard_phys + 0x1000);
+
     // Separate the PD pages between the identity map (PML4[0]) and the
     // higher-half map (PML4[256]).  The bootloader sets both PDPTs to
     // share the same PD0-PD3 pages.  Without this separation, splitting
