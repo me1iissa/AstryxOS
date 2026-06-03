@@ -2592,27 +2592,80 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             } else {
                 if !crate::syscall::is_socket_fd(pid, fd) { return -9; }
                 let socket_id = crate::syscall::get_socket_id(pid, fd);
-                // Per recvmsg(2) / IEEE 1003.1 §recv: on a non-blocking
-                // socket an empty receive queue must return -1/EAGAIN, while
-                // an orderly peer shutdown (EOF) returns 0.  Collapsing both
-                // to 0 (the prior `Ok(empty) => 0`) lied to the caller: a
-                // polled IPC reactor read the 0 as a readable edge and
-                // re-issued recvmsg in a tight loop, never yielding.  Use the
-                // status-aware recv so the two cases get their correct
-                // returns (WouldBlock → -EAGAIN, Eof → 0).
-                bytes_read = match crate::net::socket::socket_recv_status(socket_id) {
-                    Ok(crate::net::socket::RecvOutcome::Data(data)) => {
-                        let n = data.len().min(cap);
-                        unsafe {
-                            let _g = crate::arch::x86_64::smap::UserGuard::new();
-                            core::ptr::copy_nonoverlapping(data.as_ptr(), dst, n);
-                        }
-                        n as i64
-                    }
-                    Ok(crate::net::socket::RecvOutcome::Eof) => 0,
-                    Ok(crate::net::socket::RecvOutcome::WouldBlock) => -11, // EAGAIN
-                    Err(_) => -11,
+                // msghdr.msg_name / msg_namelen (x86_64 ABI): msg_name is the
+                // first 8-byte word (offset 0), msg_namelen is the socklen_t at
+                // offset 8 (low 32 bits of the second word).  recvmsg(2): on a
+                // datagram socket the source address of the received datagram
+                // is stored in msg_name (when non-NULL) and msg_namelen is set
+                // to the size of the stored address.
+                let (name_ptr, name_cap) = unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    (core::ptr::read_unaligned(msghdr_ptr.add(0)),
+                     core::ptr::read_unaligned(msghdr_ptr.add(1)) as u32 as usize)
                 };
+                if crate::net::socket::socket_is_udp(socket_id) {
+                    // Datagram path.  Use the source-address-bearing receive so
+                    // the reply's origin can be marshalled into msg_name — this
+                    // is REQUIRED by userspace DNS resolvers (RFC 1035 §4.2.1,
+                    // DNS over UDP:53) that validate the reply's source against
+                    // the configured nameserver before accepting it; without
+                    // the source, every reply is dropped and getaddrinfo(3)
+                    // times out.  A datagram socket has no orderly-EOF concept,
+                    // so an empty result is WouldBlock → EAGAIN per recvmsg(2).
+                    bytes_read = match crate::net::socket::socket_recvfrom(socket_id) {
+                        Ok((data, src_ip, src_port)) => {
+                            if data.is_empty() {
+                                -11 // EAGAIN
+                            } else {
+                                let n = data.len().min(cap);
+                                unsafe {
+                                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                                    core::ptr::copy_nonoverlapping(data.as_ptr(), dst, n);
+                                }
+                                // Marshal the datagram source into msg_name when
+                                // the caller provided a buffer.  write_sockaddr_in
+                                // sets sin_family=AF_INET, sin_port=htons(src_port),
+                                // sin_addr=src_ip and writes msg_namelen=16.  When
+                                // msg_name is NULL the address is dropped
+                                // (recvmsg(2)): leave msg_namelen untouched.
+                                if name_ptr != 0 {
+                                    // msg_namelen is the socklen_t at byte
+                                    // offset 8 of the user msghdr (arg2 base).
+                                    let namelen_ptr = (arg2 + 8) as *mut u32;
+                                    write_sockaddr_in(name_ptr, namelen_ptr,
+                                                      src_ip, src_port, name_cap);
+                                }
+                                n as i64
+                            }
+                        }
+                        Err(_) => -11, // EAGAIN
+                    };
+                } else {
+                    // Connection-mode (TCP) path.  The source is the fixed
+                    // connected peer, so per recvmsg(2) we leave msg_name
+                    // untouched (a stream socket reports no per-message source).
+                    // Per recvmsg(2) / IEEE 1003.1 §recv: on a non-blocking
+                    // socket an empty receive queue must return -1/EAGAIN, while
+                    // an orderly peer shutdown (EOF) returns 0.  Collapsing both
+                    // to 0 (the prior `Ok(empty) => 0`) lied to the caller: a
+                    // polled IPC reactor read the 0 as a readable edge and
+                    // re-issued recvmsg in a tight loop, never yielding.  Use the
+                    // status-aware recv so the two cases get their correct
+                    // returns (WouldBlock → -EAGAIN, Eof → 0).
+                    bytes_read = match crate::net::socket::socket_recv_status(socket_id) {
+                        Ok(crate::net::socket::RecvOutcome::Data(data)) => {
+                            let n = data.len().min(cap);
+                            unsafe {
+                                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                                core::ptr::copy_nonoverlapping(data.as_ptr(), dst, n);
+                            }
+                            n as i64
+                        }
+                        Ok(crate::net::socket::RecvOutcome::Eof) => 0,
+                        Ok(crate::net::socket::RecvOutcome::WouldBlock) => -11, // EAGAIN
+                        Err(_) => -11,
+                    };
+                }
             }
             bytes_read
         }

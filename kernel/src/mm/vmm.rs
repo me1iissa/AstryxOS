@@ -676,6 +676,93 @@ pub fn map_page_in_if_absent(
     true
 }
 
+/// Replace the present leaf PTE at `virt_addr` with `phys_addr`/`flags` **only
+/// if the PTE still maps `expected_phys` and is still present** -- performing the
+/// re-check and the install as one indivisible operation under `VMM_LOCK`.
+///
+/// Returns `true` if this call installed the mapping, `false` if a sibling CPU
+/// had already replaced the PTE (it no longer maps `expected_phys`, or has gone
+/// not-present).  On `false` the caller's freshly-allocated frame is redundant
+/// and the caller must free it (and undo any refcount it set on it).
+///
+/// # Why this exists
+///
+/// The copy-on-write write-fault handler samples the faulting PTE (`old_phys`),
+/// allocates a private frame, copies `old_phys` into it, then installs the
+/// private frame.  On a shared address space (CLONE_VM / vfork -- several threads
+/// on one CR3 across logical processors) two CPUs can take the write-protection
+/// `#PF` on the *same* CoW page concurrently.  Both observe the page shared,
+/// both allocate and copy, and whichever installs second overwrites the leaf PTE
+/// with a *different* private frame.  The first installer's CPU still caches the
+/// first frame in its TLB (its local invalidation only covered its own CPU and
+/// fired before the overwrite), so that CPU keeps writing the first frame while
+/// the page table -- and every later faulting CPU -- sees the second: a silent
+/// cross-CPU store-visibility failure on the now-private page (one VA, two
+/// frames).  `map_page_in_if_absent` cannot guard this transition because the
+/// CoW PTE *is* present; the correct guard is "install only if the PTE is still
+/// the value I sampled", i.e. the standard demand-paging re-validation: re-read
+/// the leaf PTE under the page-table lock immediately before writing it and
+/// abort if it changed (cf. the page-table-lock `pte_same` re-check in a CoW
+/// copy).  The loser observes the winner's already-replaced PTE under the same
+/// lock that serialises the install and backs out without aliasing the mapping.
+/// Per Intel SDM Vol. 3A 4.10.4.3 the not-present -> present invalidation of the
+/// other CPUs is handled by the caller's TLB shootdown; the hazard this guard
+/// prevents is the second *frame*.
+pub fn map_page_in_cow_if_unchanged(
+    pml4_phys: u64,
+    virt_addr: u64,
+    phys_addr: u64,
+    flags: u64,
+    expected_phys: u64,
+) -> bool {
+    let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
+    let _mm_read = _mm_guard.as_ref().map(|s| s.read());
+    let _lock = VMM_LOCK.lock();
+
+    let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
+    let pt_idx = ((virt_addr >> 12) & 0x1FF) as usize;
+
+    unsafe {
+        let pdpt_phys = match get_or_create_entry(pml4_phys, pml4_idx, flags) {
+            Some(addr) => addr,
+            None => return false,
+        };
+        let pd_phys = match get_or_create_entry(pdpt_phys, pdpt_idx, flags) {
+            Some(addr) => addr,
+            None => return false,
+        };
+        let pt_phys = match get_or_create_entry(pd_phys, pd_idx, flags) {
+            Some(addr) => addr,
+            None => return false,
+        };
+
+        let pt_ptr = p2v(pt_phys);
+        // Re-validate: the PTE must still be present AND still map the exact
+        // frame the CoW handler sampled before its copy.  If a sibling CPU
+        // already CoW-copied this page, the PTE now maps a different (private)
+        // frame and is writable; we must not clobber it with our own copy.
+        let existing = *pt_ptr.add(pt_idx);
+        if existing & PAGE_PRESENT == 0 || (existing & ADDR_MASK) != (expected_phys & ADDR_MASK) {
+            return false;
+        }
+        *pt_ptr.add(pt_idx) = (phys_addr & ADDR_MASK) | flags | PAGE_PRESENT;
+    }
+
+    #[cfg(feature = "firefox-test")]
+    crate::mm::w215_diag::pte_change_record(
+        virt_addr,
+        phys_addr & ADDR_MASK,
+        expected_phys & ADDR_MASK,
+        crate::mm::w215_diag::PTE_KIND_MAP,
+        ring_caller_rip(),
+        pml4_phys,
+    );
+
+    true
+}
+
 /// Unmap a virtual page in an arbitrary page table.
 ///
 /// See `map_page_in` for the W216 `mm_sem` read-lock invariant.
