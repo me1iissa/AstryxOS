@@ -26,6 +26,7 @@ pub mod dns;
 pub mod dhcp;
 pub mod unix;
 pub mod loopback;
+pub mod ipver;
 
 extern crate alloc;
 
