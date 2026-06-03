@@ -1064,6 +1064,10 @@ pub fn run() -> ! {
     total += 1;
     if test_map_page_in_if_absent_anti_alias() { passed += 1; }
 
+    // Test 98g2: shared-CR3 CoW write-fault anti-aliasing back-out
+    total += 1;
+    if test_map_page_in_cow_if_unchanged_anti_alias() { passed += 1; }
+
     // ── Test 98h: file-backed install-arm anti-aliasing back-out ─────────
     total += 1;
     if test_pfh_install_arm_anti_alias_backout() { passed += 1; }
@@ -1547,6 +1551,21 @@ pub fn run() -> ! {
     {
         total += 1;
         if test_tcp_read_from_isolation() { passed += 1; }
+    }
+
+    // ── TCP out-of-order FIN guard — no premature close / no truncation ──────
+    //
+    // A real multi-segment HTTP(S) response can deliver a data+FIN segment
+    // out of order.  The receive arm must NOT consume an out-of-order FIN
+    // (which would advance recv_next and transition to CloseWait on a
+    // truncated body, RFC 9293 §3.10.7.4).  Inject an Established TCB, feed
+    // an out-of-order FIN-bearing segment, and assert the connection stays
+    // Established with the in-order data intact; then feed the in-order
+    // segment and assert the FIN is finally honored.
+    #[cfg(feature = "kdb")]
+    {
+        total += 1;
+        if test_tcp_ooo_fin_guard() { passed += 1; }
     }
 
     // ── Test 270: AF_INET accept(2) — end-to-end against in-kernel TCP ────
@@ -29500,6 +29519,108 @@ fn test_map_page_in_if_absent_anti_alias() -> bool {
     true
 }
 
+/// Regression test for the copy-on-write write-fault anti-aliasing back-out
+/// (the shared-CR3 CoW double-install race).  Two threads on one CR3 can take
+/// the write-protection #PF on the same CoW page concurrently; each copies and
+/// installs a private frame, and an unconditional install lets the loser
+/// overwrite the winner's PTE -- one VA, two frames, a silent cross-CPU
+/// store-visibility failure.  `map_page_in_cow_if_unchanged` re-reads the leaf
+/// PTE under the page-table lock and installs only if it still maps the frame
+/// the caller sampled (`expected_phys`), so the loser backs out.  This mirrors
+/// the page-table-lock `pte_same` re-check in a CoW copy.
+fn test_map_page_in_cow_if_unchanged_anti_alias() -> bool {
+    test_header!("map_page_in_cow_if_unchanged: shared-CR3 CoW-fault anti-aliasing");
+
+    use crate::mm::vmm::{read_pte, map_page_in, map_page_in_cow_if_unchanged,
+                         PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER, ADDR_MASK};
+
+    let vm = match crate::mm::vma::VmSpace::new_user() {
+        Some(vs) => vs,
+        None => { test_fail!("cow_anti_alias", "VmSpace::new_user() OOM"); return false; }
+    };
+    let cr3 = vm.cr3;
+
+    let va: u64 = 0x7fff_fffe_a000;
+    let page = crate::mm::vma::page_align_down(va);
+
+    let frame_shared = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => { crate::proc::free_vm_space(vm); test_fail!("cow_anti_alias", "OOM shared"); return false; }
+    };
+    let frame_winner = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => {
+            crate::mm::pmm::free_page(frame_shared);
+            crate::proc::free_vm_space(vm);
+            test_fail!("cow_anti_alias", "OOM winner"); return false;
+        }
+    };
+    let frame_loser = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => {
+            crate::mm::pmm::free_page(frame_shared);
+            crate::mm::pmm::free_page(frame_winner);
+            crate::proc::free_vm_space(vm);
+            test_fail!("cow_anti_alias", "OOM loser"); return false;
+        }
+    };
+    if frame_shared == frame_winner || frame_shared == frame_loser || frame_winner == frame_loser {
+        crate::mm::pmm::free_page(frame_shared);
+        crate::mm::pmm::free_page(frame_winner);
+        crate::mm::pmm::free_page(frame_loser);
+        crate::proc::free_vm_space(vm);
+        test_fail!("cow_anti_alias", "allocator returned overlapping frames");
+        return false;
+    }
+
+    let ro_flags = PAGE_PRESENT | PAGE_USER;
+    let rw_flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+
+    // Establish the read-only CoW PTE mapping frame_shared (the sampled state).
+    map_page_in(cr3, page, frame_shared, ro_flags);
+
+    // (1) Winner installs its private copy, expecting the PTE to still map
+    //     frame_shared -> returns true, PTE now maps frame_winner (writable).
+    let won = map_page_in_cow_if_unchanged(cr3, page, frame_winner, rw_flags, frame_shared);
+    let pte1 = read_pte(cr3, va);
+    if !won || (pte1 & ADDR_MASK) != (frame_winner & ADDR_MASK) || pte1 & PAGE_WRITABLE == 0 {
+        crate::mm::pmm::free_page(frame_winner);
+        crate::mm::pmm::free_page(frame_loser);
+        crate::proc::free_vm_space(vm);
+        test_fail!("cow_anti_alias", "winner install failed: won={} pte={:#x} expect={:#x}",
+            won, pte1, frame_winner);
+        return false;
+    }
+    test_println!("  (1) winner replaced shared frame with private {:#x} ok", frame_winner);
+
+    // (2) Loser raced the SAME page but still expects frame_shared -- the PTE now
+    //     maps frame_winner, so the re-check must fail: returns false, PTE
+    //     untouched (no second private frame aliased onto the VA).
+    let lost = map_page_in_cow_if_unchanged(cr3, page, frame_loser, rw_flags, frame_shared);
+    let pte2 = read_pte(cr3, va);
+    if lost {
+        crate::mm::pmm::free_page(frame_loser);
+        crate::proc::free_vm_space(vm);
+        test_fail!("cow_anti_alias", "loser install returned true -- it overwrote the PTE (aliasing)");
+        return false;
+    }
+    if (pte2 & ADDR_MASK) != (frame_winner & ADDR_MASK) {
+        crate::mm::pmm::free_page(frame_loser);
+        crate::proc::free_vm_space(vm);
+        test_fail!("cow_anti_alias", "PTE no longer maps winner: pte={:#x} winner={:#x} loser={:#x}",
+            pte2, frame_winner, frame_loser);
+        return false;
+    }
+    test_println!("  (2) loser backed out; PTE still maps winner {:#x} -- no CoW aliasing ok", frame_winner);
+
+    crate::mm::pmm::free_page(frame_shared);
+    crate::mm::pmm::free_page(frame_loser);
+    crate::proc::free_vm_space(vm);
+
+    test_pass!("map_page_in_cow_if_unchanged anti-aliasing");
+    true
+}
+
 /// Regression test for the file-backed page-fault install-arm anti-aliasing
 /// back-out (the libxul GOT/PLT/.data/.bss private-writable segment race).
 ///
@@ -30118,6 +30239,89 @@ fn test_tcp_read_from_isolation() -> bool {
     }
 
     test_pass!("TCP read_from — 4-tuple isolation under shared port");
+    true
+}
+
+/// TCP out-of-order FIN guard: an out-of-order data+FIN segment must not
+/// prematurely close the connection or truncate the body (RFC 9293 §3.10.7.4 /
+/// RFC 793 §3.5).  The FIN is honored only once the sequence gap is filled and
+/// recv_next reaches it.
+#[cfg(feature = "kdb")]
+fn test_tcp_ooo_fin_guard() -> bool {
+    test_header!("TCP out-of-order FIN — no premature close / no truncation");
+
+    use crate::net::tcp;
+
+    const LOCAL_PORT: u16 = 47019;
+    let rip:  [u8;4] = [10, 0, 2, 50];
+    let rport: u16   = 52001;
+
+    // Inject an Established TCB.  test_inject_established sets recv_next = 1.
+    if let Err(e) = tcp::test_inject_established(LOCAL_PORT, rip, rport, &[]) {
+        test_fail!("tcp_ooo_fin_guard", "inject failed: {}", e);
+        return false;
+    }
+    let base = match tcp::test_recv_next(LOCAL_PORT, rip, rport) {
+        Some(n) => n,
+        None => { test_fail!("tcp_ooo_fin_guard", "no TCB"); return false; }
+    };
+
+    // Feed an OUT-OF-ORDER data+FIN segment: it begins at base+4 (a 4-byte
+    // gap), carries 3 bytes of data and the FIN flag.  The data must be
+    // dropped (hole), and crucially the FIN must NOT advance recv_next or move
+    // the connection to CloseWait — doing so would deliver a truncated body to
+    // userspace and reject the peer's retransmission forever.
+    let ooo_seq = base.wrapping_add(4);
+    match tcp::test_feed_segment(LOCAL_PORT, rip, rport, ooo_seq, b"END", true) {
+        Some((state, buflen)) => {
+            if state != tcp::TcpState::Established {
+                test_fail!("tcp_ooo_fin_guard",
+                    "OOO data+FIN prematurely changed state (expected Established)");
+                return false;
+            }
+            if buflen != 0 {
+                test_fail!("tcp_ooo_fin_guard",
+                    "OOO segment was buffered out of order (buflen={})", buflen);
+                return false;
+            }
+        }
+        None => { test_fail!("tcp_ooo_fin_guard", "feed OOO returned None"); return false; }
+    }
+
+    // Now feed the IN-ORDER 4-byte segment that fills the gap (no FIN).  This
+    // advances recv_next to base+4 and delivers the data.
+    match tcp::test_feed_segment(LOCAL_PORT, rip, rport, base, b"DATA", false) {
+        Some((state, buflen)) => {
+            if state != tcp::TcpState::Established {
+                test_fail!("tcp_ooo_fin_guard",
+                    "in-order fill unexpectedly changed state");
+                return false;
+            }
+            if buflen != 4 {
+                test_fail!("tcp_ooo_fin_guard",
+                    "in-order fill: expected 4 buffered bytes, got {}", buflen);
+                return false;
+            }
+        }
+        None => { test_fail!("tcp_ooo_fin_guard", "feed in-order returned None"); return false; }
+    }
+
+    // Finally, deliver the in-order FIN exactly at recv_next (base+4, empty
+    // payload).  Now it must be honored: recv_next advances and the state
+    // moves to CloseWait.
+    let fin_seq = base.wrapping_add(4);
+    match tcp::test_feed_segment(LOCAL_PORT, rip, rport, fin_seq, &[], true) {
+        Some((state, _)) => {
+            if state != tcp::TcpState::CloseWait {
+                test_fail!("tcp_ooo_fin_guard",
+                    "in-order FIN not honored (state not CloseWait)");
+                return false;
+            }
+        }
+        None => { test_fail!("tcp_ooo_fin_guard", "feed FIN returned None"); return false; }
+    }
+
+    test_pass!("TCP out-of-order FIN — no premature close / no truncation");
     true
 }
 

@@ -1261,9 +1261,9 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // addr2line / gdb resolve C++ names natively (no Mozilla tecken
             // dependency).  All three fall through to the same --headless
             // --screenshot pipeline.
-            const CMDLINE_MUSL_132: &str = "/disk/usr/lib/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png file:///tmp/hello.html";
-            const CMDLINE_MUSL_ESR: &str = "/disk/usr/lib/firefox-esr/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png file:///tmp/hello.html";
-            const CMDLINE_GLIBC:    &str = "/disk/opt/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png file:///tmp/hello.html";
+            const CMDLINE_MUSL_132: &str = "/disk/usr/lib/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png http://1.1.1.1/";
+            const CMDLINE_MUSL_ESR: &str = "/disk/usr/lib/firefox-esr/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png http://1.1.1.1/";
+            const CMDLINE_GLIBC:    &str = "/disk/opt/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png http://1.1.1.1/";
             // Use stat() (resolve_path + FileSystemOps::stat) for the existence
             // probe instead of read_file().  read_file() allocates a Vec sized
             // to the full file (~795 KB for firefox-bin), reads every byte, and
