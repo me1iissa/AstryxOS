@@ -348,6 +348,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "dmesg"          => op_dmesg(req, out),
         "syms"           => op_syms(req, out),
         "mem"            => op_mem(req, out),
+        "read-file"      => op_read_file(req, out),
         "trace-status"   => op_trace_status(out),
         "bell-stats"       => op_bell_stats(out),
         "cache-audit"      => op_cache_audit(out),
@@ -856,6 +857,102 @@ fn op_mem(req: &str, out: &mut String) {
     j_kv(out, "len", &alloc::format!("{}", len));
     j_kv_str(out, "hex", &hex);
     j_trim_comma(out);
+    out.push('}');
+}
+
+// ── read-file ───────────────────────────────────────────────────────────────
+//
+// Read a slice of a VFS file and return it base64-encoded (RFC 4648 §4).  This
+// is the robust, FFTEST-loop-independent extraction primitive: it works against
+// any live kdb-attached session regardless of process / scheduler state, so a
+// guest-written artefact (e.g. Firefox's /tmp/out.png screenshot) can be pulled
+// to the host even when the boot's own detect-and-emit path is blocked.
+//
+// Request : {"op":"read-file","path":"/tmp/out.png","offset":0,"len":16384}
+// Response: {"path":..,"file_size":N,"offset":O,"n":K,"eof":bool,
+//            "sig_png":bool,"b64":"<K bytes base64>"}
+//
+// `len` is capped at READ_FILE_CHUNK so the base64 payload stays under the kdb
+// MAX_RESP_BYTES truncation threshold; the host loops offset+=n until eof to
+// reassemble the whole file byte-exactly.  `sig_png` reports whether the file
+// begins with the 8-byte PNG signature (W3C PNG §5.2 / ISO 15948) — a cheap
+// "is this a real PNG?" check the host can read off the first chunk.
+
+/// Max raw bytes per read-file chunk.  16384 raw -> ceil(16384/3)*4 = 21848
+/// base64 chars, comfortably under the 32 KiB MAX_RESP_BYTES kdb response cap.
+const READ_FILE_CHUNK: u64 = 16384;
+
+fn b64_append(out: &mut String, src: &[u8]) {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut i = 0usize;
+    while i + 2 < src.len() {
+        let (b0, b1, b2) = (src[i] as usize, src[i + 1] as usize, src[i + 2] as usize);
+        out.push(ALPHABET[b0 >> 2] as char);
+        out.push(ALPHABET[((b0 & 0x3) << 4) | (b1 >> 4)] as char);
+        out.push(ALPHABET[((b1 & 0xf) << 2) | (b2 >> 6)] as char);
+        out.push(ALPHABET[b2 & 0x3f] as char);
+        i += 3;
+    }
+    if i < src.len() {
+        let b0 = src[i] as usize;
+        let b1 = if i + 1 < src.len() { src[i + 1] as usize } else { 0 };
+        out.push(ALPHABET[b0 >> 2] as char);
+        out.push(ALPHABET[((b0 & 0x3) << 4) | (b1 >> 4)] as char);
+        out.push(if i + 1 < src.len() {
+            ALPHABET[(b1 & 0xf) << 2] as char
+        } else {
+            '='
+        });
+        out.push('=');
+    }
+}
+
+fn op_read_file(req: &str, out: &mut String) {
+    let path = match extract_field(req, "path") {
+        Some(p) => p,
+        None => { out.push_str(r#"{"error":"missing 'path'"}"#); return; }
+    };
+    let offset = extract_field(req, "offset").and_then(|s| parse_u64(&s)).unwrap_or(0);
+    let len = extract_field(req, "len")
+        .and_then(|s| parse_u64(&s))
+        .unwrap_or(READ_FILE_CHUNK)
+        .min(READ_FILE_CHUNK);
+
+    // Read the whole file once (ramfs/cache-backed; cheap for the small
+    // artefacts this op targets), then slice — keeps the VFS surface minimal.
+    let bytes = match crate::vfs::read_file(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            use core::fmt::Write;
+            out.push('{');
+            j_kv_str(out, "path", &path);
+            let _ = write!(out, r#""error":"read failed: {:?}","#, e);
+            j_trim_comma(out);
+            out.push('}');
+            return;
+        }
+    };
+
+    let file_size = bytes.len() as u64;
+    let start = offset.min(file_size) as usize;
+    let end = (offset + len).min(file_size) as usize;
+    let slice = &bytes[start..end];
+    let n = slice.len() as u64;
+    let eof = (offset + n) >= file_size;
+    let sig_png = bytes.len() >= 8
+        && bytes[..8] == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+    out.push('{');
+    j_kv_str(out, "path", &path);
+    j_kv(out, "file_size", &alloc::format!("{}", file_size));
+    j_kv(out, "offset", &alloc::format!("{}", offset));
+    j_kv(out, "n", &alloc::format!("{}", n));
+    j_kv(out, "eof", if eof { "true" } else { "false" });
+    j_kv(out, "sig_png", if sig_png { "true" } else { "false" });
+    j_str(out, "b64"); out.push(':'); out.push('"');
+    b64_append(out, slice);
+    out.push('"');
     out.push('}');
 }
 

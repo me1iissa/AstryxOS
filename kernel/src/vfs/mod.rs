@@ -147,6 +147,91 @@ pub fn alloc_inode_number() -> u64 {
 /// Added by remove() when the file is still open; freed on last close().
 static DELETED_INODES: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
 
+/// Inodes pinned alive by a kernel reference that is NOT a process fd-table
+/// slot: (mount_idx, inode_number, pin_count).
+///
+/// The unlink-on-last-close machinery in [`close`] decides whether a
+/// deferred-deleted inode may be freed by scanning every process fd table for
+/// a slot that still points at it.  That scan cannot see a descriptor that is
+/// in flight — queued for SCM_RIGHTS delivery but not yet installed in the
+/// receiver's fd table.  Such a descriptor is held only in the syscall layer's
+/// PENDING_SCM queue; without a pin, a sender that `close(2)`s its copy of an
+/// unlinked memfd while the batch is still pending would free the inode out
+/// from under the un-received descriptor, corrupting the shared surface.  Per
+/// `memfd_create(2)` ("the memory is freed when all references are dropped")
+/// and `unix(7)` SCM_RIGHTS ("the passed descriptor refers to the same open
+/// file description"), an in-flight passed descriptor IS such a reference.
+///
+/// A pinned inode is never freed by `close`; it is freed only once both the
+/// last fd-table slot is gone AND the pin count reaches zero (see
+/// [`unpin_inode`]).
+static PINNED_INODES: Mutex<Vec<(usize, u64, u32)>> = Mutex::new(Vec::new());
+
+/// Add one kernel pin on `(mount_idx, inode)` so [`close`] will not free it
+/// even when no process fd table references it (e.g. an SCM_RIGHTS descriptor
+/// queued for delivery).  Balance every call with exactly one [`unpin_inode`].
+pub fn pin_inode(mount_idx: usize, inode: u64) {
+    if mount_idx == usize::MAX { return; } // sentinel fds (pipes etc.) have no inode
+    let mut p = PINNED_INODES.lock();
+    if let Some(e) = p.iter_mut().find(|(m, n, _)| *m == mount_idx && *n == inode) {
+        e.2 = e.2.saturating_add(1);
+    } else {
+        p.push((mount_idx, inode, 1));
+    }
+}
+
+/// Drop one kernel pin on `(mount_idx, inode)`.  When the pin count reaches
+/// zero AND the inode was deferred-deleted with no remaining open fd, the inode
+/// is freed here (the pin was the last thing keeping it alive).  Returns true
+/// if the inode was actually freed by this call.
+pub fn unpin_inode(mount_idx: usize, inode: u64) -> bool {
+    if mount_idx == usize::MAX { return false; }
+    let now_unpinned = {
+        let mut p = PINNED_INODES.lock();
+        if let Some(idx) = p.iter().position(|(m, n, _)| *m == mount_idx && *n == inode) {
+            if p[idx].2 > 1 {
+                p[idx].2 -= 1;
+                false
+            } else {
+                p.remove(idx);
+                true
+            }
+        } else {
+            false
+        }
+    };
+    if !now_unpinned { return false; }
+    // Last pin gone — free the inode iff it was deferred-deleted and no process
+    // fd table still references it.  Mirrors the close()-time last-close test.
+    let still_open = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().any(|p| p.file_descriptors.iter().any(|fdo| {
+            fdo.as_ref().map(|f| f.mount_idx == mount_idx && f.inode == inode)
+                .unwrap_or(false)
+        }))
+    };
+    if still_open { return false; }
+    let was_deleted = {
+        let mut dl = DELETED_INODES.lock();
+        let before = dl.len();
+        dl.retain(|(m, n)| !(*m == mount_idx && *n == inode));
+        dl.len() < before
+    };
+    if was_deleted {
+        if let Some((fs, _)) = fs_at(mount_idx) {
+            let _ = fs.remove_inode(inode);
+            return true;
+        }
+    }
+    false
+}
+
+/// True if `(mount_idx, inode)` currently has at least one kernel pin
+/// (see [`pin_inode`]).
+fn inode_is_pinned(mount_idx: usize, inode: u64) -> bool {
+    PINNED_INODES.lock().iter().any(|(m, n, c)| *m == mount_idx && *n == inode && *c > 0)
+}
+
 /// A held POSIX byte-range lock.
 #[derive(Clone)]
 pub struct FileLockEntry {
@@ -2001,13 +2086,19 @@ pub fn close(pid: crate::proc::Pid, fd_num: usize) -> VfsResult<()> {
         // C5: unlink-on-last-close — check if this inode was deferred-deleted.
         if !is_console && file_type == FileType::RegularFile && mount_idx != usize::MAX {
             // Check remaining open fds + atomically remove from DELETED_INODES if last.
+            // A kernel pin (e.g. an in-flight SCM_RIGHTS descriptor that is queued
+            // for delivery but not yet installed in any fd table — invisible to the
+            // fd-table scan below) also keeps the inode alive: do NOT free while
+            // pinned.  See PINNED_INODES / pin_inode.  When the last pin is later
+            // dropped, unpin_inode performs this same last-close test and frees the
+            // inode then.
             let should_free = {
                 let procs = crate::proc::PROCESS_TABLE.lock();
                 let still_open = procs.iter().any(|p| p.file_descriptors.iter().any(|fdo| {
                     fdo.as_ref().map(|f| f.mount_idx == mount_idx && f.inode == inode)
                         .unwrap_or(false)
                 }));
-                if !still_open {
+                if !still_open && !inode_is_pinned(mount_idx, inode) {
                     let mut dl = DELETED_INODES.lock();
                     let before = dl.len();
                     dl.retain(|(m, n)| !(*m == mount_idx && *n == inode));

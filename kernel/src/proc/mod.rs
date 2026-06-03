@@ -1009,6 +1009,22 @@ pub fn current_pid() -> Pid {
     threads.iter().find(|t| t.tid == tid).map(|t| t.pid).unwrap_or(0)
 }
 
+/// Resolve the owning process pid for a given thread id `tid`.
+///
+/// Returns 0 if no live thread carries that tid.  Used by the `tkill(2)`
+/// syscall path, which addresses a single thread by its kernel thread id;
+/// AstryxOS delivers signals at process granularity (one `signal_state` per
+/// process), so a thread-directed signal is resolved to its owning process
+/// here and then dispatched via the same path as `tgkill(2)`.
+pub fn pid_for_tid(tid: Tid) -> Pid {
+    #[cfg(feature = "firefox-test")]
+    let threads = thread_table_try_lock_or_panic(
+        "proc::pid_for_tid", THREAD_TABLE_DIAG_SPINS);
+    #[cfg(not(feature = "firefox-test"))]
+    let threads = THREAD_TABLE.lock();
+    threads.iter().find(|t| t.tid == tid).map(|t| t.pid).unwrap_or(0)
+}
+
 /// Resolve the effective credentials (pid, uid, gid) of the currently
 /// running process for use by syscall implementations that must record the
 /// caller's identity (e.g. AF_UNIX SO_PEERCRED capture per `unix(7)`).

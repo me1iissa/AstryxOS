@@ -74,6 +74,15 @@ Tier 1 — session management:
         owner-starved | true-lost-wakeup | benign-empty) + a one-line summary.
         The decisive condvar-livelock probe in one argv call (half def 128).
     python3 scripts/qemu-harness.py read-png <sid> <dst.png> [--timeout-ms MS]
+        Decode the VGA framebuffer ([SCREENSHOT-B64:…], Test 198) to a host PNG.
+    python3 scripts/qemu-harness.py read-ff-png <sid> <dst.png> [--timeout-ms MS]
+        Decode Firefox's RENDERED /tmp/out.png from the DISTINCT
+        [FF-OUT-PNG-B64:…] stream the firefox-test boot emits after FF exits.
+        This is the actual loaded page, not the boot-splash framebuffer.
+    python3 scripts/qemu-harness.py kdb-read-png <sid> <dst.png> [--path P]
+        Pull a guest VFS file (default /tmp/out.png) LIVE via the kdb
+        read-file op (chunked base64). Works the instant the file exists,
+        independent of the boot's serial emit. Requires --features kdb.
     python3 scripts/qemu-harness.py futex-wake-drill <sid> [--tid N]
                                             [--bucket-count K] [--window-lines L]
                                             [--cross-park]
@@ -5641,6 +5650,19 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
                 "pid": int(rest[0], 0),
                 "addr": f"0x{int(rest[1], 0):x}",
                 "half": half}
+    if op == "read-file":
+        # Read a slice of a VFS file, returned base64.  Robust extraction
+        # primitive — works on any live kdb session regardless of process
+        # state.  Args: <path> [<offset> [<len>]].  The host-side
+        # `read-ff-png --via-kdb` wrapper loops offset+=n until eof.
+        if not rest:
+            raise ValueError("read-file requires <path> [<offset> [<len>]]")
+        req: dict = {"op": "read-file", "path": rest[0]}
+        if len(rest) >= 2:
+            req["offset"] = int(rest[1], 0)
+        if len(rest) >= 3:
+            req["len"] = int(rest[2], 0)
+        return req
     raise ValueError(f"unknown kdb op: {op}")
 
 
@@ -10190,6 +10212,323 @@ def cmd_read_png(args):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# read-ff-png — extract Firefox's rendered /tmp/out.png from the guest via serial
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# DISTINCT from read-png above.  read-png decodes the [SCREENSHOT-B64:…] stream,
+# which carries the QEMU VGA framebuffer (the AstryxOS boot splash in headless
+# mode) — NOT Firefox's off-screen render.  Firefox writes its real screenshot
+# to the guest path /tmp/out.png; the firefox-test boot reads that file back out
+# of the VFS ramdisk and emits it over serial as a SEPARATE marker stream
+# (kernel/src/ff_out_png.rs):
+#
+#   [FF-OUT-PNG:path=/tmp/out.png size=<N> sig_ok=<bool>]
+#   [FF-OUT-PNG-B64:0/M] <up to 76 base64 chars>   (N = 0-based chunk index)
+#   [FF-OUT-PNG-B64:1/M] ...
+#   ...
+#   [FF-OUT-PNG-END]
+#
+# This subcommand:
+#   1. Waits for the [FF-OUT-PNG:…] header line (up to --timeout-ms), which
+#      carries the guest-side byte size for a cross-check.
+#   2. Scans the serial log for all M chunks (0..M-1) in order.
+#   3. Decodes the concatenated base64 (RFC 4648 §4) and writes to <dst>.
+#   4. Verifies the PNG signature (8-byte magic, W3C PNG §5.2 / ISO 15948),
+#      and that the decoded byte count matches the guest-reported size.
+#   5. Prints JSON: {"ok": true, "path": dst, "bytes": N, "chunks": M,
+#                    "guest_size": G, "size_match": bool}
+#      or {"ok": false, "error": "...", ...} on failure.
+#
+# Fully additive — does not touch read-png or its [SCREENSHOT-B64] regexes.
+
+_FFPNG_HEADER_RE = re.compile(
+    r"\[FF-OUT-PNG:path=(\S+)\s+size=(\d+)\s+sig_ok=(true|false)"
+)
+_FFPNG_CHUNK_RE = re.compile(
+    r"\[FF-OUT-PNG-B64:(\d+)/(\d+)\]\s+([A-Za-z0-9+/=]+)"
+)
+_FFPNG_END_RE = re.compile(r"\[FF-OUT-PNG-END\]")
+
+
+def cmd_read_ff_png(args):
+    """
+    Collect base64-encoded /tmp/out.png chunks from the [FF-OUT-PNG-B64:…]
+    serial stream and write to <dst>.
+
+    Waits for the [FF-OUT-PNG:…] header line, scans for all M chunks, decodes,
+    verifies the PNG signature, cross-checks the guest-reported size, and writes
+    to args.dst.  Distinct from read-png (which decodes the VGA framebuffer
+    stream).
+    """
+    import base64
+
+    sess       = _load_session(args.sid)
+    serial_log = sess["serial_log"]
+    dst        = args.dst
+    timeout_ms = args.timeout_ms
+
+    # ── 1. Wait for the [FF-OUT-PNG:…] header line ────────────────────────────
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    guest_size: Optional[int] = None
+    guest_sig_ok: Optional[bool] = None
+
+    while time.monotonic() < deadline:
+        try:
+            with open(serial_log, "r", errors="replace") as fh:
+                for ln in fh:
+                    m = _FFPNG_HEADER_RE.search(ln)
+                    if m:
+                        guest_size   = int(m.group(2))
+                        guest_sig_ok = (m.group(3) == "true")
+        except OSError:
+            time.sleep(0.1)
+            continue
+
+        if guest_size is not None:
+            break
+
+        # If QEMU has already exited, do one final scan then give up.
+        pid = sess.get("pid", 0)
+        if pid and not _pid_alive(pid):
+            try:
+                with open(serial_log, "r", errors="replace") as fh:
+                    for ln in fh:
+                        m = _FFPNG_HEADER_RE.search(ln)
+                        if m:
+                            guest_size   = int(m.group(2))
+                            guest_sig_ok = (m.group(3) == "true")
+            except OSError:
+                pass
+            break
+
+        time.sleep(0.1)
+
+    if guest_size is None:
+        _err(f"read-ff-png: timed out waiting for [FF-OUT-PNG:…] header "
+             f"(waited {timeout_ms} ms). Did firefox-test reach [FFTEST] DONE "
+             f"and did Firefox write /tmp/out.png?")
+
+    if guest_size == 0:
+        _out({
+            "ok":         False,
+            "error":      "guest_out_png_empty",
+            "guest_size": guest_size,
+            "guest_sig_ok": guest_sig_ok,
+            "hint":       "Firefox did not write a non-empty /tmp/out.png "
+                          "(reached png-write gate but produced 0 bytes).",
+        })
+        sys.exit(1)
+
+    # ── 2. Collect all chunks ─────────────────────────────────────────────────
+    # M is announced per chunk line (idx/M); we collect until we have a complete
+    # 0..M-1 set or the collect deadline elapses.  The PNG is ~30-80 KB → up to
+    # ~1400 lines; at 115200 baud that is ~10 s.  Give a 30 s collect window.
+    chunks: dict[int, str] = {}
+    total_chunks: Optional[int] = None
+    collect_deadline = time.monotonic() + 30.0
+
+    def _scan_chunks():
+        nonlocal total_chunks
+        try:
+            with open(serial_log, "r", errors="replace") as fh:
+                for ln in fh:
+                    m = _FFPNG_CHUNK_RE.search(ln)
+                    if m:
+                        idx = int(m.group(1))
+                        tot = int(m.group(2))
+                        b64 = m.group(3)
+                        if total_chunks is None:
+                            total_chunks = tot
+                        if tot == total_chunks and idx < tot:
+                            chunks[idx] = b64
+        except OSError:
+            pass
+
+    while time.monotonic() < collect_deadline:
+        _scan_chunks()
+        if total_chunks is not None and len(chunks) >= total_chunks:
+            break
+        pid = sess.get("pid", 0)
+        if pid and not _pid_alive(pid):
+            # QEMU exited; one final scan then stop.
+            _scan_chunks()
+            break
+        time.sleep(0.2)
+
+    if total_chunks is None:
+        _out({
+            "ok":         False,
+            "error":      "no_ffpng_chunks",
+            "guest_size": guest_size,
+            "hint":       "Saw the [FF-OUT-PNG:…] header but no "
+                          "[FF-OUT-PNG-B64:…] data lines.",
+        })
+        sys.exit(1)
+
+    # ── 3. Validate chunk count ───────────────────────────────────────────────
+    missing = [i for i in range(total_chunks) if i not in chunks]
+    if missing:
+        _out({
+            "ok":         False,
+            "error":      "missing_chunks",
+            "total":      total_chunks,
+            "received":   len(chunks),
+            "missing":    missing[:20],
+            "guest_size": guest_size,
+        })
+        sys.exit(1)
+
+    # ── 4. Decode base64 ──────────────────────────────────────────────────────
+    b64_concat = "".join(chunks[i] for i in range(total_chunks))
+    try:
+        png_bytes = base64.b64decode(b64_concat, validate=True)
+    except Exception as exc:
+        _out({
+            "ok":     False,
+            "error":  f"base64_decode_failed: {exc}",
+            "chunks": total_chunks,
+        })
+        sys.exit(1)
+
+    # ── 5. Verify PNG signature + size cross-check ────────────────────────────
+    if len(png_bytes) < 8 or png_bytes[:8] != _PNG_SIGNATURE:
+        got = png_bytes[:8].hex() if len(png_bytes) >= 8 else png_bytes.hex()
+        _out({
+            "ok":       False,
+            "error":    "png_signature_mismatch",
+            "got":      got,
+            "expected": _PNG_SIGNATURE.hex(),
+            "chunks":   total_chunks,
+            "bytes":    len(png_bytes),
+            "guest_size": guest_size,
+        })
+        sys.exit(1)
+
+    size_match = (len(png_bytes) == guest_size)
+
+    # ── 6. Write to dst ───────────────────────────────────────────────────────
+    dst_path = Path(dst)
+    try:
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        dst_path.write_bytes(png_bytes)
+    except OSError as exc:
+        _out({
+            "ok":    False,
+            "error": f"write_failed: {exc}",
+            "path":  dst,
+        })
+        sys.exit(1)
+
+    _out({
+        "ok":           True,
+        "path":         str(dst_path.resolve()),
+        "bytes":        len(png_bytes),
+        "chunks":       total_chunks,
+        "guest_size":   guest_size,
+        "size_match":   size_match,
+        "guest_sig_ok": guest_sig_ok,
+    })
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# kdb-read-png — pull a guest VFS file (e.g. /tmp/out.png) via the kdb read-file
+# op, regardless of the firefox-test boot's own detect-and-emit serial path.
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Robust live extraction: the kdb `read-file` op (kernel/src/kdb.rs) reads a VFS
+# file slice and returns it base64 (RFC 4648 §4).  This wrapper loops the op
+# with increasing offset until eof, concatenates, decodes, verifies the PNG
+# signature (W3C PNG §5.2 / ISO 15948), and writes to <dst>.  Unlike read-ff-png
+# (which decodes the [FF-OUT-PNG-B64] serial stream emitted at FF-exit), this
+# works against a LIVE session the instant the file exists on the guest — even
+# while Firefox is still a draining zombie and the serial emit has not fired.
+# Requires the session started with --features kdb.
+
+def cmd_kdb_read_png(args):
+    import base64
+
+    sess = _load_session(args.sid)
+    port = int(sess.get("kdb_host_port") or 0)
+    if port <= 0:
+        _out({"ok": False, "error": "session was not started with --features kdb"})
+        sys.exit(1)
+
+    path       = args.path
+    dst        = args.dst
+    timeout    = float(getattr(args, "timeout", 10.0) or 10.0)
+    max_chunks = 4096  # generous ceiling; a 16 KiB chunk × 4096 = 64 MiB cap
+
+    chunks: list[bytes] = []
+    offset = 0
+    file_size: Optional[int] = None
+    sig_png: Optional[bool] = None
+
+    for _ in range(max_chunks):
+        req = {"op": "read-file", "path": path, "offset": offset, "len": 16384}
+        try:
+            raw = _kdb_recv(port, req, timeout=timeout)
+            resp = json.loads(raw.strip().decode("utf-8", errors="replace"))
+        except (socket.timeout, ConnectionRefusedError, OSError) as e:
+            _out({"ok": False, "error": f"kdb io failed on 127.0.0.1:{port}: {e}",
+                  "offset": offset})
+            sys.exit(1)
+        except (json.JSONDecodeError, ValueError) as e:
+            _out({"ok": False, "error": f"malformed kdb response: {e}",
+                  "offset": offset, "raw": raw.decode(errors="replace")[:200]})
+            sys.exit(1)
+
+        if "error" in resp:
+            _out({"ok": False, "error": f"kdb read-file: {resp['error']}",
+                  "path": path, "offset": offset})
+            sys.exit(1)
+
+        if file_size is None:
+            file_size = int(resp.get("file_size", 0))
+            sig_png = bool(resp.get("sig_png", False))
+            if file_size == 0:
+                _out({"ok": False, "error": "guest_file_empty", "path": path})
+                sys.exit(1)
+
+        b64 = resp.get("b64", "")
+        try:
+            chunks.append(base64.b64decode(b64, validate=True))
+        except Exception as e:
+            _out({"ok": False, "error": f"base64_decode_failed: {e}",
+                  "offset": offset})
+            sys.exit(1)
+
+        n = int(resp.get("n", 0))
+        offset += n
+        if bool(resp.get("eof", False)) or n == 0:
+            break
+
+    data = b"".join(chunks)
+
+    sig = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+    is_png = len(data) >= 8 and data[:8] == sig
+    size_match = (file_size is not None and len(data) == file_size)
+
+    dst_path = Path(dst)
+    try:
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        dst_path.write_bytes(data)
+    except OSError as exc:
+        _out({"ok": False, "error": f"write_failed: {exc}", "path": dst})
+        sys.exit(1)
+
+    _out({
+        "ok":          is_png and size_match,
+        "path":        str(dst_path.resolve()),
+        "bytes":       len(data),
+        "guest_size":  file_size,
+        "size_match":  size_match,
+        "is_png":      is_png,
+        "guest_sig_png": sig_png,
+        "via":         "kdb-read-file",
+    })
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # screendump — capture the QEMU framebuffer via QMP and write a PNG
 # ══════════════════════════════════════════════════════════════════════════════
 #
@@ -10690,7 +11029,7 @@ def main():
     p_kdb.add_argument("op", choices=[
         "ping", "proc-list", "proc", "proc-tree", "fd-table", "fd-map",
         "syscall-trend", "vfs-mounts",
-        "dmesg", "syms", "mem", "tframe", "user-mem", "trace-status",
+        "dmesg", "syms", "mem", "read-file", "tframe", "user-mem", "trace-status",
         "bell-stats", "cache-audit", "cache-aliasing", "fault-cache-keys",
         "w215-cache-residency", "tlb-stats", "heap-stats", "w215-diag",
         "arm-phys",
@@ -11159,6 +11498,45 @@ def main():
              "(default 120000 = 2 min, covers build + boot + test run)"
     )
 
+    # read-ff-png — extract Firefox's rendered /tmp/out.png (DISTINCT stream)
+    p_read_ff_png = sub.add_parser(
+        "read-ff-png",
+        help="Collect Firefox's rendered /tmp/out.png from the "
+             "[FF-OUT-PNG-B64:N/M] serial stream (firefox-test boot emits it "
+             "after [FFTEST] DONE) and write to <dst.png>.  DISTINCT from "
+             "read-png, which decodes the VGA framebuffer ([SCREENSHOT-B64]) — "
+             "the boot splash, not Firefox's render.  Verifies the PNG "
+             "signature and cross-checks the guest-reported byte size.  "
+             "Example: read-ff-png <sid> /tmp/firefox-out.png"
+    )
+    p_read_ff_png.add_argument("sid")
+    p_read_ff_png.add_argument("dst", help="Host-side destination path for the PNG file")
+    p_read_ff_png.add_argument(
+        "--timeout-ms", type=int, default=120000, dest="timeout_ms",
+        help="Milliseconds to wait for the [FF-OUT-PNG:…] header line "
+             "(default 120000 = 2 min)"
+    )
+
+    # kdb-read-png — pull a guest VFS file live via the kdb read-file op
+    p_kdb_read_png = sub.add_parser(
+        "kdb-read-png",
+        help="Pull a guest VFS file (default /tmp/out.png) to <dst.png> via the "
+             "kdb read-file op (chunked base64).  Works on a LIVE session the "
+             "instant the file exists — independent of the firefox-test boot's "
+             "own serial emit.  Requires --features kdb.  "
+             "Example: kdb-read-png <sid> /tmp/firefox-out.png"
+    )
+    p_kdb_read_png.add_argument("sid")
+    p_kdb_read_png.add_argument("dst", help="Host-side destination path for the PNG file")
+    p_kdb_read_png.add_argument(
+        "--path", default="/tmp/out.png",
+        help="Guest VFS path to read (default /tmp/out.png)"
+    )
+    p_kdb_read_png.add_argument(
+        "--timeout", type=float, default=10.0,
+        help="Per-chunk kdb request timeout in seconds (default 10)"
+    )
+
     # screendump — capture the framebuffer via QMP screendump + PPM->PNG
     p_screendump = sub.add_parser(
         "screendump",
@@ -11383,6 +11761,8 @@ def main():
         "rip-walk": cmd_rip_walk,
         "rip-trace-resolve": cmd_rip_trace_resolve,
         "read-png": cmd_read_png,
+        "read-ff-png": cmd_read_ff_png,
+        "kdb-read-png": cmd_kdb_read_png,
         "screendump": cmd_screendump,
         # Shared session context
         "context": cmd_context,

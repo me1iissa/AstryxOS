@@ -74,6 +74,8 @@ mod pivot_e_demo;
 mod pivot_e_tui_demo;
 #[cfg(feature = "pivot-e-git-test")]
 mod pivot_e_git_demo;
+#[cfg(feature = "firefox-test")]
+mod ff_out_png;
 
 use astryx_shared::{BootInfo, BOOT_INFO_MAGIC};
 
@@ -1311,19 +1313,55 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             let t_launch = arch::x86_64::irq::get_ticks();
             let mut last_log_tick: u64 = 0;
             let mut firefox_exited = false;
+            // Emit Firefox's rendered /tmp/out.png over serial as soon as it is
+            // written, INDEPENDENT of Firefox-exit detection.  The screenshot
+            // file is complete the moment Firefox closes it; waiting for full
+            // process teardown is fragile (a slow Dead-thread drain can hold
+            // THREAD_TABLE long enough that is_firefox_running() never reports
+            // exit, so the post-loop emit below would never run).  Probing the
+            // file directly decouples extraction from teardown.  Fires exactly
+            // once; emit_out_png() re-reads and streams the bytes (see below).
+            let mut out_png_emitted = false;
+            let mut last_png_probe_tick: u64 = 0;
             loop {
                 gui::input::pump_input();
                 crate::net::poll();
                 crate::x11::poll();
+
+                let now = arch::x86_64::irq::get_ticks();
+                let elapsed = now.wrapping_sub(t_launch);
+
+                // Stream the rendered screenshot the moment it lands — placed
+                // HERE, immediately after net/x11 poll and BEFORE poll_output()
+                // / compose(), because those later calls take the TERMINAL and
+                // THREAD_TABLE locks and can be starved during a large
+                // Dead-thread drain at Firefox exit (271 threads observed).
+                // net::poll() above keeps kdb alive even then, so probing here
+                // guarantees the emit fires before the loop body can block.
+                // stat() reads no content; emit_out_png() returns false until
+                // the file is a COMPLETE PNG (signature + IEND), so a probe
+                // that catches the write mid-flight retries next tick.
+                if !out_png_emitted && elapsed.wrapping_sub(last_png_probe_tick) >= 200 {
+                    last_png_probe_tick = elapsed;
+                    if let Ok(st) = crate::vfs::stat("/tmp/out.png") {
+                        if st.size > 0 {
+                            serial_println!(
+                                "[FFTEST] /tmp/out.png present ({} bytes) — streaming",
+                                st.size
+                            );
+                            if ff_out_png::emit_out_png() {
+                                out_png_emitted = true;
+                            }
+                        }
+                    }
+                }
+
                 crate::gui::terminal::poll_output();
                 // Drive the compositor via the ISR-set tick flag (≈50 Hz).
                 // The timer ISR sets COMPOSITOR_TICK_DUE every 2 published
                 // ticks; compose() drains it and renders a frame.  Replaces
                 // the unreliable `ticks % 3` check (see gui/compositor.rs).
                 gui::compositor::compose();
-
-                let now = arch::x86_64::irq::get_ticks();
-                let elapsed = now.wrapping_sub(t_launch);
 
                 // Log a heartbeat every 1000 ticks (~10s).  Use try_lock so a
                 // contended/leaked THREAD_TABLE never wedges CPU0; the BSP must
@@ -1417,6 +1455,25 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // summary block at every kernel-test shutdown.
             #[cfg(feature = "firefox-test")]
             crate::subsys::linux::syscall::ghost_hist::dump_summary();
+
+            // Read Firefox's rendered screenshot (/tmp/out.png) back out of the
+            // VFS ramdisk and emit it over serial as the [FF-OUT-PNG-B64:…]
+            // marker stream for host extraction.  This is the REAL rendered
+            // page — distinct from the [SCREENSHOT-B64:…] stream, which carries
+            // the QEMU VGA framebuffer (the boot splash in headless mode), not
+            // Firefox's off-screen render.  The host decodes it with
+            // `qemu-harness.py read-ff-png`.  Best-effort: a missing or empty
+            // file is reported on the header line and never blocks shutdown.
+            //
+            // Skipped when the in-loop probe already streamed the file (the
+            // common, robust path) so we never double-emit.  This post-loop
+            // call is the fallback for the path where Firefox exited before the
+            // 200-tick probe fired (e.g. a very fast screenshot run).
+            #[cfg(feature = "firefox-test")]
+            if !out_png_emitted {
+                ff_out_png::emit_out_png();
+            }
+
             serial_println!("[FFTEST] DONE");
 
             // Brief pause for QMP screendump, then exit.

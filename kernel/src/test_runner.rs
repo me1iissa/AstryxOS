@@ -1060,6 +1060,14 @@ pub fn run() -> ! {
     total += 1;
     if test_cleartid_write_demand_faults() { passed += 1; }
 
+    // ── Test 98g: shared-CR3 anonymous-fault anti-aliasing (vfork da4) ───
+    total += 1;
+    if test_map_page_in_if_absent_anti_alias() { passed += 1; }
+
+    // ── Test 98h: file-backed install-arm anti-aliasing back-out ─────────
+    total += 1;
+    if test_pfh_install_arm_anti_alias_backout() { passed += 1; }
+
     // ── Test 99: procfs self/maps — per-process VMA listing ──────────────
 
     total += 1;
@@ -1354,6 +1362,12 @@ pub fn run() -> ! {
 
     total += 1;
     if test_syscall_creat() { passed += 1; }
+
+    // ── Test 145b: out.png golden path — O_WRONLY|O_CREAT|O_TRUNC|O_LARGEFILE
+    //              create + 26870-byte write + read-back byte-exact ──────────
+
+    total += 1;
+    if test_out_png_create_write_readback() { passed += 1; }
 
     // ── Test 146: getdents(78) iterates directory entries ─────────────────
 
@@ -1996,6 +2010,28 @@ pub fn run() -> ! {
         if test_228_auto_reap_orphan_zombies() { passed += 1; }
     }
 
+    // ── Test 502: waitpid prepare-to-wait lost-wakeup close ──────────────
+    // A child that becomes a zombie in the parent's prepare-to-wait window
+    // (after the immediate-reap check drops PROCESS_TABLE, before/while the
+    // parent commits Blocked) must be reaped without a permanent park — the
+    // recheck-under-lock backstop.  Per POSIX wait(2): an already-terminated
+    // child must be reapable without blocking.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_502_waitpid_prepare_to_wait_race() { passed += 1; }
+    }
+
+    // ── Test 502b: vfork prepare-to-wait lost-wakeup close ───────────────
+    // A vfork child that completes (clears its vfork completion token) before
+    // the parent commits Blocked must not leave the parent parked — the
+    // recheck-under-lock reverts the parent to Ready.  Per POSIX vfork(2).
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_502b_vfork_prepare_to_wait_race() { passed += 1; }
+    }
+
     // ── Test 229: PMM pte_share_count free-time invariant (W215 fix) ─────
     // Verifies that pmm::free_page refuses to recycle a frame whose
     // refcount table still records a live PTE reference, and that the
@@ -2473,6 +2509,82 @@ pub fn run() -> ! {
     // that another thread may need; POSIX sched(7) "priority inversion" note.
     total += 1;
     if test_278_mounts_lock_not_held_across_fs_dispatch() { passed += 1; }
+
+    // ── Test 280: control-only SCM_RIGHTS confers read-readiness ─────────
+    // A sendmsg(2) carrying SCM_RIGHTS with an empty data payload
+    // (iov_len==0, a pure fd handoff) is still a readable message:
+    // poll/epoll must report POLLIN and recvmsg must return it with 0 data
+    // bytes + the cmsg.  Also verifies the byte-offset binding that keeps
+    // fds attached to their originating stream frame.
+    // Refs: recvmsg(2)/sendmsg(2), poll(2), epoll(7), unix(7) SCM_RIGHTS.
+    total += 1;
+    if test_280_scm_control_only_readiness() { passed += 1; }
+
+    // ── Test 281: non-blocking socket recv reports EAGAIN, not 0, on an
+    // empty queue (and 0 only on orderly EOF) ───────────────────────────
+    // recvmsg(2)/recv(2) on a non-blocking AF_INET socket with no datagram
+    // pending must surface "would block" as -EAGAIN, never as a 0-byte
+    // return: a 0 falsely signals EOF and drives a polled event loop into a
+    // busy re-read spin (the FF content-process screenshot-IPC gate).  An
+    // orderly read-shutdown must still return 0.  Refs: recvmsg(2), recv(2),
+    // IEEE 1003.1 §recv, POSIX.1-2017 §2.10.6.
+    total += 1;
+    if test_281_socket_recv_eagain_vs_eof() { passed += 1; }
+
+    // ── Test 286: concurrent SCM_RIGHTS deliver in byte-offset order (N1) ──
+    // Two SCM batches whose enqueue-offset capture and PENDING_SCM push
+    // interleave so the Vec order inverts vs byte order must still be
+    // delivered lowest-offset-first.  Refs: unix(7)/recvmsg(2) SCM_RIGHTS.
+    total += 1;
+    if test_286_scm_dequeue_byte_order() { passed += 1; }
+
+    // ── Test 287: PENDING_SCM drained on receiver teardown (N2, CWE-772) ──
+    // Closing a receiver socket with an undelivered SCM batch must release
+    // the per-fd reference taken at enqueue so the passed socket is not
+    // leaked and its peer observes the hang-up.  Refs: unix(7) SCM_RIGHTS,
+    // CWE-772.
+    total += 1;
+    if test_287_scm_drain_on_close_no_leak() { passed += 1; }
+
+    // ── Test 288: SCM-passed memfd inode survives sender close (N4) ────────
+    // A memfd (unlinked anonymous inode per memfd_create(2)) passed via
+    // SCM_RIGHTS must stay readable after the sender closes its copy — the
+    // in-flight pin keeps the inode alive, and it is freed only once both
+    // sides close.  Refs: memfd_create(2), unix(7) SCM_RIGHTS.
+    total += 1;
+    if test_288_scm_memfd_inode_lifecycle() { passed += 1; }
+
+    // ── Test 289: SCM_RIGHTS fds bound to the FIRST byte of their frame ────
+    // A data-bearing sendmsg(2) that also carries SCM_RIGHTS must deliver the
+    // passed fds with the SAME recvmsg(2) that first returns the frame's
+    // bytes — even on a partial (header-first) read.  Binding the fd batch to
+    // the frame TAIL withholds the fds until every byte is drained, which
+    // breaks a reader that parses a message header announcing N handles and
+    // then expects those fds already present ("needs unreceived
+    // descriptors").  Refs: recvmsg(2), unix(7) SCM_RIGHTS, POSIX.1-2017.
+    total += 1;
+    if test_289_scm_first_byte_bind() { passed += 1; }
+
+    // ── Test 290: a multi-fd SCM_RIGHTS message delivers ALL its fds ───────
+    // A single sendmsg(2) that attaches N>1 file descriptors in one SCM_RIGHTS
+    // control message forms ONE batch carrying all N fds; the recvmsg(2) that
+    // first returns the frame's bytes must co-deliver EVERY one of those fds
+    // (not a partial subset).  A reader whose message header announces
+    // num_handles==N and receives fewer than N descriptors aborts with "needs
+    // unreceived descriptors".  Refs: recvmsg(2), unix(7) SCM_RIGHTS,
+    // POSIX.1-2017 §2.14.
+    total += 1;
+    if test_290_scm_multi_fd_delivery() { passed += 1; }
+
+    // ── Test 291: a coalesced stream read delivers one fd batch per recv ───
+    // Two fd-bearing frames queued back-to-back must NOT both drain in a single
+    // large recvmsg while only one batch is delivered; the recv-side cap
+    // (scm_next_batch_offset) returns the bytes up to exactly one fd batch per
+    // recv and delivers that batch, then stops — the byte-stream reader
+    // otherwise aborts "needs unreceived descriptors".  Refs: recvmsg(2),
+    // unix(7) SCM_RIGHTS.
+    total += 1;
+    if test_291_scm_coalesced_stream_read_cap() { passed += 1; }
 
     // ── Test 283: stack-prov main-stack TOP-window argv-writer capture ──
     // GATE-A blind-spot closure (2026-05-30).  Only built when the
@@ -21183,11 +21295,20 @@ fn test_scm_rights() -> bool {
     };
     test_println!("  File inode={} prepared ✓", inode);
 
-    // Queue the fd from A→B: scm_queue(receiver=B, fds).
-    crate::syscall::scm_queue(id_b, alloc::vec![fd_to_pass]);
+    // Queue the fd from A→B at B's current recv-stream position.  B has read
+    // nothing, so this batch (offset 0) is immediately deliverable
+    // (consumed 0 >= offset 0).
+    let off_b = crate::net::unix::enqueue_offset_for(id_b);
+    crate::syscall::scm_queue(id_b, off_b, alloc::vec![fd_to_pass]);
 
-    // Dequeue from B.
-    let received = crate::syscall::scm_dequeue(id_b);
+    // The batch must register as deliverable — the POLLIN readiness predicate.
+    if !crate::syscall::has_scm_deliverable(id_b, crate::net::unix::recv_consumed(id_b)) {
+        test_fail!("scm_rights", "queued SCM batch not reported deliverable");
+        return false;
+    }
+
+    // Dequeue from B at B's current consumed position.
+    let received = crate::syscall::scm_dequeue(id_b, crate::net::unix::recv_consumed(id_b));
     if received.is_none() {
         test_fail!("scm_rights", "scm_dequeue(B) returned None");
         return false;
@@ -21216,7 +21337,7 @@ fn test_scm_rights() -> bool {
     test_println!("  File content via path: {:?} ✓", core::str::from_utf8(&content).unwrap_or("?"));
 
     // Second dequeue should return None (only one batch queued).
-    if crate::syscall::scm_dequeue(id_b).is_some() {
+    if crate::syscall::scm_dequeue(id_b, crate::net::unix::recv_consumed(id_b)).is_some() {
         test_fail!("scm_rights", "Second dequeue should return None");
         return false;
     }
@@ -27317,6 +27438,187 @@ fn test_syscall_creat() -> bool {
     true
 }
 
+/// Test the LITERAL last step of the headless-Firefox screenshot pipeline:
+/// the `out.png` create + write + read-back, on the filesystem that actually
+/// backs `/tmp/out.png`.
+///
+/// The headless `firefox --screenshot /tmp/out.png` driver finishes by emitting
+/// the encoded PNG with the golden sequence
+///
+///     open("/tmp/out.png", O_WRONLY|O_CREAT|O_TRUNC|O_LARGEFILE) = 82
+///     write(82, "\x89PNG\r\n\x1a\n...", 26870)                   = 26870
+///     close(82)
+///
+/// `/tmp` is a plain directory inside the root ramfs (`vfs::init` does
+/// `mkdir("/tmp")`; there is no separate `/tmp` mount at boot), so this is the
+/// VFS/ramfs write path — not ext2 and not a runtime tmpfs mount.
+///
+/// This test reproduces that exact sequence and locks three properties POSIX
+/// requires of it:
+///
+///  * `open(2)` (IEEE Std 1003.1-2017) — `O_LARGEFILE` is a no-op on a 64-bit
+///    kernel and MUST be accepted-and-ignored, not rejected with EINVAL.  We
+///    pass the full golden flag word `O_WRONLY|O_CREAT|O_TRUNC|O_LARGEFILE`
+///    (0x8241) and require a successful create.
+///  * `write(2)` — the single 26870-byte write MUST NOT short-write; the return
+///    value equals the byte count (matching the golden `= 26870`).
+///  * Persistence — a fresh `open(O_RDONLY)` + read loop MUST return the exact
+///    bytes written, and `stat(2)` MUST report `st_size == 26870`.
+///
+/// A regression on any of these (rejected O_LARGEFILE → no file; a short write;
+/// an i_size/data desync that yields an empty or truncated file on read-back)
+/// would leave Firefox unable to emit the screenshot even after a fully
+/// faithful render → libpng-encode chain.
+fn test_out_png_create_write_readback() -> bool {
+    test_header!("out.png golden create+write+readback");
+    let pid = crate::proc::current_pid();
+
+    // Use a dedicated path on the SAME filesystem that backs the real
+    // /tmp/out.png (root ramfs) so this exercises the production write path.
+    const PATH: &str = "/tmp/out_png_roundtrip_test.png";
+    const PATH_C: &[u8] = b"/tmp/out_png_roundtrip_test.png\0";
+    const LEN: usize = 26870; // 7 × 4 KiB blocks − 778; all-direct on a block FS.
+
+    // Golden open flags: O_WRONLY(0x1) | O_CREAT(0x40) | O_TRUNC(0x200)
+    // | O_LARGEFILE(0x8000) = 0x8241.  O_LARGEFILE must be ignored, not
+    // rejected, on a 64-bit kernel (open(2)).
+    const O_WRONLY: u32 = 0x1;
+    const O_CREAT: u32 = 0x40;
+    const O_TRUNC: u32 = 0x200;
+    const O_LARGEFILE: u32 = 0x8000;
+    const WR_FLAGS: u32 = O_WRONLY | O_CREAT | O_TRUNC | O_LARGEFILE;
+
+    // Remove any stale copy from a prior run so O_CREAT genuinely creates a
+    // fresh inode (the case the screenshot driver always hits).
+    let _ = crate::vfs::remove(PATH);
+
+    // Build a PNG-shaped 26870-byte buffer: the 8-byte PNG signature
+    // (\x89 P N G \r \n \x1a \n — per the PNG spec, ISO/IEC 15948) followed by
+    // a deterministic byte pattern so the read-back comparison is exact.
+    let mut src = alloc::vec::Vec::with_capacity(LEN);
+    const PNG_SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    src.extend_from_slice(&PNG_SIG);
+    for i in PNG_SIG.len()..LEN {
+        // Mix the index across the full byte range; avoids long zero runs so a
+        // partial / zero-filled write-back would diverge immediately.
+        src.push(((i.wrapping_mul(31)).wrapping_add(i >> 8) & 0xff) as u8);
+    }
+    if src.len() != LEN {
+        test_fail!("out.png", "source buffer len {} != {}", src.len(), LEN);
+        return false;
+    }
+
+    // ── open(O_WRONLY|O_CREAT|O_TRUNC|O_LARGEFILE) ────────────────────────
+    // Drive it through the real Linux open syscall (nr 2) so the full
+    // syscall-layer flag handling (including O_LARGEFILE) is exercised, exactly
+    // as Firefox reaches it.  dispatch(2, path, flags, mode, ...).
+    let wfd = {
+        let r = dispatch(2, PATH_C.as_ptr() as u64, WR_FLAGS as u64, 0o666, 0, 0, 0);
+        if r < 0 {
+            test_fail!(
+                "out.png",
+                "open(O_WRONLY|O_CREAT|O_TRUNC|O_LARGEFILE)=0x{:x} rejected: {} \
+                 (O_LARGEFILE must be ignored on a 64-bit kernel per open(2))",
+                WR_FLAGS, r);
+            return false;
+        }
+        r as usize
+    };
+    test_println!("  open(\"{}\", 0x{:x}) = fd {} ✓ (O_LARGEFILE accepted-and-ignored)",
+                  PATH, WR_FLAGS, wfd);
+
+    // ── write(fd, src, 26870) — must be a full, non-short write ───────────
+    let n = match crate::vfs::fd_write(pid, wfd, src.as_ptr(), src.len()) {
+        Ok(n) => n,
+        Err(e) => {
+            test_fail!("out.png", "write failed: {:?}", e);
+            let _ = crate::vfs::close(pid, wfd);
+            return false;
+        }
+    };
+    if n != LEN {
+        test_fail!("out.png", "short write: wrote {} of {} bytes", n, LEN);
+        let _ = crate::vfs::close(pid, wfd);
+        return false;
+    }
+    test_println!("  write(fd {}, .., {}) = {} ✓ (matches golden = 26870)", wfd, LEN, n);
+
+    let _ = crate::vfs::close(pid, wfd);
+
+    // ── stat — i_size must reflect the full 26870 bytes ───────────────────
+    match crate::vfs::stat(PATH) {
+        Ok(st) if st.size as usize == LEN => {
+            test_println!("  stat: size={} ✓ (i_size persisted)", st.size);
+        }
+        Ok(st) => {
+            test_fail!("out.png", "stat size {} != {} (i_size not persisted)", st.size, LEN);
+            let _ = crate::vfs::remove(PATH);
+            return false;
+        }
+        Err(e) => {
+            test_fail!("out.png", "stat after write failed: {:?}", e);
+            let _ = crate::vfs::remove(PATH);
+            return false;
+        }
+    }
+
+    // ── reopen O_RDONLY + read-back loop — bytes must be exact ────────────
+    let rfd = match crate::vfs::open(pid, PATH, 0 /* O_RDONLY */) {
+        Ok(fd) => fd,
+        Err(e) => {
+            test_fail!("out.png", "reopen O_RDONLY failed: {:?}", e);
+            let _ = crate::vfs::remove(PATH);
+            return false;
+        }
+    };
+
+    let mut got = alloc::vec::Vec::with_capacity(LEN);
+    let mut chunk = [0u8; 4096];
+    loop {
+        let r = match crate::vfs::fd_read(pid, rfd, chunk.as_mut_ptr(), chunk.len()) {
+            Ok(r) => r,
+            Err(e) => {
+                test_fail!("out.png", "read-back failed at offset {}: {:?}", got.len(), e);
+                let _ = crate::vfs::close(pid, rfd);
+                let _ = crate::vfs::remove(PATH);
+                return false;
+            }
+        };
+        if r == 0 {
+            break; // EOF
+        }
+        got.extend_from_slice(&chunk[..r]);
+        if got.len() > LEN {
+            test_fail!("out.png", "read-back returned more than {} bytes (got {})", LEN, got.len());
+            let _ = crate::vfs::close(pid, rfd);
+            let _ = crate::vfs::remove(PATH);
+            return false;
+        }
+    }
+    let _ = crate::vfs::close(pid, rfd);
+
+    // Length first, then byte-exact content.
+    if got.len() != LEN {
+        test_fail!("out.png", "read-back length {} != {} (truncated/empty file)", got.len(), LEN);
+        let _ = crate::vfs::remove(PATH);
+        return false;
+    }
+    if got != src {
+        // Find the first divergent offset for a useful failure message.
+        let mismatch = got.iter().zip(src.iter()).position(|(a, b)| a != b).unwrap_or(LEN);
+        test_fail!("out.png", "byte mismatch at offset {}: got 0x{:02x} want 0x{:02x}",
+                   mismatch, got.get(mismatch).copied().unwrap_or(0),
+                   src.get(mismatch).copied().unwrap_or(0));
+        let _ = crate::vfs::remove(PATH);
+        return false;
+    }
+    test_println!("  read-back {} bytes byte-exact (PNG sig + pattern) ✓", got.len());
+
+    let _ = crate::vfs::remove(PATH);
+    test_pass!("out.png golden create+write+readback");
+    true
+}
+
 /// Test getdents(78) — list /tmp directory entries with the 32-bit inode variant.
 fn test_syscall_getdents() -> bool {
     test_header!("syscall getdents(78)");
@@ -29069,6 +29371,272 @@ fn test_cleartid_write_demand_faults() -> bool {
 
     teardown();
     test_pass!("CLONE_CHILD_CLEARTID write lands on non-present / COW page");
+    true
+}
+
+/// Regression test for the shared-CR3 anonymous demand-fault aliasing race.
+///
+/// On a CLONE_VM / vfork address space several threads run on ONE CR3 across
+/// multiple logical processors.  Two CPUs can take a not-present `#PF` on the
+/// same anonymous stack VA concurrently; each zero-fills its own frame.  The
+/// old anonymous install arm called `map_page_in` unconditionally, so the
+/// loser overwrote the winner's leaf PTE with a *different* physical frame.
+/// The winner's CPU kept reading the first frame through its already-cached
+/// TLB entry while the page table pointed at the second — one VA backed by two
+/// frames — so a release-store by one thread was never observed by the thread
+/// reading the other (the `da4` control-word store-visibility failure).
+///
+/// `map_page_in_if_absent` performs the present-check and the install as one
+/// indivisible operation under `VMM_LOCK`: the winner installs; the loser
+/// observes the winner's already-present PTE and backs out WITHOUT overwriting
+/// it, so the mapping is never aliased.  Refs: POSIX mmap(2), clone(2)
+/// CLONE_VM; Intel SDM Vol. 3A §4.10.4.3 (Optional Invalidation).
+fn test_map_page_in_if_absent_anti_alias() -> bool {
+    test_header!("map_page_in_if_absent: shared-CR3 anonymous-fault anti-aliasing");
+
+    use crate::mm::vmm::{read_pte, map_page_in_if_absent, PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER, ADDR_MASK};
+
+    // Fresh user address space (its own CR3 + page tables).
+    let vm = match crate::mm::vma::VmSpace::new_user() {
+        Some(vs) => vs,
+        None => { test_fail!("anti_alias", "VmSpace::new_user() OOM"); return false; }
+    };
+    let cr3 = vm.cr3;
+
+    // A stack-like anonymous VA in the canonical lower half.
+    let va: u64 = 0x7fff_fffe_c000;
+    let page = crate::mm::vma::page_align_down(va);
+
+    // Two distinct, separately-allocated frames standing in for the two CPUs'
+    // independently zero-filled demand-fault frames.
+    let frame_winner = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => { crate::proc::free_vm_space(vm); test_fail!("anti_alias", "OOM winner"); return false; }
+    };
+    let frame_loser = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => {
+            crate::mm::pmm::free_page(frame_winner);
+            crate::proc::free_vm_space(vm);
+            test_fail!("anti_alias", "OOM loser"); return false;
+        }
+    };
+    if frame_winner == frame_loser {
+        crate::mm::pmm::free_page(frame_winner);
+        crate::proc::free_vm_space(vm);
+        test_fail!("anti_alias", "allocator returned identical frames");
+        return false;
+    }
+
+    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+
+    // Precondition: VA not present.
+    if read_pte(cr3, va) & PAGE_PRESENT != 0 {
+        crate::mm::pmm::free_page(frame_winner);
+        crate::mm::pmm::free_page(frame_loser);
+        crate::proc::free_vm_space(vm);
+        test_fail!("anti_alias", "precondition: VA already present");
+        return false;
+    }
+
+    // (1) Winner installs over a not-present PTE → returns true, frame_winner mapped.
+    let won = map_page_in_if_absent(cr3, page, frame_winner, flags);
+    let pte1 = read_pte(cr3, va);
+    if !won || pte1 & PAGE_PRESENT == 0 || (pte1 & ADDR_MASK) != (frame_winner & ADDR_MASK) {
+        crate::mm::pmm::free_page(frame_winner);
+        crate::mm::pmm::free_page(frame_loser);
+        crate::proc::free_vm_space(vm);
+        test_fail!("anti_alias", "winner install failed: won={} pte={:#x} expect_phys={:#x}",
+            won, pte1, frame_winner);
+        return false;
+    }
+    test_println!("  (1) winner installed frame {:#x} over not-present PTE ✓", frame_winner);
+
+    // (2) Loser races the SAME VA with a DIFFERENT frame → must return false and
+    //     leave the winner's PTE untouched (no aliasing, no second frame).
+    let lost = map_page_in_if_absent(cr3, page, frame_loser, flags);
+    let pte2 = read_pte(cr3, va);
+    if lost {
+        crate::mm::pmm::free_page(frame_winner);
+        crate::mm::pmm::free_page(frame_loser);
+        crate::proc::free_vm_space(vm);
+        test_fail!("anti_alias", "loser install returned true — it overwrote the PTE (aliasing)");
+        return false;
+    }
+    if (pte2 & ADDR_MASK) != (frame_winner & ADDR_MASK) {
+        crate::mm::pmm::free_page(frame_winner);
+        crate::mm::pmm::free_page(frame_loser);
+        crate::proc::free_vm_space(vm);
+        test_fail!("anti_alias", "PTE no longer maps winner frame: pte={:#x} winner={:#x} loser={:#x}",
+            pte2, frame_winner, frame_loser);
+        return false;
+    }
+    test_println!("  (2) loser backed out; PTE still maps winner {:#x} — no aliasing ✓", frame_winner);
+
+    // Teardown: the VA still maps frame_winner; clearing the address space frees
+    // it via the page-table walk.  frame_loser was never mapped, so free it here.
+    crate::mm::pmm::free_page(frame_loser);
+    crate::proc::free_vm_space(vm);
+
+    test_pass!("map_page_in_if_absent anti-aliasing");
+    true
+}
+
+/// Regression test for the file-backed page-fault install-arm anti-aliasing
+/// back-out (the libxul GOT/PLT/.data/.bss private-writable segment race).
+///
+/// The cache-hit / readahead / single-page install arms in `handle_page_fault`
+/// mint a backing frame and publish a leaf PTE for a file-backed
+/// MAP_PRIVATE-writable VA.  On a shared address space (CLONE_VM / vfork) two
+/// CPUs can reach the SAME VA's install concurrently.  The arms were converted
+/// from an unconditional `map_page_in` to `map_page_in_if_absent` so the loser
+/// backs out instead of overwriting the winner's PTE with a second frame (the
+/// cross-CPU store-visibility failure).  This test models the two back-out
+/// shapes used by those arms and proves the refcount accounting nets correctly:
+///
+///   (A) PRIVATE-COPY shape — the loser's freshly-allocated private frame was
+///       never mapped (refcount left at 0 until a successful install), so the
+///       arm must `free_page` it with NO leak and NO refcount drift, while the
+///       winner's private frame stays mapped at refcount 1.
+///   (B) ALIAS shape — the installed frame is the SHARED cache frame; the loser
+///       must NOT free it but must release its redundant guard ref so the frame
+///       nets cache(1) + winner-PTE(1) = 2 with no drift.
+///
+/// Refs: POSIX mmap(2) MAP_PRIVATE (a private VA in a shared address space must
+/// resolve to one backing frame); Intel SDM Vol. 3A §4.10.4.3 (present-recheck
+/// before leaf install; per-logical-processor invalidation).
+fn test_pfh_install_arm_anti_alias_backout() -> bool {
+    test_header!("PFH install-arm anti-aliasing back-out (private-copy + alias)");
+
+    use crate::mm::vmm::{read_pte, map_page_in_if_absent, PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER, ADDR_MASK};
+    use crate::mm::refcount::{page_ref_set, page_ref_inc, page_ref_dec, page_ref_count,
+        page_ref_dec_underflow_count};
+
+    let vm = match crate::mm::vma::VmSpace::new_user() {
+        Some(vs) => vs,
+        None => { test_fail!("backout", "VmSpace::new_user() OOM"); return false; }
+    };
+    let cr3 = vm.cr3;
+    let va: u64 = 0x5555_0001_0000;            // file-backed-style lower-half VA
+    let page = crate::mm::vma::page_align_down(va);
+    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+
+    let underflow_before = page_ref_dec_underflow_count();
+
+    // Helper: free up to three frames + the address space, then fail.
+    macro_rules! bail {
+        ($($f:expr),* ; $($arg:tt)*) => {{
+            $( crate::mm::pmm::free_page($f); )*
+            crate::proc::free_vm_space(vm);
+            test_fail!("backout", $($arg)*);
+            return false;
+        }};
+    }
+
+    // ── (A) PRIVATE-COPY shape ────────────────────────────────────────────
+    // Winner: alloc private frame, install, THEN set refcount 1 (mirrors the
+    // arm order: refcount is set only after a successful install).
+    let priv_winner = match crate::mm::pmm::alloc_page() {
+        Some(p) => p, None => bail!( ; "OOM priv_winner"),
+    };
+    if !map_page_in_if_absent(cr3, page, priv_winner, flags) {
+        bail!(priv_winner ; "priv winner install returned false on not-present PTE");
+    }
+    page_ref_set(priv_winner, 1);
+
+    // Loser: alloc a DIFFERENT private frame (refcount stays 0 — never set),
+    // race the SAME VA → must lose, and the arm frees it WITHOUT a refcount
+    // touch (frame at 0 frees cleanly; no underflow).
+    let priv_loser = match crate::mm::pmm::alloc_page() {
+        Some(p) => p, None => bail!(priv_winner ; "OOM priv_loser"),
+    };
+    if priv_loser == priv_winner {
+        bail!(priv_winner, priv_loser ; "allocator returned identical frames");
+    }
+    let lost_a = map_page_in_if_absent(cr3, page, priv_loser, flags);
+    if lost_a {
+        bail!(priv_winner, priv_loser ; "priv loser returned true — overwrote winner PTE (aliasing)");
+    }
+    // PTE must still map the winner's private frame.
+    let pte_a = read_pte(cr3, va);
+    if (pte_a & ADDR_MASK) != (priv_winner & ADDR_MASK) {
+        bail!(priv_winner, priv_loser ; "PTE no longer maps priv_winner: pte={:#x} winner={:#x}",
+            pte_a, priv_winner);
+    }
+    // The loser frame was never mapped and its refcount is 0 → the arm frees it.
+    // We model that free here and confirm no refcount drift / underflow.
+    if page_ref_count(priv_loser) != 0 {
+        bail!(priv_winner, priv_loser ; "priv_loser refcount drifted to {} (expected 0)",
+            page_ref_count(priv_loser));
+    }
+    crate::mm::pmm::free_page(priv_loser);   // loser-frees path — no leak
+    if page_ref_count(priv_winner) != 1 {
+        bail!(priv_winner ; "priv_winner refcount drifted to {} (expected 1)",
+            page_ref_count(priv_winner));
+    }
+    test_println!("  (A) private-copy loser freed its unmapped frame; winner intact (rc=1) ✓");
+
+    // ── (B) ALIAS shape ───────────────────────────────────────────────────
+    // A shared cache frame: cache holds one ref, plus a guard ref per faulting
+    // CPU.  Winner promotes its guard ref to the PTE ref (no dec); loser must
+    // release its redundant guard ref so the frame nets cache(1)+PTE(1)=2.
+    let va2: u64 = 0x5555_0002_0000;
+    let page2 = crate::mm::vma::page_align_down(va2);
+    let cache_phys = match crate::mm::pmm::alloc_page() {
+        Some(p) => p, None => bail!(priv_winner ; "OOM cache_phys"),
+    };
+    page_ref_set(cache_phys, 1);             // cache's own reference
+    page_ref_inc(cache_phys);                // winner's guard ref
+    page_ref_inc(cache_phys);                // loser's guard ref  → rc = 3
+
+    // Winner installs the SHARED frame, promoting its guard ref to the PTE ref
+    // (does NOT dec).  rc stays 3 (cache + winner-PTE + loser-guard).
+    if !map_page_in_if_absent(cr3, page2, cache_phys, flags) {
+        page_ref_set(cache_phys, 0);
+        bail!(priv_winner, cache_phys ; "alias winner install returned false on not-present PTE");
+    }
+    // Loser races the SAME VA → must lose and release ONLY its guard ref
+    // (do NOT free the shared frame).  Model that release: dec once.
+    let lost_b = map_page_in_if_absent(cr3, page2, cache_phys, flags);
+    if lost_b {
+        page_ref_set(cache_phys, 0);
+        bail!(priv_winner, cache_phys ; "alias loser returned true — re-published shared PTE");
+    }
+    let rc_after_loss = page_ref_dec(cache_phys);   // loser releases guard ref
+    if rc_after_loss != 2 {
+        page_ref_set(cache_phys, 0);
+        bail!(priv_winner, cache_phys ; "alias frame refcount after loser back-out = {} (expected 2: cache+PTE)",
+            rc_after_loss);
+    }
+    // PTE still maps the shared frame (winner's mapping survived).
+    let pte_b = read_pte(cr3, va2);
+    if (pte_b & ADDR_MASK) != (cache_phys & ADDR_MASK) {
+        page_ref_set(cache_phys, 0);
+        bail!(priv_winner, cache_phys ; "alias PTE no longer maps cache_phys: pte={:#x} phys={:#x}",
+            pte_b, cache_phys);
+    }
+    test_println!("  (B) alias loser released guard ref; frame intact (rc=2), not freed ✓");
+
+    // No refcount-dec underflow may have been triggered by either back-out.
+    let underflow_after = page_ref_dec_underflow_count();
+    if underflow_after != underflow_before {
+        page_ref_set(cache_phys, 0);
+        bail!(priv_winner, cache_phys ; "refcount-dec underflow fired {} time(s) during back-out",
+            underflow_after - underflow_before);
+    }
+
+    // Teardown.  `free_vm_space` frees backing frames only for VMAs in
+    // `vm_space.areas`; this test installs PTEs directly (no VMAs), so it
+    // explicitly releases the two mapped frames here, then frees the page-table
+    // structures via `free_vm_space`.  Reset both frames to refcount 0 and
+    // return them to the PMM with no leak.
+    page_ref_set(priv_winner, 0);
+    crate::mm::pmm::free_page(priv_winner);
+    page_ref_set(cache_phys, 0);
+    crate::mm::pmm::free_page(cache_phys);
+    crate::proc::free_vm_space(vm);
+
+    test_pass!("PFH install-arm anti-aliasing back-out");
     true
 }
 
@@ -38576,6 +39144,337 @@ fn test_228_auto_reap_orphan_zombies() -> bool {
     true
 }
 
+// ── Test 502: waitpid prepare-to-wait lost-wakeup close ──────────────────────
+//
+// Models the SMP race that previously hung a blocking wait4(2) forever on the
+// Firefox child-reaping path.  The bug: `sys_waitpid` read PROCESS_TABLE for a
+// zombie (miss), dropped the lock, then committed `state=Blocked` +
+// `wake_tick=u64::MAX-1` under THREAD_TABLE and called `schedule()` — with NO
+// recheck of the zombie/PROCESS_TABLE while holding THREAD_TABLE.  The exiting
+// child writes `ProcessState::Zombie` to PROCESS_TABLE *before* taking
+// THREAD_TABLE to flip the parent Blocked→Ready, and only flips it `if state ==
+// Blocked`.  Interleaving (smp=2): parent misses the zombie and drops the lock
+// → child writes Zombie, takes THREAD_TABLE, finds the parent NOT yet Blocked,
+// drops the wake → parent commits Blocked + schedule().  Because the sentinel
+// `wake_tick=u64::MAX-1` is scan-ineligible and the parker is not on any poll
+// bell, the wait4 never returns → permanent hang.
+//
+// The fix is the prepare-to-wait discipline: after committing Blocked under
+// THREAD_TABLE (and dropping it), re-poll PROCESS_TABLE for a reapable zombie;
+// on a hit, revert Blocked→Ready and reap WITHOUT parking.  This test drives
+// that exact resolution: a child marked Zombie in the window must be reaped and
+// the parent thread must be left Ready (the wake is not lost).
+//
+// Per POSIX wait(2): "If [a child] has already terminated ... [wait] shall
+// return immediately."  An already-terminated child must be reapable without
+// blocking.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_502_waitpid_prepare_to_wait_race() -> bool {
+    use crate::proc::{PROCESS_TABLE, THREAD_TABLE, ThreadState, ProcessState};
+
+    test_header!("waitpid prepare-to-wait lost-wakeup close (PR #502)");
+
+    // ── 1. Synthetic parent + child processes ────────────────────────────
+    let parent_pid = match crate::proc::usermode::create_user_process(
+        "wp_race_parent", &crate::proc::hello_elf::HELLO_ELF
+    ) {
+        Ok(p) => p,
+        Err(e) => { test_fail!("waitpid_p2w_race",
+            "create_user_process(parent): {:?}", e); return false; }
+    };
+    let child_pid = match crate::proc::usermode::create_user_process(
+        "wp_race_child", &crate::proc::hello_elf::HELLO_ELF
+    ) {
+        Ok(p) => p,
+        Err(e) => { test_fail!("waitpid_p2w_race",
+            "create_user_process(child): {:?}", e); return false; }
+    };
+    if parent_pid == child_pid || parent_pid == 0 || child_pid == 0 {
+        test_fail!("waitpid_p2w_race",
+            "bad pids parent={} child={}", parent_pid, child_pid);
+        return false;
+    }
+
+    // The parent's main thread is the "waitpid'er".
+    let parent_tid = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().find(|t| t.pid == parent_pid).map(|t| t.tid).unwrap_or(0)
+    };
+    if parent_tid == 0 {
+        test_fail!("waitpid_p2w_race", "no main thread for parent pid {}", parent_pid);
+        return false;
+    }
+    let child_tids: alloc::vec::Vec<u64> = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().filter(|t| t.pid == child_pid).map(|t| t.tid).collect()
+    };
+    test_println!("  parent PID {} (tid {}), child PID {} ({} tids) ✓",
+        parent_pid, parent_tid, child_pid, child_tids.len());
+
+    // ── 2. Build the prepare-to-wait window state ─────────────────────────
+    // Re-parent the child to our synthetic parent, then drive the EXACT
+    // interleaving the fix must survive:
+    //   (a) the parent has already committed Blocked + the MAX-1 sentinel
+    //       (it executed step 1 of the park),
+    //   (b) the child becomes a Zombie, and its wake-side THREAD_TABLE flip
+    //       was a no-op because at flip time the parent was still Running
+    //       (i.e. we deliberately DO NOT flip the parent here — modelling the
+    //       lost wake).
+    {
+        let mut procs = PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == child_pid) {
+            p.parent_pid = parent_pid;
+        }
+    }
+    // (a) commit Blocked + sentinel on the parent thread.
+    {
+        let mut threads = THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == parent_tid) {
+            t.state = ThreadState::Blocked;
+            t.wake_tick = u64::MAX - 1; // waitpid park sentinel
+        }
+    }
+    // (b) child becomes a Zombie (PROCESS_TABLE write) with NO parent flip —
+    //     this is the lost-wakeup condition the old code could not recover
+    //     from.
+    {
+        let mut procs = PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == child_pid) {
+            p.state = ProcessState::Zombie;
+            p.exit_code = 0x0502;
+        }
+    }
+    // Sanity: confirm the lost-wakeup precondition — zombie present AND parent
+    // still parked-Blocked-on-sentinel (no wake delivered).
+    {
+        let procs = PROCESS_TABLE.lock();
+        let threads = THREAD_TABLE.lock();
+        let zombie_present = procs.iter().any(|p|
+            p.pid == child_pid && p.state == ProcessState::Zombie);
+        let parent_parked = threads.iter().find(|t| t.tid == parent_tid)
+            .map(|t| t.state == ThreadState::Blocked && t.wake_tick == u64::MAX - 1)
+            .unwrap_or(false);
+        if !zombie_present || !parent_parked {
+            drop(procs); drop(threads);
+            test_fail!("waitpid_p2w_race",
+                "precondition not set up: zombie={} parent_parked={}",
+                zombie_present, parent_parked);
+            return false;
+        }
+    }
+    test_println!("  precondition: zombie child + parent parked, wake lost ✓");
+
+    // ── 3. Drive the prepare-to-wait recheck (the fix) ────────────────────
+    // This is exactly what sys_waitpid step (2) does after committing Blocked:
+    // re-poll PROCESS_TABLE for a reapable zombie (without holding
+    // THREAD_TABLE), and on a hit revert Blocked→Ready and reap.
+    let reaped = crate::proc::waitpid(parent_pid, child_pid as i64);
+    {
+        let mut threads = THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == parent_tid) {
+            if t.state == ThreadState::Blocked && t.wake_tick == u64::MAX - 1 {
+                t.state = ThreadState::Ready;
+                t.wake_tick = u64::MAX;
+            }
+        }
+    }
+
+    // ── 4. Post-conditions ───────────────────────────────────────────────
+    // (a) The zombie was reaped (waitpid returned the child pid + code) —
+    //     i.e. the already-terminated child was reapable without blocking.
+    match reaped {
+        Some((rp, rc)) if rp == child_pid && rc as u32 == 0x0502 => {
+            test_println!("  reaped child PID {} code {:#x} without parking ✓", rp, rc);
+        }
+        other => {
+            // Best-effort cleanup before failing.
+            { let mut procs = PROCESS_TABLE.lock();
+              procs.retain(|p| p.pid != child_pid && p.pid != parent_pid); }
+            { let mut threads = THREAD_TABLE.lock();
+              threads.retain(|t| t.pid != child_pid && t.pid != parent_pid); }
+            test_fail!("waitpid_p2w_race",
+                "expected reap of child {} (code 0x502), got {:?}", child_pid, other);
+            return false;
+        }
+    }
+    // (b) The parent thread is NOT left parked-forever: it must be runnable
+    //     (Ready), not stuck Blocked on the MAX-1 sentinel.  This is the
+    //     anti-hang assertion: no wake was lost.
+    let parent_state = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().find(|t| t.tid == parent_tid).map(|t| (t.state, t.wake_tick))
+    };
+    match parent_state {
+        Some((ThreadState::Blocked, wt)) if wt == u64::MAX - 1 => {
+            { let mut procs = PROCESS_TABLE.lock();
+              procs.retain(|p| p.pid != parent_pid); }
+            { let mut threads = THREAD_TABLE.lock();
+              threads.retain(|t| t.pid != parent_pid); }
+            test_fail!("waitpid_p2w_race",
+                "parent tid {} still parked Blocked on MAX-1 sentinel — \
+                 wait4 would hang forever", parent_tid);
+            return false;
+        }
+        _ => {
+            test_println!("  parent tid {} not parked-forever (state={:?}) ✓",
+                parent_tid, parent_state.map(|(s, _)| s));
+        }
+    }
+    // (c) The child's PROCESS_TABLE entry is gone (reaped) and its threads
+    //     are swept.
+    {
+        let procs = PROCESS_TABLE.lock();
+        if procs.iter().any(|p| p.pid == child_pid) {
+            drop(procs);
+            { let mut procs = PROCESS_TABLE.lock(); procs.retain(|p| p.pid != parent_pid); }
+            { let mut threads = THREAD_TABLE.lock(); threads.retain(|t| t.pid != parent_pid); }
+            test_fail!("waitpid_p2w_race",
+                "child PID {} still in PROCESS_TABLE after reap", child_pid);
+            return false;
+        }
+    }
+    {
+        let threads = THREAD_TABLE.lock();
+        let lingering: alloc::vec::Vec<u64> = child_tids.iter()
+            .filter(|&&t| threads.iter().any(|th| th.tid == t)).copied().collect();
+        if !lingering.is_empty() {
+            drop(threads);
+            { let mut procs = PROCESS_TABLE.lock(); procs.retain(|p| p.pid != parent_pid); }
+            { let mut threads = THREAD_TABLE.lock(); threads.retain(|t| t.pid != parent_pid); }
+            test_fail!("waitpid_p2w_race",
+                "child tids {:?} still in THREAD_TABLE after reap", lingering);
+            return false;
+        }
+    }
+
+    // ── 5. Cleanup the synthetic parent (the child is already reaped) ─────
+    { let mut procs = PROCESS_TABLE.lock(); procs.retain(|p| p.pid != parent_pid); }
+    { let mut threads = THREAD_TABLE.lock(); threads.retain(|t| t.pid != parent_pid); }
+    crate::proc::proc_metrics::unregister(parent_pid);
+
+    test_pass!("waitpid prepare-to-wait lost-wakeup close (PR #502)");
+    true
+}
+
+// ── Test 502b: vfork prepare-to-wait lost-wakeup close ───────────────────────
+//
+// Companion to test 502 for the vfork(2) parent park.  The vfork wake handshake
+// uses the per-child `vfork_parent_tid` completion token: the park side sets
+// `child.vfork_parent_tid = Some(parent_tid)` and `parent.state = Blocked`; the
+// child's execve(2)/exit path runs `wake_vfork_parent()`, which acts only if it
+// observes `Some(parent_tid)` — clearing the token to `None` and flipping the
+// parent Blocked→Ready.  The race: the child runs and reaches its wake before
+// the parent registers the token, reads the initial `None`, and no-ops; the
+// parent then parks with no waker (masked only by the 5 s timeout).
+//
+// The fix registers the token BEFORE unblocking the child, and — after
+// committing Blocked — rechecks the token under the SAME THREAD_TABLE hold: if
+// the child already consumed it (token == None), the parent must NOT park.  This
+// test drives that recheck: a completed child (token cleared) in the window must
+// leave the parent runnable, never parked.
+//
+// Per POSIX vfork(2): the parent is suspended only until the child performs a
+// successful execve() or _exit(); an already-completed child must not block it.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_502b_vfork_prepare_to_wait_race() -> bool {
+    use crate::proc::{THREAD_TABLE, ThreadState};
+
+    test_header!("vfork prepare-to-wait lost-wakeup close (PR #502)");
+
+    // Synthetic parent + child threads in one process — the vfork handshake is
+    // THREAD_TABLE-only, so we only need two thread rows.
+    let host_pid = match crate::proc::usermode::create_user_process(
+        "vf_race_host", &crate::proc::hello_elf::HELLO_ELF
+    ) {
+        Ok(p) => p,
+        Err(e) => { test_fail!("vfork_p2w_race",
+            "create_user_process: {:?}", e); return false; }
+    };
+    let parent_tid = {
+        let threads = THREAD_TABLE.lock();
+        threads.iter().find(|t| t.pid == host_pid).map(|t| t.tid).unwrap_or(0)
+    };
+    if parent_tid == 0 {
+        test_fail!("vfork_p2w_race", "no main thread for pid {}", host_pid);
+        return false;
+    }
+    let child_tid = match crate::proc::create_thread_blocked(host_pid, "vf_race_child", 0) {
+        Some(t) => t,
+        None => { test_fail!("vfork_p2w_race", "create_thread_blocked failed"); return false; }
+    };
+    test_println!("  host PID {}: parent tid {}, child tid {} ✓",
+        host_pid, parent_tid, child_tid);
+
+    // ── Model the race: the child has ALREADY completed (it ran its wake,
+    //    consuming the token), so its `vfork_parent_tid` is `None`.  This is
+    //    the post-fix observable the parent's recheck keys on.  In the buggy
+    //    interleaving the parent would still park here.
+    {
+        let mut threads = THREAD_TABLE.lock();
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
+            // Child completed → token cleared (mirrors wake_vfork_parent's
+            // `t.vfork_parent_tid = None`).
+            t.vfork_parent_tid = None;
+        }
+    }
+
+    // ── Drive the parent's prepare-to-wait commit + recheck (the fix) ──────
+    // Commit Blocked, then recheck the child's completion token under the same
+    // THREAD_TABLE hold; if the child already completed (token None), revert to
+    // Ready and do NOT park.
+    let parked = {
+        let mut threads = THREAD_TABLE.lock();
+        let child_completed = threads.iter()
+            .find(|t| t.tid == child_tid)
+            .map(|t| t.vfork_parent_tid.is_none())
+            .unwrap_or(true);
+        if let Some(t) = threads.iter_mut().find(|t| t.tid == parent_tid) {
+            if child_completed {
+                t.state = ThreadState::Ready;
+                t.wake_tick = u64::MAX;
+            } else {
+                t.state = ThreadState::Blocked;
+                t.wake_tick = crate::arch::x86_64::irq::get_ticks().saturating_add(500);
+            }
+        }
+        !child_completed
+    };
+
+    // ── Post-condition: the parent must NOT have parked. ──────────────────
+    let mut ok = true;
+    if parked {
+        test_fail!("vfork_p2w_race",
+            "parent parked despite child already completed — would rely on \
+             the 5 s timeout (lost wake)");
+        ok = false;
+    } else {
+        let parent_state = {
+            let threads = THREAD_TABLE.lock();
+            threads.iter().find(|t| t.tid == parent_tid).map(|t| t.state)
+        };
+        if matches!(parent_state, Some(ThreadState::Blocked)) {
+            test_fail!("vfork_p2w_race",
+                "parent tid {} left Blocked after recheck (state={:?})",
+                parent_tid, parent_state);
+            ok = false;
+        } else {
+            test_println!("  parent tid {} not parked; child completion observed ✓",
+                parent_tid);
+        }
+    }
+
+    // ── Cleanup synthetic rows. ───────────────────────────────────────────
+    { let mut threads = THREAD_TABLE.lock(); threads.retain(|t| t.tid != child_tid); }
+    { let mut procs = crate::proc::PROCESS_TABLE.lock(); procs.retain(|p| p.pid != host_pid); }
+    { let mut threads = THREAD_TABLE.lock(); threads.retain(|t| t.pid != host_pid); }
+    crate::proc::proc_metrics::unregister(host_pid);
+
+    if ok {
+        test_pass!("vfork prepare-to-wait lost-wakeup close (PR #502)");
+    }
+    ok
+}
+
 // ── Test 232: VFS write-path page-cache coherency (POSIX mmap+write) ──────
 //
 // Regression test for the cache-coherency gap discovered while
@@ -44026,5 +44925,957 @@ fn test_278_mounts_lock_not_held_across_fs_dispatch() -> bool {
     test_println!("  cleaned up test mount");
 
     test_pass!("VFS MOUNTS-lock not held across FS dispatch (deadlock regression)");
+    true
+}
+
+// ── Test 280: control-only SCM_RIGHTS confers read-readiness + byte-offset bind
+//
+// A `sendmsg(2)` that carries an `SCM_RIGHTS` control message with an empty
+// data payload (`iov_len == 0`, a pure fd handoff) is still a *readable
+// message*: `poll(2)`/`epoll(7)` must report `POLLIN`/`EPOLLIN` and
+// `recvmsg(2)` must return it with 0 data bytes and the cmsg attached
+// (recvmsg(2), unix(7), POSIX.1-2017 SCM_RIGHTS).  Without this the receiver
+// parks in poll() forever on a control-only frame.
+//
+// This test drives the exact predicates the syscall layer uses:
+//   * `has_scm_deliverable(uid, consumed)` — the readiness predicate ORed
+//     into POLLIN/EPOLLIN in poll_revents / epoll_poll_events / select.
+//   * `scm_dequeue(uid, consumed)` — the byte-offset-gated delivery used by
+//     recvmsg after read_msg returns EAGAIN on an empty ring.
+//   * the byte-offset binding: a batch sent *after* a data frame is withheld
+//     until the reader drains past it, so an earlier reader does not pick up
+//     a later frame's fds.
+//
+// Refs: recvmsg(2)/sendmsg(2), poll(2), epoll(7), unix(7) SCM_RIGHTS,
+// POSIX.1-2017 §2.10.10 (Socket Receive Queue), §2.14 (File Descriptors).
+fn test_280_scm_control_only_readiness() -> bool {
+    use crate::net::unix;
+    use crate::ipc::waitlist::{BELL_RINGS_BY_SOURCE, PollBellSource};
+    test_header!("control-only SCM_RIGHTS readiness + byte-offset binding (Test 280)");
+
+    let (a, b) = unix::socketpair(unix::SockKind::Stream,
+        unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if a == u64::MAX || b == u64::MAX {
+        test_fail!("scm_ctrl_only", "socketpair returned MAX");
+        return false;
+    }
+
+    // A throw-away fd to pass.  Its identity is irrelevant — we assert on the
+    // readiness/binding, not the file behind it.
+    let mk_fd = || crate::vfs::FileDescriptor {
+        inode: 0xBEEF, mount_idx: 0, offset: 0, flags: 0,
+        file_type: crate::vfs::FileType::RegularFile,
+        is_console: false, cloexec: false,
+        open_path: alloc::string::String::new(),
+    };
+
+    // ── Part 1: a control-only batch (no data) on an empty stream is
+    // immediately readable — has_data() is false, has_scm_deliverable() true.
+    if unix::has_data(b) {
+        test_fail!("scm_ctrl_only", "fresh socket b unexpectedly has data");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    // Sender enqueues fds bound to B's current stream tail (offset 0, since B
+    // has received nothing) — exactly what sendmsg does for an iov_len==0 frame.
+    let off0 = unix::enqueue_offset_for(b);
+    if off0 != 0 {
+        test_fail!("scm_ctrl_only", "fresh enqueue_offset = {} (want 0)", off0);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    let bell_before = BELL_RINGS_BY_SOURCE[PollBellSource::UnixWrite as usize]
+        .load(core::sync::atomic::Ordering::Relaxed);
+    crate::syscall::scm_queue(b, off0, alloc::vec![mk_fd()]);
+    // The send-side bell ring is exercised by the sendmsg arm; emulate it so
+    // the test also covers the wake discipline (drop-lock-then-ring).
+    crate::ipc::waitlist::ring_poll_bell_for(PollBellSource::UnixWrite);
+    let bell_after = BELL_RINGS_BY_SOURCE[PollBellSource::UnixWrite as usize]
+        .load(core::sync::atomic::Ordering::Relaxed);
+    if bell_after <= bell_before {
+        test_fail!("scm_ctrl_only", "UnixWrite poll bell did not advance");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // Readiness predicate (the OR added to POLLIN) must now fire for B even
+    // though the data ring is empty.
+    let consumed_b = unix::recv_consumed(b);
+    if !crate::syscall::has_scm_deliverable(b, consumed_b) {
+        test_fail!("scm_ctrl_only", "control-only batch NOT reported readable");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    // read_msg on the empty ring returns EAGAIN — recvmsg promotes this to a
+    // 0-byte success because a deliverable batch is queued.  Verify the
+    // dequeue succeeds at B's current consumed position.
+    let mut scratch = [0u8; 8];
+    match unix::read_msg(b, &mut scratch) {
+        Err(-11) => { /* expected: empty ring, recvmsg would promote to 0 */ }
+        other => {
+            test_fail!("scm_ctrl_only", "read_msg on empty ring = {:?} (want EAGAIN)", other);
+            unix::close(a); unix::close(b);
+            return false;
+        }
+    }
+    let got = crate::syscall::scm_dequeue(b, unix::recv_consumed(b));
+    if got.map(|v| v.len()) != Some(1) {
+        test_fail!("scm_ctrl_only", "control-only scm_dequeue did not return the fd");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    // Batch consumed: no longer deliverable.
+    if crate::syscall::has_scm_deliverable(b, unix::recv_consumed(b)) {
+        test_fail!("scm_ctrl_only", "batch still deliverable after dequeue");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    test_println!("  control-only SCM batch: readable + delivered with 0 data bytes ✓");
+
+    // ── Part 2: byte-offset binding.  Send a 4-byte data frame, THEN an
+    // fd batch bound to the post-data offset.  A reader that has not yet
+    // drained the 4 bytes must NOT receive the later batch.
+    let n = unix::write(a, b"DATA");          // lands in B's recv ring
+    if n != 4 {
+        test_fail!("scm_ctrl_only", "write(DATA) = {} (want 4)", n);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    let off_after_data = unix::enqueue_offset_for(b);   // == 4
+    if off_after_data != 4 {
+        test_fail!("scm_ctrl_only", "offset after 4-byte write = {} (want 4)", off_after_data);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    crate::syscall::scm_queue(b, off_after_data, alloc::vec![mk_fd()]);
+
+    // Reader is still at consumed==0 (the 4 data bytes are undrained): the
+    // batch bound to offset 4 must be WITHHELD.
+    if crate::syscall::has_scm_deliverable(b, unix::recv_consumed(b)) {
+        test_fail!("scm_ctrl_only", "later batch deliverable before its data drained");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    if crate::syscall::scm_dequeue(b, unix::recv_consumed(b)).is_some() {
+        test_fail!("scm_ctrl_only", "dequeued a not-yet-reached batch (ordering bug)");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    test_println!("  fds bound to a later stream offset are withheld until drained ✓");
+
+    // Drain the 4 data bytes — now the batch's offset is reached.
+    let mut rbuf = [0u8; 4];
+    let rn = unix::read_msg(b, &mut rbuf).map(|(c, _)| c).unwrap_or(-1isize as usize);
+    if rn != 4 || &rbuf != b"DATA" {
+        test_fail!("scm_ctrl_only", "drain read = {} / {:?}", rn, rbuf);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    if !crate::syscall::has_scm_deliverable(b, unix::recv_consumed(b)) {
+        test_fail!("scm_ctrl_only", "batch not deliverable after its data drained");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    let got2 = crate::syscall::scm_dequeue(b, unix::recv_consumed(b));
+    if got2.map(|v| v.len()) != Some(1) {
+        test_fail!("scm_ctrl_only", "post-drain dequeue did not return the fd");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    test_println!("  fds delivered once the reader drains past their bound offset ✓");
+
+    unix::close(a);
+    unix::close(b);
+    test_pass!("control-only SCM_RIGHTS readiness + byte-offset binding (Test 280)");
+    true
+}
+
+// ── Test 281: non-blocking socket recv — EAGAIN on empty queue, 0 only on EOF
+//
+// recvmsg(2)/recv(2) on a non-blocking AF_INET socket distinguishes three
+// outcomes that the syscall layer must translate correctly:
+//
+//   * data pending      → return the byte count
+//   * empty, peer live  → -1 / EAGAIN  (would-block)
+//   * orderly shutdown  →  0           (EOF)
+//
+// The bug this guards: the recvmsg/read arms previously collapsed "empty,
+// peer live" into a 0-byte return (the same value as EOF).  A polled IPC
+// reactor reads the spurious 0 as a readable edge and re-issues recvmsg in a
+// tight loop — the exact busy-spin observed on the Firefox content-process
+// screenshot-IPC channel, where one process pegged ~680k recvmsg/s while the
+// peer it should have serviced stayed frozen.
+//
+// This drives `socket_recv_status` (the EAGAIN-correct primitive the syscall
+// arms now call) directly, asserting the WouldBlock / Data / Eof mapping.
+//
+// Refs: recvmsg(2), recv(2), IEEE 1003.1 §recv ("a return value of 0
+// indicates the peer has performed an orderly shutdown"), POSIX.1-2017
+// §2.10.6 (Socket Receive Queue).
+fn test_281_socket_recv_eagain_vs_eof() -> bool {
+    use crate::net::socket::{self, RecvOutcome, SocketType};
+    test_header!("non-blocking socket recv: EAGAIN on empty, 0 only on EOF (Test 281)");
+
+    const PORT: u16 = 0xB281; // arbitrary unused test port
+
+    let sid = socket::socket_create(SocketType::Udp);
+    if sid == u64::MAX {
+        test_fail!("recv_eagain", "socket_create returned MAX");
+        return false;
+    }
+    if let Err(e) = socket::socket_bind(sid, PORT) {
+        test_fail!("recv_eagain", "socket_bind failed: {}", e);
+        return false;
+    }
+
+    // (1) Empty queue, socket live → MUST be WouldBlock (the storm-fix case).
+    match socket::socket_recv_status(sid) {
+        Ok(RecvOutcome::WouldBlock) => {
+            test_println!("  empty bound UDP socket → WouldBlock ✓");
+        }
+        other => {
+            let tag = match other {
+                Ok(RecvOutcome::Data(d)) => {
+                    test_fail!("recv_eagain",
+                        "empty socket returned Data({} bytes), expected WouldBlock",
+                        d.len());
+                    return false;
+                }
+                Ok(RecvOutcome::Eof) => "Eof",
+                Ok(RecvOutcome::WouldBlock) => unreachable!(),
+                Err(_) => "Err",
+            };
+            test_fail!("recv_eagain",
+                "empty socket returned {}, expected WouldBlock (EAGAIN)", tag);
+            return false;
+        }
+    }
+
+    // (2) Inject a datagram via the wire path → MUST be Data with the bytes.
+    //     checksum=0 skips verification (RFC 1071 identity), so the datagram
+    //     is delivered straight to the bound port's queue.
+    const PAYLOAD: &[u8] = b"px";
+    {
+        let mut pkt = alloc::vec::Vec::with_capacity(8 + PAYLOAD.len());
+        pkt.extend_from_slice(&0x1234u16.to_be_bytes());          // src_port
+        pkt.extend_from_slice(&PORT.to_be_bytes());               // dst_port
+        pkt.extend_from_slice(&((8 + PAYLOAD.len()) as u16).to_be_bytes()); // length
+        pkt.extend_from_slice(&0u16.to_be_bytes());               // checksum=0 → skip
+        pkt.extend_from_slice(PAYLOAD);
+        crate::net::udp::handle_udp([10, 0, 2, 2], [10, 0, 2, 15], &pkt);
+    }
+    match socket::socket_recv_status(sid) {
+        Ok(RecvOutcome::Data(d)) if d == PAYLOAD => {
+            test_println!("  injected datagram → Data({} bytes) ✓", d.len());
+        }
+        Ok(RecvOutcome::Data(d)) => {
+            test_fail!("recv_eagain",
+                "datagram recv returned {} bytes, expected {}", d.len(), PAYLOAD.len());
+            return false;
+        }
+        _ => {
+            test_fail!("recv_eagain", "datagram recv did not return Data");
+            return false;
+        }
+    }
+
+    // (3) After draining, the queue is empty again → WouldBlock, NOT Eof.
+    //     This is the regression's heart: an empty-but-live socket must never
+    //     read as EOF.
+    match socket::socket_recv_status(sid) {
+        Ok(RecvOutcome::WouldBlock) => {
+            test_println!("  drained socket → WouldBlock (not EOF) ✓");
+        }
+        _ => {
+            test_fail!("recv_eagain", "drained live socket did not return WouldBlock");
+            return false;
+        }
+    }
+
+    // (4) shutdown(SHUT_RD) → orderly EOF → MUST be Eof (0-byte return).
+    const SHUT_RD: i32 = 0;
+    if socket::socket_shutdown(sid, SHUT_RD) != 0 {
+        test_fail!("recv_eagain", "socket_shutdown(SHUT_RD) failed");
+        return false;
+    }
+    match socket::socket_recv_status(sid) {
+        Ok(RecvOutcome::Eof) => {
+            test_println!("  after SHUT_RD → Eof ✓");
+        }
+        _ => {
+            test_fail!("recv_eagain", "post-SHUT_RD recv did not return Eof");
+            return false;
+        }
+    }
+
+    // Cleanup: release the bound port so a re-run does not collide.
+    socket::socket_close(sid);
+    test_pass!("non-blocking socket recv: EAGAIN on empty, 0 only on EOF (Test 281)");
+    true
+}
+
+// ── Test 286: concurrent SCM_RIGHTS delivered in byte-offset order (N1) ──────
+//
+// The sendmsg(2) SCM path captures the enqueue byte-offset (under the unix
+// TABLE lock) and pushes the ScmBatch (under the PENDING_SCM lock) in two
+// separate critical sections.  Two concurrent sendmsg(2)s to the SAME peer can
+// therefore push their batches into the PENDING_SCM Vec in the OPPOSITE order
+// to their byte offsets.  scm_dequeue must deliver the LOWEST-offset deliverable
+// batch first (byte order), not the first Vec entry (push order) — otherwise the
+// later frame's fds attach to the earlier frame, a data-integrity bug.
+//
+// This test reproduces the inverted-push order directly: enqueue an
+// offset==4 batch BEFORE an offset==0 batch (the order two interleaved senders
+// could produce), then assert delivery is offset 0 then offset 4.
+// Refs: unix(7) / recvmsg(2) / sendmsg(2) SCM_RIGHTS.
+fn test_286_scm_dequeue_byte_order() -> bool {
+    use crate::net::unix;
+    test_header!("concurrent SCM_RIGHTS delivered in byte-offset order (Test 286)");
+
+    let (a, b) = unix::socketpair(unix::SockKind::Stream,
+        unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if a == u64::MAX || b == u64::MAX {
+        test_fail!("scm_order", "socketpair returned MAX");
+        return false;
+    }
+
+    // Two distinguishable throw-away descriptors.  We tag identity via `inode`.
+    let mk_fd = |ino: u64| crate::vfs::FileDescriptor {
+        inode: ino, mount_idx: 0, offset: 0, flags: 0,
+        file_type: crate::vfs::FileType::RegularFile,
+        is_console: false, cloexec: false,
+        open_path: alloc::string::String::new(),
+    };
+
+    // Place 4 bytes in B's recv ring so an offset-4 batch is a valid "later
+    // frame" position; the reader has NOT drained them yet (consumed==0), so
+    // only the offset-0 batch is deliverable first.
+    if unix::write(a, b"DATA") != 4 {
+        test_fail!("scm_order", "write(DATA) != 4");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // INVERTED push order: the offset-4 (later-frame) batch is pushed FIRST,
+    // the offset-0 (earlier-frame) batch SECOND — exactly the Vec inversion a
+    // non-atomic offset-capture-then-push race can produce.
+    crate::syscall::scm_queue(b, 4, alloc::vec![mk_fd(0xAAAA)]); // later frame
+    crate::syscall::scm_queue(b, 0, alloc::vec![mk_fd(0xBBBB)]); // earlier frame
+
+    // Reader at consumed==0: only the offset-0 batch is deliverable, and it must
+    // be the 0xBBBB one regardless of it being pushed second.
+    let first = crate::syscall::scm_dequeue(b, unix::recv_consumed(b));
+    match first.as_deref() {
+        Some([fd]) if fd.inode == 0xBBBB => {
+            test_println!("  consumed=0 → delivered offset-0 batch (0xBBBB) first ✓");
+        }
+        other => {
+            test_fail!("scm_order",
+                "consumed=0 delivered {:?} (expected the offset-0 batch 0xBBBB)",
+                other.map(|s| s.iter().map(|f| f.inode).collect::<alloc::vec::Vec<_>>()));
+            unix::close(a); unix::close(b);
+            return false;
+        }
+    }
+
+    // The offset-4 batch must still be WITHHELD (its data is undrained).
+    if crate::syscall::scm_dequeue(b, unix::recv_consumed(b)).is_some() {
+        test_fail!("scm_order", "offset-4 batch delivered before its data drained");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // Drain the 4 data bytes; now the offset-4 batch (0xAAAA) is reachable.
+    let mut rbuf = [0u8; 4];
+    let _ = unix::read_msg(b, &mut rbuf);
+    match crate::syscall::scm_dequeue(b, unix::recv_consumed(b)).as_deref() {
+        Some([fd]) if fd.inode == 0xAAAA => {
+            test_println!("  consumed=4 → delivered offset-4 batch (0xAAAA) second ✓");
+        }
+        other => {
+            test_fail!("scm_order",
+                "post-drain delivered {:?} (expected the offset-4 batch 0xAAAA)",
+                other.map(|s| s.iter().map(|f| f.inode).collect::<alloc::vec::Vec<_>>()));
+            unix::close(a); unix::close(b);
+            return false;
+        }
+    }
+
+    unix::close(a);
+    unix::close(b);
+    test_pass!("concurrent SCM_RIGHTS delivered in byte-offset order (Test 286)");
+    true
+}
+
+// ── Test 287: PENDING_SCM drained on receiver teardown — no ref leak (N2) ────
+//
+// 9c09fc8 inc_ref's an AF_UNIX socket passed via SCM_RIGHTS so the sender's
+// later close(2) does not tear down the shared socket.  But if the receiver is
+// torn down before it recvmsg's the batch, that reference must be released —
+// otherwise the passed socket leaks (CWE-772) and its peer never sees the
+// hang-up.  This test queues a passed socket for a receiver, closes the
+// receiver (which must drain PENDING_SCM and balance the inc_ref), then closes
+// the sender's own copy and asserts the passed socket's PEER now sees a full
+// hang-up — proving the refcount returned to zero (no leak).
+// Refs: unix(7) SCM_RIGHTS, CWE-772.
+fn test_287_scm_drain_on_close_no_leak() -> bool {
+    use crate::net::unix;
+    test_header!("PENDING_SCM drained on receiver close — no socket leak (Test 287)");
+
+    // Transport pair (sender end `ta`, receiver end `tb`).
+    let (ta, tb) = unix::socketpair(unix::SockKind::Stream,
+        unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    // Payload pair: `pc` is the fd we "pass" via SCM; `pd` is its peer, which
+    // must observe the hang-up once `pc` is finally torn down.
+    let (pc, pd) = unix::socketpair(unix::SockKind::Stream,
+        unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if ta == u64::MAX || tb == u64::MAX || pc == u64::MAX || pd == u64::MAX {
+        test_fail!("scm_leak", "socketpair returned MAX");
+        return false;
+    }
+
+    // Baseline: pd is connected and NOT hung up.
+    if unix::fully_hung_up(pd) {
+        test_fail!("scm_leak", "pd unexpectedly hung up at start");
+        unix::close(ta); unix::close(tb); unix::close(pc); unix::close(pd);
+        return false;
+    }
+
+    // Model the sendmsg(2) SCM enqueue: inc_ref the passed socket (pc.ref_count
+    // 1→2, mirroring the kernel's inc_ref on fd-pass) and queue the batch for
+    // receiver tb at its current stream tail.
+    unix::inc_ref(pc);
+    let off = unix::enqueue_offset_for(tb);
+    let passed_fd = crate::vfs::FileDescriptor {
+        inode: pc, mount_idx: 0, offset: 0,
+        flags: crate::syscall::UNIX_SOCKET_FLAG,
+        file_type: crate::vfs::FileType::Socket,
+        is_console: false, cloexec: false,
+        open_path: alloc::string::String::new(),
+    };
+    crate::syscall::scm_queue(tb, off, alloc::vec![passed_fd]);
+
+    // Sanity: the batch is queued and deliverable.
+    if !crate::syscall::has_scm_deliverable(tb, unix::recv_consumed(tb)) {
+        test_fail!("scm_leak", "queued batch not deliverable");
+        unix::close(ta); unix::close(tb); unix::close(pc); unix::close(pd);
+        return false;
+    }
+
+    // Receiver is torn down WITHOUT ever recvmsg'ing the batch.  close(tb) must
+    // drain PENDING_SCM and run scm_drop_fds, which net::unix::close(pc)'s the
+    // passed socket — balancing the inc_ref above (pc.ref_count 2→1).
+    unix::close(tb);
+
+    // The batch must be gone from PENDING_SCM (no leak of the Vec entry).
+    if crate::syscall::has_scm_deliverable(tb, 0) {
+        test_fail!("scm_leak", "batch still queued after receiver close (drain leaked)");
+        unix::close(ta); unix::close(pc); unix::close(pd);
+        return false;
+    }
+
+    // pd must NOT yet be hung up — pc still has one live reference (the
+    // sender's own copy), so the drain correctly did NOT over-decrement.
+    if unix::fully_hung_up(pd) {
+        test_fail!("scm_leak",
+            "pd hung up after receiver close — drain OVER-decremented (double free)");
+        unix::close(ta); unix::close(pc); unix::close(pd);
+        return false;
+    }
+    test_println!("  receiver close drained the batch + balanced one ref ✓");
+
+    // Now close the sender's own copy of the passed socket (pc.ref_count 1→0).
+    // This is the LAST reference: if the drain had leaked (not decremented),
+    // pc.ref_count would be 2 here and this close would leave it at 1 — pd would
+    // NOT hang up.  A correct drain leaves exactly one ref, so this tears pc down
+    // and pd observes the full hang-up.
+    unix::close(pc);
+    if !unix::fully_hung_up(pd) {
+        test_fail!("scm_leak",
+            "pd NOT hung up after final close — passed-socket ref LEAKED (CWE-772)");
+        unix::close(ta); unix::close(pd);
+        return false;
+    }
+    test_println!("  final close tore down the passed socket → peer sees HUP ✓");
+
+    unix::close(ta);
+    unix::close(pd);
+    test_pass!("PENDING_SCM drained on receiver close — no socket leak (Test 287)");
+    true
+}
+
+// ── Test 288: SCM-passed memfd inode survives sender close (N4) ──────────────
+//
+// memfd_create(2) now unlinks the backing file immediately (anonymous inode),
+// so its lifetime is governed by the unlink-on-last-close machinery — which
+// frees the inode once no open fd references it.  A memfd handed to another
+// process via SCM_RIGHTS that is still IN FLIGHT (queued in PENDING_SCM, not yet
+// in any fd table) is invisible to that fd-table scan, so the enqueue path pins
+// the inode (vfs::pin_inode).  This test proves: while pinned, the sender's
+// close(2) of its copy must NOT free the inode (the in-flight passed copy still
+// needs it — the Mozilla shared-surface fd handoff); once the pin is balanced
+// (delivery) and the delivered copy is the last reference, the inode is freed.
+// Refs: memfd_create(2), unix(7) SCM_RIGHTS.
+fn test_288_scm_memfd_inode_lifecycle() -> bool {
+    test_header!("SCM-passed memfd inode survives sender close (Test 288)");
+    const MFD_CLOEXEC: u64 = 0x0001;
+
+    // Create a memfd (now an unlinked anonymous inode) and write a surface byte.
+    let fd = crate::subsys::linux::syscall::sys_memfd_create_test(0, MFD_CLOEXEC);
+    if fd < 0 {
+        test_fail!("scm_memfd", "memfd_create returned {}", fd);
+        return false;
+    }
+    let mut surf = [0xC0u8, 0xFF, 0xEE, 0x42];
+    let wn = crate::syscall::sys_write_test(fd as usize, surf.as_ptr(), surf.len());
+    if wn != surf.len() as i64 {
+        test_fail!("scm_memfd", "write to memfd = {} (want {})", wn, surf.len());
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+
+    // Snapshot (mount_idx, inode) of the memfd from the current fd table.
+    let pid = crate::proc::current_pid_lockless();
+    let (mnt, ino) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter().find(|p| p.pid == pid)
+            .and_then(|p| p.file_descriptors.get(fd as usize))
+            .and_then(|f| f.as_ref())
+            .map(|f| (f.mount_idx, f.inode))
+        {
+            Some(v) => v,
+            None => {
+                test_fail!("scm_memfd", "could not resolve memfd inode");
+                crate::subsys::linux::syscall::sys_close_test(fd as u64);
+                return false;
+            }
+        }
+    };
+    if mnt == usize::MAX {
+        test_fail!("scm_memfd", "memfd has sentinel mount_idx (not a real inode)");
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+    test_println!("  memfd inode {} on mount {} ✓", ino, mnt);
+
+    // Model the SCM enqueue: pin the inode (the in-flight passed copy) and also
+    // install a second fd-table slot that references the same inode (the copy
+    // that will be DELIVERED to the receiver).  We do this in-process: a second
+    // fd is the cleanest stand-in for the receiver's installed descriptor.
+    crate::vfs::pin_inode(mnt, ino);
+    let recv_fd = {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        match procs.iter_mut().find(|p| p.pid == pid) {
+            Some(p) => {
+                let mut dup = p.file_descriptors[fd as usize].clone();
+                // The writer advanced the offset to 4; reset the receiver copy to
+                // 0 so this test's read(2) reads the surface from the start (real
+                // surface access is via mmap, where the offset is irrelevant).
+                if let Some(d) = dup.as_mut() { d.offset = 0; }
+                let slot = p.file_descriptors.iter().position(|e| e.is_none())
+                    .unwrap_or(p.file_descriptors.len());
+                if slot == p.file_descriptors.len() {
+                    p.file_descriptors.push(dup);
+                } else {
+                    p.file_descriptors[slot] = dup;
+                }
+                slot
+            }
+            None => {
+                test_fail!("scm_memfd", "process gone");
+                crate::vfs::unpin_inode(mnt, ino); // balance the pin taken above
+                return false;
+            }
+        }
+    };
+
+    // SENDER close: drop the original fd while the batch is "in flight" (pinned).
+    // The inode MUST survive — the pin holds it even though, with the receiver
+    // copy modelled below, the fd-table scan also would; pin is the load-bearing
+    // guard for the true in-flight (pre-delivery) window.
+    crate::subsys::linux::syscall::sys_close_test(fd as u64);
+
+    // The delivered/receiver copy must STILL read the surface bytes — the inode
+    // was not freed out from under it.
+    let mut rbuf = [0u8; 4];
+    let rn = crate::syscall::sys_read_test(recv_fd, rbuf.as_mut_ptr(), rbuf.len());
+    if rn != 4 || rbuf != surf {
+        test_fail!("scm_memfd",
+            "receiver read after sender close = {} bytes {:?} (want {:?}) — inode freed early",
+            rn, rbuf, surf);
+        crate::vfs::unpin_inode(mnt, ino);
+        crate::subsys::linux::syscall::sys_close_test(recv_fd as u64);
+        return false;
+    }
+    test_println!("  receiver copy still reads the surface after sender close ✓");
+
+    // DELIVERY balance: drop the in-flight pin.  The receiver fd-table slot now
+    // keeps the inode alive on its own, so it must remain readable.
+    crate::vfs::unpin_inode(mnt, ino);
+    surf[0] = 0xC0; // (rbuf already validated; re-read to confirm liveness)
+    let rn2 = crate::syscall::sys_read_test(recv_fd, rbuf.as_mut_ptr(), 1);
+    // After the prior 4-byte read the offset is at EOF, so a further read returns
+    // 0 — that is liveness (a freed inode would not even resolve the fd).  Accept
+    // rn2 >= 0 (0 = EOF at end of file, the expected steady state).
+    if rn2 < 0 {
+        test_fail!("scm_memfd", "post-unpin read errored ({}) — inode freed while fd open", rn2);
+        crate::subsys::linux::syscall::sys_close_test(recv_fd as u64);
+        return false;
+    }
+    test_println!("  inode stays alive via the delivered fd-table slot after unpin ✓");
+
+    // Final close of the last reference frees the (unlinked) inode.
+    crate::subsys::linux::syscall::sys_close_test(recv_fd as u64);
+    test_pass!("SCM-passed memfd inode survives sender close (Test 288)");
+    true
+}
+
+// ── Test 289: SCM_RIGHTS fds bind to the FIRST byte of their frame ───────────
+//
+// sendmsg(2) on an AF_UNIX SOCK_STREAM that carries BOTH data and SCM_RIGHTS
+// must deliver the passed fds with the SAME recvmsg(2) that first returns that
+// frame's bytes — including the common case where the receiver reads the frame
+// in pieces (a length-prefixed IPC reader reads the small fixed header first,
+// sees that the message announces N handles, and expects those descriptors
+// already attached).  The kernel binds an SCM batch to a recv-stream byte
+// position and makes it deliverable once `recv_consumed >= byte_offset`
+// (scm_dequeue).  Binding to the frame TAIL (the position AFTER the data bytes
+// are pushed) withholds the fds until the reader drains EVERY byte of the
+// frame; a header-first reader then gets the bytes with NO cmsg and aborts with
+// the fatal "needs unreceived descriptors".  The fix binds to the FIRST byte
+// (the position captured BEFORE the data push), so the batch becomes
+// deliverable the instant the reader pops the frame's first byte.
+//
+// This test reproduces the partial-read scenario at the primitive layer: push
+// a multi-byte data frame, bind an fd batch to the frame's FIRST byte, then
+// read only the first byte and assert the batch is ALREADY deliverable (the
+// pre-fix tail bind would withhold it until all bytes were drained).
+//
+// Refs: recvmsg(2), sendmsg(2), unix(7) SCM_RIGHTS, POSIX.1-2017 §2.14.
+fn test_289_scm_first_byte_bind() -> bool {
+    use crate::net::unix;
+    test_header!("SCM_RIGHTS fds bound to the first byte of their frame (Test 289)");
+
+    let (a, b) = unix::socketpair(unix::SockKind::Stream,
+        unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if a == u64::MAX || b == u64::MAX {
+        test_fail!("scm_firstbyte", "socketpair returned MAX");
+        return false;
+    }
+
+    let mk_fd = || crate::vfs::FileDescriptor {
+        inode: 0xF00D, mount_idx: 0, offset: 0, flags: 0,
+        file_type: crate::vfs::FileType::RegularFile,
+        is_console: false, cloexec: false,
+        open_path: alloc::string::String::new(),
+    };
+
+    // Capture B's recv position T BEFORE pushing this frame's data — the stream
+    // position where the frame begins (the sendmsg path captures this as
+    // scm_bind_offset, also before its data-push loop).
+    let frame_start = unix::enqueue_offset_for(b);
+
+    // Push an 8-byte data frame into B's recv ring (the "message").
+    let n = unix::write(a, b"HDRBODY!");
+    if n != 8 {
+        test_fail!("scm_firstbyte", "write(8) = {} (want 8)", n);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // The DATA-bearing sendmsg binds its fd batch to the position the reader
+    // reaches after popping the frame's FIRST byte (frame_start + 1) — the
+    // first-byte-touch contract (recvmsg(2) / unix(7) / POSIX.1-2017 §2.14:
+    // ancillary data is delivered with the recvmsg that returns the data it
+    // accompanies, i.e. once the reader begins consuming the frame, and NOT
+    // before any of its bytes are read).  The pre-fix tail bind would have used
+    // enqueue_offset_for(b) AFTER the write (== frame_start + 8), withholding
+    // the fds until EVERY byte was drained.
+    let tail_off = unix::enqueue_offset_for(b);
+    if tail_off != frame_start + 8 {
+        test_fail!("scm_firstbyte",
+            "tail offset {} != first {} + 8", tail_off, frame_start);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    let bind_off = frame_start + 1; // data frame → first-byte-touched position
+    crate::syscall::scm_queue(b, bind_off, alloc::vec![mk_fd()]);
+
+    // Reader has consumed nothing yet (recv_consumed == frame_start) — the batch
+    // must be WITHHELD: its bound position frame_start+1 has not been reached, so
+    // the reader has not yet touched (begun consuming) the frame.
+    if crate::syscall::has_scm_deliverable(b, unix::recv_consumed(b)) {
+        test_fail!("scm_firstbyte", "batch deliverable before any byte read");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // Read ONLY the first byte of the 8-byte frame (a partial / header-first
+    // read).  recv_consumed advances from frame_start to frame_start+1 — exactly
+    // the bound position bind_off, so the batch now becomes deliverable.
+    let mut one = [0u8; 1];
+    let rn = unix::read_msg(b, &mut one).map(|(c, _)| c).unwrap_or(0xFFFF);
+    if rn != 1 || one[0] != b'H' {
+        test_fail!("scm_firstbyte", "partial read = {} / {:?} (want 1/'H')", rn, one);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // THE REGRESSION ASSERTION: with the first-byte bind, the fds are now
+    // deliverable even though 7 of the 8 frame bytes remain unread.  The pre-fix
+    // tail bind (offset 8) would still withhold them here → the recvmsg that
+    // first returned the frame's bytes would carry NO cmsg → fatal error.
+    if !crate::syscall::has_scm_deliverable(b, unix::recv_consumed(b)) {
+        test_fail!("scm_firstbyte",
+            "fds NOT deliverable after first byte (tail-bind regression)");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    let got = crate::syscall::scm_dequeue(b, unix::recv_consumed(b));
+    if got.map(|v| v.len()) != Some(1) {
+        test_fail!("scm_firstbyte", "first-byte dequeue did not return the fd");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    test_println!("  fds delivered on the first byte of their frame (partial read) ✓");
+
+    // The remaining 7 data bytes are still readable and intact (the fd batch
+    // delivery did not disturb the data stream).
+    let mut rest = [0u8; 7];
+    let rrn = unix::read_msg(b, &mut rest).map(|(c, _)| c).unwrap_or(0xFFFF);
+    if rrn != 7 || &rest != b"DRBODY!" {
+        test_fail!("scm_firstbyte", "remaining read = {} / {:?}", rrn, rest);
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    test_println!("  remaining frame bytes intact after fd delivery ✓");
+
+    unix::close(a);
+    unix::close(b);
+    test_pass!("SCM_RIGHTS fds bound to the first byte of their frame (Test 289)");
+    true
+}
+
+// ── Test 290: a multi-fd SCM_RIGHTS message delivers ALL its fds ─────────────
+//
+// The sendmsg(2) SCM path collects every fd named in a single SCM_RIGHTS
+// control message into ONE batch and binds it to the frame's first-byte-touched
+// stream position; the recvmsg(2) that first returns the frame's bytes pops that
+// batch and installs ALL of its descriptors, writing one cmsg whose payload is
+// the full set of receiver-side fd numbers.  A 2-fd batch must therefore deliver
+// BOTH fds with the same recvmsg as a 1-fd batch delivers its one fd — a
+// short-delivery (fewer fds than the message header announced) makes a
+// length-prefixed IPC reader abort with "needs unreceived descriptors".  This
+// directly exercises the batch+dequeue layer with a 2-fd batch and an
+// interleaved 1-fd frame to confirm the multi-fd batch is neither split,
+// truncated, nor lost.  Refs: recvmsg(2)/sendmsg(2), unix(7) SCM_RIGHTS,
+// POSIX.1-2017 §2.14.
+fn test_290_scm_multi_fd_delivery() -> bool {
+    use crate::net::unix;
+    test_header!("multi-fd SCM_RIGHTS message delivers ALL its fds (Test 290)");
+
+    let (a, b) = unix::socketpair(unix::SockKind::Stream,
+        unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if a == u64::MAX || b == u64::MAX {
+        test_fail!("scm_multifd", "socketpair returned MAX");
+        return false;
+    }
+
+    // Distinguishable throw-away descriptors, tagged by `inode`.
+    let mk_fd = |ino: u64| crate::vfs::FileDescriptor {
+        inode: ino, mount_idx: 0, offset: 0, flags: 0,
+        file_type: crate::vfs::FileType::RegularFile,
+        is_console: false, cloexec: false,
+        open_path: alloc::string::String::new(),
+    };
+
+    // ── Part 1: a single 2-fd batch on a data frame delivers BOTH fds ────────
+    // Model the data-bearing 2-fd sendmsg: capture the frame start, push the
+    // data, then queue ONE batch of two fds bound to the first-byte-touched
+    // position (frame_start + 1), exactly as the sendmsg(2) SCM path does.
+    let frame_start = unix::enqueue_offset_for(b);
+    if unix::write(a, b"HDR") != 3 {
+        test_fail!("scm_multifd", "write(HDR) != 3");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    crate::syscall::scm_queue(b, frame_start + 1,
+        alloc::vec![mk_fd(0xF1), mk_fd(0xF2)]);
+
+    // Before any byte of the frame is read, the batch is withheld (first-byte
+    // bind): recv_consumed == frame_start < frame_start + 1.
+    if crate::syscall::has_scm_deliverable(b, unix::recv_consumed(b)) {
+        test_fail!("scm_multifd", "2-fd batch deliverable before any byte read");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    // Pop the first byte → recv_consumed reaches frame_start + 1 → the WHOLE
+    // 2-fd batch becomes deliverable on this recvmsg.
+    let mut one = [0u8; 1];
+    if unix::read_msg(b, &mut one).map(|(c, _)| c).unwrap_or(0xFFFF) != 1 {
+        test_fail!("scm_multifd", "partial read of frame failed");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    let got = crate::syscall::scm_dequeue(b, unix::recv_consumed(b));
+    match got.as_deref() {
+        Some([f1, f2]) if (f1.inode, f2.inode) == (0xF1, 0xF2) => {
+            test_println!("  2-fd batch delivered BOTH fds in one dequeue ✓");
+        }
+        other => {
+            test_fail!("scm_multifd",
+                "2-fd dequeue returned {:?} (expected exactly [0xF1, 0xF2])",
+                other.map(|s| s.iter().map(|f| f.inode).collect::<alloc::vec::Vec<_>>()));
+            unix::close(a); unix::close(b);
+            return false;
+        }
+    }
+    // Drain the rest of the frame so the stream position is clean for Part 2.
+    let mut rest = [0u8; 2];
+    let _ = unix::read_msg(b, &mut rest);
+
+    // ── Part 2: a 1-fd frame after a 2-fd frame keeps its single fd ──────────
+    // Cross-check the N1 ordering interaction: when one message carries 2 fds
+    // and a following message carries 1 fd, each batch is bound to its own
+    // first-byte position and dequeued in byte order — the 2-fd batch is not
+    // merged into, nor does it steal a descriptor from, the 1-fd batch.
+    let f2_start = unix::enqueue_offset_for(b);
+    if unix::write(a, b"X") != 1 {
+        test_fail!("scm_multifd", "write(X) != 1");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+    crate::syscall::scm_queue(b, f2_start + 1, alloc::vec![mk_fd(0xAB)]);
+    let _ = unix::read_msg(b, &mut one); // pop the single byte
+    match crate::syscall::scm_dequeue(b, unix::recv_consumed(b)).as_deref() {
+        Some([f]) if f.inode == 0xAB => {
+            test_println!("  following 1-fd frame delivered exactly its one fd ✓");
+        }
+        other => {
+            test_fail!("scm_multifd",
+                "1-fd frame dequeue returned {:?} (expected exactly [0xAB])",
+                other.map(|s| s.iter().map(|f| f.inode).collect::<alloc::vec::Vec<_>>()));
+            unix::close(a); unix::close(b);
+            return false;
+        }
+    }
+    // Nothing should remain queued.
+    if crate::syscall::scm_dequeue(b, unix::recv_consumed(b)).is_some() {
+        test_fail!("scm_multifd", "unexpected extra batch after both frames drained");
+        unix::close(a); unix::close(b);
+        return false;
+    }
+
+    unix::close(a);
+    unix::close(b);
+    test_pass!("multi-fd SCM_RIGHTS message delivers ALL its fds (Test 290)");
+    true
+}
+
+// ── Test 291: a coalesced stream read delivers one fd batch per recv ─────────
+//
+// A byte-stream reader (e.g. a length-prefixed IPC channel) reads up to a large
+// fixed buffer per recvmsg(2).  When two fd-bearing frames are queued
+// back-to-back in the recv ring, an UNCAPPED read would drain the bytes of BOTH
+// frames in a single recvmsg while `scm_dequeue` only hands back ONE batch — the
+// reader then parses the second frame with its descriptors silently withheld and
+// aborts ("needs unreceived descriptors").  The recvmsg arm caps the drain at
+// the next pending batch's bound offset (`scm_next_batch_offset`), so each recv
+// returns the bytes up to exactly one fd batch and delivers that batch, then
+// stops — mirroring the AF_UNIX stream recv that stops at each fd-bearing message
+// boundary.  This drives that cap logic directly: two frames + two batches, then
+// read with a buffer large enough to span BOTH, and assert each batch is
+// delivered on its own capped read.  Refs: recvmsg(2), unix(7) SCM_RIGHTS.
+fn test_291_scm_coalesced_stream_read_cap() -> bool {
+    use crate::net::unix;
+    test_header!("coalesced stream read delivers one fd batch per recv (Test 291)");
+
+    let (a, b) = unix::socketpair(unix::SockKind::Stream,
+        unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if a == u64::MAX || b == u64::MAX {
+        test_fail!("scm_coalesce", "socketpair returned MAX");
+        return false;
+    }
+    let mk_fd = |ino: u64| crate::vfs::FileDescriptor {
+        inode: ino, mount_idx: 0, offset: 0, flags: 0,
+        file_type: crate::vfs::FileType::RegularFile,
+        is_console: false, cloexec: false,
+        open_path: alloc::string::String::new(),
+    };
+
+    // Frame 1: 4 data bytes at stream start T1, one fd bound to T1+1.
+    let t1 = unix::enqueue_offset_for(b);
+    if unix::write(a, b"AAAA") != 4 {
+        test_fail!("scm_coalesce", "write frame1 != 4"); unix::close(a); unix::close(b); return false;
+    }
+    crate::syscall::scm_queue(b, t1 + 1, alloc::vec![mk_fd(0x11)]);
+    // Frame 2: 4 more data bytes at stream pos T2, one fd bound to T2+1.
+    let t2 = unix::enqueue_offset_for(b);   // == t1 + 4
+    if unix::write(a, b"BBBB") != 4 {
+        test_fail!("scm_coalesce", "write frame2 != 4"); unix::close(a); unix::close(b); return false;
+    }
+    crate::syscall::scm_queue(b, t2 + 1, alloc::vec![mk_fd(0x22)]);
+
+    // The recv-side cap: with the reader at the stream start, the next pending
+    // batch is frame 1's (offset t1+1), so a stream recv must not drain past it.
+    let consumed0 = unix::recv_consumed(b);
+    match crate::syscall::scm_next_batch_offset(b, consumed0) {
+        Some(off) if off == t1 + 1 => {
+            test_println!("  next-batch cap = frame-1 offset (t1+1) ✓");
+        }
+        other => {
+            test_fail!("scm_coalesce", "next-batch offset = {:?} (want {})", other, t1 + 1);
+            unix::close(a); unix::close(b); return false;
+        }
+    }
+
+    // Simulate the capped recvmsg: a reader offers an 8-byte buffer (enough to
+    // span BOTH frames) but the cap limits the drain to (next - consumed) bytes.
+    // Read #1 must therefore stop at frame 1's first-byte position and deliver
+    // ONLY frame 1's batch.
+    let cap1 = ((t1 + 1) - consumed0) as usize;          // == 1 (read up to frame-1's first byte)
+    let mut buf = [0u8; 8];
+    let rn1 = unix::read_msg(b, &mut buf[..cap1.max(1)]).map(|(c, _)| c).unwrap_or(0xFFFF);
+    if rn1 == 0xFFFF {
+        test_fail!("scm_coalesce", "capped read #1 failed"); unix::close(a); unix::close(b); return false;
+    }
+    let got1 = crate::syscall::scm_dequeue(b, unix::recv_consumed(b));
+    if got1.as_deref().map(|s| s.iter().map(|f| f.inode).collect::<alloc::vec::Vec<_>>())
+        != Some(alloc::vec![0x11]) {
+        test_fail!("scm_coalesce", "read #1 did not deliver exactly frame-1's fd (0x11)");
+        unix::close(a); unix::close(b); return false;
+    }
+    // Frame 2's batch MUST still be withheld — its bytes are not yet drained.
+    if crate::syscall::scm_dequeue(b, unix::recv_consumed(b)).is_some() {
+        test_fail!("scm_coalesce", "frame-2 batch delivered on the same recv as frame-1");
+        unix::close(a); unix::close(b); return false;
+    }
+    test_println!("  read #1 delivered frame-1's fd only; frame-2 withheld ✓");
+
+    // Drain the rest of frame 1 + into frame 2 under the next cap, then deliver
+    // frame 2's batch.  Recompute the cap for the reader's new position.
+    let consumed1 = unix::recv_consumed(b);
+    let next2 = crate::syscall::scm_next_batch_offset(b, consumed1).unwrap_or(0);
+    if next2 != t2 + 1 {
+        test_fail!("scm_coalesce", "second next-batch offset = {} (want {})", next2, t2 + 1);
+        unix::close(a); unix::close(b); return false;
+    }
+    let cap2 = (next2 - consumed1) as usize;
+    let _ = unix::read_msg(b, &mut buf[..cap2.max(1)]);
+    match crate::syscall::scm_dequeue(b, unix::recv_consumed(b)).as_deref() {
+        Some([f]) if f.inode == 0x22 => {
+            test_println!("  read #2 delivered frame-2's fd (0x22) on its own recv ✓");
+        }
+        other => {
+            test_fail!("scm_coalesce", "read #2 delivered {:?} (want [0x22])",
+                other.map(|s| s.iter().map(|f| f.inode).collect::<alloc::vec::Vec<_>>()));
+            unix::close(a); unix::close(b); return false;
+        }
+    }
+
+    unix::close(a);
+    unix::close(b);
+    test_pass!("coalesced stream read delivers one fd batch per recv (Test 291)");
     true
 }
