@@ -706,6 +706,51 @@ pub fn socket_recvfrom(id: u64) -> Result<(Vec<u8>, Ipv4Address, u16), &'static 
     r
 }
 
+/// Returns `true` when a connection-mode (TCP) socket has reached an
+/// orderly end-of-stream that a subsequent `recv(2)` must report as EOF
+/// (a 0-byte return): the peer's FIN has been received (the TCB is in
+/// `CloseWait`/`LastAck`/`TimeWait`/`Closed` or has been reaped) *or* the
+/// local end has `shutdown(SHUT_RD)`.  Buffered data still pending is NOT
+/// EOF — the data must be drained first — so a non-empty receive queue
+/// returns `false` here.
+///
+/// Read-only: this is a blocking-loop break predicate.  A blocking
+/// `recvfrom(2)` that waits on [`socket_has_data`] alone never wakes on a
+/// FIN-closed empty stream (there is no data and none will ever arrive),
+/// so the loop must also break on this EOF condition and fall through to
+/// the EOF-aware drain, returning 0 per RFC 9293 §3.5.  UDP is
+/// connectionless and never reports EOF here.
+pub fn socket_is_read_closed(id: u64) -> bool {
+    let sockets = SOCKETS.lock();
+    let sock = match sockets.iter().find(|s| s.id == id) {
+        Some(s) => s,
+        None => return false,
+    };
+    if sock.shut_rd { return true; }
+    if sock.socket_type != SocketType::Tcp { return false; }
+    if !sock.bound { return false; }
+    let connected   = sock.connected;
+    let remote_ip   = sock.remote_ip;
+    let remote_port = sock.remote_port;
+    let local_port  = sock.local_port;
+    drop(sockets);
+    // Any buffered bytes outrank EOF — drain first.
+    let has_buffered = if connected && remote_port != 0 {
+        super::tcp::has_data_for(local_port, remote_ip, remote_port)
+    } else {
+        super::tcp::has_data(local_port)
+    };
+    if has_buffered { return false; }
+    match super::tcp::get_state(local_port) {
+        Some(st) => matches!(st,
+            super::tcp::TcpState::CloseWait
+            | super::tcp::TcpState::LastAck
+            | super::tcp::TcpState::TimeWait
+            | super::tcp::TcpState::Closed),
+        None => true,
+    }
+}
+
 /// Check if a socket has incoming data available (used by poll).
 ///
 /// For a TCP listener (bound but unconnected) the readability gate is
