@@ -71,6 +71,18 @@ struct UnixSocket {
     recv_buf:    [u8; RECV_BUF_CAP],
     recv_head:   usize,
     recv_tail:   usize,
+    /// Monotonic count of bytes ever *pushed* into `recv_buf` and ever
+    /// *popped* out of it.  Unlike the wrapping `recv_head`/`recv_tail`
+    /// indices, these never reset on read, so they form a stable absolute
+    /// stream position for the live connection (`recv_pushed - recv_popped
+    /// == recv_available()`).  Used to bind a queued `SCM_RIGHTS` control
+    /// message to the exact stream offset at which it was sent, so an
+    /// ancillary-only frame (`iov_len == 0`) is still a *readable message*
+    /// per `recvmsg(2)` / `unix(7)` / POSIX.1-2017 SCM_RIGHTS, and so a
+    /// reader draining an earlier data-only frame does not prematurely
+    /// receive a later frame's fds.
+    recv_pushed: u64,
+    recv_popped: u64,
     /// SEQPACKET message-boundary queue: each entry records the length of
     /// one outstanding sender-side message in `recv_buf`.  Unused for STREAM.
     /// Implemented as a small ring; `seq_head` is dequeue, `seq_tail` is
@@ -127,6 +139,8 @@ impl UnixSocket {
             recv_buf:    [0u8; RECV_BUF_CAP],
             recv_head:   0,
             recv_tail:   0,
+            recv_pushed: 0,
+            recv_popped: 0,
             seq_lens:    [0u32; SEQ_QUEUE_CAP],
             seq_head:    0,
             seq_tail:    0,
@@ -148,6 +162,8 @@ impl UnixSocket {
         self.peer_id     = u64::MAX;
         self.recv_head   = 0;
         self.recv_tail   = 0;
+        self.recv_pushed = 0;
+        self.recv_popped = 0;
         self.seq_head    = 0;
         self.seq_tail    = 0;
         self.backlog_len = 0;
@@ -179,6 +195,7 @@ impl UnixSocket {
             self.recv_buf[self.recv_tail] = b;
             self.recv_tail = (self.recv_tail + 1) % RECV_BUF_CAP;
         }
+        self.recv_pushed = self.recv_pushed.wrapping_add(n as u64);
         n
     }
 
@@ -190,7 +207,14 @@ impl UnixSocket {
             *byte = self.recv_buf[self.recv_head];
             self.recv_head = (self.recv_head + 1) % RECV_BUF_CAP;
         }
+        self.recv_popped = self.recv_popped.wrapping_add(n as u64);
         n
+    }
+
+    /// Absolute stream position of the *next* byte that will be pushed —
+    /// the offset to bind a queued `SCM_RIGHTS` batch to (see `recv_pushed`).
+    fn enqueue_offset(&self) -> u64 {
+        self.recv_pushed
     }
 }
 
@@ -523,6 +547,9 @@ pub fn read_msg(id: u64, buf: &mut [u8]) -> Result<(usize, usize), i64> {
         for _ in 0..discard {
             s.recv_head = (s.recv_head + 1) % RECV_BUF_CAP;
         }
+        // Discarded bytes leave the ring too — keep the absolute stream
+        // position (`recv_popped`) consistent with the wrapping head index.
+        s.recv_popped = s.recv_popped.wrapping_add(discard as u64);
         // The whole message (copied + discarded tail) leaves the recv ring.
         drained = copied + discard;
         result  = Ok((copied, discard));
@@ -647,6 +674,19 @@ pub fn close(id: u64) {
         }
     }
     drop(t);
+    // This socket is now fully torn down.  Any `SCM_RIGHTS` ancillary fds that
+    // were queued for it but never `recvmsg`'d are about to be lost — release
+    // the references that the sender took at enqueue time so the passed
+    // socket / pipe / file is not leaked and its peer observes the hang-up
+    // (CWE-772; unix(7) / recvmsg(2) SCM_RIGHTS: undelivered fds in a destroyed
+    // receive queue are dropped, mirroring close(2) of a delivered copy).
+    // The TABLE lock is released here, so draining (PENDING_SCM lock) and the
+    // per-fd drop (which may re-enter this function for a passed socket) cannot
+    // deadlock against the lock we just held.
+    let orphaned = crate::syscall::scm_drain_receiver(id);
+    if !orphaned.is_empty() {
+        crate::syscall::scm_drop_fds(orphaned);
+    }
     if ring {
         crate::ipc::waitlist::ring_poll_bell_for(
             crate::ipc::waitlist::PollBellSource::UnixShutdown);
@@ -763,6 +803,29 @@ pub fn bytes_available(id: u64) -> usize {
     } else {
         s.recv_available()
     }
+}
+
+/// Absolute stream position (total bytes ever pushed into the recv ring) at
+/// which a freshly-sent `SCM_RIGHTS` batch should attach.  An ancillary-only
+/// frame (`iov_len == 0`) pushes no bytes, so its fds attach *after* every
+/// byte already queued — i.e. at the current `recv_pushed`.  See
+/// [`scm_deliverable_offset`] for the matching drain-side test.  Returns 0
+/// for an out-of-range id.
+pub fn enqueue_offset_for(id: u64) -> u64 {
+    if id as usize >= MAX_UNIX_SOCKETS { return 0; }
+    let t = TABLE.lock();
+    t.0[id as usize].enqueue_offset()
+}
+
+/// Total bytes ever drained (popped, including SEQPACKET-truncated tails)
+/// from the recv ring of socket `id` — the absolute read position.  A queued
+/// `SCM_RIGHTS` batch bound to `byte_offset` becomes deliverable once this
+/// reaches `byte_offset` (the reader has consumed every data byte that
+/// preceded the ancillary message).  Returns 0 for an out-of-range id.
+pub fn recv_consumed(id: u64) -> u64 {
+    if id as usize >= MAX_UNIX_SOCKETS { return 0; }
+    let t = TABLE.lock();
+    t.0[id as usize].recv_popped
 }
 
 /// Return the socket type (`Stream` or `SeqPacket`) for an open socket id.

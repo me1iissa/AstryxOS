@@ -436,19 +436,191 @@ where
 }
 
 /// SCM_RIGHTS pending fd transfers.
-/// Key = receiving unix socket id.  Value = list of FileDescriptors to deliver.
-static PENDING_SCM: Mutex<Vec<(u64, Vec<crate::vfs::FileDescriptor>)>> = Mutex::new(Vec::new());
+///
+/// One entry = one ancillary-data batch sent by a `sendmsg(2)` carrying an
+/// `SCM_RIGHTS` control message.  Per `recvmsg(2)` / `unix(7)` /
+/// POSIX.1-2017, such a frame is a *readable message* in its own right — even
+/// when its data payload is empty (`iov_len == 0`, a control-only fd handoff)
+/// — and `recvmsg` must return it with the cmsg attached.
+///
+/// Each batch is bound to the receiving socket's absolute recv-stream
+/// position (`byte_offset`) captured at enqueue time, so that:
+///   * an ancillary-only frame still confers read-readiness (it sits at the
+///     stream tail with no preceding unread bytes, hence is immediately
+///     deliverable), and
+///   * a reader draining an earlier *data-only* frame does not prematurely
+///     receive a *later* frame's fds — the batch is withheld until the reader
+///     has consumed every byte that preceded it (`recv_consumed >=
+///     byte_offset`).  This keys delivery on a stream *position* rather than
+///     merely on the receiver uid.
+struct ScmBatch {
+    receiver_id: u64,
+    byte_offset: u64,
+    fds: Vec<crate::vfs::FileDescriptor>,
+}
+static PENDING_SCM: Mutex<Vec<ScmBatch>> = Mutex::new(Vec::new());
 
-/// Queue SCM_RIGHTS fds to be delivered when `receiver_id` calls recvmsg.
-pub fn scm_queue(receiver_id: u64, fds: Vec<crate::vfs::FileDescriptor>) {
-    PENDING_SCM.lock().push((receiver_id, fds));
+/// Queue an `SCM_RIGHTS` fd batch for delivery when `receiver_id`'s drained-byte
+/// count reaches `byte_offset` (see [`scm_dequeue`]: the deliver predicate is
+/// `consumed >= byte_offset`).  `byte_offset` is the stream position the reader
+/// must have reached to have *touched* (begun consuming) the frame the fds
+/// accompany — the first-byte-touch delivery contract (recvmsg(2) / unix(7) /
+/// POSIX.1-2017 §2.14: ancillary data is delivered with the recvmsg that returns
+/// the data it accompanies):
+///   * for a DATA-bearing frame starting at stream position T, the caller binds
+///     to `T + 1` — deliverable the instant the reader pops the frame's first
+///     byte (`consumed` advances T → T+1), and NOT before any byte of the frame
+///     is read;
+///   * for an ancillary-ONLY frame (no data bytes), the fds sit at the current
+///     stream tail T with nothing to touch, so the caller binds to `T` and the
+///     batch is immediately deliverable as a 0-byte readable message.
+///
+/// The single `>=` predicate covers both because the caller does the `+1`
+/// adjustment for data frames at enqueue time (see the sendmsg(2) SCM path).
+pub fn scm_queue(receiver_id: u64, byte_offset: u64, fds: Vec<crate::vfs::FileDescriptor>) {
+    PENDING_SCM.lock().push(ScmBatch { receiver_id, byte_offset, fds });
 }
 
-/// Pop SCM_RIGHTS fds for `receiver_id`.  Returns None if nothing pending.
-pub fn scm_dequeue(receiver_id: u64) -> Option<Vec<crate::vfs::FileDescriptor>> {
+/// Returns true if `receiver_id` has at least one `SCM_RIGHTS` batch that is
+/// already deliverable — its bound `byte_offset` has been reached by the
+/// reader (`consumed >= byte_offset`).  This is the readiness predicate that
+/// makes a control-only ancillary frame surface as `POLLIN`/`EPOLLIN`, since
+/// such a frame carries no recv-ring bytes for `has_data()` to see.
+///
+/// `consumed` is the receiver's absolute drained-byte count
+/// (`net::unix::recv_consumed`); passed in by the caller so this module does
+/// not have to reach back into the net layer while holding PENDING_SCM.
+pub fn has_scm_deliverable(receiver_id: u64, consumed: u64) -> bool {
+    let q = PENDING_SCM.lock();
+    q.iter().any(|b| b.receiver_id == receiver_id && consumed >= b.byte_offset)
+}
+
+/// Lowest pending `SCM_RIGHTS` batch bound-offset for `receiver_id` that the
+/// reader has NOT yet reached (`byte_offset > consumed`).  Returns None when no
+/// pending batch sits ahead of the reader's current drained position.
+///
+/// This is the recv-side read CAP for AF_UNIX SOCK_STREAM: a `recvmsg(2)` must
+/// not drain bytes *past* the stream position at which the next queued fd batch
+/// becomes deliverable, because each `scm_dequeue` hands back exactly ONE batch.
+/// A byte-stream reader (e.g. a length-prefixed IPC channel) reads up to a large
+/// fixed buffer per `recvmsg`, so without a cap a single recvmsg can drain bytes
+/// that span MULTIPLE fd-bearing frames while only ONE batch is delivered — the
+/// reader then parses a later frame whose descriptors were silently withheld and
+/// aborts ("needs unreceived descriptors").  Capping the drain at the next
+/// batch's deliver-offset makes each recvmsg return the bytes up to exactly one
+/// fd batch and deliver that batch, then stop — mirroring the AF_UNIX stream
+/// recv that stops at each fd-bearing message boundary (recvmsg(2), unix(7)
+/// SCM_RIGHTS: ancillary data is delivered with the data it accompanies, one
+/// message's fds per recv).
+pub fn scm_next_batch_offset(receiver_id: u64, consumed: u64) -> Option<u64> {
+    let q = PENDING_SCM.lock();
+    q.iter()
+        .filter(|b| b.receiver_id == receiver_id && b.byte_offset > consumed)
+        .map(|b| b.byte_offset)
+        .min()
+}
+
+/// Pop the *earliest* deliverable `SCM_RIGHTS` batch for `receiver_id` — the
+/// deliverable batch with the LOWEST bound `byte_offset` (the stream-position
+/// nearest the reader), among those whose offset the reader has now reached
+/// (`consumed >= byte_offset`).  Returns None if nothing is pending or every
+/// pending batch still sits beyond the reader's current position (the reader
+/// must drain the intervening data bytes first).  Delivering the lowest-offset
+/// batch keeps fds attached to their originating stream frame.
+///
+/// Selecting by minimum `byte_offset` — rather than by Vec push order — is
+/// load-bearing for correctness under concurrent `sendmsg(2)` to the same
+/// peer.  The send path captures the bind offset (under the unix TABLE lock)
+/// and pushes the batch (under the PENDING_SCM lock) in two separate critical
+/// sections, so two interleaved senders can push their batches into the Vec in
+/// the opposite order to their byte offsets.  A naive "first matching Vec
+/// entry" pop would then hand the reader the LATER frame's fds first, attaching
+/// the wrong descriptors to a frame — a data-integrity bug.  Per `unix(7)` /
+/// `recvmsg(2)` SCM_RIGHTS, ancillary data attaches to a stream *position*; we
+/// therefore deliver strictly in byte-offset order regardless of push order.
+pub fn scm_dequeue(receiver_id: u64, consumed: u64) -> Option<Vec<crate::vfs::FileDescriptor>> {
     let mut q = PENDING_SCM.lock();
-    let pos = q.iter().position(|(id, _)| *id == receiver_id)?;
-    Some(q.remove(pos).1)
+    // Pick the deliverable batch with the smallest byte_offset.  Ties (two
+    // batches bound to the exact same offset, e.g. two control-only frames
+    // racing at the same stream tail) fall back to Vec push order via the
+    // stable `min_by_key`, which is the best available approximation of send
+    // order when the offsets are indistinguishable.
+    let pos = q.iter().enumerate()
+        .filter(|(_, b)| b.receiver_id == receiver_id && consumed >= b.byte_offset)
+        .min_by_key(|(_, b)| b.byte_offset)
+        .map(|(i, _)| i)?;
+    Some(q.remove(pos).fds)
+}
+
+/// Drain *all* pending `SCM_RIGHTS` batches destined for `receiver_id` and
+/// return their queued `FileDescriptor`s, removing the batches from the queue.
+///
+/// Called when a receiver socket is torn down (final `close(2)` / process
+/// exit) before it has `recvmsg`'d the queued ancillary data.  Per the AF_UNIX
+/// SCM_RIGHTS contract, fds that were placed in a receive queue but never
+/// delivered must be released when that queue is destroyed (each underlying
+/// open file description gets the matching reference drop, mirroring the
+/// `close(2)` of a delivered copy).  Without this drain the references that
+/// [`scm_queue`]'s callers took at enqueue time leak (CWE-772): the passed
+/// socket / pipe / file is never torn down and its peer never observes the
+/// hang-up.  The caller is responsible for balancing each returned descriptor's
+/// underlying-object reference via [`scm_drop_fds`].
+pub fn scm_drain_receiver(receiver_id: u64) -> Vec<crate::vfs::FileDescriptor> {
+    let mut q = PENDING_SCM.lock();
+    let mut out = Vec::new();
+    // Retain only the batches NOT destined for this receiver; collect the rest.
+    let mut i = 0;
+    while i < q.len() {
+        if q[i].receiver_id == receiver_id {
+            let batch = q.remove(i);
+            out.extend(batch.fds);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Release the underlying-object reference for each `FileDescriptor` that was
+/// queued for SCM_RIGHTS delivery but never received (see
+/// [`scm_drain_receiver`]).  This is the exact inverse of the reference bumped
+/// at enqueue time in the `sendmsg(2)` SCM path and must mirror that per-type
+/// dispatch so no socket / pipe reference leaks (CWE-772):
+///
+///   * AF_UNIX socket fd → `net::unix::close` drops one open-file-description
+///     reference; the last drop tears the slot down and hangs up the peer.
+///   * anonymous pipe end → drop the reader/writer count so the pipe's other
+///     end observes EOF / EPIPE per `read(2)` / `write(2)`.
+///   * regular file / memfd → drop the inode pin taken at enqueue time
+///     (`vfs::pin_inode`); when that was the last reference to a deferred-
+///     deleted (unlinked) memfd, the inode is freed by `unpin_inode`.  Without
+///     this the pin (and thus the inode) would leak forever.
+///   * eventfd / other sentinel fds → no per-object refcount to balance.
+///
+/// MUST be called with no unix `TABLE` / `PENDING_SCM` lock held — it re-enters
+/// `net::unix::close`, which takes the unix TABLE lock.
+pub fn scm_drop_fds(fds: Vec<crate::vfs::FileDescriptor>) {
+    for fd in fds {
+        if fd.file_type == crate::vfs::FileType::Socket
+            && fd.flags & UNIX_SOCKET_FLAG != 0
+        {
+            crate::net::unix::close(fd.inode);
+        } else if fd.file_type == crate::vfs::FileType::Pipe
+            && fd.mount_idx == usize::MAX
+            && fd.flags & 0x8000_0000 != 0
+        {
+            if fd.flags & 1 == 1 {
+                crate::ipc::pipe::pipe_close_writer(fd.inode);
+            } else {
+                crate::ipc::pipe::pipe_close_reader(fd.inode);
+            }
+        } else if fd.file_type == crate::vfs::FileType::RegularFile
+            && fd.mount_idx != usize::MAX
+        {
+            crate::vfs::unpin_inode(fd.mount_idx, fd.inode);
+        }
+        // eventfds / other sentinel fds: no per-object refcount to drop.
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2237,17 +2409,89 @@ pub(crate) fn sys_waitpid(pid: i64, options: u32) -> i64 {
 
     // Block the parent thread until a child exits.
     // We use wake_tick = u64::MAX-1 as a sentinel for "blocked in waitpid".
-    // exit_thread() wakes us when a child process becomes a zombie.
+    // exit_thread() / exit_group_inner() wake us when a child process becomes
+    // a zombie.
+    //
+    // ── Prepare-to-wait discipline (lost-wakeup close) ──────────────────────
+    //
+    // The wake side writes `ProcessState::Zombie` into PROCESS_TABLE first
+    // (lock dropped), THEN acquires THREAD_TABLE and flips this parent
+    // Blocked→Ready *only if* it observes `state == Blocked && wake_tick ==
+    // u64::MAX-1`.  The immediate-reap check above reads PROCESS_TABLE and
+    // drops it; if a child becomes a zombie in the window between that drop
+    // and this thread committing `Blocked`, the wake-side flip runs while we
+    // are still Running and is a no-op — the wake is lost.  Because the
+    // sentinel `wake_tick = u64::MAX-1` is scan-ineligible (the scheduler's
+    // due-wake scan requires `wake_tick != u64::MAX && now >= wake_tick`,
+    // never true for MAX-1) and this parker is not registered on any poll
+    // bell, the park would then never self-terminate → permanent hang of
+    // wait4(2).  POSIX wait(2): a child that has ALREADY terminated must be
+    // reapable without blocking.
+    //
+    // We close the window with the standard park-then-recheck handshake (the
+    // same shape as the poll/event waitlist in `ipc::waitlist`): commit
+    // `Blocked` under THREAD_TABLE, drop it, and THEN re-poll PROCESS_TABLE
+    // for a reapable zombie.  If a zombie is now visible we revert
+    // Blocked→Ready and reap without ever calling `schedule()`.
+    //
+    // Lock ordering / no-deadlock: this routine NEVER holds THREAD_TABLE and
+    // PROCESS_TABLE simultaneously — it takes THREAD_TABLE (commit Blocked),
+    // releases it, then takes PROCESS_TABLE (recheck via
+    // `crate::proc::waitpid`).  That matches the existing exit-path invariant
+    // ("Never hold THREAD_TABLE and PROCESS_TABLE simultaneously") and the
+    // wake side's own discipline (PROCESS_TABLE then THREAD_TABLE,
+    // sequentially, never nested), so no new lock-order edge is introduced.
+    //
+    // Why this is race-free against the concurrent child exit:
+    //   • If the child writes Zombie before we commit Blocked, our post-commit
+    //     recheck observes the zombie and reaps (no park).
+    //   • If the child writes Zombie after our recheck observed no zombie,
+    //     then our `Blocked` store happened-before that recheck, which
+    //     happened-before the child's Zombie write, which happens-before the
+    //     child's THREAD_TABLE flip — so the flip sees `Blocked` and wakes us.
+    //   • If the child writes Zombie strictly between our commit and recheck,
+    //     our recheck observes the zombie and reaps; we revert our own state
+    //     so we don't fall through still-Blocked.
     let max_attempts = 200; // Safety limit: ~200 wakeup cycles (~20 seconds at 100Hz)
+    let tid = crate::proc::current_tid();
     for _ in 0..max_attempts {
+        // (1) Commit Blocked under THREAD_TABLE, then drop the lock.
         {
-            let tid = crate::proc::current_tid();
             let mut threads = crate::proc::THREAD_TABLE.lock();
             if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
                 t.state = crate::proc::ThreadState::Blocked;
                 t.wake_tick = u64::MAX - 1; // sentinel: blocked in waitpid
             }
         }
+
+        // (2) Recheck PROCESS_TABLE for a reapable zombie WITHOUT holding
+        //     THREAD_TABLE.  A child that became a zombie in the
+        //     immediate-reap→commit window is caught here.  On a hit, revert
+        //     our own state to Ready (so a missed wake can't leave us Blocked)
+        //     and reap without parking.
+        if let Some((child_pid, exit_code)) = crate::proc::waitpid(parent_pid, pid) {
+            {
+                let mut threads = crate::proc::THREAD_TABLE.lock();
+                if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+                    if t.state == crate::proc::ThreadState::Blocked
+                        && t.wake_tick == u64::MAX - 1
+                    {
+                        t.state = crate::proc::ThreadState::Ready;
+                        t.wake_tick = u64::MAX;
+                    }
+                }
+            }
+            crate::serial_println!(
+                "[SYSCALL] waitpid: child PID {} exited with code {} (reaped without park)",
+                child_pid, exit_code
+            );
+            return child_pid as i64;
+        }
+
+        // (3) No zombie visible while we hold the Blocked commit → park.  A
+        //     wake that arrives after step (2) but before/at schedule() finds
+        //     us already Blocked and flips us Ready, so schedule() (or the
+        //     scheduler tick) returns us promptly.
         crate::sched::schedule();
 
         // We were woken up — try to reap.
@@ -4027,7 +4271,14 @@ pub(crate) fn poll_revents(pid: u64, fd: usize, events: u16) -> u16 {
         let uid = get_unix_socket_id(pid, fd);
         let has_d = crate::net::unix::has_data(uid);
         let has_p = crate::net::unix::has_pending(uid);
-        let readable = has_d || has_p;
+        // A queued SCM_RIGHTS batch whose bound stream offset the reader has
+        // reached makes the socket readable even with an empty data ring: a
+        // control-only ancillary frame (iov_len==0) IS a readable message per
+        // recvmsg(2) / unix(7) / POSIX.1-2017 SCM_RIGHTS, and recvmsg must
+        // return it.  Without this, the receiver parks in poll() forever on a
+        // pure fd handoff (e.g. an IPC channel/shared-memory fd pass).
+        let has_scm = has_scm_deliverable(uid, crate::net::unix::recv_consumed(uid));
+        let readable = has_d || has_p || has_scm;
         #[cfg(feature = "firefox-test")]
         if pid >= 1 && events & POLLIN != 0 {
             crate::serial_println!("[UNIXPOLL] pid={} fd={} uid={} has_data={} avail={} events={:#x}",

@@ -2071,36 +2071,54 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 let _g = crate::arch::x86_64::smap::UserGuard::new();
                 core::slice::from_raw_parts(iov_ptr as *const [u64; 2], iov_len as usize).to_vec()
             };
+            // SCM_RIGHTS first-byte bind: capture the peer's recv-stream
+            // position BEFORE any data iovec of this frame is pushed, so a
+            // queued ancillary fd batch binds to the FIRST byte of the frame
+            // it accompanies — not its tail.  Per recvmsg(2) / unix(7) /
+            // POSIX.1-2017, the ancillary SCM_RIGHTS data is delivered with
+            // the message data it accompanies; the receiver's IPC reader
+            // parses a frame whose header announces N handles and requires
+            // those fds on the SAME recvmsg that first returns the frame's
+            // bytes.  Binding to the tail (post-push) withholds the fds until
+            // the reader has drained EVERY byte of the frame, which fails when
+            // the reader consumes the frame in pieces (e.g. reads the header,
+            // sees num_handles>=1, then expects the fds already present) —
+            // surfacing as a fatal "needs unreceived descriptors".  The
+            // deliver predicate is `recv_consumed >= byte_offset`
+            // (syscall/mod.rs scm_dequeue); with byte_offset = the frame's
+            // starting recv position, the batch becomes deliverable the
+            // instant the reader pops the frame's first byte.  Computed once
+            // here (under the unix TABLE lock, briefly) for unix sockets only.
+            let scm_bind_peer_id: u64 = if crate::syscall::is_unix_socket_fd(pid, fd) {
+                let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
+                crate::net::unix::get_peer(unix_id)
+            } else {
+                u64::MAX
+            };
+            let scm_bind_offset: u64 = if scm_bind_peer_id != u64::MAX {
+                crate::net::unix::enqueue_offset_for(scm_bind_peer_id)
+            } else {
+                0
+            };
+            // Whether this frame carries any data bytes — known from the iovec
+            // lengths BEFORE the push, so the SCM batch can be queued ahead of
+            // the data it accompanies (see the ordering note below).  A frame
+            // with at least one non-empty iovec is data-bearing.
+            let frame_has_data = iovecs_owned.iter().any(|iov| iov[1] != 0);
             let mut total = 0usize;
-            for iov in &iovecs_owned {
-                let base = iov[0] as *const u8;
-                let slen = iov[1] as usize;
-                if slen == 0 { continue; }
-                // SMAP bracket — slice materialises against the user iov
-                // buffer; copy into a kernel Vec immediately so the net
-                // layer's send (which may take locks / queue) runs
-                // outside AC=1.
-                let data_owned: alloc::vec::Vec<u8> = {
-                    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
-                    unsafe { core::slice::from_raw_parts(base, slen) }.to_vec()
-                };
-                let data: &[u8] = &data_owned;
-                if crate::syscall::is_unix_socket_fd(pid, fd) {
-                    let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
-                    match crate::net::unix::write(unix_id, data) {
-                        n if n >= 0 => total += n as usize,
-                        e => return e,
-                    }
-                } else {
-                    if !crate::syscall::is_socket_fd(pid, fd) { return -9; }
-                    let socket_id = crate::syscall::get_socket_id(pid, fd);
-                    match crate::net::socket::socket_send(socket_id, data) {
-                        Ok(n) => total += n,
-                        Err("EPIPE") => return -32,
-                        Err(_) => return -104,
-                    }
-                }
-            }
+            // ORDERING (race fix): the SCM_RIGHTS batch is queued BEFORE the data
+            // bytes are pushed into the peer's recv ring.  The data push and the
+            // batch enqueue are separate critical sections (net::unix TABLE lock
+            // vs PENDING_SCM lock); if the bytes became readable first, a peer
+            // recvmsg(2) could drain the frame's bytes and compute its read cap
+            // (scm_next_batch_offset) BEFORE the batch was visible, deliver no
+            // fds, and strand the batch past the reader's position — the
+            // intermittent "needs unreceived descriptors" on the cross-process
+            // channel.  Queuing the batch first (bound to the pre-push offset)
+            // guarantees the batch is in PENDING_SCM before any of its
+            // accompanying bytes can be read, so the reader's cap always stops at
+            // it.  Per recvmsg(2) / unix(7) / POSIX.1-2017 §2.14, the ancillary
+            // data is delivered with the data it accompanies.
             // Handle SCM_RIGHTS in msg_control (Unix sockets only).
             // msghdr layout (x86_64): msg_control at byte-offset 32 (u64 index 4),
             // msg_controllen at byte-offset 40 (u64 index 5).
@@ -2158,18 +2176,149 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                         core::ptr::read_unaligned(fd_arr.add(i))
                                     } as usize;
                                     if fd_n < p.file_descriptors.len() {
-                                        p.file_descriptors[fd_n].clone()
+                                        let cloned = p.file_descriptors[fd_n].clone();
+                                        // SCM_RIGHTS duplicates the open file
+                                        // description into the receiver — the
+                                        // passed fd "refers to the same open
+                                        // file description as the corresponding
+                                        // descriptor in the sending process"
+                                        // (unix(7) SCM_RIGHTS, POSIX.1-2017
+                                        // §2.14).  Bump the underlying object's
+                                        // refcount so that when the sender later
+                                        // close(2)s its copy, the shared socket
+                                        // /pipe is NOT torn down and the peer is
+                                        // not spuriously hung up (CWE-416 — the
+                                        // close-resets-slot/shuts-peer path).
+                                        // Mirrors the dup(2)/fork(2) inc_ref.
+                                        if let Some(ref fdesc) = cloned {
+                                            if fdesc.file_type
+                                                == crate::vfs::FileType::Socket
+                                                && fdesc.flags
+                                                    & crate::syscall::UNIX_SOCKET_FLAG != 0
+                                            {
+                                                crate::net::unix::inc_ref(fdesc.inode);
+                                            } else if fdesc.file_type
+                                                == crate::vfs::FileType::Pipe
+                                                && fdesc.mount_idx == usize::MAX
+                                                && fdesc.flags & 0x8000_0000 != 0
+                                            {
+                                                if fdesc.flags & 1 == 1 {
+                                                    crate::ipc::pipe::pipe_add_writer(
+                                                        fdesc.inode);
+                                                } else {
+                                                    crate::ipc::pipe::pipe_add_reader(
+                                                        fdesc.inode);
+                                                }
+                                            } else if fdesc.file_type
+                                                == crate::vfs::FileType::RegularFile
+                                                && fdesc.mount_idx != usize::MAX
+                                            {
+                                                // Regular file / memfd: VFS tracks
+                                                // inode lifetime by scanning open
+                                                // fd tables (unlink-on-last-close),
+                                                // but this passed copy is in flight
+                                                // in PENDING_SCM and NOT yet in any
+                                                // fd table, so the scan cannot see
+                                                // it.  Pin the inode so a sender's
+                                                // close(2) of its (possibly the
+                                                // last named) copy of an unlinked
+                                                // memfd cannot free the inode out
+                                                // from under the un-received
+                                                // descriptor — the Mozilla
+                                                // shared-surface fd handoff.
+                                                // Balanced by unpin on delivery or
+                                                // on drain (scm_drop_fds path).
+                                                crate::vfs::pin_inode(
+                                                    fdesc.mount_idx, fdesc.inode);
+                                            }
+                                        }
+                                        cloned
                                     } else { None }
                                 }).collect()
                             } else { Vec::new() }
                         };
                         if !sender_fds.is_empty() {
-                            let unix_id  = crate::syscall::get_unix_socket_id(pid, fd);
-                            let peer_id  = crate::net::unix::get_peer(unix_id);
+                            let peer_id = scm_bind_peer_id;
                             if peer_id != u64::MAX {
-                                crate::syscall::scm_queue(peer_id, sender_fds);
+                                // Bind the fd batch so it co-delivers with the
+                                // recvmsg that returns the FIRST byte of this
+                                // frame — the first-byte-touch delivery contract
+                                // (recvmsg(2) / unix(7) / POSIX.1-2017 §2.14:
+                                // ancillary data is delivered with the data it
+                                // accompanies).  `scm_bind_offset` was captured
+                                // BEFORE the data-push loop, so it is the stream
+                                // position T where the frame begins.
+                                //
+                                // The deliver predicate is `recv_consumed >=
+                                // byte_offset` (syscall/mod.rs scm_dequeue).
+                                // Popping the frame's first byte advances
+                                // recv_consumed from T to T+1, so to gate the
+                                // batch on "the reader has touched (begun
+                                // consuming) this frame" we bind a DATA-bearing
+                                // frame to T+1 — deliverable the instant the
+                                // first byte is popped, and NOT before any byte
+                                // of the frame is read.  A control-only frame
+                                // (no data bytes) carries no bytes to touch; it
+                                // sits at the stream tail and must be immediately
+                                // readable as a 0-byte ancillary message, so it
+                                // binds to T (==tail) and the predicate fires at
+                                // once.  This keeps the dequeue predicate uniform
+                                // (`>=`) while honouring both cases.  `frame_has_data`
+                                // is computed from the iovec lengths above (the
+                                // batch is queued before the push, so `total` is
+                                // not yet known here).
+                                let bind_offset = if frame_has_data {
+                                    scm_bind_offset + 1
+                                } else {
+                                    scm_bind_offset
+                                };
+                                crate::syscall::scm_queue(peer_id, bind_offset, sender_fds);
+                                // Wake any poller/epoll_wait parked on the peer
+                                // fd so it re-evaluates and discovers the new
+                                // readable (ancillary) message immediately,
+                                // rather than waiting for the resync floor.
+                                // PENDING_SCM and the unix TABLE lock are both
+                                // already released here (scm_queue takes only
+                                // PENDING_SCM, briefly), so this honours the
+                                // drop-the-lock-before-ring discipline.
+                                crate::ipc::waitlist::ring_poll_bell_for(
+                                    crate::ipc::waitlist::PollBellSource::UnixWrite);
                             }
                         }
+                    }
+                }
+            }
+            // Push the frame's data bytes AFTER the SCM_RIGHTS batch is queued
+            // (see the ordering note above): the batch is now in PENDING_SCM, so
+            // the instant these bytes become readable a peer recvmsg(2) will cap
+            // its read at the batch and deliver it.  `total` accumulates the
+            // bytes accepted by the transport for the syscall return value.
+            for iov in &iovecs_owned {
+                let base = iov[0] as *const u8;
+                let slen = iov[1] as usize;
+                if slen == 0 { continue; }
+                // SMAP bracket — slice materialises against the user iov
+                // buffer; copy into a kernel Vec immediately so the net
+                // layer's send (which may take locks / queue) runs
+                // outside AC=1.
+                let data_owned: alloc::vec::Vec<u8> = {
+                    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+                    unsafe { core::slice::from_raw_parts(base, slen) }.to_vec()
+                };
+                let data: &[u8] = &data_owned;
+                if crate::syscall::is_unix_socket_fd(pid, fd) {
+                    let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
+                    match crate::net::unix::write(unix_id, data) {
+                        n if n >= 0 => total += n as usize,
+                        e => return e,
+                    }
+                } else {
+                    if !crate::syscall::is_socket_fd(pid, fd) { return -9; }
+                    let socket_id = crate::syscall::get_socket_id(pid, fd);
+                    match crate::net::socket::socket_send(socket_id, data) {
+                        Ok(n) => total += n,
+                        Err("EPIPE") => return -32,
+                        Err(_) => return -104,
                     }
                 }
             }
@@ -2207,13 +2356,47 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let bytes_read: i64;
             if crate::syscall::is_unix_socket_fd(pid, fd) {
                 let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
+                // Cap the STREAM drain at the next pending SCM_RIGHTS batch
+                // boundary so this recvmsg does not consume bytes PAST the
+                // stream position where the next fd batch becomes deliverable.
+                // `scm_dequeue` (below) hands back exactly ONE batch per
+                // recvmsg; a byte-stream reader reads up to a large fixed buffer
+                // per call, so without this cap a single recvmsg can drain bytes
+                // spanning several fd-bearing frames while only one batch's fds
+                // are delivered — the reader then parses a later frame whose
+                // descriptors were silently withheld and aborts ("needs
+                // unreceived descriptors").  Capping at the next batch offset
+                // makes each recvmsg return the bytes up to exactly one fd batch
+                // and deliver that batch, then stop — the AF_UNIX stream recv
+                // stops at each fd-bearing message boundary (recvmsg(2), unix(7)
+                // SCM_RIGHTS: one message's ancillary fds per recv).  Datagram /
+                // SEQPACKET reads are message-framed already, so the cap only
+                // bites the byte-stream STREAM kind; it never shrinks the read
+                // below 1 byte (the next-batch offset is strictly > consumed).
+                let eff_cap = if crate::net::unix::kind(unix_id)
+                    == crate::net::unix::SockKind::Stream
+                {
+                    let consumed = crate::net::unix::recv_consumed(unix_id);
+                    match crate::syscall::scm_next_batch_offset(unix_id, consumed) {
+                        Some(next) => {
+                            // next > consumed (guaranteed by the helper); the
+                            // gap is the bytes the reader may drain before the
+                            // batch at `next` must be delivered on its own recv.
+                            let gap = (next - consumed) as usize;
+                            cap.min(gap)
+                        }
+                        None => cap,
+                    }
+                } else {
+                    cap
+                };
                 // SMAP bracket — read_msg writes through `buf` into user
                 // memory.  Held for the call duration; we drop it before
                 // the subsequent allocations / table walks below.
                 const MSG_TRUNC: u32 = 0x20;
                 bytes_read = {
                     let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
-                    let buf = unsafe { core::slice::from_raw_parts_mut(dst, cap) };
+                    let buf = unsafe { core::slice::from_raw_parts_mut(dst, eff_cap) };
                     match crate::net::unix::read_msg(unix_id, buf) {
                         Ok((n, discarded)) => {
                             // Overwrite (not OR) msg_flags — recvmsg(2) man page.
@@ -2224,12 +2407,46 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             }
                             n as i64
                         }
+                        // EAGAIN on an empty data ring is *not* the final
+                        // answer when a deliverable SCM_RIGHTS batch is
+                        // queued: a control-only ancillary frame (iov_len==0)
+                        // is a readable message that recvmsg(2) must return
+                        // with 0 data bytes and the cmsg attached (recvmsg(2),
+                        // unix(7), POSIX.1-2017 SCM_RIGHTS).  Promote to a
+                        // 0-byte success so the SCM-delivery block below runs;
+                        // msg_flags clears (no MSG_TRUNC for an empty read).
+                        Err(-11) if crate::syscall::has_scm_deliverable(
+                            unix_id, crate::net::unix::recv_consumed(unix_id)) =>
+                        {
+                            unsafe {
+                                let flags_ptr = (arg2 + 48) as *mut u32;
+                                core::ptr::write_unaligned(flags_ptr, 0u32);
+                            }
+                            0i64
+                        }
                         Err(e) => e,
                     }
                 };
                 // Deliver pending SCM_RIGHTS fds into receiver's fd table.
+                // Bound the batch to the reader's now-current stream position
+                // (recv_consumed) so an earlier data-only frame's reader does
+                // not pick up a later frame's fds.
                 if bytes_read >= 0 {
-                    if let Some(scm_fds) = crate::syscall::scm_dequeue(unix_id) {
+                    let consumed = crate::net::unix::recv_consumed(unix_id);
+                    if let Some(scm_fds) = crate::syscall::scm_dequeue(unix_id, consumed) {
+                        // Regular-file / memfd descriptors were pinned at enqueue
+                        // (PENDING_SCM holds an inode reference invisible to the
+                        // VFS fd-table scan).  Once installed in the receiver's
+                        // fd table below, the slot itself keeps the inode alive,
+                        // so the in-flight pin can be released.  Snapshot the
+                        // (mount_idx, inode) pairs BEFORE the descriptors are
+                        // moved into the table; unpin AFTER PROCESS_TABLE is
+                        // dropped (unpin_inode also takes PROCESS_TABLE).
+                        let to_unpin: Vec<(usize, u64)> = scm_fds.iter()
+                            .filter(|f| f.file_type == crate::vfs::FileType::RegularFile
+                                        && f.mount_idx != usize::MAX)
+                            .map(|f| (f.mount_idx, f.inode))
+                            .collect();
                         // Allocate fds in the receiver's process.
                         let new_fd_nums: Vec<i32> = {
                             let mut procs = crate::proc::PROCESS_TABLE.lock();
@@ -2248,6 +2465,11 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                                 }).collect()
                             } else { Vec::new() }
                         };
+                        // Balance the enqueue-time pin now that the fd-table slot
+                        // holds the reference (PROCESS_TABLE lock released above).
+                        for (m, ino) in to_unpin {
+                            crate::vfs::unpin_inode(m, ino);
+                        }
                         // Write SCM_RIGHTS cmsghdr into msg_control.  All
                         // reads/writes here target user memory — single
                         // SMAP guard spanning the whole block.
@@ -2303,18 +2525,25 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             } else {
                 if !crate::syscall::is_socket_fd(pid, fd) { return -9; }
                 let socket_id = crate::syscall::get_socket_id(pid, fd);
-                bytes_read = match crate::net::socket::socket_recv(socket_id) {
-                    Ok(data) => {
-                        if data.is_empty() { 0 }
-                        else {
-                            let n = data.len().min(cap);
-                            unsafe {
-                                let _g = crate::arch::x86_64::smap::UserGuard::new();
-                                core::ptr::copy_nonoverlapping(data.as_ptr(), dst, n);
-                            }
-                            n as i64
+                // Per recvmsg(2) / IEEE 1003.1 §recv: on a non-blocking
+                // socket an empty receive queue must return -1/EAGAIN, while
+                // an orderly peer shutdown (EOF) returns 0.  Collapsing both
+                // to 0 (the prior `Ok(empty) => 0`) lied to the caller: a
+                // polled IPC reactor read the 0 as a readable edge and
+                // re-issued recvmsg in a tight loop, never yielding.  Use the
+                // status-aware recv so the two cases get their correct
+                // returns (WouldBlock → -EAGAIN, Eof → 0).
+                bytes_read = match crate::net::socket::socket_recv_status(socket_id) {
+                    Ok(crate::net::socket::RecvOutcome::Data(data)) => {
+                        let n = data.len().min(cap);
+                        unsafe {
+                            let _g = crate::arch::x86_64::smap::UserGuard::new();
+                            core::ptr::copy_nonoverlapping(data.as_ptr(), dst, n);
                         }
+                        n as i64
                     }
+                    Ok(crate::net::socket::RecvOutcome::Eof) => 0,
+                    Ok(crate::net::socket::RecvOutcome::WouldBlock) => -11, // EAGAIN
                     Err(_) => -11,
                 };
             }
@@ -2853,6 +3082,24 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             parent_tid,
                         );
 
+                        // CLONE_VFORK prepare-to-wait: register the
+                        // child→parent wake mapping BEFORE unblocking the
+                        // child.  `wake_vfork_parent()` (called from the
+                        // child's execve(2)/exit path) acts only if it
+                        // observes `vfork_parent_tid == Some(parent_tid)`,
+                        // so the mapping must be visible before the child
+                        // can run — otherwise the child reads the initial
+                        // `None`, no-ops, and the parent parks with no waker
+                        // (lost wakeup, masked today only by the 500-tick
+                        // timeout below).  Per POSIX vfork(2): the parent
+                        // resumes only after the child execs or exits.
+                        if is_vfork {
+                            let mut threads = crate::proc::THREAD_TABLE.lock();
+                            if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
+                                t.vfork_parent_tid = Some(parent_tid);
+                            }
+                        }
+
                         // Unblock the child so the scheduler can run it.
                         crate::proc::unblock_process(child_pid);
 
@@ -2861,17 +3108,44 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         // needs the parent to block so the child can set up IPC first.
                         // Use a 500-tick timeout (~5 seconds) as a safety net.
                         if is_vfork {
+                            // Commit Blocked, then recheck the completion
+                            // token under the SAME THREAD_TABLE hold.  The
+                            // child's `wake_vfork_parent()` clears
+                            // `vfork_parent_tid` to `None` when it consumes
+                            // the token; if the child already ran (it execed
+                            // or exited in the unblock→here window), the
+                            // token is already `None` and its Blocked→Ready
+                            // flip raced ahead of our `Blocked` commit, so we
+                            // must NOT park — revert to Ready and fall
+                            // through.  Lock discipline: THREAD_TABLE only,
+                            // never nested with PROCESS_TABLE; same lock the
+                            // wake side takes, so the recheck is serialized
+                            // against the child's clear+flip.
                             let mut threads = crate::proc::THREAD_TABLE.lock();
-                            if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
-                                t.vfork_parent_tid = Some(parent_tid);
-                            }
+                            let child_completed = threads.iter()
+                                .find(|t| t.tid == child_tid)
+                                .map(|t| t.vfork_parent_tid.is_none())
+                                .unwrap_or(true); // child gone (exited+reaped) ⇒ completed
                             if let Some(t) = threads.iter_mut().find(|t| t.tid == parent_tid) {
-                                t.state = crate::proc::ThreadState::Blocked;
-                                // Timeout: wake after 500 ticks (~5s) even if child hasn't signaled
-                                let now = crate::arch::x86_64::irq::get_ticks();
-                                t.wake_tick = now.saturating_add(500);
+                                if child_completed {
+                                    // Race detected: wake already happened (or
+                                    // child is gone).  Do not park.
+                                    t.state = crate::proc::ThreadState::Ready;
+                                    t.wake_tick = u64::MAX;
+                                } else {
+                                    t.state = crate::proc::ThreadState::Blocked;
+                                    // Timeout backstop: wake after 500 ticks (~5s)
+                                    // even if the child never signals.
+                                    let now = crate::arch::x86_64::irq::get_ticks();
+                                    t.wake_tick = now.saturating_add(500);
+                                }
                             }
                             drop(threads);
+                            if child_completed {
+                                // Child already completed; skip the park
+                                // entirely and return as if resumed.
+                                return child_pid as i64;
+                            }
                             // VFORK/CANARY pre-block snapshot — see helper.
                             vfork_canary_snapshot("pre_block.clone", pid as u32, parent_tid);
                             // Axis-N+1 three-channel stack-provenance snapshot
@@ -3983,21 +4257,46 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             child_tls_base,
                             if clone_flags & CLONE_SETTLS != 0 { "CLONE_SETTLS" } else { "parent" });
 
-                        // NOW unblock the child
-                        crate::proc::unblock_process(child_pid);
-
-                        // Block parent for vfork
+                        // CLONE_VFORK prepare-to-wait: register the
+                        // child→parent wake mapping BEFORE unblocking the
+                        // child, for the same lost-wakeup reason documented
+                        // at the clone(56) site above (wake_vfork_parent acts
+                        // only on `Some(parent_tid)`).  Per POSIX vfork(2).
                         if is_vfork {
                             let mut threads = crate::proc::THREAD_TABLE.lock();
                             if let Some(t) = threads.iter_mut().find(|t| t.tid == child_tid) {
                                 t.vfork_parent_tid = Some(parent_tid);
                             }
+                        }
+
+                        // NOW unblock the child
+                        crate::proc::unblock_process(child_pid);
+
+                        // Block parent for vfork
+                        if is_vfork {
+                            // Commit Blocked, then recheck the completion
+                            // token under the SAME THREAD_TABLE hold — see the
+                            // clone(56) site above for the full race analysis
+                            // and lock-ordering reasoning.
+                            let mut threads = crate::proc::THREAD_TABLE.lock();
+                            let child_completed = threads.iter()
+                                .find(|t| t.tid == child_tid)
+                                .map(|t| t.vfork_parent_tid.is_none())
+                                .unwrap_or(true); // child gone (exited+reaped) ⇒ completed
                             if let Some(t) = threads.iter_mut().find(|t| t.tid == parent_tid) {
-                                t.state = crate::proc::ThreadState::Blocked;
-                                let now = crate::arch::x86_64::irq::get_ticks();
-                                t.wake_tick = now.saturating_add(500);
+                                if child_completed {
+                                    t.state = crate::proc::ThreadState::Ready;
+                                    t.wake_tick = u64::MAX;
+                                } else {
+                                    t.state = crate::proc::ThreadState::Blocked;
+                                    let now = crate::arch::x86_64::irq::get_ticks();
+                                    t.wake_tick = now.saturating_add(500);
+                                }
                             }
                             drop(threads);
+                            if child_completed {
+                                return child_pid as i64;
+                            }
                             // VFORK/CANARY pre-block snapshot — see helper.
                             vfork_canary_snapshot("pre_block.clone3", pid as u32, parent_tid);
                             // Axis-N+1 three-channel stack-provenance snapshot
@@ -4798,10 +5097,25 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // -1 with errno=ENODATA, and poisoned pthread's internal tkill() usage.
         // See arch-syscall.h: 192 lgetxattr .. 199 fremovexattr; 200 tkill; 201 time.
         192 | 193 | 194 | 195 | 196 | 197 | 198 | 199 => -61, // ENODATA
-        // 200: tkill(tid, sig) — minimal stub: forward to tgkill in the current pgrp.
-        // Most modern code uses tgkill (234); tkill exists for pre-2.5.75 compat.
-        // Returning ENOSYS is safe because glibc's pthread_kill fallback handles it.
-        200 => -38, // ENOSYS
+        // 200: tkill(tid, sig) — send signal `sig` to the single thread `tid`.
+        // tkill(2) addresses a thread directly by its kernel thread id (the
+        // obsolete-but-still-used predecessor of tgkill(2)).  musl's raise(3)
+        // and the abort(3) re-raise path issue tkill(self->tid, sig); returning
+        // ENOSYS here breaks that path (a crashing thread cannot re-raise to
+        // produce its default-action termination).  AstryxOS delivers signals
+        // at process granularity (one signal_state per process), so resolve the
+        // target thread's owning process and dispatch via the same path as
+        // tgkill(2) (signal::kill).  Per tkill(2): ESRCH if no such thread.
+        200 => {
+            let tid = arg1;
+            let sig = arg2 as u8;
+            let owner_pid = crate::proc::pid_for_tid(tid);
+            if owner_pid == 0 {
+                -3 // ESRCH — no thread carries this tid
+            } else {
+                crate::signal::kill(owner_pid, sig)
+            }
+        }
         // 201: time(tloc) — seconds since Epoch; optionally write to *tloc.
         // glibc calls this as a vDSO fallback; returning an error here makes
         // `time(NULL)` appear to fail with the kernel's errno, confusing callers.
@@ -5195,7 +5509,13 @@ fn sys_select_linux(
                 || crate::ipc::pipe::pipe_writer_closed(pid_id)
         } else if crate::syscall::is_unix_socket_fd(pid, fd) {
             let uid = crate::syscall::get_unix_socket_id(pid, fd);
-            crate::net::unix::has_data(uid) || crate::net::unix::has_pending(uid)
+            // A reached SCM_RIGHTS batch (control-only fd handoff, iov_len==0)
+            // is a readable message per recvmsg(2) / unix(7) / POSIX.1-2017,
+            // even with zero data bytes — surface it as select(2) readable.
+            crate::net::unix::has_data(uid)
+                || crate::net::unix::has_pending(uid)
+                || crate::syscall::has_scm_deliverable(
+                    uid, crate::net::unix::recv_consumed(uid))
         } else if crate::syscall::is_socket_fd(pid, fd) {
             crate::net::socket::socket_has_data(crate::syscall::get_socket_id(pid, fd))
         } else if crate::syscall::is_timerfd_fd(pid, fd) {
@@ -5685,8 +6005,14 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
         return ret;
     } else if crate::syscall::is_socket_fd(pid, fd as usize) {
         let socket_id = crate::syscall::get_socket_id(pid, fd as usize);
-        return match crate::net::socket::socket_recv(socket_id) {
-            Ok(data) => {
+        // Per read(2) / recv(2) / IEEE 1003.1: an empty receive on a
+        // non-blocking socket is -1/EAGAIN; an orderly peer shutdown is a
+        // 0-byte EOF.  The status-aware recv keeps the two apart so a polled
+        // reader does not mistake an empty queue for EOF and re-read in a
+        // busy loop (mirrors the pipe path above, which already separates
+        // EOF from would-block).
+        return match crate::net::socket::socket_recv_status(socket_id) {
+            Ok(crate::net::socket::RecvOutcome::Data(data)) => {
                 let n = data.len().min(count);
                 unsafe {
                     let _g = crate::arch::x86_64::smap::UserGuard::new();
@@ -5694,6 +6020,8 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
                 }
                 n as i64
             }
+            Ok(crate::net::socket::RecvOutcome::Eof) => 0,
+            Ok(crate::net::socket::RecvOutcome::WouldBlock) => -11, // EAGAIN
             Err(_) => -11, // EAGAIN
         };
     } else if crate::syscall::is_eventfd_fd(pid, fd as usize) {
@@ -9360,6 +9688,19 @@ fn sys_memfd_create(_name: u64, flags: u64) -> i64 {
         }
     }
 
+    // Per memfd_create(2): "The file is automatically removed (unlinked) ...
+    // The memory is freed when all references to the file are dropped."  Unlink
+    // the backing entry now so the memfd is a true anonymous inode with no
+    // visible name; the open fd (and any dup / fork / SCM_RIGHTS-passed copy)
+    // holds it alive via the kernel's unlink-on-last-close machinery, and it is
+    // freed once the last reference closes.  This makes a memfd handed between
+    // processes (the Mozilla shared-memory / CrossProcessPaint surface fd) safe
+    // *by construction* — the inode cannot outlive its last holder and leak,
+    // nor be freed while an SCM_RIGHTS-passed copy is in flight (PINNED_INODES).
+    // remove() on an open file performs a deferred delete, so the just-opened
+    // fd stays fully usable.
+    let _ = crate::vfs::remove(path_str);
+
     fd_num as i64
 }
 
@@ -9622,7 +9963,15 @@ fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
                     // stuck-producer pattern `epoll(7)` / `poll(2)` avoid.
                     let mut ev = if crate::net::unix::writable(inode) { EPOLLOUT } else { 0 };
                     let has_d = crate::net::unix::has_data(inode);
-                    if has_d {
+                    // A reached SCM_RIGHTS batch confers EPOLLIN even with an
+                    // empty data ring: a control-only ancillary frame
+                    // (iov_len==0) IS a readable message per recvmsg(2) /
+                    // unix(7) / POSIX.1-2017 SCM_RIGHTS, and epoll_wait(2)
+                    // must report it so the receiver recvmsg's the fd instead
+                    // of parking forever on a pure fd handoff.
+                    let has_scm = crate::syscall::has_scm_deliverable(
+                        inode, crate::net::unix::recv_consumed(inode));
+                    if has_d || has_scm {
                         ev |= EPOLLIN;
                     }
                     // `epoll(7)` distinguishes a read-side half-close from a
