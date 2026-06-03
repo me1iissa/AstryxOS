@@ -2634,6 +2634,24 @@ pub fn run() -> ! {
     total += 1;
     if test_291_scm_coalesced_stream_read_cap() { passed += 1; }
 
+    // ── Test 292: recvmsg short cbuf — MSG_CTRUNC + partial-fit SCM install ─
+    // When a recvmsg(2) SCM_RIGHTS batch of K fds does not fit the caller's
+    // msg_control buffer, exactly the fds that FIT are installed + reported in
+    // the cmsg, msg_controllen reflects the bytes written, MSG_CTRUNC is set,
+    // and the un-installed remainder is re-queued (not orphaned) so a later
+    // larger-buffer recvmsg delivers it.  Refs: recvmsg(2) (MSG_CTRUNC),
+    // cmsg(3), unix(7) SCM_RIGHTS.
+    total += 1;
+    if test_292_recvmsg_ctrunc_partial_scm_install() { passed += 1; }
+
+    // ── Test 293: epoll EPOLLIN parity on a listening AF_UNIX socket ───────
+    // A listening AF_UNIX socket with a queued connection is read-ready;
+    // epoll_wait(2) must report EPOLLIN for it just as poll(2)/select(2) do
+    // (both gate on the listen accept backlog).  Refs: epoll(7), accept(2),
+    // poll(2), unix(7).
+    total += 1;
+    if test_293_epoll_listening_unix_has_pending() { passed += 1; }
+
     // ── Test 283: stack-prov main-stack TOP-window argv-writer capture ──
     // GATE-A blind-spot closure (2026-05-30).  Only built when the
     // `stack-prov` diagnostic feature is on (CI smoke does not enable it);
@@ -46716,4 +46734,350 @@ fn test_291_scm_coalesced_stream_read_cap() -> bool {
     unix::close(b);
     test_pass!("coalesced stream read delivers one fd batch per recv (Test 291)");
     true
+}
+
+// ── Test 292: recvmsg short control buffer — MSG_CTRUNC + partial-fit install ─
+//
+// When a recvmsg(2) carries an SCM_RIGHTS batch of K fds but the caller's
+// `msg_control` buffer can hold only K-1, recvmsg(2) / cmsg(3) require:
+//   * exactly the K-1 fds that FIT are installed in the receiver fd table and
+//     reported back in the cmsg (cmsg_len = CMSG_LEN((K-1)*4) = 16 + (K-1)*4),
+//   * msg_controllen is set to the bytes actually written (16 + (K-1)*4),
+//   * MSG_CTRUNC (0x8) is raised in msg_flags to signal the truncation, and
+//   * the un-installed remainder is NOT orphaned (CWE-772): a follow-up
+//     recvmsg with an adequate control buffer must deliver the leftover fd.
+//
+// Before this fix the kernel installed EVERY fd of the batch unconditionally,
+// then — finding the buffer too small — wrote NO cmsg, set msg_controllen=0,
+// and set NO MSG_CTRUNC.  Userspace saw CMSG_FIRSTHDR()==NULL (zero fds) with
+// no truncation signal while all K fds silently occupied receiver fd-table
+// slots (leaked).  This drives the real recvmsg (nr=47) syscall through
+// dispatch_linux_kernel and asserts the corrected behaviour end-to-end.
+//
+// Refs: recvmsg(2) (MSG_CTRUNC), cmsg(3) (CMSG_LEN/CMSG_SPACE), unix(7)
+// SCM_RIGHTS, POSIX.1-2017 §2.14.
+fn test_292_recvmsg_ctrunc_partial_scm_install() -> bool {
+    use crate::net::unix;
+    test_header!("recvmsg short control buffer: MSG_CTRUNC + partial-fit SCM install (Test 292)");
+
+    const MSG_CTRUNC: u32 = 0x8;
+    const K: usize = 3; // fds in the batch; buffer will hold K-1 = 2.
+
+    // STREAM pair; receiver is `b`.  Allocate process-level fds so the recvmsg
+    // syscall can find the socket and install delivered descriptors.
+    let (id_a, id_b) = unix::socketpair(unix::SockKind::Stream,
+        unix::PeerCreds { pid: 0, uid: 0, gid: 0 });
+    if id_a == u64::MAX || id_b == u64::MAX {
+        test_fail!("recvmsg_ctrunc", "socketpair returned MAX");
+        return false;
+    }
+    let pid = crate::proc::current_pid_lockless();
+    let fd_b = crate::syscall::alloc_unix_socket_fd(pid, id_b, false, false);
+    if fd_b < 0 {
+        test_fail!("recvmsg_ctrunc", "alloc_unix_socket_fd(b) = {}", fd_b);
+        unix::close(id_a); unix::close(id_b);
+        return false;
+    }
+
+    // Distinguishable throw-away descriptors.  mount_idx == usize::MAX keeps
+    // them out of the inode-pin / unix-close machinery so the test exercises
+    // ONLY the fd-table install + cmsg-write + requeue logic.
+    let mk_fd = |ino: u64| crate::vfs::FileDescriptor {
+        inode: ino, mount_idx: usize::MAX, offset: 0, flags: 0,
+        file_type: crate::vfs::FileType::RegularFile,
+        is_console: false, cloexec: false,
+        open_path: alloc::string::String::new(),
+    };
+
+    // Queue a control-ONLY batch of K fds bound to the current stream tail, so
+    // it is immediately deliverable as a 0-byte readable message (the recvmsg
+    // data path returns EAGAIN on the empty ring and is promoted to a 0-byte
+    // success because a deliverable SCM batch is queued).  Tag fds 0xC0..0xC2.
+    let tail = unix::enqueue_offset_for(id_b);
+    crate::syscall::scm_queue(id_b, tail,
+        alloc::vec![mk_fd(0xC0), mk_fd(0xC1), mk_fd(0xC2)]);
+    if !crate::syscall::has_scm_deliverable(id_b, unix::recv_consumed(id_b)) {
+        test_fail!("recvmsg_ctrunc", "K-fd batch not deliverable after enqueue");
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_b as u64, 0, 0, 0, 0, 0);
+        unix::close(id_a); unix::close(id_b);
+        return false;
+    }
+
+    // ── recvmsg #1: control buffer sized for K-1 fds = 16 + 2*4 = 24 bytes ──
+    // msghdr (x86_64): off16=msg_iov, off24=msg_iovlen, off32=msg_control,
+    // off40=msg_controllen, off48=msg_flags.  Flat [u64;7] covers off 0..55.
+    let mut rxbuf = [0u8; 8];
+    let mut iov: [u64; 2] = [rxbuf.as_mut_ptr() as u64, 8];
+    let mut ctrl1 = [0u8; 24]; // room for exactly K-1 = 2 fds
+    let mut hdr = [0u64; 7];
+    hdr[2] = iov.as_mut_ptr() as u64;      // msg_iov     (off 16)
+    hdr[3] = 1u64;                         // msg_iovlen  (off 24)
+    hdr[4] = ctrl1.as_mut_ptr() as u64;    // msg_control (off 32)
+    hdr[5] = ctrl1.len() as u64;           // msg_controllen (off 40)
+    hdr[6] = 0;                            // msg_flags   (off 48)
+
+    let ret1 = crate::syscall::dispatch_linux_kernel(
+        47, fd_b as u64, hdr.as_mut_ptr() as u64, 0, 0, 0, 0);
+    if ret1 != 0 {
+        test_fail!("recvmsg_ctrunc", "recvmsg #1 returned {} (want 0 data bytes)", ret1);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_b as u64, 0, 0, 0, 0, 0);
+        unix::close(id_a); unix::close(id_b);
+        return false;
+    }
+
+    let controllen1 = hdr[5] as usize;
+    let flags1 = (hdr[6] & 0xFFFF_FFFF) as u32;
+    // cmsghdr: cmsg_len (u64) @0, cmsg_level (i32) @8, cmsg_type (i32) @12,
+    //          fd array starting @16.
+    let cmsg_len1 = u64::from_le_bytes(ctrl1[0..8].try_into().unwrap()) as usize;
+    let cmsg_level1 = i32::from_le_bytes(ctrl1[8..12].try_into().unwrap());
+    let cmsg_type1 = i32::from_le_bytes(ctrl1[12..16].try_into().unwrap());
+    let fd0 = i32::from_le_bytes(ctrl1[16..20].try_into().unwrap());
+    let fd1 = i32::from_le_bytes(ctrl1[20..24].try_into().unwrap());
+
+    // K-1 fds must fit: msg_controllen == 16 + 2*4 == 24, cmsg_len matches.
+    if controllen1 != 16 + (K - 1) * 4 {
+        test_fail!("recvmsg_ctrunc",
+            "msg_controllen #1 = {} (want {})", controllen1, 16 + (K - 1) * 4);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_b as u64, 0, 0, 0, 0, 0);
+        unix::close(id_a); unix::close(id_b);
+        return false;
+    }
+    if cmsg_len1 != 16 + (K - 1) * 4 || cmsg_level1 != 1 || cmsg_type1 != 1 {
+        test_fail!("recvmsg_ctrunc",
+            "cmsg #1 hdr wrong: len={} level={} type={} (want len={} SOL_SOCKET=1 SCM_RIGHTS=1)",
+            cmsg_len1, cmsg_level1, cmsg_type1, 16 + (K - 1) * 4);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_b as u64, 0, 0, 0, 0, 0);
+        unix::close(id_a); unix::close(id_b);
+        return false;
+    }
+    // MSG_CTRUNC must be set (the third fd did not fit).
+    if flags1 & MSG_CTRUNC == 0 {
+        test_fail!("recvmsg_ctrunc",
+            "MSG_CTRUNC not set in msg_flags={:#010x} after short-buffer recvmsg", flags1);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_b as u64, 0, 0, 0, 0, 0);
+        unix::close(id_a); unix::close(id_b);
+        return false;
+    }
+    // The reported fds must be REAL installed slots in the receiver fd table,
+    // pointing at the first two batch inodes (0xC0, 0xC1).  Verify directly.
+    let installed_ok = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid).map(|p| {
+            let a_ok = p.file_descriptors.get(fd0 as usize)
+                .and_then(|o| o.as_ref()).map(|f| f.inode) == Some(0xC0);
+            let b_ok = p.file_descriptors.get(fd1 as usize)
+                .and_then(|o| o.as_ref()).map(|f| f.inode) == Some(0xC1);
+            a_ok && b_ok
+        }).unwrap_or(false)
+    };
+    if !installed_ok {
+        test_fail!("recvmsg_ctrunc",
+            "cmsg fds [{},{}] do not resolve to installed inodes [0xC0,0xC1]", fd0, fd1);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd0 as u64, 0, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd1 as u64, 0, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_b as u64, 0, 0, 0, 0, 0);
+        unix::close(id_a); unix::close(id_b);
+        return false;
+    }
+    test_println!("  recvmsg #1: installed 2 fds [{},{}]=inodes[0xC0,0xC1], controllen={}, MSG_CTRUNC set ✓",
+        fd0, fd1, controllen1);
+
+    // ── recvmsg #2: adequate buffer must deliver the leftover fd (no leak) ──
+    // The remainder was re-queued at the SAME byte offset, so it is still
+    // deliverable; a larger control buffer adopts it.
+    let mut ctrl2 = [0u8; 64];
+    let mut hdr2 = [0u64; 7];
+    hdr2[2] = iov.as_mut_ptr() as u64;
+    hdr2[3] = 1u64;
+    hdr2[4] = ctrl2.as_mut_ptr() as u64;
+    hdr2[5] = ctrl2.len() as u64;
+    hdr2[6] = 0;
+
+    let ret2 = crate::syscall::dispatch_linux_kernel(
+        47, fd_b as u64, hdr2.as_mut_ptr() as u64, 0, 0, 0, 0);
+    if ret2 != 0 {
+        test_fail!("recvmsg_ctrunc", "recvmsg #2 returned {} (want 0)", ret2);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd0 as u64, 0, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd1 as u64, 0, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_b as u64, 0, 0, 0, 0, 0);
+        unix::close(id_a); unix::close(id_b);
+        return false;
+    }
+    let controllen2 = hdr2[5] as usize;
+    let flags2 = (hdr2[6] & 0xFFFF_FFFF) as u32;
+    let cmsg_len2 = u64::from_le_bytes(ctrl2[0..8].try_into().unwrap()) as usize;
+    let fd2 = i32::from_le_bytes(ctrl2[16..20].try_into().unwrap());
+
+    if controllen2 != 16 + 4 || cmsg_len2 != 16 + 4 {
+        test_fail!("recvmsg_ctrunc",
+            "recvmsg #2 controllen={} cmsg_len={} (want {} for the 1 leftover fd)",
+            controllen2, cmsg_len2, 16 + 4);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd0 as u64, 0, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd1 as u64, 0, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd2 as u64, 0, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_b as u64, 0, 0, 0, 0, 0);
+        unix::close(id_a); unix::close(id_b);
+        return false;
+    }
+    if flags2 & MSG_CTRUNC != 0 {
+        test_fail!("recvmsg_ctrunc",
+            "recvmsg #2 spuriously set MSG_CTRUNC (flags={:#010x}) for a fitting buffer", flags2);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd0 as u64, 0, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd1 as u64, 0, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd2 as u64, 0, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_b as u64, 0, 0, 0, 0, 0);
+        unix::close(id_a); unix::close(id_b);
+        return false;
+    }
+    // The leftover fd must resolve to the third batch inode (0xC2) — proving
+    // the remainder was re-queued, not orphaned.
+    let leftover_ok = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        procs.iter().find(|p| p.pid == pid)
+            .and_then(|p| p.file_descriptors.get(fd2 as usize)?.as_ref())
+            .map(|f| f.inode) == Some(0xC2)
+    };
+    if !leftover_ok {
+        test_fail!("recvmsg_ctrunc",
+            "recvmsg #2 leftover fd {} does not resolve to inode 0xC2 (remainder lost)", fd2);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd0 as u64, 0, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd1 as u64, 0, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd2 as u64, 0, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_b as u64, 0, 0, 0, 0, 0);
+        unix::close(id_a); unix::close(id_b);
+        return false;
+    }
+    // And nothing should remain queued for the receiver.
+    if crate::syscall::has_scm_deliverable(id_b, unix::recv_consumed(id_b)) {
+        test_fail!("recvmsg_ctrunc", "batch still deliverable after both recvmsgs (leak)");
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd0 as u64, 0, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd1 as u64, 0, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd2 as u64, 0, 0, 0, 0, 0);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_b as u64, 0, 0, 0, 0, 0);
+        unix::close(id_a); unix::close(id_b);
+        return false;
+    }
+    test_println!("  recvmsg #2: delivered leftover fd {}=inode 0xC2, controllen={}, no MSG_CTRUNC (requeue, no leak) ✓",
+        fd2, controllen2);
+
+    // ── Cleanup ──────────────────────────────────────────────────────────────
+    let _ = crate::syscall::dispatch_linux_kernel(3, fd0 as u64, 0, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux_kernel(3, fd1 as u64, 0, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux_kernel(3, fd2 as u64, 0, 0, 0, 0, 0);
+    let _ = crate::syscall::dispatch_linux_kernel(3, fd_b as u64, 0, 0, 0, 0, 0);
+    unix::close(id_a);
+    unix::close(id_b);
+    test_pass!("recvmsg short control buffer: MSG_CTRUNC + partial-fit SCM install (Test 292)");
+    true
+}
+
+// ── Test 293: epoll EPOLLIN on a LISTENING AF_UNIX socket with a pending conn ─
+//
+// A listening AF_UNIX socket that has a queued (not-yet-accepted) connection is
+// read-ready: accept(2) will not block, and epoll(7)/poll(2)/select(2) must all
+// report the socket as readable.  `poll`/`select` already gate POLLIN on the
+// listen accept backlog (net::unix::has_pending → backlog_len > 0), but the
+// epoll readiness computation (epoll_poll_events) gated EPOLLIN only on
+// has_data || has_scm — so an epoll-driven accept loop never woke for an
+// incoming connection (POLLIN under poll/select, but no EPOLLIN under
+// epoll_wait).  This verifies the parity fix: epoll_poll_events must report
+// EPOLLIN for a listening socket once a connection is queued, exactly as
+// poll_revents does.  A connected socketpair (backlog_len == 0) is unaffected.
+//
+// Refs: epoll(7), accept(2), poll(2), unix(7).
+fn test_293_epoll_listening_unix_has_pending() -> bool {
+    use crate::net::unix;
+    use crate::ipc::epoll::EPOLLIN;
+    test_header!("epoll EPOLLIN parity on listening AF_UNIX with pending connection (Test 293)");
+
+    let creds = unix::PeerCreds { pid: 0, uid: 0, gid: 0 };
+    let pid = crate::proc::current_pid_lockless();
+
+    // Listening server socket bound to a test-private abstract-ish path.
+    let srv = unix::create(unix::SockKind::Stream, creds);
+    if srv == u64::MAX {
+        test_fail!("epoll_listen", "create(server) returned MAX");
+        return false;
+    }
+    const SRV_PATH: &[u8] = b"/test-293-epoll-listen.sock";
+    if unix::bind(srv, SRV_PATH) != 0 {
+        test_fail!("epoll_listen", "bind(server) failed");
+        unix::close(srv);
+        return false;
+    }
+    if unix::listen(srv) != 0 {
+        test_fail!("epoll_listen", "listen(server) failed");
+        unix::close(srv);
+        return false;
+    }
+
+    // Process-level fd for the listening socket so epoll_poll_events can find it.
+    let fd_srv = crate::syscall::alloc_unix_socket_fd(pid, srv, false, false);
+    if fd_srv < 0 {
+        test_fail!("epoll_listen", "alloc_unix_socket_fd(server) = {}", fd_srv);
+        unix::close(srv);
+        return false;
+    }
+
+    // Before any connect: no pending connection → epoll must NOT report EPOLLIN.
+    let ev_idle = crate::subsys::linux::syscall::epoll_poll_events(pid, fd_srv as usize);
+    if ev_idle & EPOLLIN != 0 {
+        test_fail!("epoll_listen",
+            "epoll_poll_events reported EPOLLIN ({:#06x}) on an idle listener (no pending conn)",
+            ev_idle);
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_srv as u64, 0, 0, 0, 0, 0);
+        unix::close(srv);
+        return false;
+    }
+    test_println!("  idle listener: epoll_poll_events={:#06x} (no EPOLLIN) ✓", ev_idle);
+
+    // Client connects → server backlog_len becomes 1 → has_pending(srv) == true.
+    let cli = unix::create(unix::SockKind::Stream, creds);
+    if cli == u64::MAX {
+        test_fail!("epoll_listen", "create(client) returned MAX");
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_srv as u64, 0, 0, 0, 0, 0);
+        unix::close(srv);
+        return false;
+    }
+    if unix::connect(cli, SRV_PATH, creds) != 0 {
+        test_fail!("epoll_listen", "connect(client) failed");
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_srv as u64, 0, 0, 0, 0, 0);
+        unix::close(cli);
+        unix::close(srv);
+        return false;
+    }
+    if !unix::has_pending(srv) {
+        test_fail!("epoll_listen", "has_pending(server) false after connect (test setup error)");
+        let _ = crate::syscall::dispatch_linux_kernel(3, fd_srv as u64, 0, 0, 0, 0, 0);
+        unix::close(cli);
+        unix::close(srv);
+        return false;
+    }
+
+    // The parity assertion: epoll_poll_events MUST now report EPOLLIN.
+    let ev_pending = crate::subsys::linux::syscall::epoll_poll_events(pid, fd_srv as usize);
+    let ok = ev_pending & EPOLLIN != 0;
+    if !ok {
+        test_fail!("epoll_listen",
+            "epoll_poll_events={:#06x} has NO EPOLLIN for a listener with a pending connection \
+             (poll/select would report POLLIN — epoll parity broken)",
+            ev_pending);
+    } else {
+        test_println!("  pending listener: epoll_poll_events={:#06x} (EPOLLIN set — parity with poll) ✓",
+            ev_pending);
+    }
+
+    // ── Cleanup ──────────────────────────────────────────────────────────────
+    // Drain the backlog so close() does not leave a dangling accept-side peer.
+    let acc = unix::accept(srv);
+    if acc >= 0 { unix::close(acc as u64); }
+    let _ = crate::syscall::dispatch_linux_kernel(3, fd_srv as u64, 0, 0, 0, 0, 0);
+    unix::close(cli);
+    unix::close(srv);
+
+    if ok {
+        test_pass!("epoll EPOLLIN parity on listening AF_UNIX with pending connection (Test 293)");
+    }
+    ok
 }
