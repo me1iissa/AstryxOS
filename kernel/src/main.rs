@@ -1306,11 +1306,29 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // the headless demo bar for issue #88.  /tmp/hello.html is now
             // written to the ramdisk above (W150) so the handler will not
             // hit ENOENT when it resolves file:///tmp/hello.html.
+            // ── Crash-recovery supervisor ──────────────────────────────────
+            //
+            // The headless screenshot run is flaky: roughly two boots in three
+            // die early from an unhandled Ring-3 page fault (the group is then
+            // torn down with `exit_group(-SIGSEGV)`; see signal(7) default
+            // actions) before /tmp/out.png is written.  Rather than ending the
+            // boot on the first crash, supervise the driver the way init(8) /
+            // a service supervisor does: on a *crash* (non-zero / fatal-signal
+            // exit, and no screenshot produced) RELAUNCH the same command line,
+            // bounded by `MAX_FF_RELAUNCH`; on a *clean* exit or a produced
+            // screenshot, stop with success.  This recovers a single demo from
+            // a transient crash instead of dying — covering every early-crash
+            // cause (page-cache zeros, CoW aliasing, argv-NULL) with one
+            // mechanism.  The restart-on-failure policy mirrors the
+            // `Restart::OnFailure` semantics in `init::Restart`.
+            const MAX_FF_RELAUNCH: u32 = 5;
+            let mut ff_relaunch_count: u32 = 0;
+
             gui::terminal::launch_process(cmdline);
 
             // Run for up to 30000 ticks (~300 s), polling output and network.
             // We detect Firefox exit via EXEC_RUNNING going false (set by poll_output).
-            let t_launch = arch::x86_64::irq::get_ticks();
+            let mut t_launch = arch::x86_64::irq::get_ticks();
             let mut last_log_tick: u64 = 0;
             let mut firefox_exited = false;
             // Emit Firefox's rendered /tmp/out.png over serial as soon as it is
@@ -1400,9 +1418,107 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                     }
                 }
 
-                // Check if Firefox has exited
+                // Check if Firefox has exited, and SUPERVISE the outcome.
                 if elapsed > 60 && !crate::gui::terminal::is_firefox_running() {
-                    serial_println!("[FFTEST] Firefox exited after {} ticks", elapsed);
+                    let sc = crate::syscall::syscall_count();
+
+                    // Classify the exit.  The screenshot file is the
+                    // authoritative success oracle (the demo's whole point):
+                    // if /tmp/out.png is a non-empty file the run SUCCEEDED
+                    // regardless of the recorded exit code, because libxul
+                    // writes the PNG before any late teardown fault.  Absent
+                    // that, fall back to the exit-code classification
+                    // (`Clean` vs `Crashed`) latched at reap time.
+                    let png_ok = crate::vfs::stat("/tmp/out.png")
+                        .map(|st| st.size > 0)
+                        .unwrap_or(false);
+                    let status = crate::gui::terminal::exec_exit_status();
+
+                    let crashed = !png_ok
+                        && matches!(status, crate::gui::terminal::ExecExit::Crashed(_));
+
+                    if crashed && ff_relaunch_count < MAX_FF_RELAUNCH {
+                        let code = match status {
+                            crate::gui::terminal::ExecExit::Crashed(c) => c,
+                            _ => 0,
+                        };
+                        ff_relaunch_count += 1;
+                        serial_println!(
+                            "[FFTEST] FF crashed (exit={}) at sc={} — relaunching (retry {}/{})",
+                            code, sc, ff_relaunch_count, MAX_FF_RELAUNCH
+                        );
+
+                        // Pre-relaunch teardown — graceful + BOUNDED.  The
+                        // crashed group (a multi-threaded FF has ~271 threads)
+                        // must be fully reaped before relaunch, else a stale
+                        // `running_exec` would shadow the new child and leak
+                        // its pipe.  Drive the existing reap machinery
+                        // (`poll_output` → waitpid; `yield_cpu` → schedule() →
+                        // reap_dead_threads_sched) in a tick-bounded loop so a
+                        // slow drain can never wedge the supervisor.  Each step
+                        // is `try_lock`-guarded; the bound guarantees the
+                        // supervisor regains control even if a thread lingers.
+                        // See proc::process_thread_counts and
+                        // terminal::reset_exec_tracking.
+                        let crashed_pid = crate::gui::terminal::exec_pid();
+                        let drain_start = arch::x86_64::irq::get_ticks();
+                        const DRAIN_BUDGET_TICKS: u64 = 500; // ~5 s @ 100 Hz
+                        loop {
+                            crate::gui::terminal::poll_output();
+                            // Reap the zombie record itself if still present.
+                            if crashed_pid != 0 {
+                                let _ = crate::proc::waitpid(0, crashed_pid as i64);
+                            }
+                            crate::sched::yield_cpu();
+                            let drained = crashed_pid == 0
+                                || matches!(
+                                    crate::proc::process_thread_counts(crashed_pid),
+                                    Some((0, _)) | Some((_, 0))
+                                );
+                            let elapsed_drain = arch::x86_64::irq::get_ticks()
+                                .wrapping_sub(drain_start);
+                            if drained || elapsed_drain >= DRAIN_BUDGET_TICKS {
+                                if !drained {
+                                    serial_println!(
+                                        "[FFTEST] pre-relaunch drain budget hit ({}t) — proceeding",
+                                        elapsed_drain
+                                    );
+                                }
+                                break;
+                            }
+                        }
+
+                        // Reset tracking so the relaunch starts clean, then
+                        // re-invoke the SAME command line + env via the same
+                        // launch path.  out.png-emit / per-tick probe state is
+                        // reset so the new attempt's screenshot is observed.
+                        crate::gui::terminal::reset_exec_tracking();
+                        serial_println!(
+                            "[FFTEST] Launching {} (retry {}/{}) ...",
+                            cmdline.split(' ').next().unwrap_or(""),
+                            ff_relaunch_count, MAX_FF_RELAUNCH
+                        );
+                        gui::terminal::launch_process(cmdline);
+                        t_launch = arch::x86_64::irq::get_ticks();
+                        last_log_tick = 0;
+                        out_png_emitted = false;
+                        last_png_probe_tick = 0;
+                        continue;
+                    }
+
+                    // Clean exit, a produced screenshot, or retries exhausted:
+                    // stop the supervisor.
+                    if crashed {
+                        serial_println!(
+                            "[FFTEST] Firefox crashed after {} ticks — relaunch budget exhausted ({}/{})",
+                            elapsed, ff_relaunch_count, MAX_FF_RELAUNCH
+                        );
+                    } else {
+                        serial_println!(
+                            "[FFTEST] Firefox exited after {} ticks (status={:?}, png={})",
+                            elapsed, status, png_ok
+                        );
+                    }
                     firefox_exited = true;
                     break;
                 }

@@ -27,6 +27,24 @@ static EXEC_RUNNING: AtomicBool = AtomicBool::new(false);
 /// therefore the earliest possible signal of process termination.
 static EXEC_PID: AtomicU64 = AtomicU64::new(0);
 
+/// Sentinel for "no exec exit code latched yet".  A live exec has not
+/// recorded a code; any value other than this is a real, observed exit
+/// status (including 0 for a clean exit).
+const NO_EXEC_EXIT: i64 = i64::MIN;
+
+/// Exit code of the most recently *reaped* async child, latched the instant
+/// `poll_output()` wins the `waitpid(2)` race.  A crash-recovery supervisor
+/// (the firefox-test watchdog) reads this AFTER it observes the child gone so
+/// it can discriminate a clean exit (code 0) from a fatal-signal teardown: a
+/// Ring-3 page fault with no user handler terminates the whole thread group
+/// with `exit_group(-SIGSEGV)`, mirroring the signal(7) default action
+/// ("terminate the process").  Without this latch the code is lost —
+/// `waitpid(2)` removes the zombie record, so a supervisor querying the
+/// process table after the reap finds nothing and cannot tell success from a
+/// crash.  `NO_EXEC_EXIT` until the first reap.
+static LAST_EXEC_EXIT_CODE: core::sync::atomic::AtomicI64 =
+    core::sync::atomic::AtomicI64::new(NO_EXEC_EXIT);
+
 use crate::wm::window::{self, WindowHandle};
 
 // ---------------------------------------------------------------------------
@@ -1079,6 +1097,111 @@ pub fn is_firefox_running() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Crash-recovery supervisor support
+// ---------------------------------------------------------------------------
+
+/// Classification of how the most recently launched async child terminated.
+///
+/// A crash-recovery supervisor (the firefox-test watchdog) uses this to decide
+/// whether to relaunch.  The discrimination follows the POSIX wait(2) /
+/// signal(7) model: a child that returns 0 exited cleanly; a child terminated
+/// by an unhandled fatal signal is reported here as `Crashed` so the supervisor
+/// can apply `OnFailure`-style restart semantics (restart only on failure —
+/// see init(8) / service-supervisor conventions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecExit {
+    /// Still running (or never launched): no terminal status yet.
+    Running,
+    /// Exited cleanly (exit_group(2) code 0).
+    Clean,
+    /// Terminated abnormally — non-zero code, including a negative
+    /// fatal-signal number such as -11 (SIGSEGV).  The wrapped value is the
+    /// recorded exit code.
+    Crashed(i64),
+}
+
+/// Snapshot the most recently launched child's terminal status.
+///
+/// Resolution order, most-authoritative first:
+///   1. If the child is still alive (`is_firefox_running()`), return `Running`.
+///   2. If `poll_output()` already reaped the zombie, use the latched code in
+///      `LAST_EXEC_EXIT_CODE` (set the instant `waitpid(2)` removed the record).
+///   3. Otherwise the process may be a not-yet-reaped Zombie — scan
+///      `PROCESS_TABLE` for `EXEC_PID` and read `exit_code` directly.
+///
+/// Returning `Running` when no status is available is the safe default: the
+/// supervisor only acts on a definite terminal state.
+pub fn exec_exit_status() -> ExecExit {
+    // 1. Still alive → no terminal status.
+    if is_firefox_running() {
+        return ExecExit::Running;
+    }
+
+    // 2. Latched code from a completed poll_output() reap.
+    let latched = LAST_EXEC_EXIT_CODE.load(Ordering::Acquire);
+    if latched != NO_EXEC_EXIT {
+        return if latched == 0 { ExecExit::Clean } else { ExecExit::Crashed(latched) };
+    }
+
+    // 3. Not yet reaped: read the Zombie's exit_code straight from the table.
+    let pid = EXEC_PID.load(Ordering::Acquire);
+    if pid != 0 {
+        if let Some(procs) = crate::proc::PROCESS_TABLE.try_lock() {
+            if let Some(p) = procs.iter().find(|p| p.pid == pid) {
+                if p.state == crate::proc::ProcessState::Zombie {
+                    let code = p.exit_code as i64;
+                    return if code == 0 { ExecExit::Clean } else { ExecExit::Crashed(code) };
+                }
+            }
+        }
+    }
+
+    // Gone from the table and nothing latched (e.g. a foreign reaper removed
+    // it).  Treat as a clean disappearance — the supervisor's out.png oracle
+    // is the tie-breaker for "did it actually succeed".
+    ExecExit::Clean
+}
+
+/// PID of the most recently launched async child (0 if none).  Exposed so the
+/// supervisor can drive a bounded reap of a crashed child before relaunch.
+pub fn exec_pid() -> u64 {
+    EXEC_PID.load(Ordering::Acquire)
+}
+
+/// Test-only: install a synthetic EXEC_PID and mark an exec "running" so
+/// `exec_exit_status()` resolves against a hand-built PROCESS_TABLE record.
+/// Clears the latched exit code so step 3 (the Zombie scan) is exercised.
+#[cfg(feature = "test-mode")]
+pub fn test_set_exec_pid(pid: u64) {
+    LAST_EXEC_EXIT_CODE.store(NO_EXEC_EXIT, Ordering::Release);
+    EXEC_PID.store(pid, Ordering::Release);
+    EXEC_RUNNING.store(true, Ordering::Release);
+}
+
+/// Forcibly reset the async-exec tracking so a relaunch starts from a clean
+/// slate.  Clears `EXEC_PID` / `EXEC_RUNNING`, the latched exit code, and the
+/// TERMINAL `running_exec` handle (closing its pipe reader if still open).
+///
+/// Used by the crash-recovery supervisor AFTER it has reaped a crashed child:
+/// without this, a stale `running_exec` from the dead process would shadow the
+/// freshly launched one and leak its pipe.  Idempotent and lock-safe (uses
+/// `try_lock` on TERMINAL; a momentarily-contended lock just leaves the handle
+/// for `poll_output()` to clear, which is harmless because the next
+/// `launch_process()` overwrites it).
+pub fn reset_exec_tracking() {
+    if let Some(mut guard) = TERMINAL.try_lock() {
+        if let Some(ref mut state) = *guard {
+            if let Some((_pid, pipe_id)) = state.running_exec.take() {
+                crate::ipc::pipe::pipe_close_reader(pipe_id);
+            }
+        }
+    }
+    EXEC_PID.store(0, Ordering::Release);
+    EXEC_RUNNING.store(false, Ordering::Release);
+    LAST_EXEC_EXIT_CODE.store(NO_EXEC_EXIT, Ordering::Release);
+}
+
+// ---------------------------------------------------------------------------
 // Public per-tick poll — called from the desktop loop
 // ---------------------------------------------------------------------------
 
@@ -1162,6 +1285,12 @@ pub fn poll_output() {
             state2.write_str_colored("\r\n", DEFAULT_FG);
         }
         state2.running_exec = None;
+        // Latch the reaped child's exit code BEFORE clearing EXEC_PID so a
+        // crash-recovery supervisor can read it after the zombie is gone.
+        // `code` here is the value `exit_group(2)` recorded — 0 for a clean
+        // exit, a negative signal number (e.g. -11 / -SIGSEGV) for a
+        // fatal-signal teardown.  See `LAST_EXEC_EXIT_CODE`.
+        LAST_EXEC_EXIT_CODE.store(code as i64, Ordering::Release);
         EXEC_PID.store(0, Ordering::Release);
         EXEC_RUNNING.store(false, Ordering::Release);
         state2.draw_prompt();
