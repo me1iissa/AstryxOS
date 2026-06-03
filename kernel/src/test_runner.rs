@@ -1690,6 +1690,24 @@ pub fn run() -> ! {
     total += 1;
     if test_shutdown_unconnected_tcp_enotconn() { passed += 1; }
 
+    // ── Tests 200–203: runtime IP-version toggle (Phase NDE-8) ───────────
+    total += 1;
+    if test_ipver_socket_af_inet6_gate() { passed += 1; }
+
+    total += 1;
+    if test_ipver_connect_af_inet6_enetunreach() { passed += 1; }
+
+    total += 1;
+    if test_ipver_procfs_disable_sysctl() { passed += 1; }
+
+    // The kdb net-ipver command test only compiles/runs when the kdb
+    // dispatcher feature is built in (CI uses plain test-mode without it).
+    #[cfg(feature = "kdb")]
+    {
+        total += 1;
+        if test_ipver_kdb_command() { passed += 1; }
+    }
+
     // ── Test 191: PF handler — failed FS read must not poison page cache ─
     total += 1;
     if test_pf_failed_read_no_cache_poison() { passed += 1; }
@@ -31741,6 +31759,294 @@ fn test_shutdown_unconnected_tcp_enotconn() -> bool {
     }
     test_println!("  socket_shutdown → -107 (ENOTCONN) ✓");
     test_pass!("shutdown — unconnected TCP returns -ENOTCONN");
+    true
+}
+
+// ── Tests 200–204: runtime IP-version toggle (Phase NDE-8) ──────────────────
+//
+// Feature: net::ipver lets the operator enable/disable an entire address
+// family at runtime.  IPv6 is OFF by default (no egress path), IPv4 ON.
+// Enforcement is checked at the socket(2)/connect(2) syscall surface, the
+// procfs disable_ipv6 sysctl, and the kdb net-ipver command.
+//
+// Public-spec anchors: socket(2) "EAFNOSUPPORT — the implementation does not
+// support the specified address family" (= the documented `ipv6.disable=1`
+// behaviour); the `net.ipv6.conf.all.disable_ipv6` sysctl (= ENETUNREACH on
+// egress for an already-open AF_INET6 socket); RFC 6724 address selection.
+
+// AF constants and errnos used across the IP-version tests.
+const AF_INET_T:  u64 = 2;
+const AF_INET6_T: u64 = 10;
+const SOCK_STREAM_T: u64 = 1;
+const EAFNOSUPPORT: i64 = -97;
+const ENETUNREACH:  i64 = -101;
+
+// Test 200: with IPv6 disabled (the default), socket(AF_INET6) → EAFNOSUPPORT;
+// after enabling it succeeds; AF_INET stays available throughout.
+fn test_ipver_socket_af_inet6_gate() -> bool {
+    test_header!("ip-version — socket(AF_INET6) gated by net::ipver (EAFNOSUPPORT)");
+    use crate::net::ipver;
+    use crate::subsys::linux::syscall::dispatch;
+
+    // Snapshot + force the documented default for a deterministic run.
+    let saved_v6 = ipver::ipv6_enabled();
+    ipver::set_ipv6_enabled(false);
+
+    // socket(AF_INET6, SOCK_STREAM, 0) must fail EAFNOSUPPORT while disabled.
+    let r_disabled = dispatch(41, AF_INET6_T, SOCK_STREAM_T, 0, 0, 0, 0);
+    if r_disabled != EAFNOSUPPORT {
+        ipver::set_ipv6_enabled(saved_v6);
+        test_fail!("ipver_sock6",
+            "socket(AF_INET6) with IPv6 disabled: expected -97 (EAFNOSUPPORT), got {}",
+            r_disabled);
+        return false;
+    }
+    test_println!("  socket(AF_INET6) [v6 off] → -97 EAFNOSUPPORT ✓");
+
+    // AF_INET stays available (IPv4 on by default).
+    let r_v4 = dispatch(41, AF_INET_T, SOCK_STREAM_T, 0, 0, 0, 0);
+    if r_v4 < 0 {
+        ipver::set_ipv6_enabled(saved_v6);
+        test_fail!("ipver_sock6",
+            "socket(AF_INET) should succeed (IPv4 enabled), got {}", r_v4);
+        return false;
+    }
+    // Close the fd we just allocated to avoid leaking it in the test process.
+    let _ = dispatch(3, r_v4 as u64, 0, 0, 0, 0, 0); // close(2)
+    test_println!("  socket(AF_INET) → fd {} ✓", r_v4);
+
+    // Enable IPv6, then socket(AF_INET6) must succeed.
+    ipver::set_ipv6_enabled(true);
+    let r_enabled = dispatch(41, AF_INET6_T, SOCK_STREAM_T, 0, 0, 0, 0);
+    let ok = r_enabled >= 0;
+    if ok {
+        let _ = dispatch(3, r_enabled as u64, 0, 0, 0, 0, 0); // close(2)
+        test_println!("  socket(AF_INET6) [v6 on] → fd {} ✓", r_enabled);
+    } else {
+        test_fail!("ipver_sock6",
+            "socket(AF_INET6) with IPv6 enabled: expected an fd ≥0, got {}",
+            r_enabled);
+    }
+
+    // Restore the default-off state for downstream tests.
+    ipver::set_ipv6_enabled(saved_v6);
+    if !ok { return false; }
+    test_pass!("ip-version — socket(AF_INET6) gated by net::ipver");
+    true
+}
+
+// Test 201: connect() to an AF_INET6 sockaddr with IPv6 disabled returns
+// ENETUNREACH (no fake-success).  Belt-and-suspenders for a socket created
+// before the family was disabled — here we build an AF_INET socket (IPv4 on)
+// and aim a connect at an AF_INET6 destination sockaddr, exercising the
+// destination-family gate in the connect(2) arm.
+fn test_ipver_connect_af_inet6_enetunreach() -> bool {
+    test_header!("ip-version — connect to AF_INET6 dest with IPv6 off → ENETUNREACH");
+    use crate::net::ipver;
+    use crate::subsys::linux::syscall::dispatch;
+
+    let saved_v6 = ipver::ipv6_enabled();
+    ipver::set_ipv6_enabled(false);
+
+    // Create an AF_INET socket to connect FROM (IPv4 is enabled).
+    let fd = dispatch(41, AF_INET_T, SOCK_STREAM_T, 0, 0, 0, 0);
+    if fd < 0 {
+        ipver::set_ipv6_enabled(saved_v6);
+        test_fail!("ipver_conn6", "setup socket(AF_INET) failed: {}", fd);
+        return false;
+    }
+
+    // Build a sockaddr_in6 on the kernel stack: { sin6_family=AF_INET6 (LE),
+    // sin6_port, sin6_flowinfo, sin6_addr[16], sin6_scope_id }.  Only the
+    // family field is inspected by the gate.  connect(2) reads sa_family at
+    // offset 0 (host LE u16).  28 bytes is the full sockaddr_in6 length.
+    let mut sa6 = [0u8; 28];
+    sa6[0] = (AF_INET6_T & 0xff) as u8;
+    sa6[1] = ((AF_INET6_T >> 8) & 0xff) as u8;
+    let addr_ptr = sa6.as_ptr() as u64;
+
+    let rc = dispatch(42, fd as u64, addr_ptr, sa6.len() as u64, 0, 0, 0);
+    let _ = dispatch(3, fd as u64, 0, 0, 0, 0, 0); // close(2)
+    ipver::set_ipv6_enabled(saved_v6);
+
+    if rc != ENETUNREACH {
+        test_fail!("ipver_conn6",
+            "connect to AF_INET6 dest with IPv6 off: expected -101 (ENETUNREACH), got {}",
+            rc);
+        return false;
+    }
+    test_println!("  connect(→ AF_INET6, v6 off) → -101 ENETUNREACH ✓");
+    test_pass!("ip-version — connect to AF_INET6 dest returns ENETUNREACH");
+    true
+}
+
+// Test 202: the procfs disable_ipv6 sysctl read reflects the flag, and writing
+// "0"/"1" toggles it (and the socket behaviour changes accordingly).
+fn test_ipver_procfs_disable_sysctl() -> bool {
+    test_header!("ip-version — /proc/sys/net/ipv6/conf/all/disable_ipv6 read+write");
+    use crate::net::ipver;
+    use crate::vfs::FileSystemOps;
+
+    let saved_v6 = ipver::ipv6_enabled();
+    let mut ok = true;
+
+    // Resolve the disable_ipv6 inode via the FS lookup chain so we exercise
+    // the same read/write path userspace hits.  Read directly through
+    // ProcFs::read (which regenerates from the live flag on every call) rather
+    // than vfs::read_file — the latter is path-cached and would return a stale
+    // snapshot across an API-level toggle, which is a test artefact, not the
+    // userspace path (userspace opens fresh and reads via fd_read → ProcFs).
+    let procfs = crate::vfs::procfs::ProcFs::new();
+    // sys → net → ipv6 → conf → all → disable_ipv6
+    let inode = (|| -> Option<u64> {
+        let root = procfs.root_inode();
+        let sys  = procfs.lookup(root, "sys").ok()?;
+        let net  = procfs.lookup(sys, "net").ok()?;
+        let v6   = procfs.lookup(net, "ipv6").ok()?;
+        let conf = procfs.lookup(v6, "conf").ok()?;
+        let all  = procfs.lookup(conf, "all").ok()?;
+        procfs.lookup(all, "disable_ipv6").ok()
+    })();
+    let inode = match inode {
+        Some(i) => i,
+        None => {
+            ipver::set_ipv6_enabled(saved_v6);
+            test_fail!("ipver_sysctl", "could not resolve disable_ipv6 inode via lookup");
+            return false;
+        }
+    };
+
+    // Helper: read the sysctl content through ProcFs::read (live, uncached).
+    let read_sysctl = |ino: u64| -> Option<alloc::string::String> {
+        let mut buf = [0u8; 16];
+        match procfs.read(ino, 0, &mut buf) {
+            Ok(n) => Some(alloc::string::String::from_utf8_lossy(&buf[..n]).into_owned()),
+            Err(_) => None,
+        }
+    };
+
+    // Disabled → "1\n".
+    ipver::set_ipv6_enabled(false);
+    match read_sysctl(inode) {
+        Some(s) if s.starts_with('1') => {
+            test_println!("  read [v6 off] → {:?} ✓", s.trim_end());
+        }
+        other => {
+            test_fail!("ipver_sysctl",
+                "disable_ipv6 read with IPv6 off: expected \"1\", got {:?}", other);
+            ok = false;
+        }
+    }
+
+    // Enabled → "0\n".
+    ipver::set_ipv6_enabled(true);
+    match read_sysctl(inode) {
+        Some(s) if s.starts_with('0') => {
+            test_println!("  read [v6 on]  → {:?} ✓", s.trim_end());
+        }
+        other => {
+            test_fail!("ipver_sysctl",
+                "disable_ipv6 read with IPv6 on: expected \"0\", got {:?}", other);
+            ok = false;
+        }
+    }
+
+    // write "1\n" → IPv6 disabled.
+    match procfs.write(inode, 0, b"1\n") {
+        Ok(_) if !ipver::ipv6_enabled() => {
+            test_println!("  write \"1\" → IPv6 now DISABLED ✓");
+        }
+        other => {
+            ipver::set_ipv6_enabled(saved_v6);
+            test_fail!("ipver_sysctl",
+                "write \"1\": expected IPv6 disabled, write={:?} ipv6_enabled={}",
+                other, ipver::ipv6_enabled());
+            return false;
+        }
+    }
+    // write "0\n" → IPv6 enabled.
+    match procfs.write(inode, 0, b"0\n") {
+        Ok(_) if ipver::ipv6_enabled() => {
+            test_println!("  write \"0\" → IPv6 now ENABLED ✓");
+        }
+        other => {
+            ipver::set_ipv6_enabled(saved_v6);
+            test_fail!("ipver_sysctl",
+                "write \"0\": expected IPv6 enabled, write={:?} ipv6_enabled={}",
+                other, ipver::ipv6_enabled());
+            return false;
+        }
+    }
+    // A garbage write is rejected with EINVAL (VfsError::InvalidArg).
+    if procfs.write(inode, 0, b"x").is_ok() {
+        ipver::set_ipv6_enabled(saved_v6);
+        test_fail!("ipver_sysctl", "write \"x\" should fail EINVAL, but succeeded");
+        return false;
+    }
+    test_println!("  write \"x\" → EINVAL ✓");
+
+    ipver::set_ipv6_enabled(saved_v6);
+    if !ok { return false; }
+    test_pass!("ip-version — procfs disable_ipv6 read+write");
+    true
+}
+
+// Test 203: the kdb net-ipver command reports and toggles the flags.  Drive
+// the kdb dispatcher directly with a JSON request (the same surface the
+// harness `net-ipver` wrapper sends) and parse the structured reply.
+//
+// Gated on the `kdb` feature: the kdb dispatcher module is itself
+// `#[cfg(feature = "kdb")]`, so this test is only meaningful (and only
+// compiles) when that feature is enabled.  CI builds plain `test-mode`
+// (no kdb) and skips it; the `net-ipver` op is still validated via the
+// procfs sysctl + syscall enforcement tests above.
+#[cfg(feature = "kdb")]
+fn test_ipver_kdb_command() -> bool {
+    test_header!("ip-version — kdb net-ipver reports and toggles flags");
+    use crate::net::ipver;
+    use alloc::string::String;
+
+    let saved_v4 = ipver::ipv4_enabled();
+    let saved_v6 = ipver::ipv6_enabled();
+
+    // Read-only report reflects current state.
+    ipver::set_ipv6_enabled(false);
+    let mut out = String::new();
+    crate::kdb::dispatch(r#"{"op":"net-ipver"}"#, &mut out);
+    if !out.contains(r#""ipv6_enabled":false"#) || !out.contains(r#""ipv4_enabled":true"#) {
+        ipver::set_ipv4_enabled(saved_v4);
+        ipver::set_ipv6_enabled(saved_v6);
+        test_fail!("ipver_kdb", "report did not reflect state: {}", out);
+        return false;
+    }
+    test_println!("  net-ipver report → {} ✓", out);
+
+    // Toggle IPv6 on via the command.
+    out.clear();
+    crate::kdb::dispatch(r#"{"op":"net-ipver","family":"6","state":"on"}"#, &mut out);
+    if !ipver::ipv6_enabled() || !out.contains(r#""applied":"ipv6""#) {
+        ipver::set_ipv4_enabled(saved_v4);
+        ipver::set_ipv6_enabled(saved_v6);
+        test_fail!("ipver_kdb", "toggle v6 on failed: ipv6_enabled={} out={}",
+            ipver::ipv6_enabled(), out);
+        return false;
+    }
+    test_println!("  net-ipver 6 on → {} ✓", out);
+
+    // Toggle IPv6 back off.
+    out.clear();
+    crate::kdb::dispatch(r#"{"op":"net-ipver","family":"6","state":"off"}"#, &mut out);
+    if ipver::ipv6_enabled() {
+        ipver::set_ipv4_enabled(saved_v4);
+        ipver::set_ipv6_enabled(saved_v6);
+        test_fail!("ipver_kdb", "toggle v6 off failed: ipv6_enabled still true; out={}", out);
+        return false;
+    }
+    test_println!("  net-ipver 6 off → {} ✓", out);
+
+    ipver::set_ipv4_enabled(saved_v4);
+    ipver::set_ipv6_enabled(saved_v6);
+    test_pass!("ip-version — kdb net-ipver reports and toggles flags");
     true
 }
 

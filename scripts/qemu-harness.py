@@ -5663,6 +5663,29 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
         if len(rest) >= 3:
             req["len"] = int(rest[2], 0)
         return req
+    if op == "net-ipver":
+        # Read or toggle the runtime IPv4/IPv6 address-family enable flags.
+        #   kdb <sid> net-ipver               → report {ipv4,ipv6} state
+        #   kdb <sid> net-ipver 6 off         → disable IPv6, report state
+        #   kdb <sid> net-ipver 4 on          → enable IPv4, report state
+        # Mirrors the `net-ipver` top-level subcommand below.
+        req: dict = {"op": "net-ipver"}
+        if rest:
+            fam = rest[0].strip()
+            if fam not in ("4", "6"):
+                raise ValueError(
+                    f"net-ipver: family must be 4 or 6 (got {rest[0]!r})")
+            req["family"] = fam
+            if len(rest) >= 2:
+                st = rest[1].strip().lower()
+                if st not in ("on", "off", "1", "0", "true", "false",
+                              "enable", "disable"):
+                    raise ValueError(
+                        f"net-ipver: state must be on|off (got {rest[1]!r})")
+                req["state"] = st
+            else:
+                raise ValueError("net-ipver <family> requires a state (on|off)")
+        return req
     raise ValueError(f"unknown kdb op: {op}")
 
 
@@ -5784,6 +5807,38 @@ def cmd_kdb(args):
     try: cache.write_text(json.dumps(state))
     except OSError: pass
 
+    _out(resp)
+
+
+def cmd_net_ipver(args):
+    """Read or toggle the runtime IPv4/IPv6 address-family flags via kdb.
+
+    Thin wrapper over the kdb `net-ipver` op.  Prints the structured JSON
+    state ({applied?, error?, ipv4_enabled, ipv6_enabled}) emitted by the
+    kernel.  See net::ipver + kdb::op_net_ipver.
+    """
+    sess = _load_session(args.sid)
+    port = int(sess.get("kdb_host_port") or 0)
+    if port <= 0:
+        _out({"error": "session was not started with --features kdb"})
+        sys.exit(1)
+    if args.family is not None and args.state is None:
+        _out({"error": "net-ipver <family> requires a state (on|off)"})
+        sys.exit(1)
+    req: dict = {"op": "net-ipver"}
+    if args.family is not None:
+        req["family"] = args.family
+        req["state"] = str(args.state).strip().lower()
+    timeout = float(getattr(args, "timeout", 10.0) or 10.0)
+    try:
+        raw = _kdb_recv(port, req, timeout=timeout)
+        resp = json.loads(raw.strip().decode("utf-8", errors="replace"))
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        _out({"error": f"kdb connect/io failed on 127.0.0.1:{port}: {e}"})
+        sys.exit(1)
+    except (json.JSONDecodeError, ValueError) as e:
+        _out({"error": f"malformed response: {e}"})
+        sys.exit(1)
     _out(resp)
 
 
@@ -11052,6 +11107,10 @@ def main():
         # log to a VFS file; takes one `path=...` arg.  See
         # docs/RECORD_REPLAY_2026-05-23.md.
         "record-status", "replay-dump",
+        # net-ipver: read or toggle runtime IPv4/IPv6 address-family flags.
+        # See net::ipver + op_net_ipver.  Also exposed as the `net-ipver`
+        # top-level subcommand below.
+        "net-ipver",
     ])
     p_kdb.add_argument("args", nargs="*",
                         help="Op-specific positional args: "
@@ -11537,6 +11596,26 @@ def main():
         help="Per-chunk kdb request timeout in seconds (default 10)"
     )
 
+    # net-ipver — convenience wrapper over the kdb `net-ipver` op.  Read or
+    # toggle the runtime IPv4/IPv6 address-family enable flags (net::ipver).
+    p_net_ipver = sub.add_parser(
+        "net-ipver",
+        help="Read or toggle the runtime IPv4/IPv6 address-family flags "
+             "(requires --features kdb).  No args = report state.  "
+             "Examples: net-ipver <sid>  |  net-ipver <sid> 6 off  |  "
+             "net-ipver <sid> 4 on"
+    )
+    p_net_ipver.add_argument("sid")
+    p_net_ipver.add_argument(
+        "family", nargs="?", choices=["4", "6"], default=None,
+        help="Address family to toggle (4 or 6).  Omit to just read state.")
+    p_net_ipver.add_argument(
+        "state", nargs="?", default=None,
+        help="on|off — required when a family is given.")
+    p_net_ipver.add_argument(
+        "--timeout", type=float, default=10.0,
+        help="kdb request timeout in seconds (default 10)")
+
     # screendump — capture the framebuffer via QMP screendump + PPM->PNG
     p_screendump = sub.add_parser(
         "screendump",
@@ -11728,6 +11807,7 @@ def main():
         "autopsy": cmd_autopsy,
         # Tier 1
         "kdb":         cmd_kdb,
+        "net-ipver":   cmd_net_ipver,
         "tlb-stats":   cmd_tlb_stats,
         "fd-map":      cmd_fd_map,
         "thread-park-audit": cmd_thread_park_audit,
