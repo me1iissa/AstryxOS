@@ -552,6 +552,32 @@ pub fn scm_dequeue(receiver_id: u64, consumed: u64) -> Option<Vec<crate::vfs::Fi
     Some(q.remove(pos).fds)
 }
 
+/// Like [`scm_dequeue`] but also returns the popped batch's bound
+/// `byte_offset`.  The caller needs the offset to re-queue an *un-installed
+/// remainder* at the SAME stream position via [`scm_queue`] when the receiver's
+/// `msg_control` buffer was too small for the whole batch.
+///
+/// Per `recvmsg(2)` / `cmsg(3)`: when the ancillary buffer cannot hold every
+/// passed descriptor, the kernel delivers as many as fit and raises
+/// `MSG_CTRUNC`; the descriptors that did not fit are NOT silently dropped — a
+/// subsequent `recvmsg` with a larger control buffer must be able to receive
+/// them.  This helper lets the recvmsg path pop the batch, install the prefix
+/// that fits, then re-queue the tail at its original `byte_offset` (via
+/// [`scm_queue`]) so it stays attached to the same stream frame and is
+/// delivered on the next call rather than orphaned (CWE-772).
+pub fn scm_dequeue_with_offset(
+    receiver_id: u64,
+    consumed: u64,
+) -> Option<(u64, Vec<crate::vfs::FileDescriptor>)> {
+    let mut q = PENDING_SCM.lock();
+    let pos = q.iter().enumerate()
+        .filter(|(_, b)| b.receiver_id == receiver_id && consumed >= b.byte_offset)
+        .min_by_key(|(_, b)| b.byte_offset)
+        .map(|(i, _)| i)?;
+    let batch = q.remove(pos);
+    Some((batch.byte_offset, batch.fds))
+}
+
 /// Drain *all* pending `SCM_RIGHTS` batches destined for `receiver_id` and
 /// return their queued `FileDescriptor`s, removing the batches from the queue.
 ///
