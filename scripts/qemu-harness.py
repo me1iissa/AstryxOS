@@ -5601,6 +5601,21 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
         if not rest:
             raise ValueError("unix-diag requires <inode> (socket_id)")
         return {"op": "unix-diag", "inode": int(rest[0], 0)}
+    if op == "epoll-watch":
+        # Live epoll interest-set + per-fd readiness dump for one (pid, epfd).
+        # Pairs with unix-diag at a wedge: reports, for every fd in the epoll
+        # interest set, the caller's subscribed mask plus the LIVE readiness
+        # (revents) and what epoll_wait(2) would DELIVER (delivered/ready),
+        # computed via the same path the wait loop uses.  Decides
+        # reactor-starvation (fd ready=true but never drained -> reactor
+        # thread not running epoll_wait) vs kernel readiness-drop (fd absent
+        # from the set, or revents has no EPOLLIN despite unread data).
+        #   kdb <sid> epoll-watch <pid> <epfd>
+        if len(rest) < 2:
+            raise ValueError("epoll-watch requires <pid> <epfd>")
+        return {"op": "epoll-watch",
+                "pid": int(rest[0], 0),
+                "epfd": int(rest[1], 0)}
     if op == "syscall-trend":
         seconds = int(rest[0], 0) if len(rest) >= 1 else 5
         pid     = int(rest[1], 0) if len(rest) >= 2 else 0
