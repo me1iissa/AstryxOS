@@ -44,69 +44,65 @@ use crate::win32::SubsystemType;
 // Subsystem Detection
 // ============================================================================
 
-/// Detect the correct subsystem for an ELF binary.
+/// `e_ident[EI_OSABI]` index into the ELF identification array.
 ///
-/// Checks ELF OS/ABI byte and PT_INTERP presence:
-/// - GNU/Linux ABI (0x03) or PT_INTERP present → `Linux`
-/// - AstryxOS ABI (0xFF) or bare static ELF → `Aether`
-///
-/// This is called by the ELF loader before spawning the process so
-/// the process's `subsystem` field is set correctly from the start.
-pub fn detect_elf_subsystem(elf_bytes: &[u8]) -> SubsystemType {
-    if elf_bytes.len() < 20 {
-        return SubsystemType::Aether;
-    }
+/// Per the ELF gABI, `e_ident[7]` (`EI_OSABI`) identifies the OS/ABI for
+/// which the object is prepared.  `0` is `ELFOSABI_NONE` (System V / no
+/// extensions), `3` is `ELFOSABI_GNU` (GNU/Linux).  Values `0x40..=0xFF`
+/// are reserved for architecture/OS-specific semantics; AstryxOS claims
+/// `0xFF` as its private native-ABI marker.
+pub const EI_OSABI: usize = 7;
 
-    // ELF identity: byte 7 = OS/ABI
-    let os_abi = elf_bytes[7];
-    match os_abi {
-        0x00 => {
-            // System V ABI — could be Linux or Aether; check PT_INTERP
-            if has_pt_interp(elf_bytes) {
-                SubsystemType::Linux
-            } else {
-                // Could be either; default to Linux for disk-loaded ELFs
-                // (static musl, GCC output, etc.)
-                SubsystemType::Linux
-            }
-        }
-        0x03 => SubsystemType::Linux,  // GNU/Linux
-        0xFF => SubsystemType::Aether, // AstryxOS native (future)
-        _    => SubsystemType::Linux,  // Unknown → assume Linux compat
-    }
+/// The `EI_OSABI` byte that marks an ELF as a native AstryxOS (Aether)
+/// binary — i.e. one built against the Aether syscall numbering
+/// (`astryx_shared::syscall`, `SYS_EXIT=0 .. SYS_SYNC=49`) rather than the
+/// Linux personality.
+///
+/// `0xFF` sits in the ELF gABI's architecture/OS-specific `EI_OSABI` range
+/// (`0x40..=0xFF`), so claiming it cannot collide with the standardised
+/// values used by upstream toolchains (`ELFOSABI_NONE=0`, `ELFOSABI_GNU=3`).
+pub const ELFOSABI_ASTRYX: u8 = 0xFF;
+
+/// Returns `true` iff `elf_bytes` carries the unambiguous AstryxOS native
+/// marker `EI_OSABI == 0xFF`.
+///
+/// This is the **contract** for native-ABI routing: only an ELF that an
+/// AstryxOS toolchain explicitly stamped with `0xFF` is treated as Aether.
+/// Everything else — including a bare static System-V ELF (`EI_OSABI=0`,
+/// no `PT_INTERP`) — is *not* native and must keep using the Linux
+/// personality.  This is the load-bearing invariant that lets AstryxOS run
+/// upstream Linux binaries (glibc, musl, libxul) unmodified: those carry
+/// `EI_OSABI` of `0` (System V) or `3` (GNU) and must never be mis-routed.
+#[inline]
+pub fn elf_is_aether_native(elf_bytes: &[u8]) -> bool {
+    elf_bytes.len() > EI_OSABI && elf_bytes[EI_OSABI] == ELFOSABI_ASTRYX
 }
 
-/// Returns true if the ELF has a PT_INTERP segment (dynamic binary).
-fn has_pt_interp(elf_bytes: &[u8]) -> bool {
-    if elf_bytes.len() < 64 {
-        return false;
+/// Detect the correct subsystem for an ELF binary.
+///
+/// Keys off the ELF `EI_OSABI` byte (`e_ident[7]`):
+/// - AstryxOS native ABI (`0xFF`)            → `Aether`
+/// - everything else (System-V `0`, GNU `3`,
+///   any unknown value, or a bare static ELF) → `Linux`
+///
+/// The default is deliberately `Linux`: AstryxOS's prime directive is to
+/// run upstream Linux binaries unmodified, and the overwhelming majority of
+/// disk-loaded ELFs (static musl, GCC/Clang output, prebuilt distro
+/// binaries) carry `EI_OSABI` of `0` or `3` with no native marker.  A
+/// process is routed to `Aether` *only* on the unambiguous `0xFF` marker —
+/// see [`elf_is_aether_native`].
+///
+/// This is called by the exec/ELF-load path before spawning a process so
+/// the process's `subsystem` / `linux_abi` fields are set from the start.
+pub fn detect_elf_subsystem(elf_bytes: &[u8]) -> SubsystemType {
+    if elf_is_aether_native(elf_bytes) {
+        SubsystemType::Aether
+    } else {
+        // System-V (0), GNU/Linux (3), any unknown EI_OSABI, a too-short
+        // buffer, or a bare static ELF all stay on the Linux personality —
+        // the safe choice for a kernel that must run upstream Linux binaries.
+        SubsystemType::Linux
     }
-    // ELF64: e_phoff at offset 32 (8 bytes), e_phentsize at 54 (2 bytes), e_phnum at 56 (2 bytes)
-    let e_phoff = u64::from_le_bytes([
-        elf_bytes[32], elf_bytes[33], elf_bytes[34], elf_bytes[35],
-        elf_bytes[36], elf_bytes[37], elf_bytes[38], elf_bytes[39],
-    ]) as usize;
-    let e_phentsize = u16::from_le_bytes([elf_bytes[54], elf_bytes[55]]) as usize;
-    let e_phnum = u16::from_le_bytes([elf_bytes[56], elf_bytes[57]]) as usize;
-
-    if e_phoff == 0 || e_phentsize < 56 || e_phnum == 0 {
-        return false;
-    }
-
-    for i in 0..e_phnum {
-        let off = e_phoff + i * e_phentsize;
-        if off + 4 > elf_bytes.len() {
-            break;
-        }
-        let p_type = u32::from_le_bytes([
-            elf_bytes[off], elf_bytes[off + 1], elf_bytes[off + 2], elf_bytes[off + 3],
-        ]);
-        if p_type == 3 {
-            // PT_INTERP
-            return true;
-        }
-    }
-    false
 }
 
 // ============================================================================

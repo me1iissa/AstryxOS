@@ -1214,6 +1214,44 @@ pub extern "C" fn syscall_int80_dispatch(
 
 // ===== exec() Implementation ================================================
 
+/// Set a process's syscall personality (`linux_abi` + `subsystem`) from the
+/// `EI_OSABI` byte of the ELF image it is about to run.
+///
+/// This is the single decision point shared by both `exec()` install paths
+/// — the kernel-caller "create new process" arm and the user-mode
+/// "replace image" arm — so the two can never disagree.
+///
+/// Routing contract (see `crate::subsys::elf_is_aether_native`):
+/// - `EI_OSABI == 0xFF` (the AstryxOS native marker) → `Aether`,
+///   `linux_abi = false`; syscalls dispatch through the native
+///   `dispatch_aether` arm using the `astryx_shared::syscall` numbering.
+/// - **everything else** — System-V (`0`), GNU/Linux (`3`), any unknown
+///   value, or a bare static ELF — stays on the **Linux** personality
+///   (`linux_abi = true`).
+///
+/// The Linux default is load-bearing: AstryxOS runs upstream Linux binaries
+/// (glibc, musl, libxul) unmodified, and those carry `EI_OSABI` of `0` or
+/// `3` with no native marker — they must never be routed to Aether.  Per
+/// the ELF gABI, `e_ident[EI_OSABI]` (`0x40..=0xFF` reserved for
+/// architecture/OS-specific use) is the right channel for a private marker.
+pub(crate) fn apply_exec_subsystem(p: &mut crate::proc::Process, elf_data: &[u8]) {
+    if crate::subsys::elf_is_aether_native(elf_data) {
+        p.linux_abi = false;
+        p.subsystem = crate::win32::SubsystemType::Aether;
+        crate::serial_println!(
+            "[SYSCALL] exec: PID {} → Aether native ABI (EI_OSABI=0xFF)",
+            p.pid
+        );
+    } else {
+        p.linux_abi = true;
+        p.subsystem = crate::win32::SubsystemType::Linux;
+        crate::serial_println!(
+            "[SYSCALL] exec: PID {} → Linux personality (linux_abi=true)",
+            p.pid
+        );
+    }
+}
+
 /// Execute a new program, replacing the current process image.
 ///
 /// Execute a new program, replacing the current process image.
@@ -1465,15 +1503,16 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
         // resolves to the actual ELF that runs, not the script entry point.
         match crate::proc::usermode::create_user_process_with_args(final_path.as_str(), &elf_data, argv_slice, envp_slice) {
             Ok(new_pid) => {
-                // ELFs loaded from disk use the Linux syscall ABI.
+                // Select the syscall personality from the ELF's EI_OSABI
+                // marker (see `apply_exec_subsystem`).  Disk-loaded ELFs
+                // default to the Linux personality; only an explicit
+                // AstryxOS native marker (EI_OSABI=0xFF) routes to Aether.
                 {
                     let mut procs = crate::proc::PROCESS_TABLE.lock();
                     if let Some(p) = procs.iter_mut().find(|p| p.pid == new_pid) {
-                        p.linux_abi = true;
-                        p.subsystem = crate::win32::SubsystemType::Linux;
+                        apply_exec_subsystem(p, &elf_data);
                     }
                 }
-                crate::serial_println!("[SYSCALL] exec: created process PID {} (linux_abi=true)", new_pid);
                 return new_pid as i64;
             }
             Err(e) => {
@@ -1551,9 +1590,11 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
             //                     here, and the parent still owns its own
             //                     `vm_space` + `cr3`.  We must NOT touch those.
             extracted = p.vm_space.replace(new_vm_space);
-            // ELFs loaded from disk use the Linux syscall ABI.
-            p.linux_abi = true;
-            p.subsystem = crate::win32::SubsystemType::Linux;
+            // Select the syscall personality from the new image's EI_OSABI
+            // marker (see `apply_exec_subsystem`).  Disk-loaded ELFs default
+            // to the Linux personality; only an explicit AstryxOS native
+            // marker (EI_OSABI=0xFF) routes to Aether.
+            apply_exec_subsystem(p, &elf_data);
             // Update /proc/self/exe to the new image's path.  Per `proc(5)`,
             // the symlink target follows the executed program across
             // execve(2) — including the case where the caller forked from

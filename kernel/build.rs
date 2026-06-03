@@ -89,6 +89,108 @@ fn main() {
     // unconditionally so the include path is stable and the daemon stays
     // exercised by the workspace build.  Cost: ~0.7 s per fresh build.
     build_qga_daemon(&manifest_dir, &out_dir);
+
+    // ── Astryx Native SDK Phase 0: native_hello sample ─────────────────────
+    // Compile the native (Aether-ABI) `native_hello` sample, stamp its ELF
+    // `EI_OSABI` byte to the AstryxOS marker (0xFF), and stage it in OUT_DIR
+    // for include_bytes! by `kernel/src/proc/native_hello_elf.rs`.  Built
+    // unconditionally (small) so the include path is stable; the kernel uses
+    // it to prove the EI_OSABI→Aether exec routing.
+    build_native_hello(&manifest_dir, &out_dir);
+}
+
+/// Build the native-ABI `native_hello` sample, stamp `EI_OSABI = 0xFF`, and
+/// stage the resulting ELF as `OUT_DIR/native_hello.elf`.
+fn build_native_hello(manifest_dir: &PathBuf, out_dir: &PathBuf) {
+    let repo_root = manifest_dir.parent().expect("kernel must have a parent dir");
+    let crate_dir = repo_root.join("userspace").join("sdk").join("native_hello");
+    let sys_dir = repo_root.join("userspace").join("sdk").join("aether-sys");
+    let shared_dir = repo_root.join("shared");
+
+    // Re-run when the sample, the SDK syscall crate, or the shared ABI table
+    // change — any of them affects the produced binary.
+    for sub in &["src", "Cargo.toml", ".cargo/config.toml"] {
+        let p = crate_dir.join(sub);
+        if p.exists() {
+            println!("cargo:rerun-if-changed={}", p.display());
+        }
+    }
+    for sub in &["src", "Cargo.toml"] {
+        let p = sys_dir.join(sub);
+        if p.exists() {
+            println!("cargo:rerun-if-changed={}", p.display());
+        }
+        let q = shared_dir.join(sub);
+        if q.exists() {
+            println!("cargo:rerun-if-changed={}", q.display());
+        }
+    }
+
+    let target_dir = out_dir.join("native-hello-target");
+
+    // Build standalone for the freestanding target, run from the crate dir so
+    // cargo discovers the per-crate .cargo/config.toml (static reloc model).
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let mut cmd = Command::new(&cargo);
+    cmd.arg("build")
+        .arg("--release")
+        .arg("--target")
+        .arg("x86_64-unknown-none")
+        .arg("--manifest-path")
+        .arg(crate_dir.join("Cargo.toml"))
+        .current_dir(&crate_dir)
+        .env("CARGO_TARGET_DIR", &target_dir);
+    for var in &[
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_MANIFEST_DIR",
+        "CARGO_PKG_VERSION",
+        "RUSTC_WORKSPACE_WRAPPER",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd.env(
+        "CARGO_TARGET_X86_64_UNKNOWN_NONE_RUSTFLAGS",
+        "-C relocation-model=static -C link-args=-static",
+    );
+    let st = cmd.status().unwrap_or_else(|e| {
+        panic!("build.rs: failed to invoke cargo for native_hello: {}", e)
+    });
+    if !st.success() {
+        panic!("build.rs: cargo build for native_hello exited {}", st);
+    }
+
+    let src_elf = target_dir
+        .join("x86_64-unknown-none")
+        .join("release")
+        .join("native_hello");
+    let dst_elf = out_dir.join("native_hello.elf");
+
+    // Read the produced ELF, stamp e_ident[EI_OSABI] (byte 7) to the AstryxOS
+    // native marker (0xFF), and write the result to OUT_DIR.  Per the ELF gABI
+    // `e_ident[7]` is EI_OSABI; 0xFF lies in its architecture/OS-specific
+    // range (0x40..=0xFF), so this cannot collide with ELFOSABI_NONE (0) or
+    // ELFOSABI_GNU (3).  This is what makes the kernel exec path route the
+    // sample to the native Aether dispatch.
+    let mut bytes = std::fs::read(&src_elf).unwrap_or_else(|e| {
+        panic!("build.rs: failed to read native_hello elf {}: {}", src_elf.display(), e)
+    });
+    const EI_OSABI: usize = 7;
+    const ELFOSABI_ASTRYX: u8 = 0xFF;
+    assert!(
+        bytes.len() > EI_OSABI && &bytes[0..4] == b"\x7fELF",
+        "build.rs: native_hello is not a valid ELF (len={})",
+        bytes.len()
+    );
+    bytes[EI_OSABI] = ELFOSABI_ASTRYX;
+    std::fs::write(&dst_elf, &bytes).unwrap_or_else(|e| {
+        panic!("build.rs: failed to write stamped native_hello elf {}: {}", dst_elf.display(), e)
+    });
+
+    println!(
+        "cargo:warning=native_hello built + EI_OSABI-stamped 0xFF: {} ({} bytes)",
+        dst_elf.display(),
+        bytes.len()
+    );
 }
 
 fn build_qga_daemon(manifest_dir: &PathBuf, out_dir: &PathBuf) {
