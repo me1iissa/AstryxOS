@@ -1,0 +1,32 @@
+[package]
+name = "aether-sys"
+version = "0.1.0"
+edition = "2021"
+description = "Astryx Native SDK — Phase 0 system-call layer for native (Aether-ABI) AstryxOS programs"
+authors = ["AstryxOS"]
+
+# Native AstryxOS userspace crate.  Like `userspace/qga`, it is built
+# standalone for the freestanding `x86_64-unknown-none` target (NOT a member
+# of the kernel workspace), so it carries its own empty `[workspace]` table.
+#
+# The Aether syscall numbers are single-sourced from `astryx-shared` (the same
+# crate the kernel dispatch reads), so the table can never drift between the
+# two sides of the ABI.
+[workspace]
+
+[lib]
+name = "aether_sys"
+path = "src/lib.rs"
+
+[dependencies]
+astryx-shared = { path = "../../../shared" }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+panic = "abort"
