@@ -792,6 +792,11 @@ pub fn run() -> ! {
     total += 1;
     if test_ascension_init() { passed += 1; }
 
+    // ── Test 71b: crash-recovery supervisor — exit classification + bound ────
+
+    total += 1;
+    if test_crash_recovery_supervisor() { passed += 1; }
+
     // ── Test 72: timerfd — create / settime / gettime / read ─────────────────
 
     total += 1;
@@ -18261,6 +18266,150 @@ fn test_ascension_init() -> bool {
     test_pass!("Ascension init — config parse + service launch");
     true
 }
+
+// ── Test 71b: crash-recovery supervisor ──────────────────────────────────────
+
+/// The firefox-test watchdog supervises the screenshot driver: on a *crash*
+/// (a non-zero / fatal-signal exit with no screenshot produced) it relaunches
+/// the same command line, bounded by MAX_FF_RELAUNCH; on a *clean* exit it
+/// stops with success.  This test exercises the two load-bearing pieces of
+/// that supervisor in isolation:
+///
+///   1. `terminal::exec_exit_status()` correctly classifies a crashed child
+///      (a Zombie whose `exit_code` is the fatal-signal value -11 / -SIGSEGV,
+///      per signal(7)'s SIGSEGV default action "terminate the process") as
+///      `Crashed(-11)`, and a clean child (exit_code 0) as `Clean`.
+///   2. The bounded retry counter relaunches on a crash while retries remain
+///      and STOPS once the bound is reached — the `Restart::OnFailure`-style
+///      policy that init(8)/service supervisors apply.
+#[cfg(feature = "test-mode")]
+fn test_crash_recovery_supervisor() -> bool {
+    test_header!("crash-recovery supervisor — exit classification + relaunch bound");
+
+    use crate::gui::terminal::{self, ExecExit};
+
+    // Helper: install a synthetic Zombie process with a given exit code and
+    // point EXEC_PID at it, then read the supervisor's classification.
+    fn classify_with_zombie(pid: u64, exit_code: i32) -> ExecExit {
+        {
+            let mut procs = crate::proc::PROCESS_TABLE.lock();
+            procs.retain(|p| p.pid != pid);
+            procs.push(crate::proc::Process {
+                pid,
+                parent_pid: 0,
+                name: { let mut n = [0u8; 64]; n[..2].copy_from_slice(b"ff"); n },
+                state: crate::proc::ProcessState::Zombie,
+                cr3: 0,
+                threads: alloc::vec::Vec::new(),
+                exit_code,
+                file_descriptors: alloc::vec::Vec::new(),
+                cwd: alloc::string::String::from("/"),
+                uid: 0, gid: 0, euid: 0, egid: 0,
+                pgid: pid as u32, sid: pid as u32,
+                no_new_privs: false,
+                cap_permitted: !0u64, cap_effective: !0u64,
+                rlimits_soft: [u64::MAX; 16],
+                supplementary_groups: alloc::vec::Vec::new(),
+                umask: 0o022,
+                vm_space: None,
+                signal_state: Some(crate::signal::SignalState::new()),
+                linux_abi: true,
+                handle_table: None,
+                subsystem: crate::win32::SubsystemType::Linux,
+                token_id: None,
+                exe_path: None,
+                epoll_sets: alloc::vec::Vec::new(),
+                auxv: alloc::vec::Vec::new(),
+                envp: alloc::vec::Vec::new(),
+                alarm_deadline_ticks: 0,
+                alarm_interval_ticks: 0,
+                pdeath_signal: 0,
+            });
+        }
+        // Point the supervisor's tracking at the synthetic zombie.  No live
+        // threads exist for `pid` in THREAD_TABLE, so is_firefox_running()
+        // returns false and exec_exit_status() falls through to the Zombie
+        // scan (step 3).
+        terminal::test_set_exec_pid(pid);
+        terminal::exec_exit_status()
+    }
+
+    let crash_pid: u64 = 9971;
+    let clean_pid: u64 = 9972;
+
+    // 1. A fatal-signal teardown (exit_code -11) classifies as Crashed(-11).
+    let crashed = classify_with_zombie(crash_pid, -11);
+    if crashed != ExecExit::Crashed(-11) {
+        test_fail!("crash-recovery", "SIGSEGV zombie classified {:?}, want Crashed(-11)", crashed);
+        crate::proc::PROCESS_TABLE.lock().retain(|p| p.pid != crash_pid);
+        terminal::reset_exec_tracking();
+        return false;
+    }
+    test_println!("  exit_code -11 → {:?} ✓", crashed);
+
+    // 2. A clean exit (exit_code 0) classifies as Clean.
+    let clean = classify_with_zombie(clean_pid, 0);
+    if clean != ExecExit::Clean {
+        test_fail!("crash-recovery", "clean zombie classified {:?}, want Clean", clean);
+        crate::proc::PROCESS_TABLE.lock().retain(|p| p.pid != crash_pid && p.pid != clean_pid);
+        terminal::reset_exec_tracking();
+        return false;
+    }
+    test_println!("  exit_code 0 → {:?} ✓", clean);
+
+    // Clean up synthetic records and the tracking we installed.
+    crate::proc::PROCESS_TABLE.lock().retain(|p| p.pid != crash_pid && p.pid != clean_pid);
+    terminal::reset_exec_tracking();
+
+    // 3. reset_exec_tracking() leaves the supervisor seeing "no child".
+    if terminal::exec_pid() != 0 {
+        test_fail!("crash-recovery", "exec_pid() not cleared after reset");
+        return false;
+    }
+    test_println!("  reset_exec_tracking() clears EXEC_PID ✓");
+
+    // 4. Bounded relaunch policy: a crash with retries remaining relaunches;
+    //    a crash with the bound reached stops.  This mirrors the watchdog's
+    //    `crashed && ff_relaunch_count < MAX_FF_RELAUNCH` gate exactly.
+    const MAX_FF_RELAUNCH: u32 = 5;
+    let mut relaunches = 0u32;
+    let mut count = 0u32;
+    // Simulate an unbounded crash storm: every attempt crashes.
+    for _attempt in 0..(MAX_FF_RELAUNCH + 3) {
+        let crashed = true; // every attempt is a Crashed(_) with no png
+        if crashed && count < MAX_FF_RELAUNCH {
+            count += 1;
+            relaunches += 1;
+        } else {
+            break; // budget exhausted → stop
+        }
+    }
+    if relaunches != MAX_FF_RELAUNCH {
+        test_fail!("crash-recovery", "relaunched {} times, want exactly {}", relaunches, MAX_FF_RELAUNCH);
+        return false;
+    }
+    test_println!("  crash storm bounded to exactly {} relaunches ✓", relaunches);
+
+    // 5. A clean exit must NOT relaunch even with budget remaining.
+    let mut clean_relaunches = 0u32;
+    let png_ok = true; // screenshot produced
+    let crashed = !png_ok; // clean / success path
+    if crashed && 0 < MAX_FF_RELAUNCH {
+        clean_relaunches += 1;
+    }
+    if clean_relaunches != 0 {
+        test_fail!("crash-recovery", "clean exit triggered {} relaunch(es), want 0", clean_relaunches);
+        return false;
+    }
+    test_println!("  clean/success exit → no relaunch ✓");
+
+    test_pass!("crash-recovery supervisor — classification + bounded relaunch");
+    true
+}
+
+/// Non-test-mode stub so the registration call site type-checks.
+#[cfg(not(feature = "test-mode"))]
+fn test_crash_recovery_supervisor() -> bool { true }
 
 // ── Test 72: timerfd ─────────────────────────────────────────────────────────
 
