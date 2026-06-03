@@ -1669,6 +1669,17 @@ pub fn run() -> ! {
     total += 1;
     if test_recvfrom_truncated_addrlen() { passed += 1; }
 
+    // ── recvmsg(2) source-address writeback (Phase NDE-9) ────────────────
+    // socket_recv_status_from carries the wire source 4-tuple so the
+    // recvmsg(2) AF_INET arm can marshal msg_name — required for musl's
+    // connection-mode DNS resolver to accept the reply (RFC 1035 §7.3).
+
+    total += 1;
+    if test_recv_status_from_udp_returns_sender_4tuple() { passed += 1; }
+
+    total += 1;
+    if test_recv_status_from_udp_wouldblock_when_empty() { passed += 1; }
+
     // ── Tests 195–199: shutdown(2) half-close (Phase NDE-4) ──────────────
 
     total += 1;
@@ -31314,6 +31325,108 @@ fn test_recvfrom_udp_returns_sender_4tuple() -> bool {
         src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port, data.len());
     test_pass!("recvfrom — UDP returns sender 4-tuple");
     true
+}
+
+// socket_recv_status_from is the recvmsg(2) source-carrying recv used by the
+// AF_INET recvmsg arm to fill msg_name.  A connection-mode resolver (musl's
+// __res_msend) validates the reply source byte-for-byte against the
+// nameserver and DROPS a reply whose msg_name does not match (RFC 1035 §7.3),
+// so the dequeued datagram's true wire source must round-trip here.
+fn test_recv_status_from_udp_returns_sender_4tuple() -> bool {
+    test_header!("recvmsg — socket_recv_status_from returns sender 4-tuple");
+
+    use crate::net::socket::{self, SocketType, RecvOutcome};
+    use crate::net::udp;
+
+    const SERVER_PORT: u16 = 17142;
+    const CLIENT_PORT: u16 = 50071;
+    const PAYLOAD: &[u8] = b"NDE9 dns reply src";
+
+    let id = socket::socket_create(SocketType::Udp);
+    if let Err(e) = socket::socket_bind(id, SERVER_PORT) {
+        socket::socket_close(id);
+        test_fail!("recv_status_from", "bind({}) failed: {}", SERVER_PORT, e);
+        return false;
+    }
+
+    udp::send([127, 0, 0, 1], CLIENT_PORT, SERVER_PORT, PAYLOAD);
+    crate::net::poll();
+
+    let (outcome, src_ip, src_port) = match socket::socket_recv_status_from(id) {
+        Ok(t) => t,
+        Err(e) => {
+            socket::socket_close(id);
+            test_fail!("recv_status_from", "call failed: {}", e);
+            return false;
+        }
+    };
+    socket::socket_close(id);
+
+    let data = match outcome {
+        RecvOutcome::Data(d) => d,
+        RecvOutcome::Eof => { test_fail!("recv_status_from", "got Eof, want Data"); return false; }
+        RecvOutcome::WouldBlock => { test_fail!("recv_status_from", "got WouldBlock, want Data"); return false; }
+    };
+
+    if data != PAYLOAD {
+        test_fail!("recv_status_from", "payload mismatch: {} bytes", data.len());
+        return false;
+    }
+    if src_ip[0] != 127 {
+        test_fail!("recv_status_from", "expected loopback src, got {}.{}.{}.{}",
+            src_ip[0], src_ip[1], src_ip[2], src_ip[3]);
+        return false;
+    }
+    if src_port != CLIENT_PORT {
+        test_fail!("recv_status_from", "expected src port {}, got {}", CLIENT_PORT, src_port);
+        return false;
+    }
+
+    test_println!("  recv_status_from → src {}.{}.{}.{}:{} ({} bytes) ✓",
+        src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port, data.len());
+    test_pass!("recvmsg — socket_recv_status_from returns sender 4-tuple");
+    true
+}
+
+// An empty UDP receive queue is would-block (never EOF) per RFC 768 / the
+// connectionless socket contract, and the source out-params are unused on a
+// non-Data outcome (recvmsg(2) only fills msg_namelen on a real message).
+fn test_recv_status_from_udp_wouldblock_when_empty() -> bool {
+    test_header!("recvmsg — socket_recv_status_from empty UDP is WouldBlock");
+
+    use crate::net::socket::{self, SocketType, RecvOutcome};
+
+    const SERVER_PORT: u16 = 17143;
+
+    let id = socket::socket_create(SocketType::Udp);
+    if let Err(e) = socket::socket_bind(id, SERVER_PORT) {
+        socket::socket_close(id);
+        test_fail!("recv_status_from_empty", "bind({}) failed: {}", SERVER_PORT, e);
+        return false;
+    }
+
+    let r = socket::socket_recv_status_from(id);
+    socket::socket_close(id);
+
+    match r {
+        Ok((RecvOutcome::WouldBlock, _, _)) => {
+            test_println!("  empty UDP queue → WouldBlock ✓");
+            test_pass!("recvmsg — socket_recv_status_from empty UDP is WouldBlock");
+            true
+        }
+        Ok((RecvOutcome::Data(d), _, _)) => {
+            test_fail!("recv_status_from_empty", "unexpected Data ({} bytes)", d.len());
+            false
+        }
+        Ok((RecvOutcome::Eof, _, _)) => {
+            test_fail!("recv_status_from_empty", "UDP must not report Eof on empty queue");
+            false
+        }
+        Err(e) => {
+            test_fail!("recv_status_from_empty", "call failed: {}", e);
+            false
+        }
+    }
 }
 
 #[cfg(feature = "kdb")]

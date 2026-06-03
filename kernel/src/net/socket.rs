@@ -514,6 +514,86 @@ pub fn socket_recv_status(id: u64) -> Result<RecvOutcome, &'static str> {
     }
 }
 
+/// Like [`socket_recv_status`] but also returns the source 4-tuple of the
+/// data that was dequeued, for callers (recvmsg(2)) that must marshal
+/// `msg_name`.
+///
+/// For UDP this is the true wire source of the datagram (`src_ip`/`src_port`
+/// from the IP/UDP headers); a connection-mode resolver such as musl's
+/// `__res_msend` validates this byte-for-byte against the nameserver it
+/// queried and silently drops a reply whose source does not match (RFC 1035
+/// §7.3, recvmsg(2)).  For TCP the source is the connected peer (RFC 793).
+/// On a non-`Data` outcome the returned address is the connected peer (or a
+/// zero 4-tuple for an unconnected datagram socket), which `recvmsg(2)`
+/// leaves unused because `msg_namelen` is only written on a real message.
+pub fn socket_recv_status_from(id: u64)
+    -> Result<(RecvOutcome, Ipv4Address, u16), &'static str>
+{
+    let sockets = SOCKETS.lock();
+    let sock = sockets.iter().find(|s| s.id == id)
+        .ok_or("socket not found")?;
+
+    // shutdown(SHUT_RD): orderly EOF regardless of socket type.  Report the
+    // connected peer as the (unused) source so the tuple is well-formed.
+    if sock.shut_rd {
+        return Ok((RecvOutcome::Eof, sock.remote_ip, sock.remote_port));
+    }
+
+    match sock.socket_type {
+        SocketType::Udp => {
+            if !sock.bound {
+                return Err("not bound");
+            }
+            let local_port = sock.local_port;
+            drop(sockets);
+            match super::udp::recv(local_port) {
+                Some(datagram) => {
+                    crate::proc::proc_metrics::bump_net_read(
+                        crate::proc::current_pid_lockless(),
+                        datagram.data.len() as u64);
+                    let src_ip   = datagram.src_ip;
+                    let src_port = datagram.src_port;
+                    Ok((RecvOutcome::Data(datagram.data), src_ip, src_port))
+                }
+                // UDP is connectionless: empty queue is would-block, never EOF.
+                None => Ok((RecvOutcome::WouldBlock, [0; 4], 0)),
+            }
+        }
+        SocketType::Tcp => {
+            if !sock.bound {
+                return Err("not bound");
+            }
+            let peer_ip   = sock.remote_ip;
+            let peer_port = sock.remote_port;
+            let data = if sock.connected && sock.remote_port != 0 {
+                super::tcp::read_from(sock.local_port, sock.remote_ip, sock.remote_port)
+            } else {
+                super::tcp::read(sock.local_port)
+            };
+            if !data.is_empty() {
+                crate::proc::proc_metrics::bump_net_read(
+                    crate::proc::current_pid_lockless(), data.len() as u64);
+                return Ok((RecvOutcome::Data(data), peer_ip, peer_port));
+            }
+            // Empty stream read: distinguish peer-FIN EOF from would-block
+            // exactly as socket_recv_status does (RFC 793 §3.5).
+            let peer_closed = match super::tcp::get_state(sock.local_port) {
+                Some(st) => matches!(st,
+                    super::tcp::TcpState::CloseWait
+                    | super::tcp::TcpState::LastAck
+                    | super::tcp::TcpState::TimeWait
+                    | super::tcp::TcpState::Closed),
+                None => true,
+            };
+            if peer_closed {
+                Ok((RecvOutcome::Eof, peer_ip, peer_port))
+            } else {
+                Ok((RecvOutcome::WouldBlock, peer_ip, peer_port))
+            }
+        }
+    }
+}
+
 /// Receive data from a socket (non-blocking).
 pub fn socket_recv(id: u64) -> Result<Vec<u8>, &'static str> {
     let sockets = SOCKETS.lock();
