@@ -2600,17 +2600,58 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 // re-issued recvmsg in a tight loop, never yielding.  Use the
                 // status-aware recv so the two cases get their correct
                 // returns (WouldBlock → -EAGAIN, Eof → 0).
-                bytes_read = match crate::net::socket::socket_recv_status(socket_id) {
-                    Ok(crate::net::socket::RecvOutcome::Data(data)) => {
+                bytes_read = match crate::net::socket::socket_recv_status_from(socket_id) {
+                    Ok((crate::net::socket::RecvOutcome::Data(data), src_ip, src_port)) => {
                         let n = data.len().min(cap);
                         unsafe {
                             let _g = crate::arch::x86_64::smap::UserGuard::new();
                             core::ptr::copy_nonoverlapping(data.as_ptr(), dst, n);
                         }
+                        // Marshal the source 4-tuple into msg_name/msg_namelen.
+                        // The x86_64 `struct msghdr` lays msg_name at offset 0
+                        // (void*) and msg_namelen at offset 8 (socklen_t, 4
+                        // bytes).  Per recvmsg(2): if msg_name is non-NULL the
+                        // kernel fills it with the source address and sets
+                        // msg_namelen to the address length (truncating the
+                        // copy, but never the reported length, into a short
+                        // buffer).  Without this a connection-mode UDP resolver
+                        // such as musl's __res_msend validates the reply source
+                        // (a zero msg_name) against the nameserver it queried
+                        // and DROPS the reply (RFC 1035 §7.3), surfacing as
+                        // getaddrinfo(3) EAI_AGAIN.  This mirrors the recvfrom(2)
+                        // (syscall 45) marshalling above.
+                        let (name_ptr, name_cap) = unsafe {
+                            let _g = crate::arch::x86_64::smap::UserGuard::new();
+                            let np = core::ptr::read_unaligned(msghdr_ptr as *const u64);
+                            let nl = core::ptr::read_unaligned(
+                                (arg2 + 8) as *const u32) as usize;
+                            (np, nl)
+                        };
+                        if name_ptr != 0
+                            && crate::syscall::validate_user_ptr(name_ptr, 16.min(name_cap.max(1)))
+                        {
+                            // sockaddr_in is 16 bytes; copy min(name_cap, 16)
+                            // and always report 16 as the address length
+                            // (recvmsg(2) truncation semantics).
+                            let mut sa = [0u8; 16];
+                            sa[0] = 2; // AF_INET (sin_family lo)
+                            let p = src_port.to_be_bytes();
+                            sa[2] = p[0]; sa[3] = p[1];                 // sin_port
+                            sa[4] = src_ip[0]; sa[5] = src_ip[1];
+                            sa[6] = src_ip[2]; sa[7] = src_ip[3];       // sin_addr
+                            let cw = name_cap.min(16);
+                            unsafe {
+                                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                                core::ptr::copy_nonoverlapping(
+                                    sa.as_ptr(), name_ptr as *mut u8, cw);
+                                core::ptr::write_unaligned(
+                                    (arg2 + 8) as *mut u32, 16u32);
+                            }
+                        }
                         n as i64
                     }
-                    Ok(crate::net::socket::RecvOutcome::Eof) => 0,
-                    Ok(crate::net::socket::RecvOutcome::WouldBlock) => -11, // EAGAIN
+                    Ok((crate::net::socket::RecvOutcome::Eof, _, _)) => 0,
+                    Ok((crate::net::socket::RecvOutcome::WouldBlock, _, _)) => -11, // EAGAIN
                     Err(_) => -11,
                 };
             }

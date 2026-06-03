@@ -1261,9 +1261,18 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // addr2line / gdb resolve C++ names natively (no Mozilla tecken
             // dependency).  All three fall through to the same --headless
             // --screenshot pipeline.
-            const CMDLINE_MUSL_132: &str = "/disk/usr/lib/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png file:///tmp/hello.html";
-            const CMDLINE_MUSL_ESR: &str = "/disk/usr/lib/firefox-esr/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png file:///tmp/hello.html";
-            const CMDLINE_GLIBC:    &str = "/disk/opt/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png file:///tmp/hello.html";
+            // Website-render branch: drive Firefox at a real internet URL
+            // instead of the local file:///tmp/hello.html demo page.  We start
+            // with the IPv4-literal https://1.1.1.1/ — a literal address skips
+            // DNS (RFC 1035 is not exercised) and presents a valid certificate,
+            // so this is the cleanest first end-to-end network proof.  Swap to
+            // https://example.com/ once the literal path renders, to exercise
+            // the getaddrinfo(3)/DNS resolver.  (Making the target URL a proper
+            // runtime/config option is a follow-up; the local-page demo stays on
+            // master.)
+            const CMDLINE_MUSL_132: &str = "/disk/usr/lib/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png https://1.1.1.1/";
+            const CMDLINE_MUSL_ESR: &str = "/disk/usr/lib/firefox-esr/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png https://1.1.1.1/";
+            const CMDLINE_GLIBC:    &str = "/disk/opt/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png https://1.1.1.1/";
             // Use stat() (resolve_path + FileSystemOps::stat) for the existence
             // probe instead of read_file().  read_file() allocates a Vec sized
             // to the full file (~795 KB for firefox-bin), reads every byte, and

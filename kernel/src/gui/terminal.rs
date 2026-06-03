@@ -888,7 +888,16 @@ fn spawn_async(cmd: &str) -> Result<(u64, u64), alloc::string::String> {
         // See: https://firefox-source-docs.mozilla.org/widget/headless.html
         "MOZ_HEADLESS=1",
         "MOZ_DISABLE_CONTENT_SANDBOX=1",
-        "MOZ_DISABLE_NONLOCAL_CONNECTIONS=1",
+        // NB: we intentionally do NOT set MOZ_DISABLE_NONLOCAL_CONNECTIONS on
+        // this (website-render) branch.  gecko treats the variable as a boolean
+        // gate that is "enabled" for any value other than the literal string
+        // "0"; when enabled it refuses every non-loopback connection
+        // *in-process*, before any SYN is emitted, so the browser can never
+        // reach an internet host (the dispositive furthest_stage=none cause:
+        // the connect is rejected by libxul's necko layer, not by the kernel).
+        // The local-page demo keeps the variable set; fetching a real URL
+        // requires the gate to be absent.  MOZ_DISABLE_CONTENT_SANDBOX above is
+        // orthogonal and stays.
         "MOZ_DISABLE_AUTO_SAFE_MODE=1",
         // Short-circuit SetExceptionHandler() before it touches the
         // Crash Reports directory tree.  Release builds of Firefox check
