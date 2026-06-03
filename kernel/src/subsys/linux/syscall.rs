@@ -2461,6 +2461,11 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 // memory.  Held for the call duration; we drop it before
                 // the subsequent allocations / table walks below.
                 const MSG_TRUNC: u32 = 0x20;
+                // recvmsg(2): MSG_CTRUNC indicates that some ancillary control
+                // data was discarded because the receiver's `msg_control`
+                // buffer was too small.  Independent of MSG_TRUNC (data
+                // truncation); both may be set on the same call.
+                const MSG_CTRUNC: u32 = 0x8;
                 bytes_read = {
                     let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
                     let buf = unsafe { core::slice::from_raw_parts_mut(dst, eff_cap) };
@@ -2500,21 +2505,63 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 // not pick up a later frame's fds.
                 if bytes_read >= 0 {
                     let consumed = crate::net::unix::recv_consumed(unix_id);
-                    if let Some(scm_fds) = crate::syscall::scm_dequeue(unix_id, consumed) {
+                    // Pop the batch together with its bound stream offset so an
+                    // un-installed remainder can be re-queued at the SAME offset
+                    // (recvmsg(2) / cmsg(3): control data that does not fit is
+                    // not dropped — MSG_CTRUNC is raised and the unfitting fds
+                    // remain available to a subsequent larger-buffer recvmsg).
+                    if let Some((batch_off, mut scm_fds)) =
+                        crate::syscall::scm_dequeue_with_offset(unix_id, consumed)
+                    {
+                        let nfds = scm_fds.len();
+                        // Read the receiver's msg_control geometry up front so we
+                        // know how many descriptors actually fit BEFORE moving any
+                        // into the fd table.  cmsg(3): a single SCM_RIGHTS cmsg of
+                        // n fds occupies `CMSG_SPACE(n*4)` = 16 (cmsghdr) + n*4
+                        // bytes (we lay the fd array immediately after the 16-byte
+                        // header with no extra alignment padding, matching the
+                        // CMSG_FIRSTHDR/CMSG_DATA offsets glibc & musl compute).
+                        let (ctrl_ptr, ctrl_len) = unsafe {
+                            let _g = crate::arch::x86_64::smap::UserGuard::new();
+                            (core::ptr::read_unaligned(msghdr_ptr.add(4)),
+                             core::ptr::read_unaligned(msghdr_ptr.add(5)) as usize)
+                        };
+                        // How many fds fit: floor((ctrl_len - 16) / 4), clamped to
+                        // the batch size and to 0 when ctrl_len < 16.  A ctrl_ptr
+                        // of 0, or a range that fails user-pointer validation, is
+                        // treated as "nothing fits" so the whole batch is re-queued
+                        // and MSG_CTRUNC is raised.
+                        let mut fits = ((ctrl_len.saturating_sub(16)) / 4).min(nfds);
+                        // `validate_user_ptr` is bypassed inside a
+                        // KernelDispatchGuard (in-kernel test driver passing
+                        // kernel-VA buffers); in production it is the only
+                        // defence against a kernel-VA in msg_control directing
+                        // a supervisor write — see CWE-823 note below.
+                        let ctrl_ok = ctrl_ptr != 0
+                            && fits > 0
+                            && (crate::syscall::user_ptr_check_bypassed()
+                                || crate::syscall::validate_user_ptr(ctrl_ptr, 16 + fits * 4));
+                        if ctrl_ptr == 0 || !ctrl_ok {
+                            fits = 0;
+                        }
+                        // Split off the descriptors that will NOT be installed on
+                        // this call; they are re-queued at the batch's original
+                        // stream offset so a follow-up recvmsg adopts them.
+                        let remainder: Vec<crate::vfs::FileDescriptor> =
+                            scm_fds.split_off(fits);
                         // Regular-file / memfd descriptors were pinned at enqueue
                         // (PENDING_SCM holds an inode reference invisible to the
                         // VFS fd-table scan).  Once installed in the receiver's
                         // fd table below, the slot itself keeps the inode alive,
                         // so the in-flight pin can be released.  Snapshot the
-                        // (mount_idx, inode) pairs BEFORE the descriptors are
-                        // moved into the table; unpin AFTER PROCESS_TABLE is
-                        // dropped (unpin_inode also takes PROCESS_TABLE).
+                        // (mount_idx, inode) pairs for the INSTALLED prefix only —
+                        // the re-queued remainder keeps its enqueue-time pin.
                         let to_unpin: Vec<(usize, u64)> = scm_fds.iter()
                             .filter(|f| f.file_type == crate::vfs::FileType::RegularFile
                                         && f.mount_idx != usize::MAX)
                             .map(|f| (f.mount_idx, f.inode))
                             .collect();
-                        // Allocate fds in the receiver's process.
+                        // Allocate fds in the receiver's process for the prefix.
                         let new_fd_nums: Vec<i32> = {
                             let mut procs = crate::proc::PROCESS_TABLE.lock();
                             if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
@@ -2537,44 +2584,61 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         for (m, ino) in to_unpin {
                             crate::vfs::unpin_inode(m, ino);
                         }
-                        // Write SCM_RIGHTS cmsghdr into msg_control.  All
-                        // reads/writes here target user memory — single
-                        // SMAP guard spanning the whole block.
+                        // Re-queue the un-installed remainder at the SAME stream
+                        // offset the batch was dequeued from (recvmsg(2) /
+                        // cmsg(3): descriptors that did not fit are NOT orphaned —
+                        // CWE-772).  Keeping the original byte_offset preserves the
+                        // first-byte-touch delivery contract so the next recvmsg
+                        // with a larger control buffer adopts them.
+                        if !remainder.is_empty() {
+                            crate::syscall::scm_queue(unix_id, batch_off, remainder);
+                        }
+                        // The control buffer truncated the batch (either some fds
+                        // did not fit, or ctrl_ptr was 0 / rejected with nfds > 0):
+                        // set MSG_CTRUNC.  OR it into the existing msg_flags so the
+                        // MSG_TRUNC data-truncation bit written by the data path
+                        // above is preserved — both can co-occur (recvmsg(2)).
+                        if new_fd_nums.len() < nfds {
+                            unsafe {
+                                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                                let flags_ptr = (arg2 + 48) as *mut u32;
+                                let cur = core::ptr::read_unaligned(flags_ptr);
+                                core::ptr::write_unaligned(flags_ptr, cur | MSG_CTRUNC);
+                            }
+                        }
+                        // Write the SCM_RIGHTS cmsghdr for the INSTALLED prefix.
+                        // All reads/writes here target user memory — single SMAP
+                        // guard spanning the whole block.
                         //
                         // CWE-823: ctrl_ptr is read from user-controlled
-                        // msghdr.msg_control and is the destination of
-                        // kernel writes below.  Range-validate against the
-                        // exact byte span the writes will touch (`needed`)
-                        // before any write so a kernel-VA in msg_control
-                        // cannot direct the kernel to overwrite arbitrary
-                        // kernel memory with attacker-shaped cmsghdr bytes
-                        // (SOL_SOCKET=1, SCM_RIGHTS=1, then the receiver's
-                        // freshly-installed fd numbers).  SMAP catches the
-                        // missing-AC=1 case for user pages but does not
-                        // catch supervisor writes to kernel-VA; the range
-                        // check is the only line of defence for that.
-                        let needed = 16 + new_fd_nums.len() * 4;
+                        // msghdr.msg_control and is the destination of kernel
+                        // writes below.  The span actually written
+                        // (`16 + fits*4`) was range-validated above
+                        // (`ctrl_ok`); we never write past it.  SMAP catches the
+                        // missing-AC=1 case for user pages; the range check is the
+                        // only line of defence against a kernel-VA in msg_control.
                         unsafe {
                             let _g = crate::arch::x86_64::smap::UserGuard::new();
-                            let ctrl_ptr = core::ptr::read_unaligned(msghdr_ptr.add(4));
-                            let ctrl_len = core::ptr::read_unaligned(msghdr_ptr.add(5)) as usize;
-                            if ctrl_ptr != 0
-                                && ctrl_len >= needed
-                                && crate::syscall::validate_user_ptr(ctrl_ptr, needed)
-                            {
-                                core::ptr::write_unaligned(ctrl_ptr as *mut u64, needed as u64);
+                            if !new_fd_nums.is_empty() {
+                                // ctrl_ok held when fits>0, so the span below was
+                                // validated; cmsg_len = CMSG_LEN(fits*4) = 16 + n*4.
+                                let written = 16 + new_fd_nums.len() * 4;
+                                core::ptr::write_unaligned(ctrl_ptr as *mut u64, written as u64);
                                 core::ptr::write_unaligned((ctrl_ptr + 8)  as *mut i32, 1i32); // SOL_SOCKET
                                 core::ptr::write_unaligned((ctrl_ptr + 12) as *mut i32, 1i32); // SCM_RIGHTS
                                 for (i, &new_fd) in new_fd_nums.iter().enumerate() {
                                     core::ptr::write_unaligned((ctrl_ptr + 16 + i as u64 * 4) as *mut i32, new_fd);
                                 }
-                                core::ptr::write_unaligned(msghdr_ptr.add(5) as *mut u64, needed as u64);
+                                // msg_controllen = bytes actually written.
+                                core::ptr::write_unaligned(msghdr_ptr.add(5) as *mut u64, written as u64);
                             } else if ctrl_ptr != 0 {
-                                // No room or ctrl_ptr not in user space.  The
-                                // msghdr_ptr was already user-range-validated
-                                // at the top of the recvmsg arm, so this
-                                // single field write is safe even when
-                                // ctrl_ptr is rejected.
+                                // Nothing installed (buffer too small for even one
+                                // fd, or ctrl_ptr rejected): no cmsg written,
+                                // CMSG_FIRSTHDR()==NULL.  msg_controllen = 0;
+                                // MSG_CTRUNC was set above.  The msghdr_ptr was
+                                // user-range-validated at the top of the arm, so
+                                // this single field write is safe even when
+                                // ctrl_ptr itself was rejected.
                                 core::ptr::write_unaligned(msghdr_ptr.add(5) as *mut u64, 0u64);
                             }
                         }
@@ -10032,7 +10096,7 @@ fn write_hex64(out: &mut Vec<u8>, mut v: u64) {
 ///  - closed/invalid:      EPOLLERR
 /// Poll the readiness events for `fd` in process `pid`.
 /// Returns a bitmask of EPOLL* flags that are currently set.
-fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
+pub(crate) fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
     use crate::ipc::epoll::{EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP, EPOLLRDHUP};
 
     // Snapshot fd metadata with a brief lock hold.  `mount_idx == usize::MAX`
@@ -10120,7 +10184,18 @@ fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
                     // of parking forever on a pure fd handoff.
                     let has_scm = crate::syscall::has_scm_deliverable(
                         inode, crate::net::unix::recv_consumed(inode));
-                    if has_d || has_scm {
+                    // A LISTENING AF_UNIX socket with a queued connection is
+                    // read-ready: accept(2) will not block.  `has_pending`
+                    // reports the listen(2) accept backlog (backlog_len > 0).
+                    // `poll`/`select` already gate POLLIN on it
+                    // (`syscall::poll_revents` / `do_select`); without it here,
+                    // an epoll-driven accept loop never wakes for an incoming
+                    // connection — POLLIN under poll/select but no EPOLLIN under
+                    // epoll_wait (epoll(7) / accept(2)).  A connected socketpair
+                    // has backlog_len == 0, so this is a no-op for it and only
+                    // restores listening-socket accept-readiness parity.
+                    let has_pend = crate::net::unix::has_pending(inode);
+                    if has_d || has_scm || has_pend {
                         ev |= EPOLLIN;
                     }
                     // `epoll(7)` distinguishes a read-side half-close from a
