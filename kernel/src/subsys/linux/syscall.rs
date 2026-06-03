@@ -1636,6 +1636,22 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 crate::syscall::alloc_unix_socket_fd(pid, unix_id, cloexec, nonblock)
             } else if domain == 2 || domain == 10 {
                 // AF_INET / AF_INET6
+                //
+                // Runtime address-family gate (see net::ipver).  A disabled
+                // family makes socket(2) fail with EAFNOSUPPORT, matching the
+                // documented Linux behaviour when the family is unavailable
+                // (e.g. a kernel booted with `ipv6.disable=1`): socket(2) —
+                // "EAFNOSUPPORT — the implementation does not support the
+                // specified address family".  This is the primary, cleanest
+                // enforcement: a userspace resolver's AI_ADDRCONFIG probe sees
+                // the family fail and skips it (forcing the working family)
+                // rather than building a socket it can never use.
+                if domain == 10 && !crate::net::ipver::ipv6_enabled() {
+                    return -97; // EAFNOSUPPORT
+                }
+                if domain == 2 && !crate::net::ipver::ipv4_enabled() {
+                    return -97; // EAFNOSUPPORT
+                }
                 let net_type = match sock_type {
                     1 => crate::net::socket::SocketType::Tcp,
                     _ => crate::net::socket::SocketType::Udp,
@@ -1692,6 +1708,23 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             } else {
                 if !crate::syscall::is_socket_fd(pid, fd) { return -9; }
                 let socket_id = crate::syscall::get_socket_id(pid, fd);
+                // Runtime address-family gate (see net::ipver).  Belt-and-
+                // suspenders for a socket created *before* the family was
+                // disabled: connect(2) to a destination in a disabled family
+                // returns ENETUNREACH, matching the runtime
+                // `net.ipv6.conf.all.disable_ipv6=1` sysctl (the socket stays
+                // creatable but egress on it is unreachable).  Note: AF_INET6
+                // is the family that matters here — its connect path is not
+                // implemented at all, so this also REPLACES the former
+                // fake-success stub (which lied "connected" to a dead IPv6
+                // address and wedged RFC 6724 Happy-Eyeballs, whose IPv4
+                // fallback requires the dead-family connect to FAIL).
+                if family == 10 && !crate::net::ipver::ipv6_enabled() {
+                    return -101; // ENETUNREACH
+                }
+                if family == 2 && !crate::net::ipver::ipv4_enabled() {
+                    return -101; // ENETUNREACH
+                }
                 if family == 2 && addrlen >= 16 {
                     // sockaddr_in — SMAP-bracketed copy into kernel-local
                     // bytes so the connect / wait loop below runs without
@@ -1745,8 +1778,24 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         }
                         Err(_) => -111, // ECONNREFUSED
                     }
+                } else if family == 2 {
+                    // AF_INET but the sockaddr is too short (addrlen < 16).
+                    // connect(2): "EINVAL — ... the address length is invalid."
+                    -22 // EINVAL
+                } else if family == 10 {
+                    // AF_INET6 with IPv6 enabled: the family passed the gate
+                    // above, but there is still no IPv6 TCP egress path in the
+                    // stack (no handshake), so connect cannot complete.  Return
+                    // ENETUNREACH rather than the former fake-success stub — a
+                    // truthful "cannot reach" lets an IPv6-first resolver fall
+                    // back per RFC 6724 instead of hanging on a dead "connected"
+                    // socket.  When real IPv6 egress lands, replace this arm.
+                    -101 // ENETUNREACH
                 } else {
-                    0 // AF_INET6 stub
+                    // Unknown / unsupported address family in the sockaddr.
+                    // connect(2): "EAFNOSUPPORT — the passed address didn't
+                    // have the correct address family in its sa_family field."
+                    -97 // EAFNOSUPPORT
                 }
             }
         }
@@ -1918,6 +1967,17 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         core::ptr::copy_nonoverlapping(addr_ptr as *const u8, bytes.as_mut_ptr(), 16);
                     }
                     let family = u16::from_le_bytes([bytes[0], bytes[1]]);
+                    // Runtime address-family gate (see net::ipver).  An
+                    // explicitly-addressed datagram to a disabled family fails
+                    // with ENETUNREACH, matching connect(2) above and the
+                    // `net.ipv6.conf.all.disable_ipv6` sysctl — rather than the
+                    // former fake-success (`len as i64`) that silently dropped
+                    // the datagram and lied a full write to the caller.
+                    if (family == 10 && !crate::net::ipver::ipv6_enabled())
+                        || (family == 2 && !crate::net::ipver::ipv4_enabled())
+                    {
+                        return -101; // ENETUNREACH
+                    }
                     if family == 2 {
                         let port = u16::from_be_bytes([bytes[2], bytes[3]]);
                         let ip = [bytes[4], bytes[5], bytes[6], bytes[7]];
@@ -1926,7 +1986,14 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                             Err("EPIPE") => -32,
                             Err(_) => -104,
                         }
-                    } else { len as i64 }
+                    } else if family == 10 {
+                        // AF_INET6 with IPv6 enabled but no egress path — same
+                        // truthful ENETUNREACH as the connect(2) AF_INET6 arm.
+                        -101 // ENETUNREACH
+                    } else {
+                        // Unsupported address family in the destination.
+                        -97 // EAFNOSUPPORT
+                    }
                 } else {
                     match crate::net::socket::socket_send(socket_id, data) {
                         Ok(n) => n as i64,
@@ -2607,8 +2674,37 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     Ok(()) => 0,
                     Err(_) => -98, // EADDRINUSE
                 }
+            } else if family == 10 {
+                // AF_INET6 bind.  A bind only sets local state (no egress), so
+                // when IPv6 is enabled we accept it (the port lives in the same
+                // local table — IPv6/IPv4 distinction is moot for our SLIRP
+                // single-host setup).  When IPv6 is disabled the family is
+                // unsupported, so report EAFNOSUPPORT per bind(2) rather than
+                // faking success.
+                if !crate::net::ipver::ipv6_enabled() {
+                    return -97; // EAFNOSUPPORT
+                }
+                if addrlen >= 8 {
+                    if !crate::syscall::is_socket_fd(pid, fd) { return -9; }
+                    let socket_id = crate::syscall::get_socket_id(pid, fd);
+                    // sockaddr_in6: sin6_port lives at offset 2 (same as
+                    // sockaddr_in), so the local port read is identical.
+                    let mut bytes = [0u8; 8];
+                    unsafe {
+                        let _g = crate::arch::x86_64::smap::UserGuard::new();
+                        core::ptr::copy_nonoverlapping(addr_ptr as *const u8, bytes.as_mut_ptr(), 8);
+                    }
+                    let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+                    match crate::net::socket::socket_bind(socket_id, port) {
+                        Ok(()) => 0,
+                        Err(_) => -98, // EADDRINUSE
+                    }
+                } else {
+                    -22 // EINVAL — sockaddr too short for an AF_INET6 bind
+                }
             } else {
-                0 // unknown family stub
+                // Unsupported address family in the bind sockaddr.
+                -97 // EAFNOSUPPORT
             }
         }
         // 50: listen(sockfd, backlog)
