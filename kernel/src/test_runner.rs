@@ -1549,6 +1549,25 @@ pub fn run() -> ! {
         if test_tcp_read_from_isolation() { passed += 1; }
     }
 
+    // ── Test 281: AF_INET peer-FIN read-closed edge + CloseWait drain ───────
+    //
+    // A peer FIN moves an Established TCB to CloseWait.  Two invariants
+    // must then hold for a poll(2)/epoll(7)-driven reader to complete a
+    // close-delimited response (RFC 9112 §6.3) instead of parking forever:
+    //   1. socket_read_closed() reports the read-closed edge (peer FIN),
+    //      and socket_fully_hung_up() withholds POLLHUP/EPOLLHUP until the
+    //      buffered CloseWait tail is drained (data-before-EOF, RFC 9293
+    //      §3.5).
+    //   2. tcp::read_from() still drains the CloseWait tail (it must accept
+    //      Established|CloseWait, not Established alone), and only after the
+    //      buffer empties does socket_recv_status() report EOF.
+
+    #[cfg(feature = "kdb")]
+    {
+        total += 1;
+        if test_tcp_peer_fin_read_closed_edge() { passed += 1; }
+    }
+
     // ── Test 270: AF_INET accept(2) — end-to-end against in-kernel TCP ────
     //
     // Synthesises two Established child TCBs on a single listening port
@@ -30129,6 +30148,116 @@ fn test_tcp_read_from_isolation() -> bool {
     }
 
     test_pass!("TCP read_from — 4-tuple isolation under shared port");
+    true
+}
+
+// ── Test 281: AF_INET peer-FIN read-closed edge + CloseWait tail drain ───────
+//
+// Models the close-delimited HTTP-response completion path (RFC 9112
+// §6.3) that the necko socket-transport thread depends on: a peer FIN
+// must (a) wake a poll(2)/epoll(7) reader via the read-closed edge so it
+// issues the read() that returns 0 (onStopRequest), and (b) NOT strand a
+// buffered CloseWait tail — the reader must drain the bytes that arrived
+// before/with the FIN before observing EOF (data-before-EOF, RFC 9293
+// §3.5, POSIX read(2)/recv(2)).
+//
+// Regression guard for the readiness gap where the AF_INET poll/epoll
+// arms emitted no POLLHUP/EPOLLHUP/RDHUP on a CloseWait connection and
+// tcp::read/read_from filtered on Established alone.
+#[cfg(feature = "kdb")]
+fn test_tcp_peer_fin_read_closed_edge() -> bool {
+    test_header!("AF_INET peer-FIN read-closed edge + CloseWait drain");
+
+    use crate::net::{tcp, socket};
+    use crate::net::socket::RecvOutcome;
+
+    const LOCAL_PORT: u16 = 47120;
+    let peer_ip:   [u8; 4] = [10, 0, 2, 9];
+    let peer_port: u16     = 52345;
+    const TAIL: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody-tail";
+
+    if let Err(e) = tcp::listen(LOCAL_PORT) {
+        test_fail!("tcp_peer_fin", "listen({}) failed: {}", LOCAL_PORT, e);
+        return false;
+    }
+    // Established TCB with a buffered tail, plus a connected socket fd
+    // (connected=true ⇒ socket_read_closed uses the peer-aware lookup).
+    if let Err(e) = tcp::test_inject_established(LOCAL_PORT, peer_ip, peer_port, TAIL) {
+        test_fail!("tcp_peer_fin", "inject failed: {}", e);
+        return false;
+    }
+    let sid = socket::socket_create_accepted(LOCAL_PORT, peer_ip, peer_port);
+
+    // Pre-FIN (Established): readable on data, NOT read-closed, NOT hung up.
+    if !socket::socket_has_data(sid) {
+        test_fail!("tcp_peer_fin", "pre-FIN: socket not readable with buffered tail");
+        socket::socket_close(sid); return false;
+    }
+    if socket::socket_read_closed(sid) || socket::socket_fully_hung_up(sid) {
+        test_fail!("tcp_peer_fin", "pre-FIN: spurious read-closed/hung-up on Established");
+        socket::socket_close(sid); return false;
+    }
+
+    // Peer FIN → CloseWait (RFC 9293 §3.5).
+    if let Err(e) = tcp::test_set_state(LOCAL_PORT, peer_ip, peer_port,
+                                        tcp::TcpState::CloseWait) {
+        test_fail!("tcp_peer_fin", "set CloseWait failed: {}", e);
+        socket::socket_close(sid); return false;
+    }
+
+    // Post-FIN with tail still buffered: read-closed edge fires, but
+    // POLLHUP is WITHHELD until the tail drains (data-before-EOF).
+    if !socket::socket_read_closed(sid) {
+        test_fail!("tcp_peer_fin", "post-FIN: read-closed edge did NOT fire (poll/epoll would never wake)");
+        socket::socket_close(sid); return false;
+    }
+    if socket::socket_fully_hung_up(sid) {
+        test_fail!("tcp_peer_fin", "post-FIN: POLLHUP raised while tail still buffered (premature EOF)");
+        socket::socket_close(sid); return false;
+    }
+    if !socket::socket_has_data(sid) {
+        test_fail!("tcp_peer_fin", "post-FIN: CloseWait tail not reported readable (Established-only filter regression)");
+        socket::socket_close(sid); return false;
+    }
+
+    // Drain the tail — read_from must accept CloseWait, not Established only.
+    match socket::socket_recv_status(sid) {
+        Ok(RecvOutcome::Data(d)) => {
+            if d != TAIL {
+                test_fail!("tcp_peer_fin", "drained {} bytes, expected {} (tail truncated)",
+                    d.len(), TAIL.len());
+                socket::socket_close(sid); return false;
+            }
+        }
+        Ok(RecvOutcome::Eof) => {
+            test_fail!("tcp_peer_fin", "got EOF before draining the CloseWait tail (data-before-EOF violated)");
+            socket::socket_close(sid); return false;
+        }
+        Ok(RecvOutcome::WouldBlock) => {
+            test_fail!("tcp_peer_fin", "got WouldBlock with a buffered CloseWait tail");
+            socket::socket_close(sid); return false;
+        }
+        Err(e) => {
+            test_fail!("tcp_peer_fin", "recv_status err: {}", e);
+            socket::socket_close(sid); return false;
+        }
+    }
+
+    // Tail drained: now fully hung up — POLLHUP, and recv reports EOF.
+    if !socket::socket_fully_hung_up(sid) {
+        test_fail!("tcp_peer_fin", "post-drain: POLLHUP not raised (reader never observes EOF)");
+        socket::socket_close(sid); return false;
+    }
+    match socket::socket_recv_status(sid) {
+        Ok(RecvOutcome::Eof) => {}
+        other => {
+            test_fail!("tcp_peer_fin", "post-drain: expected EOF, got {:?}", other.is_ok());
+            socket::socket_close(sid); return false;
+        }
+    }
+
+    socket::socket_close(sid);
+    test_pass!("AF_INET peer-FIN read-closed edge + CloseWait drain");
     true
 }
 

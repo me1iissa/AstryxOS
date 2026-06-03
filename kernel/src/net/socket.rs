@@ -738,6 +738,74 @@ pub fn socket_has_data(id: u64) -> bool {
     }
 }
 
+/// True when the peer has closed its send direction (TCP FIN received)
+/// so a subsequent `read(2)` / `recv(2)` will return data still buffered
+/// and then 0 (orderly EOF).  This is the read-closed condition a
+/// `poll(2)` / `epoll(7)` reader keys on to wake and issue the read that
+/// observes EOF.
+///
+/// Mirrors the EOF discrimination in [`socket_recv_status`]: a connection
+/// that has received the peer FIN sits in CloseWait (or has progressed to
+/// LastAck / TimeWait / Closed) — RFC 9293 §3.5.  We do NOT include a
+/// caller-side `shutdown(SHUT_RD)` here because that is the local read
+/// half-close, already surfaced through the socket's own `shut_rd` flag
+/// at the recv layer; this helper is specifically the *peer*-FIN edge
+/// that no readiness arm currently reports.
+///
+/// Returns `false` for UDP (connectionless: no peer-FIN concept) and for
+/// any socket with no matching TCB.
+pub fn socket_read_closed(id: u64) -> bool {
+    let sockets = SOCKETS.lock();
+    let sock = match sockets.iter().find(|s| s.id == id) {
+        Some(s) => s,
+        None => return false,
+    };
+    if !sock.bound { return false; }
+    match sock.socket_type {
+        SocketType::Udp => false,
+        SocketType::Tcp => {
+            // Prefer a peer-aware lookup when the 4-tuple is known so the
+            // edge fires for THIS connection, not a sibling sharing the
+            // local port (RFC 9293 §3.6 demultiplexing).
+            let state = if sock.connected && sock.remote_port != 0 {
+                super::tcp::get_state_for(sock.local_port,
+                                          sock.remote_ip,
+                                          sock.remote_port)
+            } else {
+                super::tcp::get_state(sock.local_port)
+            };
+            match state {
+                Some(st) => matches!(st,
+                    super::tcp::TcpState::CloseWait
+                    | super::tcp::TcpState::LastAck
+                    | super::tcp::TcpState::TimeWait
+                    | super::tcp::TcpState::Closed),
+                // No TCB: the flow is gone — treat as read-closed so a
+                // parked reader wakes and drains to a clean EOF rather
+                // than parking on a connection that will never deliver.
+                None => true,
+            }
+        }
+    }
+}
+
+/// True when the connection is read-closed (peer FIN) **and** the receive
+/// buffer is empty — i.e. the next `read(2)` returns 0 with nothing left
+/// to drain.  This is the `poll(2)` `POLLHUP` / `epoll(7)` `EPOLLHUP`
+/// condition: the read direction is fully hung up.
+///
+/// While a CloseWait tail is still buffered this returns `false` so the
+/// readiness arm raises `POLLIN` (drain) but withholds `POLLHUP` until
+/// the buffer empties — data-before-EOF ordering (RFC 9293 §3.5, POSIX
+/// `poll(2)` which sets `POLLHUP` only once the channel is fully dead).
+pub fn socket_fully_hung_up(id: u64) -> bool {
+    if !socket_read_closed(id) {
+        return false;
+    }
+    // Read-closed: hung up iff no buffered tail remains to drain.
+    !socket_has_data(id)
+}
+
 /// Close a socket.
 ///
 /// For TCP, the underlying close path depends on whether this socket

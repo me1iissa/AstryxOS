@@ -855,6 +855,27 @@ pub fn get_state(port: u16) -> Option<TcpState> {
         .map(|c| c.state)
 }
 
+/// Peer-aware variant of [`get_state`]: returns the state of the TCB
+/// matching the full 4-tuple `(local_port, remote_ip, remote_port)`.
+///
+/// A `local_port`-only lookup is ambiguous when several connected
+/// sessions (or a listener plus its accepted children) share one local
+/// port — `get_state` returns whichever TCB happens to be found first,
+/// which may be a sibling rather than the caller's own connection
+/// (RFC 9293 §3.6 demultiplexing is by the full 4-tuple).  A `poll(2)` /
+/// `epoll(7)` readiness probe must observe *its own* connection's state
+/// so a peer-FIN read-closed edge fires for the correct fd, so the
+/// socket layer prefers this when a peer 4-tuple is known.
+pub fn get_state_for(local_port: u16,
+                     remote_ip:  Ipv4Address,
+                     remote_port: u16) -> Option<TcpState> {
+    TCP_CONNECTIONS.lock().iter()
+        .find(|c| c.local_port  == local_port
+                  && c.remote_ip   == remote_ip
+                  && c.remote_port == remote_port)
+        .map(|c| c.state)
+}
+
 /// Returns true if any TCB on `port` is in the Listen state — used by
 /// the socket-layer ephemeral-port allocator to probe for collisions.
 pub fn is_listening(port: u16) -> bool {
@@ -921,7 +942,16 @@ pub fn inject_ack(port: u16, ack_num: u32, window: u16) {
 pub fn has_data(port: u16) -> bool {
     TCP_CONNECTIONS.lock().iter()
         .any(|c| c.local_port == port
-                 && c.state == TcpState::Established
+                 // `Established | CloseWait`: a peer FIN moves the TCB to
+                 // CloseWait but any bytes that arrived before (or in the
+                 // same segment as) the FIN are still queued and MUST remain
+                 // drainable — a reader has to consume the tail before it
+                 // observes EOF (data-before-EOF ordering, RFC 9293 §3.5,
+                 // POSIX read(2)/recv(2)).  Restricting to Established alone
+                 // strands a CloseWait tail and reports an undrainable
+                 // socket as not-readable.
+                 && matches!(c.state,
+                     TcpState::Established | TcpState::CloseWait)
                  && !c.recv_buffer.is_empty())
 }
 
@@ -937,14 +967,26 @@ pub fn has_data_for(local_port: u16,
         .any(|c| c.local_port  == local_port
                  && c.remote_ip   == remote_ip
                  && c.remote_port == remote_port
-                 && c.state       == TcpState::Established
+                 // See `has_data`: a CloseWait tail (bytes that arrived
+                 // before/with the peer FIN) stays drainable until empty
+                 // (RFC 9293 §3.5, POSIX read(2)/recv(2)).
+                 && matches!(c.state,
+                     TcpState::Established | TcpState::CloseWait)
                  && !c.recv_buffer.is_empty())
 }
 
 pub fn read(port: u16) -> Vec<u8> {
     let mut conns = TCP_CONNECTIONS.lock();
     if let Some(conn) = conns.iter_mut()
-        .find(|c| c.local_port == port && c.state == TcpState::Established)
+        // `Established | CloseWait`: drain any buffered tail that arrived
+        // before/with the peer FIN so the reader sees the bytes BEFORE the
+        // EOF (data-before-EOF ordering, RFC 9293 §3.5, POSIX read(2)).
+        // `socket_recv_status` only reports EOF once this buffer is empty,
+        // so widening the read filter cannot produce a premature 0-byte
+        // return — it only prevents a stranded CloseWait tail.
+        .find(|c| c.local_port == port
+                  && matches!(c.state,
+                      TcpState::Established | TcpState::CloseWait))
     {
         let d = conn.recv_buffer.clone();
         conn.recv_buffer.clear();
@@ -1017,6 +1059,27 @@ pub fn test_inject_established(local_port: u16, remote_ip: Ipv4Address,
     Ok(())
 }
 
+/// Test-only: force the state of the TCB matching the given 4-tuple,
+/// modelling a peer-driven transition (e.g. a received FIN moving an
+/// Established connection to CloseWait, RFC 9293 §3.5) without paying the
+/// wire round-trip.  Returns `Err` if no matching TCB exists.  Gated on
+/// `kdb` alongside [`test_inject_established`].
+#[cfg(feature = "kdb")]
+pub fn test_set_state(local_port: u16, remote_ip: Ipv4Address,
+                      remote_port: u16, state: TcpState)
+    -> Result<(), &'static str>
+{
+    let mut conns = TCP_CONNECTIONS.lock();
+    match conns.iter_mut().find(|c|
+        c.local_port  == local_port
+        && c.remote_ip   == remote_ip
+        && c.remote_port == remote_port)
+    {
+        Some(c) => { c.state = state; Ok(()) }
+        None => Err("no matching TCB"),
+    }
+}
+
 /// Drain the receive buffer of the established TCB identified by the full
 /// 4-tuple `(local_port, remote_ip, remote_port)`.
 ///
@@ -1033,7 +1096,10 @@ pub fn read_from(local_port: u16, remote_ip: Ipv4Address, remote_port: u16) -> V
         c.local_port  == local_port
             && c.remote_ip   == remote_ip
             && c.remote_port == remote_port
-            && c.state       == TcpState::Established
+            // See `read`: drain a CloseWait tail before EOF (RFC 9293 §3.5,
+            // POSIX read(2)/recv(2)).
+            && matches!(c.state,
+                TcpState::Established | TcpState::CloseWait)
     }) {
         let d = conn.recv_buffer.clone();
         conn.recv_buffer.clear();

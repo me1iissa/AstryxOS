@@ -4324,6 +4324,38 @@ pub(crate) fn poll_revents(pid: u64, fd: usize, events: u16) -> u16 {
         let mut rev = 0u16;
         if crate::net::socket::socket_has_data(sid) { rev |= events & POLLIN; }
         rev |= events & POLLOUT;
+        // Peer read-closed / full hang-up edges, mirroring the AF_UNIX arm
+        // above.  Without these an AF_INET reader parked in `poll(2)` on a
+        // TCP fd is never woken when the peer sends FIN (CloseWait): no
+        // POLLIN-on-EOF, no POLLRDHUP, no POLLHUP — so it never issues the
+        // `read(2)` that returns 0 and signals end-of-response.  A length-
+        // delimited consumer that ends its message on connection close
+        // (RFC 9112 §6.3, "close-delimited" responses) then waits forever.
+        //
+        //   * read-closed (peer FIN, RFC 9293 §3.5): the read end becomes
+        //     readable — `read()` returns the buffered tail then 0 (EOF) —
+        //     so POLLIN is raised, and POLLRDHUP ("read EOF, write side may
+        //     still be valid") when the caller subscribed it.  POLLOUT
+        //     (above) stays set.
+        //   * fully hung up (read-closed AND nothing left to drain): POSIX
+        //     `poll(2)` reports POLLHUP unconditionally; it coexists with
+        //     POLLIN so a draining reader still observes EOF.
+        let rc = crate::net::socket::socket_read_closed(sid);
+        let hup = crate::net::socket::socket_fully_hung_up(sid);
+        if rc {
+            rev |= events & POLLIN;
+            rev |= events & POLLRDHUP;
+        }
+        if hup {
+            rev |= POLLHUP;
+            rev |= events & POLLIN;
+        }
+        #[cfg(feature = "firefox-test")]
+        if (rc || hup) && events & POLLIN != 0 {
+            crate::serial_println!(
+                "[FF/tcp-eof] poll pid={} fd={} sid={} read_closed={} hup={} revents={:#x}",
+                pid, fd, sid, rc, hup, rev);
+        }
         rev
     } else if is_pipe_fd(pid, fd) {
         let pipe_id = get_pipe_id(pid, fd);

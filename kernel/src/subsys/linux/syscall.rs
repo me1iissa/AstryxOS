@@ -10210,6 +10210,35 @@ fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
                     if crate::net::socket::socket_has_data(inode) {
                         ev |= EPOLLIN;
                     }
+                    // Peer read-closed / full hang-up edges, mirroring the
+                    // AF_UNIX arm above.  Without these an AF_INET reader in
+                    // `epoll_wait(2)` on a TCP fd is never woken on a peer
+                    // FIN (CloseWait): no EPOLLIN-on-EOF, no EPOLLRDHUP, no
+                    // EPOLLHUP — so it never issues the `read(2)` that
+                    // returns 0 and signals end-of-response, and a close-
+                    // delimited consumer (RFC 9112 §6.3) waits forever.
+                    //
+                    //   * read-closed (peer FIN, RFC 9293 §3.5) → the read
+                    //     end is readable (read() drains the tail then
+                    //     returns 0) so EPOLLIN, plus EPOLLRDHUP ("read EOF,
+                    //     write still valid").  EPOLLOUT stays set.
+                    //   * fully hung up (read-closed AND nothing to drain) →
+                    //     EPOLLHUP, which `epoll(7)` reports regardless of
+                    //     the interest mask.
+                    let rc = crate::net::socket::socket_read_closed(inode);
+                    let hup = crate::net::socket::socket_fully_hung_up(inode);
+                    if rc {
+                        ev |= EPOLLIN | EPOLLRDHUP;
+                    }
+                    if hup {
+                        ev |= EPOLLHUP;
+                    }
+                    #[cfg(feature = "firefox-test")]
+                    if rc || hup {
+                        crate::serial_println!(
+                            "[FF/tcp-eof] epoll pid={} fd={} sid={} read_closed={} hup={} events={:#x}",
+                            pid, fd, inode, rc, hup, ev);
+                    }
                     ev
                 }
             } else {
