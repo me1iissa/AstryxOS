@@ -2062,7 +2062,12 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 // DNS resolvers retry within 5 s anyway (RFC 1035 §4.2.1).
                 if blocking {
                     let deadline = crate::arch::x86_64::irq::get_ticks() + 3000;
-                    while !crate::net::socket::socket_has_data(socket_id) {
+                    // Break on data OR on an orderly peer-FIN EOF.  A blocking
+                    // recv on a stream whose peer has sent FIN with an empty
+                    // buffer must wake and return 0 (RFC 9293 §3.5) — it would
+                    // otherwise spin to the deadline since no data will arrive.
+                    while !crate::net::socket::socket_has_data(socket_id)
+                        && !crate::net::socket::socket_is_read_closed(socket_id) {
                         if signal_pending(pid) { return -4; } // EINTR
                         crate::net::poll();
                         if crate::arch::x86_64::irq::get_ticks() >= deadline {
@@ -2071,16 +2076,30 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         crate::sched::yield_cpu();
                     }
                 }
-                match crate::net::socket::socket_recvfrom(socket_id) {
-                    Ok((data, src_ip, src_port)) => {
-                        // Empty result on a non-blocking socket = EAGAIN
-                        // per IEEE 1003.1 §recvfrom.  We can only hit
-                        // this branch when blocking==false (the wait
-                        // loop above guarantees data on the blocking
-                        // path) so the userspace contract holds.
-                        if data.is_empty() {
-                            return -11; // EAGAIN
-                        }
+                // MSG_PEEK (0x2): non-destructive probe.  We cannot peek
+                // buffered stream bytes without consuming them, but EOF
+                // discovery must still work so a peeking reader (e.g. an
+                // Available()-style backup that PEEKs before draining) learns
+                // the connection is closed: a peek on a FIN'd empty stream
+                // returns 0, not -EAGAIN.  When data is buffered, fall through
+                // to the normal drain (best-effort: returns the bytes; the
+                // peek-non-consume guarantee is not yet wired and no current
+                // userspace path PEEKs buffered AF_INET stream data).
+                let msg_peek = (flags & 0x2) != 0;
+                if msg_peek && crate::net::socket::socket_is_read_closed(socket_id)
+                    && !crate::net::socket::socket_has_data(socket_id) {
+                    return 0; // orderly shutdown, observed via peek
+                }
+                // EOF-aware drain: give recvfrom(2) the same peer-FIN
+                // discrimination as recvmsg(2) (nr=47).  Per recv(2) /
+                // RFC 9293 §3.5: a peer-FIN'd empty stream is an orderly
+                // shutdown → return 0; a still-open empty stream is
+                // would-block → -EAGAIN.  The kernel poll readiness
+                // (POLLIN|POLLHUP) is left faithful; only the recv return
+                // is corrected so a level-triggered reactor observes EOF,
+                // closes the fd, and stops re-polling it forever.
+                match crate::net::socket::socket_recv_status_from(socket_id) {
+                    Ok((crate::net::socket::RecvOutcome::Data(data), src_ip, src_port)) => {
                         let n = data.len().min(len);
                         if n > 0 {
                             unsafe {
@@ -2105,6 +2124,11 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         }
                         n as i64
                     }
+                    // Orderly peer shutdown (FIN): 0-byte return per recv(2).
+                    // Leaves the user address buffer untouched (no message).
+                    Ok((crate::net::socket::RecvOutcome::Eof, _, _)) => 0,
+                    // Empty queue on an open stream / no datagram: EAGAIN.
+                    Ok((crate::net::socket::RecvOutcome::WouldBlock, _, _)) => -11,
                     Err(_) => -11,
                 }
             }
