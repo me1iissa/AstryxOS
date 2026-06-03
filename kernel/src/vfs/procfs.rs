@@ -96,6 +96,16 @@ const INO_OVERCOMMIT:        u64 = 2040;
 const INO_MAX_MAP_COUNT:     u64 = 2041;
 const INO_PID_MAX:           u64 = 2042;
 const INO_RAND_UUID:         u64 = 2043;
+// /proc/sys/net/ipv6/conf/{all,default}/disable_ipv6 — the Linux-faithful
+// runtime IPv6 enable/disable sysctl (see net::ipver).  Reading returns
+// "1\n" when IPv6 is disabled, "0\n" when enabled; writing "1"/"0" toggles it.
+const INO_SYS_NET_DIR:       u64 = 2070; // sys/net/
+const INO_SYS_NET_IPV6_DIR:  u64 = 2071; // sys/net/ipv6/
+const INO_SYS_NET_IPV6_CONF: u64 = 2072; // sys/net/ipv6/conf/
+const INO_SYS_NET_IPV6_ALL:  u64 = 2073; // sys/net/ipv6/conf/all/
+const INO_SYS_NET_IPV6_DEF:  u64 = 2074; // sys/net/ipv6/conf/default/
+const INO_DISABLE_IPV6_ALL:  u64 = 2075; // sys/net/ipv6/conf/all/disable_ipv6
+const INO_DISABLE_IPV6_DEF:  u64 = 2076; // sys/net/ipv6/conf/default/disable_ipv6
 
 // ── ProcFs filesystem ────────────────────────────────────────────────────────
 
@@ -125,7 +135,12 @@ impl ProcFs {
             | INO_SYS_DIR
             | INO_SYS_VM_DIR
             | INO_SYS_KERNEL_DIR
-            | INO_SYS_KERNEL_RAND => Some(FileType::Directory),
+            | INO_SYS_KERNEL_RAND
+            | INO_SYS_NET_DIR
+            | INO_SYS_NET_IPV6_DIR
+            | INO_SYS_NET_IPV6_CONF
+            | INO_SYS_NET_IPV6_ALL
+            | INO_SYS_NET_IPV6_DEF => Some(FileType::Directory),
 
             INO_CPUINFO
             | INO_MEMINFO
@@ -150,7 +165,9 @@ impl ProcFs {
             | INO_OVERCOMMIT
             | INO_MAX_MAP_COUNT
             | INO_PID_MAX
-            | INO_RAND_UUID => Some(FileType::RegularFile),
+            | INO_RAND_UUID
+            | INO_DISABLE_IPV6_ALL
+            | INO_DISABLE_IPV6_DEF => Some(FileType::RegularFile),
 
             // /proc/self/fd/<N> entries — modelled as symlinks per the Linux
             // procfs(5) contract.  Inode encoding: 3000 + fd_num (see
@@ -217,6 +234,18 @@ impl ProcFs {
             INO_MAX_MAP_COUNT => Some(b"65530\n".to_vec()),
             INO_PID_MAX       => Some(b"65536\n".to_vec()),
             INO_RAND_UUID     => Some(b"deadbeef-cafe-1234-5678-0a0b0c0d0e0f\n".to_vec()),
+            // /proc/sys/net/ipv6/conf/{all,default}/disable_ipv6 — the value is
+            // the logical negation of net::ipver::ipv6_enabled().  "1\n" means
+            // IPv6 is disabled, "0\n" means it is enabled.  Both the `all` and
+            // `default` nodes read the same global flag (AstryxOS has a single
+            // network namespace / interface set).
+            INO_DISABLE_IPV6_ALL | INO_DISABLE_IPV6_DEF => {
+                if crate::net::ipver::ipv6_enabled() {
+                    Some(b"0\n".to_vec())
+                } else {
+                    Some(b"1\n".to_vec())
+                }
+            }
             _ => None,
         }
     }
@@ -287,11 +316,21 @@ impl FileSystemOps for ProcFs {
             (INO_SELF_TASK_TID_DIR, "stat") => Ok(INO_SELF_TASK_STAT),
             (INO_SYS_DIR,  "vm")            => Ok(INO_SYS_VM_DIR),
             (INO_SYS_DIR,  "kernel")        => Ok(INO_SYS_KERNEL_DIR),
+            (INO_SYS_DIR,  "net")           => Ok(INO_SYS_NET_DIR),
             (INO_SYS_VM_DIR, "overcommit_memory") => Ok(INO_OVERCOMMIT),
             (INO_SYS_VM_DIR, "max_map_count")     => Ok(INO_MAX_MAP_COUNT),
             (INO_SYS_KERNEL_DIR, "pid_max")       => Ok(INO_PID_MAX),
             (INO_SYS_KERNEL_DIR, "random")        => Ok(INO_SYS_KERNEL_RAND),
             (INO_SYS_KERNEL_RAND, "uuid")         => Ok(INO_RAND_UUID),
+            // /proc/sys/net/ipv6/conf/{all,default}/disable_ipv6 — runtime IPv6
+            // toggle (see net::ipver).  Path components per the Linux
+            // ip-sysctl(7) layout.
+            (INO_SYS_NET_DIR,        "ipv6")         => Ok(INO_SYS_NET_IPV6_DIR),
+            (INO_SYS_NET_IPV6_DIR,   "conf")         => Ok(INO_SYS_NET_IPV6_CONF),
+            (INO_SYS_NET_IPV6_CONF,  "all")          => Ok(INO_SYS_NET_IPV6_ALL),
+            (INO_SYS_NET_IPV6_CONF,  "default")      => Ok(INO_SYS_NET_IPV6_DEF),
+            (INO_SYS_NET_IPV6_ALL,   "disable_ipv6") => Ok(INO_DISABLE_IPV6_ALL),
+            (INO_SYS_NET_IPV6_DEF,   "disable_ipv6") => Ok(INO_DISABLE_IPV6_DEF),
             // /proc/self/fd/<N> — any numeric name is accepted (returns a stub inode)
             (INO_SELF_FD_DIR, _) if !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()) => {
                 // Use the fd number as part of the inode.  The VFS readlink syscall
@@ -323,6 +362,8 @@ impl FileSystemOps for ProcFs {
         // oom_score_adj / loginuid are writable per proc(5).
         let perms = match inode {
             INO_SELF_OOM_ADJ | INO_SELF_LOGINUID => 0o644,
+            // disable_ipv6 sysctls are writable per the Linux sysctl contract.
+            INO_DISABLE_IPV6_ALL | INO_DISABLE_IPV6_DEF => 0o644,
             _ => match file_type {
                 FileType::Directory   => 0o555,
                 FileType::RegularFile => 0o444,
@@ -420,6 +461,7 @@ impl FileSystemOps for ProcFs {
             INO_SYS_DIR => alloc::vec![
                 d!("vm",     INO_SYS_VM_DIR),
                 d!("kernel", INO_SYS_KERNEL_DIR),
+                d!("net",    INO_SYS_NET_DIR),
             ],
             INO_SYS_VM_DIR => alloc::vec![
                 f!("overcommit_memory", INO_OVERCOMMIT),
@@ -431,6 +473,23 @@ impl FileSystemOps for ProcFs {
             ],
             INO_SYS_KERNEL_RAND => alloc::vec![
                 f!("uuid", INO_RAND_UUID),
+            ],
+            // /proc/sys/net/ipv6/conf/{all,default}/disable_ipv6 (see net::ipver).
+            INO_SYS_NET_DIR => alloc::vec![
+                d!("ipv6", INO_SYS_NET_IPV6_DIR),
+            ],
+            INO_SYS_NET_IPV6_DIR => alloc::vec![
+                d!("conf", INO_SYS_NET_IPV6_CONF),
+            ],
+            INO_SYS_NET_IPV6_CONF => alloc::vec![
+                d!("all",     INO_SYS_NET_IPV6_ALL),
+                d!("default", INO_SYS_NET_IPV6_DEF),
+            ],
+            INO_SYS_NET_IPV6_ALL => alloc::vec![
+                f!("disable_ipv6", INO_DISABLE_IPV6_ALL),
+            ],
+            INO_SYS_NET_IPV6_DEF => alloc::vec![
+                f!("disable_ipv6", INO_DISABLE_IPV6_DEF),
             ],
             _ => return Err(VfsError::NotADirectory),
         };
@@ -450,6 +509,22 @@ impl FileSystemOps for ProcFs {
             // canonical behaviour here; the Linux contract is "write succeeds
             // and returns the byte count" (per proc(5) / man 5 proc).
             INO_SELF_OOM_ADJ | INO_SELF_LOGINUID => Ok(data.len()),
+            // /proc/sys/net/ipv6/conf/{all,default}/disable_ipv6 — the
+            // Linux-faithful runtime IPv6 toggle (see net::ipver).  Per the
+            // sysctl contract a leading "1" disables IPv6, a leading "0"
+            // enables it; the value is the negation of ipv6_enabled().  We
+            // parse the first non-whitespace byte (echo writes "1\n").  An
+            // unparseable value is rejected with EINVAL, matching the kernel
+            // sysctl handler.  Both `all` and `default` map to the same global
+            // flag (single network namespace).
+            INO_DISABLE_IPV6_ALL | INO_DISABLE_IPV6_DEF => {
+                let first = data.iter().find(|&&b| !b.is_ascii_whitespace());
+                match first {
+                    Some(b'0') => { crate::net::ipver::set_ipv6_enabled(true);  Ok(data.len()) }
+                    Some(b'1') => { crate::net::ipver::set_ipv6_enabled(false); Ok(data.len()) }
+                    _ => Err(VfsError::InvalidArg), // EINVAL
+                }
+            }
             _ => Err(VfsError::PermissionDenied),
         }
     }

@@ -379,6 +379,9 @@ pub fn dispatch(req: &str, out: &mut String) {
         // stable across builds.
         "record-status" => op_record_status(out),
         "replay-dump"   => op_replay_dump(req, out),
+        // net-ipver: read or toggle the runtime IPv4/IPv6 address-family
+        // enable flags (net::ipver).  One-shot, structured JSON output.
+        "net-ipver"     => op_net_ipver(req, out),
         _ => {
             out.push_str(r#"{"error":"unknown op: "#);
             for c in op.chars().take(64) {
@@ -3355,6 +3358,52 @@ fn op_futex_set_cluster_wake(req: &str, out: &mut String) {
             );
         }
     }
+}
+
+// ── net-ipver ─────────────────────────────────────────────────────────────────
+//
+// Read or toggle the runtime IPv4/IPv6 address-family enable flags
+// (net::ipver).  One-shot, structured JSON.
+//
+//   {"op":"net-ipver"}                          → report current state
+//   {"op":"net-ipver","family":"6","state":"off"}  → disable IPv6, then report
+//   {"op":"net-ipver","family":"4","state":"on"}   → enable IPv4, then report
+//
+// Always emits the full {ipv4_enabled, ipv6_enabled} state so a caller never
+// needs a second round-trip to read back the effect of a toggle.
+fn op_net_ipver(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    let family = extract_field(req, "family");
+    let state  = extract_field(req, "state").map(|v| v.to_ascii_lowercase());
+
+    // Apply a toggle only when BOTH family and a recognised state are present.
+    let mut applied: Option<&'static str> = None;
+    let mut bad: Option<&'static str> = None;
+    if let Some(fam) = family.as_deref() {
+        let on = match state.as_deref() {
+            Some("on") | Some("1") | Some("true")  | Some("enable")  => Some(true),
+            Some("off") | Some("0") | Some("false") | Some("disable") => Some(false),
+            _ => None,
+        };
+        match (fam, on) {
+            ("4", Some(v)) => { crate::net::ipver::set_ipv4_enabled(v); applied = Some("ipv4"); }
+            ("6", Some(v)) => { crate::net::ipver::set_ipv6_enabled(v); applied = Some("ipv6"); }
+            (_, None)      => { bad = Some("missing or unrecognised 'state' (expected on|off)"); }
+            _              => { bad = Some("unrecognised 'family' (expected 4 or 6)"); }
+        }
+    }
+
+    let v4 = crate::net::ipver::ipv4_enabled();
+    let v6 = crate::net::ipver::ipv6_enabled();
+    out.push('{');
+    if let Some(a) = applied { let _ = write!(out, r#""applied":"{}","#, a); }
+    if let Some(e) = bad     { let _ = write!(out, r#""error":"{}","#, e); }
+    let _ = write!(
+        out,
+        r#""ipv4_enabled":{},"ipv6_enabled":{}}}"#,
+        if v4 { "true" } else { "false" },
+        if v6 { "true" } else { "false" },
+    );
 }
 
 // ── procmaps ──────────────────────────────────────────────────────────────────
