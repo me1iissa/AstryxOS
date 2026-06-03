@@ -547,17 +547,41 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8],
             if hdr.flags & ACK != 0 {
                 handle_ack(conn, hdr.ack_num);
             }
-            // In-order data.
-            if !payload.is_empty() && hdr.seq_num == conn.recv_next {
+            // In-order data: accept only when the segment begins exactly at
+            // recv_next (RFC 9293 §3.10.7.4 — a segment is processed in
+            // sequence-number order).
+            let in_order = !payload.is_empty() && hdr.seq_num == conn.recv_next;
+            if in_order {
                 conn.recv_buffer.extend_from_slice(payload);
                 conn.recv_next = conn.recv_next.wrapping_add(payload.len() as u32);
                 let sn = conn.send_next;
                 let rn = conn.recv_next;
                 let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
                 out.push(OutSeg { remote_ip: rip, seg: s });
+            } else if !payload.is_empty() && hdr.seq_num != conn.recv_next {
+                // Out-of-order in-window data (a sequence hole).  Drop the
+                // payload but emit an immediate duplicate ACK re-acking
+                // recv_next so the peer fast-retransmits the missing segment
+                // (RFC 5681 §3.2) instead of waiting a full RTO.  Without
+                // this, a single reordered/lost segment in a multi-segment
+                // HTTP(S) response stalls for seconds.
+                let sn = conn.send_next;
+                let rn = conn.recv_next;
+                let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
+                out.push(OutSeg { remote_ip: rip, seg: s });
             }
-            // FIN from peer.
-            if hdr.flags & FIN != 0 {
+            // FIN from peer.  Consume the FIN (advance recv_next, transition to
+            // CloseWait) ONLY when it sits exactly at recv_next — i.e. the
+            // segment's data has been delivered in order and the FIN occupies
+            // the next sequence number (RFC 9293 §3.10.7.4 / RFC 793 §3.5: a
+            // FIN is processed only after all preceding data).  An out-of-order
+            // segment that carries data+FIN must NOT prematurely close the
+            // connection on a truncated body — its FIN is honored only once the
+            // gap is filled and recv_next reaches it (on the peer's
+            // retransmission).
+            let fin_at_nxt = (hdr.flags & FIN != 0)
+                && hdr.seq_num.wrapping_add(payload.len() as u32) == conn.recv_next;
+            if fin_at_nxt {
                 conn.recv_next = conn.recv_next.wrapping_add(1);
                 conn.state = TcpState::CloseWait;
                 let sn = conn.send_next;
@@ -571,7 +595,12 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8],
             if hdr.flags & ACK != 0 {
                 handle_ack(conn, hdr.ack_num);
             }
-            if hdr.flags & FIN != 0 {
+            // Honor the peer's FIN only when it sits exactly at recv_next
+            // (RFC 9293 §3.10.7.4 / RFC 793 §3.5) — an out-of-order data+FIN
+            // segment must not prematurely close.
+            let fin_at_nxt = (hdr.flags & FIN != 0)
+                && hdr.seq_num.wrapping_add(payload.len() as u32) == conn.recv_next;
+            if fin_at_nxt {
                 // Simultaneous close or ACK+FIN in same segment.
                 conn.recv_next = conn.recv_next.wrapping_add(1);
                 conn.state = TcpState::TimeWait;
@@ -581,13 +610,16 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8],
                 let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
                 out.push(OutSeg { remote_ip: rip, seg: s });
             } else if hdr.flags & ACK != 0 {
-                // Pure ACK (no FIN): move to FinWait2.
+                // Pure ACK (no in-order FIN): move to FinWait2.
                 conn.state = TcpState::FinWait2;
             }
         }
 
         TcpState::FinWait2 => {
-            if hdr.flags & FIN != 0 {
+            // Honor the peer's FIN only when it sits exactly at recv_next.
+            let fin_at_nxt = (hdr.flags & FIN != 0)
+                && hdr.seq_num.wrapping_add(payload.len() as u32) == conn.recv_next;
+            if fin_at_nxt {
                 conn.recv_next = conn.recv_next.wrapping_add(1);
                 conn.state = TcpState::TimeWait;
                 conn.timewait_start = crate::arch::x86_64::irq::get_ticks();
@@ -1015,6 +1047,53 @@ pub fn test_inject_established(local_port: u16, remote_ip: Ipv4Address,
         accepted:    false,
     });
     Ok(())
+}
+
+/// Test-only: feed a single synthetic segment to the Established TCB on
+/// `(local_port, remote_ip, remote_port)` via the real `process_segment`
+/// path, then report the resulting `(state, recv_buffer_len)`.
+///
+/// Used to cover the out-of-order receive paths a real multi-segment HTTP(S)
+/// response exercises (a reordered/lost segment, a data+FIN that arrives ahead
+/// of the gap) without an e1000+SLIRP round-trip.  `seq` is the segment's
+/// sequence number, `payload` its data, `fin` whether the FIN flag is set.
+/// Any reply segments `process_segment` builds are discarded (the test only
+/// inspects connection state, not the wire ACKs).
+#[cfg(feature = "kdb")]
+pub fn test_feed_segment(local_port: u16, remote_ip: Ipv4Address,
+                          remote_port: u16, seq: u32, payload: &[u8],
+                          fin: bool) -> Option<(TcpState, usize)> {
+    let mut conns = TCP_CONNECTIONS.lock();
+    let conn = conns.iter_mut().find(|c|
+        c.local_port  == local_port
+        && c.remote_ip   == remote_ip
+        && c.remote_port == remote_port)?;
+    let hdr = TcpHeader {
+        src_port:    remote_port,
+        dst_port:    local_port,
+        seq_num:     seq,
+        ack_num:     conn.send_next,
+        data_offset: 5,
+        flags:       ACK | if fin { FIN } else { 0 },
+        window:      65535,
+        checksum:    0,
+    };
+    let mut out: Vec<OutSeg> = Vec::new();
+    process_segment(conn, &hdr, payload, &mut out);
+    Some((conn.state, conn.recv_buffer.len()))
+}
+
+/// Test-only: read the current recv_next of the Established TCB (so a test
+/// can compute an in-order vs out-of-order sequence number).
+#[cfg(feature = "kdb")]
+pub fn test_recv_next(local_port: u16, remote_ip: Ipv4Address,
+                       remote_port: u16) -> Option<u32> {
+    let conns = TCP_CONNECTIONS.lock();
+    conns.iter().find(|c|
+        c.local_port  == local_port
+        && c.remote_ip   == remote_ip
+        && c.remote_port == remote_port)
+        .map(|c| c.recv_next)
 }
 
 /// Drain the receive buffer of the established TCB identified by the full

@@ -712,7 +712,13 @@ def _get_watch_test():
 
 # ── Session directory ─────────────────────────────────────────────────────────
 
-HARNESS_DIR = Path.home() / ".astryx-harness"
+# The session directory may be overridden via ASTRYX_HARNESS_DIR.  This lets
+# two agents (or a soak loop and an interactive debug session) run concurrently
+# on the same host without their session-state files colliding — notably so
+# one agent's leaked-session cleanup ("any *.json appearing during the trial is
+# presumed ours → stop it") cannot reap the other agent's live QEMU.  Default
+# is the shared ~/.astryx-harness when the env var is unset.
+HARNESS_DIR = Path(os.environ.get("ASTRYX_HARNESS_DIR", str(Path.home() / ".astryx-harness")))
 HARNESS_DIR.mkdir(parents=True, exist_ok=True)
 
 # snap-gate: dedicated qcow2 vmstate / data-overlay files + the named-snapshot
@@ -1280,6 +1286,14 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        # Detach QEMU into its own session/process-group so it survives the
+        # teardown of the (possibly short-lived) shell that invoked `start`.
+        # Without this, an agent that runs `start` as a backgrounded one-shot
+        # has QEMU reaped (SIGKILL) the moment that wrapper process tree is
+        # cleaned up — even though the session JSON/serial-log persist on disk,
+        # leaving a "no_session"/defunct-qemu mismatch.  setsid is the standard
+        # POSIX way to orphan a long-lived child from its launcher.
+        start_new_session=True,
     )
     return proc
 

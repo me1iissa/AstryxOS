@@ -1553,6 +1553,21 @@ pub fn run() -> ! {
         if test_tcp_read_from_isolation() { passed += 1; }
     }
 
+    // ── TCP out-of-order FIN guard — no premature close / no truncation ──────
+    //
+    // A real multi-segment HTTP(S) response can deliver a data+FIN segment
+    // out of order.  The receive arm must NOT consume an out-of-order FIN
+    // (which would advance recv_next and transition to CloseWait on a
+    // truncated body, RFC 9293 §3.10.7.4).  Inject an Established TCB, feed
+    // an out-of-order FIN-bearing segment, and assert the connection stays
+    // Established with the in-order data intact; then feed the in-order
+    // segment and assert the FIN is finally honored.
+    #[cfg(feature = "kdb")]
+    {
+        total += 1;
+        if test_tcp_ooo_fin_guard() { passed += 1; }
+    }
+
     // ── Test 270: AF_INET accept(2) — end-to-end against in-kernel TCP ────
     //
     // Synthesises two Established child TCBs on a single listening port
@@ -30224,6 +30239,89 @@ fn test_tcp_read_from_isolation() -> bool {
     }
 
     test_pass!("TCP read_from — 4-tuple isolation under shared port");
+    true
+}
+
+/// TCP out-of-order FIN guard: an out-of-order data+FIN segment must not
+/// prematurely close the connection or truncate the body (RFC 9293 §3.10.7.4 /
+/// RFC 793 §3.5).  The FIN is honored only once the sequence gap is filled and
+/// recv_next reaches it.
+#[cfg(feature = "kdb")]
+fn test_tcp_ooo_fin_guard() -> bool {
+    test_header!("TCP out-of-order FIN — no premature close / no truncation");
+
+    use crate::net::tcp;
+
+    const LOCAL_PORT: u16 = 47019;
+    let rip:  [u8;4] = [10, 0, 2, 50];
+    let rport: u16   = 52001;
+
+    // Inject an Established TCB.  test_inject_established sets recv_next = 1.
+    if let Err(e) = tcp::test_inject_established(LOCAL_PORT, rip, rport, &[]) {
+        test_fail!("tcp_ooo_fin_guard", "inject failed: {}", e);
+        return false;
+    }
+    let base = match tcp::test_recv_next(LOCAL_PORT, rip, rport) {
+        Some(n) => n,
+        None => { test_fail!("tcp_ooo_fin_guard", "no TCB"); return false; }
+    };
+
+    // Feed an OUT-OF-ORDER data+FIN segment: it begins at base+4 (a 4-byte
+    // gap), carries 3 bytes of data and the FIN flag.  The data must be
+    // dropped (hole), and crucially the FIN must NOT advance recv_next or move
+    // the connection to CloseWait — doing so would deliver a truncated body to
+    // userspace and reject the peer's retransmission forever.
+    let ooo_seq = base.wrapping_add(4);
+    match tcp::test_feed_segment(LOCAL_PORT, rip, rport, ooo_seq, b"END", true) {
+        Some((state, buflen)) => {
+            if state != tcp::TcpState::Established {
+                test_fail!("tcp_ooo_fin_guard",
+                    "OOO data+FIN prematurely changed state (expected Established)");
+                return false;
+            }
+            if buflen != 0 {
+                test_fail!("tcp_ooo_fin_guard",
+                    "OOO segment was buffered out of order (buflen={})", buflen);
+                return false;
+            }
+        }
+        None => { test_fail!("tcp_ooo_fin_guard", "feed OOO returned None"); return false; }
+    }
+
+    // Now feed the IN-ORDER 4-byte segment that fills the gap (no FIN).  This
+    // advances recv_next to base+4 and delivers the data.
+    match tcp::test_feed_segment(LOCAL_PORT, rip, rport, base, b"DATA", false) {
+        Some((state, buflen)) => {
+            if state != tcp::TcpState::Established {
+                test_fail!("tcp_ooo_fin_guard",
+                    "in-order fill unexpectedly changed state");
+                return false;
+            }
+            if buflen != 4 {
+                test_fail!("tcp_ooo_fin_guard",
+                    "in-order fill: expected 4 buffered bytes, got {}", buflen);
+                return false;
+            }
+        }
+        None => { test_fail!("tcp_ooo_fin_guard", "feed in-order returned None"); return false; }
+    }
+
+    // Finally, deliver the in-order FIN exactly at recv_next (base+4, empty
+    // payload).  Now it must be honored: recv_next advances and the state
+    // moves to CloseWait.
+    let fin_seq = base.wrapping_add(4);
+    match tcp::test_feed_segment(LOCAL_PORT, rip, rport, fin_seq, &[], true) {
+        Some((state, _)) => {
+            if state != tcp::TcpState::CloseWait {
+                test_fail!("tcp_ooo_fin_guard",
+                    "in-order FIN not honored (state not CloseWait)");
+                return false;
+            }
+        }
+        None => { test_fail!("tcp_ooo_fin_guard", "feed FIN returned None"); return false; }
+    }
+
+    test_pass!("TCP out-of-order FIN — no premature close / no truncation");
     true
 }
 
