@@ -1415,17 +1415,43 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     crate::mm::pmm::free_page(new_phys);
                     return false;
                 }
-                // CoW: old_phys may still be shared with the parent; we
-                // only release this process's reference.  The CoW copy
-                // (new_phys) takes sole ownership, refcount set to 1 below.
-                let _ = crate::mm::refcount::page_ref_dec(old_phys);
+                // The private copy (new_phys) takes sole ownership; mark it
+                // before publishing so a concurrent faulter that observes the
+                // installed PTE never sees a 0-refcount frame.
                 crate::mm::refcount::page_ref_set(new_phys, 1);
-                crate::mm::vmm::map_page_in(cr3, page_addr, new_phys, page_flags);
-                // Cross-CPU shootdown: sibling threads sharing the
-                // parent's CR3 may have the old read-only translation
-                // cached.  Without this they keep faulting on every
-                // write until their TLB happens to evict the entry.
-                crate::mm::tlb::shootdown_page(cr3, page_addr);
+                // Install ONLY if the leaf PTE still maps the frame we sampled
+                // and copied (old_phys).  On a shared CR3 (CLONE_VM / vfork,
+                // threads across CPUs) two CPUs can CoW-fault the same page
+                // concurrently; an unconditional install would let the loser
+                // overwrite the winner's PTE with a *different* private frame
+                // -- one VA, two frames, a silent cross-CPU store-visibility
+                // failure (cf. the d4fb7fa anonymous-fault fix; the standard
+                // page-table-lock `pte_same` re-check in a CoW copy).
+                if crate::mm::vmm::map_page_in_cow_if_unchanged(
+                    cr3, page_addr, new_phys, page_flags, old_phys,
+                ) {
+                    // We won: the mapping that referenced old_phys is gone, so
+                    // release this process's reference to it (it may remain
+                    // shared with the parent, in which case the dec is harmless;
+                    // if this was the last reference the frame is freed).
+                    let _ = crate::mm::refcount::page_ref_dec(old_phys);
+                    // Cross-CPU shootdown: sibling threads sharing the parent's
+                    // CR3 may have the old read-only translation cached.  Without
+                    // this they keep faulting on every write until their TLB
+                    // happens to evict the entry.
+                    crate::mm::tlb::shootdown_page(cr3, page_addr);
+                } else {
+                    // A sibling CPU already CoW-copied this page and published
+                    // its own private frame.  Our copy is redundant: drop it and
+                    // leave old_phys's reference untouched (the sibling's install
+                    // accounted for removing the old mapping).  The PTE is now
+                    // present + writable, so the faulting store re-executes
+                    // cleanly on return.  Undo the refcount we set above (1 -> 0)
+                    // so free_page's pte_share_count==0 invariant is satisfied;
+                    // new_phys was never installed in any page table.
+                    let _ = crate::mm::refcount::page_ref_dec(new_phys);
+                    crate::mm::pmm::free_page(new_phys);
+                }
                 return true;
             }
             return false; // OOM

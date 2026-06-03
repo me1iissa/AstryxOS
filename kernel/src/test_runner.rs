@@ -1064,6 +1064,10 @@ pub fn run() -> ! {
     total += 1;
     if test_map_page_in_if_absent_anti_alias() { passed += 1; }
 
+    // Test 98g2: shared-CR3 CoW write-fault anti-aliasing back-out
+    total += 1;
+    if test_map_page_in_cow_if_unchanged_anti_alias() { passed += 1; }
+
     // ── Test 98h: file-backed install-arm anti-aliasing back-out ─────────
     total += 1;
     if test_pfh_install_arm_anti_alias_backout() { passed += 1; }
@@ -29479,6 +29483,108 @@ fn test_map_page_in_if_absent_anti_alias() -> bool {
     crate::proc::free_vm_space(vm);
 
     test_pass!("map_page_in_if_absent anti-aliasing");
+    true
+}
+
+/// Regression test for the copy-on-write write-fault anti-aliasing back-out
+/// (the shared-CR3 CoW double-install race).  Two threads on one CR3 can take
+/// the write-protection #PF on the same CoW page concurrently; each copies and
+/// installs a private frame, and an unconditional install lets the loser
+/// overwrite the winner's PTE -- one VA, two frames, a silent cross-CPU
+/// store-visibility failure.  `map_page_in_cow_if_unchanged` re-reads the leaf
+/// PTE under the page-table lock and installs only if it still maps the frame
+/// the caller sampled (`expected_phys`), so the loser backs out.  This mirrors
+/// the page-table-lock `pte_same` re-check in a CoW copy.
+fn test_map_page_in_cow_if_unchanged_anti_alias() -> bool {
+    test_header!("map_page_in_cow_if_unchanged: shared-CR3 CoW-fault anti-aliasing");
+
+    use crate::mm::vmm::{read_pte, map_page_in, map_page_in_cow_if_unchanged,
+                         PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER, ADDR_MASK};
+
+    let vm = match crate::mm::vma::VmSpace::new_user() {
+        Some(vs) => vs,
+        None => { test_fail!("cow_anti_alias", "VmSpace::new_user() OOM"); return false; }
+    };
+    let cr3 = vm.cr3;
+
+    let va: u64 = 0x7fff_fffe_a000;
+    let page = crate::mm::vma::page_align_down(va);
+
+    let frame_shared = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => { crate::proc::free_vm_space(vm); test_fail!("cow_anti_alias", "OOM shared"); return false; }
+    };
+    let frame_winner = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => {
+            crate::mm::pmm::free_page(frame_shared);
+            crate::proc::free_vm_space(vm);
+            test_fail!("cow_anti_alias", "OOM winner"); return false;
+        }
+    };
+    let frame_loser = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => {
+            crate::mm::pmm::free_page(frame_shared);
+            crate::mm::pmm::free_page(frame_winner);
+            crate::proc::free_vm_space(vm);
+            test_fail!("cow_anti_alias", "OOM loser"); return false;
+        }
+    };
+    if frame_shared == frame_winner || frame_shared == frame_loser || frame_winner == frame_loser {
+        crate::mm::pmm::free_page(frame_shared);
+        crate::mm::pmm::free_page(frame_winner);
+        crate::mm::pmm::free_page(frame_loser);
+        crate::proc::free_vm_space(vm);
+        test_fail!("cow_anti_alias", "allocator returned overlapping frames");
+        return false;
+    }
+
+    let ro_flags = PAGE_PRESENT | PAGE_USER;
+    let rw_flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+
+    // Establish the read-only CoW PTE mapping frame_shared (the sampled state).
+    map_page_in(cr3, page, frame_shared, ro_flags);
+
+    // (1) Winner installs its private copy, expecting the PTE to still map
+    //     frame_shared -> returns true, PTE now maps frame_winner (writable).
+    let won = map_page_in_cow_if_unchanged(cr3, page, frame_winner, rw_flags, frame_shared);
+    let pte1 = read_pte(cr3, va);
+    if !won || (pte1 & ADDR_MASK) != (frame_winner & ADDR_MASK) || pte1 & PAGE_WRITABLE == 0 {
+        crate::mm::pmm::free_page(frame_winner);
+        crate::mm::pmm::free_page(frame_loser);
+        crate::proc::free_vm_space(vm);
+        test_fail!("cow_anti_alias", "winner install failed: won={} pte={:#x} expect={:#x}",
+            won, pte1, frame_winner);
+        return false;
+    }
+    test_println!("  (1) winner replaced shared frame with private {:#x} ok", frame_winner);
+
+    // (2) Loser raced the SAME page but still expects frame_shared -- the PTE now
+    //     maps frame_winner, so the re-check must fail: returns false, PTE
+    //     untouched (no second private frame aliased onto the VA).
+    let lost = map_page_in_cow_if_unchanged(cr3, page, frame_loser, rw_flags, frame_shared);
+    let pte2 = read_pte(cr3, va);
+    if lost {
+        crate::mm::pmm::free_page(frame_loser);
+        crate::proc::free_vm_space(vm);
+        test_fail!("cow_anti_alias", "loser install returned true -- it overwrote the PTE (aliasing)");
+        return false;
+    }
+    if (pte2 & ADDR_MASK) != (frame_winner & ADDR_MASK) {
+        crate::mm::pmm::free_page(frame_loser);
+        crate::proc::free_vm_space(vm);
+        test_fail!("cow_anti_alias", "PTE no longer maps winner: pte={:#x} winner={:#x} loser={:#x}",
+            pte2, frame_winner, frame_loser);
+        return false;
+    }
+    test_println!("  (2) loser backed out; PTE still maps winner {:#x} -- no CoW aliasing ok", frame_winner);
+
+    crate::mm::pmm::free_page(frame_shared);
+    crate::mm::pmm::free_page(frame_loser);
+    crate::proc::free_vm_space(vm);
+
+    test_pass!("map_page_in_cow_if_unchanged anti-aliasing");
     true
 }
 
