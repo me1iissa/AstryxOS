@@ -344,6 +344,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "fd-table"       => op_fd_table(req, out),
         "fd-map"         => op_fd_map(req, out),
         "unix-diag"      => op_unix_diag(req, out),
+        "epoll-watch"    => op_epoll_watch(req, out),
         "syscall-trend"  => op_syscall_trend(req, out),
         "vfs-mounts"     => op_vfs_mounts(out),
         "dmesg"          => op_dmesg(req, out),
@@ -1893,6 +1894,99 @@ fn op_unix_diag(req: &str, out: &mut String) {
         out.push_str(r#"{"state":"no-peer"}"#);
     }
     out.push('}');
+}
+
+// ── epoll-watch ──────────────────────────────────────────────────────────────
+//
+// Decisive reactor-liveness probe.  Given a pid and one of its epoll fds, dump
+// the epoll INTEREST SET and each watched fd's LIVE readiness, computed via the
+// exact same path `epoll_wait(2)` uses internally.  Pairs with `unix-diag`: at
+// a wedge where a content-reply AF_UNIX channel shows parent-end
+// `recv_avail>0, recv_popped=0` frozen, this answers WHY the reactor never
+// drains it:
+//
+//   * the fd IS in the interest set and `delivered` carries EPOLLIN (ready)
+//     yet the reactor never recvmsg's  → the reactor THREAD is not running
+//     epoll_wait (parked / scheduled-out / busy elsewhere) = a starvation /
+//     userspace-reactor problem, NOT a kernel readiness drop.
+//   * the fd is ABSENT from the interest set, OR `revents` reports no EPOLLIN
+//     despite unread data  → a kernel epoll readiness/registration divergence
+//     (epoll(7): a level-triggered fd with unread data MUST report EPOLLIN).
+//
+// Request: {"op":"epoll-watch","pid":P,"epfd":E}.
+// Output:  {pid, epfd, epoll_id, watches:[{fd, subscribed, subscribed_flags,
+//          revents, revents_flags, delivered, delivered_flags, ready}…]}.
+// `subscribed`/`revents`/`delivered` are the raw EPOLL* bitmasks; the
+// `_flags` siblings decode them to a human-readable string; `ready` is
+// `delivered != 0`.
+
+/// Decode an EPOLL* bitmask into a compact `|`-joined flag string for JSON.
+fn epoll_flags_str(m: u32) -> alloc::string::String {
+    use crate::ipc::epoll::{
+        EPOLLIN, EPOLLPRI, EPOLLOUT, EPOLLERR, EPOLLHUP, EPOLLRDHUP,
+    };
+    let mut s = alloc::string::String::new();
+    let mut push = |name: &str| {
+        if !s.is_empty() { s.push('|'); }
+        s.push_str(name);
+    };
+    if m & EPOLLIN    != 0 { push("EPOLLIN"); }
+    if m & EPOLLOUT   != 0 { push("EPOLLOUT"); }
+    if m & EPOLLPRI   != 0 { push("EPOLLPRI"); }
+    if m & EPOLLRDHUP != 0 { push("EPOLLRDHUP"); }
+    if m & EPOLLHUP   != 0 { push("EPOLLHUP"); }
+    if m & EPOLLERR   != 0 { push("EPOLLERR"); }
+    if s.is_empty() { s.push('0'); }
+    s
+}
+
+fn op_epoll_watch(req: &str, out: &mut String) {
+    use core::fmt::Write;
+
+    let pid: u64 = match extract_field(req, "pid").and_then(|s| parse_u64(&s)) {
+        Some(v) => v,
+        None => { out.push_str(r#"{"error":"missing 'pid' field"}"#); return; }
+    };
+    let epfd: usize = match extract_field(req, "epfd").and_then(|s| parse_u64(&s)) {
+        Some(v) => v as usize,
+        None => { out.push_str(r#"{"error":"missing 'epfd' field"}"#); return; }
+    };
+
+    use crate::subsys::linux::syscall::{epoll_watch_diag, EpollWatchResult};
+    out.push('{');
+    let _ = write!(out, r#""pid":{},"epfd":{},"#, pid, epfd);
+    match epoll_watch_diag(pid, epfd) {
+        EpollWatchResult::NoProc =>
+            out.push_str(r#""error":"no-such-pid","watches":[]}"#),
+        EpollWatchResult::NotEpoll =>
+            out.push_str(r#""error":"fd-not-epoll","watches":[]}"#),
+        EpollWatchResult::NoInstance =>
+            out.push_str(r#""error":"no-epoll-instance","watches":[]}"#),
+        EpollWatchResult::Ok { epoll_id, watches } => {
+            let _ = write!(out, r#""epoll_id":{},"watch_count":{},"#,
+                epoll_id, watches.len());
+            out.push_str(r#""watches":["#);
+            let mut first = true;
+            for w in &watches {
+                if !first { out.push(','); }
+                first = false;
+                out.push('{');
+                let _ = write!(out, r#""fd":{},"#, w.fd);
+                let _ = write!(out, r#""subscribed":{},"#, w.subscribed);
+                let _ = write!(out, r#""subscribed_flags":"{}","#,
+                    epoll_flags_str(w.subscribed));
+                let _ = write!(out, r#""revents":{},"#, w.revents);
+                let _ = write!(out, r#""revents_flags":"{}","#,
+                    epoll_flags_str(w.revents));
+                let _ = write!(out, r#""delivered":{},"#, w.delivered);
+                let _ = write!(out, r#""delivered_flags":"{}","#,
+                    epoll_flags_str(w.delivered));
+                let _ = write!(out, r#""ready":{}"#, w.delivered != 0);
+                out.push('}');
+            }
+            out.push_str("]}");
+        }
+    }
 }
 
 // ── syscall-trend ────────────────────────────────────────────────────────────

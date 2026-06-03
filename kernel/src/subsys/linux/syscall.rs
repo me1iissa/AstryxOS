@@ -10248,6 +10248,89 @@ fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
     }
 }
 
+/// One epoll interest-set entry, with its LIVE readiness, for the kdb
+/// `epoll-watch` diagnostic.  See [`epoll_watch_diag`].
+pub(crate) struct EpollWatchDiag {
+    /// The watched fd in the owning process's fd table.
+    pub fd: usize,
+    /// The caller's raw subscribed interest mask (EPOLL* bits), as stored
+    /// at `epoll_ctl(ADD|MOD)` time — unmodified.
+    pub subscribed: u32,
+    /// The LIVE readiness mask `epoll_wait(2)` would compute right now for
+    /// this fd, via the exact same `epoll_poll_events` path the wait loop
+    /// uses.  EPOLLIN/EPOLLOUT/EPOLLHUP/EPOLLRDHUP/EPOLLERR.
+    pub revents: u32,
+    /// What `epoll_wait(2)` would actually DELIVER for this watch:
+    /// `(subscribed & revents) | (revents & (EPOLLERR | EPOLLHUP))`.
+    /// Non-zero here means the reactor's next `epoll_wait` returns this fd
+    /// ready — so if the reactor still never drains it, the reactor THREAD
+    /// is not running `epoll_wait` (parked / scheduled-out / busy).
+    pub delivered: u32,
+}
+
+/// Result of an `epoll-watch` diagnostic lookup for one (pid, epfd).
+pub(crate) enum EpollWatchResult {
+    /// No such pid.
+    NoProc,
+    /// The fd is not an epoll fd in this process.
+    NotEpoll,
+    /// The epoll fd resolved but no `EpollInstance` matched its id.
+    NoInstance,
+    /// Success — the resolved instance id plus its full interest set, each
+    /// entry carrying its live readiness.
+    Ok { epoll_id: u64, watches: alloc::vec::Vec<EpollWatchDiag> },
+}
+
+/// Live epoll interest-set + per-fd readiness dump for the kdb `epoll-watch`
+/// op.  Resolves the epoll instance for `(pid, epfd)` using the SAME by-id
+/// path as `sys_epoll_wait` (FileDescriptor.inode of the `[epoll]` fd → the
+/// matching `EpollInstance` in `proc.epoll_sets`), then for every watched fd
+/// reports the caller's subscribed mask alongside the LIVE `epoll_poll_events`
+/// result and the mask `epoll_wait(2)` would actually deliver.
+///
+/// This is the decisive discriminator for a wedged reactor: if the
+/// content-reply channel fd is in the interest set AND `delivered` carries
+/// EPOLLIN while the reactor never `recvmsg`s, the reactor thread is not
+/// running `epoll_wait` (parked/starved).  If the fd is ABSENT, or `revents`
+/// reports no EPOLLIN despite unread data, that is a kernel epoll
+/// readiness/registration divergence per `epoll(7)`.
+///
+/// Read-only; takes PROCESS_TABLE only for the brief watch-list snapshot,
+/// then computes readiness lock-free (each `epoll_poll_events` re-takes the
+/// lock briefly per fd, exactly as the wait loop does).
+pub(crate) fn epoll_watch_diag(pid: u64, epfd: usize) -> EpollWatchResult {
+    use crate::ipc::epoll::{EPOLLERR, EPOLLHUP};
+
+    // Snapshot the watch list under a brief lock hold — mirrors
+    // sys_epoll_wait Step 1 (by-id lookup so a dup'd epfd resolves to the
+    // same shared instance).
+    let (epoll_id, watches_snap): (u64, alloc::vec::Vec<(usize, u32)>) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        let proc = match procs.iter().find(|p| p.pid == pid) {
+            Some(p) => p,
+            None    => return EpollWatchResult::NoProc,
+        };
+        let epoll_id = match proc.file_descriptors.get(epfd).and_then(|f| f.as_ref()) {
+            Some(f) if f.open_path == "[epoll]" => f.inode,
+            _                                   => return EpollWatchResult::NotEpoll,
+        };
+        let inst = match proc.epoll_sets.iter().find(|e| e.id == epoll_id) {
+            Some(i) => i,
+            None    => return EpollWatchResult::NoInstance,
+        };
+        (epoll_id, inst.watches.iter().map(|w| (w.fd, w.events)).collect())
+    }; // lock released
+
+    // Poll each watch lock-free — identical readiness path to sys_epoll_wait.
+    let mut watches = alloc::vec::Vec::with_capacity(watches_snap.len());
+    for (fd, subscribed) in watches_snap {
+        let revents = epoll_poll_events(pid, fd);
+        let delivered = (subscribed & revents) | (revents & (EPOLLERR | EPOLLHUP));
+        watches.push(EpollWatchDiag { fd, subscribed, revents, delivered });
+    }
+    EpollWatchResult::Ok { epoll_id, watches }
+}
+
 /// Returns true if a deliverable (pending && !blocked) signal is queued for `pid`.
 /// Used by blocking syscalls (epoll_wait, select) to honour the POSIX contract
 /// that they must abort with EINTR when a signal is delivered during the wait.
