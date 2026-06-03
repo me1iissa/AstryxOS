@@ -495,6 +495,20 @@ pub fn has_scm_deliverable(receiver_id: u64, consumed: u64) -> bool {
     q.iter().any(|b| b.receiver_id == receiver_id && consumed >= b.byte_offset)
 }
 
+/// Diagnostic-only: snapshot the pending `SCM_RIGHTS` batches queued for
+/// `receiver_id`, returning `(byte_offset, fd_count, deliverable)` per batch
+/// where `deliverable = consumed >= byte_offset`.  Used by the kdb `unix-diag`
+/// op to decide, at a live wedge, whether a content proc's IPDL channel has an
+/// undelivered fd batch sitting ahead of its read position (P2) versus an empty
+/// queue (frame never landed → P3/P4).  Holds PENDING_SCM only for the snapshot.
+pub fn scm_diag_for(receiver_id: u64, consumed: u64) -> alloc::vec::Vec<(u64, usize, bool)> {
+    let q = PENDING_SCM.lock();
+    q.iter()
+        .filter(|b| b.receiver_id == receiver_id)
+        .map(|b| (b.byte_offset, b.fds.len(), consumed >= b.byte_offset))
+        .collect()
+}
+
 /// Lowest pending `SCM_RIGHTS` batch bound-offset for `receiver_id` that the
 /// reader has NOT yet reached (`byte_offset > consumed`).  Returns None when no
 /// pending batch sits ahead of the reader's current drained position.

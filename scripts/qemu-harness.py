@@ -5592,6 +5592,15 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
         if pid != 0:
             req["pid"] = pid
         return req
+    if op == "unix-diag":
+        # Recv-side readiness probe for one AF_UNIX socket inode.  Reports
+        # recv_avail / recv_pushed / recv_popped / shutdown edges + pending
+        # SCM_RIGHTS batches (byte_offset, fd_count, deliverable) for the
+        # inode AND its peer.  Decides P1 (data in ring, epoll silent) vs
+        # P2 (SCM batch undelivered) vs P3/P4 (empty ring, never written).
+        if not rest:
+            raise ValueError("unix-diag requires <inode> (socket_id)")
+        return {"op": "unix-diag", "inode": int(rest[0], 0)}
     if op == "syscall-trend":
         seconds = int(rest[0], 0) if len(rest) >= 1 else 5
         pid     = int(rest[1], 0) if len(rest) >= 2 else 0
@@ -11117,6 +11126,7 @@ def main():
     p_kdb.add_argument("sid")
     p_kdb.add_argument("op", choices=[
         "ping", "proc-list", "proc", "proc-tree", "fd-table", "fd-map",
+        "unix-diag",
         "syscall-trend", "vfs-mounts",
         "dmesg", "syms", "mem", "read-file", "tframe", "user-mem", "trace-status",
         "bell-stats", "cache-audit", "cache-aliasing", "fault-cache-keys",
