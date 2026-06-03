@@ -343,6 +343,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "proc-tree"      => op_proc_tree(req, out),
         "fd-table"       => op_fd_table(req, out),
         "fd-map"         => op_fd_map(req, out),
+        "unix-diag"      => op_unix_diag(req, out),
         "syscall-trend"  => op_syscall_trend(req, out),
         "vfs-mounts"     => op_vfs_mounts(out),
         "dmesg"          => op_dmesg(req, out),
@@ -1814,6 +1815,84 @@ fn op_fd_map(req: &str, out: &mut String) {
     }
 
     out.push_str("]}");
+}
+
+// ── unix-diag ────────────────────────────────────────────────────────────────
+//
+// Decisive recv-side readiness probe for one AF_UNIX socket inode.  Answers, at
+// a live wedge, the gate-4 question: does the content proc's IPDL channel have
+// UNREAD data in its recv ring (recv_avail>0) that epoll fails to report (=> P1
+// epoll readiness drop), an undelivered SCM batch sitting ahead of the reader
+// (=> P2 recvmsg SCM drop), or an EMPTY ring with no pending SCM (=> the parent
+// never wrote to this inode => P3 routing / P4 navigation-never-sent)?
+//
+// Request: {"op":"unix-diag","inode":N}.  Reports for socket N AND its peer:
+//   recv_avail (unread bytes in ring), recv_pushed/recv_popped (stream pos),
+//   read/write shutdown, plus the pending SCM batches bound to N
+//   (byte_offset, fd_count, deliverable=consumed>=offset).
+fn op_unix_diag(req: &str, out: &mut String) {
+    use core::fmt::Write;
+
+    let inode: u64 = match extract_field(req, "inode").and_then(|s| parse_u64(&s)) {
+        Some(v) => v,
+        None => { out.push_str(r#"{"error":"missing 'inode' field"}"#); return; }
+    };
+
+    let emit_sock = |out: &mut String, id: u64| {
+        match crate::net::unix::diag_for(id) {
+            Some(d) => {
+                let consumed = d.recv_popped;
+                let scm = crate::syscall::scm_diag_for(id, consumed);
+                let has_scm_deliv = scm.iter().any(|(_, _, deliv)| *deliv);
+                out.push('{');
+                let _ = write!(out, r#""id":{},"#, d.id);
+                j_kv_str(out, "state", match d.state {
+                    crate::net::unix::UnixState::Free => "free",
+                    crate::net::unix::UnixState::Unbound => "unbound",
+                    crate::net::unix::UnixState::Bound => "bound",
+                    crate::net::unix::UnixState::Listening => "listening",
+                    crate::net::unix::UnixState::Connected => "connected",
+                });
+                let _ = write!(out, r#""peer_id":{},"#, d.peer_id as i64);
+                let _ = write!(out, r#""recv_avail":{},"#, d.recv_avail);
+                let _ = write!(out, r#""recv_pushed":{},"#, d.recv_pushed);
+                let _ = write!(out, r#""recv_popped":{},"#, d.recv_popped);
+                let _ = write!(out, r#""read_shutdown":{},"#, d.read_shutdown);
+                let _ = write!(out, r#""write_shutdown":{},"#, d.write_shutdown);
+                let _ = write!(out, r#""has_data":{},"#, d.recv_avail > 0);
+                let _ = write!(out, r#""scm_deliverable":{},"#, has_scm_deliv);
+                out.push_str(r#""scm_batches":["#);
+                let mut first = true;
+                for (off, nfds, deliv) in &scm {
+                    if !first { out.push(','); }
+                    first = false;
+                    let _ = write!(out,
+                        r#"{{"byte_offset":{},"fd_count":{},"deliverable":{}}}"#,
+                        off, nfds, deliv);
+                }
+                out.push_str("]}");
+            }
+            None => {
+                let _ = write!(out, r#"{{"id":{},"state":"free-or-oob"}}"#, id);
+            }
+        }
+    };
+
+    out.push('{');
+    let _ = write!(out, r#""inode":{},"#, inode);
+    out.push_str(r#""socket":"#);
+    emit_sock(out, inode);
+    // Peer end (where the parent's writes land BEFORE they reach this end's
+    // recv ring is the OTHER direction — but report the peer for context).
+    let peer = crate::net::unix::get_peer(inode);
+    out.push(',');
+    out.push_str(r#""peer":"#);
+    if peer != u64::MAX {
+        emit_sock(out, peer);
+    } else {
+        out.push_str(r#"{"state":"no-peer"}"#);
+    }
+    out.push('}');
 }
 
 // ── syscall-trend ────────────────────────────────────────────────────────────

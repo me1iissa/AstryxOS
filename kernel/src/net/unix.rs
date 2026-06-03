@@ -908,6 +908,44 @@ pub fn has_pending(id: u64) -> bool {
     TABLE.lock().0[id as usize].backlog_len > 0
 }
 
+/// Diagnostic-only one-socket snapshot for the kdb `unix-diag` op.
+/// Reports the recv-ring read-readiness state of socket `id` so a live wedge
+/// can be classified: `recv_avail` = unread bytes sitting in the ring (the
+/// `has_data` input), `recv_pushed`/`recv_popped` = absolute stream positions
+/// (the `enqueue_offset`/`recv_consumed` inputs to SCM delivery), plus the
+/// half-close edges.  All values read under one TABLE lock.  Returns None for
+/// an out-of-range or Free slot.
+pub fn diag_for(id: u64) -> Option<UnixDiag> {
+    if id as usize >= MAX_UNIX_SOCKETS { return None; }
+    let t = TABLE.lock();
+    let s = &t.0[id as usize];
+    if s.state == UnixState::Free { return None; }
+    Some(UnixDiag {
+        id,
+        state: s.state,
+        kind: s.kind,
+        peer_id: s.peer_id,
+        recv_avail: s.recv_available(),
+        recv_pushed: s.recv_pushed,
+        recv_popped: s.recv_popped,
+        read_shutdown: s.shut_rd,
+        write_shutdown: s.shut_wr,
+    })
+}
+
+/// Per-socket recv-readiness diagnostic (see [`diag_for`]).
+pub struct UnixDiag {
+    pub id: u64,
+    pub state: UnixState,
+    pub kind: SockKind,
+    pub peer_id: u64,
+    pub recv_avail: usize,
+    pub recv_pushed: u64,
+    pub recv_popped: u64,
+    pub read_shutdown: bool,
+    pub write_shutdown: bool,
+}
+
 pub fn state(id: u64) -> UnixState {
     if id as usize >= MAX_UNIX_SOCKETS { return UnixState::Free; }
     TABLE.lock().0[id as usize].state
