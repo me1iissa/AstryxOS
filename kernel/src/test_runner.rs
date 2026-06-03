@@ -326,6 +326,12 @@ pub fn run() -> ! {
     total += 1;
     if test_elf_loader() { passed += 1; }
 
+    // ── Aether native exec routing (Astryx Native SDK Phase 0) ──────
+    // EI_OSABI=0xFF → dispatch_aether; every non-native ELF stays Linux.
+
+    total += 1;
+    if test_aether_native_routing() { passed += 1; }
+
     // ── Test 12: FAT32 Filesystem ───────────────────────────────────
 
     total += 1;
@@ -3566,6 +3572,179 @@ fn test_elf_libc_flavor() -> bool {
 
     if ok { test_pass!("ELF libc-flavour (PT_INTERP) classifier"); }
     ok
+}
+
+/// Astryx Native SDK Phase 0: prove the exec path routes a native
+/// (`EI_OSABI = 0xFF`) ELF to the Aether dispatch, while every non-native
+/// ELF — System-V (0), GNU/Linux (3), a bare static binary — stays on the
+/// Linux personality.  The Linux default is the load-bearing invariant that
+/// keeps upstream Linux binaries (glibc, musl, libxul) running unmodified.
+///
+/// Tests, in order of increasing fidelity:
+///   1. `elf_is_aether_native` + `detect_elf_subsystem` on byte patterns.
+///   2. The real embedded artefacts: `NATIVE_HELLO_ELF` (stamped 0xFF) → Aether;
+///      `HELLO_ELF` (static, EI_OSABI=0) → Linux  (the regression proof).
+///   3. `apply_exec_subsystem` — the exact decision the two exec sites use —
+///      applied to a live process, flipping its `subsystem`/`linux_abi`.
+fn test_aether_native_routing() -> bool {
+    use crate::subsys::{detect_elf_subsystem, elf_is_aether_native};
+    use crate::win32::SubsystemType;
+    test_header!("Aether native exec routing (EI_OSABI=0xFF → dispatch_aether)");
+
+    let mut ok = true;
+
+    // ── 1. Byte-pattern classification ──────────────────────────────────
+    // Minimal 8-byte ELF idents that differ only in e_ident[7] (EI_OSABI).
+    let mut sysv = [0u8; 8]; // EI_OSABI = 0   (ELFOSABI_NONE / System V)
+    sysv[0..4].copy_from_slice(b"\x7fELF");
+    sysv[4] = 2; // ELFCLASS64
+    sysv[5] = 1; // ELFDATA2LSB
+    sysv[6] = 1; // EV_CURRENT
+    sysv[7] = 0x00;
+
+    let mut gnu = sysv;
+    gnu[7] = 0x03; // ELFOSABI_GNU (Linux)
+
+    let mut astryx = sysv;
+    astryx[7] = 0xFF; // ELFOSABI_ASTRYX (native)
+
+    let mut weird = sysv;
+    weird[7] = 0x42; // unknown OS/ABI — must NOT be treated as native
+
+    let cases: &[(&str, &[u8], bool, SubsystemType)] = &[
+        ("System-V  (EI_OSABI=0x00)", &sysv,   false, SubsystemType::Linux),
+        ("GNU/Linux (EI_OSABI=0x03)", &gnu,    false, SubsystemType::Linux),
+        ("AstryxOS  (EI_OSABI=0xFF)", &astryx, true,  SubsystemType::Aether),
+        ("Unknown   (EI_OSABI=0x42)", &weird,  false, SubsystemType::Linux),
+        ("too short (3 bytes)",       &b"\x7fEL"[..], false, SubsystemType::Linux),
+    ];
+    for (label, bytes, want_native, want_sub) in cases {
+        let got_native = elf_is_aether_native(bytes);
+        let got_sub = detect_elf_subsystem(bytes);
+        if got_native != *want_native || got_sub != *want_sub {
+            test_fail!(
+                "aether-routing",
+                "{}: native={} sub={:?}, want native={} sub={:?}",
+                label, got_native, got_sub, want_native, want_sub
+            );
+            ok = false;
+        } else {
+            test_println!("  {:<28} → native={:<5} {:?} ✓", label, got_native, got_sub);
+        }
+    }
+
+    // ── 2. Real embedded artefacts ──────────────────────────────────────
+    // The static HELLO_ELF carries EI_OSABI=0 (System V) — it is the
+    // canonical "bare static ELF" that MUST stay Linux.  This is the
+    // regression proof: a static binary is not silently routed to Aether.
+    let hello = &crate::proc::hello_elf::HELLO_ELF;
+    if elf_is_aether_native(hello) || detect_elf_subsystem(hello) != SubsystemType::Linux {
+        test_fail!(
+            "aether-routing",
+            "static HELLO_ELF (EI_OSABI={:#x}) mis-routed to Aether",
+            hello.get(7).copied().unwrap_or(0)
+        );
+        ok = false;
+    } else {
+        test_println!("  static HELLO_ELF (EI_OSABI=0x00) → Linux ✓ (regression proof)");
+    }
+
+    // The native_hello sample is built + stamped 0xFF by kernel/build.rs.
+    let native = crate::proc::native_hello_elf::NATIVE_HELLO_ELF;
+    if !crate::proc::elf::is_elf(native) {
+        test_fail!("aether-routing", "NATIVE_HELLO_ELF is not a valid ELF");
+        ok = false;
+    } else if !elf_is_aether_native(native)
+        || detect_elf_subsystem(native) != SubsystemType::Aether
+    {
+        test_fail!(
+            "aether-routing",
+            "NATIVE_HELLO_ELF EI_OSABI={:#x} not classified Aether",
+            native.get(7).copied().unwrap_or(0)
+        );
+        ok = false;
+    } else {
+        test_println!(
+            "  native_hello ELF (EI_OSABI=0xFF, {} bytes) → Aether ✓",
+            native.len()
+        );
+    }
+
+    // ── 3. apply_exec_subsystem on a live process ───────────────────────
+    // Spawn a throwaway user process, then drive the EXACT decision both
+    // exec sites use against 0xFF and non-0xFF images, reading back the
+    // process's subsystem/linux_abi each time.  The thread is created
+    // suspended (never scheduled); we leave it parked — the suite does not
+    // run user threads to completion.
+    match crate::proc::usermode::create_user_process_with_args_blocked(
+        "native_route_probe",
+        hello,
+        &["native_route_probe"],
+        &["HOME=/"],
+    ) {
+        Ok(pid) => {
+            // Apply native (0xFF) image → expect Aether / linux_abi=false.
+            {
+                let mut procs = crate::proc::PROCESS_TABLE.lock();
+                if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                    crate::syscall::apply_exec_subsystem(p, native);
+                }
+            }
+            let (sub_a, abi_a) = read_proc_subsystem(pid);
+            // Apply Linux (static, EI_OSABI=0) image → expect Linux / true.
+            {
+                let mut procs = crate::proc::PROCESS_TABLE.lock();
+                if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                    crate::syscall::apply_exec_subsystem(p, hello);
+                }
+            }
+            let (sub_l, abi_l) = read_proc_subsystem(pid);
+
+            if sub_a != SubsystemType::Aether || abi_a {
+                test_fail!(
+                    "aether-routing",
+                    "apply_exec_subsystem(0xFF): sub={:?} linux_abi={} (want Aether/false)",
+                    sub_a, abi_a
+                );
+                ok = false;
+            } else {
+                test_println!("  apply_exec_subsystem(native 0xFF) → Aether, linux_abi=false ✓");
+            }
+            if sub_l != SubsystemType::Linux || !abi_l {
+                test_fail!(
+                    "aether-routing",
+                    "apply_exec_subsystem(static): sub={:?} linux_abi={} (want Linux/true)",
+                    sub_l, abi_l
+                );
+                ok = false;
+            } else {
+                test_println!("  apply_exec_subsystem(static EI_OSABI=0) → Linux, linux_abi=true ✓");
+            }
+
+            // The probe was created via `_blocked` and never marked Ready, so
+            // the scheduler will never run it.  Leave it parked rather than
+            // touch the process-teardown refcount path from a test.
+        }
+        Err(e) => {
+            test_fail!("aether-routing", "probe process spawn failed: {:?}", e);
+            ok = false;
+        }
+    }
+
+    if ok {
+        test_pass!("Aether native exec routing (EI_OSABI=0xFF → dispatch_aether)");
+    }
+    ok
+}
+
+/// Read a process's `(subsystem, linux_abi)` pair from the table.
+fn read_proc_subsystem(pid: crate::proc::Pid) -> (crate::win32::SubsystemType, bool) {
+    let procs = crate::proc::PROCESS_TABLE.lock();
+    procs
+        .iter()
+        .find(|p| p.pid == pid)
+        .map(|p| (p.subsystem, p.linux_abi))
+        .unwrap_or((crate::win32::SubsystemType::Linux, true))
 }
 
 /// Test the ELF64 loader: validate header parsing and segment loading.

@@ -16,6 +16,11 @@ pub mod elf;
 pub mod hello_elf;
 pub mod hello_pe;
 pub mod hello_win32_pe;
+// Astryx Native SDK Phase 0 sample (EI_OSABI=0xFF native binary).  Embedded
+// only for the test suite, which uses it to prove EI_OSABI→Aether exec
+// routing; production / firefox builds don't carry it.
+#[cfg(feature = "test-mode")]
+pub mod native_hello_elf;
 pub mod orbit_elf;
 pub mod pe;
 pub mod proc_metrics;
