@@ -828,6 +828,23 @@ pub fn recv_consumed(id: u64) -> u64 {
     t.0[id as usize].recv_popped
 }
 
+/// Usable byte-stream capacity of one AF_UNIX socket end's recv ring — the
+/// maximum number of bytes a `sendmsg(2)`/`write(2)` to the peer can have
+/// outstanding (unread) before the transport returns -EAGAIN.  The ring stores
+/// `RECV_BUF_CAP` slots but reserves one to disambiguate full-vs-empty (see
+/// `recv_space`), so the usable capacity is `RECV_BUF_CAP - 1`.
+///
+/// Reported verbatim via `getsockopt(SO_SNDBUF)`/`SO_RCVBUF` so that a
+/// length-prefixed IPC stream writer (which queries SO_SNDBUF to decide how
+/// large a single `sendmsg(2)` to offer, per socket(7)) chunks at the real
+/// transport boundary.  Advertising a larger SO_SNDBUF than the ring can hold
+/// makes such a writer offer a >ring-sized frame in one call, which the
+/// transport can only partially accept — forcing the partial-write resume path
+/// on every large frame.
+pub const fn buf_capacity() -> usize {
+    RECV_BUF_CAP - 1
+}
+
 /// Return the socket type (`Stream` or `SeqPacket`) for an open socket id.
 /// Returns `Stream` for an out-of-range id (matching the default).
 pub fn kind(id: u64) -> SockKind {
