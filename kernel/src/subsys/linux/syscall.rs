@@ -2156,9 +2156,14 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             // starting recv position, the batch becomes deliverable the
             // instant the reader pops the frame's first byte.  Computed once
             // here (under the unix TABLE lock, briefly) for unix sockets only.
-            let scm_bind_peer_id: u64 = if crate::syscall::is_unix_socket_fd(pid, fd) {
-                let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
-                crate::net::unix::get_peer(unix_id)
+            // Sender's own AF_UNIX socket id (for the writable-gate below).
+            let scm_sender_unix_id: u64 = if crate::syscall::is_unix_socket_fd(pid, fd) {
+                crate::syscall::get_unix_socket_id(pid, fd)
+            } else {
+                u64::MAX
+            };
+            let scm_bind_peer_id: u64 = if scm_sender_unix_id != u64::MAX {
+                crate::net::unix::get_peer(scm_sender_unix_id)
             } else {
                 u64::MAX
             };
@@ -2172,6 +2177,29 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             // the data it accompanies (see the ordering note below).  A frame
             // with at least one non-empty iovec is data-bearing.
             let frame_has_data = iovecs_owned.iter().any(|iov| iov[1] != 0);
+            // First-byte-accepted gate for the SCM_RIGHTS batch.  The batch is
+            // queued BEFORE the data push (the ordering invariant below), but it
+            // must only be queued if at least one byte of THIS frame will be
+            // accepted into the peer ring — otherwise the push loop returns
+            // -EAGAIN with `total == 0` (nothing queued), the whole sendmsg(2)
+            // reports -EAGAIN, and a userspace stream writer retries the entire
+            // frame from the start WITH its control message re-attached.  Were
+            // the batch queued unconditionally, that retry would enqueue a
+            // SECOND batch for the same frame — duplicating the fds on the peer
+            // (CWE-675 / a double-delivery of the ancillary descriptors).  A
+            // DATA-bearing frame thus queues its batch only when the peer ring
+            // has room for >=1 byte (net::unix::writable, the same predicate
+            // that gates whether write() returns >0 vs -EAGAIN).  A control-ONLY
+            // frame (no data bytes) carries nothing to push and is a 0-byte
+            // readable ancillary message in its own right (recvmsg(2), unix(7)
+            // SCM_RIGHTS); it is always queued regardless of ring fullness.
+            let scm_first_byte_will_land = if !frame_has_data {
+                true
+            } else if scm_sender_unix_id != u64::MAX {
+                crate::net::unix::writable(scm_sender_unix_id)
+            } else {
+                false
+            };
             let mut total = 0usize;
             // ORDERING (race fix): the SCM_RIGHTS batch is queued BEFORE the data
             // bytes are pushed into the peer's recv ring.  The data push and the
@@ -2224,7 +2252,15 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         (0u64, 0usize, 0usize, 0i32, 0i32)
                     }
                 };
-                if ctrl_ptr != 0 && ctrl_len >= 16 {
+                // `scm_first_byte_will_land` gate: skip the entire SCM_RIGHTS
+                // clone/ref-bump/enqueue when no byte of this data-bearing frame
+                // will be accepted (peer ring full).  The push loop will then
+                // return -EAGAIN with total==0 and the writer retries the WHOLE
+                // frame (cmsg included) — so queuing here would double the batch.
+                // Gating before the clone also avoids taking fd references we
+                // would otherwise have to release (CWE-772).  A control-only
+                // frame always lands (scm_first_byte_will_land == true).
+                if ctrl_ptr != 0 && ctrl_len >= 16 && scm_first_byte_will_land {
                     const SOL_SOCKET_I32: i32 = 1;
                     const SCM_RIGHTS_I32: i32 = 1;
                     if cmsg_level == SOL_SOCKET_I32 && cmsg_type == SCM_RIGHTS_I32 && cmsg_len > 16 {
@@ -2377,6 +2413,26 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
                     match crate::net::unix::write(unix_id, data) {
                         n if n >= 0 => total += n as usize,
+                        // Per POSIX.1-2017 send(2)/sendmsg(2): a non-blocking
+                        // SOCK_STREAM transmit that has already queued some
+                        // bytes must report the COUNT actually queued (a short
+                        // write), NOT -EAGAIN — -EAGAIN is reserved for the
+                        // case where ZERO bytes could be queued.  net::unix::write
+                        // returns -EAGAIN (-11) only when the peer recv ring was
+                        // already full (n == 0).  When the ring fills part-way
+                        // through this iovec loop, earlier iovecs of THIS frame
+                        // (and possibly a leading partial of this iovec) are
+                        // already in the ring: `total > 0`.  Returning the raw
+                        // -EAGAIN here would discard that `total`, so the userspace
+                        // stream writer (which resumes a short write from the
+                        // returned byte count and re-sends from frame-start on a
+                        // bare -EAGAIN) would re-transmit the already-queued
+                        // leading bytes AND re-attach the frame's SCM_RIGHTS
+                        // control fds — desynchronising the byte stream and the
+                        // ancillary-fd accounting on the peer.  Break and return
+                        // the honest short-write count; -EAGAIN is returned only
+                        // when nothing at all was queued (total == 0).
+                        e if e == -11 && total > 0 => break,
                         e => return e,
                     }
                 } else {
@@ -2962,8 +3018,18 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 const SO_PEERCRED: u64 = 17;
                 match (level, opt) {
                     (SOL_SOCKET, SO_TYPE)   => 1,  // SOCK_STREAM
-                    (SOL_SOCKET, SO_RCVBUF) => 87380,
-                    (SOL_SOCKET, SO_SNDBUF) => 131072,
+                    // Report the AF_UNIX send/recv buffer sizes as the actual
+                    // usable capacity of this transport's per-end recv ring
+                    // (net::unix::buf_capacity()).  Per socket(7), SO_SNDBUF is
+                    // the kernel's send-buffer size; a length-prefixed IPC stream
+                    // writer queries it to size each sendmsg(2) so it never offers
+                    // more than the transport can atomically accept.  Advertising
+                    // a value larger than the ring (the previous 131072 vs a
+                    // 32 KiB ring) makes such a writer offer a >ring frame in one
+                    // call, which can only be partially queued — needlessly
+                    // forcing the partial-write resume path on every large frame.
+                    (SOL_SOCKET, SO_RCVBUF) => crate::net::unix::buf_capacity() as u32,
+                    (SOL_SOCKET, SO_SNDBUF) => crate::net::unix::buf_capacity() as u32,
                     (SOL_SOCKET, SO_ERROR)  => 0,
                     (SOL_SOCKET, SO_PEERCRED) => {
                         // Return struct ucred { pid: u32, uid: u32, gid: u32 } = 12 bytes.
