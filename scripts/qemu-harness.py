@@ -2709,6 +2709,33 @@ def cmd_check(args):
     return rc
 
 
+def cmd_build(args):
+    """
+    Run the REAL kernel build (`cargo +nightly build` for astryx-boot +
+    astryx-kernel, then objcopy to the flat kernel.bin and stage the boot EFI) —
+    i.e. codegen + link + ESP staging — and emit a JSON verdict with the host
+    wall-clock build time.  No QEMU is launched.
+
+    This exists so the perf-benchmark BUILD phase can time a genuine build (the
+    magnitude that surfaces a slow-codegen or slow-link regression) rather than a
+    type-check-only `cargo check`.  `start` already builds internally; this is the
+    standalone, no-boot build for measurement.  Output is additive structured
+    JSON (build_ms, ok, features) so any caller can resume.
+    """
+    features = args.features or ""
+    t0 = time.time()
+    ok = _build(features)
+    build_ms = int((time.time() - t0) * 1000)
+    out = {
+        "ok": bool(ok),
+        "features": features,
+        "build_ms": build_ms,
+        "probe": "build",   # vs `check` — names the magnitude captured
+    }
+    print(json.dumps(out, indent=2))
+    return 0 if ok else 1
+
+
 def _qemu_img() -> str:
     """Resolve the qemu-img binary (snap-gate creates qcow2 overlays)."""
     return shutil.which("qemu-img") or "qemu-img"
@@ -11887,6 +11914,15 @@ def main():
                           help="Feature flags passed VERBATIM to cargo. "
                                "Empty string → default desktop kernel.")
 
+    p_build = sub.add_parser("build",
+                              help="Run the REAL kernel build (codegen+link+ESP "
+                                   "stage) for given --features and report "
+                                   "build_ms. No boot. Use for the BUILD-phase "
+                                   "perf measurement (not `check`).")
+    p_build.add_argument("--features", default="", metavar="FLAGS",
+                          help="Feature flags passed VERBATIM to cargo. "
+                               "Empty string → default desktop kernel.")
+
     # context — shared session-context management (delegates to agent-context.py)
     p_ctx = sub.add_parser(
         "context",
@@ -11948,6 +11984,7 @@ def main():
         "allowlist": cmd_allowlist,
         "soak":      cmd_soak,
         "check":     cmd_check,
+        "build":     cmd_build,
         "start":  cmd_start,
         "stop":   cmd_stop,
         "list":   cmd_list,
