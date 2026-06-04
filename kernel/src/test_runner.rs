@@ -30221,7 +30221,12 @@ fn test_tcp_peer_fin_read_closed_edge() -> bool {
     use crate::net::socket::RecvOutcome;
 
     const LOCAL_PORT: u16 = 47120;
-    let peer_ip:   [u8; 4] = [10, 0, 2, 9];
+    // Use the ARP-cached SLIRP gateway IP (10.0.2.2) as the synthetic peer,
+    // like test_tcp_inbound_3whs.  The final socket_close drives a FIN through
+    // send_ipv4 -> resolve_mac; against a host-less synthetic IP that path
+    // enters an ARP poll loop, whereas the gateway's MAC is already cached so
+    // the FIN goes out immediately.
+    let peer_ip:   [u8; 4] = [10, 0, 2, 2];
     let peer_port: u16     = 52345;
     const TAIL: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody-tail";
 
@@ -30326,7 +30331,12 @@ fn test_tcp_ooo_reassembly() -> bool {
     use crate::net::tcp;
 
     const LOCAL_PORT: u16 = 47220;
-    let peer_ip:   [u8; 4] = [10, 0, 2, 22];
+    // Use the SLIRP gateway IP (10.0.2.2) as the synthetic peer, exactly as
+    // test_tcp_inbound_3whs does: the ACKs that process_segment emits go out
+    // through send_ipv4 -> resolve_mac, and the gateway answers ARP promptly
+    // (a host-less synthetic IP would instead cost ~510 ms of ARP retries per
+    // ACK).  The 4-tuple stays unique via the distinct local/peer ports.
+    let peer_ip:   [u8; 4] = [10, 0, 2, 2];
     let peer_port: u16     = 51001;
 
     // test_inject_established sets recv_next = 1, so the in-order byte

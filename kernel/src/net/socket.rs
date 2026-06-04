@@ -496,17 +496,32 @@ pub fn socket_recv_status(id: u64) -> Result<RecvOutcome, &'static str> {
             // Empty stream read: distinguish peer-FIN EOF from would-block.
             // A connection that has received the peer's FIN sits in
             // CloseWait (or has progressed to LastAck/Closed/TimeWait); with
-            // no buffered data that is an orderly EOF (RFC 793 §3.5).  An
+            // no buffered data that is an orderly EOF (RFC 9293 §3.5).  An
             // Established (or still-handshaking) connection with an empty
             // buffer is would-block.
-            let peer_closed = match super::tcp::get_state(sock.local_port) {
+            //
+            // Use the peer-aware (4-tuple) lookup when the connection's
+            // remote endpoint is known, exactly as `read_from` (above) and
+            // `socket_read_closed` do.  A port-only lookup returns whichever
+            // TCB sits first in the table for this local port — which on a
+            // socket sharing its port with a listener (or another session)
+            // is the wrong TCB, so the EOF edge is read off a sibling and a
+            // reader spins on WouldBlock instead of completing (RFC 9293
+            // §3.6 demultiplexing).
+            let state = if sock.connected && sock.remote_port != 0 {
+                super::tcp::get_state_for(sock.local_port,
+                                          sock.remote_ip, sock.remote_port)
+            } else {
+                super::tcp::get_state(sock.local_port)
+            };
+            let peer_closed = match state {
                 Some(st) => matches!(st,
                     super::tcp::TcpState::CloseWait
                     | super::tcp::TcpState::LastAck
                     | super::tcp::TcpState::TimeWait
                     | super::tcp::TcpState::Closed),
-                // No TCB found for this port: the flow is gone — treat as EOF
-                // so a reader drains to completion rather than spinning.
+                // No TCB found: the flow is gone — treat as EOF so a reader
+                // drains to completion rather than spinning.
                 None => true,
             };
             if peer_closed { Ok(RecvOutcome::Eof) } else { Ok(RecvOutcome::WouldBlock) }
@@ -576,8 +591,17 @@ pub fn socket_recv_status_from(id: u64)
                 return Ok((RecvOutcome::Data(data), peer_ip, peer_port));
             }
             // Empty stream read: distinguish peer-FIN EOF from would-block
-            // exactly as socket_recv_status does (RFC 793 §3.5).
-            let peer_closed = match super::tcp::get_state(sock.local_port) {
+            // exactly as socket_recv_status does (RFC 9293 §3.5).  Peer-aware
+            // (4-tuple) lookup when the remote endpoint is known, so the EOF
+            // edge is read off THIS connection and not a sibling sharing the
+            // local port (RFC 9293 §3.6).
+            let state = if sock.connected && sock.remote_port != 0 {
+                super::tcp::get_state_for(sock.local_port,
+                                          sock.remote_ip, sock.remote_port)
+            } else {
+                super::tcp::get_state(sock.local_port)
+            };
+            let peer_closed = match state {
                 Some(st) => matches!(st,
                     super::tcp::TcpState::CloseWait
                     | super::tcp::TcpState::LastAck
