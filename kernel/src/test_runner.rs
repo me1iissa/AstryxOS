@@ -1948,7 +1948,7 @@ pub fn run() -> ! {
     // Verifies CR4.SMAP, CPUID, and smap::SMAP_ENABLED are mutually
     // consistent and that UserGuard's STAC/CLAC bracket actually toggles
     // EFLAGS.AC.  See `docs/SECURITY_AUDIT_2026-05-16.md` finding H1.
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     {
         total += 1;
         if test_security_smap_h1_state() { passed += 1; }
@@ -1961,7 +1961,7 @@ pub fn run() -> ! {
     // the borrow must NOT outlive AC=1 if there's no caller-side bracket).
     // Regression guard against an unbracketed user-memory deref slipping
     // back in.  Per Intel SDM Vol. 3A §4.6 + CWE-823.
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     {
         total += 1;
         if test_220c_smap_userguard_nesting() { passed += 1; }
@@ -1972,7 +1972,7 @@ pub fn run() -> ! {
     // idle kernel.  A failure here indicates either a false-positive in the
     // audit logic or a real boot-time page-cache leak.  Test 220 is the
     // CWE-823 guard (PR #242); 221 is reserved for this invariant check.
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     {
         total += 1;
         if test_221_audit_invariant_idle_kernel() { passed += 1; }
@@ -1986,7 +1986,7 @@ pub fn run() -> ! {
     // Handlers known to lack validation emit [TEST/ARGVAL/SKIP] markers;
     // any handler that returns >= 0 for a kernel-VA pointer is flagged as
     // [TEST/ARGVAL/REGRESSION] (CVE-class).  See test body for the table.
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     {
         total += 1;
         if test_222_syscall_arg_validation_matrix() { passed += 1; }
@@ -1997,7 +1997,7 @@ pub fn run() -> ! {
     // the user-controlled RFLAGS that sys_sigreturn restores via SYSRETQ.
     // Regression guard for finding C1 of the 2026-05-16 security audit
     // (BadIRET / CVE-2014-9322 class, CWE-269).
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     {
         total += 1;
         if test_223_sigreturn_rflags_sanitiser() { passed += 1; }
@@ -2037,7 +2037,7 @@ pub fn run() -> ! {
     // ── Test 227: sigreturn frame_base user-pointer validation (H3 follow-up)
     // Verifies that validate_user_ptr rejects kernel-VA addresses for the
     // SignalFrame size, closing the H3 finding from docs/SECURITY_AUDIT_2026-05-16.md.
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     {
         total += 1;
         if test_227_sigreturn_frame_base_ptr_validation() { passed += 1; }
@@ -2052,7 +2052,7 @@ pub fn run() -> ! {
     // wait(2): "If the parent terminates without waiting for the child, the
     // init process shall inherit the child."  AstryxOS plays that role for
     // any zombie whose would-be reaper is itself dying.
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     {
         total += 1;
         if test_228_auto_reap_orphan_zombies() { passed += 1; }
@@ -2064,7 +2064,7 @@ pub fn run() -> ! {
     // parent commits Blocked) must be reaped without a permanent park — the
     // recheck-under-lock backstop.  Per POSIX wait(2): an already-terminated
     // child must be reapable without blocking.
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     {
         total += 1;
         if test_502_waitpid_prepare_to_wait_race() { passed += 1; }
@@ -2074,7 +2074,7 @@ pub fn run() -> ! {
     // A vfork child that completes (clears its vfork completion token) before
     // the parent commits Blocked must not leave the parent parked — the
     // recheck-under-lock reverts the parent to Ready.  Per POSIX vfork(2).
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     {
         total += 1;
         if test_502b_vfork_prepare_to_wait_race() { passed += 1; }
@@ -2118,7 +2118,7 @@ pub fn run() -> ! {
     // tuples touched, so subsequent mmap fault hits and existing
     // mmap'd PTEs both observe the new content.  See
     // `mm::cache::update_range` for the contract.
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     {
         total += 1;
         if test_232_vfs_write_page_cache_coherency() { passed += 1; }
@@ -2137,7 +2137,7 @@ pub fn run() -> ! {
     //       (System V ABI Ch. 5)
     //   (c) PT_LOAD PF_W | PF_X    → ElfError::WritableExecutable
     //       (CWE-269, W^X enforcement)
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     {
         total += 1;
         if test_235_elf_loader_hardening() { passed += 1; }
@@ -2148,7 +2148,7 @@ pub fn run() -> ! {
     // through `push_dead_stack`, pops it back, and asserts every byte is
     // zero.  Regression guard for finding H5 of the 2026-05-16 security
     // audit (CWE-244 information disclosure across thread boundaries).
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     {
         total += 1;
         if test_236_dead_stack_zeroing() { passed += 1; }
@@ -2159,7 +2159,7 @@ pub fn run() -> ! {
     // the right byte offset across truncation, padding, and adversarial
     // total_length values.  Regression guard for finding H6 of the
     // 2026-05-16 security audit.
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     {
         total += 1;
         if test_237_ipv4_total_length_clamp() { passed += 1; }
@@ -2174,7 +2174,7 @@ pub fn run() -> ! {
     // 256-byte cluster IS parked, which is the PNG-2 shape.  Compiled in
     // when either `firefox-test` (primary consumer) or `test-mode`
     // (so the kernel test suite can verify the diagnostic) is enabled.
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     {
         total += 1;
         if test_238_futex_wake_ghost_cluster() { passed += 1; }
@@ -2194,7 +2194,7 @@ pub fn run() -> ! {
     //   (c) history-gated path — a waiter at +0x10 (non-canonical
     //       offset, inside cluster) IS woken if the same TGID recently
     //       parked there.
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     {
         total += 1;
         if test_239_futex_cluster_wake_compensation() { passed += 1; }
@@ -2206,7 +2206,7 @@ pub fn run() -> ! {
     // returns woken=0 within HIST_WINDOW_TICKS of the recorded wait
     // increments `hist_hits` plus the +0x50 offset bucket (canonical
     // glibc pthread_cond_t __g_refs[0] offset per BZ 25847).
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     {
         total += 1;
         if test_240_futex_wake_ghost_hist() { passed += 1; }
@@ -2217,7 +2217,7 @@ pub fn run() -> ! {
     // W101 plateau diagnostic).  Verifies the per-TID `read_user_rip`
     // helper, the read_sample / record_syscall round-trip, and the
     // dispatch error envelopes for unknown / invalid tid values.
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     #[cfg(feature = "kdb")]
     {
         total += 1;
@@ -2255,7 +2255,7 @@ pub fn run() -> ! {
     // 16-bit one's-complement Internet Checksum (RFC 1071) does not
     // validate.  These tests pin the per-protocol counters and the
     // accept/reject decision across hand-crafted loopback datagrams.
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     {
         total += 1;
         if test_245_ipv4_rx_checksum_validation() { passed += 1; }
@@ -2309,7 +2309,7 @@ pub fn run() -> ! {
     // (CPUID.07H:ECX[2]).  Closes the kernel-address-leak recon class
     // (SGDT / SIDT / SLDT / STR / SMSW) that future ROP-into-kernel
     // exploits depend on.  CWE-200 / CWE-203.
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     {
         total += 1;
         if test_257_cr4_umip_enablement() { passed += 1; }
@@ -2320,7 +2320,7 @@ pub fn run() -> ! {
     // outside { GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE }.  Closes
     // a CWE-20 (Improper Input Validation) hazard where a future flag
     // with security-sensitive semantics would be silently accepted.
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     {
         total += 1;
         if test_258_getrandom_unknown_flag_rejection() { passed += 1; }
@@ -2430,7 +2430,7 @@ pub fn run() -> ! {
     // thread runtime + `signal::ctrl_c` reactor from bringing up cleanly on
     // an Alpine musl image.  Refs: signalfd(2), epoll_pwait2(2),
     // pidfd_open(2), prctl(2), POSIX-1.2017.
-    #[cfg(any(feature = "test-mode", feature = "firefox-test"))]
+    #[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
     {
         total += 1;
         if test_271_tokio_syscall_backfills() { passed += 1; }
@@ -2445,7 +2445,7 @@ pub fn run() -> ! {
     // and cloud-init's NoCloud datasource both follow this discovery
     // pattern.  Refs: kernel.org/Documentation/ABI/testing/sysfs-class-net,
     // Documentation/networking/operstates.rst, man 7 netdevice, man 5 sysfs.
-    #[cfg(any(feature = "test-mode", feature = "firefox-test", feature = "oracle-test"))]
+    #[cfg(any(feature = "test-mode", feature = "firefox-test-core", feature = "oracle-test"))]
     {
         total += 1;
         if test_272_sys_class_net() { passed += 1; }
@@ -2464,7 +2464,7 @@ pub fn run() -> ! {
     //
     // Refs: RFC 9293 §3.4 (TCP connection establishment), RFC 9293 §3.7
     // (data exchange), IEEE Std 1003.1-2017 §send.
-    #[cfg(any(feature = "test-mode", feature = "firefox-test", feature = "oracle-test"))]
+    #[cfg(any(feature = "test-mode", feature = "firefox-test-core", feature = "oracle-test"))]
     {
         total += 1;
         if test_273_tcp_medium_payload_loopback() { passed += 1; }
@@ -2481,7 +2481,7 @@ pub fn run() -> ! {
     //
     // Refs: RFC 9293 §3.7 (data transfer), RFC 9293 §3.8.1 (send buffer),
     // RFC 5681 §3.1 (slow start / cwnd), IEEE Std 1003.1-2017 §write.
-    #[cfg(any(feature = "test-mode", feature = "firefox-test",
+    #[cfg(any(feature = "test-mode", feature = "firefox-test-core",
               feature = "oracle-test", feature = "oracle-daemon-test"))]
     {
         total += 1;
@@ -2509,7 +2509,7 @@ pub fn run() -> ! {
     // self-contained on the BSP without needing a NIC or SLIRP.
     // Public-spec refs: RFC 768 (UDP), RFC 6335 §6 (ephemeral ports),
     // IEEE 1003.1 §connect / §sendto / §recvfrom.
-    #[cfg(any(feature = "test-mode", feature = "firefox-test", feature = "oracle-test", feature = "busybox-test"))]
+    #[cfg(any(feature = "test-mode", feature = "firefox-test-core", feature = "oracle-test", feature = "busybox-test"))]
     {
         total += 1;
         if test_274_udp_connect_auto_bind() { passed += 1; }
@@ -2701,7 +2701,7 @@ pub fn run() -> ! {
     // the flake lived without the wall-clock cost that gates `native-core-tests`.
     // Cite POSIX sched(7) / clock_nanosleep(2) and Intel SDM Vol. 3A §8.10.6.7
     // (HLT) — deferred-drain shape.
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     {
         total += 1;
         if test_284_due_wake_survives_contention() { passed += 1; }
@@ -2714,7 +2714,7 @@ pub fn run() -> ! {
     // the standing boost differential.  Deterministic and fast (pure scoring
     // arithmetic + curve assertions).  Cite POSIX sched(7) (SCHED_OTHER: every
     // runnable thread eventually runs).
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     {
         total += 1;
         if test_285_anti_starvation_aging() { passed += 1; }
@@ -2733,7 +2733,7 @@ pub fn run() -> ! {
     // ── Post-suite invariant audit ───────────────────────────────────────
     // Called after every test has exercised the page cache so any rc=0
     // orphans introduced under load are caught before QEMU exits.
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     {
         let (total_entries, orphan_count) = crate::mm::cache::audit_invariant();
         if orphan_count > 0 {
@@ -12835,7 +12835,7 @@ fn test_page_aliasing_reproducer() -> bool {
     // test still works -- it asserts on the userspace exit code rather
     // than the per-byte diagnostic chatter -- and the summary remains
     // available on the framebuffer console for human inspection.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     crate::syscall::ring::enable_for(user_pid);
 
     let was_active = crate::sched::is_active();
@@ -13013,7 +13013,7 @@ fn test_vdso_userspace_probe() -> bool {
     // the verdict survives via the exit code (sufficient for the assertion)
     // but the diagnostic detail is lost.  Mirrors the same pattern as
     // test_page_aliasing_reproducer above.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     crate::syscall::ring::enable_for(user_pid);
 
     let was_active = crate::sched::is_active();
@@ -22855,7 +22855,7 @@ fn test_256_property_notify_root_mask() -> bool {
 // UMIP bit, gated on the same CPUID probe used by the enablement path
 // (a CPU that does not advertise UMIP cannot have CR4.UMIP set without
 // raising #GP, so a "missing" bit on such a CPU is correct behaviour).
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_257_cr4_umip_enablement() -> bool {
     test_header!("CR4.UMIP enablement (cycle-3 — SGDT/SIDT/SLDT/STR/SMSW leak)");
 
@@ -22938,7 +22938,7 @@ fn test_257_cr4_umip_enablement() -> bool {
 // flag not in { GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE }.
 //
 // CWE-20 (Improper Input Validation).
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_258_getrandom_unknown_flag_rejection() -> bool {
     test_header!("sys_getrandom unknown-flag rejection (CWE-20)");
 
@@ -31385,7 +31385,7 @@ fn test_273_tcp_medium_payload_loopback() -> bool {
 //
 // Refs: RFC 9293 §3.7.4 (sender flow control / send window), RFC 5681 §3.1
 // (congestion window), IEEE Std 1003.1-2017 §write.
-#[cfg(any(feature = "test-mode", feature = "firefox-test",
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core",
           feature = "oracle-test", feature = "oracle-daemon-test"))]
 fn test_276_tcp_send_buffer_drain() -> bool {
     test_header!("TCP send_buffer drain — multi-MSS payload fully delivered (loopback)");
@@ -33165,7 +33165,7 @@ fn test_230_so_peercred_returns_peer_pid() -> bool {
 //   4. Assert peer_creds(accepted_fd) == 8000 (client's identity).
 //
 // References: unix(7) SO_PEERCRED; POSIX.1-2017 §getsockopt; CWE-287.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_230b_peercred_connect_path() -> bool {
     test_header!("AF_UNIX SO_PEERCRED client-side stamping via connect() path");
 
@@ -38698,7 +38698,7 @@ fn test_security_user_ptr_validation_cwe823() -> bool {
 //   * CPUID.(EAX=07H,ECX=00H):EBX[bit 20] = SMAP support
 //   * CWE-269 (Improper Privilege Management) — SMAP closes the
 //     unintentional-user-pointer-deref escalation primitive
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_security_smap_h1_state() -> bool {
     test_header!("security: SMAP CR4.SMAP coherent with smap::SMAP_ENABLED (H1)");
 
@@ -38818,7 +38818,7 @@ fn test_security_smap_h1_state() -> bool {
 //   * Intel SDM Vol. 3A §4.6 (SMAP enforcement)
 //   * CWE-823 (Use of Out-of-range Pointer Offset)
 //   * CWE-119 (Buffer Errors with Improper Bounds Checking)
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_220c_smap_userguard_nesting() -> bool {
     test_header!("security: UserGuard nested/early-drop AC-state regression");
 
@@ -39027,7 +39027,7 @@ fn test_220c_smap_userguard_nesting() -> bool {
 //
 // Regression markers: a syscall that returns `>= 0` for a kernel-VA pointer
 // emits `[TEST/ARGVAL/REGRESSION] ...` — harness watchers escalate these.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_222_syscall_arg_validation_matrix() -> bool {
     test_header!("syscall arg-validation matrix — adversarial pointer sweep (GAP-CRIT-2)");
 
@@ -39372,7 +39372,7 @@ fn test_222_syscall_arg_validation_matrix() -> bool {
 // frame; constructing both safely inside the test runner is more invasive
 // than reproducing the mask in-place.  If RFLAGS_USER_MASK is silently
 // weakened, this test fails immediately.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_223_sigreturn_rflags_sanitiser() -> bool {
     test_header!("sigreturn RFLAGS sanitiser — IOPL/NT/RF/VM/AC clear + IF forced (GAP-HIGH-1)");
 
@@ -39443,7 +39443,7 @@ fn test_223_sigreturn_rflags_sanitiser() -> bool {
 // and asserts the orphan count is zero.  The post-suite audit block (at the
 // bottom of run()) performs a second call after all other tests have exercised
 // the page cache, catching leaks that only appear under load.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_221_audit_invariant_idle_kernel() -> bool {
     test_header!("cache::audit_invariant — zero orphans on idle kernel (GAP-CRIT-1)");
     let (total_entries, orphan_count) = crate::mm::cache::audit_invariant();
@@ -39835,7 +39835,7 @@ fn test_226_prop_cache_insert_lookup_roundtrip() -> bool {
 //
 // Per POSIX.1-2017 §14.4 sigaction: signal frames are allocated on the
 // user-mode signal stack; a kernel-VA pointer is unconditionally invalid.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_227_sigreturn_frame_base_ptr_validation() -> bool {
     test_header!("sigreturn frame_base user-pointer validation — kernel-VA rejected (H3)");
 
@@ -40026,7 +40026,7 @@ fn test_228_auto_reap_orphan_zombies() -> bool {
 // Per POSIX wait(2): "If [a child] has already terminated ... [wait] shall
 // return immediately."  An already-terminated child must be reapable without
 // blocking.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_502_waitpid_prepare_to_wait_race() -> bool {
     use crate::proc::{PROCESS_TABLE, THREAD_TABLE, ThreadState, ProcessState};
 
@@ -40233,7 +40233,7 @@ fn test_502_waitpid_prepare_to_wait_race() -> bool {
 //
 // Per POSIX vfork(2): the parent is suspended only until the child performs a
 // successful execve() or _exit(); an already-completed child must not block it.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_502b_vfork_prepare_to_wait_race() -> bool {
     use crate::proc::{THREAD_TABLE, ThreadState};
 
@@ -40367,7 +40367,7 @@ fn test_502b_vfork_prepare_to_wait_race() -> bool {
 // the cache page through the higher-half identity map.  Pre-fix
 // behaviour: cache bytes unchanged (FAIL).  Post-fix: cache bytes
 // match the written data (PASS).
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_232_vfs_write_page_cache_coherency() -> bool {
     test_header!("VFS sys_write / page-cache coherency (POSIX mmap+write contract)");
 
@@ -40514,7 +40514,7 @@ fn test_232_vfs_write_page_cache_coherency() -> bool {
 // to produce SIGBUS.  But the *tail page* — the partial last page —
 // is in-bounds for the mapping and must observe the appended bytes
 // per the same MAP_SHARED visibility contract.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_233_vfs_append_page_cache_coherency() -> bool {
     test_header!("VFS append_file / page-cache coherency (tail-page update)");
 
@@ -40617,7 +40617,7 @@ fn test_233_vfs_append_page_cache_coherency() -> bool {
 // Uses `/tmp` (tmpfs) so the cache entries can be safely injected
 // against a real (mount, inode) without disturbing the rest of the
 // suite.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_234_cache_update_range_boundaries() -> bool {
     test_header!("mm::cache::update_range — page-boundary arithmetic");
 
@@ -40750,7 +40750,7 @@ fn test_234_cache_update_range_boundaries() -> bool {
 //   - IEEE Std 1003.1-2017 ftruncate(2) / truncate(2): extension reads as
 //     zero; the file's bytes are otherwise unchanged.
 //   - IEEE Std 1003.1-2017 mmap(2): MAP_SHARED visibility of file changes.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_240_vfs_truncate_page_cache_coherency() -> bool {
     test_header!("VFS truncate / page-cache coherency (POSIX ftruncate zero-fill)");
     const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
@@ -40974,7 +40974,7 @@ fn test_240_vfs_truncate_page_cache_coherency() -> bool {
 // FUTEX_WAKE on a different uaddr in the same cluster.  No real userspace
 // threads are involved — the goal is to exercise the kernel-side
 // diagnostic logic deterministically.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_238_futex_wake_ghost_cluster() -> bool {
     use core::sync::atomic::Ordering;
     test_header!("subsys/linux: FUTEX_WAKE_GHOST cluster diagnostic");
@@ -41107,7 +41107,7 @@ fn test_238_futex_wake_ghost_cluster() -> bool {
 //
 //   (c) History-gated — non-canonical offset (+0x10) with prior
 //       `record_wait(pid, +0x10)`.  MUST wake.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_239_futex_cluster_wake_compensation() -> bool {
     use core::sync::atomic::Ordering;
     test_header!("subsys/linux: FUTEX_WAKE cluster-wake compensation");
@@ -41260,7 +41260,7 @@ fn test_239_futex_cluster_wake_compensation() -> bool {
 //     https://sourceware.org/bugzilla/show_bug.cgi?id=25847
 //   - futex(2): https://man7.org/linux/man-pages/man2/futex.2.html
 //   - POSIX pthread_cond_signal(3p)
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_240_futex_wake_ghost_hist() -> bool {
     use core::sync::atomic::Ordering;
     use crate::subsys::linux::syscall::ghost_hist;
@@ -41405,7 +41405,7 @@ fn test_240_futex_wake_ghost_hist() -> bool {
 // Each adversarial image starts from the same valid ET_DYN base image and
 // flips exactly the field under test, so each rejection is attributable to
 // the corresponding check.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_235_elf_loader_hardening() -> bool {
     test_header!("security: ELF loader hardening — phnum cap, filesz/memsz, W^X (audit H4)");
 
@@ -41554,7 +41554,7 @@ fn test_235_elf_loader_hardening() -> bool {
 //
 // CWE-244 (Improper Clean Up on Thrown Exception in the broader
 // "recycled-resource leak of residual data" class).
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_236_dead_stack_zeroing() -> bool {
     test_header!("security: push_dead_stack zeros recycled kstack (audit H5)");
 
@@ -41701,7 +41701,7 @@ fn test_236_dead_stack_zeroing() -> bool {
 //       slice is empty.
 //   (d) total_length == frame_len, total_length > frame_len, and the
 //       degenerate frame_len == payload_start case.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_237_ipv4_total_length_clamp() -> bool {
     test_header!("security: IPv4 total_length payload clamp (audit H6, RFC 791 §3.1)");
 
@@ -41767,7 +41767,7 @@ fn test_237_ipv4_total_length_clamp() -> bool {
 //
 // Cite: Intel SDM Vol 3A §8.2.3 (TSO same-line ordering) — implicitly
 // justifies the (rip, rbp, seq) read-back invariant exercised here.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 #[cfg(feature = "kdb")]
 fn test_241_kdb_rip_trace_shape() -> bool {
     test_header!("kdb rip-trace op JSON shape sanity");
@@ -42331,7 +42331,7 @@ fn test_243_vfork_alloc_rejects_kernel_va() -> bool {
 //   (c) Restore and re-checksum — counter must NOT advance again.
 //
 // Cite: RFC 791 §3.1, RFC 1071 §1 (Internet Checksum), RFC 1122 §3.2.1.2.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_245_ipv4_rx_checksum_validation() -> bool {
     test_header!("net: IPv4 RX header checksum validation (RFC 791 §3.1)");
 
@@ -42421,7 +42421,7 @@ fn test_245_ipv4_rx_checksum_validation() -> bool {
 //       without counting a drop.
 //
 // Cite: RFC 768, RFC 1122 §4.1.3.4, RFC 1071 §1 (Internet Checksum).
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_246_udp_rx_checksum_validation() -> bool {
     test_header!("net: UDP RX checksum validation (RFC 768, RFC 1122 §4.1.3.4)");
 
@@ -42541,7 +42541,7 @@ fn test_246_udp_rx_checksum_validation() -> bool {
 //       checksum field is now wrong, counter MUST advance by one.
 //
 // Cite: RFC 792 (ICMP), RFC 1122 §3.2.2 ("Validity tests"), RFC 1071 §1.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_247_icmp_rx_checksum_validation() -> bool {
     test_header!("net: ICMP RX checksum validation (RFC 792, RFC 1122 §3.2.2)");
 
@@ -43197,7 +43197,7 @@ fn test_263_sched_starvation_counter() -> bool {
 //   * Intel SDM Vol. 3A §8.10.6.7 (HLT) — motivates the deferred-drain shape
 //     (the hard IRQ records pending work; a lock-safe context drains it).
 
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_284_due_wake_survives_contention() -> bool {
     use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -43373,7 +43373,7 @@ fn test_284_due_wake_survives_contention() -> bool {
 // NORMAL peer; (3) with no wait (age 0) priority ordering is unchanged.  Pure
 // arithmetic — deterministic, no thread spawning, no scheduler races.  Cite
 // POSIX sched(7): under SCHED_OTHER every runnable thread eventually runs.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn test_285_anti_starvation_aging() -> bool {
     use crate::proc::{PRIORITY_NORMAL, PRIORITY_BOOST_WAIT};
     use crate::sched::wait_age_bonus;
@@ -44666,7 +44666,7 @@ fn test_269_sigkill_clears_sibling_cleartid() -> bool {
 // Refs: signalfd(2), signalfd4(2), epoll_wait(2), epoll_pwait2(2),
 // pidfd_open(2), pidfd_send_signal(2), POSIX-1.2017 `<signal.h>`,
 // kernel.org/Documentation/admin-guide/syscalls.
-#[cfg(any(feature = "test-mode", feature = "firefox-test"))]
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
 fn test_271_tokio_syscall_backfills() -> bool {
     test_header!("tokio I1b backfills: signalfd / epoll_pwait2 / pidfd_open");
 
@@ -44862,7 +44862,7 @@ fn test_271_tokio_syscall_backfills() -> bool {
 // Refs: kernel.org/Documentation/ABI/testing/sysfs-class-net,
 //       kernel.org/Documentation/networking/operstates.rst,
 //       man 7 netdevice, man 5 sysfs, RFC 1042 (ARP types).
-#[cfg(any(feature = "test-mode", feature = "firefox-test", feature = "oracle-test"))]
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core", feature = "oracle-test"))]
 fn test_272_sys_class_net() -> bool {
     test_header!("/sys/class/net native sysfs surface");
 
@@ -45078,7 +45078,7 @@ fn test_272_sys_class_net() -> bool {
 //
 // Public-spec refs: RFC 768 (UDP), RFC 6335 §6 (ephemeral port range),
 // IEEE 1003.1 §connect, §sendto, §recvfrom.
-#[cfg(any(feature = "test-mode", feature = "firefox-test", feature = "oracle-test", feature = "busybox-test"))]
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core", feature = "oracle-test", feature = "busybox-test"))]
 fn test_274_udp_connect_auto_bind() -> bool {
     test_header!("UDP connect()/sendto() auto-bind (DNS unblocker)");
 

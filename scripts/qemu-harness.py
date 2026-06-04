@@ -26,8 +26,30 @@ Do NOT pass --no-kvm unless you are explicitly reproducing a TCG-only
 environment or testing on a host without /dev/kvm. The harness will emit a
 WARNING to stderr when --no-kvm is used and /dev/kvm is available.
 
+Firefox serial profiles (perf vs trace):
+    The Firefox kernel ships two profiles that share identical FUNCTIONAL
+    behaviour and differ only in diagnostic serial volume:
+
+      PERF / RENDER / CI (fast, default):
+          start --features firefox-test-core[,kdb,...]
+          High-frequency diagnostic emitters ([FF/stderr]/[FF/write],
+          [POLL_RET], per-component [VFS/resolve], [FUTEX_*]) are compiled OUT.
+          A boot emits <2 MB serial instead of ~45 MB; since each serial byte is
+          one PIO VM-exit under KVM (Intel SDM Vol. 3C §25 / NS16550A THR-write
+          model), the synchronous transcription cost that dominated wall-clock
+          (~56 min) collapses to minutes.  Firefox still runs IDENTICALLY.
+
+      DEBUG / TRACE (full serial, opt-in):
+          start --features firefox-test-core --trace        (preferred)
+          start --features firefox-test                     (back-compat alias)
+          Adds firefox-test-trace → the full per-syscall serial transcript.
+          --trace appends the trace feature and prints the expansion to stderr
+          (never injected silently).  Do NOT add futex-wait-scan or
+          firefox-trace-verbose to a perf boot — both add large PT-walk + serial
+          cost and stay explicit opt-ins outside both profiles.
+
 Tier 1 — session management:
-    python3 scripts/qemu-harness.py start [--features FLAGS] [--no-build]
+    python3 scripts/qemu-harness.py start [--features FLAGS] [--trace] [--no-build]
                                           [--gdb-port PORT] [--gdb-wait]
                                           [--firefox-variant musl|glibc]
                                           [--snapshottable]
@@ -2735,6 +2757,48 @@ def cmd_start(args):
     # ports are just forwarded; only the SLIRP side binds inside QEMU).
     features_str = (args.features or "")
     feats = [f.strip() for f in features_str.split(",")]
+
+    # ── Firefox serial profile (perf vs trace) ───────────────────────────────
+    # Two profiles share the same functional kernel:
+    #
+    #   PERF / RENDER / CI (default):  --features firefox-test-core
+    #       Functional Firefox bring-up with the high-frequency diagnostic
+    #       serial emitters compiled OUT.  A boot emits <2 MB of serial instead
+    #       of ~45 MB; since each emitted byte is one PIO VM-exit under KVM
+    #       (Intel SDM Vol. 3C §25), this collapses the synchronous transcription
+    #       cost that otherwise dominated wall-clock (~56 min → minutes).
+    #
+    #   DEBUG / TRACE (opt-in):  --features firefox-test-core --trace
+    #       (or the back-compat super-feature  --features firefox-test)
+    #       Adds firefox-test-trace → the full per-syscall mirror
+    #       ([FF/stderr]/[FF/write]), [POLL_RET], per-component [VFS/resolve],
+    #       and [FUTEX_*] traces, for debugging boots that want the dense log.
+    #
+    # --trace appends firefox-test-trace only when the core/full feature is
+    # present, and prints the expansion to stderr (never injected silently —
+    # the harness's standing rule).  NEVER auto-add futex-wait-scan or
+    # firefox-trace-verbose; those carry extra PT-walk + serial cost and stay
+    # explicit opt-ins outside both profiles.
+    if getattr(args, "ff_trace", False):
+        has_ff = ("firefox-test-core" in feats) or ("firefox-test" in feats)
+        if has_ff and "firefox-test-trace" not in feats and "firefox-test" not in feats:
+            feats.append("firefox-test-trace")
+            features_str = ",".join(f for f in feats if f)
+            # Write the expansion back onto args so the downstream build
+            # (_build(args.features) at session start) and the recorded session
+            # state both see the trace feature.  feats/features_str are kept in
+            # sync for the per-feature presence checks below.
+            args.features = features_str
+            sys.stderr.write(
+                "[harness] --trace: appended 'firefox-test-trace' → features="
+                f"{features_str}\n"
+            )
+        elif not has_ff:
+            sys.stderr.write(
+                "[harness] --trace ignored: feature set has neither "
+                "'firefox-test-core' nor 'firefox-test'\n"
+            )
+
     kdb_host_port = 0
     if "kdb" in feats:
         # Derive deterministically from sid so reruns are stable and two
@@ -10835,6 +10899,17 @@ def main():
                                "and __llvm_cov* sections; the test runner's "
                                "pre-exit hook then dumps them as [COV-CHUNK] "
                                "serial lines for `coverage --collect`.")
+    p_start.add_argument("--trace", action="store_true", dest="ff_trace",
+                          help="Diagnostic-serial profile: append "
+                               "'firefox-test-trace' to the feature list when it "
+                               "contains 'firefox-test-core' (or 'firefox-test'). "
+                               "This turns ON the high-frequency per-syscall/"
+                               "per-poll/per-resolve serial emitters ([FF/stderr], "
+                               "[POLL_RET], [VFS/resolve], [FUTEX_*]) for a "
+                               "debugging boot.  WITHOUT --trace, a "
+                               "'firefox-test-core' boot is the FAST perf/render "
+                               "profile (<2 MB serial vs ~45 MB).  The expansion "
+                               "is printed to stderr, never silent.")
     p_start.add_argument("--no-build", action="store_true",
                           help="Skip cargo build; use existing kernel.bin")
     p_start.add_argument("--build-only", action="store_true", dest="build_only",

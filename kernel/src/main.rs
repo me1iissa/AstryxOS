@@ -74,7 +74,7 @@ mod pivot_e_demo;
 mod pivot_e_tui_demo;
 #[cfg(feature = "pivot-e-git-test")]
 mod pivot_e_git_demo;
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 mod ff_out_png;
 
 use astryx_shared::{BootInfo, BOOT_INFO_MAGIC};
@@ -400,7 +400,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         // Mutually exclusive with firefox-test: both set would race for
         // Xastryx + the visible-window slot.
         #[cfg(all(not(feature = "gui-test"),
-                  not(feature = "firefox-test"),
+                  not(feature = "firefox-test-core"),
                   not(feature = "busybox-test"),
                   not(feature = "wget-test"),
                   not(feature = "httpd-test"),
@@ -613,7 +613,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         // enforced at compile time via the cfg gates above.
         #[cfg(all(not(feature = "gui-test"),
                   not(feature = "xeyes-test"),
-                  not(feature = "firefox-test"),
+                  not(feature = "firefox-test-core"),
                   not(feature = "httpd-test"),
                   not(feature = "sshd-test"),
                   not(feature = "tls-test"),
@@ -674,7 +674,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         // function; we just open a listener here and run the demo loop.
         #[cfg(all(not(feature = "gui-test"),
                   not(feature = "xeyes-test"),
-                  not(feature = "firefox-test"),
+                  not(feature = "firefox-test-core"),
                   not(feature = "busybox-test"),
                   not(feature = "wget-test"),
                   not(feature = "sshd-test"),
@@ -720,7 +720,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         // ── sshd-test: dropbear SSH-service userspace demo (PIVOT-D, 2026-05-23) ──
         #[cfg(all(not(feature = "gui-test"),
                   not(feature = "xeyes-test"),
-                  not(feature = "firefox-test"),
+                  not(feature = "firefox-test-core"),
                   not(feature = "busybox-test"),
                   not(feature = "wget-test"),
                   not(feature = "httpd-test"),
@@ -763,7 +763,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         // ── tls-test: TLS userspace handshake demo (PIVOT-I1a, 2026-05-23) ──
         #[cfg(all(not(feature = "gui-test"),
                   not(feature = "xeyes-test"),
-                  not(feature = "firefox-test"),
+                  not(feature = "firefox-test-core"),
                   not(feature = "busybox-test"),
                   not(feature = "wget-test"),
                   not(feature = "httpd-test"),
@@ -806,7 +806,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         // ── oracle-test: oracle endpoint agent first-boot demo (PIVOT-I2, 2026-05-23) ──
         #[cfg(all(not(feature = "gui-test"),
                   not(feature = "xeyes-test"),
-                  not(feature = "firefox-test"),
+                  not(feature = "firefox-test-core"),
                   not(feature = "busybox-test"),
                   not(feature = "wget-test"),
                   not(feature = "httpd-test"),
@@ -854,7 +854,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         // contract and `scripts/oracle-stub-conflux.py` for the host side.
         #[cfg(all(not(feature = "gui-test"),
                   not(feature = "xeyes-test"),
-                  not(feature = "firefox-test"),
+                  not(feature = "firefox-test-core"),
                   not(feature = "busybox-test"),
                   not(feature = "wget-test"),
                   not(feature = "httpd-test"),
@@ -907,7 +907,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         // cfg-gate level (all share the BSP idle slot).
         #[cfg(all(not(feature = "gui-test"),
                   not(feature = "xeyes-test"),
-                  not(feature = "firefox-test"),
+                  not(feature = "firefox-test-core"),
                   not(feature = "busybox-test"),
                   not(feature = "wget-test"),
                   not(feature = "httpd-test"),
@@ -957,7 +957,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         // cfg-gate level (all share the BSP idle slot).
         #[cfg(all(not(feature = "gui-test"),
                   not(feature = "xeyes-test"),
-                  not(feature = "firefox-test"),
+                  not(feature = "firefox-test-core"),
                   not(feature = "busybox-test"),
                   not(feature = "wget-test"),
                   not(feature = "httpd-test"),
@@ -1010,7 +1010,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         // cfg-gate level (all share the BSP idle slot).
         #[cfg(all(not(feature = "gui-test"),
                   not(feature = "xeyes-test"),
-                  not(feature = "firefox-test"),
+                  not(feature = "firefox-test-core"),
                   not(feature = "busybox-test"),
                   not(feature = "wget-test"),
                   not(feature = "httpd-test"),
@@ -1065,7 +1065,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                   not(feature = "pivot-e-test"),
                   not(feature = "pivot-e-tui-test"),
                   not(feature = "pivot-e-git-test"),
-                  feature = "firefox-test"))]
+                  feature = "firefox-test-core"))]
         {
             serial_println!("[FFTEST] Firefox-test mode starting...");
             x11::init();
@@ -1569,7 +1569,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // on firefox-test so test-mode boots (where the diagnostic
             // is exercised by Test 239 only) do not emit a stray
             // summary block at every kernel-test shutdown.
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-core")]
             crate::subsys::linux::syscall::ghost_hist::dump_summary();
 
             // Read Firefox's rendered screenshot (/tmp/out.png) back out of the
@@ -1585,7 +1585,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // common, robust path) so we never double-emit.  This post-loop
             // call is the fallback for the path where Firefox exited before the
             // 200-tick probe fired (e.g. a very fast screenshot run).
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-core")]
             if !out_png_emitted {
                 ff_out_png::emit_out_png();
             }
@@ -1609,7 +1609,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         }
 
         // ── Normal boot: launch userspace + interactive shell ──────────────
-        #[cfg(not(any(feature = "gui-test", feature = "firefox-test", feature = "xeyes-test", feature = "busybox-test", feature = "wget-test", feature = "httpd-test", feature = "sshd-test", feature = "tls-test", feature = "oracle-test", feature = "oracle-daemon-test")))]
+        #[cfg(not(any(feature = "gui-test", feature = "firefox-test-core", feature = "xeyes-test", feature = "busybox-test", feature = "wget-test", feature = "httpd-test", feature = "sshd-test", feature = "tls-test", feature = "oracle-test", feature = "oracle-daemon-test")))]
         {
         // Phase 13: Launch Ascension (init) and Orbit (shell) as Ring 3 processes
         serial_println!("[Aether] Phase 13: Launching userspace processes...");
@@ -1669,7 +1669,7 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         // Drop to the kernel shell for interactive debugging/management.
         // Ascension will eventually replace this with a full user-mode init.
         shell::launch()
-        } // end #[cfg(not(any(feature = "gui-test", feature = "firefox-test", feature = "xeyes-test", feature = "busybox-test", feature = "wget-test", feature = "httpd-test", feature = "sshd-test")))]
+        } // end #[cfg(not(any(feature = "gui-test", feature = "firefox-test-core", feature = "xeyes-test", feature = "busybox-test", feature = "wget-test", feature = "httpd-test", feature = "sshd-test")))]
     }
 }
 

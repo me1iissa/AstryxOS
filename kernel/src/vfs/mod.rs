@@ -1341,7 +1341,13 @@ impl ResolveTrace {
 /// genuinely needs >20 iterations to resolve.
 #[inline]
 fn resolve_trace(tctx: &mut ResolveTrace, args: core::fmt::Arguments<'_>) {
-    #[cfg(any(feature = "vfs-trace", feature = "firefox-test"))]
+    // Per-component [VFS/resolve] progress trace.  High-frequency diagnostic
+    // (one line per path component per resolve) with no correctness role — the
+    // [VFS/resolve] DEADLINE EXCEEDED error line below is emitted
+    // unconditionally and is the only resolve signal a non-trace build needs.
+    // Gated on `firefox-test-trace` (and the standalone `vfs-trace`) so the
+    // functional `firefox-test-core` boot does not flood COM1.
+    #[cfg(any(feature = "vfs-trace", feature = "firefox-test-trace"))]
     {
         if tctx.emitted < ResolveTrace::MAX_LINES {
             crate::serial_println!("{}", args);
@@ -1353,7 +1359,7 @@ fn resolve_trace(tctx: &mut ResolveTrace, args: core::fmt::Arguments<'_>) {
             }
         }
     }
-    #[cfg(not(any(feature = "vfs-trace", feature = "firefox-test")))]
+    #[cfg(not(any(feature = "vfs-trace", feature = "firefox-test-trace")))]
     {
         let _ = tctx;
         let _ = args;
@@ -2246,7 +2252,7 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
             if flags & 0x0400_0000 != 0 { return Ok(0); }
             // bit 25 = /dev/zero  → fill buffer with zeros
             if flags & 0x0200_0000 != 0 {
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-core")]
                 crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::DevZero, buf, count);
                 unsafe {
                     let _g = crate::arch::x86_64::smap::UserGuard::new();

@@ -298,7 +298,7 @@ pub mod f3_code_dr_watch;
 /// optionally waking nearby waiters when a `FUTEX_WAKE(uaddr, n)` would
 /// otherwise leave a recently-parked sibling stranded.  See
 /// `futex_cluster.rs` for the safety harness.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 pub mod futex_cluster;
 
 /// Futex-key resolution diagnostic for `FUTEX_WAKE woken=0`.
@@ -311,13 +311,13 @@ pub mod futex_cluster;
 /// (<https://man7.org/linux/man-pages/man2/futex.2.html>) the
 /// `FUTEX_PRIVATE_FLAG` key is `(mm, uaddr)`; AstryxOS uses `(pid, uaddr)`
 /// equivalent.  See `futex_key_diag.rs` for the audit framing.
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-trace")]
 pub mod futex_key_diag;
 
 /// Firefox-test diagnostic ring helpers — tiny shim that holds the "current
 /// syscall's ring-entry index" so sys_read_linux / sys_open_linux can attach
 /// path / read-content context without threading it through every signature.
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 pub mod syscall_ring {
     use core::sync::atomic::{AtomicI64, Ordering};
     use crate::arch::x86_64::apic::MAX_CPUS;

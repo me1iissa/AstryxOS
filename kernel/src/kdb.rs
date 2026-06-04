@@ -369,9 +369,9 @@ pub fn dispatch(req: &str, out: &mut String) {
         "thread-park-audit" => op_thread_park_audit(req, out),
         "rip-trace"      => op_rip_trace(req, out),
         "procmaps"       => op_procmaps(req, out),
-        #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+        #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
         "futex-stats"           => op_futex_stats(out),
-        #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+        #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
         "futex-set-cluster-wake" => op_futex_set_cluster_wake(req, out),
         "futex-ghost-hist" => op_futex_ghost_hist(req, out),
         // cond-autopsy: one-shot musl pthread_cond/mutex wake-target-vs-
@@ -1052,7 +1052,7 @@ fn op_bell_stats(out: &mut String) {
 //   pfh_writable_alias_cache > 0 but key matches installer          → NULL; re-frame
 
 fn op_cache_aliasing(out: &mut String) {
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         use core::fmt::Write;
         let pfh_alias = crate::arch::x86_64::idt::pfh_writable_alias_cache_count();
@@ -1062,7 +1062,7 @@ fn op_cache_aliasing(out: &mut String) {
             pfh_alias, mmap_sw);
         out.push('}');
     }
-    #[cfg(not(feature = "firefox-test"))]
+    #[cfg(not(feature = "firefox-test-core"))]
     {
         out.push_str(r#"{"error":"cache-aliasing requires firefox-test feature"}"#);
     }
@@ -1090,7 +1090,7 @@ fn op_cache_aliasing(out: &mut String) {
 // Returns zero for all buckets before any W215-cluster fault fires (idle state).
 
 fn op_fault_cache_keys(out: &mut String) {
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         use core::fmt::Write;
         let (a, b, c) = crate::signal::fault_cache_key_bucket_counts();
@@ -1100,7 +1100,7 @@ fn op_fault_cache_keys(out: &mut String) {
         );
         out.push('}');
     }
-    #[cfg(not(feature = "firefox-test"))]
+    #[cfg(not(feature = "firefox-test-core"))]
     {
         out.push_str(r#"{"error":"fault-cache-keys requires firefox-test feature"}"#);
     }
@@ -1125,7 +1125,7 @@ fn op_fault_cache_keys(out: &mut String) {
 // pid/vaddr/phys/key for provenance.  Requires --features firefox-test.
 
 fn op_w215_cache_residency(out: &mut String) {
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         use core::fmt::Write;
         out.push('{');
@@ -1136,7 +1136,7 @@ fn op_w215_cache_residency(out: &mut String) {
         }
         out.push('}');
     }
-    #[cfg(not(feature = "firefox-test"))]
+    #[cfg(not(feature = "firefox-test-core"))]
     {
         out.push_str(r#"{"error":"w215-cache-residency requires firefox-test feature"}"#);
     }
@@ -1180,7 +1180,7 @@ fn op_w215_cache_residency(out: &mut String) {
 // Requires: --features firefox-test.
 
 fn op_w215_diag(out: &mut String) {
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         use core::fmt::Write;
         let window_race = crate::mm::w215_diag::window_race_count();
@@ -1200,7 +1200,7 @@ fn op_w215_diag(out: &mut String) {
         out.push(']');
         out.push('}');
     }
-    #[cfg(not(feature = "firefox-test"))]
+    #[cfg(not(feature = "firefox-test-core"))]
     {
         out.push_str(r#"{"error":"w215-diag requires firefox-test feature"}"#);
     }
@@ -1931,7 +1931,7 @@ fn op_syscall_trend(req: &str, out: &mut String) {
 // On non-firefox-test builds the op returns a capabilities note instead.
 
 fn op_cache_audit(out: &mut String) {
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         use core::fmt::Write;
 
@@ -1954,7 +1954,7 @@ fn op_cache_audit(out: &mut String) {
         out.push_str(r#","note":"per-orphan detail in serial log [CACHE/AUDIT/ORPHAN] lines""#);
         out.push('}');
     }
-    #[cfg(not(feature = "firefox-test"))]
+    #[cfg(not(feature = "firefox-test-core"))]
     {
         out.push_str(r#"{"error":"cache-audit requires firefox-test feature"}"#);
     }
@@ -2935,7 +2935,7 @@ fn op_rip_trace(req: &str, out: &mut String) {
 // this op is the only structured way to read it back without scraping
 // the serial transcript.  The synchronous summary emission is
 // idempotent — calling it multiple times just refreshes the line.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn op_futex_ghost_hist(req: &str, out: &mut String) {
     use core::fmt::Write;
     use core::sync::atomic::Ordering;
@@ -3002,7 +3002,7 @@ fn op_futex_ghost_hist(req: &str, out: &mut String) {
     ghost_hist::dump_summary();
 }
 
-#[cfg(not(any(feature = "firefox-test", feature = "test-mode")))]
+#[cfg(not(any(feature = "firefox-test-core", feature = "test-mode")))]
 fn op_futex_ghost_hist(_req: &str, out: &mut String) {
     out.push_str(r#"{"error":"futex-ghost-hist requires firefox-test or test-mode feature"}"#);
 }
@@ -3150,10 +3150,10 @@ fn op_cond_autopsy(req: &str, out: &mut String) {
     // ── Stage 4: recent wake targets in the window ─────────────────────
     // firefox-test/test-mode only — the per-CPU wake rings live in the
     // feature-gated futex_cluster module.  Empty otherwise.
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     let recent_wakes: alloc::vec::Vec<(u64, u64, i64)> =
         crate::subsys::linux::futex_cluster::recent_wakes_near(addr, half);
-    #[cfg(not(any(feature = "firefox-test", feature = "test-mode")))]
+    #[cfg(not(any(feature = "firefox-test-core", feature = "test-mode")))]
     let recent_wakes: alloc::vec::Vec<(u64, u64, i64)> = alloc::vec::Vec::new();
 
     // ── Stage 5: holder inference ──────────────────────────────────────
@@ -3331,7 +3331,7 @@ fn file_type_str(ft: crate::vfs::FileType) -> &'static str {
 // recovery upholds the at-least-one-unblocked guarantee when older glibc
 // loses the race documented at the public bug
 // <https://sourceware.org/bugzilla/show_bug.cgi?id=25847>.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn op_futex_stats(out: &mut String) {
     use core::fmt::Write;
     let s = crate::subsys::linux::futex_cluster::stats();
@@ -3359,7 +3359,7 @@ fn op_futex_stats(out: &mut String) {
 // Default is ON when the kernel was built with `firefox-test`, OFF otherwise.
 // Production safety: operator must explicitly opt-in via this kdb command
 // on a stock build.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn op_futex_set_cluster_wake(req: &str, out: &mut String) {
     use core::fmt::Write;
     let on_field = extract_field(req, "on").map(|v| v.to_ascii_lowercase());
