@@ -364,6 +364,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "arm-phys"         => op_arm_phys(req, out),
         "coverage-flush" => op_coverage_flush(out),
         "proc-metrics"   => op_proc_metrics(out),
+        "poll-revents"   => op_poll_revents(req, out),
         "thread-park-audit" => op_thread_park_audit(req, out),
         "rip-trace"      => op_rip_trace(req, out),
         "procmaps"       => op_procmaps(req, out),
@@ -2178,6 +2179,74 @@ fn op_coverage_flush(out: &mut String) {
     {
         out.push_str(r#"{"error":"coverage-flush requires coverage feature"}"#);
     }
+}
+
+// ── poll-revents ─────────────────────────────────────────────────────────────
+//
+// Request: {"op":"poll-revents","pid":N[,"fd":F]}.
+//
+// Evaluates the kernel's poll(2) readiness verdict for one PID's descriptors
+// via the same `crate::syscall::poll_revents()` path the poll/select/epoll
+// syscalls use, asking for POLLIN|POLLOUT (0x0005).  With a "fd" field, reports
+// just that descriptor; without it, scans every open fd and lists those the
+// kernel currently considers readable (revents & POLLIN).  This is the decisive
+// discriminator for a "data is queued on the socket but the poller never wakes"
+// stall: it answers "does the kernel itself report this fd as POLLIN-ready?"
+// independent of whether the userspace poll() set actually includes the fd.
+//   revents bits (poll(2)): POLLIN=0x1, POLLOUT=0x4, POLLERR=0x8,
+//   POLLHUP=0x10, POLLRDHUP=0x2000 (Linux ABI).
+fn op_poll_revents(req: &str, out: &mut String) {
+    use core::fmt::Write;
+
+    let pid: u64 = match extract_field(req, "pid").and_then(|s| parse_u64(&s)) {
+        Some(v) => v,
+        None => { out.push_str(r#"{"error":"missing or bad 'pid'"}"#); return; }
+    };
+    let one_fd: Option<usize> =
+        extract_field(req, "fd").and_then(|s| parse_u64(&s)).map(|v| v as usize);
+
+    // POLLIN | POLLOUT — ask for the read+write readiness the IPC poll loops use.
+    const REQ_EVENTS: u16 = 0x0001 | 0x0004;
+
+    // Snapshot the set of open fd indices first (brief PROCESS_TABLE hold), then
+    // evaluate readiness OUTSIDE the table lock — `poll_revents` re-locks
+    // PROCESS_TABLE internally, so holding it here would deadlock.
+    let fds: Option<Vec<usize>> = match try_lock_brief(&PROCESS_TABLE) {
+        Some(g) => g.iter().find(|p| p.pid == pid).map(|p| {
+            match one_fd {
+                Some(f) => if p.file_descriptors.get(f).map_or(false, |e| e.is_some()) {
+                    alloc::vec![f]
+                } else {
+                    Vec::new()
+                },
+                None => p.file_descriptors.iter().enumerate()
+                    .filter_map(|(i, e)| e.as_ref().map(|_| i))
+                    .collect(),
+            }
+        }),
+        None => { out.push_str(r#"{"error":"PROCESS_TABLE busy"}"#); return; }
+    };
+    let fds = match fds {
+        Some(v) => v,
+        None => { let _ = write!(out, r#"{{"error":"no pid {}"}}"#, pid); return; }
+    };
+
+    out.push('{');
+    let _ = write!(out, r#""pid":{},"#, pid);
+    out.push_str(r#""fds":["#);
+    let mut first = true;
+    for fd in fds {
+        let revents = crate::syscall::poll_revents(pid, fd, REQ_EVENTS);
+        if !first { out.push(','); }
+        first = false;
+        let _ = write!(out,
+            r#"{{"fd":{},"revents":{},"pollin":{},"pollout":{},"pollhup":{}}}"#,
+            fd, revents,
+            revents & 0x0001 != 0,
+            revents & 0x0004 != 0,
+            revents & 0x0010 != 0);
+    }
+    out.push_str("]}");
 }
 
 // ── proc-metrics ─────────────────────────────────────────────────────────────

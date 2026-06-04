@@ -5597,6 +5597,19 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
     if op == "fd-table":
         if not rest: raise ValueError("fd-table requires <pid>")
         return {"op": "fd-table", "pid": int(rest[0], 0)}
+    if op == "poll-revents":
+        # Kernel poll(2) readiness verdict for a PID's fds via the same
+        # poll_revents() path poll/select/epoll use.  `poll-revents <pid>`
+        # scans all fds and lists POLLIN/POLLOUT/POLLHUP per fd;
+        # `poll-revents <pid> <fd>` probes one fd.  Decides "kernel reports
+        # the socket readable but the userspace poller never wakes" (poll
+        # loop / wake-bell bug) vs "kernel reports not-readable" (fd→backend
+        # resolution bug) at an AF_UNIX recv-readiness stall.
+        if not rest: raise ValueError("poll-revents requires <pid> [<fd>]")
+        req2: dict = {"op": "poll-revents", "pid": int(rest[0], 0)}
+        if len(rest) > 1:
+            req2["fd"] = int(rest[1], 0)
+        return req2
     if op == "fd-map":
         pid = int(rest[0], 0) if rest else 0  # 0 = all processes
         req: dict = {"op": "fd-map"}
@@ -11158,7 +11171,7 @@ def main():
         "bell-stats", "cache-audit", "cache-aliasing", "fault-cache-keys",
         "w215-cache-residency", "tlb-stats", "heap-stats", "w215-diag",
         "arm-phys",
-        "coverage-flush", "proc-metrics", "thread-park-audit",
+        "coverage-flush", "proc-metrics", "poll-revents", "thread-park-audit",
         "rip-trace",
         "futex-ghost-hist",
         # One-shot musl pthread_cond/mutex wake-target-vs-wait-addr report:
