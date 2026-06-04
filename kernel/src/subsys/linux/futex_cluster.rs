@@ -56,7 +56,7 @@
 //! builds, so a fleet kernel never executes the path unless an operator
 //! explicitly enables it via `kdb futex-set-cluster-wake`.
 
-#![cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#![cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 
 extern crate alloc;
 
@@ -142,7 +142,7 @@ const DIAG_FIRST_N: u64 = 4;
 /// (the workload the compensation was designed for); OFF otherwise so a
 /// stock build never executes the path.  Operator can flip at runtime via
 /// `kdb futex-set-cluster-wake {on|off}`.
-pub static ENABLED: AtomicBool = AtomicBool::new(cfg!(feature = "firefox-test"));
+pub static ENABLED: AtomicBool = AtomicBool::new(cfg!(feature = "firefox-test-core"));
 
 #[inline]
 pub fn is_enabled() -> bool { ENABLED.load(Ordering::Relaxed) }
@@ -524,13 +524,13 @@ pub fn stats() -> ClusterWakeStats {
 /// Test-only direct entry for the in-kernel test harness.  Performs no
 /// syscall, no user-pointer validation; the harness controls the
 /// `FUTEX_WAITERS` content and history rings directly.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 pub fn _test_compensate(pid: u64, wake_tid: u64, wake_uaddr: u64, nr_wake: u64) -> u64 {
     compensate(pid, wake_tid, wake_uaddr, nr_wake)
 }
 
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 pub fn _test_record_wake(tid: u64, uaddr: u64) { record_wake(tid, uaddr); }
 
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 pub fn _test_record_wait(pid: u64, uaddr: u64) { record_wait(pid, uaddr); }

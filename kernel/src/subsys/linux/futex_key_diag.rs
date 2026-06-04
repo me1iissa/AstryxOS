@@ -56,7 +56,7 @@
 //! same `FUTEX_WAITERS` lock the wake already takes; budget is bounded by
 //! the constant cap on emitted neighbours.
 
-#![cfg(feature = "firefox-test")]
+#![cfg(feature = "firefox-test-trace")]
 
 extern crate alloc;
 
