@@ -309,6 +309,15 @@ firefox-trace-verbose = []
 # line per #PF (before VMA resolution). Pairs with `syscall-trace` to make a
 # full cause-and-effect stream for Ring 3 crashes. See docs/HARNESS.md.
 pf-trace = []
+# Tier-0 virtio-blk request tracing. Emits one `[BLK] op=R|W lba=<sector>
+# len=<sectors> pid=<n>` line per submitted virtio-blk request (per batched
+# descriptor chain, so the LBA granularity reflects the actual on-disk request
+# rather than the logical caller range). Off by default — default builds emit
+# no per-request line and pay zero overhead. Enable alongside `firefox-test`
+# to feed the data.img block-map heatmap in `scripts/serial-web.py`
+# (`qemu-harness.py grep <sid> '^\[BLK\] '`). The serial log does not otherwise
+# carry per-request LBAs; only the aggregate `disk=R../W..` bytes counter does.
+blk-trace = []
 # Tier-1 in-kernel debugger. Opens a read-only JSON introspection TCP server
 # on port 9999 (proc-list, proc, vfs-mounts, dmesg, syms, mem, trace-status,
 # ping). Driven by `scripts/qemu-harness.py kdb`. Default builds are
