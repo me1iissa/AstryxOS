@@ -1248,3 +1248,149 @@ pub fn alloc_shadow_recorded_count() -> u64 {
 pub fn alloc_shadow_displaced_count() -> u64 {
     ALLOC_SHADOW_DISPLACED.load(Ordering::Relaxed)
 }
+
+// ── CoW double-install witness ─────────────────────────────────────────────
+//
+// The copy-on-write present+write fault arm allocates a private frame, copies
+// the shared page into it, and installs the new frame at the faulting VA.  On
+// a shared address space (CLONE_VM — several threads on one CR3 scheduled
+// across logical processors) two sibling threads can take the present+write
+// CoW fault on the SAME virtual address concurrently.  Each mints its own
+// private frame; whichever installs second overwrites the first installer's
+// leaf PTE with a DIFFERENT physical frame — the W215 double-install.  The
+// first installer's logical processor keeps its own frame cached in its TLB
+// (Intel SDM Vol. 3A §4.10.4 — TLB invalidation is per-logical-processor),
+// so a store by one thread to a shared control word lands on one frame and is
+// never observed by the thread reading the other.
+//
+// This witness records the dispositive pair at the install site: when a CoW
+// install is about to write `incoming_phys` at `va_page` but the leaf PTE is
+// ALREADY present with a frame that is neither the pre-CoW shared frame
+// (`old_phys`) nor `incoming_phys`, a sibling has already CoW-installed its
+// own distinct new frame.  That is one VA resolving to two frames — captured
+// here without a TLB read or a single-step breakpoint, which the install-race
+// is too transient to catch reliably.
+//
+// firefox-test gated; behaviourally inert (read-only diagnostic).
+
+const COW_WITNESS_CAP: usize = 32;
+
+#[repr(C)]
+struct CowDoubleInstall {
+    /// Page-aligned faulting VA; `0` = empty slot.
+    va_page: AtomicU64,
+    /// Frame a sibling already installed (the PTE we observed = frame B).
+    existing_phys: AtomicU64,
+    /// Frame this CoW install was about to write (frame A).
+    incoming_phys: AtomicU64,
+    /// Pre-CoW shared frame both siblings copied from.
+    old_phys: AtomicU64,
+    /// Packed: [31:16] this-CPU, [15:0] this-TID(low16).
+    cpu_tid: AtomicU64,
+    /// Tick of the witnessed collision.
+    tick: AtomicU64,
+}
+
+impl CowDoubleInstall {
+    const fn new() -> Self {
+        Self {
+            va_page: AtomicU64::new(0),
+            existing_phys: AtomicU64::new(0),
+            incoming_phys: AtomicU64::new(0),
+            old_phys: AtomicU64::new(0),
+            cpu_tid: AtomicU64::new(0),
+            tick: AtomicU64::new(0),
+        }
+    }
+}
+
+struct CowWitnessTable {
+    slots: [CowDoubleInstall; COW_WITNESS_CAP],
+}
+
+impl CowWitnessTable {
+    const fn new() -> Self {
+        const E: CowDoubleInstall = CowDoubleInstall::new();
+        Self { slots: [E; COW_WITNESS_CAP] }
+    }
+}
+
+static COW_WITNESS: CowWitnessTable = CowWitnessTable::new();
+static COW_WITNESS_NEXT: AtomicU64 = AtomicU64::new(0);
+static COW_WITNESS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record a witnessed CoW double-install.  Called from the page-fault CoW arm
+/// immediately before the install when the leaf PTE is already present with a
+/// frame distinct from both the pre-CoW shared frame and the frame this CPU is
+/// about to install.
+#[inline]
+pub fn cow_double_install_witness(
+    va_page: u64,
+    existing_phys: u64,
+    incoming_phys: u64,
+    old_phys: u64,
+) {
+    let n = COW_WITNESS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let cpu = crate::arch::x86_64::apic::cpu_index() as u64;
+    let tid = crate::proc::current_tid() & 0xFFFF;
+    let tick = crate::arch::x86_64::irq::TICK_COUNT.load(Ordering::Relaxed);
+    let idx = (COW_WITNESS_NEXT.fetch_add(1, Ordering::Relaxed) as usize) % COW_WITNESS_CAP;
+    let s = &COW_WITNESS.slots[idx];
+    s.va_page.store(va_page & !0xFFFu64, Ordering::Relaxed);
+    s.existing_phys.store(existing_phys & 0x000F_FFFF_FFFF_F000, Ordering::Relaxed);
+    s.incoming_phys.store(incoming_phys & 0x000F_FFFF_FFFF_F000, Ordering::Relaxed);
+    s.old_phys.store(old_phys & 0x000F_FFFF_FFFF_F000, Ordering::Relaxed);
+    s.cpu_tid.store((cpu << 16) | tid, Ordering::Relaxed);
+    s.tick.store(tick, Ordering::Relaxed);
+    // Emit the first handful and then periodically so the serial log carries
+    // the dispositive A-vs-B pair even without a kdb query.
+    if n < 8 || n % 256 == 0 {
+        crate::serial_println!(
+            "[W215/COW-DBLINSTALL] #{} va={:#x} existing_phys(B)={:#x} \
+             incoming_phys(A)={:#x} old_phys={:#x} cpu={} tid={} tick={}",
+            n, va_page & !0xFFFu64,
+            existing_phys & 0x000F_FFFF_FFFF_F000,
+            incoming_phys & 0x000F_FFFF_FFFF_F000,
+            old_phys & 0x000F_FFFF_FFFF_F000,
+            cpu, tid, tick,
+        );
+    }
+}
+
+/// Total witnessed CoW double-installs (for kdb readout).
+pub fn cow_double_install_total() -> u64 {
+    COW_WITNESS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Dump the witness table for a specific VA (kdb introspection).  Returns the
+/// number of matching slots emitted.
+pub fn dump_cow_witness_for_va(va: u64) -> u64 {
+    let va_page = va & !0xFFFu64;
+    let total = COW_WITNESS_TOTAL.load(Ordering::Relaxed);
+    let mut hits = 0u64;
+    for s in COW_WITNESS.slots.iter() {
+        let v = s.va_page.load(Ordering::Relaxed);
+        if v == 0 || (va_page != 0 && v != va_page) {
+            continue;
+        }
+        let existing = s.existing_phys.load(Ordering::Relaxed);
+        let incoming = s.incoming_phys.load(Ordering::Relaxed);
+        let old = s.old_phys.load(Ordering::Relaxed);
+        let cpu_tid = s.cpu_tid.load(Ordering::Relaxed);
+        let tick = s.tick.load(Ordering::Relaxed);
+        crate::serial_println!(
+            "[W215/COW-WITNESS] va={:#x} existing_phys(B)={:#x} \
+             incoming_phys(A)={:#x} old_phys={:#x} cpu={} tid={} tick={} total={}",
+            v, existing, incoming, old,
+            (cpu_tid >> 16) & 0xFFFF, cpu_tid & 0xFFFF, tick, total,
+        );
+        hits += 1;
+    }
+    if hits == 0 {
+        crate::serial_println!(
+            "[W215/COW-WITNESS] va={:#x} hit=0 total_witnessed={}",
+            va_page, total,
+        );
+    }
+    hits
+}

@@ -360,6 +360,7 @@ pub fn dispatch(req: &str, out: &mut String) {
         "tlb-stats"        => op_tlb_stats(out),
         "heap-stats"       => op_heap_stats(out),
         "w215-diag"        => op_w215_diag(out),
+        "w215-cow-witness" => op_w215_cow_witness(req, out),
         "arm-phys"         => op_arm_phys(req, out),
         "coverage-flush" => op_coverage_flush(out),
         "proc-metrics"   => op_proc_metrics(out),
@@ -1181,6 +1182,37 @@ fn op_w215_diag(out: &mut String) {
     #[cfg(not(feature = "firefox-test"))]
     {
         out.push_str(r#"{"error":"w215-diag requires firefox-test feature"}"#);
+    }
+}
+
+// ── w215-cow-witness ───────────────────────────────────────────────────────
+//
+// Dump the CoW double-install witness table.  Each entry is a dispositive
+// A-vs-B pair captured at the page-fault CoW install site: a sibling thread on
+// the same shared CR3 already installed its OWN frame (existing_phys = frame B)
+// at the faulting VA while this CPU was about to install a DIFFERENT frame
+// (incoming_phys = frame A) — one VA resolving to two physical frames, the
+// W215 shared-CR3 double-install (Intel SDM Vol. 3A §4.10.4).
+//
+// Request:  {"op":"w215-cow-witness"}            dump all slots + total
+//           {"op":"w215-cow-witness","va":"0x7eff19c7a534"}  filter to one VA
+// Response: {"total":N,"hits":M}  (the per-entry detail is emitted to serial
+//           as [W215/COW-WITNESS] lines for grep capture)
+//
+// Requires: --features firefox-test.
+fn op_w215_cow_witness(req: &str, out: &mut String) {
+    #[cfg(feature = "firefox-test")]
+    {
+        use core::fmt::Write;
+        let va = extract_field(req, "va").and_then(|s| parse_u64(&s)).unwrap_or(0);
+        let total = crate::mm::w215_diag::cow_double_install_total();
+        let hits = crate::mm::w215_diag::dump_cow_witness_for_va(va);
+        let _ = write!(out, r#"{{"total":{},"hits":{},"va":"{:#x}"}}"#, total, hits, va);
+    }
+    #[cfg(not(feature = "firefox-test"))]
+    {
+        let _ = req;
+        out.push_str(r#"{"error":"w215-cow-witness requires firefox-test feature"}"#);
     }
 }
 

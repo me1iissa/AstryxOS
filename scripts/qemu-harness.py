@@ -5576,6 +5576,13 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
                 "(expected on|off|true|false|1|0)"
             )
         return {"op": "futex-set-cluster-wake", "on": val}
+    if op == "w215-cow-witness":
+        # CoW double-install witness dump.  Optional <va> filters to one VA
+        # (the contested futex word); omit to dump all witnessed pairs.
+        req2: dict = {"op": "w215-cow-witness"}
+        if rest:
+            req2["va"] = hex(int(rest[0], 0))
+        return req2
     if op == "proc":
         if not rest: raise ValueError("proc requires <pid>")
         return {"op": "proc", "pid": int(rest[0], 0)}

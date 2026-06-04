@@ -1068,6 +1068,10 @@ pub fn run() -> ! {
     total += 1;
     if test_pfh_install_arm_anti_alias_backout() { passed += 1; }
 
+    // ── Test 98i: CoW present+write arm anti-aliasing + refcount back-out ─
+    total += 1;
+    if test_pfh_cow_arm_anti_alias_refcount() { passed += 1; }
+
     // ── Test 99: procfs self/maps — per-process VMA listing ──────────────
 
     total += 1;
@@ -29576,6 +29580,123 @@ fn test_map_page_in_if_absent_anti_alias() -> bool {
     crate::proc::free_vm_space(vm);
 
     test_pass!("map_page_in_if_absent anti-aliasing");
+    true
+}
+
+/// The copy-on-write present+write fault arm: two sibling threads on one shared
+/// CR3 take the CoW fault on the SAME VA concurrently, each having allocated and
+/// copied its own private frame.  The winner installs its frame and releases one
+/// reference to the shared (pre-CoW) frame; the loser observes the winner's
+/// already-present PTE and backs out WITHOUT a second release of the shared
+/// frame — a double-release would underflow the refcount and free a frame the
+/// parent / forked child still map.  This test models that accounting directly.
+/// Refs: POSIX clone(2) CLONE_VM, fork(2) copy-on-write; Intel SDM Vol. 3A
+/// §4.10.4 (TLB invalidation is per-logical-processor).
+fn test_pfh_cow_arm_anti_alias_refcount() -> bool {
+    test_header!("CoW present+write arm: anti-aliasing + refcount back-out");
+
+    use crate::mm::vmm::{read_pte, map_page_in, map_page_in_cow_if_unchanged,
+        PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER, ADDR_MASK};
+    use crate::mm::refcount::{page_ref_set, page_ref_dec, page_ref_count};
+
+    let vm = match crate::mm::vma::VmSpace::new_user() {
+        Some(vs) => vs,
+        None => { test_fail!("cow_refcount", "VmSpace::new_user() OOM"); return false; }
+    };
+    let cr3 = vm.cr3;
+
+    let va: u64 = 0x7fff_fffe_b000;
+    let page = crate::mm::vma::page_align_down(va);
+    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+
+    // The shared, pre-CoW frame, mapped read-only at `va` and shared with a
+    // (notional) forked child — refcount 2.
+    let shared = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => { crate::proc::free_vm_space(vm); test_fail!("cow_refcount", "OOM shared"); return false; }
+    };
+    page_ref_set(shared, 2);
+    // Install the shared frame read-only at `va` (the post-fork CoW state:
+    // PRESENT but not writable).
+    map_page_in(cr3, page, shared, PAGE_PRESENT | PAGE_USER);
+
+    // Two distinct private frames — the two CPUs' independent CoW copies.
+    let win = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => { crate::mm::pmm::free_page(shared); crate::proc::free_vm_space(vm);
+                  test_fail!("cow_refcount", "OOM win"); return false; }
+    };
+    let lose = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => { crate::mm::pmm::free_page(shared); crate::mm::pmm::free_page(win);
+                  crate::proc::free_vm_space(vm); test_fail!("cow_refcount", "OOM lose"); return false; }
+    };
+
+    // Winner path: the leaf PTE still references `shared` (present, RO), so the
+    // compare-and-swap succeeds, swapping in `win`.  Release ONE shared ref.
+    page_ref_set(win, 1);
+    let won = map_page_in_cow_if_unchanged(cr3, page, shared, win, flags);
+    if won { let _ = page_ref_dec(shared); }
+    if !won {
+        crate::mm::pmm::free_page(shared); crate::mm::pmm::free_page(win);
+        crate::mm::pmm::free_page(lose); crate::proc::free_vm_space(vm);
+        test_fail!("cow_refcount", "winner CAS over PTE→shared returned false");
+        return false;
+    }
+    // After the winner: PTE maps `win`; `shared` dropped 2 → 1.
+    if page_ref_count(shared) != 1 {
+        crate::mm::pmm::free_page(shared); crate::mm::pmm::free_page(win);
+        crate::mm::pmm::free_page(lose); crate::proc::free_vm_space(vm);
+        test_fail!("cow_refcount", "after winner: shared refcount={} (expected 1)",
+            page_ref_count(shared));
+        return false;
+    }
+    test_println!("  (1) winner installed {:#x}; shared {:#x} refcount 2→1 ✓", win, shared);
+
+    // Loser path: a concurrent sibling that took the same CoW fault still
+    // expects the PTE to reference `shared`, but the winner already swapped in
+    // `win`.  The compare-and-swap must fail (return false) and leave the
+    // winner's PTE untouched.  Critically, the loser must NOT decrement
+    // `shared` a second time.
+    page_ref_set(lose, 1);
+    let lost = map_page_in_cow_if_unchanged(cr3, page, shared, lose, flags);
+    if lost {
+        crate::mm::pmm::free_page(shared); crate::mm::pmm::free_page(win);
+        crate::mm::pmm::free_page(lose); crate::proc::free_vm_space(vm);
+        test_fail!("cow_refcount", "loser install returned true — it overwrote the PTE (aliasing)");
+        return false;
+    }
+    // Loser backs out: reset its frame to 0 and free it; do NOT touch `shared`.
+    page_ref_set(lose, 0);
+    crate::mm::pmm::free_page(lose);
+
+    let pte = read_pte(cr3, va);
+    if (pte & ADDR_MASK) != (win & ADDR_MASK) {
+        crate::mm::pmm::free_page(shared); crate::mm::pmm::free_page(win);
+        crate::proc::free_vm_space(vm);
+        test_fail!("cow_refcount", "PTE no longer maps winner: pte={:#x} win={:#x}", pte, win);
+        return false;
+    }
+    // The decisive invariant: `shared` must still be at 1 (loser did NOT
+    // double-dec it to 0 — which would have prematurely freed a still-mapped
+    // frame, the W215 corruption).
+    if page_ref_count(shared) != 1 {
+        crate::mm::pmm::free_page(shared); crate::mm::pmm::free_page(win);
+        crate::proc::free_vm_space(vm);
+        test_fail!("cow_refcount", "after loser back-out: shared refcount={} (expected 1 — \
+            a value of 0 means a double-release underflow)", page_ref_count(shared));
+        return false;
+    }
+    test_println!("  (2) loser backed out; PTE still maps winner; shared refcount held at 1 ✓");
+
+    // Teardown.  `win` is mapped at `va`; freeing the address space frees it.
+    // `shared` is no longer mapped here (refcount 1 = the notional child) — free
+    // it to balance this test's allocation.
+    let _ = page_ref_dec(shared);
+    crate::mm::pmm::free_page(shared);
+    crate::proc::free_vm_space(vm);
+
+    test_pass!("CoW arm anti-aliasing + refcount back-out");
     true
 }
 

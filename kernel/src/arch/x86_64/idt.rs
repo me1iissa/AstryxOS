@@ -1415,17 +1415,91 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     crate::mm::pmm::free_page(new_phys);
                     return false;
                 }
-                // CoW: old_phys may still be shared with the parent; we
-                // only release this process's reference.  The CoW copy
-                // (new_phys) takes sole ownership, refcount set to 1 below.
-                let _ = crate::mm::refcount::page_ref_dec(old_phys);
+                // W215 measurement (Phase-1 witness, behaviourally inert):
+                // re-read the leaf PTE immediately before the install.  If a
+                // sibling thread on this shared CR3 already CoW-installed its
+                // OWN distinct frame at this VA (present, frame != old_phys and
+                // != new_phys), record the dispositive double-install pair —
+                // one VA, two frames.  See Intel SDM Vol. 3A §4.10.4.
+                #[cfg(feature = "firefox-test")]
+                {
+                    let pre = crate::mm::vmm::read_pte(cr3, page_addr);
+                    let pre_phys = pre & 0x000F_FFFF_FFFF_F000;
+                    if pre & crate::mm::vmm::PAGE_PRESENT != 0
+                        && pre_phys != old_phys
+                        && pre_phys != new_phys
+                        && pre_phys != 0
+                    {
+                        crate::mm::w215_diag::cow_double_install_witness(
+                            page_addr, pre_phys, new_phys, old_phys,
+                        );
+                    }
+                }
+                // Anti-aliasing install (Intel SDM Vol. 3A §4.10.4).  On a
+                // shared address space (CLONE_VM — several threads on one CR3
+                // across logical processors) two sibling threads can take the
+                // present+write CoW fault on the SAME VA concurrently.  Each
+                // mints its own `new_phys` and copies `old_phys` into it.  An
+                // unconditional install lets the loser overwrite the winner's
+                // leaf PTE with a DIFFERENT frame: the winner keeps reading its
+                // frame through its stale local TLB entry while the loser's
+                // store lands on the other frame and is never observed — a
+                // silent cross-CPU store-visibility failure (one VA → two
+                // frames).  Doing the present-check atomically with the install
+                // under VMM_LOCK closes the window: the loser observes the
+                // winner's already-present PTE and backs out without aliasing.
+                //
+                // Set `new_phys`'s refcount to 1 BEFORE the install attempt so
+                // the winner publishes a fully-accounted frame; the loser path
+                // resets it to 0 and frees cleanly.  The page is PRESENT
+                // (read-only, → `old_phys`) on entry, so this is a
+                // compare-and-swap on the expected old frame — NOT an
+                // install-if-absent.  The first sibling sees the PTE still at
+                // `old_phys` and swaps in its private copy; a concurrent sibling
+                // that took the same CoW fault sees the winner's frame already
+                // installed (≠ `old_phys`) and backs out.
                 crate::mm::refcount::page_ref_set(new_phys, 1);
-                crate::mm::vmm::map_page_in(cr3, page_addr, new_phys, page_flags);
-                // Cross-CPU shootdown: sibling threads sharing the
-                // parent's CR3 may have the old read-only translation
-                // cached.  Without this they keep faulting on every
-                // write until their TLB happens to evict the entry.
-                crate::mm::tlb::shootdown_page(cr3, page_addr);
+                if crate::mm::vmm::map_page_in_cow_if_unchanged(
+                    cr3, page_addr, old_phys, new_phys, page_flags)
+                {
+                    // Winner: this VA now resolves to `new_phys`.  Release this
+                    // process's reference to the shared frame — the PTE no
+                    // longer points at `old_phys` (the parent / forked child
+                    // keeps its own references).
+                    let _ = crate::mm::refcount::page_ref_dec(old_phys);
+                    // Cross-CPU shootdown: sibling threads sharing this CR3 may
+                    // have the old read-only translation cached (the page was
+                    // PRESENT before this fault, so per SDM §4.10.4.3 a
+                    // cross-logical-processor invalidation IS required — unlike
+                    // a not-present→present demand fault).  Without it they keep
+                    // faulting on every write until their TLB happens to evict.
+                    crate::mm::tlb::shootdown_page(cr3, page_addr);
+                    return true;
+                }
+                // Loser: a sibling CPU already CoW-installed its own frame for
+                // this VA under the same lock.  The PTE no longer references
+                // `old_phys` (the winner already released that reference), so we
+                // must NOT decrement `old_phys` again — a double-dec would
+                // underflow the refcount and free a still-mapped frame (the
+                // classic W215 corruption).  `new_phys` was never published;
+                // reset its refcount to 0 and free it.  Flush THIS CPU's stale
+                // read-only translation so the faulting instruction re-walks to
+                // the winner's authoritative PTE, then report the fault handled.
+                #[cfg(feature = "firefox-test")]
+                {
+                    static COW_RACE: core::sync::atomic::AtomicU64 =
+                        core::sync::atomic::AtomicU64::new(0);
+                    let n = COW_RACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    if n < 10 || n % 500 == 0 {
+                        crate::serial_println!(
+                            "[PF/cow-anon-race] #{} addr={:#x} sibling already \
+                             CoW-mapped — dropping private frame {:#x}",
+                            n, page_addr, new_phys);
+                    }
+                }
+                crate::mm::refcount::page_ref_set(new_phys, 0);
+                crate::mm::pmm::free_page(new_phys);
+                crate::mm::vmm::invlpg(page_addr);
                 return true;
             }
             return false; // OOM
