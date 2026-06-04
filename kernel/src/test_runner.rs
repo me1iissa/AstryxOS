@@ -1950,6 +1950,20 @@ pub fn run() -> ! {
     total += 1;
     if test_socketpair_survives_child_close_w216() { passed += 1; }
 
+    // ── Test 219b: MAP_SHARED stays shared across fork(2) (store-visibility) ─
+    // POSIX mmap(2): a store to a MAP_SHARED region changes the underlying
+    // object and is visible to every mapper.  POSIX fork(2): the child is a
+    // copy of the parent EXCEPT that MAP_SHARED mappings remain shared (they
+    // are NOT copy-on-write).  Regression guard for the coupled
+    // clone_for_fork + page-fault-CoW bug that silently demoted a MAP_SHARED
+    // page to a private frame across a copy-fork — which would make Firefox's
+    // CrossProcessPaint shared surface incoherent (a blank screenshot).
+    // Verifies the MAP_SHARED leaf survives fork writable + same frame (so a
+    // store via either mapping is visible to the other) AND that a MAP_PRIVATE
+    // leaf still gets the CoW write-protect (no regression).
+    total += 1;
+    if test_map_shared_survives_fork_store_visibility() { passed += 1; }
+
     // (Tests 199/200 run earlier — right after Test 80c — so the vDSO
     // TSC fast path is verified before the slow PNG screenshot test.
     // Stream-A pipe / eventfd wake-hook tests run first — see Tests
@@ -38593,6 +38607,206 @@ fn test_socketpair_survives_child_close_w216() -> bool {
     test_println!("  final close — both slots freed ✓");
 
     test_pass!("socketpair refcount survives child close (W216 H_A)");
+    true
+}
+
+/// Test 219b — MAP_SHARED pages stay genuinely shared across a copy-fork, and
+/// MAP_PRIVATE pages still copy-on-write.
+///
+/// POSIX mmap(2): "writes to [a MAP_SHARED] region [...] change the underlying
+/// object [...] visible in [other] process[es]".  POSIX fork(2): the child's
+/// address space is a copy of the parent's, but MAP_SHARED mappings refer to
+/// the same underlying object in both — they must NOT be made copy-on-write.
+///
+/// The bug this guards: `clone_for_fork` write-protected EVERY present PTE with
+/// no MAP_SHARED exemption (arming CoW on shared frames), and the present+write
+/// page-fault arm then copied the shared page into a private frame.  Together
+/// they silently demoted a MAP_SHARED surface to MAP_PRIVATE across a copy-fork
+/// — the kind of fork used by gecko's fork-server / glib g_spawn / NSPR
+/// PR_CreateProcess.  The content process would then paint into a private frame
+/// the parent never reads back: a structurally-valid but BLANK screenshot.
+///
+/// This drives the real `VmSpace::clone_for_fork` and asserts:
+///   (1) the MAP_SHARED leaf survives in the child writable and pointing at the
+///       SAME physical frame as the parent (no private copy);
+///   (2) a store written through the frame is observed by both parent and child
+///       PTEs (cross-process store-visibility);
+///   (3) the MAP_PRIVATE leaf is write-protected in BOTH parent and child
+///       (CoW correctly armed — no regression).
+///
+/// Refs: POSIX mmap(2), fork(2); Intel SDM Vol. 3A §4.10.4.
+fn test_map_shared_survives_fork_store_visibility() -> bool {
+    test_header!("MAP_SHARED survives fork — cross-process store visibility");
+
+    use crate::mm::vma::{VmArea, VmBacking, VmSpace, MAP_SHARED, MAP_PRIVATE,
+                         PROT_READ, PROT_WRITE, page_align_down};
+    use crate::mm::vmm::{read_pte, map_page_in, PAGE_PRESENT, PAGE_WRITABLE,
+                         PAGE_USER, ADDR_MASK};
+    use crate::mm::refcount::page_ref_count;
+
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+
+    // Parent address space (its own CR3 + page tables).
+    let mut parent = match VmSpace::new_user() {
+        Some(vs) => vs,
+        None => { test_fail!("map_shared_fork", "VmSpace::new_user() OOM"); return false; }
+    };
+    let parent_cr3 = parent.cr3;
+
+    // Two distinct page-aligned user VAs: one MAP_SHARED, one MAP_PRIVATE.
+    let shared_va:  u64 = 0x5555_0000_0000;
+    let private_va: u64 = 0x5555_0010_0000;
+    let shared_pg  = page_align_down(shared_va);
+    let private_pg = page_align_down(private_va);
+
+    // Real backing frames.
+    let shared_frame = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => { crate::proc::free_vm_space(parent); test_fail!("map_shared_fork", "OOM shared frame"); return false; }
+    };
+    let private_frame = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => {
+            crate::mm::pmm::free_page(shared_frame);
+            crate::proc::free_vm_space(parent);
+            test_fail!("map_shared_fork", "OOM private frame"); return false;
+        }
+    };
+
+    // Register the VMAs so clone_for_fork's MAP_SHARED predicate (and the
+    // page-fault arm) can classify each VA.  Anonymous backing keeps the test
+    // independent of the VFS / page-cache; the MAP_SHARED flag is what matters.
+    let rw_flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+    let mk = |base: u64, flags: u32, name: &'static str| VmArea {
+        base,
+        length: 0x1000,
+        prot: PROT_READ | PROT_WRITE,
+        flags,
+        backing: VmBacking::Anonymous,
+        name,
+    };
+    if parent.insert_vma(mk(shared_pg,  MAP_SHARED,  "[shared]")).is_err()
+        || parent.insert_vma(mk(private_pg, MAP_PRIVATE, "[private]")).is_err()
+    {
+        crate::mm::pmm::free_page(shared_frame);
+        crate::mm::pmm::free_page(private_frame);
+        crate::proc::free_vm_space(parent);
+        test_fail!("map_shared_fork", "insert_vma failed");
+        return false;
+    }
+
+    // Map both frames writable in the parent and seed the shared frame with a
+    // recognisable pattern (as if the parent had painted into the surface).
+    map_page_in(parent_cr3, shared_pg,  shared_frame,  rw_flags);
+    map_page_in(parent_cr3, private_pg, private_frame, rw_flags);
+    // Both frames are now mapped once → refcount must reflect the live mapping
+    // before the fork so the post-fork +1 assertion below is meaningful.
+    crate::mm::refcount::page_ref_set(shared_frame, 1);
+    crate::mm::refcount::page_ref_set(private_frame, 1);
+
+    let pattern_a: u64 = 0xA5A5_DEAD_BEEF_1234;
+    unsafe { core::ptr::write_volatile((PHYS_OFF + shared_frame) as *mut u64, pattern_a); }
+
+    // === fork: clone the address space ===
+    let child = match parent.clone_for_fork(parent_cr3) {
+        Some(c) => c,
+        None => {
+            crate::mm::pmm::free_page(shared_frame);
+            crate::mm::pmm::free_page(private_frame);
+            crate::proc::free_vm_space(parent);
+            test_fail!("map_shared_fork", "clone_for_fork returned None (OOM)");
+            return false;
+        }
+    };
+    let child_cr3 = child.cr3;
+
+    // Helper to fail + tear down both address spaces (and unmapped frames).
+    macro_rules! fail_teardown {
+        ($($arg:tt)*) => {{
+            crate::proc::free_vm_space(child);
+            crate::proc::free_vm_space(parent);
+            test_fail!("map_shared_fork", $($arg)*);
+            return false;
+        }};
+    }
+
+    // (1) MAP_SHARED: child PTE must map the SAME frame, writable, and the
+    //     parent PTE must remain writable (not write-protected for CoW).
+    let p_shared = read_pte(parent_cr3, shared_pg);
+    let c_shared = read_pte(child_cr3,  shared_pg);
+    if (p_shared & ADDR_MASK) != (shared_frame & ADDR_MASK) {
+        fail_teardown!("parent MAP_SHARED PTE no longer maps shared frame: pte={:#x} frame={:#x}",
+            p_shared, shared_frame);
+    }
+    if (c_shared & ADDR_MASK) != (shared_frame & ADDR_MASK) {
+        fail_teardown!("child MAP_SHARED PTE maps a DIFFERENT frame (demoted to private!): \
+            child_pte={:#x} parent_frame={:#x}", c_shared, shared_frame);
+    }
+    if p_shared & PAGE_WRITABLE == 0 {
+        fail_teardown!("parent MAP_SHARED PTE was write-protected by fork (CoW armed): pte={:#x}", p_shared);
+    }
+    if c_shared & PAGE_WRITABLE == 0 {
+        fail_teardown!("child MAP_SHARED PTE is read-only (CoW armed on shared page): pte={:#x}", c_shared);
+    }
+    test_println!("  (1) MAP_SHARED leaf: parent+child both map frame {:#x} WRITABLE ✓", shared_frame);
+
+    // (2) Cross-process store visibility: child's PTE resolves to shared_frame;
+    //     a store through it must be observed by the parent's mapping of the
+    //     SAME frame.  Both PTEs point at one frame, so write once and read via
+    //     each PTE's physical target.
+    let child_phys  = c_shared & ADDR_MASK;
+    let parent_phys = p_shared & ADDR_MASK;
+    // Parent must still see the pre-fork pattern through its frame.
+    let seen_by_parent = unsafe { core::ptr::read_volatile((PHYS_OFF + parent_phys) as *const u64) };
+    if seen_by_parent != pattern_a {
+        fail_teardown!("parent lost the pre-fork store: got {:#x} want {:#x}", seen_by_parent, pattern_a);
+    }
+    // Child writes a new pattern; parent must observe it (shared, not copied).
+    let pattern_b: u64 = 0x1357_CAFE_F00D_9999;
+    unsafe { core::ptr::write_volatile((PHYS_OFF + child_phys) as *mut u64, pattern_b); }
+    let seen_by_parent2 = unsafe { core::ptr::read_volatile((PHYS_OFF + parent_phys) as *const u64) };
+    if seen_by_parent2 != pattern_b {
+        fail_teardown!("child's store NOT visible to parent (MAP_SHARED incoherent!): \
+            parent sees {:#x}, child wrote {:#x}", seen_by_parent2, pattern_b);
+    }
+    test_println!("  (2) child store {:#x} observed by parent — store-visibility survives fork ✓", pattern_b);
+
+    // (3) MAP_PRIVATE: BOTH parent and child PTEs must be write-protected so the
+    //     next write traps and the page-fault handler installs a private copy.
+    let p_priv = read_pte(parent_cr3, private_pg);
+    let c_priv = read_pte(child_cr3,  private_pg);
+    if (p_priv & ADDR_MASK) != (private_frame & ADDR_MASK)
+        || (c_priv & ADDR_MASK) != (private_frame & ADDR_MASK)
+    {
+        fail_teardown!("MAP_PRIVATE PTE frame changed unexpectedly: parent={:#x} child={:#x} frame={:#x}",
+            p_priv, c_priv, private_frame);
+    }
+    if p_priv & PAGE_WRITABLE != 0 {
+        fail_teardown!("MAP_PRIVATE parent PTE still writable — CoW NOT armed (regression): pte={:#x}", p_priv);
+    }
+    if c_priv & PAGE_WRITABLE != 0 {
+        fail_teardown!("MAP_PRIVATE child PTE still writable — CoW NOT armed (regression): pte={:#x}", c_priv);
+    }
+    test_println!("  (3) MAP_PRIVATE leaf: parent+child both write-protected — CoW armed ✓");
+
+    // (4) Refcount: the shared frame gained the child's mapping (+1); the
+    //     private frame likewise tracks the second mapper until CoW splits it.
+    let shared_rc  = page_ref_count(shared_frame);
+    let private_rc = page_ref_count(private_frame);
+    if shared_rc < 2 {
+        fail_teardown!("shared frame refcount {} after fork (want >= 2 — child mapping not counted)", shared_rc);
+    }
+    if private_rc < 2 {
+        fail_teardown!("private frame refcount {} after fork (want >= 2 — CoW ref not counted)", private_rc);
+    }
+    test_println!("  (4) refcounts: shared={} private={} (both >= 2) ✓", shared_rc, private_rc);
+
+    // Teardown: both address spaces drop their mappings via the page-table walk,
+    // which decrements each frame's refcount; the last drop frees the frame.
+    crate::proc::free_vm_space(child);
+    crate::proc::free_vm_space(parent);
+
+    test_pass!("MAP_SHARED survives fork — cross-process store visibility");
     true
 }
 

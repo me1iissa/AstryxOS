@@ -1359,18 +1359,45 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
 
         // Determine page flags from the VMA if available; fall back to RW|User
         // for pages with no registered VMA (orphaned CoW pages after fork).
-        let page_flags = match vm_space.find_vma(faulting_addr) {
+        // Also capture whether the covering VMA is MAP_SHARED: a write to a
+        // MAP_SHARED page must land on the shared frame itself, never on a
+        // private COW copy (POSIX mmap(2): stores to a MAP_SHARED region change
+        // the underlying object; the change is visible to every mapper).
+        let (page_flags, is_map_shared) = match vm_space.find_vma(faulting_addr) {
             Some(vma) => {
                 if vma.prot & crate::mm::vma::PROT_WRITE == 0 {
                     return false; // Genuine write-protection fault — SIGSEGV
                 }
-                vma.to_page_flags()
+                (vma.to_page_flags(), vma.flags & crate::mm::vma::MAP_SHARED != 0)
             }
             None => {
                 // No VMA but page is present — treat as RW|User (CoW orphan).
-                PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
+                // No VMA means no backing object to keep coherent, so this can
+                // only be a private CoW orphan, never MAP_SHARED.
+                (PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER, false)
             }
         };
+
+        // MAP_SHARED short-circuit (POSIX mmap(2); Intel SDM Vol. 3A §4.10.4.3):
+        // the page is PRESENT and the VMA is MAP_SHARED, so this fault is a
+        // write-protect trap left by fork(2)'s page-table walk on a still-shared
+        // frame (or a stale read-only TLB entry).  We must NOT copy-on-write:
+        // make the existing frame writable IN PLACE so the store reaches the
+        // shared object, then cross-LP shootdown because the page was PRESENT
+        // (read-only) on entry, so §4.10.4.3 requires the invalidation — sibling
+        // logical processors may still cache the read-only translation.  This
+        // runs regardless of refcount: any number of mappers may share the frame
+        // and every one of them must see the write.  It mirrors the single-owner
+        // re-make-writable branch below, but applies to MAP_SHARED at any
+        // refcount, short-circuiting the private-copy path entirely.
+        if is_map_shared {
+            let pte = crate::mm::vmm::read_pte(cr3, page_addr);
+            let cur_phys = pte & 0x000F_FFFF_FFFF_F000;
+            let new_pte = cur_phys | page_flags | PAGE_PRESENT;
+            crate::mm::vmm::write_pte(cr3, page_addr, new_pte);
+            crate::mm::tlb::shootdown_page(cr3, page_addr);
+            return true;
+        }
 
         // W216 H_5j-B (unified concurrency): sample VmSpace generation before
         // the CoW copy + install sequence.  A sibling CPU running

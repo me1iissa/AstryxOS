@@ -757,10 +757,39 @@ impl VmSpace {
             }
         }
 
+        // MAP_SHARED ranges must NOT be copy-on-write across fork(2): a store
+        // by any process that maps the shared object is required to be visible
+        // to every other mapper (POSIX mmap(2): "writes to the [MAP_SHARED]
+        // region [...] change the underlying object", and fork(2): the child's
+        // memory is "a copy" of the parent's *except* that MAP_SHARED mappings
+        // remain shared).  Write-protecting a MAP_SHARED PTE here arms the COW
+        // copy in the page-fault handler, which would mint a private frame the
+        // other mapper never sees — silently demoting MAP_SHARED to MAP_PRIVATE.
+        //
+        // Snapshot the parent's MAP_SHARED VA ranges once, under the mm_sem
+        // write lock held above (so `self.areas` is stable for the whole walk).
+        // For a leaf/huge PTE whose VA lies in one of these ranges we copy the
+        // mapping UNCHANGED into the child — same physical frame, keep
+        // PAGE_WRITABLE — and only bump the frame refcount so it stays alive
+        // until both mappings are gone.  Private/anonymous PTEs keep the COW
+        // write-protect.  See Intel SDM Vol. 3A §4.10.4 (TLB management).
+        let shared_ranges: Vec<(u64, u64)> = self
+            .areas
+            .iter()
+            .filter(|vma| vma.flags & MAP_SHARED != 0)
+            .map(|vma| (vma.base, vma.end()))
+            .collect();
+        let va_is_shared = |va: u64| -> bool {
+            shared_ranges
+                .iter()
+                .any(|&(start, end)| va >= start && va < end)
+        };
+
         // Walk parent's user page tables (PML4[0..256]).
         // At each level allocate a fresh table for the child so the child's
         // PD/PT pages are never shared with the parent's.
         let mut total_pages_cow: u64 = 0;
+        let mut total_pages_shared: u64 = 0;
         unsafe {
             let parent_pml4 = (PHYS_OFF + actual_cr3) as *mut u64;
             let child_pml4  = (PHYS_OFF + child_pml4_phys) as *mut u64;
@@ -784,10 +813,25 @@ impl VmSpace {
                     let pdpte = *parent_pdpt.add(pdpt_idx);
                     if pdpte & PAGE_PRESENT == 0 { continue; }
 
-                    // 1 GB huge page — write-protect in both, no CoW split.
+                    // 1 GB huge page.
                     if pdpte & PAGE_HUGE != 0 {
-                        let flags_ro = (pdpte & !ADDR_MASK) & !PAGE_WRITABLE;
                         let phys_1g  = pdpte & !0x3FFF_FFFFu64;
+                        let va_1g    = ((pml4_idx as u64) << 39) | ((pdpt_idx as u64) << 30);
+                        if va_is_shared(va_1g) {
+                            // MAP_SHARED — copy unchanged (keep writable); the
+                            // store must reach the shared object, not a COW copy.
+                            // The private 1 GB arm below shares the frame between
+                            // parent and child without a per-subpage refcount, so
+                            // we match that convention here (a 1 GB MAP_SHARED
+                            // mapping is not produced by the page-paged memfd
+                            // surfaces this guards; the frame's lifetime is owned
+                            // by its backing object, not the fork refcount).
+                            *child_pdpt.add(pdpt_idx) = pdpte;
+                            total_pages_shared += 1;
+                            continue;
+                        }
+                        // Private — write-protect in both, no CoW split.
+                        let flags_ro = (pdpte & !ADDR_MASK) & !PAGE_WRITABLE;
                         *parent_pdpt.add(pdpt_idx) = phys_1g | flags_ro;
                         *child_pdpt .add(pdpt_idx) = phys_1g | flags_ro;
                         continue;
@@ -807,10 +851,27 @@ impl VmSpace {
                         let pde = *parent_pd.add(pd_idx);
                         if pde & PAGE_PRESENT == 0 { continue; }
 
-                        // 2 MB huge page — write-protect in both and ref-count sub-pages.
+                        // 2 MB huge page.
                         if pde & PAGE_HUGE != 0 {
-                            let phys_2m     = pde & 0x000F_FFFF_FFE0_0000u64;
-                            let flags_ro    = (pde & !ADDR_MASK) & !PAGE_WRITABLE;
+                            let phys_2m = pde & 0x000F_FFFF_FFE0_0000u64;
+                            let va_2m   = ((pml4_idx as u64) << 39)
+                                | ((pdpt_idx as u64) << 30)
+                                | ((pd_idx as u64) << 21);
+                            if va_is_shared(va_2m) {
+                                // MAP_SHARED — copy unchanged (keep writable) and
+                                // ref-count sub-pages so the shared frame stays
+                                // alive until both mappings are gone.  Do NOT
+                                // write-protect: the store must reach the shared
+                                // object, not a private COW copy.
+                                *child_pd.add(pd_idx) = pde;
+                                for sub in 0..512u64 {
+                                    page_ref_inc(phys_2m + sub * 0x1000);
+                                }
+                                total_pages_shared += 1;
+                                continue;
+                            }
+                            // Private — write-protect in both and ref-count sub-pages.
+                            let flags_ro = (pde & !ADDR_MASK) & !PAGE_WRITABLE;
                             *parent_pd.add(pd_idx) = phys_2m | flags_ro;
                             *child_pd .add(pd_idx) = phys_2m | flags_ro;
                             for sub in 0..512u64 {
@@ -833,8 +894,30 @@ impl VmSpace {
                             let pte = *parent_pt.add(pt_idx);
                             if pte & PAGE_PRESENT == 0 { continue; }
 
-                            let phys       = pte & ADDR_MASK;
-                            let flags_ro   = (pte & !ADDR_MASK) & !PAGE_WRITABLE;
+                            let phys = pte & ADDR_MASK;
+                            let va   = ((pml4_idx as u64) << 39)
+                                | ((pdpt_idx as u64) << 30)
+                                | ((pd_idx as u64) << 21)
+                                | ((pt_idx as u64) << 12);
+
+                            if va_is_shared(va) {
+                                // MAP_SHARED leaf — copy the PTE UNCHANGED into
+                                // the child (keep PAGE_WRITABLE, keep the same
+                                // physical frame) and do NOT touch the parent.
+                                // A subsequent write by either mapper lands on the
+                                // shared frame, as POSIX mmap(2)/fork(2) require.
+                                // Still ref-count the frame so it stays alive
+                                // until both mappings are gone.
+                                *child_pt.add(pt_idx) = pte;
+                                page_ref_inc(phys);
+                                total_pages_shared += 1;
+                                continue;
+                            }
+
+                            // Private/anonymous leaf — copy-on-write: write-protect
+                            // both parent and child so the first write traps and
+                            // the page-fault handler installs a private copy.
+                            let flags_ro = (pte & !ADDR_MASK) & !PAGE_WRITABLE;
 
                             // Write-protect parent PTE in place.
                             *parent_pt.add(pt_idx) = phys | flags_ro;
@@ -862,7 +945,7 @@ impl VmSpace {
         // the original mapping are still covered because the per-CR3
         // active-CPU mask is consulted at shootdown time.
         crate::mm::tlb::shootdown_full_user(self.cr3);
-        crate::serial_println!("[FORK-COW] total {} 4KB pages CoW'd into child CR3={:#x}", total_pages_cow, child_pml4_phys);
+        crate::serial_println!("[FORK-COW] total {} 4KB pages CoW'd, {} MAP_SHARED ranges kept writable into child CR3={:#x}", total_pages_cow, total_pages_shared, child_pml4_phys);
 
         // Copy VMA list to child.
         let mut child_areas = Vec::with_capacity(self.areas.len());
