@@ -5545,6 +5545,10 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
               "tlb-stats", "heap-stats", "w215-diag",
               "coverage-flush", "proc-metrics",
               "futex-stats",
+              # net-rxstats: receive-path health snapshot (per-conn recv_next
+              # cursors + e1000 RX-ring MPC/byte counts).  Zero-arg; read
+              # repeatedly to watch recv_next advance or stall.
+              "net-rxstats",
               # INFRA-3 record/replay: zero-arg introspection.
               "record-status"):
         return {"op": op}
@@ -11170,6 +11174,12 @@ def main():
         # See net::ipver + op_net_ipver.  Also exposed as the `net-ipver`
         # top-level subcommand below.
         "net-ipver",
+        # net-rxstats: receive-path health snapshot — per-connection recv_next
+        # sequence cursors + e1000 RX-ring MPC/byte counts.  Zero-arg; read
+        # repeatedly to watch recv_next advance (progress) or stall (a gap).
+        # See net::tcp::snapshot_connections + net::e1000::rx_stats +
+        # op_net_rxstats.
+        "net-rxstats",
     ])
     p_kdb.add_argument("args", nargs="*",
                         help="Op-specific positional args: "

@@ -1568,6 +1568,23 @@ pub fn run() -> ! {
         if test_tcp_peer_fin_read_closed_edge() { passed += 1; }
     }
 
+    // ── Test 282: TCP out-of-order receive reassembly (RFC 9293 §3.10.7.4) ──
+    //
+    // A segment that arrives ahead of recv_next (a reorder, or after an
+    // earlier segment was dropped) must be BUFFERED, not silently discarded,
+    // and the receiver must emit an immediate duplicate ACK of recv_next so
+    // the peer fast-retransmits the gap (RFC 5681 §3.2).  Once the gap-filling
+    // segment arrives, the buffered data drains in order.  A FIN riding an
+    // out-of-order segment must not tear the connection down with a hole
+    // still open.  This is the receive-side fix that lets a multi-segment
+    // HTTP response complete after a single mid-stream drop instead of
+    // wedging recv_next permanently.
+    #[cfg(feature = "kdb")]
+    {
+        total += 1;
+        if test_tcp_ooo_reassembly() { passed += 1; }
+    }
+
     // ── Test 270: AF_INET accept(2) — end-to-end against in-kernel TCP ────
     //
     // Synthesises two Established child TCBs on a single listening port
@@ -30290,6 +30307,135 @@ fn test_tcp_peer_fin_read_closed_edge() -> bool {
 
     socket::socket_close(sid);
     test_pass!("AF_INET peer-FIN read-closed edge + CloseWait drain");
+    true
+}
+
+// ── Test 282: TCP out-of-order receive reassembly ────────────────────────────
+//
+// RFC 9293 §3.10.7.4: a segment that arrives ahead of RCV.NXT (a reorder, or
+// the segment after a dropped one) must be queued, not dropped, and the
+// receiver sends a duplicate ACK of RCV.NXT (RFC 5681 §3.2) so the peer
+// fast-retransmits the missing data.  Once the gap is filled the buffered
+// data is delivered in order.  Before this fix the in-order-only accept path
+// dropped any seq != recv_next and sent no ACK, so a single mid-stream loss
+// wedged recv_next forever and a 628 KiB HTTP response never completed.
+#[cfg(feature = "kdb")]
+fn test_tcp_ooo_reassembly() -> bool {
+    test_header!("TCP out-of-order receive reassembly (RFC 9293 §3.10.7.4)");
+
+    use crate::net::tcp;
+
+    const LOCAL_PORT: u16 = 47220;
+    let peer_ip:   [u8; 4] = [10, 0, 2, 22];
+    let peer_port: u16     = 51001;
+
+    // test_inject_established sets recv_next = 1, so the in-order byte
+    // stream the peer sends starts at seq 1.  Split a 10-byte payload into
+    // two 5-byte segments: seg1 @ seq 1 ("HELLO"), seg2 @ seq 6 ("WORLD").
+    if let Err(e) = tcp::test_inject_established(LOCAL_PORT, peer_ip, peer_port, b"") {
+        test_fail!("tcp_ooo", "inject failed: {}", e);
+        return false;
+    }
+    let our_ip = crate::net::our_ip();
+
+    // Helper: the recv_next currently recorded for our TCB.
+    let recv_next_of = || -> Option<u32> {
+        tcp::snapshot_connections().iter()
+            .find(|c| c.local_port == LOCAL_PORT
+                   && c.remote_ip == peer_ip
+                   && c.remote_port == peer_port)
+            .map(|c| c.recv_next)
+    };
+
+    // Sanity: recv_next starts at 1.
+    if recv_next_of() != Some(1) {
+        test_fail!("tcp_ooo", "initial recv_next != 1 (got {:?})", recv_next_of());
+        let _ = tcp::close_connection(LOCAL_PORT, peer_ip, peer_port);
+        return false;
+    }
+
+    // Step 1 — deliver the SECOND segment first (out of order).  seq = 6.
+    // It must be BUFFERED: recv_next must NOT advance, and nothing becomes
+    // readable yet.
+    let seg2 = make_tcp_seg_with_payload(peer_port, LOCAL_PORT,
+        6, 0, tcp::PSH | tcp::ACK, b"WORLD");
+    tcp::handle_tcp(peer_ip, our_ip, &seg2);
+
+    if recv_next_of() != Some(1) {
+        test_fail!("tcp_ooo", "recv_next advanced on out-of-order segment (got {:?}, want 1) — OOO segment was not buffered",
+                    recv_next_of());
+        let _ = tcp::close_connection(LOCAL_PORT, peer_ip, peer_port);
+        return false;
+    }
+    if !tcp::read_from(LOCAL_PORT, peer_ip, peer_port).is_empty() {
+        test_fail!("tcp_ooo", "out-of-order data became readable before the gap was filled");
+        let _ = tcp::close_connection(LOCAL_PORT, peer_ip, peer_port);
+        return false;
+    }
+    test_println!("  OOO segment (seq 6) buffered, recv_next held at 1 ✓");
+
+    // Step 2 — deliver the FIRST segment (fills the gap).  seq = 1.
+    // recv_next must advance past BOTH segments (1 → 6 → 11) as the buffered
+    // segment drains in order, and the full 10 bytes become readable
+    // contiguously.
+    let seg1 = make_tcp_seg_with_payload(peer_port, LOCAL_PORT,
+        1, 0, tcp::PSH | tcp::ACK, b"HELLO");
+    tcp::handle_tcp(peer_ip, our_ip, &seg1);
+
+    if recv_next_of() != Some(11) {
+        test_fail!("tcp_ooo", "recv_next != 11 after gap filled (got {:?}) — OOO drain did not run",
+                    recv_next_of());
+        let _ = tcp::close_connection(LOCAL_PORT, peer_ip, peer_port);
+        return false;
+    }
+    let got = tcp::read_from(LOCAL_PORT, peer_ip, peer_port);
+    if got != b"HELLOWORLD" {
+        test_fail!("tcp_ooo", "reassembled stream = {:?}, expected \"HELLOWORLD\"",
+                    core::str::from_utf8(&got).unwrap_or("<non-utf8>"));
+        let _ = tcp::close_connection(LOCAL_PORT, peer_ip, peer_port);
+        return false;
+    }
+    test_println!("  gap-filling segment (seq 1) drained OOO queue in order: \"HELLOWORLD\" ✓");
+
+    // Step 3 — FIN gating.  Inject a fresh TCB, deliver an out-of-order data
+    // segment (leaving a gap) that ALSO carries a FIN.  The FIN sits past the
+    // gap, so it must NOT advance recv_next or move to CloseWait — tearing
+    // down with a hole open would truncate the response.
+    const PORT2: u16 = 47221;
+    let peer2_port: u16 = 51002;
+    if let Err(e) = tcp::test_inject_established(PORT2, peer_ip, peer2_port, b"") {
+        test_fail!("tcp_ooo", "inject #2 failed: {}", e);
+        let _ = tcp::close_connection(LOCAL_PORT, peer_ip, peer_port);
+        return false;
+    }
+    // seq 6 (a gap at 1..6), data "TAIL", FIN set.  recv_next is 1.
+    let ooo_fin = make_tcp_seg_with_payload(peer2_port, PORT2,
+        6, 0, tcp::PSH | tcp::ACK | tcp::FIN, b"TAIL");
+    tcp::handle_tcp(peer_ip, our_ip, &ooo_fin);
+
+    let st2 = tcp::snapshot_connections().iter()
+        .find(|c| c.local_port == PORT2 && c.remote_ip == peer_ip
+               && c.remote_port == peer2_port)
+        .map(|c| (c.state, c.recv_next));
+    match st2 {
+        Some((tcp::TcpState::Established, 1)) =>
+            test_println!("  out-of-order FIN ignored: stayed Established, recv_next held at 1 ✓"),
+        Some((s, rn)) => {
+            test_fail!("tcp_ooo", "out-of-order FIN mishandled: state={:?} recv_next={} (premature teardown / hole-skip)", s, rn);
+            let _ = tcp::close_connection(LOCAL_PORT, peer_ip, peer_port);
+            let _ = tcp::close_connection(PORT2, peer_ip, peer2_port);
+            return false;
+        }
+        None => {
+            test_fail!("tcp_ooo", "TCB #2 vanished after out-of-order FIN");
+            let _ = tcp::close_connection(LOCAL_PORT, peer_ip, peer_port);
+            return false;
+        }
+    }
+
+    let _ = tcp::close_connection(LOCAL_PORT, peer_ip, peer_port);
+    let _ = tcp::close_connection(PORT2, peer_ip, peer2_port);
+    test_pass!("TCP out-of-order receive reassembly + dup-ACK + FIN gating");
     true
 }
 

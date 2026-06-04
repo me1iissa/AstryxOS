@@ -52,6 +52,17 @@ const TIMEWAIT_TICKS: u64 = 200;
 /// is conventional, not a correctness lever.
 const MAX_TCP_CONNECTIONS: usize = 1024;
 
+/// Upper bound on bytes held in a single connection's out-of-order
+/// reassembly queue (`ooo_segments`).  A peer that keeps sending segments
+/// ahead of a never-filled gap (loss of the gap-filling segment, or a
+/// deliberate hole) would otherwise pile data on the kernel heap without
+/// bound.  256 KiB comfortably covers a bandwidth-delay product for the
+/// in-kernel demo workload (≤ ~64 KiB rwnd worth of reordering in flight)
+/// while bounding the worst case.  Segments arriving above the cap are
+/// dropped (not ACKed past), so the peer retransmits — RFC 9293 §3.10.7.4
+/// permits dropping a segment that cannot be buffered.
+const OOO_MAX_BYTES: usize = 256 * 1024;
+
 /// Grace period before a `Closed` connection is eligible for GC.
 ///
 /// Connections enter `Closed` either via TIME_WAIT expiry, a peer RST,
@@ -104,6 +115,23 @@ pub struct TcpConnection {
     // Data buffers
     pub recv_buffer: Vec<u8>,  // application receive queue
     pub send_buffer: Vec<u8>,  // data pending window space
+
+    /// Out-of-order receive reassembly queue (RFC 9293 §3.10.7.4).
+    ///
+    /// Holds in-window segments whose `seq` is *ahead* of `recv_next` —
+    /// i.e. a later segment that arrived before the one filling the gap.
+    /// Without this, a single dropped or reordered segment would wedge
+    /// `recv_next` permanently: the in-order accept path refuses anything
+    /// other than `seq == recv_next`, so the rest of the response could
+    /// never be delivered even after the peer retransmits.
+    ///
+    /// Invariants: entries are kept sorted ascending by `seq`, carry only
+    /// data strictly ahead of `recv_next` at insert time, never overlap
+    /// (overlaps are trimmed on insert), and are bounded by
+    /// `OOO_MAX_BYTES` so a malicious or pathological peer cannot grow the
+    /// queue without bound.  Drained in order by `drain_ooo` once the gap
+    /// at `recv_next` is filled.
+    ooo_segments: Vec<(u32, Vec<u8>)>,
 
     // Retransmit queue
     retransmit_queue: VecDeque<RetransmitEntry>,
@@ -294,6 +322,105 @@ fn seq_gt(a: u32, b: u32) -> bool {
     (b.wrapping_sub(a) as i32) < 0
 }
 
+/// `a < b` in sequence space.
+#[inline]
+fn seq_lt(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) < 0
+}
+
+// ── Out-of-order receive reassembly (RFC 9293 §3.10.7.4) ──────────────────────
+
+/// Total bytes currently held across all out-of-order segments.
+fn ooo_bytes(conn: &TcpConnection) -> usize {
+    conn.ooo_segments.iter().map(|(_, d)| d.len()).sum()
+}
+
+/// Buffer one in-window segment whose data starts at `seg_seq`, strictly
+/// ahead of `recv_next` (the caller has already established this is not the
+/// in-order segment).  Trims any portion that overlaps already-buffered or
+/// already-delivered bytes so the queue carries each octet exactly once, and
+/// keeps the queue sorted ascending by sequence number.  Drops the segment
+/// (without recording it) once the per-connection byte budget would be
+/// exceeded — the peer will retransmit, RFC 9293 §3.10.7.4.
+fn insert_ooo(conn: &mut TcpConnection, seg_seq: u32, payload: &[u8]) {
+    // Clamp the left edge to recv_next: never re-buffer bytes we have
+    // already delivered in order.
+    let mut start = seg_seq;
+    let mut data: &[u8] = payload;
+    if seq_lt(start, conn.recv_next) {
+        let skip = conn.recv_next.wrapping_sub(start) as usize;
+        if skip >= data.len() { return; }   // wholly old data
+        data = &data[skip..];
+        start = conn.recv_next;
+    }
+    if data.is_empty() { return; }
+
+    // If a previously-buffered segment already covers this start, and
+    // extends at least as far, the new segment adds nothing.
+    for (s, d) in conn.ooo_segments.iter() {
+        let end = s.wrapping_add(d.len() as u32);
+        if seq_le(*s, start) && seq_le(start.wrapping_add(data.len() as u32), end) {
+            return; // fully covered by an existing entry
+        }
+    }
+
+    // Budget guard: drop rather than grow unbounded.
+    if ooo_bytes(conn).saturating_add(data.len()) > OOO_MAX_BYTES {
+        return;
+    }
+
+    // Insert sorted by sequence number.  We keep overlapping entries simple:
+    // the drain step (`drain_ooo`) trims any residual overlap against
+    // recv_next as it consumes, so exact dedup here is a best-effort
+    // optimisation, not a correctness requirement.
+    let entry = (start, data.to_vec());
+    let pos = conn.ooo_segments
+        .iter()
+        .position(|(s, _)| seq_gt(*s, start))
+        .unwrap_or(conn.ooo_segments.len());
+    conn.ooo_segments.insert(pos, entry);
+}
+
+/// After `recv_next` advances, deliver any buffered out-of-order segments
+/// that are now contiguous, advancing `recv_next` past each.  Returns true
+/// if at least one buffered segment was delivered (so the caller knows the
+/// cumulative ACK must reflect the new recv_next).
+fn drain_ooo(conn: &mut TcpConnection) -> bool {
+    let mut delivered = false;
+    loop {
+        // Find a buffered segment that begins at or before recv_next and
+        // extends past it (i.e. it fills, or partially fills, the gap).
+        let mut take: Option<usize> = None;
+        for (i, (s, d)) in conn.ooo_segments.iter().enumerate() {
+            let end = s.wrapping_add(d.len() as u32);
+            if seq_le(*s, conn.recv_next) && seq_gt(end, conn.recv_next) {
+                take = Some(i);
+                break;
+            }
+            // Drop any segment now wholly behind recv_next (already
+            // delivered by an overlapping in-order arrival).
+            if seq_le(end, conn.recv_next) {
+                take = Some(i);
+                break;
+            }
+        }
+        let Some(i) = take else { break };
+        let (s, d) = conn.ooo_segments.remove(i);
+        let end = s.wrapping_add(d.len() as u32);
+        if seq_le(end, conn.recv_next) {
+            // Wholly stale — discard, keep scanning.
+            continue;
+        }
+        // Append only the portion ahead of recv_next.
+        let skip = conn.recv_next.wrapping_sub(s) as usize;
+        let fresh = &d[skip..];
+        conn.recv_buffer.extend_from_slice(fresh);
+        conn.recv_next = conn.recv_next.wrapping_add(fresh.len() as u32);
+        delivered = true;
+    }
+    delivered
+}
+
 // ── ACK / congestion helpers ───────────────────────────────────────────────────
 
 /// Remove retransmit-queue entries whose end sequence ≤ ack_num.
@@ -430,10 +557,34 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
         // on SMP would stall a peer core spinning on the lock across the
         // unbounded transmit.  See `OutSeg`.
         let mut out: Vec<OutSeg> = Vec::new();
+        // Did this segment make the socket newly readable?  Compare the
+        // application receive-queue length (and a FIN-driven EOF transition)
+        // across process_segment so we ring the poll bell only on a genuine
+        // readiness change — not on a bare ACK.
+        let rb_before = conns[i].recv_buffer.len();
+        let st_before = conns[i].state;
         process_segment(&mut conns[i], &hdr, payload, &mut out);
+        let rb_after = conns[i].recv_buffer.len();
+        let st_after = conns[i].state;
+        // CloseWait carries a peer-FIN EOF that pollers must observe as
+        // POLLIN/EPOLLHUP (RFC 9293 §3.5, POSIX poll(2)).
+        let became_readable = rb_after > rb_before
+            || (st_after == TcpState::CloseWait && st_before != TcpState::CloseWait);
         drop(conns);
         for o in out {
             super::ipv4::send_ipv4(o.remote_ip, super::ipv4::PROTO_TCP, &o.seg);
+        }
+        // Wake any thread parked in poll(2)/epoll_wait(2)/select(2) on a
+        // socket fd backed by this connection.  The kernel host loop pumps
+        // net::poll() every iteration so RX is harvested regardless, but
+        // without this ring a parked poller observes the new data only on
+        // the ~1 s resync floor in wait_poll_event — the same sub-second
+        // wake discipline udp.rs and the AF_UNIX paths already follow.
+        // Rung AFTER drop(conns) so the woken thread never contends the
+        // TCP table lock on wake (lock order: socket → protocol → device).
+        if became_readable {
+            crate::ipc::waitlist::ring_poll_bell_for(
+                crate::ipc::waitlist::PollBellSource::InetRx);
         }
         return;
     }
@@ -482,6 +633,7 @@ pub fn handle_tcp(src_ip: Ipv4Address, dst_ip: Ipv4Address, data: &[u8]) {
                 recv_next:   rcv_nxt,
                 recv_buffer: Vec::new(),
                 send_buffer: Vec::new(),
+                ooo_segments: Vec::new(),
                 retransmit_queue: VecDeque::new(),
                 rto:         RTO_INITIAL,
                 srtt:        RTO_INITIAL / 2,
@@ -547,19 +699,66 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8],
             if hdr.flags & ACK != 0 {
                 handle_ack(conn, hdr.ack_num);
             }
-            // In-order data.
-            if !payload.is_empty() && hdr.seq_num == conn.recv_next {
-                conn.recv_buffer.extend_from_slice(payload);
-                conn.recv_next = conn.recv_next.wrapping_add(payload.len() as u32);
-                let sn = conn.send_next;
-                let rn = conn.recv_next;
-                let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
-                out.push(OutSeg { remote_ip: rip, seg: s });
+
+            // Receive-side processing per RFC 9293 §3.10.7.4.
+            //
+            // The segment is one of:
+            //   (a) in-order      — seq == recv_next: deliver, then drain any
+            //                        out-of-order segments now contiguous.
+            //   (b) out-of-order  — seq  > recv_next (in window): buffer it
+            //                        and send an immediate duplicate ACK so
+            //                        the peer fast-retransmits the gap
+            //                        (RFC 5681 §3.2).
+            //   (c) old / dup     — seq  < recv_next, or end <= recv_next:
+            //                        already delivered.  Re-ACK so the peer
+            //                        learns recv_next and stops retransmitting.
+            //
+            // `need_ack` is set whenever the segment carried data (or a FIN);
+            // a single cumulative ACK of the (possibly advanced) recv_next is
+            // emitted at the end so an in-order arrival that also drains the
+            // OOO queue does not emit a stale intermediate ACK.
+            let mut need_ack = false;
+
+            if !payload.is_empty() {
+                need_ack = true;
+                let seg_end = hdr.seq_num.wrapping_add(payload.len() as u32);
+                if hdr.seq_num == conn.recv_next {
+                    // (a) In-order: append and advance.
+                    conn.recv_buffer.extend_from_slice(payload);
+                    conn.recv_next = conn.recv_next.wrapping_add(payload.len() as u32);
+                    // Deliver any buffered segments that are now contiguous.
+                    drain_ooo(conn);
+                } else if seq_gt(seg_end, conn.recv_next) {
+                    // (b) Out-of-order but carries new data ahead of the gap:
+                    // buffer for later in-order delivery.  (If seq < recv_next
+                    // but the segment straddles recv_next, insert_ooo clamps
+                    // the left edge so only the genuinely new tail is kept.)
+                    insert_ooo(conn, hdr.seq_num, payload);
+                }
+                // else (c): wholly old data — fall through to re-ACK only.
             }
-            // FIN from peer.
+
+            // FIN from peer — only honour it when it sits exactly at
+            // recv_next (i.e. all preceding data has been delivered).  A FIN
+            // riding an out-of-order or gap-following segment must NOT advance
+            // recv_next or change state, or the connection would tear down
+            // with a hole still unfilled (RFC 9293 §3.10.7.4: process the FIN
+            // only if the segment is in order).  The FIN occupies the
+            // sequence number immediately after the segment's payload.
             if hdr.flags & FIN != 0 {
-                conn.recv_next = conn.recv_next.wrapping_add(1);
-                conn.state = TcpState::CloseWait;
+                let fin_seq = hdr.seq_num.wrapping_add(payload.len() as u32);
+                if fin_seq == conn.recv_next {
+                    conn.recv_next = conn.recv_next.wrapping_add(1);
+                    conn.state = TcpState::CloseWait;
+                    need_ack = true;
+                } else {
+                    // Out-of-order FIN: acknowledge current recv_next so the
+                    // peer retransmits the missing data + FIN.
+                    need_ack = true;
+                }
+            }
+
+            if need_ack {
                 let sn = conn.send_next;
                 let rn = conn.recv_next;
                 let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
@@ -812,6 +1011,20 @@ pub struct ConnSnap {
     pub remote_ip:   Ipv4Address,
     pub remote_port: u16,
     pub state:       TcpState,
+    /// RCV.NXT — next in-order sequence number expected from the peer.
+    /// A value that stalls while the peer keeps retransmitting indicates a
+    /// receive-side gap (a dropped/reordered segment the in-order-only
+    /// accept path refused — RFC 9293 §3.10.7.4).
+    pub recv_next:      u32,
+    /// SND.NXT / SND.UNA — outbound sequence cursors.
+    pub send_next:      u32,
+    pub send_unack:     u32,
+    /// Bytes in the application receive queue not yet consumed by recv(2).
+    pub recv_buf_len:   u32,
+    /// Peer's last advertised receive window.
+    pub peer_window:    u32,
+    /// Unacknowledged segments on our retransmit queue.
+    pub retransmit_len: u32,
 }
 
 /// Return a snapshot of every connection in the TCP table.  Caller-owned
@@ -824,6 +1037,12 @@ pub fn snapshot_connections() -> alloc::vec::Vec<ConnSnap> {
         remote_ip:   c.remote_ip,
         remote_port: c.remote_port,
         state:       c.state,
+        recv_next:      c.recv_next,
+        send_next:      c.send_next,
+        send_unack:     c.send_unack,
+        recv_buf_len:   c.recv_buffer.len() as u32,
+        peer_window:    c.peer_window,
+        retransmit_len: c.retransmit_queue.len() as u32,
     }).collect()
 }
 
@@ -1041,6 +1260,7 @@ pub fn test_inject_established(local_port: u16, remote_ip: Ipv4Address,
         recv_next:   1,
         recv_buffer: recv_data.to_vec(),
         send_buffer: Vec::new(),
+        ooo_segments: Vec::new(),
         retransmit_queue: VecDeque::new(),
         rto:         RTO_INITIAL,
         srtt:        RTO_INITIAL / 2,
@@ -1193,6 +1413,7 @@ pub fn listen(port: u16) -> Result<(), &'static str> {
         recv_next:   0,
         recv_buffer: Vec::new(),
         send_buffer: Vec::new(),
+        ooo_segments: Vec::new(),
         retransmit_queue: VecDeque::new(),
         rto:         RTO_INITIAL,
         srtt:        RTO_INITIAL / 2,
@@ -1238,6 +1459,7 @@ pub fn connect(remote_ip: Ipv4Address, remote_port: u16) -> Result<u16, &'static
             recv_next:   0,
             recv_buffer: Vec::new(),
             send_buffer: Vec::new(),
+            ooo_segments: Vec::new(),
             retransmit_queue: VecDeque::new(),
             rto:         RTO_INITIAL,
             srtt:        RTO_INITIAL / 2,
