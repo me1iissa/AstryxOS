@@ -118,6 +118,29 @@ pub fn compute_heap_layout() -> (usize, u64, u64) {
     (va_start, phys_start, phys_end)
 }
 
+/// Compute the physical frames of the two heap guard pages directly from
+/// `compute_heap_layout()`, **without** depending on `heap::init()` having
+/// latched `HEAP_START_VA`.
+///
+/// `vmm::init()` runs before `heap::init()` and allocates page-table pages
+/// (PD copies in `separate_higher_half_pds`, the 1..4 GiB PDs in
+/// `extend_higher_half_to_4gib`).  Those allocations draw from the PMM, whose
+/// next free frame immediately above the just-reserved heap-backing range is
+/// exactly the above-guard frame (`heap_phys_end`).  If that frame is handed
+/// out as a page-table page and `heap::init_guard_pages()` then marks its
+/// higher-half VA not-present, a later write to that page table (e.g. the
+/// LAPIC MMIO PD entry during `apic::init`, Intel SDM Vol. 3A §10.4.4) faults
+/// on the guard page.  Reserving both guard frames here — before any
+/// `pmm::alloc_page()` — closes that window.
+///
+/// Returns `(below_guard_phys, above_guard_phys)`, each a 4 KiB frame.
+pub fn compute_guard_phys() -> (u64, u64) {
+    let (_va, phys_start, phys_end) = compute_heap_layout();
+    // Below-guard sits one page under the heap base; above-guard is the first
+    // page past the heap (== phys_end-exclusive).
+    (phys_start.saturating_sub(0x1000), phys_end)
+}
+
 /// Physical frame backing the below-guard VA, for PMM reservation.
 #[inline]
 fn heap_guard_below_phys() -> u64 {
