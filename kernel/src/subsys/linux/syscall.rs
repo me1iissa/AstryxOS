@@ -2030,6 +2030,16 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let addrlen_ptr  = arg6 as *mut u32;
             if crate::syscall::is_unix_socket_fd(pid, fd) {
                 let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
+                // Per recvfrom(2) / unix(7): a recv on a socket without
+                // O_NONBLOCK and without MSG_DONTWAIT MUST block until a
+                // message is available rather than returning -EAGAIN on a
+                // momentarily-empty ring.  Park (bounded) until the socket is
+                // readable; non-blocking fds skip the wait and fall through to
+                // the single drain that yields EAGAIN-on-empty unchanged.
+                let blocking = !(msg_dontwait || fd_is_nonblocking(pid, fd));
+                if let Err(e) = unix_recv_block_wait(unix_id, pid, blocking) {
+                    return e;
+                }
                 // SMAP bracket — `buf` is a user slice; unix::read writes
                 // into it.  Bracket spans the call so the writes inside
                 // unix::read run with AC=1.
@@ -2503,6 +2513,25 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let bytes_read: i64;
             if crate::syscall::is_unix_socket_fd(pid, fd) {
                 let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
+                // Per recvmsg(2) / unix(7): a recv on a socket that is not in
+                // non-blocking mode (no O_NONBLOCK on the description, no
+                // MSG_DONTWAIT in `flags`) MUST block until a message is
+                // available rather than returning -EAGAIN on a momentarily-empty
+                // recv ring.  recvmsg(2) flags is the third argument (arg3);
+                // MSG_DONTWAIT = 0x40 per <sys/socket.h>.  The single-shot
+                // read_msg below returns -EAGAIN on an empty ring regardless of
+                // mode, so without this gate a blocking recvmsg consumer — such
+                // as a SOCK_SEQPACKET request/response broker that loops on
+                // recvmsg with no MSG_DONTWAIT and only retries on EINTR —
+                // mis-reads the spurious EAGAIN and tears its channel down.
+                // The SCM-deliverable promote-to-0 arm below is preserved: a
+                // control-only frame is "ready" (unix_recv_ready), so the wait
+                // returns Ok and the drain falls into that arm.
+                let msg_dontwait = (arg3 & 0x40) != 0;
+                let blocking = !(msg_dontwait || fd_is_nonblocking(pid, fd));
+                if let Err(e) = unix_recv_block_wait(unix_id, pid, blocking) {
+                    return e;
+                }
                 // Cap the STREAM drain at the next pending SCM_RIGHTS batch
                 // boundary so this recvmsg does not consume bytes PAST the
                 // stream position where the next fd batch becomes deliverable.
@@ -6221,6 +6250,15 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
         }
     } else if crate::syscall::is_unix_socket_fd(pid, fd as usize) {
         let unix_id = crate::syscall::get_unix_socket_id(pid, fd as usize);
+        // Per read(2) / unix(7): read on a blocking AF_UNIX socket (no
+        // O_NONBLOCK) must block until a message is available; read(2) has no
+        // flags argument, so blocking is governed solely by O_NONBLOCK.  Park
+        // (bounded) until readable; non-blocking fds skip the wait and the
+        // single drain below yields EAGAIN-on-empty unchanged.
+        let blocking = !fd_is_nonblocking(pid, fd as usize);
+        if let Err(e) = unix_recv_block_wait(unix_id, pid, blocking) {
+            return e;
+        }
         let avail = crate::net::unix::bytes_available(unix_id);
         let buf_sl = unsafe { core::slice::from_raw_parts_mut(buf_ptr, count) };
         let ret = crate::net::unix::read(unix_id, buf_sl);
@@ -10353,6 +10391,90 @@ pub(crate) fn epoll_watch_diag(pid: u64, epfd: usize) -> EpollWatchResult {
         watches.push(EpollWatchDiag { fd, subscribed, revents, delivered });
     }
     EpollWatchResult::Ok { epoll_id, watches }
+}
+
+/// Readiness predicate for an AF_UNIX recv: the socket can return *something*
+/// other than EAGAIN right now.  True when the recv ring has bytes (STREAM) or
+/// a queued message (SEQPACKET) — `net::unix::has_data`; when a control-only
+/// `SCM_RIGHTS` ancillary frame is deliverable at the reader's current stream
+/// position (`has_scm_deliverable`, an empty-data readable message per
+/// recvmsg(2) / unix(7)); or when the read direction is shut (orderly EOF,
+/// which read_msg surfaces as `Ok((0,0))`).  Mirrors the POLLIN edge the poll
+/// path already exposes, so a blocking recvmsg/recvfrom parks until exactly the
+/// condition that will let it make progress.
+fn unix_recv_ready(unix_id: u64) -> bool {
+    if crate::net::unix::has_data(unix_id) {
+        return true;
+    }
+    if crate::net::unix::read_shutdown(unix_id) {
+        return true;
+    }
+    let consumed = crate::net::unix::recv_consumed(unix_id);
+    crate::syscall::has_scm_deliverable(unix_id, consumed)
+}
+
+/// Block the calling thread until an AF_UNIX recv on `unix_id` can make
+/// progress, or a bounded wait deadline / pending signal fires.
+///
+/// Per POSIX recvmsg(2) / recvfrom(2) and unix(7): a receive on a socket that
+/// is NOT in non-blocking mode (no `O_NONBLOCK` on the description, no
+/// `MSG_DONTWAIT` in `flags`) MUST block until a message is available — it must
+/// NOT return -EAGAIN on a momentarily-empty queue.  The prior AF_UNIX recv
+/// paths called `read`/`read_msg` exactly once and returned -EAGAIN on an empty
+/// ring regardless of blocking mode, which broke any blocking-recvmsg consumer
+/// (e.g. a SOCK_SEQPACKET request/response broker that loops on recvmsg with no
+/// MSG_DONTWAIT and only retries on EINTR — a spurious EAGAIN there tears the
+/// channel down).  This loop mirrors the AF_INET recvfrom(2) blocking wait.
+///
+/// Returns `Ok(())` when the socket is ready to be drained (the caller then
+/// performs the actual `read`/`read_msg`, which may still return 0 for an
+/// orderly EOF), or `Err(errno)` to be returned to userspace directly:
+///   * `-4`  (EINTR)  — a deliverable signal arrived during the wait.
+///   * `-11` (EAGAIN) — the bounded wait deadline elapsed with no data.  This
+///     preserves liveness: a never-arriving message cannot pin a syscall
+///     forever.  Most IPC brokers retry, and the deadline (≈30 s) is far longer
+///     than any in-flight request round-trip.
+///
+/// When `blocking` is false (non-blocking fd or MSG_DONTWAIT) this returns
+/// `Ok(())` immediately so the single drain attempt below yields the correct
+/// EAGAIN-on-empty behaviour unchanged.
+fn unix_recv_block_wait(unix_id: u64, pid: u64, blocking: bool) -> Result<(), i64> {
+    if !blocking {
+        return Ok(());
+    }
+    // Fast path: already ready — no need to read get_ticks / yield at all.
+    if unix_recv_ready(unix_id) {
+        return Ok(());
+    }
+    let deadline = crate::arch::x86_64::irq::get_ticks() + 3000; // ≈30 s upper bound
+    while !unix_recv_ready(unix_id) {
+        if signal_pending(pid) {
+            return Err(-4); // EINTR
+        }
+        // Pump the network stack so any cross-process AF_UNIX write that
+        // landed since the last check becomes visible, and so SLIRP/virtio
+        // RX is serviced (a content-process reply travels through net::poll's
+        // wake bell on the unix backend).
+        crate::net::poll();
+        if crate::arch::x86_64::irq::get_ticks() >= deadline {
+            return Err(-11); // EAGAIN — bounded-wait liveness floor
+        }
+        crate::sched::yield_cpu();
+    }
+    Ok(())
+}
+
+/// Read the `O_NONBLOCK` (0x800) flag off process `pid`'s fd-table slot `fd`.
+/// Returns false if the fd is absent (the caller has already validated the fd
+/// as a socket before reaching the recv drain, so a missing slot here only
+/// occurs on a teardown race — defaulting to "blocking" is the safe choice and
+/// the subsequent drain will surface EBADF/EAGAIN as appropriate).
+fn fd_is_nonblocking(pid: u64, fd: usize) -> bool {
+    let procs = crate::proc::PROCESS_TABLE.lock();
+    procs.iter().find(|p| p.pid == pid)
+        .and_then(|p| p.file_descriptors.get(fd).and_then(|f| f.as_ref()))
+        .map(|f| (f.flags & 0x0800) != 0)
+        .unwrap_or(false)
 }
 
 /// Returns true if a deliverable (pending && !blocked) signal is queued for `pid`.
