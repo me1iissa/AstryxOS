@@ -28,7 +28,9 @@ HARNESS_DIR = os.path.expanduser("~/.astryx-harness")
 SID_RE = re.compile(r"^[A-Za-z0-9_-]{4,64}$")
 TAIL_BYTES = 96 * 1024
 GATE_SCAN_BYTES = 256 * 1024
-GATE_SCAN_MAX_AGE = 600          # only compute gate/sc for sessions this fresh (perf)
+GATE_SCAN_MAX_AGE = 3600         # compute gate/sc for sessions <1h old; result is
+                                 # cached by (mtime,size) so frozen logs scan once,
+                                 # live logs re-scan each poll (only the 2-3 active ones)
 METRICS_SCAN_BYTES = 512 * 1024  # tail window for the latest PROC-METRICS/HB sample
 BLK_SCAN_BYTES = 8 * 1024 * 1024 # tail window for the [BLK] block-map histogram
 GUEST_RAM_BYTES = 2 * 1024 * 1024 * 1024   # 2 GiB guest RAM (from the qemu cmdline)
@@ -75,8 +77,11 @@ def scan_gate(path, size):
             "sc": sc, "tick": tick, "panic": bool(_PANIC_RE.search(text))}
 
 
-# Ordered bring-up + render milestones. Each: (label, (substring markers,...)).
-# Easily extended — add a tuple and it shows up in every session's timeline.
+# Ordered bring-up + render milestones. Each: (label, markers). A marker is a
+# substring (str) OR a tuple-of-substrings (ALL must be on the SAME line) — the
+# AND form anchors render-stage markers to the real kernel [FF/write] IPDL line
+# so they don't false-positive on the same strings inside FF's serialized JS
+# source / startup cache. Easily extended — add an entry, it shows everywhere.
 MILESTONES = [
     ("kernel entry",      ("AstryxOS kernel", "kernel_main", "Booting")),
     ("heap guard",        ("[HEAP GUARD] Guard pages installed",)),
@@ -87,54 +92,96 @@ MILESTONES = [
     ("init / userspace",  ("init started", "PID 1", "spawn")),
     ("X11 ready",         ("X11 server ready", "Xastryx")),
     ("firefox exec",      ("firefox-bin",)),
-    ("TLS / network",     ("] Established", "[TCP] Established")),
+    ("TLS / network",     ("[TCP] Established", "] Established →")),
     ("content procs",     ("isForBrowser",)),
-    ("screenshot-actors", ("ScreenshotParent", "getDimensions")),
-    ("drawSnapshot",      ("drawSnapshot", "CrossProcessPaint", "libpng16")),
+    # render stages: AND-anchored to the actual kernel [FF/write]/[FF/write-fd]
+    # log line, NOT the bare string (which also lives in the cached JS source).
+    ("screenshot-actors", (("[FF/write]", "getDimensions"), ("[FF/write]", "ScreenshotParent"), ("[FF/write]", "sendQuery"))),
+    ("drawSnapshot",      ("libpng16.so",)),
     ("PNG write",         ("89504e47", "out.png written")),
-    ("exit_group",        ("exit_group",)),
+    ("exit_group",        ("exit_group(",)),
 ]
 # Only the kernel's own tick lines, not arbitrary "tick=" in FF/JS output.
 _TICK_KERNEL = re.compile(r"(?:\[HB\]|PROC-METRICS\]) tick=(\d+)")
 
 
-def scan_milestones(path):
-    """FORWARD-ORDERED first-hit timeline. Milestone N+1 is only matched on a
-    line at/after milestone N's line — so a marker string appearing early in
-    unrelated content (e.g. 'drawSnapshot' inside the serialized JS source, or a
-    forkserver's early exit_group) does NOT produce a false 'hit'. Ticks are read
-    only from the kernel HB/PROC-METRICS lines."""
-    found = {}            # label -> (line, tick)
-    idx = 0               # next milestone to look for, in order
-    cur_tick = None
+def _match(line, marks):
+    """True if `line` satisfies any marker in `marks`. A marker is a substring,
+    or a tuple of substrings ALL of which must appear on the line (AND)."""
+    for mk in marks:
+        if isinstance(mk, tuple):
+            if all(s in line for s in mk):
+                return True
+        elif mk in line:
+            return True
+    return False
+
+
+# Cache: path -> (mtime, size, result). ONE forward-ordered scan per session,
+# reused until the log changes — so the left badge and the right timeline ALWAYS
+# agree (both read this), and stopped logs are free.
+_prog_cache = {}
+
+
+def scan_progress(path):
+    """FORWARD-ORDERED scan -> {timeline, gate (deepest hit label), gate_idx,
+    gate_max, sc (latest pid=1), tick (latest kernel), panic}. The single source
+    of truth for BOTH the session-list gate badge and the milestone rail, so they
+    can never disagree. Milestone N+1 only matches at/after milestone N's line,
+    which (with the AND-anchored render markers) filters the cached-JS-source
+    false positives."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {}
+    c = _prog_cache.get(path)
+    if c and c[0] == st.st_mtime and c[1] == st.st_size:
+        return c[2]
+    found = {}
+    idx = 0
+    cur_tick = sc = None
+    panic = False
     n = 0
     try:
         with open(path, "r", errors="replace") as f:
             for line in f:
                 n += 1
-                m = _TICK_KERNEL.search(line)
-                if m:
-                    cur_tick = int(m.group(1))
-                # advance through any milestones this line satisfies, in order
-                while idx < len(MILESTONES) and any(s in line for s in MILESTONES[idx][1]):
+                tk = _TICK_KERNEL.search(line)
+                if tk:
+                    cur_tick = int(tk.group(1))
+                scm = _SC_RE.search(line)
+                if scm:
+                    sc = int(scm.group(1))
+                if not panic and _PANIC_RE.search(line):
+                    panic = True
+                while idx < len(MILESTONES) and _match(line, MILESTONES[idx][1]):
                     found[MILESTONES[idx][0]] = (n, cur_tick)
                     idx += 1
-                if idx >= len(MILESTONES):
-                    break
+                # don't early-break: keep scanning so the latest sc/tick (current
+                # state) stays fresh even after the deepest milestone is hit.
     except OSError:
         pass
-    out, prev = [], None
-    for lab, _ in MILESTONES:
+    timeline, prev, deep_idx, deep_lab = [], None, -1, None
+    for i, (lab, _m) in enumerate(MILESTONES):
         h = found.get(lab)
-        delta = None
-        if h and h[1] is not None and prev is not None:
-            delta = h[1] - prev
+        delta = (h[1] - prev) if (h and h[1] is not None and prev is not None) else None
         if h and h[1] is not None:
             prev = h[1]
-        out.append({"label": lab, "hit": h is not None,
-                    "line": h[0] if h else None,
-                    "tick": h[1] if h else None, "dtick": delta})
-    return out
+        if h:
+            deep_idx, deep_lab = i, lab
+        timeline.append({"label": lab, "hit": h is not None,
+                         "line": h[0] if h else None,
+                         "tick": h[1] if h else None, "dtick": delta})
+    res = {"timeline": timeline, "gate": deep_lab or "boot",
+           "gate_idx": max(deep_idx, 0), "gate_max": len(MILESTONES),
+           "sc": sc, "tick": cur_tick, "panic": panic}
+    _prog_cache[path] = (st.st_mtime, st.st_size, res)
+    return res
+
+
+def scan_milestones(path):
+    """Back-compat wrapper for /api/milestones — the timeline from scan_progress."""
+    return scan_progress(path).get("timeline", [])
 
 
 def read_context(path, line, ctx):
@@ -345,7 +392,10 @@ def list_sessions():
              "elapsed": int(elapsed) if elapsed is not None else None,
              "mtime": st.st_mtime}
         if age < GATE_SCAN_MAX_AGE:
-            s.update(scan_gate(log, st.st_size))
+            p = scan_progress(log)   # SAME source as the milestone rail
+            s.update({"gate": p.get("gate"), "gate_idx": p.get("gate_idx"),
+                      "gate_max": p.get("gate_max"), "sc": p.get("sc"),
+                      "tick": p.get("tick"), "panic": p.get("panic")})
         out.append(s)
     return out
 
@@ -478,14 +528,14 @@ function classify(t){
   if(/PROC-METRICS|\\[HB\\] tick|\\[BLK\\] /.test(t))return'met';
   if(/FUTEX|CLEARTID|UNIXPOLL/.test(t))return'futex';
   return'';}
-function gateClass(s){return s.panic?'gate ge':s.gate_idx>=7?'gate gp':'gate';}
+function gateClass(s){return s.panic?'gate ge':s.gate_idx>=((s.gate_max||15)-3)?'gate gp':'gate';}
 function render(){
   const q=$('q').value.toLowerCase(),onlyA=$('onlyactive').checked;
   let r=sessions.filter(s=>(!onlyA||s.active||s.age<600)&&(!q||s.sid.includes(q)||(s.features||'').toLowerCase().includes(q)));
   $('cnt').textContent='('+r.length+'/'+sessions.length+')';
   list.innerHTML=r.map(s=>{
-    const pct=s.gate_idx!=null?Math.round(s.gate_idx/(s.gate_max||8)*100):0;
-    const gl=s.gate?`<div class=glab>gate <b>${s.gate}</b> ${s.gate_idx}/${s.gate_max||8}${s.sc!=null?' · sc '+human(s.sc):''}${s.panic?' · ⚠ panic':''}</div>`:'';
+    const pct=s.gate_idx!=null?Math.round(s.gate_idx/(s.gate_max||15)*100):0;
+    const gl=s.gate?`<div class=glab>gate <b>${s.gate}</b> ${s.gate_idx}/${s.gate_max||15}${s.sc!=null?' · sc '+human(s.sc):''}${s.panic?' · ⚠ panic':''}</div>`:'';
     const gb=s.gate_idx!=null?`<div class="${gateClass(s)}"><i style=width:${pct}%></i></div>${gl}`:'';
     const lt=s.started_at?`<div class=launch>▸ ${utc(s.started_at)} · ${fmt(s.elapsed)} ago${s.started_src!=='json'?' (≈)':''}</div>`:'';
     return `<div class="s${s.sid===cur?' sel':''}" data-sid="${s.sid}">
@@ -498,7 +548,7 @@ async function refresh(){
   try{sessions=await(await fetch('/api/sessions')).json()}catch(e){return}
   if($('autolive').checked){const live=sessions.find(s=>s.active);if(live&&live.sid!==cur)openS(live.sid);}
   const c=sessions.find(s=>s.sid===cur); metaCur=c||metaCur;
-  if(c){const g=$('gate');if(c.gate){g.style.display='';g.textContent='gate '+c.gate+' '+c.gate_idx+'/'+(c.gate_max||8);g.style.color=c.panic?'#ff7b72':c.gate_idx>=7?'#d2a8ff':'#7ee787';}
+  if(c){const g=$('gate');if(c.gate){g.style.display='';g.textContent='gate '+c.gate+' '+c.gate_idx+'/'+(c.gate_max||15);g.style.color=c.panic?'#ff7b72':c.gate_idx>=((c.gate_max||15)-3)?'#d2a8ff':'#7ee787';}
         $('sc').textContent=c.sc!=null?'sc '+human(c.sc):'';
         $('launch').textContent=c.started_at?('⏱ '+utc(c.started_at)+' · up '+fmt(c.elapsed)):'';
         banner(c);}
@@ -508,7 +558,7 @@ function banner(c){
   const b=$('banner');
   if(c.panic){b.className='';b.style.display='block';b.textContent='⚠ KERNEL FAULT — panic / heap-guard / deadlock / bugcheck detected in tail';return;}
   // stall alert: active session whose lines/sec has gone to ~0
-  if(c.active&&rate.last!=null&&rate.last<1&&c.gate_idx<8){b.className='stall';b.style.display='block';b.textContent='◷ STALL — serial output ~0 lines/s on a live session (gate '+(c.gate||'?')+')';return;}
+  if(c.active&&rate.last!=null&&rate.last<1&&c.gate_idx<((c.gate_max||15)-1)){b.className='stall';b.style.display='block';b.textContent='◷ STALL — serial output ~0 lines/s on a live session (gate '+(c.gate||'?')+')';return;}
   b.style.display='none';
 }
 function openS(sid){
