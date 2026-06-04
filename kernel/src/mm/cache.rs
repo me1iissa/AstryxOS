@@ -586,6 +586,138 @@ pub fn update_range(mount_idx: usize, inode: u64, offset: u64, data: &[u8]) {
     }
 }
 
+/// Bring the page cache into coherence with a file that has just been
+/// resized from `old_size` to `new_size` bytes.
+///
+/// This is the truncate-path cohort for the page cache, analogous to
+/// [`update_range`] for the write path.  A `truncate(2)` / `ftruncate(2)`
+/// changes the file's length on the backing store, but any page that was
+/// already faulted into the page cache (keyed by `(mount_idx, inode,
+/// page_offset)`) keeps its pre-truncate contents.  Per POSIX:
+///
+///   * `ftruncate(2)` / `truncate(2)` (IEEE Std 1003.1-2017): "If the file
+///     previously was smaller than [length], the extended area shall appear
+///     as if it were zero-filled."  A grown region MUST read as zero,
+///     including through an existing `mmap(MAP_SHARED)` mapping.
+///   * `mmap(2)` MAP_SHARED visibility: a change to the file's bytes must be
+///     observed by other mappers of the same region.
+///
+/// Without this, a grown region keeps whatever bytes its cache frame held
+/// before the resize (previous tenant / stale garbage), and a shrunk-then-
+/// regrown region resurrects the discarded tail — both violating the
+/// zero-fill guarantee.
+///
+/// ## Coherence model
+///
+/// Let `boundary = min(old_size, new_size)` — the lowest file offset whose
+/// page contents are no longer authoritative after the resize.  For
+/// SHRINK, that is the new end-of-file; for GROW, it is the old end-of-file
+/// (everything from there on must now read as zero).  This function:
+///
+///   1. Zeroes the partial tail of the page that contains `boundary`, from
+///      `boundary % PAGE` to the page end, in place — if that page is
+///      cached.  Mappers with a live PTE to the boundary page then observe
+///      zeros past the (new or old) EOF without a TLB shootdown, and a
+///      future re-grow that lands within that same page reads zero.
+///   2. Evicts every fully-invalidated cache page at offset
+///      `>= round_up(boundary, PAGE)`, releasing the cache's reference on
+///      each.  The next demand fault re-reads the page from the backing
+///      filesystem, which (having been resized) zero-extends past its own
+///      end — installing a correctly zero-filled frame.
+///
+/// Evicted frames whose reference count drops to zero are routed through
+/// [`crate::mm::tlb::quarantine_free`] rather than freed immediately: a
+/// stale TLB entry for the frame may still be live on a sibling CPU, so
+/// the quarantine grace period (one timer ISR on every online CPU) is
+/// required before the frame is recycled.  Per Intel SDM Vol. 3A §4.10.5,
+/// paging-structure changes must be propagated to all processors before
+/// the physical frame is repurposed.  The quarantine calls are made AFTER
+/// the cache lock is released to preserve the cache → TLB → PMM lock order.
+pub fn truncate_range(mount_idx: usize, inode: u64, old_size: u64, new_size: u64) {
+    const PAGE: u64 = 4096;
+    const PHYS_OFFSET: u64 = 0xFFFF_8000_0000_0000;
+
+    // The lowest offset whose page contents are stale after the resize.
+    let boundary = core::cmp::min(old_size, new_size);
+    let boundary_page = boundary & !(PAGE - 1);
+    let boundary_in_page = (boundary & (PAGE - 1)) as usize;
+    // First fully-invalidated page: round the boundary up to a page bound.
+    // Pages strictly after the boundary page (or the boundary page itself
+    // when `boundary` is page-aligned) are dropped wholesale.
+    let first_full_evict = (boundary + PAGE - 1) & !(PAGE - 1);
+
+    // Collect the physical frames whose cache reference reached zero so we
+    // can quarantine-free them after dropping the cache lock (lock order:
+    // cache → TLB quarantine → PMM).
+    let mut to_quarantine: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+
+    {
+        let mut cache = PAGE_CACHE.lock();
+
+        // (1) Partial boundary page: zero its tail [boundary_in_page, PAGE)
+        // in place.  Only meaningful when the boundary is not page-aligned
+        // (otherwise there is no surviving partial page — that page is in
+        // the full-evict set below).
+        if boundary_in_page != 0 {
+            if let Some(entry) = cache.get_mut(&(mount_idx, inode, boundary_page)) {
+                // SAFETY: the cache holds a reference to `entry.phys` while
+                // the cache lock is held, so the frame is alive; the kernel
+                // higher-half identity map covers every PMM frame.  We zero
+                // [boundary_in_page, PAGE) which is in-bounds of the 4 KiB
+                // frame.
+                let dst = (PHYS_OFFSET + entry.phys + boundary_in_page as u64) as *mut u8;
+                let n = PAGE as usize - boundary_in_page;
+                unsafe {
+                    core::ptr::write_bytes(dst, 0, n);
+                }
+                entry.dirty = true;
+            }
+        }
+
+        // (2) Evict every fully-invalidated page at offset >= first_full_evict.
+        // The page cache is a BTreeMap, so the keys for this (mount, inode)
+        // form a contiguous band; range-scan [first_full_evict, ∞) and
+        // collect the offsets first (cannot mutate the map while iterating).
+        let mut keys_to_evict: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        let lo = (mount_idx, inode, first_full_evict);
+        let hi = (mount_idx, inode, u64::MAX);
+        for (&(_m, _i, off), _entry) in cache.range(lo..=hi) {
+            keys_to_evict.push(off);
+        }
+
+        for off in keys_to_evict {
+            if let Some(entry) = cache.remove(&(mount_idx, inode, off)) {
+                // Release the cache's own reference.  If it was the last
+                // reference, the frame must be reclaimed (via quarantine).
+                let new_rc = crate::mm::refcount::page_ref_dec(entry.phys);
+                if new_rc == 0 {
+                    to_quarantine.push(entry.phys);
+                }
+                // W215 diagnostic provenance, mirroring `evict`.
+                #[cfg(feature = "firefox-test")]
+                {
+                    crate::mm::w215_diag::prov_record(
+                        entry.phys,
+                        crate::mm::w215_diag::KIND_EVICT,
+                        crate::mm::w215_diag::pack_cache_key(inode, off),
+                    );
+                    crate::mm::w215_diag::preins_check_op(
+                        entry.phys,
+                        crate::mm::w215_diag::OP_EVICT,
+                        ((off >> 12) & 0xFFFF_FFFF) as u32,
+                    );
+                    #[cfg(feature = "w215-diag")]
+                    crate::mm::w215_crc::record_evict(entry.phys);
+                }
+            }
+        }
+    } // release cache lock
+
+    for phys in to_quarantine {
+        crate::mm::tlb::quarantine_free(phys);
+    }
+}
+
 /// Evict a page from the cache, releasing the cache's reference.
 /// Returns the physical address of the evicted page, if any.
 pub fn evict(mount_idx: usize, inode: u64, page_offset: u64) -> Option<u64> {
