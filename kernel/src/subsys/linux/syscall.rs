@@ -131,9 +131,9 @@ fn memfd_seals_add(inode: u64, new_seals: u32) -> i64 {
 // Lockless reads/writes via `AtomicU64`; sized for ≤16 concurrent vfork
 // parents which is well above any observed live count.  No allocation, no
 // teardown — entries are overwritten in place.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 const MAX_INFLIGHT: usize = 16;
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 static RBP_PRE_CACHE: [(core::sync::atomic::AtomicU64, core::sync::atomic::AtomicU64); MAX_INFLIGHT] = [
     (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)),
     (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)),
@@ -157,7 +157,7 @@ static RBP_PRE_CACHE: [(core::sync::atomic::AtomicU64, core::sync::atomic::Atomi
 /// on `parent_tid` if present, else claims an empty slot (key==0).  Falls
 /// back to slot 0 on full ring — only loses precision for unrealistic
 /// concurrent-vfork counts.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn rbp_pre_cache_store(parent_tid: u64, rbp: u64) {
     use core::sync::atomic::Ordering;
     for (k, v) in RBP_PRE_CACHE.iter() {
@@ -176,7 +176,7 @@ fn rbp_pre_cache_store(parent_tid: u64, rbp: u64) {
 /// snapshot has been stored (e.g. on a post-wake call without a matching
 /// pre-block).  Does NOT clear the slot — re-vfork by the same TID
 /// overwrites in-place.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn rbp_pre_cache_load(parent_tid: u64) -> Option<u64> {
     use core::sync::atomic::Ordering;
     for (k, v) in RBP_PRE_CACHE.iter() {
@@ -187,7 +187,7 @@ fn rbp_pre_cache_load(parent_tid: u64) -> Option<u64> {
     None
 }
 
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn vfork_canary_snapshot(label: &str, pid: u32, parent_tid: u64) {
     use core::fmt::Write;
 
@@ -323,7 +323,7 @@ fn vfork_canary_snapshot(label: &str, pid: u32, parent_tid: u64) {
     crate::serial_println!("{}", line);
 }
 
-#[cfg(not(any(feature = "firefox-test", feature = "test-mode")))]
+#[cfg(not(any(feature = "firefox-test-core", feature = "test-mode")))]
 fn vfork_canary_snapshot(_label: &str, _pid: u32, _parent_tid: u64) {}
 
 /// Check whether the current process uses the Linux syscall ABI.
@@ -987,7 +987,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     // build clean.  The default `firefox-test` still emits the `[SC]` line
     // (under `syscall-trace`), which carries the leaf RIP and caller RIP —
     // sufficient for throughput measurement.
-    #[cfg(all(feature = "firefox-test", feature = "firefox-trace-verbose"))]
+    #[cfg(all(feature = "firefox-test-core", feature = "firefox-trace-verbose"))]
     {
         // First PID at which the user-stack snapshot emitter starts firing.
         // Lower PIDs belong to the kernel bringup chain (idle, init, X11
@@ -1061,7 +1061,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     // Record the call at entry so that the path/return-value hooks inside
     // sys_read_linux / sys_open_linux can attach extra context before we
     // patch the return value after the match dispatch completes.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     let ring_entry_idx = {
         let pid = crate::proc::current_pid_lockless();
         // Auto-track every user-process PID >= 1 that makes a Linux syscall —
@@ -1081,7 +1081,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
             None
         }
     };
-    #[cfg(not(feature = "firefox-test"))]
+    #[cfg(not(feature = "firefox-test-core"))]
     let _ring_entry_idx: Option<usize> = None;
 
     // ── Transient debug trace: log Linux syscalls from user processes ─────────
@@ -1094,7 +1094,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     // identifies every syscall by number, pid, tid, and full argv.  Keep the
     // non-`firefox-test` branch (which limits to 500 lines from pid >= 12)
     // since it is bounded and useful for early-boot diagnostics.
-    #[cfg(all(feature = "firefox-test", feature = "firefox-trace-verbose"))]
+    #[cfg(all(feature = "firefox-test-core", feature = "firefox-trace-verbose"))]
     {
         static TRACE_N: core::sync::atomic::AtomicU64 =
             core::sync::atomic::AtomicU64::new(0);
@@ -1106,7 +1106,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
             }
         }
     }
-    #[cfg(not(feature = "firefox-test"))]
+    #[cfg(not(feature = "firefox-test-core"))]
     {
         static TRACE_N: core::sync::atomic::AtomicU64 =
             core::sync::atomic::AtomicU64::new(0);
@@ -1133,7 +1133,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     // sys_open_linux can attach path / read-content context to the pending
     // entry without needing to thread it through every syscall signature.
     // Syscalls are serialised per CPU, so a single atomic per CPU is safe.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     crate::subsys::linux::syscall_ring::set_current_entry(ring_entry_idx);
 
     // Route through dispatch_body() so an early `return` inside any match
@@ -1142,7 +1142,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     let ret: i64 = dispatch_body(num, arg1, arg2, arg3, arg4, arg5, arg6);
 
     // ── Close out the ring entry with the syscall's return value ─────────────
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         let pid = crate::proc::current_pid_lockless();
         crate::syscall::ring::end(pid, ring_entry_idx, ret);
@@ -1404,7 +1404,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
 
             // Poll entry logging disabled — deep call stack + serial formatting
             // was contributing to kernel stack overflow for Firefox.
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-core")]
             if false && pid >= 1 {
                 crate::serial_println!("[POLL_ENTRY] pid={} nfds={} timeout={}",
                     pid, nfds, timeout_ms);
@@ -1464,7 +1464,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 crate::net::poll();
                 let r = do_check(true, true);
                 if r > 0 {
-                    #[cfg(feature = "firefox-test")]
+                    #[cfg(feature = "firefox-test-trace")]
                     if pid >= 1 { crate::serial_println!("[POLL_RET] pid={} ret={} (post-x11-poll)", pid, r); }
                     return r;
                 }
@@ -1513,7 +1513,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     }
                     let r = do_check(true, true);
                     if r > 0 {
-                        #[cfg(feature = "firefox-test")]
+                        #[cfg(feature = "firefox-test-trace")]
                         if pid >= 1 { crate::serial_println!("[POLL_RET] pid={} ret={} (woke)", pid, r); }
                         return r;
                     }
@@ -1521,11 +1521,11 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     let now = crate::arch::x86_64::irq::get_ticks();
                     if now >= deadline_tick { break; }
                 }
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-trace")]
                 if pid >= 1 { crate::serial_println!("[POLL_RET] pid={} ret=0 (timeout)", pid); }
                 0
             } else {
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-trace")]
                 if pid >= 1 { crate::serial_println!("[POLL_RET] pid={} ret={} (immediate)", pid, ready); }
                 ready
             }
@@ -1586,7 +1586,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // 33: dup2(oldfd, newfd) — duplicate fd to specific slot
         33 => {
             let ret = crate::syscall::sys_dup2(arg1 as usize, arg2 as usize);
-            #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+            #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
             {
                 let pid = crate::proc::current_pid_lockless();
                 if pid == 1 || crate::syscall::ring::is_tracked(pid) {
@@ -1692,7 +1692,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 let path_bytes: &[u8] = &path_owned;
                 // Strip trailing NUL
                 let plen = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-core")]
                 if pid >= 1 {
                     if let Ok(p) = core::str::from_utf8(&path_bytes[..plen]) {
                         crate::serial_println!("[FF/connect] pid={} path={}", pid, p);
@@ -4326,7 +4326,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                  *((arg1 + 16) as *const u64),
                  *((arg1 + 24) as *const u64))
             };
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-core")]
             crate::serial_println!(
                 "[CLONE3] flags={:#x} child_tid={:#x} parent_tid={:#x} arg2_size={}",
                 clone_flags, child_tidptr, parent_tidptr, arg2
@@ -4694,7 +4694,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             if !crate::syscall::validate_user_ptr(arg2, 144) {
                 return -14; // EFAULT
             }
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-core")]
             crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Getrusage, arg2 as *const u8, 144);
 
             // RUSAGE_CHILDREN: we don't currently track per-child rollups;
@@ -4792,7 +4792,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             if !crate::syscall::validate_user_ptr(arg1, 112) {
                 return -14; // EFAULT
             }
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-core")]
             crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Sysinfo, arg1 as *const u8, 112);
 
             // Live system state.
@@ -5085,7 +5085,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     }
                 }
             }
-            #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+            #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
             {
                 let pid = crate::proc::current_pid_lockless();
                 if pid == 1 || crate::syscall::ring::is_tracked(pid) {
@@ -5120,7 +5120,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 Ok(st) => {
                     // struct statx is 256 bytes; zero the whole thing first
                     let base = arg5 as *mut u8;
-                    #[cfg(feature = "firefox-test")]
+                    #[cfg(feature = "firefox-test-core")]
                     crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Statx, base, 256);
                     let mode: u16 = match st.file_type {
                         crate::vfs::FileType::Directory => 0o040_755,
@@ -5185,7 +5185,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // 100: times(buf) — CPU usage times; return zero struct
         100 => {
             if arg1 != 0 && crate::syscall::validate_user_ptr(arg1, 32) {
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-core")]
                 crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Times, arg1 as *const u8, 32);
                 unsafe {
                     let _g = crate::arch::x86_64::smap::UserGuard::new();
@@ -5235,7 +5235,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // 127: rt_sigpending(set, sigsetsize) — stub: no pending signals
         127 => {
             if arg1 != 0 && crate::syscall::validate_user_ptr(arg1, arg2 as usize) {
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-core")]
                 crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Memset, arg1 as *const u8, arg2 as usize);
                 unsafe {
                     let _g = crate::arch::x86_64::smap::UserGuard::new();
@@ -5868,13 +5868,13 @@ fn sys_select_linux(
 
 /// W215 telemetry: number of MADV_DONTNEED/MADV_FREE per-page zero-fills
 /// suppressed by the file-backed guard.  Read from kdb / serial logging.
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 static MADV_ZERO_SUPPRESSED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
 /// Number of zero-fills the W215 file-backed guard has suppressed.  Always 0
 /// on non-firefox-test builds.
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 pub fn madv_zero_suppressed_count() -> u64 {
     MADV_ZERO_SUPPRESSED.load(core::sync::atomic::Ordering::Relaxed)
 }
@@ -6020,7 +6020,7 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
                     // mean the guard is dead code (e.g. file-backed regions
                     // never receiving MADV_DONTNEED) and the actual writer is
                     // elsewhere.
-                    #[cfg(feature = "firefox-test")]
+                    #[cfg(feature = "firefox-test-core")]
                     MADV_ZERO_SUPPRESSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
                 // Clear the PTE.  Do NOT free the frame yet.
@@ -6210,7 +6210,7 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
         let avail = crate::net::unix::bytes_available(unix_id);
         let buf_sl = unsafe { core::slice::from_raw_parts_mut(buf_ptr, count) };
         let ret = crate::net::unix::read(unix_id, buf_sl);
-        #[cfg(feature = "firefox-test")]
+        #[cfg(feature = "firefox-test-core")]
         if pid >= 1 {
             crate::serial_println!("[XSOCK] read fd={} uid={} want={} avail={} got={}",
                 fd, unix_id, count, avail, ret);
@@ -6325,7 +6325,7 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
     match crate::vfs::fd_read(pid, fd as usize, buf_ptr, count) {
         Ok(n) => {
             crate::mm::file_buf_witness::post_read(__fbw_snap, n as i64);
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-core")]
             {
                 // Look up the fd's open_path to decide whether to peek.  We
                 // do this AFTER the read so we see the actual returned bytes.
@@ -6417,7 +6417,13 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
 
     if count == 0 { return 0; }
 
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    // Diagnostic stdout/stderr mirror ([FF/stderr] / [FF/write] / [FF/write-fd]).
+    // This is the single largest serial source on a Firefox boot (~78% of a
+    // ~45 MB log) and has no correctness role — it transcribes every tracked
+    // write(2) to COM1, one PIO VM-exit per byte under KVM.  Gated on the
+    // *-trace features so the functional `firefox-test-core` / plain `test-mode`
+    // builds run identically without the spew.
+    #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace"))]
     {
         let pid = crate::proc::current_pid_lockless();
         if pid == 1 || crate::syscall::ring::is_tracked(pid) {
@@ -6610,14 +6616,18 @@ pub fn sys_open_linux(pathname: u64, flags: u64, _mode: u64) -> i64 {
     //
     // Snapshot the path up front so `[FF/open-ret]` can quote it even if
     // the path argument points into user memory that the handler later
-    // re-reads. The inner impl re-decodes for its own logic.
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    // re-reads. The inner impl re-decodes for its own logic.  Trace-gated to
+    // match the emit below so the perf core boot pays neither the extra
+    // user-string read nor the allocation.
+    #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace"))]
     let path_snapshot: alloc::string::String = {
         let bytes = read_cstring_from_user(pathname);
         alloc::string::String::from_utf8_lossy(&bytes).into_owned()
     };
     let ret = sys_open_linux_inner(pathname, flags, _mode);
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    // Per-open(2) diagnostic mirror — high-frequency; gated to the trace
+    // features so the perf core boot does not pay a serial line per open.
+    #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace"))]
     {
         let pid = crate::proc::current_pid_lockless();
         if pid == 1 || crate::syscall::ring::is_tracked(pid) {
@@ -6676,13 +6686,15 @@ fn sys_open_linux_inner(pathname: u64, flags: u64, _mode: u64) -> i64 {
         }
     };
     let path: &str = path_owned.as_str();
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    // Per-open(2) path mirror — high-frequency diagnostic; trace-gated so the
+    // perf core boot does not emit a serial line per open.
+    #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace"))]
     if pid == 1 || crate::syscall::ring::is_tracked(pid) {
         crate::serial_println!("[FF/open] pid={} path={}", pid, path);
     }
     // Attach the resolved path string to the pending ring entry so the ring
     // dump can show what each open() / openat() actually tried to open.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         let idx = crate::subsys::linux::syscall_ring::current_entry();
         crate::syscall::ring::set_path(pid, idx, path);
@@ -8240,7 +8252,7 @@ fn sys_openat(dirfd: u64, pathname: u64, flags: u64, mode: u64) -> i64 {
     };
 
     // Attach the resolved path to the pending ring entry.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         let idx = crate::subsys::linux::syscall_ring::current_entry();
         crate::syscall::ring::set_path(pid, idx, &full_path);
@@ -8537,7 +8549,7 @@ fn sys_rt_sigprocmask_linux(how: u64, set: u64, oldset: u64, _sigsetsize: u64) -
 /// real userspace) and `test-mode` (where Test 238 drives it with a
 /// synthetic waiter).  Both features are diagnostic-only configurations
 /// and the 8-byte atomic has no cost on the default build.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 pub(crate) static FUTEX_WAKE_GHOST_COUNT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
@@ -8587,7 +8599,7 @@ pub(crate) static FUTEX_WAKE_GHOST_COUNT: core::sync::atomic::AtomicU64 =
 // kernel BSS and is only touched when the `firefox-test` or `test-mode`
 // feature is enabled.  Zero overhead on the default build.
 
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 pub(crate) mod ghost_hist {
     //! History-based FUTEX_WAKE_GHOST detection helpers.
     //!
@@ -8655,9 +8667,9 @@ pub(crate) mod ghost_hist {
     /// can be toggled at runtime via `kdb futex set-ghost-hist on|off`.
     /// The default is OFF under `test-mode` alone so the in-kernel test
     /// suite does not accumulate history from the wider test corpus.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     pub static GHOST_HIST_ENABLED: AtomicBool = AtomicBool::new(true);
-    #[cfg(all(feature = "test-mode", not(feature = "firefox-test")))]
+    #[cfg(all(feature = "test-mode", not(feature = "firefox-test-core")))]
     pub static GHOST_HIST_ENABLED: AtomicBool = AtomicBool::new(false);
 
     /// Counts.
@@ -9064,7 +9076,7 @@ pub fn sys_futex_linux(
             // parking the caller.  Catch this before touching the wait queue
             // so we never end up with a registered-but-already-expired waiter.
             if matches!(timeout_ns, TimeoutNs::AlreadyExpired) {
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-trace")]
                 crate::serial_println!(
                     "[FUTEX_TIMEDOUT] tid={} pid={} uaddr={:#x} op={:#x} (absolute deadline elapsed)",
                     crate::proc::current_tid(), pid, uaddr, futex_op
@@ -9125,7 +9137,7 @@ pub fn sys_futex_linux(
             // correlating against history during our sleep sees this
             // entry.  No-op if `ghost_hist::GHOST_HIST_ENABLED` is false.
             // See `ghost_hist::record_wait` for the BZ 25847 reference.
-            #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+            #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
             ghost_hist::record_wait(pid, tid, uaddr);
 
             // ── Diagnostics live OUTSIDE the critical section ──────────────
@@ -9136,7 +9148,7 @@ pub fn sys_futex_linux(
             // [FUTEX_WAIT_REG] line and the rbp-chain walk now — the waiter
             // is already on the queue and Blocked, so a wake racing with
             // these prints is correct.
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-trace")]
             {
                 let user_rip = unsafe { crate::syscall::get_user_rip() };
                 let (user_rsp, user_rbp) = crate::syscall::get_user_rsp_rbp();
@@ -9157,7 +9169,7 @@ pub fn sys_futex_linux(
             // the cluster-wake compensation (below) can use "this TGID
             // recently parked here" as a safety-harness signal when a
             // future FUTEX_WAKE on a nearby uaddr misses.
-            #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+            #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
             crate::subsys::linux::futex_cluster::record_wait(pid, uaddr);
 
             crate::sched::schedule();
@@ -9193,7 +9205,7 @@ pub fn sys_futex_linux(
             // If we removed ourselves from the waiter list, the scheduler woke us = timeout.
             // If the list entry was already gone, FUTEX_WAKE removed us = success.
             if timed_out {
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-trace")]
                 crate::serial_println!(
                     "[FUTEX_TIMEDOUT] tid={} pid={} uaddr={:#x} op={:#x}",
                     tid, pid, uaddr, futex_op
@@ -9215,7 +9227,7 @@ pub fn sys_futex_linux(
             // whether a missing-wakeup is "wake call never reached" vs
             // "wake call reached but wrong uaddr".  See the FUTEX_WAIT_REG
             // site for the fault-safety rationale of the user-frame helpers.
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-trace")]
             {
                 let user_rip = unsafe { crate::syscall::get_user_rip() };
                 let (user_rsp, user_rbp) = crate::syscall::get_user_rsp_rbp();
@@ -9262,7 +9274,7 @@ pub fn sys_futex_linux(
             // wakes against waiters by uaddr without having to instrument
             // userspace.  Gated to firefox-test to stay out of the test-mode
             // serial budget.
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-trace")]
             crate::serial_println!(
                 "[FUTEX_WAKE] tid={} pid={} uaddr={:#x} woken={} max={} op={:#x}",
                 crate::proc::current_tid(), pid, uaddr, woken, val, futex_op
@@ -9283,7 +9295,7 @@ pub fn sys_futex_linux(
             // the userspace producer signalled the wrong field of a
             // composite cond-var (musl `pthread_cond_t._c_seq` vs
             // `_c_waiters`, public layout in the musl source).
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-trace")]
             if woken == 0 {
                 crate::subsys::linux::futex_key_diag::emit_wake_empty(
                     pid, crate::proc::current_tid(), uaddr, futex_op,
@@ -9295,7 +9307,7 @@ pub fn sys_futex_linux(
             // recently issued a wake at this uaddr" as a safety-harness
             // signal on a subsequent ghost wake at a nearby slot.  Cheap
             // — bounded ring, ≤ 64 entries.
-            #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+            #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
             crate::subsys::linux::futex_cluster::record_wake(
                 crate::proc::current_tid(), uaddr,
             );
@@ -9321,7 +9333,7 @@ pub fn sys_futex_linux(
             // `firefox-test`, OFF in stock builds) and behind the same
             // feature gates as the GHOST diagnostic above.  See
             // `subsys/linux/futex_cluster.rs` for the full algorithm.
-            #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+            #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
             let extra_woken = if woken == 0 && (op == 1 || op == 10) {
                 crate::subsys::linux::futex_cluster::compensate(
                     pid, crate::proc::current_tid(), uaddr, max_wake,
@@ -9329,7 +9341,7 @@ pub fn sys_futex_linux(
             } else {
                 0
             };
-            #[cfg(not(any(feature = "firefox-test", feature = "test-mode")))]
+            #[cfg(not(any(feature = "firefox-test-core", feature = "test-mode")))]
             let extra_woken: u64 = 0;
             woken = woken.saturating_add(extra_woken);
 
@@ -9360,7 +9372,13 @@ pub fn sys_futex_linux(
             // in CI).  The FUTEX_WAITERS scan and the per-event serial
             // output are diagnostic-only — the default build pays no
             // overhead.
-            #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+            // Diagnostic GHOST scan (FUTEX_WAITERS lock + BTreeMap range scan +
+            // [FUTEX_WAKE_GHOST] emit on every woken==0 wake).  Gated on the
+            // trace features so the perf `firefox-test-core` boot pays neither
+            // the per-wake scan nor the serial; `test-mode` keeps the full
+            // behaviour so Test 238 (which asserts FUTEX_WAKE_GHOST_COUNT
+            // advances) is unchanged.
+            #[cfg(any(feature = "firefox-test-trace", feature = "test-mode"))]
             if woken == 0 && (op == 1 || op == 10) {
                 const FUTEX_GHOST_CLUSTER: u64 = 256;
                 let cluster_lo = uaddr & !(FUTEX_GHOST_CLUSTER - 1);
@@ -9396,8 +9414,11 @@ pub fn sys_futex_linux(
             // uaddr that has been recorded within the last
             // HIST_WINDOW_TICKS ticks.  See the `ghost_hist` module for
             // the BZ 25847 framing.  The correlation does NOT modify
-            // `woken`; the wake decision above is unchanged.
-            #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+            // `woken`; the wake decision above is unchanged.  Gated on the
+            // trace features (like the GHOST scan above) so the perf
+            // `firefox-test-core` boot pays no per-wake counter/correlation
+            // cost; `test-mode` keeps it so Test 240 is unchanged.
+            #[cfg(any(feature = "firefox-test-trace", feature = "test-mode"))]
             if op == 1 || op == 10 {
                 ghost_hist::GHOST_HIST_TOTAL_WAKES
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -9801,7 +9822,7 @@ fn sys_fstatfs_linux(_fd: usize, buf: *mut u8) -> i64 {
 /// Write a plausible statfs structure into `buf` (120 bytes).
 fn fill_statfs_buf(buf: *mut u8) {
     // Wipe first.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Preadv120, buf, 120);
     // SMAP bracket — `buf` is a user-VA pointer.
     let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
@@ -11234,7 +11255,7 @@ fn sys_pwritev(fd: u64, iov_ptr: u64, iovcnt: u64, offset: i64) -> i64 {
 // frame pointers are omitted (common in JIT code), which is harmless —
 // we still get the leaf, the libc-wrapper caller (`cr=` in [SC]), and as
 // many native frames as the compiler preserved.
-#[cfg(all(feature = "firefox-test", feature = "firefox-trace-verbose"))]
+#[cfg(all(feature = "firefox-test-core", feature = "firefox-trace-verbose"))]
 fn emit_user_stack_snapshot(num: u64, sample_idx: u64) {
     use core::fmt::Write as _;
     const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;

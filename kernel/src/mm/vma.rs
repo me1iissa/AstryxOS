@@ -733,9 +733,18 @@ impl VmSpace {
             self.cr3 = actual_cr3;
         }
 
-        crate::serial_println!("[FORK-COW] clone_for_fork START cr3={:#x} hw_cr3={:#x} vmas={}", actual_cr3, hw_cr3, self.areas.len());
-        for vma in &self.areas {
-            crate::serial_println!("[FORK-COW]   VMA [{:#x}..{:#x}) prot={:#x} flags={:#x} {:?}", vma.base, vma.base + vma.length, vma.prot, vma.flags, vma.backing);
+        // Per-fork [FORK-COW] dump (START line + one line per VMA, ~100 VMAs
+        // per Firefox process).  ALWAYS-ON historically — this taxed every
+        // fork(2) in EVERY build, including stock production.  Pure diagnostic:
+        // gate it behind the off-by-default `fork-cow-trace` feature.  The
+        // cr3-mismatch WARN above and the OOM line below stay UNCONDITIONAL —
+        // those are rare, real error signals, not hot-path chatter.
+        #[cfg(feature = "fork-cow-trace")]
+        {
+            crate::serial_println!("[FORK-COW] clone_for_fork START cr3={:#x} hw_cr3={:#x} vmas={}", actual_cr3, hw_cr3, self.areas.len());
+            for vma in &self.areas {
+                crate::serial_println!("[FORK-COW]   VMA [{:#x}..{:#x}) prot={:#x} flags={:#x} {:?}", vma.base, vma.base + vma.length, vma.prot, vma.flags, vma.backing);
+            }
         }
 
         // Allocate a fresh, zeroed PML4 for the child.
@@ -768,6 +777,7 @@ impl VmSpace {
             for pml4_idx in 0..256usize {
                 let pml4e = *parent_pml4.add(pml4_idx);
                 if pml4e & PAGE_PRESENT == 0 { continue; }
+                #[cfg(feature = "fork-cow-trace")]
                 crate::serial_println!("[FORK-COW] PML4[{}] present (phys={:#x})", pml4_idx, pml4e & ADDR_MASK);
 
                 let parent_pdpt_phys = pml4e & ADDR_MASK;
@@ -862,7 +872,12 @@ impl VmSpace {
         // the original mapping are still covered because the per-CR3
         // active-CPU mask is consulted at shootdown time.
         crate::mm::tlb::shootdown_full_user(self.cr3);
+        #[cfg(feature = "fork-cow-trace")]
         crate::serial_println!("[FORK-COW] total {} 4KB pages CoW'd into child CR3={:#x}", total_pages_cow, child_pml4_phys);
+        // `total_pages_cow` is only read by the trace line above; bind it when
+        // the trace is compiled out so the running tally does not warn.
+        #[cfg(not(feature = "fork-cow-trace"))]
+        let _ = total_pages_cow;
 
         // Copy VMA list to child.
         let mut child_areas = Vec::with_capacity(self.areas.len());

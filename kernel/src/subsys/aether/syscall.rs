@@ -65,7 +65,10 @@ pub fn dispatch(
                 }
             } else {
                 // Try VFS first; fall back to TTY for fd 1/2 if no file open.
-                #[cfg(feature = "firefox-test")]
+                // Diagnostic stderr mirror — high-frequency, no correctness
+                // role; gated on the trace feature so functional core boots
+                // skip the per-write COM1 spew.
+                #[cfg(feature = "firefox-test-trace")]
                 if fd == 2 {
                     // `slice` is a kernel-resident snapshot — from_utf8 is
                     // safe outside any SMAP bracket.

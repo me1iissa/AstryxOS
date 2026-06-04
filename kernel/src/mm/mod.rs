@@ -24,7 +24,7 @@ pub mod file_buf_witness;
 // See `Cargo.toml` for the underlying PMM-vs-BSS rationale.
 #[cfg(feature = "w215-diag")]
 pub mod w215_crc;
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 pub mod w215_diag;
 // PSE 2026-05-20: `[VMA-DUMP]` on fatal user-mode exceptions.  Used by
 // `vma-dump-on-gp` to anchor PIE-ASLR bases at the moment a process is

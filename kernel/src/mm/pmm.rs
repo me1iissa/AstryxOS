@@ -24,23 +24,23 @@ use spin::Mutex;
 // for safety margin; matches the W203 1 ms historical threshold scaled to the
 // quarantine grace-period (≥1 full tick guaranteed by `on_cpu_tick`).
 
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 const RECENT_FREE_CAP: usize = 64;
 
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 const RECENT_FREE_WINDOW_TICKS: u64 = 2;
 
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 #[derive(Copy, Clone)]
 struct RecentFreeEntry { phys: u64, freed_tick: u64 }
 
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 struct RecentFreeRing {
     entries: [RecentFreeEntry; RECENT_FREE_CAP],
     next: usize,
 }
 
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 impl RecentFreeRing {
     const fn new() -> Self {
         Self {
@@ -66,7 +66,7 @@ impl RecentFreeRing {
     }
 }
 
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 // See FREE_SHADOW in mm/w215_diag.rs for a parallel direct-addressed
 // tracer; future consolidation opportunity.
 static RECENT_FREE_RING: Mutex<RecentFreeRing> = Mutex::new(RecentFreeRing::new());
@@ -75,7 +75,7 @@ static RECENT_FREE_RING: Mutex<RecentFreeRing> = Mutex::new(RecentFreeRing::new(
 /// `RECENT_FREE_WINDOW_TICKS` ticks of their most recent free.  A non-zero
 /// value indicates that the PMM is recycling frames faster than the
 /// quarantine grace-period guarantees — the time-axis condition for H2.
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 pub(crate) static PMM_ALLOC_RECENT_FREE: AtomicU64 = AtomicU64::new(0);
 
 /// Page size: 4 KiB.
@@ -109,7 +109,7 @@ static NEXT_FIT_BYTE: AtomicU64 = AtomicU64::new(0);
 /// bitmap drift): the PMM believes a frame is free (bitmap bit clear) but
 /// the refcount table still holds a live reference — indicating the previous
 /// owner never called `page_ref_dec` before the frame was recycled.
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 static PMM_ALLOC_NONZERO_RC: AtomicU64 = AtomicU64::new(0);
 
 /// Cumulative count of `free_page` calls that were refused because the
@@ -420,7 +420,7 @@ unsafe fn alloc_page_locked() -> Option<u64> {
                         NEXT_FIT_BYTE.store(next as u64, Ordering::Relaxed);
                         let phys = (page * PAGE_SIZE) as u64;
                         // W215 diagnostic Arm-1: record the ALLOC event.
-                        #[cfg(feature = "firefox-test")]
+                        #[cfg(feature = "firefox-test-core")]
                         crate::mm::w215_diag::prov_record(
                             phys, crate::mm::w215_diag::KIND_ALLOC, 0,
                         );
@@ -432,7 +432,7 @@ unsafe fn alloc_page_locked() -> Option<u64> {
                         // SDM Vol. 3A §4.10.5 the most-recent alloc is the
                         // upstream of any use-after-recycle observable at
                         // the current rip_phys).
-                        #[cfg(feature = "firefox-test")]
+                        #[cfg(feature = "firefox-test-core")]
                         {
                             let rip = caller_rip();
                             crate::mm::w215_diag::alloc_shadow_record(phys, rip);
@@ -442,7 +442,7 @@ unsafe fn alloc_page_locked() -> Option<u64> {
                         // PMM bitmap (free) and the refcount table (in-use).
                         // Gated on firefox-test to keep production builds
                         // identical.
-                        #[cfg(feature = "firefox-test")]
+                        #[cfg(feature = "firefox-test-core")]
                         {
                             let rc = crate::mm::refcount::page_ref_count(phys);
                             if rc != 0 {
@@ -461,7 +461,7 @@ unsafe fn alloc_page_locked() -> Option<u64> {
                         // recently (within RECENT_FREE_WINDOW_TICKS).  Uses
                         // `try_lock` to avoid holding two spinlocks; a missed
                         // check under contention is acceptable for a diagnostic.
-                        #[cfg(feature = "firefox-test")]
+                        #[cfg(feature = "firefox-test-core")]
                         if let Some(mut ring) = RECENT_FREE_RING.try_lock() {
                             let now = crate::arch::x86_64::irq::TICK_COUNT
                                 .load(Ordering::Relaxed);
@@ -667,7 +667,7 @@ pub fn free_page(phys_addr: u64) {
     // per-pfn collision is recorded as a displacement counter increment
     // rather than silent data loss.  At 64 Ki slots × 24 bytes = 1.5 MiB
     // BSS, the cost is material only in `firefox-test` builds.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         let rip = caller_rip();
         crate::mm::w215_diag::prov_record_free(phys_addr, rip);
@@ -683,7 +683,7 @@ pub fn free_page(phys_addr: u64) {
 
     // H2 diagnostic: record this free in the recent-free ring so that
     // a rapid re-allocation of the same frame triggers PMM_ALLOC_RECENT_FREE.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     if let Some(mut ring) = RECENT_FREE_RING.try_lock() {
         let tick = crate::arch::x86_64::irq::TICK_COUNT
             .load(Ordering::Relaxed);
@@ -759,11 +759,11 @@ pub fn stats() -> (u64, u64) {
 /// re-allocated within `RECENT_FREE_WINDOW_TICKS` ticks of their most recent
 /// free.  Returns 0 in non-firefox-test builds.
 pub fn pmm_alloc_recent_free_count() -> u64 {
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         PMM_ALLOC_RECENT_FREE.load(Ordering::Relaxed)
     }
-    #[cfg(not(feature = "firefox-test"))]
+    #[cfg(not(feature = "firefox-test-core"))]
     {
         0
     }
@@ -781,9 +781,9 @@ pub fn free_page_count() -> u64 {
 /// Returns the number of times an `alloc_page` call returned a frame whose
 /// refcount was already non-zero.  Always 0 on non-firefox-test builds.
 pub fn pmm_alloc_nonzero_rc_count() -> u64 {
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     { PMM_ALLOC_NONZERO_RC.load(Ordering::Relaxed) }
-    #[cfg(not(feature = "firefox-test"))]
+    #[cfg(not(feature = "firefox-test-core"))]
     { 0 }
 }
 

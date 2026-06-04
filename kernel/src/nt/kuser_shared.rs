@@ -378,7 +378,7 @@ pub fn current_tick_count64() -> u64 {
     unsafe { read_ksystem_time(OFF_TICK_COUNT) }
 }
 
-#[cfg(any(feature = "test-mode", feature = "firefox-test"))]
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
 pub fn page_base_for_test() -> *const u8 {
     page_ptr() as *const u8
 }

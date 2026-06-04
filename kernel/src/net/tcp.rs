@@ -837,7 +837,7 @@ pub fn tcp_timer_tick() {
 /// default builds — the struct would otherwise alter LLVM's symbol
 /// mangling hashes of neighbouring statics.
 #[cfg(any(feature = "kdb", feature = "httpd-test", feature = "test-mode",
-          feature = "firefox-test", feature = "oracle-test"))]
+          feature = "firefox-test-core", feature = "oracle-test"))]
 #[derive(Clone, Copy)]
 pub struct ConnSnap {
     pub local_port:  u16,
@@ -849,7 +849,7 @@ pub struct ConnSnap {
 /// Return a snapshot of every connection in the TCP table.  Caller-owned
 /// copy — safe to use after the lock is dropped.
 #[cfg(any(feature = "kdb", feature = "httpd-test", feature = "test-mode",
-          feature = "firefox-test", feature = "oracle-test"))]
+          feature = "firefox-test-core", feature = "oracle-test"))]
 pub fn snapshot_connections() -> alloc::vec::Vec<ConnSnap> {
     TCP_CONNECTIONS.lock().iter().map(|c| ConnSnap {
         local_port:  c.local_port,
@@ -869,7 +869,7 @@ pub fn snapshot_connections() -> alloc::vec::Vec<ConnSnap> {
 /// zero discards the buffered tail because the FIN advances `send_next`
 /// past data that has not yet been transmitted.
 #[cfg(any(feature = "kdb", feature = "httpd-test", feature = "test-mode",
-          feature = "firefox-test", feature = "oracle-test"))]
+          feature = "firefox-test-core", feature = "oracle-test"))]
 pub fn outbound_pending(local_port: u16, remote_ip: Ipv4Address, remote_port: u16) -> usize {
     TCP_CONNECTIONS.lock().iter()
         .find(|c| c.local_port == local_port

@@ -150,7 +150,7 @@ pub fn lookup_and_acquire(mount_idx: usize, inode: u64, page_offset: u64) -> Opt
     // W215 diagnostic Arm-2: a lookup_acquire reaching a phys that has an
     // in-flight pre-insert witness implies a sibling-CPU reader has obtained
     // a handle to bytes that the original installer has not yet copied in.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     crate::mm::w215_diag::preins_check_op(
         phys,
         crate::mm::w215_diag::OP_LOOKUP_ACQUIRE,
@@ -277,7 +277,7 @@ pub fn insert_with_expected(
             // (no live PTEs, no other cache users) and must be freed.
             let new_rc = crate::mm::refcount::page_ref_dec(old_entry.phys);
             evicted_zero_rc = if new_rc == 0 { Some(old_entry.phys) } else { None };
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-core")]
             {
                 crate::mm::w215_diag::prov_record(
                     old_entry.phys,
@@ -294,7 +294,7 @@ pub fn insert_with_expected(
 
     // W215 diagnostic Arm-1: record the INSERT event for `phys`.  Arm-2:
     // clear the pre-insert witness, if any — the happy path.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         crate::mm::w215_diag::prov_record(
             phys,
@@ -694,7 +694,7 @@ pub fn truncate_range(mount_idx: usize, inode: u64, old_size: u64, new_size: u64
                     to_quarantine.push(entry.phys);
                 }
                 // W215 diagnostic provenance, mirroring `evict`.
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-core")]
                 {
                     crate::mm::w215_diag::prov_record(
                         entry.phys,
@@ -728,7 +728,7 @@ pub fn evict(mount_idx: usize, inode: u64, page_offset: u64) -> Option<u64> {
         // the cache's reference.
         let _ = crate::mm::refcount::page_ref_dec(entry.phys);
         // W215 diagnostic Arm-1 / Arm-2.
-        #[cfg(feature = "firefox-test")]
+        #[cfg(feature = "firefox-test-core")]
         {
             crate::mm::w215_diag::prov_record(
                 entry.phys,
@@ -931,7 +931,7 @@ pub fn prepopulate_file(path: &str) -> usize {
                 // W215 diagnostic Arm-1+2: record the PHYS_OFF pre-insert
                 // write intent.  preins_register opens the race window;
                 // the matching cache::insert below will close it.
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-core")]
                 {
                     crate::mm::w215_diag::prov_record(
                         phys,
@@ -1003,7 +1003,7 @@ pub fn evict_if_phys(
     let key = (mount_idx, inode, page_offset);
     // W215 diagnostic Arm-2: an evict_if_phys call against a phys with an
     // in-flight pre-insert witness is a race candidate.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     crate::mm::w215_diag::preins_check_op(
         expected_phys,
         crate::mm::w215_diag::OP_EVICT_IF_PHYS,
@@ -1019,7 +1019,7 @@ pub fn evict_if_phys(
         cache.remove(&key);
         // Release the cache's reference to the evicted frame.
         let _ = crate::mm::refcount::page_ref_dec(expected_phys);
-        #[cfg(feature = "firefox-test")]
+        #[cfg(feature = "firefox-test-core")]
         {
             crate::mm::w215_diag::prov_record(
                 expected_phys,
@@ -1053,7 +1053,7 @@ pub fn stats() -> (usize, usize) {
 ///
 /// Per-entry `phys` comparison is exact — the cache holds one physical frame per
 /// key and frames are 4 KiB-aligned, so a u64 equality test is sufficient.
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 pub fn is_phys_in_cache(phys: u64) -> Option<(usize, u64, u64)> {
     // W215 diagnostic Arm-2: probe BEFORE taking the cache lock so the
     // witness check is not serialised against insert.  A racing pre-insert
@@ -1087,7 +1087,7 @@ pub fn is_phys_in_cache(phys: u64) -> Option<(usize, u64, u64)> {
 /// At most 16 orphan lines are emitted per call to avoid serial flood.
 ///
 /// Returns `(total_entries, orphan_count)`.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 pub fn audit_invariant() -> (usize, usize) {
     use crate::mm::refcount::page_ref_count;
     use core::fmt::Write as _;
