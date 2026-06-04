@@ -2865,6 +2865,23 @@ def cmd_start(args):
         if not ok:
             _err("Build failed")
 
+    # --build-only: compile + stage the in-tree ESP, then exit WITHOUT booting
+    # QEMU. The just-built kernel.bin/BOOTX64.EFI now sit at the in-tree ESP, so
+    # a later `start --no-build` reuses this exact binary. Lets a host run the
+    # (CPU-bound) compile while a concurrent KVM boot is in flight, then boot in
+    # a quiet window — keeping cycle-accurate timing free of host-core
+    # contention. Additive flag; absent → existing behaviour is unchanged.
+    if getattr(args, "build_only", False):
+        _out({
+            "ok": True,
+            "build_only": True,
+            "features": args.features or "",
+            "kernel_bin": str(_get_watch_test().KERNEL_BIN),
+            "note": "kernel staged at in-tree ESP; boot later with "
+                    "`start --no-build`",
+        })
+        return
+
     # Snapshot the in-tree ESP into a session-scoped directory so concurrent
     # rebuilds from other workspaces cannot clobber the kernel binary this
     # session is running. See _freeze_session_esp() docstring for the bug
@@ -5530,6 +5547,8 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
               "tlb-stats", "heap-stats", "w215-diag",
               "coverage-flush", "proc-metrics",
               "futex-stats",
+              # blk-trace: out-of-band drain of the virtio-blk LBA ring.
+              "blk-trace", "blk-trace-flush",
               # INFRA-3 record/replay: zero-arg introspection.
               "record-status"):
         return {"op": op}
@@ -5822,6 +5841,35 @@ def cmd_kdb(args):
     except OSError: pass
 
     _out(resp)
+
+
+def cmd_blk_trace(args):
+    """Drain the virtio-blk LBA trace ring (out-of-band; replaces the old
+    per-op `[BLK]` serial write).
+
+    Forms:
+      blk-trace drain <sid>   -> kdb `blk-trace` op: live ring as JSON
+                                 ({feature, total, resident, dropped, emitted,
+                                  cap, events:[{op,lba,len,pid}...]}).
+      blk-trace flush <sid>   -> kdb `blk-trace-flush` op: re-emit the classic
+                                 `[BLK]` serial lines in one burst (legacy
+                                 heatmap ingestion), returns {emitted}.
+
+    Thin wrapper over `cmd_kdb`; requires the session to have been started with
+    `--features ...,kdb,blk-trace`. `drain` against a non-blk-trace build returns
+    `{"feature":"off",...}` rather than an error, so the protocol surface is
+    stable across builds.
+    """
+    sub = getattr(args, "blk_action", None)
+    op = {"drain": "blk-trace", "flush": "blk-trace-flush"}.get(sub)
+    if op is None:
+        _out({"error": f"blk-trace: unknown action {sub!r} "
+                       "(expected 'drain' or 'flush')"})
+        sys.exit(1)
+    # Reuse the kdb one-shot path verbatim (port resolution, recv, JSON, cache).
+    args.op = op
+    args.args = []
+    cmd_kdb(args)
 
 
 def cmd_net_ipver(args):
@@ -10789,6 +10837,14 @@ def main():
                                "serial lines for `coverage --collect`.")
     p_start.add_argument("--no-build", action="store_true",
                           help="Skip cargo build; use existing kernel.bin")
+    p_start.add_argument("--build-only", action="store_true", dest="build_only",
+                          help="Build the kernel for --features then exit (no "
+                               "QEMU boot). Stages the in-tree ESP so a later "
+                               "`start --no-build` reuses this exact binary. "
+                               "Lets a host run the (CPU-bound) compile while a "
+                               "concurrent KVM boot is in flight, then boot in a "
+                               "quiet window — keeps cycle-accurate perf timing "
+                               "free of host-core contention.")
     p_start.add_argument("--snapshottable", action="store_true",
                           dest="snapshottable",
                           help="snap-gate: launch with the QEMU savevm/loadvm-"
@@ -11102,6 +11158,10 @@ def main():
         "bell-stats", "cache-audit", "cache-aliasing", "fault-cache-keys",
         "w215-cache-residency", "tlb-stats", "heap-stats", "w215-diag",
         "arm-phys",
+        # blk-trace: drain the virtio-blk LBA ring (JSON) / re-emit `[BLK]`
+        # serial lines for the heatmap. Also exposed as the `blk-trace`
+        # top-level subcommand below (drain|flush).
+        "blk-trace", "blk-trace-flush",
         "coverage-flush", "proc-metrics", "thread-park-audit",
         "rip-trace",
         "futex-ghost-hist",
@@ -11139,6 +11199,23 @@ def main():
     p_kdb.add_argument("--timeout", type=float, default=30.0,
                         help="Overall deadline in seconds (default 30.0). "
                              "Wraps retry/backoff for BSP starvation tolerance.")
+
+    # blk-trace — out-of-band drain of the virtio-blk LBA trace ring.
+    # Replaces the old per-op `[BLK]` COM1 write (a KVM VM-exit storm) with a
+    # lock-free ring drained on demand. Requires --features ...,kdb,blk-trace.
+    p_blktrace = sub.add_parser(
+        "blk-trace",
+        help="[Tier1] Drain the virtio-blk LBA trace ring. "
+             "`drain` -> live ring as JSON; `flush` -> re-emit classic `[BLK]` "
+             "serial lines for the data.img heatmap. "
+             "Requires --features ...,kdb,blk-trace at start.")
+    p_blktrace.add_argument(
+        "blk_action", choices=["drain", "flush"],
+        help="drain: dump ring as JSON (events:[{op,lba,len,pid}...]). "
+             "flush: emit `[BLK]` serial lines on demand (heatmap compat).")
+    p_blktrace.add_argument("sid")
+    p_blktrace.add_argument("--timeout", type=float, default=30.0,
+                             help="kdb overall deadline (default 30.0s).")
 
     # tlb-stats — dedicated top-level subcommand for W215 H2 TLB diagnostic
     p_tlb_stats = sub.add_parser(
@@ -11821,6 +11898,7 @@ def main():
         "autopsy": cmd_autopsy,
         # Tier 1
         "kdb":         cmd_kdb,
+        "blk-trace":   cmd_blk_trace,
         "net-ipver":   cmd_net_ipver,
         "tlb-stats":   cmd_tlb_stats,
         "fd-map":      cmd_fd_map,

@@ -1479,6 +1479,26 @@ fn do_io(req_type: u32, lba: u64, count: u32, buf: *mut u8) -> Result<(), BlockE
         // SAFETY: caller has already validated `buf` covers `count` sectors.
         let data_ptr = unsafe { buf.add(offset) };
 
+        // ── Per-request LBA trace (feature `blk-trace`; default builds no-op).
+        // One record per submitted virtio request — i.e. per batched descriptor
+        // chain — so the LBA/len reflect the actual on-disk request granularity
+        // (bounded by MAX_SECTORS) rather than the logical caller range. Drives
+        // the data.img block-map heatmap. This records into a lock-free ring
+        // (drivers/blk_trace) instead of a synchronous COM1 write, so it does
+        // NOT inject a per-op PIO VM-exit storm into the disk hot path under
+        // KVM. Drain out of band: kdb `blk-trace` op / harness `blk-trace
+        // drain` / serial flush. The cfg guard keeps default builds
+        // byte-identical: when the feature is off NONE of the argument
+        // expressions (incl. the pid read) are evaluated, so the disk hot path
+        // is exactly as before.
+        #[cfg(feature = "blk-trace")]
+        crate::drivers::blk_trace::record(
+            if req_type == VIRTIO_BLK_T_IN { b'R' } else { b'W' },
+            lba + sector_idx as u64,
+            batch,
+            crate::proc::current_pid_lockless() as u32,
+        );
+
         // ── Acquire a completion slot (lock-free spin) ─────────────────
         //
         // Slot acquisition is independent of the device mutex — it just

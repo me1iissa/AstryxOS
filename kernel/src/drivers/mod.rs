@@ -8,6 +8,7 @@ pub mod ahci;
 pub mod rtc;
 pub mod ata;
 pub mod block;
+pub mod blk_trace;
 pub mod console;
 pub mod keyboard;
 pub mod mouse;
