@@ -2403,22 +2403,64 @@ fn resolve_user_write_page(cr3: u64, vaddr: u64) -> bool {
 ///
 /// Returns the PID of the process that changed state, or negative errno.
 pub(crate) fn sys_waitpid(pid: i64, options: u32) -> i64 {
+    // `wait4(2)` / `waitpid(2)` always REAP (collect-and-remove) the child.
+    // The only POSIX option the legacy entry honours is WNOHANG (=1); see
+    // `sys_waitpid_ex` for the WNOWAIT (peek-without-reap) variant used by
+    // `waitid(2)`.
+    sys_waitpid_ex(pid, (options & 1) != 0 /*WNOHANG*/, false /*WNOWAIT*/)
+}
+
+/// Core wait implementation shared by `wait4(2)` and `waitid(2)`.
+///
+/// * `wnohang` — POSIX `WNOHANG`: return 0 immediately if no matching child
+///   has yet changed state, instead of blocking.
+/// * `wnowait` — POSIX `WNOWAIT` (`waitid(2)` only): report the child's status
+///   but leave it in a waitable state (do NOT remove the zombie from the
+///   process table), so a subsequent wait can collect it.  Without this, a
+///   caller that peeks a child's exit status and then issues a second wait to
+///   actually reap it (the canonical `waitid(WNOWAIT)` then `waitid(WNOHANG)`
+///   reaping idiom) parks forever on the second call against an
+///   already-removed child.
+///
+/// Returns the reaped/peeked child pid (`> 0`), 0 (WNOHANG, nothing ready),
+/// or a negative errno (`-ECHILD` when there is no matching child at all).
+pub(crate) fn sys_waitpid_ex(pid: i64, wnohang: bool, wnowait: bool) -> i64 {
     let parent_pid = crate::proc::current_pid_lockless();
-    let wnohang = (options & 1) != 0; // WNOHANG = 1
 
-    crate::serial_println!("[SYSCALL] waitpid({}, opts=0x{:x}) from PID {}", pid, options, parent_pid);
+    crate::serial_println!(
+        "[SYSCALL] waitpid({}, wnohang={} wnowait={}) from PID {}",
+        pid, wnohang, wnowait, parent_pid);
 
-    // Try to reap immediately.
-    if let Some((child_pid, exit_code)) = crate::proc::waitpid(parent_pid, pid) {
+    // Try to collect a ready (zombie) child immediately.  WNOWAIT peeks the
+    // status without removing the zombie; otherwise we reap it.
+    if wnowait {
+        if let Some((child_pid, exit_code)) = crate::proc::peek_zombie(parent_pid, pid) {
+            crate::serial_println!(
+                "[SYSCALL] waitpid: child PID {} exited with code {} (peeked, WNOWAIT)",
+                child_pid, exit_code);
+            return child_pid as i64;
+        }
+    } else if let Some((child_pid, exit_code)) = crate::proc::waitpid(parent_pid, pid) {
         crate::serial_println!(
             "[SYSCALL] waitpid: child PID {} exited with code {}",
-            child_pid, exit_code
-        );
+            child_pid, exit_code);
         return child_pid as i64;
     }
 
+    // No reapable child yet.  Per POSIX `wait(2)` / `waitid(2)`: a wait for a
+    // process that is not (or is no longer) a child of the caller MUST fail
+    // with ECHILD rather than block.  This is the load-bearing guard against
+    // the `waitid(P_PID, x, WNOWAIT)`-then-`waitid(P_PID, x)` idiom hanging:
+    // once the first call has reaped x (legacy WNOWAIT-ignored behaviour) — or
+    // any time x is simply gone — the follow-up wait has no matching child and
+    // would otherwise park on the `wake_tick == u64::MAX-1` sentinel that only
+    // a child *exit* clears, which can never arrive for an already-dead child.
+    if !crate::proc::has_matching_child(parent_pid, pid) {
+        return -10; // ECHILD
+    }
+
     if wnohang {
-        return 0; // No zombie yet, WNOHANG → return 0.
+        return 0; // Matching child exists but hasn't changed state → 0.
     }
 
     // Block the parent thread until a child exits.
@@ -2468,6 +2510,11 @@ pub(crate) fn sys_waitpid(pid: i64, options: u32) -> i64 {
     //     so we don't fall through still-Blocked.
     let max_attempts = 200; // Safety limit: ~200 wakeup cycles (~20 seconds at 100Hz)
     let tid = crate::proc::current_tid();
+    // Collect a ready child honouring WNOWAIT: peek (leave waitable) vs reap.
+    let collect = |parent: u64, want: i64| -> Option<(u64, i32)> {
+        if wnowait { crate::proc::peek_zombie(parent, want) }
+        else       { crate::proc::waitpid(parent, want) }
+    };
     for _ in 0..max_attempts {
         // (1) Commit Blocked under THREAD_TABLE, then drop the lock.
         {
@@ -2482,8 +2529,8 @@ pub(crate) fn sys_waitpid(pid: i64, options: u32) -> i64 {
         //     THREAD_TABLE.  A child that became a zombie in the
         //     immediate-reap→commit window is caught here.  On a hit, revert
         //     our own state to Ready (so a missed wake can't leave us Blocked)
-        //     and reap without parking.
-        if let Some((child_pid, exit_code)) = crate::proc::waitpid(parent_pid, pid) {
+        //     and collect (reap or peek) without parking.
+        if let Some((child_pid, exit_code)) = collect(parent_pid, pid) {
             {
                 let mut threads = crate::proc::THREAD_TABLE.lock();
                 if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
@@ -2496,10 +2543,32 @@ pub(crate) fn sys_waitpid(pid: i64, options: u32) -> i64 {
                 }
             }
             crate::serial_println!(
-                "[SYSCALL] waitpid: child PID {} exited with code {} (reaped without park)",
+                "[SYSCALL] waitpid: child PID {} exited with code {} (collected without park)",
                 child_pid, exit_code
             );
             return child_pid as i64;
+        }
+
+        // (2b) The awaited child may have been collected by another thread
+        //      while we held the Blocked commit (e.g. a sibling reaper, or the
+        //      WNOWAIT-peek-then-reap idiom).  If no matching child remains,
+        //      revert to Ready and return ECHILD instead of parking on a wake
+        //      that can never arrive (the `wake_tick == u64::MAX-1` sentinel is
+        //      only cleared by a *child exit*).  Per POSIX `wait(2)`: waiting
+        //      for a non-child fails with ECHILD.  This closes the lost-wakeup
+        //      that wedged a multi-threaded parent's IPC-I/O thread when its
+        //      `waitid(P_PID, x)` raced the child's reaping.
+        if !crate::proc::has_matching_child(parent_pid, pid) {
+            let mut threads = crate::proc::THREAD_TABLE.lock();
+            if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+                if t.state == crate::proc::ThreadState::Blocked
+                    && t.wake_tick == u64::MAX - 1
+                {
+                    t.state = crate::proc::ThreadState::Ready;
+                    t.wake_tick = u64::MAX;
+                }
+            }
+            return -10; // ECHILD
         }
 
         // (3) No zombie visible while we hold the Blocked commit → park.  A
@@ -2508,8 +2577,8 @@ pub(crate) fn sys_waitpid(pid: i64, options: u32) -> i64 {
         //     scheduler tick) returns us promptly.
         crate::sched::schedule();
 
-        // We were woken up — try to reap.
-        if let Some((child_pid, exit_code)) = crate::proc::waitpid(parent_pid, pid) {
+        // We were woken up — try to collect.
+        if let Some((child_pid, exit_code)) = collect(parent_pid, pid) {
             crate::serial_println!(
                 "[SYSCALL] waitpid: child PID {} exited with code {}",
                 child_pid, exit_code

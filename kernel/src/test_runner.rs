@@ -2115,6 +2115,17 @@ pub fn run() -> ! {
         if test_502b_vfork_prepare_to_wait_race() { passed += 1; }
     }
 
+    // ── Test 515: waitid WNOWAIT peek + ECHILD-on-already-reaped ─────────
+    // A blocking waitid(P_PID, x) for a child that no longer exists (already
+    // reaped — e.g. by the WNOWAIT-peek-then-reap launcher idiom) must return
+    // ECHILD immediately, not park forever; and WNOWAIT must leave a peeked
+    // zombie waitable for a follow-up reap.  Per POSIX waitid(2).
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_515_waitid_wnowait_and_echild() { passed += 1; }
+    }
+
     // ── Test 229: PMM pte_share_count free-time invariant (W215 fix) ─────
     // Verifies that pmm::free_page refuses to recycle a frame whose
     // refcount table still records a live PTE reference, and that the
@@ -40544,6 +40555,129 @@ fn test_502b_vfork_prepare_to_wait_race() -> bool {
         test_pass!("vfork prepare-to-wait lost-wakeup close (PR #502)");
     }
     ok
+}
+
+// ── Test 515: waitid WNOWAIT peek + ECHILD-on-already-reaped ─────────────────
+//
+// Models the Firefox process-launcher reaping idiom that previously wedged the
+// parent's IPC-I/O thread (the gecko launcher does
+// `waitid(P_PID, h, WEXITED|WNOWAIT)` to OBSERVE the helper's exit, then a
+// second `waitid` to COLLECT it).  Two regressions are covered:
+//
+//   (1) WNOWAIT must PEEK the zombie's status and LEAVE it waitable, not reap
+//       it.  Before the fix, `waitid` ignored WNOWAIT and reaped on the first
+//       call, so the second call found the child gone.
+//
+//   (2) A blocking wait for a child that no longer exists (already reaped, or
+//       simply not a child) must return ECHILD IMMEDIATELY, never park on the
+//       `wake_tick == u64::MAX-1` sentinel that only a child *exit* can clear —
+//       which, for an already-dead child, can never arrive.  This is the
+//       lost-wakeup that hung the I/O thread forever and tripped the
+//       SCHEDULER_DEADLOCK bugcheck.
+//
+// Per POSIX `waitid(2)`: WNOWAIT "leave[s] the child in a waitable state"; and
+// `wait(2)`: waiting for a process that is not a child fails with ECHILD.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_515_waitid_wnowait_and_echild() -> bool {
+    use crate::proc::{PROCESS_TABLE, THREAD_TABLE, ProcessState};
+
+    test_header!("waitid WNOWAIT peek + ECHILD-on-already-reaped (POSIX waitid(2))");
+
+    // ── 1. Synthetic parent + child ──────────────────────────────────────
+    let parent_pid = match crate::proc::usermode::create_user_process(
+        "wnowait_parent", &crate::proc::hello_elf::HELLO_ELF
+    ) {
+        Ok(p) => p,
+        Err(e) => { test_fail!("waitid_wnowait", "create parent: {:?}", e); return false; }
+    };
+    let child_pid = match crate::proc::usermode::create_user_process(
+        "wnowait_child", &crate::proc::hello_elf::HELLO_ELF
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            { let mut procs = PROCESS_TABLE.lock(); procs.retain(|p| p.pid != parent_pid); }
+            { let mut threads = THREAD_TABLE.lock(); threads.retain(|t| t.pid != parent_pid); }
+            test_fail!("waitid_wnowait", "create child: {:?}", e); return false;
+        }
+    };
+
+    let cleanup = |pp: u64, cp: u64| {
+        let mut procs = PROCESS_TABLE.lock();
+        procs.retain(|p| p.pid != pp && p.pid != cp);
+        drop(procs);
+        let mut threads = THREAD_TABLE.lock();
+        threads.retain(|t| t.pid != pp && t.pid != cp);
+        drop(threads);
+        crate::proc::proc_metrics::unregister(pp);
+        crate::proc::proc_metrics::unregister(cp);
+    };
+
+    // Re-parent the child and make it a zombie with a recognisable code.
+    {
+        let mut procs = PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == child_pid) {
+            p.parent_pid = parent_pid;
+            p.state = ProcessState::Zombie;
+            p.exit_code = 0x515;
+        }
+    }
+
+    // ── 2. WNOWAIT must PEEK (leave the zombie in place) ──────────────────
+    match crate::proc::peek_zombie(parent_pid, child_pid as i64) {
+        Some((cp, code)) if cp == child_pid && code as u32 == 0x515 => {
+            test_println!("  WNOWAIT peek returned PID {} code {:#x} ✓", cp, code);
+        }
+        other => { cleanup(parent_pid, child_pid);
+            test_fail!("waitid_wnowait", "peek_zombie expected ({},0x515), got {:?}",
+                child_pid, other); return false; }
+    }
+    // The peeked zombie MUST still be present (not reaped).
+    {
+        let still = PROCESS_TABLE.lock().iter().any(|p|
+            p.pid == child_pid && p.state == ProcessState::Zombie);
+        if !still { cleanup(parent_pid, child_pid);
+            test_fail!("waitid_wnowait",
+                "WNOWAIT peek wrongly removed the zombie — second wait would hang");
+            return false; }
+    }
+    test_println!("  zombie still waitable after WNOWAIT peek ✓");
+
+    // A follow-up REAP must now collect it (the launcher's second waitid).
+    match crate::proc::waitpid(parent_pid, child_pid as i64) {
+        Some((cp, code)) if cp == child_pid && code as u32 == 0x515 => {
+            test_println!("  follow-up reap collected PID {} code {:#x} ✓", cp, code);
+        }
+        other => { cleanup(parent_pid, child_pid);
+            test_fail!("waitid_wnowait", "follow-up reap expected ({},0x515), got {:?}",
+                child_pid, other); return false; }
+    }
+
+    // ── 3. ECHILD: the child is gone now — a fresh wait must NOT find it ──
+    //     `has_matching_child` is the guard `sys_waitpid` consults before
+    //     parking; for an already-reaped specific pid it must be false so the
+    //     blocking path returns ECHILD instead of parking forever.
+    if crate::proc::has_matching_child(parent_pid, child_pid as i64) {
+        cleanup(parent_pid, child_pid);
+        test_fail!("waitid_wnowait",
+            "has_matching_child still true for reaped PID {} — wait would park forever",
+            child_pid);
+        return false;
+    }
+    // And a non-child pid must likewise be unmatched (immediate ECHILD).
+    if crate::proc::has_matching_child(parent_pid, (child_pid + 9999) as i64) {
+        cleanup(parent_pid, child_pid);
+        test_fail!("waitid_wnowait", "has_matching_child true for a non-child pid");
+        return false;
+    }
+    test_println!("  no matching child for reaped/non-child pid → ECHILD path ✓");
+
+    // ── 4. Cleanup (child already reaped; remove the synthetic parent) ────
+    { let mut procs = PROCESS_TABLE.lock(); procs.retain(|p| p.pid != parent_pid); }
+    { let mut threads = THREAD_TABLE.lock(); threads.retain(|t| t.pid != parent_pid); }
+    crate::proc::proc_metrics::unregister(parent_pid);
+
+    test_pass!("waitid WNOWAIT peek + ECHILD-on-already-reaped (POSIX waitid(2))");
+    true
 }
 
 // ── Test 232: VFS write-path page-cache coherency (POSIX mmap+write) ──────

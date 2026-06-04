@@ -3964,6 +3964,46 @@ pub fn waitpid(parent_pid: Pid, wait_pid: i64) -> Option<(Pid, i32)> {
     Some((child_pid, exit_code))
 }
 
+/// Peek a reapable zombie child WITHOUT removing it from the process table.
+///
+/// Mirrors [`waitpid`]'s selection predicate but leaves the zombie in place so
+/// it remains waitable by a subsequent call.  This is the kernel side of
+/// `waitid(2)`'s `WNOWAIT` flag: "Leave the child in a waitable state; a later
+/// wait call can be used to again retrieve the child status information."
+/// (POSIX.1-2017 `waitid`, `man 2 waitid`).  Without it, a caller that peeks a
+/// child's exit status (WNOWAIT) and then issues a second `waitid` to actually
+/// collect it would find the child already gone on the second call.
+///
+/// Returns `Some((child_pid, exit_code))` for a matching zombie, else `None`.
+pub fn peek_zombie(parent_pid: Pid, wait_pid: i64) -> Option<(Pid, i32)> {
+    let procs = PROCESS_TABLE.lock();
+    procs.iter()
+        .find(|p| {
+            p.parent_pid == parent_pid
+                && p.state == ProcessState::Zombie
+                && (wait_pid < 0 || p.pid == wait_pid as u64)
+        })
+        .map(|p| (p.pid, p.exit_code))
+}
+
+/// True if `parent_pid` has at least one child — live OR zombie — matching the
+/// `wait_pid` selector (specific PID when `wait_pid >= 0`, any child when
+/// `wait_pid < 0`).
+///
+/// Used by the blocking `wait(2)` / `waitid(2)` path to honour POSIX: a wait
+/// for a process that is not (or is no longer) a child of the caller MUST fail
+/// immediately with `ECHILD` rather than block forever.  In particular, once a
+/// specific child has been reaped (removed from the table), a fresh
+/// `waitid(P_PID, that_pid)` has no matching child and must return `ECHILD` —
+/// it must not park on a wake that can never arrive.
+pub fn has_matching_child(parent_pid: Pid, wait_pid: i64) -> bool {
+    let procs = PROCESS_TABLE.lock();
+    procs.iter().any(|p| {
+        p.parent_pid == parent_pid
+            && (wait_pid < 0 || p.pid == wait_pid as u64)
+    })
+}
+
 /// Assign an access token to a process by PID.
 pub fn assign_token(pid: u64, token_id: u64) {
     let mut procs = PROCESS_TABLE.lock();
