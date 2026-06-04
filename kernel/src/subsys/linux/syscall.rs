@@ -949,7 +949,13 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         let kdepth = if kstack_base > 0 {
             kstack_base.wrapping_add(kstack_size).wrapping_sub(rsp_live)
         } else { 0 };
-        crate::serial_println!(
+        // Firehose: one ~150-byte line per syscall.  Route through the
+        // near-zero-overhead guest-RAM log ring (drivers::log_ring) instead of
+        // the per-byte COM1 16550 PIO path — under KVM the latter is ~one
+        // VM-exit per byte (Intel SDM Vol. 3C §25.1.3), which dominates a
+        // high-syscall-rate boot.  `serial_fast_println!` falls back to COM1
+        // when the ring sink is disabled, so the trace is never lost.
+        crate::serial_fast_println!(
             "[SC] pid={} tid={} nr={} rip={:#x} cr={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x} a6={:#x} ksp={:#x} kdepth={:#x}",
             pid_now,
             tid_now,
@@ -1168,8 +1174,10 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     // Emitted AFTER the handler returns but BEFORE the caller writes RAX
     // back to the user frame, so the trace reflects the actual syscall
     // result the process will observe.
+    // Firehose return-side line — same per-syscall cadence as `[SC]`; route
+    // through the cheap guest-RAM ring (see the `[SC]` emit site above).
     #[cfg(feature = "syscall-trace")]
-    crate::serial_println!(
+    crate::serial_fast_println!(
         "[SC-RET] pid={} tid={} nr={} ret={:#x}",
         crate::proc::current_pid_lockless(),
         crate::proc::current_tid(),

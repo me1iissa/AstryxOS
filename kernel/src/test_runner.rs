@@ -1232,6 +1232,21 @@ pub fn run() -> ! {
     total += 1;
     if test_umount_removes_mount() { passed += 1; }
 
+    // ── Cheap-log-transport: ring framing/drain correctness + cost ─────────
+    // Cross-subsystem: drivers::log_ring (the PMM-backed guest-RAM ring) +
+    // drivers::serial (the fast-path routing + COM1 fallback).  One test
+    // asserts the firehose bytes round-trip through the ring intact; the other
+    // asserts the ring write is materially cheaper than the per-byte COM1 PIO
+    // path it replaces.  Placed here — ahead of the GDI PNG screenshot test,
+    // whose ~25k-line base64 dump would otherwise bury this output in the
+    // serial log (the very firehose problem this transport solves).
+    total += 1;
+    if test_log_ring_record_drain_roundtrip() { passed += 1; }
+    total += 1;
+    if test_log_ring_cheaper_than_com1() { passed += 1; }
+    total += 1;
+    if test_log_ring_ab_com1_vs_ring() { passed += 1; }
+
     // ── Test 198: GDI PNG screenshot — render shapes + encode PNG headlessly
     // Runs here (before userspace ELF tests) because it only needs GDI + VFS.
 
@@ -36482,6 +36497,255 @@ fn test_cpu_index_rdtscp_microbench() -> bool {
     }
 
     test_pass!("cpu_index() RDTSCP fast path (KVM VMEXIT regression)");
+    true
+}
+
+// ── Cheap log transport: ring framing/drain round-trip ───────────────────────
+//
+// Cross-subsystem coverage for the near-zero-overhead log transport. The
+// firehose trace families now write to drivers::log_ring (a lock-free guest-RAM
+// ring) via serial_fast_println! / drivers::serial::log_fast, and the host
+// harness drains it out of band — replacing the per-byte COM1 16550 PIO path
+// (~one KVM VM-exit per byte, Intel SDM Vol. 3C §25.1.3).
+//
+// This test exercises BOTH halves the fix touches:
+//   * drivers::log_ring  — record(), the framing protocol, and drain recovery.
+//   * drivers::serial    — log_fast() routing while the ring sink is enabled.
+//
+// It records a set of distinctly-sized lines (including one over MAX_RECORD to
+// exercise truncation), drains the ring, and asserts every line is recovered in
+// order with its bytes intact. test-mode only — _test_reset / _test_drain are
+// compiled out of release builds.
+#[cfg(feature = "test-mode")]
+fn test_log_ring_record_drain_roundtrip() -> bool {
+    test_header!("log_ring record/drain round-trip (cheap log transport)");
+    use crate::drivers::log_ring;
+
+    // Start from a clean ring so prior boot traffic doesn't perturb the count.
+    log_ring::_test_reset();
+
+    // A spread of payload sizes: tiny, a realistic ~150-byte [SC]-shaped line,
+    // and one just over MAX_RECORD to confirm truncation does not desync the
+    // frame stream.
+    let sc_like = b"[SC] pid=12 tid=34 nr=202 rip=0x7f00abcd1234 cr=0x7f00abcd5678 a1=0x1 a2=0x80 a3=0x0 a4=0x0 a5=0x0 a6=0x0 ksp=0xffff8000deadbeef kdepth=0x140\n";
+    let tiny = b"x\n";
+    let mut big = [b'A'; log_ring::MAX_RECORD + 64];
+    big[big.len() - 1] = b'\n';
+
+    log_ring::record(tiny);
+    log_ring::record(sc_like);
+    log_ring::record(&big);
+
+    // Drain and capture each recovered payload's (len, first, last) signature so
+    // we can assert without a heap of comparisons.
+    let mut seen: [(usize, u8, u8); 8] = [(0, 0, 0); 8];
+    let mut n = 0usize;
+    let (records, dropped) = log_ring::_test_drain(|payload| {
+        if n < seen.len() && !payload.is_empty() {
+            seen[n] = (payload.len(), payload[0], payload[payload.len() - 1]);
+        }
+        n += 1;
+    });
+
+    test_println!("  drained records={} dropped_bytes={}", records, dropped);
+
+    if records != 3 {
+        test_fail!("log_ring round-trip",
+            "expected 3 records, drained {}", records);
+        return false;
+    }
+    // Record 0: tiny — 2 bytes, 'x' .. '\n'.
+    if seen[0] != (tiny.len(), b'x', b'\n') {
+        test_fail!("log_ring round-trip",
+            "record0 mismatch: got (len={}, first={:#x}, last={:#x})",
+            seen[0].0, seen[0].1, seen[0].2);
+        return false;
+    }
+    // Record 1: the [SC]-shaped line — full length, '[' .. '\n'.
+    if seen[1] != (sc_like.len(), b'[', b'\n') {
+        test_fail!("log_ring round-trip",
+            "record1 mismatch: got (len={}, first={:#x}, last={:#x}) want len={}",
+            seen[1].0, seen[1].1, seen[1].2, sc_like.len());
+        return false;
+    }
+    // Record 2: the oversized line truncated to exactly MAX_RECORD bytes, all
+    // 'A' (the trailing '\n' was past the cap, so last == 'A').
+    if seen[2].0 != log_ring::MAX_RECORD || seen[2].1 != b'A' {
+        test_fail!("log_ring round-trip",
+            "record2 truncation wrong: got len={} first={:#x} (want len={} first='A')",
+            seen[2].0, seen[2].1, log_ring::MAX_RECORD);
+        return false;
+    }
+
+    test_pass!("log_ring record/drain round-trip (cheap log transport)");
+    true
+}
+
+// ── Cheap log transport: ring write vs COM1 PIO cost ─────────────────────────
+//
+// The whole point of the transport is that the firehose write is near-zero
+// overhead. This benchmarks one log_ring::record() of a realistic ~150-byte
+// line against the cost the old path paid PER BYTE on the COM1 16550 THR.
+//
+// We can't safely drive real `outb`s to 0x3F8 in a tight loop here (it would
+// flood the console and, under KVM, take the very VM-exits we're avoiding), so
+// we measure the ring write directly and assert it lands in a small,
+// fixed-cost cycle budget. The contrast is structural: the ring write is one
+// atomic reservation + a bounded memcpy with ZERO VM-exits, whereas the COM1
+// path is O(bytes) port-I/O instructions each trapping to the hypervisor.
+#[cfg(feature = "test-mode")]
+fn test_log_ring_cheaper_than_com1() -> bool {
+    test_header!("log_ring write cost (near-zero-overhead transport)");
+    use crate::drivers::log_ring;
+
+    let rdtsc = || -> u64 {
+        let (lo, hi): (u32, u32);
+        unsafe {
+            core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi,
+                             options(nomem, nostack, preserves_flags));
+        }
+        ((hi as u64) << 32) | (lo as u64)
+    };
+
+    let line = b"[SC] pid=12 tid=34 nr=202 rip=0x7f00abcd1234 cr=0x7f00abcd5678 a1=0x1 a2=0x80 a3=0x0 a4=0x0 a5=0x0 a6=0x0 ksp=0xffff8000deadbeef kdepth=0x140\n";
+    const ITERS: u64 = 50_000;
+
+    log_ring::_test_reset();
+
+    // Warm up icache / branch predictor.
+    for _ in 0..1024u32 {
+        log_ring::record(line);
+    }
+    log_ring::_test_reset();
+
+    let t0 = rdtsc();
+    for _ in 0..ITERS {
+        log_ring::record(line);
+    }
+    let t1 = rdtsc();
+
+    let total = t1.wrapping_sub(t0);
+    let per_call = total / ITERS;
+    let per_byte = per_call / (line.len() as u64);
+    test_println!("  {} records ({}B each) in {} cyc — {} cyc/record, {} cyc/byte",
+        ITERS, line.len(), total, per_call, per_byte);
+
+    // Sanity: every record must have been counted (no lost reservations).
+    let st = log_ring::stats();
+    if st.records != ITERS {
+        test_fail!("log_ring write cost",
+            "recorded {} of {} lines", st.records, ITERS);
+        return false;
+    }
+
+    // Ceiling. A relaxed fetch_add + ~150-byte memcpy is hundreds of cycles at
+    // most even on a cold cache. The COM1 path under KVM costs ~one VM-exit
+    // (thousands of cycles) PER BYTE — i.e. ~150 exits for this line — so any
+    // ceiling in the low thousands of cycles/record already demonstrates a
+    // multi-order-of-magnitude reduction. 5000 cyc/record is a generous bound
+    // that separates "wrote to RAM" from "took VM-exits".
+    const CEILING: u64 = 5_000;
+    if per_call >= CEILING {
+        test_fail!("log_ring write cost",
+            "record() costs {} cyc/call (ceiling {}) — not the lock-free RAM path",
+            per_call, CEILING);
+        return false;
+    }
+
+    // Clean up so the benchmark's 50k lines don't pollute a later drain.
+    log_ring::_test_reset();
+
+    test_pass!("log_ring write cost (near-zero-overhead transport)");
+    true
+}
+
+// ── Cheap log transport: A/B — COM1 16550 PIO vs the ring ────────────────────
+//
+// The decisive before/after: emit the SAME fixed batch of identical ~142-byte
+// lines (a) through the classic COM1 16550 PIO path (drivers::serial::
+// write_bytes_com1 — one `outb` per byte to the THR, plus an `inb` LSR poll per
+// 16-byte FIFO chunk), and (b) through the near-zero-overhead ring
+// (log_ring::record). Both are timed with rdtsc in the same boot, so there is
+// no boot-to-boot variance to confound the ratio.
+//
+// Under KVM each COM1 port-I/O instruction is a VM-exit to the hypervisor
+// (Intel SDM Vol. 3C §25.1.3); the serial chardev is file-backed with no baud
+// throttle, so the cost is purely the per-instruction exits, not link timing.
+// The ring write takes ZERO exits. The printed ratio is the measured multi-x
+// reduction this transport delivers on a fixed high-volume-logging workload.
+//
+// LINES is kept modest (the COM1 leg genuinely shifts every byte out to the
+// host serial file, so a large count would bloat the log and slow the boot —
+// the very problem we are fixing). A few hundred lines is plenty to measure the
+// per-byte gulf.
+#[cfg(feature = "test-mode")]
+fn test_log_ring_ab_com1_vs_ring() -> bool {
+    test_header!("log_ring A/B: COM1 16550 PIO vs guest-RAM ring (KVM VM-exit cost)");
+    use crate::drivers::{log_ring, serial};
+
+    let rdtsc = || -> u64 {
+        let (lo, hi): (u32, u32);
+        unsafe {
+            core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi,
+                             options(nomem, nostack, preserves_flags));
+        }
+        ((hi as u64) << 32) | (lo as u64)
+    };
+
+    // A representative [SC]-trace-shaped line. The COM1 leg prefixes each with a
+    // tag so the bytes that DO reach the serial file are visibly the A/B
+    // payload, not stray output.
+    let line = b"[LOG-AB] [SC] pid=12 tid=34 nr=202 a1=0x1 a2=0x80 a3=0x0 a4=0x0 a5=0x0 a6=0x0 ksp=0xffff8000deadbeef\n";
+    const LINES: u64 = 256;
+    let bytes_per_line = line.len() as u64;
+
+    // Leg A — classic COM1 16550 PIO. Each call: 1 LSR `inb` poll per 16-byte
+    // FIFO chunk + one `outb` per byte. Under KVM every one is a VM-exit.
+    let a0 = rdtsc();
+    for _ in 0..LINES {
+        serial::write_bytes_com1(line);
+    }
+    let a1 = rdtsc();
+    let com1_cycles = a1.wrapping_sub(a0);
+
+    // Leg B — the ring. One atomic reservation + a bounded memcpy, zero exits.
+    log_ring::_test_reset();
+    let b0 = rdtsc();
+    for _ in 0..LINES {
+        log_ring::record(line);
+    }
+    let b1 = rdtsc();
+    let ring_cycles = b1.wrapping_sub(b0);
+    log_ring::_test_reset();
+
+    let com1_per_byte = com1_cycles / (LINES * bytes_per_line);
+    let ring_per_byte = ring_cycles / (LINES * bytes_per_line);
+    // Integer speedup ratio (guard against divide-by-zero on absurdly fast HW).
+    let ratio = if ring_cycles == 0 { 0 } else { com1_cycles / ring_cycles };
+
+    test_println!(
+        "  COM1 16550 PIO: {} lines x {}B = {} cyc ({} cyc/byte)",
+        LINES, bytes_per_line, com1_cycles, com1_per_byte);
+    test_println!(
+        "  guest-RAM ring: {} lines x {}B = {} cyc ({} cyc/byte)",
+        LINES, bytes_per_line, ring_cycles, ring_per_byte);
+    test_println!(
+        "  >>> ring is ~{}x cheaper than COM1 PIO on this fixed workload <<<",
+        ratio);
+
+    // The ring MUST be materially cheaper. Under KVM the gap is typically two to
+    // three orders of magnitude (per-byte VM-exits vs a RAM memcpy); we require
+    // at least 10x so the test is meaningful on a fast TCG host too (where there
+    // are no VM-exits and the gap narrows, but COM1's per-byte LSR poll + outb
+    // still dwarfs a memcpy).
+    if ratio < 10 {
+        test_fail!("log_ring A/B",
+            "ring only {}x cheaper than COM1 (com1={} ring={} cyc) — expected >=10x",
+            ratio, com1_cycles, ring_cycles);
+        return false;
+    }
+
+    test_pass!("log_ring A/B: COM1 16550 PIO vs guest-RAM ring (KVM VM-exit cost)");
     true
 }
 

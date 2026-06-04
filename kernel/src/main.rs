@@ -1718,3 +1718,23 @@ macro_rules! serial_println {
     () => ($crate::serial_print!("\n"));
     ($($arg:tt)*) => ($crate::serial_print!("{}\n", format_args!($($arg)*)))
 }
+
+/// High-volume ("fast path") log line.
+///
+/// Routes through the near-zero-overhead guest-RAM log ring
+/// ([`crate::drivers::log_ring`]) instead of the per-byte COM1 16550 PIO path,
+/// when the ring sink is enabled (the default).  Use this — not
+/// `serial_println!` — for the firehose trace families (e.g. the `[SC]`
+/// syscall trace) so a Firefox boot does not pay tens of millions of VM-exits
+/// shipping the log out one `outb` at a time.  When the ring is disabled the
+/// macro falls back to the classic COM1 path so no output is ever lost.
+///
+/// Always appends a trailing newline so each record is a self-contained line in
+/// the drained output.
+#[macro_export]
+macro_rules! serial_fast_println {
+    () => ($crate::drivers::serial::log_fast(format_args!("\n")));
+    ($($arg:tt)*) => (
+        $crate::drivers::serial::log_fast(format_args!("{}\n", format_args!($($arg)*)))
+    )
+}
