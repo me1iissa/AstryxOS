@@ -1479,6 +1479,24 @@ fn do_io(req_type: u32, lba: u64, count: u32, buf: *mut u8) -> Result<(), BlockE
         // SAFETY: caller has already validated `buf` covers `count` sectors.
         let data_ptr = unsafe { buf.add(offset) };
 
+        // ── Per-request LBA trace (feature-gated; default builds emit nothing).
+        // One line per submitted virtio request — i.e. per batched descriptor
+        // chain — so the LBA/len reflects the actual on-disk request granularity
+        // (bounded by MAX_SECTORS) rather than the logical caller range. Drives
+        // the data.img block-map heatmap in scripts/serial-web.py. The aggregate
+        // disk=R../W.. bytes counter is the only other LBA-bearing signal, and
+        // it carries no sector address — hence this opt-in trace.
+        #[cfg(feature = "blk-trace")]
+        {
+            crate::serial_println!(
+                "[BLK] op={} lba={} len={} pid={}",
+                if req_type == VIRTIO_BLK_T_IN { 'R' } else { 'W' },
+                lba + sector_idx as u64,
+                batch,
+                crate::proc::current_pid_lockless(),
+            );
+        }
+
         // ── Acquire a completion slot (lock-free spin) ─────────────────
         //
         // Slot acquisition is independent of the device mutex — it just
