@@ -4206,8 +4206,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let id      = arg2 as i64;
             let infop   = arg3 as *mut u8; // siginfo_t*
             let options = arg4 as u32;
-            const WNOHANG:  u32 = 1;
-            const WEXITED:  u32 = 4;
+            // POSIX `waitid(2)` option bits (Linux UAPI <linux/wait.h>):
+            const WNOHANG:  u32 = 0x0000_0001;
+            const WEXITED:  u32 = 0x0000_0004;
+            const WNOWAIT:  u32 = 0x0100_0000;
             let pid: i64 = match idtype {
                 0 => -1,    // P_ALL  — any child
                 1 => id,    // P_PID  — specific pid
@@ -4215,7 +4217,13 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 _ => return -22, // EINVAL
             };
             if options & WEXITED == 0 { return -22; } // must request at least WEXITED
-            let ret = crate::syscall::sys_waitpid(pid, if options & WNOHANG != 0 { WNOHANG } else { 0 });
+            // Honour WNOWAIT: peek the child's status but leave it in a
+            // waitable state, so the canonical "waitid(WNOWAIT) then
+            // waitid(reap)" idiom (used by process launchers to observe a
+            // child's exit before collecting it) does not race-reap the child
+            // on the first call and hang the second against an already-gone pid.
+            let ret = crate::syscall::sys_waitpid_ex(
+                pid, options & WNOHANG != 0, options & WNOWAIT != 0);
             if ret > 0 && !infop.is_null() {
                 // Fill minimal siginfo_t: si_signo=SIGCHLD(17), si_errno=0,
                 // si_code=CLD_EXITED(1), si_pid=child_pid, si_status=exit_code
