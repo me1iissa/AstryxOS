@@ -51,7 +51,7 @@ static VMM_LOCK: Mutex<()> = Mutex::new(());
 /// matches `mm/pmm.rs::caller_rip` (KERNEL_VIRT_OFFSET .. +4 GiB).  Diag-
 /// nostic only, gated on the `firefox-test` feature so default builds are
 /// byte-identical.
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 #[inline(never)]
 fn ring_caller_rip() -> u64 {
     let rbp: u64;
@@ -554,7 +554,7 @@ pub fn map_page_in(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -
     // Best-effort pre-mutation snapshot: a concurrent CPU may race between
     // snapshot and the write below, so old_phys_for_ring can be stale.
     // Diagnostic-only.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     let old_phys_for_ring = read_pte(pml4_phys, virt_addr) & ADDR_MASK;
 
     unsafe {
@@ -580,7 +580,7 @@ pub fn map_page_in(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -
     // trick used by `pmm::caller_rip()` — see Intel SDM Vol. 3A §4.10.5 for
     // the underlying TLB-coherence invariant whose violation produces the
     // F3 fingerprint.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     crate::mm::w215_diag::pte_change_record(
         virt_addr,
         phys_addr & ADDR_MASK,
@@ -663,7 +663,7 @@ pub fn map_page_in_if_absent(
         *pt_ptr.add(pt_idx) = (phys_addr & ADDR_MASK) | flags | PAGE_PRESENT;
     }
 
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     crate::mm::w215_diag::pte_change_record(
         virt_addr,
         phys_addr & ADDR_MASK,
@@ -750,7 +750,7 @@ pub fn map_page_in_cow_if_unchanged(
         *pt_ptr.add(pt_idx) = (phys_addr & ADDR_MASK) | flags | PAGE_PRESENT;
     }
 
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     crate::mm::w215_diag::pte_change_record(
         virt_addr,
         phys_addr & ADDR_MASK,
@@ -783,7 +783,7 @@ pub fn unmap_page_in(pml4_phys: u64, virt_addr: u64) {
     // Best-effort pre-mutation snapshot: a concurrent CPU may race between
     // snapshot and the write below, so old_phys_for_ring can be stale.
     // Diagnostic-only.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     let old_phys_for_ring = read_pte(pml4_phys, virt_addr) & ADDR_MASK;
 
     unsafe {
@@ -799,7 +799,7 @@ pub fn unmap_page_in(pml4_phys: u64, virt_addr: u64) {
         *p2v(pd_entry & ADDR_MASK).add(pt_idx) = 0;
     }
 
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     crate::mm::w215_diag::pte_change_record(
         virt_addr,
         0,
@@ -989,7 +989,7 @@ pub fn write_pte(pml4_phys: u64, virt_addr: u64, pte: u64) {
     // Best-effort pre-mutation snapshot: a concurrent CPU may race between
     // snapshot and the write below, so old_phys_for_ring can be stale.
     // Diagnostic-only.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     let old_phys_for_ring = read_pte(pml4_phys, virt_addr) & ADDR_MASK;
 
     unsafe {
@@ -1005,7 +1005,7 @@ pub fn write_pte(pml4_phys: u64, virt_addr: u64, pte: u64) {
         *p2v(pd_entry & ADDR_MASK).add(pt_idx) = pte;
     }
 
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     crate::mm::w215_diag::pte_change_record(
         virt_addr,
         pte & ADDR_MASK,

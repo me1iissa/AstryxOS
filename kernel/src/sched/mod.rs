@@ -908,7 +908,7 @@ pub fn wait_dead_stacks_quiesced() {
 
 /// Production callers MUST use `pop_dead_stack`; the gate is load-bearing
 /// for closing the kstack-reuse-while-RSP-still-live race (PR #348).
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 pub fn pop_dead_stack_force() -> Option<(u64, u64)> {
     let mut cache = DEAD_STACK_CACHE.lock();
     if cache.is_empty() { return None; }

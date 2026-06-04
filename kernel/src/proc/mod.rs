@@ -500,10 +500,10 @@ pub static THREAD_TABLE: Mutex<Vec<Thread>> = Mutex::new(Vec::new());
 /// concurrent worker threads competed with the timer-ISR scheduler picker for
 /// `THREAD_TABLE`.  The bound exists to surface true deadlocks, not raw
 /// contention.
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 pub const THREAD_TABLE_DIAG_SPINS: u32 = 10_000_000;
 
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 #[inline]
 pub fn thread_table_try_lock_or_panic(
     site: &'static str,
@@ -1006,10 +1006,10 @@ pub fn current_pid_lockless() -> Pid {
 /// Get the currently running process's PID.
 pub fn current_pid() -> Pid {
     let tid = current_tid();
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     let threads = thread_table_try_lock_or_panic(
         "proc::current_pid", THREAD_TABLE_DIAG_SPINS);
-    #[cfg(not(feature = "firefox-test"))]
+    #[cfg(not(feature = "firefox-test-core"))]
     let threads = THREAD_TABLE.lock();
     threads.iter().find(|t| t.tid == tid).map(|t| t.pid).unwrap_or(0)
 }
@@ -1022,10 +1022,10 @@ pub fn current_pid() -> Pid {
 /// process), so a thread-directed signal is resolved to its owning process
 /// here and then dispatched via the same path as `tgkill(2)`.
 pub fn pid_for_tid(tid: Tid) -> Pid {
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     let threads = thread_table_try_lock_or_panic(
         "proc::pid_for_tid", THREAD_TABLE_DIAG_SPINS);
-    #[cfg(not(feature = "firefox-test"))]
+    #[cfg(not(feature = "firefox-test-core"))]
     let threads = THREAD_TABLE.lock();
     threads.iter().find(|t| t.tid == tid).map(|t| t.pid).unwrap_or(0)
 }
@@ -1075,10 +1075,10 @@ pub fn recover_current_tid() -> Tid {
     if tid != 0 { return tid; }
     let kstack_top = crate::syscall::get_current_kernel_rsp();
     if kstack_top == 0 { return 0; }
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     let threads = thread_table_try_lock_or_panic(
         "proc::recover_current_tid", THREAD_TABLE_DIAG_SPINS);
-    #[cfg(not(feature = "firefox-test"))]
+    #[cfg(not(feature = "firefox-test-core"))]
     let threads = THREAD_TABLE.lock();
     threads.iter()
         .find(|t| {
@@ -1526,7 +1526,7 @@ pub fn exit_thread(exit_code: i64) {
                 .map(|t| t.clear_child_tid)
                 .unwrap_or(0)
         };
-        #[cfg(feature = "firefox-test")]
+        #[cfg(feature = "firefox-test-core")]
         crate::serial_println!(
             "[CLEARTID] tid={} pid={} clear_addr={:#x}",
             tid, pid, clear_addr
@@ -1537,7 +1537,7 @@ pub fn exit_thread(exit_code: i64) {
                 let procs = PROCESS_TABLE.lock();
                 procs.iter().find(|p| p.pid == pid).map(|p| p.cr3).unwrap_or(0)
             };
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-core")]
             crate::serial_println!("[CLEARTID] tid={} cr3={:#x}", tid, cr3);
             if cr3 != 0 {
                 crate::syscall::write_u32_to_user_pub(cr3, clear_addr, 0);
@@ -1925,7 +1925,7 @@ pub fn exit_group(exit_code: i64) {
     // per-process syscall ring buffer to serial.  Both must run BEFORE any
     // teardown so the caller's CR3 and VMAs are still live.  Neither dump
     // takes locks that conflict with the teardown below.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         if pid >= 1 {
             if exit_code != 0 {
@@ -2576,7 +2576,7 @@ pub(crate) fn fire_cleartid_for_group(pid: Pid) {
     //     `futex_wake_for_exit` is a no-op if no waiter is parked on the
     //     uaddr.
     for (tid, uaddr) in &writers {
-        #[cfg(feature = "firefox-test")]
+        #[cfg(feature = "firefox-test-core")]
         crate::serial_println!(
             "[CLEARTID/group] pid={} tid={} clear_addr={:#x} cr3={:#x}",
             pid, tid, uaddr, cr3
