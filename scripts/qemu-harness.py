@@ -5128,6 +5128,41 @@ def _autopsy_run_step(gdb: GdbClient, regs: dict, step: dict,
                 "bytes": data.hex(),
             }
 
+        if kind == "mem_ptr_chain":
+            # Follow a pointer chain: start at `addr` (absolute hex/int) or
+            # (reg + offset), read 8 bytes as a little-endian pointer, then
+            # read `len` bytes at the pointed-to location.  `derefs` (default
+            # 1) repeats the 8-byte pointer-read that many times before the
+            # final byte read.  Used to deref a global that holds a C-string
+            # pointer (e.g. Mozilla's gMozCrashReason: read the global to get
+            # the message pointer, then read the string it points at).
+            length = min(int(step["len"]), per_step_cap)
+            derefs = int(step.get("derefs", 1))
+            if "addr" in step:
+                cur = int(step["addr"], 0) if isinstance(step["addr"], str) \
+                      else int(step["addr"])
+            else:
+                reg = step["reg"].lower()
+                if reg not in regs:
+                    return {"kind": kind, "error": f"unknown register {reg!r}"}
+                base = int(regs[reg], 16) if isinstance(regs[reg], str) \
+                       else int(regs[reg])
+                cur = (base + int(step.get("offset", 0))) & 0xFFFF_FFFF_FFFF_FFFF
+            chain = [hex(cur)]
+            try:
+                for _ in range(derefs):
+                    ptr_bytes = gdb.read_mem(cur, 8)
+                    cur = int.from_bytes(ptr_bytes, "little")
+                    chain.append(hex(cur))
+                data = gdb.read_mem(cur, length) if cur else b""
+                return {
+                    "kind": kind, "chain": chain, "final_addr": hex(cur),
+                    "len": len(data), "bytes": data.hex(),
+                    "ascii": data.split(b"\x00", 1)[0].decode("latin-1"),
+                }
+            except Exception as e:
+                return {"kind": kind, "chain": chain, "error": str(e)}
+
         if kind in ("mem_at", "mem_via_reg"):
             reg = step["reg"].lower()
             if reg not in regs:

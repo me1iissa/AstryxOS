@@ -275,3 +275,73 @@ presets:
         reg: rbp
         offset: -64
         len: 128
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # moz-crash-reason
+  # ───────────────────────────────────────────────────────────────────────────
+  # Read the Mozilla MOZ_CRASH / MOZ_RELEASE_ASSERT reason at the
+  # gMozCrashReason store site.  Break at the instruction that does
+  # `mov reason_ptr -> gMozCrashReason` (the `mov %rax,(%rcx)` just
+  # before the `movl $line,0x0` deliberate-null-write abort), at which
+  # point RAX holds the C-string pointer for the assertion message and
+  # RSI/R14 frequently carry the in-flight object/buffer being asserted.
+  # Single-deref RAX yields the human-readable crash reason — the thing
+  # the kernel-side SIGSEGV register snapshot cannot show.
+  moz-crash-reason:
+    description: |
+      Mozilla MOZ_CRASH reason capture.  Registers + the C-string at
+      [rax] (gMozCrashReason message) + windows at the in-flight object
+      pointers (rsi/r14/rbx) + a stack window for the caller frame.
+    steps:
+      - name: regs
+        kind: regs
+      - name: reason_string
+        kind: mem_at
+        reg: rax
+        offset: 0
+        len: 256
+      - name: rsi_window
+        kind: mem_at
+        reg: rsi
+        offset: 0
+        len: 128
+      - name: r14_window
+        kind: mem_at
+        reg: r14
+        offset: 0
+        len: 128
+      - name: rbx_window
+        kind: mem_at
+        reg: rbx
+        offset: 0
+        len: 64
+      - name: stack_top
+        kind: mem_via_reg
+        reg: rsp
+        offset: 0
+        len: 256
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # moz-crash-reason-from-isr
+  # ───────────────────────────────────────────────────────────────────────────
+  # Read Mozilla's gMozCrashReason at kernel SIGSEGV-delivery time.  Break at
+  # deliver_sigsegv_from_isr (the faulting process CR3 is active, so the
+  # crashing libxul globals are readable); RDI=cr2, RSI=error_code,
+  # RDX=*InterruptFrame.  The MOZ_CRASH macro stores the reason pointer into
+  # the gMozCrashReason GLOBAL *before* the deliberate null-write that faults,
+  # so by SIGSEGV time the global holds a valid message pointer.  The caller
+  # supplies the absolute gMozCrashReason VA (libxul_base + 0x7c05230) via a
+  # per-boot copy of this preset, or overrides reason_global.addr inline.
+  moz-crash-reason-from-isr:
+    description: |
+      gMozCrashReason capture at deliver_sigsegv_from_isr.  Registers
+      (RDI=cr2) + a pointer-chain deref of the gMozCrashReason global to
+      its C-string.  Set reason_global.addr to libxul_base+0x7c05230.
+    steps:
+      - name: regs
+        kind: regs
+      - name: reason_string
+        kind: mem_ptr_chain
+        addr: "0x7eff4e5f1230"
+        derefs: 2
+        len: 200
