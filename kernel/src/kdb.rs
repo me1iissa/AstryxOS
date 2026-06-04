@@ -350,6 +350,11 @@ pub fn dispatch(req: &str, out: &mut String) {
         "mem"            => op_mem(req, out),
         "read-file"      => op_read_file(req, out),
         "trace-status"   => op_trace_status(out),
+        // blk-trace: dump the virtio-blk LBA trace ring as JSON (out-of-band
+        // drain replacing the old per-op COM1 write). `blk-trace-flush` re-emits
+        // the classic `[BLK]` serial lines for the legacy heatmap ingestion.
+        "blk-trace"      => op_blk_trace(out),
+        "blk-trace-flush" => op_blk_trace_flush(out),
         "bell-stats"       => op_bell_stats(out),
         "cache-audit"      => op_cache_audit(out),
         "cache-aliasing"   => op_cache_aliasing(out),
@@ -965,6 +970,29 @@ fn op_trace_status(out: &mut String) {
     use core::fmt::Write;
     let _ = write!(out, r#"{{"syscall_trace":{},"pf_trace":{},"build":"kdb"}}"#,
                    cfg!(feature = "syscall-trace"), cfg!(feature = "pf-trace"));
+}
+
+// ── blk-trace ────────────────────────────────────────────────────────────────
+//
+// Drain the virtio-blk LBA trace ring (drivers/blk_trace) as JSON. This is the
+// out-of-band replacement for the old per-op `[BLK]` COM1 write — the kernel
+// now records each request into a lock-free ring (no VM-exit storm), and this
+// op serialises the most-recent window on demand. When the `blk-trace` feature
+// is off the ring is absent and the op reports `feature: off`.
+
+fn op_blk_trace(out: &mut String) {
+    crate::drivers::blk_trace::dump_json(out);
+}
+
+// blk-trace-flush: re-emit the classic `[BLK] op/lba/len/pid` serial lines in a
+// single controlled burst so the legacy data.img-heatmap serial-log ingestion
+// keeps working. Unlike the old design these lines are emitted on demand, not
+// once per disk op in the hot path. Returns the emitted line count as JSON.
+fn op_blk_trace_flush(out: &mut String) {
+    use core::fmt::Write;
+    let emitted = crate::drivers::blk_trace::flush_to_serial();
+    let _ = write!(out, r#"{{"ok":true,"emitted":{},"feature":"{}"}}"#,
+                   emitted, if cfg!(feature = "blk-trace") { "on" } else { "off" });
 }
 
 // ── bell-stats ───────────────────────────────────────────────────────────────
