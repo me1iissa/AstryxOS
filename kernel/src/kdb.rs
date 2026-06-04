@@ -355,6 +355,9 @@ pub fn dispatch(req: &str, out: &mut String) {
         // the classic `[BLK]` serial lines for the legacy heatmap ingestion.
         "blk-trace"      => op_blk_trace(out),
         "blk-trace-flush" => op_blk_trace_flush(out),
+        "log-ring"        => op_log_ring(out),
+        "log-ring-flush"  => op_log_ring_flush(out),
+        "log-ring-enable" => op_log_ring_enable(req, out),
         "bell-stats"       => op_bell_stats(out),
         "cache-audit"      => op_cache_audit(out),
         "cache-aliasing"   => op_cache_aliasing(out),
@@ -993,6 +996,51 @@ fn op_blk_trace_flush(out: &mut String) {
     let emitted = crate::drivers::blk_trace::flush_to_serial();
     let _ = write!(out, r#"{{"ok":true,"emitted":{},"feature":"{}"}}"#,
                    emitted, if cfg!(feature = "blk-trace") { "on" } else { "off" });
+}
+
+// ── log-ring ─────────────────────────────────────────────────────────────────
+//
+// Out-of-band drain of the near-zero-overhead guest-RAM log ring
+// (drivers::log_ring) — the cheap high-volume log transport that replaces the
+// per-byte COM1 16550 PIO firehose.  `log-ring` serialises the live ring as
+// JSON over this kdb channel (zero UART cost); `log-ring-flush` re-emits the
+// buffered lines to COM1 in one burst for serial-log consumers; the
+// `log-ring-enable` toggle forces the slow COM1 path on/off for an A/B
+// measurement.
+
+fn op_log_ring(out: &mut String) {
+    crate::drivers::log_ring::dump_json(out);
+}
+
+fn op_log_ring_flush(out: &mut String) {
+    use core::fmt::Write;
+    let emitted = crate::drivers::log_ring::flush_to_serial();
+    let _ = write!(out, r#"{{"ok":true,"emitted":{}}}"#, emitted);
+}
+
+fn op_log_ring_enable(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    // Optional JSON field `"on": "on"|"off"|"true"|"false"|"1"|"0"`.  Absent →
+    // report current state without changing it (query-only).  Mirrors the
+    // `futex-set-cluster-wake` request shape so the kdb protocol is consistent.
+    let arg = extract_field(req, "on").unwrap_or_default();
+    let prev = crate::drivers::log_ring::stats().enabled;
+    let now = match arg.as_str() {
+        "on" | "1" | "true" => {
+            crate::drivers::log_ring::set_enabled(true);
+            true
+        }
+        "off" | "0" | "false" => {
+            crate::drivers::log_ring::set_enabled(false);
+            false
+        }
+        _ => prev, // query-only (field absent or unrecognised)
+    };
+    let _ = write!(
+        out,
+        r#"{{"ok":true,"prev":{},"enabled":{}}}"#,
+        prev, now
+    );
 }
 
 // ── bell-stats ───────────────────────────────────────────────────────────────
