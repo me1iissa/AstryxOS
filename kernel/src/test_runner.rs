@@ -2126,6 +2126,8 @@ pub fn run() -> ! {
         if test_233_vfs_append_page_cache_coherency() { passed += 1; }
         total += 1;
         if test_234_cache_update_range_boundaries() { passed += 1; }
+        total += 1;
+        if test_240_vfs_truncate_page_cache_coherency() { passed += 1; }
     }
 
     // ── Test 235: ELF loader hardening (H4) ──────────────────────────────
@@ -40713,6 +40715,235 @@ fn test_234_cache_update_range_boundaries() -> bool {
     }
     let _ = crate::vfs::remove(path);
     test_pass!("mm::cache::update_range — page-boundary arithmetic");
+    true
+}
+
+// ── Test 240: VFS truncate / page-cache coherency ────────────────────────
+//
+// Regression guard for the truncate-path page-cache coherence bug: prior
+// to `mm::cache::truncate_range`, `truncate(2)` / `ftruncate(2)` resized
+// the backing-file data but never reconciled the page cache, so:
+//
+//   * GROW left a stale (previous-tenant) frame in the extended region —
+//     a MAP_SHARED reader / cached read saw garbage instead of zeros,
+//     violating POSIX ftruncate(2): "the extended area shall appear as if
+//     it were zero-filled."  (This is exactly the blank/garbage shared
+//     surface that a memfd + ftruncate consumer would observe.)
+//   * SHRINK left the discarded tail's frames in the cache, so a re-grow
+//     or re-fault resurrected stale bytes.
+//
+// The test injects cache pages directly (as the demand-fault handler
+// does: alloc PMM frame → fill → `cache::insert`), then exercises
+// `vfs::truncate_path` and asserts the cache cohort is reconciled:
+//   (a) GROW: the old-EOF boundary page's tail is zeroed in place, and
+//       pages beyond old EOF are evicted (lookup → None) so a re-fault
+//       installs a zero-filled frame.
+//   (b) SHRINK: pages beyond the new EOF are evicted and the new-EOF
+//       boundary page's tail is zeroed in place.
+//   (c) regression: a subsequent write still propagates through
+//       `update_range` (coherence is reconciled, not blanket-disabled).
+//
+// Uses `/tmp` (tmpfs/ramfs — the memfd backend) so the injected cache
+// entries map to a real (mount, inode).
+//
+// References:
+//   - IEEE Std 1003.1-2017 ftruncate(2) / truncate(2): extension reads as
+//     zero; the file's bytes are otherwise unchanged.
+//   - IEEE Std 1003.1-2017 mmap(2): MAP_SHARED visibility of file changes.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_240_vfs_truncate_page_cache_coherency() -> bool {
+    test_header!("VFS truncate / page-cache coherency (POSIX ftruncate zero-fill)");
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    const PAGE: usize = 4096;
+
+    let path = "/tmp/test240_trunc_coh.bin";
+    let _ = crate::vfs::remove(path);
+    if let Err(e) = crate::vfs::create_file(path) {
+        test_fail!("test240", "create_file({}) failed: {:?}", path, e);
+        return false;
+    }
+
+    // Initial content: two full pages of a recognizable pattern.  Page 0 =
+    // 'A', page 1 = 'B'.  File size = 8192.
+    let mut initial = alloc::vec![b'A'; 2 * PAGE];
+    for b in initial[PAGE..].iter_mut() { *b = b'B'; }
+    if let Err(e) = crate::vfs::write_file(path, &initial) {
+        test_fail!("test240", "initial write_file failed: {:?}", e);
+        let _ = crate::vfs::remove(path);
+        return false;
+    }
+    test_println!("  initial write 8192B (page0='A', page1='B') ✓");
+
+    let (mount_idx, inode) = match crate::vfs::resolve_path(path) {
+        Ok(r) => r,
+        Err(e) => {
+            test_fail!("test240", "resolve_path failed: {:?}", e);
+            let _ = crate::vfs::remove(path);
+            return false;
+        }
+    };
+
+    // Helper: inject a cache page filled with `fill` at `page_off`,
+    // simulating a demand-paged mmap frame.  Returns the phys, or None on
+    // OOM (caller fails the test).
+    let inject = |page_off: u64, fill: u8| -> Option<u64> {
+        let phys = crate::mm::pmm::alloc_page()?;
+        let va = (PHYS_OFF + phys) as *mut u8;
+        unsafe { core::ptr::write_bytes(va, fill, PAGE); }
+        crate::mm::cache::insert(mount_idx, inode, page_off, phys);
+        Some(phys)
+    };
+
+    // Inject the two file pages, plus a third "stale tenant" page at
+    // offset 8192 holding 'Z' — this simulates a frame that some prior
+    // mapping faulted in past the current EOF (or a recycled tenant).  It
+    // must NOT survive once a grow makes [8192,12288) part of the file as
+    // zero-filled, nor a shrink that drops it.
+    let p0 = match inject(0, b'A') {
+        Some(p) => p, None => { test_fail!("test240","alloc p0"); let _=crate::vfs::remove(path); return false; }
+    };
+    let p1 = match inject(PAGE as u64, b'B') {
+        Some(p) => p, None => { test_fail!("test240","alloc p1"); let _=crate::vfs::remove(path); return false; }
+    };
+    let p2 = match inject(2 * PAGE as u64, b'Z') {
+        Some(p) => p, None => { test_fail!("test240","alloc p2"); let _=crate::vfs::remove(path); return false; }
+    };
+    let _ = (p0, p1, p2);
+    test_println!("  injected cache pages at off 0,4096,8192 (A,B,Z) ✓");
+
+    // ── (a) GROW to a non-page-aligned size that lands inside page 1 ──────
+    // New size 4096+100 = 4196 means: file = page0 (full 'A') + first 100
+    // bytes of page1.  Bytes [4196, EOF) of the file are now zero per
+    // ftruncate(2).  But our injected page1 frame still holds 'B'; the
+    // boundary page (4096) tail [100, 4096) must be zeroed in place, and
+    // the stale page2 (8192, 'Z') must be evicted (it is past the new EOF).
+    //
+    // NOTE: this is a SHRINK relative to the 8192 initial size for the
+    // upper pages but the partial-page semantics are identical — boundary
+    // = min(old,new) = 4196.
+    let grow_target: u64 = PAGE as u64 + 100;
+    if let Err(e) = crate::vfs::truncate_path(path, grow_target) {
+        test_fail!("test240", "truncate to {} failed: {:?}", grow_target, e);
+        let _ = crate::mm::cache::evict(mount_idx, inode, 0);
+        let _ = crate::vfs::remove(path);
+        return false;
+    }
+    // Boundary page (4096) must still be cached, with [0,100) = 'B' and
+    // [100,4096) = 0.
+    match crate::mm::cache::lookup(mount_idx, inode, PAGE as u64) {
+        Some(ph) => {
+            let va = (PHYS_OFF + ph) as *const u8;
+            let head = unsafe { core::ptr::read_volatile(va) };
+            let tail99 = unsafe { core::ptr::read_volatile(va.add(99)) };
+            let tail100 = unsafe { core::ptr::read_volatile(va.add(100)) };
+            let tail_end = unsafe { core::ptr::read_volatile(va.add(PAGE - 1)) };
+            if head != b'B' || tail99 != b'B' || tail100 != 0 || tail_end != 0 {
+                test_fail!("test240",
+                    "boundary page after trunc: [0]={:#x} [99]={:#x} [100]={:#x} [4095]={:#x} \
+                     (expected 0x42 0x42 0x00 0x00)", head, tail99, tail100, tail_end);
+                let _ = crate::mm::cache::evict(mount_idx, inode, 0);
+                let _ = crate::mm::cache::evict(mount_idx, inode, PAGE as u64);
+                let _ = crate::vfs::remove(path);
+                return false;
+            }
+        }
+        None => {
+            test_fail!("test240", "boundary page (4096) evicted — partial page must survive zeroed");
+            let _ = crate::vfs::remove(path);
+            return false;
+        }
+    }
+    // The stale page past the new EOF (8192) MUST be gone.
+    if crate::mm::cache::lookup(mount_idx, inode, 2 * PAGE as u64).is_some() {
+        test_fail!("test240", "stale page at 8192 ('Z') not evicted after truncate to {}", grow_target);
+        let _ = crate::vfs::remove(path);
+        return false;
+    }
+    test_println!("  truncate→4196: boundary[100..]=0, page@8192 evicted ✓");
+
+    // Now GROW past the data: ftruncate to 3 pages (12288).  The FS data
+    // (ramfs Vec) zero-extends; the extension MUST read as zero.  Re-fault
+    // a page at offset 8192 by reading through the FS (as the demand-fault
+    // handler does) and assert it is all-zero — proving the grow region is
+    // not resurrecting the old 'Z'/'B' bytes.
+    if let Err(e) = crate::vfs::truncate_path(path, 3 * PAGE as u64) {
+        test_fail!("test240", "grow truncate to 12288 failed: {:?}", e);
+        let _ = crate::vfs::remove(path);
+        return false;
+    }
+    {
+        let fs = match crate::vfs::fs_at(mount_idx) { Some(f) => f.0, None => {
+            test_fail!("test240","fs_at"); let _=crate::vfs::remove(path); return false; } };
+        let mut buf = alloc::vec![0xCCu8; PAGE];
+        match fs.read(inode, 2 * PAGE as u64, &mut buf) {
+            Ok(n) => {
+                // ramfs zero-extends: the grown page reads as n bytes of zero.
+                if !buf[..n].iter().all(|&b| b == 0) {
+                    test_fail!("test240", "grown region [8192,12288) not zero-filled (n={})", n);
+                    let _ = crate::vfs::remove(path);
+                    return false;
+                }
+            }
+            Err(e) => { test_fail!("test240","read grown region: {:?}", e); let _=crate::vfs::remove(path); return false; }
+        }
+    }
+    test_println!("  grow→12288: extension reads ZERO via FS ✓");
+
+    // ── (b) SHRINK to 0 then verify a re-grow reads zero ──────────────────
+    // Re-inject a tenant page at offset 0 holding 'Q', then truncate to 0.
+    // The page must be evicted (boundary 0 is page-aligned → no partial
+    // page survives).
+    let _ = crate::mm::cache::evict(mount_idx, inode, 0);
+    let _ = crate::mm::cache::evict(mount_idx, inode, PAGE as u64);
+    let pq = match inject(0, b'Q') {
+        Some(p) => p, None => { test_fail!("test240","alloc pq"); let _=crate::vfs::remove(path); return false; }
+    };
+    let _ = pq;
+    if let Err(e) = crate::vfs::truncate_path(path, 0) {
+        test_fail!("test240", "shrink truncate to 0 failed: {:?}", e);
+        let _ = crate::vfs::remove(path);
+        return false;
+    }
+    if crate::mm::cache::lookup(mount_idx, inode, 0).is_some() {
+        test_fail!("test240", "page@0 ('Q') not evicted after truncate to 0");
+        let _ = crate::vfs::remove(path);
+        return false;
+    }
+    test_println!("  shrink→0: page@0 evicted (no stale tail) ✓");
+
+    // ── (c) regression: a normal write still propagates via update_range ──
+    let again: [u8; 64] = [b'W'; 64];
+    if let Err(e) = crate::vfs::write_file(path, &again) {
+        test_fail!("test240", "post-truncate write_file failed: {:?}", e);
+        let _ = crate::vfs::remove(path);
+        return false;
+    }
+    // Inject a cache page and confirm a subsequent overwrite reaches it
+    // (the update_range path is intact).
+    let pw = match inject(0, 0u8) {
+        Some(p) => p, None => { test_fail!("test240","alloc pw"); let _=crate::vfs::remove(path); return false; }
+    };
+    let again2: [u8; 64] = [b'X'; 64];
+    if let Err(e) = crate::vfs::write_file(path, &again2) {
+        test_fail!("test240", "second write_file failed: {:?}", e);
+        let _ = crate::mm::cache::evict(mount_idx, inode, 0);
+        let _ = crate::vfs::remove(path);
+        return false;
+    }
+    let pw_va = (PHYS_OFF + pw) as *const u8;
+    let w0 = unsafe { core::ptr::read_volatile(pw_va) };
+    if w0 != b'X' {
+        test_fail!("test240", "regression: cache[0]={:#x} after write (expected 'X'=0x58)", w0);
+        let _ = crate::mm::cache::evict(mount_idx, inode, 0);
+        let _ = crate::vfs::remove(path);
+        return false;
+    }
+    test_println!("  regression: write propagated to cache ('X') ✓");
+
+    // Cleanup.
+    let _ = crate::mm::cache::evict(mount_idx, inode, 0);
+    let _ = crate::vfs::remove(path);
+    test_pass!("VFS truncate / page-cache coherency (POSIX ftruncate zero-fill)");
     true
 }
 
