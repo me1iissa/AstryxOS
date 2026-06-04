@@ -693,6 +693,90 @@ pub fn map_page_in_if_absent(
     true
 }
 
+/// Install `phys_addr` at `virt_addr` **only if the current leaf PTE is present
+/// and references `expected_old_phys`**, performing the compare and the install
+/// as one indivisible operation under `VMM_LOCK`.
+///
+/// Returns `true` if this call installed the mapping, `false` if the leaf PTE no
+/// longer references `expected_old_phys` (a sibling CPU already replaced it — in
+/// which case nothing is written and the caller's frame is redundant and must be
+/// freed by the caller).
+///
+/// # Why this exists
+///
+/// The copy-on-write present+write fault arm cannot use
+/// [`map_page_in_if_absent`]: the page is already PRESENT (read-only, mapped to
+/// the shared pre-CoW frame), so an "install only if absent" check would treat
+/// every CoW fault as a loser and never install the private copy.  What the CoW
+/// arm needs is a compare-and-swap on the *expected old frame*: the first
+/// sibling sees the PTE still referencing the shared frame and swaps in its
+/// private copy; a second sibling that took the same CoW fault concurrently sees
+/// the PTE already referencing the winner's private frame (≠ `expected_old_phys`)
+/// and backs out.  Without this, two siblings on one shared CR3 (CLONE_VM) each
+/// `map_page_in` their own private frame unconditionally; the loser overwrites
+/// the winner's leaf PTE with a DIFFERENT frame, the winner keeps reading its
+/// frame through its stale local TLB entry, and a store by one thread to a
+/// shared control word lands on one frame and is never observed by the thread
+/// reading the other — a silent cross-CPU store-visibility failure (one VA, two
+/// frames).  Per Intel SDM Vol. 3A §4.10.4, TLB invalidation is
+/// per-logical-processor; the install itself is serialised here, and the caller
+/// issues the cross-LP shootdown for the present→present frame change.
+pub fn map_page_in_cow_if_unchanged(
+    pml4_phys: u64,
+    virt_addr: u64,
+    expected_old_phys: u64,
+    phys_addr: u64,
+    flags: u64,
+) -> bool {
+    let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
+    let _mm_read = _mm_guard.as_ref().map(|s| s.read());
+    let _lock = VMM_LOCK.lock();
+
+    let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
+    let pt_idx = ((virt_addr >> 12) & 0x1FF) as usize;
+
+    unsafe {
+        let pdpt_phys = match get_or_create_entry(pml4_phys, pml4_idx, flags) {
+            Some(addr) => addr,
+            None => return false,
+        };
+        let pd_phys = match get_or_create_entry(pdpt_phys, pdpt_idx, flags) {
+            Some(addr) => addr,
+            None => return false,
+        };
+        let pt_phys = match get_or_create_entry(pd_phys, pd_idx, flags) {
+            Some(addr) => addr,
+            None => return false,
+        };
+
+        let pt_ptr = p2v(pt_phys);
+        // Compare-with-install: only swap in `phys_addr` if the leaf PTE is
+        // present and still references the expected shared frame.  A sibling
+        // CoW winner will have already replaced it with its own frame.
+        let existing = *pt_ptr.add(pt_idx);
+        if existing & PAGE_PRESENT == 0
+            || (existing & ADDR_MASK) != (expected_old_phys & ADDR_MASK)
+        {
+            return false;
+        }
+        *pt_ptr.add(pt_idx) = (phys_addr & ADDR_MASK) | flags | PAGE_PRESENT;
+    }
+
+    #[cfg(feature = "firefox-test")]
+    crate::mm::w215_diag::pte_change_record(
+        virt_addr,
+        phys_addr & ADDR_MASK,
+        expected_old_phys & ADDR_MASK,
+        crate::mm::w215_diag::PTE_KIND_WRITE,
+        ring_caller_rip(),
+        pml4_phys,
+    );
+
+    true
+}
+
 /// Unmap a virtual page in an arbitrary page table.
 ///
 /// See `map_page_in` for the W216 `mm_sem` read-lock invariant.
