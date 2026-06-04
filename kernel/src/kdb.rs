@@ -384,6 +384,10 @@ pub fn dispatch(req: &str, out: &mut String) {
         // net-ipver: read or toggle the runtime IPv4/IPv6 address-family
         // enable flags (net::ipver).  One-shot, structured JSON output.
         "net-ipver"     => op_net_ipver(req, out),
+        // net-rxstats: receive-path health — per-connection recv_next/seq
+        // cursors + e1000 RX-ring MPC/byte counts.  Used to confirm TCP/NIC
+        // packet loss (a stalled recv_next or a non-zero MPC).
+        "net-rxstats"   => op_net_rxstats(req, out),
         _ => {
             out.push_str(r#"{"error":"unknown op: "#);
             for c in op.chars().take(64) {
@@ -3577,6 +3581,66 @@ fn op_net_ipver(req: &str, out: &mut String) {
         if v4 { "true" } else { "false" },
         if v6 { "true" } else { "false" },
     );
+}
+
+// ── net-rxstats ───────────────────────────────────────────────────────────────
+//
+// One-shot receive-path health snapshot for confirming TCP/NIC packet loss.
+// Emits, for every connection in the TCP table, the 4-tuple + state + the
+// sequence cursors (recv_next / send_next / send_unack), the application
+// receive-queue depth, the peer window, and the retransmit-queue depth.  A
+// recv_next that stalls while the peer keeps retransmitting (retransmit_len
+// stays > 0 on the peer's side, observable as a non-advancing recv_next on
+// repeated polls) localizes a receive-side gap — the in-order-only accept
+// path refusing an out-of-order segment (RFC 9293 §3.10.7.4).
+//
+// Also emits the e1000 RX statistics: cumulative software frame/byte counts
+// delivered to the stack, plus the hardware Missed-Packets-Count (MPC) and
+// Receive-No-Buffers-Count (RNBC) deltas.  A non-zero MPC confirms the NIC
+// dropped inbound frames because the descriptor ring was full (ring overrun).
+//
+// Read repeatedly (e.g. once a second) to watch recv_next advance or stall.
+fn op_net_rxstats(_req: &str, out: &mut String) {
+    use core::fmt::Write;
+    out.push('{');
+
+    // e1000 RX statistics first.
+    let (rx_frames, rx_bytes, mpc, rnbc, ring) = crate::net::e1000::rx_stats();
+    let _ = write!(
+        out,
+        r#""e1000":{{"rx_frames":{},"rx_bytes":{},"mpc_delta":{},"rnbc_delta":{},"num_rx_desc":{}}},"#,
+        rx_frames, rx_bytes, mpc, rnbc, ring,
+    );
+
+    out.push_str(r#""conns":["#);
+    let snap = tcp::snapshot_connections();
+    let mut first = true;
+    for c in snap.iter() {
+        if !first { out.push(','); }
+        first = false;
+        let st = match c.state {
+            TcpState::Closed      => "Closed",
+            TcpState::Listen      => "Listen",
+            TcpState::SynSent     => "SynSent",
+            TcpState::SynReceived => "SynReceived",
+            TcpState::Established  => "Established",
+            TcpState::FinWait1    => "FinWait1",
+            TcpState::FinWait2    => "FinWait2",
+            TcpState::CloseWait   => "CloseWait",
+            TcpState::LastAck     => "LastAck",
+            TcpState::TimeWait    => "TimeWait",
+        };
+        let _ = write!(
+            out,
+            r#"{{"local_port":{},"remote_ip":"{}.{}.{}.{}","remote_port":{},"state":"{}","recv_next":{},"send_next":{},"send_unack":{},"recv_buf_len":{},"peer_window":{},"retransmit_len":{}}}"#,
+            c.local_port,
+            c.remote_ip[0], c.remote_ip[1], c.remote_ip[2], c.remote_ip[3],
+            c.remote_port, st,
+            c.recv_next, c.send_next, c.send_unack,
+            c.recv_buf_len, c.peer_window, c.retransmit_len,
+        );
+    }
+    out.push_str("]}");
 }
 
 // ── procmaps ──────────────────────────────────────────────────────────────────
