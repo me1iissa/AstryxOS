@@ -918,6 +918,59 @@ def run_kdb_read_png_check():
     print()
 
 
+def run_blk_trace_argv_check():
+    """
+    Tier 1.5 host-only check: blk-trace drain/flush CLI + `start --build-only`.
+
+    No QEMU launched (< 1s). Locks down the two additive harness surfaces from
+    the blk-trace KVM-cost mitigation so a future refactor cannot silently
+    regress them:
+
+      * `start --build-only` is an accepted flag (build-then-exit, no boot)
+      * `blk-trace drain <sid>` / `blk-trace flush <sid>` parse, and map to the
+        kdb ops `blk-trace` / `blk-trace-flush` via `_kdb_build_request`
+      * a bad blk-trace action is rejected
+    """
+    print("=== Tier 1.5: blk-trace CLI + start --build-only (host-only) ===")
+    print()
+
+    import importlib.util
+    h_path = Path(__file__).resolve().parent / "qemu-harness.py"
+    spec = importlib.util.spec_from_file_location("qemu_harness_smoke_blk", h_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    # ── start --build-only is parsed and lands on the dest attr ────────────────
+    p = mod.build_parser() if hasattr(mod, "build_parser") else None
+    if p is None:
+        # Fall back to invoking --help and grepping; the flag must be advertised.
+        _, raw, rc = _h("start", "--help")
+        check("start --build-only advertised in --help",
+              "--build-only" in raw, "flag missing from start --help")
+    else:
+        ns = p.parse_args(["start", "--features", "test-mode", "--build-only"])
+        check("start --build-only -> build_only=True",
+              getattr(ns, "build_only", False) is True, str(ns))
+
+    # ── blk-trace drain/flush map to the correct kdb ops ───────────────────────
+    req_drain = mod._kdb_build_request("blk-trace", [])
+    check("kdb blk-trace op request shape",
+          req_drain == {"op": "blk-trace"}, str(req_drain))
+    req_flush = mod._kdb_build_request("blk-trace-flush", [])
+    check("kdb blk-trace-flush op request shape",
+          req_flush == {"op": "blk-trace-flush"}, str(req_flush))
+
+    # ── blk-trace subcommand CLI parses drain/flush, rejects bad action ────────
+    _, raw, _ = _h("blk-trace", "--help")
+    check("blk-trace subcommand advertises drain/flush",
+          "drain" in raw and "flush" in raw, "drain/flush missing from help")
+    # argparse rejects an out-of-choices action with a non-zero exit.
+    _, _, rc_bad = _h("blk-trace", "bogus", "sid123")
+    check("blk-trace rejects unknown action",
+          rc_bad != 0, f"rc={rc_bad} (expected non-zero)")
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="AstryxOS qemu-harness smoke test")
@@ -950,6 +1003,7 @@ def main():
     run_snapgate_argv_check()
     run_read_ff_png_check()
     run_kdb_read_png_check()
+    run_blk_trace_argv_check()
 
     if args.staleness_only:
         # Early exit for CI cycles that just want the cheap host-only checks.

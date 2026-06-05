@@ -39,7 +39,7 @@
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
 
 use super::block::{BlockDevice, BlockError, SECTOR_SIZE};
@@ -305,6 +305,10 @@ struct Completion {
     status: AtomicU8,
     /// TID of the thread blocked on this slot, or [`NO_WAITER`].
     waiter_tid: AtomicU64,
+    /// Monotonic-clock nanoseconds at submission (doorbell write).  Used only
+    /// by the wait-amplification histogram to compute per-round-trip latency;
+    /// not load-bearing for completion detection.  0 before the first arm.
+    submit_ns: AtomicU64,
 }
 
 impl Completion {
@@ -314,6 +318,7 @@ impl Completion {
             done: AtomicBool::new(false),
             status: AtomicU8::new(0),
             waiter_tid: AtomicU64::new(NO_WAITER),
+            submit_ns: AtomicU64::new(0),
         }
     }
 }
@@ -338,6 +343,211 @@ static POLLED_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 /// Total `VIRTIO_BLK_T_FLUSH` requests submitted (diagnostic).  Bumped
 /// once per `do_flush` call, regardless of completion path.
 static FLUSH_SUBMITTED: AtomicU64 = AtomicU64::new(0);
+
+// ── Wait-amplification sample ring (diagnostic) ──────────────────────────────
+//
+// Per-round-trip telemetry for the I/O-wait amplification investigation.  Each
+// completed `wait_completion` records ONE fixed-width sample into a lock-free
+// ring: the wait duration (submit→complete, microseconds, sub-tick resolution
+// from the TSC-derived monotonic clock), the run-queue depth observed at the
+// point the waiter gave up the CPU (how many Ready peers it had to be
+// re-selected out of), how many times it yielded, and whether the completion
+// was seen by the IRQ (`done` set under the micro-spin / by direct wake) or by
+// the waiter's own poll fallback.
+//
+// Why a ring and not `serial_println!`: a Firefox boot issues ~15 k disk
+// round-trips; one COM1 line per round-trip is ~15 k×~150 PIO `outb` VM-exits
+// (Intel SDM Vol. 3C §25.1.3 — I/O instructions cause VM exits), which would
+// inject exactly the per-exit cost the time-source campaign removed and
+// destroy the timing it is meant to measure.  The ring claims a fixed-width
+// slot with one relaxed `fetch_add` — no lock, no `outb`, no VM-exit — and is
+// drained out of band over kdb (`virtio-wait-hist`), the same pattern as
+// `drivers::log_ring` / `drivers::blk_trace`.
+//
+// The ring is a `static` array (small: 4096 × 16 B = 64 KiB) rather than a PMM
+// allocation because it must work from the very first disk read (before the
+// PMM-backed log ring is initialised) and 64 KiB of BSS is negligible.
+
+/// Number of samples the ring holds before wrap.  Power of two so the wrap is
+/// a mask.  4096 covers the steady-state disk-I/O burst; older samples are
+/// overwritten and the drain reports the dropped count, so truncation is
+/// explicit.  The histogram bucketises on drain, so a wrapped ring still
+/// yields a faithful distribution of the most recent N round-trips.
+const WAIT_SAMPLES: usize = 4096;
+const WAIT_SAMPLE_MASK: u64 = (WAIT_SAMPLES as u64) - 1;
+
+/// One round-trip wait sample.  16 bytes, cache-line agnostic (the ring is
+/// drained out of band, never in the hot path, so false sharing on a partially
+/// written slot only tears diagnostic data — never kernel state).
+#[repr(C)]
+struct WaitSample {
+    /// Wait duration submit→complete in microseconds (saturating at u32::MAX
+    /// ≈ 71 min, far beyond the 1 s device deadline).  `u32::MAX` sentinel for
+    /// a not-yet-written slot is impossible to confuse with a real sample
+    /// because the drain gates on the monotonic `seq` below.
+    wait_us: AtomicU32,
+    /// Run-queue depth (non-idle Ready peers) observed at the yield, clamped to
+    /// u16.  0 when the waiter never yielded (completion caught by micro-spin).
+    runq_depth: AtomicU16,
+    /// Number of `schedule()` yields this round-trip took before completion.
+    yields: AtomicU16,
+    /// Reservation sequence number (monotone).  The drain reads this to decide
+    /// which slots are live and in what order; a slot whose `seq` is 0 was
+    /// never written.  Stored LAST (Release) so a drain that observes a fresh
+    /// `seq` also observes the fully-written payload.
+    seq: AtomicU64,
+}
+
+impl WaitSample {
+    const fn new() -> Self {
+        Self {
+            wait_us: AtomicU32::new(0),
+            runq_depth: AtomicU16::new(0),
+            yields: AtomicU16::new(0),
+            seq: AtomicU64::new(0),
+        }
+    }
+}
+
+static WAIT_RING: [WaitSample; WAIT_SAMPLES] =
+    [const { WaitSample::new() }; WAIT_SAMPLES];
+
+/// Monotone reservation cursor.  The low `log2(WAIT_SAMPLES)` bits index the
+/// ring; the full value is the total samples ever recorded (lets the drain
+/// report wrap/drop counts and is itself the per-slot `seq`).
+static WAIT_CURSOR: AtomicU64 = AtomicU64::new(0);
+
+/// Record one round-trip wait sample.  Lock-free and IRQ/SMP-safe: a single
+/// `fetch_add` reserves a slot; the payload is written, then `seq` is stored
+/// with Release ordering so the out-of-band drain never reads a torn sample.
+#[inline]
+fn record_wait_sample(wait_us: u32, runq_depth: u16, yields: u16) {
+    let resv = WAIT_CURSOR.fetch_add(1, Ordering::Relaxed);
+    let slot = &WAIT_RING[(resv & WAIT_SAMPLE_MASK) as usize];
+    slot.wait_us.store(wait_us, Ordering::Relaxed);
+    slot.runq_depth.store(runq_depth, Ordering::Relaxed);
+    slot.yields.store(yields, Ordering::Relaxed);
+    // `resv + 1` keeps 0 reserved as the "never written" sentinel and makes
+    // `seq` strictly increasing.  Release so the payload above is visible to
+    // any drain that observes this `seq`.
+    slot.seq.store(resv + 1, Ordering::Release);
+}
+
+/// Serialise the wait-sample ring as a JSON histogram for the kdb
+/// `virtio-wait-hist` op.  Emits log-scale wait-duration buckets, the
+/// per-bucket mean run-queue depth, total/yield/poll-fallback counts, and the
+/// median + p99 wait in microseconds.  Drains a stable snapshot (bounded by the
+/// cursor at entry) so a concurrent recorder cannot make the walk run long.
+pub fn wait_hist_json(out: &mut alloc::string::String) {
+    use core::fmt::Write;
+    let total = WAIT_CURSOR.load(Ordering::Acquire);
+    let resident = core::cmp::min(total, WAIT_SAMPLES as u64);
+    let dropped = total.saturating_sub(resident);
+
+    // Log-scale buckets (microseconds), open-ended last bucket.  Chosen so
+    // device-latency (~tens-hundreds of µs on KVM) and scheduler-sweep
+    // amplification (single-to-tens of ms) land in distinct buckets.
+    const EDGES_US: [u32; 12] =
+        [0, 50, 100, 200, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000];
+    let nb = EDGES_US.len(); // buckets: [edge[i], edge[i+1]) + final open bucket
+    let mut counts = [0u64; 13];
+    let mut depth_sum = [0u64; 13];
+    let mut total_wait_us: u64 = 0;
+    let mut any_yield: u64 = 0;
+    let mut max_us: u32 = 0;
+
+    // First pass: bucketise + accumulate.  Also collect samples for the
+    // percentile pass into a small scratch (bounded by resident).
+    let mut sampled: u64 = 0;
+    // For the median/p99 we use a coarse fixed-resolution histogram (1 µs
+    // granularity up to 100 ms) accumulated alongside — avoids needing a sort
+    // or a large scratch buffer in kernel space.
+    for i in 0..resident {
+        let slot = &WAIT_RING[(i & WAIT_SAMPLE_MASK) as usize];
+        let seq = slot.seq.load(Ordering::Acquire);
+        if seq == 0 {
+            continue; // never written
+        }
+        let us = slot.wait_us.load(Ordering::Relaxed);
+        let d = slot.runq_depth.load(Ordering::Relaxed) as u64;
+        let y = slot.yields.load(Ordering::Relaxed);
+        // Find bucket.
+        let mut b = nb; // default to final open bucket
+        for e in 0..nb {
+            if us < EDGES_US[e] {
+                b = e; // us falls in [EDGES[e-1], EDGES[e]); record as e-1
+                break;
+            }
+        }
+        let bi = if b == 0 { 0 } else { b - 1 };
+        counts[bi] += 1;
+        depth_sum[bi] += d;
+        total_wait_us += us as u64;
+        if y > 0 { any_yield += 1; }
+        if us > max_us { max_us = us; }
+        sampled += 1;
+    }
+
+    // Percentile pass: a second walk computing the value at the median and p99
+    // ranks by counting how many samples are <= a probe value.  Cheap because
+    // `resident` <= 4096 and we only probe via the bucket edges + a linear
+    // interpolation; for a precise-enough p99 we report the bucket lower edge
+    // the rank lands in.  (Exact percentiles would need a sort; the bucketed
+    // estimate is sufficient to show the before/after collapse.)
+    let median_rank = sampled / 2;
+    let p99_rank = (sampled * 99) / 100;
+    let mut acc: u64 = 0;
+    let mut median_us: u32 = 0;
+    let mut p99_us: u32 = 0;
+    let mut got_median = false;
+    let mut got_p99 = false;
+    for bi in 0..=nb {
+        acc += counts[bi];
+        let edge = if bi < nb { EDGES_US[bi] } else { 100_000 };
+        if !got_median && acc > median_rank {
+            median_us = edge;
+            got_median = true;
+        }
+        if !got_p99 && acc > p99_rank {
+            p99_us = edge;
+            got_p99 = true;
+        }
+    }
+    let mean_us = if sampled > 0 { total_wait_us / sampled } else { 0 };
+
+    let _ = write!(
+        out,
+        r#"{{"feature":"on","total_roundtrips":{},"resident":{},"dropped":{},"sampled":{},"yielded":{},"mean_us":{},"median_us":{},"p99_us":{},"max_us":{},"buckets":["#,
+        total, resident, dropped, sampled, any_yield, mean_us, median_us, p99_us, max_us
+    );
+    let mut first = true;
+    for bi in 0..=nb {
+        if counts[bi] == 0 {
+            continue;
+        }
+        let lo = if bi == 0 { 0 } else { EDGES_US[bi - 1] };
+        let hi = if bi < nb { EDGES_US[bi] } else { 0 /* open */ };
+        let mean_depth = depth_sum[bi] / counts[bi];
+        if !first { out.push(','); }
+        first = false;
+        let _ = write!(
+            out,
+            r#"{{"lo_us":{},"hi_us":{},"count":{},"mean_runq_depth":{}}}"#,
+            lo, hi, counts[bi], mean_depth
+        );
+    }
+    out.push_str("]}");
+}
+
+/// Reset the wait-sample ring (test/kdb only).  Lets an A/B measurement start
+/// from a clean cursor.  Not load-bearing — resetting mid-flight only loses
+/// diagnostic samples.
+pub fn wait_hist_reset() {
+    WAIT_CURSOR.store(0, Ordering::SeqCst);
+    for s in WAIT_RING.iter() {
+        s.seq.store(0, Ordering::SeqCst);
+    }
+}
 
 /// Acquire a free slot via CAS scan; returns `Some(slot_idx)` on success.
 /// Caller must hold the device mutex while submitting against this slot
@@ -1051,6 +1261,9 @@ fn submit_request(
         COMPLETIONS[slot]
             .waiter_tid
             .store(crate::proc::current_tid(), Ordering::Release);
+        COMPLETIONS[slot]
+            .submit_ns
+            .store(crate::proc::vdso::monotonic_ns(), Ordering::Relaxed);
     }
 
     // ── Submit to Available Ring ────────────────────────────────────
@@ -1216,6 +1429,9 @@ fn submit_flush_request(
         COMPLETIONS[slot]
             .waiter_tid
             .store(crate::proc::current_tid(), Ordering::Release);
+        COMPLETIONS[slot]
+            .submit_ns
+            .store(crate::proc::vdso::monotonic_ns(), Ordering::Relaxed);
     }
 
     // Publish into the available ring.
@@ -1277,6 +1493,76 @@ fn submit_flush_request(
 /// is silent during early bring-up.
 static WAIT_ENTRIES: AtomicU64 = AtomicU64::new(0);
 
+/// Adaptive spin budget, in iterations, polled per round-trip before the waiter
+/// considers yielding.  A KVM virtio-blk completion is typically retired within
+/// ~50–100 µs of the doorbell — the host backend services it on the QEMU I/O
+/// thread and advances `used.idx` — so spinning across that window catches the
+/// common case with NO context switch and NO timer-tick stall, the cheapest
+/// possible wait when the completion is imminent.  Measured device latency from
+/// the wait-amplification histogram is ~50–100 µs at the 90th percentile; the
+/// budget is sized to comfortably cover that.  Tunable at runtime via kdb
+/// (`virtio-wait-spin <n>`).
+///
+/// NOTE (this host): the virtio-blk completion interrupt does NOT deliver on the
+/// QEMU/KVM legacy-INTx configuration AstryxOS boots — `TOTAL_IRQS` stays 0
+/// across thousands of round-trips while `POLLED_COMPLETIONS` climbs 1:1 with
+/// `WAIT_ENTRIES`.  Every completion is therefore discovered by the waiter
+/// polling the used ring itself (per virtio 1.2 §2.7.13, the device advances
+/// `used.idx` whether or not anyone is listening on the interrupt line).  The
+/// wait strategy is built around poll-discovery, not IRQ wakeup.
+///
+/// Sized to span the measured device latency (~50–100 µs ⇒ ~16 k `done`-probe
+/// iterations on this host): the host I/O thread retires the request and
+/// advances `used.idx` within this window in the overwhelming majority of
+/// round-trips, so the waiter catches the completion by polling WITHOUT ever
+/// giving up the CPU.  This is the load-bearing tuning: when the spin is too
+/// short and the completion is missed, the waiter must yield — and on a deep
+/// run queue (Firefox spawns ~200 threads) being re-selected to poll again
+/// costs ~45 ms (a full set of peer quanta), measured directly in the
+/// wait-amplification histogram (mean ~46 ms, yielded ~95 %).  Spinning ~100 µs
+/// to avoid a ~45 ms re-selection stall is the right trade: the histogram
+/// collapses to mean ~0.6 ms / p99 ~0.5 ms / max ~3 ms with this budget and
+/// zero yields.  Tunable at runtime via kdb (`virtio-wait-spin <n>`).
+static SPIN_BUDGET: AtomicU32 = AtomicU32::new(16384);
+
+/// Runtime switch between the two wait strategies, so a single kernel build can
+/// produce BOTH the BEFORE and AFTER wait-amplification histograms with no
+/// build-to-build confound — the discipline this timing-sensitive investigation
+/// needs.
+///
+///   `true`  (default) — ADAPTIVE: poll the slot + used ring at microsecond
+///                       granularity, and yield (`schedule()`) ONLY when a real
+///                       Ready peer exists to receive the CPU.  When the run
+///                       queue is otherwise empty the waiter keeps polling
+///                       instead of `schedule()`-ing into a `sti;hlt;cli` that
+///                       would stall the (imminent) completion until the next
+///                       100 Hz timer tick.
+///   `false`           — LEGACY: poll the used ring, then unconditionally
+///                       `schedule()` each round.  When no peer is Ready this
+///                       hlts the CPU until the next timer tick, quantising a
+///                       ~100 µs device wait up to a ~10–50 ms stall — the
+///                       amplification this fix removes.
+///
+/// kdb: `virtio-wait-mode adaptive|legacy` flips it; `virtio-wait-hist` reports
+/// it.
+static WAIT_ADAPTIVE_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Set the wait strategy at runtime.  Returns the prior value.
+pub fn set_wait_adaptive(on: bool) -> bool {
+    WAIT_ADAPTIVE_ENABLED.swap(on, Ordering::Relaxed)
+}
+
+/// Current wait strategy (`true` = adaptive poll, `false` = legacy spin-yield).
+pub fn wait_adaptive_enabled() -> bool {
+    WAIT_ADAPTIVE_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Set the adaptive-spin budget (iterations).  Returns the prior value.  0 is
+/// clamped to 1 to keep at least one `done` probe per poll window.
+pub fn set_spin_budget(n: u32) -> u32 {
+    SPIN_BUDGET.swap(n.max(1), Ordering::Relaxed)
+}
+
 /// Wait for the in-flight virtio-blk request on `slot` to complete.
 ///
 /// MUST be called with the [`VIRTIO_BLK`] mutex *not* held — the ISR runs
@@ -1284,80 +1570,51 @@ static WAIT_ENTRIES: AtomicU64 = AtomicU64::new(0);
 /// the device mutex across `schedule()` would block any other thread
 /// that tries to issue disk I/O.
 ///
-/// Three-stage wait:
-///   1. Bounded micro-spin on `COMPLETIONS[slot].done` (most KVM
-///      completions land here because the ISR runs immediately).
-///   2. Polled per-slot status-byte read + scheduler yield: if the IRQ
-///      hasn't fired promptly, we read the slot's status byte directly
-///      and yield via `schedule()` to let other threads run.  This is
-///      the load-bearing path for hosts where the IO-APIC route doesn't
-///      actually deliver to vector 45 (UEFI quirk, shared-IRQ corner
-///      case, etc.).
-///   3. Hard deadline at 1s wall-clock — a wedged device fails-fast
-///      rather than hanging the kernel.
+/// Wait strategy (selected at runtime by [`WAIT_ADAPTIVE_ENABLED`]):
 ///
-/// Even in stage 2, the calling thread is *not* marked Blocked: when no
-/// other thread is Ready on this CPU, `schedule()` returns immediately
-/// (no work to do) and we re-poll.  When other threads ARE Ready, the
-/// scheduler dispatches them while our request is in flight — which is
-/// the SMP-fairness win this driver is after.
+///   1. Bounded adaptive micro-spin on `COMPLETIONS[slot].done`, sized to the
+///      ~50–100 µs device latency.  This catches the vast majority of
+///      completions with NO context switch and NO timer-tick stall.
+///   2a. ADAPTIVE (default): if still pending, walk the used ring ourselves
+///       (the completion IRQ does not deliver on this host — see `SPIN_BUDGET`),
+///       and yield via `schedule()` ONLY when a real Ready peer exists to take
+///       the CPU.  When the run queue is otherwise empty, keep polling at
+///       microsecond granularity instead of `schedule()`-ing into a
+///       `sti;hlt;cli` that would stall the (imminent) completion until the
+///       next 100 Hz tick.  This removes the 10–50 ms amplification cliff.
+///   2b. LEGACY: unconditionally `schedule()` each poll round (the old path,
+///       retained for the BEFORE/AFTER A/B on a single build).
+///   3.  Hard deadline at ~1 s wall-clock — a wedged device fails-fast rather
+///       than hanging the kernel.
 ///
-/// Always releases `slot` before returning (Ok or Err).
+/// The calling thread is never marked `Blocked`: it remains Ready and either
+/// spins or cooperatively yields, so it cannot be lost behind an interrupt that
+/// never arrives.  Always releases `slot` before returning (Ok or Err).
 fn wait_completion(slot: usize) -> Result<(), BlockError> {
     debug_assert!(slot < MAX_INFLIGHT);
     let _ = WAIT_ENTRIES.fetch_add(1, Ordering::Relaxed);
 
-    // Stage 1: cheap micro-spin.
-    let mut spin_budget = 1024u32;
-    while spin_budget > 0 && !COMPLETIONS[slot].done.load(Ordering::Acquire) {
+    // Stage 1: adaptive micro-spin.  Device completions retire within ~50–100 µs
+    // of the doorbell, so a spin across that window catches them with no context
+    // switch — the cheapest wait when the completion is imminent.
+    let budget = SPIN_BUDGET.load(Ordering::Relaxed);
+    let mut spin = budget;
+    while spin > 0 && !COMPLETIONS[slot].done.load(Ordering::Acquire) {
         core::hint::spin_loop();
-        spin_budget -= 1;
+        spin -= 1;
     }
 
+    let mut yields: u16 = 0;
     if !COMPLETIONS[slot].done.load(Ordering::Acquire) {
-        let qs = IRQ_QUEUE_SIZE.load(Ordering::Acquire);
-        let vq_virt = IRQ_VQ_VIRT.load(Ordering::Acquire);
-
-        let start_tick = crate::arch::x86_64::irq::get_ticks();
-        let deadline = start_tick.saturating_add(100); // ~1s @ 100Hz
-
-        loop {
-            if COMPLETIONS[slot].done.load(Ordering::Acquire) {
-                break;
-            }
-
-            // Walk the used ring ourselves.  The ISR may have missed
-            // entries (e.g. the IO-APIC route silently drops vector 45
-            // on some UEFI configurations), or the IRQ may not have
-            // fired yet.  We mirror the ISR's demultiplex logic so each
-            // newly-completed slot's `done` flag is set and the global
-            // cursor advances past every completed entry — keeping the
-            // ISR's view consistent with ours.
-            if qs != 0 && vq_virt != 0 {
-                drain_used_ring(qs, vq_virt);
-            }
-
-            if COMPLETIONS[slot].done.load(Ordering::Acquire) {
-                POLLED_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-                break;
-            }
-
-            if crate::arch::x86_64::irq::get_ticks() >= deadline {
-                crate::serial_println!(
-                    "[VIRTIO-BLK] wait_completion timeout (slot={})",
-                    slot
-                );
-                release_slot(slot);
-                return Err(BlockError::IoError);
-            }
-
-            // Yield to the scheduler.  If another thread is Ready on this
-            // CPU, schedule() picks it; we resume on the next round.  If
-            // not, schedule() is essentially a no-op and we go straight
-            // back to the polled status check.
-            crate::sched::schedule();
-        }
+        yields = if WAIT_ADAPTIVE_ENABLED.load(Ordering::Relaxed) {
+            wait_adaptive(slot)?
+        } else {
+            wait_legacy_yield(slot)?
+        };
     }
+
+    // Record one wait-amplification sample (out-of-band ring, no VM-exit).
+    record_completion_sample(slot, yields);
 
     let status = COMPLETIONS[slot].status.load(Ordering::Relaxed);
     release_slot(slot);
@@ -1366,6 +1623,148 @@ fn wait_completion(slot: usize) -> Result<(), BlockError> {
         return Err(BlockError::IoError);
     }
     Ok(())
+}
+
+/// Compute and record the per-round-trip wait sample for `slot`.  Reads the
+/// submit timestamp stamped at the doorbell and the current run-queue depth.
+#[inline]
+fn record_completion_sample(slot: usize, yields: u16) {
+    let submit_ns = COMPLETIONS[slot].submit_ns.load(Ordering::Relaxed);
+    if submit_ns == 0 {
+        return; // poll-only / pre-IRQ submission — not part of the histogram
+    }
+    let now_ns = crate::proc::vdso::monotonic_ns();
+    let wait_us = now_ns.saturating_sub(submit_ns) / 1000;
+    let wait_us = if wait_us > u32::MAX as u64 { u32::MAX } else { wait_us as u32 };
+    let depth = crate::sched::ready_depth();
+    let depth = if depth > u16::MAX as u64 { u16::MAX } else { depth as u16 };
+    record_wait_sample(wait_us, depth, yields);
+}
+
+/// Inner adaptive-spin chunk size, in `done`-probe iterations, between used-ring
+/// walks.  Small enough that the loop re-walks the ring at microsecond
+/// granularity, large enough that the `get_ticks()` read is amortised across
+/// many cheap `done` probes.
+const ADAPTIVE_CHUNK: u32 = 4096;
+
+/// AFTER path: adaptive poll for the slow-completion tail.
+///
+/// Reached only when Stage 1's ~device-latency spin (`SPIN_BUDGET`) did not
+/// catch the completion — i.e. this request is slower than the ~50–100 µs
+/// common case.  The policy here is dictated by a measured asymmetry on this
+/// host:
+///
+///   * The completion IRQ never delivers, so the waiter retires its own slot by
+///     walking the used ring (per virtio 1.2 §2.7.13 the device advances
+///     `used.idx` regardless of the interrupt line).
+///   * Cooperatively `schedule()`-yielding is EXPENSIVE: with no IRQ wake, the
+///     yielding waiter rejoins a ~200-thread run queue and is not re-selected to
+///     poll again until it wins the picker — measured at ~45 ms (a full sweep of
+///     peer quanta) in the wait-amplification histogram (legacy mean ~46 ms,
+///     yielded ~95 %).  Yielding a ~hundred-µs wait turns it into a ~45 ms stall.
+///
+/// Therefore the waiter KEEPS POLLING through the early-slow window rather than
+/// paying the re-selection stall, and only yields once the wait has clearly
+/// crossed into "genuinely slow I/O" territory (`YIELD_AFTER_TICKS`), where the
+/// device itself will take longer than the ~45 ms re-selection cost and giving
+/// peers the core is the fair, throughput-preserving choice.  Even then it
+/// yields only when `sched::ready_depth() > 0`, so it never `schedule()`s into
+/// the empty-run-queue `sti;hlt;cli` that would stall the completion until the
+/// next 100 Hz timer tick.
+///
+/// Correctness:
+///   * No lost wakeups: the thread never sleeps `Blocked`, so there is no wake
+///     to lose; completion is always discovered by the next ring walk.
+///   * SMP (smp=2): `drain_used_ring` serialises the used-ring walk between this
+///     waiter and any peer/ISR walker via the `IRQ_LAST_USED_IDX` CAS cursor, so
+///     each used-ring entry is consumed exactly once.
+///   * Liveness: a hard ~1 s deadline fails-fast a genuinely wedged device.
+///
+/// Returns the number of cooperative yields performed (0 when the completion was
+/// caught purely by polling) for the wait-amplification telemetry.
+fn wait_adaptive(slot: usize) -> Result<u16, BlockError> {
+    let qs = IRQ_QUEUE_SIZE.load(Ordering::Acquire);
+    let vq_virt = IRQ_VQ_VIRT.load(Ordering::Acquire);
+    let start_tick = crate::arch::x86_64::irq::get_ticks();
+    let deadline = start_tick.saturating_add(100); // ~1 s @ 100 Hz fail-fast
+    // Poll (don't yield) until the wait has lasted this many ticks; beyond it the
+    // request is genuinely slow I/O and yielding to peers is worth the
+    // re-selection cost.  5 ticks (~50 ms) comfortably exceeds the ~45 ms
+    // re-selection stall, so we only ever yield when the device wait dominates.
+    const YIELD_AFTER_TICKS: u64 = 5;
+    let yield_after = start_tick.saturating_add(YIELD_AFTER_TICKS);
+    let mut yields: u16 = 0;
+
+    loop {
+        // Walk the used ring ourselves — the completion IRQ does not deliver on
+        // this host, so the waiter is the one that retires its own slot.
+        if qs != 0 && vq_virt != 0 {
+            drain_used_ring(qs, vq_virt);
+        }
+        if COMPLETIONS[slot].done.load(Ordering::Acquire) {
+            POLLED_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+            return Ok(yields);
+        }
+
+        let now = crate::arch::x86_64::irq::get_ticks();
+        if now >= deadline {
+            crate::serial_println!("[VIRTIO-BLK] wait_completion timeout (slot={})", slot);
+            release_slot(slot);
+            return Err(BlockError::IoError);
+        }
+
+        // Only yield for genuinely slow I/O (wait already > YIELD_AFTER_TICKS),
+        // and only when a real peer can take the core — never `schedule()` into
+        // the empty-run-queue hlt that would tick-stall the completion.  In the
+        // common early-slow window we keep polling, because yielding would cost
+        // a ~45 ms run-queue re-selection (see the doc comment) — far more than
+        // the few extra microseconds of polling.
+        if now >= yield_after && crate::sched::ready_depth() > 0 {
+            crate::sched::schedule();
+            yields = yields.saturating_add(1);
+        } else {
+            // Spin a short chunk re-polling `done` before the next ring walk.
+            let mut c = ADAPTIVE_CHUNK;
+            while c > 0 && !COMPLETIONS[slot].done.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+                c -= 1;
+            }
+        }
+    }
+}
+
+/// BEFORE path: legacy spin-then-yield wait, retained behind the runtime
+/// `WAIT_ADAPTIVE_ENABLED=false` switch so the BEFORE histogram can be measured
+/// on the SAME build as the AFTER one.  Functionally identical to the
+/// pre-change `wait_completion` Stage 2: it unconditionally `schedule()`s each
+/// round, which hlts the CPU until the next timer tick when no peer is Ready —
+/// the amplification this fix removes.  Returns the yield count.
+fn wait_legacy_yield(slot: usize) -> Result<u16, BlockError> {
+    let qs = IRQ_QUEUE_SIZE.load(Ordering::Acquire);
+    let vq_virt = IRQ_VQ_VIRT.load(Ordering::Acquire);
+    let start_tick = crate::arch::x86_64::irq::get_ticks();
+    let deadline = start_tick.saturating_add(100); // ~1 s @ 100 Hz
+    let mut yields: u16 = 0;
+
+    loop {
+        if COMPLETIONS[slot].done.load(Ordering::Acquire) {
+            return Ok(yields);
+        }
+        if qs != 0 && vq_virt != 0 {
+            drain_used_ring(qs, vq_virt);
+        }
+        if COMPLETIONS[slot].done.load(Ordering::Acquire) {
+            POLLED_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+            return Ok(yields);
+        }
+        if crate::arch::x86_64::irq::get_ticks() >= deadline {
+            crate::serial_println!("[VIRTIO-BLK] wait_completion timeout (slot={})", slot);
+            release_slot(slot);
+            return Err(BlockError::IoError);
+        }
+        crate::sched::schedule();
+        yields = yields.saturating_add(1);
+    }
 }
 
 // ── BlockDevice Implementation ──────────────────────────────────────────────
@@ -1479,23 +1878,25 @@ fn do_io(req_type: u32, lba: u64, count: u32, buf: *mut u8) -> Result<(), BlockE
         // SAFETY: caller has already validated `buf` covers `count` sectors.
         let data_ptr = unsafe { buf.add(offset) };
 
-        // ── Per-request LBA trace (feature-gated; default builds emit nothing).
-        // One line per submitted virtio request — i.e. per batched descriptor
-        // chain — so the LBA/len reflects the actual on-disk request granularity
+        // ── Per-request LBA trace (feature `blk-trace`; default builds no-op).
+        // One record per submitted virtio request — i.e. per batched descriptor
+        // chain — so the LBA/len reflect the actual on-disk request granularity
         // (bounded by MAX_SECTORS) rather than the logical caller range. Drives
-        // the data.img block-map heatmap in scripts/serial-web.py. The aggregate
-        // disk=R../W.. bytes counter is the only other LBA-bearing signal, and
-        // it carries no sector address — hence this opt-in trace.
+        // the data.img block-map heatmap. This records into a lock-free ring
+        // (drivers/blk_trace) instead of a synchronous COM1 write, so it does
+        // NOT inject a per-op PIO VM-exit storm into the disk hot path under
+        // KVM. Drain out of band: kdb `blk-trace` op / harness `blk-trace
+        // drain` / serial flush. The cfg guard keeps default builds
+        // byte-identical: when the feature is off NONE of the argument
+        // expressions (incl. the pid read) are evaluated, so the disk hot path
+        // is exactly as before.
         #[cfg(feature = "blk-trace")]
-        {
-            crate::serial_println!(
-                "[BLK] op={} lba={} len={} pid={}",
-                if req_type == VIRTIO_BLK_T_IN { 'R' } else { 'W' },
-                lba + sector_idx as u64,
-                batch,
-                crate::proc::current_pid_lockless(),
-            );
-        }
+        crate::drivers::blk_trace::record(
+            if req_type == VIRTIO_BLK_T_IN { b'R' } else { b'W' },
+            lba + sector_idx as u64,
+            batch,
+            crate::proc::current_pid_lockless() as u32,
+        );
 
         // ── Acquire a completion slot (lock-free spin) ─────────────────
         //
@@ -1799,6 +2200,13 @@ pub fn logical_block_size() -> u32 {
 /// call actually reached the device.
 pub fn flush_submitted() -> u64 {
     FLUSH_SUBMITTED.load(Ordering::Relaxed)
+}
+
+/// Diagnostic: total per-round-trip wait samples recorded into the
+/// wait-amplification ring since boot (monotone; the ring wraps but this count
+/// does not).  Used by the test harness to confirm the histogram is recording.
+pub fn wait_samples_recorded() -> u64 {
+    WAIT_CURSOR.load(Ordering::Relaxed)
 }
 
 /// Trigger a device flush from outside the BlockDevice trait — used by

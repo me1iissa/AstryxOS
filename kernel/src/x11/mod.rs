@@ -69,7 +69,7 @@ impl Client {
     }
     fn next_seq(&mut self) -> u16 { self.seq = self.seq.wrapping_add(1); self.seq }
     fn send(&self, data: &[u8])   {
-        #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
+        #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
         if data.len() >= 4 && data[0] == 1 {
             // Reply: log fd, seq, reply_length, total_bytes
             let seq = u16::from_le_bytes([data[2], data[3]]);
@@ -438,7 +438,7 @@ pub fn poll() {
       for (i, sl) in s.clients.iter().enumerate() {
           if let Some(c) = sl {
               let hd = unix::has_data(c.fd);
-              #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
+              #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
               if hd { crate::serial_println!("[X11POLL] svc_fd={} has_data=true avail={}", c.fd, unix::bytes_available(c.fd)); }
               if hd { pending[i] = c.fd; }
           }
@@ -454,7 +454,7 @@ fn service_fd(fd: u64) {
     let n = unix::read(fd, &mut buf);
     if n <= 0 { return; }
     let data = &buf[..n as usize];
-    #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
     crate::serial_println!("[X11SVC] fd={} read {} bytes", fd, n);
     let setup = {
         let s = SERVER.lock();
@@ -479,7 +479,7 @@ fn handle_setup(fd: u64, data: &[u8]) {
     if data.len() < 12       { send_fail(fd, b"truncated"); return; }
     if data[0] != 0x6C       { send_fail(fd, b"big-endian not supported"); return; }
     if r16(data,2) != 11     { send_fail(fd, b"unsupported protocol"); return; }
-    #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
     {
         let n_auth = r16(data, 6) as usize;
         let d_auth = r16(data, 8) as usize;
@@ -487,7 +487,7 @@ fn handle_setup(fd: u64, data: &[u8]) {
             data[0], r16(data,2), r16(data,4), n_auth, d_auth, data.len());
     }
     let reply = build_setup_ok();
-    #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
     {
         crate::serial_println!("[X11] setup_ok len={} hdr={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} additional_units={} n_screens={} n_formats={}",
             reply.len(), reply[0], reply[1], reply[2], reply[3], reply[4], reply[5], reply[6], reply[7],
@@ -496,7 +496,7 @@ fn handle_setup(fd: u64, data: &[u8]) {
             r32(&reply,12), r32(&reply,16), r16(&reply,24), r16(&reply,26));
     }
     let n_written = unix::write(fd, &reply);
-    #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
     crate::serial_println!("[X11] setup_ok written={}", n_written);
     let mut srv = SERVER.lock();
     for sl in srv.clients.iter_mut() {
@@ -539,7 +539,7 @@ fn build_setup_ok() -> [u8; 128] {
 fn handle_request(fd: u64, data: &[u8]) {
     if data.len() < 4 { return; }
     let opcode = data[0];
-    #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
     {
         static X11_REQ_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
         let n = X11_REQ_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -653,7 +653,7 @@ fn handle_request(fd: u64, data: &[u8]) {
         proto::OP_GET_MODIFIER_MAPPING  => op_get_modifier_mapping(fd, seq),
         proto::OP_NO_OPERATION          => {}
         _ => {
-            #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
+            #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
             crate::serial_println!("[X11] unknown opcode={} len={}", opcode, data.len());
             with_client(fd, |c| c.send_error(proto::ERR_REQUEST, 0, opcode));
         }
@@ -1073,7 +1073,7 @@ fn op_get_property(fd: u64, data: &[u8], seq: u16) {
     let rtype   = r32(data, 12);
     let offset  = r32(data, 16) as usize * 4;
     let req_len = r32(data, 20) as usize * 4;
-    #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
     crate::serial_println!("[X11GP] fd={} wid={} atom={} seq={}", fd, wid, atom, seq);
 
     // Root-window properties are stored in SERVER.root_properties, not per-client.
@@ -1097,7 +1097,7 @@ fn op_get_property(fd: u64, data: &[u8], seq: u16) {
         if atom == 0 {
             let mut b = [0u8;32]; b[0]=1; w16(&mut b,2,seq);
             let wr = unix::write(c.fd, &b);
-            #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
+            #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
             crate::serial_println!("[X11GP] atom=0 empty reply fd={} wr={}", c.fd, wr);
             return;
         }
@@ -1108,13 +1108,13 @@ fn op_get_property(fd: u64, data: &[u8], seq: u16) {
                 (p.type_, p.format, p.len, arr)
             })
         });
-        #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
+        #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
         crate::serial_println!("[X11GP] result={} wid={} atom={}", result.is_some(), wid, atom);
         match result {
             None => {
                 let mut b=[0u8;32]; b[0]=1; w16(&mut b,2,seq);
                 let wr = unix::write(c.fd, &b);
-                #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
+                #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
                 crate::serial_println!("[X11GP] none-reply fd={} seq={} wr={}", c.fd, seq, wr);
             }
             Some((type_,fmt,total,raw)) => {
@@ -2485,7 +2485,7 @@ fn op_damage(fd: u64, data: &[u8], seq: u16) {
 fn op_xinput(fd: u64, data: &[u8], seq: u16) {
     if data.len() < 4 { return; }
     let minor = data[1];
-    #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
     crate::serial_println!("[X11/XI] minor={} len={}", minor, data.len());
     match minor {
         // ── XI v1 (subset commonly issued by libXi during device discovery) ───
@@ -2615,7 +2615,7 @@ fn op_xinput(fd: u64, data: &[u8], seq: u16) {
             // Unknown XInputExtension minor.  Treat as a no-reply request
             // (best-effort; the alternative is a BadRequest error which
             // many toolkits handle worse than silence).
-            #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
+            #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
             crate::serial_println!("[X11/XI] unhandled minor={} (no reply)", minor);
         }
     }
@@ -2704,7 +2704,7 @@ fn op_sync_ext(fd: u64, data: &[u8], seq: u16) {
 fn op_xkeyboard(fd: u64, data: &[u8], seq: u16) {
     if data.len() < 4 { return; }
     let minor = data[1];
-    #[cfg(any(feature = "firefox-test", feature = "xeyes-test"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "xeyes-test"))]
     crate::serial_println!("[X11XKB] minor={} seq={} len={}", minor, seq, data.len());
     // XKB minor opcodes that need replies:
     // 0=UseExtension, 4=GetState, 6=GetControls, 9=ListComponents,

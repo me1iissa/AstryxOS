@@ -6,6 +6,18 @@
 **GUI Tests**: 10/10 pixel checks passing (`scripts/run-gui-test.sh`)
 **Firefox**: Runs for full 15000 ticks without crashing (was: crash at 1481 syscalls at RIP=0x0)
 
+### Milestone 44 — perf: gate high-frequency diagnostic serial behind *-trace features (✅, PR #518)
+**Completed**: 2026-06-04
+
+**What was built:**
+- [x] **Feature split** (`kernel/Cargo.toml`): `firefox-test-core` (functional FF bring-up, no hot-path serial) + `firefox-test-trace` (all high-frequency diagnostic emitters; depends on -core) + `firefox-test = [core, trace]` (back-compat, byte-identical full-debug). Mirrored for the test suite: `test-mode-trace` + `test-mode = [heap-canary, test-mode-trace]`. New `fork-cow-trace` gates the previously **always-on** `[FORK-COW]` clone_for_fork dump (taxed every fork in every build, incl. production).
+- [x] **Emitters moved to trace**: the `[FF/stderr]`/`[FF/write]`/`[FF/write-fd]` write mirror (~78% of a 45 MB boot log), `[POLL_RET]`, per-component `[VFS/resolve]`, the per-syscall `[FUTEX_WAIT_REG]`/`[FUTEX_WAKE]`/`[FUTEX_TIMEDOUT]`/`[FUTEX_WAKE_REQ]`/`[FUTEX-WAKE-EMPTY]`/`[FUTEX_WAKE_GHOST*]` traces, `[FFTEST/mmap-so]` (per-.so-mmap), and `[FF/open]`/`[FF/open-ret]` (per-open). Every other `firefox-test` functional site renamed to `firefox-test-core` (pure token sub).
+- [x] **Preserved functional**: FUTEX cluster bookkeeping (record_wait/record_wake) + the GHOST counters Tests 238/240 assert on stay active under test-mode; the `[VFS/resolve] DEADLINE EXCEEDED` error line, the FORK-COW cr3-mismatch WARN + OOM line, and counter-capped/rare-error `[PF/*]` traces stay unconditional.
+- [x] **Harness** (`scripts/qemu-harness.py`): `start --trace` appends `firefox-test-trace` (printed to stderr, never silent); `firefox-test-core` is the default fast perf/render/CI profile. Two profiles documented in the docstring; futex-wait-scan/firefox-trace-verbose kept out of both.
+- [x] **Measured (KVM, same data.img, sequential, FF musl)**: at the same FF work point (`firefox-bin sc=684`) serial dropped **114,677 B → 27,893 B (−76%)** with the early linking phase; every gated family verified at **0 lines** while reaching the same FF depth. The dominant `[FF/stderr]` (78% of the deep log) ramps later and is now entirely off the default path → full-boot serial collapses from ~45 MB toward the bounded boot-marker floor, collapsing the synchronous PIO-VM-exit wall-clock cost (Intel SDM Vol. 3C §25).
+- [x] **No functional change** — only diagnostic serial emission removed from the default path; FF runs identically. `cargo check` clean (0 errors, no new warnings) across firefox-test-core, firefox-test, firefox-test-trace, test-mode, test-mode-trace, fork-cow-trace, and the default `[]` build.
+- [x] Files changed: `kernel/Cargo.toml`, `kernel/src/subsys/linux/syscall.rs`, `kernel/src/subsys/aether/syscall.rs`, `kernel/src/subsys/linux/{mod,futex_key_diag}.rs`, `kernel/src/syscall/mod.rs`, `kernel/src/vfs/mod.rs`, `kernel/src/mm/vma.rs`, the `firefox-test`→`firefox-test-core` rename across ~20 more files, and `scripts/qemu-harness.py`.
+
 ### Milestone 43 — syscall/mod.rs split into subsys/{aether,linux}/syscall.rs (✅)
 **Completed**: 2026-04-21
 

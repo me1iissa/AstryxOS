@@ -770,7 +770,12 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8],
             if hdr.flags & ACK != 0 {
                 handle_ack(conn, hdr.ack_num);
             }
-            if hdr.flags & FIN != 0 {
+            // Honor the peer's FIN only when it sits exactly at recv_next
+            // (RFC 9293 §3.10.7.4 / RFC 793 §3.5) — an out-of-order data+FIN
+            // segment must not prematurely close.
+            let fin_at_nxt = (hdr.flags & FIN != 0)
+                && hdr.seq_num.wrapping_add(payload.len() as u32) == conn.recv_next;
+            if fin_at_nxt {
                 // Simultaneous close or ACK+FIN in same segment.
                 conn.recv_next = conn.recv_next.wrapping_add(1);
                 conn.state = TcpState::TimeWait;
@@ -780,13 +785,16 @@ fn process_segment(conn: &mut TcpConnection, hdr: &TcpHeader, payload: &[u8],
                 let s = build_segment(lp, rp, sn, rn, ACK, lip, rip, &[]);
                 out.push(OutSeg { remote_ip: rip, seg: s });
             } else if hdr.flags & ACK != 0 {
-                // Pure ACK (no FIN): move to FinWait2.
+                // Pure ACK (no in-order FIN): move to FinWait2.
                 conn.state = TcpState::FinWait2;
             }
         }
 
         TcpState::FinWait2 => {
-            if hdr.flags & FIN != 0 {
+            // Honor the peer's FIN only when it sits exactly at recv_next.
+            let fin_at_nxt = (hdr.flags & FIN != 0)
+                && hdr.seq_num.wrapping_add(payload.len() as u32) == conn.recv_next;
+            if fin_at_nxt {
                 conn.recv_next = conn.recv_next.wrapping_add(1);
                 conn.state = TcpState::TimeWait;
                 conn.timewait_start = crate::arch::x86_64::irq::get_ticks();
@@ -1004,7 +1012,7 @@ pub fn tcp_timer_tick() {
 /// default builds — the struct would otherwise alter LLVM's symbol
 /// mangling hashes of neighbouring statics.
 #[cfg(any(feature = "kdb", feature = "httpd-test", feature = "test-mode",
-          feature = "firefox-test", feature = "oracle-test"))]
+          feature = "firefox-test-core", feature = "oracle-test"))]
 #[derive(Clone, Copy)]
 pub struct ConnSnap {
     pub local_port:  u16,
@@ -1030,7 +1038,7 @@ pub struct ConnSnap {
 /// Return a snapshot of every connection in the TCP table.  Caller-owned
 /// copy — safe to use after the lock is dropped.
 #[cfg(any(feature = "kdb", feature = "httpd-test", feature = "test-mode",
-          feature = "firefox-test", feature = "oracle-test"))]
+          feature = "firefox-test-core", feature = "oracle-test"))]
 pub fn snapshot_connections() -> alloc::vec::Vec<ConnSnap> {
     TCP_CONNECTIONS.lock().iter().map(|c| ConnSnap {
         local_port:  c.local_port,
@@ -1056,7 +1064,7 @@ pub fn snapshot_connections() -> alloc::vec::Vec<ConnSnap> {
 /// zero discards the buffered tail because the FIN advances `send_next`
 /// past data that has not yet been transmitted.
 #[cfg(any(feature = "kdb", feature = "httpd-test", feature = "test-mode",
-          feature = "firefox-test", feature = "oracle-test"))]
+          feature = "firefox-test-core", feature = "oracle-test"))]
 pub fn outbound_pending(local_port: u16, remote_ip: Ipv4Address, remote_port: u16) -> usize {
     TCP_CONNECTIONS.lock().iter()
         .find(|c| c.local_port == local_port
@@ -1298,6 +1306,53 @@ pub fn test_set_state(local_port: u16, remote_ip: Ipv4Address,
         Some(c) => { c.state = state; Ok(()) }
         None => Err("no matching TCB"),
     }
+}
+
+/// Test-only: feed a single synthetic segment to the Established TCB on
+/// `(local_port, remote_ip, remote_port)` via the real `process_segment`
+/// path, then report the resulting `(state, recv_buffer_len)`.
+///
+/// Used to cover the out-of-order receive paths a real multi-segment HTTP(S)
+/// response exercises (a reordered/lost segment, a data+FIN that arrives ahead
+/// of the gap) without an e1000+SLIRP round-trip.  `seq` is the segment's
+/// sequence number, `payload` its data, `fin` whether the FIN flag is set.
+/// Any reply segments `process_segment` builds are discarded (the test only
+/// inspects connection state, not the wire ACKs).
+#[cfg(feature = "kdb")]
+pub fn test_feed_segment(local_port: u16, remote_ip: Ipv4Address,
+                          remote_port: u16, seq: u32, payload: &[u8],
+                          fin: bool) -> Option<(TcpState, usize)> {
+    let mut conns = TCP_CONNECTIONS.lock();
+    let conn = conns.iter_mut().find(|c|
+        c.local_port  == local_port
+        && c.remote_ip   == remote_ip
+        && c.remote_port == remote_port)?;
+    let hdr = TcpHeader {
+        src_port:    remote_port,
+        dst_port:    local_port,
+        seq_num:     seq,
+        ack_num:     conn.send_next,
+        data_offset: 5,
+        flags:       ACK | if fin { FIN } else { 0 },
+        window:      65535,
+        checksum:    0,
+    };
+    let mut out: Vec<OutSeg> = Vec::new();
+    process_segment(conn, &hdr, payload, &mut out);
+    Some((conn.state, conn.recv_buffer.len()))
+}
+
+/// Test-only: read the current recv_next of the Established TCB (so a test
+/// can compute an in-order vs out-of-order sequence number).
+#[cfg(feature = "kdb")]
+pub fn test_recv_next(local_port: u16, remote_ip: Ipv4Address,
+                       remote_port: u16) -> Option<u32> {
+    let conns = TCP_CONNECTIONS.lock();
+    conns.iter().find(|c|
+        c.local_port  == local_port
+        && c.remote_ip   == remote_ip
+        && c.remote_port == remote_port)
+        .map(|c| c.recv_next)
 }
 
 /// Drain the receive buffer of the established TCB identified by the full

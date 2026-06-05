@@ -775,6 +775,21 @@ pub fn socket_is_read_closed(id: u64) -> bool {
     }
 }
 
+/// Returns `true` if the socket is a datagram (UDP / SOCK_DGRAM) socket.
+///
+/// Used by the recvmsg(2) AF_INET path to decide whether to marshal the
+/// per-datagram source address into `msg_name`.  Connection-mode (TCP)
+/// sockets do not need a per-message source — the source is the fixed
+/// connected peer — and they carry an EOF/WouldBlock distinction that the
+/// datagram path does not, so the two are handled separately.  Returns
+/// `false` for an unknown id.
+pub fn socket_is_udp(id: u64) -> bool {
+    let sockets = SOCKETS.lock();
+    sockets.iter().find(|s| s.id == id)
+        .map(|s| s.socket_type == SocketType::Udp)
+        .unwrap_or(false)
+}
+
 /// Check if a socket has incoming data available (used by poll).
 ///
 /// For a TCP listener (bound but unconnected) the readability gate is

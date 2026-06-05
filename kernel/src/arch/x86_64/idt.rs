@@ -22,10 +22,10 @@ pub fn page_fault_count() -> u64 { PAGE_FAULT_TOTAL.load(Ordering::Relaxed) }
 /// where the installer's intent differs from the cache's recorded key.
 ///
 /// Only armed in `firefox-test` builds; zero cost in all others.
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 pub(crate) static PFH_WRITABLE_ALIAS_CACHE: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 pub fn pfh_writable_alias_cache_count() -> u64 {
     PFH_WRITABLE_ALIAS_CACHE.load(Ordering::Relaxed)
 }
@@ -476,7 +476,7 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
             );
         }
 
-        #[cfg(feature = "firefox-test")]
+        #[cfg(feature = "firefox-test-core")]
         {
             use core::sync::atomic::{AtomicU64, Ordering};
             static PF_TOTAL_LOG: AtomicU64 = AtomicU64::new(0);
@@ -807,7 +807,7 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
                 // `isr_with_error!` macro definition lower in this file).
                 // Reads are 8-byte aligned and within the kernel stack
                 // page we are executing on.
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-core")]
                 {
                     let base = frame as *const InterruptFrame as *const u64;
                     let rdx = unsafe { *base.sub(4) };
@@ -1162,7 +1162,7 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, frame: &mut Interr
             // a `call [rdi]` through a freed vtable is named by the
             // FREE-shadow on `rdi`'s page just as well here as it would be
             // at the corresponding #PF.  See SysV AMD64 ABI §3.2.3.
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-core")]
             {
                 let base = frame as *const InterruptFrame as *const u64;
                 let rdx = unsafe { *base.sub(4) };
@@ -1427,7 +1427,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 // and `VmSpace::*` mutators (Intel SDM Vol. 3A §8.2.3).
                 let gen_now = vm_space.generation.load(core::sync::atomic::Ordering::Acquire);
                 if gen_now != gen_at_start {
-                    #[cfg(feature = "firefox-test")]
+                    #[cfg(feature = "firefox-test-core")]
                     {
                         static CNT: core::sync::atomic::AtomicU64 =
                             core::sync::atomic::AtomicU64::new(0);
@@ -1448,7 +1448,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 // OWN distinct frame at this VA (present, frame != old_phys and
                 // != new_phys), record the dispositive double-install pair —
                 // one VA, two frames.  See Intel SDM Vol. 3A §4.10.4.
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-core")]
                 {
                     let pre = crate::mm::vmm::read_pte(cr3, page_addr);
                     let pre_phys = pre & 0x000F_FFFF_FFFF_F000;
@@ -1478,8 +1478,8 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 //
                 // Set `new_phys`'s refcount to 1 BEFORE the install attempt so
                 // the winner publishes a fully-accounted frame; the loser path
-                // resets it to 0 and frees cleanly.  The page is PRESENT
-                // (read-only, → `old_phys`) on entry, so this is a
+                // decrements it back to 0 and frees cleanly.  The page is
+                // PRESENT (read-only, → `old_phys`) on entry, so this is a
                 // compare-and-swap on the expected old frame — NOT an
                 // install-if-absent.  The first sibling sees the PTE still at
                 // `old_phys` and swaps in its private copy; a concurrent sibling
@@ -1487,8 +1487,8 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 // installed (≠ `old_phys`) and backs out.
                 crate::mm::refcount::page_ref_set(new_phys, 1);
                 if crate::mm::vmm::map_page_in_cow_if_unchanged(
-                    cr3, page_addr, old_phys, new_phys, page_flags)
-                {
+                    cr3, page_addr, new_phys, page_flags, old_phys,
+                ) {
                     // Winner: this VA now resolves to `new_phys`.  Release this
                     // process's reference to the shared frame — the PTE no
                     // longer points at `old_phys` (the parent / forked child
@@ -1501,32 +1501,34 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     // a not-present→present demand fault).  Without it they keep
                     // faulting on every write until their TLB happens to evict.
                     crate::mm::tlb::shootdown_page(cr3, page_addr);
-                    return true;
-                }
-                // Loser: a sibling CPU already CoW-installed its own frame for
-                // this VA under the same lock.  The PTE no longer references
-                // `old_phys` (the winner already released that reference), so we
-                // must NOT decrement `old_phys` again — a double-dec would
-                // underflow the refcount and free a still-mapped frame (the
-                // classic W215 corruption).  `new_phys` was never published;
-                // reset its refcount to 0 and free it.  Flush THIS CPU's stale
-                // read-only translation so the faulting instruction re-walks to
-                // the winner's authoritative PTE, then report the fault handled.
-                #[cfg(feature = "firefox-test")]
-                {
-                    static COW_RACE: core::sync::atomic::AtomicU64 =
-                        core::sync::atomic::AtomicU64::new(0);
-                    let n = COW_RACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    if n < 10 || n % 500 == 0 {
-                        crate::serial_println!(
-                            "[PF/cow-anon-race] #{} addr={:#x} sibling already \
-                             CoW-mapped — dropping private frame {:#x}",
-                            n, page_addr, new_phys);
+                } else {
+                    // Loser: a sibling CPU already CoW-installed its own frame
+                    // for this VA under the same lock.  The PTE no longer
+                    // references `old_phys` (the winner already released that
+                    // reference), so we must NOT decrement `old_phys` again — a
+                    // double-dec would underflow the refcount and free a
+                    // still-mapped frame (the classic W215 corruption).
+                    // `new_phys` was never published; decrement its refcount
+                    // back to 0 (it satisfies free_page's pte_share_count==0
+                    // invariant) and free it.  Flush THIS CPU's stale read-only
+                    // translation so the faulting instruction re-walks to the
+                    // winner's authoritative PTE, then report the fault handled.
+                    #[cfg(feature = "firefox-test-core")]
+                    {
+                        static COW_RACE: core::sync::atomic::AtomicU64 =
+                            core::sync::atomic::AtomicU64::new(0);
+                        let n = COW_RACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        if n < 10 || n % 500 == 0 {
+                            crate::serial_println!(
+                                "[PF/cow-anon-race] #{} addr={:#x} sibling already \
+                                 CoW-mapped — dropping private frame {:#x}",
+                                n, page_addr, new_phys);
+                        }
                     }
+                    let _ = crate::mm::refcount::page_ref_dec(new_phys);
+                    crate::mm::pmm::free_page(new_phys);
+                    crate::mm::vmm::invlpg(page_addr);
                 }
-                crate::mm::refcount::page_ref_set(new_phys, 0);
-                crate::mm::pmm::free_page(new_phys);
-                crate::mm::vmm::invlpg(page_addr);
                 return true;
             }
             return false; // OOM
@@ -1623,7 +1625,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
             let page_offset_in_vma = page_addr - vma_base;
             let file_page_offset = file_base_offset + page_offset_in_vma;
 
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-core")]
             {
                 static PF_FILE_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
                 let n = PF_FILE_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -1744,7 +1746,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     // alive, or frees it if the cache evicted the entry between
                     // our lookup and now.
                     let _ = crate::mm::refcount::page_ref_dec(cached_phys);
-                    #[cfg(feature = "firefox-test")]
+                    #[cfg(feature = "firefox-test-core")]
                     crate::serial_println!(
                         "[PF/revalidate] CACHE-HIT VMA stale addr={:#x} \
                          mount={} inode={} foff={:#x} — abandoning",
@@ -1800,7 +1802,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         // W216 H_5j-B (unified concurrency): re-check generation
                         // immediately before install — see arm-level closure.
                         if !gen_unchanged() {
-                            #[cfg(feature = "firefox-test")]
+                            #[cfg(feature = "firefox-test-core")]
                             {
                                 static CNT: core::sync::atomic::AtomicU64 =
                                     core::sync::atomic::AtomicU64::new(0);
@@ -1856,7 +1858,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         // own ref keeps `cached_phys` alive), refresh THIS CPU's
                         // TLB so the faulting instruction re-walks to the
                         // winner's authoritative PTE, and report success.
-                        #[cfg(feature = "firefox-test")]
+                        #[cfg(feature = "firefox-test-core")]
                         {
                             static RACE: core::sync::atomic::AtomicU64 =
                                 core::sync::atomic::AtomicU64::new(0);
@@ -1911,7 +1913,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     // guard ref so the cache's own reference remains the sole
                     // holder of `cached_phys`.
                     if !gen_unchanged() {
-                        #[cfg(feature = "firefox-test")]
+                        #[cfg(feature = "firefox-test-core")]
                         {
                             static CNT: core::sync::atomic::AtomicU64 =
                                 core::sync::atomic::AtomicU64::new(0);
@@ -1932,7 +1934,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     // knows under a different (mount,inode,offset) identity.
                     // Only file-backed installs (is_shared && is_writable) reach
                     // this arm; anonymous frames are never in the cache.
-                    #[cfg(feature = "firefox-test")]
+                    #[cfg(feature = "firefox-test-core")]
                     if is_writable {
                         if let Some((c_mount, c_inode, c_off)) =
                             crate::mm::cache::is_phys_in_cache(cached_phys)
@@ -1986,7 +1988,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         // sibling-PTE(1) = 2.  Do NOT free the cache frame — it
                         // is shared and still referenced.  Refresh THIS CPU's
                         // TLB and report success.
-                        #[cfg(feature = "firefox-test")]
+                        #[cfg(feature = "firefox-test-core")]
                         {
                             static RACE: core::sync::atomic::AtomicU64 =
                                 core::sync::atomic::AtomicU64::new(0);
@@ -2003,7 +2005,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         return true;
                     }
                 }
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-core")]
                 {
                     static PF_CACHED_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
                     let n2 = PF_CACHED_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2158,7 +2160,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         }
                         // W215 diagnostic Arm-1+2: open the pre-insert
                         // race window for `phys` at the readahead site.
-                        #[cfg(feature = "firefox-test")]
+                        #[cfg(feature = "firefox-test-core")]
                         {
                             crate::mm::w215_diag::prov_record(
                                 phys,
@@ -2208,7 +2210,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                             buf.copy_from_slice(src);
                         } else if fs.read(inode, foff, buf).is_err() {
                             crate::mm::pmm::free_page(phys);
-                            #[cfg(feature = "firefox-test")]
+                            #[cfg(feature = "firefox-test-core")]
                             crate::serial_println!(
                                 "[PF/io-err] readahead read failed inode={} foff={:#x} pg_idx={}",
                                 inode, foff, pg_idx);
@@ -2307,7 +2309,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     // VMA replaced or removed during I/O.  Free all frames we
                     // allocated, then abandon the fault.  The user will re-fault
                     // against the new VMA and receive correct data.
-                    #[cfg(feature = "firefox-test")]
+                    #[cfg(feature = "firefox-test-core")]
                     crate::serial_println!(
                         "[PF/revalidate] READAHEAD VMA stale after I/O addr={:#x} \
                          mount={} inode={} foff={:#x} — dropping {} pages",
@@ -2351,7 +2353,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 // CPU's own pre-insert witness has been cleared by
                 // `preins_clear_on_insert`, so a remaining witness means
                 // a DIFFERENT CPU is mid-write on the same phys.
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-core")]
                 crate::mm::w215_diag::prov_record(
                     phys,
                     crate::mm::w215_diag::KIND_PFH_INSTALL,
@@ -2372,7 +2374,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 if let Some(g) = vm_generation.as_ref() {
                     let gen_now = g.load(core::sync::atomic::Ordering::Acquire);
                     if gen_now != gen_at_revalidate {
-                        #[cfg(feature = "firefox-test")]
+                        #[cfg(feature = "firefox-test-core")]
                         crate::serial_println!(
                             "[PF/gen-abort] READAHEAD addr={:#x} mount={} inode={} \
                              foff={:#x} gen_at_rev={} gen_now={} — releasing {} \
@@ -2440,7 +2442,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 // If a witness for this phys is STILL present, a sibling
                 // CPU registered a pre-insert for the same phys — the
                 // smoking-gun race for axis A.
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-core")]
                 crate::mm::w215_diag::preins_check_install(
                     phys, mount_idx, inode, foff,
                 );
@@ -2513,7 +2515,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                             // → frees cleanly; release the guard ref on the cache
                             // frame exactly as the winner path does, refresh THIS
                             // CPU's TLB, and move to the next readahead page.
-                            #[cfg(feature = "firefox-test")]
+                            #[cfg(feature = "firefox-test-core")]
                             {
                                 static RACE: core::sync::atomic::AtomicU64 =
                                     core::sync::atomic::AtomicU64::new(0);
@@ -2562,7 +2564,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     // key for the same phys between our insert and this check —
                     // a structural aliasing bug distinct from the MAP_SHARED case
                     // in the cache-hit arm above.
-                    #[cfg(feature = "firefox-test")]
+                    #[cfg(feature = "firefox-test-core")]
                     if is_writable_vma {
                         if let Some((c_mount, c_inode, c_off)) =
                             crate::mm::cache::is_phys_in_cache(phys)
@@ -2605,7 +2607,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         // it still names our phys), drop the guard ref, free the
                         // frame if it reached zero, refresh THIS CPU's TLB, and
                         // move to the next readahead page.  No PTE ref is taken.
-                        #[cfg(feature = "firefox-test")]
+                        #[cfg(feature = "firefox-test-core")]
                         {
                             static RACE: core::sync::atomic::AtomicU64 =
                                 core::sync::atomic::AtomicU64::new(0);
@@ -2628,7 +2630,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
             }
 
             // Log progress periodically
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-core")]
             {
                 static PF_VERIFY_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
                 let vn = PF_VERIFY_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2650,7 +2652,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 }
                 // W215 diagnostic Arm-1+2: open the pre-insert race window
                 // for `phys` at the single-page fallback site.
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-core")]
                 {
                     crate::mm::w215_diag::prov_record(
                         phys,
@@ -2719,7 +2721,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     // behaviour for I/O errors during demand-page.
                     if fs.read(inode, file_page_offset, buf).is_err() {
                         crate::mm::pmm::free_page(phys);
-                        #[cfg(feature = "firefox-test")]
+                        #[cfg(feature = "firefox-test-core")]
                         crate::serial_println!(
                             "[PF/io-err] single-page read failed inode={} foff={:#x} addr={:#x}",
                             inode, file_page_offset, page_addr);
@@ -2782,7 +2784,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     if !still_valid {
                         // VMA replaced during I/O.  Release the frame and let
                         // the user re-fault against the replacement VMA.
-                        #[cfg(feature = "firefox-test")]
+                        #[cfg(feature = "firefox-test-core")]
                         crate::serial_println!(
                             "[PF/revalidate] SINGLE-PAGE VMA stale after I/O addr={:#x} \
                              mount={} inode={} foff={:#x} — dropping frame",
@@ -2795,7 +2797,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 if let Some(g) = sp_vm_generation.as_ref() {
                     let gen_now = g.load(core::sync::atomic::Ordering::Acquire);
                     if gen_now != sp_gen_at_revalidate {
-                        #[cfg(feature = "firefox-test")]
+                        #[cfg(feature = "firefox-test-core")]
                         crate::serial_println!(
                             "[PF/gen-abort] SINGLE-PAGE addr={:#x} mount={} inode={} \
                              foff={:#x} gen_at_rev={} gen_now={} — dropping frame",
@@ -2836,7 +2838,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                 // W215 diagnostic Arm-2 (single-page fallback): same
                 // semantic as the readahead path — own witness now cleared,
                 // a residual witness is a sibling-CPU race on the same phys.
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-core")]
                 crate::mm::w215_diag::preins_check_install(
                     phys, mount_idx, inode, file_page_offset,
                 );
@@ -2896,7 +2898,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                         // exactly as the winner path does, refresh THIS CPU's TLB,
                         // and report success so the faulting instruction re-walks
                         // to the winner's authoritative PTE.
-                        #[cfg(feature = "firefox-test")]
+                        #[cfg(feature = "firefox-test-core")]
                         {
                             static RACE: core::sync::atomic::AtomicU64 =
                                 core::sync::atomic::AtomicU64::new(0);
@@ -2939,7 +2941,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     // The single-page path inserts under (mount_idx, inode,
                     // file_page_offset); if is_phys_in_cache returns a different
                     // key, a concurrent re-insertion race has occurred.
-                    #[cfg(feature = "firefox-test")]
+                    #[cfg(feature = "firefox-test-core")]
                     if is_writable_spf {
                         if let Some((c_mount, c_inode, c_off)) =
                             crate::mm::cache::is_phys_in_cache(phys)
@@ -2961,7 +2963,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     // W215 diagnostic Arm-1 (single-page alias install
                     // — install-race witness already probed above after
                     // cache::insert).
-                    #[cfg(feature = "firefox-test")]
+                    #[cfg(feature = "firefox-test-core")]
                     crate::mm::w215_diag::prov_record(
                         phys,
                         crate::mm::w215_diag::KIND_PFH_INSTALL,
@@ -2990,7 +2992,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     // cache entry (only if it still names our phys), release the
                     // guard ref, free the frame if it reached zero, refresh THIS
                     // CPU's TLB, and report success.  No PTE ref is taken.
-                    #[cfg(feature = "firefox-test")]
+                    #[cfg(feature = "firefox-test-core")]
                     {
                         static RACE: core::sync::atomic::AtomicU64 =
                             core::sync::atomic::AtomicU64::new(0);
@@ -3021,7 +3023,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
 
         match &vma.backing {
             crate::mm::vma::VmBacking::Anonymous => {
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-core")]
                 {
                     static ANON_PF_N: core::sync::atomic::AtomicU64
                         = core::sync::atomic::AtomicU64::new(0);
@@ -3053,7 +3055,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     let gen_now =
                         vm_space.generation.load(core::sync::atomic::Ordering::Acquire);
                     if gen_now != gen_at_start {
-                        #[cfg(feature = "firefox-test")]
+                        #[cfg(feature = "firefox-test-core")]
                         {
                             static CNT: core::sync::atomic::AtomicU64 =
                                 core::sync::atomic::AtomicU64::new(0);
@@ -3115,7 +3117,7 @@ fn handle_page_fault(faulting_addr: u64, error_code: u64, _frame: &mut Interrupt
                     // frame was never installed (refcount still 0), so it frees
                     // cleanly.  Refresh THIS CPU's TLB so the faulting
                     // instruction re-walks to the winner's authoritative PTE.
-                    #[cfg(feature = "firefox-test")]
+                    #[cfg(feature = "firefox-test-core")]
                     {
                         static RACE: core::sync::atomic::AtomicU64 =
                             core::sync::atomic::AtomicU64::new(0);

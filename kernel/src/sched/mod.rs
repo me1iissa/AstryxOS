@@ -137,6 +137,27 @@ pub fn pick_hlt_count() -> u64 {
     SCHED_PICK_HLT_TOTAL.load(Ordering::Relaxed)
 }
 
+/// Most-recently-observed run-queue depth: the count of `Ready` non-idle
+/// threads the picker considered on its last pass.  Published lock-free from
+/// inside `schedule()` (which already iterates `THREAD_TABLE` and tests each
+/// thread's state), so any caller can read an O(1) estimate of how many
+/// runnable peers a yielding thread is competing against WITHOUT taking the
+/// table lock itself.  This is the metric the virtio-blk wait-amplification
+/// histogram correlates against (see `drivers::virtio_blk`): it is the size
+/// of the field a spin-then-yield disk waiter must be re-selected out of.
+///
+/// "Estimate" because it is a snapshot of the last picker pass, not a fresh
+/// count — but the picker runs on every quantum and every yield, so under the
+/// disk-I/O workload it is at most a few ticks stale, which is exactly the
+/// resolution the histogram needs.
+static READY_DEPTH: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the last-observed run-queue depth (non-idle `Ready` peers).
+/// O(1), lock-free.  See [`READY_DEPTH`].
+pub fn ready_depth() -> u64 {
+    READY_DEPTH.load(Ordering::Relaxed)
+}
+
 /// Snapshot of the cumulative starvation events.  An increment indicates
 /// the picker held the same thread for `STARVATION_BURST_THRESHOLD`
 /// consecutive HLT cycles without a successful pick.
@@ -908,7 +929,7 @@ pub fn wait_dead_stacks_quiesced() {
 
 /// Production callers MUST use `pop_dead_stack`; the gate is load-bearing
 /// for closing the kstack-reuse-while-RSP-still-live race (PR #348).
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 pub fn pop_dead_stack_force() -> Option<(u64, u64)> {
     let mut cache = DEAD_STACK_CACHE.lock();
     if cache.is_empty() { return None; }
@@ -1199,12 +1220,24 @@ was_emergency_4k={}",
         // the backstop.
         let mut force_idx: Option<usize> = None;
         let mut force_age: u64 = 0;
+        // Run-queue depth: count of non-idle Ready peers considered this pass.
+        // Published lock-free into READY_DEPTH after the scan so disk-I/O
+        // waiters (and the wait-amplification histogram) can read, without the
+        // table lock, how many runnable peers a yield competes against.
+        let mut ready_peers: u64 = 0;
 
         for i in 1..len {
             let idx = (current_idx + i) % len;
             let t = &threads[idx];
             if t.state != ThreadState::Ready {
                 continue;
+            }
+            if t.tid < 0x1000 {
+                // Non-idle Ready peer (idle threads are TID >= 0x1000); count it
+                // toward the run-queue depth before any affinity/validity skips
+                // so the metric reflects total runnable work, not just
+                // this-CPU-eligible work.
+                ready_peers += 1;
             }
             // Skip threads whose kernel RSP is not yet valid — another CPU is
             // mid-way through switching them out and hasn't saved the new RSP
@@ -1276,6 +1309,10 @@ was_emergency_4k={}",
                 best_score = score;
             }
         }
+
+        // Publish the run-queue depth observed this pass (lock-free, relaxed —
+        // a diagnostic estimate, not a synchronisation point).
+        READY_DEPTH.store(ready_peers, Ordering::Relaxed);
 
         // Pass 2 fallback: if no non-idle Ready peer is available on this
         // CPU, fall through to the idle thread.  This preserves the

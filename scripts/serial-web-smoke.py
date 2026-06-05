@@ -22,6 +22,10 @@ Covers (matches the operator-requested feature set):
                       breakdown, both STUCK_IN_NR= and cur_nr= variants.
   * /api/blkmap     — [BLK] histogram bucketing across the 4194304-sector device,
                       has_trace=False when no [BLK] lines are present.
+  * /api/milestones per-gate TIMING — host elapsed (+Ns) + per-gate delta (Δ+Ns)
+                      from the marks sidecar (EXACT live stamps) and from
+                      kernel-tick derivation (APPROX historical), incl. the
+                      monotone/forward-ordered delta invariant.
 """
 import importlib.util
 import json
@@ -75,6 +79,188 @@ SERIAL = """\
 [HB] tick=10500 cpu=1 pf=520 sc=1500
 [PROC-METRICS] tick=10500 pid=1 name=/disk/usr/lib/firefox-esr/firefox-bin sc=900 (vm=450 file=320 net=12 sync=22 proc=32 sig=22 other=20) pf=320 disk=R524288/W0 rreq=400 net=R0/W200 cur_nr=5@25t
 """
+
+
+# Full forward-ordered ladder with interleaved kernel ticks. Each gate line is
+# preceded by an [HB] tick= so the tick-derivation can stamp it. Ticks: kernel
+# entry @0, APIC @100 (=1.0s), drivers @300 (=3.0s), VFS @400 (=4.0s),
+# X11 @900 (=9.0s), firefox @950 (=9.5s) — at the published 100 Hz (10ms/tick).
+TIMED_SERIAL = """\
+[HB] tick=0 cpu=0 pf=0 sc=0
+[BOOT] AstryxOS kernel kernel_main Booting
+[HEAP GUARD] Guard pages installed
+[HB] tick=100 cpu=0 pf=1 sc=1
+[ACPI] Phase 5b APIC init
+[SMP] scheduler online AP online Phase 6
+[HB] tick=300 cpu=0 pf=1 sc=1
+[DRIVERS] virtio Phase 7
+[HB] tick=400 cpu=0 pf=1 sc=1
+[VFS] ext2 mounted rootfs
+[INIT] PID 1 spawn
+[HB] tick=900 cpu=0 pf=1 sc=1
+[FFTEST] X11 server ready
+[HB] tick=950 cpu=0 pf=1 sc=1
+[EXEC] firefox-bin
+"""
+
+
+def _gate_timing_checks(sw, tmp):
+    """Per-gate timing: EXACT (marks sidecar) + APPROX (tick-derived), and the
+    forward-ordered/monotone delta invariant. Independently hand-computed values."""
+    import gate_marks as gm
+
+    # ---- APPROX path: no marks sidecar, derive from kernel ticks ----
+    sidA = "timedapprox01"
+    logA = os.path.join(tmp, sidA + ".serial.log")
+    with open(logA, "w") as f:
+        f.write(TIMED_SERIAL)
+    with open(os.path.join(tmp, sidA + ".json"), "w") as f:
+        json.dump({"sid": sidA, "started_at": time.time() - 60,
+                   "features": "firefox-test,kdb", "running": False}, f)
+    tA = {x["label"]: x for x in sw.scan_milestones_timed(sidA, logA)}
+    # tick 100 -> 1.0s, 300 -> 3.0s, 400 -> 4.0s, 900 -> 9.0s, 950 -> 9.5s
+    check("approx APIC elapsed +1.0s",
+          tA["APIC init"]["host_elapsed"] == 1.0, tA["APIC init"]["host_elapsed"])
+    check("approx APIC is approx (tick-derived)", tA["APIC init"]["approx"] is True)
+    check("approx drivers elapsed +3.0s",
+          tA["drivers"]["host_elapsed"] == 3.0, tA["drivers"]["host_elapsed"])
+    # per-gate DELTA: drivers since APIC = 3.0-1.0 = 2.0s (the key compare signal)
+    check("approx drivers delta = +2.0s (vs APIC)",
+          tA["drivers"]["host_delta"] == 2.0, tA["drivers"]["host_delta"])
+    check("approx VFS delta = +1.0s (4.0-3.0)",
+          tA["VFS / mount"]["host_delta"] == 1.0, tA["VFS / mount"]["host_delta"])
+    check("approx X11 delta = +5.0s (9.0-4.0)",
+          tA["X11 ready"]["host_delta"] == 5.0, tA["X11 ready"]["host_delta"])
+    # monotone: every hit gate's elapsed is non-decreasing in ladder order
+    seq = [x["host_elapsed"] for x in sw.scan_milestones_timed(sidA, logA)
+           if x["hit"] and x["host_elapsed"] is not None]
+    check("approx elapsed monotone non-decreasing",
+          all(seq[i] <= seq[i + 1] for i in range(len(seq) - 1)), seq)
+
+    # ---- EXACT path: marks sidecar with known host stamps ----
+    sidE = "timedexact01"
+    logE = os.path.join(tmp, sidE + ".serial.log")
+    with open(logE, "w") as f:
+        f.write(TIMED_SERIAL)
+    started = 5000.0
+    with open(os.path.join(tmp, sidE + ".json"), "w") as f:
+        json.dump({"sid": sidE, "started_at": started,
+                   "features": "firefox-test,kdb", "running": True}, f)
+    # watcher would stamp these; here we write them directly via the shared helper
+    stamps = [("kernel entry", 5000.2), ("heap guard", 5000.4),
+              ("APIC init", 5002.0), ("SMP / scheduler", 5003.0),
+              ("drivers", 5005.0), ("VFS / mount", 5009.0),
+              ("init / userspace", 5010.0), ("X11 ready", 5023.0),
+              ("firefox exec", 5024.0)]
+    for lab, ts in stamps:
+        gm.append_gate_mark(sidE, tmp, lab, host_ts=ts, tick=None, line=1)
+    tE = {x["label"]: x for x in sw.scan_milestones_timed(sidE, logE)}
+    # X11 arrived at 5023.0, launch 5000.0 -> elapsed 23.0s exact (NOT approx)
+    check("exact X11 elapsed +23.0s",
+          tE["X11 ready"]["host_elapsed"] == 23.0, tE["X11 ready"]["host_elapsed"])
+    check("exact X11 NOT approx", tE["X11 ready"]["approx"] is False)
+    check("exact X11 has absolute host_ts",
+          tE["X11 ready"]["host_ts"] == 5023.0, tE["X11 ready"]["host_ts"])
+    # X11 delta from previous HIT gate (init/userspace @5010) = 23.0-10.0 = 13.0s
+    check("exact X11 delta = +13.0s (vs init/userspace)",
+          tE["X11 ready"]["host_delta"] == 13.0, tE["X11 ready"]["host_delta"])
+    check("exact drivers delta = +2.0s (5005-5003)",
+          tE["drivers"]["host_delta"] == 2.0, tE["drivers"]["host_delta"])
+
+    # ---- the shared gate<->phase mapping is internally consistent ----
+    mlabels = {l for l, _ in gm.MILESTONES}
+    check("GATE_TO_PHASE covers every milestone",
+          set(gm.GATE_TO_PHASE) == mlabels,
+          set(gm.GATE_TO_PHASE) ^ mlabels)
+
+    # ---- HTTP: /api/milestones surfaces the timing fields ----
+    from http.server import ThreadingHTTPServer
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), sw.H)
+    srv.daemon_threads = True
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/milestones?sid={sidE}",
+                timeout=5) as r:
+            body = r.read()
+        check("/api/milestones has host_elapsed", b"host_elapsed" in body)
+        check("/api/milestones has host_delta", b"host_delta" in body)
+    finally:
+        srv.shutdown()
+
+
+# A `firefox-test-core` (fast default) boot: the per-write `[FF/write]`/
+# `[FF/stderr]`/`[FF/open]` diagnostic firehose is OFF, so the ONLY render-gate
+# signal is the low-frequency kernel-emitted `[GATE] <label>` milestone markers
+# (plus the functional `[EXEC] …-isForBrowser` argv line). The headless demo
+# renders a local file:// page, so there is NO TCP line (TLS / network is
+# legitimately absent). This is exactly the case PR #518's serial split created
+# a blind spot for — before the milestone markers the monitor showed "firefox
+# exec" as the deepest gate even though FF reached content-proc spawn + the
+# render handshake. This fixture proves the ladder now advances past it.
+CORE_PROFILE_SERIAL = """\
+[BOOT] AstryxOS kernel kernel_main Booting
+[HEAP GUARD] Guard pages installed
+[ACPI] Phase 5b APIC init
+[SMP] scheduler online AP online Phase 6
+[DRIVERS] virtio Phase 7
+[VFS] ext2 mounted rootfs
+[X11] Xastryx ready on /tmp/.X11-unix/X0 (fd=0)
+[FFTEST] X11 server ready
+[PROC] Created kernel process firefox-bin PID 1 TID 1
+[EXEC] pid=1 tid=1 argv="firefox-bin" "--headless" (2 of 14 args shown)
+[HB] tick=200 cpu=0 pid=1 sc=120000
+[GATE] libxul
+[HB] tick=400 cpu=0 pid=1 sc=300000
+[EXEC] pid=1 tid=9 argv="firefox-bin" "-contentproc" "-isForBrowser" (3 of 16 args shown)
+[GATE] content-procs
+[HB] tick=800 cpu=0 pid=1 sc=1600000
+[GATE] screenshot-actors
+[HB] tick=1200 cpu=0 pid=1 sc=2000000
+[GATE] drawSnapshot
+[FFTEST] /tmp/out.png present (12345 bytes) — streaming
+[FF-OUT-PNG:path=/tmp/out.png size=12345 sig_ok=true complete=true]
+[PROC] PID 1 exit_group(0)
+"""
+
+
+def _core_profile_gate_checks(sw, tmp):
+    """firefox-test-core (firehose OFF): the `[GATE]` milestone markers + the
+    functional FF-supervisor PNG line must advance the ladder PAST 'firefox
+    exec' to the deep render gates. Also exercises the OPTIONAL-skip rule: the
+    no-network file:// render emits no TCP line ('TLS / network' absent) AND the
+    fixture emits 'X11 server ready' BEFORE the 'PID 1' line ('init / userspace'
+    out of order) — neither may stall the strictly-monotone ladder."""
+    sid = "coreprofile01"
+    log = os.path.join(tmp, sid + ".serial.log")
+    with open(log, "w") as f:
+        f.write(CORE_PROFILE_SERIAL)
+    prog = sw.scan_progress(log)
+    hit = {s["label"] for s in prog["timeline"] if s["hit"]}
+    # The blind-spot fix: deepest gate is NOT stuck at 'firefox exec' (or before).
+    check("core: deepest gate past 'firefox exec'",
+          prog["gate"] not in ("firefox exec", "init / userspace", "boot"),
+          prog["gate"])
+    # PNG write is detected via the functional FF-supervisor line, the rest via
+    # the kernel `[GATE]` markers — all default-on on firefox-test-core.
+    for g in ("content procs", "screenshot-actors", "drawSnapshot", "PNG write"):
+        check(f"core: '{g}' reached on fast profile (firehose off)", g in hit,
+              sorted(hit))
+    # firefox exec must still be hit (the gate we advance PAST).
+    check("core: 'firefox exec' hit (then surpassed)", "firefox exec" in hit)
+    # Optional gates: absent/out-of-order, but the ladder still reaches PNG.
+    check("core: 'TLS / network' optional (absent on file://, not stalling)",
+          "TLS / network" not in hit and "PNG write" in hit)
+    check("core: 'init / userspace' optional-skip (X11-before-PID1, not stalling)",
+          "X11 ready" in hit and "firefox exec" in hit)
+    # Prove the firehose really is off in this fixture (no per-write mirror).
+    fire = (CORE_PROFILE_SERIAL.count("[FF/write]")
+            + CORE_PROFILE_SERIAL.count("[FF/stderr]")
+            + CORE_PROFILE_SERIAL.count("[FF/write-fd]")
+            + CORE_PROFILE_SERIAL.count("[FF/open]"))
+    check("core: firehose stayed off (0 [FF/write]/[FF/stderr]/[FF/open])",
+          fire == 0, fire)
 
 
 def main():
@@ -153,6 +339,14 @@ def main():
     # no-trace log reports has_trace False
     bk2 = sw.scan_blkmap(log2, os.path.getsize(log2), 256)
     check("blkmap no-trace -> has_trace False", not bk2["has_trace"])
+
+    # ── per-gate TIMING: elapsed-since-launch + per-gate delta ──
+    print("── per-gate timing ──")
+    _gate_timing_checks(sw, tmp)
+
+    # ── firefox-test-core (fast profile, firehose OFF) gate visibility ──
+    print("── core-profile gate visibility ──")
+    _core_profile_gate_checks(sw, tmp)
 
     # ── HTTP layer end-to-end on an ephemeral port ──
     print("── HTTP endpoints ──")

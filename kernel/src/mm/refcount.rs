@@ -20,7 +20,7 @@ use spin::Once;
 /// refcount.  A decreasing set-over-nonzero is the H1 signature for a caller
 /// that resets a live frame's refcount without going through `page_ref_dec`,
 /// bypassing the zero-check that would trigger `pmm::free_page`.
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 static REFCOUNT_SET_OVER_NONZERO: AtomicU64 = AtomicU64::new(0);
 
 /// Cumulative count of `page_ref_dec` calls that found the refcount already
@@ -31,7 +31,7 @@ static REFCOUNT_SET_OVER_NONZERO: AtomicU64 = AtomicU64::new(0);
 /// concurrent `page_ref_inc`, which could lose increments and re-corrupt
 /// the table.  See `page_ref_dec` for the CAS-loop discipline that replaces
 /// the racy recovery.  Always 0 outside `firefox-test` builds.
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 static PAGE_REF_DEC_UNDERFLOW: AtomicU64 = AtomicU64::new(0);
 
 /// Maximum physical pages we track (same as PMM: 4 GiB / 4 KiB = 1M pages).
@@ -93,7 +93,7 @@ pub fn page_ref_inc(phys_addr: u64) {
         rc[idx].fetch_add(1, Ordering::Relaxed);
     }
     // W215 diagnostic Arm-1: record the REFINC event.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     crate::mm::w215_diag::prov_record(
         phys_addr, crate::mm::w215_diag::KIND_REFINC, 0,
     );
@@ -138,7 +138,7 @@ pub fn page_ref_inc(phys_addr: u64) {
               whether the count reached zero and schedule a shootdown+free"]
 pub fn page_ref_dec(phys_addr: u64) -> u16 {
     // W215 diagnostic Arm-1: record the REFDEC event.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     crate::mm::w215_diag::prov_record(
         phys_addr, crate::mm::w215_diag::KIND_REFDEC, 0,
     );
@@ -155,7 +155,7 @@ pub fn page_ref_dec(phys_addr: u64) -> u16 {
             // the caller's "did we reach zero?" check still fires (it would
             // already have fired on the legitimate decrement that took the
             // count to zero; this second call is the bug).
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-core")]
             {
                 let total = PAGE_REF_DEC_UNDERFLOW
                     .fetch_add(1, Ordering::Relaxed) + 1;
@@ -191,9 +191,9 @@ pub fn page_ref_dec(phys_addr: u64) -> u16 {
 /// decremented one whose `page_ref_inc` was missed).  Always 0 on
 /// non-`firefox-test` builds.
 pub fn page_ref_dec_underflow_count() -> u64 {
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     { PAGE_REF_DEC_UNDERFLOW.load(Ordering::Relaxed) }
-    #[cfg(not(feature = "firefox-test"))]
+    #[cfg(not(feature = "firefox-test-core"))]
     { 0 }
 }
 
@@ -255,7 +255,7 @@ pub fn page_ref_set(phys_addr: u64, count: u16) {
     let idx = pfn(phys_addr);
     if idx < rc.len() {
         // H1 diagnostic: observe decreasing set-over-nonzero transitions.
-        #[cfg(feature = "firefox-test")]
+        #[cfg(feature = "firefox-test-core")]
         {
             let existing = rc[idx].load(Ordering::Relaxed);
             if existing > 0 && count != existing && count < existing {
@@ -278,8 +278,8 @@ pub fn page_ref_set(phys_addr: u64, count: u16) {
 /// Returns the number of times `page_ref_set` decreased a non-zero refcount.
 /// Always 0 on non-firefox-test builds.
 pub fn refcount_set_over_nonzero_count() -> u64 {
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     { REFCOUNT_SET_OVER_NONZERO.load(Ordering::Relaxed) }
-    #[cfg(not(feature = "firefox-test"))]
+    #[cfg(not(feature = "firefox-test-core"))]
     { 0 }
 }

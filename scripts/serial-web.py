@@ -24,6 +24,16 @@ import os, sys, json, time, glob, argparse, re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+# Shared gate-timing helper (marks sidecar + gate<->phase mapping). Imported so
+# the milestone rail can show per-gate host elapsed/delta from the SAME source
+# the harness watcher stamps and perf-bench ingests. Optional: if it is not on
+# this checkout, the dashboard degrades to the original hit/line/tick view.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import gate_marks as _gate_marks  # noqa: E402
+except Exception:
+    _gate_marks = None
+
 HARNESS_DIR = os.path.expanduser("~/.astryx-harness")
 SID_RE = re.compile(r"^[A-Za-z0-9_-]{4,64}$")
 TAIL_BYTES = 96 * 1024
@@ -37,16 +47,25 @@ GUEST_RAM_BYTES = 2 * 1024 * 1024 * 1024   # 2 GiB guest RAM (from the qemu cmdl
 DISK_SECTORS = 4194304           # virtio-blk capacity=4194304 sectors (data.img)
 SECTOR_BYTES = 512
 
-# render ladder, deepest first (idx, label, substring markers)
+# render ladder, deepest first (idx, label, substring markers). Each render gate
+# accepts BOTH the low-frequency kernel-emitted `[GATE] <label>` milestone marker
+# (default-ON on the fast firefox-test-core profile) AND the historical
+# diagnostic/JS strings (present on a full-trace boot) — so a gate is detected
+# whichever serial source is enabled. This is a tail-window substring scan (no
+# AND-anchoring), so the `[GATE]` markers carry the load on the fast profile.
 GATES = [
-    (8, "PNG",               ("89504e47", "out.png written", "kdb-read-png")),
-    (7, "drawSnapshot",      ("drawSnapshot", "CrossProcessPaint", "libpng16")),
-    (6, "screenshot-actors", ("ScreenshotParent", "getDimensions")),
-    (5, "content-proc",      ("isForBrowser",)),
+    (8, "PNG",               ("[FF-OUT-PNG:path=/tmp/out.png size=",
+                              "/tmp/out.png present", "89504e47", "out.png written",
+                              "kdb-read-png")),
+    (7, "drawSnapshot",      ("[GATE] drawSnapshot", "drawSnapshot",
+                              "CrossProcessPaint", "libpng16")),
+    (6, "screenshot-actors", ("[GATE] screenshot-actors", "ScreenshotParent",
+                              "getDimensions")),
+    (5, "content-proc",      ("[GATE] content-procs", "isForBrowser")),
     (4, "network",           ("] Established", "Established →", "[TCP]")),
     (3, "ff-launch",         ("firefox-bin",)),
     (2, "x11",               ("X11 server ready", "Xastryx")),
-    (1, "lib-load",          ("libxul",)),
+    (1, "lib-load",          ("[GATE] libxul", "libxul")),
 ]
 GATE_MAX = 8
 _SC_RE = re.compile(r"pid=1[^\n]*?sc=(\d+)")
@@ -93,14 +112,51 @@ MILESTONES = [
     ("X11 ready",         ("X11 server ready", "Xastryx")),
     ("firefox exec",      ("firefox-bin",)),
     ("TLS / network",     ("[TCP] Established", "] Established →")),
-    ("content procs",     ("isForBrowser",)),
-    # render stages: AND-anchored to the actual kernel [FF/write]/[FF/write-fd]
-    # log line, NOT the bare string (which also lives in the cached JS source).
-    ("screenshot-actors", (("[FF/write]", "getDimensions"), ("[FF/write]", "ScreenshotParent"), ("[FF/write]", "sendQuery"))),
-    ("drawSnapshot",      ("libpng16.so",)),
-    ("PNG write",         ("89504e47", "out.png written")),
+    # content-process spawn. `[GATE] content-procs` is the kernel-emitted
+    # milestone marker (default-ON on firefox-test-core, fires once); the
+    # `[EXEC] …-isForBrowser …` argv line is the functional default-on fallback
+    # (the bare `isForBrowser` substring also lives in FF's cached JS, so we
+    # anchor it to the kernel `[EXEC]` line). On a full-trace boot all fire.
+    ("content procs",     ("[GATE] content-procs", ("[EXEC]", "isForBrowser"))),
+    # render stages. On the FAST `firefox-test-core` profile the per-write
+    # `[FF/write]` IPDL mirror is OFF, so these match the low-frequency
+    # kernel-emitted `[GATE] <label>` markers instead. The `[FF/write]`-anchored
+    # tuples are kept for full-trace boots (firefox-test / *-trace), where they
+    # also fire — both detect the same gate, whichever serial source is on.
+    ("screenshot-actors", ("[GATE] screenshot-actors",
+                           ("[FF/write]", "getDimensions"),
+                           ("[FF/write]", "ScreenshotParent"),
+                           ("[FF/write]", "sendQuery"))),
+    ("drawSnapshot",      ("[GATE] drawSnapshot", "libpng16.so")),
+    # PNG write. The FINAL screenshot PNG is NOT detected by a raw [GATE]/magic
+    # marker (Firefox writes many internal PNGs — favicons, theme assets — that
+    # would false-positive). The authoritative, single-per-run signal is the FF
+    # supervisor's functional `[FFTEST] /tmp/out.png present` /
+    # `[FF-OUT-PNG:… sig_ok=true …]` lines (default-on on firefox-test-core); the
+    # `89504e47` magic / `out.png written` are kept for full-trace boots.
+    ("PNG write",         (("[FF-OUT-PNG:", "sig_ok=true"),
+                           "/tmp/out.png present", "89504e47", "out.png written")),
     ("exit_group",        ("exit_group(",)),
 ]
+
+# OPTIONAL milestones: gates that can be absent OR arrive out-of-order on a
+# successful run, and so must never STALL the strictly-monotone ladder below.
+# When a DEEPER milestone matches the current line but an in-between optional
+# gate was not yet seen, the scan advances past the optional gate (same
+# discipline as perf_markers.ANCHOR_OPTIONAL). Two members:
+#   * "TLS / network" — the headless demo renders a local file:// page with no
+#     network I/O, so the TCP gate legitimately never fires, yet content-process
+#     spawn + the render gates DO.
+#   * "init / userspace" — the FF supervisor emits "X11 server ready" BEFORE the
+#     "[PROC] … PID 1" line this gate keys on, so on a strict in-order scan the
+#     ladder would dead-end here (X11-ready can't fire while the cursor waits on
+#     PID 1) and EVERY deeper gate — firefox exec, [GATE] libxul/content-procs,
+#     the render gates — would show as un-hit. Marking it optional lets the
+#     ladder advance to the gates the boot actually reached. (Pre-existing
+#     ordering quirk, surfaced once the deep [GATE] markers made the deeper
+#     gates reachable on the fast profile.)
+OPTIONAL_MILESTONES = {"TLS / network", "init / userspace"}
+
 # Only the kernel's own tick lines, not arbitrary "tick=" in FF/JS output.
 _TICK_KERNEL = re.compile(r"(?:\[HB\]|PROC-METRICS\]) tick=(\d+)")
 
@@ -140,6 +196,7 @@ def scan_progress(path):
     found = {}
     idx = 0
     cur_tick = sc = None
+    first_tick = None
     panic = False
     n = 0
     try:
@@ -149,14 +206,29 @@ def scan_progress(path):
                 tk = _TICK_KERNEL.search(line)
                 if tk:
                     cur_tick = int(tk.group(1))
+                    if first_tick is None:
+                        first_tick = cur_tick
                 scm = _SC_RE.search(line)
                 if scm:
                     sc = int(scm.group(1))
                 if not panic and _PANIC_RE.search(line):
                     panic = True
-                while idx < len(MILESTONES) and _match(line, MILESTONES[idx][1]):
-                    found[MILESTONES[idx][0]] = (n, cur_tick)
-                    idx += 1
+                while idx < len(MILESTONES):
+                    if _match(line, MILESTONES[idx][1]):
+                        found[MILESTONES[idx][0]] = (n, cur_tick)
+                        idx += 1
+                        continue
+                    # Current milestone didn't match. If it is OPTIONAL and a
+                    # DEEPER milestone matches this line, skip the optional gate
+                    # so it can't stall the ladder (e.g. a file:// render emits
+                    # no TCP line, but `[GATE] content-procs` / render markers do).
+                    if MILESTONES[idx][0] in OPTIONAL_MILESTONES and any(
+                        _match(line, MILESTONES[j][1])
+                        for j in range(idx + 1, len(MILESTONES))
+                    ):
+                        idx += 1
+                        continue
+                    break
                 # don't early-break: keep scanning so the latest sc/tick (current
                 # state) stays fresh even after the deepest milestone is hit.
     except OSError:
@@ -174,14 +246,40 @@ def scan_progress(path):
                          "tick": h[1] if h else None, "dtick": delta})
     res = {"timeline": timeline, "gate": deep_lab or "boot",
            "gate_idx": max(deep_idx, 0), "gate_max": len(MILESTONES),
-           "sc": sc, "tick": cur_tick, "panic": panic}
+           "sc": sc, "tick": cur_tick, "first_tick": first_tick, "panic": panic}
     _prog_cache[path] = (st.st_mtime, st.st_size, res)
     return res
 
 
 def scan_milestones(path):
-    """Back-compat wrapper for /api/milestones — the timeline from scan_progress."""
+    """Back-compat wrapper for /api/milestones — the timeline from scan_progress.
+
+    Returns the bare timeline (hit/line/tick/dtick). For the per-gate host
+    elapsed/delta view use scan_milestones_timed(sid, path)."""
     return scan_progress(path).get("timeline", [])
+
+
+def scan_milestones_timed(sid, path):
+    """Timeline ENRICHED with per-gate host elapsed/delta (the 'compare
+    performance' signal). Each hit gate gains, ADDITIVELY (existing keys
+    untouched):
+        host_elapsed  float|None  seconds since launch at the gate's arrival
+        host_delta    float|None  seconds since the PREVIOUS hit gate
+        host_ts       float|None  absolute host epoch (exact live marks only)
+        approx        bool        True when tick-derived (no exact watcher mark)
+
+    Source priority per gate: the exact host stamp the harness watcher wrote to
+    <sid>.marks.jsonl > a kernel-tick derivation (approx). Falls back to the bare
+    timeline when the shared gate_marks helper is unavailable."""
+    prog = scan_progress(path)
+    timeline = prog.get("timeline", [])
+    if _gate_marks is None:
+        return timeline
+    started_at, _src = _launch_info(sid, path,
+                                    os.stat(path) if os.path.exists(path) else None)
+    marks = _gate_marks.read_gate_marks(sid, HARNESS_DIR)
+    return _gate_marks.gate_timeline(
+        timeline, marks, started_at, first_tick=prog.get("first_tick") or 0)
 
 
 def read_context(path, line, ctx):
@@ -443,6 +541,7 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
  .mile.hit:hover{box-shadow:0 0 6px rgba(126,231,135,.5)}
  .mile.hit.last{border-color:var(--accent);box-shadow:0 0 6px rgba(57,211,83,.4)}
  .mile.png{color:#d2a8ff;border-color:#3a2a52;background:#160e22} .mile b{color:#56b6c2;font-weight:600}
+ .mile .dlt,.rstep .dlt{color:#f0c674;font-weight:600} .rstep .rel{color:#56b6c2}
  /* right-hand progression rail overlay */
  #rail{width:0;transition:width .15s;overflow:hidden;border-left:1px solid var(--edge);background:#0d111a}
  #rail.open{width:210px;min-width:210px;overflow:auto}
@@ -585,22 +684,33 @@ function appendLine(text,nNum,isGate){
   d.dataset.t=text.toLowerCase(); if(nNum)d.dataset.n=nNum; d.textContent=text;
   applyFlt(d); log.appendChild(d); return d;
 }
+// elapsed/delta seconds -> "+2m14s" / "Δ +18s". `approx` (tick-derived, no exact
+// watcher mark) gets a leading '~' so it's never confused with a live stamp.
+function dur(s){if(s==null)return '';s=Math.round(s);if(s<60)return s+'s';
+  const m=Math.floor(s/60),r=s%60;return m<60?m+'m'+(r?r+'s':''):Math.floor(m/60)+'h'+(m%60)+'m';}
+function elapStr(x){if(x.host_elapsed==null)return '';return (x.approx?'~+':'+')+dur(x.host_elapsed);}
+function deltaStr(x){if(x.host_delta==null)return '';return 'Δ '+(x.approx?'~+':'+')+dur(x.host_delta);}
 async function loadMiles(sid){
   let m; try{m=await(await fetch('/api/milestones?sid='+encodeURIComponent(sid))).json()}catch(e){return}
   if(sid!==cur)return; miles=m;
   let lastHit=-1; m.forEach((x,i)=>{if(x.hit)lastHit=i;});
-  // top milestone chips (existing)
+  // top milestone chips: label + elapsed-since-launch + per-gate Δ (the compare
+  // signal). Absolute wall time + line/tick provenance live in the tooltip.
   $('miles').innerHTML=m.map((x,i)=>{
     const cls='mile'+(x.hit?' hit':'')+(i===lastHit?' last':'')+(/PNG|drawSnapshot/.test(x.label)?' png':'');
-    const tk=x.hit&&x.tick!=null?' <b>@'+human(x.tick)+'</b>':'';
-    const ti=x.hit?('line '+x.line+(x.tick!=null?' · tick '+x.tick:'')+(x.dtick!=null?' · +'+x.dtick+' ticks':'')+' — click to jump'):'not reached';
-    return '<span class="'+cls+'" data-line="'+(x.line||'')+'" data-label="'+x.label+'" title="'+ti+'">'+(x.hit?'✓':'○')+' '+x.label+tk+'</span>';
+    const el=x.hit?elapStr(x):'', dl=x.hit?deltaStr(x):'';
+    const timing=(el||dl)?(' <b>'+el+'</b>'+(dl?' <span class=dlt>'+dl+'</span>':'')):'';
+    const wall=x.host_ts!=null?(' · '+utc(x.host_ts)):'';
+    const ti=x.hit?('line '+x.line+(x.tick!=null?' · tick '+x.tick:'')+(x.dtick!=null?' · +'+x.dtick+' ticks':'')+(x.host_elapsed!=null?' · '+(x.approx?'≈':'')+'+'+dur(x.host_elapsed)+' since launch'+(x.host_delta!=null?', Δ+'+dur(x.host_delta)+' vs prev gate':''):'')+wall+(x.approx?' (tick-derived approx)':'')+' — click to jump'):'not reached';
+    return '<span class="'+cls+'" data-line="'+(x.line||'')+'" data-label="'+x.label+'" title="'+ti+'">'+(x.hit?'✓':'○')+' '+x.label+timing+'</span>';
   }).join('');
   $('miles').querySelectorAll('.mile.hit').forEach(e=>{if(e.dataset.line)e.onclick=()=>jumpToLine(+e.dataset.line,e.dataset.label);});
-  // right-hand progression rail
+  // right-hand progression rail: same per-gate elapsed + Δ, stacked.
   $('rail').innerHTML='<h3>progression</h3>'+m.map((x,i)=>{
     const cls='rstep'+(x.hit?' hit':'')+(i===lastHit?' last':'');
-    const sub=x.hit?('line '+x.line+(x.tick!=null?' · @'+human(x.tick):'')):'not yet';
+    const el=x.hit?elapStr(x):'', dl=x.hit?deltaStr(x):'';
+    const tline='line '+x.line+(x.tick!=null?' · @'+human(x.tick):'');
+    const sub=x.hit?((el?'<span class=rel>'+el+(dl?' · <span class=dlt>'+dl+'</span>':'')+'</span>':'')+tline):'not yet';
     return '<div class="'+cls+'" data-line="'+(x.line||'')+'" data-label="'+x.label+'"><span class=ic>'+(x.hit?'✓':'○')+'</span>'
       +'<span class=lab>'+x.label+'<small>'+sub+'</small></span></div>';
   }).join('');
@@ -753,10 +863,11 @@ class H(BaseHTTPRequestHandler):
         elif u.path == "/api/sessions":
             self._json(list_sessions())
         elif u.path == "/api/milestones":
-            p = self._log_path(q.get("sid", [""])[0])
+            sid = q.get("sid", [""])[0]
+            p = self._log_path(sid)
             if not p:
                 self._hdr(404, "text/plain"); self.wfile.write(b"no log"); return
-            self._json(scan_milestones(p))
+            self._json(scan_milestones_timed(sid, p))
         elif u.path == "/api/context":
             p = self._log_path(q.get("sid", [""])[0])
             if not p:

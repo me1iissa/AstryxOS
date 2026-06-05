@@ -818,7 +818,7 @@ pub extern "C" fn signal_check_on_syscall_return(frame: *mut u64) -> u64 {
             // W215 axis-B probe: signal-frame delivery into a user stack
             // that happens to back onto a cache-resident frame (e.g. a
             // libxul mmap aliasing the worker thread's signal stack).
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-core")]
             crate::mm::w215_diag::probe(
                 crate::mm::w215_diag::Writer::Sigframe,
                 new_rsp as *const u8,
@@ -1134,7 +1134,7 @@ pub unsafe fn deliver_sigsegv_from_isr(
     // W215 axis-B probe: SIGSEGV synth-frame delivery into a user stack
     // backed by a cache-resident frame.  Same Writer::Sigframe counter as
     // the regular delivery path; the per-writer first-line gate de-dupes.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     crate::mm::w215_diag::probe(
         crate::mm::w215_diag::Writer::Sigframe,
         new_rsp as *const u8,
@@ -1527,18 +1527,18 @@ fn emit_signal_vma_banner(pid: u64, user_rip: u64, cr2: u64, snap: &[VmaSnap]) {
 //     The cache evicted the entry without shooting down the PTE; subsequent
 //     PMM recycling may have overwritten the frame.
 //
-// All counters are `#[cfg(feature = "firefox-test")]`-gated and `Relaxed` —
+// All counters are `#[cfg(feature = "firefox-test-core")]`-gated and `Relaxed` —
 // they are read by the kdb `fault-cache-keys` op at human pace, never under
 // timing pressure.  ISR-safe: no allocation, no sleeping locks.
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 pub static FAULT_CACHE_KEY_BUCKET_A: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 pub static FAULT_CACHE_KEY_BUCKET_B: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 pub static FAULT_CACHE_KEY_BUCKET_C: AtomicU64 = AtomicU64::new(0);
 
 /// Read-only accessor for the kdb `fault-cache-keys` op.
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 pub fn fault_cache_key_bucket_counts() -> (u64, u64, u64) {
     (
         FAULT_CACHE_KEY_BUCKET_A.load(Ordering::Relaxed),
@@ -1555,7 +1555,7 @@ pub fn fault_cache_key_bucket_counts() -> (u64, u64, u64) {
 /// `vma.file_offset + (fault_va_page - vma.base)`.
 ///
 /// Returns `None` for anonymous or device VMAs (no cache entry exists for them).
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 fn vma_file_key(vma: &VmaSnap, fault_va: u64) -> Option<(usize, u64, u64)> {
     if !vma.file_backed {
         return None;
@@ -1599,7 +1599,7 @@ pub fn emit_fault_gpr_phys_for_fatal(
     cr3: u64,
     candidates: &[(&'static str, u64)],
 ) {
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         const KERNEL_BASE: u64 = 0x0000_8000_0000_0000;
         let tid = crate::proc::current_tid();
@@ -1637,7 +1637,7 @@ pub fn emit_fault_gpr_phys_for_fatal(
         // filter.
         let _ = (pid, cr3, tid);
     }
-    #[cfg(not(feature = "firefox-test"))]
+    #[cfg(not(feature = "firefox-test-core"))]
     let _ = (pid, cr3, candidates);
 }
 
@@ -1710,7 +1710,7 @@ pub(crate) fn emit_fault_phys_diagnostic(
     // D13: `cr2` is consumed only by the firefox-test gated block below
     // (see [D13/CR2-PROV]).  Silence the unused-variable warning when the
     // feature is off — default builds stay byte-identical.
-    #[cfg(not(feature = "firefox-test"))]
+    #[cfg(not(feature = "firefox-test-core"))]
     let _ = cr2;
     const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
     const KERNEL_BASE: u64 = 0x0000_8000_0000_0000;
@@ -1772,7 +1772,7 @@ pub(crate) fn emit_fault_phys_diagnostic(
     // collisions are observable (via a global displacement counter) instead
     // of silent.  Emit one line per fault so the operator can correlate the
     // fault's `rip_phys` with the unmap caller-RIP that released the frame.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     if let Some(rp) = rip_phys {
         crate::mm::w215_diag::dump_free_shadow_for_phys(rp);
     }
@@ -1798,7 +1798,7 @@ pub(crate) fn emit_fault_phys_diagnostic(
     // qemu-harness grep pattern is invariant.  `cr2 < KERNEL_BASE` guards
     // against kernel-mode CR2 (which would not have a user CR3 mapping
     // anyway, but cheap to be explicit).
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     if let Some(cr2_va) = cr2 {
         if cr2_va < KERNEL_BASE && cr2_va >= 0x1000 {
             let cr2_page = cr2_va & !0xFFFu64;
@@ -1862,7 +1862,7 @@ pub(crate) fn emit_fault_phys_diagnostic(
     // for file-backed faults are bounded by the ring's 16 entries per
     // bucket, so the cost is at most two ~16-line bursts on a fatal fault
     // — negligible relative to the existing FAULT/PHYS noise.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     if let Some(rp) = rip_phys {
         crate::serial_println!(
             "[FAULT/PHYS/PROV] kind=unconditional pid={} tid={} rip={:#x} rip_phys={:#x}",
@@ -1881,7 +1881,7 @@ pub(crate) fn emit_fault_phys_diagnostic(
     //
     // ISR-safe: `is_phys_in_cache` takes PAGE_CACHE.lock() (spin, no sleep).
     // `vma_file_key` is pure arithmetic.  No allocation.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     if let Some(rip_phys) = rip_phys {
         // Find the VMA that contains user_rip so we know its file identity.
         let rip_vma = vma_snapshot.iter().find(|v| v.contains_rip);
