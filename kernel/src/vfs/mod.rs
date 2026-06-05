@@ -1341,7 +1341,13 @@ impl ResolveTrace {
 /// genuinely needs >20 iterations to resolve.
 #[inline]
 fn resolve_trace(tctx: &mut ResolveTrace, args: core::fmt::Arguments<'_>) {
-    #[cfg(any(feature = "vfs-trace", feature = "firefox-test"))]
+    // Per-component [VFS/resolve] progress trace.  High-frequency diagnostic
+    // (one line per path component per resolve) with no correctness role — the
+    // [VFS/resolve] DEADLINE EXCEEDED error line below is emitted
+    // unconditionally and is the only resolve signal a non-trace build needs.
+    // Gated on `firefox-test-trace` (and the standalone `vfs-trace`) so the
+    // functional `firefox-test-core` boot does not flood COM1.
+    #[cfg(any(feature = "vfs-trace", feature = "firefox-test-trace"))]
     {
         if tctx.emitted < ResolveTrace::MAX_LINES {
             crate::serial_println!("{}", args);
@@ -1353,7 +1359,7 @@ fn resolve_trace(tctx: &mut ResolveTrace, args: core::fmt::Arguments<'_>) {
             }
         }
     }
-    #[cfg(not(any(feature = "vfs-trace", feature = "firefox-test")))]
+    #[cfg(not(any(feature = "vfs-trace", feature = "firefox-test-trace")))]
     {
         let _ = tctx;
         let _ = args;
@@ -1686,15 +1692,20 @@ pub fn readdir(path: &str) -> VfsResult<Vec<(String, FileType)>> {
 /// Write data to a file (overwrite from beginning).
 pub fn write_file(path: &str, data: &[u8]) -> VfsResult<usize> {
     let (mount_idx, inode) = resolve_path(path)?;
-    let n = {
+    let (old_size, n) = {
         let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
+        let old_size = fs.stat(inode).map(|s| s.size).unwrap_or(0);
         fs.truncate(inode, 0)?;
-        fs.write(inode, 0, data)?
+        (old_size, fs.write(inode, 0, data)?)
     };
     // Page-cache coherency (POSIX mmap(2) MAP_SHARED + write(2) contract):
-    // update any cache pages that overlap the written range so existing
-    // mmap'd readers observe the new bytes immediately.  See
-    // `mm::cache::update_range` for the contract details.
+    // this overwrite-from-beginning first truncates to 0, then writes the
+    // new bytes.  `update_range` reconciles the [0, n) overlap, but any
+    // cache page that belonged to the OLD file beyond the new length is now
+    // stale (the truncate-to-0 discarded it).  Drop those pages first so a
+    // mmap / cached read does not resurrect the pre-write tail; then bring
+    // the freshly-written range up to date in place.
+    crate::mm::cache::truncate_range(mount_idx, inode, old_size, n as u64);
     if n > 0 {
         crate::mm::cache::update_range(mount_idx, inode, 0, &data[..n]);
     }
@@ -1853,13 +1864,33 @@ pub fn fchmod(pid: crate::proc::Pid, fd_num: usize, mode: u32) -> VfsResult<()> 
 }
 
 /// Truncate a file to `size` bytes by path.
+///
+/// Maintains page-cache coherence per POSIX truncate(2): the bytes that
+/// change visibility as a result of the resize (the discarded tail on a
+/// shrink, or the zero-filled extension on a grow) must be reflected in
+/// any page already faulted into the cache.  See
+/// `mm::cache::truncate_range` for the coherence contract.
 pub fn truncate_path(path: &str, size: u64) -> VfsResult<()> {
     let (mount_idx, inode) = resolve_path(path)?;
     let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
-    fs.truncate(inode, size)
+    // Capture the pre-truncate size so the cache cohort knows which range
+    // became zero-filled (grow) or invalid (shrink).  A stat failure leaves
+    // the cache as-is rather than aborting the truncate; we conservatively
+    // pass old_size == size so only the new EOF boundary page is reconciled.
+    let old_size = fs.stat(inode).map(|s| s.size).unwrap_or(size);
+    fs.truncate(inode, size)?;
+    crate::mm::cache::truncate_range(mount_idx, inode, old_size, size);
+    // Path-keyed read cache must be invalidated so a subsequent
+    // `read_file(path)` does not return the pre-truncate snapshot.
+    invalidate_path_read_cache(path);
+    Ok(())
 }
 
 /// Truncate the file open as `fd_num` for process `pid` to `size` bytes.
+///
+/// As with [`truncate_path`], the page cache is reconciled with the new
+/// file length per POSIX ftruncate(2) so MAP_SHARED mappings and cached
+/// reads observe the zero-filled extension / discarded tail.
 pub fn fd_truncate(pid: crate::proc::Pid, fd_num: usize, size: u64) -> VfsResult<()> {
     let (mount_idx, inode) = {
         let procs = crate::proc::PROCESS_TABLE.lock();
@@ -1871,7 +1902,10 @@ pub fn fd_truncate(pid: crate::proc::Pid, fd_num: usize, size: u64) -> VfsResult
         (fd.mount_idx, fd.inode)
     };
     let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
-    fs.truncate(inode, size)
+    let old_size = fs.stat(inode).map(|s| s.size).unwrap_or(size);
+    fs.truncate(inode, size)?;
+    crate::mm::cache::truncate_range(mount_idx, inode, old_size, size);
+    Ok(())
 }
 
 // ===== Process File Descriptor Operations =====
@@ -1987,6 +2021,10 @@ pub fn open(pid: crate::proc::Pid, path: &str, open_flags: u32) -> VfsResult<usi
 
     if open_flags & flags::O_TRUNC != 0 && file_stat.file_type == FileType::RegularFile {
         fs.truncate(inode, 0)?;
+        // Page-cache coherence (POSIX open(2) O_TRUNC + ftruncate(2)):
+        // discard every cached page of the now-empty file so a subsequent
+        // mmap / cached read does not resurrect the pre-truncate contents.
+        crate::mm::cache::truncate_range(mount_idx, inode, file_stat.size, 0);
     }
 
     let fd = FileDescriptor {
@@ -2214,7 +2252,7 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
             if flags & 0x0400_0000 != 0 { return Ok(0); }
             // bit 25 = /dev/zero  → fill buffer with zeros
             if flags & 0x0200_0000 != 0 {
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-core")]
                 crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::DevZero, buf, count);
                 unsafe {
                     let _g = crate::arch::x86_64::smap::UserGuard::new();

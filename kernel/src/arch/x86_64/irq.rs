@@ -24,9 +24,9 @@ static WATCHDOG_COUNTER: [AtomicU32; MAX_CPUS] =
 /// Firefox's NSS / PK11 / ICU / font-cache initialisation performs long
 /// CPU-bound work with no syscalls or page faults, and the shorter production
 /// limit would false-positive during that phase.
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 const WATCHDOG_LIMIT: u32 = 60_000;
-#[cfg(not(feature = "firefox-test"))]
+#[cfg(not(feature = "firefox-test-core"))]
 const WATCHDOG_LIMIT: u32 = 12_000;
 
 /// Reset the watchdog counter for the current CPU.
@@ -472,7 +472,7 @@ extern "C" fn sample_tick_trampoline(
     _frame_ptr: *const super::idt::InterruptFrame,
     _saved_rbp: u64,
 ) {
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         // Skip the sampler entirely while a bugcheck is in flight; the
         // interrupted state may already be garbage and we don't want to
@@ -592,7 +592,7 @@ extern "C" fn timer_tick() {
     // one publisher) regardless of which CPU is actually firing the LAPIC
     // — under KVM, the BSP's LAPIC is sometimes silent while APs deliver,
     // so a BSP-only emit would mute the heartbeat entirely.
-    #[cfg(any(feature = "test-mode", feature = "firefox-test"))]
+    #[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
     {
         if we_published && tick > 0 {
             // Emit if THIS publish crossed a 500-tick boundary.

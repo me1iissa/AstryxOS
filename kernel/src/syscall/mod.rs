@@ -24,14 +24,14 @@ use spin::Mutex;
 /// Per-process syscall ring buffer (firefox-test diagnostic aid).  Active
 /// code is feature-gated inside; the module itself compiles out cleanly when
 /// the feature is off because nothing outside the module references it.
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 pub mod ring;
 
 /// Stub `ring` module for builds without the firefox-test feature.  Provides
 /// the `is_tracked()` predicate so generic syscall-trace gates can compile
 /// uniformly; always returns false because no PIDs are tracked outside of
 /// the firefox-test diagnostic build.
-#[cfg(not(feature = "firefox-test"))]
+#[cfg(not(feature = "firefox-test-core"))]
 pub mod ring {
     #[inline]
     pub fn is_tracked(_pid: u64) -> bool { false }
@@ -50,11 +50,11 @@ pub mod ring {
 /// from the cache — which is precisely the W215 H3a failure chain.
 ///
 /// Only armed in `firefox-test` builds.  Zero cost in all others.
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 static SYS_MMAP_SHARED_WRITE_FILEBACKED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 pub fn sys_mmap_shared_write_filebacked_count() -> u64 {
     SYS_MMAP_SHARED_WRITE_FILEBACKED.load(core::sync::atomic::Ordering::Relaxed)
 }
@@ -566,6 +566,32 @@ pub fn scm_dequeue(receiver_id: u64, consumed: u64) -> Option<Vec<crate::vfs::Fi
     Some(q.remove(pos).fds)
 }
 
+/// Like [`scm_dequeue`] but also returns the popped batch's bound
+/// `byte_offset`.  The caller needs the offset to re-queue an *un-installed
+/// remainder* at the SAME stream position via [`scm_queue`] when the receiver's
+/// `msg_control` buffer was too small for the whole batch.
+///
+/// Per `recvmsg(2)` / `cmsg(3)`: when the ancillary buffer cannot hold every
+/// passed descriptor, the kernel delivers as many as fit and raises
+/// `MSG_CTRUNC`; the descriptors that did not fit are NOT silently dropped — a
+/// subsequent `recvmsg` with a larger control buffer must be able to receive
+/// them.  This helper lets the recvmsg path pop the batch, install the prefix
+/// that fits, then re-queue the tail at its original `byte_offset` (via
+/// [`scm_queue`]) so it stays attached to the same stream frame and is
+/// delivered on the next call rather than orphaned (CWE-772).
+pub fn scm_dequeue_with_offset(
+    receiver_id: u64,
+    consumed: u64,
+) -> Option<(u64, Vec<crate::vfs::FileDescriptor>)> {
+    let mut q = PENDING_SCM.lock();
+    let pos = q.iter().enumerate()
+        .filter(|(_, b)| b.receiver_id == receiver_id && consumed >= b.byte_offset)
+        .min_by_key(|(_, b)| b.byte_offset)
+        .map(|(i, _)| i)?;
+    let batch = q.remove(pos);
+    Some((batch.byte_offset, batch.fds))
+}
+
 /// Drain *all* pending `SCM_RIGHTS` batches destined for `receiver_id` and
 /// return their queued `FileDescriptor`s, removing the batches from the queue.
 ///
@@ -980,7 +1006,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     // blocked thread is parked inside without a syscall-ring walk.
     // Lock-free; four relaxed atomic stores. Behind firefox-test so
     // production builds pay nothing.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         let tid = crate::proc::current_tid();
         let tick = crate::arch::x86_64::irq::TICK_COUNT
@@ -1228,6 +1254,44 @@ pub extern "C" fn syscall_int80_dispatch(
 
 // ===== exec() Implementation ================================================
 
+/// Set a process's syscall personality (`linux_abi` + `subsystem`) from the
+/// `EI_OSABI` byte of the ELF image it is about to run.
+///
+/// This is the single decision point shared by both `exec()` install paths
+/// — the kernel-caller "create new process" arm and the user-mode
+/// "replace image" arm — so the two can never disagree.
+///
+/// Routing contract (see `crate::subsys::elf_is_aether_native`):
+/// - `EI_OSABI == 0xFF` (the AstryxOS native marker) → `Aether`,
+///   `linux_abi = false`; syscalls dispatch through the native
+///   `dispatch_aether` arm using the `astryx_shared::syscall` numbering.
+/// - **everything else** — System-V (`0`), GNU/Linux (`3`), any unknown
+///   value, or a bare static ELF — stays on the **Linux** personality
+///   (`linux_abi = true`).
+///
+/// The Linux default is load-bearing: AstryxOS runs upstream Linux binaries
+/// (glibc, musl, libxul) unmodified, and those carry `EI_OSABI` of `0` or
+/// `3` with no native marker — they must never be routed to Aether.  Per
+/// the ELF gABI, `e_ident[EI_OSABI]` (`0x40..=0xFF` reserved for
+/// architecture/OS-specific use) is the right channel for a private marker.
+pub(crate) fn apply_exec_subsystem(p: &mut crate::proc::Process, elf_data: &[u8]) {
+    if crate::subsys::elf_is_aether_native(elf_data) {
+        p.linux_abi = false;
+        p.subsystem = crate::win32::SubsystemType::Aether;
+        crate::serial_println!(
+            "[SYSCALL] exec: PID {} → Aether native ABI (EI_OSABI=0xFF)",
+            p.pid
+        );
+    } else {
+        p.linux_abi = true;
+        p.subsystem = crate::win32::SubsystemType::Linux;
+        crate::serial_println!(
+            "[SYSCALL] exec: PID {} → Linux personality (linux_abi=true)",
+            p.pid
+        );
+    }
+}
+
 /// Execute a new program, replacing the current process image.
 ///
 /// Execute a new program, replacing the current process image.
@@ -1420,6 +1484,24 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
                 pid, tid, shown, total_args
             );
         }
+
+        // Content-process spawn MILESTONE (low-frequency, DEFAULT-ON). The
+        // `[EXEC] …-isForBrowser …` argv line above is already functional and
+        // default-on, but it is a per-exec line; emit a single stable
+        // `[GATE] content-procs` the first time a `-isForBrowser` content
+        // process is launched so the fast-profile gate monitor has an
+        // unambiguous marker (the bare `isForBrowser` substring also appears in
+        // FF's cached JS, hence the dedicated kernel-emitted gate). Fires once.
+        #[cfg(feature = "firefox-test-core")]
+        {
+            use core::sync::atomic::{AtomicBool, Ordering};
+            static CONTENTPROC_GATE_SEEN: AtomicBool = AtomicBool::new(false);
+            let is_content = argv_owned.iter().any(|a| a == "-isForBrowser")
+                || argv_owned.iter().any(|a| a == "-contentproc");
+            if is_content && !CONTENTPROC_GATE_SEEN.swap(true, Ordering::Relaxed) {
+                crate::serial_println!("[GATE] content-procs");
+            }
+        }
     }
 
     // Validate it's an ELF binary (resolve_shebang guarantees this on Ok).
@@ -1479,15 +1561,16 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
         // resolves to the actual ELF that runs, not the script entry point.
         match crate::proc::usermode::create_user_process_with_args(final_path.as_str(), &elf_data, argv_slice, envp_slice) {
             Ok(new_pid) => {
-                // ELFs loaded from disk use the Linux syscall ABI.
+                // Select the syscall personality from the ELF's EI_OSABI
+                // marker (see `apply_exec_subsystem`).  Disk-loaded ELFs
+                // default to the Linux personality; only an explicit
+                // AstryxOS native marker (EI_OSABI=0xFF) routes to Aether.
                 {
                     let mut procs = crate::proc::PROCESS_TABLE.lock();
                     if let Some(p) = procs.iter_mut().find(|p| p.pid == new_pid) {
-                        p.linux_abi = true;
-                        p.subsystem = crate::win32::SubsystemType::Linux;
+                        apply_exec_subsystem(p, &elf_data);
                     }
                 }
-                crate::serial_println!("[SYSCALL] exec: created process PID {} (linux_abi=true)", new_pid);
                 return new_pid as i64;
             }
             Err(e) => {
@@ -1565,9 +1648,11 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
             //                     here, and the parent still owns its own
             //                     `vm_space` + `cr3`.  We must NOT touch those.
             extracted = p.vm_space.replace(new_vm_space);
-            // ELFs loaded from disk use the Linux syscall ABI.
-            p.linux_abi = true;
-            p.subsystem = crate::win32::SubsystemType::Linux;
+            // Select the syscall personality from the new image's EI_OSABI
+            // marker (see `apply_exec_subsystem`).  Disk-loaded ELFs default
+            // to the Linux personality; only an explicit AstryxOS native
+            // marker (EI_OSABI=0xFF) routes to Aether.
+            apply_exec_subsystem(p, &elf_data);
             // Update /proc/self/exe to the new image's path.  Per `proc(5)`,
             // the symlink target follows the executed program across
             // execve(2) — including the case where the caller forked from
@@ -2131,11 +2216,11 @@ pub fn futex_drain_pid(pid: u64) {
 /// Wake futex waiters from the exit path (CLONE_CHILD_CLEARTID).
 /// This is called from proc::exit_thread when a thread with clear_child_tid exits.
 pub fn futex_wake_for_exit(pid: u64, uaddr: u64, max_wake: u64) {
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     let key_present;
     let tids_to_wake: alloc::vec::Vec<u64> = {
         let mut waiters = FUTEX_WAITERS.lock();
-        #[cfg(feature = "firefox-test")]
+        #[cfg(feature = "firefox-test-core")]
         {
             key_present = waiters.contains_key(&(pid, uaddr));
         }
@@ -2154,7 +2239,7 @@ pub fn futex_wake_for_exit(pid: u64, uaddr: u64, max_wake: u64) {
             alloc::vec::Vec::new()
         }
     };
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         // Snapshot remaining keys for diagnosis if our lookup missed.
         let waiters = FUTEX_WAITERS.lock();
@@ -2228,7 +2313,7 @@ pub(crate) fn write_u32_to_user(cr3: u64, vaddr: u64, val: u32) {
     // W215 axis-B probe: check if the resolved phys page is cache-resident.
     // This writer hits via PHYS_OFF direct map, bypassing user-PTE permission
     // bits — a candidate W215 corruption path.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         let phys_page = phys & !0xFFFu64;
         if let Some(key) = crate::mm::cache::is_phys_in_cache(phys_page) {
@@ -3178,9 +3263,9 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
         // can emit a `[FFTEST/mmap-so]` trace AFTER dropping the lock.  Letting
         // the print happen under PROCESS_TABLE could block other CPUs on a
         // slow serial port.  The capture is gated to match the emit cfg
-        // below — `test-mode` or `firefox-test` — so we don't pay the
-        // String allocation in throughput-only builds.
-        #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+        // below — the `*-trace` features — so neither the per-mmap String
+        // allocation nor the serial line is paid in the fast/perf builds.
+        #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace"))]
         let so_trace_path: Option<alloc::string::String> = {
             let fd_num = fd as usize;
             proc.file_descriptors
@@ -3242,18 +3327,18 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
             }
         };
 
-        #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+        #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace"))]
         {
             (space.cr3, vma_backing, vma_name, chosen_base, so_trace_path)
         }
-        #[cfg(not(any(feature = "firefox-test", feature = "test-mode")))]
+        #[cfg(not(any(feature = "firefox-test-trace", feature = "test-mode-trace")))]
         {
             (space.cr3, vma_backing, vma_name, chosen_base)
         }
     };
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace"))]
     let (cr3, backing, name, base, so_trace_path_out) = mmap_setup;
-    #[cfg(not(any(feature = "firefox-test", feature = "test-mode")))]
+    #[cfg(not(any(feature = "firefox-test-trace", feature = "test-mode-trace")))]
     let (cr3, backing, name, base) = mmap_setup;
 
     // W215 H3a diagnostic: count MAP_SHARED+PROT_WRITE file-backed mappings.
@@ -3267,7 +3352,7 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
     // demand-page faults copy the already-written (e.g. relocated) content
     // into their private frame, producing wrong code bytes at the original
     // file offset (the W215 H3a hypothesis).
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     if (flags & MAP_SHARED as u32 != 0) && (prot & PROT_WRITE != 0) {
         if let VmBacking::File { mount_idx: m, inode: ino, .. } = &backing {
             SYS_MMAP_SHARED_WRITE_FILEBACKED
@@ -3296,7 +3381,7 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
     // mmap-so traces the harness symbolicator cannot resolve user RIPs to
     // `<lib>+offset`, which made `rip-trace`'s output uninterpretable for
     // PIE binaries.
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace"))]
     if let Some(path) = so_trace_path_out {
         crate::serial_println!(
             "[FFTEST/mmap-so] pid={} base={:#x} len={:#x} off={:#x} prot={:#x} fd={} path={}",
@@ -3389,7 +3474,7 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
     // line, which under the demo workload runs into the thousands.  Gate it
     // behind `firefox-trace-verbose`; the `[SC]` / `[SC-RET]` pair under
     // `syscall-trace` already records the mmap return value and length.
-    #[cfg(all(feature = "firefox-test", feature = "firefox-trace-verbose"))]
+    #[cfg(all(feature = "firefox-test-core", feature = "firefox-trace-verbose"))]
     {
         let r = if prot & PROT_READ  != 0 { 'r' } else { '-' };
         let w = if prot & PROT_WRITE != 0 { 'w' } else { '-' };
@@ -3422,7 +3507,7 @@ pub(crate) fn sys_mmap(addr_hint: u64, length: u64, prot: u32, flags: u32, fd: u
             let hint_before = space.mmap_hint;
             space.note_mmap_placement(base, is_fixed, is_stack_alloc);
             let hint_after = space.mmap_hint;
-            #[cfg(all(feature = "firefox-test", feature = "firefox-trace-verbose"))]
+            #[cfg(all(feature = "firefox-test-core", feature = "firefox-trace-verbose"))]
             crate::serial_println!(
                 "[MMAP-HINT] pid={} base={:#x} hint_before={:#x} hint_after={:#x} is_fixed={} is_stack_alloc={}",
                 pid, base, hint_before, hint_after, is_fixed as u8, is_stack_alloc as u8
@@ -4362,7 +4447,7 @@ pub(crate) fn poll_revents(pid: u64, fd: usize, events: u16) -> u16 {
         // pure fd handoff (e.g. an IPC channel/shared-memory fd pass).
         let has_scm = has_scm_deliverable(uid, crate::net::unix::recv_consumed(uid));
         let readable = has_d || has_p || has_scm;
-        #[cfg(feature = "firefox-test")]
+        #[cfg(feature = "firefox-test-core")]
         if pid >= 1 && events & POLLIN != 0 {
             crate::serial_println!("[UNIXPOLL] pid={} fd={} uid={} has_data={} avail={} events={:#x}",
                 pid, fd, uid, has_d, crate::net::unix::bytes_available(uid), events);
@@ -4867,7 +4952,7 @@ pub(crate) fn sys_getrandom(buf: *mut u8, count: usize, flags: u32) -> i64 {
         return -14; // EFAULT
     }
 
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Getrandom, buf, count);
 
     // Record/replay: fill from the deterministic kernel PRNG instead of
@@ -5039,7 +5124,7 @@ pub use crate::subsys::linux::syscall::{
 /// counter at zero, so the dispatch arms enforce validation as designed.
 ///
 /// Only present in `test-mode` and `firefox-test` builds.
-#[cfg(any(feature = "test-mode", feature = "firefox-test"))]
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
 pub static KERNEL_DISPATCH_BYPASS: [core::sync::atomic::AtomicU64; MAX_CPUS] = {
     const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     [Z; MAX_CPUS]
@@ -5053,12 +5138,12 @@ pub static KERNEL_DISPATCH_BYPASS: [core::sync::atomic::AtomicU64; MAX_CPUS] = {
 /// never skipped.  The compiler eliminates the surrounding dead branches.
 #[inline]
 pub fn user_ptr_check_bypassed() -> bool {
-    #[cfg(any(feature = "test-mode", feature = "firefox-test"))]
+    #[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
     {
         let cpu = cpu_index();
         KERNEL_DISPATCH_BYPASS[cpu].load(core::sync::atomic::Ordering::Acquire) > 0
     }
-    #[cfg(not(any(feature = "test-mode", feature = "firefox-test")))]
+    #[cfg(not(any(feature = "test-mode", feature = "firefox-test-core")))]
     {
         false
     }
@@ -5070,12 +5155,12 @@ pub fn user_ptr_check_bypassed() -> bool {
 /// the Linux dispatcher.
 ///
 /// Only present in `test-mode` and `firefox-test` builds.
-#[cfg(any(feature = "test-mode", feature = "firefox-test"))]
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
 pub struct KernelDispatchGuard {
     cpu: usize,
 }
 
-#[cfg(any(feature = "test-mode", feature = "firefox-test"))]
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
 impl KernelDispatchGuard {
     #[inline]
     pub fn new() -> Self {
@@ -5086,7 +5171,7 @@ impl KernelDispatchGuard {
     }
 }
 
-#[cfg(any(feature = "test-mode", feature = "firefox-test"))]
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
 impl Drop for KernelDispatchGuard {
     #[inline]
     fn drop(&mut self) {
@@ -5104,7 +5189,7 @@ impl Drop for KernelDispatchGuard {
 /// the CWE-823 validation gates.
 ///
 /// Only present in `test-mode` and `firefox-test` builds.
-#[cfg(any(feature = "test-mode", feature = "firefox-test"))]
+#[cfg(any(feature = "test-mode", feature = "firefox-test-core"))]
 pub fn dispatch_linux_kernel(num: u64, arg1: u64, arg2: u64, arg3: u64,
                               arg4: u64, arg5: u64, arg6: u64) -> i64 {
     let _g = KernelDispatchGuard::new();

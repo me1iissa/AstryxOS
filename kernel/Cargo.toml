@@ -17,9 +17,52 @@ default = []
 # generic allocator red-zone / guard-byte technique; System V AMD64 ABI §3.1.2
 # (natural alignment of fundamental types).
 heap-canary = []
-test-mode = ["heap-canary"]
+# `test-mode-trace` — the high-frequency per-syscall / per-poll / per-resolve
+# diagnostic serial emitters, split out of `test-mode` so the kernel test
+# suite keeps its historical serial output (`test-mode` = functional + trace)
+# while a future fast-turnaround test profile can drop the spew.  Pure
+# diagnostic: gating it off changes NO kernel behaviour, only what is
+# transcribed to COM1.  Each emitted byte is one PIO VM-exit under KVM
+# (Intel SDM Vol. 3C §25 I/O-instruction VM-exits; NS16550A THR-write model),
+# so on the hot path the spew dominates wall-clock.
+test-mode-trace = []
+test-mode = ["heap-canary", "test-mode-trace"]
 gui-test = []
-firefox-test = ["heap-canary"]
+# `firefox-test-core` — the FUNCTIONAL behaviour the Firefox bring-up path
+# needs to RUN: heap-canary fencing, the FF workload selection + launch in
+# main.rs, kernel-stack pre-alloc, page-cache pre-population, the syscall-ring
+# PID-tracking plumbing, the demand-fault / refcount / TLB bring-up paths, the
+# ghost-hist summary, and the out.png emit.  NONE of this is a hot-path
+# `serial_println!`; gating ONLY on core gives a fast, low-serial boot that
+# still runs Firefox identically.
+firefox-test-core = ["heap-canary"]
+# `firefox-test-trace` — ALL the high-frequency diagnostic serial emitters the
+# Firefox path historically printed per-syscall: the [FF/stderr] / [FF/write]
+# stdout/stderr mirror (the single largest serial source — ~78% of a real
+# 45 MB boot log), [POLL_RET], the per-component [VFS/resolve] trace, and the
+# [FUTEX_WAIT_REG]/[FUTEX_WAKE]/[FUTEX_TIMEDOUT]/[FUTEX_WAKE_REQ]/
+# [FUTEX_WAKE_GHOST*] traces.  Gating these off makes a perf/render/CI boot
+# emit <2 MB of serial instead of ~45 MB, collapsing the synchronous PIO
+# VM-exit cost (Intel SDM Vol. 3C §25 I/O-instruction VM-exits).  Pure
+# diagnostic — no correctness role.  Depends on `firefox-test-core` because the
+# trace emitters reuse core-only diagnostic plumbing (e.g. the syscall-ring
+# `dump_futex_wait_stack` rbp-chain walker) — trace is a strict superset of the
+# functional core, never a standalone.
+firefox-test-trace = ["firefox-test-core"]
+# Backward-compatible super-feature: `--features firefox-test` enables both the
+# functional core and the full diagnostic trace, so existing debugging
+# invocations are byte-identical to before this split.  Perf/render/CI boots
+# enable only `firefox-test-core` for the fast, low-serial profile.
+firefox-test = ["firefox-test-core", "firefox-test-trace"]
+# `fork-cow-trace` — the per-fork [FORK-COW] page-table dump in
+# `VmSpace::clone_for_fork` (a START line, one line per VMA — ~100 per Firefox
+# process — a PML4-present line per populated top-level slot, and a total
+# line).  This was historically ALWAYS-ON (no cfg gate), so it taxed EVERY
+# fork(2) in EVERY build including stock production.  Off by default now;
+# enable only when debugging the CoW page-table walk.  The cr3-mismatch WARN
+# and the OOM line in the same function stay UNCONDITIONAL — they are rare,
+# real signals, not hot-path chatter.
+fork-cow-trace = []
 # X11 "hello world" pivot — launches Alpine's xeyes binary (~28 KB musl PIE,
 # linked against libX11/libXt/libXmu/libxcb) as the test workload instead of
 # Firefox.  Shares the in-kernel Xastryx server (kernel/src/x11/) with
@@ -309,14 +352,18 @@ firefox-trace-verbose = []
 # line per #PF (before VMA resolution). Pairs with `syscall-trace` to make a
 # full cause-and-effect stream for Ring 3 crashes. See docs/HARNESS.md.
 pf-trace = []
-# Tier-0 virtio-blk request tracing. Emits one `[BLK] op=R|W lba=<sector>
-# len=<sectors> pid=<n>` line per submitted virtio-blk request (per batched
-# descriptor chain, so the LBA granularity reflects the actual on-disk request
-# rather than the logical caller range). Off by default — default builds emit
-# no per-request line and pay zero overhead. Enable alongside `firefox-test`
-# to feed the data.img block-map heatmap in `scripts/serial-web.py`
-# (`qemu-harness.py grep <sid> '^\[BLK\] '`). The serial log does not otherwise
-# carry per-request LBAs; only the aggregate `disk=R../W..` bytes counter does.
+# Per-request virtio-blk LBA trace for the data.img block-map heatmap
+# (default-OFF). When enabled, each submitted virtio request appends an
+# (op,lba,len,pid) record to a lock-free in-memory ring (drivers/blk_trace.rs).
+# The ring is drained OUT OF BAND — `qemu-harness.py blk-trace drain <sid>`
+# (JSON) or the kdb `blk-trace` op, or a one-shot serial flush for the legacy
+# heatmap ingestion. This is the cheap form: recording is a single relaxed
+# fetch_add, so unlike a synchronous per-op `serial_println!` it adds NO
+# per-op COM1 PIO VM-exit storm under KVM. A prior synchronous-serial design
+# slowed a 50k-read disk run ~39x under KVM (Intel SDM Vol.3C §25.1.3 — every
+# `outb` to COM1 is a VM-exit; NS16550A datasheet §8.3 — per-chunk THR drain
+# spin). Recording compiles to an empty no-op when this feature is off, so
+# default builds are byte-identical.
 blk-trace = []
 # Tier-1 in-kernel debugger. Opens a read-only JSON introspection TCP server
 # on port 9999 (proc-list, proc, vfs-mounts, dmesg, syms, mem, trace-status,

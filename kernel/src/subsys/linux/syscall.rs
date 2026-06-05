@@ -131,9 +131,9 @@ fn memfd_seals_add(inode: u64, new_seals: u32) -> i64 {
 // Lockless reads/writes via `AtomicU64`; sized for ≤16 concurrent vfork
 // parents which is well above any observed live count.  No allocation, no
 // teardown — entries are overwritten in place.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 const MAX_INFLIGHT: usize = 16;
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 static RBP_PRE_CACHE: [(core::sync::atomic::AtomicU64, core::sync::atomic::AtomicU64); MAX_INFLIGHT] = [
     (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)),
     (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)),
@@ -157,7 +157,7 @@ static RBP_PRE_CACHE: [(core::sync::atomic::AtomicU64, core::sync::atomic::Atomi
 /// on `parent_tid` if present, else claims an empty slot (key==0).  Falls
 /// back to slot 0 on full ring — only loses precision for unrealistic
 /// concurrent-vfork counts.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn rbp_pre_cache_store(parent_tid: u64, rbp: u64) {
     use core::sync::atomic::Ordering;
     for (k, v) in RBP_PRE_CACHE.iter() {
@@ -176,7 +176,7 @@ fn rbp_pre_cache_store(parent_tid: u64, rbp: u64) {
 /// snapshot has been stored (e.g. on a post-wake call without a matching
 /// pre-block).  Does NOT clear the slot — re-vfork by the same TID
 /// overwrites in-place.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn rbp_pre_cache_load(parent_tid: u64) -> Option<u64> {
     use core::sync::atomic::Ordering;
     for (k, v) in RBP_PRE_CACHE.iter() {
@@ -187,7 +187,7 @@ fn rbp_pre_cache_load(parent_tid: u64) -> Option<u64> {
     None
 }
 
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn vfork_canary_snapshot(label: &str, pid: u32, parent_tid: u64) {
     use core::fmt::Write;
 
@@ -323,7 +323,7 @@ fn vfork_canary_snapshot(label: &str, pid: u32, parent_tid: u64) {
     crate::serial_println!("{}", line);
 }
 
-#[cfg(not(any(feature = "firefox-test", feature = "test-mode")))]
+#[cfg(not(any(feature = "firefox-test-core", feature = "test-mode")))]
 fn vfork_canary_snapshot(_label: &str, _pid: u32, _parent_tid: u64) {}
 
 /// Check whether the current process uses the Linux syscall ABI.
@@ -949,7 +949,13 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
         let kdepth = if kstack_base > 0 {
             kstack_base.wrapping_add(kstack_size).wrapping_sub(rsp_live)
         } else { 0 };
-        crate::serial_println!(
+        // Firehose: one ~150-byte line per syscall.  Route through the
+        // near-zero-overhead guest-RAM log ring (drivers::log_ring) instead of
+        // the per-byte COM1 16550 PIO path — under KVM the latter is ~one
+        // VM-exit per byte (Intel SDM Vol. 3C §25.1.3), which dominates a
+        // high-syscall-rate boot.  `serial_fast_println!` falls back to COM1
+        // when the ring sink is disabled, so the trace is never lost.
+        crate::serial_fast_println!(
             "[SC] pid={} tid={} nr={} rip={:#x} cr={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x} a6={:#x} ksp={:#x} kdepth={:#x}",
             pid_now,
             tid_now,
@@ -987,7 +993,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     // build clean.  The default `firefox-test` still emits the `[SC]` line
     // (under `syscall-trace`), which carries the leaf RIP and caller RIP —
     // sufficient for throughput measurement.
-    #[cfg(all(feature = "firefox-test", feature = "firefox-trace-verbose"))]
+    #[cfg(all(feature = "firefox-test-core", feature = "firefox-trace-verbose"))]
     {
         // First PID at which the user-stack snapshot emitter starts firing.
         // Lower PIDs belong to the kernel bringup chain (idle, init, X11
@@ -1061,7 +1067,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     // Record the call at entry so that the path/return-value hooks inside
     // sys_read_linux / sys_open_linux can attach extra context before we
     // patch the return value after the match dispatch completes.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     let ring_entry_idx = {
         let pid = crate::proc::current_pid_lockless();
         // Auto-track every user-process PID >= 1 that makes a Linux syscall —
@@ -1081,7 +1087,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
             None
         }
     };
-    #[cfg(not(feature = "firefox-test"))]
+    #[cfg(not(feature = "firefox-test-core"))]
     let _ring_entry_idx: Option<usize> = None;
 
     // ── Transient debug trace: log Linux syscalls from user processes ─────────
@@ -1094,7 +1100,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     // identifies every syscall by number, pid, tid, and full argv.  Keep the
     // non-`firefox-test` branch (which limits to 500 lines from pid >= 12)
     // since it is bounded and useful for early-boot diagnostics.
-    #[cfg(all(feature = "firefox-test", feature = "firefox-trace-verbose"))]
+    #[cfg(all(feature = "firefox-test-core", feature = "firefox-trace-verbose"))]
     {
         static TRACE_N: core::sync::atomic::AtomicU64 =
             core::sync::atomic::AtomicU64::new(0);
@@ -1106,7 +1112,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
             }
         }
     }
-    #[cfg(not(feature = "firefox-test"))]
+    #[cfg(not(feature = "firefox-test-core"))]
     {
         static TRACE_N: core::sync::atomic::AtomicU64 =
             core::sync::atomic::AtomicU64::new(0);
@@ -1133,7 +1139,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     // sys_open_linux can attach path / read-content context to the pending
     // entry without needing to thread it through every syscall signature.
     // Syscalls are serialised per CPU, so a single atomic per CPU is safe.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     crate::subsys::linux::syscall_ring::set_current_entry(ring_entry_idx);
 
     // Route through dispatch_body() so an early `return` inside any match
@@ -1142,7 +1148,7 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     let ret: i64 = dispatch_body(num, arg1, arg2, arg3, arg4, arg5, arg6);
 
     // ── Close out the ring entry with the syscall's return value ─────────────
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         let pid = crate::proc::current_pid_lockless();
         crate::syscall::ring::end(pid, ring_entry_idx, ret);
@@ -1168,8 +1174,10 @@ pub fn dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64,
     // Emitted AFTER the handler returns but BEFORE the caller writes RAX
     // back to the user frame, so the trace reflects the actual syscall
     // result the process will observe.
+    // Firehose return-side line — same per-syscall cadence as `[SC]`; route
+    // through the cheap guest-RAM ring (see the `[SC]` emit site above).
     #[cfg(feature = "syscall-trace")]
-    crate::serial_println!(
+    crate::serial_fast_println!(
         "[SC-RET] pid={} tid={} nr={} ret={:#x}",
         crate::proc::current_pid_lockless(),
         crate::proc::current_tid(),
@@ -1404,7 +1412,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
 
             // Poll entry logging disabled — deep call stack + serial formatting
             // was contributing to kernel stack overflow for Firefox.
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-core")]
             if false && pid >= 1 {
                 crate::serial_println!("[POLL_ENTRY] pid={} nfds={} timeout={}",
                     pid, nfds, timeout_ms);
@@ -1464,7 +1472,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 crate::net::poll();
                 let r = do_check(true, true);
                 if r > 0 {
-                    #[cfg(feature = "firefox-test")]
+                    #[cfg(feature = "firefox-test-trace")]
                     if pid >= 1 { crate::serial_println!("[POLL_RET] pid={} ret={} (post-x11-poll)", pid, r); }
                     return r;
                 }
@@ -1513,7 +1521,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     }
                     let r = do_check(true, true);
                     if r > 0 {
-                        #[cfg(feature = "firefox-test")]
+                        #[cfg(feature = "firefox-test-trace")]
                         if pid >= 1 { crate::serial_println!("[POLL_RET] pid={} ret={} (woke)", pid, r); }
                         return r;
                     }
@@ -1521,11 +1529,11 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     let now = crate::arch::x86_64::irq::get_ticks();
                     if now >= deadline_tick { break; }
                 }
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-trace")]
                 if pid >= 1 { crate::serial_println!("[POLL_RET] pid={} ret=0 (timeout)", pid); }
                 0
             } else {
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-trace")]
                 if pid >= 1 { crate::serial_println!("[POLL_RET] pid={} ret={} (immediate)", pid, ready); }
                 ready
             }
@@ -1586,7 +1594,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // 33: dup2(oldfd, newfd) — duplicate fd to specific slot
         33 => {
             let ret = crate::syscall::sys_dup2(arg1 as usize, arg2 as usize);
-            #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+            #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
             {
                 let pid = crate::proc::current_pid_lockless();
                 if pid == 1 || crate::syscall::ring::is_tracked(pid) {
@@ -1692,7 +1700,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 let path_bytes: &[u8] = &path_owned;
                 // Strip trailing NUL
                 let plen = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-core")]
                 if pid >= 1 {
                     if let Ok(p) = core::str::from_utf8(&path_bytes[..plen]) {
                         crate::serial_println!("[FF/connect] pid={} path={}", pid, p);
@@ -2570,6 +2578,11 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 // memory.  Held for the call duration; we drop it before
                 // the subsequent allocations / table walks below.
                 const MSG_TRUNC: u32 = 0x20;
+                // recvmsg(2): MSG_CTRUNC indicates that some ancillary control
+                // data was discarded because the receiver's `msg_control`
+                // buffer was too small.  Independent of MSG_TRUNC (data
+                // truncation); both may be set on the same call.
+                const MSG_CTRUNC: u32 = 0x8;
                 bytes_read = {
                     let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
                     let buf = unsafe { core::slice::from_raw_parts_mut(dst, eff_cap) };
@@ -2609,21 +2622,63 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 // not pick up a later frame's fds.
                 if bytes_read >= 0 {
                     let consumed = crate::net::unix::recv_consumed(unix_id);
-                    if let Some(scm_fds) = crate::syscall::scm_dequeue(unix_id, consumed) {
+                    // Pop the batch together with its bound stream offset so an
+                    // un-installed remainder can be re-queued at the SAME offset
+                    // (recvmsg(2) / cmsg(3): control data that does not fit is
+                    // not dropped — MSG_CTRUNC is raised and the unfitting fds
+                    // remain available to a subsequent larger-buffer recvmsg).
+                    if let Some((batch_off, mut scm_fds)) =
+                        crate::syscall::scm_dequeue_with_offset(unix_id, consumed)
+                    {
+                        let nfds = scm_fds.len();
+                        // Read the receiver's msg_control geometry up front so we
+                        // know how many descriptors actually fit BEFORE moving any
+                        // into the fd table.  cmsg(3): a single SCM_RIGHTS cmsg of
+                        // n fds occupies `CMSG_SPACE(n*4)` = 16 (cmsghdr) + n*4
+                        // bytes (we lay the fd array immediately after the 16-byte
+                        // header with no extra alignment padding, matching the
+                        // CMSG_FIRSTHDR/CMSG_DATA offsets glibc & musl compute).
+                        let (ctrl_ptr, ctrl_len) = unsafe {
+                            let _g = crate::arch::x86_64::smap::UserGuard::new();
+                            (core::ptr::read_unaligned(msghdr_ptr.add(4)),
+                             core::ptr::read_unaligned(msghdr_ptr.add(5)) as usize)
+                        };
+                        // How many fds fit: floor((ctrl_len - 16) / 4), clamped to
+                        // the batch size and to 0 when ctrl_len < 16.  A ctrl_ptr
+                        // of 0, or a range that fails user-pointer validation, is
+                        // treated as "nothing fits" so the whole batch is re-queued
+                        // and MSG_CTRUNC is raised.
+                        let mut fits = ((ctrl_len.saturating_sub(16)) / 4).min(nfds);
+                        // `validate_user_ptr` is bypassed inside a
+                        // KernelDispatchGuard (in-kernel test driver passing
+                        // kernel-VA buffers); in production it is the only
+                        // defence against a kernel-VA in msg_control directing
+                        // a supervisor write — see CWE-823 note below.
+                        let ctrl_ok = ctrl_ptr != 0
+                            && fits > 0
+                            && (crate::syscall::user_ptr_check_bypassed()
+                                || crate::syscall::validate_user_ptr(ctrl_ptr, 16 + fits * 4));
+                        if ctrl_ptr == 0 || !ctrl_ok {
+                            fits = 0;
+                        }
+                        // Split off the descriptors that will NOT be installed on
+                        // this call; they are re-queued at the batch's original
+                        // stream offset so a follow-up recvmsg adopts them.
+                        let remainder: Vec<crate::vfs::FileDescriptor> =
+                            scm_fds.split_off(fits);
                         // Regular-file / memfd descriptors were pinned at enqueue
                         // (PENDING_SCM holds an inode reference invisible to the
                         // VFS fd-table scan).  Once installed in the receiver's
                         // fd table below, the slot itself keeps the inode alive,
                         // so the in-flight pin can be released.  Snapshot the
-                        // (mount_idx, inode) pairs BEFORE the descriptors are
-                        // moved into the table; unpin AFTER PROCESS_TABLE is
-                        // dropped (unpin_inode also takes PROCESS_TABLE).
+                        // (mount_idx, inode) pairs for the INSTALLED prefix only —
+                        // the re-queued remainder keeps its enqueue-time pin.
                         let to_unpin: Vec<(usize, u64)> = scm_fds.iter()
                             .filter(|f| f.file_type == crate::vfs::FileType::RegularFile
                                         && f.mount_idx != usize::MAX)
                             .map(|f| (f.mount_idx, f.inode))
                             .collect();
-                        // Allocate fds in the receiver's process.
+                        // Allocate fds in the receiver's process for the prefix.
                         let new_fd_nums: Vec<i32> = {
                             let mut procs = crate::proc::PROCESS_TABLE.lock();
                             if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
@@ -2646,44 +2701,61 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         for (m, ino) in to_unpin {
                             crate::vfs::unpin_inode(m, ino);
                         }
-                        // Write SCM_RIGHTS cmsghdr into msg_control.  All
-                        // reads/writes here target user memory — single
-                        // SMAP guard spanning the whole block.
+                        // Re-queue the un-installed remainder at the SAME stream
+                        // offset the batch was dequeued from (recvmsg(2) /
+                        // cmsg(3): descriptors that did not fit are NOT orphaned —
+                        // CWE-772).  Keeping the original byte_offset preserves the
+                        // first-byte-touch delivery contract so the next recvmsg
+                        // with a larger control buffer adopts them.
+                        if !remainder.is_empty() {
+                            crate::syscall::scm_queue(unix_id, batch_off, remainder);
+                        }
+                        // The control buffer truncated the batch (either some fds
+                        // did not fit, or ctrl_ptr was 0 / rejected with nfds > 0):
+                        // set MSG_CTRUNC.  OR it into the existing msg_flags so the
+                        // MSG_TRUNC data-truncation bit written by the data path
+                        // above is preserved — both can co-occur (recvmsg(2)).
+                        if new_fd_nums.len() < nfds {
+                            unsafe {
+                                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                                let flags_ptr = (arg2 + 48) as *mut u32;
+                                let cur = core::ptr::read_unaligned(flags_ptr);
+                                core::ptr::write_unaligned(flags_ptr, cur | MSG_CTRUNC);
+                            }
+                        }
+                        // Write the SCM_RIGHTS cmsghdr for the INSTALLED prefix.
+                        // All reads/writes here target user memory — single SMAP
+                        // guard spanning the whole block.
                         //
                         // CWE-823: ctrl_ptr is read from user-controlled
-                        // msghdr.msg_control and is the destination of
-                        // kernel writes below.  Range-validate against the
-                        // exact byte span the writes will touch (`needed`)
-                        // before any write so a kernel-VA in msg_control
-                        // cannot direct the kernel to overwrite arbitrary
-                        // kernel memory with attacker-shaped cmsghdr bytes
-                        // (SOL_SOCKET=1, SCM_RIGHTS=1, then the receiver's
-                        // freshly-installed fd numbers).  SMAP catches the
-                        // missing-AC=1 case for user pages but does not
-                        // catch supervisor writes to kernel-VA; the range
-                        // check is the only line of defence for that.
-                        let needed = 16 + new_fd_nums.len() * 4;
+                        // msghdr.msg_control and is the destination of kernel
+                        // writes below.  The span actually written
+                        // (`16 + fits*4`) was range-validated above
+                        // (`ctrl_ok`); we never write past it.  SMAP catches the
+                        // missing-AC=1 case for user pages; the range check is the
+                        // only line of defence against a kernel-VA in msg_control.
                         unsafe {
                             let _g = crate::arch::x86_64::smap::UserGuard::new();
-                            let ctrl_ptr = core::ptr::read_unaligned(msghdr_ptr.add(4));
-                            let ctrl_len = core::ptr::read_unaligned(msghdr_ptr.add(5)) as usize;
-                            if ctrl_ptr != 0
-                                && ctrl_len >= needed
-                                && crate::syscall::validate_user_ptr(ctrl_ptr, needed)
-                            {
-                                core::ptr::write_unaligned(ctrl_ptr as *mut u64, needed as u64);
+                            if !new_fd_nums.is_empty() {
+                                // ctrl_ok held when fits>0, so the span below was
+                                // validated; cmsg_len = CMSG_LEN(fits*4) = 16 + n*4.
+                                let written = 16 + new_fd_nums.len() * 4;
+                                core::ptr::write_unaligned(ctrl_ptr as *mut u64, written as u64);
                                 core::ptr::write_unaligned((ctrl_ptr + 8)  as *mut i32, 1i32); // SOL_SOCKET
                                 core::ptr::write_unaligned((ctrl_ptr + 12) as *mut i32, 1i32); // SCM_RIGHTS
                                 for (i, &new_fd) in new_fd_nums.iter().enumerate() {
                                     core::ptr::write_unaligned((ctrl_ptr + 16 + i as u64 * 4) as *mut i32, new_fd);
                                 }
-                                core::ptr::write_unaligned(msghdr_ptr.add(5) as *mut u64, needed as u64);
+                                // msg_controllen = bytes actually written.
+                                core::ptr::write_unaligned(msghdr_ptr.add(5) as *mut u64, written as u64);
                             } else if ctrl_ptr != 0 {
-                                // No room or ctrl_ptr not in user space.  The
-                                // msghdr_ptr was already user-range-validated
-                                // at the top of the recvmsg arm, so this
-                                // single field write is safe even when
-                                // ctrl_ptr is rejected.
+                                // Nothing installed (buffer too small for even one
+                                // fd, or ctrl_ptr rejected): no cmsg written,
+                                // CMSG_FIRSTHDR()==NULL.  msg_controllen = 0;
+                                // MSG_CTRUNC was set above.  The msghdr_ptr was
+                                // user-range-validated at the top of the arm, so
+                                // this single field write is safe even when
+                                // ctrl_ptr itself was rejected.
                                 core::ptr::write_unaligned(msghdr_ptr.add(5) as *mut u64, 0u64);
                             }
                         }
@@ -2701,68 +2773,80 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             } else {
                 if !crate::syscall::is_socket_fd(pid, fd) { return -9; }
                 let socket_id = crate::syscall::get_socket_id(pid, fd);
-                // Per recvmsg(2) / IEEE 1003.1 §recv: on a non-blocking
-                // socket an empty receive queue must return -1/EAGAIN, while
-                // an orderly peer shutdown (EOF) returns 0.  Collapsing both
-                // to 0 (the prior `Ok(empty) => 0`) lied to the caller: a
-                // polled IPC reactor read the 0 as a readable edge and
-                // re-issued recvmsg in a tight loop, never yielding.  Use the
-                // status-aware recv so the two cases get their correct
-                // returns (WouldBlock → -EAGAIN, Eof → 0).
-                bytes_read = match crate::net::socket::socket_recv_status_from(socket_id) {
-                    Ok((crate::net::socket::RecvOutcome::Data(data), src_ip, src_port)) => {
-                        let n = data.len().min(cap);
-                        unsafe {
-                            let _g = crate::arch::x86_64::smap::UserGuard::new();
-                            core::ptr::copy_nonoverlapping(data.as_ptr(), dst, n);
-                        }
-                        // Marshal the source 4-tuple into msg_name/msg_namelen.
-                        // The x86_64 `struct msghdr` lays msg_name at offset 0
-                        // (void*) and msg_namelen at offset 8 (socklen_t, 4
-                        // bytes).  Per recvmsg(2): if msg_name is non-NULL the
-                        // kernel fills it with the source address and sets
-                        // msg_namelen to the address length (truncating the
-                        // copy, but never the reported length, into a short
-                        // buffer).  Without this a connection-mode UDP resolver
-                        // such as musl's __res_msend validates the reply source
-                        // (a zero msg_name) against the nameserver it queried
-                        // and DROPS the reply (RFC 1035 §7.3), surfacing as
-                        // getaddrinfo(3) EAI_AGAIN.  This mirrors the recvfrom(2)
-                        // (syscall 45) marshalling above.
-                        let (name_ptr, name_cap) = unsafe {
-                            let _g = crate::arch::x86_64::smap::UserGuard::new();
-                            let np = core::ptr::read_unaligned(msghdr_ptr as *const u64);
-                            let nl = core::ptr::read_unaligned(
-                                (arg2 + 8) as *const u32) as usize;
-                            (np, nl)
-                        };
-                        if name_ptr != 0
-                            && crate::syscall::validate_user_ptr(name_ptr, 16.min(name_cap.max(1)))
-                        {
-                            // sockaddr_in is 16 bytes; copy min(name_cap, 16)
-                            // and always report 16 as the address length
-                            // (recvmsg(2) truncation semantics).
-                            let mut sa = [0u8; 16];
-                            sa[0] = 2; // AF_INET (sin_family lo)
-                            let p = src_port.to_be_bytes();
-                            sa[2] = p[0]; sa[3] = p[1];                 // sin_port
-                            sa[4] = src_ip[0]; sa[5] = src_ip[1];
-                            sa[6] = src_ip[2]; sa[7] = src_ip[3];       // sin_addr
-                            let cw = name_cap.min(16);
-                            unsafe {
-                                let _g = crate::arch::x86_64::smap::UserGuard::new();
-                                core::ptr::copy_nonoverlapping(
-                                    sa.as_ptr(), name_ptr as *mut u8, cw);
-                                core::ptr::write_unaligned(
-                                    (arg2 + 8) as *mut u32, 16u32);
+                // msghdr.msg_name / msg_namelen (x86_64 ABI): msg_name is the
+                // first 8-byte word (offset 0), msg_namelen is the socklen_t at
+                // offset 8 (low 32 bits of the second word).  recvmsg(2): on a
+                // datagram socket the source address of the received datagram
+                // is stored in msg_name (when non-NULL) and msg_namelen is set
+                // to the size of the stored address.
+                let (name_ptr, name_cap) = unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    (core::ptr::read_unaligned(msghdr_ptr.add(0)),
+                     core::ptr::read_unaligned(msghdr_ptr.add(1)) as u32 as usize)
+                };
+                if crate::net::socket::socket_is_udp(socket_id) {
+                    // Datagram path.  Use the source-address-bearing receive so
+                    // the reply's origin can be marshalled into msg_name — this
+                    // is REQUIRED by userspace DNS resolvers (RFC 1035 §4.2.1,
+                    // DNS over UDP:53) that validate the reply's source against
+                    // the configured nameserver before accepting it; without
+                    // the source, every reply is dropped and getaddrinfo(3)
+                    // times out.  A datagram socket has no orderly-EOF concept,
+                    // so an empty result is WouldBlock → EAGAIN per recvmsg(2).
+                    bytes_read = match crate::net::socket::socket_recvfrom(socket_id) {
+                        Ok((data, src_ip, src_port)) => {
+                            if data.is_empty() {
+                                -11 // EAGAIN
+                            } else {
+                                let n = data.len().min(cap);
+                                unsafe {
+                                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                                    core::ptr::copy_nonoverlapping(data.as_ptr(), dst, n);
+                                }
+                                // Marshal the datagram source into msg_name when
+                                // the caller provided a buffer.  write_sockaddr_in
+                                // sets sin_family=AF_INET, sin_port=htons(src_port),
+                                // sin_addr=src_ip and writes msg_namelen=16.  When
+                                // msg_name is NULL the address is dropped
+                                // (recvmsg(2)): leave msg_namelen untouched.
+                                if name_ptr != 0 {
+                                    // msg_namelen is the socklen_t at byte
+                                    // offset 8 of the user msghdr (arg2 base).
+                                    let namelen_ptr = (arg2 + 8) as *mut u32;
+                                    write_sockaddr_in(name_ptr, namelen_ptr,
+                                                      src_ip, src_port, name_cap);
+                                }
+                                n as i64
                             }
                         }
-                        n as i64
-                    }
-                    Ok((crate::net::socket::RecvOutcome::Eof, _, _)) => 0,
-                    Ok((crate::net::socket::RecvOutcome::WouldBlock, _, _)) => -11, // EAGAIN
-                    Err(_) => -11,
-                };
+                        Err(_) => -11, // EAGAIN
+                    };
+                } else {
+                    // Connection-mode (TCP) path.  The source is the fixed
+                    // connected peer, so per recvmsg(2) we leave msg_name
+                    // untouched (a stream socket reports no per-message source).
+                    // Per recvmsg(2) / IEEE 1003.1 §recv: on a non-blocking
+                    // socket an empty receive queue must return -1/EAGAIN, while
+                    // an orderly peer shutdown (EOF) returns 0.  Collapsing both
+                    // to 0 (the prior `Ok(empty) => 0`) lied to the caller: a
+                    // polled IPC reactor read the 0 as a readable edge and
+                    // re-issued recvmsg in a tight loop, never yielding.  Use the
+                    // status-aware recv so the two cases get their correct
+                    // returns (WouldBlock → -EAGAIN, Eof → 0).
+                    bytes_read = match crate::net::socket::socket_recv_status(socket_id) {
+                        Ok(crate::net::socket::RecvOutcome::Data(data)) => {
+                            let n = data.len().min(cap);
+                            unsafe {
+                                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                                core::ptr::copy_nonoverlapping(data.as_ptr(), dst, n);
+                            }
+                            n as i64
+                        }
+                        Ok(crate::net::socket::RecvOutcome::Eof) => 0,
+                        Ok(crate::net::socket::RecvOutcome::WouldBlock) => -11, // EAGAIN
+                        Err(_) => -11,
+                    };
+                }
             }
             bytes_read
         }
@@ -4377,7 +4461,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                  *((arg1 + 16) as *const u64),
                  *((arg1 + 24) as *const u64))
             };
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-core")]
             crate::serial_println!(
                 "[CLONE3] flags={:#x} child_tid={:#x} parent_tid={:#x} arg2_size={}",
                 clone_flags, child_tidptr, parent_tidptr, arg2
@@ -4745,7 +4829,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             if !crate::syscall::validate_user_ptr(arg2, 144) {
                 return -14; // EFAULT
             }
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-core")]
             crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Getrusage, arg2 as *const u8, 144);
 
             // RUSAGE_CHILDREN: we don't currently track per-child rollups;
@@ -4843,7 +4927,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             if !crate::syscall::validate_user_ptr(arg1, 112) {
                 return -14; // EFAULT
             }
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-core")]
             crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Sysinfo, arg1 as *const u8, 112);
 
             // Live system state.
@@ -5136,7 +5220,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     }
                 }
             }
-            #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+            #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
             {
                 let pid = crate::proc::current_pid_lockless();
                 if pid == 1 || crate::syscall::ring::is_tracked(pid) {
@@ -5171,7 +5255,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 Ok(st) => {
                     // struct statx is 256 bytes; zero the whole thing first
                     let base = arg5 as *mut u8;
-                    #[cfg(feature = "firefox-test")]
+                    #[cfg(feature = "firefox-test-core")]
                     crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Statx, base, 256);
                     let mode: u16 = match st.file_type {
                         crate::vfs::FileType::Directory => 0o040_755,
@@ -5236,7 +5320,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // 100: times(buf) — CPU usage times; return zero struct
         100 => {
             if arg1 != 0 && crate::syscall::validate_user_ptr(arg1, 32) {
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-core")]
                 crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Times, arg1 as *const u8, 32);
                 unsafe {
                     let _g = crate::arch::x86_64::smap::UserGuard::new();
@@ -5286,7 +5370,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // 127: rt_sigpending(set, sigsetsize) — stub: no pending signals
         127 => {
             if arg1 != 0 && crate::syscall::validate_user_ptr(arg1, arg2 as usize) {
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-core")]
                 crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Memset, arg1 as *const u8, arg2 as usize);
                 unsafe {
                     let _g = crate::arch::x86_64::smap::UserGuard::new();
@@ -5919,13 +6003,13 @@ fn sys_select_linux(
 
 /// W215 telemetry: number of MADV_DONTNEED/MADV_FREE per-page zero-fills
 /// suppressed by the file-backed guard.  Read from kdb / serial logging.
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 static MADV_ZERO_SUPPRESSED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
 /// Number of zero-fills the W215 file-backed guard has suppressed.  Always 0
 /// on non-firefox-test builds.
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 pub fn madv_zero_suppressed_count() -> u64 {
     MADV_ZERO_SUPPRESSED.load(core::sync::atomic::Ordering::Relaxed)
 }
@@ -6071,7 +6155,7 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
                     // mean the guard is dead code (e.g. file-backed regions
                     // never receiving MADV_DONTNEED) and the actual writer is
                     // elsewhere.
-                    #[cfg(feature = "firefox-test")]
+                    #[cfg(feature = "firefox-test-core")]
                     MADV_ZERO_SUPPRESSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
                 // Clear the PTE.  Do NOT free the frame yet.
@@ -6270,7 +6354,7 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
         let avail = crate::net::unix::bytes_available(unix_id);
         let buf_sl = unsafe { core::slice::from_raw_parts_mut(buf_ptr, count) };
         let ret = crate::net::unix::read(unix_id, buf_sl);
-        #[cfg(feature = "firefox-test")]
+        #[cfg(feature = "firefox-test-core")]
         if pid >= 1 {
             crate::serial_println!("[XSOCK] read fd={} uid={} want={} avail={} got={}",
                 fd, unix_id, count, avail, ret);
@@ -6385,7 +6469,7 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
     match crate::vfs::fd_read(pid, fd as usize, buf_ptr, count) {
         Ok(n) => {
             crate::mm::file_buf_witness::post_read(__fbw_snap, n as i64);
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-core")]
             {
                 // Look up the fd's open_path to decide whether to peek.  We
                 // do this AFTER the read so we see the actual returned bytes.
@@ -6470,6 +6554,106 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
     }
 }
 
+// ── Render-lifecycle MILESTONE markers (low-frequency, DEFAULT-ON) ──────────
+//
+// Distinct from the `[FF/stderr]`/`[FF/write]` per-write firehose above (which
+// is gated on the `*-trace` features and transcribes EVERY tracked write — one
+// PIO VM-exit per byte, ~78% of a full boot log). These milestone markers are
+// the OPPOSITE: a tiny curated substring set covering the headless-screenshot
+// render lifecycle, each emitted EXACTLY ONCE per boot (first-arrival), so the
+// total cost is a handful of serial lines for the whole run — not a firehose.
+//
+// They exist so the deep render gates are visible on the fast default profile
+// (`firefox-test-core`, diagnostic serial OFF) without re-enabling the firehose:
+// the serial monitor and perf phase taxonomy detect `screenshot-actors`,
+// `drawSnapshot`, etc. from these `[GATE] <label>` lines instead of from the
+// now-gated-off `[FF/write]` mirror.
+//
+// Each curated substring maps to one bit of `MILESTONE_SEEN`; once a bit is set
+// the marker never re-emits, so a matching string appearing thousands of times
+// in FF's IPDL traffic still produces a single line. The earlier bring-up gates
+// are emitted elsewhere: content-process spawn from the exec path
+// (`[GATE] content-procs`, next to the `[EXEC] …-isForBrowser` argv line) and
+// libxul load from the open path (`[GATE] libxul`, because the per-open
+// `[FF/open]` mirror is trace-gated). So this write-payload set only needs the
+// render-stage substrings that have no other default-on signal.
+//
+// (label, substring) — order is the bit index; keep ≤32 entries (u32 mask).
+#[cfg(feature = "firefox-test-core")]
+const MILESTONE_MARKERS: &[(&str, &[u8])] = &[
+    // screenshot-actors stage — the IPDL screenshot query/parent actors. These
+    // protocol-actor names are specific to the headless-screenshot path and do
+    // not appear in ordinary page content.
+    ("screenshot-actors", b"getDimensions"),
+    ("screenshot-actors", b"ScreenshotParent"),
+    ("screenshot-actors", b"sendQuery"),
+    // drawSnapshot / cross-process paint stage — the actual composite + draw.
+    // `drawSnapshot` and `CrossProcessPaint` are render-API-specific symbols.
+    ("drawSnapshot",      b"drawSnapshot"),
+    ("drawSnapshot",      b"CrossProcessPaint"),
+    // NOTE: the FINAL screenshot-PNG write is intentionally NOT detected here by
+    // the raw `\x89PNG` magic — Firefox writes many internal PNGs (favicons,
+    // theme/UI assets) whose payloads also start with that signature, so a
+    // magic-based `[GATE] PNG` would false-positive long before the real
+    // screenshot. The authoritative, single-per-run PNG-write signal is the FF
+    // supervisor's functional `[FFTEST] /tmp/out.png present` /
+    // `[FF-OUT-PNG:… sig_ok=true …]` lines (default-on on firefox-test-core),
+    // which the gate consumers key on for the PNG gate.
+];
+
+/// First-arrival bitmask for [`MILESTONE_MARKERS`]: bit `i` set ⇒ marker `i`
+/// has already emitted its `[GATE]` line. Lockless, default-relaxed — a benign
+/// double-emit under a 2-CPU race is harmless (the monitor takes first-arrival),
+/// and the common case (bit already set) is a single atomic load with no store.
+#[cfg(feature = "firefox-test-core")]
+static MILESTONE_SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Scan a write payload for the curated render-lifecycle milestone substrings
+/// and emit one `[GATE] <label>` line the FIRST time each is seen this boot.
+///
+/// Called from the tracked-write path on the DEFAULT (core) profile. Cheap: a
+/// bounded substring search over an already-snapshotted buffer, skipped entirely
+/// once every milestone bit is set. Never allocates, never takes a lock.
+#[cfg(feature = "firefox-test-core")]
+#[inline]
+fn emit_render_milestones(snapshot: &[u8]) {
+    use core::sync::atomic::Ordering;
+    let seen = MILESTONE_SEEN.load(Ordering::Relaxed);
+    // Fast exit once every curated marker has fired (the steady state for the
+    // vast majority of a boot's writes).
+    let all_mask: u32 = (1u32 << MILESTONE_MARKERS.len()) - 1;
+    if seen == all_mask {
+        return;
+    }
+    for (i, (label, needle)) in MILESTONE_MARKERS.iter().enumerate() {
+        let bit = 1u32 << i;
+        if seen & bit != 0 {
+            continue; // already emitted this marker
+        }
+        if !slice_contains(snapshot, needle) {
+            continue;
+        }
+        // First arrival — claim the bit and emit exactly one milestone line.
+        // fetch_or returns the PRE-update value; only the CPU that observed the
+        // bit clear emits, so a concurrent partner cannot double-print.
+        let prev = MILESTONE_SEEN.fetch_or(bit, Ordering::Relaxed);
+        if prev & bit == 0 {
+            crate::serial_println!("[GATE] {}", label);
+        }
+    }
+}
+
+/// Bounded substring search (`haystack.windows(needle.len()).any(== needle)`),
+/// kept allocation-free for the milestone hot path.
+#[cfg(feature = "firefox-test-core")]
+#[inline]
+fn slice_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 /// Linux write(fd, buf, count) — same semantics as AstryxOS write.
 pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
     let buf_ptr = buf as *const u8;
@@ -6477,7 +6661,44 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
 
     if count == 0 { return 0; }
 
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    // Render-lifecycle MILESTONE markers (low-frequency, DEFAULT-ON on the
+    // Firefox bring-up profile). Scans the write payload for a curated set of
+    // render-stage substrings and emits ONE `[GATE] <label>` line the first
+    // time each is seen — a handful of lines for the whole boot, NOT the
+    // per-write `[FF/write]` firehose below (which stays *-trace-gated). This
+    // makes the deep render gates visible on the fast `firefox-test-core` boot
+    // (where the firehose is OFF) without paying the firehose cost.
+    //
+    // Gated on `firefox-test-core` (present in every FF profile incl. the full
+    // `firefox-test`/`*-trace` superset) so plain `test-mode` / production
+    // builds are byte-identical. The snapshot is bounded (512 B) and skipped
+    // once every milestone bit is set, so the steady-state cost is one atomic
+    // load per tracked write.
+    #[cfg(feature = "firefox-test-core")]
+    {
+        let mpid = crate::proc::current_pid_lockless();
+        if (mpid == 1 || crate::syscall::ring::is_tracked(mpid))
+            && MILESTONE_SEEN.load(core::sync::atomic::Ordering::Relaxed)
+                != (1u32 << MILESTONE_MARKERS.len()) - 1
+        {
+            let take = count.min(512);
+            // SMAP-bracketed snapshot of the user buffer — the milestone scan
+            // reads kernel memory only (Intel SDM Vol. 3A §4.6.1).
+            let snap: alloc::vec::Vec<u8> = unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                core::slice::from_raw_parts(buf_ptr, take).to_vec()
+            };
+            emit_render_milestones(&snap);
+        }
+    }
+
+    // Diagnostic stdout/stderr mirror ([FF/stderr] / [FF/write] / [FF/write-fd]).
+    // This is the single largest serial source on a Firefox boot (~78% of a
+    // ~45 MB log) and has no correctness role — it transcribes every tracked
+    // write(2) to COM1, one PIO VM-exit per byte under KVM.  Gated on the
+    // *-trace features so the functional `firefox-test-core` / plain `test-mode`
+    // builds run identically without the spew.
+    #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace"))]
     {
         let pid = crate::proc::current_pid_lockless();
         if pid == 1 || crate::syscall::ring::is_tracked(pid) {
@@ -6670,14 +6891,18 @@ pub fn sys_open_linux(pathname: u64, flags: u64, _mode: u64) -> i64 {
     //
     // Snapshot the path up front so `[FF/open-ret]` can quote it even if
     // the path argument points into user memory that the handler later
-    // re-reads. The inner impl re-decodes for its own logic.
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    // re-reads. The inner impl re-decodes for its own logic.  Trace-gated to
+    // match the emit below so the perf core boot pays neither the extra
+    // user-string read nor the allocation.
+    #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace"))]
     let path_snapshot: alloc::string::String = {
         let bytes = read_cstring_from_user(pathname);
         alloc::string::String::from_utf8_lossy(&bytes).into_owned()
     };
     let ret = sys_open_linux_inner(pathname, flags, _mode);
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    // Per-open(2) diagnostic mirror — high-frequency; gated to the trace
+    // features so the perf core boot does not pay a serial line per open.
+    #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace"))]
     {
         let pid = crate::proc::current_pid_lockless();
         if pid == 1 || crate::syscall::ring::is_tracked(pid) {
@@ -6736,13 +6961,31 @@ fn sys_open_linux_inner(pathname: u64, flags: u64, _mode: u64) -> i64 {
         }
     };
     let path: &str = path_owned.as_str();
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    // Per-open(2) path mirror — high-frequency diagnostic; trace-gated so the
+    // perf core boot does not emit a serial line per open.
+    #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace"))]
     if pid == 1 || crate::syscall::ring::is_tracked(pid) {
         crate::serial_println!("[FF/open] pid={} path={}", pid, path);
     }
+    // libxul load MILESTONE (low-frequency, DEFAULT-ON). The per-open `[FF/open]`
+    // mirror above is trace-gated, so on the fast `firefox-test-core` boot the
+    // gate monitor has no default-on signal that the main shared library mapped.
+    // Emit a single `[GATE] libxul` the first time libxul is opened by a tracked
+    // process — one line per boot, not the per-open firehose.
+    #[cfg(feature = "firefox-test-core")]
+    {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        static LIBXUL_GATE_SEEN: AtomicBool = AtomicBool::new(false);
+        if (pid == 1 || crate::syscall::ring::is_tracked(pid))
+            && path.ends_with("libxul.so")
+            && !LIBXUL_GATE_SEEN.swap(true, Ordering::Relaxed)
+        {
+            crate::serial_println!("[GATE] libxul");
+        }
+    }
     // Attach the resolved path string to the pending ring entry so the ring
     // dump can show what each open() / openat() actually tried to open.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         let idx = crate::subsys::linux::syscall_ring::current_entry();
         crate::syscall::ring::set_path(pid, idx, path);
@@ -8300,7 +8543,7 @@ fn sys_openat(dirfd: u64, pathname: u64, flags: u64, mode: u64) -> i64 {
     };
 
     // Attach the resolved path to the pending ring entry.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         let idx = crate::subsys::linux::syscall_ring::current_entry();
         crate::syscall::ring::set_path(pid, idx, &full_path);
@@ -8597,7 +8840,7 @@ fn sys_rt_sigprocmask_linux(how: u64, set: u64, oldset: u64, _sigsetsize: u64) -
 /// real userspace) and `test-mode` (where Test 238 drives it with a
 /// synthetic waiter).  Both features are diagnostic-only configurations
 /// and the 8-byte atomic has no cost on the default build.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 pub(crate) static FUTEX_WAKE_GHOST_COUNT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
@@ -8647,7 +8890,7 @@ pub(crate) static FUTEX_WAKE_GHOST_COUNT: core::sync::atomic::AtomicU64 =
 // kernel BSS and is only touched when the `firefox-test` or `test-mode`
 // feature is enabled.  Zero overhead on the default build.
 
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 pub(crate) mod ghost_hist {
     //! History-based FUTEX_WAKE_GHOST detection helpers.
     //!
@@ -8715,9 +8958,9 @@ pub(crate) mod ghost_hist {
     /// can be toggled at runtime via `kdb futex set-ghost-hist on|off`.
     /// The default is OFF under `test-mode` alone so the in-kernel test
     /// suite does not accumulate history from the wider test corpus.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     pub static GHOST_HIST_ENABLED: AtomicBool = AtomicBool::new(true);
-    #[cfg(all(feature = "test-mode", not(feature = "firefox-test")))]
+    #[cfg(all(feature = "test-mode", not(feature = "firefox-test-core")))]
     pub static GHOST_HIST_ENABLED: AtomicBool = AtomicBool::new(false);
 
     /// Counts.
@@ -9124,7 +9367,7 @@ pub fn sys_futex_linux(
             // parking the caller.  Catch this before touching the wait queue
             // so we never end up with a registered-but-already-expired waiter.
             if matches!(timeout_ns, TimeoutNs::AlreadyExpired) {
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-trace")]
                 crate::serial_println!(
                     "[FUTEX_TIMEDOUT] tid={} pid={} uaddr={:#x} op={:#x} (absolute deadline elapsed)",
                     crate::proc::current_tid(), pid, uaddr, futex_op
@@ -9185,7 +9428,7 @@ pub fn sys_futex_linux(
             // correlating against history during our sleep sees this
             // entry.  No-op if `ghost_hist::GHOST_HIST_ENABLED` is false.
             // See `ghost_hist::record_wait` for the BZ 25847 reference.
-            #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+            #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
             ghost_hist::record_wait(pid, tid, uaddr);
 
             // ── Diagnostics live OUTSIDE the critical section ──────────────
@@ -9196,7 +9439,7 @@ pub fn sys_futex_linux(
             // [FUTEX_WAIT_REG] line and the rbp-chain walk now — the waiter
             // is already on the queue and Blocked, so a wake racing with
             // these prints is correct.
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-trace")]
             {
                 let user_rip = unsafe { crate::syscall::get_user_rip() };
                 let (user_rsp, user_rbp) = crate::syscall::get_user_rsp_rbp();
@@ -9217,7 +9460,7 @@ pub fn sys_futex_linux(
             // the cluster-wake compensation (below) can use "this TGID
             // recently parked here" as a safety-harness signal when a
             // future FUTEX_WAKE on a nearby uaddr misses.
-            #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+            #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
             crate::subsys::linux::futex_cluster::record_wait(pid, uaddr);
 
             crate::sched::schedule();
@@ -9253,7 +9496,7 @@ pub fn sys_futex_linux(
             // If we removed ourselves from the waiter list, the scheduler woke us = timeout.
             // If the list entry was already gone, FUTEX_WAKE removed us = success.
             if timed_out {
-                #[cfg(feature = "firefox-test")]
+                #[cfg(feature = "firefox-test-trace")]
                 crate::serial_println!(
                     "[FUTEX_TIMEDOUT] tid={} pid={} uaddr={:#x} op={:#x}",
                     tid, pid, uaddr, futex_op
@@ -9275,7 +9518,7 @@ pub fn sys_futex_linux(
             // whether a missing-wakeup is "wake call never reached" vs
             // "wake call reached but wrong uaddr".  See the FUTEX_WAIT_REG
             // site for the fault-safety rationale of the user-frame helpers.
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-trace")]
             {
                 let user_rip = unsafe { crate::syscall::get_user_rip() };
                 let (user_rsp, user_rbp) = crate::syscall::get_user_rsp_rbp();
@@ -9322,7 +9565,7 @@ pub fn sys_futex_linux(
             // wakes against waiters by uaddr without having to instrument
             // userspace.  Gated to firefox-test to stay out of the test-mode
             // serial budget.
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-trace")]
             crate::serial_println!(
                 "[FUTEX_WAKE] tid={} pid={} uaddr={:#x} woken={} max={} op={:#x}",
                 crate::proc::current_tid(), pid, uaddr, woken, val, futex_op
@@ -9343,7 +9586,7 @@ pub fn sys_futex_linux(
             // the userspace producer signalled the wrong field of a
             // composite cond-var (musl `pthread_cond_t._c_seq` vs
             // `_c_waiters`, public layout in the musl source).
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-trace")]
             if woken == 0 {
                 crate::subsys::linux::futex_key_diag::emit_wake_empty(
                     pid, crate::proc::current_tid(), uaddr, futex_op,
@@ -9355,7 +9598,7 @@ pub fn sys_futex_linux(
             // recently issued a wake at this uaddr" as a safety-harness
             // signal on a subsequent ghost wake at a nearby slot.  Cheap
             // — bounded ring, ≤ 64 entries.
-            #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+            #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
             crate::subsys::linux::futex_cluster::record_wake(
                 crate::proc::current_tid(), uaddr,
             );
@@ -9381,7 +9624,7 @@ pub fn sys_futex_linux(
             // `firefox-test`, OFF in stock builds) and behind the same
             // feature gates as the GHOST diagnostic above.  See
             // `subsys/linux/futex_cluster.rs` for the full algorithm.
-            #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+            #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
             let extra_woken = if woken == 0 && (op == 1 || op == 10) {
                 crate::subsys::linux::futex_cluster::compensate(
                     pid, crate::proc::current_tid(), uaddr, max_wake,
@@ -9389,7 +9632,7 @@ pub fn sys_futex_linux(
             } else {
                 0
             };
-            #[cfg(not(any(feature = "firefox-test", feature = "test-mode")))]
+            #[cfg(not(any(feature = "firefox-test-core", feature = "test-mode")))]
             let extra_woken: u64 = 0;
             woken = woken.saturating_add(extra_woken);
 
@@ -9420,7 +9663,13 @@ pub fn sys_futex_linux(
             // in CI).  The FUTEX_WAITERS scan and the per-event serial
             // output are diagnostic-only — the default build pays no
             // overhead.
-            #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+            // Diagnostic GHOST scan (FUTEX_WAITERS lock + BTreeMap range scan +
+            // [FUTEX_WAKE_GHOST] emit on every woken==0 wake).  Gated on the
+            // trace features so the perf `firefox-test-core` boot pays neither
+            // the per-wake scan nor the serial; `test-mode` keeps the full
+            // behaviour so Test 238 (which asserts FUTEX_WAKE_GHOST_COUNT
+            // advances) is unchanged.
+            #[cfg(any(feature = "firefox-test-trace", feature = "test-mode"))]
             if woken == 0 && (op == 1 || op == 10) {
                 const FUTEX_GHOST_CLUSTER: u64 = 256;
                 let cluster_lo = uaddr & !(FUTEX_GHOST_CLUSTER - 1);
@@ -9456,8 +9705,11 @@ pub fn sys_futex_linux(
             // uaddr that has been recorded within the last
             // HIST_WINDOW_TICKS ticks.  See the `ghost_hist` module for
             // the BZ 25847 framing.  The correlation does NOT modify
-            // `woken`; the wake decision above is unchanged.
-            #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+            // `woken`; the wake decision above is unchanged.  Gated on the
+            // trace features (like the GHOST scan above) so the perf
+            // `firefox-test-core` boot pays no per-wake counter/correlation
+            // cost; `test-mode` keeps it so Test 240 is unchanged.
+            #[cfg(any(feature = "firefox-test-trace", feature = "test-mode"))]
             if op == 1 || op == 10 {
                 ghost_hist::GHOST_HIST_TOTAL_WAKES
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -9861,7 +10113,7 @@ fn sys_fstatfs_linux(_fd: usize, buf: *mut u8) -> i64 {
 /// Write a plausible statfs structure into `buf` (120 bytes).
 fn fill_statfs_buf(buf: *mut u8) {
     // Wipe first.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     crate::mm::w215_diag::probe(crate::mm::w215_diag::Writer::Preadv120, buf, 120);
     // SMAP bracket — `buf` is a user-VA pointer.
     let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
@@ -10156,7 +10408,7 @@ fn write_hex64(out: &mut Vec<u8>, mut v: u64) {
 ///  - closed/invalid:      EPOLLERR
 /// Poll the readiness events for `fd` in process `pid`.
 /// Returns a bitmask of EPOLL* flags that are currently set.
-fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
+pub(crate) fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
     use crate::ipc::epoll::{EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP, EPOLLRDHUP};
 
     // Snapshot fd metadata with a brief lock hold.  `mount_idx == usize::MAX`
@@ -10244,7 +10496,18 @@ fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
                     // of parking forever on a pure fd handoff.
                     let has_scm = crate::syscall::has_scm_deliverable(
                         inode, crate::net::unix::recv_consumed(inode));
-                    if has_d || has_scm {
+                    // A LISTENING AF_UNIX socket with a queued connection is
+                    // read-ready: accept(2) will not block.  `has_pending`
+                    // reports the listen(2) accept backlog (backlog_len > 0).
+                    // `poll`/`select` already gate POLLIN on it
+                    // (`syscall::poll_revents` / `do_select`); without it here,
+                    // an epoll-driven accept loop never wakes for an incoming
+                    // connection — POLLIN under poll/select but no EPOLLIN under
+                    // epoll_wait (epoll(7) / accept(2)).  A connected socketpair
+                    // has backlog_len == 0, so this is a no-op for it and only
+                    // restores listening-socket accept-readiness parity.
+                    let has_pend = crate::net::unix::has_pending(inode);
+                    if has_d || has_scm || has_pend {
                         ev |= EPOLLIN;
                     }
                     // `epoll(7)` distinguishes a read-side half-close from a
@@ -11479,7 +11742,7 @@ fn sys_pwritev(fd: u64, iov_ptr: u64, iovcnt: u64, offset: i64) -> i64 {
 // frame pointers are omitted (common in JIT code), which is harmless —
 // we still get the leaf, the libc-wrapper caller (`cr=` in [SC]), and as
 // many native frames as the compiler preserved.
-#[cfg(all(feature = "firefox-test", feature = "firefox-trace-verbose"))]
+#[cfg(all(feature = "firefox-test-core", feature = "firefox-trace-verbose"))]
 fn emit_user_stack_snapshot(num: u64, sample_idx: u64) {
     use core::fmt::Write as _;
     const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;

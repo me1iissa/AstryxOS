@@ -26,8 +26,30 @@ Do NOT pass --no-kvm unless you are explicitly reproducing a TCG-only
 environment or testing on a host without /dev/kvm. The harness will emit a
 WARNING to stderr when --no-kvm is used and /dev/kvm is available.
 
+Firefox serial profiles (perf vs trace):
+    The Firefox kernel ships two profiles that share identical FUNCTIONAL
+    behaviour and differ only in diagnostic serial volume:
+
+      PERF / RENDER / CI (fast, default):
+          start --features firefox-test-core[,kdb,...]
+          High-frequency diagnostic emitters ([FF/stderr]/[FF/write],
+          [POLL_RET], per-component [VFS/resolve], [FUTEX_*]) are compiled OUT.
+          A boot emits <2 MB serial instead of ~45 MB; since each serial byte is
+          one PIO VM-exit under KVM (Intel SDM Vol. 3C §25 / NS16550A THR-write
+          model), the synchronous transcription cost that dominated wall-clock
+          (~56 min) collapses to minutes.  Firefox still runs IDENTICALLY.
+
+      DEBUG / TRACE (full serial, opt-in):
+          start --features firefox-test-core --trace        (preferred)
+          start --features firefox-test                     (back-compat alias)
+          Adds firefox-test-trace → the full per-syscall serial transcript.
+          --trace appends the trace feature and prints the expansion to stderr
+          (never injected silently).  Do NOT add futex-wait-scan or
+          firefox-trace-verbose to a perf boot — both add large PT-walk + serial
+          cost and stay explicit opt-ins outside both profiles.
+
 Tier 1 — session management:
-    python3 scripts/qemu-harness.py start [--features FLAGS] [--no-build]
+    python3 scripts/qemu-harness.py start [--features FLAGS] [--trace] [--no-build]
                                           [--gdb-port PORT] [--gdb-wait]
                                           [--firefox-variant musl|glibc]
                                           [--snapshottable]
@@ -712,7 +734,13 @@ def _get_watch_test():
 
 # ── Session directory ─────────────────────────────────────────────────────────
 
-HARNESS_DIR = Path.home() / ".astryx-harness"
+# The session directory may be overridden via ASTRYX_HARNESS_DIR.  This lets
+# two agents (or a soak loop and an interactive debug session) run concurrently
+# on the same host without their session-state files colliding — notably so
+# one agent's leaked-session cleanup ("any *.json appearing during the trial is
+# presumed ours → stop it") cannot reap the other agent's live QEMU.  Default
+# is the shared ~/.astryx-harness when the env var is unset.
+HARNESS_DIR = Path(os.environ.get("ASTRYX_HARNESS_DIR", str(Path.home() / ".astryx-harness")))
 HARNESS_DIR.mkdir(parents=True, exist_ok=True)
 
 # snap-gate: dedicated qcow2 vmstate / data-overlay files + the named-snapshot
@@ -866,15 +894,45 @@ _PANIC_RE = re.compile(
 )
 _IDLE_SECONDS = 30
 
+# Kernel-tick regex for stamping each gate mark with the latest tick (so a
+# historical re-derivation cross-checks against the exact host stamp). Same
+# kernel-only form serial-web/perf_markers use ([HB]/PROC-METRICS tick=).
+_WATCH_TICK_RE = re.compile(r"(?:\[HB\]|PROC-METRICS\]) tick=(\d+)")
+
+
+def _load_gate_marks():
+    """Lazy-import the shared gate-marks helper. Returns the module, or None when
+    it is not on this branch (an older master that predates the dashboards) — in
+    which case the watcher simply skips gate stamping and keeps its panic/idle
+    duties. Additive: never fails the watcher."""
+    try:
+        import gate_marks  # noqa: PLC0415
+        return gate_marks
+    except Exception:
+        return None
+
+
 def _watcher_thread(sid: str, serial_log: str, qmp_sock: str, pid: int):
     """
-    Monitors the serial log for panic patterns and idle periods.
+    Monitors the serial log for panic patterns and idle periods, and stamps the
+    host arrival time of each bring-up/render gate to <sid>.marks.jsonl (the
+    exact-host-time source the serial monitor reads). Gate detection is
+    forward-ordered (milestone N+1 only fires at/after N) — identical discipline
+    to serial-web's scan_progress — so render markers don't false-positive on
+    Firefox's serialized-JS startup cache.
+
     Runs as a daemon thread started by `start`.
     """
     last_size = 0
     last_activity = time.monotonic()
     idle_event_sent = False
     log_path = Path(serial_log)
+
+    # Gate stamping state (forward-ordered, append first-arrival only).
+    _gm = _load_gate_marks()
+    _gate_idx = 0
+    _cur_tick = None
+    _line_no = 0
 
     while _pid_alive(pid):
         try:
@@ -890,6 +948,39 @@ def _watcher_thread(sid: str, serial_log: str, qmp_sock: str, pid: int):
                     new_data = f.read(size - last_size)
                 new_text = new_data.decode("utf-8", errors="replace")
                 for line in new_text.splitlines():
+                    _line_no += 1
+                    # Track latest kernel tick so each gate mark carries the tick
+                    # at its arrival (lets a historical re-derivation cross-check).
+                    # The whole gate block is best-effort: any failure here must
+                    # NOT disrupt the watcher's panic/idle duties (the harness is
+                    # critical infra), so it is wrapped defensively.
+                    if _gm is not None:
+                        try:
+                            _tk = _WATCH_TICK_RE.search(line)
+                            if _tk:
+                                _cur_tick = int(_tk.group(1))
+                            # Forward-ordered milestone stamping: the instant we
+                            # first see milestone N's marker (and only at/after
+                            # N-1), record its host arrival time. One line can
+                            # satisfy several milestones in sequence (while-advance).
+                            while (_gate_idx < len(_gm.MILESTONES)
+                                   and _gm.match(line, _gm.MILESTONES[_gate_idx][1])):
+                                _label = _gm.MILESTONES[_gate_idx][0]
+                                _gm.append_gate_mark(
+                                    sid, str(HARNESS_DIR), _label,
+                                    host_ts=time.time(), tick=_cur_tick,
+                                    line=_line_no)
+                                _emit_event(sid, {
+                                    "event": "gate",
+                                    "label": _label,
+                                    "tick": _cur_tick,
+                                    "line": _line_no,
+                                })
+                                _gate_idx += 1
+                        except Exception:
+                            # disable gate stamping for the rest of this run; keep
+                            # the watcher alive for panics/idles.
+                            _gm = None
                     m = _PANIC_RE.search(line)
                     if m:
                         snap_name = f"{sid}-panic"
@@ -1294,6 +1385,14 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        # Detach QEMU into its own session/process-group so it survives the
+        # teardown of the (possibly short-lived) shell that invoked `start`.
+        # Without this, an agent that runs `start` as a backgrounded one-shot
+        # has QEMU reaped (SIGKILL) the moment that wrapper process tree is
+        # cleaned up — even though the session JSON/serial-log persist on disk,
+        # leaving a "no_session"/defunct-qemu mismatch.  setsid is the standard
+        # POSIX way to orphan a long-lived child from its launcher.
+        start_new_session=True,
     )
     return proc
 
@@ -2687,6 +2786,33 @@ def cmd_check(args):
     return rc
 
 
+def cmd_build(args):
+    """
+    Run the REAL kernel build (`cargo +nightly build` for astryx-boot +
+    astryx-kernel, then objcopy to the flat kernel.bin and stage the boot EFI) —
+    i.e. codegen + link + ESP staging — and emit a JSON verdict with the host
+    wall-clock build time.  No QEMU is launched.
+
+    This exists so the perf-benchmark BUILD phase can time a genuine build (the
+    magnitude that surfaces a slow-codegen or slow-link regression) rather than a
+    type-check-only `cargo check`.  `start` already builds internally; this is the
+    standalone, no-boot build for measurement.  Output is additive structured
+    JSON (build_ms, ok, features) so any caller can resume.
+    """
+    features = args.features or ""
+    t0 = time.time()
+    ok = _build(features)
+    build_ms = int((time.time() - t0) * 1000)
+    out = {
+        "ok": bool(ok),
+        "features": features,
+        "build_ms": build_ms,
+        "probe": "build",   # vs `check` — names the magnitude captured
+    }
+    print(json.dumps(out, indent=2))
+    return 0 if ok else 1
+
+
 def _qemu_img() -> str:
     """Resolve the qemu-img binary (snap-gate creates qcow2 overlays)."""
     return shutil.which("qemu-img") or "qemu-img"
@@ -2735,6 +2861,48 @@ def cmd_start(args):
     # ports are just forwarded; only the SLIRP side binds inside QEMU).
     features_str = (args.features or "")
     feats = [f.strip() for f in features_str.split(",")]
+
+    # ── Firefox serial profile (perf vs trace) ───────────────────────────────
+    # Two profiles share the same functional kernel:
+    #
+    #   PERF / RENDER / CI (default):  --features firefox-test-core
+    #       Functional Firefox bring-up with the high-frequency diagnostic
+    #       serial emitters compiled OUT.  A boot emits <2 MB of serial instead
+    #       of ~45 MB; since each emitted byte is one PIO VM-exit under KVM
+    #       (Intel SDM Vol. 3C §25), this collapses the synchronous transcription
+    #       cost that otherwise dominated wall-clock (~56 min → minutes).
+    #
+    #   DEBUG / TRACE (opt-in):  --features firefox-test-core --trace
+    #       (or the back-compat super-feature  --features firefox-test)
+    #       Adds firefox-test-trace → the full per-syscall mirror
+    #       ([FF/stderr]/[FF/write]), [POLL_RET], per-component [VFS/resolve],
+    #       and [FUTEX_*] traces, for debugging boots that want the dense log.
+    #
+    # --trace appends firefox-test-trace only when the core/full feature is
+    # present, and prints the expansion to stderr (never injected silently —
+    # the harness's standing rule).  NEVER auto-add futex-wait-scan or
+    # firefox-trace-verbose; those carry extra PT-walk + serial cost and stay
+    # explicit opt-ins outside both profiles.
+    if getattr(args, "ff_trace", False):
+        has_ff = ("firefox-test-core" in feats) or ("firefox-test" in feats)
+        if has_ff and "firefox-test-trace" not in feats and "firefox-test" not in feats:
+            feats.append("firefox-test-trace")
+            features_str = ",".join(f for f in feats if f)
+            # Write the expansion back onto args so the downstream build
+            # (_build(args.features) at session start) and the recorded session
+            # state both see the trace feature.  feats/features_str are kept in
+            # sync for the per-feature presence checks below.
+            args.features = features_str
+            sys.stderr.write(
+                "[harness] --trace: appended 'firefox-test-trace' → features="
+                f"{features_str}\n"
+            )
+        elif not has_ff:
+            sys.stderr.write(
+                "[harness] --trace ignored: feature set has neither "
+                "'firefox-test-core' nor 'firefox-test'\n"
+            )
+
     kdb_host_port = 0
     if "kdb" in feats:
         # Derive deterministically from sid so reruns are stable and two
@@ -2864,6 +3032,23 @@ def cmd_start(args):
             sys.stdout = _orig_stdout
         if not ok:
             _err("Build failed")
+
+    # --build-only: compile + stage the in-tree ESP, then exit WITHOUT booting
+    # QEMU. The just-built kernel.bin/BOOTX64.EFI now sit at the in-tree ESP, so
+    # a later `start --no-build` reuses this exact binary. Lets a host run the
+    # (CPU-bound) compile while a concurrent KVM boot is in flight, then boot in
+    # a quiet window — keeping cycle-accurate timing free of host-core
+    # contention. Additive flag; absent → existing behaviour is unchanged.
+    if getattr(args, "build_only", False):
+        _out({
+            "ok": True,
+            "build_only": True,
+            "features": args.features or "",
+            "kernel_bin": str(_get_watch_test().KERNEL_BIN),
+            "note": "kernel staged at in-tree ESP; boot later with "
+                    "`start --no-build`",
+        })
+        return
 
     # Snapshot the in-tree ESP into a session-scoped directory so concurrent
     # rebuilds from other workspaces cannot clobber the kernel binary this
@@ -5584,9 +5769,52 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
               # cursors + e1000 RX-ring MPC/byte counts).  Zero-arg; read
               # repeatedly to watch recv_next advance or stall.
               "net-rxstats",
+              # blk-trace: out-of-band drain of the virtio-blk LBA ring.
+              "blk-trace", "blk-trace-flush",
+              # log-ring: out-of-band drain / burst-flush of the cheap log ring.
+              "log-ring", "log-ring-flush",
+              # virtio-blk wait-amplification: drain the per-round-trip wait
+              # histogram / zero the ring.  See drivers::virtio_blk +
+              # op_virtio_wait_hist.
+              "virtio-wait-hist", "virtio-wait-reset",
               # INFRA-3 record/replay: zero-arg introspection.
               "record-status"):
         return {"op": op}
+    if op == "virtio-wait-mode":
+        # Flip the wait strategy at runtime: adaptive (poll + peer-aware yield) |
+        # legacy (unconditional schedule()-yield).  Absent → query-only.  Carried
+        # as {"mode": ...} to match the kernel op's extract_field("mode") parse.
+        if not rest:
+            return {"op": "virtio-wait-mode"}
+        val = rest[0].strip().lower()
+        if val not in ("adaptive", "legacy", "true", "false", "1", "0"):
+            raise ValueError(
+                f"virtio-wait-mode: unrecognised value '{rest[0]}' "
+                "(expected adaptive|legacy)"
+            )
+        return {"op": "virtio-wait-mode", "mode": val}
+    if op == "virtio-wait-spin":
+        # Set the adaptive-spin budget (iterations) before blocking.
+        if not rest:
+            raise ValueError("virtio-wait-spin requires an integer iteration count")
+        try:
+            n = int(rest[0])
+        except ValueError:
+            raise ValueError(f"virtio-wait-spin: '{rest[0]}' is not an integer")
+        return {"op": "virtio-wait-spin", "n": str(n)}
+    if op == "log-ring-enable":
+        # Toggle the fast-path ring sink (A/B control). Optional on/off; absent
+        # → query-only. Carried as {"on": "on"|"off"} to match the kernel op's
+        # extract_field("on") parse (mirrors futex-set-cluster-wake).
+        if not rest:
+            return {"op": "log-ring-enable"}
+        val = rest[0].strip().lower()
+        if val not in ("on", "off", "true", "false", "1", "0"):
+            raise ValueError(
+                f"log-ring-enable: unrecognised value '{rest[0]}' "
+                "(expected on|off)"
+            )
+        return {"op": "log-ring-enable", "on": val}
     if op == "replay-dump":
         # INFRA-3: dump the in-RAM record log to a VFS file.  Single
         # required positional `path=<abs>` arg (or just `<abs>`).
@@ -5920,6 +6148,117 @@ def cmd_kdb(args):
     except OSError: pass
 
     _out(resp)
+
+
+def cmd_blk_trace(args):
+    """Drain the virtio-blk LBA trace ring (out-of-band; replaces the old
+    per-op `[BLK]` serial write).
+
+    Forms:
+      blk-trace drain <sid>   -> kdb `blk-trace` op: live ring as JSON
+                                 ({feature, total, resident, dropped, emitted,
+                                  cap, events:[{op,lba,len,pid}...]}).
+      blk-trace flush <sid>   -> kdb `blk-trace-flush` op: re-emit the classic
+                                 `[BLK]` serial lines in one burst (legacy
+                                 heatmap ingestion), returns {emitted}.
+
+    Thin wrapper over `cmd_kdb`; requires the session to have been started with
+    `--features ...,kdb,blk-trace`. `drain` against a non-blk-trace build returns
+    `{"feature":"off",...}` rather than an error, so the protocol surface is
+    stable across builds.
+    """
+    sub = getattr(args, "blk_action", None)
+    op = {"drain": "blk-trace", "flush": "blk-trace-flush"}.get(sub)
+    if op is None:
+        _out({"error": f"blk-trace: unknown action {sub!r} "
+                       "(expected 'drain' or 'flush')"})
+        sys.exit(1)
+    # Reuse the kdb one-shot path verbatim (port resolution, recv, JSON, cache).
+    args.op = op
+    args.args = []
+    cmd_kdb(args)
+
+
+def cmd_log_ring(args):
+    """Drain / flush / toggle the near-zero-overhead guest-RAM log ring.
+
+    The cheap high-volume log transport (drivers::log_ring) collects the
+    firehose trace families (serial_fast_println!, e.g. `[SC]`) into a lock-free
+    ring in guest RAM with ZERO VM-exits, replacing the per-byte COM1 16550 PIO
+    path. This wrapper drains it out of band.
+
+    Forms:
+      log-ring drain <sid> [--out-file PATH]
+          -> kdb `log-ring` op: live ring as JSON
+             {feature, cap, total_bytes, resident_bytes, dropped_bytes,
+              records, oversize_drops, text, emitted_records}.
+             `text` is the recovered, newline-delimited log content. With
+             --out-file the decoded bytes are also written there (so the same
+             firehose lands in a file a human/agent/serial-web.py can read).
+      log-ring flush <sid>
+          -> kdb `log-ring-flush` op: re-emit buffered lines to COM1 in one
+             burst (serial-log consumers see the firehose), returns {emitted}.
+      log-ring enable <sid> [on|off]
+          -> kdb `log-ring-enable` op: set the fast-path ring sink on/off (the
+             A/B control — `off` forces the slow per-byte COM1 path). Omit the
+             state to query. Returns {prev, enabled}.
+
+    Thin wrapper over `cmd_kdb`. Requires the session to have been started with
+    `--features ...,kdb`.
+    """
+    sub = getattr(args, "log_action", None)
+    op = {"drain": "log-ring",
+          "flush": "log-ring-flush",
+          "enable": "log-ring-enable"}.get(sub)
+    if op is None:
+        _out({"error": f"log-ring: unknown action {sub!r} "
+                       "(expected 'drain', 'flush', or 'enable')"})
+        sys.exit(1)
+
+    # `enable` carries an optional on/off positional we forward to the kernel op.
+    extra_args = []
+    if sub == "enable":
+        st = getattr(args, "state", None)
+        if st:
+            extra_args = [st]
+
+    # For drain with --out-file we need the parsed JSON back, so call the kdb
+    # one-shot path directly instead of cmd_kdb (which prints and exits).
+    out_file = getattr(args, "out_file", None)
+    if sub == "drain" and out_file:
+        sess = _load_session(args.sid)
+        port = int(sess.get("kdb_host_port") or 0)
+        if port <= 0:
+            _out({"error": "session was not started with --features kdb"})
+            sys.exit(1)
+        timeout = float(getattr(args, "timeout", 30.0) or 30.0)
+        try:
+            raw = _kdb_recv(port, {"op": op}, timeout=timeout)
+            resp = json.loads(raw.strip().decode("utf-8", errors="replace"))
+        except (socket.timeout, ConnectionRefusedError, OSError) as e:
+            _out({"error": f"kdb connect/io failed on 127.0.0.1:{port}: {e}"})
+            sys.exit(1)
+        except (json.JSONDecodeError, ValueError) as e:
+            _out({"error": f"malformed response: {e}"})
+            sys.exit(1)
+        text = resp.get("text", "")
+        try:
+            with open(out_file, "w", errors="replace") as fh:
+                fh.write(text)
+            resp["out_file"] = out_file
+            resp["out_file_bytes"] = len(text)
+        except OSError as e:
+            resp["out_file_error"] = str(e)
+        # Drop the (potentially huge) text from the printed JSON; it's on disk.
+        resp_print = dict(resp)
+        resp_print["text"] = f"<{len(text)} bytes written to {out_file}>"
+        _out(resp_print)
+        return
+
+    # Reuse the kdb one-shot path verbatim (port resolution, recv, JSON, cache).
+    args.op = op
+    args.args = extra_args
+    cmd_kdb(args)
 
 
 def cmd_net_ipver(args):
@@ -10885,8 +11224,27 @@ def main():
                                "and __llvm_cov* sections; the test runner's "
                                "pre-exit hook then dumps them as [COV-CHUNK] "
                                "serial lines for `coverage --collect`.")
+    p_start.add_argument("--trace", action="store_true", dest="ff_trace",
+                          help="Diagnostic-serial profile: append "
+                               "'firefox-test-trace' to the feature list when it "
+                               "contains 'firefox-test-core' (or 'firefox-test'). "
+                               "This turns ON the high-frequency per-syscall/"
+                               "per-poll/per-resolve serial emitters ([FF/stderr], "
+                               "[POLL_RET], [VFS/resolve], [FUTEX_*]) for a "
+                               "debugging boot.  WITHOUT --trace, a "
+                               "'firefox-test-core' boot is the FAST perf/render "
+                               "profile (<2 MB serial vs ~45 MB).  The expansion "
+                               "is printed to stderr, never silent.")
     p_start.add_argument("--no-build", action="store_true",
                           help="Skip cargo build; use existing kernel.bin")
+    p_start.add_argument("--build-only", action="store_true", dest="build_only",
+                          help="Build the kernel for --features then exit (no "
+                               "QEMU boot). Stages the in-tree ESP so a later "
+                               "`start --no-build` reuses this exact binary. "
+                               "Lets a host run the (CPU-bound) compile while a "
+                               "concurrent KVM boot is in flight, then boot in a "
+                               "quiet window — keeps cycle-accurate perf timing "
+                               "free of host-core contention.")
     p_start.add_argument("--snapshottable", action="store_true",
                           dest="snapshottable",
                           help="snap-gate: launch with the QEMU savevm/loadvm-"
@@ -11206,6 +11564,10 @@ def main():
         "bell-stats", "cache-audit", "cache-aliasing", "fault-cache-keys",
         "w215-cache-residency", "tlb-stats", "heap-stats", "w215-diag",
         "arm-phys",
+        # blk-trace: drain the virtio-blk LBA ring (JSON) / re-emit `[BLK]`
+        # serial lines for the heatmap. Also exposed as the `blk-trace`
+        # top-level subcommand below (drain|flush).
+        "blk-trace", "blk-trace-flush",
         "coverage-flush", "proc-metrics", "poll-revents", "thread-park-audit",
         "rip-trace",
         "futex-ghost-hist",
@@ -11235,6 +11597,15 @@ def main():
         # See net::tcp::snapshot_connections + net::e1000::rx_stats +
         # op_net_rxstats.
         "net-rxstats",
+        # virtio-blk wait-amplification telemetry + runtime A/B controls.
+        # `virtio-wait-hist` drains the per-round-trip wait histogram (µs
+        # buckets × mean run-queue depth, median/p99); `virtio-wait-mode
+        # block|yield` flips the wait strategy on a live build (no rebuild);
+        # `virtio-wait-spin <n>` tunes the adaptive-spin budget;
+        # `virtio-wait-reset` zeroes the ring for a clean A/B window.
+        # See drivers::virtio_blk + op_virtio_wait_*.
+        "virtio-wait-hist", "virtio-wait-mode", "virtio-wait-spin",
+        "virtio-wait-reset",
     ])
     p_kdb.add_argument("args", nargs="*",
                         help="Op-specific positional args: "
@@ -11249,6 +11620,51 @@ def main():
     p_kdb.add_argument("--timeout", type=float, default=30.0,
                         help="Overall deadline in seconds (default 30.0). "
                              "Wraps retry/backoff for BSP starvation tolerance.")
+
+    # blk-trace — out-of-band drain of the virtio-blk LBA trace ring.
+    # Replaces the old per-op `[BLK]` COM1 write (a KVM VM-exit storm) with a
+    # lock-free ring drained on demand. Requires --features ...,kdb,blk-trace.
+    p_blktrace = sub.add_parser(
+        "blk-trace",
+        help="[Tier1] Drain the virtio-blk LBA trace ring. "
+             "`drain` -> live ring as JSON; `flush` -> re-emit classic `[BLK]` "
+             "serial lines for the data.img heatmap. "
+             "Requires --features ...,kdb,blk-trace at start.")
+    p_blktrace.add_argument(
+        "blk_action", choices=["drain", "flush"],
+        help="drain: dump ring as JSON (events:[{op,lba,len,pid}...]). "
+             "flush: emit `[BLK]` serial lines on demand (heatmap compat).")
+    p_blktrace.add_argument("sid")
+    p_blktrace.add_argument("--timeout", type=float, default=30.0,
+                             help="kdb overall deadline (default 30.0s).")
+
+    # log-ring — out-of-band drain of the near-zero-overhead guest-RAM log ring.
+    # The cheap high-volume log transport: the firehose trace families
+    # (serial_fast_println!, e.g. the `[SC]` syscall trace) write to a lock-free
+    # ring in guest RAM with ZERO VM-exits instead of the per-byte COM1 16550
+    # PIO path. `drain` serialises the ring over the kdb channel (no UART cost);
+    # `flush` re-emits the buffered lines to COM1 for serial-log consumers;
+    # `enable on|off` toggles the slow COM1 fallback for an A/B measurement.
+    # Requires --features ...,kdb at start.
+    p_logring = sub.add_parser(
+        "log-ring",
+        help="[Tier1] Drain the guest-RAM log ring (cheap high-volume log "
+             "transport). `drain` -> live ring as JSON {text, counters}; "
+             "`flush` -> re-emit buffered lines to COM1 (serial-log compat); "
+             "`enable on|off` -> toggle the slow COM1 fallback. "
+             "Requires --features ...,kdb at start.")
+    p_logring.add_argument(
+        "log_action", choices=["drain", "flush", "enable"],
+        help="drain: dump ring as JSON. flush: emit lines to COM1 on demand. "
+             "enable: set the fast-path ring sink on/off (A/B control).")
+    p_logring.add_argument("sid")
+    p_logring.add_argument("state", nargs="?", choices=["on", "off"],
+                           help="for `enable`: on|off (omit to query).")
+    p_logring.add_argument("--out-file", default=None,
+                           help="for `drain`: write the recovered log text to "
+                                "this file (raw bytes) in addition to JSON.")
+    p_logring.add_argument("--timeout", type=float, default=30.0,
+                           help="kdb overall deadline (default 30.0s).")
 
     # tlb-stats — dedicated top-level subcommand for W215 H2 TLB diagnostic
     p_tlb_stats = sub.add_parser(
@@ -11845,6 +12261,15 @@ def main():
                           help="Feature flags passed VERBATIM to cargo. "
                                "Empty string → default desktop kernel.")
 
+    p_build = sub.add_parser("build",
+                              help="Run the REAL kernel build (codegen+link+ESP "
+                                   "stage) for given --features and report "
+                                   "build_ms. No boot. Use for the BUILD-phase "
+                                   "perf measurement (not `check`).")
+    p_build.add_argument("--features", default="", metavar="FLAGS",
+                          help="Feature flags passed VERBATIM to cargo. "
+                               "Empty string → default desktop kernel.")
+
     # context — shared session-context management (delegates to agent-context.py)
     p_ctx = sub.add_parser(
         "context",
@@ -11906,6 +12331,7 @@ def main():
         "allowlist": cmd_allowlist,
         "soak":      cmd_soak,
         "check":     cmd_check,
+        "build":     cmd_build,
         "start":  cmd_start,
         "stop":   cmd_stop,
         "list":   cmd_list,
@@ -11931,6 +12357,8 @@ def main():
         "autopsy": cmd_autopsy,
         # Tier 1
         "kdb":         cmd_kdb,
+        "blk-trace":   cmd_blk_trace,
+        "log-ring":    cmd_log_ring,
         "net-ipver":   cmd_net_ipver,
         "tlb-stats":   cmd_tlb_stats,
         "fd-map":      cmd_fd_map,

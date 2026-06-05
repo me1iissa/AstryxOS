@@ -51,7 +51,7 @@ static VMM_LOCK: Mutex<()> = Mutex::new(());
 /// matches `mm/pmm.rs::caller_rip` (KERNEL_VIRT_OFFSET .. +4 GiB).  Diag-
 /// nostic only, gated on the `firefox-test` feature so default builds are
 /// byte-identical.
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 #[inline(never)]
 fn ring_caller_rip() -> u64 {
     let rbp: u64;
@@ -125,15 +125,21 @@ pub fn init() {
     // `heap::init_guard_pages()` (which runs after this function).  The
     // guard frames bracket the heap-backing range: the below-guard is the
     // page under `heap_phys_start`, the above-guard is `heap_phys_end`
-    // itself.  Without reserving them up-front, the very next `alloc_page()`
-    // in `separate_higher_half_pds()` / `extend_higher_half_to_4gib()` can
-    // return the above-guard frame (it is the first free frame past the
-    // just-reserved heap) and use it as a page-table page; once
-    // `heap::init_guard_pages()` makes that frame's higher-half VA
-    // not-present, the next write to that page table — e.g. the LAPIC MMIO
-    // PD entry in `apic::init()` (Intel SDM Vol. 3A §10.4.4) — faults on the
-    // guard page during early boot.  Reserving them before any allocation
-    // closes that ordering window for every BSS size / feature combination.
+    // itself.  The `reserve_range` above is END-EXCLUSIVE, so it covers
+    // neither.  Without reserving them up-front, the very next `alloc_page()`
+    // in `separate_higher_half_pds()` / `extend_higher_half_to_4gib()` — or
+    // any later 2 MiB-split for MMIO — can return the above-guard frame (it is
+    // the first free frame past the just-reserved heap) and use it as a
+    // page-table page; once `heap::init_guard_pages()` makes that frame's
+    // higher-half VA not-present, the next write to that page table — a PD/PT
+    // entry write during MMIO mapping, or the LAPIC MMIO PD entry in
+    // `apic::init()` (Intel SDM Vol. 3A §10.4.4) — faults on the guard page
+    // during early boot.  The trigger is PMM-cursor-/feature-order-sensitive,
+    // so the symptom presents as a flaky boot panic on some builds and a
+    // deterministic one on others; reserving both frames before any allocation
+    // closes the window for every BSS size / feature combination.  Intel SDM
+    // Vol. 3A §4.10.5: paging-structure frames must stay reserved against
+    // recycling.
     let (below_guard_phys, above_guard_phys) = super::heap::compute_guard_phys();
     pmm::reserve_range(below_guard_phys, below_guard_phys + 0x1000);
     pmm::reserve_range(above_guard_phys, above_guard_phys + 0x1000);
@@ -571,7 +577,7 @@ pub fn map_page_in(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -
     // Best-effort pre-mutation snapshot: a concurrent CPU may race between
     // snapshot and the write below, so old_phys_for_ring can be stale.
     // Diagnostic-only.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     let old_phys_for_ring = read_pte(pml4_phys, virt_addr) & ADDR_MASK;
 
     unsafe {
@@ -597,7 +603,7 @@ pub fn map_page_in(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -
     // trick used by `pmm::caller_rip()` — see Intel SDM Vol. 3A §4.10.5 for
     // the underlying TLB-coherence invariant whose violation produces the
     // F3 fingerprint.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     crate::mm::w215_diag::pte_change_record(
         virt_addr,
         phys_addr & ADDR_MASK,
@@ -680,7 +686,7 @@ pub fn map_page_in_if_absent(
         *pt_ptr.add(pt_idx) = (phys_addr & ADDR_MASK) | flags | PAGE_PRESENT;
     }
 
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     crate::mm::w215_diag::pte_change_record(
         virt_addr,
         phys_addr & ADDR_MASK,
@@ -693,40 +699,44 @@ pub fn map_page_in_if_absent(
     true
 }
 
-/// Install `phys_addr` at `virt_addr` **only if the current leaf PTE is present
-/// and references `expected_old_phys`**, performing the compare and the install
-/// as one indivisible operation under `VMM_LOCK`.
+/// Replace the present leaf PTE at `virt_addr` with `phys_addr`/`flags` **only
+/// if the PTE still maps `expected_phys` and is still present** -- performing the
+/// re-check and the install as one indivisible operation under `VMM_LOCK`.
 ///
-/// Returns `true` if this call installed the mapping, `false` if the leaf PTE no
-/// longer references `expected_old_phys` (a sibling CPU already replaced it — in
-/// which case nothing is written and the caller's frame is redundant and must be
-/// freed by the caller).
+/// Returns `true` if this call installed the mapping, `false` if a sibling CPU
+/// had already replaced the PTE (it no longer maps `expected_phys`, or has gone
+/// not-present).  On `false` the caller's freshly-allocated frame is redundant
+/// and the caller must free it (and undo any refcount it set on it).
 ///
 /// # Why this exists
 ///
-/// The copy-on-write present+write fault arm cannot use
-/// [`map_page_in_if_absent`]: the page is already PRESENT (read-only, mapped to
-/// the shared pre-CoW frame), so an "install only if absent" check would treat
-/// every CoW fault as a loser and never install the private copy.  What the CoW
-/// arm needs is a compare-and-swap on the *expected old frame*: the first
-/// sibling sees the PTE still referencing the shared frame and swaps in its
-/// private copy; a second sibling that took the same CoW fault concurrently sees
-/// the PTE already referencing the winner's private frame (≠ `expected_old_phys`)
-/// and backs out.  Without this, two siblings on one shared CR3 (CLONE_VM) each
-/// `map_page_in` their own private frame unconditionally; the loser overwrites
-/// the winner's leaf PTE with a DIFFERENT frame, the winner keeps reading its
-/// frame through its stale local TLB entry, and a store by one thread to a
-/// shared control word lands on one frame and is never observed by the thread
-/// reading the other — a silent cross-CPU store-visibility failure (one VA, two
-/// frames).  Per Intel SDM Vol. 3A §4.10.4, TLB invalidation is
-/// per-logical-processor; the install itself is serialised here, and the caller
-/// issues the cross-LP shootdown for the present→present frame change.
+/// The copy-on-write write-fault handler samples the faulting PTE (`old_phys`),
+/// allocates a private frame, copies `old_phys` into it, then installs the
+/// private frame.  On a shared address space (CLONE_VM / vfork -- several threads
+/// on one CR3 across logical processors) two CPUs can take the write-protection
+/// `#PF` on the *same* CoW page concurrently.  Both observe the page shared,
+/// both allocate and copy, and whichever installs second overwrites the leaf PTE
+/// with a *different* private frame.  The first installer's CPU still caches the
+/// first frame in its TLB (its local invalidation only covered its own CPU and
+/// fired before the overwrite), so that CPU keeps writing the first frame while
+/// the page table -- and every later faulting CPU -- sees the second: a silent
+/// cross-CPU store-visibility failure on the now-private page (one VA, two
+/// frames).  `map_page_in_if_absent` cannot guard this transition because the
+/// CoW PTE *is* present; the correct guard is "install only if the PTE is still
+/// the value I sampled", i.e. the standard demand-paging re-validation: re-read
+/// the leaf PTE under the page-table lock immediately before writing it and
+/// abort if it changed (cf. the page-table-lock `pte_same` re-check in a CoW
+/// copy).  The loser observes the winner's already-replaced PTE under the same
+/// lock that serialises the install and backs out without aliasing the mapping.
+/// Per Intel SDM Vol. 3A 4.10.4.3 the not-present -> present invalidation of the
+/// other CPUs is handled by the caller's TLB shootdown; the hazard this guard
+/// prevents is the second *frame*.
 pub fn map_page_in_cow_if_unchanged(
     pml4_phys: u64,
     virt_addr: u64,
-    expected_old_phys: u64,
     phys_addr: u64,
     flags: u64,
+    expected_phys: u64,
 ) -> bool {
     let _mm_guard = crate::mm::vma::mm_sem_for_cr3(pml4_phys);
     let _mm_read = _mm_guard.as_ref().map(|s| s.read());
@@ -752,24 +762,23 @@ pub fn map_page_in_cow_if_unchanged(
         };
 
         let pt_ptr = p2v(pt_phys);
-        // Compare-with-install: only swap in `phys_addr` if the leaf PTE is
-        // present and still references the expected shared frame.  A sibling
-        // CoW winner will have already replaced it with its own frame.
+        // Re-validate: the PTE must still be present AND still map the exact
+        // frame the CoW handler sampled before its copy.  If a sibling CPU
+        // already CoW-copied this page, the PTE now maps a different (private)
+        // frame and is writable; we must not clobber it with our own copy.
         let existing = *pt_ptr.add(pt_idx);
-        if existing & PAGE_PRESENT == 0
-            || (existing & ADDR_MASK) != (expected_old_phys & ADDR_MASK)
-        {
+        if existing & PAGE_PRESENT == 0 || (existing & ADDR_MASK) != (expected_phys & ADDR_MASK) {
             return false;
         }
         *pt_ptr.add(pt_idx) = (phys_addr & ADDR_MASK) | flags | PAGE_PRESENT;
     }
 
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     crate::mm::w215_diag::pte_change_record(
         virt_addr,
         phys_addr & ADDR_MASK,
-        expected_old_phys & ADDR_MASK,
-        crate::mm::w215_diag::PTE_KIND_WRITE,
+        expected_phys & ADDR_MASK,
+        crate::mm::w215_diag::PTE_KIND_MAP,
         ring_caller_rip(),
         pml4_phys,
     );
@@ -797,7 +806,7 @@ pub fn unmap_page_in(pml4_phys: u64, virt_addr: u64) {
     // Best-effort pre-mutation snapshot: a concurrent CPU may race between
     // snapshot and the write below, so old_phys_for_ring can be stale.
     // Diagnostic-only.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     let old_phys_for_ring = read_pte(pml4_phys, virt_addr) & ADDR_MASK;
 
     unsafe {
@@ -813,7 +822,7 @@ pub fn unmap_page_in(pml4_phys: u64, virt_addr: u64) {
         *p2v(pd_entry & ADDR_MASK).add(pt_idx) = 0;
     }
 
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     crate::mm::w215_diag::pte_change_record(
         virt_addr,
         0,
@@ -1003,7 +1012,7 @@ pub fn write_pte(pml4_phys: u64, virt_addr: u64, pte: u64) {
     // Best-effort pre-mutation snapshot: a concurrent CPU may race between
     // snapshot and the write below, so old_phys_for_ring can be stale.
     // Diagnostic-only.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     let old_phys_for_ring = read_pte(pml4_phys, virt_addr) & ADDR_MASK;
 
     unsafe {
@@ -1019,7 +1028,7 @@ pub fn write_pte(pml4_phys: u64, virt_addr: u64, pte: u64) {
         *p2v(pd_entry & ADDR_MASK).add(pt_idx) = pte;
     }
 
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     crate::mm::w215_diag::pte_change_record(
         virt_addr,
         pte & ADDR_MASK,

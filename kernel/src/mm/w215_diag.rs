@@ -56,7 +56,7 @@
 //! may be racily overwritten, in which case `PROV_RING_OVERFLOW` ticks
 //! up.  The diagnostic favours simplicity over precision.
 
-#![cfg(feature = "firefox-test")]
+#![cfg(feature = "firefox-test-core")]
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 

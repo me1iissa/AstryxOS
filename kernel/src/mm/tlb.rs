@@ -187,15 +187,15 @@ static STAT_QUARANTINE_RELEASED: AtomicU64 = AtomicU64::new(0);
 /// A non-zero value is direct evidence that the protocol declares the
 /// shootdown complete while the receiving CPU's `local_invlpg_range` may
 /// not yet be committed to the hardware TLB, making the W215 frame-aliasing
-/// class mechanically plausible.  Gated behind `#[cfg(feature = "firefox-test")]`.
-#[cfg(feature = "firefox-test")]
+/// class mechanically plausible.  Gated behind `#[cfg(feature = "firefox-test-core")]`.
+#[cfg(feature = "firefox-test-core")]
 pub(crate) static STAT_CLEAN_ACK_LATE: AtomicU64 = AtomicU64::new(0);
 
 /// H2 diagnostic counter: number of times `shootdown_range_inner` returned
 /// `false` (unclean → quarantine path).  Counts timed-out shootdowns routed
 /// to quarantine — these never reach the done-flag poll.
-/// Gated behind `#[cfg(feature = "firefox-test")]`.
-#[cfg(feature = "firefox-test")]
+/// Gated behind `#[cfg(feature = "firefox-test-core")]`.
+#[cfg(feature = "firefox-test-core")]
 pub(crate) static STAT_UNCLEAN_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Per-CPU "done" flag set by `handle_shootdown_ipi` immediately AFTER the
@@ -211,7 +211,7 @@ pub(crate) static STAT_UNCLEAN_TOTAL: AtomicU64 = AtomicU64::new(0);
 ///
 /// Only materialised under `firefox-test`; in production the slot's `pending`
 /// flag is the sole synchronisation point and carries no extra overhead.
-#[cfg(feature = "firefox-test")]
+#[cfg(feature = "firefox-test-core")]
 static SHOOTDOWN_DONE_FLAGS: [AtomicU8; apic::MAX_CPUS] =
     [const { AtomicU8::new(0) }; apic::MAX_CPUS];
 
@@ -528,7 +528,7 @@ fn shootdown_range_inner(cr3: u64, va_lo: u64, va_hi: u64) -> bool {
         // payload so the handler's subsequent store of 1 is
         // unambiguously for *this* shootdown, not a residual from a prior
         // one.  Must precede the Release-store of pending below.
-        #[cfg(feature = "firefox-test")]
+        #[cfg(feature = "firefox-test-core")]
         SHOOTDOWN_DONE_FLAGS[bit].store(0, Ordering::Release);
         // pending=1 must be the LAST write so the handler sees a
         // fully-published payload.  Release pairs with Acquire in
@@ -609,7 +609,7 @@ fn shootdown_range_inner(cr3: u64, va_lo: u64, va_hi: u64) -> bool {
         );
         // H2 diagnostic: count this unclean shootdown for baseline comparison
         // with CLEAN_ACK_LATE.
-        #[cfg(feature = "firefox-test")]
+        #[cfg(feature = "firefox-test-core")]
         STAT_UNCLEAN_TOTAL.fetch_add(1, Ordering::Relaxed);
         return false;
     }
@@ -623,7 +623,7 @@ fn shootdown_range_inner(cr3: u64, va_lo: u64, va_hi: u64) -> bool {
     // the pending clear); the done flag provides a second, independent
     // readback point that is set AFTER the invalidation instruction
     // completes, giving us a measurement of whether the two signals race.
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         // Brief spin on the done flags: 4000 iterations ≈ a few µs, far
         // cheaper than the ACK_BOUND above, but enough to cover any IPI
@@ -898,7 +898,7 @@ pub extern "C" fn handle_shootdown_ipi() {
             // has committed.  The Release fence here pairs with the Acquire
             // poll in `shootdown_range_inner` so the sender observes the
             // completed `invlpg` ordering, not just the `pending` clear.
-            #[cfg(feature = "firefox-test")]
+            #[cfg(feature = "firefox-test-core")]
             if cpu < apic::MAX_CPUS {
                 SHOOTDOWN_DONE_FLAGS[cpu].store(1, Ordering::Release);
             }
@@ -943,13 +943,13 @@ pub fn stats() -> Stats {
         quarantine_deferred: STAT_QUARANTINE_DEFERRED.load(Ordering::Relaxed),
         quarantine_released: STAT_QUARANTINE_RELEASED.load(Ordering::Relaxed),
         quarantine_depth: STAT_QUARANTINE_DEPTH.load(Ordering::Relaxed),
-        #[cfg(feature = "firefox-test")]
+        #[cfg(feature = "firefox-test-core")]
         clean_ack_late: STAT_CLEAN_ACK_LATE.load(Ordering::Relaxed),
-        #[cfg(not(feature = "firefox-test"))]
+        #[cfg(not(feature = "firefox-test-core"))]
         clean_ack_late: 0,
-        #[cfg(feature = "firefox-test")]
+        #[cfg(feature = "firefox-test-core")]
         unclean_total: STAT_UNCLEAN_TOTAL.load(Ordering::Relaxed),
-        #[cfg(not(feature = "firefox-test"))]
+        #[cfg(not(feature = "firefox-test-core"))]
         unclean_total: 0,
     }
 }

@@ -352,6 +352,19 @@ pub fn dispatch(req: &str, out: &mut String) {
         "mem"            => op_mem(req, out),
         "read-file"      => op_read_file(req, out),
         "trace-status"   => op_trace_status(out),
+        // blk-trace: dump the virtio-blk LBA trace ring as JSON (out-of-band
+        // drain replacing the old per-op COM1 write). `blk-trace-flush` re-emits
+        // the classic `[BLK]` serial lines for the legacy heatmap ingestion.
+        "blk-trace"      => op_blk_trace(out),
+        "blk-trace-flush" => op_blk_trace_flush(out),
+        "log-ring"        => op_log_ring(out),
+        "log-ring-flush"  => op_log_ring_flush(out),
+        "log-ring-enable" => op_log_ring_enable(req, out),
+        // virtio-blk wait-amplification telemetry + runtime A/B controls.
+        "virtio-wait-hist"  => op_virtio_wait_hist(out),
+        "virtio-wait-mode"  => op_virtio_wait_mode(req, out),
+        "virtio-wait-spin"  => op_virtio_wait_spin(req, out),
+        "virtio-wait-reset" => op_virtio_wait_reset(out),
         "bell-stats"       => op_bell_stats(out),
         "cache-audit"      => op_cache_audit(out),
         "cache-aliasing"   => op_cache_aliasing(out),
@@ -368,9 +381,9 @@ pub fn dispatch(req: &str, out: &mut String) {
         "thread-park-audit" => op_thread_park_audit(req, out),
         "rip-trace"      => op_rip_trace(req, out),
         "procmaps"       => op_procmaps(req, out),
-        #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+        #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
         "futex-stats"           => op_futex_stats(out),
-        #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+        #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
         "futex-set-cluster-wake" => op_futex_set_cluster_wake(req, out),
         "futex-ghost-hist" => op_futex_ghost_hist(req, out),
         // cond-autopsy: one-shot musl pthread_cond/mutex wake-target-vs-
@@ -975,6 +988,134 @@ fn op_trace_status(out: &mut String) {
                    cfg!(feature = "syscall-trace"), cfg!(feature = "pf-trace"));
 }
 
+// ── blk-trace ────────────────────────────────────────────────────────────────
+//
+// Drain the virtio-blk LBA trace ring (drivers/blk_trace) as JSON. This is the
+// out-of-band replacement for the old per-op `[BLK]` COM1 write — the kernel
+// now records each request into a lock-free ring (no VM-exit storm), and this
+// op serialises the most-recent window on demand. When the `blk-trace` feature
+// is off the ring is absent and the op reports `feature: off`.
+
+fn op_blk_trace(out: &mut String) {
+    crate::drivers::blk_trace::dump_json(out);
+}
+
+// blk-trace-flush: re-emit the classic `[BLK] op/lba/len/pid` serial lines in a
+// single controlled burst so the legacy data.img-heatmap serial-log ingestion
+// keeps working. Unlike the old design these lines are emitted on demand, not
+// once per disk op in the hot path. Returns the emitted line count as JSON.
+fn op_blk_trace_flush(out: &mut String) {
+    use core::fmt::Write;
+    let emitted = crate::drivers::blk_trace::flush_to_serial();
+    let _ = write!(out, r#"{{"ok":true,"emitted":{},"feature":"{}"}}"#,
+                   emitted, if cfg!(feature = "blk-trace") { "on" } else { "off" });
+}
+
+// ── log-ring ─────────────────────────────────────────────────────────────────
+//
+// Out-of-band drain of the near-zero-overhead guest-RAM log ring
+// (drivers::log_ring) — the cheap high-volume log transport that replaces the
+// per-byte COM1 16550 PIO firehose.  `log-ring` serialises the live ring as
+// JSON over this kdb channel (zero UART cost); `log-ring-flush` re-emits the
+// buffered lines to COM1 in one burst for serial-log consumers; the
+// `log-ring-enable` toggle forces the slow COM1 path on/off for an A/B
+// measurement.
+
+fn op_log_ring(out: &mut String) {
+    crate::drivers::log_ring::dump_json(out);
+}
+
+fn op_log_ring_flush(out: &mut String) {
+    use core::fmt::Write;
+    let emitted = crate::drivers::log_ring::flush_to_serial();
+    let _ = write!(out, r#"{{"ok":true,"emitted":{}}}"#, emitted);
+}
+
+fn op_log_ring_enable(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    // Optional JSON field `"on": "on"|"off"|"true"|"false"|"1"|"0"`.  Absent →
+    // report current state without changing it (query-only).  Mirrors the
+    // `futex-set-cluster-wake` request shape so the kdb protocol is consistent.
+    let arg = extract_field(req, "on").unwrap_or_default();
+    let prev = crate::drivers::log_ring::stats().enabled;
+    let now = match arg.as_str() {
+        "on" | "1" | "true" => {
+            crate::drivers::log_ring::set_enabled(true);
+            true
+        }
+        "off" | "0" | "false" => {
+            crate::drivers::log_ring::set_enabled(false);
+            false
+        }
+        _ => prev, // query-only (field absent or unrecognised)
+    };
+    let _ = write!(
+        out,
+        r#"{{"ok":true,"prev":{},"enabled":{}}}"#,
+        prev, now
+    );
+}
+
+// ── virtio-blk wait-amplification telemetry ──────────────────────────────────
+//
+// `virtio-wait-hist` drains the per-round-trip wait-sample ring as a JSON
+// histogram (log-scale µs buckets × mean run-queue depth, plus median/p99).
+// `virtio-wait-mode block|yield` flips the wait strategy at runtime so a single
+// build measures BOTH the BEFORE (spin-then-yield) and AFTER (IRQ-driven block)
+// distributions with no build-to-build confound.  `virtio-wait-spin <n>` tunes
+// the adaptive-spin budget.  `virtio-wait-reset` zeroes the ring for a clean
+// A/B window.
+
+fn op_virtio_wait_hist(out: &mut String) {
+    use core::fmt::Write;
+    // Prefix the current strategy so the histogram is self-describing.
+    let mode = if crate::drivers::virtio_blk::wait_adaptive_enabled() { "adaptive" } else { "legacy" };
+    let _ = write!(out, r#"{{"mode":"{}","hist":"#, mode);
+    crate::drivers::virtio_blk::wait_hist_json(out);
+    out.push('}');
+}
+
+fn op_virtio_wait_mode(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    let arg = extract_field(req, "mode").unwrap_or_default();
+    let prev = crate::drivers::virtio_blk::wait_adaptive_enabled();
+    let now = match arg.as_str() {
+        "adaptive" | "1" | "true" => {
+            crate::drivers::virtio_blk::set_wait_adaptive(true);
+            true
+        }
+        "legacy" | "0" | "false" => {
+            crate::drivers::virtio_blk::set_wait_adaptive(false);
+            false
+        }
+        _ => prev, // query-only
+    };
+    let _ = write!(
+        out,
+        r#"{{"ok":true,"prev_mode":"{}","mode":"{}"}}"#,
+        if prev { "adaptive" } else { "legacy" },
+        if now { "adaptive" } else { "legacy" }
+    );
+}
+
+fn op_virtio_wait_spin(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    match extract_field(req, "n").and_then(|s| s.parse::<u32>().ok()) {
+        Some(n) => {
+            let prev = crate::drivers::virtio_blk::set_spin_budget(n);
+            let _ = write!(out, r#"{{"ok":true,"prev_spin":{},"spin":{}}}"#, prev, n.max(1));
+        }
+        None => {
+            out.push_str(r#"{"error":"virtio-wait-spin needs integer field 'n'"}"#);
+        }
+    }
+}
+
+fn op_virtio_wait_reset(out: &mut String) {
+    crate::drivers::virtio_blk::wait_hist_reset();
+    out.push_str(r#"{"ok":true,"reset":true}"#);
+}
+
 // ── bell-stats ───────────────────────────────────────────────────────────────
 //
 // Dump the per-source `POLL_BELL` ring counters plus the
@@ -1032,7 +1173,7 @@ fn op_bell_stats(out: &mut String) {
 //   pfh_writable_alias_cache > 0 but key matches installer          → NULL; re-frame
 
 fn op_cache_aliasing(out: &mut String) {
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         use core::fmt::Write;
         let pfh_alias = crate::arch::x86_64::idt::pfh_writable_alias_cache_count();
@@ -1042,7 +1183,7 @@ fn op_cache_aliasing(out: &mut String) {
             pfh_alias, mmap_sw);
         out.push('}');
     }
-    #[cfg(not(feature = "firefox-test"))]
+    #[cfg(not(feature = "firefox-test-core"))]
     {
         out.push_str(r#"{"error":"cache-aliasing requires firefox-test feature"}"#);
     }
@@ -1070,7 +1211,7 @@ fn op_cache_aliasing(out: &mut String) {
 // Returns zero for all buckets before any W215-cluster fault fires (idle state).
 
 fn op_fault_cache_keys(out: &mut String) {
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         use core::fmt::Write;
         let (a, b, c) = crate::signal::fault_cache_key_bucket_counts();
@@ -1080,7 +1221,7 @@ fn op_fault_cache_keys(out: &mut String) {
         );
         out.push('}');
     }
-    #[cfg(not(feature = "firefox-test"))]
+    #[cfg(not(feature = "firefox-test-core"))]
     {
         out.push_str(r#"{"error":"fault-cache-keys requires firefox-test feature"}"#);
     }
@@ -1105,7 +1246,7 @@ fn op_fault_cache_keys(out: &mut String) {
 // pid/vaddr/phys/key for provenance.  Requires --features firefox-test.
 
 fn op_w215_cache_residency(out: &mut String) {
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         use core::fmt::Write;
         out.push('{');
@@ -1116,7 +1257,7 @@ fn op_w215_cache_residency(out: &mut String) {
         }
         out.push('}');
     }
-    #[cfg(not(feature = "firefox-test"))]
+    #[cfg(not(feature = "firefox-test-core"))]
     {
         out.push_str(r#"{"error":"w215-cache-residency requires firefox-test feature"}"#);
     }
@@ -1160,7 +1301,7 @@ fn op_w215_cache_residency(out: &mut String) {
 // Requires: --features firefox-test.
 
 fn op_w215_diag(out: &mut String) {
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         use core::fmt::Write;
         let window_race = crate::mm::w215_diag::window_race_count();
@@ -1180,7 +1321,7 @@ fn op_w215_diag(out: &mut String) {
         out.push(']');
         out.push('}');
     }
-    #[cfg(not(feature = "firefox-test"))]
+    #[cfg(not(feature = "firefox-test-core"))]
     {
         out.push_str(r#"{"error":"w215-diag requires firefox-test feature"}"#);
     }
@@ -2113,7 +2254,7 @@ fn op_syscall_trend(req: &str, out: &mut String) {
 // On non-firefox-test builds the op returns a capabilities note instead.
 
 fn op_cache_audit(out: &mut String) {
-    #[cfg(feature = "firefox-test")]
+    #[cfg(feature = "firefox-test-core")]
     {
         use core::fmt::Write;
 
@@ -2136,7 +2277,7 @@ fn op_cache_audit(out: &mut String) {
         out.push_str(r#","note":"per-orphan detail in serial log [CACHE/AUDIT/ORPHAN] lines""#);
         out.push('}');
     }
-    #[cfg(not(feature = "firefox-test"))]
+    #[cfg(not(feature = "firefox-test-core"))]
     {
         out.push_str(r#"{"error":"cache-audit requires firefox-test feature"}"#);
     }
@@ -3185,7 +3326,7 @@ fn op_rip_trace(req: &str, out: &mut String) {
 // this op is the only structured way to read it back without scraping
 // the serial transcript.  The synchronous summary emission is
 // idempotent — calling it multiple times just refreshes the line.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn op_futex_ghost_hist(req: &str, out: &mut String) {
     use core::fmt::Write;
     use core::sync::atomic::Ordering;
@@ -3252,7 +3393,7 @@ fn op_futex_ghost_hist(req: &str, out: &mut String) {
     ghost_hist::dump_summary();
 }
 
-#[cfg(not(any(feature = "firefox-test", feature = "test-mode")))]
+#[cfg(not(any(feature = "firefox-test-core", feature = "test-mode")))]
 fn op_futex_ghost_hist(_req: &str, out: &mut String) {
     out.push_str(r#"{"error":"futex-ghost-hist requires firefox-test or test-mode feature"}"#);
 }
@@ -3400,10 +3541,10 @@ fn op_cond_autopsy(req: &str, out: &mut String) {
     // ── Stage 4: recent wake targets in the window ─────────────────────
     // firefox-test/test-mode only — the per-CPU wake rings live in the
     // feature-gated futex_cluster module.  Empty otherwise.
-    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    #[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
     let recent_wakes: alloc::vec::Vec<(u64, u64, i64)> =
         crate::subsys::linux::futex_cluster::recent_wakes_near(addr, half);
-    #[cfg(not(any(feature = "firefox-test", feature = "test-mode")))]
+    #[cfg(not(any(feature = "firefox-test-core", feature = "test-mode")))]
     let recent_wakes: alloc::vec::Vec<(u64, u64, i64)> = alloc::vec::Vec::new();
 
     // ── Stage 5: holder inference ──────────────────────────────────────
@@ -3581,7 +3722,7 @@ fn file_type_str(ft: crate::vfs::FileType) -> &'static str {
 // recovery upholds the at-least-one-unblocked guarantee when older glibc
 // loses the race documented at the public bug
 // <https://sourceware.org/bugzilla/show_bug.cgi?id=25847>.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn op_futex_stats(out: &mut String) {
     use core::fmt::Write;
     let s = crate::subsys::linux::futex_cluster::stats();
@@ -3609,7 +3750,7 @@ fn op_futex_stats(out: &mut String) {
 // Default is ON when the kernel was built with `firefox-test`, OFF otherwise.
 // Production safety: operator must explicitly opt-in via this kdb command
 // on a stock build.
-#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
 fn op_futex_set_cluster_wake(req: &str, out: &mut String) {
     use core::fmt::Write;
     let on_field = extract_field(req, "on").map(|v| v.to_ascii_lowercase());
