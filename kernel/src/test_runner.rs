@@ -445,6 +445,10 @@ pub fn run() -> ! {
     if test_ext2_perf_indirect_cache() { passed += 1; }
     total += 1;
     if test_ext2_smp_alloc_race() { passed += 1; }
+    total += 1;
+    if test_ext2_perf_inode_cache() { passed += 1; }
+    total += 1;
+    if test_ext2_inode_cache_coherence() { passed += 1; }
 
     // ── Test 18: Signal Delivery Trampoline ─────────────────────────────
 
@@ -7944,6 +7948,195 @@ fn test_ext2_smp_alloc_race() -> bool {
     }
 
     test_pass!("EXT2-SMP-ALLOC-RACE");
+    true
+}
+
+// ============================================================================
+// EXT2-PERF-INODE-CACHE: per-superblock inode cache bounds repeat read_inode
+// ============================================================================
+//
+// `resolve_path_opts` calls `stat()` (→ `read_inode`) on every component of
+// every open/stat/access, so the same inode is read thousands of times during
+// a large dynamic-link load.  A per-superblock inode cache serves the parsed
+// inode after the first read, eliminating the repeat disk round-trips.
+//
+// Test: stat the same inode 1000 times.  Call 1 is a miss (populates the
+// cache); calls 2..1000 must be hits, so we expect ≥ 999 hits.
+fn test_ext2_perf_inode_cache() -> bool {
+    test_header!("EXT2-PERF-INODE-CACHE: inode cache hit rate ≥ 999/1000");
+    use crate::vfs::FileSystemOps;
+    let fs = mount_ext2_test_image();
+
+    // Create a file so we have a non-reserved inode to stat repeatedly.
+    let ino = match fs.create_file(2, "perf_inode_target.txt") {
+        Ok(i) => i,
+        Err(e) => {
+            test_fail!("EXT2-PERF-INODE-CACHE", "create_file failed: {:?}", e);
+            return false;
+        }
+    };
+
+    // The create path wrote the inode through the cache, so prime by reading
+    // once then snapshot the counter.  (Reset baseline after the first stat
+    // so the first counted call is guaranteed to find the entry present.)
+    let _ = fs.stat(ino);
+    let hits_before = fs.inode_cache_hits_for_test();
+
+    for i in 0..1000u32 {
+        match fs.stat(ino) {
+            Ok(st) if st.inode == ino => {}
+            Ok(st) => {
+                test_fail!("EXT2-PERF-INODE-CACHE",
+                    "stat #{} returned inode {} want {}", i, st.inode, ino);
+                return false;
+            }
+            Err(e) => {
+                test_fail!("EXT2-PERF-INODE-CACHE", "stat #{} failed: {:?}", i, e);
+                return false;
+            }
+        }
+    }
+
+    let hits = fs.inode_cache_hits_for_test() - hits_before;
+    test_println!("  inode cache hits for 1000 stats: {}", hits);
+    if hits < 1000 {
+        test_fail!("EXT2-PERF-INODE-CACHE",
+            "hit count {} < 1000 (entry was primed before counting)", hits);
+        return false;
+    }
+
+    test_pass!("EXT2-PERF-INODE-CACHE");
+    true
+}
+
+// ============================================================================
+// EXT2-INODE-CACHE-COHERENCE: cache never serves stale inode metadata
+// ============================================================================
+//
+// The inode cache is the FS's in-core copy of on-disk inode metadata.  POSIX
+// permits the in-core copy, but it MUST reflect every mutation:
+//
+//   * write/append  → cached i_size must grow to match (read back through a
+//                     fresh stat that hits the cache)
+//   * truncate      → cached i_size must shrink
+//   * chmod         → cached i_mode bits must change
+//   * unlink+free   → the freed inode number must be invalidated, so a
+//                     recreate that reuses the number reads fresh state
+//                     (size 0, mode S_IFREG|0644), never the dead file's
+//                     metadata.
+//
+// A stale cached inode would be a data-integrity bug (e.g. a reader seeing an
+// old, too-small size after a write, or a recycled inode surfacing a dead
+// file's block pointers).  This test asserts the cache stays coherent across
+// each mutating path while the cache is warm (the inode is read first so it is
+// definitely cached, then mutated, then re-read).
+fn test_ext2_inode_cache_coherence() -> bool {
+    test_header!("EXT2-INODE-CACHE-COHERENCE: write/truncate/chmod/unlink invalidation");
+    use crate::vfs::{FileSystemOps, FileType};
+    let fs = mount_ext2_test_image();
+
+    let ino = match fs.create_file(2, "coherence.txt") {
+        Ok(i) => i,
+        Err(e) => {
+            test_fail!("EXT2-INODE-CACHE-COHERENCE", "create_file failed: {:?}", e);
+            return false;
+        }
+    };
+
+    // Warm the cache: stat reads the inode into the cache.
+    let st0 = fs.stat(ino).expect("stat fresh");
+    if st0.size != 0 {
+        test_fail!("EXT2-INODE-CACHE-COHERENCE",
+            "fresh file size {} want 0", st0.size);
+        return false;
+    }
+    if !fs.inode_cache_contains_for_test(ino) {
+        test_fail!("EXT2-INODE-CACHE-COHERENCE",
+            "inode {} not cached after stat", ino);
+        return false;
+    }
+
+    // ── write: cached size must grow ───────────────────────────────────────
+    let payload = b"the quick brown fox jumps over the lazy dog";
+    let n = fs.write(ino, 0, payload).expect("write");
+    if n != payload.len() {
+        test_fail!("EXT2-INODE-CACHE-COHERENCE", "short write {}/{}", n, payload.len());
+        return false;
+    }
+    let st1 = fs.stat(ino).expect("stat after write");
+    if st1.size != payload.len() as u64 {
+        test_fail!("EXT2-INODE-CACHE-COHERENCE",
+            "STALE size after write: got {} want {}", st1.size, payload.len());
+        return false;
+    }
+    // Read the data back through a fresh resolve to confirm the cached inode's
+    // block pointers / size let us read the new content.
+    let mut buf = alloc::vec![0u8; payload.len()];
+    let r = fs.read(ino, 0, &mut buf).expect("read after write");
+    if r != payload.len() || &buf[..] != payload {
+        test_fail!("EXT2-INODE-CACHE-COHERENCE",
+            "read-back mismatch (got {} bytes)", r);
+        return false;
+    }
+
+    // ── truncate: cached size must shrink ──────────────────────────────────
+    fs.truncate(ino, 10).expect("truncate");
+    let st2 = fs.stat(ino).expect("stat after truncate");
+    if st2.size != 10 {
+        test_fail!("EXT2-INODE-CACHE-COHERENCE",
+            "STALE size after truncate: got {} want 10", st2.size);
+        return false;
+    }
+
+    // ── chmod: cached mode bits must change ────────────────────────────────
+    fs.chmod(ino, 0o600).expect("chmod");
+    let st3 = fs.stat(ino).expect("stat after chmod");
+    if st3.permissions & 0o777 != 0o600 {
+        test_fail!("EXT2-INODE-CACHE-COHERENCE",
+            "STALE mode after chmod: got {:o} want 600", st3.permissions & 0o777);
+        return false;
+    }
+
+    // ── unlink + recreate: freed inode number must be invalidated ──────────
+    // Unlink drops links_count to 0 → the inode is freed.  Its cache entry
+    // must be invalidated so a recreate that reuses the number does not
+    // surface the dead file's size/mode.
+    fs.unlink_entry(2, "coherence.txt").expect("unlink");
+    // remove_inode tears the inode down when links_count hits 0 and no fd
+    // holds it; that frees the inode number (and invalidates the cache).
+    let _ = fs.remove_inode(ino);
+    if fs.inode_cache_contains_for_test(ino) {
+        test_fail!("EXT2-INODE-CACHE-COHERENCE",
+            "freed inode {} STILL cached after unlink/remove", ino);
+        return false;
+    }
+
+    // Recreate — the allocator may hand back the same number.  Whatever
+    // number it returns, a fresh stat must show a pristine regular file
+    // (size 0, default mode), never the dead file's truncated size/0o600.
+    let ino2 = match fs.create_file(2, "reborn.txt") {
+        Ok(i) => i,
+        Err(e) => {
+            test_fail!("EXT2-INODE-CACHE-COHERENCE", "recreate failed: {:?}", e);
+            return false;
+        }
+    };
+    let st4 = fs.stat(ino2).expect("stat reborn");
+    if st4.file_type != FileType::RegularFile || st4.size != 0 {
+        test_fail!("EXT2-INODE-CACHE-COHERENCE",
+            "reborn inode {} STALE: type={:?} size={} (want RegularFile/0)",
+            ino2, st4.file_type, st4.size);
+        return false;
+    }
+    if st4.permissions & 0o777 != 0o644 {
+        test_fail!("EXT2-INODE-CACHE-COHERENCE",
+            "reborn inode {} STALE mode {:o} (want 644)",
+            ino2, st4.permissions & 0o777);
+        return false;
+    }
+
+    test_println!("  write/truncate/chmod refresh + unlink invalidation all coherent");
+    test_pass!("EXT2-INODE-CACHE-COHERENCE");
     true
 }
 
