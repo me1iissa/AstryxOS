@@ -68,6 +68,36 @@ jobs:
       - name: check fault-immunity tokens (ke::bugcheck + no_alloc_fmt)
         run: bash scripts/check_fault_immune.sh
 
+  tooling-smoke:
+    # Host-only smoke tests for the dev-dashboard tooling (no kernel build, no
+    # QEMU boot — pure Python against synthetic + real serial-log fixtures, <10s
+    # total). Gates the PR on the dashboard parsers/derivations staying correct:
+    #   * serial-web-smoke.py     — the serial monitor's endpoints + per-gate
+    #                               TIMING (elapsed/delta from the marks sidecar
+    #                               and the kernel-tick derivation).
+    #   * perf-bench-smoke.py     — the perf taxonomy, import-logs, AND the
+    #                               ingest-marks bridge (gate marks -> a
+    #                               time-series record the perf dashboard reads).
+    #   * perf-baseline-linux-smoke.py — the Linux-baseline record shape.
+    # Failure mode this prevents: a regression in the gate<->phase mapping, the
+    # tick->ms derivation, or the marks-sidecar schema silently corrupting the
+    # numbers BOTH dashboards display, with no kernel-boot job to catch it.
+    name: tooling smoke (host-only dashboards)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: serial-web smoke (serial monitor + per-gate timing)
+        run: python3 scripts/serial-web-smoke.py
+      - name: perf-bench smoke (taxonomy + ingest-marks bridge)
+        run: python3 scripts/perf-bench-smoke.py
+      - name: perf baseline-linux smoke (record shape)
+        run: python3 scripts/perf-baseline-linux-smoke.py
+
   kernel-build:
     name: bootloader + kernel builds
     runs-on: ubuntu-latest
