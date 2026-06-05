@@ -53,6 +53,23 @@ Tier 1 — session management:
                                           [--gdb-port PORT] [--gdb-wait]
                                           [--firefox-variant musl|glibc]
                                           [--snapshottable]
+                                          [--livelock-reap-sc N]
+                                          [--livelock-reap-secs SECS]
+                                          [--no-livelock-reap]
+        Livelock auto-reap (default ON): a spinning FF render boot — pid 1
+        busy-looping (waitpid/futex) while the deepest gate is frozen — drives
+        the pid=1 syscall count into the hundreds-of-millions/billions at ~100%
+        host CPU with NO forward progress.  The watcher auto-stops such a boot
+        so it stops pinning a core and skewing concurrent timing runs.  The
+        rule: once the pid=1 syscall count churns by > --livelock-reap-sc
+        (default 50,000,000) WHILE the deepest FF gate stays frozen for longer
+        than --livelock-reap-secs (default 180s), the session is cleanly stopped
+        (same path as `stop`), marked terminal_cause="livelock-autoreap" in the
+        session JSON + events.jsonl, and a "[HARNESS] livelock auto-reap: …"
+        line is logged.  BEFORE a reap, `status`/`list`/the serial monitor show
+        a live `livelock_suspected: true` flag.  Pass --no-livelock-reap (or set
+        either threshold to 0) to keep a spinning session alive for inspection
+        (debugging/autopsy holds).
     python3 scripts/qemu-harness.py stop <sid>
     python3 scripts/qemu-harness.py list
     python3 scripts/qemu-harness.py wait <sid> <regex> [--ms MS]
@@ -899,6 +916,234 @@ _IDLE_SECONDS = 30
 # kernel-only form serial-web/perf_markers use ([HB]/PROC-METRICS tick=).
 _WATCH_TICK_RE = re.compile(r"(?:\[HB\]|PROC-METRICS\]) tick=(\d+)")
 
+# ── Livelock auto-reap ────────────────────────────────────────────────────────
+#
+# A spinning FF render boot (the livelock variant of the screenshot-IPC stall —
+# e.g. pid 1 busy-looping on waitpid/futex while the deepest gate is frozen)
+# drives the pid=1 syscall counter into the hundreds-of-millions / billions at
+# ~100% host CPU while making NO forward progress.  Left alone it pins a core
+# until the wall-clock timeout, skewing concurrent timing boots.  The watcher
+# already tails the serial log; the detector below turns "huge syscall churn,
+# zero gate progress" into a clean auto-stop.
+#
+# The authoritative live pid=1 syscall count comes from the per-process metrics
+# line the kernel emits every ~500 ticks:
+#
+#   [PROC-METRICS] tick=420514 pid=1 name=/disk/.../firefox-bin sc=758998 (...)
+#
+# That line can be prefixed by another marker on the same physical line (the
+# serial mux interleaves emitters), so the regex anchors on the `PROC-METRICS]`
+# token rather than start-of-line.  Only pid=1 is tracked (the dispatching
+# process whose runaway churn is the symptom).
+_PROC_METRICS_PID1_SC_RE = re.compile(rb"PROC-METRICS\] .*?\bpid=1\b.*?\bsc=(\d+)")
+
+# Defaults: ON.  A boot must churn > 50M pid=1 syscalls with the deepest gate
+# frozen for > 180 s of wall-clock before it is reaped.  Both are tunable per
+# session via `start --livelock-reap-sc N --livelock-reap-secs N`, and the whole
+# guard is disabled with `start --no-livelock-reap`.
+LIVELOCK_REAP_SC_DEFAULT   = 50_000_000
+LIVELOCK_REAP_SECS_DEFAULT = 180.0
+
+
+class LivelockDetector:
+    """Pure (no-I/O) "syscall-churn-without-gate-progress" detector.
+
+    The watcher feeds it observations as the serial log advances:
+
+        det = LivelockDetector(reap_sc=50_000_000, reap_secs=180.0)
+        det.observe(sc=12_345, gate_idx=3, now=t)   # repeatedly
+        if det.suspected: ...                       # live "coming" flag
+        if det.should_reap(now=t): reap()           # terminal verdict
+
+    State is a single moving anchor: the (sc, time) captured the last time the
+    *deepest gate index* advanced.  Livelock is declared when, relative to that
+    anchor, the syscall counter has advanced by more than `reap_sc` AND the gate
+    has stayed put for more than `reap_secs` of wall-clock.  Any gate advance
+    re-anchors and clears suspicion, so a boot that is churning syscalls *and*
+    making progress is never flagged.
+
+    `suspected` is the early-warning flag (both conditions partially met — churn
+    over threshold, gate frozen, but the time window not yet elapsed) so a
+    dashboard can badge a spinning session *before* it is reaped.  `should_reap`
+    is the strict terminal predicate.
+
+    `success_gate_idx` (the last/png-write gate index) makes the detector REFUSE
+    to suspect or reap once the success gate is reached — a boot that rendered
+    the screenshot is done, not livelocked, even if it keeps churning syscalls
+    afterwards.  Pass -1 (the default) to disable this guard.
+
+    Disabled (`enabled=False`, set when reap_sc<=0 or reap_secs<=0, or
+    --no-livelock-reap) the detector observes but never suspects or reaps.
+    """
+
+    def __init__(self, reap_sc: int, reap_secs: float, enabled: bool = True,
+                 success_gate_idx: int = -1):
+        self.reap_sc = int(reap_sc)
+        self.reap_secs = float(reap_secs)
+        # A non-positive threshold (either axis) disables the guard outright —
+        # callers can pass 0 to mean "off" without a separate flag.
+        self.enabled = bool(enabled) and self.reap_sc > 0 and self.reap_secs > 0
+        # The success/terminal gate index (png-write).  Once the boot reaches
+        # it the detector goes inert — a rendered screenshot is success, never
+        # a livelock.  -1 = no success gate (detector always armed).
+        self.success_gate_idx = int(success_gate_idx)
+        self.anchor_sc = 0          # pid=1 sc at the last gate advance
+        self.anchor_time = None     # wall-clock at the last gate advance
+        self.deepest_gate_idx = -1  # deepest FF gate index seen so far
+        self.last_sc = 0            # most recent pid=1 sc observed
+        self.last_gate_idx = -1
+        # Frozen at reap time so the event/JSON report the exact numbers that
+        # tripped the guard.
+        self.reaped = False
+        self.reap_sc_at = None
+        self.reap_frozen_secs = None
+
+    def observe(self, sc, gate_idx, now):
+        """Record one observation.  `sc` is the latest pid=1 syscall count (or
+        None if this line carried no pid=1 metrics), `gate_idx` the deepest FF
+        gate index reached so far (-1 = none), `now` a monotonic timestamp."""
+        if self.anchor_time is None:
+            # First observation establishes the baseline anchor.
+            self.anchor_time = now
+            self.anchor_sc = sc if sc is not None else 0
+        if sc is not None:
+            self.last_sc = sc
+        if gate_idx is not None and gate_idx > self.deepest_gate_idx:
+            # Forward progress — re-anchor (clears any accumulated suspicion).
+            self.deepest_gate_idx = gate_idx
+            self.anchor_sc = self.last_sc
+            self.anchor_time = now
+        self.last_gate_idx = self.deepest_gate_idx
+
+    @property
+    def sc_delta(self) -> int:
+        return self.last_sc - self.anchor_sc
+
+    def frozen_secs(self, now) -> float:
+        if self.anchor_time is None:
+            return 0.0
+        return now - self.anchor_time
+
+    @property
+    def _reached_success(self) -> bool:
+        """True once the deepest gate is at/past the success (png-write) gate —
+        the boot rendered the screenshot, so it is success, never a livelock."""
+        return (self.success_gate_idx >= 0
+                and self.deepest_gate_idx >= self.success_gate_idx)
+
+    @property
+    def suspected(self) -> bool:
+        """Live early-warning: churn over threshold while the gate is frozen.
+
+        Intentionally does NOT require the time window — it is the "this is
+        heading for a reap" badge a human/agent sees on the dashboard before
+        the terminal verdict fires.  False when disabled or once the success
+        gate (png-write) has been reached."""
+        if not self.enabled or self._reached_success:
+            return False
+        return self.sc_delta > self.reap_sc
+
+    def should_reap(self, now) -> bool:
+        """Strict terminal predicate: churn over threshold AND gate frozen for
+        longer than the configured wall-clock window.  False when disabled,
+        already reaped, or once the success gate (png-write) has been reached."""
+        if not self.enabled or self.reaped or self._reached_success:
+            return False
+        if self.sc_delta <= self.reap_sc:
+            return False
+        if self.frozen_secs(now) <= self.reap_secs:
+            return False
+        # Latch the tripping numbers for the report.
+        self.reaped = True
+        self.reap_sc_at = self.last_sc
+        self.reap_frozen_secs = self.frozen_secs(now)
+        return True
+
+
+def _ll_persist_suspected(sid: str, suspected: bool, det: "LivelockDetector",
+                          gate_id):
+    """Stamp the live `livelock_suspected` early-warning flag (and the current
+    churn/frozen numbers) into the session JSON so `status`, `list`, and the
+    serial-monitor can badge a spinning session BEFORE it is reaped.  Additive
+    fields — never present on sessions started before this landed.  Best-effort:
+    a transient read/write race must not disturb the watcher."""
+    try:
+        sess = _load_session(sid)
+    except SystemExit:
+        return
+    sess["livelock_suspected"] = bool(suspected)
+    sess["livelock_info"] = {
+        "suspected":   bool(suspected),
+        "sc_delta":    det.sc_delta,
+        "frozen_gate": gate_id,
+        "reap_sc":     det.reap_sc,
+        "reap_secs":   det.reap_secs,
+        "enabled":     det.enabled,
+    }
+    try:
+        _save_session(sess)
+    except OSError:
+        pass
+
+
+def _ll_reap_session(sid: str, qmp_sock: str, pid: int,
+                     det: "LivelockDetector", gate_id):
+    """Clean-stop a livelocked session: record `terminal_cause` in the session
+    JSON + events, log a clear [HARNESS] line, then take QEMU down via the same
+    SIGTERM→SIGKILL path `stop` uses.  The session JSON is updated (NOT deleted)
+    so a post-mortem `status <sid>` still shows terminal_cause=livelock-autoreap;
+    a later explicit `stop <sid>` cleans the file up."""
+    frozen = det.reap_frozen_secs if det.reap_frozen_secs is not None else 0.0
+    sc_at = det.reap_sc_at if det.reap_sc_at is not None else det.last_sc
+    # Record on the session JSON first (so the verdict survives even if the
+    # kill below races a manual stop).
+    try:
+        sess = _load_session(sid)
+        sess["terminal_cause"] = "livelock-autoreap"
+        sess["livelock_suspected"] = True
+        sess["livelock_reap_result"] = {
+            "frozen_gate":  gate_id,
+            "sc_at_reap":   sc_at,
+            "sc_delta":     det.sc_delta,
+            "frozen_secs":  round(frozen, 1),
+            "reap_sc":      det.reap_sc,
+            "reap_secs":    det.reap_secs,
+            "reaped_at":    time.time(),
+        }
+        _save_session(sess)
+    except SystemExit:
+        pass
+    except OSError:
+        pass
+    _emit_event(sid, {
+        "event":        "livelock_autoreap",
+        "terminal_cause": "livelock-autoreap",
+        "frozen_gate":  gate_id,
+        "sc_at_reap":   sc_at,
+        "sc_delta":     det.sc_delta,
+        "frozen_secs":  round(frozen, 1),
+        "reap_sc":      det.reap_sc,
+        "reap_secs":    det.reap_secs,
+    })
+    # Clear, greppable host-side log line (goes to the detached watcher's stderr,
+    # which is /dev/null in production — the durable record is the event above).
+    sys.stderr.write(
+        f"[HARNESS] livelock auto-reap: sid={sid} gate={gate_id} "
+        f"sc={sc_at} sc_delta={det.sc_delta} "
+        f"(no gate progress for {round(frozen, 1)}s)\n")
+    # Take QEMU down — same SIGTERM→(3s)→SIGKILL escalation as cmd_stop.
+    if pid and _pid_alive(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(30):
+                if not _pid_alive(pid):
+                    break
+                time.sleep(0.1)
+            if _pid_alive(pid):
+                os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
 
 def _load_gate_marks():
     """Lazy-import the shared gate-marks helper. Returns the module, or None when
@@ -933,6 +1178,37 @@ def _watcher_thread(sid: str, serial_log: str, qmp_sock: str, pid: int):
     _gate_idx = 0
     _cur_tick = None
     _line_no = 0
+
+    # ── Livelock auto-reap setup ──────────────────────────────────────────────
+    # Read the per-session config (thresholds + opt-out) the `start` command
+    # stamped into the session JSON.  Tolerant of legacy sessions that predate
+    # this field — fall back to the built-in defaults (guard ON).
+    try:
+        _sess0 = _load_session(sid)
+    except SystemExit:
+        _sess0 = {}
+    _ll_cfg = (_sess0.get("livelock_reap") or {}) if isinstance(_sess0, dict) else {}
+    # FF gate ladder (same source as `ff-progress`) — forward-ordered deepest
+    # gate the boot has reached.  Best-effort: a missing ladder just leaves the
+    # detector observing sc-only (gate index never advances → it can still reap
+    # a boot that churns without ANY gate, which is the right behaviour).
+    try:
+        _ff_gates = _load_ff_gates()
+    except Exception:
+        _ff_gates = []
+    # The success gate is the last ladder entry (png-write).  Once reached the
+    # detector goes inert — a rendered screenshot is success, not a livelock.
+    _ll_success_idx = (len(_ff_gates) - 1) if _ff_gates else -1
+    _ll_det = LivelockDetector(
+        reap_sc   = _ll_cfg.get("reap_sc", LIVELOCK_REAP_SC_DEFAULT),
+        reap_secs = _ll_cfg.get("reap_secs", LIVELOCK_REAP_SECS_DEFAULT),
+        enabled   = _ll_cfg.get("enabled", True),
+        success_gate_idx = _ll_success_idx,
+    )
+    _ff_gate_idx = -1                # deepest FF gate index reached (-1 = none)
+    _ff_gate_id = None               # its stable id (for the reap report)
+    _ll_last_suspected = None        # last value pushed to the session JSON
+    _ll_last_persist = 0.0           # throttle session-JSON writes
 
     while _pid_alive(pid):
         try:
@@ -1006,6 +1282,48 @@ def _watcher_thread(sid: str, serial_log: str, qmp_sock: str, pid: int):
                             "snapshot": snap_name if snap_ok else None,
                             "snapshot_error": snap_err,
                         })
+
+                    # ── Livelock auto-reap: advance the FF gate index + feed
+                    # the detector the live pid=1 syscall count. Entirely
+                    # best-effort — wrapped so a malformed line can never take
+                    # the watcher's panic/idle duties down.
+                    try:
+                        _rawline = line.encode("utf-8", errors="replace")
+                        # Forward-ordered FF gate advance (same discipline as
+                        # ff-progress): one line may satisfy several gates.
+                        _is_ipc = bool(_FF_IPC_WRITE_RE.search(_rawline))
+                        while (_ff_gate_idx + 1) < len(_ff_gates):
+                            _g = _ff_gates[_ff_gate_idx + 1]
+                            if _g["kind"] == "ipc-body" and not _is_ipc:
+                                if not _g["regex"].search(_rawline):
+                                    break
+                            if not _g["regex"].search(_rawline):
+                                break
+                            _ff_gate_idx += 1
+                            _ff_gate_id = _g["id"]
+                        # Live pid=1 syscall count (None when this line carried
+                        # no pid=1 PROC-METRICS).
+                        _scm = _PROC_METRICS_PID1_SC_RE.search(_rawline)
+                        _sc_val = int(_scm.group(1)) if _scm else None
+                        _now = time.monotonic()
+                        _ll_det.observe(sc=_sc_val, gate_idx=_ff_gate_idx, now=_now)
+                        # Push the early-warning flag to the session JSON for
+                        # status/list/serial-web — but only when it CHANGES, and
+                        # at most every ~5 s, so we never thrash the JSON file.
+                        _susp = _ll_det.suspected
+                        if (_susp != _ll_last_suspected
+                                and (_now - _ll_last_persist) >= 5.0):
+                            _ll_persist_suspected(sid, _susp, _ll_det, _ff_gate_id)
+                            _ll_last_suspected = _susp
+                            _ll_last_persist = _now
+                        # Terminal verdict: churn over threshold AND gate frozen
+                        # for the configured wall-clock window → clean reap.
+                        if _ll_det.should_reap(now=_now):
+                            _ll_reap_session(sid, qmp_sock, pid, _ll_det,
+                                             _ff_gate_id)
+                            return
+                    except Exception:
+                        pass
                 last_size = size
                 last_activity = time.monotonic()
                 idle_event_sent = False
@@ -3499,6 +3817,21 @@ def cmd_start(args):
         "no_kvm_flag":        no_kvm_flag,
         "force_kvm_flag":     force_kvm_flag,
         "breakpoints": [],
+        # Livelock auto-reap config (read by the detached watcher). `enabled`
+        # is False when --no-livelock-reap was passed or either threshold was
+        # set to 0.  Additive — never present on sessions started before this
+        # landed; the watcher falls back to the built-in defaults (guard ON).
+        "livelock_reap": {
+            "enabled": (not getattr(args, "no_livelock_reap", False)
+                        and getattr(args, "livelock_reap_sc",
+                                    LIVELOCK_REAP_SC_DEFAULT) > 0
+                        and getattr(args, "livelock_reap_secs",
+                                    LIVELOCK_REAP_SECS_DEFAULT) > 0),
+            "reap_sc":   getattr(args, "livelock_reap_sc",
+                                 LIVELOCK_REAP_SC_DEFAULT),
+            "reap_secs": getattr(args, "livelock_reap_secs",
+                                 LIVELOCK_REAP_SECS_DEFAULT),
+        },
         # True when data.img was absent at session start (after any auto-symlink
         # attempt). Agents inspecting this field can immediately distinguish a
         # firefox-test wedge caused by missing /disk from a real regression.
@@ -3727,8 +4060,13 @@ def cmd_list(args):
                 sess = json.load(f)
             pid = sess.get("pid", 0)
             alive = _pid_alive(pid) if pid else False
-            if not alive:
-                # Prune dead session
+            stored_terminal = sess.get("terminal_cause")
+            if not alive and not stored_terminal:
+                # Prune dead session.  EXCEPTION: a session the watcher reaped
+                # for livelock carries a stored `terminal_cause` — keep it
+                # listed (with running=False) so the dashboard/agent sees the
+                # `livelock-autoreap` verdict.  An explicit `stop <sid>` removes
+                # the file when the operator is done with it.
                 p.unlink(missing_ok=True)
                 continue
             sessions.append({
@@ -3737,6 +4075,11 @@ def cmd_list(args):
                 "started_at": sess.get("started_at"),
                 "features":   sess.get("features"),
                 "running":    alive,
+                # Additive: authoritative terminal cause (livelock-autoreap when
+                # the watcher reaped a spinning boot) + the live early-warning
+                # flag for boots heading toward a reap.
+                "terminal_cause":     stored_terminal,
+                "livelock_suspected": bool(sess.get("livelock_suspected", False)),
             })
         except (json.JSONDecodeError, KeyError):
             pass
@@ -4166,6 +4509,11 @@ def cmd_status(args):
 
     exit_cause = _classify_exit_cause(sess["serial_log"], alive)
 
+    # Livelock auto-reap: a stored `terminal_cause` (set by the watcher when it
+    # reaped this session) is authoritative over the live-classified exit_cause.
+    stored_terminal = sess.get("terminal_cause")
+    terminal_cause = stored_terminal or (None if alive else exit_cause)
+
     _out({
         "running":         alive,
         "sid":             sid,
@@ -4174,6 +4522,16 @@ def cmd_status(args):
         "uptime_s":        round(uptime, 1),
         "features":        sess.get("features"),
         "exit_cause":      exit_cause,
+        # Authoritative terminal cause: `livelock-autoreap` when the watcher
+        # reaped a spinning boot, else the classified exit cause once dead,
+        # else None while still running.  Additive — never renames exit_cause.
+        "terminal_cause":  terminal_cause,
+        # Live early-warning flag: True when the boot is churning pid=1
+        # syscalls past the reap threshold with the deepest gate frozen, but
+        # the wall-clock window has not yet elapsed (a reap is "coming").
+        "livelock_suspected": bool(sess.get("livelock_suspected", False)),
+        "livelock_info":      sess.get("livelock_info"),
+        "livelock_reap_result": sess.get("livelock_reap_result"),
         # D10: Firefox variant pin.  Additive — never present on sessions
         # started before this field landed.  `kernel_chosen`/`match` are
         # filled in by the post-boot verifier once the [FFTEST] probe line
@@ -11240,6 +11598,31 @@ def main():
                                "Suppress the auto-restage with "
                                "--no-regen-data-img — the mismatch is still "
                                "warned about on stderr.")
+    # Livelock auto-reap (default ON).  A spinning FF render boot (pid 1
+    # busy-looping while the deepest gate is frozen) drives the pid=1 syscall
+    # counter into the hundreds-of-millions/billions at ~100% host CPU with no
+    # forward progress; the watcher auto-stops it so it stops pinning a core
+    # and skewing concurrent timing boots.
+    p_start.add_argument("--livelock-reap-sc", dest="livelock_reap_sc",
+                          type=int, default=LIVELOCK_REAP_SC_DEFAULT,
+                          metavar="N",
+                          help="Auto-reap a boot once its pid=1 syscall count "
+                               f"churns by > N (default {LIVELOCK_REAP_SC_DEFAULT:_}) "
+                               "WHILE the deepest FF gate stays frozen for longer "
+                               "than --livelock-reap-secs. Set to 0 to disable.")
+    p_start.add_argument("--livelock-reap-secs", dest="livelock_reap_secs",
+                          type=float, default=LIVELOCK_REAP_SECS_DEFAULT,
+                          metavar="SECS",
+                          help="Wall-clock window (default "
+                               f"{int(LIVELOCK_REAP_SECS_DEFAULT)}s) of zero "
+                               "deepest-gate progress that — combined with "
+                               "--livelock-reap-sc syscall churn — declares a "
+                               "livelock. Set to 0 to disable.")
+    p_start.add_argument("--no-livelock-reap", dest="no_livelock_reap",
+                          action="store_true",
+                          help="Disable the livelock auto-reap guard for this "
+                               "session entirely. Use for a debugging/autopsy "
+                               "hold you WANT to keep spinning for inspection.")
 
     # stop
     p_stop = sub.add_parser("stop", help="Kill a QEMU session")

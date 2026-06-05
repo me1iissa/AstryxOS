@@ -691,12 +691,19 @@ def list_sessions():
         feats, running, pid = "", None, None
         started_at, started_src = _launch_info(sid, log, st)
         meta = os.path.join(HARNESS_DIR, sid + ".json")
+        # Additive livelock-autoreap surfacing: the watcher stamps these onto
+        # the session JSON so the dashboard can badge a spinning boot before it
+        # is reaped (livelock_suspected) and show the verdict after (terminal).
+        livelock_suspected = False
+        terminal_cause = None
         if os.path.exists(meta):
             try:
                 m = json.load(open(meta))
                 feats = m.get("features", "") or ""
                 running = m.get("running")
                 pid = m.get("pid")
+                livelock_suspected = bool(m.get("livelock_suspected", False))
+                terminal_cause = m.get("terminal_cause")
             except Exception:
                 pass
         elapsed = (now - started_at) if started_at else None
@@ -704,6 +711,8 @@ def list_sessions():
              "age": age, "active": age < 20, "running": running, "pid": pid,
              "started_at": started_at, "started_src": started_src,
              "elapsed": int(elapsed) if elapsed is not None else None,
+             "livelock_suspected": livelock_suspected,
+             "terminal_cause": terminal_cause,
              "mtime": st.st_mtime}
         if age < GATE_SCAN_MAX_AGE:
             p = scan_progress(log)   # SAME source as the milestone rail
