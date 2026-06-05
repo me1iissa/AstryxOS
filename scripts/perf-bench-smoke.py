@@ -250,6 +250,108 @@ def main():
         check("export-json schema_v==1", out.get("schema_v") == 1)
         check("export-json timeseries_count==1", out.get("timeseries_count") == 1)
 
+        # ── ingest-marks: serial-monitor gate marks -> a time-series record ───
+        # A second session WITH a marks sidecar (the live path). The watcher would
+        # write these; here we write them via the shared helper. Phase_ms for the
+        # gate-closed phases must equal the per-gate host deltas (independently
+        # hand-computed), on the HOST axis (exact), and the point must land in the
+        # store so perf-web /api/series surfaces it. NOTE: placed AFTER the
+        # list/export-json count checks so it does not perturb their n==1 baseline.
+        import gate_marks as gmk  # noqa: PLC0415
+        msid = "marksess00000001"
+        mlog = harness_dir / (msid + ".serial.log")
+        # full forward-ordered ladder so scan_progress reaches firefox exec
+        mlog.write_text(
+            "[BOOT] AstryxOS kernel kernel_main Booting\n"
+            "[HEAP GUARD] Guard pages installed\n"
+            "[ACPI] Phase 5b APIC init\n"
+            "[SMP] scheduler online AP online Phase 6\n"
+            "[DRIVERS] virtio Phase 7\n"
+            "[VFS] ext2 mounted rootfs\n"
+            "[INIT] PID 1 spawn\n"
+            "[FFTEST] X11 server ready\n"
+            "[EXEC] firefox-bin\n")
+        mstart = 7000.0
+        (harness_dir / (msid + ".json")).write_text(json.dumps({
+            "sid": msid, "started_at": mstart, "features": "firefox-test,kdb",
+            "kvm_effective": True, "smp": 2, "running": False}))
+        (harness_dir / (msid + ".events.jsonl")).write_text(json.dumps({
+            "kind": "cpu_model", "kvm_effective": True, "ts": mstart}) + "\n")
+        # exact host stamps: APIC@+2, drivers@+5, VFS@+9, X11@+23, firefox@+24
+        mstamps = [("kernel entry", 7000.2), ("heap guard", 7000.4),
+                   ("APIC init", 7002.0), ("SMP / scheduler", 7003.0),
+                   ("drivers", 7005.0), ("VFS / mount", 7009.0),
+                   ("init / userspace", 7010.0), ("X11 ready", 7023.0),
+                   ("firefox exec", 7024.0)]
+        for lab, ts in mstamps:
+            gmk.append_gate_mark(msid, str(harness_dir), lab, ts, None, 1)
+        rc, out, raw = run(["ingest-marks", msid, "--full"], env=env)
+        check("ingest-marks rc==0", rc == 0, raw[-300:] if rc else "")
+        check("ingest-marks ok", out.get("ok") is True, str(out.get("ok")))
+        check("ingest-marks not approx (exact stamps)",
+              out.get("marks_approx") is False, str(out.get("marks_approx")))
+        gpm = out.get("gate_phase_ms") or {}
+        # KERNEL-EARLY = APIC(+2.0) - heap-guard(+0.4) = 1.6s = 1600 ms
+        check("ingest KERNEL-EARLY == 1600ms (7002.0-7000.4)",
+              gpm.get("KERNEL-EARLY") == 1600, str(gpm.get("KERNEL-EARLY")))
+        # DRIVERS = drivers(+5) - SMP(+3) = 2.0s = 2000ms
+        check("ingest DRIVERS == 2000ms", gpm.get("DRIVERS") == 2000,
+              str(gpm.get("DRIVERS")))
+        # VFS-MOUNT = VFS(+9) - drivers(+5) = 4.0s = 4000ms
+        check("ingest VFS-MOUNT == 4000ms", gpm.get("VFS-MOUNT") == 4000,
+              str(gpm.get("VFS-MOUNT")))
+        # INIT = X11(+23) - init/userspace(+10) = 13.0s = 13000ms
+        check("ingest INIT == 13000ms (X11 - init/userspace)",
+              gpm.get("INIT") == 13000, str(gpm.get("INIT")))
+        # FF-STARTUP = firefox(+24) - X11(+23) = 1.0s = 1000ms
+        check("ingest FF-STARTUP == 1000ms", gpm.get("FF-STARTUP") == 1000,
+              str(gpm.get("FF-STARTUP")))
+        rec = out.get("record") or {}
+        check("ingest record source == ingest-marks",
+              rec.get("source") == "ingest-marks", str(rec.get("source")))
+        check("ingest record phase_ms on host axis for INIT",
+              (rec.get("phase_axis") or {}).get("INIT") == "host",
+              str((rec.get("phase_axis") or {}).get("INIT")))
+        check("ingest record kvm recovered True", rec.get("kvm") is True)
+        check("ingest record total_ms == 24000 (last gate elapsed)",
+              rec.get("total_ms") == 24000, str(rec.get("total_ms")))
+
+        # ── ingest-marks APPROX path: no sidecar, tick-derived ────────────────
+        # An independent hand-computed tick case: ticks 100/300/400 -> the same
+        # derivation serial-web uses (10ms/tick). Marks sidecar ABSENT.
+        tsid = "marktick00000001"
+        tlog = harness_dir / (tsid + ".serial.log")
+        tlog.write_text(
+            "[HB] tick=0 cpu=0 pf=0 sc=0\n"
+            "[BOOT] AstryxOS kernel kernel_main Booting\n"
+            "[HEAP GUARD] Guard pages installed\n"
+            "[HB] tick=100 cpu=0 pf=1 sc=1\n"
+            "[ACPI] Phase 5b APIC init\n"
+            "[SMP] scheduler online AP online Phase 6\n"
+            "[HB] tick=300 cpu=0 pf=1 sc=1\n"
+            "[DRIVERS] virtio Phase 7\n"
+            "[HB] tick=400 cpu=0 pf=1 sc=1\n"
+            "[VFS] ext2 mounted rootfs\n")
+        (harness_dir / (tsid + ".json")).write_text(json.dumps({
+            "sid": tsid, "started_at": 6000.0, "features": "kdb"}))
+        rc, out, raw = run(["ingest-marks", tsid], env=env)
+        check("ingest-marks (tick) rc==0", rc == 0, raw[-200:] if rc else "")
+        check("ingest-marks (tick) is approx", out.get("marks_approx") is True,
+              str(out.get("marks_approx")))
+        tgpm = out.get("gate_phase_ms") or {}
+        # DRIVERS = tick300(+3.0s) - tick100(APIC,+1.0s) = 2.0s = 2000ms;
+        # VFS-MOUNT = tick400(+4.0s) - tick300(+3.0s) = 1.0s = 1000ms.
+        check("ingest (tick) DRIVERS == 2000ms", tgpm.get("DRIVERS") == 2000,
+              str(tgpm.get("DRIVERS")))
+        check("ingest (tick) VFS-MOUNT == 1000ms", tgpm.get("VFS-MOUNT") == 1000,
+              str(tgpm.get("VFS-MOUNT")))
+
+        # ── the ingested points land in the store (perf-web reads this file) ──
+        rc, out, raw = run(["list", "--source", "ingest-marks", "--limit", "5"],
+                           env=env)
+        check("list source=ingest-marks finds the points",
+              out.get("n") == 2, str(out.get("n")))
+
         # ── run build-only gate (no build, no boot) ──────────────────────────
         rc, out, raw = run(["run", "--no-build", "--build-only", "--dry-run"],
                            env=env)

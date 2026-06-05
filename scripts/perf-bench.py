@@ -92,6 +92,7 @@ import subprocess
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import perf_markers as pm   # noqa: E402
+import gate_marks as gmk    # noqa: E402  (gate<->phase mapping + marks sidecar)
 
 SCHEMA_V = 1
 HARNESS_DIR = os.path.expanduser(os.environ.get("ASTRYX_HARNESS_DIR",
@@ -272,6 +273,188 @@ def _deepest_phase(durations):
         if d["from_line"] is not None or d["to_line"] is not None:
             deepest = name
     return deepest
+
+
+# ── gate-marks -> phase_ms (the serial-monitor <-> perf-dashboard bridge) ─────
+def _scan_progress_timeline(log_path):
+    """Forward-ordered milestone timeline (label/hit/line/tick) for a log, using
+    serial-web.py's scan_progress when available (single source of truth), else a
+    minimal re-scan with the shared MILESTONES ladder. Returns (timeline, first_tick)."""
+    sw = pm._sw  # the serial-web module perf_markers already imported (or None)
+    if sw is not None and hasattr(sw, "scan_progress"):
+        prog = sw.scan_progress(log_path)
+        return prog.get("timeline", []), (prog.get("first_tick") or 0)
+    # Fallback: vendored re-scan (mirrors scan_progress' first-hit + dtick logic).
+    found, idx, cur_tick, first_tick, n = {}, 0, None, None, 0
+    try:
+        with open(log_path, "r", errors="replace") as f:
+            for line in f:
+                n += 1
+                tk = pm._TICK_KERNEL.search(line)
+                if tk:
+                    cur_tick = int(tk.group(1))
+                    if first_tick is None:
+                        first_tick = cur_tick
+                while idx < len(gmk.MILESTONES) and gmk.match(line, gmk.MILESTONES[idx][1]):
+                    found[gmk.MILESTONES[idx][0]] = (n, cur_tick)
+                    idx += 1
+    except OSError:
+        pass
+    timeline = []
+    prev = None
+    for lab, _m in gmk.MILESTONES:
+        h = found.get(lab)
+        dtick = (h[1] - prev) if (h and h[1] is not None and prev is not None) else None
+        if h and h[1] is not None:
+            prev = h[1]
+        timeline.append({"label": lab, "hit": h is not None,
+                         "line": h[0] if h else None,
+                         "tick": h[1] if h else None, "dtick": dtick})
+    return timeline, (first_tick or 0)
+
+
+def _marks_to_phase_ms(sid, log_path, started_at):
+    """Turn a session's gate marks (or tick-derived timeline) into a perf-style
+    {phase_name: ms} dict via the shared GATE_TO_PHASE mapping.
+
+    Each gate that ENDS a perf phase (GATE_TO_PHASE[label] is not None) contributes
+    its per-gate host_delta (seconds-since-previous-gate) as that phase's ms. The
+    delta is the SAME 'compare performance' signal the serial monitor shows, so the
+    two dashboards agree by construction.
+
+    Returns (phase_ms, phase_axis, phase_lines, reached_marker, approx_any,
+             total_marks_ms, n_marks). `approx_any` is True when ANY contributing
+    gate was tick-derived (no exact watcher mark)."""
+    timeline, first_tick = _scan_progress_timeline(log_path)
+    marks = gmk.read_gate_marks(sid, HARNESS_DIR)
+    timed = gmk.gate_timeline(timeline, marks, started_at, first_tick=first_tick)
+
+    phase_ms = {}
+    phase_axis = {}
+    phase_lines = {}
+    approx_any = False
+    deepest_label = None
+    n_marks = 0
+    last_elapsed = None
+    for step in timed:
+        lab = step.get("label")
+        if not step.get("hit"):
+            continue
+        deepest_label = lab
+        if step.get("host_elapsed") is not None:
+            last_elapsed = step["host_elapsed"]
+            n_marks += 1
+        phase = gmk.GATE_TO_PHASE.get(lab)
+        if phase is None:
+            continue
+        d = step.get("host_delta")
+        if d is not None:
+            phase_ms[phase] = round(d * 1000.0)         # seconds -> ms
+            phase_axis[phase] = "host" if not step.get("approx") else "tick"
+            phase_lines[phase] = {"to": step.get("line")}
+            if step.get("approx"):
+                approx_any = True
+    total_marks_ms = round(last_elapsed * 1000.0) if last_elapsed is not None else None
+    return (phase_ms, phase_axis, phase_lines, deepest_label, approx_any,
+            total_marks_ms, n_marks)
+
+
+# ── subcommand: ingest-marks ─────────────────────────────────────────────────
+def cmd_ingest_marks(args):
+    """Turn a single session's gate marks into a time-series record so a boot
+    watched in the SERIAL MONITOR (:8088) shows up on the PERF dashboard (:8099).
+
+    Builds the base record exactly like `import-logs` (same revision attribution,
+    host/kvm/features/png detection, schema), then OVERLAYS the gate-marks-derived
+    phase_ms onto it. Additive: every existing field is preserved; new keys are
+    `phase_ms_source`, `marks_approx`, `total_marks_ms`, `n_gate_marks`.
+    """
+    sid = args.sid
+    log_path = os.path.join(HARNESS_DIR, sid + ".serial.log")
+    if not os.path.exists(log_path):
+        print(json.dumps({"ok": False, "error": "no_serial_log",
+                          "sid": sid, "path": log_path}))
+        return 1
+
+    host = socket.gethostname()
+    # revision attribution + launch anchor + session meta — same as import-logs
+    commit_timeline = _build_commit_timeline()
+    try:
+        mtime = os.path.getmtime(log_path)
+    except OSError:
+        mtime = time.time()
+    rev, subj = _attribute_revision(mtime, commit_timeline)
+    started_at, launch_src = pm.launch_anchor(sid, log_path, HARNESS_DIR)
+    features_auth, kvm, smp = _session_meta(sid)
+
+    # base record (tick-axis phase_ms, png, max_sc, etc. — the import path)
+    rec = _record_from_log(
+        log_path, sid, rev, subj, host, source="ingest-marks",
+        started_at=started_at, features_auth=features_auth, kvm=kvm, smp=smp)
+    rec["rev_attribution"] = "mtime-bisect" if rev != "unknown" else "none"
+    rec["launch_src"] = launch_src
+
+    # overlay the gate-marks-derived phase durations (host axis when exact)
+    (gphase_ms, gphase_axis, gphase_lines, deepest_label, approx_any,
+     total_marks_ms, n_marks) = _marks_to_phase_ms(sid, log_path, started_at)
+
+    if n_marks == 0:
+        print(json.dumps({
+            "ok": False, "error": "no_gate_marks_or_ticks", "sid": sid,
+            "note": ("No <sid>.marks.jsonl sidecar AND no recoverable kernel "
+                     "ticks at gate lines — nothing to ingest. A LIVE session "
+                     "watched through the harness gets a marks sidecar "
+                     "automatically; a historical log needs [HB]/PROC-METRICS "
+                     "tick lines for the approximate derivation."),
+        }, indent=2))
+        return 1
+
+    # merge: gate-marks phase_ms takes precedence for the phases it covers; the
+    # tick-axis values from _record_from_log fill the rest. Additive-only.
+    merged_phase_ms = dict(rec.get("phase_ms") or {})
+    merged_phase_axis = dict(rec.get("phase_axis") or {})
+    merged_phase_lines = dict(rec.get("phase_lines") or {})
+    merged_phase_ms.update(gphase_ms)
+    merged_phase_axis.update(gphase_axis)
+    for k, v in gphase_lines.items():
+        cur = dict(merged_phase_lines.get(k) or {})
+        cur.update(v)
+        merged_phase_lines[k] = cur
+    rec["phase_ms"] = merged_phase_ms
+    rec["phase_axis"] = merged_phase_axis
+    rec["phase_lines"] = merged_phase_lines
+
+    # additive provenance keys (downstream tolerates extra keys)
+    rec["phase_ms_source"] = "gate-marks"
+    rec["marks_approx"] = approx_any
+    rec["total_marks_ms"] = total_marks_ms
+    rec["n_gate_marks"] = n_marks
+    rec["deepest_gate"] = deepest_label
+    rec["gate_phase_ms"] = gphase_ms   # the gate-only slice, for transparency
+    # total_ms: prefer the marks-derived end-to-last-gate when it's exact and the
+    # import path left total_ms null (historical anchor lost). Keep additive.
+    if rec.get("total_ms") is None and not approx_any and total_marks_ms is not None:
+        rec["total_ms"] = total_marks_ms
+
+    if not args.dry_run:
+        _append_timeseries(rec)
+
+    print(json.dumps({
+        "ok": True,
+        "sid": sid,
+        "revision": rev,
+        "host": host,
+        "kvm": kvm,
+        "deepest_gate": deepest_label,
+        "n_gate_marks": n_marks,
+        "marks_approx": approx_any,
+        "gate_phase_ms": gphase_ms,
+        "total_marks_ms": total_marks_ms,
+        "reached_png": rec.get("reached_png"),
+        "wrote_to": None if args.dry_run else TIMESERIES,
+        "record": rec if args.full else None,
+    }, indent=2))
+    return 0
 
 
 # ── subcommand: import-logs ──────────────────────────────────────────────────
@@ -697,6 +880,17 @@ def main():
     r.add_argument("--dry-run", action="store_true",
                    help="do not write to the store")
     r.set_defaults(func=cmd_run)
+
+    im = sub.add_parser("ingest-marks",
+                        help="turn ONE session's gate marks into a time-series "
+                             "record (serial-monitor -> perf-dashboard bridge)")
+    im.add_argument("sid", help="harness session id (reads "
+                                "~/.astryx-harness/<sid>.serial.log + .marks.jsonl)")
+    im.add_argument("--dry-run", action="store_true",
+                    help="compute + print but do not write the store")
+    im.add_argument("--full", action="store_true",
+                    help="include the full record object in the output")
+    im.set_defaults(func=cmd_ingest_marks)
 
     il = sub.add_parser("import-logs",
                         help="parse existing serial logs into time-series records")
