@@ -1091,6 +1091,155 @@ def run_blk_trace_argv_check():
     print()
 
 
+def run_pcap_argv_check():
+    """
+    Tier 1.5 host-only check: `start --pcap` filter-dump composition +
+    serial-web /api/pcap + /api/wire endpoints.
+
+    No QEMU launched (< 2s).  Locks down the host-side packet-capture surface
+    so a future refactor cannot silently regress it:
+
+      * `start --pcap` is advertised and parses to pcap=True
+      * the filter-dump `-object` references the e1000/SLIRP netdev id (net0)
+        and a per-session pcap file, and is emitted AFTER `-netdev` so QEMU's
+        object resolver finds the netdev (QEMU networking docs)
+      * the in-place kdb-hostfwd patch (which mutates the `-netdev` arg, not
+        its id) leaves the filter-dump binding intact
+      * serial-web serves the raw .pcap (application/vnd.tcpdump.pcap,
+        attachment) byte-identically, and /api/wire returns a stable envelope
+        (decode_available bool + pcap_url) whether or not the wire decoder
+        scripts/pcap_decode.py is present on the checkout
+    """
+    print("=== Tier 1.5: --pcap filter-dump + serial-web wire (host-only) ===")
+    print()
+
+    import importlib.util, tempfile, os as _os, struct, urllib.request, json as _json
+    import http.server, socketserver, threading
+
+    # ── start --pcap advertised + parses ──────────────────────────────────────
+    _, raw, _ = _h("start", "--help")
+    check("start --pcap advertised in --help",
+          "--pcap" in raw, "flag missing from start --help")
+
+    # ── filter-dump arg composes correctly through build_qemu_cmd ──────────────
+    aq_path = Path(__file__).resolve().parent / "astryx_qemu.py"
+    spec = importlib.util.spec_from_file_location("astryx_qemu_pcap_smoke", aq_path)
+    aq = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(aq)
+
+    _di = tempfile.NamedTemporaryFile(suffix=".img", delete=False)
+    _di.write(b"\0" * 4096); _di.close()
+    data_img = _di.name
+    sid = "smoke0000pcap"
+    pcap_path = f"/x/harness/{sid}.pcap"
+    # This is the exact extra_args cmd_start injects for --pcap.
+    extra = ["-object", f"filter-dump,id=netdump,netdev=net0,file={pcap_path}"]
+    cmd = aq.build_qemu_cmd("", data_img, "/x/s.log", mode="test",
+                            ovmf_code="/x/code.fd", ovmf_vars="/x/vars",
+                            esp_dir="/x/esp", qmp_sock="/x/q.sock", kvm=False,
+                            extra_args=extra)
+    try:
+        netdev_i = next(i for i, a in enumerate(cmd) if a == "-netdev")
+        obj_i = next(i for i, a in enumerate(cmd) if a == "-object")
+        check("filter-dump -object present", True, "")
+        check("filter-dump references netdev=net0",
+              "netdev=net0" in cmd[obj_i + 1], cmd[obj_i + 1])
+        check("filter-dump writes per-session pcap file",
+              f"file={pcap_path}" in cmd[obj_i + 1], cmd[obj_i + 1])
+        check("netdev emitted before filter-dump object",
+              netdev_i < obj_i, f"netdev@{netdev_i} object@{obj_i}")
+        # Replicate the kdb-hostfwd in-place patch from _launch_qemu_harness.
+        for i, a in enumerate(cmd):
+            if a == "-netdev" and cmd[i + 1].startswith("user,id=net0"):
+                cmd[i + 1] = cmd[i + 1] + ",hostfwd=tcp:127.0.0.1:9991-:9999"
+                break
+        obj_i2 = next(i for i, a in enumerate(cmd) if a == "-object")
+        check("filter-dump binding survives kdb-hostfwd patch",
+              "netdev=net0" in cmd[obj_i2 + 1], cmd[obj_i2 + 1])
+    except StopIteration:
+        check("filter-dump -object present", False,
+              "no -object in composed cmdline")
+
+    try:
+        _os.unlink(data_img)
+    except OSError:
+        pass
+
+    # ── serial-web /api/pcap + /api/wire against a fixture ─────────────────────
+    # Build a tiny valid libpcap fixture (global header + 1 ethernet frame) in a
+    # throwaway HARNESS_DIR, then serve it through serial-web's handler.
+    tmpdir = tempfile.mkdtemp(prefix="pcap-smoke-")
+    fsid = "fixt0000pcap"
+    fpcap = _os.path.join(tmpdir, fsid + ".pcap")
+    with open(fpcap, "wb") as f:
+        # classic pcap global header, LINKTYPE_ETHERNET (1), snaplen 65535
+        f.write(struct.pack("<IHHiIII", 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1))
+        frame = bytes(14) + b"\x45" + bytes(19)   # 34-byte stub ethernet+ipv4
+        f.write(struct.pack("<IIII", 1780000000, 0, len(frame), len(frame)))
+        f.write(frame)
+    with open(_os.path.join(tmpdir, fsid + ".serial.log"), "w") as f:
+        f.write("[boot] pcap smoke fixture\n")
+    with open(_os.path.join(tmpdir, fsid + ".json"), "w") as f:
+        _json.dump({"sid": fsid, "pid": 0, "pcap_path": fpcap,
+                    "serial_log": _os.path.join(tmpdir, fsid + ".serial.log")}, f)
+
+    sw_path = Path(__file__).resolve().parent / "serial-web.py"
+    spec2 = importlib.util.spec_from_file_location("serial_web_pcap_smoke", sw_path)
+    sw = importlib.util.module_from_spec(spec2)
+    spec2.loader.exec_module(sw)
+    sw.HARNESS_DIR = tmpdir   # point the handler at the throwaway dir
+
+    srv = socketserver.TCPServer(("127.0.0.1", 0), sw.H)
+    srv.allow_reuse_address = True
+    port = srv.server_address[1]
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        base = f"http://127.0.0.1:{port}"
+        with urllib.request.urlopen(f"{base}/api/pcap?sid={fsid}") as r:
+            ct = r.headers.get("Content-Type")
+            cd = r.headers.get("Content-Disposition")
+            body = r.read()
+        with open(fpcap, "rb") as f:
+            orig = f.read()
+        check("/api/pcap Content-Type is libpcap",
+              ct == "application/vnd.tcpdump.pcap", str(ct))
+        check("/api/pcap is an attachment download",
+              cd and "attachment" in cd and f"{fsid}.pcap" in cd, str(cd))
+        check("/api/pcap bytes match capture file",
+              body == orig, f"{len(body)} vs {len(orig)} bytes")
+
+        wreq = urllib.request.urlopen(f"{base}/api/wire?sid={fsid}")
+        wj = _json.loads(wreq.read())
+        # /api/wire is correct in BOTH worlds: with scripts/pcap_decode.py on
+        # the checkout it returns a decoded summary (decode_available:true);
+        # without it, it degrades to decode_available:false. Either way the
+        # envelope must carry pcap_url so the UI can still offer the raw
+        # download. (The decoder's own parsing is gated by its --selftest and
+        # by serial-web-smoke.py's decoded-fixture checks.)
+        check("/api/wire envelope carries decode_available + pcap_url",
+              isinstance(wj.get("decode_available"), bool)
+              and wj.get("pcap_url") == f"/api/pcap?sid={fsid}",
+              _json.dumps(wj)[:140])
+
+        # missing-capture session -> structured 404, never a 500
+        try:
+            urllib.request.urlopen(f"{base}/api/pcap?sid=nopcap00000a")
+            code = 200
+        except urllib.error.HTTPError as e:
+            code = e.code
+            err = _json.loads(e.read())
+        check("/api/pcap missing capture -> 404 JSON",
+              code == 404 and err.get("error") == "no_pcap", f"code={code}")
+    except Exception as e:
+        check("serial-web pcap/wire endpoints serve", False, repr(e))
+    finally:
+        srv.shutdown(); srv.server_close()
+        import shutil as _sh
+        _sh.rmtree(tmpdir, ignore_errors=True)
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="AstryxOS qemu-harness smoke test")
@@ -1125,6 +1274,7 @@ def main():
     run_kdb_read_png_check()
     run_blk_trace_argv_check()
     run_livelock_reap_check()
+    run_pcap_argv_check()
 
     if args.staleness_only:
         # Early exit for CI cycles that just want the cheap host-only checks.

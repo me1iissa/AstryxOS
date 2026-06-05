@@ -91,8 +91,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-      - name: serial-web smoke (serial monitor + per-gate timing)
+      - name: serial-web smoke (serial monitor + per-gate timing + wire panel)
         run: python3 scripts/serial-web-smoke.py
+      - name: pcap-decode selftest (wire summary parser)
+        # Crafts + decodes a synthetic libpcap (DNS query + TLS ClientHello/SNI)
+        # entirely in-process and asserts the structured wire facts come out.
+        # Failure mode this prevents: a regression in the libpcap/Ethernet/IP/
+        # TCP/DNS/TLS parsing that the /api/wire endpoint relies on, silently
+        # corrupting the decoded "what's on the wire" view with no kernel boot.
+        run: python3 scripts/pcap_decode.py --selftest
       - name: perf-bench smoke (taxonomy + ingest-marks bridge)
         run: python3 scripts/perf-bench-smoke.py
       - name: perf baseline-linux smoke (record shape)
