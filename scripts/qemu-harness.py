@@ -5640,9 +5640,24 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
               "futex-stats",
               # blk-trace: out-of-band drain of the virtio-blk LBA ring.
               "blk-trace", "blk-trace-flush",
+              # log-ring: out-of-band drain / burst-flush of the cheap log ring.
+              "log-ring", "log-ring-flush",
               # INFRA-3 record/replay: zero-arg introspection.
               "record-status"):
         return {"op": op}
+    if op == "log-ring-enable":
+        # Toggle the fast-path ring sink (A/B control). Optional on/off; absent
+        # → query-only. Carried as {"on": "on"|"off"} to match the kernel op's
+        # extract_field("on") parse (mirrors futex-set-cluster-wake).
+        if not rest:
+            return {"op": "log-ring-enable"}
+        val = rest[0].strip().lower()
+        if val not in ("on", "off", "true", "false", "1", "0"):
+            raise ValueError(
+                f"log-ring-enable: unrecognised value '{rest[0]}' "
+                "(expected on|off)"
+            )
+        return {"op": "log-ring-enable", "on": val}
     if op == "replay-dump":
         # INFRA-3: dump the in-RAM record log to a VFS file.  Single
         # required positional `path=<abs>` arg (or just `<abs>`).
@@ -5960,6 +5975,88 @@ def cmd_blk_trace(args):
     # Reuse the kdb one-shot path verbatim (port resolution, recv, JSON, cache).
     args.op = op
     args.args = []
+    cmd_kdb(args)
+
+
+def cmd_log_ring(args):
+    """Drain / flush / toggle the near-zero-overhead guest-RAM log ring.
+
+    The cheap high-volume log transport (drivers::log_ring) collects the
+    firehose trace families (serial_fast_println!, e.g. `[SC]`) into a lock-free
+    ring in guest RAM with ZERO VM-exits, replacing the per-byte COM1 16550 PIO
+    path. This wrapper drains it out of band.
+
+    Forms:
+      log-ring drain <sid> [--out-file PATH]
+          -> kdb `log-ring` op: live ring as JSON
+             {feature, cap, total_bytes, resident_bytes, dropped_bytes,
+              records, oversize_drops, text, emitted_records}.
+             `text` is the recovered, newline-delimited log content. With
+             --out-file the decoded bytes are also written there (so the same
+             firehose lands in a file a human/agent/serial-web.py can read).
+      log-ring flush <sid>
+          -> kdb `log-ring-flush` op: re-emit buffered lines to COM1 in one
+             burst (serial-log consumers see the firehose), returns {emitted}.
+      log-ring enable <sid> [on|off]
+          -> kdb `log-ring-enable` op: set the fast-path ring sink on/off (the
+             A/B control — `off` forces the slow per-byte COM1 path). Omit the
+             state to query. Returns {prev, enabled}.
+
+    Thin wrapper over `cmd_kdb`. Requires the session to have been started with
+    `--features ...,kdb`.
+    """
+    sub = getattr(args, "log_action", None)
+    op = {"drain": "log-ring",
+          "flush": "log-ring-flush",
+          "enable": "log-ring-enable"}.get(sub)
+    if op is None:
+        _out({"error": f"log-ring: unknown action {sub!r} "
+                       "(expected 'drain', 'flush', or 'enable')"})
+        sys.exit(1)
+
+    # `enable` carries an optional on/off positional we forward to the kernel op.
+    extra_args = []
+    if sub == "enable":
+        st = getattr(args, "state", None)
+        if st:
+            extra_args = [st]
+
+    # For drain with --out-file we need the parsed JSON back, so call the kdb
+    # one-shot path directly instead of cmd_kdb (which prints and exits).
+    out_file = getattr(args, "out_file", None)
+    if sub == "drain" and out_file:
+        sess = _load_session(args.sid)
+        port = int(sess.get("kdb_host_port") or 0)
+        if port <= 0:
+            _out({"error": "session was not started with --features kdb"})
+            sys.exit(1)
+        timeout = float(getattr(args, "timeout", 30.0) or 30.0)
+        try:
+            raw = _kdb_recv(port, {"op": op}, timeout=timeout)
+            resp = json.loads(raw.strip().decode("utf-8", errors="replace"))
+        except (socket.timeout, ConnectionRefusedError, OSError) as e:
+            _out({"error": f"kdb connect/io failed on 127.0.0.1:{port}: {e}"})
+            sys.exit(1)
+        except (json.JSONDecodeError, ValueError) as e:
+            _out({"error": f"malformed response: {e}"})
+            sys.exit(1)
+        text = resp.get("text", "")
+        try:
+            with open(out_file, "w", errors="replace") as fh:
+                fh.write(text)
+            resp["out_file"] = out_file
+            resp["out_file_bytes"] = len(text)
+        except OSError as e:
+            resp["out_file_error"] = str(e)
+        # Drop the (potentially huge) text from the printed JSON; it's on disk.
+        resp_print = dict(resp)
+        resp_print["text"] = f"<{len(text)} bytes written to {out_file}>"
+        _out(resp_print)
+        return
+
+    # Reuse the kdb one-shot path verbatim (port resolution, recv, JSON, cache).
+    args.op = op
+    args.args = extra_args
     cmd_kdb(args)
 
 
@@ -11319,6 +11416,34 @@ def main():
     p_blktrace.add_argument("--timeout", type=float, default=30.0,
                              help="kdb overall deadline (default 30.0s).")
 
+    # log-ring — out-of-band drain of the near-zero-overhead guest-RAM log ring.
+    # The cheap high-volume log transport: the firehose trace families
+    # (serial_fast_println!, e.g. the `[SC]` syscall trace) write to a lock-free
+    # ring in guest RAM with ZERO VM-exits instead of the per-byte COM1 16550
+    # PIO path. `drain` serialises the ring over the kdb channel (no UART cost);
+    # `flush` re-emits the buffered lines to COM1 for serial-log consumers;
+    # `enable on|off` toggles the slow COM1 fallback for an A/B measurement.
+    # Requires --features ...,kdb at start.
+    p_logring = sub.add_parser(
+        "log-ring",
+        help="[Tier1] Drain the guest-RAM log ring (cheap high-volume log "
+             "transport). `drain` -> live ring as JSON {text, counters}; "
+             "`flush` -> re-emit buffered lines to COM1 (serial-log compat); "
+             "`enable on|off` -> toggle the slow COM1 fallback. "
+             "Requires --features ...,kdb at start.")
+    p_logring.add_argument(
+        "log_action", choices=["drain", "flush", "enable"],
+        help="drain: dump ring as JSON. flush: emit lines to COM1 on demand. "
+             "enable: set the fast-path ring sink on/off (A/B control).")
+    p_logring.add_argument("sid")
+    p_logring.add_argument("state", nargs="?", choices=["on", "off"],
+                           help="for `enable`: on|off (omit to query).")
+    p_logring.add_argument("--out-file", default=None,
+                           help="for `drain`: write the recovered log text to "
+                                "this file (raw bytes) in addition to JSON.")
+    p_logring.add_argument("--timeout", type=float, default=30.0,
+                           help="kdb overall deadline (default 30.0s).")
+
     # tlb-stats — dedicated top-level subcommand for W215 H2 TLB diagnostic
     p_tlb_stats = sub.add_parser(
         "tlb-stats",
@@ -12011,6 +12136,7 @@ def main():
         # Tier 1
         "kdb":         cmd_kdb,
         "blk-trace":   cmd_blk_trace,
+        "log-ring":    cmd_log_ring,
         "net-ipver":   cmd_net_ipver,
         "tlb-stats":   cmd_tlb_stats,
         "fd-map":      cmd_fd_map,

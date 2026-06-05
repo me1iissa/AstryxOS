@@ -507,6 +507,113 @@ pub fn _serial_print(args: fmt::Arguments) {
     // (If IF was off on entry it remains off here — correct behaviour.)
 }
 
+/// High-volume ("fast path") log entry.
+///
+/// Routes a formatted line to the near-zero-overhead guest-RAM ring
+/// ([`crate::drivers::log_ring`]) when the ring sink is enabled, instead of
+/// paying ~one VM-exit per byte on the COM1 16550 THR (Intel SDM Vol. 3C
+/// §25.1.3 — port I/O traps to the hypervisor under KVM).  The ring write is a
+/// single relaxed atomic reservation plus a bounded `memcpy`: no lock, no
+/// `outb`, no exit.  The bytes are drained out of band by the harness
+/// (`qemu-harness.py log-ring drain|flush`).
+///
+/// Falls back to the classic [`_serial_print`] COM1 path when the ring is
+/// disabled (e.g. forced off for an A/B measurement, or before the ring is the
+/// active sink).  This keeps every call site correct regardless of routing —
+/// the firehose is cheap when the ring is on and still visible when it is off.
+///
+/// Callers that MUST always reach COM1 immediately (early boot, panic,
+/// bugcheck, low-volume lifeline output) keep calling `serial_println!`
+/// directly; only the high-frequency trace families use this entry.
+#[doc(hidden)]
+pub fn log_fast(args: fmt::Arguments) {
+    use fmt::Write;
+    if !crate::drivers::log_ring::enabled() {
+        // Ring disabled: behave exactly like serial_println! so no output is
+        // ever lost.
+        _serial_print(args);
+        return;
+    }
+    // Format into a bounded stack buffer (no heap), then commit to the ring in
+    // one shot.  A line longer than the buffer is soft-truncated; the ring also
+    // caps at MAX_RECORD, so this is belt-and-braces.
+    const CAP: usize = crate::drivers::log_ring::MAX_RECORD;
+    struct RingBuf {
+        buf: [u8; CAP],
+        len: usize,
+    }
+    impl fmt::Write for RingBuf {
+        fn write_str(&mut self, s: &str) -> fmt::Result {
+            for &b in s.as_bytes() {
+                if self.len >= self.buf.len() {
+                    break;
+                }
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+            Ok(())
+        }
+    }
+    let mut rb = RingBuf { buf: [0u8; CAP], len: 0 };
+    let _ = rb.write_fmt(args);
+    crate::drivers::log_ring::record(&rb.buf[..rb.len]);
+}
+
+/// Burst a slice of already-formatted bytes to the COM1 16550 THR.
+///
+/// Used by the log-ring flush drain to re-emit buffered firehose lines to the
+/// serial log in one controlled burst (paying the per-byte UART cost once, at
+/// drain time, never in the hot path).  Takes the `SERIAL` mutex and reuses the
+/// same chunked, IRQ-windowed FIFO writer as `_serial_print`, but does NOT
+/// expand `'\n'` to `"\r\n"` — the payload already carries its own line
+/// terminator, and the ring stores raw producer bytes.
+pub fn write_bytes_com1(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let rflags: u64;
+    // SAFETY: pushfq/pop is a pure register read with no memory side effects.
+    unsafe {
+        core::arch::asm!(
+            "pushfq; pop {rflags}",
+            rflags = out(reg) rflags,
+            options(nomem, nostack),
+        );
+    }
+    let if_was_set = rflags & (1 << 9) != 0;
+
+    crate::hal::disable_interrupts();
+    let cpu = crate::arch::x86_64::apic::cpu_index();
+    if PER_CPU_IN_SERIAL[cpu].swap(true, Ordering::Acquire) {
+        // Same-CPU re-entry: avoid self-deadlock on the non-reentrant mutex.
+        // Drop the burst (the flush runs from the drain path, not an ISR, so
+        // this is not expected to fire).
+        if if_was_set {
+            crate::hal::enable_interrupts();
+        }
+        return;
+    }
+    let mut port = SERIAL.lock();
+    // Push FIFO_DEPTH-sized chunks under per-chunk cli, mirroring _serial_print
+    // but without newline expansion.
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let end = core::cmp::min(off + FIFO_DEPTH, bytes.len());
+        crate::hal::disable_interrupts();
+        port.write_chunk(&bytes[off..end]);
+        if if_was_set {
+            crate::hal::enable_interrupts();
+        }
+        off = end;
+    }
+    drop(port);
+    crate::hal::disable_interrupts();
+    PER_CPU_IN_SERIAL[cpu].store(false, Ordering::Release);
+    if if_was_set {
+        crate::hal::enable_interrupts();
+    }
+}
+
 /// Direct-to-UART fallback writer used when `_serial_print` detects
 /// same-CPU re-entry (PER_CPU_IN_SERIAL[cpu] already set).  Bypasses the
 /// SERIAL mutex; pushes bytes directly to the COM1 THR with a bounded
