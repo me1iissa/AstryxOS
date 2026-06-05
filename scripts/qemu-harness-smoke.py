@@ -1106,8 +1106,9 @@ def run_pcap_argv_check():
       * the in-place kdb-hostfwd patch (which mutates the `-netdev` arg, not
         its id) leaves the filter-dump binding intact
       * serial-web serves the raw .pcap (application/vnd.tcpdump.pcap,
-        attachment) byte-identically, and /api/wire degrades gracefully
-        (decode_available:false) when scripts/pcap_decode.py is absent
+        attachment) byte-identically, and /api/wire returns a stable envelope
+        (decode_available bool + pcap_url) whether or not the wire decoder
+        scripts/pcap_decode.py is present on the checkout
     """
     print("=== Tier 1.5: --pcap filter-dump + serial-web wire (host-only) ===")
     print()
@@ -1210,9 +1211,14 @@ def run_pcap_argv_check():
 
         wreq = urllib.request.urlopen(f"{base}/api/wire?sid={fsid}")
         wj = _json.loads(wreq.read())
-        # pcap_decode.py is component B's file (absent here) -> graceful degrade.
-        check("/api/wire degrades gracefully without decoder",
-              wj.get("decode_available") is False
+        # /api/wire is correct in BOTH worlds: with scripts/pcap_decode.py on
+        # the checkout it returns a decoded summary (decode_available:true);
+        # without it, it degrades to decode_available:false. Either way the
+        # envelope must carry pcap_url so the UI can still offer the raw
+        # download. (The decoder's own parsing is gated by its --selftest and
+        # by serial-web-smoke.py's decoded-fixture checks.)
+        check("/api/wire envelope carries decode_available + pcap_url",
+              isinstance(wj.get("decode_available"), bool)
               and wj.get("pcap_url") == f"/api/pcap?sid={fsid}",
               _json.dumps(wj)[:140])
 

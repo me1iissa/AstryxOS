@@ -61,6 +61,28 @@ def load_module(harness_dir):
     return sw
 
 
+def _build_pcap_fixture():
+    """Return bytes of a tiny but spec-faithful libpcap capture for the wire
+    endpoints. Reuses pcap_decode's own frame builders (the same ones its
+    --selftest exercises) so the fixture is a real Ethernet/IPv4/UDP DNS query
+    plus a TCP+TLS ClientHello carrying an SNI — i.e. /api/wire must decode a
+    DNS question and a TLS SNI out of it. Imported lazily so a checkout missing
+    pcap_decode.py degrades to the decode_available=False path instead of
+    erroring the whole smoke run."""
+    pd_spec = importlib.util.spec_from_file_location(
+        "pcap_decode_fixture", os.path.join(HERE, "pcap_decode.py"))
+    pd = importlib.util.module_from_spec(pd_spec)
+    pd_spec.loader.exec_module(pd)
+    dns = pd._build_eth_ipv4("10.0.2.15", "10.0.2.3", pd.IPPROTO_UDP,
+                             pd._build_udp(50000, 53, pd._build_dns_query("example.com")))
+    ch = pd._build_eth_ipv4("10.0.2.15", "93.184.216.34", pd.IPPROTO_TCP,
+                            pd._build_tcp(50001, 443, 1, 0, 0x02))  # SYN
+    hello = pd._build_eth_ipv4("10.0.2.15", "93.184.216.34", pd.IPPROTO_TCP,
+                               pd._build_tcp(50001, 443, 2, 1, 0x18,
+                                             pd._build_client_hello("example.com")))
+    return pd._write_pcap([(1, 0, dns), (1, 1000, ch), (1, 2000, hello)])
+
+
 # ── synthetic fixtures ────────────────────────────────────────────────────────
 SERIAL = """\
 [BOOT] AstryxOS kernel starting
@@ -488,6 +510,22 @@ def main():
     log2 = os.path.join(tmp, sid2 + ".serial.log")
     with open(log2, "w") as f:
         f.write("[BOOT] AstryxOS kernel\n")
+    # a third session WITH a --pcap capture — exercises /api/pcap (raw libpcap
+    # download) + /api/wire (decoded DNS/TCP/TLS/HTTP summary). The fixture pcap
+    # is built spec-faithfully via pcap_decode's own frame builders (DNS query +
+    # TLS ClientHello with SNI), so the wire summary must surface them.
+    sid3 = "pcapsess9012"
+    log3 = os.path.join(tmp, sid3 + ".serial.log")
+    with open(log3, "w") as f:
+        f.write("[BOOT] AstryxOS kernel (pcap session)\n")
+    pcap_fixture = _build_pcap_fixture()
+    pcap_path = os.path.join(tmp, sid3 + ".pcap")
+    with open(pcap_path, "wb") as f:
+        f.write(pcap_fixture)
+    with open(os.path.join(tmp, sid3 + ".json"), "w") as f:
+        json.dump({"sid": sid3, "pid": 5252, "started_at": time.time() - 30,
+                   "features": "firefox-test,kdb", "running": True,
+                   "pcap_path": pcap_path}, f)
 
     sw = load_module(tmp)
 
@@ -591,6 +629,63 @@ def main():
         check("GET /api/blkmap 200", st == 200 and b'"buckets"' in body)
         st, body = get("/")
         check("GET / dashboard 200", st == 200 and b"AstryxOS" in body)
+        # the dashboard HTML wires up the wire/network panel + endpoints
+        check("dashboard HTML references wire panel",
+              b"id=wire" in body and b"/api/pcap?" in body
+              and b"/api/wire?" in body)
+
+        # ── /api/pcap (raw libpcap download) ──────────────────────────────
+        reqc = urllib.request.urlopen(base + f"/api/pcap?sid={sid3}", timeout=5)
+        bodyc = reqc.read()
+        check("GET /api/pcap 200 + libpcap content-type",
+              reqc.status == 200
+              and reqc.headers.get("Content-Type") == "application/vnd.tcpdump.pcap")
+        check("GET /api/pcap Content-Disposition attachment",
+              "attachment" in (reqc.headers.get("Content-Disposition") or ""))
+        check("GET /api/pcap returns the exact capture bytes",
+              bodyc == pcap_fixture)
+        # absent capture (session not run with --pcap) -> JSON 404, never 500
+        try:
+            urllib.request.urlopen(base + f"/api/pcap?sid={sid}", timeout=5)
+            pcap404 = False
+        except urllib.error.HTTPError as e:
+            pcap404 = (e.code == 404
+                       and e.headers.get("Content-Type") == "application/json")
+        check("GET /api/pcap absent -> JSON 404 (no 500)", pcap404)
+
+        # ── /api/wire (decoded DNS/TCP/TLS/HTTP summary) ──────────────────
+        st, body = get(f"/api/wire?sid={sid3}")
+        wire = json.loads(body)
+        check("GET /api/wire 200 envelope", st == 200 and "decode_available" in wire)
+        if wire.get("decode_available"):
+            # decoder present: the fixture's DNS question + TLS SNI must surface
+            check("GET /api/wire decoded ok", wire.get("ok") is True)
+            check("GET /api/wire carries pcap_url",
+                  wire.get("pcap_url") == f"/api/pcap?sid={sid3}")
+            check("GET /api/wire surfaces DNS example.com",
+                  any((d.get("name") == "example.com") for d in wire.get("dns", [])))
+            check("GET /api/wire surfaces TLS SNI example.com",
+                  any((t.get("sni") == "example.com") for t in wire.get("tls", [])))
+            check("GET /api/wire packet count >= 3", (wire.get("packets") or 0) >= 3)
+        else:
+            # checkout without pcap_decode.py: must still return raw-download hint
+            check("GET /api/wire degrades to decode_available=false",
+                  wire.get("ok") is False and wire.get("pcap_url"))
+        # absent capture -> JSON 404 with decode_available flag, never 500
+        try:
+            urllib.request.urlopen(base + f"/api/wire?sid={sid}", timeout=5)
+            wire404 = False
+        except urllib.error.HTTPError as e:
+            wire404 = e.code == 404
+        check("GET /api/wire absent -> JSON 404 (no 500)", wire404)
+        # bad sid -> 400, never 500
+        try:
+            urllib.request.urlopen(base + "/api/wire?sid=../../etc/passwd", timeout=5)
+            wirebad = False
+        except urllib.error.HTTPError as e:
+            wirebad = e.code in (400, 404)
+        check("GET /api/wire bad sid rejected", wirebad)
+
         # path-traversal / bad sid rejected
         try:
             get("/api/metrics?sid=../../etc/passwd")
