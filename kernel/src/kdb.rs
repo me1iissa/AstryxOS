@@ -358,6 +358,11 @@ pub fn dispatch(req: &str, out: &mut String) {
         "log-ring"        => op_log_ring(out),
         "log-ring-flush"  => op_log_ring_flush(out),
         "log-ring-enable" => op_log_ring_enable(req, out),
+        // virtio-blk wait-amplification telemetry + runtime A/B controls.
+        "virtio-wait-hist"  => op_virtio_wait_hist(out),
+        "virtio-wait-mode"  => op_virtio_wait_mode(req, out),
+        "virtio-wait-spin"  => op_virtio_wait_spin(req, out),
+        "virtio-wait-reset" => op_virtio_wait_reset(out),
         "bell-stats"       => op_bell_stats(out),
         "cache-audit"      => op_cache_audit(out),
         "cache-aliasing"   => op_cache_aliasing(out),
@@ -1041,6 +1046,66 @@ fn op_log_ring_enable(req: &str, out: &mut String) {
         r#"{{"ok":true,"prev":{},"enabled":{}}}"#,
         prev, now
     );
+}
+
+// ── virtio-blk wait-amplification telemetry ──────────────────────────────────
+//
+// `virtio-wait-hist` drains the per-round-trip wait-sample ring as a JSON
+// histogram (log-scale µs buckets × mean run-queue depth, plus median/p99).
+// `virtio-wait-mode block|yield` flips the wait strategy at runtime so a single
+// build measures BOTH the BEFORE (spin-then-yield) and AFTER (IRQ-driven block)
+// distributions with no build-to-build confound.  `virtio-wait-spin <n>` tunes
+// the adaptive-spin budget.  `virtio-wait-reset` zeroes the ring for a clean
+// A/B window.
+
+fn op_virtio_wait_hist(out: &mut String) {
+    use core::fmt::Write;
+    // Prefix the current strategy so the histogram is self-describing.
+    let mode = if crate::drivers::virtio_blk::wait_adaptive_enabled() { "adaptive" } else { "legacy" };
+    let _ = write!(out, r#"{{"mode":"{}","hist":"#, mode);
+    crate::drivers::virtio_blk::wait_hist_json(out);
+    out.push('}');
+}
+
+fn op_virtio_wait_mode(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    let arg = extract_field(req, "mode").unwrap_or_default();
+    let prev = crate::drivers::virtio_blk::wait_adaptive_enabled();
+    let now = match arg.as_str() {
+        "adaptive" | "1" | "true" => {
+            crate::drivers::virtio_blk::set_wait_adaptive(true);
+            true
+        }
+        "legacy" | "0" | "false" => {
+            crate::drivers::virtio_blk::set_wait_adaptive(false);
+            false
+        }
+        _ => prev, // query-only
+    };
+    let _ = write!(
+        out,
+        r#"{{"ok":true,"prev_mode":"{}","mode":"{}"}}"#,
+        if prev { "adaptive" } else { "legacy" },
+        if now { "adaptive" } else { "legacy" }
+    );
+}
+
+fn op_virtio_wait_spin(req: &str, out: &mut String) {
+    use core::fmt::Write;
+    match extract_field(req, "n").and_then(|s| s.parse::<u32>().ok()) {
+        Some(n) => {
+            let prev = crate::drivers::virtio_blk::set_spin_budget(n);
+            let _ = write!(out, r#"{{"ok":true,"prev_spin":{},"spin":{}}}"#, prev, n.max(1));
+        }
+        None => {
+            out.push_str(r#"{"error":"virtio-wait-spin needs integer field 'n'"}"#);
+        }
+    }
+}
+
+fn op_virtio_wait_reset(out: &mut String) {
+    crate::drivers::virtio_blk::wait_hist_reset();
+    out.push_str(r#"{"ok":true,"reset":true}"#);
 }
 
 // ── bell-stats ───────────────────────────────────────────────────────────────
