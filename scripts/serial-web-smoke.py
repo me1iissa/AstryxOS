@@ -27,14 +27,18 @@ Covers (matches the operator-requested feature set):
                       kernel-tick derivation (APPROX historical), incl. the
                       monotone/forward-ordered delta invariant.
 """
+import base64
 import importlib.util
 import json
 import os
+import struct
 import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
+import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PASS = "\033[32mPASS\033[0m"
@@ -263,6 +267,212 @@ def _core_profile_gate_checks(sw, tmp):
           fire == 0, fire)
 
 
+# ── screenshot streams: base64 PNG decode (VGA framebuffer + Firefox render) ──
+PNG_SIG = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+
+
+def _make_png(w, h):
+    """A real, valid PNG built with stdlib zlib only (NO Pillow). 8-bit RGBA,
+    one IDAT, one IEND. Its IHDR carries w/h so the dimension parse is exercised."""
+    def chunk(typ, data):
+        c = typ + data
+        return struct.pack(">I", len(data)) + c + struct.pack(
+            ">I", zlib.crc32(c) & 0xFFFFFFFF)
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)   # 8-bit, colour-type 6
+    # filter byte 0 + RGBA scanlines (a flat colour compresses small/fast)
+    raw = b"".join(b"\x00" + b"\x39\xd3\x53\xff" * w for _ in range(h))
+    return (PNG_SIG + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+def _emit_stream(png, kind, drop_tail=0, end=True):
+    """Render `png` as the chunked base64 serial stream for `kind` (vga|ff). When
+    drop_tail>0, omit the last `drop_tail` chunks (and the END marker) to model
+    an in-progress/partial stream. Mirrors the kernel's 76-char chunk width."""
+    b64 = base64.b64encode(png).decode()
+    parts = [b64[i:i + 76] for i in range(0, len(b64), 76)]
+    M = len(parts)
+    keep = M - drop_tail
+    lines = []
+    if kind == "ff":
+        lines.append(f"[FF-OUT-PNG:path=/tmp/out.png size={len(png)} sig_ok=true]")
+        tag = "FF-OUT-PNG-B64"
+        endtag = "[FF-OUT-PNG-END]"
+    else:
+        tag = "SCREENSHOT-B64"
+        endtag = "[SCREENSHOT-B64-END]"
+    for i in range(keep):
+        lines.append(f"[{tag}:{i}/{M}] {parts[i]}")
+    if end and drop_tail == 0:
+        lines.append(endtag)
+    return "\n".join(lines) + "\n", M, keep
+
+
+def _screenshot_checks(sw, tmp):
+    """The screenshot decode endpoint: complete + partial streams for BOTH the
+    VGA framebuffer (kind=vga) and the Firefox render (kind=ff). Validates the
+    decoded PNG signature/dimensions, completeness flags, partial-pct, the
+    metadata endpoint, and graceful degradation (no 500 on a torn stream; a
+    clean JSON 404 when absent). All synthetic — CI-safe, no real logs needed."""
+    # ---- complete VGA + complete FF in one log ----
+    png_vga = _make_png(800, 450)        # matches the real fixture dimensions
+    png_ff = _make_png(64, 48)
+    sid = "shots01"
+    log = os.path.join(tmp, sid + ".serial.log")
+    vga_txt, vgaM, _ = _emit_stream(png_vga, "vga")
+    ff_txt, ffM, _ = _emit_stream(png_ff, "ff")
+    with open(log, "w") as f:
+        f.write("[BOOT] AstryxOS kernel\n" + vga_txt + ff_txt)
+
+    dv = sw._decode_shot(log, "vga")
+    check("shots vga decodes to valid PNG", dv["sig_ok"] and dv["png"][:8] == PNG_SIG)
+    check("shots vga complete", dv["complete"] is True, dv["complete"])
+    check("shots vga dims 800x450", dv["w"] == 800 and dv["h"] == 450, (dv["w"], dv["h"]))
+    check("shots vga byte-exact", dv["bytes"] == len(png_vga), (dv["bytes"], len(png_vga)))
+    check("shots vga chunks==total", dv["chunks"] == vgaM and dv["total"] == vgaM)
+
+    df = sw._decode_shot(log, "ff")
+    check("shots ff decodes to valid PNG", df["sig_ok"] and df["png"][:8] == PNG_SIG)
+    check("shots ff complete", df["complete"] is True, df["complete"])
+    check("shots ff dims 64x48", df["w"] == 64 and df["h"] == 48, (df["w"], df["h"]))
+    check("shots ff byte-exact + guest_size cross-check",
+          df["bytes"] == len(png_ff) == df["guest_size"],
+          (df["bytes"], len(png_ff), df["guest_size"]))
+
+    # ---- metadata endpoint: both present, no png bytes shipped ----
+    md = sw.scan_screenshots(log)
+    check("scan_screenshots vga present+complete",
+          md["vga"]["present"] and md["vga"]["complete"])
+    check("scan_screenshots ff present+complete",
+          md["ff"]["present"] and md["ff"]["complete"])
+    check("scan_screenshots strips png bytes (metadata only)",
+          "png" not in md["vga"] and "png" not in md["ff"])
+    check("scan_screenshots consistent schema (both branches have end_seen/received)",
+          all(k in md["vga"] for k in ("end_seen", "received", "first_gap", "partial_pct")))
+
+    # ---- PARTIAL VGA: drop ~33% of the tail + the END marker ----
+    sidp = "shotspart01"
+    logp = os.path.join(tmp, sidp + ".serial.log")
+    drop = vgaM // 3
+    vpart, _, vkeep = _emit_stream(png_vga, "vga", drop_tail=drop)
+    with open(logp, "w") as f:
+        f.write(vpart)
+    dp = sw._decode_shot(logp, "vga")
+    check("shots PARTIAL does not error (graceful)", dp["error"] is None, dp["error"])
+    check("shots PARTIAL present but not complete",
+          dp["present"] and dp["complete"] is False, (dp["present"], dp["complete"]))
+    check("shots PARTIAL still a valid PNG prefix (IHDR present)",
+          dp["sig_ok"] and dp["png"][:8] == PNG_SIG)
+    check("shots PARTIAL keeps IHDR dims (800x450)",
+          dp["w"] == 800 and dp["h"] == 450, (dp["w"], dp["h"]))
+    check("shots PARTIAL pct == int(100*keep/total)",
+          dp["partial_pct"] == int(100 * vkeep / vgaM),
+          (dp["partial_pct"], vkeep, vgaM))
+    check("shots PARTIAL end_seen False (no END marker)", dp["end_seen"] is False)
+
+    # ---- absent stream: clean 'present:false', no crash ----
+    sidn = "shotsnone01"
+    logn = os.path.join(tmp, sidn + ".serial.log")
+    with open(logn, "w") as f:
+        f.write("[BOOT] AstryxOS kernel\n[FFTEST] no screenshot here\n")
+    dn = sw._decode_shot(logn, "vga")
+    check("shots absent -> present False, no error", not dn["present"] and dn["error"] is None)
+
+    # ---- HTTP layer: serve PNG bytes, headers, JSON 404 on absent ----
+    from http.server import ThreadingHTTPServer
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), sw.H)
+    srv.daemon_threads = True
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        # complete VGA -> 200 image/png, PNG magic, complete header
+        req = urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/screenshot?sid={sid}&kind=vga", timeout=5)
+        body = req.read()
+        check("GET /api/screenshot vga 200 image/png",
+              req.status == 200 and req.headers.get("Content-Type") == "image/png")
+        check("GET /api/screenshot vga returns PNG bytes", body[:8] == PNG_SIG)
+        check("GET /api/screenshot vga X-Screenshot-Complete true",
+              req.headers.get("X-Screenshot-Complete") == "true")
+        check("GET /api/screenshot vga X-Screenshot-Dimensions 800x450",
+              req.headers.get("X-Screenshot-Dimensions") == "800x450")
+        # complete FF -> 200 image/png
+        reqf = urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/screenshot?sid={sid}&kind=ff", timeout=5)
+        bodyf = reqf.read()
+        check("GET /api/screenshot ff 200 PNG bytes",
+              reqf.status == 200 and bodyf[:8] == PNG_SIG)
+        # partial VGA -> 200 but Complete:false (degrades, not 500)
+        reqp = urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/screenshot?sid={sidp}&kind=vga", timeout=5)
+        bodyp = reqp.read()
+        check("GET /api/screenshot PARTIAL 200 (not 500) + PNG bytes",
+              reqp.status == 200 and bodyp[:8] == PNG_SIG)
+        check("GET /api/screenshot PARTIAL Complete header false",
+              reqp.headers.get("X-Screenshot-Complete") == "false")
+        # absent FF on a vga-only log -> JSON 404
+        try:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/screenshot?sid={sidp}&kind=ff", timeout=5)
+            absent404 = False
+        except urllib.error.HTTPError as e:
+            absent404 = (e.code == 404
+                         and e.headers.get("Content-Type") == "application/json")
+        check("GET /api/screenshot absent -> JSON 404 (no 500)", absent404)
+        # bad kind -> 400 JSON
+        try:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/screenshot?sid={sid}&kind=bogus", timeout=5)
+            bad400 = False
+        except urllib.error.HTTPError as e:
+            bad400 = e.code == 400
+        check("GET /api/screenshot bad kind -> 400", bad400)
+        # metadata endpoint
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/screenshots?sid={sid}", timeout=5) as r:
+            mbody = json.loads(r.read())
+        check("GET /api/screenshots both kinds + no png bytes",
+              mbody["vga"]["complete"] and mbody["ff"]["complete"]
+              and "png" not in mbody["vga"])
+        # the dashboard HTML wires up the screenshots panel + endpoint
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as r:
+            page = r.read()
+        check("dashboard HTML references screenshots panel",
+              b"id=shots" in page and b"/api/screenshot?" in page
+              and b"VGA framebuffer" in page and b"Firefox render" in page)
+    finally:
+        srv.shutdown()
+
+
+def _real_fixture_checks(sw):
+    """Opportunistic check against the REAL operator fixtures, only when this
+    host has them (skipped silently in CI, which has no ~/.astryx-harness logs).
+    fcc3cb95d128 = a COMPLETE [SCREENSHOT-B64] (25275/25275 -> 800x450 PNG);
+    137d5d460cc0 = a PARTIAL one (16990/25275)."""
+    hd = os.path.expanduser("~/.astryx-harness")
+    comp = os.path.join(hd, "fcc3cb95d128.serial.log")
+    part = os.path.join(hd, "137d5d460cc0.serial.log")
+    if not (os.path.exists(comp) and os.path.exists(part)):
+        print("  (real fixtures absent — host-fixture checks skipped)")
+        return
+    old = sw.HARNESS_DIR
+    sw.HARNESS_DIR = hd
+    try:
+        dc = sw._decode_shot(comp, "vga")
+        check("REAL complete fixture -> valid 800x450 PNG",
+              dc["complete"] and dc["sig_ok"] and dc["w"] == 800 and dc["h"] == 450,
+              (dc["complete"], dc["w"], dc["h"]))
+        check("REAL complete fixture 25275 chunks",
+              dc["total"] == 25275 and dc["chunks"] == 25275, (dc["chunks"], dc["total"]))
+        dp = sw._decode_shot(part, "vga")
+        check("REAL partial fixture decodes gracefully (no error, valid prefix)",
+              dp["error"] is None and dp["sig_ok"] and dp["present"], dp["error"])
+        check("REAL partial fixture not complete + pct ~67",
+              dp["complete"] is False and dp["partial_pct"] == 67, dp["partial_pct"])
+    finally:
+        sw.HARNESS_DIR = old
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="serialweb-smoke-")
     sid = "smoketest1234"
@@ -347,6 +557,11 @@ def main():
     # ── firefox-test-core (fast profile, firehose OFF) gate visibility ──
     print("── core-profile gate visibility ──")
     _core_profile_gate_checks(sw, tmp)
+
+    # ── screenshot streams: base64 PNG decode (VGA framebuffer + FF render) ──
+    print("── screenshot decode (VGA framebuffer + Firefox render) ──")
+    _screenshot_checks(sw, tmp)
+    _real_fixture_checks(sw)
 
     # ── HTTP layer end-to-end on an ephemeral port ──
     print("── HTTP endpoints ──")
