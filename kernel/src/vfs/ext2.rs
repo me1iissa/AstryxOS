@@ -39,6 +39,18 @@ use crate::vfs::VfsError;
 /// Linux installation (≈600–900 shared libraries) with some headroom.
 const DENTRY_CACHE_CAP: usize = 1024;
 
+/// Maximum number of entries kept in the per-superblock inode cache.
+///
+/// Each entry is the parsed 128-byte on-disk inode keyed by inode number.
+/// Path resolution (`resolve_path_opts`) calls `stat()` — and therefore
+/// `read_inode` — on every component of every open/stat/access, so the same
+/// handful of directory and library inodes are re-read from disk thousands of
+/// times during a large dynamic-link load.  Caching the parsed inode collapses
+/// those repeat reads into a single disk round-trip per inode.  2048 entries
+/// comfortably cover the directory chain plus every shared object on the
+/// dynamic-link path with headroom; eviction is FIFO, like the dentry cache.
+const INODE_CACHE_CAP: usize = 2048;
+
 /// ext2 magic number.
 const EXT2_MAGIC: u16 = 0xEF53;
 
@@ -256,6 +268,22 @@ struct Ext2State {
     /// Tuple is `(block_num, block_data)`.  Invalidated whenever
     /// [`Ext2Fs::write_indirect_slot`] modifies an indirect block.
     indirect_cache: Option<(u32, Vec<u8>)>,
+    /// Per-superblock inode cache: inode number → parsed on-disk inode.
+    ///
+    /// This is the FS's in-core copy of the on-disk inode metadata (size,
+    /// mode, uid/gid, link count, timestamps, block pointers).  POSIX permits
+    /// a filesystem to keep an in-core copy of inode metadata; the contract is
+    /// that mutations are reflected back, which this driver guarantees because
+    /// every metadata write funnels through [`Ext2Fs::write_inode`] (which
+    /// refreshes the cache write-through) and every inode free funnels through
+    /// [`Ext2Fs::free_inode`] (which invalidates the entry so a recycled inode
+    /// number is re-read from disk).  Protected by the state mutex, shared with
+    /// the dentry cache, so the established lock order is preserved.
+    inode_map: BTreeMap<u64, Ext2Inode>,
+    /// FIFO eviction queue for [`Ext2State::inode_map`].  Inode numbers in
+    /// insertion order; the front is popped when the map reaches
+    /// [`INODE_CACHE_CAP`].
+    inode_fifo: VecDeque<u64>,
 }
 
 /// ext2 filesystem instance.
@@ -295,6 +323,11 @@ pub struct Ext2Fs {
     /// Count of dentry-cache hits since mount.  Incremented atomically
     /// so it is visible to test assertions without taking the state lock.
     pub dentry_cache_hits: AtomicUsize,
+    /// Count of inode-cache hits since mount.  Incremented atomically so it
+    /// is visible to test assertions / perf accounting without taking the
+    /// state lock.  Each hit is one avoided pair of `read_inode` disk reads
+    /// (the BGD read is also avoided — see [`Ext2Fs::read_inode`]).
+    pub inode_cache_hits: AtomicUsize,
 }
 
 impl Ext2Fs {
@@ -452,9 +485,12 @@ impl Ext2Fs {
                 dentry_map: BTreeMap::new(),
                 dentry_fifo: VecDeque::new(),
                 indirect_cache: None,
+                inode_map: BTreeMap::new(),
+                inode_fifo: VecDeque::new(),
             }),
             per_group_alloc,
             dentry_cache_hits: AtomicUsize::new(0),
+            inode_cache_hits: AtomicUsize::new(0),
         })
     }
 
@@ -538,9 +574,12 @@ impl Ext2Fs {
                 dentry_map: BTreeMap::new(),
                 dentry_fifo: VecDeque::new(),
                 indirect_cache: None,
+                inode_map: BTreeMap::new(),
+                inode_fifo: VecDeque::new(),
             }),
             per_group_alloc,
             dentry_cache_hits: AtomicUsize::new(0),
+            inode_cache_hits: AtomicUsize::new(0),
         })
     }
 
@@ -660,47 +699,129 @@ impl Ext2Fs {
     }
 
     /// Read an inode by number (1-based).
+    ///
+    /// # Caching (PR perf/ext2-inode-cache)
+    ///
+    /// `read_inode` is the hottest disk-touching path on the dynamic-link
+    /// load: `resolve_path_opts` calls `stat()` on every component of every
+    /// `open`/`stat`/`access`, so the same directory and shared-library inodes
+    /// are read thousands of times.  Two redundant disk round-trips per call
+    /// are eliminated here:
+    ///
+    /// 1. **BGD read.**  The block-group descriptor table is parsed once at
+    ///    mount and held in `state.bgdt` (it is fixed at mkfs time for the
+    ///    read path — allocation bitmaps live elsewhere, in the per-group
+    ///    bitmap blocks).  We read the descriptor straight out of the in-core
+    ///    BGDT instead of re-reading its sector from disk.
+    /// 2. **Inode read.**  A per-superblock inode cache (`state.inode_map`)
+    ///    holds the parsed on-disk inode keyed by number.  On a hit we return
+    ///    the cached copy with no disk I/O at all.  The cache is kept coherent
+    ///    by [`Ext2Fs::write_inode`] (write-through on every metadata write)
+    ///    and [`Ext2Fs::free_inode`] (invalidate on free), so a cache entry is
+    ///    always the FS's authoritative in-core copy of the on-disk inode —
+    ///    POSIX permits this in-core copy.
+    ///
+    /// The state mutex is **not** held across the disk read on a miss (lock
+    /// discipline: never hold the FS state lock across a yielding block-device
+    /// op).  On the insert after a miss we never overwrite an entry a
+    /// concurrent `write_inode` may have installed in the gap, so a newer
+    /// write-through value always wins over a stale disk read.
     fn read_inode(&self, inode_num: u64) -> Option<Ext2Inode> {
         if inode_num == 0 { return None; }
         let inode_idx = (inode_num - 1) as u32;
         let group = inode_idx / self.superblock.inodes_per_group;
         let idx_in_group = inode_idx % self.superblock.inodes_per_group;
 
-        // Read block group descriptor
-        let bgd_block = if self.block_size == 1024 { 2 } else { 1 };
-        let bgd_offset = group as usize * 32; // sizeof(BlockGroupDesc) = 32
-        let bgd_sector = bgd_block as u64 * (self.block_size as u64 / 512) + (bgd_offset as u64 / 512);
-
-        let mut sector_buf = [0u8; 512];
-        if self.read_sectors_inner(bgd_sector, 1, &mut sector_buf).is_err() {
-            return None;
-        }
-
-        let bgd_off_in_sector = bgd_offset % 512;
-        let bgd: BlockGroupDesc = unsafe {
-            core::ptr::read_unaligned(sector_buf[bgd_off_in_sector..].as_ptr() as *const BlockGroupDesc)
+        // ── Fast path: inode-cache hit.  Also resolves the BGD entry from
+        //    the in-core BGDT under the same lock, avoiding both disk reads.
+        let inode_table = {
+            let state = self.state.lock();
+            if let Some(cached) = state.inode_map.get(&inode_num) {
+                let copy = *cached;
+                drop(state);
+                self.inode_cache_hits.fetch_add(1, Ordering::Relaxed);
+                return Some(copy);
+            }
+            // Cache miss — read the BGD from the in-core table (no disk read).
+            state.bgdt.get(group as usize)?.inode_table
         };
 
-        // Calculate inode location
-        let inode_table_byte = bgd.inode_table as u64 * self.block_size as u64;
+        // Calculate inode location.
+        let inode_table_byte = inode_table as u64 * self.block_size as u64;
         let inode_byte = inode_table_byte + idx_in_group as u64 * self.inode_size as u64;
         let inode_sector = inode_byte / 512;
         let inode_off = (inode_byte % 512) as usize;
 
-        let mut buf = [0u8; 512];
-        if self.read_sectors_inner(inode_sector, 1, &mut buf).is_err() {
-            return None;
-        }
-
-        if inode_off + 128 <= 512 {
-            Some(unsafe { core::ptr::read_unaligned(buf[inode_off..].as_ptr() as *const Ext2Inode) })
+        let inode = if inode_off + 128 <= 512 {
+            let mut buf = [0u8; 512];
+            if self.read_sectors_inner(inode_sector, 1, &mut buf).is_err() {
+                return None;
+            }
+            unsafe { core::ptr::read_unaligned(buf[inode_off..].as_ptr() as *const Ext2Inode) }
         } else {
-            // Inode spans sector boundary — read two sectors
+            // Inode spans a sector boundary — read two sectors.
             let mut buf2 = [0u8; 1024];
             if self.read_sectors_inner(inode_sector, 2, &mut buf2).is_err() {
                 return None;
             }
-            Some(unsafe { core::ptr::read_unaligned(buf2[inode_off..].as_ptr() as *const Ext2Inode) })
+            unsafe { core::ptr::read_unaligned(buf2[inode_off..].as_ptr() as *const Ext2Inode) }
+        };
+
+        // Populate the cache on miss.  Insert-if-absent so a concurrent
+        // `write_inode` that ran while we were off-lock doing disk I/O keeps
+        // its newer write-through value (a stale disk read must not clobber it).
+        self.inode_cache_insert_if_absent(inode_num, inode);
+        Some(inode)
+    }
+
+    /// Insert `inode` into the inode cache for `inode_num` only if no entry
+    /// already exists.  FIFO-evicts when at [`INODE_CACHE_CAP`].  Used by the
+    /// `read_inode` miss path so a stale disk read can never overwrite a
+    /// newer write-through value installed by a racing `write_inode`.
+    fn inode_cache_insert_if_absent(&self, inode_num: u64, inode: Ext2Inode) {
+        let mut state = self.state.lock();
+        if state.inode_map.contains_key(&inode_num) {
+            return;
+        }
+        if state.inode_map.len() >= INODE_CACHE_CAP {
+            if let Some(oldest) = state.inode_fifo.pop_front() {
+                state.inode_map.remove(&oldest);
+            }
+        }
+        state.inode_map.insert(inode_num, inode);
+        state.inode_fifo.push_back(inode_num);
+    }
+
+    /// Write-through update of the inode cache: unconditionally store the
+    /// freshest copy of `inode` for `inode_num`.  Called by
+    /// [`Ext2Fs::write_inode`] after a successful disk write so the cache can
+    /// never serve a value older than what is on disk.  If the inode is not
+    /// yet cached it is inserted (with FIFO accounting); if it is, the value
+    /// is overwritten in place without touching FIFO order.
+    fn inode_cache_update(&self, inode_num: u64, inode: Ext2Inode) {
+        let mut state = self.state.lock();
+        if state.inode_map.contains_key(&inode_num) {
+            state.inode_map.insert(inode_num, inode);
+            return;
+        }
+        if state.inode_map.len() >= INODE_CACHE_CAP {
+            if let Some(oldest) = state.inode_fifo.pop_front() {
+                state.inode_map.remove(&oldest);
+            }
+        }
+        state.inode_map.insert(inode_num, inode);
+        state.inode_fifo.push_back(inode_num);
+    }
+
+    /// Invalidate the inode-cache entry for `inode_num` (if any).  Called by
+    /// [`Ext2Fs::free_inode`] when an inode number is released back to the
+    /// allocator: the next allocation may reuse the number for a brand-new
+    /// file, so a future `read_inode` MUST re-read it from disk rather than
+    /// serve the freed file's stale metadata.
+    fn inode_cache_invalidate(&self, inode_num: u64) {
+        let mut state = self.state.lock();
+        if state.inode_map.remove(&inode_num).is_some() {
+            state.inode_fifo.retain(|&k| k != inode_num);
         }
     }
 
@@ -978,7 +1099,7 @@ impl Ext2Fs {
         let inode_sector = inode_byte / 512;
         let inode_off = (inode_byte % 512) as usize;
 
-        if inode_off + 128 <= 512 {
+        let write_result = if inode_off + 128 <= 512 {
             let mut buf = [0u8; 512];
             self.read_sectors_inner(inode_sector, 1, &mut buf)?;
             unsafe {
@@ -994,7 +1115,18 @@ impl Ext2Fs {
                     buf2[inode_off..].as_mut_ptr() as *mut Ext2Inode, *inode);
             }
             self.write_sectors_inner(inode_sector, 2, &buf2)
+        };
+
+        // Write-through the inode cache only after the on-disk write
+        // succeeded, so the cache can never be ahead of disk.  This is the
+        // single coherence point for ALL inode-metadata mutations — every
+        // size/mtime/mode/uid/links_count change in this driver funnels
+        // through `write_inode`, so refreshing here keeps the cache exact
+        // without per-mutator invalidation.
+        if write_result.is_ok() {
+            self.inode_cache_update(inode_num, *inode);
         }
+        write_result
     }
 
     /// Allocate one free data block, mark its bitmap bit, decrement free
@@ -1209,6 +1341,12 @@ impl Ext2Fs {
                 + bit_idx as u32 + 1;
             drop(_group_guard);
 
+            // Defensive: a freshly-allocated inode number must not carry any
+            // cached metadata from a prior life.  `free_inode` already
+            // invalidates on the normal free path, so this is belt-and-braces
+            // against any allocation path that did not route through it.
+            self.inode_cache_invalidate(inum as u64);
+
             let (bgd_snap, sb_snap) = {
                 let mut state = self.state.lock();
                 state.bgdt[group].free_inodes_count =
@@ -1232,6 +1370,13 @@ impl Ext2Fs {
         let group = (inum - 1) / self.superblock.inodes_per_group;
         let bit_idx = ((inum - 1) % self.superblock.inodes_per_group) as usize;
         if group as usize >= self.num_groups as usize { return; }
+        // Drop any cached copy of this inode before releasing the number to
+        // the allocator: a future allocation may reuse it for a brand-new
+        // file, and a stale cached inode would surface the freed file's
+        // metadata (size, mode, block pointers) — a correctness/data-integrity
+        // bug.  Invalidate unconditionally and up front so even an
+        // already-clear-bitmap early return cannot leave a stale entry.
+        self.inode_cache_invalidate(inum as u64);
         let mut state = self.state.lock();
         let bitmap_block = state.bgdt[group as usize].inode_bitmap;
         drop(state);
@@ -2296,6 +2441,24 @@ impl Ext2Fs {
     #[doc(hidden)]
     pub fn dentry_cache_size_for_test(&self) -> usize {
         self.state.lock().dentry_map.len()
+    }
+
+    /// Test-only accessor: current inode-cache hit counter.
+    #[doc(hidden)]
+    pub fn inode_cache_hits_for_test(&self) -> usize {
+        self.inode_cache_hits.load(Ordering::Relaxed)
+    }
+
+    /// Test-only accessor: current inode-cache size.
+    #[doc(hidden)]
+    pub fn inode_cache_size_for_test(&self) -> usize {
+        self.state.lock().inode_map.len()
+    }
+
+    /// Test-only accessor: `true` if `inode_num` is currently cached.
+    #[doc(hidden)]
+    pub fn inode_cache_contains_for_test(&self, inode_num: u64) -> bool {
+        self.state.lock().inode_map.contains_key(&inode_num)
     }
 
     /// Test-only accessor for the live `s_free_blocks_count` counter.
