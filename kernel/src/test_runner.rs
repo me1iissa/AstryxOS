@@ -2243,6 +2243,8 @@ pub fn run() -> ! {
         if test_234_cache_update_range_boundaries() { passed += 1; }
         total += 1;
         if test_240_vfs_truncate_page_cache_coherency() { passed += 1; }
+        total += 1;
+        if test_241_ramfs_mmap_read_coherency() { passed += 1; }
     }
 
     // ── Test 235: ELF loader hardening (H4) ──────────────────────────────
@@ -42338,6 +42340,167 @@ fn test_234_cache_update_range_boundaries() -> bool {
     }
     let _ = crate::vfs::remove(path);
     test_pass!("mm::cache::update_range — page-boundary arithmetic");
+    true
+}
+
+// ── Test 241: ramfs/tmpfs/memfd mmap ↔ read(2) coherency ──────────────────
+//
+// Regression guard for the REVERSE-direction page-cache coherence bug on the
+// in-memory backends (ramfs / tmpfs / memfd).  On those backends an inode keeps
+// its own `Vec<u8>` storage, and once a page is demand-faulted by an
+// `mmap(MAP_SHARED)` the file ALSO has a page-cache frame.  A store through the
+// shared mapping lands in the page-cache frame but never touches the inode
+// `Vec`.  Before `mm::cache::read_through`, `read(2)` consulted only the `Vec`
+// (`fs.read`), so it returned stale (pre-store) bytes — Mozilla's `/dev/shm`
+// IPC SharedMemory stages bytes through the mapping that the peer reads back via
+// `read(2)`, so the peer saw zeros and dereferenced a NULL IPC object pointer.
+//
+// This test models the bug at the kernel API without a full userspace process:
+//   1. Create a tmpfs/ramfs file and `write_file` a known pattern (populates the
+//      inode `Vec`).
+//   2. Allocate a page-cache frame for page 0, seed it from the `Vec` (mirrors
+//      the mmap demand-fault seeding from `fs.read`), and `cache::insert` it —
+//      the file is now "mmap'd": one shared cache frame backs page 0.
+//   3. Store a DIFFERENT pattern directly into the cache frame through the
+//      higher-half map — this is exactly what a `MAP_SHARED`+`PROT_WRITE` store
+//      does (it writes the mapped physical frame, NOT the inode `Vec`).
+//   4. `read(2)` the file via `fd_read` and assert it returns the STORE pattern,
+//      not the original `write_file` pattern.
+//
+// Pre-fix: step 4 returns the original pattern (FAIL — `fs.read` reads the
+// stale `Vec`).  Post-fix: `read_through` overlays the cache frame, so step 4
+// returns the store pattern (PASS).
+//
+// POSIX mmap(2): a write through a MAP_SHARED region is a write to the
+// underlying file object and shall be visible to a subsequent `read(2)` of the
+// same file.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_241_ramfs_mmap_read_coherency() -> bool {
+    test_header!("ramfs/tmpfs mmap ↔ read(2) coherency (reverse direction)");
+
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    let path = "/tmp/test241_mmap_read.bin";
+    let pid = crate::proc::current_pid();
+
+    let _ = crate::vfs::remove(path);
+    if let Err(e) = crate::vfs::create_file(path) {
+        test_fail!("test241", "create_file failed: {:?}", e);
+        return false;
+    }
+
+    // (1) Seed the inode Vec with the ORIGINAL pattern (one full page of 'A').
+    let original: alloc::vec::Vec<u8> = alloc::vec![b'A'; 4096];
+    if let Err(e) = crate::vfs::write_file(path, &original) {
+        test_fail!("test241", "write_file failed: {:?}", e);
+        let _ = crate::vfs::remove(path);
+        return false;
+    }
+
+    let (mount_idx, inode) = match crate::vfs::resolve_path(path) {
+        Ok(r) => r,
+        Err(e) => {
+            test_fail!("test241", "resolve_path failed: {:?}", e);
+            let _ = crate::vfs::remove(path);
+            return false;
+        }
+    };
+
+    // (2) "Demand-fault" page 0: allocate a frame, seed it from the Vec (as the
+    //     mmap fault path does via fs.read), and install it in the cache.  The
+    //     file is now mmap-resident: this frame is the shared MAP_SHARED page.
+    let phys = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => {
+            test_fail!("test241", "pmm alloc_page failed");
+            let _ = crate::vfs::remove(path);
+            return false;
+        }
+    };
+    let frame = (PHYS_OFF + phys) as *mut u8;
+    unsafe { core::ptr::copy_nonoverlapping(original.as_ptr(), frame, 4096); }
+    crate::mm::cache::insert(mount_idx, inode, 0, phys);
+
+    // (3) Store a DIFFERENT pattern ('B') through the shared frame — exactly
+    //     what a MAP_SHARED+PROT_WRITE store does (writes the frame, not the Vec).
+    unsafe { core::ptr::write_bytes(frame, b'B', 4096); }
+
+    // (4) read(2) the file and require the mmap'd store to be visible.
+    let fd = match crate::vfs::open(pid, path, 0 /*O_RDONLY*/) {
+        Ok(f) => f,
+        Err(e) => {
+            test_fail!("test241", "open failed: {:?}", e);
+            let _ = crate::mm::cache::evict(mount_idx, inode, 0);
+            let _ = crate::vfs::remove(path);
+            return false;
+        }
+    };
+    let mut readbuf = [0u8; 4096];
+    let n = crate::vfs::fd_read(pid, fd, readbuf.as_mut_ptr(), readbuf.len());
+    let _ = crate::vfs::close(pid, fd);
+
+    let read_ok = match n {
+        Ok(got) => got == 4096 && readbuf.iter().all(|&b| b == b'B'),
+        Err(e) => {
+            test_fail!("test241", "fd_read failed: {:?}", e);
+            false
+        }
+    };
+
+    // Cleanup: the cache holds a reference on `phys`; evict releases it.
+    if let Some(p) = crate::mm::cache::evict(mount_idx, inode, 0) {
+        crate::mm::pmm::free_page(p);
+    }
+    let _ = crate::vfs::remove(path);
+
+    if !read_ok {
+        // Report what the read returned so a regression is diagnosable: a 'A'
+        // page is the stale-Vec (pre-fix) failure; anything else is a deeper bug.
+        let first = readbuf[0];
+        let last = readbuf[4095];
+        test_fail!("test241",
+            "read(2) did not observe the MAP_SHARED store: buf[0]={:#x} buf[4095]={:#x} \
+             (expected all 'B' {:#x}; 'A' {:#x} means read still served the stale inode Vec)",
+            first, last, b'B', b'A');
+        return false;
+    }
+    test_println!("  store-through-mapping ('B') visible to read(2) ✓");
+
+    // Forward-direction regression guard: a write(2) to the same file must also
+    // remain visible (update_range keeps the cache frame coherent on writes).
+    // Re-create, re-seed a cache page, write through fd_write, read back.
+    let _ = crate::vfs::create_file(path);
+    let _ = crate::vfs::write_file(path, &original); // page of 'A'
+    let (mi2, in2) = match crate::vfs::resolve_path(path) {
+        Ok(r) => r,
+        Err(_) => { let _ = crate::vfs::remove(path); test_pass!("ramfs mmap ↔ read(2) coherency"); return true; }
+    };
+    if let Some(phys2) = crate::mm::pmm::alloc_page() {
+        let f2 = (PHYS_OFF + phys2) as *mut u8;
+        unsafe { core::ptr::write_bytes(f2, b'A', 4096); }
+        crate::mm::cache::insert(mi2, in2, 0, phys2);
+        // write(2) 'C' over the first 100 bytes via fd_write.
+        let cbytes: alloc::vec::Vec<u8> = alloc::vec![b'C'; 100];
+        if let Ok(wfd) = crate::vfs::open(pid, path, 0x1 /*O_WRONLY*/) {
+            let _ = crate::vfs::fd_write(pid, wfd, cbytes.as_ptr(), cbytes.len());
+            let _ = crate::vfs::close(pid, wfd);
+        }
+        // The cache frame must now show 'C' in [0,100) (update_range) and the
+        // overlaid read must agree.
+        let cache_c = unsafe { *f2 } == b'C' && unsafe { *f2.add(99) } == b'C'
+            && unsafe { *f2.add(100) } == b'A';
+        if let Some(p) = crate::mm::cache::evict(mi2, in2, 0) {
+            crate::mm::pmm::free_page(p);
+        }
+        if !cache_c {
+            test_fail!("test241", "forward direction: write(2) did not propagate to cache frame");
+            let _ = crate::vfs::remove(path);
+            return false;
+        }
+        test_println!("  write(2) ('C') propagated into cache frame ✓");
+    }
+    let _ = crate::vfs::remove(path);
+
+    test_pass!("ramfs mmap ↔ read(2) coherency");
     true
 }
 

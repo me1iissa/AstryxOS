@@ -2170,16 +2170,23 @@ pub fn close(pid: crate::proc::Pid, fd_num: usize) -> VfsResult<()> {
 
 /// Read from a file descriptor.
 ///
-/// Forward-direction coherency (write(2) visible to a subsequent read or
-/// mmap reader) is maintained by `fd_write` / `write_file` via
-/// `mm::cache::update_range`.  The reverse direction — a write through a
-/// MAP_SHARED+PROT_WRITE PTE visible to a subsequent `read(2)` — is not
-/// currently served from the page cache; this path goes straight to
-/// `fs.read`, which on tmpfs/ramfs returns the in-memory file content
-/// (consistent with mmap'd writes IF those writes have also been flushed
-/// back to FS storage).  Adding a read-through cache lookup here is a
-/// follow-up — see W215 docs/W215_CRC_MISMATCH_INVESTIGATION_*.md for the
-/// scope discussion.
+/// Page-cache coherency is maintained in BOTH directions for FS-backed fds:
+///
+///   * Forward — a `write(2)` visible to a subsequent `read(2)` or mmap reader —
+///     is maintained by `fd_write` / `write_file` via `mm::cache::update_range`,
+///     which copies the written bytes into every overlapping cache-resident page.
+///   * Reverse — a store through a `MAP_SHARED`+`PROT_WRITE` PTE visible to a
+///     subsequent `read(2)` — is maintained here: after `fs.read` returns the
+///     filesystem's own bytes, `mm::cache::read_through` overlays any
+///     cache-resident page on top, so a store that landed in the page-cache frame
+///     (the only handle a MAP_SHARED store records on the in-memory ramfs/tmpfs/
+///     memfd backends, where the inode keeps a separate `Vec<u8>`) is observed by
+///     `read(2)`.
+///
+/// Together these make a cache-resident inode present one source of truth — the
+/// page-cache frame — to mmap mappers, `read(2)`, and `write(2)` alike, matching
+/// the unified-page-cache semantics POSIX mmap(2)/read(2) require (see
+/// `mm::cache::read_through` / `update_range` for the citations).
 pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize) -> VfsResult<usize> {
     // SMAP bracket — fd_read writes data into `buf` which is typically
     // a user-VA from the syscall path.  The function does not call
@@ -2383,6 +2390,23 @@ pub fn fd_read(pid: crate::proc::Pid, fd_num: usize, buf: *mut u8, count: usize)
                 let fs = fs_at(mount_idx).ok_or(VfsError::NotFound)?.0;
                 fs.read(inode, offset, &mut buffer)?
             };
+
+            // Reverse-direction page-cache coherency (closes the ramfs/tmpfs/
+            // memfd incoherence).  `fs.read` above returned the bytes from the
+            // filesystem's own storage (the inode `Vec<u8>` for an in-memory FS).
+            // For a file that has been mmap(MAP_SHARED)'d, a store through the
+            // shared mapping landed in the page-cache frame — NOT the inode
+            // `Vec` — so the `Vec` (and thus `fs.read`) is stale for those
+            // pages.  Overlay the cache-resident bytes on top of `buffer` so the
+            // value `read(2)` returns reflects the mapping's current content.
+            // Per POSIX mmap(2)/read(2): a write through a MAP_SHARED region is a
+            // write to the underlying file object and must be visible to a later
+            // `read(2)`.  Block-backed filesystems are unaffected (their cache and
+            // on-disk bytes already agree via `cache::update_range`, so the
+            // overlay copies identical bytes).  See `mm::cache::read_through`.
+            if n > 0 && mount_idx != usize::MAX {
+                crate::mm::cache::read_through(mount_idx, inode, offset, &mut buffer[..n]);
+            }
 
             // Update offset.
             {
