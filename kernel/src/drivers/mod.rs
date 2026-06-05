@@ -9,6 +9,7 @@ pub mod rtc;
 pub mod ata;
 pub mod block;
 pub mod blk_trace;
+pub mod log_ring;
 pub mod console;
 pub mod keyboard;
 pub mod mouse;
@@ -28,6 +29,14 @@ use astryx_shared::BootInfo;
 /// Initialize all drivers.
 pub fn init(boot_info: &BootInfo) {
     serial::init();
+    // Bring up the near-zero-overhead log ring early (right after COM1) so the
+    // high-volume fast-log path has its PMM-backed buffer before the firehose
+    // trace families start emitting.  Until this runs, `serial_fast_println!`
+    // transparently falls back to COM1.  The PMM is already initialised by the
+    // time drivers::init runs (see virtio_blk below, which also alloc_pages).
+    if log_ring::init() {
+        crate::serial_println!("[DRIVERS] Log ring initialized (cheap high-volume log transport)");
+    }
     console::init(boot_info);
     keyboard::init();
     mouse::init(boot_info.framebuffer.width, boot_info.framebuffer.height);
