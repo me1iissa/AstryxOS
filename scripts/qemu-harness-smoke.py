@@ -1099,12 +1099,17 @@ def run_pcap_argv_check():
     No QEMU launched (< 2s).  Locks down the host-side packet-capture surface
     so a future refactor cannot silently regress it:
 
-      * `start --pcap` is advertised and parses to pcap=True
+      * `start --pcap` and `start --no-pcap` are advertised and parse
       * the filter-dump `-object` references the e1000/SLIRP netdev id (net0)
         and a per-session pcap file, and is emitted AFTER `-netdev` so QEMU's
         object resolver finds the netdev (QEMU networking docs)
       * the in-place kdb-hostfwd patch (which mutates the `-netdev` arg, not
         its id) leaves the filter-dump binding intact
+      * the default-ON / opt-out decision precedence (`_resolve_pcap_decision`,
+        the helper cmd_start drives): --no-pcap > --pcap > FF-feature-set > off
+        — an FF-render feature set captures by default, --no-pcap suppresses it
+        even on FF, a non-FF boot stays off, and --pcap force-enables any boot;
+        each on/off decision is cross-checked against the composed cmdline
       * serial-web serves the raw .pcap (application/vnd.tcpdump.pcap,
         attachment) byte-identically, and /api/wire returns a stable envelope
         (decode_available bool + pcap_url) whether or not the wire decoder
@@ -1116,10 +1121,12 @@ def run_pcap_argv_check():
     import importlib.util, tempfile, os as _os, struct, urllib.request, json as _json
     import http.server, socketserver, threading
 
-    # ── start --pcap advertised + parses ──────────────────────────────────────
+    # ── start --pcap / --no-pcap advertised + parse ───────────────────────────
     _, raw, _ = _h("start", "--help")
     check("start --pcap advertised in --help",
           "--pcap" in raw, "flag missing from start --help")
+    check("start --no-pcap advertised in --help",
+          "--no-pcap" in raw, "opt-out flag missing from start --help")
 
     # ── filter-dump arg composes correctly through build_qemu_cmd ──────────────
     aq_path = Path(__file__).resolve().parent / "astryx_qemu.py"
@@ -1159,6 +1166,81 @@ def run_pcap_argv_check():
     except StopIteration:
         check("filter-dump -object present", False,
               "no -object in composed cmdline")
+
+    # ── pcap default-ON / opt-out decision + cmdline composition ───────────────
+    # Lock down the precedence introduced by tools/pcap-default-ff:
+    #   --no-pcap > --pcap > FF-feature-set > off.  We drive the SAME decision
+    #   helper cmd_start uses (`_resolve_pcap_decision`), then — for the on/off
+    #   cases — replicate cmd_start's filter-dump injection and feed it through
+    #   build_qemu_cmd to confirm the -object lands (or doesn't) and stays
+    #   ordered after -netdev, exactly as the live `start` path does.
+    qh_spec = importlib.util.spec_from_file_location("qh_pcap_smoke", HARNESS)
+    qh = importlib.util.module_from_spec(qh_spec)
+    qh_spec.loader.exec_module(qh)
+    resolve = qh._resolve_pcap_decision
+
+    def _compose_has_filterdump(enabled):
+        """Replicate cmd_start's injection for a decision, return (has, ok_ordered)."""
+        di = tempfile.NamedTemporaryFile(suffix=".img", delete=False)
+        di.write(b"\0" * 4096); di.close()
+        try:
+            ex = []
+            if enabled:
+                ex = ["-object",
+                      f"filter-dump,id=netdump,netdev=net0,file=/x/harness/s.pcap"]
+            c = aq.build_qemu_cmd("", di.name, "/x/s.log", mode="test",
+                                  ovmf_code="/x/code.fd", ovmf_vars="/x/vars",
+                                  esp_dir="/x/esp", qmp_sock="/x/q.sock",
+                                  kvm=False, extra_args=ex)
+            has = any(a == "-object" and "filter-dump" in c[i + 1]
+                      for i, a in enumerate(c[:-1]))
+            ok_order = True
+            if has:
+                ndi = next(i for i, a in enumerate(c) if a == "-netdev")
+                oi = next(i for i, a in enumerate(c)
+                          if a == "-object" and "filter-dump" in c[i + 1])
+                ok_order = ndi < oi and "netdev=net0" in c[oi + 1]
+            return has, ok_order
+        finally:
+            try:
+                _os.unlink(di.name)
+            except OSError:
+                pass
+
+    # 1) firefox-test-core (no flags) -> ON by default ("ff-default"), -object lands.
+    en, rs = resolve(["firefox-test-core"], False, False)
+    has, ordered = _compose_has_filterdump(en)
+    check("FF-render boot defaults pcap ON",
+          en is True and rs == "ff-default", f"enabled={en} reason={rs}")
+    check("FF-default cmdline carries filter-dump after -netdev",
+          has and ordered, f"has={has} ordered={ordered}")
+
+    # 2) firefox-test-core --no-pcap -> OFF ("no-pcap-optout"), NO -object.
+    en, rs = resolve(["firefox-test-core"], False, True)
+    has, _o = _compose_has_filterdump(en)
+    check("FF boot + --no-pcap disables pcap",
+          en is False and rs == "no-pcap-optout", f"enabled={en} reason={rs}")
+    check("--no-pcap cmdline has NO filter-dump", not has, f"has={has}")
+
+    # 3) test-mode (non-FF, no flags) -> OFF by default ("non-ff-default"), NO -object.
+    en, rs = resolve(["test-mode"], False, False)
+    has, _o = _compose_has_filterdump(en)
+    check("non-FF boot defaults pcap OFF",
+          en is False and rs == "non-ff-default", f"enabled={en} reason={rs}")
+    check("non-FF-default cmdline has NO filter-dump", not has, f"has={has}")
+
+    # 4) test-mode --pcap -> force ON ("pcap-forced"), -object lands.
+    en, rs = resolve(["test-mode"], True, False)
+    has, ordered = _compose_has_filterdump(en)
+    check("non-FF boot + --pcap forces pcap ON",
+          en is True and rs == "pcap-forced", f"enabled={en} reason={rs}")
+    check("--pcap-on-non-FF cmdline carries filter-dump after -netdev",
+          has and ordered, f"has={has} ordered={ordered}")
+
+    # 5) precedence: --no-pcap beats an explicit --pcap on an FF boot.
+    en, rs = resolve(["firefox-test-core"], True, True)
+    check("--no-pcap wins over --pcap (precedence)",
+          en is False and rs == "no-pcap-optout", f"enabled={en} reason={rs}")
 
     try:
         _os.unlink(data_img)
