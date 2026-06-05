@@ -5642,9 +5642,35 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
               "blk-trace", "blk-trace-flush",
               # log-ring: out-of-band drain / burst-flush of the cheap log ring.
               "log-ring", "log-ring-flush",
+              # virtio-blk wait-amplification: drain the per-round-trip wait
+              # histogram / zero the ring.  See drivers::virtio_blk +
+              # op_virtio_wait_hist.
+              "virtio-wait-hist", "virtio-wait-reset",
               # INFRA-3 record/replay: zero-arg introspection.
               "record-status"):
         return {"op": op}
+    if op == "virtio-wait-mode":
+        # Flip the wait strategy at runtime: adaptive (poll + peer-aware yield) |
+        # legacy (unconditional schedule()-yield).  Absent → query-only.  Carried
+        # as {"mode": ...} to match the kernel op's extract_field("mode") parse.
+        if not rest:
+            return {"op": "virtio-wait-mode"}
+        val = rest[0].strip().lower()
+        if val not in ("adaptive", "legacy", "true", "false", "1", "0"):
+            raise ValueError(
+                f"virtio-wait-mode: unrecognised value '{rest[0]}' "
+                "(expected adaptive|legacy)"
+            )
+        return {"op": "virtio-wait-mode", "mode": val}
+    if op == "virtio-wait-spin":
+        # Set the adaptive-spin budget (iterations) before blocking.
+        if not rest:
+            raise ValueError("virtio-wait-spin requires an integer iteration count")
+        try:
+            n = int(rest[0])
+        except ValueError:
+            raise ValueError(f"virtio-wait-spin: '{rest[0]}' is not an integer")
+        return {"op": "virtio-wait-spin", "n": str(n)}
     if op == "log-ring-enable":
         # Toggle the fast-path ring sink (A/B control). Optional on/off; absent
         # → query-only. Carried as {"on": "on"|"off"} to match the kernel op's
@@ -11384,6 +11410,15 @@ def main():
         # See net::ipver + op_net_ipver.  Also exposed as the `net-ipver`
         # top-level subcommand below.
         "net-ipver",
+        # virtio-blk wait-amplification telemetry + runtime A/B controls.
+        # `virtio-wait-hist` drains the per-round-trip wait histogram (µs
+        # buckets × mean run-queue depth, median/p99); `virtio-wait-mode
+        # block|yield` flips the wait strategy on a live build (no rebuild);
+        # `virtio-wait-spin <n>` tunes the adaptive-spin budget;
+        # `virtio-wait-reset` zeroes the ring for a clean A/B window.
+        # See drivers::virtio_blk + op_virtio_wait_*.
+        "virtio-wait-hist", "virtio-wait-mode", "virtio-wait-spin",
+        "virtio-wait-reset",
     ])
     p_kdb.add_argument("args", nargs="*",
                         help="Op-specific positional args: "
