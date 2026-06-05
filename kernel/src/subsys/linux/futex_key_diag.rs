@@ -101,21 +101,28 @@ pub fn emit_wake_empty(
     // We extract only what we need to print so the lock release happens
     // before any serial I/O.
     let (bucket_present, same_pid_keys, nearest, same_page) = {
+        use crate::syscall::FutexKey;
         let waiters = crate::syscall::FUTEX_WAITERS.lock();
 
-        let bucket_present = if waiters.contains_key(&(pid, uaddr)) { 1u8 } else { 0u8 };
+        // This diagnostic reasons about the same-process (PRIVATE-key) cluster
+        // of futex words; a process-SHARED futex is keyed by backing-object
+        // identity, not by `(pid, uaddr)`, so it has no contiguous virtual
+        // range to scan and is excluded here.
+        let bucket_present =
+            if waiters.contains_key(&FutexKey::Private(pid, uaddr)) { 1u8 } else { 0u8 };
 
         // Page-aligned bounds for the same_page scan.  4 KiB page,
         // 0-extended (uaddr is a u64 user-VA; arithmetic stays in u64).
         let page_lo = uaddr & !0xFFFu64;
         let page_hi = page_lo.saturating_add(0x1000);
 
-        // Walk this `pid`'s slice of FUTEX_WAITERS only — BTreeMap is keyed
-        // lexicographically on `(pid, uaddr)`, so a half-open range from
-        // `(pid, 0)` to `(pid+1, 0)` walks exactly this pid's entries in
-        // ascending uaddr order.
-        let lo = (pid, 0u64);
-        let hi = (pid.saturating_add(1), 0u64);
+        // Walk this `pid`'s PRIVATE slice of FUTEX_WAITERS only — the FutexKey
+        // ordering sorts the `Private` variant lexicographically on
+        // `(pid, uaddr)` (and before any `Shared` key), so a half-open range
+        // from `Private(pid, 0)` to `Private(pid+1, 0)` walks exactly this
+        // pid's private entries in ascending uaddr order.
+        let lo = FutexKey::Private(pid, 0u64);
+        let hi = FutexKey::Private(pid.saturating_add(1), 0u64);
 
         let mut same_pid_keys: u64 = 0;
         let mut same_page: Vec<(u64, usize)> = Vec::with_capacity(SAME_PAGE_CAP);
@@ -123,7 +130,11 @@ pub fn emit_wake_empty(
         // distance.  Cheap: linear pass with bounded inserts.
         let mut nearest: Vec<(u64, usize)> = Vec::with_capacity(NEAREST_CAP * 2);
 
-        for (&(_p, wuaddr), tids) in waiters.range(lo..hi) {
+        for (k, tids) in waiters.range(lo..hi) {
+            let wuaddr = match k {
+                FutexKey::Private(_p, u) => *u,
+                FutexKey::Shared { .. } => continue,
+            };
             same_pid_keys = same_pid_keys.saturating_add(1);
 
             if wuaddr >= page_lo && wuaddr < page_hi && same_page.len() < SAME_PAGE_CAP {

@@ -9293,11 +9293,30 @@ pub fn sys_futex_linux(
 ) -> i64 {
     const FUTEX_PRIVATE_FLAG:   u64 = 0x80;
     const FUTEX_CLOCK_REALTIME: u64 = 0x100;
-    let _ = FUTEX_PRIVATE_FLAG; // documented for clarity; no behavioural use
 
     let op = futex_op & 0x7F; // Strip FUTEX_PRIVATE_FLAG and FUTEX_CLOCK_REALTIME
     let abs_realtime = (futex_op & FUTEX_CLOCK_REALTIME) != 0;
     let pid = crate::proc::current_pid_lockless();
+
+    // Per `futex(2)` (FUTEX_PRIVATE_FLAG): when the caller sets the private
+    // flag, the futex is process-private and keyed by `(mm, uaddr)` — the
+    // fast path.  When it is clear, a futex word that lives on a `MAP_SHARED`
+    // file/`memfd`-backed page is process-shared and must be keyed by its
+    // backing-object identity so two processes mapping the same object at
+    // different virtual addresses rendezvous (`resolve_futex_key`).  Mozilla's
+    // cross-process screenshot rendezvous (`CrossProcessSemaphore` on a
+    // `memfd` `MAP_SHARED` page) takes exactly this shared path: it does NOT
+    // set FUTEX_PRIVATE_FLAG, the content process WAITs and the parent WAKEs
+    // (or vice versa), and only a shared key lets the wake reach the waiter.
+    let force_private = (futex_op & FUTEX_PRIVATE_FLAG) != 0;
+    // The rendezvous key for ops that operate on `uaddr` (WAIT/WAKE/REQUEUE
+    // source/WAKE_OP first wake).  Resolved once here (one VMA lookup on the
+    // shared path; a no-op on the private fast path), then reused by every
+    // bucket operation below so waiter and waker land in the same bucket.
+    let key = crate::syscall::resolve_futex_key(pid, uaddr, force_private);
+    // The destination key for the two-address ops (REQUEUE dst, WAKE_OP second
+    // wake) is resolved lazily in those branches — `uaddr2` is unused (and may
+    // be a non-pointer count) for the single-address ops.
 
     // Read the timespec at `timeout_ptr` (NULL means "no timeout") and convert
     // it to a *relative* nanosecond duration that the rest of the handler can
@@ -9481,7 +9500,7 @@ pub fn sys_futex_linux(
             // transitioned to Blocked, so it cannot return `woken=0` while
             // we're still mid-registration.
             match crate::syscall::futex_wait_check_and_enqueue(
-                pid, uaddr, val, tid, wake_tick,
+                key, val, tid, wake_tick,
                 || unsafe { crate::syscall::user_read_u32(uaddr) },
             ) {
                 crate::syscall::FutexWaitOutcome::Enqueued     => {}
@@ -9551,13 +9570,18 @@ pub fn sys_futex_linux(
                 // requeue insert).  `take`-style: remove it so the map does
                 // not leak across this waiter's lifetime.
                 let dest = crate::syscall::FUTEX_REQUEUE_DEST.lock().remove(&(pid, tid));
-                let key = (pid, dest.unwrap_or(uaddr));
-                if let Some(list) = waiters.get_mut(&key) {
+                // The bucket the waiter actually sits in: the requeue
+                // destination key if a requeue moved it, else the key it
+                // originally enqueued under.  Both are full FutexKeys, so a
+                // shared-futex waiter (or one requeued onto a shared bucket) is
+                // scanned in the right bucket.
+                let cleanup_key = dest.unwrap_or(key);
+                if let Some(list) = waiters.get_mut(&cleanup_key) {
                     let before = list.len();
                     list.retain(|&t| t != tid);
                     if list.len() < before { timed_out = true; } // still in list → timed out; already gone → woken
                     if list.is_empty() {
-                        waiters.remove(&key);
+                        waiters.remove(&cleanup_key);
                     }
                 }
             }
@@ -9600,14 +9624,14 @@ pub fn sys_futex_linux(
 
             let tids_to_wake: Vec<u64> = {
                 let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
-                if let Some(list) = waiters.get_mut(&(pid, uaddr)) {
+                if let Some(list) = waiters.get_mut(&key) {
                     let mut result = Vec::new();
                     while !list.is_empty() && woken < max_wake {
                         result.push(list.remove(0));
                         woken += 1;
                     }
                     if list.is_empty() {
-                        waiters.remove(&(pid, uaddr));
+                        waiters.remove(&key);
                     }
                     result
                 } else {
@@ -9737,18 +9761,33 @@ pub fn sys_futex_linux(
             // the per-wake scan nor the serial; `test-mode` keeps the full
             // behaviour so Test 238 (which asserts FUTEX_WAKE_GHOST_COUNT
             // advances) is unchanged.
+            // The composite-cond-var GHOST cluster is a same-address-space
+            // (PRIVATE-key) phenomenon — sibling pthread_cond_t fields within
+            // one process's enclosing object.  A SHARED-key wake has no
+            // `(pid, uaddr)` cluster to scan (its bucket identity is a backing
+            // object, not a contiguous virtual range), so the diagnostic only
+            // runs on the private path.
             #[cfg(any(feature = "firefox-test-trace", feature = "test-mode"))]
             if woken == 0 && (op == 1 || op == 10) {
+                if let crate::syscall::FutexKey::Private(_, _) = key {
                 const FUTEX_GHOST_CLUSTER: u64 = 256;
                 let cluster_lo = uaddr & !(FUTEX_GHOST_CLUSTER - 1);
                 let cluster_hi = cluster_lo + FUTEX_GHOST_CLUSTER;
                 let waiters = crate::syscall::FUTEX_WAITERS.lock();
-                // BTreeMap::range over the half-open [(pid, cluster_lo),
-                // (pid, cluster_hi)) interval lets us find sibling uaddrs
-                // in O(log n + k) without scanning the whole table.
-                for (&(wpid, wuaddr), tids) in waiters
-                    .range((pid, cluster_lo)..(pid, cluster_hi))
+                // BTreeMap::range over the half-open [Private(pid, cluster_lo),
+                // Private(pid, cluster_hi)) interval lets us find sibling
+                // uaddrs in O(log n + k) without scanning the whole table.
+                // Private(pid, _) keys for one pid are contiguous in the
+                // FutexKey ordering (the Private variant sorts before Shared
+                // and lexicographically by (pid, uaddr)).
+                use crate::syscall::FutexKey;
+                for (k, tids) in waiters
+                    .range(FutexKey::Private(pid, cluster_lo)..FutexKey::Private(pid, cluster_hi))
                 {
+                    let (wpid, wuaddr) = match k {
+                        FutexKey::Private(p, u) => (*p, *u),
+                        FutexKey::Shared { .. } => continue,
+                    };
                     if wpid != pid || wuaddr == uaddr { continue; }
                     if let Some(&first_tid) = tids.first() {
                         crate::serial_println!(
@@ -9764,6 +9803,7 @@ pub fn sys_futex_linux(
                         );
                     }
                 }
+                } // close: if let Private(_, _) = key
             }
 
             // History-mode GHOST correlation — observe-only.  This bumps
@@ -9831,12 +9871,20 @@ pub fn sys_futex_linux(
             let mut woken = 0u64;
             let mut requeued = 0u64;
 
+            // Destination rendezvous key for uaddr2.  Resolved with the same
+            // `force_private` as the source — both addresses live in the same
+            // address space and the private flag applies to the whole op.  A
+            // requeue may legitimately move waiters between a private source
+            // bucket and a shared destination bucket (or vice versa); keying
+            // both correctly is what lets the requeued waiter be found later.
+            let key2 = crate::syscall::resolve_futex_key(pid, uaddr2, force_private);
+
             let tids_to_wake: Vec<u64>;
             let tids_to_requeue: Vec<u64>;
 
             {
                 let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
-                let src = waiters.remove(&(pid, uaddr)).unwrap_or_default();
+                let src = waiters.remove(&key).unwrap_or_default();
                 let mut wake_list = Vec::new();
                 let mut requeue_list = Vec::new();
                 for tid in src {
@@ -9848,21 +9896,21 @@ pub fn sys_futex_linux(
                         requeued += 1;
                     }
                 }
-                // Requeue surviving waiters to uaddr2.
+                // Requeue surviving waiters to uaddr2's key.
                 if !requeue_list.is_empty() {
-                    waiters.entry((pid, uaddr2)).or_insert_with(Vec::new).extend(requeue_list.iter());
+                    waiters.entry(key2).or_insert_with(Vec::new).extend(requeue_list.iter());
                     // Record each requeued TID's new destination key so its
                     // own FUTEX_WAIT post-`schedule()` cleanup scans the
-                    // bucket it now sits in `(pid, uaddr2)` rather than its
-                    // original `(pid, uaddr)`.  Per `futex(2)`, requeue
-                    // updates the waiter's queue key to uaddr2; without this a
-                    // timeout-after-requeue would leave an orphan in the
-                    // uaddr2 bucket and misreport ETIMEDOUT as success.  Taken
-                    // while still holding FUTEX_WAITERS to keep the single
-                    // FUTEX_WAITERS → FUTEX_REQUEUE_DEST lock order.
+                    // bucket it now sits in (`key2`) rather than its original
+                    // `key`.  Per `futex(2)`, requeue updates the waiter's
+                    // queue key to uaddr2; without this a timeout-after-requeue
+                    // would leave an orphan in the destination bucket and
+                    // misreport ETIMEDOUT as success.  Taken while still
+                    // holding FUTEX_WAITERS to keep the single FUTEX_WAITERS →
+                    // FUTEX_REQUEUE_DEST lock order.
                     let mut dest = crate::syscall::FUTEX_REQUEUE_DEST.lock();
                     for &tid in &requeue_list {
-                        dest.insert((pid, tid), uaddr2);
+                        dest.insert((pid, tid), key2);
                     }
                 }
                 tids_to_wake = wake_list;
@@ -9927,6 +9975,13 @@ pub fn sys_futex_linux(
                 oparg = 1i32 << (oparg & 31);
             }
 
+            // Resolve uaddr2's rendezvous key BEFORE taking FUTEX_WAITERS:
+            // `resolve_futex_key` acquires PROCESS_TABLE, and the established
+            // lock order is FUTEX_WAITERS → THREAD_TABLE (never FUTEX_WAITERS →
+            // PROCESS_TABLE).  Resolving up front keeps the critical section
+            // below lock-clean.
+            let key2 = crate::syscall::resolve_futex_key(pid, uaddr2, force_private);
+
             // ── Atomic modify of *uaddr2, capturing the old value ─────────
             // Read-modify-write is serialised by the FUTEX_WAITERS lock held
             // across the whole op: every wake-class futex op takes it, so no
@@ -9957,13 +10012,13 @@ pub fn sys_futex_linux(
             // ── Wake up to `val` waiters on uaddr ─────────────────────────
             let max_wake1 = if val == 0 { u64::MAX } else { val };
             let mut tids_to_wake: Vec<u64> = Vec::new();
-            if let Some(list) = waiters.get_mut(&(pid, uaddr)) {
+            if let Some(list) = waiters.get_mut(&key) {
                 let mut n = 0u64;
                 while !list.is_empty() && n < max_wake1 {
                     tids_to_wake.push(list.remove(0));
                     n += 1;
                 }
-                if list.is_empty() { waiters.remove(&(pid, uaddr)); }
+                if list.is_empty() { waiters.remove(&key); }
             }
 
             // ── Evaluate CMP(oldval, cmparg); if true wake uaddr2 too ─────
@@ -9978,13 +10033,13 @@ pub fn sys_futex_linux(
             };
             if cmp_true {
                 let max_wake2 = if val2 == 0 { u64::MAX } else { val2 };
-                if let Some(list) = waiters.get_mut(&(pid, uaddr2)) {
+                if let Some(list) = waiters.get_mut(&key2) {
                     let mut n = 0u64;
                     while !list.is_empty() && n < max_wake2 {
                         tids_to_wake.push(list.remove(0));
                         n += 1;
                     }
-                    if list.is_empty() { waiters.remove(&(pid, uaddr2)); }
+                    if list.is_empty() { waiters.remove(&key2); }
                 }
             }
             drop(waiters);
