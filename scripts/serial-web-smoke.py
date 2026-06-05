@@ -190,6 +190,79 @@ def _gate_timing_checks(sw, tmp):
         srv.shutdown()
 
 
+# A `firefox-test-core` (fast default) boot: the per-write `[FF/write]`/
+# `[FF/stderr]`/`[FF/open]` diagnostic firehose is OFF, so the ONLY render-gate
+# signal is the low-frequency kernel-emitted `[GATE] <label>` milestone markers
+# (plus the functional `[EXEC] …-isForBrowser` argv line). The headless demo
+# renders a local file:// page, so there is NO TCP line (TLS / network is
+# legitimately absent). This is exactly the case PR #518's serial split created
+# a blind spot for — before the milestone markers the monitor showed "firefox
+# exec" as the deepest gate even though FF reached content-proc spawn + the
+# render handshake. This fixture proves the ladder now advances past it.
+CORE_PROFILE_SERIAL = """\
+[BOOT] AstryxOS kernel kernel_main Booting
+[HEAP GUARD] Guard pages installed
+[ACPI] Phase 5b APIC init
+[SMP] scheduler online AP online Phase 6
+[DRIVERS] virtio Phase 7
+[VFS] ext2 mounted rootfs
+[X11] Xastryx ready on /tmp/.X11-unix/X0 (fd=0)
+[FFTEST] X11 server ready
+[PROC] Created kernel process firefox-bin PID 1 TID 1
+[EXEC] pid=1 tid=1 argv="firefox-bin" "--headless" (2 of 14 args shown)
+[HB] tick=200 cpu=0 pid=1 sc=120000
+[GATE] libxul
+[HB] tick=400 cpu=0 pid=1 sc=300000
+[EXEC] pid=1 tid=9 argv="firefox-bin" "-contentproc" "-isForBrowser" (3 of 16 args shown)
+[GATE] content-procs
+[HB] tick=800 cpu=0 pid=1 sc=1600000
+[GATE] screenshot-actors
+[HB] tick=1200 cpu=0 pid=1 sc=2000000
+[GATE] drawSnapshot
+[FFTEST] /tmp/out.png present (12345 bytes) — streaming
+[FF-OUT-PNG:path=/tmp/out.png size=12345 sig_ok=true complete=true]
+[PROC] PID 1 exit_group(0)
+"""
+
+
+def _core_profile_gate_checks(sw, tmp):
+    """firefox-test-core (firehose OFF): the `[GATE]` milestone markers + the
+    functional FF-supervisor PNG line must advance the ladder PAST 'firefox
+    exec' to the deep render gates. Also exercises the OPTIONAL-skip rule: the
+    no-network file:// render emits no TCP line ('TLS / network' absent) AND the
+    fixture emits 'X11 server ready' BEFORE the 'PID 1' line ('init / userspace'
+    out of order) — neither may stall the strictly-monotone ladder."""
+    sid = "coreprofile01"
+    log = os.path.join(tmp, sid + ".serial.log")
+    with open(log, "w") as f:
+        f.write(CORE_PROFILE_SERIAL)
+    prog = sw.scan_progress(log)
+    hit = {s["label"] for s in prog["timeline"] if s["hit"]}
+    # The blind-spot fix: deepest gate is NOT stuck at 'firefox exec' (or before).
+    check("core: deepest gate past 'firefox exec'",
+          prog["gate"] not in ("firefox exec", "init / userspace", "boot"),
+          prog["gate"])
+    # PNG write is detected via the functional FF-supervisor line, the rest via
+    # the kernel `[GATE]` markers — all default-on on firefox-test-core.
+    for g in ("content procs", "screenshot-actors", "drawSnapshot", "PNG write"):
+        check(f"core: '{g}' reached on fast profile (firehose off)", g in hit,
+              sorted(hit))
+    # firefox exec must still be hit (the gate we advance PAST).
+    check("core: 'firefox exec' hit (then surpassed)", "firefox exec" in hit)
+    # Optional gates: absent/out-of-order, but the ladder still reaches PNG.
+    check("core: 'TLS / network' optional (absent on file://, not stalling)",
+          "TLS / network" not in hit and "PNG write" in hit)
+    check("core: 'init / userspace' optional-skip (X11-before-PID1, not stalling)",
+          "X11 ready" in hit and "firefox exec" in hit)
+    # Prove the firehose really is off in this fixture (no per-write mirror).
+    fire = (CORE_PROFILE_SERIAL.count("[FF/write]")
+            + CORE_PROFILE_SERIAL.count("[FF/stderr]")
+            + CORE_PROFILE_SERIAL.count("[FF/write-fd]")
+            + CORE_PROFILE_SERIAL.count("[FF/open]"))
+    check("core: firehose stayed off (0 [FF/write]/[FF/stderr]/[FF/open])",
+          fire == 0, fire)
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="serialweb-smoke-")
     sid = "smoketest1234"
@@ -270,6 +343,10 @@ def main():
     # ── per-gate TIMING: elapsed-since-launch + per-gate delta ──
     print("── per-gate timing ──")
     _gate_timing_checks(sw, tmp)
+
+    # ── firefox-test-core (fast profile, firehose OFF) gate visibility ──
+    print("── core-profile gate visibility ──")
+    _core_profile_gate_checks(sw, tmp)
 
     # ── HTTP layer end-to-end on an ephemeral port ──
     print("── HTTP endpoints ──")

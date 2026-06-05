@@ -1470,6 +1470,24 @@ pub(crate) fn sys_exec(path_ptr: u64, path_len: u64, argv_ptr: u64, envp_ptr: u6
                 pid, tid, shown, total_args
             );
         }
+
+        // Content-process spawn MILESTONE (low-frequency, DEFAULT-ON). The
+        // `[EXEC] …-isForBrowser …` argv line above is already functional and
+        // default-on, but it is a per-exec line; emit a single stable
+        // `[GATE] content-procs` the first time a `-isForBrowser` content
+        // process is launched so the fast-profile gate monitor has an
+        // unambiguous marker (the bare `isForBrowser` substring also appears in
+        // FF's cached JS, hence the dedicated kernel-emitted gate). Fires once.
+        #[cfg(feature = "firefox-test-core")]
+        {
+            use core::sync::atomic::{AtomicBool, Ordering};
+            static CONTENTPROC_GATE_SEEN: AtomicBool = AtomicBool::new(false);
+            let is_content = argv_owned.iter().any(|a| a == "-isForBrowser")
+                || argv_owned.iter().any(|a| a == "-contentproc");
+            if is_content && !CONTENTPROC_GATE_SEEN.swap(true, Ordering::Relaxed) {
+                crate::serial_println!("[GATE] content-procs");
+            }
+        }
     }
 
     // Validate it's an ELF binary (resolve_shebang guarantees this on Ok).

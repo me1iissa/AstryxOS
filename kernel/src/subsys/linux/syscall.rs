@@ -6418,12 +6418,143 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
     }
 }
 
+// ── Render-lifecycle MILESTONE markers (low-frequency, DEFAULT-ON) ──────────
+//
+// Distinct from the `[FF/stderr]`/`[FF/write]` per-write firehose above (which
+// is gated on the `*-trace` features and transcribes EVERY tracked write — one
+// PIO VM-exit per byte, ~78% of a full boot log). These milestone markers are
+// the OPPOSITE: a tiny curated substring set covering the headless-screenshot
+// render lifecycle, each emitted EXACTLY ONCE per boot (first-arrival), so the
+// total cost is a handful of serial lines for the whole run — not a firehose.
+//
+// They exist so the deep render gates are visible on the fast default profile
+// (`firefox-test-core`, diagnostic serial OFF) without re-enabling the firehose:
+// the serial monitor and perf phase taxonomy detect `screenshot-actors`,
+// `drawSnapshot`, etc. from these `[GATE] <label>` lines instead of from the
+// now-gated-off `[FF/write]` mirror.
+//
+// Each curated substring maps to one bit of `MILESTONE_SEEN`; once a bit is set
+// the marker never re-emits, so a matching string appearing thousands of times
+// in FF's IPDL traffic still produces a single line. The earlier bring-up gates
+// are emitted elsewhere: content-process spawn from the exec path
+// (`[GATE] content-procs`, next to the `[EXEC] …-isForBrowser` argv line) and
+// libxul load from the open path (`[GATE] libxul`, because the per-open
+// `[FF/open]` mirror is trace-gated). So this write-payload set only needs the
+// render-stage substrings that have no other default-on signal.
+//
+// (label, substring) — order is the bit index; keep ≤32 entries (u32 mask).
+#[cfg(feature = "firefox-test-core")]
+const MILESTONE_MARKERS: &[(&str, &[u8])] = &[
+    // screenshot-actors stage — the IPDL screenshot query/parent actors. These
+    // protocol-actor names are specific to the headless-screenshot path and do
+    // not appear in ordinary page content.
+    ("screenshot-actors", b"getDimensions"),
+    ("screenshot-actors", b"ScreenshotParent"),
+    ("screenshot-actors", b"sendQuery"),
+    // drawSnapshot / cross-process paint stage — the actual composite + draw.
+    // `drawSnapshot` and `CrossProcessPaint` are render-API-specific symbols.
+    ("drawSnapshot",      b"drawSnapshot"),
+    ("drawSnapshot",      b"CrossProcessPaint"),
+    // NOTE: the FINAL screenshot-PNG write is intentionally NOT detected here by
+    // the raw `\x89PNG` magic — Firefox writes many internal PNGs (favicons,
+    // theme/UI assets) whose payloads also start with that signature, so a
+    // magic-based `[GATE] PNG` would false-positive long before the real
+    // screenshot. The authoritative, single-per-run PNG-write signal is the FF
+    // supervisor's functional `[FFTEST] /tmp/out.png present` /
+    // `[FF-OUT-PNG:… sig_ok=true …]` lines (default-on on firefox-test-core),
+    // which the gate consumers key on for the PNG gate.
+];
+
+/// First-arrival bitmask for [`MILESTONE_MARKERS`]: bit `i` set ⇒ marker `i`
+/// has already emitted its `[GATE]` line. Lockless, default-relaxed — a benign
+/// double-emit under a 2-CPU race is harmless (the monitor takes first-arrival),
+/// and the common case (bit already set) is a single atomic load with no store.
+#[cfg(feature = "firefox-test-core")]
+static MILESTONE_SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Scan a write payload for the curated render-lifecycle milestone substrings
+/// and emit one `[GATE] <label>` line the FIRST time each is seen this boot.
+///
+/// Called from the tracked-write path on the DEFAULT (core) profile. Cheap: a
+/// bounded substring search over an already-snapshotted buffer, skipped entirely
+/// once every milestone bit is set. Never allocates, never takes a lock.
+#[cfg(feature = "firefox-test-core")]
+#[inline]
+fn emit_render_milestones(snapshot: &[u8]) {
+    use core::sync::atomic::Ordering;
+    let seen = MILESTONE_SEEN.load(Ordering::Relaxed);
+    // Fast exit once every curated marker has fired (the steady state for the
+    // vast majority of a boot's writes).
+    let all_mask: u32 = (1u32 << MILESTONE_MARKERS.len()) - 1;
+    if seen == all_mask {
+        return;
+    }
+    for (i, (label, needle)) in MILESTONE_MARKERS.iter().enumerate() {
+        let bit = 1u32 << i;
+        if seen & bit != 0 {
+            continue; // already emitted this marker
+        }
+        if !slice_contains(snapshot, needle) {
+            continue;
+        }
+        // First arrival — claim the bit and emit exactly one milestone line.
+        // fetch_or returns the PRE-update value; only the CPU that observed the
+        // bit clear emits, so a concurrent partner cannot double-print.
+        let prev = MILESTONE_SEEN.fetch_or(bit, Ordering::Relaxed);
+        if prev & bit == 0 {
+            crate::serial_println!("[GATE] {}", label);
+        }
+    }
+}
+
+/// Bounded substring search (`haystack.windows(needle.len()).any(== needle)`),
+/// kept allocation-free for the milestone hot path.
+#[cfg(feature = "firefox-test-core")]
+#[inline]
+fn slice_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 /// Linux write(fd, buf, count) — same semantics as AstryxOS write.
 pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
     let buf_ptr = buf as *const u8;
     let count = count as usize;
 
     if count == 0 { return 0; }
+
+    // Render-lifecycle MILESTONE markers (low-frequency, DEFAULT-ON on the
+    // Firefox bring-up profile). Scans the write payload for a curated set of
+    // render-stage substrings and emits ONE `[GATE] <label>` line the first
+    // time each is seen — a handful of lines for the whole boot, NOT the
+    // per-write `[FF/write]` firehose below (which stays *-trace-gated). This
+    // makes the deep render gates visible on the fast `firefox-test-core` boot
+    // (where the firehose is OFF) without paying the firehose cost.
+    //
+    // Gated on `firefox-test-core` (present in every FF profile incl. the full
+    // `firefox-test`/`*-trace` superset) so plain `test-mode` / production
+    // builds are byte-identical. The snapshot is bounded (512 B) and skipped
+    // once every milestone bit is set, so the steady-state cost is one atomic
+    // load per tracked write.
+    #[cfg(feature = "firefox-test-core")]
+    {
+        let mpid = crate::proc::current_pid_lockless();
+        if (mpid == 1 || crate::syscall::ring::is_tracked(mpid))
+            && MILESTONE_SEEN.load(core::sync::atomic::Ordering::Relaxed)
+                != (1u32 << MILESTONE_MARKERS.len()) - 1
+        {
+            let take = count.min(512);
+            // SMAP-bracketed snapshot of the user buffer — the milestone scan
+            // reads kernel memory only (Intel SDM Vol. 3A §4.6.1).
+            let snap: alloc::vec::Vec<u8> = unsafe {
+                let _g = crate::arch::x86_64::smap::UserGuard::new();
+                core::slice::from_raw_parts(buf_ptr, take).to_vec()
+            };
+            emit_render_milestones(&snap);
+        }
+    }
 
     // Diagnostic stdout/stderr mirror ([FF/stderr] / [FF/write] / [FF/write-fd]).
     // This is the single largest serial source on a Firefox boot (~78% of a
@@ -6699,6 +6830,22 @@ fn sys_open_linux_inner(pathname: u64, flags: u64, _mode: u64) -> i64 {
     #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace"))]
     if pid == 1 || crate::syscall::ring::is_tracked(pid) {
         crate::serial_println!("[FF/open] pid={} path={}", pid, path);
+    }
+    // libxul load MILESTONE (low-frequency, DEFAULT-ON). The per-open `[FF/open]`
+    // mirror above is trace-gated, so on the fast `firefox-test-core` boot the
+    // gate monitor has no default-on signal that the main shared library mapped.
+    // Emit a single `[GATE] libxul` the first time libxul is opened by a tracked
+    // process — one line per boot, not the per-open firehose.
+    #[cfg(feature = "firefox-test-core")]
+    {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        static LIBXUL_GATE_SEEN: AtomicBool = AtomicBool::new(false);
+        if (pid == 1 || crate::syscall::ring::is_tracked(pid))
+            && path.ends_with("libxul.so")
+            && !LIBXUL_GATE_SEEN.swap(true, Ordering::Relaxed)
+        {
+            crate::serial_println!("[GATE] libxul");
+        }
     }
     // Attach the resolved path string to the pending ring entry so the ring
     // dump can show what each open() / openat() actually tried to open.
