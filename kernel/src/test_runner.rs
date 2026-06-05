@@ -2781,6 +2781,17 @@ pub fn run() -> ! {
     total += 1;
     if test_294_epoll_edge_triggered_eventfd() { passed += 1; }
 
+    // ── Test 295: cross-process SHARED futex keying (memfd MAP_SHARED) ─────
+    // Two processes mapping the SAME memfd/file-backed MAP_SHARED page at
+    // DIFFERENT virtual addresses must rendezvous on a process-shared futex:
+    // a FUTEX_WAIT in process A and the matching FUTEX_WAKE in process B
+    // resolve to the SAME backing-object key and hash to the same bucket.
+    // Also pins the private fast path: a MAP_PRIVATE/anon word keys per-mm.
+    // This is the kernel side of the gecko cross-process screenshot
+    // rendezvous.  Refs: futex(2) FUTEX_PRIVATE_FLAG, memfd_create(2).
+    total += 1;
+    if test_295_crossproc_shared_futex_keying() { passed += 1; }
+
     // ── Test 283: stack-prov main-stack TOP-window argv-writer capture ──
     // GATE-A blind-spot closure (2026-05-30).  Only built when the
     // `stack-prov` diagnostic feature is on (CI smoke does not enable it);
@@ -14555,7 +14566,7 @@ fn test_futex_requeue() -> bool {
 //
 // Ref: futex(2) FUTEX_REQUEUE / FUTEX_CMP_REQUEUE (q->key = key2 invariant).
 fn test_futex_requeue_dest_tracking() -> bool {
-    use crate::syscall::{FUTEX_WAITERS, FUTEX_REQUEUE_DEST};
+    use crate::syscall::{FUTEX_WAITERS, FUTEX_REQUEUE_DEST, FutexKey};
     test_header!("futex REQUEUE destination tracking (orphan-free timeout)");
 
     // Use the CURRENT pid (the requeue syscall keys on current_pid_lockless).
@@ -14565,19 +14576,24 @@ fn test_futex_requeue_dest_tracking() -> bool {
     let uaddr2: u32 = 0;
     let a1 = &uaddr1 as *const u32 as u64;
     let a2 = &uaddr2 as *const u32 as u64;
+    // These are stack-local words (private anonymous mapping), so the futex
+    // keys are the PRIVATE shape `Private(pid, uaddr)` — the same keys the
+    // requeue syscall path resolves for them.
+    let k1 = FutexKey::Private(pid, a1);
+    let k2 = FutexKey::Private(pid, a2);
     // Synthetic waiter TID that collides with no live thread.
     let fake_tid: u64 = 0xF00D_5678;
 
     // Clean slate for these keys (a prior failed run could leak).
     {
         let mut w = FUTEX_WAITERS.lock();
-        w.remove(&(pid, a1));
-        w.remove(&(pid, a2));
+        w.remove(&k1);
+        w.remove(&k2);
         FUTEX_REQUEUE_DEST.lock().remove(&(pid, fake_tid));
     }
 
     // Step 1: register a fake waiter on uaddr1.
-    FUTEX_WAITERS.lock().entry((pid, a1))
+    FUTEX_WAITERS.lock().entry(k1)
         .or_insert_with(alloc::vec::Vec::new).push(fake_tid);
     test_println!("  registered fake waiter tid={:#x} on uaddr1", fake_tid);
 
@@ -14587,19 +14603,19 @@ fn test_futex_requeue_dest_tracking() -> bool {
             202, a1, 3, /*val=wake*/0, /*val2=requeue*/1, a2, 0)
     };
     if r != 0 {
-        FUTEX_WAITERS.lock().remove(&(pid, a1));
-        FUTEX_WAITERS.lock().remove(&(pid, a2));
+        FUTEX_WAITERS.lock().remove(&k1);
+        FUTEX_WAITERS.lock().remove(&k2);
         FUTEX_REQUEUE_DEST.lock().remove(&(pid, fake_tid));
         test_fail!("futex_requeue_dest", "REQUEUE returned {} (expected 0 woken)", r);
         return false;
     }
 
     // Step 3a: the waiter must have MOVED — gone from uaddr1, present at uaddr2.
-    let in_a1 = FUTEX_WAITERS.lock().get(&(pid, a1)).map(|v| v.contains(&fake_tid)).unwrap_or(false);
-    let in_a2 = FUTEX_WAITERS.lock().get(&(pid, a2)).map(|v| v.contains(&fake_tid)).unwrap_or(false);
+    let in_a1 = FUTEX_WAITERS.lock().get(&k1).map(|v| v.contains(&fake_tid)).unwrap_or(false);
+    let in_a2 = FUTEX_WAITERS.lock().get(&k2).map(|v| v.contains(&fake_tid)).unwrap_or(false);
     if in_a1 || !in_a2 {
-        FUTEX_WAITERS.lock().remove(&(pid, a1));
-        FUTEX_WAITERS.lock().remove(&(pid, a2));
+        FUTEX_WAITERS.lock().remove(&k1);
+        FUTEX_WAITERS.lock().remove(&k2);
         FUTEX_REQUEUE_DEST.lock().remove(&(pid, fake_tid));
         test_fail!("futex_requeue_dest",
             "after requeue: in_uaddr1={} in_uaddr2={} (expected false/true)", in_a1, in_a2);
@@ -14607,26 +14623,27 @@ fn test_futex_requeue_dest_tracking() -> bool {
     }
     test_println!("  waiter moved uaddr1→uaddr2 ✓");
 
-    // Step 3b: the destination must be recorded so the WAIT cleanup scans uaddr2.
+    // Step 3b: the destination key must be recorded so the WAIT cleanup scans
+    // uaddr2's bucket (now a full FutexKey, not a bare uaddr).
     let recorded = FUTEX_REQUEUE_DEST.lock().get(&(pid, fake_tid)).copied();
-    if recorded != Some(a2) {
-        FUTEX_WAITERS.lock().remove(&(pid, a2));
+    if recorded != Some(k2) {
+        FUTEX_WAITERS.lock().remove(&k2);
         FUTEX_REQUEUE_DEST.lock().remove(&(pid, fake_tid));
         test_fail!("futex_requeue_dest",
-            "FUTEX_REQUEUE_DEST[(pid,tid)]={:#x?} (expected {:#x})", recorded, a2);
+            "FUTEX_REQUEUE_DEST[(pid,tid)]={:#x?} (expected {:#x?})", recorded, k2);
         return false;
     }
     test_println!("  destination recorded: (pid,tid)→uaddr2 ✓ (gap #3)");
 
     // Step 4: replay the WAIT-branch timeout cleanup's bucket selection EXACTLY:
-    //   dest = FUTEX_REQUEUE_DEST.remove((pid,tid)); key = dest.unwrap_or(uaddr1)
+    //   dest = FUTEX_REQUEUE_DEST.remove((pid,tid)); key = dest.unwrap_or(k1)
     // and remove the TID from that bucket.  Pre-fix this used uaddr1 and would
     // leave the orphan in uaddr2 + misreport timeout as a wake.
     let timed_out;
     {
         let mut waiters = FUTEX_WAITERS.lock();
         let dest = FUTEX_REQUEUE_DEST.lock().remove(&(pid, fake_tid));
-        let key = (pid, dest.unwrap_or(a1));
+        let key = dest.unwrap_or(k1);
         if let Some(list) = waiters.get_mut(&key) {
             let before = list.len();
             list.retain(|&t| t != fake_tid);
@@ -14637,19 +14654,19 @@ fn test_futex_requeue_dest_tracking() -> bool {
         }
     }
     if !timed_out {
-        FUTEX_WAITERS.lock().remove(&(pid, a2));
+        FUTEX_WAITERS.lock().remove(&k2);
         test_fail!("futex_requeue_dest",
             "cleanup scanned the wrong bucket — orphan would survive (timed_out=false)");
         return false;
     }
 
     // Step 5: no orphan left anywhere, dest map cleaned.
-    let leak_a1 = FUTEX_WAITERS.lock().contains_key(&(pid, a1));
-    let leak_a2 = FUTEX_WAITERS.lock().contains_key(&(pid, a2));
+    let leak_a1 = FUTEX_WAITERS.lock().contains_key(&k1);
+    let leak_a2 = FUTEX_WAITERS.lock().contains_key(&k2);
     let leak_dest = FUTEX_REQUEUE_DEST.lock().contains_key(&(pid, fake_tid));
     if leak_a1 || leak_a2 || leak_dest {
-        FUTEX_WAITERS.lock().remove(&(pid, a1));
-        FUTEX_WAITERS.lock().remove(&(pid, a2));
+        FUTEX_WAITERS.lock().remove(&k1);
+        FUTEX_WAITERS.lock().remove(&k2);
         FUTEX_REQUEUE_DEST.lock().remove(&(pid, fake_tid));
         test_fail!("futex_requeue_dest",
             "leak after cleanup: a1={} a2={} dest={}", leak_a1, leak_a2, leak_dest);
@@ -29813,7 +29830,7 @@ fn test_access_w_ok_readonly() -> bool {
 fn test_cleartid_futex_wake() -> bool {
     test_header!("CLONE_CHILD_CLEARTID exit-time futex wake (key match + dequeue)");
 
-    use crate::syscall::{FUTEX_WAITERS, futex_wake_for_exit};
+    use crate::syscall::{FUTEX_WAITERS, FutexKey, futex_wake_for_exit};
 
     // Pick a synthetic (pid, uaddr) pair that no real thread is using.
     // The high tid value 0xFEED_1234 ensures we do not collide with any
@@ -29822,11 +29839,15 @@ fn test_cleartid_futex_wake() -> bool {
     let fake_pid: u64    = 0xDEAD_BEEF;
     let fake_uaddr: u64  = 0x7EFF_FF44_9990; // shape matches glibc joinstate addr
     let fake_tid: u64    = 0xFEED_1234;
+    // The CLEARTID word is a private thread-local; fake_pid has no VmSpace, so
+    // futex_wake_for_exit resolves it to `Private(fake_pid, fake_uaddr)` — the
+    // same key the test registers under.
+    let fk = FutexKey::Private(fake_pid, fake_uaddr);
 
     // Step 1: register a fake waiter.
     {
         let mut waiters = FUTEX_WAITERS.lock();
-        waiters.entry((fake_pid, fake_uaddr))
+        waiters.entry(fk)
             .or_insert_with(alloc::vec::Vec::new)
             .push(fake_tid);
     }
@@ -29839,13 +29860,13 @@ fn test_cleartid_futex_wake() -> bool {
     // Step 3: the (pid, uaddr) key must be gone (last waiter popped).
     {
         let waiters = FUTEX_WAITERS.lock();
-        if waiters.contains_key(&(fake_pid, fake_uaddr)) {
+        if waiters.contains_key(&fk) {
             drop(waiters);
             test_fail!("cleartid_futex_wake",
                 "FUTEX_WAITERS still contains (pid={:#x}, uaddr={:#x}) after wake",
                 fake_pid, fake_uaddr);
             // Best-effort cleanup so a failed run does not leak the entry.
-            FUTEX_WAITERS.lock().remove(&(fake_pid, fake_uaddr));
+            FUTEX_WAITERS.lock().remove(&fk);
             return false;
         }
     }
@@ -29855,11 +29876,11 @@ fn test_cleartid_futex_wake() -> bool {
     futex_wake_for_exit(fake_pid, fake_uaddr, 1);
     {
         let waiters = FUTEX_WAITERS.lock();
-        if waiters.contains_key(&(fake_pid, fake_uaddr)) {
+        if waiters.contains_key(&fk) {
             drop(waiters);
             test_fail!("cleartid_futex_wake",
                 "wake-on-missing-key fabricated a stale entry");
-            FUTEX_WAITERS.lock().remove(&(fake_pid, fake_uaddr));
+            FUTEX_WAITERS.lock().remove(&fk);
             return false;
         }
     }
@@ -29868,7 +29889,7 @@ fn test_cleartid_futex_wake() -> bool {
     // Step 5: queue with multiple waiters — wake 1 leaves the rest.
     {
         let mut waiters = FUTEX_WAITERS.lock();
-        let v = waiters.entry((fake_pid, fake_uaddr))
+        let v = waiters.entry(fk)
             .or_insert_with(alloc::vec::Vec::new);
         v.push(0xAAA1);
         v.push(0xAAA2);
@@ -29877,11 +29898,11 @@ fn test_cleartid_futex_wake() -> bool {
     futex_wake_for_exit(fake_pid, fake_uaddr, 1);
     let remaining = {
         let waiters = FUTEX_WAITERS.lock();
-        waiters.get(&(fake_pid, fake_uaddr)).map(|v| v.len()).unwrap_or(0)
+        waiters.get(&fk).map(|v| v.len()).unwrap_or(0)
     };
     if remaining != 2 {
         // Cleanup before failing.
-        FUTEX_WAITERS.lock().remove(&(fake_pid, fake_uaddr));
+        FUTEX_WAITERS.lock().remove(&fk);
         test_fail!("cleartid_futex_wake",
             "expected 2 remaining waiters, got {}", remaining);
         return false;
@@ -29891,10 +29912,10 @@ fn test_cleartid_futex_wake() -> bool {
     futex_wake_for_exit(fake_pid, fake_uaddr, u64::MAX);
     let leftover = {
         let waiters = FUTEX_WAITERS.lock();
-        waiters.contains_key(&(fake_pid, fake_uaddr))
+        waiters.contains_key(&fk)
     };
     if leftover {
-        FUTEX_WAITERS.lock().remove(&(fake_pid, fake_uaddr));
+        FUTEX_WAITERS.lock().remove(&fk);
         test_fail!("cleartid_futex_wake", "drain wake left a stale key");
         return false;
     }
@@ -29926,7 +29947,7 @@ fn test_cleartid_write_demand_faults() -> bool {
     test_header!("CLONE_CHILD_CLEARTID write lands on non-present / COW page");
 
     use crate::mm::vmm::{read_pte, map_page_in, PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER};
-    use crate::syscall::{write_u32_to_user_pub, futex_wake_for_exit, FUTEX_WAITERS};
+    use crate::syscall::{write_u32_to_user_pub, futex_wake_for_exit, FUTEX_WAITERS, FutexKey};
     const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
 
     let test_pid: u64 = 9971;
@@ -30007,7 +30028,7 @@ fn test_cleartid_write_demand_faults() -> bool {
             old
         };
         if let Some(space) = old { crate::proc::free_vm_space(space); }
-        FUTEX_WAITERS.lock().remove(&(test_pid, 0)); // belt-and-braces
+        FUTEX_WAITERS.lock().remove(&FutexKey::Private(test_pid, 0)); // belt-and-braces
     };
 
     // ── Part A: write to a word on a NOT-PRESENT page ───────────────────────
@@ -30025,7 +30046,7 @@ fn test_cleartid_write_demand_faults() -> bool {
     let waiter_tid: u64 = 0x5151;
     {
         let mut waiters = FUTEX_WAITERS.lock();
-        waiters.entry((test_pid, addr_a)).or_insert_with(alloc::vec::Vec::new).push(waiter_tid);
+        waiters.entry(FutexKey::Private(test_pid, addr_a)).or_insert_with(alloc::vec::Vec::new).push(waiter_tid);
     }
 
     write_u32_to_user_pub(cr3, addr_a, 0);
@@ -30033,7 +30054,7 @@ fn test_cleartid_write_demand_faults() -> bool {
     // (a) PTE must now be present + writable + user.
     let pte_a = read_pte(cr3, addr_a);
     if pte_a & PAGE_PRESENT == 0 || pte_a & PAGE_WRITABLE == 0 || pte_a & PAGE_USER == 0 {
-        FUTEX_WAITERS.lock().remove(&(test_pid, addr_a));
+        FUTEX_WAITERS.lock().remove(&FutexKey::Private(test_pid, addr_a));
         teardown();
         test_fail!("cleartid_demand", "addr_a PTE not present/writable/user after write: {:#x}", pte_a);
         return false;
@@ -30042,7 +30063,7 @@ fn test_cleartid_write_demand_faults() -> bool {
     let phys_a = (pte_a & crate::mm::vmm::ADDR_MASK) + (addr_a & 0xFFF);
     let read_back_a = unsafe { core::ptr::read_volatile((PHYS_OFF + phys_a) as *const u32) };
     if read_back_a != 0 {
-        FUTEX_WAITERS.lock().remove(&(test_pid, addr_a));
+        FUTEX_WAITERS.lock().remove(&FutexKey::Private(test_pid, addr_a));
         teardown();
         test_fail!("cleartid_demand", "addr_a read-back {:#x}, expected 0", read_back_a);
         return false;
@@ -30053,10 +30074,10 @@ fn test_cleartid_write_demand_faults() -> bool {
     futex_wake_for_exit(test_pid, addr_a, 1);
     let still_parked = {
         let waiters = FUTEX_WAITERS.lock();
-        waiters.get(&(test_pid, addr_a)).map(|v| v.contains(&waiter_tid)).unwrap_or(false)
+        waiters.get(&FutexKey::Private(test_pid, addr_a)).map(|v| v.contains(&waiter_tid)).unwrap_or(false)
     };
     if still_parked {
-        FUTEX_WAITERS.lock().remove(&(test_pid, addr_a));
+        FUTEX_WAITERS.lock().remove(&FutexKey::Private(test_pid, addr_a));
         teardown();
         test_fail!("cleartid_demand", "waiter still parked after write+wake (lost wakeup)");
         return false;
@@ -34318,7 +34339,7 @@ fn test_rt_sigaction_flags_mask_roundtrip() -> bool {
 // the waiter sees `*uaddr != val` under the lock and returns EAGAIN.
 fn test_futex_wait_atomic_check_then_queue() -> bool {
     use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-    use crate::syscall::{FUTEX_WAITERS, FutexWaitOutcome, futex_wait_check_and_enqueue,
+    use crate::syscall::{FUTEX_WAITERS, FutexKey, FutexWaitOutcome, futex_wait_check_and_enqueue,
                           futex_wake_for_exit};
 
     test_header!("FUTEX_WAIT atomic check-then-queue (lost-wakeup race) — issue: pre-PR");
@@ -34328,6 +34349,9 @@ fn test_futex_wait_atomic_check_then_queue() -> bool {
     // never dereferences it because we pass an in-kernel `read_u32` closure.
     const SYNTH_PID: u64    = 0xCAFE_BABE_DEAD_BEEF;
     const SYNTH_UADDR: u64  = 0x7EFF_F123_0000_0000;
+    // SYNTH_PID has no VmSpace, so both the enqueue and the wake resolve this
+    // word to the PRIVATE key — capture it once so the test keys consistently.
+    const SYNTH_KEY: FutexKey = FutexKey::Private(SYNTH_PID, SYNTH_UADDR);
     const EXPECTED_VAL: u32 = 0x4243_4445; // arbitrary sentinel
 
     // Shared kernel-mode "futex word" the closure reads under the lock.
@@ -34347,7 +34371,7 @@ fn test_futex_wait_atomic_check_then_queue() -> bool {
     WAKES_POSTED.store(0, Ordering::SeqCst);
     STOP_WAKERS.store(0, Ordering::SeqCst);
     // Remove any stale queue entry from a prior test run.
-    FUTEX_WAITERS.lock().remove(&(SYNTH_PID, SYNTH_UADDR));
+    FUTEX_WAITERS.lock().remove(&SYNTH_KEY);
 
     const N_WAITERS: u32 = 4;
     const N_WAKERS:  u32 = 2;
@@ -34362,7 +34386,7 @@ fn test_futex_wait_atomic_check_then_queue() -> bool {
         // helper returns ValueMismatch we count as "done" (a benign
         // EAGAIN — wake-side beat us via the FUTEX_WORD update).
         let outcome = futex_wait_check_and_enqueue(
-            SYNTH_PID, SYNTH_UADDR, EXPECTED_VAL as u64, tid,
+            SYNTH_KEY, EXPECTED_VAL as u64, tid,
             u64::MAX, // indefinite
             || Some(FUTEX_WORD.load(Ordering::SeqCst)),
         );
@@ -34374,10 +34398,10 @@ fn test_futex_wait_atomic_check_then_queue() -> bool {
                 // Cleanup: dequeue self if still on the list (timeout path).
                 {
                     let mut waiters = FUTEX_WAITERS.lock();
-                    if let Some(list) = waiters.get_mut(&(SYNTH_PID, SYNTH_UADDR)) {
+                    if let Some(list) = waiters.get_mut(&SYNTH_KEY) {
                         list.retain(|&t| t != tid);
                         if list.is_empty() {
-                            waiters.remove(&(SYNTH_PID, SYNTH_UADDR));
+                            waiters.remove(&SYNTH_KEY);
                         }
                     }
                 }
@@ -34474,7 +34498,7 @@ fn test_futex_wait_atomic_check_then_queue() -> bool {
     // WAITERS_DONE would be < N_WAITERS.
     if !all_done || done < N_WAITERS {
         // Best-effort cleanup so a failed run does not leak the queue entry.
-        FUTEX_WAITERS.lock().remove(&(SYNTH_PID, SYNTH_UADDR));
+        FUTEX_WAITERS.lock().remove(&SYNTH_KEY);
         test_fail!("futex_wait_atomic_check_then_queue",
             "only {}/{} waiters completed (lost wakeup — {} still parked)",
             done, N_WAITERS, N_WAITERS - done);
@@ -34484,10 +34508,10 @@ fn test_futex_wait_atomic_check_then_queue() -> bool {
     // Invariant 2: FUTEX_WAITERS must not contain a stale entry for our key.
     let leftover = {
         let waiters = FUTEX_WAITERS.lock();
-        waiters.get(&(SYNTH_PID, SYNTH_UADDR)).map(|v| v.len()).unwrap_or(0)
+        waiters.get(&SYNTH_KEY).map(|v| v.len()).unwrap_or(0)
     };
     if leftover != 0 {
-        FUTEX_WAITERS.lock().remove(&(SYNTH_PID, SYNTH_UADDR));
+        FUTEX_WAITERS.lock().remove(&SYNTH_KEY);
         test_fail!("futex_wait_atomic_check_then_queue",
             "{} waiter(s) left on FUTEX_WAITERS after drain (leaked queue entry)",
             leftover);
@@ -34517,13 +34541,15 @@ fn test_futex_wait_atomic_check_then_queue() -> bool {
 // 32 bits of `val`; when the low 32 bits differ it must report ValueMismatch.
 fn test_futex_wait_val_is_32bit() -> bool {
     use core::sync::atomic::{AtomicU32, Ordering};
-    use crate::syscall::{FUTEX_WAITERS, FutexWaitOutcome, futex_wait_check_and_enqueue};
+    use crate::syscall::{FUTEX_WAITERS, FutexKey, FutexWaitOutcome, futex_wait_check_and_enqueue};
 
     test_header!("FUTEX_WAIT 32-bit value compare (int sign-extension safe)");
 
     // Synthetic key, well clear of any live mapping.
     const SYNTH_PID:   u64 = 0xF00D_F00D_0000_0001;
     const SYNTH_UADDR: u64 = 0x7EFF_F222_0000_0000;
+    // No VmSpace for this synthetic pid → PRIVATE key.
+    const SYNTH_KEY: FutexKey = FutexKey::Private(SYNTH_PID, SYNTH_UADDR);
     // Futex word with bit 31 (musl waiters bit) set — exactly the value
     // captured live at the Firefox main-thread mutex storm (_m_lock = waiters
     // | EBUSY).
@@ -34536,14 +34562,14 @@ fn test_futex_wait_val_is_32bit() -> bool {
     FUTEX_WORD.store(WORD, Ordering::SeqCst);
 
     // Clean any stale queue entry from a prior run.
-    FUTEX_WAITERS.lock().remove(&(SYNTH_PID, SYNTH_UADDR));
+    FUTEX_WAITERS.lock().remove(&SYNTH_KEY);
 
     let tid = crate::proc::current_tid();
 
     // Case 1: low-32 bits agree, high bits all-ones (sign-extended int).
     // MUST Enqueue (pre-fix this returned ValueMismatch → the storm).
     let outcome = futex_wait_check_and_enqueue(
-        SYNTH_PID, SYNTH_UADDR, VAL_SIGN_EXTENDED, tid,
+        SYNTH_KEY, VAL_SIGN_EXTENDED, tid,
         u64::MAX,
         || Some(FUTEX_WORD.load(Ordering::SeqCst)),
     );
@@ -34553,9 +34579,9 @@ fn test_futex_wait_val_is_32bit() -> bool {
     // that so the scheduler keeps running us, and clear the queue entry.
     {
         let mut waiters = FUTEX_WAITERS.lock();
-        if let Some(list) = waiters.get_mut(&(SYNTH_PID, SYNTH_UADDR)) {
+        if let Some(list) = waiters.get_mut(&SYNTH_KEY) {
             list.retain(|&t| t != tid);
-            if list.is_empty() { waiters.remove(&(SYNTH_PID, SYNTH_UADDR)); }
+            if list.is_empty() { waiters.remove(&SYNTH_KEY); }
         }
     }
     {
@@ -34579,16 +34605,16 @@ fn test_futex_wait_val_is_32bit() -> bool {
     // the comparison legitimately exists to produce; the fix must not mask it).
     let bad_val: u64 = 0xFFFF_FFFF_8000_0011; // low32 = 0x8000_0011 != WORD
     let outcome2 = futex_wait_check_and_enqueue(
-        SYNTH_PID, SYNTH_UADDR, bad_val, tid,
+        SYNTH_KEY, bad_val, tid,
         u64::MAX,
         || Some(FUTEX_WORD.load(Ordering::SeqCst)),
     );
     // Defensive cleanup if it somehow enqueued.
     {
         let mut waiters = FUTEX_WAITERS.lock();
-        if let Some(list) = waiters.get_mut(&(SYNTH_PID, SYNTH_UADDR)) {
+        if let Some(list) = waiters.get_mut(&SYNTH_KEY) {
             list.retain(|&t| t != tid);
-            if list.is_empty() { waiters.remove(&(SYNTH_PID, SYNTH_UADDR)); }
+            if list.is_empty() { waiters.remove(&SYNTH_KEY); }
         }
         let mut threads = crate::proc::THREAD_TABLE.lock();
         if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
@@ -38423,7 +38449,7 @@ fn test_exec_from_shared_vm_child() -> bool {
 /// the supplied exit code.
 fn test_exit_group_wakes_siblings() -> bool {
     use crate::proc::{PROCESS_TABLE, THREAD_TABLE, ThreadState, ProcessState};
-    use crate::syscall::FUTEX_WAITERS;
+    use crate::syscall::{FUTEX_WAITERS, FutexKey};
 
     test_header!("exit_group wakes parked sibling threads (W59)");
 
@@ -38473,9 +38499,10 @@ fn test_exit_group_wakes_siblings() -> bool {
     // Park the two siblings on FUTEX_WAIT(uaddr_A) and FUTEX_WAIT(uaddr_B).
     {
         let mut waiters = FUTEX_WAITERS.lock();
-        waiters.entry((target_pid, UADDR_A)).or_insert_with(alloc::vec::Vec::new)
+        // Synthetic uaddrs are unmapped, so the drain path keys them PRIVATE.
+        waiters.entry(FutexKey::Private(target_pid, UADDR_A)).or_insert_with(alloc::vec::Vec::new)
                .push(sib_a_tid);
-        waiters.entry((target_pid, UADDR_B)).or_insert_with(alloc::vec::Vec::new)
+        waiters.entry(FutexKey::Private(target_pid, UADDR_B)).or_insert_with(alloc::vec::Vec::new)
                .push(sib_b_tid);
     }
     test_println!("  target PID {}: main TID {}, siblings TID {}/{} parked on futex",
@@ -38529,7 +38556,7 @@ fn test_exit_group_wakes_siblings() -> bool {
     {
         let waiters = FUTEX_WAITERS.lock();
         let lingering: alloc::vec::Vec<_> = waiters.keys()
-            .filter(|&&(p, _)| p == target_pid).copied().collect();
+            .filter(|k| k.private_pid() == Some(target_pid)).copied().collect();
         if !lingering.is_empty() {
             test_fail!("exit_group_wakes_siblings",
                 "FUTEX_WAITERS still contains entries for dead pid: {:?}",
@@ -42604,7 +42631,7 @@ fn test_238_futex_wake_ghost_cluster() -> bool {
     {
         let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
         waiters
-            .entry((pid, uaddr_sibling))
+            .entry(crate::syscall::FutexKey::Private(pid, uaddr_sibling))
             .or_insert_with(alloc::vec::Vec::new)
             .push(fake_tid);
     }
@@ -42613,7 +42640,7 @@ fn test_238_futex_wake_ghost_cluster() -> bool {
     {
         let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
         waiters
-            .entry((pid, uaddr_far))
+            .entry(crate::syscall::FutexKey::Private(pid, uaddr_far))
             .or_insert_with(alloc::vec::Vec::new)
             .push(fake_tid.wrapping_add(1));
     }
@@ -42634,8 +42661,8 @@ fn test_238_futex_wake_ghost_cluster() -> bool {
     // regardless of pass/fail (subsequent tests must not see fake_tid).
     {
         let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
-        let _ = waiters.remove(&(pid, uaddr_sibling));
-        let _ = waiters.remove(&(pid, uaddr_far));
+        let _ = waiters.remove(&crate::syscall::FutexKey::Private(pid, uaddr_sibling));
+        let _ = waiters.remove(&crate::syscall::FutexKey::Private(pid, uaddr_far));
     }
 
     let post = crate::subsys::linux::syscall::FUTEX_WAKE_GHOST_COUNT
@@ -42732,7 +42759,7 @@ fn test_239_futex_cluster_wake_compensation() -> bool {
     let install = |uaddr: u64, tid: u64| {
         let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
         waiters
-            .entry((pid, uaddr))
+            .entry(crate::syscall::FutexKey::Private(pid, uaddr))
             .or_insert_with(alloc::vec::Vec::new)
             .push(tid);
     };
@@ -42740,7 +42767,7 @@ fn test_239_futex_cluster_wake_compensation() -> bool {
     // doesn't see fake TIDs in subsequent tests.
     let drain = |uaddr: u64| {
         let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
-        let _ = waiters.remove(&(pid, uaddr));
+        let _ = waiters.remove(&crate::syscall::FutexKey::Private(pid, uaddr));
     };
 
     // ── (a) Positive control: canonical-offset wake ─────────────────────
@@ -45737,8 +45764,8 @@ fn test_268_exit_group_clears_sibling_cleartid() -> bool {
     }
     {
         let waiters = crate::syscall::FUTEX_WAITERS.lock();
-        if waiters.contains_key(&(SYNTH_PID, UADDR_A))
-        || waiters.contains_key(&(SYNTH_PID, UADDR_B))
+        if waiters.contains_key(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_A))
+        || waiters.contains_key(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_B))
         {
             test_fail!("test268",
                 "synthetic FUTEX_WAITERS keys already present — test \
@@ -45830,11 +45857,11 @@ fn test_268_exit_group_clears_sibling_cleartid() -> bool {
         let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
         let mut v = alloc::vec::Vec::new();
         v.push(SYNTH_WAITER);
-        waiters.insert((SYNTH_PID, UADDR_A), v);
+        waiters.insert(crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_A), v);
         // A second key with NO waiters parked — proves the helper does
         // not leak per-(pid,uaddr) entries when the wake list is empty
         // (the `futex_wake_for_exit` no-op branch).
-        waiters.insert((SYNTH_PID, UADDR_B), alloc::vec::Vec::new());
+        waiters.insert(crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_B), alloc::vec::Vec::new());
     }
 
     // Phase 2: exercise the helper.
@@ -45851,8 +45878,8 @@ fn test_268_exit_group_clears_sibling_cleartid() -> bool {
         let pa = find(SYNTH_SIB_A);
         let pb = find(SYNTH_SIB_B);
         let pw = find(SYNTH_WAITER);
-        let wa = waiters.contains_key(&(SYNTH_PID, UADDR_A));
-        let wb = waiters.contains_key(&(SYNTH_PID, UADDR_B));
+        let wa = waiters.contains_key(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_A));
+        let wb = waiters.contains_key(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_B));
         let ws = pw.map(|(_, _, _, s)| s);
         (pa, pb, pw, wa, wb, ws)
     };
@@ -45866,8 +45893,8 @@ fn test_268_exit_group_clears_sibling_cleartid() -> bool {
     }
     {
         let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
-        waiters.remove(&(SYNTH_PID, UADDR_A));
-        waiters.remove(&(SYNTH_PID, UADDR_B));
+        waiters.remove(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_A));
+        waiters.remove(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_B));
     }
 
     if sched_was_active { crate::sched::enable(); }
@@ -46036,8 +46063,8 @@ fn test_269_sigkill_clears_sibling_cleartid() -> bool {
     }
     {
         let waiters = crate::syscall::FUTEX_WAITERS.lock();
-        if waiters.contains_key(&(SYNTH_PID, UADDR_A))
-        || waiters.contains_key(&(SYNTH_PID, UADDR_B))
+        if waiters.contains_key(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_A))
+        || waiters.contains_key(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_B))
         {
             test_fail!("test269",
                 "synthetic FUTEX_WAITERS keys already present — test \
@@ -46100,11 +46127,11 @@ fn test_269_sigkill_clears_sibling_cleartid() -> bool {
         let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
         let mut v = alloc::vec::Vec::new();
         v.push(SYNTH_WAITER);
-        waiters.insert((SYNTH_PID, UADDR_A), v);
+        waiters.insert(crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_A), v);
         // Empty-list key: proves the no-op wake path also removes the
         // key (mirrors Test 268; redundant validation that the helper
         // contract holds across two synthetic groups).
-        waiters.insert((SYNTH_PID, UADDR_B), alloc::vec::Vec::new());
+        waiters.insert(crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_B), alloc::vec::Vec::new());
     }
 
     // Exercise: this is the EXACT call the lethal-signal path now makes
@@ -46122,8 +46149,8 @@ fn test_269_sigkill_clears_sibling_cleartid() -> bool {
         let pa = find(SYNTH_SIB_A);
         let pb = find(SYNTH_SIB_B);
         let pw = find(SYNTH_WAITER);
-        let wa = waiters.contains_key(&(SYNTH_PID, UADDR_A));
-        let wb = waiters.contains_key(&(SYNTH_PID, UADDR_B));
+        let wa = waiters.contains_key(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_A));
+        let wb = waiters.contains_key(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_B));
         let ws = pw.map(|(_, _, _, s)| s);
         (pa, pb, pw, wa, wb, ws)
     };
@@ -46137,8 +46164,8 @@ fn test_269_sigkill_clears_sibling_cleartid() -> bool {
     }
     {
         let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
-        waiters.remove(&(SYNTH_PID, UADDR_A));
-        waiters.remove(&(SYNTH_PID, UADDR_B));
+        waiters.remove(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_A));
+        waiters.remove(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_B));
     }
 
     if sched_was_active { crate::sched::enable(); }
@@ -49053,6 +49080,271 @@ fn test_294_epoll_edge_triggered_eventfd() -> bool {
 
     if ok {
         test_pass!("epoll EPOLLET edge-trigger on a level-ready eventfd (Test 294)");
+    }
+    ok
+}
+
+// ── Test 295: cross-process SHARED futex keying (memfd MAP_SHARED) ───────────
+//
+// Per futex(2) (FUTEX_PRIVATE_FLAG): a process-SHARED futex names a backing
+// object, not a virtual address.  Two processes that map the same file/memfd
+// MAP_SHARED page at DIFFERENT virtual addresses must rendezvous — a
+// FUTEX_WAIT in process A and the matching FUTEX_WAKE in process B operate on
+// the same logical futex word, so the kernel must key both by the backing
+// object identity (mount_idx, inode, byte offset), NOT by (pid, uaddr).  This
+// is the gecko cross-process screenshot-rendezvous case (a CrossProcessSemaphore
+// on a memfd MAP_SHARED page: content process waits, parent wakes).
+//
+// The test builds two synthetic processes whose VmSpaces each contain a
+// MAP_SHARED VMA backed by the SAME (mount_idx, inode) at DIFFERENT virtual
+// addresses, then asserts:
+//   (a) resolve_futex_key produces the SAME Shared key for both — the
+//       cross-process rendezvous identity;
+//   (b) a waiter enqueued under process A's resolved key is found and woken by
+//       a FUTEX_WAKE issued by process B (proving the cross-process bucket
+//       hit, the actual screenshot-IPC unblock);
+//   (c) the PRIVATE fast path is preserved — a MAP_PRIVATE/anon word and a
+//       FUTEX_PRIVATE_FLAG'd shared word both resolve to per-(pid, uaddr)
+//       Private keys, so two processes at the same VA do NOT collide.
+//
+// Refs: futex(2) FUTEX_PRIVATE_FLAG, memfd_create(2),
+//       POSIX.1-2017 §pthread_mutexattr_getpshared.
+fn test_295_crossproc_shared_futex_keying() -> bool {
+    use crate::syscall::{FUTEX_WAITERS, FutexKey, resolve_futex_key};
+    use crate::mm::vma::{VmArea, VmBacking, VmSpace,
+                         MAP_SHARED, MAP_PRIVATE, MAP_ANONYMOUS,
+                         PROT_READ, PROT_WRITE};
+
+    test_header!("cross-process SHARED futex keying (memfd MAP_SHARED rendezvous, Test 295)");
+
+    // Synthetic pids / shared backing identity.  The (mount_idx, inode) below
+    // names a single backing object the two processes both map.
+    const PID_A: u64 = 0xC0DE_2950;
+    const PID_B: u64 = 0xC0DE_2951;
+    const SHARED_MOUNT: usize = 0x295;
+    const SHARED_INODE: u64   = 0x2950_BEEF;
+    // The two processes map the shared object at DIFFERENT virtual addresses —
+    // the crux of the test.  Both place a 1-page MAP_SHARED VMA over the same
+    // file offset 0 so the futex word at +0x40 in each maps the same backing
+    // byte.
+    const VA_A: u64 = 0x5000_0000;   // process A's mapping VA
+    const VA_B: u64 = 0x6800_0000;   // process B's mapping VA (different!)
+    const WORD_OFF: u64 = 0x40;      // futex word offset within the shared page
+    // A private anonymous word both processes happen to place at the SAME VA —
+    // used to prove private futexes do NOT collide across processes.
+    const PRIV_VA: u64 = 0x7000_0000;
+    let fake_tid: u64 = 0x2950_F00D;
+
+    // Build a VmSpace with a MAP_SHARED file-backed VMA over [base, base+page)
+    // plus a MAP_PRIVATE anon VMA at PRIV_VA.  Returns the new cr3 or None.
+    fn build_space(base: u64) -> Option<(VmSpace, u64)> {
+        let mut vm = VmSpace::new_user()?;
+        let cr3 = vm.cr3;
+        // MAP_SHARED file/memfd-backed page.
+        vm.insert_vma(VmArea {
+            base,
+            length: 0x1000,
+            prot: PROT_READ | PROT_WRITE,
+            flags: MAP_SHARED,
+            backing: VmBacking::File {
+                mount_idx: SHARED_MOUNT,
+                inode: SHARED_INODE,
+                offset: 0,
+                elf_load_delta: 0,
+            },
+            name: "[test-shm]",
+        }).ok()?;
+        // MAP_PRIVATE anonymous page at the fixed PRIV_VA.
+        vm.insert_vma(VmArea {
+            base: PRIV_VA,
+            length: 0x1000,
+            prot: PROT_READ | PROT_WRITE,
+            flags: MAP_PRIVATE | MAP_ANONYMOUS,
+            backing: VmBacking::Anonymous,
+            name: "[test-priv]",
+        }).ok()?;
+        Some((vm, cr3))
+    }
+
+    // Register a synthetic process holding `vm` under `pid` so the resolver's
+    // PROCESS_TABLE VMA lookup succeeds.
+    fn register_proc(pid: u64, cr3: u64, vm: VmSpace) {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        procs.push(crate::proc::Process {
+            pid,
+            parent_pid: 0,
+            name: { let mut n = [0u8; 64]; n[..4].copy_from_slice(b"shm!"); n },
+            state: crate::proc::ProcessState::Active,
+            cr3,
+            threads: alloc::vec::Vec::new(),
+            exit_code: 0,
+            file_descriptors: alloc::vec::Vec::new(),
+            cwd: alloc::string::String::from("/"),
+            uid: 0, gid: 0, euid: 0, egid: 0,
+            pgid: pid as u32, sid: pid as u32,
+            no_new_privs: false,
+            cap_permitted: !0u64, cap_effective: !0u64,
+            rlimits_soft: [u64::MAX; 16],
+            supplementary_groups: alloc::vec::Vec::new(),
+            umask: 0o022,
+            vm_space: Some(vm),
+            signal_state: Some(crate::signal::SignalState::new()),
+            linux_abi: true,
+            handle_table: None,
+            subsystem: crate::win32::SubsystemType::Linux,
+            token_id: None,
+            exe_path: None,
+            epoll_sets: alloc::vec::Vec::new(),
+            auxv: alloc::vec::Vec::new(),
+            envp: alloc::vec::Vec::new(),
+            alarm_deadline_ticks: 0,
+            alarm_interval_ticks: 0,
+            pdeath_signal: 0,
+        });
+    }
+
+    // Tear down a synthetic process and reclaim its VmSpace.
+    fn teardown_proc(pid: u64) {
+        let old = {
+            let mut procs = crate::proc::PROCESS_TABLE.lock();
+            let old = procs.iter_mut().find(|p| p.pid == pid)
+                .and_then(|p| p.vm_space.take());
+            procs.retain(|p| p.pid != pid);
+            old
+        };
+        if let Some(space) = old { crate::proc::free_vm_space(space); }
+    }
+
+    // ── Setup ────────────────────────────────────────────────────────────
+    let (vm_a, cr3_a) = match build_space(VA_A) {
+        Some(x) => x,
+        None => { test_fail!("crossproc_futex", "build_space A OOM"); return false; }
+    };
+    let (vm_b, cr3_b) = match build_space(VA_B) {
+        Some(x) => x,
+        None => {
+            crate::proc::free_vm_space(vm_a);
+            test_fail!("crossproc_futex", "build_space B OOM");
+            return false;
+        }
+    };
+    register_proc(PID_A, cr3_a, vm_a);
+    register_proc(PID_B, cr3_b, vm_b);
+
+    // Clean any stale keys from a prior run.
+    {
+        let mut w = FUTEX_WAITERS.lock();
+        w.remove(&FutexKey::Shared { mount_idx: SHARED_MOUNT, inode: SHARED_INODE, byte_off: WORD_OFF });
+        w.remove(&FutexKey::Private(PID_A, PRIV_VA));
+        w.remove(&FutexKey::Private(PID_B, PRIV_VA));
+    }
+
+    let mut ok = true;
+
+    // ── (a) Same shared key for both processes despite different VAs ───────
+    let key_a = resolve_futex_key(PID_A, VA_A + WORD_OFF, /*force_private=*/false);
+    let key_b = resolve_futex_key(PID_B, VA_B + WORD_OFF, /*force_private=*/false);
+    let expected = FutexKey::Shared {
+        mount_idx: SHARED_MOUNT, inode: SHARED_INODE, byte_off: WORD_OFF,
+    };
+    if key_a != expected {
+        test_fail!("crossproc_futex",
+            "process A shared word resolved to {:#x?} (expected {:#x?})", key_a, expected);
+        ok = false;
+    }
+    if key_b != expected {
+        test_fail!("crossproc_futex",
+            "process B shared word resolved to {:#x?} (expected {:#x?})", key_b, expected);
+        ok = false;
+    }
+    if key_a != key_b {
+        test_fail!("crossproc_futex",
+            "cross-process keys DIFFER: A={:#x?} B={:#x?} (different VAs must rendezvous)",
+            key_a, key_b);
+        ok = false;
+    }
+    if ok {
+        test_println!("  (a) procA@{:#x} and procB@{:#x} → SAME shared key {:#x?} ✓",
+            VA_A + WORD_OFF, VA_B + WORD_OFF, key_a);
+    }
+
+    // ── (b) Cross-process rendezvous: WAIT under A's key, WAKE under B ─────
+    // Enqueue a synthetic waiter under process A's resolved shared key.
+    {
+        let mut w = FUTEX_WAITERS.lock();
+        w.entry(key_a).or_insert_with(alloc::vec::Vec::new).push(fake_tid);
+    }
+    // Issue a FUTEX_WAKE the way process B's syscall path would: resolve B's
+    // key and drain its bucket.  Because the keys are equal, B finds A's
+    // waiter — the wake reaches across the process boundary.
+    let woken = {
+        let mut w = FUTEX_WAITERS.lock();
+        let mut n = 0u64;
+        if let Some(list) = w.get_mut(&key_b) {
+            while let Some(_t) = list.pop() { n += 1; }
+            if list.is_empty() { w.remove(&key_b); }
+        }
+        n
+    };
+    if woken != 1 {
+        test_fail!("crossproc_futex",
+            "WAKE under process B woke {} waiters (expected 1) — cross-proc bucket miss",
+            woken);
+        ok = false;
+    } else {
+        test_println!("  (b) WAIT(procA key) woken by WAKE(procB key): woken=1 ✓");
+    }
+    // Belt-and-braces: the shared bucket must now be empty.
+    {
+        let w = FUTEX_WAITERS.lock();
+        if w.contains_key(&expected) {
+            drop(w);
+            test_fail!("crossproc_futex", "shared bucket leaked after cross-proc wake");
+            FUTEX_WAITERS.lock().remove(&expected);
+            ok = false;
+        }
+    }
+
+    // ── (c) Private fast path preserved (no cross-process collision) ───────
+    // Both processes have a MAP_PRIVATE word at the SAME VA; their keys MUST
+    // differ (per-mm), and a FUTEX_PRIVATE_FLAG'd shared word must also stay
+    // private.
+    let priv_a = resolve_futex_key(PID_A, PRIV_VA, false);
+    let priv_b = resolve_futex_key(PID_B, PRIV_VA, false);
+    if priv_a != FutexKey::Private(PID_A, PRIV_VA) {
+        test_fail!("crossproc_futex", "private word A resolved to {:#x?} (expected Private)", priv_a);
+        ok = false;
+    }
+    if priv_a == priv_b {
+        test_fail!("crossproc_futex",
+            "two processes' private words at the same VA collided: {:#x?} — fast path broken",
+            priv_a);
+        ok = false;
+    }
+    // FUTEX_PRIVATE_FLAG forces the shared word to a private key even though
+    // its VMA is MAP_SHARED (per futex(2): the flag selects the private shape).
+    let forced = resolve_futex_key(PID_A, VA_A + WORD_OFF, /*force_private=*/true);
+    if forced != FutexKey::Private(PID_A, VA_A + WORD_OFF) {
+        test_fail!("crossproc_futex",
+            "FUTEX_PRIVATE_FLAG over MAP_SHARED resolved to {:#x?} (expected Private)", forced);
+        ok = false;
+    }
+    if ok {
+        test_println!("  (c) private words key per-(pid,uaddr); PRIVATE_FLAG forces private ✓");
+    }
+
+    // ── Teardown ──────────────────────────────────────────────────────────
+    {
+        let mut w = FUTEX_WAITERS.lock();
+        w.remove(&expected);
+        w.remove(&FutexKey::Private(PID_A, PRIV_VA));
+        w.remove(&FutexKey::Private(PID_B, PRIV_VA));
+    }
+    teardown_proc(PID_A);
+    teardown_proc(PID_B);
+
+    if ok {
+        test_pass!("cross-process SHARED futex keying (memfd MAP_SHARED rendezvous, Test 295)");
     }
     ok
 }

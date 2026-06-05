@@ -2590,9 +2590,18 @@ fn op_thread_park_audit(req: &str, out: &mut String) {
         alloc::collections::BTreeMap::new();
     let futex_busy = match try_lock_brief(&crate::syscall::FUTEX_WAITERS) {
         Some(waiters) => {
-            for ((pid_k, uaddr), tids) in waiters.iter() {
+            use crate::syscall::FutexKey;
+            for (k, tids) in waiters.iter() {
+                // Map the key to the diagnostic `(pid, uaddr)` pair the JSON
+                // shape expects.  A process-SHARED futex has no single owning
+                // pid; surface it as `(u64::MAX, byte_off)` so the reverse
+                // lookup still records the waiter without inventing a pid.
+                let (pid_k, uaddr) = match k {
+                    FutexKey::Private(p, u) => (*p, *u),
+                    FutexKey::Shared { byte_off, .. } => (u64::MAX, *byte_off),
+                };
                 for tid in tids {
-                    tid_to_futex.insert(*tid, (*pid_k, *uaddr));
+                    tid_to_futex.insert(*tid, (pid_k, uaddr));
                 }
             }
             false
@@ -3510,7 +3519,16 @@ fn op_cond_autopsy(req: &str, out: &mut String) {
     let mut waiter_rows: Vec<WaiterRow> = Vec::new();
     match try_lock_brief(&crate::syscall::FUTEX_WAITERS) {
         Some(w) => {
-            for (&(wpid, wuaddr), tids) in w.range((pid, lo)..=(pid, hi)) {
+            use crate::syscall::FutexKey;
+            // Scan the same-process PRIVATE-key cluster around `addr`.  A
+            // process-SHARED futex is keyed by backing-object identity, not by
+            // `(pid, uaddr)`, so it does not appear in this virtual-address
+            // window.
+            for (k, tids) in w.range(FutexKey::Private(pid, lo)..=FutexKey::Private(pid, hi)) {
+                let (wpid, wuaddr) = match k {
+                    FutexKey::Private(p, u) => (*p, *u),
+                    FutexKey::Shared { .. } => continue,
+                };
                 if wpid != pid { continue; }
                 if tids.is_empty() { continue; }
                 for &tid in tids.iter() {
