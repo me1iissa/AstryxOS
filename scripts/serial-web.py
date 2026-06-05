@@ -13,6 +13,16 @@ serial logs (read-only; safe alongside live boots).
                               proxy/IO bytes+IOPS/net, plus per-pid breakdown
   GET /api/blkmap?sid=&grid=N JSON: data.img block-map histogram built from
                               feature-gated [BLK] op/lba/len trace lines
+  GET /api/screenshots?sid=   JSON: metadata for BOTH base64 PNG streams a
+                              firefox-test/test-mode boot emits —
+                              {vga:{present,complete,chunks,total,w,h,…}, ff:{…}}
+  GET /api/screenshot?sid=&kind=vga|ff
+                              image/png: the decoded screenshot. kind=vga is the
+                              VGA framebuffer ([SCREENSHOT-B64:…], Test 198);
+                              kind=ff is Firefox's render (/tmp/out.png,
+                              [FF-OUT-PNG-B64:…]). Partial/in-progress streams
+                              serve best-effort (200 + X-Screenshot-Complete:
+                              false); absent/invalid streams return a JSON 404.
 
   python3 scripts/serial-web.py [--port 8088] [--host 0.0.0.0]
 
@@ -435,6 +445,212 @@ def scan_blkmap(path, size, grid):
     }
 
 
+# ── screenshot streams: decode the base64 PNG the boot emits over serial ──────
+#
+# A firefox-test / test-mode boot emits TWO DISTINCT chunked base64 PNG streams.
+# Both share the same wire shape (0-based index N, total M, base64 payload) but
+# carry DIFFERENT images — the UI must label them unambiguously:
+#
+#   VGA framebuffer (Test 198) — the guest's console/GUI screen (the QEMU VGA
+#   framebuffer), 800x450 RGBA in practice:
+#       [SCREENSHOT-B64:N/M] <base64 chunk>
+#       ...
+#       [SCREENSHOT-B64-END]
+#
+#   Firefox render (/tmp/out.png) — Firefox's actual off-screen rendered page,
+#   emitted after FF exits (the DEMO GOAL output), DISTINCT from the framebuffer.
+#   Preceded by a header line carrying the guest-side byte size:
+#       [FF-OUT-PNG:path=/tmp/out.png size=<N> sig_ok=<bool>]
+#       [FF-OUT-PNG-B64:N/M] <base64 chunk>
+#       ...
+#       [FF-OUT-PNG-END]
+#
+# Decode (identical to qemu-harness.py read-png / read-ff-png): collect the
+# chunks in index order, concatenate the base64, decode (RFC 4648 §4), and the
+# result is a PNG (8-byte magic 89 50 4E 47 0D 0A 1A 0A, W3C PNG §5.2 / ISO
+# 15948). PARTIAL / in-progress streams are decoded best-effort: we keep the
+# leading contiguous run of chunks (0,1,2,… until the first gap), pad the
+# concatenated base64 to a multiple of 4, and decode what is present — so a
+# truncated stream still yields a (partial) PNG the browser can render the top
+# of, rather than a 500.
+#
+# Two image "kinds" the endpoints accept: kind=vga (the framebuffer) and
+# kind=ff (the Firefox render). Read-only, like every other endpoint.
+
+PNG_SIGNATURE = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+
+_SHOT_KINDS = {
+    "vga": {
+        "label":  "VGA framebuffer (Test 198)",
+        "source": "QEMU VGA framebuffer — the guest console/GUI screen",
+        # header is optional for the VGA stream (no size line); chunk + end only
+        "header_re": None,
+        "chunk_re": re.compile(r"\[SCREENSHOT-B64:(\d+)/(\d+)\]\s+([A-Za-z0-9+/=]+)"),
+        "end_re":   re.compile(r"\[SCREENSHOT-B64-END\]"),
+    },
+    "ff": {
+        "label":  "Firefox render (/tmp/out.png)",
+        "source": "Firefox's off-screen rendered page, emitted after FF exits",
+        "header_re": re.compile(
+            r"\[FF-OUT-PNG:path=(\S+)\s+size=(\d+)\s+sig_ok=(true|false)"),
+        "chunk_re": re.compile(r"\[FF-OUT-PNG-B64:(\d+)/(\d+)\]\s+([A-Za-z0-9+/=]+)"),
+        "end_re":   re.compile(r"\[FF-OUT-PNG-END\]"),
+    },
+}
+
+# Cap a single screenshot decode: 25275 chunks x ~64 base64 chars ~= 1.6 MB of
+# base64 -> ~1.2 MB PNG. Bound the scan so a pathological log can't OOM us.
+SHOT_SCAN_MAX_LINES = 4_000_000
+
+
+def _png_dimensions(png_bytes):
+    """(width, height) from the IHDR chunk, or (None, None). The IHDR is the
+    first chunk after the 8-byte signature: bytes [16:20]=width, [20:24]=height,
+    big-endian uint32 (W3C PNG §11.2.2). Tolerates a partial PNG as long as the
+    first 24 bytes (signature + length + 'IHDR' + W + H) are present."""
+    if len(png_bytes) < 24 or png_bytes[:8] != PNG_SIGNATURE:
+        return None, None
+    if png_bytes[12:16] != b"IHDR":
+        return None, None
+    w = int.from_bytes(png_bytes[16:20], "big")
+    h = int.from_bytes(png_bytes[20:24], "big")
+    return w, h
+
+
+def _collect_shot_chunks(path, spec):
+    """Single forward scan of the serial log for one screenshot stream's chunks.
+    Returns (chunks, total, end_seen, header). `chunks` is {idx: b64}; `total`
+    is the announced M (None if no chunk line seen); `end_seen` is True once the
+    stream's END marker appears; `header` is {path,size,sig_ok} for the ff
+    stream (None otherwise). Best-effort and read-only — never raises."""
+    import base64  # noqa: F401  (kept local, mirrors harness convention)
+    chunks = {}
+    total = None
+    end_seen = False
+    header = None
+    header_re = spec["header_re"]
+    chunk_re = spec["chunk_re"]
+    end_re = spec["end_re"]
+    n = 0
+    try:
+        with open(path, "r", errors="replace") as f:
+            for line in f:
+                n += 1
+                if n > SHOT_SCAN_MAX_LINES:
+                    break
+                if header_re is not None and header is None:
+                    hm = header_re.search(line)
+                    if hm:
+                        header = {"path": hm.group(1),
+                                  "size": int(hm.group(2)),
+                                  "sig_ok": hm.group(3) == "true"}
+                m = chunk_re.search(line)
+                if m:
+                    idx = int(m.group(1))
+                    tot = int(m.group(2))
+                    if total is None:
+                        total = tot
+                    # Tolerate a single stream only (ignore stray lines that
+                    # announce a different M than the first chunk's).
+                    if tot == total and idx >= 0:
+                        chunks[idx] = m.group(3)
+                    continue
+                if end_re.search(line):
+                    end_seen = True
+    except OSError:
+        pass
+    return chunks, total, end_seen, header
+
+
+def _contiguous_b64(chunks, total):
+    """Concatenate the leading CONTIGUOUS run of chunks (0,1,2,… until the first
+    missing index). Returns (b64_concat, contig_count, first_gap). For a
+    complete stream contig_count == total and first_gap is None."""
+    parts = []
+    i = 0
+    limit = total if total is not None else (max(chunks) + 1 if chunks else 0)
+    while i < limit and i in chunks:
+        parts.append(chunks[i])
+        i += 1
+    first_gap = None if (total is not None and i >= total) else i
+    return "".join(parts), i, first_gap
+
+
+def _decode_shot(path, kind):
+    """Decode one screenshot stream from `path` to PNG bytes, best-effort.
+
+    Returns a dict (never raises on a malformed/partial stream):
+        present     bool   any chunk line for this kind was seen
+        complete    bool   END marker seen AND all 0..M-1 chunks present
+        chunks      int    contiguous chunks decoded (leading run)
+        total       int|None  announced M
+        png         bytes|None decoded PNG (signature-verified prefix)
+        bytes       int    decoded byte length
+        w,h         int|None  PNG dimensions from IHDR
+        sig_ok      bool   decoded bytes start with the PNG magic
+        partial_pct int|None  100*chunks/total when total known and <100
+        guest_size  int|None  ff stream's header-reported byte size
+        error       str|None  set only when present but undecodable
+    """
+    import base64
+    spec = _SHOT_KINDS[kind]
+    chunks, total, end_seen, header = _collect_shot_chunks(path, spec)
+    if not chunks:
+        return {"kind": kind, "label": spec["label"], "source": spec["source"],
+                "present": False, "complete": False, "chunks": 0,
+                "received": 0, "total": total, "first_gap": 0,
+                "end_seen": end_seen, "bytes": 0, "w": None, "h": None,
+                "sig_ok": False, "partial_pct": None, "png": None,
+                "guest_size": header["size"] if header else None,
+                "error": None}
+    b64, contig, first_gap = _contiguous_b64(chunks, total)
+    # Normalise the concatenated base64 to a decodable length. A base64 group is
+    # 4 chars -> 3 bytes; a partial/truncated tail can leave 1-3 leftover chars.
+    # A remainder of 1 is invalid (encodes 0 bytes) — drop it; a remainder of 2
+    # or 3 is a valid final group once padded with '='. So: trim to a multiple
+    # of 4, then re-pad the LAST whole-or-partial group. Concretely, drop the
+    # trailing (len % 4) chars (the torn group) so what remains is a clean
+    # multiple of 4 we can decode without raising. This loses at most the final
+    # 2 bytes of a partial PNG — the browser still renders the leading scanlines.
+    rem = len(b64) % 4
+    b64_clean = b64[:-rem] if rem else b64
+    png = b""
+    error = None
+    try:
+        png = base64.b64decode(b64_clean, validate=False)
+    except Exception as exc:  # pragma: no cover - defensive
+        error = f"base64_decode_failed: {exc}"
+        png = b""
+    sig_ok = len(png) >= 8 and png[:8] == PNG_SIGNATURE
+    if png and not sig_ok and error is None:
+        error = "png_signature_mismatch"
+    w, h = _png_dimensions(png)
+    have_all = (total is not None and contig >= total)
+    complete = bool(end_seen and have_all and sig_ok)
+    pct = (int(100 * contig / total) if (total and total > 0 and not complete)
+           else (100 if complete else None))
+    return {"kind": kind, "label": spec["label"], "source": spec["source"],
+            "present": True, "complete": complete, "chunks": contig,
+            "received": len(chunks), "total": total, "first_gap": first_gap,
+            "end_seen": end_seen, "bytes": len(png), "w": w, "h": h,
+            "sig_ok": sig_ok, "partial_pct": pct, "png": png,
+            "guest_size": header["size"] if header else None,
+            "error": error}
+
+
+def scan_screenshots(path):
+    """Metadata for BOTH screenshot streams in one log, WITHOUT shipping the PNG
+    bytes — what the UI needs to decide which thumbnails to show. Returns
+    {vga:{present,complete,chunks,total,w,h,partial_pct,…}, ff:{…}}. The decoded
+    PNG itself is fetched separately from /api/screenshot."""
+    out = {}
+    for kind in ("vga", "ff"):
+        d = _decode_shot(path, kind)
+        d.pop("png", None)   # metadata only — keep the JSON small
+        out[kind] = d
+    return out
+
+
 # ── launch-time / session listing ─────────────────────────────────────────────
 def _launch_info(sid, log_path, log_stat):
     """Absolute + relative launch time, anchored to the host clock. Reads
@@ -574,6 +790,32 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
  #blk .hd b{color:#56b6c2} #blkcanvas{display:block;width:100%;height:34px;image-rendering:pixelated;border:1px solid var(--edge);border-radius:3px}
  #blk .hint{color:var(--dim);font-size:11px} #blk .lg{font-size:10px;color:var(--dim);margin-top:3px}
  #blk .lg i{display:inline-block;width:9px;height:9px;border-radius:2px;vertical-align:middle;margin:0 3px 0 9px}
+ /* screenshots panel — decoded base64 PNG streams (VGA framebuffer + FF render) */
+ #shots{display:none;border-bottom:1px solid var(--edge);background:#0d111a;padding:8px 12px}
+ #shots.show{display:block} #shots .hd{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+ #shots .grid{display:flex;gap:14px;flex-wrap:wrap}
+ #shots .hint{color:var(--dim);font-size:11px}
+ .shot{border:1px solid var(--edge);border-radius:6px;background:#11151f;padding:8px;width:236px}
+ .shot.ff{border-color:#3a2a52} .shot.vga{border-color:#214a52}
+ .shot .knd{font-size:11px;font-weight:600;display:flex;align-items:center;gap:6px;margin-bottom:5px}
+ .shot.vga .knd{color:#56b6c2} .shot.ff .knd{color:#d2a8ff}
+ .shot .knd .tag{font-size:9px;font-weight:600;padding:1px 5px;border-radius:8px;text-transform:uppercase;letter-spacing:.5px}
+ .shot.vga .knd .tag{background:#0e1c22;color:#56b6c2;border:1px solid #214a52}
+ .shot.ff .knd .tag{background:#160e22;color:#d2a8ff;border:1px solid #3a2a52}
+ .shot .thumb{width:100%;height:124px;background:#0b0e14 repeating-conic-gradient(#161b27 0 25%,#0b0e14 0 50%) 0 0/16px 16px;
+   border:1px solid var(--edge);border-radius:4px;display:flex;align-items:center;justify-content:center;overflow:hidden;cursor:pointer}
+ .shot .thumb img{max-width:100%;max-height:100%;display:block;image-rendering:auto}
+ .shot .thumb.empty{color:var(--dim);font-size:11px;cursor:default;text-align:center;padding:6px}
+ .shot .src{color:var(--dim);font-size:10px;margin:5px 0 3px;line-height:1.3}
+ .shot .stat{font-size:10px;color:var(--dim);display:flex;flex-wrap:wrap;gap:4px 8px}
+ .shot .stat .ok{color:#7ee787} .shot .stat .part{color:#f0c674} .shot .stat .dim{color:#56b6c2}
+ .shot .pbar{height:4px;background:#1b2230;border-radius:2px;margin-top:5px;overflow:hidden}
+ .shot.vga .pbar>i{display:block;height:100%;background:#56b6c2} .shot.ff .pbar>i{display:block;height:100%;background:#d2a8ff}
+ /* full-size lightbox */
+ #lightbox{display:none;position:fixed;inset:0;background:rgba(2,4,8,.92);z-index:50;align-items:center;justify-content:center;flex-direction:column;cursor:zoom-out}
+ #lightbox.show{display:flex} #lightbox img{max-width:94vw;max-height:86vh;border:1px solid var(--edge);box-shadow:0 0 30px rgba(0,0,0,.7);image-rendering:auto}
+ #lightbox .cap{margin-top:10px;font-size:12px;color:var(--fg);background:var(--panel);border:1px solid var(--edge);padding:6px 12px;border-radius:6px}
+ #lightbox .cap b{color:#7ee787} #lightbox .cap .part{color:#f0c674}
  .toggles{display:flex;gap:6px} .toggles button.on{border-color:var(--accent);color:#7ee787}
 </style></head><body><div id=app>
  <div id=side>
@@ -591,6 +833,7 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
      <span class=toggles>
        <button id=tMetrics class=on title="guest metrics + sparklines">metrics</button>
        <button id=tBlk title="data.img block map (needs blk-trace)">blkmap</button>
+       <button id=tShots class=on title="decoded screenshot streams (VGA framebuffer + Firefox render)">shots</button>
        <button id=tRail class=on title="gate progression rail">rail</button>
      </span>
      <input id=flt placeholder="filter lines…"><label><input type=checkbox id=follow checked> follow</label>
@@ -601,12 +844,14 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
    <div id=metrics class=show></div>
    <div id=pids></div>
    <div id=blk></div>
+   <div id=shots></div>
    <div id=miles></div>
    <div id=logwrap>
      <div id=log><div id=empty>Pick a session on the left to stream its serial output.</div></div>
      <div id=rail class=open></div>
    </div>
  </div></div>
+ <div id=lightbox><img id=lbimg alt=""><div class=cap id=lbcap></div></div>
 <script>
 let cur=null,es=null,sessions=[],rate={n:0,t:Date.now()};
 let miles=[],frozen=false,metaCur=null;
@@ -665,8 +910,9 @@ function openS(sid){
   if(es)es.close(); rate={n:0,t:Date.now(),last:null}; mPrev=null;
   for(const k in buf)buf[k]=[];
   $('jumpLive').style.display='none';
+  shotsSig=''; shotsMetaCache=null; $('shots').innerHTML='';
   startStream(sid);
-  render(); loadMiles(sid); pollMetrics(); pollBlk();
+  render(); loadMiles(sid); pollMetrics(); pollBlk(); pollShots();
 }
 function startStream(sid){
   if(es)es.close();
@@ -813,13 +1059,86 @@ function drawBlk(bk){
   x.putImageData(img,0,0);
 }
 
+// ── screenshots: decoded base64 PNG streams (VGA framebuffer + FF render) ──
+// Two DISTINCT streams a firefox-test/test-mode boot emits, labeled
+// unambiguously so a VGA framebuffer is never mistaken for a Firefox render.
+// Metadata comes from /api/screenshots (no PNG bytes); each present stream's
+// <img src> points at /api/screenshot?kind=… which decodes + serves the PNG.
+let shotsSig='';                     // cache-bust + change-detect signature
+function pctOf(s){return s.complete?100:(s.partial_pct!=null?s.partial_pct:0);}
+function shotCard(sid,kind,s){
+  const cls='shot '+kind;
+  const tag=kind==='vga'?'VGA':'FF';
+  // image src: cache-bust on (chunks,complete) so a growing partial refreshes,
+  // but a frozen complete log isn't re-decoded every poll.
+  const v=encodeURIComponent(sid)+'.'+kind+'.'+s.chunks+'.'+(s.complete?1:0);
+  const src='/api/screenshot?sid='+encodeURIComponent(sid)+'&kind='+kind+'&v='+v;
+  const dims=s.w!=null?(s.w+'×'+s.h):'—';
+  const comp=s.complete
+    ?'<span class=ok>✓ complete</span>'
+    :'<span class=part>◔ partial '+pctOf(s)+'%</span>';
+  const chunks=s.total!=null?(s.chunks+'/'+s.total+' chunks'):(s.chunks+' chunks');
+  const thumb=s.sig_ok
+    ?('<div class=thumb data-kind="'+kind+'" data-src="'+src+'"><img src="'+src+'" alt="'+s.label+'"></div>')
+    :('<div class="thumb empty">stream present but no valid PNG yet<br><small>'+(s.error||'awaiting chunks')+'</small></div>');
+  return '<div class="'+cls+'">'
+    +'<div class=knd><span class=tag>'+tag+'</span>'+s.label+'</div>'
+    +thumb
+    +'<div class=src>'+s.source+'<br>session <b>'+sid+'</b></div>'
+    +'<div class=stat>'+comp+' <span class=dim>'+dims+'</span> '+chunks
+      +(s.bytes?' · '+bytes(s.bytes):'')+'</div>'
+    +'<div class=pbar><i style=width:'+pctOf(s)+'%></i></div>'
+    +'</div>';
+}
+let shotsMetaCache=null;             // last metadata (for the lightbox caption)
+async function pollShots(){
+  if(!cur||!$('tShots').classList.contains('on'))return;
+  let m;try{m=await(await fetch('/api/screenshots?sid='+encodeURIComponent(cur))).json()}catch(e){return}
+  if(cur==null)return;
+  shotsMetaCache=m;
+  const present=['vga','ff'].filter(k=>m[k]&&m[k].present);
+  // signature: only re-render when something actually changed (avoids the <img>
+  // flicker that re-setting innerHTML every poll would cause).
+  const sig=present.map(k=>k+':'+m[k].chunks+':'+(m[k].complete?1:0)+':'+(m[k].sig_ok?1:0)).join('|');
+  $('shots').className='show';
+  if(!present.length){
+    if(shotsSig!=='__none__'){
+      $('shots').innerHTML='<div class=hd>screenshots</div><div class=hint>'
+        +'No <b>[SCREENSHOT-B64]</b> (VGA framebuffer, Test 198) or '
+        +'<b>[FF-OUT-PNG-B64]</b> (Firefox render, /tmp/out.png) stream in this log. '
+        +'A <b>firefox-test</b> / <b>test-mode</b> boot emits these after the screenshot is taken.</div>';
+      shotsSig='__none__';
+    }
+    return;
+  }
+  if(sig===shotsSig)return; shotsSig=sig;
+  $('shots').innerHTML='<div class=hd>screenshots · decoded base64 PNG streams</div>'
+    +'<div class=grid>'+present.map(k=>shotCard(cur,k,m[k])).join('')+'</div>';
+  $('shots').querySelectorAll('.thumb[data-src]').forEach(e=>{
+    e.onclick=()=>openLightbox(e.dataset.src,e.dataset.kind);});
+}
+function openLightbox(src,kind){
+  const m=shotsMetaCache&&shotsMetaCache[kind];
+  $('lbimg').src=src;
+  if(m){
+    const comp=m.complete?'<b>complete</b>':'<span class=part>partial '+pctOf(m)+'%</span>';
+    $('lbcap').innerHTML=m.label+' · session '+cur+' · '
+      +(m.w!=null?m.w+'×'+m.h+' · ':'')+comp
+      +(m.total!=null?' · '+m.chunks+'/'+m.total+' chunks':'');
+  } else $('lbcap').textContent=kind;
+  $('lightbox').classList.add('show');
+}
+$('lightbox').onclick=()=>$('lightbox').classList.remove('show');
+document.addEventListener('keydown',e=>{if(e.key==='Escape')$('lightbox').classList.remove('show');});
+
 // toggles
 function tog(btn,after){btn.onclick=()=>{btn.classList.toggle('on');
   if(btn===$('tRail'))$('rail').classList.toggle('open',btn.classList.contains('on'));
   if(btn===$('tMetrics')&&!btn.classList.contains('on')){$('metrics').classList.remove('show');$('pids').classList.remove('show');}
   if(btn===$('tBlk')&&!btn.classList.contains('on'))$('blk').classList.remove('show');
+  if(btn===$('tShots')&&!btn.classList.contains('on'))$('shots').classList.remove('show');
   if(after&&btn.classList.contains('on'))after();};}
-tog($('tMetrics'),pollMetrics);tog($('tBlk'),pollBlk);tog($('tRail'),null);
+tog($('tMetrics'),pollMetrics);tog($('tBlk'),pollBlk);tog($('tShots'),pollShots);tog($('tRail'),null);
 $('tRail').onclick=()=>{$('tRail').classList.toggle('on');$('rail').classList.toggle('open',$('tRail').classList.contains('on'));};
 
 setInterval(()=>{const now=Date.now(),dt=(now-rate.t)/1000;if(dt>=2){const r=rate.n/dt;rate.last=r;$('rate').textContent=cur?r.toFixed(0)+' ln/s':'';rate={n:0,t:now,last:r};}},1000);
@@ -827,6 +1146,7 @@ refresh(); setInterval(refresh,3000);
 setInterval(()=>{if(cur)loadMiles(cur);},5000);
 setInterval(pollMetrics,2000);
 setInterval(pollBlk,3000);
+setInterval(pollShots,4000);
 </script></body></html>"""
 
 
@@ -897,10 +1217,79 @@ class H(BaseHTTPRequestHandler):
             except (OSError, ValueError):
                 size, grid = 0, 256
             self._json(scan_blkmap(p, size, grid))
+        elif u.path == "/api/screenshots":
+            # metadata for BOTH streams (no PNG bytes) — the UI uses this to
+            # decide which thumbnails to show without decoding twice.
+            p = self._log_path(q.get("sid", [""])[0])
+            if not p:
+                self._hdr(404, "text/plain"); self.wfile.write(b"no log"); return
+            self._json(scan_screenshots(p))
+        elif u.path == "/api/screenshot":
+            self._screenshot(q.get("sid", [""])[0], q.get("kind", ["vga"])[0])
         elif u.path == "/api/stream":
             self._stream(q.get("sid", [""])[0])
         else:
             self._hdr(404, "text/plain"); self.wfile.write(b"404")
+
+    def _screenshot(self, sid, kind):
+        """Decode a session's screenshot stream and serve it as image/png.
+
+        kind=vga -> the VGA framebuffer ([SCREENSHOT-B64:…], Test 198);
+        kind=ff  -> Firefox's render (/tmp/out.png, [FF-OUT-PNG-B64:…]).
+
+        Partial / in-progress streams are served best-effort (HTTP 200, with an
+        X-Screenshot-Complete: false header so the caller can tell). Only a
+        genuinely absent or signature-invalid stream returns a JSON 404 — we
+        never 500 on a truncated log."""
+        if kind not in _SHOT_KINDS:
+            self._hdr(400, "application/json")
+            self.wfile.write(json.dumps(
+                {"ok": False, "error": "bad_kind",
+                 "valid": sorted(_SHOT_KINDS)}).encode())
+            return
+        p = self._log_path(sid)
+        if not p:
+            self._hdr(404, "application/json")
+            self.wfile.write(json.dumps(
+                {"ok": False, "error": "no_log", "sid": sid}).encode())
+            return
+        d = _decode_shot(p, kind)
+        png = d.get("png") or b""
+        # No valid PNG to serve: report clearly as JSON (never 500). Either the
+        # stream is absent, or its leading bytes aren't a PNG (torn/garbage).
+        if not d["present"] or not d["sig_ok"] or len(png) < 8:
+            self._hdr(404, "application/json")
+            self.wfile.write(json.dumps({
+                "ok": False,
+                "error": ("no_stream" if not d["present"]
+                          else (d.get("error") or "no_valid_png")),
+                "sid": sid, "kind": kind, "label": d["label"],
+                "present": d["present"], "chunks": d["chunks"],
+                "total": d["total"], "bytes": d["bytes"],
+            }).encode())
+            return
+        # Serve the PNG (complete or partial). Custom X- headers carry the
+        # provenance so callers/curl can see kind + completeness without the
+        # metadata endpoint. Content-Disposition names it for a save.
+        extra = {
+            "X-Screenshot-Kind":     kind,
+            "X-Screenshot-Label":    d["label"],
+            "X-Screenshot-Complete": "true" if d["complete"] else "false",
+            "X-Screenshot-Chunks":   f"{d['chunks']}/{d['total']}"
+                                     if d["total"] is not None else str(d["chunks"]),
+            "X-Screenshot-Bytes":    str(len(png)),
+            "Cache-Control":         "no-cache",
+            "Content-Disposition":   f'inline; filename="{sid}.{kind}.png"',
+        }
+        if d["w"] is not None:
+            extra["X-Screenshot-Dimensions"] = f"{d['w']}x{d['h']}"
+        if d["partial_pct"] is not None:
+            extra["X-Screenshot-Partial-Pct"] = str(d["partial_pct"])
+        try:
+            self._hdr(ctype="image/png", extra=extra)
+            self.wfile.write(png)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
 
     def _stream(self, sid):
         path = self._log_path(sid)
