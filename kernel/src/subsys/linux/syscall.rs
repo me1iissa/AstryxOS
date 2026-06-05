@@ -4077,7 +4077,37 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             0 // dead — exit_thread diverges
         }
         // 61: wait4(pid, wstatus, options, rusage)
-        61 => crate::syscall::sys_waitpid(arg1 as i64, arg3 as u32),
+        //
+        // Returns the reaped child pid AND, when `wstatus` (arg2) is non-NULL,
+        // writes the encoded wait status so the caller's `WIFEXITED` /
+        // `WEXITSTATUS` / `WIFSIGNALED` / `WTERMSIG` macros decode correctly
+        // (Linux man-pages `wait(2)`, "status").  Without this, a `waitpid()`
+        // wrapper (musl/glibc `waitpid` → `wait4`) reads an uninitialised
+        // status and mis-classifies the child's exit.  Encoding:
+        //   normal exit:  (exit_status & 0xff) << 8
+        //   killed:       signo (low 7 bits); AstryxOS stores `-signo`.
+        61 => {
+            let want = arg1 as i64;
+            let mut exit_code: i32 = 0;
+            let ret = crate::syscall::sys_waitpid_ex(
+                want, (arg3 & 1) != 0 /*WNOHANG*/, false /*WNOWAIT*/,
+                Some(&mut exit_code));
+            if ret > 0 && arg2 != 0
+                && (crate::syscall::user_ptr_check_bypassed()
+                    || crate::syscall::validate_user_ptr(arg2, 4))
+            {
+                let wstatus: i32 = if exit_code < 0 {
+                    (-exit_code) & 0x7f                  // WIFSIGNALED: WTERMSIG
+                } else {
+                    (exit_code & 0xff) << 8              // WIFEXITED:  WEXITSTATUS
+                };
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    core::ptr::write_unaligned(arg2 as *mut i32, wstatus);
+                }
+            }
+            ret
+        }
         // 62: kill(pid, sig)
         62 => crate::signal::kill(arg1, arg2 as u8),
         // 72: fcntl(fd, cmd, arg)
@@ -4306,21 +4336,59 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             // waitid(reap)" idiom (used by process launchers to observe a
             // child's exit before collecting it) does not race-reap the child
             // on the first call and hang the second against an already-gone pid.
-            let ret = crate::syscall::sys_waitpid_ex(
-                pid, options & WNOHANG != 0, options & WNOWAIT != 0);
-            if ret > 0 && !infop.is_null() {
-                // Fill minimal siginfo_t: si_signo=SIGCHLD(17), si_errno=0,
-                // si_code=CLD_EXITED(1), si_pid=child_pid, si_status=exit_code
-                // siginfo_t is 128 bytes; we only fill the first 20 bytes.
-                unsafe {
-                    let _g = crate::arch::x86_64::smap::UserGuard::new();
-                    core::ptr::write_bytes(infop, 0, 128);
-                    core::ptr::write_unaligned(infop.add(0)  as *mut i32, 17); // si_signo = SIGCHLD
-                    core::ptr::write_unaligned(infop.add(8)  as *mut i32, 1);  // si_code  = CLD_EXITED
-                    core::ptr::write_unaligned(infop.add(12) as *mut i32, ret as i32); // si_pid
+            match crate::syscall::sys_waitid(
+                pid, options & WNOHANG != 0, options & WNOWAIT != 0)
+            {
+                crate::syscall::WaitidOutcome::Collected { pid: child, si_code, si_status } => {
+                    // Serialise the user `siginfo_t` for SIGCHLD per
+                    // POSIX.1-2017 `waitid(2)` and Linux
+                    // `<asm-generic/siginfo.h>`.  The x86-64 (LP64) field
+                    // offsets live in `crate::syscall` (si_pid @16, si_status
+                    // @24 — the `_sifields` union is 8-byte aligned and starts
+                    // at offset 16, NOT 12).  Writing si_pid at the wrong
+                    // offset makes a reader that branches on `si_pid` (gecko's
+                    // IsProcessDead: `if (si.si_pid == 0) return Running;`) see a
+                    // zero pid and busy-loop the blocking `waitid(WNOWAIT)`
+                    // forever, pinning the caller's thread.
+                    if !infop.is_null()
+                        && (crate::syscall::user_ptr_check_bypassed()
+                            || crate::syscall::validate_user_ptr(
+                                arg3, crate::syscall::SI_SIZE))
+                    {
+                        let uid = {
+                            let cur = crate::proc::current_pid_lockless();
+                            crate::proc::PROCESS_TABLE.lock()
+                                .iter().find(|p| p.pid == cur)
+                                .map(|p| p.uid as i32).unwrap_or(0)
+                        };
+                        let mut si = [0u8; crate::syscall::SI_SIZE];
+                        crate::syscall::fill_sigchld_siginfo(
+                            &mut si, si_code, child as i32, uid, si_status);
+                        unsafe {
+                            let _g = crate::arch::x86_64::smap::UserGuard::new();
+                            core::ptr::copy_nonoverlapping(
+                                si.as_ptr(), infop, crate::syscall::SI_SIZE);
+                        }
+                    }
+                    0 // waitid returns 0 on success (not child pid)
                 }
+                // WNOHANG, nothing ready: per `waitid(2)`, return 0 with a
+                // zeroed `si_pid` so the caller sees "no child changed state".
+                crate::syscall::WaitidOutcome::NoHang => {
+                    if !infop.is_null()
+                        && (crate::syscall::user_ptr_check_bypassed()
+                            || crate::syscall::validate_user_ptr(
+                                arg3, crate::syscall::SI_SIZE))
+                    {
+                        unsafe {
+                            let _g = crate::arch::x86_64::smap::UserGuard::new();
+                            core::ptr::write_bytes(infop, 0, crate::syscall::SI_SIZE);
+                        }
+                    }
+                    0
+                }
+                crate::syscall::WaitidOutcome::Err(e) => e, // negative errno
             }
-            if ret > 0 { 0 } else { ret } // waitid returns 0 on success (not child pid)
         }
         // 257: openat(dirfd, pathname, flags, mode)
         257 => {
