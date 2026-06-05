@@ -111,12 +111,18 @@ else:
         ("X11 ready",         ("X11 server ready", "Xastryx")),
         ("firefox exec",      ("firefox-bin",)),
         ("TLS / network",     ("[TCP] Established", "] Established →")),
-        ("content procs",     ("isForBrowser",)),
-        ("screenshot-actors", (("[FF/write]", "getDimensions"),
+        # Mirror of serial-web.py — render gates accept the low-frequency
+        # kernel `[GATE] <label>` markers (default-ON on firefox-test-core) so
+        # they fire when the per-write `[FF/write]` firehose is OFF, plus the
+        # `[FF/write]`-anchored tuples for full-trace boots.
+        ("content procs",     ("[GATE] content-procs", ("[EXEC]", "isForBrowser"))),
+        ("screenshot-actors", ("[GATE] screenshot-actors",
+                               ("[FF/write]", "getDimensions"),
                                ("[FF/write]", "ScreenshotParent"),
                                ("[FF/write]", "sendQuery"))),
-        ("drawSnapshot",      ("libpng16.so",)),
-        ("PNG write",         ("89504e47", "out.png written")),
+        ("drawSnapshot",      ("[GATE] drawSnapshot", "libpng16.so")),
+        ("PNG write",         (("[FF-OUT-PNG:", "sig_ok=true"),
+                               "/tmp/out.png present", "89504e47", "out.png written")),
         ("exit_group",        ("exit_group(",)),
     ]
     _TICK_KERNEL = re.compile(r"(?:\[HB\]|PROC-METRICS\]) tick=(\d+)")
@@ -208,16 +214,26 @@ PHASES = [
     ("VFS-MOUNT",         ("[VFS] Probing virtio-blk",),                  ("X11 server ready", "Xastryx ready"),                     "host"),
     ("INIT",              ("X11 server ready", "Xastryx ready"),          ("[FFTEST] Launching", "[EXEC] pid=1"),                    "host"),
     ("FF-STARTUP",        ("[FFTEST] Launching", "[EXEC] pid=1"),         (("[FF/open]", "libxul.so"),),                             "host"),
-    ("LIBXUL-INIT",       (("[FF/open]", "libxul.so"),),                  ("[TCP] Established", "[TCP] Accepted", "] Established →"), "tick"),
+    # The render-stage from/to markers below additively accept the low-frequency
+    # `[GATE] <label>` markers (default-ON on firefox-test-core) alongside the
+    # historical `[FF/write]`/`[FF/open]` trace markers. NOTE: this PHASES table
+    # documents the taxonomy + supplies PHASE_NAMES/PHASE_AXIS; the actual scan
+    # is driven by ANCHORS / PHASE_SPAN above (kept in sync).
+    ("LIBXUL-INIT",       ("[GATE] libxul", ("[FF/open]", "libxul.so")),  ("[TCP] Established", "[TCP] Accepted", "] Established →"), "tick"),
     ("NETWORK/TLS",       ("[TCP] Established", "[TCP] Accepted",
-                           "] Established →"),                            (("[FF/write]", "getDimensions"),
+                           "] Established →"),                            ("[GATE] screenshot-actors",
+                                                                           ("[FF/write]", "getDimensions"),
                                                                            ("[FF/write]", "ScreenshotParent")),                      "tick"),
-    ("RENDER-SETUP",      (("[FF/write]", "getDimensions"),
-                           ("[FF/write]", "ScreenshotParent")),          (("[FF/open]", "/tmp/out.png"),),                          "tick"),
-    ("RENDER",            (("[FF/write]", "getDimensions"),
-                           ("[FF/write]", "ScreenshotParent")),          (("[FF/open]", "/tmp/out.png"),),                          "tick"),
-    ("ENCODE",            (("[FF/open]", "/tmp/out.png"),),               ("89504e47",),                                             "tick"),
-    ("TEARDOWN",          ("89504e47",),                                  (("[PROC]", "PID 1 exit_group"),),                         "host"),
+    ("RENDER-SETUP",      ("[GATE] screenshot-actors",
+                           ("[FF/write]", "getDimensions"),
+                           ("[FF/write]", "ScreenshotParent")),          (("[FF/open]", "/tmp/out.png"), "/tmp/out.png present"),    "tick"),
+    ("RENDER",            ("[GATE] screenshot-actors",
+                           ("[FF/write]", "getDimensions"),
+                           ("[FF/write]", "ScreenshotParent")),          (("[FF/open]", "/tmp/out.png"), "/tmp/out.png present"),    "tick"),
+    ("ENCODE",            (("[FF/open]", "/tmp/out.png"), "/tmp/out.png present"),
+                                                                         (("[FF-OUT-PNG:", "sig_ok=true"), "89504e47"), "tick"),
+    ("TEARDOWN",          (("[FF-OUT-PNG:", "sig_ok=true"), "89504e47"),
+                                                                         (("[PROC]", "PID 1 exit_group"),),                         "host"),
 ]
 
 # The ordered list of phase boundary *marker sets* that the monotone scan walks.
@@ -251,19 +267,31 @@ ANCHORS = [
     # `[VFS/resolve] component=libxul.so` line that can precede ff_launch and so
     # mis-anchor FF-STARTUP to ~zero. The AND-tuple ties the anchor to the FF
     # open path, a deterministic post-launch boundary.
-    ("libxul",         (("[FF/open]", "libxul.so"),)),
+    # Render-stage anchors accept the low-frequency kernel `[GATE] <label>`
+    # markers (default-ON on the fast firefox-test-core profile, where the
+    # `[FF/write]`/`[FF/open]` diagnostic mirror is OFF) in ADDITION to the
+    # historical trace markers (still present on a full firefox-test/*-trace
+    # boot). Either source advances the phase taxonomy — additive, never a
+    # rename of the existing markers.
+    ("libxul",         ("[GATE] libxul", ("[FF/open]", "libxul.so"))),
     ("tcp",            ("[TCP] Established", "[TCP] Accepted", "] Established →")),
-    ("screenshot",     (("[FF/write]", "getDimensions"),
+    ("screenshot",     ("[GATE] screenshot-actors",
+                        ("[FF/write]", "getDimensions"),
                         ("[FF/write]", "ScreenshotParent"))),
     # render_start: a DISTINCT composite/draw line, when the build emits one.
     # Optional — absent on these builds, in which case RENDER collapses to null
     # and RENDER-SETUP carries the whole screenshot->encode-open interval (MECE).
-    ("render_start",   ("CrossProcessPaint", "drawSnapshot")),
+    ("render_start",   ("[GATE] drawSnapshot", "CrossProcessPaint", "drawSnapshot")),
     # out_png_open: the test harness opens the output PNG file — the real draw->
     # encode boundary (replaces the structurally-wrong libpng16.so load marker).
-    ("out_png_open",   (("[FF/open]", "/tmp/out.png"),)),
-    # png_written: PNG magic in the write payload. Exactly one per success run.
-    ("png_written",    ("89504e47",)),
+    # On firefox-test-core the `[FF/open]` mirror is OFF, so also accept the
+    # functional FF-supervisor screenshot-present line as the encode-open edge.
+    ("out_png_open",   (("[FF/open]", "/tmp/out.png"), "/tmp/out.png present")),
+    # png_written: PNG magic, or the functional FF-supervisor valid-PNG line
+    # (`[FF-OUT-PNG:… sig_ok=true …]`). Exactly one per success run. NOTE: the
+    # raw `[GATE] PNG` magic marker is deliberately NOT emitted by the kernel —
+    # FF writes many internal PNGs that would false-positive (see syscall.rs).
+    ("png_written",    (("[FF-OUT-PNG:", "sig_ok=true"), "89504e47")),
     # exit_group: the pid=1 (Firefox launcher) teardown specifically. The bare
     # `exit_group(` token matches EVERY child process exit (PID 2/4/5/6 emit it
     # long before the launcher), so anchor on the `[PROC] PID 1 exit_group` form

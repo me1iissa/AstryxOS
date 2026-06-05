@@ -198,6 +198,53 @@ def main():
               "tcp" not in scan2["anchors"])
         notcp_log.unlink()
 
+        # ── firefox-test-core (firehose OFF): [GATE] markers drive the taxonomy ─
+        # On the fast default profile the `[FF/write]`/`[FF/open]` per-write
+        # mirror is OFF; the render anchors must instead fire on the low-frequency
+        # kernel `[GATE] <label>` milestone markers. This proves the perf phase
+        # taxonomy still derives RENDER/ENCODE/TEARDOWN on a core-profile boot.
+        core_log_text = (
+            "BdsDxe: starting Boot0002 \"UEFI QEMU HARDDISK\"\n"
+            "[AstryxBoot] Initializing UEFI bootloader...\n"
+            "[Aether] Phase 5b: APIC init...\n"
+            "[VFS] Probing virtio-blk device (4194304 sectors) for partitions...\n"
+            "[X11] Xastryx ready on /tmp/.X11-unix/X0 (fd=0)\n"
+            "[FFTEST] X11 server ready\n"
+            "[FFTEST] Launching /disk/usr/lib/firefox/firefox-bin ...\n"
+            "[EXEC] pid=1 tid=1 argv=\"firefox-bin\" \"--headless\" (2 of 14 args)\n"
+            "[HB] tick=100 cpu=0 pf=10 sc=50\n"
+            "[GATE] libxul\n"
+            "[HB] tick=500 cpu=1 pf=50 sc=400\n"
+            "[GATE] screenshot-actors\n"
+            "[HB] tick=600 cpu=1 pf=60 sc=500\n"
+            "[FFTEST] /tmp/out.png present (12345 bytes) — streaming\n"
+            "[HB] tick=900 cpu=0 pf=90 sc=800\n"
+            "[FF-OUT-PNG:path=/tmp/out.png size=12345 sig_ok=true complete=true]\n"
+            "[HB] tick=1000 cpu=0 pf=100 sc=900\n"
+            "[PROC] PID 1 exit_group(0) caller_tid=2\n"
+        )
+        core_log = harness_dir / "smoke0000gates.serial.log"
+        core_log.write_text(core_log_text)
+        scan3 = pm.scan_phase_boundaries(str(core_log))
+        a3 = scan3["anchors"]
+        check("core: [GATE] libxul anchors LIBXUL-INIT", "libxul" in a3,
+              str(sorted(a3)))
+        check("core: [GATE] screenshot-actors anchors render", "screenshot" in a3,
+              str(sorted(a3)))
+        check("core: FF-OUT-PNG(sig_ok) anchors png_written", "png_written" in a3,
+              str(sorted(a3)))
+        check("core: render reaches exit_group anchor",
+              scan3["deepest_anchor"] == "exit_group", scan3["deepest_anchor"])
+        d3 = pm.phase_durations(scan3)
+        # screenshot tick=500 -> out_png_open ([FF-OUT-PNG present] tick=600) => 1000 ms
+        check("core: RENDER-SETUP derived from [GATE] markers (1000ms)",
+              d3["RENDER-SETUP"]["tick_ms"] == 1000.0,
+              str(d3["RENDER-SETUP"]["tick_ms"]))
+        # firehose really off in this fixture
+        check("core: firehose off in fixture (0 [FF/write])",
+              "[FF/write]" not in core_log_text)
+        core_log.unlink()
+
         # ── events.jsonl host-anchoring: true launch ts + kvm_effective ───────
         # The session json is absent (historical case). The first events.jsonl
         # line (cpu_model) carries the true started_at + kvm_effective; the import

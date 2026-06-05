@@ -47,16 +47,25 @@ GUEST_RAM_BYTES = 2 * 1024 * 1024 * 1024   # 2 GiB guest RAM (from the qemu cmdl
 DISK_SECTORS = 4194304           # virtio-blk capacity=4194304 sectors (data.img)
 SECTOR_BYTES = 512
 
-# render ladder, deepest first (idx, label, substring markers)
+# render ladder, deepest first (idx, label, substring markers). Each render gate
+# accepts BOTH the low-frequency kernel-emitted `[GATE] <label>` milestone marker
+# (default-ON on the fast firefox-test-core profile) AND the historical
+# diagnostic/JS strings (present on a full-trace boot) — so a gate is detected
+# whichever serial source is enabled. This is a tail-window substring scan (no
+# AND-anchoring), so the `[GATE]` markers carry the load on the fast profile.
 GATES = [
-    (8, "PNG",               ("89504e47", "out.png written", "kdb-read-png")),
-    (7, "drawSnapshot",      ("drawSnapshot", "CrossProcessPaint", "libpng16")),
-    (6, "screenshot-actors", ("ScreenshotParent", "getDimensions")),
-    (5, "content-proc",      ("isForBrowser",)),
+    (8, "PNG",               ("[FF-OUT-PNG:path=/tmp/out.png size=",
+                              "/tmp/out.png present", "89504e47", "out.png written",
+                              "kdb-read-png")),
+    (7, "drawSnapshot",      ("[GATE] drawSnapshot", "drawSnapshot",
+                              "CrossProcessPaint", "libpng16")),
+    (6, "screenshot-actors", ("[GATE] screenshot-actors", "ScreenshotParent",
+                              "getDimensions")),
+    (5, "content-proc",      ("[GATE] content-procs", "isForBrowser")),
     (4, "network",           ("] Established", "Established →", "[TCP]")),
     (3, "ff-launch",         ("firefox-bin",)),
     (2, "x11",               ("X11 server ready", "Xastryx")),
-    (1, "lib-load",          ("libxul",)),
+    (1, "lib-load",          ("[GATE] libxul", "libxul")),
 ]
 GATE_MAX = 8
 _SC_RE = re.compile(r"pid=1[^\n]*?sc=(\d+)")
@@ -103,14 +112,51 @@ MILESTONES = [
     ("X11 ready",         ("X11 server ready", "Xastryx")),
     ("firefox exec",      ("firefox-bin",)),
     ("TLS / network",     ("[TCP] Established", "] Established →")),
-    ("content procs",     ("isForBrowser",)),
-    # render stages: AND-anchored to the actual kernel [FF/write]/[FF/write-fd]
-    # log line, NOT the bare string (which also lives in the cached JS source).
-    ("screenshot-actors", (("[FF/write]", "getDimensions"), ("[FF/write]", "ScreenshotParent"), ("[FF/write]", "sendQuery"))),
-    ("drawSnapshot",      ("libpng16.so",)),
-    ("PNG write",         ("89504e47", "out.png written")),
+    # content-process spawn. `[GATE] content-procs` is the kernel-emitted
+    # milestone marker (default-ON on firefox-test-core, fires once); the
+    # `[EXEC] …-isForBrowser …` argv line is the functional default-on fallback
+    # (the bare `isForBrowser` substring also lives in FF's cached JS, so we
+    # anchor it to the kernel `[EXEC]` line). On a full-trace boot all fire.
+    ("content procs",     ("[GATE] content-procs", ("[EXEC]", "isForBrowser"))),
+    # render stages. On the FAST `firefox-test-core` profile the per-write
+    # `[FF/write]` IPDL mirror is OFF, so these match the low-frequency
+    # kernel-emitted `[GATE] <label>` markers instead. The `[FF/write]`-anchored
+    # tuples are kept for full-trace boots (firefox-test / *-trace), where they
+    # also fire — both detect the same gate, whichever serial source is on.
+    ("screenshot-actors", ("[GATE] screenshot-actors",
+                           ("[FF/write]", "getDimensions"),
+                           ("[FF/write]", "ScreenshotParent"),
+                           ("[FF/write]", "sendQuery"))),
+    ("drawSnapshot",      ("[GATE] drawSnapshot", "libpng16.so")),
+    # PNG write. The FINAL screenshot PNG is NOT detected by a raw [GATE]/magic
+    # marker (Firefox writes many internal PNGs — favicons, theme assets — that
+    # would false-positive). The authoritative, single-per-run signal is the FF
+    # supervisor's functional `[FFTEST] /tmp/out.png present` /
+    # `[FF-OUT-PNG:… sig_ok=true …]` lines (default-on on firefox-test-core); the
+    # `89504e47` magic / `out.png written` are kept for full-trace boots.
+    ("PNG write",         (("[FF-OUT-PNG:", "sig_ok=true"),
+                           "/tmp/out.png present", "89504e47", "out.png written")),
     ("exit_group",        ("exit_group(",)),
 ]
+
+# OPTIONAL milestones: gates that can be absent OR arrive out-of-order on a
+# successful run, and so must never STALL the strictly-monotone ladder below.
+# When a DEEPER milestone matches the current line but an in-between optional
+# gate was not yet seen, the scan advances past the optional gate (same
+# discipline as perf_markers.ANCHOR_OPTIONAL). Two members:
+#   * "TLS / network" — the headless demo renders a local file:// page with no
+#     network I/O, so the TCP gate legitimately never fires, yet content-process
+#     spawn + the render gates DO.
+#   * "init / userspace" — the FF supervisor emits "X11 server ready" BEFORE the
+#     "[PROC] … PID 1" line this gate keys on, so on a strict in-order scan the
+#     ladder would dead-end here (X11-ready can't fire while the cursor waits on
+#     PID 1) and EVERY deeper gate — firefox exec, [GATE] libxul/content-procs,
+#     the render gates — would show as un-hit. Marking it optional lets the
+#     ladder advance to the gates the boot actually reached. (Pre-existing
+#     ordering quirk, surfaced once the deep [GATE] markers made the deeper
+#     gates reachable on the fast profile.)
+OPTIONAL_MILESTONES = {"TLS / network", "init / userspace"}
+
 # Only the kernel's own tick lines, not arbitrary "tick=" in FF/JS output.
 _TICK_KERNEL = re.compile(r"(?:\[HB\]|PROC-METRICS\]) tick=(\d+)")
 
@@ -167,9 +213,22 @@ def scan_progress(path):
                     sc = int(scm.group(1))
                 if not panic and _PANIC_RE.search(line):
                     panic = True
-                while idx < len(MILESTONES) and _match(line, MILESTONES[idx][1]):
-                    found[MILESTONES[idx][0]] = (n, cur_tick)
-                    idx += 1
+                while idx < len(MILESTONES):
+                    if _match(line, MILESTONES[idx][1]):
+                        found[MILESTONES[idx][0]] = (n, cur_tick)
+                        idx += 1
+                        continue
+                    # Current milestone didn't match. If it is OPTIONAL and a
+                    # DEEPER milestone matches this line, skip the optional gate
+                    # so it can't stall the ladder (e.g. a file:// render emits
+                    # no TCP line, but `[GATE] content-procs` / render markers do).
+                    if MILESTONES[idx][0] in OPTIONAL_MILESTONES and any(
+                        _match(line, MILESTONES[j][1])
+                        for j in range(idx + 1, len(MILESTONES))
+                    ):
+                        idx += 1
+                        continue
+                    break
                 # don't early-break: keep scanning so the latest sc/tick (current
                 # state) stays fresh even after the deepest milestone is hit.
     except OSError:
