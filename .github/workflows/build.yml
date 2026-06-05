@@ -97,6 +97,14 @@ jobs:
         run: python3 scripts/perf-bench-smoke.py
       - name: perf baseline-linux smoke (record shape)
         run: python3 scripts/perf-baseline-linux-smoke.py
+      # Host-only subset of the harness smoke: the data.img staleness detector,
+      # the ci/allow-fail allowlist, the snap-gate/blk-trace CLI surfaces, the
+      # PNG decoders, AND the livelock auto-reap detector (LivelockDetector +
+      # the pid=1 PROC-METRICS sc regex + the new `start` flags). No QEMU boot.
+      # Failure mode this prevents: a refactor silently breaking the livelock
+      # guard so a spinning FF render boot pins a host core indefinitely.
+      - name: qemu-harness host-only smoke (staleness + livelock reap)
+        run: python3 scripts/qemu-harness-smoke.py --staleness-only
 
   kernel-build:
     name: bootloader + kernel builds
