@@ -18,7 +18,7 @@ pub const EPOLLOUT:     u32 = 0x0004;
 pub const EPOLLERR:     u32 = 0x0008;
 pub const EPOLLHUP:     u32 = 0x0010;
 pub const EPOLLRDHUP:   u32 = 0x2000;
-pub const EPOLLET:      u32 = 1 << 31; // edge-triggered (accepted but not enforced)
+pub const EPOLLET:      u32 = 1 << 31; // edge-triggered (enforced in sys_epoll_wait via per-watch et_seen)
 pub const EPOLLONESHOT: u32 = 1 << 30;
 
 /// Equivalent to Linux `struct epoll_event` (packed, 12 bytes).
@@ -35,6 +35,18 @@ pub struct EpollWatch {
     pub fd:     usize,
     pub events: u32,
     pub data:   u64,
+    /// Edge-trigger baseline (`EPOLLET` only).  For a watch registered with
+    /// `EPOLLET`, `epoll_wait(2)` must report a given readiness bit only on
+    /// the rising edge — when the monitored fd transitions from not-having
+    /// to having that condition — and NOT again until the condition is first
+    /// cleared and then re-occurs (`epoll(7)`, "Level-triggered and
+    /// edge-triggered").  `et_seen` records the subset of readiness bits that
+    /// were already delivered on a prior `epoll_wait` and have stayed
+    /// continuously asserted since: those bits are suppressed on subsequent
+    /// calls.  A bit that drops to not-ready is cleared from `et_seen`, so a
+    /// later re-rise fires a fresh edge.  Unused (always 0) for
+    /// level-triggered watches.
+    pub et_seen: u32,
 }
 
 /// Per-process monotonically increasing identifier for epoll instances.
@@ -125,7 +137,7 @@ impl EpollInstance {
     /// and no spurious HUP/ERR readiness leaks into the parking decision.
     pub fn add(&mut self, fd: usize, events: u32, data: u64) -> bool {
         if self.watches.iter().any(|w| w.fd == fd) { return false; }
-        self.watches.push(EpollWatch { fd, events, data });
+        self.watches.push(EpollWatch { fd, events, data, et_seen: 0 });
         true
     }
 
@@ -148,6 +160,11 @@ impl EpollInstance {
         if let Some(w) = self.watches.iter_mut().find(|w| w.fd == fd) {
             w.events = events;
             w.data   = data;
+            // `EPOLL_CTL_MOD` re-arms the watch: per `epoll(7)`, changing the
+            // interest mask of an `EPOLLET` watch makes any currently-asserted
+            // condition count as a fresh edge on the next `epoll_wait`.  Reset
+            // the edge baseline so a level-ready fd is reported once more.
+            w.et_seen = 0;
             true
         } else {
             false
