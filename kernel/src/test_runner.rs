@@ -24279,7 +24279,39 @@ fn test_heap_guard_pte() -> bool {
     test_println!("  Guard below={:#x} above={:#x} heap={:#x}..{:#x}",
         below_va, above_va,
         heap_va, heap_va + HEAP_SIZE as u64);
-    test_pass!("Heap guard pages — PTE present-bit verification");
+
+    // 5. Both guard *frames* must be reserved (marked used) in the PMM bitmap.
+    //    The guard PTEs above carry no physical backing (PTE = 0), so the
+    //    bootloader's direct map still aliases the guard VAs to their physical
+    //    frames (`guard_va - PHYS_OFF`) via 2 MiB huge pages.  If those frames
+    //    were free in the PMM they could be handed to `alloc_page()` and used
+    //    as a page-table page; a later write to that page table would then
+    //    fault on the guard page (the heap-guard overflow this regresses
+    //    against — a PD/PT entry or the LAPIC MMIO PD landed on the above-guard
+    //    frame because it was reserved only *after* vmm::init's page-table
+    //    allocations ran).  The fix reserves both guard frames in vmm::init()
+    //    before any allocation; assert that invariant here.  Refs: Intel SDM
+    //    Vol. 3A §4.10.5 (paging-structure frames must stay reserved against
+    //    recycling).
+    const PHYS_OFF_T: u64 = 0xFFFF_8000_0000_0000;
+    let below_frame = (below_va - PHYS_OFF_T) / 0x1000;
+    let above_frame = (above_va - PHYS_OFF_T) / 0x1000;
+    if !crate::mm::pmm::is_page_used_for_test(below_frame as usize) {
+        test_fail!("heap_guard",
+            "Below-guard frame pfn={} (phys={:#x}) is FREE in PMM — guard frame not reserved",
+            below_frame, below_va - PHYS_OFF_T);
+        return false;
+    }
+    if !crate::mm::pmm::is_page_used_for_test(above_frame as usize) {
+        test_fail!("heap_guard",
+            "Above-guard frame pfn={} (phys={:#x}) is FREE in PMM — guard frame not reserved",
+            above_frame, above_va - PHYS_OFF_T);
+        return false;
+    }
+    test_println!("  Guard frames reserved in PMM: below pfn={} above pfn={} ✓",
+        below_frame, above_frame);
+
+    test_pass!("Heap guard pages — PTE present-bit + frame-reservation verification");
     true
 }
 

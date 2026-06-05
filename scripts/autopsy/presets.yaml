@@ -275,3 +275,34 @@ presets:
         reg: rbp
         offset: -64
         len: 128
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # heap-guard-writer
+  # ───────────────────────────────────────────────────────────────────────────
+  # [KERNEL HEAP GUARD] overflow investigation.  Break at handle_page_fault
+  # (idt.rs) — the page-fault dispatcher that owns the guard check that
+  # panics at idt.rs:1279.  Signature: handle_page_fault(faulting_addr: u64,
+  # error_code: u64, frame: &mut InterruptFrame) -> bool.  By sysV AMD64 ABI
+  # §3.2.3 the args land in RDI=faulting_addr (== CR2), RSI=error_code,
+  # RDX=&InterruptFrame.  The InterruptFrame is #[repr(C)] { rip(+0), cs(+8),
+  # rflags(+16), rsp(+24), ss(+32) } (Intel SDM Vol. 3A §6.12.1: the CPU-pushed
+  # exception frame), so reading 40 bytes at RDX yields the ORIGINAL faulting
+  # writer's RIP and RSP — i.e. WHICH kernel instruction wrote to the guard
+  # page, the thing the panic-side register dump cannot show (it has already
+  # unwound onto the panic stack).  error_code bit1 (RSI & 2) distinguishes a
+  # write fault (heap overflow store) from a read fault.
+  heap-guard-writer:
+    description: |
+      handle_page_fault entry for a [KERNEL HEAP GUARD] hit.  RDI=faulting
+      addr (CR2), RSI=error_code, RDX=&InterruptFrame.  Captures the
+      InterruptFrame (40B at RDX) so the ORIGINAL writer RIP/RSP is
+      recovered, plus a stack window around the writer's RSP for a blame
+      walk.  Symbolise frame.rip against the kernel ELF to name the store.
+    steps:
+      - name: regs
+        kind: regs
+      - name: interrupt_frame
+        kind: mem_via_reg
+        reg: rdx
+        offset: 0
+        len: 40
