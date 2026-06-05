@@ -10,6 +10,22 @@ No GPL-contaminated derivation: all descriptions sourced from `man 2` pages and 
 
 ## Recent conformance fixes
 
+- **2026-06-05** — `waitid(2)` (247) `siginfo_t` field offsets corrected to the
+  x86\_64 (LP64) layout of `<asm-generic/siginfo.h>`: the `_sifields` union is
+  8-byte aligned and begins at offset 16, so `si_pid` is at **offset 16** (was
+  written at 12), `si_uid` at 20, and `si_status` at **24** (was never
+  written).  A reader that branches on `si_pid` — gecko's `IsProcessDead`
+  (`waitid(P_PID, …, WEXITED|WNOWAIT)` to observe, then a reaping `waitid`),
+  which does `if (si.si_pid == 0) return Running;` — saw a zeroed `si_pid`,
+  concluded the child was still alive, and re-issued the **blocking**
+  `waitid(WNOWAIT)` forever, pinning the caller's thread (observed as a
+  >900M-call `waitpid` spin that starved the Firefox render reactor).  The
+  exit status is now decomposed per the SIGCHLD contract (`CLD_EXITED` +
+  status, or `CLD_KILLED` + signal).  Companion fix: `wait4(2)` (61) now
+  writes the encoded `wstatus` (WIFEXITED/WEXITSTATUS, WIFSIGNALED/WTERMSIG)
+  per `wait(2)` — it previously ignored the `wstatus` pointer.  Pinned by
+  test 516 (byte-level `siginfo_t` layout) in `test_runner.rs`.  Per
+  POSIX.1-2017 `waitid(2)` / `wait(2)` and Linux `<asm-generic/siginfo.h>`.
 - **2026-05-30** — **musl / Linux-ABI completeness audit** added at
   `docs/MUSL_ABI_COMPLETENESS_AUDIT_2026-05-30.md`, scoped to the syscall
   surface musl libc (Alpine/libxul) actually issues.  Verdict: the surface is
@@ -175,7 +191,7 @@ Ranked by frequency in real program traces. Syscalls that would most unblock rea
 | 57 | `fork` | Full |
 | 59 | `execve` | Full; reads C-string path, delegates to exec subsystem |
 | 60 | `exit` | Full; exit_thread |
-| 61 | `wait4` | Full; delegates to sys_waitpid |
+| 61 | `wait4` | Full; reaps child and writes encoded `wstatus` (WIFEXITED/WEXITSTATUS, WIFSIGNALED/WTERMSIG) per wait(2) |
 | 62 | `kill` | Full; signal delivery |
 | 63 | `uname` | Full; returns AstryxOS utsname |
 | 65 | `shmctl` (note: UAPI 65 is `semop`) | Dispatches to sysv_shm::shmctl — **number mismatch: UAPI 65=semop, 31=shmdt, 67=shmdt** |
@@ -230,7 +246,7 @@ Ranked by frequency in real program traces. Syscalls that would most unblock rea
 | 232 | `epoll_wait` | Full |
 | 233 | `epoll_ctl` | Full |
 | 234 | `tgkill` | Full; signal by tgid |
-| 247 | `waitid` | Full; fills siginfo_t |
+| 247 | `waitid` | Full; honours WNOWAIT; fills `siginfo_t` at architectural x86-64 offsets (si_pid@16, si_uid@20, si_status@24) per `<asm-generic/siginfo.h>` |
 | 253 | `inotify_add_watch` | Full (stub impl but wired) |
 | 254 | `inotify_rm_watch` | Full (stub impl but wired) |
 | 257 | `openat` | Full; AT_FDCWD + relative path resolution |

@@ -2183,6 +2183,18 @@ pub fn run() -> ! {
         if test_515_waitid_wnowait_and_echild() { passed += 1; }
     }
 
+    // ── Test 516: waitid(2) siginfo_t byte layout (gecko IsProcessDead) ──
+    // The user siginfo_t that waitid fills must place si_pid at offset 16 and
+    // si_status at offset 24 (the _sifields union is 8-byte aligned). A reader
+    // that branches on si_pid (gecko's IsProcessDead) busy-loops the blocking
+    // waitid(WNOWAIT) forever if si_pid lands at the wrong offset. Per
+    // POSIX waitid(2) + Linux <asm-generic/siginfo.h>.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_516_waitid_siginfo_layout() { passed += 1; }
+    }
+
     // ── Test 229: PMM pte_share_count free-time invariant (W215 fix) ─────
     // Verifies that pmm::free_page refuses to recycle a frame whose
     // refcount table still records a live PTE reference, and that the
@@ -41796,6 +41808,112 @@ fn test_515_waitid_wnowait_and_echild() -> bool {
     crate::proc::proc_metrics::unregister(parent_pid);
 
     test_pass!("waitid WNOWAIT peek + ECHILD-on-already-reaped (POSIX waitid(2))");
+    true
+}
+
+// ── Test 516: waitid(2) siginfo_t byte layout (gecko IsProcessDead) ─────────
+//
+// The Firefox parent's `IsProcessDead` (ipc/chromium/src/base/
+// process_util_posix.cc) calls `waitid(P_PID, pid, &si, WEXITED|WNOWAIT)` to
+// OBSERVE a child's exit, then branches:
+//     if (si.si_pid == 0) return ProcessStatus::Running;   // not exited yet
+//     switch (si.si_code) { case CLD_EXITED: ...; }        // then reaps
+// If the kernel writes `si_pid` at the wrong byte offset, the reader sees a
+// zero `si_pid`, concludes the child is still running, and re-issues the
+// blocking `waitid(WNOWAIT)` forever — pinning the caller's thread (observed
+// as a >900M-call waitpid spin that starved Firefox's render reactor).
+//
+// This test verifies the *serialised bytes*, which the existing kernel-side
+// peek/reap test (515) never checked. Per POSIX.1-2017 `waitid(2)` and the
+// Linux `<asm-generic/siginfo.h>` x86-64 (LP64) layout: the three-int header
+// (si_signo@0, si_errno@4, si_code@8) is followed by the 8-byte-aligned
+// `_sifields` union at offset 16, whose `_sigchld` arm is _pid@16, _uid@20,
+// _status@24.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_516_waitid_siginfo_layout() -> bool {
+    use crate::syscall::{
+        fill_sigchld_siginfo, SI_SIZE, SI_OFF_SIGNO, SI_OFF_CODE,
+        SI_OFF_PID, SI_OFF_UID, SI_OFF_STATUS, CLD_EXITED, CLD_KILLED,
+    };
+
+    test_header!("waitid(2) siginfo_t byte layout (POSIX waitid(2))");
+
+    let rd = |buf: &[u8; SI_SIZE], off: usize| -> i32 {
+        i32::from_ne_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]])
+    };
+
+    // ── 1. Normal exit (CLD_EXITED): child pid 4, status 0 (the FF case) ──
+    let mut si = [0u8; SI_SIZE];
+    fill_sigchld_siginfo(&mut si, CLD_EXITED, 4, 0, 0);
+
+    // si_pid MUST be at offset 16 (the bug wrote it at 12). gecko reads here.
+    if rd(&si, SI_OFF_PID) != 4 {
+        test_fail!("waitid_siginfo", "si_pid@{} = {} (want 4) — gecko sees Running, spins",
+            SI_OFF_PID, rd(&si, SI_OFF_PID));
+        return false;
+    }
+    // The old-bug offset (12) MUST be zero now (it's union padding).
+    if rd(&si, 12) != 0 {
+        test_fail!("waitid_siginfo", "offset 12 = {} (want 0 padding); si_pid leaked here",
+            rd(&si, 12));
+        return false;
+    }
+    if rd(&si, SI_OFF_SIGNO) != 17 {
+        test_fail!("waitid_siginfo", "si_signo@0 = {} (want 17=SIGCHLD)", rd(&si, SI_OFF_SIGNO));
+        return false;
+    }
+    if rd(&si, SI_OFF_CODE) != CLD_EXITED {
+        test_fail!("waitid_siginfo", "si_code@8 = {} (want CLD_EXITED=1)", rd(&si, SI_OFF_CODE));
+        return false;
+    }
+    if rd(&si, SI_OFF_STATUS) != 0 {
+        test_fail!("waitid_siginfo", "si_status@24 = {} (want 0)", rd(&si, SI_OFF_STATUS));
+        return false;
+    }
+    test_println!("  CLD_EXITED: si_pid@16=4, si_code@8=1, si_status@24=0, pad@12=0 ✓");
+
+    // ── 2. Non-zero exit status is placed at offset 24, low 8 bits ────────
+    fill_sigchld_siginfo(&mut si, CLD_EXITED, 7, 0, 42);
+    if rd(&si, SI_OFF_PID) != 7 || rd(&si, SI_OFF_STATUS) != 42 {
+        test_fail!("waitid_siginfo", "exit status: si_pid@16={} si_status@24={} (want 7,42)",
+            rd(&si, SI_OFF_PID), rd(&si, SI_OFF_STATUS));
+        return false;
+    }
+    test_println!("  CLD_EXITED status 42: si_pid@16=7, si_status@24=42 ✓");
+
+    // ── 3. Killed-by-signal: si_code=CLD_KILLED, si_status=signal number ──
+    // (The kernel maps a `-signo` exit_code to CLD_KILLED + signo.)
+    let (code, status) = crate::syscall::test_exit_code_to_siginfo(-9); // SIGKILL
+    fill_sigchld_siginfo(&mut si, code, 5, 1000, status);
+    if rd(&si, SI_OFF_CODE) != CLD_KILLED || rd(&si, SI_OFF_STATUS) != 9 {
+        test_fail!("waitid_siginfo", "killed: si_code@8={} si_status@24={} (want 2,9)",
+            rd(&si, SI_OFF_CODE), rd(&si, SI_OFF_STATUS));
+        return false;
+    }
+    if rd(&si, SI_OFF_UID) != 1000 {
+        test_fail!("waitid_siginfo", "si_uid@20 = {} (want 1000)", rd(&si, SI_OFF_UID));
+        return false;
+    }
+    test_println!("  CLD_KILLED(SIGKILL): si_code@8=2, si_status@24=9, si_uid@20=1000 ✓");
+
+    // ── 4. The struct is fully zeroed outside the written fields (no leak) ─
+    // Every 4-byte word except {0,8,16,20,24} must be zero (offsets 4,12 and
+    // 28..124).
+    let mut leaked = false;
+    let mut off = 0;
+    while off + 4 <= SI_SIZE {
+        let is_written = off == SI_OFF_SIGNO || off == SI_OFF_CODE
+            || off == SI_OFF_PID || off == SI_OFF_UID || off == SI_OFF_STATUS;
+        if !is_written && rd(&si, off) != 0 { leaked = true; break; }
+        off += 4;
+    }
+    if leaked {
+        test_fail!("waitid_siginfo", "stale bytes leaked at offset {} (want fully zeroed pad)", off);
+        return false;
+    }
+    test_println!("  padding/union tail fully zeroed (no stack-byte leak) ✓");
+
+    test_pass!("waitid(2) siginfo_t byte layout (POSIX waitid(2))");
     true
 }
 

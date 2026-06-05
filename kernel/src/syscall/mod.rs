@@ -2492,7 +2492,110 @@ pub(crate) fn sys_waitpid(pid: i64, options: u32) -> i64 {
     // The only POSIX option the legacy entry honours is WNOHANG (=1); see
     // `sys_waitpid_ex` for the WNOWAIT (peek-without-reap) variant used by
     // `waitid(2)`.
-    sys_waitpid_ex(pid, (options & 1) != 0 /*WNOHANG*/, false /*WNOWAIT*/)
+    sys_waitpid_ex(pid, (options & 1) != 0 /*WNOHANG*/, false /*WNOWAIT*/, None)
+}
+
+/// POSIX `<signal.h>` / Linux `<asm-generic/siginfo.h>` SIGCHLD `si_code`s.
+/// (POSIX.1-2017 `<signal.h>`; Linux man-pages `sigaction(2)`, "SIGCHLD".)
+pub(crate) const CLD_EXITED: i32 = 1; // child called _exit(2)
+pub(crate) const CLD_KILLED: i32 = 2; // child terminated by signal (no core)
+
+/// Result of a `waitid(2)` collect, decomposed for the user `siginfo_t`.
+pub(crate) enum WaitidOutcome {
+    /// A child changed state.  `si_code`/`si_status` follow the SIGCHLD
+    /// contract: `CLD_EXITED`+exit-status, or `CLD_KILLED`+signal number.
+    Collected { pid: u64, si_code: i32, si_status: i32 },
+    /// WNOHANG requested and no matching child has changed state.
+    NoHang,
+    /// Negative errno (e.g. `-ECHILD` when there is no matching child).
+    Err(i64),
+}
+
+/// Map AstryxOS's raw `exit_code` to the POSIX `waitid(2)` `(si_code,
+/// si_status)` pair.  A non-negative code is an `_exit(2)` status (`CLD_EXITED`,
+/// low 8 bits per `wait(2)` "WEXITSTATUS"); a negative code is `-signo` from a
+/// terminating signal (`CLD_KILLED`, `si_status = signo`) — AstryxOS encodes a
+/// signal-terminated child as `-signo` in the signal-default-terminate /
+/// SIGKILL paths of `signal::check_signals`.
+fn exit_code_to_siginfo(exit_code: i32) -> (i32, i32) {
+    if exit_code < 0 {
+        (CLD_KILLED, -exit_code)
+    } else {
+        (CLD_EXITED, exit_code & 0xff)
+    }
+}
+
+/// Test-only accessor for [`exit_code_to_siginfo`] (Test 516).
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+pub(crate) fn test_exit_code_to_siginfo(exit_code: i32) -> (i32, i32) {
+    exit_code_to_siginfo(exit_code)
+}
+
+// ── x86-64 `siginfo_t` field offsets (LP64) ─────────────────────────────────
+//
+// Per POSIX.1-2017 `<signal.h>` and Linux `<asm-generic/siginfo.h>`.  The
+// header is three `int`s (si_signo, si_errno, si_code) = 12 bytes, then the
+// `union __sifields`.  That union contains members with 8-byte alignment
+// (`void *_addr` in `_sigfault`, `__ARCH_SI_CLOCK_T _utime` in `_sigchld`), so
+// it is 8-byte aligned and begins at offset 16 — NOT 12.  The SIGCHLD arm
+// (`_sigchld`) then lays out `_pid` (16), `_uid` (20), `_status` (24).
+//
+// Total `siginfo_t` size is `SI_MAX_SIZE` = 128 bytes.
+pub(crate) const SI_SIZE:       usize = 128;
+pub(crate) const SI_OFF_SIGNO:  usize = 0;  // int si_signo
+pub(crate) const SI_OFF_CODE:   usize = 8;  // int si_code
+pub(crate) const SI_OFF_PID:    usize = 16; // pid_t _sigchld._pid  (union @16)
+pub(crate) const SI_OFF_UID:    usize = 20; // uid_t _sigchld._uid
+pub(crate) const SI_OFF_STATUS: usize = 24; // int   _sigchld._status
+
+// Compile-time guard: the SIGCHLD union fields must sit inside the struct and
+// past the 12-byte header (so they never alias si_signo/si_errno/si_code).
+const _: () = {
+    assert!(SI_OFF_PID >= 16 && SI_OFF_PID + 4 <= SI_SIZE);
+    assert!(SI_OFF_UID == SI_OFF_PID + 4);
+    assert!(SI_OFF_STATUS == SI_OFF_UID + 4);
+};
+
+/// Serialise a SIGCHLD `siginfo_t` for `waitid(2)` into a 128-byte buffer at
+/// the architectural x86-64 offsets.  Zeroes the whole struct first so no
+/// padding/union bytes leak.  Shared by the syscall handler and its test so the
+/// byte layout has a single source of truth.
+pub(crate) fn fill_sigchld_siginfo(
+    buf: &mut [u8; SI_SIZE],
+    si_code: i32,
+    si_pid: i32,
+    si_uid: i32,
+    si_status: i32,
+) {
+    *buf = [0u8; SI_SIZE];
+    const SIGCHLD: i32 = 17;
+    buf[SI_OFF_SIGNO..SI_OFF_SIGNO + 4].copy_from_slice(&SIGCHLD.to_ne_bytes());
+    buf[SI_OFF_CODE..SI_OFF_CODE + 4].copy_from_slice(&si_code.to_ne_bytes());
+    buf[SI_OFF_PID..SI_OFF_PID + 4].copy_from_slice(&si_pid.to_ne_bytes());
+    buf[SI_OFF_UID..SI_OFF_UID + 4].copy_from_slice(&si_uid.to_ne_bytes());
+    buf[SI_OFF_STATUS..SI_OFF_STATUS + 4].copy_from_slice(&si_status.to_ne_bytes());
+}
+
+/// `waitid(2)` collect that reports the full `siginfo_t` decomposition the
+/// syscall must hand back to user space.
+///
+/// This is the kernel side that makes gecko's `IsProcessDead`
+/// (`waitid(P_PID, …, WEXITED|WNOWAIT)` to observe, then a reaping `waitid`)
+/// terminate instead of busy-looping: that caller branches on `si.si_pid`
+/// (offset 16) and `si.si_code` (offset 8) per `<asm-generic/siginfo.h>`, so
+/// the syscall layer must serialise those fields at the architectural offsets,
+/// not return only the pid.  See POSIX.1-2017 `waitid(2)`.
+pub(crate) fn sys_waitid(pid: i64, wnohang: bool, wnowait: bool) -> WaitidOutcome {
+    let mut exit_code: i32 = 0;
+    let ret = sys_waitpid_ex(pid, wnohang, wnowait, Some(&mut exit_code));
+    if ret > 0 {
+        let (si_code, si_status) = exit_code_to_siginfo(exit_code);
+        WaitidOutcome::Collected { pid: ret as u64, si_code, si_status }
+    } else if ret == 0 {
+        WaitidOutcome::NoHang
+    } else {
+        WaitidOutcome::Err(ret)
+    }
 }
 
 /// Core wait implementation shared by `wait4(2)` and `waitid(2)`.
@@ -2509,7 +2612,17 @@ pub(crate) fn sys_waitpid(pid: i64, options: u32) -> i64 {
 ///
 /// Returns the reaped/peeked child pid (`> 0`), 0 (WNOHANG, nothing ready),
 /// or a negative errno (`-ECHILD` when there is no matching child at all).
-pub(crate) fn sys_waitpid_ex(pid: i64, wnohang: bool, wnowait: bool) -> i64 {
+///
+/// When a child is collected and `exit_out` is `Some`, the child's raw
+/// `exit_code` is written through it so the `waitid(2)` path can decompose it
+/// into the user `siginfo_t` (`si_code`/`si_status`).  `wait4(2)` callers pass
+/// `None` (they only need the pid).
+pub(crate) fn sys_waitpid_ex(
+    pid: i64,
+    wnohang: bool,
+    wnowait: bool,
+    mut exit_out: Option<&mut i32>,
+) -> i64 {
     let parent_pid = crate::proc::current_pid_lockless();
 
     crate::serial_println!(
@@ -2523,12 +2636,14 @@ pub(crate) fn sys_waitpid_ex(pid: i64, wnohang: bool, wnowait: bool) -> i64 {
             crate::serial_println!(
                 "[SYSCALL] waitpid: child PID {} exited with code {} (peeked, WNOWAIT)",
                 child_pid, exit_code);
+            if let Some(out) = exit_out.as_deref_mut() { *out = exit_code; }
             return child_pid as i64;
         }
     } else if let Some((child_pid, exit_code)) = crate::proc::waitpid(parent_pid, pid) {
         crate::serial_println!(
             "[SYSCALL] waitpid: child PID {} exited with code {}",
             child_pid, exit_code);
+        if let Some(out) = exit_out.as_deref_mut() { *out = exit_code; }
         return child_pid as i64;
     }
 
@@ -2631,6 +2746,7 @@ pub(crate) fn sys_waitpid_ex(pid: i64, wnohang: bool, wnowait: bool) -> i64 {
                 "[SYSCALL] waitpid: child PID {} exited with code {} (collected without park)",
                 child_pid, exit_code
             );
+            if let Some(out) = exit_out.as_deref_mut() { *out = exit_code; }
             return child_pid as i64;
         }
 
@@ -2668,6 +2784,7 @@ pub(crate) fn sys_waitpid_ex(pid: i64, wnohang: bool, wnowait: bool) -> i64 {
                 "[SYSCALL] waitpid: child PID {} exited with code {}",
                 child_pid, exit_code
             );
+            if let Some(out) = exit_out.as_deref_mut() { *out = exit_code; }
             return child_pid as i64;
         }
     }
