@@ -2757,6 +2757,18 @@ pub fn run() -> ! {
     total += 1;
     if test_293_epoll_listening_unix_has_pending() { passed += 1; }
 
+    // ── Test 294: epoll EPOLLET edge-trigger on a level-ready eventfd ──────
+    // A watch registered with EPOLLET must report a readiness condition only
+    // on its rising edge: an eventfd whose counter stays nonzero (never
+    // drained) is delivered EPOLLIN exactly ONCE, then the next epoll_wait
+    // returns 0 — NOT the same level-ready event on every call.  Draining the
+    // eventfd (counter→0) and re-writing it re-arms the edge.  This is the
+    // regression guard for the gecko main-MessagePump spin (a wakeup eventfd
+    // left level-ready monopolised the CPU under pure level-triggered epoll).
+    // Refs: epoll(7) "Level-triggered and edge-triggered", eventfd(2).
+    total += 1;
+    if test_294_epoll_edge_triggered_eventfd() { passed += 1; }
+
     // ── Test 283: stack-prov main-stack TOP-window argv-writer capture ──
     // GATE-A blind-spot closure (2026-05-30).  Only built when the
     // `stack-prov` diagnostic feature is on (CI smoke does not enable it);
@@ -48775,6 +48787,154 @@ fn test_293_epoll_listening_unix_has_pending() -> bool {
 
     if ok {
         test_pass!("epoll EPOLLIN parity on listening AF_UNIX with pending connection (Test 293)");
+    }
+    ok
+}
+
+// ── Test 294: epoll EPOLLET edge-trigger on a level-ready eventfd ─────────────
+//
+// Regression guard for the gecko main-MessagePump epoll spin: a wakeup eventfd
+// registered with EPOLLET that stays level-ready (counter never drained to 0)
+// must be reported EPOLLIN on its rising edge ONCE, then suppressed on
+// subsequent epoll_wait calls — NOT re-delivered on every call (which under a
+// purely level-triggered implementation pins the polling thread at 100% CPU).
+// Draining the eventfd and re-writing it re-arms a fresh edge.
+//
+// Refs: epoll(7) "Level-triggered and edge-triggered notification",
+// epoll_ctl(2), epoll_wait(2), eventfd(2).
+fn test_294_epoll_edge_triggered_eventfd() -> bool {
+    test_header!("epoll EPOLLET edge-trigger on a level-ready eventfd (Test 294)");
+    let dispatch = crate::syscall::dispatch_linux_kernel;
+
+    // Linux ABI for this process (epoll/eventfd are Linux-personality syscalls).
+    let pid = crate::proc::current_pid();
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            p.linux_abi = true;
+            p.subsystem = crate::win32::SubsystemType::Linux;
+        }
+    }
+
+    fn make_ev(events: u32, data: u64) -> [u8; 12] {
+        let mut b = [0u8; 12];
+        b[0..4].copy_from_slice(&events.to_le_bytes());
+        b[4..12].copy_from_slice(&data.to_le_bytes());
+        b
+    }
+    fn ev_events(b: &[u8; 12]) -> u32 {
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    }
+
+    const EPOLLIN: u32 = 0x0001;
+    const EPOLLET: u32 = 1 << 31;
+    const CTL_ADD: u64 = 1;
+    // eventfd2 / epoll syscall numbers (Linux x86-64 ABI).
+    const SYS_EPOLL_CTL:    u64 = 233;
+    const SYS_EPOLL_WAIT:   u64 = 232;
+    const SYS_EPOLL_CREATE: u64 = 291; // epoll_create1
+    const SYS_EVENTFD2:     u64 = 290;
+    const SYS_CLOSE:        u64 = 3;
+    const SYS_READ:         u64 = 0;
+    const SYS_WRITE:        u64 = 1;
+
+    let mut ok = true;
+
+    // eventfd2(initval=0, flags=0) → a fresh counter-zero eventfd.
+    let efd = dispatch(SYS_EVENTFD2, 0, 0, 0, 0, 0, 0);
+    if efd < 0 {
+        test_fail!("epollet", "eventfd2 = {}", efd);
+        return false;
+    }
+    let epfd = dispatch(SYS_EPOLL_CREATE, 0, 0, 0, 0, 0, 0);
+    if epfd < 0 {
+        test_fail!("epollet", "epoll_create1 = {}", epfd);
+        let _ = dispatch(SYS_CLOSE, efd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+
+    // Register the eventfd EPOLLIN|EPOLLET.
+    {
+        let ev = make_ev(EPOLLIN | EPOLLET, 0xE7);
+        let r = dispatch(SYS_EPOLL_CTL, epfd as u64, CTL_ADD, efd as u64, ev.as_ptr() as u64, 0, 0);
+        if r != 0 {
+            test_fail!("epollet", "epoll_ctl(ADD, ET) = {}", r);
+            ok = false;
+        }
+    }
+
+    // Write 1 to the eventfd → counter 0→1: the rising edge.  (We deliberately
+    // never read the eventfd, so it stays level-ready throughout.)
+    {
+        let v: u64 = 1;
+        let r = dispatch(SYS_WRITE, efd as u64, (&v as *const u64) as u64, 8, 0, 0, 0);
+        if r != 8 {
+            test_fail!("epollet", "write(eventfd, 1) = {} (want 8)", r);
+            ok = false;
+        }
+    }
+
+    // First epoll_wait(timeout=0): MUST deliver the rising-edge EPOLLIN once.
+    {
+        let mut buf = [[0u8; 12]; 4];
+        let r = dispatch(SYS_EPOLL_WAIT, epfd as u64, buf[0].as_mut_ptr() as u64, 4, 0, 0, 0);
+        if r == 1 && ev_events(&buf[0]) & EPOLLIN != 0 {
+            test_println!("  wait#1 → 1 event EPOLLIN (rising edge delivered) ✓");
+        } else {
+            test_fail!("epollet", "wait#1 r={} events={:#x} (want 1 / EPOLLIN)",
+                r, ev_events(&buf[0]));
+            ok = false;
+        }
+    }
+
+    // Second epoll_wait(timeout=0): the eventfd is STILL level-ready (counter
+    // never drained), but under EPOLLET the edge was already consumed → MUST
+    // return 0.  A purely level-triggered kernel returns 1 here forever — the
+    // spin this fix closes.
+    {
+        let mut buf = [[0u8; 12]; 4];
+        let r = dispatch(SYS_EPOLL_WAIT, epfd as u64, buf[0].as_mut_ptr() as u64, 4, 0, 0, 0);
+        if r == 0 {
+            test_println!("  wait#2 → 0 events (edge already consumed, no re-report) ✓");
+        } else {
+            test_fail!("epollet",
+                "wait#2 r={} events={:#x} — EPOLLET fd re-reported while level-ready (spin bug)",
+                r, ev_events(&buf[0]));
+            ok = false;
+        }
+    }
+
+    // Drain the eventfd (read → counter back to 0) then re-write → fresh edge.
+    {
+        let mut rbuf = [0u8; 8];
+        let r = dispatch(SYS_READ, efd as u64, rbuf.as_mut_ptr() as u64, 8, 0, 0, 0);
+        if r != 8 {
+            test_fail!("epollet", "read(eventfd) = {} (want 8 to drain)", r);
+            ok = false;
+        }
+        let v: u64 = 1;
+        let _ = dispatch(SYS_WRITE, efd as u64, (&v as *const u64) as u64, 8, 0, 0, 0);
+    }
+
+    // Third epoll_wait: the drain-then-write produced a NEW rising edge → MUST
+    // deliver EPOLLIN once again (proves re-arm works, not a one-shot latch).
+    {
+        let mut buf = [[0u8; 12]; 4];
+        let r = dispatch(SYS_EPOLL_WAIT, epfd as u64, buf[0].as_mut_ptr() as u64, 4, 0, 0, 0);
+        if r == 1 && ev_events(&buf[0]) & EPOLLIN != 0 {
+            test_println!("  wait#3 → 1 event EPOLLIN (re-armed after drain+write) ✓");
+        } else {
+            test_fail!("epollet", "wait#3 r={} events={:#x} (want 1 / EPOLLIN re-arm)",
+                r, ev_events(&buf[0]));
+            ok = false;
+        }
+    }
+
+    let _ = dispatch(SYS_CLOSE, epfd as u64, 0, 0, 0, 0, 0);
+    let _ = dispatch(SYS_CLOSE, efd as u64, 0, 0, 0, 0, 0);
+
+    if ok {
+        test_pass!("epoll EPOLLET edge-trigger on a level-ready eventfd (Test 294)");
     }
     ok
 }
