@@ -376,6 +376,73 @@ pub fn init(boot_info: &BootInfo) {
         boot_info_reserved_pages,
     );
 
+    // Reserve the UEFI bootstrap stack the BSP is *currently executing on*.
+    //
+    // After `ExitBootServices`, UEFI reports the region that backed the
+    // loader's stack as `EfiBootServicesData`, which our converter maps to
+    // `Available` (UEFI §7.2, GetMemoryMap) — so the pages under the live
+    // bootstrap stack are marked free above and become eligible for
+    // `alloc_page`/`alloc_pages`.  But the BSP main/idle thread (TID 0) keeps
+    // running on this very stack for the lifetime of the kernel: `_start` does
+    // NOT switch the BSP onto TID 0's higher-half `kernel_stack_base`
+    // (see `kernel/src/main.rs` and `proc::init`).  If a later
+    // `alloc_pages` (e.g. a clone/pthread kernel-stack allocation under heavy
+    // thread churn) hands out the bootstrap-stack frames, the new thread writes
+    // its own data over TID 0's live stack — clobbering the callee-saved frame
+    // `switch_context_asm` later pops, so the next switch *into* TID 0 faults
+    // with a #GP/non-canonical `ret` (BUGCHECK KERNEL_GPF / UNEXPECTED_KERNEL_
+    // MODE_TRAP on `switch_context_asm`).  Reserve the live stack here, while
+    // we are still on it, exactly as the BootInfo reservation above closes the
+    // same UEFI-reclamation hole for the BootInfo struct.
+    //
+    // We read the current stack pointer and reserve a window that brackets it:
+    // a generous downward guard (the stack grows down, and the BSP poll loop's
+    // deepest call chain plus interrupt frames must fit) and the remainder of
+    // the current page upward (data already pushed above the current RSP).
+    //
+    // Refs: UEFI Specification §7.2 (GetMemoryMap / EfiBootServicesData);
+    //       Intel SDM Vol. 3A §4.10.5 (frames backing live kernel structures
+    //       must remain reserved against PMM recycling); System V AMD64 ABI
+    //       §3.4 (stack grows toward lower addresses).
+    {
+        // Downward guard: the bootstrap stack only ever grows DOWN from the
+        // current RSP during the rest of boot and the BSP poll loop.  128 KiB
+        // dwarfs the BSP's deepest observed call chain (a few KiB) while
+        // costing only 32 frames of otherwise-free low memory.
+        const BOOTSTRAP_STACK_GUARD_DOWN: u64 = 128 * 1024;
+        let rsp: u64;
+        // SAFETY: read-only capture of the current stack pointer; we are
+        // executing on the bootstrap stack here (pmm::init runs before any
+        // stack switch), so RSP names a live address inside it.
+        unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)); }
+        // The bootstrap stack is in the identity-mapped low region (PML4[0]),
+        // so its physical address equals its virtual address.
+        let stack_lo = rsp.saturating_sub(BOOTSTRAP_STACK_GUARD_DOWN) & !(PAGE_SIZE as u64 - 1);
+        // Cover to the top of the page containing RSP (data pushed above us).
+        let stack_hi = (rsp | (PAGE_SIZE as u64 - 1)).saturating_add(1);
+        let first_page = (stack_lo / PAGE_SIZE as u64) as usize;
+        let last_page  = ((stack_hi - 1) / PAGE_SIZE as u64) as usize;
+        let mut newly_reserved = 0u64;
+        for page in first_page..=last_page {
+            if page < MAX_PAGES {
+                // SAFETY: PMM lock held, page in bounds.  Idempotent against
+                // pages already reserved (kernel image / first-1-MiB below).
+                unsafe {
+                    if !is_page_used_locked(page) {
+                        mark_page_used(page);
+                        if total_available > 0 { total_available -= 1; }
+                        newly_reserved += 1;
+                    }
+                }
+            }
+        }
+        crate::serial_println!(
+            "[PMM] Bootstrap-stack reservation: rsp={:#x} phys=[{:#x}..{:#x}) \
+             pages={}..={} newly_reserved={} (BSP TID 0 live stack)",
+            rsp, stack_lo, stack_hi, first_page, last_page, newly_reserved,
+        );
+    }
+
     // Mark first 1 MiB as reserved (BIOS, VGA, etc.)
     for page in 0..256 {
         // SAFETY: We hold the PMM lock and page is in bounds.
