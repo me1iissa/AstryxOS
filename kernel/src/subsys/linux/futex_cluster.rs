@@ -321,8 +321,19 @@ fn select_candidates(
 
     let mut out: alloc::vec::Vec<Candidate> = alloc::vec::Vec::new();
     {
+        use crate::syscall::FutexKey;
         let waiters = crate::syscall::FUTEX_WAITERS.lock();
-        for (&(wpid, wuaddr), tids) in waiters.range((pid, lo)..(pid, hi)) {
+        // The cluster-wake compensation operates on the same-process
+        // (PRIVATE-key) virtual-address cluster: sibling pthread_cond_t fields
+        // within one process's enclosing object.  A process-SHARED futex is
+        // keyed by backing-object identity (no contiguous virtual range), so it
+        // is excluded — `Private(pid, _)` keys form a contiguous, ascending
+        // slice in the FutexKey ordering.
+        for (k, tids) in waiters.range(FutexKey::Private(pid, lo)..FutexKey::Private(pid, hi)) {
+            let (wpid, wuaddr) = match k {
+                FutexKey::Private(p, u) => (*p, *u),
+                FutexKey::Shared { .. } => continue,
+            };
             if wpid != pid { continue; }
             if wuaddr == wake_uaddr { continue; } // exact match handled by main wake
             if tids.is_empty() { continue; }
@@ -394,13 +405,17 @@ fn select_candidates(
 /// was already woken; our compensation simply didn't wake an additional
 /// one.
 fn wake_one_candidate(pid: u64, cand: &Candidate) -> Option<u64> {
+    use crate::syscall::FutexKey;
+    // Candidates are selected only from the PRIVATE-key cluster, so the
+    // bucket to drain is the private key for `(pid, cand.uaddr)`.
+    let cand_key = FutexKey::Private(pid, cand.uaddr);
     let tid = {
         let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
-        let list = waiters.get_mut(&(pid, cand.uaddr))?;
+        let list = waiters.get_mut(&cand_key)?;
         if list.is_empty() { return None; }
         let t = list.remove(0);
         if list.is_empty() {
-            waiters.remove(&(pid, cand.uaddr));
+            waiters.remove(&cand_key);
         }
         t
     };
@@ -444,9 +459,10 @@ pub fn compensate(pid: u64, wake_tid: u64, wake_uaddr: u64, nr_wake: u64) -> u64
             .saturating_add(CLUSTER_HALF_WINDOW)
             .saturating_add(3) & !3u64;
         let any_neighbour = {
+            use crate::syscall::FutexKey;
             let waiters = crate::syscall::FUTEX_WAITERS.lock();
-            waiters.range((pid, lo)..(pid, hi))
-                .any(|(&(p, u), tids)| p == pid && u != wake_uaddr && !tids.is_empty())
+            waiters.range(FutexKey::Private(pid, lo)..FutexKey::Private(pid, hi))
+                .any(|(k, tids)| matches!(k, FutexKey::Private(p, u) if *p == pid && *u != wake_uaddr) && !tids.is_empty())
         };
         if any_neighbour {
             CLUSTER_WAKE_MISSES.fetch_add(1, Ordering::Relaxed);

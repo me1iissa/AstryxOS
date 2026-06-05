@@ -255,49 +255,118 @@ pub(crate) unsafe fn user_read_timespec(addr: u64) -> Option<(u64, u64)> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Futex wait queue — keyed by (pid, uaddr)
+// Futex wait queue — keyed by [`FutexKey`] (private: (pid, uaddr); shared:
+// backing-object identity)
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// Key shape: `(pid, uaddr)` — the FUTEX_PRIVATE key per `futex(2)`.
+// Per `futex(2)` (Linux man-pages, "FUTEX_PRIVATE_FLAG") a futex word names a
+// rendezvous point that must hash identically for the waiter and the waker:
 //
-// Per `futex(2)` (Linux man-pages, "FUTEX_PRIVATE_FLAG" and "Priority-inheritance
-// futexes"):
+//   * A PRIVATE futex is scoped to a single address space and identified by
+//     the tuple `(mm, virtual address)`.  We approximate `mm` with `pid` —
+//     correct because every Linux task on AstryxOS has its own page tables and
+//     no two distinct pids share an `mm`.
 //
-//   * FUTEX_PRIVATE futexes are scoped to a single process and identified by
-//     the tuple `(mm_struct, virtual address)`.  We approximate `mm_struct`
-//     with `pid` — correct because every process has its own page tables and
-//     no two processes share the `mm` of a Linux task on AstryxOS.
+//   * A SHARED (process-shared / `pshared`) futex names a *backing object*,
+//     not a virtual address.  Two processes that map the same shared object —
+//     a file, or an `memfd_create(2)` anonymous file — at DIFFERENT virtual
+//     addresses must still rendezvous: a `FUTEX_WAIT` in process A and the
+//     matching `FUTEX_WAKE` in process B operate on the same logical futex
+//     word even though their `uaddr` values differ.  Keying such a futex by
+//     `(pid, uaddr)` would place the waiter and the waker in different hash
+//     buckets and the wake would never reach the waiter.  The key is therefore
+//     the page identity of the backing object: `(mount_idx, inode, byte offset
+//     within the object)`.  See the `get_futex_key`-equivalent semantics
+//     described in `futex(2)`.
 //
-//   * FUTEX_SHARED futexes are scoped to a backing object and identified by
-//     the tuple `(inode, page offset within file)` for file-backed mappings
-//     or by an anonymous-mapping anchor for `MAP_SHARED|MAP_ANONYMOUS`.
-//     Two processes that map the same shared region at different virtual
-//     addresses must still hash to the same key, otherwise a
-//     `pthread_mutex_lock` in process A and the matching wake in process B
-//     will miss.
+// Which kind a given `(pid, uaddr)` names is resolved at futex-syscall time by
+// [`resolve_futex_key`]: it consults the VMA backing `uaddr`.  A `MAP_SHARED`
+// file/`memfd`-backed VMA yields the SHARED key; everything else (private
+// mappings, anonymous mappings — including `MAP_SHARED|MAP_ANONYMOUS`, whose
+// pinning object is the mm itself, matching `futex(2)`) yields the PRIVATE key.
+// `FUTEX_PRIVATE_FLAG`, when the caller sets it, forces the PRIVATE shape; its
+// absence over a shared VMA selects the SHARED key.  The PRIVATE path is the
+// fast path and is unchanged: a private futex resolves to `(pid, uaddr)`
+// exactly as before, and the only added cost on the shared path is one VMA
+// lookup at op entry (no extra cost once the key is in hand).
 //
-// This implementation uses the FUTEX_PRIVATE key shape for ALL futex
-// operations, including those with the FUTEX_PRIVATE_FLAG clear.  This is
-// correct in practice when:
-//
-//   (a) The futex is FUTEX_PRIVATE (FUTEX_PRIVATE_FLAG set, or implied by
-//       the caller's intent — `pthread_mutexattr_setpshared(_, PROCESS_PRIVATE)`
-//       and similar default to FUTEX_PRIVATE).
-//   (b) The futex is FUTEX_SHARED AND both processes have mapped the shared
-//       region at the same `uaddr` (common when a parent forks and the child
-//       inherits identical mappings, or when both ends explicitly request
-//       MAP_FIXED at the same VA).
-//
-// Cross-process FUTEX_SHARED synchronisation across DIFFERENT virtual
-// addresses is NOT supported.  No upstream binary on the current demo path
-// (musl-FF strace differential 2026-05-20) uses it.  When a use case
-// emerges, change `(u64, u64)` to a `FutexKey` enum with `Private(pid, va)`
-// and `Shared(mount_idx, inode, page_off)` variants, derive the shared
-// variant from `vma::lookup(pid, uaddr)` on every WAIT/WAKE/REQUEUE entry,
-// and back-fill tests with a two-process MAP_SHARED+pthread_mutex case.
-//
-// Refs: `futex(2)` Linux man-pages; POSIX.1-2017 §pthread_mutexattr_getpshared.
-pub(crate) static FUTEX_WAITERS: Mutex<BTreeMap<(u64, u64), Vec<u64>>> = Mutex::new(BTreeMap::new());
+// Refs: `futex(2)` Linux man-pages; `memfd_create(2)`;
+// POSIX.1-2017 §pthread_mutexattr_getpshared.
+
+/// Identity of a futex rendezvous point.
+///
+/// A futex word is named either by its address space + virtual address (a
+/// PRIVATE futex) or by the page identity of the shared backing object it
+/// lives on (a SHARED / `pshared` futex).  Both variants are total-ordered so
+/// the type can key the `FUTEX_WAITERS` `BTreeMap`.
+///
+/// Per `futex(2)`: a PRIVATE futex hashes on `(mm, uaddr)`; a SHARED futex
+/// hashes on the backing object so two processes mapping the same object at
+/// different virtual addresses rendezvous.  See [`resolve_futex_key`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum FutexKey {
+    /// Process-private futex: `(pid, uaddr)`.  Two operations rendezvous iff
+    /// they share both the pid (address space) and the virtual address.
+    Private(u64, u64),
+    /// Process-shared futex on a file/`memfd`-backed `MAP_SHARED` page.  Keyed
+    /// by the backing object identity + byte offset within that object, so two
+    /// processes mapping the same object at different virtual addresses
+    /// rendezvous.  `byte_off` is the absolute byte offset of the futex word
+    /// within the backing object (VMA file offset folded with the word's
+    /// distance from the VMA base); the 4-byte alignment of every futex word
+    /// keeps it well-defined.
+    Shared { mount_idx: usize, inode: u64, byte_off: u64 },
+}
+
+impl FutexKey {
+    /// The pid an operation issued for, for the diagnostic/exit paths that
+    /// still reason per-process.  For SHARED keys there is no single owning
+    /// pid; returns `None`.
+    #[inline]
+    pub(crate) fn private_pid(&self) -> Option<u64> {
+        match self {
+            FutexKey::Private(pid, _) => Some(*pid),
+            FutexKey::Shared { .. } => None,
+        }
+    }
+}
+
+/// Resolve the `(pid, uaddr)` of a futex operation to the [`FutexKey`] that
+/// names its rendezvous point.
+///
+/// The futex word at `uaddr` is SHARED iff the VMA covering it is `MAP_SHARED`
+/// and file/`memfd`-backed (`VmBacking::File`); in that case the key is the
+/// backing object identity plus the word's absolute byte offset within the
+/// object.  Every other case — private mappings, anonymous mappings (shared or
+/// private), an unmapped `uaddr`, or the absence of a resolvable VmSpace —
+/// yields the PRIVATE key `(pid, uaddr)`, which is both the fast path and the
+/// correct fallback (an anonymous shared mapping's pinning object is the mm,
+/// per `futex(2)`).
+///
+/// `force_private` is set when the caller passed `FUTEX_PRIVATE_FLAG`: per
+/// `futex(2)` that flag unconditionally selects the private key shape, so the
+/// VMA lookup is skipped entirely (the fast path the flag exists to provide).
+///
+/// Acquires `PROCESS_TABLE` briefly (via
+/// [`crate::proc::futex_backing_for`]); takes no futex lock, so it is safe to
+/// call before acquiring `FUTEX_WAITERS`.
+pub(crate) fn resolve_futex_key(pid: u64, uaddr: u64, force_private: bool) -> FutexKey {
+    if force_private {
+        return FutexKey::Private(pid, uaddr);
+    }
+    match crate::proc::futex_backing_for(pid, uaddr) {
+        Some((mount_idx, inode, vma_base, file_offset)) => {
+            // Absolute byte offset of the futex word within the backing
+            // object: the VMA's base file offset, plus the word's distance
+            // from the VMA base.  4-byte futex-word alignment keeps this exact.
+            let byte_off = file_offset.wrapping_add(uaddr.wrapping_sub(vma_base));
+            FutexKey::Shared { mount_idx, inode, byte_off }
+        }
+        None => FutexKey::Private(pid, uaddr),
+    }
+}
+
+pub(crate) static FUTEX_WAITERS: Mutex<BTreeMap<FutexKey, Vec<u64>>> = Mutex::new(BTreeMap::new());
 
 /// Destination key for waiters that a `FUTEX_REQUEUE` / `FUTEX_CMP_REQUEUE`
 /// moved off their original WAIT queue.
@@ -312,20 +381,23 @@ pub(crate) static FUTEX_WAITERS: Mutex<BTreeMap<(u64, u64), Vec<u64>>> = Mutex::
 /// for a later wake to spuriously pop, and (b) misclassify the timeout as a
 /// successful wake (returning 0 instead of ETIMEDOUT).
 ///
-/// This map records `(pid, tid) → dest_uaddr` for exactly the window between a
+/// This map records `(pid, tid) → dest_key` for exactly the window between a
 /// requeue moving the TID and that TID's WAIT branch running its post-wake
 /// cleanup.  The cleanup consults it to scan the bucket the waiter actually
 /// sits in, then removes the entry.  Keyed by `(pid, tid)`: a TID is unique
 /// within a process and at most one requeue destination is live per parked
-/// waiter.  Lock order: acquired only while NOT holding `FUTEX_WAITERS` for
-/// the requeue insert (insert happens after the `FUTEX_WAITERS` critical
-/// section in the REQUEUE branch) and acquired *inside* the `FUTEX_WAITERS`
-/// critical section in the WAIT cleanup — to keep a single, consistent order
-/// (`FUTEX_WAITERS` → `FUTEX_REQUEUE_DEST`), the requeue insert takes
-/// `FUTEX_REQUEUE_DEST` while still holding `FUTEX_WAITERS`.
+/// waiter.  The destination is a full [`FutexKey`] because a requeue may move a
+/// waiter onto a SHARED bucket (uaddr2 on a different shared backing object),
+/// not merely a different virtual address.  Lock order: acquired only while NOT
+/// holding `FUTEX_WAITERS` for the requeue insert (insert happens after the
+/// `FUTEX_WAITERS` critical section in the REQUEUE branch) and acquired
+/// *inside* the `FUTEX_WAITERS` critical section in the WAIT cleanup — to keep
+/// a single, consistent order (`FUTEX_WAITERS` → `FUTEX_REQUEUE_DEST`), the
+/// requeue insert takes `FUTEX_REQUEUE_DEST` while still holding
+/// `FUTEX_WAITERS`.
 ///
 /// Ref: `futex(2)` Linux man-pages (FUTEX_REQUEUE / FUTEX_CMP_REQUEUE).
-pub(crate) static FUTEX_REQUEUE_DEST: Mutex<BTreeMap<(u64, u64), u64>> = Mutex::new(BTreeMap::new());
+pub(crate) static FUTEX_REQUEUE_DEST: Mutex<BTreeMap<(u64, u64), FutexKey>> = Mutex::new(BTreeMap::new());
 
 /// Outcome of `futex_wait_check_and_enqueue`.
 #[derive(Debug)]
@@ -357,9 +429,13 @@ pub(crate) enum FutexWaitOutcome {
 /// path uses a kernel-mode reader so the same critical section is exercised
 /// without needing a real user mapping.  The closure must be cheap and must
 /// not acquire any kernel locks.
+///
+/// `key` is the resolved [`FutexKey`] (private or shared) naming the
+/// rendezvous; the caller resolves it once before this call (see
+/// [`resolve_futex_key`]).  All bucket operations key on it, so a shared-futex
+/// waiter lands in the same bucket a cross-process waker scans.
 pub(crate) fn futex_wait_check_and_enqueue<R>(
-    pid: u64,
-    uaddr: u64,
+    key: FutexKey,
     val: u64,
     tid: u64,
     wake_tick: u64,
@@ -392,7 +468,7 @@ where
         return FutexWaitOutcome::ValueMismatch;
     }
 
-    waiters.entry((pid, uaddr)).or_insert_with(Vec::new).push(tid);
+    waiters.entry(key).or_insert_with(Vec::new).push(tid);
 
     // Mark Blocked under THREAD_TABLE while still holding FUTEX_WAITERS.
     //
@@ -404,25 +480,24 @@ where
     // overwrite Dead with Blocked, leaving a "Blocked but not in any wait
     // queue" thread that schedule() never picks and the reaper never reaps.
     //
-    // Defensive: if state is already Dead, undo our queue push (exit_group's
-    // `futex_drain_pid` will run when we release FUTEX_WAITERS, but draining
-    // is keyed on (pid, _) and we have just made the queue non-empty under a
-    // valid key — the drain still works, but it costs an extra branch.  Pop
-    // explicitly so the queue is clean immediately).  Skip the state write.
-    // Returning Enqueued is the right outcome: the caller will call
-    // schedule(), which will skip this Dead thread, and the next pass of
-    // reap_dead_threads_sched will reclaim it.
+    // Defensive: if state is already Dead, undo our queue push so the queue is
+    // clean immediately, then skip the state write.  (exit_group's
+    // `futex_drain_pid` drains the dying process's PRIVATE buckets when we
+    // release FUTEX_WAITERS; an explicit pop here keeps the bucket clean
+    // regardless of whether `key` is private or shared.)  Returning Enqueued is
+    // the right outcome: the caller will call schedule(), which will skip this
+    // Dead thread, and the next pass of reap_dead_threads_sched will reclaim it.
     {
         let mut threads = crate::proc::THREAD_TABLE.lock();
         if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
             if t.state == crate::proc::ThreadState::Dead {
                 // Undo the queue push we just made.
-                if let Some(list) = waiters.get_mut(&(pid, uaddr)) {
+                if let Some(list) = waiters.get_mut(&key) {
                     if let Some(pos) = list.iter().rposition(|&x| x == tid) {
                         list.remove(pos);
                     }
                     if list.is_empty() {
-                        waiters.remove(&(pid, uaddr));
+                        waiters.remove(&key);
                     }
                 }
             } else {
@@ -2187,20 +2262,47 @@ pub fn write_u32_to_user_pub(cr3: u64, vaddr: u64, val: u32) {
 /// Per futex(2) NOTES: "If a process exits while threads of that process
 /// are blocked on a futex, those threads are woken (with a wake-up
 /// indicating the futex is in an inconsistent state)."  We achieve the
-/// equivalent here: the threads themselves are already Dead, so we just
-/// clean up the queue keyed by `(pid, _)`.
+/// equivalent here: the threads themselves are already Dead.
+///
+/// Two bucket classes are scrubbed:
+///   * PRIVATE buckets `Private(pid, _)` belong solely to the dying process,
+///     so the whole bucket is removed.
+///   * SHARED buckets may hold waiters from *several* processes that map the
+///     same backing object; only the dying process's TIDs are removed,
+///     leaving any other process's waiters parked.  The dying TIDs are taken
+///     from `THREAD_TABLE` (`t.pid == pid`), which still lists them as Dead at
+///     drain time (reaping happens later).
 pub fn futex_drain_pid(pid: u64) {
+    // Snapshot the dying process's TIDs so shared buckets can be scrubbed by
+    // TID membership.  THREAD_TABLE is taken and released BEFORE FUTEX_WAITERS
+    // to avoid introducing a THREAD_TABLE→FUTEX_WAITERS edge (the WAIT path
+    // takes FUTEX_WAITERS→THREAD_TABLE; holding both in the reverse order here
+    // would be a lock-order inversion).
+    let dying_tids: alloc::vec::Vec<u64> = {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        threads.iter().filter(|t| t.pid == pid).map(|t| t.tid).collect()
+    };
+
     let mut waiters = FUTEX_WAITERS.lock();
-    let dead_keys: alloc::vec::Vec<(u64, u64)> = waiters
-        .keys()
-        .filter(|&&(p, _)| p == pid)
-        .copied()
-        .collect();
-    for key in dead_keys {
-        waiters.remove(&key);
+    let to_scrub: alloc::vec::Vec<FutexKey> = waiters.keys().copied().collect();
+    for key in to_scrub {
+        match key {
+            FutexKey::Private(p, _) if p == pid => {
+                waiters.remove(&key);
+            }
+            FutexKey::Shared { .. } => {
+                if let Some(list) = waiters.get_mut(&key) {
+                    list.retain(|t| !dying_tids.contains(t));
+                    if list.is_empty() {
+                        waiters.remove(&key);
+                    }
+                }
+            }
+            FutexKey::Private(..) => {} // another process's private bucket
+        }
     }
     // Drain any lingering requeue-destination records for this pid so a
-    // PID-reuse cannot inherit a stale `(pid, tid) → uaddr2` mapping.  Same
+    // PID-reuse cannot inherit a stale `(pid, tid) → dest_key` mapping.  Same
     // FUTEX_WAITERS → FUTEX_REQUEUE_DEST lock order as the requeue/WAIT paths.
     let mut dest = FUTEX_REQUEUE_DEST.lock();
     let dead_dest: alloc::vec::Vec<(u64, u64)> = dest
@@ -2215,16 +2317,26 @@ pub fn futex_drain_pid(pid: u64) {
 
 /// Wake futex waiters from the exit path (CLONE_CHILD_CLEARTID).
 /// This is called from proc::exit_thread when a thread with clear_child_tid exits.
+///
+/// The `clear_child_tid` word is a thread-local address in the exiting
+/// thread's own address space; per `clone(2)` CLONE_CHILD_CLEARTID it is a
+/// process-private futex.  We resolve the [`FutexKey`] the same way the WAIT
+/// side did (`resolve_futex_key`) so a waiter that parked on this word — even
+/// in the unlikely event the word lives on a shared mapping — is found in the
+/// bucket it actually occupies.  If the mapping has already been torn down the
+/// resolver falls back to `Private(pid, uaddr)`, which is the key a private
+/// CLEARTID waiter used.
 pub fn futex_wake_for_exit(pid: u64, uaddr: u64, max_wake: u64) {
+    let key = resolve_futex_key(pid, uaddr, false);
     #[cfg(feature = "firefox-test-core")]
     let key_present;
     let tids_to_wake: alloc::vec::Vec<u64> = {
         let mut waiters = FUTEX_WAITERS.lock();
         #[cfg(feature = "firefox-test-core")]
         {
-            key_present = waiters.contains_key(&(pid, uaddr));
+            key_present = waiters.contains_key(&key);
         }
-        if let Some(list) = waiters.get_mut(&(pid, uaddr)) {
+        if let Some(list) = waiters.get_mut(&key) {
             let mut result = alloc::vec::Vec::new();
             let mut woken = 0u64;
             while !list.is_empty() && woken < max_wake {
@@ -2232,7 +2344,7 @@ pub fn futex_wake_for_exit(pid: u64, uaddr: u64, max_wake: u64) {
                 woken += 1;
             }
             if list.is_empty() {
-                waiters.remove(&(pid, uaddr));
+                waiters.remove(&key);
             }
             result
         } else {
@@ -2243,14 +2355,14 @@ pub fn futex_wake_for_exit(pid: u64, uaddr: u64, max_wake: u64) {
     {
         // Snapshot remaining keys for diagnosis if our lookup missed.
         let waiters = FUTEX_WAITERS.lock();
-        let other_keys: alloc::vec::Vec<(u64, u64)> = waiters
+        let other_keys: alloc::vec::Vec<FutexKey> = waiters
             .keys()
-            .filter(|&&(p, _)| p == pid)
+            .filter(|k| k.private_pid() == Some(pid))
             .copied()
             .collect();
         crate::serial_println!(
-            "[FUTEX_WAKE_EXIT] pid={} uaddr={:#x} key_present={} woken={:?} remaining_pid_keys={:?}",
-            pid, uaddr, key_present, tids_to_wake, other_keys
+            "[FUTEX_WAKE_EXIT] pid={} uaddr={:#x} key={:?} key_present={} woken={:?} remaining_pid_keys={:?}",
+            pid, uaddr, key, key_present, tids_to_wake, other_keys
         );
     }
     // Wake the threads (no lock held).
