@@ -918,6 +918,126 @@ def run_kdb_read_png_check():
     print()
 
 
+def run_livelock_reap_check():
+    """
+    Tier 1.5 host-only check: the LivelockDetector + the auto-reap CLI surface.
+
+    No QEMU launched (< 1s). Drives the pure detector with synthetic metrics
+    sequences so a future refactor cannot silently break the guard that stops a
+    spinning FF boot from pinning a core:
+
+      * a livelock sequence (pid=1 sc explodes while the deepest gate is frozen
+        past the wall-clock window) MUST flag `suspected` then `should_reap`
+      * a healthy sequence (sc climbs AND the gate advances) MUST NOT flag/reap
+      * a success sequence (reaches the png-write gate, then churns) MUST NOT
+        reap — a rendered screenshot is success, not a livelock
+      * --no-livelock-reap / a 0 threshold disables the guard
+      * the pid=1 PROC-METRICS sc regex extracts the count from an interleaved
+        line and ignores pid!=1 metrics
+      * the new `start` flags are advertised in --help
+    """
+    print("=== Tier 1.5: livelock auto-reap detector + CLI (host-only) ===")
+    print()
+
+    import importlib.util
+    h_path = Path(__file__).resolve().parent / "qemu-harness.py"
+    spec = importlib.util.spec_from_file_location("qemu_harness_smoke_ll", h_path)
+    mod = importlib.util.module_from_spec(spec)
+    _orig_argv = sys.argv
+    sys.argv = ["qemu-harness.py", "list"]
+    try:
+        spec.loader.exec_module(mod)
+    except SystemExit:
+        pass
+    finally:
+        sys.argv = _orig_argv
+
+    LD = getattr(mod, "LivelockDetector", None)
+    check("LivelockDetector importable", LD is not None, "")
+    if LD is None:
+        return
+    SC = 50_000_000
+    SECS = 180.0
+    # The success gate is the last FF ladder index — derive it the same way the
+    # watcher does so the test tracks the real ladder length.
+    try:
+        SUCCESS = len(mod._load_ff_gates()) - 1
+    except Exception:
+        SUCCESS = 7
+
+    # ── Livelock: sc 0->200M while gate frozen at idx 5, past the window ───────
+    d = LD(reap_sc=SC, reap_secs=SECS, success_gate_idx=SUCCESS)
+    d.observe(sc=100, gate_idx=5, now=1000.0)
+    d.observe(sc=200_000_000, gate_idx=5, now=1060.0)   # 60s: churn but no time
+    check("livelock: suspected before window",   d.suspected is True, "")
+    check("livelock: NOT reaped before window",  d.should_reap(now=1060.0) is False, "")
+    d.observe(sc=200_000_000, gate_idx=5, now=1200.0)   # 200s: window elapsed
+    reap = d.should_reap(now=1200.0)
+    check("livelock: reaped after window",       reap is True, "")
+    check("livelock: sc_at_reap latched",        d.reap_sc_at == 200_000_000, str(d.reap_sc_at))
+    check("livelock: frozen_secs latched",       round(d.reap_frozen_secs) == 200, str(d.reap_frozen_secs))
+    check("livelock: reap latches (2nd False)",  d.should_reap(now=1200.0) is False, "")
+
+    # ── Healthy: sc climbs AND gate advances every step → never flag/reap ──────
+    d2 = LD(reap_sc=SC, reap_secs=SECS, success_gate_idx=SUCCESS)
+    t, sc, flagged, reaped = 0.0, 0, False, False
+    for g in range(0, min(7, SUCCESS)):
+        t += 60; sc += 60_000_000
+        d2.observe(sc=sc, gate_idx=g, now=t)
+        flagged = flagged or d2.suspected
+        reaped = reaped or d2.should_reap(now=t)
+    check("healthy: never suspected",            flagged is False, "")
+    check("healthy: never reaped",               reaped is False, "")
+
+    # ── Success: reach png-write then churn hard → never reap ─────────────────
+    d3 = LD(reap_sc=SC, reap_secs=SECS, success_gate_idx=SUCCESS)
+    t = 0.0
+    for g in range(0, SUCCESS + 1):
+        t += 10; d3.observe(sc=g * 1000, gate_idx=g, now=t)
+    d3.observe(sc=900_000_000, gate_idx=SUCCESS, now=t + 10_000)
+    check("success: not suspected after png",    d3.suspected is False, "")
+    check("success: not reaped after png",       d3.should_reap(now=t + 10_000) is False, "")
+
+    # ── Disabled paths ────────────────────────────────────────────────────────
+    d4 = LD(reap_sc=SC, reap_secs=SECS, enabled=False, success_gate_idx=SUCCESS)
+    d4.observe(sc=100, gate_idx=5, now=0); d4.observe(sc=500_000_000, gate_idx=5, now=10_000)
+    check("disabled(enabled=False): inert",      not d4.suspected and not d4.should_reap(now=10_000), "")
+    check("disabled(reap_sc=0): enabled False",  LD(reap_sc=0, reap_secs=SECS).enabled is False, "")
+    check("disabled(reap_secs=0): enabled False", LD(reap_sc=SC, reap_secs=0).enabled is False, "")
+
+    # ── Under-threshold churn never reaps ─────────────────────────────────────
+    d5 = LD(reap_sc=SC, reap_secs=SECS, success_gate_idx=SUCCESS)
+    d5.observe(sc=0, gate_idx=3, now=0); d5.observe(sc=40_000_000, gate_idx=3, now=10_000)
+    check("under-threshold: never reaped",       d5.should_reap(now=10_000) is False, "")
+
+    # ── No-gate boot that churns → SHOULD reap (wedge before any gate) ─────────
+    d6 = LD(reap_sc=SC, reap_secs=SECS, success_gate_idx=SUCCESS)
+    d6.observe(sc=0, gate_idx=-1, now=0); d6.observe(sc=200_000_000, gate_idx=-1, now=300)
+    check("no-gate churn: reaped",               d6.should_reap(now=300) is True, "")
+
+    # ── pid=1 PROC-METRICS sc regex ───────────────────────────────────────────
+    RE = getattr(mod, "_PROC_METRICS_PID1_SC_RE", None)
+    check("pid=1 sc regex present", RE is not None, "")
+    if RE is not None:
+        ln = (b"[FUTEX_WAIT_STACK] tid=60 pid=1 uaddr=0x7e[PROC-METRICS] "
+              b"tick=420514 pid=1 name=/disk/usr/lib/firefox-esr/firefox-bin "
+              b"sc=758998 (vm=6446 file=300940)")
+        m = RE.search(ln)
+        check("pid=1 sc from interleaved line",  bool(m) and int(m.group(1)) == 758998,
+              str(m.group(1) if m else None))
+        check("pid=2 metrics ignored",
+              RE.search(b"[PROC-METRICS] tick=500 pid=2 name=x sc=12345 (...)") is None, "")
+        check("pid=12 metrics ignored",
+              RE.search(b"[PROC-METRICS] tick=1 pid=12 name=x sc=5 (...)") is None, "")
+
+    # ── start --help advertises the new flags ─────────────────────────────────
+    _, raw, _ = _h("start", "--help")
+    check("start --livelock-reap-sc advertised",   "--livelock-reap-sc" in raw, "")
+    check("start --livelock-reap-secs advertised", "--livelock-reap-secs" in raw, "")
+    check("start --no-livelock-reap advertised",   "--no-livelock-reap" in raw, "")
+    print()
+
+
 def run_blk_trace_argv_check():
     """
     Tier 1.5 host-only check: blk-trace drain/flush CLI + `start --build-only`.
@@ -1004,6 +1124,7 @@ def main():
     run_read_ff_png_check()
     run_kdb_read_png_check()
     run_blk_trace_argv_check()
+    run_livelock_reap_check()
 
     if args.staleness_only:
         # Early exit for CI cycles that just want the cheap host-only checks.
