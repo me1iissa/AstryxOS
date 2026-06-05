@@ -3756,6 +3756,28 @@ def cmd_start(args):
     if "xeyes-test" in feats and not any(a == "-vga" for a in extra_qemu_args):
         extra_qemu_args += ["-vga", "vmware"]
 
+    # --pcap: host-side packet capture on the e1000/SLIRP netdev (net0).
+    #
+    # `-object filter-dump,id=netdump,netdev=net0,file=<sid>.pcap` taps the
+    # netdev frontend on the HOST side (QEMU networking docs: filter-dump
+    # records every packet on the named netdev to a libpcap file, RFC-less
+    # classic pcap format).  Because the tap lives in the host QEMU process
+    # — not the guest — the guest takes ZERO extra VM-exits; the only cost
+    # is a host fwrite per frame, bounded by traffic volume (~MB per page
+    # load).  This is fundamentally cheaper than the serial firehose, where
+    # every emitted byte was a synchronous PIO VM-exit (Intel SDM Vol. 3C
+    # §25).  The `-object` is appended via extra_qemu_args; it references
+    # the netdev by id (`net0`) so the in-place hostfwd patching in
+    # `_launch_qemu_harness` (which mutates the `-netdev` arg, not its id)
+    # leaves the filter-dump binding intact.
+    pcap_path = ""
+    if bool(getattr(args, "pcap", False)):
+        pcap_path = str(HARNESS_DIR / f"{sid}.pcap")
+        extra_qemu_args += [
+            "-object",
+            f"filter-dump,id=netdump,netdev=net0,file={pcap_path}",
+        ]
+
     # snap-gate (--snapshottable): build the savevm/loadvm-compatible device
     # topology so the running guest can be snapshotted live.  The default
     # firefox-test boot disk (writable vvfat) + writable OVMF_VARS pflash
@@ -3799,6 +3821,12 @@ def cmd_start(args):
         "kdb_host_port": kdb_host_port,
         "http_host_port": http_host_port,
         "ssh_host_port": ssh_host_port,
+        # --pcap host-side network capture (off by default).  Empty string
+        # when not requested; otherwise the libpcap file QEMU's filter-dump
+        # object writes every guest netdev frame to.  serial-web serves it at
+        # /api/pcap?sid=<sid> and decodes it at /api/wire?sid=<sid>.  Additive
+        # — never present on sessions started before --pcap landed.
+        "pcap_path": pcap_path,
         # PIVOT-I2 Phase D — host stub Conflux for oracle-daemon-test.
         # If oracle_stub_pid is 0 the stub wasn't launched (default).
         "oracle_stub_port": oracle_stub_port,
@@ -3949,6 +3977,8 @@ def cmd_start(args):
           "gdb_port": gdb_port, "kdb_host_port": kdb_host_port,
           "http_host_port": http_host_port,
           "ssh_host_port": ssh_host_port,
+          # --pcap host-side capture path ("" when not requested).
+          "pcap_path": pcap_path,
           # W106: structured CPU-model fields. `cpu_model_resolved` is
           # the literal string passed to QEMU `-cpu`; `cpu_model_reason`
           # is one of "override" | "kvm-host" | "tcg-safe".
@@ -4514,6 +4544,17 @@ def cmd_status(args):
     stored_terminal = sess.get("terminal_cause")
     terminal_cause = stored_terminal or (None if alive else exit_cause)
 
+    # --pcap host-side capture.  Report path + whether QEMU has started
+    # writing frames (file present + byte size).  pcap_path is "" on sessions
+    # not launched with --pcap (and absent entirely on pre-feature sessions).
+    pcap_path = sess.get("pcap_path") or ""
+    pcap_size = 0
+    if pcap_path:
+        try:
+            pcap_size = Path(pcap_path).stat().st_size
+        except OSError:
+            pass
+
     _out({
         "running":         alive,
         "sid":             sid,
@@ -4537,6 +4578,10 @@ def cmd_status(args):
         # filled in by the post-boot verifier once the [FFTEST] probe line
         # is parsed; until then they remain None.
         "firefox_variant_info": sess.get("firefox_variant_info"),
+        # --pcap host-side capture.  `pcap_path` is "" when not enabled;
+        # `pcap_size` > 0 confirms QEMU's filter-dump is writing frames.
+        "pcap_path":       pcap_path,
+        "pcap_size":       pcap_size,
     })
 
 
@@ -11623,6 +11668,21 @@ def main():
                           help="Disable the livelock auto-reap guard for this "
                                "session entirely. Use for a debugging/autopsy "
                                "hold you WANT to keep spinning for inspection.")
+    p_start.add_argument("--pcap", action="store_true", dest="pcap",
+                          help="Capture ALL guest network traffic on the "
+                               "e1000/SLIRP netdev (net0) to a libpcap file at "
+                               "~/.astryx-harness/<sid>.pcap via a HOST-SIDE "
+                               "QEMU `-object filter-dump`.  Off by default. "
+                               "This taps the netdev on the host side — the "
+                               "guest is unaware, so there are ZERO guest "
+                               "VM-exits and negligible guest perf cost (only "
+                               "host disk writes bounded by traffic volume, a "
+                               "few MB for a page load).  Unlike the serial "
+                               "firehose (per-byte PIO VM-exits), this is "
+                               "free on the guest path.  The pcap opens in "
+                               "Wireshark; serial-web serves it at "
+                               "/api/pcap?sid=<sid> and a decoded wire summary "
+                               "at /api/wire?sid=<sid>.")
 
     # stop
     p_stop = sub.add_parser("stop", help="Kill a QEMU session")

@@ -23,6 +23,16 @@ serial logs (read-only; safe alongside live boots).
                               [FF-OUT-PNG-B64:…]). Partial/in-progress streams
                               serve best-effort (200 + X-Screenshot-Complete:
                               false); absent/invalid streams return a JSON 404.
+  GET /api/pcap?sid=<sid>     application/vnd.tcpdump.pcap (attachment): the raw
+                              libpcap file QEMU's host-side filter-dump captured
+                              for a `start --pcap` session — opens directly in
+                              Wireshark.  404 JSON if the session wasn't run
+                              with --pcap or no file exists yet.
+  GET /api/wire?sid=<sid>     JSON: a decoded wire summary of the same .pcap
+                              (DNS / TCP flows / TLS-SNI / HTTP) via
+                              scripts/pcap_decode.py.  decode_available=False
+                              when that module isn't on this checkout — the raw
+                              /api/pcap download still works regardless.
 
   python3 scripts/serial-web.py [--port 8088] [--host 0.0.0.0]
 
@@ -43,6 +53,17 @@ try:
     import gate_marks as _gate_marks  # noqa: E402
 except Exception:
     _gate_marks = None
+
+# Wire-summary decoder (component B — scripts/pcap_decode.py).  Optional, same
+# degrade-gracefully contract as _gate_marks: if the module isn't on this
+# checkout the /api/wire route reports decode_available=False and the raw
+# .pcap download (/api/pcap) still works regardless.  Contract: the module
+# exposes `decode_pcap(path, max_packets=...) -> dict` returning a
+# JSON-serialisable wire summary (DNS / TCP flows / TLS-SNI / HTTP).
+try:
+    import pcap_decode as _pcap_decode  # noqa: E402
+except Exception:
+    _pcap_decode = None
 
 HARNESS_DIR = os.path.expanduser("~/.astryx-harness")
 SID_RE = re.compile(r"^[A-Za-z0-9_-]{4,64}$")
@@ -820,6 +841,24 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
  .shot .stat .ok{color:#7ee787} .shot .stat .part{color:#f0c674} .shot .stat .dim{color:#56b6c2}
  .shot .pbar{height:4px;background:#1b2230;border-radius:2px;margin-top:5px;overflow:hidden}
  .shot.vga .pbar>i{display:block;height:100%;background:#56b6c2} .shot.ff .pbar>i{display:block;height:100%;background:#d2a8ff}
+ /* network / wire panel — host-side filter-dump capture (needs start --pcap) */
+ #wire{display:none;border-bottom:1px solid var(--edge);background:#0d111a;padding:8px 12px}
+ #wire.show{display:block}
+ #wire .hd{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+ #wire .hd b{color:#56b6c2} #wire .hint{color:var(--dim);font-size:11px}
+ #wire a.dl{font-size:11px;font-weight:600;color:#0b0e14;background:#39d353;border-radius:5px;padding:3px 10px;text-decoration:none}
+ #wire a.dl:hover{box-shadow:0 0 6px var(--accent)}
+ #wire .stats{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+ #wire .pill{font-size:11px;border:1px solid var(--edge);border-radius:10px;padding:2px 9px;color:var(--dim);background:#11151f}
+ #wire .pill b{color:#7ee787}
+ #wire .grid{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start}
+ #wire .col{flex:1;min-width:240px;border:1px solid var(--edge);border-radius:6px;background:#11151f;padding:8px}
+ #wire .col h4{margin:0 0 6px;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:#56b6c2;font-weight:600}
+ #wire .col.dns h4{color:#7ee787} #wire .col.tls h4{color:#d2a8ff} #wire .col.http h4{color:#f0c674}
+ #wire table{width:100%;border-collapse:collapse;font-size:11px}
+ #wire td{padding:2px 6px 2px 0;color:var(--fg);vertical-align:top;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
+ #wire td.dim{color:var(--dim)} #wire tr:nth-child(even){background:#0d111a}
+ #wire .empty{color:var(--dim);font-size:11px;padding:4px 0}
  /* full-size lightbox */
  #lightbox{display:none;position:fixed;inset:0;background:rgba(2,4,8,.92);z-index:50;align-items:center;justify-content:center;flex-direction:column;cursor:zoom-out}
  #lightbox.show{display:flex} #lightbox img{max-width:94vw;max-height:86vh;border:1px solid var(--edge);box-shadow:0 0 30px rgba(0,0,0,.7);image-rendering:auto}
@@ -843,6 +882,7 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
        <button id=tMetrics class=on title="guest metrics + sparklines">metrics</button>
        <button id=tBlk title="data.img block map (needs blk-trace)">blkmap</button>
        <button id=tShots class=on title="decoded screenshot streams (VGA framebuffer + Firefox render)">shots</button>
+       <button id=tWire title="captured network wire (needs start --pcap): DNS / TCP / TLS-SNI / HTTP + .pcap download">wire</button>
        <button id=tRail class=on title="gate progression rail">rail</button>
      </span>
      <input id=flt placeholder="filter lines…"><label><input type=checkbox id=follow checked> follow</label>
@@ -854,6 +894,7 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
    <div id=pids></div>
    <div id=blk></div>
    <div id=shots></div>
+   <div id=wire></div>
    <div id=miles></div>
    <div id=logwrap>
      <div id=log><div id=empty>Pick a session on the left to stream its serial output.</div></div>
@@ -920,8 +961,9 @@ function openS(sid){
   for(const k in buf)buf[k]=[];
   $('jumpLive').style.display='none';
   shotsSig=''; shotsMetaCache=null; $('shots').innerHTML='';
+  wireSig=''; $('wire').innerHTML='';
   startStream(sid);
-  render(); loadMiles(sid); pollMetrics(); pollBlk(); pollShots();
+  render(); loadMiles(sid); pollMetrics(); pollBlk(); pollShots(); pollWire();
 }
 function startStream(sid){
   if(es)es.close();
@@ -1074,6 +1116,7 @@ function drawBlk(bk){
 // Metadata comes from /api/screenshots (no PNG bytes); each present stream's
 // <img src> points at /api/screenshot?kind=… which decodes + serves the PNG.
 let shotsSig='';                     // cache-bust + change-detect signature
+let wireSig='';                      // wire panel change-detect signature
 function pctOf(s){return s.complete?100:(s.partial_pct!=null?s.partial_pct:0);}
 function shotCard(sid,kind,s){
   const cls='shot '+kind;
@@ -1140,14 +1183,78 @@ function openLightbox(src,kind){
 $('lightbox').onclick=()=>$('lightbox').classList.remove('show');
 document.addEventListener('keydown',e=>{if(e.key==='Escape')$('lightbox').classList.remove('show');});
 
+// network / wire panel — decoded host-side filter-dump capture (start --pcap)
+function esc(s){return (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function wireRows(arr,cols){
+  if(!arr||!arr.length)return '<div class=empty>none</div>';
+  return '<table>'+arr.slice(0,200).map(r=>'<tr>'+cols.map(c=>{
+    const v=r[c.k]; return '<td'+(c.dim?' class=dim':'')+' title="'+esc(v)+'">'+esc(v==null?'':v)+'</td>';
+  }).join('')+'</tr>').join('')+'</table>';
+}
+async function pollWire(){
+  if(!cur||!$('tWire').classList.contains('on'))return;
+  let w;try{w=await(await fetch('/api/wire?sid='+encodeURIComponent(cur))).json()}catch(e){return}
+  if(cur==null)return;
+  $('wire').className='show';
+  const dl='/api/pcap?sid='+encodeURIComponent(cur);
+  // No capture for this session: explain how to enable it. Raw download link
+  // is still offered (it will 404 cleanly until a --pcap session exists).
+  if(w.error==='no_pcap'){
+    if(wireSig!=='__none__'){
+      $('wire').innerHTML='<div class=hd>network / wire</div><div class=hint>'
+        +'No <b>.pcap</b> capture for this session. Start it with '
+        +'<b>qemu-harness.py start --pcap …</b> — a host-side QEMU '
+        +'<b>filter-dump</b> taps the e1000/SLIRP netdev (zero guest VM-exits) '
+        +'and records DNS / TCP / TLS / HTTP to a libpcap file for Wireshark.</div>';
+      wireSig='__none__';
+    }
+    return;
+  }
+  if(w.decode_available===false){
+    // Raw .pcap exists but the decode module isn't on this checkout.
+    if(wireSig!=='__nodecode__'){
+      $('wire').innerHTML='<div class=hd>network / wire '
+        +'<a class=dl href="'+dl+'">⤓ download .pcap</a></div>'
+        +'<div class=hint>Capture present, but the wire-decode module '
+        +'(<b>scripts/pcap_decode.py</b>) is not on this checkout. '
+        +'Download the raw <b>.pcap</b> and open it in Wireshark.</div>';
+      wireSig='__nodecode__';
+    }
+    return;
+  }
+  const dns=w.dns||[], tls=w.tls||[], http=w.http||[], flows=w.flows||[];
+  const sig=JSON.stringify([w.packets,w.bytes,dns.length,tls.length,http.length,flows.length]);
+  if(sig===wireSig)return; wireSig=sig;
+  // Stat pills: tolerate whatever top-level counters the decoder provides.
+  const pill=(k,v)=> v==null?'':'<span class=pill>'+k+' <b>'+esc(v)+'</b></span>';
+  const stats='<div class=stats>'
+    +pill('packets',w.packets)+pill('bytes',w.bytes!=null?bytes(w.bytes):null)
+    +pill('flows',flows.length||null)+pill('DNS',dns.length||null)
+    +pill('TLS',tls.length||null)+pill('HTTP',http.length||null)+'</div>';
+  $('wire').innerHTML='<div class=hd>network / wire · host-side filter-dump capture '
+      +'<a class=dl href="'+dl+'">⤓ download .pcap</a></div>'
+    +stats
+    +'<div class=grid>'
+    +'<div class="col dns"><h4>DNS queries</h4>'
+      +wireRows(dns,[{k:'name'},{k:'type',dim:1},{k:'answer',dim:1}])+'</div>'
+    +'<div class="col tls"><h4>TLS · SNI</h4>'
+      +wireRows(tls,[{k:'sni'},{k:'version',dim:1},{k:'dst',dim:1}])+'</div>'
+    +'<div class="col http"><h4>HTTP</h4>'
+      +wireRows(http,[{k:'method'},{k:'host'},{k:'path',dim:1}])+'</div>'
+    +'<div class="col"><h4>TCP flows</h4>'
+      +wireRows(flows,[{k:'dst'},{k:'bytes',dim:1},{k:'pkts',dim:1}])+'</div>'
+    +'</div>';
+}
+
 // toggles
 function tog(btn,after){btn.onclick=()=>{btn.classList.toggle('on');
   if(btn===$('tRail'))$('rail').classList.toggle('open',btn.classList.contains('on'));
   if(btn===$('tMetrics')&&!btn.classList.contains('on')){$('metrics').classList.remove('show');$('pids').classList.remove('show');}
   if(btn===$('tBlk')&&!btn.classList.contains('on'))$('blk').classList.remove('show');
   if(btn===$('tShots')&&!btn.classList.contains('on'))$('shots').classList.remove('show');
+  if(btn===$('tWire')&&!btn.classList.contains('on'))$('wire').classList.remove('show');
   if(after&&btn.classList.contains('on'))after();};}
-tog($('tMetrics'),pollMetrics);tog($('tBlk'),pollBlk);tog($('tShots'),pollShots);tog($('tRail'),null);
+tog($('tMetrics'),pollMetrics);tog($('tBlk'),pollBlk);tog($('tShots'),pollShots);tog($('tWire'),pollWire);tog($('tRail'),null);
 $('tRail').onclick=()=>{$('tRail').classList.toggle('on');$('rail').classList.toggle('open',$('tRail').classList.contains('on'));};
 
 setInterval(()=>{const now=Date.now(),dt=(now-rate.t)/1000;if(dt>=2){const r=rate.n/dt;rate.last=r;$('rate').textContent=cur?r.toFixed(0)+' ln/s':'';rate={n:0,t:now,last:r};}},1000);
@@ -1156,6 +1263,7 @@ setInterval(()=>{if(cur)loadMiles(cur);},5000);
 setInterval(pollMetrics,2000);
 setInterval(pollBlk,3000);
 setInterval(pollShots,4000);
+setInterval(pollWire,5000);
 </script></body></html>"""
 
 
@@ -1176,6 +1284,32 @@ class H(BaseHTTPRequestHandler):
         if not SID_RE.match(sid):
             return None
         path = os.path.join(HARNESS_DIR, sid + ".serial.log")
+        if not os.path.realpath(path).startswith(os.path.realpath(HARNESS_DIR)):
+            return None
+        return path if os.path.exists(path) else None
+
+    def _pcap_path(self, sid):
+        """Validate sid and resolve its capture pcap inside HARNESS_DIR, or None.
+
+        Prefers the session-json's `pcap_path` (authoritative, set by
+        `start --pcap`), but falls back to the conventional
+        HARNESS_DIR/<sid>.pcap location.  Returns None when the sid is
+        malformed, the resolved path escapes HARNESS_DIR, or no file exists
+        (e.g. the session was not run with --pcap)."""
+        if not SID_RE.match(sid):
+            return None
+        path = None
+        meta = os.path.join(HARNESS_DIR, sid + ".json")
+        try:
+            with open(meta) as f:
+                pp = json.load(f).get("pcap_path") or ""
+            if pp:
+                path = pp
+        except (OSError, ValueError):
+            pass
+        if not path:
+            path = os.path.join(HARNESS_DIR, sid + ".pcap")
+        # Containment: the resolved real path must stay inside HARNESS_DIR.
         if not os.path.realpath(path).startswith(os.path.realpath(HARNESS_DIR)):
             return None
         return path if os.path.exists(path) else None
@@ -1235,6 +1369,11 @@ class H(BaseHTTPRequestHandler):
             self._json(scan_screenshots(p))
         elif u.path == "/api/screenshot":
             self._screenshot(q.get("sid", [""])[0], q.get("kind", ["vga"])[0])
+        elif u.path == "/api/pcap":
+            self._pcap(q.get("sid", [""])[0])
+        elif u.path == "/api/wire":
+            self._wire(q.get("sid", [""])[0],
+                       q.get("max", [""])[0])
         elif u.path == "/api/stream":
             self._stream(q.get("sid", [""])[0])
         else:
@@ -1299,6 +1438,106 @@ class H(BaseHTTPRequestHandler):
             self.wfile.write(png)
         except (BrokenPipeError, ConnectionResetError, OSError):
             return
+
+    def _pcap(self, sid):
+        """Serve the raw libpcap file for download into Wireshark.
+
+        Content-Type application/vnd.tcpdump.pcap + Content-Disposition
+        attachment so a browser GET saves <sid>.pcap.  A JSON 404 (never 500)
+        when the session wasn't run with --pcap or no file exists yet — the
+        capture only appears once QEMU's filter-dump has flushed its global
+        header.  Streamed in 64 KiB chunks so a multi-MB page-load capture
+        doesn't buffer entirely in memory."""
+        if not SID_RE.match(sid):
+            self._hdr(400, "application/json")
+            self.wfile.write(json.dumps(
+                {"ok": False, "error": "bad_sid", "sid": sid}).encode())
+            return
+        path = self._pcap_path(sid)
+        if not path:
+            self._hdr(404, "application/json")
+            self.wfile.write(json.dumps(
+                {"ok": False, "error": "no_pcap", "sid": sid,
+                 "hint": "session not started with --pcap, or no frames "
+                         "captured yet"}).encode())
+            return
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        try:
+            self._hdr(ctype="application/vnd.tcpdump.pcap", extra={
+                "Content-Disposition": f'attachment; filename="{sid}.pcap"',
+                "Content-Length": str(size),
+                "Cache-Control": "no-cache",
+            })
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+
+    def _wire(self, sid, max_str):
+        """Serve the decoded wire summary (DNS / TCP flows / TLS-SNI / HTTP).
+
+        Delegates the actual parse to scripts/pcap_decode.py (component B).
+        Always returns JSON.  When that module isn't present the response is
+        {ok:False, decode_available:False, ...} so the UI can still offer the
+        raw /api/pcap download.  A malformed sid or absent capture is reported
+        as a structured 404/400, never a 500."""
+        if not SID_RE.match(sid):
+            self._hdr(400, "application/json")
+            self.wfile.write(json.dumps(
+                {"ok": False, "error": "bad_sid", "sid": sid}).encode())
+            return
+        path = self._pcap_path(sid)
+        if not path:
+            self._hdr(404, "application/json")
+            self.wfile.write(json.dumps(
+                {"ok": False, "error": "no_pcap", "sid": sid,
+                 "decode_available": _pcap_decode is not None,
+                 "hint": "session not started with --pcap, or no frames "
+                         "captured yet"}).encode())
+            return
+        if _pcap_decode is None:
+            # Decoder not on this checkout — the raw download still works.
+            self._hdr(200, "application/json")
+            self.wfile.write(json.dumps({
+                "ok": False, "decode_available": False, "sid": sid,
+                "pcap_url": f"/api/pcap?sid={sid}",
+                "error": "pcap_decode module not present on this checkout",
+            }).encode())
+            return
+        try:
+            max_packets = int(max_str) if max_str else 0
+        except ValueError:
+            max_packets = 0
+        try:
+            if max_packets > 0:
+                summary = _pcap_decode.decode_pcap(path, max_packets=max_packets)
+            else:
+                summary = _pcap_decode.decode_pcap(path)
+        except Exception as e:  # never 500 on a torn/partial capture
+            self._hdr(200, "application/json")
+            self.wfile.write(json.dumps({
+                "ok": False, "decode_available": True, "sid": sid,
+                "pcap_url": f"/api/pcap?sid={sid}",
+                "error": "decode_failed", "detail": str(e),
+            }).encode())
+            return
+        # Pass the decoder's dict through verbatim (additive keys tolerated),
+        # annotating with our own provenance so the UI has a stable envelope.
+        out = {"ok": True, "decode_available": True, "sid": sid,
+               "pcap_url": f"/api/pcap?sid={sid}"}
+        if isinstance(summary, dict):
+            out.update(summary)
+        else:
+            out["summary"] = summary
+        self._hdr(200, "application/json")
+        self.wfile.write(json.dumps(out).encode())
 
     def _stream(self, sid):
         path = self._log_path(sid)
