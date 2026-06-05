@@ -894,15 +894,45 @@ _PANIC_RE = re.compile(
 )
 _IDLE_SECONDS = 30
 
+# Kernel-tick regex for stamping each gate mark with the latest tick (so a
+# historical re-derivation cross-checks against the exact host stamp). Same
+# kernel-only form serial-web/perf_markers use ([HB]/PROC-METRICS tick=).
+_WATCH_TICK_RE = re.compile(r"(?:\[HB\]|PROC-METRICS\]) tick=(\d+)")
+
+
+def _load_gate_marks():
+    """Lazy-import the shared gate-marks helper. Returns the module, or None when
+    it is not on this branch (an older master that predates the dashboards) — in
+    which case the watcher simply skips gate stamping and keeps its panic/idle
+    duties. Additive: never fails the watcher."""
+    try:
+        import gate_marks  # noqa: PLC0415
+        return gate_marks
+    except Exception:
+        return None
+
+
 def _watcher_thread(sid: str, serial_log: str, qmp_sock: str, pid: int):
     """
-    Monitors the serial log for panic patterns and idle periods.
+    Monitors the serial log for panic patterns and idle periods, and stamps the
+    host arrival time of each bring-up/render gate to <sid>.marks.jsonl (the
+    exact-host-time source the serial monitor reads). Gate detection is
+    forward-ordered (milestone N+1 only fires at/after N) — identical discipline
+    to serial-web's scan_progress — so render markers don't false-positive on
+    Firefox's serialized-JS startup cache.
+
     Runs as a daemon thread started by `start`.
     """
     last_size = 0
     last_activity = time.monotonic()
     idle_event_sent = False
     log_path = Path(serial_log)
+
+    # Gate stamping state (forward-ordered, append first-arrival only).
+    _gm = _load_gate_marks()
+    _gate_idx = 0
+    _cur_tick = None
+    _line_no = 0
 
     while _pid_alive(pid):
         try:
@@ -918,6 +948,39 @@ def _watcher_thread(sid: str, serial_log: str, qmp_sock: str, pid: int):
                     new_data = f.read(size - last_size)
                 new_text = new_data.decode("utf-8", errors="replace")
                 for line in new_text.splitlines():
+                    _line_no += 1
+                    # Track latest kernel tick so each gate mark carries the tick
+                    # at its arrival (lets a historical re-derivation cross-check).
+                    # The whole gate block is best-effort: any failure here must
+                    # NOT disrupt the watcher's panic/idle duties (the harness is
+                    # critical infra), so it is wrapped defensively.
+                    if _gm is not None:
+                        try:
+                            _tk = _WATCH_TICK_RE.search(line)
+                            if _tk:
+                                _cur_tick = int(_tk.group(1))
+                            # Forward-ordered milestone stamping: the instant we
+                            # first see milestone N's marker (and only at/after
+                            # N-1), record its host arrival time. One line can
+                            # satisfy several milestones in sequence (while-advance).
+                            while (_gate_idx < len(_gm.MILESTONES)
+                                   and _gm.match(line, _gm.MILESTONES[_gate_idx][1])):
+                                _label = _gm.MILESTONES[_gate_idx][0]
+                                _gm.append_gate_mark(
+                                    sid, str(HARNESS_DIR), _label,
+                                    host_ts=time.time(), tick=_cur_tick,
+                                    line=_line_no)
+                                _emit_event(sid, {
+                                    "event": "gate",
+                                    "label": _label,
+                                    "tick": _cur_tick,
+                                    "line": _line_no,
+                                })
+                                _gate_idx += 1
+                        except Exception:
+                            # disable gate stamping for the rest of this run; keep
+                            # the watcher alive for panics/idles.
+                            _gm = None
                     m = _PANIC_RE.search(line)
                     if m:
                         snap_name = f"{sid}-panic"
