@@ -93,6 +93,8 @@ jobs:
           python-version: "3.x"
       - name: serial-web smoke (serial monitor + per-gate timing)
         run: python3 scripts/serial-web-smoke.py
+      - name: pcap_decode selftest (wire decoder the /api/wire panel depends on)
+        run: python3 scripts/pcap_decode.py --selftest
       - name: perf-bench smoke (taxonomy + ingest-marks bridge)
         run: python3 scripts/perf-bench-smoke.py
       - name: perf baseline-linux smoke (record shape)
