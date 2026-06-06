@@ -73,7 +73,7 @@ pub fn dispatch(
                     // `slice` is a kernel-resident snapshot — from_utf8 is
                     // safe outside any SMAP bracket.
                     let s = core::str::from_utf8(slice).unwrap_or("<binary>");
-                    crate::serial_println!("[FF/stderr] pid={} {:?}", pid, s);
+                    crate::serial_fast_println!("[FF/stderr] pid={} {:?}", pid, s);
                 }
                 match crate::vfs::fd_write(pid, fd as usize, arg2 as *const u8, count) {
                     Ok(n) => n as i64,

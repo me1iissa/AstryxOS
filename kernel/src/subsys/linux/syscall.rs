@@ -1473,7 +1473,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 let r = do_check(true, true);
                 if r > 0 {
                     #[cfg(feature = "firefox-test-trace")]
-                    if pid >= 1 { crate::serial_println!("[POLL_RET] pid={} ret={} (post-x11-poll)", pid, r); }
+                    if pid >= 1 { crate::serial_fast_println!("[POLL_RET] pid={} ret={} (post-x11-poll)", pid, r); }
                     return r;
                 }
                 // Block the thread until an fd becomes ready or timeout expires.
@@ -1522,7 +1522,7 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     let r = do_check(true, true);
                     if r > 0 {
                         #[cfg(feature = "firefox-test-trace")]
-                        if pid >= 1 { crate::serial_println!("[POLL_RET] pid={} ret={} (woke)", pid, r); }
+                        if pid >= 1 { crate::serial_fast_println!("[POLL_RET] pid={} ret={} (woke)", pid, r); }
                         return r;
                     }
                     if signal_pending(pid) { return -4; } // EINTR
@@ -1530,11 +1530,11 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     if now >= deadline_tick { break; }
                 }
                 #[cfg(feature = "firefox-test-trace")]
-                if pid >= 1 { crate::serial_println!("[POLL_RET] pid={} ret=0 (timeout)", pid); }
+                if pid >= 1 { crate::serial_fast_println!("[POLL_RET] pid={} ret=0 (timeout)", pid); }
                 0
             } else {
                 #[cfg(feature = "firefox-test-trace")]
-                if pid >= 1 { crate::serial_println!("[POLL_RET] pid={} ret={} (immediate)", pid, ready); }
+                if pid >= 1 { crate::serial_fast_println!("[POLL_RET] pid={} ret={} (immediate)", pid, ready); }
                 ready
             }
         }
@@ -6825,7 +6825,7 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
                 }
                 if truncated { buf.push_str("..."); }
                 let tag = if fd == 2 { "FF/stderr" } else { "FF/write" };
-                crate::serial_println!("[{}] pid={} fd={} bytes={} body=\"{}\"", tag, pid, fd, count, buf);
+                crate::serial_fast_println!("[{}] pid={} fd={} bytes={} body=\"{}\"", tag, pid, fd, count, buf);
             }
 
             // Full-fd coverage: capture writes to fds OTHER than 0/1/2 so we
@@ -6841,7 +6841,7 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
                     hex.push(HEX[(b >> 4) as usize] as char);
                     hex.push(HEX[(b & 0xF) as usize] as char);
                 }
-                crate::serial_println!(
+                crate::serial_fast_println!(
                     "[FF/write-fd] pid={} fd={} len={} bytes={}",
                     pid, fd, count, hex
                 );
@@ -6998,7 +6998,7 @@ pub fn sys_open_linux(pathname: u64, flags: u64, _mode: u64) -> i64 {
     {
         let pid = crate::proc::current_pid_lockless();
         if pid == 1 || crate::syscall::ring::is_tracked(pid) {
-            crate::serial_println!(
+            crate::serial_fast_println!(
                 "[FF/open-ret] pid={} path={} ret={}",
                 pid, path_snapshot, ret,
             );
@@ -7057,7 +7057,7 @@ fn sys_open_linux_inner(pathname: u64, flags: u64, _mode: u64) -> i64 {
     // perf core boot does not emit a serial line per open.
     #[cfg(any(feature = "firefox-test-trace", feature = "test-mode-trace"))]
     if pid == 1 || crate::syscall::ring::is_tracked(pid) {
-        crate::serial_println!("[FF/open] pid={} path={}", pid, path);
+        crate::serial_fast_println!("[FF/open] pid={} path={}", pid, path);
     }
     // libxul load MILESTONE (low-frequency, DEFAULT-ON). The per-open `[FF/open]`
     // mirror above is trace-gated, so on the fast `firefox-test-core` boot the
@@ -9185,7 +9185,7 @@ pub(crate) mod ghost_hist {
                 // Rate-limit the serial line: 1 in HIST_HIT_PRINT_EVERY.
                 if total_hits % HIST_HIT_PRINT_EVERY == 0 || total_hits <= 4 {
                     let age_ms = age_ticks.saturating_mul(10); // 10 ms/tick
-                    crate::serial_println!(
+                    crate::serial_fast_println!(
                         "[FUTEX_WAKE_GHOST_HIST] tid={} tgid={} wake={:#x} \
                          waiter={:#x} waiter_tid={} offset={} age_ms={} \
                          woken_now=0 hits={}",
@@ -9479,7 +9479,7 @@ pub fn sys_futex_linux(
             // so we never end up with a registered-but-already-expired waiter.
             if matches!(timeout_ns, TimeoutNs::AlreadyExpired) {
                 #[cfg(feature = "firefox-test-trace")]
-                crate::serial_println!(
+                crate::serial_fast_println!(
                     "[FUTEX_TIMEDOUT] tid={} pid={} uaddr={:#x} op={:#x} (absolute deadline elapsed)",
                     crate::proc::current_tid(), pid, uaddr, futex_op
                 );
@@ -9554,7 +9554,7 @@ pub fn sys_futex_linux(
             {
                 let user_rip = unsafe { crate::syscall::get_user_rip() };
                 let (user_rsp, user_rbp) = crate::syscall::get_user_rsp_rbp();
-                crate::serial_println!(
+                crate::serial_fast_println!(
                     "[FUTEX_WAIT_REG] tid={} pid={} uaddr={:#x} val={} op={:#x} \
                      rip={:#x} rsp={:#x} rbp={:#x}",
                     tid, pid, uaddr, val, futex_op, user_rip, user_rsp, user_rbp
@@ -9613,7 +9613,7 @@ pub fn sys_futex_linux(
             // If the list entry was already gone, FUTEX_WAKE removed us = success.
             if timed_out {
                 #[cfg(feature = "firefox-test-trace")]
-                crate::serial_println!(
+                crate::serial_fast_println!(
                     "[FUTEX_TIMEDOUT] tid={} pid={} uaddr={:#x} op={:#x}",
                     tid, pid, uaddr, futex_op
                 );
@@ -9638,7 +9638,7 @@ pub fn sys_futex_linux(
             {
                 let user_rip = unsafe { crate::syscall::get_user_rip() };
                 let (user_rsp, user_rbp) = crate::syscall::get_user_rsp_rbp();
-                crate::serial_println!(
+                crate::serial_fast_println!(
                     "[FUTEX_WAKE_REQ] tid={} pid={} uaddr={:#x} max={} op={:#x} \
                      rip={:#x} rsp={:#x} rbp={:#x}",
                     crate::proc::current_tid(), pid, uaddr, val, futex_op,
@@ -9682,7 +9682,7 @@ pub fn sys_futex_linux(
             // userspace.  Gated to firefox-test to stay out of the test-mode
             // serial budget.
             #[cfg(feature = "firefox-test-trace")]
-            crate::serial_println!(
+            crate::serial_fast_println!(
                 "[FUTEX_WAKE] tid={} pid={} uaddr={:#x} woken={} max={} op={:#x}",
                 crate::proc::current_tid(), pid, uaddr, woken, val, futex_op
             );
@@ -9814,7 +9814,7 @@ pub fn sys_futex_linux(
                     };
                     if wpid != pid || wuaddr == uaddr { continue; }
                     if let Some(&first_tid) = tids.first() {
-                        crate::serial_println!(
+                        crate::serial_fast_println!(
                             "[FUTEX_WAKE_GHOST] tid={} pid={} caller_uaddr={:#x} \
                              sibling_uaddr={:#x} sibling_tid={} sibling_count={} \
                              cluster_lo={:#x} cluster_hi={:#x}",

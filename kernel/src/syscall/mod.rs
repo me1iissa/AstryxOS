@@ -2360,7 +2360,7 @@ pub fn futex_wake_for_exit(pid: u64, uaddr: u64, max_wake: u64) {
             .filter(|k| k.private_pid() == Some(pid))
             .copied()
             .collect();
-        crate::serial_println!(
+        crate::serial_fast_println!(
             "[FUTEX_WAKE_EXIT] pid={} uaddr={:#x} key={:?} key_present={} woken={:?} remaining_pid_keys={:?}",
             pid, uaddr, key, key_present, tids_to_wake, other_keys
         );
@@ -4678,7 +4678,7 @@ pub(crate) fn poll_revents(pid: u64, fd: usize, events: u16) -> u16 {
         let readable = has_d || has_p || has_scm;
         #[cfg(feature = "firefox-test-core")]
         if pid >= 1 && events & POLLIN != 0 {
-            crate::serial_println!("[UNIXPOLL] pid={} fd={} uid={} has_data={} avail={} events={:#x}",
+            crate::serial_fast_println!("[UNIXPOLL] pid={} fd={} uid={} has_data={} avail={} events={:#x}",
                 pid, fd, uid, has_d, crate::net::unix::bytes_available(uid), events);
         }
         let mut rev = 0u16;
