@@ -1973,8 +1973,118 @@ fn proc_task_tid_from_stat_path(open_path: &str) -> Option<u64> {
     tid_str.parse::<u64>().ok()
 }
 
+/// Parse a `/proc/<pid-or-self>/fd/<N>` magic-symlink path and return the
+/// target file descriptor number, resolving `self` (and `/proc/<N>/`, which is
+/// already redirected to `self` before `open()` runs) against `caller_pid`.
+///
+/// Per proc(5), each `/proc/[pid]/fd/<N>` entry is a *magic* symbolic link:
+/// opening it does not re-resolve a path but re-opens the same open file
+/// description that fd `<N>` refers to.  This must work even when the
+/// underlying file has been unlinked — the canonical case being a
+/// `memfd_create(2)` object, which `memfd_create(2)` deletes ("the memory is
+/// freed when all references are dropped") so it has no resolvable name.
+/// Mozilla's POSIX shared-memory layer relies on exactly this:
+/// `memfd_create(...)` then `open("/proc/self/fd/<memfd>", O_RDONLY)` to obtain
+/// a read-only handle on the same anonymous object.  Resolving the (unlinked)
+/// name would return ENOENT and force a fallback path.
+///
+/// Returns `Some(fd_num)` only for the `/proc/{self|N}/fd/<N>` shape with a
+/// numeric leaf; `None` for every other path (including `/proc/self/fd` itself).
+fn proc_fd_magic_fd(path: &str, _caller_pid: crate::proc::Pid) -> Option<usize> {
+    let rest = path.strip_prefix("/proc/")?;
+    let (pid_comp, tail) = rest.split_once('/')?;
+    // Accept "self" or all-digits for the pid component.  Numeric-pid paths are
+    // redirected to /proc/self before open() reaches here, but accept both so
+    // the helper is correct regardless of call site.
+    if pid_comp != "self" && (pid_comp.is_empty() || !pid_comp.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let fd_str = tail.strip_prefix("fd/")?;
+    // Leaf must be a bare fd number with no further components.
+    if fd_str.is_empty() || fd_str.contains('/') || !fd_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    fd_str.parse::<usize>().ok()
+}
+
 /// Open a file for a process, returning the fd number.
 pub fn open(pid: crate::proc::Pid, path: &str, open_flags: u32) -> VfsResult<usize> {
+    // proc(5) magic-symlink: open("/proc/<self|N>/fd/<M>", ...) re-opens the
+    // open file description that fd <M> already refers to, NOT a path.  Re-open
+    // by (mount_idx, inode) so it works for unlinked/anonymous objects —
+    // notably memfd_create(2) objects, which have no resolvable name.  Without
+    // this, the symlink resolves to the (since-unlinked) backing path and
+    // returns ENOENT, breaking the memfd read-only-dup idiom that Mozilla's
+    // shared-memory IPC uses (it then falls back to /dev/shm).
+    if let Some(target_fd) = proc_fd_magic_fd(path, pid) {
+        let (mount_idx, inode, file_type, is_console) = {
+            let procs = crate::proc::PROCESS_TABLE.lock();
+            let proc = procs
+                .iter()
+                .find(|p| p.pid == pid)
+                .ok_or(VfsError::InvalidArg)?;
+            let fd = proc
+                .file_descriptors
+                .get(target_fd)
+                .and_then(|slot| slot.as_ref())
+                .ok_or(VfsError::NotFound)?;
+            (fd.mount_idx, fd.inode, fd.file_type, fd.is_console)
+        };
+        // Console / anonymous fds with no VFS inode cannot be re-opened by
+        // inode here; fall through to the legacy symlink-resolution path which
+        // synthesises a /dev/fd/<N> name for them.
+        if !is_console {
+            // Honour O_TRUNC on a regular file, mirroring the normal open path.
+            if open_flags & flags::O_TRUNC != 0 && file_type == FileType::RegularFile {
+                if let Some(fs) = fs_at(mount_idx).map(|(fs, _)| fs) {
+                    let old = fs.stat(inode).map(|s| s.size).unwrap_or(0);
+                    fs.truncate(inode, 0)?;
+                    crate::mm::cache::truncate_range(mount_idx, inode, old, 0);
+                }
+            }
+            let reopened = FileDescriptor {
+                inode,
+                mount_idx,
+                offset: 0,
+                flags: open_flags,
+                file_type,
+                is_console: false,
+                cloexec: (open_flags & 0x0008_0000) != 0, // O_CLOEXEC
+                // Preserve the source fd's name so /proc/self/fd, fchdir, and the
+                // unlink-on-last-close bookkeeping keep treating both handles as
+                // the same object.
+                open_path: {
+                    let procs = crate::proc::PROCESS_TABLE.lock();
+                    procs
+                        .iter()
+                        .find(|p| p.pid == pid)
+                        .and_then(|p| p.file_descriptors.get(target_fd))
+                        .and_then(|slot| slot.as_ref())
+                        .map(|f| f.open_path.clone())
+                        .unwrap_or_default()
+                },
+            };
+            let mut procs = crate::proc::PROCESS_TABLE.lock();
+            let proc = procs.iter_mut().find(|p| p.pid == pid).ok_or(VfsError::InvalidArg)?;
+            let free_idx = proc.file_descriptors.iter().position(|f| f.is_none());
+            let fd_idx = if let Some(i) = free_idx {
+                proc.file_descriptors[i] = Some(reopened);
+                i
+            } else {
+                let nofile_limit = proc.rlimits_soft[7]
+                    .min(MAX_FDS_PER_PROCESS as u64) as usize;
+                if proc.file_descriptors.len() < nofile_limit {
+                    let idx = proc.file_descriptors.len();
+                    proc.file_descriptors.push(Some(reopened));
+                    idx
+                } else {
+                    return Err(VfsError::TooManyOpenFiles);
+                }
+            };
+            return Ok(fd_idx);
+        }
+    }
+
     // C4: redirect /proc/<N>/... to /proc/self/... for inode resolution,
     // while preserving the original path in the fd for target-PID detection.
     //
