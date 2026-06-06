@@ -1829,6 +1829,30 @@ pub fn symlink(link_path: &str, target: &str) -> VfsResult<()> {
     Ok(())
 }
 
+/// Create a hard link `new_path` referencing the same inode as `old_path`.
+///
+/// Per POSIX `link(2)`: the final component of `old_path` names the file to
+/// be linked (a trailing symlink is NOT followed — this is `link()`, not the
+/// `AT_SYMLINK_FOLLOW` form); `new_path` must not already exist (EEXIST);
+/// both paths must reside on the same filesystem (cross-mount hard links are
+/// not representable — POSIX EXDEV, reported here as `Unsupported`).
+pub fn link(old_path: &str, new_path: &str) -> VfsResult<()> {
+    let (old_mount, target_inode) = resolve_path_no_follow(old_path)?;
+    let (new_mount, new_parent, new_name) = resolve_parent(new_path)?;
+    if old_mount != new_mount {
+        return Err(VfsError::Unsupported); // EXDEV-equivalent
+    }
+    {
+        let fs = fs_at(new_mount).ok_or(VfsError::NotFound)?.0;
+        fs.link(target_inode, new_parent, &new_name)?;
+    }
+    // A new name appeared in the target directory — fire IN_CREATE so inotify
+    // watchers (and any dentry-cache invalidation riding on it) observe it.
+    let (new_dir, new_fn) = split_parent_name(new_path);
+    crate::ipc::inotify::notify_event(new_dir, new_fn, crate::ipc::inotify::IN_CREATE, 0);
+    Ok(())
+}
+
 /// Read the target of a symbolic link (does not follow the final symlink).
 pub fn readlink(path: &str) -> VfsResult<String> {
     let (mount_idx, inode) = resolve_path_no_follow(path)?;
