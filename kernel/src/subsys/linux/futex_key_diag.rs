@@ -190,7 +190,7 @@ pub fn emit_wake_empty(
     }
     same_page_buf.push(']');
 
-    crate::serial_println!(
+    crate::serial_fast_println!(
         "[FUTEX-WAKE-EMPTY] tid={} pid={} op={:#x} uaddr={:#x} \
          key=(pid={},uaddr={:#x}) bucket_present={} same_pid_keys={} \
          nearest={} same_page={}",

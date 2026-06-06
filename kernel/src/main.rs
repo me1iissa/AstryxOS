@@ -1601,6 +1601,20 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
             serial_println!("[FFTEST] DONE");
 
+            // Drain the cheap guest-RAM log ring (drivers::log_ring) to COM1 in
+            // one controlled burst before shutdown.  The firehose trace families
+            // (`[SC]`, `[FUTEX_*]`, `[POLL_RET]`, `[FF/*]`, `[UNIXPOLL]`,
+            // `[SC-REC]`) route through `serial_fast_println!` into the ring to
+            // avoid a per-byte COM1 16550 PIO VM-exit (Intel SDM Vol. 3C
+            // §25.1.3) on every line; this re-emits the buffered content into
+            // the same serial log a host scanner reads, paying the per-byte UART
+            // cost once, batched, instead of millions of times in the hot path.
+            // A no-op when the ring is disabled or empty (the fast path already
+            // fell back to COM1).  Reliability-critical lifeline lines (`[GATE]`,
+            // boot/PNG markers, panics, bugchecks) stay on synchronous COM1 and
+            // are unaffected.
+            crate::drivers::log_ring::flush_to_serial();
+
             // Brief pause for QMP screendump, then exit.
             let t_done = arch::x86_64::irq::get_ticks();
             while arch::x86_64::irq::get_ticks().wrapping_sub(t_done) < 100 {

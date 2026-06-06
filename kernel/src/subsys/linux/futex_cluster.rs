@@ -492,7 +492,7 @@ pub fn compensate(pid: u64, wake_tid: u64, wake_uaddr: u64, nr_wake: u64) -> u64
                     CandidateReason::WaitHistory => "wait_history",
                 };
                 let signed_off: i64 = cand.uaddr as i64 - wake_uaddr as i64;
-                crate::serial_println!(
+                crate::serial_fast_println!(
                     "[FUTEX_CLUSTER_WAKE] tid={} tgid={} wake_uaddr={:#x} \
                      target_uaddr={:#x} offset={} reason={} \
                      waiter_count={} woken_tid={} attempt_no={}",
