@@ -971,6 +971,237 @@ def run_blk_trace_argv_check():
     print()
 
 
+def run_pcap_argv_check():
+    """
+    Tier 1.5 host-only check: `start --pcap` filter-dump composition +
+    serial-web /api/pcap + /api/wire endpoints.
+
+    No QEMU launched (< 2s).  Locks down the host-side packet-capture surface
+    so a future refactor cannot silently regress it:
+
+      * `start --pcap` and `start --no-pcap` are advertised and parse
+      * the filter-dump `-object` references the e1000/SLIRP netdev id (net0)
+        and a per-session pcap file, and is emitted AFTER `-netdev` so QEMU's
+        object resolver finds the netdev (QEMU networking docs)
+      * the in-place kdb-hostfwd patch (which mutates the `-netdev` arg, not
+        its id) leaves the filter-dump binding intact
+      * the default-ON / opt-out decision precedence (`_resolve_pcap_decision`,
+        the helper cmd_start drives): --no-pcap > --pcap > FF-feature-set > off
+        — an FF-render feature set captures by default, --no-pcap suppresses it
+        even on FF, a non-FF boot stays off, and --pcap force-enables any boot;
+        each on/off decision is cross-checked against the composed cmdline
+      * serial-web serves the raw .pcap (application/vnd.tcpdump.pcap,
+        attachment) byte-identically, and /api/wire returns a stable envelope
+        (decode_available bool + pcap_url) whether or not the wire decoder
+        scripts/pcap_decode.py is present on the checkout
+    """
+    print("=== Tier 1.5: --pcap filter-dump + serial-web wire (host-only) ===")
+    print()
+
+    import importlib.util, tempfile, os as _os, struct, urllib.request, json as _json
+    import http.server, socketserver, threading
+
+    # ── start --pcap / --no-pcap advertised + parse ───────────────────────────
+    _, raw, _ = _h("start", "--help")
+    check("start --pcap advertised in --help",
+          "--pcap" in raw, "flag missing from start --help")
+    check("start --no-pcap advertised in --help",
+          "--no-pcap" in raw, "opt-out flag missing from start --help")
+
+    # ── filter-dump arg composes correctly through build_qemu_cmd ──────────────
+    aq_path = Path(__file__).resolve().parent / "astryx_qemu.py"
+    spec = importlib.util.spec_from_file_location("astryx_qemu_pcap_smoke", aq_path)
+    aq = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(aq)
+
+    _di = tempfile.NamedTemporaryFile(suffix=".img", delete=False)
+    _di.write(b"\0" * 4096); _di.close()
+    data_img = _di.name
+    sid = "smoke0000pcap"
+    pcap_path = f"/x/harness/{sid}.pcap"
+    # This is the exact extra_args cmd_start injects for --pcap.
+    extra = ["-object", f"filter-dump,id=netdump,netdev=net0,file={pcap_path}"]
+    cmd = aq.build_qemu_cmd("", data_img, "/x/s.log", mode="test",
+                            ovmf_code="/x/code.fd", ovmf_vars="/x/vars",
+                            esp_dir="/x/esp", qmp_sock="/x/q.sock", kvm=False,
+                            extra_args=extra)
+    try:
+        netdev_i = next(i for i, a in enumerate(cmd) if a == "-netdev")
+        obj_i = next(i for i, a in enumerate(cmd) if a == "-object")
+        check("filter-dump -object present", True, "")
+        check("filter-dump references netdev=net0",
+              "netdev=net0" in cmd[obj_i + 1], cmd[obj_i + 1])
+        check("filter-dump writes per-session pcap file",
+              f"file={pcap_path}" in cmd[obj_i + 1], cmd[obj_i + 1])
+        check("netdev emitted before filter-dump object",
+              netdev_i < obj_i, f"netdev@{netdev_i} object@{obj_i}")
+        # Replicate the kdb-hostfwd in-place patch from _launch_qemu_harness.
+        for i, a in enumerate(cmd):
+            if a == "-netdev" and cmd[i + 1].startswith("user,id=net0"):
+                cmd[i + 1] = cmd[i + 1] + ",hostfwd=tcp:127.0.0.1:9991-:9999"
+                break
+        obj_i2 = next(i for i, a in enumerate(cmd) if a == "-object")
+        check("filter-dump binding survives kdb-hostfwd patch",
+              "netdev=net0" in cmd[obj_i2 + 1], cmd[obj_i2 + 1])
+    except StopIteration:
+        check("filter-dump -object present", False,
+              "no -object in composed cmdline")
+
+    # ── pcap default-ON / opt-out decision + cmdline composition ───────────────
+    # Lock down the precedence introduced by tools/pcap-default-ff:
+    #   --no-pcap > --pcap > FF-feature-set > off.  We drive the SAME decision
+    #   helper cmd_start uses (`_resolve_pcap_decision`), then — for the on/off
+    #   cases — replicate cmd_start's filter-dump injection and feed it through
+    #   build_qemu_cmd to confirm the -object lands (or doesn't) and stays
+    #   ordered after -netdev, exactly as the live `start` path does.
+    qh_spec = importlib.util.spec_from_file_location("qh_pcap_smoke", HARNESS)
+    qh = importlib.util.module_from_spec(qh_spec)
+    qh_spec.loader.exec_module(qh)
+    resolve = qh._resolve_pcap_decision
+
+    def _compose_has_filterdump(enabled):
+        """Replicate cmd_start's injection for a decision, return (has, ok_ordered)."""
+        di = tempfile.NamedTemporaryFile(suffix=".img", delete=False)
+        di.write(b"\0" * 4096); di.close()
+        try:
+            ex = []
+            if enabled:
+                ex = ["-object",
+                      f"filter-dump,id=netdump,netdev=net0,file=/x/harness/s.pcap"]
+            c = aq.build_qemu_cmd("", di.name, "/x/s.log", mode="test",
+                                  ovmf_code="/x/code.fd", ovmf_vars="/x/vars",
+                                  esp_dir="/x/esp", qmp_sock="/x/q.sock",
+                                  kvm=False, extra_args=ex)
+            has = any(a == "-object" and "filter-dump" in c[i + 1]
+                      for i, a in enumerate(c[:-1]))
+            ok_order = True
+            if has:
+                ndi = next(i for i, a in enumerate(c) if a == "-netdev")
+                oi = next(i for i, a in enumerate(c)
+                          if a == "-object" and "filter-dump" in c[i + 1])
+                ok_order = ndi < oi and "netdev=net0" in c[oi + 1]
+            return has, ok_order
+        finally:
+            try:
+                _os.unlink(di.name)
+            except OSError:
+                pass
+
+    # 1) firefox-test-core (no flags) -> ON by default ("ff-default"), -object lands.
+    en, rs = resolve(["firefox-test-core"], False, False)
+    has, ordered = _compose_has_filterdump(en)
+    check("FF-render boot defaults pcap ON",
+          en is True and rs == "ff-default", f"enabled={en} reason={rs}")
+    check("FF-default cmdline carries filter-dump after -netdev",
+          has and ordered, f"has={has} ordered={ordered}")
+
+    # 2) firefox-test-core --no-pcap -> OFF ("no-pcap-optout"), NO -object.
+    en, rs = resolve(["firefox-test-core"], False, True)
+    has, _o = _compose_has_filterdump(en)
+    check("FF boot + --no-pcap disables pcap",
+          en is False and rs == "no-pcap-optout", f"enabled={en} reason={rs}")
+    check("--no-pcap cmdline has NO filter-dump", not has, f"has={has}")
+
+    # 3) test-mode (non-FF, no flags) -> OFF by default ("non-ff-default"), NO -object.
+    en, rs = resolve(["test-mode"], False, False)
+    has, _o = _compose_has_filterdump(en)
+    check("non-FF boot defaults pcap OFF",
+          en is False and rs == "non-ff-default", f"enabled={en} reason={rs}")
+    check("non-FF-default cmdline has NO filter-dump", not has, f"has={has}")
+
+    # 4) test-mode --pcap -> force ON ("pcap-forced"), -object lands.
+    en, rs = resolve(["test-mode"], True, False)
+    has, ordered = _compose_has_filterdump(en)
+    check("non-FF boot + --pcap forces pcap ON",
+          en is True and rs == "pcap-forced", f"enabled={en} reason={rs}")
+    check("--pcap-on-non-FF cmdline carries filter-dump after -netdev",
+          has and ordered, f"has={has} ordered={ordered}")
+
+    # 5) precedence: --no-pcap beats an explicit --pcap on an FF boot.
+    en, rs = resolve(["firefox-test-core"], True, True)
+    check("--no-pcap wins over --pcap (precedence)",
+          en is False and rs == "no-pcap-optout", f"enabled={en} reason={rs}")
+
+    try:
+        _os.unlink(data_img)
+    except OSError:
+        pass
+
+    # ── serial-web /api/pcap + /api/wire against a fixture ─────────────────────
+    # Build a tiny valid libpcap fixture (global header + 1 ethernet frame) in a
+    # throwaway HARNESS_DIR, then serve it through serial-web's handler.
+    tmpdir = tempfile.mkdtemp(prefix="pcap-smoke-")
+    fsid = "fixt0000pcap"
+    fpcap = _os.path.join(tmpdir, fsid + ".pcap")
+    with open(fpcap, "wb") as f:
+        # classic pcap global header, LINKTYPE_ETHERNET (1), snaplen 65535
+        f.write(struct.pack("<IHHiIII", 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1))
+        frame = bytes(14) + b"\x45" + bytes(19)   # 34-byte stub ethernet+ipv4
+        f.write(struct.pack("<IIII", 1780000000, 0, len(frame), len(frame)))
+        f.write(frame)
+    with open(_os.path.join(tmpdir, fsid + ".serial.log"), "w") as f:
+        f.write("[boot] pcap smoke fixture\n")
+    with open(_os.path.join(tmpdir, fsid + ".json"), "w") as f:
+        _json.dump({"sid": fsid, "pid": 0, "pcap_path": fpcap,
+                    "serial_log": _os.path.join(tmpdir, fsid + ".serial.log")}, f)
+
+    sw_path = Path(__file__).resolve().parent / "serial-web.py"
+    spec2 = importlib.util.spec_from_file_location("serial_web_pcap_smoke", sw_path)
+    sw = importlib.util.module_from_spec(spec2)
+    spec2.loader.exec_module(sw)
+    sw.HARNESS_DIR = tmpdir   # point the handler at the throwaway dir
+
+    srv = socketserver.TCPServer(("127.0.0.1", 0), sw.H)
+    srv.allow_reuse_address = True
+    port = srv.server_address[1]
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        base = f"http://127.0.0.1:{port}"
+        with urllib.request.urlopen(f"{base}/api/pcap?sid={fsid}") as r:
+            ct = r.headers.get("Content-Type")
+            cd = r.headers.get("Content-Disposition")
+            body = r.read()
+        with open(fpcap, "rb") as f:
+            orig = f.read()
+        check("/api/pcap Content-Type is libpcap",
+              ct == "application/vnd.tcpdump.pcap", str(ct))
+        check("/api/pcap is an attachment download",
+              cd and "attachment" in cd and f"{fsid}.pcap" in cd, str(cd))
+        check("/api/pcap bytes match capture file",
+              body == orig, f"{len(body)} vs {len(orig)} bytes")
+
+        wreq = urllib.request.urlopen(f"{base}/api/wire?sid={fsid}")
+        wj = _json.loads(wreq.read())
+        # /api/wire is correct in BOTH worlds: with scripts/pcap_decode.py on
+        # the checkout it returns a decoded summary (decode_available:true);
+        # without it, it degrades to decode_available:false. Either way the
+        # envelope must carry pcap_url so the UI can still offer the raw
+        # download. (The decoder's own parsing is gated by its --selftest and
+        # by serial-web-smoke.py's decoded-fixture checks.)
+        check("/api/wire envelope carries decode_available + pcap_url",
+              isinstance(wj.get("decode_available"), bool)
+              and wj.get("pcap_url") == f"/api/pcap?sid={fsid}",
+              _json.dumps(wj)[:140])
+
+        # missing-capture session -> structured 404, never a 500
+        try:
+            urllib.request.urlopen(f"{base}/api/pcap?sid=nopcap00000a")
+            code = 200
+        except urllib.error.HTTPError as e:
+            code = e.code
+            err = _json.loads(e.read())
+        check("/api/pcap missing capture -> 404 JSON",
+              code == 404 and err.get("error") == "no_pcap", f"code={code}")
+    except Exception as e:
+        check("serial-web pcap/wire endpoints serve", False, repr(e))
+    finally:
+        srv.shutdown(); srv.server_close()
+        import shutil as _sh
+        _sh.rmtree(tmpdir, ignore_errors=True)
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="AstryxOS qemu-harness smoke test")
@@ -1004,6 +1235,7 @@ def main():
     run_read_ff_png_check()
     run_kdb_read_png_check()
     run_blk_trace_argv_check()
+    run_pcap_argv_check()
 
     if args.staleness_only:
         # Early exit for CI cycles that just want the cheap host-only checks.
