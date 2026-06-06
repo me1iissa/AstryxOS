@@ -26592,6 +26592,28 @@ fn test_membarrier_query() -> bool {
         return false;
     }
 
+    // Verify PRIVATE_EXPEDITED (cmd=0x08) returns 0 and drives the cross-CPU
+    // barrier path (mm::tlb::membarrier_private_expedited).  On SMP this
+    // broadcasts a serializing IPI to every sibling CPU on this CR3 and spins
+    // for ack; on UP it is the caller's local fence only.  Either way the
+    // syscall must complete and return 0 — a hang here would surface as a
+    // test-runner timeout, and a non-zero return is a regression.  The
+    // SYNC_CORE variant (0x20) takes the same path and must also return 0.
+    let r5 = crate::syscall::dispatch_linux_kernel(324, 0x08, 0, 0, 0, 0, 0);
+    test_println!("  membarrier(PRIVATE_EXPEDITED) = {}", r5);
+    if r5 != 0 {
+        test_fail!("membarrier_query",
+            "PRIVATE_EXPEDITED returned {} (expected 0)", r5);
+        return false;
+    }
+    let r6 = crate::syscall::dispatch_linux_kernel(324, 0x20, 0, 0, 0, 0, 0);
+    test_println!("  membarrier(PRIVATE_EXPEDITED_SYNC_CORE) = {}", r6);
+    if r6 != 0 {
+        test_fail!("membarrier_query",
+            "PRIVATE_EXPEDITED_SYNC_CORE returned {} (expected 0)", r6);
+        return false;
+    }
+
     // Unknown command must still return -EINVAL.
     let r4 = crate::syscall::dispatch_linux_kernel(324, 0x7FFF, 0, 0, 0, 0, 0);
     if r4 != -22 {

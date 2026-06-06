@@ -4439,21 +4439,51 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // once per process; returning EINVAL previously caused content-process
         // bringup to take the synchronous-barrier fallback path.
         //
-        // AstryxOS issues a global mfence+lfence on every barrier command —
-        // conservative but correct: on x86_64 stores are TSO-ordered, so the
-        // resulting barrier exceeds the membarrier(2) spec ("ordering of memory
-        // accesses by user-space threads") in both required directions.  The
-        // REGISTER_* arms are accept-and-return-0: they exist so the kernel can
-        // pre-allocate per-task state, which AstryxOS does not need.
+        // A purely *local* fence on the calling CPU satisfies the GLOBAL and
+        // GLOBAL_EXPEDITED variants (those order the caller only).  But the
+        // *PRIVATE_EXPEDITED* variants carry a stronger contract: per `man 2
+        // membarrier` they "ensure that all running threads [...] of the same
+        // process [...] have a memory barrier" before returning.  Multi-
+        // threaded programs (notably the gecko content process's lock-free
+        // TaskController / thread-pool handshakes) use this as the heavy side
+        // of an *asymmetric* barrier — a sibling thread on another core elides
+        // its own store-load fence and relies on the membarrier-issuing thread
+        // to force the matching fence on the sibling's CPU.  A local-only
+        // fence leaves that sibling free to reorder a relaxed load ahead of a
+        // store the caller is publishing, so the sibling can spin forever on a
+        // condition that has, architecturally, already been satisfied.  The
+        // correct kernel behaviour is to drive a serializing event (an IPI
+        // whose handler + IRET serialize memory, Intel SDM Vol. 3A §8.3) onto
+        // every other CPU running this process — see
+        // `mm::tlb::membarrier_private_expedited`.  The REGISTER_* arms are
+        // accept-and-return-0: AstryxOS needs no per-task opt-in.
         324 => {
             // Bits per command index, matching the cmd numeric value when
             // used as an OR-able bitmask.  We advertise everything we accept.
             const MEMBARRIER_SUPPORTED: i64 =
                 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40;
+            // Command numeric values (cmd == bit index value):
+            //   GLOBAL = 0x01, GLOBAL_EXPEDITED = 0x02,
+            //   PRIVATE_EXPEDITED = 0x08, PRIVATE_EXPEDITED_SYNC_CORE = 0x20.
+            const PRIVATE_EXPEDITED: i64 = 0x08;
+            const PRIVATE_EXPEDITED_SYNC_CORE: i64 = 0x20;
             match arg1 as i64 {
                 0 => MEMBARRIER_SUPPORTED,
-                // Barrier-issuing commands — emit a real fence.
-                0x01 | 0x02 | 0x08 | 0x20 => {
+                // Process-private expedited barrier: the caller's local fence
+                // (below) is the caller-side half; the cross-CPU IPI is the
+                // sibling-side half required by the man-page contract.  The
+                // SYNC_CORE variant additionally orders the instruction stream
+                // (after a JIT W^X flip) — the same IPI serializes the I-cache
+                // pipeline on each target via IRET, so it satisfies both.
+                PRIVATE_EXPEDITED | PRIVATE_EXPEDITED_SYNC_CORE => {
+                    unsafe { core::arch::asm!("mfence", "lfence", options(nostack, preserves_flags)); }
+                    let cr3 = crate::mm::vmm::get_cr3();
+                    crate::mm::tlb::membarrier_private_expedited(cr3);
+                    0
+                }
+                // GLOBAL / GLOBAL_EXPEDITED: order the calling CPU only.  On
+                // x86 TSO a local mfence+lfence meets this weaker contract.
+                0x01 | 0x02 => {
                     unsafe { core::arch::asm!("mfence", "lfence", options(nostack, preserves_flags)); }
                     0
                 }
