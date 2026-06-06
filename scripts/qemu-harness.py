@@ -6194,7 +6194,15 @@ def _kdb_recv(port: int, req: dict, timeout: float = 30.0) -> bytes:
                 if not chunk:
                     break
                 buf += chunk
-                if len(buf) > 128 * 1024:
+                # Safety valve against a non-terminating response.  kdb is
+                # newline-terminated and deadline-bounded, but cap total bytes
+                # to avoid unbounded memory growth on a wedged peer.  The cap
+                # MUST exceed the largest legitimate response: the `log-ring`
+                # drain serialises the whole guest-RAM log ring (drivers::
+                # log_ring, 4 MiB resident) plus JSON escaping, so a 128 KiB
+                # cap truncated it mid-string and broke json.loads.  32 MiB
+                # comfortably covers the ring + worst-case 6×-escape expansion.
+                if len(buf) > 32 * 1024 * 1024:
                     break
             if buf.endswith(b"\n"):
                 return buf

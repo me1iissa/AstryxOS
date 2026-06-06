@@ -6801,7 +6801,7 @@ pub fn sys_write_linux(fd: u64, buf: u64, count: u64) -> i64 {
                 }
                 if truncated { buf.push_str("..."); }
                 let tag = if fd == 2 { "FF/stderr" } else { "FF/write" };
-                crate::serial_println!("[{}] pid={} fd={} bytes={} body=\"{}\"", tag, pid, fd, count, buf);
+                crate::serial_fast_println!("[{}] pid={} fd={} bytes={} body=\"{}\"", tag, pid, fd, count, buf);
             }
 
             // Full-fd coverage: capture writes to fds OTHER than 0/1/2 so we
