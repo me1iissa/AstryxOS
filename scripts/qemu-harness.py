@@ -2846,6 +2846,48 @@ def _make_snap_topology(sid: str, data_img: str) -> dict:
             "data_img": str(data_img)}
 
 
+# Feature flags that mark a boot as a "Firefox-render" boot (the profiles that
+# exercise the network: a real HTTPS page load over the e1000/SLIRP netdev).
+# `firefox-test` is the back-compat super-feature; `firefox-test-core` is the
+# perf/render profile; `firefox-test-trace` is the dense-trace add-on. When the
+# resolved feature set intersects this set, host-side pcap capture defaults ON
+# (see `_resolve_pcap_decision`) — every FF boot's VM<->internet traffic is
+# captured automatically. Non-FF boots (test-mode, default desktop) have no
+# network worth capturing, so capture stays OFF for them by default.
+FF_RENDER_FEATURES = frozenset({
+    "firefox-test",
+    "firefox-test-core",
+    "firefox-test-trace",
+})
+
+
+def _resolve_pcap_decision(feats, pcap_flag, no_pcap_flag):
+    """Decide whether host-side pcap capture is enabled for this boot.
+
+    Pure (no I/O) so the smoke suite can exercise every branch without a boot.
+
+    Precedence (highest first):
+      1. ``--no-pcap``  -> OFF unconditionally (wins over everything; lets a
+         clean perf-timing FF run suppress even the host fwrite).
+      2. ``--pcap``     -> ON unconditionally (force-on for ANY boot, incl. the
+         non-FF / no-network ones).
+      3. FF-render feature set present -> ON (the default: every Firefox boot
+         captures its VM<->internet traffic automatically).
+      4. otherwise      -> OFF (non-FF boots have no network worth capturing).
+
+    `feats` is the fully-resolved feature list (post `--trace` expansion).
+    Returns ``(enabled: bool, reason: str)`` where reason is one of
+    ``"no-pcap-optout" | "pcap-forced" | "ff-default" | "non-ff-default"``.
+    """
+    if no_pcap_flag:
+        return False, "no-pcap-optout"
+    if pcap_flag:
+        return True, "pcap-forced"
+    if any(f in FF_RENDER_FEATURES for f in feats):
+        return True, "ff-default"
+    return False, "non-ff-default"
+
+
 def cmd_start(args):
     sid = uuid.uuid4().hex[:12]
     serial_log  = str(HARNESS_DIR / f"{sid}.serial.log")
@@ -3466,6 +3508,44 @@ def cmd_start(args):
     if "xeyes-test" in feats and not any(a == "-vga" for a in extra_qemu_args):
         extra_qemu_args += ["-vga", "vmware"]
 
+    # Host-side packet capture on the e1000/SLIRP netdev (net0).
+    #
+    # `-object filter-dump,id=netdump,netdev=net0,file=<sid>.pcap` taps the
+    # netdev frontend on the HOST side (QEMU networking docs: filter-dump
+    # records every packet on the named netdev to a libpcap file, classic
+    # pcap file format).  Because the tap lives in the host QEMU process
+    # — not the guest — the guest takes ZERO extra VM-exits; the only cost
+    # is a host fwrite per frame, bounded by traffic volume (~MB per page
+    # load).  This is fundamentally cheaper than the serial firehose, where
+    # every emitted byte was a synchronous PIO VM-exit (Intel SDM Vol. 3C
+    # §25).  The `-object` is appended via extra_qemu_args; it references
+    # the netdev by id (`net0`) so the in-place hostfwd patching in
+    # `_launch_qemu_harness` (which mutates the `-netdev` arg, not its id)
+    # leaves the filter-dump binding intact.
+    #
+    # Capture defaults ON for Firefox-render boots (the FF profiles exercise a
+    # real network load), so every FF boot's VM<->internet traffic is captured
+    # automatically with no opt-in.  `--pcap` force-enables it for ANY boot
+    # (incl. non-FF); `--no-pcap` disables it even on FF boots (for a clean
+    # perf-timing run).  Precedence and the decision live in
+    # `_resolve_pcap_decision`; `pcap_reason` records which rule fired.
+    pcap_enabled, pcap_reason = _resolve_pcap_decision(
+        feats,
+        bool(getattr(args, "pcap", False)),
+        bool(getattr(args, "no_pcap", False)),
+    )
+    pcap_path = ""
+    if pcap_enabled:
+        pcap_path = str(HARNESS_DIR / f"{sid}.pcap")
+        extra_qemu_args += [
+            "-object",
+            f"filter-dump,id=netdump,netdev=net0,file={pcap_path}",
+        ]
+        print(f"[HARNESS] pcap capture: {pcap_path}", file=sys.stderr)
+    else:
+        print(f"[HARNESS] pcap capture: disabled ({pcap_reason})",
+              file=sys.stderr)
+
     # snap-gate (--snapshottable): build the savevm/loadvm-compatible device
     # topology so the running guest can be snapshotted live.  The default
     # firefox-test boot disk (writable vvfat) + writable OVMF_VARS pflash
@@ -3510,6 +3590,17 @@ def cmd_start(args):
         "kdb_host_port": kdb_host_port,
         "http_host_port": http_host_port,
         "ssh_host_port": ssh_host_port,
+        # Host-side network capture.  `pcap_path` is the source of truth —
+        # the libpcap file QEMU's filter-dump object writes every guest netdev
+        # frame to, or "" when capture is disabled.  serial-web serves it at
+        # /api/pcap?sid=<sid> and decodes it at /api/wire?sid=<sid>.  Defaults
+        # ON for FF-render boots, OFF otherwise; `--pcap` force-on, `--no-pcap`
+        # force-off (precedence in `_resolve_pcap_decision`).  `pcap_enabled`
+        # mirrors `bool(pcap_path)`; `pcap_reason` records which rule decided.
+        # All additive — never present on sessions started before they landed.
+        "pcap_path":    pcap_path,
+        "pcap_enabled": pcap_enabled,
+        "pcap_reason":  pcap_reason,
         # PIVOT-I2 Phase D — host stub Conflux for oracle-daemon-test.
         # If oracle_stub_pid is 0 the stub wasn't launched (default).
         "oracle_stub_port": oracle_stub_port,
@@ -3645,6 +3736,13 @@ def cmd_start(args):
           "gdb_port": gdb_port, "kdb_host_port": kdb_host_port,
           "http_host_port": http_host_port,
           "ssh_host_port": ssh_host_port,
+          # Host-side capture: path ("" when disabled) is the source of truth;
+          # `pcap_enabled` mirrors bool(path); `pcap_reason` is the rule that
+          # fired ("ff-default" | "pcap-forced" | "no-pcap-optout" |
+          # "non-ff-default").  Additive.
+          "pcap_path":    pcap_path,
+          "pcap_enabled": pcap_enabled,
+          "pcap_reason":  pcap_reason,
           # W106: structured CPU-model fields. `cpu_model_resolved` is
           # the literal string passed to QEMU `-cpu`; `cpu_model_reason`
           # is one of "override" | "kvm-host" | "tcg-safe".
@@ -4195,6 +4293,22 @@ def cmd_status(args):
 
     exit_cause = _classify_exit_cause(sess["serial_log"], alive)
 
+    # Host-side capture.  Report path + whether QEMU has started writing frames
+    # (file present + byte size), plus the decision metadata.  pcap_path is ""
+    # when capture was disabled for this session (and absent entirely on
+    # sessions that predate the feature).  `pcap_reason` records which rule
+    # enabled/disabled it; older sessions fall back to deriving it from path.
+    pcap_path = sess.get("pcap_path") or ""
+    pcap_enabled = bool(sess.get("pcap_enabled", bool(pcap_path)))
+    # None on sessions that predate the field (decision rule unknown).
+    pcap_reason = sess.get("pcap_reason")
+    pcap_size = 0
+    if pcap_path:
+        try:
+            pcap_size = Path(pcap_path).stat().st_size
+        except OSError:
+            pass
+
     _out({
         "running":         alive,
         "sid":             sid,
@@ -4208,6 +4322,15 @@ def cmd_status(args):
         # filled in by the post-boot verifier once the [FFTEST] probe line
         # is parsed; until then they remain None.
         "firefox_variant_info": sess.get("firefox_variant_info"),
+        # Host-side capture.  `pcap_path` is "" when capture was disabled;
+        # `pcap_size` > 0 confirms QEMU's filter-dump is writing frames.
+        # `pcap_enabled` mirrors bool(path); `pcap_reason` is the rule that
+        # decided ("ff-default" | "pcap-forced" | "no-pcap-optout" |
+        # "non-ff-default"), or None on pre-feature sessions.  Additive.
+        "pcap_path":       pcap_path,
+        "pcap_size":       pcap_size,
+        "pcap_enabled":    pcap_enabled,
+        "pcap_reason":     pcap_reason,
     })
 
 
@@ -11357,6 +11480,33 @@ def main():
                                "Suppress the auto-restage with "
                                "--no-regen-data-img — the mismatch is still "
                                "warned about on stderr.")
+    p_start.add_argument("--pcap", action="store_true", dest="pcap",
+                          help="FORCE host-side packet capture ON for this "
+                               "boot, even a non-FF one.  Captures ALL guest "
+                               "network traffic on the e1000/SLIRP netdev "
+                               "(net0) to a libpcap file at "
+                               "~/.astryx-harness/<sid>.pcap via a HOST-SIDE "
+                               "QEMU `-object filter-dump`.  Capture already "
+                               "DEFAULTS ON for Firefox-render boots (features "
+                               "firefox-test / firefox-test-core / "
+                               "firefox-test-trace) — this flag is only needed "
+                               "to force it on a non-FF boot.  The tap lives on "
+                               "the host side — the guest is unaware, so there "
+                               "are ZERO guest VM-exits and negligible guest "
+                               "perf cost (only host disk writes bounded by "
+                               "traffic volume, a few MB for a page load).  "
+                               "Unlike the serial firehose (per-byte PIO "
+                               "VM-exits), this is free on the guest path.  The "
+                               "pcap opens in Wireshark; serial-web serves it "
+                               "at /api/pcap?sid=<sid> and a decoded wire "
+                               "summary at /api/wire?sid=<sid>.")
+    p_start.add_argument("--no-pcap", action="store_true", dest="no_pcap",
+                          help="Disable host-side packet capture for this boot "
+                               "even when it would otherwise default ON (an "
+                               "FF-render boot).  Use for a clean perf-timing "
+                               "run where even the per-frame host fwrite is "
+                               "unwanted.  Wins over both the FF-default and an "
+                               "explicit --pcap.")
 
     # stop
     p_stop = sub.add_parser("stop", help="Kill a QEMU session")
