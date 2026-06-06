@@ -2038,6 +2038,16 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let addrlen_ptr  = arg6 as *mut u32;
             if crate::syscall::is_unix_socket_fd(pid, fd) {
                 let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
+                // Per recvfrom(2) / unix(7): a recv on a socket without
+                // O_NONBLOCK and without MSG_DONTWAIT MUST block until a
+                // message is available rather than returning -EAGAIN on a
+                // momentarily-empty ring.  Park (bounded) until the socket is
+                // readable; non-blocking fds skip the wait and fall through to
+                // the single drain that yields EAGAIN-on-empty unchanged.
+                let blocking = !(msg_dontwait || fd_is_nonblocking(pid, fd));
+                if let Err(e) = unix_recv_block_wait(unix_id, pid, blocking) {
+                    return e;
+                }
                 // SMAP bracket — `buf` is a user slice; unix::read writes
                 // into it.  Bracket spans the call so the writes inside
                 // unix::read run with AC=1.
@@ -2070,7 +2080,12 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 // DNS resolvers retry within 5 s anyway (RFC 1035 §4.2.1).
                 if blocking {
                     let deadline = crate::arch::x86_64::irq::get_ticks() + 3000;
-                    while !crate::net::socket::socket_has_data(socket_id) {
+                    // Break on data OR on an orderly peer-FIN EOF.  A blocking
+                    // recv on a stream whose peer has sent FIN with an empty
+                    // buffer must wake and return 0 (RFC 9293 §3.5) — it would
+                    // otherwise spin to the deadline since no data will arrive.
+                    while !crate::net::socket::socket_has_data(socket_id)
+                        && !crate::net::socket::socket_is_read_closed(socket_id) {
                         if signal_pending(pid) { return -4; } // EINTR
                         crate::net::poll();
                         if crate::arch::x86_64::irq::get_ticks() >= deadline {
@@ -2079,16 +2094,30 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         crate::sched::yield_cpu();
                     }
                 }
-                match crate::net::socket::socket_recvfrom(socket_id) {
-                    Ok((data, src_ip, src_port)) => {
-                        // Empty result on a non-blocking socket = EAGAIN
-                        // per IEEE 1003.1 §recvfrom.  We can only hit
-                        // this branch when blocking==false (the wait
-                        // loop above guarantees data on the blocking
-                        // path) so the userspace contract holds.
-                        if data.is_empty() {
-                            return -11; // EAGAIN
-                        }
+                // MSG_PEEK (0x2): non-destructive probe.  We cannot peek
+                // buffered stream bytes without consuming them, but EOF
+                // discovery must still work so a peeking reader (e.g. an
+                // Available()-style backup that PEEKs before draining) learns
+                // the connection is closed: a peek on a FIN'd empty stream
+                // returns 0, not -EAGAIN.  When data is buffered, fall through
+                // to the normal drain (best-effort: returns the bytes; the
+                // peek-non-consume guarantee is not yet wired and no current
+                // userspace path PEEKs buffered AF_INET stream data).
+                let msg_peek = (flags & 0x2) != 0;
+                if msg_peek && crate::net::socket::socket_is_read_closed(socket_id)
+                    && !crate::net::socket::socket_has_data(socket_id) {
+                    return 0; // orderly shutdown, observed via peek
+                }
+                // EOF-aware drain: give recvfrom(2) the same peer-FIN
+                // discrimination as recvmsg(2) (nr=47).  Per recv(2) /
+                // RFC 9293 §3.5: a peer-FIN'd empty stream is an orderly
+                // shutdown → return 0; a still-open empty stream is
+                // would-block → -EAGAIN.  The kernel poll readiness
+                // (POLLIN|POLLHUP) is left faithful; only the recv return
+                // is corrected so a level-triggered reactor observes EOF,
+                // closes the fd, and stops re-polling it forever.
+                match crate::net::socket::socket_recv_status_from(socket_id) {
+                    Ok((crate::net::socket::RecvOutcome::Data(data), src_ip, src_port)) => {
                         let n = data.len().min(len);
                         if n > 0 {
                             unsafe {
@@ -2113,6 +2142,11 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         }
                         n as i64
                     }
+                    // Orderly peer shutdown (FIN): 0-byte return per recv(2).
+                    // Leaves the user address buffer untouched (no message).
+                    Ok((crate::net::socket::RecvOutcome::Eof, _, _)) => 0,
+                    // Empty queue on an open stream / no datagram: EAGAIN.
+                    Ok((crate::net::socket::RecvOutcome::WouldBlock, _, _)) => -11,
                     Err(_) => -11,
                 }
             }
@@ -2164,9 +2198,14 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             // starting recv position, the batch becomes deliverable the
             // instant the reader pops the frame's first byte.  Computed once
             // here (under the unix TABLE lock, briefly) for unix sockets only.
-            let scm_bind_peer_id: u64 = if crate::syscall::is_unix_socket_fd(pid, fd) {
-                let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
-                crate::net::unix::get_peer(unix_id)
+            // Sender's own AF_UNIX socket id (for the writable-gate below).
+            let scm_sender_unix_id: u64 = if crate::syscall::is_unix_socket_fd(pid, fd) {
+                crate::syscall::get_unix_socket_id(pid, fd)
+            } else {
+                u64::MAX
+            };
+            let scm_bind_peer_id: u64 = if scm_sender_unix_id != u64::MAX {
+                crate::net::unix::get_peer(scm_sender_unix_id)
             } else {
                 u64::MAX
             };
@@ -2180,6 +2219,29 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             // the data it accompanies (see the ordering note below).  A frame
             // with at least one non-empty iovec is data-bearing.
             let frame_has_data = iovecs_owned.iter().any(|iov| iov[1] != 0);
+            // First-byte-accepted gate for the SCM_RIGHTS batch.  The batch is
+            // queued BEFORE the data push (the ordering invariant below), but it
+            // must only be queued if at least one byte of THIS frame will be
+            // accepted into the peer ring — otherwise the push loop returns
+            // -EAGAIN with `total == 0` (nothing queued), the whole sendmsg(2)
+            // reports -EAGAIN, and a userspace stream writer retries the entire
+            // frame from the start WITH its control message re-attached.  Were
+            // the batch queued unconditionally, that retry would enqueue a
+            // SECOND batch for the same frame — duplicating the fds on the peer
+            // (CWE-675 / a double-delivery of the ancillary descriptors).  A
+            // DATA-bearing frame thus queues its batch only when the peer ring
+            // has room for >=1 byte (net::unix::writable, the same predicate
+            // that gates whether write() returns >0 vs -EAGAIN).  A control-ONLY
+            // frame (no data bytes) carries nothing to push and is a 0-byte
+            // readable ancillary message in its own right (recvmsg(2), unix(7)
+            // SCM_RIGHTS); it is always queued regardless of ring fullness.
+            let scm_first_byte_will_land = if !frame_has_data {
+                true
+            } else if scm_sender_unix_id != u64::MAX {
+                crate::net::unix::writable(scm_sender_unix_id)
+            } else {
+                false
+            };
             let mut total = 0usize;
             // ORDERING (race fix): the SCM_RIGHTS batch is queued BEFORE the data
             // bytes are pushed into the peer's recv ring.  The data push and the
@@ -2232,7 +2294,15 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                         (0u64, 0usize, 0usize, 0i32, 0i32)
                     }
                 };
-                if ctrl_ptr != 0 && ctrl_len >= 16 {
+                // `scm_first_byte_will_land` gate: skip the entire SCM_RIGHTS
+                // clone/ref-bump/enqueue when no byte of this data-bearing frame
+                // will be accepted (peer ring full).  The push loop will then
+                // return -EAGAIN with total==0 and the writer retries the WHOLE
+                // frame (cmsg included) — so queuing here would double the batch.
+                // Gating before the clone also avoids taking fd references we
+                // would otherwise have to release (CWE-772).  A control-only
+                // frame always lands (scm_first_byte_will_land == true).
+                if ctrl_ptr != 0 && ctrl_len >= 16 && scm_first_byte_will_land {
                     const SOL_SOCKET_I32: i32 = 1;
                     const SCM_RIGHTS_I32: i32 = 1;
                     if cmsg_level == SOL_SOCKET_I32 && cmsg_type == SCM_RIGHTS_I32 && cmsg_len > 16 {
@@ -2385,6 +2455,26 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
                     match crate::net::unix::write(unix_id, data) {
                         n if n >= 0 => total += n as usize,
+                        // Per POSIX.1-2017 send(2)/sendmsg(2): a non-blocking
+                        // SOCK_STREAM transmit that has already queued some
+                        // bytes must report the COUNT actually queued (a short
+                        // write), NOT -EAGAIN — -EAGAIN is reserved for the
+                        // case where ZERO bytes could be queued.  net::unix::write
+                        // returns -EAGAIN (-11) only when the peer recv ring was
+                        // already full (n == 0).  When the ring fills part-way
+                        // through this iovec loop, earlier iovecs of THIS frame
+                        // (and possibly a leading partial of this iovec) are
+                        // already in the ring: `total > 0`.  Returning the raw
+                        // -EAGAIN here would discard that `total`, so the userspace
+                        // stream writer (which resumes a short write from the
+                        // returned byte count and re-sends from frame-start on a
+                        // bare -EAGAIN) would re-transmit the already-queued
+                        // leading bytes AND re-attach the frame's SCM_RIGHTS
+                        // control fds — desynchronising the byte stream and the
+                        // ancillary-fd accounting on the peer.  Break and return
+                        // the honest short-write count; -EAGAIN is returned only
+                        // when nothing at all was queued (total == 0).
+                        e if e == -11 && total > 0 => break,
                         e => return e,
                     }
                 } else {
@@ -2431,6 +2521,25 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let bytes_read: i64;
             if crate::syscall::is_unix_socket_fd(pid, fd) {
                 let unix_id = crate::syscall::get_unix_socket_id(pid, fd);
+                // Per recvmsg(2) / unix(7): a recv on a socket that is not in
+                // non-blocking mode (no O_NONBLOCK on the description, no
+                // MSG_DONTWAIT in `flags`) MUST block until a message is
+                // available rather than returning -EAGAIN on a momentarily-empty
+                // recv ring.  recvmsg(2) flags is the third argument (arg3);
+                // MSG_DONTWAIT = 0x40 per <sys/socket.h>.  The single-shot
+                // read_msg below returns -EAGAIN on an empty ring regardless of
+                // mode, so without this gate a blocking recvmsg consumer — such
+                // as a SOCK_SEQPACKET request/response broker that loops on
+                // recvmsg with no MSG_DONTWAIT and only retries on EINTR —
+                // mis-reads the spurious EAGAIN and tears its channel down.
+                // The SCM-deliverable promote-to-0 arm below is preserved: a
+                // control-only frame is "ready" (unix_recv_ready), so the wait
+                // returns Ok and the drain falls into that arm.
+                let msg_dontwait = (arg3 & 0x40) != 0;
+                let blocking = !(msg_dontwait || fd_is_nonblocking(pid, fd));
+                if let Err(e) = unix_recv_block_wait(unix_id, pid, blocking) {
+                    return e;
+                }
                 // Cap the STREAM drain at the next pending SCM_RIGHTS batch
                 // boundary so this recvmsg does not consume bytes PAST the
                 // stream position where the next fd batch becomes deliverable.
@@ -3046,8 +3155,18 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 const SO_PEERCRED: u64 = 17;
                 match (level, opt) {
                     (SOL_SOCKET, SO_TYPE)   => 1,  // SOCK_STREAM
-                    (SOL_SOCKET, SO_RCVBUF) => 87380,
-                    (SOL_SOCKET, SO_SNDBUF) => 131072,
+                    // Report the AF_UNIX send/recv buffer sizes as the actual
+                    // usable capacity of this transport's per-end recv ring
+                    // (net::unix::buf_capacity()).  Per socket(7), SO_SNDBUF is
+                    // the kernel's send-buffer size; a length-prefixed IPC stream
+                    // writer queries it to size each sendmsg(2) so it never offers
+                    // more than the transport can atomically accept.  Advertising
+                    // a value larger than the ring (the previous 131072 vs a
+                    // 32 KiB ring) makes such a writer offer a >ring frame in one
+                    // call, which can only be partially queued — needlessly
+                    // forcing the partial-write resume path on every large frame.
+                    (SOL_SOCKET, SO_RCVBUF) => crate::net::unix::buf_capacity() as u32,
+                    (SOL_SOCKET, SO_SNDBUF) => crate::net::unix::buf_capacity() as u32,
                     (SOL_SOCKET, SO_ERROR)  => 0,
                     (SOL_SOCKET, SO_PEERCRED) => {
                         // Return struct ucred { pid: u32, uid: u32, gid: u32 } = 12 bytes.
@@ -3958,7 +4077,37 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             0 // dead — exit_thread diverges
         }
         // 61: wait4(pid, wstatus, options, rusage)
-        61 => crate::syscall::sys_waitpid(arg1 as i64, arg3 as u32),
+        //
+        // Returns the reaped child pid AND, when `wstatus` (arg2) is non-NULL,
+        // writes the encoded wait status so the caller's `WIFEXITED` /
+        // `WEXITSTATUS` / `WIFSIGNALED` / `WTERMSIG` macros decode correctly
+        // (Linux man-pages `wait(2)`, "status").  Without this, a `waitpid()`
+        // wrapper (musl/glibc `waitpid` → `wait4`) reads an uninitialised
+        // status and mis-classifies the child's exit.  Encoding:
+        //   normal exit:  (exit_status & 0xff) << 8
+        //   killed:       signo (low 7 bits); AstryxOS stores `-signo`.
+        61 => {
+            let want = arg1 as i64;
+            let mut exit_code: i32 = 0;
+            let ret = crate::syscall::sys_waitpid_ex(
+                want, (arg3 & 1) != 0 /*WNOHANG*/, false /*WNOWAIT*/,
+                Some(&mut exit_code));
+            if ret > 0 && arg2 != 0
+                && (crate::syscall::user_ptr_check_bypassed()
+                    || crate::syscall::validate_user_ptr(arg2, 4))
+            {
+                let wstatus: i32 = if exit_code < 0 {
+                    (-exit_code) & 0x7f                  // WIFSIGNALED: WTERMSIG
+                } else {
+                    (exit_code & 0xff) << 8              // WIFEXITED:  WEXITSTATUS
+                };
+                unsafe {
+                    let _g = crate::arch::x86_64::smap::UserGuard::new();
+                    core::ptr::write_unaligned(arg2 as *mut i32, wstatus);
+                }
+            }
+            ret
+        }
         // 62: kill(pid, sig)
         62 => crate::signal::kill(arg1, arg2 as u8),
         // 72: fcntl(fd, cmd, arg)
@@ -4171,8 +4320,10 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
             let id      = arg2 as i64;
             let infop   = arg3 as *mut u8; // siginfo_t*
             let options = arg4 as u32;
-            const WNOHANG:  u32 = 1;
-            const WEXITED:  u32 = 4;
+            // POSIX `waitid(2)` option bits (Linux UAPI <linux/wait.h>):
+            const WNOHANG:  u32 = 0x0000_0001;
+            const WEXITED:  u32 = 0x0000_0004;
+            const WNOWAIT:  u32 = 0x0100_0000;
             let pid: i64 = match idtype {
                 0 => -1,    // P_ALL  — any child
                 1 => id,    // P_PID  — specific pid
@@ -4180,20 +4331,64 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 _ => return -22, // EINVAL
             };
             if options & WEXITED == 0 { return -22; } // must request at least WEXITED
-            let ret = crate::syscall::sys_waitpid(pid, if options & WNOHANG != 0 { WNOHANG } else { 0 });
-            if ret > 0 && !infop.is_null() {
-                // Fill minimal siginfo_t: si_signo=SIGCHLD(17), si_errno=0,
-                // si_code=CLD_EXITED(1), si_pid=child_pid, si_status=exit_code
-                // siginfo_t is 128 bytes; we only fill the first 20 bytes.
-                unsafe {
-                    let _g = crate::arch::x86_64::smap::UserGuard::new();
-                    core::ptr::write_bytes(infop, 0, 128);
-                    core::ptr::write_unaligned(infop.add(0)  as *mut i32, 17); // si_signo = SIGCHLD
-                    core::ptr::write_unaligned(infop.add(8)  as *mut i32, 1);  // si_code  = CLD_EXITED
-                    core::ptr::write_unaligned(infop.add(12) as *mut i32, ret as i32); // si_pid
+            // Honour WNOWAIT: peek the child's status but leave it in a
+            // waitable state, so the canonical "waitid(WNOWAIT) then
+            // waitid(reap)" idiom (used by process launchers to observe a
+            // child's exit before collecting it) does not race-reap the child
+            // on the first call and hang the second against an already-gone pid.
+            match crate::syscall::sys_waitid(
+                pid, options & WNOHANG != 0, options & WNOWAIT != 0)
+            {
+                crate::syscall::WaitidOutcome::Collected { pid: child, si_code, si_status } => {
+                    // Serialise the user `siginfo_t` for SIGCHLD per
+                    // POSIX.1-2017 `waitid(2)` and Linux
+                    // `<asm-generic/siginfo.h>`.  The x86-64 (LP64) field
+                    // offsets live in `crate::syscall` (si_pid @16, si_status
+                    // @24 — the `_sifields` union is 8-byte aligned and starts
+                    // at offset 16, NOT 12).  Writing si_pid at the wrong
+                    // offset makes a reader that branches on `si_pid` (gecko's
+                    // IsProcessDead: `if (si.si_pid == 0) return Running;`) see a
+                    // zero pid and busy-loop the blocking `waitid(WNOWAIT)`
+                    // forever, pinning the caller's thread.
+                    if !infop.is_null()
+                        && (crate::syscall::user_ptr_check_bypassed()
+                            || crate::syscall::validate_user_ptr(
+                                arg3, crate::syscall::SI_SIZE))
+                    {
+                        let uid = {
+                            let cur = crate::proc::current_pid_lockless();
+                            crate::proc::PROCESS_TABLE.lock()
+                                .iter().find(|p| p.pid == cur)
+                                .map(|p| p.uid as i32).unwrap_or(0)
+                        };
+                        let mut si = [0u8; crate::syscall::SI_SIZE];
+                        crate::syscall::fill_sigchld_siginfo(
+                            &mut si, si_code, child as i32, uid, si_status);
+                        unsafe {
+                            let _g = crate::arch::x86_64::smap::UserGuard::new();
+                            core::ptr::copy_nonoverlapping(
+                                si.as_ptr(), infop, crate::syscall::SI_SIZE);
+                        }
+                    }
+                    0 // waitid returns 0 on success (not child pid)
                 }
+                // WNOHANG, nothing ready: per `waitid(2)`, return 0 with a
+                // zeroed `si_pid` so the caller sees "no child changed state".
+                crate::syscall::WaitidOutcome::NoHang => {
+                    if !infop.is_null()
+                        && (crate::syscall::user_ptr_check_bypassed()
+                            || crate::syscall::validate_user_ptr(
+                                arg3, crate::syscall::SI_SIZE))
+                    {
+                        unsafe {
+                            let _g = crate::arch::x86_64::smap::UserGuard::new();
+                            core::ptr::write_bytes(infop, 0, crate::syscall::SI_SIZE);
+                        }
+                    }
+                    0
+                }
+                crate::syscall::WaitidOutcome::Err(e) => e, // negative errno
             }
-            if ret > 0 { 0 } else { ret } // waitid returns 0 on success (not child pid)
         }
         // 257: openat(dirfd, pathname, flags, mode)
         257 => {
@@ -6215,6 +6410,15 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
         }
     } else if crate::syscall::is_unix_socket_fd(pid, fd as usize) {
         let unix_id = crate::syscall::get_unix_socket_id(pid, fd as usize);
+        // Per read(2) / unix(7): read on a blocking AF_UNIX socket (no
+        // O_NONBLOCK) must block until a message is available; read(2) has no
+        // flags argument, so blocking is governed solely by O_NONBLOCK.  Park
+        // (bounded) until readable; non-blocking fds skip the wait and the
+        // single drain below yields EAGAIN-on-empty unchanged.
+        let blocking = !fd_is_nonblocking(pid, fd as usize);
+        if let Err(e) = unix_recv_block_wait(unix_id, pid, blocking) {
+            return e;
+        }
         let avail = crate::net::unix::bytes_available(unix_id);
         let buf_sl = unsafe { core::slice::from_raw_parts_mut(buf_ptr, count) };
         let ret = crate::net::unix::read(unix_id, buf_sl);
@@ -9089,11 +9293,30 @@ pub fn sys_futex_linux(
 ) -> i64 {
     const FUTEX_PRIVATE_FLAG:   u64 = 0x80;
     const FUTEX_CLOCK_REALTIME: u64 = 0x100;
-    let _ = FUTEX_PRIVATE_FLAG; // documented for clarity; no behavioural use
 
     let op = futex_op & 0x7F; // Strip FUTEX_PRIVATE_FLAG and FUTEX_CLOCK_REALTIME
     let abs_realtime = (futex_op & FUTEX_CLOCK_REALTIME) != 0;
     let pid = crate::proc::current_pid_lockless();
+
+    // Per `futex(2)` (FUTEX_PRIVATE_FLAG): when the caller sets the private
+    // flag, the futex is process-private and keyed by `(mm, uaddr)` — the
+    // fast path.  When it is clear, a futex word that lives on a `MAP_SHARED`
+    // file/`memfd`-backed page is process-shared and must be keyed by its
+    // backing-object identity so two processes mapping the same object at
+    // different virtual addresses rendezvous (`resolve_futex_key`).  Mozilla's
+    // cross-process screenshot rendezvous (`CrossProcessSemaphore` on a
+    // `memfd` `MAP_SHARED` page) takes exactly this shared path: it does NOT
+    // set FUTEX_PRIVATE_FLAG, the content process WAITs and the parent WAKEs
+    // (or vice versa), and only a shared key lets the wake reach the waiter.
+    let force_private = (futex_op & FUTEX_PRIVATE_FLAG) != 0;
+    // The rendezvous key for ops that operate on `uaddr` (WAIT/WAKE/REQUEUE
+    // source/WAKE_OP first wake).  Resolved once here (one VMA lookup on the
+    // shared path; a no-op on the private fast path), then reused by every
+    // bucket operation below so waiter and waker land in the same bucket.
+    let key = crate::syscall::resolve_futex_key(pid, uaddr, force_private);
+    // The destination key for the two-address ops (REQUEUE dst, WAKE_OP second
+    // wake) is resolved lazily in those branches — `uaddr2` is unused (and may
+    // be a non-pointer count) for the single-address ops.
 
     // Read the timespec at `timeout_ptr` (NULL means "no timeout") and convert
     // it to a *relative* nanosecond duration that the rest of the handler can
@@ -9277,7 +9500,7 @@ pub fn sys_futex_linux(
             // transitioned to Blocked, so it cannot return `woken=0` while
             // we're still mid-registration.
             match crate::syscall::futex_wait_check_and_enqueue(
-                pid, uaddr, val, tid, wake_tick,
+                key, val, tid, wake_tick,
                 || unsafe { crate::syscall::user_read_u32(uaddr) },
             ) {
                 crate::syscall::FutexWaitOutcome::Enqueued     => {}
@@ -9347,13 +9570,18 @@ pub fn sys_futex_linux(
                 // requeue insert).  `take`-style: remove it so the map does
                 // not leak across this waiter's lifetime.
                 let dest = crate::syscall::FUTEX_REQUEUE_DEST.lock().remove(&(pid, tid));
-                let key = (pid, dest.unwrap_or(uaddr));
-                if let Some(list) = waiters.get_mut(&key) {
+                // The bucket the waiter actually sits in: the requeue
+                // destination key if a requeue moved it, else the key it
+                // originally enqueued under.  Both are full FutexKeys, so a
+                // shared-futex waiter (or one requeued onto a shared bucket) is
+                // scanned in the right bucket.
+                let cleanup_key = dest.unwrap_or(key);
+                if let Some(list) = waiters.get_mut(&cleanup_key) {
                     let before = list.len();
                     list.retain(|&t| t != tid);
                     if list.len() < before { timed_out = true; } // still in list → timed out; already gone → woken
                     if list.is_empty() {
-                        waiters.remove(&key);
+                        waiters.remove(&cleanup_key);
                     }
                 }
             }
@@ -9396,14 +9624,14 @@ pub fn sys_futex_linux(
 
             let tids_to_wake: Vec<u64> = {
                 let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
-                if let Some(list) = waiters.get_mut(&(pid, uaddr)) {
+                if let Some(list) = waiters.get_mut(&key) {
                     let mut result = Vec::new();
                     while !list.is_empty() && woken < max_wake {
                         result.push(list.remove(0));
                         woken += 1;
                     }
                     if list.is_empty() {
-                        waiters.remove(&(pid, uaddr));
+                        waiters.remove(&key);
                     }
                     result
                 } else {
@@ -9533,18 +9761,33 @@ pub fn sys_futex_linux(
             // the per-wake scan nor the serial; `test-mode` keeps the full
             // behaviour so Test 238 (which asserts FUTEX_WAKE_GHOST_COUNT
             // advances) is unchanged.
+            // The composite-cond-var GHOST cluster is a same-address-space
+            // (PRIVATE-key) phenomenon — sibling pthread_cond_t fields within
+            // one process's enclosing object.  A SHARED-key wake has no
+            // `(pid, uaddr)` cluster to scan (its bucket identity is a backing
+            // object, not a contiguous virtual range), so the diagnostic only
+            // runs on the private path.
             #[cfg(any(feature = "firefox-test-trace", feature = "test-mode"))]
             if woken == 0 && (op == 1 || op == 10) {
+                if let crate::syscall::FutexKey::Private(_, _) = key {
                 const FUTEX_GHOST_CLUSTER: u64 = 256;
                 let cluster_lo = uaddr & !(FUTEX_GHOST_CLUSTER - 1);
                 let cluster_hi = cluster_lo + FUTEX_GHOST_CLUSTER;
                 let waiters = crate::syscall::FUTEX_WAITERS.lock();
-                // BTreeMap::range over the half-open [(pid, cluster_lo),
-                // (pid, cluster_hi)) interval lets us find sibling uaddrs
-                // in O(log n + k) without scanning the whole table.
-                for (&(wpid, wuaddr), tids) in waiters
-                    .range((pid, cluster_lo)..(pid, cluster_hi))
+                // BTreeMap::range over the half-open [Private(pid, cluster_lo),
+                // Private(pid, cluster_hi)) interval lets us find sibling
+                // uaddrs in O(log n + k) without scanning the whole table.
+                // Private(pid, _) keys for one pid are contiguous in the
+                // FutexKey ordering (the Private variant sorts before Shared
+                // and lexicographically by (pid, uaddr)).
+                use crate::syscall::FutexKey;
+                for (k, tids) in waiters
+                    .range(FutexKey::Private(pid, cluster_lo)..FutexKey::Private(pid, cluster_hi))
                 {
+                    let (wpid, wuaddr) = match k {
+                        FutexKey::Private(p, u) => (*p, *u),
+                        FutexKey::Shared { .. } => continue,
+                    };
                     if wpid != pid || wuaddr == uaddr { continue; }
                     if let Some(&first_tid) = tids.first() {
                         crate::serial_println!(
@@ -9560,6 +9803,7 @@ pub fn sys_futex_linux(
                         );
                     }
                 }
+                } // close: if let Private(_, _) = key
             }
 
             // History-mode GHOST correlation — observe-only.  This bumps
@@ -9627,12 +9871,20 @@ pub fn sys_futex_linux(
             let mut woken = 0u64;
             let mut requeued = 0u64;
 
+            // Destination rendezvous key for uaddr2.  Resolved with the same
+            // `force_private` as the source — both addresses live in the same
+            // address space and the private flag applies to the whole op.  A
+            // requeue may legitimately move waiters between a private source
+            // bucket and a shared destination bucket (or vice versa); keying
+            // both correctly is what lets the requeued waiter be found later.
+            let key2 = crate::syscall::resolve_futex_key(pid, uaddr2, force_private);
+
             let tids_to_wake: Vec<u64>;
             let tids_to_requeue: Vec<u64>;
 
             {
                 let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
-                let src = waiters.remove(&(pid, uaddr)).unwrap_or_default();
+                let src = waiters.remove(&key).unwrap_or_default();
                 let mut wake_list = Vec::new();
                 let mut requeue_list = Vec::new();
                 for tid in src {
@@ -9644,21 +9896,21 @@ pub fn sys_futex_linux(
                         requeued += 1;
                     }
                 }
-                // Requeue surviving waiters to uaddr2.
+                // Requeue surviving waiters to uaddr2's key.
                 if !requeue_list.is_empty() {
-                    waiters.entry((pid, uaddr2)).or_insert_with(Vec::new).extend(requeue_list.iter());
+                    waiters.entry(key2).or_insert_with(Vec::new).extend(requeue_list.iter());
                     // Record each requeued TID's new destination key so its
                     // own FUTEX_WAIT post-`schedule()` cleanup scans the
-                    // bucket it now sits in `(pid, uaddr2)` rather than its
-                    // original `(pid, uaddr)`.  Per `futex(2)`, requeue
-                    // updates the waiter's queue key to uaddr2; without this a
-                    // timeout-after-requeue would leave an orphan in the
-                    // uaddr2 bucket and misreport ETIMEDOUT as success.  Taken
-                    // while still holding FUTEX_WAITERS to keep the single
-                    // FUTEX_WAITERS → FUTEX_REQUEUE_DEST lock order.
+                    // bucket it now sits in (`key2`) rather than its original
+                    // `key`.  Per `futex(2)`, requeue updates the waiter's
+                    // queue key to uaddr2; without this a timeout-after-requeue
+                    // would leave an orphan in the destination bucket and
+                    // misreport ETIMEDOUT as success.  Taken while still
+                    // holding FUTEX_WAITERS to keep the single FUTEX_WAITERS →
+                    // FUTEX_REQUEUE_DEST lock order.
                     let mut dest = crate::syscall::FUTEX_REQUEUE_DEST.lock();
                     for &tid in &requeue_list {
-                        dest.insert((pid, tid), uaddr2);
+                        dest.insert((pid, tid), key2);
                     }
                 }
                 tids_to_wake = wake_list;
@@ -9723,6 +9975,13 @@ pub fn sys_futex_linux(
                 oparg = 1i32 << (oparg & 31);
             }
 
+            // Resolve uaddr2's rendezvous key BEFORE taking FUTEX_WAITERS:
+            // `resolve_futex_key` acquires PROCESS_TABLE, and the established
+            // lock order is FUTEX_WAITERS → THREAD_TABLE (never FUTEX_WAITERS →
+            // PROCESS_TABLE).  Resolving up front keeps the critical section
+            // below lock-clean.
+            let key2 = crate::syscall::resolve_futex_key(pid, uaddr2, force_private);
+
             // ── Atomic modify of *uaddr2, capturing the old value ─────────
             // Read-modify-write is serialised by the FUTEX_WAITERS lock held
             // across the whole op: every wake-class futex op takes it, so no
@@ -9753,13 +10012,13 @@ pub fn sys_futex_linux(
             // ── Wake up to `val` waiters on uaddr ─────────────────────────
             let max_wake1 = if val == 0 { u64::MAX } else { val };
             let mut tids_to_wake: Vec<u64> = Vec::new();
-            if let Some(list) = waiters.get_mut(&(pid, uaddr)) {
+            if let Some(list) = waiters.get_mut(&key) {
                 let mut n = 0u64;
                 while !list.is_empty() && n < max_wake1 {
                     tids_to_wake.push(list.remove(0));
                     n += 1;
                 }
-                if list.is_empty() { waiters.remove(&(pid, uaddr)); }
+                if list.is_empty() { waiters.remove(&key); }
             }
 
             // ── Evaluate CMP(oldval, cmparg); if true wake uaddr2 too ─────
@@ -9774,13 +10033,13 @@ pub fn sys_futex_linux(
             };
             if cmp_true {
                 let max_wake2 = if val2 == 0 { u64::MAX } else { val2 };
-                if let Some(list) = waiters.get_mut(&(pid, uaddr2)) {
+                if let Some(list) = waiters.get_mut(&key2) {
                     let mut n = 0u64;
                     while !list.is_empty() && n < max_wake2 {
                         tids_to_wake.push(list.remove(0));
                         n += 1;
                     }
-                    if list.is_empty() { waiters.remove(&(pid, uaddr2)); }
+                    if list.is_empty() { waiters.remove(&key2); }
                 }
             }
             drop(waiters);
@@ -10407,6 +10666,35 @@ pub(crate) fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
                     if crate::net::socket::socket_has_data(inode) {
                         ev |= EPOLLIN;
                     }
+                    // Peer read-closed / full hang-up edges, mirroring the
+                    // AF_UNIX arm above.  Without these an AF_INET reader in
+                    // `epoll_wait(2)` on a TCP fd is never woken on a peer
+                    // FIN (CloseWait): no EPOLLIN-on-EOF, no EPOLLRDHUP, no
+                    // EPOLLHUP — so it never issues the `read(2)` that
+                    // returns 0 and signals end-of-response, and a close-
+                    // delimited consumer (RFC 9112 §6.3) waits forever.
+                    //
+                    //   * read-closed (peer FIN, RFC 9293 §3.5) → the read
+                    //     end is readable (read() drains the tail then
+                    //     returns 0) so EPOLLIN, plus EPOLLRDHUP ("read EOF,
+                    //     write still valid").  EPOLLOUT stays set.
+                    //   * fully hung up (read-closed AND nothing to drain) →
+                    //     EPOLLHUP, which `epoll(7)` reports regardless of
+                    //     the interest mask.
+                    let rc = crate::net::socket::socket_read_closed(inode);
+                    let hup = crate::net::socket::socket_fully_hung_up(inode);
+                    if rc {
+                        ev |= EPOLLIN | EPOLLRDHUP;
+                    }
+                    if hup {
+                        ev |= EPOLLHUP;
+                    }
+                    #[cfg(feature = "firefox-test")]
+                    if rc || hup {
+                        crate::serial_println!(
+                            "[FF/tcp-eof] epoll pid={} fd={} sid={} read_closed={} hup={} events={:#x}",
+                            pid, fd, inode, rc, hup, ev);
+                    }
                     ev
                 }
             } else {
@@ -10414,6 +10702,173 @@ pub(crate) fn epoll_poll_events(pid: u64, fd: usize) -> u32 {
             }
         }
     }
+}
+
+/// One epoll interest-set entry, with its LIVE readiness, for the kdb
+/// `epoll-watch` diagnostic.  See [`epoll_watch_diag`].
+pub(crate) struct EpollWatchDiag {
+    /// The watched fd in the owning process's fd table.
+    pub fd: usize,
+    /// The caller's raw subscribed interest mask (EPOLL* bits), as stored
+    /// at `epoll_ctl(ADD|MOD)` time — unmodified.
+    pub subscribed: u32,
+    /// The LIVE readiness mask `epoll_wait(2)` would compute right now for
+    /// this fd, via the exact same `epoll_poll_events` path the wait loop
+    /// uses.  EPOLLIN/EPOLLOUT/EPOLLHUP/EPOLLRDHUP/EPOLLERR.
+    pub revents: u32,
+    /// What `epoll_wait(2)` would actually DELIVER for this watch:
+    /// `(subscribed & revents) | (revents & (EPOLLERR | EPOLLHUP))`.
+    /// Non-zero here means the reactor's next `epoll_wait` returns this fd
+    /// ready — so if the reactor still never drains it, the reactor THREAD
+    /// is not running `epoll_wait` (parked / scheduled-out / busy).
+    pub delivered: u32,
+}
+
+/// Result of an `epoll-watch` diagnostic lookup for one (pid, epfd).
+pub(crate) enum EpollWatchResult {
+    /// No such pid.
+    NoProc,
+    /// The fd is not an epoll fd in this process.
+    NotEpoll,
+    /// The epoll fd resolved but no `EpollInstance` matched its id.
+    NoInstance,
+    /// Success — the resolved instance id plus its full interest set, each
+    /// entry carrying its live readiness.
+    Ok { epoll_id: u64, watches: alloc::vec::Vec<EpollWatchDiag> },
+}
+
+/// Live epoll interest-set + per-fd readiness dump for the kdb `epoll-watch`
+/// op.  Resolves the epoll instance for `(pid, epfd)` using the SAME by-id
+/// path as `sys_epoll_wait` (FileDescriptor.inode of the `[epoll]` fd → the
+/// matching `EpollInstance` in `proc.epoll_sets`), then for every watched fd
+/// reports the caller's subscribed mask alongside the LIVE `epoll_poll_events`
+/// result and the mask `epoll_wait(2)` would actually deliver.
+///
+/// This is the decisive discriminator for a wedged reactor: if the
+/// content-reply channel fd is in the interest set AND `delivered` carries
+/// EPOLLIN while the reactor never `recvmsg`s, the reactor thread is not
+/// running `epoll_wait` (parked/starved).  If the fd is ABSENT, or `revents`
+/// reports no EPOLLIN despite unread data, that is a kernel epoll
+/// readiness/registration divergence per `epoll(7)`.
+///
+/// Read-only; takes PROCESS_TABLE only for the brief watch-list snapshot,
+/// then computes readiness lock-free (each `epoll_poll_events` re-takes the
+/// lock briefly per fd, exactly as the wait loop does).
+pub(crate) fn epoll_watch_diag(pid: u64, epfd: usize) -> EpollWatchResult {
+    use crate::ipc::epoll::{EPOLLERR, EPOLLHUP};
+
+    // Snapshot the watch list under a brief lock hold — mirrors
+    // sys_epoll_wait Step 1 (by-id lookup so a dup'd epfd resolves to the
+    // same shared instance).
+    let (epoll_id, watches_snap): (u64, alloc::vec::Vec<(usize, u32)>) = {
+        let procs = crate::proc::PROCESS_TABLE.lock();
+        let proc = match procs.iter().find(|p| p.pid == pid) {
+            Some(p) => p,
+            None    => return EpollWatchResult::NoProc,
+        };
+        let epoll_id = match proc.file_descriptors.get(epfd).and_then(|f| f.as_ref()) {
+            Some(f) if f.open_path == "[epoll]" => f.inode,
+            _                                   => return EpollWatchResult::NotEpoll,
+        };
+        let inst = match proc.epoll_sets.iter().find(|e| e.id == epoll_id) {
+            Some(i) => i,
+            None    => return EpollWatchResult::NoInstance,
+        };
+        (epoll_id, inst.watches.iter().map(|w| (w.fd, w.events)).collect())
+    }; // lock released
+
+    // Poll each watch lock-free — identical readiness path to sys_epoll_wait.
+    let mut watches = alloc::vec::Vec::with_capacity(watches_snap.len());
+    for (fd, subscribed) in watches_snap {
+        let revents = epoll_poll_events(pid, fd);
+        let delivered = (subscribed & revents) | (revents & (EPOLLERR | EPOLLHUP));
+        watches.push(EpollWatchDiag { fd, subscribed, revents, delivered });
+    }
+    EpollWatchResult::Ok { epoll_id, watches }
+}
+
+/// Readiness predicate for an AF_UNIX recv: the socket can return *something*
+/// other than EAGAIN right now.  True when the recv ring has bytes (STREAM) or
+/// a queued message (SEQPACKET) — `net::unix::has_data`; when a control-only
+/// `SCM_RIGHTS` ancillary frame is deliverable at the reader's current stream
+/// position (`has_scm_deliverable`, an empty-data readable message per
+/// recvmsg(2) / unix(7)); or when the read direction is shut (orderly EOF,
+/// which read_msg surfaces as `Ok((0,0))`).  Mirrors the POLLIN edge the poll
+/// path already exposes, so a blocking recvmsg/recvfrom parks until exactly the
+/// condition that will let it make progress.
+fn unix_recv_ready(unix_id: u64) -> bool {
+    if crate::net::unix::has_data(unix_id) {
+        return true;
+    }
+    if crate::net::unix::read_shutdown(unix_id) {
+        return true;
+    }
+    let consumed = crate::net::unix::recv_consumed(unix_id);
+    crate::syscall::has_scm_deliverable(unix_id, consumed)
+}
+
+/// Block the calling thread until an AF_UNIX recv on `unix_id` can make
+/// progress, or a bounded wait deadline / pending signal fires.
+///
+/// Per POSIX recvmsg(2) / recvfrom(2) and unix(7): a receive on a socket that
+/// is NOT in non-blocking mode (no `O_NONBLOCK` on the description, no
+/// `MSG_DONTWAIT` in `flags`) MUST block until a message is available — it must
+/// NOT return -EAGAIN on a momentarily-empty queue.  The prior AF_UNIX recv
+/// paths called `read`/`read_msg` exactly once and returned -EAGAIN on an empty
+/// ring regardless of blocking mode, which broke any blocking-recvmsg consumer
+/// (e.g. a SOCK_SEQPACKET request/response broker that loops on recvmsg with no
+/// MSG_DONTWAIT and only retries on EINTR — a spurious EAGAIN there tears the
+/// channel down).  This loop mirrors the AF_INET recvfrom(2) blocking wait.
+///
+/// Returns `Ok(())` when the socket is ready to be drained (the caller then
+/// performs the actual `read`/`read_msg`, which may still return 0 for an
+/// orderly EOF), or `Err(errno)` to be returned to userspace directly:
+///   * `-4`  (EINTR)  — a deliverable signal arrived during the wait.
+///   * `-11` (EAGAIN) — the bounded wait deadline elapsed with no data.  This
+///     preserves liveness: a never-arriving message cannot pin a syscall
+///     forever.  Most IPC brokers retry, and the deadline (≈30 s) is far longer
+///     than any in-flight request round-trip.
+///
+/// When `blocking` is false (non-blocking fd or MSG_DONTWAIT) this returns
+/// `Ok(())` immediately so the single drain attempt below yields the correct
+/// EAGAIN-on-empty behaviour unchanged.
+fn unix_recv_block_wait(unix_id: u64, pid: u64, blocking: bool) -> Result<(), i64> {
+    if !blocking {
+        return Ok(());
+    }
+    // Fast path: already ready — no need to read get_ticks / yield at all.
+    if unix_recv_ready(unix_id) {
+        return Ok(());
+    }
+    let deadline = crate::arch::x86_64::irq::get_ticks() + 3000; // ≈30 s upper bound
+    while !unix_recv_ready(unix_id) {
+        if signal_pending(pid) {
+            return Err(-4); // EINTR
+        }
+        // Pump the network stack so any cross-process AF_UNIX write that
+        // landed since the last check becomes visible, and so SLIRP/virtio
+        // RX is serviced (a content-process reply travels through net::poll's
+        // wake bell on the unix backend).
+        crate::net::poll();
+        if crate::arch::x86_64::irq::get_ticks() >= deadline {
+            return Err(-11); // EAGAIN — bounded-wait liveness floor
+        }
+        crate::sched::yield_cpu();
+    }
+    Ok(())
+}
+
+/// Read the `O_NONBLOCK` (0x800) flag off process `pid`'s fd-table slot `fd`.
+/// Returns false if the fd is absent (the caller has already validated the fd
+/// as a socket before reaching the recv drain, so a missing slot here only
+/// occurs on a teardown race — defaulting to "blocking" is the safe choice and
+/// the subsequent drain will surface EBADF/EAGAIN as appropriate).
+fn fd_is_nonblocking(pid: u64, fd: usize) -> bool {
+    let procs = crate::proc::PROCESS_TABLE.lock();
+    procs.iter().find(|p| p.pid == pid)
+        .and_then(|p| p.file_descriptors.get(fd).and_then(|f| f.as_ref()))
+        .map(|f| (f.flags & 0x0800) != 0)
+        .unwrap_or(false)
 }
 
 /// Returns true if a deliverable (pending && !blocked) signal is queued for `pid`.
@@ -10531,7 +10986,7 @@ fn sys_epoll_ctl(epfd: usize, op: u64, fd: usize, event_ptr: u64) -> i64 {
 
 /// epoll_wait — collect ready events into caller's buffer.
 fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i32) -> i64 {
-    use crate::ipc::epoll::{EpollEvent, EPOLLERR, EPOLLHUP};
+    use crate::ipc::epoll::{EpollEvent, EPOLLERR, EPOLLHUP, EPOLLET};
     if maxevents == 0 { return -22; } // EINVAL
     let pid = crate::proc::current_pid_lockless();
 
@@ -10541,13 +10996,20 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
     // dup'd epoll fds share the inode and thus the same instance.
     // Symmetric with sys_epoll_ctl above; see that block for the full
     // by-id rationale (PIVOT-I2 Phase D, 2026-05-23).
-    let watches_snap: alloc::vec::Vec<(usize, u32, u64)> = {
+    // Each snapshot entry is `(fd, subscribed, data, et_seen)`.  `et_seen`
+    // is the per-watch edge-trigger baseline for `EPOLLET` watches (the
+    // subset of readiness bits already delivered on a prior call and still
+    // continuously asserted); 0 for level-triggered watches.  `epoll_id`
+    // is retained so the (possibly updated) edge baselines can be written
+    // back into the live `EpollInstance` after the poll completes.
+    let epoll_id: u64;
+    let watches_snap: alloc::vec::Vec<(usize, u32, u64, u32)> = {
         let procs = crate::proc::PROCESS_TABLE.lock();
         let proc = match procs.iter().find(|p| p.pid == pid) {
             Some(p) => p,
             None    => return -9, // EBADF
         };
-        let epoll_id = match proc.file_descriptors.get(epfd).and_then(|f| f.as_ref()) {
+        epoll_id = match proc.file_descriptors.get(epfd).and_then(|f| f.as_ref()) {
             Some(f) if f.open_path == "[epoll]" => f.inode,
             _                                   => return -9, // EBADF
         };
@@ -10555,51 +11017,105 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
             Some(i) => i,
             None    => return -9,
         };
-        inst.watches.iter().map(|w| (w.fd, w.events, w.data)).collect()
+        inst.watches.iter().map(|w| (w.fd, w.events, w.data, w.et_seen)).collect()
     }; // lock released here
+
+    // Live edge-trigger baselines, one per snapshot entry (index-aligned).
+    // Seeded from the stored `et_seen` and mutated by `do_poll` / `probe_ready`
+    // as edges are consumed and re-armed; flushed back to the live instance
+    // at Step 3.  A `RefCell` lets the `Fn` closures below mutate it without
+    // capturing `&mut` (they are also called from the park predicate path).
+    let et_state: core::cell::RefCell<alloc::vec::Vec<u32>> =
+        core::cell::RefCell::new(watches_snap.iter().map(|w| w.3).collect());
+
+    // Compute the mask `epoll_wait(2)` would deliver for one watch, honouring
+    // the level-vs-edge contract of `epoll(7)`.
+    //
+    //   * The base "interest" is built as two disjoint parts, unchanged from
+    //     the level-triggered ABI fix:
+    //       - the caller-subscribed bits currently ready (`subscribed & ready`)
+    //       - any EPOLLERR / EPOLLHUP ready even when unsubscribed
+    //         (`ready & (EPOLLERR | EPOLLHUP)`).
+    //     EPOLLRDHUP is NOT always-on, so it flows through the first term only.
+    //     The stored `subscribed` mask is the caller's raw interest and is
+    //     never mutated.
+    //
+    //   * Level-triggered watch (no EPOLLET): the full `interest` is delivered
+    //     on every call as long as the condition holds — identical to before.
+    //
+    //   * Edge-triggered watch (EPOLLET): per `epoll(7)` ("Level-triggered and
+    //     edge-triggered"), a readiness bit is delivered only on its rising
+    //     edge — when the fd transitions from not-having to having it — and not
+    //     again until that condition is first cleared and then re-occurs.  The
+    //     per-watch `seen` baseline (in `et_state[idx]`) records which bits
+    //     were already delivered and have stayed continuously asserted.  We
+    //     deliver only the newly-risen bits (`interest & !seen`), re-arm any
+    //     bit that has since dropped (`seen &= interest`), and fold the just-
+    //     reported bits into the baseline (`seen |= report`).  A watched fd
+    //     that stays level-ready without the consumer draining it (e.g. a
+    //     wakeup eventfd whose counter the reactor leaves nonzero) is reported
+    //     exactly once, so `epoll_wait` blocks on the next call instead of
+    //     spinning — matching Linux edge-trigger semantics.
+    //
+    // Read-only edge/level computation: the mask `epoll_wait(2)` WOULD deliver
+    // for watch `idx` right now, without mutating the baseline.  The effective
+    // post-re-arm baseline is `seen & interest`, so the deliverable set is
+    // `interest & !(seen & interest)` = `interest & !seen`; the re-arm step is
+    // pure bookkeeping for persistence and does not change the current report.
+    // Used by `probe_ready` so the park predicate never *consumes* an edge.
+    let peek_for = |idx: usize, subscribed: u32, ready_ev: u32| -> u32 {
+        let interest =
+            (subscribed & ready_ev) | (ready_ev & (EPOLLERR | EPOLLHUP));
+        if subscribed & EPOLLET == 0 {
+            return interest; // level-triggered: report whenever ready
+        }
+        let seen = et_state.borrow()[idx];
+        interest & !seen // rising-edge bits only (read-only)
+    };
+
+    // Consuming edge/level computation: same deliverable mask as `peek_for`,
+    // but it also commits the baseline update for EPOLLET watches (re-arm
+    // dropped bits, then mark the just-delivered bits seen).  Only the call
+    // sites that ACTUALLY return events to userspace use this — never the park
+    // predicate — so a rising edge is consumed exactly once.
+    let deliver_for = |idx: usize, subscribed: u32, ready_ev: u32| -> u32 {
+        let interest =
+            (subscribed & ready_ev) | (ready_ev & (EPOLLERR | EPOLLHUP));
+        if subscribed & EPOLLET == 0 {
+            return interest; // level-triggered: report whenever ready
+        }
+        let mut et = et_state.borrow_mut();
+        let seen = &mut et[idx];
+        *seen &= interest;            // re-arm any bit that dropped to not-ready
+        let report = interest & !*seen; // rising-edge bits only
+        *seen |= report;              // remember what we just delivered
+        report
+    };
 
     // ── Step 2: poll without holding the lock ────────────────────────────────
     let do_poll = |fired: &mut alloc::vec::Vec<EpollEvent>| {
-        for &(fd, subscribed, data) in &watches_snap {
+        for (idx, &(fd, subscribed, data, _)) in watches_snap.iter().enumerate() {
             if fired.len() >= maxevents { break; }
             let ready_ev = epoll_poll_events(pid, fd);
-            // Per `epoll(7)`: "EPOLLERR and EPOLLHUP ... it is not necessary
-            // to set [them] in events"; the kernel reports them whenever they
-            // occur, independent of the caller's interest set.  Build the
-            // delivered mask as two disjoint parts:
-            //   * the caller-subscribed bits that are currently ready
-            //     (`subscribed & ready_ev`), and
-            //   * any EPOLLERR / EPOLLHUP that is ready, delivered even when
-            //     unsubscribed (`ready_ev & (EPOLLERR | EPOLLHUP)`).
-            // EPOLLRDHUP is NOT in the always-on set — Linux only reports it
-            // when subscribed — so it flows through the first term only.
-            //
-            // The stored `subscribed` mask is the caller's raw interest and is
-            // never mutated; ERR/HUP are force-added to the *ready* side here
-            // at the single delivery site.  This keeps the readiness/wake
-            // matching wake-safe: a healthy fd reporting only EPOLLOUT against
-            // an EPOLLIN-only watch yields `(EPOLLIN & EPOLLOUT) | (EPOLLOUT &
-            // (ERR|HUP)) = 0`, so no spurious-ready perturbs the parking
-            // decision — exactly as before this ABI fix.
-            let interest =
-                (subscribed & ready_ev) | (ready_ev & (EPOLLERR | EPOLLHUP));
-            if interest != 0 {
-                fired.push(EpollEvent { events: interest, data });
+            let report = deliver_for(idx, subscribed, ready_ev);
+            if report != 0 {
+                fired.push(EpollEvent { events: report, data });
             }
         }
     };
 
-    // Read-only readiness probe over the watch snapshot — true if any
-    // watched fd currently has a deliverable event.  Mirrors `do_poll`'s
-    // interest/ERR/HUP masking but allocates nothing and pushes nothing;
-    // used as the recheck-under-lock predicate for `wait_poll_event` so
-    // the check-and-park lost-wakeup window is closed (prepare-to-wait).
+    // Read-only readiness probe over the watch snapshot — true if any watched
+    // fd currently has a deliverable event.  Mirrors `do_poll`'s edge/level
+    // masking but NON-consumingly (via `peek_for`): an EPOLLET fd whose edge
+    // has already been delivered and merely stays level-ready must NOT keep
+    // the predicate "ready" — otherwise the park never commits and the spin
+    // persists.  Allocates nothing and pushes nothing; used as the
+    // recheck-under-lock predicate for `wait_poll_event` so the
+    // check-and-park lost-wakeup window is closed (prepare-to-wait).
     let probe_ready = || -> bool {
-        for &(fd, subscribed, _data) in &watches_snap {
+        for (idx, &(fd, subscribed, _data, _)) in watches_snap.iter().enumerate() {
             let ready_ev = epoll_poll_events(pid, fd);
-            let interest =
-                (subscribed & ready_ev) | (ready_ev & (EPOLLERR | EPOLLHUP));
-            if interest != 0 { return true; }
+            if peek_for(idx, subscribed, ready_ev) != 0 { return true; }
         }
         false
     };
@@ -10684,7 +11200,38 @@ fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: usize, timeout_ms: i3
         }
     }
 
-    // ── Step 3: copy events to the caller's buffer ───────────────────────────
+    // ── Step 3: flush updated EPOLLET edge baselines back to the instance ────
+    // `et_state` accumulated the per-watch rising-edge consumption during the
+    // poll/wait loop above.  Persist it so a subsequent `epoll_wait` on the
+    // same instance honours the edge (does not re-report a still-asserted
+    // EPOLLET condition).  Matched by fd — not snapshot index — so a watch
+    // that an `epoll_ctl(DEL/ADD)` reordered between snapshot and now is left
+    // untouched (a concurrently re-added fd starts with a fresh `et_seen=0`).
+    // Only entries whose subscribed mask carried EPOLLET need writing; LT
+    // watches keep `et_seen == 0` throughout, so they are skipped.
+    {
+        let et = et_state.borrow();
+        let needs_flush = watches_snap.iter().enumerate().any(|(i, w)| {
+            (w.1 & EPOLLET != 0) && (et[i] != w.3)
+        });
+        if needs_flush {
+            let mut procs = crate::proc::PROCESS_TABLE.lock();
+            if let Some(proc) = procs.iter_mut().find(|p| p.pid == pid) {
+                if let Some(inst) = proc.epoll_sets.iter_mut().find(|e| e.id == epoll_id) {
+                    for (i, snap) in watches_snap.iter().enumerate() {
+                        if snap.1 & EPOLLET == 0 { continue; }
+                        if let Some(w) = inst.watches.iter_mut()
+                            .find(|w| w.fd == snap.0 && w.events == snap.1)
+                        {
+                            w.et_seen = et[i];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Step 4: copy events to the caller's buffer ───────────────────────────
     let count = fired.len();
     if count > 0 && events_ptr != 0 {
         unsafe {

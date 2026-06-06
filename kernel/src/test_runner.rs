@@ -1095,6 +1095,10 @@ pub fn run() -> ! {
     total += 1;
     if test_pfh_install_arm_anti_alias_backout() { passed += 1; }
 
+    // ── Test 98i: CoW present+write arm anti-aliasing + refcount back-out ─
+    total += 1;
+    if test_pfh_cow_arm_anti_alias_refcount() { passed += 1; }
+
     // ── Test 99: procfs self/maps — per-process VMA listing ──────────────
 
     total += 1;
@@ -1591,6 +1595,42 @@ pub fn run() -> ! {
         if test_tcp_read_from_isolation() { passed += 1; }
     }
 
+    // ── Test 281: AF_INET peer-FIN read-closed edge + CloseWait drain ───────
+    //
+    // A peer FIN moves an Established TCB to CloseWait.  Two invariants
+    // must then hold for a poll(2)/epoll(7)-driven reader to complete a
+    // close-delimited response (RFC 9112 §6.3) instead of parking forever:
+    //   1. socket_read_closed() reports the read-closed edge (peer FIN),
+    //      and socket_fully_hung_up() withholds POLLHUP/EPOLLHUP until the
+    //      buffered CloseWait tail is drained (data-before-EOF, RFC 9293
+    //      §3.5).
+    //   2. tcp::read_from() still drains the CloseWait tail (it must accept
+    //      Established|CloseWait, not Established alone), and only after the
+    //      buffer empties does socket_recv_status() report EOF.
+
+    #[cfg(feature = "kdb")]
+    {
+        total += 1;
+        if test_tcp_peer_fin_read_closed_edge() { passed += 1; }
+    }
+
+    // ── Test 282: TCP out-of-order receive reassembly (RFC 9293 §3.10.7.4) ──
+    //
+    // A segment that arrives ahead of recv_next (a reorder, or after an
+    // earlier segment was dropped) must be BUFFERED, not silently discarded,
+    // and the receiver must emit an immediate duplicate ACK of recv_next so
+    // the peer fast-retransmits the gap (RFC 5681 §3.2).  Once the gap-filling
+    // segment arrives, the buffered data drains in order.  A FIN riding an
+    // out-of-order segment must not tear the connection down with a hole
+    // still open.  This is the receive-side fix that lets a multi-segment
+    // HTTP response complete after a single mid-stream drop instead of
+    // wedging recv_next permanently.
+    #[cfg(feature = "kdb")]
+    {
+        total += 1;
+        if test_tcp_ooo_reassembly() { passed += 1; }
+    }
+
     // ── TCP out-of-order FIN guard — no premature close / no truncation ──────
     //
     // A real multi-segment HTTP(S) response can deliver a data+FIN segment
@@ -1725,6 +1765,17 @@ pub fn run() -> ! {
 
     total += 1;
     if test_recvfrom_truncated_addrlen() { passed += 1; }
+
+    // ── recvmsg(2) source-address writeback (Phase NDE-9) ────────────────
+    // socket_recv_status_from carries the wire source 4-tuple so the
+    // recvmsg(2) AF_INET arm can marshal msg_name — required for musl's
+    // connection-mode DNS resolver to accept the reply (RFC 1035 §7.3).
+
+    total += 1;
+    if test_recv_status_from_udp_returns_sender_4tuple() { passed += 1; }
+
+    total += 1;
+    if test_recv_status_from_udp_wouldblock_when_empty() { passed += 1; }
 
     // ── Tests 195–199: shutdown(2) half-close (Phase NDE-4) ──────────────
 
@@ -1956,6 +2007,20 @@ pub fn run() -> ! {
     total += 1;
     if test_socketpair_survives_child_close_w216() { passed += 1; }
 
+    // ── Test 219b: MAP_SHARED stays shared across fork(2) (store-visibility) ─
+    // POSIX mmap(2): a store to a MAP_SHARED region changes the underlying
+    // object and is visible to every mapper.  POSIX fork(2): the child is a
+    // copy of the parent EXCEPT that MAP_SHARED mappings remain shared (they
+    // are NOT copy-on-write).  Regression guard for the coupled
+    // clone_for_fork + page-fault-CoW bug that silently demoted a MAP_SHARED
+    // page to a private frame across a copy-fork — which would make Firefox's
+    // CrossProcessPaint shared surface incoherent (a blank screenshot).
+    // Verifies the MAP_SHARED leaf survives fork writable + same frame (so a
+    // store via either mapping is visible to the other) AND that a MAP_PRIVATE
+    // leaf still gets the CoW write-protect (no regression).
+    total += 1;
+    if test_map_shared_survives_fork_store_visibility() { passed += 1; }
+
     // (Tests 199/200 run earlier — right after Test 80c — so the vDSO
     // TSC fast path is verified before the slow PNG screenshot test.
     // Stream-A pipe / eventfd wake-hook tests run first — see Tests
@@ -2107,6 +2172,29 @@ pub fn run() -> ! {
         if test_502b_vfork_prepare_to_wait_race() { passed += 1; }
     }
 
+    // ── Test 515: waitid WNOWAIT peek + ECHILD-on-already-reaped ─────────
+    // A blocking waitid(P_PID, x) for a child that no longer exists (already
+    // reaped — e.g. by the WNOWAIT-peek-then-reap launcher idiom) must return
+    // ECHILD immediately, not park forever; and WNOWAIT must leave a peeked
+    // zombie waitable for a follow-up reap.  Per POSIX waitid(2).
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_515_waitid_wnowait_and_echild() { passed += 1; }
+    }
+
+    // ── Test 516: waitid(2) siginfo_t byte layout (gecko IsProcessDead) ──
+    // The user siginfo_t that waitid fills must place si_pid at offset 16 and
+    // si_status at offset 24 (the _sifields union is 8-byte aligned). A reader
+    // that branches on si_pid (gecko's IsProcessDead) busy-loops the blocking
+    // waitid(WNOWAIT) forever if si_pid lands at the wrong offset. Per
+    // POSIX waitid(2) + Linux <asm-generic/siginfo.h>.
+    #[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+    {
+        total += 1;
+        if test_516_waitid_siginfo_layout() { passed += 1; }
+    }
+
     // ── Test 229: PMM pte_share_count free-time invariant (W215 fix) ─────
     // Verifies that pmm::free_page refuses to recycle a frame whose
     // refcount table still records a live PTE reference, and that the
@@ -2155,6 +2243,8 @@ pub fn run() -> ! {
         if test_234_cache_update_range_boundaries() { passed += 1; }
         total += 1;
         if test_240_vfs_truncate_page_cache_coherency() { passed += 1; }
+        total += 1;
+        if test_241_ramfs_mmap_read_coherency() { passed += 1; }
     }
 
     // ── Test 235: ELF loader hardening (H4) ──────────────────────────────
@@ -2680,6 +2770,41 @@ pub fn run() -> ! {
     // poll(2), unix(7).
     total += 1;
     if test_293_epoll_listening_unix_has_pending() { passed += 1; }
+
+    // ── Test 294: epoll EPOLLET edge-trigger on a level-ready eventfd ──────
+    // A watch registered with EPOLLET must report a readiness condition only
+    // on its rising edge: an eventfd whose counter stays nonzero (never
+    // drained) is delivered EPOLLIN exactly ONCE, then the next epoll_wait
+    // returns 0 — NOT the same level-ready event on every call.  Draining the
+    // eventfd (counter→0) and re-writing it re-arms the edge.  This is the
+    // regression guard for the gecko main-MessagePump spin (a wakeup eventfd
+    // left level-ready monopolised the CPU under pure level-triggered epoll).
+    // Refs: epoll(7) "Level-triggered and edge-triggered", eventfd(2).
+    total += 1;
+    if test_294_epoll_edge_triggered_eventfd() { passed += 1; }
+
+    // ── Test 295: cross-process SHARED futex keying (memfd MAP_SHARED) ─────
+    // Two processes mapping the SAME memfd/file-backed MAP_SHARED page at
+    // DIFFERENT virtual addresses must rendezvous on a process-shared futex:
+    // a FUTEX_WAIT in process A and the matching FUTEX_WAKE in process B
+    // resolve to the SAME backing-object key and hash to the same bucket.
+    // Also pins the private fast path: a MAP_PRIVATE/anon word keys per-mm.
+    // This is the kernel side of the gecko cross-process screenshot
+    // rendezvous.  Refs: futex(2) FUTEX_PRIVATE_FLAG, memfd_create(2).
+    total += 1;
+    if test_295_crossproc_shared_futex_keying() { passed += 1; }
+
+    // ── Test 296: /proc/self/fd/<N> magic-symlink re-open of an unlinked memfd ─
+    // proc(5): /proc/[pid]/fd/<N> is a magic symlink; opening it re-opens the
+    // same open file description as fd <N>, even when the underlying object has
+    // no name.  memfd_create(2) objects are unlinked by construction, so the
+    // canonical "read-only dup" idiom — memfd_create() then
+    // open("/proc/self/fd/<memfd>", O_RDONLY) — must succeed and see the same
+    // bytes.  This is the kernel gate for Mozilla's POSIX shared-memory layer
+    // (shared_memory_posix.cc): on failure it logs "read-only dup failed; not
+    // using memfd" and falls back to /dev/shm.  Refs: proc(5), memfd_create(2).
+    total += 1;
+    if test_296_proc_fd_reopen_unlinked_memfd() { passed += 1; }
 
     // ── Test 283: stack-prov main-stack TOP-window argv-writer capture ──
     // GATE-A blind-spot closure (2026-05-30).  Only built when the
@@ -14455,7 +14580,7 @@ fn test_futex_requeue() -> bool {
 //
 // Ref: futex(2) FUTEX_REQUEUE / FUTEX_CMP_REQUEUE (q->key = key2 invariant).
 fn test_futex_requeue_dest_tracking() -> bool {
-    use crate::syscall::{FUTEX_WAITERS, FUTEX_REQUEUE_DEST};
+    use crate::syscall::{FUTEX_WAITERS, FUTEX_REQUEUE_DEST, FutexKey};
     test_header!("futex REQUEUE destination tracking (orphan-free timeout)");
 
     // Use the CURRENT pid (the requeue syscall keys on current_pid_lockless).
@@ -14465,19 +14590,24 @@ fn test_futex_requeue_dest_tracking() -> bool {
     let uaddr2: u32 = 0;
     let a1 = &uaddr1 as *const u32 as u64;
     let a2 = &uaddr2 as *const u32 as u64;
+    // These are stack-local words (private anonymous mapping), so the futex
+    // keys are the PRIVATE shape `Private(pid, uaddr)` — the same keys the
+    // requeue syscall path resolves for them.
+    let k1 = FutexKey::Private(pid, a1);
+    let k2 = FutexKey::Private(pid, a2);
     // Synthetic waiter TID that collides with no live thread.
     let fake_tid: u64 = 0xF00D_5678;
 
     // Clean slate for these keys (a prior failed run could leak).
     {
         let mut w = FUTEX_WAITERS.lock();
-        w.remove(&(pid, a1));
-        w.remove(&(pid, a2));
+        w.remove(&k1);
+        w.remove(&k2);
         FUTEX_REQUEUE_DEST.lock().remove(&(pid, fake_tid));
     }
 
     // Step 1: register a fake waiter on uaddr1.
-    FUTEX_WAITERS.lock().entry((pid, a1))
+    FUTEX_WAITERS.lock().entry(k1)
         .or_insert_with(alloc::vec::Vec::new).push(fake_tid);
     test_println!("  registered fake waiter tid={:#x} on uaddr1", fake_tid);
 
@@ -14487,19 +14617,19 @@ fn test_futex_requeue_dest_tracking() -> bool {
             202, a1, 3, /*val=wake*/0, /*val2=requeue*/1, a2, 0)
     };
     if r != 0 {
-        FUTEX_WAITERS.lock().remove(&(pid, a1));
-        FUTEX_WAITERS.lock().remove(&(pid, a2));
+        FUTEX_WAITERS.lock().remove(&k1);
+        FUTEX_WAITERS.lock().remove(&k2);
         FUTEX_REQUEUE_DEST.lock().remove(&(pid, fake_tid));
         test_fail!("futex_requeue_dest", "REQUEUE returned {} (expected 0 woken)", r);
         return false;
     }
 
     // Step 3a: the waiter must have MOVED — gone from uaddr1, present at uaddr2.
-    let in_a1 = FUTEX_WAITERS.lock().get(&(pid, a1)).map(|v| v.contains(&fake_tid)).unwrap_or(false);
-    let in_a2 = FUTEX_WAITERS.lock().get(&(pid, a2)).map(|v| v.contains(&fake_tid)).unwrap_or(false);
+    let in_a1 = FUTEX_WAITERS.lock().get(&k1).map(|v| v.contains(&fake_tid)).unwrap_or(false);
+    let in_a2 = FUTEX_WAITERS.lock().get(&k2).map(|v| v.contains(&fake_tid)).unwrap_or(false);
     if in_a1 || !in_a2 {
-        FUTEX_WAITERS.lock().remove(&(pid, a1));
-        FUTEX_WAITERS.lock().remove(&(pid, a2));
+        FUTEX_WAITERS.lock().remove(&k1);
+        FUTEX_WAITERS.lock().remove(&k2);
         FUTEX_REQUEUE_DEST.lock().remove(&(pid, fake_tid));
         test_fail!("futex_requeue_dest",
             "after requeue: in_uaddr1={} in_uaddr2={} (expected false/true)", in_a1, in_a2);
@@ -14507,26 +14637,27 @@ fn test_futex_requeue_dest_tracking() -> bool {
     }
     test_println!("  waiter moved uaddr1→uaddr2 ✓");
 
-    // Step 3b: the destination must be recorded so the WAIT cleanup scans uaddr2.
+    // Step 3b: the destination key must be recorded so the WAIT cleanup scans
+    // uaddr2's bucket (now a full FutexKey, not a bare uaddr).
     let recorded = FUTEX_REQUEUE_DEST.lock().get(&(pid, fake_tid)).copied();
-    if recorded != Some(a2) {
-        FUTEX_WAITERS.lock().remove(&(pid, a2));
+    if recorded != Some(k2) {
+        FUTEX_WAITERS.lock().remove(&k2);
         FUTEX_REQUEUE_DEST.lock().remove(&(pid, fake_tid));
         test_fail!("futex_requeue_dest",
-            "FUTEX_REQUEUE_DEST[(pid,tid)]={:#x?} (expected {:#x})", recorded, a2);
+            "FUTEX_REQUEUE_DEST[(pid,tid)]={:#x?} (expected {:#x?})", recorded, k2);
         return false;
     }
     test_println!("  destination recorded: (pid,tid)→uaddr2 ✓ (gap #3)");
 
     // Step 4: replay the WAIT-branch timeout cleanup's bucket selection EXACTLY:
-    //   dest = FUTEX_REQUEUE_DEST.remove((pid,tid)); key = dest.unwrap_or(uaddr1)
+    //   dest = FUTEX_REQUEUE_DEST.remove((pid,tid)); key = dest.unwrap_or(k1)
     // and remove the TID from that bucket.  Pre-fix this used uaddr1 and would
     // leave the orphan in uaddr2 + misreport timeout as a wake.
     let timed_out;
     {
         let mut waiters = FUTEX_WAITERS.lock();
         let dest = FUTEX_REQUEUE_DEST.lock().remove(&(pid, fake_tid));
-        let key = (pid, dest.unwrap_or(a1));
+        let key = dest.unwrap_or(k1);
         if let Some(list) = waiters.get_mut(&key) {
             let before = list.len();
             list.retain(|&t| t != fake_tid);
@@ -14537,19 +14668,19 @@ fn test_futex_requeue_dest_tracking() -> bool {
         }
     }
     if !timed_out {
-        FUTEX_WAITERS.lock().remove(&(pid, a2));
+        FUTEX_WAITERS.lock().remove(&k2);
         test_fail!("futex_requeue_dest",
             "cleanup scanned the wrong bucket — orphan would survive (timed_out=false)");
         return false;
     }
 
     // Step 5: no orphan left anywhere, dest map cleaned.
-    let leak_a1 = FUTEX_WAITERS.lock().contains_key(&(pid, a1));
-    let leak_a2 = FUTEX_WAITERS.lock().contains_key(&(pid, a2));
+    let leak_a1 = FUTEX_WAITERS.lock().contains_key(&k1);
+    let leak_a2 = FUTEX_WAITERS.lock().contains_key(&k2);
     let leak_dest = FUTEX_REQUEUE_DEST.lock().contains_key(&(pid, fake_tid));
     if leak_a1 || leak_a2 || leak_dest {
-        FUTEX_WAITERS.lock().remove(&(pid, a1));
-        FUTEX_WAITERS.lock().remove(&(pid, a2));
+        FUTEX_WAITERS.lock().remove(&k1);
+        FUTEX_WAITERS.lock().remove(&k2);
         FUTEX_REQUEUE_DEST.lock().remove(&(pid, fake_tid));
         test_fail!("futex_requeue_dest",
             "leak after cleanup: a1={} a2={} dest={}", leak_a1, leak_a2, leak_dest);
@@ -29713,7 +29844,7 @@ fn test_access_w_ok_readonly() -> bool {
 fn test_cleartid_futex_wake() -> bool {
     test_header!("CLONE_CHILD_CLEARTID exit-time futex wake (key match + dequeue)");
 
-    use crate::syscall::{FUTEX_WAITERS, futex_wake_for_exit};
+    use crate::syscall::{FUTEX_WAITERS, FutexKey, futex_wake_for_exit};
 
     // Pick a synthetic (pid, uaddr) pair that no real thread is using.
     // The high tid value 0xFEED_1234 ensures we do not collide with any
@@ -29722,11 +29853,15 @@ fn test_cleartid_futex_wake() -> bool {
     let fake_pid: u64    = 0xDEAD_BEEF;
     let fake_uaddr: u64  = 0x7EFF_FF44_9990; // shape matches glibc joinstate addr
     let fake_tid: u64    = 0xFEED_1234;
+    // The CLEARTID word is a private thread-local; fake_pid has no VmSpace, so
+    // futex_wake_for_exit resolves it to `Private(fake_pid, fake_uaddr)` — the
+    // same key the test registers under.
+    let fk = FutexKey::Private(fake_pid, fake_uaddr);
 
     // Step 1: register a fake waiter.
     {
         let mut waiters = FUTEX_WAITERS.lock();
-        waiters.entry((fake_pid, fake_uaddr))
+        waiters.entry(fk)
             .or_insert_with(alloc::vec::Vec::new)
             .push(fake_tid);
     }
@@ -29739,13 +29874,13 @@ fn test_cleartid_futex_wake() -> bool {
     // Step 3: the (pid, uaddr) key must be gone (last waiter popped).
     {
         let waiters = FUTEX_WAITERS.lock();
-        if waiters.contains_key(&(fake_pid, fake_uaddr)) {
+        if waiters.contains_key(&fk) {
             drop(waiters);
             test_fail!("cleartid_futex_wake",
                 "FUTEX_WAITERS still contains (pid={:#x}, uaddr={:#x}) after wake",
                 fake_pid, fake_uaddr);
             // Best-effort cleanup so a failed run does not leak the entry.
-            FUTEX_WAITERS.lock().remove(&(fake_pid, fake_uaddr));
+            FUTEX_WAITERS.lock().remove(&fk);
             return false;
         }
     }
@@ -29755,11 +29890,11 @@ fn test_cleartid_futex_wake() -> bool {
     futex_wake_for_exit(fake_pid, fake_uaddr, 1);
     {
         let waiters = FUTEX_WAITERS.lock();
-        if waiters.contains_key(&(fake_pid, fake_uaddr)) {
+        if waiters.contains_key(&fk) {
             drop(waiters);
             test_fail!("cleartid_futex_wake",
                 "wake-on-missing-key fabricated a stale entry");
-            FUTEX_WAITERS.lock().remove(&(fake_pid, fake_uaddr));
+            FUTEX_WAITERS.lock().remove(&fk);
             return false;
         }
     }
@@ -29768,7 +29903,7 @@ fn test_cleartid_futex_wake() -> bool {
     // Step 5: queue with multiple waiters — wake 1 leaves the rest.
     {
         let mut waiters = FUTEX_WAITERS.lock();
-        let v = waiters.entry((fake_pid, fake_uaddr))
+        let v = waiters.entry(fk)
             .or_insert_with(alloc::vec::Vec::new);
         v.push(0xAAA1);
         v.push(0xAAA2);
@@ -29777,11 +29912,11 @@ fn test_cleartid_futex_wake() -> bool {
     futex_wake_for_exit(fake_pid, fake_uaddr, 1);
     let remaining = {
         let waiters = FUTEX_WAITERS.lock();
-        waiters.get(&(fake_pid, fake_uaddr)).map(|v| v.len()).unwrap_or(0)
+        waiters.get(&fk).map(|v| v.len()).unwrap_or(0)
     };
     if remaining != 2 {
         // Cleanup before failing.
-        FUTEX_WAITERS.lock().remove(&(fake_pid, fake_uaddr));
+        FUTEX_WAITERS.lock().remove(&fk);
         test_fail!("cleartid_futex_wake",
             "expected 2 remaining waiters, got {}", remaining);
         return false;
@@ -29791,10 +29926,10 @@ fn test_cleartid_futex_wake() -> bool {
     futex_wake_for_exit(fake_pid, fake_uaddr, u64::MAX);
     let leftover = {
         let waiters = FUTEX_WAITERS.lock();
-        waiters.contains_key(&(fake_pid, fake_uaddr))
+        waiters.contains_key(&fk)
     };
     if leftover {
-        FUTEX_WAITERS.lock().remove(&(fake_pid, fake_uaddr));
+        FUTEX_WAITERS.lock().remove(&fk);
         test_fail!("cleartid_futex_wake", "drain wake left a stale key");
         return false;
     }
@@ -29826,7 +29961,7 @@ fn test_cleartid_write_demand_faults() -> bool {
     test_header!("CLONE_CHILD_CLEARTID write lands on non-present / COW page");
 
     use crate::mm::vmm::{read_pte, map_page_in, PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER};
-    use crate::syscall::{write_u32_to_user_pub, futex_wake_for_exit, FUTEX_WAITERS};
+    use crate::syscall::{write_u32_to_user_pub, futex_wake_for_exit, FUTEX_WAITERS, FutexKey};
     const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
 
     let test_pid: u64 = 9971;
@@ -29907,7 +30042,7 @@ fn test_cleartid_write_demand_faults() -> bool {
             old
         };
         if let Some(space) = old { crate::proc::free_vm_space(space); }
-        FUTEX_WAITERS.lock().remove(&(test_pid, 0)); // belt-and-braces
+        FUTEX_WAITERS.lock().remove(&FutexKey::Private(test_pid, 0)); // belt-and-braces
     };
 
     // ── Part A: write to a word on a NOT-PRESENT page ───────────────────────
@@ -29925,7 +30060,7 @@ fn test_cleartid_write_demand_faults() -> bool {
     let waiter_tid: u64 = 0x5151;
     {
         let mut waiters = FUTEX_WAITERS.lock();
-        waiters.entry((test_pid, addr_a)).or_insert_with(alloc::vec::Vec::new).push(waiter_tid);
+        waiters.entry(FutexKey::Private(test_pid, addr_a)).or_insert_with(alloc::vec::Vec::new).push(waiter_tid);
     }
 
     write_u32_to_user_pub(cr3, addr_a, 0);
@@ -29933,7 +30068,7 @@ fn test_cleartid_write_demand_faults() -> bool {
     // (a) PTE must now be present + writable + user.
     let pte_a = read_pte(cr3, addr_a);
     if pte_a & PAGE_PRESENT == 0 || pte_a & PAGE_WRITABLE == 0 || pte_a & PAGE_USER == 0 {
-        FUTEX_WAITERS.lock().remove(&(test_pid, addr_a));
+        FUTEX_WAITERS.lock().remove(&FutexKey::Private(test_pid, addr_a));
         teardown();
         test_fail!("cleartid_demand", "addr_a PTE not present/writable/user after write: {:#x}", pte_a);
         return false;
@@ -29942,7 +30077,7 @@ fn test_cleartid_write_demand_faults() -> bool {
     let phys_a = (pte_a & crate::mm::vmm::ADDR_MASK) + (addr_a & 0xFFF);
     let read_back_a = unsafe { core::ptr::read_volatile((PHYS_OFF + phys_a) as *const u32) };
     if read_back_a != 0 {
-        FUTEX_WAITERS.lock().remove(&(test_pid, addr_a));
+        FUTEX_WAITERS.lock().remove(&FutexKey::Private(test_pid, addr_a));
         teardown();
         test_fail!("cleartid_demand", "addr_a read-back {:#x}, expected 0", read_back_a);
         return false;
@@ -29953,10 +30088,10 @@ fn test_cleartid_write_demand_faults() -> bool {
     futex_wake_for_exit(test_pid, addr_a, 1);
     let still_parked = {
         let waiters = FUTEX_WAITERS.lock();
-        waiters.get(&(test_pid, addr_a)).map(|v| v.contains(&waiter_tid)).unwrap_or(false)
+        waiters.get(&FutexKey::Private(test_pid, addr_a)).map(|v| v.contains(&waiter_tid)).unwrap_or(false)
     };
     if still_parked {
-        FUTEX_WAITERS.lock().remove(&(test_pid, addr_a));
+        FUTEX_WAITERS.lock().remove(&FutexKey::Private(test_pid, addr_a));
         teardown();
         test_fail!("cleartid_demand", "waiter still parked after write+wake (lost wakeup)");
         return false;
@@ -30112,6 +30247,123 @@ fn test_map_page_in_if_absent_anti_alias() -> bool {
     crate::proc::free_vm_space(vm);
 
     test_pass!("map_page_in_if_absent anti-aliasing");
+    true
+}
+
+/// The copy-on-write present+write fault arm: two sibling threads on one shared
+/// CR3 take the CoW fault on the SAME VA concurrently, each having allocated and
+/// copied its own private frame.  The winner installs its frame and releases one
+/// reference to the shared (pre-CoW) frame; the loser observes the winner's
+/// already-present PTE and backs out WITHOUT a second release of the shared
+/// frame — a double-release would underflow the refcount and free a frame the
+/// parent / forked child still map.  This test models that accounting directly.
+/// Refs: POSIX clone(2) CLONE_VM, fork(2) copy-on-write; Intel SDM Vol. 3A
+/// §4.10.4 (TLB invalidation is per-logical-processor).
+fn test_pfh_cow_arm_anti_alias_refcount() -> bool {
+    test_header!("CoW present+write arm: anti-aliasing + refcount back-out");
+
+    use crate::mm::vmm::{read_pte, map_page_in, map_page_in_cow_if_unchanged,
+        PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER, ADDR_MASK};
+    use crate::mm::refcount::{page_ref_set, page_ref_dec, page_ref_count};
+
+    let vm = match crate::mm::vma::VmSpace::new_user() {
+        Some(vs) => vs,
+        None => { test_fail!("cow_refcount", "VmSpace::new_user() OOM"); return false; }
+    };
+    let cr3 = vm.cr3;
+
+    let va: u64 = 0x7fff_fffe_b000;
+    let page = crate::mm::vma::page_align_down(va);
+    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+
+    // The shared, pre-CoW frame, mapped read-only at `va` and shared with a
+    // (notional) forked child — refcount 2.
+    let shared = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => { crate::proc::free_vm_space(vm); test_fail!("cow_refcount", "OOM shared"); return false; }
+    };
+    page_ref_set(shared, 2);
+    // Install the shared frame read-only at `va` (the post-fork CoW state:
+    // PRESENT but not writable).
+    map_page_in(cr3, page, shared, PAGE_PRESENT | PAGE_USER);
+
+    // Two distinct private frames — the two CPUs' independent CoW copies.
+    let win = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => { crate::mm::pmm::free_page(shared); crate::proc::free_vm_space(vm);
+                  test_fail!("cow_refcount", "OOM win"); return false; }
+    };
+    let lose = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => { crate::mm::pmm::free_page(shared); crate::mm::pmm::free_page(win);
+                  crate::proc::free_vm_space(vm); test_fail!("cow_refcount", "OOM lose"); return false; }
+    };
+
+    // Winner path: the leaf PTE still references `shared` (present, RO), so the
+    // compare-and-swap succeeds, swapping in `win`.  Release ONE shared ref.
+    page_ref_set(win, 1);
+    let won = map_page_in_cow_if_unchanged(cr3, page, win, flags, shared);
+    if won { let _ = page_ref_dec(shared); }
+    if !won {
+        crate::mm::pmm::free_page(shared); crate::mm::pmm::free_page(win);
+        crate::mm::pmm::free_page(lose); crate::proc::free_vm_space(vm);
+        test_fail!("cow_refcount", "winner CAS over PTE→shared returned false");
+        return false;
+    }
+    // After the winner: PTE maps `win`; `shared` dropped 2 → 1.
+    if page_ref_count(shared) != 1 {
+        crate::mm::pmm::free_page(shared); crate::mm::pmm::free_page(win);
+        crate::mm::pmm::free_page(lose); crate::proc::free_vm_space(vm);
+        test_fail!("cow_refcount", "after winner: shared refcount={} (expected 1)",
+            page_ref_count(shared));
+        return false;
+    }
+    test_println!("  (1) winner installed {:#x}; shared {:#x} refcount 2→1 ✓", win, shared);
+
+    // Loser path: a concurrent sibling that took the same CoW fault still
+    // expects the PTE to reference `shared`, but the winner already swapped in
+    // `win`.  The compare-and-swap must fail (return false) and leave the
+    // winner's PTE untouched.  Critically, the loser must NOT decrement
+    // `shared` a second time.
+    page_ref_set(lose, 1);
+    let lost = map_page_in_cow_if_unchanged(cr3, page, lose, flags, shared);
+    if lost {
+        crate::mm::pmm::free_page(shared); crate::mm::pmm::free_page(win);
+        crate::mm::pmm::free_page(lose); crate::proc::free_vm_space(vm);
+        test_fail!("cow_refcount", "loser install returned true — it overwrote the PTE (aliasing)");
+        return false;
+    }
+    // Loser backs out: reset its frame to 0 and free it; do NOT touch `shared`.
+    page_ref_set(lose, 0);
+    crate::mm::pmm::free_page(lose);
+
+    let pte = read_pte(cr3, va);
+    if (pte & ADDR_MASK) != (win & ADDR_MASK) {
+        crate::mm::pmm::free_page(shared); crate::mm::pmm::free_page(win);
+        crate::proc::free_vm_space(vm);
+        test_fail!("cow_refcount", "PTE no longer maps winner: pte={:#x} win={:#x}", pte, win);
+        return false;
+    }
+    // The decisive invariant: `shared` must still be at 1 (loser did NOT
+    // double-dec it to 0 — which would have prematurely freed a still-mapped
+    // frame, the W215 corruption).
+    if page_ref_count(shared) != 1 {
+        crate::mm::pmm::free_page(shared); crate::mm::pmm::free_page(win);
+        crate::proc::free_vm_space(vm);
+        test_fail!("cow_refcount", "after loser back-out: shared refcount={} (expected 1 — \
+            a value of 0 means a double-release underflow)", page_ref_count(shared));
+        return false;
+    }
+    test_println!("  (2) loser backed out; PTE still maps winner; shared refcount held at 1 ✓");
+
+    // Teardown.  `win` is mapped at `va`; freeing the address space frees it.
+    // `shared` is no longer mapped here (refcount 1 = the notional child) — free
+    // it to balance this test's allocation.
+    let _ = page_ref_dec(shared);
+    crate::mm::pmm::free_page(shared);
+    crate::proc::free_vm_space(vm);
+
+    test_pass!("CoW arm anti-aliasing + refcount back-out");
     true
 }
 
@@ -30835,6 +31087,255 @@ fn test_tcp_read_from_isolation() -> bool {
     }
 
     test_pass!("TCP read_from — 4-tuple isolation under shared port");
+    true
+}
+
+// ── Test 281: AF_INET peer-FIN read-closed edge + CloseWait tail drain ───────
+//
+// Models the close-delimited HTTP-response completion path (RFC 9112
+// §6.3) that the necko socket-transport thread depends on: a peer FIN
+// must (a) wake a poll(2)/epoll(7) reader via the read-closed edge so it
+// issues the read() that returns 0 (onStopRequest), and (b) NOT strand a
+// buffered CloseWait tail — the reader must drain the bytes that arrived
+// before/with the FIN before observing EOF (data-before-EOF, RFC 9293
+// §3.5, POSIX read(2)/recv(2)).
+//
+// Regression guard for the readiness gap where the AF_INET poll/epoll
+// arms emitted no POLLHUP/EPOLLHUP/RDHUP on a CloseWait connection and
+// tcp::read/read_from filtered on Established alone.
+#[cfg(feature = "kdb")]
+fn test_tcp_peer_fin_read_closed_edge() -> bool {
+    test_header!("AF_INET peer-FIN read-closed edge + CloseWait drain");
+
+    use crate::net::{tcp, socket};
+    use crate::net::socket::RecvOutcome;
+
+    const LOCAL_PORT: u16 = 47120;
+    // Use the ARP-cached SLIRP gateway IP (10.0.2.2) as the synthetic peer,
+    // like test_tcp_inbound_3whs.  The final socket_close drives a FIN through
+    // send_ipv4 -> resolve_mac; against a host-less synthetic IP that path
+    // enters an ARP poll loop, whereas the gateway's MAC is already cached so
+    // the FIN goes out immediately.
+    let peer_ip:   [u8; 4] = [10, 0, 2, 2];
+    let peer_port: u16     = 52345;
+    const TAIL: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody-tail";
+
+    if let Err(e) = tcp::listen(LOCAL_PORT) {
+        test_fail!("tcp_peer_fin", "listen({}) failed: {}", LOCAL_PORT, e);
+        return false;
+    }
+    // Established TCB with a buffered tail, plus a connected socket fd
+    // (connected=true ⇒ socket_read_closed uses the peer-aware lookup).
+    if let Err(e) = tcp::test_inject_established(LOCAL_PORT, peer_ip, peer_port, TAIL) {
+        test_fail!("tcp_peer_fin", "inject failed: {}", e);
+        return false;
+    }
+    let sid = socket::socket_create_accepted(LOCAL_PORT, peer_ip, peer_port);
+
+    // Pre-FIN (Established): readable on data, NOT read-closed, NOT hung up.
+    if !socket::socket_has_data(sid) {
+        test_fail!("tcp_peer_fin", "pre-FIN: socket not readable with buffered tail");
+        socket::socket_close(sid); return false;
+    }
+    if socket::socket_read_closed(sid) || socket::socket_fully_hung_up(sid) {
+        test_fail!("tcp_peer_fin", "pre-FIN: spurious read-closed/hung-up on Established");
+        socket::socket_close(sid); return false;
+    }
+
+    // Peer FIN → CloseWait (RFC 9293 §3.5).
+    if let Err(e) = tcp::test_set_state(LOCAL_PORT, peer_ip, peer_port,
+                                        tcp::TcpState::CloseWait) {
+        test_fail!("tcp_peer_fin", "set CloseWait failed: {}", e);
+        socket::socket_close(sid); return false;
+    }
+
+    // Post-FIN with tail still buffered: read-closed edge fires, but
+    // POLLHUP is WITHHELD until the tail drains (data-before-EOF).
+    if !socket::socket_read_closed(sid) {
+        test_fail!("tcp_peer_fin", "post-FIN: read-closed edge did NOT fire (poll/epoll would never wake)");
+        socket::socket_close(sid); return false;
+    }
+    if socket::socket_fully_hung_up(sid) {
+        test_fail!("tcp_peer_fin", "post-FIN: POLLHUP raised while tail still buffered (premature EOF)");
+        socket::socket_close(sid); return false;
+    }
+    if !socket::socket_has_data(sid) {
+        test_fail!("tcp_peer_fin", "post-FIN: CloseWait tail not reported readable (Established-only filter regression)");
+        socket::socket_close(sid); return false;
+    }
+
+    // Drain the tail — read_from must accept CloseWait, not Established only.
+    match socket::socket_recv_status(sid) {
+        Ok(RecvOutcome::Data(d)) => {
+            if d != TAIL {
+                test_fail!("tcp_peer_fin", "drained {} bytes, expected {} (tail truncated)",
+                    d.len(), TAIL.len());
+                socket::socket_close(sid); return false;
+            }
+        }
+        Ok(RecvOutcome::Eof) => {
+            test_fail!("tcp_peer_fin", "got EOF before draining the CloseWait tail (data-before-EOF violated)");
+            socket::socket_close(sid); return false;
+        }
+        Ok(RecvOutcome::WouldBlock) => {
+            test_fail!("tcp_peer_fin", "got WouldBlock with a buffered CloseWait tail");
+            socket::socket_close(sid); return false;
+        }
+        Err(e) => {
+            test_fail!("tcp_peer_fin", "recv_status err: {}", e);
+            socket::socket_close(sid); return false;
+        }
+    }
+
+    // Tail drained: now fully hung up — POLLHUP, and recv reports EOF.
+    if !socket::socket_fully_hung_up(sid) {
+        test_fail!("tcp_peer_fin", "post-drain: POLLHUP not raised (reader never observes EOF)");
+        socket::socket_close(sid); return false;
+    }
+    match socket::socket_recv_status(sid) {
+        Ok(RecvOutcome::Eof) => {}
+        other => {
+            test_fail!("tcp_peer_fin", "post-drain: expected EOF, got {:?}", other.is_ok());
+            socket::socket_close(sid); return false;
+        }
+    }
+
+    socket::socket_close(sid);
+    test_pass!("AF_INET peer-FIN read-closed edge + CloseWait drain");
+    true
+}
+
+// ── Test 282: TCP out-of-order receive reassembly ────────────────────────────
+//
+// RFC 9293 §3.10.7.4: a segment that arrives ahead of RCV.NXT (a reorder, or
+// the segment after a dropped one) must be queued, not dropped, and the
+// receiver sends a duplicate ACK of RCV.NXT (RFC 5681 §3.2) so the peer
+// fast-retransmits the missing data.  Once the gap is filled the buffered
+// data is delivered in order.  Before this fix the in-order-only accept path
+// dropped any seq != recv_next and sent no ACK, so a single mid-stream loss
+// wedged recv_next forever and a 628 KiB HTTP response never completed.
+#[cfg(feature = "kdb")]
+fn test_tcp_ooo_reassembly() -> bool {
+    test_header!("TCP out-of-order receive reassembly (RFC 9293 §3.10.7.4)");
+
+    use crate::net::tcp;
+
+    const LOCAL_PORT: u16 = 47220;
+    // Use the SLIRP gateway IP (10.0.2.2) as the synthetic peer, exactly as
+    // test_tcp_inbound_3whs does: the ACKs that process_segment emits go out
+    // through send_ipv4 -> resolve_mac, and the gateway answers ARP promptly
+    // (a host-less synthetic IP would instead cost ~510 ms of ARP retries per
+    // ACK).  The 4-tuple stays unique via the distinct local/peer ports.
+    let peer_ip:   [u8; 4] = [10, 0, 2, 2];
+    let peer_port: u16     = 51001;
+
+    // test_inject_established sets recv_next = 1, so the in-order byte
+    // stream the peer sends starts at seq 1.  Split a 10-byte payload into
+    // two 5-byte segments: seg1 @ seq 1 ("HELLO"), seg2 @ seq 6 ("WORLD").
+    if let Err(e) = tcp::test_inject_established(LOCAL_PORT, peer_ip, peer_port, b"") {
+        test_fail!("tcp_ooo", "inject failed: {}", e);
+        return false;
+    }
+    let our_ip = crate::net::our_ip();
+
+    // Helper: the recv_next currently recorded for our TCB.
+    let recv_next_of = || -> Option<u32> {
+        tcp::snapshot_connections().iter()
+            .find(|c| c.local_port == LOCAL_PORT
+                   && c.remote_ip == peer_ip
+                   && c.remote_port == peer_port)
+            .map(|c| c.recv_next)
+    };
+
+    // Sanity: recv_next starts at 1.
+    if recv_next_of() != Some(1) {
+        test_fail!("tcp_ooo", "initial recv_next != 1 (got {:?})", recv_next_of());
+        let _ = tcp::close_connection(LOCAL_PORT, peer_ip, peer_port);
+        return false;
+    }
+
+    // Step 1 — deliver the SECOND segment first (out of order).  seq = 6.
+    // It must be BUFFERED: recv_next must NOT advance, and nothing becomes
+    // readable yet.
+    let seg2 = make_tcp_seg_with_payload(peer_port, LOCAL_PORT,
+        6, 0, tcp::PSH | tcp::ACK, b"WORLD");
+    tcp::handle_tcp(peer_ip, our_ip, &seg2);
+
+    if recv_next_of() != Some(1) {
+        test_fail!("tcp_ooo", "recv_next advanced on out-of-order segment (got {:?}, want 1) — OOO segment was not buffered",
+                    recv_next_of());
+        let _ = tcp::close_connection(LOCAL_PORT, peer_ip, peer_port);
+        return false;
+    }
+    if !tcp::read_from(LOCAL_PORT, peer_ip, peer_port).is_empty() {
+        test_fail!("tcp_ooo", "out-of-order data became readable before the gap was filled");
+        let _ = tcp::close_connection(LOCAL_PORT, peer_ip, peer_port);
+        return false;
+    }
+    test_println!("  OOO segment (seq 6) buffered, recv_next held at 1 ✓");
+
+    // Step 2 — deliver the FIRST segment (fills the gap).  seq = 1.
+    // recv_next must advance past BOTH segments (1 → 6 → 11) as the buffered
+    // segment drains in order, and the full 10 bytes become readable
+    // contiguously.
+    let seg1 = make_tcp_seg_with_payload(peer_port, LOCAL_PORT,
+        1, 0, tcp::PSH | tcp::ACK, b"HELLO");
+    tcp::handle_tcp(peer_ip, our_ip, &seg1);
+
+    if recv_next_of() != Some(11) {
+        test_fail!("tcp_ooo", "recv_next != 11 after gap filled (got {:?}) — OOO drain did not run",
+                    recv_next_of());
+        let _ = tcp::close_connection(LOCAL_PORT, peer_ip, peer_port);
+        return false;
+    }
+    let got = tcp::read_from(LOCAL_PORT, peer_ip, peer_port);
+    if got != b"HELLOWORLD" {
+        test_fail!("tcp_ooo", "reassembled stream = {:?}, expected \"HELLOWORLD\"",
+                    core::str::from_utf8(&got).unwrap_or("<non-utf8>"));
+        let _ = tcp::close_connection(LOCAL_PORT, peer_ip, peer_port);
+        return false;
+    }
+    test_println!("  gap-filling segment (seq 1) drained OOO queue in order: \"HELLOWORLD\" ✓");
+
+    // Step 3 — FIN gating.  Inject a fresh TCB, deliver an out-of-order data
+    // segment (leaving a gap) that ALSO carries a FIN.  The FIN sits past the
+    // gap, so it must NOT advance recv_next or move to CloseWait — tearing
+    // down with a hole open would truncate the response.
+    const PORT2: u16 = 47221;
+    let peer2_port: u16 = 51002;
+    if let Err(e) = tcp::test_inject_established(PORT2, peer_ip, peer2_port, b"") {
+        test_fail!("tcp_ooo", "inject #2 failed: {}", e);
+        let _ = tcp::close_connection(LOCAL_PORT, peer_ip, peer_port);
+        return false;
+    }
+    // seq 6 (a gap at 1..6), data "TAIL", FIN set.  recv_next is 1.
+    let ooo_fin = make_tcp_seg_with_payload(peer2_port, PORT2,
+        6, 0, tcp::PSH | tcp::ACK | tcp::FIN, b"TAIL");
+    tcp::handle_tcp(peer_ip, our_ip, &ooo_fin);
+
+    let st2 = tcp::snapshot_connections().iter()
+        .find(|c| c.local_port == PORT2 && c.remote_ip == peer_ip
+               && c.remote_port == peer2_port)
+        .map(|c| (c.state, c.recv_next));
+    match st2 {
+        Some((tcp::TcpState::Established, 1)) =>
+            test_println!("  out-of-order FIN ignored: stayed Established, recv_next held at 1 ✓"),
+        Some((s, rn)) => {
+            test_fail!("tcp_ooo", "out-of-order FIN mishandled: state={:?} recv_next={} (premature teardown / hole-skip)", s, rn);
+            let _ = tcp::close_connection(LOCAL_PORT, peer_ip, peer_port);
+            let _ = tcp::close_connection(PORT2, peer_ip, peer2_port);
+            return false;
+        }
+        None => {
+            test_fail!("tcp_ooo", "TCB #2 vanished after out-of-order FIN");
+            let _ = tcp::close_connection(LOCAL_PORT, peer_ip, peer_port);
+            return false;
+        }
+    }
+
+    let _ = tcp::close_connection(LOCAL_PORT, peer_ip, peer_port);
+    let _ = tcp::close_connection(PORT2, peer_ip, peer2_port);
+    test_pass!("TCP out-of-order receive reassembly + dup-ACK + FIN gating");
     true
 }
 
@@ -32114,6 +32615,108 @@ fn test_recvfrom_udp_returns_sender_4tuple() -> bool {
         src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port, data.len());
     test_pass!("recvfrom — UDP returns sender 4-tuple");
     true
+}
+
+// socket_recv_status_from is the recvmsg(2) source-carrying recv used by the
+// AF_INET recvmsg arm to fill msg_name.  A connection-mode resolver (musl's
+// __res_msend) validates the reply source byte-for-byte against the
+// nameserver and DROPS a reply whose msg_name does not match (RFC 1035 §7.3),
+// so the dequeued datagram's true wire source must round-trip here.
+fn test_recv_status_from_udp_returns_sender_4tuple() -> bool {
+    test_header!("recvmsg — socket_recv_status_from returns sender 4-tuple");
+
+    use crate::net::socket::{self, SocketType, RecvOutcome};
+    use crate::net::udp;
+
+    const SERVER_PORT: u16 = 17142;
+    const CLIENT_PORT: u16 = 50071;
+    const PAYLOAD: &[u8] = b"NDE9 dns reply src";
+
+    let id = socket::socket_create(SocketType::Udp);
+    if let Err(e) = socket::socket_bind(id, SERVER_PORT) {
+        socket::socket_close(id);
+        test_fail!("recv_status_from", "bind({}) failed: {}", SERVER_PORT, e);
+        return false;
+    }
+
+    udp::send([127, 0, 0, 1], CLIENT_PORT, SERVER_PORT, PAYLOAD);
+    crate::net::poll();
+
+    let (outcome, src_ip, src_port) = match socket::socket_recv_status_from(id) {
+        Ok(t) => t,
+        Err(e) => {
+            socket::socket_close(id);
+            test_fail!("recv_status_from", "call failed: {}", e);
+            return false;
+        }
+    };
+    socket::socket_close(id);
+
+    let data = match outcome {
+        RecvOutcome::Data(d) => d,
+        RecvOutcome::Eof => { test_fail!("recv_status_from", "got Eof, want Data"); return false; }
+        RecvOutcome::WouldBlock => { test_fail!("recv_status_from", "got WouldBlock, want Data"); return false; }
+    };
+
+    if data != PAYLOAD {
+        test_fail!("recv_status_from", "payload mismatch: {} bytes", data.len());
+        return false;
+    }
+    if src_ip[0] != 127 {
+        test_fail!("recv_status_from", "expected loopback src, got {}.{}.{}.{}",
+            src_ip[0], src_ip[1], src_ip[2], src_ip[3]);
+        return false;
+    }
+    if src_port != CLIENT_PORT {
+        test_fail!("recv_status_from", "expected src port {}, got {}", CLIENT_PORT, src_port);
+        return false;
+    }
+
+    test_println!("  recv_status_from → src {}.{}.{}.{}:{} ({} bytes) ✓",
+        src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port, data.len());
+    test_pass!("recvmsg — socket_recv_status_from returns sender 4-tuple");
+    true
+}
+
+// An empty UDP receive queue is would-block (never EOF) per RFC 768 / the
+// connectionless socket contract, and the source out-params are unused on a
+// non-Data outcome (recvmsg(2) only fills msg_namelen on a real message).
+fn test_recv_status_from_udp_wouldblock_when_empty() -> bool {
+    test_header!("recvmsg — socket_recv_status_from empty UDP is WouldBlock");
+
+    use crate::net::socket::{self, SocketType, RecvOutcome};
+
+    const SERVER_PORT: u16 = 17143;
+
+    let id = socket::socket_create(SocketType::Udp);
+    if let Err(e) = socket::socket_bind(id, SERVER_PORT) {
+        socket::socket_close(id);
+        test_fail!("recv_status_from_empty", "bind({}) failed: {}", SERVER_PORT, e);
+        return false;
+    }
+
+    let r = socket::socket_recv_status_from(id);
+    socket::socket_close(id);
+
+    match r {
+        Ok((RecvOutcome::WouldBlock, _, _)) => {
+            test_println!("  empty UDP queue → WouldBlock ✓");
+            test_pass!("recvmsg — socket_recv_status_from empty UDP is WouldBlock");
+            true
+        }
+        Ok((RecvOutcome::Data(d), _, _)) => {
+            test_fail!("recv_status_from_empty", "unexpected Data ({} bytes)", d.len());
+            false
+        }
+        Ok((RecvOutcome::Eof, _, _)) => {
+            test_fail!("recv_status_from_empty", "UDP must not report Eof on empty queue");
+            false
+        }
+        Err(e) => {
+            test_fail!("recv_status_from_empty", "call failed: {}", e);
+            false
+        }
+    }
 }
 
 #[cfg(feature = "kdb")]
@@ -33750,7 +34353,7 @@ fn test_rt_sigaction_flags_mask_roundtrip() -> bool {
 // the waiter sees `*uaddr != val` under the lock and returns EAGAIN.
 fn test_futex_wait_atomic_check_then_queue() -> bool {
     use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-    use crate::syscall::{FUTEX_WAITERS, FutexWaitOutcome, futex_wait_check_and_enqueue,
+    use crate::syscall::{FUTEX_WAITERS, FutexKey, FutexWaitOutcome, futex_wait_check_and_enqueue,
                           futex_wake_for_exit};
 
     test_header!("FUTEX_WAIT atomic check-then-queue (lost-wakeup race) — issue: pre-PR");
@@ -33760,6 +34363,9 @@ fn test_futex_wait_atomic_check_then_queue() -> bool {
     // never dereferences it because we pass an in-kernel `read_u32` closure.
     const SYNTH_PID: u64    = 0xCAFE_BABE_DEAD_BEEF;
     const SYNTH_UADDR: u64  = 0x7EFF_F123_0000_0000;
+    // SYNTH_PID has no VmSpace, so both the enqueue and the wake resolve this
+    // word to the PRIVATE key — capture it once so the test keys consistently.
+    const SYNTH_KEY: FutexKey = FutexKey::Private(SYNTH_PID, SYNTH_UADDR);
     const EXPECTED_VAL: u32 = 0x4243_4445; // arbitrary sentinel
 
     // Shared kernel-mode "futex word" the closure reads under the lock.
@@ -33779,7 +34385,7 @@ fn test_futex_wait_atomic_check_then_queue() -> bool {
     WAKES_POSTED.store(0, Ordering::SeqCst);
     STOP_WAKERS.store(0, Ordering::SeqCst);
     // Remove any stale queue entry from a prior test run.
-    FUTEX_WAITERS.lock().remove(&(SYNTH_PID, SYNTH_UADDR));
+    FUTEX_WAITERS.lock().remove(&SYNTH_KEY);
 
     const N_WAITERS: u32 = 4;
     const N_WAKERS:  u32 = 2;
@@ -33794,7 +34400,7 @@ fn test_futex_wait_atomic_check_then_queue() -> bool {
         // helper returns ValueMismatch we count as "done" (a benign
         // EAGAIN — wake-side beat us via the FUTEX_WORD update).
         let outcome = futex_wait_check_and_enqueue(
-            SYNTH_PID, SYNTH_UADDR, EXPECTED_VAL as u64, tid,
+            SYNTH_KEY, EXPECTED_VAL as u64, tid,
             u64::MAX, // indefinite
             || Some(FUTEX_WORD.load(Ordering::SeqCst)),
         );
@@ -33806,10 +34412,10 @@ fn test_futex_wait_atomic_check_then_queue() -> bool {
                 // Cleanup: dequeue self if still on the list (timeout path).
                 {
                     let mut waiters = FUTEX_WAITERS.lock();
-                    if let Some(list) = waiters.get_mut(&(SYNTH_PID, SYNTH_UADDR)) {
+                    if let Some(list) = waiters.get_mut(&SYNTH_KEY) {
                         list.retain(|&t| t != tid);
                         if list.is_empty() {
-                            waiters.remove(&(SYNTH_PID, SYNTH_UADDR));
+                            waiters.remove(&SYNTH_KEY);
                         }
                     }
                 }
@@ -33906,7 +34512,7 @@ fn test_futex_wait_atomic_check_then_queue() -> bool {
     // WAITERS_DONE would be < N_WAITERS.
     if !all_done || done < N_WAITERS {
         // Best-effort cleanup so a failed run does not leak the queue entry.
-        FUTEX_WAITERS.lock().remove(&(SYNTH_PID, SYNTH_UADDR));
+        FUTEX_WAITERS.lock().remove(&SYNTH_KEY);
         test_fail!("futex_wait_atomic_check_then_queue",
             "only {}/{} waiters completed (lost wakeup — {} still parked)",
             done, N_WAITERS, N_WAITERS - done);
@@ -33916,10 +34522,10 @@ fn test_futex_wait_atomic_check_then_queue() -> bool {
     // Invariant 2: FUTEX_WAITERS must not contain a stale entry for our key.
     let leftover = {
         let waiters = FUTEX_WAITERS.lock();
-        waiters.get(&(SYNTH_PID, SYNTH_UADDR)).map(|v| v.len()).unwrap_or(0)
+        waiters.get(&SYNTH_KEY).map(|v| v.len()).unwrap_or(0)
     };
     if leftover != 0 {
-        FUTEX_WAITERS.lock().remove(&(SYNTH_PID, SYNTH_UADDR));
+        FUTEX_WAITERS.lock().remove(&SYNTH_KEY);
         test_fail!("futex_wait_atomic_check_then_queue",
             "{} waiter(s) left on FUTEX_WAITERS after drain (leaked queue entry)",
             leftover);
@@ -33949,13 +34555,15 @@ fn test_futex_wait_atomic_check_then_queue() -> bool {
 // 32 bits of `val`; when the low 32 bits differ it must report ValueMismatch.
 fn test_futex_wait_val_is_32bit() -> bool {
     use core::sync::atomic::{AtomicU32, Ordering};
-    use crate::syscall::{FUTEX_WAITERS, FutexWaitOutcome, futex_wait_check_and_enqueue};
+    use crate::syscall::{FUTEX_WAITERS, FutexKey, FutexWaitOutcome, futex_wait_check_and_enqueue};
 
     test_header!("FUTEX_WAIT 32-bit value compare (int sign-extension safe)");
 
     // Synthetic key, well clear of any live mapping.
     const SYNTH_PID:   u64 = 0xF00D_F00D_0000_0001;
     const SYNTH_UADDR: u64 = 0x7EFF_F222_0000_0000;
+    // No VmSpace for this synthetic pid → PRIVATE key.
+    const SYNTH_KEY: FutexKey = FutexKey::Private(SYNTH_PID, SYNTH_UADDR);
     // Futex word with bit 31 (musl waiters bit) set — exactly the value
     // captured live at the Firefox main-thread mutex storm (_m_lock = waiters
     // | EBUSY).
@@ -33968,14 +34576,14 @@ fn test_futex_wait_val_is_32bit() -> bool {
     FUTEX_WORD.store(WORD, Ordering::SeqCst);
 
     // Clean any stale queue entry from a prior run.
-    FUTEX_WAITERS.lock().remove(&(SYNTH_PID, SYNTH_UADDR));
+    FUTEX_WAITERS.lock().remove(&SYNTH_KEY);
 
     let tid = crate::proc::current_tid();
 
     // Case 1: low-32 bits agree, high bits all-ones (sign-extended int).
     // MUST Enqueue (pre-fix this returned ValueMismatch → the storm).
     let outcome = futex_wait_check_and_enqueue(
-        SYNTH_PID, SYNTH_UADDR, VAL_SIGN_EXTENDED, tid,
+        SYNTH_KEY, VAL_SIGN_EXTENDED, tid,
         u64::MAX,
         || Some(FUTEX_WORD.load(Ordering::SeqCst)),
     );
@@ -33985,9 +34593,9 @@ fn test_futex_wait_val_is_32bit() -> bool {
     // that so the scheduler keeps running us, and clear the queue entry.
     {
         let mut waiters = FUTEX_WAITERS.lock();
-        if let Some(list) = waiters.get_mut(&(SYNTH_PID, SYNTH_UADDR)) {
+        if let Some(list) = waiters.get_mut(&SYNTH_KEY) {
             list.retain(|&t| t != tid);
-            if list.is_empty() { waiters.remove(&(SYNTH_PID, SYNTH_UADDR)); }
+            if list.is_empty() { waiters.remove(&SYNTH_KEY); }
         }
     }
     {
@@ -34011,16 +34619,16 @@ fn test_futex_wait_val_is_32bit() -> bool {
     // the comparison legitimately exists to produce; the fix must not mask it).
     let bad_val: u64 = 0xFFFF_FFFF_8000_0011; // low32 = 0x8000_0011 != WORD
     let outcome2 = futex_wait_check_and_enqueue(
-        SYNTH_PID, SYNTH_UADDR, bad_val, tid,
+        SYNTH_KEY, bad_val, tid,
         u64::MAX,
         || Some(FUTEX_WORD.load(Ordering::SeqCst)),
     );
     // Defensive cleanup if it somehow enqueued.
     {
         let mut waiters = FUTEX_WAITERS.lock();
-        if let Some(list) = waiters.get_mut(&(SYNTH_PID, SYNTH_UADDR)) {
+        if let Some(list) = waiters.get_mut(&SYNTH_KEY) {
             list.retain(|&t| t != tid);
-            if list.is_empty() { waiters.remove(&(SYNTH_PID, SYNTH_UADDR)); }
+            if list.is_empty() { waiters.remove(&SYNTH_KEY); }
         }
         let mut threads = crate::proc::THREAD_TABLE.lock();
         if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
@@ -37855,7 +38463,7 @@ fn test_exec_from_shared_vm_child() -> bool {
 /// the supplied exit code.
 fn test_exit_group_wakes_siblings() -> bool {
     use crate::proc::{PROCESS_TABLE, THREAD_TABLE, ThreadState, ProcessState};
-    use crate::syscall::FUTEX_WAITERS;
+    use crate::syscall::{FUTEX_WAITERS, FutexKey};
 
     test_header!("exit_group wakes parked sibling threads (W59)");
 
@@ -37905,9 +38513,10 @@ fn test_exit_group_wakes_siblings() -> bool {
     // Park the two siblings on FUTEX_WAIT(uaddr_A) and FUTEX_WAIT(uaddr_B).
     {
         let mut waiters = FUTEX_WAITERS.lock();
-        waiters.entry((target_pid, UADDR_A)).or_insert_with(alloc::vec::Vec::new)
+        // Synthetic uaddrs are unmapped, so the drain path keys them PRIVATE.
+        waiters.entry(FutexKey::Private(target_pid, UADDR_A)).or_insert_with(alloc::vec::Vec::new)
                .push(sib_a_tid);
-        waiters.entry((target_pid, UADDR_B)).or_insert_with(alloc::vec::Vec::new)
+        waiters.entry(FutexKey::Private(target_pid, UADDR_B)).or_insert_with(alloc::vec::Vec::new)
                .push(sib_b_tid);
     }
     test_println!("  target PID {}: main TID {}, siblings TID {}/{} parked on futex",
@@ -37961,7 +38570,7 @@ fn test_exit_group_wakes_siblings() -> bool {
     {
         let waiters = FUTEX_WAITERS.lock();
         let lingering: alloc::vec::Vec<_> = waiters.keys()
-            .filter(|&&(p, _)| p == target_pid).copied().collect();
+            .filter(|k| k.private_pid() == Some(target_pid)).copied().collect();
         if !lingering.is_empty() {
             test_fail!("exit_group_wakes_siblings",
                 "FUTEX_WAITERS still contains entries for dead pid: {:?}",
@@ -39193,6 +39802,206 @@ fn test_socketpair_survives_child_close_w216() -> bool {
     test_println!("  final close — both slots freed ✓");
 
     test_pass!("socketpair refcount survives child close (W216 H_A)");
+    true
+}
+
+/// Test 219b — MAP_SHARED pages stay genuinely shared across a copy-fork, and
+/// MAP_PRIVATE pages still copy-on-write.
+///
+/// POSIX mmap(2): "writes to [a MAP_SHARED] region [...] change the underlying
+/// object [...] visible in [other] process[es]".  POSIX fork(2): the child's
+/// address space is a copy of the parent's, but MAP_SHARED mappings refer to
+/// the same underlying object in both — they must NOT be made copy-on-write.
+///
+/// The bug this guards: `clone_for_fork` write-protected EVERY present PTE with
+/// no MAP_SHARED exemption (arming CoW on shared frames), and the present+write
+/// page-fault arm then copied the shared page into a private frame.  Together
+/// they silently demoted a MAP_SHARED surface to MAP_PRIVATE across a copy-fork
+/// — the kind of fork used by gecko's fork-server / glib g_spawn / NSPR
+/// PR_CreateProcess.  The content process would then paint into a private frame
+/// the parent never reads back: a structurally-valid but BLANK screenshot.
+///
+/// This drives the real `VmSpace::clone_for_fork` and asserts:
+///   (1) the MAP_SHARED leaf survives in the child writable and pointing at the
+///       SAME physical frame as the parent (no private copy);
+///   (2) a store written through the frame is observed by both parent and child
+///       PTEs (cross-process store-visibility);
+///   (3) the MAP_PRIVATE leaf is write-protected in BOTH parent and child
+///       (CoW correctly armed — no regression).
+///
+/// Refs: POSIX mmap(2), fork(2); Intel SDM Vol. 3A §4.10.4.
+fn test_map_shared_survives_fork_store_visibility() -> bool {
+    test_header!("MAP_SHARED survives fork — cross-process store visibility");
+
+    use crate::mm::vma::{VmArea, VmBacking, VmSpace, MAP_SHARED, MAP_PRIVATE,
+                         PROT_READ, PROT_WRITE, page_align_down};
+    use crate::mm::vmm::{read_pte, map_page_in, PAGE_PRESENT, PAGE_WRITABLE,
+                         PAGE_USER, ADDR_MASK};
+    use crate::mm::refcount::page_ref_count;
+
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+
+    // Parent address space (its own CR3 + page tables).
+    let mut parent = match VmSpace::new_user() {
+        Some(vs) => vs,
+        None => { test_fail!("map_shared_fork", "VmSpace::new_user() OOM"); return false; }
+    };
+    let parent_cr3 = parent.cr3;
+
+    // Two distinct page-aligned user VAs: one MAP_SHARED, one MAP_PRIVATE.
+    let shared_va:  u64 = 0x5555_0000_0000;
+    let private_va: u64 = 0x5555_0010_0000;
+    let shared_pg  = page_align_down(shared_va);
+    let private_pg = page_align_down(private_va);
+
+    // Real backing frames.
+    let shared_frame = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => { crate::proc::free_vm_space(parent); test_fail!("map_shared_fork", "OOM shared frame"); return false; }
+    };
+    let private_frame = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => {
+            crate::mm::pmm::free_page(shared_frame);
+            crate::proc::free_vm_space(parent);
+            test_fail!("map_shared_fork", "OOM private frame"); return false;
+        }
+    };
+
+    // Register the VMAs so clone_for_fork's MAP_SHARED predicate (and the
+    // page-fault arm) can classify each VA.  Anonymous backing keeps the test
+    // independent of the VFS / page-cache; the MAP_SHARED flag is what matters.
+    let rw_flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+    let mk = |base: u64, flags: u32, name: &'static str| VmArea {
+        base,
+        length: 0x1000,
+        prot: PROT_READ | PROT_WRITE,
+        flags,
+        backing: VmBacking::Anonymous,
+        name,
+    };
+    if parent.insert_vma(mk(shared_pg,  MAP_SHARED,  "[shared]")).is_err()
+        || parent.insert_vma(mk(private_pg, MAP_PRIVATE, "[private]")).is_err()
+    {
+        crate::mm::pmm::free_page(shared_frame);
+        crate::mm::pmm::free_page(private_frame);
+        crate::proc::free_vm_space(parent);
+        test_fail!("map_shared_fork", "insert_vma failed");
+        return false;
+    }
+
+    // Map both frames writable in the parent and seed the shared frame with a
+    // recognisable pattern (as if the parent had painted into the surface).
+    map_page_in(parent_cr3, shared_pg,  shared_frame,  rw_flags);
+    map_page_in(parent_cr3, private_pg, private_frame, rw_flags);
+    // Both frames are now mapped once → refcount must reflect the live mapping
+    // before the fork so the post-fork +1 assertion below is meaningful.
+    crate::mm::refcount::page_ref_set(shared_frame, 1);
+    crate::mm::refcount::page_ref_set(private_frame, 1);
+
+    let pattern_a: u64 = 0xA5A5_DEAD_BEEF_1234;
+    unsafe { core::ptr::write_volatile((PHYS_OFF + shared_frame) as *mut u64, pattern_a); }
+
+    // === fork: clone the address space ===
+    let child = match parent.clone_for_fork(parent_cr3) {
+        Some(c) => c,
+        None => {
+            crate::mm::pmm::free_page(shared_frame);
+            crate::mm::pmm::free_page(private_frame);
+            crate::proc::free_vm_space(parent);
+            test_fail!("map_shared_fork", "clone_for_fork returned None (OOM)");
+            return false;
+        }
+    };
+    let child_cr3 = child.cr3;
+
+    // Helper to fail + tear down both address spaces (and unmapped frames).
+    macro_rules! fail_teardown {
+        ($($arg:tt)*) => {{
+            crate::proc::free_vm_space(child);
+            crate::proc::free_vm_space(parent);
+            test_fail!("map_shared_fork", $($arg)*);
+            return false;
+        }};
+    }
+
+    // (1) MAP_SHARED: child PTE must map the SAME frame, writable, and the
+    //     parent PTE must remain writable (not write-protected for CoW).
+    let p_shared = read_pte(parent_cr3, shared_pg);
+    let c_shared = read_pte(child_cr3,  shared_pg);
+    if (p_shared & ADDR_MASK) != (shared_frame & ADDR_MASK) {
+        fail_teardown!("parent MAP_SHARED PTE no longer maps shared frame: pte={:#x} frame={:#x}",
+            p_shared, shared_frame);
+    }
+    if (c_shared & ADDR_MASK) != (shared_frame & ADDR_MASK) {
+        fail_teardown!("child MAP_SHARED PTE maps a DIFFERENT frame (demoted to private!): \
+            child_pte={:#x} parent_frame={:#x}", c_shared, shared_frame);
+    }
+    if p_shared & PAGE_WRITABLE == 0 {
+        fail_teardown!("parent MAP_SHARED PTE was write-protected by fork (CoW armed): pte={:#x}", p_shared);
+    }
+    if c_shared & PAGE_WRITABLE == 0 {
+        fail_teardown!("child MAP_SHARED PTE is read-only (CoW armed on shared page): pte={:#x}", c_shared);
+    }
+    test_println!("  (1) MAP_SHARED leaf: parent+child both map frame {:#x} WRITABLE ✓", shared_frame);
+
+    // (2) Cross-process store visibility: child's PTE resolves to shared_frame;
+    //     a store through it must be observed by the parent's mapping of the
+    //     SAME frame.  Both PTEs point at one frame, so write once and read via
+    //     each PTE's physical target.
+    let child_phys  = c_shared & ADDR_MASK;
+    let parent_phys = p_shared & ADDR_MASK;
+    // Parent must still see the pre-fork pattern through its frame.
+    let seen_by_parent = unsafe { core::ptr::read_volatile((PHYS_OFF + parent_phys) as *const u64) };
+    if seen_by_parent != pattern_a {
+        fail_teardown!("parent lost the pre-fork store: got {:#x} want {:#x}", seen_by_parent, pattern_a);
+    }
+    // Child writes a new pattern; parent must observe it (shared, not copied).
+    let pattern_b: u64 = 0x1357_CAFE_F00D_9999;
+    unsafe { core::ptr::write_volatile((PHYS_OFF + child_phys) as *mut u64, pattern_b); }
+    let seen_by_parent2 = unsafe { core::ptr::read_volatile((PHYS_OFF + parent_phys) as *const u64) };
+    if seen_by_parent2 != pattern_b {
+        fail_teardown!("child's store NOT visible to parent (MAP_SHARED incoherent!): \
+            parent sees {:#x}, child wrote {:#x}", seen_by_parent2, pattern_b);
+    }
+    test_println!("  (2) child store {:#x} observed by parent — store-visibility survives fork ✓", pattern_b);
+
+    // (3) MAP_PRIVATE: BOTH parent and child PTEs must be write-protected so the
+    //     next write traps and the page-fault handler installs a private copy.
+    let p_priv = read_pte(parent_cr3, private_pg);
+    let c_priv = read_pte(child_cr3,  private_pg);
+    if (p_priv & ADDR_MASK) != (private_frame & ADDR_MASK)
+        || (c_priv & ADDR_MASK) != (private_frame & ADDR_MASK)
+    {
+        fail_teardown!("MAP_PRIVATE PTE frame changed unexpectedly: parent={:#x} child={:#x} frame={:#x}",
+            p_priv, c_priv, private_frame);
+    }
+    if p_priv & PAGE_WRITABLE != 0 {
+        fail_teardown!("MAP_PRIVATE parent PTE still writable — CoW NOT armed (regression): pte={:#x}", p_priv);
+    }
+    if c_priv & PAGE_WRITABLE != 0 {
+        fail_teardown!("MAP_PRIVATE child PTE still writable — CoW NOT armed (regression): pte={:#x}", c_priv);
+    }
+    test_println!("  (3) MAP_PRIVATE leaf: parent+child both write-protected — CoW armed ✓");
+
+    // (4) Refcount: the shared frame gained the child's mapping (+1); the
+    //     private frame likewise tracks the second mapper until CoW splits it.
+    let shared_rc  = page_ref_count(shared_frame);
+    let private_rc = page_ref_count(private_frame);
+    if shared_rc < 2 {
+        fail_teardown!("shared frame refcount {} after fork (want >= 2 — child mapping not counted)", shared_rc);
+    }
+    if private_rc < 2 {
+        fail_teardown!("private frame refcount {} after fork (want >= 2 — CoW ref not counted)", private_rc);
+    }
+    test_println!("  (4) refcounts: shared={} private={} (both >= 2) ✓", shared_rc, private_rc);
+
+    // Teardown: both address spaces drop their mappings via the page-table walk,
+    // which decrements each frame's refcount; the last drop frees the frame.
+    crate::proc::free_vm_space(child);
+    crate::proc::free_vm_space(parent);
+
+    test_pass!("MAP_SHARED survives fork — cross-process store visibility");
     true
 }
 
@@ -40932,6 +41741,235 @@ fn test_502b_vfork_prepare_to_wait_race() -> bool {
     ok
 }
 
+// ── Test 515: waitid WNOWAIT peek + ECHILD-on-already-reaped ─────────────────
+//
+// Models the Firefox process-launcher reaping idiom that previously wedged the
+// parent's IPC-I/O thread (the gecko launcher does
+// `waitid(P_PID, h, WEXITED|WNOWAIT)` to OBSERVE the helper's exit, then a
+// second `waitid` to COLLECT it).  Two regressions are covered:
+//
+//   (1) WNOWAIT must PEEK the zombie's status and LEAVE it waitable, not reap
+//       it.  Before the fix, `waitid` ignored WNOWAIT and reaped on the first
+//       call, so the second call found the child gone.
+//
+//   (2) A blocking wait for a child that no longer exists (already reaped, or
+//       simply not a child) must return ECHILD IMMEDIATELY, never park on the
+//       `wake_tick == u64::MAX-1` sentinel that only a child *exit* can clear —
+//       which, for an already-dead child, can never arrive.  This is the
+//       lost-wakeup that hung the I/O thread forever and tripped the
+//       SCHEDULER_DEADLOCK bugcheck.
+//
+// Per POSIX `waitid(2)`: WNOWAIT "leave[s] the child in a waitable state"; and
+// `wait(2)`: waiting for a process that is not a child fails with ECHILD.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_515_waitid_wnowait_and_echild() -> bool {
+    use crate::proc::{PROCESS_TABLE, THREAD_TABLE, ProcessState};
+
+    test_header!("waitid WNOWAIT peek + ECHILD-on-already-reaped (POSIX waitid(2))");
+
+    // ── 1. Synthetic parent + child ──────────────────────────────────────
+    let parent_pid = match crate::proc::usermode::create_user_process(
+        "wnowait_parent", &crate::proc::hello_elf::HELLO_ELF
+    ) {
+        Ok(p) => p,
+        Err(e) => { test_fail!("waitid_wnowait", "create parent: {:?}", e); return false; }
+    };
+    let child_pid = match crate::proc::usermode::create_user_process(
+        "wnowait_child", &crate::proc::hello_elf::HELLO_ELF
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            { let mut procs = PROCESS_TABLE.lock(); procs.retain(|p| p.pid != parent_pid); }
+            { let mut threads = THREAD_TABLE.lock(); threads.retain(|t| t.pid != parent_pid); }
+            test_fail!("waitid_wnowait", "create child: {:?}", e); return false;
+        }
+    };
+
+    let cleanup = |pp: u64, cp: u64| {
+        let mut procs = PROCESS_TABLE.lock();
+        procs.retain(|p| p.pid != pp && p.pid != cp);
+        drop(procs);
+        let mut threads = THREAD_TABLE.lock();
+        threads.retain(|t| t.pid != pp && t.pid != cp);
+        drop(threads);
+        crate::proc::proc_metrics::unregister(pp);
+        crate::proc::proc_metrics::unregister(cp);
+    };
+
+    // Re-parent the child and make it a zombie with a recognisable code.
+    {
+        let mut procs = PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == child_pid) {
+            p.parent_pid = parent_pid;
+            p.state = ProcessState::Zombie;
+            p.exit_code = 0x515;
+        }
+    }
+
+    // ── 2. WNOWAIT must PEEK (leave the zombie in place) ──────────────────
+    match crate::proc::peek_zombie(parent_pid, child_pid as i64) {
+        Some((cp, code)) if cp == child_pid && code as u32 == 0x515 => {
+            test_println!("  WNOWAIT peek returned PID {} code {:#x} ✓", cp, code);
+        }
+        other => { cleanup(parent_pid, child_pid);
+            test_fail!("waitid_wnowait", "peek_zombie expected ({},0x515), got {:?}",
+                child_pid, other); return false; }
+    }
+    // The peeked zombie MUST still be present (not reaped).
+    {
+        let still = PROCESS_TABLE.lock().iter().any(|p|
+            p.pid == child_pid && p.state == ProcessState::Zombie);
+        if !still { cleanup(parent_pid, child_pid);
+            test_fail!("waitid_wnowait",
+                "WNOWAIT peek wrongly removed the zombie — second wait would hang");
+            return false; }
+    }
+    test_println!("  zombie still waitable after WNOWAIT peek ✓");
+
+    // A follow-up REAP must now collect it (the launcher's second waitid).
+    match crate::proc::waitpid(parent_pid, child_pid as i64) {
+        Some((cp, code)) if cp == child_pid && code as u32 == 0x515 => {
+            test_println!("  follow-up reap collected PID {} code {:#x} ✓", cp, code);
+        }
+        other => { cleanup(parent_pid, child_pid);
+            test_fail!("waitid_wnowait", "follow-up reap expected ({},0x515), got {:?}",
+                child_pid, other); return false; }
+    }
+
+    // ── 3. ECHILD: the child is gone now — a fresh wait must NOT find it ──
+    //     `has_matching_child` is the guard `sys_waitpid` consults before
+    //     parking; for an already-reaped specific pid it must be false so the
+    //     blocking path returns ECHILD instead of parking forever.
+    if crate::proc::has_matching_child(parent_pid, child_pid as i64) {
+        cleanup(parent_pid, child_pid);
+        test_fail!("waitid_wnowait",
+            "has_matching_child still true for reaped PID {} — wait would park forever",
+            child_pid);
+        return false;
+    }
+    // And a non-child pid must likewise be unmatched (immediate ECHILD).
+    if crate::proc::has_matching_child(parent_pid, (child_pid + 9999) as i64) {
+        cleanup(parent_pid, child_pid);
+        test_fail!("waitid_wnowait", "has_matching_child true for a non-child pid");
+        return false;
+    }
+    test_println!("  no matching child for reaped/non-child pid → ECHILD path ✓");
+
+    // ── 4. Cleanup (child already reaped; remove the synthetic parent) ────
+    { let mut procs = PROCESS_TABLE.lock(); procs.retain(|p| p.pid != parent_pid); }
+    { let mut threads = THREAD_TABLE.lock(); threads.retain(|t| t.pid != parent_pid); }
+    crate::proc::proc_metrics::unregister(parent_pid);
+
+    test_pass!("waitid WNOWAIT peek + ECHILD-on-already-reaped (POSIX waitid(2))");
+    true
+}
+
+// ── Test 516: waitid(2) siginfo_t byte layout (gecko IsProcessDead) ─────────
+//
+// The Firefox parent's `IsProcessDead` (ipc/chromium/src/base/
+// process_util_posix.cc) calls `waitid(P_PID, pid, &si, WEXITED|WNOWAIT)` to
+// OBSERVE a child's exit, then branches:
+//     if (si.si_pid == 0) return ProcessStatus::Running;   // not exited yet
+//     switch (si.si_code) { case CLD_EXITED: ...; }        // then reaps
+// If the kernel writes `si_pid` at the wrong byte offset, the reader sees a
+// zero `si_pid`, concludes the child is still running, and re-issues the
+// blocking `waitid(WNOWAIT)` forever — pinning the caller's thread (observed
+// as a >900M-call waitpid spin that starved Firefox's render reactor).
+//
+// This test verifies the *serialised bytes*, which the existing kernel-side
+// peek/reap test (515) never checked. Per POSIX.1-2017 `waitid(2)` and the
+// Linux `<asm-generic/siginfo.h>` x86-64 (LP64) layout: the three-int header
+// (si_signo@0, si_errno@4, si_code@8) is followed by the 8-byte-aligned
+// `_sifields` union at offset 16, whose `_sigchld` arm is _pid@16, _uid@20,
+// _status@24.
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+fn test_516_waitid_siginfo_layout() -> bool {
+    use crate::syscall::{
+        fill_sigchld_siginfo, SI_SIZE, SI_OFF_SIGNO, SI_OFF_CODE,
+        SI_OFF_PID, SI_OFF_UID, SI_OFF_STATUS, CLD_EXITED, CLD_KILLED,
+    };
+
+    test_header!("waitid(2) siginfo_t byte layout (POSIX waitid(2))");
+
+    let rd = |buf: &[u8; SI_SIZE], off: usize| -> i32 {
+        i32::from_ne_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]])
+    };
+
+    // ── 1. Normal exit (CLD_EXITED): child pid 4, status 0 (the FF case) ──
+    let mut si = [0u8; SI_SIZE];
+    fill_sigchld_siginfo(&mut si, CLD_EXITED, 4, 0, 0);
+
+    // si_pid MUST be at offset 16 (the bug wrote it at 12). gecko reads here.
+    if rd(&si, SI_OFF_PID) != 4 {
+        test_fail!("waitid_siginfo", "si_pid@{} = {} (want 4) — gecko sees Running, spins",
+            SI_OFF_PID, rd(&si, SI_OFF_PID));
+        return false;
+    }
+    // The old-bug offset (12) MUST be zero now (it's union padding).
+    if rd(&si, 12) != 0 {
+        test_fail!("waitid_siginfo", "offset 12 = {} (want 0 padding); si_pid leaked here",
+            rd(&si, 12));
+        return false;
+    }
+    if rd(&si, SI_OFF_SIGNO) != 17 {
+        test_fail!("waitid_siginfo", "si_signo@0 = {} (want 17=SIGCHLD)", rd(&si, SI_OFF_SIGNO));
+        return false;
+    }
+    if rd(&si, SI_OFF_CODE) != CLD_EXITED {
+        test_fail!("waitid_siginfo", "si_code@8 = {} (want CLD_EXITED=1)", rd(&si, SI_OFF_CODE));
+        return false;
+    }
+    if rd(&si, SI_OFF_STATUS) != 0 {
+        test_fail!("waitid_siginfo", "si_status@24 = {} (want 0)", rd(&si, SI_OFF_STATUS));
+        return false;
+    }
+    test_println!("  CLD_EXITED: si_pid@16=4, si_code@8=1, si_status@24=0, pad@12=0 ✓");
+
+    // ── 2. Non-zero exit status is placed at offset 24, low 8 bits ────────
+    fill_sigchld_siginfo(&mut si, CLD_EXITED, 7, 0, 42);
+    if rd(&si, SI_OFF_PID) != 7 || rd(&si, SI_OFF_STATUS) != 42 {
+        test_fail!("waitid_siginfo", "exit status: si_pid@16={} si_status@24={} (want 7,42)",
+            rd(&si, SI_OFF_PID), rd(&si, SI_OFF_STATUS));
+        return false;
+    }
+    test_println!("  CLD_EXITED status 42: si_pid@16=7, si_status@24=42 ✓");
+
+    // ── 3. Killed-by-signal: si_code=CLD_KILLED, si_status=signal number ──
+    // (The kernel maps a `-signo` exit_code to CLD_KILLED + signo.)
+    let (code, status) = crate::syscall::test_exit_code_to_siginfo(-9); // SIGKILL
+    fill_sigchld_siginfo(&mut si, code, 5, 1000, status);
+    if rd(&si, SI_OFF_CODE) != CLD_KILLED || rd(&si, SI_OFF_STATUS) != 9 {
+        test_fail!("waitid_siginfo", "killed: si_code@8={} si_status@24={} (want 2,9)",
+            rd(&si, SI_OFF_CODE), rd(&si, SI_OFF_STATUS));
+        return false;
+    }
+    if rd(&si, SI_OFF_UID) != 1000 {
+        test_fail!("waitid_siginfo", "si_uid@20 = {} (want 1000)", rd(&si, SI_OFF_UID));
+        return false;
+    }
+    test_println!("  CLD_KILLED(SIGKILL): si_code@8=2, si_status@24=9, si_uid@20=1000 ✓");
+
+    // ── 4. The struct is fully zeroed outside the written fields (no leak) ─
+    // Every 4-byte word except {0,8,16,20,24} must be zero (offsets 4,12 and
+    // 28..124).
+    let mut leaked = false;
+    let mut off = 0;
+    while off + 4 <= SI_SIZE {
+        let is_written = off == SI_OFF_SIGNO || off == SI_OFF_CODE
+            || off == SI_OFF_PID || off == SI_OFF_UID || off == SI_OFF_STATUS;
+        if !is_written && rd(&si, off) != 0 { leaked = true; break; }
+        off += 4;
+    }
+    if leaked {
+        test_fail!("waitid_siginfo", "stale bytes leaked at offset {} (want fully zeroed pad)", off);
+        return false;
+    }
+    test_println!("  padding/union tail fully zeroed (no stack-byte leak) ✓");
+
+    test_pass!("waitid(2) siginfo_t byte layout (POSIX waitid(2))");
+    true
+}
+
 // ── Test 232: VFS write-path page-cache coherency (POSIX mmap+write) ──────
 //
 // Regression test for the cache-coherency gap discovered while
@@ -41317,6 +42355,167 @@ fn test_234_cache_update_range_boundaries() -> bool {
     true
 }
 
+// ── Test 241: ramfs/tmpfs/memfd mmap ↔ read(2) coherency ──────────────────
+//
+// Regression guard for the REVERSE-direction page-cache coherence bug on the
+// in-memory backends (ramfs / tmpfs / memfd).  On those backends an inode keeps
+// its own `Vec<u8>` storage, and once a page is demand-faulted by an
+// `mmap(MAP_SHARED)` the file ALSO has a page-cache frame.  A store through the
+// shared mapping lands in the page-cache frame but never touches the inode
+// `Vec`.  Before `mm::cache::read_through`, `read(2)` consulted only the `Vec`
+// (`fs.read`), so it returned stale (pre-store) bytes — Mozilla's `/dev/shm`
+// IPC SharedMemory stages bytes through the mapping that the peer reads back via
+// `read(2)`, so the peer saw zeros and dereferenced a NULL IPC object pointer.
+//
+// This test models the bug at the kernel API without a full userspace process:
+//   1. Create a tmpfs/ramfs file and `write_file` a known pattern (populates the
+//      inode `Vec`).
+//   2. Allocate a page-cache frame for page 0, seed it from the `Vec` (mirrors
+//      the mmap demand-fault seeding from `fs.read`), and `cache::insert` it —
+//      the file is now "mmap'd": one shared cache frame backs page 0.
+//   3. Store a DIFFERENT pattern directly into the cache frame through the
+//      higher-half map — this is exactly what a `MAP_SHARED`+`PROT_WRITE` store
+//      does (it writes the mapped physical frame, NOT the inode `Vec`).
+//   4. `read(2)` the file via `fd_read` and assert it returns the STORE pattern,
+//      not the original `write_file` pattern.
+//
+// Pre-fix: step 4 returns the original pattern (FAIL — `fs.read` reads the
+// stale `Vec`).  Post-fix: `read_through` overlays the cache frame, so step 4
+// returns the store pattern (PASS).
+//
+// POSIX mmap(2): a write through a MAP_SHARED region is a write to the
+// underlying file object and shall be visible to a subsequent `read(2)` of the
+// same file.
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+fn test_241_ramfs_mmap_read_coherency() -> bool {
+    test_header!("ramfs/tmpfs mmap ↔ read(2) coherency (reverse direction)");
+
+    const PHYS_OFF: u64 = 0xFFFF_8000_0000_0000;
+    let path = "/tmp/test241_mmap_read.bin";
+    let pid = crate::proc::current_pid();
+
+    let _ = crate::vfs::remove(path);
+    if let Err(e) = crate::vfs::create_file(path) {
+        test_fail!("test241", "create_file failed: {:?}", e);
+        return false;
+    }
+
+    // (1) Seed the inode Vec with the ORIGINAL pattern (one full page of 'A').
+    let original: alloc::vec::Vec<u8> = alloc::vec![b'A'; 4096];
+    if let Err(e) = crate::vfs::write_file(path, &original) {
+        test_fail!("test241", "write_file failed: {:?}", e);
+        let _ = crate::vfs::remove(path);
+        return false;
+    }
+
+    let (mount_idx, inode) = match crate::vfs::resolve_path(path) {
+        Ok(r) => r,
+        Err(e) => {
+            test_fail!("test241", "resolve_path failed: {:?}", e);
+            let _ = crate::vfs::remove(path);
+            return false;
+        }
+    };
+
+    // (2) "Demand-fault" page 0: allocate a frame, seed it from the Vec (as the
+    //     mmap fault path does via fs.read), and install it in the cache.  The
+    //     file is now mmap-resident: this frame is the shared MAP_SHARED page.
+    let phys = match crate::mm::pmm::alloc_page() {
+        Some(p) => p,
+        None => {
+            test_fail!("test241", "pmm alloc_page failed");
+            let _ = crate::vfs::remove(path);
+            return false;
+        }
+    };
+    let frame = (PHYS_OFF + phys) as *mut u8;
+    unsafe { core::ptr::copy_nonoverlapping(original.as_ptr(), frame, 4096); }
+    crate::mm::cache::insert(mount_idx, inode, 0, phys);
+
+    // (3) Store a DIFFERENT pattern ('B') through the shared frame — exactly
+    //     what a MAP_SHARED+PROT_WRITE store does (writes the frame, not the Vec).
+    unsafe { core::ptr::write_bytes(frame, b'B', 4096); }
+
+    // (4) read(2) the file and require the mmap'd store to be visible.
+    let fd = match crate::vfs::open(pid, path, 0 /*O_RDONLY*/) {
+        Ok(f) => f,
+        Err(e) => {
+            test_fail!("test241", "open failed: {:?}", e);
+            let _ = crate::mm::cache::evict(mount_idx, inode, 0);
+            let _ = crate::vfs::remove(path);
+            return false;
+        }
+    };
+    let mut readbuf = [0u8; 4096];
+    let n = crate::vfs::fd_read(pid, fd, readbuf.as_mut_ptr(), readbuf.len());
+    let _ = crate::vfs::close(pid, fd);
+
+    let read_ok = match n {
+        Ok(got) => got == 4096 && readbuf.iter().all(|&b| b == b'B'),
+        Err(e) => {
+            test_fail!("test241", "fd_read failed: {:?}", e);
+            false
+        }
+    };
+
+    // Cleanup: the cache holds a reference on `phys`; evict releases it.
+    if let Some(p) = crate::mm::cache::evict(mount_idx, inode, 0) {
+        crate::mm::pmm::free_page(p);
+    }
+    let _ = crate::vfs::remove(path);
+
+    if !read_ok {
+        // Report what the read returned so a regression is diagnosable: a 'A'
+        // page is the stale-Vec (pre-fix) failure; anything else is a deeper bug.
+        let first = readbuf[0];
+        let last = readbuf[4095];
+        test_fail!("test241",
+            "read(2) did not observe the MAP_SHARED store: buf[0]={:#x} buf[4095]={:#x} \
+             (expected all 'B' {:#x}; 'A' {:#x} means read still served the stale inode Vec)",
+            first, last, b'B', b'A');
+        return false;
+    }
+    test_println!("  store-through-mapping ('B') visible to read(2) ✓");
+
+    // Forward-direction regression guard: a write(2) to the same file must also
+    // remain visible (update_range keeps the cache frame coherent on writes).
+    // Re-create, re-seed a cache page, write through fd_write, read back.
+    let _ = crate::vfs::create_file(path);
+    let _ = crate::vfs::write_file(path, &original); // page of 'A'
+    let (mi2, in2) = match crate::vfs::resolve_path(path) {
+        Ok(r) => r,
+        Err(_) => { let _ = crate::vfs::remove(path); test_pass!("ramfs mmap ↔ read(2) coherency"); return true; }
+    };
+    if let Some(phys2) = crate::mm::pmm::alloc_page() {
+        let f2 = (PHYS_OFF + phys2) as *mut u8;
+        unsafe { core::ptr::write_bytes(f2, b'A', 4096); }
+        crate::mm::cache::insert(mi2, in2, 0, phys2);
+        // write(2) 'C' over the first 100 bytes via fd_write.
+        let cbytes: alloc::vec::Vec<u8> = alloc::vec![b'C'; 100];
+        if let Ok(wfd) = crate::vfs::open(pid, path, 0x1 /*O_WRONLY*/) {
+            let _ = crate::vfs::fd_write(pid, wfd, cbytes.as_ptr(), cbytes.len());
+            let _ = crate::vfs::close(pid, wfd);
+        }
+        // The cache frame must now show 'C' in [0,100) (update_range) and the
+        // overlaid read must agree.
+        let cache_c = unsafe { *f2 } == b'C' && unsafe { *f2.add(99) } == b'C'
+            && unsafe { *f2.add(100) } == b'A';
+        if let Some(p) = crate::mm::cache::evict(mi2, in2, 0) {
+            crate::mm::pmm::free_page(p);
+        }
+        if !cache_c {
+            test_fail!("test241", "forward direction: write(2) did not propagate to cache frame");
+            let _ = crate::vfs::remove(path);
+            return false;
+        }
+        test_println!("  write(2) ('C') propagated into cache frame ✓");
+    }
+    let _ = crate::vfs::remove(path);
+
+    test_pass!("ramfs mmap ↔ read(2) coherency");
+    true
+}
+
 // ── Test 240: VFS truncate / page-cache coherency ────────────────────────
 //
 // Regression guard for the truncate-path page-cache coherence bug: prior
@@ -41607,7 +42806,7 @@ fn test_238_futex_wake_ghost_cluster() -> bool {
     {
         let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
         waiters
-            .entry((pid, uaddr_sibling))
+            .entry(crate::syscall::FutexKey::Private(pid, uaddr_sibling))
             .or_insert_with(alloc::vec::Vec::new)
             .push(fake_tid);
     }
@@ -41616,7 +42815,7 @@ fn test_238_futex_wake_ghost_cluster() -> bool {
     {
         let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
         waiters
-            .entry((pid, uaddr_far))
+            .entry(crate::syscall::FutexKey::Private(pid, uaddr_far))
             .or_insert_with(alloc::vec::Vec::new)
             .push(fake_tid.wrapping_add(1));
     }
@@ -41637,8 +42836,8 @@ fn test_238_futex_wake_ghost_cluster() -> bool {
     // regardless of pass/fail (subsequent tests must not see fake_tid).
     {
         let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
-        let _ = waiters.remove(&(pid, uaddr_sibling));
-        let _ = waiters.remove(&(pid, uaddr_far));
+        let _ = waiters.remove(&crate::syscall::FutexKey::Private(pid, uaddr_sibling));
+        let _ = waiters.remove(&crate::syscall::FutexKey::Private(pid, uaddr_far));
     }
 
     let post = crate::subsys::linux::syscall::FUTEX_WAKE_GHOST_COUNT
@@ -41735,7 +42934,7 @@ fn test_239_futex_cluster_wake_compensation() -> bool {
     let install = |uaddr: u64, tid: u64| {
         let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
         waiters
-            .entry((pid, uaddr))
+            .entry(crate::syscall::FutexKey::Private(pid, uaddr))
             .or_insert_with(alloc::vec::Vec::new)
             .push(tid);
     };
@@ -41743,7 +42942,7 @@ fn test_239_futex_cluster_wake_compensation() -> bool {
     // doesn't see fake TIDs in subsequent tests.
     let drain = |uaddr: u64| {
         let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
-        let _ = waiters.remove(&(pid, uaddr));
+        let _ = waiters.remove(&crate::syscall::FutexKey::Private(pid, uaddr));
     };
 
     // ── (a) Positive control: canonical-offset wake ─────────────────────
@@ -44740,8 +45939,8 @@ fn test_268_exit_group_clears_sibling_cleartid() -> bool {
     }
     {
         let waiters = crate::syscall::FUTEX_WAITERS.lock();
-        if waiters.contains_key(&(SYNTH_PID, UADDR_A))
-        || waiters.contains_key(&(SYNTH_PID, UADDR_B))
+        if waiters.contains_key(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_A))
+        || waiters.contains_key(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_B))
         {
             test_fail!("test268",
                 "synthetic FUTEX_WAITERS keys already present — test \
@@ -44833,11 +46032,11 @@ fn test_268_exit_group_clears_sibling_cleartid() -> bool {
         let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
         let mut v = alloc::vec::Vec::new();
         v.push(SYNTH_WAITER);
-        waiters.insert((SYNTH_PID, UADDR_A), v);
+        waiters.insert(crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_A), v);
         // A second key with NO waiters parked — proves the helper does
         // not leak per-(pid,uaddr) entries when the wake list is empty
         // (the `futex_wake_for_exit` no-op branch).
-        waiters.insert((SYNTH_PID, UADDR_B), alloc::vec::Vec::new());
+        waiters.insert(crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_B), alloc::vec::Vec::new());
     }
 
     // Phase 2: exercise the helper.
@@ -44854,8 +46053,8 @@ fn test_268_exit_group_clears_sibling_cleartid() -> bool {
         let pa = find(SYNTH_SIB_A);
         let pb = find(SYNTH_SIB_B);
         let pw = find(SYNTH_WAITER);
-        let wa = waiters.contains_key(&(SYNTH_PID, UADDR_A));
-        let wb = waiters.contains_key(&(SYNTH_PID, UADDR_B));
+        let wa = waiters.contains_key(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_A));
+        let wb = waiters.contains_key(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_B));
         let ws = pw.map(|(_, _, _, s)| s);
         (pa, pb, pw, wa, wb, ws)
     };
@@ -44869,8 +46068,8 @@ fn test_268_exit_group_clears_sibling_cleartid() -> bool {
     }
     {
         let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
-        waiters.remove(&(SYNTH_PID, UADDR_A));
-        waiters.remove(&(SYNTH_PID, UADDR_B));
+        waiters.remove(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_A));
+        waiters.remove(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_B));
     }
 
     if sched_was_active { crate::sched::enable(); }
@@ -45039,8 +46238,8 @@ fn test_269_sigkill_clears_sibling_cleartid() -> bool {
     }
     {
         let waiters = crate::syscall::FUTEX_WAITERS.lock();
-        if waiters.contains_key(&(SYNTH_PID, UADDR_A))
-        || waiters.contains_key(&(SYNTH_PID, UADDR_B))
+        if waiters.contains_key(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_A))
+        || waiters.contains_key(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_B))
         {
             test_fail!("test269",
                 "synthetic FUTEX_WAITERS keys already present — test \
@@ -45103,11 +46302,11 @@ fn test_269_sigkill_clears_sibling_cleartid() -> bool {
         let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
         let mut v = alloc::vec::Vec::new();
         v.push(SYNTH_WAITER);
-        waiters.insert((SYNTH_PID, UADDR_A), v);
+        waiters.insert(crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_A), v);
         // Empty-list key: proves the no-op wake path also removes the
         // key (mirrors Test 268; redundant validation that the helper
         // contract holds across two synthetic groups).
-        waiters.insert((SYNTH_PID, UADDR_B), alloc::vec::Vec::new());
+        waiters.insert(crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_B), alloc::vec::Vec::new());
     }
 
     // Exercise: this is the EXACT call the lethal-signal path now makes
@@ -45125,8 +46324,8 @@ fn test_269_sigkill_clears_sibling_cleartid() -> bool {
         let pa = find(SYNTH_SIB_A);
         let pb = find(SYNTH_SIB_B);
         let pw = find(SYNTH_WAITER);
-        let wa = waiters.contains_key(&(SYNTH_PID, UADDR_A));
-        let wb = waiters.contains_key(&(SYNTH_PID, UADDR_B));
+        let wa = waiters.contains_key(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_A));
+        let wb = waiters.contains_key(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_B));
         let ws = pw.map(|(_, _, _, s)| s);
         (pa, pb, pw, wa, wb, ws)
     };
@@ -45140,8 +46339,8 @@ fn test_269_sigkill_clears_sibling_cleartid() -> bool {
     }
     {
         let mut waiters = crate::syscall::FUTEX_WAITERS.lock();
-        waiters.remove(&(SYNTH_PID, UADDR_A));
-        waiters.remove(&(SYNTH_PID, UADDR_B));
+        waiters.remove(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_A));
+        waiters.remove(&crate::syscall::FutexKey::Private(SYNTH_PID, UADDR_B));
     }
 
     if sched_was_active { crate::sched::enable(); }
@@ -47216,6 +48415,86 @@ fn test_288_scm_memfd_inode_lifecycle() -> bool {
     true
 }
 
+// ── Test 296: /proc/self/fd/<N> re-opens an unlinked memfd ───────────────────
+// Reproduces the Mozilla shared-memory "read-only dup" idiom at the kernel
+// layer: memfd_create(2) (which unlinks the backing object), write a marker,
+// then open("/proc/self/fd/<memfd>", O_RDONLY) and assert (a) the open
+// SUCCEEDS — not ENOENT against the now-unlinked name — and (b) the re-opened
+// handle reads back the SAME bytes from offset 0 (re-opened the open file
+// description, not a path).  Also asserts inode lifetime: the bytes are still
+// readable through the re-opened fd after the ORIGINAL memfd fd is closed,
+// since the re-opened fd holds the (unlinked) inode alive.
+// Refs: proc(5) /proc/[pid]/fd, memfd_create(2).
+fn test_296_proc_fd_reopen_unlinked_memfd() -> bool {
+    test_header!("/proc/self/fd/<N> re-opens an unlinked memfd (Test 296)");
+    const MFD_CLOEXEC: u64 = 0x0001;
+
+    let fd = crate::subsys::linux::syscall::sys_memfd_create_test(0, MFD_CLOEXEC);
+    if fd < 0 {
+        test_fail!("proc_fd_reopen", "memfd_create returned {}", fd);
+        return false;
+    }
+    let marker = [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let wn = crate::syscall::sys_write_test(fd as usize, marker.as_ptr(), marker.len());
+    if wn != marker.len() as i64 {
+        test_fail!("proc_fd_reopen", "write to memfd = {} (want {})", wn, marker.len());
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+
+    // Build "/proc/self/fd/<fd>" and open it O_RDONLY — the failing idiom.
+    let mut path = alloc::string::String::from("/proc/self/fd/");
+    path.push_str(&alloc::format!("{}", fd));
+    let ro_fd = crate::syscall::sys_open_test(&path, crate::vfs::flags::O_RDONLY);
+    if ro_fd < 0 {
+        test_fail!("proc_fd_reopen",
+            "open(\"{}\", O_RDONLY) = {} (expected fd >= 0; the unlinked memfd \
+             must be re-openable via its /proc/self/fd magic symlink)", path, ro_fd);
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        return false;
+    }
+    test_println!("  open(\"{}\", O_RDONLY) = {} ✓", path, ro_fd);
+
+    // The re-opened handle must read the SAME bytes from offset 0.
+    let mut rbuf = [0u8; 8];
+    let rn = crate::syscall::sys_read_test(ro_fd as usize, rbuf.as_mut_ptr(), rbuf.len());
+    if rn != marker.len() as i64 {
+        test_fail!("proc_fd_reopen", "read(reopen) = {} (want {})", rn, marker.len());
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        crate::subsys::linux::syscall::sys_close_test(ro_fd as u64);
+        return false;
+    }
+    if rbuf != marker {
+        test_fail!("proc_fd_reopen",
+            "read(reopen) content {:?} != written {:?} (re-open targeted the wrong inode)",
+            rbuf, marker);
+        crate::subsys::linux::syscall::sys_close_test(fd as u64);
+        crate::subsys::linux::syscall::sys_close_test(ro_fd as u64);
+        return false;
+    }
+    test_println!("  re-opened fd reads back the same {} bytes from offset 0 ✓", rn);
+
+    // Close the ORIGINAL memfd fd; the unlinked inode must stay alive because
+    // the re-opened fd still references it.
+    crate::subsys::linux::syscall::sys_close_test(fd as u64);
+    let mut rbuf2 = [0u8; 8];
+    let rn2 = crate::syscall::sys_read_test(ro_fd as usize, rbuf2.as_mut_ptr(), rbuf2.len());
+    // The re-opened fd's own offset is now 8 (already read), so a second read of
+    // a fresh handle is needed to re-confirm content; assert the inode survived
+    // (read does not error with EBADF/ENOENT and returns 0 at EOF, not an error).
+    if rn2 < 0 {
+        test_fail!("proc_fd_reopen",
+            "post-original-close read errored ({}) — inode freed while re-opened fd is live", rn2);
+        crate::subsys::linux::syscall::sys_close_test(ro_fd as u64);
+        return false;
+    }
+    test_println!("  inode survives original-memfd close via the re-opened fd ✓");
+
+    crate::subsys::linux::syscall::sys_close_test(ro_fd as u64);
+    test_pass!("/proc/self/fd/<N> re-opens an unlinked memfd (Test 296)");
+    true
+}
+
 // ── Test 289: SCM_RIGHTS fds bind to the FIRST byte of their frame ───────────
 //
 // sendmsg(2) on an AF_UNIX SOCK_STREAM that carries BOTH data and SCM_RIGHTS
@@ -47908,6 +49187,419 @@ fn test_293_epoll_listening_unix_has_pending() -> bool {
 
     if ok {
         test_pass!("epoll EPOLLIN parity on listening AF_UNIX with pending connection (Test 293)");
+    }
+    ok
+}
+
+// ── Test 294: epoll EPOLLET edge-trigger on a level-ready eventfd ─────────────
+//
+// Regression guard for the gecko main-MessagePump epoll spin: a wakeup eventfd
+// registered with EPOLLET that stays level-ready (counter never drained to 0)
+// must be reported EPOLLIN on its rising edge ONCE, then suppressed on
+// subsequent epoll_wait calls — NOT re-delivered on every call (which under a
+// purely level-triggered implementation pins the polling thread at 100% CPU).
+// Draining the eventfd and re-writing it re-arms a fresh edge.
+//
+// Refs: epoll(7) "Level-triggered and edge-triggered notification",
+// epoll_ctl(2), epoll_wait(2), eventfd(2).
+fn test_294_epoll_edge_triggered_eventfd() -> bool {
+    test_header!("epoll EPOLLET edge-trigger on a level-ready eventfd (Test 294)");
+    let dispatch = crate::syscall::dispatch_linux_kernel;
+
+    // Linux ABI for this process (epoll/eventfd are Linux-personality syscalls).
+    let pid = crate::proc::current_pid();
+    {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            p.linux_abi = true;
+            p.subsystem = crate::win32::SubsystemType::Linux;
+        }
+    }
+
+    fn make_ev(events: u32, data: u64) -> [u8; 12] {
+        let mut b = [0u8; 12];
+        b[0..4].copy_from_slice(&events.to_le_bytes());
+        b[4..12].copy_from_slice(&data.to_le_bytes());
+        b
+    }
+    fn ev_events(b: &[u8; 12]) -> u32 {
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    }
+
+    const EPOLLIN: u32 = 0x0001;
+    const EPOLLET: u32 = 1 << 31;
+    const CTL_ADD: u64 = 1;
+    // eventfd2 / epoll syscall numbers (Linux x86-64 ABI).
+    const SYS_EPOLL_CTL:    u64 = 233;
+    const SYS_EPOLL_WAIT:   u64 = 232;
+    const SYS_EPOLL_CREATE: u64 = 291; // epoll_create1
+    const SYS_EVENTFD2:     u64 = 290;
+    const SYS_CLOSE:        u64 = 3;
+    const SYS_READ:         u64 = 0;
+    const SYS_WRITE:        u64 = 1;
+
+    let mut ok = true;
+
+    // eventfd2(initval=0, flags=0) → a fresh counter-zero eventfd.
+    let efd = dispatch(SYS_EVENTFD2, 0, 0, 0, 0, 0, 0);
+    if efd < 0 {
+        test_fail!("epollet", "eventfd2 = {}", efd);
+        return false;
+    }
+    let epfd = dispatch(SYS_EPOLL_CREATE, 0, 0, 0, 0, 0, 0);
+    if epfd < 0 {
+        test_fail!("epollet", "epoll_create1 = {}", epfd);
+        let _ = dispatch(SYS_CLOSE, efd as u64, 0, 0, 0, 0, 0);
+        return false;
+    }
+
+    // Register the eventfd EPOLLIN|EPOLLET.
+    {
+        let ev = make_ev(EPOLLIN | EPOLLET, 0xE7);
+        let r = dispatch(SYS_EPOLL_CTL, epfd as u64, CTL_ADD, efd as u64, ev.as_ptr() as u64, 0, 0);
+        if r != 0 {
+            test_fail!("epollet", "epoll_ctl(ADD, ET) = {}", r);
+            ok = false;
+        }
+    }
+
+    // Write 1 to the eventfd → counter 0→1: the rising edge.  (We deliberately
+    // never read the eventfd, so it stays level-ready throughout.)
+    {
+        let v: u64 = 1;
+        let r = dispatch(SYS_WRITE, efd as u64, (&v as *const u64) as u64, 8, 0, 0, 0);
+        if r != 8 {
+            test_fail!("epollet", "write(eventfd, 1) = {} (want 8)", r);
+            ok = false;
+        }
+    }
+
+    // First epoll_wait(timeout=0): MUST deliver the rising-edge EPOLLIN once.
+    {
+        let mut buf = [[0u8; 12]; 4];
+        let r = dispatch(SYS_EPOLL_WAIT, epfd as u64, buf[0].as_mut_ptr() as u64, 4, 0, 0, 0);
+        if r == 1 && ev_events(&buf[0]) & EPOLLIN != 0 {
+            test_println!("  wait#1 → 1 event EPOLLIN (rising edge delivered) ✓");
+        } else {
+            test_fail!("epollet", "wait#1 r={} events={:#x} (want 1 / EPOLLIN)",
+                r, ev_events(&buf[0]));
+            ok = false;
+        }
+    }
+
+    // Second epoll_wait(timeout=0): the eventfd is STILL level-ready (counter
+    // never drained), but under EPOLLET the edge was already consumed → MUST
+    // return 0.  A purely level-triggered kernel returns 1 here forever — the
+    // spin this fix closes.
+    {
+        let mut buf = [[0u8; 12]; 4];
+        let r = dispatch(SYS_EPOLL_WAIT, epfd as u64, buf[0].as_mut_ptr() as u64, 4, 0, 0, 0);
+        if r == 0 {
+            test_println!("  wait#2 → 0 events (edge already consumed, no re-report) ✓");
+        } else {
+            test_fail!("epollet",
+                "wait#2 r={} events={:#x} — EPOLLET fd re-reported while level-ready (spin bug)",
+                r, ev_events(&buf[0]));
+            ok = false;
+        }
+    }
+
+    // Drain the eventfd (read → counter back to 0) then re-write → fresh edge.
+    {
+        let mut rbuf = [0u8; 8];
+        let r = dispatch(SYS_READ, efd as u64, rbuf.as_mut_ptr() as u64, 8, 0, 0, 0);
+        if r != 8 {
+            test_fail!("epollet", "read(eventfd) = {} (want 8 to drain)", r);
+            ok = false;
+        }
+        let v: u64 = 1;
+        let _ = dispatch(SYS_WRITE, efd as u64, (&v as *const u64) as u64, 8, 0, 0, 0);
+    }
+
+    // Third epoll_wait: the drain-then-write produced a NEW rising edge → MUST
+    // deliver EPOLLIN once again (proves re-arm works, not a one-shot latch).
+    {
+        let mut buf = [[0u8; 12]; 4];
+        let r = dispatch(SYS_EPOLL_WAIT, epfd as u64, buf[0].as_mut_ptr() as u64, 4, 0, 0, 0);
+        if r == 1 && ev_events(&buf[0]) & EPOLLIN != 0 {
+            test_println!("  wait#3 → 1 event EPOLLIN (re-armed after drain+write) ✓");
+        } else {
+            test_fail!("epollet", "wait#3 r={} events={:#x} (want 1 / EPOLLIN re-arm)",
+                r, ev_events(&buf[0]));
+            ok = false;
+        }
+    }
+
+    let _ = dispatch(SYS_CLOSE, epfd as u64, 0, 0, 0, 0, 0);
+    let _ = dispatch(SYS_CLOSE, efd as u64, 0, 0, 0, 0, 0);
+
+    if ok {
+        test_pass!("epoll EPOLLET edge-trigger on a level-ready eventfd (Test 294)");
+    }
+    ok
+}
+
+// ── Test 295: cross-process SHARED futex keying (memfd MAP_SHARED) ───────────
+//
+// Per futex(2) (FUTEX_PRIVATE_FLAG): a process-SHARED futex names a backing
+// object, not a virtual address.  Two processes that map the same file/memfd
+// MAP_SHARED page at DIFFERENT virtual addresses must rendezvous — a
+// FUTEX_WAIT in process A and the matching FUTEX_WAKE in process B operate on
+// the same logical futex word, so the kernel must key both by the backing
+// object identity (mount_idx, inode, byte offset), NOT by (pid, uaddr).  This
+// is the gecko cross-process screenshot-rendezvous case (a CrossProcessSemaphore
+// on a memfd MAP_SHARED page: content process waits, parent wakes).
+//
+// The test builds two synthetic processes whose VmSpaces each contain a
+// MAP_SHARED VMA backed by the SAME (mount_idx, inode) at DIFFERENT virtual
+// addresses, then asserts:
+//   (a) resolve_futex_key produces the SAME Shared key for both — the
+//       cross-process rendezvous identity;
+//   (b) a waiter enqueued under process A's resolved key is found and woken by
+//       a FUTEX_WAKE issued by process B (proving the cross-process bucket
+//       hit, the actual screenshot-IPC unblock);
+//   (c) the PRIVATE fast path is preserved — a MAP_PRIVATE/anon word and a
+//       FUTEX_PRIVATE_FLAG'd shared word both resolve to per-(pid, uaddr)
+//       Private keys, so two processes at the same VA do NOT collide.
+//
+// Refs: futex(2) FUTEX_PRIVATE_FLAG, memfd_create(2),
+//       POSIX.1-2017 §pthread_mutexattr_getpshared.
+fn test_295_crossproc_shared_futex_keying() -> bool {
+    use crate::syscall::{FUTEX_WAITERS, FutexKey, resolve_futex_key};
+    use crate::mm::vma::{VmArea, VmBacking, VmSpace,
+                         MAP_SHARED, MAP_PRIVATE, MAP_ANONYMOUS,
+                         PROT_READ, PROT_WRITE};
+
+    test_header!("cross-process SHARED futex keying (memfd MAP_SHARED rendezvous, Test 295)");
+
+    // Synthetic pids / shared backing identity.  The (mount_idx, inode) below
+    // names a single backing object the two processes both map.
+    const PID_A: u64 = 0xC0DE_2950;
+    const PID_B: u64 = 0xC0DE_2951;
+    const SHARED_MOUNT: usize = 0x295;
+    const SHARED_INODE: u64   = 0x2950_BEEF;
+    // The two processes map the shared object at DIFFERENT virtual addresses —
+    // the crux of the test.  Both place a 1-page MAP_SHARED VMA over the same
+    // file offset 0 so the futex word at +0x40 in each maps the same backing
+    // byte.
+    const VA_A: u64 = 0x5000_0000;   // process A's mapping VA
+    const VA_B: u64 = 0x6800_0000;   // process B's mapping VA (different!)
+    const WORD_OFF: u64 = 0x40;      // futex word offset within the shared page
+    // A private anonymous word both processes happen to place at the SAME VA —
+    // used to prove private futexes do NOT collide across processes.
+    const PRIV_VA: u64 = 0x7000_0000;
+    let fake_tid: u64 = 0x2950_F00D;
+
+    // Build a VmSpace with a MAP_SHARED file-backed VMA over [base, base+page)
+    // plus a MAP_PRIVATE anon VMA at PRIV_VA.  Returns the new cr3 or None.
+    fn build_space(base: u64) -> Option<(VmSpace, u64)> {
+        let mut vm = VmSpace::new_user()?;
+        let cr3 = vm.cr3;
+        // MAP_SHARED file/memfd-backed page.
+        vm.insert_vma(VmArea {
+            base,
+            length: 0x1000,
+            prot: PROT_READ | PROT_WRITE,
+            flags: MAP_SHARED,
+            backing: VmBacking::File {
+                mount_idx: SHARED_MOUNT,
+                inode: SHARED_INODE,
+                offset: 0,
+                elf_load_delta: 0,
+            },
+            name: "[test-shm]",
+        }).ok()?;
+        // MAP_PRIVATE anonymous page at the fixed PRIV_VA.
+        vm.insert_vma(VmArea {
+            base: PRIV_VA,
+            length: 0x1000,
+            prot: PROT_READ | PROT_WRITE,
+            flags: MAP_PRIVATE | MAP_ANONYMOUS,
+            backing: VmBacking::Anonymous,
+            name: "[test-priv]",
+        }).ok()?;
+        Some((vm, cr3))
+    }
+
+    // Register a synthetic process holding `vm` under `pid` so the resolver's
+    // PROCESS_TABLE VMA lookup succeeds.
+    fn register_proc(pid: u64, cr3: u64, vm: VmSpace) {
+        let mut procs = crate::proc::PROCESS_TABLE.lock();
+        procs.push(crate::proc::Process {
+            pid,
+            parent_pid: 0,
+            name: { let mut n = [0u8; 64]; n[..4].copy_from_slice(b"shm!"); n },
+            state: crate::proc::ProcessState::Active,
+            cr3,
+            threads: alloc::vec::Vec::new(),
+            exit_code: 0,
+            file_descriptors: alloc::vec::Vec::new(),
+            cwd: alloc::string::String::from("/"),
+            uid: 0, gid: 0, euid: 0, egid: 0,
+            pgid: pid as u32, sid: pid as u32,
+            no_new_privs: false,
+            cap_permitted: !0u64, cap_effective: !0u64,
+            rlimits_soft: [u64::MAX; 16],
+            supplementary_groups: alloc::vec::Vec::new(),
+            umask: 0o022,
+            vm_space: Some(vm),
+            signal_state: Some(crate::signal::SignalState::new()),
+            linux_abi: true,
+            handle_table: None,
+            subsystem: crate::win32::SubsystemType::Linux,
+            token_id: None,
+            exe_path: None,
+            epoll_sets: alloc::vec::Vec::new(),
+            auxv: alloc::vec::Vec::new(),
+            envp: alloc::vec::Vec::new(),
+            alarm_deadline_ticks: 0,
+            alarm_interval_ticks: 0,
+            pdeath_signal: 0,
+        });
+    }
+
+    // Tear down a synthetic process and reclaim its VmSpace.
+    fn teardown_proc(pid: u64) {
+        let old = {
+            let mut procs = crate::proc::PROCESS_TABLE.lock();
+            let old = procs.iter_mut().find(|p| p.pid == pid)
+                .and_then(|p| p.vm_space.take());
+            procs.retain(|p| p.pid != pid);
+            old
+        };
+        if let Some(space) = old { crate::proc::free_vm_space(space); }
+    }
+
+    // ── Setup ────────────────────────────────────────────────────────────
+    let (vm_a, cr3_a) = match build_space(VA_A) {
+        Some(x) => x,
+        None => { test_fail!("crossproc_futex", "build_space A OOM"); return false; }
+    };
+    let (vm_b, cr3_b) = match build_space(VA_B) {
+        Some(x) => x,
+        None => {
+            crate::proc::free_vm_space(vm_a);
+            test_fail!("crossproc_futex", "build_space B OOM");
+            return false;
+        }
+    };
+    register_proc(PID_A, cr3_a, vm_a);
+    register_proc(PID_B, cr3_b, vm_b);
+
+    // Clean any stale keys from a prior run.
+    {
+        let mut w = FUTEX_WAITERS.lock();
+        w.remove(&FutexKey::Shared { mount_idx: SHARED_MOUNT, inode: SHARED_INODE, byte_off: WORD_OFF });
+        w.remove(&FutexKey::Private(PID_A, PRIV_VA));
+        w.remove(&FutexKey::Private(PID_B, PRIV_VA));
+    }
+
+    let mut ok = true;
+
+    // ── (a) Same shared key for both processes despite different VAs ───────
+    let key_a = resolve_futex_key(PID_A, VA_A + WORD_OFF, /*force_private=*/false);
+    let key_b = resolve_futex_key(PID_B, VA_B + WORD_OFF, /*force_private=*/false);
+    let expected = FutexKey::Shared {
+        mount_idx: SHARED_MOUNT, inode: SHARED_INODE, byte_off: WORD_OFF,
+    };
+    if key_a != expected {
+        test_fail!("crossproc_futex",
+            "process A shared word resolved to {:#x?} (expected {:#x?})", key_a, expected);
+        ok = false;
+    }
+    if key_b != expected {
+        test_fail!("crossproc_futex",
+            "process B shared word resolved to {:#x?} (expected {:#x?})", key_b, expected);
+        ok = false;
+    }
+    if key_a != key_b {
+        test_fail!("crossproc_futex",
+            "cross-process keys DIFFER: A={:#x?} B={:#x?} (different VAs must rendezvous)",
+            key_a, key_b);
+        ok = false;
+    }
+    if ok {
+        test_println!("  (a) procA@{:#x} and procB@{:#x} → SAME shared key {:#x?} ✓",
+            VA_A + WORD_OFF, VA_B + WORD_OFF, key_a);
+    }
+
+    // ── (b) Cross-process rendezvous: WAIT under A's key, WAKE under B ─────
+    // Enqueue a synthetic waiter under process A's resolved shared key.
+    {
+        let mut w = FUTEX_WAITERS.lock();
+        w.entry(key_a).or_insert_with(alloc::vec::Vec::new).push(fake_tid);
+    }
+    // Issue a FUTEX_WAKE the way process B's syscall path would: resolve B's
+    // key and drain its bucket.  Because the keys are equal, B finds A's
+    // waiter — the wake reaches across the process boundary.
+    let woken = {
+        let mut w = FUTEX_WAITERS.lock();
+        let mut n = 0u64;
+        if let Some(list) = w.get_mut(&key_b) {
+            while let Some(_t) = list.pop() { n += 1; }
+            if list.is_empty() { w.remove(&key_b); }
+        }
+        n
+    };
+    if woken != 1 {
+        test_fail!("crossproc_futex",
+            "WAKE under process B woke {} waiters (expected 1) — cross-proc bucket miss",
+            woken);
+        ok = false;
+    } else {
+        test_println!("  (b) WAIT(procA key) woken by WAKE(procB key): woken=1 ✓");
+    }
+    // Belt-and-braces: the shared bucket must now be empty.
+    {
+        let w = FUTEX_WAITERS.lock();
+        if w.contains_key(&expected) {
+            drop(w);
+            test_fail!("crossproc_futex", "shared bucket leaked after cross-proc wake");
+            FUTEX_WAITERS.lock().remove(&expected);
+            ok = false;
+        }
+    }
+
+    // ── (c) Private fast path preserved (no cross-process collision) ───────
+    // Both processes have a MAP_PRIVATE word at the SAME VA; their keys MUST
+    // differ (per-mm), and a FUTEX_PRIVATE_FLAG'd shared word must also stay
+    // private.
+    let priv_a = resolve_futex_key(PID_A, PRIV_VA, false);
+    let priv_b = resolve_futex_key(PID_B, PRIV_VA, false);
+    if priv_a != FutexKey::Private(PID_A, PRIV_VA) {
+        test_fail!("crossproc_futex", "private word A resolved to {:#x?} (expected Private)", priv_a);
+        ok = false;
+    }
+    if priv_a == priv_b {
+        test_fail!("crossproc_futex",
+            "two processes' private words at the same VA collided: {:#x?} — fast path broken",
+            priv_a);
+        ok = false;
+    }
+    // FUTEX_PRIVATE_FLAG forces the shared word to a private key even though
+    // its VMA is MAP_SHARED (per futex(2): the flag selects the private shape).
+    let forced = resolve_futex_key(PID_A, VA_A + WORD_OFF, /*force_private=*/true);
+    if forced != FutexKey::Private(PID_A, VA_A + WORD_OFF) {
+        test_fail!("crossproc_futex",
+            "FUTEX_PRIVATE_FLAG over MAP_SHARED resolved to {:#x?} (expected Private)", forced);
+        ok = false;
+    }
+    if ok {
+        test_println!("  (c) private words key per-(pid,uaddr); PRIVATE_FLAG forces private ✓");
+    }
+
+    // ── Teardown ──────────────────────────────────────────────────────────
+    {
+        let mut w = FUTEX_WAITERS.lock();
+        w.remove(&expected);
+        w.remove(&FutexKey::Private(PID_A, PRIV_VA));
+        w.remove(&FutexKey::Private(PID_B, PRIV_VA));
+    }
+    teardown_proc(PID_A);
+    teardown_proc(PID_B);
+
+    if ok {
+        test_pass!("cross-process SHARED futex keying (memfd MAP_SHARED rendezvous, Test 295)");
     }
     ok
 }

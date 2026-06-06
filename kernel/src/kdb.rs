@@ -343,6 +343,8 @@ pub fn dispatch(req: &str, out: &mut String) {
         "proc-tree"      => op_proc_tree(req, out),
         "fd-table"       => op_fd_table(req, out),
         "fd-map"         => op_fd_map(req, out),
+        "unix-diag"      => op_unix_diag(req, out),
+        "epoll-watch"    => op_epoll_watch(req, out),
         "syscall-trend"  => op_syscall_trend(req, out),
         "vfs-mounts"     => op_vfs_mounts(out),
         "dmesg"          => op_dmesg(req, out),
@@ -371,9 +373,11 @@ pub fn dispatch(req: &str, out: &mut String) {
         "tlb-stats"        => op_tlb_stats(out),
         "heap-stats"       => op_heap_stats(out),
         "w215-diag"        => op_w215_diag(out),
+        "w215-cow-witness" => op_w215_cow_witness(req, out),
         "arm-phys"         => op_arm_phys(req, out),
         "coverage-flush" => op_coverage_flush(out),
         "proc-metrics"   => op_proc_metrics(out),
+        "poll-revents"   => op_poll_revents(req, out),
         "thread-park-audit" => op_thread_park_audit(req, out),
         "rip-trace"      => op_rip_trace(req, out),
         "procmaps"       => op_procmaps(req, out),
@@ -395,6 +399,10 @@ pub fn dispatch(req: &str, out: &mut String) {
         // net-ipver: read or toggle the runtime IPv4/IPv6 address-family
         // enable flags (net::ipver).  One-shot, structured JSON output.
         "net-ipver"     => op_net_ipver(req, out),
+        // net-rxstats: receive-path health — per-connection recv_next/seq
+        // cursors + e1000 RX-ring MPC/byte counts.  Used to confirm TCP/NIC
+        // packet loss (a stalled recv_next or a non-zero MPC).
+        "net-rxstats"   => op_net_rxstats(req, out),
         _ => {
             out.push_str(r#"{"error":"unknown op: "#);
             for c in op.chars().take(64) {
@@ -1319,6 +1327,37 @@ fn op_w215_diag(out: &mut String) {
     }
 }
 
+// ── w215-cow-witness ───────────────────────────────────────────────────────
+//
+// Dump the CoW double-install witness table.  Each entry is a dispositive
+// A-vs-B pair captured at the page-fault CoW install site: a sibling thread on
+// the same shared CR3 already installed its OWN frame (existing_phys = frame B)
+// at the faulting VA while this CPU was about to install a DIFFERENT frame
+// (incoming_phys = frame A) — one VA resolving to two physical frames, the
+// W215 shared-CR3 double-install (Intel SDM Vol. 3A §4.10.4).
+//
+// Request:  {"op":"w215-cow-witness"}            dump all slots + total
+//           {"op":"w215-cow-witness","va":"0x7eff19c7a534"}  filter to one VA
+// Response: {"total":N,"hits":M}  (the per-entry detail is emitted to serial
+//           as [W215/COW-WITNESS] lines for grep capture)
+//
+// Requires: --features firefox-test.
+fn op_w215_cow_witness(req: &str, out: &mut String) {
+    #[cfg(feature = "firefox-test")]
+    {
+        use core::fmt::Write;
+        let va = extract_field(req, "va").and_then(|s| parse_u64(&s)).unwrap_or(0);
+        let total = crate::mm::w215_diag::cow_double_install_total();
+        let hits = crate::mm::w215_diag::dump_cow_witness_for_va(va);
+        let _ = write!(out, r#"{{"total":{},"hits":{},"va":"{:#x}"}}"#, total, hits, va);
+    }
+    #[cfg(not(feature = "firefox-test"))]
+    {
+        let _ = req;
+        out.push_str(r#"{"error":"w215-cow-witness requires firefox-test feature"}"#);
+    }
+}
+
 // ── arm-phys ─────────────────────────────────────────────────────────────────
 //
 // Manually arm a write-only hardware watchpoint on a specific physical
@@ -1957,6 +1996,177 @@ fn op_fd_map(req: &str, out: &mut String) {
     out.push_str("]}");
 }
 
+// ── unix-diag ────────────────────────────────────────────────────────────────
+//
+// Decisive recv-side readiness probe for one AF_UNIX socket inode.  Answers, at
+// a live wedge, the gate-4 question: does the content proc's IPDL channel have
+// UNREAD data in its recv ring (recv_avail>0) that epoll fails to report (=> P1
+// epoll readiness drop), an undelivered SCM batch sitting ahead of the reader
+// (=> P2 recvmsg SCM drop), or an EMPTY ring with no pending SCM (=> the parent
+// never wrote to this inode => P3 routing / P4 navigation-never-sent)?
+//
+// Request: {"op":"unix-diag","inode":N}.  Reports for socket N AND its peer:
+//   recv_avail (unread bytes in ring), recv_pushed/recv_popped (stream pos),
+//   read/write shutdown, plus the pending SCM batches bound to N
+//   (byte_offset, fd_count, deliverable=consumed>=offset).
+fn op_unix_diag(req: &str, out: &mut String) {
+    use core::fmt::Write;
+
+    let inode: u64 = match extract_field(req, "inode").and_then(|s| parse_u64(&s)) {
+        Some(v) => v,
+        None => { out.push_str(r#"{"error":"missing 'inode' field"}"#); return; }
+    };
+
+    let emit_sock = |out: &mut String, id: u64| {
+        match crate::net::unix::diag_for(id) {
+            Some(d) => {
+                let consumed = d.recv_popped;
+                let scm = crate::syscall::scm_diag_for(id, consumed);
+                let has_scm_deliv = scm.iter().any(|(_, _, deliv)| *deliv);
+                out.push('{');
+                let _ = write!(out, r#""id":{},"#, d.id);
+                j_kv_str(out, "state", match d.state {
+                    crate::net::unix::UnixState::Free => "free",
+                    crate::net::unix::UnixState::Unbound => "unbound",
+                    crate::net::unix::UnixState::Bound => "bound",
+                    crate::net::unix::UnixState::Listening => "listening",
+                    crate::net::unix::UnixState::Connected => "connected",
+                });
+                let _ = write!(out, r#""peer_id":{},"#, d.peer_id as i64);
+                let _ = write!(out, r#""recv_avail":{},"#, d.recv_avail);
+                let _ = write!(out, r#""recv_pushed":{},"#, d.recv_pushed);
+                let _ = write!(out, r#""recv_popped":{},"#, d.recv_popped);
+                let _ = write!(out, r#""read_shutdown":{},"#, d.read_shutdown);
+                let _ = write!(out, r#""write_shutdown":{},"#, d.write_shutdown);
+                let _ = write!(out, r#""has_data":{},"#, d.recv_avail > 0);
+                let _ = write!(out, r#""scm_deliverable":{},"#, has_scm_deliv);
+                out.push_str(r#""scm_batches":["#);
+                let mut first = true;
+                for (off, nfds, deliv) in &scm {
+                    if !first { out.push(','); }
+                    first = false;
+                    let _ = write!(out,
+                        r#"{{"byte_offset":{},"fd_count":{},"deliverable":{}}}"#,
+                        off, nfds, deliv);
+                }
+                out.push_str("]}");
+            }
+            None => {
+                let _ = write!(out, r#"{{"id":{},"state":"free-or-oob"}}"#, id);
+            }
+        }
+    };
+
+    out.push('{');
+    let _ = write!(out, r#""inode":{},"#, inode);
+    out.push_str(r#""socket":"#);
+    emit_sock(out, inode);
+    // Peer end (where the parent's writes land BEFORE they reach this end's
+    // recv ring is the OTHER direction — but report the peer for context).
+    let peer = crate::net::unix::get_peer(inode);
+    out.push(',');
+    out.push_str(r#""peer":"#);
+    if peer != u64::MAX {
+        emit_sock(out, peer);
+    } else {
+        out.push_str(r#"{"state":"no-peer"}"#);
+    }
+    out.push('}');
+}
+
+// ── epoll-watch ──────────────────────────────────────────────────────────────
+//
+// Decisive reactor-liveness probe.  Given a pid and one of its epoll fds, dump
+// the epoll INTEREST SET and each watched fd's LIVE readiness, computed via the
+// exact same path `epoll_wait(2)` uses internally.  Pairs with `unix-diag`: at
+// a wedge where a content-reply AF_UNIX channel shows parent-end
+// `recv_avail>0, recv_popped=0` frozen, this answers WHY the reactor never
+// drains it:
+//
+//   * the fd IS in the interest set and `delivered` carries EPOLLIN (ready)
+//     yet the reactor never recvmsg's  → the reactor THREAD is not running
+//     epoll_wait (parked / scheduled-out / busy elsewhere) = a starvation /
+//     userspace-reactor problem, NOT a kernel readiness drop.
+//   * the fd is ABSENT from the interest set, OR `revents` reports no EPOLLIN
+//     despite unread data  → a kernel epoll readiness/registration divergence
+//     (epoll(7): a level-triggered fd with unread data MUST report EPOLLIN).
+//
+// Request: {"op":"epoll-watch","pid":P,"epfd":E}.
+// Output:  {pid, epfd, epoll_id, watches:[{fd, subscribed, subscribed_flags,
+//          revents, revents_flags, delivered, delivered_flags, ready}…]}.
+// `subscribed`/`revents`/`delivered` are the raw EPOLL* bitmasks; the
+// `_flags` siblings decode them to a human-readable string; `ready` is
+// `delivered != 0`.
+
+/// Decode an EPOLL* bitmask into a compact `|`-joined flag string for JSON.
+fn epoll_flags_str(m: u32) -> alloc::string::String {
+    use crate::ipc::epoll::{
+        EPOLLIN, EPOLLPRI, EPOLLOUT, EPOLLERR, EPOLLHUP, EPOLLRDHUP,
+    };
+    let mut s = alloc::string::String::new();
+    let mut push = |name: &str| {
+        if !s.is_empty() { s.push('|'); }
+        s.push_str(name);
+    };
+    if m & EPOLLIN    != 0 { push("EPOLLIN"); }
+    if m & EPOLLOUT   != 0 { push("EPOLLOUT"); }
+    if m & EPOLLPRI   != 0 { push("EPOLLPRI"); }
+    if m & EPOLLRDHUP != 0 { push("EPOLLRDHUP"); }
+    if m & EPOLLHUP   != 0 { push("EPOLLHUP"); }
+    if m & EPOLLERR   != 0 { push("EPOLLERR"); }
+    if s.is_empty() { s.push('0'); }
+    s
+}
+
+fn op_epoll_watch(req: &str, out: &mut String) {
+    use core::fmt::Write;
+
+    let pid: u64 = match extract_field(req, "pid").and_then(|s| parse_u64(&s)) {
+        Some(v) => v,
+        None => { out.push_str(r#"{"error":"missing 'pid' field"}"#); return; }
+    };
+    let epfd: usize = match extract_field(req, "epfd").and_then(|s| parse_u64(&s)) {
+        Some(v) => v as usize,
+        None => { out.push_str(r#"{"error":"missing 'epfd' field"}"#); return; }
+    };
+
+    use crate::subsys::linux::syscall::{epoll_watch_diag, EpollWatchResult};
+    out.push('{');
+    let _ = write!(out, r#""pid":{},"epfd":{},"#, pid, epfd);
+    match epoll_watch_diag(pid, epfd) {
+        EpollWatchResult::NoProc =>
+            out.push_str(r#""error":"no-such-pid","watches":[]}"#),
+        EpollWatchResult::NotEpoll =>
+            out.push_str(r#""error":"fd-not-epoll","watches":[]}"#),
+        EpollWatchResult::NoInstance =>
+            out.push_str(r#""error":"no-epoll-instance","watches":[]}"#),
+        EpollWatchResult::Ok { epoll_id, watches } => {
+            let _ = write!(out, r#""epoll_id":{},"watch_count":{},"#,
+                epoll_id, watches.len());
+            out.push_str(r#""watches":["#);
+            let mut first = true;
+            for w in &watches {
+                if !first { out.push(','); }
+                first = false;
+                out.push('{');
+                let _ = write!(out, r#""fd":{},"#, w.fd);
+                let _ = write!(out, r#""subscribed":{},"#, w.subscribed);
+                let _ = write!(out, r#""subscribed_flags":"{}","#,
+                    epoll_flags_str(w.subscribed));
+                let _ = write!(out, r#""revents":{},"#, w.revents);
+                let _ = write!(out, r#""revents_flags":"{}","#,
+                    epoll_flags_str(w.revents));
+                let _ = write!(out, r#""delivered":{},"#, w.delivered);
+                let _ = write!(out, r#""delivered_flags":"{}","#,
+                    epoll_flags_str(w.delivered));
+                let _ = write!(out, r#""ready":{}"#, w.delivered != 0);
+                out.push('}');
+            }
+            out.push_str("]}");
+        }
+    }
+}
+
 // ── syscall-trend ────────────────────────────────────────────────────────────
 //
 // Histogram of recent syscall events from the perf::syscall_ring.  Optionally
@@ -2110,6 +2320,74 @@ fn op_coverage_flush(out: &mut String) {
     {
         out.push_str(r#"{"error":"coverage-flush requires coverage feature"}"#);
     }
+}
+
+// ── poll-revents ─────────────────────────────────────────────────────────────
+//
+// Request: {"op":"poll-revents","pid":N[,"fd":F]}.
+//
+// Evaluates the kernel's poll(2) readiness verdict for one PID's descriptors
+// via the same `crate::syscall::poll_revents()` path the poll/select/epoll
+// syscalls use, asking for POLLIN|POLLOUT (0x0005).  With a "fd" field, reports
+// just that descriptor; without it, scans every open fd and lists those the
+// kernel currently considers readable (revents & POLLIN).  This is the decisive
+// discriminator for a "data is queued on the socket but the poller never wakes"
+// stall: it answers "does the kernel itself report this fd as POLLIN-ready?"
+// independent of whether the userspace poll() set actually includes the fd.
+//   revents bits (poll(2)): POLLIN=0x1, POLLOUT=0x4, POLLERR=0x8,
+//   POLLHUP=0x10, POLLRDHUP=0x2000 (Linux ABI).
+fn op_poll_revents(req: &str, out: &mut String) {
+    use core::fmt::Write;
+
+    let pid: u64 = match extract_field(req, "pid").and_then(|s| parse_u64(&s)) {
+        Some(v) => v,
+        None => { out.push_str(r#"{"error":"missing or bad 'pid'"}"#); return; }
+    };
+    let one_fd: Option<usize> =
+        extract_field(req, "fd").and_then(|s| parse_u64(&s)).map(|v| v as usize);
+
+    // POLLIN | POLLOUT — ask for the read+write readiness the IPC poll loops use.
+    const REQ_EVENTS: u16 = 0x0001 | 0x0004;
+
+    // Snapshot the set of open fd indices first (brief PROCESS_TABLE hold), then
+    // evaluate readiness OUTSIDE the table lock — `poll_revents` re-locks
+    // PROCESS_TABLE internally, so holding it here would deadlock.
+    let fds: Option<Vec<usize>> = match try_lock_brief(&PROCESS_TABLE) {
+        Some(g) => g.iter().find(|p| p.pid == pid).map(|p| {
+            match one_fd {
+                Some(f) => if p.file_descriptors.get(f).map_or(false, |e| e.is_some()) {
+                    alloc::vec![f]
+                } else {
+                    Vec::new()
+                },
+                None => p.file_descriptors.iter().enumerate()
+                    .filter_map(|(i, e)| e.as_ref().map(|_| i))
+                    .collect(),
+            }
+        }),
+        None => { out.push_str(r#"{"error":"PROCESS_TABLE busy"}"#); return; }
+    };
+    let fds = match fds {
+        Some(v) => v,
+        None => { let _ = write!(out, r#"{{"error":"no pid {}"}}"#, pid); return; }
+    };
+
+    out.push('{');
+    let _ = write!(out, r#""pid":{},"#, pid);
+    out.push_str(r#""fds":["#);
+    let mut first = true;
+    for fd in fds {
+        let revents = crate::syscall::poll_revents(pid, fd, REQ_EVENTS);
+        if !first { out.push(','); }
+        first = false;
+        let _ = write!(out,
+            r#"{{"fd":{},"revents":{},"pollin":{},"pollout":{},"pollhup":{}}}"#,
+            fd, revents,
+            revents & 0x0001 != 0,
+            revents & 0x0004 != 0,
+            revents & 0x0010 != 0);
+    }
+    out.push_str("]}");
 }
 
 // ── proc-metrics ─────────────────────────────────────────────────────────────
@@ -2312,9 +2590,18 @@ fn op_thread_park_audit(req: &str, out: &mut String) {
         alloc::collections::BTreeMap::new();
     let futex_busy = match try_lock_brief(&crate::syscall::FUTEX_WAITERS) {
         Some(waiters) => {
-            for ((pid_k, uaddr), tids) in waiters.iter() {
+            use crate::syscall::FutexKey;
+            for (k, tids) in waiters.iter() {
+                // Map the key to the diagnostic `(pid, uaddr)` pair the JSON
+                // shape expects.  A process-SHARED futex has no single owning
+                // pid; surface it as `(u64::MAX, byte_off)` so the reverse
+                // lookup still records the waiter without inventing a pid.
+                let (pid_k, uaddr) = match k {
+                    FutexKey::Private(p, u) => (*p, *u),
+                    FutexKey::Shared { byte_off, .. } => (u64::MAX, *byte_off),
+                };
                 for tid in tids {
-                    tid_to_futex.insert(*tid, (*pid_k, *uaddr));
+                    tid_to_futex.insert(*tid, (pid_k, uaddr));
                 }
             }
             false
@@ -3232,7 +3519,16 @@ fn op_cond_autopsy(req: &str, out: &mut String) {
     let mut waiter_rows: Vec<WaiterRow> = Vec::new();
     match try_lock_brief(&crate::syscall::FUTEX_WAITERS) {
         Some(w) => {
-            for (&(wpid, wuaddr), tids) in w.range((pid, lo)..=(pid, hi)) {
+            use crate::syscall::FutexKey;
+            // Scan the same-process PRIVATE-key cluster around `addr`.  A
+            // process-SHARED futex is keyed by backing-object identity, not by
+            // `(pid, uaddr)`, so it does not appear in this virtual-address
+            // window.
+            for (k, tids) in w.range(FutexKey::Private(pid, lo)..=FutexKey::Private(pid, hi)) {
+                let (wpid, wuaddr) = match k {
+                    FutexKey::Private(p, u) => (*p, *u),
+                    FutexKey::Shared { .. } => continue,
+                };
                 if wpid != pid { continue; }
                 if tids.is_empty() { continue; }
                 for &tid in tids.iter() {
@@ -3545,6 +3841,66 @@ fn op_net_ipver(req: &str, out: &mut String) {
         if v4 { "true" } else { "false" },
         if v6 { "true" } else { "false" },
     );
+}
+
+// ── net-rxstats ───────────────────────────────────────────────────────────────
+//
+// One-shot receive-path health snapshot for confirming TCP/NIC packet loss.
+// Emits, for every connection in the TCP table, the 4-tuple + state + the
+// sequence cursors (recv_next / send_next / send_unack), the application
+// receive-queue depth, the peer window, and the retransmit-queue depth.  A
+// recv_next that stalls while the peer keeps retransmitting (retransmit_len
+// stays > 0 on the peer's side, observable as a non-advancing recv_next on
+// repeated polls) localizes a receive-side gap — the in-order-only accept
+// path refusing an out-of-order segment (RFC 9293 §3.10.7.4).
+//
+// Also emits the e1000 RX statistics: cumulative software frame/byte counts
+// delivered to the stack, plus the hardware Missed-Packets-Count (MPC) and
+// Receive-No-Buffers-Count (RNBC) deltas.  A non-zero MPC confirms the NIC
+// dropped inbound frames because the descriptor ring was full (ring overrun).
+//
+// Read repeatedly (e.g. once a second) to watch recv_next advance or stall.
+fn op_net_rxstats(_req: &str, out: &mut String) {
+    use core::fmt::Write;
+    out.push('{');
+
+    // e1000 RX statistics first.
+    let (rx_frames, rx_bytes, mpc, rnbc, ring) = crate::net::e1000::rx_stats();
+    let _ = write!(
+        out,
+        r#""e1000":{{"rx_frames":{},"rx_bytes":{},"mpc_delta":{},"rnbc_delta":{},"num_rx_desc":{}}},"#,
+        rx_frames, rx_bytes, mpc, rnbc, ring,
+    );
+
+    out.push_str(r#""conns":["#);
+    let snap = tcp::snapshot_connections();
+    let mut first = true;
+    for c in snap.iter() {
+        if !first { out.push(','); }
+        first = false;
+        let st = match c.state {
+            TcpState::Closed      => "Closed",
+            TcpState::Listen      => "Listen",
+            TcpState::SynSent     => "SynSent",
+            TcpState::SynReceived => "SynReceived",
+            TcpState::Established  => "Established",
+            TcpState::FinWait1    => "FinWait1",
+            TcpState::FinWait2    => "FinWait2",
+            TcpState::CloseWait   => "CloseWait",
+            TcpState::LastAck     => "LastAck",
+            TcpState::TimeWait    => "TimeWait",
+        };
+        let _ = write!(
+            out,
+            r#"{{"local_port":{},"remote_ip":"{}.{}.{}.{}","remote_port":{},"state":"{}","recv_next":{},"send_next":{},"send_unack":{},"recv_buf_len":{},"peer_window":{},"retransmit_len":{}}}"#,
+            c.local_port,
+            c.remote_ip[0], c.remote_ip[1], c.remote_ip[2], c.remote_ip[3],
+            c.remote_port, st,
+            c.recv_next, c.send_next, c.send_unack,
+            c.recv_buf_len, c.peer_window, c.retransmit_len,
+        );
+    }
+    out.push_str("]}");
 }
 
 // ── procmaps ──────────────────────────────────────────────────────────────────

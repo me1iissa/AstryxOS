@@ -2474,6 +2474,70 @@ pub fn find_vma_with_parent_fallback(pid: Pid, addr: u64) -> Option<VmaLookupHit
     Some(extract(vma, true))
 }
 
+/// Resolve the backing object of a process-SHARED futex word at `addr`.
+///
+/// Returns `Some((mount_idx, inode, vma_base, file_offset))` **only** when the
+/// VMA covering `addr` in `pid`'s address space (with the same CLONE_VM
+/// parent-fallback as [`find_vma_with_parent_fallback`]) is `MAP_SHARED` AND
+/// file/`memfd`-backed (`VmBacking::File`).  In every other case — a private
+/// mapping, an anonymous mapping (shared or private), an unmapped address, or
+/// no resolvable VmSpace — returns `None`, signalling the caller to use the
+/// PRIVATE `(pid, uaddr)` futex key.
+///
+/// This is the kernel side of the `futex(2)` process-shared rendezvous: a
+/// futex word living on a shared file/`memfd` page must hash to the same key
+/// for any process that maps the same object, regardless of the virtual
+/// address it chose.  The returned `(mount_idx, inode, file_offset)` is the
+/// VMA's backing identity and base file offset; the caller folds in the word's
+/// distance from `vma_base` to obtain the absolute byte offset within the
+/// object.  See [`crate::syscall::resolve_futex_key`].
+///
+/// Acquires `PROCESS_TABLE` briefly; the returned tuple owns no borrows.
+pub fn futex_backing_for(pid: Pid, addr: u64) -> Option<(usize, u64, u64, u64)> {
+    use crate::mm::vma::{VmArea, VmBacking, MAP_SHARED};
+
+    // Pull out (mount_idx, inode, vma_base, file_offset) iff the VMA is a
+    // MAP_SHARED file/memfd-backed region.  Private/anonymous → None.
+    fn shared_file_backing(vma: &VmArea) -> Option<(usize, u64, u64, u64)> {
+        if vma.flags & MAP_SHARED == 0 {
+            return None;
+        }
+        match vma.backing {
+            VmBacking::File { mount_idx, inode, offset, .. } => {
+                Some((mount_idx, inode, vma.base, offset))
+            }
+            // Anonymous (incl. MAP_SHARED|MAP_ANONYMOUS) and Device backings
+            // are pinned by the mm, not a cross-process object — keep them on
+            // the private key path (matches futex(2)).
+            _ => None,
+        }
+    }
+
+    let procs = PROCESS_TABLE.lock();
+    let child = procs.iter().find(|p| p.pid == pid)?;
+
+    // Direct hit on the child's own VmSpace.  If the child has diverged
+    // (its own VmSpace exists but does not cover `addr`), do NOT fall back to
+    // the parent — its VMA list is authoritative.  Same rule as
+    // `find_vma_with_parent_fallback`.
+    if let Some(space) = child.vm_space.as_ref() {
+        return space.find_vma(addr).and_then(shared_file_backing);
+    }
+
+    // Child has no VmSpace (CLONE_VM shared-VM state).  Consult the parent only
+    // when the CR3 matches.
+    let child_cr3 = child.cr3;
+    let parent_pid = child.parent_pid;
+    if child_cr3 == 0 || parent_pid == 0 {
+        return None;
+    }
+    let parent = procs.iter().find(|p| p.pid == parent_pid)?;
+    if parent.cr3 != child_cr3 {
+        return None;
+    }
+    parent.vm_space.as_ref()?.find_vma(addr).and_then(shared_file_backing)
+}
+
 /// Store the clear_child_tid address in a thread for CLONE_CHILD_CLEARTID.
 /// When that thread exits, the kernel will write 0 to that address and wake futex.
 pub fn set_clear_child_tid(pid: Pid, tid: Tid, tidptr: u64) {
@@ -3967,6 +4031,46 @@ pub fn waitpid(parent_pid: Pid, wait_pid: i64) -> Option<(Pid, i32)> {
     );
 
     Some((child_pid, exit_code))
+}
+
+/// Peek a reapable zombie child WITHOUT removing it from the process table.
+///
+/// Mirrors [`waitpid`]'s selection predicate but leaves the zombie in place so
+/// it remains waitable by a subsequent call.  This is the kernel side of
+/// `waitid(2)`'s `WNOWAIT` flag: "Leave the child in a waitable state; a later
+/// wait call can be used to again retrieve the child status information."
+/// (POSIX.1-2017 `waitid`, `man 2 waitid`).  Without it, a caller that peeks a
+/// child's exit status (WNOWAIT) and then issues a second `waitid` to actually
+/// collect it would find the child already gone on the second call.
+///
+/// Returns `Some((child_pid, exit_code))` for a matching zombie, else `None`.
+pub fn peek_zombie(parent_pid: Pid, wait_pid: i64) -> Option<(Pid, i32)> {
+    let procs = PROCESS_TABLE.lock();
+    procs.iter()
+        .find(|p| {
+            p.parent_pid == parent_pid
+                && p.state == ProcessState::Zombie
+                && (wait_pid < 0 || p.pid == wait_pid as u64)
+        })
+        .map(|p| (p.pid, p.exit_code))
+}
+
+/// True if `parent_pid` has at least one child — live OR zombie — matching the
+/// `wait_pid` selector (specific PID when `wait_pid >= 0`, any child when
+/// `wait_pid < 0`).
+///
+/// Used by the blocking `wait(2)` / `waitid(2)` path to honour POSIX: a wait
+/// for a process that is not (or is no longer) a child of the caller MUST fail
+/// immediately with `ECHILD` rather than block forever.  In particular, once a
+/// specific child has been reaped (removed from the table), a fresh
+/// `waitid(P_PID, that_pid)` has no matching child and must return `ECHILD` —
+/// it must not park on a wake that can never arrive.
+pub fn has_matching_child(parent_pid: Pid, wait_pid: i64) -> bool {
+    let procs = PROCESS_TABLE.lock();
+    procs.iter().any(|p| {
+        p.parent_pid == parent_pid
+            && (wait_pid < 0 || p.pid == wait_pid as u64)
+    })
 }
 
 /// Count how many threads in `THREAD_TABLE` still belong to `pid`, and how

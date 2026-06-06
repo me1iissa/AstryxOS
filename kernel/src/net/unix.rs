@@ -828,6 +828,23 @@ pub fn recv_consumed(id: u64) -> u64 {
     t.0[id as usize].recv_popped
 }
 
+/// Usable byte-stream capacity of one AF_UNIX socket end's recv ring — the
+/// maximum number of bytes a `sendmsg(2)`/`write(2)` to the peer can have
+/// outstanding (unread) before the transport returns -EAGAIN.  The ring stores
+/// `RECV_BUF_CAP` slots but reserves one to disambiguate full-vs-empty (see
+/// `recv_space`), so the usable capacity is `RECV_BUF_CAP - 1`.
+///
+/// Reported verbatim via `getsockopt(SO_SNDBUF)`/`SO_RCVBUF` so that a
+/// length-prefixed IPC stream writer (which queries SO_SNDBUF to decide how
+/// large a single `sendmsg(2)` to offer, per socket(7)) chunks at the real
+/// transport boundary.  Advertising a larger SO_SNDBUF than the ring can hold
+/// makes such a writer offer a >ring-sized frame in one call, which the
+/// transport can only partially accept — forcing the partial-write resume path
+/// on every large frame.
+pub const fn buf_capacity() -> usize {
+    RECV_BUF_CAP - 1
+}
+
 /// Return the socket type (`Stream` or `SeqPacket`) for an open socket id.
 /// Returns `Stream` for an out-of-range id (matching the default).
 pub fn kind(id: u64) -> SockKind {
@@ -889,6 +906,44 @@ pub fn peer_creds(id: u64) -> Option<PeerCreds> {
 pub fn has_pending(id: u64) -> bool {
     if id as usize >= MAX_UNIX_SOCKETS { return false; }
     TABLE.lock().0[id as usize].backlog_len > 0
+}
+
+/// Diagnostic-only one-socket snapshot for the kdb `unix-diag` op.
+/// Reports the recv-ring read-readiness state of socket `id` so a live wedge
+/// can be classified: `recv_avail` = unread bytes sitting in the ring (the
+/// `has_data` input), `recv_pushed`/`recv_popped` = absolute stream positions
+/// (the `enqueue_offset`/`recv_consumed` inputs to SCM delivery), plus the
+/// half-close edges.  All values read under one TABLE lock.  Returns None for
+/// an out-of-range or Free slot.
+pub fn diag_for(id: u64) -> Option<UnixDiag> {
+    if id as usize >= MAX_UNIX_SOCKETS { return None; }
+    let t = TABLE.lock();
+    let s = &t.0[id as usize];
+    if s.state == UnixState::Free { return None; }
+    Some(UnixDiag {
+        id,
+        state: s.state,
+        kind: s.kind,
+        peer_id: s.peer_id,
+        recv_avail: s.recv_available(),
+        recv_pushed: s.recv_pushed,
+        recv_popped: s.recv_popped,
+        read_shutdown: s.shut_rd,
+        write_shutdown: s.shut_wr,
+    })
+}
+
+/// Per-socket recv-readiness diagnostic (see [`diag_for`]).
+pub struct UnixDiag {
+    pub id: u64,
+    pub state: UnixState,
+    pub kind: SockKind,
+    pub peer_id: u64,
+    pub recv_avail: usize,
+    pub recv_pushed: u64,
+    pub recv_popped: u64,
+    pub read_shutdown: bool,
+    pub write_shutdown: bool,
 }
 
 pub fn state(id: u64) -> UnixState {
