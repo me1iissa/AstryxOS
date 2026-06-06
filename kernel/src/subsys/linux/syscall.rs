@@ -3917,11 +3917,17 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         // treat the bitmap as invalid and silently fall back to single-CPU
         // assumptions, which under-sizes thread pools.
         //
-        // Cap at 128 bytes (1024 CPUs) — comfortably above MAX_CPUS=16.
+        // The return value must be `min(cpusetsize, sizeof(cpumask_t))` — NOT
+        // the caller's buffer size.  On x86-64 with NR_CPUS <= 64 the kernel's
+        // internal cpumask_t is one unsigned long = 8 bytes; real Linux returns
+        // 8 here (verified against a golden strace), and consumers that inspect
+        // the byte count (rather than just popcounting) rely on that exact
+        // value.  We support MAX_CPUS=16, which fits in 8 bytes.  The libc
+        // wrapper zeroes any remaining bytes of a larger caller buffer.
         204 => {
             let buf = arg3 as *mut u8;
             let bufsiz = arg2 as usize;
-            const KERNEL_CPUMASK_BYTES: usize = 128;
+            const KERNEL_CPUMASK_BYTES: usize = 8;
             let written = bufsiz.min(KERNEL_CPUMASK_BYTES);
             if buf == core::ptr::null_mut() || written == 0 {
                 // Nothing to write — preserve permissive 0 return for NULL/zero
