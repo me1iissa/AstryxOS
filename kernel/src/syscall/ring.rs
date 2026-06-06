@@ -361,7 +361,7 @@ pub fn log_synthetic_read(fd: u64, path: &str, ret: i64, data: &[u8]) {
         hex.push(HEX[(b >> 4) as usize] as char);
         hex.push(HEX[(b & 0xF) as usize] as char);
     }
-    crate::serial_println!(
+    crate::serial_fast_println!(
         "[FF/read-bytes] fd={} path={:?} ret={} bytes={}",
         fd, path, ret, hex
     );

@@ -373,7 +373,7 @@ pub fn record_syscall_entry(
         a1, a2, a3, a4, a5, a6,
         user_rip, fs_base, gen_id,
     );
-    crate::serial_println!("[SC-REC] {}", line);
+    crate::serial_fast_println!("[SC-REC] {}", line);
 
     // In-RAM mirror, bounded.
     let mut g = RECORD_LOG.lock();
