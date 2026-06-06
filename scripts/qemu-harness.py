@@ -8175,6 +8175,114 @@ def _qmp_xv_u64_via_cr3(qmp: "QMP", cr3: int, vaddr: int) -> Optional[int]:
     return struct.unpack_from("<Q", raw)[0]
 
 
+def _walk_va_full(qmp: "QMP", cr3: int, vaddr: int) -> dict:
+    """Full 4-level x86_64 page-table walk under an explicit CR3.
+
+    Returns a dict with the PTE at every level, the resolved physical
+    address (12-bit offset preserved), and the leaf frame number.  Used by
+    the `va2pa` phys-provenance subcommand so a producer-CR3 vs consumer-CR3
+    walk of the same predicate VA can be compared frame-for-frame (Intel SDM
+    Vol. 3A §4.5 4-level paging).
+    """
+    cr3_pa = cr3 & ~0xFFF
+    levels = [(39, "pml4"), (30, "pdpt"), (21, "pd"), (12, "pt")]
+    table_pa = cr3_pa
+    chain = []
+    pa = None
+    frame = None
+    for shift, name in levels:
+        idx = (vaddr >> shift) & 0x1FF
+        entry_pa = table_pa + idx * 8
+        raw = _qmp_xp_bytes(qmp, entry_pa, 8)
+        if raw is None or len(raw) < 8:
+            chain.append({"level": name, "idx": idx,
+                          "entry_pa": f"0x{entry_pa:x}", "entry": None,
+                          "present": False})
+            break
+        entry = struct.unpack_from("<Q", raw)[0]
+        present = bool(entry & 0x1)
+        ps = bool(entry & (1 << 7))
+        chain.append({
+            "level": name, "idx": idx, "entry_pa": f"0x{entry_pa:x}",
+            "entry": f"0x{entry:016x}", "present": present,
+            "rw": bool(entry & 0x2), "us": bool(entry & 0x4),
+            "ps": ps, "nx": bool(entry & (1 << 63)),
+            "frame": f"0x{(entry & 0x000F_FFFF_FFFF_F000):x}",
+        })
+        if not present:
+            break
+        if shift in (30, 21) and ps:
+            base = entry & 0x000F_FFFF_FFFF_F000
+            mask = (1 << shift) - 1
+            pa = (base & ~mask) | (vaddr & mask)
+            frame = (base & ~mask)
+            break
+        table_pa = entry & 0x000F_FFFF_FFFF_F000
+        if name == "pt":
+            pa = table_pa | (vaddr & 0xFFF)
+            frame = table_pa
+    return {"va": f"0x{vaddr:x}", "cr3": f"0x{cr3:x}",
+            "pa": (f"0x{pa:x}" if pa is not None else None),
+            "frame": (f"0x{frame:x}" if frame is not None else None),
+            "walk": chain}
+
+
+def cmd_va2pa(args):
+    """PHYS-PROVENANCE: page-walk a VA under an EXPLICIT CR3 and report the
+    resolved physical address + leaf frame + raw bytes there.
+
+    The decisive aliasing test: run this twice — once with the producer's
+    CR3, once with the consumer's CR3, for the same predicate VA — and
+    compare the `frame` fields.  frame_A != frame_B (two CR3s → two frames)
+    is the only proof of store-visibility aliasing.  frame_A == frame_B
+    means the two views share one frame (not aliasing — look at the data
+    value / producer chain instead).
+
+    Usage: va2pa <sid> <cr3-hex> <va-hex> [nbytes]
+    """
+    sess = _load_session(args.sid)
+    qmp_sock = sess.get("qmp_sock") or str(HARNESS_DIR / f"{args.sid}.qmp.sock")
+    cr3 = int(args.cr3, 0)
+    va = int(args.va, 0)
+    nbytes = int(args.bytes, 0) if args.bytes else 8
+    qmp = QMP(qmp_sock)
+    if not qmp.connect():
+        _out({"ok": False, "error": "QMP connect failed"})
+        return
+    # Pause so the walk + read are coherent (no concurrent guest mutation).
+    paused = False
+    if not args.no_pause:
+        try:
+            qmp.execute("stop")
+            paused = True
+        except Exception:
+            pass
+    try:
+        walk = _walk_va_full(qmp, cr3, va)
+        data_hex = None
+        if walk["pa"] is not None:
+            raw = _qmp_xv_via_cr3(qmp, cr3, va, nbytes)
+            if raw is not None:
+                data_hex = raw.hex()
+        out = dict(walk)
+        out["ok"] = walk["pa"] is not None
+        out["bytes"] = nbytes
+        out["data_hex"] = data_hex
+        # Convenience: little-endian u32/u64 of the first word (the common
+        # futex/cond predicate width).
+        if data_hex and len(data_hex) >= 8:
+            out["u32_le"] = struct.unpack_from("<I", bytes.fromhex(data_hex))[0]
+        if data_hex and len(data_hex) >= 16:
+            out["u64_le"] = struct.unpack_from("<Q", bytes.fromhex(data_hex))[0]
+        _out(out)
+    finally:
+        if paused:
+            try:
+                qmp.execute("cont")
+            except Exception:
+                pass
+
+
 def _qmp_xv_via_qmp(qmp: "QMP", cpu: int, vaddr: int, nbytes: int) -> Optional[bytes]:
     """Read N bytes of guest *virtual* memory through CPU `cpu`'s active
     CR3, using a CALLER-SUPPLIED open QMP connection.
@@ -12020,6 +12128,19 @@ def main():
     p_qmp_xp.add_argument("bytes", help="Number of bytes to read")
     p_qmp_xp.add_argument("--raw", action="store_true")
 
+    p_va2pa = sub.add_parser(
+        "va2pa",
+        help="PHYS-PROVENANCE: page-walk a VA under an EXPLICIT CR3 -> "
+             "resolved PA + leaf frame + raw bytes. Run twice (producer CR3, "
+             "consumer CR3) and compare frames for the A!=B aliasing proof.")
+    p_va2pa.add_argument("sid")
+    p_va2pa.add_argument("cr3", help="Explicit CR3 (0x... or decimal)")
+    p_va2pa.add_argument("va", help="Virtual address (0x... or decimal)")
+    p_va2pa.add_argument("bytes", nargs="?", default="8",
+                          help="Bytes to read at the frame (default 8)")
+    p_va2pa.add_argument("--no-pause", action="store_true",
+                          help="Do not stop/cont the guest around the walk")
+
     # rip-walk — pause at a serial-log marker, walk user RBP chain.
     p_rwalk = sub.add_parser(
         "rip-walk",
@@ -12390,6 +12511,7 @@ def main():
         "qmp-regs": cmd_qmp_regs,
         "qmp-xv":   cmd_qmp_xv,
         "qmp-xp":   cmd_qmp_xp,
+        "va2pa":    cmd_va2pa,
         "rip-walk": cmd_rip_walk,
         "rip-trace-resolve": cmd_rip_trace_resolve,
         "read-png": cmd_read_png,
