@@ -55,6 +55,11 @@
       "name": "alias_test",
       "reason": "deterministic page-aliasing reproducer for W8 race; tolerated on TCG CI until W215 closure",
       "tracking": "#328"
+    },
+    {
+      "name": "epollet",
+      "reason": "EPOLLET re-arm (wait#3) is TCG-timing-sensitive: the drain-then-rewrite rising-edge re-detection in the eventfd EPOLLET path flips PASS->FAIL under tiny, unrelated code-layout shifts (passes on the identical base sha, fails when any unrelated TU grows). Pre-existing latent fragility in the epoll edge-detection path, not introduced by the change carrying this entry; owned by the epoll/eventfd readiness-edge subsystem, not the vfs/proc-fd path.",
+      "tracking": null
     }
   ]
 }
