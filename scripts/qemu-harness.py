@@ -4598,6 +4598,602 @@ def cmd_ff_progress(args):
     })
 
 
+# ── health: active circle / spin / stall detector ─────────────────────────────
+#
+# `health` classifies a boot's *liveness* from the harness session files alone
+# (serial log + ps + the optional kdb proc-list) — NO new guest-side cost.  The
+# coordinator runs it every turn so a wedged FF boot burning a core for nothing
+# is reaped automatically instead of being spotted by a human.
+#
+# The classifier takes TWO samples a few seconds apart so it can tell a busy
+# loop (sc rockets, no gate advance) from a boot that is genuinely advancing
+# (gate / sc climbing) from a stall (sc frozen, a thread still burning cycles).
+# A single shot cannot distinguish SPINNING from progressing — rates need a
+# delta.  Verdict enum (see HEALTH_CLASSES):
+#
+#   HEALTHY              deepest [GATE] advanced, or per-proc sc climbing at a
+#                        healthy rate, or a fresh kdb/autopsy artefact shows an
+#                        agent is actively investigating it.
+#   SLOW-ALIVE           progressing but slowly — sc/gate advance, but slowly;
+#                        the firefox-test serial firehose throttles forward
+#                        progress and explains the high CPU.  NEVER reaped.
+#   SPINNING             a busy loop — per-proc sc climbs very fast (> ~5000/s)
+#                        with NO gate advance for the window, OR a single
+#                        syscall-nr / a single [FUTEX_*]/[POLL_*] tag dominates
+#                        the recent tail (> ~70 %) at ~100 % CPU.
+#   STALLED              sc FROZEN (delta ~0) AND deepest [GATE] frozen, at
+#                        meaningful CPU — e.g. the content-handshake wedge where
+#                        pid threads churn FUTEX_WAIT -> FUTEX_TIMEDOUT on the
+#                        same uaddr while the gate counter is frozen.
+#   WEDGED-PRE-BUGCHECK  STALLED and approaching the no-forward-progress
+#                        watchdog (a thread STUCK_IN_NR for close to the
+#                        ~60000-tick SCHEDULER_DEADLOCK budget) — about to halt.
+#   DEAD/BUGCHECKED      serial contains AETHER KERNEL BUGCHECK / a panic /
+#                        SCHEDULER_DEADLOCK, or the qemu pid is gone.
+#
+# Signals (all free — derived from files the harness already writes):
+#   - <sid>.serial.log : [GATE] markers, [HB]/[PROC-METRICS] tick=, per-proc
+#                        sc=, STUCK_IN_NR=nr@Tt, and the [FUTEX_*]/[POLL_*]/nr=
+#                        tags in the tail.
+#   - ps              : qemu %CPU, etimes, liveness.
+#   - serial-log size : growth rate (kB/s) between the two samples.
+#   - <sid>.kdb.json mtime : is an agent autopsying this boot right now?
+#   - kdb proc-list   : used OPPORTUNISTICALLY when the kdb feature is on and the
+#                        boot still answers (short timeout, failure tolerated);
+#                        the verdict never DEPENDS on kdb — serial + ps suffice.
+
+HEALTH_CLASSES = [
+    "HEALTHY",
+    "SLOW-ALIVE",
+    "SPINNING",
+    "STALLED",
+    "WEDGED-PRE-BUGCHECK",
+    "DEAD/BUGCHECKED",
+]
+
+# Classes the --reap-circles flag will stop().  HEALTHY and SLOW-ALIVE are
+# NEVER reaped — a firehose-throttled boot that is slowly advancing its [GATE]
+# must survive.
+HEALTH_REAP_CLASSES = {
+    "SPINNING",
+    "STALLED",
+    "WEDGED-PRE-BUGCHECK",
+    "DEAD/BUGCHECKED",
+}
+
+# Thresholds (tunable; chosen from the ea3da73280e2 wedge autopsy + healthy
+# boots).  Tick rate is ~100 Hz (10 ms/tick), so 1 s ~= 100 ticks.
+_HEALTH_SPIN_SC_RATE = 5000.0      # sc/s above this with no gate advance = SPINNING
+_HEALTH_SLOW_SC_RATE = 5.0         # sc/s below this (but > ~0) = slow-but-alive floor
+_HEALTH_FROZEN_SC_DELTA = 3        # |sc delta| <= this over the window = "frozen"
+_HEALTH_DOMINANT_TAG_PCT = 70.0    # one tag >= this % of the tail = dominated
+_HEALTH_TAIL_LINES = 400           # how many trailing serial lines to bucket
+_HEALTH_WEDGE_TICKS = 50000        # STUCK_IN_NR@T at/above this => pre-bugcheck
+_HEALTH_KDB_FRESH_S = 90.0         # kdb.json touched within this = active autopsy
+_HEALTH_SAMPLE_GAP_S = 4.0         # default delay between the two rate samples
+
+# A leading "[TAG]" token at the start of a serial line.  We bucket the tail by
+# this to find a dominant-tag busy loop (e.g. [FUTEX_TIMEDOUT] churn).
+_HEALTH_TAG_RE = re.compile(rb"\[([A-Z][A-Z0-9_]+)\]")
+# Global kernel tick (heartbeat / proc-metrics).  Authoritative "kernel time".
+_HEALTH_TICK_RE = re.compile(rb"(?:\[HB\]|\[PROC-METRICS\])\s+tick=(\d+)")
+# Per-process syscall counter line.
+_HEALTH_PROC_SC_RE = re.compile(rb"\[PROC-METRICS\][^\n]*?\bpid=(\d+)[^\n]*?\bsc=(\d+)")
+# STUCK_IN_NR=<nr>@<ticks>t — a thread parked in one syscall for <ticks> ticks.
+_HEALTH_STUCK_RE = re.compile(rb"STUCK_IN_NR=(\d+)@(\d+)t")
+# A bare [GATE] <name> marker (serial milestone).  Deepest = last distinct one.
+_HEALTH_GATE_RE = re.compile(rb"\[GATE\]\s+(\S+)")
+# nr=<n> appears on raw [SC] trace lines; used to detect single-syscall spin.
+_HEALTH_NR_RE = re.compile(rb"\bnr=(\d+)\b")
+_HEALTH_BUGCHECK_RE = re.compile(
+    rb"AETHER KERNEL BUGCHECK|BUGCHECK\s+0x[0-9a-fA-F]+|SCHEDULER_DEADLOCK|"
+    rb"PANIC:|panicked at"
+)
+
+
+def _health_tail_bytes(path: Path, nbytes: int) -> bytes:
+    """Return the last `nbytes` of a file (or the whole file if smaller).
+
+    O(1) regardless of log size — the wedge signal is always near the end."""
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - nbytes), 0)
+            return fh.read()
+    except OSError:
+        return b""
+
+
+def _health_scan_gates(serial_log: str) -> list[str]:
+    """Distinct serial [GATE] markers in first-seen order across the WHOLE log.
+
+    [GATE] markers are rare (a handful per boot) and never regress, so scanning
+    the whole file just for them is cheap even on a multi-GiB log — we stream in
+    1 MiB chunks and only keep the gate names.  The trailing-window scan in
+    `_health_scan_serial` can miss an early gate once a long boot scrolls it out
+    of the 4 MiB tail; this dedicated pass keeps the *deepest reached* gate
+    correct regardless of log size."""
+    gate_order: list[str] = []
+    seen: set[str] = set()
+    try:
+        with Path(serial_log).open("rb") as fh:
+            carry = b""
+            while True:
+                chunk = fh.read(1024 * 1024)
+                if not chunk:
+                    break
+                buf = carry + chunk
+                # Keep the last partial line to avoid splitting a [GATE] marker
+                # across a chunk boundary.
+                nl = buf.rfind(b"\n")
+                if nl >= 0:
+                    scan, carry = buf[:nl], buf[nl + 1:]
+                else:
+                    scan, carry = b"", buf
+                for m in _HEALTH_GATE_RE.finditer(scan):
+                    g = m.group(1).decode("ascii", "replace")
+                    if g not in seen:
+                        seen.add(g)
+                        gate_order.append(g)
+            for m in _HEALTH_GATE_RE.finditer(carry):
+                g = m.group(1).decode("ascii", "replace")
+                if g not in seen:
+                    seen.add(g)
+                    gate_order.append(g)
+    except OSError:
+        pass
+    return gate_order
+
+
+def _health_scan_serial(serial_log: str) -> dict:
+    """One pass over the END of the serial log -> the per-sample progress
+    fingerprint: latest global tick, per-proc sc map (pid -> sc), the deepest
+    [GATE] marker + its ordinal, and the max STUCK_IN_NR tick count.
+
+    Reads only the trailing window (4 MiB) for the tick/sc/stuck signals so it
+    stays cheap on multi-GiB logs — the most recent PROC-METRICS sweep for every
+    live proc (printed every ~500 ticks) always sits in that window.  The
+    deepest-[GATE] signal is taken from a dedicated whole-file gate pass
+    (`_health_scan_gates`) since an early gate can scroll out of the tail on a
+    long boot, and gates never regress."""
+    path = Path(serial_log)
+    tail = _health_tail_bytes(path, 4 * 1024 * 1024)
+
+    latest_tick = None
+    for m in _HEALTH_TICK_RE.finditer(tail):
+        latest_tick = int(m.group(1))
+
+    # Per-proc latest sc.  PROC-METRICS sweeps every proc every ~500 ticks, so
+    # the last occurrence of each pid in the window is its current sc.
+    proc_sc: dict[int, int] = {}
+    for m in _HEALTH_PROC_SC_RE.finditer(tail):
+        proc_sc[int(m.group(1))] = int(m.group(2))
+
+    # Deepest serial [GATE] from the whole-file gate pass (ordinal = number of
+    # distinct gates reached).  Never regresses, so it is a monotone progress
+    # axis: an advance between the two samples is unambiguous forward progress.
+    gate_order = _health_scan_gates(serial_log)
+    deepest_gate = gate_order[-1] if gate_order else None
+
+    # Max STUCK_IN_NR tick count across procs (best-effort no-progress signal).
+    max_stuck_ticks = 0
+    stuck_nr = None
+    for m in _HEALTH_STUCK_RE.finditer(tail):
+        t = int(m.group(2))
+        if t > max_stuck_ticks:
+            max_stuck_ticks = t
+            stuck_nr = int(m.group(1))
+
+    return {
+        "latest_tick":     latest_tick,
+        "proc_sc":         proc_sc,
+        "sc_sum":          sum(proc_sc.values()),
+        "deepest_gate":    deepest_gate,
+        "gate_ordinal":    len(gate_order),
+        "max_stuck_ticks": max_stuck_ticks,
+        "stuck_nr":        stuck_nr,
+    }
+
+
+def _health_dominant_tail_tag(serial_log: str, n_lines: int) -> tuple[Optional[str], float, int]:
+    """Bucket the last `n_lines` serial lines by leading [TAG] (falling back to
+    a `nr=<n>` syscall bucket when a line carries no tag) and return
+    (dominant_label, pct_of_tagged_lines, tagged_line_count).
+
+    A single dominant tag at ~100 % CPU is the SPINNING fingerprint (e.g.
+    [FUTEX_TIMEDOUT] churn, or one syscall nr looping)."""
+    # ~200 bytes/line average; grab generously so we have >= n_lines.
+    tail = _health_tail_bytes(Path(serial_log), max(n_lines * 300, 256 * 1024))
+    lines = tail.split(b"\n")
+    if len(lines) > n_lines:
+        lines = lines[-n_lines:]
+    counts: dict[str, int] = {}
+    tagged = 0
+    for ln in lines:
+        if not ln.strip():
+            continue
+        mt = _HEALTH_TAG_RE.match(ln.lstrip())
+        if mt:
+            label = "[" + mt.group(1).decode("ascii", "replace") + "]"
+        else:
+            mn = _HEALTH_NR_RE.search(ln)
+            if mn:
+                label = "nr=" + mn.group(1).decode("ascii", "replace")
+            else:
+                continue
+        counts[label] = counts.get(label, 0) + 1
+        tagged += 1
+    if not counts or tagged == 0:
+        return None, 0.0, 0
+    top_label, top_count = max(counts.items(), key=lambda kv: kv[1])
+    pct = 100.0 * top_count / tagged
+    return top_label, round(pct, 1), tagged
+
+
+def _health_ps(pid: int) -> dict:
+    """ps snapshot for a qemu pid: %CPU (instantaneous) + etimes (seconds).
+    Returns {} when the pid is gone or ps is unavailable."""
+    if not pid:
+        return {}
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "pcpu=,etimes=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if not out:
+        return {}
+    parts = out.split()
+    try:
+        return {"cpu_pct": float(parts[0]), "etimes": int(parts[1])}
+    except (ValueError, IndexError):
+        return {}
+
+
+def _health_kdb_autopsy_fresh(sid: str) -> bool:
+    """True when <sid>.kdb.json was written within _HEALTH_KDB_FRESH_S — i.e.
+    an agent is actively autopsying this boot right now (so it is being worked,
+    not abandoned in a circle).  Best-effort; missing file -> False."""
+    p = HARNESS_DIR / f"{sid}.kdb.json"
+    try:
+        return (time.time() - p.stat().st_mtime) <= _HEALTH_KDB_FRESH_S
+    except OSError:
+        return False
+
+
+def _health_kdb_proclist(sess: dict, timeout: float = 2.0) -> Optional[dict]:
+    """OPPORTUNISTIC kdb proc-list, wrapped in a short deadline.  Returns the
+    parsed response (with syscall_count_total + per-proc thread states) when the
+    boot was started with --features kdb AND still answers; None otherwise.
+
+    The verdict NEVER depends on this — it only enriches the JSON when cheap."""
+    port = int(sess.get("kdb_host_port") or 0)
+    if port <= 0:
+        return None
+    try:
+        return _kdb_call(port, {"op": "proc-list"}, timeout=timeout)
+    except Exception:
+        return None
+
+
+def _health_classify(s0: dict, s1: dict, ps: dict, dt: float,
+                     dominant_tag: Optional[str], dominant_pct: float,
+                     futex_churn: bool, kdb_fresh: bool,
+                     bugchecked: bool, alive: bool) -> tuple[str, str]:
+    """Pure classification from the two samples + ps + tail signals.
+
+    Returns (verdict, one-line reason).  Order matters — first decisive rule
+    wins, mirroring the precedence in the class docstring."""
+    # 1. Dead / bugchecked — process gone, or a halt marker in the serial tail.
+    if not alive:
+        return "DEAD/BUGCHECKED", "qemu process is gone"
+    if bugchecked:
+        return "DEAD/BUGCHECKED", "serial shows BUGCHECK/panic/SCHEDULER_DEADLOCK"
+
+    cpu = ps.get("cpu_pct", 0.0)
+    gate_advanced = (
+        s1["gate_ordinal"] > s0["gate_ordinal"]
+        or (s1["deepest_gate"] != s0["deepest_gate"]
+            and s1["deepest_gate"] is not None)
+    )
+    sc_delta = s1["sc_sum"] - s0["sc_sum"]
+    sc_rate = (sc_delta / dt) if dt > 0 else 0.0
+    tick_advanced = (
+        s0["latest_tick"] is not None and s1["latest_tick"] is not None
+        and s1["latest_tick"] > s0["latest_tick"]
+    )
+    stuck_ticks = max(s0["max_stuck_ticks"], s1["max_stuck_ticks"])
+
+    # 2. Active autopsy -> being worked, not a circle.  (Still HEALTHY even if
+    #    momentarily frozen — an agent paused it at a breakpoint, etc.)
+    if kdb_fresh:
+        return "HEALTHY", "fresh kdb/autopsy artefact — under active investigation"
+
+    # 3. Gate advanced in the window -> unambiguously making forward progress.
+    if gate_advanced:
+        return "HEALTHY", (
+            f"[GATE] advanced {s0['deepest_gate']!r}->{s1['deepest_gate']!r} "
+            f"(sc rate {sc_rate:.0f}/s)"
+        )
+
+    # 4. WEDGED-PRE-BUGCHECK — a thread has been stuck in one syscall for close
+    #    to the no-forward-progress watchdog budget, with no gate advance.
+    if stuck_ticks >= _HEALTH_WEDGE_TICKS:
+        return "WEDGED-PRE-BUGCHECK", (
+            f"thread STUCK_IN_NR={s1.get('stuck_nr')} for {stuck_ticks} ticks "
+            f"(approaching ~60000-tick deadlock watchdog), no [GATE] advance"
+        )
+
+    # 5. SPINNING — busy loop.  Either sc rockets with no gate advance, or one
+    #    tag/syscall dominates the tail at high CPU.
+    if sc_rate >= _HEALTH_SPIN_SC_RATE:
+        return "SPINNING", (
+            f"sc climbing {sc_rate:.0f}/s with no [GATE] advance — busy loop"
+        )
+    if (dominant_tag is not None
+            and dominant_pct >= _HEALTH_DOMINANT_TAG_PCT
+            and cpu >= 50.0):
+        return "SPINNING", (
+            f"{dominant_tag} dominates {dominant_pct:.0f}% of the tail at "
+            f"{cpu:.0f}% CPU — single-tag busy loop"
+        )
+
+    # 6. Frozen sc + frozen gate at meaningful CPU -> STALLED.  The FUTEX churn
+    #    case (content-handshake wedge) reads here when sc isn't climbing fast.
+    frozen = abs(sc_delta) <= _HEALTH_FROZEN_SC_DELTA
+    if frozen and cpu >= 20.0:
+        why = "sc frozen + [GATE] frozen at meaningful CPU"
+        if futex_churn:
+            why += " (FUTEX_WAIT->FUTEX_TIMEDOUT churn on the same uaddr)"
+        return "STALLED", why
+
+    # 7. Genuinely slow but advancing -> SLOW-ALIVE.  Either sc is creeping up,
+    #    or the tick is advancing while the firehose throttles forward progress.
+    #    This MUST win over a STALLED misread for a firehose boot.
+    if sc_rate > _HEALTH_SLOW_SC_RATE or (sc_delta > _HEALTH_FROZEN_SC_DELTA):
+        return "SLOW-ALIVE", (
+            f"sc creeping {sc_rate:.0f}/s (firehose-throttled), no gate advance"
+        )
+    if tick_advanced and not frozen:
+        return "SLOW-ALIVE", "kernel tick advancing, sc creeping — slow but alive"
+
+    # 8. Fallback.  A frozen log is only STALLED when a thread is actually
+    #    burning cycles — STALLED is defined as "no progress AT MEANINGFUL CPU".
+    #    A frozen log at low/idle CPU is quiesced (blocked in the scheduler,
+    #    nothing to do), NOT a circle, so it must read SLOW-ALIVE and never be
+    #    reaped.  (Rule 6 already caught the frozen + >=20% CPU case; this only
+    #    reaches frozen sessions below that CPU floor or with CPU unknown.)
+    if frozen:
+        if cpu >= 20.0:
+            return "STALLED", "sc + [GATE] frozen across samples at meaningful CPU"
+        return "SLOW-ALIVE", "sc flat at low/idle CPU — quiesced, not a circle"
+    if tick_advanced:
+        return "SLOW-ALIVE", "tick advancing — slow but alive"
+    return "SLOW-ALIVE", "no decisive spin/stall signal — assume alive"
+
+
+def _health_one(sid: str, sample_gap_s: float, do_sample2: bool = True) -> dict:
+    """Compute the full health record for one session.
+
+    Reads the serial log directly so it also works on a STOPPED session whose
+    <sid>.json was already pruned (post-mortem) — the single-sid `health <sid>`
+    path is intentionally lenient so an agent can classify a historical wedge."""
+    sess: dict = {}
+    p = _session_path(sid)
+    if p.exists():
+        try:
+            sess = _load_session(sid)
+        except SystemExit:
+            sess = {}
+    serial_log = sess.get("serial_log") or str(HARNESS_DIR / f"{sid}.serial.log")
+    pid = int(sess.get("pid") or 0)
+    alive = _pid_alive(pid) if pid else False
+
+    if not Path(serial_log).exists():
+        return {
+            "sid": sid, "qemu_pid": pid or None, "alive": alive,
+            "verdict": "DEAD/BUGCHECKED",
+            "reason": "no serial log on disk (session gone)",
+            "etimes": None, "cpu_pct": None,
+            "deepest_gate": None, "gate_advancing": False,
+            "sc_now": None, "sc_rate_per_s": None, "serial_growth_kbps": None,
+            "dominant_tail_tag": None, "dominant_tag_pct": None,
+            "futex_timeout_churn": False, "kdb_autopsy_fresh": False,
+            "bugchecked": False, "ticks_since_progress": None,
+        }
+
+    # Sample 0.
+    t0 = time.monotonic()
+    size0 = Path(serial_log).stat().st_size if Path(serial_log).exists() else 0
+    s0 = _health_scan_serial(serial_log)
+
+    # Bugcheck/panic in the tail short-circuits the gap wait — no point sampling
+    # a halted kernel for a rate.
+    tail_for_bc = _health_tail_bytes(Path(serial_log), 256 * 1024)
+    bugchecked = bool(_HEALTH_BUGCHECK_RE.search(tail_for_bc))
+
+    if do_sample2 and alive and not bugchecked:
+        # Sleep the rate window, then resample.
+        remaining = sample_gap_s
+        # Don't block forever if the file vanished.
+        time.sleep(max(0.0, remaining))
+    dt = time.monotonic() - t0
+
+    size1 = Path(serial_log).stat().st_size if Path(serial_log).exists() else size0
+    s1 = _health_scan_serial(serial_log) if (do_sample2 and alive and not bugchecked) else s0
+    if not (do_sample2 and alive and not bugchecked):
+        dt = max(dt, 1e-6)
+
+    # ps + opportunistic kdb.
+    ps = _health_ps(pid) if alive else {}
+    kdb_fresh = _health_kdb_autopsy_fresh(sid)
+    kdb_proclist = _health_kdb_proclist(sess) if (alive and sess) else None
+
+    # Tail-tag dominance + futex churn.
+    dominant_tag, dominant_pct, tagged_n = _health_dominant_tail_tag(
+        serial_log, _HEALTH_TAIL_LINES)
+    futex_churn = (
+        dominant_tag == "[FUTEX_TIMEDOUT]"
+        and dominant_pct >= 40.0
+    )
+
+    # Rates.
+    sc_delta = s1["sc_sum"] - s0["sc_sum"]
+    sc_rate = (sc_delta / dt) if dt > 0 else 0.0
+    growth_kbps = ((size1 - size0) / 1024.0 / dt) if dt > 0 else 0.0
+
+    gate_advanced = (
+        s1["gate_ordinal"] > s0["gate_ordinal"]
+        or (s1["deepest_gate"] != s0["deepest_gate"]
+            and s1["deepest_gate"] is not None)
+    )
+    ticks_since_progress = max(s0["max_stuck_ticks"], s1["max_stuck_ticks"]) or None
+
+    verdict, reason = _health_classify(
+        s0, s1, ps, dt, dominant_tag, dominant_pct, futex_churn,
+        kdb_fresh, bugchecked, alive,
+    )
+
+    rec = {
+        "sid":                 sid,
+        "qemu_pid":            pid or None,
+        "alive":               alive,
+        "etimes":              ps.get("etimes"),
+        "cpu_pct":             ps.get("cpu_pct"),
+        "deepest_gate":        s1["deepest_gate"],
+        "gate_advancing":      gate_advanced,
+        "sc_now":              s1["sc_sum"],
+        "sc_rate_per_s":       round(sc_rate, 1),
+        "serial_growth_kbps":  round(growth_kbps, 2),
+        "dominant_tail_tag":   dominant_tag,
+        "dominant_tag_pct":    dominant_pct,
+        "futex_timeout_churn": futex_churn,
+        "kdb_autopsy_fresh":   kdb_fresh,
+        "bugchecked":          bugchecked,
+        "ticks_since_progress": ticks_since_progress,
+        "verdict":             verdict,
+        "reason":              reason,
+        # Additive context — handy for an agent without changing the contract.
+        "sample_gap_s":        round(dt, 2),
+        "per_proc_sc":         s1["proc_sc"],
+        "latest_tick":         s1["latest_tick"],
+        "stuck_nr":            s1["stuck_nr"],
+        "tagged_tail_lines":   tagged_n,
+        "features":            sess.get("features"),
+        # Cross-reference the in-process watcher's own early-warning flag (the
+        # LivelockDetector stamped into the session JSON by `start`).  Additive,
+        # and only present on sessions started after that landed — health does
+        # NOT depend on it, but surfacing it lets an agent see both the
+        # out-of-band classifier verdict and the in-process watcher's view at a
+        # glance.
+        "watcher_livelock_suspected": bool(sess.get("livelock_suspected", False)),
+        "watcher_terminal_cause":     sess.get("terminal_cause"),
+    }
+    if kdb_proclist is not None:
+        rec["kdb_proc_list"] = kdb_proclist
+    return rec
+
+
+def cmd_health(args):
+    """Active circle/spin/stall detector — see HEALTH_CLASSES.
+
+    `health <sid>`                  one session -> JSON record.
+    `health --all`                  every live session -> JSON array.
+    `health --all --reap-circles`   additionally stop() SPINNING / STALLED /
+                                    WEDGED-PRE-BUGCHECK / DEAD sessions and
+                                    report reaped:[...] with a per-sid reason.
+                                    HEALTHY and SLOW-ALIVE are NEVER reaped.
+
+    Takes two samples `--gap` seconds apart (default 4) for the rate signals."""
+    gap = float(getattr(args, "gap", _HEALTH_SAMPLE_GAP_S) or _HEALTH_SAMPLE_GAP_S)
+
+    if not args.all:
+        if not args.sid:
+            _out({"error": "health <sid> requires a session id, or use --all"})
+            sys.exit(1)
+        _out(_health_one(args.sid, gap))
+        return
+
+    # --all: classify every live session.  Only a canonical <sid>.json counts —
+    # NOT the auxiliary `<sid>.kdb.json` / `<sid>.fdmap.*.json` /
+    # `<sid>.thread-park.*.json` caches, which share the `*.json` glob but carry
+    # no top-level "sid" key.  Filtering on a dict-with-"sid" matches cmd_list's
+    # implicit contract and avoids classifying a phantom "<sid>.kdb" session.
+    sids = []
+    for p in sorted(HARNESS_DIR.glob("*.json")):
+        try:
+            with p.open() as f:
+                doc = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(doc, dict) and doc.get("sid") == p.stem:
+            sids.append(p.stem)
+    records = []
+    reaped = []
+    for sid in sids:
+        try:
+            rec = _health_one(sid, gap)
+        except Exception as e:  # never let one bad session sink the sweep
+            rec = {"sid": sid, "verdict": "DEAD/BUGCHECKED",
+                   "reason": f"health probe error: {e}",
+                   "alive": False}
+        records.append(rec)
+
+    if args.reap_circles:
+        for rec in records:
+            verdict = rec.get("verdict")
+            if verdict in HEALTH_REAP_CLASSES:
+                sid = rec["sid"]
+                reason = rec.get("reason", "")
+                # NEVER a silent kill — log the reap to the per-session event
+                # stream AND echo it in the output with the deciding reason.
+                try:
+                    _emit_event(sid, {
+                        "kind": "health_reap",
+                        "verdict": verdict,
+                        "reason": reason,
+                        "cpu_pct": rec.get("cpu_pct"),
+                        "sc_rate_per_s": rec.get("sc_rate_per_s"),
+                        "ticks_since_progress": rec.get("ticks_since_progress"),
+                    })
+                except Exception:
+                    pass
+                # stop() is idempotent and prints its own JSON; suppress that so
+                # our single health envelope stays the one structured result.
+                _reap_stop_quiet(sid)
+                reaped.append({"sid": sid, "verdict": verdict, "reason": reason})
+                rec["reaped"] = True
+
+    _out({
+        "sessions": records,
+        "reaped":   reaped,
+        "reap_enabled": bool(args.reap_circles),
+        "classes":  HEALTH_CLASSES,
+    })
+
+
+def _reap_stop_quiet(sid: str):
+    """stop() a session without letting its `_out` JSON leak into health's
+    single structured envelope.  Reuses cmd_stop so the teardown (SIGTERM ->
+    SIGKILL, socket/ESP cleanup) is identical to a manual stop."""
+    import io  # noqa: PLC0415 — local to keep the helper self-contained
+    class _A:  # minimal args shim for cmd_stop
+        pass
+    a = _A()
+    a.sid = sid
+    buf = io.StringIO()
+    old = sys.stdout
+    try:
+        sys.stdout = buf
+        cmd_stop(a)
+    except SystemExit:
+        pass
+    finally:
+        sys.stdout = old
+
+
 def cmd_status(args):
     sid = args.sid
     p   = _session_path(sid)
@@ -12279,6 +12875,28 @@ def main():
              "and terminal_cause.")
     p_ffprog.add_argument("sid")
 
+    # health — active circle / spin / stall detector (see HEALTH_CLASSES).
+    p_health = sub.add_parser(
+        "health",
+        help="[Tier0] Classify a boot's liveness from serial+ps (+opportunistic "
+             "kdb): HEALTHY / SLOW-ALIVE / SPINNING / STALLED / "
+             "WEDGED-PRE-BUGCHECK / DEAD-BUGCHECKED. Takes two samples a few "
+             "seconds apart for the rate signals. `--all` sweeps every live "
+             "session; add `--reap-circles` to stop() (and LOG) the wedged "
+             "ones (SPINNING/STALLED/WEDGED-PRE-BUGCHECK/DEAD). HEALTHY and "
+             "SLOW-ALIVE are never reaped.")
+    p_health.add_argument("sid", nargs="?", default=None,
+                          help="session id (omit with --all)")
+    p_health.add_argument("--all", action="store_true",
+                          help="classify every live session in the harness dir")
+    p_health.add_argument("--reap-circles", dest="reap_circles",
+                          action="store_true",
+                          help="with --all: stop() and log SPINNING/STALLED/"
+                               "WEDGED-PRE-BUGCHECK/DEAD sessions")
+    p_health.add_argument("--gap", type=float, default=_HEALTH_SAMPLE_GAP_S,
+                          help="seconds between the two rate samples "
+                               f"(default {_HEALTH_SAMPLE_GAP_S})")
+
     # scrings — parse firefox-test syscall ring-buffer dumps from serial log.
     p_scrings = sub.add_parser(
         "scrings",
@@ -12799,6 +13417,7 @@ def main():
         "prune":   cmd_prune,
         "results": cmd_results,
         "ff-progress": cmd_ff_progress,
+        "health":      cmd_health,
         "scrings": cmd_scrings,
         "stack":   cmd_stack,
         "ustack":  cmd_ustack,

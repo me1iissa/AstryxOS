@@ -112,6 +112,18 @@ jobs:
       # guard so a spinning FF render boot pins a host core indefinitely.
       - name: qemu-harness host-only smoke (staleness + livelock reap)
         run: python3 scripts/qemu-harness-smoke.py --staleness-only
+      # Boot-free smoke for the `health` circle/spin/stall classifier (the
+      # coordinator runs it every turn, so a regression cascades into every
+      # dispatch). Layer 1 pins _health_classify's verdict for all six classes
+      # over fixture sample-pairs (incl. the load-bearing "firehose-throttled
+      # boot reads SLOW-ALIVE, never reaped" invariant); Layer 2 drives the
+      # `health <sid>` / `health --all --reap-circles` argv over synthetic
+      # serial logs and asserts the JSON contract + that --reap-circles stops
+      # AND logs (never silently) exactly the four circle classes.
+      # Failure mode this prevents: a refactor flipping a verdict so health
+      # either reaps a HEALTHY/SLOW-ALIVE boot or fails to reap a wedged one.
+      - name: health smoke (circle/spin/stall classifier + reap contract)
+        run: python3 scripts/health-smoke.py
 
   kernel-build:
     name: bootloader + kernel builds
