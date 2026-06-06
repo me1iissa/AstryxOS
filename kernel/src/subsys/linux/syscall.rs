@@ -3621,6 +3621,22 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 Err(e) => crate::subsys::linux::errno::vfs_err(e),
             }
         }
+        // 86: link(oldpath, newpath) — create a hard link.  Both are C-string
+        // paths.  Implements POSIX `link(2)`; the dominant real-world caller on
+        // this path is fontconfig's atomic cache-lock idiom `link(TMP, LCK)`
+        // (FcDirCacheLock).  Without it fontconfig cannot lock the cache dir,
+        // never persists a font cache, and rescans fonts forever — stalling the
+        // content-process font-init thread.
+        86 => {
+            let old_raw = read_cstring_from_user(arg1);
+            let new_raw = read_cstring_from_user(arg2);
+            let old_str = core::str::from_utf8(&old_raw).unwrap_or("");
+            let new_str = core::str::from_utf8(&new_raw).unwrap_or("");
+            match crate::vfs::link(old_str, new_str) {
+                Ok(()) => 0,
+                Err(e) => crate::subsys::linux::errno::vfs_err(e),
+            }
+        }
         // 89: readlink(path, buf, bufsiz) — C string path
         // Special-cased for /proc/self/exe → returns current process executable path.
         89 => {
@@ -5726,6 +5742,8 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
         263 => sys_unlinkat(arg1, arg2, arg3),
         // 264: renameat(olddirfd, oldpath, newdirfd, newpath)
         264 => sys_renameat(arg1, arg2, arg3, arg4),
+        // 265: linkat(olddirfd, oldpath, newdirfd, newpath, flags) — hard link.
+        265 => sys_linkat(arg1, arg2, arg3, arg4, arg5),
 
         // ─── T1 batch 2 additions ─────────────────────────────────────────
 
@@ -11744,6 +11762,35 @@ fn sys_renameat(olddirfd: u64, oldpath: u64, newdirfd: u64, newpath: u64) -> i64
         Err(e) => return e,
     };
     match crate::vfs::rename(&old, &new) {
+        Ok(()) => 0,
+        Err(e) => crate::subsys::linux::errno::vfs_err(e),
+    }
+}
+
+/// linkat(olddirfd, oldpath, newdirfd, newpath, flags) — create a hard link
+/// relative to directory fds.  Implements POSIX/Linux `linkat(2)`.
+///
+/// `flags` may carry `AT_SYMLINK_FOLLOW` (0x400) — follow a trailing symlink
+/// in `oldpath` — and `AT_EMPTY_PATH` (0x1000).  AstryxOS' `vfs::link` does
+/// not follow a trailing symlink (it links the named object itself); since
+/// the dominant caller (fontconfig's `link(TMP, LCK)`) links a regular file,
+/// not a symlink, both behaviours coincide and the flags are accepted but
+/// have no observable effect here.  Unknown flag bits are rejected (EINVAL).
+fn sys_linkat(olddirfd: u64, oldpath: u64, newdirfd: u64, newpath: u64, flags: u64) -> i64 {
+    const AT_SYMLINK_FOLLOW: u64 = 0x400;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
+        return -22; // EINVAL
+    }
+    let old = match resolve_at_path(olddirfd, oldpath) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let new = match resolve_at_path(newdirfd, newpath) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    match crate::vfs::link(&old, &new) {
         Ok(()) => 0,
         Err(e) => crate::subsys::linux::errno::vfs_err(e),
     }

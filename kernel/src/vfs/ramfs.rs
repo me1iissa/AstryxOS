@@ -33,6 +33,13 @@ enum RamInode {
         created: u64,
         modified: u64,
         accessed: u64,
+        /// Hard-link count (POSIX `st_nlink`).  Created with 1; incremented
+        /// by `link(2)` (a second directory entry naming this inode) and
+        /// decremented by `unlink(2)`.  The inode's storage is freed only
+        /// when this count reaches 0, so a file kept alive solely by a
+        /// second link (e.g. fontconfig's `link(TMP, LCK)` lockfile pattern,
+        /// per `link(2)`) survives removal of its original name.
+        nlink: u32,
     },
     Dir {
         inode: u64,
@@ -137,6 +144,7 @@ impl FileSystemOps for RamFs {
             created: now,
             modified: now,
             accessed: now,
+            nlink: 1,
         };
         inodes.push(new_file);
 
@@ -217,8 +225,22 @@ impl FileSystemOps for RamFs {
             entries.retain(|e| e.name != name);
         }
 
-        // Remove the inode.
-        inodes.retain(|n| n.inode_number() != target_inode);
+        // Per POSIX `unlink(2)`: "When the file's link count reaches 0 and no
+        // process has the file open, the space occupied by the file shall be
+        // freed."  A regular file may have multiple hard links (see `link`);
+        // decrement its link count and only free the inode storage once the
+        // last name is gone.  Directories and symlinks have exactly one link
+        // in ramfs, so they are freed unconditionally.
+        let drop_inode = match &mut inodes[target_idx] {
+            RamInode::File { nlink, .. } => {
+                *nlink = nlink.saturating_sub(1);
+                *nlink == 0
+            }
+            _ => true,
+        };
+        if drop_inode {
+            inodes.retain(|n| n.inode_number() != target_inode);
+        }
 
         Ok(())
     }
@@ -298,7 +320,7 @@ impl FileSystemOps for RamFs {
         let idx = Self::find_inode_idx(&inodes, inode).ok_or(VfsError::NotFound)?;
 
         match &inodes[idx] {
-            RamInode::File { inode, data, permissions, created, modified, accessed } => Ok(FileStat {
+            RamInode::File { inode, data, permissions, created, modified, accessed, .. } => Ok(FileStat {
                 inode: *inode,
                 file_type: FileType::RegularFile,
                 size: data.len() as u64,
@@ -537,6 +559,50 @@ impl FileSystemOps for RamFs {
         Ok(())
     }
 
+    /// Create a hard link: insert `name` in `parent_inode` referencing the
+    /// existing `target_inode`, bumping its link count.
+    ///
+    /// Per POSIX `link(2)`:
+    ///   * "If the path named by `path2` exists, `link()` shall fail" — EEXIST.
+    ///   * Hard-linking a directory is not permitted — EPERM.
+    /// Symlinks are likewise not hard-linkable here (ramfs tracks a link
+    /// count only on regular files).  This implements exactly the lockfile
+    /// idiom `link(TMP, LCK)` that fontconfig (`FcDirCacheLock`) and many
+    /// other tools use for atomic, NFS-safe locking.
+    fn link(&self, target_inode: u64, parent_inode: u64, name: &str) -> VfsResult<()> {
+        let mut inodes = self.inodes.lock();
+
+        let parent_idx = Self::find_inode_idx(&inodes, parent_inode).ok_or(VfsError::NotFound)?;
+        match &inodes[parent_idx] {
+            RamInode::Dir { entries, .. } => {
+                if entries.iter().any(|e| e.name == name) {
+                    return Err(VfsError::FileExists);
+                }
+            }
+            _ => return Err(VfsError::NotADirectory),
+        }
+
+        // The target must exist and be a regular file (no dir/symlink links).
+        let target_idx = Self::find_inode_idx(&inodes, target_inode).ok_or(VfsError::NotFound)?;
+        match &mut inodes[target_idx] {
+            RamInode::File { nlink, .. } => {
+                *nlink = nlink.saturating_add(1);
+            }
+            RamInode::Dir { .. } => return Err(VfsError::PermissionDenied), // EPERM
+            RamInode::SymLink { .. } => return Err(VfsError::Unsupported),
+        }
+
+        if let RamInode::Dir { entries, modified, .. } = &mut inodes[parent_idx] {
+            entries.push(DirEntry {
+                name: String::from(name),
+                inode: target_inode,
+            });
+            *modified = now_secs();
+        }
+
+        Ok(())
+    }
+
     fn symlink(&self, parent_inode: u64, name: &str, target: &str) -> VfsResult<u64> {
         let mut inodes = self.inodes.lock();
 
@@ -599,6 +665,16 @@ impl FileSystemOps for RamFs {
         let mut inodes = self.inodes.lock();
         let parent_idx = Self::find_inode_idx(&inodes, parent_inode)
             .ok_or(VfsError::NotFound)?;
+        // Resolve the target inode of the name being removed so we can drop its
+        // link count.  `unlink_entry` removes only the directory entry (the
+        // deferred-delete path keeps the inode storage alive until the last fd
+        // closes), but the *link* count must still fall — otherwise a file with
+        // a second hard link would over-count and never be freed.
+        let target_inode = match &inodes[parent_idx] {
+            RamInode::Dir { entries, .. } =>
+                entries.iter().find(|e| e.name == name).map(|e| e.inode),
+            _ => return Err(VfsError::NotADirectory),
+        };
         match &mut inodes[parent_idx] {
             RamInode::Dir { entries, modified, .. } => {
                 let before = entries.len();
@@ -607,14 +683,33 @@ impl FileSystemOps for RamFs {
                     return Err(VfsError::NotFound);
                 }
                 *modified = now_secs();
-                Ok(())
             }
-            _ => Err(VfsError::NotADirectory),
+            _ => return Err(VfsError::NotADirectory),
         }
+        if let Some(ti) = target_inode {
+            if let Some(tidx) = Self::find_inode_idx(&inodes, ti) {
+                if let RamInode::File { nlink, .. } = &mut inodes[tidx] {
+                    *nlink = nlink.saturating_sub(1);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn remove_inode(&self, inode: u64) -> VfsResult<()> {
         let mut inodes = self.inodes.lock();
+        // Honour the hard-link count: the deferred-delete machinery calls this
+        // on last-close of an unlinked file, but if another hard link still
+        // names the inode (nlink > 0) its storage must survive (POSIX
+        // `unlink(2)` link-count semantics).  Only regular files carry a link
+        // count; directories/symlinks are single-linked here.
+        if let Some(idx) = Self::find_inode_idx(&inodes, inode) {
+            if let RamInode::File { nlink, .. } = &inodes[idx] {
+                if *nlink > 0 {
+                    return Ok(()); // still referenced by another name — keep it
+                }
+            }
+        }
         inodes.retain(|n| n.inode_number() != inode);
         Ok(())
     }

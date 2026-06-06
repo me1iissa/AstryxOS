@@ -564,6 +564,11 @@ pub fn run() -> ! {
     total += 1;
     if test_vfs_rename() { passed += 1; }
 
+    // ── Test 517: VFS hard links (link/linkat + nlink lifetime) ─────────
+
+    total += 1;
+    if test_vfs_hardlink() { passed += 1; }
+
     // ── Test 35: VFS Symlinks ───────────────────────────────────────────
 
     total += 1;
@@ -12349,6 +12354,72 @@ fn test_vfs_rename() -> bool {
     // Clean up
     let _ = crate::vfs::remove("/tmp/rename_dir_dst/file_inside");
     let _ = crate::vfs::remove("/tmp/rename_dir_dst");
+
+    if ok { test_println!("  PASS"); } else { test_println!("  FAIL"); }
+    ok
+}
+
+fn test_vfs_hardlink() -> bool {
+    test_header!("VFS Hard Links (link/linkat + nlink lifetime)");
+    let mut ok = true;
+
+    // Create the original file with known content.
+    let _ = crate::vfs::remove("/tmp/hl_orig");
+    let _ = crate::vfs::remove("/tmp/hl_link");
+    if crate::vfs::create_file("/tmp/hl_orig").is_err() {
+        test_println!("  FAIL: could not create /tmp/hl_orig");
+        return false;
+    }
+    if crate::vfs::write_file("/tmp/hl_orig", b"hardlink payload").is_err() {
+        test_println!("  FAIL: could not write /tmp/hl_orig");
+        ok = false;
+    }
+
+    // link(orig, new) — both names must now resolve to the same content.
+    match crate::vfs::link("/tmp/hl_orig", "/tmp/hl_link") {
+        Ok(()) => {
+            match crate::vfs::read_file("/tmp/hl_link") {
+                Ok(d) if d == b"hardlink payload" => {}
+                Ok(_) => { test_println!("  FAIL: linked name has wrong content"); ok = false; }
+                Err(e) => { test_println!("  FAIL: cannot read linked name: {:?}", e); ok = false; }
+            }
+        }
+        Err(e) => { test_println!("  FAIL: link() failed: {:?}", e); ok = false; }
+    }
+
+    // EEXIST: linking onto an existing name must fail.
+    if crate::vfs::link("/tmp/hl_orig", "/tmp/hl_link").is_ok() {
+        test_println!("  FAIL: link onto existing name should fail (EEXIST)");
+        ok = false;
+    }
+
+    // ENOENT: linking a nonexistent source must fail.
+    if crate::vfs::link("/tmp/hl_nope", "/tmp/hl_link2").is_ok() {
+        test_println!("  FAIL: link of nonexistent source should fail (ENOENT)");
+        ok = false;
+    }
+
+    // The fontconfig lock invariant: remove the ORIGINAL name; the inode must
+    // survive because the second link still references it (POSIX link count).
+    if crate::vfs::remove("/tmp/hl_orig").is_err() {
+        test_println!("  FAIL: could not unlink original name");
+        ok = false;
+    }
+    match crate::vfs::read_file("/tmp/hl_link") {
+        Ok(d) if d == b"hardlink payload" => {}
+        Ok(_) => { test_println!("  FAIL: surviving link has wrong content after orig unlink"); ok = false; }
+        Err(e) => {
+            test_println!("  FAIL: inode died after one unlink (nlink not honoured): {:?}", e);
+            ok = false;
+        }
+    }
+
+    // Remove the last name; the file must now be gone.
+    let _ = crate::vfs::remove("/tmp/hl_link");
+    if crate::vfs::stat("/tmp/hl_link").is_ok() {
+        test_println!("  FAIL: file still present after last unlink");
+        ok = false;
+    }
 
     if ok { test_println!("  PASS"); } else { test_println!("  FAIL"); }
     ok
