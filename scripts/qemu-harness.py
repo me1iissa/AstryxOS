@@ -11575,6 +11575,11 @@ def main():
         # struct dump + parked waiters + recent wakes + holder + verdict.
         # See subsys/linux/futex_cluster.rs::recent_wakes_near + op_cond_autopsy.
         "cond-autopsy",
+        # epoll-watch: live epoll interest-set + per-fd readiness/delivered dump
+        # for one (pid, epfd).  Tests "fd POLLIN-ready but epoll_wait never
+        # delivers it" (reactor-starvation vs kernel readiness-drop).  Request
+        # builder + op_epoll_watch already wired; this just enables the CLI op.
+        "epoll-watch",
         # Terse file-backed VMA map; one entry per VMA with first_page_phys.
         "procmaps",
         # FUTEX_WAKE cluster-wake compensation (firefox-test/test-mode only).
