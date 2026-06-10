@@ -47,6 +47,19 @@ pub struct EpollWatch {
     /// later re-rise fires a fresh edge.  Unused (always 0) for
     /// level-triggered watches.
     pub et_seen: u32,
+    /// Per-source EPOLLIN rising-edge generation last delivered to this
+    /// `EPOLLET` watch.  `et_seen` alone can only re-arm an edge when an
+    /// `epoll_wait` happens to re-poll the fd while it is momentarily
+    /// not-ready; a source that drops to not-ready and rises again entirely
+    /// between two `epoll_wait` calls would otherwise be missed, because the
+    /// readiness *bit* is identical across the two observations.  Sources
+    /// that expose a monotonic rising-edge generation (e.g. eventfd) bump it
+    /// on every not-ready→ready transition; storing the last-delivered value
+    /// here lets `epoll_wait` recognise that a fresh edge occurred even when
+    /// the bit looks unchanged, as `epoll(7)` requires.  Sources that do not
+    /// expose a generation report 0, so this field stays 0 and the bit-based
+    /// `et_seen` logic governs them unchanged.
+    pub et_rise: u64,
 }
 
 /// Per-process monotonically increasing identifier for epoll instances.
@@ -137,7 +150,7 @@ impl EpollInstance {
     /// and no spurious HUP/ERR readiness leaks into the parking decision.
     pub fn add(&mut self, fd: usize, events: u32, data: u64) -> bool {
         if self.watches.iter().any(|w| w.fd == fd) { return false; }
-        self.watches.push(EpollWatch { fd, events, data, et_seen: 0 });
+        self.watches.push(EpollWatch { fd, events, data, et_seen: 0, et_rise: 0 });
         true
     }
 
@@ -163,8 +176,10 @@ impl EpollInstance {
             // `EPOLL_CTL_MOD` re-arms the watch: per `epoll(7)`, changing the
             // interest mask of an `EPOLLET` watch makes any currently-asserted
             // condition count as a fresh edge on the next `epoll_wait`.  Reset
-            // the edge baseline so a level-ready fd is reported once more.
+            // both edge baselines (the seen-bits AND the rising-edge
+            // generation) so a level-ready fd is reported once more.
             w.et_seen = 0;
+            w.et_rise = 0;
             true
         } else {
             false

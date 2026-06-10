@@ -56,11 +56,21 @@ struct EventFdEntry {
     counter: u64,
     flags:   u32,
     in_use:  bool,
+    /// EPOLLIN rising-edge generation.  Incremented every time the counter
+    /// transitions from 0 (not read-ready) to non-zero (read-ready) — i.e.
+    /// on each rising edge of the `EPOLLIN` condition.  Edge-triggered
+    /// `epoll_wait(2)` watchers compare this against the generation they
+    /// last delivered, so a drop-then-rise that happens entirely between two
+    /// `epoll_wait` calls (with no intervening call to re-observe the
+    /// not-ready state) is still reported as a fresh edge, as required by
+    /// `epoll(7)` ("Level-triggered and edge-triggered notification").
+    /// Starts at 0; the first rising edge makes it 1.
+    rise_seq: u64,
 }
 
 impl EventFdEntry {
     const fn empty() -> Self {
-        Self { counter: 0, flags: 0, in_use: false }
+        Self { counter: 0, flags: 0, in_use: false, rise_seq: 0 }
     }
 }
 
@@ -163,8 +173,32 @@ pub fn write(id: u64, val: u64) -> Result<(), i64> {
     if val > u64::MAX - 1 - slot.counter {
         return Err(-27); // EFBIG
     }
+    // A write of 0 leaves the counter unchanged and is not a rising edge
+    // (per eventfd(2), only a non-zero add can make a zero counter ready).
+    let was_zero = slot.counter == 0;
     slot.counter += val;
+    if was_zero && slot.counter > 0 {
+        // Counter crossed 0 → non-zero: this is an `EPOLLIN` rising edge.
+        // Bump the generation so an edge-triggered epoll watcher detects a
+        // fresh edge even if it never observed the intervening not-ready
+        // state (epoll(7)).
+        slot.rise_seq = slot.rise_seq.wrapping_add(1);
+    }
     Ok(())
+}
+
+/// EPOLLIN rising-edge generation for this eventfd (see
+/// `EventFdEntry::rise_seq`).  Returns 0 for an absent/closed slot — a
+/// freshly observed generation that can never equal a live watcher's
+/// last-delivered value once the fd has had at least one rising edge.
+/// Used by edge-triggered `epoll_wait(2)` to distinguish a continuously
+/// asserted readiness from a drop-then-rise that occurred between calls.
+pub fn rise_seq(id: u64) -> u64 {
+    let table = TABLE.lock();
+    table.get(id as usize)
+        .filter(|s| s.in_use)
+        .map(|s| s.rise_seq)
+        .unwrap_or(0)
 }
 
 /// Free an eventfd slot.  Wakes every reader parked on the slot so they

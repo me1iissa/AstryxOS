@@ -243,7 +243,7 @@ Ranked by frequency in real program traces. Syscalls that would most unblock rea
 | 229 | `clock_getres` | Stub; always returns 1 ns |
 | 230 | `clock_nanosleep` | Full; delegates to nanosleep impl |
 | 231 | `exit_group` | Full; kills all threads in process group |
-| 232 | `epoll_wait` | Full |
+| 232 | `epoll_wait` | Full; level- and edge-triggered (`EPOLLET`) per `epoll(7)`. `EPOLLET` reports a readiness bit only on its rising edge and re-arms after a ready→not-ready→ready transition. A source that exposes a monotonic rising-edge generation (eventfd) re-arms `EPOLLIN` even when the drop-then-rise happens entirely between two `epoll_wait` calls (no intervening call observes the not-ready state); other sources use the bit-only `et_seen` baseline. `EPOLLERR`/`EPOLLHUP` are always-on; `EPOLL_CTL_MOD` resets the edge baseline. |
 | 233 | `epoll_ctl` | Full |
 | 234 | `tgkill` | Full; signal by tgid |
 | 247 | `waitid` | Full; honours WNOWAIT; fills `siginfo_t` at architectural x86-64 offsets (si_pid@16, si_uid@20, si_status@24) per `<asm-generic/siginfo.h>` |
