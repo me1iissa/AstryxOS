@@ -496,20 +496,124 @@ pub fn socket_recv_status(id: u64) -> Result<RecvOutcome, &'static str> {
             // Empty stream read: distinguish peer-FIN EOF from would-block.
             // A connection that has received the peer's FIN sits in
             // CloseWait (or has progressed to LastAck/Closed/TimeWait); with
-            // no buffered data that is an orderly EOF (RFC 793 §3.5).  An
+            // no buffered data that is an orderly EOF (RFC 9293 §3.5).  An
             // Established (or still-handshaking) connection with an empty
             // buffer is would-block.
-            let peer_closed = match super::tcp::get_state(sock.local_port) {
+            //
+            // Use the peer-aware (4-tuple) lookup when the connection's
+            // remote endpoint is known, exactly as `read_from` (above) and
+            // `socket_read_closed` do.  A port-only lookup returns whichever
+            // TCB sits first in the table for this local port — which on a
+            // socket sharing its port with a listener (or another session)
+            // is the wrong TCB, so the EOF edge is read off a sibling and a
+            // reader spins on WouldBlock instead of completing (RFC 9293
+            // §3.6 demultiplexing).
+            let state = if sock.connected && sock.remote_port != 0 {
+                super::tcp::get_state_for(sock.local_port,
+                                          sock.remote_ip, sock.remote_port)
+            } else {
+                super::tcp::get_state(sock.local_port)
+            };
+            let peer_closed = match state {
                 Some(st) => matches!(st,
                     super::tcp::TcpState::CloseWait
                     | super::tcp::TcpState::LastAck
                     | super::tcp::TcpState::TimeWait
                     | super::tcp::TcpState::Closed),
-                // No TCB found for this port: the flow is gone — treat as EOF
-                // so a reader drains to completion rather than spinning.
+                // No TCB found: the flow is gone — treat as EOF so a reader
+                // drains to completion rather than spinning.
                 None => true,
             };
             if peer_closed { Ok(RecvOutcome::Eof) } else { Ok(RecvOutcome::WouldBlock) }
+        }
+    }
+}
+
+/// Like [`socket_recv_status`] but also returns the source 4-tuple of the
+/// data that was dequeued, for callers (recvmsg(2)) that must marshal
+/// `msg_name`.
+///
+/// For UDP this is the true wire source of the datagram (`src_ip`/`src_port`
+/// from the IP/UDP headers); a connection-mode resolver such as musl's
+/// `__res_msend` validates this byte-for-byte against the nameserver it
+/// queried and silently drops a reply whose source does not match (RFC 1035
+/// §7.3, recvmsg(2)).  For TCP the source is the connected peer (RFC 793).
+/// On a non-`Data` outcome the returned address is the connected peer (or a
+/// zero 4-tuple for an unconnected datagram socket), which `recvmsg(2)`
+/// leaves unused because `msg_namelen` is only written on a real message.
+pub fn socket_recv_status_from(id: u64)
+    -> Result<(RecvOutcome, Ipv4Address, u16), &'static str>
+{
+    let sockets = SOCKETS.lock();
+    let sock = sockets.iter().find(|s| s.id == id)
+        .ok_or("socket not found")?;
+
+    // shutdown(SHUT_RD): orderly EOF regardless of socket type.  Report the
+    // connected peer as the (unused) source so the tuple is well-formed.
+    if sock.shut_rd {
+        return Ok((RecvOutcome::Eof, sock.remote_ip, sock.remote_port));
+    }
+
+    match sock.socket_type {
+        SocketType::Udp => {
+            if !sock.bound {
+                return Err("not bound");
+            }
+            let local_port = sock.local_port;
+            drop(sockets);
+            match super::udp::recv(local_port) {
+                Some(datagram) => {
+                    crate::proc::proc_metrics::bump_net_read(
+                        crate::proc::current_pid_lockless(),
+                        datagram.data.len() as u64);
+                    let src_ip   = datagram.src_ip;
+                    let src_port = datagram.src_port;
+                    Ok((RecvOutcome::Data(datagram.data), src_ip, src_port))
+                }
+                // UDP is connectionless: empty queue is would-block, never EOF.
+                None => Ok((RecvOutcome::WouldBlock, [0; 4], 0)),
+            }
+        }
+        SocketType::Tcp => {
+            if !sock.bound {
+                return Err("not bound");
+            }
+            let peer_ip   = sock.remote_ip;
+            let peer_port = sock.remote_port;
+            let data = if sock.connected && sock.remote_port != 0 {
+                super::tcp::read_from(sock.local_port, sock.remote_ip, sock.remote_port)
+            } else {
+                super::tcp::read(sock.local_port)
+            };
+            if !data.is_empty() {
+                crate::proc::proc_metrics::bump_net_read(
+                    crate::proc::current_pid_lockless(), data.len() as u64);
+                return Ok((RecvOutcome::Data(data), peer_ip, peer_port));
+            }
+            // Empty stream read: distinguish peer-FIN EOF from would-block
+            // exactly as socket_recv_status does (RFC 9293 §3.5).  Peer-aware
+            // (4-tuple) lookup when the remote endpoint is known, so the EOF
+            // edge is read off THIS connection and not a sibling sharing the
+            // local port (RFC 9293 §3.6).
+            let state = if sock.connected && sock.remote_port != 0 {
+                super::tcp::get_state_for(sock.local_port,
+                                          sock.remote_ip, sock.remote_port)
+            } else {
+                super::tcp::get_state(sock.local_port)
+            };
+            let peer_closed = match state {
+                Some(st) => matches!(st,
+                    super::tcp::TcpState::CloseWait
+                    | super::tcp::TcpState::LastAck
+                    | super::tcp::TcpState::TimeWait
+                    | super::tcp::TcpState::Closed),
+                None => true,
+            };
+            if peer_closed {
+                Ok((RecvOutcome::Eof, peer_ip, peer_port))
+            } else {
+                Ok((RecvOutcome::WouldBlock, peer_ip, peer_port))
+            }
         }
     }
 }
@@ -626,6 +730,51 @@ pub fn socket_recvfrom(id: u64) -> Result<(Vec<u8>, Ipv4Address, u16), &'static 
     r
 }
 
+/// Returns `true` when a connection-mode (TCP) socket has reached an
+/// orderly end-of-stream that a subsequent `recv(2)` must report as EOF
+/// (a 0-byte return): the peer's FIN has been received (the TCB is in
+/// `CloseWait`/`LastAck`/`TimeWait`/`Closed` or has been reaped) *or* the
+/// local end has `shutdown(SHUT_RD)`.  Buffered data still pending is NOT
+/// EOF — the data must be drained first — so a non-empty receive queue
+/// returns `false` here.
+///
+/// Read-only: this is a blocking-loop break predicate.  A blocking
+/// `recvfrom(2)` that waits on [`socket_has_data`] alone never wakes on a
+/// FIN-closed empty stream (there is no data and none will ever arrive),
+/// so the loop must also break on this EOF condition and fall through to
+/// the EOF-aware drain, returning 0 per RFC 9293 §3.5.  UDP is
+/// connectionless and never reports EOF here.
+pub fn socket_is_read_closed(id: u64) -> bool {
+    let sockets = SOCKETS.lock();
+    let sock = match sockets.iter().find(|s| s.id == id) {
+        Some(s) => s,
+        None => return false,
+    };
+    if sock.shut_rd { return true; }
+    if sock.socket_type != SocketType::Tcp { return false; }
+    if !sock.bound { return false; }
+    let connected   = sock.connected;
+    let remote_ip   = sock.remote_ip;
+    let remote_port = sock.remote_port;
+    let local_port  = sock.local_port;
+    drop(sockets);
+    // Any buffered bytes outrank EOF — drain first.
+    let has_buffered = if connected && remote_port != 0 {
+        super::tcp::has_data_for(local_port, remote_ip, remote_port)
+    } else {
+        super::tcp::has_data(local_port)
+    };
+    if has_buffered { return false; }
+    match super::tcp::get_state(local_port) {
+        Some(st) => matches!(st,
+            super::tcp::TcpState::CloseWait
+            | super::tcp::TcpState::LastAck
+            | super::tcp::TcpState::TimeWait
+            | super::tcp::TcpState::Closed),
+        None => true,
+    }
+}
+
 /// Returns `true` if the socket is a datagram (UDP / SOCK_DGRAM) socket.
 ///
 /// Used by the recvmsg(2) AF_INET path to decide whether to marshal the
@@ -671,6 +820,74 @@ pub fn socket_has_data(id: u64) -> bool {
             }
         }
     }
+}
+
+/// True when the peer has closed its send direction (TCP FIN received)
+/// so a subsequent `read(2)` / `recv(2)` will return data still buffered
+/// and then 0 (orderly EOF).  This is the read-closed condition a
+/// `poll(2)` / `epoll(7)` reader keys on to wake and issue the read that
+/// observes EOF.
+///
+/// Mirrors the EOF discrimination in [`socket_recv_status`]: a connection
+/// that has received the peer FIN sits in CloseWait (or has progressed to
+/// LastAck / TimeWait / Closed) — RFC 9293 §3.5.  We do NOT include a
+/// caller-side `shutdown(SHUT_RD)` here because that is the local read
+/// half-close, already surfaced through the socket's own `shut_rd` flag
+/// at the recv layer; this helper is specifically the *peer*-FIN edge
+/// that no readiness arm currently reports.
+///
+/// Returns `false` for UDP (connectionless: no peer-FIN concept) and for
+/// any socket with no matching TCB.
+pub fn socket_read_closed(id: u64) -> bool {
+    let sockets = SOCKETS.lock();
+    let sock = match sockets.iter().find(|s| s.id == id) {
+        Some(s) => s,
+        None => return false,
+    };
+    if !sock.bound { return false; }
+    match sock.socket_type {
+        SocketType::Udp => false,
+        SocketType::Tcp => {
+            // Prefer a peer-aware lookup when the 4-tuple is known so the
+            // edge fires for THIS connection, not a sibling sharing the
+            // local port (RFC 9293 §3.6 demultiplexing).
+            let state = if sock.connected && sock.remote_port != 0 {
+                super::tcp::get_state_for(sock.local_port,
+                                          sock.remote_ip,
+                                          sock.remote_port)
+            } else {
+                super::tcp::get_state(sock.local_port)
+            };
+            match state {
+                Some(st) => matches!(st,
+                    super::tcp::TcpState::CloseWait
+                    | super::tcp::TcpState::LastAck
+                    | super::tcp::TcpState::TimeWait
+                    | super::tcp::TcpState::Closed),
+                // No TCB: the flow is gone — treat as read-closed so a
+                // parked reader wakes and drains to a clean EOF rather
+                // than parking on a connection that will never deliver.
+                None => true,
+            }
+        }
+    }
+}
+
+/// True when the connection is read-closed (peer FIN) **and** the receive
+/// buffer is empty — i.e. the next `read(2)` returns 0 with nothing left
+/// to drain.  This is the `poll(2)` `POLLHUP` / `epoll(7)` `EPOLLHUP`
+/// condition: the read direction is fully hung up.
+///
+/// While a CloseWait tail is still buffered this returns `false` so the
+/// readiness arm raises `POLLIN` (drain) but withholds `POLLHUP` until
+/// the buffer empties — data-before-EOF ordering (RFC 9293 §3.5, POSIX
+/// `poll(2)` which sets `POLLHUP` only once the channel is fully dead).
+pub fn socket_fully_hung_up(id: u64) -> bool {
+    if !socket_read_closed(id) {
+        return false;
+    }
+    // Read-closed: hung up iff no buffered tail remains to drain.
+    !socket_has_data(id)
 }
 
 /// Close a socket.

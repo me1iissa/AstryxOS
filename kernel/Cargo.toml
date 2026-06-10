@@ -827,6 +827,17 @@ vma-dump-on-gp = ["firefox-test"]
 # AMD64 ABI §3.4 (kernel-mode trap frame layout); POSIX clone(2)
 # CLONE_CHILD_CLEARTID semantics.
 kernel-gp-trap-diag = ["firefox-test"]
+# Diagnostic lever: turn the no-forward-progress scheduler watchdog
+# (`BUGCHECK_SCHEDULER_DEADLOCK`, 0xDEAD_0004) from HALT-the-kernel into
+# WARN-and-continue.  When built, reaching `WATCHDOG_LIMIT` ticks without a
+# context switch on a CPU emits a single rate-limited `[SCHED/WD-WARN]` line
+# (cpu / stall-ticks / tid / pid / tick) and resets that CPU's watchdog
+# counter, so a wedged Firefox render boot SITS live at the wedge for
+# kdb/GDB autopsy instead of bugchecking out.  Standalone (no extra deps) so
+# it can be combined with any feature set.  PRODUCTION SAFETY: default builds
+# (feature OFF) keep the hard bugcheck — the no-progress guarantee is intact.
+# Byte-identical when off.
+sched-deadlock-warn = []
 # Per-binary `[ELF/INIT-ARRAY]` emission at every kernel-side ELF load (main
 # executable + ELF interpreter).  Records DT_INIT / DT_INIT_ARRAY /
 # DT_PREINIT_ARRAY virtual addresses and reads the first four DT_INIT_ARRAY

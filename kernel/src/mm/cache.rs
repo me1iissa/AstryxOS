@@ -586,6 +586,87 @@ pub fn update_range(mount_idx: usize, inode: u64, offset: u64, data: &[u8]) {
     }
 }
 
+/// Overlay cache-resident bytes onto a buffer that already holds the
+/// backing-filesystem's bytes for the file range `[offset, offset + buf.len())`.
+///
+/// This is the read-side symmetric counterpart of [`update_range`] and closes
+/// the *reverse* coherence direction for in-memory filesystems (ramfs / tmpfs /
+/// memfd).  On those backends the inode keeps its own `Vec<u8>` storage AND, once
+/// a page has been demand-faulted by an `mmap(MAP_SHARED)`, a page-cache frame.
+/// A store through the shared mapping lands in the page-cache frame but never
+/// touches the inode `Vec`; a subsequent `read(2)` that consulted only the `Vec`
+/// would observe stale (pre-store) bytes.  Per POSIX:
+///
+///   * mmap(2) (IEEE Std 1003.1-2017): "The application shall ensure ... write
+///     references to a memory region mapped with MAP_SHARED are visible ... to
+///     other processes ... that have mapped the same portion of the file."
+///   * read(2): "After a write() to a regular file has successfully returned ...
+///     any subsequent ... read() ... shall return the data written."  A store
+///     through a MAP_SHARED region IS a write to the underlying file object, so
+///     it must be visible to a later `read(2)` of the same file.
+///
+/// The two contracts compose: the page-cache frame is the only handle through
+/// which a MAP_SHARED store is recorded, so `read(2)` must consult it.  For any
+/// page in `[offset, offset + buf.len())` that has a live cache entry, copy the
+/// overlapping slice of the cache frame over the corresponding slice of `buf`.
+/// Pages with no cache entry are left as the FS already filled them (the
+/// authoritative `Vec`/disk content, which the `write(2)` path keeps current via
+/// [`update_range`]).  This makes a cache-resident inode present ONE source of
+/// truth — the cache frame — to both mmap mappers and `read(2)`, exactly as a
+/// unified-page-cache tmpfs does.
+///
+/// Block-backed filesystems (ext2 / fat32 / ntfs) are unaffected in practice:
+/// their `write(2)` path already calls `update_range`, so a cache page and the
+/// on-disk bytes agree, and overlaying agreeing bytes is a no-op.  The overlay
+/// is therefore safe for every backend and only *changes* observed bytes for the
+/// in-memory backends, where it is exactly the missing coherence.
+///
+/// `offset` is the file offset of `buf[0]`; only `buf[..valid]` need hold
+/// meaningful FS bytes, but the overlay is applied to the whole `buf` span the
+/// caller passes (callers pass the exact `[offset, offset+n)` they intend to
+/// return to userspace).
+///
+/// Safety: each cache entry's `phys` is alive while the cache lock is held (the
+/// cache holds a reference), so the `PHYS_OFF + phys` read lands in valid memory
+/// (Intel SDM Vol. 3A §4.10.5 higher-half identity map).  The cache lock is held
+/// across the small per-page copies; no FS or PMM dispatch happens under it.
+pub fn read_through(mount_idx: usize, inode: u64, offset: u64, buf: &mut [u8]) {
+    if buf.is_empty() {
+        return;
+    }
+    const PAGE: u64 = 4096;
+    const PHYS_OFFSET: u64 = 0xFFFF_8000_0000_0000;
+
+    let start = offset;
+    let end = offset.saturating_add(buf.len() as u64);
+    let first_page = start & !(PAGE - 1);
+    let last_page_exclusive = (end + PAGE - 1) & !(PAGE - 1);
+
+    let cache = PAGE_CACHE.lock();
+    let mut page = first_page;
+    while page < last_page_exclusive {
+        if let Some(entry) = cache.get(&(mount_idx, inode, page)) {
+            // [page, page+PAGE) ∩ [start, end) in file coordinates.
+            let slice_start = core::cmp::max(page, start);
+            let slice_end = core::cmp::min(page + PAGE, end);
+            debug_assert!(slice_start < slice_end);
+            let cache_off = (slice_start - page) as usize;
+            let buf_off = (slice_start - start) as usize;
+            let n = (slice_end - slice_start) as usize;
+            let src = (PHYS_OFFSET + entry.phys + cache_off as u64) as *const u8;
+            let dst = unsafe { buf.as_mut_ptr().add(buf_off) };
+            // SAFETY: cache page is 4 KiB; cache_off + n ≤ PAGE by construction.
+            // `buf[buf_off..buf_off+n]` is in-bounds because slice_end ≤ end =
+            // start + buf.len().  Source (PMM frame) and destination (caller
+            // buffer) are distinct allocations.
+            unsafe {
+                core::ptr::copy_nonoverlapping(src, dst, n);
+            }
+        }
+        page += PAGE;
+    }
+}
+
 /// Bring the page cache into coherence with a file that has just been
 /// resized from `old_size` to `new_size` bytes.
 ///

@@ -5,7 +5,7 @@
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 
 // ── PCI constants ───────────────────────────────────────────────────────────
@@ -39,6 +39,11 @@ const REG_TDT: u32      = 0x3818; // TX Descriptor Tail
 const REG_RAL0: u32     = 0x5400; // Receive Address Low (MAC bytes 0-3)
 const REG_RAH0: u32     = 0x5404; // Receive Address High (MAC bytes 4-5) + AV bit
 const REG_MTA: u32      = 0x5200; // Multicast Table Array (128 entries)
+
+// ── Statistics registers (read-to-clear, per the 82540EM datasheet) ─────────
+const REG_MPC: u32      = 0x4010; // Missed Packets Count (RX FIFO/ring overrun)
+const REG_RNBC: u32     = 0x40A0; // Receive No-Buffers Count
+const REG_GPRC: u32     = 0x4074; // Good Packets Received Count
 
 // ── Control bits ────────────────────────────────────────────────────────────
 
@@ -111,6 +116,14 @@ static MMIO_BASE: Mutex<u64> = Mutex::new(0);
 
 /// Whether the e1000 NIC has been initialized.
 static AVAILABLE: AtomicBool = AtomicBool::new(false);
+
+/// Software RX statistics.  `RX_FRAMES` counts EOP descriptors drained from
+/// the ring; `RX_BYTES` sums their lengths.  These complement the hardware
+/// statistics registers (MPC/RNBC) so a host-side diagnostic can compare the
+/// bytes we actually delivered to the stack against the HTTP Content-Length —
+/// a shortfall localizes a receive-side drop.
+static RX_FRAMES: AtomicU64 = AtomicU64::new(0);
+static RX_BYTES:  AtomicU64 = AtomicU64::new(0);
 
 /// Kernel direct-map base for raw physical addresses.  AstryxOS maps the
 /// full physical address space at `KERNEL_VIRT_BASE` (higher-half), so a
@@ -743,6 +756,8 @@ pub fn poll_rx() {
         // so a reply path (or a second core's poll_rx) can re-acquire
         // RX_CUR without spinning behind us.
         if frame_len > 0 {
+            RX_FRAMES.fetch_add(1, Ordering::Relaxed);
+            RX_BYTES.fetch_add(frame_len as u64, Ordering::Relaxed);
             super::handle_rx_packet(&frame_buf[..frame_len]);
         }
     }
@@ -931,6 +946,31 @@ pub fn read_ctrl_regs() -> (u32, u32) {
 pub fn read_rah0() -> u32 {
     if !AVAILABLE.load(Ordering::Acquire) { return 0; }
     mmio_read(REG_RAH0)
+}
+
+/// RX statistics snapshot, for confirming receive-side packet loss.
+///
+/// Returns `(rx_frames, rx_bytes, mpc, rnbc, num_rx_desc)`:
+///  * `rx_frames` / `rx_bytes` — cumulative software counts of frames/bytes
+///    actually delivered to the network stack (see `RX_FRAMES`/`RX_BYTES`).
+///  * `mpc`  — Missed Packets Count delta (RX FIFO/ring overrun) since the
+///    previous read.  Read-to-clear per the 82540EM datasheet; non-zero
+///    confirms the hardware dropped inbound frames because the descriptor
+///    ring was full.
+///  * `rnbc` — Receive No-Buffers Count delta (no free descriptor available).
+///  * `num_rx_desc` — current RX ring depth, so the caller can reason about
+///    headroom vs a burst.
+pub fn rx_stats() -> (u64, u64, u32, u32, usize) {
+    if !AVAILABLE.load(Ordering::Acquire) {
+        return (0, 0, 0, 0, NUM_RX_DESC);
+    }
+    (
+        RX_FRAMES.load(Ordering::Relaxed),
+        RX_BYTES.load(Ordering::Relaxed),
+        mmio_read(REG_MPC),
+        mmio_read(REG_RNBC),
+        NUM_RX_DESC,
+    )
 }
 
 

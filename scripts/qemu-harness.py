@@ -1627,6 +1627,7 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
                           snapshottable: bool = False,
                           data_overlay: Optional[str] = None,
                           vmstate_qcow2: Optional[str] = None,
+                          mem_mib: int = 0,
                           ) -> subprocess.Popen:
     """
     Launch QEMU with a per-session serial log and QMP socket.
@@ -1713,6 +1714,19 @@ def _launch_qemu_harness(sid: str, serial_log: str, qmp_sock: str,
         for i, arg in enumerate(cmd):
             if arg == "-smp" and i + 1 < len(cmd):
                 cmd[i + 1] = str(smp)
+                break
+
+    # Override -m guest RAM if the caller asked for more than the canonical
+    # `mode="test"` 1 GiB.  Firefox/libxul's working set exceeds 1 GiB, so a
+    # 1 GiB guest thrashes the demand-pager (code pages evicted under memory
+    # pressure re-fault from disk — measured tens of thousands of extra read
+    # requests to reach the render gate).  Patched in-place here, mirroring the
+    # -smp override above, so `build_qemu_cmd` (the canonical builder) stays
+    # unchanged.
+    if mem_mib and mem_mib > 0:
+        for i, arg in enumerate(cmd):
+            if arg == "-m" and i + 1 < len(cmd):
+                cmd[i + 1] = f"{mem_mib}M"
                 break
 
     # Inject the kdb hostfwd rule by patching the `-netdev user,id=net0`
@@ -3782,6 +3796,20 @@ def cmd_start(args):
     smp = int(getattr(args, "smp", 2) or 2)
     cpu_model = getattr(args, "cpu_model", None)
 
+    # Guest RAM: the canonical builder uses mode="test" = 1 GiB.  That is too
+    # small for the firefox-test browser bring-up (Firefox/libxul working set
+    # > 1 GiB → demand-page thrash).  Auto-bump to 2 GiB when the feature set
+    # includes firefox-test (unless the caller overrode it with --mem).  An
+    # explicit --mem always wins; a 0/absent flag keeps the auto behaviour.
+    mem_override = int(getattr(args, "mem", 0) or 0)
+    _feats = (getattr(args, "features", None) or "")
+    if mem_override > 0:
+        mem_mib = mem_override
+    elif "firefox-test" in _feats:
+        mem_mib = 2048
+    else:
+        mem_mib = 0  # keep the builder's mode="test" default
+
     # Resolve effective KVM state + CPU model up-front so we can log the
     # decision (W106: catches "TCG run with -cpu host advertising AVX-512
     # → glibc IFUNC trap → spurious #UD" misconfiguration before launch).
@@ -3876,7 +3904,8 @@ def cmd_start(args):
                                  extra_qemu_args=extra_qemu_args,
                                  snapshottable=snapshottable,
                                  data_overlay=(snap_topology or {}).get("data_overlay"),
-                                 vmstate_qcow2=(snap_topology or {}).get("vmstate_qcow2"))
+                                 vmstate_qcow2=(snap_topology or {}).get("vmstate_qcow2"),
+                                 mem_mib=mem_mib)
 
     session = {
         "sid":        sid,
@@ -6374,6 +6403,41 @@ def _autopsy_run_step(gdb: GdbClient, regs: dict, step: dict,
                 "bytes": data.hex(),
             }
 
+        if kind == "mem_ptr_chain":
+            # Follow a pointer chain: start at `addr` (absolute hex/int) or
+            # (reg + offset), read 8 bytes as a little-endian pointer, then
+            # read `len` bytes at the pointed-to location.  `derefs` (default
+            # 1) repeats the 8-byte pointer-read that many times before the
+            # final byte read.  Used to deref a global that holds a C-string
+            # pointer (e.g. Mozilla's gMozCrashReason: read the global to get
+            # the message pointer, then read the string it points at).
+            length = min(int(step["len"]), per_step_cap)
+            derefs = int(step.get("derefs", 1))
+            if "addr" in step:
+                cur = int(step["addr"], 0) if isinstance(step["addr"], str) \
+                      else int(step["addr"])
+            else:
+                reg = step["reg"].lower()
+                if reg not in regs:
+                    return {"kind": kind, "error": f"unknown register {reg!r}"}
+                base = int(regs[reg], 16) if isinstance(regs[reg], str) \
+                       else int(regs[reg])
+                cur = (base + int(step.get("offset", 0))) & 0xFFFF_FFFF_FFFF_FFFF
+            chain = [hex(cur)]
+            try:
+                for _ in range(derefs):
+                    ptr_bytes = gdb.read_mem(cur, 8)
+                    cur = int.from_bytes(ptr_bytes, "little")
+                    chain.append(hex(cur))
+                data = gdb.read_mem(cur, length) if cur else b""
+                return {
+                    "kind": kind, "chain": chain, "final_addr": hex(cur),
+                    "len": len(data), "bytes": data.hex(),
+                    "ascii": data.split(b"\x00", 1)[0].decode("latin-1"),
+                }
+            except Exception as e:
+                return {"kind": kind, "chain": chain, "error": str(e)}
+
         if kind in ("mem_at", "mem_via_reg"):
             reg = step["reg"].lower()
             if reg not in regs:
@@ -6791,6 +6855,10 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
               "tlb-stats", "heap-stats", "w215-diag",
               "coverage-flush", "proc-metrics",
               "futex-stats",
+              # net-rxstats: receive-path health snapshot (per-conn recv_next
+              # cursors + e1000 RX-ring MPC/byte counts).  Zero-arg; read
+              # repeatedly to watch recv_next advance or stall.
+              "net-rxstats",
               # blk-trace: out-of-band drain of the virtio-blk LBA ring.
               "blk-trace", "blk-trace-flush",
               # log-ring: out-of-band drain / burst-flush of the cheap log ring.
@@ -6861,6 +6929,13 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
                 "(expected on|off|true|false|1|0)"
             )
         return {"op": "futex-set-cluster-wake", "on": val}
+    if op == "w215-cow-witness":
+        # CoW double-install witness dump.  Optional <va> filters to one VA
+        # (the contested futex word); omit to dump all witnessed pairs.
+        req2: dict = {"op": "w215-cow-witness"}
+        if rest:
+            req2["va"] = hex(int(rest[0], 0))
+        return req2
     if op == "proc":
         if not rest: raise ValueError("proc requires <pid>")
         return {"op": "proc", "pid": int(rest[0], 0)}
@@ -6875,12 +6950,49 @@ def _kdb_build_request(op: str, rest: list[str]) -> dict:
     if op == "fd-table":
         if not rest: raise ValueError("fd-table requires <pid>")
         return {"op": "fd-table", "pid": int(rest[0], 0)}
+    if op == "poll-revents":
+        # Kernel poll(2) readiness verdict for a PID's fds via the same
+        # poll_revents() path poll/select/epoll use.  `poll-revents <pid>`
+        # scans all fds and lists POLLIN/POLLOUT/POLLHUP per fd;
+        # `poll-revents <pid> <fd>` probes one fd.  Decides "kernel reports
+        # the socket readable but the userspace poller never wakes" (poll
+        # loop / wake-bell bug) vs "kernel reports not-readable" (fd→backend
+        # resolution bug) at an AF_UNIX recv-readiness stall.
+        if not rest: raise ValueError("poll-revents requires <pid> [<fd>]")
+        req2: dict = {"op": "poll-revents", "pid": int(rest[0], 0)}
+        if len(rest) > 1:
+            req2["fd"] = int(rest[1], 0)
+        return req2
     if op == "fd-map":
         pid = int(rest[0], 0) if rest else 0  # 0 = all processes
         req: dict = {"op": "fd-map"}
         if pid != 0:
             req["pid"] = pid
         return req
+    if op == "unix-diag":
+        # Recv-side readiness probe for one AF_UNIX socket inode.  Reports
+        # recv_avail / recv_pushed / recv_popped / shutdown edges + pending
+        # SCM_RIGHTS batches (byte_offset, fd_count, deliverable) for the
+        # inode AND its peer.  Decides P1 (data in ring, epoll silent) vs
+        # P2 (SCM batch undelivered) vs P3/P4 (empty ring, never written).
+        if not rest:
+            raise ValueError("unix-diag requires <inode> (socket_id)")
+        return {"op": "unix-diag", "inode": int(rest[0], 0)}
+    if op == "epoll-watch":
+        # Live epoll interest-set + per-fd readiness dump for one (pid, epfd).
+        # Pairs with unix-diag at a wedge: reports, for every fd in the epoll
+        # interest set, the caller's subscribed mask plus the LIVE readiness
+        # (revents) and what epoll_wait(2) would DELIVER (delivered/ready),
+        # computed via the same path the wait loop uses.  Decides
+        # reactor-starvation (fd ready=true but never drained -> reactor
+        # thread not running epoll_wait) vs kernel readiness-drop (fd absent
+        # from the set, or revents has no EPOLLIN despite unread data).
+        #   kdb <sid> epoll-watch <pid> <epfd>
+        if len(rest) < 2:
+            raise ValueError("epoll-watch requires <pid> <epfd>")
+        return {"op": "epoll-watch",
+                "pid": int(rest[0], 0),
+                "epfd": int(rest[1], 0)}
     if op == "syscall-trend":
         seconds = int(rest[0], 0) if len(rest) >= 1 else 5
         pid     = int(rest[1], 0) if len(rest) >= 2 else 0
@@ -9151,6 +9263,114 @@ def _qmp_xv_u64_via_cr3(qmp: "QMP", cr3: int, vaddr: int) -> Optional[int]:
     if raw is None or len(raw) < 8:
         return None
     return struct.unpack_from("<Q", raw)[0]
+
+
+def _walk_va_full(qmp: "QMP", cr3: int, vaddr: int) -> dict:
+    """Full 4-level x86_64 page-table walk under an explicit CR3.
+
+    Returns a dict with the PTE at every level, the resolved physical
+    address (12-bit offset preserved), and the leaf frame number.  Used by
+    the `va2pa` phys-provenance subcommand so a producer-CR3 vs consumer-CR3
+    walk of the same predicate VA can be compared frame-for-frame (Intel SDM
+    Vol. 3A §4.5 4-level paging).
+    """
+    cr3_pa = cr3 & ~0xFFF
+    levels = [(39, "pml4"), (30, "pdpt"), (21, "pd"), (12, "pt")]
+    table_pa = cr3_pa
+    chain = []
+    pa = None
+    frame = None
+    for shift, name in levels:
+        idx = (vaddr >> shift) & 0x1FF
+        entry_pa = table_pa + idx * 8
+        raw = _qmp_xp_bytes(qmp, entry_pa, 8)
+        if raw is None or len(raw) < 8:
+            chain.append({"level": name, "idx": idx,
+                          "entry_pa": f"0x{entry_pa:x}", "entry": None,
+                          "present": False})
+            break
+        entry = struct.unpack_from("<Q", raw)[0]
+        present = bool(entry & 0x1)
+        ps = bool(entry & (1 << 7))
+        chain.append({
+            "level": name, "idx": idx, "entry_pa": f"0x{entry_pa:x}",
+            "entry": f"0x{entry:016x}", "present": present,
+            "rw": bool(entry & 0x2), "us": bool(entry & 0x4),
+            "ps": ps, "nx": bool(entry & (1 << 63)),
+            "frame": f"0x{(entry & 0x000F_FFFF_FFFF_F000):x}",
+        })
+        if not present:
+            break
+        if shift in (30, 21) and ps:
+            base = entry & 0x000F_FFFF_FFFF_F000
+            mask = (1 << shift) - 1
+            pa = (base & ~mask) | (vaddr & mask)
+            frame = (base & ~mask)
+            break
+        table_pa = entry & 0x000F_FFFF_FFFF_F000
+        if name == "pt":
+            pa = table_pa | (vaddr & 0xFFF)
+            frame = table_pa
+    return {"va": f"0x{vaddr:x}", "cr3": f"0x{cr3:x}",
+            "pa": (f"0x{pa:x}" if pa is not None else None),
+            "frame": (f"0x{frame:x}" if frame is not None else None),
+            "walk": chain}
+
+
+def cmd_va2pa(args):
+    """PHYS-PROVENANCE: page-walk a VA under an EXPLICIT CR3 and report the
+    resolved physical address + leaf frame + raw bytes there.
+
+    The decisive aliasing test: run this twice — once with the producer's
+    CR3, once with the consumer's CR3, for the same predicate VA — and
+    compare the `frame` fields.  frame_A != frame_B (two CR3s → two frames)
+    is the only proof of store-visibility aliasing.  frame_A == frame_B
+    means the two views share one frame (not aliasing — look at the data
+    value / producer chain instead).
+
+    Usage: va2pa <sid> <cr3-hex> <va-hex> [nbytes]
+    """
+    sess = _load_session(args.sid)
+    qmp_sock = sess.get("qmp_sock") or str(HARNESS_DIR / f"{args.sid}.qmp.sock")
+    cr3 = int(args.cr3, 0)
+    va = int(args.va, 0)
+    nbytes = int(args.bytes, 0) if args.bytes else 8
+    qmp = QMP(qmp_sock)
+    if not qmp.connect():
+        _out({"ok": False, "error": "QMP connect failed"})
+        return
+    # Pause so the walk + read are coherent (no concurrent guest mutation).
+    paused = False
+    if not args.no_pause:
+        try:
+            qmp.execute("stop")
+            paused = True
+        except Exception:
+            pass
+    try:
+        walk = _walk_va_full(qmp, cr3, va)
+        data_hex = None
+        if walk["pa"] is not None:
+            raw = _qmp_xv_via_cr3(qmp, cr3, va, nbytes)
+            if raw is not None:
+                data_hex = raw.hex()
+        out = dict(walk)
+        out["ok"] = walk["pa"] is not None
+        out["bytes"] = nbytes
+        out["data_hex"] = data_hex
+        # Convenience: little-endian u32/u64 of the first word (the common
+        # futex/cond predicate width).
+        if data_hex and len(data_hex) >= 8:
+            out["u32_le"] = struct.unpack_from("<I", bytes.fromhex(data_hex))[0]
+        if data_hex and len(data_hex) >= 16:
+            out["u64_le"] = struct.unpack_from("<Q", bytes.fromhex(data_hex))[0]
+        _out(out)
+    finally:
+        if paused:
+            try:
+                qmp.execute("cont")
+            except Exception:
+                pass
 
 
 def _qmp_xv_via_qmp(qmp: "QMP", cpu: int, vaddr: int, nbytes: int) -> Optional[bytes]:
@@ -12288,6 +12508,11 @@ def main():
                           help="Number of QEMU vCPUs (default 2). Plan-C "
                                "experiment uses 16 to test Mozilla "
                                "nsThreadPool sizing under wider _SC_NPROCESSORS_ONLN.")
+    p_start.add_argument("--mem", type=int, default=0, metavar="MIB",
+                          help="Guest RAM in MiB. Default: 2048 when the feature "
+                               "set includes firefox-test (Firefox/libxul needs "
+                               ">1 GiB to avoid demand-page thrash), else the "
+                               "canonical 1024. An explicit value always wins.")
     p_start.add_argument("--cpu", dest="cpu_model", default=None, metavar="MODEL",
                           help="Override QEMU -cpu model verbatim (e.g. 'host', "
                                "'max', 'Cascadelake-Server', 'EPYC-Genoa-v1', "
@@ -12583,6 +12808,7 @@ def main():
     p_kdb.add_argument("sid")
     p_kdb.add_argument("op", choices=[
         "ping", "proc-list", "proc", "proc-tree", "fd-table", "fd-map",
+        "unix-diag",
         "syscall-trend", "vfs-mounts",
         "dmesg", "syms", "mem", "read-file", "tframe", "user-mem", "trace-status",
         "bell-stats", "cache-audit", "cache-aliasing", "fault-cache-keys",
@@ -12592,7 +12818,7 @@ def main():
         # serial lines for the heatmap. Also exposed as the `blk-trace`
         # top-level subcommand below (drain|flush).
         "blk-trace", "blk-trace-flush",
-        "coverage-flush", "proc-metrics", "thread-park-audit",
+        "coverage-flush", "proc-metrics", "poll-revents", "thread-park-audit",
         "rip-trace",
         "futex-ghost-hist",
         # One-shot musl pthread_cond/mutex wake-target-vs-wait-addr report:
@@ -12615,6 +12841,12 @@ def main():
         # See net::ipver + op_net_ipver.  Also exposed as the `net-ipver`
         # top-level subcommand below.
         "net-ipver",
+        # net-rxstats: receive-path health snapshot — per-connection recv_next
+        # sequence cursors + e1000 RX-ring MPC/byte counts.  Zero-arg; read
+        # repeatedly to watch recv_next advance (progress) or stall (a gap).
+        # See net::tcp::snapshot_connections + net::e1000::rx_stats +
+        # op_net_rxstats.
+        "net-rxstats",
         # virtio-blk wait-amplification telemetry + runtime A/B controls.
         # `virtio-wait-hist` drains the per-round-trip wait histogram (µs
         # buckets × mean run-queue depth, median/p99); `virtio-wait-mode
@@ -13060,6 +13292,19 @@ def main():
     p_qmp_xp.add_argument("bytes", help="Number of bytes to read")
     p_qmp_xp.add_argument("--raw", action="store_true")
 
+    p_va2pa = sub.add_parser(
+        "va2pa",
+        help="PHYS-PROVENANCE: page-walk a VA under an EXPLICIT CR3 -> "
+             "resolved PA + leaf frame + raw bytes. Run twice (producer CR3, "
+             "consumer CR3) and compare frames for the A!=B aliasing proof.")
+    p_va2pa.add_argument("sid")
+    p_va2pa.add_argument("cr3", help="Explicit CR3 (0x... or decimal)")
+    p_va2pa.add_argument("va", help="Virtual address (0x... or decimal)")
+    p_va2pa.add_argument("bytes", nargs="?", default="8",
+                          help="Bytes to read at the frame (default 8)")
+    p_va2pa.add_argument("--no-pause", action="store_true",
+                          help="Do not stop/cont the guest around the walk")
+
     # rip-walk — pause at a serial-log marker, walk user RBP chain.
     p_rwalk = sub.add_parser(
         "rip-walk",
@@ -13431,6 +13676,7 @@ def main():
         "qmp-regs": cmd_qmp_regs,
         "qmp-xv":   cmd_qmp_xv,
         "qmp-xp":   cmd_qmp_xp,
+        "va2pa":    cmd_va2pa,
         "rip-walk": cmd_rip_walk,
         "rip-trace-resolve": cmd_rip_trace_resolve,
         "read-png": cmd_read_png,

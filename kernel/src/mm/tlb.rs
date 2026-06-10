@@ -679,6 +679,51 @@ pub fn shootdown_page(cr3: u64, va: u64) -> bool {
     shootdown_range(cr3, lo, lo + 0x1000)
 }
 
+/// Issue a process-private expedited memory barrier on every CPU that is
+/// currently running a thread of the calling process — the semantics of
+/// `membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED)`.
+///
+/// Per `man 2 membarrier`: this command "ensures that all running threads
+/// [...] of the same process as the calling thread [...] have a memory
+/// barrier" before it returns.  That guarantee is what lets a multi-threaded
+/// program use an *asymmetric* barrier — the fast-path thread elides its own
+/// fence and relies on the membarrier-issuing thread to force the matching
+/// fence on the fast-path thread's CPU.  A purely *local* fence on the
+/// calling CPU is therefore **not** sufficient: a sibling thread on another
+/// core that elided its store-load fence can still reorder a relaxed load
+/// ahead of a store the caller is trying to publish.  The kernel must make
+/// the sibling cores execute the barrier, which on x86 means an IPI whose
+/// handler is itself a serializing event (Intel SDM Vol. 3A §8.3 — `MFENCE`,
+/// locked atomics, and `IRET` are serializing with respect to memory).
+///
+/// We reuse the cross-CPU shootdown protocol's IPI + per-CPU ack machinery:
+/// a degenerate empty range (`va_lo == va_hi`) makes the receiver's
+/// `invlpg` loop a no-op, but the receiver still runs the `AcqRel`
+/// compare-exchange that claims the slot and the `IRET` out of the handler —
+/// both of which are full memory barriers on the target core.  The target
+/// set is exactly `snapshot_active_mask(cr3) & !self` — the *other* CPUs
+/// whose active CR3 is the caller's, i.e. the other running threads of this
+/// (single-address-space) process — which is precisely the membarrier
+/// PRIVATE_EXPEDITED contract.  The local half of the barrier is the
+/// `SeqCst` fence `shootdown_range_inner` issues before publishing the
+/// payload.
+///
+/// On UP, or when no sibling CPU is on this CR3, the caller's own fence is
+/// the entire barrier and no IPI is sent (the local `mfence`/`lfence` in the
+/// syscall arm already covers the caller).  Returns once every targeted CPU
+/// has acknowledged (or the bounded ack spin gives up, identically to a TLB
+/// shootdown — the barrier is still architecturally complete on every CPU
+/// that took the IPI).
+#[inline]
+pub fn membarrier_private_expedited(cr3: u64) {
+    // An empty VA range: no page is invalidated, but the IPI still forces
+    // each sibling CPU through its serializing handler + IRET.  The local
+    // `invlpg` of an empty range is a no-op; `shootdown_range` performs its
+    // own `SeqCst` fence on this CPU before broadcasting, which is the
+    // caller-side half of the asymmetric barrier.
+    let _ = shootdown_range(cr3, 0, 0);
+}
+
 /// Convenience wrapper for the "all of the user half" shootdown that
 /// process-teardown sites need.  Covers the canonical lower-half VA
 /// range `[0, 0x0000_8000_0000_0000)`.  Page-count above the

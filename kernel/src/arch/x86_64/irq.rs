@@ -29,6 +29,17 @@ const WATCHDOG_LIMIT: u32 = 60_000;
 #[cfg(not(feature = "firefox-test-core"))]
 const WATCHDOG_LIMIT: u32 = 12_000;
 
+/// Per-CPU throttle counter for the `sched-deadlock-warn` diagnostic lever.
+/// When the `sched-deadlock-warn` feature is built, reaching `WATCHDOG_LIMIT`
+/// emits a single `[SCHED/WD-WARN]` line per CPU and then continues running
+/// (resetting the counter so the wedge can sit live under kdb/GDB) instead of
+/// raising `BUGCHECK_SCHEDULER_DEADLOCK`.  This is a *diagnostic* build lever —
+/// production builds (no `sched-deadlock-warn`) always bugcheck, preserving the
+/// hard no-forward-progress guarantee.  Default builds never compile this in.
+#[cfg(feature = "sched-deadlock-warn")]
+static WATCHDOG_WARN_COUNT: [AtomicU32; MAX_CPUS] =
+    [const { AtomicU32::new(0) }; MAX_CPUS];
+
 /// Reset the watchdog counter for the current CPU.
 /// Called by schedule() after a successful context switch.
 #[inline]
@@ -634,6 +645,32 @@ extern "C" fn timer_tick() {
             } else {
                 let wd = WATCHDOG_COUNTER[cpu as usize].fetch_add(1, Ordering::Relaxed);
                 if wd >= WATCHDOG_LIMIT {
+                    // ── Diagnostic lever: WARN-and-continue ──────────────────
+                    // When built with `sched-deadlock-warn`, the no-forward-
+                    // progress watchdog WARNs once per CPU (rate-limited) and
+                    // resets its counter so the wedged boot can SIT live for
+                    // kdb/GDB autopsy, instead of halting the kernel.  This is
+                    // a diagnostic-only build lever; production (the feature
+                    // off) keeps the hard bugcheck below.
+                    #[cfg(feature = "sched-deadlock-warn")]
+                    {
+                        let n = WATCHDOG_WARN_COUNT[cpu as usize]
+                            .fetch_add(1, Ordering::Relaxed);
+                        // Emit on the first trip and then once every 8 to keep
+                        // a steady trail without flooding a multi-minute soak.
+                        if n == 0 || n % 8 == 0 {
+                            let tid = crate::proc::current_tid();
+                            let pid = crate::proc::current_pid_lockless();
+                            crate::serial_println!(
+                                "[SCHED/WD-WARN] cpu={} no-progress {} ticks \
+                                 (warn-continue #{}) tid={} pid={} tick={}",
+                                cpu, wd, n, tid, pid, tick);
+                        }
+                        // Reset so the next stall window is freshly measured;
+                        // never bugcheck in the diagnostic build.
+                        WATCHDOG_COUNTER[cpu as usize].store(0, Ordering::Relaxed);
+                    }
+                    #[cfg(not(feature = "sched-deadlock-warn"))]
                     crate::ke::bugcheck::ke_bugcheck(
                         crate::ke::bugcheck::BUGCHECK_SCHEDULER_DEADLOCK,
                         cpu as u64,

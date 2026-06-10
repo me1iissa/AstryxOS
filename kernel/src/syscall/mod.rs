@@ -255,49 +255,118 @@ pub(crate) unsafe fn user_read_timespec(addr: u64) -> Option<(u64, u64)> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Futex wait queue — keyed by (pid, uaddr)
+// Futex wait queue — keyed by [`FutexKey`] (private: (pid, uaddr); shared:
+// backing-object identity)
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// Key shape: `(pid, uaddr)` — the FUTEX_PRIVATE key per `futex(2)`.
+// Per `futex(2)` (Linux man-pages, "FUTEX_PRIVATE_FLAG") a futex word names a
+// rendezvous point that must hash identically for the waiter and the waker:
 //
-// Per `futex(2)` (Linux man-pages, "FUTEX_PRIVATE_FLAG" and "Priority-inheritance
-// futexes"):
+//   * A PRIVATE futex is scoped to a single address space and identified by
+//     the tuple `(mm, virtual address)`.  We approximate `mm` with `pid` —
+//     correct because every Linux task on AstryxOS has its own page tables and
+//     no two distinct pids share an `mm`.
 //
-//   * FUTEX_PRIVATE futexes are scoped to a single process and identified by
-//     the tuple `(mm_struct, virtual address)`.  We approximate `mm_struct`
-//     with `pid` — correct because every process has its own page tables and
-//     no two processes share the `mm` of a Linux task on AstryxOS.
+//   * A SHARED (process-shared / `pshared`) futex names a *backing object*,
+//     not a virtual address.  Two processes that map the same shared object —
+//     a file, or an `memfd_create(2)` anonymous file — at DIFFERENT virtual
+//     addresses must still rendezvous: a `FUTEX_WAIT` in process A and the
+//     matching `FUTEX_WAKE` in process B operate on the same logical futex
+//     word even though their `uaddr` values differ.  Keying such a futex by
+//     `(pid, uaddr)` would place the waiter and the waker in different hash
+//     buckets and the wake would never reach the waiter.  The key is therefore
+//     the page identity of the backing object: `(mount_idx, inode, byte offset
+//     within the object)`.  See the `get_futex_key`-equivalent semantics
+//     described in `futex(2)`.
 //
-//   * FUTEX_SHARED futexes are scoped to a backing object and identified by
-//     the tuple `(inode, page offset within file)` for file-backed mappings
-//     or by an anonymous-mapping anchor for `MAP_SHARED|MAP_ANONYMOUS`.
-//     Two processes that map the same shared region at different virtual
-//     addresses must still hash to the same key, otherwise a
-//     `pthread_mutex_lock` in process A and the matching wake in process B
-//     will miss.
+// Which kind a given `(pid, uaddr)` names is resolved at futex-syscall time by
+// [`resolve_futex_key`]: it consults the VMA backing `uaddr`.  A `MAP_SHARED`
+// file/`memfd`-backed VMA yields the SHARED key; everything else (private
+// mappings, anonymous mappings — including `MAP_SHARED|MAP_ANONYMOUS`, whose
+// pinning object is the mm itself, matching `futex(2)`) yields the PRIVATE key.
+// `FUTEX_PRIVATE_FLAG`, when the caller sets it, forces the PRIVATE shape; its
+// absence over a shared VMA selects the SHARED key.  The PRIVATE path is the
+// fast path and is unchanged: a private futex resolves to `(pid, uaddr)`
+// exactly as before, and the only added cost on the shared path is one VMA
+// lookup at op entry (no extra cost once the key is in hand).
 //
-// This implementation uses the FUTEX_PRIVATE key shape for ALL futex
-// operations, including those with the FUTEX_PRIVATE_FLAG clear.  This is
-// correct in practice when:
-//
-//   (a) The futex is FUTEX_PRIVATE (FUTEX_PRIVATE_FLAG set, or implied by
-//       the caller's intent — `pthread_mutexattr_setpshared(_, PROCESS_PRIVATE)`
-//       and similar default to FUTEX_PRIVATE).
-//   (b) The futex is FUTEX_SHARED AND both processes have mapped the shared
-//       region at the same `uaddr` (common when a parent forks and the child
-//       inherits identical mappings, or when both ends explicitly request
-//       MAP_FIXED at the same VA).
-//
-// Cross-process FUTEX_SHARED synchronisation across DIFFERENT virtual
-// addresses is NOT supported.  No upstream binary on the current demo path
-// (musl-FF strace differential 2026-05-20) uses it.  When a use case
-// emerges, change `(u64, u64)` to a `FutexKey` enum with `Private(pid, va)`
-// and `Shared(mount_idx, inode, page_off)` variants, derive the shared
-// variant from `vma::lookup(pid, uaddr)` on every WAIT/WAKE/REQUEUE entry,
-// and back-fill tests with a two-process MAP_SHARED+pthread_mutex case.
-//
-// Refs: `futex(2)` Linux man-pages; POSIX.1-2017 §pthread_mutexattr_getpshared.
-pub(crate) static FUTEX_WAITERS: Mutex<BTreeMap<(u64, u64), Vec<u64>>> = Mutex::new(BTreeMap::new());
+// Refs: `futex(2)` Linux man-pages; `memfd_create(2)`;
+// POSIX.1-2017 §pthread_mutexattr_getpshared.
+
+/// Identity of a futex rendezvous point.
+///
+/// A futex word is named either by its address space + virtual address (a
+/// PRIVATE futex) or by the page identity of the shared backing object it
+/// lives on (a SHARED / `pshared` futex).  Both variants are total-ordered so
+/// the type can key the `FUTEX_WAITERS` `BTreeMap`.
+///
+/// Per `futex(2)`: a PRIVATE futex hashes on `(mm, uaddr)`; a SHARED futex
+/// hashes on the backing object so two processes mapping the same object at
+/// different virtual addresses rendezvous.  See [`resolve_futex_key`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum FutexKey {
+    /// Process-private futex: `(pid, uaddr)`.  Two operations rendezvous iff
+    /// they share both the pid (address space) and the virtual address.
+    Private(u64, u64),
+    /// Process-shared futex on a file/`memfd`-backed `MAP_SHARED` page.  Keyed
+    /// by the backing object identity + byte offset within that object, so two
+    /// processes mapping the same object at different virtual addresses
+    /// rendezvous.  `byte_off` is the absolute byte offset of the futex word
+    /// within the backing object (VMA file offset folded with the word's
+    /// distance from the VMA base); the 4-byte alignment of every futex word
+    /// keeps it well-defined.
+    Shared { mount_idx: usize, inode: u64, byte_off: u64 },
+}
+
+impl FutexKey {
+    /// The pid an operation issued for, for the diagnostic/exit paths that
+    /// still reason per-process.  For SHARED keys there is no single owning
+    /// pid; returns `None`.
+    #[inline]
+    pub(crate) fn private_pid(&self) -> Option<u64> {
+        match self {
+            FutexKey::Private(pid, _) => Some(*pid),
+            FutexKey::Shared { .. } => None,
+        }
+    }
+}
+
+/// Resolve the `(pid, uaddr)` of a futex operation to the [`FutexKey`] that
+/// names its rendezvous point.
+///
+/// The futex word at `uaddr` is SHARED iff the VMA covering it is `MAP_SHARED`
+/// and file/`memfd`-backed (`VmBacking::File`); in that case the key is the
+/// backing object identity plus the word's absolute byte offset within the
+/// object.  Every other case — private mappings, anonymous mappings (shared or
+/// private), an unmapped `uaddr`, or the absence of a resolvable VmSpace —
+/// yields the PRIVATE key `(pid, uaddr)`, which is both the fast path and the
+/// correct fallback (an anonymous shared mapping's pinning object is the mm,
+/// per `futex(2)`).
+///
+/// `force_private` is set when the caller passed `FUTEX_PRIVATE_FLAG`: per
+/// `futex(2)` that flag unconditionally selects the private key shape, so the
+/// VMA lookup is skipped entirely (the fast path the flag exists to provide).
+///
+/// Acquires `PROCESS_TABLE` briefly (via
+/// [`crate::proc::futex_backing_for`]); takes no futex lock, so it is safe to
+/// call before acquiring `FUTEX_WAITERS`.
+pub(crate) fn resolve_futex_key(pid: u64, uaddr: u64, force_private: bool) -> FutexKey {
+    if force_private {
+        return FutexKey::Private(pid, uaddr);
+    }
+    match crate::proc::futex_backing_for(pid, uaddr) {
+        Some((mount_idx, inode, vma_base, file_offset)) => {
+            // Absolute byte offset of the futex word within the backing
+            // object: the VMA's base file offset, plus the word's distance
+            // from the VMA base.  4-byte futex-word alignment keeps this exact.
+            let byte_off = file_offset.wrapping_add(uaddr.wrapping_sub(vma_base));
+            FutexKey::Shared { mount_idx, inode, byte_off }
+        }
+        None => FutexKey::Private(pid, uaddr),
+    }
+}
+
+pub(crate) static FUTEX_WAITERS: Mutex<BTreeMap<FutexKey, Vec<u64>>> = Mutex::new(BTreeMap::new());
 
 /// Destination key for waiters that a `FUTEX_REQUEUE` / `FUTEX_CMP_REQUEUE`
 /// moved off their original WAIT queue.
@@ -312,20 +381,23 @@ pub(crate) static FUTEX_WAITERS: Mutex<BTreeMap<(u64, u64), Vec<u64>>> = Mutex::
 /// for a later wake to spuriously pop, and (b) misclassify the timeout as a
 /// successful wake (returning 0 instead of ETIMEDOUT).
 ///
-/// This map records `(pid, tid) → dest_uaddr` for exactly the window between a
+/// This map records `(pid, tid) → dest_key` for exactly the window between a
 /// requeue moving the TID and that TID's WAIT branch running its post-wake
 /// cleanup.  The cleanup consults it to scan the bucket the waiter actually
 /// sits in, then removes the entry.  Keyed by `(pid, tid)`: a TID is unique
 /// within a process and at most one requeue destination is live per parked
-/// waiter.  Lock order: acquired only while NOT holding `FUTEX_WAITERS` for
-/// the requeue insert (insert happens after the `FUTEX_WAITERS` critical
-/// section in the REQUEUE branch) and acquired *inside* the `FUTEX_WAITERS`
-/// critical section in the WAIT cleanup — to keep a single, consistent order
-/// (`FUTEX_WAITERS` → `FUTEX_REQUEUE_DEST`), the requeue insert takes
-/// `FUTEX_REQUEUE_DEST` while still holding `FUTEX_WAITERS`.
+/// waiter.  The destination is a full [`FutexKey`] because a requeue may move a
+/// waiter onto a SHARED bucket (uaddr2 on a different shared backing object),
+/// not merely a different virtual address.  Lock order: acquired only while NOT
+/// holding `FUTEX_WAITERS` for the requeue insert (insert happens after the
+/// `FUTEX_WAITERS` critical section in the REQUEUE branch) and acquired
+/// *inside* the `FUTEX_WAITERS` critical section in the WAIT cleanup — to keep
+/// a single, consistent order (`FUTEX_WAITERS` → `FUTEX_REQUEUE_DEST`), the
+/// requeue insert takes `FUTEX_REQUEUE_DEST` while still holding
+/// `FUTEX_WAITERS`.
 ///
 /// Ref: `futex(2)` Linux man-pages (FUTEX_REQUEUE / FUTEX_CMP_REQUEUE).
-pub(crate) static FUTEX_REQUEUE_DEST: Mutex<BTreeMap<(u64, u64), u64>> = Mutex::new(BTreeMap::new());
+pub(crate) static FUTEX_REQUEUE_DEST: Mutex<BTreeMap<(u64, u64), FutexKey>> = Mutex::new(BTreeMap::new());
 
 /// Outcome of `futex_wait_check_and_enqueue`.
 #[derive(Debug)]
@@ -357,9 +429,13 @@ pub(crate) enum FutexWaitOutcome {
 /// path uses a kernel-mode reader so the same critical section is exercised
 /// without needing a real user mapping.  The closure must be cheap and must
 /// not acquire any kernel locks.
+///
+/// `key` is the resolved [`FutexKey`] (private or shared) naming the
+/// rendezvous; the caller resolves it once before this call (see
+/// [`resolve_futex_key`]).  All bucket operations key on it, so a shared-futex
+/// waiter lands in the same bucket a cross-process waker scans.
 pub(crate) fn futex_wait_check_and_enqueue<R>(
-    pid: u64,
-    uaddr: u64,
+    key: FutexKey,
     val: u64,
     tid: u64,
     wake_tick: u64,
@@ -392,7 +468,7 @@ where
         return FutexWaitOutcome::ValueMismatch;
     }
 
-    waiters.entry((pid, uaddr)).or_insert_with(Vec::new).push(tid);
+    waiters.entry(key).or_insert_with(Vec::new).push(tid);
 
     // Mark Blocked under THREAD_TABLE while still holding FUTEX_WAITERS.
     //
@@ -404,25 +480,24 @@ where
     // overwrite Dead with Blocked, leaving a "Blocked but not in any wait
     // queue" thread that schedule() never picks and the reaper never reaps.
     //
-    // Defensive: if state is already Dead, undo our queue push (exit_group's
-    // `futex_drain_pid` will run when we release FUTEX_WAITERS, but draining
-    // is keyed on (pid, _) and we have just made the queue non-empty under a
-    // valid key — the drain still works, but it costs an extra branch.  Pop
-    // explicitly so the queue is clean immediately).  Skip the state write.
-    // Returning Enqueued is the right outcome: the caller will call
-    // schedule(), which will skip this Dead thread, and the next pass of
-    // reap_dead_threads_sched will reclaim it.
+    // Defensive: if state is already Dead, undo our queue push so the queue is
+    // clean immediately, then skip the state write.  (exit_group's
+    // `futex_drain_pid` drains the dying process's PRIVATE buckets when we
+    // release FUTEX_WAITERS; an explicit pop here keeps the bucket clean
+    // regardless of whether `key` is private or shared.)  Returning Enqueued is
+    // the right outcome: the caller will call schedule(), which will skip this
+    // Dead thread, and the next pass of reap_dead_threads_sched will reclaim it.
     {
         let mut threads = crate::proc::THREAD_TABLE.lock();
         if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
             if t.state == crate::proc::ThreadState::Dead {
                 // Undo the queue push we just made.
-                if let Some(list) = waiters.get_mut(&(pid, uaddr)) {
+                if let Some(list) = waiters.get_mut(&key) {
                     if let Some(pos) = list.iter().rposition(|&x| x == tid) {
                         list.remove(pos);
                     }
                     if list.is_empty() {
-                        waiters.remove(&(pid, uaddr));
+                        waiters.remove(&key);
                     }
                 }
             } else {
@@ -493,6 +568,20 @@ pub fn scm_queue(receiver_id: u64, byte_offset: u64, fds: Vec<crate::vfs::FileDe
 pub fn has_scm_deliverable(receiver_id: u64, consumed: u64) -> bool {
     let q = PENDING_SCM.lock();
     q.iter().any(|b| b.receiver_id == receiver_id && consumed >= b.byte_offset)
+}
+
+/// Diagnostic-only: snapshot the pending `SCM_RIGHTS` batches queued for
+/// `receiver_id`, returning `(byte_offset, fd_count, deliverable)` per batch
+/// where `deliverable = consumed >= byte_offset`.  Used by the kdb `unix-diag`
+/// op to decide, at a live wedge, whether a content proc's IPDL channel has an
+/// undelivered fd batch sitting ahead of its read position (P2) versus an empty
+/// queue (frame never landed → P3/P4).  Holds PENDING_SCM only for the snapshot.
+pub fn scm_diag_for(receiver_id: u64, consumed: u64) -> alloc::vec::Vec<(u64, usize, bool)> {
+    let q = PENDING_SCM.lock();
+    q.iter()
+        .filter(|b| b.receiver_id == receiver_id)
+        .map(|b| (b.byte_offset, b.fds.len(), consumed >= b.byte_offset))
+        .collect()
 }
 
 /// Lowest pending `SCM_RIGHTS` batch bound-offset for `receiver_id` that the
@@ -2173,20 +2262,47 @@ pub fn write_u32_to_user_pub(cr3: u64, vaddr: u64, val: u32) {
 /// Per futex(2) NOTES: "If a process exits while threads of that process
 /// are blocked on a futex, those threads are woken (with a wake-up
 /// indicating the futex is in an inconsistent state)."  We achieve the
-/// equivalent here: the threads themselves are already Dead, so we just
-/// clean up the queue keyed by `(pid, _)`.
+/// equivalent here: the threads themselves are already Dead.
+///
+/// Two bucket classes are scrubbed:
+///   * PRIVATE buckets `Private(pid, _)` belong solely to the dying process,
+///     so the whole bucket is removed.
+///   * SHARED buckets may hold waiters from *several* processes that map the
+///     same backing object; only the dying process's TIDs are removed,
+///     leaving any other process's waiters parked.  The dying TIDs are taken
+///     from `THREAD_TABLE` (`t.pid == pid`), which still lists them as Dead at
+///     drain time (reaping happens later).
 pub fn futex_drain_pid(pid: u64) {
+    // Snapshot the dying process's TIDs so shared buckets can be scrubbed by
+    // TID membership.  THREAD_TABLE is taken and released BEFORE FUTEX_WAITERS
+    // to avoid introducing a THREAD_TABLE→FUTEX_WAITERS edge (the WAIT path
+    // takes FUTEX_WAITERS→THREAD_TABLE; holding both in the reverse order here
+    // would be a lock-order inversion).
+    let dying_tids: alloc::vec::Vec<u64> = {
+        let threads = crate::proc::THREAD_TABLE.lock();
+        threads.iter().filter(|t| t.pid == pid).map(|t| t.tid).collect()
+    };
+
     let mut waiters = FUTEX_WAITERS.lock();
-    let dead_keys: alloc::vec::Vec<(u64, u64)> = waiters
-        .keys()
-        .filter(|&&(p, _)| p == pid)
-        .copied()
-        .collect();
-    for key in dead_keys {
-        waiters.remove(&key);
+    let to_scrub: alloc::vec::Vec<FutexKey> = waiters.keys().copied().collect();
+    for key in to_scrub {
+        match key {
+            FutexKey::Private(p, _) if p == pid => {
+                waiters.remove(&key);
+            }
+            FutexKey::Shared { .. } => {
+                if let Some(list) = waiters.get_mut(&key) {
+                    list.retain(|t| !dying_tids.contains(t));
+                    if list.is_empty() {
+                        waiters.remove(&key);
+                    }
+                }
+            }
+            FutexKey::Private(..) => {} // another process's private bucket
+        }
     }
     // Drain any lingering requeue-destination records for this pid so a
-    // PID-reuse cannot inherit a stale `(pid, tid) → uaddr2` mapping.  Same
+    // PID-reuse cannot inherit a stale `(pid, tid) → dest_key` mapping.  Same
     // FUTEX_WAITERS → FUTEX_REQUEUE_DEST lock order as the requeue/WAIT paths.
     let mut dest = FUTEX_REQUEUE_DEST.lock();
     let dead_dest: alloc::vec::Vec<(u64, u64)> = dest
@@ -2201,16 +2317,26 @@ pub fn futex_drain_pid(pid: u64) {
 
 /// Wake futex waiters from the exit path (CLONE_CHILD_CLEARTID).
 /// This is called from proc::exit_thread when a thread with clear_child_tid exits.
+///
+/// The `clear_child_tid` word is a thread-local address in the exiting
+/// thread's own address space; per `clone(2)` CLONE_CHILD_CLEARTID it is a
+/// process-private futex.  We resolve the [`FutexKey`] the same way the WAIT
+/// side did (`resolve_futex_key`) so a waiter that parked on this word — even
+/// in the unlikely event the word lives on a shared mapping — is found in the
+/// bucket it actually occupies.  If the mapping has already been torn down the
+/// resolver falls back to `Private(pid, uaddr)`, which is the key a private
+/// CLEARTID waiter used.
 pub fn futex_wake_for_exit(pid: u64, uaddr: u64, max_wake: u64) {
+    let key = resolve_futex_key(pid, uaddr, false);
     #[cfg(feature = "firefox-test-core")]
     let key_present;
     let tids_to_wake: alloc::vec::Vec<u64> = {
         let mut waiters = FUTEX_WAITERS.lock();
         #[cfg(feature = "firefox-test-core")]
         {
-            key_present = waiters.contains_key(&(pid, uaddr));
+            key_present = waiters.contains_key(&key);
         }
-        if let Some(list) = waiters.get_mut(&(pid, uaddr)) {
+        if let Some(list) = waiters.get_mut(&key) {
             let mut result = alloc::vec::Vec::new();
             let mut woken = 0u64;
             while !list.is_empty() && woken < max_wake {
@@ -2218,7 +2344,7 @@ pub fn futex_wake_for_exit(pid: u64, uaddr: u64, max_wake: u64) {
                 woken += 1;
             }
             if list.is_empty() {
-                waiters.remove(&(pid, uaddr));
+                waiters.remove(&key);
             }
             result
         } else {
@@ -2229,14 +2355,14 @@ pub fn futex_wake_for_exit(pid: u64, uaddr: u64, max_wake: u64) {
     {
         // Snapshot remaining keys for diagnosis if our lookup missed.
         let waiters = FUTEX_WAITERS.lock();
-        let other_keys: alloc::vec::Vec<(u64, u64)> = waiters
+        let other_keys: alloc::vec::Vec<FutexKey> = waiters
             .keys()
-            .filter(|&&(p, _)| p == pid)
+            .filter(|k| k.private_pid() == Some(pid))
             .copied()
             .collect();
         crate::serial_println!(
-            "[FUTEX_WAKE_EXIT] pid={} uaddr={:#x} key_present={} woken={:?} remaining_pid_keys={:?}",
-            pid, uaddr, key_present, tids_to_wake, other_keys
+            "[FUTEX_WAKE_EXIT] pid={} uaddr={:#x} key={:?} key_present={} woken={:?} remaining_pid_keys={:?}",
+            pid, uaddr, key, key_present, tids_to_wake, other_keys
         );
     }
     // Wake the threads (no lock held).
@@ -2474,22 +2600,179 @@ fn resolve_user_write_page(cr3: u64, vaddr: u64) -> bool {
 ///
 /// Returns the PID of the process that changed state, or negative errno.
 pub(crate) fn sys_waitpid(pid: i64, options: u32) -> i64 {
+    // `wait4(2)` / `waitpid(2)` always REAP (collect-and-remove) the child.
+    // The only POSIX option the legacy entry honours is WNOHANG (=1); see
+    // `sys_waitpid_ex` for the WNOWAIT (peek-without-reap) variant used by
+    // `waitid(2)`.
+    sys_waitpid_ex(pid, (options & 1) != 0 /*WNOHANG*/, false /*WNOWAIT*/, None)
+}
+
+/// POSIX `<signal.h>` / Linux `<asm-generic/siginfo.h>` SIGCHLD `si_code`s.
+/// (POSIX.1-2017 `<signal.h>`; Linux man-pages `sigaction(2)`, "SIGCHLD".)
+pub(crate) const CLD_EXITED: i32 = 1; // child called _exit(2)
+pub(crate) const CLD_KILLED: i32 = 2; // child terminated by signal (no core)
+
+/// Result of a `waitid(2)` collect, decomposed for the user `siginfo_t`.
+pub(crate) enum WaitidOutcome {
+    /// A child changed state.  `si_code`/`si_status` follow the SIGCHLD
+    /// contract: `CLD_EXITED`+exit-status, or `CLD_KILLED`+signal number.
+    Collected { pid: u64, si_code: i32, si_status: i32 },
+    /// WNOHANG requested and no matching child has changed state.
+    NoHang,
+    /// Negative errno (e.g. `-ECHILD` when there is no matching child).
+    Err(i64),
+}
+
+/// Map AstryxOS's raw `exit_code` to the POSIX `waitid(2)` `(si_code,
+/// si_status)` pair.  A non-negative code is an `_exit(2)` status (`CLD_EXITED`,
+/// low 8 bits per `wait(2)` "WEXITSTATUS"); a negative code is `-signo` from a
+/// terminating signal (`CLD_KILLED`, `si_status = signo`) — AstryxOS encodes a
+/// signal-terminated child as `-signo` in the signal-default-terminate /
+/// SIGKILL paths of `signal::check_signals`.
+fn exit_code_to_siginfo(exit_code: i32) -> (i32, i32) {
+    if exit_code < 0 {
+        (CLD_KILLED, -exit_code)
+    } else {
+        (CLD_EXITED, exit_code & 0xff)
+    }
+}
+
+/// Test-only accessor for [`exit_code_to_siginfo`] (Test 516).
+#[cfg(any(feature = "firefox-test", feature = "test-mode"))]
+pub(crate) fn test_exit_code_to_siginfo(exit_code: i32) -> (i32, i32) {
+    exit_code_to_siginfo(exit_code)
+}
+
+// ── x86-64 `siginfo_t` field offsets (LP64) ─────────────────────────────────
+//
+// Per POSIX.1-2017 `<signal.h>` and Linux `<asm-generic/siginfo.h>`.  The
+// header is three `int`s (si_signo, si_errno, si_code) = 12 bytes, then the
+// `union __sifields`.  That union contains members with 8-byte alignment
+// (`void *_addr` in `_sigfault`, `__ARCH_SI_CLOCK_T _utime` in `_sigchld`), so
+// it is 8-byte aligned and begins at offset 16 — NOT 12.  The SIGCHLD arm
+// (`_sigchld`) then lays out `_pid` (16), `_uid` (20), `_status` (24).
+//
+// Total `siginfo_t` size is `SI_MAX_SIZE` = 128 bytes.
+pub(crate) const SI_SIZE:       usize = 128;
+pub(crate) const SI_OFF_SIGNO:  usize = 0;  // int si_signo
+pub(crate) const SI_OFF_CODE:   usize = 8;  // int si_code
+pub(crate) const SI_OFF_PID:    usize = 16; // pid_t _sigchld._pid  (union @16)
+pub(crate) const SI_OFF_UID:    usize = 20; // uid_t _sigchld._uid
+pub(crate) const SI_OFF_STATUS: usize = 24; // int   _sigchld._status
+
+// Compile-time guard: the SIGCHLD union fields must sit inside the struct and
+// past the 12-byte header (so they never alias si_signo/si_errno/si_code).
+const _: () = {
+    assert!(SI_OFF_PID >= 16 && SI_OFF_PID + 4 <= SI_SIZE);
+    assert!(SI_OFF_UID == SI_OFF_PID + 4);
+    assert!(SI_OFF_STATUS == SI_OFF_UID + 4);
+};
+
+/// Serialise a SIGCHLD `siginfo_t` for `waitid(2)` into a 128-byte buffer at
+/// the architectural x86-64 offsets.  Zeroes the whole struct first so no
+/// padding/union bytes leak.  Shared by the syscall handler and its test so the
+/// byte layout has a single source of truth.
+pub(crate) fn fill_sigchld_siginfo(
+    buf: &mut [u8; SI_SIZE],
+    si_code: i32,
+    si_pid: i32,
+    si_uid: i32,
+    si_status: i32,
+) {
+    *buf = [0u8; SI_SIZE];
+    const SIGCHLD: i32 = 17;
+    buf[SI_OFF_SIGNO..SI_OFF_SIGNO + 4].copy_from_slice(&SIGCHLD.to_ne_bytes());
+    buf[SI_OFF_CODE..SI_OFF_CODE + 4].copy_from_slice(&si_code.to_ne_bytes());
+    buf[SI_OFF_PID..SI_OFF_PID + 4].copy_from_slice(&si_pid.to_ne_bytes());
+    buf[SI_OFF_UID..SI_OFF_UID + 4].copy_from_slice(&si_uid.to_ne_bytes());
+    buf[SI_OFF_STATUS..SI_OFF_STATUS + 4].copy_from_slice(&si_status.to_ne_bytes());
+}
+
+/// `waitid(2)` collect that reports the full `siginfo_t` decomposition the
+/// syscall must hand back to user space.
+///
+/// This is the kernel side that makes gecko's `IsProcessDead`
+/// (`waitid(P_PID, …, WEXITED|WNOWAIT)` to observe, then a reaping `waitid`)
+/// terminate instead of busy-looping: that caller branches on `si.si_pid`
+/// (offset 16) and `si.si_code` (offset 8) per `<asm-generic/siginfo.h>`, so
+/// the syscall layer must serialise those fields at the architectural offsets,
+/// not return only the pid.  See POSIX.1-2017 `waitid(2)`.
+pub(crate) fn sys_waitid(pid: i64, wnohang: bool, wnowait: bool) -> WaitidOutcome {
+    let mut exit_code: i32 = 0;
+    let ret = sys_waitpid_ex(pid, wnohang, wnowait, Some(&mut exit_code));
+    if ret > 0 {
+        let (si_code, si_status) = exit_code_to_siginfo(exit_code);
+        WaitidOutcome::Collected { pid: ret as u64, si_code, si_status }
+    } else if ret == 0 {
+        WaitidOutcome::NoHang
+    } else {
+        WaitidOutcome::Err(ret)
+    }
+}
+
+/// Core wait implementation shared by `wait4(2)` and `waitid(2)`.
+///
+/// * `wnohang` — POSIX `WNOHANG`: return 0 immediately if no matching child
+///   has yet changed state, instead of blocking.
+/// * `wnowait` — POSIX `WNOWAIT` (`waitid(2)` only): report the child's status
+///   but leave it in a waitable state (do NOT remove the zombie from the
+///   process table), so a subsequent wait can collect it.  Without this, a
+///   caller that peeks a child's exit status and then issues a second wait to
+///   actually reap it (the canonical `waitid(WNOWAIT)` then `waitid(WNOHANG)`
+///   reaping idiom) parks forever on the second call against an
+///   already-removed child.
+///
+/// Returns the reaped/peeked child pid (`> 0`), 0 (WNOHANG, nothing ready),
+/// or a negative errno (`-ECHILD` when there is no matching child at all).
+///
+/// When a child is collected and `exit_out` is `Some`, the child's raw
+/// `exit_code` is written through it so the `waitid(2)` path can decompose it
+/// into the user `siginfo_t` (`si_code`/`si_status`).  `wait4(2)` callers pass
+/// `None` (they only need the pid).
+pub(crate) fn sys_waitpid_ex(
+    pid: i64,
+    wnohang: bool,
+    wnowait: bool,
+    mut exit_out: Option<&mut i32>,
+) -> i64 {
     let parent_pid = crate::proc::current_pid_lockless();
-    let wnohang = (options & 1) != 0; // WNOHANG = 1
 
-    crate::serial_println!("[SYSCALL] waitpid({}, opts=0x{:x}) from PID {}", pid, options, parent_pid);
+    crate::serial_println!(
+        "[SYSCALL] waitpid({}, wnohang={} wnowait={}) from PID {}",
+        pid, wnohang, wnowait, parent_pid);
 
-    // Try to reap immediately.
-    if let Some((child_pid, exit_code)) = crate::proc::waitpid(parent_pid, pid) {
+    // Try to collect a ready (zombie) child immediately.  WNOWAIT peeks the
+    // status without removing the zombie; otherwise we reap it.
+    if wnowait {
+        if let Some((child_pid, exit_code)) = crate::proc::peek_zombie(parent_pid, pid) {
+            crate::serial_println!(
+                "[SYSCALL] waitpid: child PID {} exited with code {} (peeked, WNOWAIT)",
+                child_pid, exit_code);
+            if let Some(out) = exit_out.as_deref_mut() { *out = exit_code; }
+            return child_pid as i64;
+        }
+    } else if let Some((child_pid, exit_code)) = crate::proc::waitpid(parent_pid, pid) {
         crate::serial_println!(
             "[SYSCALL] waitpid: child PID {} exited with code {}",
-            child_pid, exit_code
-        );
+            child_pid, exit_code);
+        if let Some(out) = exit_out.as_deref_mut() { *out = exit_code; }
         return child_pid as i64;
     }
 
+    // No reapable child yet.  Per POSIX `wait(2)` / `waitid(2)`: a wait for a
+    // process that is not (or is no longer) a child of the caller MUST fail
+    // with ECHILD rather than block.  This is the load-bearing guard against
+    // the `waitid(P_PID, x, WNOWAIT)`-then-`waitid(P_PID, x)` idiom hanging:
+    // once the first call has reaped x (legacy WNOWAIT-ignored behaviour) — or
+    // any time x is simply gone — the follow-up wait has no matching child and
+    // would otherwise park on the `wake_tick == u64::MAX-1` sentinel that only
+    // a child *exit* clears, which can never arrive for an already-dead child.
+    if !crate::proc::has_matching_child(parent_pid, pid) {
+        return -10; // ECHILD
+    }
+
     if wnohang {
-        return 0; // No zombie yet, WNOHANG → return 0.
+        return 0; // Matching child exists but hasn't changed state → 0.
     }
 
     // Block the parent thread until a child exits.
@@ -2539,6 +2822,11 @@ pub(crate) fn sys_waitpid(pid: i64, options: u32) -> i64 {
     //     so we don't fall through still-Blocked.
     let max_attempts = 200; // Safety limit: ~200 wakeup cycles (~20 seconds at 100Hz)
     let tid = crate::proc::current_tid();
+    // Collect a ready child honouring WNOWAIT: peek (leave waitable) vs reap.
+    let collect = |parent: u64, want: i64| -> Option<(u64, i32)> {
+        if wnowait { crate::proc::peek_zombie(parent, want) }
+        else       { crate::proc::waitpid(parent, want) }
+    };
     for _ in 0..max_attempts {
         // (1) Commit Blocked under THREAD_TABLE, then drop the lock.
         {
@@ -2553,8 +2841,8 @@ pub(crate) fn sys_waitpid(pid: i64, options: u32) -> i64 {
         //     THREAD_TABLE.  A child that became a zombie in the
         //     immediate-reap→commit window is caught here.  On a hit, revert
         //     our own state to Ready (so a missed wake can't leave us Blocked)
-        //     and reap without parking.
-        if let Some((child_pid, exit_code)) = crate::proc::waitpid(parent_pid, pid) {
+        //     and collect (reap or peek) without parking.
+        if let Some((child_pid, exit_code)) = collect(parent_pid, pid) {
             {
                 let mut threads = crate::proc::THREAD_TABLE.lock();
                 if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
@@ -2567,10 +2855,33 @@ pub(crate) fn sys_waitpid(pid: i64, options: u32) -> i64 {
                 }
             }
             crate::serial_println!(
-                "[SYSCALL] waitpid: child PID {} exited with code {} (reaped without park)",
+                "[SYSCALL] waitpid: child PID {} exited with code {} (collected without park)",
                 child_pid, exit_code
             );
+            if let Some(out) = exit_out.as_deref_mut() { *out = exit_code; }
             return child_pid as i64;
+        }
+
+        // (2b) The awaited child may have been collected by another thread
+        //      while we held the Blocked commit (e.g. a sibling reaper, or the
+        //      WNOWAIT-peek-then-reap idiom).  If no matching child remains,
+        //      revert to Ready and return ECHILD instead of parking on a wake
+        //      that can never arrive (the `wake_tick == u64::MAX-1` sentinel is
+        //      only cleared by a *child exit*).  Per POSIX `wait(2)`: waiting
+        //      for a non-child fails with ECHILD.  This closes the lost-wakeup
+        //      that wedged a multi-threaded parent's IPC-I/O thread when its
+        //      `waitid(P_PID, x)` raced the child's reaping.
+        if !crate::proc::has_matching_child(parent_pid, pid) {
+            let mut threads = crate::proc::THREAD_TABLE.lock();
+            if let Some(t) = threads.iter_mut().find(|t| t.tid == tid) {
+                if t.state == crate::proc::ThreadState::Blocked
+                    && t.wake_tick == u64::MAX - 1
+                {
+                    t.state = crate::proc::ThreadState::Ready;
+                    t.wake_tick = u64::MAX;
+                }
+            }
+            return -10; // ECHILD
         }
 
         // (3) No zombie visible while we hold the Blocked commit → park.  A
@@ -2579,12 +2890,13 @@ pub(crate) fn sys_waitpid(pid: i64, options: u32) -> i64 {
         //     scheduler tick) returns us promptly.
         crate::sched::schedule();
 
-        // We were woken up — try to reap.
-        if let Some((child_pid, exit_code)) = crate::proc::waitpid(parent_pid, pid) {
+        // We were woken up — try to collect.
+        if let Some((child_pid, exit_code)) = collect(parent_pid, pid) {
             crate::serial_println!(
                 "[SYSCALL] waitpid: child PID {} exited with code {}",
                 child_pid, exit_code
             );
+            if let Some(out) = exit_out.as_deref_mut() { *out = exit_code; }
             return child_pid as i64;
         }
     }
@@ -4409,6 +4721,38 @@ pub(crate) fn poll_revents(pid: u64, fd: usize, events: u16) -> u16 {
         let mut rev = 0u16;
         if crate::net::socket::socket_has_data(sid) { rev |= events & POLLIN; }
         rev |= events & POLLOUT;
+        // Peer read-closed / full hang-up edges, mirroring the AF_UNIX arm
+        // above.  Without these an AF_INET reader parked in `poll(2)` on a
+        // TCP fd is never woken when the peer sends FIN (CloseWait): no
+        // POLLIN-on-EOF, no POLLRDHUP, no POLLHUP — so it never issues the
+        // `read(2)` that returns 0 and signals end-of-response.  A length-
+        // delimited consumer that ends its message on connection close
+        // (RFC 9112 §6.3, "close-delimited" responses) then waits forever.
+        //
+        //   * read-closed (peer FIN, RFC 9293 §3.5): the read end becomes
+        //     readable — `read()` returns the buffered tail then 0 (EOF) —
+        //     so POLLIN is raised, and POLLRDHUP ("read EOF, write side may
+        //     still be valid") when the caller subscribed it.  POLLOUT
+        //     (above) stays set.
+        //   * fully hung up (read-closed AND nothing left to drain): POSIX
+        //     `poll(2)` reports POLLHUP unconditionally; it coexists with
+        //     POLLIN so a draining reader still observes EOF.
+        let rc = crate::net::socket::socket_read_closed(sid);
+        let hup = crate::net::socket::socket_fully_hung_up(sid);
+        if rc {
+            rev |= events & POLLIN;
+            rev |= events & POLLRDHUP;
+        }
+        if hup {
+            rev |= POLLHUP;
+            rev |= events & POLLIN;
+        }
+        #[cfg(feature = "firefox-test")]
+        if (rc || hup) && events & POLLIN != 0 {
+            crate::serial_println!(
+                "[FF/tcp-eof] poll pid={} fd={} sid={} read_closed={} hup={} revents={:#x}",
+                pid, fd, sid, rc, hup, rev);
+        }
         rev
     } else if is_pipe_fd(pid, fd) {
         let pipe_id = get_pipe_id(pid, fd);
