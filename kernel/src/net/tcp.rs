@@ -1203,6 +1203,21 @@ pub fn has_data_for(local_port: u16,
 }
 
 pub fn read(port: u16) -> Vec<u8> {
+    read_n(port, usize::MAX)
+}
+
+/// Bounded drain: dequeue at most `max` bytes, leaving any surplus in the
+/// receive queue for subsequent reads.
+///
+/// Per IEEE Std 1003.1-2017 §recv and recv(2): on a STREAM socket, data in
+/// excess of the caller's buffer "shall remain in the socket receive queue"
+/// — discarding it corrupts the byte stream.  (Datagram truncation discard
+/// is a property of SOCK_DGRAM only, handled at the syscall layer.)  An
+/// exact-length record reader (read N-byte header, then the body it
+/// announces) is destroyed by an unbounded drain: its first short read
+/// silently consumes the whole queue and every subsequent read blocks for
+/// bytes the peer already sent.
+pub fn read_n(port: u16, max: usize) -> Vec<u8> {
     let mut conns = TCP_CONNECTIONS.lock();
     if let Some(conn) = conns.iter_mut()
         // `Established | CloseWait`: drain any buffered tail that arrived
@@ -1215,11 +1230,19 @@ pub fn read(port: u16) -> Vec<u8> {
                   && matches!(c.state,
                       TcpState::Established | TcpState::CloseWait))
     {
-        let d = conn.recv_buffer.clone();
-        conn.recv_buffer.clear();
-        d
+        drain_up_to(&mut conn.recv_buffer, max)
     } else {
         Vec::new()
+    }
+}
+
+/// Dequeue at most `max` bytes from the front of `buf`, keeping the rest.
+fn drain_up_to(buf: &mut Vec<u8>, max: usize) -> Vec<u8> {
+    if max >= buf.len() {
+        core::mem::take(buf)
+    } else {
+        let rest = buf.split_off(max);
+        core::mem::replace(buf, rest)
     }
 }
 
@@ -1366,6 +1389,13 @@ pub fn test_recv_next(local_port: u16, remote_ip: Ipv4Address,
 ///
 /// Mirrors the shape of [`send_data_to`] / [`close_connection`].
 pub fn read_from(local_port: u16, remote_ip: Ipv4Address, remote_port: u16) -> Vec<u8> {
+    read_from_n(local_port, remote_ip, remote_port, usize::MAX)
+}
+
+/// Bounded 4-tuple drain — see [`read_n`] for the stream-surplus contract
+/// (IEEE Std 1003.1-2017 §recv: excess stream bytes remain queued).
+pub fn read_from_n(local_port: u16, remote_ip: Ipv4Address, remote_port: u16,
+                   max: usize) -> Vec<u8> {
     let mut conns = TCP_CONNECTIONS.lock();
     if let Some(conn) = conns.iter_mut().find(|c| {
         c.local_port  == local_port
@@ -1376,9 +1406,7 @@ pub fn read_from(local_port: u16, remote_ip: Ipv4Address, remote_port: u16) -> V
             && matches!(c.state,
                 TcpState::Established | TcpState::CloseWait)
     }) {
-        let d = conn.recv_buffer.clone();
-        conn.recv_buffer.clear();
-        d
+        drain_up_to(&mut conn.recv_buffer, max)
     } else {
         Vec::new()
     }
