@@ -108,10 +108,24 @@ pub fn dispatch(
                 // supplied &mut [u8].  Bracket the entire call so the
                 // writes execute with AC=1.  The borrow stays inside
                 // the guard scope.
-                let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
-                let buf = unsafe { core::slice::from_raw_parts_mut(arg2 as *mut u8, count) };
-                match crate::ipc::pipe::pipe_read(pipe_id, buf) {
-                    Some(n) => n as i64,
+                let n = {
+                    let _g = unsafe { crate::arch::x86_64::smap::UserGuard::new() };
+                    let buf = unsafe { core::slice::from_raw_parts_mut(arg2 as *mut u8, count) };
+                    crate::ipc::pipe::pipe_read(pipe_id, buf)
+                };
+                match n {
+                    Some(n) => {
+                        if n > 0 {
+                            // Per `man 7 pipe`: a drain that frees ring-buffer
+                            // space must wake any writer parked on a full pipe
+                            // so it can deposit (a writer parked via
+                            // `wait_writable(.., u64::MAX)` is otherwise never
+                            // re-Readied by the timer-wake scan).  Symmetric
+                            // with the Linux `sys_read_linux` pipe arm.
+                            crate::ipc::pipe::wake_writers_all(pipe_id);
+                        }
+                        n as i64
+                    }
                     None => -9, // EBADF
                 }
             } else {
