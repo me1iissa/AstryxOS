@@ -17,6 +17,10 @@
 #![feature(abi_x86_interrupt)]
 #![allow(dead_code, unused_imports)]
 
+// The crate root needs `alloc` in scope for the firefox-test launch path,
+// which builds an owned `String` command line (runtime `--ff-url` substitution).
+extern crate alloc;
+
 mod arch;
 mod config;
 mod drivers;
@@ -76,6 +80,11 @@ mod pivot_e_tui_demo;
 mod pivot_e_git_demo;
 #[cfg(feature = "firefox-test-core")]
 mod ff_out_png;
+// Boot-time fw_cfg config (firefox-test target URL).  Compiled under the FF
+// profile (where ff_url_override() is called from the launch path) AND under
+// test-mode (where the test runner exercises the pure parser self-tests).
+#[cfg(any(feature = "firefox-test-core", feature = "test-mode"))]
+mod boot_config;
 
 use astryx_shared::{BootInfo, BOOT_INFO_MAGIC};
 
@@ -1261,9 +1270,28 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             // addr2line / gdb resolve C++ names natively (no Mozilla tecken
             // dependency).  All three fall through to the same --headless
             // --screenshot pipeline.
-            const CMDLINE_MUSL_132: &str = "/disk/usr/lib/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png file:///tmp/hello.html";
-            const CMDLINE_MUSL_ESR: &str = "/disk/usr/lib/firefox-esr/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png file:///tmp/hello.html";
-            const CMDLINE_GLIBC:    &str = "/disk/opt/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png file:///tmp/hello.html";
+            // The target URL is a runtime option: the harness can pass
+            // `astryx.ff_url=<url>` through the QEMU `opt/astryx/cmdline`
+            // `fw_cfg` blob (harness flag `--ff-url`), and `boot_config` reads it
+            // at launch.  When present (and validated as http/https/file per
+            // RFC 3986 §3.1) it REPLACES the trailing URL token below WITHOUT a
+            // rebuild; when absent, the compiled default stands.  The cmdline is
+            // therefore an owned `String` rather than a `&'static str`.
+            //
+            // Each base ends just before the URL; the chosen base + " " + URL
+            // forms the launched command line.  The `--screenshot` PATH token is
+            // fixed (`/tmp/out.png`) and is registered with the VFS so the
+            // close-after-write hook can emit the `[GATE] png-write` marker for
+            // exactly that file.
+            const CMDLINE_MUSL_132_BASE: &str = "/disk/usr/lib/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png";
+            const CMDLINE_MUSL_ESR_BASE: &str = "/disk/usr/lib/firefox-esr/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png";
+            const CMDLINE_GLIBC_BASE:    &str = "/disk/opt/firefox/firefox-bin --headless --no-remote --profile /tmp/ff-profile --new-instance --screenshot /tmp/out.png";
+            // Compiled default target URL (used when no `astryx.ff_url=` override
+            // is supplied via fw_cfg).  The local demo page keeps DNS/network
+            // out of the default path; pass `--ff-url` for a website render.
+            const DEFAULT_FF_URL: &str = "file:///tmp/hello.html";
+            // Fixed screenshot output path (the token after `--screenshot`).
+            const FF_SCREENSHOT_PATH: &str = "/tmp/out.png";
             // Use stat() (resolve_path + FileSystemOps::stat) for the existence
             // probe instead of read_file().  read_file() allocates a Vec sized
             // to the full file (~795 KB for firefox-bin), reads every byte, and
@@ -1282,13 +1310,35 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 musl_esr_stat.as_ref().map(|s| s.size).map_err(|e| *e),
                 glibc_stat.as_ref().map(|s| s.size).map_err(|e| *e),
             );
-            let cmdline = if musl_132_stat.is_ok() {
-                CMDLINE_MUSL_132
+            let cmdline_base = if musl_132_stat.is_ok() {
+                CMDLINE_MUSL_132_BASE
             } else if musl_esr_stat.is_ok() {
-                CMDLINE_MUSL_ESR
+                CMDLINE_MUSL_ESR_BASE
             } else {
-                CMDLINE_GLIBC
+                CMDLINE_GLIBC_BASE
             };
+            // Resolve the target URL: runtime fw_cfg override (validated) or the
+            // compiled default.  Announce which source won so a forensic reader
+            // of a render boot can tell at a glance whether the harness's
+            // `--ff-url` actually took effect.
+            let ff_url: alloc::string::String = match boot_config::ff_url_override() {
+                Some(u) => {
+                    serial_println!("[FFTEST] target URL (fw_cfg override): {}", u);
+                    u
+                }
+                None => {
+                    serial_println!("[FFTEST] target URL (compiled default): {}", DEFAULT_FF_URL);
+                    alloc::string::String::from(DEFAULT_FF_URL)
+                }
+            };
+            // The launched command line: <base> <space> <url>.  Owned String so
+            // the runtime URL substitution requires no rebuild.
+            let cmdline = alloc::format!("{} {}", cmdline_base, ff_url);
+            let cmdline: &str = &cmdline;
+            // Register the screenshot output path so the VFS close-after-write
+            // hook can emit `[GATE] png-write` for exactly this file (and only
+            // on a genuine written-and-closed event, not on opens/resolves).
+            crate::vfs::set_screenshot_gate_path(FF_SCREENSHOT_PATH);
             serial_println!("[FFTEST] Launching {} ...", cmdline.split(' ').next().unwrap_or(""));
             // Headless mode: pass `--headless` so libxul takes the IsHeadless()
             // path and does not call XOpenDisplay() / gdk_display_open().  With
@@ -1518,6 +1568,20 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                             "[FFTEST] Firefox exited after {} ticks (status={:?}, png={})",
                             elapsed, status, png_ok
                         );
+                        // Emit the clean-exit gate marker so the harness /
+                        // serial-web UI can classify a winning boot WITHOUT
+                        // grepping the [FFTEST] prose.  Fires once, on the pid-1
+                        // (Firefox-root) group exit in firefox-test mode.  The
+                        // code is the recorded exit status (0 for a clean
+                        // exit_group(0); the latched code when a screenshot was
+                        // produced before a late teardown fault).  Emitted only
+                        // on the non-crashed terminal branch — a relaunch-budget-
+                        // exhausted crash does NOT fire it.
+                        let exit_code = match status {
+                            crate::gui::terminal::ExecExit::Crashed(c) => c,
+                            _ => 0,
+                        };
+                        serial_println!("[GATE] ff-exit-clean code={}", exit_code);
                     }
                     firefox_exited = true;
                     break;

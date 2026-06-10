@@ -187,6 +187,23 @@ pub fn run() -> ! {
         }
     }
 
+    // ── Test R0b: boot-config fw_cfg URL-parser self-tests ───────────────
+    // Pure-Rust unit tests for the `astryx.ff_url=<url>` parser + the
+    // scheme/length/printable validation that gates an untrusted fw_cfg
+    // blob (boot_config.rs).  No serial I/O cost when the module is absent
+    // (the module compiles under firefox-test-core OR test-mode; this
+    // arm only fires under test-mode where the runner itself exists).
+    {
+        total += 1;
+        let n = crate::boot_config::self_tests();
+        if n >= 10 {
+            passed += 1;
+            test_println!("  Test R0b: boot-config URL-parser self-tests passed ({} asserts)", n);
+        } else {
+            test_println!("  Test R0b: boot-config URL-parser self-tests FAILED ({} asserts ran)", n);
+        }
+    }
+
     // ── Test 0-heap: Heap free-list validation + canaries — healthy churn ─
     // Runs FIRST (before any test that could itself perturb the heap) so it
     // is a clean no-false-positive assertion for the hardened allocator: the
