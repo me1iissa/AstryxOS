@@ -2121,7 +2121,11 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                 // (POLLIN|POLLHUP) is left faithful; only the recv return
                 // is corrected so a level-triggered reactor observes EOF,
                 // closes the fd, and stops re-polling it forever.
-                match crate::net::socket::socket_recv_status_from(socket_id) {
+                // Stream-bounded dequeue: pass the caller's buffer length so
+                // excess STREAM bytes stay queued (IEEE 1003.1 §recv); the
+                // datagram arm still returns the whole datagram and the
+                // `.min(len)` below performs the SOCK_DGRAM truncation.
+                match crate::net::socket::socket_recv_status_from(socket_id, len) {
                     Ok((crate::net::socket::RecvOutcome::Data(data), src_ip, src_port)) => {
                         let n = data.len().min(len);
                         if n > 0 {
@@ -2849,7 +2853,9 @@ fn dispatch_body(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64
                     // re-issued recvmsg in a tight loop, never yielding.  Use the
                     // status-aware recv so the two cases get their correct
                     // returns (WouldBlock → -EAGAIN, Eof → 0).
-                    bytes_read = match crate::net::socket::socket_recv_status(socket_id) {
+                    // Bounded by the iovec capacity: excess stream bytes
+                    // remain queued for the next recvmsg (IEEE 1003.1 §recv).
+                    bytes_read = match crate::net::socket::socket_recv_status(socket_id, cap) {
                         Ok(crate::net::socket::RecvOutcome::Data(data)) => {
                             let n = data.len().min(cap);
                             unsafe {
@@ -6476,7 +6482,9 @@ pub fn sys_read_linux(fd: u64, buf: u64, count: u64) -> i64 {
         // reader does not mistake an empty queue for EOF and re-read in a
         // busy loop (mirrors the pipe path above, which already separates
         // EOF from would-block).
-        return match crate::net::socket::socket_recv_status(socket_id) {
+        // Bounded by the read(2) buffer: excess stream bytes remain queued
+        // for the next read (IEEE 1003.1 §recv).
+        return match crate::net::socket::socket_recv_status(socket_id, count) {
             Ok(crate::net::socket::RecvOutcome::Data(data)) => {
                 let n = data.len().min(count);
                 unsafe {

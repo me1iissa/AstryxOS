@@ -1628,6 +1628,23 @@ pub fn run() -> ! {
         if test_tcp_peer_fin_read_closed_edge() { passed += 1; }
     }
 
+    // ── Test 519: TCP stream surplus retention on bounded recv ──────────
+    //
+    // IEEE Std 1003.1-2017 §recv / recv(2): on a STREAM socket, data in
+    // excess of the caller's buffer SHALL remain in the receive queue for
+    // subsequent receives.  Guards the recv(2)/recvfrom(2)/recvmsg(2)/read(2)
+    // arms against the unbounded-drain regression where a short read
+    // silently destroyed every byte beyond the user buffer — which broke
+    // any exact-length record reader (a TLS client reads the 5-byte record
+    // header first; the surplus server flight was discarded and the
+    // handshake waited forever).
+
+    #[cfg(feature = "kdb")]
+    {
+        total += 1;
+        if test_519_tcp_stream_surplus_retention() { passed += 1; }
+    }
+
     // ── Test 282: TCP out-of-order receive reassembly (RFC 9293 §3.10.7.4) ──
     //
     // A segment that arrives ahead of recv_next (a reorder, or after an
@@ -31265,7 +31282,7 @@ fn test_tcp_peer_fin_read_closed_edge() -> bool {
     }
 
     // Drain the tail — read_from must accept CloseWait, not Established only.
-    match socket::socket_recv_status(sid) {
+    match socket::socket_recv_status(sid, usize::MAX) {
         Ok(RecvOutcome::Data(d)) => {
             if d != TAIL {
                 test_fail!("tcp_peer_fin", "drained {} bytes, expected {} (tail truncated)",
@@ -31292,7 +31309,7 @@ fn test_tcp_peer_fin_read_closed_edge() -> bool {
         test_fail!("tcp_peer_fin", "post-drain: POLLHUP not raised (reader never observes EOF)");
         socket::socket_close(sid); return false;
     }
-    match socket::socket_recv_status(sid) {
+    match socket::socket_recv_status(sid, usize::MAX) {
         Ok(RecvOutcome::Eof) => {}
         other => {
             test_fail!("tcp_peer_fin", "post-drain: expected EOF, got {:?}", other.is_ok());
@@ -31302,6 +31319,100 @@ fn test_tcp_peer_fin_read_closed_edge() -> bool {
 
     socket::socket_close(sid);
     test_pass!("AF_INET peer-FIN read-closed edge + CloseWait drain");
+    true
+}
+
+// ── Test 519: TCP stream surplus retention on bounded recv ──────────────────
+//
+// IEEE Std 1003.1-2017 §recv / recv(2): for SOCK_STREAM, bytes in excess of
+// the caller's buffer remain in the receive queue; only SOCK_DGRAM discards
+// the excess of a truncated datagram.  Exercises the bounded dequeue end to
+// end on an injected Established TCB:
+//
+//   1. recv with max=5 returns EXACTLY the first 5 bytes,
+//   2. the socket stays readable (POLLIN level holds on the surplus),
+//   3. the next recv returns the remaining bytes in order, byte-exact,
+//   4. the drained-empty socket is WouldBlock (not EOF).
+#[cfg(feature = "kdb")]
+fn test_519_tcp_stream_surplus_retention() -> bool {
+    test_header!("TCP stream surplus retention on bounded recv (Test 519)");
+
+    use crate::net::{tcp, socket};
+    use crate::net::socket::RecvOutcome;
+
+    const LOCAL_PORT: u16 = 47121;
+    // SLIRP gateway as synthetic peer (MAC already ARP-cached, see the
+    // peer-FIN test above) so socket_close's FIN egresses without a poll loop.
+    let peer_ip:   [u8; 4] = [10, 0, 2, 2];
+    let peer_port: u16     = 52346;
+    // Shaped like a TLS server flight: a 5-byte record header followed by a
+    // body — the reader takes the header first, then expects the body to
+    // still be there.
+    const FLIGHT: &[u8] = b"\x16\x03\x03\x00\x1cServerHelloBodyBytes12345678";
+
+    if let Err(e) = tcp::listen(LOCAL_PORT) {
+        test_fail!("tcp_surplus", "listen({}) failed: {}", LOCAL_PORT, e);
+        return false;
+    }
+    if let Err(e) = tcp::test_inject_established(LOCAL_PORT, peer_ip, peer_port, FLIGHT) {
+        test_fail!("tcp_surplus", "inject failed: {}", e);
+        return false;
+    }
+    let sid = socket::socket_create_accepted(LOCAL_PORT, peer_ip, peer_port);
+
+    // (1) Bounded read of the 5-byte record header.
+    match socket::socket_recv_status(sid, 5) {
+        Ok(RecvOutcome::Data(d)) => {
+            if d != &FLIGHT[..5] {
+                test_fail!("tcp_surplus", "header read returned {} bytes {:x?}, expected first 5",
+                    d.len(), &d[..d.len().min(8)]);
+                socket::socket_close(sid); return false;
+            }
+            test_println!("  recv(max=5) → first 5 bytes exactly ✓");
+        }
+        other => {
+            test_fail!("tcp_surplus", "header read not Data (ok={})", other.is_ok());
+            socket::socket_close(sid); return false;
+        }
+    }
+
+    // (2) Surplus must still be queued and readable (POLLIN level).
+    if !socket::socket_has_data(sid) {
+        test_fail!("tcp_surplus",
+            "surplus discarded: socket not readable after bounded read (stream bytes lost)");
+        socket::socket_close(sid); return false;
+    }
+    test_println!("  surplus still queued, socket readable ✓");
+
+    // (3) The rest arrives in order, byte-exact.
+    match socket::socket_recv_status(sid, usize::MAX) {
+        Ok(RecvOutcome::Data(d)) => {
+            if d != &FLIGHT[5..] {
+                test_fail!("tcp_surplus", "body read returned {} bytes, expected {} (stream corrupted)",
+                    d.len(), FLIGHT.len() - 5);
+                socket::socket_close(sid); return false;
+            }
+            test_println!("  second recv → remaining {} bytes in order ✓", d.len());
+        }
+        other => {
+            test_fail!("tcp_surplus", "body read not Data (ok={})", other.is_ok());
+            socket::socket_close(sid); return false;
+        }
+    }
+
+    // (4) Fully drained, peer live → WouldBlock (not EOF).
+    match socket::socket_recv_status(sid, usize::MAX) {
+        Ok(RecvOutcome::WouldBlock) => {
+            test_println!("  drained live socket → WouldBlock ✓");
+        }
+        other => {
+            test_fail!("tcp_surplus", "drained socket not WouldBlock (ok={})", other.is_ok());
+            socket::socket_close(sid); return false;
+        }
+    }
+
+    socket::socket_close(sid);
+    test_pass!("TCP stream surplus retention on bounded recv (Test 519)");
     true
 }
 
@@ -31632,7 +31743,7 @@ fn test_af_inet_accept_end_to_end() -> bool {
     }
 
     // Drain A — must see exactly RX_A.
-    let got_a = match socket::socket_recv(sid_a) {
+    let got_a = match socket::socket_recv(sid_a, usize::MAX) {
         Ok(d) => d,
         Err(e) => {
             test_fail!("test270", "socket_recv A failed: {}", e);
@@ -31649,7 +31760,7 @@ fn test_af_inet_accept_end_to_end() -> bool {
         test_fail!("test270", "B's recv buffer drained when only A was read");
         return false;
     }
-    let got_b = match socket::socket_recv(sid_b) {
+    let got_b = match socket::socket_recv(sid_b, usize::MAX) {
         Ok(d) => d,
         Err(e) => {
             test_fail!("test270", "socket_recv B failed: {}", e);
@@ -32742,7 +32853,7 @@ fn test_recv_status_from_udp_returns_sender_4tuple() -> bool {
     udp::send([127, 0, 0, 1], CLIENT_PORT, SERVER_PORT, PAYLOAD);
     crate::net::poll();
 
-    let (outcome, src_ip, src_port) = match socket::socket_recv_status_from(id) {
+    let (outcome, src_ip, src_port) = match socket::socket_recv_status_from(id, usize::MAX) {
         Ok(t) => t,
         Err(e) => {
             socket::socket_close(id);
@@ -32795,7 +32906,7 @@ fn test_recv_status_from_udp_wouldblock_when_empty() -> bool {
         return false;
     }
 
-    let r = socket::socket_recv_status_from(id);
+    let r = socket::socket_recv_status_from(id, usize::MAX);
     socket::socket_close(id);
 
     match r {
@@ -33058,7 +33169,7 @@ fn test_shutdown_tcp_rd_returns_eof() -> bool {
     };
     let _ = socket::socket_shutdown(id, socket::SHUT_RD);
     // Even though the TCB has QUEUED bytes pending, recv must return EOF.
-    let recv_result = socket::socket_recv(id);
+    let recv_result = socket::socket_recv(id, usize::MAX);
     let _ = tcp::abort(PORT);
     match recv_result {
         Ok(d) if d.is_empty() => {
@@ -33117,7 +33228,7 @@ fn test_shutdown_tcp_rdwr_breaks_both() -> bool {
         Some(i) => i, None => return false,
     };
     let _ = socket::socket_shutdown(id, socket::SHUT_RDWR);
-    let recv_ok    = matches!(socket::socket_recv(id), Ok(ref d) if d.is_empty());
+    let recv_ok    = matches!(socket::socket_recv(id, usize::MAX), Ok(ref d) if d.is_empty());
     let send_epipe = matches!(socket::socket_send(id, b"x"), Err("EPIPE"));
     let state = tcp::snapshot_connections().iter()
         .find(|c| c.local_port == PORT && c.remote_ip == peer).map(|c| c.state);
@@ -48421,7 +48532,7 @@ fn test_281_socket_recv_eagain_vs_eof() -> bool {
     }
 
     // (1) Empty queue, socket live → MUST be WouldBlock (the storm-fix case).
-    match socket::socket_recv_status(sid) {
+    match socket::socket_recv_status(sid, usize::MAX) {
         Ok(RecvOutcome::WouldBlock) => {
             test_println!("  empty bound UDP socket → WouldBlock ✓");
         }
@@ -48456,7 +48567,7 @@ fn test_281_socket_recv_eagain_vs_eof() -> bool {
         pkt.extend_from_slice(PAYLOAD);
         crate::net::udp::handle_udp([10, 0, 2, 2], [10, 0, 2, 15], &pkt);
     }
-    match socket::socket_recv_status(sid) {
+    match socket::socket_recv_status(sid, usize::MAX) {
         Ok(RecvOutcome::Data(d)) if d == PAYLOAD => {
             test_println!("  injected datagram → Data({} bytes) ✓", d.len());
         }
@@ -48474,7 +48585,7 @@ fn test_281_socket_recv_eagain_vs_eof() -> bool {
     // (3) After draining, the queue is empty again → WouldBlock, NOT Eof.
     //     This is the regression's heart: an empty-but-live socket must never
     //     read as EOF.
-    match socket::socket_recv_status(sid) {
+    match socket::socket_recv_status(sid, usize::MAX) {
         Ok(RecvOutcome::WouldBlock) => {
             test_println!("  drained socket → WouldBlock (not EOF) ✓");
         }
@@ -48490,7 +48601,7 @@ fn test_281_socket_recv_eagain_vs_eof() -> bool {
         test_fail!("recv_eagain", "socket_shutdown(SHUT_RD) failed");
         return false;
     }
-    match socket::socket_recv_status(sid) {
+    match socket::socket_recv_status(sid, usize::MAX) {
         Ok(RecvOutcome::Eof) => {
             test_println!("  after SHUT_RD → Eof ✓");
         }

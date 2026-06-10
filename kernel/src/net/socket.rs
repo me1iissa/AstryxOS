@@ -452,7 +452,18 @@ pub enum RecvOutcome {
 /// `recv(2)` on a non-blocking socket with no data pending must return
 /// `EAGAIN` per IEEE 1003.1; returning 0 there is an EOF lie that drives a
 /// polled reactor into a tight re-read loop.
-pub fn socket_recv_status(id: u64) -> Result<RecvOutcome, &'static str> {
+///
+/// `max` is the caller's buffer capacity.  For a STREAM (TCP) socket the
+/// dequeue is bounded by it: per IEEE Std 1003.1-2017 §recv / recv(2), data
+/// in excess of the supplied buffer SHALL remain in the receive queue for
+/// subsequent receives.  An unbounded drain here silently destroyed the
+/// surplus, which breaks any exact-length record reader (e.g. a TLS client
+/// reading the 5-byte record header first: the header read consumed the
+/// entire buffered server flight, and the handshake then waited forever for
+/// bytes the kernel had discarded).  For a DATAGRAM (UDP) socket the whole
+/// datagram is returned and the syscall layer truncates (excess datagram
+/// bytes are discarded per §recvfrom — that is SOCK_DGRAM-only semantics).
+pub fn socket_recv_status(id: u64, max: usize) -> Result<RecvOutcome, &'static str> {
     let sockets = SOCKETS.lock();
     let sock = sockets.iter().find(|s| s.id == id)
         .ok_or("socket not found")?;
@@ -484,9 +495,10 @@ pub fn socket_recv_status(id: u64) -> Result<RecvOutcome, &'static str> {
                 return Err("not bound");
             }
             let data = if sock.connected && sock.remote_port != 0 {
-                super::tcp::read_from(sock.local_port, sock.remote_ip, sock.remote_port)
+                super::tcp::read_from_n(sock.local_port, sock.remote_ip,
+                                        sock.remote_port, max)
             } else {
-                super::tcp::read(sock.local_port)
+                super::tcp::read_n(sock.local_port, max)
             };
             if !data.is_empty() {
                 crate::proc::proc_metrics::bump_net_read(
@@ -541,7 +553,11 @@ pub fn socket_recv_status(id: u64) -> Result<RecvOutcome, &'static str> {
 /// On a non-`Data` outcome the returned address is the connected peer (or a
 /// zero 4-tuple for an unconnected datagram socket), which `recvmsg(2)`
 /// leaves unused because `msg_namelen` is only written on a real message.
-pub fn socket_recv_status_from(id: u64)
+///
+/// `max` bounds the stream dequeue exactly as in [`socket_recv_status`]
+/// (IEEE Std 1003.1-2017 §recv: excess STREAM bytes remain queued; datagram
+/// truncation stays at the syscall layer).
+pub fn socket_recv_status_from(id: u64, max: usize)
     -> Result<(RecvOutcome, Ipv4Address, u16), &'static str>
 {
     let sockets = SOCKETS.lock();
@@ -581,9 +597,10 @@ pub fn socket_recv_status_from(id: u64)
             let peer_ip   = sock.remote_ip;
             let peer_port = sock.remote_port;
             let data = if sock.connected && sock.remote_port != 0 {
-                super::tcp::read_from(sock.local_port, sock.remote_ip, sock.remote_port)
+                super::tcp::read_from_n(sock.local_port, sock.remote_ip,
+                                        sock.remote_port, max)
             } else {
-                super::tcp::read(sock.local_port)
+                super::tcp::read_n(sock.local_port, max)
             };
             if !data.is_empty() {
                 crate::proc::proc_metrics::bump_net_read(
@@ -619,7 +636,10 @@ pub fn socket_recv_status_from(id: u64)
 }
 
 /// Receive data from a socket (non-blocking).
-pub fn socket_recv(id: u64) -> Result<Vec<u8>, &'static str> {
+///
+/// `max` bounds the stream dequeue — see [`socket_recv_status`]
+/// (IEEE Std 1003.1-2017 §recv: excess STREAM bytes remain queued).
+pub fn socket_recv(id: u64, max: usize) -> Result<Vec<u8>, &'static str> {
     let sockets = SOCKETS.lock();
     let sock = sockets.iter().find(|s| s.id == id)
         .ok_or("socket not found")?;
@@ -650,11 +670,11 @@ pub fn socket_recv(id: u64) -> Result<Vec<u8>, &'static str> {
             // RFC 793 §3.8 demultiplexing.  Falls back to the
             // port-only drain only for the legacy single-peer case.
             if sock.connected && sock.remote_port != 0 {
-                Ok(super::tcp::read_from(sock.local_port,
-                                         sock.remote_ip,
-                                         sock.remote_port))
+                Ok(super::tcp::read_from_n(sock.local_port,
+                                           sock.remote_ip,
+                                           sock.remote_port, max))
             } else {
-                Ok(super::tcp::read(sock.local_port))
+                Ok(super::tcp::read_n(sock.local_port, max))
             }
         }
     };
